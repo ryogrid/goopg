@@ -182,6 +182,37 @@ restored correctness, and is developed against the 3-s repro with the same tripl
 gate. Each sub-step is independently revertible so a `M0072`-style hang is caught
 at the first failing query, never on a blind full rewrite.
 
+### 4.3 Phase-2 investigation results (2026-07-23) — mechanism pinned, timing is the open piece
+
+Instrumented the executor (`GOOPG_NLI_OUTDUMP`) and the re-resolve pass
+(`GOOPG_RERESOLVE_DEBUG`); temporary NLI-force under cost-driven
+(`GOOPG_FORCE_NLI`). Findings:
+
+- **Exact mechanism confirmed.** The partsupp NLI's probe keys are bound at
+  `tryBuildNLI` time to the *build-time* outer schema (orders-first,
+  `l_suppkey@13`, `l_partkey@16`). `reresolveJoinByName` — invoked by
+  `applyJoinTreePosMap` for the outer `*Join` — **rebuilds** that outer's merged
+  schema (`j.schema = leftSchema ++ rightSchema`) from its post-NLI-conversion
+  children, and by runtime the outer is **lineitem-first** (`l_suppkey@4`). The
+  NLI keys, left at `@13`/`@16`, then read `runtime[13]` = `l_linenumber`. Every
+  earlier symptom (composite probe, hash-join-also-drops) is downstream of this.
+- **The fix logic is right; the timing is wrong.** Added
+  `reresolveNLIKeysByName(nli)` (re-resolve `Inner.Key`/`Inner.Keys` by
+  Name+SourceTableIdx against `Outer.Output()`, and refresh `nli.schema =
+  outer ++ inner`), wired into `applyJoinTreePosMap`'s NLI case bottom-up. It
+  **ran** for partsupp — but the debug showed the outer was **still orders-first
+  (`l_suppkey@13`) at that moment**, so it kept the keys at `@13`. The reorder to
+  lineitem-first happens **AFTER `remapWithBindings`** (the pass containing
+  `applyJoinTreePosMap`). So the re-resolution executed too early and was a no-op.
+- **Open piece for Phase 2:** find the pass that runs *after* `remapWithBindings`
+  (planner.go:1015) and reorders the outer subtree's `Output()` (candidates:
+  `buildAggregateStage`, the outer query's integration of the derived-table
+  sub-query, or an execution-setup step), and run `reresolveNLIKeysByName` (a
+  final NLI-key re-resolution walk over the *complete* plan) after it — or, if the
+  reorder is in the sub-query→outer boundary, at that boundary. The helper is
+  written and correct; only its invocation point is unresolved. Phase 1 keeps
+  correctness in the meantime.
+
 ## 5. Verification
 
 - **Repro gate:** the §1 minimal query returns 16 216 (not 0); full Q9 @ SF1
