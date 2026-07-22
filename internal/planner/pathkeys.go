@@ -72,3 +72,20 @@ func pathkeysContainedIn(keys, required []PathKey) bool {
 	}
 	return true
 }
+
+// pathkeysForSortKeys builds the pathkeys a Sort node's keys guarantee — the
+// make_pathkeys_for_sortclauses analogue (pathkeys.c:1336). A Sort path, an
+// ORDER-BY-satisfying scan, or a Gather Merge carries these so add_path can keep
+// it as the more-ordered candidate ([04] §3). goopg's SortKey uses Desc; a
+// PathKey uses SortAsc, so the sense is inverted here. Consumed from C3/C5; the
+// helper and its behaviour are pinned now so those phases inherit a tested API.
+func pathkeysForSortKeys(keys []SortKey) []PathKey {
+	if len(keys) == 0 {
+		return nil
+	}
+	pks := make([]PathKey, len(keys))
+	for i, k := range keys {
+		pks[i] = PathKey{Expr: k.Expr, SortAsc: !k.Desc, NullsFirst: k.NullsFirst}
+	}
+	return pks
+}

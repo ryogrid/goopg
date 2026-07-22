@@ -36,8 +36,13 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   plan by construction).
 
 ## C1 — Pathkeys (minimal)
-- [ ] **C1.1** `pathkeys.go`: `PathKey`, `pathkeysContainedIn`; fold the pathkey
-  dimension into `addPath`. Gate: plan-gate zero diffs; containment unit tests.
+- [x] **C1.1** `pathkeys.go`: core (`PathKey`, `comparePathkeysDim`,
+  `pathkeysContainedIn`, pathkey axis in `addPath`) landed in C0.1; C1 completes the
+  API with `pathkeysForSortKeys` (the `make_pathkeys_for_sortclauses` analogue,
+  consumed from C3/C5) and 9 tests: prefix-satisfies, longer-requirement-fails,
+  direction/NULLS mismatch, the deliberate syntactic false-negative, dominance of
+  the longer ordering, divergence→incomparable, and the SortKey→PathKey produce
+  helper. Plan-preserving (no live consumer yet). Gate: units PASS, suite green.
 
 ## C2 — Estimation inputs
 - [ ] **C2.1** `RelOptInfo.Rows` via `set_baserel_size_estimates` analogue; tuple
@@ -74,6 +79,7 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green
+- 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green
+- 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green — `b44998b5`
 - 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green — `4fee8d87`
 - 2026-07-22 — C0.0 — doc reconciliation (ch09 plan-gate) + TODO tracker created — `2dc44de8`
