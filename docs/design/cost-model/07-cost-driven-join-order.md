@@ -134,6 +134,44 @@ This must be a stated test target: run the DP twice on the same input and assert
 identical chosen path ([09](09-verification-and-acceptance.md) §1). Without it, the
 plan-gate becomes non-deterministic the moment the cost is a float.
 
+## 4.5 MEASURED at implementation (C4): the order-then-rewrite mismatch
+
+An implementation attempt that costed **only binary hash-join order** in the DP —
+leaving goopg's `MultiHashJoin` packing (`rewriteMultiWayChain`) and NL-index
+conversion (`rewriteJoinsToNLI`) as the **post-DP passes they are today** — was
+measured on SF1 (serial, ANALYZE'd) and **must not be shipped**. It recovered Q8
+(200 s → 21 s) and improved Q5 (18 s → 5 s), changed 16 of 22 plans, but
+**regressed Q9 from 27 s to > 250 s**. Every other changed query was
+same-or-better; Q9 was the lone regression, and it is decisive.
+
+The cause is structural, not a mis-tuned constant. goopg decides join **order** in
+the bushy DP and then **rewrites method afterward** (binary hash-join chains →
+`MultiHashJoin`; hash joins with an indexed inner → NL-index join). A cost model
+that ranks *binary hash-join* orders is therefore optimising a cost that **does
+not match how the plan will execute**. Q9's diagnosis makes it concrete: the
+integer heuristic put `orders` in the 4-way MHJ and NL-index-probed `partsupp`
+*selectively* through its composite PK; the binary-hash cost model instead put
+`partsupp` in the MHJ and left `orders` to be NL-index-probed **~6 M times**. The
+cost-"optimal" binary order rewrote into a catastrophic real plan.
+
+**The correction — and it cannot be deferred.** Cost-driven join order in goopg is
+unsafe until the DP costs the **actual execution shape**. The MHJ comparability
+invariant ([06](06-scan-and-join-path-costs.md) §4) and the NL-index path
+([06](06-scan-and-join-path-costs.md) §2.3) are therefore **not** later
+refinements layered onto a working binary-order DP — they are *prerequisites*. The
+DP must generate MHJ paths and NL-index paths as first-class alternatives **during**
+enumeration (competing in `add_path` against the binary-hash path over the same
+joinrel), so that `set_cheapest` ranks orders by what actually runs. This is the
+"full-fidelity DP", and it is the real content of this phase; the binary-only
+version above is recorded as a rejected intermediate so a future implementer does
+not repeat it. Concretely, at each DP composition the generator must add: (a) the
+binary hash path (both build orientations, §1); (b) an **NL-index path** when the
+inner joinrel is a base table with an index covering the join key, costed by
+`nestloopCost` with one index probe per outer row — this is what makes the
+`partsupp`-vs-`orders` probe-selectivity difference visible to the cost; and (c),
+for a subset whose binary shape would pack into an MHJ, the **MHJ path** costed per
+[06](06-scan-and-join-path-costs.md) §4.1. Only then is the argmin switch safe.
+
 ## 5. Enumeration cost
 
 The DP now generates several join-*method* paths per subset (hash build-left, hash

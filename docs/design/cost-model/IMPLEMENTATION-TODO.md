@@ -70,10 +70,25 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   DP-traversal wiring and merge/nestloop/MHJ generation land with C4 (where
   selection switches). Plan-preserving. Gate: units PASS, suite green.
 
-## C4 — Switch join order to costed pathlists *(first behavior change)*
-- [ ] **C4.1** Retire the integer argmin; DP composes via `addPath`/`setCheapest`;
-  LIMIT on the startup axis. Gate: milestone bar — 5 regressions recover w/o losing
-  Q5; rows byte-identical; plan-gate re-baselined + classified.
+## C4 — Full-fidelity cost-driven join order *(first behavior change)*
+**Revised after the C4 binary-only attempt (see log + ch07 §4.5).** A binary-hash-
+only order switch is UNSAFE: it recovered Q8 (200→21s) + Q5 (18→5s) but regressed
+Q9 (27→>250s) because goopg packs MHJ and converts NL-index AFTER the DP, so
+binary-hash cost ≠ real execution. The DP must cost the actual execution shape.
+Direction chosen by user: **full-fidelity DP (MHJ/NLI-aware)**. The binary-only
+attempt is stashed (`git stash list`: "C4 cost-driven join order (binary-hash…)").
+- [~] **C4a** NL-index-aware path generation in the DP: when the inner joinrel is a
+  base table with an index covering the join key (matching `rewriteJoinsToNLI`'s
+  conversion conditions, `nl_index_join.go`), generate an NLI path costed by
+  `nestloopCost` (one index probe per outer row) alongside the hash path. This is
+  what makes Q9's `partsupp`-vs-`orders` probe-selectivity visible. Gate: Q9 does
+  not regress.
+- [ ] **C4b** MHJ-aware costing: for a subset whose binary shape packs into a
+  `MultiHashJoin`, generate the MHJ path under the ch06 §4.1 comparability invariant
+  (costed vs the equivalent left-deep hash cascade). Targets Q2/Q22.
+- [ ] **C4c** Switch selection to the costed pathlists + measure. Gate: the milestone
+  bar — the 5 regressions recover WITHOUT regressing Q9 or losing Q5, on SF1;
+  plan-gate re-baselined + `pg-oracle-diff` classified.
 
 ## C5 — Parallel paths + parallelize decision
 - [ ] **C5.1** Partial paths + `generate_gather_paths`; parallelize = `setCheapest`;
@@ -93,7 +108,8 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C3.2 — pathgen.go: scan (serial+partial) + hash-join (both orientations) generation primitives + 4 tests; plan-preserving
+- 2026-07-22 — C4 attempt (binary-hash-only, STASHED not landed) — SF1 serial+stats: recovered Q8 200→21s, Q5 18→5s; but REGRESSED Q9 27→>250s (post-DP MHJ/NLI mismatch). Q2/Q4/Q12/Q22 unrecovered (their causes are outside the DP: semi-join method, MHJ, build-side). Full-fidelity DP (MHJ/NLI-aware) chosen; see ch07 §4.5. C0-baseline + costmodel-c4 snapshots + sf1-r4-w0-serial are the references.
+- 2026-07-22 — C3.2 — pathgen.go: scan (serial+partial) + hash-join (both orientations) generation primitives + 4 tests; plan-preserving — `d92d10a9`
 - 2026-07-22 — C3.1 — cost_funcs.go: 8 per-node PG-unit cost functions + 7 oracle tests + config drift guard; plan-preserving — `9297cf7a`
 - 2026-07-22 — C2.1/C2.2 — relsize.go: baseRelRows + width estimator + estimate_rel_size fallback; cold-start test PASS; plan-preserving — `1e5b5a4f`
 - 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green — `b4770527`
