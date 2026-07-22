@@ -72,6 +72,63 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 	}
 }
 
+// relWithScanCost makes a rel carrying a single scan path of the given cost, with
+// setCheapest already run — a convenient stand-in for a DP child rel in tests.
+func relWithScanCost(relids RelSet, rows float64, total float64) *RelOptInfo {
+	rel := newRelOptInfo(relids, rows, 40)
+	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: total}})
+	setCheapest(rel)
+	return rel
+}
+
+// TestGenerateNLIPath_RuinousForLargeOuter is the Q9 lesson (ch. 07 §4.5): an
+// NL-index join is cheap when the outer is small (few probes) but ruinous when the
+// outer is large — the distinction a binary-hash-only cost model could not make.
+func TestGenerateNLIPath_RuinousForLargeOuter(t *testing.T) {
+	cp := defaultCostParams()
+	bigInner := relWithScanCost(RelSet(0b10), 1000000, 10000)
+
+	smallOuter := relWithScanCost(RelSet(0b01), 100, 5)
+	jSmall := newRelOptInfo(RelSet(0b11), 100, 40)
+	generateNLIPath(jSmall, smallOuter, bigInner, cp)
+	setCheapest(jSmall)
+	nliSmall := jSmall.CheapestTotal.Cost.Total // ~ 100*8 + 5
+
+	bigOuter := relWithScanCost(RelSet(0b01), 6000000, 60000)
+	jLarge := newRelOptInfo(RelSet(0b11), 6000000, 40)
+	generateNLIPath(jLarge, bigOuter, bigInner, cp)
+	setCheapest(jLarge)
+	nliLarge := jLarge.CheapestTotal.Cost.Total // ~ 6M*8
+
+	if nliSmall > 10000 {
+		t.Fatalf("NLI over a 100-row outer must be cheap, got %v", nliSmall)
+	}
+	if nliLarge < 1e6 {
+		t.Fatalf("NLI over a 6M-row outer must be very expensive, got %v", nliLarge)
+	}
+	// The parameterized path records its outer dependency.
+	if jLarge.CheapestTotal.RequiredOuter != bigInner.Relids {
+		t.Fatalf("NLI path must record RequiredOuter = the indexed inner's relids")
+	}
+}
+
+func TestGenerateMultiHashJoinPath(t *testing.T) {
+	cp := defaultCostParams()
+	probe := relWithScanCost(RelSet(0b1000), 6000000, 60000) // driving lineitem
+	d1 := relWithScanCost(RelSet(0b0001), 1500000, 15000)    // orders
+	d2 := relWithScanCost(RelSet(0b0010), 10000, 100)        // supplier
+	d3 := relWithScanCost(RelSet(0b0100), 25, 1)             // nation
+	joinRel := newRelOptInfo(RelSet(0b1111), 6000000, 100)
+	generateMultiHashJoinPath(joinRel, probe, []*RelOptInfo{d1, d2, d3}, cp)
+	setCheapest(joinRel)
+	if joinRel.CheapestTotal == nil || joinRel.CheapestTotal.Kind != PathMultiHash {
+		t.Fatalf("expected a MultiHashJoin path")
+	}
+	if len(joinRel.CheapestTotal.Children) != 4 {
+		t.Fatalf("MHJ path should carry the probe + 3 dims, got %d children", len(joinRel.CheapestTotal.Children))
+	}
+}
+
 func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	cp := defaultCostParams()
 	joinRel := newRelOptInfo(RelSet(0b11), 10, 10)

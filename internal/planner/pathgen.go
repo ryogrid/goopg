@@ -73,3 +73,57 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, num
 		Children: []*Path{i, o},
 	})
 }
+
+// generateNLIPath adds a nested-loop-index-join path to joinRel: for each outer
+// row, one index probe of the inner. `inner` must be a base relation the executor
+// can index-probe on the join key (the DP checks this before calling, matching
+// rewriteJoinsToNLI's conversion conditions, nl_index_join.go). It is cheap only
+// when the outer side is small — for a large outer this cost is correctly ruinous,
+// which is what a binary-hash-only cost model could not see (ch. 07 §4.5). The
+// path is parameterized by the inner's index dependency on the outer key
+// (RequiredOuter), design ch. 03 §3.1.
+func generateNLIPath(joinRel, outer, inner *RelOptInfo, cp costParams) {
+	o, i := outer.CheapestTotal, inner.CheapestTotal
+	if o == nil || i == nil {
+		return
+	}
+	addPath(joinRel, &Path{
+		Kind:          PathNestLoop,
+		Rel:           joinRel,
+		Rows:          joinRel.Rows,
+		Cost:          nestloopCost(cp, o.Cost, i.Cost, outer.Rows, joinRel.Rows, indexProbeCost(cp)),
+		Children:      []*Path{o, i},
+		RequiredOuter: inner.Relids, // the inner index depends on the outer key
+	})
+}
+
+// generateMultiHashJoinPath adds a MultiHashJoin path to joinRel over one driving
+// (probe) rel and several dimension (build) rels, under the ch. 06 §4.1
+// comparability invariant. Competes in add_path against the equivalent hash
+// cascade; the DP keeps whichever is cheaper. setCheapest must have run on every
+// child rel.
+func generateMultiHashJoinPath(joinRel, probe *RelOptInfo, dims []*RelOptInfo, cp costParams) {
+	p := probe.CheapestTotal
+	if p == nil {
+		return
+	}
+	dimCosts := make([]Cost, 0, len(dims))
+	dimRows := make([]float64, 0, len(dims))
+	children := make([]*Path, 0, len(dims)+1)
+	children = append(children, p)
+	for _, d := range dims {
+		if d.CheapestTotal == nil {
+			return
+		}
+		dimCosts = append(dimCosts, d.CheapestTotal.Cost)
+		dimRows = append(dimRows, d.Rows)
+		children = append(children, d.CheapestTotal)
+	}
+	addPath(joinRel, &Path{
+		Kind:     PathMultiHash,
+		Rel:      joinRel,
+		Rows:     joinRel.Rows,
+		Cost:     multiHashJoinCost(cp, p.Cost, probe.Rows, dimCosts, dimRows, joinRel.Rows),
+		Children: children,
+	})
+}

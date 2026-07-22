@@ -1,6 +1,10 @@
 package planner
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"math"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // Relation size and width estimation — the inputs the cost model's per-node cost
 // functions consume. See docs/design/cost-model/ chapter 05. These are pure
@@ -105,6 +109,31 @@ func estimateRelSizeRows(blocks int64, width int) float64 {
 		rows = 1
 	}
 	return rows
+}
+
+// nodeTupleWidth estimates the average output-row width of any plan node from
+// its schema — the width the cost model charges for a scan leaf.
+func nodeTupleWidth(n Node) int {
+	if n == nil {
+		return 1
+	}
+	return tupleWidth(n.Output())
+}
+
+// estScanPages estimates a relation's block count from its row count and width —
+// the inverse of the estimate_rel_size density (§4). Used to feed cost_seqscan a
+// page count inside the join-order DP, where the live smgr block count is not in
+// scope; scan cost is order-independent, so the approximation does not perturb the
+// order ranking, only its absolute scale.
+func estScanPages(rows float64, width int) int64 {
+	if rows < 1 {
+		rows = 1
+	}
+	pages := int64(math.Ceil(rows * float64(width) / float64(usableBytesPerBlock)))
+	if pages < 1 {
+		pages = 1
+	}
+	return pages
 }
 
 // baseRelRows is the set_baserel_size_estimates analogue for a base relation's

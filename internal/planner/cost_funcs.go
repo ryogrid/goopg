@@ -131,6 +131,38 @@ func gatherCost(cp costParams, sub Cost, outputRows float64) Cost {
 	return Cost{Startup: startup, Total: total}
 }
 
+// indexProbeCost is the cost of one equality probe of a selective/unique index
+// returning ~1 row: an index page and a heap page, both random, plus per-tuple
+// CPU. This is the per-outer-row rescan cost a nested-loop-index join pays
+// (nestloopCost's innerRescanTotal). It is what makes NL-index cheap for a
+// selective outer side and ruinous for a large one — the Q9 lesson (ch. 07 §4.5).
+func indexProbeCost(cp costParams) float64 {
+	return 2*cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost + cp.cpuOperatorCost
+}
+
+// multiHashJoinCost costs goopg's N-way MultiHashJoin under the comparability
+// invariant (design ch. 06 §4.1): build each dimension hash table (charged as
+// startup, since all builds complete before probing) and make ONE probe pass over
+// the driving table, hashing each driving row against every dimension. dims/dimRows
+// are the build-side rels; probe/probeRows the driving rel; outputRows the join
+// result. Costed in the same PG units as the equivalent hash cascade, so add_path
+// can rank the MHJ against it — the MHJ wins exactly when eliminating the cascade's
+// intermediate materialisations pays.
+func multiHashJoinCost(cp costParams, probe Cost, probeRows float64, dims []Cost, dimRows []float64, outputRows float64) Cost {
+	build := 0.0
+	for i := range dims {
+		r := 0.0
+		if i < len(dimRows) {
+			r = dimRows[i]
+		}
+		build += (cp.cpuOperatorCost+cp.cpuTupleCost)*r + dims[i].Total
+	}
+	startup := build + probe.Startup
+	probeCost := cp.cpuOperatorCost*float64(len(dims))*probeRows + cp.cpuTupleCost*outputRows
+	total := startup + (probe.Total - probe.Startup) + probeCost
+	return Cost{Startup: startup, Total: total}
+}
+
 // aggCost reproduces the AGG_HASHED arm of cost_agg (costsize.c:2751): per input
 // tuple, a transition call plus a hash of each group column; per output group, a
 // finalize plus a tuple emit. numAggs transition calls are charged per input row.

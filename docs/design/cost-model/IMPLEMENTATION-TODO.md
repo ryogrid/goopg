@@ -77,15 +77,23 @@ Q9 (27→>250s) because goopg packs MHJ and converts NL-index AFTER the DP, so
 binary-hash cost ≠ real execution. The DP must cost the actual execution shape.
 Direction chosen by user: **full-fidelity DP (MHJ/NLI-aware)**. The binary-only
 attempt is stashed (`git stash list`: "C4 cost-driven join order (binary-hash…)").
-- [~] **C4a** NL-index-aware path generation in the DP: when the inner joinrel is a
-  base table with an index covering the join key (matching `rewriteJoinsToNLI`'s
-  conversion conditions, `nl_index_join.go`), generate an NLI path costed by
-  `nestloopCost` (one index probe per outer row) alongside the hash path. This is
-  what makes Q9's `partsupp`-vs-`orders` probe-selectivity visible. Gate: Q9 does
-  not regress.
-- [ ] **C4b** MHJ-aware costing: for a subset whose binary shape packs into a
+- [~] **C4a** NL-index / MHJ costing.
+  - [x] **C4a-i** *Primitives (pure, not wired — plan-preserving).* `cost_funcs.go`:
+    `indexProbeCost` (one selective index probe) + `multiHashJoinCost` (ch06 §4.1
+    comparability). `pathgen.go`: `generateNLIPath` (parameterized, RequiredOuter)
+    + `generateMultiHashJoinPath`. `relsize.go`: `nodeTupleWidth`/`estScanPages`
+    helpers. Tests incl. the **Q9 lesson** (NLI ruinous over a 6M-row outer, cheap
+    over 100). Gate: units PASS, suite green.
+  - [ ] **C4a-ii** *Wire NLI/MHJ generation into the DP* + measure. The DP must
+    detect, per split, when a side is a base table with a usable index (matching
+    `tryBuildNLI`/`pickInnerSide`, `nl_index_join.go`) and when a subset packs into
+    an MHJ, generate those paths as alternatives, then re-run the selection switch.
+    Gate: Q9 does not regress (+ nothing else). NOTE from analysis: NLI cost alone
+    does not distinguish Q9's two ~6M-probe options — MHJ composition also matters,
+    so C4a-ii and C4b land together and need SF1 iteration.
+- [ ] **C4b** MHJ-aware costing wired: for a subset whose binary shape packs into a
   `MultiHashJoin`, generate the MHJ path under the ch06 §4.1 comparability invariant
-  (costed vs the equivalent left-deep hash cascade). Targets Q2/Q22.
+  (costed vs the equivalent left-deep hash cascade). Targets Q2/Q22. Lands with C4a-ii.
 - [ ] **C4c** Switch selection to the costed pathlists + measure. Gate: the milestone
   bar — the 5 regressions recover WITHOUT regressing Q9 or losing Q5, on SF1;
   plan-gate re-baselined + `pg-oracle-diff` classified.
@@ -108,6 +116,7 @@ attempt is stashed (`git stash list`: "C4 cost-driven join order (binary-hash…
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-22 — C4a-i — NLI/MHJ cost + path-gen primitives (indexProbeCost, multiHashJoinCost, generateNLIPath, generateMultiHashJoinPath) + size helpers; pure/plan-preserving; Q9-lesson test PASS
 - 2026-07-22 — C4 attempt (binary-hash-only, STASHED not landed) — SF1 serial+stats: recovered Q8 200→21s, Q5 18→5s; but REGRESSED Q9 27→>250s (post-DP MHJ/NLI mismatch). Q2/Q4/Q12/Q22 unrecovered (their causes are outside the DP: semi-join method, MHJ, build-side). Full-fidelity DP (MHJ/NLI-aware) chosen; see ch07 §4.5. C0-baseline + costmodel-c4 snapshots + sf1-r4-w0-serial are the references.
 - 2026-07-22 — C3.2 — pathgen.go: scan (serial+partial) + hash-join (both orientations) generation primitives + 4 tests; plan-preserving — `d92d10a9`
 - 2026-07-22 — C3.1 — cost_funcs.go: 8 per-node PG-unit cost functions + 7 oracle tests + config drift guard; plan-preserving — `9297cf7a`

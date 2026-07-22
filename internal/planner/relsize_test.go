@@ -68,6 +68,22 @@ func TestEstimateRelSizeRows_Density(t *testing.T) {
 	}
 }
 
+func TestEstScanPages(t *testing.T) {
+	// 100000 rows * 100 bytes / 8168 usable = ceil(1224.3) = 1225 pages.
+	if got := estScanPages(100000, 100); got != 1225 {
+		t.Fatalf("estScanPages(100000,100) = %d, want 1225", got)
+	}
+	if got := estScanPages(0, 100); got != 1 {
+		t.Fatalf("estScanPages floors at 1 page, got %d", got)
+	}
+}
+
+func TestNodeTupleWidth_NilSafe(t *testing.T) {
+	if got := nodeTupleWidth(nil); got != 1 {
+		t.Fatalf("nodeTupleWidth(nil) = %d, want 1", got)
+	}
+}
+
 // TestBaseRelRows_ColdStartFallback is the C2 headline: after a restart RowCount
 // is 0 (unrestored, ledger pq-P6), and baseRelRows must return the block-derived
 // estimate rather than 0 — the property that makes the milestone
