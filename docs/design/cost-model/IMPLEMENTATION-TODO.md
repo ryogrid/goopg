@@ -169,6 +169,18 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-22 — **C4-prereq: layout-aware bushy join-key remapping (LANDED `65dd185a`)** —
+  Fixes the Q8=0 root cause. `dpEntry.layout` (table→offset in the child's real
+  schema) threaded through the DP; `remapKeyToLayout` replaces the ascending-order
+  assumption in `buildJoinFromDP`. **No-op for every plan the integer DP produces
+  today** (for ascending subsets layout[t] == old prefix-sum — proven + double-capture
+  shows plans deterministic given stats). New `TestBuildJoinFromDP_NonAscendingSubset­KeyRemap`
+  pins the `[t2,t0]` case (RED→GREEN); full planner suite green; pre-commit smoke PASS.
+  End-to-end Q8-correct-under-cost-driven-order is the acceptance test for C4c.
+  NOTE: `make plan-gate` shows 16/22 "diverged" vs `costmodel-c0-baseline` — this is
+  PRE-EXISTING ANALYZE-sampling noise (the integer DP is cardinality-sensitive), NOT a
+  regression: plans are deterministic given a FIXED sample, but a fresh ANALYZE
+  resamples NDistinct and shifts the integer-DP argmin. c0-baseline needs re-capture.
 - 2026-07-22 — **C4-pg-ii Q8=0 ROOT CAUSE (EXPLAIN ANALYZE, SF1 stats-on)** — Reproduced
   under the stashed C4-pg-ii files. `EXPLAIN ANALYZE` Q8 completes in **3.9 s but
   returns 0 rows**. The drop is localised precisely: the subtree
