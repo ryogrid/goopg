@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"math/big"
 	"testing"
 	"unsafe"
 
@@ -217,5 +218,40 @@ func TestM0092MaterializeAlwaysDeepCopies(t *testing.T) {
 	// Content must match.
 	if mat.row[0].Int != 1 || mat.row[1].StringValue() != "x" {
 		t.Errorf("Materialize corrupted row content: %+v", mat.row)
+	}
+}
+
+// TestBigNumericArenaSurvivesReset pins the sibling-path fix: a
+// mctx-backed big-numeric (flagBigNumeric) must be fully detached by
+// cloneRowOwned / MaterializeArena at the retention boundary, so a
+// producer arena Reset cannot corrupt it. Before the fix, rowHasArena /
+// cloneRowOwned only handled KindString/KindBytes, leaving big-numeric
+// build rows aliasing an arena that resets at scale (the class of bug
+// behind wrong join results on large builds).
+func TestBigNumericArenaSurvivesReset(t *testing.T) {
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	// A value beyond int64 range forces the flagBigNumeric lane.
+	bi, _ := new(big.Int).SetString("123456789012345678901234567890", 10)
+	src := newBigNumericInCtx(a, bi, 5)
+	if src.Flags&flagBigNumeric == 0 || src.ArenaID == 0 {
+		t.Fatalf("setup: expected arena-backed big-numeric, got Flags=%d ArenaID=%d", src.Flags, src.ArenaID)
+	}
+
+	// rowHasArena must now SEE the big-numeric (not just String/Bytes).
+	if !rowHasArena(Row{src}) {
+		t.Fatalf("rowHasArena did not detect an arena-backed big-numeric")
+	}
+
+	// Detach at the retention boundary, THEN destroy the source arena.
+	owned := cloneRowOwned(Row{src})
+	a.Reset()
+	a.Release()
+
+	got := owned[0].NumericBigValue()
+	if got.Cmp(bi) != 0 {
+		t.Errorf("after source-arena Reset, cloned big-numeric = %s, want %s (shallow copy corrupted it)", got, bi)
+	}
+	if owned[0].NumericScaleValue() != 5 {
+		t.Errorf("scale = %d, want 5", owned[0].NumericScaleValue())
 	}
 }
