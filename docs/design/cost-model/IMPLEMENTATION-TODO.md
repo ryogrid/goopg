@@ -169,6 +169,24 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-22 — **C4 Q9=0 correctness — investigated, NOT yet fixed (correctness-first per
+  user).** EXPLAIN ANALYZE (serial) localises the drop: `lineitem(6M) ⋈ orders_pk` =
+  6M ✓, then `⋈ partsupp_pk` COMPOSITE (`ps_partkey=l_partkey AND ps_suppkey=l_suppkey`)
+  = **179 197** (should preserve ~6M) → `⋈ part(green)` = **0**. So Q9's two-edge
+  `partsupp↔lineitem` pair mis-probes under cost-driven order.
+  - **Tried (committed, flag-gated, INSUFFICIENT):** `attachExtraEdgesLocal` — attach the
+    SECOND edge in LOCAL coords in buildJoinFromDP instead of `attachUnusedCrossEdges`'
+    raw-GLOBAL coords (which only MHJ consumed). Q9 still 0.
+  - **Key negative result:** disabling NLI to force all-hash was inconclusive —
+    `SetNLIEnabled(false)` in init() is OVERRIDDEN by server startup, so the "all-hash"
+    run still built NLIs (plan byte-identical). Need a different lever to test the
+    all-hash hypothesis (e.g. a GUC honoured after startup, or a planner-level gate).
+  - **Assessment:** the single-edge layout remap (65dd185a) that fixed Q8 does NOT close
+    the two-edge case. The residual defect spans the multi-edge pipeline (extra-edge
+    coords through DP → residual → `remapWithBindings` → NLI rebind `nl_index_join.go:470+`).
+    Deeper than one session. Next: (a) add a cost-driven all-hash lever that survives
+    startup to bisect hash-vs-NLI as the culprit; (b) trace the composite probe's actual
+    bound ColumnRef.Index at the partsupp join.
 - 2026-07-22 — **C4 cost-driven pivot IMPLEMENTED + measured — does NOT meet the gate;
   STOP for judgment. All flag-gated (`costDrivenJoinOrder` default OFF, prod
   unaffected).** Commits `f6329a5b` (C4-pg-i cost-driven order + MHJ-drop scaffolding),
