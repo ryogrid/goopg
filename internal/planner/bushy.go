@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"math"
 	"math/bits"
 	"os"
 
@@ -1009,6 +1010,41 @@ func sideKeyDistinct(key Expr, tbl *catalog.Table) int64 {
 	return maxColSaturatedDistinct(tbl)
 }
 
+// satRowsMulDiv returns a*b/d clamped to [1, MaxInt64], computed in
+// float64 so the a*b product cannot overflow int64. Composed-subset
+// cardinalities reach ~1e14 at SF1 scale; an int64 a*b then wraps
+// negative before the divide. float64 keeps ~15 significant digits —
+// ample for a cardinality estimate — and saturates instead of wrapping.
+func satRowsMulDiv(a, b, d int64) int64 {
+	if d < 1 {
+		d = 1
+	}
+	v := float64(a) * float64(b) / float64(d)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	if v < 1 {
+		return 1
+	}
+	return int64(v)
+}
+
+// satCost sums the 3-part integer cost in float64 and clamps to
+// [1, MaxInt64], for the same overflow reason as satRowsMulDiv (the
+// output/build/probe terms can each be ~1e14 at scale).
+func satCost(out, build, probe int64) int64 {
+	v := float64(out)*float64(outputRowWeight) +
+		float64(build)*float64(hashBuildWeight) +
+		float64(probe)*float64(hashProbeWeight)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	if v < 1 {
+		return 1
+	}
+	return int64(v)
+}
+
 func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
@@ -1053,10 +1089,15 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 			}
 		}
 	}
-	outputRows = leftRows * rightRows / ndv
-	if outputRows < 1 {
-		outputRows = 1
-	}
+	// Overflow guard: for deep composed subsets at scale, leftRows and
+	// rightRows can each be ~1e12–1e14, so the int64 product wraps
+	// NEGATIVE before the `/ ndv` divide and the `< 1` clamp then pins it
+	// to 1 — a garbage cardinality that poisons the integer cost, the
+	// build-side decision, AND the cost-driven pgCost (which reads this as
+	// outRows). Compute in float64 (ample range for an estimate) and
+	// saturate at MaxInt64. This is the scale boundary behind Q9's 6M-vs-
+	// 300k behaviour.
+	outputRows = satRowsMulDiv(leftRows, rightRows, ndv)
 	// Build side = smaller, probe side = larger. This is the
 	// same heuristic `buildJoinFromDP` uses to pick BuildLeft;
 	// keeping the cost-side and physical-side decisions in
@@ -1066,12 +1107,7 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	if rightRows < leftRows {
 		buildRows, probeRows = rightRows, leftRows
 	}
-	cost = outputRows*outputRowWeight +
-		buildRows*hashBuildWeight +
-		probeRows*hashProbeWeight
-	if cost < 1 {
-		cost = 1
-	}
+	cost = satCost(outputRows, buildRows, probeRows)
 	// M0076-0004: penalise edges produced from synthesised
 	// (transitively-inferred) conjuncts. Slice D adds these
 	// only via anchored synthesis; the penalty stays as a final
