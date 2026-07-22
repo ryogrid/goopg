@@ -169,6 +169,31 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **Q9=0 ROOT CAUSE FOUND (re-reframe): it IS the NLI composite-probe rebind,
+  NOT scale/executor. Two methodology confounds had hidden it.** The prior "executor scale
+  bug / planner vindicated" reframe was WRONG — built on confounded runs.
+  - **Confound 1 (plan cache):** server-level cache keyed on SQL text + dbOid, invalidated
+    ONLY by DDL. `SET`/ANALYZE don't invalidate. Repeated same-text Q9 runs reused the first
+    cached plan regardless of my flags.
+  - **Confound 2 (`SET enable_nestloop_index=off` inert):** the OnChange→SetNLIEnabled bridge
+    fires only on runtime SET and my cached plans bypassed it; conf-load doesn't fire it
+    either. Reliable switch is env **`GOOPG_DISABLE_NLI=1`** (main.go:294). So EVERY earlier
+    "all-hash gives 0" run was SECRETLY STILL NLI.
+  - **Clean discriminator (env-forced, EXPLAIN-verified, cache-busted), Q9 @ l_orderkey<300000:
+    all-hash = 175 CORRECT; NLI-on = 0 WRONG.** Same query, same scale — only NLI differs.
+    **The bug is the NLI path**, and it reproduces FAST (3.5s) at 300k (not scale-dependent).
+  - **Localised:** NLI 300k EXPLAIN ANALYZE — `lineitem⋈orders`=300588 ✓ → composite
+    `partsupp_pk` NLI (`ps_partkey=l_partkey AND ps_suppkey=l_suppkey`) = **9069** (3% survive,
+    same ratio as 6M's 179197) → part = 0. The composite probe mis-resolves ONE key in the
+    rebind (`nl_index_join.go:470+`); `collectCrossSideEquiKeys`+`pickIndexCovering…` map
+    traces correct, so defect is the per-outer rebind for the composite/bushy-outer case.
+  - **NEXT:** instrument/fix the composite probe-key rebind in tryBuildNLI against the 3.5s
+    NLI-300k repro (`GOOPG_DISABLE_NLI` unset; l_orderkey<300000).
+- 2026-07-23 — **int64 overflow in estimateJoinCost FIXED/LANDED (`9106121e`)** —
+  leftRows*rightRows/ndv wrapped negative for ~1e14 deep subsets → clamp-to-1 garbage
+  cardinality poisoning cost+pgCost. Fixed via float64-saturating satRowsMulDiv/satCost;
+  tpch-spotcheck PASS; regression test. Real bug (found via user's overflow question) but
+  NOT the Q9 cause.
 - 2026-07-23 — **Arena-retention sibling-path fix LANDED (`65965d47`) — real bug, NOT the
   Q9 cause.** `rowHasArena`/`MaterializeArena`/`cloneRowOwned` (internal/executor/datum.go)
   only deep-copied String/Bytes, leaving mctx-backed big-numeric (flagBigNumeric) aliasing
