@@ -137,12 +137,14 @@ func TestBuildJoinFromDPUsesProvidedRows(t *testing.T) {
 	// But the caller-provided dpEntry.rows say left=100, right=100000;
 	// after Slice C the build-side decision must use those — picking
 	// LEFT (100 rows) as the build.
-	join := buildJoinFromDP(leftScan, rightScan, 100, 100000, 0b01, 0b10, edge, g)
+	lLayout := map[int]int{0: 0}
+	rLayout := map[int]int{1: 0}
+	join := buildJoinFromDP(leftScan, rightScan, 100, 100000, 0b01, 0b10, lLayout, rLayout, edge, g)
 	if !join.BuildLeft {
 		t.Error("BuildLeft must be true when caller-provided leftRows < rightRows even though EstimateRows ties")
 	}
 	// Symmetric: when the caller says right is smaller, build right.
-	join2 := buildJoinFromDP(leftScan, rightScan, 100000, 100, 0b01, 0b10, edge, g)
+	join2 := buildJoinFromDP(leftScan, rightScan, 100000, 100, 0b01, 0b10, lLayout, rLayout, edge, g)
 	if join2.BuildLeft {
 		t.Error("BuildLeft must be false when caller-provided rightRows < leftRows")
 	}

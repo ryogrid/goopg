@@ -500,6 +500,21 @@ type dpEntry struct {
 	// `EstimateRows(plan)` re-evaluation).
 	rows int64
 	cost int64
+
+	// layout maps each base-table index (0..nodes-1) to the column
+	// offset at which that table's columns begin within THIS entry's
+	// plan.Output(). A singleton {i} is {i:0}; a composed subset is
+	// leftLayout ∪ {t: rightLayout[t] + leftWidth}. buildJoinFromDP
+	// uses it to remap a join key to its REAL position in a child
+	// plan whose schema is `leftSchema ++ rightSchema` — which is NOT
+	// ascending table order for bushy compositions (enumerateSplits
+	// assigns arbitrary subsets to left/right). The old ascending
+	// assumption mis-resolved keys for non-ascending subsets (TPC-H
+	// Q8 → 0 rows under cost-driven order; see cost-model
+	// IMPLEMENTATION-TODO). For ascending subsets layout[t] equals the
+	// old prefix-sum, so behaviour is unchanged for every plan the
+	// integer DP produces today.
+	layout map[int]int
 }
 
 func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
@@ -540,7 +555,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 
 	for i := 0; i < g.nodes; i++ {
 		mask := uint16(1 << i)
-		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i]}
+		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i], layout: map[int]int{i: 0}}
 	}
 
 	for size := 2; size <= g.nodes; size++ {
@@ -579,8 +594,9 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				// (the two diverge once the build term enters).
 				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
 				if best == nil || cost < best.cost {
-					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, edge, g)
-					best = &dpEntry{plan: join, rows: outRows, cost: cost}
+					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
+					mergedLayout := mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout}
 					bestEdgeIdx = edgeIdx
 				}
 			})
@@ -848,7 +864,7 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	return outputRows, cost
 }
 
-func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
+func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, leftLayout, rightLayout map[int]int, edge *joinEdge, g *joinGraph) *Join {
 	// Determine which edge key belongs to which subset BEFORE
 	// remapping.  The edge stores {leftTable, rightTable} in
 	// FROM-clause order, but the DP may have assigned those
@@ -860,8 +876,14 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		// leftTable is in subset b → leftKey belongs to b
 		lk, rk = edge.rightKey, edge.leftKey
 	}
-	leftKey := remapKeyToSubset(lk, a, g)
-	rightKey := remapKeyToSubset(rk, b, g)
+	// Remap each key to its REAL position within the child plan using
+	// that child's actual table→offset layout, not an ascending-order
+	// assumption: a bushy child schema is `leftSchema ++ rightSchema`
+	// over arbitrary subsets, so a table's columns need not sit at
+	// their ascending prefix-sum. (Fixes the Q8=0-rows cost-driven
+	// remap bug; see dpEntry.layout.)
+	leftKey := remapKeyToLayout(lk, leftLayout, g)
+	rightKey := remapKeyToLayout(rk, rightLayout, g)
 
 	leftSchema := leftPlan.Output()
 	rightSchema := rightPlan.Output()
@@ -919,25 +941,41 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 	}
 }
 
-// remapKeyToSubset adjusts ColumnRef indices from the global merged
-// schema to the per-subset local schema.
-func remapKeyToSubset(key Expr, subset uint16, g *joinGraph) Expr {
+// mergeSubsetLayouts composes the table→offset layouts of a join's two
+// children into the parent's layout. The runtime schema is
+// `leftSchema ++ rightSchema`, so left-side tables keep their offsets
+// and every right-side table shifts by leftWidth (= len(leftPlan.Output())).
+func mergeSubsetLayouts(leftLayout, rightLayout map[int]int, leftWidth int) map[int]int {
+	merged := make(map[int]int, len(leftLayout)+len(rightLayout))
+	for t, off := range leftLayout {
+		merged[t] = off
+	}
+	for t, off := range rightLayout {
+		merged[t] = off + leftWidth
+	}
+	return merged
+}
+
+// remapKeyToLayout adjusts a ColumnRef index from the global
+// (FROM-order concatenation) coordinate space to a child plan's LOCAL
+// schema, using that plan's actual table→offset layout. The global
+// index identifies a base table t and a within-table offset via the
+// g.scanWidth prefix sums; the local index is layout[t] + that
+// within-table offset. Unlike the old ascending-order assumption this
+// is correct for bushy child schemas (`leftSchema ++ rightSchema` over
+// arbitrary subsets). For an ascending subset layout[t] equals the old
+// prefix-sum, so the result is identical to the prior behaviour.
+func remapKeyToLayout(key Expr, layout map[int]int, g *joinGraph) Expr {
 	if col, ok := key.(*ColumnRef); ok {
 		cl := *col
-		offset := int32(0)
+		offset := 0
 		for i := 0; i < g.nodes; i++ {
-			w := int32(g.scanWidth[i])
-			if subset&(1<<i) != 0 {
-				if cl.Index >= int(offset) && cl.Index < int(offset+w) {
-					newOff := int32(0)
-					for j := 0; j < i; j++ {
-						if subset&(1<<j) != 0 {
-							newOff += int32(g.scanWidth[j])
-						}
-					}
-					cl.Index = int(newOff + (int32(cl.Index) - offset))
-					return &cl
+			w := g.scanWidth[i]
+			if cl.Index >= offset && cl.Index < offset+w {
+				if localBase, ok := layout[i]; ok {
+					cl.Index = localBase + (cl.Index - offset)
 				}
+				return &cl
 			}
 			offset += w
 		}
