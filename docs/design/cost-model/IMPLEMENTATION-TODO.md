@@ -169,6 +169,15 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **Arena-retention sibling-path fix LANDED (`65965d47`) — real bug, NOT the
+  Q9 cause.** `rowHasArena`/`MaterializeArena`/`cloneRowOwned` (internal/executor/datum.go)
+  only deep-copied String/Bytes, leaving mctx-backed big-numeric (flagBigNumeric) aliasing
+  a resettable producer arena → silent corruption on large builds. Fixed all three (trigger
+  on any ArenaID≠0; big-numeric re-stored in `mctx.Perm()`; cloneRowOwned routes through
+  MaterializeArena). `TestBigNumericArenaSurvivesReset` FAILS-before/PASSES-after; executor
+  suite green; **tpch-spotcheck PASS (Q12=2, Q13=33)**. **Re-tested Q9: still 0** — confirms
+  Q9's keys are fast-path integers, so this gap is not implicated. Q9=0 remains an open
+  scale bug (next: full-scale build/probe match-count instrumentation, option (a)).
 - 2026-07-23 — **C4 Q9=0 MAJOR REFRAME: it is an EXECUTOR scale bug, NOT a planner/coordinate
   bug. The cost-driven planner is VINDICATED.** Deep bisection under verified-fresh stats:
   - **Bug is real, not a stats artifact:** verified all 8 tables' stats loaded (o_orderkey
