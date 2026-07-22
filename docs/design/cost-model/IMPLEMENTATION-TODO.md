@@ -81,12 +81,21 @@ correct-by-definition). NLI construction stays SOLELY in `rewriteJoinsToNLI` (it
 proven coordinate logic; reimplementing caused the reverted Q9 "1 row not 7" bug);
 the DP only *costs* a join as NLI by delegating to `tryBuildNLI` (same predicate,
 no desync). Staged:
-- [ ] **C4-pg-i** Drop MHJ for cost-driven plans (skip `rewriteMultiWayChain`,
-  planner.go:988), restore the binary-hash-cost DP switch, keep `rewriteJoinsToNLI`
-  + scan-input rewrite. Measure Q9/Q8/Q5 on SF1. Open question: does removing MHJ
-  mis-composition alone fix Q9?
-- [ ] **C4-pg-ii** (only if C4-pg-i still mis-ranks) Delegated NLI costing: DP costs
-  each candidate as its actual method via `tryBuildNLI` on a clone (ch12 §4).
+- [x] **C4-pg-i** Drop MHJ (skip `rewriteMultiWayChain` via `mhjPackingEnabled`,
+  planner.go:988) + binary-hash-cost DP switch. **MEASURED SF1 (serial, stats):**
+  Q5 4.9s ✓, Q8 21.9s ✓ (from 200s), Q2 68.5s (unchanged), **Q9 >200s ✗**.
+  Answer to the open question: **NO — MHJ-drop alone does not fix Q9.** Q9's plan is
+  correctly PG-*shaped* (binary tree, index-NL probes on partsupp/orders/nation) but
+  *slow*: the binary-hash-cost DP hash-joins lineitem first (~6M rows) then NL-probes
+  partsupp AND orders across 6M each — the DP costs everything as hash and cannot see
+  the NL-probe cost, so it orders badly. (WIP stashed, not landed — Q9 regression.)
+- [ ] **C4-pg-ii** *(now required)* Delegated NLI costing: in the DP, cost each
+  candidate join as its ACTUAL method by consulting `tryBuildNLI` on a clone (ch12
+  §4) — construction stays in `rewriteJoinsToNLI`. This gives the DP the NL-probe
+  cost so it orders the binary tree PG-like (filter/drive to minimise the 6M-row
+  intermediate). Then re-measure Q9 (+ full set). NOTE: goopg's MHJ is genuinely
+  faster than the binary tree for Q9 (user accepted "not fastest"); the bar is that
+  the PG-shaped tree is *fast* (like PG's Q9), not that it beats MHJ.
 - [ ] **C4-pg-iii** Gate: 5 regressions recover, Q9 not regressed, Q5 held (SF1);
   `pg-oracle-diff` shape parity. Q4 (semi-join method) tracked separately (ch12 §6).
 - ~~old C4a/C4b (MHJ-in-DP)~~ superseded by the pivot. Binary-hash DP switch stashed
