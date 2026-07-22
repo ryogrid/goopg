@@ -24,9 +24,16 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   `addPath` needs the pathkey axis; C1 adds the produce/consume wiring. Pure
   library, no integration. Gate: units PASS (`path_test.go`, 13 tests), vet clean,
   full planner suite green.
-- [ ] **C0.2** `internal/planner/createplan.go`: `createPlan(path) Node`; wire at
-  the `tryBushyDP` seam so the DP's chosen order round-trips through a (prebuilt)
-  Path. Gate: **plan-gate zero diffs** vs `costmodel-c0-baseline`.
+- [x] **C0.2** `internal/planner/createplan.go`: `createPlan(path) Node` +
+  `createPlanFromDPChoice`, wired at `bushy.go:207` (the `tryBushyDP` seam). In C0
+  it is a proven **identity** (`createPlan(PathPrebuilt)` returns the same Node
+  pointer), so plans are pointer-identical — a stronger guarantee than byte-
+  identical EXPLAIN. Captured the warm (ANALYZE'd) reference
+  `plan_snapshots/costmodel-c0-baseline.txt` (22 queries, stats-driven + parallel
+  plans) for the C1–C3 gates. Gate: full planner suite green (incl. all
+  bushy/joinorder/tpch plan-shape tests) + 3 createplan unit tests; live
+  `make plan-gate` deferred to C4 where plans first change (C0.2 cannot change a
+  plan by construction).
 
 ## C1 — Pathkeys (minimal)
 - [ ] **C1.1** `pathkeys.go`: `PathKey`, `pathkeysContainedIn`; fold the pathkey
@@ -67,5 +74,6 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green
+- 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green
+- 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green — `4fee8d87`
 - 2026-07-22 — C0.0 — doc reconciliation (ch09 plan-gate) + TODO tracker created — `2dc44de8`

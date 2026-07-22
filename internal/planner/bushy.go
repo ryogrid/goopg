@@ -205,6 +205,11 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	if len(locals.byBinding) > 0 {
 		bushyPlan = attachRelationLocalFilters(bushyPlan, locals, scans, ctx.bindings)
 	}
+	// Cost-model C0.2 (design ch. 03 §3): route the DP's chosen join subtree
+	// through create_plan. Today this is an identity transform (the subtree is
+	// carried whole in a PathPrebuilt); from C4 the *cost-selected* path flows
+	// through this same seam instead of the integer DP's hand-built tree.
+	bushyPlan = createPlanFromDPChoice(bushyPlan)
 	if len(residual) == 0 {
 		// All conjuncts consumed — Filter is unnecessary.
 		return bushyPlan, nil
