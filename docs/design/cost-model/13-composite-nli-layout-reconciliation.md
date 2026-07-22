@@ -86,6 +86,29 @@ the outer's `Output()` schema coordinate space, but the NLI executor reads the
 outer tuple in a different (pre-rewrite / runtime) coordinate space, and the two
 diverge once a sub-query scope reorders the runtime layout.*
 
+### 2.1 CORRECTION (measured 2026-07-23): the divergence is in the NLI *output*, not the probe
+
+Declining the composite `partsupp` NLI (moving it to a hash join) did **not** fix
+Q9 — the composite `partsupp` **Hash Join** *also* drops to 9 069. The reason: its
+OUTER subtree still contains OTHER NLIs (`orders_pk`, `supplier`, `lineitem`
+index scans), and **an NLI emits a runtime tuple whose column order diverges from
+its OID-sorted `Output()` schema** (the exact tension `nl_index_join.go:481-489`
+documents). So *any* downstream join — hash or NLI — that binds its keys to that
+schema reads the wrong runtime columns. This is why:
+
+- **all-hash** Q9 (no NLIs anywhere) = 175 ✓ (no divergent producer),
+- **any-NLI-in-the-plan** Q9 = 0 ✗ (the NLI subtree feeds a downstream join),
+- yet a **flat** 6-table query with the same NLIs = 16 216 ✓ — so the divergence
+  is triggered specifically by the **derived-table (IsolatedScope) scope**, where
+  `remapWithBindings` reorders the NLI subtree's runtime layout differently than in
+  a flat query.
+
+**Revised one-line bug:** *inside a derived-table scope, an NLI subtree's runtime
+tuple order diverges from its `Output()` schema, so every downstream join that
+binds keys to that schema (hash or NLI) reads the wrong columns.* The composite
+probe is just the first visible symptom, not the cause. A composite-NLI-only
+decline (§4 Phase 1, first attempt) is therefore INSUFFICIENT and was reverted.
+
 ## 3. Why prior attempts failed (constraints on the fix)
 
 - `M0067-0003` (composite-NLI hoist) — reverted: moved the conjunct correctly but
@@ -112,31 +135,35 @@ whether `remapWithBindings` altered the outer's runtime layout vs its schema.
 Deliverable: a one-paragraph confirmation of *which* pass reorders the runtime and
 *which* coordinate space the executor actually uses. This pins the fix target.
 
-### Phase 1 — Correctness safety net: decline the unreconcilable composite NLI
+### Phase 1 — Correctness safety net: decline NLI inside an IsolatedScope (REVISED)
 
-**Goal: Q9 correct immediately, zero risk to working plans.** Extend the existing
-decline (`nl_index_join.go:466`, which already refuses NLI for a direct
-`IsolatedScope` `Project` outer) to also refuse the **composite** (`len(keys) > 1`)
-NLI when the outer is a multi-relation subtree whose runtime layout cannot be
-guaranteed to match its schema — concretely, when the NLI is being built **inside
-an `IsolatedScope`** (sub-query) and the outer is a `*Join` / `*NestedLoopIndexJoin`
-rather than a base scan.
+The first attempt (decline only the *composite* NLI) was **insufficient** (§2.1):
+the divergence is produced by ANY NLI in the sub-query scope, not the composite
+join. **Revised safety net: decline NLI *conversion* for any join built inside an
+`IsolatedScope` (derived-table / sub-query) scope**, so the whole sub-query plans
+all-hash (measured correct: flat all-hash = 16 216, Q9 = 175).
 
-- Correct because the hash join over the same predicate is order-agnostic
-  (all-hash Q9 = 175 ✓).
-- Bounded because it only affects composite NLIs with a multi-relation outer in a
-  sub-query scope — single-key NLIs and flat composite NLIs (2–6 tables, all
-  measured correct) are untouched.
-- The cost is that these specific joins run as hash instead of NL-index (a
-  performance trade, not a correctness one) until Phase 2.
+- Requires threading an `inIsolatedScope` flag through `walkRewriteNLI` (set when
+  recursing through a `*Project{IsolatedScope:true}`), and returning early from
+  `tryBuildNLI` when set. Bounded, local, revertible.
+- Correct because hash is order-agnostic; the sub-query's NLIs become hash joins,
+  removing the divergent producers.
+- Trade-off: derived-table sub-queries lose NL-index acceleration until Phase 2.
+  Verify this does not regress Q2/Q7/Q11/Q15/Q17/Q18/Q20/Q22 row counts (they use
+  sub-queries) — correctness must hold; some may slow.
 
-Gate: Q9 → 175; `tpch-spotcheck` PASS; all 22 row counts unchanged vs all-hash.
+Gate: Q9 → 175; `tpch-spotcheck` PASS; all 22 row counts equal the all-hash
+reference on SF1 (no silent regression); each query completes under timeout.
 
 ### Phase 2 — The real reconciliation (performance recovery)
 
-Bind the composite probe keys in the **same coordinate space the NLI executor
-actually reads** — the pre-rewrite / runtime layout the single-key path already
-uses successfully — instead of the `Output()` schema space. Concretely, one of:
+Given §2.1, the reconciliation is broader than the probe keys: **an NLI's runtime
+output must match its `Output()` schema** so downstream joins (which bind to that
+schema) read the right columns. The fix must make `remapWithBindings` (and the NLI
+executor) agree on ONE layout for an NLI subtree's output — either by keeping the
+NLI runtime in the OID-sorted order its schema advertises, or by not OID-reordering
+NLI subtree schemas in the first place. Only then can probe keys (and downstream
+hash keys) be bound reliably. Concretely, one of:
 
 1. **Late binding:** defer composite-key index assignment until *after*
    `remapWithBindings`, resolving against a runtime-truthful layout descriptor
