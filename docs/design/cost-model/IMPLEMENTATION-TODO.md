@@ -169,6 +169,34 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **C4 Q9=0 MAJOR REFRAME: it is an EXECUTOR scale bug, NOT a planner/coordinate
+  bug. The cost-driven planner is VINDICATED.** Deep bisection under verified-fresh stats:
+  - **Bug is real, not a stats artifact:** verified all 8 tables' stats loaded (o_orderkey
+    n_distinct=-1 etc.); under identical cost-driven conditions Q12=2✓, Q13=33✓, Q9=0✗.
+    So it is Q9-specific, not a broad cost-driven or stats failure.
+  - **Planner is CORRECT:** dumped every DP + final-tree join predicate AND hash key
+    (lkey/rkey) with index→schema-name — ALL coordinate-correct, including the two-edge
+    partsupp join (`ps_suppkey[idx1]=l_suppkey[idx18] AND ps_partkey[idx0]=l_partkey[idx21]`),
+    stable through `remapWithBindings`. Earlier "coordinate-remap" hypothesis REFUTED.
+  - **Executor paths verified correct:** padded hash-key extraction (buildHashRight pads
+    keyRow to full width so joined-coord index works), residual `joinPredicateMatch`
+    evaluated, left++right composition (eager concatRows + lazy VirtualSlot) all correct.
+  - **Ruled out spill:** no-spill (`SET work_mem='8GB'`) full-scale run STILL returns 0
+    (and faster, 76s vs 163s — confirming no spill), so it is not the spill path.
+  - **SCALE-DEPENDENT (the key clue):** `l_orderkey < 300000` → Q9 returns **175 rows
+    CORRECT** (partsupp join preserves 300588 rows); full 6M scale → **0**. Same query
+    family, correct small / wrong large. Full-scale EXPLAIN ANALYZE > 280s so per-node
+    actual-rows at 6M not yet captured.
+  - **Latent sibling-path bug FOUND (worth fixing regardless, likely NOT the Q9 cause):**
+    `MaterializeArena` / `rowHasArena` / `cloneRowOwned` (internal/executor/datum.go) only
+    deep-copy `KindString`/`KindBytes` — they MISS other mctx-backed kinds (big-numeric
+    `flagBigNumeric`, interval). At scale, arena resets corrupt shallow-copied missed-kind
+    Datums. BUT Q9's join keys are small integers (fast-path numeric, ArenaID=0), so this
+    probably doesn't corrupt the keys → flagged honestly as not-yet-the-proven-cause.
+  - **NEXT:** targeted executor instrumentation at full scale — log build/probe key counts
+    and per-bucket match counts during the 6M partsupp build to catch where matches vanish;
+    and fix the datum.go sibling-path arena gap (extend all three to every ArenaID≠0 kind).
+    All diagnostic debug code reverted; tree clean at HEAD.
 - 2026-07-22 — **C4 Q9=0 correctness — investigated, NOT yet fixed (correctness-first per
   user).** EXPLAIN ANALYZE (serial) localises the drop: `lineitem(6M) ⋈ orders_pk` =
   6M ✓, then `⋈ partsupp_pk` COMPOSITE (`ps_partkey=l_partkey AND ps_suppkey=l_suppkey`)
