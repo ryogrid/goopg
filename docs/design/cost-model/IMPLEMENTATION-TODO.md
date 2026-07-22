@@ -45,10 +45,14 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   helper. Plan-preserving (no live consumer yet). Gate: units PASS, suite green.
 
 ## C2 — Estimation inputs
-- [ ] **C2.1** `RelOptInfo.Rows` via `set_baserel_size_estimates` analogue; tuple
-  width estimator. Gate: rows-invariant (plan-gate zero diffs).
-- [ ] **C2.2** `estimate_rel_size` row fallback off `smgr.NBlocks`. Gate: cold-start
-  test (baseRows returns block estimate, not 0).
+- [x] **C2.1/C2.2** `internal/planner/relsize.go`: `baseRelRows`
+  (`set_baserel_size_estimates` analogue), `tupleWidth`/`typeWidth` (type-derived
+  width, needs no stats), and `estimateRelSizeRows` (the `estimate_rel_size`
+  density fallback off a live block count). Pure helpers — no live caller yet
+  (wired at C3/C4), so plan-preserving by construction. Gate: 4 unit tests
+  including the **cold-start headline** (`baseRelRows(0, blocks, width) > 0` — a
+  block estimate, not 0 — while a warm RowCount wins); suite green. Live wiring +
+  the block-count source (`smgr.NBlocks` via `BlocksForTable`) plug in at C3.
 
 ## C3 — Cost functions + path generation
 - [ ] **C3.1** `cost_funcs.go`: per-node PG-unit cost functions reading config GUCs;
@@ -79,7 +83,8 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green
+- 2026-07-22 — C2.1/C2.2 — relsize.go: baseRelRows + width estimator + estimate_rel_size fallback; cold-start test PASS; plan-preserving
+- 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green — `b4770527`
 - 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green — `b44998b5`
 - 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green — `4fee8d87`
 - 2026-07-22 — C0.0 — doc reconciliation (ch09 plan-gate) + TODO tracker created — `2dc44de8`
