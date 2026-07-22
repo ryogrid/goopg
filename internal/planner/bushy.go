@@ -681,6 +681,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 			}
 			var best *dpEntry
 			var bestEdgeIdx int
+			var bestA, bestB uint16
 			bestEdgeIdx = -1
 			enumerateSplits(mask, func(a, b uint16) {
 				if !isConnectedMask(a, g) || !isConnectedMask(b, g) {
@@ -734,11 +735,29 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 					}
 					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout, pgCost: pgCost}
 					bestEdgeIdx = edgeIdx
+					bestA, bestB = a, b
 				}
 			})
 			if best != nil {
 				dp[mask] = *best
-				if bestEdgeIdx >= 0 {
+				if costDrivenJoinOrder {
+					// Cost-driven buildJoinFromDP attached EVERY cross-edge
+					// between bestA and bestB onto the join in local coords
+					// (attachExtraEdgesLocal), so mark them all consumed —
+					// none should survive as a residual or be re-attached in
+					// global coords by attachUnusedCrossEdges (which the
+					// composite NLI cannot localise; the Q9=0 cause).
+					for i := range g.edges {
+						e := &g.edges[i]
+						la := bestA&(1<<e.leftTable) != 0
+						ra := bestA&(1<<e.rightTable) != 0
+						lb := bestB&(1<<e.leftTable) != 0
+						rb := bestB&(1<<e.rightTable) != 0
+						if (la && rb) || (ra && lb) {
+							edgeUsed[i] = true
+						}
+					}
+				} else if bestEdgeIdx >= 0 {
 					// Mark only the SPECIFIC edge picked at this
 					// DP step. Internal edges of the two subsets
 					// were marked when their dp[] entries were
@@ -1130,7 +1149,7 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		rightKey = &cl
 	}
 
-	return &Join{
+	j := &Join{
 		pos:       0,
 		Type:      JoinTypeInner,
 		Algo:      JoinAlgoHash,
@@ -1141,6 +1160,60 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		RightKey:  rightKey,
 		BuildLeft: buildLeft,
 		schema:    mergedSchema,
+	}
+
+	// Cost-model C4: when two subsets are connected by MORE than one
+	// equality (TPC-H Q9's partsupp↔lineitem: ps_suppkey=l_suppkey AND
+	// ps_partkey=l_partkey), the DP wires ONE as the canonical
+	// LeftKey/RightKey; the rest must also be enforced on this join.
+	// The non-cost-driven planner defers them to attachUnusedCrossEdges
+	// (raw GLOBAL coords, consumed by MultiHashJoin). With MHJ dropped
+	// (cost-driven), no consumer localises those global coords and the
+	// composite NLI probes a wrong column → drops rows (Q9=0). So here,
+	// where the layouts are known, AND each extra edge onto the
+	// Predicate in the SAME LOCAL coordinates as the canonical key.
+	if costDrivenJoinOrder {
+		attachExtraEdgesLocal(j, a, b, leftLayout, rightLayout, len(leftSchema), edge, g)
+	}
+
+	return j
+}
+
+// attachExtraEdgesLocal ANDs every cross-edge between subsets a and b
+// (other than the canonical `skip` edge, already the join's key) onto
+// j.Predicate, remapping each side's key to the join's local schema —
+// a-side into leftLayout, b-side into rightLayout shifted by leftWidth,
+// exactly as the canonical key is remapped. This keeps a multi-equality
+// join (Q9) fully local-coordinate so the downstream NLI/hash consumer
+// resolves both probe columns correctly.
+func attachExtraEdgesLocal(j *Join, a, b uint16, leftLayout, rightLayout map[int]int, leftWidth int, skip *joinEdge, g *joinGraph) {
+	for i := range g.edges {
+		e := &g.edges[i]
+		if e == skip {
+			continue
+		}
+		la := a&(1<<e.leftTable) != 0
+		ra := a&(1<<e.rightTable) != 0
+		lb := b&(1<<e.leftTable) != 0
+		rb := b&(1<<e.rightTable) != 0
+		// The edge must cross a↔b (one endpoint in each subset).
+		if !((la && rb) || (ra && lb)) {
+			continue
+		}
+		// Orient so ak belongs to subset a, bk to subset b.
+		ak, bk := e.leftKey, e.rightKey
+		if !la {
+			ak, bk = e.rightKey, e.leftKey
+		}
+		aKey := remapKeyToLayout(ak, leftLayout, g)
+		bKey := remapKeyToLayout(bk, rightLayout, g)
+		if cr, ok := bKey.(*ColumnRef); ok {
+			cl := *cr
+			cl.Index += leftWidth
+			bKey = &cl
+		}
+		extra := &BinaryOp{pos: 0, Op: parser.OpEq, Left: aKey, Right: bKey}
+		j.Predicate = &BinaryOp{pos: 0, Op: parser.OpAnd, Left: j.Predicate, Right: extra}
 	}
 }
 
