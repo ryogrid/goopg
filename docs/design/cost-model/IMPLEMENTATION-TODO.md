@@ -169,6 +169,31 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **Q9=0 = the KNOWN-DEFERRED composite-NLI schema-vs-runtime-layout bug
+  (M0067-0003 → M0068), independently rediscovered + precisely characterized + minimal
+  repro.** `nl_index_join.go:142-150` already documents it: the composite `partsupp_pk`
+  NLI's rebind hits a "schema-annotation-vs-runtime-layout mismatch ... picked the wrong
+  runtime slot" (was "Q9 1 row not 7"). So it is a PRE-EXISTING latent NLI bug, NOT
+  introduced by the cost-model work — the cost-driven plan shape + Q9's derived-table
+  structure merely EXPOSE it.
+  - **Planner binding is CORRECT** (GOOPG_NLI_DEBUG dump: composite keys resolve
+    ps_partkey→l_partkey, ps_suppkey→l_suppkey, idx→schema-name "ok"). The defect is the
+    OUTER's RUNTIME layout diverging from its `Output()` schema, so the "correct" indices
+    read wrong runtime values → composite probe matches ~3% (9069/300588; 179197/6M).
+  - **Isolation (all at l_orderkey<300000, NLI on):** composite NLI is CORRECT for FLAT
+    outers of 2/3/4/5/6 tables (all 300588; 6t+green = 16216 ✓). It breaks ONLY inside a
+    **derived-table (subquery) scope**: `SELECT count(*) FROM (SELECT * FROM <6 tables>
+    WHERE … l_orderkey<300000) x` = **0** vs the flat `SELECT count(*) FROM <same 6 tables>`
+    = 16216. Not column-pruning (SELECT * also 0). The subquery wrapper (IsolatedScope) is
+    the trigger; the existing decline (`nl_index_join.go:466`) only catches a DIRECT Project
+    outer, not a Join subtree inside the scope.
+  - **MINIMAL FAST REPRO (~1–3s):** cost-driven, NLI on, the `SELECT count(*) FROM (SELECT *
+    FROM part,supplier,lineitem,partsupp,orders,nation WHERE <6 eq-joins> AND p_name LIKE
+    '%green%' AND l_orderkey<300000) x` → 0 (correct 16216).
+  - **FIX DIRECTION:** the real fix is the deferred "schema/layout reconciliation" (M0068,
+    hard — prior full rebind attempt HUNG, M0072-0002, per practice card). Safer bounded
+    option: DECLINE the composite NLI when its outer is a multi-relation subtree inside an
+    IsolatedScope (extend the :466 decline), forcing the correct hash join. TBD with user.
 - 2026-07-23 — **Q9=0 ROOT CAUSE FOUND (re-reframe): it IS the NLI composite-probe rebind,
   NOT scale/executor. Two methodology confounds had hidden it.** The prior "executor scale
   bug / planner vindicated" reframe was WRONG — built on confounded runs.
