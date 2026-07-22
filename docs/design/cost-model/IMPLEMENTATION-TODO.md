@@ -169,6 +169,37 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-22 — **C4-pg-ii Q8=0 ROOT CAUSE (EXPLAIN ANALYZE, SF1 stats-on)** — Reproduced
+  under the stashed C4-pg-ii files. `EXPLAIN ANALYZE` Q8 completes in **3.9 s but
+  returns 0 rows**. The drop is localised precisely: the subtree
+  `nation n1 ⋈ customer ⋈ orders ⋈ lineitem ⋈ supplier` produces **246 553 rows**
+  (healthy), then the LATE `Hash Join (INNER)` that joins it to
+  `Seq Scan on region (r_name='AMERICA')` yields **0 rows**. `region` itself shows
+  actual rows=5 (all regions — the `AMERICA` filter appears not to narrow at the join
+  level), consistent with mis-resolved column indices for that late join. **Diagnosis:
+  a bushy join-key column-index remapping defect in `buildJoinFromDP` — the
+  cost-driven DP selects a bushy ORDER (region joined last, over a wide composed row)
+  whose key indices for `r_regionkey = n1.n_regionkey` point at the wrong columns of
+  the composed subtree, so the equality matches nothing.** The old integer-DP argmin
+  never chose this order, so the latent remap bug stayed hidden. Same
+  schema-layout-vs-annotation fragility class as the reverted Q9 NLI hoist
+  (`nl_index_join.go:142-150`). **Implication: correct bushy join-key remapping for
+  ARBITRARY orders is a correctness PREREQUISITE for any cost-driven reordering,
+  independent of costing.** Clean HEAD restored; C4-pg-ii kept in `git stash`.
+- 2026-07-22 — **Cardinality fix (NDistinctFrac) — NOT landable standalone (SF1
+  measured)** — Tested both forms: (a) crude table-max `maxAccurateDistinct` and
+  (b) correct join-key `accurateKeyDistinct` (resolves `edge.leftKey/rightKey` →
+  `NDistinctFrac × RowCount`, saturated-max fallback for unresolvable keys; all
+  planner unit tests green). BOTH change 16/22 TPC-H plan shapes vs c0-baseline.
+  Timing (correct form vs clean HEAD, stats-on): Q2 57.6s≈57.1s, Q3 9.1s≈9.0s,
+  Q4 timeout≈timeout, **Q5 8.3s→11.8s (+42% WORSE)**. It does NOT fix the pre-existing
+  Round-4 slow queries (Q2/Q4/Q8 already slow/timeout at HEAD) and regresses Q5.
+  **Root cause: the integer DP's cost weights (`output + build*4 + probe`) are
+  implicitly calibrated to the SATURATED-NDistinct regime; feeding accurate
+  cardinality without real PG-unit costs (C4) unbalances join-order selection.** The
+  fix is correct in isolation but only pays off INSIDE the Path cost model — it
+  belongs in C4, not standalone. Correct-form patch kept in `git stash` (stash@{0})
+  for when C4 resumes. Reinforces ch05 §5 + ch07 thesis.
 - 2026-07-22 — C4a-i — NLI/MHJ cost + path-gen primitives (indexProbeCost, multiHashJoinCost, generateNLIPath, generateMultiHashJoinPath) + size helpers; pure/plan-preserving; Q9-lesson test PASS
 - 2026-07-22 — C4 attempt (binary-hash-only, STASHED not landed) — SF1 serial+stats: recovered Q8 200→21s, Q5 18→5s; but REGRESSED Q9 27→>250s (post-DP MHJ/NLI mismatch). Q2/Q4/Q12/Q22 unrecovered (their causes are outside the DP: semi-join method, MHJ, build-side). Full-fidelity DP (MHJ/NLI-aware) chosen; see ch07 §4.5. C0-baseline + costmodel-c4 snapshots + sf1-r4-w0-serial are the references.
 - 2026-07-22 — C3.2 — pathgen.go: scan (serial+partial) + hash-join (both orientations) generation primitives + 4 tests; plan-preserving — `d92d10a9`
