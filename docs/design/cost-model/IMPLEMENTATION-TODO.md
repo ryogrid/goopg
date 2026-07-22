@@ -89,13 +89,28 @@ no desync). Staged:
   *slow*: the binary-hash-cost DP hash-joins lineitem first (~6M rows) then NL-probes
   partsupp AND orders across 6M each — the DP costs everything as hash and cannot see
   the NL-probe cost, so it orders badly. (WIP stashed, not landed — Q9 regression.)
-- [ ] **C4-pg-ii** *(now required)* Delegated NLI costing: in the DP, cost each
-  candidate join as its ACTUAL method by consulting `tryBuildNLI` on a clone (ch12
-  §4) — construction stays in `rewriteJoinsToNLI`. This gives the DP the NL-probe
-  cost so it orders the binary tree PG-like (filter/drive to minimise the 6M-row
-  intermediate). Then re-measure Q9 (+ full set). NOTE: goopg's MHJ is genuinely
-  faster than the binary tree for Q9 (user accepted "not fastest"); the bar is that
-  the PG-shaped tree is *fast* (like PG's Q9), not that it beats MHJ.
+- [~] **C4-pg-ii** Delegated NLI costing (consult `tryBuildNLI` on a clone in the
+  DP) — **ATTEMPTED, produces incorrect + slow plans; WIP stashed.** SF1 (serial,
+  stats): **Q5 >200s** (was 4.9s) AND **Q8 = 0 rows (WRONG — should be 2)**. The
+  cost-driven method/order choice interacts badly with the actual `rewriteJoinsToNLI`
+  conversion — a **correctness** regression, not just speed. Two deep blockers
+  surfaced:
+  - **Cardinality quality (root cause, partially fixed).** `estimateJoinCost`
+    (`bushy.go:863`) divided by the SATURATED `NDistinct` (~30000 sample cap), so
+    `lineitem⋈orders` estimated **303M rows vs the true ~6M** (50× off). Fixed in the
+    WIP via `maxAccurateDistinct` (uses `NDistinctFrac × RowCount`, the accurate
+    unsaturated fraction — ch05 §5). This fix is **genuine and salvageable
+    independent of the cost model** — it addresses a real estimator gap. But it did
+    not by itself make the delegated-NLI plans correct or fast.
+  - **Correctness of cost-driven method selection.** The DP choosing NL-index for a
+    join whose conversion then yields wrong rows (Q8=0) means the delegated approach
+    needs to guarantee the chosen method both converts AND is semantically correct
+    in the final tree — deeper than costing. Needs careful debugging.
+  **Status:** the ch12 pivot (PG-style enumeration, drop MHJ) is architecturally
+  sound and Q8/Q5 were correct+recovered under C4-pg-i (MHJ-drop only). The
+  delegated NLI costing on top is where correctness broke. Next: (a) land the
+  cardinality fix standalone; (b) debug the Q8 correctness regression before any
+  further cost-driven method selection.
 - [ ] **C4-pg-iii** Gate: 5 regressions recover, Q9 not regressed, Q5 held (SF1);
   `pg-oracle-diff` shape parity. Q4 (semi-join method) tracked separately (ch12 §6).
 - ~~old C4a/C4b (MHJ-in-DP)~~ superseded by the pivot. Binary-hash DP switch stashed
