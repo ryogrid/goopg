@@ -70,13 +70,27 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   DP-traversal wiring and merge/nestloop/MHJ generation land with C4 (where
   selection switches). Plan-preserving. Gate: units PASS, suite green.
 
-## C4 — Full-fidelity cost-driven join order *(first behavior change)*
-**Revised after the C4 binary-only attempt (see log + ch07 §4.5).** A binary-hash-
-only order switch is UNSAFE: it recovered Q8 (200→21s) + Q5 (18→5s) but regressed
-Q9 (27→>250s) because goopg packs MHJ and converts NL-index AFTER the DP, so
-binary-hash cost ≠ real execution. The DP must cost the actual execution shape.
-Direction chosen by user: **full-fidelity DP (MHJ/NLI-aware)**. The binary-only
-attempt is stashed (`git stash list`: "C4 cost-driven join order (binary-hash…)").
+## C4 — PG-style join-path enumeration *(pivoted; see [ch12](12-pg-style-join-path-enumeration.md))*
+**Pivot (user-directed, agent-reviewed).** The "full-fidelity DP with MHJ-in-the-DP"
+direction was reconsidered: PG plans TPC-H well because it decides order+method
++access-path TOGETHER per joinrel (`add_paths_to_joinrel`) and **has no MHJ**. So
+the cost-driven planner **drops MHJ** (produces PG-shaped binary trees; user
+authorized "need not be goopg's fastest"), which dissolves the MHJ structural
+problem and the in-memory-calibration problem (target PG *shape* ⇒ PG constants
+correct-by-definition). NLI construction stays SOLELY in `rewriteJoinsToNLI` (its
+proven coordinate logic; reimplementing caused the reverted Q9 "1 row not 7" bug);
+the DP only *costs* a join as NLI by delegating to `tryBuildNLI` (same predicate,
+no desync). Staged:
+- [ ] **C4-pg-i** Drop MHJ for cost-driven plans (skip `rewriteMultiWayChain`,
+  planner.go:988), restore the binary-hash-cost DP switch, keep `rewriteJoinsToNLI`
+  + scan-input rewrite. Measure Q9/Q8/Q5 on SF1. Open question: does removing MHJ
+  mis-composition alone fix Q9?
+- [ ] **C4-pg-ii** (only if C4-pg-i still mis-ranks) Delegated NLI costing: DP costs
+  each candidate as its actual method via `tryBuildNLI` on a clone (ch12 §4).
+- [ ] **C4-pg-iii** Gate: 5 regressions recover, Q9 not regressed, Q5 held (SF1);
+  `pg-oracle-diff` shape parity. Q4 (semi-join method) tracked separately (ch12 §6).
+- ~~old C4a/C4b (MHJ-in-DP)~~ superseded by the pivot. Binary-hash DP switch stashed
+  (`git stash list`).
 - [~] **C4a** NL-index / MHJ costing.
   - [x] **C4a-i** *Primitives (pure, not wired — plan-preserving).* `cost_funcs.go`:
     `indexProbeCost` (one selective index probe) + `multiHashJoinCost` (ch06 §4.1

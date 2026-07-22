@@ -129,6 +129,15 @@ that produced the Round-4 regressions in a different guise
 
 ## 4. MultiHashJoin: the operator with no oracle
 
+> **Superseded for the cost-driven path (see [12](12-pg-style-join-path-enumeration.md) §3).**
+> This section designed `MultiHashJoin` as a first-class costed DP path under a
+> comparability invariant. The C4 pivot **drops MHJ from the cost-driven planner**
+> entirely (PG has no MHJ; keeping it created the order-then-rewrite trap that
+> regressed Q9, [07](07-cost-driven-join-order.md) §4.5). MHJ remains a valid
+> executor operator and a hand-tuned optimisation, but the cost path emits
+> PG-shaped binary trees instead. The rest of this section is retained as the
+> record of the rejected approach.
+
 `MultiHashJoin` (`internal/executor/multi_hash_join.go`, built by
 `rewriteMultiWayChain`, `bushy.go:1193`) is goopg's N-way hash join with **no PG
 counterpart**, so no `cost_*` function to copy. It probes one driving table
