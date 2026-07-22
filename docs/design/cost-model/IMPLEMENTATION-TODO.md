@@ -169,6 +169,36 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-22 — **C4 cost-driven pivot IMPLEMENTED + measured — does NOT meet the gate;
+  STOP for judgment. All flag-gated (`costDrivenJoinOrder` default OFF, prod
+  unaffected).** Commits `f6329a5b` (C4-pg-i cost-driven order + MHJ-drop scaffolding),
+  `84928536` (accurate join-key cardinality, gated), `5fd5db96` (C4-pg-ii delegated NLI
+  costing + `GOOPG_INDEX_PROBE_MULT`). Enable with `GOOPG_COST_DRIVEN_JOINORDER=1`.
+  **SF1 progression (serial, stats-on; HEAD = integer DP):**
+  | Q | HEAD | pg-i | +card | +NLI(mult1) |
+  |---|------|------|-------|-------------|
+  | Q2 | 57s | 3.4s✓ | 7s✓ | 4.3s✓ |
+  | Q3 | 9s | timeout | 117s | 121s |
+  | Q5 | 8.3s | 170s | 174s | timeout |
+  | Q8 | to/**0-rows** | 25s✓ | 2.7s✓ | 4.1s✓ |
+  | Q9 | 31.7s | timeout | timeout | 81s **0 rows WRONG** |
+  **Robust wins:** Q2 (57→~4s) and Q8 (timeout+0-rows → ~3s, CORRECT) — the latter
+  validates the layout remap fix end-to-end (the whole reason for this line).
+  **Unresolved:** Q3/Q5 never recover; Q9 regresses; **delegated NLI costing INTRODUCES
+  a Q9=0-rows correctness bug** (a SECOND coordinate-rebind fragility, this time in
+  `rewriteJoinsToNLI`'s node build `nl_index_join.go:470+`, exposed by the new
+  cost-driven order — the layout fix corrected `buildJoinFromDP` hash keys, not the NLI
+  rebind).
+  **Root cause (contradicts ch12 §5):** goopg's NL-index probe is far slower than PG's
+  random_page_cost model (eager TID materialisation, ch06 §5), so PG constants
+  under-cost NL-probes of large relations → PG-shaped NL plans run 20-200× slower.
+  ch12 §5 claimed targeting PG-shape "dissolves" the calibration problem; measurement
+  shows it does NOT — goopg-specific `indexProbeCost` recalibration (the deferred
+  "optimisation past parity") is NECESSARY, and even then Q9's correctness rebind must
+  be fixed first. **Two open blockers for the pivot: (1) audit/fix `rewriteJoinsToNLI`
+  coordinate rebind for arbitrary cost-driven orders (correctness, like the
+  buildJoinFromDP layout fix but for NLI); (2) calibrate `indexProbeCost` to goopg's
+  in-memory NL cost. Needs a direction decision (recalibrate vs guard vs accept).**
 - 2026-07-22 — **C4-prereq: layout-aware bushy join-key remapping (LANDED `65dd185a`)** —
   Fixes the Q8=0 root cause. `dpEntry.layout` (table→offset in the child's real
   schema) threaded through the DP; `remapKeyToLayout` replaces the ascending-order
