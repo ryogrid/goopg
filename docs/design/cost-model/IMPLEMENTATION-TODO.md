@@ -62,8 +62,13 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   (`getParallelDivisor(2)=2.4`, `costSeqscan(1000,100000,1)=2250`, build-is-startup,
   gather setup+transfer) + a **drift guard** asserting `defaultCostParams` equals
   the config-registered GUC BootVals. Pure, no live caller. Gate: units PASS.
-- [ ] **C3.2** Generate costed scan + join paths into pathlists (selection still on
-  integer DP). `addPath`/`setCheapest` dominance gate. Gate: plan-gate zero diffs.
+- [x] **C3.2** `internal/planner/pathgen.go`: path-generation primitives —
+  `generateScanPaths` (serial + divisor-divided partial) and
+  `generateHashJoinPaths` (both build orientations; `add_path` keeps the cheaper,
+  so the small dimension builds because it is cheaper, not by name-tag). 4 tests
+  incl. the build-side-falls-out-of-cost dominance case. Pure functions; the
+  DP-traversal wiring and merge/nestloop/MHJ generation land with C4 (where
+  selection switches). Plan-preserving. Gate: units PASS, suite green.
 
 ## C4 — Switch join order to costed pathlists *(first behavior change)*
 - [ ] **C4.1** Retire the integer argmin; DP composes via `addPath`/`setCheapest`;
@@ -88,7 +93,8 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C3.1 — cost_funcs.go: 8 per-node PG-unit cost functions + 7 oracle tests + config drift guard; plan-preserving
+- 2026-07-22 — C3.2 — pathgen.go: scan (serial+partial) + hash-join (both orientations) generation primitives + 4 tests; plan-preserving
+- 2026-07-22 — C3.1 — cost_funcs.go: 8 per-node PG-unit cost functions + 7 oracle tests + config drift guard; plan-preserving — `9297cf7a`
 - 2026-07-22 — C2.1/C2.2 — relsize.go: baseRelRows + width estimator + estimate_rel_size fallback; cold-start test PASS; plan-preserving — `1e5b5a4f`
 - 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green — `b4770527`
 - 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green — `b44998b5`
