@@ -84,13 +84,28 @@ attempt is stashed (`git stash list`: "C4 cost-driven join order (binary-hash…
     + `generateMultiHashJoinPath`. `relsize.go`: `nodeTupleWidth`/`estScanPages`
     helpers. Tests incl. the **Q9 lesson** (NLI ruinous over a 6M-row outer, cheap
     over 100). Gate: units PASS, suite green.
-  - [ ] **C4a-ii** *Wire NLI/MHJ generation into the DP* + measure. The DP must
-    detect, per split, when a side is a base table with a usable index (matching
-    `tryBuildNLI`/`pickInnerSide`, `nl_index_join.go`) and when a subset packs into
-    an MHJ, generate those paths as alternatives, then re-run the selection switch.
-    Gate: Q9 does not regress (+ nothing else). NOTE from analysis: NLI cost alone
-    does not distinguish Q9's two ~6M-probe options — MHJ composition also matters,
-    so C4a-ii and C4b land together and need SF1 iteration.
+  - [ ] **C4a-ii** *Wire NLI/MHJ generation into the DP* + measure. Blocked on three
+    concrete sub-problems the integration analysis surfaced (each needs care +
+    SF1 iteration; the DP switch is stashed until they land):
+    1. **Composite-index NLI detection in the DP.** `pickIndexCoveringAllLeadingColumns`
+       (`nl_index_join.go:950`) needs EVERY leading index column bound. The DP
+       composes one edge at a time (`findEdgeBetweenIdx`), so a composite index —
+       e.g. `partsupp_pk` on (ps_partkey, ps_suppkey), which Q9's good plan probes —
+       is invisible at single-edge composition. The DP must collect ALL edges
+       between the two masks and build the inner→outer column-NAME map, bridging its
+       global-column-index coordinates to `tryBuildNLI`'s schema-name model.
+    2. **MHJ structural constraints.** goopg's MHJ packs SINGLE-column hash keys
+       only; a composite-key join (partsupp) cannot go in the MHJ and must be
+       NLI/separate. The bad C4 plan wrongly put partsupp in the 4-way MHJ; the good
+       plan keeps orders in the MHJ and partsupp as NLI. The DP must model this to
+       pick the right MHJ membership.
+    3. **In-memory cost-constant calibration.** goopg's indexes/heaps are in-memory
+       at SF1; PG's disk-based `random_page_cost=4` / `seq_page_cost=1` mis-rank
+       goopg's plans (an index probe is CPU-bound, ~0.02, not ~8 = 2·random_page).
+       The PG-oracle constants likely need goopg calibration from SF1 profiling — a
+       real, documented deviation from the "PG as oracle" premise (design impact:
+       ch02 §3 / ch09).
+    Gate: Q9 does not regress; the 5 regressions recover; Q5 held; SF1-measured.
 - [ ] **C4b** MHJ-aware costing wired: for a subset whose binary shape packs into a
   `MultiHashJoin`, generate the MHJ path under the ch06 §4.1 comparability invariant
   (costed vs the equivalent left-deep hash cascade). Targets Q2/Q22. Lands with C4a-ii.
