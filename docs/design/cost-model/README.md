@@ -144,6 +144,7 @@ earlier internal draft found each one hiding a real bug:
 | 12 | [pg-style-join-path-enumeration](12-pg-style-join-path-enumeration.md) | the cost-driven pivot: PG-shaped binary join tree, MHJ dropped, full-fidelity DP |
 | 13 | [composite-nli-layout-reconciliation](13-composite-nli-layout-reconciliation.md) | the Q9=0 composite-NLI runtime-layout bug and its Phase-2 fix |
 | 14 | [fk-aware-and-mcv-join-selectivity](14-fk-aware-and-mcv-join-selectivity.md) | unique/FK-aware + multi-clause + MCV join selectivity (Q9 order), PG-faithful binary stats, correlation |
+| 15 | [mhj-in-cost-driven-star-shapes](15-mhj-in-cost-driven-star-shapes.md) | re-admitting MultiHashJoin to the cost-driven DP for star shapes — implemented, measured, cannot be cost-forced for Q9 (804s profile); composite-NLI-keep landed (no more OOM) |
 
 ## Reading order
 
