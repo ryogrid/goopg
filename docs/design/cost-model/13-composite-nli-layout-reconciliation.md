@@ -7,6 +7,15 @@
 | blocks | C4 cost-driven join order (Q9 returns 0 rows) |
 | relates to | reverted `M0067-0003`, deferred `M0068`, hung `M0072-0002` |
 
+> **STATUS UPDATE 2026-07-23: FIXED (Phase 1 `33d9c8b3` + Phase 2 `54731a97`).**
+> `reconcileNLILayout` (a final bottom-up pass in `planner.Plan`, gated on
+> cost-driven) re-resolves NLI probe keys, NLI/Join output schemas, AND downstream
+> Project/Aggregate/Filter/Sort refs by name after sub-query integration reorders a
+> derived-table outer. Q9 now returns 175 (was 0) WITH NLI on; repro = 16 216; a
+> correctness sweep (incl. the Q7 self-join) is all-canonical; `tpch-spotcheck` PASS
+> (production untouched). Remaining: Q9@6M is correct but slow — a cost-driven
+> ORDER-quality issue, separate from this layout fix. See §4.3.
+
 ## 0. Summary
 
 Under the cost-driven planner, TPC-H **Q9 returns 0 rows** (correct: 175). The

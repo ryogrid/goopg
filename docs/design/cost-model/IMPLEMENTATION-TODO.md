@@ -169,6 +169,19 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **C4 Q9=0 FIXED — Phase-2 NLI-layout reconciliation LANDED (`54731a97`).**
+  NLI re-enabled under cost-driven; Q9 returns 175 (was 0) WITH NL-index acceleration
+  (Q9@300k 175 in 29s vs Phase-1 all-hash 62s). Mechanism (doc 13 §4.3): probe keys bound
+  to BUILD-TIME outer schema; sub-query integration + reresolveJoinByName reorder the outer
+  runtime (orders-first l_suppkey@13 → lineitem-first @4); stale keys read l_linenumber; the
+  reordered NLI Output() schema misleads downstream joins. Fix = `reconcileNLILayout`, a
+  FINAL bottom-up pass in `planner.Plan` (gated cost-driven) after ALL planning incl.
+  sub-query integration: reresolveJoinByName (Joins) + reresolveNLIKeysByName (NLI keys +
+  schema) + reresolveExprByName (downstream Project/Agg/Filter/Sort refs — the cascade that
+  made full Q9 return 1 row). Phase-1 skip removed (superseded). VERIFIED: Q9@300k=175,
+  repro=16216, sweep Q1/2/6/7(self-join)/12/13/14/19 all canonical, tpch-spotcheck PASS,
+  suites green. REMAINING: Q9@6M correct-but-slow = cost-driven ORDER quality (separate;
+  the overflow fix `9106121e` + NLI-cost tuning are the levers).
 - 2026-07-23 — **C4 Q9=0 Phase-1 correctness fix LANDED (`33d9c8b3`) — skip NLI under
   cost-driven order.** Root cause corrected (design doc 13 §2.1): NOT the composite probe —
   an NLI subtree emits a runtime tuple diverging from its OID-sorted Output() schema inside a
