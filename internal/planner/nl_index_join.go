@@ -1251,9 +1251,41 @@ func SetNLICostGateLegacy(on bool) { nliCostGateLegacy.Store(on) }
 func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
 	outerRows := EstimateRows(outer)
 	semiAnti := joinType == JoinTypeSemi || joinType == JoinTypeAnti
-	if !semiAnti || nliCostGateLegacy.Load() {
-		// Historical heuristic (also the legacy escape hatch for
-		// semi/anti): small-or-unknown outer → NLI.
+	if nliCostGateLegacy.Load() {
+		// Legacy escape hatch: small-or-unknown outer → NLI.
+		if outerRows <= 0 {
+			return true
+		}
+		return outerRows <= nliMaxOuterRowsHeuristic
+	}
+	if !semiAnti {
+		// INNER: under cost-driven order, apply the same stats-aware
+		// fan-out test the semi/anti arm uses. An index probe on a
+		// NON-UNIQUE inner column returns matchSet = innerRows /
+		// NDistinct(probe column) rows per outer row, so the NLI does
+		// outerRows × matchSet work. That is ruinous when the inner index
+		// is low-selectivity regardless of outer size — TPC-H Q5
+		// index-probes supplier_nation_fkidx (~400 suppliers per nation),
+		// fanning a 730k outer to ~290M and running 200s+ — while a
+		// unique-key probe (matchSet ≈ 1) stays cheap (Q7/Q8/Q9's
+		// o_orderkey / n_nationkey probes). Reject iff NLI's probe work
+		// exceeds the hash alternative (one inner build + O(1) per outer).
+		// The production integer DP keeps the historical outer-row
+		// heuristic (its plans are snapshot-pinned and it reaches the star
+		// join via MultiHashJoin, not this fan-out NLI). When stats are
+		// absent (goopg's in-memory ANALYZE is lost on restart — the
+		// common case) the formula falls back to that same heuristic, so
+		// NLI is never permanently disabled.
+		if costDrivenJoinOrder {
+			var innerRows, matchSet int64
+			if innerScan != nil && innerScan.Table != nil {
+				innerRows = tableRows(innerScan.Table)
+				matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
+			}
+			if outerRows > 0 && innerRows > 0 && matchSet > 0 {
+				return outerRows*matchSet < innerRows+outerRows
+			}
+		}
 		if outerRows <= 0 {
 			return true
 		}
