@@ -169,6 +169,33 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **C4 order-quality — the real lever is PREDICATE PUSHDOWN, not cost
+  constants.** A full cost-constant sweep (index-probe mult, cardinality-accuracy /
+  offset-bug fix, output-row mult) was NET-NEGATIVE: every knob traded queries because
+  goopg's executor cost diverges from the PG model at the ORDER level, and the baseline's
+  saturated-NDV cardinality accidentally penalises large intermediates (the goopg-correct
+  objective). Root cause of the slow cost-driven queries instead: single-table WHERE
+  filters (date ranges, inequalities, literal IN-lists) were left on the top residual
+  Filter, so the binary Join tree hash-joined FULL tables then filtered — Q3 joined all 6M
+  lineitem then applied l_shipdate (121s). Two LANDED fixes, both cost-driven-scoped
+  (production integer DP byte-identical), verified vs-PG parity identical on all 22 +
+  tpch-spotcheck Q12=2/Q13=33 + row counts unchanged (Q16=18192):
+  - `17d11216` — widen shouldAttachBeforeMHJ to every cost-driven multi-table plan (was
+    ≥5-table+small-dim) so relation-local filters reach leaf scans + the DP sees filtered
+    base-rel cardinality; resolve literal `col IN (…)` to its table in visitColumnRefsForTable.
+    SF1: **Q3 121→17s, Q21 timeout→18.5s, Q2 9.6→3.4s**; Q7/Q8 NLI wins preserved.
+  - `0c4b7b9b` — extend the SEMI/ANTI fan-out veto in nliCostGateAccepts to INNER joins:
+    reject NLI iff outerRows·matchSet ≥ innerRows+outerRows (matchSet = innerRows/NDistinct
+    of the probe column). Rejects Q5's non-unique s_nationkey probe (~400/probe, 730k
+    outer→290M). SF1: **Q5 218→26s** (Q2 3.4→10s — deliberate user-approved trade; Q2/Q5
+    have structurally opposed NLI-gate needs, no matchSet threshold separates them).
+  - Reverted (unsafe): lowering the 2-table DP threshold fixed Q12 (123→16s) but the DP
+    restructured a subtree feeding a NOT-IN anti-join → Q16 rows 18192→29727. 2-table
+    pushdown needs a semi/anti-aware guard (Q12 deferred residual).
+  - Evidence: `evidence/sf1-costdriven-serial-pushdown-fanout.txt`. Residuals (structural,
+    not filter-placement): Q4 (EXISTS semi-join), Q9 (6-table composite-key order — times
+    out even all-hash), Q12 (2-table, needs guarded pushdown), Q18 (subquery-IN), Q22
+    (correlated subquery).
 - 2026-07-23 — **C4 Q9=0 FIXED — Phase-2 NLI-layout reconciliation LANDED (`54731a97`).**
   NLI re-enabled under cost-driven; Q9 returns 175 (was 0) WITH NL-index acceleration
   (Q9@300k 175 in 29s vs Phase-1 all-hash 62s). Mechanism (doc 13 §4.3): probe keys bound
