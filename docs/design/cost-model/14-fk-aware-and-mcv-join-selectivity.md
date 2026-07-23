@@ -2,11 +2,28 @@
 
 | field | value |
 | --- | --- |
-| status | draft (DESIGN ONLY) |
+| status | §2–§5 **MEASURED & REJECTED** (thesis refuted); §6–§7 to implement |
 | date | 2026-07-23 |
 | depends on | [05](05-statistics-and-estimation-inputs.md), [06](06-scan-and-join-path-costs.md), [07](07-cost-driven-join-order.md), [12](12-pg-style-join-path-enumeration.md) |
 | relates to | [13](13-composite-nli-layout-reconciliation.md) (the same Q9 composite key, a different failure) |
-| premise | join-ORDER quality is dominated by intermediate CARDINALITY, so accurate cardinality fixes the order even under goopg's crude linear cost model — the non-linear per-row cost is a separate (method-selection) axis |
+| premise (REFUTED) | join-ORDER quality is dominated by intermediate CARDINALITY, so accurate cardinality fixes the order — **measured false for goopg**, see banner |
+
+> **STATUS UPDATE (2026-07-23, measured on real SF1).** The join-selectivity design
+> (§2–§5) was IMPLEMENTED and MEASURED, and the central premise is **refuted**. §2's
+> composite-unique-index no-fan-out rule fires correctly on every Q9 FK join (verified: it
+> divides by `partsupp_pk`'s raw 800k, giving the correct ~6M composite estimate) — yet Q9
+> **still times out**, and Q7/Q8/Q5/Q10 **regress** (some to timeout). Adding cost-constant
+> calibration (an intermediate-materialisation penalty, `outputRowCostMultiplier` swept at
+> 1/8/64) does NOT rescue it — Q9 never recovers and higher penalties are strictly worse.
+> **Conclusion:** Q9 is a **structural (MultiHashJoin-drop)** failure, not a cardinality
+> one — every binary-hash order must materialise the 6M-row `lineitem` joins that MHJ
+> single-passes, so no cardinality/constant combination reaches it; and correct cardinality
+> flips other FK-chain orders to goopg-slow ones (the [09] §0 executor-vs-model divergence,
+> at the ORDER level). §2–§5 are reverted. The Q9-class residuals (Q4/Q9/Q12/Q18/Q22) are
+> the MHJ-drop and semi/subquery structure, out of scope by the no-TPC-H-tuning rule.
+> **§6 (PG-faithful binary statistics) and §7 (correlation) are independent of this
+> refuted thesis and proceed** as PG-faithfulness improvements. The join-selectivity
+> sections below are retained as the tested design + negative result.
 
 ## 0. Why this chapter exists
 
