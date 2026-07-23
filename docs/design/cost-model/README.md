@@ -141,6 +141,9 @@ earlier internal draft found each one hiding a real bug:
 | 09 | [verification-and-acceptance](09-verification-and-acceptance.md) | the three-tier acceptance bar and honest measurement |
 | 10 | [statistics-persistence](10-statistics-persistence.md) | PG-like `reltuples`/`relpages` persistence — **deferred, designed for later** |
 | 11 | [roadmap](11-roadmap.md) | phases C0…C7, gates, and the deliberately-deferred table |
+| 12 | [pg-style-join-path-enumeration](12-pg-style-join-path-enumeration.md) | the cost-driven pivot: PG-shaped binary join tree, MHJ dropped, full-fidelity DP |
+| 13 | [composite-nli-layout-reconciliation](13-composite-nli-layout-reconciliation.md) | the Q9=0 composite-NLI runtime-layout bug and its Phase-2 fix |
+| 14 | [fk-aware-and-mcv-join-selectivity](14-fk-aware-and-mcv-join-selectivity.md) | unique/FK-aware + multi-clause + MCV join selectivity (Q9 order), PG-faithful binary stats, correlation |
 
 ## Reading order
 
