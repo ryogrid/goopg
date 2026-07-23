@@ -39,6 +39,18 @@ type joinOp struct {
 
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
+	// int64 fast-path (cost-model ch.14): when every build-side key is
+	// int64-representable, lazyIntHash replaces lazyHash so the probe hot
+	// path (e.g. Q9's ~6M lineitem rows) hashes an int64 instead of
+	// allocating a datumKey string per row — the GC-heavy cost that made
+	// the binary hash cascade slow where MultiHashJoin's int64 keys are
+	// fast (multi_hash_join.go M0043-0003). Only the plain INNER build
+	// paths opt in; CTID-preserving and semi/anti builds keep the string
+	// map (lazyHashIsInt stays false). lazyBuildAllInt64 tracks whether an
+	// int64 table is still viable during the build.
+	lazyIntHash       map[int64][]Row
+	lazyHashIsInt     bool
+	lazyBuildAllInt64 bool
 	lazyProbe    Operator         // probe side (streaming)
 	lazyRow      Row              // current probe row
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
@@ -581,15 +593,15 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			}
 			copy(keyRow[:leftWidth], l)
 			copy(keyRow[leftWidth:], nullRight)
-			key, ok, err := o.evalHashKey(o.plan.LeftKey, keyRow)
+			kd, ok, err := o.evalHashKeyDatum(o.plan.LeftKey, keyRow)
 			if err != nil {
 			return false, err
 		}
 			if !ok { continue }
-			if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
-			o.lazyHash[key] = append(o.lazyHash[key], l)
+			o.lazyHashInsertDatum(kd, l)
 		}
 		_ = buildOp.Close()
+		o.lazyHashFinalize()
 		return false, nil
 	}
 	if err := o.right.Open(ctx); err != nil {
@@ -643,7 +655,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		}
 		copy(keyRow[:leftWidth], nullLeft)
 		copy(keyRow[leftWidth:], r)
-		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
+		kd, ok, err := o.evalHashKeyDatum(o.plan.RightKey, keyRow)
 		if err != nil {
 			return false, err
 		}
@@ -656,10 +668,22 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			}
 			continue
 		}
-		if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
-		o.lazyHash[key] = append(o.lazyHash[key], r)
+		// int64 fast-path is INNER-only; semi/anti keep the string map so
+		// their NullAware / no-fan-out invariants are untouched.
+		if o.plan.Type == planner.JoinTypeInner {
+			o.lazyHashInsertDatum(kd, r)
+		} else {
+			sk := datumKey(kd)
+			if o.lazyHash == nil {
+				o.lazyHash = make(map[string][]Row)
+			}
+			o.lazyHash[sk] = append(o.lazyHash[sk], r)
+		}
 	}
 	_ = buildOp.Close()
+	if o.plan.Type == planner.JoinTypeInner {
+		o.lazyHashFinalize()
+	}
 	return true, nil
 }
 
@@ -884,6 +908,54 @@ func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error
 	return datumKey(v), true, nil
 }
 
+// evalHashKeyDatum is evalHashKey but returns the key Datum instead of its
+// string form, so the int64 fast-path can try datumToInt64Key before
+// falling back to datumKey. ok is false for a NULL key.
+func (o *joinOp) evalHashKeyDatum(keyExpr planner.Expr, row Row) (Datum, bool, error) {
+	v, err := evalExpr(keyExpr, row, o.ctx)
+	if err != nil {
+		return Datum{}, false, err
+	}
+	if v.IsNull() {
+		return Datum{}, false, nil
+	}
+	return v, true, nil
+}
+
+// lazyHashInsertDatum inserts a build row keyed by keyDatum. It always
+// populates lazyHash (string) and, while every key so far has been
+// int64-representable, also lazyIntHash. The first non-int64 key drops the
+// int table. lazyHashFinalize then keeps whichever survives.
+func (o *joinOp) lazyHashInsertDatum(keyDatum Datum, row Row) {
+	if o.lazyHash == nil {
+		o.lazyHash = make(map[string][]Row)
+		o.lazyIntHash = make(map[int64][]Row)
+		o.lazyBuildAllInt64 = true
+	}
+	sk := datumKey(keyDatum)
+	o.lazyHash[sk] = append(o.lazyHash[sk], row)
+	if o.lazyBuildAllInt64 {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			o.lazyIntHash[ik] = append(o.lazyIntHash[ik], row)
+		} else {
+			o.lazyBuildAllInt64 = false
+			o.lazyIntHash = nil
+		}
+	}
+}
+
+// lazyHashFinalize commits the int64 table (and frees the string table)
+// when every build key was int64-representable. Called once after the
+// build loop of a plain INNER hash join.
+func (o *joinOp) lazyHashFinalize() {
+	if o.lazyBuildAllInt64 && len(o.lazyIntHash) > 0 {
+		o.lazyHashIsInt = true
+		o.lazyHash = nil // free the string map; KEEP lazyIntHash
+	} else {
+		o.lazyIntHash = nil
+	}
+}
+
 func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if o.plan.Predicate == nil {
 		return true, nil
@@ -1102,21 +1174,43 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.lazyKeyRow == nil || len(o.lazyKeyRow) != w {
 			o.lazyKeyRow = make(Row, w)
 		}
-		var key string
+		var key string // used only by the string path + the CTID lookup
 		var ok bool
+		var probeKeyExpr planner.Expr
 		if o.plan.BuildLeft {
 			copy(o.lazyKeyRow[:o.lazyLW], nullLeft)
 			copy(o.lazyKeyRow[o.lazyLW:], r)
-			key, ok, err = o.evalHashKey(o.plan.RightKey, o.lazyKeyRow)
+			probeKeyExpr = o.plan.RightKey
 		} else {
 			copy(o.lazyKeyRow[:o.lazyLW], r)
 			copy(o.lazyKeyRow[o.lazyLW:], nullRight)
-			key, ok, err = o.evalHashKey(o.plan.LeftKey, o.lazyKeyRow)
+			probeKeyExpr = o.plan.LeftKey
 		}
-		if err != nil {
-			return nil, err
+		var matches []Row
+		if o.lazyHashIsInt {
+			// int64 fast-path: hash the probe key as an int64 (no per-row
+			// string alloc). A probe key that isn't int64-representable
+			// cannot equal any (all-int64) build key → no match.
+			kd, kok, kerr := o.evalHashKeyDatum(probeKeyExpr, o.lazyKeyRow)
+			if kerr != nil {
+				return nil, kerr
+			}
+			ok = kok
+			if kok {
+				if ik, iok := datumToInt64Key(kd); iok {
+					matches = o.lazyIntHash[ik]
+				}
+			}
+		} else {
+			// Assign the OUTER key: the preserveBuildSide CTID lookup
+			// below reads o.lazyHashCTID[key], so a shadowing inner
+			// declaration would leave it empty for FOR UPDATE joins.
+			key, ok, err = o.evalHashKey(probeKeyExpr, o.lazyKeyRow)
+			if err != nil {
+				return nil, err
+			}
+			matches = o.lazyHash[key]
 		}
-		matches := o.lazyHash[key]
 		if !ok {
 			matches = nil
 		}
@@ -1213,6 +1307,7 @@ func (o *joinOp) Close() error {
 	o.leftCTIDs = nil
 	o.rowSourceLeft = nil
 	o.lazyHash = nil
+	o.lazyIntHash = nil
 	o.lazyProbe = nil
 	o.lazyRow = nil
 	o.lazyMatches = nil

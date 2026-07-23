@@ -37,6 +37,14 @@ type sharedHashBuild struct {
 	hash     map[string][]Row
 	hashCTID map[string][]joinRowCTID
 
+	// int64 fast-path (INNER only): when the build side's keys were all
+	// int64-representable, buildLazyHashTable/lazyHashFinalize sets
+	// lazyHashIsInt and frees lazyHash, leaving the table in lazyIntHash. These
+	// must ride along, or a worker probes an empty string map and drops every
+	// match (the symptom: parallel INNER joins return 0 rows).
+	intHash   map[int64][]Row
+	hashIsInt bool
+
 	// probeIsLeft records which side the build consumed, so a worker opens the
 	// other one without re-deriving the rule.
 	probeIsLeft bool
@@ -54,6 +62,8 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 	return &sharedHashBuild{
 		hash:              o.lazyHash,
 		hashCTID:          o.lazyHashCTID,
+		intHash:           o.lazyIntHash,
+		hashIsInt:         o.lazyHashIsInt,
 		probeIsLeft:       probeIsLeft,
 		preserveBuildSide: o.preserveBuildSide,
 		antiBuildRows:     o.antiBuildRows,
@@ -71,6 +81,8 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
 	o.lazyHash = sb.hash
 	o.lazyHashCTID = sb.hashCTID
+	o.lazyIntHash = sb.intHash
+	o.lazyHashIsInt = sb.hashIsInt
 	o.preserveBuildSide = sb.preserveBuildSide
 	o.antiBuildRows = sb.antiBuildRows
 	o.antiBuildHasNull = sb.antiBuildHasNull
