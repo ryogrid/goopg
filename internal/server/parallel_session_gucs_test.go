@@ -19,10 +19,10 @@ import (
 func TestSessionMaxParallelWorkersPerGather(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		set  string // "" ⇒ leave at boot default (2)
+		set  string // "" ⇒ leave at boot default (4, goopg deliberate; PG ships 2)
 		want int
 	}{
-		{name: "unset-default", set: "", want: 2},
+		{name: "unset-default", set: "", want: 4},
 		{name: "explicit-zero-disables", set: "0", want: 0},
 		{name: "four", set: "4", want: 4},
 		{name: "max", set: "1024", want: 1024},

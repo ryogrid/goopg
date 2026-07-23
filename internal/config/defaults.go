@@ -602,7 +602,14 @@ func BuildDefaultRegistry() *Registry {
 	// postgres/src/backend/utils/misc/guc_tables.c entries
 	// where applicable.
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_parallel_workers_per_gather", Type: TypeInt, BootVal: "2",
+		// BootVal 4 is a deliberate goopg default (PG 18.3 ships 2): goopg
+		// workers are goroutines, not scarce pre-allocated PG worker slots, so a
+		// higher per-gather degree is cheaper to grant. The DECISION and
+		// WORKER-COUNT logic stay PG-faithful — computeParallelWorkers is
+		// compute_parallel_worker's log3 progression over min_parallel_table_scan_size,
+		// capped by THIS value; the max_parallel_workers=8 cluster cap still bounds
+		// total concurrency (operators_gather.go).
+		Name: "max_parallel_workers_per_gather", Type: TypeInt, BootVal: "4",
 		MinVal: 0, MaxVal: 1024,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,

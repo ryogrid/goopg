@@ -75,7 +75,7 @@
 #io_max_concurrency = 0                 # 0-1024; 0 = let the method decide
                                         # (change requires restart)
 #backend_flush_after = 0                # 0-256 pages; 0 disables writeback (default)
-#max_parallel_workers_per_gather = 2    # 0-1024; taken into account by SET-only;
+#max_parallel_workers_per_gather = 4    # 0-1024; taken into account by SET-only; goopg default 4 (PG ships 2)
                                         # planner currently ignores it
 #max_parallel_workers = 8               # 0-1024; cluster-wide cap on active
                                         # parallel workers
