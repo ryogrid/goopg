@@ -722,7 +722,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				// so deeper DP levels see this subset's
 				// cardinality estimate rather than its cost
 				// (the two diverge once the build term enters).
-				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
+				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, a, b, g, cat)
 				// Cost-driven mode builds the candidate join up front so its
 				// pgCost can reflect the method rewriteJoinsToNLI will build
 				// (ch. 12 §2, §4). Integer mode defers the build to the
@@ -1045,6 +1045,23 @@ func satRowsMulDiv(a, b, d int64) int64 {
 	return int64(v)
 }
 
+// satMul returns a*b clamped to [1, MaxInt64], computed in float64 so the
+// product cannot wrap int64 negative — the §4 multi-clause divisor multiplies
+// several ~1e5 per-column NDVs, whose product reaches ~1e15.
+func satMul(a, b int64) int64 {
+	if a < 1 {
+		a = 1
+	}
+	if b < 1 {
+		b = 1
+	}
+	v := float64(a) * float64(b)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
 // satCost sums the 3-part integer cost in float64 and clamps to
 // [1, MaxInt64], for the same overflow reason as satRowsMulDiv (the
 // output/build/probe terms can each be ~1e14 at scale).
@@ -1061,7 +1078,123 @@ func satCost(out, build, probe int64) int64 {
 	return int64(v)
 }
 
-func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
+// crossEdgesBetween returns every graph edge that straddles the two subset
+// masks a and b (in either FROM-order orientation). findEdgeBetweenIdx returns
+// only the FIRST such edge; the FK/unique/multi-clause estimators (ch. 14
+// §2–§4) need ALL of them — Q9's partsupp↔lineitem join spans two edges
+// (ps_partkey=l_partkey AND ps_suppkey=l_suppkey) and a single edge sees only
+// one column of the composite key.
+func crossEdgesBetween(a, b uint16, g *joinGraph) []*joinEdge {
+	var out []*joinEdge
+	for i := range g.edges {
+		e := &g.edges[i]
+		lm := uint16(1) << uint(e.leftTable)
+		rm := uint16(1) << uint(e.rightTable)
+		if (a&lm != 0 && b&rm != 0) || (a&rm != 0 && b&lm != 0) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// edgeColName resolves the base-table column name a join-key expression refers
+// to, preferring the reliable table-relative Index over the diagnostic Name.
+func edgeColName(key Expr, tbl *catalog.Table) (string, bool) {
+	cr, ok := key.(*ColumnRef)
+	if !ok || tbl == nil {
+		return "", false
+	}
+	if cr.Index >= 0 && cr.Index < len(tbl.Columns) {
+		return tbl.Columns[cr.Index].Name, true
+	}
+	if cr.Name != "" {
+		return cr.Name, true
+	}
+	return "", false
+}
+
+// columnsSubset reports whether every name in want is present in have.
+func columnsSubset(want []string, have map[string]bool) bool {
+	if len(want) == 0 {
+		return false
+	}
+	for _, c := range want {
+		if !have[c] {
+			return false
+		}
+	}
+	return true
+}
+
+// uniqueNoFanoutRawCount implements ch. 14 §2/§3: when the columns equated
+// between the two joined subsets contain (as a superkey ⊆) a UNIQUE index on
+// one of the tables — or a valid+enforced FK's child columns — that side is
+// key/fully-contained, so the join does NOT fan out. PG reaches this via
+// get_variable_numdistinct's `isunique ⇒ nd = raw ntuples`; we reproduce it by
+// dividing |L|·|R| by the unique side's RAW (unfiltered) tuple count. Returns
+// (rawCount, true) on a proven superkey — the largest such raw count when both
+// sides qualify (tighter selectivity, matching PG's MIN(1/nd1,1/nd2)). The ⊆
+// test (not set-equality) fires an (a,b)-unique index under an (a,b,c)-equated
+// join. IndexesOnTable is called through the planner's own catalog `cat` so the
+// active-DB index set is used (the dbOid hazard, §2).
+func uniqueNoFanoutRawCount(edges []*joinEdge, g *joinGraph, cat catalog.Catalog) (int64, bool) {
+	if cat == nil {
+		return 0, false
+	}
+	eqCols := map[int]map[string]bool{}
+	addCol := func(ti int, key Expr) {
+		if ti < 0 || ti >= len(g.tables) || g.tables[ti] == nil {
+			return
+		}
+		name, ok := edgeColName(key, g.tables[ti])
+		if !ok {
+			return
+		}
+		if eqCols[ti] == nil {
+			eqCols[ti] = map[string]bool{}
+		}
+		eqCols[ti][name] = true
+	}
+	for _, e := range edges {
+		addCol(e.leftTable, e.leftKey)
+		addCol(e.rightTable, e.rightKey)
+	}
+	best := int64(0)
+	for ti, cols := range eqCols {
+		tbl := g.tables[ti]
+		if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+			continue
+		}
+		unique := false
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if idx != nil && idx.Unique && columnsSubset(idx.Columns, cols) {
+				unique = true
+				break
+			}
+		}
+		// §3 FK: a valid+enforced FK whose child columns are a subset of the
+		// equated set makes this (child) side fully contained. The loaded
+		// TPC-H data declares 0 FKs, so §2's unique-index probe is what fires
+		// today; this branch covers a schema that does declare them.
+		if !unique {
+			for _, fk := range tbl.ForeignKeys {
+				if !fk.NotValid && !fk.NotEnforced && columnsSubset(fk.Columns, cols) {
+					unique = true
+					break
+				}
+			}
+		}
+		if unique && tbl.Stats.RowCount > best {
+			best = tbl.Stats.RowCount
+		}
+	}
+	if best > 0 {
+		return best, true
+	}
+	return 0, false
+}
+
+func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, a, b uint16, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
 	}
@@ -1077,11 +1210,33 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 		// PG's plan shape; it is deliberately NOT applied to the integer
 		// DP, whose build*4 weights are calibrated to the saturated
 		// regime and regress under accurate cardinality (measured).
-		if edge.leftTable < len(g.tables) {
-			ndv = max(ndv, sideKeyDistinct(edge.leftKey, g.tables[edge.leftTable]))
+		//
+		// ch. 14 §2–§4: enumerate ALL edges spanning the two subsets, not
+		// just the first one findEdgeBetweenIdx returned. If the equated
+		// columns contain a UNIQUE index / valid FK as a superkey, the join
+		// does not fan out → divide by the unique side's RAW tuple count
+		// (§2/§3). Otherwise divide by the PRODUCT of every spanning edge's
+		// per-column NDV (§4 multi-clause), which is tighter than a single
+		// edge for a composite key.
+		edges := crossEdgesBetween(a, b, g)
+		if len(edges) == 0 {
+			edges = []*joinEdge{edge}
 		}
-		if edge.rightTable < len(g.tables) {
-			ndv = max(ndv, sideKeyDistinct(edge.rightKey, g.tables[edge.rightTable]))
+		if raw, ok := uniqueNoFanoutRawCount(edges, g, cat); ok {
+			ndv = max(ndv, raw)
+		} else {
+			prod := int64(1)
+			for _, e := range edges {
+				en := int64(1)
+				if e.leftTable < len(g.tables) {
+					en = max(en, sideKeyDistinct(e.leftKey, g.tables[e.leftTable]))
+				}
+				if e.rightTable < len(g.tables) {
+					en = max(en, sideKeyDistinct(e.rightKey, g.tables[e.rightTable]))
+				}
+				prod = satMul(prod, en)
+			}
+			ndv = max(ndv, prod)
 		}
 	} else {
 		if edge.leftTable < len(g.tables) && g.tables[edge.leftTable] != nil {

@@ -1283,7 +1283,30 @@ func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *
 				matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
 			}
 			if outerRows > 0 && innerRows > 0 && matchSet > 0 {
-				return outerRows*matchSet < innerRows+outerRows
+				// Cost-based decision (was a bare tuple-count compare
+				// `outerRows*matchSet < innerRows+outerRows`, which for a
+				// UNIQUE inner — matchSet=1 — reduced to `outerRows <
+				// innerRows+outerRows`, i.e. ALWAYS accept NLI regardless of
+				// outer size). That silently picked NLI for Q9's orders /
+				// partsupp joins: 322k random index probes over a 1.5M/800k
+				// inner, each probe paying goopg's eager per-probe TID
+				// materialisation — ruinous, and it timed the query out.
+				//
+				// Charge each side its real per-row cost instead. An index
+				// probe pays indexProbeCost (2 random pages + CPU, ×
+				// indexProbeCostMultiplier — goopg's probe is far dearer than
+				// PG's random_page_cost model, ch. 06 §5). The hash
+				// alternative builds the inner once and does ONE cheap int64
+				// probe per outer row — the int64 fast-path (executor
+				// operators_join_agg.go) put goopg's binary hash join back on
+				// PG's cost model, so PG's hash constants now apply. NLI wins
+				// only for a genuinely selective outer (few probes); a large
+				// outer flips to the now-cheap hash, exactly Q9's fix.
+				cp := defaultCostParams()
+				nliCost := float64(outerRows) * float64(matchSet) * indexProbeCost(cp)
+				hashCost := float64(innerRows)*(cp.cpuTupleCost+cp.cpuOperatorCost) +
+					float64(outerRows)*cp.cpuOperatorCost
+				return nliCost < hashCost
 			}
 		}
 		if outerRows <= 0 {
