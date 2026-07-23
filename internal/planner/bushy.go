@@ -419,8 +419,24 @@ func visitColumnRefsForTable(e Expr, onIdx func(int)) {
 	switch x := e.(type) {
 	case *ColumnRef:
 		onIdx(x.Index)
-	case *OuterColumnRef, *SubqueryExpr, *InExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
+	case *OuterColumnRef, *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
 		// outer refs and subqueries → out of scope
+	case *InExpr:
+		// `col IN (subquery)` (Plan != nil) references an enclosing
+		// scope → out of scope, like the subquery nodes above. But a
+		// literal-list `col IN (a, b, ...)` is an ordinary single-table
+		// predicate; descend so tableForCol can resolve it to its
+		// relation and the relation-local partition can push it onto the
+		// leaf scan (TPC-H Q12's l_shipmode IN ('MAIL','SHIP'), the query's
+		// most selective restriction, was otherwise stranded at the top
+		// Filter). conjunctIsLocalEligible already rejects the subquery form.
+		if x.Plan != nil {
+			return
+		}
+		visitColumnRefsForTable(x.Operand, onIdx)
+		for _, item := range x.List {
+			visitColumnRefsForTable(item, onIdx)
+		}
 	case *BinaryOp:
 		visitColumnRefsForTable(x.Left, onIdx)
 		visitColumnRefsForTable(x.Right, onIdx)
