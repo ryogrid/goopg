@@ -30,7 +30,7 @@ func TestEstimateJoinCostNoInt64Overflow(t *testing.T) {
 	tbl := &catalog.Table{Name: "t", Stats: &catalog.TableStats{RowCount: 1, Columns: []catalog.ColumnStats{{NDistinct: 1}}}}
 	g := &joinGraph{nodes: 2, tables: []*catalog.Table{tbl, tbl}}
 	edge := &joinEdge{leftTable: 0, rightTable: 1}
-	out, cost := estimateJoinCost(20_000_000_000, 20_000_000_000, edge, g, nil)
+	out, cost := estimateJoinCost(20_000_000_000, 20_000_000_000, edge, 0, 0, g, nil)
 	if out <= 1 {
 		t.Errorf("estimateJoinCost outputRows = %d, want >1 (2e10*2e10 overflows int64 and must not clamp to 1)", out)
 	}

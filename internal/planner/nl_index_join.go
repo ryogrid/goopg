@@ -1277,6 +1277,17 @@ func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *
 		// common case) the formula falls back to that same heuristic, so
 		// NLI is never permanently disabled.
 		if costDrivenJoinOrder {
+			// Composite-index exact probe MUST stay NLI. pickIndexCoveringAllLeadingColumns
+			// only returns a multi-column index when EVERY leading column is bound by an
+			// equi-conjunct, so this NLI probes the whole composite key exactly (matchSet=1,
+			// no fan-out). The hash alternative cannot: goopg's hash/MHJ join keys on a
+			// SINGLE column, so a composite join hashes on one key column and fans out on the
+			// rest — Q9's partsupp on ps_partkey alone fans each row ~4× to 24M and OOMs.
+			// The integer planner keeps partsupp as an NLI for exactly this reason
+			// (design 14 §2 / IMPLEMENTATION-TODO C4a-ii "composite cannot go in a hash").
+			if idx != nil && len(idx.Columns) > 1 {
+				return true
+			}
 			var innerRows, matchSet int64
 			if innerScan != nil && innerScan.Table != nil {
 				innerRows = tableRows(innerScan.Table)
