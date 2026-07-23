@@ -2408,6 +2408,146 @@ func findColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx i
 //
 // When a name is ambiguous (appears in multiple positions, e.g.
 // self‑joins), the original index is preserved for that ref.
+// reresolveNLIKeysByName re-resolves a NestedLoopIndexJoin's probe keys
+// (Inner.Key / Inner.Keys) by Name+SourceTableIdx against its outer
+// Output() schema, and refreshes the NLI's own schema to outer ++ inner.
+// Cost-model doc 13 Phase 2: the probe keys were bound at tryBuildNLI
+// time to the build-time outer schema, but a later pass reorders that
+// schema (reresolveJoinByName rebuilds a child *Join's merged schema),
+// leaving the keys pinned to a stale slot that reads the wrong runtime
+// column (TPC-H Q9: l_suppkey probe reads l_linenumber → 0 rows).
+func reresolveNLIKeysByName(nli *NestedLoopIndexJoin) {
+	if nli == nil || nli.Inner == nil || nli.Outer == nil {
+		return
+	}
+	outerSchema := nli.Outer.Output()
+	rebind := func(e Expr) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		idx := -1
+		if cr.SourceTableIdx != 0 {
+			idx = findColumnIndexByNameAndSource(outerSchema, cr.Name, cr.SourceTableIdx, 0)
+		}
+		if idx < 0 {
+			idx = findUniqueColumnIndex(outerSchema, cr.Name, 0)
+		}
+		if idx >= 0 {
+			cr.Index = idx
+		}
+	}
+	if nli.Inner.Key != nil {
+		rebind(nli.Inner.Key)
+	}
+	for _, k := range nli.Inner.Keys {
+		rebind(k)
+	}
+	if nli.Type != JoinTypeSemi && nli.Type != JoinTypeAnti {
+		innerSchema := nli.Inner.Output()
+		merged := make(Schema, len(outerSchema)+len(innerSchema))
+		copy(merged, outerSchema)
+		copy(merged[len(outerSchema):], innerSchema)
+		nli.schema = merged
+	} else {
+		nli.schema = append(Schema(nil), outerSchema...)
+	}
+}
+
+// reconcileNLILayout is a FINAL bottom-up pass (doc 13 Phase 2) that runs
+// after all planning — including sub-query integration, the point where a
+// derived-table outer's schema is reordered relative to the build-time
+// schema the NLI keys were bound to. For each *Join it refreshes the
+// merged schema + re-resolves keys by name (reresolveJoinByName); for each
+// *NestedLoopIndexJoin it re-resolves the probe keys + refreshes the NLI
+// schema (reresolveNLIKeysByName). Bottom-up so a child NLI's schema is
+// truthful before its parent binds against it. Gated on costDrivenJoinOrder
+// (Plan), so only the experimental cost path — where NLI is being re-enabled
+// — pays for it; production is untouched.
+func reconcileNLILayout(node Node) {
+	switch n := node.(type) {
+	case *Join:
+		reconcileNLILayout(n.Left)
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			reconcileNLILayout(n.Right)
+		}
+		reresolveJoinByName(n)
+	case *NestedLoopIndexJoin:
+		reconcileNLILayout(n.Outer)
+		reresolveNLIKeysByName(n)
+	case *Filter:
+		reconcileNLILayout(n.Child)
+		if !n.LeafLocal {
+			reresolveExprByName(n.Predicate, n.Child.Output())
+		}
+	case *Project:
+		reconcileNLILayout(n.Child)
+		if !n.IsolatedScope {
+			cs := n.Child.Output()
+			for i := range n.Targets {
+				reresolveExprByName(n.Targets[i], cs)
+			}
+		}
+	case *Aggregate:
+		reconcileNLILayout(n.Child)
+		cs := n.Child.Output()
+		for i := range n.GroupExprs {
+			reresolveExprByName(n.GroupExprs[i], cs)
+		}
+		for i := range n.Passthrough {
+			reresolveExprByName(n.Passthrough[i], cs)
+		}
+		for i := range n.Aggs {
+			reresolveExprByName(n.Aggs[i].Arg, cs)
+			reresolveExprByName(n.Aggs[i].Arg2, cs)
+			for j := range n.Aggs[i].ExtraArgs {
+				reresolveExprByName(n.Aggs[i].ExtraArgs[j], cs)
+			}
+		}
+	case *WindowAgg:
+		reconcileNLILayout(n.Child)
+	case *Sort:
+		reconcileNLILayout(n.Child)
+		cs := n.Child.Output()
+		for i := range n.Keys {
+			reresolveExprByName(n.Keys[i].Expr, cs)
+		}
+	case *Limit:
+		reconcileNLILayout(n.Child)
+	case *MultiHashJoin:
+		for i := range n.Tables {
+			reconcileNLILayout(n.Tables[i])
+		}
+	}
+}
+
+// reresolveExprByName re-resolves every plain ColumnRef in e by
+// Name+SourceTableIdx against childSchema (offset 0). visitColumnRefs
+// does not descend into sub-query scopes or *OuterColumnRef, so only
+// same-scope refs are touched. Ambiguous names (self-join without a
+// source disambiguator) resolve to -1 and are left unchanged.
+func reresolveExprByName(e Expr, childSchema Schema) {
+	if e == nil {
+		return
+	}
+	visitColumnRefs(e, func(x Expr) {
+		cr, ok := x.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		idx := -1
+		if cr.SourceTableIdx != 0 {
+			idx = findColumnIndexByNameAndSource(childSchema, cr.Name, cr.SourceTableIdx, 0)
+		}
+		if idx < 0 {
+			idx = findUniqueColumnIndex(childSchema, cr.Name, 0)
+		}
+		if idx >= 0 {
+			cr.Index = idx
+		}
+	})
+}
+
 func reresolveJoinByName(j *Join) {
 	if j == nil {
 		return

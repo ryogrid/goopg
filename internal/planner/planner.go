@@ -91,6 +91,14 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Cost-model doc 13 Phase 2: final NLI-layout reconciliation. Runs
+	// after all planning (incl. sub-query integration), which is where a
+	// derived-table outer's schema is reordered relative to the build-time
+	// schema the NLI probe keys were bound to. Gated on cost-driven (where
+	// NLI is being re-enabled); a no-op for production.
+	if costDrivenJoinOrder {
+		reconcileNLILayout(node)
+	}
 	return lowerSubPlanParams(node), nil
 }
 
