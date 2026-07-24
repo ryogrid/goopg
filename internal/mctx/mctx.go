@@ -82,7 +82,40 @@ var (
 	ctxMu           sync.Mutex
 )
 
+// permMu guards permanentContext's chunks/head. It lives at package level
+// rather than on Context because exactly one context is ever shared, and
+// Context is size-constrained to <=96 B by the design (see TestContextSizeof);
+// an embedded RWMutex would cost 24 B on every per-statement and per-expression
+// context to protect a single process-global one.
+//
+// RWMutex rather than Mutex because a permanent payload is written once and
+// read many times: concurrent readers of distinct big numerics must not
+// serialise on each other.
+var permMu sync.RWMutex
+
+// isShared reports whether c may be touched by more than one goroutine. Only
+// the permanent context is: every per-session, per-statement and
+// per-expression context is single-owner by contract (see the type comment),
+// so they keep the lock-free fast path.
+func (c *Context) isShared() bool { return c.id == PermContextID }
+
 // permanentContext is the process-global literal-payload context (slot 1).
+//
+// It is the ONE Context that is legitimately shared across goroutines: every
+// backend's big-mantissa numerics allocate from it (newBigNumericInCtx), and
+// it is never Reset or Released, which is precisely why arena-backed numerics
+// are safe to pass between goroutines at all.
+//
+// That sharing was previously unsynchronised. Because allocation is a bump
+// pointer that appends to c.chunks, and Bytes reads that same slice, two
+// concurrent SESSIONS doing arithmetic on numerics too large for an int64
+// mantissa already raced here — a pre-existing defect, rare only because such
+// values are rare. Parallel query would turn it from rare into routine, so it
+// is fixed here rather than worked around.
+//
+// `shared` opts this one context into locking; every per-session, per-statement
+// and per-expression context keeps the unsynchronised fast path, since those
+// are single-owner by contract.
 var permanentContext = func() *Context {
 	c := &Context{cs: defaultChunkSize, id: PermContextID, kind: KindSession}
 	ctxRegistry[PermContextID] = c
@@ -255,6 +288,10 @@ func (c *Context) Alloc(n int) []byte {
 	if n <= 0 {
 		return nil
 	}
+	if c.isShared() {
+		permMu.Lock()
+		defer permMu.Unlock()
+	}
 	if len(c.chunks) == 0 {
 		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
 		c.head = 0
@@ -276,6 +313,10 @@ func (c *Context) Alloc(n int) []byte {
 
 // AllocAligned returns aligned storage. align must be a power of two in [1, 64].
 func (c *Context) AllocAligned(n, align int) []byte {
+	if c.isShared() {
+		permMu.Lock()
+		defer permMu.Unlock()
+	}
 	if len(c.chunks) == 0 {
 		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
 		c.head = 0
@@ -310,6 +351,10 @@ func (c *Context) allocBytes(b []byte) (offset, length uint32) {
 	if n == 0 {
 		return 0, 0
 	}
+	if c.isShared() {
+		permMu.Lock()
+		defer permMu.Unlock()
+	}
 	if len(c.chunks) == 0 {
 		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
 		c.head = 0
@@ -341,6 +386,13 @@ func (c *Context) AllocString(s string) (offset, length uint32) {
 func (c *Context) Bytes(offset, length uint32) []byte {
 	if length == 0 {
 		return nil
+	}
+	// The read path needs the lock too, not just allocation: growChunk both
+	// appends to c.chunks and memmoves its tail, so a concurrent reader can
+	// otherwise observe a torn or relocated slice header.
+	if c.isShared() {
+		permMu.RLock()
+		defer permMu.RUnlock()
 	}
 	chunkIdx := offset / c.cs
 	chunkStart := offset % c.cs

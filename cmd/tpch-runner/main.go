@@ -40,7 +40,13 @@ func main() {
 	signalFile := flag.String("signal-file", "", "path to a sentinel file; when the file appears the current query is cancelled (context cancel + CancelRequest) and the runner moves to the next query. The file is removed after detection. Useful for manual mid-run interruption without stopping the whole process.")
 	doExplain := flag.Bool("explain", false, "issue EXPLAIN <query> instead of the query body")
 	doCheckpoint := flag.Bool("checkpoint", false, "issue a CHECKPOINT and exit (ignore -queries)")
+	parallelWorkers := flag.Int("parallel-workers", -1, "if >=0, SET max_parallel_workers_per_gather = N on each per-query session (-1 = leave the server default). Each query gets a fresh connection, so the SET is re-issued per query.")
 	flag.Parse()
+
+	// Thread the parallel-worker override to the per-query session setup via a
+	// package var: timeOneWithCancel is called from several sites and this
+	// avoids widening every signature for a measurement flag.
+	sessionParallelWorkers = *parallelWorkers
 
 	connStr := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
 		*host, *port, *dbName, *user, *pass)
@@ -121,6 +127,11 @@ func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, signalFile 
 // closed.
 //
 // Connection isolation: every query acquires a *fresh* `*sql.Conn`
+// sessionParallelWorkers, when >= 0, is applied as
+// SET max_parallel_workers_per_gather on every per-query session. -1 leaves the
+// server default untouched. Set once from the --parallel-workers flag in main.
+var sessionParallelWorkers = -1
+
 // via db.Conn(ctx) and Close()s it on exit. Combined with
 // MaxOpenConns=1, this guarantees a pristine TCP/protocol state
 // across queries; one query's error (e.g. SQLSTATE 42883 from Q9's
@@ -191,6 +202,19 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 		_ = conn.Raw(func(driverConn interface{}) error { return driver.ErrBadConn })
 		conn.Close()
 	}()
+
+	// Per-session parallel-worker override. Re-issued on every query because
+	// each query runs on its own fresh, then-discarded connection.
+	if sessionParallelWorkers >= 0 {
+		setCtx, setCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, serr := conn.ExecContext(setCtx,
+			fmt.Sprintf("SET max_parallel_workers_per_gather = %d", sessionParallelWorkers)); serr != nil {
+			setCancel()
+			fmt.Printf("%s: ERROR — SET max_parallel_workers_per_gather: %v\n", label, serr)
+			return
+		}
+		setCancel()
+	}
 
 	t0 := time.Now()
 	rows, err := conn.QueryContext(queryCtx, stmt)

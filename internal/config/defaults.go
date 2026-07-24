@@ -1,5 +1,7 @@
 package config
 
+import "math"
+
 // BuildDefaultRegistry returns a Registry seeded with every GUC the
 // goopg server currently advertises. Variables added here should cite
 // the upstream entry in postgres/src/backend/utils/misc/guc_tables.c so
@@ -615,7 +617,14 @@ func BuildDefaultRegistry() *Registry {
 	// postgres/src/backend/utils/misc/guc_tables.c entries
 	// where applicable.
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_parallel_workers_per_gather", Type: TypeInt, BootVal: "2",
+		// BootVal 4 is a deliberate goopg default (PG 18.3 ships 2): goopg
+		// workers are goroutines, not scarce pre-allocated PG worker slots, so a
+		// higher per-gather degree is cheaper to grant. The DECISION and
+		// WORKER-COUNT logic stay PG-faithful — computeParallelWorkers is
+		// compute_parallel_worker's log3 progression over min_parallel_table_scan_size,
+		// capped by THIS value; the max_parallel_workers=8 cluster cap still bounds
+		// total concurrency (operators_gather.go).
+		Name: "max_parallel_workers_per_gather", Type: TypeInt, BootVal: "4",
 		MinVal: 0, MaxVal: 1024,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
@@ -627,19 +636,39 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// P0: these two are GUC_UNIT_BLOCKS upstream, not kB. They were
+	// previously registered as UnitKB with the byte counts as boot values
+	// (8388608 / 524288), so `SHOW min_parallel_table_scan_size` reported
+	// 8GB where PG reports 8MB — wrong by 1024x in both value and unit.
+	// MinVal/MaxVal are in the native unit (blocks) and PG uses
+	// 0 .. INT_MAX/3 for both, which is the same 715827882 the kB
+	// registration happened to carry.
+	// postgres/src/backend/utils/misc/guc_tables.c:3727-3747.
 	r.MustRegister(NewVariable(Variable{
-		Name: "min_parallel_table_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "8388608",
+		Name: "min_parallel_table_scan_size", Type: TypeInt, Unit: UnitBlocks, BootVal: "8MB",
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "min_parallel_index_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "524288",
+		Name: "min_parallel_index_scan_size", Type: TypeInt, Unit: UnitBlocks, BootVal: "512kB",
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
+	}))
+	// max_parallel_workers — the cluster-wide cap on concurrently active
+	// parallel workers, distinct from the per-Gather cap. PG's default is 8
+	// (guc_tables.c). goopg does not launch workers yet, but the knob must
+	// exist and read back correctly; it becomes load-bearing when Gather
+	// insertion lands, because goroutines have no natural scarcity to bound
+	// oversubscription the way PG's pre-allocated worker slots do.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_parallel_workers", Type: TypeInt, BootVal: "8",
+		MinVal: 0, MaxVal: 1024,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
@@ -717,14 +746,16 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "parallel_setup_cost", Type: TypeReal, BootVal: "1000",
-		MinVal: 0, MaxVal: 1e15,
+		// PG's ceiling is DBL_MAX (guc_tables.c), not 1e15.
+		MinVal: 0, MaxVal: math.MaxFloat64,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "parallel_tuple_cost", Type: TypeReal, BootVal: "0.1",
-		MinVal: 0, MaxVal: 1e15,
+		// PG's ceiling is DBL_MAX (guc_tables.c), not 1e15.
+		MinVal: 0, MaxVal: math.MaxFloat64,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,

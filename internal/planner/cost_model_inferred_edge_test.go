@@ -29,8 +29,8 @@ func TestEstimateJoinCostInferredEdgePenalty(t *testing.T) {
 	explicitEdge := &joinEdge{leftTable: 0, rightTable: 1, isInferred: false}
 	inferredEdge := &joinEdge{leftTable: 0, rightTable: 1, isInferred: true}
 
-	_, costExplicit := estimateJoinCost(1000, 1000, explicitEdge, g, nil)
-	_, costInferred := estimateJoinCost(1000, 1000, inferredEdge, g, nil)
+	_, costExplicit := estimateJoinCost(1000, 1000, explicitEdge, 0, 0, g, nil)
+	_, costInferred := estimateJoinCost(1000, 1000, inferredEdge, 0, 0, g, nil)
 
 	if costInferred <= costExplicit {
 		t.Errorf("inferred-edge cost should be > explicit; got %d vs %d", costInferred, costExplicit)
@@ -64,7 +64,7 @@ func TestEstimateJoinCostExplicitUnaffected(t *testing.T) {
 		tables: []*catalog.Table{tbl, tbl},
 	}
 	edge := &joinEdge{leftTable: 0, rightTable: 1}
-	out, cost := estimateJoinCost(100, 100, edge, g, nil)
+	out, cost := estimateJoinCost(100, 100, edge, 0, 0, g, nil)
 	if out != 1000 {
 		t.Errorf("outputRows = %d, want 1000 (10000/10)", out)
 	}

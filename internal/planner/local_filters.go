@@ -152,6 +152,22 @@ func conjunctIsLocalEligible(e Expr) bool {
 //
 // (M0077-0001.)
 func shouldAttachBeforeMHJ(bindings []rangeBinding) bool {
+	// Cost-driven order builds a binary Join tree (no MultiHashJoin), so a
+	// single-table restriction that isn't routed to its leaf scan here
+	// filters the full-table join output at the top instead — e.g. TPC-H
+	// Q3 hash-joins all 6M lineitem rows then applies l_shipdate (121s vs
+	// 17s once the filter sits on the scan). Partitioning the locals out
+	// pre-DP also feeds the DP filtered base-rel cardinality, so it can
+	// pick the order for the RESTRICTED sizes rather than the full tables.
+	// Fire for every multi-table cost-driven plan. The NLI path is
+	// unaffected: the ≥5-table shapes already reach here (Q8's part scan
+	// is wrapped AND still becomes a NestedLoopIndexJoin), so a leaf
+	// Filter does not block the probe. The production integer DP keeps the
+	// original ≥5-table + small-dimension gate — its MultiHashJoin path
+	// routes leaf filters separately and its plans are snapshot-pinned.
+	if costDrivenJoinOrder {
+		return len(bindings) >= 2
+	}
 	if len(bindings) < 5 {
 		return false
 	}

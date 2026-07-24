@@ -22,6 +22,7 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -375,6 +376,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)
+	ectx.MaxParallelWorkers = sessionMaxParallelWorkers(sess)
+	ectx.MinParallelTableScanBlocks = sessionMinParallelTableScanSize(sess)
+	ectx.ParallelLeaderParticipation = sessionParallelLeaderParticipation(sess)
+	ectx.DebugParallelQuery = sessionDebugParallelQuery(sess)
 	if sess != nil {
 		ectx.AdvisorySessionIdentity = sess
 		ectx.GetSetting = func(name string) (string, bool) {
@@ -958,6 +964,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				precached = freshNode
 			}
+			// P6: wrap AFTER the cache read/write, so the CACHE holds the
+			// serial plan and the Gather is chosen per statement from this
+			// session's GUCs. See applyParallelPostPass.
+			precached = applyParallelPostPass(precached, sess, ectx)
 		}
 		// M0097-0059: enforce statement_timeout by deriving a deadline
 		// context. The executor checks ctx.Ctx.Err() at each outer-row
@@ -1167,6 +1177,175 @@ func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
 		return true // GUC not registered yet, default on
 	}
 	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
+// applyParallelPostPass wraps a finished plan in a Gather when the statement
+// and the session's settings allow it. P6 of docs/design/parallel-query/.
+//
+// It is called AFTER the plan-cache lookup on BOTH protocol paths, and that
+// placement is load-bearing rather than incidental. plancache.go is
+// process-wide and cross-session, keyed on namespace-oid + normalised SQL only
+// — no session identity, no GUC fingerprint. Caching a plan that already
+// contained a Gather would let one session's max_parallel_workers_per_gather
+// leak into another's execution, so `SET max_parallel_workers_per_gather = 0`
+// would silently fail to disable parallelism. The cache therefore stores
+// SERIAL plans, and this wraps per statement.
+//
+// planner.MaybeAddGather is correspondingly non-mutating: it returns a new
+// root sharing the cached children, because that cached node is being read
+// concurrently by every other session running the same SQL.
+func applyParallelPostPass(node planner.Node, sess *config.SessionRegistry, ectx *executor.Context) planner.Node {
+	if node == nil || ectx == nil {
+		return node
+	}
+	return planner.MaybeAddGather(node, planner.ParallelSettings{
+		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
+		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
+		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+		IsSerializable:      ectx.Tx.Isolation == mvcc.IsolationSerializable,
+		BlocksForTable:      parallelBlocksForTable(ectx),
+	})
+}
+
+// parallelBlocksForTable returns the relation-size lookup the parallel size
+// gate uses. It is a live O(1) counter read (storage.relFile.nBlocks holds the
+// value in memory), NOT a statistics lookup and NOT a scan — the same input
+// PG's compute_parallel_worker() gets from RelationGetNumberOfBlocks().
+//
+// This is what lets the gate work on a freshly started server: goopg's ANALYZE
+// row count is not restored at startup (ledger row pq-P6), so anything keyed on
+// it would refuse every query until an ANALYZE had run.
+func parallelBlocksForTable(ectx *executor.Context) func(*catalog.Table) (int64, bool) {
+	if ectx == nil {
+		return nil
+	}
+	return parallelBlocksForTableFrom(ectx.Pool, ectx.Catalog)
+}
+
+// parallelBlocksForTableFrom is the pool/catalog form, for the extended
+// protocol where planning happens before an executor context exists.
+func parallelBlocksForTableFrom(pool *storage.Pool, cat catalog.Catalog) func(*catalog.Table) (int64, bool) {
+	if pool == nil || cat == nil {
+		return nil
+	}
+	return func(t *catalog.Table) (int64, bool) {
+		if t == nil {
+			return 0, false
+		}
+		n, err := pool.NBlocks(cat.RelFileNode(t))
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	}
+}
+
+// ── parallel-query session GUCs (docs/design/parallel-query, P1) ──────────
+//
+// These follow the sessionStatsTarget shape exactly: three layers of
+// defensive fallback (nil registry / unregistered GUC / unparseable value),
+// each landing on a value that is CORRECT rather than a sentinel. That matters
+// here more than usual — six other executor.NewContext() sites (copy.go,
+// database_ddl.go, role_ddl.go) set no session GUCs at all, so a zero value
+// must mean something sane on its own.
+//
+// All of them read via sess.Get, never GetDisplay: Get returns the canonical
+// bare integer ("1024"), GetDisplay returns the human form ("8MB"). Internal
+// arithmetic must use the former (internal/config/session.go:85-90).
+
+// sessionMaxParallelWorkersPerGather reads `max_parallel_workers_per_gather`.
+// Zero means "no parallelism" and is a legitimate user setting, not an
+// absence — so an unreadable GUC falls back to 0 (serial), the safe direction.
+func sessionMaxParallelWorkersPerGather(sess *config.SessionRegistry) int {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("max_parallel_workers_per_gather")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(eff))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// sessionMaxParallelWorkers reads the cluster-wide `max_parallel_workers`
+// cap. Same fallback reasoning as above: 0 disables parallelism entirely,
+// which is the direction that cannot cause harm.
+func sessionMaxParallelWorkers(sess *config.SessionRegistry) int {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("max_parallel_workers")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(eff))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// sessionMinParallelTableScanSize reads `min_parallel_table_scan_size` in
+// BLOCKS — the GUC's native unit as of P0. A relation smaller than this never
+// gets a parallel path (upstream compute_parallel_worker,
+// postgres/src/backend/optimizer/path/allpaths.c:4273).
+//
+// Zero here would mean "every relation qualifies", which is the unsafe
+// direction, so an unreadable GUC falls back to PG's default of 1024 blocks
+// (8MB) rather than to zero.
+func sessionMinParallelTableScanSize(sess *config.SessionRegistry) int64 {
+	const pgDefaultBlocks = 1024 // (8 * 1024 * 1024) / BLCKSZ
+	if sess == nil {
+		return pgDefaultBlocks
+	}
+	_, eff, ok := sess.Get("min_parallel_table_scan_size")
+	if !ok {
+		return pgDefaultBlocks
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || n < 0 {
+		return pgDefaultBlocks
+	}
+	return n
+}
+
+// sessionParallelLeaderParticipation reads `parallel_leader_participation`.
+// Upstream's default is on; an unreadable GUC keeps that.
+func sessionParallelLeaderParticipation(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return true
+	}
+	_, eff, ok := sess.Get("parallel_leader_participation")
+	if !ok {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
+// sessionDebugParallelQuery reads `debug_parallel_query`, upstream's lever for
+// forcing parallel plans in testing. Returns the canonical enum value
+// ("off" / "on" / "regress"); the P0 synonym work means a user may have
+// written `true`, and canonicalisation has already mapped it to "on".
+func sessionDebugParallelQuery(sess *config.SessionRegistry) string {
+	if sess == nil {
+		return "off"
+	}
+	_, eff, ok := sess.Get("debug_parallel_query")
+	if !ok {
+		return "off"
+	}
+	v := strings.ToLower(strings.TrimSpace(eff))
+	switch v {
+	case "on", "regress":
+		return v
+	default:
+		return "off"
+	}
 }
 
 func sessionWorkMem(sess *config.SessionRegistry) int64 {
@@ -1425,7 +1604,7 @@ func searchPathSchemas(sess *config.SessionRegistry) []string {
 // search_path, mirroring internal/executor/expr.go's regObjectSchemaVisible
 // (used there to decide regproc/regoperator/regtype schema-qualification).
 // Unlike searchPathSchemas above, an explicitly empty search_path (pg_dump's
-// search_path='', ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
+// search_path=”, ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
 // public here — it correctly yields no visible schemas, forcing
 // RegtypeName's caller to schema-qualify a user-defined type name.
 // getSetting is nil-safe (a nil executor.Context.GetSetting, or no session
@@ -2356,6 +2535,16 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		// Note: plan cache storage happens at the dispatch level (caller
 		// stores if cacheKey was computed). This function only executes.
+		//
+		// P6: this fallback plans for statements the caller's cache block
+		// skipped (multi-statement queries, NOTIFY/2PC, pending DDL). It
+		// needs the parallel post-pass too — the caller only applies it to
+		// the cached path, and a Gather that appears on one entry point but
+		// not another is exactly the kind of inconsistency that makes a
+		// feature look intermittent.
+		if sess, _ := ctx.AdvisorySessionIdentity.(*config.SessionRegistry); sess != nil {
+			node = applyParallelPostPass(node, sess, ctx)
+		}
 	}
 	// Transaction verbs: BEGIN/COMMIT/ROLLBACK require per-connection
 	// explicit transaction management (M0096-0005). BEGIN promotes the

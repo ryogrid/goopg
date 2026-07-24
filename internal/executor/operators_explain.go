@@ -450,6 +450,19 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
 func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
 	switch p := n.(type) {
+	case *planner.Gather:
+		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
+		// property. `Workers Launched:` is execution-time and belongs to the
+		// ANALYZE walk instead.
+		*rows = append(*rows, Row{NewStringDatum(
+			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
+	case *planner.GatherMerge:
+		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
+		// print the merge keys (explain.c has no show_sort_keys call in the
+		// T_GatherMerge arm) — the keys are the child Sort's, and it prints
+		// them itself one line below.
+		*rows = append(*rows, Row{NewStringDatum(
+			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
 	case *planner.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
@@ -1088,13 +1101,46 @@ func describePlan(n planner.Node) string {
 			return fmt.Sprintf("%s (%s, build=left)", algo, jt)
 		}
 		return fmt.Sprintf("%s (%s)", algo, jt)
+	case *planner.Gather:
+		return "Gather"
+	case *planner.GatherMerge:
+		return "Gather Merge"
 	case *planner.Distinct:
 		return "Unique"
 	case *planner.Aggregate:
-		if len(p.GroupExprs) == 0 {
-			return "Aggregate"
+		// P9: PG prefixes a split aggregate's two halves with "Partial " and
+		// "Finalize " (explain.c, from the Agg node's aggsplit). Without them
+		// a parallel plan shows two identical HashAggregate lines stacked with
+		// a Gather between, which reads as a bug rather than as the split it
+		// is. This is the prefix P2's rename was sequenced to protect.
+		prefix := ""
+		switch p.Mode {
+		case planner.AggModePartial:
+			prefix = "Partial "
+		case planner.AggModeFinal:
+			prefix = "Finalize "
 		}
-		return fmt.Sprintf("GroupAggregate (%d keys)", len(p.GroupExprs))
+		if len(p.GroupExprs) == 0 {
+			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
+			// regardless of strategy, so this one is already faithful.
+			return prefix + "Aggregate"
+		}
+		// P2 (docs/design/parallel-query/06 §4.1): this used to say
+		// "GroupAggregate", which in PG means specifically the SORTED,
+		// streaming strategy (AGG_SORTED). goopg has exactly one grouped
+		// implementation and it is a hash aggregate — aggregateOp.Open
+		// builds `groups := map[string]*groupRuntime{}` for every case,
+		// with no sorted/streaming variant and no hash-agg spill. The label
+		// was therefore describing a strategy the engine does not have.
+		//
+		// Corrected here rather than later because P5 prefixes these labels
+		// with "Partial "/"Finalize " for parallel aggregation, which would
+		// otherwise cement "Partial GroupAggregate" onto a hash node.
+		//
+		// The "(%d keys)" suffix is goopg's own; PG emits a separate
+		// "Group Key: <exprs>" detail line instead. Kept as-is to hold this
+		// stage to the rename — see the TODO's follow-up note.
+		return fmt.Sprintf("%sHashAggregate (%d keys)", prefix, len(p.GroupExprs))
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:
@@ -1227,6 +1273,10 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Sort:
 		return []planner.Node{p.Child}
 	case *planner.Limit:
+		return []planner.Node{p.Child}
+	case *planner.Gather:
+		return []planner.Node{p.Child}
+	case *planner.GatherMerge:
 		return []planner.Node{p.Child}
 	case *planner.Distinct:
 		return []planner.Node{p.Child}

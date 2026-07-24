@@ -65,14 +65,14 @@ func TestEstimateJoinCostPrefersSmallFilteredBuild(t *testing.T) {
 	}
 	edge := &joinEdge{leftTable: 0, rightTable: 1}
 	// Small build: 100-row hashed against 1000-row probe.
-	_, costSmallBuild := estimateJoinCost(100, 1000, edge, g, nil)
+	_, costSmallBuild := estimateJoinCost(100, 1000, edge, 0, 0, g, nil)
 	// Big build: 1000-row hashed against 100-row probe.
 	// The implementation picks min(L,R) as build, so the
 	// build is still 100. To force a 1000-row build, swap
 	// rows so neither side is < the other; here L=R=1000.
 	// We then compare to a 100-row build at L=R=100 (probe
 	// stays a 1000-row probe via L=100,R=1000 above).
-	_, costBigBuild := estimateJoinCost(1000, 1000, edge, g, nil)
+	_, costBigBuild := estimateJoinCost(1000, 1000, edge, 0, 0, g, nil)
 	if costBigBuild <= costSmallBuild {
 		t.Errorf("big-build cost (%d) should exceed small-build cost (%d)", costBigBuild, costSmallBuild)
 	}
@@ -94,8 +94,8 @@ func TestEstimateJoinCostBuildSideIsMinSide(t *testing.T) {
 	// L=10, R=1000 vs L=1000, R=10 must produce the same
 	// cost — which side is "left" doesn't matter for the
 	// cost; only min/max do.
-	_, c1 := estimateJoinCost(10, 1000, edge, g, nil)
-	_, c2 := estimateJoinCost(1000, 10, edge, g, nil)
+	_, c1 := estimateJoinCost(10, 1000, edge, 0, 0, g, nil)
+	_, c2 := estimateJoinCost(1000, 10, edge, 0, 0, g, nil)
 	if c1 != c2 {
 		t.Errorf("cost(L=10,R=1000)=%d != cost(L=1000,R=10)=%d (build side should be min)", c1, c2)
 	}
@@ -137,12 +137,14 @@ func TestBuildJoinFromDPUsesProvidedRows(t *testing.T) {
 	// But the caller-provided dpEntry.rows say left=100, right=100000;
 	// after Slice C the build-side decision must use those — picking
 	// LEFT (100 rows) as the build.
-	join := buildJoinFromDP(leftScan, rightScan, 100, 100000, 0b01, 0b10, edge, g)
+	lLayout := map[int]int{0: 0}
+	rLayout := map[int]int{1: 0}
+	join := buildJoinFromDP(leftScan, rightScan, 100, 100000, 0b01, 0b10, lLayout, rLayout, edge, g)
 	if !join.BuildLeft {
 		t.Error("BuildLeft must be true when caller-provided leftRows < rightRows even though EstimateRows ties")
 	}
 	// Symmetric: when the caller says right is smaller, build right.
-	join2 := buildJoinFromDP(leftScan, rightScan, 100000, 100, 0b01, 0b10, edge, g)
+	join2 := buildJoinFromDP(leftScan, rightScan, 100000, 100, 0b01, 0b10, lLayout, rLayout, edge, g)
 	if join2.BuildLeft {
 		t.Error("BuildLeft must be false when caller-provided rightRows < leftRows")
 	}

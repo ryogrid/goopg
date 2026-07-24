@@ -363,7 +363,19 @@ func newBytesArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 //
 // M0073-0004.
 func (d Datum) MaterializeArena() Datum {
-	if d.ArenaID == 0 || (d.Kind != KindString && d.Kind != KindBytes) {
+	if d.ArenaID == 0 {
+		return d
+	}
+	// Big-numeric (flagBigNumeric) is mctx-backed just like an arena
+	// string, but on a different Kind. It must be detached at the same
+	// retention boundary or a producer arena reset corrupts its
+	// sign+BE-magnitude bytes at scale (the sibling-path gap that only
+	// String/Bytes were covering; see rowHasArena/cloneRowOwned). Re-store
+	// it in the permanent arena, which never resets.
+	if d.Kind == KindNumeric && d.Flags&flagBigNumeric != 0 {
+		return newBigNumericInCtx(mctx.Perm(), d.NumericBigValue(), d.Scale)
+	}
+	if d.Kind != KindString && d.Kind != KindBytes {
 		return d
 	}
 	length := uint32(d.Int & 0xFFFFFFFF)
@@ -390,7 +402,12 @@ func (d Datum) MaterializeArena() Datum {
 // in production; the test surface exercises it directly.
 func rowHasArena(r Row) bool {
 	for _, d := range r {
-		if d.ArenaID != 0 && (d.Kind == KindString || d.Kind == KindBytes) {
+		// Any arena-backed Datum needs materialising at the retention
+		// boundary — String/Bytes AND big-numeric (flagBigNumeric) all set
+		// ArenaID. Keying on ArenaID != 0 (rather than a Kind allow-list)
+		// closes the sibling-path gap that silently corrupted big-numeric
+		// build rows at scale.
+		if d.ArenaID != 0 {
 			return true
 		}
 	}
@@ -408,25 +425,11 @@ func rowHasArena(r Row) bool {
 func cloneRowOwned(src Row) Row {
 	dst := acquireRow(len(src))
 	for i, d := range src {
-		if d.ArenaID != 0 && (d.Kind == KindString || d.Kind == KindBytes) {
-			length := uint32(d.Int & 0xFFFFFFFF)
-			if length == 0 {
-				dst[i] = Datum{Kind: d.Kind}
-				continue
-			}
-			ctx := mctx.Lookup(d.ArenaID)
-			if ctx == nil {
-				dst[i] = Datum{Kind: d.Kind}
-				continue
-			}
-			offset := uint32(d.Int >> 32)
-			s := ctx.Bytes(offset, length)
-			buf := make([]byte, length)
-			copy(buf, s)
-			dst[i] = Datum{Kind: d.Kind, Buf: buf}
-		} else {
-			dst[i] = d
-		}
+		// MaterializeArena detaches EVERY arena-backed kind (String/Bytes
+		// and big-numeric) from a resettable producer arena. Previously
+		// this inlined only the String/Bytes case, silently leaving
+		// big-numeric build rows aliasing an arena that resets at scale.
+		dst[i] = d.MaterializeArena()
 	}
 	return dst
 }

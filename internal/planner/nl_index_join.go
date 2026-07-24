@@ -82,6 +82,13 @@ func rewriteJoinsToNLI(n Node, cat catalog.Catalog) Node {
 	if !nliEnabled.Load() {
 		return n
 	}
+	// NLI is enabled under cost-driven order too: doc 13 Phase 2's
+	// reconcileNLILayout (a final pass in planner.Plan, gated on
+	// costDrivenJoinOrder) re-resolves NLI probe keys, NLI/Join output
+	// schemas, and downstream refs by name after the late sub-query
+	// integration reorders a derived-table outer — the divergence that
+	// used to make TPC-H Q9 return 0/1 rows. (Phase 1's blanket
+	// cost-driven skip is superseded by that fix.)
 	return walkRewriteNLI(n, cat)
 }
 
@@ -1244,9 +1251,75 @@ func SetNLICostGateLegacy(on bool) { nliCostGateLegacy.Store(on) }
 func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
 	outerRows := EstimateRows(outer)
 	semiAnti := joinType == JoinTypeSemi || joinType == JoinTypeAnti
-	if !semiAnti || nliCostGateLegacy.Load() {
-		// Historical heuristic (also the legacy escape hatch for
-		// semi/anti): small-or-unknown outer → NLI.
+	if nliCostGateLegacy.Load() {
+		// Legacy escape hatch: small-or-unknown outer → NLI.
+		if outerRows <= 0 {
+			return true
+		}
+		return outerRows <= nliMaxOuterRowsHeuristic
+	}
+	if !semiAnti {
+		// INNER: under cost-driven order, apply the same stats-aware
+		// fan-out test the semi/anti arm uses. An index probe on a
+		// NON-UNIQUE inner column returns matchSet = innerRows /
+		// NDistinct(probe column) rows per outer row, so the NLI does
+		// outerRows × matchSet work. That is ruinous when the inner index
+		// is low-selectivity regardless of outer size — TPC-H Q5
+		// index-probes supplier_nation_fkidx (~400 suppliers per nation),
+		// fanning a 730k outer to ~290M and running 200s+ — while a
+		// unique-key probe (matchSet ≈ 1) stays cheap (Q7/Q8/Q9's
+		// o_orderkey / n_nationkey probes). Reject iff NLI's probe work
+		// exceeds the hash alternative (one inner build + O(1) per outer).
+		// The production integer DP keeps the historical outer-row
+		// heuristic (its plans are snapshot-pinned and it reaches the star
+		// join via MultiHashJoin, not this fan-out NLI). When stats are
+		// absent (goopg's in-memory ANALYZE is lost on restart — the
+		// common case) the formula falls back to that same heuristic, so
+		// NLI is never permanently disabled.
+		if costDrivenJoinOrder {
+			// Composite-index exact probe MUST stay NLI. pickIndexCoveringAllLeadingColumns
+			// only returns a multi-column index when EVERY leading column is bound by an
+			// equi-conjunct, so this NLI probes the whole composite key exactly (matchSet=1,
+			// no fan-out). The hash alternative cannot: goopg's hash/MHJ join keys on a
+			// SINGLE column, so a composite join hashes on one key column and fans out on the
+			// rest — Q9's partsupp on ps_partkey alone fans each row ~4× to 24M and OOMs.
+			// The integer planner keeps partsupp as an NLI for exactly this reason
+			// (design 14 §2 / IMPLEMENTATION-TODO C4a-ii "composite cannot go in a hash").
+			if idx != nil && len(idx.Columns) > 1 {
+				return true
+			}
+			var innerRows, matchSet int64
+			if innerScan != nil && innerScan.Table != nil {
+				innerRows = tableRows(innerScan.Table)
+				matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
+			}
+			if outerRows > 0 && innerRows > 0 && matchSet > 0 {
+				// Cost-based decision (was a bare tuple-count compare
+				// `outerRows*matchSet < innerRows+outerRows`, which for a
+				// UNIQUE inner — matchSet=1 — reduced to `outerRows <
+				// innerRows+outerRows`, i.e. ALWAYS accept NLI regardless of
+				// outer size). That silently picked NLI for Q9's orders /
+				// partsupp joins: 322k random index probes over a 1.5M/800k
+				// inner, each probe paying goopg's eager per-probe TID
+				// materialisation — ruinous, and it timed the query out.
+				//
+				// Charge each side its real per-row cost instead. An index
+				// probe pays indexProbeCost (2 random pages + CPU, ×
+				// indexProbeCostMultiplier — goopg's probe is far dearer than
+				// PG's random_page_cost model, ch. 06 §5). The hash
+				// alternative builds the inner once and does ONE cheap int64
+				// probe per outer row — the int64 fast-path (executor
+				// operators_join_agg.go) put goopg's binary hash join back on
+				// PG's cost model, so PG's hash constants now apply. NLI wins
+				// only for a genuinely selective outer (few probes); a large
+				// outer flips to the now-cheap hash, exactly Q9's fix.
+				cp := defaultCostParams()
+				nliCost := float64(outerRows) * float64(matchSet) * indexProbeCost(cp)
+				hashCost := float64(innerRows)*(cp.cpuTupleCost+cp.cpuOperatorCost) +
+					float64(outerRows)*cp.cpuOperatorCost
+				return nliCost < hashCost
+			}
+		}
 		if outerRows <= 0 {
 			return true
 		}

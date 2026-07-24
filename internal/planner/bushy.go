@@ -2,11 +2,24 @@ package planner
 
 import (
 	"fmt"
+	"math"
 	"math/bits"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// GOOPG_COST_DRIVEN_JOINORDER=1 enables the C4 cost-driven join-order
+// planner (real PG-unit path cost) with MultiHashJoin packing dropped
+// (ch. 12). Off by default so production planning is unchanged; used to
+// measure the pivot on the bench server before promoting the default.
+func init() {
+	if os.Getenv("GOOPG_COST_DRIVEN_JOINORDER") == "1" {
+		costDrivenJoinOrder = true
+		mhjPackingEnabled = false
+	}
+}
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
 // FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)
@@ -205,6 +218,11 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	if len(locals.byBinding) > 0 {
 		bushyPlan = attachRelationLocalFilters(bushyPlan, locals, scans, ctx.bindings)
 	}
+	// Cost-model C0.2 (design ch. 03 §3): route the DP's chosen join subtree
+	// through create_plan. Today this is an identity transform (the subtree is
+	// carried whole in a PathPrebuilt); from C4 the *cost-selected* path flows
+	// through this same seam instead of the integer DP's hand-built tree.
+	bushyPlan = createPlanFromDPChoice(bushyPlan)
 	if len(residual) == 0 {
 		// All conjuncts consumed — Filter is unnecessary.
 		return bushyPlan, nil
@@ -401,8 +419,24 @@ func visitColumnRefsForTable(e Expr, onIdx func(int)) {
 	switch x := e.(type) {
 	case *ColumnRef:
 		onIdx(x.Index)
-	case *OuterColumnRef, *SubqueryExpr, *InExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
+	case *OuterColumnRef, *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
 		// outer refs and subqueries → out of scope
+	case *InExpr:
+		// `col IN (subquery)` (Plan != nil) references an enclosing
+		// scope → out of scope, like the subquery nodes above. But a
+		// literal-list `col IN (a, b, ...)` is an ordinary single-table
+		// predicate; descend so tableForCol can resolve it to its
+		// relation and the relation-local partition can push it onto the
+		// leaf scan (TPC-H Q12's l_shipmode IN ('MAIL','SHIP'), the query's
+		// most selective restriction, was otherwise stranded at the top
+		// Filter). conjunctIsLocalEligible already rejects the subquery form.
+		if x.Plan != nil {
+			return
+		}
+		visitColumnRefsForTable(x.Operand, onIdx)
+		for _, item := range x.List {
+			visitColumnRefsForTable(item, onIdx)
+		}
 	case *BinaryOp:
 		visitColumnRefsForTable(x.Left, onIdx)
 		visitColumnRefsForTable(x.Right, onIdx)
@@ -495,6 +529,118 @@ type dpEntry struct {
 	// `EstimateRows(plan)` re-evaluation).
 	rows int64
 	cost int64
+
+	// layout maps each base-table index (0..nodes-1) to the column
+	// offset at which that table's columns begin within THIS entry's
+	// plan.Output(). A singleton {i} is {i:0}; a composed subset is
+	// leftLayout ∪ {t: rightLayout[t] + leftWidth}. buildJoinFromDP
+	// uses it to remap a join key to its REAL position in a child
+	// plan whose schema is `leftSchema ++ rightSchema` — which is NOT
+	// ascending table order for bushy compositions (enumerateSplits
+	// assigns arbitrary subsets to left/right). The old ascending
+	// assumption mis-resolved keys for non-ascending subsets (TPC-H
+	// Q8 → 0 rows under cost-driven order; see cost-model
+	// IMPLEMENTATION-TODO). For ascending subsets layout[t] equals the
+	// old prefix-sum, so behaviour is unchanged for every plan the
+	// integer DP produces today.
+	layout map[int]int
+
+	// pgCost is the subtree's cost in real PG units (cost.h), built
+	// bottom-up: base = costSeqscan; join = hashJoinCost over the two
+	// children's pgCosts (or nestloopCost when the join will convert
+	// to an NL-index, C4-pg-ii). When costDrivenJoinOrder is on the DP
+	// selects the join order by pgCost.Total instead of the integer
+	// `cost` heuristic (cost-model ch. 12 §2). Always computed so the
+	// switch is a comparison-key change, not a structural one.
+	pgCost Cost
+}
+
+// costDrivenJoinOrder switches enumerateBushyPlans from the integer
+// `output + build*4 + probe` argmin (bushy.go:764) to real PG-unit
+// path cost (dpEntry.pgCost) for join-order selection — the C4 pivot
+// (cost-model ch. 12 §2). Default OFF: the integer DP is unchanged and
+// plan-preserving until a measurement gate promotes the switch.
+var costDrivenJoinOrder = false
+
+// SetCostDrivenJoinOrder toggles cost-driven join-order selection.
+// Returns the previous value so a caller/test can restore it.
+func SetCostDrivenJoinOrder(v bool) bool {
+	prev := costDrivenJoinOrder
+	costDrivenJoinOrder = v
+	return prev
+}
+
+// mhjPackingEnabled controls whether planSelect packs binary hash-join
+// chains into a MultiHashJoin (rewriteMultiWayChain). PG has no MHJ;
+// the cost-driven planner drops it (ch. 12 §3) so the DP's PG-shaped
+// binary tree is final and the order-then-rewrite mismatch that
+// regressed Q9 cannot recur. Default ON to preserve the current
+// (non-cost-driven) planner; SetCostDrivenJoinOrder(true) should be
+// paired with SetMHJPackingEnabled(false).
+var mhjPackingEnabled = true
+
+// SetMHJPackingEnabled toggles MultiHashJoin packing. Returns the
+// previous value.
+func SetMHJPackingEnabled(v bool) bool {
+	prev := mhjPackingEnabled
+	mhjPackingEnabled = v
+	return prev
+}
+
+// nliCostDelegation, when true (default under cost-driven order), makes
+// the DP cost each candidate join as the method rewriteJoinsToNLI will
+// ACTUALLY build it (ch. 12 §4): consult tryBuildNLI on a clone and, if
+// convertible, cost the join with nestloopCost + indexProbeCost instead
+// of hashJoinCost. Construction stays solely in rewriteJoinsToNLI — the
+// DP only borrows tryBuildNLI as the shared predicate so its ranking and
+// the executed method cannot desync.
+var nliCostDelegation = true
+
+// SetNLICostDelegation toggles delegated NLI costing. Returns previous.
+func SetNLICostDelegation(v bool) bool {
+	prev := nliCostDelegation
+	nliCostDelegation = v
+	return prev
+}
+
+// isProbableInnerScan reports whether a node is a base-relation scan
+// (optionally behind a Filter) — the shape tryBuildNLI index-probes as
+// the NLI inner. Used to decide which side drives the loop when costing
+// a delegated NLI (ch. 12 §4).
+func isProbableInnerScan(n Node) bool {
+	switch x := n.(type) {
+	case *SeqScan, *IndexScan:
+		return true
+	case *Filter:
+		return isProbableInnerScan(x.Child)
+	}
+	return false
+}
+
+// costJoinCandidate returns the PG-unit cost of a candidate join as the
+// method it will actually execute. Default: hashJoinCost. When NLI-cost
+// delegation is on and tryBuildNLI reports the join convertible (on a
+// shallow clone, so no mutation escapes), it is costed as a nested loop
+// whose inner is one index probe per outer row — the cost that makes the
+// DP avoid orders that NL-probe a large relation.
+func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRows int64, cat catalog.Catalog) Cost {
+	hashCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
+		float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+	if !nliCostDelegation || cat == nil || join == nil {
+		return hashCost
+	}
+	clone := *join
+	if _, ok := tryBuildNLI(&clone, cat); !ok {
+		return hashCost
+	}
+	// tryBuildNLI prefers the Right child as the index-probed inner; the
+	// other side drives the loop. Cost = outer scan + one probe per outer
+	// row (indexProbeCost) + per-output CPU.
+	outerCost, outerRows, innerCost := entryA.pgCost, entryA.rows, entryB.pgCost
+	if !isProbableInnerScan(entryB.plan) {
+		outerCost, outerRows, innerCost = entryB.pgCost, entryB.rows, entryA.pgCost
+	}
+	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), float64(outRows), indexProbeCost(cp))
 }
 
 func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
@@ -532,10 +678,13 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 
 	edgeUsed := make([]bool, len(g.edges))
 	dp := make(map[uint16]dpEntry)
+	cp := defaultCostParams()
 
 	for i := 0; i < g.nodes; i++ {
 		mask := uint16(1 << i)
-		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i]}
+		width := nodeTupleWidth(g.scans[i])
+		baseCost := costSeqscan(cp, estScanPages(float64(rowCounts[i]), width), float64(rowCounts[i]), 0)
+		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i], layout: map[int]int{i: 0}, pgCost: baseCost}
 	}
 
 	for size := 2; size <= g.nodes; size++ {
@@ -549,6 +698,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 			}
 			var best *dpEntry
 			var bestEdgeIdx int
+			var bestA, bestB uint16
 			bestEdgeIdx = -1
 			enumerateSplits(mask, func(a, b uint16) {
 				if !isConnectedMask(a, g) || !isConnectedMask(b, g) {
@@ -572,16 +722,59 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				// so deeper DP levels see this subset's
 				// cardinality estimate rather than its cost
 				// (the two diverge once the build term enters).
-				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
-				if best == nil || cost < best.cost {
-					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, edge, g)
-					best = &dpEntry{plan: join, rows: outRows, cost: cost}
+				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, a, b, g, cat)
+				// Cost-driven mode builds the candidate join up front so its
+				// pgCost can reflect the method rewriteJoinsToNLI will build
+				// (ch. 12 §2, §4). Integer mode defers the build to the
+				// winner only (unchanged, plan-preserving).
+				var join *Join
+				var mergedLayout map[int]int
+				var pgCost Cost
+				if costDrivenJoinOrder {
+					join = buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
+					mergedLayout = mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					pgCost = costJoinCandidate(cp, join, entryA, entryB, outRows, cat)
+				}
+				// Selection key: real PG cost when cost-driven, else the
+				// integer heuristic.
+				better := best == nil
+				if !better {
+					if costDrivenJoinOrder {
+						better = pgCost.Total < best.pgCost.Total
+					} else {
+						better = cost < best.cost
+					}
+				}
+				if better {
+					if join == nil {
+						join = buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
+						mergedLayout = mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					}
+					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout, pgCost: pgCost}
 					bestEdgeIdx = edgeIdx
+					bestA, bestB = a, b
 				}
 			})
 			if best != nil {
 				dp[mask] = *best
-				if bestEdgeIdx >= 0 {
+				if costDrivenJoinOrder {
+					// Cost-driven buildJoinFromDP attached EVERY cross-edge
+					// between bestA and bestB onto the join in local coords
+					// (attachExtraEdgesLocal), so mark them all consumed —
+					// none should survive as a residual or be re-attached in
+					// global coords by attachUnusedCrossEdges (which the
+					// composite NLI cannot localise; the Q9=0 cause).
+					for i := range g.edges {
+						e := &g.edges[i]
+						la := bestA&(1<<e.leftTable) != 0
+						ra := bestA&(1<<e.rightTable) != 0
+						lb := bestB&(1<<e.leftTable) != 0
+						rb := bestB&(1<<e.rightTable) != 0
+						if (la && rb) || (ra && lb) {
+							edgeUsed[i] = true
+						}
+					}
+				} else if bestEdgeIdx >= 0 {
 					// Mark only the SPECIFIC edge picked at this
 					// DP step. Internal edges of the two subsets
 					// were marked when their dp[] entries were
@@ -782,7 +975,226 @@ const (
 // rather than re-reading raw table sizes.
 //
 // (M0077-0003 / Slice C per design 02 §3.)
-func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
+// accurateKeyDistinct returns the distinct-value count of a single join-key
+// column, preferring the UNSATURATED estimate NDistinctFrac × RowCount (PG's
+// negative stadistinct fraction) over the raw sample NDistinct (saturates
+// ~30000). It resolves the SPECIFIC key column (not the table max) because an
+// equijoin's selectivity is governed by the joined columns only. Mirrors
+// cardinality.go's columnNDistinctForChild resolution (ColumnRef.Index indexes
+// the base table's positional Stats.Columns). Returns 0 when unresolvable.
+func accurateKeyDistinct(key Expr, tbl *catalog.Table) int64 {
+	if tbl == nil || tbl.Stats == nil {
+		return 0
+	}
+	cr, ok := key.(*ColumnRef)
+	if !ok {
+		return 0
+	}
+	idx := cr.Index
+	if idx < 0 || idx >= len(tbl.Stats.Columns) {
+		return 0
+	}
+	cs := tbl.Stats.Columns[idx]
+	if cs.NDistinctFrac > 0 && tbl.Stats.RowCount > 0 {
+		return int64(cs.NDistinctFrac * float64(tbl.Stats.RowCount))
+	}
+	return cs.NDistinct
+}
+
+// maxColSaturatedDistinct is the historical fallback: the largest per-column
+// SAMPLE NDistinct across the table. Used when the join key does not resolve to
+// a base-table ColumnRef, so keyless/degenerate edges estimate as before.
+func maxColSaturatedDistinct(tbl *catalog.Table) int64 {
+	if tbl == nil || tbl.Stats == nil {
+		return 0
+	}
+	best := int64(0)
+	for _, cs := range tbl.Stats.Columns {
+		if cs.NDistinct > best {
+			best = cs.NDistinct
+		}
+	}
+	return best
+}
+
+// sideKeyDistinct resolves the accurate join-key distinct for one side, falling
+// back to the table's saturated max when the key is unresolvable.
+func sideKeyDistinct(key Expr, tbl *catalog.Table) int64 {
+	if d := accurateKeyDistinct(key, tbl); d > 0 {
+		return d
+	}
+	return maxColSaturatedDistinct(tbl)
+}
+
+// satRowsMulDiv returns a*b/d clamped to [1, MaxInt64], computed in
+// float64 so the a*b product cannot overflow int64. Composed-subset
+// cardinalities reach ~1e14 at SF1 scale; an int64 a*b then wraps
+// negative before the divide. float64 keeps ~15 significant digits —
+// ample for a cardinality estimate — and saturates instead of wrapping.
+func satRowsMulDiv(a, b, d int64) int64 {
+	if d < 1 {
+		d = 1
+	}
+	v := float64(a) * float64(b) / float64(d)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	if v < 1 {
+		return 1
+	}
+	return int64(v)
+}
+
+// satMul returns a*b clamped to [1, MaxInt64], computed in float64 so the
+// product cannot wrap int64 negative — the §4 multi-clause divisor multiplies
+// several ~1e5 per-column NDVs, whose product reaches ~1e15.
+func satMul(a, b int64) int64 {
+	if a < 1 {
+		a = 1
+	}
+	if b < 1 {
+		b = 1
+	}
+	v := float64(a) * float64(b)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
+// satCost sums the 3-part integer cost in float64 and clamps to
+// [1, MaxInt64], for the same overflow reason as satRowsMulDiv (the
+// output/build/probe terms can each be ~1e14 at scale).
+func satCost(out, build, probe int64) int64 {
+	v := float64(out)*float64(outputRowWeight) +
+		float64(build)*float64(hashBuildWeight) +
+		float64(probe)*float64(hashProbeWeight)
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	if v < 1 {
+		return 1
+	}
+	return int64(v)
+}
+
+// crossEdgesBetween returns every graph edge that straddles the two subset
+// masks a and b (in either FROM-order orientation). findEdgeBetweenIdx returns
+// only the FIRST such edge; the FK/unique/multi-clause estimators (ch. 14
+// §2–§4) need ALL of them — Q9's partsupp↔lineitem join spans two edges
+// (ps_partkey=l_partkey AND ps_suppkey=l_suppkey) and a single edge sees only
+// one column of the composite key.
+func crossEdgesBetween(a, b uint16, g *joinGraph) []*joinEdge {
+	var out []*joinEdge
+	for i := range g.edges {
+		e := &g.edges[i]
+		lm := uint16(1) << uint(e.leftTable)
+		rm := uint16(1) << uint(e.rightTable)
+		if (a&lm != 0 && b&rm != 0) || (a&rm != 0 && b&lm != 0) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// edgeColName resolves the base-table column name a join-key expression refers
+// to, preferring the reliable table-relative Index over the diagnostic Name.
+func edgeColName(key Expr, tbl *catalog.Table) (string, bool) {
+	cr, ok := key.(*ColumnRef)
+	if !ok || tbl == nil {
+		return "", false
+	}
+	if cr.Index >= 0 && cr.Index < len(tbl.Columns) {
+		return tbl.Columns[cr.Index].Name, true
+	}
+	if cr.Name != "" {
+		return cr.Name, true
+	}
+	return "", false
+}
+
+// columnsSubset reports whether every name in want is present in have.
+func columnsSubset(want []string, have map[string]bool) bool {
+	if len(want) == 0 {
+		return false
+	}
+	for _, c := range want {
+		if !have[c] {
+			return false
+		}
+	}
+	return true
+}
+
+// uniqueNoFanoutRawCount implements ch. 14 §2/§3: when the columns equated
+// between the two joined subsets contain (as a superkey ⊆) a UNIQUE index on
+// one of the tables — or a valid+enforced FK's child columns — that side is
+// key/fully-contained, so the join does NOT fan out. PG reaches this via
+// get_variable_numdistinct's `isunique ⇒ nd = raw ntuples`; we reproduce it by
+// dividing |L|·|R| by the unique side's RAW (unfiltered) tuple count. Returns
+// (rawCount, true) on a proven superkey — the largest such raw count when both
+// sides qualify (tighter selectivity, matching PG's MIN(1/nd1,1/nd2)). The ⊆
+// test (not set-equality) fires an (a,b)-unique index under an (a,b,c)-equated
+// join. IndexesOnTable is called through the planner's own catalog `cat` so the
+// active-DB index set is used (the dbOid hazard, §2).
+func uniqueNoFanoutRawCount(edges []*joinEdge, g *joinGraph, cat catalog.Catalog) (int64, bool) {
+	if cat == nil {
+		return 0, false
+	}
+	eqCols := map[int]map[string]bool{}
+	addCol := func(ti int, key Expr) {
+		if ti < 0 || ti >= len(g.tables) || g.tables[ti] == nil {
+			return
+		}
+		name, ok := edgeColName(key, g.tables[ti])
+		if !ok {
+			return
+		}
+		if eqCols[ti] == nil {
+			eqCols[ti] = map[string]bool{}
+		}
+		eqCols[ti][name] = true
+	}
+	for _, e := range edges {
+		addCol(e.leftTable, e.leftKey)
+		addCol(e.rightTable, e.rightKey)
+	}
+	best := int64(0)
+	for ti, cols := range eqCols {
+		tbl := g.tables[ti]
+		if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+			continue
+		}
+		unique := false
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if idx != nil && idx.Unique && columnsSubset(idx.Columns, cols) {
+				unique = true
+				break
+			}
+		}
+		// §3 FK: a valid+enforced FK whose child columns are a subset of the
+		// equated set makes this (child) side fully contained. The loaded
+		// TPC-H data declares 0 FKs, so §2's unique-index probe is what fires
+		// today; this branch covers a schema that does declare them.
+		if !unique {
+			for _, fk := range tbl.ForeignKeys {
+				if !fk.NotValid && !fk.NotEnforced && columnsSubset(fk.Columns, cols) {
+					unique = true
+					break
+				}
+			}
+		}
+		if unique && tbl.Stats.RowCount > best {
+			best = tbl.Stats.RowCount
+		}
+	}
+	if best > 0 {
+		return best, true
+	}
+	return 0, false
+}
+
+func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, a, b uint16, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
 	}
@@ -790,30 +1202,73 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 		rightRows = 1
 	}
 	ndv := int64(1)
-	if edge.leftTable < len(g.tables) && g.tables[edge.leftTable] != nil {
-		tbl := g.tables[edge.leftTable]
-		if tbl.Stats != nil {
-			for _, cs := range tbl.Stats.Columns {
-				if cs.NDistinct > 0 {
-					ndv = max(ndv, int64(cs.NDistinct))
+	if costDrivenJoinOrder {
+		// Cost-driven order needs cardinality close to PG's (ch. 12 §5):
+		// resolve the JOIN-KEY column's unsaturated distinct
+		// (NDistinctFrac × RowCount) rather than the table's saturated
+		// max. This precondition is what makes PG's constants reproduce
+		// PG's plan shape; it is deliberately NOT applied to the integer
+		// DP, whose build*4 weights are calibrated to the saturated
+		// regime and regress under accurate cardinality (measured).
+		//
+		// ch. 14 §2–§4: enumerate ALL edges spanning the two subsets, not
+		// just the first one findEdgeBetweenIdx returned. If the equated
+		// columns contain a UNIQUE index / valid FK as a superkey, the join
+		// does not fan out → divide by the unique side's RAW tuple count
+		// (§2/§3). Otherwise divide by the PRODUCT of every spanning edge's
+		// per-column NDV (§4 multi-clause), which is tighter than a single
+		// edge for a composite key.
+		edges := crossEdgesBetween(a, b, g)
+		if len(edges) == 0 {
+			edges = []*joinEdge{edge}
+		}
+		if raw, ok := uniqueNoFanoutRawCount(edges, g, cat); ok {
+			ndv = max(ndv, raw)
+		} else {
+			prod := int64(1)
+			for _, e := range edges {
+				en := int64(1)
+				if e.leftTable < len(g.tables) {
+					en = max(en, sideKeyDistinct(e.leftKey, g.tables[e.leftTable]))
+				}
+				if e.rightTable < len(g.tables) {
+					en = max(en, sideKeyDistinct(e.rightKey, g.tables[e.rightTable]))
+				}
+				prod = satMul(prod, en)
+			}
+			ndv = max(ndv, prod)
+		}
+	} else {
+		if edge.leftTable < len(g.tables) && g.tables[edge.leftTable] != nil {
+			tbl := g.tables[edge.leftTable]
+			if tbl.Stats != nil {
+				for _, cs := range tbl.Stats.Columns {
+					if cs.NDistinct > 0 {
+						ndv = max(ndv, int64(cs.NDistinct))
+					}
+				}
+			}
+		}
+		if edge.rightTable < len(g.tables) && g.tables[edge.rightTable] != nil {
+			tbl := g.tables[edge.rightTable]
+			if tbl.Stats != nil {
+				for _, cs := range tbl.Stats.Columns {
+					if cs.NDistinct > 0 {
+						ndv = max(ndv, int64(cs.NDistinct))
+					}
 				}
 			}
 		}
 	}
-	if edge.rightTable < len(g.tables) && g.tables[edge.rightTable] != nil {
-		tbl := g.tables[edge.rightTable]
-		if tbl.Stats != nil {
-			for _, cs := range tbl.Stats.Columns {
-				if cs.NDistinct > 0 {
-					ndv = max(ndv, int64(cs.NDistinct))
-				}
-			}
-		}
-	}
-	outputRows = leftRows * rightRows / ndv
-	if outputRows < 1 {
-		outputRows = 1
-	}
+	// Overflow guard: for deep composed subsets at scale, leftRows and
+	// rightRows can each be ~1e12–1e14, so the int64 product wraps
+	// NEGATIVE before the `/ ndv` divide and the `< 1` clamp then pins it
+	// to 1 — a garbage cardinality that poisons the integer cost, the
+	// build-side decision, AND the cost-driven pgCost (which reads this as
+	// outRows). Compute in float64 (ample range for an estimate) and
+	// saturate at MaxInt64. This is the scale boundary behind Q9's 6M-vs-
+	// 300k behaviour.
+	outputRows = satRowsMulDiv(leftRows, rightRows, ndv)
 	// Build side = smaller, probe side = larger. This is the
 	// same heuristic `buildJoinFromDP` uses to pick BuildLeft;
 	// keeping the cost-side and physical-side decisions in
@@ -823,12 +1278,7 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	if rightRows < leftRows {
 		buildRows, probeRows = rightRows, leftRows
 	}
-	cost = outputRows*outputRowWeight +
-		buildRows*hashBuildWeight +
-		probeRows*hashProbeWeight
-	if cost < 1 {
-		cost = 1
-	}
+	cost = satCost(outputRows, buildRows, probeRows)
 	// M0076-0004: penalise edges produced from synthesised
 	// (transitively-inferred) conjuncts. Slice D adds these
 	// only via anchored synthesis; the penalty stays as a final
@@ -843,7 +1293,7 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	return outputRows, cost
 }
 
-func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
+func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, leftLayout, rightLayout map[int]int, edge *joinEdge, g *joinGraph) *Join {
 	// Determine which edge key belongs to which subset BEFORE
 	// remapping.  The edge stores {leftTable, rightTable} in
 	// FROM-clause order, but the DP may have assigned those
@@ -855,8 +1305,14 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		// leftTable is in subset b → leftKey belongs to b
 		lk, rk = edge.rightKey, edge.leftKey
 	}
-	leftKey := remapKeyToSubset(lk, a, g)
-	rightKey := remapKeyToSubset(rk, b, g)
+	// Remap each key to its REAL position within the child plan using
+	// that child's actual table→offset layout, not an ascending-order
+	// assumption: a bushy child schema is `leftSchema ++ rightSchema`
+	// over arbitrary subsets, so a table's columns need not sit at
+	// their ascending prefix-sum. (Fixes the Q8=0-rows cost-driven
+	// remap bug; see dpEntry.layout.)
+	leftKey := remapKeyToLayout(lk, leftLayout, g)
+	rightKey := remapKeyToLayout(rk, rightLayout, g)
 
 	leftSchema := leftPlan.Output()
 	rightSchema := rightPlan.Output()
@@ -900,7 +1356,7 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		rightKey = &cl
 	}
 
-	return &Join{
+	j := &Join{
 		pos:       0,
 		Type:      JoinTypeInner,
 		Algo:      JoinAlgoHash,
@@ -912,27 +1368,97 @@ func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b u
 		BuildLeft: buildLeft,
 		schema:    mergedSchema,
 	}
+
+	// Cost-model C4: when two subsets are connected by MORE than one
+	// equality (TPC-H Q9's partsupp↔lineitem: ps_suppkey=l_suppkey AND
+	// ps_partkey=l_partkey), the DP wires ONE as the canonical
+	// LeftKey/RightKey; the rest must also be enforced on this join.
+	// The non-cost-driven planner defers them to attachUnusedCrossEdges
+	// (raw GLOBAL coords, consumed by MultiHashJoin). With MHJ dropped
+	// (cost-driven), no consumer localises those global coords and the
+	// composite NLI probes a wrong column → drops rows (Q9=0). So here,
+	// where the layouts are known, AND each extra edge onto the
+	// Predicate in the SAME LOCAL coordinates as the canonical key.
+	if costDrivenJoinOrder {
+		attachExtraEdgesLocal(j, a, b, leftLayout, rightLayout, len(leftSchema), edge, g)
+	}
+
+	return j
 }
 
-// remapKeyToSubset adjusts ColumnRef indices from the global merged
-// schema to the per-subset local schema.
-func remapKeyToSubset(key Expr, subset uint16, g *joinGraph) Expr {
+// attachExtraEdgesLocal ANDs every cross-edge between subsets a and b
+// (other than the canonical `skip` edge, already the join's key) onto
+// j.Predicate, remapping each side's key to the join's local schema —
+// a-side into leftLayout, b-side into rightLayout shifted by leftWidth,
+// exactly as the canonical key is remapped. This keeps a multi-equality
+// join (Q9) fully local-coordinate so the downstream NLI/hash consumer
+// resolves both probe columns correctly.
+func attachExtraEdgesLocal(j *Join, a, b uint16, leftLayout, rightLayout map[int]int, leftWidth int, skip *joinEdge, g *joinGraph) {
+	for i := range g.edges {
+		e := &g.edges[i]
+		if e == skip {
+			continue
+		}
+		la := a&(1<<e.leftTable) != 0
+		ra := a&(1<<e.rightTable) != 0
+		lb := b&(1<<e.leftTable) != 0
+		rb := b&(1<<e.rightTable) != 0
+		// The edge must cross a↔b (one endpoint in each subset).
+		if !((la && rb) || (ra && lb)) {
+			continue
+		}
+		// Orient so ak belongs to subset a, bk to subset b.
+		ak, bk := e.leftKey, e.rightKey
+		if !la {
+			ak, bk = e.rightKey, e.leftKey
+		}
+		aKey := remapKeyToLayout(ak, leftLayout, g)
+		bKey := remapKeyToLayout(bk, rightLayout, g)
+		if cr, ok := bKey.(*ColumnRef); ok {
+			cl := *cr
+			cl.Index += leftWidth
+			bKey = &cl
+		}
+		extra := &BinaryOp{pos: 0, Op: parser.OpEq, Left: aKey, Right: bKey}
+		j.Predicate = &BinaryOp{pos: 0, Op: parser.OpAnd, Left: j.Predicate, Right: extra}
+	}
+}
+
+// mergeSubsetLayouts composes the table→offset layouts of a join's two
+// children into the parent's layout. The runtime schema is
+// `leftSchema ++ rightSchema`, so left-side tables keep their offsets
+// and every right-side table shifts by leftWidth (= len(leftPlan.Output())).
+func mergeSubsetLayouts(leftLayout, rightLayout map[int]int, leftWidth int) map[int]int {
+	merged := make(map[int]int, len(leftLayout)+len(rightLayout))
+	for t, off := range leftLayout {
+		merged[t] = off
+	}
+	for t, off := range rightLayout {
+		merged[t] = off + leftWidth
+	}
+	return merged
+}
+
+// remapKeyToLayout adjusts a ColumnRef index from the global
+// (FROM-order concatenation) coordinate space to a child plan's LOCAL
+// schema, using that plan's actual table→offset layout. The global
+// index identifies a base table t and a within-table offset via the
+// g.scanWidth prefix sums; the local index is layout[t] + that
+// within-table offset. Unlike the old ascending-order assumption this
+// is correct for bushy child schemas (`leftSchema ++ rightSchema` over
+// arbitrary subsets). For an ascending subset layout[t] equals the old
+// prefix-sum, so the result is identical to the prior behaviour.
+func remapKeyToLayout(key Expr, layout map[int]int, g *joinGraph) Expr {
 	if col, ok := key.(*ColumnRef); ok {
 		cl := *col
-		offset := int32(0)
+		offset := 0
 		for i := 0; i < g.nodes; i++ {
-			w := int32(g.scanWidth[i])
-			if subset&(1<<i) != 0 {
-				if cl.Index >= int(offset) && cl.Index < int(offset+w) {
-					newOff := int32(0)
-					for j := 0; j < i; j++ {
-						if subset&(1<<j) != 0 {
-							newOff += int32(g.scanWidth[j])
-						}
-					}
-					cl.Index = int(newOff + (int32(cl.Index) - offset))
-					return &cl
+			w := g.scanWidth[i]
+			if cl.Index >= offset && cl.Index < offset+w {
+				if localBase, ok := layout[i]; ok {
+					cl.Index = localBase + (cl.Index - offset)
 				}
+				return &cl
 			}
 			offset += w
 		}
@@ -2053,6 +2579,146 @@ func findColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx i
 //
 // When a name is ambiguous (appears in multiple positions, e.g.
 // self‑joins), the original index is preserved for that ref.
+// reresolveNLIKeysByName re-resolves a NestedLoopIndexJoin's probe keys
+// (Inner.Key / Inner.Keys) by Name+SourceTableIdx against its outer
+// Output() schema, and refreshes the NLI's own schema to outer ++ inner.
+// Cost-model doc 13 Phase 2: the probe keys were bound at tryBuildNLI
+// time to the build-time outer schema, but a later pass reorders that
+// schema (reresolveJoinByName rebuilds a child *Join's merged schema),
+// leaving the keys pinned to a stale slot that reads the wrong runtime
+// column (TPC-H Q9: l_suppkey probe reads l_linenumber → 0 rows).
+func reresolveNLIKeysByName(nli *NestedLoopIndexJoin) {
+	if nli == nil || nli.Inner == nil || nli.Outer == nil {
+		return
+	}
+	outerSchema := nli.Outer.Output()
+	rebind := func(e Expr) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		idx := -1
+		if cr.SourceTableIdx != 0 {
+			idx = findColumnIndexByNameAndSource(outerSchema, cr.Name, cr.SourceTableIdx, 0)
+		}
+		if idx < 0 {
+			idx = findUniqueColumnIndex(outerSchema, cr.Name, 0)
+		}
+		if idx >= 0 {
+			cr.Index = idx
+		}
+	}
+	if nli.Inner.Key != nil {
+		rebind(nli.Inner.Key)
+	}
+	for _, k := range nli.Inner.Keys {
+		rebind(k)
+	}
+	if nli.Type != JoinTypeSemi && nli.Type != JoinTypeAnti {
+		innerSchema := nli.Inner.Output()
+		merged := make(Schema, len(outerSchema)+len(innerSchema))
+		copy(merged, outerSchema)
+		copy(merged[len(outerSchema):], innerSchema)
+		nli.schema = merged
+	} else {
+		nli.schema = append(Schema(nil), outerSchema...)
+	}
+}
+
+// reconcileNLILayout is a FINAL bottom-up pass (doc 13 Phase 2) that runs
+// after all planning — including sub-query integration, the point where a
+// derived-table outer's schema is reordered relative to the build-time
+// schema the NLI keys were bound to. For each *Join it refreshes the
+// merged schema + re-resolves keys by name (reresolveJoinByName); for each
+// *NestedLoopIndexJoin it re-resolves the probe keys + refreshes the NLI
+// schema (reresolveNLIKeysByName). Bottom-up so a child NLI's schema is
+// truthful before its parent binds against it. Gated on costDrivenJoinOrder
+// (Plan), so only the experimental cost path — where NLI is being re-enabled
+// — pays for it; production is untouched.
+func reconcileNLILayout(node Node) {
+	switch n := node.(type) {
+	case *Join:
+		reconcileNLILayout(n.Left)
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			reconcileNLILayout(n.Right)
+		}
+		reresolveJoinByName(n)
+	case *NestedLoopIndexJoin:
+		reconcileNLILayout(n.Outer)
+		reresolveNLIKeysByName(n)
+	case *Filter:
+		reconcileNLILayout(n.Child)
+		if !n.LeafLocal {
+			reresolveExprByName(n.Predicate, n.Child.Output())
+		}
+	case *Project:
+		reconcileNLILayout(n.Child)
+		if !n.IsolatedScope {
+			cs := n.Child.Output()
+			for i := range n.Targets {
+				reresolveExprByName(n.Targets[i], cs)
+			}
+		}
+	case *Aggregate:
+		reconcileNLILayout(n.Child)
+		cs := n.Child.Output()
+		for i := range n.GroupExprs {
+			reresolveExprByName(n.GroupExprs[i], cs)
+		}
+		for i := range n.Passthrough {
+			reresolveExprByName(n.Passthrough[i], cs)
+		}
+		for i := range n.Aggs {
+			reresolveExprByName(n.Aggs[i].Arg, cs)
+			reresolveExprByName(n.Aggs[i].Arg2, cs)
+			for j := range n.Aggs[i].ExtraArgs {
+				reresolveExprByName(n.Aggs[i].ExtraArgs[j], cs)
+			}
+		}
+	case *WindowAgg:
+		reconcileNLILayout(n.Child)
+	case *Sort:
+		reconcileNLILayout(n.Child)
+		cs := n.Child.Output()
+		for i := range n.Keys {
+			reresolveExprByName(n.Keys[i].Expr, cs)
+		}
+	case *Limit:
+		reconcileNLILayout(n.Child)
+	case *MultiHashJoin:
+		for i := range n.Tables {
+			reconcileNLILayout(n.Tables[i])
+		}
+	}
+}
+
+// reresolveExprByName re-resolves every plain ColumnRef in e by
+// Name+SourceTableIdx against childSchema (offset 0). visitColumnRefs
+// does not descend into sub-query scopes or *OuterColumnRef, so only
+// same-scope refs are touched. Ambiguous names (self-join without a
+// source disambiguator) resolve to -1 and are left unchanged.
+func reresolveExprByName(e Expr, childSchema Schema) {
+	if e == nil {
+		return
+	}
+	visitColumnRefs(e, func(x Expr) {
+		cr, ok := x.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		idx := -1
+		if cr.SourceTableIdx != 0 {
+			idx = findColumnIndexByNameAndSource(childSchema, cr.Name, cr.SourceTableIdx, 0)
+		}
+		if idx < 0 {
+			idx = findUniqueColumnIndex(childSchema, cr.Name, 0)
+		}
+		if idx >= 0 {
+			cr.Index = idx
+		}
+	})
+}
+
 func reresolveJoinByName(j *Join) {
 	if j == nil {
 		return

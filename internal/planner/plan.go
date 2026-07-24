@@ -889,7 +889,31 @@ type Aggregate struct {
 	Aggs        []AggregateCall
 	Passthrough []Expr
 	schema      Schema
+
+	// Mode splits an aggregate across a parallel boundary (P9). The zero
+	// value is AggModeSimple, so every existing construction site keeps
+	// today's semantics without being touched.
+	Mode AggMode
+	// PartialSource is set on a Finalize node and points at the Partial node
+	// below the Gather whose per-group states it combines. Stated explicitly
+	// rather than rediscovered by walking down through the Gather, because the
+	// two nodes are created together and the link is what pairs them at
+	// runtime.
+	PartialSource *Aggregate
 }
+
+// AggMode is an aggregate node's role in a parallel split.
+type AggMode int8
+
+const (
+	// AggModeSimple is an ordinary, whole-input aggregate.
+	AggModeSimple AggMode = iota
+	// AggModePartial aggregates one worker's share and publishes the per-group
+	// transition states instead of finished values.
+	AggModePartial
+	// AggModeFinal combines the published states and produces the result.
+	AggModeFinal
+)
 
 func (n *Aggregate) Pos() int       { return n.pos }
 func (n *Aggregate) Output() Schema { return n.schema }
@@ -1895,6 +1919,67 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // Distinct eliminates duplicate rows from its child, implementing
 // SELECT DISTINCT. Deduplication uses the same rowKey hash as the
 // recursive UNION dedup path. M0097-0005.
+// Gather is the boundary between parallel and serial execution: Child is run
+// by WorkersPlanned goroutines whose output this node interleaves in arbitrary
+// order. Everything below a Gather is a PARTIAL plan — run by several workers
+// simultaneously, it collectively produces the full result exactly once.
+//
+// P4 of docs/design/parallel-query/ (chapter 05). Nothing in the planner
+// inserts one yet; insertion is P6.
+//
+// Divergence from PostgreSQL: PG's Gather is substantially a transport
+// implementation — one shm_mq per worker, tuples serialised in and out — while
+// goopg's is a fan-out over a Go channel, since workers share the address
+// space. The risk correspondingly moves from "is the transport correct" to "is
+// the shutdown correct".
+type Gather struct {
+	pos   int
+	Child Node
+	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
+	// it as PG's `Workers Planned:`; the number actually launched can be lower
+	// when the cluster-wide cap is exhausted, which is why PG reports both.
+	WorkersPlanned int
+	// SingleCopy mirrors PG's single_copy: run Child in exactly one worker
+	// rather than partitioning it. Reserved; nothing sets it yet.
+	SingleCopy bool
+	schema     Schema
+}
+
+func (n *Gather) Pos() int       { return n.pos }
+func (n *Gather) Output() Schema { return n.schema }
+
+// NewGather wraps child in a Gather that plans nWorkers workers.
+func NewGather(pos int, child Node, nWorkers int) *Gather {
+	return &Gather{pos: pos, Child: child, WorkersPlanned: nWorkers, schema: child.Output()}
+}
+
+// GatherMerge is Gather with output ordering preserved: each worker produces a
+// stream already sorted by Keys, and the leader merges them with a heap.
+//
+// The node exists — rather than sorting above a plain Gather — so the sort can
+// be PARTIAL: N workers each sort their own share in parallel and the leader
+// only merges. Sorting above a Gather would serialise the whole sort in the
+// leader and give back most of the benefit.
+//
+// P7 of docs/design/parallel-query/ (chapter 05 §4).
+type GatherMerge struct {
+	pos            int
+	Child          Node
+	WorkersPlanned int
+	// Keys is the ordering every worker's stream is already sorted by, and
+	// which the leader's merge preserves.
+	Keys   []SortKey
+	schema Schema
+}
+
+func (n *GatherMerge) Pos() int       { return n.pos }
+func (n *GatherMerge) Output() Schema { return n.schema }
+
+// NewGatherMerge wraps child in an order-preserving Gather.
+func NewGatherMerge(pos int, child Node, nWorkers int, keys []SortKey) *GatherMerge {
+	return &GatherMerge{pos: pos, Child: child, WorkersPlanned: nWorkers, Keys: keys, schema: child.Output()}
+}
+
 type Distinct struct {
 	pos    int
 	Child  Node

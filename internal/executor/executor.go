@@ -204,6 +204,24 @@ func Build(plan planner.Node) (Operator, error) {
 			return maybeInstrument(p, newUpsertOp(p, child)), nil
 		}
 		return maybeInstrument(p, newInsertOp(p, child)), nil
+	case *planner.Gather:
+		// Each worker builds its OWN operator tree over the shared, read-only
+		// partial plan — Build is a pure function of the plan node, so N calls
+		// give N independent trees. The closure is what makes that per-worker
+		// construction possible without the operator knowing about the planner.
+		//
+		// Deliberately NOT migrated to the slab path: buildRec's default arm
+		// wraps this in an OpAdapter, so the live BuildFastIterator path
+		// reaches it with no slab changes and no shared per-node state.
+		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
+			return Build(p.Child)
+		})), nil
+	case *planner.GatherMerge:
+		// Same per-worker construction as Gather; the difference is entirely in
+		// how the leader consumes the streams.
+		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
+			return Build(p.Child)
+		})), nil
 	case *planner.Distinct:
 		child, err := Build(p.Child)
 		if err != nil {

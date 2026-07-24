@@ -83,7 +83,18 @@ const (
 	UnitMin
 	UnitH
 	UnitD
+	// UnitBlocks mirrors upstream's GUC_UNIT_BLOCKS: the value is stored
+	// as a count of BLCKSZ-sized blocks. Used by the min_parallel_*_scan_size
+	// GUCs, which upstream declares in blocks and displays in kB/MB.
+	// There is deliberately no "block" suffix in unitFromSuffix — upstream
+	// accepts only byte suffixes on input for these GUCs too.
+	UnitBlocks
 )
+
+// blockSize is BLCKSZ, the on-disk page size, in bytes. It is the conversion
+// factor for UnitBlocks. Kept local to the config package because the GUC
+// layer must not import storage.
+const blockSize = 8192
 
 // VarFlag is a bitmask of behaviour modifiers. Mirrors
 // postgres/src/include/utils/guc.h flags but only the ones we use.
@@ -276,6 +287,32 @@ func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
 				return opt, nil
 			}
 		}
+		// Upstream registers boolean synonyms for on/off-bearing enums as
+		// HIDDEN config_enum_entry rows (hidden = true) — see
+		// debug_parallel_query_options in
+		// postgres/src/backend/utils/misc/guc_tables.c:395-405, which lists
+		// true/false/yes/no/1/0 with hidden=true. `SET
+		// debug_parallel_query = true` is therefore accepted, while the
+		// synonyms stay out of pg_settings.enumvals and out of the error
+		// HINT. Reproduce that by falling back to the boolean parser only
+		// when the enum actually offers both "on" and "off" — which keeps
+		// enums like IntervalStyle unaffected — and by NOT adding the
+		// synonyms to EnumOptions, so enumvals and the error text below
+		// stay PG-shaped.
+		//
+		// One deliberate superset: parseBoolish also accepts "t"/"f", which
+		// upstream's hidden list omits for this GUC (it does accept them for
+		// real TypeBool GUCs). Accepting a strict superset of PG here is
+		// harmless — no valid PG input is rejected — and keeps one boolean
+		// parser rather than two.
+		if enumHasBoolPair(v.EnumOptions) {
+			if b, ok := parseBoolish(value); ok {
+				if b {
+					return "on", nil
+				}
+				return "off", nil
+			}
+		}
 		return "", fmt.Errorf("invalid value %q for enum (valid: %s)",
 			value, strings.Join(v.EnumOptions, ", "))
 	}
@@ -331,6 +368,22 @@ var memoryDisplayUnits = map[Unit][]unitConversion{
 	UnitMB:    {{"TB", 1024 * 1024}, {"GB", 1024}, {"MB", 1}},
 	UnitGB:    {{"TB", 1024}, {"GB", 1}},
 	UnitTB:    {{"TB", 1}},
+	// UnitBlocks mirrors upstream's GUC_UNIT_BLOCKS rows in
+	// memory_unit_conversion_table. Note the kB row's multiplier is
+	// NEGATIVE: a block (8 kB) is LARGER than the display unit, so
+	// convert_int_from_base_unit multiplies instead of dividing. See the
+	// negative-multiplier branch in FormatDisplayValue.
+	//
+	//	{"TB", (1024*1024*1024)/(BLCKSZ/1024)} == 134217728
+	//	{"GB", (1024*1024)/(BLCKSZ/1024)}      ==    131072
+	//	{"MB", (1024)/(BLCKSZ/1024)}           ==       128
+	//	{"kB", -(BLCKSZ/1024)}                 ==        -8
+	UnitBlocks: {
+		{"TB", (1024 * 1024 * 1024) / (blockSize / 1024)},
+		{"GB", (1024 * 1024) / (blockSize / 1024)},
+		{"MB", 1024 / (blockSize / 1024)},
+		{"kB", -(blockSize / 1024)},
+	},
 }
 
 var timeDisplayUnits = map[Unit][]unitConversion{
@@ -370,6 +423,16 @@ func (v *Variable) FormatDisplayValue(raw string) string {
 		return raw
 	}
 	for _, u := range table {
+		// Negative multiplier: the storage unit is LARGER than the display
+		// unit, so upstream's convert_int_from_base_unit multiplies rather
+		// than divides (and the division-evenness test does not apply — the
+		// result is always exact). Only UnitBlocks' kB row has this today.
+		// Without this branch a blocks-valued GUC whose value is smaller
+		// than one MB (e.g. min_parallel_index_scan_size = 64 blocks) would
+		// match no row and print as a bare number instead of "512kB".
+		if u.multiplier < 0 {
+			return strconv.FormatInt(n*(-u.multiplier), 10) + u.suffix
+		}
 		if u.multiplier <= 1 || n%u.multiplier == 0 {
 			return strconv.FormatInt(n/u.multiplier, 10) + u.suffix
 		}
@@ -581,6 +644,23 @@ func setFromFile(v *Variable, value string) error {
 
 // parseBoolish recognises every spelling upstream guc.c:parse_bool
 // accepts.
+// enumHasBoolPair reports whether opts contains both "on" and "off", which is
+// how this package recognises an enum for which upstream also accepts the
+// hidden boolean synonyms (true/false/yes/no/1/0). See the TypeEnum arm of
+// canonicalizeFrom.
+func enumHasBoolPair(opts []string) bool {
+	var on, off bool
+	for _, o := range opts {
+		switch strings.ToLower(o) {
+		case "on":
+			on = true
+		case "off":
+			off = true
+		}
+	}
+	return on && off
+}
+
 func parseBoolish(s string) (bool, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "on", "true", "yes", "1", "t":
@@ -666,6 +746,11 @@ func convertUnit(n int64, from, to Unit) (int64, error) {
 			return 1024 * 1024 * 1024, true
 		case UnitTB:
 			return 1024 * 1024 * 1024 * 1024, true
+		case UnitBlocks:
+			// A block is BLCKSZ bytes, so blocks sit in the byte family
+			// with a multiplier of 8192. `SET x = '8MB'` on a blocks-valued
+			// GUC therefore stores 1024.
+			return blockSize, true
 		}
 		return 0, false
 	}

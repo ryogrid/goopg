@@ -758,6 +758,14 @@ type seqScanOp struct {
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
 	curSlot  uint16
+
+	// pscan, when non-nil, makes this a PARALLEL scan: curBlock is then
+	// claimed from a shared atomic allocator instead of being incremented
+	// locally, so N workers' blocks partition the relation. Everything else
+	// in this struct stays per-worker — the pin, the decode buffer, the
+	// emitted slot, the per-page arena, the ring and the prefetch watermark.
+	// P4 of docs/design/parallel-query/ (chapter 04).
+	pscan *parallelScanState
 	slotMax  int
 	pinned   *storage.Slot
 
@@ -1266,6 +1274,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		return err
 	}
 	o.nBlocks = n
+	// Parallel scan: publish the relation size to the shared allocator. Every
+	// worker's scan calls this with the same value during Open; sync.Once makes
+	// the first one authoritative and supplies the happens-before edge.
+	o.pscan.setBoundary(n)
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
@@ -1276,7 +1288,22 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// Activate the ring strategy when the relation is large enough that a
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
-	if ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
+	//
+	// P4: the ring is DISABLED for a parallel scan. storage.ScanRing has no
+	// synchronisation at all, so each worker would need its own — and N
+	// private rings consume N times the buffers the single-scan heuristic
+	// was sized for, while every worker sees the same nBlocks and so all N
+	// would activate together. Correct sizing under parallelism is an
+	// empirical question (chapter 04 §4.1); until it is measured, workers go
+	// through the shared pool.
+	//
+	// Two consequences worth stating rather than discovering: this removes
+	// pool-pollution protection for exactly the large relations the ring
+	// exists to protect, and — because the hint-bit path is gated on
+	// `o.pinned != nil`, which is nil under the ring — it turns hint-bit
+	// writing ON for those scans. Both are latched and PG-consistent, but
+	// neither is implied by the phrase "disable a buffering strategy".
+	if o.pscan == nil && ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
 		o.ring = storage.NewScanRing(ctx.Pool, o.rel)
 	}
 	o.refillPrefetchWindow(o.rel)
@@ -1288,6 +1315,15 @@ func (o *seqScanOp) Open(ctx *Context) error {
 // disabled (no AIO engine attached) Pool.Prefetch is a no-op,
 // so this loop is cheap.
 func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
+	// P4 (chapter 04 §4.2): prefetch is disabled for a parallel scan. With a
+	// shared allocator a worker's next block is no longer curBlock+1 — it is
+	// whatever the allocator hands out — so a per-worker lookahead window
+	// prefetches blocks this worker will probably never read, and N workers
+	// would each do it. The I/O concurrency prefetch emulates is supplied
+	// directly by N workers each issuing a synchronous page read.
+	if o.pscan != nil {
+		return
+	}
 	target := o.curBlock + seqScanLookahead
 	if target > o.nBlocks {
 		target = o.nBlocks
@@ -1361,12 +1397,16 @@ func (o *seqScanOp) rewind() error {
 		return err
 	}
 	o.nBlocks = n
+	// Parallel scan: publish the relation size to the shared allocator. Every
+	// worker's scan calls this with the same value during Open; sync.Once makes
+	// the first one authoritative and supplies the happens-before edge.
+	o.pscan.setBoundary(n)
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
 	o.sctx.Reset()
-	if o.ctx.Pool != nil && int(n) > o.ctx.Pool.Capacity()/4 {
+	if o.pscan == nil && o.ctx.Pool != nil && int(n) > o.ctx.Pool.Capacity()/4 {
 		o.ring = storage.NewScanRing(o.ctx.Pool, o.rel)
 	}
 	o.refillPrefetchWindow(o.rel)
@@ -1391,7 +1431,19 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.rel
 	for {
 		if o.pinned == nil && o.activePage == nil {
-			if o.curBlock >= o.nBlocks {
+			// Serial: curBlock walks 0..nBlocks-1 locally. Parallel: the
+			// next block is claimed from the shared allocator, so workers
+			// partition the relation between them. advanceBlock() below
+			// leaves curBlock unset for a parallel scan, so the claim
+			// happens here, once per page, at the same point the serial
+			// path tests its cursor.
+			if o.pscan != nil {
+				b, ok := o.pscan.nextBlock()
+				if !ok {
+					return nil, EOF
+				}
+				o.curBlock = b
+			} else if o.curBlock >= o.nBlocks {
 				return nil, EOF
 			}
 			// Poll for query cancellation at each new block boundary.
@@ -1431,7 +1483,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			page := o.activePage
 			if storage.IsNew(page) {
 				o.releasePinned()
-				o.curBlock++
+				o.advanceBlock()
 				continue
 			}
 			// Brief RLock around the line-pointer count read; the
@@ -1706,7 +1758,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			return &o.slot, nil
 		}
 		o.releasePinned()
-		o.curBlock++
+		o.advanceBlock()
 		// M0073-0004: rewind the per-page byte arena. All slots
 		// emitted from the just-finished page have either been
 		// consumed by the parent or had their arena Datums
@@ -1725,6 +1777,25 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		// engine while we decode the current page.
 		o.refillPrefetchWindow(rel)
 	}
+}
+
+// advanceBlock moves the scan off the block it just finished.
+//
+// Serial scans step the local cursor. Parallel scans do NOT: the next block is
+// claimed from the shared allocator at the top of Next(), so advancing here
+// would skip a block. Setting the cursor past nBlocks is deliberate — it makes
+// a parallel scan that somehow reaches the serial termination test fall out
+// rather than loop, without needing a second flag.
+//
+// P4 of docs/design/parallel-query/ (chapter 04 §2).
+func (o *seqScanOp) advanceBlock() {
+	if o.pscan != nil {
+		// The claim happens in Next(); nothing to do but ensure the local
+		// cursor cannot be mistaken for a valid position.
+		o.curBlock = o.nBlocks
+		return
+	}
+	o.curBlock++
 }
 
 // currentTID returns the (rel, ItemPointer) of the most recently

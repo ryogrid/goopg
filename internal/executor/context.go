@@ -196,6 +196,79 @@ type Context struct {
 	// sample-size behaviour.
 	StatsTarget int
 
+	// ── parallel-query settings (docs/design/parallel-query, P1) ──────────
+	//
+	// These carry the effective per-session parallel GUCs for the current
+	// statement. They exist separately from the planning-time reads because
+	// the two needs are genuinely distinct: the planner decides a worker
+	// COUNT (and on the extended protocol it runs before this context even
+	// exists — dispatch_extended.go plans at :92/:103, ectx is built at
+	// :141), whereas the executor needs the same values at RUN time to size
+	// the fan-out and honour leader participation.
+	//
+	// Every zero value means "no parallelism", which is the safe direction:
+	// the several NewContext() sites that never populate these (COPY, DDL)
+	// then simply behave serially rather than reading a sentinel.
+
+	// MaxParallelWorkersPerGather is the effective
+	// `max_parallel_workers_per_gather`. Zero — whether set by the user or
+	// left unpopulated — means no Gather fan-out.
+	MaxParallelWorkersPerGather int
+
+	// MaxParallelWorkers is the effective cluster-wide `max_parallel_workers`
+	// cap. It bounds workers launched across all concurrent Gathers, which is
+	// what makes EXPLAIN's `Workers Launched:` differ from `Workers Planned:`.
+	// Unlike PG, where worker slots are a pre-allocated scarce resource,
+	// goroutines have no natural scarcity — so this cap is the only thing
+	// preventing oversubscription. Zero means no parallelism.
+	MaxParallelWorkers int
+
+	// MinParallelTableScanBlocks is the effective
+	// `min_parallel_table_scan_size` in BLOCKS (the GUC's native unit).
+	// Relations smaller than this get no parallel path, mirroring
+	// upstream's compute_parallel_worker. Zero means "unpopulated"; the
+	// planner treats that as PG's 1024-block default rather than as
+	// "every relation qualifies".
+	MinParallelTableScanBlocks int64
+
+	// ParallelLeaderParticipation is the effective
+	// `parallel_leader_participation`. When false the leader only drains
+	// worker output instead of also executing a share. Note the zero value
+	// (false) is NOT upstream's default (on) — it is only ever read when a
+	// Gather exists, and a Gather is only built by the wire path, which
+	// populates this.
+	ParallelLeaderParticipation bool
+
+	// DebugParallelQuery is the effective `debug_parallel_query`
+	// ("off" / "on" / "regress") — upstream's lever for forcing parallel
+	// plans in testing. Empty is equivalent to "off".
+	DebugParallelQuery string
+
+	// SharedHashBuilds carries hash-join build tables that a Gather built ONCE
+	// in the leader and published before fanning out (P8, chapter 07). A
+	// joinOp finding its own plan node here adopts the table instead of
+	// building one, and opens only its probe side.
+	//
+	// Read-only for the entire lifetime of the fan-out. Every worker holds the
+	// same map and the same tables, unlocked, which is safe for exactly one
+	// reason: nothing writes to them after publication. Any future code that
+	// inserted into lazyHash during probing would turn this into a data race.
+	//
+	// Nil outside a Gather, which is the serial case.
+	SharedHashBuilds map[*planner.Join]*sharedHashBuild
+
+	// PartialAggStates carries per-group aggregate transition states from the
+	// Partial nodes running in workers up to the Finalize node in the leader
+	// (P9, chapter 06), keyed by the Partial node.
+	//
+	// Registered by the Finalize node before it opens its child, so it is in
+	// place by the time any worker exists. Unlike SharedHashBuilds this is
+	// WRITTEN by workers — each accumulator carries its own mutex, and the
+	// combine happens on insert.
+	//
+	// Nil outside a split aggregate, which is the serial case.
+	PartialAggStates map[*planner.Aggregate]*aggPartialAccum
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.

@@ -1296,8 +1296,20 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 	// float4 columns (stanullfrac, stadistinct) are encoded as varlena text
 	// by EncodeRowPG's "float4" branch; pass KindString.
 	nullFracStr := strconv.FormatFloat(stats.NullFrac, 'g', -1, 32)
+	// stadistinct follows PG's sign convention (selfuncs.c
+	// get_variable_numdistinct): POSITIVE is an absolute count, NEGATIVE is a
+	// fraction of the relation's rows. goopg previously only ever wrote the
+	// positive form, so the fraction had nowhere to live on disk even though
+	// internal/catalog/codec.go has always documented the negative case.
+	//
+	// The fraction is preferred when available because it is scale-free and so
+	// survives a restart usefully — the absolute count cannot be interpreted
+	// without a row count, and the row count is not restored (ledger pq-P6).
 	var distinctF64 float64
-	if stats.NDistinct > 0 {
+	switch {
+	case stats.NDistinctFrac > 0:
+		distinctF64 = -stats.NDistinctFrac
+	case stats.NDistinct > 0:
 		distinctF64 = float64(stats.NDistinct)
 	}
 	distinctStr := strconv.FormatFloat(distinctF64, 'g', -1, 32)
