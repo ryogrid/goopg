@@ -68,8 +68,9 @@ scripts/tpcds-load.sh
 1. Creates TPC-DS schema (25 tables) via `tpcds.sql`
 2. TRUNCATE + COPY each table from `.tsv` file
 3. ANALYZE each table
+4. CHECKPOINT — flushes all data to disk so WAL replay is not needed on restart
 
-**Expect:** 25 tables loaded with row counts shown.
+**Expect:** 25 tables loaded with row counts shown. Server can be restarted without WAL replay error.
 
 ### State 3 → Results: Run Queries
 

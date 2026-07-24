@@ -69,6 +69,10 @@ for tsv in "${TPCDS_DATA_DIR}"/*.tsv; do
 done
 log "  ANALYZE complete"
 
+# ---- Step 4: CHECKPOINT (flush WAL so restart doesn't need replay) ---
+log "Step 4/4: Running CHECKPOINT..."
+${PG} -c "CHECKPOINT" >/dev/null 2>&1 && log "  CHECKPOINT done" || log "  CHECKPOINT failed (non-fatal)"
+
 log ""
 log "=== LOAD COMPLETE ==="
 log "Next: scripts/tpcds-run.sh   (run benchmark)"
