@@ -1,3 +1,6 @@
 [submodule "postgres"]
 	path = postgres
 	url = https://github.com/postgres/postgres.git
+[submodule "third-party/tpcds-postgres"]
+	path = third-party/tpcds-postgres
+	url = https://github.com/celuk/tpcds-postgres.git
