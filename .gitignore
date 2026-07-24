@@ -110,3 +110,4 @@ ci/logs/*
 !ci/logs/scheduler.log
 !ci/logs/history.jsonl
 
+analysis/tpcds-sf1-all-queries.md
