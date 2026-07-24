@@ -202,17 +202,96 @@ func newNumeric(b *big.Int, scale int) Datum {
 // requires the *big.Int slow path. (M0058-0003.)
 //
 // HammerDB's TPC-H schema declares all integer columns as NUMERIC,
-// so the typical lineitem row has 16 NUMERIC columns whose textual
-// payload is a small integer. The slow-path big.Int allocation
-// (~100 bytes + GC pressure) used to dominate SeqScan cost (~400 ns
-// per column).  This helper avoids the allocation entirely when the
-// digit count is in the int64 range.
-func parseNumericFast(text string) (int64, int16, bool) {
+// parseNumericFastScale parses a NUMERIC text value with support for
+// decimal points. On success, returns the mantissa as int64 and the
+// actual scale (number of fractional digits).
+//
+// The mantissa represents the value × 10^scale. For example:
+//
+//	"123.45" → (12345, 2, true)     — 12345 × 10⁻² = 123.45
+//	"-0.01"  → (-1, 2, true)        — -1 × 10⁻² = -0.01
+//	"42"     → (42, 0, true)        — 42 × 10⁰ = 42
+//
+// Falls back to (0, 0, false) when:
+//   - The value exceeds 18 decimal digits (int64 overflow risk)
+//   - An exponent notation (e/E) is present
+//   - Any character other than [+-]?[0-9]*[.]?[0-9]* digit is present
+//
+// expectedScale, when >= 0, is the column's declared scale (e.g. 2 for
+// NUMERIC(15,2)). When expectedScale >= 0 and the actual scale differs, the
+// function returns false — the caller should fall back to the big.Int path.
+//
+// See docs/design/tpch-round5-fixes/06.
+func parseNumericFastScale(text string, expectedScale int16) (int64, int16, bool) {
+	if len(text) == 0 {
+		return 0, 0, false
+	}
+	// Strip leading sign.
+	neg := false
+	s := text
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		neg = true
+		s = s[1:]
+	}
+	if len(s) == 0 {
+		return 0, 0, false
+	}
+	// Reject exponent notation.
+	for i := 0; i < len(s); i++ {
+		if s[i] == 'e' || s[i] == 'E' {
+			return 0, 0, false
+		}
+	}
+	// Find decimal point.
+	dot := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' {
+			dot = i
+			break
+		}
+	}
+	var intPart, fracPart string
+	if dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+	} else {
+		intPart = s
+	}
+	digits := intPart + fracPart
+	if len(digits) == 0 || len(digits) > 18 {
+		return 0, 0, false
+	}
+	// Parse digits as int64.
+	var v int64
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, 0, false
+		}
+		v = v*10 + int64(c-'0')
+	}
+	if neg {
+		v = -v
+	}
+	actualScale := int16(len(fracPart))
+	// When the column has a declared scale, verify it matches.
+	if expectedScale >= 0 && actualScale != expectedScale {
+		return 0, 0, false
+	}
+	return v, actualScale, true
+}
+
+// parseNumericFastInt parses a NUMERIC text value that is an integer
+// (no decimal point, no fractional part). Returns (value, scale=0, true)
+// on success.  This is the renamed original parseNumericFast.
+func parseNumericFastInt(text string) (int64, int16, bool) {
 	s := text
 	if len(s) == 0 {
 		return 0, 0, false
 	}
-	// Strip a single leading sign.
 	neg := false
 	switch s[0] {
 	case '+':
@@ -222,19 +301,12 @@ func parseNumericFast(text string) (int64, int16, bool) {
 		s = s[1:]
 	}
 	if len(s) == 0 || len(s) > 18 {
-		// Empty after sign, or more than 18 digits — uncertain int64
-		// fit. Fall back to slow path. (math.MinInt64 is 19 digits
-		// but we only accept 18-digit positive magnitudes; this loses
-		// a sliver of fast-path coverage in exchange for a branch-free
-		// loop.)
 		return 0, 0, false
 	}
 	var v int64
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c < '0' || c > '9' {
-			// Decimal point, exponent, leading whitespace etc. all
-			// fail the fast path.
 			return 0, 0, false
 		}
 		v = v*10 + int64(c-'0')
@@ -243,6 +315,12 @@ func parseNumericFast(text string) (int64, int16, bool) {
 		v = -v
 	}
 	return v, 0, true
+}
+
+// parseNumericFast is the legacy wrapper; prefers the integer-only fast path.
+// New callers should use parseNumericFastInt or parseNumericFastScale directly.
+func parseNumericFast(text string) (int64, int16, bool) {
+	return parseNumericFastInt(text)
 }
 
 // parseNumeric parses a SQL NUMERIC literal — `123`, `123.45`,
