@@ -4,9 +4,9 @@
 **Scope:** the current codebase measured *in its default/normal state* — the successor
 to round 4. The round-5 body of work is the cost-model-enhancement branch
 (`costmodel-enhance1`): an always-on int64 hash-join fast-path, an experimental
-cost-driven join-order planner (**OFF by default**, not measured here), and the parallel
-per-gather default raised 2→4. This document measures **one configuration** — the shipping
-default — not a sweep.
+cost-driven join-order planner (**OFF by default**; measured separately in **§6**), and the
+parallel per-gather default raised 2→4. The main measurement is **one configuration** — the
+shipping default — not a sweep; §6 adds the cost-driven planner as an addendum.
 **Predecessor:** [`tpch-evolution-round4-parallel-query-20260722.md`](tpch-evolution-round4-parallel-query-20260722.md)
 (the parallel-query bundle, w0/w2/w4/w8). Read its §1 first; this document inherits its
 caveats.
@@ -21,7 +21,8 @@ what this default-config measurement sees: **`0aeb7613`** (the int64 hash-join f
 always-on), **`9106121e`** (an int64-overflow fix in the cardinality/cost math — shifts
 displayed `rows=` estimates by ~1 %), and **`cb37d166`** (the 2→4 parallel default). The
 §2/veto/composite-NLI-keep planner work is gated behind `GOOPG_COST_DRIVEN_JOINORDER` and
-is **invisible** in this measurement.
+is **invisible** in the default-config measurement (§0–§5); it is measured on its own in the
+**§6 addendum**.
 
 ---
 
@@ -52,7 +53,8 @@ cost-driven join-order **off**. The user asked for "how the current codebase pla
 runs in its normal state," so the R5 column is that state directly — no per-query
 worker-count selection. Where round 4 quotes a `best` cell it is the fastest of four
 worker counts *for that query*; the R5 cell is the single honest default, which makes
-R5's near-parity with R4-`best` (below) the stronger statement.
+R5's stream total *beating* even round 4's cherry-picked best-per-query total (§2, by ~33 s)
+the stronger statement.
 
 **1.2 The delta vs round 4 is the int64 hash-join fast-path, and nothing else structural.**
 Every INNER binary hash join whose join keys are int64-representable now hashes an `int64`
@@ -114,7 +116,7 @@ uses R5.
 **Stream totals:** R3 1162 s, R4 w4 **1128 s**, R4 best-per-query 1120 s (cherry-picked
 across worker counts), **R5 1086 s** (single default config). R5 beats R4 w4 by 42 s
 (3.7 %) at the *same* worker degree, and beats even round 4's cherry-picked
-best-per-query total (by 34 s) while being a single honest configuration.
+best-per-query total (by 33 s) while being a single honest configuration.
 
 ---
 
@@ -124,24 +126,36 @@ The right comparison is **R4 w4 → R5**: identical 4-worker degree, identical s
 plans (§5). The only moving part is the int64 fast-path (plus the ~1 % cardinality-display
 shift, which cannot change runtime). A factor **> 1 is a speedup**.
 
-| Q | R4 w4 → R5 | reading |
-|---|---:|---|
-| Q9 | **1.06×** | the flagship: int64 keys on the 6 M-row `lineitem` hash cascade — the query the fast-path was written for |
-| Q13 | **1.05×** | large GROUP-BY hash |
-| Q22 | **1.04×** | `customer`/`orders` hash + NOT-IN anti-join |
-| Q12 | **1.05×** | `lineitem`↔`orders` hash |
-| Q8 | **1.04×** | eight-table hash tree with a buried `lineitem` MHJ |
-| Q4 | **1.04×** | the 6 M-row `lineitem` hash-semi build |
-| Q7 | 1.02× | subquery-bound; the hash parts speed up, the rest doesn't |
-| Q2/Q3/Q10/Q11/Q14/Q17/Q18/Q19/Q21 | 1.02–1.05× | uniform small hash-path gains |
-| Q5/Q6/Q15a/Q16/Q20/Q15b | ~1.00× | scan/aggregate-bound or tiny — little hash work to accelerate |
-| Q1 | 0.98× | noise (agg-split, no joins); within run-to-run variance |
+**The aggregate signal is where the attribution is solid.** The eight 100-second-class
+hash-heavy queries all moved the same direction (faster), and their *absolute* savings carry
+the round:
 
-The structure is the point: **the speedup is broad and small, concentrated exactly on the
-hash-heavy queries** (Q4/Q8/Q9/Q12/Q13/Q22 — all the 100-second-plus cells and the Q9
-cascade), and near-zero on the scan/aggregate queries that have no large hash to
-accelerate. That is the signature of a per-row hash-key optimisation doing precisely what
-it says, and nothing it doesn't. No query regressed beyond noise.
+| Q | R4 w4 → R5 | Δ seconds | what it hashes |
+|---|---:|---:|---|
+| Q4 | 1.04× | −9.9 | 6 M-row `lineitem` hash-semi build |
+| Q8 | 1.04× | −6.5 | eight-table hash tree with a buried `lineitem` MHJ |
+| Q13 | 1.05× | −5.0 | large GROUP-BY hash |
+| Q12 | 1.05× | −4.6 | `lineitem`↔`orders` hash |
+| Q22 | 1.04× | −4.3 | `customer`/`orders` hash + NOT-IN anti-join |
+| Q7 | 1.02× | −3.1 | subquery-bound; only the hash parts speed up |
+| Q2 | 1.04× | −2.3 | (also a default-planner stats-regression cell) |
+| Q9 | 1.06× | −1.6 | the flagship: int64 keys on the 6 M-row `lineitem` cascade |
+| **subtotal** | | **−37.3** | **≈ 89 % of the whole 42 s stream delta** |
+
+Eight queries, all faster, all hash-heavy, together ~89 % of the improvement — a coordinated
+same-direction move on the largest cells that run-to-run noise does not produce. **That
+aggregate attribution — "≈4 % of the stream from the int64 fast-path" — is defensible.**
+
+**The per-query signature, however, is NOT clean, and the report should not claim it is.**
+The remaining ~5 s is spread across small queries whose few-percent moves are at or below the
+noise floor — and that floor is set by queries the fast-path *cannot* touch. Q6 and Q15a have
+**no join at all** (pure `Partial Aggregate → Seq Scan lineitem`), so their motion is pure
+run-to-run variance, yet they moved **+7.1 % (Q6, 3.3→3.08 s)** and **+6.1 % (Q15a, 3.8→3.58 s)**
+— *favourable* and *as large as* the biggest small-query "gains" (Q14 +10.6 %, a real
+2-table `lineitem`⋈`part` hash; Q11 +8.4 %; Q17 +7.5 %; Q19 +7.1 %). The no-join noise floor
+spans roughly **−1.6 % (Q1) … +7.1 % (Q6)**. So a specific small query's 2–8 % move cannot be
+attributed to int64 with confidence — only the coordinated shift of the eight large cells can.
+No query regressed beyond that noise floor.
 
 **What did *not* change.** The five statistics regressions (Q2 51 s, Q4 257 s, Q8 181 s,
 Q12 100 s, Q22 97 s) are still the worst cells in the document. int64 trimmed each by a few
@@ -173,9 +187,10 @@ join order, same MHJ/Gather/Hash-Semi placements. Two second-order differences o
 
 1. **Worker degree 2 → up to 4.** Round 4's snapshot capped every Gather at 2; R5 shows the
    PG-faithful `compute_parallel_worker` log3 progression at the new cap of 4:
-   **13 queries plan 4 workers**, **2 plan 3** (Q11, Q16 — mid-size driving scans), and
-   **4 plan 2** (Q2, Q8, Q13, Q22 — smaller driving relations). This is the intended effect
-   of the 2→4 default and matches PostgreSQL's size-driven worker count.
+   **13 queries plan 4 workers**, **2 plan 3** (Q11, Q16 — mid-size driving scans), **4 plan 2**
+   (Q2, Q8, Q13, Q22 — smaller driving relations), and **3 stay serial** (Q9, Q20, Q21 — no
+   Gather placed). This is the intended effect of the 2→4 default and matches PostgreSQL's
+   size-driven worker count.
 2. **`rows=` estimates shifted ~1 %** (e.g. a semi-join estimate 25 932 866 → 25 686 741),
    from the int64-overflow fix in the cardinality math (`9106121e`). These are *displayed
    estimates* only; they did not flip a single join order (the tree is identical), and
@@ -189,14 +204,88 @@ their plateau.
 
 ---
 
-## 6. Summary judgement
+## 6. Addendum — the cost-driven planner (`GOOPG_COST_DRIVEN_JOINORDER=1`)
+
+Everything above is the shipping default (integer-DP planner). This section measures the
+**experimental cost-driven join-order planner** on the same HEAD, same 8-table ANALYZE, same
+4-worker default — the round's headline work, off by default. It answers a question round 4
+§5 left open ("statistics regressions demand a cost model") with a real, mixed result.
+
+**Methodology (differs from the default sweep, and must):** a cost-driven plan that drops
+MHJ can build a binary-cascade intermediate that memory-thrashes, and — measured here — such
+a query **does not honor cancellation** (the runner's 300 s timeout was ignored on Q5/Q21;
+the server stayed pinned at ~10 GB RSS). So this arm used a **per-query-isolated harness**:
+each query in its own runner process, 300 s per-query timeout with a 340 s external hard cap,
+and a **full server restart + re-ANALYZE between queries** to clear the retained heap. Stats
+reached the cost-driven planner (82 `(stats)` annotations in
+[`plan_snapshots/r5-costdriven.txt`](../plan_snapshots/r5-costdriven.txt); Q9's plan shows
+the composite `partsupp_pk` NLI kept, per cost-model ch. 15). Evidence:
+[`sf1-r5-costdriven-cb37d166.txt`](../docs/design/cost-model/evidence/sf1-r5-costdriven-cb37d166.txt).
+
+| Q | R5 default | cost-driven | rows | verdict |
+|---|---:|---:|---:|---|
+| Q1 | 4.47 | 4.40 | 4 | ~ |
+| **Q2** | 51.23 | **2.72** | 459 | **WIN 18.8×** |
+| Q3 | 9.14 | 5.58 | 11175 | win 1.6× |
+| Q4 | 256.96 | 256.62 | 5 | ~ |
+| **Q5** | 6.43 | **HANG (>300 s)** | – | **REGRESSION (memory-thrash)** |
+| Q6 | 3.08 | 3.12 | 1 | ~ |
+| Q7 | 138.36 | 264.37 | 4 | regr 1.9× |
+| **Q8** | 181.36 | **44.33** | 2 | **WIN 4.1×** |
+| **Q9** | 25.69 | **>300 s (cancelled)** | – | **REGRESSION** |
+| **Q10** | 9.61 | 109.27 | 20522 | **regr 11.4×** |
+| Q11 | 1.66 | 1.36 | 785 | win |
+| Q12 | 100.13 | 100.40 | 2 | ~ |
+| Q13 | 98.14 | 97.74 | 33 | ~ |
+| Q14 | 4.07 | 4.13 | 1 | ~ |
+| Q15a | 3.58 | 3.63 | 10000 | ~ |
+| Q15b | 34.13 | 33.60 | 1 | ~ |
+| Q16 | 1.08 | 1.06 | 18192 | ~ |
+| Q17 | 4.28 | 4.26 | 1 | ~ |
+| **Q18** | 28.24 | 120.26 | 7 | **regr 4.3×** |
+| Q19 | 5.60 | 5.21 | 1 | ~ |
+| Q20 | 2.03 | 2.09 | 92 | ~ |
+| **Q21** | 20.08 | **HANG (>300 s)** | – | **REGRESSION (memory-thrash)** |
+| Q22 | 96.89 | 96.81 | 7 | ~ |
+
+**Correctness holds where it completes:** every completing query returns the same rows as the
+default (and round 4). Three did not complete (Q5, Q9, Q21).
+
+**The result is a coin flip — and the two planners are complementary, not ranked.** The
+tally: **4 wins, 6 regressions (3 of them non-completing), 12 neutral.**
+
+- **Cost-driven *fixes* the integer planner's own worst cells.** Q2 (51→2.7 s, 18.8×) and Q8
+  (181→44 s, 4.1×) are exactly two of the five "statistics wrecked it" regressions round 4 §5
+  named (Q2 "26× slower", Q8 "53× slower"). The default planner's stats-less small-dimension
+  heuristic mis-orders these; a cost-based order avoids the large intermediate. This is the
+  direct measured evidence that a cost model is the right answer to round 4 §5.
+- **Cost-driven *creates* new regressions on the star/snowflake queries** — Q5/Q21 thrash to a
+  hang, Q9 times out, Q10 (11.4×), Q18 (4.3×), Q7 (1.9×). Cause: the cost-driven mode drops
+  MultiHashJoin (cost-model ch. 12), so a fact-with-many-dims query becomes a binary hash
+  cascade that materialises the wide 6 M-row intermediates a single MHJ probe-pass would
+  stream (the exact pathology of cost-model ch. 15). Some build large enough to memory-thrash
+  under the cgroup cap.
+- **The 12 neutral queries** are ≤2-table joins or shapes where both planners pick the same
+  order — cost-driven's DP only engages for 3+-table joins.
+
+So neither planner dominates: cost-driven and the integer planner **fix each other's failure
+modes** (stats-driven mis-orders vs MHJ-drop cascades). This is precisely why cost-driven
+ships **off by default** (this session's decision): its regressions — two of them
+non-completing hangs — outweigh its wins as a blanket default, even though its wins are real
+and large. The path to making it a net win is cost-model ch. 15's open item (re-admit MHJ to
+the cost-driven DP for star shapes), which this session found could not be forced without
+distorting the other queries.
+
+---
+
+## 7. Summary judgement
 
 | dimension | verdict |
 |---|---|
 | correctness | **flawless.** All 24 row counts match round 4, under the int64 fast-path and at the new 4-worker default. |
-| int64 hash-join fast-path (the round's shipped, always-on win) | **a clean, broad, safe gain.** 2–6 % on every hash-heavy query, concentrated exactly where large hash tables live (Q4/Q8/Q9/Q12/Q13/Q22), zero regressions, no plan changes. Stream −3.7 % at equal worker degree. |
+| int64 hash-join fast-path (the round's shipped, always-on win) | **a real aggregate gain, cleanly attributed at the stream level.** The eight 100 s-class hash-heavy queries all move faster and carry ~89 % of the −3.7 % stream delta (§3); per-query small-cell moves (2–10 %) sit at the run-to-run noise floor and are not individually attributable. No plan changes; no query slower beyond noise. |
 | parallel default 2 → 4 | **correct and PG-faithful.** Worker counts now follow `compute_parallel_worker` up to 4; the MHJ per-worker-rebuild ceiling (round 4) means the gain over 2 is modest for the MHJ queries but free elsewhere. |
-| cost-driven join-order planner | **not in this measurement** — OFF by default (a deliberate decision this round: enabling it drops MHJ and regresses the star queries; see the cost-model design bundle ch. 15). |
+| cost-driven join-order planner (OFF by default; measured in §6) | **a coin flip — complementary to the default, not better.** Fixes the integer planner's stats-driven regressions (Q2 18.8×, Q8 4.1×) but creates star-query regressions from dropping MHJ (Q5/Q21 hang, Q9 timeout, Q10 11.4×, Q18 4.3×): 4 wins / 6 regressions / 12 neutral. Correct where it completes. Ships off by default; the fix is cost-model ch. 15's open item. |
 | net on the stream total | **1128 → 1086 s (−3.7 %)** vs round 4 at the same worker degree; a single default config now beats round 4's best full sweep. |
 | vs PG overall | still 3×–1615×; the worst cells remain the **statistics regressions** (Q22 1615×, Q4 1352×, Q8 907×) — unchanged in kind from round 4, trimmed a few percent by int64. |
 
@@ -210,10 +299,10 @@ planner-layer, and it needs a cost model.
 
 ---
 
-## 7. Provenance
+## 8. Provenance
 
 - **HEAD:** `cb37d166` (branch `costmodel-enhance1`). Round-4 baseline `648f5e47`.
-- **goopg R5 sweep:** `cmd/tpch-runner` at HEAD, one server start under
+- **goopg R5 default sweep:** `cmd/tpch-runner` at HEAD, one server start under
   `scripts/csq-bench-server.sh` (cgroup-capped, `127.0.0.1:65433`, data dir
   `bench/tpch/runtime_goopg/data` = the `postgres` DB), one per-table ANALYZE of all 8
   tables (bare `ANALYZE;` is a no-op on goopg — each table analysed by name), then a single
@@ -221,7 +310,14 @@ planner-layer, and it needs a cost model.
   (`-1` = the server boot default of 4 — the true default state). Cost-driven join-order
   **not** enabled (`GOOPG_COST_DRIVEN_JOINORDER` unset). Evidence:
   [`docs/design/cost-model/evidence/sf1-r5-default-cb37d166.txt`](../docs/design/cost-model/evidence/sf1-r5-default-cb37d166.txt).
-- **goopg R5 plans:** `make plan-snapshot-capture LABEL=r5-default PLAN_DB=postgres` →
+- **goopg R5 cost-driven arm (§6):** same HEAD/server/ANALYZE with
+  `GOOPG_COST_DRIVEN_JOINORDER=1` exported to the server, but a **per-query-isolated** harness
+  (one `tmp/tpch-runner --queries=N --per-query-timeout=300s` per query, 340 s external hard
+  cap, full server restart + re-ANALYZE between queries) — required because a memory-thrashing
+  cost-driven plan does not honor cancellation. Evidence:
+  [`docs/design/cost-model/evidence/sf1-r5-costdriven-cb37d166.txt`](../docs/design/cost-model/evidence/sf1-r5-costdriven-cb37d166.txt);
+  plans [`plan_snapshots/r5-costdriven.txt`](../plan_snapshots/r5-costdriven.txt).
+- **goopg R5 default plans:** `make plan-snapshot-capture LABEL=r5-default PLAN_DB=postgres` →
   [`plan_snapshots/r5-default.txt`](../plan_snapshots/r5-default.txt), stats on, server
   default 4 workers.
 - **Round 4 columns (PG / R3 / R4 w4 / R4 best):** carried verbatim from

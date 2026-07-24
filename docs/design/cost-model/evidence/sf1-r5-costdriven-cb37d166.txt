@@ -1,0 +1,29 @@
+# TPC-H SF1 Round 5 — COST-DRIVEN planner (HEAD cb37d166, GOOPG_COST_DRIVEN_JOINORDER=1, max_parallel_workers_per_gather=4)
+# per-query isolated runner, --per-query-timeout=300s, external 340s hard cap; server restarted+re-ANALYZEd on any hang or >8G RSS
+# a memory-thrashing cost-driven plan does NOT honor cancellation → recorded as HANG
+# 2026-07-24 09:09:03 start
+Q1: OK elapsed=4.40s rows=4
+Q2: OK elapsed=2.72s rows=459
+Q3: OK elapsed=5.58s rows=11175
+Q4: OK elapsed=256.62s rows=5
+Q5: HANG (>300s wall, cancellation not honored — memory-thrash)
+Q6: OK elapsed=3.12s rows=1
+Q7: OK elapsed=264.37s rows=4
+Q8: OK elapsed=44.33s rows=2
+Q9: ERROR after 300.12s — pq: canceling statement due to user request (57014)
+Q10: OK elapsed=109.27s rows=20522
+Q11: OK elapsed=1.36s rows=785
+Q12: OK elapsed=100.40s rows=2
+Q13: OK elapsed=97.74s rows=33
+Q14: OK elapsed=4.13s rows=1
+Q15-CREATEVIEW: OK elapsed=0.02s rows=0
+Q15a-VIEWBODY: OK elapsed=3.63s rows=10000
+Q15b-MAIN: OK elapsed=33.60s rows=1
+Q16: OK elapsed=1.06s rows=18192
+Q17: OK elapsed=4.26s rows=1
+Q18: OK elapsed=120.26s rows=7
+Q19: OK elapsed=5.21s rows=1
+Q20: OK elapsed=2.09s rows=92
+Q21: HANG (>300s wall, cancellation not honored — memory-thrash)
+Q22: OK elapsed=96.81s rows=7
+# 2026-07-24 10:00:22 done
