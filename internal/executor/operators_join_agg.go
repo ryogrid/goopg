@@ -3184,8 +3184,13 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 		if rowHasArena(row) {
 			dup = cloneRowOwned(row)
 		} else {
-			dup = acquireRow(len(row))
-			copy(dup, row)
+			// Row is already fully owned (all arena bytes materialized,
+			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
+			// The row was independently allocated via acquireRow; appending
+			// directly is safe because the producer allocates a fresh row
+			// on the next call.  Eliminates a redundant O(width) copy.
+			// See docs/design/tpch-round5-fixes/04.
+			dup = row
 		}
 		rows = append(rows, dup)
 		n++
@@ -3223,8 +3228,13 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 		if rowHasArena(row) {
 			dup = cloneRowOwned(row)
 		} else {
-			dup = acquireRow(len(row))
-			copy(dup, row)
+			// Row is already fully owned (all arena bytes materialized,
+			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
+			// The row was independently allocated via acquireRow; appending
+			// directly is safe because the producer allocates a fresh row
+			// on the next call.  Eliminates a redundant O(width) copy.
+			// See docs/design/tpch-round5-fixes/04.
+			dup = row
 		}
 		rows = append(rows, dup)
 		if scanLeaf != nil {

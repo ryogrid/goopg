@@ -11,6 +11,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/runtimeshim"
 )
 
@@ -827,9 +828,63 @@ func ClearCurrentGoroutine() {
 	goroutineActivityMu.Unlock()
 }
 
+// ——— Global registry singleton (fast-path gls lookup) ———————————
+//
+// Fix 02 (docs/design/tpch-round5-fixes/02): a process-wide atomic pointer
+// to the ActivityRegistry, set once at server startup.  LookupByBackendID
+// uses gls.BackendID() for O(1) lookup without runtime.Stack, eliminating
+// the last remaining hot-path goroutine-ID extractions.
+
+var globalRegistry atomic.Pointer[ActivityRegistry]
+
+// SetGlobalRegistry stores the process-wide ActivityRegistry for fast
+// gls-based lookups.  Called once at server startup, before any connections.
+func SetGlobalRegistry(reg *ActivityRegistry) {
+	globalRegistry.Store(reg)
+}
+
+// LookupByBackendID returns the registry and procNum for the calling
+// goroutine using gls.BackendID() — a pointer load + single label scan,
+// allocation-free, NO runtime.Stack.  Returns (nil, 0, false) if gls is
+// not usable on this runtime, the global registry is not set, or the
+// procNum slot is not occupied.
+func LookupByBackendID() (*ActivityRegistry, int32, bool) {
+	reg := globalRegistry.Load()
+	if reg == nil {
+		return nil, 0, false
+	}
+	procNum, ok := gls.BackendID()
+	if !ok {
+		return nil, 0, false
+	}
+	if procNum < 0 || int(procNum) >= len(reg.slots) {
+		return nil, 0, false
+	}
+	// Verify the slot is occupied (a registered backend).
+	if reg.slots[procNum].cold.Load() == nil {
+		return nil, 0, false
+	}
+	return reg, procNum, true
+}
+
 // LookupCurrentGoroutine returns the registry and procNum for the calling
 // goroutine, or (nil, 0, false) if not registered.
+// Prefers the gls-based fast path (LookupByBackendID); falls back to the
+// goroutine-ID map on unsupported runtimes.
 func LookupCurrentGoroutine() (*ActivityRegistry, int32, bool) {
+	// Fast path: gls.BackendID() — no runtime.Stack, no map lookup.
+	if reg, procNum, ok := LookupByBackendID(); ok {
+		return reg, procNum, ok
+	}
+	// Slow path: goroutine ID → map lookup (runtime.Stack).
+	return lookupCurrentGoroutineLegacy()
+}
+
+// lookupCurrentGoroutineLegacy is the original implementation using
+// runtime.Stack to extract the goroutine ID.  Kept as fallback for
+// unsupported runtimes and goroutines without pprof labels (e.g.
+// background workers that don't call gls.SetBackendID).
+func lookupCurrentGoroutineLegacy() (*ActivityRegistry, int32, bool) {
 	id := goroutineID()
 	goroutineActivityMu.RLock()
 	entry, ok := goroutineActivityMap[id]

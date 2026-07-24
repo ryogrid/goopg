@@ -1196,9 +1196,18 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, err
 		}
 		text := string(payload)
-		if v, scale, ok := parseNumericFast(text); ok {
+		if v, scale, ok := parseNumericFastInt(text); ok {
 			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
 		}
+		// Try known-scale fast path when the column type declares a scale
+		// (all TPC-H NUMERIC columns).  Args[0]=precision, Args[1]=scale.
+		// See docs/design/tpch-round5-fixes/06.
+		if len(t.Args) >= 2 {
+			if v, scale, ok := parseNumericFastScale(text, int16(t.Args[1])); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+			}
+		}
+		// Fall through to big.Int slow path.
 		m, s, err := parseNumeric(text)
 		if err != nil {
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)

@@ -298,6 +298,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// etc.) are assigned slots in the background-worker range above the
 	// regular backend range.
 	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	// Publish the process-wide registry so hot-path callers can use
+	// LookupByBackendID → gls.BackendID() instead of runtime.Stack.
+	// See docs/design/tpch-round5-fixes/02.
+	activity.SetGlobalRegistry(act)
 	// Pre-register the WAL writer background slot so the OnWALWrite closure
 	// can call WaitEventStart(walProcNum, ...) without a goroutine map lookup.
 	walProcNum := act.RegisterBackground(activity.WalWriterIdx, &activity.Backend{

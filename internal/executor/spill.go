@@ -18,6 +18,15 @@ type spillWriter struct {
 	f    *os.File
 	path string
 	buf  []byte // reusable encode buffer
+
+	// Cached activity registry reference and procNum for IO wait-event
+	// recording. Populated once at construction via LookupCurrentGoroutine;
+	// safe because the spillWriter is single-goroutine and the goroutine
+	// is registered (SetCurrentGoroutine in server.go) before any spill
+	// writer is created. See docs/design/tpch-round5-fixes/01.
+	reg     *activity.ActivityRegistry
+	procNum int32
+	hasReg  bool
 }
 
 func newSpillWriter(dir string) (*spillWriter, error) {
@@ -25,7 +34,16 @@ func newSpillWriter(dir string) (*spillWriter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spillWriter: create temp file: %w", err)
 	}
-	return &spillWriter{f: f, path: f.Name()}, nil
+	w := &spillWriter{f: f, path: f.Name()}
+	// Cache the registry reference once at construction time instead
+	// of calling LookupCurrentGoroutine (→ runtime.Stack) on every
+	// spilled row.  See docs/design/tpch-round5-fixes/01.
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		w.reg = reg
+		w.procNum = procNum
+		w.hasReg = true
+	}
+	return w, nil
 }
 
 func (w *spillWriter) WriteRow(row Row) error {
@@ -37,14 +55,13 @@ func (w *spillWriter) WriteRow(row Row) error {
 	// Prefix with total length for framing.
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
-	reg, procNum, okReg := activity.LookupCurrentGoroutine()
-	if okReg {
-		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileWrite)
+	if w.hasReg {
+		w.reg.WaitEventStart(w.procNum, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
 	_, err1 := w.f.Write(lenBuf)
 	_, err2 := w.f.Write(w.buf)
-	if okReg {
-		reg.WaitEventEnd(procNum)
+	if w.hasReg {
+		w.reg.WaitEventEnd(w.procNum)
 	}
 	if err1 != nil {
 		return err1
@@ -71,6 +88,12 @@ type spillReader struct {
 	// shrunk — typical TPC-H rows are well-bounded so the steady
 	// state is small.
 	dataBuf []byte
+
+	// Cached activity registry reference and procNum (mirrors spillWriter).
+	// See docs/design/tpch-round5-fixes/01.
+	reg     *activity.ActivityRegistry
+	procNum int32
+	hasReg  bool
 }
 
 func newSpillReader(path string) (*spillReader, error) {
@@ -78,7 +101,13 @@ func newSpillReader(path string) (*spillReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spillReader: open %s: %w", path, err)
 	}
-	return &spillReader{f: f, path: path}, nil
+	r := &spillReader{f: f, path: path}
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		r.reg = reg
+		r.procNum = procNum
+		r.hasReg = true
+	}
+	return r, nil
 }
 
 func (r *spillReader) ReadRow() (Row, error) {
@@ -101,13 +130,12 @@ func (r *spillReader) ReadRow() (Row, error) {
 // across calls.
 func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 	var lenBuf [4]byte
-	reg, procNum, okReg := activity.LookupCurrentGoroutine()
-	if okReg {
-		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
+	if r.hasReg {
+		r.reg.WaitEventStart(r.procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errLen := io.ReadFull(r.f, lenBuf[:])
-	if okReg {
-		reg.WaitEventEnd(procNum)
+	if r.hasReg {
+		r.reg.WaitEventEnd(r.procNum)
 	}
 	if errLen != nil {
 		return nil, errLen
@@ -121,12 +149,12 @@ func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 		r.dataBuf = r.dataBuf[:dataLen]
 	}
 	data := r.dataBuf
-	if okReg {
-		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
+	if r.hasReg {
+		r.reg.WaitEventStart(r.procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errData := io.ReadFull(r.f, data)
-	if okReg {
-		reg.WaitEventEnd(procNum)
+	if r.hasReg {
+		r.reg.WaitEventEnd(r.procNum)
 	}
 	if errData != nil {
 		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)
