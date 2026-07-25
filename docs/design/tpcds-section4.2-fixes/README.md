@@ -436,16 +436,19 @@ tracing to locate the exact Project node and its parent Join.
 **Deferred work:** trace the full planner tree for Q8 to identify the
 remaining crash site, then apply the same index-remapping pattern there.
 
-### Q90 — Data Integrity Issue
+### Q90 — COPY Btree Index Bug (Resolved)
 
-Investigation revealed that `web_page.wp_web_page_sk = 1` (integer equality)
-returns 0 rows on goopg while `wp_web_page_sk::text = '1'` (text cast) returns
-1 row correctly.  The `\d web_page` output shows a corrupted column list
-mixing `web_page` and `household_demographics` columns, indicating a data
-loading schema corruption.  This is a pre-existing issue in the TPC-DS data
-directory, not caused by these engine changes.
+Investigation revealed `wp_web_page_sk = 1` returned 0 rows on goopg while
+`wp_web_page_sk::text = '1'` returned 1 row correctly.  The root cause was
+that `COPY FROM` never called `maintainUniqueIndexesForInsert`, so all btree
+indexes (including PRIMARY KEYs) remained empty after data loading.  Every
+index scan returned zero rows, while sequential scans worked correctly.
 
-**Deferred work:** re-load TPC-DS data with verified schemas.
+Fixed in commit `8ee4194b` by adding `maintainUniqueIndexesForInsert` calls
+to both `PushLine` and `PushBinaryData` in `internal/executor/copy.go`.
+After the fix and data reload, Q90 returns 1 row — **perfect match with PG**.
+The `\d web_page` anomaly was a pre-existing catalog display issue, not a
+schema corruption.
 
 - **Design document:** `docs/design/tpcds-section4.2-fixes/README.md`
 - **Parent report:** `analysis/tpcds-sf1-goopg-20260724.md`
