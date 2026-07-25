@@ -161,22 +161,37 @@ The `cast('...' as date) + INTERVAL 'N days'` pattern already worked.
 
 ## §3 Fix 4: Division by Zero (Q90)
 
-### §3.1 Analysis
+### §3.1 Root Cause
 
-The Q90 query computes `cast(amc as decimal)/cast(pmc as decimal)` where
-`pmc` = count of PM sales.  Both PostgreSQL AND goopg raise `division by zero`
-(SQLSTATE 22012) for `numeric / 0`.  PG returned 1 row for Q90, so PG data
-has `pmc > 0` while goopg data has `pmc = 0`.
+Q90 computes `cast(amc as decimal)/cast(pmc as decimal)`.  On the original data
+load Q90 errored with `division by zero` because `pmc = 0`.  Investigation
+revealed that `COPY FROM` did NOT call `maintainUniqueIndexesForInsert`, so
+btree indexes (including all PRIMARY KEYs) were never populated for COPY-loaded
+rows.  Every index scan returned zero rows.
 
-Since identical TSV data files were loaded, the discrepancy suggests:
-1. A data-loading difference (missing rows in `time_dim` or `web_sales`)
-2. A query-evaluation difference (BETWEEN constant-folding for `14+1`)
+Q90's `pmc` subquery joins `web_sales` with `web_page` on
+`ws_web_page_sk = wp_web_page_sk`.  `web_page` has a PRIMARY KEY index on
+`wp_web_page_sk`, so the planner chose an index scan.  With an empty btree,
+the index scan found no rows, the join produced 0 rows, `pmc = 0`, and the
+outer division failed.
 
-### §3.2 Status
+### §3.2 Fix
 
-Investigation deferred until end-to-end verification with a running server.
-The fix is likely in data loading (`tpcds-load.sh` or `convert_tpcds.py`),
-not in engine code.
+**File:** `internal/executor/copy.go`, `PushLine` and `PushBinaryData`.
+
+Changed both functions to use `writeHeapRowReturning` (which returns the
+`ItemPointer` of the inserted row) and then call
+`maintainUniqueIndexesForInsert`, matching the INSERT code path.
+
+After the fix and data reload, Q90 returns 1 row — **perfect match with PG**.
+
+### §3.3 Verification (2026-07-25)
+
+| System | Result | Rows |
+|--------|--------|------|
+| goopg (before fix) | `ERROR: division by zero` | — |
+| goopg (after fix + reload) | OK (18s) | 1 |
+| PostgreSQL 18.3 | OK (1s) | 1 |
 
 ---
 
