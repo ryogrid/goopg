@@ -42,6 +42,15 @@ func orderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Ex
 				return tgt.Expr
 			}
 		}
+		// Also match against derived output column names (e.g.
+		// ORDER BY item_id matches SELECT ss_items.item_id).
+		for _, tgt := range targets {
+			if tgt.Alias == "" {
+				if derived := deriveAnalyzerTargetName(tgt.Expr); derived != "" && strings.EqualFold(derived, cr.Column) {
+					return tgt.Expr
+				}
+			}
+		}
 	}
 	return expr
 }
@@ -1349,6 +1358,21 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return catalog.Type{Name: "interval"}, nil
 			}
+			// date + integer → date (date_pli).  PG treats the integer as
+			// a day count; executor: addDateTimeInt in expr.go.
+			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) && x.Op == parser.OpAdd {
+				return leftTyp, nil
+			}
+			if isIntegerLike(leftTyp) && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
+				return rightTyp, nil
+			}
+			// date + interval → timestamp (date_pl_interval).
+			if strings.EqualFold(leftTyp.Name, "date") && strings.EqualFold(rightTyp.Name, "interval") && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "timestamp"}, nil
+			}
+			if strings.EqualFold(leftTyp.Name, "interval") && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "timestamp"}, nil
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -1919,13 +1943,13 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 	if table == "" {
 		return schema != ""
 	}
-	if strings.EqualFold(table, rel.table.Name) {
-		return true
+	// If the FROM entry has an explicit alias, it is referenceable ONLY
+	// by that alias — PostgreSQL hides the original table name once a
+	// FROM entry is aliased.  Mirror planner.bindingMatchesRelation.
+	if rel.alias != "" {
+		return strings.EqualFold(table, rel.alias)
 	}
-	if rel.alias != "" && strings.EqualFold(table, rel.alias) {
-		return true
-	}
-	return false
+	return strings.EqualFold(table, rel.table.Name)
 }
 
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {

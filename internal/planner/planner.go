@@ -4849,11 +4849,20 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 		}
 		return expr
 	}
-	// Alias: bare ColumnRef whose Column matches a target's Alias.
+	// Alias: bare ColumnRef whose Column matches a target's Alias
+	// or, when no explicit AS is given, the derived output column name
+	// (e.g. ORDER BY item_id matches SELECT ss_items.item_id).
 	if cr, ok := expr.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
 		for _, tgt := range targets {
 			if tgt.Alias != "" && strings.EqualFold(tgt.Alias, cr.Column) {
 				return tgt.Expr
+			}
+		}
+		for _, tgt := range targets {
+			if tgt.Alias == "" {
+				if derived := deriveSubqueryTargetName(tgt.Expr); derived != "" && strings.EqualFold(derived, cr.Column) {
+					return tgt.Expr
+				}
 			}
 		}
 	}
@@ -5168,65 +5177,92 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		return child, inputCtx, nil, nil
 	}
 
-	firstSpec := windowSpecKey(calls[0].Over)
-	for i := 1; i < len(calls); i++ {
-		if windowSpecKey(calls[i].Over) != firstSpec {
-			return nil, nil, nil, &PlanError{Pos: calls[i].Pos(), Code: "0A000", Message: "multiple window specifications are not supported in v0 planner"}
-		}
+	// Group calls by distinct window specification (PartitionBy + OrderBy + Frame).
+	// Each group becomes its own WindowAgg node, chained so the output of one
+	// feeds the input of the next — downstream window functions can reference
+	// earlier window-function results, matching PG semantics.
+	type specGroup struct {
+		key   string
+		calls []*parser.FuncCall
 	}
-
-	partition := make([]Expr, 0, len(calls[0].Over.PartitionBy))
-	for _, p := range calls[0].Over.PartitionBy {
-		r, err := resolveExprForWindowInput(p, inputCtx, agg)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		partition = append(partition, r)
-	}
-	order := make([]SortKey, 0, len(calls[0].Over.OrderBy))
-	for _, ob := range calls[0].Over.OrderBy {
-		r, err := resolveExprForWindowInput(ob.Expr, inputCtx, agg)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		order = append(order, SortKey{Expr: r, Desc: ob.Desc, NullsFirst: sortByNullsFirst(ob)})
-	}
-
-	outputSchema := append(Schema(nil), inputCtx.schema...)
-	funcs := make([]WindowFunc, 0, len(calls))
-	byKey := make(map[string]windowBinding, len(calls))
+	var groups []*specGroup
+	groupByKey := map[string]*specGroup{}
 	for _, fc := range calls {
-		k := windowCallKey(fc)
-		if _, exists := byKey[k]; exists {
-			continue
+		key := windowSpecKey(fc.Over)
+		if g, ok := groupByKey[key]; ok {
+			g.calls = append(g.calls, fc)
+		} else {
+			g := &specGroup{key: key, calls: []*parser.FuncCall{fc}}
+			groups = append(groups, g)
+			groupByKey[key] = g
 		}
-		wf, err := buildWindowFunc(fc, inputCtx, agg)
+	}
+
+	currentChild := child
+	currentCtx := inputCtx
+	combinedByKey := make(map[string]windowBinding)
+
+	for _, g := range groups {
+		partition := make([]Expr, 0, len(g.calls[0].Over.PartitionBy))
+		for _, p := range g.calls[0].Over.PartitionBy {
+			r, err := resolveExprForWindowInput(p, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			partition = append(partition, r)
+		}
+		order := make([]SortKey, 0, len(g.calls[0].Over.OrderBy))
+		for _, ob := range g.calls[0].Over.OrderBy {
+			r, err := resolveExprForWindowInput(ob.Expr, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			order = append(order, SortKey{Expr: r, Desc: ob.Desc, NullsFirst: sortByNullsFirst(ob)})
+		}
+
+		outputSchema := append(Schema(nil), currentCtx.schema...)
+		funcs := make([]WindowFunc, 0, len(g.calls))
+		byKey := make(map[string]windowBinding, len(g.calls))
+		for _, fc := range g.calls {
+			k := windowCallKey(fc)
+			if _, exists := byKey[k]; exists {
+				continue
+			}
+			wf, err := buildWindowFunc(fc, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			idx := len(outputSchema)
+			funcs = append(funcs, wf)
+			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: wf.Type})
+			byKey[k] = windowBinding{index: idx, typ: wf.Type}
+		}
+
+		frame, err := resolveWindowFrame(g.calls[0].Over.Frame, currentCtx, agg)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		idx := len(outputSchema)
-		funcs = append(funcs, wf)
-		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: wf.Type})
-		byKey[k] = windowBinding{index: idx, typ: wf.Type}
+
+		windowNode := &WindowAgg{
+			pos:         s.Pos(),
+			Child:       currentChild,
+			PartitionBy: partition,
+			OrderBy:     order,
+			Funcs:       funcs,
+			Frame:       frame,
+			schema:      outputSchema,
+		}
+		currentChild = windowNode
+		currentCtx = newResolveContext(nil, outputSchema)
+
+		for k, v := range byKey {
+			combinedByKey[k] = v
+		}
 	}
 
-	frame, err := resolveWindowFrame(calls[0].Over.Frame, inputCtx, agg)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 
-	windowNode := &WindowAgg{
-		pos:         s.Pos(),
-		Child:       child,
-		PartitionBy: partition,
-		OrderBy:     order,
-		Funcs:       funcs,
-		Frame:       frame,
-		schema:      outputSchema,
-	}
-	outCtx := newResolveContext(nil, outputSchema)
-	surface := &windowSurface{input: inputCtx, agg: agg, output: outCtx, windowByKey: byKey}
-	return windowNode, outCtx, surface, nil
+	surface := &windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey}
+	return currentChild, currentCtx, surface, nil
 }
 
 func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {

@@ -1423,6 +1423,16 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		if left.Kind == KindInterval && right.Kind == KindInterval {
 			return addIntervalInterval(left, right, op == parser.OpSub, pos)
 		}
+		// date ± integer → date (days arithmetic).
+		// Mirrors upstream date_pli / date_mi: the integer operand is
+		// treated as a day count.  Requires the left datum to carry
+		// flagDate (a bare timestamp+int would be ambiguous).
+		if left.Kind == KindTime && left.Flags&flagDate != 0 && right.Kind == KindInt {
+			return addDateTimeInt(left, right, op == parser.OpSub, pos)
+		}
+		if op == parser.OpAdd && left.Kind == KindInt && right.Kind == KindTime && right.Flags&flagDate != 0 {
+			return addDateTimeInt(right, left, false, pos)
+		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
 		// scale-aligning helpers.  Also try to parse string
@@ -1910,6 +1920,22 @@ func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
 		return false, err
 	}
 	return re.MatchString(s), nil
+}
+
+// addDateTimeInt adds or subtracts an integer number of days to a DATE
+// datum.  It mirrors upstream date_pli / date_mi: the integer is interpreted
+// as a day count, and the result is a DATE.  ∞-day spans are not supported
+// (PG rejects infinity date arithmetic).
+func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
+	if dt.IsTimestampNotFinite() {
+		return NullDatum, timestampOutOfRange(pos)
+	}
+	t := time.Unix(0, dt.Int).UTC()
+	n := int(days.Int)
+	if subtract {
+		n = -n
+	}
+	return NewDateDatum(t.AddDate(0, 0, n)), nil
 }
 
 // addTimeInterval applies an interval to a time value. When
