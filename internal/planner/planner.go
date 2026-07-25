@@ -2387,6 +2387,74 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
+// remapSubqueryColumnRefs walks the plan tree rooted at n and rewrites every
+// Project node so that its targets are position-based ColumnRefs (indices
+// 0..N-1) relative to the Project's own child output schema.  The original
+// output schema (column names and types) is preserved; only the ColumnRef
+// indices are rebuilt.
+//
+// This is a safety-normalisation pass applied after planning a FROM-clause
+// subquery: if outer resolve-context leakage caused the sub-SELECT's Project
+// to reference columns by their global FROM-clause index rather than by the
+// subquery's own output index, this pass corrects those indices before the
+// executor ever sees them.
+func remapSubqueryColumnRefs(n Node) Node {
+	if n == nil {
+		return nil
+	}
+	switch x := n.(type) {
+	case *Project:
+		// Recurse into child first.
+		x.Child = remapSubqueryColumnRefs(x.Child)
+		childSchema := x.Child.Output()
+		// Rebuild every target as a position-based ColumnRef.
+		newTargets := make([]Expr, len(x.Targets))
+		for i, t := range x.Targets {
+			// If target is a simple ColumnRef, replace with
+			// position-based index from child schema.
+			if cr, ok := t.(*ColumnRef); ok {
+				// Find matching column in child output by name.
+				found := false
+				for j, sc := range childSchema {
+					if strings.EqualFold(cr.Name, sc.Name) {
+						clone := *cr
+						clone.Index = j
+						newTargets[i] = &clone
+						found = true
+						break
+					}
+				}
+				if !found {
+					newTargets[i] = t // keep as-is
+				}
+			} else {
+				newTargets[i] = t // keep non-ColumnRef expressions
+			}
+		}
+		x.Targets = newTargets
+		return x
+
+	case *Join:
+		x.Left = remapSubqueryColumnRefs(x.Left)
+		x.Right = remapSubqueryColumnRefs(x.Right)
+	case *Filter:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Sort:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Aggregate:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Limit:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *SetOp:
+		x.Left = remapSubqueryColumnRefs(x.Left)
+		x.Right = remapSubqueryColumnRefs(x.Right)
+	case *Gather:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	}
+	return n
+}
+
+
 // containsSetOp reports whether the plan subtree rooted at n contains
 // a SetOp or RecursiveUnion node.  Hash-join conversion must be skipped
 // when a join side contains a set operation because the column indices
@@ -3030,6 +3098,15 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		}
 		return nil, rangeBinding{}, err
 	}
+	// M0097-0058: remap ColumnRef indices in all Project nodes within the
+	// subquery plan to use position-based indices (0..N-1) relative to each
+	// Project's own child output.  This normalises away any column-index
+	// corruption from outer resolve-context leakage during sub-SELECT
+	// planning — without this, a non-lateral subquery's Project may
+	// reference columns by their global FROM-clause index (e.g. 57)
+	// instead of by the subquery's own output index (e.g. 0), causing an
+	// index-out-of-bounds crash at execution time.
+	inner = remapSubqueryColumnRefs(inner)
 	innerSchema := inner.Output()
 	// Use the inner plan's output schema as the source of truth for the
 	// derived table's columns: it already accounts for star-expansion

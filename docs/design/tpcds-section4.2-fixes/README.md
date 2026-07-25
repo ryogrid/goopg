@@ -394,5 +394,48 @@ next verification phase.
 
 - **Branch:** `tpcds-error-fix`
 - **Base commit:** `782db4d2` (nightly batch 20260725)
+**Latest:** `9ddbc679` + `remapSubqueryColumnRefs` (uncommitted)
+
+
+---
+
+## §9 Q8/Q90 Investigation Addendum (2026-07-25)
+
+### Q8 — Column-Index Remapping Defence-in-Depth
+
+After the initial `containsSetOp` guard (commit `9ddbc679`), Q8 was still
+crashing through an unidentified nested-loop join path.  Additional defences
+were added:
+
+1. **`remapSubqueryColumnRefs`** (`planner.go`): recursively walks the
+   subquery plan tree after `planSelectWithParent` and rewrites every
+   Project node's targets to use position-based ColumnRef indices (0..N-1)
+   relative to the Project's own child output.  This normalises away any
+   column-index corruption from outer resolve-context leakage.
+
+2. **`containsSetOp` guards** (pushdown.go, planner.go): prevent
+   CrossJoin-to-InnerJoin promotion and hash-join algorithm selection when
+   either join side contains a SetOp/RecursiveUnion node.
+
+These form a defence-in-depth that prevents the index-out-of-bounds crash
+in the most common code paths (CrossJoin promotion, hash join).  The
+remaining crash path (triggered at ~2 min for TPC-DS Q8) is in an
+unidentified nested-loop materialization and requires deeper planner
+tracing to locate the exact Project node and its parent Join.
+
+**Deferred work:** trace the full planner tree for Q8 to identify the
+remaining crash site, then apply the same index-remapping pattern there.
+
+### Q90 — Data Integrity Issue
+
+Investigation revealed that `web_page.wp_web_page_sk = 1` (integer equality)
+returns 0 rows on goopg while `wp_web_page_sk::text = '1'` (text cast) returns
+1 row correctly.  The `\d web_page` output shows a corrupted column list
+mixing `web_page` and `household_demographics` columns, indicating a data
+loading schema corruption.  This is a pre-existing issue in the TPC-DS data
+directory, not caused by these engine changes.
+
+**Deferred work:** re-load TPC-DS data with verified schemas.
+
 - **Design document:** `docs/design/tpcds-section4.2-fixes/README.md`
 - **Parent report:** `analysis/tpcds-sf1-goopg-20260724.md`
