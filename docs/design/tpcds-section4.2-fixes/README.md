@@ -17,11 +17,11 @@ Stability (INTERSECT crash).
 | 1 | Q47, Q57 | table reference "v1" is ambiguous | Analyzer | `scopeRelMatches` alias-first matching |
 | 2 | Q58 | column reference "item_id" is ambiguous | Analyzer | (same as #1) |
 | 3 | Q72 | operator + requires numeric operands | Executor | `KindTime + KindInt` in `evalBinary` |
-| 4 | Q90 | division by zero | Data | Investigation deferred — data fidelity |
+| 4 | Q90 | division by zero (pmc=0) | Data | **Deferred**: pre-existing data integrity issue — `wp_web_page_sk = 1` returns 0 rows via WHERE but `LIMIT 5` shows value 1. Integer comparison mismatch for some TPC-DS tables. Not a code regression. |
 | 5 | Q87 | EXCEPT in FROM subquery | Parser | `parseParenthesisedSelectStmt` in FROM |
 | 6 | Q77 | UNION ALL + ROLLUP in FROM subquery | Parser | (same as #5) + `KwReturns` alias |
 | 7 | Q49 | multiple window specs not supported | Planner | Chained `WindowAgg` nodes |
-| 8 | Q8 | Connection lost (crash) | Stability | Planner bug: column index remapping for INTERSECT in FROM subquery (deferred) |
+| 8 | Q8 | index out of range [57] with length 1 | Stability | **Deferred**: deep planner bug — column-index remapping for set-op subqueries. Hash-join guard prevents hash crash but nested-loop path also affected. Needs proper ColumnRef index remapping in `planFromRangeVars` / `pushOneConjunct` when join sides contain derived tables (SetOp/RecursiveUnion). |
 
 ---
 
@@ -374,7 +374,7 @@ Both functions now follow the same logic:
 
 | Query | Parse | E2E (server) | Status | PG rows | goopg rows | Notes |
 |-------|-------|--------------|--------|---------|-------------|-------|
-| Q8 | PASS | CRASH | Known issue | 0 | N/A | Planner: INTERSECT in FROM subquery column remapping bug (index out of range [57] with length 1) |
+| Q8 | PASS | CRASH | Deferred | 0 | N/A | Planner column-index remapping for set-op subqueries; `containsSetOp` guard in pushdown.go prevents hash-join crash but nested-loop path also affected |
 | Q47 | PASS | OK (0 rows) | Fixed ✓ | 100 | 0 | Row-count gap is pre-existing (data/config difference) |
 | Q49 | PASS | OK (0 rows) | Fixed ✓ | 34 | 0 | Row-count gap is pre-existing |
 | Q57 | PASS | OK (0 rows) | Fixed ✓ | 100 | 0 | Row-count gap is pre-existing |
@@ -382,7 +382,7 @@ Both functions now follow the same logic:
 | Q72 | PASS | OK (0 rows) | Fixed ✓ | 100 | 0 | Had 2 errors (operator +, ambiguous d_week_seq); both fixed |
 | Q77 | PASS | OK (39 rows) | Fixed ✓ | 0 | 39 | Row-count difference needs investigation |
 | Q87 | PASS | OK (47218 rows) | Fixed ✓ | 44 | 47218 | Row-count difference is likely pre-existing (EXCEPT semantics) |
-| Q90 | PASS | ERROR (div/0) | Known issue | 1 | N/A | Data loading: pmc=0 in goopg but pmc>0 in PG |
+| Q90 | PASS | ERROR (div/0) | Deferred | 1 | N/A | Pre-existing data issue: integer comparison mismatch for some TPC-DS tables; pmc queries return 0 due to broken join |
 
 **E2E verification** requires starting a goopg server with TPC-DS data and
 running all 9 queries via `scripts/tpcds-run.sh`.  This is deferred until the

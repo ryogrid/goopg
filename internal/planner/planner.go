@@ -2064,6 +2064,22 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			}
 			jn.LeftKey = lk
 			jn.RightKey = rk
+			// M0097-0058: skip hash-join for subquery-derived sides.
+			// When a FROM-clause subquery (containing INTERSECT,
+			// EXCEPT, or other non-scan children) is on either side
+			// of a join, the column indices stored in the join-key
+			// ColumnRefs refer to the global FROM-clause schema
+			// rather than the subquery's own output.  Converting
+			// such a join to a hash join places a projection on
+			// the build side that references the wrong columns,
+			// causing an index-out-of-bounds panic at execution
+			// time (e.g. TPC-DS Q8: INTERSECT in a FROM subquery
+			// joined with three base tables).
+			if containsSetOp(jn.Left) || containsSetOp(jn.Right) {
+				// Keep the join as nested-loop; the planner
+				// will re-evaluate at plan-finalisation time
+				// when bindings are rebuilt.
+			} else {
 			switch jn.Type {
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
@@ -2090,6 +2106,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 				}
 			}
 		}
+		} // close else from allLeavesAreTableScans guard
 		leftNode = jn
 		leftCtx = mergedCtx
 	}
@@ -2370,6 +2387,39 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
+// containsSetOp reports whether the plan subtree rooted at n contains
+// a SetOp or RecursiveUnion node.  Hash-join conversion must be skipped
+// when a join side contains a set operation because the column indices
+// in join-key ColumnRefs were resolved against the global FROM-clause
+// schema and do not match the SetOp's narrow output schema.
+func containsSetOp(n Node) bool {
+	if _, ok := n.(*SetOp); ok {
+		return true
+	}
+	if _, ok := n.(*RecursiveUnion); ok {
+		return true
+	}
+	if j, ok := n.(*Join); ok {
+		return containsSetOp(j.Left) || containsSetOp(j.Right)
+	}
+	if f, ok := n.(*Filter); ok {
+		return containsSetOp(f.Child)
+	}
+	if p, ok := n.(*Project); ok {
+		return containsSetOp(p.Child)
+	}
+	if s, ok := n.(*Sort); ok {
+		return containsSetOp(s.Child)
+	}
+	if a, ok := n.(*Aggregate); ok {
+		return containsSetOp(a.Child)
+	}
+	if l, ok := n.(*Limit); ok {
+		return containsSetOp(l.Child)
+	}
+	return false
+}
+
 
 // collectInheritanceDescendants performs a breadth-first traversal of the
 // inheritance tree rooted at parentOID and returns all descendants in BFS
