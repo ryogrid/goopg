@@ -7,7 +7,7 @@
 | branch | `tpcds-fix2` (round 1 landed on `tpcds-error-fix`) |
 | parent report | `analysis/tpcds-sf1-goopg-20260726.md` |
 | parent design | `docs/design/tpcds-section4.2-fixes/README.md` |
-| chapters | [01](01-expression-walker-unification.md) · [02](02-mhj-filter-coordinate-spaces.md) · [03](03-posmap-node-coverage.md) · [04](04-in-list-cross-kind-equality.md) · [05](05-timeout-mechanisms.md) |
+| chapters | single-file bundle; split only if a section outgrows this document |
 
 ---
 
@@ -18,22 +18,34 @@ PostgreSQL 18.3's **91**. This document establishes the root cause of every
 remaining goopg-only failure and designs the fix for each.
 
 The headline finding is that **three of the four correctness classes are the same
-defect class**: goopg's planner contains eleven independent hand-written expression
-walkers, each a partial copy of the others, and each silently passing through the
-`Expr` node kinds it does not enumerate. Silence is the problem — a walker that
-skips `IsNullExpr` does not fail, it just leaves a stale `ColumnRef.Index` behind,
-and the query returns the wrong answer. `internal/planner/plan.go` declares **32**
-concrete `Expr` types; the worst walker handles 11.
+defect class**: goopg's planner contains **fourteen** independent hand-written
+expression walkers, each a partial copy of the others, and each silently passing
+through the `Expr` node kinds it does not enumerate. Silence is the problem — a
+walker that skips `IsNullExpr` does not fail, it just leaves a stale
+`ColumnRef.Index` behind, and the query returns the wrong answer.
+`internal/planner/plan.go` declares **32** concrete `Expr` types; the walker
+responsible for the known wrong answers enumerates 11, and the worst pair
+enumerates **4**.
 
 The second finding is independent and equally sharp: `MultiHashJoin.Tables` is
 sorted by **table OID**, but the conjuncts in `MultiHashJoin.Filters` still carry
 **FROM-clause-cumulative** column indices. One pass consumes the latter as if they
-were the former. On TPC-H the two orders coincide often enough that the bug never
-surfaced; on TPC-DS they routinely disagree and a `date_dim` predicate is evaluated
-against `store`.
+were the former, and a `date_dim` predicate ends up evaluated against `store`.
+Worse, once that pass has pushed a conjunct into a table's `Filter`, the later
+remap never revisits it — `applyJoinTreePosMap`'s `*MultiHashJoin` arm remaps
+`n.Filters` and then **returns without recursing into `n.Tables[i]`**
+(`internal/planner/bushy.go:2461-2474`). The corruption is therefore permanent.
 
 Neither bug is a missing feature. Both are silent wrong answers in code that has
 been shipping.
+
+**Coverage, stated plainly.** This document establishes a verified root cause and a
+landing fix for **6** of the 24 in-scope queries (Q8, Q47, Q50, Q72, Q76, Q83). Q39
+and Q49 get a measurement plan, not a fix, because neither has a confirmed
+mechanism yet. The 16 timeouts get one hypothesised primary mechanism (§7.1) whose
+fix ships **behind a flag that defaults off**, so nothing in that class changes
+until a later, separately-measured commit flips it. §9 states which phase does
+what.
 
 ---
 
@@ -145,7 +157,7 @@ that carry child expressions and are **not** enumerated are:
 (`MultiAssignSubqRow` itself holds a `Plan Node`, not an `Expr`, so it is an
 opaque-scope **leaf** for traversal purposes, not a container.)
 
-plus three skipped child slots inside kinds that *are* enumerated: `InExpr.List`,
+plus four skipped child slots inside kinds that *are* enumerated: `InExpr.List`,
 `InExpr.Args`, `ExistsExpr.Args` and `SubqueryExpr.Args` (the last three are
 PARAM_EXEC-style argument expressions evaluated against the **current outer row**,
 so a stale index there is a second, latent wrong-answer source).
@@ -178,16 +190,18 @@ arm exists; the `IsNullExpr` inside `CaseWhen.When` does not.
 
 ### §2.4 The full walker inventory
 
-The same defect class is present in eleven walkers. `walkColumnRefs`
-(`pushdown.go:350`), `remapColumnRefsToSchema` (`planner.go:11321`) and
-`shiftColumnRefsBy` (`planner.go:11538`) are the most complete at 13 kinds each;
-every other walker is a stale partial copy.
+The same defect class is present across **fourteen** walkers. The three most
+complete are `walkColumnRefs` (`pushdown.go:350`, 14 arms covering 17 types — it
+handles `CastExpr`/`IsNull`/`IsBool`/`IsDistinctFrom`/`Collate`/`RowExpr` and is
+missing only `ArraySubqueryExpr`), `remapColumnRefsToSchema` (`planner.go:11321`,
+13 arms) and `shiftColumnRefsBy` (`planner.go:11538`, 13 arms). The eleven below
+are stale partial copies of those.
 
 | walker | file:line | missing container kinds | live consequence |
 |---|---|---|---|
 | `remapByPosMap` | `bushy.go:2154` | IsNull, IsBool, IsDistinctFrom, Collate, Row; `InExpr.List`; `.Args` on In/Exists/Subquery | **wrong answers — Q76, Q72** |
 | `visitColumnRefsByName` | `bushy.go:1653` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row, `InExpr.List` | `extraInScans` (`bushy.go:1625`) returns a vacuous `true` for an `IS NULL`-only conjunct, capturing out-of-subset conjuncts into `mh.Filters` |
-| `visitColumnRefsForTable` | `bushy.go:415` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row, ArraySubquery | `tableForCol` (`bushy.go:391`) mis-partitions; becomes a wrong-answer bug the moment §6.1's gate opens |
+| `visitColumnRefsForTable` | `bushy.go:415` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row, ArraySubquery | `tableForCol` (`bushy.go:391`) mis-partitions; becomes a wrong-answer bug the moment §7.3's `shouldAttachBeforeMHJ` gate opens |
 | `visitColumnRefs` | `bushy.go:2838` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row | `reresolveExprByName` / `reresolveJoinByName` silently skip re-resolution |
 | `conjunctIsLocalEligible` | `local_filters.go:89` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row, ArraySubquery, MultiAssignSubq* | a `SubqueryExpr` hidden under a `CastExpr` is invisible → conjunct wrongly declared leaf-local |
 | `localizeExprToLeaf` | `local_filters.go:268` | Cast, IsNull, IsBool, IsDistinctFrom, Collate, Row | indices not rebased → leaf `Filter` reads the wrong column |
@@ -223,10 +237,37 @@ with three thin drivers on top — `walkExprRefs` (read-only),
 `rewriteExprRefsInPlace` (mutate), `cloneExprRefs` (structural copy) — and every
 walker in §2.4 reimplemented as one driver call plus a per-kind callback.
 
-`kindOpaqueScope` is the load-bearing part of the design. Each existing walker
-encodes "do not cross into a subplan" by simply not listing those cases, which is
-indistinguishable from "the author forgot". Naming the category once removes the
-ambiguity permanently.
+**Correction from review — one classification is not enough.** The four walkers
+that touch subquery-bearing kinds do four *different* things, and collapsing them
+into a single `kindOpaqueScope` would silently change behaviour:
+
+| walker | behaviour on `SubqueryExpr` / `ExistsExpr` |
+|---|---|
+| `walkColumnRefs` (`pushdown.go:357`) | fires the `onOuter` **callback** — a signal the caller acts on |
+| `conjunctIsLocalEligible` (`local_filters.go:97`) | sets `eligible = false` — a **veto** |
+| `visitColumnRefsForTable` (`bushy.go:422`) | matches and does nothing — **silent ignore** |
+| `remapByPosMap` (`bushy.go:2193-2211`) | **descends** into `x.Plan` via `remapOuterRefsInSubplan`, translating `OuterColumnRef.Index` |
+
+So the driver takes a **per-caller scope policy** (`skip` / `signal` / `veto` /
+`descend`), and `exprChildSlots` only reports *that a node opens an inner scope*.
+`remapByPosMap` is in fact the opposite of opaque — crossing the boundary is its
+job.
+
+Two typing constraints the signature must respect:
+
+- `MultiAssignSubqElem.Row` is declared `*MultiAssignSubqRow`, not `Expr`, so
+  `&x.Row` is a `**MultiAssignSubqRow` and cannot be returned as a `*Expr`. It
+  needs its own arm.
+- The inner-scope children (`InExpr.Plan`, `ExistsExpr.Plan`, `SubqueryExpr.Plan`,
+  `MultiAssignSubqRow.Plan`) are `Node`, not `Expr`, so a scope-opening node
+  reports **zero** `Expr` child slots. The classification, not `len(kids)`, is what
+  distinguishes it from a true leaf.
+
+A third hazard the driver must preserve: `remapByPosMap` deliberately **clones** on
+rewrite (`cl := *x; cl.Index = newIdx`, `bushy.go:2160-2165`) while
+`remapOuterRefsInSubplan` **mutates in place** (`x.Index = posMap(x.Index)`,
+`bushy.go:2240`). A generic in-place driver that flattens that asymmetry will
+double-remap any shared or twice-visited subplan.
 
 The durable artefact is not the helper but the exhaustiveness gate,
 `internal/planner/exprwalk_exhaustive_test.go`: parse `plan.go` with `go/ast`,
@@ -319,11 +360,37 @@ remapping that would reconcile the two happens **later**, in `internal/planner/p
 ```
 1003  node = rewriteMultiWayChain(node, cat)                       // OID-sorts mh.Tables
 1012  node = rewriteScanInputsWithSingleTablePredicates(node, cat) // → pushSingleSourceFiltersIntoMHJTables
-1024  remapWithBindings(node, ctx.bindings)                        // ← reconciliation, too late
+1027  remapWithBindings(node, ctx.bindings)                        // ← reconciliation, too late
 ```
 
-The comment at `bushy.go:1791` ("Build output schema from all tables (now in FROM
+The comment at `bushy.go:1792` ("Build output schema from all tables (now in FROM
 order)") is stale — the sort key immediately above it is `oid`, not FROM position.
+
+**How a single-table predicate reaches `mh.Filters` at all** (the precondition the
+first draft of this document left unstated). `pushOneConjunct`
+(`internal/planner/pushdown.go:203`) pushes a conjunct onto a `Join` only when
+`classifyConjunctSide` returns `sideMixed`, i.e. the conjunct appears to span both
+sides. A genuinely single-table predicate reaches that verdict only by **width
+misclassification**: its FROM-order indices straddle the join's `leftWidth`
+boundary even though every reference belongs to one relation. The name-based guard
+`allColumnRefNamesInScope` (`pushdown.go:187`) then passes, because the referenced
+relation *is* somewhere in that join's subtree. The conjunct is ANDed onto the
+join, `collectMultiHashTables` captures it as an "extra", and it lands in
+`mh.Filters`.
+
+That is why TPC-H is not visibly broken today: its predicates mostly do not
+straddle, so they stay in the outer `Filter` and are absorbed later by the
+**name-based** `absorbConjunctsIntoSubtree` (`mhj_input_rewrite.go:134`), which is
+coordinate-space independent. It is luck of index ranges, not a structural
+guarantee.
+
+**Why the corruption is permanent.** `applyJoinTreePosMap`'s `*MultiHashJoin` arm
+(`bushy.go:2461-2474`) remaps `n.Filters` — its own comment says those refs "are in
+pre-rewrite (global FROM-order) coords; remap them to MHJ-output coords here" — and
+then `return`s **without recursing into `n.Tables[i]`**. A conjunct already pushed
+into a table's `Filter` at `planner.go:1012` is therefore never revisited by the
+`:1027` remap. This also means §2's `remapByPosMap` fix does nothing for Q47/Q50,
+which is why §9 orders them as separate phases.
 
 ### §3.3 Arithmetic confirmation
 
@@ -351,17 +418,32 @@ they are coordinate-space independent and unaffected. Only
 
 ### §3.4 Design
 
-Keep the existing offset range test and add a second, independent attribution by
-**column name** against each `mh.Tables[i].Output()`. Push only when both agree on
-the same `i` and the name resolution is unambiguous; otherwise leave the conjunct
-in `mh.Filters`, where `remapWithBindings` handles it correctly. Derive the
-localized index from the name lookup, not from `-offsets[idx]`.
+There is only one coordinate space that is correct here, and the pipeline already
+produces it — just too late. **Move `pushSingleSourceFiltersIntoMHJTables` to run
+after `remapWithBindings`** (`planner.go:1027`) instead of inside
+`rewriteScanInputsWithSingleTablePredicates` (`:1012`). After the remap,
+`mh.Filters` is in MHJ-output coordinates, which is exactly the space
+`offsets[]` is computed in, so index attribution becomes correct by construction
+rather than correct by luck.
 
-This is deliberately conservative. Where the two attributions agree — all of
-TPC-H, because there FROM order and creation order essentially coincide — the
-emitted plan is bit-identical, so there is **no TPC-H performance risk by
-construction**. Where they disagree — TPC-DS — the conjunct simply evaluates one
-level higher than it might have.
+`rewriteMHJInputsWithSingleTablePredicates` (the SeqScan→IndexScan promotion) stays
+where it is: it resolves by column **name**, is already coordinate-space
+independent, and moving it would change the scan identities `buildBindingsPosMap`
+keys on.
+
+Defence in depth, in the same commit: before pushing, cross-check the index
+attribution against a **name** attribution over `mh.Tables[i].Output()`, and
+decline the push when they disagree or when the name is ambiguous (a self-join such
+as `date_dim d1, d2, d3` gives every column two or three candidate tables). A
+declined conjunct simply stays in `mh.Filters` and evaluates one level higher —
+slower, never wrong.
+
+**Risk assessment, corrected from review.** An earlier draft claimed this was
+"bit-identical on TPC-H by construction" because FROM order and creation order
+coincide there. That is false: of the eight join-heavy TPC-H queries, **seven**
+have a FROM order that differs from OID order (only Q3 coincides). TPC-H is
+protected by the straddling precondition above, not by order agreement, so this
+change must be gated on a full TPC-H run like any other planner change.
 
 **Atomicity requirement.** `shiftColumnRefs` (`mhj_input_rewrite.go:667`) and
 `cloneExprForShift` (`:719`) currently enumerate the *same* four node kinds. They
@@ -374,7 +456,7 @@ moves.
 ### §3.5 Deferred: the root fix
 
 The structural fix is to run `rewriteScanInputsWithSingleTablePredicates` **after**
-`remapWithBindings` (`planner.go:1012` vs `:1024`), so there is only ever one
+`remapWithBindings` (`planner.go:1012` vs `:1027`), so there is only ever one
 coordinate space in play. That reorder also moves `IndexScan` promotion after the
 remap, which changes the scan identities `buildBindingsPosMap` keys on. It needs
 its own design doc and its own benchmark round; it is **not** attempted here.
@@ -429,7 +511,7 @@ Two independent gaps:
    is not covered by the parallel-worker `recover` in
    `internal/executor/parallel_runtime.go:141`, which converts a worker panic into
    an `XX000` `ExecError`. The panic instead reaches
-   `internal/server/server.go:780`, which logs `backend goroutine panic` and then
+   `internal/server/server.go:782`, which logs `backend goroutine panic` and then
    **closes the socket** — no `ErrorResponse`, no `ReadyForQuery`.
 
 PostgreSQL's contract is that an ERROR kills the statement, not the backend
@@ -440,17 +522,37 @@ PostgreSQL's contract is that an ERROR kills the statement, not the backend
 
 **Coverage.** Restructure `collect` into two explicit sets plus a loud default:
 
-- *descend* (node schema is the concatenation of its children):
-  `Join, NestedLoopIndexJoin, Filter, Sort, Aggregate, Distinct, DistinctOn,
-  Limit, LockRows, Gather, GatherMerge, Memoize, WindowAgg`
+- *descend* (node schema is exactly the concatenation of its children):
+  `Join, NestedLoopIndexJoin, Filter, Sort, Distinct, DistinctOn, Limit, LockRows,
+  Memoize`
 - *opaque leaf* (`off += len(n.Output())`, do not descend):
   `Project, Values, CTEScan, MaterializedCTEScan, SetOp, RecursiveUnion,
-  WorkTableScan, ProjectSet, OrdinalityWrap, RowsFrom, IndexOnlyScan`, the SRF group
+  WorkTableScan, ProjectSet, OrdinalityWrap, RowsFrom, IndexOnlyScan, WindowAgg`,
+  the SRF group
 - `default:` → **return nil**, declining the whole remap.
 
+Two placements corrected from review:
+
+- **`WindowAgg` is an opaque leaf, not a descend node.** It *appends* window-function
+  columns to its child's output, so descending into it would leave every scan to
+  its right short by the number of window columns — the identical defect `SetOp`
+  has today.
+- **`Aggregate` is deliberately absent from both sets**, so it now hits the
+  `default:` decline. Its output is `GroupExprs ++ Aggs`, not its child's
+  concatenation; the current code descends into it and is only accidentally correct
+  because `collect` is always entered at the plan root or at `aggNode.Child`, never
+  at an `Aggregate` sitting as a join input. Declining makes that assumption
+  explicit instead of load-bearing-but-unwritten.
+
+`Gather`/`GatherMerge` cannot appear here at all — `MaybeAddGather` runs at
+`internal/server/dispatch.go:1201`, after the planner returns.
+
 Declining is the safe direction: an unremapped tree is only wrong when a reorder
-actually happened, whereas a mis-advanced offset is wrong unconditionally. This
-converts every future unhandled node from "wrong answer or panic" into "no remap".
+actually happened, whereas a mis-advanced offset is wrong unconditionally. **All
+three call sites already nil-check the returned posMap** — `remapWithBindings`
+(`bushy.go:2019-2022`), `remapTopProjection` (`:2062-2065`) and
+`remapAggExprsWithBindings` (`:2115-2118`) — so declining is safe without any
+call-site change.
 
 **Diagnostic.** Behind `GOOPG_POSMAP_ASSERT=1`, compare the accumulated offset
 against `len(node.Output())` after `collect` and log on mismatch. Not a hard gate —
@@ -526,6 +628,28 @@ Two consequent divergences from PG, both recorded in the deferral ledger:
 
 ---
 
+## §5a Q49 (30 vs 34 rows) — no confirmed mechanism
+
+Q49 is three `UNION ALL` branches (web / catalog / store), each ranking a derived
+ratio and filtering `return_rank <= 10 or currency_rank <= 10`. goopg returns
+exactly **30** where PG returns 34 — suspiciously exactly 3 × 10.
+
+**Ruled out by probe:** `rank()` peer-tie handling. `rank`, `dense_rank` and
+`row_number` over a tied ORDER BY are byte-identical to PG (`1,1,3,3,3,6` on both),
+so the `<= 10` filter is not silently degrading to `row_number` semantics.
+
+**Remaining candidates**, to be bisected after phase 1.2 and 2.1 land:
+
+1. the `decimal(15,4)` division producing `return_ratio` / `currency_ratio` — a
+   precision difference reorders ties and changes which rows sit at rank 10;
+2. the mixed `store_sales sts LEFT OUTER JOIN store_returns sr … , date_dim` shape,
+   which is exactly the outer-join-plus-comma-join form §2.3 flags as unverified
+   for Q72.
+
+No fix is designed here. This is an honest open item, not a deferral.
+
+---
+
 ## §6 RC-4 — Q39 "connection lost"
 
 No `backend goroutine panic` line exists for Q39 in either server log, so this is
@@ -560,7 +684,7 @@ requiring its own design doc, and is deferred until measured.
 ## §7 The timeout class
 
 `EXPLAIN` cost and width are hardcoded literals in goopg
-(`internal/executor/operators_explain.go:378`, `:849`), so costing cannot be
+(`internal/executor/operators_explain.go:378`, `:925`), so costing cannot be
 diagnosed from a plan. The three signals that are real are plan **shape**,
 `EXPLAIN ANALYZE` **actual** rows, and the per-SubPlan
 `Calls/Rebuilds/Rescans/CacheHits/CacheMisses` counters emitted by
@@ -581,7 +705,7 @@ cat.SetTableStats(tbl, stats)
 - `tableRows` (`cardinality.go:89`) returns 0 → `EstimateRows` is 0 for every scan
   → the MHJ probe-side choice is arbitrary (§6);
 - the bushy DP's seed falls back to `rowCounts[i] = 1` for every relation
-  (`bushy.go:679`) → join order is effectively unordered;
+  (`bushy.go:675`) → join order is effectively unordered;
 - `estimateBaseRelInfo.baseRows` is 0 → filtered cardinalities are meaningless;
 - `pg_class.reltuples` renders 0.
 
@@ -600,8 +724,8 @@ cardinality context rather than inventing a new one.
 This is the route `.ralph/deferral_ledger.md` row `pq-P10` already recommends
 (option (b)): it needs no new persistence and "also revives `EstimateRows`
 generally after a restart, which is the wider win". Option (a) — persisting
-`reltuples`/`relpages` — has a known unreproduced round-trip failure and stays
-deferred.
+`reltuples`/`relpages` — stays deferred: per `pq-P10`, one analyze-plus-restart
+round-trips but a second does not, and the cause is not yet established.
 
 **Risk.** This is the highest-regression-risk change in the document. Direct
 precedent: `analysis/tpch-evolution-round4-parallel-query-20260722.md` records that
@@ -614,18 +738,24 @@ only in a separate commit carrying its own `analysis/` report.
 ### §7.2 Secondary mechanism — the bushy DP declines outright
 
 `tryBushyDP` bails when `len(tables) > 12` (`bushy.go:93`) or when **any** FROM
-leaf is not a `SeqScan`/`IndexScan`/`MultiHashJoin` (`bushy.go:104-113`) — i.e.
+leaf is not a `SeqScan`/`IndexScan`/`MultiHashJoin` (`bushy.go:110-117`) — i.e.
 any CTE or derived table. Q64 has roughly 20 FROM items, so it receives no join
 ordering at all and falls back to SQL-text order.
 
 **In scope:** add a greedy fallback for `n > 12` — repeatedly join the cheapest
 connected pair using the existing `estimateJoinCost` (`bushy.go:1197`) — rather
 than declining. Gated behind the same flag as §7.1, since it is meaningless
-without real cardinalities. No TPC-H query exceeds 12 FROM items, so TPC-H is
+without real cardinalities. No TPC-H query exceeds 8 FROM items, so TPC-H is
 unaffected by construction.
 
+**This alone does not fix Q64** (corrected from review). `query64.sql` opens with
+`with cs_ui as (…)` and its 18-item FROM references that CTE, so `tryBushyDP`
+declines at **both** gates — `len(tables) > 12` *and* the non-scan-leaf check. With
+only the first gate lifted, Q64 declines exactly as before. Q64 needs the deferred
+second gate too, and is therefore **not** claimed as fixed by this phase.
+
 **Deferred:** admitting derived-table/CTE leaves requires `buildBindingsPosMap` to
-key those leaves, which is the exact hazard documented at `bushy.go:99-107` as
+key those leaves, which is the exact hazard documented at `bushy.go:101-109` as
 having previously caused an index-out-of-bounds panic. Not attempted here.
 
 ### §7.3 Mechanisms deferred, with reasons
@@ -652,7 +782,7 @@ Every result must be labelled with one of three states:
 | state | how to reach it | what the planner sees |
 |---|---|---|
 | **S-cold** | restart via `scripts/csq-bench-server.sh`, no ANALYZE this session | `Stats.RowCount = 0`; column stats load from `pg_statistic`; `EstimateRows` = 0 everywhere; DP seed `rowCounts[i] = 1`; MHJ probe = first DFS scan. **This is what the 2026-07-26 benchmark measured.** |
-| **S-warm** | S-cold, then `ANALYZE` every table, then issue each query for the first time | `RowCount` and column stats both correct. A restart returns you to S-cold; a reused connection may be served a pre-ANALYZE cached plan |
+| **S-warm** | S-cold, then `ANALYZE` every table, then issue each query for the **first** time | `RowCount` and column stats both correct. See the caveat below — S-warm is only reachable for a query that has not been planned yet in this server process |
 | **S-fallback** | S-cold + `GOOPG_RELSIZE_FALLBACK=1` (§7.1) | `RowCount` derived from live block count — the state §7.1 is designed to make equal to S-warm |
 
 Per-query procedure:
@@ -679,7 +809,16 @@ Per-query procedure:
    solo run with RSS monitoring and a cgroup `memory.events` `oom_kill` check.
    "Connection lost with no `backend goroutine panic` in the log" means SIGKILL,
    not a Go panic — the two need completely different fixes.
-6. **TPC-H regression protocol**, mandatory for §2.6, §3.4 and all of §7: a full
+6. **S-warm is single-shot per server process.** `planCache.Invalidate()` fires
+   only on a `*planner.DDL` node (`dispatch.go:2975`, `dispatch_extended.go:363`),
+   and ANALYZE plans to a `*Utility` node (`planner.go:212-218`), so ANALYZE never
+   flushes the cache — and there is no flush command. A query planned before the
+   ANALYZE keeps its S-cold plan for the life of the process, while a restart
+   returns the whole server to S-cold. So the {S-cold, S-warm} × {before, after}
+   matrix in step 2 must be run as: restart → measure S-cold → ANALYZE → measure
+   S-warm **on queries not yet issued in that process**. Issue each query exactly
+   once per process, or the state label is a lie.
+7. **TPC-H regression protocol**, mandatory for §2.6, §3.4 and all of §7: a full
    TPC-H power run from a fresh capped server, in both flag states, with a
    per-query table written to `analysis/`. `scripts/tpch-spotcheck.sh` (Q12/Q13
    row counts) is a **correctness** gate and will not catch a 128× Q22 regression.
@@ -695,13 +834,13 @@ Per-query procedure:
 | 1.1 | `internal/planner/exprwalk.go` + exhaustiveness test (§2.5) | nothing yet — dead code | none |
 | 1.2 | convert `remapByPosMap` (§2.2) | **Q76, Q72** | highest TPC-H exposure in the correctness set |
 | 1.3 | `buildBindingsPosMap` coverage + decline-on-unknown (§4.4) | **Q8** | plan-gate + TPC-H |
-| 2.1 | `pushSingleSourceFiltersIntoMHJTables` dual attribution, with `shiftColumnRefs`/`cloneExprForShift` in the same commit (§3.4) | **Q50, Q47** | none on TPC-H by construction |
-| 2.2 | convert the remaining walkers, one per commit (§2.4) | latent | plan-gate + TPC-H each |
-| 3 | `compareEq` cross-kind delegation (§5.3) | **Q83** | low |
-| 4 | measure Q39 (§6); measure Q49 and Q35 | Q39, Q49 | none |
-| 5 | harness fixes (§1.3) | report fidelity | none |
-| 6.1 | `tableRows` block-count fallback behind `GOOPG_RELSIZE_FALLBACK` (§7.1) | the timeout class | highest overall; flag-gated |
-| 6.2 | greedy join-order fallback for `n > 12` (§7.2) | Q64 | flag-gated |
+| 2.1 | move `pushSingleSourceFiltersIntoMHJTables` after `remapWithBindings`, plus the name cross-check, plus `shiftColumnRefs`/`cloneExprForShift` generalised in the same commit (§3.4) | **Q50, Q47** | real TPC-H risk — 7 of 8 join-heavy TPC-H queries have FROM order ≠ OID order; full TPC-H run required |
+| 2.2 | convert the remaining walkers, one per commit (§2.4) | latent | **plan-shape change, not just index arithmetic** — `visitColumnRefsByName` feeds `extraInScans` (`bushy.go:1625-1649`), whose vacuous `true` for a ref-less conjunct decides *which conjuncts enter `mh.Filters` at all*. Full TPC-H per commit |
+| 3 | `compareEq` cross-kind delegation (§5.3) — **LANDED** `b3493a6e` | **Q83** (0 → 22 rows, exact match) | low |
+| 4 | measure Q39 (§6); measure Q49 and Q35 | diagnosis only, no fix designed yet | none |
+| 5 | harness fixes (§1.3) — **LANDED** `b3493a6e` | report fidelity; Q45/Q46 confirmed correct | none |
+| 6.1 | `tableRows` block-count fallback behind `GOOPG_RELSIZE_FALLBACK` (§7.1) | nothing until the default is flipped in a later commit | highest overall; flag-gated |
+| 6.2 | greedy join-order fallback for `n > 12` (§7.2) | **not Q64** — Q64 also needs the deferred non-scan-leaf gate | flag-gated |
 
 Every phase runs `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
 before commit; the pre-commit hook adds the pgbench smoke. Planner and executor
@@ -728,6 +867,48 @@ phases additionally run `scripts/tpch-spotcheck.sh` and `make plan-gate`.
 - goopg HEAD at analysis time: `ee86594e`, branch `tpcds-fix2`
 - benchmark data: `/tmp/tpcds-bench-v4.txt` (2026-07-26), curated in
   `analysis/tpcds-sf1-goopg-20260726.md`
-- crash evidence: `bench/tpch/runtime_goopg/goopg.tpcds.log:3076`
-- all SQL reproductions in §2, §3 and §5 were executed against the live servers
-  described in §1.4 on 2026-07-27
+- crash evidence: `bench/tpch/runtime_goopg/goopg.tpcds.log:3076`, timestamped
+  **2026-07-24T17:18:18** — it predates the 2026-07-26 sweep. The stack matches
+  §4.1 line for line and Q8 still errors at 2 s in the 07-26 run, so the diagnosis
+  stands, but this is not a 07-26 artefact.
+- the SQL reproductions in §2.1, §3.1, §5.1 and §5a were executed against the live
+  servers described in §1.4 on 2026-07-27. **§2.3's Q72 attribution is inference,
+  not a reproduction** — Q72 reaches `promotion` through a `LEFT OUTER JOIN`
+  (`query72.sql:16`), and it is not established that an outer-joined leaf reaches
+  `rewriteMultiWayChain` at all. Q72 must be re-measured after phase 1.2 rather
+  than assumed fixed.
+
+---
+
+## §12 Review record (2026-07-27)
+
+This document was put through an adversarial verification pass that re-opened every
+cited file:line. Four blocking errors and a number of inaccuracies were found. They
+are corrected inline above and recorded here so the corrections are not silently
+absorbed.
+
+| id | finding | resolution |
+|---|---|---|
+| B1 | "FROM order and OID order coincide on TPC-H" is **false** — 7 of the 8 join-heavy TPC-H queries differ (only Q3 coincides). The "no TPC-H risk by construction" argument for the MHJ fix was therefore unsupported. | §3.4 rewritten. The real protection is the straddling precondition, and a full TPC-H run is now mandatory for that phase. |
+| B2 | The stated causal model predicted TPC-H Q10 would be silently wrong today, which it is not — so the model of *when the pass fires* was incomplete. | §3.2 now states the precondition: a single-table conjunct reaches `mh.Filters` only via a `sideMixed` **width misclassification** in `pushOneConjunct` that then passes the name guard. Ordinary single-table filters go to the name-based `absorbConjunctsIntoSubtree` instead. Verified against `pushdown.go:203-232` and `mhj_input_rewrite.go:134`. |
+| B3 | Lifting only the `n > 12` DP gate cannot fix Q64 — `query64.sql`'s FROM references the `cs_ui` CTE, so the non-scan-leaf gate declines too. | §7.2 and the §9 table now state Q64 is **not** fixed by that phase. |
+| B4 | §0 claimed a root cause "for every remaining failure"; in fact 6 of the 24 in-scope queries get a designed landing fix. | §0 now states coverage plainly. |
+| D1 | `kindOpaqueScope` collapses four distinct existing behaviours (signal / veto / ignore / descend), and two proposed child slots are not `Expr`-typed. | §2.5 replaced with a per-caller scope **policy**, plus the `MultiAssignSubqElem.Row` and `Plan Node` typing constraints and the clone-vs-mutate asymmetry hazard. |
+| D2 | `WindowAgg` was wrongly placed in the descend set; `Aggregate` is only accidentally correct there. `return nil` confirmed safe — all three call sites already nil-check. | §4.4 corrected. |
+| D3 | The permanence mechanism was missing: `applyJoinTreePosMap`'s MHJ arm remaps `Filters` and returns without recursing into `Tables[i]`. | Added to §0 and §3.2. It is why phase 1.2 cannot fix Q47/Q50 and the phases must stay separate. |
+| D4 | Phase 2.2's risk was labelled "latent"; converting `visitColumnRefsByName` actually changes MHJ *composition* through `extraInScans`. | §9 risk column corrected. |
+| G3 | Q49 had no root cause and no hypothesis at all. | New §5a: `rank()` ties ruled out by probe; two remaining candidates named; stated as an open item rather than a deferral. |
+| — | Six stale line numbers (`operators_explain.go:849`→`:925`, `planner.go:1024`→`:1027`, `bushy.go:679`→`:675`, `bushy.go:1791`→`:1792`, `bushy.go:104-113`→`:110-117`, `server.go:780`→`:782`); miscounts ("three skipped slots"→four, "eleven walkers"→fourteen, "the worst handles 11"→4); and the `pq-P10` characterisation ("unreproduced"→reproduced but unexplained). | All corrected inline. |
+| — | §8 noted that ANALYZE never invalidates the plan cache but gave no way out. | New step 6: S-warm is single-shot per server process — issue each query exactly once per process or the state label is wrong. |
+
+Confirmed correct by the review and left unchanged: the `remapByPosMap` 11-kind
+inventory and absent `default:`; the count of 32 `Expr` types; every listed missing
+container's child slots; the OID sort in `rewriteMultiWayChain`; the §2.3 and §3.3
+offset arithmetic including the TPC-DS column counts (23/22/28/20) and the
+prediction of which Q50 conjuncts move and which straddles; the whole
+`buildBindingsPosMap` arm inventory and its absent `SetOp` arm; the §4.1 stack
+trace line for line; the unchecked `slot.go:79` and `opnode.go:99` gets;
+`prebuildSharedHashJoins` running outside the parallel-worker recover; every §5
+line cite and the `root-0019` runtime-coercion policy; `probeIdx` staying 0 under
+all-zero estimates; `loadStatisticsFromHeap` leaving `RowCount`/`Pages`/`AvgWidth`
+zero; and the existence and wording of ledger rows `pq-P6` and `pq-P10`.
