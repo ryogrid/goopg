@@ -7613,6 +7613,29 @@ func compareEq(a, b Datum) (Datum, error) {
 	case a.Kind == KindEnum && b.Kind == KindEnum:
 		return NewBoolDatum(a.Int == b.Int), nil
 	}
+	// Cross-kind fallback: exactly one side is an unknown-typed string
+	// literal. PostgreSQL resolves an IN list at parse time
+	// (parse_expr.c transformAExprIn → select_common_type →
+	// coerce_to_common_type), so `d_date IN ('2001-07-13')` compares
+	// date-to-date. goopg types a bare StringConst as `unknown` and
+	// resolves coercion at runtime instead (design doc
+	// root-0019-unknown-literal-coercion.md), so the coercion has to
+	// happen here. Without it `d_date IN ('2001-07-13')` fell through to
+	// the not-equal return below while the equivalent
+	// `d_date = '2001-07-13'` matched — the `=` path reaches
+	// compareDatum → promoteCrossKind → tryParseStringAs, which parses
+	// the literal, and compareEq bypassed all of it (TPC-DS Q83).
+	//
+	// Delegating to compareDatum reuses exactly that promotion. As in
+	// the NUMERIC arm above, an incompatible pair is not-equal rather
+	// than an error, which is what IN-list semantics want.
+	if aIsString != bIsString {
+		cmp, err := compareDatum(a, b, 0)
+		if err != nil {
+			return NewBoolDatum(false), nil
+		}
+		return NewBoolDatum(cmp == 0), nil
+	}
 	return NewBoolDatum(false), nil
 }
 
