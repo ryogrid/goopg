@@ -366,6 +366,30 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", cref.Name, cref.Index, vs.Width())}
 			}
 		}
+		// Catch-all bounds check. The two guards above cover only
+		// rowSlotView and *VirtualSlot; *MaterializedSlot (slot.go
+		// Get is a bare `s.row[col]`) and *Slot were unchecked, so a
+		// stale planner index panicked raw instead of raising an
+		// error. That panic surfaced during the hash-join build-side
+		// drain, which gatherOp.Open runs in the LEADER goroutine —
+		// outside ParallelGroup.Go's recover — so it escaped to
+		// serveConn, which logs and closes the socket. The client saw
+		// "connection lost" and the harness restarted the server
+		// (TPC-DS Q8: "index out of range [57] with length 1").
+		// PostgreSQL's contract is that an ERROR kills the statement,
+		// not the backend. SlotView itself carries only Get/IsNull, so
+		// the check is written per concrete type rather than widening
+		// the interface on this hot path.
+		if ms, ok := slot.(*MaterializedSlot); ok {
+			if w := ms.Width(); cref.Index < 0 || cref.Index >= w {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of MaterializedSlot range %d", cref.Name, cref.Index, w)}
+			}
+		}
+		if sl, ok := slot.(*Slot); ok {
+			if w := sl.Width(); cref.Index < 0 || cref.Index >= w {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of Slot range %d", cref.Name, cref.Index, w)}
+			}
+		}
 		return slot.Get(cref.Index), nil
 	}
 	switch x := e.(type) {
