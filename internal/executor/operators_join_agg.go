@@ -3161,8 +3161,14 @@ func drainRows(op Operator) ([]Row, error) {
 // copies the arena bytes into owned []byte. Without this, the build-
 // side hash tables would alias the source operator's per-page arena
 // pages — invalidated on the next arena.Reset() (typically per-page
-// in seqScan, per-Rescan in indexScan). The fast path
-// (rowHasArena=false) preserves the legacy O(width) struct copy.
+// in seqScan, per-Rescan in indexScan).
+//
+// Always copies the row slice and materializes arena-backed Datums before
+// appending.  Producers (SeqScan, CTEScan, etc.) may reuse the same slot
+// and row buffer across Next() calls, so the row slice must be independently
+// owned.  MaterializeArena detaches arena-backed Datums onto fresh Buf
+// allocations; the slice copy ensures non-arena Datums are safely owned too.
+// (M0097-0058 CTE-left cross join fix.)
 func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
 	n := 0
@@ -3184,6 +3190,9 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 		// materialize any arena-backed Datums so each entry stays
 		// valid regardless of the producer's slot reuse or arena
 		// reset.  (M0097-0058 CTE-left cross join fix.)
+		// Always make an independent copy: clone the slice AND materialize
+		// any arena-backed Datums so each entry stays valid regardless of
+		// the producer's slot reuse or arena reset.
 		dup := make(Row, len(row))
 		copy(dup, row)
 		if rowHasArena(row) {
@@ -3194,12 +3203,6 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	}
 }
 
-// drainRowsCtxCTID drains op like drainRowsCtx and additionally captures the
-// currentTID from scanLeaf (if non-nil) after each yielded slot, returning a
-// parallel ctid slice. Callers must call op.Open before this and must not call
-// op.Close after (the drain loop reaches EOF naturally). Used by eager NL join
-// to preserve left-side heap ctids through the drain so lockRowsOp can stamp
-// tuple locks after the scan has been closed (M0100-0010).
 func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([]Row, []joinRowCTID, error) {
 	rows := make([]Row, 0)
 	var ctids []joinRowCTID
@@ -3235,6 +3238,8 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 		n++
 	}
 }
+
+// drainRowsCtxCTID drains op like drainRowsCtx and additionally captures the
 
 func concatRows(a, b Row) Row {
 	out := make(Row, 0, len(a)+len(b))

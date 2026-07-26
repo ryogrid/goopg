@@ -50,14 +50,17 @@ for tsv in "${TPCDS_DATA_DIR}"/*.tsv; do
 
     # TRUNCATE if table has data, then COPY
     ${PG} -c "TRUNCATE ${table}" >/dev/null 2>&1 || true
-    if ${PG} -c "COPY ${table} FROM '${tsv}'" >/dev/null 2>&1; then
+    COPY_ERR=$(mktemp)
+    if ${PG} -c "COPY ${table} FROM '${tsv}'" 2>"${COPY_ERR}"; then
         COUNT=$(${PG} -t -c "SELECT count(*) FROM ${table}" 2>/dev/null | tr -d ' ')
         echo "OK (${COUNT} rows)"
         OK=$((OK + 1))
     else
-        echo "FAILED"
+        ERR_MSG=$(head -1 "${COPY_ERR}" | cut -c1-120)
+        echo "FAILED: ${ERR_MSG}"
         FAIL=$((FAIL + 1))
     fi
+    rm -f "${COPY_ERR}"
 done
 log "  Loaded: ${OK} tables, Failed: ${FAIL}"
 
@@ -65,7 +68,12 @@ log "  Loaded: ${OK} tables, Failed: ${FAIL}"
 log "Step 3/3: Running ANALYZE..."
 for tsv in "${TPCDS_DATA_DIR}"/*.tsv; do
     table=$(basename "$tsv" .tsv)
-    ${PG} -c "ANALYZE ${table}" >/dev/null 2>&1 || true
+    printf "  %-30s " "${table}..."
+    if ${PG} -c "ANALYZE ${table}" 2>&1 | tail -1; then
+        echo "  OK"
+    else
+        echo "  ANALYZE failed (non-fatal)"
+    fi
 done
 log "  ANALYZE complete"
 
