@@ -114,9 +114,14 @@ run_one() {
     local status rows err blocks
     if [[ $qex -eq 124 ]]; then
         status="TIMEOUT"; rows=0; blocks=""; err="timeout after ${TIMEOUT_SEC}s"
-    elif grep -qi "ERROR" <<<"$qout"; then
+    # Match psql's own error prefix, not a bare "error" anywhere in the
+    # output. The previous form (`grep -qi ERROR` over the whole result)
+    # turned any query returning a row whose text contains "error" into a
+    # false ERROR with rows=0 — and it ran BEFORE the row-count branch, so
+    # the misclassification was silent.
+    elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):' <<<"$qout"; then
         status="ERROR"; rows=0; blocks=""
-        err=$(grep -i "ERROR" <<<"$qout" | head -1 | tr -d '|' | cut -c1-200)
+        err=$(grep -E '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):' <<<"$qout" | head -1 | tr -d '|' | cut -c1-200)
     elif grep -qP '\(\d+ rows?\)' <<<"$qout"; then
         status="OK"; err=""
         # Fix (2): sum EVERY result block, not just the last one, so a

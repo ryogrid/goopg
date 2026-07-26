@@ -20,11 +20,18 @@ root-caused but deliberately held back behind an unrunnable regression gate.
 | outcome | queries |
 | --- | --- |
 | **Fixed, exact PG match** | Q76 (0 → 100), Q83 (0 → 22) |
-| **Confirmed already correct** — harness bug, not engine bug | Q45 (14), Q46 (100) |
+| **Confirmed already correct** — measurement artefacts, not engine bugs | Q45 (14), Q46 (100) |
 | **Contained** — server crash became a normal SQL error | Q8 |
 | **Root-caused, fix designed, deliberately deferred** | Q47, Q50, Q72 |
 | **Open, hypotheses narrowed** | Q39, Q49, Q35 |
 | **Not attempted this round** | the 16 timeouts |
+
+The first three rows list 27 queries against a 24-query scope: Q45, Q46 and Q35
+are measurement artefacts carried over from the previous report rather than
+members of the 2 + 6 + 16 decomposition. **Q34 is a fourth such carry-over and is
+not addressed here** — `/tmp/tpcds-bench-v4.txt` has a PG line (374 rows) but no
+goopg line at all, lost to the same mid-benchmark restart as Q46. It needs a
+measurement, not a fix.
 
 The headline finding is structural rather than per-query: **three of the four
 correctness classes are one defect class.** goopg's planner carries fourteen
@@ -34,6 +41,9 @@ each silently passing through the `Expr` node kinds it does not enumerate.
 caused the observed wrong answers enumerated 11, and the worst pair enumerates 4.
 Silence is the defect: a walker that skips `IsNullExpr` does not fail, it leaves a
 stale `ColumnRef.Index` behind and the query quietly returns the wrong rows.
+
+**One of those fourteen walkers was fixed.** The shared-traversal fix the design
+doc specifies for the other thirteen was not landed — see §2.2.
 
 ---
 
@@ -78,7 +88,7 @@ select count(*) from date_dim where d_date in (date '2001-07-13');  -- goopg 1  
 select count(*) from date_dim where d_date in ('2001-07-13');       -- goopg 0  ✗  PG 1
 ```
 
-`compareEq` (`internal/executor/expr.go:7568`), the equality oracle behind
+`compareEq` (`internal/executor/expr.go:7592`, pre-fix `:7568`), the equality oracle behind
 `evalInExpr` and `CASE`, had no `KindTime`↔`KindString` arm and fell through to an
 unconditional not-equal. The `=` form worked because `BinaryOp` routes through
 `compareDatum` → `promoteCrossKind` → `tryParseStringAs`, which parses the
@@ -137,22 +147,47 @@ concurrently under `&` … `wait`, contaminating both timings.
 All three are fixed; the script now also takes a query list/range and EXPLAINs
 each statement separately.
 
-**Consequence for the previous report:** the `?` row counts recorded for Q45 and
-Q46 were this bug. Re-measured, both engines agree exactly — Q45 **14**, Q46
-**100**. They were never engine defects and should be removed from the gap list.
+**Consequence for the previous report — corrected on review.** The two `?` row
+counts in `/tmp/tpcds-bench-v4.txt` were **Q35 and Q45**, not Q45 and Q46. Q46 had
+a different cause: the previous report states it "was interrupted by a
+mid-benchmark server restart" — i.e. the Q8/Q39 crash that §1.3 contains.
+
+Neither Q45 nor Q46 is a multi-statement template (one `;` each), so the `tail -1`
+defect cannot be their cause either; the PATH defect is the one that fits, and it
+is independently corroborated — 63 of the 64 `goopg_q{36..99}_explain.txt` files
+from the previous run are the `timeout: failed to run command 'psql'` stub.
+
+Re-measured, both engines agree exactly — Q45 **14**, Q46 **100** — so neither is
+an engine defect. But **Q35, the query the `?` actually hit, is still unmeasured**
+(§2.3). Fixing the harness did not close that one.
+
+Caveat: Q45 and Q46 were measured at 07:00–07:01, before the RC-1a binary was
+built at 07:18. They have not been re-confirmed against the walker change that §3
+itself names as the regression risk; the pending sweep will do that.
 
 ---
 
 ## §2 What was deliberately not landed, and why
 
-### §2.1 RC-1b — MHJ filter push-down uses two coordinate spaces → Q47, Q50, Q72
+### §2.1 RC-1b — MHJ filter push-down uses two coordinate spaces → Q47, Q50 (and probably Q72)
 
-Root cause is confirmed and the fix is designed, but it is **held back**.
+Root cause is confirmed **for Q47 and Q50** and the fix is designed, but it is
+**held back**.
+
+**Q72 is an attribution correction, and the hedge belongs in it.** Commit
+`9740fce9` predicted Q72 would be fixed by RC-1a, through
+`sum(case when p_promo_sk is null …)`. It was not — Q72 measured 0 rows again on
+the fixed binary. That establishes only the negative: RC-1a is not Q72's cause.
+It does **not** establish RC-1b as the cause, and no new positive evidence was
+gathered. Q72 also reaches `promotion` through a `LEFT OUTER JOIN`, and it has not
+been shown that an outer-joined leaf reaches `rewriteMultiWayChain` at all.
 
 `pushSingleSourceFiltersIntoMHJTables` (`internal/planner/mhj_input_rewrite.go:624`)
 computes per-table offsets from the **OID-sorted** `mh.Tables`, while the
 conjuncts in `mh.Filters` still carry **FROM-cumulative** indices. The
-reconciling remap runs later — `planner.go:1012` vs `:1027`.
+reconciling remap runs later — the push happens at `planner.go:1020`, inside
+`rewriteScanInputsWithSingleTablePredicates` (`:1012`), and `remapWithBindings`
+only at `:1024`.
 
 Observed directly:
 
@@ -169,7 +204,7 @@ scan. The arithmetic predicts exactly which conjuncts move and which straddles,
 and matches the emitted plan.
 
 The corruption is permanent: `applyJoinTreePosMap`'s `*MultiHashJoin` arm
-(`bushy.go:2461-2474`) remaps `n.Filters` and then **returns without recursing
+(`bushy.go:2555-2570`) remaps `n.Filters` and then **returns without recursing
 into `n.Tables[i]`**, so a conjunct already pushed into a table's `Filter` is
 never revisited. This is why §1.1's fix does nothing for these three queries —
 they are a genuinely separate bug, not the same one.
@@ -192,10 +227,38 @@ without that gate would repeat the pattern already on record in
 `analysis/tpch-evolution-round4-parallel-query-20260722.md`, where enabling
 ANALYZE fixed TPC-H Q5 and simultaneously regressed Q22 128×, Q4 79×, Q8 53×.
 
-**Unblocking step:** load TPC-H SF=1 into a data directory of its own, then land
-RC-1b behind a full TPC-H power run in both states.
+**Unblocking step, with its real cost.** This is not a re-run: the repo contains
+no TPC-H `*.tbl` data and no `dbgen` (`third-party/` holds only `tpcds-postgres`),
+and `bench/tpch/runtime` is the *PostgreSQL* cluster, which cannot serve a goopg
+gate. Unblocking means fetching or building `dbgen`, generating SF=1, and loading
+it into a goopg data directory of its own — after which RC-1b can land behind a
+full TPC-H power run in both flag states.
 
-### §2.2 The 16 timeouts
+### §2.2 The structural fix from §0 was not landed — 13 of 14 walkers are untouched
+
+§0 leads with the fourteen-walker finding. One walker was fixed. That needs saying
+plainly here rather than being left as a discovery in the summary.
+
+The design doc (§2.5) is explicit that patching `remapByPosMap` alone "would fix
+Q76 and leave ten loaded guns", and specifies the real fix: a shared
+`internal/planner/exprwalk.go` traversal primitive plus a `go/ast` exhaustiveness
+test that turns an unenumerated `Expr` type into a **build failure**. That file
+does not exist and no other walker was converted. Current arm counts:
+
+| walker | arms |
+| --- | ---: |
+| `shiftColumnRefs`, `cloneExprForShift` | 4 each |
+| `cloneExprShiftIdx` | 6 |
+| `visitColumnRefsByName`, `conjunctIsLocalEligible`, `localizeExprToLeaf` | 7 each |
+| `exprSide` | 8 |
+
+`remapByPosMap` itself still has **no `default:` arm** — the very property §0 names
+as the defect. That is defensible today (all 14 remaining unenumerated types are
+genuine leaves with no child `Expr` slots, so the silence is currently harmless),
+but the diagnosis was not applied even to the walker that was fixed. The next
+`Expr` type added to `plan.go` reopens the hole.
+
+### §2.3 The 16 timeouts
 
 No timeout fix was attempted. The mechanisms were surveyed and documented with
 file:line in the design doc §7; the primary hypothesis was confirmed live:
@@ -215,23 +278,37 @@ block count already plumbed as `ParallelSettings.BlocksForTable` — is the
 highest-regression-risk change in the bundle and is blocked on the same missing
 TPC-H gate. It is specified in design doc §7.1 and ledger rows `pq-P6`/`pq-P10`.
 
-### §2.3 Open with narrowed hypotheses
+### §2.4 Open with narrowed hypotheses
 
 | query | ruled out | remaining |
 | --- | --- | --- |
-| **Q49** (30 vs 34) | `rank()` peer ties — `rank`/`dense_rank`/`row_number` are byte-identical to PG (`1,1,3,3,3,6`) | the `decimal(15,4)` ratio division reordering ties at rank 10; or the `LEFT OUTER JOIN … , date_dim` shape. 30 is exactly 3×10, one per UNION ALL branch |
-| **Q39** (connection lost) | a Go panic — **no** `backend goroutine panic` line exists for it in any server log, so it is a SIGKILL | the cgroup cap (`MemoryMax=24G`) killing an arbitrary hash-join build side (`probeIdx` is meaningless at zero stats, and `inventory` is 11.7M rows), or the unbounded `aggregateOp`. §2.2's fix may resolve it for free |
+| **Q49** (30 vs 34) | `rank()` peer ties — `rank`/`dense_rank`/`row_number` are byte-identical to PG (`1,1,3,3,3,6`) | the `decimal(15,4)` ratio division reordering ties at rank 10; or the `LEFT OUTER JOIN … , date_dim` shape. 30 is exactly 3×10, one per branch (the three branches are joined by plain `union`, not `UNION ALL`) |
+| **Q39** (connection lost) | **nothing — corrected on review.** An earlier draft listed "a Go panic" as ruled out because no `backend goroutine panic` line exists for Q39 in any log. That is an argument from silence over a window with **no log at all**: coverage is `goopg.tpcds.log` 07-24 16:58–17:40 and `goopg.csq-bench.log` 07-27 07:18 onward, while the v4 sweep ran 07-26 13:57–18:19. The panic-vs-SIGKILL question is **open**, not settled | a Go panic in an unlogged window; the cgroup cap (`MemoryMax=24G`) killing an arbitrary hash-join build side (`probeIdx` is meaningless at zero stats, and `inventory` is 11.7M rows); or the unbounded `aggregateOp`. Re-run Q39 alone with logging and RSS monitoring before choosing a fix |
 | **Q35** | — | row count still unmeasured (525 s run) |
 
 ---
 
 ## §3 Full 99-query sweep
 
-A full sweep on both engines is running with the fixed harness
-(`TIMEOUT_SEC=300`), writing to
+A full sweep on both engines is running with the fixed harness at
+**`TIMEOUT_SEC=600`**, writing to
 `bench/tpch/runtime_goopg/tpcds-results/sweep-20260727.txt`. It is the only way to
 detect a regression among the 75 queries that already passed, which matters here
 because §1.1 makes `remapByPosMap` remap strictly *more* than before.
+
+**Threshold note.** The baseline is not uniform: `/tmp/tpcds-bench-v4.txt` used
+600 s for Q1–Q46 and 300 s for Q47–Q99. An initial 300 s sweep was started and
+then discarded, because at 300 s several queries that legitimately completed in
+the baseline — Q18 at 358 s, Q1 at 262 s, Q23 at 226 s — would report TIMEOUT and
+read as regressions caused by §1.1. The re-run uses 600 s throughout, which is
+≥ both baseline thresholds. Consequence when reading §5: for Q47–Q99 a query
+taking 300–600 s will look like an improvement over the baseline when it is only a
+longer clock.
+
+A second harness defect was found during this review and fixed: the classifier ran
+`grep -qi "ERROR"` over the entire psql output *before* the row-count branch, so a
+result row whose text merely contained the word "error" silently became
+`ERROR, rows=0`. It now matches psql's own `ERROR:`/`FATAL:`/`PANIC:` prefix.
 
 Results are appended in §5 when it completes. Until then the claims in this report
 are limited to the per-query measurements shown above, each run individually
@@ -249,6 +326,14 @@ against both engines.
 | `scripts/tpch-spotcheck.sh` | **SKIPPED — no TPC-H data.** Not a pass. See §2.1 |
 | `make plan-gate` | not run — the baseline is TPC-H plans |
 | per-query TPC-DS, both engines | as tabulated above |
+
+**Net position, stated plainly: no planner regression gate ran against these two
+planner commits.** `tpch-spotcheck` skipped for want of data and `plan-gate` was
+not run because its baseline is TPC-H plans. What stands behind a change that
+makes `remapByPosMap` remap strictly *more* than before is the package unit tests
+plus a pgbench smoke — neither of which exercises a multi-table analytic plan. The
+pending sweep (§3) is the first real regression signal, and it is not a substitute
+for the TPC-H gate.
 
 New regression test: `internal/executor/compare_eq_crosskind_test.go` pins the
 IN-list cross-kind coercion and that NULL still short-circuits to NULL.
@@ -271,5 +356,6 @@ IN-list cross-kind coercion and that NULL still short-circuits to NULL.
 - PostgreSQL 18.3 endpoint `127.0.0.1:65432`, db `tpcds`, role `ryo`, data
   `bench/tpch/runtime_goopg/pgdata`
 - queries `bench/tpch/runtime_goopg/tpcds-data/queries/query{N}.sql`
-- table row counts verified identical on both engines
+- table row counts compared by `select count(*)` per table on both engines (not
+  from `pg_class.reltuples`, which is 0 on goopg — see §2.3)
 - deferral ledger: five rows appended 2026-07-27 under task-id `tpcds-round2`

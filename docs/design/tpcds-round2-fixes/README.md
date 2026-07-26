@@ -360,7 +360,7 @@ remapping that would reconcile the two happens **later**, in `internal/planner/p
 ```
 1003  node = rewriteMultiWayChain(node, cat)                       // OID-sorts mh.Tables
 1012  node = rewriteScanInputsWithSingleTablePredicates(node, cat) // → pushSingleSourceFiltersIntoMHJTables
-1027  remapWithBindings(node, ctx.bindings)                        // ← reconciliation, too late
+1024  remapWithBindings(node, ctx.bindings)                        // ← reconciliation, too late
 ```
 
 The comment at `bushy.go:1792` ("Build output schema from all tables (now in FROM
@@ -385,7 +385,7 @@ coordinate-space independent. It is luck of index ranges, not a structural
 guarantee.
 
 **Why the corruption is permanent.** `applyJoinTreePosMap`'s `*MultiHashJoin` arm
-(`bushy.go:2461-2474`) remaps `n.Filters` — its own comment says those refs "are in
+(`bushy.go:2555-2570` (pre-fix `:2461-2474`)) remaps `n.Filters` — its own comment says those refs "are in
 pre-rewrite (global FROM-order) coords; remap them to MHJ-output coords here" — and
 then `return`s **without recursing into `n.Tables[i]`**. A conjunct already pushed
 into a table's `Filter` at `planner.go:1012` is therefore never revisited by the
@@ -420,7 +420,7 @@ they are coordinate-space independent and unaffected. Only
 
 There is only one coordinate space that is correct here, and the pipeline already
 produces it — just too late. **Move `pushSingleSourceFiltersIntoMHJTables` to run
-after `remapWithBindings`** (`planner.go:1027`) instead of inside
+after `remapWithBindings`** (`planner.go:1024`) instead of inside
 `rewriteScanInputsWithSingleTablePredicates` (`:1012`). After the remap,
 `mh.Filters` is in MHJ-output coordinates, which is exactly the space
 `offsets[]` is computed in, so index attribution becomes correct by construction
@@ -456,7 +456,7 @@ moves.
 ### §3.5 Deferred: the root fix
 
 The structural fix is to run `rewriteScanInputsWithSingleTablePredicates` **after**
-`remapWithBindings` (`planner.go:1012` vs `:1027`), so there is only ever one
+`remapWithBindings` (`planner.go:1020` (the push) vs `:1024` (the remap)), so there is only ever one
 coordinate space in play. That reorder also moves `IndexScan` promotion after the
 remap, which changes the scan identities `buildBindingsPosMap` keys on. It needs
 its own design doc and its own benchmark round; it is **not** attempted here.
