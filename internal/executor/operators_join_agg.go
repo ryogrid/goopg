@@ -3180,17 +3180,14 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			return nil, err
 		}
 		row := slotRow(slot)
-		var dup Row
+		// Always make an independent copy: clone the slice AND
+		// materialize any arena-backed Datums so each entry stays
+		// valid regardless of the producer's slot reuse or arena
+		// reset.  (M0097-0058 CTE-left cross join fix.)
+		dup := make(Row, len(row))
+		copy(dup, row)
 		if rowHasArena(row) {
-			dup = cloneRowOwned(row)
-		} else {
-			// Row is already fully owned (all arena bytes materialized,
-			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
-			// The row was independently allocated via acquireRow; appending
-			// directly is safe because the producer allocates a fresh row
-			// on the next call.  Eliminates a redundant O(width) copy.
-			// See docs/design/tpch-round5-fixes/04.
-			dup = row
+			dup = cloneRowOwned(dup)
 		}
 		rows = append(rows, dup)
 		n++
@@ -3224,17 +3221,11 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 			return nil, nil, err
 		}
 		row := slotRow(slot)
-		var dup Row
+		// Always make an independent copy (see drainRowsCtx above).
+		dup := make(Row, len(row))
+		copy(dup, row)
 		if rowHasArena(row) {
-			dup = cloneRowOwned(row)
-		} else {
-			// Row is already fully owned (all arena bytes materialized,
-			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
-			// The row was independently allocated via acquireRow; appending
-			// directly is safe because the producer allocates a fresh row
-			// on the next call.  Eliminates a redundant O(width) copy.
-			// See docs/design/tpch-round5-fixes/04.
-			dup = row
+			dup = cloneRowOwned(dup)
 		}
 		rows = append(rows, dup)
 		if scanLeaf != nil {

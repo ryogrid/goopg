@@ -2384,6 +2384,16 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
 			// Advance off by the output width so sibling scans stay aligned.
 			off += len(x.Output())
+		case *CTEScan:
+			// CTE Scan (WITH query) contributes its output columns to the
+			// join-tree schema.  Advance off so sibling scans get the
+			// correct scanMap offset; without this, aggregate arguments and
+			// GROUP BY expressions referencing columns to the right of a
+			// CTE are remapped to the wrong indices.  (M0097-0058)
+			off += len(x.Output())
+		case *MaterializedCTEScan:
+			// DML CTE — same offset-advance requirement as CTEScan above.
+			off += len(x.Output())
 		case *FromUnnest, *GenerateSeries, *GenerateSubscripts,
 			*UserSrfScan, *ScalarFuncScan, *PgPartitionTree, *PgOptionsToTable,
 			*PgInputErrorInfo, *PgGetPublicationTables,

@@ -93,6 +93,17 @@ func collectScanOutputNames(n Node, names map[string]bool) {
 		for _, c := range x.Output() {
 			names[c.Name] = true
 		}
+	case *CTEScan:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
+		// Recurse into the inlined CTE body so columns from the
+		// underlying plan (scan/project/etc.) are also visible.
+		collectScanOutputNames(x.Child, names)
+	case *MaterializedCTEScan:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
 	}
 }
 
