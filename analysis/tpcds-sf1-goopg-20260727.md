@@ -283,7 +283,7 @@ TPC-H gate. It is specified in design doc §7.1 and ledger rows `pq-P6`/`pq-P10`
 | query | ruled out | remaining |
 | --- | --- | --- |
 | **Q49** (30 vs 34) | `rank()` peer ties — `rank`/`dense_rank`/`row_number` are byte-identical to PG (`1,1,3,3,3,6`) | the `decimal(15,4)` ratio division reordering ties at rank 10; or the `LEFT OUTER JOIN … , date_dim` shape. 30 is exactly 3×10, one per branch (the three branches are joined by plain `union`, not `UNION ALL`) |
-| **Q39** (connection lost) | **RESOLVED after publication — root cause found at SF0.5** (see deferral ledger `tpcds-round2 Q39`): `exactIntVariance`'s Newton-Raphson stddev sqrt panicked on `big.Float.Quo(0,0)` for any group whose inputs are all equal (variance exactly 0 → seed 0); Q39's `stddev_samp` over constant inventory snapshots triggered it every run, and the panic escaped to serveConn as a socket close. Neither an OOM nor unexplained: the SF=1 crashes simply fell in unlogged windows. Guard mirrored from the numeric sibling; **E2E verified**: SF=1 OK 181 s with 230+6 = 236 rows, exact per-statement match with PG (the baseline's "6 rows" was the tail-1 harness artifact); SF0.5 = 77 rows, exact oracle match | — |
+| **Q39** (connection lost) | **RESOLVED after publication — root cause found at SF0.5** (see deferral ledger `tpcds-round2 Q39`): `exactIntVariance`'s Newton-Raphson stddev sqrt panicked on `big.Float.Quo(0,0)` for any group whose inputs are all equal (variance exactly 0 → seed 0); Q39's `stddev_samp` over constant inventory snapshots triggered it every run, and the panic escaped to serveConn as a socket close. Neither an OOM nor unexplained: the SF=1 crashes simply fell in unlogged windows. Guard mirrored from the numeric sibling; **E2E verified**: SF=1 OK with 230+6 = 236 rows — per-statement **row counts** exactly match PG (the baseline's "6 rows" was the tail-1 harness artifact); SF0.5 = 77 rows, exact oracle match. Two measurements exist: 181 s standalone, 179 s in the full sweep. Caveat found on final review: the float `cov` column (stddev/mean) differs from PG in the **last 1–2 digits on 235 of 236 rows** (e.g. `…7982042` vs `…7982044`) — goopg computes stddev by 128-bit Newton-Raphson and formats at 18 significant digits, PG via numeric sqrt. Row-identity and grouping are exact; the value-precision gap is recorded in the deferral ledger | — |
 | **Q35** | — | row count still unmeasured (525 s run) |
 
 **Methodological caution learned here.** The Q6/Q7 investigation initially
@@ -401,10 +401,147 @@ Two former SF=1 permanent timeouts — **Q82 and Q88 — completed and PASSED**,
 receiving their first-ever row-count verification. Q39's crash finally landed
 in a logged window here, which is what produced its root cause.
 
-### §5.2 SF=1 sweep (resumed from Q30)
+### §5.2 SF=1 sweep — final (paused at Q29 for the SF0.5 build; resumed segment finished ~18:18 per file mtime)
 
-*(pending — appended when the resumed run completes; Q1–Q29 recorded before
-the pause, statuses all matching the 07-26 baseline)*
+Protocol notes: uniform 600 s timeout both engines; goopg restarted after every
+goopg TIMEOUT (sweep-tail-collapse guard); Q30–Q99 ran on the Q39-fixed binary
+`927472e0` — safe for cross-segment consistency because the variance guard only
+alters executions that previously *panicked*, so every completed Q1–Q29 result
+is unaffected by construction.
+
+**goopg: OK=79 · TIMEOUT=16 · ERROR=4** (of the 4 errors, 3 are the Q36/70/86
+dsqgen artifacts that fail on PG too — **goopg-only errors: 1**, the contained
+Q8).
+
+Versus the 2026-07-26 baseline (75 OK / 17 TIMEOUT / 5 ERROR):
+
+| change | queries | cause |
+|---|---|---|
+| ERROR → OK | Q39 (179 s, 236 rows = PG exactly) | the variance-guard fix |
+| unmeasured → OK, rows = PG | Q34 (374), Q46 (100), Q82 (2) | baseline lost them to crash-restarts / the 300 s cap |
+| TIMEOUT → OK-but-wrong | Q51 (597 s, 0 vs 100) | 600 s budget reveals the wrong answer previously hidden by the 300 s cap |
+| row gap → exact match | Q76 (100), Q83 (22) | the RC-1a walker fix and the IN-list coercion fix, holding in full-sweep context |
+| OK → TIMEOUT | Q35 (651 s; was 525/600) | borderline query flipping across the line, not a regression |
+| timing drift > 1.5× | Q18 (358→626 s, 1.75×) and Q45 (5→18 s, 3.6× — trivial in absolute terms) | Q18 is the only substantial one: S-cold anomaly, flagged, unexplained. Of 74 both-OK queries, 52 ran faster than baseline, 15 slower, 7 equal |
+
+Row mismatches against PG among OK queries: **5** — Q47 (0/100), Q49 (30/34),
+Q50 (0/6), Q51 (0/100), Q72 (0/100). Q47/Q50/Q72 and (probably) Q51 are the
+RC-1b family whose designed fix is held behind the unrunnable TPC-H gate;
+Q49 is the one-row-per-branch tie, bisectable cheaply at SF0.5.
+
+**Zero unexplained goopg anomalies.** Every goopg non-OK and every mismatch in
+the final table is attributed above or in §2. On the PG side, three rows are
+non-OK: Q4 (times out on both engines, out of scope), Q11 and Q74 (PG timeouts
+present in the baseline too — goopg beats PG on both), and Q6 — whose in-sweep
+ERROR is **my measurement bug, not PostgreSQL's**: the mid-sweep orphan reap
+(§3) terminated its healthy backend. Re-measured after the sweep: OK 143 s /
+44 rows, matching the baseline; the table row carries the correction.
+
+Full per-query table (goopg | PG, `status time / rows`, last measurement wins
+for the pre-pause duplicate of Q30):
+
+| Q | goopg | PG 18.3 | note |
+|---|---|---|---|
+| 1 | OK 250s / 100 | OK 209s / 100 |  |
+| 2 | OK 28s / 2513 | OK 0s / 2513 |  |
+| 3 | OK 18s / 31 | OK 0s / 31 |  |
+| 4 | TIMEOUT 644s / 0 | TIMEOUT 649s / 0 | times out on both engines |
+| 5 | TIMEOUT 649s / 0 | OK 2s / 100 |  |
+| 6 | OK 59s / 44 | ERROR 45s / 0 † | † in-sweep PG record corrupted by the reap bug (§3); re-measured cleanly after the sweep: **OK 143 s / 44**, matching baseline |
+| 7 | OK 65s / 100 | OK 1s / 100 |  |
+| 8 | ERROR 24s / 0 | OK 0s / 0 |  |
+| 9 | OK 146s / 1 | OK 1s / 1 |  |
+| 10 | TIMEOUT 649s / 0 | OK 14s / 1 |  |
+| 11 | OK 77s / 95 | TIMEOUT 652s / 0 |  |
+| 12 | OK 6s / 100 | OK 0s / 100 |  |
+| 13 | OK 62s / 1 | OK 0s / 1 |  |
+| 14 | TIMEOUT 647s / 0 | OK 36s / 200 |  |
+| 15 | OK 15s / 100 | OK 0s / 100 |  |
+| 16 | OK 48s / 1 | OK 1s / 1 |  |
+| 17 | OK 52s / 1 | OK 1s / 1 |  |
+| 18 | OK 626s / 100 | OK 0s / 100 | 1.75× slower than baseline (S-cold; only such drift) |
+| 19 | OK 69s / 100 | OK 0s / 100 |  |
+| 20 | OK 17s / 100 | OK 0s / 100 |  |
+| 21 | OK 47s / 100 | OK 1s / 100 |  |
+| 22 | OK 162s / 100 | OK 4s / 100 |  |
+| 23 | OK 208s / 1 | OK 6s / 1 |  |
+| 24 | OK 75s / 0 | OK 0s / 0 |  |
+| 25 | OK 55s / 0 | OK 1s / 0 |  |
+| 26 | OK 35s / 100 | OK 0s / 100 |  |
+| 27 | OK 239s / 100 | OK 1s / 100 |  |
+| 28 | OK 89s / 1 | OK 1s / 1 |  |
+| 29 | OK 53s / 1 | OK 1s / 1 |  |
+| 30 | TIMEOUT 649s / 0 | OK 15s / 63 |  |
+| 31 | TIMEOUT 647s / 0 | OK 15s / 43 |  |
+| 32 | OK 10s / 1 | OK 1s / 1 |  |
+| 33 | OK 69s / 100 | OK 0s / 100 |  |
+| 34 | OK 35s / 374 | OK 0s / 374 | first goopg measurement (lost to a crash-restart in the baseline) |
+| 35 | TIMEOUT 651s / 0 | OK 2s / 100 | borderline flip (525 s OK in baseline) |
+| 36 | ERROR 0s / 0 | SKIP | dsqgen artifact — fails on PG too |
+| 37 | OK 311s / 0 | OK 0s / 0 |  |
+| 38 | OK 41s / 1 | OK 2s / 1 |  |
+| 39 | OK 179s / 236 | OK 6s / 236 | **fixed this round** (was: server crash) |
+| 40 | OK 42s / 100 | OK 0s / 100 |  |
+| 41 | OK 8s / 1 | OK 2s / 1 |  |
+| 42 | OK 15s / 10 | OK 0s / 10 |  |
+| 43 | OK 18s / 6 | OK 1s / 6 |  |
+| 44 | OK 58s / 10 | OK 0s / 10 |  |
+| 45 | OK 18s / 14 | OK 0s / 14 |  |
+| 46 | OK 43s / 100 | OK 0s / 100 | first clean measurement (ditto) |
+| 47 | OK 17s / 0 | OK 2s / 100 | known row gap (RC-1b / Q49) |
+| 48 | OK 52s / 1 | OK 1s / 1 |  |
+| 49 | OK 82s / 30 | OK 1s / 34 | known row gap (RC-1b / Q49) |
+| 50 | OK 15s / 0 | OK 1s / 6 | known row gap (RC-1b / Q49) |
+| 51 | OK 597s / 0 | OK 3s / 100 | **completes at 600 s; wrong answer newly visible** (0 vs 100 cross-scale confirmed; RC-1b family membership probable, unproven) |
+| 52 | OK 15s / 100 | OK 0s / 100 |  |
+| 53 | OK 44s / 100 | OK 1s / 100 |  |
+| 54 | TIMEOUT 657s / 0 | OK 0s / 0 |  |
+| 55 | OK 18s / 73 | OK 0s / 73 |  |
+| 56 | OK 67s / 100 | OK 1s / 100 |  |
+| 57 | OK 109s / 100 | OK 1s / 100 |  |
+| 58 | OK 41s / 0 | OK 0s / 0 |  |
+| 59 | OK 33s / 100 | OK 1s / 100 |  |
+| 60 | OK 67s / 100 | OK 1s / 100 |  |
+| 61 | OK 120s / 1 | OK 0s / 1 |  |
+| 62 | OK 12s / 100 | OK 0s / 100 |  |
+| 63 | OK 43s / 100 | OK 0s / 100 |  |
+| 64 | TIMEOUT 654s / 0 | OK 1s / 8 |  |
+| 65 | TIMEOUT 659s / 0 | OK 1s / 100 |  |
+| 66 | OK 34s / 5 | OK 1s / 5 |  |
+| 67 | TIMEOUT 654s / 0 | OK 6s / 100 |  |
+| 68 | OK 41s / 100 | OK 0s / 100 |  |
+| 69 | TIMEOUT 658s / 0 | OK 1s / 100 |  |
+| 70 | ERROR 0s / 0 | SKIP | dsqgen artifact — fails on PG too |
+| 71 | TIMEOUT 652s / 0 | OK 0s / 1129 |  |
+| 72 | OK 14s / 0 | OK 2s / 100 | known row gap (RC-1b / Q49) |
+| 73 | OK 34s / 3 | OK 0s / 3 |  |
+| 74 | OK 36s / 100 | TIMEOUT 652s / 0 |  |
+| 75 | OK 47s / 100 | OK 2s / 100 |  |
+| 76 | OK 36s / 100 | OK 0s / 100 | fixed earlier this round, holds in full sweep |
+| 77 | OK 50s / 44 | OK 0s / 44 |  |
+| 78 | TIMEOUT 651s / 0 | OK 2s / 100 |  |
+| 79 | OK 34s / 100 | OK 1s / 100 |  |
+| 80 | OK 169s / 100 | OK 0s / 100 |  |
+| 81 | TIMEOUT 653s / 0 | OK 57s / 100 |  |
+| 82 | OK 576s / 2 | OK 0s / 2 | first SF=1 row verification — matches |
+| 83 | OK 7s / 22 | OK 0s / 22 | fixed earlier this round, holds in full sweep |
+| 84 | OK 5s / 18 | OK 0s / 18 |  |
+| 85 | OK 7s / 2 | OK 0s / 2 |  |
+| 86 | ERROR 0s / 0 | SKIP | dsqgen artifact — fails on PG too |
+| 87 | OK 36s / 1 | OK 2s / 1 |  |
+| 88 | TIMEOUT 660s / 0 | OK 1s / 1 |  |
+| 89 | OK 41s / 100 | OK 0s / 100 |  |
+| 90 | OK 19s / 1 | OK 0s / 1 |  |
+| 91 | OK 5s / 1 | OK 1s / 1 |  |
+| 92 | OK 4s / 1 | OK 0s / 1 |  |
+| 93 | OK 31s / 0 | OK 0s / 0 |  |
+| 94 | OK 24s / 1 | OK 0s / 1 |  |
+| 95 | OK 60s / 1 | OK 32s / 1 |  |
+| 96 | OK 31s / 1 | OK 0s / 1 |  |
+| 97 | OK 52s / 1 | OK 0s / 1 |  |
+| 98 | OK 20s / 2531 | OK 1s / 2531 |  |
+| 99 | OK 22s / 90 | OK 1s / 90 |  |
+
 
 ---
 
@@ -420,4 +557,9 @@ the pause, statuses all matching the 07-26 baseline)*
 - queries `bench/tpch/runtime_goopg/tpcds-data/queries/query{N}.sql`
 - table row counts compared by `select count(*)` per table on both engines (not
   from `pg_class.reltuples`, which is 0 on goopg — see §2.3)
-- deferral ledger: five rows appended 2026-07-27 under task-id `tpcds-round2`
+- deferral ledger: five rows appended 2026-07-27 under task-id `tpcds-round2`,
+  plus the stddev value-precision row added after the final review
+- this report passed two adversarial review passes; the second (scoped to
+  §5.1/§5.2/§2.4) verified all 99 table rows and every tally against the
+  primary files with zero transcription errors, and produced the Q6/Q45/Q39
+  claim corrections marked above
