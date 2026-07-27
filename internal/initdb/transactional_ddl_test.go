@@ -121,7 +121,7 @@ func (tc *txnConn) run(sql string) {
 // BEGIN; CREATE TABLE t1; ROLLBACK; must leave t1 non-existent.
 func TestTransactionalCreateTableRollback(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -144,7 +144,7 @@ func TestTransactionalCreateTableRollback(t *testing.T) {
 // BEGIN; CREATE TABLE t; COMMIT; leaves t in the catalog.
 func TestTransactionalCreateTableCommit(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -167,7 +167,7 @@ func TestTransactionalCreateTableCommit(t *testing.T) {
 // a rolled-back transaction removes the index from the catalog.
 func TestTransactionalCreateIndexRollback(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -192,7 +192,7 @@ func TestTransactionalCreateIndexRollback(t *testing.T) {
 // CREATE TABLE statements inside one transaction are ALL undone on ROLLBACK.
 func TestTransactionalDDLMultipleCreatesRollback(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -219,7 +219,7 @@ func TestTransactionalDDLMultipleCreatesRollback(t *testing.T) {
 // explicit BEGIN auto-commits and the table persists.
 func TestAutoCommitDDLSurvivesImplicitTransaction(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -249,7 +249,7 @@ func TestAutoCommitDDLSurvivesImplicitTransaction(t *testing.T) {
 // deleteCatalogRowsForOID so the startup scan skips them.
 func TestRollbackedTableNotVisibleAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,7 +291,7 @@ func TestRollbackedTableNotVisibleAfterRestart(t *testing.T) {
 // next Open, leaving the catalog out of sync with itself across restart.
 func TestDroppedTableNotVisibleAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -334,7 +334,7 @@ func TestDroppedTableNotVisibleAfterRestart(t *testing.T) {
 // `execDropIndex`.
 func TestDroppedIndexNotVisibleAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 

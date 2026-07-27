@@ -42,6 +42,10 @@ func runKillKillRecovery(t *testing.T) {
 		DataDir:      filepath.Join(base, "data"),
 		StartupWait:  30 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		// Durability allowlist (ci/design/test-gate-speedups/02 §4): the
+		// kill-then-reopen replay below asserts the durable path itself.
+		SyncInit:    true,
+		SyncRuntime: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +132,9 @@ func TestKillReleasesListenerPort(t *testing.T) {
 		DataDir:      filepath.Join(base, "data"),
 		StartupWait:  30 * time.Second,
 		ShutdownWait: 10 * time.Second,
+		// Durability allowlist (ci/design/test-gate-speedups/02 §4).
+		SyncInit:    true,
+		SyncRuntime: true,
 	})
 	if err != nil {
 		t.Fatal(err)

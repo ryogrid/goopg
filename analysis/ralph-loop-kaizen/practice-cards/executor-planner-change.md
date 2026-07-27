@@ -30,6 +30,8 @@ where data exists.
 
 (Encodes `feedback_tpch_pre_commit_gates`, `m0071_stage_b_silent_regression`.)
 
+Never `-count=1` in a gate run (cache policy: ci/design/test-gate-speedups/05 §1).
+
 ## Sibling-path audit (do this in the SAME loop)
 
 A planner/executor change usually has a twin that must change together. Before

@@ -25,6 +25,8 @@ intermediate and burn a whole run.
   is a regression — re-check the canonical counts, especially the
   Q12/Q13 silent-regression tripwires ([[feedback_tpch_pre_commit_gates]],
   see [[executor-planner-change]]).
+- Never `-count=1` in a gate run (cache policy:
+  ci/design/test-gate-speedups/05 §1).
 
 ## Known traps
 

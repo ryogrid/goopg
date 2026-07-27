@@ -74,6 +74,8 @@ func TestE2E_ChecksumStreamingGoopgToPG(t *testing.T) {
 		DataDir:      filepath.Join(baseDir, "goopg-primary"),
 		StartupWait:  45 * time.Second,
 		ShutdownWait: 10 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 		// The whole point of this gate: a checksummed goopg primary.
 		InitArgs: []string{"--data-checksums"},
 	})

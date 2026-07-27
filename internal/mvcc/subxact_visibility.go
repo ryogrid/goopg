@@ -61,6 +61,19 @@ func (m *SubxactMap) EnablePersistence(dir string) error {
 	return nil
 }
 
+// SetFsyncDisabled mirrors `fsync = off` for the pg_subtrans mirror: parent
+// links are still written through, but SetParent's fsync is skipped. Call
+// after EnablePersistence; a nil SLRU (persistence disabled) is a no-op.
+// Test harnesses only; see ci/design/test-gate-speedups/02.
+func (m *SubxactMap) SetFsyncDisabled(disabled bool) {
+	m.mu.RLock()
+	slru := m.slru
+	m.mu.RUnlock()
+	if slru != nil {
+		slru.fsyncDisabled.Store(disabled)
+	}
+}
+
 // RestoreFromSLRU reloads every persisted parent link from the on-disk
 // pg_subtrans SLRU into the in-memory map (gap G5 read path / restore-on-restart).
 // It must be called after EnablePersistence; a nil SLRU returns an error so a

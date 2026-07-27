@@ -26,6 +26,10 @@ dirs.
   data is unreadable and will produce misleading failures
   (`pg_lsn_completed` notes a full TPC-H re-run was needed after an S2 format
   change).
+- Never `-count=1` in a gate run (cache policy:
+  ci/design/test-gate-speedups/05 §1); if the change touches
+  recovery/durability paths, keep those tests on the durable harness config
+  (ci/design/test-gate-speedups/02 §4).
 
 ## Trap
 

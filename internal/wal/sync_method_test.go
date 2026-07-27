@@ -82,3 +82,38 @@ func TestSyncMethodUnsupportedRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestFsyncDisabledStillFlushesAndReplays pins the fsync=off contract
+// (ci/design/test-gate-speedups/02): doSync skips only the durability
+// syscall — bytes still reach the segment files in order, flushedLSN
+// still advances (FlushUpTo succeeds), the sync *request* is still
+// counted (upstream's wal_sync stat shape), and a re-read from disk
+// (the process-crash recovery surface) sees every record.
+func TestFsyncDisabledStillFlushesAndReplays(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 128, FsyncDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, end, err := w.Append([]byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatalf("FlushUpTo under fsync=off: %v", err)
+	}
+	if got := w.FsyncCount(); got != 1 {
+		t.Fatalf("FsyncCount under fsync=off = %d, want 1 (requests are still counted)", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := ReadAll(walDir, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || string(recs[0].Payload) != "payload" {
+		t.Fatalf("ReadAll under fsync=off = %+v, want one %q record", recs, "payload")
+	}
+}

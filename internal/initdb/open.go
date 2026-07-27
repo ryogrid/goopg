@@ -144,6 +144,16 @@ type OpenOptions struct {
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	WALSyncMethod string
 
+	// FsyncDisabled mirrors `fsync = off` (inverted so the Go zero value
+	// keeps the durable PG default): when true, every runtime durability
+	// sync — WAL commit flush, checkpoint data-file sync, CLOG/SLRU sync —
+	// is skipped. Writes still happen in the same order, so process-crash
+	// recovery is unaffected; only host-crash durability is forfeit. Test
+	// harnesses only (upstream Cluster.pm writes `fsync = off` into every
+	// test instance). See
+	// ci/design/test-gate-speedups/02-durability-off-for-test-servers.md.
+	FsyncDisabled bool
+
 	// CommitDelayUs / CommitSiblings forward to wal.Config for the
 	// backend-driven flush group commit (docs/design/wal-backend-flush/).
 	// Mirror the `commit_delay` (µs) and `commit_siblings` GUCs; PG defaults
@@ -280,6 +290,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr := storage.NewManager(storage.ManagerConfig{
 		DataDir:          abs,
 		ChecksumsEnabled: checksumsEnabled,
+		FsyncDisabled:    opts.FsyncDisabled,
 	})
 
 	// Activity registry (M0022 / M0107-0005): per-backend slot array with
@@ -379,6 +390,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SenderMemoryBuffer:  opts.WALSenderMemoryBuffer,
 		WALBuffers:          opts.WALBuffers,
 		SyncMethod:          opts.WALSyncMethod,
+		FsyncDisabled:       opts.FsyncDisabled,
 		MinWALSize:          opts.WALMinSize,
 		MaxWALSize:          opts.WALMaxSize,
 		CommitDelayUs:       opts.CommitDelayUs,
@@ -937,6 +949,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// that page's highest associated commit-record LSN first — the invariant
 	// synchronous_commit=off relies on instead of an inline per-commit fsync.
 	clog.SetFlushWALHook(walWriter.FlushUpTo)
+	// fsync=off (test harnesses only): skip the CLOG store's per-segment
+	// fsyncs; write-through and ordering (including the FlushWAL barrier
+	// above) are unchanged. See ci/design/test-gate-speedups/02.
+	if opts.FsyncDisabled {
+		clog.SetFsyncDisabled(true)
+	}
 	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
 	// parentage survives a restart (gap G5 read path). EnablePersistence opens
 	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
@@ -957,6 +975,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
+	}
+	if opts.FsyncDisabled {
+		subxactMap.SetFsyncDisabled(true)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
 	// C3-S3 blocker fix B: storage.TupleDeadToAll (prune / VACUUM / the

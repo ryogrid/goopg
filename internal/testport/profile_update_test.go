@@ -16,7 +16,14 @@ func TestProfileUpdate(t *testing.T) {
 		t.Skip("skipping profile test in short mode")
 	}
 
-	c := newCluster(t, "profile_update")
+	// Durable-pinned NOT for durability: at fsync=off throughput (~2.3k TPS
+	// vs ~1.3k) this fixed 4-worker × 5-row contention reproducibly trips
+	// the known spurious-40001 divergence (plain autocommit UPDATE returns
+	// "could not serialize access due to concurrent update (deadlock)";
+	// PG would wait — deferred tuple-lock FIFO work, ledger 0021-0012).
+	// Adjudicated fast-only per ci/design/test-gate-speedups/06 B.2 (fast
+	// 2/2 fail, durable 3/3 pass, 2026-07-17); un-pin when 0021-0012 lands.
+	c := newDurableCluster(t, "profile_update")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
@@ -45,6 +52,7 @@ func TestProfileUpdate(t *testing.T) {
 	deadline := time.After(10 * time.Second)
 	done := make(chan struct{})
 	counts := make(chan int, 4)
+	workerErrs := make(chan error, 4)
 
 	for w := 0; w < 4; w++ {
 		go func() {
@@ -55,6 +63,11 @@ func TestProfileUpdate(t *testing.T) {
 				_, err := c.Query(ctx,
 					fmt.Sprintf("UPDATE t SET val = val + %d WHERE id = %d", delta, id))
 				if err != nil {
+					// MUST still send counts: the collector below reads
+					// exactly 4 values, and a silent return here used to
+					// deadlock the whole suite until go test's timeout.
+					workerErrs <- err
+					counts <- localCount
 					return
 				}
 				localCount++
@@ -75,6 +88,10 @@ func TestProfileUpdate(t *testing.T) {
 	totalCount := 0
 	for i := 0; i < 4; i++ {
 		totalCount += <-counts
+	}
+	close(workerErrs)
+	for err := range workerErrs {
+		t.Errorf("UPDATE worker exited on error: %v", err)
 	}
 	t.Logf("UPDATEs: %d in 10s = %d TPS", totalCount, totalCount/10)
 	t.Logf("Profile: go tool pprof -top /tmp/update.pprof")

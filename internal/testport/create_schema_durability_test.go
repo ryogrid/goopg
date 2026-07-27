@@ -41,6 +41,8 @@ func TestPort_CreateSchemaSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +104,8 @@ func TestPort_AlterSchemaSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +151,8 @@ func TestPort_FunctionSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +200,8 @@ func TestPort_SequenceCatalogRowSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +247,8 @@ func TestPort_DomainSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +327,8 @@ func TestPort_RangeTypeSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -372,6 +384,8 @@ func TestPort_EnumSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -431,6 +445,8 @@ func TestPort_CastSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -485,6 +501,8 @@ func TestPort_AggregateSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -543,6 +561,8 @@ func TestPort_OperatorSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -603,6 +623,8 @@ func TestPort_CollationSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -655,6 +677,8 @@ func TestPort_ConversionSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -704,6 +728,8 @@ func TestPort_OpClassFamilySurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -39,6 +39,8 @@ func TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk(t *testing.T) {
 		DataDir:      dataDir,
 		StartupWait:  45 * time.Second,
 		ShutdownWait: 10 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatalf("cluster.New: %v", err)

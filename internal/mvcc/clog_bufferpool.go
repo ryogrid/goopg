@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -147,6 +148,12 @@ type clogBufferPool struct {
 	// wal.Writer.FlushUpTo by the CLog layer when the pool goes live (Part B);
 	// injection keeps the mvcc package free of a wal import.
 	flushWAL func(lsn uint64) error
+
+	// fsyncDisabled mirrors `fsync = off`: write-back still happens (page
+	// bytes reach the OS cache in the same order) but the per-segment
+	// fsync is skipped. Test harnesses only; see
+	// ci/design/test-gate-speedups/02.
+	fsyncDisabled atomic.Bool
 }
 
 // newCLOGBufferPool creates a pool over the segment directory dir holding at
@@ -280,9 +287,11 @@ func (p *clogBufferPool) writePageToDisk(pageNo int64, data []byte) error {
 		f.Close()
 		return fmt.Errorf("clog bufpool: write %q@%d: %w", segPath, off, err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("clog bufpool: sync %q: %w", segPath, err)
+	if !p.fsyncDisabled.Load() {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("clog bufpool: sync %q: %w", segPath, err)
+		}
 	}
 	return f.Close()
 }
@@ -452,9 +461,11 @@ func (p *clogBufferPool) flushDirty() error {
 				return fmt.Errorf("clog bufpool: write %q@%d: %w", segPath, off, err)
 			}
 		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return fmt.Errorf("clog bufpool: sync %q: %w", segPath, err)
+		if !p.fsyncDisabled.Load() {
+			if err := f.Sync(); err != nil {
+				f.Close()
+				return fmt.Errorf("clog bufpool: sync %q: %w", segPath, err)
+			}
 		}
 		if err := f.Close(); err != nil {
 			return fmt.Errorf("clog bufpool: close %q: %w", segPath, err)

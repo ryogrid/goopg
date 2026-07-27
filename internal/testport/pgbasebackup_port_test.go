@@ -153,7 +153,7 @@ func TestPort_PgBasebackup010BackupExecution(t *testing.T) {
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup010_exec")
+	c := newDurableCluster(t, "pgbasebackup010_exec")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestPort_PgBasebackup010StreamWAL(t *testing.T) {
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup010_stream")
+	c := newDurableCluster(t, "pgbasebackup010_stream")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestPort_PgBasebackup010FetchWAL(t *testing.T) {
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup010_fetch")
+	c := newDurableCluster(t, "pgbasebackup010_fetch")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestPort_PgBasebackup010Manifest(t *testing.T) {
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup010_manifest")
+	c := newDurableCluster(t, "pgbasebackup010_manifest")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestPort_PgBasebackup010ManifestChecksums(t *testing.T) {
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup010_manifest_checksums")
+	c := newDurableCluster(t, "pgbasebackup010_manifest_checksums")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -752,7 +752,7 @@ func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 	if psqlBin == "" {
 		t.Skip("psql not in PATH or postgres/local_install/bin")
 	}
-	c := newCluster(t, "pgbasebackup011_inplace")
+	c := newDurableCluster(t, "pgbasebackup011_inplace")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -913,7 +913,7 @@ func TestPort_PgReceivewal020(t *testing.T) {
 	// TestPort_PgBasebackup010StreamWAL `-X stream` test exercises. This tier
 	// reproduces upstream 020's slot create -> stream -> drop sequence against
 	// a live goopg cluster.
-	c := newCluster(t, "pgreceivewal020")
+	c := newDurableCluster(t, "pgreceivewal020")
 	if err := c.Init(); err != nil {
 		t.Fatalf("init: %v", err)
 	}

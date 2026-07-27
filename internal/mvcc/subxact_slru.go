@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -42,6 +43,11 @@ const (
 type SubtransSLRU struct {
 	mu  sync.Mutex
 	dir string
+
+	// fsyncDisabled mirrors `fsync = off`: SetParent's write-through still
+	// happens, but its fsync is skipped. Test harnesses only; see
+	// ci/design/test-gate-speedups/02.
+	fsyncDisabled atomic.Bool
 }
 
 // OpenSubtransSLRU opens (or creates) the pg_subtrans SLRU mirror under dir.
@@ -120,6 +126,9 @@ func (s *SubtransSLRU) SetParent(xid, parent storage.TransactionID) error {
 	}
 	if _, err := f.WriteAt(le[:], byteOffset); err != nil {
 		return fmt.Errorf("subtrans slru: write %q@%d: %w", segPath, byteOffset, err)
+	}
+	if s.fsyncDisabled.Load() {
+		return nil
 	}
 	return f.Sync()
 }

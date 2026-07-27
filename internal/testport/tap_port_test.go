@@ -202,6 +202,27 @@ func newCluster(t *testing.T, name string) *cluster.Cluster {
 	return c
 }
 
+// newDurableCluster is newCluster for tests on the durability allowlist
+// (ci/design/test-gate-speedups/02 §4): crash/kill-then-reopen recovery,
+// basebackup/replication, and restart-durability tests keep the synced init
+// path (no template clone) and runtime fsync, because the durable path is
+// part of what they assert.
+func newDurableCluster(t *testing.T, name string) *cluster.Cluster {
+	t.Helper()
+	c, err := cluster.New(name, cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func mustInitStart(t *testing.T, c *cluster.Cluster) {
 	t.Helper()
 	if err := c.Init(); err != nil {

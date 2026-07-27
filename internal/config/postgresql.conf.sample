@@ -109,6 +109,8 @@
                                         # (change requires restart)
 #full_page_writes = on                  # log full pages after first mod since
                                         # last checkpoint (SIGHUP to apply)
+#fsync = on                             # off skips all durability syncs;
+                                        # only ever off for throwaway test servers
 #synchronous_commit = on                # off | local | remote_write |
                                         # on (= remote_flush) | remote_apply
 

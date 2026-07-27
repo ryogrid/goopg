@@ -43,7 +43,8 @@ cd "$(dirname "$0")/.."
 #   smoke           Part 2 only — what .githooks/pre-commit runs on EVERY commit.
 #
 # Division of labour (no duplication): the agent runs `units` by hand to clear
-# the ~10 min unit suite once per change; the commit hook runs `smoke` (~2-3 min
+# the unit suite (~5 min warm test-cache / up to ~40 min cold) once per change;
+# the commit hook runs `smoke` (~2-3 min
 # pgbench) on every commit. Together that is full CI parity with each part run
 # once. `full` remains for one-shot local runs (e.g. exercising pgbench yourself
 # before committing a concurrency/executor change) — using it means the hook's
@@ -205,7 +206,10 @@ rm -rf "$DATADIR"
 
 go build -o bin/goopg ./cmd/goopg
 
-./bin/goopg init -D "$DATADIR"
+# Throwaway per-commit instance — skip the recursive durability fsync, exactly
+# as upstream pg_regress does for its temp instance (pg_regress.c: initdb
+# --no-clean --no-sync). The data dir is deleted in the EXIT trap.
+./bin/goopg init -D "$DATADIR" --no-sync
 
 # Start the server under the memory cap (AGENT.md mandates that any goopg
 # server / pgbench run go through scripts/goopg-test-run.sh on this WSL2 box;

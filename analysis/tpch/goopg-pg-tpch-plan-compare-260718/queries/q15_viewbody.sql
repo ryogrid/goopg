@@ -1,0 +1,1 @@
+select l_suppkey, sum(l_extendedprice * (1 - l_discount)) from lineitem where l_shipdate >= to_date('1996-01-01', 'YYYY-MM-DD') and l_shipdate < (to_date('1996-01-01', 'YYYY-MM-DD') + interval '3 month') group by l_suppkey

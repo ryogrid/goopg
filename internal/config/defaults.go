@@ -285,6 +285,21 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// fsync mirrors upstream's GUC of the same name (guc_tables.c: "Forces
+	// synchronization of updates to disk."): when off, every fsync/fdatasync
+	// issued for durability — the WAL commit flush, checkpoint data-file
+	// sync, CLOG/SLRU sync — is skipped. Write ordering and content are
+	// unchanged, so a process crash still recovers; only host-crash
+	// durability is forfeit. Default `on` (PG parity, GUC-defaults rule);
+	// test harnesses opt into `off` per postgresql.conf, exactly like
+	// upstream PostgreSQL::Test::Cluster. See
+	// ci/design/test-gate-speedups/02-durability-off-for-test-servers.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "fsync", Type: TypeBool, BootVal: "on",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+
 	// wal_init_zero controls whether new WAL segments are zero-
 	// filled at creation time so subsequent commit-path syncs
 	// don't pay for inode metadata updates and don't trigger

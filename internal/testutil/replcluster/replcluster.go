@@ -103,11 +103,17 @@ func New(name string, opts Options) (*ReplCluster, error) {
 		slotName = "standby_slot"
 	}
 
+	// Replication clusters are on the durability allowlist
+	// (ci/design/test-gate-speedups/02 §4): replication interacts with flush
+	// LSNs and cluster identity, so both nodes keep synced init and runtime
+	// fsync, and never init from the shared template.
 	primary, err := cluster.New(name+"-primary", cluster.Options{
 		RepoRoot:     opts.RepoRoot,
 		DataDir:      filepath.Join(baseDir, "primary"),
 		StartupWait:  opts.StartupWait,
 		ShutdownWait: opts.ShutdownWait,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replcluster: primary: %w", err)
@@ -117,6 +123,8 @@ func New(name string, opts Options) (*ReplCluster, error) {
 		DataDir:      filepath.Join(baseDir, "standby"),
 		StartupWait:  opts.StartupWait,
 		ShutdownWait: opts.ShutdownWait,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replcluster: standby: %w", err)

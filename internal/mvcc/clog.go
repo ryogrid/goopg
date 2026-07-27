@@ -72,6 +72,11 @@ type CLog struct {
 	// is set once, before the server accepts connections).
 	pool atomic.Pointer[clogBufferPool]
 
+	// fsyncDisabled mirrors `fsync = off` for mirrorToSLRUUnlocked (the
+	// pool carries its own copy — see SetFsyncDisabled). Test harnesses
+	// only.
+	fsyncDisabled atomic.Bool
+
 	// clogBuffers is the resident-page budget for pool (the transaction_buffers
 	// GUC value; 0 ⇒ auto-tune via EffectiveCLOGBuffers at creation time). Set
 	// via SetCLOGBuffers before EnablePGSLRUMirror; a no-op afterwards.
@@ -587,7 +592,11 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 	// C2-S4; production calls EnablePGSLRUMirror exactly once at startup,
 	// before the server accepts connections, and pool is an
 	// atomic.Pointer.)
-	c.pool.Store(newCLOGBufferPool(dir, EffectiveCLOGBuffers(c.clogBuffers, 0)))
+	pool := newCLOGBufferPool(dir, EffectiveCLOGBuffers(c.clogBuffers, 0))
+	// Carry an already-set fsync=off flag into the new pool so the call
+	// order of SetFsyncDisabled vs EnablePGSLRUMirror doesn't matter.
+	pool.fsyncDisabled.Store(c.fsyncDisabled.Load())
+	c.pool.Store(pool)
 	return nil
 }
 
@@ -609,6 +618,18 @@ func (c *CLog) SetCLOGBuffers(n int) {
 func (c *CLog) SetFlushWALHook(fn func(lsn uint64) error) {
 	if p := c.pool.Load(); p != nil {
 		p.SetFlushWALHook(fn)
+	}
+}
+
+// SetFsyncDisabled mirrors `fsync = off` for the CLOG store: page write-backs
+// (eviction, checkpoint FlushAll) and the SLRU mirror write still happen, but
+// their per-segment fsync is skipped. Like SetFlushWALHook, call after
+// EnablePGSLRUMirror; a nil pool is a no-op for the pool half. Test harnesses
+// only; see ci/design/test-gate-speedups/02.
+func (c *CLog) SetFsyncDisabled(disabled bool) {
+	c.fsyncDisabled.Store(disabled)
+	if p := c.pool.Load(); p != nil {
+		p.fsyncDisabled.Store(disabled)
 	}
 }
 
@@ -695,6 +716,9 @@ func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus)
 	bBuf[0] |= bits << bShift
 	if _, err := f.WriteAt(bBuf[:], byteOffset); err != nil {
 		return fmt.Errorf("clog slru: write %q@%d: %w", segPath, byteOffset, err)
+	}
+	if c.fsyncDisabled.Load() {
+		return nil
 	}
 	return f.Sync()
 }

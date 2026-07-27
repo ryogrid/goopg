@@ -65,7 +65,7 @@ func checkModeRecursive(t *testing.T, dir string, wantDir, wantFile fs.FileMode)
 // file 0640, and log_file_mode = 0640 is seeded into postgresql.conf.
 func TestInitAllowGroupAccess(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data_group")
-	if err := Init(Options{DataDir: dir, AllowGroupAccess: true}); err != nil {
+	if err := Init(Options{DataDir: dir, AllowGroupAccess: true, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	checkModeRecursive(t, dir, 0o750, 0o640)
@@ -86,7 +86,7 @@ func TestInitAllowGroupAccess(t *testing.T) {
 // PG_FILE_MODE_OWNER), and log_file_mode is left at the template default.
 func TestInitDefaultIsOwnerOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	checkModeRecursive(t, dir, 0o700, 0o600)
@@ -108,7 +108,7 @@ func TestInitAllowGroupAccessWithWALDir(t *testing.T) {
 	tmp := t.TempDir()
 	dir := filepath.Join(tmp, "data")
 	walDir := filepath.Join(tmp, "pgxlog") // non-existent: Init creates it
-	if err := Init(Options{DataDir: dir, WALDir: walDir, AllowGroupAccess: true}); err != nil {
+	if err := Init(Options{DataDir: dir, WALDir: walDir, AllowGroupAccess: true, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	// Whole tree, including the external WAL dir reached via the pg_wal

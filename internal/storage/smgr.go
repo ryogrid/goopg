@@ -144,6 +144,12 @@ type ManagerConfig struct {
 	// verification on read (whether or not the failure is fatal). The
 	// server wires this to its log / pg_stat checksum-failure counters.
 	OnChecksumFailure func(rel RelFileNode, blk BlockNumber)
+
+	// FsyncDisabled mirrors `fsync = off` (inverted so the zero value keeps
+	// the durable default): Sync/SyncAll become no-ops. Writes are
+	// unchanged; only host-crash durability is forfeit. Test harnesses
+	// only. See ci/design/test-gate-speedups/02.
+	FsyncDisabled bool
 }
 
 // NewManager constructs an empty Manager. Files open lazily on first
@@ -467,6 +473,9 @@ func (m *Manager) RelPath(rel RelFileNode) string {
 // checkpointer to make sure dirty buffers we already wrote are
 // durable before we advance the redo pointer.
 func (m *Manager) Sync(rel RelFileNode) error {
+	if m.cfg.FsyncDisabled {
+		return nil
+	}
 	if m.OnSyncWait != nil {
 		m.OnSyncWait()
 	}
@@ -489,6 +498,9 @@ func (m *Manager) Sync(rel RelFileNode) error {
 // rewind the heap to its last-fsync'd state — but the WAL had
 // already advanced its redo pointer past those records. M0089-0001.
 func (m *Manager) SyncAll() error {
+	if m.cfg.FsyncDisabled {
+		return nil
+	}
 	if m.OnSyncWait != nil {
 		m.OnSyncWait()
 	}
