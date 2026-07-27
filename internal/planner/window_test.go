@@ -63,18 +63,14 @@ func TestPlanWindowOrderByAliasUsesWindowOutput(t *testing.T) {
 	}
 }
 
-func TestPlanWindowRejectsMixedSpecs(t *testing.T) {
+func TestPlanWindowMultipleSpecs(t *testing.T) {
 	cat := pgbenchCatalog(t)
-	_, err := Plan(parseOne(t,
+	plan, err := Plan(parseOne(t,
 		"SELECT row_number() OVER (ORDER BY aid), rank() OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts"), cat)
-	if err == nil {
-		t.Fatal("expected error")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	pe, ok := err.(*PlanError)
-	if !ok {
-		t.Fatalf("err type=%T want *PlanError", err)
-	}
-	if pe.Code != "0A000" {
-		t.Fatalf("code=%s want 0A000", pe.Code)
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
 	}
 }

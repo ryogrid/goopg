@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 TPCDS_QUERY_DIR="${RUNTIME_DIR}/tpcds-data/queries"
 TPCDS_RESULTS_DIR="${RUNTIME_DIR}/tpcds-results"
@@ -27,7 +27,7 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 
 PG="psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_SUPERUSER} -d ${BENCH_DB}"
 RESULTS="${TPCDS_RESULTS_DIR}/results.txt"
-RESTART_CMD="${REPO_ROOT}/scripts/csq-bench-server.sh"
+RESTART_CMD="${REPO_ROOT}/bench/tpcds/server.sh"
 
 # ---- Prerequisites ------------------------------------------------
 pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || \

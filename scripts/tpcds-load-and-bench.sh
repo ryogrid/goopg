@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 TPCDS_TOOLS="${REPO_ROOT}/third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools"
 TPCDS_DIR="${REPO_ROOT}/third-party/tpcds-postgres"
@@ -120,7 +120,7 @@ for q in $(seq 1 99); do
     # Check for goopg crash and restart
     if ! pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1; then
         log "    goopg CRASHED! Restarting..."
-        "${REPO_ROOT}/scripts/csq-bench-server.sh" start 2>&1 | tail -1
+        "${REPO_ROOT}/bench/tpcds/server.sh" start sf1 2>&1 | tail -1
         pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || die "goopg restart failed"
     fi
 

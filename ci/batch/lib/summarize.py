@@ -419,6 +419,46 @@ def analyze(run_dir, repo_root, run_id):
         if looks_resource_killed(tpch_all_logs):
             it.resource_kills.append({"stage": "tpch", "evidence": ev("tpch/server.log")})
 
+    # ---- tpcds
+    tpcds_status = stages.get("tpcds", {}).get("status", "")
+    if tpcds_status.startswith("fail(spotcheck)"):
+        it.add_regression(
+            "tpcds/spotcheck", "TPC-DS spotcheck row-count mismatch (Q3=31, Q98=2531)",
+            "psql -h 127.0.0.1 -p 65435 -U postgres -d postgres -f bench/tpcds/runtime_goopg/tpcds-data/queries/query3.sql",
+            ev("tpcds/run.log"),
+        )
+
+    anchor_rows_tpcds = read_csv(os.path.join(repo_root, "ci/batch/tpcds-row-anchors.csv"))
+    anchors_tpcds = {
+        r["query"]: (int(r["rows"]), r.get("kind", "pinned"))
+        for r in anchor_rows_tpcds
+        if r.get("query") and r.get("rows")
+    }
+    tpcds_timings = parse_timings(os.path.join(run_dir, "tpcds", "timings.csv"))
+    for t in tpcds_timings:
+        q = t["query"]
+        repro = (
+            f"psql -h 127.0.0.1 -p 65435 -U postgres -d postgres "
+            f"-f bench/tpcds/runtime_goopg/tpcds-data/queries/{q.lower()}.sql"
+        )
+        anchor = anchors_tpcds.get(q)
+        if t["status"] == "ok" and anchor and t["rows"] is not None and t["rows"] != anchor[0]:
+            it.add_regression(
+                f"tpcds/{q}-rows",
+                f"{q} returned {t['rows']} rows, anchor is {anchor[0]} ({anchor[1]})",
+                repro, ev("tpcds/timings.csv"),
+            )
+        elif t["status"] == "error":
+            it.add_regression(f"tpcds/{q}-error", f"{q} errored during the sweep", repro, ev("tpcds/run.log"))
+        elif t["status"] == "timeout":
+            it.add_perf(f"tpcds/{q}-timeout", f"{q} hit its per-query budget (57014/cancel)", repro, ev("tpcds/run.log"))
+        elif t["status"].startswith("not-run"):
+            it.add_perf(f"tpcds/{q}-not-run", f"{q} not run: total budget exhausted", repro, ev("tpcds/timings.csv"))
+
+    tpcds_all_logs = read_file(os.path.join(run_dir, "tpcds", "run.log")) + "\n" + read_file(os.path.join(run_dir, "tpcds", "server.log"))
+    if looks_resource_killed(tpcds_all_logs):
+        it.resource_kills.append({"stage": "tpcds", "evidence": ev("tpcds/server.log")})
+
     # ---- skips / plan-drift notes
     for name, stg in sorted(stages.items()):
         if stg["status"].startswith("skip"):
@@ -459,6 +499,7 @@ def analyze(run_dir, repo_root, run_id):
         "testport": {"testport", "regress"},
         "pgbench": {"pgbench"},
         "tpch": {"tpch"},
+        "tpcds": {"tpcds"},
     }
     for name, stg in stages.items():
         if name == "summary" or not stg["status"].startswith("fail"):
@@ -487,6 +528,9 @@ def analyze(run_dir, repo_root, run_id):
         ) if pg_log else None,
         "tpch_timeouts": sum(1 for t in timings if t["status"] == "timeout"),
         "tpch_not_run": sum(1 for t in timings if t["status"].startswith("not-run")),
+        "tpcds_timeouts": sum(1 for t in tpcds_timings if t["status"] == "timeout"),
+        "tpcds_not_run": sum(1 for t in tpcds_timings if t["status"].startswith("not-run")),
+        "tpcds_ok": sum(1 for t in tpcds_timings if t["status"] == "ok"),
     }
     return it, stages, timings, spot_line, extra
 
@@ -591,6 +635,12 @@ def main():
             "total_s": total_s,
             "total_vs_baseline": round(total_s / TPCH_BASELINE_TOTAL_S, 2) if timings else None,
         },
+        "tpcds": {
+            "completed": sum(1 for t in tpcds_timings if t["status"] == "ok"),
+            "of": len(tpcds_timings),
+            "timeouts": extra["tpcds_timeouts"],
+            "not_run": extra["tpcds_not_run"],
+        },
     }
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
@@ -601,7 +651,7 @@ def main():
     md.append("")
     md.append("| stage | status | elapsed_s |")
     md.append("|-------|--------|----------:|")
-    for name in ("preflight", "units", "race", "testport", "pgbench", "tpch", "summary"):
+    for name in ("preflight", "units", "race", "testport", "pgbench", "tpch", "tpcds", "summary"):
         if name in stages:
             s = stages[name]
             md.append(f"| {name} | {s['status']} | {s['elapsed_s'] if s['elapsed_s'] is not None else ''} |")
@@ -621,6 +671,16 @@ def main():
         md.append("| query | elapsed_s | rows | status |")
         md.append("|-------|----------:|-----:|--------|")
         for t in timings:
+            md.append(
+                f"| {t['query']} | {t['elapsed_s'] if t['elapsed_s'] is not None else ''} "
+                f"| {t['rows'] if t['rows'] is not None else ''} | {t['status']} |"
+            )
+    if tpcds_timings:
+        md.append("")
+        md.append("## TPC-DS timings")
+        md.append("| query | elapsed_s | rows | status |")
+        md.append("|-------|----------:|-----:|--------|")
+        for t in tpcds_timings:
             md.append(
                 f"| {t['query']} | {t['elapsed_s'] if t['elapsed_s'] is not None else ''} "
                 f"| {t['rows'] if t['rows'] is not None else ''} | {t['status']} |"

@@ -4,10 +4,10 @@ Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations
 Q9,175,structural,any,nation x year groups (25 x 7)
 Q12,2,structural,any,GROUP BY l_shipmode IN (MAIL;SHIP) = 2 rows (spotcheck invariant)
 Q22,7,structural,any,7 country-code groups
-Q13,33,pinned,20260613,bench/tpch/spotcheck_expected.env (re-pinned 2026-06-13; load-dependent — re-pin after every reload)
-Q3,11686,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (PRE-reload dataset; informational until re-pinned)
-Q10,20412,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
-Q11,791,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
-Q16,18360,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
-Q18,9,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
-Q21,370,load-dependent,20260709,M0122-0011 live re-verification (bench/tpch/runtime_goopg/data, tmp/tpch-runner --queries=21); matches ci/logs/action-items.md's already-flagged non-blocking 20260708 notice, not a regression
+Q13,35,pinned,20260727,bench/tpch/spotcheck_expected.env (re-pinned 2026-07-27 reload; lineitem=5997241; load-dependent — re-pin after every reload)
+Q3,11521,load-dependent,20260727,tmp/tpch-runner anchor pass on the 2026-07-27 HammerDB reload (build_goopg_20260727-192854.log; tables live in PERSISTENT db tpch)
+Q10,20501,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
+Q11,819,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
+Q16,18213,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
+Q18,10,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
+Q21,405,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27; NOTE: at S-cold (per-DB ANALYZE gap - see ledger bench-reorg ANALYZE-scope) Q21 needs GC enabled: with GOGC=off-style growth under GOMEMLIMIT=18GiB it reached 19.8G RSS and drew a host-level OOM kill; at GOGC=100 + GOMEMLIMIT=12GiB it completes in ~231s

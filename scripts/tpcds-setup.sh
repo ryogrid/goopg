@@ -7,8 +7,8 @@
 # State 2 outcome:
 #   - dsdgen + dsqgen compiled
 #   - SF=1 .dat files under DSGen-software-code-3.2.0rc1/tools/
-#   - COPY-ready .tsv files under bench/tpch/runtime_goopg/tpcds-data/
-#   - PG-fixed query files under bench/tpch/runtime_goopg/tpcds-data/queries/
+#   - COPY-ready .tsv files under bench/tpcds/runtime_goopg/tpcds-data/
+#   - PG-fixed query files under bench/tpcds/runtime_goopg/tpcds-data/queries/
 #
 # Usage: scripts/tpcds-setup.sh [SCALE]
 set -euo pipefail
@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 SCALE="${1:-1}"
 TPCDS_DIR="${REPO_ROOT}/third-party/tpcds-postgres"

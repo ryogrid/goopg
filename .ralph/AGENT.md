@@ -441,6 +441,17 @@ If a GUC must NOT appear in the template (internal-only, not file-settable),
 mark it `FlagDisallowInFile` in its registration so the sync test
 recognises the exemption.
 
+## Benchmark clusters (TPC-H / TPC-DS)
+
+Two separate stacks; full port/dir table and rules in repo-root `CLAUDE.md`.
+TPC-H: `bench/tpch/` (goopg :65433, PG reference :65432, HammerDB SF=1 load —
+see `bench/tpch/README.md`). TPC-DS: `bench/tpcds/` (goopg SF=1 :65436,
+SF=0.5 gate :65437, PG reference :65438 — see `bench/tpcds/README.md`;
+lifecycle via `bench/tpcds/server.sh`). Ports 65434/65435 are reserved nightly
+ci/batch clone lanes. Row anchors (`bench/tpch/spotcheck_expected.env`,
+`ci/batch/tpch-row-anchors.csv`) are load-dependent — re-pin after any TPC-H
+reload.
+
 ## Key Learnings
 
 - Go module path is `github.com/goopg/goopg` (placeholder; rename if a real

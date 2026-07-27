@@ -111,7 +111,12 @@ Consequences for the design:
 Reserved lanes already in use on this host (survey doc 03): 5432 (make
 start/CI), 5433/5434 (pgbench-compare), 5533/5534 (perf), 5535+ (precommit
 probes upward), 65433 (TPC-H bench / loop spotcheck), 65434 (nightly TPC-H
-clone), 15435 (regress runner).
+clone), 65435 (nightly TPC-DS clone), 65436 (TPC-DS goopg SF=1,
+`bench/tpcds/runtime_goopg/data`), 65437 (TPC-DS goopg SF=0.5 regression
+gate), 65438 (TPC-DS PostgreSQL reference, `bench/tpcds/runtime/pgdata`),
+15435 (regress runner). Full cross-benchmark map: repo-root `CLAUDE.md`.
+(2026-07-27: TPC-DS moved to `bench/tpcds/`; the SF0.5 gate previously
+defaulted to 65434 and collided with the nightly TPC-H lane — fixed.)
 
 Batch policy:
 

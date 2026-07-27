@@ -4,7 +4,7 @@
 #
 # Single entrypoint (also `make nightly-batch`). Stage flow:
 #   S0 preflight -> S1 [Lane L: units,race | Lane H: testport,pgbench] (parallel)
-#   -> barrier -> S2 tpch (solo) -> S3 summary.
+#   -> barrier -> S2 tpch (solo) -> S3 tpcds (solo) -> S4 summary.
 #
 # Exit codes (normative, ci/design/04 §D): 0 pass, 2 fail, 3 inconclusive,
 # 4 aborted, 5 run lock already held.
@@ -21,7 +21,7 @@ export REPO_ROOT
 export NIGHTLY_GO_P="${NIGHTLY_GO_P:-4}"
 export NIGHTLY_PORT_WAIT="${NIGHTLY_PORT_WAIT:-900}"
 NIGHTLY_KEEP="${NIGHTLY_KEEP:-14}"
-NIGHTLY_STAGES="${NIGHTLY_STAGES:-preflight,units,race,testport,pgbench,tpch,summary}"
+NIGHTLY_STAGES="${NIGHTLY_STAGES:-preflight,units,race,testport,pgbench,tpch,tpcds,summary}"
 
 # --- run lock (fd 8): manual + scheduled firings never overlap (design 06 §C)
 LOCK_DIR="${HOME}/.ralph/locks"; mkdir -p "${LOCK_DIR}"
@@ -96,7 +96,7 @@ abort_cleanup() {
         # Kill the lane subshells and any in-flight stage FIRST — otherwise a
         # lane would keep starting new stages after the scopes are stopped.
         kill_tree ${LANE_PIDS} ${CUR_STAGE_PID}
-        for u in goopg-nightly-units goopg-nightly-race goopg-nightly-testport goopg-nightly-pgbench goopg-nightly-tpch; do
+        for u in goopg-nightly-units goopg-nightly-race goopg-nightly-testport goopg-nightly-pgbench goopg-nightly-tpch goopg-nightly-tpcds; do
             stop_scope "${u}"
         done
         # Minimal machine record so an aborted run is still accounted for.
@@ -215,9 +215,14 @@ if [[ ${build_failed} -eq 0 ]]; then
     if want tpch; then
         run_stage tpch || true
     fi
+
+    # --- S3: TPC-DS solo --------------------------------------------------------
+    if want tpcds; then
+        run_stage tpcds || true
+    fi
 fi
 
-# --- S3: summary (its exit code is the batch verdict) -----------------------------
+# --- S4: summary (its exit code is the batch verdict) -----------------------------
 final_rc=0
 if want summary; then
     run_stage summary || final_rc=$?

@@ -2524,8 +2524,20 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	if isSqrt {
 		// For stddev, compute sqrt via high-precision float.
 		f64, _ := rat.Float64()
-		if f64 < 0 {
-			f64 = 0
+		if f64 <= 0 {
+			// Variance is exactly 0 (all inputs equal) or negative due to
+			// floating-point artifacts: stddev = 0, matching PostgreSQL.
+			//
+			// Without this guard the Newton seed below is sqrt(0) = 0 and the
+			// first iteration computes big.Float Quo(0, 0), which PANICS
+			// ("division of zero by zero"). The panic escaped to serveConn and
+			// dropped the connection — TPC-DS Q39's stddev_samp over a
+			// (warehouse, item, month) inventory group whose quantity never
+			// changes hit it on every run (the long-unexplained RC-4
+			// "connection lost"). The numeric sibling exactNumericVariance
+			// already had exactly this guard; the int path had lost it —
+			// sibling paths must agree.
+			return NewStringDatum("0")
 		}
 		// Newton-Raphson sqrt with 128-bit precision.
 		prec := uint(128)
@@ -2533,6 +2545,9 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
 		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
 		for i := 0; i < 15; i++ {
+			if seed.Sign() == 0 {
+				break
+			}
 			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
 			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
 		}
@@ -3161,8 +3176,14 @@ func drainRows(op Operator) ([]Row, error) {
 // copies the arena bytes into owned []byte. Without this, the build-
 // side hash tables would alias the source operator's per-page arena
 // pages — invalidated on the next arena.Reset() (typically per-page
-// in seqScan, per-Rescan in indexScan). The fast path
-// (rowHasArena=false) preserves the legacy O(width) struct copy.
+// in seqScan, per-Rescan in indexScan).
+//
+// Always copies the row slice and materializes arena-backed Datums before
+// appending.  Producers (SeqScan, CTEScan, etc.) may reuse the same slot
+// and row buffer across Next() calls, so the row slice must be independently
+// owned.  MaterializeArena detaches arena-backed Datums onto fresh Buf
+// allocations; the slice copy ensures non-arena Datums are safely owned too.
+// (M0097-0058 CTE-left cross join fix.)
 func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
 	n := 0
@@ -3180,29 +3201,23 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			return nil, err
 		}
 		row := slotRow(slot)
-		var dup Row
+		// Always make an independent copy: clone the slice AND
+		// materialize any arena-backed Datums so each entry stays
+		// valid regardless of the producer's slot reuse or arena
+		// reset.  (M0097-0058 CTE-left cross join fix.)
+		// Always make an independent copy: clone the slice AND materialize
+		// any arena-backed Datums so each entry stays valid regardless of
+		// the producer's slot reuse or arena reset.
+		dup := make(Row, len(row))
+		copy(dup, row)
 		if rowHasArena(row) {
-			dup = cloneRowOwned(row)
-		} else {
-			// Row is already fully owned (all arena bytes materialized,
-			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
-			// The row was independently allocated via acquireRow; appending
-			// directly is safe because the producer allocates a fresh row
-			// on the next call.  Eliminates a redundant O(width) copy.
-			// See docs/design/tpch-round5-fixes/04.
-			dup = row
+			dup = cloneRowOwned(dup)
 		}
 		rows = append(rows, dup)
 		n++
 	}
 }
 
-// drainRowsCtxCTID drains op like drainRowsCtx and additionally captures the
-// currentTID from scanLeaf (if non-nil) after each yielded slot, returning a
-// parallel ctid slice. Callers must call op.Open before this and must not call
-// op.Close after (the drain loop reaches EOF naturally). Used by eager NL join
-// to preserve left-side heap ctids through the drain so lockRowsOp can stamp
-// tuple locks after the scan has been closed (M0100-0010).
 func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([]Row, []joinRowCTID, error) {
 	rows := make([]Row, 0)
 	var ctids []joinRowCTID
@@ -3224,17 +3239,11 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 			return nil, nil, err
 		}
 		row := slotRow(slot)
-		var dup Row
+		// Always make an independent copy (see drainRowsCtx above).
+		dup := make(Row, len(row))
+		copy(dup, row)
 		if rowHasArena(row) {
-			dup = cloneRowOwned(row)
-		} else {
-			// Row is already fully owned (all arena bytes materialized,
-			// e.g. by seqScanOp's cloneRowOwned before page-RLock release).
-			// The row was independently allocated via acquireRow; appending
-			// directly is safe because the producer allocates a fresh row
-			// on the next call.  Eliminates a redundant O(width) copy.
-			// See docs/design/tpch-round5-fixes/04.
-			dup = row
+			dup = cloneRowOwned(dup)
 		}
 		rows = append(rows, dup)
 		if scanLeaf != nil {
@@ -3244,6 +3253,8 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 		n++
 	}
 }
+
+// drainRowsCtxCTID drains op like drainRowsCtx and additionally captures the
 
 func concatRows(a, b Row) Row {
 	out := make(Row, 0, len(a)+len(b))

@@ -366,6 +366,30 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", cref.Name, cref.Index, vs.Width())}
 			}
 		}
+		// Catch-all bounds check. The two guards above cover only
+		// rowSlotView and *VirtualSlot; *MaterializedSlot (slot.go
+		// Get is a bare `s.row[col]`) and *Slot were unchecked, so a
+		// stale planner index panicked raw instead of raising an
+		// error. That panic surfaced during the hash-join build-side
+		// drain, which gatherOp.Open runs in the LEADER goroutine —
+		// outside ParallelGroup.Go's recover — so it escaped to
+		// serveConn, which logs and closes the socket. The client saw
+		// "connection lost" and the harness restarted the server
+		// (TPC-DS Q8: "index out of range [57] with length 1").
+		// PostgreSQL's contract is that an ERROR kills the statement,
+		// not the backend. SlotView itself carries only Get/IsNull, so
+		// the check is written per concrete type rather than widening
+		// the interface on this hot path.
+		if ms, ok := slot.(*MaterializedSlot); ok {
+			if w := ms.Width(); cref.Index < 0 || cref.Index >= w {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of MaterializedSlot range %d", cref.Name, cref.Index, w)}
+			}
+		}
+		if sl, ok := slot.(*Slot); ok {
+			if w := sl.Width(); cref.Index < 0 || cref.Index >= w {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of Slot range %d", cref.Name, cref.Index, w)}
+			}
+		}
 		return slot.Get(cref.Index), nil
 	}
 	switch x := e.(type) {
@@ -1423,6 +1447,16 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		if left.Kind == KindInterval && right.Kind == KindInterval {
 			return addIntervalInterval(left, right, op == parser.OpSub, pos)
 		}
+		// date ± integer → date (days arithmetic).
+		// Mirrors upstream date_pli / date_mi: the integer operand is
+		// treated as a day count.  Requires the left datum to carry
+		// flagDate (a bare timestamp+int would be ambiguous).
+		if left.Kind == KindTime && left.Flags&flagDate != 0 && right.Kind == KindInt {
+			return addDateTimeInt(left, right, op == parser.OpSub, pos)
+		}
+		if op == parser.OpAdd && left.Kind == KindInt && right.Kind == KindTime && right.Flags&flagDate != 0 {
+			return addDateTimeInt(right, left, false, pos)
+		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
 		// scale-aligning helpers.  Also try to parse string
@@ -1910,6 +1944,22 @@ func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
 		return false, err
 	}
 	return re.MatchString(s), nil
+}
+
+// addDateTimeInt adds or subtracts an integer number of days to a DATE
+// datum.  It mirrors upstream date_pli / date_mi: the integer is interpreted
+// as a day count, and the result is a DATE.  ∞-day spans are not supported
+// (PG rejects infinity date arithmetic).
+func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
+	if dt.IsTimestampNotFinite() {
+		return NullDatum, timestampOutOfRange(pos)
+	}
+	t := time.Unix(0, dt.Int).UTC()
+	n := int(days.Int)
+	if subtract {
+		n = -n
+	}
+	return NewDateDatum(t.AddDate(0, 0, n)), nil
 }
 
 // addTimeInterval applies an interval to a time value. When
@@ -7586,6 +7636,29 @@ func compareEq(a, b Datum) (Datum, error) {
 		return NewBoolDatum(a.StringValue() == string(b.Buf)), nil
 	case a.Kind == KindEnum && b.Kind == KindEnum:
 		return NewBoolDatum(a.Int == b.Int), nil
+	}
+	// Cross-kind fallback: exactly one side is an unknown-typed string
+	// literal. PostgreSQL resolves an IN list at parse time
+	// (parse_expr.c transformAExprIn → select_common_type →
+	// coerce_to_common_type), so `d_date IN ('2001-07-13')` compares
+	// date-to-date. goopg types a bare StringConst as `unknown` and
+	// resolves coercion at runtime instead (design doc
+	// root-0019-unknown-literal-coercion.md), so the coercion has to
+	// happen here. Without it `d_date IN ('2001-07-13')` fell through to
+	// the not-equal return below while the equivalent
+	// `d_date = '2001-07-13'` matched — the `=` path reaches
+	// compareDatum → promoteCrossKind → tryParseStringAs, which parses
+	// the literal, and compareEq bypassed all of it (TPC-DS Q83).
+	//
+	// Delegating to compareDatum reuses exactly that promotion. As in
+	// the NUMERIC arm above, an incompatible pair is not-equal rather
+	// than an error, which is what IN-list semantics want.
+	if aIsString != bIsString {
+		cmp, err := compareDatum(a, b, 0)
+		if err != nil {
+			return NewBoolDatum(false), nil
+		}
+		return NewBoolDatum(cmp == 0), nil
 	}
 	return NewBoolDatum(false), nil
 }

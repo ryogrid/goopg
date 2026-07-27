@@ -1369,28 +1369,21 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 	}
 	if isSubqueryStart {
 		pos := p.cur().Pos
-		// Consume ALL leading '(' tokens so that ((SELECT ...)) is handled
-		// as well as the simple (SELECT ...) case. Track depth to match the
-		// right number of closing ')' after the subquery. M0097-0055.
-		depth := 0
-		for p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-			p.advance()
-			depth++
-		}
+		// Use parseParenthesisedSelectStmt which correctly handles:
+		//   (SELECT ...)                        — simple derived table
+		//   (((SELECT ...)))                    — multi-wrapped
+		//   ((SELECT ...) EXCEPT (SELECT ...))  — parenthesised set-ops
+		// It consumes the leading '(' and the matching ')' plus any
+		// trailing UNION/INTERSECT/EXCEPT chain, so we never need the
+		// old depth-counter approach that broke on set-ops in FROM.
 		// SELECT … INTO is not permitted in a derived-table subquery (M0097-0020).
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
 		p.selectIntoNoPos = false
-		inner, err := p.parseSelect()
+		inner, err := p.parseParenthesisedSelectStmt()
 		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 		if err != nil {
 			return RangeVar{}, err
-		}
-		// Consume all matching closing parens.
-		for i := 0; i < depth; i++ {
-			if !p.acceptSymbol(")") {
-				return RangeVar{}, p.errAtCur("expected ')' after subquery in FROM")
-			}
 		}
 		sel, ok := inner.(*SelectStmt)
 		if !ok {
@@ -1647,10 +1640,15 @@ func isAliasStart(t Token) bool {
 		KwUnion, KwIntersect, KwExcept:
 		return false
 	}
-	// Conservative: don't treat keywords as aliases unless we know
-	// they're harmless. Upstream's "unreserved keyword" list is more
-	// permissive; we tighten it here and let the analyzer relax later.
-	return false
+		// Conservative: don't treat keywords as aliases unless we know
+		// they're harmless. Upstream's "unreserved keyword" list is more
+		// permissive; we tighten it here and let the analyzer relax later.
+		// KwReturns is allowed so that TPC-DS queries using "returns"
+		// as a column alias (e.g. coalesce(returns, 0) returns) parse.
+		if t.Keyword == KwReturns {
+			return true
+		}
+		return false
 }
 
 func (p *parser) parseSortList() ([]SortBy, error) {

@@ -2179,6 +2179,16 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 	case *InExpr:
 		// Remap the probe operand; do NOT remap the inner Plan (already remapped).
 		remapByPosMap(&x.Operand, posMap)
+		// The literal in-list (`col IN (a, b, c)`) can hold ColumnRefs,
+		// and Args are the PARAM_EXEC-style argument expressions
+		// evaluated against the CURRENT outer row — both are in the
+		// same coordinate space as Operand and were previously skipped.
+		for i := range x.List {
+			remapByPosMap(&x.List[i], posMap)
+		}
+		for i := range x.Args {
+			remapByPosMap(&x.Args[i], posMap)
+		}
 	case *CaseExpr:
 		if x.Operand != nil {
 			remapByPosMap(&x.Operand, posMap)
@@ -2205,10 +2215,47 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 		// l_suppkey was meant, producing a numeric-cast error on
 		// text).
 		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+		for i := range x.Args {
+			remapByPosMap(&x.Args[i], posMap)
+		}
 	case *SubqueryExpr:
 		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+		for i := range x.Args {
+			remapByPosMap(&x.Args[i], posMap)
+		}
 	case *ArraySubqueryExpr:
 		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	// The arms below were missing entirely, which is the RC-1a defect:
+	// an unenumerated container is a SILENT no-op here, so its inner
+	// ColumnRef keeps its pre-rewrite (FROM-order) index while the rest
+	// of the predicate is remapped into MHJ-output coordinates. The
+	// predicate then reads a different table's column. For TPC-DS Q76
+	// (`WHERE ss_customer_sk IS NULL`) index 3 survived the remap and
+	// evaluated IS NULL against a date_dim column that is never NULL,
+	// so the query returned 0 rows instead of 100. The same hole reaches
+	// Q72 one level deeper, through `sum(case when p_promo_sk is null
+	// …)`. See docs/design/tpcds-round2-fixes/README.md §2.
+	case *IsNullExpr:
+		remapByPosMap(&x.Operand, posMap)
+	case *IsBoolExpr:
+		remapByPosMap(&x.Operand, posMap)
+	case *IsDistinctFromExpr:
+		remapByPosMap(&x.Left, posMap)
+		remapByPosMap(&x.Right, posMap)
+	case *CollateExpr:
+		remapByPosMap(&x.Operand, posMap)
+	case *RowExpr:
+		for i := range x.Elems {
+			remapByPosMap(&x.Elems[i], posMap)
+		}
+	case *MultiAssignSubqRow:
+		// Plan is a Node, not an Expr — an inner scope, handled the
+		// same way as SubqueryExpr.
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	case *MultiAssignSubqElem:
+		if x.Row != nil {
+			remapOuterRefsInSubplan(x.Row.Plan, 1, posMap)
+		}
 	}
 }
 
@@ -2324,6 +2371,10 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 	}
 	var entries []scanEntry
 	var off int
+	// declined is set by collect's default arm when it meets a node kind
+	// it cannot classify; see the comment there. Once set, the whole
+	// remap is abandoned rather than applied with a wrong offset.
+	var declined bool
 	var collect func(Node)
 	collect = func(n Node) {
 		if n == nil {
@@ -2384,6 +2435,16 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
 			// Advance off by the output width so sibling scans stay aligned.
 			off += len(x.Output())
+		case *CTEScan:
+			// CTE Scan (WITH query) contributes its output columns to the
+			// join-tree schema.  Advance off so sibling scans get the
+			// correct scanMap offset; without this, aggregate arguments and
+			// GROUP BY expressions referencing columns to the right of a
+			// CTE are remapped to the wrong indices.  (M0097-0058)
+			off += len(x.Output())
+		case *MaterializedCTEScan:
+			// DML CTE — same offset-advance requirement as CTEScan above.
+			off += len(x.Output())
 		case *FromUnnest, *GenerateSeries, *GenerateSubscripts,
 			*UserSrfScan, *ScalarFuncScan, *PgPartitionTree, *PgOptionsToTable,
 			*PgInputErrorInfo, *PgGetPublicationTables,
@@ -2401,10 +2462,53 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			// columns need no remap: the posMap returns oldIdx unchanged
 			// for bindings absent from scanMap.
 			off += len(x.Output())
+
+		// --- RC-2 (TPC-DS Q8): opaque leaves that were missing entirely.
+		// Each of these contributes output columns to the join-tree
+		// schema but carries no scanKey. Without an arm, `off` is not
+		// advanced and EVERY scan to their right gets an offset that is
+		// too low, so ColumnRef indices are remapped into another
+		// table's columns. For a set operation inside a FROM subquery
+		// that produced `index out of range [57] with length 1` in
+		// MaterializedSlot.Get, via the hash-join build-side drain that
+		// gatherOp.Open runs in the leader (see
+		// docs/design/tpcds-round2-fixes/README.md §4).
+		//
+		// WindowAgg belongs here, NOT in the descend set: it APPENDS
+		// window-function columns to its child's output, so descending
+		// would leave right-hand scans short by exactly that many
+		// columns — the identical defect SetOp has today.
+		case *SetOp, *RecursiveUnion, *WorkTableScan, *WindowAgg,
+			*ProjectSet, *OrdinalityWrap, *RowsFrom, *IndexOnlyScan:
+			off += len(x.Output())
+
+		// --- Pass-through nodes: schema is exactly the child's, so
+		// descend without advancing.
+		case *Distinct:
+			collect(x.Child)
+		case *DistinctOn:
+			collect(x.Child)
+		case *Limit:
+			collect(x.Child)
+		case *LockRows:
+			collect(x.Child)
+		case *Memoize:
+			collect(x.Child)
+
+		default:
+			// RC-2: an unhandled node used to fall through silently,
+			// leaving `off` un-advanced — a wrong answer or an
+			// out-of-range panic, unconditionally. Declining the whole
+			// remap instead is the safe direction: an unremapped tree is
+			// only wrong when a reorder actually happened, whereas a
+			// mis-advanced offset is always wrong. All three callers
+			// (remapWithBindings, remapTopProjection,
+			// remapAggExprsWithBindings) already nil-check the result.
+			declined = true
 		}
 	}
 	collect(node)
-	if len(entries) == 0 {
+	if declined || len(entries) == 0 {
 		return nil
 	}
 

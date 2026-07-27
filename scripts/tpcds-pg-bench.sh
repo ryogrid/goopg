@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 QDIR="${RUNTIME_DIR}/tpcds-data/queries"
 RDIR="${RUNTIME_DIR}/tpcds-results"
 RF="${RDIR}/pg_results.txt"
 TO="${1:-120}"
-PG_P="${PG_PREFIX}/bin/psql -h 127.0.0.1 -p 65432 -U ryo -d tpcds"
+PG_P="${PG_PREFIX}/bin/psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${TPCDS_PG_DB}"
 
 mkdir -p "${RDIR}"
 echo "# TPC-DS SF=1 on PG 18.3 — $(date -Iseconds)" > "${RF}"

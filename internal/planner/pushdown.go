@@ -93,6 +93,17 @@ func collectScanOutputNames(n Node, names map[string]bool) {
 		for _, c := range x.Output() {
 			names[c.Name] = true
 		}
+	case *CTEScan:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
+		// Recurse into the inlined CTE body so columns from the
+		// underlying plan (scan/project/etc.) are also visible.
+		collectScanOutputNames(x.Child, names)
+	case *MaterializedCTEScan:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
 	}
 }
 
@@ -220,6 +231,16 @@ func pushOneConjunct(node Node, c Expr) bool {
 		return false
 	}
 	if j.Type == JoinTypeCross {
+		// M0097-0058: when either side contains a set operation
+		// (SetOp/RecursiveUnion), skip promotion to Inner Join.
+		// The column indices in the predicate were resolved against
+		// the global FROM-clause schema and do not match the
+		// subquery's narrow output schema, causing index-out-of-
+		// bounds panics when the executor drains the build side
+		// (e.g. TPC-DS Q8: INTERSECT in FROM subquery).
+		if containsSetOp(j.Left) || containsSetOp(j.Right) {
+			return false // predicate stays in the outer Filter
+		}
 		// Predicate spans both sides — promote the Join.
 		j.Type = JoinTypeInner
 		j.Predicate = c
@@ -237,23 +258,28 @@ func pushOneConjunct(node Node, c Expr) bool {
 		if okSplit {
 			j.LeftKey = lk
 			j.RightKey = rk
-			j.Algo = JoinAlgoHash
-			lRows := EstimateRows(j.Left)
-			rRows := EstimateRows(j.Right)
-			if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
-				j.Algo = algo
-			}
-			if j.Algo == JoinAlgoHash {
-				if lRows > 0 && rRows > 0 && lRows < rRows {
-					j.BuildLeft = true
+			// M0097-0058: skip hash-join when a set-operation
+			// subquery is on either side (column-index mismatch
+			// crash, e.g. TPC-DS Q8 INTERSECT in FROM subquery).
+			if !containsSetOp(j.Left) && !containsSetOp(j.Right) {
+				j.Algo = JoinAlgoHash
+				lRows := EstimateRows(j.Left)
+				rRows := EstimateRows(j.Right)
+				if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+					j.Algo = algo
 				}
-				// M0054-0010: small-dimension override.
-				leftSmall := IsSmallDimensionSide(j.Left)
-				rightSmall := IsSmallDimensionSide(j.Right)
-				if leftSmall && !rightSmall {
-					j.BuildLeft = true
-				} else if rightSmall && !leftSmall {
-					j.BuildLeft = false
+				if j.Algo == JoinAlgoHash {
+					if lRows > 0 && rRows > 0 && lRows < rRows {
+						j.BuildLeft = true
+					}
+					// M0054-0010: small-dimension override.
+					leftSmall := IsSmallDimensionSide(j.Left)
+					rightSmall := IsSmallDimensionSide(j.Right)
+					if leftSmall && !rightSmall {
+						j.BuildLeft = true
+					} else if rightSmall && !leftSmall {
+						j.BuildLeft = false
+					}
 				}
 			}
 		}

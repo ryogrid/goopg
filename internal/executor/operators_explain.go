@@ -747,6 +747,82 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"
 	case *planner.InExpr:
 		return formatInExprPG(x, reg)
+	case *planner.IsNullExpr:
+		// ruleutils.c get_rule_expr, T_NullTest.
+		if x.Negated {
+			return "(" + formatExprPGReg(x.Operand, reg) + " IS NOT NULL)"
+		}
+		return "(" + formatExprPGReg(x.Operand, reg) + " IS NULL)"
+	case *planner.IsBoolExpr:
+		// T_BooleanTest. TestTrue/TestFalse both false means IS UNKNOWN
+		// (see evalExprSlot's IsBoolExpr arm).
+		what := "UNKNOWN"
+		if x.TestTrue {
+			what = "TRUE"
+		} else if x.TestFalse {
+			what = "FALSE"
+		}
+		not := ""
+		if x.Negated {
+			not = "NOT "
+		}
+		return "(" + formatExprPGReg(x.Operand, reg) + " IS " + not + what + ")"
+	case *planner.IsDistinctFromExpr:
+		op := " IS DISTINCT FROM "
+		if x.Negated {
+			op = " IS NOT DISTINCT FROM "
+		}
+		return "(" + formatExprPGReg(x.Left, reg) + op + formatExprPGReg(x.Right, reg) + ")"
+	case *planner.CaseExpr:
+		// T_CaseExpr. Simple form keeps the operand after CASE.
+		var b strings.Builder
+		b.WriteString("CASE")
+		if x.Operand != nil {
+			b.WriteString(" ")
+			b.WriteString(formatExprPGReg(x.Operand, reg))
+		}
+		for _, w := range x.Whens {
+			b.WriteString(" WHEN ")
+			b.WriteString(formatExprPGReg(w.When, reg))
+			b.WriteString(" THEN ")
+			b.WriteString(formatExprPGReg(w.Then, reg))
+		}
+		if x.Else != nil {
+			b.WriteString(" ELSE ")
+			b.WriteString(formatExprPGReg(x.Else, reg))
+		}
+		b.WriteString(" END")
+		return b.String()
+	case *planner.ExtractExpr:
+		return "EXTRACT(" + x.Field + " FROM " + formatExprPGReg(x.Source, reg) + ")"
+	case *planner.CollateExpr:
+		return "(" + formatExprPGReg(x.Operand, reg) + " COLLATE " + x.CollationName + ")"
+	case *planner.RowExpr:
+		elems := make([]string, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = formatExprPGReg(el, reg)
+		}
+		return "ROW(" + strings.Join(elems, ", ") + ")"
+	case *planner.TableOidExpr:
+		return "tableoid"
+	case *planner.CTIDExpr:
+		return "ctid"
+	case *planner.MergeActionExpr:
+		return "merge_action()"
+	case *planner.MergeWholeRowRef:
+		if x.IsOld {
+			return "old"
+		}
+		return "new"
+	case *planner.MultiAssignSubqRow:
+		// Multi-assignment sublink (`SET (a,b) = (SELECT …)`); the row
+		// itself is the subplan reference.
+		return "(" + subPlanName(reg, x, x.Plan) + ")"
+	case *planner.MultiAssignSubqElem:
+		// One column of the multi-assignment row. PG renders these as
+		// PARAM_EXEC slots; goopg has no slot number here, so name the
+		// owning subplan and the 1-based column.
+		return formatExprPGReg(x.Row, reg) + fmt.Sprintf(".%d", x.ColIdx+1)
 	}
 	return fmt.Sprintf("<%T>", e)
 }

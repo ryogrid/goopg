@@ -206,9 +206,15 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 		row[tgtOrd] = src[srcIdx]
 	}
 	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
-	if err := writeHeapRow(c.ctx, rel, c.cols, row); err != nil {
+	ptr, err := writeHeapRowReturning(c.ctx, rel, c.cols, row)
+	if err != nil {
 		return err
 	}
+	// M0097-0058: maintain btree indexes for COPY-loaded rows.
+	// writeHeapRow only inserts the heap tuple; unique/primary-key
+	// indexes must be updated separately, otherwise index scans
+	// return zero rows for COPY-loaded data.
+	maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
 	c.rowsIn++
 	return nil
 }
@@ -253,9 +259,11 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 			row[tgtOrd] = src[srcIdx]
 		}
 		rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
-		if writeErr := writeHeapRow(c.ctx, rel, c.cols, row); writeErr != nil {
+		ptr, writeErr := writeHeapRowReturning(c.ctx, rel, c.cols, row)
+		if writeErr != nil {
 			return false, writeErr
 		}
+		maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
 		c.rowsIn++
 	}
 	return trailerFound, nil

@@ -2064,6 +2064,22 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			}
 			jn.LeftKey = lk
 			jn.RightKey = rk
+			// M0097-0058: skip hash-join for subquery-derived sides.
+			// When a FROM-clause subquery (containing INTERSECT,
+			// EXCEPT, or other non-scan children) is on either side
+			// of a join, the column indices stored in the join-key
+			// ColumnRefs refer to the global FROM-clause schema
+			// rather than the subquery's own output.  Converting
+			// such a join to a hash join places a projection on
+			// the build side that references the wrong columns,
+			// causing an index-out-of-bounds panic at execution
+			// time (e.g. TPC-DS Q8: INTERSECT in a FROM subquery
+			// joined with three base tables).
+			if containsSetOp(jn.Left) || containsSetOp(jn.Right) {
+				// Keep the join as nested-loop; the planner
+				// will re-evaluate at plan-finalisation time
+				// when bindings are rebuilt.
+			} else {
 			switch jn.Type {
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
@@ -2090,6 +2106,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 				}
 			}
 		}
+		} // close else from allLeavesAreTableScans guard
 		leftNode = jn
 		leftCtx = mergedCtx
 	}
@@ -2370,6 +2387,107 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
+// remapSubqueryColumnRefs walks the plan tree rooted at n and rewrites every
+// Project node so that its targets are position-based ColumnRefs (indices
+// 0..N-1) relative to the Project's own child output schema.  The original
+// output schema (column names and types) is preserved; only the ColumnRef
+// indices are rebuilt.
+//
+// This is a safety-normalisation pass applied after planning a FROM-clause
+// subquery: if outer resolve-context leakage caused the sub-SELECT's Project
+// to reference columns by their global FROM-clause index rather than by the
+// subquery's own output index, this pass corrects those indices before the
+// executor ever sees them.
+func remapSubqueryColumnRefs(n Node) Node {
+	if n == nil {
+		return nil
+	}
+	switch x := n.(type) {
+	case *Project:
+		// Recurse into child first.
+		x.Child = remapSubqueryColumnRefs(x.Child)
+		childSchema := x.Child.Output()
+		// Rebuild every target as a position-based ColumnRef.
+		newTargets := make([]Expr, len(x.Targets))
+		for i, t := range x.Targets {
+			// If target is a simple ColumnRef, replace with
+			// position-based index from child schema.
+			if cr, ok := t.(*ColumnRef); ok {
+				// Find matching column in child output by name.
+				found := false
+				for j, sc := range childSchema {
+					if strings.EqualFold(cr.Name, sc.Name) {
+						clone := *cr
+						clone.Index = j
+						newTargets[i] = &clone
+						found = true
+						break
+					}
+				}
+				if !found {
+					newTargets[i] = t // keep as-is
+				}
+			} else {
+				newTargets[i] = t // keep non-ColumnRef expressions
+			}
+		}
+		x.Targets = newTargets
+		return x
+
+	case *Join:
+		x.Left = remapSubqueryColumnRefs(x.Left)
+		x.Right = remapSubqueryColumnRefs(x.Right)
+	case *Filter:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Sort:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Aggregate:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *Limit:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	case *SetOp:
+		x.Left = remapSubqueryColumnRefs(x.Left)
+		x.Right = remapSubqueryColumnRefs(x.Right)
+	case *Gather:
+		x.Child = remapSubqueryColumnRefs(x.Child)
+	}
+	return n
+}
+
+
+// containsSetOp reports whether the plan subtree rooted at n contains
+// a SetOp or RecursiveUnion node.  Hash-join conversion must be skipped
+// when a join side contains a set operation because the column indices
+// in join-key ColumnRefs were resolved against the global FROM-clause
+// schema and do not match the SetOp's narrow output schema.
+func containsSetOp(n Node) bool {
+	if _, ok := n.(*SetOp); ok {
+		return true
+	}
+	if _, ok := n.(*RecursiveUnion); ok {
+		return true
+	}
+	if j, ok := n.(*Join); ok {
+		return containsSetOp(j.Left) || containsSetOp(j.Right)
+	}
+	if f, ok := n.(*Filter); ok {
+		return containsSetOp(f.Child)
+	}
+	if p, ok := n.(*Project); ok {
+		return containsSetOp(p.Child)
+	}
+	if s, ok := n.(*Sort); ok {
+		return containsSetOp(s.Child)
+	}
+	if a, ok := n.(*Aggregate); ok {
+		return containsSetOp(a.Child)
+	}
+	if l, ok := n.(*Limit); ok {
+		return containsSetOp(l.Child)
+	}
+	return false
+}
+
 
 // collectInheritanceDescendants performs a breadth-first traversal of the
 // inheritance tree rooted at parentOID and returns all descendants in BFS
@@ -2980,6 +3098,15 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		}
 		return nil, rangeBinding{}, err
 	}
+	// M0097-0058: remap ColumnRef indices in all Project nodes within the
+	// subquery plan to use position-based indices (0..N-1) relative to each
+	// Project's own child output.  This normalises away any column-index
+	// corruption from outer resolve-context leakage during sub-SELECT
+	// planning — without this, a non-lateral subquery's Project may
+	// reference columns by their global FROM-clause index (e.g. 57)
+	// instead of by the subquery's own output index (e.g. 0), causing an
+	// index-out-of-bounds crash at execution time.
+	inner = remapSubqueryColumnRefs(inner)
 	innerSchema := inner.Output()
 	// Use the inner plan's output schema as the source of truth for the
 	// derived table's columns: it already accounts for star-expansion
@@ -4849,11 +4976,20 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 		}
 		return expr
 	}
-	// Alias: bare ColumnRef whose Column matches a target's Alias.
+	// Alias: bare ColumnRef whose Column matches a target's Alias
+	// or, when no explicit AS is given, the derived output column name
+	// (e.g. ORDER BY item_id matches SELECT ss_items.item_id).
 	if cr, ok := expr.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
 		for _, tgt := range targets {
 			if tgt.Alias != "" && strings.EqualFold(tgt.Alias, cr.Column) {
 				return tgt.Expr
+			}
+		}
+		for _, tgt := range targets {
+			if tgt.Alias == "" {
+				if derived := deriveSubqueryTargetName(tgt.Expr); derived != "" && strings.EqualFold(derived, cr.Column) {
+					return tgt.Expr
+				}
 			}
 		}
 	}
@@ -5168,65 +5304,92 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		return child, inputCtx, nil, nil
 	}
 
-	firstSpec := windowSpecKey(calls[0].Over)
-	for i := 1; i < len(calls); i++ {
-		if windowSpecKey(calls[i].Over) != firstSpec {
-			return nil, nil, nil, &PlanError{Pos: calls[i].Pos(), Code: "0A000", Message: "multiple window specifications are not supported in v0 planner"}
-		}
+	// Group calls by distinct window specification (PartitionBy + OrderBy + Frame).
+	// Each group becomes its own WindowAgg node, chained so the output of one
+	// feeds the input of the next — downstream window functions can reference
+	// earlier window-function results, matching PG semantics.
+	type specGroup struct {
+		key   string
+		calls []*parser.FuncCall
 	}
-
-	partition := make([]Expr, 0, len(calls[0].Over.PartitionBy))
-	for _, p := range calls[0].Over.PartitionBy {
-		r, err := resolveExprForWindowInput(p, inputCtx, agg)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		partition = append(partition, r)
-	}
-	order := make([]SortKey, 0, len(calls[0].Over.OrderBy))
-	for _, ob := range calls[0].Over.OrderBy {
-		r, err := resolveExprForWindowInput(ob.Expr, inputCtx, agg)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		order = append(order, SortKey{Expr: r, Desc: ob.Desc, NullsFirst: sortByNullsFirst(ob)})
-	}
-
-	outputSchema := append(Schema(nil), inputCtx.schema...)
-	funcs := make([]WindowFunc, 0, len(calls))
-	byKey := make(map[string]windowBinding, len(calls))
+	var groups []*specGroup
+	groupByKey := map[string]*specGroup{}
 	for _, fc := range calls {
-		k := windowCallKey(fc)
-		if _, exists := byKey[k]; exists {
-			continue
+		key := windowSpecKey(fc.Over)
+		if g, ok := groupByKey[key]; ok {
+			g.calls = append(g.calls, fc)
+		} else {
+			g := &specGroup{key: key, calls: []*parser.FuncCall{fc}}
+			groups = append(groups, g)
+			groupByKey[key] = g
 		}
-		wf, err := buildWindowFunc(fc, inputCtx, agg)
+	}
+
+	currentChild := child
+	currentCtx := inputCtx
+	combinedByKey := make(map[string]windowBinding)
+
+	for _, g := range groups {
+		partition := make([]Expr, 0, len(g.calls[0].Over.PartitionBy))
+		for _, p := range g.calls[0].Over.PartitionBy {
+			r, err := resolveExprForWindowInput(p, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			partition = append(partition, r)
+		}
+		order := make([]SortKey, 0, len(g.calls[0].Over.OrderBy))
+		for _, ob := range g.calls[0].Over.OrderBy {
+			r, err := resolveExprForWindowInput(ob.Expr, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			order = append(order, SortKey{Expr: r, Desc: ob.Desc, NullsFirst: sortByNullsFirst(ob)})
+		}
+
+		outputSchema := append(Schema(nil), currentCtx.schema...)
+		funcs := make([]WindowFunc, 0, len(g.calls))
+		byKey := make(map[string]windowBinding, len(g.calls))
+		for _, fc := range g.calls {
+			k := windowCallKey(fc)
+			if _, exists := byKey[k]; exists {
+				continue
+			}
+			wf, err := buildWindowFunc(fc, currentCtx, agg)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			idx := len(outputSchema)
+			funcs = append(funcs, wf)
+			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: wf.Type})
+			byKey[k] = windowBinding{index: idx, typ: wf.Type}
+		}
+
+		frame, err := resolveWindowFrame(g.calls[0].Over.Frame, currentCtx, agg)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		idx := len(outputSchema)
-		funcs = append(funcs, wf)
-		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: wf.Type})
-		byKey[k] = windowBinding{index: idx, typ: wf.Type}
+
+		windowNode := &WindowAgg{
+			pos:         s.Pos(),
+			Child:       currentChild,
+			PartitionBy: partition,
+			OrderBy:     order,
+			Funcs:       funcs,
+			Frame:       frame,
+			schema:      outputSchema,
+		}
+		currentChild = windowNode
+		currentCtx = newResolveContext(nil, outputSchema)
+
+		for k, v := range byKey {
+			combinedByKey[k] = v
+		}
 	}
 
-	frame, err := resolveWindowFrame(calls[0].Over.Frame, inputCtx, agg)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 
-	windowNode := &WindowAgg{
-		pos:         s.Pos(),
-		Child:       child,
-		PartitionBy: partition,
-		OrderBy:     order,
-		Funcs:       funcs,
-		Frame:       frame,
-		schema:      outputSchema,
-	}
-	outCtx := newResolveContext(nil, outputSchema)
-	surface := &windowSurface{input: inputCtx, agg: agg, output: outCtx, windowByKey: byKey}
-	return windowNode, outCtx, surface, nil
+	surface := &windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey}
+	return currentChild, currentCtx, surface, nil
 }
 
 func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
