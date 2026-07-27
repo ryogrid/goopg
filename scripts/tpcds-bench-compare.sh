@@ -60,6 +60,8 @@ PG_PSQL="psql -h 127.0.0.1 -p 65432 -U ryo -d tpcds"
 TIMEOUT_SEC="${TIMEOUT_SEC:-600}"
 EXPLAIN_TIMEOUT="${EXPLAIN_TIMEOUT:-30}"
 ENGINES="${ENGINES:-goopg pg}"
+# Set by run_one so the caller can react to a TIMEOUT (see restart_goopg).
+LAST_STATUS=""
 
 # PG queries to skip (dsqgen subquery-in-FROM generation artefacts;
 # these fail on upstream PostgreSQL too — see design doc §1.2).
@@ -135,6 +137,7 @@ run_one() {
     fi
 
     printf '%s\n' "${qout}" > "${result_file}"
+    LAST_STATUS="${status}"
     printf "%-5s %-4s %-7s %6ss %8s %s%s\n" \
         "${label}" "Q${q}" "${status}" "${elapsed}" "${rows}" \
         "${blocks:+[${blocks}] }" "${err:0:80}"
@@ -145,12 +148,43 @@ echo "# goopg: $(git log --oneline -1)  PG: 18.3"
 echo "# timeout: ${TIMEOUT_SEC}s per query, engines: ${ENGINES}, PG skip: ${PG_SKIP}"
 echo ""
 
+# restart_goopg — bounce the goopg server to drop accumulated heap.
+#
+# Why this exists (2026-07-27): the bench server runs with GOGC=off and
+# GOMEMLIMIT=12GiB, so the Go GC only fires as the heap nears the limit.
+# A 600 s timeout query builds an enormous intermediate; once one or two
+# of those have run, the heap sits at the limit and every SUBSEQUENT
+# query in the same process thrashes GC. The effect is a "sweep-tail
+# collapse" that looks exactly like a code regression:
+#
+#   Q6  70s -> TIMEOUT, Q7 67s -> TIMEOUT   (measured, immediately after
+#   Q4 and Q5 both timed out at 600 s)
+#
+# but the same binary on a freshly started server returns Q6 in 62 s and
+# Q7 in 64 s, matching both the baseline and PostgreSQL's row counts.
+# Restarting after each goopg TIMEOUT keeps a heap bomb from poisoning
+# the rest of the sweep. Set RESTART_AFTER_TIMEOUT=0 to disable.
+restart_goopg() {
+    [[ "${RESTART_AFTER_TIMEOUT:-1}" == "1" ]] || return 0
+    echo "      (restarting goopg to drop accumulated heap)"
+    "${REPO_ROOT}/scripts/csq-bench-server.sh" stop  >/dev/null 2>&1 || true
+    "${REPO_ROOT}/scripts/csq-bench-server.sh" start >/dev/null 2>&1 || {
+        echo "      WARNING: goopg restart failed — remaining results are suspect"
+        return 1
+    }
+}
+
 for q in $(parse_qlist "${1:-}"); do
     # Fix (3): sequential, never concurrent — a concurrent peer
     # contaminates the elapsed time of both engines.
     for eng in ${ENGINES}; do
         case "$eng" in
-        goopg) run_one "goopg" "${GOOPG_PSQL}" "${q}" ;;
+        goopg)
+            run_one "goopg" "${GOOPG_PSQL}" "${q}"
+            # A goopg TIMEOUT means a 600 s query just built an enormous
+            # intermediate; bounce the server before it poisons the rest.
+            [[ "${LAST_STATUS}" == "TIMEOUT" ]] && restart_goopg
+            ;;
         pg)
             if ! grep -qw "${q}" <<<"${PG_SKIP}"; then
                 run_one "pg" "${PG_PSQL}" "${q}"

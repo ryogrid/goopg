@@ -286,6 +286,15 @@ TPC-H gate. It is specified in design doc §7.1 and ledger rows `pq-P6`/`pq-P10`
 | **Q39** (connection lost) | **nothing — corrected on review.** An earlier draft listed "a Go panic" as ruled out because no `backend goroutine panic` line exists for Q39 in any log. That is an argument from silence over a window with **no log at all**: coverage is `goopg.tpcds.log` 07-24 16:58–17:40 and `goopg.csq-bench.log` 07-27 07:18 onward, while the v4 sweep ran 07-26 13:57–18:19. The panic-vs-SIGKILL question is **open**, not settled | a Go panic in an unlogged window; the cgroup cap (`MemoryMax=24G`) killing an arbitrary hash-join build side (`probeIdx` is meaningless at zero stats, and `inventory` is 11.7M rows); or the unbounded `aggregateOp`. Re-run Q39 alone with logging and RSS monitoring before choosing a fix |
 | **Q35** | — | row count still unmeasured (525 s run) |
 
+**Methodological caution learned here.** The Q6/Q7 investigation initially
+concluded — and this report initially stated — that commit `9740fce9` had caused a
+regression, on the strength of an A/B where the pre-fix binary was fast and the
+post-fix binary slow. That A/B was confounded: the pre-fix arm ran on a fresh
+server, the post-fix arm on one that had just executed two 600 s timeouts. Re-run
+with **both** arms on fresh servers, the post-fix binary is fast and the code is
+exonerated. Any future goopg timing comparison must control for server age and for
+what ran before it in the same process.
+
 ---
 
 ## §3 Full 99-query sweep
@@ -309,6 +318,33 @@ A second harness defect was found during this review and fixed: the classifier r
 `grep -qi "ERROR"` over the entire psql output *before* the row-count branch, so a
 result row whose text merely contained the word "error" silently became
 `ERROR, rows=0`. It now matches psql's own `ERROR:`/`FATAL:`/`PANIC:` prefix.
+
+**A third harness defect, found by the sweep itself — sweep-tail collapse.** The
+first 600 s run reported Q6 (70 s in the baseline) and Q7 (67 s) as TIMEOUTs.
+Both are 5-table star joins and neither is on the known-timeout list, so they
+looked like regressions caused by §1.1. They were not. On a **freshly started**
+server the same binary returns:
+
+| | baseline 07-26 | during sweep | fresh server |
+| --- | ---: | ---: | ---: |
+| Q6 | OK 70 s / 44 | TIMEOUT >600 s | **OK 62 s / 44** ✓ |
+| Q7 | OK 67 s / 100 | TIMEOUT >600 s | **OK 64 s / 100** ✓ |
+
+Cause: the bench server runs with `GOGC=off` and `GOMEMLIMIT=12GiB`
+(`bench/tpch/env_goopg.sh`), so the collector only fires as the heap nears the
+limit. Q4 and Q5 immediately precede Q6 and **both time out at 600 s**, each
+building an enormous intermediate. After them the heap sits at the limit and every
+subsequent query in that process thrashes GC. This is the failure mode already on
+record in the project's operational notes as *"sweep-tail collapse mimics a code
+regression"* — and it did exactly that.
+
+`scripts/tpcds-bench-compare.sh` now restarts the goopg server after any goopg
+TIMEOUT (`RESTART_AFTER_TIMEOUT=1`, the default) so a heap bomb cannot poison the
+rest of the run.
+
+**This also casts doubt on the 07-26 baseline's own timings**, which were produced
+by a single long-lived process with 16 timeouts in it. Any query that ran late in
+that sweep may be recorded slower than it truly is.
 
 Results are appended in §5 when it completes. Until then the claims in this report
 are limited to the per-query measurements shown above, each run individually
