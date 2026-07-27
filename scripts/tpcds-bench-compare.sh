@@ -39,24 +39,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# Fix (1): put the PG 18.3 client tools on PATH. env_goopg.sh sets
-# `set -euo pipefail` and exports PG_PREFIX/PATH/LD_LIBRARY_PATH.
+# Fix (1): put the PG 18.3 client tools on PATH (env_tpcds.sh exports
+# PG_PREFIX/PATH/LD_LIBRARY_PATH and every TPC-DS dir/port).
 # shellcheck source=/dev/null
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
-export PATH="${PG_PREFIX}/bin:${PATH}"
-export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 if ! command -v psql >/dev/null 2>&1; then
-    echo "FATAL: psql not on PATH after sourcing env_goopg.sh (looked in ${PG_PREFIX}/bin)" >&2
+    echo "FATAL: psql not on PATH after sourcing env_tpcds.sh (looked in ${PG_PREFIX}/bin)" >&2
     exit 2
 fi
 
-QDIR="${REPO_ROOT}/bench/tpch/runtime_goopg/tpcds-data/queries"
-OUTDIR="${REPO_ROOT}/bench/tpch/runtime_goopg/tpcds-results"
+QDIR="${TPCDS_QUERY_DIR}"
+OUTDIR="${TPCDS_RESULTS_DIR}"
 mkdir -p "${OUTDIR}"
 
-GOOPG_PSQL="psql -h 127.0.0.1 -p 65433 -U postgres -d postgres"
-PG_PSQL="psql -h 127.0.0.1 -p 65432 -U ryo -d tpcds"
+GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
+PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${TPCDS_PG_DB}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-600}"
 EXPLAIN_TIMEOUT="${EXPLAIN_TIMEOUT:-30}"
 ENGINES="${ENGINES:-goopg pg}"
@@ -167,8 +165,8 @@ echo ""
 restart_goopg() {
     [[ "${RESTART_AFTER_TIMEOUT:-1}" == "1" ]] || return 0
     echo "      (restarting goopg to drop accumulated heap)"
-    "${REPO_ROOT}/scripts/csq-bench-server.sh" stop  >/dev/null 2>&1 || true
-    "${REPO_ROOT}/scripts/csq-bench-server.sh" start >/dev/null 2>&1 || {
+    "${REPO_ROOT}/bench/tpcds/server.sh" stop  sf1 >/dev/null 2>&1 || true
+    "${REPO_ROOT}/bench/tpcds/server.sh" start sf1 >/dev/null 2>&1 || {
         echo "      WARNING: goopg restart failed — remaining results are suspect"
         return 1
     }

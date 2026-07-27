@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 TPCDS_TOOLS="${REPO_ROOT}/third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools"
 TPCDS_DATA_DIR="${RUNTIME_DIR}/tpcds-data"
@@ -24,7 +24,7 @@ PG="psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_SUPERUSER} -d ${BENCH_DB} -v ON_ERR
 # ---- Prerequisites ------------------------------------------------
 [[ -f "${TPCDS_TOOLS}/tpcds.sql" ]] || die "Run scripts/tpcds-setup.sh first"
 pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || \
-    die "goopg not running — start it with: scripts/csq-bench-server.sh start"
+    die "goopg not running — start it with: bench/tpcds/server.sh start sf1"
 
 # ---- Step 1: Create schema ----------------------------------------
 log "Step 1/3: Creating TPC-DS schema..."

@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # shellcheck source=../bench/tpch/env_goopg.sh
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 # ---- Configuration ------------------------------------------------
 SCALE="${TPCDS_SCALE:-1}"

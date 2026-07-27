@@ -19,12 +19,12 @@ source "${REPO_ROOT}/ci/batch/lib/common.sh"
 TPCDS_DIR="${RUN_DIR}/tpcds"
 mkdir -p "${TPCDS_DIR}"
 
-# Shared bench config
+# Shared bench config (TPC-DS moved to bench/tpcds/ on 2026-07-27)
 # shellcheck source=/dev/null
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 set +e
-SRC_DATA="${PGDATA}"
-SRC_PORT="${PG_PORT}"           # 65433 — loop's spotcheck lane
+SRC_DATA="${TPCDS_PGDATA}"      # bench/tpcds/runtime_goopg/data
+SRC_PORT="${TPCDS_PORT}"        # 65436 — the TPC-DS SF=1 bench lane
 RUN_PORT="${NIGHTLY_TPCDS_PORT:-65435}"
 RUN_DATA="${REPO_ROOT}/tmp/goopg-nightly-tpcds-data"
 
@@ -125,7 +125,7 @@ fi
 # --- step 1: spotcheck tripwire ------------------------------------------------
 progress "S2b" "tpcds: spotcheck Q3=${SPOTCHECK_EXPECTED[0]} Q98=${SPOTCHECK_EXPECTED[1]}"
 spot_ok=1
-QDIR="${REPO_ROOT}/bench/tpch/runtime_goopg/tpcds-data/queries"
+QDIR="${TPCDS_QUERY_DIR}"
 for i in 0 1; do
     qn="${SPOTCHECK_QUERIES[$i]}"
     expected="${SPOTCHECK_EXPECTED[$i]}"

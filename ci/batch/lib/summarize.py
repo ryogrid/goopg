@@ -424,7 +424,7 @@ def analyze(run_dir, repo_root, run_id):
     if tpcds_status.startswith("fail(spotcheck)"):
         it.add_regression(
             "tpcds/spotcheck", "TPC-DS spotcheck row-count mismatch (Q3=31, Q98=2531)",
-            "psql -h 127.0.0.1 -p 65435 -U postgres -d postgres -f bench/tpch/runtime_goopg/tpcds-data/queries/query3.sql",
+            "psql -h 127.0.0.1 -p 65435 -U postgres -d postgres -f bench/tpcds/runtime_goopg/tpcds-data/queries/query3.sql",
             ev("tpcds/run.log"),
         )
 
@@ -439,7 +439,7 @@ def analyze(run_dir, repo_root, run_id):
         q = t["query"]
         repro = (
             f"psql -h 127.0.0.1 -p 65435 -U postgres -d postgres "
-            f"-f bench/tpch/runtime_goopg/tpcds-data/queries/{q.lower()}.sql"
+            f"-f bench/tpcds/runtime_goopg/tpcds-data/queries/{q.lower()}.sql"
         )
         anchor = anchors_tpcds.get(q)
         if t["status"] == "ok" and anchor and t["rows"] is not None and t["rows"] != anchor[0]:

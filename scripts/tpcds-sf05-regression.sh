@@ -45,15 +45,15 @@
 #
 # Usage:
 #   scripts/tpcds-sf05-regression.sh build-data    # sample SF=1 TSVs -> SF0.5 TSVs
-#   scripts/tpcds-sf05-regression.sh load-pg       # create+load PG db 'tpcds05'
+#   scripts/tpcds-sf05-regression.sh load-pg       # create+load PG db 'tpcds05' (:65438)
 #   scripts/tpcds-sf05-regression.sh oracle        # PG EXPLAIN ANALYZE -> oracle.txt + plans
-#   scripts/tpcds-sf05-regression.sh load-goopg    # init+load goopg cluster on :65434
+#   scripts/tpcds-sf05-regression.sh load-goopg    # init+load goopg cluster on :65437
 #   scripts/tpcds-sf05-regression.sh sweep         # goopg run vs oracle (the recurring gate)
 #   scripts/tpcds-sf05-regression.sh all           # everything above, in order
 #   scripts/tpcds-sf05-regression.sh status
 #
 # Env:
-#   SF05_PORT=65434         goopg port (65433 = SF1 bench, 65435 = nightly)
+#   SF05_PORT=65437         goopg port (see bench/tpcds/env_tpcds.sh port map)
 #   SF05_PG_DB=tpcds05      PostgreSQL database name
 #   ORACLE_TIMEOUT=600      per-query timeout for PG oracle capture (one-time)
 #   TIMEOUT_SEC=300         per-query timeout for the goopg sweep
@@ -65,29 +65,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 # shellcheck source=/dev/null
-source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
-export PATH="${PG_PREFIX}/bin:${PATH}"
-export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
-TPCDS_TOOLS="${REPO_ROOT}/third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools"
-SRC_DATA_DIR="${RUNTIME_DIR}/tpcds-data"           # SF=1 TSVs (input)
-QDIR="${SRC_DATA_DIR}/queries"                     # SF=1 PG-fixed queries (reused)
-SF05_DATA_DIR="${RUNTIME_DIR}/tpcds-data-sf05"     # sampled TSVs
-SF05_GOOPG_DATA="${RUNTIME_DIR}/data-sf05"         # goopg cluster
-OUTDIR="${RUNTIME_DIR}/tpcds-results-sf05"
+# Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF05_DATA_DIR,
+# SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
+SRC_DATA_DIR="${TPCDS_DATA_DIR}"                   # SF=1 TSVs (input)
+QDIR="${TPCDS_QUERY_DIR}"                          # SF=1 PG-fixed queries (reused)
+OUTDIR="${SF05_RESULTS_DIR}"
 ORACLE="${OUTDIR}/oracle.txt"                      # q|status|rows|secs
-SF05_PORT="${SF05_PORT:-65434}"
-SF05_PG_DB="${SF05_PG_DB:-tpcds05}"
-SF05_LOG="${RUNTIME_DIR}/goopg.sf05.log"
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-600}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
-CG_UNIT="goopg-sf05"
+CG_UNIT="goopg-tpcds-sf05"
 
 PG_SKIP="36 70 86"   # dsqgen artefacts; fail on upstream PG too
 
-GOOPG_PSQL="psql -h 127.0.0.1 -p ${SF05_PORT} -U ${PG_SUPERUSER} -d postgres"
-PG_PSQL="psql -h 127.0.0.1 -p 65432 -U ryo -d ${SF05_PG_DB}"
-PG_ADMIN="psql -h 127.0.0.1 -p 65432 -U ryo -d postgres"
+GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${SF05_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
+PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${SF05_PG_DB}"
+PG_ADMIN="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d postgres"
 
 # The 25 real tables (mirrors tpcds-load.sh's filter).
 TABLES="call_center catalog_page catalog_returns catalog_sales customer \
@@ -163,7 +157,7 @@ cmd_build_data() {
 cmd_load_pg() {
     guard_sf1_sweep
     [[ -d "${SF05_DATA_DIR}" ]] || die "run build-data first"
-    log "Recreating PG database ${SF05_PG_DB} on :65432"
+    log "Recreating PG database ${SF05_PG_DB} on :${TPCDS_PG_PORT}"
     ${PG_ADMIN} -c "DROP DATABASE IF EXISTS ${SF05_PG_DB}" >/dev/null
     ${PG_ADMIN} -c "CREATE DATABASE ${SF05_PG_DB}" >/dev/null
     ${PG_PSQL} -q -f "${TPCDS_TOOLS}/tpcds.sql" 2>&1 | tail -2 || true
@@ -390,7 +384,7 @@ cmd_sweep() {
 # ------------------------------------------------------------------- status
 cmd_status() {
     echo "SF0.5 TSVs   : $([[ -d ${SF05_DATA_DIR} ]] && ls "${SF05_DATA_DIR}"/*.tsv 2>/dev/null | wc -l || echo 0) files (${SF05_DATA_DIR})"
-    echo "PG db        : $(${PG_ADMIN} -t -A -c "select count(*) from pg_database where datname='${SF05_PG_DB}'" 2>/dev/null || echo '?') (${SF05_PG_DB} on :65432)"
+    echo "PG db        : $(${PG_ADMIN} -t -A -c "select count(*) from pg_database where datname='${SF05_PG_DB}'" 2>/dev/null || echo '?') (${SF05_PG_DB} on :${TPCDS_PG_PORT})"
     echo "goopg cluster: $([[ -d ${SF05_GOOPG_DATA} ]] && echo present || echo absent) (${SF05_GOOPG_DATA}, port ${SF05_PORT})"
     echo "oracle       : $([[ -s ${ORACLE} ]] && grep -c '|OK|' "${ORACLE}" || echo 0) OK entries (${ORACLE})"
     ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -3 | sed 's/^/last sweeps  : /' || true

@@ -1,4 +1,11 @@
-# TPC-DS SF=1 Benchmark on goopg — Workflow
+# TPC-DS Benchmark on goopg — Workflow
+
+> **Location note (2026-07-27):** everything TPC-DS lives under `bench/tpcds/`
+> — clusters in `runtime_goopg/` (goopg SF=1 :65436, SF=0.5 :65437) and
+> `runtime/pgdata` (PostgreSQL reference :65438, dbs `tpcds`/`tpcds05`).
+> Env: `bench/tpcds/env_tpcds.sh`. Lifecycle:
+> `bench/tpcds/server.sh {start|stop|status} [sf1|sf05|pg|all]`.
+> Port map + cross-benchmark picture: repo-root `CLAUDE.md`.
 
 ## Prerequisites
 
@@ -21,7 +28,7 @@ State 1                   State 2                       State 3
      │                         │                            ├─ tpcds-run.sh ──► results
      │                         │                            │
      ▼                         ▼                            ▼
-  third-party/             bench/tpch/runtime_goopg/     bench/tpch/runtime_goopg/
+  third-party/             bench/tpcds/runtime_goopg/    bench/tpcds/runtime_goopg/
   tpcds-postgres/          tpcds-data/                   tpcds-results/
   (repo cloned)            ├── *.tsv (COPY-ready)        └── results.txt
                            └── queries/
@@ -51,14 +58,14 @@ scripts/tpcds-setup.sh
    - Queries 36, 70, 86: wrap in `SELECT * FROM (...) AS sub`
 
 **Output:**
-- `bench/tpch/runtime_goopg/tpcds-data/*.tsv` (25 COPY-ready files)
-- `bench/tpch/runtime_goopg/tpcds-data/queries/query*.sql` (99 PG-fixed queries)
+- `bench/tpcds/runtime_goopg/tpcds-data/*.tsv` (25 COPY-ready files)
+- `bench/tpcds/runtime_goopg/tpcds-data/queries/query*.sql` (99 PG-fixed queries)
 
 ### State 2 → State 3: Load Data
 
 ```bash
 # Requires goopg running:
-scripts/csq-bench-server.sh start
+bench/tpcds/server.sh start sf1
 
 # Load TSV data into goopg + ANALYZE
 scripts/tpcds-load.sh
@@ -88,8 +95,8 @@ scripts/tpcds-run.sh 1,3,5-10
 ```
 
 **Output:**
-- `bench/tpch/runtime_goopg/tpcds-results/results.txt` — per-query timing + status
-- `bench/tpch/runtime_goopg/tpcds-results/qN_output.txt` — per-query full output
+- `bench/tpcds/runtime_goopg/tpcds-results/results.txt` — per-query timing + status
+- `bench/tpcds/runtime_goopg/tpcds-results/qN_output.txt` — per-query full output
 
 **Recovery:** If goopg crashes mid-query, the script auto-restarts it and continues.
 
@@ -127,7 +134,7 @@ goopg uses PostgreSQL-compatible SQL syntax. The following netezza-isms are fixe
 | `TPCDS_TIMEOUT` | `600` | Per-query timeout (seconds) |
 | `TPCDS_SCALE` | `1` | Scale factor (GB) |
 
-All other variables inherited from `bench/tpch/env_goopg.sh` (port 65433, GOMEMLIMIT=12GiB, GOGC=off).
+All other variables inherited from `bench/tpch/env_goopg.sh` (goopg SF=1 on port 65436; see env table).
 
 ---
 
@@ -185,13 +192,14 @@ too) plus anything that errors on PG during oracle capture.
 ## Load procedure (one-time, ~30–45 min end to end)
 
 Prerequisite: State 2 of the SF=1 flow (`scripts/tpcds-setup.sh` has produced
-the SF=1 TSVs and queries), and the PG 18.3 instance on :65432 is running.
+the SF=1 TSVs and queries), and the PG 18.3 instance on :65438 is running
+(`bench/tpcds/server.sh start pg`).
 
 ```bash
 # 1. Sample the SF=1 TSVs -> tpcds-data-sf05/   (~20 s, pure text processing)
 scripts/tpcds-sf05-regression.sh build-data
 
-# 2. Load PostgreSQL: drops+recreates db 'tpcds05' on :65432, schema, COPY,
+# 2. Load PostgreSQL: drops+recreates db 'tpcds05' on :65438, schema, COPY,
 #    ANALYZE (PG keeps stats persistently, so this is one-time)   (~1 min)
 scripts/tpcds-sf05-regression.sh load-pg
 
@@ -200,8 +208,8 @@ scripts/tpcds-sf05-regression.sh load-pg
 #    tpcds-results-sf05/oracle.txt   (~20 min; ORACLE_TIMEOUT=600 default)
 scripts/tpcds-sf05-regression.sh oracle
 
-# 4. Init + load a dedicated goopg cluster at runtime_goopg/data-sf05 on
-#    port 65434 (cgroup-capped via goopg-test-run.sh, scope goopg-sf05),
+# 4. Init + load a dedicated goopg cluster at bench/tpcds/runtime_goopg/data-sf05 on
+#    port 65437 (cgroup-capped via goopg-test-run.sh, scope goopg-tpcds-sf05),
 #    then stop it — the gate always starts its own fresh server   (~3 min)
 scripts/tpcds-sf05-regression.sh load-goopg
 ```
@@ -271,7 +279,7 @@ same plan line carries the planner's *estimated* `rows=` first.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SF05_PORT` | `65434` | goopg port (65433 = SF1 bench, 65435 = nightly) |
+| `SF05_PORT` | `65437` | goopg SF0.5 port (see env_tpcds.sh port map) |
 | `SF05_PG_DB` | `tpcds05` | PostgreSQL database name |
 | `ORACLE_TIMEOUT` | `600` | per-query timeout for the one-time PG capture |
 | `TIMEOUT_SEC` | `300` | per-query timeout for the goopg sweep |
