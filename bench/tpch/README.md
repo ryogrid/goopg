@@ -1,5 +1,12 @@
 # TPC-H Benchmark (HammerDB → PostgreSQL)
 
+> **Note (2026-07-27):** TPC-DS moved to its own tree — `bench/tpcds/` (see
+> `bench/tpcds/README.md` and repo-root `CLAUDE.md` for the port map). This
+> directory is TPC-H-only again. The goopg TPC-H cluster
+> (`runtime_goopg/data`, :65433) was rebuilt via HammerDB on 2026-07-27 after
+> the TPC-DS SF=1 load had overwritten it; row anchors were re-pinned to the
+> new load (`spotcheck_expected.env`, `ci/batch/tpch-row-anchors.csv`).
+
 Driver scripts that run the TPC-H workload from HammerDB 5.0 against a
 locally-built PostgreSQL 18.3 (under `postgres/local_install`) at the
 smallest scale factor (SF=1, ≈1 GB).
