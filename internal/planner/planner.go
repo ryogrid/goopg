@@ -1023,6 +1023,18 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if len(ctx.bindings) > 0 {
 		remapWithBindings(node, ctx.bindings)
 	}
+	// RC-1b (TPC-DS Q47/Q50): route single-source conjuncts from
+	// mh.Filters onto their Tables[i] only AFTER the remap above, when
+	// ColumnRef indices and Tables offsets finally share the MHJ-output
+	// coordinate space. Running this inside
+	// rewriteScanInputsWithSingleTablePredicates (pre-remap) attributed
+	// by FROM-cumulative indices against OID-sorted offsets and pushed
+	// predicates onto the WRONG scan — a date_dim OR-predicate landed on
+	// store, silently zeroing the result. The pass also validates every
+	// ref positionally by name and declines on any mismatch, so a path
+	// where the remap did not run degrades to post-join evaluation
+	// (slower, never wrong). Design: docs/design/tpcds-round2-fixes §3.4.
+	pushSingleSourceFiltersAfterRemap(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer

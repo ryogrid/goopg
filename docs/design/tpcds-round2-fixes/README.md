@@ -418,6 +418,12 @@ they are coordinate-space independent and unaffected. Only
 
 ### §3.4 Design
 
+**STATUS (late 2026-07-27): LANDED.** Implemented exactly as designed below once
+the rebuilt TPC-H gate unblocked it; verified with zero TPC-H row/timing drift,
+Q50 6=6, both probes exact. Two residuals discovered on un-zeroed inputs — a
+second Q47 defect downstream of the now-correct CTE body, and Q72 flipping
+wrong→timeout — are recorded in the ledger row, not silently absorbed.
+
 There is only one coordinate space that is correct here, and the pipeline already
 produces it — just too late. **Move `pushSingleSourceFiltersIntoMHJTables` to run
 after `remapWithBindings`** (`planner.go:1024`) instead of inside

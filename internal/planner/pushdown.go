@@ -343,15 +343,32 @@ func classifyConjunctSide(c Expr, leftWidth, totalWidth int) joinSide {
 	return state
 }
 
+// visitColumnRefNodes invokes onRef for every *ColumnRef NODE in e
+// (index and name together) and onOuter for any encounter that should
+// disqualify pushdown — same traversal contract as walkColumnRefs
+// below, which it delegates to for coverage parity.
+func visitColumnRefNodes(e Expr, onRef func(*ColumnRef), onOuter func()) {
+	walkColumnRefsImpl(e, nil, onRef, onOuter)
+}
+
 // walkColumnRefs invokes onIdx for every ColumnRef.Index in e and
 // onOuter for any encounter that should disqualify pushdown
 // (OuterColumnRef, SubqueryExpr, ExistsExpr — anything whose
 // runtime value depends on state outside this Join's schema).
 func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
+	walkColumnRefsImpl(e, onIdx, nil, onOuter)
+}
+
+func walkColumnRefsImpl(e Expr, onIdx func(int), onRef func(*ColumnRef), onOuter func()) {
 	switch x := e.(type) {
 	case nil:
 	case *ColumnRef:
-		onIdx(x.Index)
+		if onIdx != nil {
+			onIdx(x.Index)
+		}
+		if onRef != nil {
+			onRef(x)
+		}
 	case *OuterColumnRef:
 		onOuter()
 	case *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
@@ -370,47 +387,47 @@ func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
 			onOuter()
 			return
 		}
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 		for _, item := range x.List {
-			walkColumnRefs(item, onIdx, onOuter)
+			walkColumnRefsImpl(item, onIdx, onRef, onOuter)
 		}
 	case *BinaryOp:
-		walkColumnRefs(x.Left, onIdx, onOuter)
-		walkColumnRefs(x.Right, onIdx, onOuter)
+		walkColumnRefsImpl(x.Left, onIdx, onRef, onOuter)
+		walkColumnRefsImpl(x.Right, onIdx, onRef, onOuter)
 	case *UnaryOp:
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 	case *FuncCall:
 		for _, a := range x.Args {
-			walkColumnRefs(a, onIdx, onOuter)
+			walkColumnRefsImpl(a, onIdx, onRef, onOuter)
 		}
 	case *CaseExpr:
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 		for _, w := range x.Whens {
-			walkColumnRefs(w.When, onIdx, onOuter)
-			walkColumnRefs(w.Then, onIdx, onOuter)
+			walkColumnRefsImpl(w.When, onIdx, onRef, onOuter)
+			walkColumnRefsImpl(w.Then, onIdx, onRef, onOuter)
 		}
-		walkColumnRefs(x.Else, onIdx, onOuter)
+		walkColumnRefsImpl(x.Else, onIdx, onRef, onOuter)
 	case *ExtractExpr:
-		walkColumnRefs(x.Source, onIdx, onOuter)
+		walkColumnRefsImpl(x.Source, onIdx, onRef, onOuter)
 	case *CastExpr:
 		// A cast can wrap an outer-side ColumnRef (e.g. `cast(outer.col AS
 		// text) = inner.col`). Missing this case made classifyConjunctSide
 		// blind to the wrapped ref, so a mixed conjunct could be misread as
 		// single-side and wrongly pushed below a LEFT JOIN. Keep in lockstep
 		// with shiftColumnRefsBy's CastExpr case.
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 	case *IsNullExpr:
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 	case *IsBoolExpr:
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 	case *IsDistinctFromExpr:
-		walkColumnRefs(x.Left, onIdx, onOuter)
-		walkColumnRefs(x.Right, onIdx, onOuter)
+		walkColumnRefsImpl(x.Left, onIdx, onRef, onOuter)
+		walkColumnRefsImpl(x.Right, onIdx, onRef, onOuter)
 	case *CollateExpr:
-		walkColumnRefs(x.Operand, onIdx, onOuter)
+		walkColumnRefsImpl(x.Operand, onIdx, onRef, onOuter)
 	case *RowExpr:
 		for _, el := range x.Elems {
-			walkColumnRefs(el, onIdx, onOuter)
+			walkColumnRefsImpl(el, onIdx, onRef, onOuter)
 		}
 	}
 }

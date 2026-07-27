@@ -44,6 +44,7 @@ import "github.com/goopg/goopg/internal/parser"
 //     self-joins.
 
 import (
+	"strings"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -80,10 +81,16 @@ func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Nod
 			x.Tables[i] = rewriteScanInputsWithSingleTablePredicates(x.Tables[i], cat)
 		}
 		rewriteMHJInputsWithSingleTablePredicates(x, cat)
-		// M0071-0004: push remaining single-source non-indexable
-		// filters down onto matching Tables[i] so build-side
-		// cardinality drops before MHJ hash-builds.
-		pushSingleSourceFiltersIntoMHJTables(x)
+		// M0071-0004's pushSingleSourceFiltersIntoMHJTables used to run
+		// HERE — before remapWithBindings — which is the RC-1b wrong-answer
+		// bug (TPC-DS Q47/Q50): mh.Filters still carried FROM-cumulative
+		// ColumnRef indices while offsets were computed from the OID-sorted
+		// mh.Tables, so a date_dim predicate could be pushed onto store's
+		// scan. The push now runs from planSelect AFTER the bindings remap
+		// (pushSingleSourceFiltersAfterRemap), when both sides of the
+		// attribution live in MHJ-output coordinates.
+		// (rewriteMHJInputsWithSingleTablePredicates above is unaffected:
+		// it resolves by column NAME, not by index range.)
 		return x
 	case *Aggregate:
 		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
@@ -621,6 +628,41 @@ func rewriteMHJInputsWithSingleTablePredicates(mh *MultiHashJoin, cat catalog.Ca
 // The conjunct's ColumnRef indices are SHIFTED to be local to
 // Tables[i].Output() so the wrapped Filter evaluates against
 // Tables[i]'s row directly.
+// pushSingleSourceFiltersAfterRemap walks the plan tree and applies
+// pushSingleSourceFiltersIntoMHJTables to every MultiHashJoin. It MUST
+// run after remapWithBindings (planSelect's pipeline), because the push
+// attributes conjuncts to Tables[i] by ColumnRef index range and the
+// indices are only in MHJ-output coordinates once the remap has run —
+// see the RC-1b note at the *MultiHashJoin* arm of
+// rewriteScanInputsWithSingleTablePredicates above.
+func pushSingleSourceFiltersAfterRemap(n Node) {
+	if n == nil {
+		return
+	}
+	switch x := n.(type) {
+	case *MultiHashJoin:
+		pushSingleSourceFiltersIntoMHJTables(x)
+	case *Join:
+		pushSingleSourceFiltersAfterRemap(x.Left)
+		pushSingleSourceFiltersAfterRemap(x.Right)
+	case *NestedLoopIndexJoin:
+		pushSingleSourceFiltersAfterRemap(x.Outer)
+		pushSingleSourceFiltersAfterRemap(x.Inner)
+	case *Filter:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	case *Project:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	case *Sort:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	case *Limit:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	case *Aggregate:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	case *WindowAgg:
+		pushSingleSourceFiltersAfterRemap(x.Child)
+	}
+}
+
 func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 	if mh == nil || len(mh.Filters) == 0 || len(mh.Tables) == 0 {
 		return
@@ -631,14 +673,23 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 		offsets[i+1] = offsets[i] + len(t.Output())
 	}
 	// For each conjunct, find the unique Tables[i] whose
-	// [offsets[i], offsets[i+1]) range covers ALL ColumnRefs.
+	// [offsets[i], offsets[i+1]) range covers ALL ColumnRefs — and
+	// validate every ref POSITIONALLY BY NAME: the column at the
+	// index-derived (table, local-slot) position must carry the same
+	// name the ref claims. This is the defence-in-depth from design doc
+	// tpcds-round2-fixes §3.4: if the conjunct's indices are in any
+	// coordinate space other than MHJ-output (e.g. a path where the
+	// remap did not run), the name check fails and the conjunct simply
+	// stays in mh.Filters, where post-join evaluation is slower but
+	// always correct.
 	tableForConjunct := func(c Expr) int {
 		target := -1
 		ok := true
-		walkColumnRefs(c, func(idx int) {
+		visitColumnRefNodes(c, func(cr *ColumnRef) {
 			if !ok {
 				return
 			}
+			idx := cr.Index
 			t := -1
 			for i := 0; i < len(mh.Tables); i++ {
 				if idx >= offsets[i] && idx < offsets[i+1] {
@@ -647,6 +698,12 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 				}
 			}
 			if t < 0 {
+				ok = false
+				return
+			}
+			out := mh.Tables[t].Output()
+			local := idx - offsets[t]
+			if cr.Name != "" && !strings.EqualFold(out[local].Name, cr.Name) {
 				ok = false
 				return
 			}
@@ -664,6 +721,16 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 	// shiftColumnRefs adjusts every ColumnRef.Index in `e` by
 	// `delta` (typically -offsets[i] to localise indices to
 	// Tables[i]).
+	//
+	// LOCKSTEP INVARIANT (design doc tpcds-round2-fixes §3.4): this
+	// walker and cloneExprForShift below MUST enumerate the same node
+	// kinds. The shift mutates; the clone is what makes that mutation
+	// safe. A kind covered here but not in the clone would let the
+	// shift corrupt a subtree still shared with the enclosing
+	// Filter's predicate. Both were extended together from 4 kinds to
+	// the full container set after RC-1a showed how partial walkers
+	// silently corrupt (an IS NULL conjunct would previously have had
+	// its operand's index left un-shifted).
 	var shiftColumnRefs func(Expr, int)
 	shiftColumnRefs = func(e Expr, delta int) {
 		if e == nil {
@@ -680,6 +747,38 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 		case *FuncCall:
 			for _, a := range x.Args {
 				shiftColumnRefs(a, delta)
+			}
+		case *CastExpr:
+			shiftColumnRefs(x.Operand, delta)
+		case *ExtractExpr:
+			shiftColumnRefs(x.Source, delta)
+		case *IsNullExpr:
+			shiftColumnRefs(x.Operand, delta)
+		case *IsBoolExpr:
+			shiftColumnRefs(x.Operand, delta)
+		case *IsDistinctFromExpr:
+			shiftColumnRefs(x.Left, delta)
+			shiftColumnRefs(x.Right, delta)
+		case *CollateExpr:
+			shiftColumnRefs(x.Operand, delta)
+		case *RowExpr:
+			for _, el := range x.Elems {
+				shiftColumnRefs(el, delta)
+			}
+		case *CaseExpr:
+			shiftColumnRefs(x.Operand, delta)
+			for _, w := range x.Whens {
+				shiftColumnRefs(w.When, delta)
+				shiftColumnRefs(w.Then, delta)
+			}
+			shiftColumnRefs(x.Else, delta)
+		case *InExpr:
+			// Literal in-list only: a sublink form (x.Plan != nil) is
+			// never pushed (tableForConjunct's onOuter veto), so Plan
+			// and Args need no handling here.
+			shiftColumnRefs(x.Operand, delta)
+			for _, it := range x.List {
+				shiftColumnRefs(it, delta)
 			}
 		}
 	}
@@ -710,12 +809,14 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 	mh.Filters = kept
 }
 
-// cloneExprForShift makes a structural copy of an expression
-// so index shifts on one branch don't propagate to other
-// references in the plan tree. Only the ColumnRef-/operator-
-// branches that pushSingleSourceFiltersIntoMHJTables walks
-// are actually mutated, so the clone only needs to copy
-// those.
+// cloneExprForShift makes a structural copy of an expression so index
+// shifts on one branch don't propagate to other references in the plan
+// tree.
+//
+// LOCKSTEP INVARIANT with shiftColumnRefs (see the comment there): the
+// clone must cover every kind the shift mutates through. Kinds the
+// shift does not descend into (constants, params, sublink Plans) may
+// safely be shared, so the default arm returns the node as-is.
 func cloneExprForShift(e Expr) Expr {
 	if e == nil {
 		return nil
@@ -725,19 +826,70 @@ func cloneExprForShift(e Expr) Expr {
 		cl := *x
 		return &cl
 	case *BinaryOp:
-		return &BinaryOp{
-			Op:    x.Op,
-			Left:  cloneExprForShift(x.Left),
-			Right: cloneExprForShift(x.Right),
-		}
+		cl := *x
+		cl.Left = cloneExprForShift(x.Left)
+		cl.Right = cloneExprForShift(x.Right)
+		return &cl
 	case *UnaryOp:
-		return &UnaryOp{Op: x.Op, Operand: cloneExprForShift(x.Operand)}
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		return &cl
 	case *FuncCall:
-		args := make([]Expr, len(x.Args))
+		cl := *x
+		cl.Args = make([]Expr, len(x.Args))
 		for i, a := range x.Args {
-			args[i] = cloneExprForShift(a)
+			cl.Args[i] = cloneExprForShift(a)
 		}
-		return &FuncCall{Name: x.Name, Args: args, Star: x.Star}
+		return &cl
+	case *CastExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		return &cl
+	case *ExtractExpr:
+		cl := *x
+		cl.Source = cloneExprForShift(x.Source)
+		return &cl
+	case *IsNullExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		return &cl
+	case *IsBoolExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		return &cl
+	case *IsDistinctFromExpr:
+		cl := *x
+		cl.Left = cloneExprForShift(x.Left)
+		cl.Right = cloneExprForShift(x.Right)
+		return &cl
+	case *CollateExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		return &cl
+	case *RowExpr:
+		cl := *x
+		cl.Elems = make([]Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			cl.Elems[i] = cloneExprForShift(el)
+		}
+		return &cl
+	case *CaseExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		cl.Whens = make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			cl.Whens[i] = CaseWhen{When: cloneExprForShift(w.When), Then: cloneExprForShift(w.Then)}
+		}
+		cl.Else = cloneExprForShift(x.Else)
+		return &cl
+	case *InExpr:
+		cl := *x
+		cl.Operand = cloneExprForShift(x.Operand)
+		cl.List = make([]Expr, len(x.List))
+		for i, it := range x.List {
+			cl.List[i] = cloneExprForShift(it)
+		}
+		return &cl
 	default:
 		return e
 	}
