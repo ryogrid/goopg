@@ -2524,8 +2524,20 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	if isSqrt {
 		// For stddev, compute sqrt via high-precision float.
 		f64, _ := rat.Float64()
-		if f64 < 0 {
-			f64 = 0
+		if f64 <= 0 {
+			// Variance is exactly 0 (all inputs equal) or negative due to
+			// floating-point artifacts: stddev = 0, matching PostgreSQL.
+			//
+			// Without this guard the Newton seed below is sqrt(0) = 0 and the
+			// first iteration computes big.Float Quo(0, 0), which PANICS
+			// ("division of zero by zero"). The panic escaped to serveConn and
+			// dropped the connection — TPC-DS Q39's stddev_samp over a
+			// (warehouse, item, month) inventory group whose quantity never
+			// changes hit it on every run (the long-unexplained RC-4
+			// "connection lost"). The numeric sibling exactNumericVariance
+			// already had exactly this guard; the int path had lost it —
+			// sibling paths must agree.
+			return NewStringDatum("0")
 		}
 		// Newton-Raphson sqrt with 128-bit precision.
 		prec := uint(128)
@@ -2533,6 +2545,9 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
 		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
 		for i := 0; i < 15; i++ {
+			if seed.Sign() == 0 {
+				break
+			}
 			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
 			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
 		}

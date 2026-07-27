@@ -283,7 +283,7 @@ TPC-H gate. It is specified in design doc §7.1 and ledger rows `pq-P6`/`pq-P10`
 | query | ruled out | remaining |
 | --- | --- | --- |
 | **Q49** (30 vs 34) | `rank()` peer ties — `rank`/`dense_rank`/`row_number` are byte-identical to PG (`1,1,3,3,3,6`) | the `decimal(15,4)` ratio division reordering ties at rank 10; or the `LEFT OUTER JOIN … , date_dim` shape. 30 is exactly 3×10, one per branch (the three branches are joined by plain `union`, not `UNION ALL`) |
-| **Q39** (connection lost) | **nothing — corrected on review.** An earlier draft listed "a Go panic" as ruled out because no `backend goroutine panic` line exists for Q39 in any log. That is an argument from silence over a window with **no log at all**: coverage is `goopg.tpcds.log` 07-24 16:58–17:40 and `goopg.csq-bench.log` 07-27 07:18 onward, while the v4 sweep ran 07-26 13:57–18:19. The panic-vs-SIGKILL question is **open**, not settled | a Go panic in an unlogged window; the cgroup cap (`MemoryMax=24G`) killing an arbitrary hash-join build side (`probeIdx` is meaningless at zero stats, and `inventory` is 11.7M rows); or the unbounded `aggregateOp`. Re-run Q39 alone with logging and RSS monitoring before choosing a fix |
+| **Q39** (connection lost) | **RESOLVED after publication — root cause found at SF0.5** (see deferral ledger `tpcds-round2 Q39`): `exactIntVariance`'s Newton-Raphson stddev sqrt panicked on `big.Float.Quo(0,0)` for any group whose inputs are all equal (variance exactly 0 → seed 0); Q39's `stddev_samp` over constant inventory snapshots triggered it every run, and the panic escaped to serveConn as a socket close. Neither an OOM nor unexplained: the SF=1 crashes simply fell in unlogged windows. Guard mirrored from the numeric sibling; **E2E verified**: SF=1 OK 181 s with 230+6 = 236 rows, exact per-statement match with PG (the baseline's "6 rows" was the tail-1 harness artifact); SF0.5 = 77 rows, exact oracle match | — |
 | **Q35** | — | row count still unmeasured (525 s run) |
 
 **Methodological caution learned here.** The Q6/Q7 investigation initially
@@ -378,7 +378,33 @@ IN-list cross-kind coercion and that NULL still short-circuits to NULL.
 
 ## §5 Sweep results
 
-*(pending — appended when the run in §3 completes)*
+### §5.1 SF 0.5 gate — first full run (2026-07-27, completed)
+
+The user-requested fast regression gate (`scripts/tpcds-sf05-regression.sh`,
+commit `bdef5be8`) ran end-to-end while the SF=1 sweep was paused:
+half-sampled dataset, PG row-count oracle captured once via
+`EXPLAIN (ANALYZE, TIMING OFF)` (95/96 queries in 20 min), then one goopg pass.
+
+**`PASS=74 MISMATCH=5 ERROR=2 TIMEOUT=14 SKIP=4`** — every non-PASS accounted for:
+
+| bucket | queries | attribution |
+|---|---|---|
+| MISMATCH | Q47, Q50, Q72 | RC-1b (held fix) — same signature as SF=1 |
+| MISMATCH | Q49 | the known gap, narrowed to **one row** (24 vs 25) — cheap bisect now possible |
+| MISMATCH | **Q51** | **new discovery**: always TIMED OUT at SF=1 so never row-verifiable; completes at SF0.5 (66 s) and returns **0 vs oracle 100** — a wrong answer that was hiding behind a timeout |
+| ERROR | Q8 | the contained planner error, same signature |
+| ERROR | Q39 | the variance panic — root-caused and fixed the same day (§2.4) |
+| TIMEOUT | Q5 10 14 30 31 35 54 64 65 67 69 71 78 81 | the SF=1 planner family (+borderline Q35): join-order failures, not volume — half data does not rescue them |
+| SKIP | Q36 70 86, Q4 | policy (PG-failing / oracle timeout) |
+
+Two former SF=1 permanent timeouts — **Q82 and Q88 — completed and PASSED**,
+receiving their first-ever row-count verification. Q39's crash finally landed
+in a logged window here, which is what produced its root cause.
+
+### §5.2 SF=1 sweep (resumed from Q30)
+
+*(pending — appended when the resumed run completes; Q1–Q29 recorded before
+the pause, statuses all matching the 07-26 baseline)*
 
 ---
 
