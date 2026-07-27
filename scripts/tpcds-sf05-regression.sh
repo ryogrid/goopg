@@ -282,7 +282,14 @@ cmd_oracle() {
     guard_sf1_sweep
     mkdir -p "${OUTDIR}"
     log "Capturing PG oracle (EXPLAIN ANALYZE, timeout ${ORACLE_TIMEOUT}s/query) -> ${ORACLE}"
-    : > "${ORACLE}"
+    {
+        echo "# TPC-DS SF0.5 row-count oracle — PostgreSQL 18.3 ground truth"
+        echo "# captured: $(date -Iseconds)  source: $(git -C "${REPO_ROOT}" log --oneline -1 | cut -d' ' -f1)"
+        echo "# dataset: SF=1 TSVs, facts halved by key parity (see tpcds-sf05-regression.sh header)"
+        echo "# format: q|status|rows|secs   (secs are machine-specific; rows are the fixture)"
+        echo "# This file is GIT-TRACKED as a pinned fixture so other machines/CI can skip"
+        echo "# the ~20 min PG capture. Re-run 'oracle' only when the dataset or queries change."
+    } > "${ORACLE}"
     local q qf plan secs start rc rows status zero=0 okc=0
     for q in $(seq 1 99); do
         if grep -qw "$q" <<<"${PG_SKIP}"; then

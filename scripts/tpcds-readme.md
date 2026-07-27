@@ -257,9 +257,15 @@ same plan line carries the planner's *estimated* `rows=` first.
   (Q8 Q10 Q17 Q24 Q25 Q29 Q37 Q54 Q58 Q82 Q85 Q93).
 - Halving data does **not** rescue the ~16 planner-timeout queries — they are
   join-order failures, not volume failures, and most still TIMEOUT at SF 0.5.
-- Generated artefacts (`tpcds-data-sf05/`, `data-sf05/`, `tpcds-results-sf05/`,
+- Generated artefacts (`tpcds-data-sf05/`, `data-sf05/`, the plan captures,
   the `tpcds05` PG database) are runtime state, **not** git-tracked; they are
-  fully reproducible from the tracked script + the SF=1 TSVs.
+  fully reproducible from the tracked script + the SF=1 TSVs. **The one
+  exception is `tpcds-results-sf05/oracle.txt`, which IS git-tracked** as a
+  pinned fixture (~2 KB): the row counts are deterministic given the dataset
+  and queries, so tracking it lets other machines and CI run the goopg sweep
+  without the ~20 min PG capture. Re-run `oracle` (and commit the diff) only
+  when the dataset or the query files change — a row diff there is itself a
+  signal that ground truth moved.
 
 ## Environment knobs
 
