@@ -97,6 +97,45 @@ statement that kills backends.
 This qualifies §13.1 phase 5's "harness fixes — landed": the SF=1 harness still lacks a
 hazard the SF0.5 harness codifies.
 
+> **LANDED 2026-07-28** (`scripts/tpcds-bench-compare.sh`, `reap_pg_orphans`). The port keeps
+> both load-bearing properties (MATERIALIZED victim set, `client backend` + `active`), takes its
+> interval from `TIMEOUT_SEC` and its endpoint from `PG_PSQL`, and is called only on a `pg`
+> arm whose `LAST_STATUS` is `TIMEOUT`, printing the number terminated. Verified against the
+> live 65438 cluster with no orphans present: returns `0`, exit 0 — i.e. the no-victim case is
+> a no-op, not an error.
+
+### D4a. Engine provenance is a binary property, not a `git log` line
+
+Chunked execution (fix_plan's "Chunked execution" note) splits the sweep across invocations,
+and the stated invariant was "all chunk headers must name the same SHA". Measured while
+porting D4, `git log --oneline -1` is wrong in **both** directions:
+
+- it **changes** when a docs/tracker commit lands between chunks — not a code change, but it
+  reads as one; and
+- it does **not** change when the engine differs. `bench/tpcds/server.sh start` runs
+  `go build -o tmp/goopg-bench-bin ./cmd/goopg` **from the working tree**, and
+  `RESTART_AFTER_TIMEOUT=1` calls it after every goopg TIMEOUT. An uncommitted engine edit
+  therefore enters the sweep at the next bounce, under an unchanged header. This is the
+  mechanism behind the mis-provenanced sweep in "Problem" above.
+
+Worse, the on-disk binary is not necessarily the one *serving* the cluster. Live state at the
+start of this loop: the SF=1 server had been up 16 h on image `4140b160…` (shown by
+`/proc/<pid>/exe` as `(deleted)`) while `tmp/goopg-bench-bin` was `7a4b4f7b…`. A header naming
+either the commit or the on-disk build would have described an engine that answered nothing.
+
+The header therefore carries three lines: `git log -1` (kept, for readability),
+`# engine-tree:` (`git rev-parse HEAD:internal HEAD:cmd` — immune to docs commits), and
+`# engine-binary: running=<sha> on-disk=<sha>`, where `running` is the sha256 of
+`/proc/$(head -1 $TPCDS_PGDATA/postmaster.pid)/exe`. A mismatch prints a restart warning
+before any query runs, and `restart_goopg` re-checks after each rebuild, printing
+`*** SWEEP VOID: engine binary changed mid-sweep ***`. `go build` is deterministic for this
+target (verified: two builds of an unchanged tree → identical sha256), so the guard does not
+false-positive across the restarts the protocol itself performs.
+
+**Comparability rule, restated:** chunks are comparable when `engine-tree` **and**
+`engine-binary` match. A differing `git log -1` with identical tree+binary is a docs commit
+and does not void anything.
+
 ### D5. State labelling (§8)
 
 Every goopg number is **S-cold**. Record the proof before the sweep and paste it into the
@@ -105,13 +144,28 @@ report:
 ```
 psql -h 127.0.0.1 -p 65436 -U postgres -d postgres -c \
   "select relname, reltuples::bigint, relpages from pg_class
-    where relnamespace='public'::regnamespace order by 2 desc limit 8;"
+    where relname in ('store_sales','catalog_sales','web_sales','inventory',
+                      'customer','date_dim','item','store') order by 1;"
 psql -h 127.0.0.1 -p 65436 -U postgres -d postgres -c \
   "select count(*) from pg_stats where schemaname='public';"
 ```
 
 Zero `reltuples` ⇒ S-cold, the state M0125-0003 is designed to change. Non-zero means this
 is not the baseline M0125 needs.
+
+> **Correction 2026-07-28 — the original predicate made the proof vacuous.** This section first
+> filtered `where relnamespace='public'::regnamespace`. On goopg that returns **`(0 rows)` with
+> no error**: `regnamespace` is not implemented as PG's name-resolving type (`'public'::regnamespace::oid`
+> errors with `invalid input syntax for type oid: "public"`), so the predicate matches nothing.
+> "Zero rows" then satisfies "zero `reltuples`" *by construction* — it would have read as S-cold
+> on a fully ANALYZEd cluster too. The named-relation form above is the actual proof. Ledger row
+> 2026-07-28 records the missing `regnamespace` input function.
+>
+> Proof captured for this sweep — `analysis/tpcds-sf1-resweep-20260728/s-cold-proof.txt`:
+> all four probed relations report `reltuples=0 relpages=0` (`relnamespace=2200`), and
+> `count(*) from pg_stats where schemaname='public'` = **0**, with the data confirmed loaded
+> (`select count(*) from store_sales` = 2 880 404 = SF=1). GC regime `GOGC=off`,
+> `GOMEMLIMIT=12GiB`.
 
 ### D6. Classification and row counting
 

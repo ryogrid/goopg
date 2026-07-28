@@ -489,6 +489,25 @@ blocker; a code change landing mid-sweep voids the sweep.
         = 0), the `reap_pg_orphans` port from `scripts/tpcds-sf05-regression.sh`,
         and the final merge into `analysis/tpcds-sf1-goopg-<date>.md` reporting
         confirm/refute for the 13 §13.3 projections.
+      - **PROGRESS 2026-07-28 (loop #1 of the chunked sweep).** Once-per-sweep
+        prerequisites are DONE and committed: `reap_pg_orphans` ported (design
+        doc D4, verified against 65438 — 0 victims, exit 0) and the S-cold proof
+        captured at `analysis/tpcds-sf1-resweep-20260728/s-cold-proof.txt`
+        (8 relations `reltuples=0 relpages=0`, `pg_stats`=0, `store_sales`=2 880 404).
+        Two corrections landed with them: (a) D5's original predicate
+        `relnamespace='public'::regnamespace` returns `(0 rows)` on goopg, so the
+        S-cold proof was VACUOUS — now `relname IN (...)`; ledger row 2026-07-28
+        carries the missing `regnamespacein`; (b) **the same-SHA invariant is
+        replaced by same-`engine-tree` + same-`engine-binary`** (doc D4a) —
+        `git log -1` both changes on a docs commit and fails to change when
+        `server.sh start` rebuilds the engine from an uncommitted worktree at a
+        `RESTART_AFTER_TIMEOUT` bounce. The header now prints
+        `engine-tree:`/`engine-binary: running=… on-disk=…` (running = sha256 of
+        `/proc/<postmaster>/exe`; the serving image was 16 h stale at loop start)
+        and `restart_goopg` prints `*** SWEEP VOID … ***` on a mid-sweep change.
+        Sweep baseline: `engine-binary e6774c4f5e22f2fa`, `engine-tree
+        bba744a8… c47d4ed6…`, `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`. Every
+        later chunk must reprint those two values unchanged.
 - [ ] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
       (§13.5 #5). Phases 1.2/1.3 landed while `tpch-spotcheck.sh` reported SKIPPED
       and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the

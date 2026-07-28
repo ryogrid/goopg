@@ -141,8 +141,50 @@ run_one() {
         "${blocks:+[${blocks}] }" "${err:0:80}"
 }
 
+# Sweep-integrity provenance (M0124-0001, design doc 0124-0001 D1).
+#
+# A multi-loop sweep is chunked into several invocations and every chunk
+# header must describe the SAME engine. `git log -1` alone cannot carry that
+# invariant for two measured reasons:
+#
+#  * it changes when a docs/tracker commit lands between chunks, which is not
+#    a code change and must not read as one; and
+#  * it does NOT change when the engine differs — `bench/tpcds/server.sh
+#    start` runs `go build` from the WORKING TREE, so an uncommitted engine
+#    edit enters the sweep at the next RESTART_AFTER_TIMEOUT bounce. That is
+#    exactly the mis-provenance trap the design doc opens with
+#    (`sweep-20260727-214619.txt` labelled with RC-1b's parent).
+#
+# So the header also carries the tree hashes of the engine source and the
+# sha256 of the binary actually serving the cluster. Chunks are comparable
+# when engine-tree AND engine-binary match; restart_goopg re-checks the
+# binary after every rebuild.
+engine_tree_id() { git rev-parse "HEAD:internal" "HEAD:cmd" 2>/dev/null | tr '\n' ' '; }
+engine_bin_sha() { [[ -f "${GOOPG_BIN}" ]] && sha256sum "${GOOPG_BIN}" | cut -c1-16 || echo "absent"; }
+
+# The on-disk binary is not necessarily the one SERVING the cluster: a server
+# started before the last rebuild keeps running its (now deleted) image. That
+# was the live state when this guard was written — the SF=1 server had been up
+# 16 h on 4140b160 while tmp/goopg-bench-bin was 7a4b4f7b. Hash /proc/<pid>/exe
+# of the postmaster so the header names the engine that actually answered.
+running_engine_sha() {
+    local pidfile="${TPCDS_PGDATA}/postmaster.pid" pid
+    [[ -f "${pidfile}" ]] || { echo "no-pidfile"; return; }
+    pid="$(head -1 "${pidfile}")"
+    [[ -r "/proc/${pid}/exe" ]] || { echo "unreadable"; return; }
+    sha256sum "/proc/${pid}/exe" 2>/dev/null | cut -c1-16 || echo "unreadable"
+}
+ENGINE_BIN_SHA_AT_START="$(running_engine_sha)"
+
 echo "# TPC-DS SF=1 Benchmark — $(date -Iseconds)"
 echo "# goopg: $(git log --oneline -1)  PG: 18.3"
+echo "# engine-tree: $(engine_tree_id)"
+echo "# engine-binary: running=${ENGINE_BIN_SHA_AT_START} on-disk=$(engine_bin_sha) (${GOOPG_BIN})"
+if [[ "${ENGINE_BIN_SHA_AT_START}" != "$(engine_bin_sha)" ]]; then
+    echo "# WARNING: the serving goopg predates the current build of ${GOOPG_BIN}."
+    echo "#          Restart it (bench/tpcds/server.sh stop sf1 && … start sf1) before"
+    echo "#          a chunk you intend to publish, or the chunk measures an unknown engine."
+fi
 echo "# timeout: ${TIMEOUT_SEC}s per query, engines: ${ENGINES}, PG skip: ${PG_SKIP}"
 echo ""
 
@@ -170,6 +212,43 @@ restart_goopg() {
         echo "      WARNING: goopg restart failed — remaining results are suspect"
         return 1
     }
+    # server.sh start rebuilds from the working tree, so this restart is the
+    # one place a mid-sweep engine change can enter unnoticed. Say so loudly.
+    local now; now="$(running_engine_sha)"
+    if [[ "${now}" != "${ENGINE_BIN_SHA_AT_START}" ]]; then
+        echo "      *** SWEEP VOID: engine binary changed mid-sweep" \
+             "(${ENGINE_BIN_SHA_AT_START} -> ${now}) — re-run this chunk ***"
+        ENGINE_BIN_SHA_AT_START="${now}"
+    fi
+}
+
+# reap_pg_orphans — kill PG backends left running by a client-side timeout.
+#
+# Ported from scripts/tpcds-sf05-regression.sh for M0124-0001 (design doc
+# 0124-0001 D4): `timeout N psql` kills only the CLIENT; the PostgreSQL
+# backend keeps executing the query and contaminates every later timing in
+# the sweep. The SF0.5 harness codified this hazard; the SF=1 harness had no
+# equivalent, so a PG-side TIMEOUT silently left a hot backend behind.
+#
+# Two properties are load-bearing and must not be "simplified":
+#  * the victim set is MATERIALIZED — SQL does not guarantee evaluation
+#    order, and a bare `WHERE … AND pg_terminate_backend(pid)` has already
+#    killed a healthy backend in this programme (the Q6 incident);
+#  * the predicate is `backend_type='client backend' AND state='active'`,
+#    matching SF0.5 exactly. A looser `state <> 'idle'` would also match
+#    `idle in transaction` — a silent widening of a statement that kills
+#    backends.
+reap_pg_orphans() {
+    ${PG_PSQL} -t -A -c "
+        with victims as materialized (
+            select pid from pg_stat_activity
+            where backend_type='client backend'
+              and pid <> pg_backend_pid()
+              and datname='${TPCDS_PG_DB}'
+              and state='active'
+              and now()-query_start > interval '${TIMEOUT_SEC} seconds'
+        )
+        select count(*) from victims where pg_terminate_backend(pid)" 2>/dev/null || true
 }
 
 for q in $(parse_qlist "${1:-}"); do
@@ -186,6 +265,11 @@ for q in $(parse_qlist "${1:-}"); do
         pg)
             if ! grep -qw "${q}" <<<"${PG_SKIP}"; then
                 run_one "pg" "${PG_PSQL}" "${q}"
+                # A PG TIMEOUT killed only psql; reap the orphaned backend
+                # before it steals CPU from the next query (D4).
+                if [[ "${LAST_STATUS}" == "TIMEOUT" ]]; then
+                    echo "      (reaping orphaned PG backends: $(reap_pg_orphans | tr -d '[:space:]') terminated)"
+                fi
             else
                 printf "%-5s %-4s %-7s %s\n" "pg" "Q${q}" "SKIP" "known dsqgen artefact (fails on PG too)"
             fi
