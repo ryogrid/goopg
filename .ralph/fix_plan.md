@@ -1263,7 +1263,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **M0125-0011** below. Design
       `docs/design/0125-0009-parser-expr-key-structural.md`.
 
-- [ ] **M0125-0010 — FROM-subquery Project remap binds sibling aggregates by
+- [x] **M0125-0010 — FROM-subquery Project remap binds sibling aggregates by
       FUNCTION NAME, so `select * from (select sum(a), sum(b) …) d` returns
       `sum(a)` twice** (discovered by M0124-0006 2026-07-29, ledger row
       2026-07-29). **One-line root cause, wrong answers, row counts intact.**
@@ -1322,6 +1322,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       The two defects **compose**: Q21/Q66 need both fixes, so neither can be
       graded by "does the query match PG" alone. **This is now the top of the
       value-divergence queue.**
+      **CLOSED 2026-07-29.** Fix = `remapSubqueryColumnRefs` is now
+      **verify-then-repair**: a bare-`ColumnRef` target whose existing index is
+      in range AND names the column the ref asks for is left untouched (the only
+      branch that can tell two same-named child columns apart, so it must run
+      before any name search); only an out-of-range index, or one naming a
+      different column — the actual M0097-0058 leakage signature — is re-derived
+      by name. A plan dump with the pass disabled proved the **pre-remap indices
+      were already correct**: the pass was causing the damage, not repairing it.
+      A *positional* remap (which the pass's own doc comment claimed to
+      implement) was rejected — it breaks any `Project` that reorders or subsets
+      its child (`select b, a from t`). Gate = 3 tests in the new
+      `internal/planner/subquery_remap_test.go`; against the old code 4 of the 6
+      control-matrix rows fail, `group by` as the partial collapse `[0 1 1]`.
+      The third test is the M0097-0058 leakage-repair guard, without which the
+      fix could be "simplified" into deleting the pass and reintroducing the
+      original index-out-of-bounds crash. **Measured at SF=1 (65436 vs 65438):
+      all six carrier queries now match PG** — reproducer and Q21 byte-identical,
+      Q28/Q46/Q66/Q68/Q79 identical modulo the separate `char(n)` padding gap.
+      Q21 and Q66 needed BOTH this and M0125-0009. Artifacts
+      `analysis/m0125-0010-acceptance/`; design = §9 of
+      `docs/design/0125-0009-parser-expr-key-structural.md`; ledger row
+      2026-07-29 records the undiagnosed leak the pass still guards.
 - [ ] **M0125-0011 — FULL OUTER JOIN drops all but the FIRST conjunct of its ON
       condition** (discovered by M0125-0009's acceptance run, 2026-07-29, ledger
       row 2026-07-29). Isolated on the SF=1 clusters from TPC-DS **Q97**, whose

@@ -1,39 +1,46 @@
 (idle — nothing in flight)
 
-Last loop (#15, 2026-07-29): **M0124-0001 CLOSED.** The merged D7 deliverable
-`analysis/tpcds-sf1-goopg-20260728.md` landed. The sweep was NOT re-run — every
-figure is read back from `analysis/tpcds-sf1-resweep-20260728/`. Result: 11 of
-13 §13.3 projections confirmed as stated, 2 (Q50, Q46) confirmed on rows and
-REFUTED on values, 0 refuted outright; the projected **21** goopg-only defects
-measure **40** (ERROR 2 + TIMEOUT 17 [15 unbounded / 2 budget-marginal Q18+Q35]
-+ wrong-row-count 3 + **wrong-answer-behind-a-matching-row-count 18**).
-**The engine-commit freeze is LIFTED.**
+Last loop (#17, 2026-07-29): **M0125-0010 CLOSED** — the FROM-subquery
+`Project` remap. `remapSubqueryColumnRefs` (`internal/planner/planner.go`) is
+now **verify-then-repair**: a bare-`ColumnRef` target whose index is in range
+AND names the column the ref asks for is left alone; only an out-of-range index
+or one naming a different column (the M0097-0058 leakage signature) is
+re-derived by name. A plan dump with the pass disabled proved the pre-remap
+indices were ALREADY correct — the pass caused the damage. A positional remap
+(what its own doc comment claimed) was rejected: breaks `select b, a from t`.
+Gate = 3 tests in new `internal/planner/subquery_remap_test.go`; 4 of 6
+control-matrix rows fail against the old code, `GROUP BY` as `[0 1 1]`.
 
-NEXT LOOP — banner still M0124 → M0125 (M-NIGHTLY PARKED: keep FILING `## AI-`
-items, do not select; `ci/logs/action-items.md` unchanged since 2026-07-25, all
-26 already filed as ID RANGES `-008..-026`, so a per-ID grep FALSE-NEGATIVES —
-grep loosely, e.g. `grep 20260725 .ralph/fix_plan.md`).
+Measured SF=1: **all six carriers now match PG** — reproducer + Q21
+byte-identical; Q28 Q46 Q66 Q68 Q79 identical mod `char(n)` padding. Q21/Q66
+needed BOTH -0009 and -0010. Artifacts `analysis/m0125-0010-acceptance/`.
 
-**Recommended: M0125-0009** — the first engine fix now that the freeze is
-lifted. One-line root cause (`parserExprKey`'s `%T` fallback collapses sibling
-`sum(CASE …)` targets), 10 queries of evidence (Q2 Q21 Q40 Q43 Q50 Q59 Q62 Q66
-Q97 Q99), and the most legible instance in the sweep is Q97 —
-`store_only|catalog_only|store_and_catalog` = `392155|392155|392155` against PG's
-`541140|286927|161`, three disjoint sets, so equal cardinalities are impossible.
-Flat reproducer, no subquery: `select sum(case…), sum(case…) from date_dim`
-→ `10435|10435`.
+NEXT LOOP — re-read the `## Current Priority` banner (M-NIGHTLY still PARKED:
+keep FILING `## AI-` items, do not select; `ci/logs/action-items.md` unchanged
+since 2026-07-25, all 26 filed as ID RANGES `-008..-026`, so a per-ID grep
+FALSE-NEGATIVES — grep loosely, e.g. `grep 20260725 .ralph/fix_plan.md`).
 
-**M0125-0010 is a close second and INDEPENDENT** — `remapSubqueryColumnRefs`
-(`internal/planner/planner.go:2450`, name-match + `break` at `:2468`) binds
-FROM-subquery `Project` targets by column name, and an `Aggregate` names outputs
-after the function. 4 queries (Q28 Q46 Q68 Q79). Reproducer uses no `CASE`:
-`select * from (select sum(d_dom), sum(d_year) from date_dim) d`
-→ `1149021|1149021` vs PG `1149021|146061700`. Neither defect subsumes the other.
+**Recommended: M0125-0011** — FULL OUTER JOIN drops all but the FIRST ON
+conjunct. Probe matrix is in the fix_plan item; acceptance Q97 =
+`541140|286927|161`. Unlike -0009/-0010 it CHANGES row counts, so the SF0.5
+gate can see it. Design doc: §6 of
+`docs/design/0125-0009-parser-expr-key-structural.md` has the isolation.
 
-Acceptance for BOTH: value-compare, never row counts —
-`scripts/tpcds-value-diff.py bench/tpcds/runtime_goopg/tpcds-results <q>` (D6a).
-Never score a Q18/Q35 verdict flip or a Q50/Q46 row-count match as a win.
-Planner commits also need the TPC-H spotcheck + a timed 22-query power run.
+Gate notes for next loop (both cost time if rediscovered):
+- The SF0.5 sweep has **no query-range option** and one full run EXCEEDS the
+  60 min headless Bash ceiling (it reached Q53 in 3400 s). Run it in two parts:
+  the script for Q1-Q53, then a manual row-count loop vs
+  `bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt` for the tail,
+  restricted to baseline-PASS queries (a baseline TIMEOUT carries no signal).
+  See `analysis/m0125-0010-acceptance/README.md` for the exact loop.
+- Killing that sweep leaves an orphaned `psql` AND a 21 GB goopg on :65437 —
+  reap both (`server.sh stop sf05`) before any timing work.
+- **Q75 = `ERROR: division by zero` is PRE-EXISTING**, verified by reverting the
+  planner hunk and re-running. Do not attribute it to a planner change.
+- The 2026-07-27 SF0.5 pipeline log is a STALE baseline (10+ engine commits);
+  Q4/Q39/Q49/Q50/Q51 have since recovered to PASS on their own.
 
-Gates run: `make ralph-state-guard` PASS; pre-commit hook (pgbench smoke) PASS.
+Gates run: units precommit PASS; planner/analyzer/parser/executor PASS;
+tpch-spotcheck PASS (Q12=2, Q13=35); SF0.5 full coverage, zero regressions;
+pgbench smoke via commit hook.
 In-flight: none.

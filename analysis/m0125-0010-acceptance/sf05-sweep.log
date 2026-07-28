@@ -1,0 +1,60 @@
+[03:37:58] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260729-033758.txt
+Q1   PASS       64s      100 rows
+Q2   PASS       18s     2513 rows
+Q3   PASS        8s       31 rows
+Q4   SKIP (oracle: TIMEOUT)
+Q5   TIMEOUT   300s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q6   PASS       27s       37 rows
+Q7   PASS       33s      100 rows
+Q8   ERROR      12s psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query8.sql:10
+Q9   PASS       69s        1 rows
+Q10  TIMEOUT   304s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q11  PASS       24s        8 rows
+Q12  PASS        4s      100 rows
+Q13  PASS       27s        1 rows
+Q14  TIMEOUT   305s (oracle 200 rows)
+      (restarting goopg to drop accumulated heap)
+Q15  PASS        8s      100 rows
+Q16  PASS       23s        1 rows
+Q17  PASS       26s        0 rows
+Q18  PASS      152s      100 rows
+Q19  PASS       31s      100 rows
+Q20  PASS        7s      100 rows
+Q21  PASS       18s      100 rows
+Q22  PASS       27s      100 rows
+Q23  PASS       97s        1 rows
+Q24  PASS       34s        0 rows
+Q25  PASS       26s        0 rows
+Q26  PASS       16s      100 rows
+Q27  PASS       87s      100 rows
+Q28  PASS       42s        1 rows
+Q29  PASS       26s        0 rows
+Q30  TIMEOUT   305s (oracle 31 rows)
+      (restarting goopg to drop accumulated heap)
+Q31  TIMEOUT   305s (oracle 19 rows)
+      (restarting goopg to drop accumulated heap)
+Q32  PASS        5s        1 rows
+Q33  PASS       31s      100 rows
+Q34  PASS       16s      187 rows
+Q35  TIMEOUT   305s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS       26s        0 rows
+Q38  PASS       17s        1 rows
+Q39  PASS       69s       77 rows
+Q40  PASS       18s      100 rows
+Q41  PASS        9s        1 rows
+Q42  PASS        8s       10 rows
+Q43  PASS       10s        6 rows
+Q44  PASS       28s       10 rows
+Q45  PASS        9s        7 rows
+Q46  PASS       21s      100 rows
+Q47  MISMATCH   41s goopg=0 oracle=100
+Q48  PASS       24s        1 rows
+Q49  PASS       38s       25 rows
+Q50  PASS        9s        6 rows
+Q51  PASS       66s      100 rows
+Q52  PASS        8s      100 rows
+Q53  PASS       21s      100 rows

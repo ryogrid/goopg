@@ -2436,10 +2436,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
-// remapSubqueryColumnRefs walks the plan tree rooted at n and rewrites every
-// Project node so that its targets are position-based ColumnRefs (indices
-// 0..N-1) relative to the Project's own child output schema.  The original
-// output schema (column names and types) is preserved; only the ColumnRef
+// remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every
+// Project node whose bare-ColumnRef targets carry a column index that does not
+// address the Project's own child output schema.  The original output schema
+// (column names and types) is preserved; only demonstrably-broken ColumnRef
 // indices are rebuilt.
 //
 // This is a safety-normalisation pass applied after planning a FROM-clause
@@ -2447,6 +2447,20 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // to reference columns by their global FROM-clause index rather than by the
 // subquery's own output index, this pass corrects those indices before the
 // executor ever sees them.
+//
+// M0125-0010: it used to rebind EVERY target unconditionally, by matching
+// cr.Name against the child schema and taking the first hit.  An output
+// schema's names are not unique — an Aggregate names its outputs after the
+// aggregate *function*, so `select * from (select sum(a), sum(b) from t) d`
+// gave a child schema of [sum, sum] and both targets bound to slot 0,
+// returning sum(a) twice (TPC-DS Q21 Q28 Q46 Q66 Q68 Q79).  The repair is now
+// conditional: a target whose existing index already addresses a same-named
+// child column is left alone, so correct plans — the overwhelming majority —
+// are never touched, and duplicate names cannot collapse.  Only an index that
+// is out of range, or that points at a differently-named column (the actual
+// leakage signature this pass exists for), is re-derived by name.  Same
+// failure mode as M0125-0009: an ambiguous key resolved by taking the first
+// match.
 func remapSubqueryColumnRefs(n Node) Node {
 	if n == nil {
 		return nil
@@ -2456,28 +2470,39 @@ func remapSubqueryColumnRefs(n Node) Node {
 		// Recurse into child first.
 		x.Child = remapSubqueryColumnRefs(x.Child)
 		childSchema := x.Child.Output()
-		// Rebuild every target as a position-based ColumnRef.
+		// Repair only the targets whose index does not address the child.
 		newTargets := make([]Expr, len(x.Targets))
 		for i, t := range x.Targets {
-			// If target is a simple ColumnRef, replace with
-			// position-based index from child schema.
-			if cr, ok := t.(*ColumnRef); ok {
-				// Find matching column in child output by name.
-				found := false
-				for j, sc := range childSchema {
-					if strings.EqualFold(cr.Name, sc.Name) {
-						clone := *cr
-						clone.Index = j
-						newTargets[i] = &clone
-						found = true
-						break
-					}
-				}
-				if !found {
-					newTargets[i] = t // keep as-is
-				}
-			} else {
+			cr, ok := t.(*ColumnRef)
+			if !ok {
 				newTargets[i] = t // keep non-ColumnRef expressions
+				continue
+			}
+			// Already sound: the index is in range and names the same
+			// column the ref asks for.  This is the only branch that can
+			// distinguish two same-named child columns from each other,
+			// so it must run before any name-based search (M0125-0010).
+			if cr.Index >= 0 && cr.Index < len(childSchema) &&
+				strings.EqualFold(cr.Name, childSchema[cr.Index].Name) {
+				newTargets[i] = t
+				continue
+			}
+			// Broken index (out of range, or naming a different column):
+			// re-derive it from the child output by name.  A duplicate
+			// name here is genuinely ambiguous — the first match is a
+			// best effort on a plan that is already wrong.
+			found := false
+			for j, sc := range childSchema {
+				if strings.EqualFold(cr.Name, sc.Name) {
+					clone := *cr
+					clone.Index = j
+					newTargets[i] = &clone
+					found = true
+					break
+				}
+			}
+			if !found {
+				newTargets[i] = t // keep as-is
 			}
 		}
 		x.Targets = newTargets
