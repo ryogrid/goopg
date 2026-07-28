@@ -92,6 +92,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 54 | TIMEOUT 632 s | 0 | OK 0 s | 0 | TIMEOUT 657 s | goopg-only timeout; unbounded above; unchanged from set A |
 | 55 | OK 16 s | 73 | OK 0 s | 73 | OK 18 s / 73 | rows = PG; stable |
 | 56 | OK 66 s | 100 | OK 0 s | 100 | OK 67 s / 100 | rows = PG; stable |
+| 57 | OK 108 s | 100 | OK 1 s | 100 | OK 109 s / 100 | rows = PG; stable (−1 s) |
+| 58 | OK 42 s | 0 | OK 0 s | 0 | OK 41 s / 0 | rows = PG (**both** engines return 0); stable |
+| 59 | OK 32 s | 100 | OK 1 s | 100 | OK 33 s / 100 | rows = PG; stable |
+| 60 | OK 67 s | 100 | OK 0 s | 100 | OK 67 s / 100 | rows = PG; stable (exact) |
+| 61 | OK 123 s | 1 | OK 0 s | 1 | OK 120 s / 1 | rows = PG; stable (+3 s) |
+| 62 | OK 9 s | 100 | OK 0 s | 100 | OK 12 s / 100 | rows = PG; stable (−3 s) |
+| 63 | OK 44 s | 100 | OK 0 s | 100 | OK 43 s / 100 | rows = PG; stable |
+| 64 | TIMEOUT 632 s | 0 | OK 0 s | 8 | TIMEOUT 654 s / 0 | goopg-only timeout; unbounded above; reproduces set A (−22 s, both cut at budget) |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -292,6 +300,47 @@ Row mismatches vs PG among OK queries, Q1–Q56: Q47 (0/100), Q49 (30/34), Q51
 (0/100). Set A's list over the same range was Q47, Q49, **Q50**, Q51 — Q50 has
 since been fixed.
 
+### Chunk 57–64 — the first fully uneventful chunk of the sweep
+
+Chunk 57–64 (`chunk-57-64.txt`) ran ~18 min, exit 0, header reprinting the sweep
+baseline `engine-id` unchanged (still ONE sweep under D4a). One goopg-only
+timeout (Q64) triggered the scripted restart; no reap was needed.
+
+This is the **first chunk in the whole re-sweep that produced no new finding at
+all**, and that is itself the result worth recording:
+
+- **All seven OK queries match PG's row count exactly** (Q57 100, Q58 0, Q59 100,
+  Q60 100, Q61 1, Q62 100, Q63 100). No new row mismatch enters the sweep-wide
+  list, which still stands at Q47/Q49/Q51 for Q1–Q64.
+- **Every OK runtime reproduces set A within ±3 s** (max deviation Q61 +3 s and
+  Q62 −3 s, both well inside run-to-run noise; Q60 is exact at 67 s). Nothing
+  here resembles the Q47 8.4× signal that opened and then closed the
+  runtime-deviation class — that class stays **empty**.
+- **Q58's 0 rows is not a defect.** Both engines return 0 at SF=1, i.e. the
+  query's date/item predicates simply select nothing from this dataset. It is
+  scored `rows = PG`, not a row gap; the pattern to avoid is reading a bare
+  "goopg returned 0" as a wrong answer without checking PG's own count (the
+  mistake that mis-framed Q47 in chunk 41–48).
+- **Q64 reproduces set A's goopg-only timeout** (632 s vs 654 s, both cut at the
+  600 s budget). Unlike Q54, PG *does* return a non-empty answer here (8 rows in
+  0 s), so goopg's 0 is uninformative about correctness — the query never
+  produced output before the cut. Classified **unbounded above**; whether Q64
+  also has a row gap cannot be decided until it completes under a larger budget.
+
+Running timeout classification (D6), Q1–Q64 (57–64 contributed one goopg-only
+timeout, Q64 — already present in set A — and no new ERROR):
+
+- **both engines** (excluded from "goopg-only"): Q4
+- **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31, Q54, **Q64**
+- **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
+  at 600 s): Q18, Q35, Q51
+- **PG-only** (goopg wins): Q11
+- **goopg ERROR**: Q8
+- **not a goopg error** (query text invalid on PG too): Q36
+
+Row mismatches vs PG among OK queries, Q1–Q64: unchanged at Q47 (0/100), Q49
+(30/34), Q51 (0/100).
+
 ## Cursor
 
-`M0124-0001 sweep: 1-56 done; next 57-64.`
+`M0124-0001 sweep: 1-64 done; next 65-72.`

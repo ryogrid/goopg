@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `57-64`
->    (`scripts/tpcds-bench-compare.sh 57-64`; chunks 1–56 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `65-72`
+>    (`scripts/tpcds-bench-compare.sh 65-72`; chunks 1–64 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -588,6 +588,27 @@ blocker; a code change landing mid-sweep voids the sweep.
         Q44 58 s), so one call, est. ~5 min. Predict the known **RC-1b row gap at
         Q47** (goopg 0 rows vs PG 100) — a correctness delta, not a timing one,
         and already-known, so it must not be filed as a new finding.
+      - **Chunks 41–64 DONE** (loops #6–#8; `chunk-41-48.txt`, `chunk-49-56.txt`,
+        `chunk-57-64.txt`, one harness call each, all reprinting the sweep-baseline
+        `engine-id`). Per-cell detail lives in `RESULTS.md` (authoritative); the
+        two conclusions that outlive the chunks: (1) the **runtime-deviation
+        class opened at Q47 (8.4×) is CLOSED and empty** — chunk 49–56's decisive
+        cell was **Q50, whose row gap closed 0 → 6 = PG**, proving the RC-1b fix
+        `5db0a067` landed and changed plans in that family, so Q47's 17 s → 142 s
+        is the cost of newly-*correct* input, not a regression. The chunk-41–48
+        rule "rows didn't move ⇒ not a newly-correct plan" was **wrong** and must
+        not be reused; Q47's surviving 0-vs-100 is a separate downstream defect.
+        (2) Chunk 57–64 is the **first fully uneventful chunk**: all seven OK
+        cells match PG's rows exactly and reproduce set A within ±3 s. Q58's 0
+        rows is **not** a gap — PG returns 0 too. Running D6 for Q1–Q64:
+        both-engine Q4; goopg-only unbounded Q5/Q10/Q14/Q30/Q31/Q54/**Q64**;
+        goopg-only budget-marginal Q18/Q35/**Q51** (Q51 did not flip, 587 s, 13 s
+        headroom); PG-only Q11; goopg ERROR Q8; not-a-goopg-error Q36. Row
+        mismatches among OK queries Q1–Q64: Q47, Q49, Q51.
+        **NEXT: chunk `65-72`.** Check set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 6[5-9]|^| 7[0-2] `) for the timeout count in range FIRST and
+        size the Bash `timeout` accordingly; note `PG_SKIP="36 70 86"` covers **Q70**
+        in this range, so that cell has no PG side by design.
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
