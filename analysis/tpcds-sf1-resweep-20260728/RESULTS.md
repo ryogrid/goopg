@@ -60,6 +60,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 22 | OK 156 s | 100 | OK 5 s | 100 | OK 162 s / 100 | rows = PG; stable |
 | 23 | OK 210 s | 1 [1+0] | OK 6 s | 1 [1+0] | OK 208 s / 1 | rows = PG; stable |
 | 24 | OK 75 s | 0 [0+0] | OK 0 s | 0 [0+0] | OK 75 s / 0 | rows = PG (both empty); stable |
+| 25 | OK 53 s | 0 | OK 2 s | 0 | OK 55 s / 0 | rows = PG (both empty); stable |
+| 26 | OK 34 s | 100 | OK 0 s | 100 | OK 35 s / 100 | rows = PG; stable |
+| 27 | OK 234 s | 100 | OK 1 s | 100 | OK 239 s / 100 | rows = PG; stable |
+| 28 | OK 88 s | 1 | OK 2 s | 1 | OK 89 s / 1 | rows = PG; stable |
+| 29 | OK 55 s | 1 | OK 0 s | 1 | OK 53 s / 1 | rows = PG; stable |
+| 30 | TIMEOUT 627 s | 0 | OK 13 s | 63 | TIMEOUT 649 s | goopg-only timeout; **unbounded above** — unchanged |
+| 31 | TIMEOUT 629 s | 0 | OK 12 s | 43 | TIMEOUT 647 s | goopg-only timeout; **unbounded above** — unchanged |
+| 32 | OK 11 s | 1 | OK 0 s | 1 | OK 10 s / 1 | rows = PG; stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -100,10 +108,31 @@ Q18's timeout again moved the binary image hash (`01bb0f65…` → `22110d95…`
 `engine-id` unmoved — the same `vcs.revision` stamp effect documented above for
 chunks 5–8 and 9–12, not a source change.
 
-Running timeout classification (D6), Q1–Q24:
+Chunk 25–32 was run as two harness calls (`chunk-25-28.txt`, `chunk-29-32.txt`)
+because set A shows two goopg timeouts in the range and the split keeps each call
+inside one foreground budget; both reprint the sweep-baseline `engine-id`
+unchanged, so D4a still holds and this is one sweep.
+
+Every one of the eight cells reproduces set A — largest delta 5 s among the six
+OK cells (Q27, 239 → 234 s), and the two timeouts land on the same verdict with
+the usual sub-budget excess. **Q30 and Q31 are the cleanest members of the D6
+goopg-only class so far**: PG answers both cheaply and exactly (13 s / 63 rows,
+12 s / 43 rows), goopg has never completed either in any run of either sweep, and
+the pair has now been observed at 649/647 s (set A) and 627/629 s (here) — all
+four figures are the harness cutting an execution that was still running, so the
+true runtime is **unbounded above** in the Q5/Q10/Q14 sense, not budget-marginal
+like Q18. Any future change that lands Q30 or Q31 under the budget is therefore
+real signal, and unlike Q18 the cell carries a PG row count to validate against.
+
+The reap did not fire in this range (no PG timeouts). Both goopg restarts — after
+Q30 and after Q31 — reported the same post-restart image (`46632999aa3f5c75`),
+which is the expected steady state: the `vcs.revision` stamp moves once when the
+commit under which the binary was built changes, not on every restart.
+
+Running timeout classification (D6), Q1–Q32:
 
 - **both engines** (excluded from "goopg-only"): Q4
-- **goopg-only, runtime unbounded above**: Q5, Q10, Q14
+- **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31
 - **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
   at 600 s): Q18
 - **PG-only** (goopg wins): Q11
@@ -111,4 +140,4 @@ Running timeout classification (D6), Q1–Q24:
 
 ## Cursor
 
-`M0124-0001 sweep: 1-24 done; next 25-32.`
+`M0124-0001 sweep: 1-32 done; next 33-40.`

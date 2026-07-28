@@ -1,10 +1,10 @@
 Task: **M0124-0001** — TPC-DS SF=1 dual-engine re-sweep at HEAD, chunked.
-Status: once-per-sweep prerequisites DONE + **chunks 1–24 DONE**.
+Status: once-per-sweep prerequisites DONE + **chunks 1–32 DONE**.
 
-Files: `analysis/tpcds-sf1-resweep-20260728/{RESULTS.md,chunk-17-24.txt}`,
-`docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md` (D6 sub-class),
-`docs/design/README.md` (index line), `.ralph/fix_plan.md` (progress + banner
-cursor). No engine/harness code changed this loop — measurement only.
+Files: `analysis/tpcds-sf1-resweep-20260728/{RESULTS.md,chunk-25-28.txt,
+chunk-29-32.txt}`, `.ralph/fix_plan.md` (chunk-4 note + banner cursor + the
+task's NEXT line). No engine/harness code and no design doc changed this loop —
+measurement only; the D6 sub-class the doc needed landed with chunk 3.
 
 Key symbols: `reap_pg_orphans`, `engine_id`, `restart_goopg` (all in
 `scripts/tpcds-bench-compare.sh`) — unchanged this loop.
@@ -14,33 +14,37 @@ Findings:
   `engine-id bba744a817f7ebdec31fd47edfed40362641dd0c
   c47d4ed683a0ac63d56c7f755e70892a635f3a42 diff=e3b0c44298fc`,
   `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`, `RESTART_AFTER_TIMEOUT=1`, S-cold.
-  chunk-17-24 reprinted it — still ONE sweep under D4a.
-- Q17/Q19–Q24 reproduce set A within 6 s. **Q18 flipped as predicted:** set A
-  `OK 626 s/100`, now `TIMEOUT 627 s/0` — 1 s apart, same work, opposite side of
-  the cut. Recorded as budget noise; NOT re-run.
-- **D6 now has a budget-marginal sub-class** (landed in the design doc): a
-  verdict flip on Q18 (or Q82, ~576 s) is a coin re-roll and must never be
-  reported as a fix/regression; Q5/Q10/Q14 are unbounded-above and ARE signal.
-- Running D6, Q1–Q24: both-engine Q4; goopg-only unbounded Q5/Q10/Q14;
+  Both chunk-4 calls reprinted it — still ONE sweep under D4a.
+- Chunk 4 was SPLIT (`25-28` + `29-32`) per the ≥2-set-A-timeouts rule; the
+  estimator was right a third time (Q30, Q31 both timed out).
+- All 8 cells reproduce set A; largest delta 5 s (Q27 239→234 s).
+- **Q30/Q31 are the cleanest D6 goopg-only members yet** — PG answers both
+  cheaply and exactly (13 s/63, 12 s/43); goopg has never completed either in
+  any run of either sweep (649/647 s set A, 627/629 s here — all four are the
+  harness cutting a still-running execution). **Unbounded above**, like
+  Q5/Q10/Q14, NOT budget-marginal like Q18. Valid M0125 targets, and they carry
+  a PG row count to validate a fix against.
+- Running D6, Q1–Q32: both-engine Q4; goopg-only unbounded Q5/Q10/Q14/Q30/Q31;
   goopg-only budget-marginal Q18; PG-only Q11; goopg ERROR Q8.
-- Binary image moved again on the post-Q18 restart (`01bb0f65…`→`22110d95…`)
-  with `engine-id` unmoved — known `vcs.revision` stamp effect, not a change.
+- Both restarts reported the SAME post-restart image (`46632999aa3f5c75`) —
+  the `vcs.revision` stamp moves with the build commit, not per restart.
 
-NEXT LOOP — continue M0124-0001, **chunk `25-32`** (banner: M0124 → M0125;
+NEXT LOOP — continue M0124-0001, **chunk `33-40`** (banner: M0124 → M0125;
 M-NIGHTLY stays PARKED — keep FILING `## AI-` items, do not select them; the 26
-`AI-20260725-*` items are already filed and nothing newer exists as of this loop):
+`AI-20260725-*` items are filed BY SUBJECT, not by id, and nothing newer exists):
   `ENGINES="goopg pg" TIMEOUT_SEC=600 RESTART_AFTER_TIMEOUT=1 \
-   scripts/tpcds-bench-compare.sh 25-32 > \
-   analysis/tpcds-sf1-resweep-20260728/chunk-25-32.txt 2>&1`
-Foreground, Bash `timeout` 55 min. **Check set A first** (`analysis/
-tpcds-sf1-goopg-20260727.md` §5.2, rows 25–32) and SPLIT into `25-28`/`29-32` if
-it shows ≥2 timeouts in the range — that estimator has been right twice now.
-Watch for another budget-marginal cell (any set-A `OK` above ~570 s).
-Then append rows to `RESULTS.md` and move its cursor. No engine commit may land
-until the sweep reaches Q99 — a docs/tracker commit is fine (engine-id unmoved).
+   scripts/tpcds-bench-compare.sh 33-40 > \
+   analysis/tpcds-sf1-resweep-20260728/chunk-33-40.txt 2>&1`
+Foreground, Bash `timeout` 55 min. Set A rows 33–40 show only ONE goopg timeout
+(Q35) → **no split needed**; est. ~30 min. **Predict Q35 as budget-marginal**:
+set A `TIMEOUT 651 s` but the 2026-07-26 baseline had it `OK 525 s`, so an `OK`
+here is a re-rolled coin, NOT a fix — classify it as the Q18 sub-class. Also
+expect Q36 `ERROR 0 s` on goopg / `SKIP` on PG (known dsqgen artifact, fails on
+PG too — not a goopg error). Then append rows to `RESULTS.md`, update its
+Cursor, and move the fix_plan banner + task NEXT lines. No engine commit may
+land until the sweep reaches Q99 — a docs/tracker commit is fine.
 
-Gates run: one full harness chunk (exit 0, header verified against the baseline
-engine-id); `make ralph-state-guard` OK (self-repaired a stale progress marker);
-pgbench smoke via the commit hook. No Go code touched, so no unit-suite run was
-warranted.
+Gates run: two full harness chunks (both exit 0, headers verified against the
+baseline engine-id); `make ralph-state-guard`; pgbench smoke via the commit hook.
+No Go code touched, so no unit-suite run was warranted.
 In-flight: none.

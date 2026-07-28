@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `25-32`
->    (`scripts/tpcds-bench-compare.sh 25-32`; chunks 1–24 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `33-40`
+>    (`scripts/tpcds-bench-compare.sh 33-40`; chunks 1–32 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -553,7 +553,23 @@ blocker; a code change landing mid-sweep voids the sweep.
         goopg ERROR Q8. No reap this range (no PG timeout); the post-Q18 restart
         again moved the binary image (`01bb0f65…` → `22110d95…`) with `engine-id`
         unmoved — the documented `vcs.revision` stamp effect, not a source change.
-        **NEXT: chunk `25-32`.**
+      - **Chunk 4 (Q25–Q32) DONE** (2026-07-28, split into `chunk-25-28.txt` +
+        `chunk-29-32.txt` because set A shows two goopg timeouts in the range;
+        both calls reprint the sweep-baseline `engine-id`, so D4a holds and this
+        is still ONE sweep). All eight cells reproduce set A — largest delta 5 s
+        (Q27 239 → 234 s). **Q30 and Q31 are the cleanest D6 goopg-only members
+        yet:** PG answers both cheaply and exactly (13 s/63 rows, 12 s/43 rows),
+        goopg has never completed either in any run of either sweep, and all four
+        observations (649/647 s set A, 627/629 s here) are the harness cutting a
+        still-running execution — **unbounded above**, like Q5/Q10/Q14, NOT
+        budget-marginal like Q18. They are therefore valid M0125 targets whose
+        movement would be real signal, and they carry a PG row count to validate
+        against. Running D6 classification for Q1–Q32: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14/**Q30**/**Q31**; goopg-only budget-marginal Q18;
+        PG-only Q11; goopg ERROR Q8. No reap this range (no PG timeout); both
+        restarts reported the same post-restart image (`46632999aa3f5c75`) —
+        the stamp moves with the build commit, not per restart.
+        **NEXT: chunk `33-40`.**
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
