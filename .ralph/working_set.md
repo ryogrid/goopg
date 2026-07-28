@@ -1,46 +1,51 @@
 (idle — nothing in flight)
 
-Last loop (#17, 2026-07-29): **M0125-0010 CLOSED** — the FROM-subquery
-`Project` remap. `remapSubqueryColumnRefs` (`internal/planner/planner.go`) is
-now **verify-then-repair**: a bare-`ColumnRef` target whose index is in range
-AND names the column the ref asks for is left alone; only an out-of-range index
-or one naming a different column (the M0097-0058 leakage signature) is
-re-derived by name. A plan dump with the pass disabled proved the pre-remap
-indices were ALREADY correct — the pass caused the damage. A positional remap
-(what its own doc comment claimed) was rejected: breaks `select b, a from t`.
-Gate = 3 tests in new `internal/planner/subquery_remap_test.go`; 4 of 6
-control-matrix rows fail against the old code, `GROUP BY` as `[0 1 1]`.
+Last loop (#18, 2026-07-29): **M0124-0003 CLOSED** — the round-2 §10
+deferral-ledger completion. 13 rows appended to `.ralph/deferral_ledger.md`
+(516 → 529 lines): the seven §10 rows (in-list-common-type, scaninput-reorder,
+smalldim-gate, grouping-sets-operator, exists-under-or, setop-parallel,
+plancache-analyze), the `aggregateOp work_mem` DROP row as `status = resolved`
+(no new status value invented), and five audit rows (row-anchor
+value-blindness, exprwalk-residual, posmap-assert, panic-to-xx000,
+q47-q49-q51). Plus the `pq-P10` UPDATE naming M0125-0003 as consumer of its
+option (b). Design doc flipped to `accepted` with an execution record.
 
-Measured SF=1: **all six carriers now match PG** — reproducer + Q21
-byte-identical; Q28 Q46 Q66 Q68 Q79 identical mod `char(n)` padding. Q21/Q66
-needed BOTH -0009 and -0010. Artifacts `analysis/m0125-0010-acceptance/`.
+Doc-only loop — no Go code touched.
 
-NEXT LOOP — re-read the `## Current Priority` banner (M-NIGHTLY still PARKED:
-keep FILING `## AI-` items, do not select; `ci/logs/action-items.md` unchanged
-since 2026-07-25, all 26 filed as ID RANGES `-008..-026`, so a per-ID grep
-FALSE-NEGATIVES — grep loosely, e.g. `grep 20260725 .ralph/fix_plan.md`).
+**Reusable findings (do not re-derive):**
+- The round-2 README's line cites are STALE by ~10 commits. Six drifted:
+  `open.go:2911`→`:2924`; `planner.go:1020`→`:1012` (push) vs `:1024` (remap)
+  vs `:1037` (`pushSingleSourceFiltersAfterRemap`); grouping sets `:3176`→
+  `:650`; MHJ gate conditions at `local_filters.go:171`/`:175`; `*SetOp` at
+  `parallel.go:313`. Re-resolve before citing.
+- **M0125-0002 is NINE walkers, not seven** — `walkColumnRefsImpl`
+  (`pushdown.go:362`) and the `shiftColumnRefs` closure
+  (`mhj_input_rewrite.go:735`) also lack `default:`. The first is fail-open in
+  the dangerous direction: no callback ⇒ no `onOuter()` veto ⇒ a conjunct
+  wrapping an outer ref reads single-side and can be pushed below an outer join.
+- ANALYZE **cannot** reach `planCache.Invalidate()` by any path: both call
+  sites (`dispatch.go:2976`, `dispatch_extended.go:364`) are
+  `*planner.DDL`-guarded and ANALYZE plans to `*planner.Utility`
+  (`planner.go:212-218`).
+- Ledger rendering: nine PRE-EXISTING rows carry unescaped `|` inside code
+  spans and already render with 8–21 cells on GitHub (GFM splits cells before
+  inline parsing). Never put a bare `|` in a cell; escape as `\|`.
 
-**Recommended: M0125-0011** — FULL OUTER JOIN drops all but the FIRST ON
-conjunct. Probe matrix is in the fix_plan item; acceptance Q97 =
-`541140|286927|161`. Unlike -0009/-0010 it CHANGES row counts, so the SF0.5
-gate can see it. Design doc: §6 of
-`docs/design/0125-0009-parser-expr-key-structural.md` has the isolation.
+NEXT LOOP — re-read the `## Current Priority` banner. Its "NEXT TASK TO SELECT"
+pointer is STALE (still names M0124-0001, closed loop #17). M0124 remains
+priority 2 with three open items, all needing multi-hour benchmark runs:
+**M0124-0004** (Q35 row count — needs a small SF0.5 script change first: no
+per-query mode, `TPCDS_RESULTS_DIR` not env-overridable, `restart_goopg`
+hardcodes sf1; then a solo 900 s run on 65437), **M0124-0005** (SF0.5 oracle
+checksum column), **M0124-0002** (retroactive TPC-H + plan-gate A/B, the
+longest). M0124-0004 is the cheapest of the three and its `EXPLAIN ANALYZE`
+also discharges RC-8's "measure first" criterion for Q10/Q35/Q69 at once.
+M-NIGHTLY still PARKED: `ci/logs/action-items.md` unchanged since 2026-07-25,
+all 26 filed as ID RANGES `-008..-026`, so a per-ID grep FALSE-NEGATIVES —
+grep loosely (`grep 20260725 .ralph/fix_plan.md`).
 
-Gate notes for next loop (both cost time if rediscovered):
-- The SF0.5 sweep has **no query-range option** and one full run EXCEEDS the
-  60 min headless Bash ceiling (it reached Q53 in 3400 s). Run it in two parts:
-  the script for Q1-Q53, then a manual row-count loop vs
-  `bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt` for the tail,
-  restricted to baseline-PASS queries (a baseline TIMEOUT carries no signal).
-  See `analysis/m0125-0010-acceptance/README.md` for the exact loop.
-- Killing that sweep leaves an orphaned `psql` AND a 21 GB goopg on :65437 —
-  reap both (`server.sh stop sf05`) before any timing work.
-- **Q75 = `ERROR: division by zero` is PRE-EXISTING**, verified by reverting the
-  planner hunk and re-running. Do not attribute it to a planner change.
-- The 2026-07-27 SF0.5 pipeline log is a STALE baseline (10+ engine commits);
-  Q4/Q39/Q49/Q50/Q51 have since recovered to PASS on their own.
-
-Gates run: units precommit PASS; planner/analyzer/parser/executor PASS;
-tpch-spotcheck PASS (Q12=2, Q13=35); SF0.5 full coverage, zero regressions;
-pgbench smoke via commit hook.
+Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(all cached — correct, zero Go files changed); D6 render check via
+`gh api --method POST /markdown` (1 table, 14 rows, 7 cells each);
+`make ralph-state-guard`; pgbench smoke via the commit hook.
 In-flight: none.

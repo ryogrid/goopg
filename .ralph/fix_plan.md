@@ -822,9 +822,37 @@ blocker; a code change landing mid-sweep voids the sweep.
       7's missing `analysis/` artifact for phase 2.1. Noise band: >8 % explained,
       >25 % blocks (round-5 §3 calls 2–8 % moves unattributable). Design
       `docs/design/0124-0002-retroactive-tpch-plan-gate-discharge.md`.
-- [ ] **M0124-0003 — append the seven missing §10 deferral-ledger rows** (§13.5
-      #6). §13.2: the seven `tpcds-round2` rows that exist are the rows the WORK
-      produced, not the rows §10 planned. Append: parse-time IN-list
+- [x] **M0124-0003 — append the seven missing §10 deferral-ledger rows** (§13.5
+      #6). **DONE 2026-07-29.** 13 rows appended to `.ralph/deferral_ledger.md`
+      (516 → 529 lines): D2's seven §10 rows, D3's drop row, D5's five
+      audit-produced rows — plus D4's `UPDATE` on the existing `pq-P10` row
+      naming **M0125-0003** as the consumer of its option (b) and recording that
+      option (a), actually persisting `reltuples`/`relpages`, stays deferred and
+      unowned. No eighth `reltuples` row. The moot `aggregateOp work_mem` row is
+      `status = resolved` with the drop in its task-id, so **no new status value
+      was invented** and M0119's queue gains no phantom work. D6 render check via
+      `gh api --method POST /markdown`: one table, 14 body rows, 7 cells each.
+      **Every claim was re-resolved against HEAD before it was written, and six
+      cites had drifted** — `open.go:2911`→`:2924`; §3.5's push/remap pair
+      `planner.go:1020`→`:1012` vs `:1024`, with the compensating
+      `pushSingleSourceFiltersAfterRemap` at `:1037`; the reorder's resume point
+      is a *call-order* change in `planner.go`, not `mhj_input_rewrite.go`;
+      grouping-sets `:3176`→`:650`; the MHJ gate's two conditions at
+      `local_filters.go:171`/`:175`; `*SetOp` at `parallel.go:313`. Verification
+      strengthened three rows: **ANALYZE cannot reach either `Invalidate()` call
+      site by any path** (it plans to `*planner.Utility`, both sites are
+      `*planner.DDL`-guarded) and `planCacheIsCacheable`'s comment names a class
+      its switch omits; **`walkColumnRefsImpl`'s missing `default:` is fail-open
+      in the dangerous direction** — no callback means no `onOuter()` veto, so a
+      conjunct wrapping an outer ref reads single-side and can be pushed below an
+      outer join, which makes **M0125-0002 nine walkers, not seven**; and the
+      value-blindness row covers `ci/batch/tpch-row-anchors.csv` as well as the
+      TPC-DS anchors. Follow-up observed, deliberately not fixed (Non-goals):
+      nine pre-existing rows carry unescaped `|` inside code spans and already
+      render with 8–21 cells — a second instance of the ledger rendering hazard,
+      same `\|` discipline. Design doc now `accepted` with an execution record.
+      Original scope follows. §13.2: the seven `tpcds-round2` rows that exist are
+      the rows the WORK produced, not the rows §10 planned. Append: parse-time IN-list
       `select_common_type` (§5.4); the `rewriteScanInputsWithSingleTablePredicates`
       reorder (§3.5); the `shouldAttachBeforeMHJ` `SmallDimension` gate (RC-5);
       shared-scan GROUPING SETS (RC-7); EXISTS-under-OR / hashed-SubPlan caching

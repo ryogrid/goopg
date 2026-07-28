@@ -1,6 +1,6 @@
 # 0124-0003 — Round-2 §10 deferral-ledger completion
 
-Status: draft
+Status: accepted (executed 2026-07-29 — see "Execution record")
 Date: 2026-07-28
 Milestone: M0124-0003 (`docs/design/tpcds-round2-fixes/README.md` §13.5 action 6)
 
@@ -106,3 +106,67 @@ decision, not a transcription.
 
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`, the pre-commit hook, and D6's
 render check.
+
+## Execution record (2026-07-29)
+
+Executed as specified: **13 rows appended** to `.ralph/deferral_ledger.md` (516 → 529 lines) —
+D2's seven, D3's drop row, D5's five — plus D4's `UPDATE` note on the existing `pq-P10` row.
+No eighth `reltuples` row was created.
+
+D3 was followed literally, so **no new `status` value was invented**: the moot `work_mem` row
+is `status = resolved` with the drop stated in its task-id
+(`tpcds-round2 aggregate-work-mem (DROPPED — precondition never fired)`) and the falsifying
+measurement in the row body. The ledger's existing two-value legend is unchanged.
+
+### Every claim was re-verified against HEAD before it was written down, and six cites had drifted
+
+The round-2 README's line numbers predate ten engine commits. Writing a resume point from a
+stale cite is how a ledger row becomes unusable, so each was re-resolved:
+
+| this doc / README said | HEAD | note |
+|---|---|---|
+| `internal/initdb/open.go:2911` (D2 row 3) | **`:2924`** | `SmallDimension` is still `region`/`nation` only, at both writers (`:2924`, `internal/executor/operators_ddl.go:3376`) |
+| §3.5's `planner.go:1020` push vs `:1024` remap | **`:1012`** vs `:1024`, with the compensating `pushSingleSourceFiltersAfterRemap` at **`:1037`** | the row now cites all three, because the deferral is precisely the gap between them |
+| D2 row 2 resume point `mhj_input_rewrite.go` | **`internal/planner/planner.go`** | the reorder is a *call-order* change in `planner.go`; `mhj_input_rewrite.go:51` is only the entry point being moved |
+| §7.3's `planner.go:3176` (grouping sets) | **`:650`** (`rewriteGroupingSets`) | |
+| §7.3's `local_filters.go:154` gate detail | `:154` correct; the two gate conditions are at **`:171`** (`len(bindings) < 5`) and **`:175`** (`SmallDimension`) | |
+| §7.3's `parallel.go:311` | `:311` correct; `*SetOp` is at **`:313`** | |
+
+Re-confirmed zero-hit / absence claims: `GOOPG_POSMAP_ASSERT` 0 hits, `GOOPG_RELSIZE_FALLBACK`
+0 hits, `internal/planner/exprwalk.go` absent, `internal/server/` still holding exactly one
+`recover()` (`server.go:780`), `tableRows` (`internal/planner/cardinality.go:89`) still
+returning `tbl.Stats.RowCount` with no fallback.
+
+### Three findings the verification pass added to the rows
+
+1. **D2 row 7 is stronger than "fires only on DDL".** `planCache.Invalidate()` has exactly two
+   call sites (`internal/server/dispatch.go:2976`, `internal/server/dispatch_extended.go:364`),
+   both guarded by `node.(*planner.DDL)`, and ANALYZE plans to `*planner.Utility`
+   (`internal/planner/planner.go:212-218`) — so ANALYZE cannot reach either site by any path,
+   not merely "is not currently matched". Separately, `planCacheIsCacheable` (`:107`) has the
+   comment "DDL, Transaction, and **utility** nodes … must never be cached" while its switch
+   lists `*planner.DDL`, `*planner.Transaction`, `*planner.Copy` — `*planner.Utility` is
+   absent. Comment and code disagree about a third class; folded into the same row to be fixed
+   in the same commit.
+2. **D5 row 2's `walkColumnRefsImpl` is a wrong-answer path, not just an unenumerated switch.**
+   Its missing `default:` is *fail-open in the dangerous direction*: an unenumerated type
+   produces **no callback at all**, and `onOuter()` is the veto that marks a conjunct
+   out-of-scope — so a conjunct wrapping an outer ref in an unknown node reads as single-side
+   and can be pushed below an outer join. The function's own `CastExpr` comment records that
+   exact bug having been found and fixed once already. Consequence for sequencing: **M0125-0002
+   converts nine walkers, not seven.**
+3. **D5 row 1 covers both anchor fixtures, not just TPC-DS.** `ci/batch/tpch-row-anchors.csv`
+   (`query,rows,kind,dataset,source`) is as value-blind as
+   `ci/batch/tpcds-row-anchors.csv` (`query,expected_rows,kind`); neither has a value column.
+
+### D6 render check
+
+`gh api --method POST /markdown` over the header plus the fourteen touched rows returns
+**one** `<table>`, **14** body rows, **7** `<td>` in every one — no nesting, no cell drift.
+
+Noted but deliberately **not** fixed (Non-goals: no re-triage of pre-existing rows): nine
+older rows contain unescaped `|` inside code spans (e.g. `q|status|rows|ck|secs`), and GFM
+splits cells before inline parsing, so they already render with 8–21 cells. This is a second,
+distinct instance of the hazard `deferral_ledger_raw_html_tag_nesting` recorded for raw tags —
+the same escape discipline (`\|`) applies. Every row appended here avoids `|` inside cells
+entirely.
