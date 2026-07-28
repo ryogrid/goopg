@@ -68,6 +68,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 30 | TIMEOUT 627 s | 0 | OK 13 s | 63 | TIMEOUT 649 s | goopg-only timeout; **unbounded above** — unchanged |
 | 31 | TIMEOUT 629 s | 0 | OK 12 s | 43 | TIMEOUT 647 s | goopg-only timeout; **unbounded above** — unchanged |
 | 32 | OK 11 s | 1 | OK 0 s | 1 | OK 10 s / 1 | rows = PG; stable |
+| 33 | OK 68 s | 100 | OK 1 s | 100 | OK 69 s / 100 | rows = PG; stable |
+| 34 | OK 34 s | 374 | OK 0 s | 374 | OK 35 s / 374 | rows = PG; stable |
+| 35 | **TIMEOUT 628 s** | 0 | OK 1 s | 100 | TIMEOUT 651 s | goopg-only timeout, **budget-marginal** (Q18 sub-class, not unbounded) — see below |
+| 36 | ERROR 0 s | 0 | SKIP | — | ERROR 0 s | dsqgen artefact — the query text fails on PG too, so it is **not** a goopg error; PG_SKIP list |
+| 37 | OK 316 s | 0 | OK 0 s | 0 | OK 311 s / 0 | rows = PG (both empty); stable |
+| 38 | OK 40 s | 1 | OK 3 s | 1 | OK 41 s / 1 | rows = PG; stable |
+| 39 | OK 181 s | 236 [230+6] | OK 5 s | 236 [230+6] | OK 179 s / 236 | rows = PG on both blocks; stable (set A's "fixed this round" holds) |
+| 40 | OK 38 s | 100 | OK 0 s | 100 | OK 42 s / 100 | rows = PG; stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -129,15 +137,44 @@ Q30 and after Q31 — reported the same post-restart image (`46632999aa3f5c75`),
 which is the expected steady state: the `vcs.revision` stamp moves once when the
 commit under which the binary was built changes, not on every restart.
 
-Running timeout classification (D6), Q1–Q32:
+Chunk 33–40 (`chunk-33-40.txt`) needed no split — set A shows a single goopg
+timeout in the range — and reproduces set A on all eight cells. Largest delta
+among the six OK cells is 5 s (Q37, 311 → 316 s); every completed cell matches
+PG's row count exactly, including Q39's two-block 236 [230+6].
+
+**Q35 is the second member of the budget-marginal sub-class** (with Q18), not a
+new unbounded-above timeout. Both sweeps cut it at the budget (651 s set A,
+628 s here), but the 2026-07-26 baseline **completed** it at `OK 525 s` — set A
+already flagged it as a "borderline flip" for exactly that reason. So its true
+runtime sits just under-to-just-over 600 s and the verdict is a coin flip: an
+`OK` in a later chunk would be a re-rolled coin, **not** evidence of a fix. The
+distinction matters for M0125, which must not count a Q35 flip as a win. Unlike
+Q18, Q35 does carry a usable PG row count (100), so a genuine fix can still be
+validated on rows.
+
+**Q36 is not a goopg defect.** goopg reports `ERROR 0 s` and the harness `SKIP`s
+PG via `PG_SKIP="36 70 86"` because the dsqgen-generated query text is malformed
+and PostgreSQL rejects it too. It is excluded from the D6 goopg-ERROR class (that
+class holds Q8 alone so far).
+
+The reap did not fire in this range (no PG timeouts). The single goopg restart —
+after Q35 — moved the binary image from `46632999aa3f5c75` to `9a6a5c070ad7364d`
+with `engine-id` unmoved, which is the **third** live confirmation of the
+harness's provenance rule: the chunk-4 commit (`3798b57e`, docs/tracker only)
+landed between chunks, so the rebuild re-stamped `vcs.revision` even though
+`git diff HEAD -- internal cmd` is empty. Had the binary sha been the
+comparability key, this chunk would have falsely read "SWEEP VOID".
+
+Running timeout classification (D6), Q1–Q40:
 
 - **both engines** (excluded from "goopg-only"): Q4
 - **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31
 - **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
-  at 600 s): Q18
+  at 600 s): Q18, Q35
 - **PG-only** (goopg wins): Q11
 - **goopg ERROR**: Q8
+- **not a goopg error** (query text invalid on PG too): Q36
 
 ## Cursor
 
-`M0124-0001 sweep: 1-32 done; next 33-40.`
+`M0124-0001 sweep: 1-40 done; next 41-48.`

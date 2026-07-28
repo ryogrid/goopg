@@ -1,0 +1,28 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T19:15:24+09:00
+# goopg: 3798b57e bench(tpcds): M0124-0001 chunk 4 — Q25-Q32 measured; Q30/Q31 are unbounded-above goopg-only timeouts  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=46632999aa3f5c75 on-disk=46632999aa3f5c75 (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q33  OK          68s      100 
+pg    Q33  OK           1s      100 
+goopg Q34  OK          34s      374 
+pg    Q34  OK           0s      374 
+goopg Q35  TIMEOUT    628s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      (engine source unchanged; image now 9a6a5c070ad7364d)
+pg    Q35  OK           1s      100 
+goopg Q36  ERROR        0s        0 psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/que
+pg    Q36  SKIP    known dsqgen artefact (fails on PG too)
+goopg Q37  OK         316s        0 
+pg    Q37  OK           0s        0 
+goopg Q38  OK          40s        1 
+pg    Q38  OK           3s        1 
+goopg Q39  OK         181s      236 [230+6] 
+pg    Q39  OK           5s      236 [230+6] 
+goopg Q40  OK          38s      100 
+pg    Q40  OK           0s      100 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

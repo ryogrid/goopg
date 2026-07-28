@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `33-40`
->    (`scripts/tpcds-bench-compare.sh 33-40`; chunks 1–32 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `41-48`
+>    (`scripts/tpcds-bench-compare.sh 41-48`; chunks 1–40 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -569,7 +569,25 @@ blocker; a code change landing mid-sweep voids the sweep.
         PG-only Q11; goopg ERROR Q8. No reap this range (no PG timeout); both
         restarts reported the same post-restart image (`46632999aa3f5c75`) —
         the stamp moves with the build commit, not per restart.
-        **NEXT: chunk `33-40`.**
+      - Chunk 5 (`chunk-33-40.txt`, Q33–Q40, no split needed) reproduces set A on
+        all eight cells; largest delta 5 s (Q37 311 → 316 s) and every completed
+        cell matches PG's row count, incl. Q39's 236 [230+6]. **Q35 is the second
+        budget-marginal member (with Q18), NOT unbounded:** both sweeps cut it at
+        the budget (651 s set A, 628 s here) but the 2026-07-26 baseline
+        *completed* it at `OK 525 s`, so a later `OK` is a re-rolled coin, not a
+        fix — M0125 must not score a Q35 flip as a win (it does carry a PG row
+        count, 100, so a real fix is still validatable on rows). **Q36 is not a
+        goopg defect**: dsqgen emits malformed text that PG rejects too, hence
+        `PG_SKIP="36 70 86"`. Running D6 for Q1–Q40: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14/Q30/Q31; goopg-only budget-marginal Q18/**Q35**;
+        PG-only Q11; goopg ERROR Q8; not-a-goopg-error Q36. The single restart
+        (after Q35) moved the image `46632999aa3f5c75` → `9a6a5c070ad7364d` with
+        `engine-id` unmoved — third live confirmation that the docs-only chunk-4
+        commit re-stamps `vcs.revision` without touching the engine.
+        **NEXT: chunk `41-48`.** Set A shows NO timeout in that range (slowest
+        Q44 58 s), so one call, est. ~5 min. Predict the known **RC-1b row gap at
+        Q47** (goopg 0 rows vs PG 100) — a correctness delta, not a timing one,
+        and already-known, so it must not be filed as a new finding.
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
