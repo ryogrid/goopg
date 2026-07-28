@@ -861,7 +861,21 @@ blocker; a code change landing mid-sweep voids the sweep.
       aggregate, not the `LIMIT 100` window, so a PASS there is a finding about
       the window rather than a broken checksum.
       Design `docs/design/0124-0005-sf05-oracle-checksum-column.md`.
-- [ ] **M0124-0006 — attribute the 21 value-divergent OK cells of the re-sweep**
+- [x] **M0124-0006 — attribute the 23 value-divergent OK cells of the re-sweep**
+      — **DONE 2026-07-29.** Tool `scripts/tpcds-value-diff.py` (graded
+      normalisation, design D6a); verdicts in
+      `analysis/tpcds-sf1-resweep-20260728/RESULTS.md` §M0124-0006. **No cell is
+      ordering-only. 5 of 23 are not defects**: Q7/Q26/Q27/Q83 are the
+      exactly-zero-quotient scale renderer (**Q27 newly added** — it was
+      unattributed), and **Q39 is float8 accumulation order** (relative 1.4e-16),
+      not a collapse — it leaves the M0125-0009 acceptance set. The other 18:
+      **M0125-0009** ×10 (Q2 Q21 Q40 Q43 Q50 Q59 Q62 **Q66** Q97 Q99 — Q66 newly
+      confirmed via its 48 inner `sum(CASE)` siblings), **M0125-0007** ×3 (Q16
+      Q94 Q95), **M0125-0006** ×1 (Q87), and **M0125-0010 ×4 — a NEW defect filed
+      this loop** (Q28 Q46 Q68 Q79: `remapSubqueryColumnRefs` binds sibling
+      aggregates by function name, `planner.go:2468`). Original text follows.
+
+- [ ] ~~**M0124-0006 — attribute the 21 value-divergent OK cells of the re-sweep**~~
       (raised by M0124-0001 chunk 12; **due before the merged deliverable**). The
       sweep's headline finding — "row counts reproduce set A" — is now known to be
       much weaker than "goopg agrees with PG". Chunks 1–10 were checked on row
@@ -1167,6 +1181,22 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       buckets show the same shape with col 1 correct and cols 2–5 replicating it
       (`1231|1231|1231|1231|1231` vs PG `1231|1228|1289|0|0`), which pins the
       "reads the FIRST aggregate's slot" mechanism directly.
+      **M0124-0006 (2026-07-29) settled the evidence set at TEN queries** — Q2 Q21
+      Q40 Q43 Q50 Q59 Q62 Q66 Q97 Q99 — with two corrections to the earlier guess.
+      (a) **Q39 is NOT an instance**: its `cov` columns differ by a relative
+      1.4e-16 (`…82042` vs `…82044`), i.e. float8 accumulation order, not a
+      collapse — drop it from the acceptance set. (b) **Q66 IS an instance**
+      despite its outer aggregates being `sum(<plain column>)` (a working
+      control): its *inner* derived table holds **48 `sum(CASE …)` siblings**
+      (`query66.sql:56+`) that collapse there, and the outer sums then faithfully
+      add twelve already-identical columns. The tell is that goopg's
+      `jan_net…dec_net` equal `jan_sales` **exactly** — every one of the 48
+      collapsed onto the first `sum(CASE)` in that subquery. Q66 is therefore the
+      widest-blast-radius acceptance case (34 wrong columns in 5 rows).
+      **Do not confuse this with M0125-0010** (filed 2026-07-29): that one
+      collapses sibling aggregates *by function name* through a FROM-subquery and
+      needs no `CASE`; this one collapses `CASE` expressions and needs no
+      subquery. Neither subsumes the other and both are live.
       Design `docs/design/0125-0009-parser-expr-key-structural.md`.
       **Sweep precondition SATISFIED 2026-07-28** (the sweep reached Q99; 99/99
       measured) — the engine-commit freeze lifts once M0124-0001's merged
@@ -1174,6 +1204,55 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Planner change → full pre-commit bar.
       Likely the single highest-value fix in the TPC-DS programme: it silently
       corrupts every pivot-style aggregate query while keeping row counts intact.
+
+- [ ] **M0125-0010 — FROM-subquery Project remap binds sibling aggregates by
+      FUNCTION NAME, so `select * from (select sum(a), sum(b) …) d` returns
+      `sum(a)` twice** (discovered by M0124-0006 2026-07-29, ledger row
+      2026-07-29). **One-line root cause, wrong answers, row counts intact.**
+      Minimal reproducer, no `CASE`, no `GROUP BY`, on the SF=1 clusters:
+      `select * from (select sum(d_dom) a, sum(d_year) b from date_dim) d;`
+      → goopg `1149021|1149021`, PG `1149021|146061700`. The identical flat query
+      (`select sum(d_dom), sum(d_year) from date_dim`) is **correct**.
+      Root cause: `remapSubqueryColumnRefs` (`internal/planner/planner.go:2450`)
+      is called **only** from the FROM-subquery path (`planSubqueryRangeVar`,
+      `planner.go:3158`). For every `Project` target that is a bare `ColumnRef` it
+      rebuilds the index by matching the **column name** against the child output
+      schema — `strings.EqualFold(cr.Name, sc.Name)` with `break` on the first hit
+      (**`planner.go:2468`**). An `Aggregate` names its output columns after the
+      aggregate *function*, so two `sum`s yield two child columns both named
+      `sum` and every target binds to the first slot. The pass's own comment calls
+      it a "safety-normalisation" for outer-resolve-context leakage; it is
+      unsound as written because **an output schema's names are not unique**.
+      Control matrix (all probed on 65436 vs 65438, read-only): flat / top-level
+      `GROUP BY` / CTE (`with x as (…) select * from x`) / different function
+      names (`sum,avg`; `sum,count(*),avg`) / non-`ColumnRef` target
+      (`max(a)+0`) / aggregates *outside* a `UNION ALL` derived table are **all
+      correct**; FROM-subquery with two same-named aggregates is wrong **even
+      with an explicit `d(x,y)` column list**, and selecting `d.b` alone returns
+      `a` — so it is the *inner* plan that is wrong, not outer name resolution.
+      `count(x)` vs `count(distinct x)` also collapse, because `DISTINCT` does not
+      change the output column name (`count(distinct …)` alone is correct:
+      probed 134220|18480 = PG).
+      **Fix the matching, not the names** — the remap must be positional, or must
+      refuse to rewrite when the child schema has duplicate names, or must key on
+      the target's identity rather than its label. Silently binding to the first
+      of N equally-named columns is the same failure mode as M0125-0009,
+      M0097-0032 and M0097-0003: *an ambiguous key resolved by taking the first
+      match*. Verify first whether the pass is still needed at all — if the leakage
+      it guards against is gone, deleting it is the better fix; if it is still
+      needed, add a regression test for the leakage case before changing it.
+      **Evidence (4 TPC-DS queries, all `OK`/`OK` with matching row counts)**:
+      **Q28** (`count`/`count distinct` pair wrong in all six cross-joined blocks;
+      `avg` correct), **Q46** (`profit` = `amt`), **Q68** (`extended_tax` and
+      `list_price` both = `extended_price`), **Q79** (`profit` = `amt`).
+      **Accept by VALUE**: the reproducer + the full control matrix above as
+      planner unit tests, plus Q28/Q46/Q68/Q79 asserted against PG. Row-count
+      gates cannot see this class — `scripts/tpch-spotcheck.sh` and the SF0.5
+      oracle both pass today.
+      Design: extend `docs/design/0125-0009-parser-expr-key-structural.md` with a
+      second section (same failure mode, different key) rather than a new doc.
+      Planner change → full pre-commit bar. Blocked by the same engine-commit
+      freeze as M0125-0009 (lifts when M0124-0001's merged deliverable lands).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

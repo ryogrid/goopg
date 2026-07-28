@@ -825,8 +825,108 @@ list from chunk 12 becomes **23** (`+Q97 +Q99`), of which Q98 is explicitly *not
 a member (formatting only). The engine-commit freeze is now free to lift once the
 merged deliverable lands.
 
+## M0124-0006 — attribution of the 23 value-divergent cells (2026-07-29)
+
+Method per design D6a: `scripts/tpcds-value-diff.py
+bench/tpcds/runtime_goopg/tpcds-results <q>…` over the **on-disk** result files
+(all 23 are stamped 2026-07-28, i.e. this sweep; the sweep was **not** re-run).
+Graded normalisation — field-strip, numeric canonicalisation, 1e-14 relative
+tolerance — each compared positionally *and* as a sorted multiset.
+
+**Headline: no cell is ordering-only, and 5 of the 23 are not defects at all.
+The remaining 18 attribute to four root causes, of which one is NEW.**
+
+| verdict | queries | n |
+|---|---|---|
+| answer-neutral — numeric division drops scale on an exactly-zero quotient | Q7 Q26 Q27 Q83 | 4 |
+| answer-neutral — float8 accumulation order (`cov` differs in the 17th digit) | Q39 | 1 |
+| **M0125-0009** — sibling `sum(CASE …)` collapse (`parserExprKey` `%T` fallback) | Q2 Q21 Q40 Q43 Q50 Q59 Q62 Q66 Q97 Q99 | 10 |
+| **M0125-0007** — date input rejects unpadded month/day, silently → empty result | Q16 Q94 Q95 | 3 |
+| **M0125-0006** — set-op chain re-association (`EXCEPT`) | Q87 | 1 |
+| **M0125-0010 — NEW, filed this loop** — FROM-subquery Project remap binds sibling aggregates by function name | Q28 Q46 Q68 Q79 | 4 |
+
+Two of these were previously *unattributed guesses* and are now settled by
+measurement rather than by shape:
+
+- **Q27 joins the answer-neutral bucket** (chunk 12 left it unattributed). It is
+  the same zero-scale renderer as Q7/Q26/Q83.
+- **Q39 is not a value divergence at all.** Its two `cov` columns differ as
+  `1.4066976767982042` vs `…44` — a relative 1.4e-16, i.e. float8 aggregate
+  accumulation order. String comparison called this a wrong answer; a relative
+  tolerance does not. This is why D6a has a pass 3.
+
+### Q66 is M0125-0009 despite looking like a new class
+
+Q66's outer aggregates are `sum(jan_sales) … sum(dec_sales)` — plain
+`ColumnRef` arguments, which M0125-0009 lists as a *working control*, so it
+initially read as a separate defect. It is not. Q66's **inner** derived table
+holds **48 `sum(CASE …)` siblings** (`query66.sql:56+`), which collapse to the
+first one there; the outer sums then faithfully add twelve already-identical
+columns. The tell is in the numbers: goopg's `jan_net … dec_net` equal
+`jan_sales` exactly (56238489.97), because every one of the inner 48 collapsed
+onto the very first `sum(CASE)` in that subquery, which is `jan_sales`. The
+`*_per_sq_foot` block replicates its own first member instead only because its
+argument is `jan_sales/w_warehouse_sq_ft`, a different expression.
+
+### NEW defect: sibling aggregates collapse through a FROM-subquery (M0125-0010)
+
+Q46/Q68/Q79 use `sum(<plain column>)` — a working control for M0125-0009 — and
+Q28 uses `count(x)` vs `count(distinct x)`, and all four still replicate. Probed
+on the live clusters (read-only, both engines, same session shape):
+
+```
+-- goopg 65436                                    -- PG 65438
+select * from (select sum(d_dom) a, sum(d_year) b from date_dim) d;
+  1149021|1149021                                   1149021|146061700   <-- WRONG
+select sum(d_dom), sum(d_year) from date_dim;
+  1149021|146061700                                 1149021|146061700   <-- correct
+```
+
+Controls that pin it exactly:
+
+| probe | shape | goopg |
+|---|---|---|
+| flat `select sum(a), sum(b) from t` | no subquery | **correct** |
+| `group by` at top level | no subquery | **correct** |
+| `from (select sum(a), sum(b) …) d` | FROM-subquery | **WRONG** |
+| same, with `d(x,y)` explicit column list | FROM-subquery | **WRONG** — not an outer name collision |
+| `select d.b` alone from that subquery | FROM-subquery | **WRONG** — returns `a`; the *inner* plan is already wrong |
+| `with x as (select sum(a), sum(b) …) select * from x` | CTE | **correct** — different code path |
+| `sum(a), avg(b)` / `sum(a), count(*), sum(b)` | FROM-subquery, different function names | **correct** |
+| `max(a)+0, max(b)+0` | FROM-subquery, target is a `BinaryOp` | **correct** |
+| `sum(a), sum(b)` over a `UNION ALL` derived table | aggregates outside the subquery | **correct** |
+
+Root cause, one line: `remapSubqueryColumnRefs`
+(`internal/planner/planner.go:2450`) runs **only** on the FROM-subquery path
+(`planSubqueryRangeVar`, `planner.go:3158`) and rebuilds each `Project` target
+that is a bare `ColumnRef` into a position-based index by matching **the column
+name** against the child schema — `strings.EqualFold(cr.Name, sc.Name)` with a
+`break` on first hit (`planner.go:2468`). An `Aggregate` node names its output
+columns after the aggregate *function*, so two `sum`s produce two child columns
+both named `sum`, and every target binds to the first. That is exactly the
+observed control set: different function names give different child names and
+survive; a non-`ColumnRef` target takes the `else` branch and survives; the CTE
+path never calls the pass. `count(x)` vs `count(distinct x)` collapse because
+`DISTINCT` does not change the output column name — which is also why Q28's
+`avg` column is correct while its `count`/`count distinct` pair is not, and why
+`count(distinct …)` on its own is fine (probed: 134220|18480, matching PG).
+
+This is a **different** defect from M0125-0009 and neither subsumes the other:
+M0125-0009's reproducer is flat (`select sum(case…), sum(case…) from date_dim`
+→ `10435|10435`, no subquery, so this pass never runs), and M0125-0010's
+reproducer uses no `CASE` at all. Both must be fixed.
+
+### Cross-check against the sweep's own claims
+
+Chunk 12/13 attributed Q43/Q50/Q66/Q97/Q99 (and "probably Q2/Q39") to
+M0125-0009. That holds for all except **Q39, which is now answer-neutral** —
+the "probably" was wrong, and it was wrong in the safe direction. The chunk-12
+guess that Q7/Q26/Q83 are the numeric-scale gap is confirmed and extends to Q27.
+
 ## Cursor
 
-`M0124-0001 sweep: 1-99 ALL DONE (13/13 chunks). Sweep COMPLETE — next is the
-merged deliverable analysis/tpcds-sf1-goopg-20260728.md (13 §13.3 projections),
-with M0124-0006 due before/with it.`
+`M0124-0001 sweep: 1-99 ALL DONE (13/13 chunks). Sweep COMPLETE.
+M0124-0006 DONE (2026-07-29): all 23 value-divergent cells attributed; 5 are
+answer-neutral, 18 split across M0125-0006/-0007/-0009 and the newly filed
+M0125-0010. Next is the merged deliverable
+analysis/tpcds-sf1-goopg-20260728.md (13 §13.3 projections).`

@@ -217,6 +217,48 @@ Where M0124-0005 has landed, capture the per-query result checksum in the same p
 harness already writes `*_result.txt` per query and engine, so it is nearly free. (Note the
 SF0.5 sweep does **not** write result files; see `0124-0005`.)
 
+### D6a. A matching row count is not agreement — the value-comparison rule
+
+**Added 2026-07-29 (M0124-0006), from a measured failure of this protocol.** D6 as
+originally written classified a cell by status and row count. That is too weak, and the sweep
+proved it: Q16 was recorded `OK / 1 row` in **chunk 2** while returning `0` against PG's `45`,
+and stayed unnoticed for ten chunks. Restricted to cells that were `OK` on both engines *and*
+equal in row count, **23 of 99 disagreed by value**. Row-count equality is therefore a
+necessary condition for agreement, never a sufficient one.
+
+Every `OK`/`OK` cell with equal row counts MUST additionally be value-compared, with
+`scripts/tpcds-value-diff.py <resultdir> <q>...`. A raw `diff` is not usable for this: two
+answer-neutral renderers dominate it and would bury the real defects. The script therefore
+applies **graded normalisation**, and the pass a cell survives *is* its classification:
+
+| pass | normalisation | what it absorbs |
+|---|---|---|
+| 0 | raw bytes | — |
+| 1 | split on `\|`, strip each field | psql column alignment **and `char(n)` blank-padding** (ledger 2026-07-06, M0122-0005: goopg's `octet_length` on `character(30)` is 7, PG's is 30) |
+| 2 | additionally canonicalise every field that parses as a `Decimal` | numeric division dropping scale **when the quotient is exactly zero** (`0.00` vs `0.00000000000000000000`; non-zero quotients are byte-identical) |
+| 3 | relative tolerance 1e-14 on numeric fields | float8 aggregate accumulation-order differences (Q39's `cov` diverges in the 17th significant digit) |
+
+Each pass compares both **positionally and as a sorted multiset**, which is what separates a
+genuine value divergence from an ordering-only difference under a tie-bearing `ORDER BY`. Only
+a difference surviving pass 3 *both ways* is a wrong answer.
+
+Two traps this rule exists to prevent, both hit in practice:
+
+- **`length()` is not a padding check.** PG's `bpcharlen` ignores trailing blanks, so `length()`
+  agrees on both engines even though the values differ. `octet_length` is the discriminator.
+- **A large raw diff does not mean a large defect, and a small one does not mean none.** Q98's
+  5068-line raw diff is entirely rendering (its values are correct); Q97's diff is a single
+  line and is impossible-by-construction wrong (`store_only|catalog_only|store_and_catalog` =
+  `392155|392155|392155`, three disjoint sets with equal cardinality).
+
+For a surviving divergence the script reports the differing columns and probes one specific
+signature — **column replication**, where goopg emits some earlier column's value in column *j*
+on every row while PG's differ. Search every earlier column, not just the first: Q66 replicates
+within three separate 12-column blocks and Q28 pairwise inside six cross-joined blocks. That
+signature attributes 14 of the 23 cells on its own. Guard against its one false positive: a
+result whose columns are all NULL/empty (Q16/Q94/Q95 return `0||`) matches the replication test
+trivially and is an *empty-result* defect, not a replication one.
+
 ### D7. Deliverable
 
 `analysis/tpcds-sf1-goopg-<YYYYMMDD>.md`: provenance (commit, budget, cluster paths, S-cold
