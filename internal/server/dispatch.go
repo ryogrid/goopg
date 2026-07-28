@@ -209,7 +209,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 		}
 		msg, extra := syntaxErrorMsg(err)
-		return s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...)
+		return s.writeQueryError(w, syntaxErrorCode(err), msg, extra...)
 	}
 	if len(stmts) == 0 {
 		if err := w.WriteEmptyQueryResponse(); err != nil {

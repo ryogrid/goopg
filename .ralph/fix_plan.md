@@ -257,9 +257,37 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       WAL stream anchoring, a leading-contrecord skip in both scanners (which was
       also destroying 54–97 durable records on every reopen), and PG's end-of-WAL
       semantics instead of a fatal decode error.
-      **Still open here:** (a) measure `portals_p2`, `select`, `select_distinct`
-      at HEAD — re-run the same prefix and confirm it now reaches them; (b)
-      `index_including`'s real divergence (diffs land in `GOOPG_REGRESS_DIFF_DIR`);
+      **(a) MEASURED 2026-07-28** (same 176-case prefix, 622 s): with root-0032
+      + root-0033 the cluster restart now SUCCEEDS — the log shows three
+      `restarting the cluster` events and three `cluster recovered`, zero
+      `restart failed`, so the 53 phantom `deferred: cluster restart failed`
+      cases are gone. `portals_p2`, `select` and `select_distinct` therefore
+      have real results at HEAD for the first time, and all three genuinely
+      diverge (`output mismatch`). Diffs captured in `/tmp/rdiff-loop6`
+      (regenerate with the prefix + `GOOPG_REGRESS_DIFF_DIR`).
+      **(b) CLOSED 2026-07-28 — root-0034**
+      (`docs/design/root-0034-float-type-alias-opt-float-reduction.md`). Not an
+      index-only-scan bug despite §10's title ("names stored as cstrings in
+      indexes"): the whole 378-line divergence is four lines, and the row is
+      gone from a plain seq scan on a table with no index. §10's fixture is
+      `CREATE TABLE nametbl (c1 int, c2 name, c3 float)` — and `float` has no
+      `pg_type` entry, because PG resolves `FLOAT [ (p) ]` entirely inside the
+      grammar (`gram.y` opt_float). goopg's parser stored the literal token, so
+      it reached `catalog.TypeNameToOID`'s `default: return OIDText` and the
+      column became **text**, while `internal/executor`'s own type tables
+      (`codec.go:482`, `expr.go:3035`) list `"float"` next to float8 and encoded
+      an 8-byte IEEE-754 datum. `INSERT 0 1`, then zero rows forever. Fixed by
+      performing PG's reduction where PG performs it (`normalizeFloatTypeName`,
+      wired into the four typmod-bearing type-name sites), with opt_float's two
+      22023 errors byte-identical. `index_including` PASSES in full-suite
+      ordering (88-case prefix, 244 s). Three ledger rows filed.
+      **Still open here:** (e) the three now-genuine divergences (a) exposed —
+      `portals_p2`, `select`, `select_distinct`. They are real output
+      mismatches, not restart phantoms and not (per the earlier isolation runs)
+      normalization-rule gaps; work them with the prefix method below, reading
+      the per-case `*_expected.txt`/`*_actual.txt` pair rather than the suite
+      log. Note root-0034 was found the same way and touched none of these, so
+      each needs its own diff.
       ~~(c) the root-0032 §5 redo failure~~ **FIXED 2026-07-28 as root-0033**
       (`docs/design/root-0033-redo-prune-redirect-only-compaction.md`): the
       PG-format prune redo arm `replayDecodedXLogHeapPrune` guarded its
@@ -275,6 +303,25 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       `GOOPG_REGRESS_DIFF_DIR`, and ALWAYS grep the log for
       `restarting the cluster` / `restart failed` before reading anything into a
       case's result.
+- [ ] **server/TestRestartAfterRetention — root-0032 regressed a pass-required
+      unit test.** Found while gating root-0034 (it is red at HEAD and is NOT
+      caused by that change — verified by stashing it). `go test -run
+      TestRestartAfterRetention ./internal/server/` fails deterministically in
+      1.9 s with
+      `initdb.Open: goopg: wal replay: replay record 0 lsn[301990201,301990520]:
+      wal: xlog heap-insert apply: storage: not enough free space in page`.
+      **Already bisected**: PASSES at `3716d5cd` (pre-root-0032), FAILS at
+      `fa90714a` (root-0032) — so root-0032's `liveSegmentRunStart` /
+      leading-contrecord skip changed which records replay after retention, and
+      a heap-INSERT redo now lands on a page reconstructed with less free space
+      than the running server's. Same shape as root-0033 but on the INSERT arm
+      rather than the prune arm, so start by diffing the redo-side page
+      reconstruction for `xl_heap_insert` against its runtime sibling
+      (`internal/wal/recovery.go` ↔ `internal/storage/`), exactly as root-0033
+      did for `xl_heap_prune`. Note `RALPH_PRECOMMIT_SCOPE=units` does NOT
+      cover `internal/server` (verified 2026-07-28: the gate is green at HEAD
+      while this test is red), which is why two loops shipped over it — the
+      nightly batch is the only gate that sees it. Ledger row 2026-07-28.
 - [x] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
       `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
       in the previous run"; repro:

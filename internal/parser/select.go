@@ -2486,6 +2486,13 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 		p.advance()
 	}
 	typmods = synthesizeBareCharTypmod(firstTok.Kind == TokenQuotedIdent, name.Name, typmods)
+	if firstTok.Kind != TokenQuotedIdent && name.Schema == "" {
+		tn, tm, ferr := normalizeFloatTypeName(name.Name, typmods, firstTok.Pos)
+		if ferr != nil {
+			return nil, ferr
+		}
+		name.Name, typmods = tn, tm
+	}
 	return &CastExpr{pos: tok.Pos, Operand: operand, Type: name, Typmods: typmods}, nil
 }
 
@@ -2597,6 +2604,13 @@ func (p *parser) parseCastFuncExpr(pos int) (Expr, error) {
 		return nil, p.errAtCur("expected ')' to close CAST()")
 	}
 	typmods = synthesizeBareCharTypmod(firstTok.Kind == TokenQuotedIdent, name.Name, typmods)
+	if firstTok.Kind != TokenQuotedIdent && name.Schema == "" {
+		tn, tm, ferr := normalizeFloatTypeName(name.Name, typmods, firstTok.Pos)
+		if ferr != nil {
+			return nil, ferr
+		}
+		name.Name, typmods = tn, tm
+	}
 	return &CastExpr{pos: pos, Operand: expr, Type: name, Typmods: typmods}, nil
 }
 
