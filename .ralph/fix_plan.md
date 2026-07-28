@@ -243,15 +243,34 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       self-relation RENAME COLUMN collision check, `DROP AGGREGATE` resolving its
       argument type after the name lookup). `errors` now PASSES in full-suite
       ordering **in a run that took the restart path**; 5 ledger rows filed.
-      **Still open here:** re-verify `index_including`, `portals_p2`, `select`,
-      `select_distinct` at HEAD — some may have been collateral of the same
-      restart (`select`'s fixtures are not inheritance-based, so expect at least
-      one distinct cause). Cheap method proven this loop: run an alphabetical
-      PREFIX of the suite up to the target case
-      (`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`, cases are discovered
-      in `filepath.Glob` order) with `GOOPG_REGRESS_DIFF_DIR` — 63 cases ≈ 3.5 min
-      versus ~1 h for the full suite — and check the log for
-      `restarting the cluster` before reading anything into the ordering.
+      **RE-VERIFIED 2026-07-28 (prefix through `select_distinct`, 176 cases,
+      670 s) — three of the four were NEVER MEASURED.** After `misc` timed out,
+      root-0029's recovery restart FAILED and all 53 remaining cases (#123
+      `misc_functions` … #176 `select_distinct`) reported a phantom
+      `deferred: cluster restart failed`. So `portals_p2`, `select` and
+      `select_distinct` have no result at HEAD; only `index_including` produced a
+      genuine `output mismatch` (cluster alive at #88). The restart failed because
+      **goopg could not start after a crash** —
+      `wal replay: decode at offset 771751920: invalid record header: unknown
+      rmid=31` — fixed as **root-0032**
+      (`docs/design/root-0032-crash-restart-wal-stream-anchoring.md`): live-run
+      WAL stream anchoring, a leading-contrecord skip in both scanners (which was
+      also destroying 54–97 durable records on every reopen), and PG's end-of-WAL
+      semantics instead of a fatal decode error.
+      **Still open here:** (a) measure `portals_p2`, `select`, `select_distinct`
+      at HEAD — re-run the same prefix and confirm it now reaches them; (b)
+      `index_including`'s real divergence (diffs land in `GOOPG_REGRESS_DIFF_DIR`);
+      (c) the root-0032 §5 redo failure (`heap-update add new tuple: not enough
+      free space in page`) — a crash under sustained write load still leaves an
+      unstartable cluster, ledger row 2026-07-28, repro
+      `analysis/wal-crash-restart-repro.sh`; (d) the harness's phantom
+      `deferred:` per case after a failed restart (ledger row, same date).
+      Cheap method (proven twice): run an alphabetical PREFIX of the suite up to
+      the target case (`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`,
+      cases are discovered in `filepath.Glob` order) with
+      `GOOPG_REGRESS_DIFF_DIR`, and ALWAYS grep the log for
+      `restarting the cluster` / `restart failed` before reading anything into a
+      case's result.
 - [x] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
       `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
       in the previous run"; repro:

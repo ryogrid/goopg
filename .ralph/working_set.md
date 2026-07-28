@@ -1,40 +1,39 @@
 (idle — nothing in flight)
 
-Last loop (#49): M-NIGHTLY regress divergences — **`regress/errors` CLOSED**
-via root-0031 (`docs/design/root-0031-pg-inherits-restart-persistence.md`).
+Last loop (#50): M-NIGHTLY regress divergences — the surviving three were
+**never measured**, and the real defect was **crash restart**. Fixed as
+root-0032 (`docs/design/root-0032-crash-restart-wal-stream-anchoring.md`).
 
-The "a case mutates the shared test_setup fixtures" hypothesis is REFUTED.
-Bisecting the ordering never converges because the trigger is nondeterministic:
-root-0029's `clusterPoisoned` recovery restarts the cluster after any 120 s
-timeout (frequent under nightly co-load, never in an isolated repro), and
-`pg_inherits` was a purely VIRTUAL catalog — written only by `CREATE TABLE …
-INHERITS`, reloaded by nothing. Every case after a restart therefore ran with
-all inheritance edges gone: `pg_inherits` empty, parent scans returning no child
-rows, and `ALTER TABLE emp RENAME COLUMN salary TO manager` SUCCEEDING (two
-`manager` columns) because `renameatt`'s child-collision recursion had no
-children to walk. Fix = heap-backed pg_inherits (`base/<dbOid>/2611`) written
-from the `syncTableToCatalogHeap` funnel + `loadInheritanceFromHeap` in
-`open.go`, plus three PG-fidelity bugs the restart had masked: qualified
-`RenameTable` message, missing self-relation RENAME COLUMN collision check, and
-`DROP AGGREGATE` resolving its arg type after the name lookup (fixing which
-exposed the name-keyed registry dropping the wrong overload).
+The prefix run through `select_distinct` (176 cases, 670 s) showed `misc`
+timed out, root-0029's recovery restart then FAILED, and all 53 remaining
+cases (#123..#176 — including `portals_p2`, `select`, `select_distinct`)
+reported a phantom `deferred: cluster restart failed`. Only `index_including`
+produced a genuine `output mismatch`. The restart failed with
+`wal replay: decode at offset 771751920: invalid record header: unknown
+rmid=31` — goopg could not start after a crash once retention had run.
+Reproduced standalone (`analysis/wal-crash-restart-repro.sh`: pgbench -c 16,
+kill -9, restart; fails at ~570 MB of WAL). Three causes, one theme — both
+scanners assumed the stream begins on a record boundary and stays valid:
+a hole in pg_wal (normal residue of a SIGKILL during `removeOldSegments`,
+which walks newest-first) was fatal; a segment opening with
+XLP_FIRST_IS_CONTRECORD had its continuation decoded as a record header
+(which was ALSO destroying 54–97 durable records on every clean reopen);
+and an unreadable tail was an error instead of PG's end-of-WAL.
 
-Next M-NIGHTLY step (still open, preempts M0124): re-verify `index_including`,
-`portals_p2`, `select`, `select_distinct` at HEAD. Expect at least one distinct
-cause — `select`'s fixtures are not inheritance-based. **Method proven this
-loop:** run an alphabetical PREFIX of the suite up to the target case
-(`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`; cases are discovered in
-`filepath.Glob` order) with `GOOPG_REGRESS_DIFF_DIR` — 63 cases ≈ 3.5 min vs
-~1 h for the full suite — and grep the log for `restarting the cluster` before
-reading anything into the ordering. Then M0124 → M0125 per the 2026-07-28
-directive.
+Next M-NIGHTLY step (still open, preempts M0124): (a) re-run the same prefix
+and confirm it now REACHES `portals_p2`/`select`/`select_distinct`, then
+measure them; (b) `index_including`'s real divergence; (c) root-0032 §5 — the
+same repro now fails one stage later in redo (`heap-update add new tuple: not
+enough free space in page`), so a crash under load still leaves an unstartable
+cluster (ledger 2026-07-28); (d) the harness's phantom `deferred:` per case
+after a failed restart (ledger, same date). ALWAYS grep a suite log for
+`restarting the cluster` / `restart failed` before believing a case result.
 
-Gates run: new `TestPort_InheritanceSurvivesRestart` PASS (1.5 s) + negative
-control (fails with the reload disabled, so non-vacuous); regress prefix through
-`errors` PASS with `restarts=1` (8 divergent lines → 0; prefix pass count 9→10);
-`go test ./internal/executor/ ./internal/catalog/ ./internal/initdb/` PASS;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35). TPC-DS SF0.5 gate
-deliberately skipped — no TPC-DS query uses inheritance, `DROP AGGREGATE`, or
-`ALTER TABLE … RENAME` (rationale in the design doc §4).
+Gates run: `go test ./internal/wal/ ./internal/initdb/ ./internal/storage/`
+PASS; `go test -race ./internal/wal/` PASS; negative control on both halves of
+the fix (each new test fails with its fix disabled, so non-vacuous);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (exit 0);
+pgbench smoke via the commit hook. tpch-spotcheck deliberately not run — no
+planner/executor/codec change (WAL read path only); the crash repro is the
+end-to-end evidence instead.
 In-flight: none.
