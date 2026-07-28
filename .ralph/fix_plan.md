@@ -64,10 +64,14 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `89-96`
->    (`scripts/tpcds-bench-compare.sh 89-96`; chunks 1–88 are DONE). See that
->    task's "Chunked execution" note — the sweep is deliberately split across
->    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
+>    **↳ NEXT TASK TO SELECT (updated 2026-07-29): `M0124-0001` is CLOSED, and so
+>    are `-0003`, `-0005` and `-0006`. What remains is `M0124-0002` (retroactive
+>    TPC-H + plan-baseline discharge) and `M0124-0004` (Q35's row count). **Both
+>    need a QUIET host** — `M0124-0002` is a timed A/B and `M0124-0004`'s two
+>    previous readings were voided by the nightly CI batch. Check
+>    `ci/batch/run-nightly.sh` is not running before selecting either; the
+>    harness guards now refuse to start otherwise (`FORCE=1` overrides, and is
+>    only legitimate for value/row-count work, never for a timing).** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
 > 3. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
 >    Milestone doc
@@ -928,7 +932,31 @@ blocker; a code change landing mid-sweep voids the sweep.
       (including the M0125-0009 fix's) were taken under the nightly — their
       row-count verdicts survive, their TIMEOUT verdicts and timings do not.
       M0124-0001's SF=1 re-sweep is clean (finished 34 min before the fire).
-- [ ] **M0124-0005 — add a value checksum to the SF0.5 oracle** (§13.4 item 3).
+- [x] **M0124-0005 — add a value checksum to the SF0.5 oracle** (§13.4 item 3).
+      **DONE 2026-07-29.** `scripts/tpcds-result-checksum.py` (new),
+      `cmd_oracle` switched to a **plain** PG run emitting
+      `q|status|rows|ck|secs`, `cmd_sweep` teaching the fatal `CKMISMATCH`
+      verdict and a `PASS=N (x ck-verified, y ck=n/a)` summary; `oracle.txt`
+      re-captured with the normalisation contract in its header. 4-column
+      oracles still load (degrade to row-count-only) so no other checkout
+      breaks. **D5 #1 PASSED — all 99 entries match the pinned fixture on
+      status and rows**, but only after it caught a row-dropping parse bug:
+      psql emits its blank line AFTER the `(N rows)` tally, so a blank line
+      inside a block is a data row (a single column holding NULL), and Q23/Q92
+      were being counted as 0 rows instead of 1. **D5 #2 PASSED** — Q39 (the
+      float case) passes with a matching ck, no `ck=n/a` query misfires, and
+      the sweep's five `CKMISMATCH`es are all hand-confirmed real wrong
+      answers (Q16/Q94/Q95 `0|NULL|NULL` vs PG's values; Q87 23837 vs 23762;
+      Q97 395879 vs 35). Q16 is the proof: M0124-0006 needed a bespoke SF=1
+      investigation to find it, the gate now flags it in 24 s. Coverage: **57
+      of 95 OK queries carry a checksum, 38 are `ck=n/a`** — the n/a rule is a
+      conservative saturation over-approximation (ledger row, resume point
+      recorded). **D5 #3 (pre-RC-1b Q75 replay) deferred** — ledger row
+      2026-07-29; it needs an old binary + its own cluster load and is a
+      hypothesis check, discharged in substance by the five live catches.
+      Sweep `analysis/tpcds-sf05-ck-m0124-0005/` (taken under the nightly with
+      `FORCE=1`: value verdicts hold, **timings and the TIMEOUT set do not**).
+      Original statement of the task follows.
       The gate is row-count only and structurally blind to "right count, wrong
       values" — Q75 PASSed for weeks with 100 rows while its CTE computed
       1,057,469 against PG's 2,368,670, hidden by `LIMIT 100`. Filed as a task,
