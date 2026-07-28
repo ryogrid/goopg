@@ -6907,11 +6907,12 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 	// collapsed them onto one slot, so the filtered count silently
 	// reported the unfiltered total (e.g. sysviews pg_hba_file_rules
 	// `count(*) FILTER (WHERE error IS NOT NULL)`). M0097-0032.
-	if fc.Filter != nil {
-		b.WriteString("filter|")
-		b.WriteString(parserExprKey(fc.Filter))
-		b.WriteString("|")
-	}
+	//
+	// M0125-0009 generalised that one-off fix: funcCallTailKey folds in FILTER
+	// *and* the other content this key used to drop (OVER, the in-argument
+	// ORDER BY, WITHIN GROUP, VARIADIC), which collapsed e.g.
+	// `string_agg(x, ',' ORDER BY a)` with `string_agg(x, ',' ORDER BY b)`.
+	b.WriteString(funcCallTailKey(fc))
 	return b.String()
 }
 
@@ -7475,13 +7476,31 @@ func parserExprKey(e parser.Expr) string {
 			k.WriteString(parserExprKey(a))
 			k.WriteString("|")
 		}
+		// FILTER / OVER / ORDER BY / WITHIN GROUP / VARIADIC are content too:
+		// two calls differing only there are different calls. Empty tail →
+		// empty string, so a plain call's key is unchanged. M0125-0009.
+		k.WriteString(funcCallTailKey(x))
 		return k.String()
 	case *parser.StarExpr:
 		return "star:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table)
 	case *parser.CastExpr:
-		return "cast:" + strings.ToLower(x.Type.String()) + ":(" + parserExprKey(x.Operand) + ")"
+		// Typmods belong in the key: `x::numeric(10,2)` and `x::numeric(20,4)`
+		// are different expressions and ObjectName.String() does not render
+		// the parenthesised arguments. M0125-0009.
+		tm := ""
+		for _, m := range x.Typmods {
+			tm += ":" + strconv.FormatInt(m, 10)
+		}
+		return "cast:" + strings.ToLower(x.Type.String()) + tm + ":(" + parserExprKey(x.Operand) + ")"
 	}
-	return fmt.Sprintf("expr:%T", e)
+	// Every other expression type falls through to a STRUCTURAL key over the
+	// node's exported fields (internal/planner/exprkey.go). It must never be
+	// keyed by type name alone: that made all 17 unenumerated types — CaseExpr
+	// above all — compare equal to any other instance of themselves, so
+	// sibling `sum(CASE …)` aggregates collapsed onto one slot and pivot
+	// queries returned the first column's value in every column with the row
+	// count intact (M0125-0009; TPC-DS Q2 Q21 Q40 Q43 Q50 Q59 Q62 Q66 Q97 Q99).
+	return structuralExprKey(e)
 }
 
 // enforceInheritanceFanout, when true, additionally refuses IndexScan when

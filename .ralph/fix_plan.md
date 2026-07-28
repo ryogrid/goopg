@@ -1164,7 +1164,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `docs/design/0125-0008-semi-anti-conjunction-residual.md`.
       **Blocked until the sweep reaches Q99**; planner/executor change → full
       pre-commit bar (`tpch-spotcheck.sh`, SF0.5 gate, `make plan-diff`).
-- [ ] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
+- [x] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
       sibling aggregates** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). **One-line root cause, wide blast radius.** Aggregate dedup
       keys are built by `aggregateCallKey` → `parserExprKey`
@@ -1231,6 +1231,37 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Planner change → full pre-commit bar.
       Likely the single highest-value fix in the TPC-DS programme: it silently
       corrupts every pivot-style aggregate query while keeping row counts intact.
+      **DONE 2026-07-29.** Fallback replaced by a reflective structural walk over
+      exported fields (`internal/planner/exprkey.go`), skipping the unexported
+      `pos` — the analogue of PG `equalfuncs.c`'s `COMPARE_LOCATION_FIELD` no-op,
+      and load-bearing: without it `GROUP BY <case>` would start raising a
+      spurious 42803. Nested nodes route back through `parserExprKey` so the
+      ColumnRef normalisation still applies at depth; maps render sorted for
+      determinism; cycles are path-marked. Two explicit cases leaked the same way
+      and were folded in — `FuncCall` dropped FILTER/OVER/in-arg ORDER BY/WITHIN
+      GROUP/VARIADIC (so `string_agg(x,',' ORDER BY a)` collapsed with
+      `… ORDER BY b`; `funcCallTailKey` now serves both `parserExprKey` and
+      `aggregateCallKey`, subsuming M0097-0032's one-off), and `CastExpr` dropped
+      `Typmods`. Exhaustiveness gate is two tests in
+      `internal/planner/exprkey_test.go`: a source scan of `exprNode()` receivers
+      that fails when a new Expr type is unregistered (goopg's answer to PG's
+      `elog(ERROR, "unrecognized node type")`), and a per-field test asserting
+      every exported field changes the key — exemptions must be declared with a
+      reason and a *stale* exemption fails too. Against the OLD key that test
+      enumerates **40+ field-level collapses**. **Measured at SF=1 (65436 vs
+      65438), all ten evidence queries re-run:** Q2/Q40/Q43/Q59 byte-identical to
+      PG; Q50/Q62/Q99 value-identical (differing only by the known `char(n)`
+      blank-padding gap — Q99 is now `1231|1228|1289|0|0` = PG, was
+      `1231|1231|1231|1231|1231`); flat reproducer `10435|10436|10436` = PG.
+      **Q21 and Q66 still diverge for an INDEPENDENT reason** — both wrap their
+      aggregates in a FROM-subquery, so `remapSubqueryColumnRefs` rebinds every
+      target to the first `sum` slot; that is **M0125-0010**, and the two defects
+      compose (each needs both fixes). This is the prediction in the "do not
+      confuse this with M0125-0010" note above, confirmed by measurement.
+      **Q97's collapse is gone** (`392155|177135|1553910`, was
+      `392155|392155|392155`) and its residual gap was isolated to a NEW defect —
+      **M0125-0011** below. Design
+      `docs/design/0125-0009-parser-expr-key-structural.md`.
 
 - [ ] **M0125-0010 — FROM-subquery Project remap binds sibling aggregates by
       FUNCTION NAME, so `select * from (select sum(a), sum(b) …) d` returns
@@ -1280,6 +1311,52 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       second section (same failure mode, different key) rather than a new doc.
       Planner change → full pre-commit bar. Blocked by the same engine-commit
       freeze as M0125-0009 (lifts when M0124-0001's merged deliverable lands).
+      **UNBLOCKED 2026-07-29** (freeze lifted; M0125-0009 landed). **Evidence
+      grew to SIX queries**: re-running the M0125-0009 acceptance set at SF=1
+      showed **Q21** and **Q66** still divergent *after* the CASE collapse was
+      fixed, and both are this shape — Q21 is
+      `select * from (… sum(case…) inv_before, sum(case…) inv_after …) x`
+      (goopg `1516|1516`, PG `1516|2833`) and Q66's inner derived table holds the
+      48 `sum(CASE …)` siblings whose now-distinct slots are re-collapsed by the
+      remap (34 replicated columns in 5 rows — the widest blast radius on record).
+      The two defects **compose**: Q21/Q66 need both fixes, so neither can be
+      graded by "does the query match PG" alone. **This is now the top of the
+      value-divergence queue.**
+- [ ] **M0125-0011 — FULL OUTER JOIN drops all but the FIRST conjunct of its ON
+      condition** (discovered by M0125-0009's acceptance run, 2026-07-29, ledger
+      row 2026-07-29). Isolated on the SF=1 clusters from TPC-DS **Q97**, whose
+      residual divergence survived the M0125-0009 fix. Probe matrix (goopg 65436
+      vs PG 65438, read-only, `ssci`/`csci` = Q97's two CTEs):
+
+      | probe | goopg | PG |
+      |---|---|---|
+      | `count(*)` of each CTE | `548694 / 287769` | `548694 / 287769` |
+      | `ssci JOIN csci ON (customer_sk AND item_sk)` | `161` | `161` |
+      | `ssci FULL OUTER JOIN csci ON (customer_sk)` | `2131274` | `2131274` |
+      | `ssci FULL OUTER JOIN csci ON (customer_sk AND item_sk)` | **`2131274`** | **`836302`** |
+
+      The inputs agree, the INNER join on both keys agrees, and the single-key
+      FULL OUTER JOIN agrees exactly — only the two-conjunct FULL OUTER JOIN
+      diverges, and it returns *precisely the single-key number*, so the second
+      equality is being dropped rather than mis-evaluated. PG's `836302` is
+      `548694 + 287769 − 161`, the full-outer identity for 161 matches, which
+      independently confirms the reference side. (`sum(case …)` totals sit `8074`
+      below the row count on BOTH engines — rows with NULL `customer_sk` on both
+      sides match no CASE arm; not a defect, do not chase it.)
+      **Start at** the FULL OUTER JOIN construction in `internal/planner/` — how
+      a multi-conjunct `ON` is split into join keys vs residual, and whether the
+      residual is attached at all for the FULL variety (the INNER path clearly
+      keeps it, since the inner join returns PG's 161). Then the full-outer
+      operator in `internal/executor/`. Related sibling pair from Hard-won Rule
+      #2: Semi/Anti residual ↔ source-table mapping (see M0125-0008).
+      **Accept by VALUE**: the four-row probe matrix above as a planner/executor
+      test (a two-key FULL OUTER JOIN must NOT equal its single-key counterpart),
+      plus TPC-DS Q97 = `541140|286927|161`. Unlike M0125-0009 this one *changes
+      the row count*, so the SF0.5 gate and the nightly anchors can see it —
+      check whether Q97's anchors need re-pinning once fixed.
+      Design `docs/design/0125-0011-full-outer-join-on-conjunct-drop.md`.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
+      gate, `make plan-diff`).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
