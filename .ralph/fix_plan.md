@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `41-48`
->    (`scripts/tpcds-bench-compare.sh 41-48`; chunks 1–40 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `49-56`
+>    (`scripts/tpcds-bench-compare.sh 49-56`; chunks 1–48 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;

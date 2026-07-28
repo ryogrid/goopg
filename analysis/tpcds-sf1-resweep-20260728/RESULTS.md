@@ -76,6 +76,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 38 | OK 40 s | 1 | OK 3 s | 1 | OK 41 s / 1 | rows = PG; stable |
 | 39 | OK 181 s | 236 [230+6] | OK 5 s | 236 [230+6] | OK 179 s / 236 | rows = PG on both blocks; stable (set A's "fixed this round" holds) |
 | 40 | OK 38 s | 100 | OK 0 s | 100 | OK 42 s / 100 | rows = PG; stable |
+| 41 | OK 8 s | 1 | OK 2 s | 1 | OK 8 s / 1 | rows = PG; stable |
+| 42 | OK 17 s | 10 | OK 1 s | 10 | OK 15 s / 10 | rows = PG; stable |
+| 43 | OK 16 s | 6 | OK 0 s | 6 | OK 18 s / 6 | rows = PG; stable |
+| 44 | OK 59 s | 10 | OK 0 s | 10 | OK 58 s / 10 | rows = PG; stable |
+| 45 | OK 20 s | 14 | OK 0 s | 14 | OK 18 s / 14 | rows = PG; stable |
+| 46 | OK 43 s | 100 | OK 0 s | 100 | OK 43 s / 100 | rows = PG; stable |
+| 47 | **OK 142 s** | **0** | OK 3 s | 100 | **OK 17 s / 0** | known RC-1b row gap (unchanged, still 0 vs 100) **but an 8.4× runtime deviation** — reproduced at 143 s; see below |
+| 48 | OK 50 s | 1 | OK 0 s | 1 | OK 52 s / 1 | rows = PG; stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -165,7 +173,47 @@ landed between chunks, so the rebuild re-stamped `vcs.revision` even though
 `git diff HEAD -- internal cmd` is empty. Had the binary sha been the
 comparability key, this chunk would have falsely read "SWEEP VOID".
 
-Running timeout classification (D6), Q1–Q40:
+Chunk 41–48 (`chunk-41-48.txt`) needed no split — set A shows no timeout in the
+range — and ran in ~6 min, exit 0, header reprinting the sweep baseline
+`engine-id` unchanged (still ONE sweep under D4a). No timeout, no restart, no
+reap. Seven of eight cells reproduce set A within ±2 s and match PG's row count
+exactly. The eighth is Q47.
+
+**Q47 is the first cell in Q1–Q48 to deviate from set A on RUNTIME rather than
+on a timeout verdict: `OK 17 s` → `OK 142 s`, an 8.4× slowdown.** It is not
+noise and not sweep-tail collapse:
+
+- It **reproduces**: an immediate goopg-only re-run (`diag-q47-rerun.txt`) gave
+  `OK 143 s`, 1 s from the sweep cell.
+- It is **query-specific**, so it cannot be server age / GC thrash under
+  `GOGC=off`: the same server, at the same age, in the same chunk, returned
+  Q44 59 s (set A 58 s), Q46 43 s (43 s) and Q48 50 s (52 s). A GC-pressure
+  effect would have inflated those too.
+- The **row count did not move**: still 0 vs PG's 100. The known RC-1b gap is
+  intact — this is a runtime deviation *on top of* an unfixed wrong answer, not
+  the cost of a newly-correct plan.
+
+Cause is bounded but **not** established (deliberately not root-caused here —
+this task is the measurement baseline). Set A's stated base is `ee86594e` with
+commits `b3493a6e`, `21301982`, `9740fce9`; ten further engine commits have
+landed since, and the prime suspect is `5db0a067`
+*"fix(planner): RC-1b — push MHJ single-source filters AFTER the bindings
+remap"* (2026-07-27), which post-dates set A and touches **Q47's own RC-1b
+family**. A filter pushed to a different point changes what the MHJ probes, so
+an 8× cost move with an unchanged wrong answer is the shape that commit could
+produce. `cecdab97` (SELECT DISTINCT ORDER BY, 2026-07-28) is a second, weaker
+candidate.
+
+**Action for M0125, filed not worked:** the other RC-1b members — Q49, Q50 and
+the probable member Q51 — all fall in the next chunk (49–56) and all carry set A
+runtimes (82 s, 15 s, 597 s). If they show the same runtime inflation, the cause
+is the RC-1b commit and not Q47; if they do not, Q47 needs its own EXPLAIN diff
+against set A. Q51 matters most: it completed at `OK 597 s` in set A, i.e. it is
+budget-marginal already, so any inflation at all flips it to TIMEOUT and it must
+**not** be scored as a new regression class without this context.
+
+Running timeout classification (D6), Q1–Q48 (unchanged by this chunk — 41–48
+contributed no new timeout, no new ERROR):
 
 - **both engines** (excluded from "goopg-only"): Q4
 - **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31
@@ -175,6 +223,9 @@ Running timeout classification (D6), Q1–Q40:
 - **goopg ERROR**: Q8
 - **not a goopg error** (query text invalid on PG too): Q36
 
+Separate from the timeout classification, a **runtime-deviation** class opens
+with one member: Q47 (reproducible 8.4× vs set A, answer unchanged).
+
 ## Cursor
 
-`M0124-0001 sweep: 1-40 done; next 41-48.`
+`M0124-0001 sweep: 1-48 done; next 49-56.`

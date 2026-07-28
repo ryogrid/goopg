@@ -1,0 +1,11 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T19:49:23+09:00
+# goopg: e51f53ae bench(tpcds): M0124-0001 chunk 5 — Q33-Q40 measured; Q35 is budget-marginal, Q36 is not a goopg error  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=9a6a5c070ad7364d on-disk=9a6a5c070ad7364d (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg, PG skip: 36 70 86
+
+goopg Q47  OK         143s        0 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt
