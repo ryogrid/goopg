@@ -100,6 +100,22 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 62 | OK 9 s | 100 | OK 0 s | 100 | OK 12 s / 100 | rows = PG; stable (−3 s) |
 | 63 | OK 44 s | 100 | OK 0 s | 100 | OK 43 s / 100 | rows = PG; stable |
 | 64 | TIMEOUT 632 s | 0 | OK 0 s | 8 | TIMEOUT 654 s / 0 | goopg-only timeout; unbounded above; reproduces set A (−22 s, both cut at budget) |
+| 65 | TIMEOUT 636 s | 0 | OK 0 s | 100 | TIMEOUT 659 s / 0 | goopg-only timeout; unchanged |
+| 66 | OK 36 s | 5 | OK 1 s | 5 | OK 34 s / 5 | rows = PG; stable |
+| 67 | TIMEOUT 637 s | 0 | OK 6 s | 100 | TIMEOUT 654 s / 0 | goopg-only timeout; unchanged |
+| 68 | OK 44 s | 100 | OK 1 s | 100 | OK 41 s / 100 | rows = PG; stable |
+| 69 | TIMEOUT 630 s | 0 | OK 1 s | 100 | TIMEOUT 658 s / 0 | goopg-only timeout; unchanged |
+| 70 | ERROR 0 s | 0 | SKIP | — | ERROR 0 s / 0 | dsqgen artefact — query text invalid on PG too, so the PG arm is skipped by design; **not a goopg defect** |
+| 71 | TIMEOUT 634 s | 0 | OK 0 s | 1129 | TIMEOUT 652 s / 0 | goopg-only timeout; unchanged |
+| 72 | **TIMEOUT 635 s** | 0 | OK 2 s | 100 | OK 14 s / 0 | **first set-A `OK` → HEAD `TIMEOUT`**; re-probed fresh at 636 s; set A's 0-row gap now unobservable — see "Chunk 65–72" below |
+| 73 | OK 34 s | 3 | OK 0 s | 3 | OK 34 s / 3 | rows = PG; stable |
+| 74 | OK 34 s | 100 | **TIMEOUT 638 s** | 0 | OK 36 s / 100 | **PG-only timeout** — goopg completes what PG cannot at this budget; unchanged from set A; the reap terminated 1 orphaned PG backend |
+| 75 | **ERROR 66 s** | 0 | OK 2 s | 100 | OK 47 s / 100 | **first set-A `OK` → HEAD `ERROR`**: `ERROR: division by zero` (query75.sql:67); server survives (Q76 ran next); this is the *predicted* M0125-0004 / ledger `tpcds-round2 Q75-eval-order` outcome — see "Chunk 73–80" below |
+| 76 | OK 34 s | 100 | OK 0 s | 100 | OK 36 s / 100 | rows = PG; stable (RC-1b hold confirmed a second time) |
+| 77 | OK 47 s | 44 | OK 0 s | 44 | OK 50 s / 44 | rows = PG; stable |
+| 78 | TIMEOUT 637 s | 0 | OK 2 s | 100 | TIMEOUT 651 s / 0 | goopg-only timeout; unbounded above; reproduces set A |
+| 79 | OK 34 s | 100 | OK 0 s | 100 | OK 34 s / 100 | rows = PG; stable |
+| 80 | OK 164 s | 100 | OK 1 s | 100 | OK 169 s / 100 | rows = PG; stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -424,6 +440,82 @@ timeouts, four of them already in set A plus the new Q72, and no new ERROR):
 Row mismatches vs PG among OK queries, Q1–Q72: unchanged at Q47 (0/100), Q49
 (30/34), Q51 (0/100) — Q72's former gap is now masked by its timeout.
 
+### Chunk 73–80 — Q75 errors out, exactly as predicted; RC-1b's fourth outcome
+
+Chunk 73–80 (`chunk-73-80.txt`) ran ~35 min, exit 0, header reprinting the sweep
+baseline `engine-id bba744a8… c47d4ed6… diff=e3b0c44298fc` unchanged, so D4a
+still holds and this remains ONE sweep.
+
+**Bookkeeping repair first:** the chunk-9 loop wrote the "Chunk 65–72" prose but
+never appended its eight rows to the Results table above, which stopped at Q64.
+Rows 65–72 are backfilled in this loop from `chunk-65-72.txt`; no figure changed,
+the table simply now matches the prose.
+
+Seven of eight cells reproduce set A in verdict. Q73/Q76/Q77/Q79/Q80 all match PG
+on rows and sit within ±5 s of set A; **Q78** reproduces its set-A goopg-only
+TIMEOUT (637 s vs 651 s, both cut at budget) and stays unbounded above; **Q74**
+reproduces its **PG-side** TIMEOUT (638 s vs 652 s) while goopg answers in 34 s
+with PG's row count — only the second PG-only timeout in the sweep after Q11, and
+the first place in this range where `reap_pg_orphans` fired (1 backend
+terminated), so no later PG timing in the chunk is contaminated by it.
+
+The eighth cell is the finding: **goopg Q75 goes `OK 47 s / 100` → `ERROR 66 s`,
+`ERROR: division by zero` at `query75.sql:67`.** The server survives — Q76 ran
+immediately afterwards and completed normally — so this is the contained-error
+shape already seen at Q8, not a crash.
+
+This is **not a new discovery, and that is the point.** Ledger row
+`tpcds-round2 Q75-eval-order` (2026-07-27) already recorded this error as
+deterministic 3/3 on the SF0.5 stack, and it is filed as **M0125-0004** with a
+diagnosis: with RC-1b's now-correct `all_sales` CTE a `d_year=2003` group with
+`sales_cnt = 0` genuinely exists (PG has it too), and goopg evaluates the
+side-mixed conjunct `CAST(curr.sales_cnt)/CAST(prev.sales_cnt) < 0.9` as the
+hash-join residual per matched pair *before* the outer Filter's `d_year` equalities
+can exclude that pair, where PG pushes the single-relation quals to scan level
+first. What this chunk contributes is the promotion of §13.3's **projection to a
+measurement**, at SF=1, inside the sweep-baseline engine — which is the entire
+purpose of M0124-0001.
+
+It also completes a fourth outcome for the RC-1b fix `5db0a067`, whose family now
+reads: Q50 fixed outright (0 → 6 = PG), Q47 newly-correct input but still the
+wrong answer (17 → 142 s), Q72 pushed past the budget, and Q75 pushed into a
+contained error. All four share one mechanism — the input stopped being silently
+zeroed — and three of the four look like regressions on the verdict column while
+being strict improvements in input correctness.
+
+Q75 deserves one further note, because the naive reading of the table is wrong.
+Set A's `OK 47 s / 100` was **not** a passing cell: the same ledger row proves the
+pre-fix CTE computed 1,057,469 against PG's 2,368,670, i.e. 100 garbage rows that
+matched PG's row *count* and nothing else, with `LIMIT 100` hiding the corruption.
+HEAD's loud `ERROR` is therefore more honest than set A's silent pass, and this
+cell is the concrete justification for **M0124-0005** (a value checksum in the
+SF0.5 oracle) — a row-count-only gate is structurally blind to exactly this.
+
+Consequence for the nightly lane: `Q75,100,pinned` at
+`ci/batch/tpcds-row-anchors.csv:46` has no `expected-failures.csv` entry, so this
+is a live nightly break. Under the 2026-07-28 amendment M-NIGHTLY is PARKED and
+the TPC-DS row-anchor gate is **not** one of the four carve-out gates
+(`tpch-spotcheck.sh`, the SF0.5 gate, `make plan-diff`, the bench clusters), none
+of which this touches — the sweep itself ran clean. So it stays filed and
+unchecked as M0125-0004; no engine change may land before Q99 regardless.
+
+Running timeout/error classification (D6), Q1–Q80 (73–80 contributed one
+goopg-only timeout, one PG-only timeout and the first new goopg ERROR since Q8):
+
+- **both engines** (excluded from "goopg-only"): Q4
+- **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31, Q54, Q64,
+  Q65, Q67, Q69, Q71, Q72, **Q78**
+- **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
+  at 600 s): Q18, Q35, Q51
+- **PG-only** (goopg wins): Q11, **Q74**
+- **goopg ERROR**: Q8, **Q75**
+- **not a goopg error** (query text invalid on PG too): Q36, Q70
+
+Row mismatches vs PG among OK queries, Q1–Q80: unchanged at Q47 (0/100), Q49
+(30/34), Q51 (0/100). Q75 does not join them — it left the OK class entirely —
+but its set-A row *match* is now known to have been value-corrupt, so the honest
+count of "queries whose answer is known-good at HEAD" excludes it too.
+
 ## Cursor
 
-`M0124-0001 sweep: 1-72 done; next 73-80.`
+`M0124-0001 sweep: 1-80 done; next 81-88.`

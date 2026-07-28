@@ -630,6 +630,44 @@ blocker; a code change landing mid-sweep voids the sweep.
         TIMEOUT** (652 s; goopg OK 36 s) — the only PG arm that times out here, so
         `reap_pg_orphans` will fire; budget for it and do not read it as a goopg
         result. Q78 and Q81 are goopg-only timeouts in/near the range.
+      - **Chunk 73–80 DONE** (loop #10; `chunk-73-80.txt`, one harness call,
+        ~35 min, exit 0, sweep-baseline `engine-id` reprinted unchanged).
+        Q73/Q76/Q77/Q79/Q80 match PG on rows within ±5 s of set A; **Q78**
+        reproduces its set-A goopg-only TIMEOUT (637 s) and **Q74** reproduces its
+        **PG-side** TIMEOUT (638 s) while goopg answers in 34 s with PG's rows —
+        the sweep's second PG-only timeout after Q11, and the first `reap_pg_orphans`
+        fire in this range (1 backend terminated). The finding is **Q75 — the first
+        set-A `OK` to become an `ERROR`** (`OK 47 s / 100` → `ERROR 66 s`,
+        `ERROR: division by zero` at `query75.sql:67`); the server survives (Q76 ran
+        next), the Q8 contained-error shape. This is the **predicted** outcome, and
+        that is its value: ledger `tpcds-round2 Q75-eval-order` (2026-07-27) already
+        had it deterministic 3/3 at SF0.5 and **M0125-0004** already carries the
+        diagnosis, so this chunk promotes §13.3's *projection* to a *measurement* at
+        SF=1 under the sweep baseline. It also completes RC-1b `5db0a067`'s **fourth**
+        family outcome: **Q50 fixed 0 → 6 = PG, Q47 17 → 142 s still wrong, Q72 past
+        the budget, Q75 into a contained error** — one mechanism (input stopped being
+        silently zeroed), three cells that read as regressions on the verdict column
+        while being strict improvements in input correctness. **Do not read set A's
+        Q75 `100` as a pass**: the ledger proves the pre-fix CTE computed 1,057,469
+        vs PG's 2,368,670, i.e. 100 garbage rows whose *count* matched under
+        `LIMIT 100` — HEAD's loud ERROR is more honest, and this cell is the concrete
+        justification for **M0124-0005**'s value checksum. Nightly `Q75,100,pinned`
+        (`ci/batch/tpcds-row-anchors.csv:46`) is therefore a live break with no
+        `expected-failures.csv` entry, but the TPC-DS row-anchor gate is **not** one
+        of the banner's four carve-out gates, so it stays filed and unchecked under
+        M0125-0004. Also repaired a chunk-9 bookkeeping gap: `RESULTS.md`'s Results
+        table stopped at Q64 (the 65–72 prose landed without its rows); rows 65–72
+        are backfilled from `chunk-65-72.txt`, no figure changed. Running D6 for
+        Q1–Q80: both-engine Q4; goopg-only unbounded
+        Q5/Q10/Q14/Q30/Q31/Q54/Q64/Q65/Q67/Q69/Q71/Q72/**Q78**; goopg-only
+        budget-marginal Q18/Q35/Q51; PG-only Q11/**Q74**; goopg ERROR Q8/**Q75**;
+        not-a-goopg-error Q36/Q70. Row mismatches among OK queries Q1–Q80: still
+        Q47, Q49, Q51.
+        **NEXT: chunk `81-88`.** Read set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 8[1-8] `) for the timeout count in range FIRST and size the
+        Bash `timeout` accordingly — count **both** engines' columns (col 1 = goopg,
+        col 2 = PG; loop #10's baton undercounted 73–80 by reading only the goopg
+        side, and Q78's goopg timeout cost ~11 unbudgeted minutes).
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
