@@ -52,6 +52,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 14 | TIMEOUT 625 s | 0 | OK 37 s | 200 [100+100] | TIMEOUT 647 s | goopg-only timeout; unchanged (PG row count is the summed two-block value — harness fix 2) |
 | 15 | OK 17 s | 100 | OK 0 s | 100 | OK 15 s / 100 | rows = PG; stable |
 | 16 | OK 48 s | 1 | OK 1 s | 1 | OK 48 s / 1 | rows = PG; stable |
+| 17 | OK 53 s | 1 | OK 2 s | 1 | OK 52 s / 1 | rows = PG; stable |
+| 18 | **TIMEOUT 627 s** | 0 | OK 0 s | 100 | **OK 626 s / 100** | **budget-marginal flip** — same work as set A, opposite verdict; see below |
+| 19 | OK 64 s | 100 | OK 0 s | 100 | OK 69 s / 100 | rows = PG; stable |
+| 20 | OK 14 s | 100 | OK 0 s | 100 | OK 17 s / 100 | rows = PG; stable |
+| 21 | OK 50 s | 100 | OK 2 s | 100 | OK 47 s / 100 | rows = PG; stable |
+| 22 | OK 156 s | 100 | OK 5 s | 100 | OK 162 s / 100 | rows = PG; stable |
+| 23 | OK 210 s | 1 [1+0] | OK 6 s | 1 [1+0] | OK 208 s / 1 | rows = PG; stable |
+| 24 | OK 75 s | 0 [0+0] | OK 0 s | 0 [0+0] | OK 75 s / 0 | rows = PG (both empty); stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -66,13 +74,41 @@ The range was split into two harness invocations (9–12, 13–16) purely to sta
 inside the loop's foreground Bash budget; both print the same `engine-id`
 baseline, so they are one continuous sweep under D4a.
 
-Running timeout classification (D6), Q1–Q16:
+Chunk 17–24 (`chunk-17-24.txt`) reproduces set A on seven of eight cells (largest
+delta 6 s, both directions). The eighth, **Q18, is the one predicted flip**: set A
+recorded `OK 626 s / 100`, this sweep records `TIMEOUT 627 s / 0`. The two
+elapsed figures are one second apart, so the query did the *same* amount of work
+in both runs — what differs is only which side of the 600 s cut it landed on.
+Elapsed here is wall time for the whole cell (query + the ≤30 s EXPLAIN capture,
+which is outside the timeout-guarded query), which is why a cell can read
+`OK` at an elapsed figure above the budget at all.
+
+This makes Q18 a **budget-marginal** query, and it must not be merged into the
+D6 goopg-only timeout class without that qualifier. The distinction is
+load-bearing for M0125: Q5, Q10 and Q14 were cut at 600 s with their true
+runtime *unbounded above* (no run of this sweep or set A has ever seen them
+finish), whereas Q18's true runtime is **known** to sit within ~1 % of the
+budget. A change that moves Q18 across the line therefore says nothing about
+whether goopg got faster — only that it re-rolled a coin — while the same
+movement on Q5/Q10/Q14 would be real signal. Any future re-sweep that reports
+"Q18 fixed" or "Q18 regressed" at a 600 s budget is reporting noise; raising the
+budget for Q18 specifically (or classifying it by measured runtime rather than by
+verdict) is the only way to make that cell informative.
+
+The reap did not fire in this range (no PG timeouts). The goopg restart after
+Q18's timeout again moved the binary image hash (`01bb0f65…` → `22110d95…`) with
+`engine-id` unmoved — the same `vcs.revision` stamp effect documented above for
+chunks 5–8 and 9–12, not a source change.
+
+Running timeout classification (D6), Q1–Q24:
 
 - **both engines** (excluded from "goopg-only"): Q4
-- **goopg-only**: Q5, Q10, Q14
+- **goopg-only, runtime unbounded above**: Q5, Q10, Q14
+- **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
+  at 600 s): Q18
 - **PG-only** (goopg wins): Q11
 - **goopg ERROR**: Q8
 
 ## Cursor
 
-`M0124-0001 sweep: 1-16 done; next 17-24.`
+`M0124-0001 sweep: 1-24 done; next 25-32.`

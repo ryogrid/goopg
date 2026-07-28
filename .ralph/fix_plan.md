@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `17-24`
->    (`scripts/tpcds-bench-compare.sh 17-24`; chunks 1–16 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `25-32`
+>    (`scripts/tpcds-bench-compare.sh 25-32`; chunks 1–24 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -530,7 +530,30 @@ blocker; a code change landing mid-sweep voids the sweep.
         D4a they are one continuous sweep, not two. The reap fired again on PG's
         Q11 timeout. Running D6 classification for Q1–Q16: both-engine timeout
         Q4; goopg-only Q5/Q10/Q14; PG-only Q11; goopg ERROR Q8.
-        **NEXT: chunk `17-24`.**
+        ~~**NEXT: chunk `17-24`.**~~ done, see below.
+      - **Chunks 17–24 DONE** (loop #3; `chunk-17-24.txt`, one harness call —
+        no timeout in set A for this range). Seven of eight cells reproduce set A
+        within 6 s: Q17 53 s/1, Q19 64 s/100, Q20 14 s/100, Q21 50 s/100,
+        Q22 156 s/100, Q23 210 s/1, Q24 75 s/0 (both engines empty).
+        **Q18 flipped as predicted:** set A `OK 626 s / 100`, this sweep
+        `TIMEOUT 627 s / 0`. One second apart, so the query did the same work and
+        only landed on the other side of the 600 s cut (cell elapsed includes the
+        ≤30 s EXPLAIN capture, which is outside the timeout-guarded query — that
+        is how a cell can read `OK` above the budget). Recorded as **budget
+        noise, not a regression**, and not re-run.
+        **D6 needs a sub-class because of it, and this is load-bearing for
+        M0125:** Q18 is *budget-marginal* (true runtime known to sit within ~1 %
+        of the budget), whereas Q5/Q10/Q14 were cut with their true runtime
+        *unbounded above* — no run has ever seen them finish. Movement on Q18 at
+        a 600 s budget is a re-rolled coin and must not be reported as a
+        fix or a regression; movement on Q5/Q10/Q14 is real signal. To make Q18
+        informative, classify it by measured runtime or give it a larger budget.
+        Running D6 classification for Q1–Q24: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14; goopg-only **budget-marginal Q18**; PG-only Q11;
+        goopg ERROR Q8. No reap this range (no PG timeout); the post-Q18 restart
+        again moved the binary image (`01bb0f65…` → `22110d95…`) with `engine-id`
+        unmoved — the documented `vcs.revision` stamp effect, not a source change.
+        **NEXT: chunk `25-32`.**
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps

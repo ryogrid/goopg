@@ -195,6 +195,24 @@ case-insensitive substring anywhere in the output. Row counts sum **every** `(N 
 — Q14, Q23, Q24 and Q39 hold two statements each. Q36/Q70/Q86 stay SKIP (`PG_SKIP`); Q4 is
 reported but excluded from "goopg-only" (PG times out too).
 
+**Budget-marginal sub-class (added 2026-07-28, loop #3 — measured, not hypothetical).** A
+TIMEOUT verdict carries information only when the query's true runtime is *unbounded above* by
+the cut. Q18 proved the other case exists: set A recorded `OK 626 s / 100` and this sweep
+`TIMEOUT 627 s / 0` — one second apart, i.e. the same work landing on opposite sides of the
+600 s cut. So the timeout class splits in two, and reports must keep them apart:
+
+- **unbounded** — no run at this budget has seen the query finish (Q5, Q10, Q14). A verdict
+  change here is signal.
+- **budget-marginal** — some run has finished it within ~5 % of the budget (Q18; Q82 at
+  ~576 s is the next candidate, already flagged "watch for flapping" in D7). A verdict change
+  here is a re-rolled coin and **must not be reported as a fix or a regression.** To make such
+  a cell informative, classify it by measured runtime rather than by verdict, or re-measure it
+  at a larger budget — never by re-running at the same budget until it reads the desired way.
+
+Note that a cell's elapsed figure covers query **plus** the ≤30 s EXPLAIN capture, which sits
+outside the timeout-guarded query; that is why an `OK` cell can report an elapsed above the
+budget at all, and why elapsed is not directly comparable to `TIMEOUT_SEC`.
+
 Where M0124-0005 has landed, capture the per-query result checksum in the same pass — this
 harness already writes `*_result.txt` per query and engine, so it is nearly free. (Note the
 SF0.5 sweep does **not** write result files; see `0124-0005`.)
