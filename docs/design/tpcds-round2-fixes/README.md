@@ -1051,6 +1051,22 @@ position — still 21 goopg-only defects, different membership:
 is the single highest-value next action; until it runs, no claim about SF=1 at
 HEAD is better than inference.
 
+> **SUPERSEDED 2026-07-29 by measurement (M0124-0001).** The sweep ran — 99/99
+> queries, one 600 s budget, one engine-id, 13 chunks. The deliverable is
+> **`analysis/tpcds-sf1-goopg-20260728.md`** (raw data:
+> `analysis/tpcds-sf1-resweep-20260728/`). Outcome: **all 13 projections above
+> are confirmed at the level they were stated (status + row count), none
+> refuted outright** — but **Q50 and Q46 are refuted on *values*** (PG's row
+> count, the wrong answer), and the projected **21** goopg-only defects measure
+> **40**. The gap is one class this section could not see, because the protocol
+> it was written under classified a cell by status and row count only:
+> **18 queries complete, match PG's row count exactly, and return a wrong
+> answer** (root causes M0125-0009 ×10, the newly-found M0125-0010 ×4,
+> M0125-0007 ×3, M0125-0006 ×1). The timeout class measures 17, not 16 — Q18
+> joined it — and it now splits into **15 unbounded-above** plus **2
+> budget-marginal** (Q18, Q35), whose verdict flips carry no signal. Read the
+> deliverable, not this projection.
+
 ### §13.4 Findings that complicate the plan's premise
 
 1. **RC-1b introduced a new goopg-only failure.** Q75 was OK / 100 rows = PG at

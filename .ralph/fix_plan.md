@@ -444,7 +444,34 @@ select (2026-07-28(b) amendment); M-NIGHTLY is parked below it and only filed.**
 No engine change: if a task uncovers a defect it files a ledger row and an M0125
 blocker; a code change landing mid-sweep voids the sweep.
 
-- [ ] **M0124-0001 — SF=1 dual-engine re-sweep at HEAD** (§13.5 #1). One sweep,
+- [x] **M0124-0001 — SF=1 dual-engine re-sweep at HEAD** (§13.5 #1). **COMPLETE
+      2026-07-29 — the D7 deliverable landed as
+      `analysis/tpcds-sf1-goopg-20260728.md` and the engine-commit freeze
+      LIFTS.** All 13 §13.3 projections tested at SF=1: **11 CONFIRMED as
+      stated, 2 CONFIRMED on rows and REFUTED on values (Q50, Q46), 0 refuted
+      outright.** §13.3's projected **21** goopg-only defects measure **40**:
+      ERROR 2 (Q8 Q75, as projected) + TIMEOUT **17** (projected 16 — Q18
+      joined; splits **15 unbounded-above** / **2 budget-marginal** Q18+Q35,
+      whose verdict flips carry NO signal) + wrong-row-count 3 (Q47 Q49 Q51, as
+      projected) + **wrong ANSWER behind a matching row count 18 — a class
+      §13.3 could not see**, because the protocol it was written under
+      classified a cell by status and row count only. Two notable confirms:
+      **Q72**'s projection was SF0.5-derived and had a *contrary* SF=1
+      measurement in set A (`OK 14 s`) — the projection won (`TIMEOUT 635 s`),
+      a genuine ≥45× regression; **Q47** confirmed on rows but carries an
+      unprojected 8.4× slowdown (17 s → 142 s, reproduces at 143 s standalone,
+      query-specific, unattributed by design). **40 is a LOWER BOUND** — D6a's
+      value comparison is only possible on `OK`/`OK` equal-row cells, so the 17
+      timeouts, 2 errors and 3 row-mismatch cells have never been
+      value-compared at any scale. **Consequences for M0125:** its baseline is
+      this table, not §13.3; the largest class is now wrong answers (18), not
+      timeouts (17); **M0125-0009 first** (10 queries, one-line cause, Q97 is
+      the impossible-by-construction instance), **M0125-0010** second (4
+      queries, independent — neither subsumes the other); never score a Q18/Q35
+      verdict flip or a Q50/Q46 row-count match as a win. **M0124-0005 is now
+      justified by measurement**: 18 of 99 SF=1 queries pass a row-count-only
+      gate while answering wrongly. Original scope below.
+      One sweep,
       both engines, uniform 600 s via `scripts/tpcds-bench-compare.sh`
       (`ENGINES="goopg pg"`). Endpoints differ per arm: goopg `-U postgres -d
       postgres` on 65436, PG `-U ryo -d tpcds` on 65438. Records the goopg commit

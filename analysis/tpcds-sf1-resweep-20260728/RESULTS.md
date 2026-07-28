@@ -928,5 +928,9 @@ guess that Q7/Q26/Q83 are the numeric-scale gap is confirmed and extends to Q27.
 `M0124-0001 sweep: 1-99 ALL DONE (13/13 chunks). Sweep COMPLETE.
 M0124-0006 DONE (2026-07-29): all 23 value-divergent cells attributed; 5 are
 answer-neutral, 18 split across M0125-0006/-0007/-0009 and the newly filed
-M0125-0010. Next is the merged deliverable
-analysis/tpcds-sf1-goopg-20260728.md (13 §13.3 projections).`
+M0125-0010.
+M0124-0001 CLOSED (2026-07-29): merged deliverable
+analysis/tpcds-sf1-goopg-20260728.md LANDED — 11/13 §13.3 projections confirmed
+as stated, 2 (Q50, Q46) confirmed on rows and refuted on values, 0 refuted
+outright; projected 21 goopg-only defects measure 40. Engine-commit freeze
+LIFTED. Next: M0125-0009 (recommended first fix), then M0125-0010.`

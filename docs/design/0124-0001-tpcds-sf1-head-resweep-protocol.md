@@ -261,6 +261,16 @@ trivially and is an *empty-result* defect, not a replication one.
 
 ### D7. Deliverable
 
+> **LANDED 2026-07-29 — `analysis/tpcds-sf1-goopg-20260728.md`.** All 13
+> projections below were tested at SF=1. **11 confirmed as stated; 2 (Q50, Q46)
+> confirmed on rows and refuted on values; 0 refuted outright.** §13.3's
+> projected 21 goopg-only defects measure **40** — the difference is the
+> wrong-answer class D6a exists to find (18 cells), plus Q18 joining the timeout
+> class. Q72 is the notable case: its projection was SF0.5-derived and had a
+> *contrary* SF=1 measurement in set A (`OK 14 s`), and the projection won
+> (`TIMEOUT 635 s`) — which is exactly the "test the hypothesis, never quote it"
+> case D2 permits.
+
 `analysis/tpcds-sf1-goopg-<YYYYMMDD>.md`: provenance (commit, budget, cluster paths, S-cold
 proof, GC regime); the defect table; then a **confirm/refute line for each projection**,
 since the point of the sweep is to test §13.3, not restate it. Every expectation below is an
