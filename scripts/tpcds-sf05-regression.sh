@@ -59,6 +59,13 @@
 #   TIMEOUT_SEC=300         per-query timeout for the goopg sweep
 #   RESTART_AFTER_TIMEOUT=1 bounce goopg after each goopg TIMEOUT
 #   FORCE=1                 run even while the SF=1 sweep harness is active
+#   QUERIES="35 46"         restrict oracle/sweep to a subset (SOLO probe mode);
+#                           the sweep report is stamped "SUBSET PROBE" and is
+#                           NOT a gate result. With 'oracle' it additionally
+#                           requires SF05_ORACLE (it would truncate the fixture)
+#   SF05_ORACLE=<path>      read/write the oracle fixture elsewhere
+#   SF05_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
+#                           fixture stays where SF05_ORACLE points
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,8 +78,11 @@ source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 # SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
 SRC_DATA_DIR="${TPCDS_DATA_DIR}"                   # SF=1 TSVs (input)
 QDIR="${TPCDS_QUERY_DIR}"                          # SF=1 PG-fixed queries (reused)
-OUTDIR="${SF05_RESULTS_DIR}"
-ORACLE="${OUTDIR}/oracle.txt"                      # q|status|rows|secs
+OUTDIR="${SF05_RESULTS_DIR}"                       # env-overridable (env_tpcds.sh)
+# The oracle is a GIT-TRACKED FIXTURE, not a run artefact: it stays in the
+# canonical results dir even when SF05_RESULTS_DIR is redirected to a scratch
+# dir for a one-off probe. Only 'oracle' (re-capture) writes it.
+ORACLE="${SF05_ORACLE:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf05/oracle.txt}"  # q|status|rows|secs
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-600}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 CG_UNIT="goopg-tpcds-sf05"
@@ -106,10 +116,47 @@ sample_key() {
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# query_list — which queries 'oracle' and 'sweep' iterate over.
+#
+# Default is the full 1..99 gate. QUERIES restricts it to a subset (comma-,
+# space- or newline-separated, e.g. QUERIES=35 or QUERIES="35 45,46"), which is
+# what makes a SOLO probe possible: M0124-0004 needed Q35 alone on a fresh
+# server at a 900 s budget, and before this existed the only way to reach it was
+# a ~1 h full sweep whose 34 preceding queries also perturbed the server's heap.
+# A subset run is a PROBE, not a gate result — cmd_sweep stamps the report so a
+# later reader cannot mistake a 1-query summary for a passing gate.
+query_list() {
+    if [[ -n "${QUERIES:-}" ]]; then
+        tr ',' ' ' <<<"${QUERIES}" | tr -s '[:space:]' '\n' | grep -E '^[0-9]+$' || true
+    else
+        seq 1 99
+    fi
+}
+
+# guard_sf1_sweep — refuse to run while another benchmark owns the host.
+#
+# The original check covered only the sibling SF=1 harness. On 2026-07-29
+# (M0124-0004) that proved to be the smaller half of the problem: the **nightly
+# CI batch** (`ci/batch/run-nightly.sh`) fires at 00:00 and its TPC-H stage runs
+# a capped goopg server on :65434 for HOURS — measured at 112% CPU and 7.5 GiB
+# RSS, 5 h into the run. It shares nothing with the TPC-DS clusters by port or
+# data dir, so nothing stopped a "solo, fresh server" TPC-DS probe from landing
+# on top of it, and two SF0.5 sweeps (2026-07-29 00:47 and 03:38) plus the
+# M0124-0004 Q35 probes were all taken against that background before anyone
+# noticed. Timings taken that way are not comparable to a quiet-host baseline,
+# which is the one property every M0124/M0125 measurement depends on.
+#
+# The nightly is detected by its driver scripts rather than by its port, so a
+# lane change cannot silently re-open the hole.
 guard_sf1_sweep() {
     [[ "${FORCE:-0}" == "1" ]] && return 0
-    if ps -eo args --no-headers | grep -q '[b]ash scripts/tpcds-bench-compare.sh'; then
+    local procs
+    procs=$(bench_foreign_procs)   # ancestor-filtered; see env_tpcds.sh
+    if grep -q '[b]ash scripts/tpcds-bench-compare.sh' <<<"${procs}"; then
         die "the SF=1 sweep harness is running — this would contaminate its timings (FORCE=1 to override)"
+    fi
+    if grep -qE 'ci/batch/(run-nightly\.sh|stages/)' <<<"${procs}"; then
+        die "the nightly CI batch is running (ci/batch) — its TPC-H stage saturates CPU/RAM for hours and would contaminate these timings (FORCE=1 to override)"
     fi
 }
 
@@ -274,6 +321,12 @@ sum_top_actual_rows() {
 
 cmd_oracle() {
     guard_sf1_sweep
+    # cmd_oracle TRUNCATES the fixture. A partial re-capture under QUERIES would
+    # therefore delete the other 98 rows, silently turning the gate into a
+    # 1-query no-op — so a subset capture must name its own output file.
+    if [[ -n "${QUERIES:-}" && -z "${SF05_ORACLE:-}" ]]; then
+        die "QUERIES= with 'oracle' would truncate the git-tracked fixture; set SF05_ORACLE=<scratch path> too"
+    fi
     mkdir -p "${OUTDIR}"
     log "Capturing PG oracle (EXPLAIN ANALYZE, timeout ${ORACLE_TIMEOUT}s/query) -> ${ORACLE}"
     {
@@ -285,7 +338,7 @@ cmd_oracle() {
         echo "# the ~20 min PG capture. Re-run 'oracle' only when the dataset or queries change."
     } > "${ORACLE}"
     local q qf plan secs start rc rows status zero=0 okc=0
-    for q in $(seq 1 99); do
+    for q in $(query_list); do
         if grep -qw "$q" <<<"${PG_SKIP}"; then
             echo "${q}|SKIP_QUERYGEN|0|0" >> "${ORACLE}"
             printf "Q%-3s SKIP (dsqgen artefact)\n" "$q"
@@ -332,8 +385,10 @@ cmd_sweep() {
         echo "# goopg: $(git log --oneline -1)"
         echo "# oracle: ${ORACLE} (PG 18.3 EXPLAIN ANALYZE row counts)"
         echo "# timeout: ${TIMEOUT_SEC}s"
+        [[ -n "${QUERIES:-}" ]] && \
+            echo "# SUBSET PROBE (QUERIES=${QUERIES}) — NOT a gate result; the summary below covers only these queries"
     } > "$report"
-    for q in $(seq 1 99); do
+    for q in $(query_list); do
         line=$(grep -E "^${q}\|" "${ORACLE}" || true)
         ostatus=$(cut -d'|' -f2 <<<"$line"); orows=$(cut -d'|' -f3 <<<"$line")
         if [[ "$ostatus" != "OK" ]]; then

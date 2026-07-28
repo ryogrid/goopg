@@ -895,6 +895,39 @@ blocker; a code change landing mid-sweep voids the sweep.
       as performance-only (→ M0125-0003) or as a wrong answer hiding behind a
       timeout, the Q51 shape. Design
       `docs/design/0124-0004-q35-rowcount-resolution.md`.
+      **PARTIALLY EXECUTED 2026-07-29 — stays OPEN; the count is still
+      unrecovered.** The three script blockers are FIXED and verified (`QUERIES=`
+      per-query mode via a new `query_list` shared by `sweep`/`oracle`, subset
+      reports stamped `SUBSET PROBE … NOT a gate result`;
+      `SF05_RESULTS_DIR`/`TPCDS_RESULTS_DIR`/`SF05_ORACLE` env-overridable with
+      the oracle pinned to its git-tracked home independently of the redirect;
+      `restart_goopg` → `${SF_LANE:-sf1}`). Both probes TIMED OUT (SF0.5 solo
+      900 s → 921 s; SF=1 `EXPLAIN ANALYZE` 1800 s → 1846 s) and **both readings
+      are VOID: the nightly CI batch was running throughout** (fired 00:23:44,
+      TPC-H stage at 112% CPU / 7.5 GiB RSS on the 16-core host). Neither
+      harness had a host-quiet guard; both now refuse to start under
+      `ci/batch/run-nightly.sh`/`ci/batch/stages/`, after fixing a `ps | grep`
+      self-match via `bench_foreign_procs` (`bench/tpcds/env_tpcds.sh`).
+      **Two things a later loop must NOT re-derive.** (1) The
+      SF0.5-slower-than-SF=1 anomaly is **not a plan flip** — the plans are
+      byte-identical at both scale factors and `customer` holds 100,000 rows at
+      both (the sampler halves facts by key parity, copies dimensions whole), so
+      the outer cardinality multiplying all three SubPlans is unchanged. (2)
+      RC-8's "measure first" is **half discharged**: the shape is confirmed
+      (`$0 = ss_customer_sk` is a nested-loop **Filter**, not an index cond — so
+      each of three `EXISTS` re-scans a whole fact table per outer row), but the
+      `Calls`/`CacheMisses` counters need a COMPLETING `EXPLAIN ANALYZE`.
+      **Resume:** on a quiet host, `QUERIES=35 TIMEOUT_SEC=1800
+      RESTART_AFTER_TIMEOUT=0 SF05_RESULTS_DIR="$PWD/analysis/tpcds-q35-m0124-0004"
+      bash scripts/tpcds-sf05-regression.sh sweep`; on a second TIMEOUT escalate
+      to SF=1 with a **plain** run, NOT `EXPLAIN ANALYZE` (per-tuple
+      instrumentation inside three per-row SubPlans is itself a large multiplier
+      and confounds the 525 s/628 s comparison). Artefacts
+      `analysis/tpcds-q35-m0124-0004/`; ledger rows 2026-07-29 ×2.
+      **Side effect for M0125:** the SF0.5 sweeps of 2026-07-29 00:47 and 03:38
+      (including the M0125-0009 fix's) were taken under the nightly — their
+      row-count verdicts survive, their TIMEOUT verdicts and timings do not.
+      M0124-0001's SF=1 re-sweep is clean (finished 34 min before the fire).
 - [ ] **M0124-0005 — add a value checksum to the SF0.5 oracle** (§13.4 item 3).
       The gate is row-count only and structurally blind to "right count, wrong
       values" — Q75 PASSed for weeks with 100 rows while its CTE computed

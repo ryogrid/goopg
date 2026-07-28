@@ -57,6 +57,11 @@ GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PORT} -U ${TPCDS_SUPERUSER} -d post
 PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${TPCDS_PG_DB}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-600}"
 EXPLAIN_TIMEOUT="${EXPLAIN_TIMEOUT:-30}"
+# Which bench/tpcds/server.sh lane restart_goopg bounces. It was hardcoded to
+# sf1, so pointing this harness at another cluster (TPCDS_PORT=65437) still
+# restarted the SF=1 server — i.e. it bounced the wrong cluster and left the
+# measured one untouched. Default is unchanged.
+SF_LANE="${SF_LANE:-sf1}"
 ENGINES="${ENGINES:-goopg pg}"
 # Set by run_one so the caller can react to a TIMEOUT (see restart_goopg).
 LAST_STATUS=""
@@ -208,6 +213,29 @@ fi
 echo "# timeout: ${TIMEOUT_SEC}s per query, engines: ${ENGINES}, PG skip: ${PG_SKIP}"
 echo ""
 
+# guard_host_quiet — refuse to sweep while the nightly CI batch owns the host.
+#
+# This harness had NO such guard until 2026-07-29 (M0124-0004). The nightly
+# batch fires at 00:00 and its TPC-H stage keeps a capped goopg server on :65434
+# alive for hours (measured: 112% CPU, 7.5 GiB RSS at 5 h). It collides with
+# this harness on neither port nor data dir, so a sweep started in that window
+# looked clean and produced timings that cannot be compared against a
+# quiet-host baseline — the property the whole SF=1 sweep exists to establish.
+#
+# The M0124-0001 re-sweep itself was lucky, not careful: it ran 17:06–23:49 on
+# 2026-07-28 and finished 34 min before the 00:23:44 fire. The guard makes that
+# a checked precondition instead of a coincidence. FORCE=1 overrides, and the
+# SF0.5 harness carries the mirror-image check.
+guard_host_quiet() {
+    [[ "${FORCE:-0}" == "1" ]] && return 0
+    if bench_foreign_procs | grep -qE 'ci/batch/(run-nightly\.sh|stages/)'; then
+        echo "FATAL: the nightly CI batch is running (ci/batch) — its TPC-H stage would" >&2
+        echo "       contaminate every timing in this sweep. Wait for it, or FORCE=1." >&2
+        exit 2
+    fi
+}
+guard_host_quiet
+
 # restart_goopg — bounce the goopg server to drop accumulated heap.
 #
 # Why this exists (2026-07-27): the bench server runs with GOGC=off and
@@ -227,8 +255,8 @@ echo ""
 restart_goopg() {
     [[ "${RESTART_AFTER_TIMEOUT:-1}" == "1" ]] || return 0
     echo "      (restarting goopg to drop accumulated heap)"
-    "${REPO_ROOT}/bench/tpcds/server.sh" stop  sf1 >/dev/null 2>&1 || true
-    "${REPO_ROOT}/bench/tpcds/server.sh" start sf1 >/dev/null 2>&1 || {
+    "${REPO_ROOT}/bench/tpcds/server.sh" stop  "${SF_LANE}" >/dev/null 2>&1 || true
+    "${REPO_ROOT}/bench/tpcds/server.sh" start "${SF_LANE}" >/dev/null 2>&1 || {
         echo "      WARNING: goopg restart failed — remaining results are suspect"
         return 1
     }

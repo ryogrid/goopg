@@ -39,8 +39,11 @@ SF05_GOOPG_DATA="${TPCDS_RUNTIME_DIR}/data-sf05"        # goopg SF=0.5 cluster
 TPCDS_PG_DATA="${TPCDS_BENCH_DIR}/runtime/pgdata"       # PostgreSQL reference cluster
 TPCDS_DATA_DIR="${TPCDS_RUNTIME_DIR}/tpcds-data"        # SF=1 TSVs + queries/
 SF05_DATA_DIR="${TPCDS_RUNTIME_DIR}/tpcds-data-sf05"    # sampled SF=0.5 TSVs
-TPCDS_RESULTS_DIR="${TPCDS_RUNTIME_DIR}/tpcds-results"
-SF05_RESULTS_DIR="${TPCDS_RUNTIME_DIR}/tpcds-results-sf05"
+# Results dirs are env-overridable so a one-off probe (e.g. the M0124-0004 solo
+# Q35 run) can write to a scratch dir instead of dropping artefacts next to a
+# published sweep. Defaults are unchanged, so every existing caller is a no-op.
+TPCDS_RESULTS_DIR="${TPCDS_RESULTS_DIR:-${TPCDS_RUNTIME_DIR}/tpcds-results}"
+SF05_RESULTS_DIR="${SF05_RESULTS_DIR:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf05}"
 TPCDS_QUERY_DIR="${TPCDS_DATA_DIR}/queries"
 TPCDS_TOOLS="${REPO_ROOT}/third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools"
 
@@ -53,6 +56,27 @@ TPCDS_SUPERUSER="postgres"               # goopg (auth is trust on loopback)
 TPCDS_PG_USER="ryo"                      # PostgreSQL reference cluster owner
 TPCDS_PG_DB="${TPCDS_PG_DB:-tpcds}"      # SF=1 database on the PG cluster
 SF05_PG_DB="${SF05_PG_DB:-tpcds05}"      # SF=0.5 database on the PG cluster
+
+# --- Contamination guards --------------------------------------------------
+# bench_foreign_procs — the argv of every running process EXCEPT this shell and
+# its ancestors.
+#
+# Any `ps | grep <script-name>` guard self-matches: the invoking shell's own
+# command line contains the script name, so the guard reports "already running"
+# against itself. This is the same trap as `pkill -f goopg` (CLAUDE.md rule 3),
+# and it fired for real on 2026-07-29 — the SF0.5 harness refused to start
+# because the wrapper `bash -c '… scripts/tpcds-bench-compare.sh …'` string was
+# in the process table. Filtering the ancestor chain is what makes these guards
+# trustworthy enough to leave switched on.
+bench_foreign_procs() {
+    local pids=() p=$$
+    while [[ -n "$p" && "$p" != "0" && "$p" != "1" ]]; do
+        pids+=("$p")
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
+    local skip; skip=$(IFS='|'; echo "${pids[*]}")
+    ps -eo pid,args --no-headers | awk -v skip="^(${skip})$" '$1 !~ skip { $1=""; print }'
+}
 
 TPCDS_GOOPG_LOG="${TPCDS_RUNTIME_DIR}/goopg.tpcds.log"
 SF05_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf05.log"

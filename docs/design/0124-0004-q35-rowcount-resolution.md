@@ -1,7 +1,9 @@
 # 0124-0004 — Q35: resolve the row count or classify it
 
-Status: draft
-Date: 2026-07-28
+Status: **partially executed** — D1 landed, D4 half-discharged, D5's third
+disposition reached but on a **contaminated host**, so the run must be repeated.
+See "Execution record (2026-07-29)" at the end.
+Date: 2026-07-28 (plan), 2026-07-29 (first execution)
 Milestone: M0124-0004 (`docs/design/tpcds-round2-fixes/README.md` §13.5 action 7)
 
 ## Problem
@@ -127,3 +129,129 @@ its own budget and its own asterisk.
 
 The shell changes from D1 → `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
 plus the pre-commit hook. No engine change.
+
+---
+
+## Execution record (2026-07-29)
+
+Artefacts: `analysis/tpcds-q35-m0124-0004/`.
+
+### D1 — landed, and one obstacle above was mis-stated
+
+All four obstacles were real. Two corrections to D1's table:
+
+- The per-query mode is **`QUERIES=` env, not a positional argument**. `cmd_sweep`
+  and `cmd_oracle` share the loop, and a positional list would have collided with
+  the subcommand dispatcher (`sweep`/`oracle`/`all` are already `$1`). A new
+  `query_list` helper serves both. A subset sweep stamps its report `SUBSET
+  PROBE … NOT a gate result`, so a one-query summary cannot be misread as a
+  passing gate.
+- D1 named `TPCDS_RESULTS_DIR`, but the SF0.5 harness reads **`SF05_RESULTS_DIR`**;
+  both are now `${VAR:-default}`. A third hazard surfaced that D1 did not
+  anticipate: `ORACLE` was derived from `${OUTDIR}`, so redirecting a probe's
+  output would have orphaned the git-tracked fixture. The oracle path is now
+  `SF05_ORACLE`, defaulting to the canonical location independently of
+  `SF05_RESULTS_DIR` — it is a fixture, not a run artefact. And because
+  `cmd_oracle` *truncates* that file, `QUERIES=` with `oracle` now hard-fails
+  unless `SF05_ORACLE` also names a scratch path: a partial re-capture would
+  otherwise have deleted the other 98 rows, silently reducing the gate to one
+  query.
+
+`restart_goopg` now bounces `${SF_LANE:-sf1}`. Every default is unchanged, so
+existing callers are byte-for-byte no-ops.
+
+### D4 — half discharged: the shape is confirmed, the counters are not
+
+`goopg-sf05-explain.txt` and `goopg-sf1-explain.txt` are **identical in shape**.
+Q35 is the predicted RC-8 instance:
+
+```
+->  Multi-Way Hash Join (3 tables)
+      Filter: (EXISTS(SubPlan 1) AND (EXISTS(SubPlan 2) OR EXISTS(SubPlan 3)))
+      SubPlan 1
+        ->  Nested Loop (INNER)
+              Filter: ((($0 = ss_customer_sk) AND (d_year = 1999)) AND (d_qoy < 4))
+          ->  Seq Scan on public.store_sales
+          ->  Index Scan using public.date_dim_pkey on public.date_dim
+```
+
+The load-bearing detail is **where the correlation lands**: `$0 =
+ss_customer_sk` is a *Filter on the nested loop*, not an index condition and not
+a hash key. Each of the three `EXISTS` therefore re-scans an entire fact table
+per outer row. The `Calls/CacheMisses` counters that decide *hashed-SubPlan
+caching vs decorrelation* still need a completing `EXPLAIN ANALYZE`, which no
+budget has reached.
+
+**The SF=1-vs-SF0.5 anomaly is not a plan flip** — the plans match, and
+`customer` holds 100,000 rows at *both* scale factors, because the SF0.5 sampler
+halves facts by key parity and copies dimensions whole. The outer cardinality —
+the multiplier on all three SubPlans — is therefore identical at both scales, so
+D3's "plan instability" hypothesis is ruled out for this pair. A mechanism that
+survives: halving the facts does not halve the work, because a *failing* `EXISTS`
+must scan its whole table while a succeeding one exits early, so removing half
+the facts converts matched customers into unmatched ones and trades early exits
+for full scans.
+
+### D3 — the solo-run hygiene rule was necessary but not sufficient
+
+Both probes were taken from freshly started servers with no prior query in the
+process, and both timed out:
+
+| probe | scale | budget | result |
+|---|---|---|---|
+| solo sweep | SF0.5 | 900 s | `TIMEOUT` 921 s |
+| `EXPLAIN (ANALYZE, TIMING OFF)` | SF=1 | 1800 s | `TIMEOUT` 1846 s |
+
+**Both numbers are void.** Before concluding that a query which once finished in
+525 s now exceeds 1800 s, the host was checked: the **nightly CI batch was
+running throughout**. It fired at `2026-07-29T00:23:44` and its TPC-H stage had a
+capped goopg server on :65434 alive at **112% CPU and 7.5 GiB RSS**, 5 h in, on a
+16-core / 31 GiB host.
+
+D3 scoped contamination to *the server's own history*. The larger hole was the
+*host*: the nightly shares no port and no data directory with the TPC-DS
+clusters, `tpcds-bench-compare.sh` had no host-quiet guard at all, and
+`guard_sf1_sweep` checked only for its sibling SF=1 harness. So "solo, fresh
+server" was satisfied while a multi-hour benchmark had the other cores. The two
+most recent SF0.5 gate sweeps (00:47 and 03:38) were taken the same way and
+inherit the same doubt.
+
+**M0124-0001's SF=1 re-sweep is clean** — chunks span 17:06–23:49 on 2026-07-28,
+finishing 34 min before the fire — but by luck, not by design.
+
+Both harnesses now refuse to start while `ci/batch/run-nightly.sh` or any
+`ci/batch/stages/` script is alive (`FORCE=1` overrides), detecting the nightly
+by driver script rather than by port so a lane change cannot re-open the hole.
+Making that guard trustworthy required fixing a self-match first: `ps | grep
+<script-name>` matches the invoking shell's own argv — the `pkill -f goopg` trap
+of CLAUDE.md rule 3 — and it fired for real here, the SF0.5 harness refusing to
+start against a `bash -c` wrapper string. `bench_foreign_procs`
+(`bench/tpcds/env_tpcds.sh`) walks the `$$` ancestor chain and excludes it; both
+guards were then re-verified to fire on the real nightly and not on themselves.
+
+### D5 — outcome: unresolved, and the run is owed a repeat
+
+Q35 reached D5's third disposition (does not complete), but on a host that
+invalidates the reading, so the "re-run once from a cold server" instruction is
+**not** yet satisfied. Q35 stays *timeout-class, row count unknown*, and
+"M0125-0003 fixed Q35" remains unfalsifiable.
+
+Resume, on a quiet host (the guard now enforces it):
+
+```bash
+QUERIES=35 TIMEOUT_SEC=1800 RESTART_AFTER_TIMEOUT=0 \
+SF05_RESULTS_DIR="$PWD/analysis/tpcds-q35-m0124-0004" \
+  bash scripts/tpcds-sf05-regression.sh sweep
+```
+
+On a second `TIMEOUT`, escalate to SF=1 with a **plain** run — not `EXPLAIN
+ANALYZE`. Per-tuple instrumentation inside three per-row SubPlans is itself a
+large multiplier, and using it as the escalation confounds the comparison
+against the 525 s / 628 s history. D2's `tpcds-bench-compare.sh 35` form is now
+usable for this (its `SF_LANE` no longer hardcodes the wrong cluster).
+
+### D6 — not yet deliverable
+
+No count exists, so no Q35 row can be added to M0124-0001's report. The ledger
+rows for the un-recovered count and for the contaminated sweeps are dated
+2026-07-29 in `.ralph/deferral_ledger.md`.

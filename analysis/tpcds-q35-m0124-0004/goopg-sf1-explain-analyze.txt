@@ -1,0 +1,4 @@
+# Q35 EXPLAIN (ANALYZE, TIMING OFF) — goopg SF=1 (:65436), fresh server, solo
+# goopg: a0975c86 docs(ledger): M0124-0003 — round 2 deferred nine things and wrote down two, so seven mechanisms existed only as a forward reference
+# started: 2026-07-29T05:36:20+09:00  budget: 1800s
+rc=124 secs=1846
