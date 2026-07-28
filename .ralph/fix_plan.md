@@ -2,7 +2,10 @@
 
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
 Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
-Priority banner below or a dependency forces another order**.
+Priority banner below or a dependency forces another order**. As of 2026-07-28
+the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
+`docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
+ahead of M0123 and every other milestone.
 
 ## Notes / rules
 
@@ -21,13 +24,64 @@ Priority banner below or a dependency forces another order**.
   `completed_fix_plan_008.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-06-20 directive)
+## Current Priority (per 2026-07-28 directive)
 
 **Standing exception: M-NIGHTLY triage items (from `ci/logs/action-items.md`)
 preempt everything below** — see the M-NIGHTLY milestone directly under this
 banner.
 
-**⚡ 2026-07-18 directive — branch `wal-pg-nodetree`, priority order for this loop:**
+**⚡ 2026-07-28 directive — branch `tpcds-fix2`, priority order for this loop
+(SUPERSEDES the 2026-07-18 directive below):**
+> `docs/design/tpcds-round2-fixes/README.md` §13 audited the TPC-DS round-2 plan
+> against itself: four of twelve phases landed as planned, four with a named gap,
+> four never started; seven of nine planned deferral-ledger rows were never
+> appended; and §13.3's current status is a **projection, not a measurement**.
+> §13.5 lists the smallest set of actions that would close the plan. They are now
+> filed as **M0124** (measurement baseline, regression-gate discharge, ledger
+> debt) and **M0125** (timeout class, Q75, walker extinction), and they are the
+> **top priority of this checkout**. Work in THIS order:
+> 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
+>    "WIP recovery" item directly under this banner) before anything else, never
+>    silently drop it;
+> 2. **M-NIGHTLY** — the standing nightly-triage items below (they preempt as
+>    usual, by their own charter). Expect a TPC-DS **Q75** item: it is in the
+>    nightly qualifying set with `Q75,100,pinned` at
+>    `ci/batch/tpcds-row-anchors.csv:46` and no `expected-failures.csv` entry,
+>    and RC-1b turned it into a deterministic `division by zero`. That item IS
+>    M0125-0004 — do not open a second workstream for it;
+> 3. **M0124** — TPC-DS round-2 closeout. Milestone doc
+>    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`;
+> 4. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
+>    Milestone doc
+>    `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`.
+> **Every other roadmap milestone — M0123 included — is parked below M0125 until
+> M0124 and M0125 are complete.** M0123 keeps its own branch (`wal-pg-nodetree`)
+> and resumes there once this line is closed.
+>
+> Dependencies, stated narrowly: **M0124-0002 gates M0125-0002/-0004 and the
+> measurement half of M0125-0003** (it produces the plan snapshot they diff
+> against); **M0124-0005 gates M0125-0002 and M0125-0004's acceptance** (both are
+> accepted by value, and the SF0.5 oracle is row-count only today). M0125-0001
+> (dead code) and M0125-0003 (flag-off throughout) are unblocked. **M0125-0003 is
+> independent of M0125-0002** — an earlier draft claimed its later stages were
+> blocked on the `localizeExprToLeaf` conversion, but that walker is reached only
+> under the `shouldAttachBeforeMHJ` gate (`bushy.go:158`), and when the gate opens
+> `attachRelationLocalFilters` already calls it, so the relation-size fallback
+> wakes nothing.
+>
+> Two M0125 tasks move plan shape, and goopg's planner sits on a *measured*
+> trade-off: enabling statistics fixed TPC-H Q5 22.8× and regressed Q22 128× /
+> Q4 79× / Q8 53× / Q2 26× / Q12 4.4×, taking the serial stream 1162 → 1307 s
+> (`analysis/tpch-evolution-round4-parallel-query-20260722.md` §2/§5); and the
+> cost-driven planner is 4 wins / 6 regressions / 12 neutral
+> (`analysis/tpch-evolution-round5-int64-hashjoin-20260724.md` §6). **Every
+> regression in that §6 table came with identical row counts**, so
+> `scripts/tpch-spotcheck.sh` (a Q12/Q13 row-count gate) cannot see this class.
+> Planner commits in M0125 need a **timed** 22-query TPC-H power run plus
+> `make plan-diff LABEL=tpcds-round2-head` — note `make plan-gate` picks the
+> newest snapshot by mtime, so it cannot be pointed at a named baseline.
+
+**⚡ 2026-07-18 directive — SUPERSEDED 2026-07-28, kept for history:**
 > This checkout is on `wal-pg-nodetree` to develop **M0123 (canonical `pg_node_tree`)**
 > — see `docs/milestones/0123-canonical-pg-node-tree-serialization.md` and
 > `docs/design/wal-pg-identical-stream/02e §3`. Work in THIS priority order:
@@ -38,12 +92,13 @@ banner.
 > The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
 > M0123 is complete.
 
-Work order: **M0117 → M0118** (both complete + archived), then resume **M0110**
-(its **M0119-0004/0005/0006/0007** spinoffs are the active, in-progress form of
-that work), with **M0095** parked (blocked on logical decoding). **M0120 / M0121
-are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
-defer unless genuinely compelling (then record a ledger row); commit + push at
-every clean, green (build + pre-commit) checkpoint.
+Work order: **M0124 → M0125** (this directive), then **M0123**, then the
+pre-existing line — **M0117 → M0118** (both complete + archived), then resume
+**M0110** (its **M0119-0004/0005/0006/0007** spinoffs are the active,
+in-progress form of that work), with **M0095** parked (blocked on logical
+decoding). **M0120 / M0121 are CLOSED** (2026-07-04) and archived. Policy: fix
+blockers in place; do NOT defer unless genuinely compelling (then record a ledger
+row); commit + push at every clean, green (build + pre-commit) checkpoint.
 
 ## WIP recovery (priority #1 — before M-NIGHTLY, one-time)
 
@@ -128,6 +183,253 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       known edge; no separate fix here — tracked by the existing deferral row.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
+
+## M0124 — TPC-DS round-2 closeout: measurement baseline, gate discharge & ledger debt (filed 2026-07-28)
+
+Milestone: `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
+Source: `docs/design/tpcds-round2-fixes/README.md` §13.5 actions **1, 5, 6, 7**
+(plus §13.4 item 3). **Priority #3, after WIP recovery (#1) and M-NIGHTLY (#2).**
+No engine change: if a task uncovers a defect it files a ledger row and an M0125
+blocker; a code change landing mid-sweep voids the sweep.
+
+- [ ] **M0124-0001 — SF=1 dual-engine re-sweep at HEAD** (§13.5 #1). One sweep,
+      both engines, uniform 600 s via `scripts/tpcds-bench-compare.sh`
+      (`ENGINES="goopg pg"`). Endpoints differ per arm: goopg `-U postgres -d
+      postgres` on 65436, PG `-U ryo -d tpcds` on 65438. Records the goopg commit
+      (it becomes M0125's baseline), proves S-cold first (`reltuples` +
+      `pg_stats` = 0), keeps `RESTART_AFTER_TIMEOUT=1`, and **ports
+      `reap_pg_orphans` from `scripts/tpcds-sf05-regression.sh` — the SF=1
+      harness has no orphan reap**, so a PG-side timeout leaves a backend running
+      and contaminates later timings. **Budget-invariance rule:** a cell may be
+      compared only to a prior sweep at the SAME budget. Note §1.4's reproduction
+      environment is stale (it names the pre-reorg TPC-H ports). Reports
+      confirm/refute for the 13 named §13.3 projections at SF=1 values only
+      (Q88 is **TIMEOUT 660 s** at SF=1 — not the SF0.5 228 s figure). Plan
+      8–10 h. Deliverable `analysis/tpcds-sf1-goopg-<date>.md`. Design
+      `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`.
+- [ ] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
+      (§13.5 #5). Phases 1.2/1.3 landed while `tpch-spotcheck.sh` reported SKIPPED
+      and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the
+      cluster, so it is runnable. **Both arms build from HEAD** — arm A = HEAD
+      with `9740fce9`'s `bushy.go` hunks locally reverted (its executor bounds
+      check STAYS, or the Q8 crash returns and confounds the arm), arm B = HEAD —
+      run A/B/A/B alternating. A literal checkout of `9740fce9` is wrong: it
+      predates the cluster rebuild, and `b3493a6e`..HEAD spans four `internal/`
+      commits including `095e3ab5`'s new fsync GUC, a confound in a timed A/B.
+      S-cold by necessity (`ANALYZE <table>` in db `tpch` errors — ledger
+      `bench-reorg ANALYZE-scope`), `GOGC=100` + `GOMEMLIMIT=12GiB` (Q21 OOMs at
+      18 GiB). Use the Makefile defaults `PLAN_DB=tpch PLAN_USER=tpch`; the
+      `postgres@postgres` advice is stale folklore and would capture an empty
+      database. `plan-diff` **requires `LABEL=`** and diffs live-vs-stored;
+      `plan-gate` picks the newest snapshot by **mtime**, so capture-then-gate on
+      one arm is green by construction. Capture and **commit**
+      `plan_snapshots/tpcds-round2-head.txt` **last**. Also retro-files §8 step
+      7's missing `analysis/` artifact for phase 2.1. Noise band: >8 % explained,
+      >25 % blocks (round-5 §3 calls 2–8 % moves unattributable). Design
+      `docs/design/0124-0002-retroactive-tpch-plan-gate-discharge.md`.
+- [ ] **M0124-0003 — append the seven missing §10 deferral-ledger rows** (§13.5
+      #6). §13.2: the seven `tpcds-round2` rows that exist are the rows the WORK
+      produced, not the rows §10 planned. Append: parse-time IN-list
+      `select_common_type` (§5.4); the `rewriteScanInputsWithSingleTablePredicates`
+      reorder (§3.5); the `shouldAttachBeforeMHJ` `SmallDimension` gate (RC-5);
+      shared-scan GROUPING SETS (RC-7); EXISTS-under-OR / hashed-SubPlan caching
+      (RC-8, **now including Q35**); parallelising `SetOp` (RC-9); `plancache`
+      invalidation on ANALYZE (also a measurement-protocol blocker — it is why
+      §8's S-warm is single-shot per process). Record an explicit **drop**
+      disposition for the moot `aggregateOp work_mem` row (its §6 precondition
+      never fired — Q39 was a `Quo(0,0)` panic, MemoryPeak 13.2 G under a 24 G cap,
+      no `oom_kill`) rather than appending it as open, since M0119 treats the
+      ledger as a work queue. Plus a `pq-P10` UPDATE naming M0125-0003 as consumer,
+      and five rows the audit produced: CI row-anchor value-blindness; the two
+      out-of-scope `default:`-less walkers (`walkColumnRefsImpl` `pushdown.go:362`
+      and the `shiftColumnRefs` closure); `GOOPG_POSMAP_ASSERT`; phase 0.2's
+      unfinished panic→`XX000` half (`server.go:780` is still the only
+      `recover()`); and Q47/Q49/Q51 as three distinct defects. Row shape is the
+      ledger's own 7-column header, not fix_plan.md's stale 6-column text.
+      Entity-escape any literal `<table>`/`<col>`; verify via
+      `gh api --method POST /markdown`. Design
+      `docs/design/0124-0003-round2-deferral-ledger-completion.md`.
+- [ ] **M0124-0004 — recover or classify Q35's row count** (§13.5 #7). Q35 is the
+      only query that has never produced a goopg row count. Its 2026-07-26 count
+      was lost to the **PATH-loss** harness defect, NOT `tail -1` — `query35.sql`
+      is a single statement and the multi-statement set is Q14/Q23/Q24/Q39. Two
+      further corrections: the SF0.5 "201 s" is a **kill line, not a runtime**
+      (every TIMEOUT in that sweep carries ~20 s of harness overhead above its
+      budget), and Q35 **also timed out at the 300 s budget (319 s)**, so its
+      SF0.5 runtime is unknown and above ~300 s. **PG's answer is already git-tracked** —
+      `oracle.txt` holds `35|OK|100|0` — so this is a goopg-only question. Cheap
+      path: solo SF0.5 run at 900 s on 65437 — but **a small script change is in
+      scope**, because none of it is runnable today: the SF0.5 script has no
+      per-query mode, `TPCDS_RESULTS_DIR` is not env-overridable (so the run
+      would clobber M0124-0001's artifacts anyway), and `restart_goopg` hardcodes
+      `sf1`. Respect `guard_sf1_sweep` rather than `FORCE=1`-ing it, and run
+      AFTER M0124-0001 (the deliverable is a row in its report). Escalate to SF=1
+      at 1800 s only on mismatch. **Must run solo from a fresh server.** Record the anomaly that Q35 completed at SF=1 (525 s)
+      but never at SF0.5 on half the data. Fold in one `EXPLAIN ANALYZE` with the
+      per-SubPlan counters: Q35 is an exact instance of RC-8's
+      `exists(…) and (exists(…) or exists(…))` shape, so this discharges RC-8's
+      "measure first" criterion for three queries at once. Outcome classifies Q35
+      as performance-only (→ M0125-0003) or as a wrong answer hiding behind a
+      timeout, the Q51 shape. Design
+      `docs/design/0124-0004-q35-rowcount-resolution.md`.
+- [ ] **M0124-0005 — add a value checksum to the SF0.5 oracle** (§13.4 item 3).
+      The gate is row-count only and structurally blind to "right count, wrong
+      values" — Q75 PASSed for weeks with 100 rows while its CTE computed
+      1,057,469 against PG's 2,368,670, hidden by `LIMIT 100`. Filed as a task,
+      not a deferral, because M0125-0002 and M0125-0004 are both accepted at this
+      gate and both change which rows reach a join or filter. Extend `oracle.txt`
+      from `q|status|rows|secs` to `q|status|rows|ck|secs`, deriving `rows` and
+      `ck` from the SAME PG run. **Float normalisation to 12 significant digits is
+      mandatory** — ledger `tpcds-round2 stddev-precision` records goopg's
+      `stddev_samp` diverging from PG's `sqrt_var` in the last 1–2 digits on 235
+      of 236 Q39 rows, so a naive byte checksum flags Q39 immediately. `ck = n/a`
+      is a first-class value for a `LIMIT` over a non-total `ORDER BY`; do NOT
+      sort-then-hash, which would silently accept a wrong ordering. New
+      `CKMISMATCH` verdict kept distinct from `MISMATCH`. **The capture method must change**: `cmd_oracle` derives rows from
+      `EXPLAIN (ANALYZE)`, which emits a plan and NO tuples — there is nothing to
+      checksum — so switch to a plain execution and *prove* the new row counts
+      equal the pinned fixture. Gate-of-the-gate: re-run pre-RC-1b Q75 and record
+      the outcome; `CKMISMATCH` is expected, but the evidence covers the CTE
+      aggregate, not the `LIMIT 100` window, so a PASS there is a finding about
+      the window rather than a broken checksum.
+      Design `docs/design/0124-0005-sf05-oracle-checksum-column.md`.
+
+## M0125 — TPC-DS timeout class & planner expression-walker extinction (filed 2026-07-28)
+
+Milestone: `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`.
+Source: `docs/design/tpcds-round2-fixes/README.md` §13.5 actions **2, 3, 4**.
+**Priority #4, after M0124.** M0125-0002/-0004 diff against
+`plan_snapshots/tpcds-round2-head.txt` (M0124-0002) and are accepted with
+M0124-0005's checksums; M0125-0001 and M0125-0003 stage 1 are unblocked.
+
+**Read before picking any task here.** Two of these move plan shape, and goopg's
+planner sits on a *measured* trade-off. Enabling statistics fixed TPC-H Q5 22.8×
+(415.2 → 18.2 s) and regressed **Q22 128×, Q4 79×, Q8 53×, Q2 26×, Q12 4.4×**,
+taking the serial stream **1162 → 1307 s** (round-4 §2/§5). The cost-driven
+join-order planner is **4 wins / 6 regressions / 12 neutral** — Q2 18.8× and Q8
+4.1× faster, but Q5 and Q21 hang, Q9 times out, Q10 11.4×, Q18 4.3× — and ships
+OFF by default (round-5 §6). **Every regression in that table came with identical
+row counts**, so `scripts/tpch-spotcheck.sh` cannot see this class. Plan-shape
+commits need a **timed** 22-query TPC-H run plus `make plan-diff
+LABEL=tpcds-round2-head`. Round-5's *absolute* seconds are not a valid baseline
+(the fix bundle moved the stream 1086 → 325 s with no plan changes) — M0124-0002
+arm B is. M0125-0002's gate budget alone is ~12–20 h.
+
+- [ ] **M0125-0004 — Q75 join-residual evaluation order** (§13.5 #3). *First: it
+      is a live CI break* — `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46`
+      with no `expected-failures.csv` entry, so M-NIGHTLY preempts for it and that
+      item IS this task. RC-1b made Q75's `all_sales` CTE exactly correct and
+      thereby exposed a pre-existing divergence: goopg evaluates
+      `CAST(curr.sales_cnt)/CAST(prev.sales_cnt) < 0.9` as the hash-join residual
+      per matched pair **before** the outer Filter's `d_year` equalities exclude
+      the `sales_cnt = 0` group, where PG attaches single-relation quals to
+      `baserestrictinfo` (`distribute_restrictinfo_to_rels`) and cost-orders the
+      rest (`order_qual_clauses`). Fix: the inner-join sibling of
+      `pushOuterQualsIntoLaterals` (`internal/planner/pushdown.go:132`), run AFTER
+      `remapWithBindings` with positional name validation (RC-1b's lesson),
+      **duplicating rather than moving** the conjunct so the result set is
+      unchanged by idempotence while the error behaviour changes intentionally,
+      placing the `Filter` on the join INPUT never inside the twice-referenced CTE
+      body, and scoped to **inner joins over CTE/derived-table inputs only** so it
+      cannot re-open the `shouldAttachBeforeMHJ` Q8/Q21 PASS→CANCEL regression.
+      Decline on non-INNER joins: PG 18.3 no longer has `check_outerjoin_delay`
+      (removed in the PG 16 nullingrels rework) and goopg has no nullingrels model.
+      **Blast radius is not zero** — TPC-H Q15 (`q15_main.sql`) joins `supplier` with the
+      `revenue0` view, which may expand to a derived table, so a TPC-H plan hunk
+      triggers the full timed run; and an empty plan diff is NOT claimed (adding a
+      `Filter` is a plan change). Verify by **value**, not row count. Ledger
+      `tpcds-round2 Q75-eval-order`. Design
+      `docs/design/0125-0004-q75-join-residual-evaluation-order.md`.
+- [ ] **M0125-0001 — `internal/planner/exprwalk.go` + exhaustiveness gate** (§13.5
+      #4, phase 1.1). One `exprChildSlots` child-slot primitive over `plan.go`'s
+      **32** concrete `Expr` types (the marker is unexported, so the set is
+      closed), three distinctly-named drivers (walk / rewrite-in-place /
+      clone-and-rewrite — conflating them compiles and silently drops the rewrite,
+      and `remapByPosMap` clones while `remapOuterRefsInSubplan` mutates), and a
+      per-caller `scopePolicy` covering the four behaviours real call sites rely on
+      (signal / veto / ignore / descend). Three typing traps:
+      `MultiAssignSubqElem.Row` is statically `*MultiAssignSubqRow` not `Expr`;
+      inner-scope children are `Node` in a different coordinate space (a Semi/Anti
+      inner plan must NOT be remapped); and a scope-opening node reports ZERO
+      `Expr` slots, so classify by slot kind, never by `len(kids)`. Ship a `go/ast`
+      test asserting set equality **in both directions** between `plan.go`'s
+      `exprNode()` receivers and the type-switch cases, so a 33rd type is a build
+      failure instead of a wrong answer. Add the §2.6 pins never written
+      (`bushy_remap_test.go` holds only
+      `TestBuildJoinFromDP_NonAscendingSubsetKeyRemap` from `65dd185a`) covering
+      all 18 `remapByPosMap` arms plus a double-remap pin. **No call site
+      converted**, so no TPC-H run. Note §13.4 item 5's "eleven remain partial" is
+      an arithmetic slip — four have been hand-touched, so **seven** is the live
+      figure. Design
+      `docs/design/0125-0001-exprwalk-driver-and-exhaustiveness-gate.md`.
+- [ ] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
+      phase 6.1). §13.5's highest-value item (15–16 of 21 defects); stage 1 is
+      inert, so it lands early. `tableRows` (`cardinality.go:89`) returns
+      `Stats.RowCount`, which `loadStatisticsFromHeap` (`initdb/open.go:3454` —
+      §7.1's `:3433` is stale) leaves 0 after every restart. Model on
+      **`table_block_relation_estimate_size`** (`postgres/src/backend/access/table/
+      tableam.c`, reached via `heapam_estimate_rel_size`) — NOT `plancat.c`'s index
+      branch: density = `(usable_bytes_per_page * fillfactor / 100) / tuple_width`
+      then `clamp_row_est`; `curpages = 10` only when `curpages < 10 && reltuples <
+      0 && !relhassubclass`; `curpages == 0 ⇒ tuples = 0`. goopg has no "never
+      analyzed" sentinel, so decide and document the empty-analyzed-table trigger.
+      Reuse `ParallelSettings.BlocksForTable`; no package global. **Staged by
+      consumer** (1 = probe-side, shape-neutral; 2 = + DP seed, where round-4's
+      regressions live; 3 = + `baseRows`), because one flag switching all three
+      gives one number and no attribution. Stages are **not** blocked on M0125-0002 (see the
+      directive above; the walker is gate-shadowed at that site after all). **§7.1's mitigation is unexecutable as written**:
+      every TPC-H run in this repo ANALYZEs first, so the fallback provably cannot
+      fire and both arms are identical — "no difference" would mean "not
+      exercised". Measure four arms {no-ANALYZE, ANALYZE} × {off, on} per stage;
+      only no-ANALYZE-on is interesting. Pre-register round-4's five regressed
+      queries as the watch list and Q5 as the expected win; make no quantitative
+      prediction, since round 4 supplied full selectivity while this supplies only
+      sizes — a third regime nobody has measured. Use round-5 §6's per-query
+      isolated harness: a mis-ordered star query was measured NOT to honour
+      cancellation (server pinned ~10 GB RSS), so a plain sweep can wedge the host.
+      Never measure together with `costDrivenJoinOrder`. Note `pg_class.reltuples`
+      reads `Stats.RowCount` directly (`internal/catalog/catalog.go:6946`) and
+      CANNOT be fixed here. Phase 6.2 out of scope (B3: does not fix Q64 alone).
+      Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
+- [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
+      #4, phase 2.2). `visitColumnRefsForTable` (`bushy.go:415`),
+      `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
+      `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
+      (`:268`), `cloneExprShiftIdx` (`nl_index_join.go:777`), `exprSide`
+      (`planner.go:5059`) — plus re-basing `remapByPosMap` and giving it the
+      `default:` it still lacks. **This is a plan-SHAPE change**: `extraInScans`
+      (`bushy.go:1625`) starts `allMatched := true` and only falsifies it from
+      inside the callback, so a conjunct of unenumerated kinds is admitted into
+      `MultiHashJoin.Filters` **by accident** — completing the walker *removes*
+      predicates. TPC-H blast radius is **{Q2, Q5, Q7, Q8, Q9}** (≥5 FROM items referencing
+      `region`/`nation`, so they pass `shouldAttachBeforeMHJ`, whose comment records
+      "Without the SmallDim guard, Slice A regresses Q8 / Q21 from PASS to
+      CANCEL"). Order: `remapByPosMap` re-base FIRST (the only genuinely
+      no-op step, pinned by 0125-0001's 18-arm table) → `cloneExprShiftIdx` →
+      `visitColumnRefs` → `visitColumnRefsForTable` → `exprSide` →
+      `conjunctIsLocalEligible`+`localizeExprToLeaf` (ONE commit — producer/
+      consumer pair) → `visitColumnRefsByName` last. **Only commit 1 carries an
+      empty-diff expectation** — `cloneExprShiftIdx` is a fail-closed admission
+      test whose completion OPENS the NLI inner-unwrap, `visitColumnRefs`
+      rewrites join-predicate indices, and `visitColumnRefsForTable` feeds
+      `tableForCol` and hence local-filter partitioning AND join-edge
+      classification. Commits 2–8 carry the full timed run. Per commit: units +
+      `plan-diff LABEL=tpcds-round2-head` + timed 22-query TPC-H + SF0.5 with
+      checksums on first/last/any-hunk commit; revert rather than fix forward.
+      Do NOT claim "the walker class is extinct" — `walkColumnRefsImpl` and the
+      `shiftColumnRefs` closure stay out of scope with a ledger row. Design
+      `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md`.
+- [ ] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
+      Separate commit, separate decision, so §7.3 RC-5's reopen criterion ("after
+      the flag defaults on") has an owner. Requires: the C1→C2 table for every
+      stage with the pre-registered watch list checked; a TPC-DS SF=1 sweep at both
+      flag states; `tpch-spotcheck.sh` re-measured for wall clock **and peak RSS**
+      in both states (it runs S-cold and Q12 is one of the regressed cells, so a
+      careless flip degrades the gate every future commit must pass); and a written
+      decision. **"Measured, and deliberately not flipped" is a successful
+      completion** — `costDrivenJoinOrder` is the precedent. On landing, update the
+      RC-5 and phase-6.2 ledger rows whose criteria this satisfies. Design
+      `docs/design/0125-0005-relsize-fallback-default-flip.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -887,8 +1189,11 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 ## M0123 — Canonical `pg_node_tree` serialization (branch `wal-pg-nodetree`)
 
-**Priority: after WIP-recovery (#1) and M-NIGHTLY (#2), M0123 is #3 — the active
-focus of this branch.** Milestone doc:
+**Priority: DEMOTED 2026-07-28. After WIP-recovery (#1), M-NIGHTLY (#2),
+M0124 (#3) and M0125 (#4), M0123 is #5.** It remains the active focus of branch
+`wal-pg-nodetree`, but this checkout (`tpcds-fix2`) closes the TPC-DS round-2
+plan first — see the Current Priority banner and
+`docs/design/tpcds-round2-fixes/README.md` §13.5. Milestone doc:
 `docs/milestones/0123-canonical-pg-node-tree-serialization.md`; design:
 `docs/design/wal-pg-identical-stream/02e-content-fidelity-and-durability.md §3`.
 

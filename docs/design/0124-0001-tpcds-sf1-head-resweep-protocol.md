@@ -1,0 +1,173 @@
+# 0124-0001 — TPC-DS SF=1 dual-engine re-sweep at HEAD
+
+Status: draft
+Date: 2026-07-28
+Milestone: M0124-0001 (`docs/design/tpcds-round2-fixes/README.md` §13.5 action 1)
+
+## Problem
+
+§13.3 states goopg's TPC-DS position at HEAD as a **projection**: "A fresh SF=1 dual-engine
+sweep at HEAD is the single highest-value next action; until it runs, no claim about SF=1 at
+HEAD is better than inference."
+
+The projection combines two incompatible measurement sets:
+
+| set | what it is | why it is not the answer |
+|---|---|---|
+| A | SF=1, both engines, uniform 600 s — `analysis/tpcds-sf1-goopg-20260727.md` §5.2 | **predates RC-1b** (`5db0a067`) |
+| B | two SF0.5 goopg-only sweeps — `sweep-20260727-120937.txt` (PASS=74 MISMATCH=5 ERROR=2 TIMEOUT=14 SKIP=4) and `sweep-20260727-214619.txt` (PASS=74 MISMATCH=3 ERROR=2 TIMEOUT=16 SKIP=4) | ran at **300 s** and **180 s**. For the timeout class they are not comparable — Q88 "entered" it purely because its 228 s exceeded the new 180 s budget. **Also mis-provenanced** — see below |
+
+> **The "post-RC-1b" SF0.5 sweep is labelled with RC-1b's parent commit.**
+> `sweep-20260727-214619.txt`'s header reads `# goopg: 27d2dae8` (2026-07-27 21:42), but
+> RC-1b `5db0a067` was committed at 23:36 — the sweep started at 21:46 and therefore ran from
+> an **uncommitted working tree**. Its `Q50 PASS 6 rows` proves the fix was in the binary, so
+> the results are usable, but the provenance line is wrong. This is exactly the failure D1
+> below exists to prevent, and any document citing that file must carry this caveat.
+
+That trap already produced a false headline (`TIMEOUT 14 → 16`) and had earlier caused a
+300 s SF=1 sweep to be discarded because Q18 (358 s) would have read as a regression. This
+protocol makes it structurally impossible to repeat.
+
+## Design
+
+### D1. One sweep, one budget, one commit
+
+- `scripts/tpcds-bench-compare.sh`, `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`, all 99 queries.
+  Its three 2026-07-27 defects (PATH loss, `tail -1` row extraction, concurrent `&`/`wait`)
+  are already fixed and documented in its header.
+- Endpoints from `bench/tpcds/env_tpcds.sh`. **The arms differ in database and role**: goopg
+  is `-U postgres -d postgres` on **65436**; PostgreSQL 18.3 is `-U ryo -d tpcds` on
+  **65438** (`scripts/tpcds-bench-compare.sh:56-57`). Lifecycle via
+  `bench/tpcds/server.sh {start|stop} sf1|pg`.
+- **One goopg commit, recorded in the report title.** It becomes M0125's delta baseline, so
+  it must be an ancestor of every M0125 commit. If any code change lands during the window,
+  the sweep is void.
+
+> **Correction to inherit, not repeat.** §1.4's reproduction environment is stale: it names
+> goopg `:65433` / PG `:65432` under `bench/tpch/`. Those are TPC-H only since the
+> 2026-07-27 bench reorg. Following §1.4 literally would re-create the accident that reorg
+> fixed — a TPC-DS load overwriting the TPC-H cluster. §13 is an appended status record that
+> did not edit the sections above it, so the correction is recorded here rather than by
+> rewriting §1.4.
+
+### D2. Budget-invariance rule
+
+A cell may be compared to a prior sweep **only** at the same per-query budget. Every table
+carries its budget in the header. A query completing above a previous sweep's budget is
+**budget-incomparable** — never "regressed" and never "entered the timeout class". This rule
+binds this document too: no SF0.5 number may be quoted as an SF=1 prediction.
+
+### D3. Server-age hygiene and the GC regime
+
+A goopg server that has just run a 600 s timeout sits at `GOMEMLIMIT` with `GOGC=off` and
+thrashes GC. `RESTART_AFTER_TIMEOUT=1` (the default) restarts the SF=1 server after each
+goopg TIMEOUT; keep it.
+
+State the regime, because it is **not** the TPC-H one: `bench/tpcds/env_tpcds.sh` exports
+`GOGC=off` and `GOMEMLIMIT=12GiB`, so every TPC-DS number here is taken with the collector
+off, while `0124-0002` prescribes `GOGC=100` for the TPC-H arms. The restart mitigates
+*carry-over*, not the regime. Never set a cgroup `memory.high` below `GOMEMLIMIT`: `GOGC=off`
+plus a low `memory.high` produces a permanent kernel-throttle band after one big query,
+which mimics a code regression.
+
+### D4. Orphan reaping — a script change, not just a step
+
+`timeout N psql` kills only the **client**; the PostgreSQL backend keeps executing and
+contaminates every later timing. **`reap_pg_orphans` exists only in
+`scripts/tpcds-sf05-regression.sh`; `scripts/tpcds-bench-compare.sh` has no equivalent.**
+Port it before the sweep. It must materialise the victim set first — SQL does not guarantee
+evaluation order, and a bare `WHERE … AND pg_terminate_backend(pid)` has already killed a
+healthy backend in this programme (the Q6 incident):
+
+```sql
+WITH victims AS MATERIALIZED (
+  SELECT pid FROM pg_stat_activity
+   WHERE datname = 'tpcds' AND pid <> pg_backend_pid()
+     AND backend_type = 'client backend'
+     AND state = 'active'
+     AND now() - query_start > interval '600 seconds'
+)
+SELECT count(*) FROM victims WHERE pg_terminate_backend(pid);
+```
+
+Match the SF0.5 predicate exactly — `backend_type = 'client backend'` **and** `state = 'active'`.
+A looser `state <> 'idle'` also matches `idle in transaction`, which is a silent widening of a
+statement that kills backends.
+
+This qualifies §13.1 phase 5's "harness fixes — landed": the SF=1 harness still lacks a
+hazard the SF0.5 harness codifies.
+
+### D5. State labelling (§8)
+
+Every goopg number is **S-cold**. Record the proof before the sweep and paste it into the
+report:
+
+```
+psql -h 127.0.0.1 -p 65436 -U postgres -d postgres -c \
+  "select relname, reltuples::bigint, relpages from pg_class
+    where relnamespace='public'::regnamespace order by 2 desc limit 8;"
+psql -h 127.0.0.1 -p 65436 -U postgres -d postgres -c \
+  "select count(*) from pg_stats where schemaname='public';"
+```
+
+Zero `reltuples` ⇒ S-cold, the state M0125-0003 is designed to change. Non-zero means this
+is not the baseline M0125 needs.
+
+### D6. Classification and row counting
+
+Status is classified on psql's `ERROR:` / `FATAL:` / `PANIC:` **line prefix**, not a
+case-insensitive substring anywhere in the output. Row counts sum **every** `(N rows)` block
+— Q14, Q23, Q24 and Q39 hold two statements each. Q36/Q70/Q86 stay SKIP (`PG_SKIP`); Q4 is
+reported but excluded from "goopg-only" (PG times out too).
+
+Where M0124-0005 has landed, capture the per-query result checksum in the same pass — this
+harness already writes `*_result.txt` per query and engine, so it is nearly free. (Note the
+SF0.5 sweep does **not** write result files; see `0124-0005`.)
+
+### D7. Deliverable
+
+`analysis/tpcds-sf1-goopg-<YYYYMMDD>.md`: provenance (commit, budget, cluster paths, S-cold
+proof, GC regime); the defect table; then a **confirm/refute line for each projection**,
+since the point of the sweep is to test §13.3, not restate it. Every expectation below is an
+**SF=1** number:
+
+| query | expected at HEAD | source |
+|---|---|---|
+| Q50 | PASS, 6 rows | fixed by RC-1b (SF0.5-confirmed; SF=1 unmeasured) |
+| Q39 | PASS, 236 rows = PG | `927472e0`, set A |
+| Q75 | **ERROR, division by zero** | new, caused by RC-1b |
+| Q72 | **TIMEOUT** (was MISMATCH 0/100 in 7 s at SF0.5) | wrong → slow |
+| Q8 | ERROR `XX000`, server survives | contained, not fixed |
+| Q47, Q49, Q51 | MISMATCH (0/100, 30/34, 0/100) | unchanged |
+| Q35 | TIMEOUT 651 s in set A; completed at **525 s** in the 07-26 sweep | see M0124-0004 |
+| Q82 | OK ~576 s / 2 rows — within 4 % of the budget; watch for flapping | set A |
+| Q88 | **TIMEOUT 660 s / 0** | set A. The 228 s / 1 row figure is SF0.5 — do not import it |
+| Q34, Q46 | OK, 374 and 100 rows = PG | set A |
+
+**These rows are the projections under test, not predictions this document endorses**, and
+several (Q75, Q72) are extrapolated from SF0.5 — which D2 forbids as a *conclusion*. Testing an
+SF0.5-derived hypothesis at SF=1 is the point of the sweep; quoting one as an SF=1 result is
+what D2 bans. Note in particular that set A measured Q72 at SF=1 as **OK 14 s / 0 rows**, so
+"TIMEOUT" is a hypothesis with a measured contradiction at this scale.
+
+Close with the resulting goopg-only defect count, replacing §13.3's projected 21.
+
+## Non-goals
+
+No fix, no flag change, no planner commit in the window. No SF0.5 comparison in this report.
+No EXPLAIN-cost analysis — cost and width are hardcoded literals
+(`internal/executor/operators_explain.go:378`, `:925`); only plan **shape** and
+`EXPLAIN ANALYZE` **actual** rows are signal.
+
+## Cost and risk
+
+Budget from set A's own wall clock, not an estimate: **16** goopg TIMEOUTs averaging ~652 s
+(≈2.9 h) plus a restart each, ~3 PG timeouts (Q4/Q11/Q74), Q82 ~576 s, plus the completing
+queries — set A's measured total is ~5.3 h of pure query time (goopg 4.6 h + PG 0.7 h). **Plan for
+8–10 h, not 4–5.** A mid-sweep restart silently returns a batch to a different state — check
+`bench/tpcds/runtime_goopg/goopg.tpcds.log` for restart boundaries before trusting any batch.
+
+## Gate
+
+Docs plus the `reap_pg_orphans` port (a shell change → units + the pre-commit hook). No
+engine change, so no TPC-H run.
