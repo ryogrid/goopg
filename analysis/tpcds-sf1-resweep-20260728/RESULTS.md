@@ -44,12 +44,35 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 6 | OK 57 s | 44 | OK 140 s | 44 | OK 59 s / 44 | rows = PG; goopg 2.5× faster than PG here |
 | 7 | OK 64 s | 100 | OK 2 s | 100 | OK 65 s / 100 | rows = PG; stable |
 | 8 | **ERROR 26 s** | 0 | OK 0 s | 0 | ERROR 24 s | `ERROR: column ref ca_zip/57 out of MaterializedSlot range 1`; **server survives** (verified `select 1` after) — confirms the §13.3 projection "ERROR, contained, not fixed" |
+| 9 | OK 143 s | 1 | OK 2 s | 1 | OK 146 s / 1 | rows = PG; stable |
+| 10 | TIMEOUT 624 s | 0 | OK 11 s | 1 | TIMEOUT 649 s | goopg-only timeout; unchanged |
+| 11 | OK 79 s | 95 | **TIMEOUT 623 s** | 0 | OK 77 s / 95 | **PG-only timeout** — goopg completes what PG cannot at this budget; unchanged from set A |
+| 12 | OK 6 s | 100 | OK 0 s | 100 | OK 6 s / 100 | rows = PG; stable |
+| 13 | OK 57 s | 1 | OK 0 s | 1 | OK 62 s / 1 | rows = PG; stable |
+| 14 | TIMEOUT 625 s | 0 | OK 37 s | 200 [100+100] | TIMEOUT 647 s | goopg-only timeout; unchanged (PG row count is the summed two-block value — harness fix 2) |
+| 15 | OK 17 s | 100 | OK 0 s | 100 | OK 15 s / 100 | rows = PG; stable |
+| 16 | OK 48 s | 1 | OK 1 s | 1 | OK 48 s / 1 | rows = PG; stable |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
 one backend running and the reap terminated it (`chunk-1-4.txt`), i.e. every
 later PG timing in this sweep is the first that is not contaminated by it.
 
+Chunk 9–16 (`chunk-9-12.txt`, `chunk-13-16.txt`) likewise reproduces set A on
+every cell — status, row count and elapsed time all within run-to-run noise
+(largest delta 25 s, on the two 600 s-budget timeouts where the excess is
+teardown, not query, time). The reap fired once more, on PG's Q11 timeout.
+The range was split into two harness invocations (9–12, 13–16) purely to stay
+inside the loop's foreground Bash budget; both print the same `engine-id`
+baseline, so they are one continuous sweep under D4a.
+
+Running timeout classification (D6), Q1–Q16:
+
+- **both engines** (excluded from "goopg-only"): Q4
+- **goopg-only**: Q5, Q10, Q14
+- **PG-only** (goopg wins): Q11
+- **goopg ERROR**: Q8
+
 ## Cursor
 
-`M0124-0001 sweep: 1-8 done; next 9-16.`
+`M0124-0001 sweep: 1-16 done; next 17-24.`

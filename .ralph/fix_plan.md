@@ -64,9 +64,10 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk 1 (`scripts/tpcds-bench-compare.sh
->    1-8`). See that task's "Chunked execution" note — the sweep is deliberately
->    split across loops.** Do not select a regress/testport case instead: as of the
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `17-24`
+>    (`scripts/tpcds-bench-compare.sh 17-24`; chunks 1–16 are DONE). See that
+>    task's "Chunked execution" note — the sweep is deliberately split across
+>    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
 > 3. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
 >    Milestone doc
@@ -516,7 +517,20 @@ blocker; a code change landing mid-sweep voids the sweep.
         ca_zip/57 out of MaterializedSlot range 1` with the server surviving
         (confirms the §13.3 "contained, not fixed" projection). The reap earned
         its keep on the first PG timeout: Q4 left one backend running and it was
-        terminated. **NEXT: chunk `9-16`.**
+        terminated. ~~**NEXT: chunk `9-16`.**~~ done, see below.
+      - **Chunks 9–16 DONE** (loop #2; `chunk-9-12.txt`, `chunk-13-16.txt`).
+        All eight cells reproduce set A again — Q9 143 s/1, Q10 goopg-only
+        TIMEOUT, Q11 79 s/95 with **PG timing out** (goopg wins this one),
+        Q12 6 s/100, Q13 57 s/1, Q14 goopg-only TIMEOUT (PG 37 s/200 — the
+        summed two-block count from harness fix 2), Q15 17 s/100, Q16 48 s/1.
+        Largest elapsed delta vs set A is 25 s and lands on the 600 s-budget
+        timeouts, i.e. teardown rather than query time. The range was split into
+        two harness calls (`9-12`, `13-16`) to stay inside the loop's foreground
+        Bash budget — both reprint the baseline `engine-id` unchanged, so under
+        D4a they are one continuous sweep, not two. The reap fired again on PG's
+        Q11 timeout. Running D6 classification for Q1–Q16: both-engine timeout
+        Q4; goopg-only Q5/Q10/Q14; PG-only Q11; goopg ERROR Q8.
+        **NEXT: chunk `17-24`.**
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
