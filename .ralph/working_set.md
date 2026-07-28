@@ -1,40 +1,37 @@
 (idle — nothing in flight)
 
-Last loop (#47): M-NIGHTLY triage of nightly run 20260725-011243 (26 items, sha
-`55809fbf` = a pre-master-merge tpcds-fix2 tip; HEAD `e7d9b88e`). One product
-change landed: root-0029, the regress "wedge cascade" misreport.
+Last loop (#48): M-NIGHTLY item AI-20260725-011243-004
+(`TestPort_IsolationEvalPlanQual`) FIXED and committed.
 
-- 001/002 units+race internal/executor (`TestVerifyHeapam_LateralCommaJoinViaFastPath`)
-  — STALE, passes at HEAD; the nightly running during this triage
-  (20260728-121843 @ e7d9b88e) reports units PASS / race PASS.
-- 003/005/006/007 testport Amcheck/InsertConflict/PartitionDropIndex/PgAmcheck002
-  — STALE, all 4 PASS at HEAD.
-- 008..026 the 19 `regress/<case> … output mismatch` items — ROOT-CAUSED + FIXED
-  (`docs/design/root-0029-nightly-regress-wedge-cascade.md`). 36 cases merely
-  burned their 120s budget; the harness diffed psql's TRUNCATED transcript
-  against the full expected .out and blamed the normalization rules. Fix:
-  `framework.ErrExecTimeout` short-circuits before the diff, `ExecuteSQL` honours
-  the ctx deadline, `clusterPoisoned` restarts the cluster after a timeout, and
-  `summarize.py` collapses the cascade into one `regress/suite-wedge` item
-  (replayed on the real log: 26 items → 17; inert on pre-fix logs).
-- The wedge's OWN cause is NOT fixed — ledger row 2026-07-28: orphaned backend
-  (no client-disconnect abort in goopg) vs GOMEMLIMIT saturation, indistinguishable
-  from per-case durations alone.
+Root cause was NOT an EPQ tuple-version bug (the loop-47 triage guess).
+`lockRowsOp` buffers its whole result (`drainAndStamp` → `drained=true`, rows
+served from `pending[pos++]`) and its `Open` is the operator's ExecReScan entry
+point, but `Close` cleared only `pending`. The SECOND `Open` —
+`classifySubPlan`'s `rescanCloseOpen` for the `EXISTS (… FOR UPDATE)` sublink,
+performed during the EvalPlanQual recheck — answered `Next` with EOF without
+re-scanning, so `EXISTS` went FALSE with zero `noisy_oper()` NOTICEs and
+`updateOp` dropped the row (silently lost update: `checking|400` vs PG `-800`).
+Fix = reset `pending`/`pos`/`drained` at the top of `lockRowsOp.Open`
+(3 lines + comment). `drained` is unique to `lockRowsOp` — no sibling path.
 
-Next (two open M-NIGHTLY tasks, in priority order — they preempt M0124):
-1. `TestPort_IsolationEvalPlanQual` — CONFIRMED deterministic at HEAD (21.5s).
-   `wnested2` permutation: goopg's EPQ recheck evaluates the nested trigger quals
-   against the pre-update tuple (L415 `upid: … f` vs PG `lock_id: … t`), final
-   read `checking|400` vs PG `checking|-800`. Genuine EPQ gap, own loop.
-2. The 9 genuine sub-timeout regress divergences (errors/index_including/
-   portals_p2/select/select_distinct still diverge at HEAD full-suite but pass in
-   isolation ⇒ suite-ordering state leakage, not normalization). Re-run with
-   `-timeout 60m` + `GOOPG_REGRESS_DIFF_DIR` to capture the actual diffs.
-   Note: the full-suite re-run hit go test's 10m default inside `tidscan`; use an
-   explicit `-timeout` and do NOT run it while a nightly batch is live (co-load).
+Design doc `docs/design/root-0030-lockrows-rescan-state.md` (+ README index).
+Ledger row appended: `lockRowsOp` still locks EAGERLY (whole child drained and
+stamped at first `Next`) where `ExecLockRows` locks one row per parent pull.
 
-Gates run: build ./... OK; `go test ./internal/testport/framework/` OK (incl. new
-TestRunRegressSubsetTimeoutIsNotOutputMismatch); `go vet ./internal/testport/` OK;
-regress-suite smoke (boolean, case) PASS; summarize.py replayed against the real
-nightly log both with and without the new rationale.
+Remaining open M-NIGHTLY task (preempts M0124):
+- The 9 genuine sub-timeout regress divergences: `errors`, `index_including`,
+  `portals_p2`, `select`, `select_distinct` still diverge in the FULL suite at
+  HEAD but pass in isolation ⇒ suite-ordering state leakage (a case mutating
+  shared `test_setup` fixtures), not normalization rules. Re-run with an
+  explicit `-timeout 60m` (the default 10m hit inside `tidscan`) plus
+  `GOOPG_REGRESS_DIFF_DIR` to capture the real diffs, and do NOT run it while a
+  nightly batch is live (co-load).
+Then M0124 → M0125 per the 2026-07-28 directive.
+
+Gates run: `TestPort_IsolationEvalPlanQual` PASS (27.6 s);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`go test ./internal/executor/` PASS; 21 row-lock isolation specs PASS (80.8 s);
+14 FK/MERGE isolation specs PASS (36.7 s); `scripts/tpch-spotcheck.sh` PASS
+(Q12 rows=2, Q13 rows=35). TPC-DS SF0.5 gate deliberately skipped — no TPC-DS
+query builds a `lockRowsOp` (rationale recorded in the design doc).
 In-flight: none.

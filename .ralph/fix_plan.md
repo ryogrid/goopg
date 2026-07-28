@@ -228,18 +228,23 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       Repro: `go test -v -run 'TestPort_RegressSuite' ./internal/testport/`
       with `-timeout 60m` and `GOOPG_REGRESS_DIFF_DIR=/tmp/rdiff` to capture the
       actual diffs, then bisect the ordering dependency.
-- [ ] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
+- [x] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
       `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
       in the previous run"; repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`).
-      **CONFIRMED at HEAD** (`e7d9b88e`, 21.5 s, deterministic — not a flake).
-      The `wnested2` permutation diverges from L415: goopg emits
-      `upid: text savings = text checking: f` where PG emits
-      `lock_id: text checking = text checking: t` / `lock_bal: numeric 600 > numeric 200.0: t`,
-      i.e. the EPQ recheck re-evaluates the nested trigger/function quals against
-      the wrong (pre-update) tuple version, and the final read shows
-      `checking |    400` where PG has `checking |   -800`. Genuine EPQ semantics
-      gap; needs its own loop.
+      **FIXED 2026-07-28** (`docs/design/root-0030-lockrows-rescan-state.md`).
+      Not an EPQ-tuple-version bug as the earlier triage guessed: `lockRowsOp`
+      buffers its rows (`drained`/`pos`/`pending`) and its `Open` is the
+      operator's rescan entry point, but `Close` cleared only `pending`. The
+      SECOND `Open` — the one `classifySubPlan`'s `rescanCloseOpen` performs for
+      the `EXISTS (… FOR UPDATE)` sublink on the EvalPlanQual recheck — therefore
+      answered `Next` with EOF without re-scanning, so `EXISTS` collapsed to
+      FALSE with zero `noisy_oper()` NOTICEs and `updateOp` dropped the row
+      (`checking | 400` vs PG's `-800` — a silently lost update). Fix: reset
+      `pending`/`pos`/`drained` at the top of `lockRowsOp.Open`, matching
+      `nodeLockRows.c`, which keeps no such buffer. Spec passes (27.6 s); 21
+      row-lock + 14 FK/MERGE isolation specs, units, and `tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all green.
 - [x] **testport/{AmcheckCreateExtension, IsolationInsertConflictSpecconflict,
       IsolationPartitionDropIndexLocking, PgAmcheck002Nonesuch}** —
       (AI-20260725-011243-003/-005/-006/-007). **Stale — all 4 PASS at HEAD**

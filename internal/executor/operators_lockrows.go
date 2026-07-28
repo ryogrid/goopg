@@ -425,6 +425,20 @@ func (o *lockRowsOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *lockRowsOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// Per-execution state reset — Open doubles as this operator's ExecReScan
+	// entry point. A correlated sublink that carries FOR UPDATE is re-run per
+	// outer row, and again during an EvalPlanQual recheck (classifySubPlan maps
+	// LockRows to rescanCloseOpen, so the retained tree is Close()d and Open()ed
+	// rather than rebuilt). Close clears `pending` but left `drained`/`pos`
+	// behind, so the second Open served EOF straight from the emptied buffer and
+	// the inner plan never re-scanned: `EXISTS (... FOR UPDATE)` in an UPDATE's
+	// WHERE silently evaluated to FALSE on the EPQ recheck and the outer row was
+	// dropped instead of updated (eval-plan-qual `wnested2`; root-0030).
+	// Upstream keeps no such buffer — ExecLockRows pulls one row at a time from
+	// its subplan and ExecReScan resets the whole subtree (nodeLockRows.c).
+	o.pending = nil
+	o.pos = 0
+	o.drained = false
 	// Resolve the lock-strength bit for the heap-tuple
 	// stamper. v0 supports a single FOR UPDATE / FOR SHARE
 	// strength per LockRows (multi-clause merge under
