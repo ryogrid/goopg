@@ -734,12 +734,41 @@ blocker; a code change landing mid-sweep voids the sweep.
         Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
         Q94 Q95 — none ordering-only; Q7/Q26/Q83 are the answer-neutral
         numeric-scale gap. Full per-query attribution filed as **M0124-0006**.
-        **NEXT: chunk `97-99`** — the FINAL chunk. Set A rows `^| 9[7-9] `; note
-        the on-disk `q97..q99` result files are STALE (set A) and were excluded
-        from the re-audit, so they must be re-run before any value claim. After it
-        lands, the sweep is complete and the merged deliverable
-        `analysis/tpcds-sf1-goopg-20260728.md` (confirm/refute the 13 §13.3
-        projections) is due — and the engine-commit freeze lifts.
+      - **PROGRESS 2026-07-28 (chunk 13 of 13 — Q97–Q99, the FINAL chunk).**
+        `scripts/tpcds-bench-compare.sh 97-99` dual-engine, foreground, ~2 min,
+        exit 0; header reprinted the sweep baseline `engine-id bba744a8…
+        c47d4ed6… diff=e3b0c442` unchanged, so all 99 queries sit in ONE sweep at
+        ONE budget. All 3 cells `OK` on both engines, row counts reproduce set A
+        (1 / 2531 / 90), timings within noise, and **no** new timeout/error/skip
+        → every D6 list CLOSES unchanged from Q1–Q96. The value diff (mandatory:
+        the on-disk `q97..q99` files were STALE set-A artifacts excluded from the
+        chunk-12 re-audit) makes **2 of the 3 final cells wrong answers behind a
+        matching row count**: **Q97** (`392155|392155|392155` vs PG
+        `541140|286927|161`) and **Q99** (cols 2–5 replicate col 1) are the
+        **4th and 5th instances of M0125-0009** — no new defect; Q97 is its most
+        legible instance anywhere in the sweep, since its three columns are
+        disjoint by construction (a customer cannot be store-only, catalog-only,
+        and both), so equal values are not merely wrong but impossible.
+        **Q98's values are CORRECT** — its 5068-line raw diff is two known
+        answer-neutral rendering gaps: (a) `char(n)` not blank-padded (probed:
+        `octet_length(sm_type)` = 30 on PG vs **7** on goopg, both
+        `character(30)`; `length()` agrees only because PG's `bpcharlen` ignores
+        trailing blanks, so it is NOT evidence of correctness) — already in the
+        ledger at row 2026-07-06 (M0122-0005), which now gains its first TPC-DS
+        consequence but needs no new filing; and (b) the numeric-scale gap, newly
+        narrowed — goopg's division rscale is right in general and short-circuits
+        **only on exactly-zero results** (`0::decimal(15,2)*100/2531.00` → goopg
+        `0.00` vs PG `0.00000000000000000000`, while the non-zero quotient is
+        byte-identical). One false alarm ruled out: Q99's `31-INTERVAL '60 days'`
+        headers appear identically in PG's output — they are in `query99.sql:7`
+        itself (TPC-DS generator substitution), not a goopg aliasing bug.
+        **THE SWEEP IS COMPLETE (99/99, 13/13 chunks).** The 21-cell
+        value-divergence list becomes **23** (`+Q97 +Q99`; Q98 explicitly not a
+        member). **NEXT: the merged deliverable
+        `analysis/tpcds-sf1-goopg-20260728.md`** (confirm/refute the 13 §13.3
+        projections at SF=1 values), with **M0124-0006** due before/with it. The
+        engine-commit freeze LIFTS once the deliverable lands; **M0125-0009 is
+        the recommended first fix** (one-line root cause, 5 queries of evidence).
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
@@ -841,9 +870,20 @@ blocker; a code change landing mid-sweep voids the sweep.
       to cells fresh this sweep, `OK` on both engines, and equal in row count,
       **21 diverge by value and none are ordering-only**:
       `Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
-      Q94 Q95`. Sampling attributes some already — Q87 → M0125-0006; Q16/Q94/Q95
-      → M0125-0007; Q43/Q50/Q66 (and probably Q2/Q39) → M0125-0009; Q7/Q26/Q83 are
-      the answer-neutral numeric-scale gap (no `select_div_scale`) — but the rest
+      Q94 Q95` — **updated by chunk 13 to 23 cells, `+Q97 +Q99`** (both attributed
+      to M0125-0009; **Q98 is NOT a member** — its values are correct and its diff
+      is rendering-only). Sampling attributes some already — Q87 → M0125-0006;
+      Q16/Q94/Q95 → M0125-0007; Q43/Q50/Q66/**Q97**/**Q99** (and probably Q2/Q39)
+      → M0125-0009; Q7/Q26/Q83 are
+      the answer-neutral numeric-scale gap (no `select_div_scale`) — **chunk 13
+      narrowed this one**: goopg's division rscale is correct in general and
+      short-circuits **only when the result is exactly zero** (`0.00` vs
+      `0.00000000000000000000`; the non-zero quotient is byte-identical), so the
+      attribution to look for is a zero fast-path, not a missing rscale rule.
+      A second answer-neutral renderer also inflates diffs and must not be
+      mistaken for a value divergence: **`char(n)` is not blank-padded**
+      (`octet_length` 7 vs PG 30 on `character(30)`; ledger row 2026-07-06,
+      M0122-0005) — normalise whitespace per field before classifying — but the rest
       are **unattributed**, and an unattributed value divergence may be a defect
       nobody has filed. Method: `diff <(norm goopg) <(norm pg)` per cell,
       classifying each as (a) an existing filed defect, (b) answer-neutral
@@ -1116,9 +1156,22 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       exhaustiveness test so a newly added Expr type cannot re-open this.
       **Accept by VALUE**: the reproducer + control matrix as planner unit tests,
       one test per previously-unhandled type, and the TPC-DS pivot queries
-      (Q43/Q50/Q66/Q2/Q39) asserted against PG.
+      (Q43/Q50/Q66/**Q97**/**Q99**/Q2/Q39) asserted against PG.
+      **Chunk 13 (2026-07-28) added Q97 and Q99 as the 4th and 5th instances**,
+      raising the evidence to five queries. Q97 is the most legible instance in
+      the sweep and the sharpest acceptance case: its three columns
+      (`store_only`, `catalog_only`, `store_and_catalog`) are **disjoint by
+      construction**, so goopg's `392155|392155|392155` (PG:
+      `541140|286927|161`) is not merely wrong but internally impossible — assert
+      the disjointness invariant, not just the literal triple. Q99's five ship-lag
+      buckets show the same shape with col 1 correct and cols 2–5 replicating it
+      (`1231|1231|1231|1231|1231` vs PG `1231|1228|1289|0|0`), which pins the
+      "reads the FIRST aggregate's slot" mechanism directly.
       Design `docs/design/0125-0009-parser-expr-key-structural.md`.
-      **Blocked until the sweep reaches Q99**; planner change → full pre-commit bar.
+      **Sweep precondition SATISFIED 2026-07-28** (the sweep reached Q99; 99/99
+      measured) — the engine-commit freeze lifts once M0124-0001's merged
+      deliverable lands, which is the only remaining gate on starting this.
+      Planner change → full pre-commit bar.
       Likely the single highest-value fix in the TPC-DS programme: it silently
       corrupts every pivot-style aggregate query while keeping row counts intact.
 
