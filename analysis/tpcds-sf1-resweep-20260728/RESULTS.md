@@ -116,6 +116,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 78 | TIMEOUT 637 s | 0 | OK 2 s | 100 | TIMEOUT 651 s / 0 | goopg-only timeout; unbounded above; reproduces set A |
 | 79 | OK 34 s | 100 | OK 0 s | 100 | OK 34 s / 100 | rows = PG; stable |
 | 80 | OK 164 s | 100 | OK 1 s | 100 | OK 169 s / 100 | rows = PG; stable |
+| 81 | TIMEOUT 637 s | 0 | OK 59 s | 100 | TIMEOUT 653 s / 0 | goopg-only timeout; unbounded above; reproduces set A |
+| 82 | OK 556 s | 2 | OK 1 s | 2 | OK 576 s / 2 | rows = PG **and values = PG**; **narrowest OK margin of the sweep** — 44 s of headroom under the 600 s budget, so its `OK` is budget-marginal |
+| 83 | OK 6 s | 22 | OK 0 s | 22 | OK 7 s / 22 | rows = PG; **values differ in rendering only** — goopg prints the `*_dev` numerics as `0.0` where PG prints `0.00000000000000000000` (numeric-division result scale); numerically equal |
+| 84 | OK 5 s | 18 | OK 0 s | 18 | OK 5 s / 18 | rows = PG; byte-identical output |
+| 85 | OK 9 s | 2 | OK 1 s | 2 | OK 7 s / 2 | rows = PG; byte-identical output |
+| 86 | ERROR 0 s | 0 | SKIP | — | ERROR 0 s / 0 | **not a goopg error** — dsqgen artefact (`syntax error … expected ')' after SELECT`), fails on PG too; joins Q36/Q70 |
+| 87 | **OK 35 s** | 1 | OK 2 s | 1 | OK 36 s / 1 | **row count matches but the ANSWER IS WRONG**: goopg `47218` vs PG `47049`. Root-caused this loop to a parser set-op associativity defect — see "Chunk 81–88" below |
+| 88 | TIMEOUT 638 s | 0 | OK 1 s | 1 | TIMEOUT 660 s / 0 | goopg-only timeout; unbounded above; reproduces set A |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -499,23 +507,98 @@ the TPC-DS row-anchor gate is **not** one of the four carve-out gates
 of which this touches — the sweep itself ran clean. So it stays filed and
 unchecked as M0125-0004; no engine change may land before Q99 regardless.
 
-Running timeout/error classification (D6), Q1–Q80 (73–80 contributed one
-goopg-only timeout, one PG-only timeout and the first new goopg ERROR since Q8):
+### Chunk 81–88 — every class reproduces set A, and the first *value-level* wrong answer
+
+All eight cells reproduce set A's class and row count (largest timing delta 22 s,
+on the two 600 s-budget timeouts where the excess is teardown, not query, time).
+Q81/Q88 re-time as goopg-only timeouts, Q86 re-confirms as the dsqgen artefact,
+Q83/Q84/Q85/Q87 are stable `OK`s. By the row-count measure the harness records,
+the chunk is uneventful.
+
+**It is not.** Because Q75 had just proved that a matching row count can hide a
+corrupt answer, this loop diffed the actual result *values* of every `OK` cell
+against PG for the first time in the sweep. That caught **Q87**: 1 row on both
+engines, but goopg answers `47218` where PG answers `47049`. A row-count gate —
+including the current SF0.5 oracle and the nightly anchors — is blind to it.
+
+Q87 is `count(*)` over `(A except B except C)`. The divergence was isolated to
+the set operation itself, not the inputs:
+
+| probe | goopg | PG |
+|---|---|---|
+| branch A / B / C cardinalities | 47428 / 31680 / 11744 | identical |
+| `A except B` alone | 47117 | 47117 |
+| full `A except B except C` | **47218** | 47049 |
+
+goopg's three-way answer (47218) is *larger* than its own two-way `A except B`
+(47117), which is impossible for a left-associative set difference — and it
+equals PG's answer for the **right**-associated reading `A except (B except C)`
+exactly. Minimal repro, confirmed on both engines this loop:
+
+```sql
+-- A={1,2,3} B={2} C={3};  PG: {1}   goopg: {1,3}
+select count(*) from ((select …A) except (select …B) except (select …C)) t;
+```
+
+The trigger is **per-branch parenthesisation**, not the subquery context:
+
+| form | goopg | PG |
+|---|---|---|
+| `A except B except C` (bare branches) | ✅ `{1}` | `{1}` |
+| `(A) except (B) except (C)` | ❌ `{1,3}` | `{1}` |
+| `(A) except all (B) except all (C)` | ❌ | — |
+| `(A) union (B) except (C)` (mixed chain) | ❌ `{1,2,3}` | `{1,2}` |
+| `(A) intersect (A) intersect (B)` | ✅ | — (associative, cannot expose it) |
+
+Root cause (read this loop, **not** fixed — no engine change may land before
+Q99): the parser always emits a right-linked chain and the *planner* re-associates
+it left. `parseParenthesisedSelectStmt` sets `innerSel.Parenthesized = true`
+(`internal/parser/select.go:1005`) **before** greedily absorbing a trailing set-op
+written *outside* those parentheses (`select.go:1007-1039`). So in
+`(A) except (B) except (C)` the node `B` carries both `Parenthesized == true` and
+`B.SetOp = {EXCEPT, C}`. The planner's flattening loop then hits
+`if rightStmt.Parenthesized { break }` (`internal/planner/planner.go:696-698`),
+stops after one segment, and plans `B EXCEPT C` recursively — yielding
+`A EXCEPT (B EXCEPT C)`. `Parenthesized` is overloaded: documented
+(`internal/parser/ast.go:861-867`) as "the whole compound was wrapped in parens",
+but set on a node that later absorbs operators that were never inside them.
+UNION-only and INTERSECT-only chains are unaffected purely because those
+operators are associative; EXCEPT / EXCEPT ALL and mixed chains are not.
+
+Blast radius in TPC-DS: only `query87.sql` changes answer. `query14.sql` and
+`query38.sql` also chain set operators, but both chain INTERSECT/UNION, which are
+associative. Filed as **M0125-0006** with a ledger row; the fix is a parser/planner
+change and is therefore blocked behind Q99 by the sweep protocol.
+
+Two lesser value-level findings from the same diff, both PG-compat gaps that do
+**not** change any answer:
+
+- **Q83** — goopg renders the `*_dev` numerics as `0.0`, PG as
+  `0.00000000000000000000`. Numerically equal; goopg's numeric-division result
+  *scale* does not follow PG's `select_div_scale` (`postgres/src/backend/utils/adt/numeric.c`).
+- **Q82** — values match after whitespace normalisation; the two outputs differ
+  only in psql's computed column width for `i_item_desc` (goopg 1 char narrower),
+  consistent with a trailing space being trimmed somewhere in the varchar path.
+
+Running timeout/error classification (D6), Q1–Q88 (81–88 contributed two
+goopg-only timeouts and one further not-a-goopg-error, and no new class):
 
 - **both engines** (excluded from "goopg-only"): Q4
 - **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31, Q54, Q64,
-  Q65, Q67, Q69, Q71, Q72, **Q78**
+  Q65, Q67, Q69, Q71, Q72, Q78, **Q81**, **Q88**
 - **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
-  at 600 s): Q18, Q35, Q51
-- **PG-only** (goopg wins): Q11, **Q74**
-- **goopg ERROR**: Q8, **Q75**
-- **not a goopg error** (query text invalid on PG too): Q36, Q70
+  at 600 s): Q18, Q35, Q51, **Q82** (556 s — passed, but with 44 s of headroom)
+- **PG-only** (goopg wins): Q11, Q74
+- **goopg ERROR**: Q8, Q75
+- **not a goopg error** (query text invalid on PG too): Q36, Q70, **Q86**
 
-Row mismatches vs PG among OK queries, Q1–Q80: unchanged at Q47 (0/100), Q49
-(30/34), Q51 (0/100). Q75 does not join them — it left the OK class entirely —
-but its set-A row *match* is now known to have been value-corrupt, so the honest
-count of "queries whose answer is known-good at HEAD" excludes it too.
+Answer mismatches vs PG among OK queries, Q1–Q88: Q47 (0/100), Q49 (30/34),
+Q51 (0/100) by row count, plus **Q87 by value at a matching row count** — the
+first of its kind in the sweep, and the reason value diffing is now part of the
+per-chunk procedure rather than an M0124-0005 deliverable alone. Q75 does not
+join them (it left the OK class entirely), but its set-A row *match* is likewise
+known to have been value-corrupt.
 
 ## Cursor
 
-`M0124-0001 sweep: 1-80 done; next 81-88.`
+`M0124-0001 sweep: 1-88 done; next 89-96.`

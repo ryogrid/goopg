@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `73-80`
->    (`scripts/tpcds-bench-compare.sh 73-80`; chunks 1–72 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `89-96`
+>    (`scripts/tpcds-bench-compare.sh 89-96`; chunks 1–88 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -663,11 +663,45 @@ blocker; a code change landing mid-sweep voids the sweep.
         budget-marginal Q18/Q35/Q51; PG-only Q11/**Q74**; goopg ERROR Q8/**Q75**;
         not-a-goopg-error Q36/Q70. Row mismatches among OK queries Q1–Q80: still
         Q47, Q49, Q51.
-        **NEXT: chunk `81-88`.** Read set A (`analysis/tpcds-sf1-goopg-20260727.md`
-        §5.2, rows `^| 8[1-8] `) for the timeout count in range FIRST and size the
-        Bash `timeout` accordingly — count **both** engines' columns (col 1 = goopg,
-        col 2 = PG; loop #10's baton undercounted 73–80 by reading only the goopg
-        side, and Q78's goopg timeout cost ~11 unbudgeted minutes).
+      - **Chunk 11 (Q81–Q88) DONE** (`chunk-81-88.txt`, ~40 min, exit 0, baseline
+        `engine-id` reprinted unchanged). All eight cells reproduce set A in class
+        and row count — by the harness's row-count measure, an uneventful chunk.
+        It was not. Acting on chunk 10's Q75 lesson (a matching row count can hide
+        a corrupt answer), this loop **diffed result VALUES against PG for every OK
+        cell** — the sweep's first value-level comparison — and caught **Q87: 1 row
+        on both engines, goopg `47218` vs PG `47049`**. Root-caused fully by
+        read-only probe: the three input branches match PG exactly, `A except B`
+        alone matches, but goopg's three-way result EXCEEDS its own two-way result
+        (impossible for a left-associative set difference) and equals PG's answer
+        for the right-associated reading. Trigger is **per-branch parenthesisation**:
+        bare `A except B except C` is correct, `(A) except (B) except (C)` is not,
+        nor is `except all`, nor the mixed chain `(A) union (B) except (C)`;
+        UNION/INTERSECT-only chains are unaffected only because they are associative.
+        Mechanism: `parseParenthesisedSelectStmt` sets `Parenthesized = true`
+        (`internal/parser/select.go:1005`) *before* absorbing a trailing set-op
+        written outside those parens (`select.go:1007-1039`), so the planner's
+        left-associative flattening loop breaks early at
+        `internal/planner/planner.go:696-698`. **Filed as M0125-0006 with a ledger
+        row; NOT fixed — the sweep forbids any engine commit before Q99.** Two
+        answer-neutral PG-compat gaps from the same diff: **Q83** numeric-division
+        result scale (`0.0` vs PG `0.00000000000000000000`, i.e. no `select_div_scale`)
+        and **Q82** a 1-char column-width delta consistent with a trimmed trailing
+        space. New D6 note: **Q82 is budget-marginal** — it passed at 556 s with only
+        44 s of headroom, the narrowest OK margin of the sweep. Running D6 for
+        Q1–Q88: both-engine Q4; goopg-only unbounded
+        Q5/Q10/Q14/Q30/Q31/Q54/Q64/Q65/Q67/Q69/Q71/Q72/Q78/**Q81**/**Q88**;
+        budget-marginal Q18/Q35/Q51/**Q82**; PG-only Q11/Q74; goopg ERROR Q8/Q75;
+        not-a-goopg-error Q36/Q70/**Q86**. Answer mismatches among OK queries
+        Q1–Q88: Q47, Q49, Q51 by row count **plus Q87 by value at a matching count**.
+        **NEXT: chunk `89-96`.** Read set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 9[0-6] ` and `^| 89 `) for the timeout count in range FIRST and
+        size the Bash `timeout` accordingly — count **both** engines' columns (col 1 =
+        goopg, col 2 = PG; loop #10's baton undercounted 73–80 by reading only the
+        goopg side). **Value-diff every OK cell** against PG (`diff` the
+        `{goopg,pg}_q<N>_result.txt` pairs in
+        `bench/tpcds/runtime_goopg/tpcds-results/`, normalising whitespace to
+        separate psql rendering from real divergence) — this is now part of the
+        per-chunk procedure, not an M0124-0005 deliverable alone.
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
@@ -897,6 +931,48 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       completion** — `costDrivenJoinOrder` is the precedent. On landing, update the
       RC-5 and phase-6.2 ledger rows whose criteria this satisfies. Design
       `docs/design/0125-0005-relsize-fallback-default-flip.md`.
+- [ ] **M0125-0006 — set-operation chains re-associate right when branches are
+      parenthesised** (discovered by M0124-0001 chunk 11, ledger row 2026-07-28).
+      **A wrong-answer defect, not a performance one**, and the first one this
+      programme found by value rather than by row count: TPC-DS Q87 returns
+      `47218` against PG's `47049` while both return exactly 1 row, so the SF0.5
+      oracle, the nightly row anchors and the harness's own comparison are all
+      structurally blind to it. SQL-standard and PG associate equal-precedence set
+      operators LEFT to right; goopg does so only when the branches are bare.
+      Confirmed-wrong forms: `(A) except (B) except (C)`, the same with
+      `except all`, and mixed chains such as `(A) union (B) except (C)`
+      (`{1,2,3}` vs PG `{1,2}`). UNION-only and INTERSECT-only chains are
+      unaffected *only* because those operators are associative — do not read
+      their passing as coverage.
+      **Mechanism (already root-caused, no re-diagnosis needed):**
+      `parseParenthesisedSelectStmt` sets `innerSel.Parenthesized = true`
+      (`internal/parser/select.go:1005`) **before** greedily absorbing a trailing
+      set-op written *outside* those parentheses (`select.go:1007-1039`). The node
+      then carries both `Parenthesized == true` and its own `SetOp`, and the
+      planner's left-associative flattening loop breaks early at
+      `if rightStmt.Parenthesized { break }`
+      (`internal/planner/planner.go:696-698`), planning `A EXCEPT (B EXCEPT C)`.
+      `Parenthesized` (`internal/parser/ast.go:861-867`) is overloaded against its
+      own doc comment.
+      **Fix in the parser, not the planner**: `Parenthesized` must describe the
+      node as it stood at the closing paren, so the absorbing node may not claim
+      the user's parentheses covered an operator that appeared after them. PG
+      cannot express this bug at all — `select_with_parens` is a *leaf* operand in
+      `gram.y`, so `transformSetOperationStmt`
+      (`postgres/src/backend/parser/analyze.c`) always receives a left-deep tree.
+      A planner-side patch at planner.go:696 would work but preserves the
+      ambiguous flag; prefer the faithful shape.
+      **Accept by VALUE**: the four-form matrix above as parser/planner unit tests,
+      plus TPC-DS Q87 asserted at `47049`. Sibling-path check per Hard-won Rule #2 —
+      `parseSelect` (select.go:292-295) and `parseValuesSelect` (select.go:91-94)
+      attach trailing chains too, and the FROM-subquery and scalar-subquery paths
+      (select.go:1372-1400, 2892-2906) repeat the same walk-to-rightmost idiom;
+      audit all of them before declaring the class closed. Executor side is
+      `internal/executor/operators_setop.go`. Design
+      `docs/design/0125-0006-setop-chain-associativity.md`.
+      **Blocked until the M0124-0001 sweep reaches Q99** (no engine commit may land
+      before then); it is a parser/planner change, so it additionally requires
+      `tpch-spotcheck.sh` + the SF0.5 gate + `make plan-diff` per the pre-commit bar.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

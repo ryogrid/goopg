@@ -1,0 +1,30 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T22:41:18+09:00
+# goopg: 7912ec01 bench(tpcds): M0124-0001 chunk 10 — Q73-Q80 measured; Q75 is the first set-A OK to become an ERROR  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=754f6d30f50bb3bb on-disk=754f6d30f50bb3bb (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q81  TIMEOUT    637s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      (engine source unchanged; image now 38ef8dff5aecb91c)
+pg    Q81  OK          59s      100 
+goopg Q82  OK         556s        2 
+pg    Q82  OK           1s        2 
+goopg Q83  OK           6s       22 
+pg    Q83  OK           0s       22 
+goopg Q84  OK           5s       18 
+pg    Q84  OK           0s       18 
+goopg Q85  OK           9s        2 
+pg    Q85  OK           1s        2 
+goopg Q86  ERROR        0s        0 psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/que
+pg    Q86  SKIP    known dsqgen artefact (fails on PG too)
+goopg Q87  OK          35s        1 
+pg    Q87  OK           2s        1 
+goopg Q88  TIMEOUT    638s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      (engine source unchanged; image now 38ef8dff5aecb91c)
+pg    Q88  OK           1s        1 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt
