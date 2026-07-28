@@ -287,11 +287,31 @@ def analyze(run_dir, repo_root, run_id):
         for r in read_csv(os.path.join(repo_root, "docs/test-port/regress-diff-baseline.csv"))
         if r.get("name")
     }
+    # A case whose psql was killed by the per-case deadline reports
+    # "deferred: execution timeout: ..." (internal/testport/framework:
+    # RationaleExecTimeout). Its output is truncated, so it says nothing about
+    # divergence — and because the wedge (orphaned backend / GC-thrashing
+    # server) outlives the case, timeouts arrive in cascades: run
+    # 20260725-011243 produced 36 of them from `rowtypes` onward, 19 of which
+    # were baseline-pass and became 19 separate bogus regressions. Collapse the
+    # whole cascade into ONE item naming the first victim, which is the only
+    # case worth investigating. (root-0029)
+    wedged = []
+    case_order = []          # every regress case, in suite execution order
     for name, status in sorted(tp_results.items()):
-        if status[0] != "SKIP" or not name.startswith("TestPort_RegressSuite/"):
+        if not name.startswith("TestPort_RegressSuite/") or "/" not in name:
             continue
         case = name.split("/", 1)[1]
-        reason = tp_skip_reasons.get(name, "")
+        reason = tp_skip_reasons.get(name, "") if status[0] == "SKIP" else ""
+        # Policy-excluded cases never touch the cluster, so they must not break
+        # the contiguity of a wedge run (they interleave alphabetically).
+        if "excluded by policy" not in reason:
+            case_order.append(case)
+        if status[0] != "SKIP":
+            continue
+        if "execution timeout" in reason:
+            wedged.append(case)
+            continue
         diverged = (
             "output mismatch" in reason
             or "execution error" in reason
@@ -311,6 +331,38 @@ def analyze(run_dir, repo_root, run_id):
                     f"go test -v -run 'TestPort_RegressSuite/{case}' ./internal/testport/",
                     ev("testport/go-test.log"),
                 )
+
+    if wedged:
+        # Point the repro at the onset of the longest *contiguous* run of
+        # timeouts, not merely the first one: an isolated timeout on a genuinely
+        # heavy case (aggregates, create_index) says little, whereas the case
+        # that starts an unbroken tail is the one that wedged the cluster.
+        wedged_set = set(wedged)
+        best_start, best_len, run_start, run_len = wedged[0], 1, None, 0
+        for case in case_order:
+            if case in wedged_set:
+                if run_len == 0:
+                    run_start = case
+                run_len += 1
+                if run_len > best_len:
+                    best_start, best_len = run_start, run_len
+            else:
+                run_len = 0
+        baseline_pass = [c for c in wedged if baseline.get(c) == "pass"]
+        what = (
+            f"regress suite wedged: {len(wedged)} case(s) hit the 120s per-case timeout "
+            f"({len(baseline_pass)} of them baseline-pass); longest unbroken run is "
+            f"{best_len} case(s) from {best_start}. Their output is truncated, so this is "
+            "NOT an output divergence — investigate what wedged the cluster at "
+            f"{best_start} (orphaned backend holding locks, or GC-thrashing server). "
+            f"cases: {', '.join(wedged[:12])}" + (" …" if len(wedged) > 12 else "")
+        )
+        first = best_start
+        it.add_regression(
+            "regress/suite-wedge", what,
+            f"go test -v -run 'TestPort_RegressSuite/{first}' ./internal/testport/",
+            ev("testport/go-test.log"),
+        )
 
     # promotable: an expected-fail case that PASSed
     for eid in expected_ids:

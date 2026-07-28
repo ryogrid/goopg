@@ -20,9 +20,11 @@ package testport
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +32,11 @@ import (
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
+
+// regressCaseTimeout bounds a single regress case end to end (the psql client
+// run plus the harness's own deadline). Shared by the suite and
+// ClusterRegressExecutor so the two can never drift apart.
+const regressCaseTimeout = 120 * time.Second
 
 // TestPort_RegressSuite runs all pg_regress SQL cases against a live goopg
 // cluster via the psql binary. Most cases report "defer" initially; the
@@ -66,6 +73,17 @@ func TestPort_RegressSuite(t *testing.T) {
 		RepoRoot: root,
 	}
 
+	// clusterPoisoned is set when a case's psql was killed by the per-case
+	// deadline. The server keeps executing after its client dies (the standing
+	// "timeout kills only the client" trap), so whatever wedged the case —
+	// an orphaned backend holding locks, or a GC-thrashing server — is still
+	// there for the next case. Nightly run 20260725-011243 shows the cost of
+	// not handling this: every case from `rowtypes` onward timed out at 120 s
+	// while `SELECT 1` still answered, so isAlive() never triggered recovery
+	// and 36 cases reported a bogus output mismatch (root-0029). Subtests here
+	// run sequentially (no t.Parallel), so a plain bool is sufficient.
+	clusterPoisoned := false
+
 	for _, rc := range cases {
 		rc := rc
 		t.Run(rc.Name, func(t *testing.T) {
@@ -81,8 +99,13 @@ func TestPort_RegressSuite(t *testing.T) {
 			// the server; on failure we Kill (clears cmd state) then Start
 			// (WAL recovery restores a consistent DB state), then re-run
 			// test_setup.sql to restore shared fixture tables.
-			if !exec.isAlive() {
-				t.Log("server not responding; attempting crash recovery")
+			if clusterPoisoned || !exec.isAlive() {
+				if clusterPoisoned {
+					t.Log("previous case timed out; restarting the cluster to drop orphaned backends")
+				} else {
+					t.Log("server not responding; attempting crash recovery")
+				}
+				clusterPoisoned = false
 				_ = c.Kill() // clear cmd so Start() doesn't return "already started"
 				if err := c.Start(); err != nil {
 					t.Skipf("deferred: cluster restart failed: %v", err)
@@ -98,7 +121,7 @@ func TestPort_RegressSuite(t *testing.T) {
 				runRegressSQLFile(t, root, psqlBin, c, preFile)
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), regressCaseTimeout)
 			defer cancel()
 
 			results, err := framework.RunRegressSubset(ctx, root, []framework.RegressCase{rc}, exec)
@@ -112,6 +135,10 @@ func TestPort_RegressSuite(t *testing.T) {
 				return
 			}
 			r := results[0]
+			if strings.HasPrefix(r.Rationale, framework.RationaleExecTimeout) {
+				// The next case must not inherit the wedge.
+				clusterPoisoned = true
+			}
 			switch r.Status {
 			case "port":
 				// Pass — nothing to do.
@@ -311,7 +338,13 @@ func (e *ClusterRegressExecutor) isAlive() bool {
 // ExecuteSQL writes sql to a temporary file and runs it through psql.
 // Returns combined stdout (primary output) on success; on psql non-zero
 // exit the stdout+stderr combination is returned so callers can diff it.
-func (e *ClusterRegressExecutor) ExecuteSQL(_ context.Context, sql string) (string, error) {
+//
+// If psql is killed by the deadline (ctx's, or regressCaseTimeout when ctx
+// carries none) the partial output is returned together with an error wrapping
+// framework.ErrExecTimeout. Reporting that as a plain diff is what let one
+// wedged cluster masquerade as ~36 independent output-mismatch regressions in
+// nightly run 20260725-011243 — see root-0029.
+func (e *ClusterRegressExecutor) ExecuteSQL(ctx context.Context, sql string) (string, error) {
 	tmpf, err := os.CreateTemp("", "goopg_regress_*.sql")
 	if err != nil {
 		return "", err
@@ -333,13 +366,29 @@ func (e *ClusterRegressExecutor) ExecuteSQL(_ context.Context, sql string) (stri
 		"-c", "SET statement_timeout = '5s'",
 		"-f", tmpf.Name(),
 	)
+	// Honour the caller's deadline when it is tighter than the default; the
+	// suite sets one per case, and RunCommand only understands a duration.
+	timeout := regressCaseTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return "", fmt.Errorf("%w: deadline already expired before psql start", framework.ErrExecTimeout)
+	}
 	result, _ := util.RunCommand(util.CommandSpec{
 		Name:    e.PsqlBin,
 		Args:    args,
 		Dir:     e.RepoRoot,
 		Env:     e.psqlEnv(),
-		Timeout: 120 * time.Second,
+		Timeout: timeout,
 	})
+	if result.TimedOut {
+		return result.Stdout + result.Stderr,
+			fmt.Errorf("%w: psql killed after %s (cluster wedged or overloaded; output is truncated, not a diff)",
+				framework.ErrExecTimeout, timeout)
+	}
 	return result.Stdout + result.Stderr, nil
 }
 

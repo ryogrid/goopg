@@ -17,7 +17,20 @@ var (
 	ErrDeferred = errors.New("deferred")
 	// ErrExcluded marks a test as excluded by policy.
 	ErrExcluded = errors.New("excluded")
+	// ErrExecTimeout marks a case whose client (psql) was killed by the
+	// per-case deadline before the SQL file finished. The partial output that
+	// comes back is NOT a comparable result: diffing it always "mismatches",
+	// which is how a single wedged/overloaded cluster used to manufacture one
+	// bogus "output mismatch; normalization rules need extension" report per
+	// remaining case (root-0029). Callers must report this distinctly and, for
+	// a shared cluster, treat the server as poisoned.
+	ErrExecTimeout = errors.New("execution timeout")
 )
+
+// RationaleExecTimeout is the rationale prefix used for an ErrExecTimeout
+// case. The nightly summarizer (ci/batch/lib/summarize.py) keys the
+// suite-wedge collapse off this prefix, so the two must stay in sync.
+const RationaleExecTimeout = "execution timeout"
 
 type RegressCase struct {
 	Name         string
@@ -86,6 +99,15 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 		}
 		if errors.Is(err, ErrDeferred) {
 			results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "defer", Rationale: "execution deferred by capability gate"})
+			continue
+		}
+		if errors.Is(err, ErrExecTimeout) {
+			// Distinct from an output diff on purpose: the case never produced
+			// a full result, so nothing about the normalization rules can be
+			// concluded from it.
+			// err already carries the RationaleExecTimeout prefix (it wraps
+			// ErrExecTimeout), so report it verbatim.
+			results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "defer", Rationale: err.Error()})
 			continue
 		}
 		if err != nil {

@@ -3,8 +3,10 @@ package framework
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,6 +72,57 @@ func TestRunRegressSubsetReportsStatuses(t *testing.T) {
 	if got["excluded_case"] != "excluded" {
 		t.Fatalf("excluded_case status=%q want excluded", got["excluded_case"])
 	}
+}
+
+// TestRunRegressSubsetTimeoutIsNotOutputMismatch pins the root-0029 fix: when
+// the executor reports that the client was killed by the per-case deadline, the
+// truncated output it returns must NOT be diffed against the expected file.
+// Before the fix the partial output fell through to the diff and every wedged
+// case reported "output mismatch; normalization rules need extension", which
+// the nightly summarizer then filed as an independent regression — one wedged
+// cluster produced 36 of them in run 20260725-011243.
+func TestRunRegressSubsetTimeoutIsNotOutputMismatch(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/sql/wedged_case.sql"), "SELECT pg_sleep(600);\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/expected/wedged_case.out"), "full expected output\n")
+
+	cases, err := DiscoverRegressCases(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The real ClusterRegressExecutor returns the partial psql output together
+	// with the wrapped ErrExecTimeout; mirror that shape here.
+	exec := &timeoutRegressExec{
+		partial:  "SELECT pg_sleep(600);\n",
+		timeoutE: fmt.Errorf("%w: psql killed after 2m0s", ErrExecTimeout),
+	}
+	results, err := RunRegressSubset(context.Background(), repo, cases, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results=%d want 1", len(results))
+	}
+	r := results[0]
+	if r.Status != "defer" {
+		t.Fatalf("status=%q want defer", r.Status)
+	}
+	if !strings.HasPrefix(r.Rationale, RationaleExecTimeout) {
+		t.Fatalf("rationale=%q want prefix %q", r.Rationale, RationaleExecTimeout)
+	}
+	if strings.Contains(r.Rationale, "output mismatch") {
+		t.Fatalf("rationale=%q must not be reported as an output diff", r.Rationale)
+	}
+}
+
+type timeoutRegressExec struct {
+	partial  string
+	timeoutE error
+}
+
+func (m *timeoutRegressExec) ExecuteSQL(_ context.Context, _ string) (string, error) {
+	return m.partial, m.timeoutE
 }
 
 func mustWrite(t *testing.T, path, content string) {

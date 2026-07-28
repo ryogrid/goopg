@@ -182,6 +182,70 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       tuple locks through `tableLockMgr` for FIFO waits). 4/19.5M is the tail of that
       known edge; no separate fix here — tracked by the existing deferral row.
 
+### Nightly run 20260725-011243 (26 items, sha `55809fbf` — a pre-`master`-merge
+### tpcds-fix2 tip; HEAD at triage time `e7d9b88e`)
+
+- [x] **units/internal/executor + race/internal/executor** — both suites failed in
+      `internal/executor` (AI-20260725-011243-001/-002; repro:
+      `go test -timeout 10m ./internal/executor/`). Single cause:
+      `TestVerifyHeapam_LateralCommaJoinViaFastPath` ("gap #6 regressed").
+      **Stale — fixed at HEAD.** Nightly sha `55809fbf` predates the `master`
+      merge `27d2dae8`; the test PASSES at HEAD (0.00s), and the nightly running
+      *while this triage ran* (`20260728-121843`, sha `e7d9b88e`) reports
+      `units PASS` / `race PASS`. No new work.
+- [x] **regress/<19 cases> — 19 phantom regressions from ONE wedged cluster**
+      (AI-20260725-011243-008..-026: boolean, case, create_function_sql, errors,
+      index_including, limit, numerology, partition_aggregate, portals_p2, select,
+      select_distinct, select_distinct_on, select_into, tid, time, timetz,
+      truncate, union, varchar). **Root-caused and FIXED — design
+      `docs/design/root-0029-nightly-regress-wedge-cascade.md`.** 36 cases had
+      merely burned their full 120 s budget; the harness then diffed psql's
+      *truncated* transcript against the full expected `.out` and reported
+      "output mismatch; normalization rules need extension". The wedge outlives
+      the case (killing psql kills only the client), so 21 consecutive cases from
+      `tid` fell over, and `isAlive()` never fired because a saturated server
+      still answers `SELECT 1` (`server not responding`: 0 occurrences).
+      Fix: `framework.ErrExecTimeout` short-circuits before the diff,
+      `ExecuteSQL` honours the caller's ctx deadline, a `clusterPoisoned` flag
+      restarts the cluster after any timeout, and `summarize.py` collapses the
+      cascade into one `regress/suite-wedge` item. Replayed on the real log:
+      26 items → 17. The wedge's own cause (orphaned backend vs. GOMEMLIMIT
+      saturation) is NOT fixed — ledger row 2026-07-28, and the 9 genuine
+      sub-timeout divergences are the task below.
+- [ ] **regress/{boolean,case,create_function_sql,errors,index_including,limit,
+      numerology,partition_aggregate,portals_p2} — genuine sub-timeout
+      divergences.** What survives the root-0029 reclassification of
+      AI-20260725-011243-008..-026: 9 baseline-pass cases that diverged in under
+      120 s. At HEAD (full-suite re-run, 2026-07-28) `errors`, `index_including`,
+      `portals_p2`, `select` and `select_distinct` still diverge, while `boolean`,
+      `case`, `create_function_sql`, `limit`, `numerology`, `partition_aggregate`
+      and `tid` now pass; `time`/`timetz`/`truncate`/`union`/`varchar` were not
+      reached (the re-run hit the 10 m go-test timeout inside `tidscan`, under
+      co-load from the concurrent nightly). Earlier loops established that
+      `errors`/`portals_p2`/`select` pass in ISOLATION and only diverge in
+      full-suite ordering — so the remaining work is suite-ordering state leakage
+      (a case mutating shared `test_setup` fixtures), not normalization rules.
+      Repro: `go test -v -run 'TestPort_RegressSuite' ./internal/testport/`
+      with `-timeout 60m` and `GOOPG_REGRESS_DIFF_DIR=/tmp/rdiff` to capture the
+      actual diffs, then bisect the ordering dependency.
+- [ ] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
+      `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
+      in the previous run"; repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`).
+      **CONFIRMED at HEAD** (`e7d9b88e`, 21.5 s, deterministic — not a flake).
+      The `wnested2` permutation diverges from L415: goopg emits
+      `upid: text savings = text checking: f` where PG emits
+      `lock_id: text checking = text checking: t` / `lock_bal: numeric 600 > numeric 200.0: t`,
+      i.e. the EPQ recheck re-evaluates the nested trigger/function quals against
+      the wrong (pre-update) tuple version, and the final read shows
+      `checking |    400` where PG has `checking |   -800`. Genuine EPQ semantics
+      gap; needs its own loop.
+- [x] **testport/{AmcheckCreateExtension, IsolationInsertConflictSpecconflict,
+      IsolationPartitionDropIndexLocking, PgAmcheck002Nonesuch}** —
+      (AI-20260725-011243-003/-005/-006/-007). **Stale — all 4 PASS at HEAD**
+      (`e7d9b88e`: 0.66 s / 20.27 s / 1.92 s / 1.15 s, one run each). Same
+      pre-merge-tip explanation as the executor items. No new work.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 ## M0124 — TPC-DS round-2 closeout: measurement baseline, gate discharge & ledger debt (filed 2026-07-28)

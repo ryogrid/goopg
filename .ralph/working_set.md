@@ -1,25 +1,40 @@
 (idle — nothing in flight)
 
-Last loop (#46): M-NIGHTLY triage of nightly run 20260720-005224 (6 items). All 6
-are stale or rare flakes at HEAD `fb5de5c4` — no product change this loop; fix_plan
-M-NIGHTLY + deferral_ledger updated, committed.
+Last loop (#47): M-NIGHTLY triage of nightly run 20260725-011243 (26 items, sha
+`55809fbf` = a pre-master-merge tpcds-fix2 tip; HEAD `e7d9b88e`). One product
+change landed: root-0029, the regress "wedge cascade" misreport.
 
-- 002-005 regress/errors,index_including,portals_p2,select — RE-VERIFIED stale at
-  HEAD in isolation (errors/portals_p2/select PASS, index_including SKIPs, suite
-  18.95s). New AI-ids appended to the existing checked task; divergence only in the
-  nightly full-suite ordering/co-load, never the isolated repro. Not reopened.
-- 001 TestE2E_FailoverPGtoGoopg/sync_on — zero-loss `count=5 want 6` was a co-load
-  timing flake (pg.log MAP_HUGETLB OOM). Passes 4/4 at HEAD isolated. New checked
-  task + ledger row (line 461): sync-rep flushLSN-vs-fsync feedback race OR
-  promotion-replay-short — uninstrumented, chase if it recurs (force fsync stall +
-  kill-after-sync-ACK). Did NOT weaken the test.
-- 006 pgbench/nightly — 4/19.5M "current transaction is aborted" at TPC-B cmd4 =
-  the known non-FIFO tuple-lock gap (goopg_dml_conflict_no_fifo_tuple_lock /
-  ledger 0021-0012). Checked, tracked by existing row, no separate fix.
+- 001/002 units+race internal/executor (`TestVerifyHeapam_LateralCommaJoinViaFastPath`)
+  — STALE, passes at HEAD; the nightly running during this triage
+  (20260728-121843 @ e7d9b88e) reports units PASS / race PASS.
+- 003/005/006/007 testport Amcheck/InsertConflict/PartitionDropIndex/PgAmcheck002
+  — STALE, all 4 PASS at HEAD.
+- 008..026 the 19 `regress/<case> … output mismatch` items — ROOT-CAUSED + FIXED
+  (`docs/design/root-0029-nightly-regress-wedge-cascade.md`). 36 cases merely
+  burned their 120s budget; the harness diffed psql's TRUNCATED transcript
+  against the full expected .out and blamed the normalization rules. Fix:
+  `framework.ErrExecTimeout` short-circuits before the diff, `ExecuteSQL` honours
+  the ctx deadline, `clusterPoisoned` restarts the cluster after a timeout, and
+  `summarize.py` collapses the cascade into one `regress/suite-wedge` item
+  (replayed on the real log: 26 items → 17; inert on pre-fix logs).
+- The wedge's OWN cause is NOT fixed — ledger row 2026-07-28: orphaned backend
+  (no client-disconnect abort in goopg) vs GOMEMLIMIT saturation, indistinguishable
+  from per-case durations alone.
 
-Next (M0123-S4 REMAINING, resume the active milestone): float SPECIALS
-(`'Infinity'::float8`/`'NaN'::float4` → IEEE inf/nan Const, mirror
-parseNumericSpecial recognition — resume-point in the 29c ledger row); typmod'd
-string numeric cast `'5.5'::numeric(10,2)`; bare-integer→int2 implicit cast FuncExpr
-(funcid 314); float4-common CASE mix; operator-driven view-qual coercion;
-other length types (varchar(N)/timestamp(N)/bit(N)); broader date input forms.
+Next (two open M-NIGHTLY tasks, in priority order — they preempt M0124):
+1. `TestPort_IsolationEvalPlanQual` — CONFIRMED deterministic at HEAD (21.5s).
+   `wnested2` permutation: goopg's EPQ recheck evaluates the nested trigger quals
+   against the pre-update tuple (L415 `upid: … f` vs PG `lock_id: … t`), final
+   read `checking|400` vs PG `checking|-800`. Genuine EPQ gap, own loop.
+2. The 9 genuine sub-timeout regress divergences (errors/index_including/
+   portals_p2/select/select_distinct still diverge at HEAD full-suite but pass in
+   isolation ⇒ suite-ordering state leakage, not normalization). Re-run with
+   `-timeout 60m` + `GOOPG_REGRESS_DIFF_DIR` to capture the actual diffs.
+   Note: the full-suite re-run hit go test's 10m default inside `tidscan`; use an
+   explicit `-timeout` and do NOT run it while a nightly batch is live (co-load).
+
+Gates run: build ./... OK; `go test ./internal/testport/framework/` OK (incl. new
+TestRunRegressSubsetTimeoutIsNotOutputMismatch); `go vet ./internal/testport/` OK;
+regress-suite smoke (boolean, case) PASS; summarize.py replayed against the real
+nightly log both with and without the new rationale.
+In-flight: none.
