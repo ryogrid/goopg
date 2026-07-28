@@ -64,8 +64,8 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `65-72`
->    (`scripts/tpcds-bench-compare.sh 65-72`; chunks 1–64 are DONE). See that
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk `73-80`
+>    (`scripts/tpcds-bench-compare.sh 73-80`; chunks 1–72 are DONE). See that
 >    task's "Chunked execution" note — the sweep is deliberately split across
 >    loops, and the authoritative cursor is the one in `RESULTS.md`.** Do not select a regress/testport case instead: as of the
 >    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
@@ -605,10 +605,31 @@ blocker; a code change landing mid-sweep voids the sweep.
         goopg-only budget-marginal Q18/Q35/**Q51** (Q51 did not flip, 587 s, 13 s
         headroom); PG-only Q11; goopg ERROR Q8; not-a-goopg-error Q36. Row
         mismatches among OK queries Q1–Q64: Q47, Q49, Q51.
-        **NEXT: chunk `65-72`.** Check set A (`analysis/tpcds-sf1-goopg-20260727.md`
-        §5.2, rows `^| 6[5-9]|^| 7[0-2] `) for the timeout count in range FIRST and
-        size the Bash `timeout` accordingly; note `PG_SKIP="36 70 86"` covers **Q70**
-        in this range, so that cell has no PG side by design.
+      - **Chunk 65–72 DONE** (loop #9; `chunk-65-72.txt`, one harness call, ~45 min,
+        sweep-baseline `engine-id` reprinted). Q65/Q67/Q69/Q71 reproduce set A's
+        goopg-only TIMEOUTs; Q66 (5) and Q68 (100) match PG within ±3 s of set A;
+        Q70 is the known dsqgen ERROR with the PG arm skipped by design. The
+        finding is **Q72 — the first cell in the re-sweep where a set-A `OK`
+        becomes a `TIMEOUT`** (`OK 14 s / 0` → `TIMEOUT 635 s`, re-probed on a
+        fresh server at 636 s, `probe-q72-reprobe.txt`). Server age is ruled out
+        twice: the re-probe followed the harness restart, and Q66/Q68 reproduce
+        set A at the same server age in this chunk. Evidence-consistent reading
+        (**hypothesis, not established** — no plan diff was run): this is the
+        RC-1b fix `5db0a067`, which set A §2.1 predicted would touch Q72, and
+        which has now produced three family outcomes — **Q50 fixed 0 → 6 = PG,
+        Q47 17 → 142 s still wrong, Q72 past the budget**. Q72's plan bottoms out
+        in a 4-table MHJ (`warehouse`/`item`/`inventory`/`catalog_sales`) with
+        **no `Filter` on that node**. Consequence: set A's Q72 row gap (0 vs 100)
+        is **no longer observable**, so Q72 joins Q64 in the "unbounded AND
+        unvalidatable" bucket — reaching it by regressing out of OK rather than
+        by always having been a timeout. Any M0125 fix for Q72 must be validated
+        on ROWS, not merely on completion.
+        **NEXT: chunk `73-80`.** Check set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 7[3-9]|^| 80 `) for the timeout count in range FIRST and
+        size the Bash `timeout` accordingly. In this range **Q74 is a PG-side
+        TIMEOUT** (652 s; goopg OK 36 s) — the only PG arm that times out here, so
+        `reap_pg_orphans` will fire; budget for it and do not read it as a goopg
+        result. Q78 and Q81 are goopg-only timeouts in/near the range.
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps

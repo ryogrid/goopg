@@ -341,6 +341,89 @@ timeout, Q64 — already present in set A — and no new ERROR):
 Row mismatches vs PG among OK queries, Q1–Q64: unchanged at Q47 (0/100), Q49
 (30/34), Q51 (0/100).
 
+### Chunk 65–72 — Q72 crosses the budget: the RC-1b fix's third outcome
+
+Chunk 65–72 (`chunk-65-72.txt`) ran ~45 min, exit 0, header reprinting the sweep
+baseline `engine-id` unchanged (still ONE sweep under D4a). Five goopg-only
+timeouts, each triggering the scripted restart; no reap was needed (no PG arm
+timed out).
+
+Seven of the eight cells reproduce set A exactly in verdict:
+
+- **Q65, Q67, Q69, Q71** reproduce set A's goopg-only TIMEOUTs (636/637/630/634 s
+  vs 659/654/658/652 s, all cut at the 600 s budget). PG answers all four in
+  ≤ 6 s (100, 100, 100, 1129 rows), so as with Q64 goopg's 0 is uninformative
+  about correctness — these are **unbounded above and unvalidatable**.
+- **Q66 (36 s / 5) and Q68 (44 s / 100)** match PG's row count exactly and
+  reproduce set A within ±3 s (34 s, 41 s). These two matter methodologically:
+  each ran immediately after a timeout-and-restart, so they demonstrate that the
+  `RESTART_AFTER_TIMEOUT=1` guard is working in this chunk and that server age is
+  **not** confounding its timings.
+- **Q70** is `ERROR` on goopg with the PG arm skipped by design (`PG skip: 36 70
+  86`). This reproduces set A and is **not a goopg defect** — the dsqgen-generated
+  query text fails on PG too.
+
+**Q72 is the finding, and it is the first cell in the whole re-sweep where a set-A
+`OK` becomes a `TIMEOUT`** — a D6 *class* change, not merely a runtime deviation
+like Q47:
+
+| | set A (2026-07-27) | this re-sweep | re-probe, fresh server |
+| --- | --- | --- | --- |
+| goopg Q72 | OK 14 s / **0** rows | **TIMEOUT 635 s** / 0 | **TIMEOUT 636 s** / 0 |
+| PG Q72 | OK 2 s / 100 | OK 2 s / 100 | — |
+
+The re-probe (`probe-q72-reprobe.txt`, `ENGINES=goopg`, same 600 s budget) was run
+on the server the harness had just restarted after Q72's own timeout, i.e. a
+**fresh** server, and reproduced within 1 s. Combined with Q66/Q68 above this
+rules out the sweep-tail-collapse / server-age confound that set A's §2 warns
+about — the one that once produced a false Q6/Q7 regression. Q72 is genuinely
+slower at HEAD than in set A.
+
+**This is almost certainly the RC-1b fix, not a new regression.** Set A §2.1
+names Q72 as a *probable* RC-1b member ("MHJ filter push-down uses two coordinate
+spaces → Q47, Q50 and probably Q72") while explicitly holding the fix back; the
+chunk 49–56 ledger row then established that `5db0a067` "push MHJ single-source
+filters AFTER the bindings remap" landed *after* set A. That single fix has now
+produced **three different outcomes across its family**:
+
+| query | set A | HEAD | reading |
+| --- | --- | --- | --- |
+| Q50 | 0 rows (wrong) | **6 = PG** | fixed outright |
+| Q47 | OK 17 s / 0 | OK 142 s / 0 | newly-correct input, still wrong downstream |
+| Q72 | OK 14 s / 0 | **TIMEOUT** / 0 | newly-correct input exceeds the budget |
+
+The captured plan (`goopg_q72_explain.txt`) is consistent with this: the bottom
+node is a **4-table Multi-Way Hash Join over `warehouse`, `item`, `inventory`,
+`catalog_sales` carrying no `Filter` at that node**, with the surviving
+predicates sitting on the outer nested loops. At SF=1 `inventory` is ~11.7 M rows
+against `catalog_sales` ~1.4 M, so an MHJ that no longer prunes early is expected
+to grind. Set A's fast 14 s / 0 rows was the *wrong* answer arriving quickly
+because a misplaced filter pruned everything; correcting the placement bought
+correctness of input at the cost of the budget. **This is a hypothesis consistent
+with all evidence gathered, not an established root cause** — confirming it needs
+a plan diff against set A's Q72 plan, which is deferred past Q99 by the
+sweep-integrity invariant.
+
+Consequence for bookkeeping: **set A's recorded Q72 row gap (0 vs PG 100) is no
+longer observable at HEAD.** Q72 joins Q64 in the "unbounded AND unvalidatable"
+bucket that D6 cannot express — but it arrives there from the opposite direction,
+by regressing out of the OK class rather than by always having been a timeout.
+
+Running timeout classification (D6), Q1–Q72 (65–72 contributed five goopg-only
+timeouts, four of them already in set A plus the new Q72, and no new ERROR):
+
+- **both engines** (excluded from "goopg-only"): Q4
+- **goopg-only, runtime unbounded above**: Q5, Q10, Q14, Q30, Q31, Q54, Q64,
+  **Q65, Q67, Q69, Q71, Q72**
+- **goopg-only, budget-marginal** (true runtime ≈ budget; verdict is a coin flip
+  at 600 s): Q18, Q35, Q51
+- **PG-only** (goopg wins): Q11
+- **goopg ERROR**: Q8
+- **not a goopg error** (query text invalid on PG too): Q36, **Q70**
+
+Row mismatches vs PG among OK queries, Q1–Q72: unchanged at Q47 (0/100), Q49
+(30/34), Q51 (0/100) — Q72's former gap is now masked by its timeout.
+
 ## Cursor
 
-`M0124-0001 sweep: 1-64 done; next 65-72.`
+`M0124-0001 sweep: 1-72 done; next 73-80.`
