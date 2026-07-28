@@ -1520,6 +1520,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_attrdef reload: %w", err)
 	}
 
+	// root-0031: table INHERITANCE persistence from the pg_inherits HEAP rows
+	// (base/<dbOid>/2611) written by writeInheritsRow. Runs immediately after the
+	// pg_attrdef pass and for the same reason — a STANDALONE UNCONDITIONAL pass
+	// AFTER every table-load pass, since the parent and the child may reload in
+	// either order and both must already be registered before the edge is
+	// restored. Without it a restart dropped every inheritance relationship.
+	if err := loadInheritanceFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_inherits reload: %w", err)
+	}
+
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
 	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)

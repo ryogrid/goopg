@@ -228,6 +228,30 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       Repro: `go test -v -run 'TestPort_RegressSuite' ./internal/testport/`
       with `-timeout 60m` and `GOOPG_REGRESS_DIFF_DIR=/tmp/rdiff` to capture the
       actual diffs, then bisect the ordering dependency.
+      **`errors` CLOSED 2026-07-28 — root-0031**
+      (`docs/design/root-0031-pg-inherits-restart-persistence.md`), and the
+      "mutating case" reading above is REFUTED for it. Bisecting the ordering
+      never converges because the trigger is nondeterministic: root-0029's
+      `clusterPoisoned` recovery RESTARTS the cluster after any 120 s timeout
+      (frequent under nightly co-load, never in an isolated repro), and
+      `pg_inherits` was a purely virtual catalog that no reload pass rebuilt —
+      so every case after a restart ran with all inheritance edges gone
+      (`ALTER TABLE emp RENAME COLUMN salary TO manager` *succeeded*, leaving two
+      `manager` columns). Fixed by making pg_inherits heap-backed
+      (`base/<dbOid>/2611`) + `loadInheritanceFromHeap`, plus the three PG-fidelity
+      bugs the restart had masked (qualified `RenameTable` message, missing
+      self-relation RENAME COLUMN collision check, `DROP AGGREGATE` resolving its
+      argument type after the name lookup). `errors` now PASSES in full-suite
+      ordering **in a run that took the restart path**; 5 ledger rows filed.
+      **Still open here:** re-verify `index_including`, `portals_p2`, `select`,
+      `select_distinct` at HEAD — some may have been collateral of the same
+      restart (`select`'s fixtures are not inheritance-based, so expect at least
+      one distinct cause). Cheap method proven this loop: run an alphabetical
+      PREFIX of the suite up to the target case
+      (`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`, cases are discovered
+      in `filepath.Glob` order) with `GOOPG_REGRESS_DIFF_DIR` — 63 cases ≈ 3.5 min
+      versus ~1 h for the full suite — and check the log for
+      `restarting the cluster` before reading anything into the ordering.
 - [x] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
       `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
       in the previous run"; repro:

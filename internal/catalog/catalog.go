@@ -12032,7 +12032,14 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 		return fmt.Errorf("relation %q does not exist", oldK)
 	}
 	if _, exists2 := ns.tables[newK]; exists2 {
-		return fmt.Errorf("relation %q already exists", newK)
+		// root-0031: report the BARE new relation name, not the schema-qualified
+		// catalog key. PG's RenameRelationInternal raises
+		// errmsg("relation \"%s\" already exists", newrelname) with the bare name
+		// (tablecmds.c) — the schema is already implied by the search path. The
+		// qualified form only surfaced once a table carried a non-empty Schema
+		// (e.g. every table reloaded from the pg_class heap after a restart),
+		// which made the message differ between a fresh and a restarted server.
+		return fmt.Errorf("relation %q already exists", new.Name)
 	}
 	// Re-key the table entry under the new name, preserving the pointer.
 	tbl.Schema = new.Schema
