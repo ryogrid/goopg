@@ -702,6 +702,44 @@ blocker; a code change landing mid-sweep voids the sweep.
         `bench/tpcds/runtime_goopg/tpcds-results/`, normalising whitespace to
         separate psql rendering from real divergence) — this is now part of the
         per-chunk procedure, not an M0124-0005 deliverable alone.
+      - **Chunk 12 (Q89–Q96) DONE** (`chunk-89-96.txt`, ~4 min, exit 0, baseline
+        `engine-id` reprinted unchanged). All eight cells are `OK` on both engines
+        and every row count reproduces set A — **no** new timeout/error/skip, so
+        every D6 list is unchanged from Q1–Q88. By value the chunk is the sweep's
+        worst: **Q94 and Q95 both return `0 / NULL / NULL`** against PG's
+        `9 / 18130.71 / -9444.12` and `57 / 85887.62 / -27169.36`, at a matching
+        row count of 1. Three defects root-caused this loop by read-only probe:
+        (1) **unpadded date literals** — PG accepts `'2002-5-01'`, goopg's
+        fixed-layout `time.Parse("2006-01-02", …)` does not; the cast path ERRORs
+        but the *comparison* path silently matches 0 rows, turning a compat gap
+        into a wrong answer (affects Q16/Q94/Q95) → **M0125-0007**;
+        (2) **SEMI + ANTI conjunction is not a subset** — with dates padded, Q94's
+        `EXISTS` alone and `NOT EXISTS` alone each match PG exactly (33/25 and
+        11/9), but together goopg returns 25/18 where PG returns 11/9; a conjunct
+        that *grows* the result is a hard correctness violation (the Semi/Anti
+        residual ↔ source-table pair of hard-won rule #2) → **M0125-0008**;
+        (3) **sibling `sum(CASE …)` aggregates collapse onto the first slot** —
+        `parserExprKey`'s fallback returns `fmt.Sprintf("expr:%T", e)`
+        (`internal/planner/planner.go:7484`), the Go type name with no content, so
+        every `*parser.CaseExpr` hashes identically and the 2nd..Nth pivot
+        aggregate is dropped as a duplicate at `planner.go:5844-5846`; **17 expr
+        types** share that fallback and the same key feeds GROUP BY matching. This
+        is the **third** recurrence of the failure mode already documented at
+        `planner.go:6905-6909` (`count(*)` vs `count(*) FILTER`, M0097-0032)
+        → **M0125-0009**. None fixed — the sweep forbids any engine commit before
+        Q99. **Back-applied the value diff to the whole sweep** (chunks 1–10 were
+        row-count-only): **Q16 was already wrong in chunk 2** — recorded `OK / 1`
+        while returning `0` vs PG's `45`. Restricted to cells fresh this sweep,
+        `OK` on both engines and equal in row count, **21 diverge by value** —
+        Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
+        Q94 Q95 — none ordering-only; Q7/Q26/Q83 are the answer-neutral
+        numeric-scale gap. Full per-query attribution filed as **M0124-0006**.
+        **NEXT: chunk `97-99`** — the FINAL chunk. Set A rows `^| 9[7-9] `; note
+        the on-disk `q97..q99` result files are STALE (set A) and were excluded
+        from the re-audit, so they must be re-run before any value claim. After it
+        lands, the sweep is complete and the merged deliverable
+        `analysis/tpcds-sf1-goopg-20260728.md` (confirm/refute the 13 §13.3
+        projections) is due — and the engine-commit freeze lifts.
       - One more guard correction landed after chunk 1 (doc D4a): the
         comparability key is `engine-id` (committed engine trees + digest of
         uncommitted engine edits), NOT the binary sha — `go build` stamps
@@ -794,6 +832,28 @@ blocker; a code change landing mid-sweep voids the sweep.
       aggregate, not the `LIMIT 100` window, so a PASS there is a finding about
       the window rather than a broken checksum.
       Design `docs/design/0124-0005-sf05-oracle-checksum-column.md`.
+- [ ] **M0124-0006 — attribute the 21 value-divergent OK cells of the re-sweep**
+      (raised by M0124-0001 chunk 12; **due before the merged deliverable**). The
+      sweep's headline finding — "row counts reproduce set A" — is now known to be
+      much weaker than "goopg agrees with PG". Chunks 1–10 were checked on row
+      counts only; value diffing began at chunk 11, and back-applying it exposed
+      **Q16 wrong since chunk 2** (`OK / 1 row`, goopg `0` vs PG `45`). Restricted
+      to cells fresh this sweep, `OK` on both engines, and equal in row count,
+      **21 diverge by value and none are ordering-only**:
+      `Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
+      Q94 Q95`. Sampling attributes some already — Q87 → M0125-0006; Q16/Q94/Q95
+      → M0125-0007; Q43/Q50/Q66 (and probably Q2/Q39) → M0125-0009; Q7/Q26/Q83 are
+      the answer-neutral numeric-scale gap (no `select_div_scale`) — but the rest
+      are **unattributed**, and an unattributed value divergence may be a defect
+      nobody has filed. Method: `diff <(norm goopg) <(norm pg)` per cell,
+      classifying each as (a) an existing filed defect, (b) answer-neutral
+      rendering/scale, or (c) NEW — file it. Record the verdict per query in
+      `RESULTS.md`. **Do not re-run the sweep for this**; the result files are on
+      disk. Note Q97–Q99's files are STALE (set A) and must be excluded until
+      chunk 13 runs — excluded is not the same as agreeing, and the same caveat
+      applies to any cell whose file predates 2026-07-28.
+      Design: fold into `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`
+      (extend D-series with a value-comparison rule) rather than a new doc.
 
 ## M0125 — TPC-DS timeout class & planner expression-walker extinction (filed 2026-07-28)
 
@@ -973,6 +1033,94 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **Blocked until the M0124-0001 sweep reaches Q99** (no engine commit may land
       before then); it is a parser/planner change, so it additionally requires
       `tpch-spotcheck.sh` + the SF0.5 gate + `make plan-diff` per the pre-commit bar.
+- [ ] **M0125-0007 — date input rejects unpadded month/day, and the comparison
+      path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). PG's `DecodeDate`/`ParseDateTime`
+      (`postgres/src/backend/utils/adt/datetime.c`) accept 1-or-2-digit month and
+      day fields; goopg parses with a fixed Go layout
+      `time.Parse("2006-01-02", …)` (`internal/executor/expr.go:2874`, sibling
+      `parseDateFields` at `internal/pgnodes/datum.go:974`) and requires
+      zero-padding. **Two sibling paths disagree, which is the real defect**:
+      `cast('2002-5-01' as date)` / `date '2002-5-01'` / `'2002-5-01'::date` all
+      raise `invalid input syntax for type date`, but `d_date = '2002-5-01'`
+      raises nothing and **matches 0 rows**. A compat gap that errors is loud; one
+      that silently returns the empty set is a wrong answer — TPC-DS Q94 and Q95
+      report `0 / NULL / NULL` at a matching row count of 1, and Q16 did the same
+      undetected since chunk 2 (`0` vs PG `45`). Single-digit *day*
+      (`'2002-05-1'`) is affected identically.
+      **Accept by VALUE**: `select '2002-5-01'::date` = `2002-05-01`; the
+      comparison and cast paths agree on every form; TPC-DS Q16/Q94/Q95 asserted
+      against PG (Q95 = `57 / 85887.62 / -27169.36`; Q94 needs M0125-0008 too).
+      Sibling-path check per Hard-won Rule #2 — audit **every** date/time entry
+      point together (executor cast, implicit coercion in `codec.go:346`, COPY's
+      `copy_text.go:818`, `pgnodes/datum.go:974`), and cover timestamp/time as
+      well: the same fixed-layout idiom likely rejects unpadded hours. Prefer a
+      shared PG-faithful field decoder over per-site `time.Parse` layouts.
+      Design `docs/design/0125-0007-pg-faithful-date-field-decode.md`.
+      **Blocked until the sweep reaches Q99**; executor/codec change, so it
+      requires `tpch-spotcheck.sh` + the SF0.5 gate per the pre-commit bar, plus
+      the full regress-port suite (Hard-won Rule #5 — this is a codec change).
+- [ ] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
+      NON-SUBSET result** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). With TPC-DS Q94's date literals padded so M0125-0007 is out of
+      the way, each correlated subquery is correct **alone** — base joins 33 rows
+      / 25 distinct orders (= PG), `+ EXISTS (… ws_warehouse_sk <> …)` 33/25
+      (= PG), `+ NOT EXISTS (web_returns …)` 11/9 (= PG) — but **together goopg
+      returns 25/18 where PG returns 11/9**. 25 is not a subset of the 11 that the
+      anti-join alone admits: adding a conjunct *grew* the result, so a residual
+      predicate is being dropped or mapped to the wrong source relation when a
+      SEMI and an ANTI join coexist over one outer rel. This is precisely the
+      "Semi/Anti residual ↔ source-table mapping" sibling pair named in Hard-won
+      Rule #2. PG control: the padded query returns `9 | 18130.71 | -9444.12`,
+      byte-identical to the unpadded run, so padding does not confound it.
+      **Start at** the semi/anti residual + `SourceTableIdx` mapping in
+      `internal/planner/` join construction (the M0077 Q21 work touched the same
+      mapping) and the anti-join operator in `internal/executor/`.
+      **Accept by VALUE**: the four-row isolation matrix above as a planner/executor
+      test (each subquery alone AND the conjunction), the monotonicity invariant
+      (result of `base + p + q` ⊆ result of `base + q`) asserted directly, and
+      TPC-DS Q94 = `9 | 18130.71 | -9444.12`. Design
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md`.
+      **Blocked until the sweep reaches Q99**; planner/executor change → full
+      pre-commit bar (`tpch-spotcheck.sh`, SF0.5 gate, `make plan-diff`).
+- [ ] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
+      sibling aggregates** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). **One-line root cause, wide blast radius.** Aggregate dedup
+      keys are built by `aggregateCallKey` → `parserExprKey`
+      (`internal/planner/planner.go:6891`, `:7425`), whose fallback is
+      `return fmt.Sprintf("expr:%T", e)` (**`planner.go:7484`**) — the Go type
+      name, carrying **no expression content**. Every `*parser.CaseExpr` therefore
+      hashes to the identical key, so the 2nd..Nth `sum(CASE …)` in one SELECT are
+      discarded as duplicates (`planner.go:5844-5846`) and every sibling pivot
+      column reads the **first** aggregate's slot. Reproducer:
+      `select sum(case when d_day_name='Sunday' then 1 else 0 end),
+      sum(case when d_day_name='Monday' then 1 else 0 end) from date_dim`
+      → goopg `10435|10435`, PG `10435|10436`. Controls that pin it (all correct
+      in goopg): distinct agg function names, `sum(d_dom+1), sum(d_dom+2)`
+      (`BinaryOp` has a real case), and `sum(col), sum(CASE …)` (mixed shapes).
+      **17 expression types share the fallback** — `CaseExpr`, `ExtractExpr`,
+      `InExpr`, `RowExpr`, `SubqueryExpr`, `ExistsExpr`, `IntervalLit`,
+      `ArrayConstructorExpr`, `ArraySubqueryExpr`, `ArraySubscriptExpr`,
+      `CollateExpr`, `IsBoolExpr`, `GroupingCall`, `TypedStringLit`,
+      `DefaultMarker`, `IndirectionStar`, `PartitionRangeBoundKeyword` — so the
+      class is far broader than CASE, and **the same key feeds GROUP BY matching**
+      (see the M0097-0003 comment at `planner.go:7443`), so grouping by two
+      distinct CASE expressions is suspect too. This is the **third** recurrence of
+      one failure mode: `planner.go:6905-6909` documents `count(*)` vs
+      `count(*) FILTER (WHERE …)` collapsing identically (M0097-0032), and
+      M0097-0003 the ColumnRef case. **Fix the fallback, not another special
+      case** — make the default path either recurse structurally over all
+      `parser.Expr` children or fail loudly (an unknown expr type must never
+      silently compare EQUAL to a different instance of the same type); a
+      deparse-based or reflective key would close all 17 at once. Add an
+      exhaustiveness test so a newly added Expr type cannot re-open this.
+      **Accept by VALUE**: the reproducer + control matrix as planner unit tests,
+      one test per previously-unhandled type, and the TPC-DS pivot queries
+      (Q43/Q50/Q66/Q2/Q39) asserted against PG.
+      Design `docs/design/0125-0009-parser-expr-key-structural.md`.
+      **Blocked until the sweep reaches Q99**; planner change → full pre-commit bar.
+      Likely the single highest-value fix in the TPC-DS programme: it silently
+      corrupts every pivot-style aggregate query while keeping row counts intact.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

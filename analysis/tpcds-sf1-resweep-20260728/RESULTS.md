@@ -124,6 +124,14 @@ Budget 600 s. "set A" = `analysis/tpcds-sf1-goopg-20260727.md` §5.2, same SF an
 | 86 | ERROR 0 s | 0 | SKIP | — | ERROR 0 s / 0 | **not a goopg error** — dsqgen artefact (`syntax error … expected ')' after SELECT`), fails on PG too; joins Q36/Q70 |
 | 87 | **OK 35 s** | 1 | OK 2 s | 1 | OK 36 s / 1 | **row count matches but the ANSWER IS WRONG**: goopg `47218` vs PG `47049`. Root-caused this loop to a parser set-op associativity defect — see "Chunk 81–88" below |
 | 88 | TIMEOUT 638 s | 0 | OK 1 s | 1 | TIMEOUT 660 s / 0 | goopg-only timeout; unbounded above; reproduces set A |
+| 89 | OK 43 s | 100 | OK 1 s | 100 | OK 41 s / 100 | rows = PG; values match after whitespace normalisation |
+| 90 | OK 19 s | 1 | OK 1 s | 1 | OK 19 s / 1 | rows = PG; byte-identical output |
+| 91 | OK 5 s | 1 | OK 0 s | 1 | OK 5 s / 1 | rows = PG; byte-identical output |
+| 92 | OK 5 s | 1 | OK 0 s | 1 | OK 4 s / 1 | rows = PG; byte-identical output |
+| 93 | OK 31 s | 0 | OK 0 s | 0 | OK 31 s / 0 | rows = PG; byte-identical output (empty) |
+| 94 | **OK 23 s** | 1 | OK 1 s | 1 | OK 24 s / 1 | **row count matches, ANSWER WRONG**: goopg `0 / NULL / NULL` vs PG `9 / 18130.71 / -9444.12`. **Two independent defects** — see "Chunk 89–96" below |
+| 95 | **OK 62 s** | 1 | OK 32 s | 1 | OK 60 s / 1 | **row count matches, ANSWER WRONG**: goopg `0 / NULL / NULL` vs PG `57 / 85887.62 / -27169.36`; unpadded-date-literal defect (same as Q94's first) |
+| 96 | OK 29 s | 1 | OK 0 s | 1 | OK 31 s / 1 | rows = PG; byte-identical output |
 
 Chunk 1–8 reproduces set A on every cell, so nothing between the two sweeps
 changed Q1–Q8 behaviour. `reap_pg_orphans` was **not** idle: PG's Q4 timeout left
@@ -599,6 +607,120 @@ per-chunk procedure rather than an M0124-0005 deliverable alone. Q75 does not
 join them (it left the OK class entirely), but its set-A row *match* is likewise
 known to have been value-corrupt.
 
+## Chunk 89–96 — two new wrong-answer defects, and a sweep-wide value re-audit
+
+All 8 cells are `OK` on both engines and every row count reproduces set A, so by
+the pre-chunk-11 criterion this chunk was uneventful. By **value** it is the
+worst chunk of the sweep: Q94 and Q95 both return `0 / NULL / NULL` against PG's
+real aggregates, at a matching row count of 1.
+
+**Defect 1 — unpadded date literals (Q16, Q94, Q95).** PG accepts single-digit
+month/day fields (`'2002-5-01'`); goopg does not. Two *sibling paths disagree*,
+which is what made this silent:
+
+| form | goopg | PG |
+|---|---|---|
+| `cast('2002-5-01' as date)`, `date '2002-5-01'`, `'2002-5-01'::date` | **ERROR** `invalid date … parsing time "2002-5-01" as "2006-01-02"` | `2002-05-01` |
+| `d_date = '2002-5-01'` (implicit coercion) | **0 rows, no error** | 1 row |
+| `d_date = '2002-05-01'` (padded control) | 1 row | 1 row |
+| `d_date = '2002-05-1'` (single-digit *day*) | **0 rows** | 1 row |
+
+The comparison path silently matching nothing is worse than the cast path's
+error: it converts a compat gap into a wrong answer. Root cause is a Go
+fixed-layout parse (`time.Parse("2006-01-02", …)`, `internal/executor/expr.go:2874`;
+sibling `internal/pgnodes/datum.go:974 parseDateFields`) where PG uses
+`ParseDateTime`/`DecodeDate` (`postgres/src/backend/utils/adt/datetime.c`), which
+accepts 1-or-2-digit fields. Affected TPC-DS queries are exactly those whose text
+carries an unpadded literal: `query16.sql` (`'2002-4-01'`), `query94.sql`
+(`'2002-5-01'`), `query95.sql` (`'2001-4-01'`). Filed **M0125-0007**.
+
+**Defect 2 — SEMI + ANTI conjunction is not a subset (Q94).** With the dates
+padded so defect 1 is out of the way, goopg *still* disagrees with PG. Each
+subquery is correct **alone**; only their conjunction breaks:
+
+| Q94 predicate set (dates padded) | goopg rows / distinct orders | PG |
+|---|---|---|
+| base joins only | 33 / 25 | 33 / 25 ✅ |
+| base + `EXISTS (… ws_warehouse_sk <> …)` | 33 / 25 | 33 / 25 ✅ |
+| base + `NOT EXISTS (web_returns …)` | 11 / 9 | 11 / 9 ✅ |
+| base + **both** (full Q94) | **25 / 18** | 11 / 9 ❌ |
+
+goopg's 25 rows are **not a subset of the 11** that `NOT EXISTS` alone yields —
+adding a conjunct grew the result, so this is a hard correctness violation, not a
+tie-break or ordering artefact. This is the Semi/Anti residual ↔ source-table
+mapping pair named in the project's hard-won rule #2. PG control: the padded
+query returns `9 | 18130.71 | -9444.12`, identical to unpadded, so padding is
+semantically neutral and does not confound the isolation. Filed **M0125-0008**.
+
+**Defect 3 — sibling `sum(CASE …)` aggregates collapse onto the first slot.**
+Found by back-applying the value diff to the whole sweep (below). goopg emits the
+*first* pivot column's value in every sibling pivot column:
+
+```
+Q43 goopg: able | AAAAAAAACAAAAAAA | 517884.59 | 517884.59 | 517884.59 | …(×7)
+Q43 pg   : able | AAAAAAAACAAAAAAA | 517884.59 | 469230.50 | 505832.67 | …
+Q50 goopg: … | 67 | 67 | 67 | 67 | 67
+Q50 pg   : … | 67 | 48 | 61 | 66 | 98
+```
+
+Minimal reproducer and the controls that pin it:
+
+| query | goopg | PG |
+|---|---|---|
+| `sum(case … 'Sunday' …), sum(case … 'Monday' …), sum(case … 'Tuesday' …)` | `10435\|10435\|10435` ❌ | `10435\|10436\|10436` |
+| same with `GROUP BY d_year` | `53\|53` ❌ | `53\|52` |
+| `sum(case … d_dom …), sum(case … d_moy …)` (different source cols) | `2400\|2400` ❌ | `2400\|6200` |
+| `sum(case …), count(case …)` (different agg funcs) | ✅ | — |
+| `sum(d_dom+1), sum(d_dom+2)` (arith exprs) | ✅ | — |
+| `sum(d_dom), sum(case …)` (mixed shapes) | ✅ | — |
+
+Root cause is exact and one line: aggregate dedup keys come from
+`aggregateCallKey` → `parserExprKey` (`internal/planner/planner.go:6891`, `:7425`),
+whose fallback is `return fmt.Sprintf("expr:%T", e)` (**`planner.go:7484`**) — the
+Go *type name only*, with no expression content. Every `*parser.CaseExpr`
+therefore hashes to the identical key `expr:*parser.CaseExpr`, so the second and
+later `sum(CASE …)` are dropped as duplicates (`planner.go:5844-5846`) and all
+sibling columns read the first aggregate's slot. The controls above are exactly
+what that predicts: `BinaryOp` and `ColumnRef` have real cases in the switch, so
+they discriminate; distinct agg *function names* differ earlier in
+`aggregateCallKey`. **17 expression types hit that fallback** — `CaseExpr`,
+`ExtractExpr`, `InExpr`, `RowExpr`, `SubqueryExpr`, `ExistsExpr`, `IntervalLit`,
+`ArrayConstructorExpr`, `ArraySubqueryExpr`, `ArraySubscriptExpr`, `CollateExpr`,
+`IsBoolExpr`, `GroupingCall`, `TypedStringLit`, `DefaultMarker`, `IndirectionStar`,
+`PartitionRangeBoundKeyword` — so the class is broader than CASE, and the same key
+feeds GROUP BY matching (see the `M0097-0003` comment at `planner.go:7443`). This
+is the **third** recurrence of one failure mode: `planner.go:6905-6909` records
+`count(*)` vs `count(*) FILTER (WHERE …)` collapsing for the same reason
+(M0097-0032). Filed **M0125-0009**.
+
+### Sweep-wide value re-audit (back-application of the chunk-11 procedure)
+
+Chunks 1–10 were checked on row counts only; value diffing began at chunk 11. Q16
+proved that gap is not theoretical — it was recorded `OK / 1 row` in chunk 2 while
+returning `0` against PG's `45`. So the diff was back-applied to every retained
+result file. Restricting to cells that are **fresh this sweep, `OK` on both
+engines, and equal in row count**, and separating ordering from content
+(`diff <(norm x|sort) <(norm y|sort)`), **21 cells diverge by value**:
+
+`Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87 Q94 Q95`
+
+None are ordering-only. Sampling classifies them into the defects above plus the
+known numeric-scale gap (Q7/Q26/Q83 are `0.00` vs `0.00000000000000000000`,
+answer-neutral). A full per-query attribution of the remaining cells is **not**
+done here — it is a task in its own right, filed as **M0124-0006**, and it must
+land before the merged deliverable, because the sweep's headline claim ("row
+counts reproduce set A") is now known to be a much weaker statement than
+"goopg agrees with PG".
+
+Caveat on scope: the back-audit covers only queries whose result files are fresh
+(mtime 2026-07-28). Q97–Q99 have not run in this sweep; their on-disk files are
+stale and were excluded, not counted as agreeing.
+
+Running timeout/error classification (D6), Q1–Q96 — chunk 89–96 contributed **no**
+new timeout, error, or PG-skip cell, so every D6 list is unchanged from Q1–Q88.
+The answer-mismatch list is not: it gains **Q94** and **Q95** by value, and the
+re-audit adds the 21-cell list above.
+
 ## Cursor
 
-`M0124-0001 sweep: 1-88 done; next 89-96.`
+`M0124-0001 sweep: 1-96 done; next 97-99 (final chunk).`
