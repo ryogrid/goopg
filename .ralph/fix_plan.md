@@ -303,9 +303,27 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       `GOOPG_REGRESS_DIFF_DIR`, and ALWAYS grep the log for
       `restarting the cluster` / `restart failed` before reading anything into a
       case's result.
-- [ ] **server/TestRestartAfterRetention — root-0032 regressed a pass-required
-      unit test.** Found while gating root-0034 (it is red at HEAD and is NOT
-      caused by that change — verified by stashing it). `go test -run
+- [x] **server/TestRestartAfterRetention — root-0032 regressed a pass-required
+      unit test.** FIXED 2026-07-28 as **root-0035**
+      (`docs/design/root-0035-wal-segment-size-derived-from-stream.md`). The
+      hypothesis below was wrong in its mechanism: nothing is wrong with the
+      `xl_heap_insert` redo arm. The LSN in the message gives it away —
+      `301990201 = 18 × 16 MiB`, while the cluster's own checkpoints
+      (`17207361`, `18882449`, `segments_removed=16`) are segment 16/18 of a
+      **1 MiB** stream. `readAllUncached` anchors at
+      `baseOffset = firstSegNo * segmentSize`, and every recovery entry point
+      passes `segmentSize = 0` → `DefaultSegmentSize`; nothing on that path ever
+      learned the cluster's real size (`OpenOptions.WALSegmentSize` fed only the
+      writer). LSNs 16× too large disarm redo's `pd_lsn` idempotency check, so
+      startup re-applied already-applied inserts until the page overflowed. The
+      bug predates root-0032 — root-0032's contrecord skip only made the path
+      decode records at all. Fix derives the size from `xlp_seg_size` the way
+      `pg_waldump`'s `search_directory()` does. Note for future loops:
+      `RALPH_PRECOMMIT_SCOPE=units` does NOT cover `internal/server` (verified
+      2026-07-28: green at HEAD while this test was red), which is why two loops
+      shipped over it — the nightly batch is the only gate that sees it.
+      Original triage below.
+      `go test -run
       TestRestartAfterRetention ./internal/server/` fails deterministically in
       1.9 s with
       `initdb.Open: goopg: wal replay: replay record 0 lsn[301990201,301990520]:

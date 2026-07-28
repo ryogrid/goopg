@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,10 +29,6 @@ type Record struct {
 // need to know which format is in use — the same call site handles
 // both during the M0014 rollout window.
 func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
-	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
-	}
-
 	// M0045-0001/0003: WAL retention may remove segment 0.  Determine
 	// the first retained segment so (a) we read the correct files and
 	// (b) we offset all LSN values by firstSegNo*segmentSize so that
@@ -46,6 +43,24 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 		return nil, nil
 	}
 	firstSegNo := uint64(firstSegNoI)
+
+	// root-0035: a caller that does not know the cluster's
+	// wal_segment_size passes 0, which used to mean DefaultSegmentSize
+	// (16 MiB) — wrong for any cluster built with a different size, and
+	// wrong in a way that is silent and destructive: baseOffset below is
+	// firstSegNo*segmentSize, so every StartLSN/EndLSN comes out 16× too
+	// large, the pd_lsn idempotency check in replay never fires, and redo
+	// re-applies records the running server had already applied. Derive
+	// it from the stream itself instead, exactly as upstream's stand-alone
+	// WAL readers do (pg_waldump.c search_directory() takes WalSegSz from
+	// the first file's longhdr->xlp_seg_size and validates it with
+	// IsValidWalSegSize).
+	if segmentSize <= 0 {
+		segmentSize = detectSegmentSizeAt(walDir, firstSegNo)
+	}
+	if segmentSize <= 0 {
+		segmentSize = DefaultSegmentSize
+	}
 
 	stream, err := readStreamFrom(walDir, segmentSize, firstSegNo)
 	if err != nil {
@@ -319,6 +334,47 @@ func firstAvailableSegment(walDir string) (int64, error) {
 	}
 	sort.Slice(segNos, func(i, j int) bool { return segNos[i] < segNos[j] })
 	return int64(liveSegmentRunStart(segNos)), nil
+}
+
+// IsValidWalSegSize mirrors upstream's IsValidWalSegSize
+// (postgres/src/include/access/xlog_internal.h): a power of two between
+// 1 MB and 1 GB. Used to sanity-check a wal_segment_size read out of an
+// on-disk long page header before trusting it.
+func IsValidWalSegSize(size int64) bool {
+	return size >= 1<<20 && size <= 1<<30 && size&(size-1) == 0
+}
+
+// detectSegmentSizeAt returns the cluster's wal_segment_size as recorded in
+// the long page header at the head of segment segNo, or 0 when it cannot be
+// determined (unreadable file, short read, non-long header, or a value that
+// fails IsValidWalSegSize).
+//
+// Every segment file begins on a segment boundary, so buildPageHeader always
+// emits the LONG form there with xlp_seg_size set to the writer's configured
+// segment size — the same cross-check field upstream validates in
+// XLogReaderValidatePageHeader and the same one pg_waldump's search_directory()
+// uses to discover WalSegSz before it has any cluster context. Reading it back
+// is therefore the authoritative answer for a caller that only has a directory
+// path, and it costs one 40-byte read.
+func detectSegmentSizeAt(walDir string, segNo uint64) int64 {
+	f, err := os.Open(filepath.Join(walDir, formatSegmentName(segNo)))
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, SizeOfXLogLongPHD)
+	if n, rerr := io.ReadFull(f, buf); rerr != nil || n != SizeOfXLogLongPHD {
+		return 0
+	}
+	long, err := DecodeXLogLongPageHeader(buf)
+	if err != nil {
+		return 0
+	}
+	size := int64(long.SegSize)
+	if !IsValidWalSegSize(size) {
+		return 0
+	}
+	return size
 }
 
 // liveSegmentRunStart returns the first segment number of the longest

@@ -3111,12 +3111,14 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 // the supplied Manager. Used by initdb.Open at startup so the
 // runtime's single Manager handles both the replay phase and
 // subsequent normal I/O. A missing or empty walDir is treated as
-// "nothing to replay" (a freshly initdb'd cluster). segmentSize
-// of 0 means use the default DefaultSegmentSize.
+// "nothing to replay" (a freshly initdb'd cluster).
+//
+// segmentSize of 0 means "the cluster's own wal_segment_size", which ReadAll
+// reads back from the stream's long page header (root-0035). It used to be
+// coerced to DefaultSegmentSize here, which made startup replay of a cluster
+// with a non-default segment size compute every record LSN against the wrong
+// base — see readAllUncached for why that silently defeats pd_lsn idempotency.
 func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error) {
-	if segmentSize == 0 {
-		segmentSize = DefaultSegmentSize
-	}
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		// Missing pg_wal on a fresh data dir is fine — no records
@@ -3911,10 +3913,9 @@ func checkpointStructOf(r Record) []byte {
 // Returns an error if WAL segments exist but no checkpoint is found —
 // this indicates an unrecoverable cluster state that requires
 // re-initialization.
+// segmentSize of 0 means "the cluster's own wal_segment_size" (root-0035);
+// ReadAll derives it from the stream rather than assuming DefaultSegmentSize.
 func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error) {
-	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
-	}
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		return 0, fmt.Errorf("wal: discover checkpoint: %w", err)
