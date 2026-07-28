@@ -1,39 +1,40 @@
 (idle — nothing in flight)
 
-Last loop (#50): M-NIGHTLY regress divergences — the surviving three were
-**never measured**, and the real defect was **crash restart**. Fixed as
-root-0032 (`docs/design/root-0032-crash-restart-wal-stream-anchoring.md`).
+Last loop (#5): M-NIGHTLY item (c) — the root-0032 §5 redo failure. Fixed and
+committed as **root-0033**
+(`docs/design/root-0033-redo-prune-redirect-only-compaction.md`).
 
-The prefix run through `select_distinct` (176 cases, 670 s) showed `misc`
-timed out, root-0029's recovery restart then FAILED, and all 53 remaining
-cases (#123..#176 — including `portals_p2`, `select`, `select_distinct`)
-reported a phantom `deferred: cluster restart failed`. Only `index_including`
-produced a genuine `output mismatch`. The restart failed with
-`wal replay: decode at offset 771751920: invalid record header: unknown
-rmid=31` — goopg could not start after a crash once retention had run.
-Reproduced standalone (`analysis/wal-crash-restart-repro.sh`: pgbench -c 16,
-kill -9, restart; fails at ~570 MB of WAL). Three causes, one theme — both
-scanners assumed the stream begins on a record boundary and stays valid:
-a hole in pg_wal (normal residue of a SIGKILL during `removeOldSegments`,
-which walks newest-first) was fatal; a segment opening with
-XLP_FIRST_IS_CONTRECORD had its continuation decoded as a record header
-(which was ALSO destroying 54–97 durable records on every clean reopen);
-and an unreadable tail was an error instead of PG's end-of-WAL.
+A crash under sustained write load left the cluster unstartable at
+`wal: xlog heap-update add new tuple: storage: not enough free space in page`.
+Root cause was a sibling divergence, not a WAL-format bug: the runtime pruner
+`pagePruneCore` (`internal/storage/prune.go`) compacts on BOTH arms — with the
+dead set when slots became unused, and with a **nil** dead set when the prune
+produced only redirects, because `VacuumHeapPageBySlots` repacks only
+`ItemIDNormal` survivors and a just-redirected chain root is `ItemIDRedirect`,
+so its body is reclaimed. The PG-format redo arm `replayDecodedXLogHeapPrune`
+(`internal/wal/recovery.go`, introduced by the A7 `EncodeHeapPruneOptPG` switch)
+guarded that repack on `len(unused) > 0`, so a redirect-only prune — the common
+pgbench HOT shape — skipped it and permanently shrank the replayed page's free
+space. The legacy native arm `replayHeapPruneOpt` in the same file always
+compacted, so only the PG-format sibling had drifted.
 
-Next M-NIGHTLY step (still open, preempts M0124): (a) re-run the same prefix
-and confirm it now REACHES `portals_p2`/`select`/`select_distinct`, then
-measure them; (b) `index_including`'s real divergence; (c) root-0032 §5 — the
-same repro now fails one stage later in redo (`heap-update add new tuple: not
-enough free space in page`), so a crash under load still leaves an unstartable
-cluster (ledger 2026-07-28); (d) the harness's phantom `deferred:` per case
-after a failed restart (ledger, same date). ALWAYS grep a suite log for
+Remaining M-NIGHTLY steps from the same investigation (all still open, they
+preempt M0124): (a) re-run the alphabetical regress PREFIX through
+`select_distinct` and finally MEASURE `portals_p2` / `select` /
+`select_distinct` — with root-0032 + root-0033 the restart should now succeed,
+so the 53 phantom `deferred: cluster restart failed` cases should disappear;
+(b) `index_including`'s real divergence (diffs land in `GOOPG_REGRESS_DIFF_DIR`);
+(d) the harness's phantom `deferred:` per case after a failed restart (ledger
+2026-07-28) — collapse the tail into one `regress/cluster-dead` item the way
+root-0029 collapsed the wedge. ALWAYS grep a suite log for
 `restarting the cluster` / `restart failed` before believing a case result.
 
-Gates run: `go test ./internal/wal/ ./internal/initdb/ ./internal/storage/`
-PASS; `go test -race ./internal/wal/` PASS; negative control on both halves of
-the fix (each new test fails with its fix disabled, so non-vacuous);
+Gates run: `analysis/wal-crash-restart-repro.sh LOADSEC=200 KILLAT=170` — HEAD
+FAILS, fixed build reports `RESTART_OK` (the defect itself, end to end);
+`go test ./internal/wal/ ./internal/storage/` PASS; `go test -race
+./internal/wal/` PASS; negative control on the new test (fails with the fix
+reverted: pd_upper 8112 vs 8160, so non-vacuous);
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (exit 0);
-pgbench smoke via the commit hook. tpch-spotcheck deliberately not run — no
-planner/executor/codec change (WAL read path only); the crash repro is the
-end-to-end evidence instead.
+pgbench smoke via the commit hook. tpch-spotcheck deliberately not run — WAL
+redo path only, no planner/executor/codec change.
 In-flight: none.

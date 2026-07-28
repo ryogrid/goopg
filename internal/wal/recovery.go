@@ -3065,12 +3065,22 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 			return fmt.Errorf("wal: xlog heap-prune redirect: %w", err)
 		}
 	}
-	if len(unused) > 0 {
+	// root-0033: compact whenever the record carries ANY prune action, not
+	// only when it has now-unused slots. The runtime sibling pagePruneCore
+	// (internal/storage/prune.go) runs VacuumHeapPageBySlots on BOTH arms —
+	// with the dead set when there are unused slots, and with a nil dead set
+	// when the prune produced only redirects — because a redirected chain
+	// root becomes ItemIDRedirect and its tuple body must be reclaimed by the
+	// repack. Guarding the repack on len(unused) made redo leave that body in
+	// place, so the replayed page held LESS free space than the runtime page
+	// and the next xl_heap_update redo failed with ErrNoSpaceInPage, leaving
+	// the cluster unstartable after a crash under write load. The native
+	// replayHeapPruneOpt below always compacts; this PG-format arm (A7) had
+	// drifted from both siblings.
+	if len(redirects) > 0 || len(unused) > 0 {
 		if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
 			return fmt.Errorf("wal: xlog heap-prune compact: %w", err)
 		}
-	}
-	if len(redirects) > 0 || len(unused) > 0 {
 		storage.MustHeader(page).SetPruneXID(0)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))

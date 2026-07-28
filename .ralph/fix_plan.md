@@ -260,10 +260,14 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       **Still open here:** (a) measure `portals_p2`, `select`, `select_distinct`
       at HEAD — re-run the same prefix and confirm it now reaches them; (b)
       `index_including`'s real divergence (diffs land in `GOOPG_REGRESS_DIFF_DIR`);
-      (c) the root-0032 §5 redo failure (`heap-update add new tuple: not enough
-      free space in page`) — a crash under sustained write load still leaves an
-      unstartable cluster, ledger row 2026-07-28, repro
-      `analysis/wal-crash-restart-repro.sh`; (d) the harness's phantom
+      ~~(c) the root-0032 §5 redo failure~~ **FIXED 2026-07-28 as root-0033**
+      (`docs/design/root-0033-redo-prune-redirect-only-compaction.md`): the
+      PG-format prune redo arm `replayDecodedXLogHeapPrune` guarded its
+      `VacuumHeapPageBySlots` repack on `len(unused) > 0`, so a **redirect-only**
+      prune (the common pgbench HOT shape) skipped the compaction the runtime
+      sibling `pagePruneCore` always performs — the replayed page kept the
+      redirected chain root's tuple body and the next `xl_heap_update` redo hit
+      `ErrNoSpaceInPage`. Same repro now reports `RESTART_OK`; (d) the harness's phantom
       `deferred:` per case after a failed restart (ledger row, same date).
       Cheap method (proven twice): run an alphabetical PREFIX of the suite up to
       the target case (`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`,
