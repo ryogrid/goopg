@@ -160,6 +160,25 @@ run_one() {
 # when engine-tree AND engine-binary match; restart_goopg re-checks the
 # binary after every rebuild.
 engine_tree_id() { git rev-parse "HEAD:internal" "HEAD:cmd" 2>/dev/null | tr '\n' ' '; }
+
+# engine_id — the identity a chunk is compared on: the COMMITTED engine trees
+# plus a digest of any UNCOMMITTED engine edit. Neither term moves when a docs
+# or tracker commit lands, and the second term is what catches the working-tree
+# build that mis-provenanced sweep-20260727-214619.
+#
+# Do NOT use the binary's sha256 for this: `go build` stamps vcs.revision,
+# vcs.time and vcs.modified into the image, so the sha changes on EVERY commit
+# and with dirt anywhere in the repo. Measured on the first chunk of this very
+# sweep: a docs-only commit moved it e6774c4f -> 8f0aac15 and the first-cut
+# guard cried "SWEEP VOID" over an engine whose source had not changed at all
+# (`git diff --stat <commit>^ <commit> -- internal cmd` was empty, and
+# `go build -buildvcs=false` reproduces one image across both). The binary sha
+# is still printed — it is the right provenance for "which image answered" —
+# but it is not the comparability key.
+engine_id() {
+    printf '%s diff=%s' "$(engine_tree_id)" \
+        "$(git diff HEAD -- internal cmd 2>/dev/null | sha256sum | cut -c1-12)"
+}
 engine_bin_sha() { [[ -f "${GOOPG_BIN}" ]] && sha256sum "${GOOPG_BIN}" | cut -c1-16 || echo "absent"; }
 
 # The on-disk binary is not necessarily the one SERVING the cluster: a server
@@ -175,10 +194,11 @@ running_engine_sha() {
     sha256sum "/proc/${pid}/exe" 2>/dev/null | cut -c1-16 || echo "unreadable"
 }
 ENGINE_BIN_SHA_AT_START="$(running_engine_sha)"
+ENGINE_ID_AT_START="$(engine_id)"
 
 echo "# TPC-DS SF=1 Benchmark — $(date -Iseconds)"
 echo "# goopg: $(git log --oneline -1)  PG: 18.3"
-echo "# engine-tree: $(engine_tree_id)"
+echo "# engine-id: ${ENGINE_ID_AT_START}"
 echo "# engine-binary: running=${ENGINE_BIN_SHA_AT_START} on-disk=$(engine_bin_sha) (${GOOPG_BIN})"
 if [[ "${ENGINE_BIN_SHA_AT_START}" != "$(engine_bin_sha)" ]]; then
     echo "# WARNING: the serving goopg predates the current build of ${GOOPG_BIN}."
@@ -214,11 +234,15 @@ restart_goopg() {
     }
     # server.sh start rebuilds from the working tree, so this restart is the
     # one place a mid-sweep engine change can enter unnoticed. Say so loudly.
-    local now; now="$(running_engine_sha)"
-    if [[ "${now}" != "${ENGINE_BIN_SHA_AT_START}" ]]; then
-        echo "      *** SWEEP VOID: engine binary changed mid-sweep" \
-             "(${ENGINE_BIN_SHA_AT_START} -> ${now}) — re-run this chunk ***"
-        ENGINE_BIN_SHA_AT_START="${now}"
+    local now; now="$(engine_id)"
+    if [[ "${now}" != "${ENGINE_ID_AT_START}" ]]; then
+        echo "      *** SWEEP VOID: engine source changed mid-sweep" \
+             "(${ENGINE_ID_AT_START} -> ${now}) — re-run this chunk ***"
+        ENGINE_ID_AT_START="${now}"
+    else
+        # Same source; the image sha still moves because of the VCS stamp.
+        # Report it so the chunk records which image answered.
+        echo "      (engine source unchanged; image now $(running_engine_sha))"
     fi
 }
 

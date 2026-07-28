@@ -505,9 +505,24 @@ blocker; a code change landing mid-sweep voids the sweep.
         `engine-tree:`/`engine-binary: running=… on-disk=…` (running = sha256 of
         `/proc/<postmaster>/exe`; the serving image was 16 h stale at loop start)
         and `restart_goopg` prints `*** SWEEP VOID … ***` on a mid-sweep change.
-        Sweep baseline: `engine-binary e6774c4f5e22f2fa`, `engine-tree
-        bba744a8… c47d4ed6…`, `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`. Every
-        later chunk must reprint those two values unchanged.
+        Sweep baseline: `engine-id bba744a8… c47d4ed6… diff=e3b0c44298fc`,
+        `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`. Every later chunk must reprint
+        that `engine-id` unchanged.
+      - **Chunks 1–8 DONE** (`analysis/tpcds-sf1-resweep-20260728/`:
+        `chunk-1-4.txt`, `chunk-5-8.txt`, running table `RESULTS.md`).
+        All eight cells reproduce set A at the same 600 s budget — Q1 246 s/100,
+        Q2 27 s/2513, Q3 15 s/31, Q4 TIMEOUT on **both** engines, Q5 goopg-only
+        TIMEOUT, Q6 57 s/44 (PG 140 s), Q7 64 s/100, Q8 ERROR `column ref
+        ca_zip/57 out of MaterializedSlot range 1` with the server surviving
+        (confirms the §13.3 "contained, not fixed" projection). The reap earned
+        its keep on the first PG timeout: Q4 left one backend running and it was
+        terminated. **NEXT: chunk `9-16`.**
+      - One more guard correction landed after chunk 1 (doc D4a): the
+        comparability key is `engine-id` (committed engine trees + digest of
+        uncommitted engine edits), NOT the binary sha — `go build` stamps
+        `vcs.revision`/`vcs.modified`, so the docs commit alone moved the image
+        and the first-cut guard printed a false `*** SWEEP VOID ***` in
+        `chunk-1-4.txt`. That chunk stands; `RESULTS.md` carries the proof.
 - [ ] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
       (§13.5 #5). Phases 1.2/1.3 landed while `tpch-spotcheck.sh` reported SKIPPED
       and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the

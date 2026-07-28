@@ -1,47 +1,42 @@
-(idle — nothing in flight)
+Task: **M0124-0001** — TPC-DS SF=1 dual-engine re-sweep at HEAD, chunked.
+Status: once-per-sweep prerequisites DONE + **chunks 1–8 DONE**.
 
-Last loop (#8): landed **root-0036** — M-NIGHTLY item (e)'s `regress/select_distinct`
-is green. Committed + pushed.
+Files: `scripts/tpcds-bench-compare.sh` (reap_pg_orphans port + provenance
+guard), `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md` (D4 landed,
+D4a new, D5 corrected), `docs/design/README.md`, `.ralph/deferral_ledger.md`,
+`.ralph/fix_plan.md`, `analysis/tpcds-sf1-resweep-20260728/{s-cold-proof.txt,
+chunk-1-4.txt,chunk-5-8.txt,RESULTS.md}`.
 
-The whole divergence was one 20-row block returned reversed. `USING >` and the
-`person*` inheritance scan in the failing query are BOTH red herrings, and so is
-the harness's "normalization rules need extension" wording. Reduced:
-`SELECT DISTINCT p.age FROM person p ORDER BY age DESC` answered **ascending**;
-the unqualified `SELECT DISTINCT age FROM person ORDER BY age DESC` was fine.
-goopg dedups via a fixed ascending sort in `distinctOp` and re-applies ORDER BY
-with an outer Sort (M0097-0046) — that Sort was the sole carrier of direction and
-was silently dropped whenever its key failed to resolve. It usually failed:
-`resolveOrderBySubstitution` rewrites a bare ORDER BY name into the target's OWN
-(qualified) expression, while the outer ctx is schema-only with no bindings and
-`SchemaColumn` carries no table name. 7 of 8 measured shapes were wrong. Fix adds
-a positional arm (star targets) + `distinctSortKeyOutputIndex` (resolve against
-the surface that built the targets, match `proj.Targets` by `exprEqual`).
+Key symbols: `reap_pg_orphans`, `engine_id`, `running_engine_sha`,
+`restart_goopg` (all in `scripts/tpcds-bench-compare.sh`).
 
-**NEXT LOOP — M0124-0001, chunk 1 (2026-07-28(b) re-prioritisation):**
-- Run `scripts/tpcds-bench-compare.sh 1-8` (foreground, Bash `timeout` 55 min,
-  `ENGINES="goopg pg" TIMEOUT_SEC=600 RESTART_AFTER_TIMEOUT=1`), stdout to
-  `analysis/tpcds-sf1-resweep-20260728/chunk-1-8.txt`. Then carry the cursor
-  (`M0124-0001 sweep: 1-8 done; next 9-16`) here. Full protocol: the "Chunked
-  execution" note on the M0124-0001 task in fix_plan.md + design doc
-  `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`.
-- **M-NIGHTLY is PARKED** (banner amendment 2026-07-28(b)): keep FILING new
-  `AI-` items each loop, do not select them. The two remaining regress cases
-  (`portals_p2`, `select`) and the phantom-`deferred:` harness item (d) keep
-  their resume notes on the parked task in fix_plan.md — do NOT start them.
-- No engine commit may land until the sweep completes: every chunk header prints
-  `# goopg: <git log -1>` and they must all name the same SHA.
+Findings:
+- **Sweep baseline (must be reprinted unchanged by every later chunk):**
+  `engine-id bba744a817f7ebdec31fd47edfed40362641dd0c
+  c47d4ed683a0ac63d56c7f755e70892a635f3a42 diff=e3b0c44298fc`,
+  `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`, `RESTART_AFTER_TIMEOUT=1`, S-cold.
+- Q1–Q8 reproduce set A cell-for-cell at the same 600 s budget (Q4 TIMEOUTs on
+  BOTH engines; Q5 goopg-only TIMEOUT; Q8 ERROR `column ref ca_zip/57 out of
+  MaterializedSlot range 1`, server survives). Table: `RESULTS.md`.
+- The `*** SWEEP VOID ***` line in `chunk-1-4.txt` is a FALSE POSITIVE — do not
+  re-run that chunk. `go build` stamps `vcs.revision/modified`, so a docs commit
+  moves the binary sha; the guard now keys on `engine-id`. Proof in RESULTS.md.
+- D5's original S-cold query was vacuous (`'public'::regnamespace` matches
+  nothing on goopg); ledger row 2026-07-28 filed for missing `regnamespacein`.
+- The reap is not decorative: PG's Q4 timeout left one live backend, reaped.
 
-**Standing gotchas:** `RALPH_PRECOMMIT_SCOPE=units` does NOT cover
-`internal/server` — run it explicitly. Neither `tpch-spotcheck.sh` nor the TPC-DS
-SF0.5 gate can see a wrong-order/right-rows bug (both are row-count only) — new
-ledger row 2026-07-28. TPC-DS Q54 reliably kills the capped sf05 server (matches
-its recorded TIMEOUT baseline); don't read that as a regression.
+NEXT LOOP — continue M0124-0001, **chunk `9-16`** (banner: M0124 → M0125;
+M-NIGHTLY stays PARKED — keep FILING `## AI-` items, do not select them):
+  `ENGINES="goopg pg" TIMEOUT_SEC=600 RESTART_AFTER_TIMEOUT=1 \
+   scripts/tpcds-bench-compare.sh 9-16 > \
+   analysis/tpcds-sf1-resweep-20260728/chunk-9-16.txt 2>&1`
+Foreground, Bash `timeout` 55 min; SPLIT the range across two Bash calls if the
+set-A estimate exceeds ~45 min (set A: Q11 and Q14 are the expensive ones).
+Then append rows to `RESULTS.md` and move the cursor. No engine commit may land
+until the sweep reaches Q99 — a docs/tracker commit is fine (engine-id unmoved).
 
-Gates run: new non-vacuous `TestDistinctHonoursOrderByDirection` (7/10 subtests
-red with the planner hunk stashed); `TestPort_RegressSuite/select_distinct`
-SKIP→PASS (negative control confirmed SKIP before the fix); `go test
-./internal/planner/ ./internal/executor/ ./internal/server/` PASS;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); TPC-DS Q41/Q6/Q87 on sf05 match
-oracle + 2026-07-27 baseline; pgbench smoke via the commit hook.
+Gates run: `bash -n` + live header/dry-run of the harness; reap SQL smoke on
+65438 (0 victims, exit 0) and a real reap during chunk 1-4;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS; pgbench
+smoke via the commit hook (13.2k TPS); `make ralph-state-guard` OK.
 In-flight: none.

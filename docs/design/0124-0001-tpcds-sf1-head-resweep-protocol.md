@@ -124,17 +124,38 @@ start of this loop: the SF=1 server had been up 16 h on image `4140b160…` (sho
 either the commit or the on-disk build would have described an engine that answered nothing.
 
 The header therefore carries three lines: `git log -1` (kept, for readability),
-`# engine-tree:` (`git rev-parse HEAD:internal HEAD:cmd` — immune to docs commits), and
-`# engine-binary: running=<sha> on-disk=<sha>`, where `running` is the sha256 of
-`/proc/$(head -1 $TPCDS_PGDATA/postmaster.pid)/exe`. A mismatch prints a restart warning
-before any query runs, and `restart_goopg` re-checks after each rebuild, printing
-`*** SWEEP VOID: engine binary changed mid-sweep ***`. `go build` is deterministic for this
-target (verified: two builds of an unchanged tree → identical sha256), so the guard does not
-false-positive across the restarts the protocol itself performs.
+`# engine-id:`, and `# engine-binary: running=<sha> on-disk=<sha>`, where `running` is the
+sha256 of `/proc/$(head -1 $TPCDS_PGDATA/postmaster.pid)/exe`. An on-disk/running mismatch
+prints a restart warning before any query runs, and `restart_goopg` re-checks `engine-id`
+after each rebuild, printing `*** SWEEP VOID: engine source changed mid-sweep ***`.
 
-**Comparability rule, restated:** chunks are comparable when `engine-tree` **and**
-`engine-binary` match. A differing `git log -1` with identical tree+binary is a docs commit
-and does not void anything.
+**`engine-id`, not the binary's sha256 — corrected on chunk 1 of this sweep.** The first cut
+compared the binary image, on the reasoning that `go build` is deterministic (it is: two
+builds of an unchanged tree gave one sha). That is true and irrelevant, because the toolchain
+stamps `vcs.revision`, `vcs.time` and `vcs.modified` into the image. The docs-only commit
+that landed these very harness changes moved the image `e6774c4f → 8f0aac15`, and the guard
+duly cried `SWEEP VOID` over an engine whose source had not changed — a **false positive that
+would have condemned a good 21-minute chunk**. Proof the source was identical:
+`git diff --stat 6d6bd1ea^ 6d6bd1ea -- internal cmd` empty, `git status --porcelain --
+internal cmd` empty, and `go build -buildvcs=false` reproducing one image (`33e7d081…`)
+across both revisions.
+
+`engine-id` is therefore the committed engine trees **plus** a digest of any uncommitted
+engine edit:
+
+```sh
+git rev-parse HEAD:internal HEAD:cmd            # committed engine state
+git diff HEAD -- internal cmd | sha256sum       # uncommitted engine state
+```
+
+Neither term moves for a docs or tracker commit; the second term is exactly what the
+mis-provenanced `sweep-20260727-214619.txt` needed and lacked. The binary sha stays in the
+header as provenance for *which image answered*, which the commit line cannot express.
+
+**Comparability rule, restated:** chunks are comparable when `engine-id` matches. A differing
+`git log -1` **or** a differing binary sha with identical `engine-id` is a docs/tracker commit
+and voids nothing — the sweep's own `chunk-1-4.txt` is the worked example, annotated in
+`analysis/tpcds-sf1-resweep-20260728/RESULTS.md`.
 
 ### D5. State labelling (§8)
 
