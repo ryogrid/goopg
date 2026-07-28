@@ -281,12 +281,40 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       wired into the four typmod-bearing type-name sites), with opt_float's two
       22023 errors byte-identical. `index_including` PASSES in full-suite
       ordering (88-case prefix, 244 s). Three ledger rows filed.
-      **Still open here:** (e) the three now-genuine divergences (a) exposed —
-      `portals_p2`, `select`, `select_distinct`. They are real output
-      mismatches, not restart phantoms and not (per the earlier isolation runs)
-      normalization-rule gaps; work them with the prefix method below, reading
-      the per-case `*_expected.txt`/`*_actual.txt` pair rather than the suite
-      log. Note root-0034 was found the same way and touched none of these, so
+      **(e) `select_distinct` CLOSED 2026-07-28 — root-0036**
+      (`docs/design/root-0036-select-distinct-order-by-direction.md`). The
+      `USING >` and the `person*` inheritance scan in the failing query are both
+      red herrings, and so is "normalization rules": the whole divergence is one
+      20-row block returned in exactly reversed order, and reduced it is
+      `SELECT DISTINCT p.age FROM person p ORDER BY age DESC` answering
+      **ascending** while the unqualified `SELECT DISTINCT age FROM person ORDER
+      BY age DESC` is correct. goopg dedups with a fixed ascending sort inside
+      `distinctOp` and re-applies the user's ORDER BY with an outer Sort
+      (M0097-0046); that Sort was the only carrier of direction and was dropped
+      whenever its key failed to resolve — which is the common case, because
+      `resolveOrderBySubstitution` rewrites a bare ORDER BY name into the
+      target's own (qualified) expression while the outer context is schema-only
+      and `SchemaColumn` has no table name. 7 of 8 measured shapes were wrong.
+      Fixed by resolving the key against whichever surface built the target list
+      and mapping it back to its select-list position
+      (`distinctSortKeyOutputIndex`), plus a positional arm for star targets.
+      Non-vacuous `TestDistinctHonoursOrderByDirection` (10 subtests, PG-18.3
+      `want` values; 7 red with the hunk stashed); the regress case flips
+      SKIP → PASS. 3 ledger rows filed. **Method note for the two below:**
+      `select_distinct` DOES reproduce in isolation (1.6 s repro loop) — the
+      "only diverges in full-suite ordering" reading recorded earlier applies to
+      `errors`/`portals_p2`/`select`, not to every case, so always try the
+      isolated `-run 'TestPort_RegressSuite/^<case>$'` first and read a SKIP as
+      "output mismatch", not "not applicable".
+      **Still open here:** the two remaining now-genuine divergences (a)
+      exposed — `portals_p2` and `select`. They are real output mismatches, not
+      restart phantoms; the loop-6 capture in `/tmp/rdiff-loop6` shows
+      `portals_p2` returning 2 rows where PG returns 1 from a cursor FETCH
+      (`portals_p2_expected.txt` vs `_actual.txt`, ~10 blocks), which looks like
+      one cursor-positioning bug rather than ten. Work them with the isolated
+      run first and the prefix method below as fallback, reading the per-case
+      `*_expected.txt`/`*_actual.txt` pair rather than the suite log. Note
+      root-0034 and root-0036 were each found this way and touched neither, so
       each needs its own diff.
       ~~(c) the root-0032 §5 redo failure~~ **FIXED 2026-07-28 as root-0033**
       (`docs/design/root-0033-redo-prune-redirect-only-compaction.md`): the

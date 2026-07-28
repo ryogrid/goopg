@@ -1563,9 +1563,46 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			outerCtx.cat = cat
 			outerKeys := make([]SortKey, 0, len(s.OrderBy))
 			for _, sb := range s.OrderBy {
+				var e Expr
+				// `ORDER BY <n>` is a 1-based reference into the DISTINCT
+				// output.  Resolve it positionally BEFORE substitution so a
+				// star target list (`SELECT DISTINCT * … ORDER BY 2 DESC`),
+				// which resolveOrderBySubstitution deliberately leaves alone,
+				// still finds its column.  Mirrors the same IntegerConst arm
+				// on the normal ORDER BY path above.
+				if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+					if idx := int(ic.Value) - 1; idx >= 0 && idx < len(distinctOut) {
+						sc := distinctOut[idx]
+						e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+					}
+				}
 				expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
-				e, err := resolveExpr(expr, outerCtx)
-				if err != nil {
+				if e == nil {
+					if re, err := resolveExpr(expr, outerCtx); err == nil {
+						e = re
+					}
+				}
+				if e == nil {
+					// resolveOrderBySubstitution rewrites a bare ORDER BY name
+					// into the matching target's OWN expression, which is often
+					// table-qualified (`SELECT DISTINCT p.age … ORDER BY age`)
+					// or computed (`… p.age+1 … ORDER BY 1`).  outerCtx carries
+					// no range bindings and SchemaColumn has no table name, so
+					// neither form resolves against the Distinct output schema —
+					// which silently dropped the outer Sort and let distinctOp's
+					// internal ascending sort become the answer, losing DESC /
+					// `USING >` entirely.  PostgreSQL requires every SELECT
+					// DISTINCT sort key to appear in the select list
+					// (transformDistinctClause, parse_clause.c — otherwise
+					// 42P10), so resolve against the pre-projection context that
+					// built the targets and map the result back to its
+					// select-list position.  M0097-0046 / root-0036.
+					if idx := distinctSortKeyOutputIndex(expr, proj, ctx, agg, win); idx >= 0 && idx < len(distinctOut) {
+						sc := distinctOut[idx]
+						e = &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+					}
+				}
+				if e == nil {
 					// Key not resolvable in Distinct output — skip outer sort.
 					outerKeys = nil
 					break
@@ -11768,6 +11805,47 @@ func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
 	}
 	for i, t := range p.Targets {
 		if tcr, ok2 := t.(*ColumnRef); ok2 && tcr.Index == cr.Index {
+			return i
+		}
+	}
+	return -1
+}
+
+// distinctSortKeyOutputIndex maps a SELECT DISTINCT sort key onto the
+// select-list position it occupies, or returns -1 when it occupies none.
+//
+// The Distinct node's output schema is the projection's, and a plan node's
+// SchemaColumn records only a name and a type — no originating table.  A sort
+// key that survived resolveOrderBySubstitution as a *qualified* or *computed*
+// expression therefore cannot be resolved against that schema directly.  It can
+// be resolved against the context the target list itself was resolved against
+// (pre-projection, aggregate surface, or window surface — whichever built the
+// targets), and the resulting planner Expr is then matched structurally against
+// proj.Targets, which are indexed in output-schema order.
+//
+// PostgreSQL guarantees such a match exists: transformDistinctClause
+// (postgres/src/backend/parser/parse_clause.c) rejects any SELECT DISTINCT
+// whose ORDER BY key is absent from the select list with 42P10, so a -1 here
+// means the expression did not resolve at all rather than "legal but unmatched".
+func distinctSortKeyOutputIndex(expr parser.Expr, proj *Project, ctx *resolveContext, agg *aggregateSurface, win *windowSurface) int {
+	if proj == nil {
+		return -1
+	}
+	var re Expr
+	var err error
+	switch {
+	case win != nil:
+		re, err = resolveExprAfterWindow(expr, win)
+	case agg != nil:
+		re, err = resolveExprAfterAggregate(expr, agg)
+	default:
+		re, err = resolveExpr(expr, ctx)
+	}
+	if err != nil || re == nil {
+		return -1
+	}
+	for i, t := range proj.Targets {
+		if exprEqual(t, re) {
 			return i
 		}
 	}

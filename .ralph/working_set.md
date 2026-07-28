@@ -1,42 +1,47 @@
 (idle — nothing in flight)
 
-Last loop (#6): M-NIGHTLY items (a) MEASURED and (b) CLOSED as **root-0034**
-(`docs/design/root-0034-float-type-alias-opt-float-reduction.md`).
+Last loop (#8): landed **root-0036** — M-NIGHTLY item (e)'s `regress/select_distinct`
+is green. Committed + pushed.
 
-(a) The 176-case alphabetical prefix (622 s) now shows 3 `restarting the
-cluster` / 3 `cluster recovered` / **0 `restart failed`** — root-0032+0033 hold.
-`portals_p2`, `select`, `select_distinct` have real results at HEAD for the
-first time and all three genuinely diverge (diffs in `/tmp/rdiff-loop6`).
+The whole divergence was one 20-row block returned reversed. `USING >` and the
+`person*` inheritance scan in the failing query are BOTH red herrings, and so is
+the harness's "normalization rules need extension" wording. Reduced:
+`SELECT DISTINCT p.age FROM person p ORDER BY age DESC` answered **ascending**;
+the unqualified `SELECT DISTINCT age FROM person ORDER BY age DESC` was fine.
+goopg dedups via a fixed ascending sort in `distinctOp` and re-applies ORDER BY
+with an outer Sort (M0097-0046) — that Sort was the sole carrier of direction and
+was silently dropped whenever its key failed to resolve. It usually failed:
+`resolveOrderBySubstitution` rewrites a bare ORDER BY name into the target's OWN
+(qualified) expression, while the outer ctx is schema-only with no bindings and
+`SchemaColumn` carries no table name. 7 of 8 measured shapes were wrong. Fix adds
+a positional arm (star targets) + `distinctSortKeyOutputIndex` (resolve against
+the surface that built the targets, match `proj.Targets` by `exprEqual`).
 
-(b) `index_including` was never an index bug. §10's fixture is
-`CREATE TABLE nametbl (c1 int, c2 name, c3 float)`, and the row vanished from a
-plain seq scan on an index-less table: `float` has no `pg_type` entry (PG
-resolves `FLOAT [ (p) ]` in the grammar, `gram.y` opt_float), goopg's parser
-kept the literal token, `catalog.TypeNameToOID`'s `default: return OIDText`
-made the column text, while `internal/executor`'s own tables (`codec.go:482`,
-`expr.go:3035`) knew `"float"` and encoded 8 IEEE-754 bytes. `INSERT 0 1` then
-zero rows forever. Fixed by doing PG's reduction in the parser
-(`normalizeFloatTypeName` → `parseColumnType`, `parseCreateDomain`,
-`parseCastTail`, `parseCastFuncExpr`), incl. opt_float's two 22023 errors
-(`parser.SyntaxError.Code` + `syntaxErrorCode`). `index_including` PASSES in
-full-suite ordering.
+**NEXT LOOP — remaining M-NIGHTLY items (they still preempt M0124/M0125):**
+- (e) two left: `regress/portals_p2` and `regress/select`. **Try the ISOLATED
+  run first** — `go test -v -run 'TestPort_RegressSuite/^portals_p2$'
+  ./internal/testport/` (~2 s). A `SKIP` there means "output mismatch", not "not
+  applicable"; that is how root-0036 was found and it is much cheaper than the
+  670 s prefix. The earlier "these only diverge in full-suite ordering" note is
+  NOT true of every case.
+  `/tmp/rdiff-loop6/portals_p2_{expected,actual}.txt` survived: PG returns 1 row
+  per FETCH where goopg returns 2 (~10 blocks, plus one 3-row block) — smells
+  like a single cursor-positioning bug, not ten.
+- (d) the regress harness emits a phantom `deferred:` per case after a failed
+  cluster restart (root-0032 §5 leftover).
+- Then M0124 → M0125 per the 2026-07-28 directive.
 
-**NEXT LOOP — highest value, already bisected:** `TestRestartAfterRetention`
-(`internal/server`) is RED at HEAD (`wal: xlog heap-insert apply: storage: not
-enough free space in page`, deterministic, 1.9 s). PASSES at `3716d5cd`, FAILS
-at `fa90714a` → **root-0032 introduced it**. Same shape as root-0033 but the
-INSERT arm: diff the redo page reconstruction for `xl_heap_insert`
-(`internal/wal/recovery.go`) against its runtime sibling. Filed as an M-NIGHTLY
-task in fix_plan + ledger row. NOTE `RALPH_PRECOMMIT_SCOPE=units` does NOT
-cover `internal/server`.
+**Standing gotchas:** `RALPH_PRECOMMIT_SCOPE=units` does NOT cover
+`internal/server` — run it explicitly. Neither `tpch-spotcheck.sh` nor the TPC-DS
+SF0.5 gate can see a wrong-order/right-rows bug (both are row-count only) — new
+ledger row 2026-07-28. TPC-DS Q54 reliably kills the capped sf05 server (matches
+its recorded TIMEOUT baseline); don't read that as a regression.
 
-Then: M-NIGHTLY (e) portals_p2/select/select_distinct, and (d) the harness's
-phantom `deferred:` per case after a failed restart.
-
-Gates run: `go test ./internal/parser/ ./internal/executor/` PASS; negative
-control on both new tests (0 rows / raw LE float64 bytes with the reduction
-short-circuited — non-vacuous); `TestPort_RegressSuite` 88-case prefix PASS
-incl. `index_including` (244 s); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` exit 0; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35); pgbench smoke via the commit hook.
+Gates run: new non-vacuous `TestDistinctHonoursOrderByDirection` (7/10 subtests
+red with the planner hunk stashed); `TestPort_RegressSuite/select_distinct`
+SKIP→PASS (negative control confirmed SKIP before the fix); `go test
+./internal/planner/ ./internal/executor/ ./internal/server/` PASS;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); TPC-DS Q41/Q6/Q87 on sf05 match
+oracle + 2026-07-27 baseline; pgbench smoke via the commit hook.
 In-flight: none.
