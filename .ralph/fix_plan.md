@@ -5,7 +5,11 @@ Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
 Priority banner below or a dependency forces another order**. As of 2026-07-28
 the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
 `docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
-ahead of M0123 and every other milestone.
+ahead of M0123 and every other milestone. **M-NIGHTLY no longer preempts it
+(amended 2026-07-28): nightly items are still FILED every loop, but they are not
+SELECTED until M0124 and M0125 close.** This banner is the sole ordering
+authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
+priority, and does not outrank it.
 
 ## Notes / rules
 
@@ -26,9 +30,24 @@ ahead of M0123 and every other milestone.
 
 ## Current Priority (per 2026-07-28 directive)
 
-**Standing exception: M-NIGHTLY triage items (from `ci/logs/action-items.md`)
-preempt everything below** — see the M-NIGHTLY milestone directly under this
-banner.
+**Standing FILING obligation (amended 2026-07-28 — replaces the former
+"M-NIGHTLY triage items preempt everything below" exception):** every loop still
+reads `ci/logs/action-items.md` and files each new `## AI-` subject as a task
+under the M-NIGHTLY milestone directly below this banner. **Filing is
+unconditional; selection is not.** M-NIGHTLY work is PARKED beneath M0124/M0125
+and its tasks stay unchecked until both milestones close. Exactly two carve-outs
+may be worked immediately, because the parked milestones cannot be *measured*
+without them:
+
+- an item that breaks the build, and
+- an item that breaks a gate M0124/M0125 depend on — `scripts/tpch-spotcheck.sh`,
+  the TPC-DS SF0.5 gate, `make plan-diff`, or a bench cluster
+  (65432/65433/65436/65437/65438).
+
+Everything else is filed and left unchecked. Rationale: every loop from
+`ddfb035e` (root-0029) through root-0036 went to nightly triage while the TPC-DS
+round-2 closeout — the measurement every M0125 task diffs against — never
+started.
 
 **⚡ 2026-07-28 directive — branch `tpcds-fix2`, priority order for this loop
 (SUPERSEDES the 2026-07-18 directive below):**
@@ -42,18 +61,24 @@ banner.
 > **top priority of this checkout**. Work in THIS order:
 > 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
 >    "WIP recovery" item directly under this banner) before anything else, never
->    silently drop it;
-> 2. **M-NIGHTLY** — the standing nightly-triage items below (they preempt as
->    usual, by their own charter). Expect a TPC-DS **Q75** item: it is in the
->    nightly qualifying set with `Q75,100,pinned` at
->    `ci/batch/tpcds-row-anchors.csv:46` and no `expected-failures.csv` entry,
->    and RC-1b turned it into a deterministic `division by zero`. That item IS
->    M0125-0004 — do not open a second workstream for it;
-> 3. **M0124** — TPC-DS round-2 closeout. Milestone doc
->    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`;
-> 4. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
+>    silently drop it. (Nothing outstanding as of 2026-07-28.)
+> 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
+>    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
+>    **↳ NEXT TASK TO SELECT: `M0124-0001`, chunk 1 (`scripts/tpcds-bench-compare.sh
+>    1-8`). See that task's "Chunked execution" note — the sweep is deliberately
+>    split across loops.** Do not select a regress/testport case instead: as of the
+>    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
+> 3. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
 >    Milestone doc
->    `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`.
+>    `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`;
+> 4. **M-NIGHTLY backlog** — the standing nightly-triage items below. Keep FILING
+>    them every loop (see the filing obligation above); work them only after M0124
+>    and M0125 close, or under one of the two carve-outs. The TPC-DS **Q75** nightly
+>    item is the exception that is already routed: it is in the qualifying set with
+>    `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46` and no
+>    `expected-failures.csv` entry, and RC-1b turned it into a deterministic
+>    `division by zero` — that item IS **M0125-0004**, so it is worked as part of
+>    M0125 and never as a second workstream.
 > **Every other roadmap milestone — M0123 included — is parked below M0125 until
 > M0124 and M0125 are complete.** M0123 keeps its own branch (`wal-pg-nodetree`)
 > and resumes there once this line is closed.
@@ -110,7 +135,7 @@ row); commit + push at every clean, green (build + pre-commit) checkpoint.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
-## M-NIGHTLY — Nightly regression triage (STANDING — HIGHEST PRIORITY)
+## M-NIGHTLY — Nightly regression triage (STANDING — FILING CONTINUES, WORK PARKED BELOW M0124/M0125 since 2026-07-28)
 
 <!-- Standing milestone: never complete it, never archive it, keep it directly
      under the Current Priority banner. Source of work: ci/logs/action-items.md
@@ -124,9 +149,14 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
           another — append the new AI-id to that task's line instead. If only a
           CHECKED task exists for the subject, the failure REOPENED: add a new
           task and note the earlier fix didn't hold.
-       2. Tasks in this milestone PREEMPT all other milestones (finish an
-          already in-flight working_set task first; preemption applies at
-          task-selection time).
+       2. AMENDED 2026-07-28: tasks in this milestone are FILED every loop but
+          are NOT selected while the Current Priority banner parks them (today:
+          below M0124/M0125). Filing is unconditional; selection follows the
+          banner. Two carve-outs may be worked at once — an item that breaks the
+          build, and an item that breaks a gate the banner's milestones depend on
+          (tpch-spotcheck, the TPC-DS SF0.5 gate, plan-diff, a bench cluster).
+          The pre-amendment rule ("these PREEMPT all other milestones") returns
+          automatically once the banner stops naming M0124/M0125.
        3. Before investigating, re-run the item's repro at HEAD — the log
           reflects the last nightly run and may be stale; if it passes, check
           the task off with a "stale — already fixed" note.
@@ -214,7 +244,18 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       sub-timeout divergences are the task below.
 - [ ] **regress/{boolean,case,create_function_sql,errors,index_including,limit,
       numerology,partition_aggregate,portals_p2} — genuine sub-timeout
-      divergences.** What survives the root-0029 reclassification of
+      divergences.**
+      **PARKED 2026-07-28(b) — do NOT select; below M0124/M0125 per the banner's
+      filing rule. Resume point carried over from loop #8's baton so nothing is
+      lost: two cases left, `portals_p2` and `select`. Try the ISOLATED run FIRST
+      — `go test -v -run 'TestPort_RegressSuite/^portals_p2$' ./internal/testport/`
+      (~2 s); a `SKIP` there means "output mismatch", not "not applicable", and
+      that is how root-0036 was found — far cheaper than the 670 s prefix run. The
+      old "these only diverge in full-suite ordering" reading is NOT true of every
+      case. `/tmp/rdiff-loop6/portals_p2_{expected,actual}.txt` (if still present)
+      shows PG returning 1 row per FETCH where goopg returns 2 — ~10 blocks plus
+      one 3-row block, i.e. one cursor-positioning bug, not ten.**
+      What survives the root-0029 reclassification of
       AI-20260725-011243-008..-026: 9 baseline-pass cases that diverged in under
       120 s. At HEAD (full-suite re-run, 2026-07-28) `errors`, `index_including`,
       `portals_p2`, `select` and `select_distinct` still diverge, while `boolean`,
@@ -397,7 +438,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 Milestone: `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
 Source: `docs/design/tpcds-round2-fixes/README.md` §13.5 actions **1, 5, 6, 7**
-(plus §13.4 item 3). **Priority #3, after WIP recovery (#1) and M-NIGHTLY (#2).**
+(plus §13.4 item 3). **Priority #1 — this milestone holds the NEXT task to
+select (2026-07-28(b) amendment); M-NIGHTLY is parked below it and only filed.**
 No engine change: if a task uncovers a defect it files a ledger row and an M0125
 blocker; a code change landing mid-sweep voids the sweep.
 
@@ -416,6 +458,37 @@ blocker; a code change landing mid-sweep voids the sweep.
       (Q88 is **TIMEOUT 660 s** at SF=1 — not the SF0.5 228 s figure). Plan
       8–10 h. Deliverable `analysis/tpcds-sf1-goopg-<date>.md`. Design
       `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`.
+      **Chunked execution (added 2026-07-28(b)) — how an 8–10 h sweep fits a
+      headless loop whose Bash ceiling is 60 min.** The design doc's "one sweep,
+      one budget, one commit" rule is unchanged; only the wall clock is split.
+      - `scripts/tpcds-bench-compare.sh` takes a query list or range (`5-14`,
+        `8,39,47`), so **a chunk is a query range**. Per-query artifacts land in
+        `${TPCDS_RESULTS_DIR}/<engine>_q<N>_{result,explain}.txt` and accumulate
+        across chunks by themselves.
+      - **Chunk size 8**, run in the FOREGROUND with an explicit Bash `timeout`
+        parameter of 55 min, stdout redirected to
+        `analysis/tpcds-sf1-resweep-<date>/chunk-<lo>-<hi>.txt`. Eight queries of
+        which two time out on both engines is ~45 min; shrink the next chunk if one
+        overruns. Never `run_in_background` across a turn boundary (PROMPT.md
+        "Headless Execution Reality").
+      - **Carry the cursor in `.ralph/working_set.md`** — e.g. `M0124-0001 sweep:
+        1-8, 9-16 done; next 17-24`. That baton is what makes a multi-loop task
+        resumable; without it the next loop re-runs chunk 1.
+      - **Sweep-integrity invariant:** the script prints `# goopg: <git log -1>` in
+        every chunk header, so **all chunk headers must name the same SHA**. That is
+        the machine-checkable form of "a code change landing mid-sweep voids the
+        sweep" — and the concrete reason M-NIGHTLY engine fixes stay parked until
+        the sweep completes. If a header disagrees, RE-RUN the affected chunks; do
+        not reconcile them narratively.
+      - Keep `ENGINES="goopg pg"`, `TIMEOUT_SEC=600`, `RESTART_AFTER_TIMEOUT=1`. A
+        chunk boundary is equivalent to the restart the script already performs
+        after every goopg TIMEOUT, so chunking does NOT violate the GC-regime rule
+        in D3 of the design doc — a fresh server per chunk is more uniform, not
+        less.
+      - Once per sweep (not per chunk): the S-cold proof (`reltuples` + `pg_stats`
+        = 0), the `reap_pg_orphans` port from `scripts/tpcds-sf05-regression.sh`,
+        and the final merge into `analysis/tpcds-sf1-goopg-<date>.md` reporting
+        confirm/refute for the 13 §13.3 projections.
 - [ ] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
       (§13.5 #5). Phases 1.2/1.3 landed while `tpch-spotcheck.sh` reported SKIPPED
       and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the
@@ -1398,7 +1471,10 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 ## M0123 — Canonical `pg_node_tree` serialization (branch `wal-pg-nodetree`)
 
-**Priority: DEMOTED 2026-07-28. After WIP-recovery (#1), M-NIGHTLY (#2),
+**Priority: DEMOTED 2026-07-28, renumbered 2026-07-28(b) when M-NIGHTLY was
+parked: the order is WIP-recovery (#1), M0124 (#2), M0125 (#3), the M-NIGHTLY
+backlog (#4), and M0123 (#5). Superseded wording kept below for history: After
+WIP-recovery (#1), M-NIGHTLY (#2),
 M0124 (#3) and M0125 (#4), M0123 is #5.** It remains the active focus of branch
 `wal-pg-nodetree`, but this checkout (`tpcds-fix2`) closes the TPC-DS round-2
 plan first — see the Current Priority banner and

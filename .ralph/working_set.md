@@ -17,19 +17,19 @@ was silently dropped whenever its key failed to resolve. It usually failed:
 a positional arm (star targets) + `distinctSortKeyOutputIndex` (resolve against
 the surface that built the targets, match `proj.Targets` by `exprEqual`).
 
-**NEXT LOOP — remaining M-NIGHTLY items (they still preempt M0124/M0125):**
-- (e) two left: `regress/portals_p2` and `regress/select`. **Try the ISOLATED
-  run first** — `go test -v -run 'TestPort_RegressSuite/^portals_p2$'
-  ./internal/testport/` (~2 s). A `SKIP` there means "output mismatch", not "not
-  applicable"; that is how root-0036 was found and it is much cheaper than the
-  670 s prefix. The earlier "these only diverge in full-suite ordering" note is
-  NOT true of every case.
-  `/tmp/rdiff-loop6/portals_p2_{expected,actual}.txt` survived: PG returns 1 row
-  per FETCH where goopg returns 2 (~10 blocks, plus one 3-row block) — smells
-  like a single cursor-positioning bug, not ten.
-- (d) the regress harness emits a phantom `deferred:` per case after a failed
-  cluster restart (root-0032 §5 leftover).
-- Then M0124 → M0125 per the 2026-07-28 directive.
+**NEXT LOOP — M0124-0001, chunk 1 (2026-07-28(b) re-prioritisation):**
+- Run `scripts/tpcds-bench-compare.sh 1-8` (foreground, Bash `timeout` 55 min,
+  `ENGINES="goopg pg" TIMEOUT_SEC=600 RESTART_AFTER_TIMEOUT=1`), stdout to
+  `analysis/tpcds-sf1-resweep-20260728/chunk-1-8.txt`. Then carry the cursor
+  (`M0124-0001 sweep: 1-8 done; next 9-16`) here. Full protocol: the "Chunked
+  execution" note on the M0124-0001 task in fix_plan.md + design doc
+  `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`.
+- **M-NIGHTLY is PARKED** (banner amendment 2026-07-28(b)): keep FILING new
+  `AI-` items each loop, do not select them. The two remaining regress cases
+  (`portals_p2`, `select`) and the phantom-`deferred:` harness item (d) keep
+  their resume notes on the parked task in fix_plan.md — do NOT start them.
+- No engine commit may land until the sweep completes: every chunk header prints
+  `# goopg: <git log -1>` and they must all name the same SHA.
 
 **Standing gotchas:** `RALPH_PRECOMMIT_SCOPE=units` does NOT cover
 `internal/server` — run it explicitly. Neither `tpch-spotcheck.sh` nor the TPC-DS
