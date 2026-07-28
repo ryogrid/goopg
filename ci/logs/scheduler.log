@@ -40,3 +40,6 @@
 2026-07-24T01:19:36+09:00 next fire at 2026-07-25T00:00:00+09:00 (sleeping 81624s)
 2026-07-25T01:12:43+09:00 firing nightly batch (scheduled 2026-07-25T00:00; woke 2026-07-25T01:12:43+09:00)
 2026-07-25T01:12:43+09:00 next fire at 2026-07-26T00:00:00+09:00 (sleeping 82037s)
+2026-07-28T12:18:43+09:00 scheduler start pid=1841567 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-07-28T12:18:43+09:00 firing nightly batch (scheduled 2026-07-28T00:00; woke 2026-07-28T12:18:43+09:00)
+2026-07-28T12:18:43+09:00 next fire at 2026-07-29T00:00:00+09:00 (sleeping 42077s)
