@@ -38,7 +38,7 @@ const (
 func EstimateRows(n Node) int64 {
 	switch x := n.(type) {
 	case *SeqScan:
-		return tableRows(x.Table)
+		return seqScanRows(x)
 	case *IndexScan:
 		// Equality probe → 1 row per call site.
 		return 1
@@ -82,6 +82,31 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	}
 	return 0
+}
+
+// seqScanRows is the base-relation row estimate for a scan leaf — the
+// stage-1 consumer of the relation-size fallback (M0125-0003 §D4).
+//
+// A warm ANALYZE'd RowCount always wins: when it is positive this returns
+// exactly what it returned before the fallback existed, which is design §D3's
+// invariant ("flag-on and flag-off must produce byte-identical plans in any
+// ANALYZEd state") and is asserted by
+// TestRelSizeFallbackDoesNotFireWhenAnalyzed.
+//
+// EstRelRows is 0 whenever the fallback did not apply, so with the flag off
+// this reduces to tableRows and no caller can observe a difference. The
+// consumers that make this move plan SHAPE — the bushy DP seed and
+// estimateBaseRelInfo.baseRows — are stages 2 and 3 and read the flag
+// separately; the only shape this one reaches is the MultiHashJoin probe-side
+// choice (bushy.go's EstimateRows comparison).
+func seqScanRows(x *SeqScan) int64 {
+	if x == nil {
+		return 0
+	}
+	if rows := tableRows(x.Table); rows > 0 {
+		return rows
+	}
+	return x.EstRelRows
 }
 
 // tableRows returns the catalog's reltuples-equivalent for a

@@ -907,6 +907,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	cat := catalog.NewInMemory()
+	// Give the catalog the live relation-size read the planner's
+	// relation-size fallback needs (M0125-0003). This is the same O(1)
+	// in-memory counter the parallel-query size gate already uses
+	// (server.parallelBlocksForTableFrom) and the same input PostgreSQL's
+	// estimate_rel_size takes from RelationGetNumberOfBlocks() — so it is
+	// available on a freshly started server, where TableStats.RowCount is
+	// still zero because it is not persisted (ledger row pq-P6).
+	//
+	// Installed on this catalog instance, not process-wide: a test binary
+	// starts several servers and each must see its own storage.
+	cat.SetRelationSizer(func(rfn storage.RelFileNode) (int64, bool) {
+		n, err := pool.NBlocks(rfn)
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	})
 	txnMgr := mvcc.NewManager()
 	// Wire the M0008 logical-decoding xact-marker hook: every
 	// successful Commit / Rollback against this manager appends
@@ -3581,7 +3598,13 @@ func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			}
 			colStats[idx] = cs
 		}
-		stats := &catalog.TableStats{Columns: colStats}
+		// Analyzed is true even though RowCount/Pages stay zero: the
+		// presence of pg_statistic rows proves an ANALYZE ran, and only
+		// the per-column slots are persisted (ledger row pq-P6). Without
+		// this the planner's relation-size fallback would read an
+		// analyzed-then-restarted relation as "never analyzed" and apply
+		// upstream's 10-page floor to it. M0125-0003.
+		stats := &catalog.TableStats{Columns: colStats, Analyzed: true}
 		cat.SetTableStats(tbl, stats)
 	}
 	return nil

@@ -575,6 +575,26 @@ type SeqScan struct {
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
+	// EstRelRows is the relation-size fallback's row estimate for Table,
+	// stamped once at plan-build time and 0 when it did not apply (the
+	// GOOPG_RELSIZE_FALLBACK flag is off, the relation is ANALYZEd, or no
+	// live block count was available). EstimateRows reads it only when
+	// TableStats.RowCount is absent.
+	//
+	// Stamped rather than computed on demand for two reasons. It mirrors
+	// PostgreSQL, which resolves relation size ONCE in get_relation_info and
+	// stores it in RelOptInfo.pages/.tuples rather than re-reading the smgr
+	// per cost call. And EstimateRows takes only a Node — it is called from
+	// the executor's EXPLAIN as well as from the planner — so there is no
+	// catalog in scope at the point of use, and threading one through a
+	// package-level variable would leak between concurrently planning
+	// sessions the way planParent already can.
+	//
+	// Consequence worth knowing: a cached plan carries the block count that
+	// was live when it was planned. PostgreSQL has the same exposure and
+	// answers it with plan invalidation, which goopg does not have yet — see
+	// the deferral ledger row for M0125-0003.
+	EstRelRows int64
 	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
 	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
 	// parent takes AccessShare on the parent relation too (PostgreSQL locks the

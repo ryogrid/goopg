@@ -1,7 +1,7 @@
 # 0125-0003 — `GOOPG_RELSIZE_FALLBACK`: block-count relation sizes, and the TPC-H statistics trade-off it re-enters
 
-Status: draft
-Date: 2026-07-28
+Status: **stage 1 landed (flag-off, inert); stages 2–3 and the measurement not started**
+Date: 2026-07-28 (stage-1 implementation record appended 2026-07-29)
 Milestone: M0125-0003 (§13.5 action 2, phase 6.1; design body §7.1)
 Depends on: M0124-0002 (plan baseline). **Independent of M0125-0002** — see the milestone's
 "A coupling that was investigated and found NOT to exist".
@@ -264,3 +264,108 @@ Units; `make plan-diff LABEL=tpcds-round2-head` — must show **no** diff with t
 the commit is inert by construction and a diff means the plumbing leaked;
 `scripts/tpch-spotcheck.sh`; the SF0.5 gate. The four-arm matrix is the deliverable, not the
 gate, but C1/C2 for stage 1 must exist before the milestone is accepted.
+
+---
+
+## Implementation record — stage 1 (2026-07-29)
+
+Stage 1 is landed and **inert**: `GOOPG_RELSIZE_FALLBACK` defaults off, and with it off no
+catalog read happens, nothing is stamped, and `EstimateRows` reduces to exactly the
+pre-M0125-0003 `tableRows`. Stages 2 and 3, and every arm of §D5.1's matrix, are still owed.
+
+### I1. What landed
+
+| piece | where |
+|---|---|
+| `TableStats.Analyzed`, the `reltuples < 0` stand-in §D1 asks for | `internal/catalog/catalog.go` |
+| `InMemory.SetRelationSizer` / `RelationBlocks` — the live `RelationGetNumberOfBlocks` | `internal/catalog/catalog.go` |
+| sizer installed from the buffer pool at startup | `internal/initdb/open.go` |
+| `estimateRelSize` — `table_block_relation_estimate_size`, rule for rule | `internal/planner/relsize.go` |
+| `clampRowEst` — `clamp_row_est` | `internal/planner/relsize.go` |
+| `typeWidth` corrected to `get_typavgwidth` (see I3) | `internal/planner/relsize.go` |
+| the staged flag + `SetRelSizeFallbackStage` | `internal/planner/relsize.go` |
+| `SeqScan.EstRelRows`, stamped at the FROM-clause scan sites | `internal/planner/plan.go`, `planner.go` |
+| the stage-1 consumer, `seqScanRows` | `internal/planner/cardinality.go` |
+
+The flag is a **stage number**, not a boolean: `1`/`2`/`3` (and `on`/`true` → 1) enable every
+consumer up to and including that stage, so stages 2 and 3 need no re-spelling of the knob.
+Unparseable values are off — an unrecognised value must not silently enable a plan-shape change.
+
+### I2. §D2's plumbing is not implementable as written, and what replaced it
+
+D2 says to thread the accessor "via a field on the planner context that `planSelect` populates
+from `ParallelSettings`". **There is no planner context**: `planSelect` is a free function
+`(*parser.SelectStmt, catalog.Catalog)`, and `ParallelSettings` reaches the planner only through
+`MaybeAddGather`, a post-pass that runs *after* planning from `internal/server/dispatch.go`.
+`EstimateRows` is worse — it takes only a `Node`, and the executor's `EXPLAIN` calls it too, so
+there is no catalog in scope at the point of use.
+
+D2's prohibition on a package-level variable is nonetheless correct, and for a sharper reason
+than it gives: goopg takes **no lock around planning**, so sessions plan concurrently. A global
+holding per-plan state is a data race, not merely an order-dependent test. (`planParent`
+already is one; that is pre-existing and out of scope here — ledger row appended.)
+
+What landed instead follows PostgreSQL: **resolve the size once and stamp it into the plan**,
+the way `get_relation_info` fills `RelOptInfo.pages`/`.tuples` rather than re-reading the smgr
+per cost call. `SeqScan.EstRelRows` is that stamp; the catalog owns the block accessor, so the
+value is per-relation rather than per-session and nothing is shared mutably.
+
+One consequence to know: a **cached plan carries the block count that was live when it was
+planned**. PostgreSQL has the same exposure and answers it with plan invalidation, which goopg
+does not have. Ledger row appended; it cannot bite while the flag is off.
+
+### I3. Discovery — `typeWidth` was not `get_typavgwidth`, and the error is multiplicative
+
+The estimate divides a page by the tuple width, so the width **is** the estimate. Checking it
+against PG 18.3 (temp tables on the TPC-DS reference instance, so autoanalyze cannot interfere;
+all reported `reltuples = -1`) found the pre-existing C2 helper wrong for every bounded varlena:
+
+| declared type | goopg (before) | PostgreSQL 18.3 | why |
+|---|---:|---:|---|
+| `varchar(20)` | 24 | **58** | typmod counts CHARACTERS: max = 20·4+4 = 84, then 32+(84−32)/2 |
+| `varchar(100)` | 104 | **218** | max = 404, then 32+(404−32)/2 |
+| `char(10)` | 14 | **44** | max = 10·4+4; for BPCHAR the max **is** the width (blank-padded) |
+| `numeric(15,2)` | 16 | **18** | `numeric_maximum_size`: 8 + ⌈(15+6)/4⌉·2 |
+
+Two independent bugs: the encoding factor (`pg_encoding_max_length`, 4 under UTF8 — goopg's only
+`server_encoding`) was missing, and so was `get_typavgwidth`'s sliding scale (`≤32` full width,
+`<1000` half of max, `≥1000` a fixed 516). On the char/varchar-heavy schemas this fallback exists
+to serve — TPC-H and TPC-DS — a 2.4× width error is a 2.4× row-estimate error, i.e. it would have
+poisoned the very measurement the milestone is built to take.
+
+Safe to correct now: `typeWidth`'s only live consumer is `nodeTupleWidth` at `bushy.go:685`,
+which feeds `dpEntry.pgCost`, read only under `costDrivenJoinOrder` — default off.
+
+With the width fixed, goopg reproduces PG's `EXPLAIN` row estimate **exactly** on all four
+measured relations, and `TestEstimateRelSize_MatchesPostgresOracle` pins them:
+
+| relation | blocks | PG `rows=` | goopg | exercises |
+|---|---:|---:|---:|---|
+| `(int4, bigint, varchar(20))` | 148 | 12284 | 12284 | width branch, integer density 8168/98 = 83 |
+| `(int4, varchar(100))` | 207 | 6624 | 6624 | the half-of-max rule at a larger bound |
+| same, `WITH (fillfactor=50)` | 299 | 12259 | 12259 | fillfactor scaling; 4084/98 truncates 41.67 → 41 |
+| empty, never analyzed | 0 | 830 | 830 | the 10-page floor **before** the `curpages == 0` exit |
+
+The last row is the §D1 boundary made concrete: PG estimates 830 rows for a never-analyzed
+empty relation and 1 for the same relation after `ANALYZE`.
+
+### I4. One deliberate divergence from PostgreSQL
+
+PG runs `estimate_rel_size` unconditionally and **scales stored statistics by the live block
+count**, so a relation that grew since its last `ANALYZE` gets a proportionally larger estimate.
+goopg short-circuits on `RowCount > 0` and does not.
+
+This is §D3's invariant, and it is load-bearing for the milestone rather than an oversight:
+flag-on and flag-off must be byte-identical in any ANALYZEd state, or the W1/W2 control arms stop
+being a control. Adopting upstream's scaling is a separate decision with its own measurement —
+ledger row appended, and it is a natural rider on M0125-0005.
+
+### I5. What stage 1 does NOT do
+
+- No plan-shape movement for TPC-H by construction: the only shape stage 1 reaches is the
+  MultiHashJoin probe-side choice. The DP seed (stage 2) and `baseRows` (stage 3) are unwired.
+- **No measurement.** §D5.1's four arms, §D7's per-query-isolated harness and §D8's SF0.5
+  instrumentation are all still owed, and until C1/C2 exist for stage 1 the milestone is not
+  acceptable. Nothing here justifies flipping the default; that remains M0125-0005.
+- Plain (non-partition) inheritance parents are not detected as `relhassubclass`, so the 10-page
+  floor may be applied to one. Ledger row appended.

@@ -1186,7 +1186,24 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       right. Two ledger rows appended (`exprwalk-node-side`; the walker-inventory
       correction).
 - [ ] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
-      phase 6.1). §13.5's highest-value item (15–16 of 21 defects); stage 1 is
+      phase 6.1). **STAGE 1 LANDED 2026-07-29, flag-off and inert** — the
+      arithmetic (`estimateRelSize`), the `reltuples < 0` sentinel
+      (`catalog.TableStats.Analyzed`), the live block count
+      (`InMemory.RelationBlocks`, installed from the pool in `initdb.Open`), the
+      staged knob, and the stage-1 consumer (`seqScanRows` via
+      `SeqScan.EstRelRows`). Verified against PG 18.3 on four measured
+      relations and reproduced EXACTLY; see the design doc's "Implementation
+      record" and five ledger rows dated 2026-07-29. **Still owed, which is why
+      this box is unchecked:** stage 2 (bushy DP seed `rowCounts[i]`,
+      `bushy.go:671`), stage 3 (`estimateBaseRelInfo.baseRows`,
+      `cardinality.go:139`), and the ENTIRE four-arm measurement — the flag
+      accepts `2`/`3` today and yields stage-1 behavior. Stage 2 is the next
+      slice and needs M0124-0002's plan baseline plus a quiet host for the
+      timed run. En route it corrected `typeWidth`, which was not
+      `get_typavgwidth` (missing the UTF8 encoding factor AND the whole sliding
+      scale: `varchar(20)` read 24 vs PG's 58) — a 2.4× width error is a 2.4×
+      row-estimate error on the char/varchar-heavy schemas this serves.
+      §13.5's highest-value item (15–16 of 21 defects); stage 1 is
       inert, so it lands early. `tableRows` (`cardinality.go:89`) returns
       `Stats.RowCount`, which `loadStatisticsFromHeap` (`initdb/open.go:3454` —
       §7.1's `:3433` is stale) leaves 0 after every restart. Model on

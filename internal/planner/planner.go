@@ -2472,7 +2472,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID}
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
+						EstRelRows: stage1RelSizeRows(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2508,7 +2509,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+				EstRelRows: stage1RelSizeRows(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
 			var root Node = parentWrapped
@@ -2521,7 +2523,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// lock, skip the now-gone child instead of erroring. M0118-0008
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID}
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
+					EstRelRows: stage1RelSizeRows(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2541,8 +2544,21 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			return root, b, nil
 		}
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+		EstRelRows: stage1RelSizeRows(cat, tbl)}, b, nil
 }
+
+// stage1RelSizeRows is the single stamping point for the relation-size
+// fallback's stage-1 consumer (M0125-0003). It returns 0 — leaving the plan
+// byte-identical to the pre-M0125-0003 planner — unless the flag is on, which
+// is what makes the landing commit inert.
+func stage1RelSizeRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
+	if !relSizeFallbackEnabled(1) {
+		return 0
+	}
+	return estimateTableRowsFallback(cat, tbl)
+}
+
 // remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every
 // Project node whose bare-ColumnRef targets carry a column index that does not
 // address the Project's own child output schema.  The original output schema

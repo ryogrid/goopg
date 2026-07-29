@@ -23,11 +23,34 @@ func TestTypeWidth_FixedAndVarlena(t *testing.T) {
 		{catalog.Type{Name: "float8"}, 8},
 		{catalog.Type{Name: "bool"}, 1},
 		{catalog.Type{Name: "text"}, varlenaDefaultWidth},
-		{catalog.Type{Name: "char", Args: []int64{10}}, 14},         // n + varlena header
-		{catalog.Type{Name: "varchar", Args: []int64{25}}, 29},      // n + header
-		{catalog.Type{Name: "numeric", Args: []int64{15, 2}}, 16},   // (15+3)/4*2 + 8
 		{catalog.Type{Name: "text", IsArray: true}, varlenaDefaultWidth},
 		{catalog.Type{Name: "unknownweirdtype"}, varlenaDefaultWidth},
+
+		// M0125-0003 corrected the bounded-varlena arm to get_typavgwidth.
+		// Every expectation below was READ OFF PostgreSQL 18.3 — the width
+		// column of `EXPLAIN SELECT * FROM <one-column table>` on the TPC-DS
+		// reference instance (port 65438, UTF8) — not derived from the
+		// formula, so they check the translation rather than restate it.
+		//
+		// char(10):  BPCHAR, max = 10*4+4 = 44, and for BPCHAR the max IS the
+		//            width (blank-padded). Was 14.
+		{catalog.Type{Name: "char", Args: []int64{10}}, 44},
+		// varchar(25): max = 25*4+4 = 104 -> 32 + (104-32)/2 = 68. Was 29.
+		{catalog.Type{Name: "varchar", Args: []int64{25}}, 68},
+		// varchar(20): max = 84 -> 32 + (84-32)/2 = 58 (PG-verified).
+		{catalog.Type{Name: "varchar", Args: []int64{20}}, 58},
+		// varchar(100): max = 404 -> 32 + (404-32)/2 = 218 (PG-verified).
+		{catalog.Type{Name: "varchar", Args: []int64{100}}, 218},
+		// varchar(7): max = 32 -> at the knee, assume full width.
+		{catalog.Type{Name: "varchar", Args: []int64{7}}, 32},
+		// varchar(1000): max = 4004 >= 1000 -> the fixed 32 + (1000-32)/2.
+		{catalog.Type{Name: "varchar", Args: []int64{1000}}, 516},
+		// numeric(15,2): numeric_maximum_size = 8 + ((15+6)/4)*2 = 18, which
+		// is <= 32 so no halving applies. Was 16 (PG-verified 18).
+		{catalog.Type{Name: "numeric", Args: []int64{15, 2}}, 18},
+		// Unconstrained numeric/varchar have no typmod -> the wild guess.
+		{catalog.Type{Name: "numeric"}, varlenaDefaultWidth},
+		{catalog.Type{Name: "varchar"}, varlenaDefaultWidth},
 	}
 	for _, c := range cases {
 		if got := typeWidth(c.t); got != c.want {
@@ -38,12 +61,12 @@ func TestTypeWidth_FixedAndVarlena(t *testing.T) {
 
 func TestTupleWidth_SumWithFloor(t *testing.T) {
 	cols := []SchemaColumn{
-		{Type: catalog.Type{Name: "int4"}},               // 4
-		{Type: catalog.Type{Name: "bigint"}},             // 8
-		{Type: catalog.Type{Name: "char", Args: []int64{10}}}, // 14
+		{Type: catalog.Type{Name: "int4"}},                    // 4
+		{Type: catalog.Type{Name: "bigint"}},                  // 8
+		{Type: catalog.Type{Name: "char", Args: []int64{10}}}, // 44 (BPCHAR, M0125-0003)
 	}
-	if got := tupleWidth(cols); got != 26 {
-		t.Fatalf("tupleWidth = %d, want 26", got)
+	if got := tupleWidth(cols); got != 56 {
+		t.Fatalf("tupleWidth = %d, want 56", got)
 	}
 	if got := tupleWidth(nil); got != 1 {
 		t.Fatalf("empty tuple width should floor at 1, got %d", got)
@@ -51,14 +74,25 @@ func TestTupleWidth_SumWithFloor(t *testing.T) {
 }
 
 func TestEstimateRelSizeRows_Density(t *testing.T) {
-	// width 100 -> perTuple 128; density = 8168/128 = 63.8125; 1000 blocks.
+	// M0125-0003 corrected this expectation. The C2 draft computed density in
+	// FLOAT (8168/128 = 63.8125 -> 63812.5 rows); upstream's
+	// table_block_relation_estimate_size computes it in INTEGER arithmetic and
+	// says so — "note: integer division is intentional here". So:
+	//
+	//	tuple_width = 100 + 28 (HEAP_OVERHEAD_BYTES_PER_TUPLE) = 128
+	//	density     = (8168 * 100 / 100) / 128 = 63   <- truncated, not 63.8125
+	//	tuples      = rint(63 * 1000) = 63000
+	//
+	// The 812-row difference is small here and proportionally largest on
+	// narrow relations, which is exactly where join-order decisions are most
+	// sensitive — hence matching PG rather than being "close enough".
 	got := estimateRelSizeRows(1000, 100)
-	want := float64(usableBytesPerBlock) / float64(100+perTupleOverhead) * 1000
+	want := float64((usableBytesPerBlock*heapDefaultFillfactor/100)/(100+perTupleOverhead)) * 1000
 	if got != want {
 		t.Fatalf("estimateRelSizeRows(1000,100) = %v, want %v", got, want)
 	}
-	if got < 60000 || got > 65000 {
-		t.Fatalf("density estimate off the expected ~63800 range: %v", got)
+	if got != 63000 {
+		t.Fatalf("PG-exact integer density expected 63000 rows, got %v", got)
 	}
 	if estimateRelSizeRows(0, 100) != 0 {
 		t.Fatalf("zero blocks must yield 0 (genuinely unknown)")
