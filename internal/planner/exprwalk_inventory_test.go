@@ -1,0 +1,317 @@
+package planner
+
+// Walker-inventory census gate (M0125-0002 STEP 0).
+//
+// M0125-0001 built the child-slot primitive (exprwalk.go) and a gate that
+// keeps it exhaustive as new Expr types appear. That gate answers "does the
+// primitive know all 32 types?". It cannot answer the question M0125-0002 is
+// scoped by: "how many hand-written type switches over Expr are still out
+// there, not built on the primitive?"
+//
+// Three different figures were carried in the plan for that count — §0 of the
+// round-2 doc said fourteen, §13.4 said seven, and M0124-0003 made it nine —
+// and none had been re-derived from source. This file derives it mechanically
+// and pins the answer, so the number can never silently drift again.
+//
+// THE CENSUS. A *site* is a function in package planner (non-test files) whose
+// body contains a type switch with at least one `case *T:` where T is an Expr
+// (i.e. T has an `exprNode()` method — the same source of truth
+// exprwalk_exhaustive_test.go uses). As derived on 2026-07-30 at 64 sites:
+//
+//	 2  exprwalkPrimitive       — exprChildSlots / shallowCloneExpr, complete
+//	50  walkerPending           — recursive traversals, 2..25 of 32 arms
+//	12  nonRecursiveClassifier  — decide-and-return, no descent
+//
+// So the live figure for the RC-1a class is **50, not seven**. The seven named
+// in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
+// local-filter blast radius; they were never the population. The per-site arm
+// counts and the severity split (which fail-opens can corrupt rows, which only
+// degrade an estimate) are recorded in
+// docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md.
+//
+// WHAT THIS GATE ENFORCES, and why it is set equality rather than a count:
+//
+//   - An UNPINNED site fails the test. A new hand-written Expr type switch is
+//     a new instance of the defect class M0125-0001 exists to end, and it must
+//     either be built on exprChildSlots or be admitted deliberately, with a
+//     deferral-ledger row.
+//   - A MISSING pinned site fails the test. When M0125-0002 converts a walker
+//     onto a driver, its type switch disappears and the pin must be deleted in
+//     the same commit — that is how the milestone's progress stays auditable
+//     instead of being asserted in prose.
+//
+// Arm counts are deliberately NOT asserted. Adding an arm to a partial walker
+// is the band-aid M0125-0001 was written to replace; pinning the counts would
+// turn every such band-aid into a test edit that looks like progress. The
+// counts live in the design doc as a dated snapshot instead.
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// walkerRole is what the census found a site to be. It is documentation
+// attached to each pin; the gate checks only that the value is one of the
+// three known roles, so a typo cannot create a silently unclassified pin.
+type walkerRole string
+
+const (
+	// exprwalkPrimitive is exprwalk.go's own switch: complete over all 32
+	// types and kept that way by exprwalk_exhaustive_test.go.
+	exprwalkPrimitive walkerRole = "primitive"
+
+	// walkerPending is a recursive traversal that enumerates a SUBSET of the
+	// Expr types, so an unenumerated type is a silent no-op. This is the
+	// RC-1a class. M0125-0002 converts these; each conversion deletes a pin.
+	walkerPending walkerRole = "walker-pending"
+
+	// nonRecursiveClassifier decides something about the node in front of it
+	// and returns without descending. Its unenumerated types fall through to
+	// a deliberate "not applicable" answer, so completing it is not required
+	// for correctness — but it is still counted here, because "does not
+	// recurse" is a property that a later edit can quietly take away.
+	nonRecursiveClassifier walkerRole = "classifier"
+)
+
+// exprSwitchInventory pins every Expr type switch in package planner, keyed
+// "<file>:<func>". Census of 2026-07-30 (HEAD ac9bf911).
+//
+// Ordering is by file then function, matching the census output so the two can
+// be diffed directly.
+var exprSwitchInventory = map[string]walkerRole{
+	"bushy.go:remapByPosMap":                                    walkerPending, // 18 of 32 arms
+	"bushy.go:remapOuterRefsInSubplan":                          walkerPending, // 5 of 32 arms
+	"bushy.go:remapPosMapAfterRewrite":                          walkerPending, // 8 of 32 arms
+	"bushy.go:visitColumnRefs":                                  walkerPending, // 7 of 32 arms
+	"bushy.go:visitColumnRefsByName":                            walkerPending, // 7 of 32 arms
+	"bushy.go:visitColumnRefsForTable":                          walkerPending, // 12 of 32 arms
+	"exprwalk.go:exprChildSlots":                                exprwalkPrimitive,
+	"exprwalk.go:shallowCloneExpr":                              exprwalkPrimitive,
+	"foldconst.go:FoldConstants":                                walkerPending, // 15 of 32 arms
+	"foldconst.go:toLiteralValue":                               nonRecursiveClassifier,
+	"inner_join_qual_pushdown.go:innerJoinPushTarget":           nonRecursiveClassifier,
+	"local_filters.go:conjunctIsLocalEligible":                  walkerPending, // 9 of 32 arms, recurses via its `walk` closure
+	"local_filters.go:localizeExprToLeaf":                       walkerPending, // 7 of 32 arms
+	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
+	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
+	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
+	"nl_index_join.go:cloneExprShiftIdx":                        walkerPending, // 12 of 32 arms
+	"nl_index_join.go:residualCostMultiplier":                   nonRecursiveClassifier,
+	"planner.go:exprEqual":                                      walkerPending, // 5 of 32 arms
+	"planner.go:exprSide":                                       walkerPending, // 15 of 32 arms
+	"planner.go:exprType":                                       walkerPending, // 22 of 32 arms
+	"planner.go:findFirstNestedSRF":                             walkerPending, // 6 of 32 arms
+	"planner.go:inferExprType":                                  nonRecursiveClassifier,
+	"planner.go:isConstantExpr":                                 walkerPending, // 25 of 32 arms
+	"planner.go:isConstantPlanExpr":                             walkerPending, // 12 of 32 arms
+	"planner.go:planExprContentKey":                             walkerPending, // 4 of 32 arms
+	"planner.go:planHasEscapingOuterRef":                        walkerPending, // 6 of 32 arms
+	"planner.go:planIndexScanFromWhere":                         nonRecursiveClassifier,
+	"planner.go:remapColumnRefsToSchema":                        walkerPending, // 13 of 32 arms
+	"planner.go:replaceExprNode":                                walkerPending, // 6 of 32 arms
+	"planner.go:shiftColumnRefsBy":                              walkerPending, // 13 of 32 arms
+	"planner.go:withinGroupDirectArgColumnName":                 walkerPending, // 2 of 32 arms
+	"predp.go:remapSublinkOuterRefs":                            walkerPending, // 3 of 32 arms
+	"predp.go:whereEligibleForPreDPUnnest":                      nonRecursiveClassifier,
+	"pushdown.go:walkColumnRefsImpl":                            walkerPending, // 18 of 32 arms
+	"selectivity.go:clauseSelectivity":                          walkerPending, // 4 of 32 arms
+	"selectivity.go:clauseSelectivityWithSource":                walkerPending, // 4 of 32 arms
+	"selectivity.go:formatExprConstant":                         nonRecursiveClassifier,
+	"selectivity.go:isConstExpr":                                nonRecursiveClassifier,
+	"subplan_lower.go:analyzeSublink":                           walkerPending, // 7 of 32 arms
+	"subplan_lower.go:excludedRefsWithin":                       walkerPending, // 6 of 32 arms
+	"subplan_lower.go:handleFor":                                nonRecursiveClassifier,
+	"subplan_lower.go:rewriteSublinkPlan":                       walkerPending, // 6 of 32 arms
+	"subplan_lower_walk.go:lowerTraverseExpr":                   walkerPending, // 24 of 32 arms
+	"unnest.go:canUnnestExistsExpr":                             walkerPending, // 5 of 32 arms
+	"unnest.go:cloneExprLeaf":                                   walkerPending, // 14 of 32 arms
+	"unnest.go:cloneExprReplacingOuter":                         walkerPending, // 11 of 32 arms
+	"unnest.go:cloneExprSubstituteAggIdx0":                      walkerPending, // 7 of 32 arms
+	"unnest.go:containsExpr":                                    walkerPending, // 5 of 32 arms
+	"unnest.go:countSublinksInExpr":                             nonRecursiveClassifier,
+	// deepVisitSublinkChildren descends through walkExprTreeDeep, which is a
+	// PLAN walker with no Expr switch of its own, so the census's mutual-
+	// recursion pass reports it non-recursive. It is a walker.
+	"unnest.go:deepVisitSublinkChildren":   walkerPending, // 5 of 32 arms
+	"unnest.go:findExistsExprInExpr":       walkerPending, // 5 of 32 arms
+	"unnest.go:findExprInExpr":             walkerPending, // 3 of 32 arms
+	"unnest.go:findInExprInExpr":           walkerPending, // 5 of 32 arms
+	"unnest.go:findSubqueryInExpr":         walkerPending, // 5 of 32 arms
+	"unnest.go:liftResidualConjuncts":      walkerPending, // 5 of 32 arms
+	"unnest.go:nullPreservingScalarTarget": walkerPending, // 9 of 32 arms
+	"unnest.go:planCloneSupported":         walkerPending, // 5 of 32 arms
+	"unnest.go:replaceExprInConjunct":      walkerPending, // 5 of 32 arms
+	"unnest.go:residualExprLiftable":       walkerPending, // 12 of 32 arms
+	"unnest.go:shiftExprColumnIdx":         walkerPending, // 5 of 32 arms
+	"unnest.go:subqueryANDReachable":       walkerPending, // 2 of 32 arms
+	"unnest.go:walkExprTree":               walkerPending, // 8 of 32 arms
+	"unnest.go:walkSubqueryPlansInExpr":    walkerPending, // 9 of 32 arms
+}
+
+// exprSwitchSites runs the census: every package function whose body holds a
+// type switch with at least one Expr-typed case, keyed "<file>:<func>".
+//
+// Methods are keyed "<file>:(T).<name>" so a method can never collide with a
+// free function of the same name. There are none today; the scheme exists so
+// that adding one does not produce a confusing duplicate-key failure.
+func exprSwitchSites(t *testing.T) map[string]int {
+	t.Helper()
+	exprTypes := exprNodeReceivers(t)
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob package files: %v", err)
+	}
+	fset := token.NewFileSet()
+	sites := map[string]int{}
+	scanned := 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		scanned++
+		base := filepath.Base(path)
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			name := fn.Name.Name
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				name = "(" + recvTypeName(fn.Recv.List[0].Type) + ")." + name
+			}
+			arms := 0
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSwitchStmt)
+				if !ok {
+					return true
+				}
+				for _, stmt := range ts.Body.List {
+					cc, ok := stmt.(*ast.CaseClause)
+					if !ok {
+						continue
+					}
+					for _, ct := range cc.List {
+						star, ok := ct.(*ast.StarExpr)
+						if !ok {
+							continue
+						}
+						id, ok := star.X.(*ast.Ident)
+						if !ok {
+							continue
+						}
+						if exprTypes[id.Name] {
+							arms++
+						}
+					}
+				}
+				return true
+			})
+			if arms > 0 {
+				sites[base+":"+name] += arms
+			}
+		}
+	}
+	if scanned == 0 || len(sites) == 0 {
+		t.Fatalf("census found %d sites across %d files — the gate would vacuously pass", len(sites), scanned)
+	}
+	return sites
+}
+
+// recvTypeName renders a receiver type as a bare name, dropping the pointer.
+func recvTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return recvTypeName(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr: // generic receiver
+		return recvTypeName(t.X)
+	}
+	return "?"
+}
+
+// TestExprSwitchInventoryIsPinned is the census gate. See the file header for
+// why it asserts set equality and not arm counts.
+func TestExprSwitchInventoryIsPinned(t *testing.T) {
+	got := exprSwitchSites(t)
+
+	var unpinned, missing []string
+	for key := range got {
+		if _, ok := exprSwitchInventory[key]; !ok {
+			unpinned = append(unpinned, key)
+		}
+	}
+	for key := range exprSwitchInventory {
+		if _, ok := got[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(unpinned)
+	sort.Strings(missing)
+
+	for _, key := range unpinned {
+		t.Errorf("unpinned Expr type switch %s (%d Expr arms): a NEW hand-written "+
+			"walker is a new instance of the RC-1a defect class. Build it on "+
+			"exprChildSlots / walkExprRefs / rewriteExprRefsInPlace / cloneExprRefs "+
+			"(exprwalk.go), or — if it must stay hand-written — add it to "+
+			"exprSwitchInventory here AND append a row to .ralph/deferral_ledger.md.",
+			key, got[key])
+	}
+	for _, key := range missing {
+		t.Errorf("pinned Expr type switch %s no longer exists: if M0125-0002 converted "+
+			"it onto an exprwalk driver, delete its line from exprSwitchInventory in "+
+			"the same commit (that deletion is how the milestone's progress is "+
+			"audited); if it was renamed, update the key.", key)
+	}
+
+	for key, role := range exprSwitchInventory {
+		switch role {
+		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier:
+		default:
+			t.Errorf("%s: unknown walkerRole %q", key, role)
+		}
+	}
+}
+
+// TestExprSwitchCensusIsNotVacuous pins the census machinery itself. Both
+// halves of the gate above are set comparisons, so a census that silently
+// stopped finding sites — a parse mode change, a glob that misses files, a
+// renamed exprNode marker — would let the inventory rot while still reporting
+// PASS. exprwalk.go's two primitives are the fixture: they are the sites this
+// package can least afford to lose track of, and they are guaranteed to be
+// found by any working census.
+func TestExprSwitchCensusIsNotVacuous(t *testing.T) {
+	got := exprSwitchSites(t)
+
+	for _, key := range []string{"exprwalk.go:exprChildSlots", "exprwalk.go:shallowCloneExpr"} {
+		arms, ok := got[key]
+		if !ok {
+			t.Fatalf("census did not find %s — the machinery is broken, not the inventory", key)
+		}
+		if arms != len(exprNodeReceivers(t)) {
+			t.Errorf("%s: census counted %d Expr arms, want all %d Expr types "+
+				"(exprwalk_exhaustive_test.go asserts completeness; a mismatch here "+
+				"means the census is miscounting arms)", key, arms, len(exprNodeReceivers(t)))
+		}
+	}
+
+	// The class is large today and shrinks only through M0125-0002 commits. A
+	// census that reports a handful of sites is a broken census, not a
+	// finished milestone; when the walkers really are gone, this floor is
+	// lowered in the same commit that removes the last pin.
+	if len(got) < 20 {
+		t.Errorf("census found only %d Expr type switches; 64 were pinned on "+
+			"2026-07-30 and they are removed one commit at a time. Verify the "+
+			"census still parses the package before lowering this floor.", len(got))
+	}
+}

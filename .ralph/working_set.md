@@ -1,46 +1,49 @@
 (idle — nothing in flight)
 
-Last loop: **`M0125-0003` STAGE 2 landed** (bushy DP seed), default-off. Banner
-item 1 said "land stage 1", but stage 1 had already landed at `c26c6fc3` — the
-next undone slice was stage 2. Banner updated to match.
+Last loop: **`M0125-0002` STEP 0 landed** — the walker inventory, re-derived from
+source and permanently gate-pinned. Banner's next-selection set was
+{`-0002`, `-0005`, `-0003` stage 3}; stage 2's TIMED arm was NOT takeable
+(`run-nightly.sh` PID 3541516 still held the host, load 5.0/9.9/12.4), and stage 3
+shadows stage 2's measurement, so `-0002` was selected — whose own documented
+STEP 0 is "re-derive the inventory FIRST or the task closes against a list that
+was never right".
 
-Fix: `bushySeedRowCounts` (`internal/planner/bushy.go`, extracted from
-`enumerateBushyPlans`) adds the estimate_rel_size fallback as a third tier under
-the DP's singleton seed, via a new single gated entry point
-`relSizeFallbackRows(stage, cat, tbl)` (`relsize.go`) that `stage1RelSizeRows`
-now delegates to as well.
-
-## NEXT (banner order)
-
-1. **`M0125-0003` stage 2's TIMED arm** on a quiet host — take it BEFORE stage 3,
-   because stage 3 makes `filteredRows` positive cold and SHADOWS the stage-2
-   tier at this site. Round-4's five regressed queries are the watch list; Q9
-   newly reaches `Gather`/`Workers Planned: 4` and is untimed.
-2. Then `M0125-0002` (seven walkers, one per commit) / `-0005` / stage 3.
-Owed independently, now **five commits deep**: one full 99-query SF0.5 gate run
-on a quiet host (own ledger row, 2026-07-30).
+Fix: `internal/planner/exprwalk_inventory_test.go` — a go/ast census of every
+type switch over an `Expr` in package `planner`, pinned as `exprSwitchInventory`.
+No production code changed, so plan shape cannot move.
 
 ## Facts the next loop should NOT re-derive
 
-- **A plan-SHAPE diff is the gate that still works under nightly contention.**
-  Both arms were measured this loop while `run-nightly.sh` held the host: it
-  proves a flag-gated landing is inert AND that it is actually wired — the
-  failure mode a "flag-off, inert" commit hides is being inert in BOTH states.
-- **The pre-stage-2 DP seeded `rows=1` for EVERY relation at S-cold.** Join order
-  was being chosen on no cardinality signal at all. Estimates now land within
-  0.37–1.01× of SF=1 truth (`nation` 20.8× = the 10-page floor, correct).
-- `bench/tpch/setup_goopg.sh` propagates the environment to the server (plain
-  `nohup`), so `GOOPG_RELSIZE_FALLBACK=2 bench/tpch/setup_goopg.sh` is how the
-  flag-on arm is taken. **Restart it flag-off afterwards** — a bench cluster left
-  with a non-default planner flag would silently poison later loops.
-- `gofmt -l internal/planner/` lists ~18 PRE-EXISTING files (go1.26 local vs
-  go1.25 repo baseline). Attribute before reacting; never `gofmt -w`.
-- 4th consumer discovered: `reorderCommaFromByCardinality`
-  (`joinorder.go:89-93`) still bails when any table lacks stats → blind S-cold.
+- **The RC-1a class is 50 walkers, not 7 / 9 / 14.** 64 sites total: 2 exprwalk
+  primitives, 50 recursive-and-incomplete (2–25 of 32 arms), 12 non-recursive
+  classifiers. The seven were picked by MHJ/local-filter blast radius — sound
+  for scoping a conversion, useless for sizing a class. `-0002` covers 8/50.
+- **`remapByPosMap` is already complete (18 arms + 14 childless leaves = 32)**,
+  so commit 1 of `-0002` really is the no-op re-base (from -0001's record).
+- **Two identity fail-opens that COLLIDE, not no-op** → filed `M0125-0024`:
+  `planExprContentKey`'s `default:` is `fmt.Sprintf("%T", e)` (type name alone ⇒
+  distinct exprs of one unenumerated type share an aggregate STATE-SHARING key,
+  M0097-0032's shipped-wrong-answer shape); `exprEqual` falls back to `%T%v`
+  text compare ("pointer-safe only for primitives"), and the pair disagrees on
+  whether `*ColumnRef.SourceTableIdx` participates.
+- Each `-0002` conversion now closes by DELETING its pin; arm counts are
+  comments, never assertions (pinning them makes band-aid arms look like work).
+- A new `.go` file needs `gofmt -w` on THAT FILE ONLY (map-literal alignment);
+  the go1.25/1.26 caveat is about pre-existing files.
 
-Gates run: `go build ./...` + `go vet` clean; planner + executor suites PASS;
-units suite PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
-`make plan-diff LABEL=tpcds-round2-head` 22/22 MATCH flag-off and 22/22 DIFFER
-at `GOOPG_RELSIZE_FALLBACK=2`; `make ralph-state-guard`; pgbench smoke via hook.
+## NEXT (banner order)
+
+1. `M0125-0002` **commit 1**: `remapByPosMap` re-base onto `cloneExprRefs` +
+   the missing `default:` (veto). Only commit that carries an empty-diff
+   expectation; 0125-0001 D6's 26 remap pins already guard it.
+2. `M0125-0003` stage 2's TIMED arm the moment the host is quiet (before
+   stage 3, which shadows it). Then `-0005` / stage 3 / `M0125-0024`.
+Owed independently, now six commits deep: one full 99-query SF0.5 gate run.
+
+Gates run: `go build ./...` + `go vet ./internal/planner/` clean; units suite
+PASS (planner 0.279s, rest cached); census gate proved to FAIL both directions
+(unpinned probe walker; renamed pin) then restored green;
+`make ralph-state-guard` (repaired stale completed marker); pgbench smoke via
+the commit hook.
 
 In-flight: none.

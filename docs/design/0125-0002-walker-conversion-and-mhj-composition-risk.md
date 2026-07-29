@@ -22,6 +22,71 @@ HEAD and **supersede README §2.4's stale cites**:
 
 Plus `remapByPosMap` (`bushy.go:2154`), 18 arms and still no `default:`.
 
+## STEP 0 (executed 2026-07-30) — the inventory, re-derived from source
+
+M0125-0001's execution record ended with an instruction: **re-derive this list before
+converting anything**, because three different figures were in circulation and not one of them
+came from the source. README §0 said fourteen, §13.4 said seven, and M0124-0003's review of
+`walkColumnRefsImpl` made it nine. The table above is the *seven*.
+
+The census is now mechanical and permanent, in `internal/planner/exprwalk_inventory_test.go`.
+A **site** is a function in a non-test file of package `planner` whose body contains a type
+switch with at least one `case *T:` where `T` has an `exprNode()` method — the same closed
+type set `exprwalk_exhaustive_test.go` derives, so the census cannot drift from the definition
+of `Expr`. Classification is by structural recursion: a site is a *walker* if a case body calls
+the enclosing function again, calls a closure declared in that function (`conjunctIsLocalEligible`
+descends through its `walk` closure), or calls another site's function (`cloneExprLeaf` ↔
+`cloneExprReplacingOuter`).
+
+| bucket | count | what it means |
+|---|---|---|
+| `exprwalkPrimitive` | 2 | `exprChildSlots` / `shallowCloneExpr`, complete over all 32 types |
+| `walkerPending` | 50 | recursive traversal enumerating 2–25 of 32 types — the RC-1a class |
+| `nonRecursiveClassifier` | 12 | decide-and-return; an unenumerated type falls through to a deliberate "not applicable" |
+| **total** | **64** | |
+
+**The live figure is 50, not seven, nine, or fourteen.** None of the three was close, and the
+error was not arithmetic: the seven were selected by *blast radius* (MHJ composition and
+local-filter partitioning), which is a sound way to scope a conversion and a useless way to
+size a defect class. This task's scope does **not** change — the same eight commits, in the
+same order — but its closing statement must be scoped to those eight call sites, which §"Explicit
+non-goal" and §"Deliverable" already require, and now has a number to be honest about: **eight
+of 50 (16 %)**.
+
+The authoritative list is the `exprSwitchInventory` map in that test file, not this table — it is
+gate-enforced in both directions, so a new hand-written walker fails the build and a converted
+walker fails until its pin is deleted. That deletion is how this milestone's progress becomes
+auditable instead of asserted. Arm counts are recorded as comments there and deliberately *not*
+asserted: adding an arm to a partial walker is the band-aid 0125-0001 exists to replace, and
+pinning the counts would make every band-aid look like progress. The gate was proved to fail in
+both directions before being trusted (an unpinned probe walker; a renamed pin), matching
+0125-0001 D5's precedent.
+
+### Two fail-opens the census found that are worse than a silent no-op
+
+The seven walkers fail open by *not descending*. Two un-named sites fail open by **colliding**,
+which is a wrong answer rather than a missed optimisation, and neither is in any milestone:
+
+1. **`planExprContentKey` (`planner.go:7027`, 4 of 32 arms)** keys aggregate **state-sharing
+   equality**, and its `default:` returns `fmt.Sprintf("%T", e)` — *the type name alone*. Every
+   pair of distinct expressions of the same unenumerated type therefore produces an identical
+   key: two different `*CaseExpr`s, two different `*CastExpr`s, two different `*SubqueryExpr`s
+   all key as their type and are treated as the same aggregate argument. This is the exact shape
+   of M0097-0032, where a dropped FILTER clause collapsed `count(*) FILTER (WHERE …)` onto
+   `count(*)` and the filtered count silently reported the unfiltered total.
+2. **`exprEqual` (`planner.go:11950`, 5 of 32 arms)** backs DISTINCT ON / ORDER BY matching and
+   falls back to `fmt.Sprintf("%T%v", a, a) == fmt.Sprintf("%T%v", b, b)`, which its own comment
+   admits is "pointer-safe only for primitives" — for an unenumerated type holding pointers it
+   compares *addresses*, so structurally equal expressions read unequal. Independently, its
+   `*ColumnRef` arm compares **only `Index`** while `planExprContentKey`'s compares
+   `SourceTableIdx/Index`: two `ColumnRef`s from different source tables at the same index are
+   equal to one and distinct to the other. That is the sibling-divergence class (encode↔decode,
+   fast-path↔interpreted) in a pair nobody had noticed was a pair.
+
+Both are recorded in the deferral ledger and filed as `M0125-0024`; **neither is fixed here**,
+because each changes aggregate sharing or DISTINCT semantics and needs its own value-checked
+gate, which is precisely what this task's per-commit discipline exists to protect.
+
 ## Why this is not "just fixing stale indices"
 
 §9's risk column was corrected during review (finding D4) because the first draft understated
@@ -213,8 +278,13 @@ the one experiment guaranteed to be uninterpretable.
 
 ## Deliverable
 
-Eight commits (seven walkers plus the `remapByPosMap` re-base), each with its gate evidence;
+STEP 0 (landed 2026-07-30): the census gate `internal/planner/exprwalk_inventory_test.go`, which
+pins all 64 Expr type switches and makes the inventory unable to drift again.
+
+Then eight commits (seven walkers plus the `remapByPosMap` re-base), each with its gate evidence;
 `analysis/tpch-walker-conversions-<date>.md` with one table per commit; and a closing statement
 scoped to **the eight named call sites** — since `walkColumnRefsImpl` and the `shiftColumnRefs`
 closure are out of scope and tracked by a ledger row, "the walker class is extinct" is not
-claimed.
+claimed. STEP 0 puts a number on that caveat: the eight are **16 % of the 50** recursive,
+incomplete walkers, and each conversion is complete only when its pin is deleted from
+`exprSwitchInventory`.

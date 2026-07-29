@@ -1404,7 +1404,27 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       CANNOT be fixed here. Phase 6.2 out of scope (B3: does not fix Q64 alone).
       Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
 - [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
-      #4, phase 2.2). `visitColumnRefsForTable` (`bushy.go:415`),
+      #4, phase 2.2).
+      **STEP 0 DONE 2026-07-30 — the inventory is re-derived from source and now
+      gate-pinned**, which M0125-0001's execution record required before any
+      conversion ("§0 says fourteen, §13.4 says seven, and neither figure has
+      been re-derived from source — do that FIRST"). All three figures were
+      wrong: `internal/planner/exprwalk_inventory_test.go` censuses every type
+      switch over an `Expr` in package `planner` and finds **64 sites — 2
+      exprwalk primitives, 50 recursive-and-incomplete walkers (the RC-1a
+      class, 2–25 of 32 arms), 12 non-recursive classifiers**. The seven were
+      selected by blast radius, which scopes a conversion soundly and sizes a
+      defect class not at all; this task's scope is UNCHANGED (same eight
+      commits, same order) but it covers **8 of 50 = 16 %**, and each
+      conversion now closes by DELETING its pin (set equality is enforced in
+      both directions, so a new hand-written walker fails the build and a
+      converted one fails until the pin goes). Gate proved to fail both ways
+      before being trusted. Arm counts are comments, not assertions — pinning
+      them would make every band-aid arm look like progress. The census also
+      found **two fail-opens that COLLIDE rather than no-op** (worse: a wrong
+      answer, not a missed optimisation) — filed as `M0125-0024`, deliberately
+      not fixed here. Design doc §"STEP 0".
+      Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
       (`:268`), `cloneExprShiftIdx` (`nl_index_join.go:777`), `exprSide`
@@ -1431,6 +1451,35 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Do NOT claim "the walker class is extinct" — `walkColumnRefsImpl` and the
       `shiftColumnRefs` closure stay out of scope with a ledger row. Design
       `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md`.
+- [ ] **M0125-0024 — two expression-identity fail-opens that COLLIDE**
+      (discovered by M0125-0002's STEP 0 census, 2026-07-30; ledger row same
+      date). Both are outside the seven, and both are wrong-answer risks rather
+      than missed optimisations, because they under-enumerate an *identity*
+      function: unenumerated types are not skipped, they are **conflated**.
+      **(a) `planExprContentKey` (`internal/planner/planner.go:7027`, 4 of 32
+      arms)** keys aggregate STATE-SHARING equality and its `default:` returns
+      `fmt.Sprintf("%T", e)` — the type name alone — so any two distinct
+      expressions of one unenumerated type (two different `*CaseExpr`s, two
+      `*CastExpr`s, two `*SubqueryExpr`s) share a key and are treated as the
+      same aggregate argument. This is M0097-0032's shape, where a dropped
+      FILTER collapsed `count(*) FILTER (WHERE …)` onto `count(*)` and the
+      filtered count reported the unfiltered total — a shipped wrong answer.
+      **(b) `exprEqual` (`:11950`, 5 of 32 arms)** backs DISTINCT ON / ORDER BY
+      matching and falls back to `fmt.Sprintf("%T%v", …)` comparison, which its
+      own comment concedes is "pointer-safe only for primitives": for an
+      unenumerated type holding pointers it compares ADDRESSES, so structurally
+      equal expressions read unequal. Independently, (b)'s `*ColumnRef` arm
+      compares only `Index` while (a)'s compares `SourceTableIdx/Index`, so two
+      refs from different source tables at the same index are equal to one and
+      distinct to the other — the sibling-divergence class in a pair nobody had
+      noticed was a pair. Both are `walkerPending` pins in
+      `exprwalk_inventory_test.go`. Fix each on `exprwalk.go`'s drivers with a
+      stated `scopePolicy`, and gate by VALUE (M0124-0005 checksums) not row
+      count: an aggregate-sharing or DISTINCT change is invisible to a
+      row-count gate. Needs a design doc
+      (`docs/design/0125-0024-expression-identity-collisions.md`) before code —
+      the aggregate-sharing path is where the shipped-wrong-answer precedent
+      lives.
 - [ ] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
       Separate commit, separate decision, so §7.3 RC-5's reopen criterion ("after
       the flag defaults on") has an owner. Requires: the C1→C2 table for every
