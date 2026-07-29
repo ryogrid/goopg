@@ -1293,7 +1293,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **Four surviving divergences were each confirmed IDENTICAL on pre-fix HEAD**,
       so none is a regression; all four are filed below with ledger rows
       (M0125-0016..-0019).
-- [ ] **M0125-0016 — the set-op fold has no operator precedence** (discovered by
+- [x] **M0125-0016 — the set-op fold has no operator precedence** (discovered by
       M0125-0006 2026-07-29, ledger row 2026-07-29). PG `gram.y:825-826` declares
       `%left UNION EXCEPT` then `%left INTERSECT`, so INTERSECT binds tighter.
       goopg folds the flat segment list left-deep regardless, so **with no
@@ -1310,6 +1310,40 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       flat index. **Accept by VALUE**: a bare-chain matrix in both precedence
       directions plus the M0125-0006 parenthesised matrix as a non-regression pin.
       Planner change -> full pre-commit bar.
+      **DONE 2026-07-29.** Design `docs/design/0125-0016-setop-operator-precedence.md`.
+      Fix is a two-level precedence climb over the already-flattened segment list:
+      `planSegment` (the existing cut/plan/restore dance, lifted out of the loop
+      body verbatim), `applySetOp` (column-count check + `wrapSetOpBranchWithCasts`
+      **re-based on the accumulated left operand** — with grouping that is no longer
+      always the leftmost branch), and `foldSetOpRange`, where a leading INTERSECT
+      run attaches directly to the accumulator and each later UNION/EXCEPT operand
+      first absorbs the maximal INTERSECT run that follows it.
+      **The second coupling turned out to be a correctness constraint, not just a
+      re-base**: `InnerSegmentCount` is a hard PRECEDENCE BARRIER, because the
+      user's parentheses grouped those segments explicitly —
+      `(A UNION B ORDER BY 1) INTERSECT C` must not become `A UNION (B INTERSECT
+      C)`. Folding each side of the barrier with a separate `foldSetOpRange` call
+      gives that *and* preserves the invariant `wrapSetOpSortLimit` depends on
+      (`left` == the inner compound at the wrap point), which is why the fix is a
+      range fold rather than a pre-pass over the segment list.
+      **Accepted BY VALUE against PG 18.3 (port 65438)**: 17 cases in
+      `internal/executor/setop_precedence_test.go` — both precedence directions,
+      `ALL` on either operator, multi-link and mid-chain INTERSECT runs, the
+      UNION/EXCEPT tie, the barrier with `ORDER BY` and `ORDER BY … LIMIT`, and
+      explicit parens overriding precedence the other way. **Proved to FAIL before
+      being trusted**: copied verbatim into a worktree at `70e1ca61`, 8 subtests
+      FAIL while all four controls and the entire barrier suite PASS there.
+      M0125-0006's matrix passes unchanged.
+      **The full 99-query SF0.5 gate was NOT run** — its guard refuses under the
+      live nightly batch, and although `FORCE=1` is legitimate for a
+      row-count/checksum gate, the sweep's ~21 GB Q5 peak does not fit beside the
+      wedged nightly server (7.5 GB of an 18 GB budget). The set-op subset
+      (Q8 Q14 Q23 Q38 Q49 Q87) was run instead: Q23/Q38/Q49/Q87 checksums are
+      **byte-identical** to the HEAD sweep `sweep-20260729-123114.txt`, and Q8's
+      ERROR + Q14's TIMEOUT are pre-existing and unchanged. TPC-DS cannot reach
+      this defect at all — Q8/Q14/Q38 are its only INTERSECT users and every chain
+      is homogeneous, hence associative. **A quiet-host loop should still run the
+      full gate once**, for the same reason M0124-0002 is waiting on one.
 - [ ] **M0125-0017 — `ORDER BY`/`LIMIT` inside a parenthesised FIRST branch is
       hoisted to the whole set-op result, silently dropping branches** (discovered
       by M0125-0006 2026-07-29, ledger row 2026-07-29). `(A ORDER BY 1 LIMIT 2)

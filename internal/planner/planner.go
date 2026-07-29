@@ -641,12 +641,10 @@ func setOpKeyword(t parser.SetOpType) string {
 // (postgres/src/backend/parser/gram.y:825-826 — later declaration wins), so
 // INTERSECT binds tighter than UNION and EXCEPT, which tie with each other.
 //
-// Only the paren-boundary decision consults this. goopg's flattening fold is
-// otherwise precedence-blind, so a BARE mixed chain such as
-// `A UNION B INTERSECT C` is still planned left-deep and still diverges from
-// PostgreSQL — a separate, pre-existing defect tracked as M0125-0016. This
-// function exists so that fixing associativity does not make the
-// explicitly-parenthesised spelling of that same chain regress. M0125-0006.
+// Two callers consult this: the paren-boundary decision (M0125-0006), which
+// must not cut a chain at a ')' when the operator written after it binds
+// tighter, and foldSetOpRange below (M0125-0016), which groups maximal
+// INTERSECT runs before the UNION/EXCEPT left-fold. M0125-0006.
 func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
@@ -842,26 +840,21 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Build left-associatively: fold each subsequent branch in from the left.
-		// When s.InnerSegmentCount > 0, ORDER BY/LIMIT/OFFSET applies to the
-		// result of the first InnerSegmentCount segments (the "inner" compound),
-		// not the final outer result. Example:
-		//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
-		// → after segment 1 (INTERSECT), apply ORDER BY to Sort(INTERSECT),
-		//   then append UNION ALL C without re-sorting. M0097-0044.
-		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
-		for i, seg := range segments {
-			// Cut segments had their SetOp saved+cleared above, then restored
-			// early for plan-cache correctness. Re-cut before planning so
-			// planSelect(seg.stmt) sees only this operand and does not
-			// recursively re-flatten the already-flattened chain. M0097-0050.
-			// A segment with cutAt == nil is either a true leaf (SetOp=nil) or
-			// a fully-parenthesised compound that must retain its SetOp so the
-			// inner compound is planned as one atomic operand.
-			// When the operand is only PARTIALLY parenthesised, cutAt is the
-			// paren boundary inside its chain rather than the operand itself,
-			// so the parenthesised prefix is planned atomically and the tail
-			// was already flattened into later segments. M0125-0006.
+		// planSegment plans segment i's operand alone.
+		//
+		// Cut segments had their SetOp saved+cleared above, then restored
+		// early for plan-cache correctness. Re-cut before planning so
+		// planSelect(seg.stmt) sees only this operand and does not
+		// recursively re-flatten the already-flattened chain. M0097-0050.
+		// A segment with cutAt == nil is either a true leaf (SetOp=nil) or
+		// a fully-parenthesised compound that must retain its SetOp so the
+		// inner compound is planned as one atomic operand.
+		// When the operand is only PARTIALLY parenthesised, cutAt is the
+		// paren boundary inside its chain rather than the operand itself,
+		// so the parenthesised prefix is planned atomically and the tail
+		// was already flattened into later segments. M0125-0006.
+		planSegment := func(i int) (Node, error) {
+			seg := segments[i]
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = nil
 			}
@@ -869,11 +862,18 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
 			}
-			if rerr != nil {
-				return nil, rerr
-			}
+			return right, rerr
+		}
+		// applySetOp joins `right` onto `acc` using segment i's operator.
+		// `acc` is whatever the fold has accumulated on the operator's left —
+		// the running left-deep result at this precedence level, NOT
+		// necessarily the leftmost branch, so type unification and the
+		// column-count check are re-based on it rather than on a flat index.
+		// M0125-0016.
+		applySetOp := func(acc, right Node, i int) (Node, error) {
+			seg := segments[i]
 			// Each branch must project the same number of columns.
-			if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
+			if lc, rc := len(acc.Output()), len(right.Output()); lc != rc {
 				return nil, &PlanError{
 					Pos:     seg.opPos,
 					Code:    "42601",
@@ -884,25 +884,100 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// nodes for columns where the left and right types differ. This ensures
 			// that string values like 'foo' are validated when the left branch
 			// declares a typed column (e.g. numeric). M0097-0056.
-			right = wrapSetOpBranchWithCasts(seg.opPos, left.Output(), right)
-			left = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: seg.opType, All: seg.opAll}
-			// If this segment is the last "inner" segment, apply the sort/limit
-			// to the intermediate result before processing outer segments.
-			if innerBoundary > 0 && i+1 == innerBoundary {
-				inner, werr := wrapSetOpSortLimit(s, left, cat)
-				if werr != nil {
-					return nil, werr
+			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
+			return &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, nil
+		}
+		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
+		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT
+		// (gram.y:825-826), and each level is left-associative.
+		//
+		// goopg used to fold the flat segment list left-deep regardless of the
+		// operator, so a BARE `A UNION B INTERSECT C` planned as
+		// `(A UNION B) INTERSECT C` and returned the wrong rows — a wrong-answer
+		// defect no row-count gate could see. The explicitly-parenthesised
+		// spelling was already correct via setOpBindsTighter at the paren
+		// boundary; this makes the bare spelling agree. M0125-0016.
+		//
+		// The shape is a two-level precedence climb: a maximal INTERSECT run is
+		// folded into a single operand before it becomes the right-hand side of
+		// the enclosing UNION/EXCEPT fold. A run that starts at `lo` has no
+		// UNION/EXCEPT to its left inside this range, so it attaches directly to
+		// acc.
+		foldSetOpRange := func(acc Node, lo, hi int) (Node, error) {
+			i := lo
+			for i < hi && segments[i].opType == parser.SetOpIntersect {
+				right, err := planSegment(i)
+				if err != nil {
+					return nil, err
 				}
-				left = inner
-				// Clear the saved ORDER BY/LIMIT/OFFSET so wrapSetOpSortLimit
-				// below doesn't apply them again to the outer result.
-				savedOrderBy = nil
-				savedLimit = nil
-				savedOffset = nil
-				s.OrderBy = nil
-				s.Limit = nil
-				s.Offset = nil
+				if acc, err = applySetOp(acc, right, i); err != nil {
+					return nil, err
+				}
+				i++
 			}
+			for i < hi {
+				opIdx := i
+				right, err := planSegment(i)
+				if err != nil {
+					return nil, err
+				}
+				i++
+				// Absorb the INTERSECT run that follows this operand: it binds
+				// tighter than segments[opIdx]'s UNION/EXCEPT, so it groups with
+				// what follows rather than with what precedes.
+				for i < hi && segments[i].opType == parser.SetOpIntersect {
+					inner, ierr := planSegment(i)
+					if ierr != nil {
+						return nil, ierr
+					}
+					if right, ierr = applySetOp(right, inner, i); ierr != nil {
+						return nil, ierr
+					}
+					i++
+				}
+				if acc, err = applySetOp(acc, right, opIdx); err != nil {
+					return nil, err
+				}
+			}
+			return acc, nil
+		}
+		// When s.InnerSegmentCount > 0, ORDER BY/LIMIT/OFFSET applies to the
+		// result of the first InnerSegmentCount segments (the "inner" compound),
+		// not the final outer result. Example:
+		//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
+		// → after segment 1 (INTERSECT), apply ORDER BY to Sort(INTERSECT),
+		//   then append UNION ALL C without re-sorting. M0097-0044.
+		//
+		// That boundary is also a hard PRECEDENCE barrier: the user's
+		// parentheses grouped those segments explicitly, so an INTERSECT run may
+		// not reach across it. `(A UNION B ORDER BY 1) INTERSECT C` must stay
+		// `(A UNION B) INTERSECT C` and must not become `A UNION (B INTERSECT
+		// C)`. Folding each side of the barrier separately gives exactly that,
+		// and it keeps `left` equal to the inner compound's value at the point
+		// the sort/limit is applied. M0125-0016.
+		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
+		if innerBoundary > 0 && innerBoundary <= len(segments) {
+			if left, err = foldSetOpRange(left, 0, innerBoundary); err != nil {
+				return nil, err
+			}
+			inner, werr := wrapSetOpSortLimit(s, left, cat)
+			if werr != nil {
+				return nil, werr
+			}
+			left = inner
+			// Clear the saved ORDER BY/LIMIT/OFFSET so wrapSetOpSortLimit
+			// below doesn't apply them again to the outer result.
+			savedOrderBy = nil
+			savedLimit = nil
+			savedOffset = nil
+			s.OrderBy = nil
+			s.Limit = nil
+			s.Offset = nil
+			if left, err = foldSetOpRange(left, innerBoundary, len(segments)); err != nil {
+				return nil, err
+			}
+		} else if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
+			return nil, err
 		}
 		// Restore final ORDER BY / LIMIT / OFFSET (may be nil if cleared above).
 		s.OrderBy = savedOrderBy
