@@ -128,13 +128,26 @@ started.
 >       root-caused; both closed at STEP 0 as *measured-and-already-fixed*, the
 >       M0124-0004 shape. Attribution stays where the SF0.5 bisect put it
 >       (**M0125-0009**) and is NOT confirmed by this run.
->    **↳ WITH ITEM 5 DONE, ALL FIVE ORDERED ITEMS ARE DISCHARGED.** The next
->    selection is no longer taken from this list: fall back to the M0125 body and
->    take **`M0125-0007`** (unpadded month/day date decode) — the single defect
->    behind the three Q16/Q94/Q95 `CKMISMATCH` cells item 3's gate uncovered, and
->    the only M0125 item with a fresh acceptance signal waiting for it. It is a
->    **codec** change, so it owes the full bar INCLUDING the regress-port suite
->    (Hard-won Rule #5), not just the units + spotcheck + SF0.5 trio.
+>    **↳ ALL FIVE ORDERED ITEMS ARE DISCHARGED, and so is the fall-back:**
+>    **`M0125-0007`** (unpadded month/day date decode) **landed 2026-07-30** —
+>    `internal/pgdatetime` + every executor date/time entry point; the three
+>    Q16/Q94/Q95 `CKMISMATCH` cells went from one shared wrong-answer checksum to
+>    three distinct real answers. It did not turn them green, and the probe that
+>    proved it also named what remains behind each, which sets the next order:
+>    1. **`M0125-0008`** (EXISTS + NOT EXISTS over one outer rel). Now the
+>       highest-value M0125 item left: it owns **two** of the three cells —
+>       Q94 (`7` vs PG `2`) and **Q16** (`63` vs PG `23`), which M0125-0007's
+>       probe newly attached to it. Unblocked; its "blocked until the sweep
+>       reaches Q99" note was discharged on 2026-07-29.
+>    2. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document
+>       still actionable.
+>    3. **`M0125-0023`** (Q95, filed 2026-07-30) — the third cell, and a
+>       different mechanism from -0008: it *under*-counts (`5` vs PG `23`) and
+>       has no `EXISTS`.
+>    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
+>    quiet host. M0125-0007 is a codec change and could only get the 3-query
+>    value probe, because the nightly CI batch held the host for its whole loop
+>    (ledger row 2026-07-30). Fold it into whichever of the above lands first.
 >    **`M0125-0020` landed at `beb7af82` before this list was written**, so its
 >    ordering is moot — but the reason it was selected is not: it was chosen on
 >    the false completeness claim corrected in item 3. Do not select the next
@@ -1646,7 +1659,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       still skips a set-op right branch, and the FULL 99-query SF0.5 gate is
       still owed — but its six-loop blocker (the wedged nightly server) CLEARED
       during this loop.
-- [ ] **M0125-0007 — date input rejects unpadded month/day, and the comparison
+- [x] **M0125-0007 — date input rejects unpadded month/day, and the comparison
       path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). PG's `DecodeDate`/`ParseDateTime`
       (`postgres/src/backend/utils/adt/datetime.c`) accept 1-or-2-digit month and
@@ -1681,6 +1694,40 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       distinct values matching the oracle. Executor/codec change, so it requires
       `tpch-spotcheck.sh` + the SF0.5 gate per the pre-commit bar, plus
       the full regress-port suite (Hard-won Rule #5 — this is a codec change).
+      **↳ DONE 2026-07-30** (`analysis/m0125-0007/README.md`, design
+      `docs/design/0125-0007-pg-faithful-date-field-decode.md`). New leaf package
+      `internal/pgdatetime` normalises PG's ISO numeric spellings — unpadded
+      month/day/hour/minute/second plus the surrounding-whitespace trim — in ONE
+      place, with `DecodeNumber`'s own `flen >= 3` floor on the leading field so
+      the DateStyle-dependent forms stay loud errors instead of becoming
+      silently-wrong dates. Every executor entry point routes through it: the
+      `date` and `timestamp`/`timestamptz` cast cases and `pg_input_is_valid`
+      (`expr.go`), and `parseTimeString` / `parseTimeTZString` /
+      `parseCopyTimestamp` (`copy_text.go`), which funnel COPY TEXT, `codec.go`'s
+      date encode and `tryParseStringAs`. `internal/pgnodes` needed nothing — its
+      `parseDateFields` was the lenient sibling all along. **A second silent wrong
+      answer was found and fixed on the way**: `ts_col = '2002-05-01 03:04:05'`
+      also matched nothing, fully padded, because `tryParseStringAs` tried
+      `parseTimeString` first and it anchors the stripped time at 1970-01-01.
+      **Acceptance: the predicted signature landed exactly** — the one goopg
+      checksum `512b5fdab820c47b` became three distinct ones and `0 / NULL / NULL`
+      became real numbers — but NOT the oracle's three, because a second defect
+      sits behind each, and the probe says which: **Q16 `63` and Q94 `7` now
+      OVER-count** PG's `23` and `2` (the EXISTS+NOT EXISTS shape = **M0125-0008**,
+      which did not previously name Q16), while **Q95 `5` UNDER-counts** PG's `23`
+      and contains no EXISTS at all (two `IN (subquery)` over a CTE — a different
+      mechanism, filed as **M0125-0023**). Gates: units PASS;
+      `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); regress-port quick set + the six
+      datetime suites diffed against a HEAD-`337526b1` worktree binary — 1/52 PASS
+      on both, every per-test diff byte-identical bar a clock-dependent `uuidv7`
+      test. **The full 99-query SF0.5 gate is still OWED** (ledger row): the
+      nightly CI batch held the host all loop, so only the 3-query value probe ran.
+      Five deferral rows record what PG still accepts and goopg does not, the
+      still-silent `d_date = 'garbage'`, the 22007-vs-22008 split, and two
+      pre-existing wrong answers this reproduction surfaced (dates outside Go's
+      `time.Time` nanosecond range round-trip wrong — `'0002-01-01'::date` gives
+      `1755-08-30`; a plain `timestamp` applies an explicit offset instead of
+      discarding it).
 - [ ] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
       NON-SUBSET result** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). With TPC-DS Q94's date literals padded so M0125-0007 is out of
@@ -1704,6 +1751,15 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `docs/design/0125-0008-semi-anti-conjunction-residual.md`.
       **Blocked until the sweep reaches Q99**; planner/executor change → full
       pre-commit bar (`tpch-spotcheck.sh`, SF0.5 gate, `make plan-diff`).
+      **↳ UNBLOCKED, and Q16 now belongs here too (2026-07-30, M0125-0007's
+      acceptance probe).** With the date defect gone, both EXISTS+NOT EXISTS
+      queries over-count at SF0.5: **Q16 returns `63 | 319602.45 | -91294.46`
+      against PG's `23 | 93334.17 | -35323.69`**, and **Q94 returns
+      `7 | 10534.30 | 7178.64` against PG's `2 | 5037.18 | 1067.82`** — the same
+      conjunction-grows-the-result signature, on the catalog side. Add Q16's
+      values to the acceptance set; its four-row isolation matrix has not been
+      taken yet. Q95 is NOT this defect (it under-counts and has no EXISTS) —
+      see M0125-0023.
 - [x] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
       sibling aggregates** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). **One-line root cause, wide blast radius.** Aggregate dedup
@@ -2231,6 +2287,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `ci/batch/tpcds-row-anchors.csv`, so add one on close.
       Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q51).
       Planner/executor change → full pre-commit bar.
+- [ ] **M0125-0023 — TPC-DS Q95 UNDER-counts: two `IN (subquery)` over the same
+      CTE drop rows PG keeps** (discovered 2026-07-30 by M0125-0007's acceptance
+      probe; ledger row same date). With the unpadded-date defect gone, Q95
+      returns **`5 | 11180.00 | -6205.20`** at SF0.5 where PG returns
+      **`23 | 45031.03 | -1282.36`** (goopg ck `663cec31dac6449c`, oracle ck
+      `e498634c02595c29`). It is **not** M0125-0008: Q95 contains no `EXISTS` at
+      all, and it loses rows rather than gaining them. Its two gates are
+      `ws1.ws_order_number in (select ws_order_number from ws_wh)` and
+      `ws1.ws_order_number in (select wr_order_number from web_returns, ws_wh
+      where wr_order_number = ws_wh.ws_order_number)`, both over the same
+      self-joined CTE `ws_wh` — so the suspects are IN-subquery → semi-join
+      conversion when the inner side is a CTE reference, and CTE re-evaluation
+      across two references in one WHERE. **First step is the isolation matrix**
+      M0125-0008 already demonstrates the value of: run the base joins alone,
+      then `+ first IN`, then `+ second IN`, on BOTH engines, and find which
+      conjunct first diverges — the monotonicity direction (goopg ⊆ PG here)
+      says a predicate is over-restricting, the opposite of Q94's.
+      **Accept by VALUE**: Q95 = `23 | 45031.03 | -1282.36` at SF0.5 (checksum
+      equal to the oracle), plus the isolation matrix as a planner/executor test.
+      Design `docs/design/0125-0023-in-subquery-over-cte-under-count.md`.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, the
+      SF0.5 gate, `make plan-diff LABEL=tpcds-round2-head`).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

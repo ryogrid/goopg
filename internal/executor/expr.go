@@ -25,6 +25,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
@@ -2296,6 +2297,15 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 // On success it returns a Datum with that kind; on failure it
 // returns a KindString Datum (the original), letting the caller
 // produce a proper type-mismatch error.
+// hasISODatePrefix reports whether s opens with a canonical, zero-padded
+// "YYYY-MM-DD" date field — the same fixed-offset probe parseTimeString and
+// parseTimeTZString use to decide a string carries a date. Callers pass a
+// pgdatetime.NormalizeInput'd string so the unpadded spellings PG accepts are
+// recognised too.
+func hasISODatePrefix(s string) bool {
+	return len(s) >= 10 && s[4] == '-' && s[7] == '-'
+}
+
 func tryParseStringAs(target DatumKind, s string) Datum {
 	switch target {
 	case KindInt:
@@ -2307,6 +2317,19 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 			return newNumeric(m, int(sc))
 		}
 	case KindTime:
+		// M0125-0007: a literal that carries a DATE part is a timestamp and has
+		// to be decoded as one FIRST. parseTimeString strips the date prefix and
+		// returns the bare time-of-day anchored at 1970-01-01, so reaching it
+		// first made `ts_col = '2002-05-01 03:04:05'` compare 2002-05-01 against
+		// 1970-01-01 and silently report no match — the same silent-wrong-answer
+		// shape as the unpadded-field defect, one type over. PG never has this
+		// ambiguity: transformExpr coerces the unknown literal to the column's
+		// type before evaluation.
+		if hasISODatePrefix(pgdatetime.NormalizeInput(s)) {
+			if t, err := parseCopyTimestamp(s); err == nil {
+				return NewTimeDatum(t)
+			}
+		}
 		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
 		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
 		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
@@ -2904,7 +2927,10 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		t, err := time.Parse("2006-01-02", x.Value)
+		// M0125-0007: PG's DecodeDate reads each numeric field on its own, so
+		// '2002-5-1' is the same date as '2002-05-01'. Normalise to the padded
+		// spelling the fixed Go layout below requires.
+		t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(x.Value))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
 		}
@@ -2954,8 +2980,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 			"2006-01-02 15:04",
 			"2006-01-02",
 		}
+		// M0125-0007: same field-at-a-time acceptance as the date case above —
+		// PG takes '2002-5-1 3:4:5' for a timestamp, the layouts below do not.
+		normalized := pgdatetime.NormalizeInput(x.Value)
 		for _, layout := range layouts {
-			if t, err := time.Parse(layout, x.Value); err == nil {
+			if t, err := time.Parse(layout, normalized); err == nil {
 				x.CachedTime = t.UTC()
 				x.CacheValid = true
 				return NewTimeDatum(x.CachedTime), nil
@@ -8746,7 +8775,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if _, ok := parseDateInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				_, err := time.Parse("2006-01-02", v)
+				// M0125-0007: pg_input_is_valid must agree with the cast path,
+				// which now accepts PG's unpadded month/day fields.
+				_, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(v))
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
 				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).

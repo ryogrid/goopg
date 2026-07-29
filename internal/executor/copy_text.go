@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/pgdatetime"
 )
 
 // COPY TEXT format (the default for `COPY ... TO/FROM STDOUT/STDIN`):
@@ -366,7 +367,11 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 // "15:36:39 America/New_York" are rejected with an error.
 func parseTimeString(s string) (time.Time, error) {
 	orig := s
-	s = strings.TrimSpace(s)
+	// M0125-0007: pad unpadded hour/minute/second (and any leading date) up
+	// front. Everything below indexes fixed offsets — the date-prefix probe
+	// `s[4] == '-' && s[7] == '-'`, the hour-24 rewrite on s[:2], the
+	// leap-second probe on s[5] — so it only ever worked on padded input.
+	s = pgdatetime.NormalizeInput(s)
 
 	// Full timestamp with date prefix: strip date, keep time part.
 	// e.g. "2003-03-07 15:36:39 America/New_York" → "15:36:39"
@@ -620,7 +625,9 @@ func parseTZOffset(s string) (int, bool) {
 // Inputs with named timezone in bare time strings (no date) are rejected.
 func parseTimeTZString(s string) (time.Time, int, error) {
 	orig := s
-	s = strings.TrimSpace(s)
+	// M0125-0007: as in parseTimeString — the date-prefix probe below is a
+	// fixed-offset test (s[4], s[7], s[:10]) that assumes zero-padded fields.
+	s = pgdatetime.NormalizeInput(s)
 
 	offsetSecs := 0
 
@@ -769,6 +776,12 @@ func wrapTimeTZError(err error, orig string) error {
 // commonly produces: with or without fractional seconds, with or
 // without timezone.
 func parseCopyTimestamp(s string) (time.Time, error) {
+	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
+	// unpadded month, day, hour, minute or second is legal input. Normalise
+	// before the fixed layouts below, which are not. This is also the coercion
+	// used by the cross-kind comparison path (tryParseStringAs), so leaving it
+	// out here is what made `d_date = '2002-5-01'` silently match no rows.
+	s = pgdatetime.NormalizeInput(s)
 	layouts := []string{
 		"2006-01-02",
 		"2006-01-02 15:04:05.000000",

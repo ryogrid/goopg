@@ -1,44 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: **`M0125-0014` and `M0125-0015` both CLOSED** — Q49/Q51 re-measured at
-SF=1 on HEAD `f3f31d87`, both value-equal to PG. Artefacts
-`analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q49 / § Q51 "Execution
-record"; ledger `tpcds-round2 Q49` → resolved, `q47-q49-q51` UPDATEd (stays open
-for Q47); banner item 5 discharged.
+Last loop: **`M0125-0007` CLOSED** — PG-faithful date/time field decode.
+`d_date = '2002-5-01'` matched zero rows and raised nothing; three TPC-DS
+queries answered `0 / NULL / NULL` because of it. New leaf package
+`internal/pgdatetime` (`NormalizeInput`) + every executor entry point.
+Artefacts `analysis/m0125-0007/`; design
+`docs/design/0125-0007-pg-faithful-date-field-decode.md` (indexed); 5 ledger
+rows; new item **M0125-0023** filed for Q95.
 
-Nightly triage: `ci/logs/action-items.md` still unchanged (mtime Jul 25 03:20),
-all 26 `AI-` subjects already filed — no-op. Separately FILED (not worked, per
-banner): the TPC-DS nightly row-anchor mechanism is dead.
+Nightly triage: `ci/logs/action-items.md` unchanged (mtime Jul 25 03:20), all
+26 `AI-` subjects already filed — no-op.
 
-## NEXT (banner order — all five ordered items are now discharged)
+## NEXT (banner order, rewritten this loop)
 
-1. **`M0125-0007`** (unpadded month/day date decode) — the banner's new
-   fall-back selection. One defect behind the three Q16/Q94/Q95 `CKMISMATCH`
-   cells; it has a fresh acceptance signal waiting. **Codec change ⇒ full bar
-   INCLUDING the regress-port suite** (Rule #5), plus `tpch-spotcheck.sh` and the
-   SF0.5 gate.
-2. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document still
-   actionable.
+1. **`M0125-0008`** — owns TWO of the three CKMISMATCH cells now: Q94 AND Q16.
+2. **`M0125-0013`** (Q47).
+3. **`M0125-0023`** (Q95) — newly filed.
+Owed independently: **one full 99-query SF0.5 gate run on a quiet host.**
 
 ## Facts the next loop should NOT re-derive
 
-- **Q49 = `OK 83 s / 34 rows`, `ck=63ace0d888e86982`; Q51 = `OK 47 s / 100 rows`,
-  `ck=443e242cfab22c02`** at SF=1, both equal to PG's checksum. The
-  `OK 79 s / 30` and `OK 587 s / 0` sweep rows are superseded — do not re-measure.
-- **Q51 is no longer budget-marginal**: 553 s of headroom, not 13 s. Q82
-  (`OK 556 s`, 44 s) is again the sweep's narrowest `OK` margin.
-- **Neither mechanism was ever found.** Both closed at STEP 0 (the M0124-0004
-  "resolve *or classify*" shape). Attribution to M0125-0009 is inherited from the
-  SF0.5 bisect, NOT measured at SF=1 — one reading at HEAD cannot separate -0009
-  from -0010/-0011/-0012/-0020. Don't restate it as measured.
-- **The TPC-DS nightly row anchors have never worked**: `summarize.py:485` reads
-  `r["rows"]`, the CSV column is `expected_rows` ⇒ all 63 dropped. TPC-H is fine
-  (its CSV uses `rows`). Filed under M-NIGHTLY, parked; the Q49/Q51 anchors added
-  this loop are inert until it lands.
-- `scripts/tpcds-result-checksum.py` takes a **path argument**, not stdin.
+- Q16/Q94/Q95 at SF0.5, post-fix vs PG: Q16 `63|319602.45|-91294.46` vs
+  `23|93334.17|-35323.69`; Q94 `7|10534.30|7178.64` vs `2|5037.18|1067.82`;
+  Q95 `5|11180.00|-6205.20` vs `23|45031.03|-1282.36`. goopg cks
+  `863c4e96d8930d66` / `fb2c619e9bcb6bae` / `663cec31dac6449c`. **Q16/Q94
+  over-count (= M0125-0008); Q95 under-counts and has NO `EXISTS` (= -0023).**
+- The one shared wrong-answer ck `512b5fdab820c47b` is GONE. Do not re-probe.
+- **Pre-existing, NOT introduced** (both reproduce at `337526b1` padded):
+  `'0002-01-01'::date` → `1755-08-30` (Go `time.Time` ns range; `Datum.Int`
+  holds UnixNano, PG holds a day count); `'…03:04:05.25-04'::timestamp` →
+  `07:04:05.25` (plain `timestamp` must DISCARD the offset). Ledger row filed.
+- `d_date = 'garbage'` is STILL silently false (PG raises 22007) — deliberate
+  deferral, own ledger row; `promoteCrossKind` has one caller (`compareDatum`).
+- PG oracle cluster :65438 takes user **`ryo`**, not `postgres` (goopg takes
+  `postgres`). `bench/tpcds/server.sh {start|stop} {pg|sf05}`.
+- `pg-regress-runner.sh --all` HANGS; the quick set (52) + the 6 datetime
+  suites take ~40 s each and are the usable form. Its per-test `.diff` files
+  embed absolute paths and a timestamp header — strip lines 1-2 AND the repo
+  path before comparing two trees, or all 52 look changed.
+- A worktree off HEAD needs `ln -s <main>/postgres <wt>/postgres`; `postgres/`
+  is a real untracked dir in the main tree, not a symlink.
 
-Gates run: `make ralph-state-guard` (INCONSISTENT → auto-REPAIRED → OK); pgbench
-smoke via the commit hook. No engine code changed (measurement + docs + CI
-metadata only), so the units/spotcheck/SF0.5/plan-diff bar was not owed.
+Gates run: units suite PASS; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
+regress-port quick set + 6 datetime suites diffed vs a HEAD-built worktree
+binary — 1/52 PASS on both, all diffs identical bar a clock-dependent `uuidv7`
+test; SF0.5 **3-query value probe only** (`FORCE=1`, nightly CI batch owned the
+host — full gate owed, ledger row); `make ralph-state-guard`; pgbench smoke via
+the commit hook.
 
 In-flight: none.
