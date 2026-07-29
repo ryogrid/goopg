@@ -1,49 +1,50 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0012 (TPC-DS Q8) COMPLETE and committed.** fix_plan box TICKED.
-Design `docs/design/0125-0012-q8-subquery-scope-index-remap.md` (§0 + §R carry the
-correction), README index row updated to `accepted`, ledger row appended.
+Last loop: **the full 99-query TPC-DS SF0.5 gate (banner item 4) RAN and PASSED.**
+Eight loops of debt discharged. Artifact `analysis/tpcds-sf05-full-gate-20260729/`
+(README = method + the eight-diff table; `merged-sweep-head-50cf7c5f.txt` = 99 rows).
+Banner item 4 struck through with the result; ledger row appended; M0125-0007
+un-blocked.
 
 Nightly triage: `ci/logs/action-items.md` unchanged since 2026-07-25 (mtime Jul 25
-03:20), all 5 `AI-` subjects already filed — no-op for the sixth loop running.
+03:20); all 26 `AI-` subjects already filed under M-NIGHTLY — no-op again.
 
 ## NEXT (banner order — `.ralph/fix_plan.md` "Current Priority" wins)
 
-Banner items 1–3 are now all done (M0125-0003 stage 1, M0124-0002, M0125-0012), so:
+Banner items 1–4 are now all done. Remaining:
 
-1. **The full 99-query SF0.5 gate**, once (banner item 4) — six loops of debt now.
-   Needs a quiet host + ~1 h+. Last attempt reached Q53/99 in 57 min before the
-   session cap (ledger 2026-07-29); resume with `QUERIES="$(seq 54 99)"`.
-2. **`M0125-0014`/`-0015`** (Q49/Q51 SF=1 re-measure) — quiet host.
-3. **`M0124-0004`** (Q35 row count) — the last open M0124 item; quiet host.
-   Check `ci/batch/run-nightly.sh` is not running first (harness guards refuse).
+1. **`M0125-0014`/`-0015`** (Q49/Q51 **SF=1** re-measure) — banner item 5. Both now
+   PASS at SF0.5, but SF0.5 is a key-parity half-sample; take the SF=1 reading
+   before ticking. Quiet host.
+2. **`M0124-0004`** (Q35 row count) — the last open M0124 item; quiet host. Check
+   `ci/batch/run-nightly.sh` is not running first (harness guards refuse).
+3. **`M0125-0007`** (unpadded month/day date decode) — now unblocked, and the gate
+   handed it an acceptance signal (see below). Codec change ⇒ needs
+   `tpch-spotcheck.sh` + SF0.5 gate + the FULL regress-port suite (Rule #5).
 
 ## Facts the next loop should NOT re-derive
 
-- **M0125-0012's fix_plan "do not re-diagnose" paragraph is REFUTED** and the box is
-  ticked with the correction inline. The defect was `applyJoinTreePosMap`
-  (`bushy.go`) descending into a FROM-subquery `Project` and applying the OUTER
-  posMap outside its domain — NOT an unrepaired `Filter` ref. 57 was an
-  **MHJ-order** offset, not a global FROM-order index.
-- **Q8 is now in the TIMEOUT class, not the ERROR class.** Post-fix it exceeds a
-  1500 s budget at SF0.5 (elapsed 1633 s) where it used to error at ~11 s. Ledger
-  row has the resume point (`pushdown.go` — push `d_qoy`/`d_year` onto `date_dim`).
-  This is pre-existing plan quality, not a regression; plan-diff proves shape is
-  unchanged. **Do not re-open it as a regression.**
-- **Fast Q8 iteration recipe**: the doll-house replica in
-  `internal/executor/q8_subquery_scope_remap_test.go` reproduces the whole shape in
-  <10 ms. Use it instead of the 11 s SF0.5 query.
-- Throwaway servers: `./bin/goopg init -D <dir>` (subcommand is `init`, NOT
-  `initdb`); real PG for oracle checks via `initdb`/`pg_ctl` from
-  `postgres/local_install` on a /tmp datadir — ~15 s, avoids touching bench clusters.
-- `pgrep -f '<pattern>'` **self-matches the invoking Bash shell** — it reported a
-  live `query8` process that did not exist. Use `pgrep -x` / `ps -C`.
-- `make plan-diff` needs a server on 65433: `bench/tpch/setup_goopg.sh` first
-  (`tpch-spotcheck.sh` stops its own server on exit).
+- **Gate result at HEAD `50cf7c5f`**: `PASS=75 (46 ck-verified) MISMATCH=1
+  CKMISMATCH=3 ERROR=1 TIMEOUT=15 SKIP=4`. Timeout class = Q5 Q8 Q10 Q14 Q30 Q31
+  Q35 Q54 Q64 Q65 Q67 Q69 Q71 Q78 Q81 (**15**, not the 17 M0125 is named after).
+  Only ERROR is Q75 (M0125-0004); only row MISMATCH is Q47.
+- **Q16/Q94/Q95 share ONE goopg checksum `512b5fdab820c47b`** (the `0/NULL/NULL`
+  answer) vs three different oracle cks. One defect = M0125-0007, three queries.
+  Acceptance: that single ck must become three distinct oracle-matching values.
+- **Q72/Q88 TIMEOUT→PASS is a threshold artefact, not a fix** — they finish at
+  263s/236s; the 2026-07-27 baseline capped at 180s, today's default is 300s.
+- **Do NOT re-open Q8 as a regression**: ERROR→TIMEOUT is M0125-0012 working.
+- **How to run the gate in one loop**: four contiguous `QUERIES="$(seq A B)"`
+  chunks on ONE pre-built binary (`go build -o tmp/goopg-bench-bin ./cmd/goopg`
+  — the script only builds if the file is MISSING, so rebuild explicitly or you
+  measure a stale binary). Splits used: 1-30 (44m), 31-53 (19m), 54-72 (44m),
+  73-99 (22m); ~110 min total. Each chunk is stamped "SUBSET PROBE"; the merged
+  file is the gate result. Ledger row carries the caveat + a `RESUME_FROM` fix.
+- `pgrep -f '<pattern>'` **self-matches the invoking Bash shell**; use `pgrep -x`
+  / `ps -C`. (Confirmed again: `ps -C goopg-bench-bin` cleanly showed no orphan.)
 
-Gates run: units PASS (`RALPH_PRECOMMIT_SCOPE=units`); `tpch-spotcheck.sh` PASS
-(Q12 rows=2, Q13 rows=35 — canonical); `make plan-diff LABEL=tpcds-round2-head`
-**22/22 MATCH, 0 mismatch**; both new Q8 tests PASS post-fix and **proved to FAIL
-pre-fix**; pgbench smoke via the commit hook; `make ralph-state-guard` OK.
+Gates run: the full 99-query SF0.5 gate (above) — the loop's deliverable;
+`make ralph-state-guard` OK; pgbench smoke via the commit hook. No code changed,
+so no unit/spotcheck/plan-diff run was owed.
 
 In-flight: none.

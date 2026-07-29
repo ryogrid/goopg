@@ -99,13 +99,25 @@ started.
 >       -0020 is "the last unblocked M0125 item" is FALSE — that enumeration omits
 >       -0012…-0015 entirely. Q8 is the only unresolved member of round 1's nine
 >       goopg-only errors and reproduces at SF0.5 in 12 s.
->    4. **The full 99-query SF0.5 gate**, once. It is five loops of debt:
->       -0016 / -0017 were accepted on 6- and 4-query subsets, and **-0018 /
->       -0019 / -0021 ran ZERO SF0.5 queries**. A reachability grep answers "can
->       this defect be reached", not "did this parser change break an unrelated
->       query", so the debt is real for all five.
+>    4. ~~**The full 99-query SF0.5 gate**, once~~ — **DONE 2026-07-29**,
+>       `analysis/tpcds-sf05-full-gate-20260729/`. **99/99 covered at HEAD
+>       `50cf7c5f`, ZERO regressions**: `PASS=75 (46 ck-verified) MISMATCH=1
+>       CKMISMATCH=3 ERROR=1 TIMEOUT=15 SKIP=4`. Eight statuses differ from the
+>       `sweep-20260727-214619` baseline and all eight are accounted for (Q8
+>       ERROR→TIMEOUT = M0125-0012's fix; Q16/Q94/Q95 PASS→CKMISMATCH = the
+>       baseline had **no** value checksum, so M0124-0005 detected three silent
+>       wrong answers — one defect, **M0125-0007**; Q49/Q51 MISMATCH→PASS = fixed;
+>       Q72/Q88 TIMEOUT→PASS = the 180s→300s cap, no code). The eight loops of
+>       debt behind -0016 … -0021 are discharged in one pass; none of the six is
+>       owed a follow-up. Run as four contiguous `QUERIES=` chunks on ONE binary
+>       (~110 min total exceeds a loop's foreground budget) — the README explains
+>       why chunking is sound and what it cannot see.
 >    5. **`M0125-0014` / `-0015`** (Q49 / Q51 SF=1 re-measure) — pair them with
 >       M0124-0002's quiet-host window rather than opening a second one.
+>       **Both now PASS at SF0.5** in the gate above (Q49 ck-verified
+>       `ccb0983b810cf1d0`; Q51 `ck=n/a`, saturated LIMIT). That is EVIDENCE, not
+>       a discharge: both items are specified at **SF=1**, and SF0.5 is a
+>       key-parity half-sample where a full-fact-table defect can hide.
 >    **`M0125-0020` landed at `beb7af82` before this list was written**, so its
 >    ordering is moot — but the reason it was selected is not: it was chosen on
 >    the false completeness claim corrected in item 3. Do not select the next
@@ -1594,8 +1606,16 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       well: the same fixed-layout idiom likely rejects unpadded hours. Prefer a
       shared PG-faithful field decoder over per-site `time.Parse` layouts.
       Design `docs/design/0125-0007-pg-faithful-date-field-decode.md`.
-      **Blocked until the sweep reaches Q99**; executor/codec change, so it
-      requires `tpch-spotcheck.sh` + the SF0.5 gate per the pre-commit bar, plus
+      ~~**Blocked until the sweep reaches Q99**~~ — **UNBLOCKED 2026-07-29**: the
+      full 99-query SF0.5 gate ran (`analysis/tpcds-sf05-full-gate-20260729/`)
+      and reached Q99. It also supplies the **value-level** evidence this item
+      previously lacked: all three of Q16/Q94/Q95 now report the *identical*
+      goopg checksum `512b5fdab820c47b` (the `0/NULL/NULL` answer) against three
+      *different* oracle checksums (`40dbec0df91d2438` / `04afc1b69831a5ea` /
+      `e498634c02595c29`) — one defect, three queries, and a ready-made
+      acceptance signal: the fix must change that one goopg ck to three
+      distinct values matching the oracle. Executor/codec change, so it requires
+      `tpch-spotcheck.sh` + the SF0.5 gate per the pre-commit bar, plus
       the full regress-port suite (Hard-won Rule #5 — this is a codec change).
 - [ ] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
       NON-SUBSET result** (discovered by M0124-0001 chunk 12, ledger row
