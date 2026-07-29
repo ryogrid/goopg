@@ -10061,6 +10061,14 @@ func exprType(e Expr) catalog.Type {
 			}
 			return catalog.Type{Name: "unknown"}
 		case parser.OpConcat:
+			// byteacat: bytea || bytea is bytea. The executor's OpConcat arm
+			// returns a KindBytes datum for that shape, so advertising text
+			// here would make the wire layer print the raw payload instead of
+			// the `\x…` hex form. M0125-0021.
+			if strings.EqualFold(exprType(x.Left).Name, "bytea") ||
+				strings.EqualFold(exprType(x.Right).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
 			return catalog.Type{Name: "text"}
 		case parser.OpAnd, parser.OpOr, parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpLike, parser.OpNotLike:
 			return catalog.Type{Name: "bool"}
@@ -10140,6 +10148,20 @@ func exprType(e Expr) catalog.Type {
 		case "to_timestamp":
 			return catalog.Type{Name: "timestamp"}
 		case "substr", "substring":
+			// bytea_substr returns bytea; text_substring returns text. The
+			// executor keys off the argument's Kind, so the advertised type
+			// must key off the argument's type or the wire layer prints a
+			// bytea slice as raw bytes. M0125-0021.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
+		case "decode":
+			// decode(text, format) -> bytea (encode.c). Untyped before
+			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as
+			// "unknown" and printed the two raw bytes instead of `\xaabb`.
+			return catalog.Type{Name: "bytea"}
+		case "encode":
 			return catalog.Type{Name: "text"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}

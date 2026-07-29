@@ -1422,23 +1422,39 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (zero of the 100 query files use `string_agg`/`array_agg`/`json_agg`/
       `xmlagg`). Two ledger rows deferred → M0125-0021 (bytea held as text) and
       the five order-sensitive aggregates with no `applyAgg` branch at all.
-- [ ] **M0125-0021 — a `bytea` literal is carried as TEXT, so `encode()` returns
-      an empty string and `length()` counts escape characters** (discovered by
-      M0125-0019 2026-07-29, ledger row 2026-07-29). Measured against the PG
-      18.3 oracle (port 65438): `length('\xaabb'::bytea)` = **6** in goopg vs
-      **2** in PG; `encode('\xaabb'::bytea,'hex')` = **`''`** vs `aabb`;
-      `encode('abc'::bytea,'base64')` = **`''`** vs `YWJj`;
-      `encode('abc'::bytea,'escape')` = **`''`** vs `abc`; and
-      `string_agg(b,'\x00'::bytea)::text` prints `\xbb\x00\xaa` vs `\xbb00aa`.
-      The `::bytea` cast yields the six-character escaped TEXT rather than a
-      `KindBytes` datum, which is why `applyAgg`'s `arg.Kind == KindBytes`
-      branch is unreachable from a literal. `encode()` returning `''` rather
-      than erroring makes this a **silent** wrong answer wherever bytea is
-      hex-dumped. **Resume**: `internal/executor/expr.go` — make the `::bytea`
-      cast produce `KindBytes`, then fix `encode`/`length`/`octet_length` to
-      read bytes; tighten `TestAggregateOrderByByteaStringAgg` (currently
-      asserts order only, deliberately) to PG's exact `\xbb00aa`. **Accept by
-      VALUE**; executor change -> full pre-commit bar.
+- [x] **M0125-0021 — a `bytea` literal was carried as TEXT, so `encode()`
+      returned an empty string and `length()` counted escape characters**
+      (discovered by M0125-0019 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0021-pg-faithful-bytea-value.md`, three ledger rows
+      2026-07-29). `'\xaabb'::bytea` was the six-character **string**
+      `\xaabb`, not the two bytes. Two symptoms are loud (`length`=6 vs 2;
+      `order by b` sorted by the backslash), the third is not and is why this
+      was a defect rather than a gap: `encode` is *the* way a caller hex-dumps
+      a bytea, so a stub returning `''` instead of `42883` made a hex dump
+      silently produce nothing. Root cause = `evalCast` had **no `bytea` arm**,
+      so the cast fell through the pass-through default and kept `KindString`;
+      `encodeValuePG` had the same hole from the other side. `KindBytes` and
+      `decode()` already existed — what was missing was any path from a literal
+      into it. Fix = `internal/executor/bytea.go` (transliterations of
+      `byteain`, `hex_decode_safe`, `esc_decode`, `pg_base64_decode`,
+      `hex_encode`, `esc_encode`, `pg_base64_encode`, `byteaout`) wired in
+      **sibling pairs**: cast ↔ storage encoder, `decode(…,'hex')` ↔
+      `'\x…'::bytea`, `<bytea>::text` ↔ the wire renderer, and executor Kind ↔
+      `planner.exprType`'s advertised column type (a `KindBytes` datum typed
+      `text` reaches psql as raw bytes). The comparator arm is load-bearing:
+      once a column holds two bytes, `where b = '\xaabb'` would have matched
+      **nothing** — a wrong number turned into a silently empty result set.
+      Three upstream subtleties pinned: `encode(…,'escape')` is `esc_encode`
+      (NUL/high-bit/backslash only), NOT `byteaout`'s escape mode;
+      `pg_base64_encode` wraps at 76 chars so its own output must be decodable
+      (Go's `base64.StdEncoding` rejects those newlines); hex errors are
+      `22023` while `byteain`'s escape pass raises `22P02`. Also removed three
+      pre-existing `decode()` deviations. **Accepted BY VALUE**: a 27-statement
+      matrix through psql against a throwaway goopg server vs the PG 18.3
+      oracle (port 65438) diffed **byte-identical**, plus 40 by-value subtests.
+      Three ledger rows deferred: `int → bytea` casts, the `bytea_output` GUC,
+      and the remaining bytea operators (`position`/`overlay`/`trim`/
+      `get_byte`/`set_byte`/`bit_length`).
 - [ ] **M0125-0020 — the set-op chain must become a TREE; three separate
       annotations are now patching the missing structure** (discovered by
       M0125-0017 2026-07-29, two ledger rows 2026-07-29). goopg stores a set-op
