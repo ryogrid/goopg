@@ -220,6 +220,50 @@ changes an error into an acceptance, and PG accepts those queries.
   (a plan-shape change is possible in principle: a laxer `pathKeyEqual` can
   merge pathkeys), and the pre-commit pgbench smoke.
 
+### 5.1 The executor half, added 2026-07-30 (both directions MEASURED)
+
+§6's "an end-to-end `CREATE AGGREGATE` value test" and §4's unmeasured
+`42P10` claim are both discharged by
+`internal/executor/agg_state_sharing_value_test.go`. The planner pin above
+asserts where the defect is *decided*; this file asserts where it becomes a
+wrong answer, and the two consequences turn out to be **user-visible in both
+directions**:
+
+| pin | at `da6d2c0c` | at HEAD | PG 18.3 |
+|---|---|---|---|
+| `ua_sum(a + b), ua_sum(a - b)` | `(77, 77)` | `(77, -63)` | `(77, -63)` |
+| `ua_sum(CASE…a), ua_sum(CASE…b)` | `(3, 3)` | `(3, 30)` | `(3, 30)` |
+| sfunc invocations, 3 rows × 2 unshared calls | 3 | 6 | 6 |
+| `DISTINCT ON (CASE…) … ORDER BY CASE…` | **`42P10`** | 3 rows | 3 rows |
+
+Three things this arm establishes that the planner-level pin could not:
+
+1. **The wrong answer is reachable end to end, and its shape is exactly as
+   argued.** `(77, 77)` is one row of plausible numbers — the second column
+   silently echoes the first — so no row-count gate anywhere in this programme
+   could have caught it.
+2. **The side effects are observable, which is how M0097-0032 was originally
+   found.** The fixture's sfunc is a real plpgsql function that `RAISE
+   NOTICE`s once per invocation, reaching `ctx.Notices` through
+   `executeSFuncCall`'s stored-routine fallback
+   (`operators_join_agg.go:3633`), so the test counts sfunc calls rather than
+   inferring them. A collision halves the count; an over-strict identity would
+   double it, which is what `TestUserAggSharesStateForEqualArgs` guards from
+   the other side — the M0097-0035 sharing optimisation must survive.
+3. **The laxer direction removed a real spurious error, not a theoretical
+   one.** §4 argued from PG's `equal()` ignoring location; measured against
+   the oracle (PG 18.3 on `127.0.0.1:65438`), goopg at `da6d2c0c` **rejected**
+   `SELECT DISTINCT ON (CASE …) … ORDER BY CASE …` with
+   `42P10: SELECT DISTINCT ON expressions must match initial ORDER BY
+   expressions`, a statement PG accepts and answers with the three rows HEAD
+   now returns. The `%T%v` fallback printed the two structurally identical
+   `*CaseExpr` nodes' nested pointers as addresses, so they never matched.
+   That makes the fix a **wrong-error fix as well as a wrong-answer fix**.
+
+The fixture reaches the leader/follower copy only because both halves are
+user-defined: `buildAggregate` leaves `SharedStateSlot = -1` for built-in
+aggregates, and only a user-defined sfunc can be observed running at all.
+
 ## 6. Deliberately not done
 
 - **A full TPC-DS SF0.5 value sweep.** Owed (ledger, 2026-07-30) and shared
@@ -229,7 +273,8 @@ changes an error into an acceptance, and PG accepts those queries.
   `TIMEOUT` cells the comparison reads.
 - **The 46 remaining `walkerPending` sites.** Unchanged scope; `M0125-0002`
   owns seven of them by blast radius.
-- **An end-to-end `CREATE AGGREGATE` value test** through the executor's
-  leader/follower copy. The planner-level `SharedStateSlot` assertion pins the
-  decision the executor consumes; the executor half is a separate fixture and
-  is recorded in the ledger.
+- ~~**An end-to-end `CREATE AGGREGATE` value test** through the executor's
+  leader/follower copy.~~ **DONE 2026-07-30 — see §5.1.** It was cheaper than
+  the deferral assumed: `executeSFuncCall` already falls back to
+  `executeStoredRoutine`, so a plpgsql sfunc needed no new fixture machinery,
+  and the same file closed the unmeasured `42P10` half against the PG oracle.

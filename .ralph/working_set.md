@@ -1,49 +1,53 @@
 (idle — nothing in flight)
 
-Last loop: **`M0125-0002` STEP 0 landed** — the walker inventory, re-derived from
-source and permanently gate-pinned. Banner's next-selection set was
-{`-0002`, `-0005`, `-0003` stage 3}; stage 2's TIMED arm was NOT takeable
-(`run-nightly.sh` PID 3541516 still held the host, load 5.0/9.9/12.4), and stage 3
-shadows stage 2's measurement, so `-0002` was selected — whose own documented
-STEP 0 is "re-derive the inventory FIRST or the task closes against a list that
-was never right".
+Last loop: **M0125-0024's owed executor-side value gate CLOSED**. New file
+`internal/executor/agg_state_sharing_value_test.go` (3 tests); design §5.1;
+ledger row 587 flipped `resolved`; one new ledger row appended.
 
-Fix: `internal/planner/exprwalk_inventory_test.go` — a go/ast census of every
-type switch over an `Expr` in package `planner`, pinned as `exprSwitchInventory`.
-No production code changed, so plan shape cannot move.
+Files: the new test file, `docs/design/0125-0024-expression-identity-collisions.md`
+(§5.1 + §6), `docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
 ## Facts the next loop should NOT re-derive
 
-- **The RC-1a class is 50 walkers, not 7 / 9 / 14.** 64 sites total: 2 exprwalk
-  primitives, 50 recursive-and-incomplete (2–25 of 32 arms), 12 non-recursive
-  classifiers. The seven were picked by MHJ/local-filter blast radius — sound
-  for scoping a conversion, useless for sizing a class. `-0002` covers 8/50.
-- **`remapByPosMap` is already complete (18 arms + 14 childless leaves = 32)**,
-  so commit 1 of `-0002` really is the no-op re-base (from -0001's record).
-- **Two identity fail-opens that COLLIDE, not no-op** → filed `M0125-0024`:
-  `planExprContentKey`'s `default:` is `fmt.Sprintf("%T", e)` (type name alone ⇒
-  distinct exprs of one unenumerated type share an aggregate STATE-SHARING key,
-  M0097-0032's shipped-wrong-answer shape); `exprEqual` falls back to `%T%v`
-  text compare ("pointer-safe only for primitives"), and the pair disagrees on
-  whether `*ColumnRef.SourceTableIdx` participates.
-- Each `-0002` conversion now closes by DELETING its pin; arm counts are
-  comments, never assertions (pinning them makes band-aid arms look like work).
-- A new `.go` file needs `gofmt -w` on THAT FILE ONLY (map-literal alignment);
-  the go1.25/1.26 caveat is about pre-existing files.
+- **A user-defined sfunc IS reachable from the in-package executor harness.**
+  The ledger row had budgeted a new fixture for this; it was not needed.
+  `executeSFuncCall` falls back to `executeStoredRoutine`
+  (`operators_join_agg.go:3633`) and `RAISE NOTICE` lands in `ctx.Notices`, so
+  a plpgsql sfunc + `newDDLFixture` + `runQuery` (with_compat_test.go) is the
+  whole recipe. Tests can COUNT sfunc calls, not just assert values.
+- **The M0125-0024 verdict is now "wrong answer AND wrong error".** At
+  `da6d2c0c`: `ua_sum(a+b), ua_sum(a-b)` → `(77, 77)` (PG: `(77, -63)`), and
+  `DISTINCT ON (CASE …) … ORDER BY CASE …` was **rejected** `42P10` although PG
+  18.3 accepts it (measured on the 65438 oracle). Do not re-argue the laxer
+  direction from `equalfuncs.c` — it is measured.
+- **PG oracle access:** 65438 is up; the role is **`ryo`, not `postgres`**
+  (`-U postgres` → `FATAL: role "postgres" does not exist`), dbs `tpcds`/`tpcds05`.
+  Read-only `VALUES`-derived queries need no DDL on the oracle cluster.
+- **Pre/post-fix proof without a worktree:** `git checkout da6d2c0c --
+  internal/planner/exprwalk.go internal/planner/planner.go`, run the *executor*
+  package, then `git checkout HEAD -- <same two>`. Planner _test.go files are
+  not compiled for another package, so this compiles cleanly. Cheap and exact.
+- **Host was NOT quiet** (nightly `run-nightly.sh` PID 3541516 since 01:51, its
+  TPC-DS stage on 65435 at ~11 GB RSS / ~590 % CPU, load ~12, budget-left ~78 min
+  at 06:59; Q18 TIMEOUT at 06:53). No timing was attempted. A goroutine dump was
+  taken from its pprof (6161) → `/tmp/nightly-goroutines-0713.txt`: it shows the
+  CURRENT query in `multiHashJoinOp.Open`, **no** orphaned-backend evidence, so
+  it is not the stack the parked shutdown-hang item wants.
 
-## NEXT (banner order)
+## NEXT (banner order — M0124 closed, M0125 first, M-NIGHTLY filed-only)
 
-1. `M0125-0002` **commit 1**: `remapByPosMap` re-base onto `cloneExprRefs` +
-   the missing `default:` (veto). Only commit that carries an empty-diff
-   expectation; 0125-0001 D6's 26 remap pins already guard it.
-2. `M0125-0003` stage 2's TIMED arm the moment the host is quiet (before
-   stage 3, which shadows it). Then `-0005` / stage 3 / `M0125-0024`.
-Owed independently, now six commits deep: one full 99-query SF0.5 gate run.
+1. **The owed SF0.5 gate, on a QUIET host** (`scripts/tpcds-sf05-regression.sh
+   sweep`, ~1 h). Owed three times over and it **must precede M0125-0002
+   commit 2**. Check `ci/batch/run-nightly.sh` is absent first.
+2. `M0125-0002` **commit 2 — `cloneExprShiftIdx`** (`nl_index_join.go:777`),
+   first commit expecting hunks; carries the full timed 22-query TPC-H run
+   (`scripts/goopg-test-run.sh`, `GOGC=100` / `GOMEMLIMIT=12GiB`).
+3. Then `M0125-0003` stage 2's TIMED arm, stage 3, `M0125-0005`.
 
-Gates run: `go build ./...` + `go vet ./internal/planner/` clean; units suite
-PASS (planner 0.279s, rest cached); census gate proved to FAIL both directions
-(unpinned probe walker; renamed pin) then restored green;
-`make ralph-state-guard` (repaired stale completed marker); pgbench smoke via
-the commit hook.
+Gates run: `go build ./...` clean; the 3 new tests proved to FAIL at `da6d2c0c`
+and PASS at HEAD; `./internal/executor/` + `./internal/planner/` PASS; units
+suite PASS (all cached); pgbench smoke via the commit hook; `make
+ralph-state-guard`. NOT run (host): SF0.5 sweep, any timed TPC-H, plan-diff
+(no planner/executor *product* code changed this loop — test-only).
 
 In-flight: none.

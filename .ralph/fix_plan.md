@@ -1528,6 +1528,31 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       half of the value gate (a real `CREATE AGGREGATE` driving the
       leader/follower state copy) and `exprIdentityKey` still ACCEPTING
       `scopeIgnore`, which is a wrong-answer policy for an identity question.
+      **↳ THE EXECUTOR HALF IS CLOSED (2026-07-30, next loop) and it upgraded
+      the verdict on this fix — BOTH directions are user-visible.** New file
+      `internal/executor/agg_state_sharing_value_test.go` (design §5.1) drives
+      the leader/follower copy end to end through a real `CREATE AGGREGATE`
+      over a real plpgsql sfunc. The fixture the ledger row budgeted for was
+      not needed: `executeSFuncCall` already falls back to
+      `executeStoredRoutine` and `RAISE NOTICE` reaches `ctx.Notices`, so the
+      test **counts sfunc invocations** (3 shared / 6 unshared over 3 rows)
+      rather than inferring them, which pins the M0097-0035 sharing
+      optimisation from the other side too. At `da6d2c0c`
+      `SELECT ua_sum(a+b), ua_sum(a-b)` returned **`(77, 77)`** where PG
+      returns `(77, -63)` — one row of plausible numbers with column 2 echoing
+      column 1, the exact shape no row-count gate in this programme could see.
+      **The same file discharges the OTHER owed half, and it was not a
+      no-op:** goopg at `da6d2c0c` **rejected** `SELECT DISTINCT ON (CASE …) …
+      ORDER BY CASE …` with `42P10`, a statement PG 18.3 accepts (verified
+      against the oracle on 65438 — three rows, identical to HEAD). So the
+      laxer `exprEqual` removed a **real spurious error**: this was a
+      wrong-ERROR fix as well as a wrong-answer fix. That ledger row is
+      flipped to `resolved`; only the `scopeIgnore` row remains. One NEW ledger
+      row came out of reading that path: an sfunc that raises is never
+      propagated — `executeSFuncCall` discards each candidate's error and
+      reports `42883 … does not exist`, and the DISTINCT leader pre-compute
+      (`operators_join_agg.go:1754`) drops the error and keeps the stale state,
+      i.e. a silently wrong number where PG aborts the statement.
       Original filing follows.
       (discovered by M0125-0002's STEP 0 census, 2026-07-30; ledger row same
       date). Both are outside the seven, and both are wrong-answer risks rather
