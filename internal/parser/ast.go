@@ -865,6 +865,27 @@ type SelectStmt struct {
 	// into the parenthesised content (which already has its own
 	// correctly-ordered chain). M0097-0042.
 	Parenthesized bool
+	// ParenBranches records how far the user's parentheses actually
+	// reached when a set-operator was written AFTER the closing ')'.
+	// It is meaningful only together with Parenthesized.
+	//
+	//	0  — the parentheses covered this node's ENTIRE SetOp chain
+	//	     (the common case; the chain is one atomic operand).
+	//	n>0 — only the first n branches (n-1 SetOp links) were inside
+	//	     the parentheses; every link past that was appended by
+	//	     parseParenthesisedSelectStmt from source text that follows
+	//	     the ')'.
+	//
+	// M0125-0006: without this, `Parenthesized` claimed the parentheses
+	// covered operators that appeared after them, so the planner treated
+	// the extended chain as one atomic operand and planned
+	// `A EXCEPT (B EXCEPT C)` for `(A) EXCEPT (B) EXCEPT (C)`. The flag
+	// alone cannot express the truth because the parentheses wrap a
+	// *prefix* of the chain, not all or nothing. PostgreSQL has no
+	// equivalent field: `select_with_parens` is a leaf operand in
+	// gram.y, so transformSetOperationStmt() always receives a properly
+	// nested tree. This is the price of goopg's linked-list set-op AST.
+	ParenBranches int
 	// InnerSegmentCount > 0 when a parenthesised compound query has an
 	// ORDER BY/LIMIT/OFFSET that belongs to the INNER compound (not the
 	// outer UNION/EXCEPT/INTERSECT that was appended after the closing

@@ -1003,6 +1003,12 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 	// so the planner's left-associativity flattening stops here (the content
 	// was explicitly grouped and must be treated as an atomic unit). M0097-0042.
 	innerSel.Parenthesized = true
+	// The ')' just consumed encloses everything innerSel currently holds,
+	// including any chain a nested parseParenthesisedSelectStmt absorbed on
+	// the way up (`((B) EXCEPT (C))` — the inner level set ParenBranches=1,
+	// but this outer paren really does cover the EXCEPT). Reset the boundary
+	// before the trailing-set-op block below re-establishes it. M0125-0006.
+	innerSel.ParenBranches = 0
 	// Optional trailing set-operation (UNION ALL / EXCEPT / INTERSECT …).
 	if setOp, present, err := p.parseSetOpClause(); err != nil {
 		return nil, err
@@ -1015,6 +1021,9 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 		//   (A EXCEPT B) UNION ALL C → A.SetOp=EXCEPT→B.SetOp=UNION_ALL→C
 		if innerSel.SetOp == nil {
 			innerSel.SetOp = setOp
+			// The parentheses covered a single branch; this operator was
+			// written after the ')'. M0125-0006.
+			innerSel.ParenBranches = 1
 		} else {
 			// Walk to the rightmost SelectStmt and attach there.
 			// Count inner segments while walking — used below to record
@@ -1026,6 +1035,10 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 				rightmost = rightmost.SetOp.Right
 			}
 			rightmost.SetOp = setOp
+			// innerSegCount links were inside the parentheses, so
+			// innerSegCount+1 branches were; everything from here on was
+			// written after the ')'. M0125-0006.
+			innerSel.ParenBranches = innerSegCount + 1
 			// When the inner compound has ORDER BY / LIMIT / OFFSET, those
 			// clauses belong to the INNER result, not the outer set-op we
 			// just appended. Record InnerSegmentCount so the planner can

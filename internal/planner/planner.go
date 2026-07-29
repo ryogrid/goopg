@@ -632,6 +632,69 @@ func setOpKeyword(t parser.SetOpType) string {
 	}
 }
 
+// setOpBindsTighter reports whether set-operator `inner` binds more tightly
+// than `outer`. PostgreSQL declares the precedence in gram.y:
+//
+//	%left		UNION EXCEPT
+//	%left		INTERSECT
+//
+// (postgres/src/backend/parser/gram.y:825-826 — later declaration wins), so
+// INTERSECT binds tighter than UNION and EXCEPT, which tie with each other.
+//
+// Only the paren-boundary decision consults this. goopg's flattening fold is
+// otherwise precedence-blind, so a BARE mixed chain such as
+// `A UNION B INTERSECT C` is still planned left-deep and still diverges from
+// PostgreSQL — a separate, pre-existing defect tracked as M0125-0016. This
+// function exists so that fixing associativity does not make the
+// explicitly-parenthesised spelling of that same chain regress. M0125-0006.
+func setOpBindsTighter(inner, outer parser.SetOpType) bool {
+	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
+}
+
+// parenBoundary reports where an explicitly-parenthesised set-op operand stops
+// being parenthesised.
+//
+// goopg stores a set-op chain as a linked list (SelectStmt.SetOp.Right), so a
+// grouped sub-expression can only be marked by flagging the head of a
+// sub-chain. That works while the parentheses cover the operand's whole chain,
+// but `parseParenthesisedSelectStmt` also absorbs a set-operator written AFTER
+// the closing ')' into the same chain — `(A) EXCEPT (B) EXCEPT (C)` parses as
+// A → B → C with B flagged, even though the user's parentheses around B closed
+// before the second EXCEPT. The parser records how far they reached in
+// ParenBranches; this function turns that into the node whose SetOp link is the
+// first one written outside the parentheses.
+//
+// Returns nil when the parentheses covered the entire chain — the operand is
+// atomic and the caller must stop flattening (the pre-M0125-0006 behaviour).
+// Otherwise it returns the boundary node: detaching that node's SetOp yields
+// exactly the parenthesised operand, and the detached remainder continues the
+// enclosing left-associative chain.
+//
+// PostgreSQL needs no analogue: `select_with_parens` is a leaf operand in
+// gram.y, so transformSetOperationStmt() (postgres/src/backend/parser/
+// analyze.c) always receives an already left-deep tree. M0125-0006.
+func parenBoundary(g *parser.SelectStmt) *parser.SelectStmt {
+	if g.ParenBranches <= 0 {
+		return nil
+	}
+	// ParenBranches counts BRANCHES inside the parens, so there are
+	// ParenBranches-1 links to walk before reaching the boundary.
+	node := g
+	for i := 1; i < g.ParenBranches; i++ {
+		if node.SetOp == nil {
+			// Chain shorter than recorded: refuse to guess and fall back to
+			// treating the operand as atomic.
+			return nil
+		}
+		node = node.SetOp.Right
+	}
+	if node.SetOp == nil {
+		// Nothing was appended after the ')' after all.
+		return nil
+	}
+	return node
+}
+
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
@@ -681,21 +744,58 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			opAll  bool
 			opPos  int
 			stmt   *parser.SelectStmt
+			// cutAt is the node whose SetOp must be detached while this
+			// segment is planned, so planSelect(stmt) sees exactly the
+			// operand and not the rest of the chain. nil means "plan stmt
+			// with its chain intact" — a true leaf, or a fully
+			// parenthesised compound that IS one atomic operand.
+			cutAt *parser.SelectStmt
 		}
 		var segments []setOpSegment
 		{
 			cur := s
 			for cur.SetOp != nil {
 				rightStmt := cur.SetOp.Right
-				segments = append(segments, setOpSegment{
+				seg := setOpSegment{
 					opType: cur.SetOp.Type,
 					opAll:  cur.SetOp.All,
 					opPos:  cur.SetOp.Pos(),
 					stmt:   rightStmt,
-				})
-				if rightStmt.Parenthesized {
-					break // explicit grouping: stop flattening, treat as atomic
 				}
+				if rightStmt.Parenthesized {
+					// Explicit grouping. The parentheses may cover only a
+					// PREFIX of rightStmt's chain when a set-operator was
+					// written after the ')': `(A) EXCEPT (B) EXCEPT (C)`
+					// parses as A → B → C with B parenthesised, yet only B
+					// itself was inside those parentheses. Cut the chain at
+					// the recorded boundary and keep flattening from there so
+					// the tail stays left-associative. M0125-0006.
+					bnd := parenBoundary(rightStmt)
+					if bnd == nil {
+						// The parentheses really did cover the whole chain:
+						// one atomic operand, so stop flattening.
+						segments = append(segments, seg)
+						break
+					}
+					if setOpBindsTighter(bnd.SetOp.Type, seg.opType) {
+						// The operator after the ')' binds TIGHTER than the one
+						// that introduced this operand, so the operand groups
+						// with what follows it, not with what precedes it:
+						// `A UNION (B) INTERSECT (C)` is `A UNION (B INTERSECT
+						// C)`. Cutting here would produce `(A UNION B)
+						// INTERSECT C`. Leave the chain intact and let the
+						// recursive planSelect build the tighter group.
+						// M0125-0006.
+						segments = append(segments, seg)
+						break
+					}
+					seg.cutAt = bnd
+					segments = append(segments, seg)
+					cur = bnd
+					continue
+				}
+				seg.cutAt = rightStmt
+				segments = append(segments, seg)
 				cur = rightStmt
 			}
 		}
@@ -706,12 +806,20 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// leftmost branch alone. Without this, `SELECT * FROM t INTERSECT
 		// … ORDER BY 1` would try to resolve the positional ORDER BY
 		// against the unexpanded StarExpr. M0097-0042.
-		savedSetOps := make([]*parser.SetOpClause, len(segments))
+		// savedSetOps[0] is s's own chain head; savedSetOps[i+1] belongs to
+		// segment i's cut node (nil when that segment is planned with its
+		// chain intact). Keying on cutAt rather than on "every segment but the
+		// last" is what lets a partially-parenthesised operand be cut at its
+		// paren boundary instead of at its end. M0125-0006.
+		savedSetOps := make([]*parser.SetOpClause, len(segments)+1)
 		savedSetOps[0] = s.SetOp
 		s.SetOp = nil
-		for i := 0; i < len(segments)-1; i++ {
-			savedSetOps[i+1] = segments[i].stmt.SetOp
-			segments[i].stmt.SetOp = nil
+		for i, seg := range segments {
+			if seg.cutAt == nil {
+				continue
+			}
+			savedSetOps[i+1] = seg.cutAt.SetOp
+			seg.cutAt.SetOp = nil
 		}
 		savedOrderBy := s.OrderBy
 		savedLimit := s.Limit
@@ -723,8 +831,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		left, err := planSelect(s, cat)
 		// Restore everything (plan cache may reuse the AST).
 		s.SetOp = savedSetOps[0]
-		for i := 0; i < len(segments)-1; i++ {
-			segments[i].stmt.SetOp = savedSetOps[i+1]
+		for i, seg := range segments {
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = savedSetOps[i+1]
+			}
 		}
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
@@ -741,20 +851,23 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		//   then append UNION ALL C without re-sorting. M0097-0044.
 		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
 		for i, seg := range segments {
-			// Middle segments (all but the last) had their SetOp saved+cleared
-			// above, then restored early for plan-cache correctness. Re-clear
-			// before planning so planSelect(seg.stmt) sees this as a leaf and
-			// does not recursively re-flatten the already-flattened chain.
-			// The last segment is either a true leaf (SetOp=nil) or an
-			// explicitly-parenthesised compound (Parenthesized=true) that must
-			// retain its SetOp so the inner compound is planned correctly.
-			// M0097-0050.
-			if i < len(segments)-1 {
-				seg.stmt.SetOp = nil
+			// Cut segments had their SetOp saved+cleared above, then restored
+			// early for plan-cache correctness. Re-cut before planning so
+			// planSelect(seg.stmt) sees only this operand and does not
+			// recursively re-flatten the already-flattened chain. M0097-0050.
+			// A segment with cutAt == nil is either a true leaf (SetOp=nil) or
+			// a fully-parenthesised compound that must retain its SetOp so the
+			// inner compound is planned as one atomic operand.
+			// When the operand is only PARTIALLY parenthesised, cutAt is the
+			// paren boundary inside its chain rather than the operand itself,
+			// so the parenthesised prefix is planned atomically and the tail
+			// was already flattened into later segments. M0125-0006.
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = nil
 			}
 			right, rerr := planSelect(seg.stmt, cat)
-			if i < len(segments)-1 {
-				seg.stmt.SetOp = savedSetOps[i+1] // restore for plan-cache
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
 			}
 			if rerr != nil {
 				return nil, rerr

@@ -1219,7 +1219,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       completion** — `costDrivenJoinOrder` is the precedent. On landing, update the
       RC-5 and phase-6.2 ledger rows whose criteria this satisfies. Design
       `docs/design/0125-0005-relsize-fallback-default-flip.md`.
-- [ ] **M0125-0006 — set-operation chains re-associate right when branches are
+- [x] **M0125-0006 — set-operation chains re-associate right when branches are
       parenthesised** (discovered by M0124-0001 chunk 11, ledger row 2026-07-28).
       **A wrong-answer defect, not a performance one**, and the first one this
       programme found by value rather than by row count: TPC-DS Q87 returns
@@ -1258,9 +1258,97 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       audit all of them before declaring the class closed. Executor side is
       `internal/executor/operators_setop.go`. Design
       `docs/design/0125-0006-setop-chain-associativity.md`.
-      **Blocked until the M0124-0001 sweep reaches Q99** (no engine commit may land
-      before then); it is a parser/planner change, so it additionally requires
-      `tpch-spotcheck.sh` + the SF0.5 gate + `make plan-diff` per the pre-commit bar.
+      **DONE 2026-07-29.** Root cause confirmed exactly as filed. The obvious
+      repair — clear the lying flag — was **refuted before any code changed** by a
+      PG-verified probe: `X UNION (A EXCEPT B) UNION C` is `{2,3,9}`, but fully
+      left-deep it is `{2,9}`. The parentheses wrap a **PREFIX** of the chain, so
+      the boundary must be a COUNT, not a bool. Fix = `SelectStmt.ParenBranches`
+      (branches inside the parens; 0 = the parens covered the whole chain),
+      **reset at the closing `')'`** — load-bearing for `((B) EXCEPT (C))`, whose
+      outer paren genuinely does cover the operator the inner level absorbed —
+      consumed by `parenBoundary` + `setOpSegment.cutAt`, which cuts the chain at
+      the boundary instead of breaking. The existing save/clear/restore passes are
+      re-keyed from "every segment but the last" onto `cutAt`; the plan-cache
+      restore discipline is unchanged.
+      **Cutting correctly exposed a second, PRE-EXISTING defect**: goopg's set-op
+      fold has no operator precedence at all (`gram.y:825-826` = `%left UNION
+      EXCEPT` then `%left INTERSECT`), so bare `A UNION B INTERSECT C` is already
+      wrong at HEAD. Before this change the *parenthesised* spelling was right by
+      accident, because flattening stopped early — so `setOpBindsTighter` declines
+      the cut when the trailing operator binds tighter. That is locally correct
+      precedence, and it is what makes this change non-regressing.
+      **Accepted BY VALUE against PG 18.3, not by row count.** TPC-DS Q87
+      `47218 -> 47049` = PG, measured on the SAME SF=1 data dir with the pre-fix
+      binary rebuilt from `6c5c48ae` (1 row in both cases — no row-count gate could
+      ever have seen it). 17 executor by-value cases
+      (`internal/executor/setop_paren_assoc_test.go`) + 9 parser AST pins
+      (`internal/parser/setop_paren_assoc_test.go`). **The gate was proved to FAIL
+      before being trusted**: copied verbatim into a worktree at `6c5c48ae`, 10
+      subtests FAIL while every non-regression pin (both precedence directions,
+      explicit right grouping, nested-paren reset, compound-grouping-preserved,
+      both associative controls) PASSES — the suite discriminates the defect, not
+      the diff. Sibling-path audit per Hard-won Rule #2 done as a 30-statement
+      goopg-vs-PG differential: derived table (the Q87 shape), CTE, scalar
+      subquery, nested/triple parens and trailing ORDER BY all correct.
+      **Four surviving divergences were each confirmed IDENTICAL on pre-fix HEAD**,
+      so none is a regression; all four are filed below with ledger rows
+      (M0125-0016..-0019).
+- [ ] **M0125-0016 — the set-op fold has no operator precedence** (discovered by
+      M0125-0006 2026-07-29, ledger row 2026-07-29). PG `gram.y:825-826` declares
+      `%left UNION EXCEPT` then `%left INTERSECT`, so INTERSECT binds tighter.
+      goopg folds the flat segment list left-deep regardless, so **with no
+      parentheses anywhere** `A UNION B INTERSECT C` is planned
+      `(A UNION B) INTERSECT C`: goopg `{3}` vs PG `{1,3}` (A={1,3} B={2,3} C={3}).
+      Pre-existing — verified identical on pre-fix HEAD. M0125-0006 added a local
+      precedence guard at the paren boundary only (`setOpBindsTighter`), so the
+      *parenthesised* spelling is correct; the bare spelling is not.
+      **Fix**: in `planSelect`'s set-op fold (`internal/planner/planner.go`), group
+      maximal INTERSECT runs before the UNION/EXCEPT left-fold. Two couplings must
+      be re-based on the grouped tree rather than the flat segment index —
+      `wrapSetOpBranchWithCasts` unifies types against the ACCUMULATED left
+      operand, and `InnerSegmentCount`'s sort/limit placement is defined on the
+      flat index. **Accept by VALUE**: a bare-chain matrix in both precedence
+      directions plus the M0125-0006 parenthesised matrix as a non-regression pin.
+      Planner change -> full pre-commit bar.
+- [ ] **M0125-0017 — `ORDER BY`/`LIMIT` inside a parenthesised FIRST branch is
+      hoisted to the whole set-op result, silently dropping branches** (discovered
+      by M0125-0006 2026-07-29, ledger row 2026-07-29). `(A ORDER BY 1 LIMIT 2)
+      UNION ALL (C)` returns `{1,2}` where PG returns `{1,2,9}` — the entire
+      `UNION ALL` branch vanishes, because the LIMIT is applied to the union
+      instead of to the parenthesised branch. Pre-existing (identical on pre-fix
+      HEAD). The COMPOUND case already works via `InnerSegmentCount` (M0097-0044);
+      only the single-branch case is broken, because
+      `internal/parser/select.go:1036` records `InnerSegmentCount` only when the
+      parenthesised content was already a compound and `InnerSegmentCount == 0` is
+      the "unset" sentinel, so a one-branch inner group cannot be expressed.
+      **Resume**: M0125-0006's new `ParenBranches` is exactly 1 in this case and is
+      the natural carrier; consume it at `planner.go`'s `innerBoundary`.
+      **Accept by VALUE** ({ORDER BY only, LIMIT only, both} x {parenthesised
+      right branch, bare right branch}). Parser/planner change -> full pre-commit bar.
+- [ ] **M0125-0018 — IN-list and EXISTS reject a parenthesised set-op chain as an
+      operand** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
+      `x IN ((A) EXCEPT (B) EXCEPT (C))` raises `expected ')' to close IN list (got
+      except)` and `EXISTS ( (A) EXCEPT (B) … )` raises `EXISTS requires a
+      parenthesised SELECT (got ()`. PG accepts both (`a_expr IN_P
+      select_with_parens`, `EXISTS select_with_parens`). Pre-existing (identical
+      errors on pre-fix HEAD). Derived-table, CTE and scalar-subquery contexts all
+      work and are pinned by M0125-0006's tests, so this is narrowly the two
+      operand parsers. **Resume**: both assume the token after `(` is the SELECT
+      keyword, so a nested `(` is rejected; route them through
+      `parseParenthesisedSelectStmt` the way the scalar-subquery path
+      (`internal/parser/select.go:2862`) already does. Parser-only change.
+- [ ] **M0125-0019 — `string_agg(x, ',' ORDER BY x)` ignores the aggregate's own
+      ORDER BY** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
+      `select string_agg(x::text,',' order by x) from (values (3),(1),(2)) v(x)`
+      returns `3,1,2` in goopg and `1,2,3` in PG. Unrelated to set operations, but
+      it silently corrupts every ordered-aggregate result **while keeping row
+      counts intact** — the same blind spot class as M0125-0009/-0010. The clause
+      survives parsing (M0125-0009's `funcCallTailKey` already keys on it, which is
+      how `string_agg(x,',' ORDER BY a)` stopped colliding with `… ORDER BY b`), so
+      the gap is that the executor aggregate never sorts by it. PG evaluates an
+      aggregate's ORDER BY inside the aggregate (`nodeAgg.c`, sort-then-transition).
+      **Resume**: the aggregate operator in `internal/executor/`. **Accept by
+      VALUE**; executor change -> full pre-commit bar.
 - [ ] **M0125-0007 — date input rejects unpadded month/day, and the comparison
       path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). PG's `DecodeDate`/`ParseDateTime`
