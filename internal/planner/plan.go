@@ -852,8 +852,36 @@ type Join struct {
 	schema    Schema
 }
 
-func (n *Join) Pos() int       { return n.pos }
-func (n *Join) Output() Schema { return n.schema }
+func (n *Join) Pos() int { return n.pos }
+
+// Output publishes the join's column layout.
+//
+// M0125-0008: Semi / Anti joins emit the OUTER (Left) row only, so
+// their layout is by definition Left's *current* output. Every
+// construction site already sets `schema` to a copy of
+// `Left.Output()` (unnest.go, three sites) and predp.go refreshes it
+// after join-order search — but `rewriteMultiWayChain` runs later and
+// re-sorts the subtree below the pinned semi/anti spine IN PLACE,
+// which leaves that copy a stale *permutation* of the real layout.
+// `reresolveJoinByName` then re-resolves an ancestor's keys by name
+// against the phantom layout, so the ancestor's key lands on the
+// wrong column and its conjunct silently stops filtering: an
+// `EXISTS … AND NOT EXISTS …` pair over one outer relation returned
+// MORE rows than either conjunct alone (TPC-DS Q16 / Q94, and the
+// non-subset signature that named this task).
+//
+// Deriving the layout here makes the invariant structural, so it
+// cannot be re-broken by a future pass that rewrites Left in place
+// and forgets to refresh the cache. `schema` is still the source of
+// truth for every other join type, where it holds the merged layout.
+func (n *Join) Output() Schema {
+	if n.Type == JoinTypeSemi || n.Type == JoinTypeAnti {
+		if n.Left != nil {
+			return n.Left.Output()
+		}
+	}
+	return n.schema
+}
 
 // AggregateCall is one aggregate function invocation in an Aggregate node.
 type AggregateCall struct {

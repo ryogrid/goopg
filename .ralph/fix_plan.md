@@ -134,16 +134,18 @@ started.
 >    Q16/Q94/Q95 `CKMISMATCH` cells went from one shared wrong-answer checksum to
 >    three distinct real answers. It did not turn them green, and the probe that
 >    proved it also named what remains behind each, which sets the next order:
->    1. **`M0125-0008`** (EXISTS + NOT EXISTS over one outer rel). Now the
->       highest-value M0125 item left: it owns **two** of the three cells —
->       Q94 (`7` vs PG `2`) and **Q16** (`63` vs PG `23`), which M0125-0007's
->       probe newly attached to it. Unblocked; its "blocked until the sweep
->       reaches Q99" note was discharged on 2026-07-29.
->    2. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document
->       still actionable.
->    3. **`M0125-0023`** (Q95, filed 2026-07-30) — the third cell, and a
->       different mechanism from -0008: it *under*-counts (`5` vs PG `23`) and
->       has no `EXISTS`.
+>    1. ~~**`M0125-0008`** (EXISTS + NOT EXISTS over one outer rel)~~ — **DONE
+>       2026-07-30.** One derivation in `Join.Output()` (Semi/Anti publish
+>       `Left.Output()` instead of a cached copy `rewriteMultiWayChain`'s
+>       in-place OID re-sort had made stale). Closed **all three** CKMISMATCH
+>       cells, not two: Q16 `40dbec0df91d2438`, Q94 `04afc1b69831a5ea` **and
+>       Q95 `e498634c02595c29`**, each matching the SF0.5 oracle exactly.
+>    2. ~~**`M0125-0023`** (Q95)~~ — **DONE 2026-07-30, same fix.** Its filing
+>       premise ("no `EXISTS`, therefore not -0008") classified by SQL keyword
+>       rather than by the join the planner builds; `IN (subquery)` unnests to
+>       the same `JoinTypeSemi`.
+>    3. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document
+>       still actionable. **NEXT SELECTION.**
 >    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
 >    quiet host. M0125-0007 is a codec change and could only get the 3-query
 >    value probe, because the nightly CI batch held the host for its whole loop
@@ -1728,7 +1730,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `time.Time` nanosecond range round-trip wrong — `'0002-01-01'::date` gives
       `1755-08-30`; a plain `timestamp` applies an explicit offset instead of
       discarding it).
-- [ ] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
+- [x] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
       NON-SUBSET result** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). With TPC-DS Q94's date literals padded so M0125-0007 is out of
       the way, each correlated subquery is correct **alone** — base joins 33 rows
@@ -1760,6 +1762,25 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       values to the acceptance set; its four-row isolation matrix has not been
       taken yet. Q95 is NOT this defect (it under-counts and has no EXISTS) —
       see M0125-0023.
+      **↳ CLOSED 2026-07-30.** Design
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md` (indexed). Root
+      cause was NOT a dropped residual or a `SourceTableIdx` mis-map: a Semi/Anti
+      join publishes the OUTER row only, and every writer set its cached `schema`
+      to a *copy* of `Left.Output()` — then `rewriteMultiWayChain` OID-sorted the
+      subtree below the pinned spine **in place**, leaving that copy a stale
+      PERMUTATION. Widths still matched so nothing detected it; the damage came
+      from `reresolveJoinByName` re-resolving keys BY NAME against
+      `j.Left.Output()`, which for a semi/anti join *stacked on another one* was
+      the phantom layout — the upper join's key landed on `dsk` instead of `ord`,
+      matched nothing, and (anti) passed every probe row through. Hence the sharp
+      bisect: correct at 1–2 base tables, wrong from **3** (the MHJ-packing
+      threshold), and reversing the conjuncts moved the failure to whichever join
+      ended up on top. Fix is one derivation in `internal/planner/plan.go`
+      (`Join.Output()` returns `Left.Output()` for Semi/Anti) rather than a fifth
+      refresh site. **Q16 and Q94 both PASS the SF0.5 oracle's exact value
+      checksums** (`40dbec0df91d2438`, `04afc1b69831a5ea`). The predicted
+      four-row isolation matrix WAS taken and shipped as tests. **The item's
+      "Q95 is NOT this defect" note was wrong** — see M0125-0023.
 - [x] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
       sibling aggregates** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). **One-line root cause, wide blast radius.** Aggregate dedup
@@ -2287,7 +2308,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `ci/batch/tpcds-row-anchors.csv`, so add one on close.
       Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q51).
       Planner/executor change → full pre-commit bar.
-- [ ] **M0125-0023 — TPC-DS Q95 UNDER-counts: two `IN (subquery)` over the same
+- [x] **M0125-0023 — TPC-DS Q95 UNDER-counts: two `IN (subquery)` over the same
       CTE drop rows PG keeps** (discovered 2026-07-30 by M0125-0007's acceptance
       probe; ledger row same date). With the unpadded-date defect gone, Q95
       returns **`5 | 11180.00 | -6205.20`** at SF0.5 where PG returns
@@ -2307,6 +2328,19 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **Accept by VALUE**: Q95 = `23 | 45031.03 | -1282.36` at SF0.5 (checksum
       equal to the oracle), plus the isolation matrix as a planner/executor test.
       Design `docs/design/0125-0023-in-subquery-over-cte-under-count.md`.
+      **↳ CLOSED 2026-07-30 by M0125-0008's fix — this item's premise was
+      wrong.** "It is not M0125-0008: Q95 contains no `EXISTS` at all" tracked
+      the KEYWORD, not the mechanism. `IN (subquery)` unnests to the very same
+      `JoinTypeSemi`, so Q95's two `IN` gates over one outer relation are exactly
+      the stacked semi/anti shape M0125-0008 describes; it under-counted rather
+      than over-counted only because the neutered conjunct was a SEMI join
+      (which then admits everything downstream of it) rather than an ANTI join.
+      No separate design doc was written — the mechanism is documented in
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md` §5. Q95 now
+      **PASSES the SF0.5 oracle's exact checksum `e498634c02595c29`**, which is
+      this item's own stated acceptance bar. Lesson recorded because it cost a
+      filed task: classify a subquery defect by the JOIN the planner builds, not
+      by the SQL keyword that produced it.
       Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, the
       SF0.5 gate, `make plan-diff LABEL=tpcds-round2-head`).
 
