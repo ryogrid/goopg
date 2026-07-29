@@ -64,11 +64,11 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
->    **↳ NEXT TASK TO SELECT (updated 2026-07-29): `M0124-0001` is CLOSED, and so
->    are `-0003`, `-0005` and `-0006`. What remains is `M0124-0002` (retroactive
->    TPC-H + plan-baseline discharge) and `M0124-0004` (Q35's row count). **Both
->    need a QUIET host** — `M0124-0002` is a timed A/B and `M0124-0004`'s two
->    previous readings were voided by the nightly CI batch. Check
+>    **↳ NEXT TASK TO SELECT (updated 2026-07-29 late): `M0124-0001` is CLOSED,
+>    and so are `-0002` (discharged this loop — `plan_snapshots/tpcds-round2-head.txt`
+>    now EXISTS and is committed), `-0003`, `-0005` and `-0006`. The only M0124
+>    item left is `M0124-0004` (Q35's row count). **It needs a QUIET host** —
+>    its two previous readings were voided by the nightly CI batch. Check
 >    `ci/batch/run-nightly.sh` is not running before selecting either; the
 >    harness guards now refuse to start otherwise (`FORCE=1` overrides, and is
 >    only legitimate for value/row-count work, never for a timing).** Do not select a regress/testport case instead: as of the
@@ -88,12 +88,12 @@ started.
 >       TIMED study → host blocker" for six consecutive loops: that is true of the
 >       four-arm study, **not** of the shape-neutral stage-1 landing. Land stage 1;
 >       defer the timed arms with a ledger row if the host is busy.
->    2. **`M0124-0002`.** Its quiet-host precondition now HOLDS — the
->       `20260729-002344` nightly wedge cleared ~17:00 (PIDs 2511542 / 2621153 both
->       gone; only `nightly-scheduler.sh` remains under `ci/batch`). Re-verify with
->       `pgrep -af ci/batch` before starting. It produces
->       `plan_snapshots/tpcds-round2-head.txt`, which unblocks M0125-0002 / -0004 /
->       -0005 — the largest single unblock available.
+>    2. ~~**`M0124-0002`**~~ — **DONE 2026-07-29** (`analysis/tpch-tpcds-round2-retro-20260729.md`).
+>       `plan_snapshots/tpcds-round2-head.txt` exists and is committed, so
+>       **M0125-0002 / -0004 / -0005 and M0125-0003 stage 2 are unblocked** — that
+>       was the largest single unblock available and it has been taken. Use
+>       `make plan-diff LABEL=tpcds-round2-head`, never `plan-gate`, when a
+>       *specific* baseline matters (`plan-gate` picks newest-by-mtime).
 >    3. **`M0125-0012` (Q8).** UNBLOCKED: its only dependency was the *soft* one on
 >       M0125-0001, which landed at `6c5c48ae`. `working_set.md`'s claim that
 >       -0020 is "the last unblocked M0125 item" is FALSE — that enumeration omits
@@ -875,8 +875,34 @@ blocker; a code change landing mid-sweep voids the sweep.
         `vcs.revision`/`vcs.modified`, so the docs commit alone moved the image
         and the first-cut guard printed a false `*** SWEEP VOID ***` in
         `chunk-1-4.txt`. That chunk stands; `RESULTS.md` carries the proof.
-- [ ] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
-      (§13.5 #5). Phases 1.2/1.3 landed while `tpch-spotcheck.sh` reported SKIPPED
+- [x] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
+      (§13.5 #5). **DONE 2026-07-29 — DISCHARGED, no regression attributable to
+      `9740fce9`.** Report `analysis/tpch-tpcds-round2-retro-20260729.md`; raw
+      output + the two harness scripts under `analysis/m0124-0002/`. Both arms
+      built from HEAD `40ad746a` (arm A = the `bushy.go` hunks reverse-applied in
+      worktree `tmp/wt-armA`, −95/+1; `internal/executor/expr.go` verified
+      byte-identical between arms so the Q8 crash could not confound it).
+      **`make plan-diff LABEL=tpcds-round2-base MODE=structural` = 22/22 MATCH** —
+      `9740fce9` changes which conjuncts are remapped, not which plan is chosen,
+      on every TPC-H query, which also makes the timing table like-for-like.
+      22/22 queries completed on both arms with identical row counts; 12/12
+      anchors (`spotcheck_expected.env` + `ci/batch/tpch-row-anchors.csv`) exact
+      on both. Stream 912 s (A) vs 885 s (B). Two queries crossed the >10 %
+      investigate band — Q9 −13.6 %, Q22 +14.3 % — and round 2 re-read both:
+      **intra-arm spread beat the inter-arm gap in each case** (Q9 arm A alone
+      202.5 → 166.3 s = 22 %; Q22 first-vs-later read inside one server = 22 %),
+      so both are stream-position / page-cache artifacts. Nothing near the 25 %
+      blocking band; §D5 never triggered. **`plan_snapshots/tpcds-round2-head.txt`
+      is committed and is the live baseline** (captured LAST — `plan-gate` picks
+      the newest by mtime and has no label parameter), with
+      `tpcds-round2-base.txt` alongside as the arm-A reference. **This unblocks
+      M0125-0002 / -0004 / -0005 and M0125-0003 stage 2.** §5 of the report
+      retro-files §8 step 7's missing artifact for phase 2.1 (RC-1b), transcribed
+      from `5db0a067` + its ledger row, not re-measured. **One deviation, ledger
+      row 2026-07-29:** §D1's A/B/A/B was reduced to a full round 1 plus a
+      two-query round 2, so a *uniform* drift would be invisible to it; resume
+      recipe in the row. Original scope follows. Phases 1.2/1.3 landed while
+      `tpch-spotcheck.sh` reported SKIPPED
       and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the
       cluster, so it is runnable. **Both arms build from HEAD** — arm A = HEAD
       with `9740fce9`'s `bushy.go` hunks locally reverted (its executor bounds

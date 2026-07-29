@@ -1,6 +1,6 @@
 # 0124-0002 — Retroactive TPC-H + plan-snapshot discharge for the round-2 planner commits
 
-Status: draft
+Status: accepted (executed 2026-07-29 — see "Execution record" at the end)
 Date: 2026-07-28
 Milestone: M0124-0002 (`docs/design/tpcds-round2-fixes/README.md` §13.5 action 5)
 
@@ -137,3 +137,39 @@ artifact was produced" — a protocol violation §13.5 does not list. One sectio
 
 Docs plus one committed snapshot. `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
 plus the pre-commit hook. No engine change.
+
+## Execution record (2026-07-29)
+
+Executed as designed; report at `analysis/tpch-tpcds-round2-retro-20260729.md`,
+raw output and the two harness scripts under `analysis/m0124-0002/`.
+
+**Verdict: discharged — no regression attributable to `9740fce9`.** Arms built
+from HEAD `40ad746a` per D1 (arm A = the `bushy.go` hunks reverse-applied in
+worktree `tmp/wt-armA`, −95/+1; `internal/executor/expr.go` verified byte-identical
+between arms, so the bounds check stayed and the Q8 crash could not confound the
+arm). All four D4 acceptance criteria met:
+
+- 22/22 queries completed on both arms with identical row counts, and all 12
+  `spotcheck_expected.env` / `tpch-row-anchors.csv` anchors exact on both.
+- `make plan-diff LABEL=tpcds-round2-base MODE=structural` returned **22/22
+  MATCH** — `9740fce9` changes which conjuncts are remapped, not which plan is
+  chosen, on every TPC-H query. That also makes the timing table a like-for-like
+  comparison: identical plans, so no timing delta could be a shape effect.
+- Stream totals 912 s (A) vs 885 s (B). Two queries crossed D4.3's 10 % band —
+  Q9 −13.6 % and Q22 +14.3 % — and round 2 re-read both. In each case the
+  **intra-arm** spread exceeded the inter-arm gap (Q9 arm A alone: 202.5 → 166.3 s,
+  22 %; Q22 first-vs-later read inside one server: 22 %), so both are stream
+  position / page-cache artifacts, not code. Nothing approached the 25 % blocking
+  band, and D5 was never triggered.
+
+`plan_snapshots/tpcds-round2-head.txt` is captured **last** and committed, with
+`tpcds-round2-base.txt` alongside it as the arm-A reference. D3's two tool facts
+held exactly as written: the Makefile's `tpch@tpch` defaults resolved to the real
+data (the `postgres@postgres` fallback never fired) and the capture order is what
+makes `plan-gate` meaningful for the next line that runs it.
+
+**Deviation from D1, filed as a deferral row** (`.ralph/deferral_ledger.md`,
+2026-07-29): round 2 was narrowed from the full 22-query stream to the two
+queries under question. It adjudicates exactly what the protocol wanted round 2
+for, but it is a weaker drift defence than A/B/A/B — a *uniform* drift would be
+invisible to it, cross-checked only by the single-reading stream totals.
