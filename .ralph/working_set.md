@@ -1,54 +1,66 @@
-Task: **M0125-0006** — set-op chains re-associate right when branches are
-parenthesised. Code + tests + docs COMPLETE; awaiting the SF0.5 gate, then commit.
+(idle — nothing in flight)
 
-Files: `internal/parser/ast.go` (`SelectStmt.ParenBranches`),
-`internal/parser/select.go` (reset at `')'`, record boundary on absorb),
-`internal/planner/planner.go` (`setOpSegment.cutAt`, `parenBoundary`,
-`setOpBindsTighter`, cutAt-keyed save/restore),
-`internal/parser/setop_paren_assoc_test.go` + `internal/executor/setop_paren_assoc_test.go` (new),
-`docs/design/0125-0006-setop-chain-associativity.md` (new) + `docs/design/README.md`,
-`.ralph/fix_plan.md` (M0125-0006 ticked; M0125-0016..-0019 filed),
-`.ralph/deferral_ledger.md` (4 rows).
+Last loop: **M0125-0006 COMPLETE**, committed + pushed as `7b436af5`.
+Nightly triage done: `ci/logs/action-items.md` unchanged since 2026-07-25
+(mtime Jul 25 03:20), all 26 items already filed — filing was a no-op.
 
-Key symbols: `parseParenthesisedSelectStmt`, `parenBoundary`,
-`setOpBindsTighter`, `setOpSegment.cutAt`, `planSelect` set-op fold.
+## Why M0125-0006 and not M0124 / -0004 / -0003 (do not re-derive)
 
-Findings (do NOT re-derive):
-- A bool CANNOT express this. Refuted by PG probe: `X UNION (A EXCEPT B) UNION C`
-  = `{2,3,9}`, but flag-cleared/fully-left-deep = `{2,9}`. Parens wrap a PREFIX.
-- The reset of `ParenBranches` at the closing `')'` is load-bearing for
-  `((B) EXCEPT (C))` — the outer paren really does cover the inner absorb.
-- Q87: **47218 → 47049 = PG**, same SF=1 data dir, pre-fix binary rebuilt from
-  `6c5c48ae`. 1 row either way — no row-count gate can see this class.
-- 4 surviving goopg-vs-PG diffs are ALL pre-existing (verified identical on
-  pre-fix HEAD): bare-chain precedence (M0125-0016), ORDER BY/LIMIT hoisted out
-  of a parenthesised first branch (M0125-0017), IN-list/EXISTS rejecting a
-  parenthesised chain (M0125-0018), `string_agg(… ORDER BY …)` ignored (M0125-0019).
-- `make plan-diff LABEL=tpcds-round2-head` is **UNRUNNABLE**: that baseline is
-  M0124-0002's deliverable and does not exist. Diffing `r5-default` is
-  meaningless (it was captured stats-loaded; a fresh server is S-cold, so all
-  22 differ on `(stats)`/`rows=` alone). Substituted a same-state pre/post A/B:
-  **22/22 TPC-H plans byte-identical** (`analysis/m0125-0006/m0125-0006-{pre,post}.txt`).
-- Only 5 TPC-DS queries can reach the changed path (a `)` before a set operator):
-  Q8, Q14, Q23, Q49, Q87. TPC-H has ZERO set operators.
+Banner order is M0124 → M0125, but everything above M0125-0006 was blocked:
+- `M0124-0002` (timed A/B) and `M0124-0004` — need a QUIET host. **The nightly
+  wedge is STILL there** (see below), so both stay unselectable.
+- `M0125-0004`, `-0002`, `-0005` all diff against
+  `plan_snapshots/tpcds-round2-head.txt`, which is **M0124-0002's deliverable
+  and does not exist** — verified by `ls plan_snapshots/` (17 labels, not that
+  one). They cannot be graded, so they cannot be worked.
+- `M0125-0003`'s deliverable is a four-arm TIMED study → same host blocker.
+- `M0125-0006` was the topmost item accepted **by value**, so host contention
+  cannot void it. Its engine-commit freeze had already lifted (M0125-0009).
 
-Next step: read `analysis/m0125-0006/sf05-sweep.log` for the final
-`PASS=/CKMISMATCH=` line; compare against the last known
-`PASS=74 CKMISMATCH=4` (M0125-0011). Then commit by explicit pathspec and push.
+## ⚠ STILL BLOCKED ON THE USER — the nightly wedge is UNCHANGED
 
-Gates run: units suite PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
-gofmt clean on my hunks (all 3 files already dirty at HEAD in unrelated regions —
-never `gofmt -w`); `go vet` clean; 26 new tests PASS; **gate proved to FAIL at
-`6c5c48ae`** (10 subtests fail, every non-regression pin passes); TPC-H plan A/B
-identical 22/22. SF0.5 sweep IN FLIGHT.
+Run `20260729-002344` wedged since ~02:07; `goopg-bench-bin` PID **2621153**
+was at 53 % CPU / 7.5 GB RSS, 11 h elapsed, at the start of this loop.
+`kill` of non-owned PIDs is hard-denied by the classifier, so I cannot clear it.
+Until it is gone, **M0124-0002 must not be selected**.
 
-In-flight: `FORCE=1 bash scripts/tpcds-sf05-regression.sh sweep`, log
-`analysis/m0125-0006/sf05-sweep.log`, results
-`bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-*.txt`. NOTE: a first attempt
-was killed at Q5 — its server hit **21 GB RSS** (the documented
-non-cancelling-star-query hazard, pre-existing) and the host reached 0 GB
-available. If it must be killed again: `kill -TERM <sweep pid>`, then
-`tmp/goopg-bench-bin stop -D <repo>/bench/tpcds/runtime_goopg/data-sf05` —
-the server is orphaned by the script's death and holds the RAM.
-**Never `pkill -f`** — it self-matched and killed my own shell (exit 144) once
-this loop.
+```
+kill -TERM 2511542    # run-nightly.sh   — stops before stage-tpcds
+kill -QUIT 2621153    # goopg server     — QUIT, not KILL: untrapped, so it
+                      # dumps the leaked backend's stack to
+                      # ci/logs/20260729-002344/tpch/server.log
+```
+Re-check with `pgrep -af ci/batch`.
+
+## Facts the next loop should NOT re-derive
+
+- **The SF0.5 gate DOES see wrong values by checksum** (not just row counts):
+  Q87 was `CKMISMATCH` at HEAD and is now `PASS`. Gate moved
+  `PASS=74 CKMISMATCH=4` → `PASS=75 CKMISMATCH=3`, Q87 the ONLY per-query change
+  in 99 (normalised diff vs `sweep-20260729-093056.txt`).
+- **`make plan-diff LABEL=r5-default` is worthless on a fresh server**: that
+  baseline was captured stats-loaded, a fresh server is S-cold, so all 22 differ
+  on `(stats)`/`rows=` alone. Use a same-state pre/post A/B instead.
+- **TPC-H has ZERO set operators**; the plan-snapshot harness covers only TPC-H
+  Q1–Q22. Only 5 TPC-DS queries have a `)` before a set operator (Q8 Q14 Q23 Q49
+  Q87), and Q8's is an `IN`-list paren.
+- Four NEW items filed with ledger rows, all confirmed identical on pre-fix HEAD:
+  **M0125-0016** (fold has no operator precedence — bare
+  `A UNION B INTERSECT C` is wrong), **M0125-0017** (`ORDER BY`/`LIMIT` in a
+  parenthesised FIRST branch is hoisted to the whole result and silently DROPS a
+  branch), **M0125-0018** (IN-list/EXISTS reject a parenthesised chain),
+  **M0125-0019** (`string_agg(… ORDER BY …)` ignored).
+- The SF0.5 sweep's Q5 pins the server at **21 GB RSS** and left the host at
+  0 GB available; killing the script ORPHANS that server — stop it with
+  `tmp/goopg-bench-bin stop -D <repo>/bench/tpcds/runtime_goopg/data-sf05`.
+- **Never `pkill -f`** — it self-matched and killed my own shell (exit 144).
+- A `cd` inside a compound Bash command PERSISTS to later calls; it silently
+  moved the cwd into `bench/tpcds/.../queries` mid-loop.
+
+Gates run: units PASS; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); SF0.5 gate
+PASS=75/CKMISMATCH=3 (Q87 the only change); TPC-H plan A/B 22/22 identical;
+26 new tests PASS and **proved to FAIL at `6c5c48ae`** (10 subtests); gofmt clean
+on my hunks (all 3 files already dirty at HEAD elsewhere — never `gofmt -w`);
+pgbench smoke PASS via hook (505 / 689 / 13826 tps); `make ralph-state-guard` OK
+(auto-repaired a stale marker).
+In-flight: none.
