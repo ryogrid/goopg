@@ -1431,6 +1431,16 @@ type aggRuntime struct {
 	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
 	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
 	arrayElemKeys [][]Datum
+	// strElems/strDelims/strElemKeys are string_agg's deferred-concatenation
+	// mode, used ONLY when the call carries its own ORDER BY (M0125-0019).
+	// PostgreSQL sorts the transition inputs before running the transition
+	// function (nodeAgg.c process_ordered_aggregate_single), so the delimiter
+	// that separates two adjacent pieces is the *right-hand* row's own second
+	// argument — which is only knowable after the sort. strResult stays the
+	// accumulator for the far more common unordered case.
+	strElems    []string
+	strDelims   []string
+	strElemKeys [][]Datum
 	// Variance accumulators (var_pop/var_samp/stddev_pop/stddev_samp).
 	// Uses Youngs-Cramer algorithm for float inputs.
 	floatSx float64 // running sum of values (Youngs-Cramer Sx)
@@ -2155,9 +2165,16 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 					delimHex = string(dh)
 				}
 			}
+			st.boolResult = true // bytea mode flag
+			if len(call.OrderBy) > 0 {
+				st.strElems = append(st.strElems, hexVal)
+				st.strDelims = append(st.strDelims, delimHex)
+				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+				st.hasValue = true
+				break
+			}
 			if !st.hasValue {
 				st.strResult = hexVal
-				st.boolResult = true // bytea mode flag
 				st.hasValue = true
 			} else {
 				st.strResult += delimHex + hexVal
@@ -2176,6 +2193,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			}
 		}
 		sv := formatDatumDateStyle(arg, o.ctx)
+		// With the aggregate's own ORDER BY, concatenation must wait for the
+		// sort (M0125-0019) — see the strElems comment on aggRuntime.
+		if len(call.OrderBy) > 0 {
+			st.strElems = append(st.strElems, sv)
+			st.strDelims = append(st.strDelims, delim)
+			st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+			st.hasValue = true
+			break
+		}
 		if !st.hasValue {
 			st.strResult = sv
 			st.hasValue = true
@@ -2412,6 +2438,83 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		}
 	}
 	return nil
+}
+
+// evalAggOrderByKeys evaluates an aggregate call's own ORDER BY expressions
+// against the current input row and materialises them, so finishAgg can sort
+// the accumulated pieces later. A key that fails to evaluate becomes NULL
+// rather than aborting the aggregate — the pre-existing array_agg behaviour
+// this was factored out of.
+func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context) []Datum {
+	if len(orderBy) == 0 {
+		return nil
+	}
+	keys := make([]Datum, 0, len(orderBy))
+	for _, sk := range orderBy {
+		kv, err := evalExprSlot(sk.Expr, slot, ctx)
+		if err != nil {
+			kv = NullDatum
+		}
+		keys = append(keys, kv.MaterializeArena())
+	}
+	return keys
+}
+
+// aggOrderBySortedIdx returns the permutation that puts the accumulated
+// per-row key tuples into the aggregate's ORDER BY order. PostgreSQL performs
+// this sort inside the aggregate, before the transition function runs
+// (postgres/src/backend/executor/nodeAgg.c, process_ordered_aggregate_single),
+// so it decides the aggregate's value and not merely its presentation.
+//
+// The sort is STABLE: rows whose keys compare equal keep arrival order, which
+// is what PG's tuplesort gives for an aggregate whose sort keys do not fully
+// determine the order.
+//
+// Shared by array_agg and string_agg — the two ordering-sensitive built-ins in
+// finishAgg's switch. They diverged once already (string_agg simply ignored
+// ORDER BY, M0125-0019); one comparator keeps them from diverging again.
+func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
+	idx := make([]int, len(keys))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ka, kb := keys[idx[a]], keys[idx[b]]
+		for ki := range ka {
+			if ki >= len(kb) {
+				break
+			}
+			akNull, bkNull := ka[ki].IsNull(), kb[ki].IsNull()
+			if akNull && bkNull {
+				continue
+			}
+			// NullsFirst is already resolved by the planner to PG's
+			// defaults (ASC→NULLS LAST, DESC→NULLS FIRST) via
+			// sortByNullsFirst, so it is read verbatim here.
+			nullsFirst := false
+			desc := false
+			if ki < len(orderBy) {
+				nullsFirst = orderBy[ki].NullsFirst
+				desc = orderBy[ki].Desc
+			}
+			if akNull {
+				return nullsFirst
+			}
+			if bkNull {
+				return !nullsFirst
+			}
+			cmp, err := compareDatum(ka[ki], kb[ki], 0)
+			if err != nil || cmp == 0 {
+				continue
+			}
+			if desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	return idx
 }
 
 // aggDatumToFloat64 converts any numeric datum to float64 for aggregate computation.
@@ -2934,59 +3037,35 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		out := st.strResult
+		// The aggregate's own ORDER BY deferred concatenation to here
+		// (M0125-0019). Each piece carries the delimiter it was collected
+		// with, and PG emits the delimiter of the RIGHT-hand piece between
+		// two neighbours — so both travel through the permutation together
+		// and the first piece's delimiter is dropped.
+		if len(st.strElems) > 0 {
+			idx := aggOrderBySortedIdx(st.strElemKeys, call.OrderBy)
+			var b strings.Builder
+			for i, orig := range idx {
+				if i > 0 && orig < len(st.strDelims) {
+					b.WriteString(st.strDelims[orig])
+				}
+				b.WriteString(st.strElems[orig])
+			}
+			out = b.String()
+		}
 		// Bytea mode: st.boolResult=true means result is hex-encoded bytes.
 		if st.boolResult {
-			return NewStringDatum(`\x` + st.strResult)
+			return NewStringDatum(`\x` + out)
 		}
-		return NewStringDatum(st.strResult)
+		return NewStringDatum(out)
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
 		}
 		// Sort elements by ORDER BY keys if present.
 		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
-			// Build index slice and sort by keys.
-			idx := make([]int, len(st.arrayElems))
-			for i := range idx {
-				idx[i] = i
-			}
-			orderByDescs := make([]bool, len(call.OrderBy))
-			for i, sk := range call.OrderBy {
-				orderByDescs[i] = sk.Desc
-			}
-			sort.SliceStable(idx, func(a, b int) bool {
-				ka, kb := st.arrayElemKeys[idx[a]], st.arrayElemKeys[idx[b]]
-				for ki := range ka {
-					if ki >= len(kb) {
-						break
-					}
-					akNull := ka[ki].IsNull()
-					bkNull := kb[ki].IsNull()
-					if akNull && bkNull {
-						continue
-					}
-					// NULLs LAST for ASC (default), NULLs FIRST for DESC (default).
-					nullsFirst := false
-					if ki < len(call.OrderBy) {
-						nullsFirst = call.OrderBy[ki].NullsFirst
-					}
-					if akNull {
-						return nullsFirst
-					}
-					if bkNull {
-						return !nullsFirst
-					}
-					cmp, err := compareDatum(ka[ki], kb[ki], 0)
-					if err != nil || cmp == 0 {
-						continue
-					}
-					if ki < len(orderByDescs) && orderByDescs[ki] {
-						return cmp > 0
-					}
-					return cmp < 0
-				}
-				return false
-			})
+			idx := aggOrderBySortedIdx(st.arrayElemKeys, call.OrderBy)
 			sortedElems := make([]string, len(st.arrayElems))
 			sortedNulls := make([]bool, len(st.arrayElems))
 			for i, origIdx := range idx {

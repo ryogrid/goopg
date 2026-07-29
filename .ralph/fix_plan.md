@@ -1398,17 +1398,46 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `74f4b264`** with every control green. **TPC-DS cannot reach it** — zero of
       99 SF0.5 query files match `(in|exists|any|all)\s*\(\s*\(`. Gates: units
       PASS, `tpch-spotcheck.sh` PASS (Q12=2, Q13=35), pgbench smoke via hook.
-- [ ] **M0125-0019 — `string_agg(x, ',' ORDER BY x)` ignores the aggregate's own
-      ORDER BY** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
-      `select string_agg(x::text,',' order by x) from (values (3),(1),(2)) v(x)`
-      returns `3,1,2` in goopg and `1,2,3` in PG. Unrelated to set operations, but
-      it silently corrupts every ordered-aggregate result **while keeping row
-      counts intact** — the same blind spot class as M0125-0009/-0010. The clause
-      survives parsing (M0125-0009's `funcCallTailKey` already keys on it, which is
-      how `string_agg(x,',' ORDER BY a)` stopped colliding with `… ORDER BY b`), so
-      the gap is that the executor aggregate never sorts by it. PG evaluates an
-      aggregate's ORDER BY inside the aggregate (`nodeAgg.c`, sort-then-transition).
-      **Resume**: the aggregate operator in `internal/executor/`. **Accept by
+- [x] **M0125-0019 — `string_agg(x, ',' ORDER BY x)` ignores the aggregate's own
+      ORDER BY** (discovered by M0125-0006 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0019-aggregate-own-order-by.md`, two ledger rows
+      2026-07-29). Root cause was a **sibling asymmetry inside one `switch`**:
+      `applyAgg` has exactly two order-sensitive built-in branches and only
+      `array_agg` captured its keys — Hard-won Rule #2 verbatim. The clause was
+      intact at every upstream stage (parser `FuncCall.OrderBy`, M0125-0009's
+      `funcCallTailKey`, planner `AggregateCall.OrderBy` with `NullsFirst`
+      already defaulted by `sortByNullsFirst`). Fix = deferred concatenation
+      (`strElems`/`strDelims`/`strElemKeys`, live only when the call has an
+      ORDER BY, so the common path allocates nothing new) + `aggOrderBySortedIdx`,
+      one stable comparator now SHARED by both branches. The delimiter is the
+      subtle part: it is a per-row argument and PG emits the RIGHT-hand row's
+      own delimiter, so delimiters ride the same permutation as the values
+      (oracle-verified: `string_agg(n,d order by n)` over `('c','|'),('a','+'),
+      ('b','*')` = `a*b|c`). Also closed a LATENT second defect —
+      `planner.AggregateIsOrderSensitive` already allowed a parallel plan under
+      an ordered `string_agg` on the premise that the aggregate sorts its own
+      input, which was false until now, so such a plan could shuffle
+      differently on every run. 17 by-value subtests, **13 proved to fail at
+      `6088e41b` with all three controls green there**. TPC-DS cannot reach it
+      (zero of the 100 query files use `string_agg`/`array_agg`/`json_agg`/
+      `xmlagg`). Two ledger rows deferred → M0125-0021 (bytea held as text) and
+      the five order-sensitive aggregates with no `applyAgg` branch at all.
+- [ ] **M0125-0021 — a `bytea` literal is carried as TEXT, so `encode()` returns
+      an empty string and `length()` counts escape characters** (discovered by
+      M0125-0019 2026-07-29, ledger row 2026-07-29). Measured against the PG
+      18.3 oracle (port 65438): `length('\xaabb'::bytea)` = **6** in goopg vs
+      **2** in PG; `encode('\xaabb'::bytea,'hex')` = **`''`** vs `aabb`;
+      `encode('abc'::bytea,'base64')` = **`''`** vs `YWJj`;
+      `encode('abc'::bytea,'escape')` = **`''`** vs `abc`; and
+      `string_agg(b,'\x00'::bytea)::text` prints `\xbb\x00\xaa` vs `\xbb00aa`.
+      The `::bytea` cast yields the six-character escaped TEXT rather than a
+      `KindBytes` datum, which is why `applyAgg`'s `arg.Kind == KindBytes`
+      branch is unreachable from a literal. `encode()` returning `''` rather
+      than erroring makes this a **silent** wrong answer wherever bytea is
+      hex-dumped. **Resume**: `internal/executor/expr.go` — make the `::bytea`
+      cast produce `KindBytes`, then fix `encode`/`length`/`octet_length` to
+      read bytes; tighten `TestAggregateOrderByByteaStringAgg` (currently
+      asserts order only, deliberately) to PG's exact `\xbb00aa`. **Accept by
       VALUE**; executor change -> full pre-commit bar.
 - [ ] **M0125-0020 — the set-op chain must become a TREE; three separate
       annotations are now patching the missing structure** (discovered by
