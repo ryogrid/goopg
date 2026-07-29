@@ -88,9 +88,11 @@ mkdir -p "$(dirname "${GOOPG_BIN}")"
 
 stop_scope "${CG_UNIT}"
 
-progress "S2b" "tpcds: fresh server on ${PG_HOST}:${RUN_PORT} (unit=${CG_UNIT})"
+PPROF_ADDR="${NIGHTLY_TPCDS_PPROF_ADDR:-127.0.0.1:6161}"
+progress "S2b" "tpcds: fresh server on ${PG_HOST}:${RUN_PORT} (unit=${CG_UNIT} pprof=${PPROF_ADDR})"
+# GOOPG_PPROF_ADDR: private pprof port — see the same note in stage-tpch.sh.
 GOOPG_CG_UNIT="${CG_UNIT}" GOOPG_MEM_HIGH=10G GOOPG_MEM_MAX=12G \
-GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
+GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB GOOPG_PPROF_ADDR="${PPROF_ADDR}" \
     "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${RUN_DATA}" \
     --listen "${PG_HOST}:${RUN_PORT}" \
@@ -99,8 +101,16 @@ GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
 server_pid=$!
 
 cleanup() {
-    "${GOOPG_BIN}" stop -D "${RUN_DATA}" >/dev/null 2>&1 || true
-    wait "${server_pid}" 2>/dev/null || true
+    # Same bounded ladder as stage-tpch.sh — this stage runs the same TIMEOUT
+    # -> killed-client -> leaked-backend shape and had the identical untimed
+    # `wait`. See stop_goopg_server in lib/common.sh.
+    STOP_PPROF_ADDR="${PPROF_ADDR}"
+    STOP_DUMP_FILE="${TPCDS_DIR}/server-goroutines.txt"
+    stop_goopg_server "${GOOPG_BIN}" "${RUN_DATA}" "${server_pid}"
+    case "${STOP_RUNG}" in
+        graceful|already-exited) ;;
+        *) progress "S2b" "tpcds: server would NOT stop gracefully — escalated to ${STOP_RUNG} (leaked backend? see tpcds/server.log)" ;;
+    esac
     stop_scope "${CG_UNIT}"
     rm -rf "${RUN_DATA}"
 }

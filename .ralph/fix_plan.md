@@ -172,6 +172,41 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] **Nightly TPC-H stage wedged the host for 6h45m after its sweep finished**
+      — worked immediately under the banner's second carve-out (it broke the bench
+      clusters AND, via the new host-quiet guards, blocked M0124-0002/-0004 from
+      running at all). **DONE 2026-07-29**, design
+      `docs/design/root-0037-nightly-server-shutdown-ladder.md`. Run
+      `20260729-002344` finished its sweep at 02:07:15 and still held the host at
+      08:50 with **no error in any log**: the stage log ends on `sweep done`, the
+      server log on a *successful* `shutdown checkpoint complete`. Q13 hit the
+      1200s cap; killing psql kills only the client, and exactly ONE backend
+      (`pid=40`) has an `established` with no `closed`. Graceful shutdown cannot
+      return until every backend has, so the process never exited and
+      `stage-tpch.sh`'s **untimed** `wait ${server_pid}` inherited the hang. Fixed
+      by `stop_goopg_server` (`ci/batch/lib/common.sh`): graceful 120s ->
+      `-mode immediate` 60s -> SIGTERM 30s -> SIGKILL, 210s worst case, applied to
+      `stage-tpch.sh` AND `stage-tpcds.sh` (identical two lines; `stage-pgbench.sh`
+      already hard-killed). Liveness reads process **state**, not `kill -0` (a
+      background child answers `kill -0` while a zombie). Escalations are reported
+      via `progress`, so this can never present as silence again. Guarded by
+      `ci/batch/lib/test_stop_ladder.sh` (5 rungs + dump capture, ~50s, no build).
+- [ ] **goopg graceful shutdown hangs forever on a backend that outlives its client**
+      — the engine defect underneath the wedge above; the ladder bounds the COST,
+      not the CAUSE. `startClientEOFWatch` (`internal/server/eof_watch.go:113`)
+      logged `client connection lost mid-query; cancelling statement` for backend
+      `pid=40` and called `cancel()`; the backend never finished. `cl.OnStop`
+      (`internal/server/server.go:602`) checkpointed, called `runCancel()` and
+      drained the accept loop, but has **no deadline and no force-terminate step**,
+      so one unresponsive backend hangs the process indefinitely. PG diverges:
+      `pg_ctl stop -m fast` SIGTERMs every backend and `ProcessInterrupts` acts at
+      the next `CHECK_FOR_INTERRUPTS()`. The blocking site is NOT established — the
+      server was idle (0.4% CPU, 23 threads sleeping), so blocked, not spinning.
+      **Get the stack before theorising**: the next occurrence now auto-saves
+      `<stage>/server-goroutines.txt`; to force one, run TPC-H Q13 at SF=1 under a
+      1200s cap and kill the psql client. Ledger row 2026-07-29 (root-0037); same
+      family as root-0029's still-open orphaned-backend row, narrowed to one pid.
+
 - [x] **TestPort_IsolationPreparedTransactions** — testport spec FAILed in
       nightly run 20260719-094219 (AI-20260719-094219-001; repro:
       `go test -v -run '^TestPort_IsolationPreparedTransactions$' ./internal/testport/`).
