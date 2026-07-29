@@ -64,6 +64,13 @@ started.
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
 > 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
 >    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
+>    **↳ M0124 IS FULLY CLOSED (2026-07-30).** `M0124-0004` — the last open item —
+>    was closed on its CLASSIFY branch: Q35 is **performance-only, RC-8 shape**,
+>    its row count is **not recoverable by any budget** (warm floor ≈9.1 days at
+>    SF=1), and it is now **M0125-0003's acceptance query**. Nothing in M0124
+>    remains; **select from M0125's ordered list in step 3 below** — items 1–4
+>    there are done, so the next selection is **item 5 (`M0125-0014`/`-0015`,
+>    Q49/Q51 SF=1 re-measure)**. Historical detail follows.
 >    **↳ NEXT TASK TO SELECT (updated 2026-07-29 late): `M0124-0001` is CLOSED,
 >    and so are `-0002` (discharged this loop — `plan_snapshots/tpcds-round2-head.txt`
 >    now EXISTS and is committed), `-0003`, `-0005` and `-0006`. The only M0124
@@ -983,7 +990,35 @@ blocker; a code change landing mid-sweep voids the sweep.
       Entity-escape any literal `<table>`/`<col>`; verify via
       `gh api --method POST /markdown`. Design
       `docs/design/0124-0003-round2-deferral-ledger-completion.md`.
-- [ ] **M0124-0004 — recover or classify Q35's row count** (§13.5 #7). Q35 is the
+- [x] **M0124-0004 — recover or classify Q35's row count** (§13.5 #7).
+      **CLOSED 2026-07-30 on the CLASSIFY branch** (the item's own disposition —
+      "recover **or** classify"). Quiet host, HEAD `bd8c484d`: the designed solo
+      SF0.5 sweep (`TIMEOUT_SEC=1800`, fresh server) = `TIMEOUT` 1964 s, the
+      escalation to a **plain** SF=1 run = `rc=124` at 1974 s. Both readings are
+      **valid** and supersede the void 2026-07-29 pair. The SF=1 `EXPLAIN` at HEAD
+      is **byte-identical** to the 05:36 capture, so neither `beb7af82` nor
+      `c26c6fc3` (M0125-0003 stage 1) flipped Q35's shape — stage 1 is
+      shape-neutral here, as designed. **The 525 s history is refuted, not merely
+      unreproduced:** outer cardinality
+      (`customer ⋈ customer_address ⋈ customer_demographics`) = **96,562** and one
+      buffer-**warm** `EXISTS` #1 evaluation floors at **8.16 s** (×4, ±0.5 %), so
+      the AND-ed conjunct **alone** floors at **≈9.1 days** at SF=1 (≈4.6 days at
+      SF0.5). A plan whose cheapest conjunct costs nine days did not return 100
+      rows in 525 s; `651 s`/`628 s` are kill lines, not runtimes. Verdict:
+      **performance-only, RC-8 shape — not a wrong answer hiding behind a
+      timeout.** The SF0.5-slower-than-SF=1 anomaly **dissolves** (the sampler
+      halves facts by key parity but copies dimensions whole, so the outer
+      cardinality is unchanged and both scale factors are kill lines whose
+      ordering carries no information). **RC-8's "measure first" is discharged for
+      Q35** without a completing `EXPLAIN ANALYZE`: `Calls` = 96,562, per-call
+      cost = 8.16 s. **The row count stays unrecovered and is NOT recoverable by a
+      bigger budget** (900 s → 1800 s → 3600 s all sit ~3 orders of magnitude
+      below the floor) — it is gated on **M0125-0003** decorrelating the RC-8
+      shape, and **Q35 is that item's natural acceptance query** (first
+      terminating run vs the git-tracked oracle `35|OK|100|0`). Ledger row
+      2026-07-30; artefacts `analysis/tpcds-q35-m0124-0004/`; design doc
+      §"Execution record (2026-07-30)". **M0124 is now fully closed.**
+      Original specification follows. Q35 is the
       only query that has never produced a goopg row count. Its 2026-07-26 count
       was lost to the **PATH-loss** harness defect, NOT `tail -1` — `query35.sql`
       is a single statement and the multi-statement set is Q14/Q23/Q24/Q39. Two

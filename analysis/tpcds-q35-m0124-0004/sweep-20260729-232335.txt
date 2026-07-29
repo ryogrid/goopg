@@ -1,0 +1,9 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-29T23:23:46+09:00
+# goopg: bd8c484d bench(tpcds): the 99-query gate eight loops of commits were accepted without — run once, zero regressions
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 1800s
+# SUBSET PROBE (QUERIES=35) — NOT a gate result; the summary below covers only these queries
+Q35  TIMEOUT  1964s (oracle 100 rows)
+
+=== SUMMARY: PASS=0 (0 ck-verified, 0 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

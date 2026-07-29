@@ -255,3 +255,87 @@ usable for this (its `SF_LANE` no longer hardcodes the wrong cluster).
 No count exists, so no Q35 row can be added to M0124-0001's report. The ledger
 rows for the un-recovered count and for the contaminated sweeps are dated
 2026-07-29 in `.ralph/deferral_ledger.md`.
+
+## Execution record (2026-07-30) — the quiet-host repeat, and the classification
+
+The 2026-07-29 repeat instruction was executed verbatim on a **quiet host**
+(no `run-nightly`, no `ci/batch/stages/` process, no goopg server, load average
+0.99 falling, 26 GiB free). Both readings below are therefore **valid**, and
+they supersede the void pair above.
+
+| probe | scale | budget | wall | result |
+|---|---|---|---|---|
+| solo sweep (`QUERIES=35`, fresh server) | SF0.5 | 1800 s | 1964 s | `TIMEOUT` |
+| plain `psql -f query35.sql` (fresh server) | SF=1 | 1800 s | 1974 s | `TIMEOUT` |
+
+`sweep-20260729-232335.txt` and `goopg-sf1-plain-20260729.txt`. The escalation
+used a plain run, not `EXPLAIN ANALYZE`, as D5 required.
+
+### The 525 s history is refuted, not merely unreproduced
+
+D5 framed the open question as "a query which once finished in 525 s now exceeds
+1800 s". The right conclusion is the other one: **Q35 has never completed on
+goopg at any scale factor, and the 2026-07-26 `OK, 525 s` reading cannot be a
+completion of this plan.** That is now arithmetic rather than inference.
+
+The plan re-captured at HEAD `bd8c484d` is **byte-identical** to the 2026-07-29
+05:36 capture (`goopg-sf1-explain-head-bd8c484d.txt` vs `goopg-sf1-explain.txt`),
+so nothing in `beb7af82` (set-op) or `c26c6fc3` (M0125-0003 stage 1, relation
+width) flipped Q35's shape — stage 1 really is shape-neutral here. The shape is
+RC-8's: `$0 = ss_customer_sk` is a nested-loop **Filter**, so each `EXISTS`
+re-scans a whole fact table per outer row. Measured on that cluster:
+
+| quantity | value |
+|---|---|
+| outer cardinality (`customer ⋈ customer_address ⋈ customer_demographics`) | **96,562** |
+| one `EXISTS` #1 evaluation, **buffer-warm**, ×4 | 8.20 / 8.16 / 8.18 / 8.16 s |
+| `store_sales` / `catalog_sales` / `web_sales` rows (SF=1) | 2,880,404 / 1,441,548 / 719,384 |
+
+96,562 × 8.16 s ≈ **7.9 × 10⁵ s ≈ 9.1 days** — for the AND-ed `EXISTS` #1 alone,
+before the OR-ed pair. The warm floor is stable to ±0.5 %, so this is a floor,
+not an estimate with a hopeful tail. A plan whose cheapest conjunct costs nine
+days cannot have returned 100 rows in 525 s; the 07-26 row is a harness artefact
+of the same PATH-loss event that ate its row count, and it should not be carried
+forward as a runtime baseline. `651 s` and `628 s` are kill lines, not runtimes,
+and say only "> 600 s".
+
+### The SF0.5-slower-than-SF=1 anomaly dissolves
+
+The README flagged it as unexplained after ruling out a plan flip. With the cost
+model above it is not an anomaly at all. The sampler halves the fact tables by
+key parity but copies the dimensions whole, so the **outer** cardinality is
+unchanged at ~96,562 and only the inner re-scan halves: SF0.5 is ~2× cheaper per
+outer row (≈ 4.1 s → ≈ 4.6 days) and still four orders of magnitude above any
+budget. Both scale factors are therefore *timeouts*, and the wall-clock ordering
+of two kill lines carries no information. Nothing needs to explain it.
+
+### D5 outcome — classified, and why the count stays unrecovered
+
+Q35 lands on D5's third disposition with the contamination removed:
+**performance-only, RC-8 shape, not a wrong answer hiding behind a timeout.**
+No correctness claim is made or needed — goopg never produces rows to be wrong.
+
+The count is not recoverable by raising the budget: 900 s → 1800 s → 3600 s all
+sit ~3 orders of magnitude below the floor. It becomes recoverable only when the
+per-row re-scan does, i.e. when **M0125-0003** decorrelates the RC-8 shape. Q35
+is thus a *dependent* of M0125-0003 rather than an open measurement of its own,
+and it is the natural acceptance query for it: the first goopg run of Q35 that
+terminates should be checked against the git-tracked oracle `35|OK|100|0`.
+
+### D4 / RC-8 — "measure first" is discharged without `EXPLAIN ANALYZE`
+
+RC-8's criterion was the per-SubPlan `Calls`/`CacheMisses` counters, which need a
+*completing* `EXPLAIN ANALYZE` — unobtainable for the same reason the count is.
+The two numbers RC-8 actually wanted are now in hand by direct measurement:
+`Calls` is the outer cardinality **96,562** (the correlation is a Filter, so
+every outer row calls every SubPlan; the OR pair short-circuits, the AND-ed one
+does not), and the per-call cost is the **8.16 s** warm floor. A completing
+`EXPLAIN ANALYZE` would report those same two quantities. RC-8's measure-first
+gate is discharged for Q35, and by shape for its Q10/Q69 siblings.
+
+### D6 — deliverable
+
+M0124-0001's report receives a **classification** rather than a count, which is
+what "recover **or classify**" allows. `M0124-0004` is closed on that basis; the
+un-recovered count is carried as a ledger row pointing at M0125-0003, not as an
+open measurement task.
