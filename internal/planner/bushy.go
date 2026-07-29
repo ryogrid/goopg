@@ -2390,17 +2390,32 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
 		case *MultiHashJoin:
+			// M0125-0013: recurse through `collect` instead of
+			// matching bare scans inline. An MHJ table is NOT
+			// always a bare scan: pushSingleSourceFiltersIntoMHJTables
+			// wraps Tables[i] in a *Filter when it pushes a
+			// single-source conjunct down (and, for >=5-table FROM
+			// clauses, so does attachRelationLocalFilters). The old
+			// two-case switch silently skipped such a table — it
+			// recorded no scanEntry AND never advanced `off`, so
+			// every table to its RIGHT got an offset short by the
+			// skipped table's width, while the skipped table's own
+			// columns kept their FROM-cumulative index. Both halves
+			// then landed in a different relation's columns: TPC-DS
+			// Q47 returned s_county for d_year and a d_date_sk for
+			// s_store_sk, with the row COUNT still correct because
+			// only the top projection was misremapped.
+			//
+			// This is the same silent-fallthrough defect the
+			// `default:` arm below was hardened against in RC-2; the
+			// MHJ loop simply never received that fix. `collect`
+			// treats *SeqScan / *IndexScan exactly as the old code
+			// did (M0062-0002 alias preservation included), sees
+			// through the *Filter wrapper via its pass-through arm,
+			// and declines the whole remap on anything it cannot
+			// classify — the documented safe direction.
 			for _, t := range x.Tables {
-				switch s := t.(type) {
-				case *SeqScan:
-					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
-					off += len(s.Output())
-				case *IndexScan:
-					// M0062-0002: same alias preservation as the
-					// top-level IndexScan arm.
-					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
-					off += len(s.Output())
-				}
+				collect(t)
 			}
 		case *Join:
 			collect(x.Left)

@@ -1,56 +1,60 @@
 (idle — nothing in flight)
 
-Last loop: **`M0125-0008` CLOSED — and it took `M0125-0023` (Q95) with it.**
-`EXISTS (…) AND NOT EXISTS (…)` over one outer rel returned MORE rows than
-either conjunct alone. One derivation in `internal/planner/plan.go`
-(`Join.Output()` returns `Left.Output()` for Semi/Anti). Design
-`docs/design/0125-0008-semi-anti-conjunction-residual.md` (indexed); 2 ledger
-rows; 2 regression tests, both verified RED with the fix reverted.
+Last loop: **`M0125-0013` (Q47) CLOSED on a refuted premise.** Q47: 0 → **100
+rows = SF0.5 oracle**. One arm in `internal/planner/bushy.go`
+(`buildBindingsPosMap`'s `*MultiHashJoin` case matched only bare
+`*SeqScan`/`*IndexScan`, so a `*Filter`-wrapped leaf was skipped silently —
+no `scanEntry` AND no `off` advance). Fix = `collect(t)`. Design
+`docs/design/0125-0013-mhj-posmap-filtered-leaf.md` (indexed); 3 ledger rows;
+2 regression tests, the Filter one verified RED with the fix reverted and the
+bare-leaf one green on both sides (pins strict generalisation).
 
 Nightly triage: `ci/logs/action-items.md` unchanged (mtime Jul 25 03:20), all
 26 `AI-` subjects already filed — no-op.
 
 ## NEXT (banner order, rewritten this loop)
 
-1. **`M0125-0013`** (Q47) — now the top M0125 item; banner marks it NEXT.
-2. Then `M0125-0002 / -0003 / -0004 / -0005` (the 5 remaining open items).
-Owed independently, now **two commits deep**: one full 99-query SF0.5 gate
+1. **`M0125-0003` stage 1** — item 1 of the banner's ordered list, still
+   unlanded (shape-neutral; land it and defer the four-arm TIMED study).
+2. Then `M0125-0002 / -0004 / -0005`, and the `M0125-0013` **bookkeeping
+   half** (Q47's 8.4x runtime verdict — needs a QUIET host).
+Owed independently, now **three commits deep**: one full 99-query SF0.5 gate
 run on a quiet host (own ledger row, 2026-07-30).
 
 ## Facts the next loop should NOT re-derive
 
-- **All three CKMISMATCH cells are GONE.** Q16 `40dbec0df91d2438`, Q94
-  `04afc1b69831a5ea`, Q95 `e498634c02595c29` — each equals the SF0.5 oracle.
-  Do not re-probe them.
-- Root cause worth remembering as a CLASS: a field every writer sets to the
-  same derived expression should BE that expression. Semi/Anti `schema` was a
-  copy of `Left.Output()` refreshed at 4 sites; `rewriteMultiWayChain` (a 5th
-  pass) OID-sorts the subtree **in place** and knew nothing about it, leaving
-  a stale *permutation* — widths matched, so nothing detected it.
-- **Classify a subquery defect by the JOIN the planner builds, not the SQL
-  keyword.** `IN (subquery)` → `JoinTypeSemi`, same as `EXISTS`. That mistake
-  cost a whole filed task (M0125-0023).
-- MHJ-packing threshold is **3 base tables** — below it, semi/anti bugs of
-  this class do not reproduce. Use ≥3 in any repro.
-- **DEFERRED, same class, unfixed:** `NestedLoopIndexJoin.Output()`
-  (`plan.go:707`) caches identically; its refresher `reconcileNLILayout` is
-  gated on `costDrivenJoinOrder` (off by default). Needs its own reproducer
-  first — remapping NLI keys previously broke TPC-H Q9/Q21.
-- SF0.5 goopg cluster takes db **`postgres`** (not `tpcds05`; that is the PG
-  side). PG oracle :65438 takes user **`ryo`**. `bench/tpcds/server.sh
-  {start|stop} {pg|sf05}`.
-- The sweep supports **`QUERIES="16 94 95" scripts/tpcds-sf05-regression.sh
-  sweep`** for a subset probe — self-labels as NOT a gate result.
-- Pre-existing TIMEOUTs, NOT regressions: Q10, Q14, Q35, Q69 (each TIMEOUT in
-  sweeps `-181319`, `-210715`, `-221359`, `-225808`).
-- `plan-gate` picks the newest `plan_snapshots/*.txt` by mtime — currently
-  `tpcds-round2-head.txt`, which despite its name holds **TPC-H** plans and
-  needs the 65433 server up (`bench/tpch/setup_goopg.sh`), db/user `tpch`.
+- **A matching row count proves nothing about the projection.** Q47's 4-way
+  join produced 332,240 rows — *exactly PG's* — while every projected column
+  read a different relation. RC-1b declared the CTE body "exactly correct" on
+  a row count and the wrong-column half survived. This is D6a's lesson at the
+  sub-query level.
+- **Do not trust the fix_plan's stated defect LOCATION.** -0013 said "start
+  BELOW the CTE, at the `v1`→`v2` window layers". The window layers were
+  never broken — `rank()` returned 1 for every row because it was
+  partitioning on a permuted column. Verify the input to a suspect layer
+  before debugging the layer.
+- **The trigger shape:** ≥4 base tables AND a *multi-column* OR disjunction.
+  A single-column OR (`d_year=2000 or d_year=1999`) stays a residual Filter
+  and is FINE; only the multi-column form is pushed into the leaf by
+  `pushSingleSourceFiltersIntoMHJTables`, which wraps `mh.Tables[i]` in a
+  `*Filter`. 3 tables does not reproduce.
+- Class, now seen twice (M0125-0008, -0013): a node kind introduced by one
+  pass becomes an unhandled shape in every *other* pass that pattern-matches
+  on node kinds. RC-2 hardened `collect`'s `default:` arm for exactly this and
+  the MHJ loop nested inside it kept its own private unhardened switch.
+- SF0.5 goopg cluster takes db **`postgres`**; PG oracle :65438 takes user
+  **`ryo`**, db `tpcds05`. `bench/tpcds/server.sh {start|stop} {pg|sf05}`.
+- The sweep supports `QUERIES="…" scripts/tpcds-sf05-regression.sh sweep`;
+  it refuses to start while the nightly batch runs — `FORCE=1` overrides and
+  is legitimate for row-count/value work ONLY, never a timing.
+- `make plan-diff LABEL=tpcds-round2-head PLAN_DB=tpch PLAN_USER=tpch` needs
+  the 65433 server up (`bench/tpch/setup_goopg.sh`); despite the label it
+  holds **TPC-H** plans. 22/22 MATCH at this HEAD.
 
 Gates run: planner + executor package suites PASS; units suite PASS;
-`tpch-spotcheck.sh` PASS (Q12=2, Q13=35); `make plan-gate` 22/22 MATCH;
-SF0.5 **subset probe** over all 13 EXISTS/IN queries — PASS=9 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=4 (all 4 pre-existing); `make ralph-state-guard`
-(auto-repaired); pgbench smoke via the commit hook.
+`tpch-spotcheck.sh` PASS (Q12=2, Q13=35); `make plan-diff` 22/22 MATCH; SF0.5
+**subset probe** (Q47/53/57/63/89 + Q16/94/95) PASS=7 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=1 (Q47, host-load artefact — measured 100 rows standalone);
+`make ralph-state-guard`; pgbench smoke via the commit hook.
 
 In-flight: none.

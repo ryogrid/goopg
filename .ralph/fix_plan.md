@@ -144,8 +144,19 @@ started.
 >       premise ("no `EXISTS`, therefore not -0008") classified by SQL keyword
 >       rather than by the join the planner builds; `IN (subquery)` unnests to
 >       the same `JoinTypeSemi`.
->    3. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document
->       still actionable. **NEXT SELECTION.**
+>    3. ~~**`M0125-0013`** (Q47)~~ — **DONE 2026-07-30.** Closed on a refuted
+>       premise: the defect was in the CTE body, not the windowed layers above
+>       it — RC-1b had measured the body by ROW COUNT, and the row count was the
+>       half that was already correct (332,240 = PG). The projection read other
+>       relations' columns, so `rank()` returned 1 for every row and the `v2`
+>       self-join on `rn = rn+1` matched nothing. One arm of
+>       `buildBindingsPosMap` (`*MultiHashJoin` matched only bare scans, skipping
+>       `*Filter`-wrapped leaves without advancing `off`). Q47: 0 → **100 rows =
+>       oracle**. Its *runtime* verdict is deliberately NOT closed and is filed
+>       as the bookkeeping half below.
+>    4. **NEXT SELECTION: the remaining open M0125 items** — `M0125-0002`,
+>       `-0003` (stage 1), `-0004`, `-0005`. Take `M0125-0003` stage 1 first per
+>       item 1 of this list, which is still unlanded.
 >    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
 >    quiet host. M0125-0007 is a codec change and could only get the 3-query
 >    value probe, because the nightly CI batch held the host for its whole loop
@@ -2177,37 +2188,54 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       unpushed, so at SF0.5 it exceeded a 1500 s client budget (elapsed 1633 s)
       where it previously errored at ~11 s. Pre-existing plan-quality defect, not a regression: the fix changes
       one `ColumnRef` index and no plan shape.
-- [ ] **M0125-0013 — Q47: a SECOND defect downstream of the CTE body RC-1b
-      repaired** (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29, §13.4 item 2).
-      Measured `OK 142 s / 0 rows` vs PG's 100. RC-1b (`5db0a067`) made Q47's CTE
-      body **exactly correct** — 661,185 rows = PG, previously 0 — by stopping a
-      mispushed predicate from silently zeroing the scan input. The full query
-      still returns 0, so a second, independent defect sits in the **windowed
-      self-join layers above the CTE**, which until RC-1b had never received
-      non-empty input and had therefore never been exercised.
-      **Start BELOW the CTE**, at the `v1`→`v2` window/self-join layers of
-      `bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql` (`rank()` /
-      `avg()` over the partitioned windows) — reproducible for the first time
-      because the input is non-empty.
-      **Cheap reproduction: SF0.5 reproduces the row gap in 43 s**
-      (`MISMATCH goopg=0 oracle=100`, `tpcds-results-sf05/sweep-20260729-093056.txt`)
-      against 142 s at SF=1 — iterate on rows there. **But value acceptance is
-      SF=1 only**: Q47's SF0.5 oracle entry is `47|OK|100|n/a|2`, i.e. `ck=n/a`
-      (a `LIMIT` over a non-total `ORDER BY`), so the gate can never value-accept it.
-      **Settle the runtime question — as STEP 0, before touching the planner.**
-      An `EXPLAIN` diff against set A's plan is only interpretable while the plan
-      is unchanged; once the fix moves plan shape the comparison is confounded.
-      set A `OK 17 s` →
-      HEAD `OK 142 s` (8.4×, reproduced standalone at 143 s,
+- [x] **M0125-0013 — Q47: a SECOND defect downstream of the CTE body RC-1b
+      repaired** — **DONE 2026-07-30.** The premise was wrong in a precise and
+      instructive way: the second defect is NOT above the CTE, it is in the CTE
+      body, in the half RC-1b never measured. RC-1b checked the body by ROW
+      COUNT and the row count was already right — goopg's 4-way join produces
+      **332,240 rows, exactly PG's**, with every join predicate and filter
+      correct. Only the PROJECTION read the wrong columns (`i_category` returned
+      `s_store_sk`, `d_year` returned `s_county`, `d_moy` returned `s_zip`). So
+      `GROUP BY i_category` grouped on `s_store_sk` (6 groups vs 11), 6-column
+      and 4-column `GROUP BY` both collapsed to the same 29,617, and
+      `rank() over (partition by …)` partitioned on columns unique per row —
+      making **`rn` 1 for every row** (PG: 1..14) and `v1.rn = v1_lag.rn + 1`
+      the unsatisfiable `1 = 2`. The windowed self-join layers were never
+      broken; they were fed a permutation. Root cause: `buildBindingsPosMap`'s
+      `*MultiHashJoin` arm matched only bare scans, so a leaf wrapped in a
+      `*Filter` by `pushSingleSourceFiltersIntoMHJTables` (Q47's multi-column OR
+      disjunction, pushed into `date_dim`) was skipped silently — recording no
+      entry AND never advancing `off`. Design
+      `docs/design/0125-0013-mhj-posmap-filtered-leaf.md` (indexed); 2 regression
+      tests verified RED with the fix reverted; 3 ledger rows.
+      **Q47 now returns exactly 100 rows = the SF0.5 oracle.**
+      **STILL OPEN, split out as bookkeeping:** the STEP-0 runtime verdict
+      (set A `OK 17 s` → HEAD `OK 142 s`) — no timing on this host can settle
+      it, see the 2026-07-30 ledger row. Original text follows.
+
+- [ ] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
+      (ledger rows `tpcds-round2 q47-q49-q51` 2026-07-29 and M0125-0013
+      2026-07-30; §13.4 item 2). The ROW defect is closed — Q47 returns 100
+      rows = oracle as of 2026-07-30. What remains is purely a documentation
+      contradiction about its RUNTIME, and it is a bookkeeping repair of
+      M0124-0001's deliverable, not engine work.
+      set A `OK 17 s` → HEAD `OK 142 s` (8.4x, reproduced standalone at 143 s,
       `analysis/tpcds-sf1-resweep-20260728/diag-q47-rerun.txt`). Two primary
-      sources disagree and the task should close the gap: `RESULTS.md` chunk
+      sources disagree and this item should close the gap: `RESULTS.md` chunk
       49–56 and the RC-1b ledger row read it as the **expected cost** of newly
       non-empty input ("14s->143s confirms real work"), while the merged
       deliverable `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6 still calls it
       "bounded but **unattributed**" (it reproduces chunk 41–48's superseded
-      reasoning). The step-0 `EXPLAIN` diff decides it; record the verdict in
-      whichever document is wrong. (This half is a bookkeeping repair of
-      M0124-0001's deliverable, not engine work — it may be split out if it grows.)
+      reasoning). Record the verdict in whichever document is wrong.
+      **Needs a QUIET host** (`pgrep -af run-nightly.sh` first): every timing
+      taken on 2026-07-30 was under the nightly CI batch at load ~10. Take the
+      `EXPLAIN` diff against set A's plan BEFORE any further plan-shape change,
+      since the comparison is only interpretable while the plan is unchanged.
+      Structural evidence now favours the RC-1b reading — post-fix `v1` yields
+      54,915 groups (was 29,617 mis-grouped) and `rank()` yields 14 distinct
+      values (was 1), so `v2`'s three-way self-join does strictly more real
+      work than any pre-RC-1b measurement — but that is an argument, not a
+      measurement, so the item stays open.
       **Accept by VALUE**: Q47 = 100 rows = PG **and** values equal PG at SF=1.
       The SF0.5 gate sees the row gap today, so it will register the fix; the
       **nightly anchors will not** — `ci/batch/tpcds-row-anchors.csv` pins 61
