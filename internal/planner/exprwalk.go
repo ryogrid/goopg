@@ -1,6 +1,11 @@
 package planner
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // exprwalk.go — the single child-slot primitive every planner expression
 // traversal is meant to be built on, plus three deliberately
@@ -502,6 +507,238 @@ func cloneExprRefs(e Expr, pol scopePolicy, r exprRewriter) (Expr, bool) {
 		c = r.Rewrite(c)
 	}
 	return c, true
+}
+
+// ---------------------------------------------------------------------
+// Identity driver (M0125-0024)
+//
+// docs/design/0125-0024-expression-identity-collisions.md
+//
+// The three drivers above answer "what are this expression's children?".
+// exprIdentityKey answers a different question — "are these two
+// expressions the SAME expression?" — and it is the question whose
+// fail-open form is worst. A traversal that meets an unenumerated type
+// and does nothing LOSES information; an identity function that does the
+// same INVENTS it, asserting two unrelated expressions are one. Both
+// former sites did exactly that: planExprContentKey's `default:` returned
+// `fmt.Sprintf("%T", e)` — the type name alone — as an aggregate
+// state-sharing key, and exprEqual's fell back to comparing `%T%v`, which
+// prints nested pointers as addresses.
+//
+// See §2 of the design doc for the consumers and for M0097-0032, the
+// shipped wrong answer of this exact shape one level up.
+// ---------------------------------------------------------------------
+
+// exprIdentityKey returns a content-based identity key for e: two
+// expressions are interchangeable for evaluation iff their keys are
+// equal. ok == false means "I cannot decide this structurally", never
+// "they differ" — every caller must translate that into ITS OWN
+// fail-closed direction, and the two current callers translate it in
+// OPPOSITE directions (design §3.1), which is why this returns a
+// decidability flag rather than a bool.
+//
+// pol MUST be scopeVeto for an identity question. An inner plan has no
+// identity function (Node traversal is deliberately outside this file —
+// ledger row `tpcds-round2 exprwalk-node-side`), so scopeIgnore would
+// step over it silently and two different subqueries with identical Args
+// would key EQUAL. The parameter is kept rather than hardcoded because
+// the policy is the caller's correctness argument to make; a driver that
+// chose silently on the caller's behalf is the shape this milestone is
+// removing.
+func exprIdentityKey(e Expr, pol scopePolicy) (string, bool) {
+	var b strings.Builder
+	if !appendExprIdentityKey(&b, e, pol) {
+		return "", false
+	}
+	return b.String(), true
+}
+
+// appendExprIdentityKey writes e's key into b. The parentheses are not
+// decoration: without them `f(g(x))` and `f(g,x)` would flatten to the
+// same byte sequence, and arity would stop being part of the identity.
+func appendExprIdentityKey(b *strings.Builder, e Expr, pol scopePolicy) bool {
+	if e == nil {
+		b.WriteString("<nil>")
+		return true
+	}
+	self, ok := exprSelfKey(e)
+	if !ok {
+		return false
+	}
+	slots, ok := exprChildSlots(e)
+	if !ok {
+		return false
+	}
+	b.WriteByte('(')
+	b.WriteString(self)
+	for _, s := range slots {
+		switch s.kind {
+		case slotSameScope:
+			b.WriteByte(' ')
+			if !appendExprIdentityKey(b, *s.expr, pol) {
+				return false
+			}
+		case slotInnerPlan:
+			// Under scopeVeto this aborts, which is the point.
+			if !scopeVisit(*s.plan, pol, nil) {
+				return false
+			}
+		case slotSubqRow:
+			row := *s.row
+			if row == nil {
+				continue
+			}
+			if !scopeVisit(row.Plan, pol, nil) {
+				return false
+			}
+		}
+	}
+	b.WriteByte(')')
+	return true
+}
+
+// exprSelfKey returns the identity-bearing fields e carries ITSELF,
+// excluding its Expr/Node children (appendExprIdentityKey supplies
+// those). ok == false for an unenumerated type, the same fail-closed
+// contract as exprChildSlots and shallowCloneExpr; the exhaustiveness
+// test asserts all three switches cover exactly the same 32 types.
+//
+// The key must distinguish everything that changes the VALUE and nothing
+// else. Excluded across the board, with the argument for each in design
+// §3.2:
+//
+//   - `pos` — source location. PG's equal() excludes it too
+//     (COMPARE_LOCATION_FIELD is a no-op in equalfuncs.c), and seeing
+//     through it is the entire purpose of a content key.
+//   - cache fields (TypedStringLit.Cached*, IntervalLit.Cached*) —
+//     memoised from Value/Unit, which ARE keyed.
+//   - resolved type metadata (ColumnRef.Type, ExecParamRef.Type,
+//     RowExpr.Types, FuncCall.ReturnType, ExtractExpr.SourceTypeName) —
+//     derived by the resolver from what is keyed; including it would add
+//     only false negatives when one side came from a path that leaves it
+//     empty.
+//   - ColumnRef.Name / OuterColumnRef.Name — "for diagnostics" per their
+//     own struct comments, and empty on some construction paths.
+//   - IsNonCorrelated / ParParam — subplan-lowering bookkeeping on the
+//     four plan-bearing types, which are undecidable anyway whenever
+//     Plan is set. Their Args children ARE keyed.
+//   - SourceTableIdx (ColumnRef, OuterColumnRef) — the sibling
+//     divergence M0125-0024 was filed for: planExprContentKey keyed it,
+//     exprEqual did not. Resolved in favour of Index alone, because
+//     SchemaColumn.SourceTableIdx documents zero as "unknown / derived"
+//     (plan.go:27-37) and both callers compare expressions resolved
+//     against the SAME coordinate space, where Index already IS the
+//     identity. Including it can therefore only split one column into
+//     two.
+func exprSelfKey(e Expr) (string, bool) {
+	switch x := e.(type) {
+
+	// ---- literals: the value, and only the value ------------------
+	case *IntegerConst:
+		return fmt.Sprintf("int:%d", x.Value), true
+	case *StringConst:
+		return "str:" + x.Value, true
+	case *NumericConst:
+		// Value is the literal's text form. Two spellings of one
+		// number ('1.0' vs '1.00') stay distinct: they are distinct
+		// Consts to PG as well until const-folding types them.
+		return "num:" + x.Value, true
+	case *TypedStringLit:
+		return "tstr:" + x.Type + ":" + x.Value, true
+	case *IntervalLit:
+		if x.PreComputed {
+			// Value/Unit/Qualified are unused in this form (see the
+			// struct comment), so keying them would compare noise.
+			return fmt.Sprintf("ivalpre:%d/%d/%d", x.PreMonths, x.PreDays, x.PreMicros), true
+		}
+		return fmt.Sprintf("ival:%s/%s/%t/%t/%d", x.Value, x.Unit, x.Qualified, x.HasPrec, x.Prec), true
+	case *NullConst:
+		return "null", true
+	case *BooleanConst:
+		return fmt.Sprintf("bool:%t", x.Value), true
+
+	// ---- references ------------------------------------------------
+	case *ColumnRef:
+		return fmt.Sprintf("col:%d", x.Index), true
+	case *OuterColumnRef:
+		// Level is part of the identity: the same Index one scope up
+		// is a different column.
+		return fmt.Sprintf("outer:%d/%d", x.Level, x.Index), true
+	case *ParamRef:
+		return fmt.Sprintf("param:%d", x.Number), true
+	case *ExecParamRef:
+		return fmt.Sprintf("execparam:%d", x.ID), true
+	case *TableOidExpr:
+		return fmt.Sprintf("tableoid:%d", x.TableOID), true
+	case *CTIDExpr:
+		return "ctid", true
+	case *MergeActionExpr:
+		return "mergeaction", true
+	case *MergeWholeRowRef:
+		return fmt.Sprintf("mergerow:%t", x.IsOld), true
+
+	// ---- single-operand operators ----------------------------------
+	case *ExtractExpr:
+		return "extract:" + x.Field, true
+	case *IsNullExpr:
+		return fmt.Sprintf("isnull:%t", x.Negated), true
+	case *IsBoolExpr:
+		return fmt.Sprintf("isbool:%t/%t/%t", x.TestTrue, x.TestFalse, x.Negated), true
+	case *CollateExpr:
+		return "collate:" + x.CollationName, true
+	case *CastExpr:
+		// SourceType selects the executor's rounding mode, so it is
+		// semantic, not metadata; it is also implied by the operand,
+		// which makes keying it free of false negatives.
+		return fmt.Sprintf("cast:%s/%s/%d", x.TargetType, x.SourceType, x.Typmod), true
+	case *UnaryOp:
+		return fmt.Sprintf("unary:%d", x.Op), true
+
+	// ---- two-operand operators -------------------------------------
+	case *BinaryOp:
+		// ResultType is derived from Op and the operand types.
+		return fmt.Sprintf("binary:%d", x.Op), true
+	case *IsDistinctFromExpr:
+		return fmt.Sprintf("isdistinct:%t", x.Negated), true
+
+	// ---- containers -------------------------------------------------
+	case *FuncCall:
+		// Lower-cased: unquoted identifiers are case-insensitive in
+		// PG. planExprContentKey folded already; exprEqual did not,
+		// and that was the laxer-vs-stricter half of the divergence.
+		//
+		// Star must be keyed even though it adds no child: count(*)
+		// and a zero-arg count() are different calls.
+		return fmt.Sprintf("fn:%s/%t/%t", strings.ToLower(x.Name), x.Star, x.Variadic), true
+	case *RowExpr:
+		return "row", true
+	case *CaseExpr:
+		// The child keys are delimited, so arity is already visible —
+		// but WHICH slot is which is not: a searched CASE with one
+		// WHEN and no ELSE presents the same slot count as a simple
+		// CASE with an operand. Key the shape explicitly.
+		return fmt.Sprintf("case:%t/%d/%t", x.Operand != nil, len(x.Whens), x.Else != nil), true
+
+	// ---- scope-opening nodes ---------------------------------------
+	// All four are undecidable (ok == false from the driver, via
+	// scopeVeto) whenever Plan is set. These arms serve the Plan == nil
+	// shapes — an IN-list, or a node built before lowering.
+	case *InExpr:
+		return fmt.Sprintf("in:%t/%t/%d/%t/%d/%t",
+			x.Negated, x.NotEqualAny, x.AnyOp, x.AllOp, len(x.List), x.Plan != nil), true
+	case *ExistsExpr:
+		return fmt.Sprintf("exists:%t", x.Negated), true
+	case *SubqueryExpr:
+		return "subquery", true
+	case *ArraySubqueryExpr:
+		return "arraysubquery", true
+	case *MultiAssignSubqRow:
+		return fmt.Sprintf("masubqrow:%d", x.NCols), true
+	case *MultiAssignSubqElem:
+		return fmt.Sprintf("masubqelem:%d", x.ColIdx), true
+	}
+
+	return "", false
 }
 
 // shallowCloneExpr copies one node, duplicating any slice field so the

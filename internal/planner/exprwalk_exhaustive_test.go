@@ -193,17 +193,34 @@ func TestShallowCloneExprCoversEveryExprType(t *testing.T) {
 	assertSetEquality(t, "shallowCloneExpr", declared, covered)
 }
 
-// The two switches must also agree with EACH OTHER. If they drift, a
+// exprSelfKey (M0125-0024) is the third switch under the gate. It supplies the
+// per-node half of an IDENTITY key, and an unenumerated type there is the worst
+// form of the RC-1a defect: not a skipped node but a CONFLATED one — the old
+// planExprContentKey returned the bare type name, so any two *CaseExprs were
+// treated as the same aggregate argument.
+func TestExprSelfKeyCoversEveryExprType(t *testing.T) {
+	declared := exprNodeReceivers(t)
+	covered := typeSwitchCaseTypes(t, "exprSelfKey")
+	assertSetEquality(t, "exprSelfKey", declared, covered)
+}
+
+// The three switches must also agree with EACH OTHER. If they drift, a
 // type could be walkable but not cloneable, so cloneExprRefs
 // would abort fail-closed on a perfectly ordinary expression.
 func TestExprWalkSwitchesAgreeWithEachOther(t *testing.T) {
-	slots := typeSwitchCaseTypes(t, "exprChildSlots")
-	clone := typeSwitchCaseTypes(t, "shallowCloneExpr")
-	if missing := diffSets(slots, clone); len(missing) > 0 {
-		t.Errorf("exprChildSlots handles types shallowCloneExpr does not: %v", missing)
+	byName := map[string]map[string]bool{}
+	for _, fn := range []string{"exprChildSlots", "shallowCloneExpr", "exprSelfKey"} {
+		byName[fn] = typeSwitchCaseTypes(t, fn)
 	}
-	if missing := diffSets(clone, slots); len(missing) > 0 {
-		t.Errorf("shallowCloneExpr handles types exprChildSlots does not: %v", missing)
+	for a, sa := range byName {
+		for b, sb := range byName {
+			if a == b {
+				continue
+			}
+			if missing := diffSets(sa, sb); len(missing) > 0 {
+				t.Errorf("%s handles types %s does not: %v", a, b, missing)
+			}
+		}
 	}
 }
 

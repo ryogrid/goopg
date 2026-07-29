@@ -22,6 +22,11 @@ package planner
 //	50  walkerPending           — recursive traversals, 2..25 of 32 arms
 //	12  nonRecursiveClassifier  — decide-and-return, no descent
 //
+// Amended 2026-07-30 by M0125-0024: 63 sites — 3 primitives (exprSelfKey
+// joined), 48 walkerPending (exprEqual and planExprContentKey converted), 12
+// classifiers. Those two were the only census members whose fail-open
+// CONFLATES instead of no-opping, because both compute an identity.
+//
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
 // local-filter blast radius; they were never the population. The per-site arm
@@ -92,13 +97,17 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function, so the pin DEMOTES instead of disappearing. A conversion is
 	// audited by this role change; only a walker whose switch vanishes
 	// entirely loses its line.
-	"bushy.go:remapByPosMap":                                    nonRecursiveClassifier,
-	"bushy.go:remapOuterRefsInSubplan":                          walkerPending, // 5 of 32 arms
-	"bushy.go:remapPosMapAfterRewrite":                          walkerPending, // 8 of 32 arms
-	"bushy.go:visitColumnRefs":                                  walkerPending, // 7 of 32 arms
-	"bushy.go:visitColumnRefsByName":                            walkerPending, // 7 of 32 arms
-	"bushy.go:visitColumnRefsForTable":                          walkerPending, // 12 of 32 arms
-	"exprwalk.go:exprChildSlots":                                exprwalkPrimitive,
+	"bushy.go:remapByPosMap":           nonRecursiveClassifier,
+	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
+	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
+	"bushy.go:visitColumnRefs":         walkerPending, // 7 of 32 arms
+	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
+	"bushy.go:visitColumnRefsForTable": walkerPending, // 12 of 32 arms
+	"exprwalk.go:exprChildSlots":       exprwalkPrimitive,
+	// Added by M0125-0024: the per-node half of the identity key, complete
+	// over all 32 types and gated with the other two by
+	// exprwalk_exhaustive_test.go.
+	"exprwalk.go:exprSelfKey":                                   exprwalkPrimitive,
 	"exprwalk.go:shallowCloneExpr":                              exprwalkPrimitive,
 	"foldconst.go:FoldConstants":                                walkerPending, // 15 of 32 arms
 	"foldconst.go:toLiteralValue":                               nonRecursiveClassifier,
@@ -110,38 +119,44 @@ var exprSwitchInventory = map[string]walkerRole{
 	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
 	"nl_index_join.go:cloneExprShiftIdx":                        walkerPending, // 12 of 32 arms
 	"nl_index_join.go:residualCostMultiplier":                   nonRecursiveClassifier,
-	"planner.go:exprEqual":                                      walkerPending, // 5 of 32 arms
-	"planner.go:exprSide":                                       walkerPending, // 15 of 32 arms
-	"planner.go:exprType":                                       walkerPending, // 22 of 32 arms
-	"planner.go:findFirstNestedSRF":                             walkerPending, // 6 of 32 arms
-	"planner.go:inferExprType":                                  nonRecursiveClassifier,
-	"planner.go:isConstantExpr":                                 walkerPending, // 25 of 32 arms
-	"planner.go:isConstantPlanExpr":                             walkerPending, // 12 of 32 arms
-	"planner.go:planExprContentKey":                             walkerPending, // 4 of 32 arms
-	"planner.go:planHasEscapingOuterRef":                        walkerPending, // 6 of 32 arms
-	"planner.go:planIndexScanFromWhere":                         nonRecursiveClassifier,
-	"planner.go:remapColumnRefsToSchema":                        walkerPending, // 13 of 32 arms
-	"planner.go:replaceExprNode":                                walkerPending, // 6 of 32 arms
-	"planner.go:shiftColumnRefsBy":                              walkerPending, // 13 of 32 arms
-	"planner.go:withinGroupDirectArgColumnName":                 walkerPending, // 2 of 32 arms
-	"predp.go:remapSublinkOuterRefs":                            walkerPending, // 3 of 32 arms
-	"predp.go:whereEligibleForPreDPUnnest":                      nonRecursiveClassifier,
-	"pushdown.go:walkColumnRefsImpl":                            walkerPending, // 18 of 32 arms
-	"selectivity.go:clauseSelectivity":                          walkerPending, // 4 of 32 arms
-	"selectivity.go:clauseSelectivityWithSource":                walkerPending, // 4 of 32 arms
-	"selectivity.go:formatExprConstant":                         nonRecursiveClassifier,
-	"selectivity.go:isConstExpr":                                nonRecursiveClassifier,
-	"subplan_lower.go:analyzeSublink":                           walkerPending, // 7 of 32 arms
-	"subplan_lower.go:excludedRefsWithin":                       walkerPending, // 6 of 32 arms
-	"subplan_lower.go:handleFor":                                nonRecursiveClassifier,
-	"subplan_lower.go:rewriteSublinkPlan":                       walkerPending, // 6 of 32 arms
-	"subplan_lower_walk.go:lowerTraverseExpr":                   walkerPending, // 24 of 32 arms
-	"unnest.go:canUnnestExistsExpr":                             walkerPending, // 5 of 32 arms
-	"unnest.go:cloneExprLeaf":                                   walkerPending, // 14 of 32 arms
-	"unnest.go:cloneExprReplacingOuter":                         walkerPending, // 11 of 32 arms
-	"unnest.go:cloneExprSubstituteAggIdx0":                      walkerPending, // 7 of 32 arms
-	"unnest.go:containsExpr":                                    walkerPending, // 5 of 32 arms
-	"unnest.go:countSublinksInExpr":                             nonRecursiveClassifier,
+	// planner.go:exprEqual and planner.go:planExprContentKey were CONVERTED by
+	// M0125-0024 and their pins are DELETED, not demoted: unlike commit 1's
+	// remapByPosMap, no per-type dispatch survives — both are now
+	// exprIdentityKey plus one fail-closed direction each, with no type switch
+	// of their own. They were the two sites whose fail-open CONFLATES rather
+	// than no-ops (an identity function's unenumerated type is not skipped, it
+	// is asserted equal to every other node of its Go type), so the RC-1a
+	// class shrinks 50 → 48 and the census 64 → 63.
+	"planner.go:exprSide":                        walkerPending, // 15 of 32 arms
+	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
+	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
+	"planner.go:inferExprType":                   nonRecursiveClassifier,
+	"planner.go:isConstantExpr":                  walkerPending, // 25 of 32 arms
+	"planner.go:isConstantPlanExpr":              walkerPending, // 12 of 32 arms
+	"planner.go:planHasEscapingOuterRef":         walkerPending, // 6 of 32 arms
+	"planner.go:planIndexScanFromWhere":          nonRecursiveClassifier,
+	"planner.go:remapColumnRefsToSchema":         walkerPending, // 13 of 32 arms
+	"planner.go:replaceExprNode":                 walkerPending, // 6 of 32 arms
+	"planner.go:shiftColumnRefsBy":               walkerPending, // 13 of 32 arms
+	"planner.go:withinGroupDirectArgColumnName":  walkerPending, // 2 of 32 arms
+	"predp.go:remapSublinkOuterRefs":             walkerPending, // 3 of 32 arms
+	"predp.go:whereEligibleForPreDPUnnest":       nonRecursiveClassifier,
+	"pushdown.go:walkColumnRefsImpl":             walkerPending, // 18 of 32 arms
+	"selectivity.go:clauseSelectivity":           walkerPending, // 4 of 32 arms
+	"selectivity.go:clauseSelectivityWithSource": walkerPending, // 4 of 32 arms
+	"selectivity.go:formatExprConstant":          nonRecursiveClassifier,
+	"selectivity.go:isConstExpr":                 nonRecursiveClassifier,
+	"subplan_lower.go:analyzeSublink":            walkerPending, // 7 of 32 arms
+	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
+	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
+	"subplan_lower.go:rewriteSublinkPlan":        walkerPending, // 6 of 32 arms
+	"subplan_lower_walk.go:lowerTraverseExpr":    walkerPending, // 24 of 32 arms
+	"unnest.go:canUnnestExistsExpr":              walkerPending, // 5 of 32 arms
+	"unnest.go:cloneExprLeaf":                    walkerPending, // 14 of 32 arms
+	"unnest.go:cloneExprReplacingOuter":          walkerPending, // 11 of 32 arms
+	"unnest.go:cloneExprSubstituteAggIdx0":       walkerPending, // 7 of 32 arms
+	"unnest.go:containsExpr":                     walkerPending, // 5 of 32 arms
+	"unnest.go:countSublinksInExpr":              nonRecursiveClassifier,
 	// deepVisitSublinkChildren descends through walkExprTreeDeep, which is a
 	// PLAN walker with no Expr switch of its own, so the census's mutual-
 	// recursion pass reports it non-recursive. It is a walker.
@@ -301,7 +316,7 @@ func TestExprSwitchInventoryIsPinned(t *testing.T) {
 func TestExprSwitchCensusIsNotVacuous(t *testing.T) {
 	got := exprSwitchSites(t)
 
-	for _, key := range []string{"exprwalk.go:exprChildSlots", "exprwalk.go:shallowCloneExpr"} {
+	for _, key := range []string{"exprwalk.go:exprChildSlots", "exprwalk.go:shallowCloneExpr", "exprwalk.go:exprSelfKey"} {
 		arms, ok := got[key]
 		if !ok {
 			t.Fatalf("census did not find %s — the machinery is broken, not the inventory", key)

@@ -7020,27 +7020,31 @@ func parserExprHasWindowFunc(e parser.Expr) bool {
 
 // planExprContentKey returns a content-based string key for a planner Expr,
 // used to compare resolved expressions for aggregate state-sharing equality. M0097-0035.
+//
+// Two calls that key equal are given one SharedStateSlot, and the executor
+// then runs sfunc ONCE for the group and copies the leader's finished state to
+// every follower (operators_join_agg.go:1699-1760). A key collision is
+// therefore a wrong answer, not a lost optimisation — the M0097-0032 shape,
+// where a dropped FILTER made a filtered count report the unfiltered total.
+//
+// M0125-0024 replaced this function's own 4-of-32-arm type switch with
+// exprwalk.go's identity driver. Its `default:` returned `fmt.Sprintf("%T", e)`
+// — the type name alone — so any two distinct expressions of one unenumerated
+// type collided: `ua(a + b)` and `ua(a - b)` shared a slot, as did any two
+// *CaseExpr or *CastExpr arguments.
+//
+// FAIL-CLOSED DIRECTION: an undecidable expression (an inner plan, or a type
+// the primitive has never been taught) must NEVER share. Keying it by pointer
+// keeps the one legitimate case — the same node reached twice — while making
+// two distinct nodes distinct. See docs/design/0125-0024-*.md §3.1.
 func planExprContentKey(e Expr) string {
 	if e == nil {
 		return "<nil>"
 	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		return fmt.Sprintf("col:%d/%d", x.SourceTableIdx, x.Index)
-	case *IntegerConst:
-		return fmt.Sprintf("int:%d", x.Value)
-	case *StringConst:
-		return fmt.Sprintf("str:%s", x.Value)
-	case *FuncCall:
-		var b strings.Builder
-		b.WriteString("fn:" + strings.ToLower(x.Name))
-		for _, a := range x.Args {
-			b.WriteString("|" + planExprContentKey(a))
-		}
-		return b.String()
-	default:
-		return fmt.Sprintf("%T", e)
+	if k, ok := exprIdentityKey(e, scopeVeto); ok {
+		return k
 	}
+	return fmt.Sprintf("opaque:%T:%p", e, e)
 }
 
 func aggregateCallKey(fc *parser.FuncCall) string {
@@ -11942,44 +11946,40 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 }
 
 // exprEqual reports whether two resolved planner Exprs are structurally equal
-// for the purpose of DISTINCT ON / ORDER BY matching.
+// for the purpose of DISTINCT ON / ORDER BY matching (planner.go:1623's 42P10
+// check, distinctSortKeyOutputIndex, and pathKeyEqual).
+//
+// M0125-0024 replaced this function's own 5-of-32-arm type switch, and with it
+// a fallback that compared `fmt.Sprintf("%T%v", …)`. That fallback was wrong in
+// BOTH directions depending only on whether a struct happened to hold a
+// pointer: `%v` prints a nested pointer as a hex address, so two structurally
+// identical expressions read UNEQUAL, while it also printed `pos`, so even a
+// childless literal at a different source offset read unequal — the opposite of
+// PG, whose equal() excludes location outright.
+//
+// FAIL-CLOSED DIRECTION — the inverse of planExprContentKey's, which is why the
+// shared driver returns a decidability flag rather than a bool: an undecidable
+// expression must read NOT equal. Claiming equality wrongly would make the
+// planner treat one expression as another; a false negative is at worst a
+// spurious 42P10, which is diagnosable. The pointer short-circuit keeps a node
+// equal to itself, which the old `%T%v` fallback happened to give for free.
+// See docs/design/0125-0024-expression-identity-collisions.md.
 func exprEqual(a, b Expr) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	switch av := a.(type) {
-	case *ColumnRef:
-		if bv, ok := b.(*ColumnRef); ok {
-			return av.Index == bv.Index
-		}
-	case *IntegerConst:
-		if bv, ok := b.(*IntegerConst); ok {
-			return av.Value == bv.Value
-		}
-	case *StringConst:
-		if bv, ok := b.(*StringConst); ok {
-			return av.Value == bv.Value
-		}
-	case *FuncCall:
-		bv, ok := b.(*FuncCall)
-		if !ok || av.Name != bv.Name || len(av.Args) != len(bv.Args) {
-			return false
-		}
-		for i := range av.Args {
-			if !exprEqual(av.Args[i], bv.Args[i]) {
-				return false
-			}
-		}
+	if a == b {
 		return true
-	case *BinaryOp:
-		bv, ok := b.(*BinaryOp)
-		if !ok || av.Op != bv.Op {
-			return false
-		}
-		return exprEqual(av.Left, bv.Left) && exprEqual(av.Right, bv.Right)
 	}
-	// Fallback: compare text representation (pointer-safe only for primitives).
-	return fmt.Sprintf("%T%v", a, a) == fmt.Sprintf("%T%v", b, b)
+	ka, okA := exprIdentityKey(a, scopeVeto)
+	if !okA {
+		return false
+	}
+	kb, okB := exprIdentityKey(b, scopeVeto)
+	if !okB {
+		return false
+	}
+	return ka == kb
 }
 
 // findExprInSchema finds the output column index in outSchema that corresponds

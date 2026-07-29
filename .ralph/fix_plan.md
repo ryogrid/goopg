@@ -1490,7 +1490,45 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Do NOT claim "the walker class is extinct" — `walkColumnRefsImpl` and the
       `shiftColumnRefs` closure stay out of scope with a ledger row. Design
       `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md`.
-- [ ] **M0125-0024 — two expression-identity fail-opens that COLLIDE**
+- [x] **M0125-0024 — two expression-identity fail-opens that COLLIDE**
+      **DONE 2026-07-30.** Both fixed on one new driver. `exprwalk.go` gained a
+      third complete-over-32-types primitive (`exprSelfKey` — the node's OWN
+      identity-bearing fields) and a fourth driver over `exprChildSlots`
+      (`exprIdentityKey(e, pol)`). It returns a **decidability flag, not a
+      bool**, because the two callers translate "undecidable" in **opposite**
+      directions, and that asymmetry is the whole safety argument:
+      `planExprContentKey` keys an unkeyable node **per pointer** so it can
+      never share an aggregate state slot, while `exprEqual` returns **not
+      equal** so it can never assert two expressions are one (a false negative
+      there is at worst a diagnosable `42P10`). Both functions lost their own
+      type switches, so **both census pins are DELETED, not demoted** — unlike
+      commit 1's `remapByPosMap`, no per-type dispatch survives (RC-1a class
+      50 → 48, census 64 → 63).
+      Three findings the filing did not have: **(1)** the collision is reachable
+      from ordinary SQL, because `*BinaryOp` was one of the 28 unenumerated
+      types — `ua(a + b)` and `ua(a - b)` shared a slot. **(2)** the `%T%v`
+      fallback in `exprEqual` was wrong in **both** directions, not one: it
+      printed nested pointers as ADDRESSES (structurally equal expressions read
+      unequal) *and* printed `pos` (the same literal at another offset read
+      unequal), where PG's `equal()` excludes location outright
+      (`COMPARE_LOCATION_FIELD` is a no-op in `equalfuncs.c`). **(3)** the
+      `*ColumnRef` divergence resolves toward `exprEqual`, i.e. **`Index`
+      alone** — `SchemaColumn.SourceTableIdx` documents zero as "unknown /
+      derived" (`plan.go:27-37`), so it is auxiliary disambiguation metadata
+      with a hole rather than a `varno`, and both callers compare expressions
+      resolved against the SAME coordinate space where `Index` already IS the
+      identity. Including it could only split one column into two.
+      Gates: every pin proved to FAIL at `da6d2c0c` and pass after (including
+      the value pin, where both calls got `SharedStateSlot=0`); units suite;
+      `plan-diff LABEL=tpcds-round2-head MODE=structural` **22/22 MATCH** (the
+      laxer `pathKeyEqual` moved no plan); pgbench smoke via the hook. Value
+      gate is `internal/planner/agg_state_sharing_test.go`, plus
+      `TestExprIdentitySiblingsAgree` — the pair invariant that makes a future
+      divergence a test failure. Two ledger rows own what is left: the executor
+      half of the value gate (a real `CREATE AGGREGATE` driving the
+      leader/follower state copy) and `exprIdentityKey` still ACCEPTING
+      `scopeIgnore`, which is a wrong-answer policy for an identity question.
+      Original filing follows.
       (discovered by M0125-0002's STEP 0 census, 2026-07-30; ledger row same
       date). Both are outside the seven, and both are wrong-answer risks rather
       than missed optimisations, because they under-enumerate an *identity*
