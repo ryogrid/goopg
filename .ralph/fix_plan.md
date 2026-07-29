@@ -1523,17 +1523,29 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `TestExecMergeJoinAppliesResidualConjuncts` (fails 5/5 subtests pre-fix);
       units suite; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); full SF0.5 sweep;
       `make plan-diff`.
-      **⚠ Measured negative result — the anchor prediction above is WRONG.**
-      "The SF0.5 gate and the nightly anchors can see it" does **not** hold:
-      Q97 was swept with *and* without the fix and PASSED both times on the
-      identical checksum `65725195ebe13a3b`, because the half-sampled facts
-      yield no `(customer_sk, item_sk)` group whose second conjunct
-      discriminates. **SF0.5 is a regression gate, not a detection gate, for
-      join-residual defects** — a green sweep is not evidence that a residual
-      is applied. No Q97 anchor re-pinning is needed (SF0.5 was already right).
-      Filed as a ledger row (2026-07-29) together with the real remaining gap:
-      `Join` still carries ONE key pair against PG's mergeclause **list**, so
-      multi-key merge joins are now correct but less selective than PG.
+      **The SF0.5 gate DOES see it, as predicted** — full 99-query sweep went
+      `PASS=73 CKMISMATCH=5` -> `PASS=74 CKMISMATCH=4`, with **Q97
+      `CKMISMATCH -> PASS` the ONLY per-query change of 99** (baseline
+      `analysis/tpcds-sf05-ck-m0124-0005/sweep/sweep-20260729-064607.txt`), and a
+      same-harness A/B reads pre-fix `ck=5687f61d9fdd4f93` vs post-fix
+      `ck=65725195ebe13a3b` (= the oracle). **No Q97 anchor re-pinning needed** —
+      the oracle was already right; goopg moved onto it.
+      **⚠ Gate-integrity trap found en route (ledger row 2026-07-29).** An
+      earlier probe appeared to show the SF0.5 gate was BLIND to this defect —
+      it was an artifact, and the wrong conclusion was nearly recorded here.
+      `scripts/tpcds-sf05-regression.sh`'s **sweep path never rebuilds
+      `tmp/goopg-bench-bin`**: line 256 guards the build with `[[ -x
+      "${GOOPG_BIN}" ]] ||` and sits in `load-goopg`, not `sweep`. So editing or
+      `git stash`-ing a source file changes nothing about what the sweep runs —
+      it measures whatever binary was last left in `tmp/` (possibly the nightly
+      batch's). **A source-level A/B against this gate is meaningless without an
+      explicit `go build -o tmp/goopg-bench-bin ./cmd/goopg` in each arm, and a
+      green sweep after an edit does not prove the edit was exercised.**
+      (`bench/tpcds/server.sh` *does* rebuild unconditionally, so which entry
+      point started the server decides whether your change is under test.)
+      Remaining real gap, filed as the other ledger row: `Join` still carries ONE
+      key pair against PG's mergeclause **list**, so multi-key merge joins are
+      now correct but less selective than PG.
 
 > **Scope note (2026-07-29).** The four tasks below (**M0125-0012 … -0015**) adopt
 > the last four TPC-DS defects that had **no owning task** — they existed only as

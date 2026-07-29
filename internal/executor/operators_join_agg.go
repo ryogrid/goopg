@@ -806,9 +806,54 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 				}
 				j++
 			}
+			// M0125-0011: the merge key is only the FIRST equality
+			// conjunct of the ON clause — splitEqualityForHash
+			// (internal/planner/planner.go) returns a single
+			// left/right pair and discards the rest. Every remaining
+			// conjunct is residual and MUST still be evaluated per
+			// candidate pair, exactly as PostgreSQL evaluates a merge
+			// join's joinqual once its mergeclauses have located the
+			// group (postgres/src/backend/executor/nodeMergejoin.c,
+			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)). Without this
+			// the residual was silently dropped, so a two-conjunct
+			// FULL OUTER JOIN degenerated into its single-key
+			// counterpart (TPC-DS Q97: 2131274 rows instead of
+			// 836302) and RIGHT OUTER JOIN was wrong the same way.
+			leftMatched := make([]bool, i-li)
+			rightMatched := make([]bool, j-rj)
 			for a := li; a < i; a++ {
 				for b := rj; b < j; b++ {
-					o.rows = append(o.rows, concatRows(leftKeyed[a].row, rightKeyed[b].row))
+					joined := concatRows(leftKeyed[a].row, rightKeyed[b].row)
+					ok, perr := o.joinPredicateMatch(joined)
+					if perr != nil {
+						return perr
+					}
+					if !ok {
+						continue
+					}
+					leftMatched[a-li] = true
+					rightMatched[b-rj] = true
+					o.rows = append(o.rows, joined)
+				}
+			}
+			// A row whose merge key matched but whose residual did not
+			// is still an UNMATCHED row for outer-join purposes, so it
+			// must be null-extended here; the cmp<0 / cmp>0 arms only
+			// see rows whose key itself found no partner.
+			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
+				for a := li; a < i; a++ {
+					if !leftMatched[a-li] {
+						o.rows = append(o.rows, concatRows(leftKeyed[a].row, nullRight))
+					}
+				}
+			}
+			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
+				for b := rj; b < j; b++ {
+					if !rightMatched[b-rj] {
+						merged := concatRows(nullLeft, rightKeyed[b].row)
+						o.coalesceUsingRow(merged)
+						o.rows = append(o.rows, merged)
+					}
 				}
 			}
 		}
