@@ -1,66 +1,63 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0019 COMPLETE** (committed + pushed; see git log).
+Last loop: **M0125-0020 COMPLETE** — the set-op chain is now a TREE.
 Nightly triage done: `ci/logs/action-items.md` unchanged since 2026-07-25
 (mtime Jul 25 03:20) — filing was a no-op again.
 
-## NEXT: `M0125-0020` (convert the set-op chain from a linked list to a TREE —
-retires `ParenBranches` + `InnerSegmentCount` + `InnerSortLimit`; it is the real
-fix behind four deferral rows from -0006/-0017). Large parser+planner change;
-accept by VALUE with the whole existing -0006/-0016/-0017/-0018 matrices as
-non-regression.
+## ⚠ STATE CHANGE: THE NIGHTLY WEDGE IS GONE — the host is QUIET
 
-Also newly filed and cheap: **`M0125-0021`** (a `bytea` literal is carried as
-escaped TEXT — `length('\xaabb'::bytea)`=6 vs PG 2, `encode(<bytea>,…)` returns
-`''` for hex/base64/escape. `encode` returning `''` instead of erroring makes it
-a SILENT wrong answer). Resume in `internal/executor/expr.go` at the `::bytea`
-cast.
+`run-nightly.sh` (PID 2511542) and the 7.5 GB `goopg-bench-bin` (PID 2621153)
+are **no longer running**; only `nightly-scheduler.sh` (2230863) remains.
+`free -g` showed 27 GB available. This unblocks, for the first time in six
+loops, the two items that needed a quiet host. Re-verify with
+`pgrep -af ci/batch` before selecting.
 
-## Why not M0124 / M0125-0002..-0005 (do not re-derive — 5th loop unchanged)
+## NEXT (banner order — `.ralph/fix_plan.md` "Current Priority" wins)
 
-- `M0124-0002` / `M0124-0004` need a QUIET host. **The nightly wedge is STILL
-  there** (below) → unselectable.
-- `M0125-0004`, `-0002`, `-0005` diff against `plan_snapshots/
-  tpcds-round2-head.txt`, which is M0124-0002's deliverable and does not exist.
-  `M0125-0003` needs a four-arm TIMED study → host blocker.
+The banner puts **M0124 → M0125 → M-NIGHTLY**. M0124 is now selectable:
 
-## ⚠ STILL BLOCKED ON THE USER — the nightly wedge is UNCHANGED (now ~14h)
+1. **`M0124-0002`** — retroactive TPC-H + plan-baseline discharge (a TIMED A/B;
+   needs the quiet host, which now exists). Produces
+   `plan_snapshots/tpcds-round2-head.txt`, which `M0125-0002/-0004/-0005` all
+   diff against and which still does not exist.
+2. **`M0124-0004`** — Q35's row count (two previous readings voided by the
+   nightly batch; harness guards refuse to start while it runs, `FORCE=1`
+   overrides and is legitimate for row-count work, never for a timing).
+3. Also owed: the **FULL 99-query SF0.5 gate** (`scripts/tpcds-sf05-regression.sh
+   sweep`, ~1 h, no `QUERIES=`), 7 loops of debt, diff against
+   `tpcds-results-sf05/sweep-20260729-123114.txt` (PASS=75 MISMATCH=1
+   CKMISMATCH=3 ERROR=2 TIMEOUT=14 SKIP=4). Ledger row 2026-07-29.
 
-Run `20260729-002344` wedged since ~02:07; `goopg-bench-bin` PID **2621153**
-still resident (7.5 GB RSS). `kill` of non-owned PIDs is hard-denied by the
-classifier, so I cannot clear it.
-
-```
-kill -TERM 2511542    # run-nightly.sh   — stops before stage-tpcds
-kill -QUIT 2621153    # goopg server     — QUIT, not KILL: untrapped, so it
-                      # dumps the leaked backend's stack to
-                      # ci/logs/20260729-002344/tpch/server.log
-```
-Re-check with `pgrep -af ci/batch`.
+Remaining M0125 items are blocked as before: -0007/-0008 wait for the sweep to
+reach Q99; -0002/-0004/-0005 need M0124-0002's snapshot; -0003 needs a four-arm
+timed study.
 
 ## Facts the next loop should NOT re-derive
 
-- **The full 99-query SF0.5 gate is now 4 loops of debt.** Same reason each
-  time: the sweep's ~21 GB Q5 peak does not fit beside the wedged 7.5 GB
-  nightly server. A quiet-host loop should run it once.
-- `internal/executor/` has an IN-PROCESS SQL harness — `newDDLFixture(t)`
-  returns `(ctx, _, cleanup)` and `runQuery(t, ctx, sql)` returns `[]Row`.
-  No server, no port, ~10 ms per matrix. Use it for by-value acceptance.
-- To check whether a change can reach TPC-DS, grep the 99 query files directly
-  (`bench/tpcds/runtime_goopg/tpcds-data/queries/*.sql`) — 10 s. It gave both
-  -0018 and -0019 a definitive "zero hits".
-- PG oracle for hand-written SQL: port **65438**, role **`ryo`** (NOT
-  `postgres`), db `tpcds`, `psql -X -q -t -A`.
-- `internal/executor/operators_join_agg.go` is **already gofmt-dirty at HEAD**
-  (12 hunks, go1.26 local vs go1.25 baseline) in the joinOp struct, the
-  `floatSpecialKind` consts, and ~8 more spots. Never `gofmt -w`; verify your
-  own hunks are absent from `gofmt -d` and that the hunk COUNT is unchanged.
+- **TPC-DS reachability grep** (10 s, decisive): for set-op shapes, only Q14,
+  Q23, Q87 have a parenthesised operand followed by a set-operator. Q87/Q23
+  checksums to match: `b363a9287bdd0920` / `00f53003bda23764`.
+- SF0.5 **subset probe**: `QUERIES="14 23 87 …" scripts/tpcds-sf05-regression.sh
+  sweep` — stamped "SUBSET PROBE", NOT a gate result. ~20 min for 10 queries.
+- **HEAD-worktree proof** (~2 min, cheap): `git worktree add /tmp/X HEAD
+  --detach`, copy the new test file in, `cd /tmp/X && go test -run …`. The shell
+  cwd resets automatically afterwards. Removes with `git worktree remove --force`.
+- PG oracle: port **65438**, role **`ryo`**, db `tpcds`, `psql -X -q -t -A`.
+  It was DOWN at loop start — `bench/tpcds/server.sh start pg`.
+- Throwaway goopg (~40 s): `./bin/goopg init -D tmp/X -N` then `GOOPG_CG_UNIT=n
+  nohup scripts/goopg-test-run.sh ./bin/goopg start -D tmp/X --listen
+  127.0.0.1:5533 &`; `./bin/goopg stop -D tmp/X`. Subcommand is `init`, not
+  `initdb`.
+- Already gofmt-dirty at HEAD (never `gofmt -w`): `catalog.go` 27 hunks,
+  `parser/ast.go` 8, `planner/planner.go` 5, `parser/select.go` 1.
+- `go test ./internal/...` HANGS in `internal/testport` (10 min panic). Use
+  `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`.
 - **Never `pkill -f`** — self-matches, kills the invoking shell (exit 144).
-- A `cd` inside a compound Bash command PERSISTS into later calls.
 
 Gates run: units PASS; `tpch-spotcheck.sh` PASS (Q12=2 rows, Q13=35 rows);
-17 by-value subtests PASS and **13 proved to FAIL at `6088e41b`** with all
-three controls green there; gofmt hunk count unchanged (12→12);
-`make ralph-state-guard` OK (auto-repaired the stale completed marker);
-pgbench smoke PASS via hook.
+SF0.5 subset probe PASS=6 ck-verified / MISMATCH=0 / ERROR=0 (Q5/Q14/Q54
+TIMEOUT, identical to baseline); 27-statement psql matrix byte-identical vs
+PG 18.3; 13 new by-value subtests PASS (5 proved failing at `8ce216dd`);
+gofmt hunk counts unchanged; pgbench smoke via commit hook;
+`make ralph-state-guard` — see status block.
 In-flight: none.

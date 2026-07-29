@@ -970,15 +970,40 @@ func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
 	return clause, true, nil
 }
 
-// parseParenthesisedSelectStmt handles a top-level compound query where the
-// first branch is wrapped in parentheses, e.g.:
+// trailingClauseFollowsParens reports whether t continues a query after a
+// `select_with_parens` operand — a set operation, or one of ORDER BY /
+// LIMIT / OFFSET. Anything else (`)`, `;`, an alias, `RETURNING`, …) means the
+// parenthesised query stands alone. Used by parseParenthesisedSelectStmt to
+// decide whether a grouping node is needed; it looks at the same keyword set
+// continuesParenthesisedQuery accepts, minus the ones that cannot introduce a
+// clause parseParenthesisedSelectStmt itself parses (`)`, FOR). M0125-0020.
+func trailingClauseFollowsParens(t Token) bool {
+	if t.Kind != TokenKeyword {
+		return false
+	}
+	switch t.Keyword {
+	case KwUnion, KwIntersect, KwExcept, KwOrder, KwLimit, KwOffset:
+		return true
+	}
+	return false
+}
+
+// parseParenthesisedSelectStmt handles a query whose first branch is wrapped in
+// parentheses, e.g.:
 //
 //	(SELECT a FROM t1 EXCEPT SELECT a FROM t2) UNION ALL (SELECT a FROM t3)
 //
-// PostgreSQL allows any branch of a set-operation to be parenthesised.
-// We handle this at the statement level by consuming '(' ... ')' and then
-// looking for a trailing UNION / INTERSECT / EXCEPT clause.
+// PostgreSQL allows any branch of a set-operation to be parenthesised. We
+// consume '(' … ')' and then look for a trailing UNION / INTERSECT / EXCEPT
+// clause and ORDER BY / LIMIT / OFFSET.
+//
+// Anything found after the ')' is attached to a fresh GROUPING node whose
+// SetOpOperand is the parenthesised query — never into that query's own chain
+// or sort/limit slots. That mirrors gram.y, where `select_with_parens` is a
+// LEAF operand of `select_clause`, so trailing text always attaches above it.
+// M0125-0020.
 func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
+	lparen := p.cur().Pos
 	p.advance() // consume '('
 	// Handle nested parentheses: (((SELECT ...))) recurses here so that any
 	// depth of wrapping works. M0097-0042.
@@ -999,106 +1024,53 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')' after SELECT in parenthesised query")
 	}
-	// Mark that this SelectStmt came from an explicit parenthesised expression
-	// so the planner's left-associativity flattening stops here (the content
-	// was explicitly grouped and must be treated as an atomic unit). M0097-0042.
+	// Everything innerSel holds — its chain and its own sort/limit — was
+	// written inside the ')' just consumed, including anything a nested
+	// parseParenthesisedSelectStmt returned (`((B) EXCEPT (C))`: the inner
+	// level built a grouping node for the EXCEPT, and this outer paren really
+	// does cover it). M0097-0042.
 	innerSel.Parenthesized = true
-	// The ')' just consumed encloses everything innerSel currently holds,
-	// including any chain a nested parseParenthesisedSelectStmt absorbed on
-	// the way up (`((B) EXCEPT (C))` — the inner level set ParenBranches=1,
-	// but this outer paren really does cover the EXCEPT). Reset the boundary
-	// before the trailing-set-op block below re-establishes it. M0125-0006.
-	innerSel.ParenBranches = 0
+	if !trailingClauseFollowsParens(p.cur()) {
+		// Nothing was written after the ')': the parenthesised query is the
+		// whole operand/statement and needs no grouping node above it.
+		return innerSel, nil
+	}
+	// Text follows the ')'. It attaches ABOVE the parenthesised query, never
+	// into it — `select_with_parens` is a leaf in gram.y. Give the branch its
+	// own node and build the enclosing one. M0125-0020.
+	grp := &SelectStmt{pos: lparen, SetOpOperand: innerSel}
 	// Optional trailing set-operation (UNION ALL / EXCEPT / INTERSECT …).
+	// Chains stay left-deep because each subsequent operand is parsed by
+	// parseSetOpClause, which recurses back here for a parenthesised one:
+	//   (A) EXCEPT (B) EXCEPT (C) → grp(A) EXCEPT grp(B) EXCEPT C.
 	if setOp, present, err := p.parseSetOpClause(); err != nil {
 		return nil, err
 	} else if present {
-		// If innerSel already has a SetOp from the parenthesised content
-		// (e.g. "(A EXCEPT B) UNION ALL (C ...)"), we need to attach the
-		// outer set-op to the RIGHTMOST node in the existing chain rather
-		// than overwriting innerSel.SetOp. This mirrors how PostgreSQL's
-		// grammar builds left-to-right set-op trees:
-		//   (A EXCEPT B) UNION ALL C → A.SetOp=EXCEPT→B.SetOp=UNION_ALL→C
-		if innerSel.SetOp == nil {
-			innerSel.SetOp = setOp
-			// The parentheses covered a single branch; this operator was
-			// written after the ')'. M0125-0006.
-			innerSel.ParenBranches = 1
-			// Anything in the ORDER BY / LIMIT / OFFSET slots right now was
-			// parsed BEFORE that ')' (the lift-from-right and trailing-clause
-			// blocks below have not run yet), so it belongs to the single
-			// parenthesised branch — zero set-op segments, which
-			// InnerSegmentCount cannot express. M0125-0017.
-			if innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil {
-				innerSel.InnerSortLimit = true
-			}
-		} else {
-			// Walk to the rightmost SelectStmt and attach there.
-			// Count inner segments while walking — used below to record
-			// InnerSegmentCount when the inner compound has ORDER BY.
-			innerSegCount := 1 // the innerSel.SetOp itself is segment 1
-			rightmost := innerSel.SetOp.Right
-			for rightmost.SetOp != nil {
-				innerSegCount++
-				rightmost = rightmost.SetOp.Right
-			}
-			rightmost.SetOp = setOp
-			// innerSegCount links were inside the parentheses, so
-			// innerSegCount+1 branches were; everything from here on was
-			// written after the ')'. M0125-0006.
-			innerSel.ParenBranches = innerSegCount + 1
-			// When the inner compound has ORDER BY / LIMIT / OFFSET, those
-			// clauses belong to the INNER result, not the outer set-op we
-			// just appended. Record InnerSegmentCount so the planner can
-			// apply the sort/limit to the inner result only.
-			// Example: (((A INTERSECT B ORDER BY 1))) UNION ALL C
-			//   innerSegCount=1 (INTERSECT), ORDER BY is on innerSel.
-			// M0097-0044.
-			//
-			// InnerSortLimit already being set means a NESTED paren level
-			// claimed these clauses for a boundary further left — e.g.
-			// `((A ORDER BY 1 LIMIT 2) UNION ALL C) EXCEPT D`, where the inner
-			// level recorded the head branch. This level's ')' encloses that
-			// boundary but must not widen it. M0125-0017.
-			if !innerSel.InnerSortLimit &&
-				(innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil) {
-				innerSel.InnerSegmentCount = innerSegCount
-				innerSel.InnerSortLimit = true
-			}
-		}
-		// Lift ORDER BY/LIMIT/OFFSET from right branch up to outermost level
-		// (mirrors what parseSelect does for non-parenthesised set ops).
-		//
-		// Not when InnerSortLimit is set: those slots are already spoken for by
-		// an inner boundary, and overwriting them would move the head branch's
-		// own sort/limit onto the wrong operand. Leaving the clauses on the
-		// right branch is exactly right when that branch is parenthesised
-		// (`(A LIMIT 2) UNION ALL (C ORDER BY 1 LIMIT 1)` — PG keeps each
-		// branch's own limit); for a BARE right branch the outer sort is lost
-		// as an ordering, which the deferral ledger records. M0125-0017.
-		if right := setOp.Right; right != nil && !innerSel.InnerSortLimit {
-			if innerSel.OrderBy == nil && right.OrderBy != nil {
-				innerSel.OrderBy = right.OrderBy
+		grp.SetOp = setOp
+		// Lift a trailing ORDER BY / LIMIT / OFFSET off a BARE right branch:
+		// parseSetOpClause parses the RHS with a full parseSelect, which
+		// greedily attaches clauses that actually bind to the whole chain.
+		// A parenthesised right branch keeps its own (`(A) UNION (C ORDER BY 1
+		// LIMIT 1)` — PG limits C alone). Same rule, same code, as
+		// parseSelect's two lift sites. M0097-0024 / M0097-0042.
+		if right := setOp.Right; right != nil && !right.Parenthesized {
+			if grp.OrderBy == nil && right.OrderBy != nil {
+				grp.OrderBy = right.OrderBy
 				right.OrderBy = nil
 			}
-			if innerSel.Limit == nil && right.Limit != nil {
-				innerSel.Limit = right.Limit
+			if grp.Limit == nil && right.Limit != nil {
+				grp.Limit = right.Limit
 				right.Limit = nil
 			}
-			if innerSel.Offset == nil && right.Offset != nil {
-				innerSel.Offset = right.Offset
+			if grp.Offset == nil && right.Offset != nil {
+				grp.Offset = right.Offset
 				right.Offset = nil
 			}
 		}
 	}
 	// Optional ORDER BY / LIMIT / OFFSET after the parenthesised compound.
-	// A clause written HERE belongs to the whole chain, so it collides with an
-	// inner boundary that already claimed the same slot. The linked-list AST
-	// has exactly one such slot, so the two cannot coexist: give the slot to
-	// the outer clause (the pre-M0125-0017 behaviour) rather than silently
-	// applying the outer text to an inner operand. Recorded in the deferral
-	// ledger. M0125-0017.
-	trailingSortLimit := false
+	// These bind to the whole chain, which is exactly what grp is — the
+	// operand's own clauses live on innerSel and are no longer overwritten.
 	if p.acceptKeyword(KwOrder) {
 		if !p.acceptKeyword(KwBy) {
 			return nil, p.errAtCur("expected BY after ORDER")
@@ -1107,32 +1079,23 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		innerSel.OrderBy = ob
-		trailingSortLimit = true
+		grp.OrderBy = ob
 	}
 	if p.acceptKeyword(KwLimit) {
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		innerSel.Limit = e
-		trailingSortLimit = true
+		grp.Limit = e
 	}
 	if p.acceptKeyword(KwOffset) {
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		innerSel.Offset = e
-		trailingSortLimit = true
+		grp.Offset = e
 	}
-	// Only the single-branch boundary is surrendered: M0097-0044's
-	// InnerSegmentCount>0 boundary predates this and keeps its behaviour
-	// byte-for-byte. M0125-0017.
-	if trailingSortLimit && innerSel.InnerSegmentCount == 0 {
-		innerSel.InnerSortLimit = false
-	}
-	return innerSel, nil
+	return grp, nil
 }
 
 func (p *parser) parseTargetList() ([]ResTarget, error) {

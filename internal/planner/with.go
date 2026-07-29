@@ -409,6 +409,10 @@ func validateNoAggregatesInRecursiveMember(sel *parser.SelectStmt, ctePos int) e
 	if sel.SetOp != nil {
 		return validateNoAggregatesInRecursiveMember(sel.SetOp.Right, ctePos)
 	}
+	// A grouping node holds its parenthesised operand below itself. M0125-0020.
+	if sel.SetOpOperand != nil {
+		return validateNoAggregatesInRecursiveMember(sel.SetOpOperand, ctePos)
+	}
 	return nil
 }
 
@@ -444,6 +448,11 @@ func (w *recRefWalker) walkSelect(sel *parser.SelectStmt, inSub, inExceptRight, 
 		} else {
 			w.walkSelect(sel.SetOp.Right, inSub, inExceptRight, inOuter)
 		}
+	}
+	// A grouping node's parenthesised operand is its left branch, and inherits
+	// the same EXCEPT / subquery context as the node itself. M0125-0020.
+	if sel.SetOpOperand != nil {
+		w.walkSelect(sel.SetOpOperand, inSub, inExceptRight, inOuter)
 	}
 	if len(sel.FromExprs) > 0 {
 		for _, fexpr := range sel.FromExprs {

@@ -197,7 +197,8 @@ func rejectUnsupportedClauses(sel *parser.SelectStmt) error {
 		len(sel.GroupBy) != 0 || sel.Having != nil || len(sel.OrderBy) != 0 ||
 		sel.Limit != nil || sel.Offset != nil || sel.SetOp != nil ||
 		len(sel.ValuesRows) != 0 || len(sel.WindowClause) != 0 ||
-		sel.GroupingSets != nil || len(sel.Locking) != 0 {
+		sel.GroupingSets != nil || len(sel.Locking) != 0 ||
+		sel.SetOpOperand != nil {
 		return ErrUnsupported
 	}
 	return nil

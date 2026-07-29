@@ -1455,27 +1455,44 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Three ledger rows deferred: `int → bytea` casts, the `bytea_output` GUC,
       and the remaining bytea operators (`position`/`overlay`/`trim`/
       `get_byte`/`set_byte`/`bit_length`).
-- [ ] **M0125-0020 — the set-op chain must become a TREE; three separate
-      annotations are now patching the missing structure** (discovered by
-      M0125-0017 2026-07-29, two ledger rows 2026-07-29). goopg stores a set-op
-      chain as a linked list (`SelectStmt.SetOp.Right`), so the head branch and
-      the whole compound are ONE node sharing ONE `OrderBy`/`Limit`/`Offset`
-      slot. Two PG behaviours are unreachable while that holds:
-      `(A ORDER BY 1 LIMIT 2) UNION ALL (C) ORDER BY 1 DESC` returns PG's rows
-      in an UNSPECIFIED order (PG: `9,2,1`), and
-      `((A ORDER BY 1 LIMIT 2) UNION ALL C) LIMIT 1` discards the inner
-      `LIMIT 2`. `ParenBranches` (M0125-0006), `InnerSegmentCount`
-      (M0097-0044) and `InnerSortLimit` (M0125-0017) are three annotations
-      around the same absent structure; a fourth should be read as the signal
-      to convert. PG needs none of them: `select_with_parens` is a leaf operand
-      in `gram.y`, so `transformSetOperationStmt`
-      (postgres/src/backend/parser/analyze.c) always receives a proper tree.
-      **Resume**: give each parenthesised branch its own `SelectStmt` in
-      `parseParenthesisedSelectStmt`, then retire the three annotations and the
-      `parenBoundary`/`cutAt` machinery in `internal/planner/planner.go`.
-      **Accept by VALUE** (the two shapes above plus the whole existing
-      M0125-0006/-0016/-0017 matrices as non-regression). Large
-      parser+planner change -> full pre-commit bar.
+- [x] **M0125-0020 — the set-op chain is now a TREE; the three annotations are
+      retired** (discovered by M0125-0017 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0020-setop-chain-as-tree.md`, three ledger rows
+      2026-07-29). goopg stored a set-op chain as a linked list
+      (`SelectStmt.SetOp.Right`) whose head doubled as its leftmost operand, so
+      a parenthesised head branch and the whole compound were ONE node sharing
+      ONE `OrderBy`/`Limit`/`Offset` slot, and `parseParenthesisedSelectStmt`
+      absorbed a set-operator written AFTER the `')'` into the parenthesised
+      query's own chain. The two filed shapes now match PG
+      (`(A ORDER BY 1 LIMIT 2) UNION ALL (C) ORDER BY 1 DESC` = `9,2,1`;
+      `((A ORDER BY 1 LIMIT 2) UNION ALL C) LIMIT 1` keeps both limits), and the
+      HEAD worktree probe found the damage was **wider than filed** — three more
+      shapes returned wrong ROWS, not merely a wrong order (`… ORDER BY 1 DESC
+      LIMIT 2` gave `9,3` for `9,2`; `((A LIMIT 1) UNION ALL (G LIMIT 1)) ORDER
+      BY 1 DESC` gave the single row `3` for `2,1`). Fix = a **grouping node**
+      (`SelectStmt.SetOpOperand`), built only when a set-operator or
+      ORDER/LIMIT/OFFSET follows the `')'`; token CONSUMPTION is unchanged, only
+      where clauses are STORED, which is why the whole existing
+      -0006/-0016/-0017 matrix stayed green unmodified. `Parenthesized` is
+      sharpened to "nothing followed the `')'`". Retires `ParenBranches`,
+      `InnerSegmentCount`, `InnerSortLimit`, `parenBoundary`, the paren-boundary
+      half of `cutAt`, and `headSortLimit`/`innerBoundary`/`sortLimitConsumed`;
+      `setOpBindsTighter` survives with `foldSetOpRange` as its only caller.
+      A grouping node has no target list, so the analyzer gained
+      `setOpLeftmostBranch` at 4 sites and 8 structural walkers + 2
+      simple-SELECT gates learned to descend through it. Accepted BY VALUE:
+      13 new executor subtests, **proved to fail 5 at `8ce216dd`** with every
+      control green, plus a 27-statement psql matrix **byte-identical** to PG
+      18.3. **TPC-DS CAN reach this one** (unlike -0018/-0019/-0021): Q87, Q14
+      and Q23 have parenthesised operands followed by a set-operator. Gates:
+      units PASS, `tpch-spotcheck.sh` PASS (Q12=2, Q13=35), SF0.5 subset probe
+      over the ten set-op queries PASS=6 ck-verified / MISMATCH=0 / ERROR=0 with
+      Q87+Q23 checksum-identical to the `sweep-20260729-123114` baseline,
+      pgbench smoke via hook. Deferred (ledger): `CREATE VIEW v AS (SELECT …)
+      UNION …` is a pre-existing view-body parser gap, `renameColumnInSelect`
+      still skips a set-op right branch, and the FULL 99-query SF0.5 gate is
+      still owed — but its six-loop blocker (the wedged nightly server) CLEARED
+      during this loop.
 - [ ] **M0125-0007 — date input rejects unpadded month/day, and the comparison
       path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). PG's `DecodeDate`/`ParseDateTime`

@@ -156,19 +156,21 @@ func TestSetOpParenthesisedHeadBranchSortLimit(t *testing.T) {
 		},
 		{
 			// A BARE right branch's trailing ORDER BY belongs to the whole
-			// union in PG. goopg cannot hold it — the single OrderBy slot is
-			// the head branch's — so the sort stays on the right branch and
-			// only the row SELECTION is guaranteed. {1,2} UNION ALL {2,3}.
-			// The lost ordering is a deferral-ledger row (2026-07-29).
+			// union in PG. goopg could not hold it while the single OrderBy
+			// slot was the head branch's, so the ordering was lost and only
+			// the row SELECTION was guaranteed here. M0125-0020's grouping
+			// node gives each its own slot; the ordering is now asserted in
+			// setop_tree_test.go. {1,2} UNION ALL {2,3}.
 			name: "head_limit_bare_right_outer_orderby",
 			sql:  "(SELECT x FROM a LIMIT 2) UNION ALL SELECT x FROM g ORDER BY 1",
 			want: []int64{1, 2, 2, 3},
 		},
 		{
 			// Same conflict with a parenthesised right branch: PG orders the
-			// union 9,2,1; goopg returns the same three rows unordered.
-			// Before M0125-0017 this returned {1,2} — a row was LOST, which is
-			// strictly worse than an unspecified order.
+			// union 9,2,1. Before M0125-0017 this returned {1,2} — a row was
+			// LOST; between -0017 and -0020 the rows were right but unordered.
+			// The ordering is asserted in setop_tree_test.go; this case stays
+			// as the multiset control.
 			name: "head_limit_paren_right_outer_orderby",
 			sql:  "(SELECT x FROM a ORDER BY 1 LIMIT 2) UNION ALL (SELECT x FROM h) ORDER BY 1 DESC",
 			want: []int64{1, 2, 9},
@@ -182,9 +184,10 @@ func TestSetOpParenthesisedHeadBranchSortLimit(t *testing.T) {
 		},
 		{
 			// M0097-0044's shape: the parenthesised content was ALREADY a
-			// compound, so InnerSegmentCount (not the new head boundary)
-			// carries it. ({1,2,3} INTERSECT {2,3}) = {2,3}, LIMIT 1 → {2};
-			// then UNION ALL {9}.
+			// compound, which needed InnerSegmentCount rather than the head
+			// boundary until M0125-0020 made both the same grouping node.
+			// ({1,2,3} INTERSECT {2,3}) = {2,3}, LIMIT 1 → {2}; then
+			// UNION ALL {9}.
 			name: "control_inner_compound_boundary",
 			sql:  "((SELECT x FROM a INTERSECT SELECT x FROM g ORDER BY 1 LIMIT 1)) UNION ALL SELECT x FROM h",
 			want: []int64{2, 9},

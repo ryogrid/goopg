@@ -48,7 +48,7 @@ func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*c
 	}
 	if v.Distinct || len(v.DistinctOn) > 0 || len(v.GroupBy) > 0 || v.Having != nil ||
 		v.Limit != nil || v.Offset != nil || v.SetOp != nil || len(v.Locking) > 0 ||
-		len(v.ValuesRows) > 0 || v.With != nil {
+		len(v.ValuesRows) > 0 || v.With != nil || v.SetOpOperand != nil {
 		return nil, nil, nil, false
 	}
 	if len(v.From) != 1 || hasJoinClauses(v.FromExprs) {

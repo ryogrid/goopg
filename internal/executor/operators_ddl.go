@@ -5611,6 +5611,11 @@ func selectRefsViewName(sel *parser.SelectStmt, name string) bool {
 	if sel.SetOp != nil && selectRefsViewName(sel.SetOp.Right, name) {
 		return true
 	}
+	// A grouping node keeps its parenthesised operand below itself rather than
+	// in its own FROM/target slots. M0125-0020.
+	if sel.SetOpOperand != nil && selectRefsViewName(sel.SetOpOperand, name) {
+		return true
+	}
 	return false
 }
 
@@ -9951,6 +9956,10 @@ func walkSelectPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 	// UNION/INTERSECT/EXCEPT: this SelectStmt is the left branch; recurse into right.
 	if sel.SetOp != nil {
 		walkSelectPKDeps(sel.SetOp.Right, cat, out, seen, dbOid)
+	}
+	// A grouping node's left branch is its parenthesised operand. M0125-0020.
+	if sel.SetOpOperand != nil {
+		walkSelectPKDeps(sel.SetOpOperand, cat, out, seen, dbOid)
 	}
 	// Main SELECT body with GROUP BY.
 	if len(sel.GroupBy) > 0 {
@@ -20510,6 +20519,10 @@ func collectSelectTableRefs(sel *parser.SelectStmt) []parser.RangeVar {
 	if sel.SetOp != nil && sel.SetOp.Right != nil {
 		refs = append(refs, collectSelectTableRefs(sel.SetOp.Right)...)
 	}
+	// A grouping node's parenthesised operand is its left side. M0125-0020.
+	if sel.SetOpOperand != nil {
+		refs = append(refs, collectSelectTableRefs(sel.SetOpOperand)...)
+	}
 	return refs
 }
 
@@ -20846,6 +20859,10 @@ func ExtractRoutineDeps(body string, argDefaults []string, schema string, r *cat
 		// Walk set-op right branch if present.
 		if sel.SetOp != nil && sel.SetOp.Right != nil {
 			walkSelect(sel.SetOp.Right)
+		}
+		// A grouping node's parenthesised operand. M0125-0020.
+		if sel.SetOpOperand != nil {
+			walkSelect(sel.SetOpOperand)
 		}
 	}
 

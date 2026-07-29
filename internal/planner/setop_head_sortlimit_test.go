@@ -81,9 +81,14 @@ func TestPlanHeadBranchLimitSitsBelowSetOp(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	sel := stmts[0].(*parser.SelectStmt)
-	if !sel.InnerSortLimit || sel.InnerSegmentCount != 0 {
-		t.Fatalf("parser: InnerSortLimit=%v InnerSegmentCount=%d, want true/0",
-			sel.InnerSortLimit, sel.InnerSegmentCount)
+	// M0125-0020: the parenthesised head branch has its own SelectStmt below a
+	// grouping node, and owns the ORDER BY / LIMIT written inside the parens.
+	if sel.SetOpOperand == nil {
+		t.Fatalf("parser: head branch is not below a grouping node")
+	}
+	if sel.SetOpOperand.Limit == nil || sel.Limit != nil {
+		t.Fatalf("parser: LIMIT on operand=%v, on grouping node=%v; want true/false",
+			sel.SetOpOperand.Limit != nil, sel.Limit != nil)
 	}
 	node, err := Plan(sel, cat)
 	if err != nil {
@@ -128,7 +133,13 @@ func TestPlanSetOpBoundaryIsReplannable(t *testing.T) {
 				t.Fatalf("parse: %v", err)
 			}
 			sel := stmts[0].(*parser.SelectStmt)
-			wantOrderBy, wantLimit, wantOffset := sel.OrderBy, sel.Limit, sel.Offset
+			// Both shapes put the clauses on the parenthesised branch's own
+			// node, one level below the grouping node. M0125-0020.
+			owner := sel
+			if sel.SetOpOperand != nil {
+				owner = sel.SetOpOperand
+			}
+			wantOrderBy, wantLimit, wantOffset := owner.OrderBy, owner.Limit, owner.Offset
 			if wantLimit == nil {
 				t.Fatalf("fixture: expected a LIMIT on the parsed statement")
 			}
@@ -136,11 +147,11 @@ func TestPlanSetOpBoundaryIsReplannable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Plan #1: %v", err)
 			}
-			if sel.OrderBy == nil || sel.Limit == nil {
+			if owner.OrderBy == nil || owner.Limit == nil {
 				t.Fatalf("Plan #1 consumed the AST: OrderBy=%v Limit=%v",
-					sel.OrderBy, sel.Limit)
+					owner.OrderBy, owner.Limit)
 			}
-			if &sel.OrderBy[0] != &wantOrderBy[0] || sel.Limit != wantLimit || sel.Offset != wantOffset {
+			if &owner.OrderBy[0] != &wantOrderBy[0] || owner.Limit != wantLimit || owner.Offset != wantOffset {
 				t.Errorf("Plan #1 replaced the AST's sort/limit clauses")
 			}
 			second, err := Plan(sel, cat)

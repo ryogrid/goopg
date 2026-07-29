@@ -20608,6 +20608,13 @@ func renameColumnInSelect(sel *parser.SelectStmt, tableName, oldCol, newCol stri
 			renameColumnInSelect(sel.From[i].Subquery, tableName, oldCol, newCol)
 		}
 	}
+	// A grouping node keeps the parenthesised branch's own target list one
+	// level down: `CREATE VIEW v AS (SELECT a FROM t) UNION …` used to hold
+	// that target list on this node itself. M0125-0020. (The set-op RIGHT
+	// branch is still not walked here — a pre-existing gap, ledger 2026-07-29.)
+	if sel.SetOpOperand != nil {
+		renameColumnInSelect(sel.SetOpOperand, tableName, oldCol, newCol)
+	}
 }
 
 func renameColumnInExpr(expr parser.Expr, tableName, oldCol, newCol string) parser.Expr {

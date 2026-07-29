@@ -858,60 +858,39 @@ type SelectStmt struct {
 	// M0097-0042: returns additional rows tied on the ORDER BY key.
 	WithTies bool
 	SetOp    *SetOpClause
-	// Parenthesized is set when this SelectStmt was the result of
-	// parseParenthesisedSelectStmt() — i.e. the whole compound was
-	// explicitly wrapped in parentheses. The planner uses this flag
-	// to stop its left-associativity flattening loop from recursing
-	// into the parenthesised content (which already has its own
-	// correctly-ordered chain). M0097-0042.
+	// Parenthesized is set when EVERYTHING this SelectStmt holds — its
+	// target list, its SetOp chain and its own ORDER BY / LIMIT / OFFSET —
+	// was written inside one pair of parentheses, with nothing appended
+	// after the closing ')'. Two consumers rely on it: the parser's
+	// lift-from-right-branch rule (a parenthesised branch keeps its own
+	// sort/limit, M0097-0042) and the planner, which stops flattening at
+	// such a branch because the user grouped it explicitly.
+	//
+	// When text DOES follow the ')', the parser builds a grouping node
+	// instead (see SetOpOperand) and this flag stays false on it.
 	Parenthesized bool
-	// ParenBranches records how far the user's parentheses actually
-	// reached when a set-operator was written AFTER the closing ')'.
-	// It is meaningful only together with Parenthesized.
+	// SetOpOperand makes this SelectStmt a GROUPING node: it stands for the
+	// parenthesised set-op operand `( SetOpOperand )` and has no Targets /
+	// From / Where of its own. Its value IS the operand's value; its own
+	// SetOp / OrderBy / Limit / Offset slots carry whatever was written
+	// AFTER the closing ')'.
 	//
-	//	0  — the parentheses covered this node's ENTIRE SetOp chain
-	//	     (the common case; the chain is one atomic operand).
-	//	n>0 — only the first n branches (n-1 SetOp links) were inside
-	//	     the parentheses; every link past that was appended by
-	//	     parseParenthesisedSelectStmt from source text that follows
-	//	     the ')'.
-	//
-	// M0125-0006: without this, `Parenthesized` claimed the parentheses
-	// covered operators that appeared after them, so the planner treated
-	// the extended chain as one atomic operand and planned
-	// `A EXCEPT (B EXCEPT C)` for `(A) EXCEPT (B) EXCEPT (C)`. The flag
-	// alone cannot express the truth because the parentheses wrap a
-	// *prefix* of the chain, not all or nothing. PostgreSQL has no
-	// equivalent field: `select_with_parens` is a leaf operand in
-	// gram.y, so transformSetOperationStmt() always receives a properly
-	// nested tree. This is the price of goopg's linked-list set-op AST.
-	ParenBranches int
-	// InnerSegmentCount > 0 when a parenthesised compound query has an
-	// ORDER BY/LIMIT/OFFSET that belongs to the INNER compound (not the
-	// outer UNION/EXCEPT/INTERSECT that was appended after the closing
-	// paren). The planner applies the sort/limit to the result of the
-	// first InnerSegmentCount set-op segments, then continues building
-	// the remaining outer segments without sorting. Example:
-	//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
-	// -> InnerSegmentCount=1 means ORDER BY 1 sorts the INTERSECT result,
-	//    not the final UNION ALL output. M0097-0044.
-	InnerSegmentCount int
-	// InnerSortLimit is true when the ORDER BY / LIMIT / OFFSET currently
-	// held on this node were written INSIDE the parentheses, and therefore
-	// apply to the first InnerSegmentCount segments rather than to the whole
-	// chain. It exists because InnerSegmentCount's zero value doubles as its
-	// "unset" sentinel and so cannot express the commonest boundary of all:
-	//
-	//	(A ORDER BY 1 LIMIT 2) UNION ALL C
-	//
-	// where the parentheses cover a SINGLE branch, i.e. ZERO set-op segments.
-	// Without this flag the planner read InnerSegmentCount==0 as "no boundary"
-	// and applied the head branch's LIMIT to the union, silently dropping the
-	// whole UNION ALL branch. PostgreSQL needs no equivalent: `select_no_parens`
-	// carries opt_sort_clause/opt_select_limit and `select_with_parens` is a
-	// leaf operand (postgres/src/backend/parser/gram.y), so an inner sort/limit
-	// simply lives on the branch's own node. M0125-0017.
-	InnerSortLimit bool
+	// This is what makes goopg's set-op AST a TREE rather than a linked
+	// list. PostgreSQL needs no flag at all here: `select_with_parens` is a
+	// leaf operand of `select_clause` in gram.y, so a set-operator, ORDER BY
+	// or LIMIT written after the ')' necessarily attaches to a node ABOVE the
+	// parenthesised query and transformSetOperationStmt()
+	// (postgres/src/backend/parser/analyze.c) always receives a proper tree.
+	// goopg used to append that trailing text into the parenthesised query's
+	// OWN chain and then describe the damage with three annotations —
+	// ParenBranches (M0125-0006), InnerSegmentCount (M0097-0044) and
+	// InnerSortLimit (M0125-0017). Two PG behaviours were unreachable that
+	// way, because head branch and whole compound shared one OrderBy/Limit
+	// slot: `(A ORDER BY 1 LIMIT 2) UNION ALL (C) ORDER BY 1 DESC` lost the
+	// outer sort, and `((A ORDER BY 1 LIMIT 2) UNION ALL C) LIMIT 1` lost the
+	// inner LIMIT. A grouping node gives each its own node, and all three
+	// annotations are retired. M0125-0020.
+	SetOpOperand *SelectStmt
 	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
 	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
 	// every pre-M0021 SELECT — preserves byte-for-byte

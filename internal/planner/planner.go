@@ -640,57 +640,16 @@ func setOpKeyword(t parser.SetOpType) string {
 //
 // (postgres/src/backend/parser/gram.y:825-826 — later declaration wins), so
 // INTERSECT binds tighter than UNION and EXCEPT, which tie with each other.
+// foldSetOpRange below (M0125-0016) consults this to group maximal INTERSECT
+// runs before the UNION/EXCEPT left-fold.
 //
-// Two callers consult this: the paren-boundary decision (M0125-0006), which
-// must not cut a chain at a ')' when the operator written after it binds
-// tighter, and foldSetOpRange below (M0125-0016), which groups maximal
-// INTERSECT runs before the UNION/EXCEPT left-fold. M0125-0006.
+// It used to have a second caller — the paren-boundary decision (M0125-0006),
+// which had to avoid cutting a chain at a ')' when the operator written after
+// it bound tighter. That case no longer exists: text after a ')' now builds a
+// grouping node, so a parenthesised operand never shares a chain with the
+// operators around it and precedence is decided here alone. M0125-0020.
 func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
-}
-
-// parenBoundary reports where an explicitly-parenthesised set-op operand stops
-// being parenthesised.
-//
-// goopg stores a set-op chain as a linked list (SelectStmt.SetOp.Right), so a
-// grouped sub-expression can only be marked by flagging the head of a
-// sub-chain. That works while the parentheses cover the operand's whole chain,
-// but `parseParenthesisedSelectStmt` also absorbs a set-operator written AFTER
-// the closing ')' into the same chain — `(A) EXCEPT (B) EXCEPT (C)` parses as
-// A → B → C with B flagged, even though the user's parentheses around B closed
-// before the second EXCEPT. The parser records how far they reached in
-// ParenBranches; this function turns that into the node whose SetOp link is the
-// first one written outside the parentheses.
-//
-// Returns nil when the parentheses covered the entire chain — the operand is
-// atomic and the caller must stop flattening (the pre-M0125-0006 behaviour).
-// Otherwise it returns the boundary node: detaching that node's SetOp yields
-// exactly the parenthesised operand, and the detached remainder continues the
-// enclosing left-associative chain.
-//
-// PostgreSQL needs no analogue: `select_with_parens` is a leaf operand in
-// gram.y, so transformSetOperationStmt() (postgres/src/backend/parser/
-// analyze.c) always receives an already left-deep tree. M0125-0006.
-func parenBoundary(g *parser.SelectStmt) *parser.SelectStmt {
-	if g.ParenBranches <= 0 {
-		return nil
-	}
-	// ParenBranches counts BRANCHES inside the parens, so there are
-	// ParenBranches-1 links to walk before reaching the boundary.
-	node := g
-	for i := 1; i < g.ParenBranches; i++ {
-		if node.SetOp == nil {
-			// Chain shorter than recorded: refuse to guess and fall back to
-			// treating the operand as atomic.
-			return nil
-		}
-		node = node.SetOp.Right
-	}
-	if node.SetOp == nil {
-		// Nothing was appended after the ')' after all.
-		return nil
-	}
-	return node
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
@@ -745,8 +704,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// cutAt is the node whose SetOp must be detached while this
 			// segment is planned, so planSelect(stmt) sees exactly the
 			// operand and not the rest of the chain. nil means "plan stmt
-			// with its chain intact" — a true leaf, or a fully
-			// parenthesised compound that IS one atomic operand.
+			// with its chain intact" — the atomic-operand case below.
 			cutAt *parser.SelectStmt
 		}
 		var segments []setOpSegment
@@ -760,37 +718,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 					opPos:  cur.SetOp.Pos(),
 					stmt:   rightStmt,
 				}
-				if rightStmt.Parenthesized {
-					// Explicit grouping. The parentheses may cover only a
-					// PREFIX of rightStmt's chain when a set-operator was
-					// written after the ')': `(A) EXCEPT (B) EXCEPT (C)`
-					// parses as A → B → C with B parenthesised, yet only B
-					// itself was inside those parentheses. Cut the chain at
-					// the recorded boundary and keep flattening from there so
-					// the tail stays left-associative. M0125-0006.
-					bnd := parenBoundary(rightStmt)
-					if bnd == nil {
-						// The parentheses really did cover the whole chain:
-						// one atomic operand, so stop flattening.
-						segments = append(segments, seg)
-						break
-					}
-					if setOpBindsTighter(bnd.SetOp.Type, seg.opType) {
-						// The operator after the ')' binds TIGHTER than the one
-						// that introduced this operand, so the operand groups
-						// with what follows it, not with what precedes it:
-						// `A UNION (B) INTERSECT (C)` is `A UNION (B INTERSECT
-						// C)`. Cutting here would produce `(A UNION B)
-						// INTERSECT C`. Leave the chain intact and let the
-						// recursive planSelect build the tighter group.
-						// M0125-0006.
-						segments = append(segments, seg)
-						break
-					}
-					seg.cutAt = bnd
+				if rightStmt.Parenthesized && rightStmt.SetOp != nil {
+					// A parenthesised operand that is itself a compound —
+					// `A UNION (B EXCEPT C)`. Parenthesized means the ')'
+					// closed with nothing after it (a trailing set-operator
+					// would have produced a grouping node instead,
+					// M0125-0020), so this operand ends the chain: plan it
+					// with its chain intact and stop flattening.
 					segments = append(segments, seg)
-					cur = bnd
-					continue
+					break
 				}
 				seg.cutAt = rightStmt
 				segments = append(segments, seg)
@@ -819,31 +755,21 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			savedSetOps[i+1] = seg.cutAt.SetOp
 			seg.cutAt.SetOp = nil
 		}
-		// headSortLimit: the parser saw the parentheses close after the FIRST
-		// branch while an ORDER BY / LIMIT / OFFSET was already attached, so
-		// those clauses belong to that branch alone — `(A ORDER BY 1 LIMIT 2)
-		// UNION ALL C` limits A, not the union. The boundary sits at segment
-		// 0, which InnerSegmentCount cannot encode (0 is its "unset"
-		// sentinel), hence the separate flag.
-		//
-		// Unlike the InnerSegmentCount>0 boundary below, this one needs no
-		// wrapSetOpSortLimit at all: leaving the clauses in place lets the
-		// recursive planSelect(s) apply them as an ordinary SELECT's own sort
-		// and limit. That is both simpler and MORE faithful — PG's
-		// select_with_parens is a leaf, so its ORDER BY may reference a
-		// non-output expression (`ORDER BY x*-1`) that the set-op-level
-		// resolver would reject. M0125-0017.
-		headSortLimit := s.InnerSortLimit && s.InnerSegmentCount == 0
+		// s's own ORDER BY / LIMIT / OFFSET always belong to the WHOLE chain
+		// (wrapSetOpSortLimit applies them at the very end), so the leftmost
+		// branch must be planned without them. A sort/limit written inside a
+		// parenthesised branch is not here at all: it lives on that branch's
+		// own SelectStmt, one level below a grouping node. M0125-0020.
 		savedOrderBy := s.OrderBy
 		savedLimit := s.Limit
 		savedOffset := s.Offset
-		if !headSortLimit {
-			s.OrderBy = nil
-			s.Limit = nil
-			s.Offset = nil
-		}
-		// Plan the leftmost branch (s without its SetOp chain, and without its
-		// sort/limit unless those belong to this branch alone).
+		s.OrderBy = nil
+		s.Limit = nil
+		s.Offset = nil
+		// Plan the leftmost branch: s without its SetOp chain and without the
+		// whole chain's sort/limit. When s is a grouping node this recursion
+		// lands on the SetOpOperand branch below and plans the parenthesised
+		// operand — including that operand's own ORDER BY / LIMIT.
 		left, err := planSelect(s, cat)
 		// Restore everything (plan cache may reuse the AST).
 		s.SetOp = savedSetOps[0]
@@ -864,13 +790,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// early for plan-cache correctness. Re-cut before planning so
 		// planSelect(seg.stmt) sees only this operand and does not
 		// recursively re-flatten the already-flattened chain. M0097-0050.
-		// A segment with cutAt == nil is either a true leaf (SetOp=nil) or
-		// a fully-parenthesised compound that must retain its SetOp so the
-		// inner compound is planned as one atomic operand.
-		// When the operand is only PARTIALLY parenthesised, cutAt is the
-		// paren boundary inside its chain rather than the operand itself,
-		// so the parenthesised prefix is planned atomically and the tail
-		// was already flattened into later segments. M0125-0006.
+		// A segment with cutAt == nil is a fully-parenthesised compound that
+		// must retain its SetOp so the inner compound is planned as one
+		// atomic operand.
 		planSegment := func(i int) (Node, error) {
 			seg := segments[i]
 			if seg.cutAt != nil {
@@ -943,7 +865,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				// Absorb the INTERSECT run that follows this operand: it binds
 				// tighter than segments[opIdx]'s UNION/EXCEPT, so it groups with
 				// what follows rather than with what precedes.
-				for i < hi && segments[i].opType == parser.SetOpIntersect {
+				for i < hi && setOpBindsTighter(segments[i].opType, segments[opIdx].opType) {
 					inner, ierr := planSegment(i)
 					if ierr != nil {
 						return nil, ierr
@@ -959,57 +881,32 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			}
 			return acc, nil
 		}
-		// When s.InnerSegmentCount > 0, ORDER BY/LIMIT/OFFSET applies to the
-		// result of the first InnerSegmentCount segments (the "inner" compound),
-		// not the final outer result. Example:
-		//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
-		// → after segment 1 (INTERSECT), apply ORDER BY to Sort(INTERSECT),
-		//   then append UNION ALL C without re-sorting. M0097-0044.
-		//
-		// That boundary is also a hard PRECEDENCE barrier: the user's
-		// parentheses grouped those segments explicitly, so an INTERSECT run may
-		// not reach across it. `(A UNION B ORDER BY 1) INTERSECT C` must stay
-		// `(A UNION B) INTERSECT C` and must not become `A UNION (B INTERSECT
-		// C)`. Folding each side of the barrier separately gives exactly that,
-		// and it keeps `left` equal to the inner compound's value at the point
-		// the sort/limit is applied. M0125-0016.
-		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
-		// sortLimitConsumed records that s's ORDER BY / LIMIT / OFFSET have
-		// already been applied to an INNER result and must not be applied a
-		// second time to the outer one. The head-branch boundary consumed them
-		// inside planSelect(s) above; the InnerSegmentCount boundary does so
-		// just below. Tracking this in a local instead of blanking the AST
-		// fields keeps s replannable — the plan cache may hand the same
-		// SelectStmt back for a second Plan(). M0125-0017.
-		sortLimitConsumed := headSortLimit
-		if innerBoundary > 0 && innerBoundary <= len(segments) {
-			if left, err = foldSetOpRange(left, 0, innerBoundary); err != nil {
-				return nil, err
-			}
-			inner, werr := wrapSetOpSortLimit(s, left, cat)
-			if werr != nil {
-				return nil, werr
-			}
-			left = inner
-			sortLimitConsumed = true
-			if left, err = foldSetOpRange(left, innerBoundary, len(segments)); err != nil {
-				return nil, err
-			}
-		} else if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
+		if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
 			return nil, err
 		}
 		// Restore final ORDER BY / LIMIT / OFFSET.
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
 		s.Offset = savedOffset
-		if sortLimitConsumed {
-			return left, nil
-		}
 		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
 		return wrapSetOpSortLimit(s, left, cat)
+	}
+	// A grouping node stands for a parenthesised set-op operand with nothing
+	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
+	// leftmost branch of a chain reached from the block above with its SetOp
+	// detached. Its value is the operand's; its own sort/limit (whatever was
+	// written after the ')') wraps that value and resolves against the
+	// operand's output columns, exactly as a trailing set-op sort/limit does.
+	// M0125-0020.
+	if s.SetOpOperand != nil {
+		operand, err := planSelect(s.SetOpOperand, cat)
+		if err != nil {
+			return nil, err
+		}
+		return wrapSetOpSortLimit(s, operand, cat)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
