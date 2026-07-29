@@ -1582,6 +1582,47 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (`docs/design/0125-0024-expression-identity-collisions.md`) before code —
       the aggregate-sharing path is where the shipped-wrong-answer precedent
       lives.
+- [x] **M0125-0025 — a raising aggregate support function must abort the
+      statement** (M0125-0024's third ledger row, 2026-07-30). **DONE
+      2026-07-30.** Selected because every other open M0125 item needs a TIMED
+      run on a quiet host and `ci/batch/run-nightly.sh` (PID 3541516) had held
+      it for 5h33m; this one is accepted purely BY VALUE. The row claimed a code
+      path rather than an observed wrong answer — it is an observed wrong
+      answer. A user-defined aggregate whose `SFUNC`/`COMBINEFUNC`/`FINALFUNC`
+      **raised** had its error discarded and the query answered anyway: at
+      `0de1b404` `SELECT p_rsum(a) FROM raise_t` returned **`1`** (the sum of
+      the rows transitioned before the raise) where PG 18.3 aborts
+      `ERROR: boom 2`; the shared-DISTINCT-slot form returned `(1, 1)`; a
+      raising `FINALFUNC` returned `NULL`; a raising `COMBINEFUNC` returned the
+      un-combined partial state `6`. Right shape, right type, plausible number —
+      M0125-0024's class, invisible to every row-count gate here. **Two
+      independent swallows:** `executeSFuncCall` discarded each candidate's
+      error (`_ = rerr`, twice) and synthesised `42883 … does not exist`, so a
+      PRESENT routine that FAILED was reported MISSING — which is what hid the
+      second swallow — and then all seven call sites read
+      `if serr == nil { state = newState }`. The three transition loops
+      (`applyAgg`, `finishAgg`'s DISTINCT dedup, `Open`'s leader/follower
+      pre-compute) are separate code and each swallowed independently. **A
+      blanket propagate would have been wrong** and that is the design's one
+      real decision: `executeSFuncCall` doubles as the lookup for the built-in
+      sfuncs it models inline and is called for slots an aggregate never
+      declared, so its `42883` is a NORMAL outcome. The two modes became
+      decidable and propagate in OPPOSITE directions — `errSFuncNotFound` →
+      swallow, `sfuncRaised()` → propagate — the same shape M0125-0024's
+      `exprIdentityKey` needed. `finishAgg` gained `(Datum, error)` by lifting
+      its built-in tail verbatim into `finishBuiltinAgg` (no re-indentation,
+      ~103 returns untouched). Gates: 7 new subtests in
+      `internal/executor/agg_sfunc_error_propagation_test.go`, every `want`
+      MEASURED against the PG 18.3 oracle on 65438 inside a rolled-back
+      transaction (reference DB verified byte-unchanged); `P0001` matches PG's
+      SQLSTATE exactly; `TestMissingSFuncStillFallsThrough` pins the half that
+      must not change. Two gaps deferred with ledger rows, one found BY the
+      gate: the two `windowOp` sites are plumbed but **unreachable** (the v0
+      analyzer rejects a user-defined aggregate in `OVER (...)` with `0A000`
+      before the executor is involved, though PG accepts it), and `applyAgg`'s
+      `evalExprSlot` calls for `Arg2`/`ExtraArgs` swallow identically, calling
+      the sfunc with FEWER arguments than declared. Design
+      `docs/design/0125-0025-sfunc-error-propagation.md`.
 - [ ] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
       Separate commit, separate decision, so §7.3 RC-5's reopen criterion ("after
       the flag defaults on") has an owner. Requires: the C1→C2 table for every
