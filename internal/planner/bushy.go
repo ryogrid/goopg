@@ -2608,15 +2608,36 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
 	case *Project:
-		// M0063-0001: SubqueryAlias-style Projects (view rename
-		// wrapper) are isolated subquery scopes. Don't recurse.
-		if n.IsolatedScope {
-			return
-		}
-		applyJoinTreePosMap(n.Child, posMap)
-		for i := range n.Targets {
-			remapByPosMap(&n.Targets[i], posMap)
-		}
+		// M0125-0012 (TPC-DS Q8): EVERY Project in the join tree is a
+		// separate planning scope, not just the M0063-0001
+		// SubqueryAlias-style (`IsolatedScope`) view-rename wrapper.
+		// `posMap` is only defined over the coordinate space that
+		// `buildBindingsPosMap`'s `collect` walked, and `collect`'s
+		// own *Project arm stops at ANY Project ("Extend it to all
+		// Projects: advance `off` by the projected output width and
+		// stop"). Descending here therefore fed posMap indices it
+		// never had a domain for: a FROM-subquery's own target
+		// `ca_zip/0`, correct against its 1-column SetOp child, fell
+		// inside the OUTER binding that happens to start at 0
+		// (`store_sales`) and was rewritten to that table's
+		// MHJ-reordered offset — 57 at SF=1, 6 in the minimal shape.
+		// Execution then read index 57 out of the SetOp's 1-wide
+		// MaterializedSlot ("column ref ca_zip/57 out of
+		// MaterializedSlot range 1").
+		//
+		// Note this is the *build* half's mirror image: `9740fce9`
+		// gave `collect` its opaque-leaf arms so `off` advances past a
+		// SetOp, but left this applier free to walk into the scope
+		// above it. Build and apply must stop at the same nodes or
+		// the map is applied outside its domain (CLAUDE.md "sibling
+		// paths must change together").
+		//
+		// Nothing is lost by stopping: the subquery's inner plan was
+		// already normalised into its own coordinate space by
+		// `remapSubqueryColumnRefs` (planner.go, M0097-0058) when the
+		// derived table was planned, and Projects ABOVE the join tree
+		// are remapped by the separate `remapTopProjection` pass.
+		return
 	case *Sort:
 		applyJoinTreePosMap(n.Child, posMap)
 		for i := range n.Keys {

@@ -1929,7 +1929,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 > **M0125-0012 has a soft dependency on M0125-0001** — if the driver has not
 > landed, take another item rather than hand-rolling a fifth walker.
 
-- [ ] **M0125-0012 — Q8: a `ColumnRef` below a FROM-subquery `Project` keeps its
+- [x] **M0125-0012 — Q8: a `ColumnRef` below a FROM-subquery `Project` keeps its
       OUTER-scope index** (round-1 §4.2 fix #8, ledger row `tpcds-round2 Q8`
       2026-07-27). **The only unresolved member of round 1's nine goopg-only
       errors**, and the sole `ERROR` in the SF=1 sweep that is not Q75.
@@ -1986,6 +1986,36 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Design `docs/design/0125-0012-q8-subquery-scope-index-remap.md`.
       Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
       gate, `make plan-diff`).
+      **DONE 2026-07-29.** ⚠️ **The "Mechanism of the residual … do not
+      re-diagnose" paragraph above is REFUTED** — keep it only as the record of
+      what was believed. Measuring the planned tree shows the outer `Filter`'s
+      `ca_zip` index (57 at SF=1, 9 in the replica) was **already correct**, and
+      no `Filter` below the subquery `Project` carried a stale ref at all. The
+      failing ref is the V1 subquery's **own `Project` target** above the
+      1-column `SetOp`, which `remapSubqueryColumnRefs` had numbered correctly
+      as `ca_zip/0`; `applyJoinTreePosMap` (`bushy.go`) then descended into that
+      `Project` — it stopped only at `IsolatedScope` wrappers — and rewrote the
+      target with the OUTER bindings' posMap, which matched the outer binding
+      that also starts at 0 (`store_sales`) and returned its **MHJ-reordered**
+      offset. So 57 is a join-order offset, not the "global FROM-order index"
+      the ledger read it as. Fix = stop at every join-tree `Project`, matching
+      `buildBindingsPosMap`'s `collect` ("Extend it to all Projects … and
+      stop") — the build half had been generalised and the apply half had not
+      (Hard-won Rule #2). **D1/D2/D3 were not implemented**: no fifth walker was
+      hand-rolled and M0125-0010's verify-then-repair narrowing is untouched.
+      Acceptance trap honoured: a **non-empty** doll-house probe verified
+      byte-identical on PostgreSQL 18.3 (`alpha|5`, `beta|7`), shipped as
+      `internal/planner/q8_subquery_scope_posmap_test.go` (structural: every
+      `Project` target addresses its own child) and
+      `internal/executor/q8_subquery_scope_remap_test.go` (values), **both
+      proved to FAIL pre-fix** with `ca_zip/6 … out of MaterializedSlot range 1`,
+      plus a shape guard that skips loudly if the defective plan stops being
+      produced. **Residual deferred (ledger 2026-07-29):** Q8 leaves the ERROR
+      class and joins the **timeout class** — the `substr` residual is evaluated
+      on a CROSS join above the full three-way MHJ with `d_qoy`/`d_year`
+      unpushed, so at SF0.5 it exceeded a 1500 s client budget (elapsed 1633 s)
+      where it previously errored at ~11 s. Pre-existing plan-quality defect, not a regression: the fix changes
+      one `ColumnRef` index and no plan shape.
 - [ ] **M0125-0013 — Q47: a SECOND defect downstream of the CTE body RC-1b
       repaired** (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29, §13.4 item 2).
       Measured `OK 142 s / 0 rows` vs PG's 100. RC-1b (`5db0a067`) made Q47's CTE

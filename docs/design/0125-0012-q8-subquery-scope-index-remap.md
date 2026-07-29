@@ -1,8 +1,24 @@
 # 0125-0012 — TPC-DS Q8: a `ColumnRef` below a FROM-subquery `Project` keeps its outer-scope index
 
-Status: draft
+Status: accepted (executed 2026-07-29)
 Date: 2026-07-29
 Milestone: M0125-0012 (round-1 §4.2 fix #8; ledger row `tpcds-round2 Q8`, 2026-07-27)
+
+> **§0 — EXECUTED 2026-07-29. Read this before §"Root cause of the residual".**
+> The pre-registered root cause below (§"Root cause of the residual", inherited
+> verbatim from the ledger row and marked "do not re-diagnose") is **refuted by
+> direct measurement of the planned tree**, and D1/D2/D3 were therefore not the
+> fix. The failing `ColumnRef` is **not** an unrepaired one inside a `Filter`
+> below the subquery's `Project`; it is the subquery's **own `Project` target**,
+> which `remapSubqueryColumnRefs` had **already numbered correctly** (`ca_zip/0`)
+> and which a *later* pass then overwrote with an outer-scope index.
+> The real defect is a **domain violation in the outer join-reorder remap**:
+> `applyJoinTreePosMap` descended into a FROM-subquery `Project` and applied a
+> position map that was never defined over that scope. See §R below for the
+> measurement, the corrected mechanism, and the landed fix. The rest of the
+> original document is kept unedited as the record of what was believed before
+> the tree was inspected — §"Verification"'s V0 acceptance bar was correct and
+> was honoured in full.
 
 ## Problem
 
@@ -152,6 +168,119 @@ Planner/executor change → the full pre-commit bar:
 - `make plan-diff` — with M0125-0004's `r5-default` fallback label until M0124-0002 lands
   `tpcds-round2-head`
 - the pgbench smoke, via the commit hook
+
+## §R. What was actually measured, and what landed (2026-07-29)
+
+### R1. The planned tree, pre-fix
+
+A doll-house replica of Q8's exact shape (`dd`/`st`/`ss` three columns each,
+`ca` two; the INTERSECT arms, the `A2`/`V1` double wrapping and the
+`substr(s_zip,1,2) = substr(V1.ca_zip,1,2)` residual all preserved) plans to:
+
+```
+Filter  out=10 [d_date_sk d_qoy d_year s_store_sk s_store_name s_zip
+                ss_sold_date_sk ss_store_sk ss_net_profit ca_zip]
+  PRED: … substr(Col(s_zip/5)) = substr(Col(ca_zip/9))      ← CORRECT
+  Join  out=10
+    MultiHashJoin out=9    (reordered: dd, st, ss)
+    Project out=1 [ca_zip]
+      TGT: Col(ca_zip/6)                                     ← WRONG, must be 0
+      SetOp out=1 [ca_zip]
+```
+
+Both halves of the pre-registered mechanism fail against this:
+
+1. The outer `Filter`'s `ca_zip` index — **9** in the replica, **57** at SF=1 —
+   is *already correct*; it addresses the 10-column joined row. No `Filter`
+   below the subquery `Project` carries a stale ref at all.
+2. The failing ref is the V1 `Project`'s own target above a 1-column `SetOp`,
+   whose correct value is `0`. `remapSubqueryColumnRefs` produced exactly that.
+   Something downstream replaced it.
+
+### R2. Corrected mechanism — an out-of-domain application, and a sibling divergence
+
+The overwriting pass is `applyJoinTreePosMap` (`internal/planner/bushy.go`),
+reached from `remapWithBindings` after the MHJ reorder. Its `*Project` arm
+descended into every `Project` not flagged `IsolatedScope` (the M0063-0001
+view-rename wrapper) and remapped its targets with the **outer** bindings'
+position map. `posMap(0)` matches the outer FROM binding that starts at
+offset 0 — `store_sales` in real Q8, `ss` in the replica — and returns that
+table's *reordered* MHJ offset: `dd 3 + st 3 = 6` in the replica,
+`date_dim 28 + store 29 = 57` at SF=1. Hence `ca_zip/57` against a 1-wide
+`MaterializedSlot`, and hence the number 57 — which the ledger read as a
+"global FROM-order index" but which is in fact an **MHJ-order** offset, the
+signature of this pass rather than of an unrepaired one.
+
+`posMap` is defined **only** over the coordinate space that
+`buildBindingsPosMap`'s `collect` walker traversed, and `collect`'s own
+`*Project` arm stops at *every* join-tree `Project`:
+
+> *"Any Project in the join-tree subtree passed to collect() is a
+> subquery-derived table … For `IsolatedScope=true` this was already the
+> contract. **Extend it to all Projects**: advance `off` by the projected output
+> width and stop."*
+
+The build half was generalised to all `Project`s; the apply half kept the narrow
+`IsolatedScope` test. That is CLAUDE.md's "sibling paths must change together"
+law, and it is the mirror image of `9740fce9`: that commit gave `collect` its
+`SetOp`/`RecursiveUnion`/`WindowAgg`/… opaque-leaf arms so `off` advances past a
+set operation, while leaving this applier free to walk into the scope above it.
+V1's sibling-path audit is therefore answered — and answered in the *opposite*
+direction from the one it anticipated.
+
+### R3. The fix
+
+`applyJoinTreePosMap`'s `*Project` arm now stops at every join-tree `Project`:
+no recursion, no target remap. Nothing is lost —
+
+- the subquery's inner plan was already normalised into its own coordinate space
+  by `remapSubqueryColumnRefs` when the derived table was planned, and
+- `Project`s **above** the join tree are covered by the separate
+  `remapTopProjection` pass, which exists precisely because
+  `applyJoinTreePosMap` does not reach them.
+
+Nor can it silently disable the outer remap: whenever the root handed to
+`remapWithBindings` is itself a `Project` (or a `Filter` over one), `collect`
+already stopped there, `entries` came back empty and `buildBindingsPosMap`
+returned `nil`, so `remapWithBindings` was a no-op before this change too. The
+only live case in which the recursion reaches a `Project` is the one being
+fixed: scans on one join side, a derived-table scope on the other.
+
+D1/D2/D3 were **not implemented**: no new walker was hand-rolled, so D3's
+concern is moot, and D2's verify-then-repair narrowing is untouched — declining
+to rewrite an index that was never in the map's domain adds no new instance of
+the "first match wins" family.
+
+### R4. Acceptance (V0 honoured in full)
+
+| gate | result |
+|---|---|
+| `internal/planner/q8_subquery_scope_posmap_test.go` — every `Project` target `ColumnRef` addresses its own child's output | PASS post-fix; **FAILS pre-fix**: `Project target 0 (ca_zip/6) is outside its child's 1-column output` |
+| `internal/executor/q8_subquery_scope_remap_test.go` — end-to-end values | PASS post-fix; **FAILS pre-fix**: `XX000: column ref ca_zip/6 out of MaterializedSlot range 1` |
+| same DDL + query on PostgreSQL 18.3 (throwaway cluster) | `alpha\|5`, `beta\|7` — goopg byte-identical |
+| real `query8.sql` at SF0.5 | ERROR at ~11 s → no error; see R5 |
+
+The probe returns a **non-empty** answer, so V0's trap ("0 rows also matches
+PG") is closed, and it reproduces the `MaterializedSlot range` signature on
+pre-fix HEAD exactly as V0 requires. `TestQ8SubqueryScopeDefectiveShapeStillReachable`
+guards the guard: it skips loudly if the planner stops producing the
+MHJ + cross-NL + `SetOp` shape, so the value assertion cannot go vacuous unseen.
+
+### R5. Residual, deferred — Q8 leaves the ERROR class and joins the timeout class
+
+Removing the error unmasks the plan's true cost, which the abort had hidden.
+The residual `substr(s_zip,1,2) = substr(V1.ca_zip,1,2)` sits on a **cross
+join** above the full three-way `store_sales ⋈ date_dim ⋈ store` MHJ, and
+`d_qoy = 2 AND d_year = 1998` are in that same post-join `Filter` rather than
+pushed into `date_dim`, so every `store_sales` row reaches the filter once per
+V1 row. Measured at SF0.5 post-fix: **exceeded a 1500 s client budget (elapsed
+1633 s, `timeout` status 124)**, where pre-fix it errored at ~11 s.
+
+This is a **pre-existing plan-quality defect, not a regression from this
+change**: the fix alters exactly one `ColumnRef` index and leaves plan *shape*
+untouched. Q8 simply moves out of the `ERROR` class into the timeout class this
+milestone is named after (RC-8 / M0125-0003 territory). Recorded as a deferral
+ledger row with a resume point.
 
 ## References
 
