@@ -119,12 +119,22 @@ started.
 >       owed a follow-up. Run as four contiguous `QUERIES=` chunks on ONE binary
 >       (~110 min total exceeds a loop's foreground budget) — the README explains
 >       why chunking is sound and what it cannot see.
->    5. **`M0125-0014` / `-0015`** (Q49 / Q51 SF=1 re-measure) — pair them with
->       M0124-0002's quiet-host window rather than opening a second one.
->       **Both now PASS at SF0.5** in the gate above (Q49 ck-verified
->       `ccb0983b810cf1d0`; Q51 `ck=n/a`, saturated LIMIT). That is EVIDENCE, not
->       a discharge: both items are specified at **SF=1**, and SF0.5 is a
->       key-parity half-sample where a full-fact-table defect can hide.
+>    5. ~~**`M0125-0014` / `-0015`** (Q49 / Q51 SF=1 re-measure)~~ — **DONE
+>       2026-07-30** on a verified quiet host, `analysis/m0125-0014-0015-q49-q51-sf1/`.
+>       The SF=1 reading the items demanded closes **both**: Q49 `OK 83 s / 34
+>       rows` and Q51 `OK 47 s / 100 rows`, each with a value checksum equal to
+>       PG's. The SF0.5 PASS was indeed only evidence — but the full-fact-table
+>       defect SF0.5 could have hidden was not there. Neither mechanism was ever
+>       root-caused; both closed at STEP 0 as *measured-and-already-fixed*, the
+>       M0124-0004 shape. Attribution stays where the SF0.5 bisect put it
+>       (**M0125-0009**) and is NOT confirmed by this run.
+>    **↳ WITH ITEM 5 DONE, ALL FIVE ORDERED ITEMS ARE DISCHARGED.** The next
+>    selection is no longer taken from this list: fall back to the M0125 body and
+>    take **`M0125-0007`** (unpadded month/day date decode) — the single defect
+>    behind the three Q16/Q94/Q95 `CKMISMATCH` cells item 3's gate uncovered, and
+>    the only M0125 item with a fresh acceptance signal waiting for it. It is a
+>    **codec** change, so it owes the full bar INCLUDING the regress-port suite
+>    (Hard-won Rule #5), not just the units + spotcheck + SF0.5 trio.
 >    **`M0125-0020` landed at `beb7af82` before this list was written**, so its
 >    ordering is moot — but the reason it was selected is not: it was chosen on
 >    the false completeness claim corrected in item 3. Do not select the next
@@ -224,6 +234,25 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      (Tasks are added here by the in-loop agent, one per subject. This
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
+
+- [ ] **Nightly TPC-DS row anchors are DEAD — all 63 have never been checked**
+      (discovered 2026-07-30 while closing `M0125-0014`/`-0015`; not from
+      `action-items.md`, and **not** one of the banner's two carve-outs, so it is
+      filed and left unchecked). `ci/batch/lib/summarize.py:485` builds
+      `anchors_tpcds` from `r["rows"]`, but `ci/batch/tpcds-row-anchors.csv`'s
+      column is **`expected_rows`** — `csv.DictReader` therefore yields no `rows`
+      key, the comprehension's `if r.get("rows")` guard drops **every** row, and
+      the dict is always empty. Consequence: the nightly batch has never reported
+      a TPC-DS row-count regression, for any of the 63 pinned queries. **TPC-H is
+      unaffected** — `ci/batch/tpch-row-anchors.csv` really does use `rows`
+      (verified: 12/12 usable vs 0/61 for TPC-DS), which is why the same code
+      shape works 80 lines earlier and why this went unnoticed.
+      Repro: `python3 -c "import csv;r=list(csv.DictReader(open('ci/batch/tpcds-row-anchors.csv')));print(sum(1 for x in r if x.get('rows')))"` → `0`.
+      Fix: read `expected_rows` in `summarize.py` (or rename the CSV column —
+      prefer fixing the reader, the CSV name is the clearer one), then confirm on
+      a nightly run that a deliberately-wrong anchor actually surfaces as a
+      regression. Until this lands, the Q49/Q51 anchors added by M0125-0014/-0015
+      protect nothing.
 
 - [x] **Nightly TPC-H stage wedged the host for 6h45m after its sweep finished**
       — worked immediately under the banner's second carve-out (it broke the bench
@@ -2109,8 +2138,18 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       not re-pinning one.
       Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q47).
       Planner/executor change → full pre-commit bar.
-- [ ] **M0125-0014 — Q49: re-measure at SF=1, then resolve or classify the
-      30-vs-34 row gap** (round-2 §5a, ledger rows `tpcds-round2 Q49` 2026-07-27
+- [x] **M0125-0014 — Q49: re-measure at SF=1, then resolve or classify the
+      30-vs-34 row gap** — **DONE 2026-07-30, CLOSED AT STEP 0 as
+      *measured-and-already-fixed*.** goopg at SF=1 on HEAD `f3f31d87` returns
+      **34 rows = PG** with an **identical value checksum** (`63ace0d888e86982`;
+      `tpcds-value-diff.py` = `RENDERING-ONLY (numeric scale)`), in `OK 83 s`.
+      The `OK 79 s / 30` reading this item was written against is superseded.
+      Anchor `Q49,34,pinned` added, and Q49 added to `stage-tpcds.sh`'s sweep
+      order — **but see the M-NIGHTLY item above: the TPC-DS anchor mechanism is
+      dead, so the anchor is inert until that lands.** No mechanism was ever
+      identified; the candidates below are retired unanswered, not solved.
+      Evidence `analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q49
+      "Execution record"; ledger rows updated (`tpcds-round2 Q49` → resolved). (round-2 §5a, ledger rows `tpcds-round2 Q49` 2026-07-27
       and `tpcds-round2 q47-q49-q51` 2026-07-29). Shaped like M0124-0004
       ("recover or classify") because the premise moved after it was written.
       **Unchanged by RC-1b, which disproves its provisional RC-1b-family
@@ -2148,8 +2187,21 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       No Q49 row exists in `ci/batch/tpcds-row-anchors.csv`, so add one on close.
       Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q49).
       Planner/executor change → full pre-commit bar.
-- [ ] **M0125-0015 — Q51: re-measure at SF=1, then resolve or classify the
-      0-vs-100 row gap** (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29,
+- [x] **M0125-0015 — Q51: re-measure at SF=1, then resolve or classify the
+      0-vs-100 row gap** — **DONE 2026-07-30, CLOSED AT STEP 0 as
+      *measured-and-already-fixed*.** goopg at SF=1 on HEAD `f3f31d87` returns
+      **100 rows = PG** with an **identical value checksum** (`443e242cfab22c02`;
+      `tpcds-value-diff.py` = `RENDERING-ONLY (bpchar/width)`), in **`OK 47 s`**
+      — the runtime this item required be reported. **The budget-marginality
+      warning is retired**: 553 s of headroom under the 600 s cut, not 13 s, so
+      Q82 (44 s) is again the sweep's narrowest `OK` margin. The 587 s → 47 s
+      drop is most likely the `LIMIT 100` finally saturating rather than a speed
+      fix — consistent, unverified, not claimed. Anchor `Q51,100,pinned` added
+      (inert, same caveat as -0014). "Third distinct defect" is now a **dropped**
+      question, not an answered one — no mechanism was ever found.
+      Evidence `analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q51
+      "Execution record"; ledger row `tpcds-round2 q47-q49-q51` updated (stays
+      open for Q47). (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29,
       §13.4 item 2). Same "resolve or classify" shape as -0014, for the same reason.
       **Also unchanged by RC-1b.** §13.4 item 2 calls it "a **third** distinct
       defect" on that basis, but the later measurements deliberately kept the

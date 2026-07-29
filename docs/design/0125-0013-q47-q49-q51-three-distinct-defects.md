@@ -1,9 +1,19 @@
 # 0125-0013 — TPC-DS Q47, Q49, Q51: three distinct defects one label had conflated
 
-Status: draft
-Date: 2026-07-29
+Status: draft — **Q49 and Q51 CLOSED 2026-07-30; Q47 open**
+Date: 2026-07-29 (updated 2026-07-30)
 Milestone: **M0125-0013 (Q47), M0125-0014 (Q49), M0125-0015 (Q51)** — one document, three
 tasks, because the load-bearing finding is that they are *not* one defect.
+
+> **⚠️ 2026-07-30 — two of the three defects no longer exist.** Re-measured at SF=1
+> on HEAD `f3f31d87`: **Q49 = 34 rows and Q51 = 100 rows, values equal to PG on
+> both** (`analysis/m0125-0014-0015-q49-q51-sf1/`). Both closed at their STEP 0 as
+> *measured-and-already-fixed*; the diagnostic material in § Q49 and § Q51 is
+> retained as record, **not as open work** — read each section's "Execution
+> record" first. **Only § Q47 (M0125-0013) is still actionable.** Note what this
+> costs: neither mechanism was ever identified, so §"Why one document" below —
+> which reads Q49 and Q51 as two *distinct* defects on the strength of RC-1b not
+> moving them — is now a question that was dropped rather than answered.
 Source: ledger row `tpcds-round2 q47-q49-q51` (2026-07-29) — the only source covering all
 three. §13.4 item 2 covers **Q47 and Q51 only**; §5a covers **Q49 only**.
 
@@ -163,6 +173,25 @@ constructed at SF=1, not inherited.
 acceptance signal — HEAD already satisfies it.** Add a Q49 row to
 `ci/batch/tpcds-row-anchors.csv` on close; there is none today.
 
+### ✅ Execution record (2026-07-30) — CLOSED at STEP 0
+
+**Q49 measures `OK 83 s / 34 rows` at SF=1 on HEAD `f3f31d87`, `ck=63ace0d888e86982`
+— byte-for-byte the checksum PG produces for the same query.**
+`scripts/tpcds-value-diff.py` reports `RENDERING-ONLY (numeric scale)`, i.e. the
+only surviving difference is the quotient-scale gap (`0.00` vs
+`0.00000000000000000000`) this document already names as a known renderer
+artefact. That is the acceptance criterion above, met in full.
+
+STEP 0 was therefore the whole task. **Everything from "Q49 is three `UNION ALL`
+branches" through "Remaining candidates" is now moot** — the 3 × 10 arithmetic
+that motivated the `OR`-collapse hypothesis describes a row count goopg no longer
+produces, and neither the `decimal(15,4)` division nor the mixed
+`LEFT OUTER JOIN … , date_dim` shape was ever confirmed to be involved. They are
+kept above as the record of what was ruled out and what was never needed, not as
+open work.
+
+Measurement: `analysis/m0125-0014-0015-q49-q51-sf1/`.
+
 ---
 
 ## § Q51 — M0125-0015: 0 rows where PG returns 100, third distinct defect
@@ -222,6 +251,38 @@ recorded**. "100 rows at SF0.5" is not an acceptance signal — HEAD already sat
 and SF0.5 cannot value-accept Q51 at all (`ck=n/a`). Closing by measurement, if SF=1 now
 matches PG, is a valid outcome; record it and UPDATE the ledger rows. Add a Q51 row to
 `ci/batch/tpcds-row-anchors.csv` on close; there is none today.
+
+### ✅ Execution record (2026-07-30) — CLOSED at STEP 0
+
+**Q51 measures `OK 47 s / 100 rows` at SF=1 on HEAD `f3f31d87`,
+`ck=443e242cfab22c02` — equal to PG's checksum for the same query.**
+`scripts/tpcds-value-diff.py` reports `RENDERING-ONLY (bpchar/width)`, the
+un-blank-padded `char(n)` artefact. Rows, values **and** the runtime the
+acceptance criterion demands are all recorded.
+
+Two consequences for this section:
+
+- **"Budget-marginal on the `OK` side" is retired.** 47 s against the 600 s cut
+  is 553 s of headroom, not 13 s. Q51 is no longer the narrowest `OK` margin of
+  the sweep — Q82 (`OK 556 s`, 44 s) is, which is what `RESULTS.md` said before
+  §5 contradicted it. The instruction to raise the budget for the acceptance run
+  was followed anyway (2400 s); it was not needed.
+- **"Third distinct defect" was never settled and now cannot be, from here.**
+  This document deliberately held it as a leading hypothesis rather than a fact,
+  and the defect is gone before any mechanism was identified. The honest record
+  is that Q51's relationship to Q47's downstream defect is **unresolved and now
+  unobservable at SF=1** — closing on measurement means the question is dropped,
+  not answered. Q47 (M0125-0013) remains open and is where that mechanism, if it
+  is shared, will surface.
+
+The 587 s → 47 s drop is 12.5×, but almost certainly not a speed fix: with zero
+qualifying rows the `LIMIT 100` could never saturate, so the full-outer-join and
+window layers were drained to completion. That explanation is consistent and
+**unverified** — see the measurement note, which does not claim it.
+
+Attribution stays where the SF0.5 bisect put it (**M0125-0009**) and is *not*
+strengthened by this run: one reading at `f3f31d87` cannot separate -0009 from
+the commits after it. See `analysis/m0125-0014-0015-q49-q51-sf1/` § Attribution.
 
 ---
 

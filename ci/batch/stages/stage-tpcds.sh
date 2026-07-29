@@ -34,8 +34,15 @@ PER_Q_CAP=1200
 CG_UNIT="goopg-nightly-tpcds"
 SERVER_LOG="${TPCDS_DIR}/server.log"
 
-# Qualifying queries (61 total — OK, non-zero rows, matches PG)
-SWEEP_ORDER=(1 2 3 6 7 9 12 13 15 16 17 18 19 20 21 22 26 27 28 29 32 33 34 38 40 41 42 43 44 48 52 53 55 56 57 59 60 61 62 63 66 68 73 74 75 77 79 80 84 85 87 89 90 91 92 94 95 96 97 98 99)
+# Qualifying queries (63 total — OK, non-zero rows, matches PG)
+#
+# Q49 and Q51 joined the set on 2026-07-30 (M0125-0014 / M0125-0015): both were
+# wrong-row-count cells until then, and both now match PG at SF=1 on rows AND
+# values (34 / 100; analysis/m0125-0014-0015-q49-q51-sf1/). They cost +130 s of
+# the 7200 s budget as measured on a quiet host (Q49 83 s, Q51 47 s) — worth
+# checking against `not-run` tail entries if the budget ever gets tight, since
+# Q51 in particular used to take 587 s when it was returning zero rows.
+SWEEP_ORDER=(1 2 3 6 7 9 12 13 15 16 17 18 19 20 21 22 26 27 28 29 32 33 34 38 40 41 42 43 44 48 49 51 52 53 55 56 57 59 60 61 62 63 66 68 73 74 75 77 79 80 84 85 87 89 90 91 92 94 95 96 97 98 99)
 if [[ -n "${NIGHTLY_TPCDS_QUERIES:-}" ]]; then
     IFS=',' read -ra SWEEP_ORDER <<< "${NIGHTLY_TPCDS_QUERIES}"
 fi

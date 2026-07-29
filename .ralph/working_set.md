@@ -1,46 +1,44 @@
 (idle — nothing in flight)
 
-Last loop: **`M0124-0004` CLOSED on the classify branch — M0124 is now fully
-closed.** Artefacts `analysis/tpcds-q35-m0124-0004/`; design doc §"Execution
-record (2026-07-30)"; ledger row 2026-07-30; banner updated.
+Last loop: **`M0125-0014` and `M0125-0015` both CLOSED** — Q49/Q51 re-measured at
+SF=1 on HEAD `f3f31d87`, both value-equal to PG. Artefacts
+`analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q49 / § Q51 "Execution
+record"; ledger `tpcds-round2 Q49` → resolved, `q47-q49-q51` UPDATEd (stays open
+for Q47); banner item 5 discharged.
 
-Nightly triage: `ci/logs/action-items.md` unchanged since 2026-07-25 (mtime
-Jul 25 03:20); all 26 `AI-` subjects already filed under M-NIGHTLY — no-op.
+Nightly triage: `ci/logs/action-items.md` still unchanged (mtime Jul 25 03:20),
+all 26 `AI-` subjects already filed — no-op. Separately FILED (not worked, per
+banner): the TPC-DS nightly row-anchor mechanism is dead.
 
-## NEXT (banner order — `.ralph/fix_plan.md` "Current Priority" wins)
+## NEXT (banner order — all five ordered items are now discharged)
 
-M0124 has no open items. M0125's ordered list items 1–4 are done. Next:
-
-1. **`M0125-0014`/`-0015`** (Q49/Q51 **SF=1** re-measure) — banner item 5. Both
-   PASS at SF0.5, but SF0.5 is a key-parity half-sample; take the SF=1 reading
-   before ticking. Quiet host.
-2. **`M0125-0007`** (unpadded month/day date decode) — unblocked; the gate handed
-   it an acceptance signal. Codec change ⇒ needs `tpch-spotcheck.sh` + SF0.5 gate
-   + the FULL regress-port suite (Rule #5).
+1. **`M0125-0007`** (unpadded month/day date decode) — the banner's new
+   fall-back selection. One defect behind the three Q16/Q94/Q95 `CKMISMATCH`
+   cells; it has a fresh acceptance signal waiting. **Codec change ⇒ full bar
+   INCLUDING the regress-port suite** (Rule #5), plus `tpch-spotcheck.sh` and the
+   SF0.5 gate.
+2. **`M0125-0013`** (Q47) — the only member of the Q47/Q49/Q51 document still
+   actionable.
 
 ## Facts the next loop should NOT re-derive
 
-- **Q35 is settled: performance-only, RC-8 shape.** Outer cardinality
-  (`customer ⋈ customer_address ⋈ customer_demographics`) = **96,562**; one
-  buffer-**warm** `EXISTS` #1 floors at **8.16 s** (×4, ±0.5 %) ⇒ the AND-ed
-  conjunct alone floors at **≈9.1 days** at SF=1, ≈4.6 days at SF0.5. Do **not**
-  re-run Q35 at a bigger budget — 3600 s is still ~3 orders of magnitude short.
-  It is now **M0125-0003's acceptance query** (first terminating run vs oracle
-  `35|OK|100|0`).
-- **The 525 s SF=1 history is REFUTED**, not unreproduced — it is an artefact of
-  the PATH-loss event that also ate the row count. `651 s`/`628 s` are kill
-  lines. Q35 has never completed on goopg at any scale factor.
-- **The SF0.5-slower-than-SF=1 anomaly is closed** — dimensions are copied whole
-  so outer cardinality is unchanged; both SFs are kill lines whose ordering is
-  noise. Nothing left to explain.
-- **`c26c6fc3` (M0125-0003 stage 1) is confirmed shape-neutral**: SF=1 `EXPLAIN`
-  at HEAD is byte-identical to the pre-stage-1 capture.
-- `timeout N psql` leaves the **server** executing — the SF=1 probe's server was
-  still alive at 30:30 etime after the client died; `server.sh stop sf1` reaped
-  it. `ps -C <exe>` (not `pgrep -f`) to check, to avoid the self-match.
+- **Q49 = `OK 83 s / 34 rows`, `ck=63ace0d888e86982`; Q51 = `OK 47 s / 100 rows`,
+  `ck=443e242cfab22c02`** at SF=1, both equal to PG's checksum. The
+  `OK 79 s / 30` and `OK 587 s / 0` sweep rows are superseded — do not re-measure.
+- **Q51 is no longer budget-marginal**: 553 s of headroom, not 13 s. Q82
+  (`OK 556 s`, 44 s) is again the sweep's narrowest `OK` margin.
+- **Neither mechanism was ever found.** Both closed at STEP 0 (the M0124-0004
+  "resolve *or classify*" shape). Attribution to M0125-0009 is inherited from the
+  SF0.5 bisect, NOT measured at SF=1 — one reading at HEAD cannot separate -0009
+  from -0010/-0011/-0012/-0020. Don't restate it as measured.
+- **The TPC-DS nightly row anchors have never worked**: `summarize.py:485` reads
+  `r["rows"]`, the CSV column is `expected_rows` ⇒ all 63 dropped. TPC-H is fine
+  (its CSV uses `rows`). Filed under M-NIGHTLY, parked; the Q49/Q51 anchors added
+  this loop are inert until it lands.
+- `scripts/tpcds-result-checksum.py` takes a **path argument**, not stdin.
 
-Gates run: `make ralph-state-guard` (INCONSISTENT → auto-REPAIRED → OK);
-pgbench smoke via the commit hook. No code changed (docs/analysis/state only),
-so no unit/spotcheck/plan-diff run was owed.
+Gates run: `make ralph-state-guard` (INCONSISTENT → auto-REPAIRED → OK); pgbench
+smoke via the commit hook. No engine code changed (measurement + docs + CI
+metadata only), so the units/spotcheck/SF0.5/plan-diff bar was not owed.
 
 In-flight: none.
