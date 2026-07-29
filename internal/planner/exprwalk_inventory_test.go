@@ -84,7 +84,15 @@ const (
 // Ordering is by file then function, matching the census output so the two can
 // be diffed directly.
 var exprSwitchInventory = map[string]walkerRole{
-	"bushy.go:remapByPosMap":                                    walkerPending, // 18 of 32 arms
+	// CONVERTED by M0125-0002 commit 1: the recursion and the
+	// exhaustiveness moved to exprChildSlots (the walker now drives
+	// rewriteExprRefsInPlace). What is left is a bottom-up dispatch over the
+	// six types needing work beyond child descent, inside the Rewrite
+	// closure — the census attributes a closure's switch to its enclosing
+	// function, so the pin DEMOTES instead of disappearing. A conversion is
+	// audited by this role change; only a walker whose switch vanishes
+	// entirely loses its line.
+	"bushy.go:remapByPosMap":                                    nonRecursiveClassifier,
 	"bushy.go:remapOuterRefsInSubplan":                          walkerPending, // 5 of 32 arms
 	"bushy.go:remapPosMapAfterRewrite":                          walkerPending, // 8 of 32 arms
 	"bushy.go:visitColumnRefs":                                  walkerPending, // 7 of 32 arms

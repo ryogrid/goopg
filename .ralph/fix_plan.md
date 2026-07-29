@@ -1424,6 +1424,45 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       found **two fail-opens that COLLIDE rather than no-op** (worse: a wrong
       answer, not a missed optimisation) — filed as `M0125-0024`, deliberately
       not fixed here. Design doc §"STEP 0".
+      **COMMIT 1 of 8 DONE 2026-07-30 — `remapByPosMap` re-based onto
+      `rewriteExprRefsInPlace`, and D2 row 1's empty-plan-diff prediction
+      HELD: 22/22 TPC-H MATCH under `make plan-diff
+      LABEL=tpcds-round2-head MODE=structural`.** Three things the design
+      left open were resolved by reading the pins rather than the prose:
+      (a) the driver is **`rewriteExprRefsInPlace`, not `cloneExprRefs`** —
+      the §2.6 pin comment guessed the latter, but
+      `TestRemapByPosMap_IdentityMapSharesNodes` requires an identity remap
+      to leave the node SHARED and a whole-tree clone replaces even the
+      root; (b) D3's "plan slots **ignore**" taken literally would have
+      **dropped the `remapOuterRefsInSubplan` calls** and reintroduced
+      TPC-H Q21's wrong-outer-column defect — the walker has TWO kinds of
+      inner plan needing OPPOSITE treatment (`InExpr.Plan` already remapped
+      vs `Exists`/`Subquery`/`ArraySubquery`/`MultiAssignSubq*` needing
+      Level-1 translation) and a per-driver `scopePolicy` cannot express a
+      per-type split, so `scopeIgnore` + a bottom-up `Rewrite` dispatch
+      owns it (`scopeDescend`+`OnScope` cannot: `OnScope` gets the `Node`
+      with no parent context); (c) the missing `default:` is a **panic**,
+      matching PG's `elog(ERROR, "unrecognized node type: %d")` in
+      `nodeFuncs.c:2667`/`:3743` — ledger row 2026-07-30 records the
+      un-PG-faithful half (a bare panic instead of `ereport` with a
+      SQLSTATE, reaching the client as `XX000` only via `server.go`'s one
+      `recover()`). **The census pin DEMOTED (`walkerPending` →
+      `nonRecursiveClassifier`) instead of being deleted**, which corrects
+      this item's own "each conversion closes by DELETING its pin": the
+      census keys a switch by its ENCLOSING FUNCTION and closures count, so
+      the six-arm dispatch inside `Rewrite` keeps the site in the census.
+      Deletion is the audit signal only for walkers whose switch vanishes
+      entirely; forcing one here would mean an `if`-chain of type
+      assertions (gaming the gate) or a renamed helper (same switch, new
+      key). Four new pins in `remap_arms_test.go`: subplan `Args` are
+      same-scope (nothing pinned it, and the driver reaches them through
+      slots), containers are not cloned, and an unenumerated type panics at
+      the root and nested. **D4 item 4's SF0.5 arm is OWED, not run** —
+      ledger row 2026-07-30: the `ci/batch` nightly held the host (load
+      ~10, TPC-DS stage mid-flight at ~11 GB RSS on 65435) and a concurrent
+      99-query sweep would have risked the memory guard SIGKILLing that
+      stage; it must run before commit 2. **Next: commit 2,
+      `cloneExprShiftIdx`** — expects hunks and carries the full timed run.
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`

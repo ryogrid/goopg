@@ -1,7 +1,7 @@
 # 0125-0002 — Converting the seven remaining walkers: a plan-**shape** change and the TPC-H trade-off it re-opens
 
-Status: draft
-Date: 2026-07-28
+Status: in progress — STEP 0 and commit 1 of 8 executed (see "Execution record")
+Date: 2026-07-28 (STEP 0 2026-07-30; commit 1 2026-07-30)
 Milestone: M0125-0002 (§13.5 action 4, phase 2.2)
 Depends on: `0125-0001-…` (the driver), M0124-0002 (the plan baseline), M0124-0005 (value checksums)
 
@@ -288,3 +288,69 @@ closure are out of scope and tracked by a ledger row, "the walker class is extin
 claimed. STEP 0 puts a number on that caveat: the eight are **16 % of the 50** recursive,
 incomplete walkers, and each conversion is complete only when its pin is deleted from
 `exprSwitchInventory`.
+
+## Execution record
+
+### Commit 1 of 8 — `remapByPosMap` re-based onto `rewriteExprRefsInPlace` (2026-07-30)
+
+D2 row 1. `internal/planner/bushy.go`: the 18-arm hand-written type switch is gone; child
+structure now comes from `exprChildSlots` alone. **The empty plan diff D2 predicted holds — all
+22 TPC-H queries MATCH** against `plan_snapshots/tpcds-round2-head.txt` in `structural` mode.
+
+Three decisions the design left open, resolved by reading the pins rather than the prose:
+
+1. **The driver is `rewriteExprRefsInPlace`, not `cloneExprRefs`** — D2 said "re-base" and the
+   §2.6 pin comment guessed `cloneExprRefs`. That guess is refuted by another pin in the same
+   file: `TestRemapByPosMap_IdentityMapSharesNodes` requires an identity remap to leave the node
+   *shared*, and `cloneExprRefs` shallow-clones **every** node including the root, so it would
+   replace it. The pre-conversion walker mutates containers in place and copies a `ColumnRef`
+   only when its index actually moves; `rewriteExprRefsInPlace` reproduces exactly that.
+   `TestRemapByPosMap_ContainerNodesAreNotCloned` now pins the container half, which nothing did
+   before — it matters because `Aggs[i].Arg`, `Keys[i].Expr` and `GroupExprs[i]` are remapped
+   through separate top-level calls in `bushy.go` while callers hold handles on the containers.
+2. **The scope policy is `scopeIgnore`, and D3's "plan slots ignore" is only half the story.**
+   Taken literally it would have *dropped* the `remapOuterRefsInSubplan` calls and reintroduced
+   the TPC-H Q21 defect (AI-20260707-000712-005: read `l_comment` where `l_suppkey` was meant).
+   The walker has **two** kinds of inner plan needing **opposite** treatment — `InExpr.Plan` was
+   already remapped by the caller and must not be touched, while
+   `Exists`/`Subquery`/`ArraySubquery`/`MultiAssignSubq*` must have their Level-1 outer refs
+   translated — and a `scopePolicy` is per-driver, not per-type, so it cannot express the split.
+   The `Rewrite` callback owns it instead: plans are invisible to the driver, and the six types
+   that need work beyond child descent are dispatched bottom-up. `scopeDescend` + `OnScope` was
+   the alternative and is wrong: `OnScope` receives the `Node` with no parent context, so it
+   cannot tell an `InExpr`'s plan from an `ExistsExpr`'s.
+3. **The missing `default:` is a panic**, matching PG: `expression_tree_walker_impl` and
+   `expression_tree_mutator_impl` both close with
+   `elog(ERROR, "unrecognized node type: %d")` (`postgres/src/backend/nodes/nodeFuncs.c:2667`,
+   `:3743`). Fail-open here is a **wrong answer**, not a missed optimisation — a subtree the
+   remap stepped over keeps pre-rewrite indices inside an otherwise-remapped predicate. It is
+   unreachable while `exprwalk_exhaustive_test.go` is green, which is the point: the gate catches
+   a 33rd type at build time, the panic is the runtime backstop. Deferral-ledger row 2026-07-30
+   records what is *not* PG-faithful about it (a bare panic rather than `ereport(ERROR)` with a
+   SQLSTATE, reaching the client as `XX000` only through `server.go`'s single `recover()`).
+
+**The census pin DEMOTED rather than disappeared, and the Deliverable section's rule needs that
+qualification.** The census keys a type switch by its *enclosing function*, and closures count,
+so the six-arm dispatch inside `Rewrite` keeps `bushy.go:remapByPosMap` in the census. Its role
+in `exprSwitchInventory` therefore moves `walkerPending` → `nonRecursiveClassifier`: the
+recursion and the exhaustiveness both moved to `exprChildSlots`, which is the property the role
+names. Pin *deletion* is the audit signal only for walkers whose switch vanishes entirely; a
+converted rewriter that still has to dispatch on node type is audited by the role change. Any
+attempt to force a deletion here would mean either hiding the switch behind an `if`-chain of
+type assertions (gaming the gate) or renaming it into a helper (the same switch, a different
+key).
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`make plan-diff LABEL=tpcds-round2-head MODE=structural` = 22/22 MATCH; pgbench smoke via the
+commit hook; four new pins in `remap_arms_test.go` (subplan `Args` are same-scope — untested
+before; containers not cloned; unenumerated type panics at the root and nested). **D4 item 4's
+SF0.5 arm is OWED, not run** — the `ci/batch` nightly held the host (load ~10, its TPC-DS stage
+mid-flight at 11 GB RSS on port 65435), and a concurrent 99-query sweep would have risked the
+memory guard killing that stage. It must run before commit 2, which is the first commit expected
+to move a plan.
+
+**Host hazard found while capturing the plan diff:** `bench/tpch/setup_goopg.sh` rebuilds
+`tmp/goopg-bench-bin`, the *same* path the `ci/batch` nightly lane runs its clone servers from.
+The running nightly server survived (Go's linker unlinks and recreates, so the live inode stays),
+but any nightly stage that starts a server *after* such a rebuild silently picks up the new
+binary mid-run. Use a private `-o` path when a nightly may be in flight.

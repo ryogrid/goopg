@@ -2185,116 +2185,117 @@ func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
 // matters.
 func mhjPosMapOf(node Node) func(int) int { return nil }
 
-// remapColumnRefs walks an expression tree and updates any
-// ColumnRef.Index using a position map built from the
-// MultiHashJoin's table OIDs.  This correctly handles duplicate
-// column names across different table instances (e.g. two
-// nation tables each with n_name).
+// remapByPosMap rewrites every same-scope ColumnRef.Index in *e through
+// posMap — a position map built from the MultiHashJoin's bindings, so it
+// handles duplicate column names across table instances (TPC-H Q7's two
+// nation scans) — and translates the Level-1 OuterColumnRefs of any inner
+// plan via remapOuterRefsInSubplan.
+//
+// M0125-0002 commit 1 (docs/design/0125-0002-walker-conversion-and-mhj-
+// composition-risk.md, D2 row 1): re-based onto exprwalk.go's
+// rewriteExprRefsInPlace. The 18-arm hand-written type switch is gone;
+// child structure now comes from the single primitive exprChildSlots, so a
+// 33rd Expr type is a build-time failure (exprwalk_exhaustive_test.go)
+// instead of the silent no-op that made TPC-DS Q76 return 0 rows instead
+// of 100 — `WHERE ss_customer_sk IS NULL` kept its pre-rewrite index
+// because there was no *IsNullExpr arm, so IS NULL was evaluated against a
+// date_dim column that is never NULL (round-2 README §2, the RC-1a class).
+//
+// Behaviour is deliberately UNCHANGED, which is why this is the one
+// M0125-0002 commit that expects an empty plan diff; remap_arms_test.go's
+// §2.6 pins are the proof. Three choices carry that equivalence:
+//
+//   - Driver is rewriteExprRefsInPlace, NOT cloneExprRefs: containers are
+//     mutated in place and a ColumnRef is copied only when its index
+//     actually moves. A whole-tree clone would replace nodes an identity
+//     remap must leave shared.
+//   - scopePolicy is scopeIgnore, so inner plans are not reached through
+//     the driver at all. The two kinds of inner plan here need OPPOSITE
+//     treatment and a policy cannot tell them apart: InExpr.Plan was
+//     already remapped by the caller and must not be touched, while
+//     Exists/Subquery/ArraySubquery/MultiAssignSubq* must have their
+//     Level-1 outer refs translated. Rewrite below owns that split.
+//   - An unenumerated type PANICS rather than being skipped — the
+//     `default:` this walker never had.
 func remapByPosMap(e *Expr, posMap func(int) int) {
 	if e == nil || *e == nil {
 		return
 	}
-	switch x := (*e).(type) {
-	case *ColumnRef:
-		newIdx := posMap(x.Index)
-		if newIdx != x.Index {
-			cl := *x
-			cl.Index = newIdx
-			*e = &cl
-		}
-	case *BinaryOp:
-		remapByPosMap(&x.Left, posMap)
-		remapByPosMap(&x.Right, posMap)
-	case *UnaryOp:
-		remapByPosMap(&x.Operand, posMap)
-	case *FuncCall:
-		for i := range x.Args {
-			remapByPosMap(&x.Args[i], posMap)
-		}
-	case *ExtractExpr:
-		remapByPosMap(&x.Source, posMap)
-	case *CastExpr:
-		remapByPosMap(&x.Operand, posMap)
-	case *InExpr:
-		// Remap the probe operand; do NOT remap the inner Plan (already remapped).
-		remapByPosMap(&x.Operand, posMap)
-		// The literal in-list (`col IN (a, b, c)`) can hold ColumnRefs,
-		// and Args are the PARAM_EXEC-style argument expressions
-		// evaluated against the CURRENT outer row — both are in the
-		// same coordinate space as Operand and were previously skipped.
-		for i := range x.List {
-			remapByPosMap(&x.List[i], posMap)
-		}
-		for i := range x.Args {
-			remapByPosMap(&x.Args[i], posMap)
-		}
-	case *CaseExpr:
-		if x.Operand != nil {
-			remapByPosMap(&x.Operand, posMap)
-		}
-		for i := range x.Whens {
-			remapByPosMap(&x.Whens[i].When, posMap)
-			remapByPosMap(&x.Whens[i].Then, posMap)
-		}
-		if x.Else != nil {
-			remapByPosMap(&x.Else, posMap)
-		}
-	case *ExistsExpr:
-		// Unlike InExpr, EXISTS/NOT EXISTS subqueries are never
-		// unnested into a join by this point (M0071-0009's Semi/Anti
-		// unnesting only fires for equality-correlated IN/=ANY
-		// shapes) — the inner Plan is evaluated in place at
-		// filter/leaf time with the outer row supplied via
-		// ctx.OuterRows, indexed by the correlated OuterColumnRef's
-		// Index. That Index was resolved against the PRE-rewrite
-		// (OID-sorted) outer schema; after the MultiHashJoin rewrite
-		// reorders columns, it must be translated through the same
-		// posMap or it silently reads the wrong outer column
-		// (AI-20260707-000712-005 / TPC-H Q21: read l_comment where
-		// l_suppkey was meant, producing a numeric-cast error on
-		// text).
-		remapOuterRefsInSubplan(x.Plan, 1, posMap)
-		for i := range x.Args {
-			remapByPosMap(&x.Args[i], posMap)
-		}
-	case *SubqueryExpr:
-		remapOuterRefsInSubplan(x.Plan, 1, posMap)
-		for i := range x.Args {
-			remapByPosMap(&x.Args[i], posMap)
-		}
-	case *ArraySubqueryExpr:
-		remapOuterRefsInSubplan(x.Plan, 1, posMap)
-	// The arms below were missing entirely, which is the RC-1a defect:
-	// an unenumerated container is a SILENT no-op here, so its inner
-	// ColumnRef keeps its pre-rewrite (FROM-order) index while the rest
-	// of the predicate is remapped into MHJ-output coordinates. The
-	// predicate then reads a different table's column. For TPC-DS Q76
-	// (`WHERE ss_customer_sk IS NULL`) index 3 survived the remap and
-	// evaluated IS NULL against a date_dim column that is never NULL,
-	// so the query returned 0 rows instead of 100. The same hole reaches
-	// Q72 one level deeper, through `sum(case when p_promo_sk is null
-	// …)`. See docs/design/tpcds-round2-fixes/README.md §2.
-	case *IsNullExpr:
-		remapByPosMap(&x.Operand, posMap)
-	case *IsBoolExpr:
-		remapByPosMap(&x.Operand, posMap)
-	case *IsDistinctFromExpr:
-		remapByPosMap(&x.Left, posMap)
-		remapByPosMap(&x.Right, posMap)
-	case *CollateExpr:
-		remapByPosMap(&x.Operand, posMap)
-	case *RowExpr:
-		for i := range x.Elems {
-			remapByPosMap(&x.Elems[i], posMap)
-		}
-	case *MultiAssignSubqRow:
-		// Plan is a Node, not an Expr — an inner scope, handled the
-		// same way as SubqueryExpr.
-		remapOuterRefsInSubplan(x.Plan, 1, posMap)
-	case *MultiAssignSubqElem:
-		if x.Row != nil {
-			remapOuterRefsInSubplan(x.Row.Plan, 1, posMap)
-		}
+	var unknown Expr
+	ok := rewriteExprRefsInPlace(e, scopeIgnore, exprRewriter{
+		// Called BOTTOM-UP, once per node. Only the types that need work
+		// BEYOND same-scope child descent appear here; every other type is
+		// handled entirely by the driver's slot walk, so this switch is
+		// neither recursive nor required to be exhaustive. That is why the
+		// census pin in exprwalk_inventory_test.go DEMOTES to
+		// `nonRecursiveClassifier` rather than disappearing: the recursion
+		// and the exhaustiveness both moved to exprChildSlots.
+		Rewrite: func(x Expr) Expr {
+			switch n := x.(type) {
+			case *ColumnRef:
+				newIdx := posMap(n.Index)
+				if newIdx == n.Index {
+					// Share on a no-op remap. Identity maps are common
+					// enough for this to matter, and
+					// TestRemapByPosMap_IdentityMapSharesNodes pins it.
+					return x
+				}
+				// Copy on change: expression nodes are shared between
+				// plan fragments, so mutating Index in place would
+				// retro-remap a fragment that was already correct.
+				cl := *n
+				cl.Index = newIdx
+				return &cl
+
+			// ---- inner plans, handled here rather than by the policy ---
+			// EXISTS/NOT EXISTS subqueries are never unnested into a join
+			// by this point (M0071-0009's Semi/Anti unnesting only fires
+			// for equality-correlated IN/=ANY shapes) — the inner Plan is
+			// evaluated in place at filter/leaf time with the outer row
+			// supplied via ctx.OuterRows, indexed by the correlated
+			// OuterColumnRef's Index. That Index was resolved against the
+			// PRE-rewrite (OID-sorted) outer schema; after the
+			// MultiHashJoin rewrite reorders columns it must be translated
+			// through the same posMap or it silently reads the wrong outer
+			// column (AI-20260707-000712-005 / TPC-H Q21: read l_comment
+			// where l_suppkey was meant, producing a numeric-cast error on
+			// text). The subquery's Args are PARAM_EXEC-style arguments
+			// evaluated against the CURRENT outer row, so they are
+			// same-scope slots and the driver already descended them.
+			case *ExistsExpr:
+				remapOuterRefsInSubplan(n.Plan, 1, posMap)
+			case *SubqueryExpr:
+				remapOuterRefsInSubplan(n.Plan, 1, posMap)
+			case *ArraySubqueryExpr:
+				remapOuterRefsInSubplan(n.Plan, 1, posMap)
+			case *MultiAssignSubqRow:
+				// Plan is a Node, not an Expr — an inner scope, handled
+				// the same way as SubqueryExpr.
+				remapOuterRefsInSubplan(n.Plan, 1, posMap)
+			case *MultiAssignSubqElem:
+				// Reached through the statically-typed Row field, which
+				// the driver steps over (slotSubqRow under scopeIgnore).
+				if n.Row != nil {
+					remapOuterRefsInSubplan(n.Row.Plan, 1, posMap)
+				}
+			}
+			return x
+		},
+		OnUnknown: func(x Expr) { unknown = x },
+	})
+	if !ok {
+		// scopeIgnore never vetoes, so a false result can only mean
+		// OnUnknown fired. PG-faithful: expression_tree_walker_impl and
+		// expression_tree_mutator_impl both close with
+		// `elog(ERROR, "unrecognized node type: %d")`
+		// (postgres/src/backend/nodes/nodeFuncs.c:2667 and :3743), which
+		// the server's recover() surfaces as XX000. Silence is not an
+		// option here: a subtree the remap stepped over keeps its
+		// pre-rewrite indices inside an otherwise-remapped predicate, and
+		// the predicate then reads a different table's column — a wrong
+		// answer, not a missed optimisation.
+		panic(fmt.Sprintf("remapByPosMap: unrecognized expression type %T — teach "+
+			"exprChildSlots (internal/planner/exprwalk.go) about it", unknown))
 	}
 }
 

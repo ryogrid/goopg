@@ -27,6 +27,7 @@ package planner
 //     corrupt the subplan, which is the mirror-image bug of RC-1a.
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -315,5 +316,114 @@ func TestRemapByPosMap_IdentityMapSharesNodes(t *testing.T) {
 	remapByPosMap(&e, func(i int) int { return i })
 	if e.(*ColumnRef) != orig {
 		t.Fatal("identity remap replaced the node; it should be left shared")
+	}
+}
+
+// ---------------------------------------------------------------------
+// M0125-0002 commit 1 — pins added with the re-base onto
+// rewriteExprRefsInPlace (docs/design/0125-0002-*.md D2 row 1). The
+// conversion is meant to be behaviour-identical, so these cover the
+// equivalences the pins above happened not to state.
+// ---------------------------------------------------------------------
+
+// A subquery node's Args are PARAM_EXEC-style arguments evaluated against
+// the CURRENT outer row, so they live in the PARENT's coordinate space and
+// must be remapped even though their owner opens a scope. The pre-conversion
+// switch remapped them; exprChildSlots reports them as slotSameScope. Nothing
+// pinned it, and getting it wrong is silent — the subplan then receives an
+// argument read from the wrong outer column.
+func TestRemapByPosMap_SubqueryArgsAreSameScope(t *testing.T) {
+	cases := []struct {
+		arm   string
+		build func(inner Node, arg Expr) Expr
+		args  func(Expr) []Expr
+	}{
+		{"ExistsExpr/Args",
+			func(n Node, arg Expr) Expr { return &ExistsExpr{Plan: n, Args: []Expr{arg}} },
+			func(e Expr) []Expr { return e.(*ExistsExpr).Args }},
+		{"SubqueryExpr/Args",
+			func(n Node, arg Expr) Expr { return &SubqueryExpr{Plan: n, Args: []Expr{arg}} },
+			func(e Expr) []Expr { return e.(*SubqueryExpr).Args }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.arm, func(t *testing.T) {
+			inner, outerRef, innerRef := innerPlanWithOuterRef(5, 7)
+			e := tc.build(inner, remapArmColRef(3))
+			remapByPosMap(&e, shiftBy10)
+
+			if got := tc.args(e)[0].(*ColumnRef).Index; got != 13 {
+				t.Errorf("%s: index %d after remap, want 13 — subplan Args are evaluated "+
+					"in the PARENT's coordinate space", tc.arm, got)
+			}
+			if outerRef.Index != 15 || innerRef.Index != 7 {
+				t.Errorf("%s: inner plan refs = (%d, %d), want (15, 7)",
+					tc.arm, outerRef.Index, innerRef.Index)
+			}
+		})
+	}
+}
+
+// The re-base picked rewriteExprRefsInPlace over cloneExprRefs, and this is
+// the observable difference: container nodes keep their identity, only a
+// ColumnRef whose index moved is replaced. A whole-tree clone would return a
+// structurally equal but pointer-distinct tree, which silently detaches every
+// caller that kept a handle on a sub-expression (`Aggs[i].Arg`, `Keys[i].Expr`
+// and `GroupExprs[i]` are all remapped through separate calls in this file).
+func TestRemapByPosMap_ContainerNodesAreNotCloned(t *testing.T) {
+	leaf := remapArmColRef(5)
+	inner := &FuncCall{Name: "abs", Args: []Expr{leaf}}
+	root := &BinaryOp{Op: parser.OpEq, Left: inner, Right: &IntegerConst{Value: 1}}
+	e := Expr(root)
+
+	remapByPosMap(&e, shiftBy10)
+
+	if e.(*BinaryOp) != root {
+		t.Fatal("the root container was replaced; remapByPosMap rewrites in place " +
+			"(cloneExprRefs would replace it)")
+	}
+	if root.Left.(*FuncCall) != inner {
+		t.Fatal("a nested container was replaced; remapByPosMap rewrites in place")
+	}
+	if got := inner.Args[0].(*ColumnRef).Index; got != 15 {
+		t.Fatalf("leaf index = %d, want 15", got)
+	}
+	if leaf.Index != 5 {
+		t.Fatalf("the original leaf was mutated (index %d); it must be copied", leaf.Index)
+	}
+}
+
+// The `default:` this walker never had. An unenumerated Expr type used to be
+// a silent no-op, which left pre-rewrite indices inside an otherwise-remapped
+// predicate — the RC-1a wrong-answer shape. It now panics, matching PG's
+// expression_tree_walker_impl / expression_tree_mutator_impl, both of which
+// close with elog(ERROR, "unrecognized node type") (nodeFuncs.c:2667, :3743).
+//
+// This is unreachable while exprwalk_exhaustive_test.go is green — that is the
+// point: the build-time gate catches a 33rd type, and this is the backstop for
+// a type that reaches the planner without one.
+func TestRemapByPosMap_PanicsOnUnenumeratedType(t *testing.T) {
+	cases := map[string]Expr{
+		"root":   &unknownExpr{},
+		"nested": &BinaryOp{Op: parser.OpEq, Left: remapArmColRef(5), Right: &unknownExpr{}},
+	}
+
+	for name, expr := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("remapByPosMap silently accepted an unenumerated Expr type; " +
+						"skipping it leaves stale column indices in a remapped predicate")
+				}
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "unknownExpr") {
+					t.Fatalf("panic value %v does not name the offending type; the message "+
+						"is the only diagnosis available at that point", r)
+				}
+			}()
+			e := expr
+			remapByPosMap(&e, shiftBy10)
+		})
 	}
 }
