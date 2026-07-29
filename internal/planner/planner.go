@@ -819,13 +819,31 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			savedSetOps[i+1] = seg.cutAt.SetOp
 			seg.cutAt.SetOp = nil
 		}
+		// headSortLimit: the parser saw the parentheses close after the FIRST
+		// branch while an ORDER BY / LIMIT / OFFSET was already attached, so
+		// those clauses belong to that branch alone — `(A ORDER BY 1 LIMIT 2)
+		// UNION ALL C` limits A, not the union. The boundary sits at segment
+		// 0, which InnerSegmentCount cannot encode (0 is its "unset"
+		// sentinel), hence the separate flag.
+		//
+		// Unlike the InnerSegmentCount>0 boundary below, this one needs no
+		// wrapSetOpSortLimit at all: leaving the clauses in place lets the
+		// recursive planSelect(s) apply them as an ordinary SELECT's own sort
+		// and limit. That is both simpler and MORE faithful — PG's
+		// select_with_parens is a leaf, so its ORDER BY may reference a
+		// non-output expression (`ORDER BY x*-1`) that the set-op-level
+		// resolver would reject. M0125-0017.
+		headSortLimit := s.InnerSortLimit && s.InnerSegmentCount == 0
 		savedOrderBy := s.OrderBy
 		savedLimit := s.Limit
 		savedOffset := s.Offset
-		s.OrderBy = nil
-		s.Limit = nil
-		s.Offset = nil
-		// Plan the leftmost branch (s without its SetOp chain or sort/limit).
+		if !headSortLimit {
+			s.OrderBy = nil
+			s.Limit = nil
+			s.Offset = nil
+		}
+		// Plan the leftmost branch (s without its SetOp chain, and without its
+		// sort/limit unless those belong to this branch alone).
 		left, err := planSelect(s, cat)
 		// Restore everything (plan cache may reuse the AST).
 		s.SetOp = savedSetOps[0]
@@ -956,6 +974,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// and it keeps `left` equal to the inner compound's value at the point
 		// the sort/limit is applied. M0125-0016.
 		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
+		// sortLimitConsumed records that s's ORDER BY / LIMIT / OFFSET have
+		// already been applied to an INNER result and must not be applied a
+		// second time to the outer one. The head-branch boundary consumed them
+		// inside planSelect(s) above; the InnerSegmentCount boundary does so
+		// just below. Tracking this in a local instead of blanking the AST
+		// fields keeps s replannable — the plan cache may hand the same
+		// SelectStmt back for a second Plan(). M0125-0017.
+		sortLimitConsumed := headSortLimit
 		if innerBoundary > 0 && innerBoundary <= len(segments) {
 			if left, err = foldSetOpRange(left, 0, innerBoundary); err != nil {
 				return nil, err
@@ -965,24 +991,20 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, werr
 			}
 			left = inner
-			// Clear the saved ORDER BY/LIMIT/OFFSET so wrapSetOpSortLimit
-			// below doesn't apply them again to the outer result.
-			savedOrderBy = nil
-			savedLimit = nil
-			savedOffset = nil
-			s.OrderBy = nil
-			s.Limit = nil
-			s.Offset = nil
+			sortLimitConsumed = true
 			if left, err = foldSetOpRange(left, innerBoundary, len(segments)); err != nil {
 				return nil, err
 			}
 		} else if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
 			return nil, err
 		}
-		// Restore final ORDER BY / LIMIT / OFFSET (may be nil if cleared above).
+		// Restore final ORDER BY / LIMIT / OFFSET.
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
 		s.Offset = savedOffset
+		if sortLimitConsumed {
+			return left, nil
+		}
 		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses

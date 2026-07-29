@@ -1344,7 +1344,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       this defect at all — Q8/Q14/Q38 are its only INTERSECT users and every chain
       is homogeneous, hence associative. **A quiet-host loop should still run the
       full gate once**, for the same reason M0124-0002 is waiting on one.
-- [ ] **M0125-0017 — `ORDER BY`/`LIMIT` inside a parenthesised FIRST branch is
+- [x] **M0125-0017 — `ORDER BY`/`LIMIT` inside a parenthesised FIRST branch is
       hoisted to the whole set-op result, silently dropping branches** (discovered
       by M0125-0006 2026-07-29, ledger row 2026-07-29). `(A ORDER BY 1 LIMIT 2)
       UNION ALL (C)` returns `{1,2}` where PG returns `{1,2,9}` — the entire
@@ -1359,6 +1359,23 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       the natural carrier; consume it at `planner.go`'s `innerBoundary`.
       **Accept by VALUE** ({ORDER BY only, LIMIT only, both} x {parenthesised
       right branch, bare right branch}). Parser/planner change -> full pre-commit bar.
+      **DONE 2026-07-29** — design doc
+      `docs/design/0125-0017-setop-head-branch-sort-limit.md`. Fix =
+      `SelectStmt.InnerSortLimit`, one bit that makes `InnerSegmentCount`'s 0
+      mean "boundary after the FIRST branch" instead of "unset"; the planner
+      consumes it by NOT clearing the sort/limit before planning the head
+      branch, so `planSelect` applies them below the `SetOp` (which also lets a
+      leaf branch sort by a non-output expression, as PG does). No fold change
+      needed — a precedence barrier at segment 0 is vacuous. Also fixed a
+      latent plan-cache hazard in the same lines: the `InnerSegmentCount` path
+      blanked `s.OrderBy`/`Limit`/`Offset` without restoring them, so a second
+      `Plan()` of the same AST produced an unlimited plan. 18 executor + 2
+      planner + 7 parser cases, **proved to fail 8 executor subtests and both
+      planner invariants at `19d844b4`**. TPC-DS cannot reach the defect (a
+      reflection walk over all 99 query files found zero `InnerSortLimit`
+      nodes). Two PG behaviours deferred with ledger rows (2026-07-29): an
+      outer ORDER BY colliding with the head boundary, and a trailing clause
+      after the `')'` discarding the inner one — see M0125-0020 below.
 - [ ] **M0125-0018 — IN-list and EXISTS reject a parenthesised set-op chain as an
       operand** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
       `x IN ((A) EXCEPT (B) EXCEPT (C))` raises `expected ')' to close IN list (got
@@ -1383,6 +1400,27 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       aggregate's ORDER BY inside the aggregate (`nodeAgg.c`, sort-then-transition).
       **Resume**: the aggregate operator in `internal/executor/`. **Accept by
       VALUE**; executor change -> full pre-commit bar.
+- [ ] **M0125-0020 — the set-op chain must become a TREE; three separate
+      annotations are now patching the missing structure** (discovered by
+      M0125-0017 2026-07-29, two ledger rows 2026-07-29). goopg stores a set-op
+      chain as a linked list (`SelectStmt.SetOp.Right`), so the head branch and
+      the whole compound are ONE node sharing ONE `OrderBy`/`Limit`/`Offset`
+      slot. Two PG behaviours are unreachable while that holds:
+      `(A ORDER BY 1 LIMIT 2) UNION ALL (C) ORDER BY 1 DESC` returns PG's rows
+      in an UNSPECIFIED order (PG: `9,2,1`), and
+      `((A ORDER BY 1 LIMIT 2) UNION ALL C) LIMIT 1` discards the inner
+      `LIMIT 2`. `ParenBranches` (M0125-0006), `InnerSegmentCount`
+      (M0097-0044) and `InnerSortLimit` (M0125-0017) are three annotations
+      around the same absent structure; a fourth should be read as the signal
+      to convert. PG needs none of them: `select_with_parens` is a leaf operand
+      in `gram.y`, so `transformSetOperationStmt`
+      (postgres/src/backend/parser/analyze.c) always receives a proper tree.
+      **Resume**: give each parenthesised branch its own `SelectStmt` in
+      `parseParenthesisedSelectStmt`, then retire the three annotations and the
+      `parenBoundary`/`cutAt` machinery in `internal/planner/planner.go`.
+      **Accept by VALUE** (the two shapes above plus the whole existing
+      M0125-0006/-0016/-0017 matrices as non-regression). Large
+      parser+planner change -> full pre-commit bar.
 - [ ] **M0125-0007 — date input rejects unpadded month/day, and the comparison
       path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
       2026-07-28). PG's `DecodeDate`/`ParseDateTime`

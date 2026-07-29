@@ -1024,6 +1024,14 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			// The parentheses covered a single branch; this operator was
 			// written after the ')'. M0125-0006.
 			innerSel.ParenBranches = 1
+			// Anything in the ORDER BY / LIMIT / OFFSET slots right now was
+			// parsed BEFORE that ')' (the lift-from-right and trailing-clause
+			// blocks below have not run yet), so it belongs to the single
+			// parenthesised branch — zero set-op segments, which
+			// InnerSegmentCount cannot express. M0125-0017.
+			if innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil {
+				innerSel.InnerSortLimit = true
+			}
 		} else {
 			// Walk to the rightmost SelectStmt and attach there.
 			// Count inner segments while walking — used below to record
@@ -1046,13 +1054,29 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			// Example: (((A INTERSECT B ORDER BY 1))) UNION ALL C
 			//   innerSegCount=1 (INTERSECT), ORDER BY is on innerSel.
 			// M0097-0044.
-			if innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil {
+			//
+			// InnerSortLimit already being set means a NESTED paren level
+			// claimed these clauses for a boundary further left — e.g.
+			// `((A ORDER BY 1 LIMIT 2) UNION ALL C) EXCEPT D`, where the inner
+			// level recorded the head branch. This level's ')' encloses that
+			// boundary but must not widen it. M0125-0017.
+			if !innerSel.InnerSortLimit &&
+				(innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil) {
 				innerSel.InnerSegmentCount = innerSegCount
+				innerSel.InnerSortLimit = true
 			}
 		}
 		// Lift ORDER BY/LIMIT/OFFSET from right branch up to outermost level
 		// (mirrors what parseSelect does for non-parenthesised set ops).
-		if right := setOp.Right; right != nil {
+		//
+		// Not when InnerSortLimit is set: those slots are already spoken for by
+		// an inner boundary, and overwriting them would move the head branch's
+		// own sort/limit onto the wrong operand. Leaving the clauses on the
+		// right branch is exactly right when that branch is parenthesised
+		// (`(A LIMIT 2) UNION ALL (C ORDER BY 1 LIMIT 1)` — PG keeps each
+		// branch's own limit); for a BARE right branch the outer sort is lost
+		// as an ordering, which the deferral ledger records. M0125-0017.
+		if right := setOp.Right; right != nil && !innerSel.InnerSortLimit {
 			if innerSel.OrderBy == nil && right.OrderBy != nil {
 				innerSel.OrderBy = right.OrderBy
 				right.OrderBy = nil
@@ -1068,6 +1092,13 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 		}
 	}
 	// Optional ORDER BY / LIMIT / OFFSET after the parenthesised compound.
+	// A clause written HERE belongs to the whole chain, so it collides with an
+	// inner boundary that already claimed the same slot. The linked-list AST
+	// has exactly one such slot, so the two cannot coexist: give the slot to
+	// the outer clause (the pre-M0125-0017 behaviour) rather than silently
+	// applying the outer text to an inner operand. Recorded in the deferral
+	// ledger. M0125-0017.
+	trailingSortLimit := false
 	if p.acceptKeyword(KwOrder) {
 		if !p.acceptKeyword(KwBy) {
 			return nil, p.errAtCur("expected BY after ORDER")
@@ -1077,6 +1108,7 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			return nil, err
 		}
 		innerSel.OrderBy = ob
+		trailingSortLimit = true
 	}
 	if p.acceptKeyword(KwLimit) {
 		e, err := p.parseExpr()
@@ -1084,6 +1116,7 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			return nil, err
 		}
 		innerSel.Limit = e
+		trailingSortLimit = true
 	}
 	if p.acceptKeyword(KwOffset) {
 		e, err := p.parseExpr()
@@ -1091,6 +1124,13 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			return nil, err
 		}
 		innerSel.Offset = e
+		trailingSortLimit = true
+	}
+	// Only the single-branch boundary is surrendered: M0097-0044's
+	// InnerSegmentCount>0 boundary predates this and keeps its behaviour
+	// byte-for-byte. M0125-0017.
+	if trailingSortLimit && innerSel.InnerSegmentCount == 0 {
+		innerSel.InnerSortLimit = false
 	}
 	return innerSel, nil
 }

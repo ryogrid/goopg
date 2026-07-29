@@ -896,6 +896,22 @@ type SelectStmt struct {
 	// -> InnerSegmentCount=1 means ORDER BY 1 sorts the INTERSECT result,
 	//    not the final UNION ALL output. M0097-0044.
 	InnerSegmentCount int
+	// InnerSortLimit is true when the ORDER BY / LIMIT / OFFSET currently
+	// held on this node were written INSIDE the parentheses, and therefore
+	// apply to the first InnerSegmentCount segments rather than to the whole
+	// chain. It exists because InnerSegmentCount's zero value doubles as its
+	// "unset" sentinel and so cannot express the commonest boundary of all:
+	//
+	//	(A ORDER BY 1 LIMIT 2) UNION ALL C
+	//
+	// where the parentheses cover a SINGLE branch, i.e. ZERO set-op segments.
+	// Without this flag the planner read InnerSegmentCount==0 as "no boundary"
+	// and applied the head branch's LIMIT to the union, silently dropping the
+	// whole UNION ALL branch. PostgreSQL needs no equivalent: `select_no_parens`
+	// carries opt_sort_clause/opt_select_limit and `select_with_parens` is a
+	// leaf operand (postgres/src/backend/parser/gram.y), so an inner sort/limit
+	// simply lives on the branch's own node. M0125-0017.
+	InnerSortLimit bool
 	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
 	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
 	// every pre-M0021 SELECT — preserves byte-for-byte

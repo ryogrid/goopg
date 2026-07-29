@@ -188,3 +188,79 @@ func TestParenthesizedFlagUnaffectedForInsertSource(t *testing.T) {
 		t.Errorf("ParenBranches=%d, want 0", ins.Select.ParenBranches)
 	}
 }
+
+// TestInnerSortLimitMarksTheOwningBoundary pins the carrier M0125-0017 added.
+//
+// InnerSegmentCount alone could not say "the parentheses closed after the FIRST
+// branch", because 0 is its unset sentinel. InnerSortLimit supplies the missing
+// bit: it is true exactly when the ORDER BY / LIMIT / OFFSET on the head node
+// were written inside the parentheses, and InnerSegmentCount then says how many
+// set-op segments they cover — possibly zero.
+func TestInnerSortLimitMarksTheOwningBoundary(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantFlag  bool
+		wantCount int
+		why       string
+	}{
+		{
+			sql:       "(SELECT x FROM a ORDER BY 1 LIMIT 2) UNION ALL SELECT x FROM h",
+			wantFlag:  true,
+			wantCount: 0,
+			why:       "single parenthesised head branch: boundary at segment 0",
+		},
+		{
+			sql:       "(SELECT x FROM a LIMIT 2) UNION ALL SELECT x FROM h",
+			wantFlag:  true,
+			wantCount: 0,
+			why:       "LIMIT alone is enough to own the boundary",
+		},
+		{
+			sql:       "((SELECT x FROM a ORDER BY 1 LIMIT 2)) UNION ALL SELECT x FROM h",
+			wantFlag:  true,
+			wantCount: 0,
+			why:       "redundant parentheses do not move the boundary",
+		},
+		{
+			sql:       "((SELECT x FROM a INTERSECT SELECT x FROM g ORDER BY 1)) UNION ALL SELECT x FROM h",
+			wantFlag:  true,
+			wantCount: 1,
+			why:       "M0097-0044's shape: the parens covered one INTERSECT segment",
+		},
+		{
+			sql:       "((SELECT x FROM a ORDER BY 1 LIMIT 2) UNION ALL SELECT x FROM h) EXCEPT SELECT x FROM g",
+			wantFlag:  true,
+			wantCount: 0,
+			why:       "an outer paren level must not widen a boundary an inner level claimed",
+		},
+		{
+			sql:       "(SELECT x FROM a) UNION ALL (SELECT x FROM h) ORDER BY 1 LIMIT 2",
+			wantFlag:  false,
+			wantCount: 0,
+			why:       "written after the ')': belongs to the whole chain",
+		},
+		{
+			sql:       "((SELECT x FROM a ORDER BY 1 LIMIT 2) UNION ALL SELECT x FROM h) LIMIT 1",
+			wantFlag:  false,
+			wantCount: 0,
+			why:       "trailing clause collides with the head's slot; the outer clause wins",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.why, func(t *testing.T) {
+			stmts, err := Parse(c.sql)
+			if err != nil {
+				t.Fatalf("%s: %v", c.sql, err)
+			}
+			sel, ok := stmts[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("got %T, want *SelectStmt", stmts[0])
+			}
+			if sel.InnerSortLimit != c.wantFlag || sel.InnerSegmentCount != c.wantCount {
+				t.Errorf("%s\n  got  InnerSortLimit=%v InnerSegmentCount=%d\n  want %v / %d (%s)",
+					c.sql, sel.InnerSortLimit, sel.InnerSegmentCount,
+					c.wantFlag, c.wantCount, c.why)
+			}
+		})
+	}
+}

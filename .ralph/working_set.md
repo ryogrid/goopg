@@ -1,33 +1,36 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0016 COMPLETE**, committed + pushed as `9e75cfaa`.
+Last loop: **M0125-0017 COMPLETE** (committed + pushed; see git log).
 Nightly triage done: `ci/logs/action-items.md` unchanged since 2026-07-25
-(mtime Jul 25 03:20), all items already filed — filing was a no-op.
+(mtime Jul 25 03:20) — filing was a no-op again.
 
-## Why M0125-0016 and not M0124 / M0125-0002..-0005 (do not re-derive)
+## NEXT: `M0125-0018` (parser-only, cheapest remaining accepted-by-value item)
 
-Same blockers as the previous loop, re-verified:
+`x IN ((A) EXCEPT (B))` and `EXISTS ((A) EXCEPT (B))` both raise a syntax
+error; PG accepts (`a_expr IN_P select_with_parens`, `EXISTS
+select_with_parens`). Resume point is already in fix_plan: both operand parsers
+assume the token after `(` is the SELECT keyword, so route them through
+`parseParenthesisedSelectStmt` the way the scalar-subquery path
+(`internal/parser/select.go:2862`) already does. Derived-table / CTE / scalar
+contexts already work and are pinned by M0125-0006's tests.
+
+After that: `M0125-0019` (executor, `string_agg(… ORDER BY …)` ignored) and the
+newly filed **`M0125-0020`** (convert the set-op chain from a linked list to a
+tree — retires `ParenBranches` + `InnerSegmentCount` + `InnerSortLimit`).
+
+## Why not M0124 / M0125-0002..-0005 (do not re-derive — 3rd loop unchanged)
+
 - `M0124-0002` / `M0124-0004` need a QUIET host. **The nightly wedge is STILL
-  there** (below), so both stay unselectable.
-- `M0125-0004`, `-0002`, `-0005` diff against
-  `plan_snapshots/tpcds-round2-head.txt`, which is M0124-0002's deliverable and
-  **does not exist**. `M0125-0003` needs a four-arm TIMED study → host blocker.
-- `M0125-0016` was the topmost item accepted **by value**, so host contention
-  cannot void it.
+  there** (below) → unselectable.
+- `M0125-0004`, `-0002`, `-0005` diff against `plan_snapshots/
+  tpcds-round2-head.txt`, which is M0124-0002's deliverable and does not exist.
+  `M0125-0003` needs a four-arm TIMED study → host blocker.
 
-**NEXT: `M0125-0017`** (topmost unchecked, accepted by value, parser+planner
-only — no host needed). Its resume point is already written in fix_plan:
-M0125-0006's `ParenBranches` is exactly 1 for the broken single-branch case and
-is the natural carrier; consume it at `planner.go`'s `innerBoundary`. Note that
-`innerBoundary` is now ALSO a precedence barrier (M0125-0016) — any change there
-must keep both roles. `M0125-0018` (parser-only) is the cheaper alternative.
-
-## ⚠ STILL BLOCKED ON THE USER — the nightly wedge is UNCHANGED
+## ⚠ STILL BLOCKED ON THE USER — the nightly wedge is UNCHANGED (now ~13h47m)
 
 Run `20260729-002344` wedged since ~02:07; `goopg-bench-bin` PID **2621153**
-still resident (7.5 GB RSS, now ~13 h elapsed). `kill` of non-owned PIDs is
-hard-denied by the classifier, so I cannot clear it. Until it is gone,
-**M0124-0002 must not be selected**.
+still resident (7.5 GB RSS). `kill` of non-owned PIDs is hard-denied by the
+classifier, so I cannot clear it.
 
 ```
 kill -TERM 2511542    # run-nightly.sh   — stops before stage-tpcds
@@ -37,40 +40,30 @@ kill -QUIT 2621153    # goopg server     — QUIT, not KILL: untrapped, so it
 ```
 Re-check with `pgrep -af ci/batch`.
 
-## Debt this loop deliberately left
-
-**The full 99-query SF0.5 gate was NOT run for M0125-0016.** Its guard refuses
-under the live nightly (`FORCE=1` would be legitimate — this gate is accepted by
-row count/checksum, never timing — but the sweep's ~21 GB Q5 peak does not fit
-beside the wedged 7.5 GB nightly server in an 18 GB budget). Ran the set-op
-subset instead: `FORCE=1 QUERIES="8 14 23 38 49 87" scripts/tpcds-sf05-regression.sh sweep`
-→ Q23/Q38/Q49/Q87 checksums **byte-identical** to HEAD sweep
-`sweep-20260729-123114.txt`; Q8 ERROR + Q14 TIMEOUT pre-existing, unchanged.
-A quiet-host loop should run the full gate once (same wait as M0124-0002).
-
 ## Facts the next loop should NOT re-derive
 
-- **`QUERIES="…" scripts/tpcds-sf05-regression.sh sweep` is a SUBSET PROBE mode**
-  — cheap, and the report labels itself as not-a-gate-result. Needs `FORCE=1`
-  while the nightly runs.
-- **TPC-DS cannot reach a set-op precedence bug**: Q8/Q14/Q38 are the only
-  queries containing INTERSECT and every chain is homogeneous (hence
-  associative). Q8's INTERSECT is at query8.sql:91.
-- `planner.go` is **already gofmt-dirty at HEAD** (go1.26 local vs go1.25
-  baseline); its hunks are at lines 2317–5649. Never `gofmt -w` it — check only
-  that your own region is clean.
-- **Never `pkill -f`** — it self-matches and kills the invoking shell (exit 144).
-- A `cd` inside a compound Bash command PERSISTS to later calls; use
-  `go test -C <dir>` for worktree runs instead.
-- The "prove the gate fails first" recipe that worked twice now:
-  `git worktree add /tmp/<x> HEAD --detach`, copy the new test file in,
-  `go test -C /tmp/<x> -run <Test> ./internal/executor/`, then
-  `git worktree remove --force`.
+- **The full 99-query SF0.5 gate is now 2 loops of debt.** Same reason both
+  times: the sweep's ~21 GB Q5 peak does not fit beside the wedged 7.5 GB
+  nightly server. A quiet-host loop should run it once (same wait as M0124-0002).
+- `QUERIES="…" scripts/tpcds-sf05-regression.sh sweep` is a **subset probe**;
+  needs `FORCE=1` while the nightly runs. Q23/Q38/Q49/Q87 are the usable set-op
+  queries (Q8 ERROR + Q14 TIMEOUT are pre-existing — skip them, Q14 burns 300 s).
+- **To decide whether a parser/planner change can reach TPC-DS at all**, drop a
+  `main.go` under `internal/parser/<tmpdir>/` (internal-package import rules
+  forbid `/tmp`) that parses all 99 query files and reflection-walks every
+  `SelectStmt`. M0125-0017 got a definitive "zero hits" in ~1 min this way.
+  query36/70/86 fail to parse for unrelated pre-existing reasons.
+- PG oracle for hand-written SQL: port **65438**, role **`ryo`** (NOT `postgres`
+  — that role does not exist), `psql -X -q -t -A` + temp tables.
+- `internal/parser/{ast,select}.go` and `planner.go` are **already gofmt-dirty at
+  HEAD** (go1.26 local vs go1.25 baseline): ast.go 8 hunks, select.go 1,
+  planner.go 5. Never `gofmt -w`; just confirm your own region is absent.
+- **Never `pkill -f`** — self-matches, kills the invoking shell (exit 144).
+- A `cd` inside a compound Bash command PERSISTS; use `go test -C <dir>`.
 
 Gates run: units PASS; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); SF0.5 set-op
-subset PASS (4 checksum-identical, 2 pre-existing failures unchanged); 17 new
-by-value tests PASS and **proved to FAIL at `70e1ca61`** (8 subtests, all
-controls + the whole barrier suite passing there); M0125-0006's matrix
-unchanged; gofmt clean on my hunks; pgbench smoke PASS via hook
-(653 / 689 / 13843 tps).
+subset PASS (4/4 checksum-verified, byte-identical to `sweep-20260729-123114`);
+27 new by-value/structural tests PASS and **proved to FAIL at `19d844b4`**
+(8 executor subtests + both planner invariants; all controls green there);
+gofmt clean on my hunks; pgbench smoke PASS via hook.
 In-flight: none.
