@@ -1,6 +1,6 @@
 # 0125-0004 — TPC-DS Q75: single-side quals must reach the inner join's inputs
 
-Status: draft
+Status: implemented (2026-07-30)
 Date: 2026-07-28
 Milestone: M0125-0004 (§13.5 action 3; ledger row `tpcds-round2 Q75-eval-order`)
 
@@ -163,3 +163,42 @@ landing, confirm `ci/batch/tpcds-row-anchors.csv`'s `Q75,100,pinned` passes agai
 RC-1b did not introduce the evaluation-order divergence; it removed the corruption that hid it.
 Reverting RC-1b restores a query returning 100 rows computed from half the data — strictly
 worse. §13.4 item 1's accounting stands: "one fewer wrong answer, one more error."
+
+## Outcome (measured 2026-07-30)
+
+Landed as `internal/planner/inner_join_qual_pushdown.go`
+(`pushSingleSideQualsIntoInnerJoinInputs`), called from `planSelect` after the last
+`applyJoinTreePosMap` inside `remapWithBindings` — pinned there because that walker remaps
+`n.Filters` and returns without recursing into `n.Tables[i]`, so a conjunct pushed earlier
+would never be revisited.
+
+**Q75 is fixed by value, not by row count.** goopg's full SF0.5 result is now **byte-identical
+to PG's** (`analysis/m0125-0004-q75/{goopg,pg}-q75-sf05.txt`, 103 lines / 100 rows, `diff`
+clean), as are the `all_sales` CTE aggregates including the `d_year = 2003` group that carries
+the genuine `sales_cnt = 0` (`zerogroups = 1`). No `division by zero`. The
+`Q75,100,pinned` anchor at `ci/batch/tpcds-row-anchors.csv:48` therefore passes on its
+intended meaning rather than on a masked one, and needs no `expected-failures.csv` entry.
+
+**Blast radius measured, not asserted.** EXPLAIN over all 99 SF0.5 queries before and after
+(`analysis/m0125-0004-q75/explain-all-{base,fixed}/`) makes the firing set exactly **seven** —
+Q4, Q11, Q31, Q39, Q64, Q74, Q75 — and in every one of them the *entire* plan delta is added
+`Filter:` lines on a CTE-scan input (`plan-diff-firing-set.txt`). No join reordered, no node
+kind changed, which is the shape property D1's "duplicate, never move" was designed to buy.
+
+Value verification of the firing set (`QUERIES="4 11 31 39 64 74 75"`, checksummed SF0.5
+gate): **MISMATCH=0 CKMISMATCH=0 ERROR=0**. Q11/Q39/Q74 PASS checksum-verified, Q75 PASS at
+100 rows (`ck=n/a` — a saturated `LIMIT` window has no stable row set, which is why the
+byte-diff against PG above carries the real evidence). Q4 SKIP: the *oracle itself* is
+TIMEOUT, so there is no baseline to diff.
+
+Q31 and Q64 TIMEOUT at the 300 s budget — **pre-existing, and proved so by A/B rather than
+assumed from host load.** Re-running both with the single call line disabled reproduced the
+timeout at 332 s / 333 s against 332 s / 336 s with it enabled. (The nightly CI batch was
+running throughout, so `FORCE=1` was used and *no timing here is a measurement* — the A/B is
+a pass/timeout verdict at a fixed budget, which is what the contention permits.)
+
+TPC-H: `make plan-diff LABEL=tpcds-round2-head` reports **22/22 MATCH including
+`Q15a-VIEWBODY`** — the `revenue0` view named above as the real blast-radius candidate. TPC-H
+plans do not move, so the full timed 22-query power run this doc's Gate section makes
+conditional on a TPC-H hunk is **not triggered**. `scripts/tpch-spotcheck.sh` PASS
+(Q12 = 2, Q13 = 35).

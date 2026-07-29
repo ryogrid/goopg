@@ -1,0 +1,11 @@
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Limit  (cost=0.00..0.00 rows=100 width=0)
+     ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(3 rows)
+
+ c_last_name | c_first_name | sales 
+-------------+--------------+-------
+(0 rows)
+

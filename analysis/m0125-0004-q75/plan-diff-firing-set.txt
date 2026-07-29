@@ -1,0 +1,31 @@
+===== Q4 =====
+>              Filter: ((sale_type = 'w') AND (dyear = 2000))
+< (21 rows)
+> (22 rows)
+===== Q11 =====
+>              Filter: ((sale_type = 'w') AND (dyear = 1999))
+< (15 rows)
+> (16 rows)
+===== Q31 =====
+>            Filter: ((d_qoy = 3) AND (d_year = 1999))
+< (44 rows)
+> (45 rows)
+===== Q39 =====
+>            Filter: (d_moy = 1)
+>            Filter: (d_moy = 2)
+< (26 rows)
+> (28 rows)
+===== Q64 =====
+>            Filter: (syear = 1999)
+>            Filter: (syear = 2000)
+< (124 rows)
+> (126 rows)
+===== Q74 =====
+>              Filter: ((sale_type = 'w') AND (year = 2000))
+< (15 rows)
+> (16 rows)
+===== Q75 =====
+>              Filter: (d_year = 2002)
+>              Filter: (d_year = 2001)
+< (11 rows)
+> (13 rows)

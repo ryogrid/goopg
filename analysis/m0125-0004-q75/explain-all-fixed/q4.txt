@@ -1,0 +1,26 @@
+                                                                                                                                                                           QUERY PLAN                                                                                                                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: customer_id, customer_first_name, customer_last_name, customer_birth_country
+     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (((((((((((((((sale_type = 's') AND (sale_type = 'c')) AND (sale_type = 'w')) AND (sale_type = 's')) AND (sale_type = 'c')) AND (sale_type = 'w')) AND (dyear = 1999)) AND (dyear = 2000)) AND (dyear = 1999)) AND (dyear = 2000)) AND (dyear = 1999)) AND (dyear = 2000)) AND (year_total > 0)) AND (year_total > 0)) AND (year_total > 0))
+       ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+               ->  CTE Scan on year_total t_s_firstyear  (cost=0.00..0.00 rows=1 width=0)
+                 ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+               ->  CTE Scan on year_total t_s_secyear  (cost=0.00..0.00 rows=1 width=0)
+                 ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+             ->  CTE Scan on year_total t_c_firstyear  (cost=0.00..0.00 rows=1 width=0)
+               ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+           ->  CTE Scan on year_total t_c_secyear  (cost=0.00..0.00 rows=1 width=0)
+             ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+         ->  CTE Scan on year_total t_w_firstyear  (cost=0.00..0.00 rows=1 width=0)
+           ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+       ->  CTE Scan on year_total t_w_secyear  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((sale_type = 'w') AND (dyear = 2000))
+         ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(22 rows)
+

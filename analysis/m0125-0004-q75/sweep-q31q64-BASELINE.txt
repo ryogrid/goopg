@@ -1,0 +1,7 @@
+[05:35:25] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260730-053525.txt
+Q31  TIMEOUT   332s (oracle 19 rows)
+      (restarting goopg to drop accumulated heap)
+Q64  TIMEOUT   333s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+scripts/tpcds-sf05-regression.sh: line 245: 3777512 Killed                  GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" "${GOOPG_BIN}" start -D "${SF05_GOOPG_DATA}" --listen "127.0.0.1:${SF05_PORT}" "${hba_arg[@]}" >> "${SF05_LOG}" 2>&1
+FATAL: goopg (sf05) did not become ready in 180s — see /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/goopg.sf05.log

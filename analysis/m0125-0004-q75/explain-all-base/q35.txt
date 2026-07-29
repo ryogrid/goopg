@@ -1,0 +1,33 @@
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+     ->  HashAggregate (6 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+             Workers Planned: 3
+         ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (EXISTS(SubPlan 1) AND (EXISTS(SubPlan 2) OR EXISTS(SubPlan 3)))
+               SubPlan 1
+                 ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                       Filter: ((($0 = ss_customer_sk) AND (d_year = 1999)) AND (d_qoy < 4))
+                   ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+                   ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                         Index Cond: (d_date_sk = ss_sold_date_sk)
+               SubPlan 2
+                 ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                       Filter: ((($1 = ws_bill_customer_sk) AND (d_year = 1999)) AND (d_qoy < 4))
+                   ->  Seq Scan on public.web_sales  (cost=0.00..0.00 rows=1 width=0)
+                   ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                         Index Cond: (d_date_sk = ws_sold_date_sk)
+               SubPlan 3
+                 ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                       Filter: ((($2 = cs_ship_customer_sk) AND (d_year = 1999)) AND (d_qoy < 4))
+                   ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=1 width=0)
+                   ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                         Index Cond: (d_date_sk = cs_sold_date_sk)
+           ->  Seq Scan on public.customer_address ca  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.customer_demographics  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.customer c  (cost=0.00..0.00 rows=1 width=0)
+(29 rows)
+

@@ -1142,6 +1142,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// where the remap did not run degrades to post-join evaluation
 	// (slower, never wrong). Design: docs/design/tpcds-round2-fixes §3.4.
 	pushSingleSourceFiltersAfterRemap(node)
+	// M0125-0004 (TPC-DS Q75): the binary-join sibling of the pass
+	// above. Copy a residual conjunct that references exactly one input
+	// of an INNER Join onto that input, so a single-relation restriction
+	// is applied before the side-mixed residual runs — PG's
+	// distribute_restrictinfo_to_rels placement. Pinned HERE, after the
+	// last applyJoinTreePosMap (inside remapWithBindings): that walker
+	// remaps n.Filters and returns without recursing into n.Tables[i],
+	// so a conjunct pushed before it would never be revisited.
+	// Design: docs/design/0125-0004-q75-join-residual-evaluation-order.md.
+	pushSingleSideQualsIntoInnerJoinInputs(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer

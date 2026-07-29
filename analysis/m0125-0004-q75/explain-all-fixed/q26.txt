@@ -1,0 +1,20 @@
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: i_item_id
+     ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((p_channel_email = 'N') OR (p_channel_event = 'N'))
+             Filter: ((((cd_gender = 'M') AND (cd_marital_status = 'W')) AND (cd_education_status = 'Unknown')) AND (d_year = 2002))
+         ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.item  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.promotion  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (d_date_sk = cs_sold_date_sk)
+         ->  Index Scan using public.customer_demographics_pkey on public.customer_demographics  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (cd_demo_sk = cs_bill_cdemo_sk)
+(16 rows)
+

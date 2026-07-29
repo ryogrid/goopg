@@ -1,0 +1,17 @@
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: (sales_cnt - sales_cnt), (sales_amt - sales_amt)
+     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: ((d_year = 2002) AND (d_year = 2001))
+       ->  CTE Scan on all_sales curr_yr  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (d_year = 2002)
+         ->  HashAggregate (5 keys)  (cost=0.00..0.00 rows=1 width=0)
+           ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+       ->  CTE Scan on all_sales prev_yr  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (d_year = 2001)
+         ->  HashAggregate (5 keys)  (cost=0.00..0.00 rows=1 width=0)
+           ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(13 rows)
+

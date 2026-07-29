@@ -1,0 +1,26 @@
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: item_sk, d_date
+     ->  WindowAgg (2 funcs)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (web_cumulative > store_cumulative)
+       ->  Merge Join (FULL)  (cost=0.00..0.00 rows=1 width=0)
+         ->  CTE Scan on web_v1 web  (cost=0.00..0.00 rows=1 width=0)
+           ->  WindowAgg (1 funcs)  (cost=0.00..0.00 rows=1 width=0)
+             ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+               ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                     Filter: (((d_month_seq >= 1212) AND (d_month_seq <= 1223)) AND (ws_item_sk IS NOT NULL))
+                 ->  Seq Scan on public.web_sales  (cost=0.00..0.00 rows=1 width=0)
+                 ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                       Index Cond: (d_date_sk = ws_sold_date_sk)
+         ->  CTE Scan on store_v1 store  (cost=0.00..0.00 rows=1 width=0)
+           ->  WindowAgg (1 funcs)  (cost=0.00..0.00 rows=1 width=0)
+             ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+               ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                     Filter: (((d_month_seq >= 1212) AND (d_month_seq <= 1223)) AND (ss_item_sk IS NOT NULL))
+                 ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+                 ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                       Index Cond: (d_date_sk = ss_sold_date_sk)
+(22 rows)
+

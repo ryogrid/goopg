@@ -1,0 +1,8 @@
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: qoh, i_product_name, i_brand, i_class, i_category
+     ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(4 rows)
+

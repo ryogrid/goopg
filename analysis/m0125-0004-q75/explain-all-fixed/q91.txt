@@ -1,0 +1,23 @@
+                                                                                                                                   QUERY PLAN                                                                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=1 width=0)
+   Sort Key: sum DESC
+   ->  HashAggregate (5 keys)  (cost=0.00..0.00 rows=1 width=0)
+     ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (((((d_year = 2000) AND (d_moy = 12)) AND (((cd_marital_status = 'M') AND (cd_education_status = 'Unknown')) OR ((cd_marital_status = 'W') AND (cd_education_status = 'Advanced Degree')))) AND (hd_buy_potential LIKE 'Unknown%')) AND (ca_gmt_offset = -7))
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+               ->  Seq Scan on public.customer_demographics  (cost=0.00..0.00 rows=1 width=0)
+               ->  Seq Scan on public.customer  (cost=0.00..0.00 rows=1 width=0)
+               ->  Seq Scan on public.household_demographics  (cost=0.00..0.00 rows=1 width=0)
+             ->  Index Scan using public.customer_address_pkey on public.customer_address  (cost=0.00..0.00 rows=1 width=0)
+                   Index Cond: (ca_address_sk = c_current_addr_sk)
+           ->  Seq Scan on public.catalog_returns  (cost=0.00..0.00 rows=1 width=0)
+         ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (d_date_sk = cr_returned_date_sk)
+       ->  Index Scan using public.call_center_pkey on public.call_center  (cost=0.00..0.00 rows=1 width=0)
+             Index Cond: (cc_call_center_sk = cr_call_center_sk)
+(19 rows)
+

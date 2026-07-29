@@ -1,0 +1,14 @@
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=1 width=0)
+   Sort Key: sum DESC, i_brand_id
+   ->  HashAggregate (4 keys)  (cost=0.00..0.00 rows=1 width=0)
+     ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (((sold_item_sk = i_item_sk) AND (i_manager_id = 1)) AND ((t_meal_time = 'breakfast') OR (t_meal_time = 'dinner')))
+       ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.item  (cost=0.00..0.00 rows=1 width=0)
+         ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+       ->  Index Scan using public.time_dim_pkey on public.time_dim  (cost=0.00..0.00 rows=1 width=0)
+             Index Cond: (t_time_sk = time_sk)
+(10 rows)
+

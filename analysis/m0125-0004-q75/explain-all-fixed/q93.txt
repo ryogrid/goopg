@@ -1,0 +1,17 @@
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: sum, ss_customer_sk
+     ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (r_reason_desc = 'reason 58')
+         ->  Nested Loop (LEFT)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (sr_item_sk = ss_item_sk)
+           ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.store_returns_pkey on public.store_returns  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (sr_item_sk = ss_item_sk AND sr_ticket_number = ss_ticket_number)
+         ->  Index Scan using public.reason_pkey on public.reason  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (r_reason_sk = sr_reason_sk)
+(13 rows)
+

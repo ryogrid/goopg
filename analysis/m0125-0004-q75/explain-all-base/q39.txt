@@ -1,0 +1,36 @@
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=1 width=0)
+   Sort Key: w_warehouse_sk, i_item_sk, d_moy, mean, cov, d_moy, mean, cov
+   ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         Filter: ((d_moy = 1) AND (d_moy = 2))
+     ->  CTE Scan on inv inv1  (cost=0.00..0.00 rows=1 width=0)
+       ->  HashAggregate (4 keys)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (CASE mean WHEN 0 THEN 0 ELSE (stdev / mean) END > 1)
+         ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (d_year = 2000)
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.warehouse  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.inventory  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.item_pkey on public.item  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (i_item_sk = inv_item_sk)
+     ->  CTE Scan on inv inv2  (cost=0.00..0.00 rows=1 width=0)
+       ->  HashAggregate (4 keys)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (CASE mean WHEN 0 THEN 0 ELSE (stdev / mean) END > 1)
+         ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (d_year = 2000)
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.warehouse  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.inventory  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.item_pkey on public.item  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (i_item_sk = inv_item_sk)
+(26 rows)
+
+ w_warehouse_sk | i_item_sk | d_moy |         mean         |        cov         | w_warehouse_sk | i_item_sk | d_moy |         mean         |        cov         
+----------------+-----------+-------+----------------------+--------------------+----------------+-----------+-------+----------------------+--------------------
+              2 |      3638 |     1 | 152.6666666666666667 | 1.6131943546920138 |              2 |      3638 |     2 | 366.3333333333333333 | 1.0911246097178881
+              4 |      4658 |     1 | 155.0000000000000000 | 1.5277931552006782 |              4 |      4658 |     2 | 468.7500000000000000 | 1.0543579601578148
+(2 rows)
+

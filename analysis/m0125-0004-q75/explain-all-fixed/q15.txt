@@ -1,0 +1,16 @@
+                                                                                                                    QUERY PLAN                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: ca_zip
+     ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+             Workers Planned: 1
+         ->  Multi-Way Hash Join (4 tables)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (((((substr(ca_zip, 1, 5) = ANY ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')) OR (ca_state = ANY ('CA', 'WA', 'GA'))) OR (cs_sales_price > 500)) AND (d_qoy = 2)) AND (d_year = 2001))
+           ->  Seq Scan on public.customer_address  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.customer  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=1 width=0)
+(12 rows)
+

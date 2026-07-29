@@ -1,0 +1,19 @@
+                                                                                                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=1 width=0)
+   Sort Key: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag DESC, ss_ticket_number
+   ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         Filter: ((cnt >= 15) AND (cnt <= 20))
+     ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((((((((d_dom >= 1) AND (d_dom <= 3)) OR ((d_dom >= 25) AND (d_dom <= 28))) AND ((hd_buy_potential = '1001-5000') OR (hd_buy_potential = '0-500'))) AND (hd_vehicle_count > 0)) AND (CASE WHEN (hd_vehicle_count > 0) THEN (hd_dep_count / hd_vehicle_count) ELSE NULL END > 1.2)) AND (d_year = ANY (2000, 2001, 2002))) AND (s_county = ANY ('Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County')))
+         ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.household_demographics  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+         ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (d_date_sk = ss_sold_date_sk)
+     ->  Index Scan using public.customer_pkey on public.customer  (cost=0.00..0.00 rows=1 width=0)
+           Index Cond: (c_customer_sk = ss_customer_sk)
+(15 rows)
+

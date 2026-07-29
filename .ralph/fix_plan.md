@@ -1243,7 +1243,7 @@ LABEL=tpcds-round2-head`. Round-5's *absolute* seconds are not a valid baseline
 (the fix bundle moved the stream 1086 → 325 s with no plan changes) — M0124-0002
 arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
-- [ ] **M0125-0004 — Q75 join-residual evaluation order** (§13.5 #3). *First: it
+- [x] **M0125-0004 — Q75 join-residual evaluation order** (§13.5 #3). *First: it
       is a live CI break* — `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46`
       with no `expected-failures.csv` entry, so M-NIGHTLY preempts for it and that
       item IS this task. RC-1b made Q75's `all_sales` CTE exactly correct and
@@ -1268,6 +1268,23 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `Filter` is a plan change). Verify by **value**, not row count. Ledger
       `tpcds-round2 Q75-eval-order`. Design
       `docs/design/0125-0004-q75-join-residual-evaluation-order.md`.
+      **DONE 2026-07-30.** D1 landed as `internal/planner/inner_join_qual_pushdown.go`
+      (`pushSingleSideQualsIntoInnerJoinInputs`), called from `planSelect` after the
+      last `applyJoinTreePosMap`. **Q75's SF0.5 output is byte-identical to PG** (100
+      rows, `diff` clean — verified by VALUE as required, since `ck=n/a` under a
+      saturated `LIMIT`), so the `Q75,100,pinned` anchor now passes on its intended
+      meaning and needs no `expected-failures.csv` entry. Blast radius **measured**:
+      a 99-query EXPLAIN A/B makes the firing set exactly seven (Q4/Q11/Q31/Q39/Q64/
+      Q74/Q75) and the entire delta is added `Filter:` lines on CTE-scan inputs — no
+      join reordered, no node kind changed. SF0.5 value gate on those seven:
+      MISMATCH=0 CKMISMATCH=0 ERROR=0. **The Q15 concern is discharged by
+      measurement, not argument** — `make plan-diff` is 22/22 MATCH *including*
+      `Q15a-VIEWBODY`, so the conditional timed TPC-H power run is not triggered.
+      Q31/Q64 TIMEOUT and Q4's oracle is itself TIMEOUT, so three of the seven carry
+      no value verification; an A/B with the call line disabled reproduced Q31/Q64 at
+      332s/333s vs 332s/336s, clearing this change of causing them (ledger row,
+      2026-07-30 — re-run on a quiet host). D3 (cost-ordered residual conjuncts),
+      `*FuncCall` pushes, and base-relation-leaf scoping are deferred with rows.
 - [x] **M0125-0001 — `internal/planner/exprwalk.go` + exhaustiveness gate** (§13.5
       #4, phase 1.1). One `exprChildSlots` child-slot primitive over `plan.go`'s
       **32** concrete `Expr` types (the marker is unexported, so the set is
