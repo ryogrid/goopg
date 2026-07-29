@@ -1468,7 +1468,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `analysis/m0125-0010-acceptance/`; design = §9 of
       `docs/design/0125-0009-parser-expr-key-structural.md`; ledger row
       2026-07-29 records the undiagnosed leak the pass still guards.
-- [ ] **M0125-0011 — FULL OUTER JOIN drops all but the FIRST conjunct of its ON
+- [x] **M0125-0011 — FULL OUTER JOIN drops all but the FIRST conjunct of its ON
       condition** (discovered by M0125-0009's acceptance run, 2026-07-29, ledger
       row 2026-07-29). Isolated on the SF=1 clusters from TPC-DS **Q97**, whose
       residual divergence survived the M0125-0009 fix. Probe matrix (goopg 65436
@@ -1503,6 +1503,253 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Design `docs/design/0125-0011-full-outer-join-on-conjunct-drop.md`.
       Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
       gate, `make plan-diff`).
+      **DONE 2026-07-29.** Cause was NOT in the planner: `splitEqualityForHash`
+      correctly returns *a* key and leaves the whole ON clause in
+      `Join.Predicate`; the executor's `runMergeJoin` then **never read
+      `Join.Predicate` at all**, so every conjunct after the first was dropped.
+      Fourth instance of Hard-won Rule #2 — nested-loop, lateral and hash all
+      call `joinPredicateMatch`, only the merge twin omitted it (which is why
+      the INNER probe was already right). The bug was **wider than filed**:
+      RIGHT OUTER JOIN is routed to `JoinAlgoMerge` too and was wrong the same
+      way. It also *lost* rows, not just invented them — the `cmp<0`/`cmp>0`
+      arms only null-extend rows whose KEY found no partner, so a row whose key
+      matched but whose residual failed could not be emitted at all. Fix
+      mirrors `nodeMergejoin.c` (`EXEC_MJ_JOINTUPLES` → `ExecQual(joinqual)`,
+      then `MJ_FILL_OUTER`/`MJ_FILL_INNER`). Accepted by value: the four-row
+      probe matrix above now matches PG on **all** rows (two-key FOJ `836302`,
+      was `2131274`) and Q97 = `541140|286927|161`. Gates: 24-cell PG
+      differential (4 join types × 6 ON shapes incl. NULL keys and
+      non-equality residuals, 24/24 match); new
+      `TestExecMergeJoinAppliesResidualConjuncts` (fails 5/5 subtests pre-fix);
+      units suite; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); full SF0.5 sweep;
+      `make plan-diff`.
+      **⚠ Measured negative result — the anchor prediction above is WRONG.**
+      "The SF0.5 gate and the nightly anchors can see it" does **not** hold:
+      Q97 was swept with *and* without the fix and PASSED both times on the
+      identical checksum `65725195ebe13a3b`, because the half-sampled facts
+      yield no `(customer_sk, item_sk)` group whose second conjunct
+      discriminates. **SF0.5 is a regression gate, not a detection gate, for
+      join-residual defects** — a green sweep is not evidence that a residual
+      is applied. No Q97 anchor re-pinning is needed (SF0.5 was already right).
+      Filed as a ledger row (2026-07-29) together with the real remaining gap:
+      `Join` still carries ONE key pair against PG's mergeclause **list**, so
+      multi-key merge joins are now correct but less selective than PG.
+
+> **Scope note (2026-07-29).** The four tasks below (**M0125-0012 … -0015**) adopt
+> the last four TPC-DS defects that had **no owning task** — they existed only as
+> deferral-ledger rows, which M0119 consumes as a *backlog*, not as a schedule.
+> `docs/milestones/0125-*.md` previously listed Q47/Q49/Q51 under **Out of scope**
+> with "all get a ledger row from M0124-0003 so they are not orphaned"; that was
+> written before M0124-0001 measured the full SF=1 board and before the ledger
+> row `tpcds-round2 q47-q49-q51` established they are **three distinct defects**
+> ("All three are separate fix_plan items, **not one**"). The milestone doc is
+> updated in the same commit. Q8 was never in that out-of-scope list — it simply
+> had no task at all, despite being the sole unresolved member of round 1's
+> nine-error set.
+>
+> **Gate visibility, measured — not assumed.** An earlier draft of this note
+> claimed all four are visible to "the SF0.5 gate and the nightly anchors". Only
+> half of that is true, and the same commit that filed these tasks records
+> M0125-0011's measured negative result that a row-count change is *not*
+> automatically detectable. Checked against
+> `bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260729-093056.txt` (HEAD)
+> and `ci/batch/tpcds-row-anchors.csv`:
+>
+> | | SF0.5 gate at HEAD | nightly anchors |
+> |---|---|---|
+> | Q8 | **sees it** — `ERROR 12s` | **absent** |
+> | Q47 | **sees it** — `MISMATCH 43s goopg=0 oracle=100` | **absent** |
+> | Q49 | **PASS 25 rows, ck matches** — blind | **absent** |
+> | Q51 | **PASS 100 rows**, `ck=n/a` — blind | **absent** |
+>
+> The anchor CSV pins 61 queries and contains **none of these four** (it does
+> contain `Q75`, which is why that one is a live CI break and these are not).
+> Closing any of them therefore requires **adding** an anchor, not re-pinning one.
+>
+> **Q49 and Q51 flipped MISMATCH → PASS at SF0.5 when M0125-0009 landed**
+> (`sweep-20260729-004730` at `7a7a2639` vs `sweep-20260729-033758` at
+> `3fbce36a`); no completion note or ledger row records that. **Neither has been
+> re-measured at SF=1 since**, so the first step of both tasks is a measurement,
+> not a fix — see -0014 / -0015.
+>
+> None of the four depends on M0124-0005's checksum column for *acceptance*
+> (each differs in rows or errors), but Q47 and Q51 carry `ck=n/a` in the SF0.5
+> oracle (a `LIMIT` over a non-total `ORDER BY`), so SF0.5 cannot value-accept
+> them either — value acceptance is SF=1 only. All four are planner/executor
+> changes, so `make plan-diff` applies with M0125-0004's `r5-default` fallback
+> until M0124-0002 lands the `tpcds-round2-head` label.
+>
+> **File order is NOT work order.** The recommended sequence is in the
+> milestone's "Interleaving rule": **-0014 / -0015 (measure first, may close
+> outright) → -0013 → -0006 / -0007 → -0012 → -0008**. In particular
+> **M0125-0012 has a soft dependency on M0125-0001** — if the driver has not
+> landed, take another item rather than hand-rolling a fifth walker.
+
+- [ ] **M0125-0012 — Q8: a `ColumnRef` below a FROM-subquery `Project` keeps its
+      OUTER-scope index** (round-1 §4.2 fix #8, ledger row `tpcds-round2 Q8`
+      2026-07-27). **The only unresolved member of round 1's nine goopg-only
+      errors**, and the sole `ERROR` in the SF=1 sweep that is not Q75.
+      Measured `ERROR 26 s` at SF=1 against PG's `OK 0 s / 0 rows`
+      (`analysis/tpcds-sf1-resweep-20260728/RESULTS.md` row 8):
+      `column ref ca_zip/57 out of MaterializedSlot range 1`; **server survives**
+      (verified `select 1` after) so this is contained, not a crash.
+      **Cheap reproduction: SF0.5 reproduces the identical ERROR in 12 s**
+      (`tpcds-results-sf05/sweep-20260729-093056.txt`) against 26 s + EXPLAIN at
+      SF=1 — iterate there.
+      **What already landed, so it is not re-attempted:** `9ddbc679`'s
+      `containsSetOp` guard protects `pushdown.go:241`, `pushdown.go:264` and
+      `planner.go:2078` — it never protected the remap path, which is why Q8
+      kept failing after it. `9740fce9` then gave `buildBindingsPosMap`
+      (`internal/planner/bushy.go`) its `SetOp`/`RecursiveUnion`/`WorkTableScan`/
+      `WindowAgg`/`ProjectSet`/`OrdinalityWrap`/`RowsFrom`/`IndexOnlyScan`
+      opaque-leaf arms plus a decline-on-unknown `default:`, and bounds-checked
+      `*MaterializedSlot`/`*Slot` in `evalExprSlot`
+      (`internal/executor/expr.go:353`) — that pair is what turned the panic
+      into a contained `XX000`.
+      **Mechanism of the residual (already root-caused, do not re-diagnose):**
+      `ca_zip` = 57 is a **global FROM-order** index reaching a **1-column**
+      `MaterializedSlot` — the INTERSECT-in-FROM subquery's own `Project` scope,
+      which `buildBindingsPosMap` never governs. `remapSubqueryColumnRefs`
+      (`internal/planner/planner.go`) rewrites only `Project` **targets**; a
+      `ColumnRef` inside a `Filter` predicate *below* that `Project` is left
+      holding the outer-scope index.
+      **Fix direction:** extend the subquery-scope remap past `Project` targets
+      to `Filter.Predicate`, `Join.LeftKey/RightKey` and
+      `Aggregate.GroupExprs/Aggs`. **⚠ Compose with M0125-0010, do not revert
+      it** — that task deliberately narrowed the pass to *verify-then-repair*
+      (leave a target whose index is in range AND names the right column;
+      re-derive only the out-of-range / wrong-name leakage signature). Every new
+      node kind must keep the verify-first branch or this becomes the **fourth
+      recurrence** of "ambiguous key resolved by taking the first match" — the
+      fifth *instance*, on the numbering `2e09250b` established when it called
+      M0125-0010 the "Third recurrence, after M0097-0003/-0032 and M0125-0009".
+      Prefer routing the new arms
+      through **M0125-0001**'s driver if it has landed; hand-rolling a fifth
+      walker is exactly the copy-paste family M0125-0001/-0002 exist to delete.
+      **⚠ Acceptance trap — "0 rows" is NOT an acceptance criterion.** PG
+      returns **0 rows** for Q8 at SF=1, so any bug that yields an empty result
+      also "matches PG". Accept instead on: (a) no `ERROR`, (b) rows = PG's 0,
+      **and (c)** a discriminating probe — the same INTERSECT-in-FROM shape with
+      predicates relaxed until PG returns a non-empty set, asserted equal by
+      value on both engines. **The probe is only valid if it FAILS on pre-fix
+      HEAD** with the same `column ref … out of MaterializedSlot range` error:
+      relaxing predicates can change the plan into one that never touches the
+      defective path, and a probe that already passes proves nothing. (Repo
+      precedent: M0125-0011's gate fails 5/5 subtests pre-fix; root-0036's fails
+      7 of 8 with the hunk stashed.) Add the probe as a planner/executor unit
+      test so the discriminator outlives the task.
+      Repro: `scripts/tpcds-bench-compare.sh 8`.
+      Design `docs/design/0125-0012-q8-subquery-scope-index-remap.md`.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
+      gate, `make plan-diff`).
+- [ ] **M0125-0013 — Q47: a SECOND defect downstream of the CTE body RC-1b
+      repaired** (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29, §13.4 item 2).
+      Measured `OK 142 s / 0 rows` vs PG's 100. RC-1b (`5db0a067`) made Q47's CTE
+      body **exactly correct** — 661,185 rows = PG, previously 0 — by stopping a
+      mispushed predicate from silently zeroing the scan input. The full query
+      still returns 0, so a second, independent defect sits in the **windowed
+      self-join layers above the CTE**, which until RC-1b had never received
+      non-empty input and had therefore never been exercised.
+      **Start BELOW the CTE**, at the `v1`→`v2` window/self-join layers of
+      `bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql` (`rank()` /
+      `avg()` over the partitioned windows) — reproducible for the first time
+      because the input is non-empty.
+      **Cheap reproduction: SF0.5 reproduces the row gap in 43 s**
+      (`MISMATCH goopg=0 oracle=100`, `tpcds-results-sf05/sweep-20260729-093056.txt`)
+      against 142 s at SF=1 — iterate on rows there. **But value acceptance is
+      SF=1 only**: Q47's SF0.5 oracle entry is `47|OK|100|n/a|2`, i.e. `ck=n/a`
+      (a `LIMIT` over a non-total `ORDER BY`), so the gate can never value-accept it.
+      **Settle the runtime question — as STEP 0, before touching the planner.**
+      An `EXPLAIN` diff against set A's plan is only interpretable while the plan
+      is unchanged; once the fix moves plan shape the comparison is confounded.
+      set A `OK 17 s` →
+      HEAD `OK 142 s` (8.4×, reproduced standalone at 143 s,
+      `analysis/tpcds-sf1-resweep-20260728/diag-q47-rerun.txt`). Two primary
+      sources disagree and the task should close the gap: `RESULTS.md` chunk
+      49–56 and the RC-1b ledger row read it as the **expected cost** of newly
+      non-empty input ("14s->143s confirms real work"), while the merged
+      deliverable `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6 still calls it
+      "bounded but **unattributed**" (it reproduces chunk 41–48's superseded
+      reasoning). The step-0 `EXPLAIN` diff decides it; record the verdict in
+      whichever document is wrong. (This half is a bookkeeping repair of
+      M0124-0001's deliverable, not engine work — it may be split out if it grows.)
+      **Accept by VALUE**: Q47 = 100 rows = PG **and** values equal PG at SF=1.
+      The SF0.5 gate sees the row gap today, so it will register the fix; the
+      **nightly anchors will not** — `ci/batch/tpcds-row-anchors.csv` pins 61
+      queries and contains no Q47 row, so closing this means **adding** an anchor,
+      not re-pinning one.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q47).
+      Planner/executor change → full pre-commit bar.
+- [ ] **M0125-0014 — Q49: re-measure at SF=1, then resolve or classify the
+      30-vs-34 row gap** (round-2 §5a, ledger rows `tpcds-round2 Q49` 2026-07-27
+      and `tpcds-round2 q47-q49-q51` 2026-07-29). Shaped like M0124-0004
+      ("recover or classify") because the premise moved after it was written.
+      **Unchanged by RC-1b, which disproves its provisional RC-1b-family
+      attribution** — a second defect, not a variant of Q47's.
+      **⚠ STEP 0 — the SF=1 number is stale.** Q49 flipped `MISMATCH 24/25` →
+      `PASS 25` at SF0.5 the moment **M0125-0009** landed
+      (`sweep-20260729-004730` at `7a7a2639` vs `sweep-20260729-033758` at
+      `3fbce36a`; HEAD's `sweep-20260729-093056` still PASSes, checksum matching),
+      and **nobody recorded that** — no completion note, no ledger row. Q49 has
+      **not** been re-measured at SF=1 since -0009/-0010/-0011 landed. Measure it
+      first: if SF=1 now returns 34 = PG by value, this task closes as
+      *measured-and-already-fixed* and its ledger rows get an UPDATE naming
+      M0125-0009 — a legitimate completion, not a skipped one. Only if the gap
+      survives does the diagnosis below apply.
+      Shape: three `UNION ALL` branches (web / catalog / store), each ranking a
+      derived ratio and filtering `return_rank <= 10 or currency_rank <= 10`.
+      goopg returns exactly **30** — suspiciously exactly 3 × 10, which is what a
+      collapse of the two-rank `OR` into a single rank filter would produce.
+      **Ruled out by probe, do not re-test:** `rank()` peer-tie handling.
+      `rank`, `dense_rank` and `row_number` over a tied `ORDER BY` are
+      byte-identical to PG (`1,1,3,3,3,6` on both), so the `<= 10` filter is not
+      silently degrading to `row_number` semantics.
+      **Remaining candidates** (§5a): (1) the `decimal(15,4)` division producing
+      `return_ratio` / `currency_ratio` — a precision difference reorders ties and
+      changes which rows sit at rank 10; (2) the mixed
+      `store_sales sts LEFT OUTER JOIN store_returns sr … , date_dim` shape, i.e.
+      the outer-join-plus-comma-join form §2.3 flags as unverified.
+      **The cheap SF0.5 reproduction is GONE.** §5a's one-row gap (24 vs 25) was
+      the recommended bisect target; it no longer reproduces (see STEP 0), so
+      SF0.5 is a *regression* gate for Q49 now, not a *detection* gate — the same
+      distinction M0125-0011 established by measurement. Any new minimal repro
+      has to be constructed, not inherited.
+      **Accept by VALUE**: 34 rows = PG and values equal PG **at SF=1**.
+      "25 rows at SF0.5" is NOT an acceptance signal — HEAD already satisfies it.
+      No Q49 row exists in `ci/batch/tpcds-row-anchors.csv`, so add one on close.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q49).
+      Planner/executor change → full pre-commit bar.
+- [ ] **M0125-0015 — Q51: re-measure at SF=1, then resolve or classify the
+      0-vs-100 row gap** (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29,
+      §13.4 item 2). Same "resolve or classify" shape as -0014, for the same reason.
+      **Also unchanged by RC-1b.** §13.4 item 2 calls it "a **third** distinct
+      defect" on that basis, but the later measurements deliberately kept the
+      question open — `RESULTS.md` chunk 49–56 says its RC-1b family membership
+      "stays **probable, unproven**", and the M0124-0001 ledger row says "**either
+      Q51 is a different defect or it shares Q47's downstream one**". Treat
+      "distinct" as the leading hypothesis, not as settled. No mechanism is
+      claimed; §13.3 records only the shape, "a wrong answer that had been hiding
+      behind a timeout", the same shape M0124-0004 names for Q35.
+      **⚠ STEP 0 — the SF=1 number is stale, exactly as for -0014.** Q51 flipped
+      `MISMATCH 0/100` → `PASS 100` at SF0.5 when **M0125-0009** landed, and still
+      PASSes at HEAD; unrecorded anywhere. **Re-measure at SF=1 against
+      M0124-0001's sweep row (`OK 587 s / 0` vs PG `OK 1 s / 100`) BEFORE assuming
+      a mechanism** — one ~590 s observation may close this task outright.
+      Note SF0.5 cannot value-accept it either: its oracle entry is
+      `51|OK|100|n/a|1`, i.e. `ck=n/a`.
+      **⚠ Budget-marginal on the `OK` side — 13 s of headroom under the 600 s cut,
+      the NARROWEST `OK` margin of the sweep (Q82's 44 s is the next-narrowest).**
+      Any fix that
+      adds work can flip it to `TIMEOUT` and *mask* a correct row count. Time it
+      explicitly and report the runtime alongside the rows; if it crosses the
+      budget, raise the budget for the acceptance run rather than declaring the
+      fix a regression (`analysis/tpcds-sf1-goopg-20260728.md` §5).
+      **Accept by VALUE**: 100 rows = PG and values equal PG **at SF=1**, with the
+      measured runtime recorded. "100 rows at SF0.5" is NOT an acceptance signal —
+      HEAD already satisfies it. No Q51 row exists in
+      `ci/batch/tpcds-row-anchors.csv`, so add one on close.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q51).
+      Planner/executor change → full pre-commit bar.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
