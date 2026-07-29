@@ -369,3 +369,87 @@ ledger row appended, and it is a natural rider on M0125-0005.
   acceptable. Nothing here justifies flipping the default; that remains M0125-0005.
 - Plain (non-partition) inheritance parents are not detected as `relhassubclass`, so the 10-page
   floor may be applied to one. Ledger row appended.
+
+## Implementation record — stage 2 (2026-07-30)
+
+Stage 2 wires the second of §D4's three consumers: the **bushy DP seed**. It is the first
+consumer that moves the JOIN ORDER rather than a single node's local choice, which is why §D4
+predicted "where round-4's regressions live" — and, as measured below, it is not a subtle effect.
+
+### I6. What landed
+
+- `bushySeedRowCounts` (`internal/planner/bushy.go`), extracted from the body of
+  `enumerateBushyPlans` so the seed's now-four tiers are readable and unit-testable without
+  standing up the whole DP. The tiers, in order: post-filter `relInfos[i].filteredRows`
+  (M0077-0002) → ANALYZE'd `Stats.RowCount` → **the stage-2 fallback** → the historical 1-row
+  floor.
+- `relSizeFallbackRows(stage, cat, tbl)` (`relsize.go`), one gated entry point that every staged
+  consumer now goes through. `stage1RelSizeRows` delegates to it unchanged, and stage 3 will need
+  no further knob work — §D4's "cumulative by construction" promise, made concrete.
+- Three tests in `relsize_fallback_test.go`: stage gating at the seed (stages 0 and 1 must still
+  produce the 1-row floor — stage 1's probe-side consumer must not leak into the join order),
+  the tier ORDER (post-filter still outranks the fallback at stage 2), and the failure direction
+  (no sizer / nil catalog ⇒ the floor, never 0, which would divide into the join-cost model).
+
+### I7. Stage 2 is live, and its effect at S-cold is total — measured
+
+The landing is inert with the flag off and demonstrably not inert with it on. Both arms are
+plan-SHAPE comparisons (`make plan-diff LABEL=tpcds-round2-head`, structural mode, TPC-H SF=1 on
+65433), so they are valid under the CPU contention that ruled out a timed run this loop:
+
+| arm | result |
+|---|---|
+| flag off (default) | **22 / 22 MATCH** — byte-identical to the committed baseline |
+| `GOOPG_RELSIZE_FALLBACK=2` | **22 / 22 DIFFER** (`analysis/m0125-0003-stage2/plan-diff-stage2-on.txt`) |
+
+Every TPC-H query changes. The reason is visible in the diff: before stage 2, an S-cold server
+seeded **`rows=1` for every relation**, so the DP ranked join orders on no cardinality signal at
+all. After, it seeds real block-derived sizes. Against SF=1 truth:
+
+| relation | stage-2 estimate | actual SF=1 | ratio |
+|---|---|---|---|
+| `lineitem` | 2,196,757 | 6,001,215 | 0.37× |
+| `orders` | 767,286 | 1,500,000 | 0.51× |
+| `partsupp` | 809,690 | 800,000 | 1.01× |
+| `part` | 101,100 | 200,000 | 0.51× |
+| `supplier` | 7,136 | 10,000 | 0.71× |
+| `nation` | 520 | 25 | 20.8× — the 10-page floor, upstream's behavior exactly (§D1 rule 1) |
+
+Coarse, and *right in the ways that matter for ordering*: the estimates preserve the relative
+sizes that a join order is chosen on, which a flat 1 destroys entirely. They under-estimate on the
+wide tables because `get_typavgwidth`'s 32-byte "wild guess" for unbounded text over-states the
+average width, and width divides into density — the same direction PG errs in, for the same
+reason. `nation` shows the floor doing its job: refusing to believe a small relation is tiny.
+
+Q9 is the clearest single case — with real sizes the planner reaches `Gather` / `Workers
+Planned: 4` over the 4-table MHJ, which it could not justify when every input claimed one row.
+Whether that is a *win* is precisely the open question, and it is **not** answered here.
+
+### I8. Ordering consequence: stage 3 will shadow stage 2 at this site
+
+Stage 3 feeds the fallback into `estimateBaseRelInfo.baseRows`, which makes `filteredRows`
+positive on a cold server — so tier 1 becomes live and the stage-2 tier stops being reached at
+this site. That is the correct outcome (stage 3's number has passed through the local filter and
+is strictly better here), but it has a scheduling consequence worth stating plainly: **stage 2's
+arm of the four-arm measurement must be read before stage 3 lands, not after.** Recorded in the
+seed's own doc comment so it cannot be lost.
+
+### I9. Discovery — a fourth, unstaged consumer that stays blind cold
+
+`reorderCommaFromByCardinality` (`internal/planner/joinorder.go:89-93`) is the greedy comma-FROM
+reorder, and it is a *sibling* of the DP seed: same question, different code path (hard-won rule
+#2). It bails out entirely — "without a row count for every relation, the reorder has no signal"
+— when any table lacks `Stats.RowCount`, so on a cold-started server it never runs at all.
+
+Stage 2 therefore does not remove cold-start blindness from the planner; it removes it from the
+bushy DP only. This is left deliberately out of scope — it is a fourth consumer, §D4 staged
+three, and adding it silently would make the measurement un-attributable, which is the exact
+failure §D4 exists to prevent. Ledger row appended.
+
+### I10. What stage 2 does NOT do
+
+- **Still no measurement.** §D5.1's four arms and §D7's per-query-isolated harness remain owed;
+  the nightly CI batch held the host all loop, and a plan-shape diff is the strongest evidence
+  available under contention. Nothing here justifies flipping the default — that is M0125-0005.
+- The 22/22 divergence is a statement about plan *shape*, not about plan *quality*. Round-4's
+  five regressed queries are the pre-registered watch list and none of them has been timed.

@@ -643,6 +643,60 @@ func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRow
 	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), float64(outRows), indexProbeCost(cp))
 }
 
+// bushySeedRowCounts computes the per-relation row count the bushy DP seeds its
+// singleton subsets with. Every join-order decision the DP makes descends from
+// these numbers, so this is the highest-leverage cardinality input in the
+// planner and the reason M0125-0003 stages it separately.
+//
+// The tiers, in order, each falling through only when the one above has nothing:
+//
+//  1. M0077-0002 (Slice B): the post-filter row count from `relInfos`. Best
+//     available — it is the only tier that accounts for local predicates.
+//  2. The historical `tableRows` lookup: ANALYZE'd, pre-filter.
+//  3. M0125-0003 stage 2: the estimate_rel_size fallback, derived from the LIVE
+//     block count and the declared column widths. This is the first tier that
+//     needs no statistics at all, which is the whole point — tiers 1 and 2 are
+//     both 0 on a cold-started server (TableStats.RowCount does not survive a
+//     restart, ledger pq-P6), so before this the DP saw a flat 1 for every
+//     relation and ranked join orders on no cardinality signal whatsoever.
+//  4. The 1-row floor, which is also what tier 3 returns to when the flag is
+//     off. Flag-off is therefore byte-identical to the pre-M0125-0003 DP.
+//
+// Tier 3 is deliberately PRE-filter: the cold server that reaches it has no
+// column statistics either, so scaling by a selectivity would be inventing
+// precision the estimate does not have. estimateBaseRelInfo makes the same
+// choice for an unreliable selectivity (cardinality.go).
+//
+// Note the ordering consequence once stage 3 lands: it feeds the fallback into
+// `estimateBaseRelInfo.baseRows`, which makes tier 1 positive on a cold server
+// and SHADOWS tier 3 at this site. That is intended — stage 3's estimate is
+// strictly better here, having passed through the local filter — but it means
+// stage 2's arm of the four-arm measurement must be read before stage 3 lands,
+// not after.
+func bushySeedRowCounts(g *joinGraph, relInfos []baseRelInfo, cat catalog.Catalog) []int64 {
+	rowCounts := make([]int64, g.nodes)
+	for i, tbl := range g.tables {
+		if i >= len(rowCounts) {
+			break // defensive: a malformed graph must not panic the planner
+		}
+		switch {
+		case i < len(relInfos) && relInfos[i].filteredRows > 0:
+			rowCounts[i] = relInfos[i].filteredRows
+		case tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0:
+			rowCounts[i] = tbl.Stats.RowCount
+		default:
+			// Returns 0 with the flag off or below stage 2, and 0 whenever the
+			// catalog cannot report a live block count — both land on the floor.
+			if rows := relSizeFallbackRows(2, cat, tbl); rows > 0 {
+				rowCounts[i] = rows
+			} else {
+				rowCounts[i] = 1
+			}
+		}
+	}
+	return rowCounts
+}
+
 func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
 	if g.nodes == 0 {
 		return nil, nil, nil
@@ -659,22 +713,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 		return g.scans[0], residual, nil
 	}
 
-	// M0077-0002 (Slice B): seed singleton subsets with
-	// post-filter rowcounts from `relInfos` when available.
-	// Falls back to the historical `tableRows` lookup with a
-	// 1-row floor for nodes that lack a corresponding entry
-	// (defensive against test fixtures and shape changes).
-	rowCounts := make([]int64, g.nodes)
-	for i, tbl := range g.tables {
-		switch {
-		case i < len(relInfos) && relInfos[i].filteredRows > 0:
-			rowCounts[i] = relInfos[i].filteredRows
-		case tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0:
-			rowCounts[i] = tbl.Stats.RowCount
-		default:
-			rowCounts[i] = 1
-		}
-	}
+	rowCounts := bushySeedRowCounts(g, relInfos, cat)
 
 	edgeUsed := make([]bool, len(g.edges))
 	dp := make(map[uint16]dpEntry)

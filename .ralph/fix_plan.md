@@ -86,7 +86,16 @@ started.
 >    **↳ NEXT TASK TO SELECT (added 2026-07-29 17:25 by the USER — this list
 >    OUTRANKS `.ralph/working_set.md`'s NEXT note, which currently says
 >    `M0125-0020`). Take them in THIS order; do not fall back to file order:**
->    1. **`M0125-0003` stage 1.** It is the ONLY designed item that can move the
+>    1. ~~**`M0125-0003` stage 1**~~ — **DONE**, and **stage 2 is DONE too
+>       (2026-07-30)**: the bushy DP seed is wired and default-off, proven inert
+>       flag-off (plan-diff 22/22 MATCH) and proven LIVE flag-on (22/22 DIFFER,
+>       replacing a flat `rows=1` seed for every relation with block-derived
+>       sizes). The four-arm TIMED study and stage 3 remain owed — see the item
+>       body and the two 2026-07-30 ledger rows. **NEXT SELECTION: `M0125-0002`,
+>       `-0005`, or `M0125-0003` stage 3** (but stage 3 shadows stage 2's
+>       measurement, so prefer taking stage 2's timed arm on a quiet host
+>       first). Original wording follows.
+>       It is the ONLY designed item that can move the
 >       **17-query timeout class** this milestone is named after — fix_plan calls
 >       it "§13.5's highest-value item (15–16 of 21 defects); stage 1 is inert, so
 >       it lands early". This banner has said "M0125-0003 (flag-off throughout) are
@@ -1338,13 +1347,31 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       staged knob, and the stage-1 consumer (`seqScanRows` via
       `SeqScan.EstRelRows`). Verified against PG 18.3 on four measured
       relations and reproduced EXACTLY; see the design doc's "Implementation
-      record" and five ledger rows dated 2026-07-29. **Still owed, which is why
-      this box is unchecked:** stage 2 (bushy DP seed `rowCounts[i]`,
-      `bushy.go:671`), stage 3 (`estimateBaseRelInfo.baseRows`,
-      `cardinality.go:139`), and the ENTIRE four-arm measurement — the flag
-      accepts `2`/`3` today and yields stage-1 behavior. Stage 2 is the next
-      slice and needs M0124-0002's plan baseline plus a quiet host for the
-      timed run. En route it corrected `typeWidth`, which was not
+      record" and five ledger rows dated 2026-07-29.
+      **STAGE 2 LANDED 2026-07-30, also default-off** — `bushySeedRowCounts`
+      (`internal/planner/bushy.go`, extracted from `enumerateBushyPlans`) adds
+      the fallback as a third tier under the DP's singleton seed, through the
+      new single gated entry point `relSizeFallbackRows(stage, cat, tbl)` that
+      `stage1RelSizeRows` now delegates to as well. Verified by plan SHAPE in
+      BOTH flag states, which is contention-immune: flag-off `make plan-diff
+      LABEL=tpcds-round2-head` = **22/22 MATCH**, `GOOPG_RELSIZE_FALLBACK=2` =
+      **22/22 DIFFER** (`analysis/m0125-0003-stage2/plan-diff-stage2-on.txt`).
+      The magnitude is the finding: an S-cold server used to seed **`rows=1` for
+      every relation**, so the DP ranked join orders on no cardinality signal at
+      all; it now seeds block-derived sizes within 0.37–1.01× of SF=1 truth
+      (`nation` at 20.8× is the 10-page floor, upstream's behavior). Q9 newly
+      reaches `Gather`/`Workers Planned: 4` — untimed, and round-4's five
+      regressed queries remain the watch list.
+      **Still owed, which is why this box is unchecked:** stage 3
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the ENTIRE
+      four-arm TIMED measurement — the flag accepts `3` today and yields
+      stage-2 behavior. **Read stage 2's timed arm BEFORE stage 3 lands**:
+      stage 3 makes `filteredRows` positive cold and therefore SHADOWS the
+      stage-2 tier at the DP seed (recorded in `bushySeedRowCounts`'s doc
+      comment and a ledger row). A fourth, unstaged consumer was discovered —
+      `reorderCommaFromByCardinality` (`joinorder.go:89-93`) bails out entirely
+      when any table lacks `Stats.RowCount`, so the greedy comma-FROM reorder is
+      still blind at S-cold; own ledger row, deliberately not folded in. En route it corrected `typeWidth`, which was not
       `get_typavgwidth` (missing the UTF8 encoding factor AND the whole sliding
       scale: `varchar(20)` read 24 vs PG's 58) — a 2.4× width error is a 2.4×
       row-estimate error on the char/varchar-heavy schemas this serves.

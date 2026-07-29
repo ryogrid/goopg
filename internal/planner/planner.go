@@ -2563,10 +2563,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // byte-identical to the pre-M0125-0003 planner — unless the flag is on, which
 // is what makes the landing commit inert.
 func stage1RelSizeRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
-	if !relSizeFallbackEnabled(1) {
-		return 0
-	}
-	return estimateTableRowsFallback(cat, tbl)
+	return relSizeFallbackRows(1, cat, tbl)
 }
 
 // remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every

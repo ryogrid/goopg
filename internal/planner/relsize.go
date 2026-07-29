@@ -21,12 +21,13 @@ import (
 //	1 — EstimateRows / the MultiHashJoin probe-side choice. Shape-neutral for
 //	    TPC-H; the cheap first cut. IMPLEMENTED.
 //	2 — + the bushy DP seed (rowCounts[i]). Where round 4's statistics
-//	    regressions live. NOT YET WIRED — M0125-0003 stage 2.
+//	    regressions live, because this is the first consumer that moves the
+//	    JOIN ORDER rather than a single node's choice. IMPLEMENTED.
 //	3 — + estimateBaseRelInfo.baseRows. NOT YET WIRED — stage 3.
 //
-// A stage enables every consumer up to and including itself, so setting 2 or 3
-// today yields stage-1 behavior: the later consumers simply do not read the
-// flag yet. Values are cumulative by construction and later stages will need no
+// A stage enables every consumer up to and including itself, so setting 3 today
+// yields stage-2 behavior: the later consumer simply does not read the flag
+// yet. Values are cumulative by construction and stage 3 will need no
 // re-spelling of the knob.
 //
 // Default OFF, mirroring costDrivenJoinOrder (bushy.go). Flipping the default
@@ -75,6 +76,23 @@ func SetRelSizeFallbackStage(stage int) int {
 // stage should read the fallback.
 func relSizeFallbackEnabled(stage int) bool {
 	return relsizeFallbackStage.Load() >= int64(stage)
+}
+
+// relSizeFallbackRows is the single gated entry point every staged consumer
+// goes through: it returns the block-count relation-size estimate for tbl, or 0
+// when the consumer introduced at `stage` is not enabled. 0 means "no estimate"
+// and every caller must keep its pre-M0125-0003 behavior on it — that is what
+// makes each staging commit inert until its flag value is set.
+//
+// The stage number is the CALLER's, not the flag's, so a consumer can never
+// accidentally read the fallback one stage early: stage 1 is stamped by
+// stage1RelSizeRows (planner.go, the SeqScan leaf) and stage 2 by
+// bushySeedRowCounts (bushy.go, the DP seed).
+func relSizeFallbackRows(stage int, cat catalog.Catalog, tbl *catalog.Table) int64 {
+	if !relSizeFallbackEnabled(stage) {
+		return 0
+	}
+	return estimateTableRowsFallback(cat, tbl)
 }
 
 // Relation size and width estimation — the inputs the cost model's per-node cost
