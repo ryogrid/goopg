@@ -2392,6 +2392,19 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after ANY/SOME/ALL")
 	}
+	if p.selectWithParensAhead() {
+		// `x = ANY ((A) UNION (B))` — `sub_type … select_with_parens`, the
+		// third sibling of the IN / EXISTS operand parsers (Hard-won Rule #2).
+		// M0125-0018.
+		sel, err := p.parseQueryOperandWithParens()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close ANY/ALL subquery")
+		}
+		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
+	}
 	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
 	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
@@ -3182,6 +3195,19 @@ func (p *parser) parseExistsExpr(negated bool) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after EXISTS")
 	}
+	if p.selectWithParensAhead() {
+		// `EXISTS ((A) EXCEPT (B))` — gram.y spells EXISTS' operand
+		// `select_with_parens`, so the branch may itself be parenthesised
+		// (and the chain may continue past it). M0125-0018.
+		sel, err := p.parseQueryOperandWithParens()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close EXISTS subquery")
+		}
+		return &ExistsExpr{pos: pos, Negated: negated, Subquery: sel}, nil
+	}
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
 		return nil, p.errAtCur("EXISTS requires a parenthesised SELECT")
 	}
@@ -3510,6 +3536,108 @@ func (p *parser) tryConsumeIntervalPrecParen() (int, bool) {
 	return n, true
 }
 
+// selectWithParensAhead reports whether the tokens starting at the CURRENT
+// position form PostgreSQL's `select_with_parens` production rather than an
+// ordinary parenthesised expression:
+//
+//	select_with_parens: '(' select_no_parens ')' | '(' select_with_parens ')'
+//
+// (postgres/src/backend/parser/gram.y). The IN / ANY-SOME-ALL / EXISTS operand
+// parsers each have to choose between this production and an expression
+// alternative — `in_expr: select_with_parens | '(' expr_list ')'` and
+// `sub_type: … select_with_parens | … '(' a_expr ')'`; EXISTS admits only
+// select_with_parens. Each of them used to test only "is the very next token
+// SELECT/VALUES", so a nested `(` — the shape every parenthesised set-op chain
+// starts with — fell through to the expression alternative. M0125-0018.
+//
+// Two conditions must hold:
+//
+//  1. peeling the leading run of `(` reaches SELECT or VALUES, so `((1),(2))`
+//     and `(a + b)` stay expressions; and
+//  2. the token after the group's matching `)` continues a QUERY rather than an
+//     expression. This is what separates `((SELECT 1),(SELECT 2))` (an
+//     expr_list of two scalar subqueries) and `((SELECT 1)::int)` (a cast) from
+//     `((SELECT 1) UNION (SELECT 2))` and the bare `((SELECT 1))`.
+//
+// Condition 2's treatment of the bare `((SELECT …))` form is not a guess:
+// PostgreSQL 18.3 answers `t` to `select 1 in ((select 1 union select 2))`,
+// which the expr_list reading cannot produce — as a scalar subquery it would
+// raise 21000 "more than one row returned by a subquery used as an
+// expression", which is exactly what goopg used to do.
+func (p *parser) selectWithParensAhead() bool {
+	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "(") {
+		return false
+	}
+	// (1) Peel the leading `(` run and require a query keyword under it.
+	for i := 0; ; i++ {
+		tok := p.peek(i)
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			continue
+		}
+		if !(tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues)) {
+			return false
+		}
+		break
+	}
+	// (2) Walk to the `)` that closes the group the current `(` opened, and
+	// judge the token after it.
+	depth := 0
+	for j := 0; ; j++ {
+		tok := p.peek(j)
+		switch {
+		case tok.Kind == TokenEOF:
+			return false
+		case tok.Kind == TokenSymbol && tok.Value == "(":
+			depth++
+		case tok.Kind == TokenSymbol && tok.Value == ")":
+			depth--
+			if depth == 0 {
+				return continuesParenthesisedQuery(p.peek(j + 1))
+			}
+		}
+	}
+}
+
+// continuesParenthesisedQuery reports whether t can follow a select_with_parens
+// inside a query operand: either it closes the operand outright, or it opens
+// one of select_no_parens' trailing clauses (a set operation, ORDER BY, the
+// LIMIT/OFFSET pair, or a locking clause). Anything else — `,`, `::`, an
+// arithmetic operator — means the parentheses belonged to an expression.
+func continuesParenthesisedQuery(t Token) bool {
+	if t.Kind == TokenSymbol && t.Value == ")" {
+		return true
+	}
+	if t.Kind != TokenKeyword {
+		return false
+	}
+	switch t.Keyword {
+	case KwUnion, KwIntersect, KwExcept, KwOrder, KwLimit, KwOffset, KwFor:
+		return true
+	}
+	return false
+}
+
+// parseQueryOperandWithParens parses a select_with_parens operand whose leading
+// `(` has NOT been consumed, restoring the caller's SELECT-INTO error context
+// afterwards. Callers must have established via selectWithParensAhead() that
+// this really is a query; on entry the current token is that `(`. M0125-0018.
+func (p *parser) parseQueryOperandWithParens() (*SelectStmt, error) {
+	// SELECT … INTO is not permitted in a subquery operand (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+	p.selectIntoNoPos = false
+	inner, err := p.parseParenthesisedSelectStmt()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := inner.(*SelectStmt)
+	if !ok {
+		return nil, p.errAtCur("expected SELECT inside parentheses")
+	}
+	return sel, nil
+}
+
 // parseInTail consumes the right side of `expr [NOT] IN (...)`
 // after the IN keyword. The parenthesised body is either a
 // parenthesised SELECT (uncorrelated subquery) or a value list
@@ -3517,6 +3645,18 @@ func (p *parser) tryConsumeIntervalPrecParen() (int, bool) {
 func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after IN")
+	}
+	if p.selectWithParensAhead() {
+		// `x IN ((A) EXCEPT (B))` — `in_expr: select_with_parens`, so the
+		// nested parentheses group a query, not a value list. M0125-0018.
+		sel, err := p.parseQueryOperandWithParens()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close IN subquery")
+		}
+		return &InExpr{pos: pos, Operand: left, Negated: negated, Subquery: sel}, nil
 	}
 	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
 		// SELECT/VALUES … inside IN (...). M0097-0020.

@@ -1376,18 +1376,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       nodes). Two PG behaviours deferred with ledger rows (2026-07-29): an
       outer ORDER BY colliding with the head boundary, and a trailing clause
       after the `')'` discarding the inner one — see M0125-0020 below.
-- [ ] **M0125-0018 — IN-list and EXISTS reject a parenthesised set-op chain as an
-      operand** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
-      `x IN ((A) EXCEPT (B) EXCEPT (C))` raises `expected ')' to close IN list (got
-      except)` and `EXISTS ( (A) EXCEPT (B) … )` raises `EXISTS requires a
-      parenthesised SELECT (got ()`. PG accepts both (`a_expr IN_P
-      select_with_parens`, `EXISTS select_with_parens`). Pre-existing (identical
-      errors on pre-fix HEAD). Derived-table, CTE and scalar-subquery contexts all
-      work and are pinned by M0125-0006's tests, so this is narrowly the two
-      operand parsers. **Resume**: both assume the token after `(` is the SELECT
-      keyword, so a nested `(` is rejected; route them through
-      `parseParenthesisedSelectStmt` the way the scalar-subquery path
-      (`internal/parser/select.go:2862`) already does. Parser-only change.
+- [x] **M0125-0018 — IN-list and EXISTS reject a parenthesised set-op chain as an
+      operand** (discovered by M0125-0006 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0018-setop-chain-as-query-operand.md`, ledger rows
+      2026-07-29). Landed wider than filed. The probe found a **third** sibling
+      the report never named — `x = ANY ((A) UNION (B))`, `parseAnyTail`, same
+      one-token lookahead — and a **quiet** half of the same root cause:
+      `x IN ((SELECT multirow))` parsed as a one-element VALUE LIST holding a
+      scalar subquery and raised `21000 more than one row returned by a
+      subquery` where PG answers the IN (`select 1 in ((select 1 union select
+      2))` = `t` on the oracle). Peeling the `(` run is NOT a sufficient test:
+      `((select 1),(select 2))`, `((select 1)::int)` and `((select 1) + 1)` are
+      expressions in PG. The discriminator is what follows the group's matching
+      `)` — `,`/`::`/operator ⇒ expression; `)`/set-op/`ORDER`/`LIMIT`/`OFFSET`/
+      `FOR` ⇒ query. Fix = `selectWithParensAhead()` (non-consuming depth walk)
+      + `parseQueryOperandWithParens()` at all three sites, delegating to
+      `parseParenthesisedSelectStmt` so the operand inherits M0125-0016's
+      precedence and M0125-0017's head-branch sort/limit. EXISTS stays strict
+      (`EXISTS ((1))` still errors — gram.y gives it no expression alternative).
+      20 executor + 16 parser tests, **proved to fail 14 + 10 subtests at
+      `74f4b264`** with every control green. **TPC-DS cannot reach it** — zero of
+      99 SF0.5 query files match `(in|exists|any|all)\s*\(\s*\(`. Gates: units
+      PASS, `tpch-spotcheck.sh` PASS (Q12=2, Q13=35), pgbench smoke via hook.
 - [ ] **M0125-0019 — `string_agg(x, ',' ORDER BY x)` ignores the aggregate's own
       ORDER BY** (discovered by M0125-0006 2026-07-29, ledger row 2026-07-29).
       `select string_agg(x::text,',' order by x) from (values (3),(1),(2)) v(x)`
