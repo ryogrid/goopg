@@ -76,6 +76,40 @@ started.
 > 3. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
 >    Milestone doc
 >    `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`;
+>    **↳ NEXT TASK TO SELECT (added 2026-07-29 17:25 by the USER — this list
+>    OUTRANKS `.ralph/working_set.md`'s NEXT note, which currently says
+>    `M0125-0020`). Take them in THIS order; do not fall back to file order:**
+>    1. **`M0125-0003` stage 1.** It is the ONLY designed item that can move the
+>       **17-query timeout class** this milestone is named after — fix_plan calls
+>       it "§13.5's highest-value item (15–16 of 21 defects); stage 1 is inert, so
+>       it lands early". This banner has said "M0125-0003 (flag-off throughout) are
+>       unblocked" since 2026-07-28, and only the **measurement half** is gated by
+>       M0124-0002. `working_set.md` has re-classified it as "needs a four-arm
+>       TIMED study → host blocker" for six consecutive loops: that is true of the
+>       four-arm study, **not** of the shape-neutral stage-1 landing. Land stage 1;
+>       defer the timed arms with a ledger row if the host is busy.
+>    2. **`M0124-0002`.** Its quiet-host precondition now HOLDS — the
+>       `20260729-002344` nightly wedge cleared ~17:00 (PIDs 2511542 / 2621153 both
+>       gone; only `nightly-scheduler.sh` remains under `ci/batch`). Re-verify with
+>       `pgrep -af ci/batch` before starting. It produces
+>       `plan_snapshots/tpcds-round2-head.txt`, which unblocks M0125-0002 / -0004 /
+>       -0005 — the largest single unblock available.
+>    3. **`M0125-0012` (Q8).** UNBLOCKED: its only dependency was the *soft* one on
+>       M0125-0001, which landed at `6c5c48ae`. `working_set.md`'s claim that
+>       -0020 is "the last unblocked M0125 item" is FALSE — that enumeration omits
+>       -0012…-0015 entirely. Q8 is the only unresolved member of round 1's nine
+>       goopg-only errors and reproduces at SF0.5 in 12 s.
+>    4. **The full 99-query SF0.5 gate**, once. It is five loops of debt:
+>       -0016 / -0017 were accepted on 6- and 4-query subsets, and **-0018 /
+>       -0019 / -0021 ran ZERO SF0.5 queries**. A reachability grep answers "can
+>       this defect be reached", not "did this parser change break an unrelated
+>       query", so the debt is real for all five.
+>    5. **`M0125-0014` / `-0015`** (Q49 / Q51 SF=1 re-measure) — pair them with
+>       M0124-0002's quiet-host window rather than opening a second one.
+>    **`M0125-0020` landed at `beb7af82` before this list was written**, so its
+>    ordering is moot — but the reason it was selected is not: it was chosen on
+>    the false completeness claim corrected in item 3. Do not select the next
+>    set-op follow-up ahead of items 1–5 on the same reasoning.
 > 4. **M-NIGHTLY backlog** — the standing nightly-triage items below. Keep FILING
 >    them every loop (see the filing obligation above); work them only after M0124
 >    and M0125 close, or under one of the two carve-outs. The TPC-DS **Q75** nightly
