@@ -1,8 +1,13 @@
 # 0125-0001 — `internal/planner/exprwalk.go`: one child-slot primitive and a build-time exhaustiveness gate
 
-Status: draft
-Date: 2026-07-28
+Status: **accepted — landed 2026-07-29**
+Date: 2026-07-28 (design), 2026-07-29 (execution record appended)
 Milestone: M0125-0001 (§13.5 action 4, phase 1.1; design body §2.5 as corrected by review D1)
+
+> **Execution record is at the bottom of this document** ("Execution record
+> (2026-07-29)"). It lists what landed, four deviations from D1/D3/D4 with
+> rationale, and three findings the implementation produced. Read it before
+> starting M0125-0002 — one finding changes that task's scope.
 
 ## Problem
 
@@ -174,3 +179,99 @@ and left both the class and the missing `default:` intact.
 
 Units + the new exhaustiveness test + the D6 pins. **No TPC-H run is required**: there are no
 call sites, so plan shape provably cannot move. That exemption does not extend to M0125-0002.
+
+---
+
+## Execution record (2026-07-29)
+
+### What landed
+
+| file | contents |
+|---|---|
+| `internal/planner/exprwalk.go` | `exprChildSlots`, `shallowCloneExpr`, the three drivers, `scopePolicy` — **inert, no call site converted** |
+| `internal/planner/exprwalk_exhaustive_test.go` | the D5 gate (3 tests) + 11 driver-behaviour tests |
+| `internal/planner/remap_arms_test.go` | the D6 pins — 26 subtests over all 18 `remapByPosMap` arms |
+
+`go vet ./internal/planner/` reports all three drivers as unused. That is the
+positive evidence for "plan shape provably cannot move": no planner code path
+reaches them.
+
+### The gate was proved to fail, twice
+
+An exhaustiveness test that has never been observed failing is not evidence of
+exhaustiveness, so both directions of D5's acceptance criterion were exercised:
+
+1. **Missing arm.** Deleting the `*CollateExpr` arm →
+   `exprChildSlots does not handle 1 Expr type(s): [CollateExpr]`, and
+   `TestExprWalkSwitchesAgreeWithEachOther` fails independently.
+2. **A 33rd type, declared outside `plan.go`** (D5's stated acceptance proof) →
+   both `exprChildSlots` and `shallowCloneExpr` gates fail naming `probe33Expr`.
+   This is what validates D5 requirement 1; a `plan.go`-only parse would have
+   passed and the gate would have been quietly worthless.
+
+Both probes were reverted; the suite is green.
+
+### Deviations from the design, with rationale
+
+1. **Three slot kinds, not four (vs D1).** D1 specified
+   `slotExpr / slotExprList / slotSubqRow / slotPlan` with a `list *[]Expr`
+   member. Landed as `slotSameScope / slotInnerPlan / slotSubqRow`: a list is
+   flattened into one `slotSameScope` per element (`&x.Args[i]`). Every caller
+   would otherwise have to write the element loop itself, which is the
+   copy-paste this task exists to delete. **Cost:** a driver cannot
+   insert/remove list elements, only replace them. No existing walker does that;
+   if one ever needs to, `slotExprList` should be added back rather than worked
+   around.
+
+2. **`scopePolicy` is an enum chosen per call, not a struct of per-node
+   callbacks (vs D3).** D3's `OnPlanSlot func(Node) scopeAction` allows a
+   different decision per encountered node. All four behaviours D3 evidenced are
+   available; only *per-node variation within one traversal* is not. No call
+   site in the §2.4 list needs it. If M0125-0002 finds one, widening the enum
+   into D3's callback form is source-compatible for every other caller.
+
+3. **Drivers return `bool` (vs D4's `void`).** Unavoidable: `scopeVeto` and the
+   fail-closed `OnUnknown` contract both have to be *observable*, or "the walk
+   declined" is exactly the silent outcome this task removes. `cloneExprRefs`
+   returns `(Expr, bool)` for the same reason — it is the shape
+   `cloneExprShiftIdx` already uses.
+
+4. **`cloneExprRefs` clones leaves; `cloneExprShiftIdx` shares them.** The
+   existing driver shares literal nodes as an allocation optimisation. Sharing
+   is unsafe under a general rewriter, because the rewriter may legitimately
+   replace a leaf — and `ColumnRef`, the entire point of a positional shift,
+   *is* a leaf. Inner plans are aliased rather than deep-copied, matching every
+   existing driver.
+
+### Findings
+
+1. **`remapByPosMap` is already complete.** Its 18 arms plus 14 childless leaf
+   types account for exactly 32. M0125-0002 lists its re-base as "the only
+   genuinely no-op step"; that reading is confirmed — the missing `default:` is
+   the only defect, there are no absent arms.
+
+2. **⚠ The traversal namespace is a live hazard, and this changes M0125-0002's
+   scope.** The package already contains `walkExpr` (over **`parser.Expr`**, not
+   `planner.Expr`), `walkExprTree`, `walkExprTreeDeep`, `walkExprTreeForDMLTest`,
+   `walkPlanExprs`, `walkPlanExprsDeep` and `walkPlanString`. Two candidate names
+   for the new drivers collided with existing functions during implementation.
+   Several take a bare `func(Expr)` callback and **would compile if swapped at a
+   call site**. Concretely: `walkExprTree` (`unnest.go:1152`) is a *further*
+   generic `Expr` walker with the same fail-open `default:`, and it is **not** in
+   §2.4's seven. M0125-0002 should re-derive its walker list from the source
+   rather than trusting the count — §0's "fourteen" is likelier than §13.4's
+   "seven".
+
+3. **`walkPlanExprs` already enumerates a `Node`'s expressions**, so
+   `scopeDescend` *could* have been implemented generically. It deliberately was
+   not: `remapOuterRefsInSubplan` tracks scope **depth** and rewrites only an
+   `OuterColumnRef` whose `Level` equals the current depth, which a depth-unaware
+   descent would get wrong. `TestRemapByPosMap_OnlyMatchingLevelIsRemapped` pins
+   that distinction. Node-side traversal therefore remains uncovered — ledger row
+   `tpcds-round2 exprwalk-node-side`.
+
+### Gates run
+
+`go build` + `go vet ./internal/planner/` clean; 40 new tests pass; both negative
+probes confirmed failure then reverted; units suite; pgbench smoke via the
+pre-commit hook.

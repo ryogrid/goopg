@@ -1106,7 +1106,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `Filter` is a plan change). Verify by **value**, not row count. Ledger
       `tpcds-round2 Q75-eval-order`. Design
       `docs/design/0125-0004-q75-join-residual-evaluation-order.md`.
-- [ ] **M0125-0001 — `internal/planner/exprwalk.go` + exhaustiveness gate** (§13.5
+- [x] **M0125-0001 — `internal/planner/exprwalk.go` + exhaustiveness gate** (§13.5
       #4, phase 1.1). One `exprChildSlots` child-slot primitive over `plan.go`'s
       **32** concrete `Expr` types (the marker is unexported, so the set is
       closed), three distinctly-named drivers (walk / rewrite-in-place /
@@ -1128,6 +1128,29 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       an arithmetic slip — four have been hand-touched, so **seven** is the live
       figure. Design
       `docs/design/0125-0001-exprwalk-driver-and-exhaustiveness-gate.md`.
+      **DONE 2026-07-29.** `internal/planner/exprwalk.go` (`exprChildSlots` over all
+      32 types + `shallowCloneExpr`; drivers `walkExprRefs` /
+      `rewriteExprRefsInPlace` / `cloneExprRefs`; four-value `scopePolicy`), the
+      `go/ast` gate, and D6's 26 remap pins. **No call site converted** — `go vet`
+      reports all three drivers unused, which is the positive evidence that plan
+      shape cannot move, so no TPC-H run. **The gate was proved to FAIL before being
+      trusted**, twice: deleting the `*CollateExpr` arm, and declaring a 33rd `Expr`
+      type OUTSIDE `plan.go` — the latter validates D5's scan-every-package-file
+      requirement, since a `plan.go`-only parse would have passed and the gate would
+      have been worthless. Both probes reverted. Four deviations from the draft
+      (D1's `slotExprList` collapsed to per-element slots; D3's per-node callbacks
+      reduced to a per-call enum; drivers return `bool` because a veto must be
+      observable; leaves cloned not shared) are recorded with rationale in the design
+      doc's execution record. **Two findings the next loop must not re-derive: (1)**
+      `remapByPosMap` is ALREADY complete — 18 arms + 14 childless leaves = 32 —
+      confirming M0125-0002's re-base as a genuine no-op step with no absent arms;
+      **(2) M0125-0002's walker inventory is WRONG.** `walkExprTree`
+      (`unnest.go:1152`) is a further generic `Expr` walker with the same fail-open
+      `default:`, outside §2.4's seven (already nine after M0124-0003). §0 says
+      **fourteen**, §13.4 says seven, and neither figure has been re-derived from
+      source — do that FIRST or M0125-0002 closes against a list that was never
+      right. Two ledger rows appended (`exprwalk-node-side`; the walker-inventory
+      correction).
 - [ ] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
       phase 6.1). §13.5's highest-value item (15–16 of 21 defects); stage 1 is
       inert, so it lands early. `tableRows` (`cardinality.go:89`) returns
