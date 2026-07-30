@@ -1,46 +1,51 @@
 (idle — nothing in flight)
 
-Loop #9 (2026-07-31) took the shared CTE/outer-join arm of **M0125-0034 +
-M0125-0035** that the banner named, and it landed the OUTER-JOIN half.
-Committed + pushed.
+Loop #10 (2026-07-31) took **M0125-0036** (C3) per the banner. Landed, gated,
+committed and pushed (`cae0b44d` + the gate-evidence commit on top).
 
-`internal/planner/inner_join_qual_pushdown.go`: `joinRestrictionSides` (new,
-the single policy site) + `pushConjunctIntoSubtree` (new, replaces the
-one-level attach in `pushInnerJoinInputQuals`). Tests in the sibling
-`_test.go` (old `…DeclinesOnOuterJoin` pin narrowed to
-`…DeclinesOnUnpreservedJoin`; three new pins). Design
-`docs/design/0125-0035a-preserved-side-restriction-descent.md`, evidence
-`analysis/m0125-0035a-preserved-side-descent/`.
+`internal/planner/exists_to_any.go` (new pass, `GOOPG_EXISTS_TO_ANY=off`),
+wired from `planner.Plan` between the last index-rewriting pass and
+`lowerSubPlanParams`. Design
+`docs/design/0125-0036-exists-to-any-hashed-subplan.md`, evidence
+`analysis/m0125-0036-exists-to-any/`. goopg now has PG's
+`convert_EXISTS_to_ANY`: an OR-ed, non-negated, single-equality correlated
+EXISTS becomes an uncorrelated `= ANY (SubPlan n)` that the Stage-11 hash
+probe builds once.
 
-Two restrictions retired: INNER-only → preserved-side-only (a restriction
-naming only the preserved side is safe with NO nullingrels model; nullable
-side / FULL / SEMI / ANTI still decline; CROSS admitted), and
-immediate-child-only → descent to the deepest holder.
+Five findings the next loop should not rediscover:
+1. **The task's acceptance row was already green.** -0036 said "Q10 completes
+   and matches `10|OK|0|1f18d650…`"; the loop-#9 gate already had `Q10 PASS
+   35s`. The query that actually moves is **Q35, TIMEOUT 327 s → PASS 18 s**.
+   -0026's acceptance rows predate -0005/-0007/-0008/-0034/-0035a — re-read
+   the latest `sweep-*.txt` before treating one as a target (ledger row).
+2. **Q10's oracle is 0 rows, so it cannot detect an empty value set.** The
+   first version of the pass read a **stale post-MHJ column index** and
+   returned 0 rows for Q35's 100 while passing Q10. Fixed by
+   `resolveHostOperandIdx`; MHJ packing OID-re-sorts its output and treats a
+   sublink body as opaque, so an index recorded inside one is not trustworthy
+   after it (same class as M0071-0003).
+3. **A silent wrong answer was found while probing and is NOT mine**: two
+   hand-written OR-ed uncorrelated `IN (subquery)` sublinks under a
+   SEMI-over-MHJ answer 1329 where PG says 1294 (either alone is exact).
+   Filed **M0125-0042**; it outranks a timeout on severity.
+4. **Q30/Q81 are NOT closed** — C3's correlated-scalar-aggregate half. Filed
+   **M0125-0041** with a warning that this pass does not generalise (their
+   shareable object is a grouped aggregate, not a value set).
+5. Scope is bounded by NULL semantics (`IN` three-valued vs EXISTS
+   two-valued), pinned by a new `boundedQualSpine` walker role — widening the
+   AND/OR-only walk would make the pass WRONG, not merely incomplete.
 
-Four findings the next loop should not rediscover:
-1. **The two open items SEPARATED, they did not converge.** -0035's remainder
-   is a CTE-BODY problem (needs single-reference `cte_inline` + EC constant
-   propagation for Q78); -0034's remainder is a JOIN-ORDER problem.
-2. **-0034's stated starting point is REFUTED by measurement.** CROSS was
-   admitted to the pass and ZERO of the 8 crosses moved. Q64 places
-   `date_dim d2`/`d3` before the `customer` their equi-predicate needs, so
-   `pushOneConjunct` is correct to decline a side-spanning conjunct. Resume in
-   `joinorder.go`/`bushy.go` (collapse/greedy threshold vs FROM order).
-3. **Q18's TIMEOUT → PASS is NOT this change** — its plan is byte-identical;
-   loop #8's reading was contaminated by the live nightly. Stays `M0125-0033`.
-4. `tmp/goopg-m0125-0035-bin` is loop #8's binary = the clean A arm for any
-   A/B against this commit.
+Gates (quiet host, nightly not running): units PASS; `tpch-spotcheck.sh`
+`RESULT=PASS` (Q12=2 Q13=35, 32.7 s); TPC-H plan-diff vs
+`m0125-0035-c2-qual-placement` **1/22 (Q17) and the SAME 1/22 with the switch
+OFF ⇒ plan-neutral on all 22** (Q17 is -0035a's); full 99-query SF0.5 gate
+**PASS=90 (54 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=4**, one
+changed cell out of 99, all 89 common PASSes identical in status AND checksum.
 
-Gates (host verified QUIET all loop — nightly ended 04:08): units PASS;
-`tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35); TPC-H plan-diff vs
-`m0125-0035-c2-qual-placement` **1/22 (Q17), zero structural change**; timed
-w2 A/B **neutral** (395.5 → 389.1 s, identical rows on all 21 completers);
-full 99-query SF0.5 gate **PASS=89 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6
-SKIP=4**, all 87 common PASSes identical in status AND checksum.
+Per the banner the next selection is **`M0125-0037` stage (ii)**. Re-read the
+banner first; it outranks this note.
 
-Per the banner the next selection is **`M0125-0036`** (C3, uncached correlated
-SubPlan). Re-read the banner first; it outranks this note.
-
-Clusters left DOWN as found; :65438 (PG) was already UP and is left UP.
-Filed this loop, unworked per the banner: M-NIGHTLY
-`testport/TestE2E_FailoverGoopgToPG` (AI-20260731-001201-001).
+Clusters: SF0.5 :65437 left UP (my binary `tmp/goopg-m0125-0036-bin`); TPC-H
+:65433 stopped; :65438 (PG) was already UP and is left UP.
+Filed this loop, unworked per the banner: nothing new — AI-20260731-001201-001
+was already on the M-NIGHTLY list at line 461.

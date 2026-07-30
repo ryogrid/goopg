@@ -6,13 +6,34 @@ oracle `:65438` db `tpcds05` user `ryo`, quiet host, 2026-07-31.
 
 ## Acceptance
 
-| query | before | after | rows | oracle rows |
+Gate baseline is loop #9's `analysis/m0125-0035a-preserved-side-descent/sweep-chunk*.txt`
+(`PASS=89 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6 SKIP=4`); this run is
+`sf05/sweep-20260731-{072144,074735,081547}.txt` (three contiguous `QUERIES=`
+chunks, one binary):
+**`PASS=90 (54 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=4`**.
+
+Diffed cell by cell over all 99 queries, **exactly one changed**:
+
+```
+< Q35 TIMEOUT rows)
+> Q35 PASS n/a
+```
+
+| query | baseline (loop #9 gate) | this run | rows | oracle rows |
 |---|---|---|---|---|
-| Q10 | TIMEOUT (>300 s) | 16.9 s | 0 | 0 (`10\|OK\|0\|1f18d650d205d71d\|11`) |
-| Q35 | TIMEOUT (>300 s) | 14.0 s | 100 | 100 (`35\|OK\|100\|n/a\|0`) |
-| Q69 (§C3's control) | 17 s | 17.3 s | 100 | 100 |
-| Q30 | TIMEOUT | TIMEOUT (345 s) | — | 31 |
-| Q81 | TIMEOUT | TIMEOUT (350 s) | — | 100 |
+| Q35 | **TIMEOUT 327 s** | **PASS 18 s** | 100 | 100 (`35\|OK\|100\|n/a\|0`) |
+| Q10 | PASS **35 s** | PASS **16 s** | 0 | 0 (`10\|OK\|0\|1f18d650d205d71d\|11`) |
+| Q69 (§C3's control) | PASS 15 s | PASS 15 s | 100 | 100 |
+| Q30 | TIMEOUT | TIMEOUT | — | 31 |
+| Q81 | TIMEOUT | TIMEOUT | — | 100 |
+
+**Q10 was already green before this change**, despite the task body naming it
+as the acceptance row: the `GOOPG_RELSIZE_FALLBACK` default flip (`M0125-0005`)
+had rescued it, and the "TIMEOUT" label on Q10 comes from `M0125-0026`'s
+capture in an earlier planner regime. The solo timings taken during
+development (Q10 16.9 s, Q35 14.0 s, Q30 345 s, Q81 350 s) are consistent with
+the gate but were measured with other clients on the host; the gate numbers
+above are the ones to quote.
 
 Q30/Q81 are §C3's correlated-scalar-aggregate variant; this pass declines both
 (scalar sublink, aggregating body) and they are unchanged. Recorded so the

@@ -127,10 +127,28 @@ SF=0.5, one binary, quiet host (`analysis/m0125-0036-exists-to-any/`):
 
 | query | before | after | oracle rows | verdict |
 |---|---|---|---|---|
-| Q10 | TIMEOUT (>300 s) | **16.9 s** | 0 | rows = oracle |
-| Q35 | TIMEOUT (>300 s) | **14.0 s** | 100 | rows = oracle |
-| Q69 (control) | 17 s | 17 s | 100 | unchanged, still a semi/anti chain |
+| Q35 | **TIMEOUT (327 s)** | **18 s** | 100 | TIMEOUT → PASS |
+| Q10 | 35 s (already PASS) | **16 s** | 0 | 2.2× faster, same checksum |
+| Q69 (control) | 15 s | 15 s | 100 | unchanged, still a semi/anti chain |
 | Q30, Q81 | TIMEOUT | TIMEOUT | 31 / 100 | untouched — see §6 |
+
+**A correction this doc must carry, because the task body would mislead the
+next reader.** `M0125-0036`'s stated acceptance is *"Q10 completes and matches
+`10|OK|0|1f18d650…`"* — but Q10 had **already** stopped timing out before this
+change: the `GOOPG_RELSIZE_FALLBACK` default flip (`M0125-0005`) rescued it, and
+the immediately preceding gate (loop #9, `analysis/m0125-0035a-preserved-side-descent/`)
+records `Q10 PASS 35s`. The "TIMEOUT" label attached to Q10 comes from
+`M0125-0026`'s capture, taken in an earlier planner regime. So the acceptance
+row was already green on arrival, and **the query that actually moves is Q35**.
+Q10's contribution is a 2.2× speed-up at an unchanged checksum.
+
+Full 99-query SF0.5 gate on one binary (`analysis/m0125-0036-exists-to-any/sf05/`,
+three contiguous `QUERIES=` chunks, quiet host):
+**`PASS=90 (54 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=4`**
+against the loop-#9 baseline's `PASS=89 … TIMEOUT=6`. Diffed cell by cell,
+**exactly one of the 99 changed** — Q35 `TIMEOUT → PASS` — and all 89 common
+PASSes agree in status *and* checksum. Remaining timeouts: Q30, Q64, Q65, Q78,
+Q81.
 
 Q10's plan is now structurally PG's:
 

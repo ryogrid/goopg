@@ -300,11 +300,19 @@ started.
 >       `internal/planner/exists_to_any.go` (`GOOPG_EXISTS_TO_ANY=off`). goopg
 >       now has PG's `convert_EXISTS_to_ANY`: an OR-ed single-equality
 >       correlated EXISTS becomes an UNCORRELATED `= ANY (SubPlan n)` that the
->       Stage-11 hash probe builds once. **Q10 TIMEOUT → 16.9 s (0 rows =
->       oracle) and Q35 TIMEOUT → 14.0 s (100 rows = oracle)**; Q69, §C3's own
->       control, is unchanged at 17 s. TPC-H plan-diff 1/22 **and the same 1/22
->       with the switch OFF — plan-neutral on all 22**; units PASS;
->       `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35). The item's premise
+>       Stage-11 hash probe builds once. Full 99-query SF0.5 gate on one binary:
+>       **`PASS=90 (54 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5
+>       SKIP=4`** vs loop #9's `PASS=89 … TIMEOUT=6`, and diffed cell by cell
+>       **exactly one of the 99 changed — `Q35 TIMEOUT (327 s) → PASS (18 s,
+>       100 rows)`** — every other query identical in status AND checksum.
+>       **READ THE ACCEPTANCE ROW CAREFULLY: `Q10` was ALREADY PASSING at 35 s**
+>       before this change (the `GOOPG_RELSIZE_FALLBACK` flip rescued it; the
+>       "TIMEOUT" label on Q10 comes from -0026's older-regime capture), so the
+>       item's stated acceptance was green on arrival and Q10's contribution here
+>       is 35 s → 16 s at an unchanged checksum. Q69, §C3's own control, is
+>       unchanged at 15 s. TPC-H plan-diff 1/22 **and the same 1/22 with the
+>       switch OFF — plan-neutral on all 22**; units PASS; `tpch-spotcheck.sh`
+>       `RESULT=PASS` (Q12=2 Q13=35). The item's premise
 >       ("the fix is caching, not decorrelation") was followed and then refined
 >       by arithmetic rather than overruled: the outer key is unique per outer
 >       row, so caching is all misses; removing the correlation is what makes
@@ -3626,9 +3634,17 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       makes the set shareable is removing the correlation, which is exactly what
       PG's own plan does via `convert_EXISTS_to_ANY` (subselect.c:1731) — and the
       *result* is still hashing, through the machinery goopg already had
-      (`executor/subplan_hash.go`). **Acceptance MET: Q10 TIMEOUT → 16.9 s, 0
-      rows = oracle; Q35 TIMEOUT → 14.0 s, 100 rows = oracle** (Q35 coordinated,
-      not duplicated, per this item). Gates: units PASS; `tpch-spotcheck.sh`
+      (`executor/subplan_hash.go`). **Acceptance MET, but not the way the row reads:
+      `Q10` was ALREADY PASSING at 35 s at the loop-#9 baseline** — the
+      `GOOPG_RELSIZE_FALLBACK` flip (`M0125-0005`) had rescued it, and the
+      "TIMEOUT" label on Q10 comes from -0026's capture in an earlier planner
+      regime. Q10 now runs in 16 s with the same checksum, and **the query that
+      actually moves is Q35: TIMEOUT (327 s) → PASS (18 s, 100 rows = oracle)**
+      (coordinated with `M0125-0003`, not duplicated, per this item). Full
+      99-query SF0.5 gate: **`PASS=90 (54 ck-verified) MISMATCH=0 CKMISMATCH=0
+      ERROR=0 TIMEOUT=5 SKIP=4`** vs loop #9's `PASS=89 … TIMEOUT=6`; diffed
+      cell by cell, **exactly one of the 99 changed** and all 89 common PASSes
+      agree in status AND checksum. Gates: units PASS; `tpch-spotcheck.sh`
       `RESULT=PASS` (Q12=2 Q13=35); TPC-H plan-diff 1/22 (Q17) **and the same
       1/22 with the switch OFF, so the change is plan-neutral on all 22** —
       Q17 belongs to M0125-0035a. **Two silent traps, both worth not
