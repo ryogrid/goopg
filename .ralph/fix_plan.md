@@ -295,6 +295,35 @@ started.
 >       arm after it, and read each item's own resume point — they are now
 >       different subsystems. Four ledger rows 2026-07-31 (three appended, one
 >       flipped to `resolved`).
+>       **↳ `M0125-0036` IS DONE (2026-07-31, loop #10) for C3's EXISTS half.**
+>       Design `docs/design/0125-0036-exists-to-any-hashed-subplan.md`; pass
+>       `internal/planner/exists_to_any.go` (`GOOPG_EXISTS_TO_ANY=off`). goopg
+>       now has PG's `convert_EXISTS_to_ANY`: an OR-ed single-equality
+>       correlated EXISTS becomes an UNCORRELATED `= ANY (SubPlan n)` that the
+>       Stage-11 hash probe builds once. **Q10 TIMEOUT → 16.9 s (0 rows =
+>       oracle) and Q35 TIMEOUT → 14.0 s (100 rows = oracle)**; Q69, §C3's own
+>       control, is unchanged at 17 s. TPC-H plan-diff 1/22 **and the same 1/22
+>       with the switch OFF — plan-neutral on all 22**; units PASS;
+>       `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35). The item's premise
+>       ("the fix is caching, not decorrelation") was followed and then refined
+>       by arithmetic rather than overruled: the outer key is unique per outer
+>       row, so caching is all misses; removing the correlation is what makes
+>       the set shareable, and the *result* is still hashing. **Three things
+>       bind later loops: (1) Q30/Q81 are NOT closed** — they are the
+>       correlated-scalar-aggregate variant, still TIMEOUT, refiled as
+>       **`M0125-0041`** with an explicit warning not to assume this pass
+>       generalises (the shareable object there is a grouped aggregate, not a
+>       value set); **(2) a SILENT WRONG ANSWER was found while probing and is
+>       filed as `M0125-0042`** — two hand-written OR-ed uncorrelated `IN
+>       (subquery)` sublinks under a SEMI-over-MHJ answer 1329 where PG says
+>       1294, pre-existing at HEAD and unrelated to this pass; **(3) the
+>       acceptance row a task names can be blind to its own defect** — Q10's
+>       oracle is 0 rows, so the first version of this pass (which read a stale
+>       post-MHJ column index) PASSED Q10 while returning 0 rows for Q35's 100.
+>       Seven ledger rows 2026-07-31. **NEXT SELECTION: `M0125-0037` stage (ii)**
+>       per the adopted order (`-0038` stays last); `-0041`/`-0042` and
+>       `-0034`'s join-order arm follow, and `-0042` outranks a timeout item on
+>       severity whenever the banner is next revised.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3582,9 +3611,37 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (b) and (c) remain untouched. Three ledger rows 2026-07-31; the earlier
       "declines every OUTER join" row is flipped to `resolved`.
 
-- [ ] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
+- [x] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
       no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same
-      README §"C3"). goopg renders Q10/Q35 as `Hash Join (SEMI)` with
+      README §"C3"). **↳ DONE 2026-07-31 for the EXISTS half; Q30/Q81 are NOT
+      closed and are refiled below as `M0125-0041`.** Design
+      `docs/design/0125-0036-exists-to-any-hashed-subplan.md`; pass
+      `internal/planner/exists_to_any.go` (kill switch `GOOPG_EXISTS_TO_ANY=off`);
+      tests `internal/planner/exists_to_any_test.go`; evidence
+      `analysis/m0125-0036-exists-to-any/`. The item's own instruction — "do not
+      pre-commit to decorrelation, the fix is hashed-SubPlan caching" — was
+      followed and then REFINED by the arithmetic: per-correlation-key caching
+      cannot reach this shape at all, because the outer key `c_customer_sk` is
+      unique per outer row and **every call is a miss by construction**. What
+      makes the set shareable is removing the correlation, which is exactly what
+      PG's own plan does via `convert_EXISTS_to_ANY` (subselect.c:1731) — and the
+      *result* is still hashing, through the machinery goopg already had
+      (`executor/subplan_hash.go`). **Acceptance MET: Q10 TIMEOUT → 16.9 s, 0
+      rows = oracle; Q35 TIMEOUT → 14.0 s, 100 rows = oracle** (Q35 coordinated,
+      not duplicated, per this item). Gates: units PASS; `tpch-spotcheck.sh`
+      `RESULT=PASS` (Q12=2 Q13=35); TPC-H plan-diff 1/22 (Q17) **and the same
+      1/22 with the switch OFF, so the change is plan-neutral on all 22** —
+      Q17 belongs to M0125-0035a. **Two silent traps, both worth not
+      rediscovering:** (1) the operand index taken verbatim from the body's
+      `OuterColumnRef` is STALE after MHJ packing (which OID-re-sorts its output
+      while treating a sublink as opaque) and made Q35 return **0 rows instead of
+      100** — `resolveHostOperandIdx` re-resolves it, and note that **Q10's own
+      acceptance row could not have caught this, because Q10's oracle IS 0 rows**;
+      (2) a join's predicate row is `left ++ right`, which is not `Output()` for
+      SEMI/ANTI. Scope is bounded by NULL semantics, not by taste: `IN` is
+      three-valued where EXISTS is two-valued, so only qual positions reached
+      through AND/OR convert and a negated EXISTS never does (upstream's
+      `isTopQual`/`unknownEqFalse`). Original wording follows. goopg renders Q10/Q35 as `Hash Join (SEMI)` with
       `Filter: (EXISTS(SubPlan 1) OR EXISTS(SubPlan 2))`, each SubPlan an
       uncached correlated hash join; PG renders the identical query as
       `Filter: ((ANY (c_customer_sk = (hashed SubPlan 2).col1)) OR (ANY (… =
@@ -3738,6 +3795,51 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       both complete inside the warm gate's budget with matching row counts.
       Bar: as `M0125-0034` (plan-diff `LABEL=tpcds-round2-head` + the SF0.5
       regression gate), because (a) and (b) are both executor/planner changes.
+
+- [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
+      re-evaluated per outer row** (filed 2026-07-31 by `M0125-0036`, which
+      closed C3's EXISTS half and deliberately did not touch this one).
+      Members: **Q30 and Q81**, both still `TIMEOUT` at SF=0.5 after -0036
+      (measured 345 s and 350 s, `analysis/m0125-0036-exists-to-any/README.md`).
+      `M0125-0026` §C3 called them "the correlated-scalar-agg variant of the
+      same gap" and priced them at CTE(≈2×10⁴) × `customer_address` 5×10⁴ = 1×10⁹
+      pairs, each surviving row re-scanning the CTE ⇒ ≈**2×10¹³** — five orders
+      above a 300 s budget, and §C3 lists C1 as compounding it.
+      **Why -0036 does not reach them and what that implies for the fix:** its
+      conversion turns a correlated EXISTS into an uncorrelated ANY, which is
+      only sound because EXISTS asks a *set-membership* question. A correlated
+      `(SELECT avg(x) … WHERE x.k = outer.k)` asks a per-group question, so the
+      shareable object is not a value set but the **grouped aggregate** — i.e.
+      the transformation is the scalar-sublink pull-up goopg already has
+      (`unnest.go`'s GROUP BY aggregate + hash join), and the question is why it
+      declines here. Start by finding out: instrument or read
+      `subqueryANDReachable` / the scalar path's guards against Q30's actual
+      plan before designing anything, because -0034's stated starting point was
+      refuted the same way. Do NOT assume the -0036 pass generalises.
+      Acceptance: **Q30 completes and matches `30|OK|31|f47a48499fd7e070`**.
+      Bar: as `M0125-0034`.
+
+- [ ] **M0125-0042 — two OR-ed uncorrelated `IN (subquery)` sublinks over-match
+      under a SEMI join over an MHJ** (filed 2026-07-31 by `M0125-0036`, found
+      while probing; **pre-existing at HEAD, not caused by that change**).
+      Reproducer and both arms in `analysis/m0125-0036-exists-to-any/`
+      (`probe35g.sql` vs `p2.sql`), SF=0.5 against the PG 18.3 oracle on
+      `:65438` db `tpcds05`:
+      **one** hand-written `c.c_customer_sk IN (SELECT …)` under the same
+      MHJ+SEMI shape answers **377 = PG**, but **two** of them OR-ed answer
+      **1329 where PG says 1294** — an over-match of 35, i.e. rows are admitted
+      that neither arm should admit. The EXISTS→ANY pass never fires on this
+      query (its only EXISTS is a top-level conjunct, which that pass declines),
+      and the *converted* form of the same predicate answers 1294 correctly —
+      which localises the defect to how a hand-written `InExpr` is indexed or
+      unnested, NOT to the shared executor probe. First suspicion, by analogy
+      with -0036's own trap: `visitColumnRefs` DOES descend into `*InExpr`
+      (unlike `*ExistsExpr`/`*OuterColumnRef`, bushy.go:422), so an MHJ re-sort
+      may shift one arm's Operand while `isUnnestableNonCorrelatedIn` reshapes
+      the other. Verify that before designing. Note this is a **silent wrong
+      answer**, so it outranks a timeout in severity even though no gate query
+      currently exercises it. Acceptance: `probe35g.sql` answers 1294, plus a
+      regression test at the planner or executor level. Bar: as `M0125-0034`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

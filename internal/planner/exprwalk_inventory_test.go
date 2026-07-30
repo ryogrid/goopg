@@ -81,6 +81,16 @@ const (
 	// for correctness — but it is still counted here, because "does not
 	// recurse" is a property that a later edit can quietly take away.
 	nonRecursiveClassifier walkerRole = "classifier"
+
+	// boundedQualSpine recurses, but over a CLOSED set of node types chosen
+	// for a semantic reason rather than for coverage: completing it would
+	// make it WRONG. Added by M0125-0036, whose EXISTS→ANY conversion walks
+	// only the AND/OR spine of a qual, because every other position — NOT,
+	// CASE, a function argument — is one where the ANY form's NULL is
+	// distinguishable from the EXISTS form's FALSE. An exprwalk driver is
+	// therefore not the fix for these; the closed set IS the invariant, and
+	// pinning it here is how a later edit that widens the set gets audited.
+	boundedQualSpine walkerRole = "bounded-qual-spine"
 )
 
 // exprSwitchInventory pins every Expr type switch in package planner, keyed
@@ -103,7 +113,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:visitColumnRefs":         walkerPending, // 7 of 32 arms
 	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
 	"bushy.go:visitColumnRefsForTable": walkerPending, // 12 of 32 arms
-	"exprwalk.go:exprChildSlots":       exprwalkPrimitive,
+	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
+	// the transformation's NULL-semantics invariant, not an omission.
+	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,
+	"exprwalk.go:exprChildSlots":              exprwalkPrimitive,
 	// Added by M0125-0024: the per-node half of the identity key, complete
 	// over all 32 types and gated with the other two by
 	// exprwalk_exhaustive_test.go.
@@ -305,7 +318,7 @@ func TestExprSwitchInventoryIsPinned(t *testing.T) {
 
 	for key, role := range exprSwitchInventory {
 		switch role {
-		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier:
+		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier, boundedQualSpine:
 		default:
 			t.Errorf("%s: unknown walkerRole %q", key, role)
 		}

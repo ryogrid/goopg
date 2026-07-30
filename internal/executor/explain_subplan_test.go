@@ -63,8 +63,32 @@ func assertNoOpaqueExpr(t *testing.T, plan string) {
 // shape hits a live planner non-termination bug at HEAD (design
 // bundle F1, fixed in stage S1a), so the IN forms are covered by
 // direct formatter unit tests at the bottom of this file.
+//
+// M0125-0036 AMENDED THE FIRST HALF OF THAT NOTE: "under an OR" is no
+// longer sufficient to keep a single-equality correlated EXISTS a
+// SubPlan, because that is exactly the shape the EXISTS→ANY conversion
+// consumes (it rewrites to a hashable uncorrelated `= ANY (SubPlan n)`).
+// Tests whose SUBJECT is the correlated-SubPlan machinery itself — the
+// handle lifecycle, the per-call stat counters, PARAM_EXEC rendering —
+// therefore call pinCorrelatedSubPlanPath below. Tests that merely need
+// *a* SubPlan (numbering, subtree indentation) are unaffected: the
+// converted form still renders one.
+
+// pinCorrelatedSubPlanPath switches the EXISTS→ANY conversion off for the
+// duration of a test whose subject is the correlated-SubPlan execution
+// path. That path stays live for every EXISTS the conversion declines
+// (composite correlation, an aggregating body, an inequality
+// correlation, a reference reaching past the body), so these tests still
+// pin real behaviour — they just cannot use the one probe shape the
+// conversion now claims.
+func pinCorrelatedSubPlanPath(t *testing.T) {
+	t.Helper()
+	planner.SetExistsToAnyEnabled(false)
+	t.Cleanup(func() { planner.SetExistsToAnyEnabled(true) })
+}
 
 func TestExplainSubPlanCorrelatedExists(t *testing.T) {
+	pinCorrelatedSubPlanPath(t)
 	ctx, cleanup := explainSubPlanFixture(t)
 	defer cleanup()
 

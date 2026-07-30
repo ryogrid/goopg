@@ -99,6 +99,13 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	if costDrivenJoinOrder {
 		reconcileNLILayout(node)
 	}
+	// M0125-0036 (C3): turn a correlated EXISTS that no pass could make a
+	// semi-join into a hashable uncorrelated ANY sublink (upstream's
+	// convert_EXISTS_to_ANY). Must run AFTER every index-rewriting pass —
+	// it synthesises a host-scope ColumnRef out of the body's
+	// OuterColumnRef — and BEFORE lowering, which is what would otherwise
+	// bind that correlation to a PARAM_EXEC slot.
+	node = rewriteExistsToAny(node)
 	return lowerSubPlanParams(node), nil
 }
 

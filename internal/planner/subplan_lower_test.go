@@ -104,6 +104,16 @@ func countRefsInPlan(t *testing.T, plan Node) (outer, execParam int) {
 }
 
 func TestLowerSingleLevelExists(t *testing.T) {
+	// M0125-0036: this fixture's shape (a single-equality correlated EXISTS
+	// under an OR) is exactly what the EXISTS→ANY conversion consumes, and
+	// an InExpr has nothing left to lower. The PARAM_EXEC path this test
+	// pins is still live for every EXISTS the conversion declines (composite
+	// correlation, an aggregating body, a reference reaching past the body),
+	// so the switch is turned off here rather than the fixture reshaped —
+	// reshaping would silently move the test off the single-level case it
+	// is named for.
+	SetExistsToAnyEnabled(false)
+	defer SetExistsToAnyEnabled(true)
 	cat := threeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x = -1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
