@@ -299,23 +299,31 @@ func TestEstimateRelSize_MatchesPostgresOracle(t *testing.T) {
 
 // ── gating ───────────────────────────────────────────────────────────────────
 
+// TestParseRelSizeFallbackStage pins the knob's contract AFTER M0125-0005
+// flipped the default 0 -> 2. Two entries here are the flip itself and are the
+// ones to read first if this fails: the empty string is now the default rather
+// than off, and an unparseable value lands on the default rather than off —
+// because once stage 2 is what goopg ships, "off" is a deviation, so a typo
+// must not silently hand an operator a planner production does not run.
 func TestParseRelSizeFallbackStage(t *testing.T) {
 	cases := map[string]int{
-		"":        0,
-		"0":       0,
-		"off":     0,
-		"false":   0,
-		"no":      0,
-		" OFF ":   0,
-		"on":      1,
-		"true":    1,
-		"YES":     1,
-		"1":       1,
+		"":      defaultRelSizeFallbackStage, // unset = the shipped default
+		"0":     0,                           // the explicit opt-out (design §7.3 RC-5's reopen path)
+		"off":   0,
+		"false": 0,
+		"no":    0,
+		" OFF ": 0,
+		// The word forms meant stage 1 while stage 1 was the whole feature.
+		// Post-flip they mean the default, so "true" cannot silently downgrade.
+		"on":      defaultRelSizeFallbackStage,
+		"true":    defaultRelSizeFallbackStage,
+		"YES":     defaultRelSizeFallbackStage,
+		"1":       1, // a numeral still selects its stage exactly
 		"2":       2,
 		"3":       3,
-		"9":       3, // clamped to the highest defined stage
-		"-1":      0,
-		"garbage": 0, // must NOT enable a plan-shape change
+		"9":       3,                           // clamped to the highest defined stage
+		"-1":      defaultRelSizeFallbackStage, // not a stage; not an opt-out either
+		"garbage": defaultRelSizeFallbackStage,
 	}
 	for in, want := range cases {
 		if got := parseRelSizeFallbackStage(in); got != want {

@@ -1,0 +1,12 @@
+tpch-spotcheck: building goopg + tpch-runner
+tpch-spotcheck: starting fresh goopg on 127.0.0.1:65433 (scope goopg-spotcheck, log /home/ryo/work/goopg/goopg/bench/tpch/runtime_goopg/goopg.spotcheck.log)
+tpch-spotcheck: planner-flags: GOOPG_RELSIZE_FALLBACK=2 GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOMEMLIMIT=12GiB GOGC=off
+tpch-spotcheck: data target = tpch@tpch
+tpch-spotcheck: running Q12 + Q13 (per-query timeout 600s)
+Q12: OK elapsed=19.63s rows=2
+Q13: OK elapsed=10.37s rows=35
+tpch-spotcheck: cost: query-phase wall clock 30.9s
+tpch-spotcheck: cost: peak scope memory 10273 MB (cgroup memory.peak, scope goopg-spotcheck)
+tpch-spotcheck: Q12 PASS — rows=2 (expected 2)
+tpch-spotcheck: Q13 PASS — rows=35 (expected 35)
+tpch-spotcheck: RESULT=PASS

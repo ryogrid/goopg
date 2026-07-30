@@ -182,8 +182,17 @@ started.
 >       `*Filter`-wrapped leaves without advancing `off`). Q47: 0 → **100 rows =
 >       oracle**. Its *runtime* verdict is deliberately NOT closed and is filed
 >       as the bookkeeping half below.
->    4. **NEXT SELECTION: `M0125-0005` first** (both halves of its evidence
->       landed 2026-07-30 — see item 1), then `M0125-0002` commit 2,
+>    4. ~~**`M0125-0005`**~~ — **DONE 2026-07-30: the default IS FLIPPED**
+>       (stage 2). Its owed spotcheck measurement came in at **2.43× FASTER**
+>       (75.0 → 30.9 s) with peak RSS unchanged and `Q12=2 / Q13=35` in all
+>       five runs, so the flip made the mandatory gate cheaper rather than
+>       costlier. Carried costs, which must not be dropped when this is cited:
+>       **Q72 1.13× slower and unexplained**, and **Q35 still TIMEOUTs**. The
+>       plan baseline is re-pinned to
+>       `plan_snapshots/m0125-0005-relsize-default-stage2.txt` — **any
+>       `analysis/` number predating 2026-07-30 is in a different planner
+>       regime and must not be compared across this commit.**
+>       **NEXT SELECTION: `M0125-0002` commit 2** (`cloneExprShiftIdx`), then
 >       `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
@@ -1743,7 +1752,36 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `evalExprSlot` calls for `Arg2`/`ExtraArgs` swallow identically, calling
       the sfunc with FEWER arguments than declared. Design
       `docs/design/0125-0025-sfunc-error-propagation.md`.
-- [ ] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
+- [x] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
+      **DONE 2026-07-30 — FLIPPED. The default is stage 2**
+      (`internal/planner/relsize.go`, `defaultRelSizeFallbackStage`); design
+      `docs/design/0125-0005-relsize-fallback-default-flip.md` Execution
+      section, written decision
+      `analysis/m0125-0005-spotcheck-20260730/README.md`. It flipped because
+      §D5.3's regression prediction is REFUTED: **none of round 4's five
+      pre-registered queries regressed** and Q12, its 4.4× loss, is a 3.4× win.
+      This task's own owed measurement — **`tpch-spotcheck.sh` wall clock AND
+      peak RSS in both states** — is discharged: two alternating runs per arm
+      plus one post-flip confirmation, **75.0 s → 30.9 s (2.43×)**, Q12
+      62.38 → 19.61 s, Q13 unmoved, **`Q12=2 / Q13=35` in all five runs**.
+      **Peak RSS is unchanged, reported as "indistinguishable" not "improved"**
+      — the off arm's own two readings differ by 1125 MB, more than any
+      off-vs-on gap; the on arm is reproducible to 3 MB. The gate now reports
+      its own cost (`planner-flags:` line + query-phase wall clock + cgroup v2
+      `memory.peak`). **The cost is carried, not buried: TPC-DS Q72 is 1.13×
+      slower (270 → 305 s), crosses the 300 s cap, and is unexplained — this
+      flip is NOT "no regressions"** — and **Q35, the acceptance query, still
+      times out**, so the flip is not sold as fixing it. Stage 3 is NOT folded
+      in (§I8 shadowing). Plan baseline re-pinned:
+      `plan_snapshots/m0125-0005-relsize-default-stage2.txt`, because the flip
+      moves **22/22** TPC-H plans (16 estimate-only, 6 structural — Q7 Q9 Q10
+      Q11 Q12 Q21) and `plan-gate` reads the newest snapshot, so the next
+      planner commit would have seen the flip as a regression; post-flip
+      plan-gate is 22/22 MATCH. Two ledger rows appended (the SF=1-for-SF0.5
+      substitution; **phase 6.2's greedy-join-order row, which this task was
+      told to update and which had never been written**), and the RC-5 row's
+      resume point now records its second precondition as satisfied. Original
+      wording follows.
       Separate commit, separate decision, so §7.3 RC-5's reopen criterion ("after
       the flag defaults on") has an owner. Requires: the C1→C2 table for every
       stage with the pre-registered watch list checked; a TPC-DS SF=1 sweep at both
