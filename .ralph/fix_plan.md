@@ -270,7 +270,19 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
-- [ ] **Nightly TPC-DS row anchors are DEAD — all 63 have never been checked**
+- [x] **Nightly TPC-DS row anchors are DEAD — all 63 have never been checked**
+      **DONE 2026-07-30 (interactive session, commit `63056c54`)** — the reader
+      now uses `expected_rows`, AND the same commit fixed a second, worse fault
+      found on top of it: `main()` referenced `tpcds_timings` that was local to
+      `analyze()`, so **every nightly since the tpcds lane landed crashed with
+      NameError before writing summary.md / action-items.md / history.jsonl**
+      (action-items.md was frozen at run `20260725-011243` for five nights —
+      do NOT re-file items about "stale action-items"; the mechanism is fixed).
+      Verified on a copy of run `20260730-011706`: completes STATUS=fail rc=2,
+      all 63 anchors load, the 15 ok queries MATCH, and a deliberately-wrong
+      `Q1,999` anchor via a doctored repo-root surfaces as `tpcds/Q1-rows`
+      regression — the item's acceptance probe. `test_summarize.py` 4/4 PASS.
+      The next real nightly run is the live confirmation. Original filing:
       (discovered 2026-07-30 while closing `M0125-0014`/`-0015`; not from
       `action-items.md`, and **not** one of the banner's two carve-outs, so it is
       filed and left unchecked). `ci/batch/lib/summarize.py:485` builds
