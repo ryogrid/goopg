@@ -354,3 +354,80 @@ to move a plan.
 The running nightly server survived (Go's linker unlinks and recreates, so the live inode stays),
 but any nightly stage that starts a server *after* such a rebuild silently picks up the new
 binary mid-run. Use a private `-o` path when a nightly may be in flight.
+
+### Commit 2 of 8 — `cloneExprShiftIdx` re-based onto `cloneExprRefs` (2026-07-30)
+
+Measured in `analysis/m0125-0002-c2-sf05-plans-20260730/` (quiet host).
+
+**D2 row 2's prediction is REFUTED, and it was refuted by measurement rather than argued away.**
+The row said commit 2 is "not inert … it does move plans", and the reasoning was right in every
+step: `cloneExprShiftIdx` fails *closed*, its caller abandons the whole inner-`Filter{SeqScan}`
+unwrap on a `false`, so teaching it 20 more kinds can only *open* the unwrap on shapes that
+declined before. What the row could not know is whether any such shape reaches this site. None
+does. TPC-H is **22/22 MATCH in `MODE=strict-text`** — byte-identical, not merely structurally
+equal — and TPC-DS SF0.5 is **96/96 byte-identical `EXPLAIN`**. The conjuncts that actually
+arrive on an inner `Filter{SeqScan}` at a Semi/Anti/Inner join were already inside the old
+12-arm set on both benchmarks. This is a negative result with teeth: goopg's `EXPLAIN` prints
+residual predicates in full, so a flipped unwrap decision would have shown as a conjunct moving
+from a leaf scan's `Filter:` onto the `Nested Loop`'s.
+
+**The SF0.5 answer sweep still ran, because the plan gate is blind to what the conversion
+actually changed on the queries it does touch.** The old arms *rebuilt* `*BinaryOp`, `*UnaryOp`
+and `*FuncCall` from a field list instead of copying the struct, and the lists were stale:
+`BinaryOp.ResultType`, `FuncCall.Variadic` and `FuncCall.ReturnType` were **dropped on every
+hoisted conjunct**. `shallowCloneExpr` copies the whole struct, so they now survive — a silent
+type-metadata loss removed, on a path where `EXPLAIN` renders both versions identically because
+it prints predicates by name. 99 cells, **PASS 83 / TIMEOUT 12 / MISMATCH 0 / CKMISMATCH 0 /
+ERROR 0**, 50 value checksums, every one equal to the `m0125-0003-sf05-relsize-20260730`
+baseline. The single differing cell is **Q72 `TIMEOUT 307 s` → `PASS 313 s`**, which is a cap
+flap and **not a rescue**: the newer run is slower, still over the 300 s cap, and Q72's plan is
+one of the 96 that are byte-identical. Q72 remains M0125-0005's unexplained 1.13× carried cost.
+
+**Completeness is not the same as admission, and this commit is where that distinction had to be
+written down.** `exprChildSlots` reports `*OuterColumnRef` and `*CTIDExpr` as childless leaves —
+a correct description of their child structure — so a conversion driven only by "the primitive
+knows this type" would have *admitted* both. Both are wrong-answer shapes here.
+`*OuterColumnRef` names a scope above this join that a flat outer++inner row cannot supply (the
+original walker's own documented decline, preserved). `*CTIDExpr` is worse than unsupported:
+`seqScanOp` injects the block/offset pair into the *scanned* row's slot
+(`MaterializedSlot.hasCTID`), so hoisting it to the NLI residual re-points it at the joined row
+and it reads the **outer** side's ctid. Both are vetoed explicitly, and
+`TestCloneExprShiftIdx_DeclinesRowBoundLeaves` was proved to fail with the veto arm removed
+before it was trusted.
+
+**D3's scope policy for this walker: `scopeVeto`.** Any node carrying an inner `Plan`
+(`*SubqueryExpr`, `*ExistsExpr`, a lowered `*InExpr`, `*ArraySubqueryExpr`,
+`*MultiAssignSubq*`) aborts the clone. The subplan's `OuterColumnRef`s are resolved against the
+*inner scan's* scope; the hoist moves the conjunct one level out and silently changes what
+Level 1 names, which no positional shift of the enclosing expression can repair. A Plan-*less*
+`*InExpr` — `col IN (1,2,3)` — is pure same-scope and is admitted.
+
+**Census pin DEMOTED, not deleted**, for exactly commit 1's reason: a two-arm bottom-up dispatch
+survives inside the `Rewrite` closure (shift a `*ColumnRef`; veto the two row-bound leaves) and
+the census attributes a closure's switch to its enclosing function. RC-1a class 48 → 47.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`make plan-diff LABEL=m0125-0005-relsize-default-stage2` 22/22 MATCH in both `structural` and
+`strict-text`; TPC-DS SF0.5 `EXPLAIN` 96/96 identical; TPC-DS SF0.5 answer sweep 99/99 as above;
+new pins in `internal/planner/nli_shift_arms_test.go`, every one proved to fail before the change
+(the admission pins against `HEAD`'s walker, the veto pins against a veto-less conversion);
+pgbench smoke via the commit hook.
+
+**Two deviations from D4, both deliberate and both recorded as ledger rows.** *Item 3's timed
+22-query TPC-H power run was NOT executed*: with `strict-text` reporting byte-identical plans the
+arms are the same plan on the same engine, and a published timing could only be host noise that
+a later loop would read as an effect. If any later commit in this series moves a TPC-H plan the
+timed run is owed again — this reasoning does not carry over. *Item 2's
+`LABEL=tpcds-round2-head` was retargeted* to `m0125-0005-relsize-default-stage2`, because
+`tpcds-round2-head` predates the M0125-0005 default flip and that flip moves 22/22 TPC-H plans by
+itself; diffing against it would bury this commit's signal under a previous commit's. D4's real
+requirement — name the label explicitly, never let `plan-gate`'s newest-by-mtime choose it — is
+kept. **Every remaining commit in this series must use the same retargeted label.**
+
+**A false line this commit found in the gate itself.** Every SF0.5 report header captured after
+M0125-0005 said `# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(off)`. The flip made unset mean
+*stage 2* and `=0` the opt-out; the reporter was never updated, so the artefact stated the
+opposite of the regime it measured — the M0125-0011 defect class (a report naming a binary it
+never ran) in its labelling form. Corrected to `unset(2)` in
+`scripts/tpcds-sf05-regression.sh` in this commit. The four raw chunk files are left as the
+harness wrote them and the merged report carries the correction as a note.

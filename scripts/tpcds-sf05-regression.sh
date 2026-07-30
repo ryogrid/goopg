@@ -524,8 +524,17 @@ cmd_sweep() {
         # and the comparison rests on the operator's memory of what was exported.
         # Every flag is printed even when unset, so "off" is a positive
         # statement in the file rather than the absence of a line.
+        #
+        # RELSIZE's unset label says `unset(2)`, not `unset(off)`, from
+        # 2026-07-30: M0125-0005 flipped defaultRelSizeFallbackStage to 2 and
+        # `=0` became the explicit opt-out. The old label survived the flip and
+        # made every artefact captured after it state the OPPOSITE of the
+        # regime it measured — the same defect class M0125-0011 fixed when the
+        # report could still name a binary it had never run. Corrected while
+        # capturing M0125-0002 commit 2's gate, whose own header was the first
+        # to carry the false line.
         printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
-            "${GOOPG_RELSIZE_FALLBACK:-unset(off)}" \
+            "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
             "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
             "${GOOPG_MEMOIZE:-unset(on)}" \
             "${GOOPG_PARALLEL:-unset(on)}"

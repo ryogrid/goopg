@@ -1,0 +1,6 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+    ->  WindowAgg (1 funcs)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (rk <= 100)
+      ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)

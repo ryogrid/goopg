@@ -1,0 +1,64 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T17:02:16+09:00
+# goopg: d4071df4 planner(costmodel): M0125-0005 — the relation-size fallback is now the default, and the gate it was feared to degrade got 2.43x cheaper
+# engine-id: 14da0579dab0d1c8b16a827eba614ff0f0c19997 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=099046e8717a
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=6fdcebecd86cf04c on-disk=6fdcebecd86cf04c (/home/ryo/work/goopg/goopg/tmp/goopg-c2-new)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(off) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25) — NOT a gate result; the summary below covers only these queries
+Q1   PASS       62s      100 rows  ck=n/a
+Q2   PASS       17s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        2s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   TIMEOUT   312s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q6   PASS       27s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       27s      100 rows  ck=n/a
+Q8   TIMEOUT   311s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q9   PASS       72s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       39s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       14s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       31s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  TIMEOUT   311s (oracle 200 rows)
+      (restarting goopg to drop accumulated heap)
+Q15  PASS        3s      100 rows  ck=n/a
+Q16  PASS       19s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       25s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      118s      100 rows  ck=n/a
+Q19  PASS       29s      100 rows  ck=n/a
+Q20  PASS        7s      100 rows  ck=n/a
+Q21  PASS       32s      100 rows  ck=n/a
+Q22  PASS       21s      100 rows  ck=n/a
+Q23  PASS       83s        1 rows  ck=00f53003bda23764
+Q24  PASS       34s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       26s        0 rows  ck=1f18d650d205d71d
+
+=== SUMMARY: PASS=21 (12 ck-verified, 9 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=3 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

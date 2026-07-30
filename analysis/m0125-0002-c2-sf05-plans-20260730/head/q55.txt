@@ -1,0 +1,11 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: sum DESC, i_brand_id
+    ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+            Workers Planned: 4
+        ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (((i_manager_id = 52) AND (d_moy = 11)) AND (d_year = 2000))
+          ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=27396 width=0)
+          ->  Seq Scan on public.item  (cost=0.00..0.00 rows=11776 width=0)
+          ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=505937 width=0)

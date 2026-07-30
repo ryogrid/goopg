@@ -769,57 +769,67 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 // rebind re-resolves the final index by name, using the shifted value
 // only as the which-side hint.
 //
-// Returns ok=false for any node kind it does not positively recognise —
-// including OuterColumnRef, which inside an inner filter means a
-// correlation into a scope above this join that a flat outer++inner row
-// cannot supply. Declining the whole rewrite (the caller's response)
-// keeps the hash path serving those shapes.
+// Returns ok=false for any node the flat outer++inner row cannot serve.
+// Declining the whole rewrite (the caller's response at :363) keeps the
+// hash path serving those shapes, so this is a fail-CLOSED admission
+// test: an unhandled kind costs an optimisation, never a wrong answer.
+//
+// M0125-0002 commit 2: built on cloneExprRefs / exprChildSlots instead of
+// its own 12-of-32 type switch. That is NOT inert — 20 previously
+// unrecognised kinds are now positively decided, and the ones that are
+// admitted OPEN the inner-Filter unwrap on shapes that declined before.
+// The newly admitted set is every pure same-scope container
+// (*IsNullExpr — the RC-1a/Q76 shape itself — plus *IsBoolExpr,
+// *ExtractExpr, *CollateExpr, *IsDistinctFromExpr, *RowExpr, *CaseExpr,
+// and a Plan-less *InExpr, i.e. `col IN (1,2,3)` inside an inner
+// filter), and the row-independent leaves (*ParamRef, *ExecParamRef,
+// *TableOidExpr, *MergeActionExpr, *MergeWholeRowRef) whose value does
+// not depend on where in the row they are evaluated.
+//
+// Two things stay DECLINED, and the declines are the correctness
+// argument for the rest:
+//
+//   - scopePolicy is scopeVeto, so any node carrying an inner Plan
+//     (*SubqueryExpr / *ExistsExpr / a lowered *InExpr /
+//     *ArraySubqueryExpr / *MultiAssignSubq*) aborts. The subplan's
+//     OuterColumnRefs are resolved against the INNER scan's scope; the
+//     hoist would move the conjunct one level out and silently change
+//     what Level 1 names. Positional shifting cannot fix that — see
+//     exprwalk.go's slotInnerPlan.
+//   - *OuterColumnRef and *CTIDExpr are vetoed explicitly, because
+//     exprChildSlots quite correctly reports both as childless leaves
+//     and a completeness-driven conversion would otherwise ADMIT them.
+//     OuterColumnRef inside an inner filter is a correlation into a
+//     scope above this join that a flat outer++inner row cannot supply
+//     (the original doc comment's reason, preserved). CTIDExpr is worse
+//     than unsupported: seqScanOp injects the block/offset pair into the
+//     scanned row's slot (MaterializedSlot.hasCTID), so hoisting it to
+//     the NLI residual re-points it at the joined row and it would read
+//     the OUTER side's ctid — a wrong answer, not a missed optimisation.
 func cloneExprShiftIdx(e Expr, shift int) (Expr, bool) {
-	switch x := e.(type) {
-	case nil:
-		return nil, true
-	case *ColumnRef:
-		cl := *x
-		if cl.Index >= 0 {
-			cl.Index += shift
-		}
-		return &cl, true
-	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst,
-		*NullConst, *TypedStringLit, *IntervalLit:
-		return e, true // literals are immutable — share
-	case *BinaryOp:
-		l, okL := cloneExprShiftIdx(x.Left, shift)
-		r, okR := cloneExprShiftIdx(x.Right, shift)
-		if !okL || !okR {
-			return nil, false
-		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, true
-	case *UnaryOp:
-		op, ok := cloneExprShiftIdx(x.Operand, shift)
-		if !ok {
-			return nil, false
-		}
-		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, true
-	case *CastExpr:
-		op, ok := cloneExprShiftIdx(x.Operand, shift)
-		if !ok {
-			return nil, false
-		}
-		cl := *x
-		cl.Operand = op
-		return &cl, true
-	case *FuncCall:
-		args := make([]Expr, len(x.Args))
-		for i, a := range x.Args {
-			cl, ok := cloneExprShiftIdx(a, shift)
-			if !ok {
-				return nil, false
+	// Set from inside Rewrite rather than returned, because the driver's
+	// Rewrite callback maps a node to a node and has no abort channel;
+	// the clone built along the way is simply discarded.
+	admissible := true
+	cl, ok := cloneExprRefs(e, scopeVeto, exprRewriter{
+		Rewrite: func(n Expr) Expr {
+			switch x := n.(type) {
+			case *ColumnRef:
+				// Index < 0 marks an unresolved ref; shifting it
+				// would manufacture a plausible-looking position.
+				if x.Index >= 0 {
+					x.Index += shift
+				}
+			case *OuterColumnRef, *CTIDExpr:
+				admissible = false
 			}
-			args[i] = cl
-		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}, true
+			return n
+		},
+	})
+	if !ok || !admissible {
+		return nil, false
 	}
-	return nil, false
+	return cl, true
 }
 
 // nliConsumedByProbe reports whether conjunct c is exactly one of the

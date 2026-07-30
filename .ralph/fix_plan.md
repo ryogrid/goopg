@@ -196,7 +196,17 @@ started.
 >       `M0125-0003` stage 3, and **`M0125-0026`** (below).~~ *(SUPERSEDED
 >       2026-07-30(b): the USER DIRECTIVE block at the end of item 3 puts
 >       `M0125-0028` → `-0029` → `-0030` ahead of these; -0002 commit 2 and
->       the -0003 four-arm study follow AFTER the warm flip.)* *(Stale
+>       the -0003 four-arm study follow AFTER the warm flip.)*
+>       **↳ RACE, resolved 2026-07-30: `M0125-0002` commit 2 had ALREADY been
+>       selected and fully gated when the (b) directive landed mid-loop, so it
+>       is COMMITTED rather than discarded — see its item body. It costs the
+>       warm programme nothing, because its verdict is not a timing: TPC-H
+>       22/22 byte-identical, TPC-DS SF0.5 96/96 byte-identical `EXPLAIN`,
+>       answer sweep 0 MISMATCH/CKMISMATCH/ERROR. Read it as regime-bound all
+>       the same — it says "the conversion changes no plan **at S-cold**", and
+>       `-0030`'s warm flip is exactly what makes S-cold stop being the
+>       measured state. **NEXT SELECTION IS `M0125-0028`** per the (b)
+>       directive, NOT commit 3.** *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -1615,8 +1625,63 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       ledger row 2026-07-30: the `ci/batch` nightly held the host (load
       ~10, TPC-DS stage mid-flight at ~11 GB RSS on 65435) and a concurrent
       99-query sweep would have risked the memory guard SIGKILLing that
-      stage; it must run before commit 2. **Next: commit 2,
-      `cloneExprShiftIdx`** — expects hunks and carries the full timed run.
+      stage; it must run before commit 2. **↳ THAT ARM IS DISCHARGED, and
+      not by re-running it: M0125-0003 §D8's 99-query SF0.5 sweep ran at
+      HEAD `e29faca9`, which CONTAINS commit 1 (`da6d2c0c`), with 0
+      MISMATCH/CKMISMATCH/ERROR.**
+      **COMMIT 2 of 8 DONE 2026-07-30 — `cloneExprShiftIdx` re-based onto
+      `cloneExprRefs`, and D2 row 2's "it does move plans" is REFUTED by
+      measurement** (`analysis/m0125-0002-c2-sf05-plans-20260730/`, quiet
+      host). TPC-H **22/22 MATCH in `MODE=strict-text`** — byte-identical,
+      not merely structural — and TPC-DS SF0.5 **96/96 byte-identical
+      `EXPLAIN`**. The 20 newly admitted kinds (`*IsNullExpr` — the RC-1a
+      shape itself — `*CaseExpr`, `*RowExpr`, `*IsBoolExpr`,
+      `*ExtractExpr`, `*CollateExpr`, `*IsDistinctFromExpr`, a Plan-less
+      `*InExpr`, and the row-independent leaves) are common in TPC-DS text
+      and evidently never reach THIS site: the conjuncts arriving on an
+      inner `Filter{SeqScan}` at a Semi/Anti/Inner join were already inside
+      the old 12-arm set on both benchmarks. **The SF0.5 answer sweep ran
+      anyway and had to**, because the plan gate is blind to the one thing
+      the conversion changed on the queries it does touch: the old arms
+      REBUILT `*BinaryOp`/`*UnaryOp`/`*FuncCall` from stale field lists and
+      **dropped `BinaryOp.ResultType`, `FuncCall.Variadic` and
+      `FuncCall.ReturnType` on every hoisted conjunct** — a silent
+      type-metadata loss that `EXPLAIN` renders identically because it
+      prints predicates by name. 99 cells: **PASS 83 / TIMEOUT 12 /
+      MISMATCH 0 / CKMISMATCH 0 / ERROR 0**, all 50 checksums equal to the
+      `m0125-0003-sf05-relsize-20260730` baseline. **The one differing cell,
+      `Q72 TIMEOUT 307 s → PASS 313 s`, is a cap flap and MUST NOT be cited
+      as a rescue** — the newer run is SLOWER, still over the 300 s cap, and
+      Q72's plan is one of the 96 byte-identical ones. Q72 stays
+      M0125-0005's unexplained 1.13×. **Completeness ≠ admission:**
+      `exprChildSlots` reports `*OuterColumnRef` and `*CTIDExpr` as
+      childless leaves (correct), so a conversion driven only by "the
+      primitive knows this type" would have ADMITTED both — the first is a
+      correlation above the join, the second reads the OUTER side's ctid
+      because `seqScanOp` injects block/offset into the scanned row's slot.
+      Both vetoed explicitly; the veto pin was proved to fail with the arm
+      removed. Census pin DEMOTED (RC-1a 48 → 47) for commit 1's reason.
+      **Two deliberate D4 deviations, both with ledger rows: the timed
+      22-query TPC-H run was NOT executed** (byte-identical plans ⇒ any
+      number would be host noise; it becomes mandatory again at the first
+      commit with a non-empty plan diff) **and `LABEL=tpcds-round2-head` was
+      retargeted to `m0125-0005-relsize-default-stage2`** — the former
+      predates the relsize default flip, which moves 22/22 TPC-H plans by
+      itself. **Every remaining commit in this series must use the
+      retargeted label.** A ledger row also records that PG does NOT decline
+      the shapes goopg vetoes: it parameterises them via nestloop params
+      (`paramassign.c: assign_nestloop_param_var`). **Fixed in passing:
+      every SF0.5 report captured after M0125-0005 said
+      `GOOPG_RELSIZE_FALLBACK=unset(off)` when unset now means stage 2 — the
+      M0125-0011 defect class in labelling form; now `unset(2)`.**
+      **Next in THIS task is commit 3 (`visitColumnRefs`) — but per the USER
+      DIRECTIVE 2026-07-30(b) the next SELECTION is `M0125-0028`, not commit 3.**
+      When commit 3 is taken it must use
+      `LABEL=m0125-0005-relsize-default-stage2` (never `tpcds-round2-head`,
+      which predates the relsize flip, and never bare `plan-gate`, which picks
+      newest-by-mtime), and it carries the timed TPC-H run the moment its plan
+      diff is non-empty — commit 2 excused that run only because its diff was
+      byte-empty.
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`

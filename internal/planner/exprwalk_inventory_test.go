@@ -117,7 +117,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
 	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
 	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
-	"nl_index_join.go:cloneExprShiftIdx":                        walkerPending, // 12 of 32 arms
+	// CONVERTED by M0125-0002 commit 2, and DEMOTED for the same reason
+	// commit 1's remapByPosMap was: the recursion and the exhaustiveness
+	// moved to exprChildSlots (via cloneExprRefs), but a two-arm bottom-up
+	// dispatch survives inside the Rewrite closure — shift a *ColumnRef,
+	// veto *OuterColumnRef / *CTIDExpr — and the census attributes a
+	// closure's switch to its enclosing function. RC-1a class 48 → 47.
+	"nl_index_join.go:cloneExprShiftIdx":                        nonRecursiveClassifier,
 	"nl_index_join.go:residualCostMultiplier":                   nonRecursiveClassifier,
 	// planner.go:exprEqual and planner.go:planExprContentKey were CONVERTED by
 	// M0125-0024 and their pins are DELETED, not demoted: unlike commit 1's

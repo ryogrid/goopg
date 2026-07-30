@@ -1,51 +1,47 @@
 (idle — nothing in flight)
 
-Last loop (#6 of this run, 2026-07-30 16:13–17:0x): **M0125-0005 is DONE — the
-`GOOPG_RELSIZE_FALLBACK` default IS FLIPPED to stage 2**, with its owed
-spotcheck measurement, written decision, design doc and re-pinned plan baseline.
+Last loop (#7, 2026-07-30 16:42–19:0x): **M0125-0002 commit 2 of 8 is DONE and
+committed** — `cloneExprShiftIdx` re-based onto `cloneExprRefs`/`exprChildSlots`.
 
-Files: `internal/planner/relsize.go` (`defaultRelSizeFallbackStage`, inverted
-parser arms), `internal/planner/relsize_fallback_test.go` (parse contract),
-`scripts/tpch-spotcheck.sh` (planner-flags line + wall clock + cgroup
-`memory.peak`), `docs/design/0125-0005-…md` (Execution section appended to the
-2026-07-28 stub), `docs/design/README.md`, `.ralph/fix_plan.md` (banner + item),
-`.ralph/deferral_ledger.md` (2 new rows + RC-5 resume point),
-`analysis/m0125-0005-spotcheck-20260730/`,
-`plan_snapshots/m0125-0005-relsize-default-stage2.txt`.
+Files: `internal/planner/nl_index_join.go` (`cloneExprShiftIdx`),
+`internal/planner/nli_shift_arms_test.go` (NEW, 7 pins),
+`internal/planner/exprwalk_inventory_test.go` (pin demoted),
+`scripts/tpcds-sf05-regression.sh` (stale `unset(off)` label → `unset(2)`),
+`docs/design/0125-0002-…md` (Commit-2 execution record),
+`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (2 rows),
+`analysis/m0125-0002-c2-sf05-plans-20260730/`.
 
 ## Facts the next loop should NOT re-derive
 
-- Spotcheck, 2 alternating runs/arm + 1 post-flip: **off 75.0 s → on 30.9 s
-  (2.43×)**, Q12 62.38 → 19.61 s, Q13 unmoved, **Q12=2 / Q13=35 in all five**.
-  Peak RSS **indistinguishable** (off arm's own spread 1125 MB > any arm gap;
-  on arm reproducible to 3 MB).
-- **§D5.3's regression prediction is REFUTED** — none of round 4's five
-  pre-registered queries regressed. That is why it flipped.
-- Carried costs that must survive every future citation: **Q72 1.13× slower
-  (270→305 s), crosses the 300 s cap, UNEXPLAINED**; **Q35 still TIMEOUTs** —
-  the flip is NOT what Q35 was waiting for, and is NOT "no regressions".
-- **Any `analysis/` number predating 2026-07-30 is a different planner
-  regime.** The flip moves 22/22 TPC-H plans (16 estimate-only, 6 structural:
-  Q7 Q9 Q10 Q11 Q12 Q21). Q12's only structural hunk is
-  `Hash Join (INNER)` → `(INNER, build=left)` — the mechanism of its 3.18×.
-- Plan baseline re-pinned; `make plan-gate` = **22/22 MATCH rc=0**. `plan-gate`
-  picks the NEWEST snapshot by mtime — that is why re-pinning was mandatory.
-- SF0.5 gate deliberately NOT re-run: criterion is
-  `MISMATCH+CKMISMATCH+ERROR==0`, the stage-2 arm scored 0/0/0 over 99 queries,
-  and unset-vs-`=2` differs only by a unit-tested parser branch.
-- Parser failure direction INVERTED: unparseable and `on`/`true`/`yes` now land
-  on the default (2), not off. `=0` is the explicit opt-out.
+- **D2 row 2 ("commit 2 does move plans") is REFUTED by measurement.** TPC-H
+  22/22 MATCH in `MODE=strict-text` (byte-identical); TPC-DS SF0.5 96/96
+  byte-identical `EXPLAIN`. The 20 newly admitted kinds never reach that site.
+- SF0.5 answer sweep ran anyway and had to: the old arms dropped
+  `BinaryOp.ResultType` / `FuncCall.Variadic` / `FuncCall.ReturnType` on every
+  hoisted conjunct, which `EXPLAIN` cannot show. **PASS 83 / TIMEOUT 12 /
+  MISMATCH 0 / CKMISMATCH 0 / ERROR 0**, all 50 cks equal to baseline.
+- **`Q72 TIMEOUT 307 s → PASS 313 s` is a CAP FLAP, not a rescue** — slower run,
+  still over 300 s, byte-identical plan. Do not cite it as a win.
+- Commit 1's owed SF0.5 arm was already discharged: §D8's sweep ran at
+  `e29faca9`, which contains `da6d2c0c`.
+- **Use `LABEL=m0125-0005-relsize-default-stage2`** for every remaining commit
+  in this series. `tpcds-round2-head` predates the relsize flip; bare
+  `plan-gate` picks newest-by-mtime.
+- Timed 22-query TPC-H run NOT executed (byte-identical plans); ledger row says
+  it is mandatory again at the first commit with a non-empty plan diff.
 
-## NEXT (banner order, already updated to match)
+## NEXT (banner order)
 
-1. **`M0125-0002` commit 2** (`cloneExprShiftIdx`) — walker conversion, 1 of 8
-   commits already in.
-2. `M0125-0003` stage 3 (needs its own arms; §I8 shadowing).
-3. `M0125-0026` (host-independent — take it when the host is busy).
+**A USER DIRECTIVE 2026-07-30(b) landed MID-LOOP** (a concurrent `ralph_loop.sh`
+was live) and reorders the queue: **`M0125-0028` → `-0029` → `-0030`** (the
+warm-statistics programme) come **before** `M0125-0002` commit 3 and the -0003
+four-arm study. `-0028` is small and host-independent. Read the directive block
+in `.ralph/fix_plan.md` (around line 240) before selecting.
 
-Gates run: units precommit PASS; `go build ./...` OK; spotcheck ×5 PASS;
-`make plan-gate` 22/22 MATCH; `make plan-diff` 22/22 diverged (the flip);
-`make ralph-state-guard` OK (auto-repaired a stale completed marker);
-pgbench smoke via the commit hook. NOT run: TPC-DS SF0.5 (reasoned, see above).
+Gates run: units precommit PASS; `go build ./...` + `go vet` clean; census gate
+PASS; 7 new pins PASS **and proved to fail before the change in both
+directions**; `make plan-diff` structural AND strict-text 22/22 MATCH; SF0.5
+`EXPLAIN` 96/96 identical; SF0.5 answer sweep 99/99; `make ralph-state-guard`
+OK; pgbench smoke via the commit hook.
 
 In-flight: none.
