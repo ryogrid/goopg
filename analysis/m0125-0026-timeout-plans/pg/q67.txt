@@ -1,0 +1,44 @@
+-- M0125-0026 capture  arm=pg  engine=pg  query=67
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query67.sql
+-- psql -h 127.0.0.1 -p 65438 -U ryo -d tpcds05 
+                                                                                        QUERY PLAN                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=43837.60..43844.54 rows=100 width=273)
+   ->  Incremental Sort  (cost=43837.60..46204.58 rows=34106 width=273)
+         Sort Key: dw1.i_category, dw1.i_class, dw1.i_brand, dw1.i_product_name, dw1.d_year, dw1.d_qoy, dw1.d_moy, dw1.s_store_id, dw1.sumsales, (rank() OVER w1)
+         Presorted Key: dw1.i_category
+         ->  WindowAgg  (cost=43827.87..44509.97 rows=34106 width=273)
+               Window: w1 AS (PARTITION BY dw1.i_category ORDER BY dw1.sumsales ROWS UNBOUNDED PRECEDING)
+               Run Condition: (rank() OVER w1 <= 100)
+               ->  Sort  (cost=43827.85..43913.11 rows=34106 width=265)
+                     Sort Key: dw1.i_category, dw1.sumsales DESC
+                     ->  Subquery Scan on dw1  (cost=35605.33..36944.55 rows=34106 width=265)
+                           ->  GroupAggregate  (cost=35605.33..36944.55 rows=34106 width=265)
+                                 Group Key: item.i_category, item.i_class, item.i_brand, item.i_product_name, date_dim.d_year, date_dim.d_qoy, date_dim.d_moy, store.s_store_id
+                                 Group Key: item.i_category, item.i_class, item.i_brand, item.i_product_name, date_dim.d_year, date_dim.d_qoy, date_dim.d_moy
+                                 Group Key: item.i_category, item.i_class, item.i_brand, item.i_product_name, date_dim.d_year, date_dim.d_qoy
+                                 Group Key: item.i_category, item.i_class, item.i_brand, item.i_product_name, date_dim.d_year
+                                 Group Key: item.i_category, item.i_class, item.i_brand, item.i_product_name
+                                 Group Key: item.i_category, item.i_class, item.i_brand
+                                 Group Key: item.i_category, item.i_class
+                                 Group Key: item.i_category
+                                 Group Key: ()
+                                 ->  Gather Merge  (cost=35605.33..36346.05 rows=6261 width=243)
+                                       Workers Planned: 3
+                                       ->  Sort  (cost=34605.29..34610.34 rows=2020 width=243)
+                                             Sort Key: item.i_category, item.i_class, item.i_brand, item.i_product_name, date_dim.d_year, date_dim.d_qoy, date_dim.d_moy, store.s_store_id
+                                             ->  Nested Loop  (cost=2072.67..34494.39 rows=2020 width=243)
+                                                   ->  Hash Join  (cost=2072.38..33870.79 rows=2020 width=43)
+                                                         Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                         ->  Parallel Hash Join  (cost=2071.11..33862.10 rows=2116 width=30)
+                                                               Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=22)
+                                                               ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=16)
+                                                                     ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=16)
+                                                                           Filter: ((d_month_seq >= 1217) AND (d_month_seq <= 1228))
+                                                         ->  Hash  (cost=1.12..1.12 rows=12 width=21)
+                                                               ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=21)
+                                                   ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=208)
+                                                         Index Cond: (i_item_sk = store_sales.ss_item_sk)
+(37 rows)
+

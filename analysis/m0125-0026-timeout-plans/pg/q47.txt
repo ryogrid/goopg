@@ -1,0 +1,46 @@
+-- M0125-0026 capture  arm=pg  engine=pg  query=47
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql
+-- psql -h 127.0.0.1 -p 65438 -U ryo -d tpcds05 
+                                                                                                                       QUERY PLAN                                                                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=38375.23..38375.23 rows=1 width=400)
+   CTE v1
+     ->  WindowAgg  (cost=36095.17..37629.93 rows=7643 width=195)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+           ->  WindowAgg  (cost=36095.17..37438.85 rows=7643 width=163)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=36095.17..37228.67 rows=7643 width=155)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=36095.17..36999.38 rows=7643 width=129)
+                             Workers Planned: 3
+                             ->  Sort  (cost=35095.13..35101.29 rows=2465 width=129)
+                                   Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                                   ->  Nested Loop  (cost=2395.52..34956.26 rows=2465 width=129)
+                                         ->  Hash Join  (cost=2395.23..34195.28 rows=2465 width=31)
+                                               Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                               ->  Parallel Hash Join  (cost=2393.96..34184.95 rows=2583 width=22)
+                                                     Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                     ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=18)
+                                                     ->  Parallel Hash  (cost=2390.82..2390.82 rows=251 width=12)
+                                                           ->  Parallel Seq Scan on date_dim  (cost=0.00..2390.82 rows=251 width=12)
+                                                                 Filter: ((d_year = 2000) OR ((d_year = 1999) AND (d_moy = 12)) OR ((d_year = 2001) AND (d_moy = 1)))
+                                               ->  Hash  (cost=1.12..1.12 rows=12 width=17)
+                                                     ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=17)
+                                         ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
+                                               Index Cond: (i_item_sk = store_sales.ss_item_sk)
+   ->  Sort  (cost=745.30..745.30 rows=1 width=400)
+         Sort Key: ((v1.sum_sales - v1.avg_monthly_sales)), v1_lead.sum_sales
+         ->  Merge Join  (cost=0.00..745.29 rows=1 width=400)
+               Merge Cond: ((v1_lead.i_category = v1.i_category) AND (v1_lead.i_brand = v1.i_brand) AND ((v1_lead.s_store_name)::text = (v1.s_store_name)::text) AND ((v1_lead.s_company_name)::text = (v1.s_company_name)::text))
+               Join Filter: (v1.rn = (v1_lead.rn - 1))
+               ->  CTE Scan on v1 v1_lead  (cost=0.00..152.86 rows=7643 width=684)
+               ->  Materialize  (cost=0.00..515.97 rows=1 width=1404)
+                     ->  Merge Join  (cost=0.00..515.97 rows=1 width=1404)
+                           Merge Cond: ((v1_lag.i_category = v1.i_category) AND (v1_lag.i_brand = v1.i_brand) AND ((v1_lag.s_store_name)::text = (v1.s_store_name)::text) AND ((v1_lag.s_company_name)::text = (v1.s_company_name)::text))
+                           Join Filter: (v1.rn = (v1_lag.rn + 1))
+                           ->  CTE Scan on v1 v1_lag  (cost=0.00..152.86 rows=7643 width=684)
+                           ->  Materialize  (cost=0.00..286.62 rows=4 width=720)
+                                 ->  CTE Scan on v1  (cost=0.00..286.61 rows=4 width=720)
+                                       Filter: ((avg_monthly_sales > '0'::numeric) AND (d_year = 2000) AND (CASE WHEN (avg_monthly_sales > '0'::numeric) THEN (abs((sum_sales - avg_monthly_sales)) / avg_monthly_sales) ELSE NULL::numeric END > 0.1))
+(39 rows)
+

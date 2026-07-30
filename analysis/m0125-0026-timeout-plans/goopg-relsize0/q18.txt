@@ -1,0 +1,11 @@
+-- M0125-0026 capture  arm=goopg-relsize0  engine=goopg  query=18
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query18.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: ca_country, ca_state, ca_county, i_item_id
+     ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(4 rows)
+

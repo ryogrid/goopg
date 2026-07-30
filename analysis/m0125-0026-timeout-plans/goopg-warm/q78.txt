@@ -1,0 +1,37 @@
+-- M0125-0026 capture  arm=goopg-warm  engine=goopg  query=78
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query78.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                                                                                                                                 QUERY PLAN                                                                                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: ss_customer_sk, ss_qty DESC, ss_wc DESC, ss_sp DESC, (coalesce(ws_qty, 0) + coalesce(cs_qty, 0)), (coalesce(ws_wc, 0) + coalesce(cs_wc, 0)), (coalesce(ws_sp, 0) + coalesce(cs_sp, 0)), round((ss_qty / (coalesce(ws_qty, 0) + coalesce(cs_qty, 0))), 2)
+     ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (((coalesce(ws_qty, 0) > 0) OR (coalesce(cs_qty, 0) > 0)) AND (ss_sold_year = 1998))
+       ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=1 width=0)
+         ->  CTE Scan on ss  (cost=0.00..0.00 rows=1 width=0)
+           ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=62871933059 width=0)
+             ->  Hash Join (INNER)  (cost=0.00..0.00 rows=377231598356 width=0)
+                   Filter: (sr_ticket_number IS NULL)
+               ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=1032817967 width=0)
+                 ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+                 ->  Seq Scan on public.store_returns (stats)  (cost=0.00..0.00 rows=143486 width=0)
+               ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+         ->  CTE Scan on ws  (cost=0.00..0.00 rows=1 width=0)
+           ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=3927482163 width=0)
+             ->  Hash Join (INNER)  (cost=0.00..0.00 rows=23564892980 width=0)
+                   Filter: (wr_order_number IS NULL)
+               ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=64518044 width=0)
+                 ->  Seq Scan on public.web_sales (stats)  (cost=0.00..0.00 rows=359432 width=0)
+                 ->  Seq Scan on public.web_returns (stats)  (cost=0.00..0.00 rows=35900 width=0)
+               ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+       ->  CTE Scan on cs  (cost=0.00..0.00 rows=1 width=0)
+         ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=15775872847 width=0)
+           ->  Hash Join (INNER)  (cost=0.00..0.00 rows=94655237083 width=0)
+                 Filter: (cr_order_number IS NULL)
+             ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=259155463 width=0)
+               ->  Seq Scan on public.catalog_sales (stats)  (cost=0.00..0.00 rows=720657 width=0)
+               ->  Seq Scan on public.catalog_returns (stats)  (cost=0.00..0.00 rows=71922 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+(30 rows)
+

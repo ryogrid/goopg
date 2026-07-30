@@ -1,0 +1,48 @@
+-- M0125-0026 capture  arm=pg  engine=pg  query=65
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query65.sql
+-- psql -h 127.0.0.1 -p 65438 -U ryo -d tpcds05 
+                                                                          QUERY PLAN                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=72116.40..72116.65 rows=100 width=202)
+   ->  Sort  (cost=72116.40..72116.73 rows=131 width=202)
+         Sort Key: store.s_store_name, item.i_item_desc
+         ->  Nested Loop  (cost=69959.66..72111.80 rows=131 width=202)
+               ->  Merge Join  (cost=69959.37..71965.11 rows=131 width=41)
+                     Merge Cond: (store_sales.ss_store_sk = store_sales_1.ss_store_sk)
+                     Join Filter: ((sum(store_sales.ss_sales_price)) <= (0.1 * (avg((sum(store_sales_1.ss_sales_price))))))
+                     ->  GroupAggregate  (cost=34979.02..35886.17 rows=6559 width=40)
+                           Group Key: store_sales.ss_store_sk, store_sales.ss_item_sk
+                           ->  Gather Merge  (cost=34979.02..35754.99 rows=6559 width=14)
+                                 Workers Planned: 3
+                                 ->  Sort  (cost=33978.98..33984.27 rows=2116 width=14)
+                                       Sort Key: store_sales.ss_store_sk, store_sales.ss_item_sk
+                                       ->  Parallel Hash Join  (cost=2071.11..33862.10 rows=2116 width=14)
+                                             Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=18)
+                                             ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=4)
+                                                   ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=4)
+                                                         Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+                     ->  Materialize  (cost=34980.35..35989.10 rows=12 width=45)
+                           ->  Merge Join  (cost=34980.35..35989.07 rows=12 width=45)
+                                 Merge Cond: (store.s_store_sk = store_sales_1.ss_store_sk)
+                                 ->  Sort  (cost=1.34..1.37 rows=12 width=9)
+                                       Sort Key: store.s_store_sk
+                                       ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=9)
+                                 ->  GroupAggregate  (cost=34979.02..35987.06 rows=200 width=36)
+                                       Group Key: store_sales_1.ss_store_sk
+                                       ->  GroupAggregate  (cost=34979.02..35886.17 rows=6559 width=40)
+                                             Group Key: store_sales_1.ss_store_sk, store_sales_1.ss_item_sk
+                                             ->  Gather Merge  (cost=34979.02..35754.99 rows=6559 width=14)
+                                                   Workers Planned: 3
+                                                   ->  Sort  (cost=33978.98..33984.27 rows=2116 width=14)
+                                                         Sort Key: store_sales_1.ss_store_sk, store_sales_1.ss_item_sk
+                                                         ->  Parallel Hash Join  (cost=2071.11..33862.10 rows=2116 width=14)
+                                                               Hash Cond: (store_sales_1.ss_sold_date_sk = date_dim_1.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..30571.90 rows=464390 width=18)
+                                                               ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=4)
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2068.55 rows=205 width=4)
+                                                                           Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+               ->  Index Scan using item_pkey on item  (cost=0.29..1.12 rows=1 width=169)
+                     Index Cond: (i_item_sk = store_sales.ss_item_sk)
+(41 rows)
+

@@ -233,10 +233,30 @@ started.
 >       work is exhausted as a route to goal (a)** and the remainder is plan-shape
 >       work. Correctness untouched (82/82 common-PASS agree on rows AND
 >       checksums); one warm regression found, Q18 117 → 251 s, filed
->       `M0125-0033`. **NEXT SELECTION: `M0125-0026`** — its classification is now
+>       `M0125-0033`. ~~**NEXT SELECTION: `M0125-0026`**~~ — **`M0125-0026` IS
+>       DONE (2026-07-31, `analysis/m0125-0026-timeout-plans/`).** It filed six
+>       per-class tasks, `M0125-0034` … `-0039`, and proposed this order, which
+>       this banner adopts:
+>       **`M0125-0037`(i) → `M0125-0039` → `M0125-0034` → `M0125-0035` →
+>       `M0125-0036` → `M0125-0037`(ii) → `M0125-0038`.**
+>       The two leading items are EXPLAIN-only, small and host-independent, and
+>       they come first for a measured reason rather than a stylistic one:
+>       **three of the eighteen queries in -0026's own capture (Q5, Q18, Q67)
+>       could not be classified** because goopg prints `*planner.SetOp` with no
+>       children, and several filters print as self-comparisons
+>       (`ctr_state = ctr_state`) that cannot be told apart from a real defect.
+>       Every later item's evidence is read through that instrument. `-0038`
+>       (no cost/cardinality propagation above base scans) is last because it is
+>       the largest and overlaps the `docs/design/cost-model/` "0077 line" —
+>       read that bundle before scoping it. **NEXT SELECTION: `M0125-0037`
+>       stage (i)** — the EXPLAIN half only; its planner half is a separate,
+>       later selection. Original wording of -0026's line follows.
+>       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
->       covers both benchmarks; the per-class fixes then file from -0034+.*** *(Stale
+>       covers both benchmarks; the per-class fixes then file from -0034+.~~
+>       *(Q18 WAS absorbed; TPC-H Q21 was not — ledger row 2026-07-31.)*
+>       *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -2940,10 +2960,35 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, the
       SF0.5 gate, `make plan-diff LABEL=tpcds-round2-head`).
 
-- [ ] **M0125-0026 — the 15-query timeout class: capture both engines' EXPLAIN,
+- [x] **M0125-0026 — the 15-query timeout class: capture both engines' EXPLAIN,
       classify, and file the planner fixes** (added 2026-07-30 by the USER;
       design `docs/design/0125-0026-timeout-class-plan-comparison.md` — a work
-      plan, deliberately not a fix design). With the correctness class closed,
+      plan, deliberately not a fix design).
+      **↳ DONE 2026-07-31 (`analysis/m0125-0026-timeout-plans/`).** All three
+      acceptance conditions met: **18 queries × 3 arms captured and committed**
+      (12 hard warm-gate members + Q72 + the four the size fallback answers +
+      Q18), the **classification table with per-class arithmetic** is in that
+      directory's `README.md`, and **six per-class tasks are filed as
+      `M0125-0034` … `-0039`** with a proposed selection order. Results in one
+      paragraph: two of the doc's five suspects are **REFUTED** — (b) join order
+      without a cardinality signal, because `GOOPG_RELSIZE_FALLBACK=0` and `=2`
+      give **byte-identical plans on all 18** once relations are ANALYZEd
+      (`plan.go:580`), which is `M0125-0031`'s runtime finding reproduced at
+      plan level; and (d) "a CTE referenced N times runs N times", because
+      `cteScanOp` + `ctx.CTERowCache` materialize once per CTE name and replay
+      (`executor.go:75-85`) — the N-fold EXPLAIN repetition is Stage-A
+      clone-per-consumer labelling only. What the capture found instead:
+      `Nested Loop (CROSS)` — a genuine Cartesian product — **14 times across 8
+      of 18 queries, at every site where a join input is a subquery** (C1); and
+      **2 of 68 `Filter:` lines sit on a `Seq Scan`** where PG puts them
+      routinely, so `date_dim` is hashed at 73,049 rows instead of 71 (C2,
+      RC-5 generalized). Three queries (Q5, Q18, Q67) could **not** be
+      classified: goopg prints `*planner.SetOp` with no children, so their
+      entire plan body is invisible — filed as `M0125-0037`(i), and it gates
+      `M0125-0033` too. Not captured: TPC-H Q21 (ledger row 2026-07-31; the
+      TPC-H clusters were down and standing them up is not host-independent, so
+      it stays with `M0125-0032`). Original body follows.
+      With the correctness class closed,
       the 15 SF0.5 timeouts (Q5 Q8 Q10 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q67 Q69 Q71
       Q78 Q81) are the ONLY remaining goopg-specific class — PG answers each in
       0–16 s on the same data and query text (`tpcds-results-sf05/oracle.txt`,
@@ -3266,6 +3311,142 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       the seven TPC-H queries -0031(b) is scoped to (37.2 s there), so a single
       root cause may serve both benchmarks. Bar for the fix: plan-diff
       `LABEL=warm-stats-base`, timed TPC-H, full SF0.5 gate.
+      **↳ CAPTURED 2026-07-31 by M0125-0026** (`goopg-warm/q18.txt`,
+      `pg/q18.txt`). It did not yield a cause: goopg's whole Q18 plan is four
+      lines because the body sits under an opaque `*planner.SetOp` node — this
+      item is BLOCKED on `M0125-0037`'s EXPLAIN half.
+
+<!-- The six items below were filed 2026-07-31 by M0125-0026's classification.
+     Evidence for every one of them: analysis/m0125-0026-timeout-plans/README.md
+     and the three plan arms beside it. Selection order is proposed in that
+     README §"Step 4" and mirrored in the Current Priority banner. -->
+
+- [ ] **M0125-0034 — C1: goopg emits a Cartesian product whenever a join input
+      is a subquery** (filed 2026-07-31 by M0125-0026; evidence
+      `analysis/m0125-0026-timeout-plans/README.md` §"The dominant mechanism").
+      `Nested Loop (CROSS)` (`planner.JoinTypeCross`) appears **14 times across
+      8 of the 18 captured queries**, always with the equi-join predicate
+      demoted to a `Filter` on the CROSS node or its parent — and at every one
+      of the eight sites at least one input is a set operation
+      (`*planner.SetOp`), a CTE reference, or a derived aggregate. Joins between
+      two base relations are correct everywhere in the capture. PG produces a
+      hash/merge/index join at all eight. Worst instances: Q64 crosses two full
+      `date_dim` copies (7.3×10⁴ each) onto the fact stream (≈5×10¹⁴ row-pairs);
+      Q54 crosses a ≈1×10⁶-row SetOp body with `item` and `date_dim` (≈1×10¹⁵).
+      Members: **Q8 Q14 Q30 Q54 Q64 Q65 Q71 Q81** — the largest class, and the
+      first fix to take. Suspected site: the join-order DP / qual-to-joincond
+      conversion where an input is not a base relation
+      (`internal/planner/joinorder.go`, `bushy.go`,
+      `inner_join_qual_pushdown.go` already special-cases `*CTEScan`).
+      Acceptance: **Q71 completes and matches the oracle row
+      `71|OK|580|521a7af7…`** (rows + ck) — the least-deep member. Bar:
+      plan-diff `LABEL=tpcds-round2-head`, timed 22-query TPC-H on a quiet host,
+      full SF0.5 gate.
+
+- [ ] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
+      never to the base scan, and never pushed into a producing subquery**
+      (filed 2026-07-31 by M0125-0026; evidence same README §"C2 is pervasive").
+      Across the 18 goopg plans, **2 of 68 `Filter:` lines sit on a `Seq Scan`**
+      (both inside scalar SubPlans); the other 66 sit on join nodes. Concrete
+      cost: goopg hashes all **73,049** `date_dim` rows and applies `d_year=…`
+      afterwards where PG's `Parallel Seq Scan on date_dim Filter: ((d_moy>=3)
+      AND (d_moy<=6) AND (d_year=2001))` yields **71** — a **1000×** larger
+      build side on the dimension every fact table joins to, in nearly every
+      member of the class. This is RC-5 confirmed and generalized
+      (`internal/planner/local_filters.go:154` hardcodes `SmallDimension` to
+      `region`/`nation`, so no TPC-DS relation can ever qualify). Acute forms:
+      **Q31** — PG attaches the per-reference filter to each of six `CTE Scan`
+      nodes, goopg attaches exactly one (`ws3`) and hoists the other five into a
+      single conjunction on the top join; **Q78** — `ss_sold_year = 1998` never
+      reaches `date_dim`, so all three channel CTEs aggregate every year where
+      PG pushes `d_year = 1998` into all three. Members: all 18 as an
+      aggravator; acute in **Q31 Q78 Q8 Q47**. **First step is not a fix:**
+      determine whether the `Multi-Way Hash Join` operator pre-filters its build
+      side at RUNTIME despite the plan text — an `EXPLAIN` cannot settle that,
+      and the answer decides whether this is a costing-only defect or an
+      execution one. Acceptance: **Q78 completes and matches `78|OK|45|8f67acff…`**.
+      Bar: as -0034.
+
+- [ ] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
+      no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same
+      README §"C3"). goopg renders Q10/Q35 as `Hash Join (SEMI)` with
+      `Filter: (EXISTS(SubPlan 1) OR EXISTS(SubPlan 2))`, each SubPlan an
+      uncached correlated hash join; PG renders the identical query as
+      `Filter: ((ANY (c_customer_sk = (hashed SubPlan 2).col1)) OR (ANY (… =
+      (hashed SubPlan 4).col1)))` — **hashed**, built once. The control is
+      **Q69**, whose three EXISTS are `and not exists … and not exists`: goopg
+      unnests those into a proper `Hash Join (ANTI)`/`(SEMI)` chain and Q69
+      completes. So the trigger is specifically the **`OR` of `EXISTS`**, which
+      cannot become a semi-join, and goopg has nothing between "unnest to a
+      semi-join" and "re-execute per row". Q30/Q81 are the correlated-scalar-agg
+      variant of the same gap. Arithmetic: outer ≈1×10⁵ × (`web_sales`
+      3.6×10⁵ + `catalog_sales` 7.2×10⁵) ≈ 1×10¹¹ row-touches; Q35's measured
+      8.16 s per outer row ⇒ ≈**9 days at SF=1**. Members: **Q10 Q35 Q30 Q81**.
+      `0124-0004` §D4's rule stands and PG's own plan corroborates it: if
+      `CacheMisses ≈ Calls` the fix is **hashed-SubPlan caching, not
+      decorrelation** — do not pre-commit to decorrelation. Acceptance:
+      **Q10 completes and matches `10|OK|0|1f18d650…`**. **Q35 is already
+      `M0125-0003`'s acceptance row — coordinate, do not duplicate it.** Bar: as
+      -0034.
+
+- [ ] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
+      planner** (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
+      goopg prints `*planner.SetOp` — a raw Go type name — **with no children**.
+      Q5, Q14 and Q18 therefore have four-line plans with the entire query body
+      invisible. Seven of eighteen captured queries contain one (Q5 ×1, Q8 ×1,
+      Q14 ×5, Q18 ×1, Q54 ×1, Q67 ×1, Q71 ×1), and **three of them (Q5, Q18,
+      Q67) could not be classified at all** — this item is what unblocks them
+      and `M0125-0033`. Two halves, and they are separable:
+      **(i) the EXPLAIN half** — teach `internal/executor/operators_explain.go`
+      to descend into the set operation's branches and to name the node the way
+      PG does (`Append`/`HashSetOp`); small, host-independent, no planner
+      change, and every later item's evidence is unreadable without it.
+      **(ii) the planner half** — the set-op node appears on one side of a
+      `Nested Loop (CROSS)` in Q8, Q14, Q54 and Q71, so the DP's inability to
+      see through it is the likely *proximate* cause of C1 at those sites; fixing
+      it may retire part of -0034. Take (i) FIRST and on its own. Acceptance for
+      (i): the captured `goopg-warm/q5.txt` shape is fully expanded on a re-run
+      and the three unclassified queries get a class. Acceptance for (ii):
+      **Q5 completes and matches `5|OK|100`**. Bar for (ii): as -0034; (i) is
+      EXPLAIN-only and needs only the unit gate plus the commit smoke.
+
+- [ ] **M0125-0038 — C5: no cost or cardinality propagation above base scans**
+      (filed 2026-07-31 by M0125-0026; evidence same README §"C5"). Every
+      non-leaf node in all 18 goopg plans renders `cost=0.00..0.00 rows=1`,
+      while leaves carry real warm statistics (`Seq Scan on public.store_sales
+      (stats) … rows=1439608`). Where a join estimate IS produced it equals the
+      Cartesian product of its inputs: Q10's SubPlan 1 reports
+      `rows=131280740`, and 359,432 (`web_sales`) × 365.25 (`date_dim` after
+      `d_year`) = 131,280,738 — **the equi-join key contributes no selectivity
+      at all**. Consequence: the join-order DP chooses among shapes it has
+      costed as identical, which is why warm statistics changed no plan
+      (`M0125-0031`) and why `GOOPG_RELSIZE_FALLBACK=0` and `=2` produce
+      byte-identical plans on all 18 queries. C5 is the reason C1–C3 are never
+      *corrected* by costing, and the reason no further cardinality-side work
+      can reach goal (a). This is the largest item of the six and overlaps the
+      `docs/design/cost-model/` "0077 line" design bundle — **read that bundle
+      before scoping it**; it may be the trigger to promote that design to
+      implementation rather than a standalone fix. No acceptance query of its
+      own: accepted when C1's and C2's fixes hold under plan-diff
+      `LABEL=tpcds-round2-head` without a hand-written override.
+
+- [ ] **M0125-0039 — diagnostics: EXPLAIN renders column references
+      unqualified, so real correlations print as self-comparisons** (filed
+      2026-07-31 by M0125-0026; evidence same README §"C4", closing paragraph).
+      goopg prints `Filter: (ctr_state = ctr_state)` for Q30/Q81 where PG prints
+      `ctr1.ctr_state = ctr_state`; likewise `(cd_marital_status <>
+      cd_marital_status)` (Q64), `(d_week_seq = d_week_seq)` (Q72), and Q31's
+      top-level `(d_qoy = 1 AND … AND d_qoy = 2 AND … AND d_qoy = 3)`. These are
+      almost certainly distinct columns of a wide join tuple, but **nothing in
+      the output distinguishes that from a genuinely unsatisfiable predicate** —
+      which is exactly the reading a triage loop needs. Small, host-independent,
+      EXPLAIN-only. Fix: qualify column references with their relation
+      alias in the EXPLAIN expression printer
+      (`internal/executor/operators_explain.go`), matching PG's `ruleutils.c`
+      behaviour of qualifying whenever the name is ambiguous in scope.
+      Acceptance: Q30's filter prints as `ctr1.ctr_state = ctr2.ctr_state`, plus
+      a unit test in `internal/executor` over a self-joined relation. Bar: unit
+      gate + commit smoke; no plan-shape bar (renders only).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
