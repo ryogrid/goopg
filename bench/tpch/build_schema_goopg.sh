@@ -37,3 +37,22 @@ echo "Building TPC-H schema against goopg; log: ${log_file}"
 ./hammerdbcli tcl auto "${SCRIPT_DIR}/tcl/build_schema.tcl" 2>&1 | tee "${log_file}"
 
 echo "Schema build complete (or errored — check ${log_file})."
+
+# M0125-0030: verify HammerDB's ANALYZE populated stats and checkpoint.
+# HammerDB's buildschema internally runs a "GATHERING SCHEMA STATISTICS" step
+# that calls ANALYZE on each table. Before M0125-0028 this step errored 42P01
+# in per-DB databases; with -0028/-0029 it should succeed and the counts must
+# survive a restart, so we verify here and make them durable.
+PGPASSWORD="${PG_SUPERUSER_PASS}" psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" -d "${TPCH_DB}" -tA <<'SQL'
+SELECT 'reltuples_check: ' ||
+       CASE WHEN count(*) = 8 THEN 'OK (' || count(*)::text || '/8 tables have reltuples > 0)'
+            ELSE 'FAIL (' || count(*)::text || '/8 tables have reltuples > 0)'
+       END
+FROM pg_class
+WHERE relname IN ('lineitem','orders','partsupp','part','customer','supplier','nation','region')
+  AND reltuples > 0;
+SQL
+echo "Running CHECKPOINT..."
+PGPASSWORD="${PG_SUPERUSER_PASS}" psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" -d "${TPCH_DB}" -c "CHECKPOINT" >/dev/null 2>&1 \
+    && echo "CHECKPOINT done" \
+    || echo "CHECKPOINT failed (non-fatal)"

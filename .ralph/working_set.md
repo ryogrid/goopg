@@ -1,45 +1,43 @@
-Task: M0125-0029 (warm-stats programme item 2/4) — DONE and committed this loop
-(#9, 2026-07-30). Stats survive restart for every database, visible to every
-connection.
+Task: M0125-0030 (warm-stats programme item 3/4) — DONE and committed this loop
+(#10, 2026-07-30). Build scripts verify + CHECKPOINT; standing clusters warmed;
+premise flipped; plan baseline captured.
 
 Files:
-- `internal/catalog/catalog.go` — NEW `GoopgRelStatsRelationId` (9410) sidecar constant
-- `internal/executor/operators_analyze.go` — per-DB routing (`tableCatalogHeapDBOid`),
-  per-column resilience (first error kept, remaining columns + size row written),
-  `GoopgRelStatsColumns()`, sidecar size row write
-- `internal/initdb/open.go` — `loadStatisticsFromHeap` iterates ALL databases via
-  `loadStatisticsFromHeapForDB`; sidecar scanner + size restoration
-- `internal/server/stats_dbid_restart_test.go` — NEW, 2 E2E restart-durability pins
-- `scripts/tpch-relsize-arm.sh` — w-arm warm-up via durable ANALYZE, stale guard
-  text retired
-- `docs/design/0125-0028-warm-stats-programme.md` — §-0029a execution record
-- `.ralph/deferral_ledger.md` — 1 new row (TOAST gap for pg_statistic histograms)
-- `.ralph/fix_plan.md` — M0125-0029 ticked [x], NEXT → M0125-0030
+- `bench/tpch/build_schema_goopg.sh` — post-HammerDB reltuples verification (8/8)
+  + CHECKPOINT
+- `scripts/tpcds-load.sh` — post-ANALYZE reltuples verification (25 tables)
+  before the pre-existing CHECKPOINT
+- `scripts/tpcds-sf05-regression.sh load-goopg` — stale "RowCount not restored"
+  comment retired; inline reltuples verification per table
+- `plan_snapshots/warm-stats-base.txt` — NEW, 22-query plan baseline under WARM
+  stats (captured from TPC-H cluster 65433 after one-shot warm-up)
+- `docs/design/0125-0028-warm-stats-programme.md` — §-0030a execution record
+- `.ralph/fix_plan.md` — M0125-0030 ticked [x], NEXT → M0125-0031
 
-## Facts the next loop should NOT re-derive
+## One-shot warm-up executed
 
-- Three gaps closed together: (1) per-DB routing via `tableCatalogHeapDBOid(ctx)`,
-  (2) reltuples/relpages via sidecar heap 9410, (3) cross-connection visibility
-  — re-verified on the SECOND session of the E2E test.
-- Per-column resilience: a wide histogram that exceeds a page (partsupp.ps_comment
-  etc.) no longer aborts the entire ANALYZE. The write fails silently for that
-  column only; the remaining columns and the size row are still written. First
-  error is kept for caller bookkeeping.
-- TOAST gap (deferred): goopg's catalog heap writer has no TOAST, so wide
-  histograms are silently absent — ledger row. Real PG toasts via pg_statistic.h.
-- The 2026-07-23 "per-connection stats" symptom did NOT reproduce; cross-connection
-  visibility is verified by the E2E test (second session reads same reltuples).
-- `tpch-relsize-arm.sh` now does its own ANALYZE warm-up when `ARM_ANALYZE=1` —
-  retired the need for `cmd/tpch-runner -analyze`.
+| cluster | port | tables | result |
+|---------|------|--------|--------|
+| TPC-H SF=1 | 65433 | 8 | all 8 survived restart; EXPLAIN confirms planner consumption |
+| TPC-DS SF=0.5 | 65437 | 25 | 24/25 survived (dbgen_version cosmetic); restart verified |
+| TPC-DS SF=1 | 65436 | — | data dir absent; deferred to next SF=1 load |
+
+## Premise flip consequences
+
+- Row-count gates: Q12=2, Q13=35 (canonical, NOT moved — spotcheck PASS)
+- Plan baseline: `plan_snapshots/warm-stats-base.txt` (22 queries WARM)
+- Timed baselines: all S-cold numbers are a different regime; every future
+  `analysis/` doc must state "WARM stats" or "S-cold" explicitly
 
 ## NEXT (banner order)
 
-**`M0125-0030`** (bench clusters warm-up + CHECKPOINT) per the 2026-07-30(b)
-directive; then `-0031` (warm-stats planning line), then
-`M0125-0002` commit 3 / `M0125-0003` four-arm study / `M0125-0026`.
+**`M0125-0031`** (warm-stats planning line — eliminate timeout class, optimize
+TPC-H/TPC-DS runtimes) per the 2026-07-30(b) directive. M0125-0031 is gated on
+-0028/-0029/-0030 — all three now landed. The first motion is a re-measurement:
+warm TPC-H power sweep at HEAD.
 
-Gates run: units precommit PASS; 2 new E2E restart pins PASS; tpch-spotcheck
-PASS Q12=2/Q13=35 (cached, unchanged); go build/vet clean; ralph-state-guard
-(to be run); pgbench smoke via commit hook.
+Gates run: tpch-spotcheck PASS (Q12=2/Q13=35, 32.7 s query phase — WARM);
+one-shot warm-up E2E verification PASS; go build/vet clean; pgbench smoke via
+commit hook.
 
 In-flight: none.

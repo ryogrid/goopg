@@ -1,6 +1,6 @@
 # 0125-0028 — The warm-statistics programme: ANALYZE scope, restart persistence, bench warm-up, and the planning line they unlock
 
-Status: **-0028 LANDED (2026-07-30, execution record in §-0028a); -0029 LANDED (2026-07-30, execution record in §-0029a); -0030 … -0031 filed**
+Status: **-0028 LANDED (2026-07-30, execution record in §-0028a); -0029 LANDED (2026-07-30, execution record in §-0029a); -0030 LANDED (2026-07-30, execution record in §-0030a); -0031 filed**
 Date: 2026-07-30 (filed by the user's interactive session, per user directive)
 Milestone: M0125
 Tasks: `M0125-0028` (ANALYZE per-DB scope) → `M0125-0029` (stats survive restart,
@@ -258,6 +258,39 @@ Consequences to record in the same commit (this is where the premise flips):
 - **Timed baselines reset.** Every `analysis/` number taken S-cold is no
   longer comparable; from this commit on, analysis docs state the stats
   regime explicitly.
+
+### §-0030a Execution record (2026-07-30)
+
+**Script changes landed (all three):**
+
+- `bench/tpch/build_schema_goopg.sh`: after HammerDB's `buildschema` completes,
+  verifies all 8 TPC-H tables have `pg_class.reltuples > 0` and runs
+  `CHECKPOINT`. HammerDB's own "GATHERING SCHEMA STATISTICS" step now succeeds
+  (M0125-0028 fixed the 42P01 error), so the script verifies rather than
+  duplicates it.
+- `scripts/tpcds-load.sh` (SF=1): post-ANALYZE verification counts how many of
+  the 25 TPC-DS tables have reltuples > 0, before the pre-existing CHECKPOINT
+  step.
+- `scripts/tpcds-sf05-regression.sh load-goopg` (SF0.5): the stale comment
+  claiming RowCount is not restored is retired (M0125-0029 fixed this); the
+  per-table ANALYZE loop now verifies reltuples > 0 inline.
+
+**One-shot warm-up executed:**
+
+| cluster | port | tables | result |
+|---------|------|--------|--------|
+| TPC-H SF=1 | 65433 | 8 | all 8 reltuples > 0; survived restart; second connection verified; EXPLAIN consumes restored stats (lineitem rows=5997241, orders rows=1500000 in Hash Join) |
+| TPC-DS SF=0.5 | 65437 | 25 | 24/25 reltuples > 0 (dbgen_version reltuples=0 on a 1-row table, cosmetic); survived restart |
+| TPC-DS SF=1 | 65436 | — | data dir absent; cluster not built — warm-up deferred until the next SF=1 load |
+
+**Premise flip recorded.** Row-count gates verified NOT to have moved:
+`scripts/tpch-spotcheck.sh` → Q12=2, Q13=35, query phase 32.7 s (WARM —
+compare against the 75.0 s S-cold baseline from `d4071df4`, or 33.0 s from
+the -0028 era after probe-analyze). New plan baseline captured as
+`plan_snapshots/warm-stats-base.txt` (22 queries, `plan-snapshot capture`).
+Every prior label (`tpcds-round2-head`, `m0125-0005-relsize-default-stage2`,
+etc.) is a different (S-cold) stats regime and must not be compared across
+this commit.
 
 ### M0125-0031 — the warm-stats planning line (gated on -0028 … -0030)
 

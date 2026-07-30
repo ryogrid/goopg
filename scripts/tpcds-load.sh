@@ -77,6 +77,24 @@ for tsv in "${TPCDS_DATA_DIR}"/*.tsv; do
 done
 log "  ANALYZE complete"
 
+# M0125-0030: verify ANALYZE populated reltuples (before -0028/-0029 the
+# per-DB routing gap + missing size persistence made this a silent no-op).
+VERIFIED=0
+for tsv in "${TPCDS_DATA_DIR}"/*.tsv; do
+    table=$(basename "$tsv" .tsv)
+    case "$table" in
+        dbgen_version|catalog_returns|catalog_sales|customer|customer_address|customer_demographics|\
+        date_dim|household_demographics|income_band|inventory|item|promotion|reason|ship_mode|\
+        store|store_returns|store_sales|time_dim|warehouse|web_page|web_returns|web_sales|web_site|\
+        call_center|catalog_page) ;;
+        *) continue ;;
+    esac
+    if ${PG} -t -A -c "SELECT reltuples FROM pg_class WHERE relname = '${table}' AND reltuples > 0" 2>/dev/null | grep -q .; then
+        VERIFIED=$((VERIFIED + 1))
+    fi
+done
+log "  reltuples verification: ${VERIFIED}/25 tables have reltuples > 0"
+
 # ---- Step 4: CHECKPOINT (flush WAL so restart doesn't need replay) ---
 log "Step 4/4: Running CHECKPOINT..."
 ${PG} -c "CHECKPOINT" >/dev/null 2>&1 && log "  CHECKPOINT done" || log "  CHECKPOINT failed (non-fatal)"

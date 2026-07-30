@@ -377,10 +377,19 @@ cmd_load_goopg() {
             echo "COPY FAILED"
         fi
     done
-    # ANALYZE persists pg_statistic column stats (RowCount is NOT restored on
-    # restart — known gap, tpcds-round2-fixes §7.1 — the gate is S-cold anyway).
+    # M0125-0028/-0029: ANALYZE now resolves per-DB and the per-column stats +
+    # relation size (reltuples/relpages via the goopg-private sidecar) survive
+    # a restart — the S-cold premise this gate was designed under no longer
+    # applies to a freshly loaded-and-ANALYZEd cluster.
     log "ANALYZE + CHECKPOINT"
-    for t in ${TABLES}; do ${GOOPG_PSQL} -c "ANALYZE ${t}" >/dev/null 2>&1 || true; done
+    local t ok=0
+    for t in ${TABLES}; do
+        ${GOOPG_PSQL} -c "ANALYZE ${t}" >/dev/null 2>&1 || true
+        if ${GOOPG_PSQL} -t -A -c "SELECT reltuples FROM pg_class WHERE relname = '${t}' AND reltuples > 0" 2>/dev/null | grep -q .; then
+            ok=$((ok + 1))
+        fi
+    done
+    log "  reltuples verification: ${ok}/25 tables have reltuples > 0"
     ${GOOPG_PSQL} -c "CHECKPOINT" >/dev/null 2>&1 || true
     sf05_goopg_stop
     log "load-goopg done (server stopped; the sweep starts its own fresh instance)"
