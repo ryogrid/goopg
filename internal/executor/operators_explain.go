@@ -1083,6 +1083,18 @@ func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
 	obj := map[string]any{
 		"Node Type": describePlan(n),
 	}
+	// M0125-0037(i): upstream's non-text formats do NOT fold the set-op
+	// command into the node name the way the text format does. Verified
+	// against PG 18.3 `EXPLAIN (FORMAT JSON)` on an INTERSECT ALL:
+	// "Node Type": "SetOp", "Strategy": "Hashed", "Command": "Intersect All"
+	// (explain.c uses `sname` for the property and `pname` for the text
+	// line). A UNION ALL has no SetOp node upstream at all, so it keeps
+	// the plain "Append" describePlan gives it.
+	if p, ok := n.(*planner.SetOp); ok && !setOpRendersAsAppend(p) {
+		obj["Node Type"] = "SetOp"
+		obj["Strategy"] = "Hashed"
+		obj["Command"] = setOpCommandName(p)
+	}
 	if est := planner.EstimateRows(n); est > 0 {
 		obj["Plan Rows"] = est
 	}
@@ -1301,8 +1313,86 @@ func describePlan(n planner.Node) string {
 		return "CTE DML"
 	case *planner.MaterializedCTEScan:
 		return fmt.Sprintf("CTE %s", p.Name)
+	case *planner.SetOp:
+		// M0125-0037(i): this node used to fall through to the `%T`
+		// default and print the raw Go type name `*planner.SetOp` —
+		// with no children, because planChildren had no case for it
+		// either. TPC-DS Q5/Q18/Q67 therefore rendered as four-line
+		// plans with the whole query body invisible, and M0125-0026
+		// could not classify them at all.
+		//
+		// PG's vocabulary (explain.c ExplainNode, T_SetOp) is:
+		//   UNION ALL          -> Append          (no SetOp node at all)
+		//   UNION (distinct)   -> HashAggregate over Append
+		//   INTERSECT / EXCEPT -> "HashSetOp <cmd>" (SETOP_HASHED),
+		//                         cmd one of Intersect / Intersect All /
+		//                         Except / Except All
+		// goopg has ONE fused node for all of these (operators_setop.go:
+		// `streaming` for UNION ALL, buffered multiset otherwise), so the
+		// two exact mappings are used verbatim and the UNION-distinct case
+		// prints `HashSetOp Union` — a spelling PG never emits, chosen
+		// because it cannot be confused with a PG node that means
+		// something else (PG's SetOpCmd has no Union member). The
+		// two-node HashAggregate/Append shape PG uses there is a
+		// deferral-ledger row, not a silent divergence.
+		return setOpNodeName(p)
 	}
 	return fmt.Sprintf("%T", n)
+}
+
+// setOpNodeName renders a SetOp's PG-style label — see the
+// describePlan case above for the mapping rationale.
+func setOpNodeName(p *planner.SetOp) string {
+	if setOpRendersAsAppend(p) {
+		return "Append"
+	}
+	return "HashSetOp " + setOpCommandName(p)
+}
+
+// setOpRendersAsAppend reports whether p is a UNION ALL, which PG
+// plans as a plain Append with no SetOp node. This is also the shape
+// the planner builds for partition / inheritance expansion
+// (planner.go:2495 and :2545 construct `SetOp{All: true}` chains),
+// so getting this branch right is what keeps a partitioned scan from
+// printing as a set operation.
+func setOpRendersAsAppend(p *planner.SetOp) bool {
+	return p.All && p.Op == parser.SetOpUnion
+}
+
+// setOpCommandName mirrors explain.c's SETOPCMD_* text (the token PG
+// appends after the node name, and its JSON "Command" property).
+func setOpCommandName(p *planner.SetOp) string {
+	var cmd string
+	switch p.Op {
+	case parser.SetOpIntersect:
+		cmd = "Intersect"
+	case parser.SetOpExcept:
+		cmd = "Except"
+	default:
+		cmd = "Union"
+	}
+	if p.All {
+		cmd += " All"
+	}
+	return cmd
+}
+
+// setOpAppendBranches flattens a left-deep chain of UNION ALL SetOps
+// into the flat child list PG's single Append carries. goopg builds
+// `a UNION ALL b UNION ALL c` as SetOp(SetOp(a,b),c); without this,
+// EXPLAIN would print nested Appends where PG prints one with three
+// children, and TPC-DS Q5's five-branch union would render five levels
+// deep. Only ALL-union links are absorbed — an INTERSECT or EXCEPT in
+// the chain is a real node and keeps its own line.
+func setOpAppendBranches(p *planner.SetOp, out []planner.Node) []planner.Node {
+	for _, side := range [...]planner.Node{p.Left, p.Right} {
+		if inner, ok := side.(*planner.SetOp); ok && setOpRendersAsAppend(inner) {
+			out = setOpAppendBranches(inner, out)
+			continue
+		}
+		out = append(out, side)
+	}
+	return out
 }
 
 func joinTypeName(t planner.JoinType) string {
@@ -1407,6 +1497,17 @@ func planChildren(n planner.Node) []planner.Node {
 		out = append(out, p.DMls...)
 		out = append(out, p.Body)
 		return out
+	case *planner.SetOp:
+		// M0125-0037(i): the missing case that truncated Q5/Q18/Q67 to a
+		// four-line plan. A UNION ALL chain collapses into one Append's
+		// child list the way PG plans it; every other set operation is a
+		// binary HashSetOp whose two inputs render directly beneath it
+		// (verified against PG 18.3: `HashSetOp Intersect` carries two
+		// Seq Scan children, not an Append).
+		if setOpRendersAsAppend(p) {
+			return setOpAppendBranches(p, nil)
+		}
+		return []planner.Node{p.Left, p.Right}
 	}
 	return nil
 }

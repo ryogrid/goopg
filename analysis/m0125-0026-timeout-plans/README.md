@@ -274,3 +274,48 @@ covers both benchmark families. It was not: the TPC-H clusters (:65432, :65433)
 were both down, and standing them up is not host-independent work
 (`bench/tpch/setup_goopg.sh` rebuilds the shared `tmp/goopg-bench-bin`). Q21's
 capture belongs to `M0125-0032`; deferral-ledger row 2026-07-31.
+
+---
+
+## 2026-07-31 addendum — the C4 instrument was fixed, and the re-capture found C6
+
+`M0125-0037` stage (i) landed the EXPLAIN half (design
+`docs/design/0125-0037-explain-set-operations.md`). The seven set-op-bearing
+members were re-captured against the same SF=0.5 goopg cluster, same plain-
+`EXPLAIN`-only protocol, into **`goopg-warm-m0125-0037/`**
+(`capture_setop_recheck.sh` is `capture.sh` with `QUERIES="5 8 14 18 54 67 71"`).
+The three arms above are left untouched as the historical record.
+
+| Q | plan lines before | after |
+|---|---|---|
+| Q5 | 4 | 128 |
+| Q18 | 4 | 91 |
+| Q67 | 6 | 94 |
+| Q14 | — | 815 |
+
+**The three unclassifiable rows in the table above now have a class.**
+
+- **Q5 → C1 + C2.** `Nested Loop (CROSS)` between the
+  `store_sales ∪ store_returns` `Append` and `date_dim`, repeated once per
+  channel, with the `d_date` range predicate on the join's `Filter:` rather
+  than on the scan — so `date_dim` is costed at its full 73,049 rows where PG's
+  scan-level filter yields 8. PG hash-joins on `ss_sold_date_sk = d_date_sk`.
+  Both existing classes; no new one.
+- **Q18, Q67 → C6, a class this capture could not see.** Both are `ROLLUP`
+  queries, and goopg expands the grouping sets into a UNION ALL of one
+  independent aggregate branch per level, each re-running the entire join
+  subtree. Q18: 4 branches, 5 `Multi-Way Hash Join`s, 5 full `catalog_sales`
+  scans (720,657 rows each). Q67: 8 branches, 9 MHJs, 9 full `store_sales`
+  scans (1,439,608 rows each). PG computes every level in ONE pass — Q18's PG
+  plan is a single `GroupAggregate` with five stacked `Group Key:` lines, Q5's
+  a `MixedAggregate` with `Hash Key` lines. **Neither query contains a
+  `union all` in its SQL text**, which is exactly why C6 hid behind C4: the
+  `Append` is goopg's own grouping-sets expansion, and it only became visible
+  when the set-op node did.
+
+C6 is filed as **`M0125-0040`** with the same bar as `-0034`. It is the most
+likely proximate cause of the Q18 and Q67 timeouts and of the Q18 warm
+regression (`M0125-0033`): an 8× multiplier on a 1.44 M-row join is not
+something cardinality or join-order work can recover.
+
+The selection order above is otherwise unchanged — next is `-0039`.

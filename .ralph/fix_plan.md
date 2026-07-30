@@ -3391,6 +3391,26 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
 - [ ] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
       planner** (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
+      **↳ STAGE (i) IS DONE (2026-07-31).** Design
+      `docs/design/0125-0037-explain-set-operations.md`; tests
+      `internal/executor/explain_setop_test.go`; re-capture
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0037/`. `describePlan`
+      and `planChildren` — the two functions all three EXPLAIN renderers drive
+      off — now carry a `*planner.SetOp` case. PG's vocabulary was captured from
+      18.3 on `:65438` rather than inferred: `UNION ALL` → `Append` (PG builds
+      **no** SetOp node), `INTERSECT`/`EXCEPT [ALL]` → `HashSetOp <cmd>` with two
+      direct children, and JSON keeps `Node Type: SetOp` plus separate
+      `Strategy`/`Command` properties. A left-deep UNION ALL chain flattens into
+      one `Append`, matching PG. Acceptance met: Q5 4 → 128 plan lines, Q18 → 91,
+      Q67 → 94, Q14 → 815, and **all three unclassifiable queries now have a
+      class** — Q5 is C1+C2 (`Nested Loop (CROSS)` between the
+      `store_sales ∪ store_returns` Append and `date_dim`, with the `d_date`
+      range on the join Filter so `date_dim` costs 73,049 where PG's yields 8).
+      Q18/Q67 exposed a class -0026 could not see, filed below as `M0125-0040`.
+      One deliberate divergence + one pre-existing indent divergence are ledger
+      rows (2026-07-31), not silent. **Stage (ii), the planner half, stays open
+      and is a separate later selection** — the banner's order is unchanged, so
+      the next selection is `M0125-0039`.
       goopg prints `*planner.SetOp` — a raw Go type name — **with no children**.
       Q5, Q14 and Q18 therefore have four-line plans with the entire query body
       invisible. Seven of eighteen captured queries contain one (Q5 ×1, Q8 ×1,
@@ -3447,6 +3467,35 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Acceptance: Q30's filter prints as `ctr1.ctr_state = ctr2.ctr_state`, plus
       a unit test in `internal/executor` over a self-joined relation. Bar: unit
       gate + commit smoke; no plan-shape bar (renders only).
+
+- [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
+      branch per grouping level, each re-running the whole join subtree**
+      (filed 2026-07-31 by `M0125-0037`(i); evidence
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0037/q18.txt` and
+      `q67.txt`, which only became readable once the set-op node did). Neither
+      query contains a `union all` in its SQL text — the `Append` is goopg's own
+      grouping-sets expansion, which is why this class was invisible to
+      `M0125-0026`. Measured fan-out at SF=0.5: **Q18 — 4 HashAggregate branches,
+      5 `Multi-Way Hash Join`s, 5 full `catalog_sales` scans (720,657 rows
+      each); Q67 — 8 branches, 9 MHJs, 9 full `store_sales` scans (1,439,608 rows
+      each)**, with no shared or materialized subtree between branches. PG
+      computes every level in ONE pass over ONE scan: Q18's PG plan is a single
+      `GroupAggregate` with five stacked `Group Key:` lines (the last `Group
+      Key: ()`), and Q5's PG plan a `MixedAggregate` with `Hash Key` lines
+      (`postgres/src/backend/executor/nodeAgg.c`, `AGG_MIXED`; planner side
+      `preprocess_grouping_sets` / `consider_groupingsets_paths` in
+      `planner.c`). This is the most likely proximate cause of both timeouts and
+      of the Q18 warm regression tracked as `M0125-0033` — an 8× multiplier on a
+      1.44 M-row join is not something cardinality or join-order work can
+      recover. Two candidate fixes, cheapest first: (a) materialize the common
+      subtree once and let the N branches read it (a `Memoize`/CTE-style share —
+      keeps the expansion, removes the re-scan), or (b) implement PG's real
+      multi-level `AGG_MIXED`/`AGG_SORTED` grouping-sets aggregate, which is the
+      faithful answer and also fixes the `Group Key: ()` grand-total row shape.
+      Acceptance: Q67's plan shows ONE scan of `store_sales`, and Q18 and Q67
+      both complete inside the warm gate's budget with matching row counts.
+      Bar: as `M0125-0034` (plan-diff `LABEL=tpcds-round2-head` + the SF0.5
+      regression gate), because (a) and (b) are both executor/planner changes.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
