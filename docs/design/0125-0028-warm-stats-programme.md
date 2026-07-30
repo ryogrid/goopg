@@ -1,6 +1,6 @@
 # 0125-0028 — The warm-statistics programme: ANALYZE scope, restart persistence, bench warm-up, and the planning line they unlock
 
-Status: **filed (work plan — four tasks M0125-0028 … -0031; no fix content here by design)**
+Status: **-0028 LANDED (2026-07-30, execution record in §-0028a); -0029 … -0031 filed**
 Date: 2026-07-30 (filed by the user's interactive session, per user directive)
 Milestone: M0125
 Tasks: `M0125-0028` (ANALYZE per-DB scope) → `M0125-0029` (stats survive restart,
@@ -72,6 +72,57 @@ analyzes every table in the **current database** — with per-DB resolution in
 hand the "no public iterator" excuse in `targets()` is stale. This task also
 un-blocks M0125-0003's owed W1/W2 control arms (ledger row 2026-07-30, which
 names this exact fix as its resume point).
+
+### §-0028a Execution record (2026-07-30)
+
+Landed exactly along the resume point, plus the twin/sibling pins the code
+walk surfaced:
+
+- **`expandAnalyzeTargets`** resolves named targets via `ctxPlanCatalog` (the
+  per-connection, DB-scoped catalog every SELECT plans against) instead of raw
+  `ctx.Catalog.LookupTable`; `PartitionChildren` calls now thread
+  `NamespaceDBOid(ctx.CurrentDatabaseOid)`.
+- **Fact (b) is FIXED, not ledgered**: bare `ANALYZE;` implements PG's
+  every-relation-in-the-current-database semantics (`get_all_vacuum_rels`)
+  over a new live-handle iterator `catalog.UserTableHandles` — live pointers
+  because `SetTableStats`'s contract is "the Table came from
+  LookupTable/CreateTable", and `AllTables`' deep copies would take the scan
+  and drop the result. Non-owned and other-sessions' temp relations are
+  skipped silently, matching upstream; partitioned parents join the
+  inheritance pass without child expansion (their leaves are their own
+  namespace entries — expanding would analyze each leaf twice).
+- **VACUUM's twins changed together** (Hard-won rule 2): named-target
+  resolution in `expandVacuumTargets`/`vacuumTableTargets` uses the same
+  ctxPlanCatalog path (`VACUUM lineitem` in db `tpch` silently skipped its
+  target before), and **`relationStillExists` — which re-checks the target
+  after the maintenance lock — now uses `LookupTableByOIDAllDBs`**: its
+  DefaultDBOid-pinned lookup would otherwise have read every per-DB target as
+  "concurrently dropped" and skipped it silently *right after* resolution was
+  fixed.
+- **Deferred with ledger rows (2026-07-30)**: database-wide `VACUUM` still
+  enumerates DefaultDBOid via `AllTables` deep copies (its
+  reltuples/relfrozenxid writes are silently lost — needs its own
+  freeze-bookkeeping verification); bare ANALYZE cannot cover heap-backed
+  system catalogs (none are registered in the executor namespace map);
+  `VACUUM <missing>` silently succeeds where PG raises 42P01.
+
+Verification: 3 new pins in `internal/executor/analyze_dbid_routing_test.go`
+(named ANALYZE / bare ANALYZE / named VACUUM under a distinct dbOid), each
+**proven to fail pre-fix** in the documented direction (42P01, silent no-op,
+silent skip). Units precommit suite PASS; `tpch-spotcheck.sh` PASS (Q12=2,
+Q13=35, 33.0 s query phase — unchanged vs the M0125-0005 baseline);
+`probe-analyze` acceptance FLIPPED: `ANALYZE lineitem` in db `tpch` succeeds,
+`pg_class.reltuples` = 5,997,241 (exact truth for this load).
+
+**Observation for -0029 (gap 3):** the probe's SECOND session also read
+reltuples = 5.997241e+06 — the 2026-07-23 cross-connection-invisibility
+symptom did **not** reproduce once resolution was per-DB. Consistent with
+`SetTableStats` mutating the shared live `catalog.Table`, which every
+connection now resolves to. -0029 should re-verify (esp. across a restart and
+for the SF=1/SF0.5 TPC-DS DBs) rather than assume, but the suspected
+"per-connection Table copies" mechanism is now doubtful; the 2026-07-23
+record may have been this same DefaultDBOid mis-routing seen from the other
+side.
 
 ### M0125-0029 — statistics survive restart, for every database, visible to every connection
 

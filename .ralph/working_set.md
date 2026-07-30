@@ -1,47 +1,47 @@
-(idle — nothing in flight)
+Task: M0125-0028 (warm-stats programme item 2/4) — DONE and committed this loop
+(#8, 2026-07-30 evening). ANALYZE/VACUUM named targets + bare `ANALYZE;` now
+resolve in the connection's database.
 
-Last loop (#7, 2026-07-30 16:42–19:0x): **M0125-0002 commit 2 of 8 is DONE and
-committed** — `cloneExprShiftIdx` re-based onto `cloneExprRefs`/`exprChildSlots`.
-
-Files: `internal/planner/nl_index_join.go` (`cloneExprShiftIdx`),
-`internal/planner/nli_shift_arms_test.go` (NEW, 7 pins),
-`internal/planner/exprwalk_inventory_test.go` (pin demoted),
-`scripts/tpcds-sf05-regression.sh` (stale `unset(off)` label → `unset(2)`),
-`docs/design/0125-0002-…md` (Commit-2 execution record),
-`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (2 rows),
-`analysis/m0125-0002-c2-sf05-plans-20260730/`.
+Files: `internal/executor/operators_analyze.go` (expandAnalyzeTargets via
+ctxPlanCatalog; bare-ANALYZE current-DB form; `targets()` deleted),
+`internal/executor/operators_vacuum.go` (named-target twins via ctxPlanCatalog;
+`relationStillExists` → LookupTableByOIDAllDBs; PartitionChildren nsOid),
+`internal/catalog/catalog.go` (NEW `UserTableHandles` — live handles, vs
+AllTables' deep copies), `internal/executor/analyze_dbid_routing_test.go`
+(NEW, 3 pins), design 0125-0028 §-0028a, README index, fix_plan, ledger
+(1 resolved + 3 new rows).
 
 ## Facts the next loop should NOT re-derive
 
-- **D2 row 2 ("commit 2 does move plans") is REFUTED by measurement.** TPC-H
-  22/22 MATCH in `MODE=strict-text` (byte-identical); TPC-DS SF0.5 96/96
-  byte-identical `EXPLAIN`. The 20 newly admitted kinds never reach that site.
-- SF0.5 answer sweep ran anyway and had to: the old arms dropped
-  `BinaryOp.ResultType` / `FuncCall.Variadic` / `FuncCall.ReturnType` on every
-  hoisted conjunct, which `EXPLAIN` cannot show. **PASS 83 / TIMEOUT 12 /
-  MISMATCH 0 / CKMISMATCH 0 / ERROR 0**, all 50 cks equal to baseline.
-- **`Q72 TIMEOUT 307 s → PASS 313 s` is a CAP FLAP, not a rescue** — slower run,
-  still over 300 s, byte-identical plan. Do not cite it as a win.
-- Commit 1's owed SF0.5 arm was already discharged: §D8's sweep ran at
-  `e29faca9`, which contains `da6d2c0c`.
-- **Use `LABEL=m0125-0005-relsize-default-stage2`** for every remaining commit
-  in this series. `tpcds-round2-head` predates the relsize flip; bare
-  `plan-gate` picks newest-by-mtime.
-- Timed 22-query TPC-H run NOT executed (byte-identical plans); ledger row says
-  it is mandatory again at the first commit with a non-empty plan diff.
+- **probe-analyze FLIPPED**: `ANALYZE lineitem` in db `tpch` OK,
+  reltuples=5,997,241 (exact). **A SECOND session saw the stats too** — the
+  2026-07-23 "per-connection stats" symptom did NOT reproduce; -0029's gap-3
+  "per-connection Table copies" mechanism is doubtful (SetTableStats mutates
+  the shared live pointer). Re-verify in -0029, don't assume.
+- All 3 pins proven to fail pre-fix (42P01 / silent no-op / silent skip) via
+  `git stash push -- <2 files>` + run + pop.
+- Deferred (ledger 2026-07-30 ×3): db-wide VACUUM still DefaultDBOid via
+  AllTables DEEP COPIES (UpdateRelStats/RelFrozenXID writes silently LOST —
+  freeze-bookkeeping change, own loop); bare ANALYZE can't reach heap system
+  catalogs (none registered in ns.tables); `VACUUM <missing>` should be 42P01.
+- Bench server 65433 was restarted with a fresh HEAD build
+  (tmp/goopg-bench-bin) after the probe; region count verified. Nightly next
+  fires 2026-07-31 00:00 JST.
+- -0029 resume points: `persistStatsToPGStatistic` hardcodes
+  `DBOid: catalog.DefaultDBOid` (operators_analyze.go:~200);
+  `loadStatisticsFromHeap` reads only `cat.DBOID()` (initdb/open.go:3479);
+  RowCount/Pages persistence needs the goopg-private mechanism (waiver);
+  restart probe must run on a durable-config cluster (no --no-sync/fsync=off).
 
 ## NEXT (banner order)
 
-**A USER DIRECTIVE 2026-07-30(b) landed MID-LOOP** (a concurrent `ralph_loop.sh`
-was live) and reorders the queue: **`M0125-0028` → `-0029` → `-0030`** (the
-warm-statistics programme) come **before** `M0125-0002` commit 3 and the -0003
-four-arm study. `-0028` is small and host-independent. Read the directive block
-in `.ralph/fix_plan.md` (around line 240) before selecting.
+**`M0125-0029`** (stats survive restart, every DB, every connection) per the
+2026-07-30(b) directive; then `-0030` (bench warm-up + CHECKPOINT, premise
+flip commit), then `-0002` commit 3 / `-0003` four-arm study / `-0026`.
 
-Gates run: units precommit PASS; `go build ./...` + `go vet` clean; census gate
-PASS; 7 new pins PASS **and proved to fail before the change in both
-directions**; `make plan-diff` structural AND strict-text 22/22 MATCH; SF0.5
-`EXPLAIN` 96/96 identical; SF0.5 answer sweep 99/99; `make ralph-state-guard`
-OK; pgbench smoke via the commit hook.
+Gates run: units precommit PASS; go build/vet clean; 3 new pins PASS (and
+fail-before proven); tpch-spotcheck PASS Q12=2/Q13=35 (33.0 s, unchanged);
+probe-analyze acceptance flipped; ralph-state-guard OK (1 auto-repair:
+progress marker reconcile); pgbench smoke via commit hook.
 
 In-flight: none.

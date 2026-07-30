@@ -122,9 +122,20 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 // non-explicit ⇒ silent SKIP_LOCKED skip) and returning the partitioned parents
 // encountered for the inheritance-statistics AccessShare scan. A named target
 // that does not exist is a hard 42P01 error, matching the prior behaviour.
+//
+// Named targets resolve through ctxPlanCatalog — the same per-connection,
+// DB-scoped catalog SELECT plans against. A raw ctx.Catalog.LookupTable keys
+// off DefaultDBOid's namespace, which holds none of a non-default database's
+// tables, so `ANALYZE lineitem` in db tpch raised 42P01 while
+// `SELECT ... FROM lineitem` worked (ledger `bench-reorg ANALYZE-scope`).
+// M0125-0028.
 func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *ExecError) {
-	cat := o.ctx.Catalog
-	im, _ := cat.(*catalog.InMemory)
+	cat := ctxPlanCatalog(o.ctx)
+	// Partition-child expansion needs the concrete InMemory catalog; peel it
+	// from the raw Context catalog, never the (possibly SearchPathCatalog-
+	// wrapped) plan catalog.
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	nsOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	var out []vacuumTarget
 	var parents []*catalog.Table
 	var add func(tbl *catalog.Table, explicit bool)
@@ -134,14 +145,47 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 		}
 		if tbl.PartitionMethod != "" && im != nil {
 			parents = append(parents, tbl)
-			for _, child := range im.PartitionChildren(tbl.OID) {
+			for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
 				add(child, false)
 			}
 			return
 		}
 		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
 	}
-	for _, name := range o.targets() {
+	if len(o.stmt.Targets) == 0 {
+		// Bare ANALYZE: every relation in the CURRENT database, mirroring
+		// upstream's get_all_vacuum_rels (postgres/src/backend/commands/
+		// vacuum.c). Live handles, not AllTables' deep copies — SetTableStats
+		// publishes onto the canonical Table pointer, so a copy would take the
+		// scan and drop its result. All skips are silent (explicit=false):
+		// upstream applies the ownership filter in get_all_vacuum_rels without
+		// logging, and analyze_rel silently returns for another session's temp
+		// relation (RELATION_IS_OTHER_TEMP). analyze_rel's other silent skip —
+		// pg_statistic itself — cannot arise here: the executor catalog
+		// registers no heap-backed system relations, so UserTableHandles
+		// yields user relations (and matviews) only. Partitioned parents join
+		// the inheritance pass but are NOT expanded: their leaves are their
+		// own namespace entries, so expanding the parent too would analyze
+		// each leaf twice. M0125-0028.
+		if im != nil {
+			owner := sessionTempOwner(o.ctx)
+			for _, tbl := range im.UserTableHandles(nsOid) {
+				if tbl.Temp && tbl.TempOwner != "" && tbl.TempOwner != owner {
+					continue
+				}
+				if !maintenancePermitted(o.ctx, tbl) {
+					continue
+				}
+				if tbl.PartitionMethod != "" {
+					parents = append(parents, tbl)
+					continue
+				}
+				out = append(out, vacuumTarget{tbl: tbl, explicit: false})
+			}
+		}
+		return out, parents, nil
+	}
+	for _, name := range o.stmt.Targets {
 		tbl, ok := cat.LookupTable(name)
 		if !ok {
 			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
@@ -162,19 +206,6 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 }
 
 func (o *analyzeOp) Close() error { return nil }
-
-// targets returns the list of relations to analyze. Empty
-// AnalyzeStmt.Targets means "every user table" — matches
-// upstream.
-func (o *analyzeOp) targets() []parser.ObjectName {
-	if len(o.stmt.Targets) > 0 {
-		return o.stmt.Targets
-	}
-	// Iterate the catalog in some stable order. v0's InMemory
-	// catalog doesn't expose a public iterator, so we don't
-	// support the catalog-wide form yet.
-	return nil
-}
 
 // persistStatsToPGStatistic writes per-column statistics to the pg_statistic
 // heap table (OID 2619) so they survive a server restart (M0112). One row is

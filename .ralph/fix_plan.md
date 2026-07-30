@@ -205,8 +205,12 @@ started.
 >       answer sweep 0 MISMATCH/CKMISMATCH/ERROR. Read it as regime-bound all
 >       the same — it says "the conversion changes no plan **at S-cold**", and
 >       `-0030`'s warm flip is exactly what makes S-cold stop being the
->       measured state. **NEXT SELECTION IS `M0125-0028`** per the (b)
->       directive, NOT commit 3.** *(Stale
+>       measured state. **`M0125-0028` LANDED 2026-07-30 (loop #8): ANALYZE/VACUUM
+>       named targets + bare `ANALYZE;` resolve in the connection's database;
+>       probe-analyze flipped (reltuples=5,997,241 in db `tpch`, and the
+>       SECOND session saw it too — -0029's gap-3 mechanism is now doubtful,
+>       see design §-0028a). NEXT SELECTION IS `M0125-0029`** per the (b)
+>       directive.** *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -3016,8 +3020,23 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Harness-only change → shell syntax + a direct probe with the server down
       (the exact reproduction above) + one with it up.
 
-- [ ] **M0125-0028 — `ANALYZE <table>` resolves in the connection's database,
-      not the shared catalog** (USER DIRECTIVE 2026-07-30(b), item 2 of 4;
+- [x] **M0125-0028 — `ANALYZE <table>` resolves in the connection's database,
+      not the shared catalog** — **DONE 2026-07-30 (loop #8).**
+      `expandAnalyzeTargets` + VACUUM's named-target twin + `relationStillExists`
+      resolve per-connection (`ctxPlanCatalog`/`LookupTableByOIDAllDBs`); fact (b)
+      is FIXED not ledgered — bare `ANALYZE;` now covers every relation of the
+      current database via new `catalog.UserTableHandles` (live handles;
+      other-session temp + non-owned skipped silently like upstream). 3 pins in
+      `internal/executor/analyze_dbid_routing_test.go`, each proven to fail
+      pre-fix (42P01 / silent no-op / silent skip). Acceptance flipped:
+      `probe-analyze` → `ANALYZE lineitem` in db `tpch` OK, reltuples=5,997,241,
+      visible to a second session (see design §-0028a — the 2026-07-23
+      cross-connection symptom did NOT reproduce; -0029 gap 3 re-verify, don't
+      assume). Gates: units suite PASS, tpch-spotcheck PASS (Q12=2/Q13=35,
+      33.0 s). 3 ledger rows: db-wide VACUUM still DefaultDBOid + deep-copy
+      (stats writes lost), bare ANALYZE can't reach heap system catalogs,
+      `VACUUM <missing>` should be 42P01. Original body follows.
+      (USER DIRECTIVE 2026-07-30(b), item 2 of 4;
       design `docs/design/0125-0028-warm-stats-programme.md`; closes ledger row
       `bench-reorg ANALYZE-scope` 2026-07-27). In db `tpch`,
       `SELECT count(*) FROM lineitem` returns 5,997,241 while `ANALYZE lineitem`

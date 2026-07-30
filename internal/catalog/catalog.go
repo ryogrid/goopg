@@ -20382,6 +20382,29 @@ func (c *InMemory) AllTables(dbOid ...uint32) []*Table {
 	return out
 }
 
+// UserTableHandles returns the live *Table handles of every non-virtual
+// relation registered under dbOid, in OID order. Sibling of AllTables with a
+// deliberately different ownership contract: AllTables deep-copies because the
+// logical-decoding snapshot builder must freeze the schema, while bare
+// `ANALYZE` (M0125-0028) needs the canonical catalog pointers —
+// SetTableStats's contract is "the Table came from LookupTable/CreateTable on
+// this catalog", and publishing stats onto a copy would silently discard the
+// whole ANALYZE scan.
+func (c *InMemory) UserTableHandles(dbOid ...uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0, len(ns.tables))
+	for _, t := range ns.tables {
+		if t.Virtual {
+			continue
+		}
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // AllViews reports every plain (non-materialized) view registered under
 // dbOid — a sibling of AllTables for CREATE DATABASE ... TEMPLATE's view-copy
 // slice (M0122-0007 4e follow-up 42). A plain view's pg_class row is always
