@@ -164,8 +164,20 @@ started.
 >       oracle**. Its *runtime* verdict is deliberately NOT closed and is filed
 >       as the bookkeeping half below.
 >    4. **NEXT SELECTION: the remaining open M0125 items** — `M0125-0002`,
->       `-0003` (stage 1), `-0004`, `-0005`. Take `M0125-0003` stage 1 first per
->       item 1 of this list, which is still unlanded.
+>       `-0005`, `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
+>       correction 2026-07-30: an earlier revision of this line said "take
+>       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
+>       item 1 above; what -0003 still owes is the timed four-arm study and
+>       stage 3, and stage 3 must NOT land before stage 2's timed arm is read.)*
+>    **`M0125-0026` (added 2026-07-30 by the USER): capture + classify the
+>    15-query timeout class** — plain-EXPLAIN-only comparison of goopg (flag-off
+>    and `GOOPG_RELSIZE_FALLBACK=2`) against PG 18.3 for Q5 Q8 Q10 Q14 Q30 Q31
+>    Q35 Q54 Q64 Q65 Q67 Q69 Q71 Q78 Q81, then file one planner-fix task per
+>    root-cause class (M0125-0027+). **It is HOST-INDEPENDENT (nothing is
+>    timed), so it is the task to take when the timed items above are blocked
+>    on a busy host** — do not burn a quiet-host window on it. Task body at the
+>    end of the M0125 section; design
+>    `docs/design/0125-0026-timeout-class-plan-comparison.md`.
 >    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
 >    quiet host. M0125-0007 is a codec change and could only get the 3-query
 >    value probe, because the nightly CI batch held the host for its whole loop
@@ -2619,6 +2631,47 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       by the SQL keyword that produced it.
       Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, the
       SF0.5 gate, `make plan-diff LABEL=tpcds-round2-head`).
+
+- [ ] **M0125-0026 — the 15-query timeout class: capture both engines' EXPLAIN,
+      classify, and file the planner fixes** (added 2026-07-30 by the USER;
+      design `docs/design/0125-0026-timeout-class-plan-comparison.md` — a work
+      plan, deliberately not a fix design). With the correctness class closed,
+      the 15 SF0.5 timeouts (Q5 Q8 Q10 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q67 Q69 Q71
+      Q78 Q81) are the ONLY remaining goopg-specific class — PG answers each in
+      0–16 s on the same data and query text (`tpcds-results-sf05/oracle.txt`,
+      last field), goopg exceeds 300 s on all 15, and **no artifact has ever put
+      goopg's EXPLAIN next to PG's for any of them**. Steps (all in the doc):
+      **(1) capture** — plain `EXPLAIN`, execution FORBIDDEN (`EXPLAIN ANALYZE`
+      on goopg is banned for this set: these are the queries that do not
+      finish), three arms into `analysis/m0125-0026-timeout-plans/`: goopg
+      default (`goopg-off/`), goopg `GOOPG_RELSIZE_FALLBACK=2`
+      (`goopg-relsize2/` — shape-only, so it does NOT confound M0125-0003's
+      owed timed study; it splits the 15 between "sizes alone fix it" and "the
+      shape is wrong"), PG 18.3 (`pg/`, `psql -p 65438 -U ryo -d tpcds05`).
+      Server via `bench/tpcds/server.sh start sf05` or the cgroup wrapper —
+      **this step is host-independent and may be taken while the nightly holds
+      the host** (nothing is timed). **(2) classify** each query against the
+      doc's suspects — RC-8 rescan-per-outer-row (Q10/Q30/Q35/Q69/Q81
+      candidates; Q35's measured 96,562 × 8.16 s ≈ 9.1 days is the class's one
+      hard number, and `0124-0004` §D4's rule stands: `CacheMisses ≈ Calls` ⇒
+      hashed SubPlan caching, not decorrelation), rows=1 join order (the arm-ON
+      diff isolates it), RC-5 unfiltered MHJ costing (aggravator), CTE
+      referenced N× = body repeated (Q31 ×6 / Q14 / Q64 / Q78 — check
+      `internal/planner/with.go`), missing TopN pushdown through window/rollup
+      (Q67/Q65). A query fitting none of the suspects is a finding.
+      **(3) arithmetic** — per class, Q35-method estimates (outer_rows ×
+      per-rescan cost, |build| × |probe|) from PG-side cardinalities showing why
+      300 s is unreachable; one significant digit. **(4) file** one planner-fix
+      task per CLASS as M0125-0027+ with the plan evidence and acceptance =
+      first-ever completion checked against the git-tracked oracle row (rows +
+      ck where present; Q35's `35|OK|100|0` is already M0125-0003's acceptance
+      row — coordinate, don't duplicate), and propose their selection order in
+      the banner. Acceptance for THIS item: the 15×3 plan capture committed,
+      the classification table with per-class arithmetic in the analysis
+      README, and the per-class fix tasks filed. This item changes NO planner
+      code, so the plan-shape bar does not apply; the fix tasks it files
+      inherit the full bar (plan-diff `LABEL=tpcds-round2-head`, timed TPC-H on
+      a quiet host, full SF0.5 gate).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
