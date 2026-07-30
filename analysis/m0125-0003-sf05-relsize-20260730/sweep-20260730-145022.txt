@@ -1,0 +1,54 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T14:50:32+09:00
+# goopg: 8453037b bench(tpch): M0125-0003 — the relation-size fallback is 1.40× with zero regressions, and the arm the design could not build now exists
+# engine-id: 5a45a42d33ef58ff9de0bcf5f82aa6ccfb66ddd5 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# build: rebuilt from tree
+# engine-binary: running=766595e8fd3fb675 on-disk=766595e8fd3fb675 (/home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=2 GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72) — NOT a gate result; the summary below covers only these queries
+Q54  TIMEOUT   307s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q55  PASS        2s       73 rows  ck=46d35b957845db41
+Q56  PASS       31s      100 rows  ck=n/a
+Q57  PASS       56s      100 rows  ck=n/a
+Q58  PASS       20s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       18s      100 rows  ck=n/a
+Q60  PASS       29s      100 rows  ck=n/a
+Q61  PASS       52s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       20s      100 rows  ck=n/a
+Q64  TIMEOUT   308s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   306s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS       16s        5 rows  ck=f6613897dd73709a
+Q67  PASS      157s      100 rows  ck=n/a
+Q68  PASS       22s      100 rows  ck=n/a
+Q69  PASS       17s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  TIMEOUT   306s (oracle 580 rows)
+      (restarting goopg to drop accumulated heap)
+Q72  TIMEOUT   307s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+
+=== SUMMARY: PASS=13 (4 ck-verified, 9 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

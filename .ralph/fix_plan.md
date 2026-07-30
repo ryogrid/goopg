@@ -94,13 +94,26 @@ started.
 >       `analysis/tpch-relsize-fallback-20260730.md`, quiet host): 1.40× on the
 >       TPC-H stream, four wins to 3.4×, ZERO regressions, identical rows —
 >       §D5.3's risk statement is REFUTED for stage 2 on TPC-H,** so stage 3 is
->       no longer shadow-blocked. What remains owed is **§D8's SF0.5 gate at
->       `GOOPG_RELSIZE_FALLBACK=2`** (the TPC-DS timeout class is this
->       milestone's acceptance criterion; a TPC-H win is not a verdict on it),
->       the W arms (measured *unconstructible* — `ANALYZE` in db `tpch` errors;
->       ledger row) and stage 3. **NEXT SELECTION: the SF0.5 gate at stage 2** —
->       ~1 h, goopg-only, and it is what unblocks `M0125-0005`'s default flip —
->       then `M0125-0002`, `-0005`, or stage 3. Original wording follows.
+>       no longer shadow-blocked. **§D8's SF0.5 GATE AT
+>       `GOOPG_RELSIZE_FALLBACK=2` IS NOW RUN TOO (2026-07-30,
+>       `analysis/m0125-0003-sf05-relsize-20260730/`, quiet host, four chunks on
+>       one binary): the timeout class shrinks 16 → 13, `PASS` 79 → 82, ZERO
+>       MISMATCH/CKMISMATCH/ERROR, all 78 common PASSes agree on rows AND value
+>       checksum, common-PASS wall time −18.8 %.** Four rescues (Q10 40 s,
+>       Q69 17 s, Q67 157 s, Q47 277 s — the last also closes M0125-0013's
+>       runtime half at SF0.5) against one cost: **Q72 is 1.13× slower and
+>       crosses the cap** (900 s probe: off 270 s, on 305 s, so it is a budget
+>       crossing, not a hang). **Both of §D8's predictions are refuted: Q72 was
+>       already passing, and Q35 — this task's own acceptance query per
+>       M0124-0004 — still times out, so the fallback is NOT what Q35 was
+>       waiting for** (ledger row: the RC-8 re-scan class needs its own task,
+>       to be filed off M0125-0026's classification). What remains owed on
+>       -0003 is the W arms (measured *unconstructible* — `ANALYZE` in db
+>       `tpch` errors; ledger row) and stage 3. **NEXT SELECTION: `M0125-0005`,
+>       the default flip — its TPC-H *and* TPC-DS evidence are now both in and
+>       both recommend it** (its remaining own work is the `tpch-spotcheck.sh`
+>       wall-clock + peak-RSS re-measurement and the written decision); then
+>       `M0125-0002` commit 2, stage 3, or `M0125-0026`. Original wording follows.
 >       It is the ONLY designed item that can move the
 >       **17-query timeout class** this milestone is named after — fix_plan calls
 >       it "§13.5's highest-value item (15–16 of 21 defects); stage 1 is inert, so
@@ -169,8 +182,9 @@ started.
 >       `*Filter`-wrapped leaves without advancing `off`). Q47: 0 → **100 rows =
 >       oracle**. Its *runtime* verdict is deliberately NOT closed and is filed
 >       as the bookkeeping half below.
->    4. **NEXT SELECTION: the remaining open M0125 items** — `M0125-0002`,
->       `-0005`, `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
+>    4. **NEXT SELECTION: `M0125-0005` first** (both halves of its evidence
+>       landed 2026-07-30 — see item 1), then `M0125-0002` commit 2,
+>       `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -1435,12 +1449,42 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       §D3's W1 = W2 invariant stays unmeasured; and the absolute seconds carry a
       `MEM_HIGH` below the true working set, so they are not cross-report
       comparable (the A/B is, both arms sharing it).
+      **§D8's TPC-DS ARM IS READ TOO, 2026-07-30, quiet host** —
+      `analysis/m0125-0003-sf05-relsize-20260730/`, the full 99-query SF0.5 gate
+      at `GOOPG_RELSIZE_FALLBACK=2`, four contiguous chunks on ONE binary and one
+      `engine-id`. **`PASS=82 (50 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=13 SKIP=4` against the off arm's `PASS=79 … TIMEOUT=16`** — the
+      timeout class this milestone is named after shrinks by **4 of 16**, and
+      **every one of the 78 queries that pass in both arms agrees on row count
+      AND value checksum**: a suite-wide join-order change that altered no
+      answer, which is the statement M0124-0005's checksum column was added to
+      make. Common-PASS wall time **2273 s → 1845 s (−18.8 %)**, 27 of the 28
+      queries that move by ≥5 s or ≥1.25× faster (Q43 11×, Q52 8×, Q40 6.3×,
+      Q88 2.11×), one slower (Q21 1.74×). Rescues: **Q10 40 s, Q69 17 s,
+      Q67 157 s, Q47 277 s** — Q47 also closes the *runtime* half of M0125-0013
+      at SF0.5. The off arm was **reused, not re-run**, licensed by an empty
+      `git diff e29faca9..HEAD -- '*.go'` plus the identical D4a `engine-id`
+      empty-diff digest in both reports; the gate now also prints
+      `# planner-flags:` (every flag, even unset) so an arm is a positive
+      statement in the artefact instead of the operator's memory.
+      **Both of §D8's pre-registered signals are REFUTED, one backwards:**
+      Q72 did not "resolve" — it was already passing at 276 s and the flag makes
+      it **1.13× slower** (900 s probe: off `PASS 270 s`, on `PASS 305 s`, 100
+      rows both), so its `PASS → TIMEOUT` is a **budget crossing of a marginal
+      query, not a hang** (0124-0001 §D6's class; a TIMEOUT cell may never be
+      read as "unbounded" without a second budget); and **Q35 — this task's own
+      acceptance query per M0124-0004 — still times out at 300 s with the flag
+      on. The relation-size fallback is NOT what Q35 was waiting for**, and its
+      RC-8 per-`EXISTS` re-scan class now needs its own task, to be filed off
+      M0125-0026's classification pass (ledger row). Two ledger rows carry
+      Q72's unexplained 13 % and Q35's non-fix; a third records that the TPC-H
+      harnesses still stamp no planner flags.
       **Still owed, which is why this box is unchecked:** stage 3
-      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`); **§D8's SF0.5 gate
-      at `GOOPG_RELSIZE_FALLBACK=2`, which is the acceptance criterion this
-      milestone is named after and the SINGLE NEXT MEASUREMENT** — TPC-DS
-      timeout relief, not a TPC-H win, is the verdict; and the W arms. The flag
-      accepts `3` today and yields stage-2 behavior.
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms. The
+      flag accepts `3` today and yields stage-2 behavior. **`M0125-0005`'s
+      evidence is now COMPLETE in both benchmark families and both recommend the
+      flip** — it is the next selection, and its commit must name Q72's 1.13× as
+      a known cost rather than claim "no regressions".
       **Read stage 2's timed arm BEFORE stage 3 lands**:
       stage 3 makes `filteredRows` positive cold and therefore SHADOWS the
       stage-2 tier at the DP seed (recorded in `bushySeedRowCounts`'s doc
@@ -1715,10 +1759,17 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       recommends the flip** — 21 comparable queries 693.8 s → 494.0 s (1.40×),
       four wins to 3.4×, **zero regressions**, identical rows; none of round 4's
       five regressed and Q12 (its 4.4× loss) is a 3.4× win. Three riders the
-      report states and this task must honour: **(1)** the TPC-DS side is NOT
-      done — §D8's SF0.5 gate at `GOOPG_RELSIZE_FALLBACK=2` has never been run,
-      and the timeout class is the acceptance criterion, so do not flip on TPC-H
-      evidence alone; **(2)** the report covers **stage 2 only** — stage 3 is
+      report states and this task must honour: **(1)** ~~the TPC-DS side is NOT
+      done~~ — **DONE 2026-07-30, and it RECOMMENDS THE FLIP**
+      (`analysis/m0125-0003-sf05-relsize-20260730/`): SF0.5 timeout class
+      **16 → 13**, `PASS` 79 → 82, **zero** MISMATCH/CKMISMATCH/ERROR, all 78
+      common PASSes agreeing on rows **and** value checksum, common-PASS wall
+      time −18.8 %. Four rescues (Q10 40 s, Q69 17 s, Q67 157 s, Q47 277 s)
+      against **one measured cost this task must carry into its commit message
+      and NOT describe as "no regressions": Q72 is 1.13× slower (270 s → 305 s
+      at a 900 s budget) and crosses the 300 s cap.** Two of §D8's predictions
+      are refuted — Q72 was already passing, and **Q35, this task's acceptance
+      query, still times out**, so the flip must not be sold as fixing it; **(2)** the report covers **stage 2 only** — stage 3 is
       unimplemented and §I8 records that it *shadows* this tier, so its own arms
       are required; **(3)** the spotcheck re-measurement above is still owed, and
       the good news is that Q12, one of its two queries, is a 3.4× win cold.
@@ -2740,7 +2791,23 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       0–16 s on the same data and query text (`tpcds-results-sf05/oracle.txt`,
       last field), goopg exceeds 300 s on all 15, and **no artifact has ever put
       goopg's EXPLAIN next to PG's for any of them**.
-      **↳ AMENDED 2026-07-30 by the full gate run
+      **↳ AMENDED AGAIN 2026-07-30 by M0125-0003's §D8 arm
+      (`analysis/m0125-0003-sf05-relsize-20260730/`), which SUPERSEDES the
+      sixteen-query amendment below: at `GOOPG_RELSIZE_FALLBACK=2` the class is
+      THIRTEEN — `Q5 Q8 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q71 Q72 Q78 Q81`. Q10, Q47,
+      Q67 and Q69 are ANSWERED by the fallback (40 s / 277 s / 157 s / 17 s) and
+      need no root-cause class; `Q72` joins, and it is the most informative
+      member of the whole list — the only query in either benchmark family where
+      the fallback COSTS time (1.13×, 270 s → 305 s at a 900 s budget), so its
+      two goopg plans side by side are the one available picture of the
+      fallback's downside. Capture all three arms for the union (17 queries) if
+      cheap, but classify against the thirteen: a root-cause class for a query
+      the flag already fixes is wasted work, and `M0125-0005` is expected to
+      make flag-on the default. **Q35 is now known NOT to be fixed by the
+      fallback** (still `TIMEOUT` in both arms), which makes its RC-8 re-scan
+      class this task's highest-value output — the follow-up task for it is
+      filed off this classification (ledger row 2026-07-30).**
+      **↳ Earlier amendment 2026-07-30 by the full gate run
       (`analysis/m0125-sf05-fullgate-20260730/`): the class is SIXTEEN queries —
       add `Q47`.** M0125-0013 fixed its row count (0 → 100 = oracle) and the
       query now does the real work, which does not fit the 300 s SF0.5 cap; the

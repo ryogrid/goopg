@@ -1,0 +1,42 @@
+===== CHUNK Q1-Q30 begins 2026-07-30T13:53:27+09:00 =====
+[13:53:27] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> analysis/m0125-0003-sf05-relsize-20260730/sweep-20260730-135327.txt
+[13:53:27] building goopg -> /home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin (tree 8453037b)
+Q1   PASS       62s      100 rows  ck=n/a
+Q2   PASS       18s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        2s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   TIMEOUT   306s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q6   PASS       28s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       25s      100 rows  ck=n/a
+Q8   TIMEOUT   307s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q9   PASS       73s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       40s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       16s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       31s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  TIMEOUT   306s (oracle 200 rows)
+      (restarting goopg to drop accumulated heap)
+Q15  PASS        3s      100 rows  ck=n/a
+Q16  PASS       18s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       27s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      117s      100 rows  ck=n/a
+Q19  PASS       30s      100 rows  ck=n/a
+Q20  PASS        7s      100 rows  ck=n/a
+Q21  PASS       33s      100 rows  ck=n/a
+Q22  PASS       20s      100 rows  ck=n/a
+Q23  PASS       86s        1 rows  ck=00f53003bda23764
+Q24  PASS       34s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       26s        0 rows  ck=1f18d650d205d71d
+Q26  PASS       14s      100 rows  ck=n/a
+Q27  PASS       74s      100 rows  ck=n/a
+Q28  PASS       45s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       27s        0 rows  ck=1f18d650d205d71d
+Q30  TIMEOUT   307s (oracle 31 rows)
+      (restarting goopg to drop accumulated heap)
+
+=== SUMMARY: PASS=25 (14 ck-verified, 11 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=4 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+[14:29:11] sweep report: analysis/m0125-0003-sf05-relsize-20260730/sweep-20260730-135327.txt
+===== CHUNK Q1-Q30 rc=0 ends 2026-07-30T14:29:11+09:00 =====

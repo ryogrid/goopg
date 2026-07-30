@@ -1,7 +1,8 @@
 # 0125-0003 — `GOOPG_RELSIZE_FALLBACK`: block-count relation sizes, and the TPC-H statistics trade-off it re-enters
 
-Status: **stage 1 landed (flag-off, inert); stages 2–3 and the measurement not started**
-Date: 2026-07-28 (stage-1 implementation record appended 2026-07-29)
+Status: **stages 1–2 landed (flag-off by default); the C-arms and §D8's TPC-DS arm are
+MEASURED (§I11–I19) — stage 3, the W arms and the default flip (M0125-0005) remain owed**
+Date: 2026-07-28 (stage-1 record 2026-07-29; stage-2, TPC-H C-arm and TPC-DS §D8 arm 2026-07-30)
 Milestone: M0125-0003 (§13.5 action 2, phase 6.1; design body §7.1)
 Depends on: M0124-0002 (plan baseline). **Independent of M0125-0002** — see the milestone's
 "A coupling that was investigated and found NOT to exist".
@@ -521,12 +522,86 @@ carries the resume point (`cmd/tpch-runner -analyze`).
 
 - **Stage 3** (`estimateBaseRelInfo.baseRows`) — unimplemented, and its arms must be run
   fresh; §I8's shadowing means this arm says nothing about it.
-- **§D8's TPC-DS instrument** — the SF0.5 gate at `GOOPG_RELSIZE_FALLBACK=2` has NOT been
-  run. TPC-DS timeout relief is this milestone's acceptance criterion, so a TPC-H win is
-  not the verdict. This is the single next measurement.
+- ~~**§D8's TPC-DS instrument**~~ — **RUN 2026-07-30; see §I16.**
 - **W1/W2**, per §I14.
 - The **absolute seconds** carry this harness's memory configuration
   (`GOMEMLIMIT=12GiB`, `MEM_HIGH=13G`, `MEM_MAX=15G`); nine queries exceeded `MEM_HIGH`,
   so the heaviest cells include kernel throttle-band time. The A/B is unaffected — one
   binary, one configuration, same-age server per query — but cross-report seconds
   comparisons are not licensed. Ledger row.
+
+---
+
+## Measurement record — §D8's TPC-DS arm (2026-07-30)
+
+Full report: [`analysis/m0125-0003-sf05-relsize-20260730/README.md`](../../analysis/m0125-0003-sf05-relsize-20260730/README.md).
+Merged 99-query board: `…/sweep-COMPLETE-20260730-155432.txt`; four chunk files and
+their drivers alongside it; the Q72 second-budget probe in `…/q72-probe/`.
+
+### I16. The acceptance measurement: the timeout class shrinks 16 → 13, and no answer changes
+
+```
+flag ON   PASS=82 (50 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=13 SKIP=4
+flag OFF  PASS=79 (49 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=16 SKIP=4
+```
+
+Five of 99 statuses move: **Q10 `TIMEOUT`→`PASS 40s`, Q69 →`PASS 17s`, Q67 →`PASS 157s`,
+Q47 →`PASS 277s`**, and **Q72 `PASS 276s`→`TIMEOUT 307s`**. All 78 queries that pass in
+both arms agree on row count **and** value checksum, so a change that re-orders joins
+across the whole suite produced zero answer changes — the statement M0124-0005's checksum
+column exists to make. Common-PASS wall time `2273 s → 1845 s` (**−18.8 %**); 27 of the 28
+queries that move by ≥5 s or ≥1.25× are faster (Q43 11×, Q52 8×, Q40 6.3×, Q88 2.11×), one
+is slower (Q21 1.74×).
+
+The off arm was **reused, not re-run**: `git diff e29faca9..HEAD -- '*.go'` is empty and
+both reports carry the same D4a `engine-id` with the empty-diff digest. That is the only
+form in which an A/B may skip an arm, and it is checkable from the artefacts alone.
+
+### I17. §D8's two predictions are both refuted — and one is refuted backwards
+
+§D8 pre-registered "the TIMEOUT count falls; **Q72** resolves; **Q35** completes". Only the
+first happened.
+
+- **Q72 was already passing** at 276 s, so §13.3's "wrong → slow" premise the prediction
+  rested on was stale; the flag made it **1.13× slower** and pushed it over the cap.
+- **Q35 still times out at 300 s with the flag on.** M0124-0004 had classified it first
+  (performance-only, RC-8 shape), so the claim was falsifiable — and it is false. Q35 is
+  M0125-0003's acceptance query and **the relation-size fallback is not what it was waiting
+  for**; its nine-day arithmetic floor is a per-`EXISTS` re-scan cost that a better relation
+  size does not touch.
+
+Taken with §I12 — where round 4's five predicted regressions did not regress and the
+predicted win did not move — two independent studies now say this planner's per-query
+effects are **not** predictable from prior rounds' tables. Pre-registration remains worth
+doing (it is what makes these refutations sayable), but a prediction from an earlier round
+is not evidence about a later one.
+
+### I18. `TIMEOUT` is a budget statement, and Q72 shows why it must be read as one
+
+Q72's `PASS → TIMEOUT` looks like a cliff. Re-run standalone at a **900 s** budget, both
+arms, same binary and a fresh S-cold server: off `PASS 270 s`, on `PASS 305 s`, 100 rows
+each. The flag costs ≈35 s (1.13×) on a query that sits ~10 % under the cap without it, so
+the status change is a **budget crossing of a marginal query**, not a new unbounded plan.
+This is design 0124-0001 §D6's budget-marginal class, and the general rule it implies is
+that the gate's TIMEOUT column may never be read as "unbounded" without a second budget.
+
+The 1.13× is real and is charged to M0125-0005's flip rather than waived. It also makes Q72
+the most informative single query for `M0125-0026`: the only member of the suite that shows
+the fallback's *downside* on TPC-DS, so its two plans are worth capturing side by side.
+
+### I19. Consequences for the tasks downstream
+
+- **M0125-0005 (the default flip) is now evidence-backed and recommended.** Two independent
+  benchmark families agree in sign and shape. Its commit must name Q72's 1.13× as a known
+  cost, and must not fold in stage 3 — §I8's shadowing would make this arm unattributable.
+- **`M0125-0026`'s capture list is the 13-query flag-on set** — Q5 Q8 Q14 Q30 Q31 Q35 Q54
+  Q64 Q65 Q71 Q72 Q78 Q81 — not the 16 written against the off arm. Q10/Q47/Q67/Q69 are
+  answered and need no root-cause class.
+- **The gate artefact now states its arm.** `scripts/tpcds-sf05-regression.sh` prints
+  `# planner-flags: …` on every sweep, every flag printed even when unset, so "off" is a
+  positive statement in the file. Before this, two arms of the same commit were
+  indistinguishable on their face and the comparison rested on the operator's memory of
+  what was exported — the same class of hole D4a closed for the *engine* identity.
+- Still owed: **stage 3**, the **W arms** (§I14), and an SF=1 reading for nothing in
+  particular — Q35, the one query SF=1 would be run for, is unmeasurable there
+  (M0124-0004: ≈9.1-day floor).

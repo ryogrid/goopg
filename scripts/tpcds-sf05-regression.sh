@@ -518,6 +518,17 @@ cmd_sweep() {
         sf05_engine_binary_line
         echo "# oracle: ${ORACLE} (PG 18.3 plain-run row counts + value checksums)"
         echo "# timeout: ${TIMEOUT_SEC}s"
+        # The arm label. D4a made the report say which ENGINE ran; a planner
+        # A/B additionally needs it to say which FLAGS ran, or two arms of the
+        # same commit produce artefacts that are indistinguishable on their face
+        # and the comparison rests on the operator's memory of what was exported.
+        # Every flag is printed even when unset, so "off" is a positive
+        # statement in the file rather than the absence of a line.
+        printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
+            "${GOOPG_RELSIZE_FALLBACK:-unset(off)}" \
+            "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
+            "${GOOPG_MEMOIZE:-unset(on)}" \
+            "${GOOPG_PARALLEL:-unset(on)}"
         [[ "${FORCE:-0}" == "1" ]] && \
             echo "# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT"
         [[ -n "${QUERIES:-}" ]] && \
