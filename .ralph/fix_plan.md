@@ -178,6 +178,24 @@ started.
 >    on a busy host** — do not burn a quiet-host window on it. Task body at the
 >    end of the M0125 section; design
 >    `docs/design/0125-0026-timeout-class-plan-comparison.md`.
+>    **↳ THE OWED FULL GATE IS DISCHARGED (2026-07-30, `analysis/m0125-sf05-fullgate-20260730/`).**
+>    99/99 at HEAD `e29faca9` on a verified quiet host, one binary, 10:20→12:26:
+>    **`PASS=79 (49 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=16
+>    SKIP=4` — ZERO correctness failures.** Five per-query changes vs the
+>    2026-07-29 baseline and no change in the other direction: Q16/Q94/Q95
+>    `CKMISMATCH → PASS` (M0125-0007 + -0008/-0023 — the three cells M0124-0005's
+>    checksum column was added to find, now closed by *independent* measurement
+>    rather than a 3-query probe), Q75 `ERROR → PASS` (M0125-0004, which also
+>    clears the live `Q75,100,pinned` nightly anchor), and Q47
+>    `MISMATCH → TIMEOUT` — its row defect is fixed (0 → 100 = oracle) and what
+>    the gate now sees is the still-open **runtime** half of M0125-0013, so
+>    `TIMEOUT` 15 → 16 is not a regression. **`M0125-0026`'s capture list is
+>    therefore 16 queries, not 15** (add Q47; but it is not "budget-marginal" in
+>    D6's sense — 142 s at SF=1 against a 300 s SF0.5 cap on half the data needs
+>    its own reading first). First run under the closed gate-integrity trap: the
+>    report carries D4a's `engine-id`/`engine-binary`, `diff=` was the empty-diff
+>    digest (engine == `e29faca9` exactly), and none of the 16 restart bounces
+>    tripped `*** SWEEP VOID ***`.
 >    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
 >    quiet host. M0125-0007 is a codec change and could only get the 3-query
 >    value probe, because the nightly CI batch held the host for its whole loop
@@ -2307,6 +2325,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       green sweep after an edit does not prove the edit was exercised.**
       (`bench/tpcds/server.sh` *does* rebuild unconditionally, so which entry
       point started the server decides whether your change is under test.)
+      **↳ TRAP CLOSED 2026-07-30** (that ledger row flipped `resolved`): `sweep`
+      now calls `sf05_ensure_bin` and builds unconditionally (`SF05_NO_BUILD=1`
+      opts out and the report then declares the binary's provenance unknown), the
+      header carries design **0124-0001 D4a**'s three fields verbatim
+      (`# goopg:` / `# engine-id:` / `# engine-binary: running=… on-disk=…`)
+      rather than a second ad-hoc format, the three definitions are SHARED from
+      `bench/tpcds/env_tpcds.sh` (`bench_engine_id`, `bench_engine_bin_sha`,
+      `bench_running_engine_sha`; `scripts/tpcds-bench-compare.sh` delegates), and
+      `sf05_guard_engine_stable` closes the restart hole — `RESTART_AFTER_TIMEOUT`
+      and the crash-restart re-exec `${GOOPG_BIN}` *as it is then*, so an
+      `engine-id` change writes `*** SWEEP VOID: engine source changed
+      mid-sweep ***` into the report and an image-only change gets D4a's benign
+      docs/tracker-rebuild note. Plus two guards on the shared-path hazard
+      itself: rebuilding `tmp/goopg-bench-bin` is REFUSED while `ci/batch`/the
+      SF=1 harness runs from it (`FORCE=1` does **not** waive this — it waives
+      timing contamination, a different question), and `GOOPG_BIN` is
+      env-overridable so a loop can build its own image. Verified by four direct
+      guard calls (inactive / source-changed / image-only / unchanged) and two
+      subset probes; the 2026-07-30 full gate below is its first real run. The
+      **TPC-H** half of the same trap is untouched and is a NEW ledger row
+      (2026-07-30): no `tpch-spotcheck.sh`, TPC-H bench script or `ci/batch`
+      stage stamps engine provenance at all.
       Remaining real gap, filed as the other ledger row: `Join` still carries ONE
       key pair against PG's mergeclause **list**, so multi-key merge joins are
       now correct but less selective than PG.
@@ -2496,6 +2536,15 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       values (was 1), so `v2`'s three-way self-join does strictly more real
       work than any pre-RC-1b measurement — but that is an argument, not a
       measurement, so the item stays open.
+      **↳ NEW DATAPOINT 2026-07-30 (full SF0.5 gate,
+      `analysis/m0125-sf05-fullgate-20260730/`): Q47 went `MISMATCH → TIMEOUT`.**
+      The row fix registered exactly as predicted below, and the runtime this item
+      is about now exceeds the gate's 300 s cap at SF=**0.5** — half the data, more
+      than twice the SF=1 standalone reading of 142 s. That is a second
+      independent sighting of the 8.4× and it pushes the interpretation toward
+      "the plan is wrong", not "the work is real", but it is still not the timed
+      EXPLAIN comparison this item asks for. Q47 is now the 16th member of
+      M0125-0026's capture set; take its reading there rather than duplicating it.
       **Accept by VALUE**: Q47 = 100 rows = PG **and** values equal PG at SF=1.
       The SF0.5 gate sees the row gap today, so it will register the fix; the
       **nightly anchors will not** — `ci/batch/tpcds-row-anchors.csv` pins 61
@@ -2640,7 +2689,18 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Q78 Q81) are the ONLY remaining goopg-specific class — PG answers each in
       0–16 s on the same data and query text (`tpcds-results-sf05/oracle.txt`,
       last field), goopg exceeds 300 s on all 15, and **no artifact has ever put
-      goopg's EXPLAIN next to PG's for any of them**. Steps (all in the doc):
+      goopg's EXPLAIN next to PG's for any of them**.
+      **↳ AMENDED 2026-07-30 by the full gate run
+      (`analysis/m0125-sf05-fullgate-20260730/`): the class is SIXTEEN queries —
+      add `Q47`.** M0125-0013 fixed its row count (0 → 100 = oracle) and the
+      query now does the real work, which does not fit the 300 s SF0.5 cap; the
+      board is otherwise unchanged (`MISMATCH=0 CKMISMATCH=0 ERROR=0`), so the
+      class grew by a *repaired* query, not a regression. Capture Q47 in all
+      three arms with the rest, but do NOT pre-classify it as unbounded: its only
+      completion reading is 142 s at SF=1 (M0125-0013's bookkeeping half), so a
+      300 s cap on half the data is not obviously a hard cut, and 0124-0001 §D6
+      forbids reporting budget-marginal and unbounded members as one class.
+      Steps (all in the doc):
       **(1) capture** — plain `EXPLAIN`, execution FORBIDDEN (`EXPLAIN ANALYZE`
       on goopg is banned for this set: these are the queries that do not
       finish), three arms into `analysis/m0125-0026-timeout-plans/`: goopg
@@ -2672,6 +2732,41 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       code, so the plan-shape bar does not apply; the fix tasks it files
       inherit the full bar (plan-diff `LABEL=tpcds-round2-head`, timed TPC-H on
       a quiet host, full SF0.5 gate).
+
+- [ ] **M0125-0027 — the SF=1 harness reports a DEAD SERVER as `OK`**
+      (found 2026-07-30 while validating M0125-0011's provenance follow-up;
+      ledger row 2026-07-30. **Numbering note: M0125-0026 will file its
+      per-class planner tasks from `M0125-0028` onward, since this id is now
+      taken.**) `scripts/tpcds-bench-compare.sh:138` ends its status ladder in a
+      catch-all `else status="OK"; rows=$(wc -l <<<"$qout")`. A psql that never
+      connected emits no `ERROR:`/`FATAL:` prefix and no `(N rows)` block, so it
+      falls into that arm and is recorded as **`OK`, with the line count of the
+      connection-error text as its ROW COUNT.** Measured, not reasoned:
+      with nothing listening on 65436, `scripts/tpcds-bench-compare.sh 99`
+      printed `goopg Q99  OK  0s  2` while
+      `bench/tpcds/runtime_goopg/tpcds-results/goopg_q99_result.txt` contains
+      only `psql: error: connection to server at "127.0.0.1", port 65436
+      failed: Connection refused`. This is the same class as 0124-0001 §D6a ("a
+      matching row count is not agreement"), one step worse: **no execution at
+      all can present as a successful cell**, and this is the harness that
+      produced M0124-0001's SF=1 board, which every M0125 SF=1 reading cites.
+      **Fix**: `qex` is already captured — a non-zero exit that is neither 124
+      nor an `ERROR:`-bearing output must not be `OK`. Add a distinct status
+      (`NOCONN`/`UNKNOWN`) carrying `qex` and the first output line, and keep the
+      catch-all `OK` only for `qex == 0` (a 0-row `\d`-style output legitimately
+      has no `(N rows)` block). The SF0.5 gate does NOT share the bug — its
+      ladder ends in a checksum/row-count comparison against the oracle, and a
+      connection failure there mismatches — but it detects it only as a
+      MISMATCH, so give it the same explicit arm.
+      **Also owed as verification, not assumption**: re-read
+      `analysis/tpcds-sf1-goopg-20260728.md` / `analysis/tpcds-sf1-resweep-20260728/`
+      for `OK` cells with a suspiciously tiny row count at ~0 s — the signature
+      of this defect — before any further SF=1 claim leans on that board. It is
+      NOT yet known whether any published cell is affected.
+      Design: extend `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`
+      (§D4a's neighbourhood — report integrity), no new doc.
+      Harness-only change → shell syntax + a direct probe with the server down
+      (the exact reproduction above) + one with it up.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

@@ -21,6 +21,7 @@ time out on goopg while PG answers them in seconds. Per the git-tracked oracle
 | Q30 | 31 | f47a4849… | 4 | CTE + **correlated scalar agg** (`> (select avg(…)*1.2 … where ctr_state = ctr1.ctr_state)`) |
 | Q31 | 19 | 2a74acfb… | 4 | 1 CTE referenced **6×** (ss/ws × 3 quarters) |
 | Q35 | 100 | n/a | 0 | **3× EXISTS** — the measured RC-8 instance (see below) |
+| Q47 | 100 | n/a | 2 | **added 2026-07-30** — CTE + `rank()` window + 3-way self-join on `rn = rn±1` |
 | Q54 | 0 | 1f18d650… | 10 | CTE, cross-channel customer set, month-range scalar subqueries |
 | Q64 | 2 | 31f0342f… | 0 | 1 big CTE self-joined (two-phase, cnt>1) |
 | Q65 | 100 | n/a | 0 | two derived aggregates over store_sales, `<= 0.1*avg` |
@@ -32,6 +33,18 @@ time out on goopg while PG answers them in seconds. Per the git-tracked oracle
 
 goopg's side: all 15 are `TIMEOUT` at the gate's 300 s cap (merged sweep at
 `50cf7c5f`), i.e. **≥ 20–300× slower than PG on the same data and query text**.
+
+**The class is SIXTEEN as of 2026-07-30, and the sixteenth arrived by being
+repaired.** The full 99-query gate at `e29faca9`
+(`analysis/m0125-sf05-fullgate-20260730/`) reports `PASS=79 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=16 SKIP=4`: Q47 moved `MISMATCH → TIMEOUT` because
+M0125-0013 fixed its row count (0 → 100 = oracle) and the query now does the real
+work. Capture it in all three arms with the rest. But it must **not** be
+pre-classified as unbounded-above: its one completion reading is `OK 142 s` at
+SF=1 (M0125-0013's open bookkeeping half), so a 300 s cap on *half* the data is
+not obviously a hard cut, and `0124-0001` §D6 forbids reporting a
+budget-marginal member and an unbounded one as a single class. Q47's own reading
+comes first; only then does it join a root-cause bucket below.
 Q35 additionally has a measured floor: outer cardinality 96,562 × 8.16 s per
 buffer-warm `EXISTS` evaluation ≈ **9.1 days at SF=1** (`0124-0004` §"Execution
 record"), so at least one member cannot complete under ANY budget with the

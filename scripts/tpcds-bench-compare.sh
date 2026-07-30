@@ -164,40 +164,14 @@ run_one() {
 # sha256 of the binary actually serving the cluster. Chunks are comparable
 # when engine-tree AND engine-binary match; restart_goopg re-checks the
 # binary after every rebuild.
-engine_tree_id() { git rev-parse "HEAD:internal" "HEAD:cmd" 2>/dev/null | tr '\n' ' '; }
-
-# engine_id — the identity a chunk is compared on: the COMMITTED engine trees
-# plus a digest of any UNCOMMITTED engine edit. Neither term moves when a docs
-# or tracker commit lands, and the second term is what catches the working-tree
-# build that mis-provenanced sweep-20260727-214619.
-#
-# Do NOT use the binary's sha256 for this: `go build` stamps vcs.revision,
-# vcs.time and vcs.modified into the image, so the sha changes on EVERY commit
-# and with dirt anywhere in the repo. Measured on the first chunk of this very
-# sweep: a docs-only commit moved it e6774c4f -> 8f0aac15 and the first-cut
-# guard cried "SWEEP VOID" over an engine whose source had not changed at all
-# (`git diff --stat <commit>^ <commit> -- internal cmd` was empty, and
-# `go build -buildvcs=false` reproduces one image across both). The binary sha
-# is still printed — it is the right provenance for "which image answered" —
-# but it is not the comparability key.
-engine_id() {
-    printf '%s diff=%s' "$(engine_tree_id)" \
-        "$(git diff HEAD -- internal cmd 2>/dev/null | sha256sum | cut -c1-12)"
-}
-engine_bin_sha() { [[ -f "${GOOPG_BIN}" ]] && sha256sum "${GOOPG_BIN}" | cut -c1-16 || echo "absent"; }
-
-# The on-disk binary is not necessarily the one SERVING the cluster: a server
-# started before the last rebuild keeps running its (now deleted) image. That
-# was the live state when this guard was written — the SF=1 server had been up
-# 16 h on 4140b160 while tmp/goopg-bench-bin was 7a4b4f7b. Hash /proc/<pid>/exe
-# of the postmaster so the header names the engine that actually answered.
-running_engine_sha() {
-    local pidfile="${TPCDS_PGDATA}/postmaster.pid" pid
-    [[ -f "${pidfile}" ]] || { echo "no-pidfile"; return; }
-    pid="$(head -1 "${pidfile}")"
-    [[ -r "/proc/${pid}/exe" ]] || { echo "unreadable"; return; }
-    sha256sum "/proc/${pid}/exe" 2>/dev/null | cut -c1-16 || echo "unreadable"
-}
+# The three helpers themselves moved to bench/tpcds/env_tpcds.sh on 2026-07-30
+# (M0125-0011's gate-integrity follow-up): the SF0.5 gate needs the SAME fields
+# with the SAME meaning, and two copies of a provenance rule drift. The reasons
+# behind each definition are documented at that single site; these wrappers keep
+# this script's call sites and its "SWEEP VOID" policy unchanged.
+engine_id() { bench_engine_id; }
+engine_bin_sha() { bench_engine_bin_sha "${GOOPG_BIN}"; }
+running_engine_sha() { bench_running_engine_sha "${TPCDS_PGDATA}"; }
 ENGINE_BIN_SHA_AT_START="$(running_engine_sha)"
 ENGINE_ID_AT_START="$(engine_id)"
 

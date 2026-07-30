@@ -171,6 +171,44 @@ deferral-ledger row (2026-07-29) proposing the sweep stamp the binary's
 build-id/mtime into its report header so a stale-binary run is visible in the
 artefact rather than inferable only from process archaeology.
 
+### The trap is closed (2026-07-30)
+
+The ledger row's resume point is implemented, in the form its `why` column asked
+for — **D4a's fields, not a second ad-hoc format**. Three changes:
+
+1. **`sweep` builds unconditionally.** `sf05_ensure_bin` runs at the top of both
+   `cmd_sweep` and `cmd_load_goopg`, so the sweep executes the current tree the
+   way `bench/tpcds/server.sh` already did (the inconsistency between two
+   harnesses over one cluster is gone). The Go build cache makes it ~1 s when
+   nothing changed. `SF05_NO_BUILD=1` keeps a deliberately-foreign binary usable
+   for a bisect probe, at the price of the report printing
+   `PRE-EXISTING, NOT BUILT BY THIS RUN … provenance unknown`.
+2. **The header carries the SF=1 harness's three provenance fields verbatim**
+   (`# goopg:` / `# engine-id:` / `# engine-binary: running=… on-disk=…`), so an
+   SF0.5 report and an SF=1 report can be compared line for line. The helpers
+   themselves moved to `bench/tpcds/env_tpcds.sh`
+   (`bench_engine_id`, `bench_engine_bin_sha`, `bench_running_engine_sha`) and
+   `scripts/tpcds-bench-compare.sh` now delegates to them: a provenance rule with
+   two implementations drifts, and D4a's whole point is that the *definition*
+   (committed engine trees + a digest of uncommitted engine edits, never the
+   binary's sha256) is the load-bearing part.
+3. **A restart cannot swap the engine silently.** `RESTART_AFTER_TIMEOUT=1` and
+   the crash-restart both re-exec `${GOOPG_BIN}` as it is *then*, and that path
+   is now guarded (`sf05_guard_engine_stable`, called from `sf05_goopg_start`
+   once the sweep owns the server): a changed `engine-id` writes
+   `*** SWEEP VOID: engine source changed mid-sweep ***` into the report itself,
+   while a changed image under an identical `engine-id` prints the benign
+   docs/tracker-rebuild note — D4a's measured false-positive lesson, kept.
+
+Two guards ride along, because the shared binary path is what made the trap
+possible in the first place: `sf05_ensure_bin` **refuses** to rebuild
+`tmp/goopg-bench-bin` while `ci/batch` or the SF=1 harness is running from it
+(`FORCE=1` does not waive this — `FORCE` waives *timing* contamination, a
+different question), and `GOOPG_BIN` is now env-overridable so a loop can build
+its own image instead. Verified by four direct calls of the guard covering
+inactive / source-changed / image-only-changed / unchanged, and by two subset
+probes reading the emitted header.
+
 ## Deferred
 
 `Join` carries a single `LeftKey`/`RightKey` pair, whereas PG's merge join takes
@@ -187,3 +225,7 @@ in `.ralph/deferral_ledger.md` (2026-07-29, M0125-0011); resume point is
 
 - `internal/executor/operators_join_agg.go` — `runMergeJoin` equal-key group.
 - `internal/executor/merge_join_residual_test.go` — new regression test.
+- `bench/tpcds/env_tpcds.sh` — shared D4a provenance helpers; `GOOPG_BIN` override.
+- `scripts/tpcds-sf05-regression.sh` — `sf05_ensure_bin`, `sf05_engine_binary_line`,
+  `sf05_guard_engine_stable` (the gate-integrity follow-up above).
+- `scripts/tpcds-bench-compare.sh` — SF=1 harness delegates to the shared helpers.

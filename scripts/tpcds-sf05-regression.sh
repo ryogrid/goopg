@@ -66,6 +66,11 @@
 #   SF05_ORACLE=<path>      read/write the oracle fixture elsewhere
 #   SF05_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
 #                           fixture stays where SF05_ORACLE points
+#   SF05_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
+#                           rebuilding from the tree (bisect probes); the report
+#                           says its provenance is unknown — see sf05_ensure_bin
+#   GOOPG_BIN=<path>        build/run a private binary instead of the SHARED
+#                           tmp/goopg-bench-bin (which the nightly also owns)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -226,6 +231,80 @@ cmd_load_pg() {
     log "load-pg done"
 }
 
+# ------------------------------------------------------------ binary identity
+#
+# Why this exists (2026-07-30). The sweep report stamped `# goopg: $(git log
+# --oneline -1)` — the WORKING TREE's HEAD — while `cmd_load_goopg` accepted any
+# already-present binary (`[[ -x "${GOOPG_BIN}" ]] || go build`). Those two
+# facts together let a report claim a commit it never executed: GOOPG_BIN is one
+# shared path (tmp/goopg-bench-bin) that the nightly CI batch and every TPC-H
+# bench script also build into, so the file sitting there belongs to whoever
+# built it last. Since every M0125 acceptance is a row-count/checksum verdict
+# read off these reports, "which binary produced this" is load-bearing evidence,
+# not decoration.
+#
+# So: build unconditionally from the current tree (the Go build cache makes that
+# ~1 s when nothing changed), and stamp what actually ran. SF05_NO_BUILD=1 keeps
+# a deliberately-foreign binary (a bisect probe) usable, at the cost of the
+# report saying so out loud.
+sf05_bin_provenance=""          # set by sf05_ensure_bin; echoed into the report
+sf05_engine_id_at_start=""      # D4a comparability key, captured before the build
+sf05_bin_sha_at_start=""        # on-disk image the sweep intended to measure
+sf05_report=""                  # cmd_sweep's report path (the restart guard appends)
+sf05_sweep_active=0             # 1 once the sweep loop owns the server
+
+sf05_ensure_bin() {
+    local tree_sha dirty built="rebuilt from tree"
+    tree_sha=$(cd "${REPO_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+    # "Dirty" must mean "the binary is not HEAD's code": only tracked Go sources
+    # and the module files can change what got compiled. Untracked analysis
+    # artefacts and .ralph churn are always present in a loop's tree and would
+    # make the flag fire on every run, i.e. mean nothing.
+    dirty=$(cd "${REPO_ROOT}" && git status --porcelain --untracked-files=no \
+                -- '*.go' go.mod go.sum 2>/dev/null | head -1)
+    if [[ "${SF05_NO_BUILD:-0}" == "1" ]]; then
+        [[ -x "${GOOPG_BIN}" ]] || die "SF05_NO_BUILD=1 but ${GOOPG_BIN} is not executable"
+        built="PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown"
+    else
+        # Refuse to clobber the SHARED default while a foreign bench harness owns
+        # the host: the nightly runs servers from this exact file for hours and
+        # restarts them between stages, so overwriting it mid-run would swap the
+        # binary under someone else's measurement. FORCE=1 does NOT waive this —
+        # it waives timing contamination, which is a different question.
+        if [[ "${GOOPG_BIN}" == "${REPO_ROOT}/tmp/goopg-bench-bin" ]] \
+           && grep -qE 'ci/batch/(run-nightly\.sh|stages/)|[b]ash scripts/tpcds-bench-compare\.sh' \
+                   <<<"$(bench_foreign_procs)"; then
+            die "refusing to rebuild the SHARED ${GOOPG_BIN} while the nightly/SF=1 harness runs from it; re-run with GOOPG_BIN=${REPO_ROOT}/tmp/goopg-sf05-bin"
+        fi
+        mkdir -p "$(dirname "${GOOPG_BIN}")"
+        log "building goopg -> ${GOOPG_BIN} (tree ${tree_sha}${dirty:+, dirty})"
+        ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) \
+            || die "goopg build failed"
+    fi
+    # Field names and semantics are D4a's, verbatim, so an SF0.5 header and an
+    # SF=1 header can be compared line for line (helpers in env_tpcds.sh).
+    # `running=` is filled in later — the postmaster does not exist yet here.
+    sf05_engine_id_at_start=$(bench_engine_id)
+    sf05_bin_provenance=$(printf '# goopg: %s\n# engine-id: %s\n# build: %s%s' \
+        "$(cd "${REPO_ROOT}" && git log --oneline -1 2>/dev/null)" \
+        "${sf05_engine_id_at_start}" \
+        "${built}" \
+        "${dirty:+ [tree DIRTY in Go sources — the binary is not this commit alone]}")
+}
+
+# sf05_engine_binary_line — D4a's third field, emitted once the cluster is up.
+# on-disk vs running differ whenever a foreign harness rebuilt the shared path
+# after this server started; the sweep header must show which image answered.
+sf05_engine_binary_line() {
+    local running ondisk
+    running=$(bench_running_engine_sha "${SF05_GOOPG_DATA}")
+    ondisk=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    printf '# engine-binary: running=%s on-disk=%s (%s)\n' "${running}" "${ondisk}" "${GOOPG_BIN}"
+    [[ "${running}" != "${ondisk}" ]] && \
+        printf '# WARNING: the serving goopg is not the on-disk build of %s — a foreign harness rebuilt it; this run measures the `running` image.\n' "${GOOPG_BIN}"
+    return 0
+}
+
 # --------------------------------------------------------------- goopg server
 sf05_goopg_stop() {
     "${GOOPG_BIN}" stop -D "${SF05_GOOPG_DATA}" >/dev/null 2>&1 || true
@@ -243,17 +322,44 @@ sf05_goopg_start() {
         >> "${SF05_LOG}" 2>&1 &
     local i
     for i in $(seq 1 180); do
-        pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 && return 0
+        if pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1; then
+            sf05_guard_engine_stable
+            return 0
+        fi
         sleep 1
     done
     die "goopg (sf05) did not become ready in 180s — see ${SF05_LOG}"
+}
+
+# sf05_guard_engine_stable — every RESTART_AFTER_TIMEOUT bounce and every
+# crash-restart re-execs ${GOOPG_BIN} as it is *then*, so a foreign harness that
+# rebuilt the shared path mid-sweep silently swaps the engine under the report
+# (D4a's second failure direction). Mirror the SF=1 harness's policy: a changed
+# engine-id VOIDS the run and must be shouted in the artefact, not left to
+# process archaeology; a changed image with identical source is a docs/tracker
+# commit rebuild and voids nothing.
+sf05_guard_engine_stable() {
+    [[ "${sf05_sweep_active}" == "1" ]] || return 0
+    local now_id now_sha msg=""
+    now_id=$(bench_engine_id)
+    now_sha=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    if [[ "${now_id}" != "${sf05_engine_id_at_start}" ]]; then
+        msg="      *** SWEEP VOID: engine source changed mid-sweep (engine-id ${sf05_engine_id_at_start} -> ${now_id}); verdicts before and after this restart are not one measurement ***"
+    elif [[ "${now_sha}" != "${sf05_bin_sha_at_start}" ]]; then
+        msg="      (engine source unchanged; ${GOOPG_BIN} image re-built ${sf05_bin_sha_at_start} -> ${now_sha} — docs/tracker commit, not a code change)"
+    fi
+    if [[ -n "${msg}" ]]; then
+        echo "${msg}"
+        [[ -n "${sf05_report}" ]] && echo "${msg}" >> "${sf05_report}"
+    fi
+    return 0
 }
 
 # --------------------------------------------------------------- load-goopg
 cmd_load_goopg() {
     guard_sf1_sweep
     [[ -d "${SF05_DATA_DIR}" ]] || die "run build-data first"
-    [[ -x "${GOOPG_BIN}" ]] || ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
+    sf05_ensure_bin
     log "Initialising fresh goopg cluster at ${SF05_GOOPG_DATA} (port ${SF05_PORT})"
     sf05_goopg_stop
     rm -rf "${SF05_GOOPG_DATA}"
@@ -393,15 +499,27 @@ cmd_sweep() {
     mkdir -p "${OUTDIR}"
     local report="${OUTDIR}/sweep-$(date +%Y%m%d-%H%M%S).txt"
     log "goopg SF0.5 sweep (timeout ${TIMEOUT_SEC}s/query, S-cold) -> ${report}"
+    sf05_ensure_bin
+    sf05_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    sf05_report="$report"
     sf05_goopg_start
+    # Only now is the sweep the server's owner: the guard must not fire on this
+    # first, intended start.
+    sf05_sweep_active=1
     local q line ostatus orows ock qf out rc secs start grows gck verdict nf
     local pass=0 mismatch=0 ckmismatch=0 gerr=0 gto=0 skip=0 ckver=0 ckna=0
     local resfile="${OUTDIR}/.goopg_result.txt"
     {
         echo "# TPC-DS SF0.5 goopg sweep — $(date -Iseconds)"
-        echo "# goopg: $(git log --oneline -1)"
+        # Identity of the engine that ACTUALLY ran, not just the tree's HEAD —
+        # see sf05_ensure_bin for why the difference bit us. Same three fields as
+        # the SF=1 harness (design 0124-0001 D4a).
+        echo "${sf05_bin_provenance}"
+        sf05_engine_binary_line
         echo "# oracle: ${ORACLE} (PG 18.3 plain-run row counts + value checksums)"
         echo "# timeout: ${TIMEOUT_SEC}s"
+        [[ "${FORCE:-0}" == "1" ]] && \
+            echo "# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT"
         [[ -n "${QUERIES:-}" ]] && \
             echo "# SUBSET PROBE (QUERIES=${QUERIES}) — NOT a gate result; the summary below covers only these queries"
     } > "$report"

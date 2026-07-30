@@ -1,0 +1,54 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T08:41:45+09:00
+# binary: /home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin
+# binary-id: sha256=61db5a84ceb865c7 mtime=2026-07-30T08:41:35+09:00 (rebuilt from tree)
+# tree: 3f9f3efe chore(ci): nightly batch 20260730-011706 logs (action-items, launch, scheduler, history)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72) — NOT a gate result; the summary below covers only these queries
+Q54  TIMEOUT   333s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q55  PASS       11s       73 rows  ck=46d35b957845db41
+Q56  PASS       32s      100 rows  ck=n/a
+Q57  PASS       72s      100 rows  ck=n/a
+Q58  PASS       19s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       26s      100 rows  ck=n/a
+Q60  PASS       33s      100 rows  ck=n/a
+Q61  PASS       56s        1 rows  ck=4766027020fae308
+Q62  PASS        9s      100 rows  ck=n/a
+Q63  PASS       20s      100 rows  ck=n/a
+Q64  TIMEOUT   332s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   332s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS       20s        5 rows  ck=f6613897dd73709a
+Q67  TIMEOUT   332s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q68  PASS       19s      100 rows  ck=n/a
+Q69  TIMEOUT   332s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  TIMEOUT   333s (oracle 580 rows)
+      (restarting goopg to drop accumulated heap)
+Q72  PASS      279s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=12 (4 ck-verified, 8 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

@@ -157,6 +157,18 @@ header as provenance for *which image answered*, which the commit line cannot ex
 and voids nothing — the sweep's own `chunk-1-4.txt` is the worked example, annotated in
 `analysis/tpcds-sf1-resweep-20260728/RESULTS.md`.
 
+**Adopted by the SF0.5 gate, and the definitions are now shared (2026-07-30).** D4a was
+written for this SF=1 harness, but the trap it describes is *harness-independent*: M0125-0011
+measured the opposite of the truth from an SF0.5 sweep because that script built
+`tmp/goopg-bench-bin` only when it was missing, so a reverted source file changed nothing
+about what ran. `scripts/tpcds-sf05-regression.sh` now builds unconditionally and prints the
+same three fields; and `bench_engine_id` / `bench_engine_bin_sha` /
+`bench_running_engine_sha` live in `bench/tpcds/env_tpcds.sh`, with
+`scripts/tpcds-bench-compare.sh` delegating to them. Two copies of a provenance rule drift,
+and the copy that drifts is the one that stops catching the trap — the SF0.5 gate is where
+every M0125 row-count/checksum verdict is read. Details in
+[0125-0011](0125-0011-full-outer-join-on-conjunct-drop.md) §"The trap is closed".
+
 ### D5. State labelling (§8)
 
 Every goopg number is **S-cold**. Record the proof before the sweep and paste it into the

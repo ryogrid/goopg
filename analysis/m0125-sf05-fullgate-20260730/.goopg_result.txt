@@ -1,0 +1,1 @@
+psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query88.sql:91: ERROR:  canceling statement due to statement timeout

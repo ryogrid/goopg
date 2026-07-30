@@ -1,0 +1,51 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T09:26:13+09:00
+# binary: /home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin
+# binary-id: sha256=61db5a84ceb865c7 mtime=2026-07-30T09:26:07+09:00 (rebuilt from tree)
+# tree: 3f9f3efe chore(ci): nightly batch 20260730-011706 logs (action-items, launch, scheduler, history)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99) — NOT a gate result; the summary below covers only these queries
+Q73  PASS       18s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       13s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       36s      100 rows  ck=n/a
+Q76  PASS       19s      100 rows  ck=n/a
+Q77  PASS       21s       44 rows  ck=2afe8ddcd18fad9c
+Q78  TIMEOUT   333s (oracle 45 rows)
+      (restarting goopg to drop accumulated heap)
+Q79  PASS       14s      100 rows  ck=n/a
+Q80  PASS       86s      100 rows  ck=n/a
+Q81  TIMEOUT   326s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q82  PASS       47s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        3s        3 rows  ck=9504298446f22ddc
+Q84  PASS        3s        6 rows  ck=073898a18264bd8e
+Q85  PASS        4s        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       17s        1 rows  ck=b363a9287bdd0920

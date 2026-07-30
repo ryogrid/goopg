@@ -1,53 +1,61 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0024's owed executor-side value gate CLOSED**. New file
-`internal/executor/agg_state_sharing_value_test.go` (3 tests); design §5.1;
-ledger row 587 flipped `resolved`; one new ledger row appended.
+Last loop (#1 of this run, 2026-07-30 10:17–12:35): **M0125-0011's gate-integrity
+follow-up landed AND the owed full 99-query SF0.5 gate is DISCHARGED.**
 
-Files: the new test file, `docs/design/0125-0024-expression-identity-collisions.md`
-(§5.1 + §6), `docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
+Task: close the ledger row (2026-07-29) whose resume point asked the SF0.5 sweep
+to stamp binary identity, then spend the quiet-host window on the gate that had
+been owed four times.
+
+Files: `bench/tpcds/env_tpcds.sh` (shared D4a helpers `bench_engine_id` /
+`bench_engine_bin_sha` / `bench_running_engine_sha`, `GOOPG_BIN` override),
+`scripts/tpcds-sf05-regression.sh` (`sf05_ensure_bin`,
+`sf05_engine_binary_line`, `sf05_guard_engine_stable`),
+`scripts/tpcds-bench-compare.sh` (delegates to the shared helpers),
+`docs/design/0125-0011-*.md` + `0124-0001-*.md` + `0125-0026-*.md` +
+`docs/design/README.md`, `analysis/m0125-sf05-fullgate-20260730/` (report +
+driver log + README), `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
 ## Facts the next loop should NOT re-derive
 
-- **A user-defined sfunc IS reachable from the in-package executor harness.**
-  The ledger row had budgeted a new fixture for this; it was not needed.
-  `executeSFuncCall` falls back to `executeStoredRoutine`
-  (`operators_join_agg.go:3633`) and `RAISE NOTICE` lands in `ctx.Notices`, so
-  a plpgsql sfunc + `newDDLFixture` + `runQuery` (with_compat_test.go) is the
-  whole recipe. Tests can COUNT sfunc calls, not just assert values.
-- **The M0125-0024 verdict is now "wrong answer AND wrong error".** At
-  `da6d2c0c`: `ua_sum(a+b), ua_sum(a-b)` → `(77, 77)` (PG: `(77, -63)`), and
-  `DISTINCT ON (CASE …) … ORDER BY CASE …` was **rejected** `42P10` although PG
-  18.3 accepts it (measured on the 65438 oracle). Do not re-argue the laxer
-  direction from `equalfuncs.c` — it is measured.
-- **PG oracle access:** 65438 is up; the role is **`ryo`, not `postgres`**
-  (`-U postgres` → `FATAL: role "postgres" does not exist`), dbs `tpcds`/`tpcds05`.
-  Read-only `VALUES`-derived queries need no DDL on the oracle cluster.
-- **Pre/post-fix proof without a worktree:** `git checkout da6d2c0c --
-  internal/planner/exprwalk.go internal/planner/planner.go`, run the *executor*
-  package, then `git checkout HEAD -- <same two>`. Planner _test.go files are
-  not compiled for another package, so this compiles cleanly. Cheap and exact.
-- **Host was NOT quiet** (nightly `run-nightly.sh` PID 3541516 since 01:51, its
-  TPC-DS stage on 65435 at ~11 GB RSS / ~590 % CPU, load ~12, budget-left ~78 min
-  at 06:59; Q18 TIMEOUT at 06:53). No timing was attempted. A goroutine dump was
-  taken from its pprof (6161) → `/tmp/nightly-goroutines-0713.txt`: it shows the
-  CURRENT query in `multiHashJoinOp.Open`, **no** orphaned-backend evidence, so
-  it is not the stack the parked shutdown-hang item wants.
+- **Gate result, HEAD `e29faca9`, quiet host, one binary, 10:20→12:26:**
+  `PASS=79 (49 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=16 SKIP=4`.
+  Five changes vs the 2026-07-29 baseline, no change in the other direction:
+  Q16/Q94/Q95 `CKMISMATCH→PASS` (M0125-0007/-0008/-0023), Q75 `ERROR→PASS`
+  (M0125-0004, also clears the live `Q75,100,pinned` anchor), Q47
+  `MISMATCH→TIMEOUT` (row defect fixed; its runtime is M0125-0013's open half).
+- **The timeout class is 16, not 15** — Q47 joined it. M0125-0026's capture list
+  is amended in both fix_plan and the design doc. Do not call Q47 unbounded: its
+  one completion reading is 142 s at SF=1 against a 300 s cap on half the data.
+- **NEW defect filed, NOT fixed: `M0125-0027`** — `tpcds-bench-compare.sh:138`'s
+  catch-all `else status="OK"` records a *connection-refused* psql as `OK` with
+  the error text's line count as its row count (measured: `goopg Q99 OK 0s 2`
+  with nothing on 65436). Also owed there: re-read the published SF=1 board for
+  `OK` cells with a tiny row count at ~0 s. M0125-0026's per-class tasks must
+  start at **M0125-0028** now.
+- The SF0.5 sweep now **always rebuilds** (`SF05_NO_BUILD=1` opts out and says so
+  in the report), refuses to clobber the shared `tmp/goopg-bench-bin` while
+  ci/batch or the SF=1 harness runs from it (FORCE=1 does NOT waive that), and
+  shouts `*** SWEEP VOID ***` into the report if a restart swaps the engine.
+  Run a private image with `GOOPG_BIN=tmp/goopg-sf05-bin`.
+- The dead chunked attempt in `analysis/m0125-sf05-fullgate-20260730/` is now
+  labelled invalid in that dir's README — don't cite its cells or seconds.
 
-## NEXT (banner order — M0124 closed, M0125 first, M-NIGHTLY filed-only)
+## NEXT (banner order — the gate obligation is no longer in the way)
 
-1. **The owed SF0.5 gate, on a QUIET host** (`scripts/tpcds-sf05-regression.sh
-   sweep`, ~1 h). Owed three times over and it **must precede M0125-0002
-   commit 2**. Check `ci/batch/run-nightly.sh` is absent first.
-2. `M0125-0002` **commit 2 — `cloneExprShiftIdx`** (`nl_index_join.go:777`),
-   first commit expecting hunks; carries the full timed 22-query TPC-H run
-   (`scripts/goopg-test-run.sh`, `GOGC=100` / `GOMEMLIMIT=12GiB`).
-3. Then `M0125-0003` stage 2's TIMED arm, stage 3, `M0125-0005`.
+1. `M0125-0002` **commit 2 — `cloneExprShiftIdx`** (`nl_index_join.go:777`): the
+   first commit expecting plan hunks; needs the timed 22-query TPC-H run
+   (`scripts/goopg-test-run.sh`, `GOGC=100` / `GOMEMLIMIT=12GiB`) on a quiet host
+   plus `make plan-diff LABEL=tpcds-round2-head`.
+2. `M0125-0003` stage 2's TIMED four-arm study (quiet host), then stage 3.
+3. `M0125-0005`; `M0125-0026` is the host-independent option when the host is busy.
 
-Gates run: `go build ./...` clean; the 3 new tests proved to FAIL at `da6d2c0c`
-and PASS at HEAD; `./internal/executor/` + `./internal/planner/` PASS; units
-suite PASS (all cached); pgbench smoke via the commit hook; `make
-ralph-state-guard`. NOT run (host): SF0.5 sweep, any timed TPC-H, plan-diff
-(no planner/executor *product* code changed this loop — test-only).
+Gates run: `go build ./...` clean; `bash -n` on all three touched shell files;
+four direct `sf05_guard_engine_stable` branch probes (inactive / source-changed /
+image-only / unchanged); two SF0.5 subset probes (Q1, Q98) validating the header;
+SF=1 harness header re-rendered after the delegation; **full 99-query SF0.5 gate
+PASS**; units suite PASS (warm cache — no Go code changed this loop);
+`make ralph-state-guard` OK; pgbench smoke via the commit hook.
+NOT run: timed TPC-H, plan-diff (no planner/executor code touched).
 
 In-flight: none.
