@@ -1,0 +1,18 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T01:17:14+09:00
+# goopg: ccab6d80 executor(explain)+bench(tpcds): M0125-0039 — a correlation stops reading as a self-comparison
+# engine-id: bf2d4c58dedf6c9551bf79d8414f11448a7d53ac c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=a8e8c5603446
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=78feac289683c529 on-disk=78feac289683c529 (/home/ryo/work/goopg/goopg/tmp/goopg-m0125-0034-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=71 8 5 14 54) — NOT a gate result; the summary below covers only these queries
+Q71  ERROR       1s psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query71.sql:3
+Q8   PASS        7s        0 rows  ck=1f18d650d205d71d
+Q5   PASS       46s      100 rows  ck=n/a
+Q14  PASS      181s      200 rows  ck=n/a
+Q54  PASS       45s        0 rows  ck=1f18d650d205d71d
+
+=== SUMMARY: PASS=4 (2 ck-verified, 2 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=1 TIMEOUT=0 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

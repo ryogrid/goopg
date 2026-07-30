@@ -1,42 +1,52 @@
 (idle — nothing in flight)
 
-Last loop (#6, 2026-07-31) closed **M0125-0039** — EXPLAIN column
-qualification. `internal/executor/explain_names.go` (new) + qual-site changes
-in `operators_explain.go`; design
-`docs/design/0125-0039-explain-column-qualification.md`; tests
-`internal/executor/explain_qualify_test.go` (8 cases).
+Last loop (#7, 2026-07-31) landed **M0125-0034's set-operation arm** — C1, the
+dominant timeout mechanism. `internal/planner/pushdown.go` (+`*SetOp` case in
+`collectScanOutputNames`; both M0097-0058 `containsSetOp` bailouts retired),
+`internal/planner/nl_index_join.go` (`pickInnerScanForNLI` declines its
+left-as-inner flip for a set-operation outer); design
+`docs/design/0125-0034-setop-join-promotion.md`; tests
+`internal/executor/setop_join_promotion_test.go` (4).
 
-Upstream's rule turned out to be TWO mechanisms, both taken from the oracle:
-explain.c splits the prefix decision by node kind (`show_scan_qual` prints a
-scan's `Filter:` BARE; `show_upper_qual`/`show_sort_group_keys` prefix once
-`es->rtable_size > 1`), and ruleutils.c `get_parameter` FORCES prefixing for a
-Param's expansion — goopg's `OuterColumnRef`. Measured on :65437 vs PG :65438
-(plain EXPLAIN, nothing executed, arm
-`analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0039/`): **Q30 and Q81 now
-print `Filter: (ctr1.ctr_state = ctr_state)` — byte-identical to PG 18.3**;
-Q64 → `(cd1.cd_marital_status <> cd2.cd_marital_status)`; Q72 names `d1`/`d2`.
+**Acceptance MET: `Q71 PASS 580 rows ck=521a7af7606d10c1`** = the oracle row.
+30 `Nested Loop (CROSS)` nodes eliminated; **Q5 Q8 Q14 Q54 Q71 TIMEOUT →
+PASS**, SF0.5 timeout class **12 → 7**.
 
-Two findings the next loop should not have to rediscover:
-1. **`SourceTableIdx` is NOT a range-table id.** `planner.go`'s `nextSourceIdx`
-   restarts at 1 for EVERY query level, so an outer subquery binding collides
-   with a base relation inside it. The naive version printed a *wrong* relation
-   name (`(a.s1 <> a.s2)` where `s2` came from `b`) — worse than printing none.
-   Contained by a column-membership guard + ancestor-match uniqueness gate; the
-   real fix is PG's `varno` and is planner work with plan-shape blast radius.
-   This is why **Q31 is only partial** (2 of 12 conjuncts qualify).
-2. A CTE body ending in an aggregate ZEROES `SourceTableIdx`, so Q30's
-   correlation is unresolvable from the id alone. Solved the way upstream does
-   — resolve against the ancestor plan node (`push_ancestor_plan`).
+Three findings the next loop should not rediscover:
+1. **The blocker was the NAME walk, not the guard.** `collectScanOutputNames`
+   enumerates node kinds; with no `*SetOp` case `allColumnRefNamesInScope`
+   answered false and `pushOneConjunct` declined *before* reaching its own
+   `containsSetOp` bailout. An under-enumerated permissive check fails
+   silently — as a missed optimisation with nothing in the plan to say why.
+   `*Distinct`, `*Limit`, `*WindowAgg`, `*IndexOnlyScan` … are still absent
+   (ledger row).
+2. **M0097-0058's premise is refuted.** `SetOp.Output()` IS the narrow schema,
+   and the executor pads a `leftWidth+rightWidth` keyRow before evaluating
+   either join key, so `index out of range [57] with length 1` cannot arise at
+   the join node. The third guard (explicit `JOIN … ON`, planner.go) is still
+   in place — no query reaches it (ledger row).
+3. **Fixing the promotion made an unreachable NLI path reachable.**
+   `pickInnerScanForNLI`'s left-as-inner flip emits `outer ++ inner`; Q71
+   planned `Append ++ item` while `sum(ext_price)` stayed bound to
+   `item ++ Append` → "aggregate sum requires numeric argument in v0". Now
+   declined. Note the flipped shape is **PG's own plan** (ledger row).
 
-Ledger: 2 rows appended 2026-07-31 (the `varno` gap; VERBOSE-forced prefixing +
-`Output:` qualification + `_N` suffix numbering).
+Gates: units PASS; `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35); plan-diff
+vs `warm-stats-base` 10/22 DIFFER but every changed line is M0125-0039's
+qualification → TPC-H-plan-inert; re-pinned
+`plan_snapshots/m0125-0034-setop-join-promotion.txt`. All 21 set-operation
+TPC-DS queries swept (the complete reachable surface), 15 unchanged.
+NOT discharged: the timed TPC-H arm and the full 99-query gate — the nightly
+CI batch held the host all loop (load ≈ 9.9), so **no second measured this
+loop is a timing**.
 
-Per the banner's adopted order the **next selection is `M0125-0034`**
-(`M0125-0037`(i) → `-0039` → **`-0034`** → `-0035` → `-0036` → `-0037`(ii) →
-`-0038`). Re-read the banner before selecting; it outranks this note.
+Per the banner the **next selection is `M0125-0035`** (C2 qual placement);
+M0125-0034 stays unchecked for its CTE/derived-aggregate arm (Q30 Q64 Q65 Q81,
+8 crosses) — fold it into -0035 if the diagnosis converges. Re-read the banner
+before selecting; it outranks this note.
 
-Host note: the nightly CI batch (run `20260731-001201`) was live all loop. The
-SF0.5 goopg cluster was started/stopped twice with
-`GOOPG_BIN=tmp/goopg-m0125-0039-bin`, so the shared `tmp/goopg-bench-bin` was
-never rebuilt under the nightly; both goopg TPC-DS clusters are DOWN again, as
-they were found.
+Host note: nightly run was live throughout; a private binary
+`tmp/goopg-m0125-0034-bin` was used everywhere EXCEPT `tpch-spotcheck.sh`,
+which rebuilds the shared `tmp/goopg-bench-bin` — that clobber happened at
+~01:53 and is worth avoiding next time. Both goopg TPC-DS clusters are DOWN
+again, as they were found; :65438 (PG) was already UP.

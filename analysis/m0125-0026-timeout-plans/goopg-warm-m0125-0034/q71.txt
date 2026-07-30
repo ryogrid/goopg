@@ -1,0 +1,30 @@
+-- M0125-0026 capture  arm=goopg-warm-m0125-0034  engine=goopg  query=71
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query71.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=1 width=0)
+   Sort Key: sum DESC, i_brand_id
+   ->  HashAggregate (4 keys)  (cost=0.00..0.00 rows=1 width=0)
+     ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: ((i_manager_id = 1) AND ((time_dim.t_meal_time = 'breakfast') OR (time_dim.t_meal_time = 'dinner')))
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Append  (cost=0.00..0.00 rows=1 width=0)
+           ->  Hash Join (INNER)  (cost=0.00..0.00 rows=131280740 width=0)
+                 Filter: ((date_dim.d_moy = 12) AND (date_dim.d_year = 2002))
+             ->  Seq Scan on public.web_sales (stats)  (cost=0.00..0.00 rows=359432 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+           ->  Hash Join (INNER)  (cost=0.00..0.00 rows=263216365 width=0)
+                 Filter: ((date_dim.d_moy = 12) AND (date_dim.d_year = 2002))
+             ->  Seq Scan on public.catalog_sales (stats)  (cost=0.00..0.00 rows=720657 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+           ->  Hash Join (INNER)  (cost=0.00..0.00 rows=525809623 width=0)
+                 Filter: ((date_dim.d_moy = 12) AND (date_dim.d_year = 2002))
+             ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+         ->  Index Scan using public.item_pkey on public.item  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (i_item_sk = sold_item_sk)
+       ->  Index Scan using public.time_dim_pkey on public.time_dim  (cost=0.00..0.00 rows=1 width=0)
+             Index Cond: (t_time_sk = time_sk)
+(23 rows)
+

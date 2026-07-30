@@ -248,9 +248,15 @@ started.
 >       Every later item's evidence is read through that instrument. `-0038`
 >       (no cost/cardinality propagation above base scans) is last because it is
 >       the largest and overlaps the `docs/design/cost-model/` "0077 line" —
->       read that bundle before scoping it. **NEXT SELECTION: `M0125-0037`
->       stage (i)** — the EXPLAIN half only; its planner half is a separate,
->       later selection. Original wording of -0026's line follows.
+>       read that bundle before scoping it. ~~**NEXT SELECTION: `M0125-0037`
+>       stage (i)**~~ — DONE 2026-07-31, and so are `-0039` (loop #6) and
+>       **`-0034`'s set-operation arm (loop #7: 30 Cartesian products gone,
+>       Q5/Q8/Q14/Q54/Q71 TIMEOUT → PASS, timeout class 12 → 7)**. `-0034`
+>       stays UNCHECKED for its CTE-reference / derived-aggregate arm (Q30
+>       Q64 Q65 Q81, 8 crosses), but that arm shares a boundary with `-0035`
+>       (C2 qual placement), so **NEXT SELECTION IS `M0125-0035`** per the
+>       adopted order; fold -0034's remainder into it if the diagnosis
+>       converges. Original wording of -0026's line follows.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3342,6 +3348,49 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `71|OK|580|521a7af7…`** (rows + ck) — the least-deep member. Bar:
       plan-diff `LABEL=tpcds-round2-head`, timed 22-query TPC-H on a quiet host,
       full SF0.5 gate.
+      **↳ THE SET-OPERATION ARM IS DONE (2026-07-31, loop #7).** Design
+      `docs/design/0125-0034-setop-join-promotion.md`; tests
+      `internal/executor/setop_join_promotion_test.go` (4); re-capture
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0034/`; artefacts
+      `analysis/m0125-0034/`. **Acceptance MET: `Q71 PASS 580 rows
+      ck=521a7af7606d10c1`** = the oracle row exactly. Three stacked defects,
+      each sufficient alone: (1) `collectScanOutputNames` had no `*SetOp` case,
+      so `allColumnRefNamesInScope` judged every conjunct spanning the set
+      operation out of scope and `pushOneConjunct` declined **before reaching
+      its own guard** — the primary cause, and a reminder that an
+      under-enumerated permissive check fails as a silent missed optimisation;
+      (2) M0097-0058's blanket `containsSetOp` bailout, whose premise is
+      REFUTED here — `SetOp.Output()` IS the narrow schema and the executor
+      pads a `leftWidth+rightWidth` keyRow before evaluating either join key,
+      so `index out of range [57] with length 1` cannot arise at the join
+      node; (3) uncovered by fixing the first two, `pickInnerScanForNLI`'s
+      left-as-inner flip emits `outer ++ inner` and was **unreachable** for a
+      set operation until the promotion was restored — Q71 planned
+      `Append ++ item` while `sum(ext_price)` stayed bound to `item ++ Append`
+      and errored `aggregate sum requires numeric argument in v0`. Measured:
+      **30 `Nested Loop (CROSS)` nodes eliminated; Q5 Q8 Q14 Q54 Q71 all
+      TIMEOUT → PASS** with oracle-identical rows AND checksums; the SF0.5
+      timeout class goes **12 → 7**. Regression surface swept EXHAUSTIVELY
+      rather than sampled — all 21 set-operation TPC-DS queries run, the 15
+      non-rescued unchanged (`PASS=15 MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`, every ck equal to the 2026-07-30 full-gate baseline).
+      Gates: units PASS; `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35);
+      plan-diff vs `warm-stats-base` 10/22 DIFFER but **every changed line is
+      M0125-0039's column qualification** — zero structural change, so this
+      task is TPC-H-plan-inert; re-pinned
+      `plan_snapshots/m0125-0034-setop-join-promotion.txt`. The nightly CI
+      batch held the host all loop (`load ≈ 9.9`), so **no second below is a
+      timing** and the "timed 22-query TPC-H on a quiet host" half of the bar
+      is NOT discharged; the full 99-query SF0.5 gate is likewise not re-run
+      (the 21-query set-operation sweep is the complete reachable surface).
+      **THIS ITEM STAYS OPEN for C1's other arm: Q30 Q64 Q65 Q81 still emit 8
+      crosses** where the join input is a CTE reference or a derived aggregate
+      (counts unchanged 1/4/2/1, all four still TIMEOUT). `collectScanOutputNames`
+      already has `*CTEScan`/`*Aggregate` cases, so the name walk is NOT their
+      blocker — start by capturing why `pushOneConjunct` declines on Q64.
+      Four ledger rows 2026-07-31 (this arm; the untouched `JOIN … ON` guard;
+      the NLI flip declined-not-fixed, where the flipped shape is PG's OWN
+      plan; the enumeration's remaining blind kinds).
 
 - [ ] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
       never to the base scan, and never pushed into a producing subquery**

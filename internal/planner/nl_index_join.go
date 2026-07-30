@@ -1196,6 +1196,22 @@ func pickInnerSide(j *Join, leftCol, rightCol *ColumnRef, leftWidth int) (*SeqSc
 		if _, rightIsValues := j.Right.(*Values); rightIsValues {
 			return nil, nil, nil
 		}
+		// M0125-0034: and decline for the same reason when outer=right
+		// is a set operation. A *SetOp's columns are no more scan-
+		// tracked than a *Values' are, so the flip is equally
+		// uncorrectable — but until this milestone the case was
+		// unreachable, because pushOneConjunct refused to promote a
+		// CROSS whose side contained a SetOp and this branch only sees
+		// INNER. TPC-DS Q71 is the witness: with the promotion
+		// restored, `item ⋈ (web ∪ catalog ∪ store)` flipped to
+		// `Append ++ item` while the outer query's `sum(ext_price)` and
+		// its four group keys stayed bound to `item ++ Append`, and the
+		// aggregate was handed `i_brand` — "aggregate sum requires
+		// numeric argument in v0". The hash-join path keeps the
+		// canonical Left ⋈ Right schema and answers correctly.
+		if containsSetOp(j.Right) {
+			return nil, nil, nil
+		}
 		return lss, leftSideRef, rightSideRef
 	}
 	return nil, nil, nil

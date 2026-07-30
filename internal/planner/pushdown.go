@@ -104,6 +104,24 @@ func collectScanOutputNames(n Node, names map[string]bool) {
 		for _, c := range x.Output() {
 			names[c.Name] = true
 		}
+	case *SetOp, *RecursiveUnion:
+		// M0125-0034 (C1). A FROM-clause subquery whose body is a set
+		// operation is a legal join input, and its Output() is the
+		// narrow projected schema the outer query resolved its
+		// ColumnRefs against — exactly what this name check needs.
+		// Without a case here the walk returned only the OTHER side's
+		// names, allColumnRefNamesInScope answered false for every
+		// conjunct spanning the set operation, and pushOneConjunct
+		// declined before it ever reached its own containsSetOp guard.
+		// The visible symptom was a `Nested Loop (CROSS)` with the
+		// equi-join demoted to a Filter — TPC-DS Q8 Q14 Q30 Q54 Q64
+		// Q65 Q71 Q81 (analysis/m0125-0026-timeout-plans/README.md,
+		// "The dominant mechanism"). No recursion into the branches:
+		// a branch's internal column names are NOT in the outer
+		// query's scope, only the set operation's own output is.
+		for _, c := range n.Output() {
+			names[c.Name] = true
+		}
 	}
 }
 
@@ -231,16 +249,28 @@ func pushOneConjunct(node Node, c Expr) bool {
 		return false
 	}
 	if j.Type == JoinTypeCross {
-		// M0097-0058: when either side contains a set operation
-		// (SetOp/RecursiveUnion), skip promotion to Inner Join.
-		// The column indices in the predicate were resolved against
-		// the global FROM-clause schema and do not match the
-		// subquery's narrow output schema, causing index-out-of-
-		// bounds panics when the executor drains the build side
-		// (e.g. TPC-DS Q8: INTERSECT in FROM subquery).
-		if containsSetOp(j.Left) || containsSetOp(j.Right) {
-			return false // predicate stays in the outer Filter
-		}
+		// M0125-0034 retires M0097-0058's blanket bailout here (and
+		// the hash-algorithm one below). That guard declined the
+		// CROSS→INNER promotion whenever either side contained a
+		// SetOp/RecursiveUnion, on the premise that the predicate's
+		// ColumnRef indices "do not match the subquery's narrow output
+		// schema" and would drive an index-out-of-bounds panic in the
+		// build-side drain (`index out of range [57] with length 1`,
+		// TPC-DS Q8, commit 9ddbc679).
+		//
+		// The premise does not survive inspection: `SetOp.Output()` IS
+		// the narrow projected schema, so `leftWidth`/`totalWidth` here
+		// and `len(o.left.Schema())` in joinOp agree, and the executor
+		// evaluates both join keys against a full-width padded keyRow
+		// (operators_join_agg.go buildHashRight — `keyRow` is
+		// leftWidth+rightWidth wide with the build row copied into its
+		// tail), never against the bare 1-wide build row. What actually
+		// produced Q8's CROSS in the shape the guard was written for
+		// was the missing *SetOp case in collectScanOutputNames above,
+		// which is now present; where the guard did fire on its own
+		// (a Project-wrapped set operation) lifting it yields a hash
+		// join with byte-identical answers.
+		//
 		// Predicate spans both sides — promote the Join.
 		j.Type = JoinTypeInner
 		j.Predicate = c
@@ -258,28 +288,26 @@ func pushOneConjunct(node Node, c Expr) bool {
 		if okSplit {
 			j.LeftKey = lk
 			j.RightKey = rk
-			// M0097-0058: skip hash-join when a set-operation
-			// subquery is on either side (column-index mismatch
-			// crash, e.g. TPC-DS Q8 INTERSECT in FROM subquery).
-			if !containsSetOp(j.Left) && !containsSetOp(j.Right) {
-				j.Algo = JoinAlgoHash
-				lRows := EstimateRows(j.Left)
-				rRows := EstimateRows(j.Right)
-				if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
-					j.Algo = algo
+			// The M0097-0058 hash-algorithm bailout for a
+			// set-operation side is retired here too; see the
+			// note on the promotion above.
+			j.Algo = JoinAlgoHash
+			lRows := EstimateRows(j.Left)
+			rRows := EstimateRows(j.Right)
+			if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+				j.Algo = algo
+			}
+			if j.Algo == JoinAlgoHash {
+				if lRows > 0 && rRows > 0 && lRows < rRows {
+					j.BuildLeft = true
 				}
-				if j.Algo == JoinAlgoHash {
-					if lRows > 0 && rRows > 0 && lRows < rRows {
-						j.BuildLeft = true
-					}
-					// M0054-0010: small-dimension override.
-					leftSmall := IsSmallDimensionSide(j.Left)
-					rightSmall := IsSmallDimensionSide(j.Right)
-					if leftSmall && !rightSmall {
-						j.BuildLeft = true
-					} else if rightSmall && !leftSmall {
-						j.BuildLeft = false
-					}
+				// M0054-0010: small-dimension override.
+				leftSmall := IsSmallDimensionSide(j.Left)
+				rightSmall := IsSmallDimensionSide(j.Right)
+				if leftSmall && !rightSmall {
+					j.BuildLeft = true
+				} else if rightSmall && !leftSmall {
+					j.BuildLeft = false
 				}
 			}
 		}
