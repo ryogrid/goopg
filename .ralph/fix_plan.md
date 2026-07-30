@@ -223,11 +223,20 @@ started.
 >       **this harness's single-run per-query noise band is ~±17 %, not ±4 %** —
 >       identical plans moved 1.17×, so no sub-1.2× per-query ratio on a sub-20 s
 >       query is evidence. Q21 times out in ALL FOUR arms → shape class, filed as
->       `M0125-0032`. **NEXT SELECTION: the TPC-DS half of -0031 goal (a) — one
->       full warm SF0.5 gate run (quiet host, ~1 h, four chunks) to read the
->       warm timeout class against the 13 baseline; if the host is BUSY take
->       `M0125-0026` instead (host-independent, and it now gains the free warm
->       arm -0031 promised it).*** *(Stale
+>       `M0125-0032`.
+>       **↳ `M0125-0031`'s SECOND MOTION IS DONE TOO (2026-07-30, loop #12,
+>       `analysis/m0125-0031-warm-sf05-20260730/`): the warm SF0.5 gate ran 99/99
+>       on one binary and goal (a) is MEASURED, NOT MET — the timeout class goes
+>       **13 → 12**, target 0, and the one mover (Q72 307 s → 308 s) merely
+>       straddles the cap. ZERO members were size-starved: all 12 have now failed
+>       under none / sizes-only / full-statistics cardinality, so **cardinality
+>       work is exhausted as a route to goal (a)** and the remainder is plan-shape
+>       work. Correctness untouched (82/82 common-PASS agree on rows AND
+>       checksums); one warm regression found, Q18 117 → 251 s, filed
+>       `M0125-0033`. **NEXT SELECTION: `M0125-0026`** — its classification is now
+>       the ONLY path to goal (a), it is host-independent, and it should absorb
+>       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
+>       covers both benchmarks; the per-class fixes then file from -0034+.*** *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -3006,7 +3015,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       … `-0031` are taken by the warm-statistics programme (user directive —
       see below), so M0125-0026's per-class planner tasks AND M0125-0031's
       evidence-filed fixes both file from `M0125-0032` onward; whichever files
-      first takes the next free id.**) `scripts/tpcds-bench-compare.sh:138` ends its status ladder in a
+      first takes the next free id. **`-0032` (TPC-H Q21, shape class) and
+      `-0033` (TPC-DS Q18, warm regression) are now taken by -0031's two
+      measurement motions — the next free id is `M0125-0034`.**) `scripts/tpcds-bench-compare.sh:138` ends its status ladder in a
       catch-all `else status="OK"; rows=$(wc -l <<<"$qout")`. A psql that never
       connected emits no `ERROR:`/`FATAL:` prefix and no `(N rows)` block, so it
       falls into that arm and is recorded as **`OK`, with the line count of the
@@ -3194,10 +3205,29 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       single-run per-query noise band is ~±17 %** (identical plans moved 1.17×),
       so the table's "Q10 1.24× slower" is NOT a regression claim; and **Q21
       times out in all four arms** → shape class, filed as `M0125-0032`.
-      **STILL OWED by -0031: goal (a) entirely** — the warm SF0.5 gate has not
-      run, so the warm TPC-DS timeout class is unknown against the 13 baseline —
-      **and goal (b)'s actual fixes.** Do not read the TPC-H result as progress
-      on (a).
+      **↳ GOAL (a) IS NOW MEASURED, AND IT IS NOT MET (2026-07-30, loop #12) —
+      `analysis/m0125-0031-warm-sf05-20260730/README.md`, design §-0031b.** The
+      warm SF0.5 gate ran all 99 queries on a quiet host (five chunks, ONE binary
+      `fdd0c6e199182fbb`, private path so the nightly's shared bin was untouched,
+      same arm `relsize=unset(2)` as the baseline): **PASS=83 TIMEOUT=12
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 SKIP=4** against the baseline's **PASS=82
+      TIMEOUT=13**. The target is 0. The single status change is **Q72
+      `TIMEOUT 307s` → `PASS 308s`, which is not a rescue** — both sit on the
+      300 s cap and this arm's own 900 s standalone probe put Q72 at 305 s. The
+      12 hard members (Q5 Q8 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q71 Q78 Q81) are
+      IDENTICAL to the baseline's. **The predicted split split entirely to one
+      side: ZERO members were size-starved.** Every member has now failed under
+      three cardinality regimes — none, sizes-only, and full statistics with MCVs
+      and histograms — so **no further cardinality work can move goal (a)**, and
+      the whole remaining path is plan-shape work through `M0125-0026`'s
+      classification and the per-class tasks it files from -0032+. Two
+      by-products: **warm statistics change no answers** (all 82 common-PASS
+      queries agree on row count AND value checksum, 50 ck-verified — the
+      TPC-DS half of -0030's "row-count gates must not move"), and **one real
+      warm regression, Q18 117 s → 251 s (2.1×)**, filed as `M0125-0033`.
+      **STILL OWED by -0031: goal (a)'s outcome (0 timeouts) — but via -0026/-0032+,
+      not via cardinality — and goal (b)'s actual fixes.** Both measurement
+      motions are now discharged; what remains under this umbrella is repair.
 
 - [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
       cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
@@ -3216,6 +3246,26 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Coordinate the classification with `M0125-0026` — Q21 is the TPC-H
       instance of the same question its capture asks of the 16 TPC-DS members,
       and one shared root-cause taxonomy is the point.
+
+- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics** (filed
+      2026-07-30 by M0125-0031 goal (a); evidence
+      `analysis/m0125-0031-warm-sf05-20260730/README.md` §"Runtime"). At SF0.5,
+      300 s cap, same arm (`GOOPG_RELSIZE_FALLBACK=2`), Q18 goes **117 s S-cold
+      → 251 s warm**; its full history is `156 s` (relsize off) → `117 s`
+      (relsize=2) → `251 s` (warm), i.e. **warm statistics cost Q18 more than the
+      relation-size fallback ever won it**. It is the ONLY query outside the
+      noise band moving the wrong way — removing it inverts the sweep's aggregate
+      from "warm 2.7 % slower" to "warm 3.2 % faster" — and its answer is
+      unchanged (100 rows, `ck=n/a` in both arms), so this is a pure plan-cost
+      defect, not a correctness one. It also does not threaten the gate: 251 s is
+      inside the 300 s budget. Next step: capture plain `EXPLAIN` for Q18 on the
+      warm SF0.5 cluster and against the PG 18.3 oracle (`tpcds05` on :65438),
+      and diff the goopg plan against a stats-blind capture — `M0125-0026`'s
+      instrument already does exactly this for the timeout class, so add Q18 to
+      its capture set rather than building a second harness. Q18 is also one of
+      the seven TPC-H queries -0031(b) is scoped to (37.2 s there), so a single
+      root cause may serve both benchmarks. Bar for the fix: plan-diff
+      `LABEL=warm-stats-base`, timed TPC-H, full SF0.5 gate.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

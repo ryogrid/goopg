@@ -1,44 +1,42 @@
-Task: M0125-0031 FIRST MOTION — the warm TPC-H power sweep at HEAD. DONE and
-committed this loop (#11, 2026-07-30). The umbrella item M0125-0031 stays OPEN.
+Task: M0125-0031 goal (a) — the WARM TPC-DS SF0.5 gate. DONE and committed this
+loop (#12, 2026-07-30). The umbrella item M0125-0031 stays OPEN (fixes owed).
 
 Files:
-- `analysis/m0125-0031-warm-tpch-20260730.md` — NEW report (4-arm table, invariant,
-  noise band, Q21, (b) target list) + `.../w{1,2}-*/` raw TSVs
-- `scripts/tpch-relsize-arm.sh` — arm flags now EXPLICIT (`0`/`2`); after the
-  M0125-0005 default flip an unset var would have turned c1→c2 and w1→w2
-- `docs/design/0125-0028-warm-stats-programme.md` — §-0031a execution record
-- `analysis/tpch-relsize-fallback-20260730.md` — noise-band superseded note
-- `.ralph/{fix_plan,deferral_ledger}.md` — -0031 body + M0125-0032 filed; row 594
-  flipped `resolved`, one new row for Q21
+- `analysis/m0125-0031-warm-sf05-20260730/` — NEW: README report, 5 chunk
+  reports, merged `sweep-COMPLETE-20260730-220423.txt` (99/99), `run-chunks.sh`
+- `docs/design/0125-0028-warm-stats-programme.md` — §-0031b execution record
+- `docs/design/README.md` — index row status + findings
+- `.ralph/{fix_plan,deferral_ledger}.md` — -0031 body, banner NEXT SELECTION,
+  numbering note, new `M0125-0033`; two ledger rows
 
-## Result (all four §D5.1 arms, quiet host, 1 binary / 44 executions)
+## Result (one binary `fdd0c6e199182fbb`, quiet host, 22:04→23:58)
 
-c1 693.8 → c2 494.0 → **w1 413.3 → w2 420.1 s** (21 comparable queries).
-Warm vs S-cold at the shipped default: **−15.0 % (1.18× faster)**, rows identical.
-Round 4's five regressions do NOT reproduce; **Q8 (its 53× loss) is the biggest
-win, 8.5×**. Q5's 22.8× win is gone (M0077 fixed Q5 already).
+S-cold @relsize=2: PASS=82 **TIMEOUT=13** → WARM @relsize=2: PASS=83
+**TIMEOUT=12**. Target was **0**. Zero MISMATCH/CKMISMATCH/ERROR in both arms.
 
 Three findings later loops must honour:
-1. §D3's invariant MEASURED — warm + `GOOPG_RELSIZE_FALLBACK=0` vs
-   `warm-stats-base` = 22/22 MATCH `structural` AND `strict-text` → relsize is an
-   S-cold-only safety net (ledger 594 resolved; W-arms discharged).
-2. Harness noise band ≈ **±17 %** per query, not ±4 % (identical plans moved
-   1.17×) → no sub-1.2× single-run ratio on a sub-20 s query is evidence.
-3. **Q21 times out in ALL FOUR arms** (612/672/381/384 s, 14.4 GB RSS) → shape
-   class, filed `M0125-0032`.
+1. **ZERO members were size-starved.** The 12 hard members (Q5 Q8 Q14 Q30 Q31
+   Q35 Q54 Q64 Q65 Q71 Q78 Q81) are identical to the baseline's and have now
+   failed under all three cardinality regimes → **cardinality work is exhausted
+   as a route to goal (a)**; only plan-shape work remains. Q72's 307→308 s
+   "rescue" is cap-straddling jitter, not a rescue.
+2. **Warm statistics change no answers** — all 82 common-PASS queries agree on
+   rows AND value checksum (50 ck-verified).
+3. **Q18 regressed 117 s → 251 s (2.1×) under warm stats** (156→117→251 across
+   the three regimes); answer unchanged → cost-model fidelity gap, not a stats
+   gap. Filed `M0125-0033`. Removing Q18 flips the aggregate from "warm 2.7 %
+   slower" to "warm 3.2 % faster".
 
 ## NEXT (banner order)
 
-**Still owed by -0031: goal (a) entirely** — run ONE full **warm SF0.5 gate**
-(quiet host, ~1 h, four `QUERIES=` chunks on one binary) and read the warm
-timeout class against the **13** baseline. If the host is BUSY, take
-**`M0125-0026`** instead (host-independent plan capture; it now gains the free
-warm arm). Then -0031(b)'s TPC-H fixes, scoped to the seven queries that are
-69 % of the stream (Q5 Q9 Q4 Q18 Q15 Q7 Q17) + Q21 via -0032.
+**`M0125-0026`** — its plan capture/classification is now the ONLY path to goal
+(a). It is host-independent. Fold into its capture set: the free **warm** arm,
+**Q18** (-0033) and TPC-H **Q21** (-0032), so one taxonomy covers both
+benchmarks; per-class fix tasks then file from **`M0125-0034`** onward.
 
-Gates run: 4-arm timed sweep (44 executions, engine-id stable start+end);
-plan-diff vs `warm-stats-base` 22/22 MATCH in both modes; `make
-ralph-state-guard` OK; pgbench smoke via the commit hook. No Go code changed
-this loop (harness/docs only), so no unit gate.
+Gates run: warm SF0.5 gate 99/99 (5 chunks, one binary, one engine-id; zero
+correctness failures); `make ralph-state-guard` OK (auto-repaired a stale
+progress marker); pgbench smoke via the commit hook. No Go code changed this
+loop (analysis/docs only), so no unit gate.
 
 In-flight: none.

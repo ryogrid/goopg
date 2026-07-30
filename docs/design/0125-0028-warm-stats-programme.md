@@ -370,6 +370,53 @@ Q15 34.9, Q7 33.3, Q17 30.7 = **69 % of the stream in seven queries** — so
 the TPC-DS side** (SF0.5 timeout class 13 → 0, whose warm re-measurement has not
 run) and goal (b)'s actual fixes.
 
+### §-0031b Execution record — goal (a) is MEASURED, and it is not met (2026-07-30, loop #12)
+
+Report `analysis/m0125-0031-warm-sf05-20260730/README.md`; merged artefact
+`.../sweep-COMPLETE-20260730-220423.txt` plus its five chunk files. HEAD
+`9ede6a1a`, engine `b1640d67…`, **one binary `fdd0c6e199182fbb` across all five
+chunks**, built to the private `tmp/goopg-sf05-warm-bin` so the nightly's shared
+`tmp/goopg-bench-bin` was never touched. Quiet host, no `FORCE`, 22:04 → 23:58,
+99/99 covered, arm `GOOPG_RELSIZE_FALLBACK=unset(2)` — the same arm as the
+baseline, so statistics are the only intended variable.
+
+The warm regime was **verified on the cluster before the run, not assumed**:
+24/25 tables at `reltuples > 0`, 25 tables present in `pg_stats`. It exists
+without any change to the gate script because -0029 decoupled "fresh S-cold
+server" from "no statistics".
+
+| arm | PASS | TIMEOUT | MISMATCH / CKMISMATCH / ERROR |
+|---|---:|---:|---|
+| S-cold @ relsize=2 (`8453037b`) | 82 | **13** | 0 / 0 / 0 |
+| **WARM @ relsize=2 (`9ede6a1a`)** | 83 | **12** | 0 / 0 / 0 |
+
+**Goal (a)'s target is 0; the result is 12.** The one status change is Q72
+`TIMEOUT 307s` → `PASS 308s`, which is not a rescue — both numbers sit on the
+300 s cap and this arm's own standalone 900 s probe measured Q72 at 305 s. The
+12 hard members (Q5 Q8 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q71 Q78 Q81) are
+**identical** to the baseline's.
+
+Consequences, all of which bind the rest of M0125:
+
+1. **The predicted split split entirely to one side.** -0031 expected part of
+   the class to be size-starved (rescued by warm stats) and part shape-class.
+   **Zero members were size-starved.** Every member has now failed under three
+   cardinality regimes — none, sizes-only, and full statistics with MCVs and
+   histograms. **No further cardinality work can move goal (a)**; that avenue is
+   closed by measurement, not by argument. The fix path runs entirely through
+   M0125-0026's classification and the per-class tasks it files from -0032+.
+2. **Warm statistics change no answers.** All 82 common-PASS queries agree on
+   row count *and* value checksum (50 ck-verified). §-0030's "row-count gates
+   must not move" prediction is discharged on the TPC-DS side too.
+3. **Runtime is flat with one real regression.** Common-PASS wall 2336 → 2398 s;
+   removing Q18 alone inverts that to 2219 → 2147 s. **Q18 is 117 s → 251 s
+   (2.1×)** — warm statistics cost it more than the relation-size fallback ever
+   won it (156 s flag-off → 117 s relsize=2 → 251 s warm). Filed as
+   **M0125-0033**; it is the first evidence that the warm premise is not free on
+   TPC-DS, and it is a plan-shape question, so it belongs in -0026's instrument.
+4. TPC-H and TPC-DS now report the **same shape**: -0031a's Q21 survives both
+   cardinality regimes at 14.4 GB RSS, exactly as these 12 do. One taxonomy.
+
 ## Relation to the standing M0125 lines
 
 - **M0125-0026 (plan capture)**: unaffected and still owed — its OFF/relsize2

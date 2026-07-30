@@ -1,0 +1,40 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T22:04:36+09:00
+# goopg: 9ede6a1a bench(tpch)+docs: M0125-0031 first motion — the warm sweep inverts round 4's sign
+# engine-id: b1640d67666163a39b5f51d978e15d6ca0ac232c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# build: rebuilt from tree
+# engine-binary: running=fdd0c6e199182fbb on-disk=fdd0c6e199182fbb (/home/ryo/work/goopg/goopg/tmp/goopg-sf05-warm-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25) — NOT a gate result; the summary below covers only these queries
+Q1   PASS       63s      100 rows  ck=n/a
+Q2   PASS       16s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        2s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   TIMEOUT   320s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q6   PASS       18s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       28s      100 rows  ck=n/a
+Q8   TIMEOUT   322s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q9   PASS       70s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       39s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       16s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       23s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  TIMEOUT   322s (oracle 200 rows)
+      (restarting goopg to drop accumulated heap)
+Q15  PASS        3s      100 rows  ck=n/a
+Q16  PASS       20s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       23s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      251s      100 rows  ck=n/a
+Q19  PASS       29s      100 rows  ck=n/a
+Q20  PASS        6s      100 rows  ck=n/a
+Q21  PASS       32s      100 rows  ck=n/a
+Q22  PASS       20s      100 rows  ck=n/a
+Q23  PASS       84s        1 rows  ck=00f53003bda23764
+Q24  PASS       20s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       23s        0 rows  ck=1f18d650d205d71d
+
+=== SUMMARY: PASS=21 (12 ck-verified, 9 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=3 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

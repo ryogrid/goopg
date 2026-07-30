@@ -1,0 +1,26 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T23:03:35+09:00
+# goopg: 9ede6a1a bench(tpch)+docs: M0125-0031 first motion — the warm sweep inverts round 4's sign
+# engine-id: b1640d67666163a39b5f51d978e15d6ca0ac232c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# build: rebuilt from tree
+# engine-binary: running=fdd0c6e199182fbb on-disk=fdd0c6e199182fbb (/home/ryo/work/goopg/goopg/tmp/goopg-sf05-warm-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=51 52 53 54 55 56 57 58 59 60 61 62 63) — NOT a gate result; the summary below covers only these queries
+Q51  PASS       13s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS       21s      100 rows  ck=n/a
+Q54  TIMEOUT   320s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q55  PASS        2s       73 rows  ck=46d35b957845db41
+Q56  PASS       32s      100 rows  ck=n/a
+Q57  PASS       55s      100 rows  ck=n/a
+Q58  PASS       20s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       17s      100 rows  ck=n/a
+Q60  PASS       31s      100 rows  ck=n/a
+Q61  PASS       53s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       18s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=12 (3 ck-verified, 9 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
