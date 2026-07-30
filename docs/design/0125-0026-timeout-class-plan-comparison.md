@@ -101,7 +101,16 @@ estimate per-node work as `outer_rows × per-rescan_cost` (rescan shapes) or
 unreachable** — e.g. Q35's 96,562 × full-fact-scan makes the budget short by
 ~3 orders of magnitude. The number needs one significant digit, not a model.
 
-### Step 4 — File the fix tasks (M0125-0027+), one per CLASS
+### Step 4 — File the fix tasks (M0125-0032+), one per CLASS
+
+(Numbering updated 2026-07-30: `M0125-0027` was taken by the SF=1 harness
+dead-server defect and `-0028` … `-0031` by the warm-statistics programme
+(`docs/design/0125-0028-warm-stats-programme.md`), so per-class tasks file
+from `M0125-0032` onward — shared runway with M0125-0031's evidence-filed
+fixes; whichever files first takes the next free id. If the warm-up
+(-0029/-0030) lands before this capture runs, add a fourth **warm** arm
+(`goopg-warm/qN.txt`) — it is free and it directly previews which members
+-0031 gets for free.)
 
 Each with: member queries, the plan evidence (file paths from step 1), the
 arithmetic from step 3, the suspected code site, and acceptance =

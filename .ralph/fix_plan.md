@@ -192,8 +192,11 @@ started.
 >       `plan_snapshots/m0125-0005-relsize-default-stage2.txt` — **any
 >       `analysis/` number predating 2026-07-30 is in a different planner
 >       regime and must not be compared across this commit.**
->       **NEXT SELECTION: `M0125-0002` commit 2** (`cloneExprShiftIdx`), then
->       `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
+>       ~~**NEXT SELECTION: `M0125-0002` commit 2** (`cloneExprShiftIdx`), then
+>       `M0125-0003` stage 3, and **`M0125-0026`** (below).~~ *(SUPERSEDED
+>       2026-07-30(b): the USER DIRECTIVE block at the end of item 3 puts
+>       `M0125-0028` → `-0029` → `-0030` ahead of these; -0002 commit 2 and
+>       the -0003 four-arm study follow AFTER the warm flip.)* *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -202,7 +205,8 @@ started.
 >    15-query timeout class** — plain-EXPLAIN-only comparison of goopg (flag-off
 >    and `GOOPG_RELSIZE_FALLBACK=2`) against PG 18.3 for Q5 Q8 Q10 Q14 Q30 Q31
 >    Q35 Q54 Q64 Q65 Q67 Q69 Q71 Q78 Q81, then file one planner-fix task per
->    root-cause class (M0125-0027+). **It is HOST-INDEPENDENT (nothing is
+>    root-cause class (M0125-0032+ — -0027 … -0031 are taken; see the numbering
+>    note at M0125-0027). **It is HOST-INDEPENDENT (nothing is
 >    timed), so it is the task to take when the timed items above are blocked
 >    on a busy host** — do not burn a quiet-host window on it. Task body at the
 >    end of the M0125 section; design
@@ -233,6 +237,27 @@ started.
 >    ordering is moot — but the reason it was selected is not: it was chosen on
 >    the false completeness claim corrected in item 3. Do not select the next
 >    set-op follow-up ahead of items 1–5 on the same reasoning.
+>    **USER DIRECTIVE 2026-07-30(b) — the WARM-STATISTICS programme
+>    (`M0125-0028` … `-0031`, task bodies at the end of the M0125 section;
+>    design `docs/design/0125-0028-warm-stats-programme.md`; "(b)" because it
+>    is the day's SECOND user directive — the first filed `M0125-0026` above).** The user has
+>    flipped the measurement premise: statistics must survive restarts (a
+>    goopg-private mechanism is AUTHORIZED — the PG-faithfulness bar is
+>    explicitly waived for this persistence), `ANALYZE <table>` must stop
+>    erroring in per-DB databases, and the bench clusters get per-table
+>    ANALYZE + CHECKPOINT at build time and once retroactively — after which
+>    every benchmark measurement assumes WARM stats. **Selection guidance:
+>    take `-0028` → `-0029` → `-0030` ahead of `M0125-0002` commit 2 and the
+>    -0003 four-arm study**, because every timed S-cold measurement taken
+>    before the warm flip risks being re-measured after it, and -0028/-0029
+>    are precisely what makes -0003's owed W-control arms constructible
+>    (ledger row 2026-07-30). `-0028` is small and host-independent; `-0030`
+>    is the commit where the premise flips (new plan-diff label, timed
+>    baselines reset). `-0031` (timeout elimination + warm-stats
+>    optimization/stabilization) is GATED on the other three and files its
+>    concrete fixes from evidence, sharing the M0125-0032+ numbering runway
+>    with -0026's per-class tasks. `M0125-0026` itself is UNAFFECTED — its
+>    capture stays valid and gains a free warm arm if -0029/-0030 land first.
 > 4. **M-NIGHTLY backlog** — the standing nightly-triage items below. Keep FILING
 >    them every loop (see the filing obligation above); work them only after M0124
 >    and M0125 close, or under one of the two carve-outs. The TPC-DS **Q75** nightly
@@ -2877,7 +2902,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **(3) arithmetic** — per class, Q35-method estimates (outer_rows ×
       per-rescan cost, |build| × |probe|) from PG-side cardinalities showing why
       300 s is unreachable; one significant digit. **(4) file** one planner-fix
-      task per CLASS as M0125-0027+ with the plan evidence and acceptance =
+      task per CLASS as M0125-0032+ (numbering note at -0027: -0027 … -0031 are
+      taken) with the plan evidence and acceptance =
       first-ever completion checked against the git-tracked oracle row (rows +
       ck where present; Q35's `35|OK|100|0` is already M0125-0003's acceptance
       row — coordinate, don't duplicate), and propose their selection order in
@@ -2890,9 +2916,11 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
 - [ ] **M0125-0027 — the SF=1 harness reports a DEAD SERVER as `OK`**
       (found 2026-07-30 while validating M0125-0011's provenance follow-up;
-      ledger row 2026-07-30. **Numbering note: M0125-0026 will file its
-      per-class planner tasks from `M0125-0028` onward, since this id is now
-      taken.**) `scripts/tpcds-bench-compare.sh:138` ends its status ladder in a
+      ledger row 2026-07-30. **Numbering note (updated 2026-07-30): `M0125-0028`
+      … `-0031` are taken by the warm-statistics programme (user directive —
+      see below), so M0125-0026's per-class planner tasks AND M0125-0031's
+      evidence-filed fixes both file from `M0125-0032` onward; whichever files
+      first takes the next free id.**) `scripts/tpcds-bench-compare.sh:138` ends its status ladder in a
       catch-all `else status="OK"; rows=$(wc -l <<<"$qout")`. A psql that never
       connected emits no `ERROR:`/`FATAL:` prefix and no `(N rows)` block, so it
       falls into that arm and is recorded as **`OK`, with the line count of the
@@ -2922,6 +2950,131 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (§D4a's neighbourhood — report integrity), no new doc.
       Harness-only change → shell syntax + a direct probe with the server down
       (the exact reproduction above) + one with it up.
+
+- [ ] **M0125-0028 — `ANALYZE <table>` resolves in the connection's database,
+      not the shared catalog** (USER DIRECTIVE 2026-07-30(b), item 2 of 4;
+      design `docs/design/0125-0028-warm-stats-programme.md`; closes ledger row
+      `bench-reorg ANALYZE-scope` 2026-07-27). In db `tpch`,
+      `SELECT count(*) FROM lineitem` returns 5,997,241 while `ANALYZE lineitem`
+      raises 42P01 `relation "lineitem" does not exist`: `expandAnalyzeTargets`
+      (`internal/executor/operators_analyze.go:145`) calls `cat.LookupTable(name)`
+      directly instead of the per-connection DB-scoped resolution SELECT uses
+      (the `DBName→Context` threading). This is also why HammerDB's final
+      "GATHERING SCHEMA STATISTICS" step fails, and it is the FIRST of the two
+      measured blockers that made M0125-0003's W1/W2 control arms
+      unconstructible (ledger row 2026-07-30 — this task is its named resume
+      point). While in the file, resolve fact (b) of the design doc: bare
+      `ANALYZE;` returns `nil` targets ("catalog-wide form not supported yet",
+      `operators_analyze.go:169-177`) despite a docstring claiming upstream
+      parity — with per-DB resolution in hand, implement PG's
+      every-table-in-the-current-database semantics or write the explicit
+      ledger row; a silent no-op with an upstream-parity docstring is not a
+      permitted end state. Acceptance: regression test (CREATE DATABASE d →
+      CREATE TABLE + rows in d → `ANALYZE <name>` in d succeeds and populates
+      stats); `scripts/tpch-relsize-arm.sh probe-analyze` flips from
+      *relation does not exist* to populated `RowCount` on the bench cluster.
+      Engine change: units suite + `scripts/tpch-spotcheck.sh`.
+
+- [ ] **M0125-0029 — statistics survive a restart, for EVERY database, visible
+      to EVERY connection** (USER DIRECTIVE 2026-07-30(b), item 1 of 4 — with
+      an explicit waiver: this persistence does NOT have to be PG-spec-
+      faithful; design `docs/design/0125-0028-warm-stats-programme.md` §-0029).
+      Three measured gaps close together because acceptance is end-to-end:
+      **(1) per-DB routing** — `persistStatsToPGStatistic`
+      (`operators_analyze.go:184`) hardcodes `DBOid: catalog.DefaultDBOid` and
+      `loadStatisticsFromHeap` (`internal/initdb/open.go:3479`) reads only
+      `cat.DBOID()`, so per-DB tables (`tpch`/`tpcds`/`tpcds05`) never round-trip;
+      **(2) the size itself** — the startup reload restores per-column stats
+      but `RowCount`/`Pages` stay 0 by design (ledger `pq-P6`: pg_statistic has
+      no reltuples slot, and goopg's `pg_class` is VIRTUAL — `reltuples` is
+      rendered live from `t.Stats.RowCount`, `catalog.go:6977` — so PG's home
+      for the count does not exist here; THIS is where the user's waiver
+      applies: persist RowCount/Pages via a goopg-private mechanism, e.g. the
+      existing goopg-private catalog-DDL WAL record + startup-replay pattern,
+      or a private row/fork beside the pg_statistic heap — decide and cite
+      in-task; the PG-scannable pg_statistic rows themselves must stay
+      PG18-canonical, additive only); **(3) cross-connection visibility** —
+      ANALYZE in one connection was measured invisible to another connection's
+      planning (2026-07-23, TPC-H bench server :65433, pre-rebuild; the record
+      does not name the database) even though `SetTableStats` mutates the
+      shared `catalog.Table`; suspected mechanism is the per-connection
+      materialization of per-DB catalog views — root-cause and fix, because
+      restored-at-startup stats a new session cannot see are worthless.
+      Acceptance (one probe, all three gaps): ANALYZE the 8 TPC-H tables by
+      name in db `tpch` → restart → NEW connection → `pg_class.reltuples` > 0
+      for all 8 AND an EXPLAIN row-estimate/join-order change proves the
+      planner consumed them, with ZERO re-ANALYZE after restart; then
+      `W_ARM_OK=1 scripts/tpch-relsize-arm.sh w1`/`w2` measures §D3's
+      "flag-on == flag-off when ANALYZEd" invariant at last. That w-arm run is
+      NOT executable today even with this task's engine fixes alone: the
+      harness's `ARM_ANALYZE` performs no ANALYZE (it only gates on
+      `W_ARM_OK`), and its guard text still demands a `cmd/tpch-runner
+      -analyze` flag — post-this-task a documented one-time per-table psql
+      ANALYZE before the run suffices (stats durable + globally visible), so
+      IN SCOPE here: give the harness that step (or the documented pre-step)
+      and retire the stale guard text. Relation to
+      M0112: facts (1)/(2) live in M0112's landed code — this task repairs its
+      routing and fills its gap under the waiver; M0112 stays open as the
+      PG-faithful end-state and is NOT marked complete here. Durability rules
+      apply: the restart probe runs on a durable-config cluster (no
+      `--no-sync`/fsync-off). Gates: units + tpch-spotcheck + the restart
+      acceptance above.
+
+- [ ] **M0125-0030 — bench clusters get warm statistics + CHECKPOINT: build
+      scripts AND a one-shot warm-up of the standing clusters** (USER DIRECTIVE
+      2026-07-30(b), item 3 of 4; DEPENDS ON -0028 and -0029; design
+      `docs/design/0125-0028-warm-stats-programme.md` §-0030). Script changes —
+      per-table `ANALYZE <name>` over the benchmark tables + `CHECKPOINT` after
+      load: `bench/tpch/build_schema_goopg.sh` (HammerDB's own ANALYZE step
+      starts working once -0028 lands — verify, don't duplicate; add the
+      CHECKPOINT), `scripts/tpcds-load.sh` (SF=1; already claims
+      "Schema + COPY + ANALYZE" — verify it actually populates under
+      -0028/-0029), `scripts/tpcds-sf05-regression.sh load-goopg` (SF0.5).
+      One-shot warm-up of the three standing clusters: 65433 (`tpch@tpch`,
+      8 tables), 65436 (`tpcds`, 25 tables), 65437 (SF0.5, 25 tables) —
+      ANALYZE each table by name, CHECKPOINT, then **restart and verify the
+      stats survived** (that restart is -0029's acceptance probe in situ).
+      All server starts through the cgroup cap / lifecycle scripts.
+      **This is the commit where the measurement premise flips — record the
+      consequences in the same commit:** (a) row-count gates must NOT move —
+      Q12/Q13 spotcheck canonical counts and the SF0.5 oracle are
+      statistics-independent, so any row change after warm-up is a real
+      defect, never a re-pin; (b) plan baselines DO move — capture a new
+      plan-diff label (`warm-stats-base`) immediately after the warm-up, and
+      treat every prior label as a different stats regime; (c) timed baselines
+      reset — every S-cold `analysis/` number stops being comparable, and
+      analysis docs state their stats regime explicitly from here on.
+
+- [ ] **M0125-0031 — the warm-stats planning line: eliminate the TPC-DS
+      timeout class, then optimize and stabilize TPC-H/TPC-DS runtimes**
+      (USER DIRECTIVE 2026-07-30(b), item 4 of 4; **GATED on -0028 … -0030**;
+      design `docs/design/0125-0028-warm-stats-programme.md` §-0031). Goal
+      state per the directive, under the warm-statistics premise -0030
+      establishes: **(a)** the SF0.5 gate's goopg-only TIMEOUT class → **0**
+      (baseline: **13** under the flipped default — `99d83714` §D8 measured
+      `GOOPG_RELSIZE_FALLBACK=2` rescuing Q10/Q69/Q67/Q47 and Q72 joining,
+      and `d4071df4` made that flag the default; the 16 at `e29faca9` is the
+      superseded flag-OFF figure. Q4 stays excluded — the PG oracle itself
+      times out — and Q36/Q70/Q86 stay dsqgen-artifact SKIPs); **(b)** TPC-H and
+      TPC-DS runtime reduction and plan stabilization. **The first motion is a
+      re-measurement, not a fix**: round-4 §2/§5 measured stats-ON fixing
+      TPC-H Q5 22.8× while regressing Q22 128×, Q4 79×, Q8 53×, Q2 26×,
+      Q12 4.4× — stream 12 % SLOWER; under the warm premise that trade-off is
+      the default behavior, so re-run the warm TPC-H power sweep at HEAD
+      (the planner has since gained int64 keys, the §2 veto, composite-NLI
+      keep, and the relsize line — round-4's absolute numbers do not
+      transfer) and fix what still regresses. Expect the timeout class to
+      SPLIT: size-starved members may complete outright under warm stats;
+      shape-class members (RC-8 rescan-per-outer-row, CTE×N re-execution,
+      missing TopN pushdown — M0125-0026's suspects a/d/e) will not, because
+      no cardinality input fixes a rescan-per-outer-row shape. File the
+      concrete fixes from evidence as M0125-0032+ (shared numbering runway
+      with -0026's per-class filings — whichever files first takes the next
+      free id; coordinate with -0026's classification rather than duplicating
+      it, and add the free warm arm to -0026's capture if it has not run yet).
+      Every fix here is a plan-shape commit and inherits the full bar against
+      the NEW label: plan-diff `LABEL=warm-stats-base`, timed 22-query TPC-H
+      on a quiet host, full SF0.5 gate.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
