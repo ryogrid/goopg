@@ -1,0 +1,33 @@
+[03:21:27] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260731-032127.txt
+[03:21:27] building goopg -> /home/ryo/work/goopg/goopg/tmp/goopg-m0125-0035-bin (tree 91f530c9, dirty)
+Q51  PASS       16s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS       19s      100 rows  ck=n/a
+Q54  PASS       41s        0 rows  ck=1f18d650d205d71d
+Q55  PASS        2s       73 rows  ck=46d35b957845db41
+Q56  PASS       32s      100 rows  ck=n/a
+Q57  PASS       61s      100 rows  ck=n/a
+Q58  PASS       22s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       16s      100 rows  ck=n/a
+Q60  PASS       34s      100 rows  ck=n/a
+Q61  PASS       56s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       19s      100 rows  ck=n/a
+Q64  TIMEOUT   329s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   328s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS       18s        5 rows  ck=f6613897dd73709a
+Q67  PASS      162s      100 rows  ck=n/a
+Q68  PASS       18s      100 rows  ck=n/a
+Q69  PASS       18s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       14s      580 rows  ck=521a7af7606d10c1
+Q72  PASS      325s      100 rows  ck=n/a
+Q73  PASS       17s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       12s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       35s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=22 (8 ck-verified, 14 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+[03:48:45] sweep report: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260731-032127.txt

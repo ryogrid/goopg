@@ -150,24 +150,87 @@ func TestInnerJoinQualPushDeclinesOnOuterJoin(t *testing.T) {
 	}
 }
 
-// TestInnerJoinQualPushDeclinesOnBaseRelationLeaf pins D2's scoping.
-// Pushing filters toward base-relation leaves is exactly what
-// shouldAttachBeforeMHJ withholds behind its SmallDimension guard, whose
-// comment records that without it "Slice A regresses Q8 / Q21 from PASS
-// to CANCEL". A SeqScan is a candidate MultiHashJoin subset member, so
-// this pass must never be the thing that wraps one.
-func TestInnerJoinQualPushDeclinesOnBaseRelationLeaf(t *testing.T) {
+// TestInnerJoinQualPushReachesBaseRelationLeaf pins M0125-0035's
+// REVERSAL of D2's leaf scoping. This test formerly asserted the
+// opposite ("DeclinesOnBaseRelationLeaf"), on the reasoning that
+// "pushing filters toward base-relation leaves is exactly what
+// shouldAttachBeforeMHJ withholds behind its SmallDimension guard,
+// whose comment records that without it Slice A regresses Q8 / Q21 from
+// PASS to CANCEL".
+//
+// That borrowed the wrong risk. Slice A MOVES a conjunct out of the DP's
+// input before enumeration, so it changes the join ORDER; this pass runs
+// last and DUPLICATES, so the order is already fixed. What the old
+// scoping actually withheld was the fix for C2, measured at 91f530c9 on
+// the SF0.5 cluster: `store_sales ⋈ date_dim WHERE d_year = 2002` hashed
+// all 73,049 date_dim rows and emitted 1,374,770 join rows for a
+// 275,107-row answer, because the qual was a post-join residual.
+// Design: docs/design/0125-0035-c2-single-table-qual-placement.md.
+func TestInnerJoinQualPushReachesBaseRelationLeaf(t *testing.T) {
 	scan := func() *SeqScan {
 		return &SeqScan{Table: &catalog.Table{Name: "t"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
 	}
 	l, r := scan(), scan()
 	f, j := ijFilterOverInnerJoin(l, r, JoinTypeInner, ijEq(0, "y", 2002), ijEq(2, "y", 2001))
 	pushInnerJoinInputQuals(f)
-	if _, ok := j.Left.(*Filter); ok {
-		t.Errorf("qual was pushed onto a base-relation SeqScan; only CTE references are in scope")
+
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("left-side conjunct must be pushed onto the base-relation leaf")
 	}
-	if _, ok := j.Right.(*Filter); ok {
-		t.Errorf("qual was pushed onto a base-relation SeqScan; only CTE references are in scope")
+	rf, ok := j.Right.(*Filter)
+	if !ok {
+		t.Fatalf("right-side conjunct must be pushed onto the base-relation leaf")
+	}
+	// A Filter above a leaf carries leaf-local ColumnRefs, so it MUST
+	// declare LeafLocal — otherwise a posMap remap would corrupt the
+	// indices (M0077-0001).
+	if !lf.LeafLocal || !rf.LeafLocal {
+		t.Errorf("leaf-targeted Filters must set LeafLocal=true, got left=%v right=%v",
+			lf.LeafLocal, rf.LeafLocal)
+	}
+	// The right-side conjunct was written at merged-output index 2 and
+	// must be shifted by -leftWidth (2) into the input's own space.
+	bin, ok := rf.Predicate.(*BinaryOp)
+	if !ok {
+		t.Fatalf("right Filter predicate = %T; want *BinaryOp", rf.Predicate)
+	}
+	cr, ok := bin.Left.(*ColumnRef)
+	if !ok {
+		t.Fatalf("right Filter predicate LHS = %T; want *ColumnRef", bin.Left)
+	}
+	if cr.Index != 0 {
+		t.Errorf("right-side conjunct ColumnRef.Index = %d; want 0 (shifted by -leftWidth)", cr.Index)
+	}
+	// Property 2: the conjunct is DUPLICATED, never moved — the residual
+	// above the join keeps both conjuncts.
+	if got := len(splitAnd(f.Predicate)); got != 2 {
+		t.Errorf("residual Filter must keep both conjuncts (duplicate, not move); got %d", got)
+	}
+}
+
+// TestInnerJoinQualPushIsIdempotent pins the guard added with the leaf
+// arm. A planned subtree is walked again whenever an enclosing scope's
+// planSelect reaches this pass with the subtree embedded, so a second
+// visit must not AND an already-present conjunct in a second time.
+// Without the guard TPC-DS Q69 printed `d_year = 2002 AND d_moy >= 1 AND
+// d_moy <= 3` TWICE on each date_dim scan — same rows, but a wasted
+// re-evaluation per row and a divergence from PG's plan text.
+func TestInnerJoinQualPushIsIdempotent(t *testing.T) {
+	scan := func() *SeqScan {
+		return &SeqScan{Table: &catalog.Table{Name: "t"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+	}
+	l, r := scan(), scan()
+	f, j := ijFilterOverInnerJoin(l, r, JoinTypeInner, ijEq(0, "y", 2002))
+	pushInnerJoinInputQuals(f)
+	pushInnerJoinInputQuals(f)
+
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("conjunct must be pushed onto the base-relation leaf")
+	}
+	if got := len(splitAnd(lf.Predicate)); got != 1 {
+		t.Errorf("pushed predicate has %d conjuncts after two visits; want 1 (idempotent)", got)
 	}
 }
 

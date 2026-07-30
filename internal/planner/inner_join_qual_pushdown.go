@@ -131,9 +131,11 @@ func pushInnerJoinInputQuals(f *Filter) {
 			target = j.Right
 			delta = -leftWidth
 		}
-		// D2 scoping: only a CTE reference is a legal target. Unwrap
-		// one Filter level so a second eligible conjunct ANDs into the
-		// wrapper the first one created instead of stacking.
+		// D2 scoping: a CTE reference or a base-relation leaf is a
+		// legal target (see innerJoinPushEligibleInput for why the
+		// leaf arm is safe here but not in Slice A). Unwrap one Filter
+		// level so a second eligible conjunct ANDs into the wrapper the
+		// first one created instead of stacking.
 		inner := target
 		if existing, isFilter := inner.(*Filter); isFilter {
 			inner = existing.Child
@@ -146,12 +148,42 @@ func pushInnerJoinInputQuals(f *Filter) {
 			continue
 		}
 		if existing, isFilter := target.(*Filter); isFilter {
-			existing.Predicate = combineAnd([]Expr{existing.Predicate, local})
+			// IDEMPOTENCE. A planned subtree is walked again when an
+			// enclosing scope's planSelect reaches this pass with the
+			// subtree already embedded, so without this guard the same
+			// conjunct ANDs in once per enclosing scope — TPC-DS Q69
+			// printed `d_year = 2002 AND d_moy >= 1 AND d_moy <= 3`
+			// TWICE on each date_dim scan. Harmless for the result set
+			// (a filter applied twice selects the same rows) but it
+			// costs a re-evaluation per row and diverges from PG's
+			// plan text. exprEqual is FAIL-CLOSED, so an undecidable
+			// conjunct degrades to the old duplicate, never to a
+			// dropped qual.
+			dup := false
+			for _, have := range splitAnd(existing.Predicate) {
+				if exprEqual(have, local) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				existing.Predicate = combineAnd([]Expr{existing.Predicate, local})
+			}
 			continue
 		}
 		// Property 2: the conjunct is DUPLICATED — f.Predicate is left
 		// untouched — so only the error behaviour changes.
-		wrapped := &Filter{pos: c.Pos(), Child: target, Predicate: local}
+		//
+		// LeafLocal follows the target: above a base-relation leaf the
+		// shifted conjunct is in leaf coordinates (M0077-0001), which is
+		// exactly what the flag asserts. A CTE reference keeps the
+		// M0125-0004 behaviour (flag clear).
+		wrapped := &Filter{
+			pos:       c.Pos(),
+			Child:     target,
+			Predicate: local,
+			LeafLocal: innerJoinPushLeafScan(inner),
+		}
 		if side == sideRight {
 			j.Right = wrapped
 		} else {
@@ -168,6 +200,39 @@ func pushInnerJoinInputQuals(f *Filter) {
 func innerJoinPushEligibleInput(n Node) bool {
 	switch n.(type) {
 	case *CTEScan, *MaterializedCTEScan:
+		return true
+	}
+	return innerJoinPushLeafScan(n)
+}
+
+// innerJoinPushLeafScan reports whether `n` is a base-relation leaf —
+// a node whose Output() is exactly one relation's columns.
+//
+// D2 originally admitted CTE references ONLY, reasoning that "pushing
+// filters toward base-relation leaves is exactly what
+// shouldAttachBeforeMHJ withholds behind its SmallDimension guard".
+// M0125-0035 retired that half of the scoping, because the two passes do
+// not do the same thing:
+//
+//   - Slice A (shouldAttachBeforeMHJ → partitionConjunctsForJoinPlanning)
+//     MOVES a conjunct out of the DP's input BEFORE enumeration, so it
+//     changes the join ORDER as well as the qual placement. That is what
+//     "Slice A regresses Q8 / Q21 from PASS to CANCEL" recorded, and why
+//     its rollout stays gated and snapshot-pinned.
+//   - This pass runs LAST (planner.go, after remapWithBindings and
+//     pushSingleSourceFiltersAfterRemap) and DUPLICATES rather than moves
+//     (property 2). The join order is already fixed when it runs, so
+//     admitting a leaf changes what a scan EMITS, never which join is
+//     built first.
+//
+// A Filter wrapping such a leaf carries LEAF-LOCAL ColumnRefs by the
+// M0077-0001 convention — attachRelationLocalFilters sets the same flag
+// on the same shape — and shiftConjunctForInput has already put the
+// duplicated conjunct in the input's own coordinate space, so the two
+// agree.
+func innerJoinPushLeafScan(n Node) bool {
+	switch n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan:
 		return true
 	}
 	return false

@@ -257,6 +257,22 @@ started.
 >       (C2 qual placement), so **NEXT SELECTION IS `M0125-0035`** per the
 >       adopted order; fold -0034's remainder into it if the diagnosis
 >       converges. Original wording of -0026's line follows.
+>       **↳ `M0125-0035`'s BINARY-JOIN ARM LANDED 2026-07-31 (loop #8), and its
+>       mandated first step is DISCHARGED: C2 is an EXECUTION defect, not
+>       costing-only** — `EXPLAIN ANALYZE` (serial, a counting instrument, so
+>       valid on the loaded host) shows `date_dim` hashed at **actual rows =
+>       73,049** and the join emitting **1,374,770** rows for a 275,107-row
+>       answer; the MHJ arm is identical. Scan-level `Filter:` lines **5 → 71**,
+>       TPC-H plan-diff **4/22 with ZERO structural change** (4 net-new scan
+>       filters, 0 removed), SF0.5 **99/99: PASS=87 MISMATCH=0 CKMISMATCH=0
+>       ERROR=0 TIMEOUT=8 SKIP=4, no new timeout**. **-0035 STAYS OPEN: its
+>       acceptance Q78 is untouched** (its qual sits above two LEFT joins and
+>       names a CTE output column). The diagnosis DID converge with -0034's open
+>       arm exactly as this banner predicted — both now need the same two
+>       things: the preserved-side extension for outer joins, and PG's
+>       single-reference CTE inlining. **NEXT SELECTION: take the shared
+>       CTE/outer-join arm of `-0034`+`-0035` together**, then `M0125-0036` per
+>       the adopted order. Three ledger rows 2026-07-31.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3415,6 +3431,64 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       and the answer decides whether this is a costing-only defect or an
       execution one. Acceptance: **Q78 completes and matches `78|OK|45|8f67acff…`**.
       Bar: as -0034.
+      **↳ FIRST STEP DISCHARGED + BINARY-JOIN ARM LANDED 2026-07-31 (loop #8).**
+      Design `docs/design/0125-0035-c2-single-table-qual-placement.md`; evidence
+      `analysis/m0125-0035-c2-qual-placement/`; re-capture
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0035/`.
+      **The determination: C2 is an EXECUTION defect, not costing-only.** Serial
+      `EXPLAIN ANALYZE` (a COUNTING instrument — valid while the nightly held the
+      host; no timing is claimed): `store_sales ⋈ date_dim WHERE d_year = 2002`
+      hashes `date_dim` at **actual rows = 73,049** (the whole table) and the
+      join emits **1,374,770** rows for a **275,107**-row answer. The MHJ arm is
+      the same shape — `customer_address` hashed at 50,000, 96,562 rows emitted
+      for 11,049. The code agrees: `multiHashJoinOp.Open` drains every build
+      child through `drainRowsCtx` and hashes all of it, then `partitionFilters`
+      evaluates a build-table qual at STEP time, after the hash exists. Both
+      answers equal PG, so what is wrong is the WORK, not the result.
+      **Why it was stranded:** both placement passes declined. Slice A needs ≥5
+      tables AND a `SmallDimension` relation — a hardcoded name-tag set only for
+      `region`/`nation`, so no TPC-DS relation can EVER qualify. M0125-0004's
+      `pushSingleSideQualsIntoInnerJoinInputs` excluded base-relation leaves by
+      borrowing Slice A's risk — **and that borrowing was wrong**: Slice A MOVES
+      a conjunct before DP enumeration (hence "Q8 / Q21 PASS → CANCEL"), while
+      that pass runs LAST and DUPLICATES, so the join order is already fixed and
+      admitting a leaf changes only what a scan EMITS.
+      **Landed:** `innerJoinPushEligibleInput` accepts `*SeqScan`/`*IndexScan`/
+      `*IndexOnlyScan`, with `LeafLocal` set to match the leaf-local coordinate
+      space and a fail-closed idempotence guard (Q69 was printing its
+      `d_year`/`d_moy` conjuncts TWICE — a subtree is re-walked once per
+      enclosing scope). `bench/tpch/env_goopg.sh` also gained the `GOOPG_BIN`
+      override `bench/tpcds/env_tpcds.sh` took on 2026-07-30, so the mandatory
+      spotcheck gate no longer clobbers the nightly's shared binary mid-run.
+      **Measured:** scan-level `Filter:` lines **5 → 71** across the 18-query
+      capture; Q69's join estimate 525,809,623 → 287,921 (wrong by 1,826×);
+      spotcheck `RESULT=PASS` (Q12=2 Q13=35, and Q12 is one of the changed
+      plans); plan-diff vs `m0125-0034-setop-join-promotion` **4/22 DIFFER
+      (Q12 Q14 Q16 Q20) with ZERO structural change** — every node-kind line
+      appears an even number of times, and the delta is exactly **4 net-new
+      scan-level filters and 0 removed**, which is property 2
+      (duplicate-never-move) confirmed on real plans; full 99-query SF0.5 gate
+      in four chunks on one binary **PASS=87 (53 ck-verified) MISMATCH=0
+      CKMISMATCH=0 ERROR=0 TIMEOUT=8 SKIP=4** — **zero correctness failures and
+      NO new timeout**, all 8 already-filed (Q30 Q64 Q65 Q81 = -0034's open arm;
+      Q18 = -0033; Q35 = -0003; Q31 + Q78 = this item). Sweep run `FORCE=1`
+      under the nightly — legitimate for row/checksum work per the banner, but
+      **every wall clock in those reports is contaminated** (Q47 306 s and Q72
+      325 s reported PASS above the nominal 300 s cap for that reason).
+      **STAYS OPEN — the acceptance is NOT met.** Three arms remain, one ledger
+      row each: **(a)** the pass declines every OUTER join, and Q78's
+      `ss_sold_year = 1998` sits above two `Hash Join (LEFT)` on a CTE OUTPUT
+      column — it needs the preserved-side extension (safe without a
+      `nullingrels` model) plus PG's single-reference CTE inlining (PG 12+
+      `cte_inline`), which is how `d_year = 1998` reaches `date_dim` in PG's
+      plan; Q31's `ws3` is referenced 6× and is the multiply-referenced control.
+      **This is the SAME boundary as -0034's open CTE arm — take them
+      together.** **(b)** the MHJ arm: `pushSingleSourceFiltersIntoMHJTables`
+      disqualifies any conjunct containing an `InExpr`, so an IN-list stays on
+      the MHJ node; small, but its walker is a planner/executor SIBLING PAIR.
+      **(c)** the costing half is untouched — the DP still sees unfiltered
+      base-rel sizes, so join ORDER is still chosen for full tables
+      (`M0125-0038` / the cost-model "0077 line").
 
 - [ ] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
       no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same
