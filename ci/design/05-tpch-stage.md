@@ -170,3 +170,4 @@ note it).
 | startup exceeds ready-timeout | stage `fail(startup)`; fsync-storm history says check SLRU backfill first |
 | canonical 65433 busy through every copy attempt | `skip(port-busy)` — never kill the holder; the copy window is the only 65433 touchpoint |
 | data dir absent/small | `skip(no-data)` |
+| **server will not exit after the sweep** (a backend leaked by a per-query TIMEOUT keeps graceful shutdown from ever returning) | `cleanup` escalates `graceful 120s → -mode immediate 60s → SIGTERM 30s → SIGKILL` via `stop_goopg_server` (lib/common.sh), capturing a goroutine dump to `tpch/server-goroutines.txt` before the first escalation, and reports the rung through `progress`. Was an **untimed `wait`** until 2026-07-29, when it held a 16-core host for 6h45m after the sweep had already finished — with no error in any log. See [root-0037](../../docs/design/root-0037-nightly-server-shutdown-ladder.md); the engine leak itself is still open. |

@@ -575,6 +575,26 @@ type SeqScan struct {
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
+	// EstRelRows is the relation-size fallback's row estimate for Table,
+	// stamped once at plan-build time and 0 when it did not apply (the
+	// GOOPG_RELSIZE_FALLBACK flag is off, the relation is ANALYZEd, or no
+	// live block count was available). EstimateRows reads it only when
+	// TableStats.RowCount is absent.
+	//
+	// Stamped rather than computed on demand for two reasons. It mirrors
+	// PostgreSQL, which resolves relation size ONCE in get_relation_info and
+	// stores it in RelOptInfo.pages/.tuples rather than re-reading the smgr
+	// per cost call. And EstimateRows takes only a Node — it is called from
+	// the executor's EXPLAIN as well as from the planner — so there is no
+	// catalog in scope at the point of use, and threading one through a
+	// package-level variable would leak between concurrently planning
+	// sessions the way planParent already can.
+	//
+	// Consequence worth knowing: a cached plan carries the block count that
+	// was live when it was planned. PostgreSQL has the same exposure and
+	// answers it with plan invalidation, which goopg does not have yet — see
+	// the deferral ledger row for M0125-0003.
+	EstRelRows int64
 	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
 	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
 	// parent takes AccessShare on the parent relation too (PostgreSQL locks the
@@ -832,8 +852,36 @@ type Join struct {
 	schema    Schema
 }
 
-func (n *Join) Pos() int       { return n.pos }
-func (n *Join) Output() Schema { return n.schema }
+func (n *Join) Pos() int { return n.pos }
+
+// Output publishes the join's column layout.
+//
+// M0125-0008: Semi / Anti joins emit the OUTER (Left) row only, so
+// their layout is by definition Left's *current* output. Every
+// construction site already sets `schema` to a copy of
+// `Left.Output()` (unnest.go, three sites) and predp.go refreshes it
+// after join-order search — but `rewriteMultiWayChain` runs later and
+// re-sorts the subtree below the pinned semi/anti spine IN PLACE,
+// which leaves that copy a stale *permutation* of the real layout.
+// `reresolveJoinByName` then re-resolves an ancestor's keys by name
+// against the phantom layout, so the ancestor's key lands on the
+// wrong column and its conjunct silently stops filtering: an
+// `EXISTS … AND NOT EXISTS …` pair over one outer relation returned
+// MORE rows than either conjunct alone (TPC-DS Q16 / Q94, and the
+// non-subset signature that named this task).
+//
+// Deriving the layout here makes the invariant structural, so it
+// cannot be re-broken by a future pass that rewrites Left in place
+// and forgets to refresh the cache. `schema` is still the source of
+// truth for every other join type, where it holds the merged layout.
+func (n *Join) Output() Schema {
+	if n.Type == JoinTypeSemi || n.Type == JoinTypeAnti {
+		if n.Left != nil {
+			return n.Left.Output()
+		}
+	}
+	return n.schema
+}
 
 // AggregateCall is one aggregate function invocation in an Aggregate node.
 type AggregateCall struct {

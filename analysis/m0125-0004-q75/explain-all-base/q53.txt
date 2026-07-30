@@ -1,0 +1,18 @@
+                                                                                                                                                                                                                                                                                                      QUERY PLAN                                                                                                                                                                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: avg_quarterly_sales, sum_sales, i_manufact_id
+     ->  WindowAgg (1 funcs)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (CASE WHEN (avg_quarterly_sales > 0) THEN (abs((sum_sales - avg_quarterly_sales)) / avg_quarterly_sales) ELSE NULL END > 0.1)
+       ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: ((d_month_seq = ANY (1186, 1187, 1188, 1189, 1190, 1191, 1192, 1193, 1194, 1195, 1196, 1197)) AND ((((i_category = ANY ('Books', 'Children', 'Electronics')) AND (i_class = ANY ('personal', 'portable', 'reference', 'self-help'))) AND (i_brand = ANY ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9'))) OR (((i_category = ANY ('Women', 'Music', 'Men')) AND (i_class = ANY ('accessories', 'classical', 'fragrances', 'pants'))) AND (i_brand = ANY ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1')))))
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.store  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.item_pkey on public.item  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (i_item_sk = ss_item_sk)
+(14 rows)
+

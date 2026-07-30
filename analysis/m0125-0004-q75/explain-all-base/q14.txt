@@ -1,0 +1,8 @@
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: channel, i_brand_id, i_class_id, i_category_id
+     ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(4 rows)
+

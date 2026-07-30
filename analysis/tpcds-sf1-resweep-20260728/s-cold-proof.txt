@@ -1,0 +1,29 @@
+# S-cold proof (D5, corrected predicate) — 2026-07-28T16:34:31+09:00
+# goopg: 2d0c2238 chore(ralph): park M-NIGHTLY below M0124/M0125 so the next loop selects the TPC-DS closeout
+# engine-binary running: e6774c4f5e22f2fa
+
+-- NOTE: the original D5 predicate (relnamespace='public'::regnamespace) returns 0 rows
+--       on goopg (regnamespace not name-resolving), making the proof vacuous.
+    relname    | relnamespace | reltuples | relpages 
+---------------+--------------+-----------+----------
+ catalog_sales |         2200 |         0 |        0
+ customer      |         2200 |         0 |        0
+ date_dim      |         2200 |         0 |        0
+ inventory     |         2200 |         0 |        0
+ item          |         2200 |         0 |        0
+ store         |         2200 |         0 |        0
+ store_sales   |         2200 |         0 |        0
+ web_sales     |         2200 |         0 |        0
+(8 rows)
+
+ pg_stats_public 
+-----------------
+               0
+(1 row)
+
+ store_sales_rows 
+------------------
+          2880404
+(1 row)
+
+# GC regime: GOGC=off GOMEMLIMIT=12GiB

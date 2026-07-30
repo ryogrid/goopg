@@ -120,7 +120,8 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		// this the COPY path leaked e.g. `syntax error at or near "from"
 		// (byte 27)` and no caret. M0097-0024.
 		msg, extra := syntaxErrorMsg(err)
-		if err := s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...); err != nil {
+		code := syntaxErrorCode(err)
+		if err := s.writeQueryError(w, code, msg, extra...); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -697,6 +698,19 @@ func (st *copyInState) consumeTextCopyData(chunk []byte) {
 		}
 	}
 	st.partialRow = chunk[len(chunk)-1] != '\n'
+}
+
+// syntaxErrorCode returns the SQLSTATE the wire layer should report for a
+// parser error: 42601 unless the *parser.SyntaxError carries an explicit
+// override. PG's grammar raises a few errors from inside a production with a
+// non-syntax code (opt_float's precision checks are 22023), and those set
+// SyntaxError.Code so goopg reports the same one.
+func syntaxErrorCode(err error) sqlstate.Code {
+	var se *parser.SyntaxError
+	if errors.As(err, &se) && se.Code != "" {
+		return sqlstate.Code(se.Code)
+	}
+	return sqlstate.SyntaxError
 }
 
 // syntaxErrorMsg returns the human-readable message and optional extra

@@ -1,0 +1,6 @@
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(2 rows)
+

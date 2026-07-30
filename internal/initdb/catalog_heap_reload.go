@@ -287,6 +287,100 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 	return nil
 }
 
+// loadInheritanceFromHeap is root-0031's pg_inherits reload — the counterpart
+// of syncTableToCatalogHeap's pg_inherits writes (base/<dbOid>/2611). Table
+// inheritance used to live ONLY in memory (catalog.inheritanceChildren plus
+// Table.InheritsParentOIDs, both populated exclusively by CREATE TABLE ...
+// INHERITS), so a restart dropped every parent→child edge: the parent stopped
+// scanning its children's rows, pg_inherits went empty, and the child
+// name-collision recursion in ALTER TABLE ... RENAME COLUMN silently passed.
+// Mirrors loadColumnDefaultsFromHeap's shape: a STANDALONE UNCONDITIONAL pass
+// run AFTER every table-load pass (the M0114 catalog cache bypasses
+// loadUserTablesFromHeap, so it cannot live inside it), scanning the main DB
+// heap plus each registered user database's own heap.
+func loadInheritanceFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadInheritanceFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadInheritanceFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadInheritanceFromHeapForDB scans base/<heapDBOid>/2611 and re-registers each
+// live (inhrelid, inhparent) edge, restoring both halves of the in-memory state
+// the DDL path maintains: the child's ordered InheritsParentOIDs (inhseqno order,
+// which pg_dump re-emits as the INHERITS (...) list) and the catalog's
+// parent→children registry. A missing/empty heap is a no-op; an edge whose child
+// or parent no longer exists is skipped rather than failing startup, matching the
+// other reload passes.
+func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	type inhRow struct {
+		child  uint32
+		parent uint32
+		seqno  int32
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2611, Fork: storage.MainFork}
+	cols := executor.PGInheritsColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_inherits",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return inhRow{
+				child:  uint32(decoded[0].Int),
+				parent: uint32(decoded[1].Int),
+				seqno:  int32(decoded[2].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	// Group by child so the parents are restored in inhseqno order regardless of
+	// the physical row order the seq-scan returns (a re-synced child's rows are
+	// appended, so heap order is not declaration order).
+	byChild := make(map[uint32][]inhRow, len(rows))
+	for _, r := range rows {
+		ih := r.(inhRow)
+		if ih.child == 0 || ih.parent == 0 {
+			continue
+		}
+		byChild[ih.child] = append(byChild[ih.child], ih)
+	}
+	for childOID, edges := range byChild {
+		childTbl, _, ok := cat.LookupTableByOIDAllDBs(childOID)
+		if !ok || childTbl == nil {
+			continue // child dropped since the rows were written
+		}
+		sort.Slice(edges, func(i, j int) bool { return edges[i].seqno < edges[j].seqno })
+		parents := make([]uint32, 0, len(edges))
+		for _, e := range edges {
+			if _, _, pok := cat.LookupTableByOIDAllDBs(e.parent); !pok {
+				continue // parent dropped since the row was written
+			}
+			parents = append(parents, e.parent)
+			cat.RegisterInheritanceChild(e.parent, childOID)
+		}
+		if len(parents) > 0 {
+			childTbl.InheritsParentOIDs = parents
+		}
+	}
+	return nil
+}
+
 // rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
 // default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
 // discriminated by the first byte — a canonical PG18 pg_node_tree always opens

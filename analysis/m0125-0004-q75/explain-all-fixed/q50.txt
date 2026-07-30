@@ -1,0 +1,17 @@
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+     ->  HashAggregate (10 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((d_year = 2001) AND (d_moy = 8))
+         ->  Multi-Way Hash Join (4 tables)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.date_dim d2  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.date_dim d1  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store_returns  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+         ->  Index Scan using public.store_pkey on public.store  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (s_store_sk = ss_store_sk)
+(13 rows)
+

@@ -2,7 +2,14 @@
 
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
 Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
-Priority banner below or a dependency forces another order**.
+Priority banner below or a dependency forces another order**. As of 2026-07-28
+the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
+`docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
+ahead of M0123 and every other milestone. **M-NIGHTLY no longer preempts it
+(amended 2026-07-28): nightly items are still FILED every loop, but they are not
+SELECTED until M0124 and M0125 close.** This banner is the sole ordering
+authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
+priority, and does not outrank it.
 
 ## Notes / rules
 
@@ -21,13 +28,200 @@ Priority banner below or a dependency forces another order**.
   `completed_fix_plan_008.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-06-20 directive)
+## Current Priority (per 2026-07-28 directive)
 
-**Standing exception: M-NIGHTLY triage items (from `ci/logs/action-items.md`)
-preempt everything below** — see the M-NIGHTLY milestone directly under this
-banner.
+**Standing FILING obligation (amended 2026-07-28 — replaces the former
+"M-NIGHTLY triage items preempt everything below" exception):** every loop still
+reads `ci/logs/action-items.md` and files each new `## AI-` subject as a task
+under the M-NIGHTLY milestone directly below this banner. **Filing is
+unconditional; selection is not.** M-NIGHTLY work is PARKED beneath M0124/M0125
+and its tasks stay unchecked until both milestones close. Exactly two carve-outs
+may be worked immediately, because the parked milestones cannot be *measured*
+without them:
 
-**⚡ 2026-07-18 directive — branch `wal-pg-nodetree`, priority order for this loop:**
+- an item that breaks the build, and
+- an item that breaks a gate M0124/M0125 depend on — `scripts/tpch-spotcheck.sh`,
+  the TPC-DS SF0.5 gate, `make plan-diff`, or a bench cluster
+  (65432/65433/65436/65437/65438).
+
+Everything else is filed and left unchecked. Rationale: every loop from
+`ddfb035e` (root-0029) through root-0036 went to nightly triage while the TPC-DS
+round-2 closeout — the measurement every M0125 task diffs against — never
+started.
+
+**⚡ 2026-07-28 directive — branch `tpcds-fix2`, priority order for this loop
+(SUPERSEDES the 2026-07-18 directive below):**
+> `docs/design/tpcds-round2-fixes/README.md` §13 audited the TPC-DS round-2 plan
+> against itself: four of twelve phases landed as planned, four with a named gap,
+> four never started; seven of nine planned deferral-ledger rows were never
+> appended; and §13.3's current status is a **projection, not a measurement**.
+> §13.5 lists the smallest set of actions that would close the plan. They are now
+> filed as **M0124** (measurement baseline, regression-gate discharge, ledger
+> debt) and **M0125** (timeout class, Q75, walker extinction), and they are the
+> **top priority of this checkout**. Work in THIS order:
+> 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
+>    "WIP recovery" item directly under this banner) before anything else, never
+>    silently drop it. (Nothing outstanding as of 2026-07-28.)
+> 2. **M0124** — TPC-DS round-2 closeout. Milestone doc
+>    `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
+>    **↳ M0124 IS FULLY CLOSED (2026-07-30).** `M0124-0004` — the last open item —
+>    was closed on its CLASSIFY branch: Q35 is **performance-only, RC-8 shape**,
+>    its row count is **not recoverable by any budget** (warm floor ≈9.1 days at
+>    SF=1), and it is now **M0125-0003's acceptance query**. Nothing in M0124
+>    remains; **select from M0125's ordered list in step 3 below** — items 1–4
+>    there are done, so the next selection is **item 5 (`M0125-0014`/`-0015`,
+>    Q49/Q51 SF=1 re-measure)**. Historical detail follows.
+>    **↳ NEXT TASK TO SELECT (updated 2026-07-29 late): `M0124-0001` is CLOSED,
+>    and so are `-0002` (discharged this loop — `plan_snapshots/tpcds-round2-head.txt`
+>    now EXISTS and is committed), `-0003`, `-0005` and `-0006`. The only M0124
+>    item left is `M0124-0004` (Q35's row count). **It needs a QUIET host** —
+>    its two previous readings were voided by the nightly CI batch. Check
+>    `ci/batch/run-nightly.sh` is not running before selecting either; the
+>    harness guards now refuse to start otherwise (`FORCE=1` overrides, and is
+>    only legitimate for value/row-count work, never for a timing).** Do not select a regress/testport case instead: as of the
+>    2026-07-28(b) amendment M-NIGHTLY no longer preempts;
+> 3. **M0125** — TPC-DS timeout class & planner expression-walker extinction.
+>    Milestone doc
+>    `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`;
+>    **↳ NEXT TASK TO SELECT (added 2026-07-29 17:25 by the USER — this list
+>    OUTRANKS `.ralph/working_set.md`'s NEXT note, which currently says
+>    `M0125-0020`). Take them in THIS order; do not fall back to file order:**
+>    1. ~~**`M0125-0003` stage 1**~~ — **DONE**, and **stage 2 is DONE too
+>       (2026-07-30)**: the bushy DP seed is wired and default-off, proven inert
+>       flag-off (plan-diff 22/22 MATCH) and proven LIVE flag-on (22/22 DIFFER,
+>       replacing a flat `rows=1` seed for every relation with block-derived
+>       sizes). The four-arm TIMED study and stage 3 remain owed — see the item
+>       body and the two 2026-07-30 ledger rows. **NEXT SELECTION: `M0125-0002`,
+>       `-0005`, or `M0125-0003` stage 3** (but stage 3 shadows stage 2's
+>       measurement, so prefer taking stage 2's timed arm on a quiet host
+>       first). Original wording follows.
+>       It is the ONLY designed item that can move the
+>       **17-query timeout class** this milestone is named after — fix_plan calls
+>       it "§13.5's highest-value item (15–16 of 21 defects); stage 1 is inert, so
+>       it lands early". This banner has said "M0125-0003 (flag-off throughout) are
+>       unblocked" since 2026-07-28, and only the **measurement half** is gated by
+>       M0124-0002. `working_set.md` has re-classified it as "needs a four-arm
+>       TIMED study → host blocker" for six consecutive loops: that is true of the
+>       four-arm study, **not** of the shape-neutral stage-1 landing. Land stage 1;
+>       defer the timed arms with a ledger row if the host is busy.
+>    2. ~~**`M0124-0002`**~~ — **DONE 2026-07-29** (`analysis/tpch-tpcds-round2-retro-20260729.md`).
+>       `plan_snapshots/tpcds-round2-head.txt` exists and is committed, so
+>       **M0125-0002 / -0004 / -0005 and M0125-0003 stage 2 are unblocked** — that
+>       was the largest single unblock available and it has been taken. Use
+>       `make plan-diff LABEL=tpcds-round2-head`, never `plan-gate`, when a
+>       *specific* baseline matters (`plan-gate` picks newest-by-mtime).
+>    3. **`M0125-0012` (Q8).** UNBLOCKED: its only dependency was the *soft* one on
+>       M0125-0001, which landed at `6c5c48ae`. `working_set.md`'s claim that
+>       -0020 is "the last unblocked M0125 item" is FALSE — that enumeration omits
+>       -0012…-0015 entirely. Q8 is the only unresolved member of round 1's nine
+>       goopg-only errors and reproduces at SF0.5 in 12 s.
+>    4. ~~**The full 99-query SF0.5 gate**, once~~ — **DONE 2026-07-29**,
+>       `analysis/tpcds-sf05-full-gate-20260729/`. **99/99 covered at HEAD
+>       `50cf7c5f`, ZERO regressions**: `PASS=75 (46 ck-verified) MISMATCH=1
+>       CKMISMATCH=3 ERROR=1 TIMEOUT=15 SKIP=4`. Eight statuses differ from the
+>       `sweep-20260727-214619` baseline and all eight are accounted for (Q8
+>       ERROR→TIMEOUT = M0125-0012's fix; Q16/Q94/Q95 PASS→CKMISMATCH = the
+>       baseline had **no** value checksum, so M0124-0005 detected three silent
+>       wrong answers — one defect, **M0125-0007**; Q49/Q51 MISMATCH→PASS = fixed;
+>       Q72/Q88 TIMEOUT→PASS = the 180s→300s cap, no code). The eight loops of
+>       debt behind -0016 … -0021 are discharged in one pass; none of the six is
+>       owed a follow-up. Run as four contiguous `QUERIES=` chunks on ONE binary
+>       (~110 min total exceeds a loop's foreground budget) — the README explains
+>       why chunking is sound and what it cannot see.
+>    5. ~~**`M0125-0014` / `-0015`** (Q49 / Q51 SF=1 re-measure)~~ — **DONE
+>       2026-07-30** on a verified quiet host, `analysis/m0125-0014-0015-q49-q51-sf1/`.
+>       The SF=1 reading the items demanded closes **both**: Q49 `OK 83 s / 34
+>       rows` and Q51 `OK 47 s / 100 rows`, each with a value checksum equal to
+>       PG's. The SF0.5 PASS was indeed only evidence — but the full-fact-table
+>       defect SF0.5 could have hidden was not there. Neither mechanism was ever
+>       root-caused; both closed at STEP 0 as *measured-and-already-fixed*, the
+>       M0124-0004 shape. Attribution stays where the SF0.5 bisect put it
+>       (**M0125-0009**) and is NOT confirmed by this run.
+>    **↳ ALL FIVE ORDERED ITEMS ARE DISCHARGED, and so is the fall-back:**
+>    **`M0125-0007`** (unpadded month/day date decode) **landed 2026-07-30** —
+>    `internal/pgdatetime` + every executor date/time entry point; the three
+>    Q16/Q94/Q95 `CKMISMATCH` cells went from one shared wrong-answer checksum to
+>    three distinct real answers. It did not turn them green, and the probe that
+>    proved it also named what remains behind each, which sets the next order:
+>    1. ~~**`M0125-0008`** (EXISTS + NOT EXISTS over one outer rel)~~ — **DONE
+>       2026-07-30.** One derivation in `Join.Output()` (Semi/Anti publish
+>       `Left.Output()` instead of a cached copy `rewriteMultiWayChain`'s
+>       in-place OID re-sort had made stale). Closed **all three** CKMISMATCH
+>       cells, not two: Q16 `40dbec0df91d2438`, Q94 `04afc1b69831a5ea` **and
+>       Q95 `e498634c02595c29`**, each matching the SF0.5 oracle exactly.
+>    2. ~~**`M0125-0023`** (Q95)~~ — **DONE 2026-07-30, same fix.** Its filing
+>       premise ("no `EXISTS`, therefore not -0008") classified by SQL keyword
+>       rather than by the join the planner builds; `IN (subquery)` unnests to
+>       the same `JoinTypeSemi`.
+>    3. ~~**`M0125-0013`** (Q47)~~ — **DONE 2026-07-30.** Closed on a refuted
+>       premise: the defect was in the CTE body, not the windowed layers above
+>       it — RC-1b had measured the body by ROW COUNT, and the row count was the
+>       half that was already correct (332,240 = PG). The projection read other
+>       relations' columns, so `rank()` returned 1 for every row and the `v2`
+>       self-join on `rn = rn+1` matched nothing. One arm of
+>       `buildBindingsPosMap` (`*MultiHashJoin` matched only bare scans, skipping
+>       `*Filter`-wrapped leaves without advancing `off`). Q47: 0 → **100 rows =
+>       oracle**. Its *runtime* verdict is deliberately NOT closed and is filed
+>       as the bookkeeping half below.
+>    4. **NEXT SELECTION: the remaining open M0125 items** — `M0125-0002`,
+>       `-0005`, `M0125-0003` stage 3, and **`M0125-0026`** (below). *(Stale
+>       correction 2026-07-30: an earlier revision of this line said "take
+>       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
+>       item 1 above; what -0003 still owes is the timed four-arm study and
+>       stage 3, and stage 3 must NOT land before stage 2's timed arm is read.)*
+>    **`M0125-0026` (added 2026-07-30 by the USER): capture + classify the
+>    15-query timeout class** — plain-EXPLAIN-only comparison of goopg (flag-off
+>    and `GOOPG_RELSIZE_FALLBACK=2`) against PG 18.3 for Q5 Q8 Q10 Q14 Q30 Q31
+>    Q35 Q54 Q64 Q65 Q67 Q69 Q71 Q78 Q81, then file one planner-fix task per
+>    root-cause class (M0125-0027+). **It is HOST-INDEPENDENT (nothing is
+>    timed), so it is the task to take when the timed items above are blocked
+>    on a busy host** — do not burn a quiet-host window on it. Task body at the
+>    end of the M0125 section; design
+>    `docs/design/0125-0026-timeout-class-plan-comparison.md`.
+>    Owed independently of all three: **one full 99-query SF0.5 gate run** on a
+>    quiet host. M0125-0007 is a codec change and could only get the 3-query
+>    value probe, because the nightly CI batch held the host for its whole loop
+>    (ledger row 2026-07-30). Fold it into whichever of the above lands first.
+>    **`M0125-0020` landed at `beb7af82` before this list was written**, so its
+>    ordering is moot — but the reason it was selected is not: it was chosen on
+>    the false completeness claim corrected in item 3. Do not select the next
+>    set-op follow-up ahead of items 1–5 on the same reasoning.
+> 4. **M-NIGHTLY backlog** — the standing nightly-triage items below. Keep FILING
+>    them every loop (see the filing obligation above); work them only after M0124
+>    and M0125 close, or under one of the two carve-outs. The TPC-DS **Q75** nightly
+>    item is the exception that is already routed: it is in the qualifying set with
+>    `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46` and no
+>    `expected-failures.csv` entry, and RC-1b turned it into a deterministic
+>    `division by zero` — that item IS **M0125-0004**, so it is worked as part of
+>    M0125 and never as a second workstream.
+> **Every other roadmap milestone — M0123 included — is parked below M0125 until
+> M0124 and M0125 are complete.** M0123 keeps its own branch (`wal-pg-nodetree`)
+> and resumes there once this line is closed.
+>
+> Dependencies, stated narrowly: **M0124-0002 gates M0125-0002/-0004 and the
+> measurement half of M0125-0003** (it produces the plan snapshot they diff
+> against); **M0124-0005 gates M0125-0002 and M0125-0004's acceptance** (both are
+> accepted by value, and the SF0.5 oracle is row-count only today). M0125-0001
+> (dead code) and M0125-0003 (flag-off throughout) are unblocked. **M0125-0003 is
+> independent of M0125-0002** — an earlier draft claimed its later stages were
+> blocked on the `localizeExprToLeaf` conversion, but that walker is reached only
+> under the `shouldAttachBeforeMHJ` gate (`bushy.go:158`), and when the gate opens
+> `attachRelationLocalFilters` already calls it, so the relation-size fallback
+> wakes nothing.
+>
+> Two M0125 tasks move plan shape, and goopg's planner sits on a *measured*
+> trade-off: enabling statistics fixed TPC-H Q5 22.8× and regressed Q22 128× /
+> Q4 79× / Q8 53× / Q2 26× / Q12 4.4×, taking the serial stream 1162 → 1307 s
+> (`analysis/tpch-evolution-round4-parallel-query-20260722.md` §2/§5); and the
+> cost-driven planner is 4 wins / 6 regressions / 12 neutral
+> (`analysis/tpch-evolution-round5-int64-hashjoin-20260724.md` §6). **Every
+> regression in that §6 table came with identical row counts**, so
+> `scripts/tpch-spotcheck.sh` (a Q12/Q13 row-count gate) cannot see this class.
+> Planner commits in M0125 need a **timed** 22-query TPC-H power run plus
+> `make plan-diff LABEL=tpcds-round2-head` — note `make plan-gate` picks the
+> newest snapshot by mtime, so it cannot be pointed at a named baseline.
+
+**⚡ 2026-07-18 directive — SUPERSEDED 2026-07-28, kept for history:**
 > This checkout is on `wal-pg-nodetree` to develop **M0123 (canonical `pg_node_tree`)**
 > — see `docs/milestones/0123-canonical-pg-node-tree-serialization.md` and
 > `docs/design/wal-pg-identical-stream/02e §3`. Work in THIS priority order:
@@ -38,12 +232,13 @@ banner.
 > The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
 > M0123 is complete.
 
-Work order: **M0117 → M0118** (both complete + archived), then resume **M0110**
-(its **M0119-0004/0005/0006/0007** spinoffs are the active, in-progress form of
-that work), with **M0095** parked (blocked on logical decoding). **M0120 / M0121
-are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
-defer unless genuinely compelling (then record a ledger row); commit + push at
-every clean, green (build + pre-commit) checkpoint.
+Work order: **M0124 → M0125** (this directive), then **M0123**, then the
+pre-existing line — **M0117 → M0118** (both complete + archived), then resume
+**M0110** (its **M0119-0004/0005/0006/0007** spinoffs are the active,
+in-progress form of that work), with **M0095** parked (blocked on logical
+decoding). **M0120 / M0121 are CLOSED** (2026-07-04) and archived. Policy: fix
+blockers in place; do NOT defer unless genuinely compelling (then record a ledger
+row); commit + push at every clean, green (build + pre-commit) checkpoint.
 
 ## WIP recovery (priority #1 — before M-NIGHTLY, one-time)
 
@@ -55,7 +250,7 @@ every clean, green (build + pre-commit) checkpoint.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
-## M-NIGHTLY — Nightly regression triage (STANDING — HIGHEST PRIORITY)
+## M-NIGHTLY — Nightly regression triage (STANDING — FILING CONTINUES, WORK PARKED BELOW M0124/M0125 since 2026-07-28)
 
 <!-- Standing milestone: never complete it, never archive it, keep it directly
      under the Current Priority banner. Source of work: ci/logs/action-items.md
@@ -69,9 +264,14 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
           another — append the new AI-id to that task's line instead. If only a
           CHECKED task exists for the subject, the failure REOPENED: add a new
           task and note the earlier fix didn't hold.
-       2. Tasks in this milestone PREEMPT all other milestones (finish an
-          already in-flight working_set task first; preemption applies at
-          task-selection time).
+       2. AMENDED 2026-07-28: tasks in this milestone are FILED every loop but
+          are NOT selected while the Current Priority banner parks them (today:
+          below M0124/M0125). Filing is unconditional; selection follows the
+          banner. Two carve-outs may be worked at once — an item that breaks the
+          build, and an item that breaks a gate the banner's milestones depend on
+          (tpch-spotcheck, the TPC-DS SF0.5 gate, plan-diff, a bench cluster).
+          The pre-amendment rule ("these PREEMPT all other milestones") returns
+          automatically once the banner stops naming M0124/M0125.
        3. Before investigating, re-run the item's repro at HEAD — the log
           reflects the last nightly run and may be stale; if it passes, check
           the task off with a "stale — already fixed" note.
@@ -81,6 +281,72 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      (Tasks are added here by the in-loop agent, one per subject. This
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
+
+- [x] **Nightly TPC-DS row anchors are DEAD — all 63 have never been checked**
+      **DONE 2026-07-30 (interactive session, commit `63056c54`)** — the reader
+      now uses `expected_rows`, AND the same commit fixed a second, worse fault
+      found on top of it: `main()` referenced `tpcds_timings` that was local to
+      `analyze()`, so **every nightly since the tpcds lane landed crashed with
+      NameError before writing summary.md / action-items.md / history.jsonl**
+      (action-items.md was frozen at run `20260725-011243` for five nights —
+      do NOT re-file items about "stale action-items"; the mechanism is fixed).
+      Verified on a copy of run `20260730-011706`: completes STATUS=fail rc=2,
+      all 63 anchors load, the 15 ok queries MATCH, and a deliberately-wrong
+      `Q1,999` anchor via a doctored repo-root surfaces as `tpcds/Q1-rows`
+      regression — the item's acceptance probe. `test_summarize.py` 4/4 PASS.
+      The next real nightly run is the live confirmation. Original filing:
+      (discovered 2026-07-30 while closing `M0125-0014`/`-0015`; not from
+      `action-items.md`, and **not** one of the banner's two carve-outs, so it is
+      filed and left unchecked). `ci/batch/lib/summarize.py:485` builds
+      `anchors_tpcds` from `r["rows"]`, but `ci/batch/tpcds-row-anchors.csv`'s
+      column is **`expected_rows`** — `csv.DictReader` therefore yields no `rows`
+      key, the comprehension's `if r.get("rows")` guard drops **every** row, and
+      the dict is always empty. Consequence: the nightly batch has never reported
+      a TPC-DS row-count regression, for any of the 63 pinned queries. **TPC-H is
+      unaffected** — `ci/batch/tpch-row-anchors.csv` really does use `rows`
+      (verified: 12/12 usable vs 0/61 for TPC-DS), which is why the same code
+      shape works 80 lines earlier and why this went unnoticed.
+      Repro: `python3 -c "import csv;r=list(csv.DictReader(open('ci/batch/tpcds-row-anchors.csv')));print(sum(1 for x in r if x.get('rows')))"` → `0`.
+      Fix: read `expected_rows` in `summarize.py` (or rename the CSV column —
+      prefer fixing the reader, the CSV name is the clearer one), then confirm on
+      a nightly run that a deliberately-wrong anchor actually surfaces as a
+      regression. Until this lands, the Q49/Q51 anchors added by M0125-0014/-0015
+      protect nothing.
+
+- [x] **Nightly TPC-H stage wedged the host for 6h45m after its sweep finished**
+      — worked immediately under the banner's second carve-out (it broke the bench
+      clusters AND, via the new host-quiet guards, blocked M0124-0002/-0004 from
+      running at all). **DONE 2026-07-29**, design
+      `docs/design/root-0037-nightly-server-shutdown-ladder.md`. Run
+      `20260729-002344` finished its sweep at 02:07:15 and still held the host at
+      08:50 with **no error in any log**: the stage log ends on `sweep done`, the
+      server log on a *successful* `shutdown checkpoint complete`. Q13 hit the
+      1200s cap; killing psql kills only the client, and exactly ONE backend
+      (`pid=40`) has an `established` with no `closed`. Graceful shutdown cannot
+      return until every backend has, so the process never exited and
+      `stage-tpch.sh`'s **untimed** `wait ${server_pid}` inherited the hang. Fixed
+      by `stop_goopg_server` (`ci/batch/lib/common.sh`): graceful 120s ->
+      `-mode immediate` 60s -> SIGTERM 30s -> SIGKILL, 210s worst case, applied to
+      `stage-tpch.sh` AND `stage-tpcds.sh` (identical two lines; `stage-pgbench.sh`
+      already hard-killed). Liveness reads process **state**, not `kill -0` (a
+      background child answers `kill -0` while a zombie). Escalations are reported
+      via `progress`, so this can never present as silence again. Guarded by
+      `ci/batch/lib/test_stop_ladder.sh` (5 rungs + dump capture, ~50s, no build).
+- [ ] **goopg graceful shutdown hangs forever on a backend that outlives its client**
+      — the engine defect underneath the wedge above; the ladder bounds the COST,
+      not the CAUSE. `startClientEOFWatch` (`internal/server/eof_watch.go:113`)
+      logged `client connection lost mid-query; cancelling statement` for backend
+      `pid=40` and called `cancel()`; the backend never finished. `cl.OnStop`
+      (`internal/server/server.go:602`) checkpointed, called `runCancel()` and
+      drained the accept loop, but has **no deadline and no force-terminate step**,
+      so one unresponsive backend hangs the process indefinitely. PG diverges:
+      `pg_ctl stop -m fast` SIGTERMs every backend and `ProcessInterrupts` acts at
+      the next `CHECK_FOR_INTERRUPTS()`. The blocking site is NOT established — the
+      server was idle (0.4% CPU, 23 threads sleeping), so blocked, not spinning.
+      **Get the stack before theorising**: the next occurrence now auto-saves
+      `<stage>/server-goroutines.txt`; to force one, run TPC-H Q13 at SF=1 under a
+      1200s cap and kill the psql client. Ledger row 2026-07-29 (root-0037); same
+      family as root-0029's still-open orphaned-backend row, narrowed to one pid.
 
 - [x] **TestPort_IsolationPreparedTransactions** — testport spec FAILed in
       nightly run 20260719-094219 (AI-20260719-094219-001; repro:
@@ -127,7 +393,2285 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       tuple locks through `tableLockMgr` for FIFO waits). 4/19.5M is the tail of that
       known edge; no separate fix here — tracked by the existing deferral row.
 
+### Nightly run 20260725-011243 (26 items, sha `55809fbf` — a pre-`master`-merge
+### tpcds-fix2 tip; HEAD at triage time `e7d9b88e`)
+
+- [x] **units/internal/executor + race/internal/executor** — both suites failed in
+      `internal/executor` (AI-20260725-011243-001/-002; repro:
+      `go test -timeout 10m ./internal/executor/`). Single cause:
+      `TestVerifyHeapam_LateralCommaJoinViaFastPath` ("gap #6 regressed").
+      **Stale — fixed at HEAD.** Nightly sha `55809fbf` predates the `master`
+      merge `27d2dae8`; the test PASSES at HEAD (0.00s), and the nightly running
+      *while this triage ran* (`20260728-121843`, sha `e7d9b88e`) reports
+      `units PASS` / `race PASS`. No new work.
+- [x] **regress/<19 cases> — 19 phantom regressions from ONE wedged cluster**
+      (AI-20260725-011243-008..-026: boolean, case, create_function_sql, errors,
+      index_including, limit, numerology, partition_aggregate, portals_p2, select,
+      select_distinct, select_distinct_on, select_into, tid, time, timetz,
+      truncate, union, varchar). **Root-caused and FIXED — design
+      `docs/design/root-0029-nightly-regress-wedge-cascade.md`.** 36 cases had
+      merely burned their full 120 s budget; the harness then diffed psql's
+      *truncated* transcript against the full expected `.out` and reported
+      "output mismatch; normalization rules need extension". The wedge outlives
+      the case (killing psql kills only the client), so 21 consecutive cases from
+      `tid` fell over, and `isAlive()` never fired because a saturated server
+      still answers `SELECT 1` (`server not responding`: 0 occurrences).
+      Fix: `framework.ErrExecTimeout` short-circuits before the diff,
+      `ExecuteSQL` honours the caller's ctx deadline, a `clusterPoisoned` flag
+      restarts the cluster after any timeout, and `summarize.py` collapses the
+      cascade into one `regress/suite-wedge` item. Replayed on the real log:
+      26 items → 17. The wedge's own cause (orphaned backend vs. GOMEMLIMIT
+      saturation) is NOT fixed — ledger row 2026-07-28, and the 9 genuine
+      sub-timeout divergences are the task below.
+- [ ] **regress/{boolean,case,create_function_sql,errors,index_including,limit,
+      numerology,partition_aggregate,portals_p2} — genuine sub-timeout
+      divergences.**
+      **PARKED 2026-07-28(b) — do NOT select; below M0124/M0125 per the banner's
+      filing rule. Resume point carried over from loop #8's baton so nothing is
+      lost: two cases left, `portals_p2` and `select`. Try the ISOLATED run FIRST
+      — `go test -v -run 'TestPort_RegressSuite/^portals_p2$' ./internal/testport/`
+      (~2 s); a `SKIP` there means "output mismatch", not "not applicable", and
+      that is how root-0036 was found — far cheaper than the 670 s prefix run. The
+      old "these only diverge in full-suite ordering" reading is NOT true of every
+      case. `/tmp/rdiff-loop6/portals_p2_{expected,actual}.txt` (if still present)
+      shows PG returning 1 row per FETCH where goopg returns 2 — ~10 blocks plus
+      one 3-row block, i.e. one cursor-positioning bug, not ten.**
+      What survives the root-0029 reclassification of
+      AI-20260725-011243-008..-026: 9 baseline-pass cases that diverged in under
+      120 s. At HEAD (full-suite re-run, 2026-07-28) `errors`, `index_including`,
+      `portals_p2`, `select` and `select_distinct` still diverge, while `boolean`,
+      `case`, `create_function_sql`, `limit`, `numerology`, `partition_aggregate`
+      and `tid` now pass; `time`/`timetz`/`truncate`/`union`/`varchar` were not
+      reached (the re-run hit the 10 m go-test timeout inside `tidscan`, under
+      co-load from the concurrent nightly). Earlier loops established that
+      `errors`/`portals_p2`/`select` pass in ISOLATION and only diverge in
+      full-suite ordering — so the remaining work is suite-ordering state leakage
+      (a case mutating shared `test_setup` fixtures), not normalization rules.
+      Repro: `go test -v -run 'TestPort_RegressSuite' ./internal/testport/`
+      with `-timeout 60m` and `GOOPG_REGRESS_DIFF_DIR=/tmp/rdiff` to capture the
+      actual diffs, then bisect the ordering dependency.
+      **`errors` CLOSED 2026-07-28 — root-0031**
+      (`docs/design/root-0031-pg-inherits-restart-persistence.md`), and the
+      "mutating case" reading above is REFUTED for it. Bisecting the ordering
+      never converges because the trigger is nondeterministic: root-0029's
+      `clusterPoisoned` recovery RESTARTS the cluster after any 120 s timeout
+      (frequent under nightly co-load, never in an isolated repro), and
+      `pg_inherits` was a purely virtual catalog that no reload pass rebuilt —
+      so every case after a restart ran with all inheritance edges gone
+      (`ALTER TABLE emp RENAME COLUMN salary TO manager` *succeeded*, leaving two
+      `manager` columns). Fixed by making pg_inherits heap-backed
+      (`base/<dbOid>/2611`) + `loadInheritanceFromHeap`, plus the three PG-fidelity
+      bugs the restart had masked (qualified `RenameTable` message, missing
+      self-relation RENAME COLUMN collision check, `DROP AGGREGATE` resolving its
+      argument type after the name lookup). `errors` now PASSES in full-suite
+      ordering **in a run that took the restart path**; 5 ledger rows filed.
+      **RE-VERIFIED 2026-07-28 (prefix through `select_distinct`, 176 cases,
+      670 s) — three of the four were NEVER MEASURED.** After `misc` timed out,
+      root-0029's recovery restart FAILED and all 53 remaining cases (#123
+      `misc_functions` … #176 `select_distinct`) reported a phantom
+      `deferred: cluster restart failed`. So `portals_p2`, `select` and
+      `select_distinct` have no result at HEAD; only `index_including` produced a
+      genuine `output mismatch` (cluster alive at #88). The restart failed because
+      **goopg could not start after a crash** —
+      `wal replay: decode at offset 771751920: invalid record header: unknown
+      rmid=31` — fixed as **root-0032**
+      (`docs/design/root-0032-crash-restart-wal-stream-anchoring.md`): live-run
+      WAL stream anchoring, a leading-contrecord skip in both scanners (which was
+      also destroying 54–97 durable records on every reopen), and PG's end-of-WAL
+      semantics instead of a fatal decode error.
+      **(a) MEASURED 2026-07-28** (same 176-case prefix, 622 s): with root-0032
+      + root-0033 the cluster restart now SUCCEEDS — the log shows three
+      `restarting the cluster` events and three `cluster recovered`, zero
+      `restart failed`, so the 53 phantom `deferred: cluster restart failed`
+      cases are gone. `portals_p2`, `select` and `select_distinct` therefore
+      have real results at HEAD for the first time, and all three genuinely
+      diverge (`output mismatch`). Diffs captured in `/tmp/rdiff-loop6`
+      (regenerate with the prefix + `GOOPG_REGRESS_DIFF_DIR`).
+      **(b) CLOSED 2026-07-28 — root-0034**
+      (`docs/design/root-0034-float-type-alias-opt-float-reduction.md`). Not an
+      index-only-scan bug despite §10's title ("names stored as cstrings in
+      indexes"): the whole 378-line divergence is four lines, and the row is
+      gone from a plain seq scan on a table with no index. §10's fixture is
+      `CREATE TABLE nametbl (c1 int, c2 name, c3 float)` — and `float` has no
+      `pg_type` entry, because PG resolves `FLOAT [ (p) ]` entirely inside the
+      grammar (`gram.y` opt_float). goopg's parser stored the literal token, so
+      it reached `catalog.TypeNameToOID`'s `default: return OIDText` and the
+      column became **text**, while `internal/executor`'s own type tables
+      (`codec.go:482`, `expr.go:3035`) list `"float"` next to float8 and encoded
+      an 8-byte IEEE-754 datum. `INSERT 0 1`, then zero rows forever. Fixed by
+      performing PG's reduction where PG performs it (`normalizeFloatTypeName`,
+      wired into the four typmod-bearing type-name sites), with opt_float's two
+      22023 errors byte-identical. `index_including` PASSES in full-suite
+      ordering (88-case prefix, 244 s). Three ledger rows filed.
+      **(e) `select_distinct` CLOSED 2026-07-28 — root-0036**
+      (`docs/design/root-0036-select-distinct-order-by-direction.md`). The
+      `USING >` and the `person*` inheritance scan in the failing query are both
+      red herrings, and so is "normalization rules": the whole divergence is one
+      20-row block returned in exactly reversed order, and reduced it is
+      `SELECT DISTINCT p.age FROM person p ORDER BY age DESC` answering
+      **ascending** while the unqualified `SELECT DISTINCT age FROM person ORDER
+      BY age DESC` is correct. goopg dedups with a fixed ascending sort inside
+      `distinctOp` and re-applies the user's ORDER BY with an outer Sort
+      (M0097-0046); that Sort was the only carrier of direction and was dropped
+      whenever its key failed to resolve — which is the common case, because
+      `resolveOrderBySubstitution` rewrites a bare ORDER BY name into the
+      target's own (qualified) expression while the outer context is schema-only
+      and `SchemaColumn` has no table name. 7 of 8 measured shapes were wrong.
+      Fixed by resolving the key against whichever surface built the target list
+      and mapping it back to its select-list position
+      (`distinctSortKeyOutputIndex`), plus a positional arm for star targets.
+      Non-vacuous `TestDistinctHonoursOrderByDirection` (10 subtests, PG-18.3
+      `want` values; 7 red with the hunk stashed); the regress case flips
+      SKIP → PASS. 3 ledger rows filed. **Method note for the two below:**
+      `select_distinct` DOES reproduce in isolation (1.6 s repro loop) — the
+      "only diverges in full-suite ordering" reading recorded earlier applies to
+      `errors`/`portals_p2`/`select`, not to every case, so always try the
+      isolated `-run 'TestPort_RegressSuite/^<case>$'` first and read a SKIP as
+      "output mismatch", not "not applicable".
+      **Still open here:** the two remaining now-genuine divergences (a)
+      exposed — `portals_p2` and `select`. They are real output mismatches, not
+      restart phantoms; the loop-6 capture in `/tmp/rdiff-loop6` shows
+      `portals_p2` returning 2 rows where PG returns 1 from a cursor FETCH
+      (`portals_p2_expected.txt` vs `_actual.txt`, ~10 blocks), which looks like
+      one cursor-positioning bug rather than ten. Work them with the isolated
+      run first and the prefix method below as fallback, reading the per-case
+      `*_expected.txt`/`*_actual.txt` pair rather than the suite log. Note
+      root-0034 and root-0036 were each found this way and touched neither, so
+      each needs its own diff.
+      ~~(c) the root-0032 §5 redo failure~~ **FIXED 2026-07-28 as root-0033**
+      (`docs/design/root-0033-redo-prune-redirect-only-compaction.md`): the
+      PG-format prune redo arm `replayDecodedXLogHeapPrune` guarded its
+      `VacuumHeapPageBySlots` repack on `len(unused) > 0`, so a **redirect-only**
+      prune (the common pgbench HOT shape) skipped the compaction the runtime
+      sibling `pagePruneCore` always performs — the replayed page kept the
+      redirected chain root's tuple body and the next `xl_heap_update` redo hit
+      `ErrNoSpaceInPage`. Same repro now reports `RESTART_OK`; (d) the harness's phantom
+      `deferred:` per case after a failed restart (ledger row, same date).
+      Cheap method (proven twice): run an alphabetical PREFIX of the suite up to
+      the target case (`-run "TestPort_RegressSuite/^(<case1>|…|<target>)$"`,
+      cases are discovered in `filepath.Glob` order) with
+      `GOOPG_REGRESS_DIFF_DIR`, and ALWAYS grep the log for
+      `restarting the cluster` / `restart failed` before reading anything into a
+      case's result.
+- [x] **server/TestRestartAfterRetention — root-0032 regressed a pass-required
+      unit test.** FIXED 2026-07-28 as **root-0035**
+      (`docs/design/root-0035-wal-segment-size-derived-from-stream.md`). The
+      hypothesis below was wrong in its mechanism: nothing is wrong with the
+      `xl_heap_insert` redo arm. The LSN in the message gives it away —
+      `301990201 = 18 × 16 MiB`, while the cluster's own checkpoints
+      (`17207361`, `18882449`, `segments_removed=16`) are segment 16/18 of a
+      **1 MiB** stream. `readAllUncached` anchors at
+      `baseOffset = firstSegNo * segmentSize`, and every recovery entry point
+      passes `segmentSize = 0` → `DefaultSegmentSize`; nothing on that path ever
+      learned the cluster's real size (`OpenOptions.WALSegmentSize` fed only the
+      writer). LSNs 16× too large disarm redo's `pd_lsn` idempotency check, so
+      startup re-applied already-applied inserts until the page overflowed. The
+      bug predates root-0032 — root-0032's contrecord skip only made the path
+      decode records at all. Fix derives the size from `xlp_seg_size` the way
+      `pg_waldump`'s `search_directory()` does. Note for future loops:
+      `RALPH_PRECOMMIT_SCOPE=units` does NOT cover `internal/server` (verified
+      2026-07-28: green at HEAD while this test was red), which is why two loops
+      shipped over it — the nightly batch is the only gate that sees it.
+      Original triage below.
+      `go test -run
+      TestRestartAfterRetention ./internal/server/` fails deterministically in
+      1.9 s with
+      `initdb.Open: goopg: wal replay: replay record 0 lsn[301990201,301990520]:
+      wal: xlog heap-insert apply: storage: not enough free space in page`.
+      **Already bisected**: PASSES at `3716d5cd` (pre-root-0032), FAILS at
+      `fa90714a` (root-0032) — so root-0032's `liveSegmentRunStart` /
+      leading-contrecord skip changed which records replay after retention, and
+      a heap-INSERT redo now lands on a page reconstructed with less free space
+      than the running server's. Same shape as root-0033 but on the INSERT arm
+      rather than the prune arm, so start by diffing the redo-side page
+      reconstruction for `xl_heap_insert` against its runtime sibling
+      (`internal/wal/recovery.go` ↔ `internal/storage/`), exactly as root-0033
+      did for `xl_heap_prune`. Note `RALPH_PRECOMMIT_SCOPE=units` does NOT
+      cover `internal/server` (verified 2026-07-28: the gate is green at HEAD
+      while this test is red), which is why two loops shipped over it — the
+      nightly batch is the only gate that sees it. Ledger row 2026-07-28.
+- [x] **testport/TestPort_IsolationEvalPlanQual** — pass-required isolation spec
+      `eval-plan-qual.spec` does not match PG (AI-20260725-011243-004, "also failed
+      in the previous run"; repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`).
+      **FIXED 2026-07-28** (`docs/design/root-0030-lockrows-rescan-state.md`).
+      Not an EPQ-tuple-version bug as the earlier triage guessed: `lockRowsOp`
+      buffers its rows (`drained`/`pos`/`pending`) and its `Open` is the
+      operator's rescan entry point, but `Close` cleared only `pending`. The
+      SECOND `Open` — the one `classifySubPlan`'s `rescanCloseOpen` performs for
+      the `EXISTS (… FOR UPDATE)` sublink on the EvalPlanQual recheck — therefore
+      answered `Next` with EOF without re-scanning, so `EXISTS` collapsed to
+      FALSE with zero `noisy_oper()` NOTICEs and `updateOp` dropped the row
+      (`checking | 400` vs PG's `-800` — a silently lost update). Fix: reset
+      `pending`/`pos`/`drained` at the top of `lockRowsOp.Open`, matching
+      `nodeLockRows.c`, which keeps no such buffer. Spec passes (27.6 s); 21
+      row-lock + 14 FK/MERGE isolation specs, units, and `tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all green.
+- [x] **testport/{AmcheckCreateExtension, IsolationInsertConflictSpecconflict,
+      IsolationPartitionDropIndexLocking, PgAmcheck002Nonesuch}** —
+      (AI-20260725-011243-003/-005/-006/-007). **Stale — all 4 PASS at HEAD**
+      (`e7d9b88e`: 0.66 s / 20.27 s / 1.92 s / 1.15 s, one run each). Same
+      pre-merge-tip explanation as the executor items. No new work.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
+
+## M0124 — TPC-DS round-2 closeout: measurement baseline, gate discharge & ledger debt (filed 2026-07-28)
+
+Milestone: `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
+Source: `docs/design/tpcds-round2-fixes/README.md` §13.5 actions **1, 5, 6, 7**
+(plus §13.4 item 3). **Priority #1 — this milestone holds the NEXT task to
+select (2026-07-28(b) amendment); M-NIGHTLY is parked below it and only filed.**
+No engine change: if a task uncovers a defect it files a ledger row and an M0125
+blocker; a code change landing mid-sweep voids the sweep.
+
+- [x] **M0124-0001 — SF=1 dual-engine re-sweep at HEAD** (§13.5 #1). **COMPLETE
+      2026-07-29 — the D7 deliverable landed as
+      `analysis/tpcds-sf1-goopg-20260728.md` and the engine-commit freeze
+      LIFTS.** All 13 §13.3 projections tested at SF=1: **11 CONFIRMED as
+      stated, 2 CONFIRMED on rows and REFUTED on values (Q50, Q46), 0 refuted
+      outright.** §13.3's projected **21** goopg-only defects measure **40**:
+      ERROR 2 (Q8 Q75, as projected) + TIMEOUT **17** (projected 16 — Q18
+      joined; splits **15 unbounded-above** / **2 budget-marginal** Q18+Q35,
+      whose verdict flips carry NO signal) + wrong-row-count 3 (Q47 Q49 Q51, as
+      projected) + **wrong ANSWER behind a matching row count 18 — a class
+      §13.3 could not see**, because the protocol it was written under
+      classified a cell by status and row count only. Two notable confirms:
+      **Q72**'s projection was SF0.5-derived and had a *contrary* SF=1
+      measurement in set A (`OK 14 s`) — the projection won (`TIMEOUT 635 s`),
+      a genuine ≥45× regression; **Q47** confirmed on rows but carries an
+      unprojected 8.4× slowdown (17 s → 142 s, reproduces at 143 s standalone,
+      query-specific, unattributed by design). **40 is a LOWER BOUND** — D6a's
+      value comparison is only possible on `OK`/`OK` equal-row cells, so the 17
+      timeouts, 2 errors and 3 row-mismatch cells have never been
+      value-compared at any scale. **Consequences for M0125:** its baseline is
+      this table, not §13.3; the largest class is now wrong answers (18), not
+      timeouts (17); **M0125-0009 first** (10 queries, one-line cause, Q97 is
+      the impossible-by-construction instance), **M0125-0010** second (4
+      queries, independent — neither subsumes the other); never score a Q18/Q35
+      verdict flip or a Q50/Q46 row-count match as a win. **M0124-0005 is now
+      justified by measurement**: 18 of 99 SF=1 queries pass a row-count-only
+      gate while answering wrongly. Original scope below.
+      One sweep,
+      both engines, uniform 600 s via `scripts/tpcds-bench-compare.sh`
+      (`ENGINES="goopg pg"`). Endpoints differ per arm: goopg `-U postgres -d
+      postgres` on 65436, PG `-U ryo -d tpcds` on 65438. Records the goopg commit
+      (it becomes M0125's baseline), proves S-cold first (`reltuples` +
+      `pg_stats` = 0), keeps `RESTART_AFTER_TIMEOUT=1`, and **ports
+      `reap_pg_orphans` from `scripts/tpcds-sf05-regression.sh` — the SF=1
+      harness has no orphan reap**, so a PG-side timeout leaves a backend running
+      and contaminates later timings. **Budget-invariance rule:** a cell may be
+      compared only to a prior sweep at the SAME budget. Note §1.4's reproduction
+      environment is stale (it names the pre-reorg TPC-H ports). Reports
+      confirm/refute for the 13 named §13.3 projections at SF=1 values only
+      (Q88 is **TIMEOUT 660 s** at SF=1 — not the SF0.5 228 s figure). Plan
+      8–10 h. Deliverable `analysis/tpcds-sf1-goopg-<date>.md`. Design
+      `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`.
+      **Chunked execution (added 2026-07-28(b)) — how an 8–10 h sweep fits a
+      headless loop whose Bash ceiling is 60 min.** The design doc's "one sweep,
+      one budget, one commit" rule is unchanged; only the wall clock is split.
+      - `scripts/tpcds-bench-compare.sh` takes a query list or range (`5-14`,
+        `8,39,47`), so **a chunk is a query range**. Per-query artifacts land in
+        `${TPCDS_RESULTS_DIR}/<engine>_q<N>_{result,explain}.txt` and accumulate
+        across chunks by themselves.
+      - **Chunk size 8**, run in the FOREGROUND with an explicit Bash `timeout`
+        parameter of 55 min, stdout redirected to
+        `analysis/tpcds-sf1-resweep-<date>/chunk-<lo>-<hi>.txt`. Eight queries of
+        which two time out on both engines is ~45 min; shrink the next chunk if one
+        overruns. Never `run_in_background` across a turn boundary (PROMPT.md
+        "Headless Execution Reality").
+      - **Carry the cursor in `.ralph/working_set.md`** — e.g. `M0124-0001 sweep:
+        1-8, 9-16 done; next 17-24`. That baton is what makes a multi-loop task
+        resumable; without it the next loop re-runs chunk 1.
+      - **Sweep-integrity invariant:** the script prints `# goopg: <git log -1>` in
+        every chunk header, so **all chunk headers must name the same SHA**. That is
+        the machine-checkable form of "a code change landing mid-sweep voids the
+        sweep" — and the concrete reason M-NIGHTLY engine fixes stay parked until
+        the sweep completes. If a header disagrees, RE-RUN the affected chunks; do
+        not reconcile them narratively.
+      - Keep `ENGINES="goopg pg"`, `TIMEOUT_SEC=600`, `RESTART_AFTER_TIMEOUT=1`. A
+        chunk boundary is equivalent to the restart the script already performs
+        after every goopg TIMEOUT, so chunking does NOT violate the GC-regime rule
+        in D3 of the design doc — a fresh server per chunk is more uniform, not
+        less.
+      - Once per sweep (not per chunk): the S-cold proof (`reltuples` + `pg_stats`
+        = 0), the `reap_pg_orphans` port from `scripts/tpcds-sf05-regression.sh`,
+        and the final merge into `analysis/tpcds-sf1-goopg-<date>.md` reporting
+        confirm/refute for the 13 §13.3 projections.
+      - **PROGRESS 2026-07-28 (loop #1 of the chunked sweep).** Once-per-sweep
+        prerequisites are DONE and committed: `reap_pg_orphans` ported (design
+        doc D4, verified against 65438 — 0 victims, exit 0) and the S-cold proof
+        captured at `analysis/tpcds-sf1-resweep-20260728/s-cold-proof.txt`
+        (8 relations `reltuples=0 relpages=0`, `pg_stats`=0, `store_sales`=2 880 404).
+        Two corrections landed with them: (a) D5's original predicate
+        `relnamespace='public'::regnamespace` returns `(0 rows)` on goopg, so the
+        S-cold proof was VACUOUS — now `relname IN (...)`; ledger row 2026-07-28
+        carries the missing `regnamespacein`; (b) **the same-SHA invariant is
+        replaced by same-`engine-tree` + same-`engine-binary`** (doc D4a) —
+        `git log -1` both changes on a docs commit and fails to change when
+        `server.sh start` rebuilds the engine from an uncommitted worktree at a
+        `RESTART_AFTER_TIMEOUT` bounce. The header now prints
+        `engine-tree:`/`engine-binary: running=… on-disk=…` (running = sha256 of
+        `/proc/<postmaster>/exe`; the serving image was 16 h stale at loop start)
+        and `restart_goopg` prints `*** SWEEP VOID … ***` on a mid-sweep change.
+        Sweep baseline: `engine-id bba744a8… c47d4ed6… diff=e3b0c44298fc`,
+        `TIMEOUT_SEC=600`, `ENGINES="goopg pg"`. Every later chunk must reprint
+        that `engine-id` unchanged.
+      - **Chunks 1–8 DONE** (`analysis/tpcds-sf1-resweep-20260728/`:
+        `chunk-1-4.txt`, `chunk-5-8.txt`, running table `RESULTS.md`).
+        All eight cells reproduce set A at the same 600 s budget — Q1 246 s/100,
+        Q2 27 s/2513, Q3 15 s/31, Q4 TIMEOUT on **both** engines, Q5 goopg-only
+        TIMEOUT, Q6 57 s/44 (PG 140 s), Q7 64 s/100, Q8 ERROR `column ref
+        ca_zip/57 out of MaterializedSlot range 1` with the server surviving
+        (confirms the §13.3 "contained, not fixed" projection). The reap earned
+        its keep on the first PG timeout: Q4 left one backend running and it was
+        terminated. ~~**NEXT: chunk `9-16`.**~~ done, see below.
+      - **Chunks 9–16 DONE** (loop #2; `chunk-9-12.txt`, `chunk-13-16.txt`).
+        All eight cells reproduce set A again — Q9 143 s/1, Q10 goopg-only
+        TIMEOUT, Q11 79 s/95 with **PG timing out** (goopg wins this one),
+        Q12 6 s/100, Q13 57 s/1, Q14 goopg-only TIMEOUT (PG 37 s/200 — the
+        summed two-block count from harness fix 2), Q15 17 s/100, Q16 48 s/1.
+        Largest elapsed delta vs set A is 25 s and lands on the 600 s-budget
+        timeouts, i.e. teardown rather than query time. The range was split into
+        two harness calls (`9-12`, `13-16`) to stay inside the loop's foreground
+        Bash budget — both reprint the baseline `engine-id` unchanged, so under
+        D4a they are one continuous sweep, not two. The reap fired again on PG's
+        Q11 timeout. Running D6 classification for Q1–Q16: both-engine timeout
+        Q4; goopg-only Q5/Q10/Q14; PG-only Q11; goopg ERROR Q8.
+        ~~**NEXT: chunk `17-24`.**~~ done, see below.
+      - **Chunks 17–24 DONE** (loop #3; `chunk-17-24.txt`, one harness call —
+        no timeout in set A for this range). Seven of eight cells reproduce set A
+        within 6 s: Q17 53 s/1, Q19 64 s/100, Q20 14 s/100, Q21 50 s/100,
+        Q22 156 s/100, Q23 210 s/1, Q24 75 s/0 (both engines empty).
+        **Q18 flipped as predicted:** set A `OK 626 s / 100`, this sweep
+        `TIMEOUT 627 s / 0`. One second apart, so the query did the same work and
+        only landed on the other side of the 600 s cut (cell elapsed includes the
+        ≤30 s EXPLAIN capture, which is outside the timeout-guarded query — that
+        is how a cell can read `OK` above the budget). Recorded as **budget
+        noise, not a regression**, and not re-run.
+        **D6 needs a sub-class because of it, and this is load-bearing for
+        M0125:** Q18 is *budget-marginal* (true runtime known to sit within ~1 %
+        of the budget), whereas Q5/Q10/Q14 were cut with their true runtime
+        *unbounded above* — no run has ever seen them finish. Movement on Q18 at
+        a 600 s budget is a re-rolled coin and must not be reported as a
+        fix or a regression; movement on Q5/Q10/Q14 is real signal. To make Q18
+        informative, classify it by measured runtime or give it a larger budget.
+        Running D6 classification for Q1–Q24: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14; goopg-only **budget-marginal Q18**; PG-only Q11;
+        goopg ERROR Q8. No reap this range (no PG timeout); the post-Q18 restart
+        again moved the binary image (`01bb0f65…` → `22110d95…`) with `engine-id`
+        unmoved — the documented `vcs.revision` stamp effect, not a source change.
+      - **Chunk 4 (Q25–Q32) DONE** (2026-07-28, split into `chunk-25-28.txt` +
+        `chunk-29-32.txt` because set A shows two goopg timeouts in the range;
+        both calls reprint the sweep-baseline `engine-id`, so D4a holds and this
+        is still ONE sweep). All eight cells reproduce set A — largest delta 5 s
+        (Q27 239 → 234 s). **Q30 and Q31 are the cleanest D6 goopg-only members
+        yet:** PG answers both cheaply and exactly (13 s/63 rows, 12 s/43 rows),
+        goopg has never completed either in any run of either sweep, and all four
+        observations (649/647 s set A, 627/629 s here) are the harness cutting a
+        still-running execution — **unbounded above**, like Q5/Q10/Q14, NOT
+        budget-marginal like Q18. They are therefore valid M0125 targets whose
+        movement would be real signal, and they carry a PG row count to validate
+        against. Running D6 classification for Q1–Q32: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14/**Q30**/**Q31**; goopg-only budget-marginal Q18;
+        PG-only Q11; goopg ERROR Q8. No reap this range (no PG timeout); both
+        restarts reported the same post-restart image (`46632999aa3f5c75`) —
+        the stamp moves with the build commit, not per restart.
+      - Chunk 5 (`chunk-33-40.txt`, Q33–Q40, no split needed) reproduces set A on
+        all eight cells; largest delta 5 s (Q37 311 → 316 s) and every completed
+        cell matches PG's row count, incl. Q39's 236 [230+6]. **Q35 is the second
+        budget-marginal member (with Q18), NOT unbounded:** both sweeps cut it at
+        the budget (651 s set A, 628 s here) but the 2026-07-26 baseline
+        *completed* it at `OK 525 s`, so a later `OK` is a re-rolled coin, not a
+        fix — M0125 must not score a Q35 flip as a win (it does carry a PG row
+        count, 100, so a real fix is still validatable on rows). **Q36 is not a
+        goopg defect**: dsqgen emits malformed text that PG rejects too, hence
+        `PG_SKIP="36 70 86"`. Running D6 for Q1–Q40: both-engine Q4; goopg-only
+        unbounded Q5/Q10/Q14/Q30/Q31; goopg-only budget-marginal Q18/**Q35**;
+        PG-only Q11; goopg ERROR Q8; not-a-goopg-error Q36. The single restart
+        (after Q35) moved the image `46632999aa3f5c75` → `9a6a5c070ad7364d` with
+        `engine-id` unmoved — third live confirmation that the docs-only chunk-4
+        commit re-stamps `vcs.revision` without touching the engine.
+        **NEXT: chunk `41-48`.** Set A shows NO timeout in that range (slowest
+        Q44 58 s), so one call, est. ~5 min. Predict the known **RC-1b row gap at
+        Q47** (goopg 0 rows vs PG 100) — a correctness delta, not a timing one,
+        and already-known, so it must not be filed as a new finding.
+      - **Chunks 41–64 DONE** (loops #6–#8; `chunk-41-48.txt`, `chunk-49-56.txt`,
+        `chunk-57-64.txt`, one harness call each, all reprinting the sweep-baseline
+        `engine-id`). Per-cell detail lives in `RESULTS.md` (authoritative); the
+        two conclusions that outlive the chunks: (1) the **runtime-deviation
+        class opened at Q47 (8.4×) is CLOSED and empty** — chunk 49–56's decisive
+        cell was **Q50, whose row gap closed 0 → 6 = PG**, proving the RC-1b fix
+        `5db0a067` landed and changed plans in that family, so Q47's 17 s → 142 s
+        is the cost of newly-*correct* input, not a regression. The chunk-41–48
+        rule "rows didn't move ⇒ not a newly-correct plan" was **wrong** and must
+        not be reused; Q47's surviving 0-vs-100 is a separate downstream defect.
+        (2) Chunk 57–64 is the **first fully uneventful chunk**: all seven OK
+        cells match PG's rows exactly and reproduce set A within ±3 s. Q58's 0
+        rows is **not** a gap — PG returns 0 too. Running D6 for Q1–Q64:
+        both-engine Q4; goopg-only unbounded Q5/Q10/Q14/Q30/Q31/Q54/**Q64**;
+        goopg-only budget-marginal Q18/Q35/**Q51** (Q51 did not flip, 587 s, 13 s
+        headroom); PG-only Q11; goopg ERROR Q8; not-a-goopg-error Q36. Row
+        mismatches among OK queries Q1–Q64: Q47, Q49, Q51.
+      - **Chunk 65–72 DONE** (loop #9; `chunk-65-72.txt`, one harness call, ~45 min,
+        sweep-baseline `engine-id` reprinted). Q65/Q67/Q69/Q71 reproduce set A's
+        goopg-only TIMEOUTs; Q66 (5) and Q68 (100) match PG within ±3 s of set A;
+        Q70 is the known dsqgen ERROR with the PG arm skipped by design. The
+        finding is **Q72 — the first cell in the re-sweep where a set-A `OK`
+        becomes a `TIMEOUT`** (`OK 14 s / 0` → `TIMEOUT 635 s`, re-probed on a
+        fresh server at 636 s, `probe-q72-reprobe.txt`). Server age is ruled out
+        twice: the re-probe followed the harness restart, and Q66/Q68 reproduce
+        set A at the same server age in this chunk. Evidence-consistent reading
+        (**hypothesis, not established** — no plan diff was run): this is the
+        RC-1b fix `5db0a067`, which set A §2.1 predicted would touch Q72, and
+        which has now produced three family outcomes — **Q50 fixed 0 → 6 = PG,
+        Q47 17 → 142 s still wrong, Q72 past the budget**. Q72's plan bottoms out
+        in a 4-table MHJ (`warehouse`/`item`/`inventory`/`catalog_sales`) with
+        **no `Filter` on that node**. Consequence: set A's Q72 row gap (0 vs 100)
+        is **no longer observable**, so Q72 joins Q64 in the "unbounded AND
+        unvalidatable" bucket — reaching it by regressing out of OK rather than
+        by always having been a timeout. Any M0125 fix for Q72 must be validated
+        on ROWS, not merely on completion.
+        **NEXT: chunk `73-80`.** Check set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 7[3-9]|^| 80 `) for the timeout count in range FIRST and
+        size the Bash `timeout` accordingly. In this range **Q74 is a PG-side
+        TIMEOUT** (652 s; goopg OK 36 s) — the only PG arm that times out here, so
+        `reap_pg_orphans` will fire; budget for it and do not read it as a goopg
+        result. Q78 and Q81 are goopg-only timeouts in/near the range.
+      - **Chunk 73–80 DONE** (loop #10; `chunk-73-80.txt`, one harness call,
+        ~35 min, exit 0, sweep-baseline `engine-id` reprinted unchanged).
+        Q73/Q76/Q77/Q79/Q80 match PG on rows within ±5 s of set A; **Q78**
+        reproduces its set-A goopg-only TIMEOUT (637 s) and **Q74** reproduces its
+        **PG-side** TIMEOUT (638 s) while goopg answers in 34 s with PG's rows —
+        the sweep's second PG-only timeout after Q11, and the first `reap_pg_orphans`
+        fire in this range (1 backend terminated). The finding is **Q75 — the first
+        set-A `OK` to become an `ERROR`** (`OK 47 s / 100` → `ERROR 66 s`,
+        `ERROR: division by zero` at `query75.sql:67`); the server survives (Q76 ran
+        next), the Q8 contained-error shape. This is the **predicted** outcome, and
+        that is its value: ledger `tpcds-round2 Q75-eval-order` (2026-07-27) already
+        had it deterministic 3/3 at SF0.5 and **M0125-0004** already carries the
+        diagnosis, so this chunk promotes §13.3's *projection* to a *measurement* at
+        SF=1 under the sweep baseline. It also completes RC-1b `5db0a067`'s **fourth**
+        family outcome: **Q50 fixed 0 → 6 = PG, Q47 17 → 142 s still wrong, Q72 past
+        the budget, Q75 into a contained error** — one mechanism (input stopped being
+        silently zeroed), three cells that read as regressions on the verdict column
+        while being strict improvements in input correctness. **Do not read set A's
+        Q75 `100` as a pass**: the ledger proves the pre-fix CTE computed 1,057,469
+        vs PG's 2,368,670, i.e. 100 garbage rows whose *count* matched under
+        `LIMIT 100` — HEAD's loud ERROR is more honest, and this cell is the concrete
+        justification for **M0124-0005**'s value checksum. Nightly `Q75,100,pinned`
+        (`ci/batch/tpcds-row-anchors.csv:46`) is therefore a live break with no
+        `expected-failures.csv` entry, but the TPC-DS row-anchor gate is **not** one
+        of the banner's four carve-out gates, so it stays filed and unchecked under
+        M0125-0004. Also repaired a chunk-9 bookkeeping gap: `RESULTS.md`'s Results
+        table stopped at Q64 (the 65–72 prose landed without its rows); rows 65–72
+        are backfilled from `chunk-65-72.txt`, no figure changed. Running D6 for
+        Q1–Q80: both-engine Q4; goopg-only unbounded
+        Q5/Q10/Q14/Q30/Q31/Q54/Q64/Q65/Q67/Q69/Q71/Q72/**Q78**; goopg-only
+        budget-marginal Q18/Q35/Q51; PG-only Q11/**Q74**; goopg ERROR Q8/**Q75**;
+        not-a-goopg-error Q36/Q70. Row mismatches among OK queries Q1–Q80: still
+        Q47, Q49, Q51.
+      - **Chunk 11 (Q81–Q88) DONE** (`chunk-81-88.txt`, ~40 min, exit 0, baseline
+        `engine-id` reprinted unchanged). All eight cells reproduce set A in class
+        and row count — by the harness's row-count measure, an uneventful chunk.
+        It was not. Acting on chunk 10's Q75 lesson (a matching row count can hide
+        a corrupt answer), this loop **diffed result VALUES against PG for every OK
+        cell** — the sweep's first value-level comparison — and caught **Q87: 1 row
+        on both engines, goopg `47218` vs PG `47049`**. Root-caused fully by
+        read-only probe: the three input branches match PG exactly, `A except B`
+        alone matches, but goopg's three-way result EXCEEDS its own two-way result
+        (impossible for a left-associative set difference) and equals PG's answer
+        for the right-associated reading. Trigger is **per-branch parenthesisation**:
+        bare `A except B except C` is correct, `(A) except (B) except (C)` is not,
+        nor is `except all`, nor the mixed chain `(A) union (B) except (C)`;
+        UNION/INTERSECT-only chains are unaffected only because they are associative.
+        Mechanism: `parseParenthesisedSelectStmt` sets `Parenthesized = true`
+        (`internal/parser/select.go:1005`) *before* absorbing a trailing set-op
+        written outside those parens (`select.go:1007-1039`), so the planner's
+        left-associative flattening loop breaks early at
+        `internal/planner/planner.go:696-698`. **Filed as M0125-0006 with a ledger
+        row; NOT fixed — the sweep forbids any engine commit before Q99.** Two
+        answer-neutral PG-compat gaps from the same diff: **Q83** numeric-division
+        result scale (`0.0` vs PG `0.00000000000000000000`, i.e. no `select_div_scale`)
+        and **Q82** a 1-char column-width delta consistent with a trimmed trailing
+        space. New D6 note: **Q82 is budget-marginal** — it passed at 556 s with only
+        44 s of headroom, the narrowest OK margin of the sweep. Running D6 for
+        Q1–Q88: both-engine Q4; goopg-only unbounded
+        Q5/Q10/Q14/Q30/Q31/Q54/Q64/Q65/Q67/Q69/Q71/Q72/Q78/**Q81**/**Q88**;
+        budget-marginal Q18/Q35/Q51/**Q82**; PG-only Q11/Q74; goopg ERROR Q8/Q75;
+        not-a-goopg-error Q36/Q70/**Q86**. Answer mismatches among OK queries
+        Q1–Q88: Q47, Q49, Q51 by row count **plus Q87 by value at a matching count**.
+        **NEXT: chunk `89-96`.** Read set A (`analysis/tpcds-sf1-goopg-20260727.md`
+        §5.2, rows `^| 9[0-6] ` and `^| 89 `) for the timeout count in range FIRST and
+        size the Bash `timeout` accordingly — count **both** engines' columns (col 1 =
+        goopg, col 2 = PG; loop #10's baton undercounted 73–80 by reading only the
+        goopg side). **Value-diff every OK cell** against PG (`diff` the
+        `{goopg,pg}_q<N>_result.txt` pairs in
+        `bench/tpcds/runtime_goopg/tpcds-results/`, normalising whitespace to
+        separate psql rendering from real divergence) — this is now part of the
+        per-chunk procedure, not an M0124-0005 deliverable alone.
+      - **Chunk 12 (Q89–Q96) DONE** (`chunk-89-96.txt`, ~4 min, exit 0, baseline
+        `engine-id` reprinted unchanged). All eight cells are `OK` on both engines
+        and every row count reproduces set A — **no** new timeout/error/skip, so
+        every D6 list is unchanged from Q1–Q88. By value the chunk is the sweep's
+        worst: **Q94 and Q95 both return `0 / NULL / NULL`** against PG's
+        `9 / 18130.71 / -9444.12` and `57 / 85887.62 / -27169.36`, at a matching
+        row count of 1. Three defects root-caused this loop by read-only probe:
+        (1) **unpadded date literals** — PG accepts `'2002-5-01'`, goopg's
+        fixed-layout `time.Parse("2006-01-02", …)` does not; the cast path ERRORs
+        but the *comparison* path silently matches 0 rows, turning a compat gap
+        into a wrong answer (affects Q16/Q94/Q95) → **M0125-0007**;
+        (2) **SEMI + ANTI conjunction is not a subset** — with dates padded, Q94's
+        `EXISTS` alone and `NOT EXISTS` alone each match PG exactly (33/25 and
+        11/9), but together goopg returns 25/18 where PG returns 11/9; a conjunct
+        that *grows* the result is a hard correctness violation (the Semi/Anti
+        residual ↔ source-table pair of hard-won rule #2) → **M0125-0008**;
+        (3) **sibling `sum(CASE …)` aggregates collapse onto the first slot** —
+        `parserExprKey`'s fallback returns `fmt.Sprintf("expr:%T", e)`
+        (`internal/planner/planner.go:7484`), the Go type name with no content, so
+        every `*parser.CaseExpr` hashes identically and the 2nd..Nth pivot
+        aggregate is dropped as a duplicate at `planner.go:5844-5846`; **17 expr
+        types** share that fallback and the same key feeds GROUP BY matching. This
+        is the **third** recurrence of the failure mode already documented at
+        `planner.go:6905-6909` (`count(*)` vs `count(*) FILTER`, M0097-0032)
+        → **M0125-0009**. None fixed — the sweep forbids any engine commit before
+        Q99. **Back-applied the value diff to the whole sweep** (chunks 1–10 were
+        row-count-only): **Q16 was already wrong in chunk 2** — recorded `OK / 1`
+        while returning `0` vs PG's `45`. Restricted to cells fresh this sweep,
+        `OK` on both engines and equal in row count, **21 diverge by value** —
+        Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
+        Q94 Q95 — none ordering-only; Q7/Q26/Q83 are the answer-neutral
+        numeric-scale gap. Full per-query attribution filed as **M0124-0006**.
+      - **PROGRESS 2026-07-28 (chunk 13 of 13 — Q97–Q99, the FINAL chunk).**
+        `scripts/tpcds-bench-compare.sh 97-99` dual-engine, foreground, ~2 min,
+        exit 0; header reprinted the sweep baseline `engine-id bba744a8…
+        c47d4ed6… diff=e3b0c442` unchanged, so all 99 queries sit in ONE sweep at
+        ONE budget. All 3 cells `OK` on both engines, row counts reproduce set A
+        (1 / 2531 / 90), timings within noise, and **no** new timeout/error/skip
+        → every D6 list CLOSES unchanged from Q1–Q96. The value diff (mandatory:
+        the on-disk `q97..q99` files were STALE set-A artifacts excluded from the
+        chunk-12 re-audit) makes **2 of the 3 final cells wrong answers behind a
+        matching row count**: **Q97** (`392155|392155|392155` vs PG
+        `541140|286927|161`) and **Q99** (cols 2–5 replicate col 1) are the
+        **4th and 5th instances of M0125-0009** — no new defect; Q97 is its most
+        legible instance anywhere in the sweep, since its three columns are
+        disjoint by construction (a customer cannot be store-only, catalog-only,
+        and both), so equal values are not merely wrong but impossible.
+        **Q98's values are CORRECT** — its 5068-line raw diff is two known
+        answer-neutral rendering gaps: (a) `char(n)` not blank-padded (probed:
+        `octet_length(sm_type)` = 30 on PG vs **7** on goopg, both
+        `character(30)`; `length()` agrees only because PG's `bpcharlen` ignores
+        trailing blanks, so it is NOT evidence of correctness) — already in the
+        ledger at row 2026-07-06 (M0122-0005), which now gains its first TPC-DS
+        consequence but needs no new filing; and (b) the numeric-scale gap, newly
+        narrowed — goopg's division rscale is right in general and short-circuits
+        **only on exactly-zero results** (`0::decimal(15,2)*100/2531.00` → goopg
+        `0.00` vs PG `0.00000000000000000000`, while the non-zero quotient is
+        byte-identical). One false alarm ruled out: Q99's `31-INTERVAL '60 days'`
+        headers appear identically in PG's output — they are in `query99.sql:7`
+        itself (TPC-DS generator substitution), not a goopg aliasing bug.
+        **THE SWEEP IS COMPLETE (99/99, 13/13 chunks).** The 21-cell
+        value-divergence list becomes **23** (`+Q97 +Q99`; Q98 explicitly not a
+        member). **NEXT: the merged deliverable
+        `analysis/tpcds-sf1-goopg-20260728.md`** (confirm/refute the 13 §13.3
+        projections at SF=1 values), with **M0124-0006** due before/with it. The
+        engine-commit freeze LIFTS once the deliverable lands; **M0125-0009 is
+        the recommended first fix** (one-line root cause, 5 queries of evidence).
+      - One more guard correction landed after chunk 1 (doc D4a): the
+        comparability key is `engine-id` (committed engine trees + digest of
+        uncommitted engine edits), NOT the binary sha — `go build` stamps
+        `vcs.revision`/`vcs.modified`, so the docs commit alone moved the image
+        and the first-cut guard printed a false `*** SWEEP VOID ***` in
+        `chunk-1-4.txt`. That chunk stands; `RESULTS.md` carries the proof.
+- [x] **M0124-0002 — retroactive TPC-H + plan-baseline discharge for `9740fce9`**
+      (§13.5 #5). **DONE 2026-07-29 — DISCHARGED, no regression attributable to
+      `9740fce9`.** Report `analysis/tpch-tpcds-round2-retro-20260729.md`; raw
+      output + the two harness scripts under `analysis/m0124-0002/`. Both arms
+      built from HEAD `40ad746a` (arm A = the `bushy.go` hunks reverse-applied in
+      worktree `tmp/wt-armA`, −95/+1; `internal/executor/expr.go` verified
+      byte-identical between arms so the Q8 crash could not confound it).
+      **`make plan-diff LABEL=tpcds-round2-base MODE=structural` = 22/22 MATCH** —
+      `9740fce9` changes which conjuncts are remapped, not which plan is chosen,
+      on every TPC-H query, which also makes the timing table like-for-like.
+      22/22 queries completed on both arms with identical row counts; 12/12
+      anchors (`spotcheck_expected.env` + `ci/batch/tpch-row-anchors.csv`) exact
+      on both. Stream 912 s (A) vs 885 s (B). Two queries crossed the >10 %
+      investigate band — Q9 −13.6 %, Q22 +14.3 % — and round 2 re-read both:
+      **intra-arm spread beat the inter-arm gap in each case** (Q9 arm A alone
+      202.5 → 166.3 s = 22 %; Q22 first-vs-later read inside one server = 22 %),
+      so both are stream-position / page-cache artifacts. Nothing near the 25 %
+      blocking band; §D5 never triggered. **`plan_snapshots/tpcds-round2-head.txt`
+      is committed and is the live baseline** (captured LAST — `plan-gate` picks
+      the newest by mtime and has no label parameter), with
+      `tpcds-round2-base.txt` alongside as the arm-A reference. **This unblocks
+      M0125-0002 / -0004 / -0005 and M0125-0003 stage 2.** §5 of the report
+      retro-files §8 step 7's missing artifact for phase 2.1 (RC-1b), transcribed
+      from `5db0a067` + its ledger row, not re-measured. **One deviation, ledger
+      row 2026-07-29:** §D1's A/B/A/B was reduced to a full round 1 plus a
+      two-query round 2, so a *uniform* drift would be invisible to it; resume
+      recipe in the row. Original scope follows. Phases 1.2/1.3 landed while
+      `tpch-spotcheck.sh` reported SKIPPED
+      and `make plan-gate` was never run (§13.4 item 4); `ef4a65a5` rebuilt the
+      cluster, so it is runnable. **Both arms build from HEAD** — arm A = HEAD
+      with `9740fce9`'s `bushy.go` hunks locally reverted (its executor bounds
+      check STAYS, or the Q8 crash returns and confounds the arm), arm B = HEAD —
+      run A/B/A/B alternating. A literal checkout of `9740fce9` is wrong: it
+      predates the cluster rebuild, and `b3493a6e`..HEAD spans four `internal/`
+      commits including `095e3ab5`'s new fsync GUC, a confound in a timed A/B.
+      S-cold by necessity (`ANALYZE <table>` in db `tpch` errors — ledger
+      `bench-reorg ANALYZE-scope`), `GOGC=100` + `GOMEMLIMIT=12GiB` (Q21 OOMs at
+      18 GiB). Use the Makefile defaults `PLAN_DB=tpch PLAN_USER=tpch`; the
+      `postgres@postgres` advice is stale folklore and would capture an empty
+      database. `plan-diff` **requires `LABEL=`** and diffs live-vs-stored;
+      `plan-gate` picks the newest snapshot by **mtime**, so capture-then-gate on
+      one arm is green by construction. Capture and **commit**
+      `plan_snapshots/tpcds-round2-head.txt` **last**. Also retro-files §8 step
+      7's missing `analysis/` artifact for phase 2.1. Noise band: >8 % explained,
+      >25 % blocks (round-5 §3 calls 2–8 % moves unattributable). Design
+      `docs/design/0124-0002-retroactive-tpch-plan-gate-discharge.md`.
+- [x] **M0124-0003 — append the seven missing §10 deferral-ledger rows** (§13.5
+      #6). **DONE 2026-07-29.** 13 rows appended to `.ralph/deferral_ledger.md`
+      (516 → 529 lines): D2's seven §10 rows, D3's drop row, D5's five
+      audit-produced rows — plus D4's `UPDATE` on the existing `pq-P10` row
+      naming **M0125-0003** as the consumer of its option (b) and recording that
+      option (a), actually persisting `reltuples`/`relpages`, stays deferred and
+      unowned. No eighth `reltuples` row. The moot `aggregateOp work_mem` row is
+      `status = resolved` with the drop in its task-id, so **no new status value
+      was invented** and M0119's queue gains no phantom work. D6 render check via
+      `gh api --method POST /markdown`: one table, 14 body rows, 7 cells each.
+      **Every claim was re-resolved against HEAD before it was written, and six
+      cites had drifted** — `open.go:2911`→`:2924`; §3.5's push/remap pair
+      `planner.go:1020`→`:1012` vs `:1024`, with the compensating
+      `pushSingleSourceFiltersAfterRemap` at `:1037`; the reorder's resume point
+      is a *call-order* change in `planner.go`, not `mhj_input_rewrite.go`;
+      grouping-sets `:3176`→`:650`; the MHJ gate's two conditions at
+      `local_filters.go:171`/`:175`; `*SetOp` at `parallel.go:313`. Verification
+      strengthened three rows: **ANALYZE cannot reach either `Invalidate()` call
+      site by any path** (it plans to `*planner.Utility`, both sites are
+      `*planner.DDL`-guarded) and `planCacheIsCacheable`'s comment names a class
+      its switch omits; **`walkColumnRefsImpl`'s missing `default:` is fail-open
+      in the dangerous direction** — no callback means no `onOuter()` veto, so a
+      conjunct wrapping an outer ref reads single-side and can be pushed below an
+      outer join, which makes **M0125-0002 nine walkers, not seven**; and the
+      value-blindness row covers `ci/batch/tpch-row-anchors.csv` as well as the
+      TPC-DS anchors. Follow-up observed, deliberately not fixed (Non-goals):
+      nine pre-existing rows carry unescaped `|` inside code spans and already
+      render with 8–21 cells — a second instance of the ledger rendering hazard,
+      same `\|` discipline. Design doc now `accepted` with an execution record.
+      Original scope follows. §13.2: the seven `tpcds-round2` rows that exist are
+      the rows the WORK produced, not the rows §10 planned. Append: parse-time IN-list
+      `select_common_type` (§5.4); the `rewriteScanInputsWithSingleTablePredicates`
+      reorder (§3.5); the `shouldAttachBeforeMHJ` `SmallDimension` gate (RC-5);
+      shared-scan GROUPING SETS (RC-7); EXISTS-under-OR / hashed-SubPlan caching
+      (RC-8, **now including Q35**); parallelising `SetOp` (RC-9); `plancache`
+      invalidation on ANALYZE (also a measurement-protocol blocker — it is why
+      §8's S-warm is single-shot per process). Record an explicit **drop**
+      disposition for the moot `aggregateOp work_mem` row (its §6 precondition
+      never fired — Q39 was a `Quo(0,0)` panic, MemoryPeak 13.2 G under a 24 G cap,
+      no `oom_kill`) rather than appending it as open, since M0119 treats the
+      ledger as a work queue. Plus a `pq-P10` UPDATE naming M0125-0003 as consumer,
+      and five rows the audit produced: CI row-anchor value-blindness; the two
+      out-of-scope `default:`-less walkers (`walkColumnRefsImpl` `pushdown.go:362`
+      and the `shiftColumnRefs` closure); `GOOPG_POSMAP_ASSERT`; phase 0.2's
+      unfinished panic→`XX000` half (`server.go:780` is still the only
+      `recover()`); and Q47/Q49/Q51 as three distinct defects. Row shape is the
+      ledger's own 7-column header, not fix_plan.md's stale 6-column text.
+      Entity-escape any literal `<table>`/`<col>`; verify via
+      `gh api --method POST /markdown`. Design
+      `docs/design/0124-0003-round2-deferral-ledger-completion.md`.
+- [x] **M0124-0004 — recover or classify Q35's row count** (§13.5 #7).
+      **CLOSED 2026-07-30 on the CLASSIFY branch** (the item's own disposition —
+      "recover **or** classify"). Quiet host, HEAD `bd8c484d`: the designed solo
+      SF0.5 sweep (`TIMEOUT_SEC=1800`, fresh server) = `TIMEOUT` 1964 s, the
+      escalation to a **plain** SF=1 run = `rc=124` at 1974 s. Both readings are
+      **valid** and supersede the void 2026-07-29 pair. The SF=1 `EXPLAIN` at HEAD
+      is **byte-identical** to the 05:36 capture, so neither `beb7af82` nor
+      `c26c6fc3` (M0125-0003 stage 1) flipped Q35's shape — stage 1 is
+      shape-neutral here, as designed. **The 525 s history is refuted, not merely
+      unreproduced:** outer cardinality
+      (`customer ⋈ customer_address ⋈ customer_demographics`) = **96,562** and one
+      buffer-**warm** `EXISTS` #1 evaluation floors at **8.16 s** (×4, ±0.5 %), so
+      the AND-ed conjunct **alone** floors at **≈9.1 days** at SF=1 (≈4.6 days at
+      SF0.5). A plan whose cheapest conjunct costs nine days did not return 100
+      rows in 525 s; `651 s`/`628 s` are kill lines, not runtimes. Verdict:
+      **performance-only, RC-8 shape — not a wrong answer hiding behind a
+      timeout.** The SF0.5-slower-than-SF=1 anomaly **dissolves** (the sampler
+      halves facts by key parity but copies dimensions whole, so the outer
+      cardinality is unchanged and both scale factors are kill lines whose
+      ordering carries no information). **RC-8's "measure first" is discharged for
+      Q35** without a completing `EXPLAIN ANALYZE`: `Calls` = 96,562, per-call
+      cost = 8.16 s. **The row count stays unrecovered and is NOT recoverable by a
+      bigger budget** (900 s → 1800 s → 3600 s all sit ~3 orders of magnitude
+      below the floor) — it is gated on **M0125-0003** decorrelating the RC-8
+      shape, and **Q35 is that item's natural acceptance query** (first
+      terminating run vs the git-tracked oracle `35|OK|100|0`). Ledger row
+      2026-07-30; artefacts `analysis/tpcds-q35-m0124-0004/`; design doc
+      §"Execution record (2026-07-30)". **M0124 is now fully closed.**
+      Original specification follows. Q35 is the
+      only query that has never produced a goopg row count. Its 2026-07-26 count
+      was lost to the **PATH-loss** harness defect, NOT `tail -1` — `query35.sql`
+      is a single statement and the multi-statement set is Q14/Q23/Q24/Q39. Two
+      further corrections: the SF0.5 "201 s" is a **kill line, not a runtime**
+      (every TIMEOUT in that sweep carries ~20 s of harness overhead above its
+      budget), and Q35 **also timed out at the 300 s budget (319 s)**, so its
+      SF0.5 runtime is unknown and above ~300 s. **PG's answer is already git-tracked** —
+      `oracle.txt` holds `35|OK|100|0` — so this is a goopg-only question. Cheap
+      path: solo SF0.5 run at 900 s on 65437 — but **a small script change is in
+      scope**, because none of it is runnable today: the SF0.5 script has no
+      per-query mode, `TPCDS_RESULTS_DIR` is not env-overridable (so the run
+      would clobber M0124-0001's artifacts anyway), and `restart_goopg` hardcodes
+      `sf1`. Respect `guard_sf1_sweep` rather than `FORCE=1`-ing it, and run
+      AFTER M0124-0001 (the deliverable is a row in its report). Escalate to SF=1
+      at 1800 s only on mismatch. **Must run solo from a fresh server.** Record the anomaly that Q35 completed at SF=1 (525 s)
+      but never at SF0.5 on half the data. Fold in one `EXPLAIN ANALYZE` with the
+      per-SubPlan counters: Q35 is an exact instance of RC-8's
+      `exists(…) and (exists(…) or exists(…))` shape, so this discharges RC-8's
+      "measure first" criterion for three queries at once. Outcome classifies Q35
+      as performance-only (→ M0125-0003) or as a wrong answer hiding behind a
+      timeout, the Q51 shape. Design
+      `docs/design/0124-0004-q35-rowcount-resolution.md`.
+      **PARTIALLY EXECUTED 2026-07-29 — stays OPEN; the count is still
+      unrecovered.** The three script blockers are FIXED and verified (`QUERIES=`
+      per-query mode via a new `query_list` shared by `sweep`/`oracle`, subset
+      reports stamped `SUBSET PROBE … NOT a gate result`;
+      `SF05_RESULTS_DIR`/`TPCDS_RESULTS_DIR`/`SF05_ORACLE` env-overridable with
+      the oracle pinned to its git-tracked home independently of the redirect;
+      `restart_goopg` → `${SF_LANE:-sf1}`). Both probes TIMED OUT (SF0.5 solo
+      900 s → 921 s; SF=1 `EXPLAIN ANALYZE` 1800 s → 1846 s) and **both readings
+      are VOID: the nightly CI batch was running throughout** (fired 00:23:44,
+      TPC-H stage at 112% CPU / 7.5 GiB RSS on the 16-core host). Neither
+      harness had a host-quiet guard; both now refuse to start under
+      `ci/batch/run-nightly.sh`/`ci/batch/stages/`, after fixing a `ps | grep`
+      self-match via `bench_foreign_procs` (`bench/tpcds/env_tpcds.sh`).
+      **Two things a later loop must NOT re-derive.** (1) The
+      SF0.5-slower-than-SF=1 anomaly is **not a plan flip** — the plans are
+      byte-identical at both scale factors and `customer` holds 100,000 rows at
+      both (the sampler halves facts by key parity, copies dimensions whole), so
+      the outer cardinality multiplying all three SubPlans is unchanged. (2)
+      RC-8's "measure first" is **half discharged**: the shape is confirmed
+      (`$0 = ss_customer_sk` is a nested-loop **Filter**, not an index cond — so
+      each of three `EXISTS` re-scans a whole fact table per outer row), but the
+      `Calls`/`CacheMisses` counters need a COMPLETING `EXPLAIN ANALYZE`.
+      **Resume:** on a quiet host, `QUERIES=35 TIMEOUT_SEC=1800
+      RESTART_AFTER_TIMEOUT=0 SF05_RESULTS_DIR="$PWD/analysis/tpcds-q35-m0124-0004"
+      bash scripts/tpcds-sf05-regression.sh sweep`; on a second TIMEOUT escalate
+      to SF=1 with a **plain** run, NOT `EXPLAIN ANALYZE` (per-tuple
+      instrumentation inside three per-row SubPlans is itself a large multiplier
+      and confounds the 525 s/628 s comparison). Artefacts
+      `analysis/tpcds-q35-m0124-0004/`; ledger rows 2026-07-29 ×2.
+      **Side effect for M0125:** the SF0.5 sweeps of 2026-07-29 00:47 and 03:38
+      (including the M0125-0009 fix's) were taken under the nightly — their
+      row-count verdicts survive, their TIMEOUT verdicts and timings do not.
+      M0124-0001's SF=1 re-sweep is clean (finished 34 min before the fire).
+- [x] **M0124-0005 — add a value checksum to the SF0.5 oracle** (§13.4 item 3).
+      **DONE 2026-07-29.** `scripts/tpcds-result-checksum.py` (new),
+      `cmd_oracle` switched to a **plain** PG run emitting
+      `q|status|rows|ck|secs`, `cmd_sweep` teaching the fatal `CKMISMATCH`
+      verdict and a `PASS=N (x ck-verified, y ck=n/a)` summary; `oracle.txt`
+      re-captured with the normalisation contract in its header. 4-column
+      oracles still load (degrade to row-count-only) so no other checkout
+      breaks. **D5 #1 PASSED — all 99 entries match the pinned fixture on
+      status and rows**, but only after it caught a row-dropping parse bug:
+      psql emits its blank line AFTER the `(N rows)` tally, so a blank line
+      inside a block is a data row (a single column holding NULL), and Q23/Q92
+      were being counted as 0 rows instead of 1. **D5 #2 PASSED** — Q39 (the
+      float case) passes with a matching ck, no `ck=n/a` query misfires, and
+      the sweep's five `CKMISMATCH`es are all hand-confirmed real wrong
+      answers (Q16/Q94/Q95 `0|NULL|NULL` vs PG's values; Q87 23837 vs 23762;
+      Q97 395879 vs 35). Q16 is the proof: M0124-0006 needed a bespoke SF=1
+      investigation to find it, the gate now flags it in 24 s. Coverage: **57
+      of 95 OK queries carry a checksum, 38 are `ck=n/a`** — the n/a rule is a
+      conservative saturation over-approximation (ledger row, resume point
+      recorded). **D5 #3 (pre-RC-1b Q75 replay) deferred** — ledger row
+      2026-07-29; it needs an old binary + its own cluster load and is a
+      hypothesis check, discharged in substance by the five live catches.
+      Sweep `analysis/tpcds-sf05-ck-m0124-0005/` (taken under the nightly with
+      `FORCE=1`: value verdicts hold, **timings and the TIMEOUT set do not**).
+      Original statement of the task follows.
+      The gate is row-count only and structurally blind to "right count, wrong
+      values" — Q75 PASSed for weeks with 100 rows while its CTE computed
+      1,057,469 against PG's 2,368,670, hidden by `LIMIT 100`. Filed as a task,
+      not a deferral, because M0125-0002 and M0125-0004 are both accepted at this
+      gate and both change which rows reach a join or filter. Extend `oracle.txt`
+      from `q|status|rows|secs` to `q|status|rows|ck|secs`, deriving `rows` and
+      `ck` from the SAME PG run. **Float normalisation to 12 significant digits is
+      mandatory** — ledger `tpcds-round2 stddev-precision` records goopg's
+      `stddev_samp` diverging from PG's `sqrt_var` in the last 1–2 digits on 235
+      of 236 Q39 rows, so a naive byte checksum flags Q39 immediately. `ck = n/a`
+      is a first-class value for a `LIMIT` over a non-total `ORDER BY`; do NOT
+      sort-then-hash, which would silently accept a wrong ordering. New
+      `CKMISMATCH` verdict kept distinct from `MISMATCH`. **The capture method must change**: `cmd_oracle` derives rows from
+      `EXPLAIN (ANALYZE)`, which emits a plan and NO tuples — there is nothing to
+      checksum — so switch to a plain execution and *prove* the new row counts
+      equal the pinned fixture. Gate-of-the-gate: re-run pre-RC-1b Q75 and record
+      the outcome; `CKMISMATCH` is expected, but the evidence covers the CTE
+      aggregate, not the `LIMIT 100` window, so a PASS there is a finding about
+      the window rather than a broken checksum.
+      Design `docs/design/0124-0005-sf05-oracle-checksum-column.md`.
+- [x] **M0124-0006 — attribute the 23 value-divergent OK cells of the re-sweep**
+      — **DONE 2026-07-29.** Tool `scripts/tpcds-value-diff.py` (graded
+      normalisation, design D6a); verdicts in
+      `analysis/tpcds-sf1-resweep-20260728/RESULTS.md` §M0124-0006. **No cell is
+      ordering-only. 5 of 23 are not defects**: Q7/Q26/Q27/Q83 are the
+      exactly-zero-quotient scale renderer (**Q27 newly added** — it was
+      unattributed), and **Q39 is float8 accumulation order** (relative 1.4e-16),
+      not a collapse — it leaves the M0125-0009 acceptance set. The other 18:
+      **M0125-0009** ×10 (Q2 Q21 Q40 Q43 Q50 Q59 Q62 **Q66** Q97 Q99 — Q66 newly
+      confirmed via its 48 inner `sum(CASE)` siblings), **M0125-0007** ×3 (Q16
+      Q94 Q95), **M0125-0006** ×1 (Q87), and **M0125-0010 ×4 — a NEW defect filed
+      this loop** (Q28 Q46 Q68 Q79: `remapSubqueryColumnRefs` binds sibling
+      aggregates by function name, `planner.go:2468`). Original text follows.
+
+- [ ] ~~**M0124-0006 — attribute the 21 value-divergent OK cells of the re-sweep**~~
+      (raised by M0124-0001 chunk 12; **due before the merged deliverable**). The
+      sweep's headline finding — "row counts reproduce set A" — is now known to be
+      much weaker than "goopg agrees with PG". Chunks 1–10 were checked on row
+      counts only; value diffing began at chunk 11, and back-applying it exposed
+      **Q16 wrong since chunk 2** (`OK / 1 row`, goopg `0` vs PG `45`). Restricted
+      to cells fresh this sweep, `OK` on both engines, and equal in row count,
+      **21 diverge by value and none are ordering-only**:
+      `Q2 Q7 Q16 Q21 Q26 Q27 Q28 Q39 Q40 Q43 Q46 Q50 Q59 Q62 Q66 Q68 Q79 Q83 Q87
+      Q94 Q95` — **updated by chunk 13 to 23 cells, `+Q97 +Q99`** (both attributed
+      to M0125-0009; **Q98 is NOT a member** — its values are correct and its diff
+      is rendering-only). Sampling attributes some already — Q87 → M0125-0006;
+      Q16/Q94/Q95 → M0125-0007; Q43/Q50/Q66/**Q97**/**Q99** (and probably Q2/Q39)
+      → M0125-0009; Q7/Q26/Q83 are
+      the answer-neutral numeric-scale gap (no `select_div_scale`) — **chunk 13
+      narrowed this one**: goopg's division rscale is correct in general and
+      short-circuits **only when the result is exactly zero** (`0.00` vs
+      `0.00000000000000000000`; the non-zero quotient is byte-identical), so the
+      attribution to look for is a zero fast-path, not a missing rscale rule.
+      A second answer-neutral renderer also inflates diffs and must not be
+      mistaken for a value divergence: **`char(n)` is not blank-padded**
+      (`octet_length` 7 vs PG 30 on `character(30)`; ledger row 2026-07-06,
+      M0122-0005) — normalise whitespace per field before classifying — but the rest
+      are **unattributed**, and an unattributed value divergence may be a defect
+      nobody has filed. Method: `diff <(norm goopg) <(norm pg)` per cell,
+      classifying each as (a) an existing filed defect, (b) answer-neutral
+      rendering/scale, or (c) NEW — file it. Record the verdict per query in
+      `RESULTS.md`. **Do not re-run the sweep for this**; the result files are on
+      disk. Note Q97–Q99's files are STALE (set A) and must be excluded until
+      chunk 13 runs — excluded is not the same as agreeing, and the same caveat
+      applies to any cell whose file predates 2026-07-28.
+      Design: fold into `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md`
+      (extend D-series with a value-comparison rule) rather than a new doc.
+
+## M0125 — TPC-DS timeout class & planner expression-walker extinction (filed 2026-07-28)
+
+Milestone: `docs/milestones/0125-tpcds-timeout-class-and-walker-extinction.md`.
+Source: `docs/design/tpcds-round2-fixes/README.md` §13.5 actions **2, 3, 4**.
+**Priority #4, after M0124.** M0125-0002/-0004 diff against
+`plan_snapshots/tpcds-round2-head.txt` (M0124-0002) and are accepted with
+M0124-0005's checksums; M0125-0001 and M0125-0003 stage 1 are unblocked.
+
+**Read before picking any task here.** Two of these move plan shape, and goopg's
+planner sits on a *measured* trade-off. Enabling statistics fixed TPC-H Q5 22.8×
+(415.2 → 18.2 s) and regressed **Q22 128×, Q4 79×, Q8 53×, Q2 26×, Q12 4.4×**,
+taking the serial stream **1162 → 1307 s** (round-4 §2/§5). The cost-driven
+join-order planner is **4 wins / 6 regressions / 12 neutral** — Q2 18.8× and Q8
+4.1× faster, but Q5 and Q21 hang, Q9 times out, Q10 11.4×, Q18 4.3× — and ships
+OFF by default (round-5 §6). **Every regression in that table came with identical
+row counts**, so `scripts/tpch-spotcheck.sh` cannot see this class. Plan-shape
+commits need a **timed** 22-query TPC-H run plus `make plan-diff
+LABEL=tpcds-round2-head`. Round-5's *absolute* seconds are not a valid baseline
+(the fix bundle moved the stream 1086 → 325 s with no plan changes) — M0124-0002
+arm B is. M0125-0002's gate budget alone is ~12–20 h.
+
+- [x] **M0125-0004 — Q75 join-residual evaluation order** (§13.5 #3). *First: it
+      is a live CI break* — `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46`
+      with no `expected-failures.csv` entry, so M-NIGHTLY preempts for it and that
+      item IS this task. RC-1b made Q75's `all_sales` CTE exactly correct and
+      thereby exposed a pre-existing divergence: goopg evaluates
+      `CAST(curr.sales_cnt)/CAST(prev.sales_cnt) < 0.9` as the hash-join residual
+      per matched pair **before** the outer Filter's `d_year` equalities exclude
+      the `sales_cnt = 0` group, where PG attaches single-relation quals to
+      `baserestrictinfo` (`distribute_restrictinfo_to_rels`) and cost-orders the
+      rest (`order_qual_clauses`). Fix: the inner-join sibling of
+      `pushOuterQualsIntoLaterals` (`internal/planner/pushdown.go:132`), run AFTER
+      `remapWithBindings` with positional name validation (RC-1b's lesson),
+      **duplicating rather than moving** the conjunct so the result set is
+      unchanged by idempotence while the error behaviour changes intentionally,
+      placing the `Filter` on the join INPUT never inside the twice-referenced CTE
+      body, and scoped to **inner joins over CTE/derived-table inputs only** so it
+      cannot re-open the `shouldAttachBeforeMHJ` Q8/Q21 PASS→CANCEL regression.
+      Decline on non-INNER joins: PG 18.3 no longer has `check_outerjoin_delay`
+      (removed in the PG 16 nullingrels rework) and goopg has no nullingrels model.
+      **Blast radius is not zero** — TPC-H Q15 (`q15_main.sql`) joins `supplier` with the
+      `revenue0` view, which may expand to a derived table, so a TPC-H plan hunk
+      triggers the full timed run; and an empty plan diff is NOT claimed (adding a
+      `Filter` is a plan change). Verify by **value**, not row count. Ledger
+      `tpcds-round2 Q75-eval-order`. Design
+      `docs/design/0125-0004-q75-join-residual-evaluation-order.md`.
+      **DONE 2026-07-30.** D1 landed as `internal/planner/inner_join_qual_pushdown.go`
+      (`pushSingleSideQualsIntoInnerJoinInputs`), called from `planSelect` after the
+      last `applyJoinTreePosMap`. **Q75's SF0.5 output is byte-identical to PG** (100
+      rows, `diff` clean — verified by VALUE as required, since `ck=n/a` under a
+      saturated `LIMIT`), so the `Q75,100,pinned` anchor now passes on its intended
+      meaning and needs no `expected-failures.csv` entry. Blast radius **measured**:
+      a 99-query EXPLAIN A/B makes the firing set exactly seven (Q4/Q11/Q31/Q39/Q64/
+      Q74/Q75) and the entire delta is added `Filter:` lines on CTE-scan inputs — no
+      join reordered, no node kind changed. SF0.5 value gate on those seven:
+      MISMATCH=0 CKMISMATCH=0 ERROR=0. **The Q15 concern is discharged by
+      measurement, not argument** — `make plan-diff` is 22/22 MATCH *including*
+      `Q15a-VIEWBODY`, so the conditional timed TPC-H power run is not triggered.
+      Q31/Q64 TIMEOUT and Q4's oracle is itself TIMEOUT, so three of the seven carry
+      no value verification; an A/B with the call line disabled reproduced Q31/Q64 at
+      332s/333s vs 332s/336s, clearing this change of causing them (ledger row,
+      2026-07-30 — re-run on a quiet host). D3 (cost-ordered residual conjuncts),
+      `*FuncCall` pushes, and base-relation-leaf scoping are deferred with rows.
+- [x] **M0125-0001 — `internal/planner/exprwalk.go` + exhaustiveness gate** (§13.5
+      #4, phase 1.1). One `exprChildSlots` child-slot primitive over `plan.go`'s
+      **32** concrete `Expr` types (the marker is unexported, so the set is
+      closed), three distinctly-named drivers (walk / rewrite-in-place /
+      clone-and-rewrite — conflating them compiles and silently drops the rewrite,
+      and `remapByPosMap` clones while `remapOuterRefsInSubplan` mutates), and a
+      per-caller `scopePolicy` covering the four behaviours real call sites rely on
+      (signal / veto / ignore / descend). Three typing traps:
+      `MultiAssignSubqElem.Row` is statically `*MultiAssignSubqRow` not `Expr`;
+      inner-scope children are `Node` in a different coordinate space (a Semi/Anti
+      inner plan must NOT be remapped); and a scope-opening node reports ZERO
+      `Expr` slots, so classify by slot kind, never by `len(kids)`. Ship a `go/ast`
+      test asserting set equality **in both directions** between `plan.go`'s
+      `exprNode()` receivers and the type-switch cases, so a 33rd type is a build
+      failure instead of a wrong answer. Add the §2.6 pins never written
+      (`bushy_remap_test.go` holds only
+      `TestBuildJoinFromDP_NonAscendingSubsetKeyRemap` from `65dd185a`) covering
+      all 18 `remapByPosMap` arms plus a double-remap pin. **No call site
+      converted**, so no TPC-H run. Note §13.4 item 5's "eleven remain partial" is
+      an arithmetic slip — four have been hand-touched, so **seven** is the live
+      figure. Design
+      `docs/design/0125-0001-exprwalk-driver-and-exhaustiveness-gate.md`.
+      **DONE 2026-07-29.** `internal/planner/exprwalk.go` (`exprChildSlots` over all
+      32 types + `shallowCloneExpr`; drivers `walkExprRefs` /
+      `rewriteExprRefsInPlace` / `cloneExprRefs`; four-value `scopePolicy`), the
+      `go/ast` gate, and D6's 26 remap pins. **No call site converted** — `go vet`
+      reports all three drivers unused, which is the positive evidence that plan
+      shape cannot move, so no TPC-H run. **The gate was proved to FAIL before being
+      trusted**, twice: deleting the `*CollateExpr` arm, and declaring a 33rd `Expr`
+      type OUTSIDE `plan.go` — the latter validates D5's scan-every-package-file
+      requirement, since a `plan.go`-only parse would have passed and the gate would
+      have been worthless. Both probes reverted. Four deviations from the draft
+      (D1's `slotExprList` collapsed to per-element slots; D3's per-node callbacks
+      reduced to a per-call enum; drivers return `bool` because a veto must be
+      observable; leaves cloned not shared) are recorded with rationale in the design
+      doc's execution record. **Two findings the next loop must not re-derive: (1)**
+      `remapByPosMap` is ALREADY complete — 18 arms + 14 childless leaves = 32 —
+      confirming M0125-0002's re-base as a genuine no-op step with no absent arms;
+      **(2) M0125-0002's walker inventory is WRONG.** `walkExprTree`
+      (`unnest.go:1152`) is a further generic `Expr` walker with the same fail-open
+      `default:`, outside §2.4's seven (already nine after M0124-0003). §0 says
+      **fourteen**, §13.4 says seven, and neither figure has been re-derived from
+      source — do that FIRST or M0125-0002 closes against a list that was never
+      right. Two ledger rows appended (`exprwalk-node-side`; the walker-inventory
+      correction).
+- [ ] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
+      phase 6.1). **STAGE 1 LANDED 2026-07-29, flag-off and inert** — the
+      arithmetic (`estimateRelSize`), the `reltuples < 0` sentinel
+      (`catalog.TableStats.Analyzed`), the live block count
+      (`InMemory.RelationBlocks`, installed from the pool in `initdb.Open`), the
+      staged knob, and the stage-1 consumer (`seqScanRows` via
+      `SeqScan.EstRelRows`). Verified against PG 18.3 on four measured
+      relations and reproduced EXACTLY; see the design doc's "Implementation
+      record" and five ledger rows dated 2026-07-29.
+      **STAGE 2 LANDED 2026-07-30, also default-off** — `bushySeedRowCounts`
+      (`internal/planner/bushy.go`, extracted from `enumerateBushyPlans`) adds
+      the fallback as a third tier under the DP's singleton seed, through the
+      new single gated entry point `relSizeFallbackRows(stage, cat, tbl)` that
+      `stage1RelSizeRows` now delegates to as well. Verified by plan SHAPE in
+      BOTH flag states, which is contention-immune: flag-off `make plan-diff
+      LABEL=tpcds-round2-head` = **22/22 MATCH**, `GOOPG_RELSIZE_FALLBACK=2` =
+      **22/22 DIFFER** (`analysis/m0125-0003-stage2/plan-diff-stage2-on.txt`).
+      The magnitude is the finding: an S-cold server used to seed **`rows=1` for
+      every relation**, so the DP ranked join orders on no cardinality signal at
+      all; it now seeds block-derived sizes within 0.37–1.01× of SF=1 truth
+      (`nation` at 20.8× is the 10-page floor, upstream's behavior). Q9 newly
+      reaches `Gather`/`Workers Planned: 4` — untimed, and round-4's five
+      regressed queries remain the watch list.
+      **Still owed, which is why this box is unchecked:** stage 3
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the ENTIRE
+      four-arm TIMED measurement — the flag accepts `3` today and yields
+      stage-2 behavior. **Read stage 2's timed arm BEFORE stage 3 lands**:
+      stage 3 makes `filteredRows` positive cold and therefore SHADOWS the
+      stage-2 tier at the DP seed (recorded in `bushySeedRowCounts`'s doc
+      comment and a ledger row). A fourth, unstaged consumer was discovered —
+      `reorderCommaFromByCardinality` (`joinorder.go:89-93`) bails out entirely
+      when any table lacks `Stats.RowCount`, so the greedy comma-FROM reorder is
+      still blind at S-cold; own ledger row, deliberately not folded in. En route it corrected `typeWidth`, which was not
+      `get_typavgwidth` (missing the UTF8 encoding factor AND the whole sliding
+      scale: `varchar(20)` read 24 vs PG's 58) — a 2.4× width error is a 2.4×
+      row-estimate error on the char/varchar-heavy schemas this serves.
+      §13.5's highest-value item (15–16 of 21 defects); stage 1 is
+      inert, so it lands early. `tableRows` (`cardinality.go:89`) returns
+      `Stats.RowCount`, which `loadStatisticsFromHeap` (`initdb/open.go:3454` —
+      §7.1's `:3433` is stale) leaves 0 after every restart. Model on
+      **`table_block_relation_estimate_size`** (`postgres/src/backend/access/table/
+      tableam.c`, reached via `heapam_estimate_rel_size`) — NOT `plancat.c`'s index
+      branch: density = `(usable_bytes_per_page * fillfactor / 100) / tuple_width`
+      then `clamp_row_est`; `curpages = 10` only when `curpages < 10 && reltuples <
+      0 && !relhassubclass`; `curpages == 0 ⇒ tuples = 0`. goopg has no "never
+      analyzed" sentinel, so decide and document the empty-analyzed-table trigger.
+      Reuse `ParallelSettings.BlocksForTable`; no package global. **Staged by
+      consumer** (1 = probe-side, shape-neutral; 2 = + DP seed, where round-4's
+      regressions live; 3 = + `baseRows`), because one flag switching all three
+      gives one number and no attribution. Stages are **not** blocked on M0125-0002 (see the
+      directive above; the walker is gate-shadowed at that site after all). **§7.1's mitigation is unexecutable as written**:
+      every TPC-H run in this repo ANALYZEs first, so the fallback provably cannot
+      fire and both arms are identical — "no difference" would mean "not
+      exercised". Measure four arms {no-ANALYZE, ANALYZE} × {off, on} per stage;
+      only no-ANALYZE-on is interesting. Pre-register round-4's five regressed
+      queries as the watch list and Q5 as the expected win; make no quantitative
+      prediction, since round 4 supplied full selectivity while this supplies only
+      sizes — a third regime nobody has measured. Use round-5 §6's per-query
+      isolated harness: a mis-ordered star query was measured NOT to honour
+      cancellation (server pinned ~10 GB RSS), so a plain sweep can wedge the host.
+      Never measure together with `costDrivenJoinOrder`. Note `pg_class.reltuples`
+      reads `Stats.RowCount` directly (`internal/catalog/catalog.go:6946`) and
+      CANNOT be fixed here. Phase 6.2 out of scope (B3: does not fix Q64 alone).
+      Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
+- [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
+      #4, phase 2.2).
+      **STEP 0 DONE 2026-07-30 — the inventory is re-derived from source and now
+      gate-pinned**, which M0125-0001's execution record required before any
+      conversion ("§0 says fourteen, §13.4 says seven, and neither figure has
+      been re-derived from source — do that FIRST"). All three figures were
+      wrong: `internal/planner/exprwalk_inventory_test.go` censuses every type
+      switch over an `Expr` in package `planner` and finds **64 sites — 2
+      exprwalk primitives, 50 recursive-and-incomplete walkers (the RC-1a
+      class, 2–25 of 32 arms), 12 non-recursive classifiers**. The seven were
+      selected by blast radius, which scopes a conversion soundly and sizes a
+      defect class not at all; this task's scope is UNCHANGED (same eight
+      commits, same order) but it covers **8 of 50 = 16 %**, and each
+      conversion now closes by DELETING its pin (set equality is enforced in
+      both directions, so a new hand-written walker fails the build and a
+      converted one fails until the pin goes). Gate proved to fail both ways
+      before being trusted. Arm counts are comments, not assertions — pinning
+      them would make every band-aid arm look like progress. The census also
+      found **two fail-opens that COLLIDE rather than no-op** (worse: a wrong
+      answer, not a missed optimisation) — filed as `M0125-0024`, deliberately
+      not fixed here. Design doc §"STEP 0".
+      **COMMIT 1 of 8 DONE 2026-07-30 — `remapByPosMap` re-based onto
+      `rewriteExprRefsInPlace`, and D2 row 1's empty-plan-diff prediction
+      HELD: 22/22 TPC-H MATCH under `make plan-diff
+      LABEL=tpcds-round2-head MODE=structural`.** Three things the design
+      left open were resolved by reading the pins rather than the prose:
+      (a) the driver is **`rewriteExprRefsInPlace`, not `cloneExprRefs`** —
+      the §2.6 pin comment guessed the latter, but
+      `TestRemapByPosMap_IdentityMapSharesNodes` requires an identity remap
+      to leave the node SHARED and a whole-tree clone replaces even the
+      root; (b) D3's "plan slots **ignore**" taken literally would have
+      **dropped the `remapOuterRefsInSubplan` calls** and reintroduced
+      TPC-H Q21's wrong-outer-column defect — the walker has TWO kinds of
+      inner plan needing OPPOSITE treatment (`InExpr.Plan` already remapped
+      vs `Exists`/`Subquery`/`ArraySubquery`/`MultiAssignSubq*` needing
+      Level-1 translation) and a per-driver `scopePolicy` cannot express a
+      per-type split, so `scopeIgnore` + a bottom-up `Rewrite` dispatch
+      owns it (`scopeDescend`+`OnScope` cannot: `OnScope` gets the `Node`
+      with no parent context); (c) the missing `default:` is a **panic**,
+      matching PG's `elog(ERROR, "unrecognized node type: %d")` in
+      `nodeFuncs.c:2667`/`:3743` — ledger row 2026-07-30 records the
+      un-PG-faithful half (a bare panic instead of `ereport` with a
+      SQLSTATE, reaching the client as `XX000` only via `server.go`'s one
+      `recover()`). **The census pin DEMOTED (`walkerPending` →
+      `nonRecursiveClassifier`) instead of being deleted**, which corrects
+      this item's own "each conversion closes by DELETING its pin": the
+      census keys a switch by its ENCLOSING FUNCTION and closures count, so
+      the six-arm dispatch inside `Rewrite` keeps the site in the census.
+      Deletion is the audit signal only for walkers whose switch vanishes
+      entirely; forcing one here would mean an `if`-chain of type
+      assertions (gaming the gate) or a renamed helper (same switch, new
+      key). Four new pins in `remap_arms_test.go`: subplan `Args` are
+      same-scope (nothing pinned it, and the driver reaches them through
+      slots), containers are not cloned, and an unenumerated type panics at
+      the root and nested. **D4 item 4's SF0.5 arm is OWED, not run** —
+      ledger row 2026-07-30: the `ci/batch` nightly held the host (load
+      ~10, TPC-DS stage mid-flight at ~11 GB RSS on 65435) and a concurrent
+      99-query sweep would have risked the memory guard SIGKILLing that
+      stage; it must run before commit 2. **Next: commit 2,
+      `cloneExprShiftIdx`** — expects hunks and carries the full timed run.
+      Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
+      `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
+      `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
+      (`:268`), `cloneExprShiftIdx` (`nl_index_join.go:777`), `exprSide`
+      (`planner.go:5059`) — plus re-basing `remapByPosMap` and giving it the
+      `default:` it still lacks. **This is a plan-SHAPE change**: `extraInScans`
+      (`bushy.go:1625`) starts `allMatched := true` and only falsifies it from
+      inside the callback, so a conjunct of unenumerated kinds is admitted into
+      `MultiHashJoin.Filters` **by accident** — completing the walker *removes*
+      predicates. TPC-H blast radius is **{Q2, Q5, Q7, Q8, Q9}** (≥5 FROM items referencing
+      `region`/`nation`, so they pass `shouldAttachBeforeMHJ`, whose comment records
+      "Without the SmallDim guard, Slice A regresses Q8 / Q21 from PASS to
+      CANCEL"). Order: `remapByPosMap` re-base FIRST (the only genuinely
+      no-op step, pinned by 0125-0001's 18-arm table) → `cloneExprShiftIdx` →
+      `visitColumnRefs` → `visitColumnRefsForTable` → `exprSide` →
+      `conjunctIsLocalEligible`+`localizeExprToLeaf` (ONE commit — producer/
+      consumer pair) → `visitColumnRefsByName` last. **Only commit 1 carries an
+      empty-diff expectation** — `cloneExprShiftIdx` is a fail-closed admission
+      test whose completion OPENS the NLI inner-unwrap, `visitColumnRefs`
+      rewrites join-predicate indices, and `visitColumnRefsForTable` feeds
+      `tableForCol` and hence local-filter partitioning AND join-edge
+      classification. Commits 2–8 carry the full timed run. Per commit: units +
+      `plan-diff LABEL=tpcds-round2-head` + timed 22-query TPC-H + SF0.5 with
+      checksums on first/last/any-hunk commit; revert rather than fix forward.
+      Do NOT claim "the walker class is extinct" — `walkColumnRefsImpl` and the
+      `shiftColumnRefs` closure stay out of scope with a ledger row. Design
+      `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md`.
+- [x] **M0125-0024 — two expression-identity fail-opens that COLLIDE**
+      **DONE 2026-07-30.** Both fixed on one new driver. `exprwalk.go` gained a
+      third complete-over-32-types primitive (`exprSelfKey` — the node's OWN
+      identity-bearing fields) and a fourth driver over `exprChildSlots`
+      (`exprIdentityKey(e, pol)`). It returns a **decidability flag, not a
+      bool**, because the two callers translate "undecidable" in **opposite**
+      directions, and that asymmetry is the whole safety argument:
+      `planExprContentKey` keys an unkeyable node **per pointer** so it can
+      never share an aggregate state slot, while `exprEqual` returns **not
+      equal** so it can never assert two expressions are one (a false negative
+      there is at worst a diagnosable `42P10`). Both functions lost their own
+      type switches, so **both census pins are DELETED, not demoted** — unlike
+      commit 1's `remapByPosMap`, no per-type dispatch survives (RC-1a class
+      50 → 48, census 64 → 63).
+      Three findings the filing did not have: **(1)** the collision is reachable
+      from ordinary SQL, because `*BinaryOp` was one of the 28 unenumerated
+      types — `ua(a + b)` and `ua(a - b)` shared a slot. **(2)** the `%T%v`
+      fallback in `exprEqual` was wrong in **both** directions, not one: it
+      printed nested pointers as ADDRESSES (structurally equal expressions read
+      unequal) *and* printed `pos` (the same literal at another offset read
+      unequal), where PG's `equal()` excludes location outright
+      (`COMPARE_LOCATION_FIELD` is a no-op in `equalfuncs.c`). **(3)** the
+      `*ColumnRef` divergence resolves toward `exprEqual`, i.e. **`Index`
+      alone** — `SchemaColumn.SourceTableIdx` documents zero as "unknown /
+      derived" (`plan.go:27-37`), so it is auxiliary disambiguation metadata
+      with a hole rather than a `varno`, and both callers compare expressions
+      resolved against the SAME coordinate space where `Index` already IS the
+      identity. Including it could only split one column into two.
+      Gates: every pin proved to FAIL at `da6d2c0c` and pass after (including
+      the value pin, where both calls got `SharedStateSlot=0`); units suite;
+      `plan-diff LABEL=tpcds-round2-head MODE=structural` **22/22 MATCH** (the
+      laxer `pathKeyEqual` moved no plan); pgbench smoke via the hook. Value
+      gate is `internal/planner/agg_state_sharing_test.go`, plus
+      `TestExprIdentitySiblingsAgree` — the pair invariant that makes a future
+      divergence a test failure. Two ledger rows own what is left: the executor
+      half of the value gate (a real `CREATE AGGREGATE` driving the
+      leader/follower state copy) and `exprIdentityKey` still ACCEPTING
+      `scopeIgnore`, which is a wrong-answer policy for an identity question.
+      **↳ THE EXECUTOR HALF IS CLOSED (2026-07-30, next loop) and it upgraded
+      the verdict on this fix — BOTH directions are user-visible.** New file
+      `internal/executor/agg_state_sharing_value_test.go` (design §5.1) drives
+      the leader/follower copy end to end through a real `CREATE AGGREGATE`
+      over a real plpgsql sfunc. The fixture the ledger row budgeted for was
+      not needed: `executeSFuncCall` already falls back to
+      `executeStoredRoutine` and `RAISE NOTICE` reaches `ctx.Notices`, so the
+      test **counts sfunc invocations** (3 shared / 6 unshared over 3 rows)
+      rather than inferring them, which pins the M0097-0035 sharing
+      optimisation from the other side too. At `da6d2c0c`
+      `SELECT ua_sum(a+b), ua_sum(a-b)` returned **`(77, 77)`** where PG
+      returns `(77, -63)` — one row of plausible numbers with column 2 echoing
+      column 1, the exact shape no row-count gate in this programme could see.
+      **The same file discharges the OTHER owed half, and it was not a
+      no-op:** goopg at `da6d2c0c` **rejected** `SELECT DISTINCT ON (CASE …) …
+      ORDER BY CASE …` with `42P10`, a statement PG 18.3 accepts (verified
+      against the oracle on 65438 — three rows, identical to HEAD). So the
+      laxer `exprEqual` removed a **real spurious error**: this was a
+      wrong-ERROR fix as well as a wrong-answer fix. That ledger row is
+      flipped to `resolved`; only the `scopeIgnore` row remains. One NEW ledger
+      row came out of reading that path: an sfunc that raises is never
+      propagated — `executeSFuncCall` discards each candidate's error and
+      reports `42883 … does not exist`, and the DISTINCT leader pre-compute
+      (`operators_join_agg.go:1754`) drops the error and keeps the stale state,
+      i.e. a silently wrong number where PG aborts the statement.
+      Original filing follows.
+      (discovered by M0125-0002's STEP 0 census, 2026-07-30; ledger row same
+      date). Both are outside the seven, and both are wrong-answer risks rather
+      than missed optimisations, because they under-enumerate an *identity*
+      function: unenumerated types are not skipped, they are **conflated**.
+      **(a) `planExprContentKey` (`internal/planner/planner.go:7027`, 4 of 32
+      arms)** keys aggregate STATE-SHARING equality and its `default:` returns
+      `fmt.Sprintf("%T", e)` — the type name alone — so any two distinct
+      expressions of one unenumerated type (two different `*CaseExpr`s, two
+      `*CastExpr`s, two `*SubqueryExpr`s) share a key and are treated as the
+      same aggregate argument. This is M0097-0032's shape, where a dropped
+      FILTER collapsed `count(*) FILTER (WHERE …)` onto `count(*)` and the
+      filtered count reported the unfiltered total — a shipped wrong answer.
+      **(b) `exprEqual` (`:11950`, 5 of 32 arms)** backs DISTINCT ON / ORDER BY
+      matching and falls back to `fmt.Sprintf("%T%v", …)` comparison, which its
+      own comment concedes is "pointer-safe only for primitives": for an
+      unenumerated type holding pointers it compares ADDRESSES, so structurally
+      equal expressions read unequal. Independently, (b)'s `*ColumnRef` arm
+      compares only `Index` while (a)'s compares `SourceTableIdx/Index`, so two
+      refs from different source tables at the same index are equal to one and
+      distinct to the other — the sibling-divergence class in a pair nobody had
+      noticed was a pair. Both are `walkerPending` pins in
+      `exprwalk_inventory_test.go`. Fix each on `exprwalk.go`'s drivers with a
+      stated `scopePolicy`, and gate by VALUE (M0124-0005 checksums) not row
+      count: an aggregate-sharing or DISTINCT change is invisible to a
+      row-count gate. Needs a design doc
+      (`docs/design/0125-0024-expression-identity-collisions.md`) before code —
+      the aggregate-sharing path is where the shipped-wrong-answer precedent
+      lives.
+- [x] **M0125-0025 — a raising aggregate support function must abort the
+      statement** (M0125-0024's third ledger row, 2026-07-30). **DONE
+      2026-07-30.** Selected because every other open M0125 item needs a TIMED
+      run on a quiet host and `ci/batch/run-nightly.sh` (PID 3541516) had held
+      it for 5h33m; this one is accepted purely BY VALUE. The row claimed a code
+      path rather than an observed wrong answer — it is an observed wrong
+      answer. A user-defined aggregate whose `SFUNC`/`COMBINEFUNC`/`FINALFUNC`
+      **raised** had its error discarded and the query answered anyway: at
+      `0de1b404` `SELECT p_rsum(a) FROM raise_t` returned **`1`** (the sum of
+      the rows transitioned before the raise) where PG 18.3 aborts
+      `ERROR: boom 2`; the shared-DISTINCT-slot form returned `(1, 1)`; a
+      raising `FINALFUNC` returned `NULL`; a raising `COMBINEFUNC` returned the
+      un-combined partial state `6`. Right shape, right type, plausible number —
+      M0125-0024's class, invisible to every row-count gate here. **Two
+      independent swallows:** `executeSFuncCall` discarded each candidate's
+      error (`_ = rerr`, twice) and synthesised `42883 … does not exist`, so a
+      PRESENT routine that FAILED was reported MISSING — which is what hid the
+      second swallow — and then all seven call sites read
+      `if serr == nil { state = newState }`. The three transition loops
+      (`applyAgg`, `finishAgg`'s DISTINCT dedup, `Open`'s leader/follower
+      pre-compute) are separate code and each swallowed independently. **A
+      blanket propagate would have been wrong** and that is the design's one
+      real decision: `executeSFuncCall` doubles as the lookup for the built-in
+      sfuncs it models inline and is called for slots an aggregate never
+      declared, so its `42883` is a NORMAL outcome. The two modes became
+      decidable and propagate in OPPOSITE directions — `errSFuncNotFound` →
+      swallow, `sfuncRaised()` → propagate — the same shape M0125-0024's
+      `exprIdentityKey` needed. `finishAgg` gained `(Datum, error)` by lifting
+      its built-in tail verbatim into `finishBuiltinAgg` (no re-indentation,
+      ~103 returns untouched). Gates: 7 new subtests in
+      `internal/executor/agg_sfunc_error_propagation_test.go`, every `want`
+      MEASURED against the PG 18.3 oracle on 65438 inside a rolled-back
+      transaction (reference DB verified byte-unchanged); `P0001` matches PG's
+      SQLSTATE exactly; `TestMissingSFuncStillFallsThrough` pins the half that
+      must not change. Two gaps deferred with ledger rows, one found BY the
+      gate: the two `windowOp` sites are plumbed but **unreachable** (the v0
+      analyzer rejects a user-defined aggregate in `OVER (...)` with `0A000`
+      before the executor is involved, though PG accepts it), and `applyAgg`'s
+      `evalExprSlot` calls for `Arg2`/`ExtraArgs` swallow identically, calling
+      the sfunc with FEWER arguments than declared. Design
+      `docs/design/0125-0025-sfunc-error-propagation.md`.
+- [ ] **M0125-0005 — flip the `GOOPG_RELSIZE_FALLBACK` default** (§13.5 #2 rider).
+      Separate commit, separate decision, so §7.3 RC-5's reopen criterion ("after
+      the flag defaults on") has an owner. Requires: the C1→C2 table for every
+      stage with the pre-registered watch list checked; a TPC-DS SF=1 sweep at both
+      flag states; `tpch-spotcheck.sh` re-measured for wall clock **and peak RSS**
+      in both states (it runs S-cold and Q12 is one of the regressed cells, so a
+      careless flip degrades the gate every future commit must pass); and a written
+      decision. **"Measured, and deliberately not flipped" is a successful
+      completion** — `costDrivenJoinOrder` is the precedent. On landing, update the
+      RC-5 and phase-6.2 ledger rows whose criteria this satisfies. Design
+      `docs/design/0125-0005-relsize-fallback-default-flip.md`.
+- [x] **M0125-0006 — set-operation chains re-associate right when branches are
+      parenthesised** (discovered by M0124-0001 chunk 11, ledger row 2026-07-28).
+      **A wrong-answer defect, not a performance one**, and the first one this
+      programme found by value rather than by row count: TPC-DS Q87 returns
+      `47218` against PG's `47049` while both return exactly 1 row, so the SF0.5
+      oracle, the nightly row anchors and the harness's own comparison are all
+      structurally blind to it. SQL-standard and PG associate equal-precedence set
+      operators LEFT to right; goopg does so only when the branches are bare.
+      Confirmed-wrong forms: `(A) except (B) except (C)`, the same with
+      `except all`, and mixed chains such as `(A) union (B) except (C)`
+      (`{1,2,3}` vs PG `{1,2}`). UNION-only and INTERSECT-only chains are
+      unaffected *only* because those operators are associative — do not read
+      their passing as coverage.
+      **Mechanism (already root-caused, no re-diagnosis needed):**
+      `parseParenthesisedSelectStmt` sets `innerSel.Parenthesized = true`
+      (`internal/parser/select.go:1005`) **before** greedily absorbing a trailing
+      set-op written *outside* those parentheses (`select.go:1007-1039`). The node
+      then carries both `Parenthesized == true` and its own `SetOp`, and the
+      planner's left-associative flattening loop breaks early at
+      `if rightStmt.Parenthesized { break }`
+      (`internal/planner/planner.go:696-698`), planning `A EXCEPT (B EXCEPT C)`.
+      `Parenthesized` (`internal/parser/ast.go:861-867`) is overloaded against its
+      own doc comment.
+      **Fix in the parser, not the planner**: `Parenthesized` must describe the
+      node as it stood at the closing paren, so the absorbing node may not claim
+      the user's parentheses covered an operator that appeared after them. PG
+      cannot express this bug at all — `select_with_parens` is a *leaf* operand in
+      `gram.y`, so `transformSetOperationStmt`
+      (`postgres/src/backend/parser/analyze.c`) always receives a left-deep tree.
+      A planner-side patch at planner.go:696 would work but preserves the
+      ambiguous flag; prefer the faithful shape.
+      **Accept by VALUE**: the four-form matrix above as parser/planner unit tests,
+      plus TPC-DS Q87 asserted at `47049`. Sibling-path check per Hard-won Rule #2 —
+      `parseSelect` (select.go:292-295) and `parseValuesSelect` (select.go:91-94)
+      attach trailing chains too, and the FROM-subquery and scalar-subquery paths
+      (select.go:1372-1400, 2892-2906) repeat the same walk-to-rightmost idiom;
+      audit all of them before declaring the class closed. Executor side is
+      `internal/executor/operators_setop.go`. Design
+      `docs/design/0125-0006-setop-chain-associativity.md`.
+      **DONE 2026-07-29.** Root cause confirmed exactly as filed. The obvious
+      repair — clear the lying flag — was **refuted before any code changed** by a
+      PG-verified probe: `X UNION (A EXCEPT B) UNION C` is `{2,3,9}`, but fully
+      left-deep it is `{2,9}`. The parentheses wrap a **PREFIX** of the chain, so
+      the boundary must be a COUNT, not a bool. Fix = `SelectStmt.ParenBranches`
+      (branches inside the parens; 0 = the parens covered the whole chain),
+      **reset at the closing `')'`** — load-bearing for `((B) EXCEPT (C))`, whose
+      outer paren genuinely does cover the operator the inner level absorbed —
+      consumed by `parenBoundary` + `setOpSegment.cutAt`, which cuts the chain at
+      the boundary instead of breaking. The existing save/clear/restore passes are
+      re-keyed from "every segment but the last" onto `cutAt`; the plan-cache
+      restore discipline is unchanged.
+      **Cutting correctly exposed a second, PRE-EXISTING defect**: goopg's set-op
+      fold has no operator precedence at all (`gram.y:825-826` = `%left UNION
+      EXCEPT` then `%left INTERSECT`), so bare `A UNION B INTERSECT C` is already
+      wrong at HEAD. Before this change the *parenthesised* spelling was right by
+      accident, because flattening stopped early — so `setOpBindsTighter` declines
+      the cut when the trailing operator binds tighter. That is locally correct
+      precedence, and it is what makes this change non-regressing.
+      **Accepted BY VALUE against PG 18.3, not by row count.** TPC-DS Q87
+      `47218 -> 47049` = PG, measured on the SAME SF=1 data dir with the pre-fix
+      binary rebuilt from `6c5c48ae` (1 row in both cases — no row-count gate could
+      ever have seen it). 17 executor by-value cases
+      (`internal/executor/setop_paren_assoc_test.go`) + 9 parser AST pins
+      (`internal/parser/setop_paren_assoc_test.go`). **The gate was proved to FAIL
+      before being trusted**: copied verbatim into a worktree at `6c5c48ae`, 10
+      subtests FAIL while every non-regression pin (both precedence directions,
+      explicit right grouping, nested-paren reset, compound-grouping-preserved,
+      both associative controls) PASSES — the suite discriminates the defect, not
+      the diff. Sibling-path audit per Hard-won Rule #2 done as a 30-statement
+      goopg-vs-PG differential: derived table (the Q87 shape), CTE, scalar
+      subquery, nested/triple parens and trailing ORDER BY all correct.
+      **Four surviving divergences were each confirmed IDENTICAL on pre-fix HEAD**,
+      so none is a regression; all four are filed below with ledger rows
+      (M0125-0016..-0019).
+- [x] **M0125-0016 — the set-op fold has no operator precedence** (discovered by
+      M0125-0006 2026-07-29, ledger row 2026-07-29). PG `gram.y:825-826` declares
+      `%left UNION EXCEPT` then `%left INTERSECT`, so INTERSECT binds tighter.
+      goopg folds the flat segment list left-deep regardless, so **with no
+      parentheses anywhere** `A UNION B INTERSECT C` is planned
+      `(A UNION B) INTERSECT C`: goopg `{3}` vs PG `{1,3}` (A={1,3} B={2,3} C={3}).
+      Pre-existing — verified identical on pre-fix HEAD. M0125-0006 added a local
+      precedence guard at the paren boundary only (`setOpBindsTighter`), so the
+      *parenthesised* spelling is correct; the bare spelling is not.
+      **Fix**: in `planSelect`'s set-op fold (`internal/planner/planner.go`), group
+      maximal INTERSECT runs before the UNION/EXCEPT left-fold. Two couplings must
+      be re-based on the grouped tree rather than the flat segment index —
+      `wrapSetOpBranchWithCasts` unifies types against the ACCUMULATED left
+      operand, and `InnerSegmentCount`'s sort/limit placement is defined on the
+      flat index. **Accept by VALUE**: a bare-chain matrix in both precedence
+      directions plus the M0125-0006 parenthesised matrix as a non-regression pin.
+      Planner change -> full pre-commit bar.
+      **DONE 2026-07-29.** Design `docs/design/0125-0016-setop-operator-precedence.md`.
+      Fix is a two-level precedence climb over the already-flattened segment list:
+      `planSegment` (the existing cut/plan/restore dance, lifted out of the loop
+      body verbatim), `applySetOp` (column-count check + `wrapSetOpBranchWithCasts`
+      **re-based on the accumulated left operand** — with grouping that is no longer
+      always the leftmost branch), and `foldSetOpRange`, where a leading INTERSECT
+      run attaches directly to the accumulator and each later UNION/EXCEPT operand
+      first absorbs the maximal INTERSECT run that follows it.
+      **The second coupling turned out to be a correctness constraint, not just a
+      re-base**: `InnerSegmentCount` is a hard PRECEDENCE BARRIER, because the
+      user's parentheses grouped those segments explicitly —
+      `(A UNION B ORDER BY 1) INTERSECT C` must not become `A UNION (B INTERSECT
+      C)`. Folding each side of the barrier with a separate `foldSetOpRange` call
+      gives that *and* preserves the invariant `wrapSetOpSortLimit` depends on
+      (`left` == the inner compound at the wrap point), which is why the fix is a
+      range fold rather than a pre-pass over the segment list.
+      **Accepted BY VALUE against PG 18.3 (port 65438)**: 17 cases in
+      `internal/executor/setop_precedence_test.go` — both precedence directions,
+      `ALL` on either operator, multi-link and mid-chain INTERSECT runs, the
+      UNION/EXCEPT tie, the barrier with `ORDER BY` and `ORDER BY … LIMIT`, and
+      explicit parens overriding precedence the other way. **Proved to FAIL before
+      being trusted**: copied verbatim into a worktree at `70e1ca61`, 8 subtests
+      FAIL while all four controls and the entire barrier suite PASS there.
+      M0125-0006's matrix passes unchanged.
+      **The full 99-query SF0.5 gate was NOT run** — its guard refuses under the
+      live nightly batch, and although `FORCE=1` is legitimate for a
+      row-count/checksum gate, the sweep's ~21 GB Q5 peak does not fit beside the
+      wedged nightly server (7.5 GB of an 18 GB budget). The set-op subset
+      (Q8 Q14 Q23 Q38 Q49 Q87) was run instead: Q23/Q38/Q49/Q87 checksums are
+      **byte-identical** to the HEAD sweep `sweep-20260729-123114.txt`, and Q8's
+      ERROR + Q14's TIMEOUT are pre-existing and unchanged. TPC-DS cannot reach
+      this defect at all — Q8/Q14/Q38 are its only INTERSECT users and every chain
+      is homogeneous, hence associative. **A quiet-host loop should still run the
+      full gate once**, for the same reason M0124-0002 is waiting on one.
+- [x] **M0125-0017 — `ORDER BY`/`LIMIT` inside a parenthesised FIRST branch is
+      hoisted to the whole set-op result, silently dropping branches** (discovered
+      by M0125-0006 2026-07-29, ledger row 2026-07-29). `(A ORDER BY 1 LIMIT 2)
+      UNION ALL (C)` returns `{1,2}` where PG returns `{1,2,9}` — the entire
+      `UNION ALL` branch vanishes, because the LIMIT is applied to the union
+      instead of to the parenthesised branch. Pre-existing (identical on pre-fix
+      HEAD). The COMPOUND case already works via `InnerSegmentCount` (M0097-0044);
+      only the single-branch case is broken, because
+      `internal/parser/select.go:1036` records `InnerSegmentCount` only when the
+      parenthesised content was already a compound and `InnerSegmentCount == 0` is
+      the "unset" sentinel, so a one-branch inner group cannot be expressed.
+      **Resume**: M0125-0006's new `ParenBranches` is exactly 1 in this case and is
+      the natural carrier; consume it at `planner.go`'s `innerBoundary`.
+      **Accept by VALUE** ({ORDER BY only, LIMIT only, both} x {parenthesised
+      right branch, bare right branch}). Parser/planner change -> full pre-commit bar.
+      **DONE 2026-07-29** — design doc
+      `docs/design/0125-0017-setop-head-branch-sort-limit.md`. Fix =
+      `SelectStmt.InnerSortLimit`, one bit that makes `InnerSegmentCount`'s 0
+      mean "boundary after the FIRST branch" instead of "unset"; the planner
+      consumes it by NOT clearing the sort/limit before planning the head
+      branch, so `planSelect` applies them below the `SetOp` (which also lets a
+      leaf branch sort by a non-output expression, as PG does). No fold change
+      needed — a precedence barrier at segment 0 is vacuous. Also fixed a
+      latent plan-cache hazard in the same lines: the `InnerSegmentCount` path
+      blanked `s.OrderBy`/`Limit`/`Offset` without restoring them, so a second
+      `Plan()` of the same AST produced an unlimited plan. 18 executor + 2
+      planner + 7 parser cases, **proved to fail 8 executor subtests and both
+      planner invariants at `19d844b4`**. TPC-DS cannot reach the defect (a
+      reflection walk over all 99 query files found zero `InnerSortLimit`
+      nodes). Two PG behaviours deferred with ledger rows (2026-07-29): an
+      outer ORDER BY colliding with the head boundary, and a trailing clause
+      after the `')'` discarding the inner one — see M0125-0020 below.
+- [x] **M0125-0018 — IN-list and EXISTS reject a parenthesised set-op chain as an
+      operand** (discovered by M0125-0006 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0018-setop-chain-as-query-operand.md`, ledger rows
+      2026-07-29). Landed wider than filed. The probe found a **third** sibling
+      the report never named — `x = ANY ((A) UNION (B))`, `parseAnyTail`, same
+      one-token lookahead — and a **quiet** half of the same root cause:
+      `x IN ((SELECT multirow))` parsed as a one-element VALUE LIST holding a
+      scalar subquery and raised `21000 more than one row returned by a
+      subquery` where PG answers the IN (`select 1 in ((select 1 union select
+      2))` = `t` on the oracle). Peeling the `(` run is NOT a sufficient test:
+      `((select 1),(select 2))`, `((select 1)::int)` and `((select 1) + 1)` are
+      expressions in PG. The discriminator is what follows the group's matching
+      `)` — `,`/`::`/operator ⇒ expression; `)`/set-op/`ORDER`/`LIMIT`/`OFFSET`/
+      `FOR` ⇒ query. Fix = `selectWithParensAhead()` (non-consuming depth walk)
+      + `parseQueryOperandWithParens()` at all three sites, delegating to
+      `parseParenthesisedSelectStmt` so the operand inherits M0125-0016's
+      precedence and M0125-0017's head-branch sort/limit. EXISTS stays strict
+      (`EXISTS ((1))` still errors — gram.y gives it no expression alternative).
+      20 executor + 16 parser tests, **proved to fail 14 + 10 subtests at
+      `74f4b264`** with every control green. **TPC-DS cannot reach it** — zero of
+      99 SF0.5 query files match `(in|exists|any|all)\s*\(\s*\(`. Gates: units
+      PASS, `tpch-spotcheck.sh` PASS (Q12=2, Q13=35), pgbench smoke via hook.
+- [x] **M0125-0019 — `string_agg(x, ',' ORDER BY x)` ignores the aggregate's own
+      ORDER BY** (discovered by M0125-0006 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0019-aggregate-own-order-by.md`, two ledger rows
+      2026-07-29). Root cause was a **sibling asymmetry inside one `switch`**:
+      `applyAgg` has exactly two order-sensitive built-in branches and only
+      `array_agg` captured its keys — Hard-won Rule #2 verbatim. The clause was
+      intact at every upstream stage (parser `FuncCall.OrderBy`, M0125-0009's
+      `funcCallTailKey`, planner `AggregateCall.OrderBy` with `NullsFirst`
+      already defaulted by `sortByNullsFirst`). Fix = deferred concatenation
+      (`strElems`/`strDelims`/`strElemKeys`, live only when the call has an
+      ORDER BY, so the common path allocates nothing new) + `aggOrderBySortedIdx`,
+      one stable comparator now SHARED by both branches. The delimiter is the
+      subtle part: it is a per-row argument and PG emits the RIGHT-hand row's
+      own delimiter, so delimiters ride the same permutation as the values
+      (oracle-verified: `string_agg(n,d order by n)` over `('c','|'),('a','+'),
+      ('b','*')` = `a*b|c`). Also closed a LATENT second defect —
+      `planner.AggregateIsOrderSensitive` already allowed a parallel plan under
+      an ordered `string_agg` on the premise that the aggregate sorts its own
+      input, which was false until now, so such a plan could shuffle
+      differently on every run. 17 by-value subtests, **13 proved to fail at
+      `6088e41b` with all three controls green there**. TPC-DS cannot reach it
+      (zero of the 100 query files use `string_agg`/`array_agg`/`json_agg`/
+      `xmlagg`). Two ledger rows deferred → M0125-0021 (bytea held as text) and
+      the five order-sensitive aggregates with no `applyAgg` branch at all.
+- [x] **M0125-0021 — a `bytea` literal was carried as TEXT, so `encode()`
+      returned an empty string and `length()` counted escape characters**
+      (discovered by M0125-0019 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0021-pg-faithful-bytea-value.md`, three ledger rows
+      2026-07-29). `'\xaabb'::bytea` was the six-character **string**
+      `\xaabb`, not the two bytes. Two symptoms are loud (`length`=6 vs 2;
+      `order by b` sorted by the backslash), the third is not and is why this
+      was a defect rather than a gap: `encode` is *the* way a caller hex-dumps
+      a bytea, so a stub returning `''` instead of `42883` made a hex dump
+      silently produce nothing. Root cause = `evalCast` had **no `bytea` arm**,
+      so the cast fell through the pass-through default and kept `KindString`;
+      `encodeValuePG` had the same hole from the other side. `KindBytes` and
+      `decode()` already existed — what was missing was any path from a literal
+      into it. Fix = `internal/executor/bytea.go` (transliterations of
+      `byteain`, `hex_decode_safe`, `esc_decode`, `pg_base64_decode`,
+      `hex_encode`, `esc_encode`, `pg_base64_encode`, `byteaout`) wired in
+      **sibling pairs**: cast ↔ storage encoder, `decode(…,'hex')` ↔
+      `'\x…'::bytea`, `<bytea>::text` ↔ the wire renderer, and executor Kind ↔
+      `planner.exprType`'s advertised column type (a `KindBytes` datum typed
+      `text` reaches psql as raw bytes). The comparator arm is load-bearing:
+      once a column holds two bytes, `where b = '\xaabb'` would have matched
+      **nothing** — a wrong number turned into a silently empty result set.
+      Three upstream subtleties pinned: `encode(…,'escape')` is `esc_encode`
+      (NUL/high-bit/backslash only), NOT `byteaout`'s escape mode;
+      `pg_base64_encode` wraps at 76 chars so its own output must be decodable
+      (Go's `base64.StdEncoding` rejects those newlines); hex errors are
+      `22023` while `byteain`'s escape pass raises `22P02`. Also removed three
+      pre-existing `decode()` deviations. **Accepted BY VALUE**: a 27-statement
+      matrix through psql against a throwaway goopg server vs the PG 18.3
+      oracle (port 65438) diffed **byte-identical**, plus 40 by-value subtests.
+      Three ledger rows deferred: `int → bytea` casts, the `bytea_output` GUC,
+      and the remaining bytea operators (`position`/`overlay`/`trim`/
+      `get_byte`/`set_byte`/`bit_length`).
+- [x] **M0125-0020 — the set-op chain is now a TREE; the three annotations are
+      retired** (discovered by M0125-0017 2026-07-29; DONE 2026-07-29, design
+      `docs/design/0125-0020-setop-chain-as-tree.md`, three ledger rows
+      2026-07-29). goopg stored a set-op chain as a linked list
+      (`SelectStmt.SetOp.Right`) whose head doubled as its leftmost operand, so
+      a parenthesised head branch and the whole compound were ONE node sharing
+      ONE `OrderBy`/`Limit`/`Offset` slot, and `parseParenthesisedSelectStmt`
+      absorbed a set-operator written AFTER the `')'` into the parenthesised
+      query's own chain. The two filed shapes now match PG
+      (`(A ORDER BY 1 LIMIT 2) UNION ALL (C) ORDER BY 1 DESC` = `9,2,1`;
+      `((A ORDER BY 1 LIMIT 2) UNION ALL C) LIMIT 1` keeps both limits), and the
+      HEAD worktree probe found the damage was **wider than filed** — three more
+      shapes returned wrong ROWS, not merely a wrong order (`… ORDER BY 1 DESC
+      LIMIT 2` gave `9,3` for `9,2`; `((A LIMIT 1) UNION ALL (G LIMIT 1)) ORDER
+      BY 1 DESC` gave the single row `3` for `2,1`). Fix = a **grouping node**
+      (`SelectStmt.SetOpOperand`), built only when a set-operator or
+      ORDER/LIMIT/OFFSET follows the `')'`; token CONSUMPTION is unchanged, only
+      where clauses are STORED, which is why the whole existing
+      -0006/-0016/-0017 matrix stayed green unmodified. `Parenthesized` is
+      sharpened to "nothing followed the `')'`". Retires `ParenBranches`,
+      `InnerSegmentCount`, `InnerSortLimit`, `parenBoundary`, the paren-boundary
+      half of `cutAt`, and `headSortLimit`/`innerBoundary`/`sortLimitConsumed`;
+      `setOpBindsTighter` survives with `foldSetOpRange` as its only caller.
+      A grouping node has no target list, so the analyzer gained
+      `setOpLeftmostBranch` at 4 sites and 8 structural walkers + 2
+      simple-SELECT gates learned to descend through it. Accepted BY VALUE:
+      13 new executor subtests, **proved to fail 5 at `8ce216dd`** with every
+      control green, plus a 27-statement psql matrix **byte-identical** to PG
+      18.3. **TPC-DS CAN reach this one** (unlike -0018/-0019/-0021): Q87, Q14
+      and Q23 have parenthesised operands followed by a set-operator. Gates:
+      units PASS, `tpch-spotcheck.sh` PASS (Q12=2, Q13=35), SF0.5 subset probe
+      over the ten set-op queries PASS=6 ck-verified / MISMATCH=0 / ERROR=0 with
+      Q87+Q23 checksum-identical to the `sweep-20260729-123114` baseline,
+      pgbench smoke via hook. Deferred (ledger): `CREATE VIEW v AS (SELECT …)
+      UNION …` is a pre-existing view-body parser gap, `renameColumnInSelect`
+      still skips a set-op right branch, and the FULL 99-query SF0.5 gate is
+      still owed — but its six-loop blocker (the wedged nightly server) CLEARED
+      during this loop.
+- [x] **M0125-0007 — date input rejects unpadded month/day, and the comparison
+      path fails SILENTLY** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). PG's `DecodeDate`/`ParseDateTime`
+      (`postgres/src/backend/utils/adt/datetime.c`) accept 1-or-2-digit month and
+      day fields; goopg parses with a fixed Go layout
+      `time.Parse("2006-01-02", …)` (`internal/executor/expr.go:2874`, sibling
+      `parseDateFields` at `internal/pgnodes/datum.go:974`) and requires
+      zero-padding. **Two sibling paths disagree, which is the real defect**:
+      `cast('2002-5-01' as date)` / `date '2002-5-01'` / `'2002-5-01'::date` all
+      raise `invalid input syntax for type date`, but `d_date = '2002-5-01'`
+      raises nothing and **matches 0 rows**. A compat gap that errors is loud; one
+      that silently returns the empty set is a wrong answer — TPC-DS Q94 and Q95
+      report `0 / NULL / NULL` at a matching row count of 1, and Q16 did the same
+      undetected since chunk 2 (`0` vs PG `45`). Single-digit *day*
+      (`'2002-05-1'`) is affected identically.
+      **Accept by VALUE**: `select '2002-5-01'::date` = `2002-05-01`; the
+      comparison and cast paths agree on every form; TPC-DS Q16/Q94/Q95 asserted
+      against PG (Q95 = `57 / 85887.62 / -27169.36`; Q94 needs M0125-0008 too).
+      Sibling-path check per Hard-won Rule #2 — audit **every** date/time entry
+      point together (executor cast, implicit coercion in `codec.go:346`, COPY's
+      `copy_text.go:818`, `pgnodes/datum.go:974`), and cover timestamp/time as
+      well: the same fixed-layout idiom likely rejects unpadded hours. Prefer a
+      shared PG-faithful field decoder over per-site `time.Parse` layouts.
+      Design `docs/design/0125-0007-pg-faithful-date-field-decode.md`.
+      ~~**Blocked until the sweep reaches Q99**~~ — **UNBLOCKED 2026-07-29**: the
+      full 99-query SF0.5 gate ran (`analysis/tpcds-sf05-full-gate-20260729/`)
+      and reached Q99. It also supplies the **value-level** evidence this item
+      previously lacked: all three of Q16/Q94/Q95 now report the *identical*
+      goopg checksum `512b5fdab820c47b` (the `0/NULL/NULL` answer) against three
+      *different* oracle checksums (`40dbec0df91d2438` / `04afc1b69831a5ea` /
+      `e498634c02595c29`) — one defect, three queries, and a ready-made
+      acceptance signal: the fix must change that one goopg ck to three
+      distinct values matching the oracle. Executor/codec change, so it requires
+      `tpch-spotcheck.sh` + the SF0.5 gate per the pre-commit bar, plus
+      the full regress-port suite (Hard-won Rule #5 — this is a codec change).
+      **↳ DONE 2026-07-30** (`analysis/m0125-0007/README.md`, design
+      `docs/design/0125-0007-pg-faithful-date-field-decode.md`). New leaf package
+      `internal/pgdatetime` normalises PG's ISO numeric spellings — unpadded
+      month/day/hour/minute/second plus the surrounding-whitespace trim — in ONE
+      place, with `DecodeNumber`'s own `flen >= 3` floor on the leading field so
+      the DateStyle-dependent forms stay loud errors instead of becoming
+      silently-wrong dates. Every executor entry point routes through it: the
+      `date` and `timestamp`/`timestamptz` cast cases and `pg_input_is_valid`
+      (`expr.go`), and `parseTimeString` / `parseTimeTZString` /
+      `parseCopyTimestamp` (`copy_text.go`), which funnel COPY TEXT, `codec.go`'s
+      date encode and `tryParseStringAs`. `internal/pgnodes` needed nothing — its
+      `parseDateFields` was the lenient sibling all along. **A second silent wrong
+      answer was found and fixed on the way**: `ts_col = '2002-05-01 03:04:05'`
+      also matched nothing, fully padded, because `tryParseStringAs` tried
+      `parseTimeString` first and it anchors the stripped time at 1970-01-01.
+      **Acceptance: the predicted signature landed exactly** — the one goopg
+      checksum `512b5fdab820c47b` became three distinct ones and `0 / NULL / NULL`
+      became real numbers — but NOT the oracle's three, because a second defect
+      sits behind each, and the probe says which: **Q16 `63` and Q94 `7` now
+      OVER-count** PG's `23` and `2` (the EXISTS+NOT EXISTS shape = **M0125-0008**,
+      which did not previously name Q16), while **Q95 `5` UNDER-counts** PG's `23`
+      and contains no EXISTS at all (two `IN (subquery)` over a CTE — a different
+      mechanism, filed as **M0125-0023**). Gates: units PASS;
+      `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); regress-port quick set + the six
+      datetime suites diffed against a HEAD-`337526b1` worktree binary — 1/52 PASS
+      on both, every per-test diff byte-identical bar a clock-dependent `uuidv7`
+      test. **The full 99-query SF0.5 gate is still OWED** (ledger row): the
+      nightly CI batch held the host all loop, so only the 3-query value probe ran.
+      Five deferral rows record what PG still accepts and goopg does not, the
+      still-silent `d_date = 'garbage'`, the 22007-vs-22008 split, and two
+      pre-existing wrong answers this reproduction surfaced (dates outside Go's
+      `time.Time` nanosecond range round-trip wrong — `'0002-01-01'::date` gives
+      `1755-08-30`; a plain `timestamp` applies an explicit offset instead of
+      discarding it).
+- [x] **M0125-0008 — EXISTS + NOT EXISTS on the same outer relation yields a
+      NON-SUBSET result** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). With TPC-DS Q94's date literals padded so M0125-0007 is out of
+      the way, each correlated subquery is correct **alone** — base joins 33 rows
+      / 25 distinct orders (= PG), `+ EXISTS (… ws_warehouse_sk <> …)` 33/25
+      (= PG), `+ NOT EXISTS (web_returns …)` 11/9 (= PG) — but **together goopg
+      returns 25/18 where PG returns 11/9**. 25 is not a subset of the 11 that the
+      anti-join alone admits: adding a conjunct *grew* the result, so a residual
+      predicate is being dropped or mapped to the wrong source relation when a
+      SEMI and an ANTI join coexist over one outer rel. This is precisely the
+      "Semi/Anti residual ↔ source-table mapping" sibling pair named in Hard-won
+      Rule #2. PG control: the padded query returns `9 | 18130.71 | -9444.12`,
+      byte-identical to the unpadded run, so padding does not confound it.
+      **Start at** the semi/anti residual + `SourceTableIdx` mapping in
+      `internal/planner/` join construction (the M0077 Q21 work touched the same
+      mapping) and the anti-join operator in `internal/executor/`.
+      **Accept by VALUE**: the four-row isolation matrix above as a planner/executor
+      test (each subquery alone AND the conjunction), the monotonicity invariant
+      (result of `base + p + q` ⊆ result of `base + q`) asserted directly, and
+      TPC-DS Q94 = `9 | 18130.71 | -9444.12`. Design
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md`.
+      **Blocked until the sweep reaches Q99**; planner/executor change → full
+      pre-commit bar (`tpch-spotcheck.sh`, SF0.5 gate, `make plan-diff`).
+      **↳ UNBLOCKED, and Q16 now belongs here too (2026-07-30, M0125-0007's
+      acceptance probe).** With the date defect gone, both EXISTS+NOT EXISTS
+      queries over-count at SF0.5: **Q16 returns `63 | 319602.45 | -91294.46`
+      against PG's `23 | 93334.17 | -35323.69`**, and **Q94 returns
+      `7 | 10534.30 | 7178.64` against PG's `2 | 5037.18 | 1067.82`** — the same
+      conjunction-grows-the-result signature, on the catalog side. Add Q16's
+      values to the acceptance set; its four-row isolation matrix has not been
+      taken yet. Q95 is NOT this defect (it under-counts and has no EXISTS) —
+      see M0125-0023.
+      **↳ CLOSED 2026-07-30.** Design
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md` (indexed). Root
+      cause was NOT a dropped residual or a `SourceTableIdx` mis-map: a Semi/Anti
+      join publishes the OUTER row only, and every writer set its cached `schema`
+      to a *copy* of `Left.Output()` — then `rewriteMultiWayChain` OID-sorted the
+      subtree below the pinned spine **in place**, leaving that copy a stale
+      PERMUTATION. Widths still matched so nothing detected it; the damage came
+      from `reresolveJoinByName` re-resolving keys BY NAME against
+      `j.Left.Output()`, which for a semi/anti join *stacked on another one* was
+      the phantom layout — the upper join's key landed on `dsk` instead of `ord`,
+      matched nothing, and (anti) passed every probe row through. Hence the sharp
+      bisect: correct at 1–2 base tables, wrong from **3** (the MHJ-packing
+      threshold), and reversing the conjuncts moved the failure to whichever join
+      ended up on top. Fix is one derivation in `internal/planner/plan.go`
+      (`Join.Output()` returns `Left.Output()` for Semi/Anti) rather than a fifth
+      refresh site. **Q16 and Q94 both PASS the SF0.5 oracle's exact value
+      checksums** (`40dbec0df91d2438`, `04afc1b69831a5ea`). The predicted
+      four-row isolation matrix WAS taken and shipped as tests. **The item's
+      "Q95 is NOT this defect" note was wrong** — see M0125-0023.
+- [x] **M0125-0009 — `parserExprKey` fallback keys on the Go TYPE NAME, collapsing
+      sibling aggregates** (discovered by M0124-0001 chunk 12, ledger row
+      2026-07-28). **One-line root cause, wide blast radius.** Aggregate dedup
+      keys are built by `aggregateCallKey` → `parserExprKey`
+      (`internal/planner/planner.go:6891`, `:7425`), whose fallback is
+      `return fmt.Sprintf("expr:%T", e)` (**`planner.go:7484`**) — the Go type
+      name, carrying **no expression content**. Every `*parser.CaseExpr` therefore
+      hashes to the identical key, so the 2nd..Nth `sum(CASE …)` in one SELECT are
+      discarded as duplicates (`planner.go:5844-5846`) and every sibling pivot
+      column reads the **first** aggregate's slot. Reproducer:
+      `select sum(case when d_day_name='Sunday' then 1 else 0 end),
+      sum(case when d_day_name='Monday' then 1 else 0 end) from date_dim`
+      → goopg `10435|10435`, PG `10435|10436`. Controls that pin it (all correct
+      in goopg): distinct agg function names, `sum(d_dom+1), sum(d_dom+2)`
+      (`BinaryOp` has a real case), and `sum(col), sum(CASE …)` (mixed shapes).
+      **17 expression types share the fallback** — `CaseExpr`, `ExtractExpr`,
+      `InExpr`, `RowExpr`, `SubqueryExpr`, `ExistsExpr`, `IntervalLit`,
+      `ArrayConstructorExpr`, `ArraySubqueryExpr`, `ArraySubscriptExpr`,
+      `CollateExpr`, `IsBoolExpr`, `GroupingCall`, `TypedStringLit`,
+      `DefaultMarker`, `IndirectionStar`, `PartitionRangeBoundKeyword` — so the
+      class is far broader than CASE, and **the same key feeds GROUP BY matching**
+      (see the M0097-0003 comment at `planner.go:7443`), so grouping by two
+      distinct CASE expressions is suspect too. This is the **third** recurrence of
+      one failure mode: `planner.go:6905-6909` documents `count(*)` vs
+      `count(*) FILTER (WHERE …)` collapsing identically (M0097-0032), and
+      M0097-0003 the ColumnRef case. **Fix the fallback, not another special
+      case** — make the default path either recurse structurally over all
+      `parser.Expr` children or fail loudly (an unknown expr type must never
+      silently compare EQUAL to a different instance of the same type); a
+      deparse-based or reflective key would close all 17 at once. Add an
+      exhaustiveness test so a newly added Expr type cannot re-open this.
+      **Accept by VALUE**: the reproducer + control matrix as planner unit tests,
+      one test per previously-unhandled type, and the TPC-DS pivot queries
+      (Q43/Q50/Q66/**Q97**/**Q99**/Q2/Q39) asserted against PG.
+      **Chunk 13 (2026-07-28) added Q97 and Q99 as the 4th and 5th instances**,
+      raising the evidence to five queries. Q97 is the most legible instance in
+      the sweep and the sharpest acceptance case: its three columns
+      (`store_only`, `catalog_only`, `store_and_catalog`) are **disjoint by
+      construction**, so goopg's `392155|392155|392155` (PG:
+      `541140|286927|161`) is not merely wrong but internally impossible — assert
+      the disjointness invariant, not just the literal triple. Q99's five ship-lag
+      buckets show the same shape with col 1 correct and cols 2–5 replicating it
+      (`1231|1231|1231|1231|1231` vs PG `1231|1228|1289|0|0`), which pins the
+      "reads the FIRST aggregate's slot" mechanism directly.
+      **M0124-0006 (2026-07-29) settled the evidence set at TEN queries** — Q2 Q21
+      Q40 Q43 Q50 Q59 Q62 Q66 Q97 Q99 — with two corrections to the earlier guess.
+      (a) **Q39 is NOT an instance**: its `cov` columns differ by a relative
+      1.4e-16 (`…82042` vs `…82044`), i.e. float8 accumulation order, not a
+      collapse — drop it from the acceptance set. (b) **Q66 IS an instance**
+      despite its outer aggregates being `sum(<plain column>)` (a working
+      control): its *inner* derived table holds **48 `sum(CASE …)` siblings**
+      (`query66.sql:56+`) that collapse there, and the outer sums then faithfully
+      add twelve already-identical columns. The tell is that goopg's
+      `jan_net…dec_net` equal `jan_sales` **exactly** — every one of the 48
+      collapsed onto the first `sum(CASE)` in that subquery. Q66 is therefore the
+      widest-blast-radius acceptance case (34 wrong columns in 5 rows).
+      **Do not confuse this with M0125-0010** (filed 2026-07-29): that one
+      collapses sibling aggregates *by function name* through a FROM-subquery and
+      needs no `CASE`; this one collapses `CASE` expressions and needs no
+      subquery. Neither subsumes the other and both are live.
+      Design `docs/design/0125-0009-parser-expr-key-structural.md`.
+      **Sweep precondition SATISFIED 2026-07-28** (the sweep reached Q99; 99/99
+      measured) — the engine-commit freeze lifts once M0124-0001's merged
+      deliverable lands, which is the only remaining gate on starting this.
+      Planner change → full pre-commit bar.
+      Likely the single highest-value fix in the TPC-DS programme: it silently
+      corrupts every pivot-style aggregate query while keeping row counts intact.
+      **DONE 2026-07-29.** Fallback replaced by a reflective structural walk over
+      exported fields (`internal/planner/exprkey.go`), skipping the unexported
+      `pos` — the analogue of PG `equalfuncs.c`'s `COMPARE_LOCATION_FIELD` no-op,
+      and load-bearing: without it `GROUP BY <case>` would start raising a
+      spurious 42803. Nested nodes route back through `parserExprKey` so the
+      ColumnRef normalisation still applies at depth; maps render sorted for
+      determinism; cycles are path-marked. Two explicit cases leaked the same way
+      and were folded in — `FuncCall` dropped FILTER/OVER/in-arg ORDER BY/WITHIN
+      GROUP/VARIADIC (so `string_agg(x,',' ORDER BY a)` collapsed with
+      `… ORDER BY b`; `funcCallTailKey` now serves both `parserExprKey` and
+      `aggregateCallKey`, subsuming M0097-0032's one-off), and `CastExpr` dropped
+      `Typmods`. Exhaustiveness gate is two tests in
+      `internal/planner/exprkey_test.go`: a source scan of `exprNode()` receivers
+      that fails when a new Expr type is unregistered (goopg's answer to PG's
+      `elog(ERROR, "unrecognized node type")`), and a per-field test asserting
+      every exported field changes the key — exemptions must be declared with a
+      reason and a *stale* exemption fails too. Against the OLD key that test
+      enumerates **40+ field-level collapses**. **Measured at SF=1 (65436 vs
+      65438), all ten evidence queries re-run:** Q2/Q40/Q43/Q59 byte-identical to
+      PG; Q50/Q62/Q99 value-identical (differing only by the known `char(n)`
+      blank-padding gap — Q99 is now `1231|1228|1289|0|0` = PG, was
+      `1231|1231|1231|1231|1231`); flat reproducer `10435|10436|10436` = PG.
+      **Q21 and Q66 still diverge for an INDEPENDENT reason** — both wrap their
+      aggregates in a FROM-subquery, so `remapSubqueryColumnRefs` rebinds every
+      target to the first `sum` slot; that is **M0125-0010**, and the two defects
+      compose (each needs both fixes). This is the prediction in the "do not
+      confuse this with M0125-0010" note above, confirmed by measurement.
+      **Q97's collapse is gone** (`392155|177135|1553910`, was
+      `392155|392155|392155`) and its residual gap was isolated to a NEW defect —
+      **M0125-0011** below. Design
+      `docs/design/0125-0009-parser-expr-key-structural.md`.
+
+- [x] **M0125-0010 — FROM-subquery Project remap binds sibling aggregates by
+      FUNCTION NAME, so `select * from (select sum(a), sum(b) …) d` returns
+      `sum(a)` twice** (discovered by M0124-0006 2026-07-29, ledger row
+      2026-07-29). **One-line root cause, wrong answers, row counts intact.**
+      Minimal reproducer, no `CASE`, no `GROUP BY`, on the SF=1 clusters:
+      `select * from (select sum(d_dom) a, sum(d_year) b from date_dim) d;`
+      → goopg `1149021|1149021`, PG `1149021|146061700`. The identical flat query
+      (`select sum(d_dom), sum(d_year) from date_dim`) is **correct**.
+      Root cause: `remapSubqueryColumnRefs` (`internal/planner/planner.go:2450`)
+      is called **only** from the FROM-subquery path (`planSubqueryRangeVar`,
+      `planner.go:3158`). For every `Project` target that is a bare `ColumnRef` it
+      rebuilds the index by matching the **column name** against the child output
+      schema — `strings.EqualFold(cr.Name, sc.Name)` with `break` on the first hit
+      (**`planner.go:2468`**). An `Aggregate` names its output columns after the
+      aggregate *function*, so two `sum`s yield two child columns both named
+      `sum` and every target binds to the first slot. The pass's own comment calls
+      it a "safety-normalisation" for outer-resolve-context leakage; it is
+      unsound as written because **an output schema's names are not unique**.
+      Control matrix (all probed on 65436 vs 65438, read-only): flat / top-level
+      `GROUP BY` / CTE (`with x as (…) select * from x`) / different function
+      names (`sum,avg`; `sum,count(*),avg`) / non-`ColumnRef` target
+      (`max(a)+0`) / aggregates *outside* a `UNION ALL` derived table are **all
+      correct**; FROM-subquery with two same-named aggregates is wrong **even
+      with an explicit `d(x,y)` column list**, and selecting `d.b` alone returns
+      `a` — so it is the *inner* plan that is wrong, not outer name resolution.
+      `count(x)` vs `count(distinct x)` also collapse, because `DISTINCT` does not
+      change the output column name (`count(distinct …)` alone is correct:
+      probed 134220|18480 = PG).
+      **Fix the matching, not the names** — the remap must be positional, or must
+      refuse to rewrite when the child schema has duplicate names, or must key on
+      the target's identity rather than its label. Silently binding to the first
+      of N equally-named columns is the same failure mode as M0125-0009,
+      M0097-0032 and M0097-0003: *an ambiguous key resolved by taking the first
+      match*. Verify first whether the pass is still needed at all — if the leakage
+      it guards against is gone, deleting it is the better fix; if it is still
+      needed, add a regression test for the leakage case before changing it.
+      **Evidence (4 TPC-DS queries, all `OK`/`OK` with matching row counts)**:
+      **Q28** (`count`/`count distinct` pair wrong in all six cross-joined blocks;
+      `avg` correct), **Q46** (`profit` = `amt`), **Q68** (`extended_tax` and
+      `list_price` both = `extended_price`), **Q79** (`profit` = `amt`).
+      **Accept by VALUE**: the reproducer + the full control matrix above as
+      planner unit tests, plus Q28/Q46/Q68/Q79 asserted against PG. Row-count
+      gates cannot see this class — `scripts/tpch-spotcheck.sh` and the SF0.5
+      oracle both pass today.
+      Design: extend `docs/design/0125-0009-parser-expr-key-structural.md` with a
+      second section (same failure mode, different key) rather than a new doc.
+      Planner change → full pre-commit bar. Blocked by the same engine-commit
+      freeze as M0125-0009 (lifts when M0124-0001's merged deliverable lands).
+      **UNBLOCKED 2026-07-29** (freeze lifted; M0125-0009 landed). **Evidence
+      grew to SIX queries**: re-running the M0125-0009 acceptance set at SF=1
+      showed **Q21** and **Q66** still divergent *after* the CASE collapse was
+      fixed, and both are this shape — Q21 is
+      `select * from (… sum(case…) inv_before, sum(case…) inv_after …) x`
+      (goopg `1516|1516`, PG `1516|2833`) and Q66's inner derived table holds the
+      48 `sum(CASE …)` siblings whose now-distinct slots are re-collapsed by the
+      remap (34 replicated columns in 5 rows — the widest blast radius on record).
+      The two defects **compose**: Q21/Q66 need both fixes, so neither can be
+      graded by "does the query match PG" alone. **This is now the top of the
+      value-divergence queue.**
+      **CLOSED 2026-07-29.** Fix = `remapSubqueryColumnRefs` is now
+      **verify-then-repair**: a bare-`ColumnRef` target whose existing index is
+      in range AND names the column the ref asks for is left untouched (the only
+      branch that can tell two same-named child columns apart, so it must run
+      before any name search); only an out-of-range index, or one naming a
+      different column — the actual M0097-0058 leakage signature — is re-derived
+      by name. A plan dump with the pass disabled proved the **pre-remap indices
+      were already correct**: the pass was causing the damage, not repairing it.
+      A *positional* remap (which the pass's own doc comment claimed to
+      implement) was rejected — it breaks any `Project` that reorders or subsets
+      its child (`select b, a from t`). Gate = 3 tests in the new
+      `internal/planner/subquery_remap_test.go`; against the old code 4 of the 6
+      control-matrix rows fail, `group by` as the partial collapse `[0 1 1]`.
+      The third test is the M0097-0058 leakage-repair guard, without which the
+      fix could be "simplified" into deleting the pass and reintroducing the
+      original index-out-of-bounds crash. **Measured at SF=1 (65436 vs 65438):
+      all six carrier queries now match PG** — reproducer and Q21 byte-identical,
+      Q28/Q46/Q66/Q68/Q79 identical modulo the separate `char(n)` padding gap.
+      Q21 and Q66 needed BOTH this and M0125-0009. Artifacts
+      `analysis/m0125-0010-acceptance/`; design = §9 of
+      `docs/design/0125-0009-parser-expr-key-structural.md`; ledger row
+      2026-07-29 records the undiagnosed leak the pass still guards.
+- [x] **M0125-0011 — FULL OUTER JOIN drops all but the FIRST conjunct of its ON
+      condition** (discovered by M0125-0009's acceptance run, 2026-07-29, ledger
+      row 2026-07-29). Isolated on the SF=1 clusters from TPC-DS **Q97**, whose
+      residual divergence survived the M0125-0009 fix. Probe matrix (goopg 65436
+      vs PG 65438, read-only, `ssci`/`csci` = Q97's two CTEs):
+
+      | probe | goopg | PG |
+      |---|---|---|
+      | `count(*)` of each CTE | `548694 / 287769` | `548694 / 287769` |
+      | `ssci JOIN csci ON (customer_sk AND item_sk)` | `161` | `161` |
+      | `ssci FULL OUTER JOIN csci ON (customer_sk)` | `2131274` | `2131274` |
+      | `ssci FULL OUTER JOIN csci ON (customer_sk AND item_sk)` | **`2131274`** | **`836302`** |
+
+      The inputs agree, the INNER join on both keys agrees, and the single-key
+      FULL OUTER JOIN agrees exactly — only the two-conjunct FULL OUTER JOIN
+      diverges, and it returns *precisely the single-key number*, so the second
+      equality is being dropped rather than mis-evaluated. PG's `836302` is
+      `548694 + 287769 − 161`, the full-outer identity for 161 matches, which
+      independently confirms the reference side. (`sum(case …)` totals sit `8074`
+      below the row count on BOTH engines — rows with NULL `customer_sk` on both
+      sides match no CASE arm; not a defect, do not chase it.)
+      **Start at** the FULL OUTER JOIN construction in `internal/planner/` — how
+      a multi-conjunct `ON` is split into join keys vs residual, and whether the
+      residual is attached at all for the FULL variety (the INNER path clearly
+      keeps it, since the inner join returns PG's 161). Then the full-outer
+      operator in `internal/executor/`. Related sibling pair from Hard-won Rule
+      #2: Semi/Anti residual ↔ source-table mapping (see M0125-0008).
+      **Accept by VALUE**: the four-row probe matrix above as a planner/executor
+      test (a two-key FULL OUTER JOIN must NOT equal its single-key counterpart),
+      plus TPC-DS Q97 = `541140|286927|161`. Unlike M0125-0009 this one *changes
+      the row count*, so the SF0.5 gate and the nightly anchors can see it —
+      check whether Q97's anchors need re-pinning once fixed.
+      Design `docs/design/0125-0011-full-outer-join-on-conjunct-drop.md`.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
+      gate, `make plan-diff`).
+      **DONE 2026-07-29.** Cause was NOT in the planner: `splitEqualityForHash`
+      correctly returns *a* key and leaves the whole ON clause in
+      `Join.Predicate`; the executor's `runMergeJoin` then **never read
+      `Join.Predicate` at all**, so every conjunct after the first was dropped.
+      Fourth instance of Hard-won Rule #2 — nested-loop, lateral and hash all
+      call `joinPredicateMatch`, only the merge twin omitted it (which is why
+      the INNER probe was already right). The bug was **wider than filed**:
+      RIGHT OUTER JOIN is routed to `JoinAlgoMerge` too and was wrong the same
+      way. It also *lost* rows, not just invented them — the `cmp<0`/`cmp>0`
+      arms only null-extend rows whose KEY found no partner, so a row whose key
+      matched but whose residual failed could not be emitted at all. Fix
+      mirrors `nodeMergejoin.c` (`EXEC_MJ_JOINTUPLES` → `ExecQual(joinqual)`,
+      then `MJ_FILL_OUTER`/`MJ_FILL_INNER`). Accepted by value: the four-row
+      probe matrix above now matches PG on **all** rows (two-key FOJ `836302`,
+      was `2131274`) and Q97 = `541140|286927|161`. Gates: 24-cell PG
+      differential (4 join types × 6 ON shapes incl. NULL keys and
+      non-equality residuals, 24/24 match); new
+      `TestExecMergeJoinAppliesResidualConjuncts` (fails 5/5 subtests pre-fix);
+      units suite; `tpch-spotcheck.sh` PASS (Q12=2, Q13=35); full SF0.5 sweep;
+      `make plan-diff`.
+      **The SF0.5 gate DOES see it, as predicted** — full 99-query sweep went
+      `PASS=73 CKMISMATCH=5` -> `PASS=74 CKMISMATCH=4`, with **Q97
+      `CKMISMATCH -> PASS` the ONLY per-query change of 99** (baseline
+      `analysis/tpcds-sf05-ck-m0124-0005/sweep/sweep-20260729-064607.txt`), and a
+      same-harness A/B reads pre-fix `ck=5687f61d9fdd4f93` vs post-fix
+      `ck=65725195ebe13a3b` (= the oracle). **No Q97 anchor re-pinning needed** —
+      the oracle was already right; goopg moved onto it.
+      **⚠ Gate-integrity trap found en route (ledger row 2026-07-29).** An
+      earlier probe appeared to show the SF0.5 gate was BLIND to this defect —
+      it was an artifact, and the wrong conclusion was nearly recorded here.
+      `scripts/tpcds-sf05-regression.sh`'s **sweep path never rebuilds
+      `tmp/goopg-bench-bin`**: line 256 guards the build with `[[ -x
+      "${GOOPG_BIN}" ]] ||` and sits in `load-goopg`, not `sweep`. So editing or
+      `git stash`-ing a source file changes nothing about what the sweep runs —
+      it measures whatever binary was last left in `tmp/` (possibly the nightly
+      batch's). **A source-level A/B against this gate is meaningless without an
+      explicit `go build -o tmp/goopg-bench-bin ./cmd/goopg` in each arm, and a
+      green sweep after an edit does not prove the edit was exercised.**
+      (`bench/tpcds/server.sh` *does* rebuild unconditionally, so which entry
+      point started the server decides whether your change is under test.)
+      Remaining real gap, filed as the other ledger row: `Join` still carries ONE
+      key pair against PG's mergeclause **list**, so multi-key merge joins are
+      now correct but less selective than PG.
+
+> **Scope note (2026-07-29).** The four tasks below (**M0125-0012 … -0015**) adopt
+> the last four TPC-DS defects that had **no owning task** — they existed only as
+> deferral-ledger rows, which M0119 consumes as a *backlog*, not as a schedule.
+> `docs/milestones/0125-*.md` previously listed Q47/Q49/Q51 under **Out of scope**
+> with "all get a ledger row from M0124-0003 so they are not orphaned"; that was
+> written before M0124-0001 measured the full SF=1 board and before the ledger
+> row `tpcds-round2 q47-q49-q51` established they are **three distinct defects**
+> ("All three are separate fix_plan items, **not one**"). The milestone doc is
+> updated in the same commit. Q8 was never in that out-of-scope list — it simply
+> had no task at all, despite being the sole unresolved member of round 1's
+> nine-error set.
+>
+> **Gate visibility, measured — not assumed.** An earlier draft of this note
+> claimed all four are visible to "the SF0.5 gate and the nightly anchors". Only
+> half of that is true, and the same commit that filed these tasks records
+> M0125-0011's measured negative result that a row-count change is *not*
+> automatically detectable. Checked against
+> `bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260729-093056.txt` (HEAD)
+> and `ci/batch/tpcds-row-anchors.csv`:
+>
+> | | SF0.5 gate at HEAD | nightly anchors |
+> |---|---|---|
+> | Q8 | **sees it** — `ERROR 12s` | **absent** |
+> | Q47 | **sees it** — `MISMATCH 43s goopg=0 oracle=100` | **absent** |
+> | Q49 | **PASS 25 rows, ck matches** — blind | **absent** |
+> | Q51 | **PASS 100 rows**, `ck=n/a` — blind | **absent** |
+>
+> The anchor CSV pins 61 queries and contains **none of these four** (it does
+> contain `Q75`, which is why that one is a live CI break and these are not).
+> Closing any of them therefore requires **adding** an anchor, not re-pinning one.
+>
+> **Q49 and Q51 flipped MISMATCH → PASS at SF0.5 when M0125-0009 landed**
+> (`sweep-20260729-004730` at `7a7a2639` vs `sweep-20260729-033758` at
+> `3fbce36a`); no completion note or ledger row records that. **Neither has been
+> re-measured at SF=1 since**, so the first step of both tasks is a measurement,
+> not a fix — see -0014 / -0015.
+>
+> None of the four depends on M0124-0005's checksum column for *acceptance*
+> (each differs in rows or errors), but Q47 and Q51 carry `ck=n/a` in the SF0.5
+> oracle (a `LIMIT` over a non-total `ORDER BY`), so SF0.5 cannot value-accept
+> them either — value acceptance is SF=1 only. All four are planner/executor
+> changes, so `make plan-diff` applies with M0125-0004's `r5-default` fallback
+> until M0124-0002 lands the `tpcds-round2-head` label.
+>
+> **File order is NOT work order.** The recommended sequence is in the
+> milestone's "Interleaving rule": **-0014 / -0015 (measure first, may close
+> outright) → -0013 → -0006 / -0007 → -0012 → -0008**. In particular
+> **M0125-0012 has a soft dependency on M0125-0001** — if the driver has not
+> landed, take another item rather than hand-rolling a fifth walker.
+
+- [x] **M0125-0012 — Q8: a `ColumnRef` below a FROM-subquery `Project` keeps its
+      OUTER-scope index** (round-1 §4.2 fix #8, ledger row `tpcds-round2 Q8`
+      2026-07-27). **The only unresolved member of round 1's nine goopg-only
+      errors**, and the sole `ERROR` in the SF=1 sweep that is not Q75.
+      Measured `ERROR 26 s` at SF=1 against PG's `OK 0 s / 0 rows`
+      (`analysis/tpcds-sf1-resweep-20260728/RESULTS.md` row 8):
+      `column ref ca_zip/57 out of MaterializedSlot range 1`; **server survives**
+      (verified `select 1` after) so this is contained, not a crash.
+      **Cheap reproduction: SF0.5 reproduces the identical ERROR in 12 s**
+      (`tpcds-results-sf05/sweep-20260729-093056.txt`) against 26 s + EXPLAIN at
+      SF=1 — iterate there.
+      **What already landed, so it is not re-attempted:** `9ddbc679`'s
+      `containsSetOp` guard protects `pushdown.go:241`, `pushdown.go:264` and
+      `planner.go:2078` — it never protected the remap path, which is why Q8
+      kept failing after it. `9740fce9` then gave `buildBindingsPosMap`
+      (`internal/planner/bushy.go`) its `SetOp`/`RecursiveUnion`/`WorkTableScan`/
+      `WindowAgg`/`ProjectSet`/`OrdinalityWrap`/`RowsFrom`/`IndexOnlyScan`
+      opaque-leaf arms plus a decline-on-unknown `default:`, and bounds-checked
+      `*MaterializedSlot`/`*Slot` in `evalExprSlot`
+      (`internal/executor/expr.go:353`) — that pair is what turned the panic
+      into a contained `XX000`.
+      **Mechanism of the residual (already root-caused, do not re-diagnose):**
+      `ca_zip` = 57 is a **global FROM-order** index reaching a **1-column**
+      `MaterializedSlot` — the INTERSECT-in-FROM subquery's own `Project` scope,
+      which `buildBindingsPosMap` never governs. `remapSubqueryColumnRefs`
+      (`internal/planner/planner.go`) rewrites only `Project` **targets**; a
+      `ColumnRef` inside a `Filter` predicate *below* that `Project` is left
+      holding the outer-scope index.
+      **Fix direction:** extend the subquery-scope remap past `Project` targets
+      to `Filter.Predicate`, `Join.LeftKey/RightKey` and
+      `Aggregate.GroupExprs/Aggs`. **⚠ Compose with M0125-0010, do not revert
+      it** — that task deliberately narrowed the pass to *verify-then-repair*
+      (leave a target whose index is in range AND names the right column;
+      re-derive only the out-of-range / wrong-name leakage signature). Every new
+      node kind must keep the verify-first branch or this becomes the **fourth
+      recurrence** of "ambiguous key resolved by taking the first match" — the
+      fifth *instance*, on the numbering `2e09250b` established when it called
+      M0125-0010 the "Third recurrence, after M0097-0003/-0032 and M0125-0009".
+      Prefer routing the new arms
+      through **M0125-0001**'s driver if it has landed; hand-rolling a fifth
+      walker is exactly the copy-paste family M0125-0001/-0002 exist to delete.
+      **⚠ Acceptance trap — "0 rows" is NOT an acceptance criterion.** PG
+      returns **0 rows** for Q8 at SF=1, so any bug that yields an empty result
+      also "matches PG". Accept instead on: (a) no `ERROR`, (b) rows = PG's 0,
+      **and (c)** a discriminating probe — the same INTERSECT-in-FROM shape with
+      predicates relaxed until PG returns a non-empty set, asserted equal by
+      value on both engines. **The probe is only valid if it FAILS on pre-fix
+      HEAD** with the same `column ref … out of MaterializedSlot range` error:
+      relaxing predicates can change the plan into one that never touches the
+      defective path, and a probe that already passes proves nothing. (Repo
+      precedent: M0125-0011's gate fails 5/5 subtests pre-fix; root-0036's fails
+      7 of 8 with the hunk stashed.) Add the probe as a planner/executor unit
+      test so the discriminator outlives the task.
+      Repro: `scripts/tpcds-bench-compare.sh 8`.
+      Design `docs/design/0125-0012-q8-subquery-scope-index-remap.md`.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, SF0.5
+      gate, `make plan-diff`).
+      **DONE 2026-07-29.** ⚠️ **The "Mechanism of the residual … do not
+      re-diagnose" paragraph above is REFUTED** — keep it only as the record of
+      what was believed. Measuring the planned tree shows the outer `Filter`'s
+      `ca_zip` index (57 at SF=1, 9 in the replica) was **already correct**, and
+      no `Filter` below the subquery `Project` carried a stale ref at all. The
+      failing ref is the V1 subquery's **own `Project` target** above the
+      1-column `SetOp`, which `remapSubqueryColumnRefs` had numbered correctly
+      as `ca_zip/0`; `applyJoinTreePosMap` (`bushy.go`) then descended into that
+      `Project` — it stopped only at `IsolatedScope` wrappers — and rewrote the
+      target with the OUTER bindings' posMap, which matched the outer binding
+      that also starts at 0 (`store_sales`) and returned its **MHJ-reordered**
+      offset. So 57 is a join-order offset, not the "global FROM-order index"
+      the ledger read it as. Fix = stop at every join-tree `Project`, matching
+      `buildBindingsPosMap`'s `collect` ("Extend it to all Projects … and
+      stop") — the build half had been generalised and the apply half had not
+      (Hard-won Rule #2). **D1/D2/D3 were not implemented**: no fifth walker was
+      hand-rolled and M0125-0010's verify-then-repair narrowing is untouched.
+      Acceptance trap honoured: a **non-empty** doll-house probe verified
+      byte-identical on PostgreSQL 18.3 (`alpha|5`, `beta|7`), shipped as
+      `internal/planner/q8_subquery_scope_posmap_test.go` (structural: every
+      `Project` target addresses its own child) and
+      `internal/executor/q8_subquery_scope_remap_test.go` (values), **both
+      proved to FAIL pre-fix** with `ca_zip/6 … out of MaterializedSlot range 1`,
+      plus a shape guard that skips loudly if the defective plan stops being
+      produced. **Residual deferred (ledger 2026-07-29):** Q8 leaves the ERROR
+      class and joins the **timeout class** — the `substr` residual is evaluated
+      on a CROSS join above the full three-way MHJ with `d_qoy`/`d_year`
+      unpushed, so at SF0.5 it exceeded a 1500 s client budget (elapsed 1633 s)
+      where it previously errored at ~11 s. Pre-existing plan-quality defect, not a regression: the fix changes
+      one `ColumnRef` index and no plan shape.
+- [x] **M0125-0013 — Q47: a SECOND defect downstream of the CTE body RC-1b
+      repaired** — **DONE 2026-07-30.** The premise was wrong in a precise and
+      instructive way: the second defect is NOT above the CTE, it is in the CTE
+      body, in the half RC-1b never measured. RC-1b checked the body by ROW
+      COUNT and the row count was already right — goopg's 4-way join produces
+      **332,240 rows, exactly PG's**, with every join predicate and filter
+      correct. Only the PROJECTION read the wrong columns (`i_category` returned
+      `s_store_sk`, `d_year` returned `s_county`, `d_moy` returned `s_zip`). So
+      `GROUP BY i_category` grouped on `s_store_sk` (6 groups vs 11), 6-column
+      and 4-column `GROUP BY` both collapsed to the same 29,617, and
+      `rank() over (partition by …)` partitioned on columns unique per row —
+      making **`rn` 1 for every row** (PG: 1..14) and `v1.rn = v1_lag.rn + 1`
+      the unsatisfiable `1 = 2`. The windowed self-join layers were never
+      broken; they were fed a permutation. Root cause: `buildBindingsPosMap`'s
+      `*MultiHashJoin` arm matched only bare scans, so a leaf wrapped in a
+      `*Filter` by `pushSingleSourceFiltersIntoMHJTables` (Q47's multi-column OR
+      disjunction, pushed into `date_dim`) was skipped silently — recording no
+      entry AND never advancing `off`. Design
+      `docs/design/0125-0013-mhj-posmap-filtered-leaf.md` (indexed); 2 regression
+      tests verified RED with the fix reverted; 3 ledger rows.
+      **Q47 now returns exactly 100 rows = the SF0.5 oracle.**
+      **STILL OPEN, split out as bookkeeping:** the STEP-0 runtime verdict
+      (set A `OK 17 s` → HEAD `OK 142 s`) — no timing on this host can settle
+      it, see the 2026-07-30 ledger row. Original text follows.
+
+- [ ] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
+      (ledger rows `tpcds-round2 q47-q49-q51` 2026-07-29 and M0125-0013
+      2026-07-30; §13.4 item 2). The ROW defect is closed — Q47 returns 100
+      rows = oracle as of 2026-07-30. What remains is purely a documentation
+      contradiction about its RUNTIME, and it is a bookkeeping repair of
+      M0124-0001's deliverable, not engine work.
+      set A `OK 17 s` → HEAD `OK 142 s` (8.4x, reproduced standalone at 143 s,
+      `analysis/tpcds-sf1-resweep-20260728/diag-q47-rerun.txt`). Two primary
+      sources disagree and this item should close the gap: `RESULTS.md` chunk
+      49–56 and the RC-1b ledger row read it as the **expected cost** of newly
+      non-empty input ("14s->143s confirms real work"), while the merged
+      deliverable `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6 still calls it
+      "bounded but **unattributed**" (it reproduces chunk 41–48's superseded
+      reasoning). Record the verdict in whichever document is wrong.
+      **Needs a QUIET host** (`pgrep -af run-nightly.sh` first): every timing
+      taken on 2026-07-30 was under the nightly CI batch at load ~10. Take the
+      `EXPLAIN` diff against set A's plan BEFORE any further plan-shape change,
+      since the comparison is only interpretable while the plan is unchanged.
+      Structural evidence now favours the RC-1b reading — post-fix `v1` yields
+      54,915 groups (was 29,617 mis-grouped) and `rank()` yields 14 distinct
+      values (was 1), so `v2`'s three-way self-join does strictly more real
+      work than any pre-RC-1b measurement — but that is an argument, not a
+      measurement, so the item stays open.
+      **Accept by VALUE**: Q47 = 100 rows = PG **and** values equal PG at SF=1.
+      The SF0.5 gate sees the row gap today, so it will register the fix; the
+      **nightly anchors will not** — `ci/batch/tpcds-row-anchors.csv` pins 61
+      queries and contains no Q47 row, so closing this means **adding** an anchor,
+      not re-pinning one.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q47).
+      Planner/executor change → full pre-commit bar.
+- [x] **M0125-0014 — Q49: re-measure at SF=1, then resolve or classify the
+      30-vs-34 row gap** — **DONE 2026-07-30, CLOSED AT STEP 0 as
+      *measured-and-already-fixed*.** goopg at SF=1 on HEAD `f3f31d87` returns
+      **34 rows = PG** with an **identical value checksum** (`63ace0d888e86982`;
+      `tpcds-value-diff.py` = `RENDERING-ONLY (numeric scale)`), in `OK 83 s`.
+      The `OK 79 s / 30` reading this item was written against is superseded.
+      Anchor `Q49,34,pinned` added, and Q49 added to `stage-tpcds.sh`'s sweep
+      order — **but see the M-NIGHTLY item above: the TPC-DS anchor mechanism is
+      dead, so the anchor is inert until that lands.** No mechanism was ever
+      identified; the candidates below are retired unanswered, not solved.
+      Evidence `analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q49
+      "Execution record"; ledger rows updated (`tpcds-round2 Q49` → resolved). (round-2 §5a, ledger rows `tpcds-round2 Q49` 2026-07-27
+      and `tpcds-round2 q47-q49-q51` 2026-07-29). Shaped like M0124-0004
+      ("recover or classify") because the premise moved after it was written.
+      **Unchanged by RC-1b, which disproves its provisional RC-1b-family
+      attribution** — a second defect, not a variant of Q47's.
+      **⚠ STEP 0 — the SF=1 number is stale.** Q49 flipped `MISMATCH 24/25` →
+      `PASS 25` at SF0.5 the moment **M0125-0009** landed
+      (`sweep-20260729-004730` at `7a7a2639` vs `sweep-20260729-033758` at
+      `3fbce36a`; HEAD's `sweep-20260729-093056` still PASSes, checksum matching),
+      and **nobody recorded that** — no completion note, no ledger row. Q49 has
+      **not** been re-measured at SF=1 since -0009/-0010/-0011 landed. Measure it
+      first: if SF=1 now returns 34 = PG by value, this task closes as
+      *measured-and-already-fixed* and its ledger rows get an UPDATE naming
+      M0125-0009 — a legitimate completion, not a skipped one. Only if the gap
+      survives does the diagnosis below apply.
+      Shape: three `UNION ALL` branches (web / catalog / store), each ranking a
+      derived ratio and filtering `return_rank <= 10 or currency_rank <= 10`.
+      goopg returns exactly **30** — suspiciously exactly 3 × 10, which is what a
+      collapse of the two-rank `OR` into a single rank filter would produce.
+      **Ruled out by probe, do not re-test:** `rank()` peer-tie handling.
+      `rank`, `dense_rank` and `row_number` over a tied `ORDER BY` are
+      byte-identical to PG (`1,1,3,3,3,6` on both), so the `<= 10` filter is not
+      silently degrading to `row_number` semantics.
+      **Remaining candidates** (§5a): (1) the `decimal(15,4)` division producing
+      `return_ratio` / `currency_ratio` — a precision difference reorders ties and
+      changes which rows sit at rank 10; (2) the mixed
+      `store_sales sts LEFT OUTER JOIN store_returns sr … , date_dim` shape, i.e.
+      the outer-join-plus-comma-join form §2.3 flags as unverified.
+      **The cheap SF0.5 reproduction is GONE.** §5a's one-row gap (24 vs 25) was
+      the recommended bisect target; it no longer reproduces (see STEP 0), so
+      SF0.5 is a *regression* gate for Q49 now, not a *detection* gate — the same
+      distinction M0125-0011 established by measurement. Any new minimal repro
+      has to be constructed, not inherited.
+      **Accept by VALUE**: 34 rows = PG and values equal PG **at SF=1**.
+      "25 rows at SF0.5" is NOT an acceptance signal — HEAD already satisfies it.
+      No Q49 row exists in `ci/batch/tpcds-row-anchors.csv`, so add one on close.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q49).
+      Planner/executor change → full pre-commit bar.
+- [x] **M0125-0015 — Q51: re-measure at SF=1, then resolve or classify the
+      0-vs-100 row gap** — **DONE 2026-07-30, CLOSED AT STEP 0 as
+      *measured-and-already-fixed*.** goopg at SF=1 on HEAD `f3f31d87` returns
+      **100 rows = PG** with an **identical value checksum** (`443e242cfab22c02`;
+      `tpcds-value-diff.py` = `RENDERING-ONLY (bpchar/width)`), in **`OK 47 s`**
+      — the runtime this item required be reported. **The budget-marginality
+      warning is retired**: 553 s of headroom under the 600 s cut, not 13 s, so
+      Q82 (44 s) is again the sweep's narrowest `OK` margin. The 587 s → 47 s
+      drop is most likely the `LIMIT 100` finally saturating rather than a speed
+      fix — consistent, unverified, not claimed. Anchor `Q51,100,pinned` added
+      (inert, same caveat as -0014). "Third distinct defect" is now a **dropped**
+      question, not an answered one — no mechanism was ever found.
+      Evidence `analysis/m0125-0014-0015-q49-q51-sf1/`; design doc § Q51
+      "Execution record"; ledger row `tpcds-round2 q47-q49-q51` updated (stays
+      open for Q47). (ledger row `tpcds-round2 q47-q49-q51` 2026-07-29,
+      §13.4 item 2). Same "resolve or classify" shape as -0014, for the same reason.
+      **Also unchanged by RC-1b.** §13.4 item 2 calls it "a **third** distinct
+      defect" on that basis, but the later measurements deliberately kept the
+      question open — `RESULTS.md` chunk 49–56 says its RC-1b family membership
+      "stays **probable, unproven**", and the M0124-0001 ledger row says "**either
+      Q51 is a different defect or it shares Q47's downstream one**". Treat
+      "distinct" as the leading hypothesis, not as settled. No mechanism is
+      claimed; §13.3 records only the shape, "a wrong answer that had been hiding
+      behind a timeout", the same shape M0124-0004 names for Q35.
+      **⚠ STEP 0 — the SF=1 number is stale, exactly as for -0014.** Q51 flipped
+      `MISMATCH 0/100` → `PASS 100` at SF0.5 when **M0125-0009** landed, and still
+      PASSes at HEAD; unrecorded anywhere. **Re-measure at SF=1 against
+      M0124-0001's sweep row (`OK 587 s / 0` vs PG `OK 1 s / 100`) BEFORE assuming
+      a mechanism** — one ~590 s observation may close this task outright.
+      Note SF0.5 cannot value-accept it either: its oracle entry is
+      `51|OK|100|n/a|1`, i.e. `ck=n/a`.
+      **⚠ Budget-marginal on the `OK` side — 13 s of headroom under the 600 s cut,
+      the NARROWEST `OK` margin of the sweep (Q82's 44 s is the next-narrowest).**
+      Any fix that
+      adds work can flip it to `TIMEOUT` and *mask* a correct row count. Time it
+      explicitly and report the runtime alongside the rows; if it crosses the
+      budget, raise the budget for the acceptance run rather than declaring the
+      fix a regression (`analysis/tpcds-sf1-goopg-20260728.md` §5).
+      **Accept by VALUE**: 100 rows = PG and values equal PG **at SF=1**, with the
+      measured runtime recorded. "100 rows at SF0.5" is NOT an acceptance signal —
+      HEAD already satisfies it. No Q51 row exists in
+      `ci/batch/tpcds-row-anchors.csv`, so add one on close.
+      Design `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` (§ Q51).
+      Planner/executor change → full pre-commit bar.
+- [x] **M0125-0023 — TPC-DS Q95 UNDER-counts: two `IN (subquery)` over the same
+      CTE drop rows PG keeps** (discovered 2026-07-30 by M0125-0007's acceptance
+      probe; ledger row same date). With the unpadded-date defect gone, Q95
+      returns **`5 | 11180.00 | -6205.20`** at SF0.5 where PG returns
+      **`23 | 45031.03 | -1282.36`** (goopg ck `663cec31dac6449c`, oracle ck
+      `e498634c02595c29`). It is **not** M0125-0008: Q95 contains no `EXISTS` at
+      all, and it loses rows rather than gaining them. Its two gates are
+      `ws1.ws_order_number in (select ws_order_number from ws_wh)` and
+      `ws1.ws_order_number in (select wr_order_number from web_returns, ws_wh
+      where wr_order_number = ws_wh.ws_order_number)`, both over the same
+      self-joined CTE `ws_wh` — so the suspects are IN-subquery → semi-join
+      conversion when the inner side is a CTE reference, and CTE re-evaluation
+      across two references in one WHERE. **First step is the isolation matrix**
+      M0125-0008 already demonstrates the value of: run the base joins alone,
+      then `+ first IN`, then `+ second IN`, on BOTH engines, and find which
+      conjunct first diverges — the monotonicity direction (goopg ⊆ PG here)
+      says a predicate is over-restricting, the opposite of Q94's.
+      **Accept by VALUE**: Q95 = `23 | 45031.03 | -1282.36` at SF0.5 (checksum
+      equal to the oracle), plus the isolation matrix as a planner/executor test.
+      Design `docs/design/0125-0023-in-subquery-over-cte-under-count.md`.
+      **↳ CLOSED 2026-07-30 by M0125-0008's fix — this item's premise was
+      wrong.** "It is not M0125-0008: Q95 contains no `EXISTS` at all" tracked
+      the KEYWORD, not the mechanism. `IN (subquery)` unnests to the very same
+      `JoinTypeSemi`, so Q95's two `IN` gates over one outer relation are exactly
+      the stacked semi/anti shape M0125-0008 describes; it under-counted rather
+      than over-counted only because the neutered conjunct was a SEMI join
+      (which then admits everything downstream of it) rather than an ANTI join.
+      No separate design doc was written — the mechanism is documented in
+      `docs/design/0125-0008-semi-anti-conjunction-residual.md` §5. Q95 now
+      **PASSES the SF0.5 oracle's exact checksum `e498634c02595c29`**, which is
+      this item's own stated acceptance bar. Lesson recorded because it cost a
+      filed task: classify a subquery defect by the JOIN the planner builds, not
+      by the SQL keyword that produced it.
+      Planner/executor change → full pre-commit bar (`tpch-spotcheck.sh`, the
+      SF0.5 gate, `make plan-diff LABEL=tpcds-round2-head`).
+
+- [ ] **M0125-0026 — the 15-query timeout class: capture both engines' EXPLAIN,
+      classify, and file the planner fixes** (added 2026-07-30 by the USER;
+      design `docs/design/0125-0026-timeout-class-plan-comparison.md` — a work
+      plan, deliberately not a fix design). With the correctness class closed,
+      the 15 SF0.5 timeouts (Q5 Q8 Q10 Q14 Q30 Q31 Q35 Q54 Q64 Q65 Q67 Q69 Q71
+      Q78 Q81) are the ONLY remaining goopg-specific class — PG answers each in
+      0–16 s on the same data and query text (`tpcds-results-sf05/oracle.txt`,
+      last field), goopg exceeds 300 s on all 15, and **no artifact has ever put
+      goopg's EXPLAIN next to PG's for any of them**. Steps (all in the doc):
+      **(1) capture** — plain `EXPLAIN`, execution FORBIDDEN (`EXPLAIN ANALYZE`
+      on goopg is banned for this set: these are the queries that do not
+      finish), three arms into `analysis/m0125-0026-timeout-plans/`: goopg
+      default (`goopg-off/`), goopg `GOOPG_RELSIZE_FALLBACK=2`
+      (`goopg-relsize2/` — shape-only, so it does NOT confound M0125-0003's
+      owed timed study; it splits the 15 between "sizes alone fix it" and "the
+      shape is wrong"), PG 18.3 (`pg/`, `psql -p 65438 -U ryo -d tpcds05`).
+      Server via `bench/tpcds/server.sh start sf05` or the cgroup wrapper —
+      **this step is host-independent and may be taken while the nightly holds
+      the host** (nothing is timed). **(2) classify** each query against the
+      doc's suspects — RC-8 rescan-per-outer-row (Q10/Q30/Q35/Q69/Q81
+      candidates; Q35's measured 96,562 × 8.16 s ≈ 9.1 days is the class's one
+      hard number, and `0124-0004` §D4's rule stands: `CacheMisses ≈ Calls` ⇒
+      hashed SubPlan caching, not decorrelation), rows=1 join order (the arm-ON
+      diff isolates it), RC-5 unfiltered MHJ costing (aggravator), CTE
+      referenced N× = body repeated (Q31 ×6 / Q14 / Q64 / Q78 — check
+      `internal/planner/with.go`), missing TopN pushdown through window/rollup
+      (Q67/Q65). A query fitting none of the suspects is a finding.
+      **(3) arithmetic** — per class, Q35-method estimates (outer_rows ×
+      per-rescan cost, |build| × |probe|) from PG-side cardinalities showing why
+      300 s is unreachable; one significant digit. **(4) file** one planner-fix
+      task per CLASS as M0125-0027+ with the plan evidence and acceptance =
+      first-ever completion checked against the git-tracked oracle row (rows +
+      ck where present; Q35's `35|OK|100|0` is already M0125-0003's acceptance
+      row — coordinate, don't duplicate), and propose their selection order in
+      the banner. Acceptance for THIS item: the 15×3 plan capture committed,
+      the classification table with per-class arithmetic in the analysis
+      README, and the per-class fix tasks filed. This item changes NO planner
+      code, so the plan-shape bar does not apply; the fix tasks it files
+      inherit the full bar (plan-diff `LABEL=tpcds-round2-head`, timed TPC-H on
+      a quiet host, full SF0.5 gate).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -887,8 +3431,14 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 ## M0123 — Canonical `pg_node_tree` serialization (branch `wal-pg-nodetree`)
 
-**Priority: after WIP-recovery (#1) and M-NIGHTLY (#2), M0123 is #3 — the active
-focus of this branch.** Milestone doc:
+**Priority: DEMOTED 2026-07-28, renumbered 2026-07-28(b) when M-NIGHTLY was
+parked: the order is WIP-recovery (#1), M0124 (#2), M0125 (#3), the M-NIGHTLY
+backlog (#4), and M0123 (#5). Superseded wording kept below for history: After
+WIP-recovery (#1), M-NIGHTLY (#2),
+M0124 (#3) and M0125 (#4), M0123 is #5.** It remains the active focus of branch
+`wal-pg-nodetree`, but this checkout (`tpcds-fix2`) closes the TPC-DS round-2
+plan first — see the Current Priority banner and
+`docs/design/tpcds-round2-fixes/README.md` §13.5. Milestone doc:
 `docs/milestones/0123-canonical-pg-node-tree-serialization.md`; design:
 `docs/design/wal-pg-identical-stream/02e-content-fidelity-and-durability.md §3`.
 

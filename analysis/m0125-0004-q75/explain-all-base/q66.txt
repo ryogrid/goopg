@@ -1,0 +1,9 @@
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: w_warehouse_name
+     ->  HashAggregate (8 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(5 rows)
+

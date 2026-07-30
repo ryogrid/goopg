@@ -1,0 +1,15 @@
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: s_store_name
+     ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (((d_qoy = 2) AND (d_year = 1998)) AND (substr(s_zip, 1, 2) = substr(ca_zip, 1, 2)))
+         ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+         ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(11 rows)
+

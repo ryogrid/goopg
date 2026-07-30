@@ -5611,6 +5611,11 @@ func selectRefsViewName(sel *parser.SelectStmt, name string) bool {
 	if sel.SetOp != nil && selectRefsViewName(sel.SetOp.Right, name) {
 		return true
 	}
+	// A grouping node keeps its parenthesised operand below itself rather than
+	// in its own FROM/target slots. M0125-0020.
+	if sel.SetOpOperand != nil && selectRefsViewName(sel.SetOpOperand, name) {
+		return true
+	}
 	return false
 }
 
@@ -8138,6 +8143,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+			// root-0031: the target relation's OWN columns must be checked too.
+			// PG's renameatt_internal recurses into the children first (so a
+			// conflict there names the child, which is why this check comes
+			// second) and then calls check_for_column_name_collision on the
+			// relation itself (tablecmds.c). goopg only had the child half, so on
+			// a childless table — or on any table at all once a restart had
+			// dropped the inheritance edges — `ALTER TABLE t RENAME COLUMN a TO b`
+			// with an existing `b` silently produced a table with two columns
+			// named `b`.
+			for _, col := range tbl.Columns {
+				if col.Dropped {
+					continue
+				}
+				if strings.EqualFold(col.Name, newColName) {
+					return &ExecError{Code: "42701", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q already exists", newColName, tbl.Name)}
+				}
+			}
 			// Rename the column in the table's schema.
 			for i, col := range tbl.Columns {
 				if strings.EqualFold(col.Name, oldColName) {
@@ -9934,6 +9956,10 @@ func walkSelectPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 	// UNION/INTERSECT/EXCEPT: this SelectStmt is the left branch; recurse into right.
 	if sel.SetOp != nil {
 		walkSelectPKDeps(sel.SetOp.Right, cat, out, seen, dbOid)
+	}
+	// A grouping node's left branch is its parenthesised operand. M0125-0020.
+	if sel.SetOpOperand != nil {
+		walkSelectPKDeps(sel.SetOpOperand, cat, out, seen, dbOid)
 	}
 	// Main SELECT body with GROUP BY.
 	if len(sel.GroupBy) > 0 {
@@ -12795,6 +12821,20 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	stampCatalogRows(ctx, attrdefRel, xmax, func(data []byte) bool {
 		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == relOID
 	})
+	// root-0031: stamp xmax on this relation's pg_inherits rows for the same
+	// reason — an ALTER re-sync (delete-old-rows + syncTableToCatalogHeap), a
+	// DROP, or a rolled-back CREATE must not leave a stale parent edge visible
+	// to loadInheritanceFromHeap. inhrelid (the CHILD) is column 0 (bytes 0:4);
+	// matching on it is what makes the re-sync idempotent, since the funnel
+	// rewrites exactly this child's rows.
+	inheritsRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: pgInheritsRelOID,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, inheritsRel, xmax, func(data []byte) bool {
+		return len(data) >= 4 && binary.LittleEndian.Uint32(data[0:4]) == relOID
+	})
 	// B5 Slice C: stamp this relation's pg_rewrite _RETURN rule row (ev_class ==
 	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
 	// loadViewsFromHeap.
@@ -13286,6 +13326,24 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), adbin); err != nil {
 			return fmt.Errorf("pg_attrdef col %q: %w", col.Name, err)
+		}
+	}
+
+	// root-0031: table inheritance persistence via real pg_inherits HEAP rows
+	// (base/<dbOid>/2611). The reloaded catalog cannot rebuild the parent→child
+	// edges from pg_class/pg_attribute (nothing there records them), so write one
+	// row per declared parent, carrying the 1-based inhseqno so the reload
+	// restores the INHERITS (...) order. Emitted from this single funnel keeps
+	// CREATE and any later re-sync in step (the caller stamps the old rows
+	// first). Partition children are deliberately NOT written here: their parent
+	// link rides PartitionParentOID, whose own restart persistence is a separate
+	// gap (see the root-0031 deferral-ledger row).
+	for i, parentOID := range tbl.InheritsParentOIDs {
+		if parentOID == 0 {
+			continue
+		}
+		if err := writeInheritsRow(ctx, tbl.OID, parentOID, int32(i+1)); err != nil {
+			return fmt.Errorf("pg_inherits parent %d: %w", parentOID, err)
 		}
 	}
 
@@ -15162,6 +15220,30 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
 	if objType == "aggregate" && len(s.Names) > 0 {
 		aggName := s.Names[0]
+		// root-0031: resolve the argument type BEFORE the registry lookup below.
+		// PG's RemoveObjects runs LookupAggNameTypeNames, whose typenameTypeId
+		// call raises `type "nonesuch" does not exist` regardless of whether an
+		// aggregate of that NAME exists (aggregatecmds.c / parse_type.c). goopg's
+		// registry has no overload resolution, so it dropped on a bare name match
+		// and never reached the identical check further down — making
+		// `DROP AGGREGATE newcnt (nonesuch)` a silent success once `newcnt` had
+		// been created. That is the last `regress/errors` divergence: it only
+		// shows in a full-suite run, where the `aggregates` case's
+		// create_aggregate.sql pre-setup has already defined newcnt.
+		// Restricted to UNQUALIFIED type names so the schema-does-not-exist
+		// (3F000) branch further down keeps winning for `someschema.sometype`,
+		// which is PG's order too (the namespace is resolved before the type).
+		if len(s.ArgTypes) > 0 {
+			if argType := s.ArgTypes[0]; argType != "" && argType != "*" &&
+				!strings.Contains(argType, ".") && dropCompatCanonicalType(argType) == "" {
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", argType))
+					return nil
+				}
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf(`type %q does not exist`, argType)}
+			}
+		}
 		// A registered user aggregate (M0097-0035 CREATE AGGREGATE, DU-002
 		// slice 405) actually drops now instead of always reporting
 		// "does not exist" (loop #56 ledger resume point). goopg's
@@ -15173,10 +15255,21 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// stamp xmax on the pg_proc + pg_aggregate rows (kind 48
 			// retired).
 			var aggOID uint32
+			signatureMatches := false
 			if agg, found := im.LookupUserAggregateByName(aggName.Name); found {
 				aggOID = agg.OID
+				// root-0031: the registry is keyed by NAME only, so a bare name
+				// match used to drop whatever was registered no matter what
+				// signature the DROP named — `DROP AGGREGATE newcnt (float4)`
+				// removed a `newcnt("any")`. PG resolves the full signature
+				// (LookupAggNameTypeNames) and raises
+				// `aggregate newcnt(real) does not exist` instead. Comparing the
+				// stored ArgTypes here restores that without redesigning the
+				// registry's keying; a mismatch falls through to the
+				// does-not-exist path built below.
+				signatureMatches = dropAggregateSignatureMatches(s.ArgTypes, agg.ArgTypes)
 			}
-			if im.DropUserAggregate(aggName.Name) {
+			if signatureMatches && im.DropUserAggregate(aggName.Name) {
 				if aggOID != 0 {
 					deleteAggregateCatalogRows(o.ctx, aggOID)
 				}
@@ -18060,6 +18153,43 @@ func dropCompatFuncTypeCanon(typeName string) string {
 	return dropCompatCanonicalType(typeName)
 }
 
+// dropAggregateSignatureMatches reports whether a DROP AGGREGATE statement's
+// argument list names the SAME signature as the registered aggregate's.
+// root-0031: goopg's aggregate registry is keyed by name alone, so this is the
+// overload check PG gets for free from LookupAggNameTypeNames.
+//
+// Type names are compared through dropCompatCanonicalType so the alias forms
+// agree (`float4` ≡ `real`), falling back to a case-insensitive raw comparison
+// for names it does not canonicalise (`"any"`, user-defined types). A DROP with
+// no argument list at all stays lenient — `DROP AGGREGATE name` is goopg's
+// established shorthand and has no signature to check.
+func dropAggregateSignatureMatches(stmtArgs, registeredArgs []string) bool {
+	if len(stmtArgs) == 0 {
+		return true
+	}
+	// `DROP AGGREGATE name(*)` names the zero-argument form.
+	if len(stmtArgs) == 1 && stmtArgs[0] == "*" {
+		return len(registeredArgs) == 0
+	}
+	if len(stmtArgs) != len(registeredArgs) {
+		return false
+	}
+	norm := func(t string) string {
+		t = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(t)), "pg_catalog.")
+		t = strings.Trim(t, `"`)
+		if canon := dropCompatCanonicalType(t); canon != "" {
+			return canon
+		}
+		return t
+	}
+	for i := range stmtArgs {
+		if norm(stmtArgs[i]) != norm(registeredArgs[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func dropCompatCanonicalType(typeName string) string {
 	switch strings.ToLower(typeName) {
 	case "int4", "integer", "int", "serial", "serial4":
@@ -20389,6 +20519,10 @@ func collectSelectTableRefs(sel *parser.SelectStmt) []parser.RangeVar {
 	if sel.SetOp != nil && sel.SetOp.Right != nil {
 		refs = append(refs, collectSelectTableRefs(sel.SetOp.Right)...)
 	}
+	// A grouping node's parenthesised operand is its left side. M0125-0020.
+	if sel.SetOpOperand != nil {
+		refs = append(refs, collectSelectTableRefs(sel.SetOpOperand)...)
+	}
 	return refs
 }
 
@@ -20725,6 +20859,10 @@ func ExtractRoutineDeps(body string, argDefaults []string, schema string, r *cat
 		// Walk set-op right branch if present.
 		if sel.SetOp != nil && sel.SetOp.Right != nil {
 			walkSelect(sel.SetOp.Right)
+		}
+		// A grouping node's parenthesised operand. M0125-0020.
+		if sel.SetOpOperand != nil {
+			walkSelect(sel.SetOpOperand)
 		}
 	}
 

@@ -84,9 +84,17 @@ func TestDetectWritePos_ZeroFirstSegStillWorks(t *testing.T) {
 	}
 }
 
-// TestDetectWritePos_GapDetectionAfterNonZeroStart verifies that gap
-// detection (segments 0x23F and 0x241 with 0x240 missing) still
-// returns an error after the M0045-0001 fix.
+// TestDetectWritePos_GapDetectionAfterNonZeroStart pins how a hole in the
+// retained range is handled (segments 0x23F and 0x241 with 0x240 missing).
+//
+// It used to assert an error. root-0032 inverted that: a hole is a NORMAL
+// post-crash state, because removeOldSegments walks the obsolete segments
+// newest-first and a SIGKILL mid-retention leaves the oldest ones behind.
+// Erroring made the cluster permanently unstartable ("wal: gap at segment N"
+// on every subsequent start, reproduced with a SIGKILLed pgbench run). The
+// contract now: the live stream is the longest contiguous run ending at the
+// highest segment, and the orphaned prefix below the hole — provably below the
+// checkpoint keep point, since only retention creates holes — is ignored.
 func TestDetectWritePos_GapDetectionAfterNonZeroStart(t *testing.T) {
 	const segSize = 512
 	const firstSegNo = uint64(0x23F)
@@ -103,9 +111,14 @@ func TestDetectWritePos_GapDetectionAfterNonZeroStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, err := detectWritePos(walDir, segSize, false)
-	if err == nil {
-		t.Fatal("expected gap error, got nil")
+	writePos, _, err := detectWritePos(walDir, segSize, false)
+	if err != nil {
+		t.Fatalf("detectWritePos over a retention hole: %v", err)
+	}
+	// The live run is the single segment 0x241 (empty), so the writer resumes
+	// at its start — NOT at 0x23F, which is orphaned pre-retention WAL.
+	if wantPos := int64(firstSegNo+2) * segSize; writePos != wantPos {
+		t.Fatalf("writePos = %d, want %d (start of the live run)", writePos, wantPos)
 	}
 }
 

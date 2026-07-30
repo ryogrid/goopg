@@ -34,8 +34,15 @@ PER_Q_CAP=1200
 CG_UNIT="goopg-nightly-tpcds"
 SERVER_LOG="${TPCDS_DIR}/server.log"
 
-# Qualifying queries (61 total — OK, non-zero rows, matches PG)
-SWEEP_ORDER=(1 2 3 6 7 9 12 13 15 16 17 18 19 20 21 22 26 27 28 29 32 33 34 38 40 41 42 43 44 48 52 53 55 56 57 59 60 61 62 63 66 68 73 74 75 77 79 80 84 85 87 89 90 91 92 94 95 96 97 98 99)
+# Qualifying queries (63 total — OK, non-zero rows, matches PG)
+#
+# Q49 and Q51 joined the set on 2026-07-30 (M0125-0014 / M0125-0015): both were
+# wrong-row-count cells until then, and both now match PG at SF=1 on rows AND
+# values (34 / 100; analysis/m0125-0014-0015-q49-q51-sf1/). They cost +130 s of
+# the 7200 s budget as measured on a quiet host (Q49 83 s, Q51 47 s) — worth
+# checking against `not-run` tail entries if the budget ever gets tight, since
+# Q51 in particular used to take 587 s when it was returning zero rows.
+SWEEP_ORDER=(1 2 3 6 7 9 12 13 15 16 17 18 19 20 21 22 26 27 28 29 32 33 34 38 40 41 42 43 44 48 49 51 52 53 55 56 57 59 60 61 62 63 66 68 73 74 75 77 79 80 84 85 87 89 90 91 92 94 95 96 97 98 99)
 if [[ -n "${NIGHTLY_TPCDS_QUERIES:-}" ]]; then
     IFS=',' read -ra SWEEP_ORDER <<< "${NIGHTLY_TPCDS_QUERIES}"
 fi
@@ -88,9 +95,11 @@ mkdir -p "$(dirname "${GOOPG_BIN}")"
 
 stop_scope "${CG_UNIT}"
 
-progress "S2b" "tpcds: fresh server on ${PG_HOST}:${RUN_PORT} (unit=${CG_UNIT})"
+PPROF_ADDR="${NIGHTLY_TPCDS_PPROF_ADDR:-127.0.0.1:6161}"
+progress "S2b" "tpcds: fresh server on ${PG_HOST}:${RUN_PORT} (unit=${CG_UNIT} pprof=${PPROF_ADDR})"
+# GOOPG_PPROF_ADDR: private pprof port — see the same note in stage-tpch.sh.
 GOOPG_CG_UNIT="${CG_UNIT}" GOOPG_MEM_HIGH=10G GOOPG_MEM_MAX=12G \
-GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
+GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB GOOPG_PPROF_ADDR="${PPROF_ADDR}" \
     "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${RUN_DATA}" \
     --listen "${PG_HOST}:${RUN_PORT}" \
@@ -99,8 +108,16 @@ GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
 server_pid=$!
 
 cleanup() {
-    "${GOOPG_BIN}" stop -D "${RUN_DATA}" >/dev/null 2>&1 || true
-    wait "${server_pid}" 2>/dev/null || true
+    # Same bounded ladder as stage-tpch.sh — this stage runs the same TIMEOUT
+    # -> killed-client -> leaked-backend shape and had the identical untimed
+    # `wait`. See stop_goopg_server in lib/common.sh.
+    STOP_PPROF_ADDR="${PPROF_ADDR}"
+    STOP_DUMP_FILE="${TPCDS_DIR}/server-goroutines.txt"
+    stop_goopg_server "${GOOPG_BIN}" "${RUN_DATA}" "${server_pid}"
+    case "${STOP_RUNG}" in
+        graceful|already-exited) ;;
+        *) progress "S2b" "tpcds: server would NOT stop gracefully — escalated to ${STOP_RUNG} (leaked backend? see tpcds/server.log)" ;;
+    esac
     stop_scope "${CG_UNIT}"
     rm -rf "${RUN_DATA}"
 }

@@ -78,7 +78,7 @@ class AnalyzeUnitsClassificationTest(unittest.TestCase):
                 f.write("fail 2160\n")
             # repo_root doesn't need to be real: every read_csv/read_file call
             # in analyze() tolerates a missing path (returns [] / "").
-            it, _stages, _timings, _spot, _extra = summarize.analyze(run_dir, tmp, "20260101-000000")
+            it, _stages, _timings, _tpcds_timings, _spot, _extra = summarize.analyze(run_dir, tmp, "20260101-000000")
             return it
 
     def test_resource_kills_and_regression_classified_independently(self):

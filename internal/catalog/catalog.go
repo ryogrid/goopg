@@ -1596,6 +1596,26 @@ type TableStats struct {
 	Pages    int           `json:"pages,omitempty"`
 	AvgWidth float64       `json:"avg_width,omitempty"`
 	Columns  []ColumnStats `json:"columns,omitempty"`
+	// Analyzed records that a VACUUM or ANALYZE cycle has run on this
+	// relation, i.e. that RowCount/Pages are MEASURED values (possibly a
+	// measured zero) rather than simply absent.
+	//
+	// It is goopg's stand-in for PostgreSQL's `pg_class.reltuples < 0`
+	// "never vacuumed or analyzed" sentinel, which
+	// table_block_relation_estimate_size (access/table/tableam.c) tests to
+	// decide whether to believe that a small relation is really small:
+	//
+	//	if (curpages < 10 && reltuples < 0 && !relhassubclass)
+	//	        curpages = 10;
+	//
+	// goopg cannot reuse that trick: RowCount is a non-negative int64, so an
+	// unset zero and a measured zero share a bit pattern. The distinction is
+	// load-bearing for the planner's relation-size fallback, which must tell
+	// "never analyzed — do not believe it is tiny" from "analyzed and
+	// genuinely empty — believe the zero", the case upstream's
+	// !relhassubclass comment is about. M0125-0003; design
+	// docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md §D1.
+	Analyzed bool `json:"analyzed,omitempty"`
 }
 
 // ColumnStats is the per-column pg_statistic-shaped subset v0
@@ -2150,6 +2170,17 @@ func newTableNamespace() *tableNamespace {
 
 type InMemory struct {
 	mu sync.RWMutex
+	// relSizer, when installed, returns a relation's LIVE size in blocks —
+	// the O(1) in-memory counter read that answers PostgreSQL's
+	// RelationGetNumberOfBlocks(), not a statistics lookup and not a scan.
+	// It is installed once by the server that owns the buffer pool (see
+	// initdb.Open) and read by RelationBlocks; nil in embedded/test catalogs
+	// with no storage behind them, where RelationBlocks reports "unknown".
+	//
+	// Held as an atomic pointer rather than under c.mu because the planner
+	// reads it once per FROM item and must not contend on the catalog lock.
+	// M0125-0003.
+	relSizer atomic.Pointer[func(storage.RelFileNode) (int64, bool)]
 	// namespaces holds the per-database table/index catalog (see
 	// tableNamespace), keyed by real physical dbOid. Access it via
 	// ns(dbOid), never directly — see ns()'s own comment for the locking
@@ -12032,7 +12063,14 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 		return fmt.Errorf("relation %q does not exist", oldK)
 	}
 	if _, exists2 := ns.tables[newK]; exists2 {
-		return fmt.Errorf("relation %q already exists", newK)
+		// root-0031: report the BARE new relation name, not the schema-qualified
+		// catalog key. PG's RenameRelationInternal raises
+		// errmsg("relation \"%s\" already exists", newrelname) with the bare name
+		// (tablecmds.c) — the schema is already implied by the search path. The
+		// qualified form only surfaced once a table carried a non-empty Schema
+		// (e.g. every table reloaded from the pg_class heap after a restart),
+		// which made the message differ between a fresh and a restarted server.
+		return fmt.Errorf("relation %q already exists", new.Name)
 	}
 	// Re-key the table entry under the new name, preserving the pointer.
 	tbl.Schema = new.Schema
@@ -12202,13 +12240,18 @@ func (c *InMemory) UpdateRelStats(table *Table, pages int, tuples int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if table.Stats == nil {
-		table.Stats = &TableStats{Pages: pages, RowCount: tuples}
+		// VACUUM measured these, so mark the relation analyzed even though
+		// no per-column pg_statistic was collected — upstream's
+		// "never VACUUMED or analyzed" sentinel is cleared by either.
+		// M0125-0003.
+		table.Stats = &TableStats{Pages: pages, RowCount: tuples, Analyzed: true}
 		return
 	}
 	// Pointer-replace so a concurrent reader never sees a torn struct.
 	merged := *table.Stats
 	merged.Pages = pages
 	merged.RowCount = tuples
+	merged.Analyzed = true
 	table.Stats = &merged
 }
 
@@ -20253,6 +20296,42 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 // using table.DBOid unconditionally here would have physically relocated
 // every "postgres" relation from base/5/… to base/1/… and broken the
 // mirror, confirmed by TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart).
+// SetRelationSizer installs the live block-count accessor RelationBlocks
+// serves. The owner of the buffer pool calls it once at startup, before the
+// server accepts connections; passing nil clears it.
+//
+// It is deliberately scoped to one catalog instance rather than to the
+// process: a package-level hook would leak between the several servers a
+// single test binary starts, making results order-dependent. M0125-0003.
+func (c *InMemory) SetRelationSizer(fn func(storage.RelFileNode) (int64, bool)) {
+	if fn == nil {
+		c.relSizer.Store(nil)
+		return
+	}
+	c.relSizer.Store(&fn)
+}
+
+// RelationBlocks returns a relation's current size in blocks, and whether it
+// could be determined. It is the goopg equivalent of
+// RelationGetNumberOfBlocks(rel) — which is what supplies `curpages` to
+// PostgreSQL's table_block_relation_estimate_size — and, like it, needs no
+// ANALYZE to have run: the value is read from the live storage counter, not
+// from pg_class.relpages.
+//
+// Returns (0, false) when no sizer is installed or the relation has no
+// storage yet; every caller must treat that as "no estimate", never as
+// "zero blocks". M0125-0003.
+func (c *InMemory) RelationBlocks(table *Table) (int64, bool) {
+	if c == nil || table == nil || table.Virtual {
+		return 0, false
+	}
+	fn := c.relSizer.Load()
+	if fn == nil {
+		return 0, false
+	}
+	return (*fn)(c.RelFileNode(table))
+}
+
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -20600,6 +20679,13 @@ func renameColumnInSelect(sel *parser.SelectStmt, tableName, oldCol, newCol stri
 		if sel.From[i].Subquery != nil {
 			renameColumnInSelect(sel.From[i].Subquery, tableName, oldCol, newCol)
 		}
+	}
+	// A grouping node keeps the parenthesised branch's own target list one
+	// level down: `CREATE VIEW v AS (SELECT a FROM t) UNION …` used to hold
+	// that target list on this node itself. M0125-0020. (The set-op RIGHT
+	// branch is still not walked here — a pre-existing gap, ledger 2026-07-29.)
+	if sel.SetOpOperand != nil {
+		renameColumnInSelect(sel.SetOpOperand, tableName, oldCol, newCol)
 	}
 }
 

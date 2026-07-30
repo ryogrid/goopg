@@ -103,12 +103,16 @@ mkdir -p "$(dirname "${GOOPG_BIN}")"
 
 stop_scope "${CG_UNIT}"   # clear a lingering scope from a crashed previous run
 
-progress "S2" "tpch: fresh server start on ${PG_HOST}:${RUN_PORT} (clone dir, unit=${CG_UNIT} high=10G max=12G)"
+PPROF_ADDR="${NIGHTLY_TPCH_PPROF_ADDR:-127.0.0.1:6160}"
+progress "S2" "tpch: fresh server start on ${PG_HOST}:${RUN_PORT} (clone dir, unit=${CG_UNIT} high=10G max=12G pprof=${PPROF_ADDR})"
 # 8>&- : the detached server must NOT inherit the orchestrator's run-lock fd —
 # an orphaned server would otherwise pin the run lock and every later firing
 # would exit 5 (ci/design/06 §C).
+# GOOPG_PPROF_ADDR: a private pprof port. The default 127.0.0.1:6060 is taken by
+# whichever goopg started first on this host, and losing that race is logged only
+# at Debug — which is why the 2026-07-29 wedge left no goroutine dump behind.
 GOOPG_CG_UNIT="${CG_UNIT}" GOOPG_MEM_HIGH=10G GOOPG_MEM_MAX=12G \
-GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
+GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB GOOPG_PPROF_ADDR="${PPROF_ADDR}" \
     "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${RUN_DATA}" \
     --listen "${PG_HOST}:${RUN_PORT}" \
@@ -117,8 +121,16 @@ GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=9GiB \
 server_pid=$!
 
 cleanup() {
-    "${GOOPG_BIN}" stop -D "${RUN_DATA}" >/dev/null 2>&1 || true
-    wait "${server_pid}" 2>/dev/null || true
+    # Bounded ladder, never a bare `wait` — a leaked backend makes the graceful
+    # stop block forever and would wedge this stage, the run, and the host
+    # (2026-07-29: 6h45m). See stop_goopg_server in lib/common.sh.
+    STOP_PPROF_ADDR="${PPROF_ADDR}"
+    STOP_DUMP_FILE="${TPCH_DIR}/server-goroutines.txt"
+    stop_goopg_server "${GOOPG_BIN}" "${RUN_DATA}" "${server_pid}"
+    case "${STOP_RUNG}" in
+        graceful|already-exited) ;;
+        *) progress "S2" "tpch: server would NOT stop gracefully — escalated to ${STOP_RUNG} (leaked backend? see tpch/server.log)" ;;
+    esac
     stop_scope "${CG_UNIT}"
     rm -rf "${RUN_DATA}"
 }

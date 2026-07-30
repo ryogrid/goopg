@@ -1,0 +1,13 @@
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: d_year, sum DESC, i_brand_id
+     ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((i_manufact_id = 816) AND (d_moy = 11))
+         ->  Seq Scan on public.date_dim dt  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.item  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+(9 rows)
+

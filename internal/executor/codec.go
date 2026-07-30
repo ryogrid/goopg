@@ -601,6 +601,30 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected bytes for int2vector, got kind %d", d.Kind)
 		}
 		return d.BytesValue(), nil
+	case "bytea":
+		// A bytea column value is BYTES. Before M0125-0021 this fell to the
+		// default text arm, so `INSERT INTO t VALUES ('\xaabb')` stored the six
+		// characters of the escape text and `length(b)` answered 6 where PG
+		// answers 2. A KindString reaching here is an unknown-type literal that
+		// PG would have routed through byteain, so route it through byteaIn —
+		// the same helper `'\xaabb'::bytea` uses (Hard-won Rule #2: the cast
+		// and the storage encoder are siblings).
+		switch d.Kind {
+		case KindBytes:
+			return varlenaPayloadBytes(d.BytesValue()), nil
+		case KindString:
+			b, err := byteaIn(d.StringValue(), 0)
+			if err != nil {
+				return nil, err
+			}
+			return varlenaPayloadBytes(b), nil
+		default:
+			s, err := coerceTextLikeDatum(t, d)
+			if err != nil {
+				return nil, err
+			}
+			return varlenaTextBytes(s), nil
+		}
 	case "uuid":
 		// Validate and normalize UUID to canonical lowercase-with-dashes format.
 		// M0097-0029.
@@ -657,6 +681,13 @@ func emptyArrayTypeBytes(elemType uint32) []byte {
 // 4-byte header otherwise. PG's SET_VARSIZE_1B encodes the TOTAL size
 // (data+header), not just the data length; bit 0 = 1 marks the 1-byte
 // form (and the body shifts by one).
+// varlenaPayloadBytes is varlenaTextBytes for a byte payload that is not text
+// (bytea). Same on-disk shape — the distinction is only in what the caller
+// means by it.
+func varlenaPayloadBytes(b []byte) []byte {
+	return varlenaTextBytes(string(b))
+}
+
 func varlenaTextBytes(s string) []byte {
 	total := len(s) + 1 // data + 1-byte header
 	if total <= 127 {   // 1-byte header: 7 bits for size (max 127)

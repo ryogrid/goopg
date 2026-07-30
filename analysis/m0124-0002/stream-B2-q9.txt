@@ -1,0 +1,8 @@
+# stream B2-q9
+# bin=/home/ryo/work/goopg/goopg/tmp/goopg-armB
+# target=tpch@tpch GOGC=100 GOMEMLIMIT=12GiB per-query-timeout=600s
+# started=2026-07-29T19:58:58+09:00
+Q9: OK elapsed=161.20s rows=175
+# runner_rc=0
+# stream_elapsed_s=177
+# finished=2026-07-29T20:01:55+09:00

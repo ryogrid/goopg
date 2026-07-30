@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -806,9 +807,54 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 				}
 				j++
 			}
+			// M0125-0011: the merge key is only the FIRST equality
+			// conjunct of the ON clause — splitEqualityForHash
+			// (internal/planner/planner.go) returns a single
+			// left/right pair and discards the rest. Every remaining
+			// conjunct is residual and MUST still be evaluated per
+			// candidate pair, exactly as PostgreSQL evaluates a merge
+			// join's joinqual once its mergeclauses have located the
+			// group (postgres/src/backend/executor/nodeMergejoin.c,
+			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)). Without this
+			// the residual was silently dropped, so a two-conjunct
+			// FULL OUTER JOIN degenerated into its single-key
+			// counterpart (TPC-DS Q97: 2131274 rows instead of
+			// 836302) and RIGHT OUTER JOIN was wrong the same way.
+			leftMatched := make([]bool, i-li)
+			rightMatched := make([]bool, j-rj)
 			for a := li; a < i; a++ {
 				for b := rj; b < j; b++ {
-					o.rows = append(o.rows, concatRows(leftKeyed[a].row, rightKeyed[b].row))
+					joined := concatRows(leftKeyed[a].row, rightKeyed[b].row)
+					ok, perr := o.joinPredicateMatch(joined)
+					if perr != nil {
+						return perr
+					}
+					if !ok {
+						continue
+					}
+					leftMatched[a-li] = true
+					rightMatched[b-rj] = true
+					o.rows = append(o.rows, joined)
+				}
+			}
+			// A row whose merge key matched but whose residual did not
+			// is still an UNMATCHED row for outer-join purposes, so it
+			// must be null-extended here; the cmp<0 / cmp>0 arms only
+			// see rows whose key itself found no partner.
+			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
+				for a := li; a < i; a++ {
+					if !leftMatched[a-li] {
+						o.rows = append(o.rows, concatRows(leftKeyed[a].row, nullRight))
+					}
+				}
+			}
+			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
+				for b := rj; b < j; b++ {
+					if !rightMatched[b-rj] {
+						merged := concatRows(nullLeft, rightKeyed[b].row)
+						o.coalesceUsingRow(merged)
+						o.rows = append(o.rows, merged)
+					}
 				}
 			}
 		}
@@ -1386,6 +1432,16 @@ type aggRuntime struct {
 	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
 	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
 	arrayElemKeys [][]Datum
+	// strElems/strDelims/strElemKeys are string_agg's deferred-concatenation
+	// mode, used ONLY when the call carries its own ORDER BY (M0125-0019).
+	// PostgreSQL sorts the transition inputs before running the transition
+	// function (nodeAgg.c process_ordered_aggregate_single), so the delimiter
+	// that separates two adjacent pieces is the *right-hand* row's own second
+	// argument — which is only knowable after the sort. strResult stays the
+	// accumulator for the far more common unordered case.
+	strElems    []string
+	strDelims   []string
+	strElemKeys [][]Datum
 	// Variance accumulators (var_pop/var_samp/stddev_pop/stddev_samp).
 	// Uses Youngs-Cramer algorithm for float inputs.
 	floatSx float64 // running sum of values (Youngs-Cramer Sx)
@@ -1697,6 +1753,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 					sfuncArgs = append(sfuncArgs, state)
 					sfuncArgs = append(sfuncArgs, argSlice...)
 					newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+					if sfuncRaised(serr) {
+						return serr
+					}
 					if serr == nil {
 						state = newState
 					}
@@ -1719,7 +1778,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 		}
 		for i, call := range o.plan.Aggs {
-			out = append(out, o.finishAgg(gr.aggs[i], call))
+			d, ferr := o.finishAgg(gr.aggs[i], call)
+			if ferr != nil {
+				return ferr
+			}
+			out = append(out, d)
 		}
 		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
@@ -1791,6 +1854,9 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				st.userStateSet = true
 			}
 			newState, serr := executeSFuncCall(ua.SFunc, []Datum{st.userState}, o.ctx)
+			if sfuncRaised(serr) {
+				return serr
+			}
 			if serr == nil {
 				st.userState = newState
 			}
@@ -2110,9 +2176,16 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 					delimHex = string(dh)
 				}
 			}
+			st.boolResult = true // bytea mode flag
+			if len(call.OrderBy) > 0 {
+				st.strElems = append(st.strElems, hexVal)
+				st.strDelims = append(st.strDelims, delimHex)
+				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+				st.hasValue = true
+				break
+			}
 			if !st.hasValue {
 				st.strResult = hexVal
-				st.boolResult = true // bytea mode flag
 				st.hasValue = true
 			} else {
 				st.strResult += delimHex + hexVal
@@ -2131,6 +2204,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			}
 		}
 		sv := formatDatumDateStyle(arg, o.ctx)
+		// With the aggregate's own ORDER BY, concatenation must wait for the
+		// sort (M0125-0019) — see the strElems comment on aggRuntime.
+		if len(call.OrderBy) > 0 {
+			st.strElems = append(st.strElems, sv)
+			st.strDelims = append(st.strDelims, delim)
+			st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+			st.hasValue = true
+			break
+		}
 		if !st.hasValue {
 			st.strResult = sv
 			st.hasValue = true
@@ -2252,6 +2334,9 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				}
 			}
 			newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+			if sfuncRaised(serr) {
+				return serr
+			}
 			if serr == nil {
 				st.userState = newState
 			}
@@ -2367,6 +2452,83 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		}
 	}
 	return nil
+}
+
+// evalAggOrderByKeys evaluates an aggregate call's own ORDER BY expressions
+// against the current input row and materialises them, so finishAgg can sort
+// the accumulated pieces later. A key that fails to evaluate becomes NULL
+// rather than aborting the aggregate — the pre-existing array_agg behaviour
+// this was factored out of.
+func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context) []Datum {
+	if len(orderBy) == 0 {
+		return nil
+	}
+	keys := make([]Datum, 0, len(orderBy))
+	for _, sk := range orderBy {
+		kv, err := evalExprSlot(sk.Expr, slot, ctx)
+		if err != nil {
+			kv = NullDatum
+		}
+		keys = append(keys, kv.MaterializeArena())
+	}
+	return keys
+}
+
+// aggOrderBySortedIdx returns the permutation that puts the accumulated
+// per-row key tuples into the aggregate's ORDER BY order. PostgreSQL performs
+// this sort inside the aggregate, before the transition function runs
+// (postgres/src/backend/executor/nodeAgg.c, process_ordered_aggregate_single),
+// so it decides the aggregate's value and not merely its presentation.
+//
+// The sort is STABLE: rows whose keys compare equal keep arrival order, which
+// is what PG's tuplesort gives for an aggregate whose sort keys do not fully
+// determine the order.
+//
+// Shared by array_agg and string_agg — the two ordering-sensitive built-ins in
+// finishAgg's switch. They diverged once already (string_agg simply ignored
+// ORDER BY, M0125-0019); one comparator keeps them from diverging again.
+func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
+	idx := make([]int, len(keys))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ka, kb := keys[idx[a]], keys[idx[b]]
+		for ki := range ka {
+			if ki >= len(kb) {
+				break
+			}
+			akNull, bkNull := ka[ki].IsNull(), kb[ki].IsNull()
+			if akNull && bkNull {
+				continue
+			}
+			// NullsFirst is already resolved by the planner to PG's
+			// defaults (ASC→NULLS LAST, DESC→NULLS FIRST) via
+			// sortByNullsFirst, so it is read verbatim here.
+			nullsFirst := false
+			desc := false
+			if ki < len(orderBy) {
+				nullsFirst = orderBy[ki].NullsFirst
+				desc = orderBy[ki].Desc
+			}
+			if akNull {
+				return nullsFirst
+			}
+			if bkNull {
+				return !nullsFirst
+			}
+			cmp, err := compareDatum(ka[ki], kb[ki], 0)
+			if err != nil || cmp == 0 {
+				continue
+			}
+			if desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	return idx
 }
 
 // aggDatumToFloat64 converts any numeric datum to float64 for aggregate computation.
@@ -2658,10 +2820,17 @@ func aggDatumToFloat64(d Datum) float64 {
 	return 0
 }
 
-func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum {
+// finishAgg finalizes one accumulated aggregate.
+//
+// It returns an error only for a user-defined aggregate whose state, combine or
+// final function was invoked and RAISED (M0125-0025); PG aborts the statement in
+// that case, so the error must reach the client rather than be turned into a
+// stale state or a NULL. Built-in finalization cannot fail, which is why the
+// bulk of the work lives in finishBuiltinAgg with no error channel at all.
+func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) (Datum, error) {
 	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
 	if call.WithinGroup {
-		return finishWithinGroupAgg(st, call, o.ctx)
+		return finishWithinGroupAgg(st, call, o.ctx), nil
 	}
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
@@ -2752,21 +2921,27 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 				sfuncArgs = append(sfuncArgs, state)
 				sfuncArgs = append(sfuncArgs, argSlice...)
 				newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+				if sfuncRaised(serr) {
+					return NullDatum, serr
+				}
 				if serr == nil {
 					state = newState
 				}
 			}
 			if ua.FinalFunc == "" {
-				return state
+				return state, nil
 			}
 			result, ferr := executeSFuncCall(ua.FinalFunc, []Datum{state}, o.ctx)
-			if ferr != nil {
-				return NullDatum
+			if sfuncRaised(ferr) {
+				return NullDatum, ferr
 			}
-			return result
+			if ferr != nil {
+				return NullDatum, nil
+			}
+			return result, nil
 		}
 		if !st.hasValue {
-			return NullDatum
+			return NullDatum, nil
 		}
 		state := st.userState
 		// Apply CombineFunc when defined: combinefunc(NULL, partial_state).
@@ -2775,20 +2950,33 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		// combinefunc with a NULL first arg returns NULL (the balk aggregate pattern). M0097-0122.
 		if ua.CombineFunc != "" {
 			combined, cerr := executeSFuncCall(ua.CombineFunc, []Datum{NullDatum, state}, o.ctx)
+			if sfuncRaised(cerr) {
+				return NullDatum, cerr
+			}
 			if cerr == nil {
 				state = combined
 			}
 		}
 		if ua.FinalFunc == "" {
-			return state
+			return state, nil
 		}
 		// Call the final function.
 		result, ferr := executeSFuncCall(ua.FinalFunc, []Datum{state}, o.ctx)
-		if ferr != nil {
-			return NullDatum
+		if sfuncRaised(ferr) {
+			return NullDatum, ferr
 		}
-		return result
+		if ferr != nil {
+			return NullDatum, nil
+		}
+		return result, nil
 	}
+	return o.finishBuiltinAgg(st, call), nil
+}
+
+// finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
+// M0125-0025 so that adding the error channel the user-defined path needs did
+// not have to touch this body's ~100 returns, none of which can fail.
+func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call planner.AggregateCall) Datum {
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -2889,59 +3077,35 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		out := st.strResult
+		// The aggregate's own ORDER BY deferred concatenation to here
+		// (M0125-0019). Each piece carries the delimiter it was collected
+		// with, and PG emits the delimiter of the RIGHT-hand piece between
+		// two neighbours — so both travel through the permutation together
+		// and the first piece's delimiter is dropped.
+		if len(st.strElems) > 0 {
+			idx := aggOrderBySortedIdx(st.strElemKeys, call.OrderBy)
+			var b strings.Builder
+			for i, orig := range idx {
+				if i > 0 && orig < len(st.strDelims) {
+					b.WriteString(st.strDelims[orig])
+				}
+				b.WriteString(st.strElems[orig])
+			}
+			out = b.String()
+		}
 		// Bytea mode: st.boolResult=true means result is hex-encoded bytes.
 		if st.boolResult {
-			return NewStringDatum(`\x` + st.strResult)
+			return NewStringDatum(`\x` + out)
 		}
-		return NewStringDatum(st.strResult)
+		return NewStringDatum(out)
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
 		}
 		// Sort elements by ORDER BY keys if present.
 		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
-			// Build index slice and sort by keys.
-			idx := make([]int, len(st.arrayElems))
-			for i := range idx {
-				idx[i] = i
-			}
-			orderByDescs := make([]bool, len(call.OrderBy))
-			for i, sk := range call.OrderBy {
-				orderByDescs[i] = sk.Desc
-			}
-			sort.SliceStable(idx, func(a, b int) bool {
-				ka, kb := st.arrayElemKeys[idx[a]], st.arrayElemKeys[idx[b]]
-				for ki := range ka {
-					if ki >= len(kb) {
-						break
-					}
-					akNull := ka[ki].IsNull()
-					bkNull := kb[ki].IsNull()
-					if akNull && bkNull {
-						continue
-					}
-					// NULLs LAST for ASC (default), NULLs FIRST for DESC (default).
-					nullsFirst := false
-					if ki < len(call.OrderBy) {
-						nullsFirst = call.OrderBy[ki].NullsFirst
-					}
-					if akNull {
-						return nullsFirst
-					}
-					if bkNull {
-						return !nullsFirst
-					}
-					cmp, err := compareDatum(ka[ki], kb[ki], 0)
-					if err != nil || cmp == 0 {
-						continue
-					}
-					if ki < len(orderByDescs) && orderByDescs[ki] {
-						return cmp > 0
-					}
-					return cmp < 0
-				}
-				return false
-			})
+			idx := aggOrderBySortedIdx(st.arrayElemKeys, call.OrderBy)
 			sortedElems := make([]string, len(st.arrayElems))
 			sortedNulls := make([]bool, len(st.arrayElems))
 			for i, origIdx := range idx {
@@ -3432,9 +3596,45 @@ func userAggInitState(ua *catalog.UserAggregate) Datum {
 	return NewStringDatum(ic)
 }
 
+// errSFuncNotFound is executeSFuncCall's "there was no routine to call"
+// outcome. It must stay distinguishable from "a routine ran and raised",
+// because the aggregate paths propagate the two in OPPOSITE directions
+// (M0125-0025): a raise aborts the statement, a missing routine keeps the
+// historical fall-through that lets an aggregate with no FINALFUNC, or one
+// whose state/final function goopg models inline, finish normally.
+//
+// It Unwraps to its *ExecError so errors.As still reaches the 42883, but it is
+// never propagated to a client by design — every call site swallows it — so a
+// bare `err.(*ExecError)` assertion elsewhere cannot see it.
+type errSFuncNotFound struct{ inner *ExecError }
+
+func (e *errSFuncNotFound) Error() string { return e.inner.Error() }
+func (e *errSFuncNotFound) Unwrap() error { return e.inner }
+
+// sfuncRaised reports whether err came from a user-defined state, final or
+// combine function that WAS found, invoked, and failed — the only
+// executeSFuncCall failure that may reach the client.
+//
+// PG has no equivalent choice to make: advance_transition_function invokes the
+// transition function through FunctionCallInvoke
+// (postgres/src/backend/executor/nodeAgg.c), so an ereport(ERROR) inside it
+// aborts the statement with the function's own SQLSTATE. goopg needs the
+// distinction only because executeSFuncCall doubles as the lookup for the
+// built-in state functions it models inline above.
+func sfuncRaised(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nf *errSFuncNotFound
+	return !errors.As(err, &nf)
+}
+
 // executeSFuncCall invokes a named state-transition or final function for a
 // user-defined aggregate.  Built-in SQL/PG functions are handled inline;
 // user-defined SQL functions are executed via executeStoredRoutine.
+//
+// A non-nil error means one of two different things; use sfuncRaised to tell
+// them apart before deciding whether to propagate.
 func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error) {
 	switch strings.ToLower(funcName) {
 	case "int8inc":
@@ -3512,15 +3712,23 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 		funcObjName := parser.ObjectName{Name: funcName}
 		candidates := rs.LookupByName(funcObjName)
 		if len(candidates) > 0 {
-			// Use first candidate with matching arg count.
+			// A routine of this name exists, so the outcome can no longer be
+			// "does not exist": remember the FIRST error raised by a routine
+			// that actually ran and report it if none succeeds (M0125-0025).
+			// Candidates are matched by arity, not signature, so several may be
+			// tried where PG resolves exactly one — keep trying after a failure
+			// so every call that succeeds today still succeeds, and change only
+			// the all-failed outcome, which used to be misreported as 42883.
+			var raised error
 			for _, r := range candidates {
 				if len(r.ArgTypes) == len(args) {
 					result, rerr := executeStoredRoutine(r, args, ctx, 0)
 					if rerr == nil {
 						return result, nil
 					}
-					// Log the error for debugging (sfunc execution failure). M0097-0117.
-					_ = rerr
+					if raised == nil {
+						raised = rerr
+					}
 				}
 			}
 			// Fallback: try any candidate.
@@ -3528,10 +3736,13 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 			if rerr == nil {
 				return result, nil
 			}
-			_ = rerr
+			if raised == nil {
+				raised = rerr
+			}
+			return NullDatum, raised
 		}
 	}
-	return NullDatum, &ExecError{Code: "42883", Message: fmt.Sprintf("aggregate state function %q does not exist", funcName)}
+	return NullDatum, &errSFuncNotFound{&ExecError{Code: "42883", Message: fmt.Sprintf("aggregate state function %q does not exist", funcName)}}
 }
 
 // formatAvgInt8 formats sum/count as a PostgreSQL numeric with 16 decimal places.

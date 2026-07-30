@@ -241,6 +241,18 @@ func lockingClauseName(s parser.LockStrength) string {
 // InExpr / ExistsExpr handlers when recursing into inner
 // SELECTs so column refs can resolve against the outer scope.
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
+	// A grouping node has no target list, FROM or WHERE of its own — it stands
+	// for the parenthesised operand `( SetOpOperand )` and holds only what was
+	// written after the ')'. Analyze the operand; the trailing sort/limit is
+	// resolved by the planner's wrapSetOpSortLimit against the operand's output
+	// columns, the same way a set-op chain's trailing ORDER BY is. Runs before
+	// the SetOp branch so a grouping node that also heads a chain
+	// (`(A) UNION B`) analyzes its operand rather than an empty SELECT when
+	// that branch clears SetOp and recurses, which lands here exactly once.
+	// M0125-0020.
+	if s.SetOpOperand != nil && s.SetOp == nil {
+		return analyzeSelectWithParent(s.SetOpOperand, cat, parent)
+	}
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
 		// FOR UPDATE/NO KEY UPDATE is not allowed on any branch of a set-op.
@@ -2265,30 +2277,33 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	}
 	body.SetOp = saved
 
-	// Build columns from the anchor's target list.
+	// Build columns from the anchor's target list. The anchor is the leftmost
+	// branch, which is below the grouping node when the body was written
+	// `((SELECT …) UNION ALL …)`. M0125-0020.
+	anchor := setOpLeftmostBranch(body)
 	innerCtx := &scope{cat: ctx.cat, parent: ctx}
 	var rels []scopeRel
-	if len(body.From) > 0 || len(body.FromExprs) > 0 {
+	if len(anchor.From) > 0 || len(anchor.FromExprs) > 0 {
 		var err error
-		rels, err = buildSelectScopeIn(body, innerCtx)
+		rels, err = buildSelectScopeIn(anchor, innerCtx)
 		if err != nil {
 			return err
 		}
 		innerCtx.rels = rels
 	}
 	var cols []catalog.Column
-	if len(body.Targets) == 0 && len(body.ValuesRows) > 0 {
+	if len(anchor.Targets) == 0 && len(anchor.ValuesRows) > 0 {
 		// VALUES anchor (e.g. VALUES (1) UNION ALL SELECT n+1 ...): no Targets,
 		// so infer columns from the first row. Names are "column1", "column2", ...
 		// and types are "unknown" (the planner resolves exact types). M0097-0062.
-		nCols := len(body.ValuesRows[0])
+		nCols := len(anchor.ValuesRows[0])
 		cols = make([]catalog.Column, nCols)
 		for i := 0; i < nCols; i++ {
 			cols[i] = catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i}
 		}
 	} else {
-		cols = make([]catalog.Column, 0, len(body.Targets))
-		for _, tgt := range body.Targets {
+		cols = make([]catalog.Column, 0, len(anchor.Targets))
+		for _, tgt := range anchor.Targets {
 			// A top-level `*` / `t.*` must be expanded to concrete columns —
 			// analyzeExpr rejects a bare StarExpr. Mirrors registerAnalyzedCTE.
 			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
@@ -2404,20 +2419,23 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	// FROM clause below. Without this, `WITH w6 AS (WITH w8 AS
 	// (SELECT 1) SELECT * FROM w8)` fails because w8 is not in scope
 	// when registerAnalyzedCTE tries to resolve FROM w8.
-	if cte.Query.With != nil {
-		if err := analyzeWith(cte.Query.With, innerCtx); err != nil {
+	// A grouping node carries no target list of its own — the CTE's columns
+	// come from the leftmost branch below it. M0125-0020.
+	src := setOpLeftmostBranch(cte.Query)
+	if src.With != nil {
+		if err := analyzeWith(src.With, innerCtx); err != nil {
 			return err
 		}
 	}
-	if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
-		rels, err := buildSelectScopeIn(cte.Query, innerCtx)
+	if len(src.From) > 0 || len(src.FromExprs) > 0 {
+		rels, err := buildSelectScopeIn(src, innerCtx)
 		if err != nil {
 			return err
 		}
 		innerCtx.rels = rels
 	}
-	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	if len(cte.Query.Targets) == 0 && len(cte.Query.ValuesRows) > 0 {
+	innerCols := make([]catalog.Column, 0, len(src.Targets))
+	if len(src.Targets) == 0 && len(src.ValuesRows) > 0 {
 		// VALUES-list CTE body (e.g. `cte (a, b) AS (VALUES (1,'x'),
 		// (2,'y'))`): there are no Targets, so the column count comes
 		// from the first VALUES row. Default names are "column1",
@@ -2427,12 +2445,12 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		// pg_amcheck's database-resolution query relies on this shape
 		// (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
 		// M0110-0003 / AC-002.
-		nCols := len(cte.Query.ValuesRows[0])
+		nCols := len(src.ValuesRows[0])
 		for i := 0; i < nCols; i++ {
 			innerCols = append(innerCols, catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i})
 		}
 	} else {
-		for _, tgt := range cte.Query.Targets {
+		for _, tgt := range src.Targets {
 			// A top-level `*` / `t.*` in the CTE body must materialise into
 			// the inner scope's concrete columns — analyzeExpr rejects a
 			// bare StarExpr ("'*' is not allowed here"). Mirrors
@@ -2606,11 +2624,14 @@ func expandInnerStarColumns(star *parser.StarExpr, innerCtx *scope) []catalog.Co
 }
 
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *scope) (*catalog.Table, error) {
+	// The output column names come from the LEFTMOST branch, which is not
+	// rv.Subquery itself when that is a grouping node. M0125-0020.
+	src := setOpLeftmostBranch(rv.Subquery)
 	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
 	// The inner SelectStmt has no Targets; build the column list from the
 	// explicit alias list (rv.Columns) or synthetic names. M0097-0003.
-	if len(rv.Subquery.ValuesRows) > 0 {
-		nCols := len(rv.Subquery.ValuesRows[0])
+	if len(src.ValuesRows) > 0 {
+		nCols := len(src.ValuesRows[0])
 		cols := make([]catalog.Column, nCols)
 		for i := 0; i < nCols; i++ {
 			name := fmt.Sprintf("column%d", i+1)
@@ -2648,18 +2669,18 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 	// that buildSelectScopeIn can find CTE-named tables via resolveTable
 	// (which walks the scope chain). buildSelectScope uses lookupTable which
 	// is catalog-only and silently drops CTE names. M0097-0098.
-	if rv.Subquery.With != nil {
-		_ = analyzeWith(rv.Subquery.With, innerCtx)
+	if src.With != nil {
+		_ = analyzeWith(src.With, innerCtx)
 	}
-	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
-		rels, err := buildSelectScopeIn(rv.Subquery, innerCtx)
+	if len(src.From) > 0 || len(src.FromExprs) > 0 {
+		rels, err := buildSelectScopeIn(src, innerCtx)
 		if err != nil {
 			return nil, err
 		}
 		innerCtx.rels = rels
 	}
-	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
-	for _, tgt := range rv.Subquery.Targets {
+	cols := make([]catalog.Column, 0, len(src.Targets))
+	for _, tgt := range src.Targets {
 		// Star expression in inner SELECT (e.g. TABLE tablename → SELECT * FROM tablename).
 		// Expand to all columns from the inner scope. M0097-0003.
 		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
@@ -2708,6 +2729,20 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 		}
 	}
 	return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+}
+
+// setOpLeftmostBranch returns the SelectStmt that actually carries a query's
+// target list. A grouping node — the node built for `( … ) UNION …`, holding
+// the parenthesised branch in SetOpOperand — has no Targets / From of its own,
+// so every caller that names a query's output columns must descend past it.
+// PostgreSQL names a set operation's columns after its LEFTMOST branch
+// (transformSetOperationStmt, postgres/src/backend/parser/analyze.c), which is
+// exactly what this walk reaches. M0125-0020.
+func setOpLeftmostBranch(s *parser.SelectStmt) *parser.SelectStmt {
+	for s != nil && s.SetOpOperand != nil {
+		s = s.SetOpOperand
+	}
+	return s
 }
 
 // deriveAnalyzerTargetName mirrors executor.deriveTargetName for

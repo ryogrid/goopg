@@ -1,0 +1,17 @@
+                                                                                                                                                                                                                                                                                 QUERY PLAN                                                                                                                                                                                                                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+         Filter: ((d_year = 2001) AND ((((((cd_demo_sk = ss_cdemo_sk) AND (cd_marital_status = 'S')) AND (cd_education_status = 'Secondary')) AND ((ss_sales_price >= 100.00) AND (ss_sales_price <= 150.00))) OR ((((cd_demo_sk = ss_cdemo_sk) AND (cd_marital_status = 'M')) AND (cd_education_status = '2 yr Degree')) AND ((ss_sales_price >= 50.00) AND (ss_sales_price <= 100.00)))) OR ((((cd_demo_sk = ss_cdemo_sk) AND (cd_marital_status = 'D')) AND (cd_education_status = 'Advanced Degree')) AND ((ss_sales_price >= 150.00) AND (ss_sales_price <= 200.00)))))
+     ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: ((((((ss_addr_sk = ca_address_sk) AND (ca_country = 'United States')) AND (ca_state = ANY ('ND', 'NY', 'SD'))) AND ((ss_net_profit >= 0) AND (ss_net_profit <= 2000))) OR ((((ss_addr_sk = ca_address_sk) AND (ca_country = 'United States')) AND (ca_state = ANY ('MD', 'GA', 'KS'))) AND ((ss_net_profit >= 150) AND (ss_net_profit <= 3000)))) OR ((((ss_addr_sk = ca_address_sk) AND (ca_country = 'United States')) AND (ca_state = ANY ('CO', 'MN', 'NC'))) AND ((ss_net_profit >= 50) AND (ss_net_profit <= 25000))))
+       ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.customer_address  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+         ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=1 width=0)
+       ->  Index Scan using public.customer_demographics_pkey on public.customer_demographics  (cost=0.00..0.00 rows=1 width=0)
+             Index Cond: (cd_demo_sk = ss_cdemo_sk)
+     ->  Index Scan using public.store_pkey on public.store  (cost=0.00..0.00 rows=1 width=0)
+           Index Cond: (s_store_sk = ss_store_sk)
+(13 rows)
+

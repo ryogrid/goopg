@@ -1,0 +1,28 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T18:12:41+09:00
+# goopg: 784dcdf3 bench(tpcds): M0124-0001 chunk 2 — Q9-Q16 measured; Q11 is a PG-only timeout  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=01bb0f65c67b6f7c on-disk=01bb0f65c67b6f7c (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q17  OK          53s        1 
+pg    Q17  OK           2s        1 
+goopg Q18  TIMEOUT    627s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      (engine source unchanged; image now 22110d95fe159084)
+pg    Q18  OK           0s      100 
+goopg Q19  OK          64s      100 
+pg    Q19  OK           0s      100 
+goopg Q20  OK          14s      100 
+pg    Q20  OK           0s      100 
+goopg Q21  OK          50s      100 
+pg    Q21  OK           2s      100 
+goopg Q22  OK         156s      100 
+pg    Q22  OK           5s      100 
+goopg Q23  OK         210s        1 [1+0] 
+pg    Q23  OK           6s        1 [1+0] 
+goopg Q24  OK          75s        0 [0+0] 
+pg    Q24  OK           0s        0 [0+0] 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

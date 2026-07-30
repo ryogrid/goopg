@@ -7,7 +7,6 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,6 +25,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
@@ -1536,6 +1536,21 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// M0097-0065. Non-array text rendering honors the session DateStyle
 		// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
 		// matching the already-fixed SELECT/COPY/CAST output paths.
+		// byteacat (varlena.c): bytea || bytea is BYTEA, not text. The
+		// unknown-type literal in `<bytea> || '\x00'` is coerced through
+		// byteain first, exactly as PG's operator resolution would; a string
+		// that is not valid bytea input falls through to the text path below
+		// rather than failing the query. M0125-0021.
+		if left.Kind == KindBytes || right.Kind == KindBytes {
+			lb, lok := byteaOperand(left)
+			rb, rok := byteaOperand(right)
+			if lok && rok {
+				out := make([]byte, 0, len(lb)+len(rb))
+				out = append(out, lb...)
+				out = append(out, rb...)
+				return NewBytesDatum(out), nil
+			}
+		}
 		ls := formatDatumDateStyle(left, ctx)
 		rs := formatDatumDateStyle(right, ctx)
 		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
@@ -2282,6 +2297,15 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 // On success it returns a Datum with that kind; on failure it
 // returns a KindString Datum (the original), letting the caller
 // produce a proper type-mismatch error.
+// hasISODatePrefix reports whether s opens with a canonical, zero-padded
+// "YYYY-MM-DD" date field — the same fixed-offset probe parseTimeString and
+// parseTimeTZString use to decide a string carries a date. Callers pass a
+// pgdatetime.NormalizeInput'd string so the unpadded spellings PG accepts are
+// recognised too.
+func hasISODatePrefix(s string) bool {
+	return len(s) >= 10 && s[4] == '-' && s[7] == '-'
+}
+
 func tryParseStringAs(target DatumKind, s string) Datum {
 	switch target {
 	case KindInt:
@@ -2293,6 +2317,19 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 			return newNumeric(m, int(sc))
 		}
 	case KindTime:
+		// M0125-0007: a literal that carries a DATE part is a timestamp and has
+		// to be decoded as one FIRST. parseTimeString strips the date prefix and
+		// returns the bare time-of-day anchored at 1970-01-01, so reaching it
+		// first made `ts_col = '2002-05-01 03:04:05'` compare 2002-05-01 against
+		// 1970-01-01 and silently report no match — the same silent-wrong-answer
+		// shape as the unpadded-field defect, one type over. PG never has this
+		// ambiguity: transformExpr coerces the unknown literal to the column's
+		// type before evaluation.
+		if hasISODatePrefix(pgdatetime.NormalizeInput(s)) {
+			if t, err := parseCopyTimestamp(s); err == nil {
+				return NewTimeDatum(t)
+			}
+		}
 		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
 		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
 		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
@@ -2541,6 +2578,25 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		bIsBytes := b.Kind == KindBytes
 		if aIsBytes && bIsBytes {
 			return strings.Compare(string(a.BytesValue()), string(b.BytesValue())), nil
+		}
+		// bytea vs string: the string side is an unknown-type literal that PG
+		// would have coerced to bytea before the operator was resolved, so
+		// `b = '\xaabb'` compares TWO BYTES, not two bytes against the six
+		// characters of the escape text. Without this, M0125-0021's storage fix
+		// would have made every such predicate silently match nothing. A string
+		// that is not valid bytea input keeps the old raw comparison rather
+		// than failing the query, matching this block's fall-back convention.
+		if aIsBytes != bIsBytes {
+			lit, other := b, a
+			if bIsBytes {
+				lit, other = a, b
+			}
+			if coerced, cerr := byteaIn(lit.StringValue(), 0); cerr == nil {
+				if aIsBytes {
+					return bytes.Compare(other.BytesValue(), coerced), nil
+				}
+				return bytes.Compare(coerced, other.BytesValue()), nil
+			}
 		}
 		// Fall back to string comparison so planner-side column
 		// misalignments don't crash the entire query.  The result
@@ -2871,7 +2927,10 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		t, err := time.Parse("2006-01-02", x.Value)
+		// M0125-0007: PG's DecodeDate reads each numeric field on its own, so
+		// '2002-5-1' is the same date as '2002-05-01'. Normalise to the padded
+		// spelling the fixed Go layout below requires.
+		t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(x.Value))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
 		}
@@ -2921,8 +2980,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 			"2006-01-02 15:04",
 			"2006-01-02",
 		}
+		// M0125-0007: same field-at-a-time acceptance as the date case above —
+		// PG takes '2002-5-1 3:4:5' for a timestamp, the layouts below do not.
+		normalized := pgdatetime.NormalizeInput(x.Value)
 		for _, layout := range layouts {
-			if t, err := time.Parse(layout, x.Value); err == nil {
+			if t, err := time.Parse(layout, normalized); err == nil {
 				x.CachedTime = t.UTC()
 				x.CacheValid = true
 				return NewTimeDatum(x.CachedTime), nil
@@ -3351,8 +3413,30 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(formatTextArray(elems)), nil
 		}
 		return d, nil
+	case "bytea":
+		// byteain (postgres/src/backend/utils/adt/varlena.c). An unknown-type
+		// literal and an explicitly-typed text value both reach this arm as
+		// KindString and PG treats them identically — `'\xaa'::text::bytea`
+		// and `'\xaa'::bytea` are both the single byte 0xAA. M0125-0021.
+		switch d.Kind {
+		case KindBytes:
+			return d, nil
+		case KindString:
+			b, err := byteaIn(d.StringValue(), pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewBytesDatum(b), nil
+		default:
+			return Datum{}, &ExecError{Code: "42846", Pos: pos,
+				Message: fmt.Sprintf("cannot cast type %s to bytea", pgKindTypeName(d.Kind))}
+		}
 	case "text", "varchar", "bpchar", "char":
 		switch d.Kind {
+		case KindBytes:
+			// byteaout, hex mode: a bytea cast to text is the `\x…` escape
+			// string, NOT the raw payload bytes. M0125-0021.
+			return NewStringDatum(byteaOutHex(d.BytesValue())), nil
 		case KindBool:
 			if d.BoolValue() {
 				return NewStringDatum("true"), nil
@@ -8691,7 +8775,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if _, ok := parseDateInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				_, err := time.Parse("2006-01-02", v)
+				// M0125-0007: pg_input_is_valid must agree with the cast path,
+				// which now accepts PG's unpadded month/day fields.
+				_, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(v))
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
 				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
@@ -9937,6 +10023,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
 					Pos:     x.Pos()}
 			}
+			if s.Kind == KindBytes {
+				// byteaoctetlen: bytes, not characters. Rune-counting a bytea
+				// happened to agree only because each invalid UTF-8 byte
+				// decodes to one RuneError. M0125-0021.
+				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
+			}
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
 	case "octet_length":
@@ -9944,6 +10036,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			if s.Kind == KindBytes {
+				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
 			}
 			return Datum{Kind: KindInt, Int: int64(len(s.StringValue()))}, nil
 		}
@@ -11181,8 +11276,48 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(fmt.Sprintf("%x", v.Int)), nil
 		}
 	case "encode":
-		// encode(bytea, format) — stub: return empty string
-		return NewStringDatum(""), nil
+		// encode(bytea, format) -> text. Formats: base64, escape, hex
+		// (binary_encode, postgres/src/backend/utils/adt/encode.c). This was a
+		// stub returning "" for every input until M0125-0021 — a hex dump that
+		// silently produced the empty string rather than erroring.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExpr(x.Args[0], row, ctx)
+		if serr != nil {
+			return NullDatum, serr
+		}
+		if src.IsNull() {
+			return NullDatum, nil
+		}
+		encFmt, ferr := evalExpr(x.Args[1], row, ctx)
+		if ferr != nil {
+			return NullDatum, ferr
+		}
+		if encFmt.IsNull() {
+			return NullDatum, nil
+		}
+		// The argument is bytea; a KindString here is an unknown-type literal
+		// that PG would have coerced through byteain first.
+		raw := src.BytesValue()
+		if src.Kind != KindBytes {
+			b, berr := byteaIn(src.StringValue(), x.Pos())
+			if berr != nil {
+				return NullDatum, berr
+			}
+			raw = b
+		}
+		switch strings.ToLower(strings.TrimSpace(encFmt.Format())) {
+		case "hex":
+			return NewStringDatum(hexEncodePG(raw)), nil
+		case "base64":
+			return NewStringDatum(b64EncodePG(raw)), nil
+		case "escape":
+			return NewStringDatum(escEncodePG(raw)), nil
+		default:
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unrecognized encoding: %q", encFmt.Format())}
+		}
 	case "decode":
 		// decode(text, format) -> bytea. Formats: hex, escape, base64.
 		if len(x.Args) != 2 {
@@ -11197,49 +11332,35 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NullDatum, nil
 		}
 		format := strings.ToLower(strings.TrimSpace(fmtArg.Format()))
+		// M0125-0021: all three decoders now come from bytea.go, shared with
+		// the `::bytea` cast, so decode() and byteain cannot drift. Three
+		// deviations were removed here: the `\x` prefix was stripped before
+		// hex-decoding (PG errors — `decode('\xaabb','hex')` is
+		// `invalid hexadecimal digit: "\"`), an invalid backslash sequence in
+		// escape format was passed through instead of raising 22P02, and
+		// base64 rejected the newlines PG's own encode() emits.
 		switch format {
 		case "hex":
-			hexStr := src.Format()
-			// strip optional \x prefix
-			hexStr = strings.TrimPrefix(hexStr, `\x`)
-			b, err := hex.DecodeString(hexStr)
+			b, err := hexDecodePG(src.Format(), x.Pos())
 			if err != nil {
-				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid hexadecimal data: %v", err)}
+				return NullDatum, err
 			}
 			return NewBytesDatum(b), nil
 		case "escape":
-			// PostgreSQL escape format: \xxx octal or \\ for backslash
-			s := src.Format()
-			var out []byte
-			for i := 0; i < len(s); {
-				if s[i] == '\\' && i+1 < len(s) {
-					if s[i+1] == '\\' {
-						out = append(out, '\\')
-						i += 2
-					} else if i+3 < len(s) && s[i+1] >= '0' && s[i+1] <= '3' &&
-						s[i+2] >= '0' && s[i+2] <= '7' && s[i+3] >= '0' && s[i+3] <= '7' {
-						v := (s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0')
-						out = append(out, v)
-						i += 4
-					} else {
-						out = append(out, s[i])
-						i++
-					}
-				} else {
-					out = append(out, s[i])
-					i++
-				}
-			}
-			return NewBytesDatum(out), nil
-		case "base64":
-			var b []byte
-			b, err := base64.StdEncoding.DecodeString(src.Format())
+			b, err := escDecodePG(src.Format(), x.Pos())
 			if err != nil {
-				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid base64 data: %v", err)}
+				return NullDatum, err
+			}
+			return NewBytesDatum(b), nil
+		case "base64":
+			b, err := b64DecodePG(src.Format(), x.Pos())
+			if err != nil {
+				return NullDatum, err
 			}
 			return NewBytesDatum(b), nil
 		default:
-			return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("unrecognized encoding: %q", format)}
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unrecognized encoding: %q", fmtArg.Format())}
 		}
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
@@ -12260,11 +12381,20 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fromArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString {
+	if src.Kind != KindString && src.Kind != KindBytes {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
+	}
+	// bytea_substr (varlena.c) slices BYTES and returns bytea. The window
+	// arithmetic below is already byte-indexed, so the only difference is the
+	// Kind of the result — without it `substring(<bytea> from 2 for 1)` would
+	// hand back a text datum that the wire renderer hex-dumps as garbage.
+	// M0125-0021.
+	mkResult := NewStringDatum
+	if src.Kind == KindBytes {
+		mkResult = func(v string) Datum { return NewBytesDatum([]byte(v)) }
 	}
 	s := src.StringValue()
 	from := fromArg.Int
@@ -12278,9 +12408,9 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		idx := int(from) - 1
 		if idx >= len(s) {
-			return NewStringDatum(""), nil
+			return mkResult(""), nil
 		}
-		return NewStringDatum(s[idx:]), nil
+		return mkResult(s[idx:]), nil
 	}
 	cntArg, err := evalExpr(x.Args[2], row, ctx)
 	if err != nil {
@@ -12306,12 +12436,12 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = startIdx
 	}
 	if startIdx >= len(s) {
-		return NewStringDatum(""), nil
+		return mkResult(""), nil
 	}
 	if endIdx > len(s) {
 		endIdx = len(s)
 	}
-	return NewStringDatum(s[startIdx:endIdx]), nil
+	return mkResult(s[startIdx:endIdx]), nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,

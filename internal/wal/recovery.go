@@ -3065,12 +3065,22 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 			return fmt.Errorf("wal: xlog heap-prune redirect: %w", err)
 		}
 	}
-	if len(unused) > 0 {
+	// root-0033: compact whenever the record carries ANY prune action, not
+	// only when it has now-unused slots. The runtime sibling pagePruneCore
+	// (internal/storage/prune.go) runs VacuumHeapPageBySlots on BOTH arms —
+	// with the dead set when there are unused slots, and with a nil dead set
+	// when the prune produced only redirects — because a redirected chain
+	// root becomes ItemIDRedirect and its tuple body must be reclaimed by the
+	// repack. Guarding the repack on len(unused) made redo leave that body in
+	// place, so the replayed page held LESS free space than the runtime page
+	// and the next xl_heap_update redo failed with ErrNoSpaceInPage, leaving
+	// the cluster unstartable after a crash under write load. The native
+	// replayHeapPruneOpt below always compacts; this PG-format arm (A7) had
+	// drifted from both siblings.
+	if len(redirects) > 0 || len(unused) > 0 {
 		if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
 			return fmt.Errorf("wal: xlog heap-prune compact: %w", err)
 		}
-	}
-	if len(redirects) > 0 || len(unused) > 0 {
 		storage.MustHeader(page).SetPruneXID(0)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
@@ -3101,12 +3111,14 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 // the supplied Manager. Used by initdb.Open at startup so the
 // runtime's single Manager handles both the replay phase and
 // subsequent normal I/O. A missing or empty walDir is treated as
-// "nothing to replay" (a freshly initdb'd cluster). segmentSize
-// of 0 means use the default DefaultSegmentSize.
+// "nothing to replay" (a freshly initdb'd cluster).
+//
+// segmentSize of 0 means "the cluster's own wal_segment_size", which ReadAll
+// reads back from the stream's long page header (root-0035). It used to be
+// coerced to DefaultSegmentSize here, which made startup replay of a cluster
+// with a non-default segment size compute every record LSN against the wrong
+// base — see readAllUncached for why that silently defeats pd_lsn idempotency.
 func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error) {
-	if segmentSize == 0 {
-		segmentSize = DefaultSegmentSize
-	}
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		// Missing pg_wal on a fresh data dir is fine — no records
@@ -3901,10 +3913,9 @@ func checkpointStructOf(r Record) []byte {
 // Returns an error if WAL segments exist but no checkpoint is found —
 // this indicates an unrecoverable cluster state that requires
 // re-initialization.
+// segmentSize of 0 means "the cluster's own wal_segment_size" (root-0035);
+// ReadAll derives it from the stream rather than assuming DefaultSegmentSize.
 func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error) {
-	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
-	}
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		return 0, fmt.Errorf("wal: discover checkpoint: %w", err)

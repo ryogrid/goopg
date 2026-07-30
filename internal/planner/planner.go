@@ -632,6 +632,26 @@ func setOpKeyword(t parser.SetOpType) string {
 	}
 }
 
+// setOpBindsTighter reports whether set-operator `inner` binds more tightly
+// than `outer`. PostgreSQL declares the precedence in gram.y:
+//
+//	%left		UNION EXCEPT
+//	%left		INTERSECT
+//
+// (postgres/src/backend/parser/gram.y:825-826 — later declaration wins), so
+// INTERSECT binds tighter than UNION and EXCEPT, which tie with each other.
+// foldSetOpRange below (M0125-0016) consults this to group maximal INTERSECT
+// runs before the UNION/EXCEPT left-fold.
+//
+// It used to have a second caller — the paren-boundary decision (M0125-0006),
+// which had to avoid cutting a chain at a ')' when the operator written after
+// it bound tighter. That case no longer exists: text after a ')' now builds a
+// grouping node, so a parenthesised operand never shares a chain with the
+// operators around it and precedence is decided here alone. M0125-0020.
+func setOpBindsTighter(inner, outer parser.SetOpType) bool {
+	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
+}
+
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
@@ -681,21 +701,35 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			opAll  bool
 			opPos  int
 			stmt   *parser.SelectStmt
+			// cutAt is the node whose SetOp must be detached while this
+			// segment is planned, so planSelect(stmt) sees exactly the
+			// operand and not the rest of the chain. nil means "plan stmt
+			// with its chain intact" — the atomic-operand case below.
+			cutAt *parser.SelectStmt
 		}
 		var segments []setOpSegment
 		{
 			cur := s
 			for cur.SetOp != nil {
 				rightStmt := cur.SetOp.Right
-				segments = append(segments, setOpSegment{
+				seg := setOpSegment{
 					opType: cur.SetOp.Type,
 					opAll:  cur.SetOp.All,
 					opPos:  cur.SetOp.Pos(),
 					stmt:   rightStmt,
-				})
-				if rightStmt.Parenthesized {
-					break // explicit grouping: stop flattening, treat as atomic
 				}
+				if rightStmt.Parenthesized && rightStmt.SetOp != nil {
+					// A parenthesised operand that is itself a compound —
+					// `A UNION (B EXCEPT C)`. Parenthesized means the ')'
+					// closed with nothing after it (a trailing set-operator
+					// would have produced a grouping node instead,
+					// M0125-0020), so this operand ends the chain: plan it
+					// with its chain intact and stop flattening.
+					segments = append(segments, seg)
+					break
+				}
+				seg.cutAt = rightStmt
+				segments = append(segments, seg)
 				cur = rightStmt
 			}
 		}
@@ -706,25 +740,43 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// leftmost branch alone. Without this, `SELECT * FROM t INTERSECT
 		// … ORDER BY 1` would try to resolve the positional ORDER BY
 		// against the unexpanded StarExpr. M0097-0042.
-		savedSetOps := make([]*parser.SetOpClause, len(segments))
+		// savedSetOps[0] is s's own chain head; savedSetOps[i+1] belongs to
+		// segment i's cut node (nil when that segment is planned with its
+		// chain intact). Keying on cutAt rather than on "every segment but the
+		// last" is what lets a partially-parenthesised operand be cut at its
+		// paren boundary instead of at its end. M0125-0006.
+		savedSetOps := make([]*parser.SetOpClause, len(segments)+1)
 		savedSetOps[0] = s.SetOp
 		s.SetOp = nil
-		for i := 0; i < len(segments)-1; i++ {
-			savedSetOps[i+1] = segments[i].stmt.SetOp
-			segments[i].stmt.SetOp = nil
+		for i, seg := range segments {
+			if seg.cutAt == nil {
+				continue
+			}
+			savedSetOps[i+1] = seg.cutAt.SetOp
+			seg.cutAt.SetOp = nil
 		}
+		// s's own ORDER BY / LIMIT / OFFSET always belong to the WHOLE chain
+		// (wrapSetOpSortLimit applies them at the very end), so the leftmost
+		// branch must be planned without them. A sort/limit written inside a
+		// parenthesised branch is not here at all: it lives on that branch's
+		// own SelectStmt, one level below a grouping node. M0125-0020.
 		savedOrderBy := s.OrderBy
 		savedLimit := s.Limit
 		savedOffset := s.Offset
 		s.OrderBy = nil
 		s.Limit = nil
 		s.Offset = nil
-		// Plan the leftmost branch (s without its SetOp chain or sort/limit).
+		// Plan the leftmost branch: s without its SetOp chain and without the
+		// whole chain's sort/limit. When s is a grouping node this recursion
+		// lands on the SetOpOperand branch below and plans the parenthesised
+		// operand — including that operand's own ORDER BY / LIMIT.
 		left, err := planSelect(s, cat)
 		// Restore everything (plan cache may reuse the AST).
 		s.SetOp = savedSetOps[0]
-		for i := 0; i < len(segments)-1; i++ {
-			segments[i].stmt.SetOp = savedSetOps[i+1]
+		for i, seg := range segments {
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = savedSetOps[i+1]
+			}
 		}
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
@@ -732,35 +784,36 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Build left-associatively: fold each subsequent branch in from the left.
-		// When s.InnerSegmentCount > 0, ORDER BY/LIMIT/OFFSET applies to the
-		// result of the first InnerSegmentCount segments (the "inner" compound),
-		// not the final outer result. Example:
-		//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
-		// → after segment 1 (INTERSECT), apply ORDER BY to Sort(INTERSECT),
-		//   then append UNION ALL C without re-sorting. M0097-0044.
-		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
-		for i, seg := range segments {
-			// Middle segments (all but the last) had their SetOp saved+cleared
-			// above, then restored early for plan-cache correctness. Re-clear
-			// before planning so planSelect(seg.stmt) sees this as a leaf and
-			// does not recursively re-flatten the already-flattened chain.
-			// The last segment is either a true leaf (SetOp=nil) or an
-			// explicitly-parenthesised compound (Parenthesized=true) that must
-			// retain its SetOp so the inner compound is planned correctly.
-			// M0097-0050.
-			if i < len(segments)-1 {
-				seg.stmt.SetOp = nil
+		// planSegment plans segment i's operand alone.
+		//
+		// Cut segments had their SetOp saved+cleared above, then restored
+		// early for plan-cache correctness. Re-cut before planning so
+		// planSelect(seg.stmt) sees only this operand and does not
+		// recursively re-flatten the already-flattened chain. M0097-0050.
+		// A segment with cutAt == nil is a fully-parenthesised compound that
+		// must retain its SetOp so the inner compound is planned as one
+		// atomic operand.
+		planSegment := func(i int) (Node, error) {
+			seg := segments[i]
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = nil
 			}
 			right, rerr := planSelect(seg.stmt, cat)
-			if i < len(segments)-1 {
-				seg.stmt.SetOp = savedSetOps[i+1] // restore for plan-cache
+			if seg.cutAt != nil {
+				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
 			}
-			if rerr != nil {
-				return nil, rerr
-			}
+			return right, rerr
+		}
+		// applySetOp joins `right` onto `acc` using segment i's operator.
+		// `acc` is whatever the fold has accumulated on the operator's left —
+		// the running left-deep result at this precedence level, NOT
+		// necessarily the leftmost branch, so type unification and the
+		// column-count check are re-based on it rather than on a flat index.
+		// M0125-0016.
+		applySetOp := func(acc, right Node, i int) (Node, error) {
+			seg := segments[i]
 			// Each branch must project the same number of columns.
-			if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
+			if lc, rc := len(acc.Output()), len(right.Output()); lc != rc {
 				return nil, &PlanError{
 					Pos:     seg.opPos,
 					Code:    "42601",
@@ -771,27 +824,67 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// nodes for columns where the left and right types differ. This ensures
 			// that string values like 'foo' are validated when the left branch
 			// declares a typed column (e.g. numeric). M0097-0056.
-			right = wrapSetOpBranchWithCasts(seg.opPos, left.Output(), right)
-			left = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: seg.opType, All: seg.opAll}
-			// If this segment is the last "inner" segment, apply the sort/limit
-			// to the intermediate result before processing outer segments.
-			if innerBoundary > 0 && i+1 == innerBoundary {
-				inner, werr := wrapSetOpSortLimit(s, left, cat)
-				if werr != nil {
-					return nil, werr
-				}
-				left = inner
-				// Clear the saved ORDER BY/LIMIT/OFFSET so wrapSetOpSortLimit
-				// below doesn't apply them again to the outer result.
-				savedOrderBy = nil
-				savedLimit = nil
-				savedOffset = nil
-				s.OrderBy = nil
-				s.Limit = nil
-				s.Offset = nil
-			}
+			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
+			return &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, nil
 		}
-		// Restore final ORDER BY / LIMIT / OFFSET (may be nil if cleared above).
+		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
+		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT
+		// (gram.y:825-826), and each level is left-associative.
+		//
+		// goopg used to fold the flat segment list left-deep regardless of the
+		// operator, so a BARE `A UNION B INTERSECT C` planned as
+		// `(A UNION B) INTERSECT C` and returned the wrong rows — a wrong-answer
+		// defect no row-count gate could see. The explicitly-parenthesised
+		// spelling was already correct via setOpBindsTighter at the paren
+		// boundary; this makes the bare spelling agree. M0125-0016.
+		//
+		// The shape is a two-level precedence climb: a maximal INTERSECT run is
+		// folded into a single operand before it becomes the right-hand side of
+		// the enclosing UNION/EXCEPT fold. A run that starts at `lo` has no
+		// UNION/EXCEPT to its left inside this range, so it attaches directly to
+		// acc.
+		foldSetOpRange := func(acc Node, lo, hi int) (Node, error) {
+			i := lo
+			for i < hi && segments[i].opType == parser.SetOpIntersect {
+				right, err := planSegment(i)
+				if err != nil {
+					return nil, err
+				}
+				if acc, err = applySetOp(acc, right, i); err != nil {
+					return nil, err
+				}
+				i++
+			}
+			for i < hi {
+				opIdx := i
+				right, err := planSegment(i)
+				if err != nil {
+					return nil, err
+				}
+				i++
+				// Absorb the INTERSECT run that follows this operand: it binds
+				// tighter than segments[opIdx]'s UNION/EXCEPT, so it groups with
+				// what follows rather than with what precedes.
+				for i < hi && setOpBindsTighter(segments[i].opType, segments[opIdx].opType) {
+					inner, ierr := planSegment(i)
+					if ierr != nil {
+						return nil, ierr
+					}
+					if right, ierr = applySetOp(right, inner, i); ierr != nil {
+						return nil, ierr
+					}
+					i++
+				}
+				if acc, err = applySetOp(acc, right, opIdx); err != nil {
+					return nil, err
+				}
+			}
+			return acc, nil
+		}
+		if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
+			return nil, err
+		}
+		// Restore final ORDER BY / LIMIT / OFFSET.
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
 		s.Offset = savedOffset
@@ -800,6 +893,20 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
 		return wrapSetOpSortLimit(s, left, cat)
+	}
+	// A grouping node stands for a parenthesised set-op operand with nothing
+	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
+	// leftmost branch of a chain reached from the block above with its SetOp
+	// detached. Its value is the operand's; its own sort/limit (whatever was
+	// written after the ')') wraps that value and resolves against the
+	// operand's output columns, exactly as a trailing set-op sort/limit does.
+	// M0125-0020.
+	if s.SetOpOperand != nil {
+		operand, err := planSelect(s.SetOpOperand, cat)
+		if err != nil {
+			return nil, err
+		}
+		return wrapSetOpSortLimit(s, operand, cat)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -1023,6 +1130,28 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if len(ctx.bindings) > 0 {
 		remapWithBindings(node, ctx.bindings)
 	}
+	// RC-1b (TPC-DS Q47/Q50): route single-source conjuncts from
+	// mh.Filters onto their Tables[i] only AFTER the remap above, when
+	// ColumnRef indices and Tables offsets finally share the MHJ-output
+	// coordinate space. Running this inside
+	// rewriteScanInputsWithSingleTablePredicates (pre-remap) attributed
+	// by FROM-cumulative indices against OID-sorted offsets and pushed
+	// predicates onto the WRONG scan — a date_dim OR-predicate landed on
+	// store, silently zeroing the result. The pass also validates every
+	// ref positionally by name and declines on any mismatch, so a path
+	// where the remap did not run degrades to post-join evaluation
+	// (slower, never wrong). Design: docs/design/tpcds-round2-fixes §3.4.
+	pushSingleSourceFiltersAfterRemap(node)
+	// M0125-0004 (TPC-DS Q75): the binary-join sibling of the pass
+	// above. Copy a residual conjunct that references exactly one input
+	// of an INNER Join onto that input, so a single-relation restriction
+	// is applied before the side-mixed residual runs — PG's
+	// distribute_restrictinfo_to_rels placement. Pinned HERE, after the
+	// last applyJoinTreePosMap (inside remapWithBindings): that walker
+	// remaps n.Filters and returns without recursing into n.Tables[i],
+	// so a conjunct pushed before it would never be revisited.
+	// Design: docs/design/0125-0004-q75-join-residual-evaluation-order.md.
+	pushSingleSideQualsIntoInnerJoinInputs(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer
@@ -1551,9 +1680,46 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			outerCtx.cat = cat
 			outerKeys := make([]SortKey, 0, len(s.OrderBy))
 			for _, sb := range s.OrderBy {
+				var e Expr
+				// `ORDER BY <n>` is a 1-based reference into the DISTINCT
+				// output.  Resolve it positionally BEFORE substitution so a
+				// star target list (`SELECT DISTINCT * … ORDER BY 2 DESC`),
+				// which resolveOrderBySubstitution deliberately leaves alone,
+				// still finds its column.  Mirrors the same IntegerConst arm
+				// on the normal ORDER BY path above.
+				if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+					if idx := int(ic.Value) - 1; idx >= 0 && idx < len(distinctOut) {
+						sc := distinctOut[idx]
+						e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+					}
+				}
 				expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
-				e, err := resolveExpr(expr, outerCtx)
-				if err != nil {
+				if e == nil {
+					if re, err := resolveExpr(expr, outerCtx); err == nil {
+						e = re
+					}
+				}
+				if e == nil {
+					// resolveOrderBySubstitution rewrites a bare ORDER BY name
+					// into the matching target's OWN expression, which is often
+					// table-qualified (`SELECT DISTINCT p.age … ORDER BY age`)
+					// or computed (`… p.age+1 … ORDER BY 1`).  outerCtx carries
+					// no range bindings and SchemaColumn has no table name, so
+					// neither form resolves against the Distinct output schema —
+					// which silently dropped the outer Sort and let distinctOp's
+					// internal ascending sort become the answer, losing DESC /
+					// `USING >` entirely.  PostgreSQL requires every SELECT
+					// DISTINCT sort key to appear in the select list
+					// (transformDistinctClause, parse_clause.c — otherwise
+					// 42P10), so resolve against the pre-projection context that
+					// built the targets and map the result back to its
+					// select-list position.  M0097-0046 / root-0036.
+					if idx := distinctSortKeyOutputIndex(expr, proj, ctx, agg, win); idx >= 0 && idx < len(distinctOut) {
+						sc := distinctOut[idx]
+						e = &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+					}
+				}
+				if e == nil {
 					// Key not resolvable in Distinct output — skip outer sort.
 					outerKeys = nil
 					break
@@ -2316,7 +2482,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID}
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
+						EstRelRows: stage1RelSizeRows(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2352,7 +2519,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+				EstRelRows: stage1RelSizeRows(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
 			var root Node = parentWrapped
@@ -2365,7 +2533,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// lock, skip the now-gone child instead of erroring. M0118-0008
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID}
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
+					EstRelRows: stage1RelSizeRows(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2385,12 +2554,22 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			return root, b, nil
 		}
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+		EstRelRows: stage1RelSizeRows(cat, tbl)}, b, nil
 }
-// remapSubqueryColumnRefs walks the plan tree rooted at n and rewrites every
-// Project node so that its targets are position-based ColumnRefs (indices
-// 0..N-1) relative to the Project's own child output schema.  The original
-// output schema (column names and types) is preserved; only the ColumnRef
+
+// stage1RelSizeRows is the single stamping point for the relation-size
+// fallback's stage-1 consumer (M0125-0003). It returns 0 — leaving the plan
+// byte-identical to the pre-M0125-0003 planner — unless the flag is on, which
+// is what makes the landing commit inert.
+func stage1RelSizeRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
+	return relSizeFallbackRows(1, cat, tbl)
+}
+
+// remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every
+// Project node whose bare-ColumnRef targets carry a column index that does not
+// address the Project's own child output schema.  The original output schema
+// (column names and types) is preserved; only demonstrably-broken ColumnRef
 // indices are rebuilt.
 //
 // This is a safety-normalisation pass applied after planning a FROM-clause
@@ -2398,6 +2577,20 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // to reference columns by their global FROM-clause index rather than by the
 // subquery's own output index, this pass corrects those indices before the
 // executor ever sees them.
+//
+// M0125-0010: it used to rebind EVERY target unconditionally, by matching
+// cr.Name against the child schema and taking the first hit.  An output
+// schema's names are not unique — an Aggregate names its outputs after the
+// aggregate *function*, so `select * from (select sum(a), sum(b) from t) d`
+// gave a child schema of [sum, sum] and both targets bound to slot 0,
+// returning sum(a) twice (TPC-DS Q21 Q28 Q46 Q66 Q68 Q79).  The repair is now
+// conditional: a target whose existing index already addresses a same-named
+// child column is left alone, so correct plans — the overwhelming majority —
+// are never touched, and duplicate names cannot collapse.  Only an index that
+// is out of range, or that points at a differently-named column (the actual
+// leakage signature this pass exists for), is re-derived by name.  Same
+// failure mode as M0125-0009: an ambiguous key resolved by taking the first
+// match.
 func remapSubqueryColumnRefs(n Node) Node {
 	if n == nil {
 		return nil
@@ -2407,28 +2600,39 @@ func remapSubqueryColumnRefs(n Node) Node {
 		// Recurse into child first.
 		x.Child = remapSubqueryColumnRefs(x.Child)
 		childSchema := x.Child.Output()
-		// Rebuild every target as a position-based ColumnRef.
+		// Repair only the targets whose index does not address the child.
 		newTargets := make([]Expr, len(x.Targets))
 		for i, t := range x.Targets {
-			// If target is a simple ColumnRef, replace with
-			// position-based index from child schema.
-			if cr, ok := t.(*ColumnRef); ok {
-				// Find matching column in child output by name.
-				found := false
-				for j, sc := range childSchema {
-					if strings.EqualFold(cr.Name, sc.Name) {
-						clone := *cr
-						clone.Index = j
-						newTargets[i] = &clone
-						found = true
-						break
-					}
-				}
-				if !found {
-					newTargets[i] = t // keep as-is
-				}
-			} else {
+			cr, ok := t.(*ColumnRef)
+			if !ok {
 				newTargets[i] = t // keep non-ColumnRef expressions
+				continue
+			}
+			// Already sound: the index is in range and names the same
+			// column the ref asks for.  This is the only branch that can
+			// distinguish two same-named child columns from each other,
+			// so it must run before any name-based search (M0125-0010).
+			if cr.Index >= 0 && cr.Index < len(childSchema) &&
+				strings.EqualFold(cr.Name, childSchema[cr.Index].Name) {
+				newTargets[i] = t
+				continue
+			}
+			// Broken index (out of range, or naming a different column):
+			// re-derive it from the child output by name.  A duplicate
+			// name here is genuinely ambiguous — the first match is a
+			// best effort on a plan that is already wrong.
+			found := false
+			for j, sc := range childSchema {
+				if strings.EqualFold(cr.Name, sc.Name) {
+					clone := *cr
+					clone.Index = j
+					newTargets[i] = &clone
+					found = true
+					break
+				}
+			}
+			if !found {
+				newTargets[i] = t // keep as-is
 			}
 		}
 		x.Targets = newTargets
@@ -6816,27 +7020,31 @@ func parserExprHasWindowFunc(e parser.Expr) bool {
 
 // planExprContentKey returns a content-based string key for a planner Expr,
 // used to compare resolved expressions for aggregate state-sharing equality. M0097-0035.
+//
+// Two calls that key equal are given one SharedStateSlot, and the executor
+// then runs sfunc ONCE for the group and copies the leader's finished state to
+// every follower (operators_join_agg.go:1699-1760). A key collision is
+// therefore a wrong answer, not a lost optimisation — the M0097-0032 shape,
+// where a dropped FILTER made a filtered count report the unfiltered total.
+//
+// M0125-0024 replaced this function's own 4-of-32-arm type switch with
+// exprwalk.go's identity driver. Its `default:` returned `fmt.Sprintf("%T", e)`
+// — the type name alone — so any two distinct expressions of one unenumerated
+// type collided: `ua(a + b)` and `ua(a - b)` shared a slot, as did any two
+// *CaseExpr or *CastExpr arguments.
+//
+// FAIL-CLOSED DIRECTION: an undecidable expression (an inner plan, or a type
+// the primitive has never been taught) must NEVER share. Keying it by pointer
+// keeps the one legitimate case — the same node reached twice — while making
+// two distinct nodes distinct. See docs/design/0125-0024-*.md §3.1.
 func planExprContentKey(e Expr) string {
 	if e == nil {
 		return "<nil>"
 	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		return fmt.Sprintf("col:%d/%d", x.SourceTableIdx, x.Index)
-	case *IntegerConst:
-		return fmt.Sprintf("int:%d", x.Value)
-	case *StringConst:
-		return fmt.Sprintf("str:%s", x.Value)
-	case *FuncCall:
-		var b strings.Builder
-		b.WriteString("fn:" + strings.ToLower(x.Name))
-		for _, a := range x.Args {
-			b.WriteString("|" + planExprContentKey(a))
-		}
-		return b.String()
-	default:
-		return fmt.Sprintf("%T", e)
+	if k, ok := exprIdentityKey(e, scopeVeto); ok {
+		return k
 	}
+	return fmt.Sprintf("opaque:%T:%p", e, e)
 }
 
 func aggregateCallKey(fc *parser.FuncCall) string {
@@ -6858,11 +7066,12 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 	// collapsed them onto one slot, so the filtered count silently
 	// reported the unfiltered total (e.g. sysviews pg_hba_file_rules
 	// `count(*) FILTER (WHERE error IS NOT NULL)`). M0097-0032.
-	if fc.Filter != nil {
-		b.WriteString("filter|")
-		b.WriteString(parserExprKey(fc.Filter))
-		b.WriteString("|")
-	}
+	//
+	// M0125-0009 generalised that one-off fix: funcCallTailKey folds in FILTER
+	// *and* the other content this key used to drop (OVER, the in-argument
+	// ORDER BY, WITHIN GROUP, VARIADIC), which collapsed e.g.
+	// `string_agg(x, ',' ORDER BY a)` with `string_agg(x, ',' ORDER BY b)`.
+	b.WriteString(funcCallTailKey(fc))
 	return b.String()
 }
 
@@ -7426,13 +7635,31 @@ func parserExprKey(e parser.Expr) string {
 			k.WriteString(parserExprKey(a))
 			k.WriteString("|")
 		}
+		// FILTER / OVER / ORDER BY / WITHIN GROUP / VARIADIC are content too:
+		// two calls differing only there are different calls. Empty tail →
+		// empty string, so a plain call's key is unchanged. M0125-0009.
+		k.WriteString(funcCallTailKey(x))
 		return k.String()
 	case *parser.StarExpr:
 		return "star:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table)
 	case *parser.CastExpr:
-		return "cast:" + strings.ToLower(x.Type.String()) + ":(" + parserExprKey(x.Operand) + ")"
+		// Typmods belong in the key: `x::numeric(10,2)` and `x::numeric(20,4)`
+		// are different expressions and ObjectName.String() does not render
+		// the parenthesised arguments. M0125-0009.
+		tm := ""
+		for _, m := range x.Typmods {
+			tm += ":" + strconv.FormatInt(m, 10)
+		}
+		return "cast:" + strings.ToLower(x.Type.String()) + tm + ":(" + parserExprKey(x.Operand) + ")"
 	}
-	return fmt.Sprintf("expr:%T", e)
+	// Every other expression type falls through to a STRUCTURAL key over the
+	// node's exported fields (internal/planner/exprkey.go). It must never be
+	// keyed by type name alone: that made all 17 unenumerated types — CaseExpr
+	// above all — compare equal to any other instance of themselves, so
+	// sibling `sum(CASE …)` aggregates collapsed onto one slot and pivot
+	// queries returned the first column's value in every column with the row
+	// count intact (M0125-0009; TPC-DS Q2 Q21 Q40 Q43 Q50 Q59 Q62 Q66 Q97 Q99).
+	return structuralExprKey(e)
 }
 
 // enforceInheritanceFanout, when true, additionally refuses IndexScan when
@@ -9758,6 +9985,14 @@ func exprType(e Expr) catalog.Type {
 			}
 			return catalog.Type{Name: "unknown"}
 		case parser.OpConcat:
+			// byteacat: bytea || bytea is bytea. The executor's OpConcat arm
+			// returns a KindBytes datum for that shape, so advertising text
+			// here would make the wire layer print the raw payload instead of
+			// the `\x…` hex form. M0125-0021.
+			if strings.EqualFold(exprType(x.Left).Name, "bytea") ||
+				strings.EqualFold(exprType(x.Right).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
 			return catalog.Type{Name: "text"}
 		case parser.OpAnd, parser.OpOr, parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpLike, parser.OpNotLike:
 			return catalog.Type{Name: "bool"}
@@ -9837,6 +10072,20 @@ func exprType(e Expr) catalog.Type {
 		case "to_timestamp":
 			return catalog.Type{Name: "timestamp"}
 		case "substr", "substring":
+			// bytea_substr returns bytea; text_substring returns text. The
+			// executor keys off the argument's Kind, so the advertised type
+			// must key off the argument's type or the wire layer prints a
+			// bytea slice as raw bytes. M0125-0021.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
+		case "decode":
+			// decode(text, format) -> bytea (encode.c). Untyped before
+			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as
+			// "unknown" and printed the two raw bytes instead of `\xaabb`.
+			return catalog.Type{Name: "bytea"}
+		case "encode":
 			return catalog.Type{Name: "text"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
@@ -11697,44 +11946,40 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 }
 
 // exprEqual reports whether two resolved planner Exprs are structurally equal
-// for the purpose of DISTINCT ON / ORDER BY matching.
+// for the purpose of DISTINCT ON / ORDER BY matching (planner.go:1623's 42P10
+// check, distinctSortKeyOutputIndex, and pathKeyEqual).
+//
+// M0125-0024 replaced this function's own 5-of-32-arm type switch, and with it
+// a fallback that compared `fmt.Sprintf("%T%v", …)`. That fallback was wrong in
+// BOTH directions depending only on whether a struct happened to hold a
+// pointer: `%v` prints a nested pointer as a hex address, so two structurally
+// identical expressions read UNEQUAL, while it also printed `pos`, so even a
+// childless literal at a different source offset read unequal — the opposite of
+// PG, whose equal() excludes location outright.
+//
+// FAIL-CLOSED DIRECTION — the inverse of planExprContentKey's, which is why the
+// shared driver returns a decidability flag rather than a bool: an undecidable
+// expression must read NOT equal. Claiming equality wrongly would make the
+// planner treat one expression as another; a false negative is at worst a
+// spurious 42P10, which is diagnosable. The pointer short-circuit keeps a node
+// equal to itself, which the old `%T%v` fallback happened to give for free.
+// See docs/design/0125-0024-expression-identity-collisions.md.
 func exprEqual(a, b Expr) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	switch av := a.(type) {
-	case *ColumnRef:
-		if bv, ok := b.(*ColumnRef); ok {
-			return av.Index == bv.Index
-		}
-	case *IntegerConst:
-		if bv, ok := b.(*IntegerConst); ok {
-			return av.Value == bv.Value
-		}
-	case *StringConst:
-		if bv, ok := b.(*StringConst); ok {
-			return av.Value == bv.Value
-		}
-	case *FuncCall:
-		bv, ok := b.(*FuncCall)
-		if !ok || av.Name != bv.Name || len(av.Args) != len(bv.Args) {
-			return false
-		}
-		for i := range av.Args {
-			if !exprEqual(av.Args[i], bv.Args[i]) {
-				return false
-			}
-		}
+	if a == b {
 		return true
-	case *BinaryOp:
-		bv, ok := b.(*BinaryOp)
-		if !ok || av.Op != bv.Op {
-			return false
-		}
-		return exprEqual(av.Left, bv.Left) && exprEqual(av.Right, bv.Right)
 	}
-	// Fallback: compare text representation (pointer-safe only for primitives).
-	return fmt.Sprintf("%T%v", a, a) == fmt.Sprintf("%T%v", b, b)
+	ka, okA := exprIdentityKey(a, scopeVeto)
+	if !okA {
+		return false
+	}
+	kb, okB := exprIdentityKey(b, scopeVeto)
+	if !okB {
+		return false
+	}
+	return ka == kb
 }
 
 // findExprInSchema finds the output column index in outSchema that corresponds
@@ -11756,6 +12001,47 @@ func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
 	}
 	for i, t := range p.Targets {
 		if tcr, ok2 := t.(*ColumnRef); ok2 && tcr.Index == cr.Index {
+			return i
+		}
+	}
+	return -1
+}
+
+// distinctSortKeyOutputIndex maps a SELECT DISTINCT sort key onto the
+// select-list position it occupies, or returns -1 when it occupies none.
+//
+// The Distinct node's output schema is the projection's, and a plan node's
+// SchemaColumn records only a name and a type — no originating table.  A sort
+// key that survived resolveOrderBySubstitution as a *qualified* or *computed*
+// expression therefore cannot be resolved against that schema directly.  It can
+// be resolved against the context the target list itself was resolved against
+// (pre-projection, aggregate surface, or window surface — whichever built the
+// targets), and the resulting planner Expr is then matched structurally against
+// proj.Targets, which are indexed in output-schema order.
+//
+// PostgreSQL guarantees such a match exists: transformDistinctClause
+// (postgres/src/backend/parser/parse_clause.c) rejects any SELECT DISTINCT
+// whose ORDER BY key is absent from the select list with 42P10, so a -1 here
+// means the expression did not resolve at all rather than "legal but unmatched".
+func distinctSortKeyOutputIndex(expr parser.Expr, proj *Project, ctx *resolveContext, agg *aggregateSurface, win *windowSurface) int {
+	if proj == nil {
+		return -1
+	}
+	var re Expr
+	var err error
+	switch {
+	case win != nil:
+		re, err = resolveExprAfterWindow(expr, win)
+	case agg != nil:
+		re, err = resolveExprAfterAggregate(expr, agg)
+	default:
+		re, err = resolveExpr(expr, ctx)
+	}
+	if err != nil || re == nil {
+		return -1
+	}
+	for i, t := range proj.Targets {
+		if exprEqual(t, re) {
 			return i
 		}
 	}

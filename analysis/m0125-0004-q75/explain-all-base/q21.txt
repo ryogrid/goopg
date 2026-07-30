@@ -1,0 +1,17 @@
+                                                                                               QUERY PLAN                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: w_warehouse_name, i_item_id
+     ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: ((CASE WHEN (inv_before > 0) THEN (inv_after / inv_before) ELSE NULL END >= 0.6666666666666666) AND (CASE WHEN (inv_before > 0) THEN (inv_after / inv_before) ELSE NULL END <= 1.5))
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((((i_current_price >= 0.99) AND (i_current_price <= 1.49)) AND (d_date >= ('1999-06-22' - '30 day'::interval))) AND (d_date <= ('1999-06-22' + '30 day'::interval)))
+         ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.item  (cost=0.00..0.00 rows=1 width=0)
+           ->  Seq Scan on public.inventory  (cost=0.00..0.00 rows=1 width=0)
+         ->  Index Scan using public.warehouse_pkey on public.warehouse  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (w_warehouse_sk = inv_warehouse_sk)
+(13 rows)
+

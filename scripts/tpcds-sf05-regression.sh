@@ -46,7 +46,7 @@
 # Usage:
 #   scripts/tpcds-sf05-regression.sh build-data    # sample SF=1 TSVs -> SF0.5 TSVs
 #   scripts/tpcds-sf05-regression.sh load-pg       # create+load PG db 'tpcds05' (:65438)
-#   scripts/tpcds-sf05-regression.sh oracle        # PG EXPLAIN ANALYZE -> oracle.txt + plans
+#   scripts/tpcds-sf05-regression.sh oracle        # PG plain run -> oracle.txt (rows+ck)
 #   scripts/tpcds-sf05-regression.sh load-goopg    # init+load goopg cluster on :65437
 #   scripts/tpcds-sf05-regression.sh sweep         # goopg run vs oracle (the recurring gate)
 #   scripts/tpcds-sf05-regression.sh all           # everything above, in order
@@ -59,6 +59,13 @@
 #   TIMEOUT_SEC=300         per-query timeout for the goopg sweep
 #   RESTART_AFTER_TIMEOUT=1 bounce goopg after each goopg TIMEOUT
 #   FORCE=1                 run even while the SF=1 sweep harness is active
+#   QUERIES="35 46"         restrict oracle/sweep to a subset (SOLO probe mode);
+#                           the sweep report is stamped "SUBSET PROBE" and is
+#                           NOT a gate result. With 'oracle' it additionally
+#                           requires SF05_ORACLE (it would truncate the fixture)
+#   SF05_ORACLE=<path>      read/write the oracle fixture elsewhere
+#   SF05_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
+#                           fixture stays where SF05_ORACLE points
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,9 +78,15 @@ source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 # SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
 SRC_DATA_DIR="${TPCDS_DATA_DIR}"                   # SF=1 TSVs (input)
 QDIR="${TPCDS_QUERY_DIR}"                          # SF=1 PG-fixed queries (reused)
-OUTDIR="${SF05_RESULTS_DIR}"
-ORACLE="${OUTDIR}/oracle.txt"                      # q|status|rows|secs
+OUTDIR="${SF05_RESULTS_DIR}"                       # env-overridable (env_tpcds.sh)
+# The oracle is a GIT-TRACKED FIXTURE, not a run artefact: it stays in the
+# canonical results dir even when SF05_RESULTS_DIR is redirected to a scratch
+# dir for a one-off probe. Only 'oracle' (re-capture) writes it.
+ORACLE="${SF05_ORACLE:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf05/oracle.txt}"  # q|status|rows|ck|secs
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-600}"
+# Value checksum (M0124-0005). Both engines' results go through the SAME parser
+# and the SAME normalisation, so "same ck" means "same answer" and nothing else.
+CKSUM="${SCRIPT_DIR}/tpcds-result-checksum.py"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 CG_UNIT="goopg-tpcds-sf05"
 
@@ -106,10 +119,47 @@ sample_key() {
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# query_list — which queries 'oracle' and 'sweep' iterate over.
+#
+# Default is the full 1..99 gate. QUERIES restricts it to a subset (comma-,
+# space- or newline-separated, e.g. QUERIES=35 or QUERIES="35 45,46"), which is
+# what makes a SOLO probe possible: M0124-0004 needed Q35 alone on a fresh
+# server at a 900 s budget, and before this existed the only way to reach it was
+# a ~1 h full sweep whose 34 preceding queries also perturbed the server's heap.
+# A subset run is a PROBE, not a gate result — cmd_sweep stamps the report so a
+# later reader cannot mistake a 1-query summary for a passing gate.
+query_list() {
+    if [[ -n "${QUERIES:-}" ]]; then
+        tr ',' ' ' <<<"${QUERIES}" | tr -s '[:space:]' '\n' | grep -E '^[0-9]+$' || true
+    else
+        seq 1 99
+    fi
+}
+
+# guard_sf1_sweep — refuse to run while another benchmark owns the host.
+#
+# The original check covered only the sibling SF=1 harness. On 2026-07-29
+# (M0124-0004) that proved to be the smaller half of the problem: the **nightly
+# CI batch** (`ci/batch/run-nightly.sh`) fires at 00:00 and its TPC-H stage runs
+# a capped goopg server on :65434 for HOURS — measured at 112% CPU and 7.5 GiB
+# RSS, 5 h into the run. It shares nothing with the TPC-DS clusters by port or
+# data dir, so nothing stopped a "solo, fresh server" TPC-DS probe from landing
+# on top of it, and two SF0.5 sweeps (2026-07-29 00:47 and 03:38) plus the
+# M0124-0004 Q35 probes were all taken against that background before anyone
+# noticed. Timings taken that way are not comparable to a quiet-host baseline,
+# which is the one property every M0124/M0125 measurement depends on.
+#
+# The nightly is detected by its driver scripts rather than by its port, so a
+# lane change cannot silently re-open the hole.
 guard_sf1_sweep() {
     [[ "${FORCE:-0}" == "1" ]] && return 0
-    if ps -eo args --no-headers | grep -q '[b]ash scripts/tpcds-bench-compare.sh'; then
+    local procs
+    procs=$(bench_foreign_procs)   # ancestor-filtered; see env_tpcds.sh
+    if grep -q '[b]ash scripts/tpcds-bench-compare.sh' <<<"${procs}"; then
         die "the SF=1 sweep harness is running — this would contaminate its timings (FORCE=1 to override)"
+    fi
+    if grep -qE 'ci/batch/(run-nightly\.sh|stages/)' <<<"${procs}"; then
+        die "the nightly CI batch is running (ci/batch) — its TPC-H stage saturates CPU/RAM for hours and would contaminate these timings (FORCE=1 to override)"
     fi
 }
 
@@ -248,70 +298,89 @@ reap_pg_orphans() {
         select count(*) from victims where pg_terminate_backend(pid)" 2>/dev/null || true
 }
 
-explain_analyze_script() {
-    awk '
-        { stmt = stmt $0 "\n" }
-        /;[[:space:]]*$/ { printf "EXPLAIN (ANALYZE, TIMING OFF) %s", stmt; stmt = "" }
-        END { if (stmt ~ /[^[:space:]]/) printf "EXPLAIN (ANALYZE, TIMING OFF) %s;\n", stmt }
-    ' "$1"
+# query_limits — the LIMIT values written in a query file, comma-joined.
+#
+# Feeds the checksum tool's saturation rule (design 0124-0005 D3): a result
+# block holding exactly as many rows as a LIMIT allows had rows discarded at the
+# window boundary, so its row SET is only stable if the ORDER BY is a total
+# order — which we cannot prove per query. Those report ck=n/a and stay
+# row-count-only rather than risk a spurious CKMISMATCH on a legitimate tie.
+query_limits() {
+    grep -oiE 'limit +[0-9]+' "$1" 2>/dev/null \
+        | grep -oE '[0-9]+' | sort -un | paste -sd, - || true
 }
 
-# Sum the TOP-node actual row counts, one per statement. The top node is the
-# first line after each ---- header; `actual rows=` must be matched explicitly
-# because the same line carries the ESTIMATED `rows=` first.
-sum_top_actual_rows() {
-    awk '
-        /^-+$/ { hdr=1; next }
-        hdr==1 {
-            if (match($0, /actual rows=[0-9]+/)) {
-                sum += substr($0, RSTART+12, RLENGTH-12)
-            }
-            hdr=0
-        }
-        END { print sum+0 }
-    ' "$1"
+# result_rows_ck — "<rows> <ck>" for one psql result capture, both derived from
+# the SAME parse of the SAME run. A checksum captured in a different run than
+# its row count is not a fixture, it is two fixtures (design D1).
+result_rows_ck() {
+    local out
+    out=$("${CKSUM}" "$1" --limits "$(query_limits "$2")" 2>/dev/null) || {
+        echo "0 err"; return 0
+    }
+    echo "$(sed -n 's/.*rows=\([0-9]*\).*/\1/p' <<<"$out") $(sed -n 's/.*ck=\([^ ]*\).*/\1/p' <<<"$out")"
 }
 
 cmd_oracle() {
     guard_sf1_sweep
+    # cmd_oracle TRUNCATES the fixture. A partial re-capture under QUERIES would
+    # therefore delete the other 98 rows, silently turning the gate into a
+    # 1-query no-op — so a subset capture must name its own output file.
+    if [[ -n "${QUERIES:-}" && -z "${SF05_ORACLE:-}" ]]; then
+        die "QUERIES= with 'oracle' would truncate the git-tracked fixture; set SF05_ORACLE=<scratch path> too"
+    fi
     mkdir -p "${OUTDIR}"
-    log "Capturing PG oracle (EXPLAIN ANALYZE, timeout ${ORACLE_TIMEOUT}s/query) -> ${ORACLE}"
+    # PLAIN execution, not EXPLAIN ANALYZE (M0124-0005 / design D1). EXPLAIN
+    # ANALYZE emits a plan and NO result tuples, so there is nothing to
+    # checksum in that run — and rows and ck must come from the SAME run or the
+    # fixture is two fixtures. The switch also changes how `rows` is derived
+    # (result tuples, not top-node `actual rows=`), which is why D5 makes
+    # "re-captured counts equal the pinned ones, query for query" the
+    # load-bearing acceptance criterion.
+    log "Capturing PG oracle (plain run + value checksum, timeout ${ORACLE_TIMEOUT}s/query) -> ${ORACLE}"
     {
-        echo "# TPC-DS SF0.5 row-count oracle — PostgreSQL 18.3 ground truth"
+        echo "# TPC-DS SF0.5 row-count + value-checksum oracle — PostgreSQL 18.3 ground truth"
         echo "# captured: $(date -Iseconds)  source: $(git -C "${REPO_ROOT}" log --oneline -1 | cut -d' ' -f1)"
         echo "# dataset: SF=1 TSVs, facts halved by key parity (see tpcds-sf05-regression.sh header)"
-        echo "# format: q|status|rows|secs   (secs are machine-specific; rows are the fixture)"
+        echo "# format: q|status|rows|ck|secs   (secs are machine-specific; rows and ck are the fixture)"
+        echo "# ck: scripts/tpcds-result-checksum.py — sha256/16 over field-stripped rows,"
+        echo "#     fractional numerics canonicalised to 12 significant digits (goopg's"
+        echo "#     stddev_samp differs from PG's sqrt_var in the last 1-2 digits: ledger row"
+        echo "#     'tpcds-round2 stddev-precision'). Column NAMES are excluded. Rows are NOT"
+        echo "#     sorted, so a wrong ORDER BY is a checksum failure, not a silent pass."
+        echo "# ck=n/a: a LIMIT window saturated at its bound — the row SET is ambiguous at"
+        echo "#     the boundary tie group, so the query stays row-count-only (design D3)."
         echo "# This file is GIT-TRACKED as a pinned fixture so other machines/CI can skip"
         echo "# the ~20 min PG capture. Re-run 'oracle' only when the dataset or queries change."
     } > "${ORACLE}"
-    local q qf plan secs start rc rows status zero=0 okc=0
-    for q in $(seq 1 99); do
+    local q qf res secs start rc rows ck status zero=0 okc=0 ckc=0 nac=0
+    for q in $(query_list); do
         if grep -qw "$q" <<<"${PG_SKIP}"; then
-            echo "${q}|SKIP_QUERYGEN|0|0" >> "${ORACLE}"
+            echo "${q}|SKIP_QUERYGEN|0|n/a|0" >> "${ORACLE}"
             printf "Q%-3s SKIP (dsqgen artefact)\n" "$q"
             continue
         fi
         qf="${QDIR}/query${q}.sql"
-        [[ -f "$qf" ]] || { echo "${q}|MISSING|0|0" >> "${ORACLE}"; continue; }
-        plan="${OUTDIR}/pg_q${q}_analyze.txt"
-        explain_analyze_script "$qf" > "${OUTDIR}/.ea.sql"
+        [[ -f "$qf" ]] || { echo "${q}|MISSING|0|n/a|0" >> "${ORACLE}"; continue; }
+        res="${OUTDIR}/pg_q${q}_result.txt"
         start=$SECONDS
-        timeout "${ORACLE_TIMEOUT}" ${PG_PSQL} -f "${OUTDIR}/.ea.sql" > "$plan" 2>&1 && rc=0 || rc=$?
+        timeout "${ORACLE_TIMEOUT}" ${PG_PSQL} -f "$qf" > "$res" 2>&1 && rc=0 || rc=$?
         secs=$((SECONDS - start))
+        ck="n/a"
         if [[ $rc -eq 124 ]]; then
             status="TIMEOUT"; rows=0
             reap_pg_orphans >/dev/null
-        elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):' "$plan"; then
+        elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):' "$res"; then
             status="PG_ERROR"; rows=0
         else
-            status="OK"; rows=$(sum_top_actual_rows "$plan")
+            status="OK"; read -r rows ck < <(result_rows_ck "$res" "$qf")
             okc=$((okc+1)); [[ "$rows" == "0" ]] && zero=$((zero+1))
+            if [[ "$ck" == "n/a" ]]; then nac=$((nac+1)); else ckc=$((ckc+1)); fi
         fi
-        echo "${q}|${status}|${rows}|${secs}" >> "${ORACLE}"
-        printf "Q%-3s %-9s %6ss %8s rows\n" "$q" "$status" "$secs" "$rows"
+        echo "${q}|${status}|${rows}|${ck}|${secs}" >> "${ORACLE}"
+        printf "Q%-3s %-9s %6ss %8s rows  ck=%s\n" "$q" "$status" "$secs" "$rows" "$ck"
     done
-    rm -f "${OUTDIR}/.ea.sql"
-    log "oracle done: ${okc} queries captured; ${zero} return 0 rows"
+    log "oracle done: ${okc} queries captured (${ckc} with a checksum, ${nac} ck=n/a); ${zero} return 0 rows"
     [[ "$zero" -gt 0 ]] && log "NOTE: 0-row oracles give a weak regression signal (0==0 passes trivially)"
     true
 }
@@ -325,24 +394,36 @@ cmd_sweep() {
     local report="${OUTDIR}/sweep-$(date +%Y%m%d-%H%M%S).txt"
     log "goopg SF0.5 sweep (timeout ${TIMEOUT_SEC}s/query, S-cold) -> ${report}"
     sf05_goopg_start
-    local q line ostatus orows qf out rc secs start grows verdict
-    local pass=0 mismatch=0 gerr=0 gto=0 skip=0
+    local q line ostatus orows ock qf out rc secs start grows gck verdict nf
+    local pass=0 mismatch=0 ckmismatch=0 gerr=0 gto=0 skip=0 ckver=0 ckna=0
+    local resfile="${OUTDIR}/.goopg_result.txt"
     {
         echo "# TPC-DS SF0.5 goopg sweep — $(date -Iseconds)"
         echo "# goopg: $(git log --oneline -1)"
-        echo "# oracle: ${ORACLE} (PG 18.3 EXPLAIN ANALYZE row counts)"
+        echo "# oracle: ${ORACLE} (PG 18.3 plain-run row counts + value checksums)"
         echo "# timeout: ${TIMEOUT_SEC}s"
+        [[ -n "${QUERIES:-}" ]] && \
+            echo "# SUBSET PROBE (QUERIES=${QUERIES}) — NOT a gate result; the summary below covers only these queries"
     } > "$report"
-    for q in $(seq 1 99); do
+    for q in $(query_list); do
         line=$(grep -E "^${q}\|" "${ORACLE}" || true)
         ostatus=$(cut -d'|' -f2 <<<"$line"); orows=$(cut -d'|' -f3 <<<"$line")
+        # 4-column oracles (pre-M0124-0005: q|status|rows|secs) stay readable —
+        # they simply carry no checksum, so every query is row-count-only. A
+        # hard failure here would strand every checkout that has not re-captured.
+        nf=$(awk -F'|' '{print NF}' <<<"$line")
+        ock="n/a"; [[ "${nf:-0}" -ge 5 ]] && ock=$(cut -d'|' -f4 <<<"$line")
         if [[ "$ostatus" != "OK" ]]; then
             printf "Q%-3s SKIP (oracle: %s)\n" "$q" "${ostatus:-absent}" | tee -a "$report"
             skip=$((skip+1)); continue
         fi
         qf="${QDIR}/query${q}.sql"
         start=$SECONDS
-        out=$(timeout "${TIMEOUT_SEC}" ${GOOPG_PSQL} -f "$qf" 2>&1) && rc=0 || rc=$?
+        # Captured to a file rather than a shell variable so the checksum tool
+        # can parse the very same bytes the verdict is drawn from. The file is
+        # reused per query and only kept (under a per-query name) when the
+        # verdict is bad — a passing gate must not litter the results dir.
+        timeout "${TIMEOUT_SEC}" ${GOOPG_PSQL} -f "$qf" > "$resfile" 2>&1 && rc=0 || rc=$?
         secs=$((SECONDS - start))
         if [[ $rc -eq 124 ]]; then
             verdict="TIMEOUT"; gto=$((gto+1))
@@ -351,34 +432,54 @@ cmd_sweep() {
                 echo "      (restarting goopg to drop accumulated heap)" | tee -a "$report"
                 sf05_goopg_start
             fi
-        elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):|connection to server was lost|server closed the connection' <<<"$out"; then
+        elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):|connection to server was lost|server closed the connection' "$resfile"; then
             verdict="ERROR"; gerr=$((gerr+1))
             printf "Q%-3s ERROR    %4ss %s\n" "$q" "$secs" \
-                "$(grep -E '(ERROR|FATAL|PANIC):' <<<"$out" | head -1 | cut -c1-90)" | tee -a "$report"
+                "$(grep -E '(ERROR|FATAL|PANIC):' "$resfile" | head -1 | cut -c1-90)" | tee -a "$report"
             # A dead server presents as a connection error on the NEXT query;
             # probe and restart so one crash doesn't cascade.
             pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || sf05_goopg_start
         else
-            grows_expr=$(grep -oP '\(\d+ rows?\)' <<<"$out" | grep -oP '\d+' | paste -sd+ - 2>/dev/null || true)
-            grows=$(( ${grows_expr:-0} ))
-            if [[ "$grows" == "$orows" ]]; then
-                verdict="PASS"; pass=$((pass+1))
-                printf "Q%-3s PASS     %4ss %8s rows\n" "$q" "$secs" "$grows" | tee -a "$report"
-            else
+            read -r grows gck < <(result_rows_ck "$resfile" "$qf")
+            if [[ "$grows" != "$orows" ]]; then
                 verdict="MISMATCH"; mismatch=$((mismatch+1))
                 printf "Q%-3s MISMATCH %4ss goopg=%s oracle=%s\n" "$q" "$secs" "$grows" "$orows" | tee -a "$report"
+                cp -f "$resfile" "${OUTDIR}/goopg_q${q}_result.txt"
+            elif [[ "$ock" != "n/a" && "$gck" != "n/a" && "$gck" != "$ock" ]]; then
+                # The right number of WRONG rows — the more alarming of the two
+                # failures, and the one this whole column exists to catch (Q75
+                # PASSed for weeks at 100 rows over a corrupt CTE).
+                verdict="CKMISMATCH"; ckmismatch=$((ckmismatch+1))
+                printf "Q%-3s CKMISMATCH %2ss %8s rows  goopg ck=%s oracle ck=%s\n" \
+                    "$q" "$secs" "$grows" "$gck" "$ock" | tee -a "$report"
+                cp -f "$resfile" "${OUTDIR}/goopg_q${q}_result.txt"
+            else
+                verdict="PASS"; pass=$((pass+1))
+                if [[ "$ock" != "n/a" && "$gck" == "$ock" ]]; then
+                    ckver=$((ckver+1))
+                    printf "Q%-3s PASS     %4ss %8s rows  ck=%s\n" "$q" "$secs" "$grows" "$gck" | tee -a "$report"
+                else
+                    ckna=$((ckna+1))
+                    printf "Q%-3s PASS     %4ss %8s rows  ck=n/a\n" "$q" "$secs" "$grows" | tee -a "$report"
+                fi
             fi
         fi
     done
     sf05_goopg_stop
+    rm -f "$resfile"
     {
         echo ""
-        echo "=== SUMMARY: PASS=${pass} MISMATCH=${mismatch} ERROR=${gerr} TIMEOUT=${gto} SKIP=${skip} ==="
+        echo "=== SUMMARY: PASS=${pass} (${ckver} ck-verified, ${ckna} ck=n/a) MISMATCH=${mismatch} CKMISMATCH=${ckmismatch} ERROR=${gerr} TIMEOUT=${gto} SKIP=${skip} ==="
+        # Say out loud how much of the PASS count is value-verified. Without
+        # this, "N queries PASS" reads as "N right answers" when part of it is
+        # only "N right row counts" (round-2 README §13.4 item 3).
+        echo "# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set."
     } | tee -a "$report"
     log "sweep report: ${report}"
     # Gate semantics: correctness failures are fatal; timeouts are reported but
-    # non-fatal (perf tracking, not a correctness gate).
-    [[ $((mismatch + gerr)) -eq 0 ]]
+    # non-fatal (perf tracking, not a correctness gate). CKMISMATCH is a
+    # correctness failure — the right number of wrong rows.
+    [[ $((mismatch + ckmismatch + gerr)) -eq 0 ]]
 }
 
 # ------------------------------------------------------------------- status

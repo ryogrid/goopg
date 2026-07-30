@@ -29,6 +29,14 @@ type SyntaxError struct {
 	// Message verbatim. Used for semantic errors caught during parsing (e.g.
 	// "SELECT … INTO is not allowed here") that have their own wording.
 	Raw bool
+	// Code overrides the SQLSTATE the wire layer reports for this error.
+	// Empty means the parser default, 42601 (syntax_error). PG's grammar
+	// raises a handful of non-42601 errors from inside a production — e.g.
+	// opt_float's precision checks are ERRCODE_INVALID_PARAMETER_VALUE
+	// (22023) — and those cases set this so goopg reports the same code.
+	// Kept as a bare string so internal/parser stays free of an sqlstate
+	// import.
+	Code string
 }
 
 func (e *SyntaxError) Error() string {

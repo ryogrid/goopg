@@ -1,0 +1,21 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T16:37:38+09:00
+# goopg: 6d6bd1ea bench(tpcds): M0124-0001 sweep prerequisites — orphan reap + real S-cold proof + engine-binary provenance  PG: 18.3
+# engine-tree: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42 
+# engine-binary: running=e6774c4f5e22f2fa on-disk=e6774c4f5e22f2fa (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q1   OK         246s      100 
+pg    Q1   OK         206s      100 
+goopg Q2   OK          27s     2513 
+pg    Q2   OK           1s     2513 
+goopg Q3   OK          15s       31 
+pg    Q3   OK           0s       31 
+goopg Q4   TIMEOUT    622s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      *** SWEEP VOID: engine binary changed mid-sweep (e6774c4f5e22f2fa -> 8f0aac15ce9d2aa9) — re-run this chunk ***
+pg    Q4   TIMEOUT    616s        0 timeout after 600s
+      (reaping orphaned PG backends: 1 terminated)
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

@@ -1,0 +1,16 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T23:47:51+09:00
+# goopg: 472c5c38 bench(tpcds): M0124-0001 chunk 12 — Q89-Q96 measured; three new wrong-answer defects, worst is a one-line aggregate-key fallback  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=38ef8dff5aecb91c on-disk=38ef8dff5aecb91c (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q97  OK          48s        1 
+pg    Q97  OK           0s        1 
+goopg Q98  OK          21s     2531 
+pg    Q98  OK           0s     2531 
+goopg Q99  OK          23s       90 
+pg    Q99  OK           0s       90 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

@@ -1,0 +1,10 @@
+# stream A2-q22
+# bin=/home/ryo/work/goopg/goopg/tmp/goopg-armA
+# target=tpch@tpch GOGC=100 GOMEMLIMIT=12GiB per-query-timeout=600s
+# started=2026-07-29T20:02:39+09:00
+Q22: OK elapsed=11.94s rows=7
+Q22: OK elapsed=9.78s rows=7
+Q22: OK elapsed=9.97s rows=7
+# runner_rc=0
+# stream_elapsed_s=35
+# finished=2026-07-29T20:03:14+09:00

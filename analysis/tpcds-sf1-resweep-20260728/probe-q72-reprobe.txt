@@ -1,0 +1,13 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T21:49:05+09:00
+# goopg: 39b28f49 bench(tpcds): M0124-0001 chunk 8 — Q57-Q64 measured; first uneventful chunk, Q64 unbounded-and-unvalidatable  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=ddbe024389138d2b on-disk=ddbe024389138d2b (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg, PG skip: 36 70 86
+
+goopg Q72  TIMEOUT    636s        0 timeout after 600s
+      (restarting goopg to drop accumulated heap)
+      (engine source unchanged; image now ddbe024389138d2b)
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

@@ -1293,8 +1293,24 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	// other than 0 contradicts the retention contract.
 	//
 	// The old check `if segNos[0] != 0 { return error }` is dropped.
-	// Gap detection (missing segment in the retained range) is still
-	// done correctly by comparing consecutive entries.
+	//
+	// root-0032: a hole in the retained range is NOT an error either. A
+	// crash during a checkpoint's retention pass leaves the oldest obsolete
+	// segments on disk below a hole (removeOldSegments walks them
+	// newest-first), and treating that as fatal left the cluster permanently
+	// unstartable — "wal: gap at segment N" on every subsequent start. Trim
+	// to the live run, exactly as the replay-side firstAvailableSegment does,
+	// so writer and reader agree on where the stream begins. The contiguity
+	// check further down is retained as a defensive invariant; after this
+	// trim it can no longer fire.
+	if runStart := liveSegmentRunStart(segNos); runStart != segNos[0] {
+		for i, seg := range segNos {
+			if seg == runStart {
+				segNos = segNos[i:]
+				break
+			}
+		}
+	}
 	firstSegNo := segNos[0]
 
 	// M0007 eager-lookahead follow-up: state.eagerPreallocSegment can
@@ -1424,6 +1440,27 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 	streamBase := int64(segNo) * cfgSegSize
 	off := 0
 	var lastRecPtr uint64
+
+	// root-0032, sibling of readAllPageAware's identical skip: a segment's
+	// first page carries XLP_FIRST_IS_CONTRECORD when the record being written
+	// straddled the segment boundary, and its first MAXALIGN(xlp_rem_len) bytes
+	// are that record's tail — not a record header. Decoding them as one fails,
+	// and the pre-root-0032 scan then reported the segment as holding just its
+	// 40-byte page header, so the writer resumed at the top of the segment and
+	// appended OVER the records that followed the straddling record. The stale
+	// bytes beyond the new (shorter) write position are what later surfaced as
+	// a fatal "wal: decode at offset N: invalid record header: unknown rmid=31"
+	// on a subsequent crash restart. Upstream skips xlp_rem_len for the same
+	// reason when it picks a page up mid-record (xlogreader.c).
+	if hsize := pageHeaderSizeAt(streamBase, cfgSegSize); len(data) >= hsize {
+		if hdr, derr := DecodeXLogPageHeader(data[:hsize]); derr == nil && hdr.Info&XLPFirstIsContRecord != 0 {
+			off = hsize + maxAlignXLog(int(hdr.RemLen))
+			if off >= len(data) {
+				return int64(len(data)), 0, nil
+			}
+		}
+	}
+
 	for off < len(data) {
 		pos := streamBase + int64(off)
 		if pos%XLOGBlockSize == 0 {

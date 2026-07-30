@@ -1,0 +1,24 @@
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=1 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: sum
+     ->  Finalize Aggregate  (cost=0.00..0.00 rows=1 width=0)
+       ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+             Workers Planned: 1
+         ->  Partial Aggregate  (cost=0.00..0.00 rows=1 width=0)
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+                 Filter: ((((i_manufact_id = 714) AND (d_date >= '2000-02-01')) AND (d_date <= ('2000-02-01' + '90 day'::interval))) AND (ws_ext_discount_amt > (SubPlan 1)))
+                 SubPlan 1
+                   ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                     ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                           Filter: ((d_date >= '2000-02-01') AND (d_date <= ('2000-02-01' + '90 day'::interval)))
+                       ->  Index Scan using public.web_sales_pkey on public.web_sales  (cost=0.00..0.00 rows=1 width=0)
+                             Index Cond: (ws_item_sk = $0)
+                       ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                             Index Cond: (d_date_sk = ws_sold_date_sk)
+             ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.item  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.web_sales  (cost=0.00..0.00 rows=1 width=0)
+(20 rows)
+

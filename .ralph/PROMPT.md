@@ -7,12 +7,19 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
 1. If `.ralph/working_set.md` exists and is non-empty, read it FIRST — it carries the
    previous loop's in-flight state (task, files touched, hypothesis, next step). Resume
    from it instead of re-exploring.
-2. NIGHTLY TRIAGE: after the working_set resume (working_set.md stays the very first
-   read), read `ci/logs/action-items.md` (absent file = skip). If it lists `## AI-`
-   items whose subject has no open M-NIGHTLY task in fix_plan.md, add them there and
-   work them BEFORE selecting any other milestone's work. Finish an already in-flight
-   task first — preemption applies at task-selection time, not mid-task. (Rules in the
-   M-NIGHTLY comment / ci/design/07-ralph-feedback.md.)
+2. NIGHTLY TRIAGE (FILE, don't necessarily work — amended 2026-07-28): after the
+   working_set resume (working_set.md stays the very first read), read
+   `ci/logs/action-items.md` (absent file = skip). If it lists `## AI-` items whose
+   subject has no open M-NIGHTLY task in fix_plan.md, add them there. **Filing is
+   unconditional; selecting them is not.** Which milestone you then WORK is decided
+   solely by the `## Current Priority` banner in `.ralph/fix_plan.md` — as of
+   2026-07-28 that banner parks M-NIGHTLY *below* M0124/M0125, so a newly filed item
+   is recorded and left unchecked. Two exceptions you may work immediately: an item
+   that breaks the build, or one that breaks a gate the banner's own milestones
+   depend on (`scripts/tpch-spotcheck.sh`, the TPC-DS SF0.5 gate, `make plan-diff`,
+   the bench clusters) — the measurement cannot proceed without those. Finish an
+   already in-flight task first. (Rules in the M-NIGHTLY comment /
+   ci/design/07-ralph-feedback.md §B, incl. its 2026-07-28 amendment.)
 3. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
 4. Review .ralph/fix_plan.md for current priorities
 5. Implement the highest priority item using best practices
@@ -43,6 +50,12 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
 usage limits mid-task; without this file the next loop re-derives everything (~25
 wasted turns).
 - At loop START: if the file is non-empty, read it and resume from "Next step".
+- **Precedence (added 2026-07-28):** the baton carries *state*, not *authority*. If
+  its "NEXT LOOP" suggestion names a different milestone than the `## Current
+  Priority` banner in `.ralph/fix_plan.md`, **the banner wins** — the baton was
+  written by a loop that ran before the banner changed. Select per the banner and
+  rewrite the baton to match, instead of following the stale suggestion. (Resuming a
+  genuinely `In-flight:` task is unaffected: finish it, then re-read the banner.)
 - At loop END (immediately before the status block), REWRITE it (≤40 lines) with:
   - `Task:` the fix_plan item being worked (id + one line)
   - `Files:` files touched/being edited (paths, brief why)

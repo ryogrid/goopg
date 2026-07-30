@@ -1,0 +1,19 @@
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: substr, sm_type, cc_name
+     ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: ((d_month_seq >= 1194) AND (d_month_seq <= 1205))
+         ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.call_center  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=1 width=0)
+           ->  Index Scan using public.ship_mode_pkey on public.ship_mode  (cost=0.00..0.00 rows=1 width=0)
+                 Index Cond: (sm_ship_mode_sk = cs_ship_mode_sk)
+         ->  Index Scan using public.warehouse_pkey on public.warehouse  (cost=0.00..0.00 rows=1 width=0)
+               Index Cond: (w_warehouse_sk = cs_warehouse_sk)
+(15 rows)
+

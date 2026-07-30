@@ -1,0 +1,26 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T23:28:49+09:00
+# goopg: e978c73c bench(tpcds): M0124-0001 chunk 11 — Q81-Q88 measured; Q87 is a wrong ANSWER behind a matching row count  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=38ef8dff5aecb91c on-disk=38ef8dff5aecb91c (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q89  OK          43s      100 
+pg    Q89  OK           1s      100 
+goopg Q90  OK          19s        1 
+pg    Q90  OK           1s        1 
+goopg Q91  OK           5s        1 
+pg    Q91  OK           0s        1 
+goopg Q92  OK           5s        1 
+pg    Q92  OK           0s        1 
+goopg Q93  OK          31s        0 
+pg    Q93  OK           0s        0 
+goopg Q94  OK          23s        1 
+pg    Q94  OK           1s        1 
+goopg Q95  OK          62s        1 
+pg    Q95  OK          32s        1 
+goopg Q96  OK          29s        1 
+pg    Q96  OK           0s        1 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

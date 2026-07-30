@@ -1,0 +1,11 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T02:24:03+09:00
+# goopg: 337526b1 bench(tpcds): M0125-0014/-0015 — two defects closed by measuring them, and the anchor that was never checking anything
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# SUBSET PROBE (QUERIES=16 94 95) — NOT a gate result; the summary below covers only these queries
+Q16  CKMISMATCH 27s        1 rows  goopg ck=863c4e96d8930d66 oracle ck=40dbec0df91d2438
+Q94  CKMISMATCH 12s        1 rows  goopg ck=fb2c619e9bcb6bae oracle ck=04afc1b69831a5ea
+Q95  CKMISMATCH 23s        1 rows  goopg ck=663cec31dac6449c oracle ck=e498634c02595c29
+
+=== SUMMARY: PASS=0 (0 ck-verified, 0 ck=n/a) MISMATCH=0 CKMISMATCH=3 ERROR=0 TIMEOUT=0 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

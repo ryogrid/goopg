@@ -42,7 +42,7 @@ func finishAggValue(ctx *Context, call planner.AggregateCall, st *aggRuntime) (D
 	op := aggTestOp(ctx)
 	c := call
 	c.Arg = &planner.ColumnRef{Index: 0}
-	return op.finishAgg(*st, c), nil
+	return op.finishAgg(*st, c)
 }
 
 // datumFloatForTest coerces a finished aggregate result to float64.

@@ -285,6 +285,11 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 	stats := &catalog.TableStats{
 		Pages:   int(nBlocks),
 		Columns: make([]catalog.ColumnStats, len(tbl.Columns)),
+		// This IS the analyze cycle, so the counters below are measured —
+		// including a measured zero for an empty relation. See
+		// TableStats.Analyzed for why that distinction is recorded
+		// explicitly instead of inferred from RowCount. M0125-0003.
+		Analyzed: true,
 	}
 	var totalBytes int64
 	var seen int64

@@ -1,0 +1,3 @@
+psql:/tmp/ex_36.sql:30: ERROR:  syntax error at or near "expected ')' after SELECT in parenthesised query (got ;)"
+LINE 29:   limit 100;
+                    ^

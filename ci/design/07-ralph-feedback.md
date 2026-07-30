@@ -103,6 +103,33 @@ task done with a note "already fixed / stale item" instead of investigating.
 
 ## B. The standing milestone in `.ralph/fix_plan.md`
 
+> **AMENDMENT 2026-07-28(b) — preemption suspended, filing unchanged.** The
+> charter below (and the §C PROMPT.md hook) is quoted as originally specified;
+> two clauses are currently overridden in the live files.
+>
+> - **Filing is unchanged and unconditional.** Every loop still reads
+>   `ci/logs/action-items.md` and files each new `## AI-` subject as a task under
+>   the M-NIGHTLY milestone. The batch → log → agent → fix_plan flow is untouched.
+> - **Selection no longer preempts.** Rule 2's "these PREEMPT all other
+>   milestones" is suspended while `.ralph/fix_plan.md`'s `## Current Priority`
+>   banner parks M-NIGHTLY — today beneath **M0124** (TPC-DS round-2 closeout
+>   measurement) and **M0125**. Filed items stay unchecked until both close.
+> - **Two carve-outs may still be worked immediately**, because the parked
+>   milestones cannot be measured without them: an item that breaks the build, and
+>   an item that breaks a gate they depend on (`scripts/tpch-spotcheck.sh`, the
+>   TPC-DS SF0.5 gate, `make plan-diff`, a bench cluster).
+> - **Reversion is automatic**, not a further edit: the charter's original rule 2
+>   applies again as soon as the banner stops naming M0124/M0125. The mechanism is
+>   the one §B already relies on — fix_plan.md's own "unless the Current Priority
+>   banner forces another order" convention — so this amendment changes which
+>   order the banner forces, not who decides.
+>
+> Why: `ddfb035e` (root-0029) through root-0036 were all nightly triage, and the
+> round-2 closeout — the measurement baseline every M0125 task diffs against —
+> never started. The live wording is in `.ralph/fix_plan.md` (banner + milestone
+> header + charter rule 2) and `.ralph/PROMPT.md` objective 2, which also gained a
+> precedence rule: the banner outranks `.ralph/working_set.md`'s "NEXT LOOP" note.
+
 Implementation adds this block **at the top of the milestone list** in
 `.ralph/fix_plan.md` (and keeps it there permanently — it is a standing
 milestone, never completed, never deleted; the driver's completion detector

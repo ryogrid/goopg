@@ -1,0 +1,8 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-29T05:18:35+09:00
+# goopg: a0975c86 docs(ledger): M0124-0003 — round 2 deferred nine things and wrote down two, so seven mechanisms existed only as a forward reference
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 EXPLAIN ANALYZE row counts)
+# timeout: 900s
+# SUBSET PROBE (QUERIES=35) — NOT a gate result; the summary below covers only these queries
+Q35  TIMEOUT   921s (oracle 100 rows)
+
+=== SUMMARY: PASS=0 MISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=0 ===

@@ -50,7 +50,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return res, qerr
 		}
 		msg, extra := syntaxErrorMsg(err)
-		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
+		qerr := &extendedQueryError{Code: syntaxErrorCode(err), Message: msg}
 		for _, f := range extra {
 			if f.Code == protocol.FieldPosition {
 				if p, _ := strconv.Atoi(f.Value); p > 0 {

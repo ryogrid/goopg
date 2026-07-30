@@ -1,0 +1,18 @@
+# TPC-DS SF=1 Benchmark — 2026-07-28T18:40:47+09:00
+# goopg: e84b3af5 bench(tpcds): M0124-0001 chunk 3 — Q17-Q24 measured; Q18 is budget-marginal, not a regression  PG: 18.3
+# engine-id: bba744a817f7ebdec31fd47edfed40362641dd0c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: running=22110d95fe159084 on-disk=22110d95fe159084 (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# timeout: 600s per query, engines: goopg pg, PG skip: 36 70 86
+
+goopg Q25  OK          53s        0 
+pg    Q25  OK           2s        0 
+goopg Q26  OK          34s      100 
+pg    Q26  OK           0s      100 
+goopg Q27  OK         234s      100 
+pg    Q27  OK           1s      100 
+goopg Q28  OK          88s        1 
+pg    Q28  OK           2s        1 
+
+=== DONE ===
+Results:  /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_result.txt
+EXPLAINs: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results/<engine>_q<N>_explain.txt

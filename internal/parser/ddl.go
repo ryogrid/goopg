@@ -4619,6 +4619,15 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
 		ct.Args = []int64{1}
 	}
+	// FLOAT [ (precision) ] → float4/float8 (gram.y opt_float). A quoted
+	// "float" names a user type, not the standard alias, so skip it.
+	if first.Kind != TokenQuotedIdent && ct.Schema == "" {
+		name, args, err := normalizeFloatTypeName(ct.Name, ct.Args, pos)
+		if err != nil {
+			return ColumnType{}, err
+		}
+		ct.Name, ct.Args = name, args
+	}
 	// Accept trailing [] array notation (e.g. int[], text[][], integer[]).
 	// We don't track the dimension count; just consume the brackets. M0097-0071.
 	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
@@ -4627,6 +4636,59 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		ct.IsArray = true
 	}
 	return ct, nil
+}
+
+// normalizeFloatTypeName resolves the SQL-standard `FLOAT [ ( precision ) ]`
+// spelling to the concrete goopg/PG type it names, mirroring upstream's
+// opt_float production (postgres/src/backend/parser/gram.y): no precision →
+// float8, 1..24 → float4, 25..53 → float8, and out-of-range precisions are
+// hard errors with ERRCODE_INVALID_PARAMETER_VALUE. Upstream builds a
+// SystemTypeName("float4"/"float8") that carries NO typmod, so the precision
+// is consumed by the reduction rather than stored — the returned args are
+// therefore nil for a recognised float(p).
+//
+// Without this, "float" fell through catalog.TypeNameToOID's `default:
+// return OIDText` fallback and a `c3 float` column was created as text while
+// the executor's own type tables (codec.go, expr.go) still read the name as
+// float8 — the encode/decode sibling split that made an INSERT report
+// "INSERT 0 1" and then return zero rows (regress `index_including` §10).
+//
+// name must already be lower-cased or is compared case-insensitively; an
+// optional trailing "[]" array suffix (the cast paths append it to the type
+// name) is preserved. Types other than float are returned unchanged.
+func normalizeFloatTypeName(name string, args []int64, pos int) (string, []int64, error) {
+	base, suffix := name, ""
+	if strings.HasSuffix(base, "[]") {
+		base, suffix = base[:len(base)-2], "[]"
+	}
+	if !strings.EqualFold(base, "float") {
+		return name, args, nil
+	}
+	if len(args) == 0 {
+		return "float8" + suffix, nil, nil
+	}
+	// PG's opt_float only ever sees a single Iconst; a second one is a
+	// syntax error in the grammar, so anything else keeps the raw spelling
+	// and lets the downstream type lookup report it.
+	if len(args) != 1 {
+		return name, args, nil
+	}
+	switch p := args[0]; {
+	case p < 1:
+		return "", nil, &SyntaxError{
+			Pos: pos, Raw: true, Code: "22023",
+			Message: "precision for type float must be at least 1 bit",
+		}
+	case p <= 24:
+		return "float4" + suffix, nil, nil
+	case p <= 53:
+		return "float8" + suffix, nil, nil
+	default:
+		return "", nil, &SyntaxError{
+			Pos: pos, Raw: true, Code: "22023",
+			Message: "precision for type float must be less than 54 bits",
+		}
+	}
 }
 
 // parseMultiWordTypeName consumes the trailing keywords of a multi-word
@@ -10050,6 +10112,15 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 	// time zone" where the timezone qualifier follows the typmod parens.
 	if len(stmt.BaseTypeArgs) > 0 {
 		stmt.BaseType = p.parseTimeZoneQualifierAfterArgs(stmt.BaseType)
+	}
+	// FLOAT [ (precision) ] → float4/float8, same opt_float reduction the
+	// CREATE TABLE column-type path applies.
+	if baseTypeName.Schema == "" {
+		bt, btArgs, ferr := normalizeFloatTypeName(stmt.BaseType, stmt.BaseTypeArgs, pos)
+		if ferr != nil {
+			return nil, ferr
+		}
+		stmt.BaseType, stmt.BaseTypeArgs = bt, btArgs
 	}
 	// Accept array notation: int[], text[], etc. Append [] to the base type
 	// name and skip any dimension expressions like [N]. M0097-0065.

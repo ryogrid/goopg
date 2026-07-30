@@ -1,0 +1,14 @@
+[05:20:36] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260730-052036.txt
+Q4   SKIP (oracle: TIMEOUT)
+Q11  PASS       17s        8 rows  ck=3567170dea89bdc1
+Q31  TIMEOUT   332s (oracle 19 rows)
+      (restarting goopg to drop accumulated heap)
+Q39  PASS       75s       77 rows  ck=4db806a9a11fddfd
+Q64  TIMEOUT   336s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q74  PASS       14s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       36s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=4 (3 ck-verified, 1 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+[05:34:40] sweep report: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260730-052036.txt
