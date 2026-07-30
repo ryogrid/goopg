@@ -1,52 +1,50 @@
 (idle — nothing in flight)
 
-Last loop (#7, 2026-07-31) landed **M0125-0034's set-operation arm** — C1, the
-dominant timeout mechanism. `internal/planner/pushdown.go` (+`*SetOp` case in
-`collectScanOutputNames`; both M0097-0058 `containsSetOp` bailouts retired),
-`internal/planner/nl_index_join.go` (`pickInnerScanForNLI` declines its
-left-as-inner flip for a set-operation outer); design
-`docs/design/0125-0034-setop-join-promotion.md`; tests
-`internal/executor/setop_join_promotion_test.go` (4).
+Last loop (#8, 2026-07-31) landed **M0125-0035's binary-join arm** as `5054dac0`
+(pushed). `internal/planner/inner_join_qual_pushdown.go` (+`innerJoinPushLeafScan`;
+`innerJoinPushEligibleInput` now admits base-relation leaves; fail-closed
+idempotence guard on the AND-in path), its test file (the old
+`…DeclinesOnBaseRelationLeaf` pin INVERTED, + an idempotence pin),
+`bench/tpch/env_goopg.sh` (`GOOPG_BIN` override), design
+`docs/design/0125-0035-c2-single-table-qual-placement.md`, evidence
+`analysis/m0125-0035-c2-qual-placement/`.
 
-**Acceptance MET: `Q71 PASS 580 rows ck=521a7af7606d10c1`** = the oracle row.
-30 `Nested Loop (CROSS)` nodes eliminated; **Q5 Q8 Q14 Q54 Q71 TIMEOUT →
-PASS**, SF0.5 timeout class **12 → 7**.
+**-0035's mandated first step is DISCHARGED: C2 is an EXECUTION defect, not
+costing-only.** Serial `EXPLAIN ANALYZE` — a COUNTING instrument, so valid on
+the loaded host — shows `date_dim` hashed at **actual rows = 73,049** and the
+join emitting **1,374,770** rows for a 275,107-row answer; the MHJ arm is the
+same. `multiHashJoinOp.Open` drains every build child and hashes all of it, then
+`partitionFilters` evaluates a build-table qual at STEP time.
 
 Three findings the next loop should not rediscover:
-1. **The blocker was the NAME walk, not the guard.** `collectScanOutputNames`
-   enumerates node kinds; with no `*SetOp` case `allColumnRefNamesInScope`
-   answered false and `pushOneConjunct` declined *before* reaching its own
-   `containsSetOp` bailout. An under-enumerated permissive check fails
-   silently — as a missed optimisation with nothing in the plan to say why.
-   `*Distinct`, `*Limit`, `*WindowAgg`, `*IndexOnlyScan` … are still absent
-   (ledger row).
-2. **M0097-0058's premise is refuted.** `SetOp.Output()` IS the narrow schema,
-   and the executor pads a `leftWidth+rightWidth` keyRow before evaluating
-   either join key, so `index out of range [57] with length 1` cannot arise at
-   the join node. The third guard (explicit `JOIN … ON`, planner.go) is still
-   in place — no query reaches it (ledger row).
-3. **Fixing the promotion made an unreachable NLI path reachable.**
-   `pickInnerScanForNLI`'s left-as-inner flip emits `outer ++ inner`; Q71
-   planned `Append ++ item` while `sum(ext_price)` stayed bound to
-   `item ++ Append` → "aggregate sum requires numeric argument in v0". Now
-   declined. Note the flipped shape is **PG's own plan** (ledger row).
+1. **The D2 leaf scoping borrowed the wrong risk.** Slice A MOVES a conjunct
+   pre-DP (so it changes join ORDER — that is what "Q8/Q21 PASS→CANCEL" meant);
+   `pushSingleSideQualsIntoInnerJoinInputs` runs LAST and DUPLICATES, so order is
+   already fixed. Proven on real plans: TPC-H plan-diff 4/22 with **zero**
+   structural change, 4 net-new scan filters, **0 removed**.
+2. **A planned subtree is re-walked once per enclosing scope.** Without the new
+   guard Q69 printed its `d_year`/`d_moy` conjuncts TWICE. Any future pass in
+   this tail of `planSelect` must be idempotent.
+3. **`SmallDimension` is a hardcoded name-tag** (`region`/`nation`, initdb/open.go),
+   so Slice A can never fire on TPC-DS. This change ROUTES AROUND it; the DP still
+   sees unfiltered base-rel sizes (ledger row (c), → `M0125-0038`).
 
-Gates: units PASS; `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35); plan-diff
-vs `warm-stats-base` 10/22 DIFFER but every changed line is M0125-0039's
-qualification → TPC-H-plan-inert; re-pinned
-`plan_snapshots/m0125-0034-setop-join-promotion.txt`. All 21 set-operation
-TPC-DS queries swept (the complete reachable surface), 15 unchanged.
-NOT discharged: the timed TPC-H arm and the full 99-query gate — the nightly
-CI batch held the host all loop (load ≈ 9.9), so **no second measured this
-loop is a timing**.
+Gates: units PASS; `tpch-spotcheck.sh` `RESULT=PASS` (Q12=2 Q13=35); plan-diff vs
+`m0125-0034-setop-join-promotion` 4/22 DIFFER, all additive; **full 99-query SF0.5
+gate PASS=87 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=8 SKIP=4 — no new timeout**,
+all 8 already filed. Sweep ran `FORCE=1` under the live nightly: legitimate for
+row/checksum work, but **every wall clock in it is contaminated** — no timing was
+taken this loop.
 
-Per the banner the **next selection is `M0125-0035`** (C2 qual placement);
-M0125-0034 stays unchecked for its CTE/derived-aggregate arm (Q30 Q64 Q65 Q81,
-8 crosses) — fold it into -0035 if the diagnosis converges. Re-read the banner
-before selecting; it outranks this note.
+**-0035 STAYS OPEN — acceptance Q78 is untouched** (qual sits above two
+`Hash Join (LEFT)` and names a CTE output column). Per the banner the next
+selection is the **shared CTE/outer-join arm of `-0034` + `-0035`**: preserved-side
+pushdown for outer joins (safe without a `nullingrels` model) + PG's
+single-reference CTE inlining (PG 12+ `cte_inline`). Re-read the banner before
+selecting; it outranks this note.
 
-Host note: nightly run was live throughout; a private binary
-`tmp/goopg-m0125-0034-bin` was used everywhere EXCEPT `tpch-spotcheck.sh`,
-which rebuilds the shared `tmp/goopg-bench-bin` — that clobber happened at
-~01:53 and is worth avoiding next time. Both goopg TPC-DS clusters are DOWN
-again, as they were found; :65438 (PG) was already UP.
+Host note: nightly CI batch was live all loop (load ≈ 8). Private binaries
+`tmp/goopg-m0125-0035-bin` and `-spotcheck` used everywhere — the shared
+`tmp/goopg-bench-bin` was NOT clobbered this time (that is what the
+`env_goopg.sh` override fixes). All goopg clusters left DOWN as found; :65438
+(PG) was already UP and is left UP.
