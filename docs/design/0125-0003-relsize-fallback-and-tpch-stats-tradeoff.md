@@ -453,3 +453,80 @@ failure §D4 exists to prevent. Ledger row appended.
   available under contention. Nothing here justifies flipping the default — that is M0125-0005.
 - The 22/22 divergence is a statement about plan *shape*, not about plan *quality*. Round-4's
   five regressed queries are the pre-registered watch list and none of them has been timed.
+
+## Measurement record — the C-arms (2026-07-30)
+
+Full report: [`analysis/tpch-relsize-fallback-20260730.md`](../../analysis/tpch-relsize-fallback-20260730.md).
+Raw per-query TSVs with D4a provenance: `analysis/tpch-relsize-fallback-20260730/`.
+
+### I11. §D7's harness exists now — `scripts/tpch-relsize-arm.sh`
+
+§D7 specified a per-query-isolated harness and no such thing existed: the only TPC-H
+driver in the repo (`bench/tpch/run_power_test_goopg.sh`) drives HammerDB, which runs all
+22 queries in ONE session against ONE long-lived server. That shape cannot express this
+experiment for a reason beyond the memory-thrash argument §D7 gives:
+**`GOOPG_RELSIZE_FALLBACK` is read once, in the planner package's `init()`, from the
+SERVER's environment** (`relsize.go:40`). There is no GUC, so the arm can only be
+selected at server start — per-query restart is what makes "arm" a well-defined thing,
+not merely a hygiene measure.
+
+The script takes `c1|c2|w1|w2|probe-analyze`, and it keeps §D7's one deliberate
+divergence (no re-ANALYZE for the C arms) as the default rather than as a comment.
+
+### I12. The C1 → C2 result, and the pre-registration it refutes
+
+21 comparable queries: **693.8 s → 494.0 s (−28.8 %, 1.40×). Four wins — Q9 3.29×,
+Q12 3.43×, Q10 2.58×, Q7 1.32× — and ZERO regressions**, largest adverse move Q14 at
+1.08× (0.43 s) inside the harness's own 1.02–1.04× noise band. Row counts identical in
+both arms on every completing query.
+
+**§D5.2's pre-registration was wrong in both directions.** None of round-4's five
+regressed queries regressed; **Q12, round-4's 4.4× loss, is the second-largest win**;
+and **Q5, the named expected win, did not move** (0.99×) because M0077 had already
+fixed it — this cluster runs Q5 at 66.7 s cold, not round 4's 415.2 s. Q9 was the one
+correct call.
+
+§D5.2's qualification 1 is therefore **confirmed as the operative fact**: round 4
+supplied full ANALYZE (selectivity *and* sizes) while this flag supplies sizes only, and
+the measured shape of that third regime is *sizes alone are monotonically helpful here;
+selectivity is what wrecked those five queries*. §D5.3's risk statement is **refuted for
+stage 2 on this workload** — which is a statement about TPC-H SF=1 at S-cold on this
+code, and is NOT transferable to stage 3 (see §I8: stage 3 shadows this tier).
+
+### I13. Q21 fails in BOTH arms, and it reproduces round-5 §6's non-cancelling defect
+
+Q21 TIMEOUTs at a 300 s cap and again at a 600 s cap in **both** arms (re-run at 600 s
+in each so the table is symmetric), at 14.2–14.8 GB VmHWM. It is not caused by the flag.
+Two findings worth more than the cell:
+
+- **It does not honour cancellation** — 672 s of wall clock against a 300 s runner
+  budget, ended by the external clamp, then needing SIGKILL. Round-5 §6 measured this on
+  the *cost-driven* planner; here it is the **default integer DP at S-cold**, so the
+  defect class is broader than the experimental planner. Ledger row.
+- It sits ~0.2–0.8 GB under the harness's `GOOPG_MEM_MAX=15G`, consistent with
+  `CLAUDE.md`'s record of Q21 drawing a host-level OOM at `GOMEMLIMIT=18GiB`.
+
+### I14. §D5.1's W arms are unconstructible today — measured, not assumed
+
+`probe-analyze` measured both blockers on this cluster: `ANALYZE lineitem` in database
+`tpch` errors *relation does not exist* (ledger `bench-reorg ANALYZE-scope`), so
+`RowCount` cannot be raised above 0 at all; and goopg's stats are per-connection, so
+even after that fix the ANALYZE must be issued in the query's own session, which
+`cmd/tpch-runner` cannot do. **§D3's W1 = W2 invariant therefore remains unmeasured** and
+rests on `relSizeFallbackRows`'s early return plus its unit test. The harness refuses the
+w-arms with that text rather than emitting a duplicate C-arm under a W label. Ledger row
+carries the resume point (`cmd/tpch-runner -analyze`).
+
+### I15. What is still owed after this arm
+
+- **Stage 3** (`estimateBaseRelInfo.baseRows`) — unimplemented, and its arms must be run
+  fresh; §I8's shadowing means this arm says nothing about it.
+- **§D8's TPC-DS instrument** — the SF0.5 gate at `GOOPG_RELSIZE_FALLBACK=2` has NOT been
+  run. TPC-DS timeout relief is this milestone's acceptance criterion, so a TPC-H win is
+  not the verdict. This is the single next measurement.
+- **W1/W2**, per §I14.
+- The **absolute seconds** carry this harness's memory configuration
+  (`GOMEMLIMIT=12GiB`, `MEM_HIGH=13G`, `MEM_MAX=15G`); nine queries exceeded `MEM_HIGH`,
+  so the heaviest cells include kernel throttle-band time. The A/B is unaffected — one
+  binary, one configuration, same-age server per query — but cross-report seconds
+  comparisons are not licensed. Ledger row.

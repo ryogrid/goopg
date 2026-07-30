@@ -1,0 +1,11 @@
+# arm: c2  (GOOPG_RELSIZE_FALLBACK='2'  analyze=0)
+# started: 2026-07-30T13:18:07+09:00
+# engine-id: 5a45a42d33ef58ff9de0bcf5f82aa6ccfb66ddd5 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: on-disk=5b87cf4b53780639 (tmp/goopg-relsize-bin)
+# per-query cap: 600s (external clamp 660s); restart per query; NO re-ANALYZE
+# host: load6.16 8.15 6.17
+query	secs	rows	status	peak_rss_kb	running_engine
+Q22	12.72	7	ok	5032176	5b87cf4b53780639
+Q21	672		timeout	14825680	5b87cf4b53780639
+# finished: 2026-07-30T13:30:39+09:00  wall=752s
+# engine-id at end: 5a45a42d33ef58ff9de0bcf5f82aa6ccfb66ddd5 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc

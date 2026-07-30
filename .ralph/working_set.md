@@ -1,61 +1,56 @@
 (idle — nothing in flight)
 
-Last loop (#1 of this run, 2026-07-30 10:17–12:35): **M0125-0011's gate-integrity
-follow-up landed AND the owed full 99-query SF0.5 gate is DISCHARGED.**
+Last loop (#2 of this run, 2026-07-30 12:38–13:55): **M0125-0003 stage 2's TIMED
+C-arms are MEASURED — the six-loop-old measurement debt is discharged.**
 
-Task: close the ledger row (2026-07-29) whose resume point asked the SF0.5 sweep
-to stamp binary identity, then spend the quiet-host window on the gate that had
-been owed four times.
+Task: the banner's quiet-host item. Host verified quiet (no nightly, load ~0.3,
+only PG:65438 up). Built §D7's missing harness, then ran the arms.
 
-Files: `bench/tpcds/env_tpcds.sh` (shared D4a helpers `bench_engine_id` /
-`bench_engine_bin_sha` / `bench_running_engine_sha`, `GOOPG_BIN` override),
-`scripts/tpcds-sf05-regression.sh` (`sf05_ensure_bin`,
-`sf05_engine_binary_line`, `sf05_guard_engine_stable`),
-`scripts/tpcds-bench-compare.sh` (delegates to the shared helpers),
-`docs/design/0125-0011-*.md` + `0124-0001-*.md` + `0125-0026-*.md` +
-`docs/design/README.md`, `analysis/m0125-sf05-fullgate-20260730/` (report +
-driver log + README), `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
+Files: `scripts/tpch-relsize-arm.sh` (NEW — the per-query-isolated harness),
+`scripts/lib/bench-engine-id.sh` (NEW — D4a helpers extracted so TPC-H and
+TPC-DS report the same fields), `bench/tpcds/env_tpcds.sh` (now sources it),
+`analysis/tpch-relsize-fallback-20260730.md` + `…-20260730/` (report + raw TSVs),
+`docs/design/0125-0003-*.md` (§I11–I15), `docs/design/README.md`,
+`.ralph/fix_plan.md` (banner + M0125-0003 + M0125-0005), `.ralph/deferral_ledger.md` (3 rows).
 
 ## Facts the next loop should NOT re-derive
 
-- **Gate result, HEAD `e29faca9`, quiet host, one binary, 10:20→12:26:**
-  `PASS=79 (49 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=16 SKIP=4`.
-  Five changes vs the 2026-07-29 baseline, no change in the other direction:
-  Q16/Q94/Q95 `CKMISMATCH→PASS` (M0125-0007/-0008/-0023), Q75 `ERROR→PASS`
-  (M0125-0004, also clears the live `Q75,100,pinned` anchor), Q47
-  `MISMATCH→TIMEOUT` (row defect fixed; its runtime is M0125-0013's open half).
-- **The timeout class is 16, not 15** — Q47 joined it. M0125-0026's capture list
-  is amended in both fix_plan and the design doc. Do not call Q47 unbounded: its
-  one completion reading is 142 s at SF=1 against a 300 s cap on half the data.
-- **NEW defect filed, NOT fixed: `M0125-0027`** — `tpcds-bench-compare.sh:138`'s
-  catch-all `else status="OK"` records a *connection-refused* psql as `OK` with
-  the error text's line count as its row count (measured: `goopg Q99 OK 0s 2`
-  with nothing on 65436). Also owed there: re-read the published SF=1 board for
-  `OK` cells with a tiny row count at ~0 s. M0125-0026's per-class tasks must
-  start at **M0125-0028** now.
-- The SF0.5 sweep now **always rebuilds** (`SF05_NO_BUILD=1` opts out and says so
-  in the report), refuses to clobber the shared `tmp/goopg-bench-bin` while
-  ci/batch or the SF=1 harness runs from it (FORCE=1 does NOT waive that), and
-  shouts `*** SWEEP VOID ***` into the report if a restart swaps the engine.
-  Run a private image with `GOOPG_BIN=tmp/goopg-sf05-bin`.
-- The dead chunked attempt in `analysis/m0125-sf05-fullgate-20260730/` is now
-  labelled invalid in that dir's README — don't cite its cells or seconds.
+- **C1 (flag off) → C2 (`GOOPG_RELSIZE_FALLBACK=2`), 21 comparable TPC-H queries:
+  693.8 s → 494.0 s (−28.8 %, 1.40×), four wins (Q9 3.29×, Q12 3.43×, Q10 2.58×,
+  Q7 1.32×), ZERO regressions, identical row counts, one binary
+  (`5b87cf4b53780639`) across all 45 executions.** §D5.3's risk statement is
+  refuted for stage 2 **on TPC-H**; stage 3 is no longer shadow-blocked.
+- **The pre-registration was wrong both ways:** none of round 4's five regressed;
+  Q12 (its 4.4× *loss*) is the 2nd-largest win; Q5, the named expected win, did
+  not move — M0077 already fixed it (66.7 s cold here, not 415 s). Do not cite
+  round-4 seconds as a live baseline again.
+- **W1/W2 are unconstructible, measured** (`scripts/tpch-relsize-arm.sh
+  probe-analyze`): `ANALYZE lineitem` in db `tpch` → *relation does not exist*,
+  and stats are per-connection while `cmd/tpch-runner` opens one conn per query.
+  §D3's W1 = W2 invariant is UNMEASURED. Harness refuses `w1`/`w2` (W_ARM_OK=1 overrides).
+- **TPC-H Q21 TIMEOUTs in BOTH arms** (300 s and 600 s caps; 14.2–14.8 GB VmHWM)
+  and **does not honour cancellation** (672 s wall vs a 300 s budget, SIGKILL to
+  stop) — round-5 §6's defect on the DEFAULT planner. Pre-existing; not the flag.
+- Harness gotcha already fixed: a SIGKILLed predecessor made the NEXT start fail
+  (that is how c2/Q22 was lost); `start_server` now waits for the port and retries once.
+- Absolute seconds carry `MEM_HIGH=13G` < working set (2 GB buffers + 12 GiB heap
+  ≈ 14 GB), so 9 queries ran partly in the throttle band. A/B unaffected; cross-report diffs are not.
 
-## NEXT (banner order — the gate obligation is no longer in the way)
+## NEXT (banner order, now updated to match)
 
-1. `M0125-0002` **commit 2 — `cloneExprShiftIdx`** (`nl_index_join.go:777`): the
-   first commit expecting plan hunks; needs the timed 22-query TPC-H run
-   (`scripts/goopg-test-run.sh`, `GOGC=100` / `GOMEMLIMIT=12GiB`) on a quiet host
-   plus `make plan-diff LABEL=tpcds-round2-head`.
-2. `M0125-0003` stage 2's TIMED four-arm study (quiet host), then stage 3.
-3. `M0125-0005`; `M0125-0026` is the host-independent option when the host is busy.
+1. **§D8's SF0.5 gate at `GOOPG_RELSIZE_FALLBACK=2`** (~1 h, goopg-only) — the
+   TPC-DS timeout class is M0125's acceptance criterion and a TPC-H win is not a
+   verdict on it. This is what unblocks `M0125-0005`'s default flip.
+2. `M0125-0002` commit 2 (`cloneExprShiftIdx`), `M0125-0003` stage 3, `M0125-0005`.
+3. `M0125-0026` when the host is busy; `M0125-0027` (SF=1 harness reports a dead
+   server as `OK`) is still open and host-independent.
 
-Gates run: `go build ./...` clean; `bash -n` on all three touched shell files;
-four direct `sf05_guard_engine_stable` branch probes (inactive / source-changed /
-image-only / unchanged); two SF0.5 subset probes (Q1, Q98) validating the header;
-SF=1 harness header re-rendered after the delegation; **full 99-query SF0.5 gate
-PASS**; units suite PASS (warm cache — no Go code changed this loop);
-`make ralph-state-guard` OK; pgbench smoke via the commit hook.
-NOT run: timed TPC-H, plan-diff (no planner/executor code touched).
+Gates run: units suite PASS (warm cache; **no Go code changed** this loop);
+`bash -n` on all 4 touched shell files; D4a fields re-rendered through
+`env_tpcds.sh` after the extraction (engine-id/bin-sha/running all resolve);
+4 successful harness runs + a post-SIGKILL cluster sanity read (Q1 ok, 4 rows);
+`make ralph-state-guard` OK (auto-repaired the previous loop's completed marker);
+pgbench smoke via the commit hook. NOT run: plan-diff, tpch-spotcheck (no
+planner/executor code touched — this loop is measurement + shell + docs).
 
 In-flight: none.

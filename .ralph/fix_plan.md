@@ -90,11 +90,17 @@ started.
 >       (2026-07-30)**: the bushy DP seed is wired and default-off, proven inert
 >       flag-off (plan-diff 22/22 MATCH) and proven LIVE flag-on (22/22 DIFFER,
 >       replacing a flat `rows=1` seed for every relation with block-derived
->       sizes). The four-arm TIMED study and stage 3 remain owed — see the item
->       body and the two 2026-07-30 ledger rows. **NEXT SELECTION: `M0125-0002`,
->       `-0005`, or `M0125-0003` stage 3** (but stage 3 shadows stage 2's
->       measurement, so prefer taking stage 2's timed arm on a quiet host
->       first). Original wording follows.
+>       sizes). **STAGE 2's TIMED C-ARMS ARE NOW READ (2026-07-30,
+>       `analysis/tpch-relsize-fallback-20260730.md`, quiet host): 1.40× on the
+>       TPC-H stream, four wins to 3.4×, ZERO regressions, identical rows —
+>       §D5.3's risk statement is REFUTED for stage 2 on TPC-H,** so stage 3 is
+>       no longer shadow-blocked. What remains owed is **§D8's SF0.5 gate at
+>       `GOOPG_RELSIZE_FALLBACK=2`** (the TPC-DS timeout class is this
+>       milestone's acceptance criterion; a TPC-H win is not a verdict on it),
+>       the W arms (measured *unconstructible* — `ANALYZE` in db `tpch` errors;
+>       ledger row) and stage 3. **NEXT SELECTION: the SF0.5 gate at stage 2** —
+>       ~1 h, goopg-only, and it is what unblocks `M0125-0005`'s default flip —
+>       then `M0125-0002`, `-0005`, or stage 3. Original wording follows.
 >       It is the ONLY designed item that can move the
 >       **17-query timeout class** this milestone is named after — fix_plan calls
 >       it "§13.5's highest-value item (15–16 of 21 defects); stage 1 is inert, so
@@ -1404,10 +1410,38 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (`nation` at 20.8× is the 10-page floor, upstream's behavior). Q9 newly
       reaches `Gather`/`Workers Planned: 4` — untimed, and round-4's five
       regressed queries remain the watch list.
+      **STAGE 2's TIMED C-ARMS ARE READ, 2026-07-30, on a verified quiet host**
+      — `analysis/tpch-relsize-fallback-20260730.md`, harness
+      `scripts/tpch-relsize-arm.sh` (new; §D7's first implementation, and the
+      only shape that *can* express an arm, because the flag is read once from
+      the SERVER's env in `planner.init()` — there is no GUC). 21 comparable
+      TPC-H queries **693.8 s → 494.0 s, −28.8 % (1.40×), four wins (Q9 3.29×,
+      Q12 3.43×, Q10 2.58×, Q7 1.32×), ZERO regressions**, row counts identical
+      in both arms, one binary (`5b87cf4b53780639`) across all 45 executions.
+      **§D5.2's pre-registration was wrong in both directions:** none of round
+      4's five regressed, **Q12 — round 4's 4.4× LOSS — is the second-largest
+      win**, and **Q5, the named expected win, did not move** (0.99×; M0077 had
+      already fixed it, so this cluster runs it at 66.7 s cold, not 415 s).
+      §D5.2's qualification 1 is the operative fact — round 4 supplied
+      selectivity AND sizes, this supplies sizes only — so **§D5.3's risk
+      statement is refuted for stage 2 on this workload** and is NOT
+      transferable to stage 3. Three things the arm could not close, each with a
+      ledger row: **Q21 TIMEOUTs in BOTH arms** (300 s and 600 s caps, 14.2–14.8
+      GB VmHWM) and **does not honour cancellation** — round-5 §6's non-cancelling
+      defect on the *default* planner, not just the cost-driven one; **W1/W2 are
+      unconstructible**, measured by the harness's new `probe-analyze` mode
+      (`ANALYZE` in db `tpch` errors *relation does not exist*, and stats are
+      per-connection while `cmd/tpch-runner` opens one connection per query), so
+      §D3's W1 = W2 invariant stays unmeasured; and the absolute seconds carry a
+      `MEM_HIGH` below the true working set, so they are not cross-report
+      comparable (the A/B is, both arms sharing it).
       **Still owed, which is why this box is unchecked:** stage 3
-      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the ENTIRE
-      four-arm TIMED measurement — the flag accepts `3` today and yields
-      stage-2 behavior. **Read stage 2's timed arm BEFORE stage 3 lands**:
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`); **§D8's SF0.5 gate
+      at `GOOPG_RELSIZE_FALLBACK=2`, which is the acceptance criterion this
+      milestone is named after and the SINGLE NEXT MEASUREMENT** — TPC-DS
+      timeout relief, not a TPC-H win, is the verdict; and the W arms. The flag
+      accepts `3` today and yields stage-2 behavior.
+      **Read stage 2's timed arm BEFORE stage 3 lands**:
       stage 3 makes `filteredRows` positive cold and therefore SHADOWS the
       stage-2 tier at the DP seed (recorded in `bushySeedRowCounts`'s doc
       comment and a ledger row). A fourth, unstaged consumer was discovered —
@@ -1676,6 +1710,22 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       completion** — `costDrivenJoinOrder` is the precedent. On landing, update the
       RC-5 and phase-6.2 ledger rows whose criteria this satisfies. Design
       `docs/design/0125-0005-relsize-fallback-default-flip.md`.
+      **↳ INPUT AVAILABLE 2026-07-30 (`analysis/tpch-relsize-fallback-20260730.md`
+      §6): the TPC-H half of this task's evidence is DONE for stage 2 and it
+      recommends the flip** — 21 comparable queries 693.8 s → 494.0 s (1.40×),
+      four wins to 3.4×, **zero regressions**, identical rows; none of round 4's
+      five regressed and Q12 (its 4.4× loss) is a 3.4× win. Three riders the
+      report states and this task must honour: **(1)** the TPC-DS side is NOT
+      done — §D8's SF0.5 gate at `GOOPG_RELSIZE_FALLBACK=2` has never been run,
+      and the timeout class is the acceptance criterion, so do not flip on TPC-H
+      evidence alone; **(2)** the report covers **stage 2 only** — stage 3 is
+      unimplemented and §I8 records that it *shadows* this tier, so its own arms
+      are required; **(3)** the spotcheck re-measurement above is still owed, and
+      the good news is that Q12, one of its two queries, is a 3.4× win cold.
+      Also inherited, arm-independent: **TPC-H Q21 TIMEOUTs at S-cold on today's
+      default** (>600 s, 14.2–14.8 GB VmHWM) **and does not honour
+      cancellation** — pre-existing, not caused by the flag, own ledger row; do
+      not let the flip be blamed for it, and do not let it block the flip.
 - [x] **M0125-0006 — set-operation chains re-associate right when branches are
       parenthesised** (discovered by M0124-0001 chunk 11, ledger row 2026-07-28).
       **A wrong-answer defect, not a performance one**, and the first one this
