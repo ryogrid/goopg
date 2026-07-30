@@ -481,10 +481,11 @@ def analyze(run_dir, repo_root, run_id):
         )
 
     anchor_rows_tpcds = read_csv(os.path.join(repo_root, "ci/batch/tpcds-row-anchors.csv"))
+    # tpcds-row-anchors.csv's column is "expected_rows" (tpch's is "rows").
     anchors_tpcds = {
-        r["query"]: (int(r["rows"]), r.get("kind", "pinned"))
+        r["query"]: (int(r["expected_rows"]), r.get("kind", "pinned"))
         for r in anchor_rows_tpcds
-        if r.get("query") and r.get("rows")
+        if r.get("query") and r.get("expected_rows")
     }
     tpcds_timings = parse_timings(os.path.join(run_dir, "tpcds", "timings.csv"))
     for t in tpcds_timings:
@@ -584,7 +585,7 @@ def analyze(run_dir, repo_root, run_id):
         "tpcds_not_run": sum(1 for t in tpcds_timings if t["status"].startswith("not-run")),
         "tpcds_ok": sum(1 for t in tpcds_timings if t["status"] == "ok"),
     }
-    return it, stages, timings, spot_line, extra
+    return it, stages, timings, tpcds_timings, spot_line, extra
 
 
 # --------------------------------------------------------------------- outputs
@@ -631,7 +632,7 @@ def main():
         meta = {}
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-    it, stages, timings, spot_line, extra = analyze(run_dir, repo_root, run_id)
+    it, stages, timings, tpcds_timings, spot_line, extra = analyze(run_dir, repo_root, run_id)
 
     gating = it.regressions + it.perf_drastic
     if gating:
