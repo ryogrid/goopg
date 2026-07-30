@@ -1,0 +1,48 @@
+go build -o "/home/ryo/work/goopg/goopg/tmp/plan-snapshot" ./cmd/plan-snapshot
+"/home/ryo/work/goopg/goopg/tmp/plan-snapshot" diff --label "m0125-0035-c2-qual-placement" --mode "structural" \
+	--host "127.0.0.1" --port 65433 \
+	--db "tpch" --user "tpch" --password "tpch"
+Q1: MATCH
+Q10: MATCH
+Q11: MATCH
+Q12: MATCH
+Q13: MATCH
+Q14: MATCH
+Q15a-VIEWBODY: MATCH
+Q16: MATCH
+Q17: DIFFER (mode=structural)
+---
+  Finalize Aggregate  (cost=0.00..0.00 rows=1 width=0)
+  ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+  Workers Planned: 4
+  ->  Partial Aggregate  (cost=0.00..0.00 rows=1 width=0)
+- ->  Hash Join (INNER)  (cost=0.00..0.00 rows=89917234037100 width=0)
++ ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2247930476 width=0)
+  Filter: (((part.p_brand = 'Brand#23') AND (part.p_container = 'MED BOX')) AND (lineitem.l_quantity < (0.2 * avg)))
+- ->  Hash Join (INNER)  (cost=0.00..0.00 rows=5997241000 width=0)
++ ->  Hash Join (INNER)  (cost=0.00..0.00 rows=149931 width=0)
+  ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+  ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0)
+- ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=2998620 width=0)
++ Filter: ((p_brand = 'Brand#23') AND (p_container = 'MED BOX'))
+- ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
++ ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=2998620 width=0)
+- Filter: (true)
++ ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
++ Filter: (true)
+---
+Q18: MATCH
+Q19: MATCH
+Q2: MATCH
+Q20: MATCH
+Q21: MATCH
+Q22: MATCH
+Q3: MATCH
+Q4: MATCH
+Q5: MATCH
+Q6: MATCH
+Q7: MATCH
+Q8: MATCH
+Q9: MATCH
+1 / 22 queries diverged
+make: *** [Makefile:364: plan-diff] Error 1

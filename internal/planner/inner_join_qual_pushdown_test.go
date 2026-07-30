@@ -133,20 +133,166 @@ func TestInnerJoinQualPushEndToEndCTESelfJoin(t *testing.T) {
 
 // --- the declines ----------------------------------------------------
 
-// TestInnerJoinQualPushDeclinesOnOuterJoin pins property 4. The qual
-// here sits on the PRESERVED side of a LEFT JOIN, where pushing would in
-// fact be safe — the pin is on the deliberate conservatism, not on a
-// semantic hazard. goopg has no nullingrels model, and PG 18.3 removed
-// check_outerjoin_delay in the nullingrels rework, so safety can only be
-// expressed by declining on every non-INNER join.
-func TestInnerJoinQualPushDeclinesOnOuterJoin(t *testing.T) {
-	for _, typ := range []JoinType{JoinTypeLeft, JoinTypeRight, JoinTypeFull, JoinTypeSemi, JoinTypeAnti} {
+// TestInnerJoinQualPushDeclinesOnUnpreservedJoin pins property 4 as
+// M0125-0035 arm (a) restated it. The pin formerly read
+// "DeclinesOnOuterJoin" and covered LEFT and RIGHT as well, on the
+// reasoning that "goopg has no nullingrels model … so safety can only be
+// expressed by declining on every non-INNER join". Its own comment
+// conceded the qual it used "sits on the PRESERVED side of a LEFT JOIN,
+// where pushing would in fact be safe".
+//
+// That conservatism cost real work — see
+// TestInnerJoinQualPushReachesPreservedOuterSide — and the nullingrels
+// model it was waiting for is not needed for a preserved side. What
+// still declines, and is pinned here:
+//
+//   - FULL, where NEITHER input is preserved;
+//   - SEMI / ANTI, whose Output() is Left's layout alone, so the merged
+//     coordinate arithmetic does not describe the Filter's ColumnRefs;
+//   - the NULLABLE side of LEFT / RIGHT, which is the case that really
+//     does need nullingrels.
+func TestInnerJoinQualPushDeclinesOnUnpreservedJoin(t *testing.T) {
+	for _, typ := range []JoinType{JoinTypeFull, JoinTypeSemi, JoinTypeAnti} {
 		curr, prev := ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
 		f, j := ijFilterOverInnerJoin(curr, prev, typ, ijEq(0, "y", 2002))
 		pushInnerJoinInputQuals(f)
 		if _, ok := j.Left.(*Filter); ok {
-			t.Errorf("join type %v: qual was pushed onto Join.Left; the pass must decline on non-INNER joins", typ)
+			t.Errorf("join type %v: qual was pushed onto Join.Left; neither input of this join kind is preserved", typ)
 		}
+	}
+	// The nullable side of an outer join: a restriction there would
+	// delete rows the join would otherwise have null-extended and kept.
+	// Merged layout is [curr.y=0, curr.cnt=1, prev.y=2, prev.cnt=3], so
+	// index 2 is the right (nullable, under LEFT) input.
+	curr, prev := ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
+	f, j := ijFilterOverInnerJoin(curr, prev, JoinTypeLeft, ijEq(2, "y", 2001))
+	pushInnerJoinInputQuals(f)
+	if _, ok := j.Right.(*Filter); ok {
+		t.Errorf("LEFT JOIN: qual was pushed onto the NULLABLE Join.Right")
+	}
+	curr, prev = ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
+	f, j = ijFilterOverInnerJoin(curr, prev, JoinTypeRight, ijEq(0, "y", 2002))
+	pushInnerJoinInputQuals(f)
+	if _, ok := j.Left.(*Filter); ok {
+		t.Errorf("RIGHT JOIN: qual was pushed onto the NULLABLE Join.Left")
+	}
+}
+
+// TestInnerJoinQualPushReachesPreservedOuterSide is the inversion: the
+// preserved input of an outer join DOES receive the restriction.
+//
+// Why it is sound without a nullingrels model: every preserved-side row
+// reaches the join output at least once, matched or null-extended, and
+// the conjunct does not mention the other side — so discarding a
+// preserved row before the join discards exactly the output rows the
+// residual Filter above would have discarded.
+//
+// TPC-DS Q78 is the witness for why it matters: `ss_sold_year = 1998`
+// sits above two stacked `Hash Join (LEFT)` whose preserved spine leads
+// to the `ss` channel, and the pass declined at the first one.
+func TestInnerJoinQualPushReachesPreservedOuterSide(t *testing.T) {
+	curr, prev := ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
+	f, j := ijFilterOverInnerJoin(curr, prev, JoinTypeLeft, ijEq(0, "y", 2002))
+	pushInnerJoinInputQuals(f)
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("LEFT JOIN: Join.Left is %T, want *Filter with the pushed preserved-side qual", j.Left)
+	}
+	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("pushed predicate refs = %v, want [0]", got)
+	}
+	// Property 2 still holds across the widening.
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	}
+	// Mirror image for RIGHT: index 2 is the preserved (right) input.
+	curr, prev = ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
+	f, j = ijFilterOverInnerJoin(curr, prev, JoinTypeRight, ijEq(2, "y", 2001))
+	pushInnerJoinInputQuals(f)
+	rf, ok := j.Right.(*Filter)
+	if !ok {
+		t.Fatalf("RIGHT JOIN: Join.Right is %T, want *Filter with the pushed preserved-side qual", j.Right)
+	}
+	if got := columnRefIndexes(rf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("pushed predicate refs = %v, want [0] (shifted by -leftWidth)", got)
+	}
+}
+
+// TestInnerJoinQualPushDescendsJoinSpine pins the other half of arm (a):
+// a restriction is carried to the DEEPEST node that can hold it, not
+// just to the residual join's immediate input.
+//
+// PG's distribute_restrictinfo_to_rels files a single-relation
+// restriction on that relation's baserestrictinfo regardless of how deep
+// the join tree above it is; stopping at the immediate input meant a
+// conjunct only ever reached a leaf that happened to be a direct child
+// of the join carrying the residual Filter, which is not the shape
+// TPC-DS builds. Q78's spine — `Filter -> Join(LEFT) -> Join(LEFT) ->
+// CTE Scan on ss` — is reproduced here, including the index SHIFT
+// applying once per level.
+func TestInnerJoinQualPushDescendsJoinSpine(t *testing.T) {
+	ss, ws, cs := ijCTEScan("ss"), ijCTEScan("ws"), ijCTEScan("cs")
+	// Inner spine: ss (0,1) LEFT JOIN ws (2,3).
+	inner := &Join{
+		Type:   JoinTypeLeft,
+		Left:   ss,
+		Right:  ws,
+		schema: append(append(Schema{}, ss.Output()...), ws.Output()...),
+	}
+	// Outer spine: inner (0..3) LEFT JOIN cs (4,5), residual on ss.y.
+	f, j := ijFilterOverInnerJoin(inner, cs, JoinTypeLeft, ijEq(0, "y", 1998))
+	pushInnerJoinInputQuals(f)
+
+	if _, ok := j.Left.(*Filter); ok {
+		t.Fatalf("the conjunct stopped at the outer join's immediate input; it must descend to the CTE reference")
+	}
+	sf, ok := inner.Left.(*Filter)
+	if !ok {
+		t.Fatalf("inner Join.Left is %T, want *Filter directly above the `ss` CTE reference", inner.Left)
+	}
+	if _, ok := sf.Child.(*CTEScan); !ok {
+		t.Errorf("pushed Filter sits above %T, want *CTEScan", sf.Child)
+	}
+	if got := columnRefIndexes(sf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("descended predicate refs = %v, want [0]", got)
+	}
+	// Re-running must be a no-op: a planned subtree is re-walked once per
+	// enclosing scope (the Q69 double-print), and descent multiplies the
+	// number of places that could stack a duplicate.
+	pushInnerJoinInputQuals(f)
+	if got := len(splitAnd(sf.Predicate)); got != 1 {
+		t.Errorf("after a second walk the pushed Filter has %d conjuncts, want 1 (idempotence)", got)
+	}
+}
+
+// TestInnerJoinQualPushReachesCrossJoinInput pins that a CROSS join
+// participates. A CROSS join is an inner join whose predicate is absent
+// or was demoted to a residual Filter — exactly M0125-0034's C1 shape,
+// where the demoted equi-predicate cannot be pushed (it spans both
+// inputs) but a single-side restriction alongside it can, and is worth
+// more there than anywhere else because it shrinks an input of a
+// Cartesian product.
+func TestInnerJoinQualPushReachesCrossJoinInput(t *testing.T) {
+	curr, prev := ijCTEScan("cs1"), ijCTEScan("cs2")
+	f, j := ijFilterOverInnerJoin(curr, prev, JoinTypeCross,
+		ijEq(0, "y", 1999),
+		// A side-spanning conjunct that must NOT move.
+		&BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &ColumnRef{Index: 1, Name: "cnt", Type: catalog.Type{Name: "int4"}},
+			Right: &ColumnRef{Index: 3, Name: "cnt", Type: catalog.Type{Name: "int4"}},
+		},
+	)
+	pushInnerJoinInputQuals(f)
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("CROSS: Join.Left is %T, want *Filter with the pushed single-side qual", j.Left)
+	}
+	if got := len(splitAnd(lf.Predicate)); got != 1 {
+		t.Errorf("pushed Filter has %d conjuncts, want 1 — the side-spanning conjunct must stay above", got)
+	}
+	if _, ok := j.Right.(*Filter); ok {
+		t.Errorf("CROSS: a side-spanning conjunct was pushed onto Join.Right")
 	}
 }
 

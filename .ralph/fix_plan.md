@@ -270,9 +270,31 @@ started.
 >       names a CTE output column). The diagnosis DID converge with -0034's open
 >       arm exactly as this banner predicted — both now need the same two
 >       things: the preserved-side extension for outer joins, and PG's
->       single-reference CTE inlining. **NEXT SELECTION: take the shared
->       CTE/outer-join arm of `-0034`+`-0035` together**, then `M0125-0036` per
->       the adopted order. Three ledger rows 2026-07-31.
+>       single-reference CTE inlining. ~~**NEXT SELECTION: take the shared
+>       CTE/outer-join arm of `-0034`+`-0035` together**~~ — **TAKEN 2026-07-31
+>       (loop #9): the OUTER-JOIN half landed and the CTE half did not.**
+>       Design `docs/design/0125-0035a-preserved-side-restriction-descent.md`.
+>       The pass now pushes onto the PRESERVED side of LEFT/RIGHT (safe with no
+>       `nullingrels` model — see the item body) and DESCENDS the join spine to
+>       the deepest node that can hold the restriction. **Q31 — one of -0035's
+>       two acute members — TIMEOUT → PASS at 11 s with rows AND checksum equal
+>       to the oracle**, its six `CTE Scan` nodes each carrying their own filter
+>       exactly as PG places them; SF0.5 **PASS=89 TIMEOUT=6**, all 87 common
+>       PASSes byte-identical in status and checksum; TPC-H plan-diff 1/22 with
+>       zero structural change and a NEUTRAL timed w2 arm on a quiet host.
+>       **The two open items separated rather than converged**, which is the
+>       finding that sets the next order: `-0035`'s remainder is a
+>       **CTE-body** problem (single-reference `cte_inline` + EC constant
+>       propagation, the only route to its Q78 acceptance), while `-0034`'s 8
+>       crosses were MEASURED not to move and are a **join-ORDER** problem
+>       (Q64 places `date_dim d2`/`d3` before the `customer` their equi-predicate
+>       needs) — so `pushOneConjunct`, the starting point -0034's body named, is
+>       refuted. **NEXT SELECTION: `M0125-0036`** per the adopted order
+>       (`-0037`(i), `-0039`, `-0034`'s set-op arm and `-0035`'s two placement
+>       arms are all discharged); take -0034's join-order arm or -0035's CTE
+>       arm after it, and read each item's own resume point — they are now
+>       different subsystems. Four ledger rows 2026-07-31 (three appended, one
+>       flipped to `resolved`).
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -435,6 +457,19 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      (Tasks are added here by the in-loop agent, one per subject. This
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
+
+- [ ] **testport/TestE2E_FailoverGoopgToPG** — goopg→PG heterogeneous physical
+      failover FAILed (subtest `sync_remote_apply`) in nightly run
+      `20260731-001201` at sha `927742f8` (AI-20260731-001201-001; repro:
+      `go test -v -run '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`;
+      evidence `ci/logs/20260731-001201/testport/go-test.log`). FILED, NOT
+      SELECTED per the 2026-07-28(b) amendment — it neither breaks the build nor
+      breaks a gate M0124/M0125 depend on. First-seen 20260731 (new). Note for
+      whoever takes it: the OPPOSITE direction (`TestE2E_FailoverPGtoGoopg/sync_on`,
+      checked below) was a co-load-timing flake around the same sync-rep feedback
+      invariant on 2026-07-20 — re-run the repro in isolation at HEAD before
+      assuming a deterministic regression, and see that item's 2026-07-20 ledger
+      row for the sync-feedback / last-record-replay durability edge.
 
 - [x] **Nightly TPC-DS row anchors are DEAD — all 63 have never been checked**
       **DONE 2026-07-30 (interactive session, commit `63056c54`)** — the reader
@@ -3404,6 +3439,21 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (counts unchanged 1/4/2/1, all four still TIMEOUT). `collectScanOutputNames`
       already has `*CTEScan`/`*Aggregate` cases, so the name walk is NOT their
       blocker — start by capturing why `pushOneConjunct` declines on Q64.
+      **↳ THAT STARTING POINT IS REFUTED (2026-07-31, loop #9,
+      `docs/design/0125-0035a-preserved-side-restriction-descent.md` §6).** The
+      shared arm was taken with -0035 as this banner directed, and it MEASURED
+      the CROSS count rather than assuming it: `pushSingleSideQualsIntoInnerJoinInputs`
+      now admits `JoinTypeCross`, and **zero of the 8 crosses moved.** They are a
+      join-**ORDER** defect, not a qual-placement one — in Q64 the two crosses are
+      `date_dim d2` and `date_dim d3`, whose equi-predicates
+      (`customer.c_first_sales_date_sk = d2.d_date_sk` + the `d3` twin) are demoted
+      to a `Filter` TWO levels above them because the enumeration places `d2`/`d3`
+      BEFORE `customer`, the relation their predicate needs. `pushOneConjunct` is
+      behaving correctly: a side-spanning conjunct is one it must never move.
+      **Resume in `internal/planner/joinorder.go` / `bushy.go`**, starting with
+      whether the 18-relation FROM list trips a collapse/greedy threshold and falls
+      back to FROM order (PG's analogues: `join_collapse_limit` 8, `geqo_threshold`
+      12). Ledger row 2026-07-31.
       Four ledger rows 2026-07-31 (this arm; the untouched `JOIN … ON` guard;
       the NLI flip declined-not-fixed, where the flipped shape is PG's OWN
       plan; the enumeration's remaining blind kinds).
@@ -3489,6 +3539,48 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **(c)** the costing half is untouched — the DP still sees unfiltered
       base-rel sizes, so join ORDER is still chosen for full tables
       (`M0125-0038` / the cost-model "0077 line").
+      **↳ ARM (a) IS HALF-DISCHARGED 2026-07-31 (loop #9) — the preserved-side
+      extension AND the descent landed; the CTE-body half did not.** Design
+      `docs/design/0125-0035a-preserved-side-restriction-descent.md`; evidence
+      `analysis/m0125-0035a-preserved-side-descent/`; re-capture
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0035a/`. Two
+      restrictions were retired, each with its own pin: **INNER-only became
+      preserved-side-only** (for `A LEFT JOIN B` and a restriction naming only
+      `A`, every `A` row reaches the output matched or null-extended and the
+      restriction cannot read `B`, so pushing it discards exactly the rows the
+      residual would have — no `nullingrels` model needed, which is what the old
+      decline was waiting for; the NULLABLE side still declines, FULL declines,
+      SEMI/ANTI decline because their `Output()` is `Left`'s layout alone, and
+      CROSS is admitted), and **immediate-child-only became descent to the
+      deepest holder** (`pushConjunctIntoSubtree`, PG's
+      `distribute_restrictinfo_to_rels` placement). **Measured: the two ACUTE
+      members named in this item's own body are exactly the two plans that
+      change.** Q31 — all six `CTE Scan` nodes now carry their own
+      `(d_qoy = N) AND (d_year = 1999)`, which is PG's placement — goes
+      **TIMEOUT → PASS at 11 s, 19 rows, `ck=2a74acfb556c21a7` = the oracle**.
+      Q78's `ss_sold_year = 1998` descends to `CTE Scan on ss`. Full 99-query
+      SF0.5 gate on a QUIET host, four chunks on one binary: **PASS=89 (54
+      ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6 SKIP=4**, and
+      **all 87 common PASSes are identical in status AND value checksum** vs
+      loop #8. Q18 also went TIMEOUT → PASS (266 s) and that is deliberately
+      **NOT claimed here** — its plan is byte-identical across the change and
+      loop #8's reading was taken under the live nightly, so host quietness is
+      the economical explanation; it stays filed as `M0125-0033`. TPC-H:
+      plan-diff vs `m0125-0035-c2-qual-placement` **1/22 DIFFER (Q17) with ZERO
+      structural change** — one added scan-level filter, and `part`'s reaching
+      its scan drops the join estimate 5,997,241,000 → 149,931; the owed TIMED
+      w2 arm ran on the quiet host and is **neutral** (stream 395.5 → 389.1 s,
+      Q17 0.84×, both inside `M0125-0031`'s measured ±17 % band) with
+      **identical row counts on all 21 completing queries**; `tpch-spotcheck.sh`
+      `RESULT=PASS` (Q12=2 Q13=35). **STILL OPEN — the acceptance is STILL NOT
+      met.** Q78's qual now lands on the CTE *reference*, which filters the
+      CTE's OUTPUT after the aggregate, so all three channels still aggregate
+      every year. Reaching `date_dim` needs **single-reference CTE inlining**
+      (PG 12+ `cte_inline`, `subselect.c::inline_cte`; Q31's 6×-referenced `ws3`
+      is the control that must NOT inline) and then **equivalence-class constant
+      propagation** (`equivclass.c`) to carry the constant to `ws`/`cs`. Arms
+      (b) and (c) remain untouched. Three ledger rows 2026-07-31; the earlier
+      "declines every OUTER join" row is flipped to `resolved`.
 
 - [ ] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
       no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same

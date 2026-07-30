@@ -55,20 +55,28 @@ import "strings"
 //     the *CTEScan — which is a labelling wrapper the executor unwraps —
 //     leaves the shared body untouched.
 //
-//  4. INNER joins only. For an outer join, a restriction on the nullable
-//     side changes which rows are null-extended. PG 18.3 no longer has the
-//     old check_outerjoin_delay guard (removed in the nullingrels rework);
-//     safety is now expressed through a clause's nulling-relids and
-//     is_pushed_down, and goopg has no nullingrels model, so this pass
-//     simply declines.
+//  4. PRESERVED sides only. For an outer join, a restriction on the
+//     NULLABLE side changes which rows are null-extended, and PG 18.3
+//     expresses that safety through a clause's nulling-relids and
+//     is_pushed_down (the old check_outerjoin_delay guard went away in
+//     the nullingrels rework). goopg has no nullingrels model, so the
+//     nullable side is declined outright — but the PRESERVED side needs
+//     no such model, because every preserved row reaches the output
+//     either matched or null-extended. M0125-0035 arm (a) widened the
+//     pass from "INNER only" to that rule; joinRestrictionSides is the
+//     single place it is decided.
 //
-// Scoping (D2) is deliberately narrow: the target input must be a CTE
-// reference, never a base-relation leaf. Pushing filters toward
-// base-relation leaves is exactly what shouldAttachBeforeMHJ
-// (local_filters.go) withholds behind its SmallDimension guard, whose
-// comment records that without it "Slice A regresses Q8 / Q21 from PASS
-// to CANCEL". Base-relation leaf filters keep going through
-// attachRelationLocalFilters, whose plans are snapshot-pinned.
+// Scoping (D2) started deliberately narrow — the target input had to be
+// a CTE reference and had to be the join's IMMEDIATE child — and both
+// halves have since been retired against evidence:
+//
+//   - base-relation leaves became legal targets in M0125-0035's binary
+//     arm (see innerJoinPushLeafScan for why the SmallDimension risk it
+//     borrowed from Slice A does not transfer to a pass that runs last
+//     and duplicates);
+//   - the immediate-child restriction went in arm (a): a restriction is
+//     now carried down the join spine to the deepest node that can hold
+//     it (pushConjunctIntoSubtree), which is where PG files it.
 func pushSingleSideQualsIntoInnerJoinInputs(n Node) {
 	if n == nil {
 		return
@@ -104,92 +112,195 @@ func pushSingleSideQualsIntoInnerJoinInputs(n Node) {
 
 // pushInnerJoinInputQuals applies the transformation described on
 // pushSingleSideQualsIntoInnerJoinInputs to one Filter-over-Join pair.
-// It is a no-op unless f.Child is a non-lateral INNER Join.
+// It is a no-op unless f.Child is a non-lateral Join of a pushable
+// type (see joinRestrictionSides).
+//
+// The Filter-over-Join ENTRY shape is deliberate even though
+// pushConjunctIntoSubtree can attach below any node: a Filter sitting
+// directly on a CTE reference or a leaf already applies the conjunct
+// exactly where PG would, so descending there would only stack a
+// second, redundant Filter and churn the plan text.
 func pushInnerJoinInputQuals(f *Filter) {
 	if f == nil || f.Predicate == nil {
 		return
 	}
 	j, ok := f.Child.(*Join)
-	// Property 4: INNER only. A LATERAL inner join is also declined —
-	// its right side is re-opened per outer row and is owned by
-	// pushOuterQualsIntoLaterals, which has its own outer-side contract.
-	if !ok || j.Type != JoinTypeInner || j.Lateral {
+	if !ok {
 		return
 	}
-	// Wrapping an input in a Filter does not change its Output(), so
-	// leftWidth is stable across the conjunct loop even as inputs are
-	// rewritten.
-	leftWidth := len(j.Left.Output())
+	if _, _, pushable := joinRestrictionSides(j); !pushable {
+		return
+	}
 	for _, c := range splitAnd(f.Predicate) {
-		side, ok := innerJoinPushTarget(c, j, leftWidth)
+		// Property 2: the conjunct is DUPLICATED — f.Predicate is left
+		// untouched — so only the error behaviour changes.
+		if repl, ok := pushConjunctIntoSubtree(j, c); ok {
+			f.Child = repl
+		}
+	}
+}
+
+// joinRestrictionSides reports which of a join's inputs may receive a
+// copy of a restriction clause that sits ABOVE the join, and whether
+// this join kind participates at all.
+//
+// This is property 4 of pushSingleSideQualsIntoInnerJoinInputs, refined
+// by M0125-0035 arm (a) from "INNER only" to "every side PG would call
+// preserved":
+//
+//   - INNER / CROSS — both inputs. A CROSS join is an inner join whose
+//     predicate is absent (or was demoted to a residual Filter, which is
+//     precisely the M0125-0034 C1 shape), so a single-side restriction is
+//     as safe there as on any inner join, and it is worth far more: it
+//     shrinks an input of a Cartesian product.
+//   - LEFT — the LEFT (preserved) input only. Every preserved-side row
+//     reaches the join output at least once, either matched or
+//     null-extended, and the restriction does not mention the nullable
+//     side, so removing a preserved row before the join removes exactly
+//     the output rows the Filter above would have removed. This needs no
+//     nullingrels model, which is why it is safe here while the nullable
+//     side is not: a restriction on the NULLABLE side would delete rows
+//     that the join would otherwise have null-extended and kept. (PG
+//     reaches the same place from the other direction — a strict WHERE
+//     qual on the nullable side lets reduce_outer_joins turn the join
+//     into an inner join first; goopg has no strictness model either, so
+//     it declines.)
+//   - RIGHT — mirror image: the RIGHT input only.
+//   - FULL — neither input is preserved.
+//   - SEMI / ANTI — declined for a second, independent reason: their
+//     Output() is Left's layout alone (see Join.Output), so the
+//     leftWidth/totalWidth coordinate arithmetic below does not describe
+//     the space the Filter's ColumnRefs live in.
+//
+// A LATERAL join is declined whatever its type: its right side is
+// re-opened per outer row and is owned by pushOuterQualsIntoLaterals,
+// which has its own outer-side contract.
+func joinRestrictionSides(j *Join) (left, right, pushable bool) {
+	if j == nil || j.Lateral {
+		return false, false, false
+	}
+	switch j.Type {
+	case JoinTypeInner, JoinTypeCross:
+		return true, true, true
+	case JoinTypeLeft:
+		return true, false, true
+	case JoinTypeRight:
+		return false, true, true
+	}
+	return false, false, false
+}
+
+// pushConjunctIntoSubtree attaches a copy of conjunct c — expressed in
+// n's OWN coordinate space — to the deepest node of n's subtree that a
+// PG restriction clause would reach, and returns the replacement for n.
+//
+// PG's analogue is distribute_restrictinfo_to_rels
+// (postgres/src/backend/optimizer/plan/initsplan.c), which files a
+// single-relation restriction directly on that relation's
+// baserestrictinfo no matter how deep the join tree above it is. The
+// original M0125-0004 pass stopped at the join's immediate input, so a
+// restriction only ever reached a leaf that happened to be a direct
+// child of the join carrying the residual Filter. Descending is what
+// lets a conjunct cross the join spine that TPC-DS builds above a
+// dimension table.
+//
+// The recursion is coordinate-correct by construction: a Filter does not
+// change its child's Output(), and shiftConjunctForInput re-bases the
+// copy into the chosen input's space before the next level sees it.
+func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
+	switch x := n.(type) {
+	case *Filter:
+		// Descend past a Filter only when its child is a Join. If the
+		// child is a terminal target, ANDing into THIS Filter is both
+		// the shorter plan and the idempotence guard below; recursing
+		// would wrap the leaf a second time on every re-walk.
+		if _, isJoin := x.Child.(*Join); isJoin {
+			repl, ok := pushConjunctIntoSubtree(x.Child, c)
+			if ok {
+				x.Child = repl
+			}
+			return x, ok
+		}
+		if !innerJoinPushEligibleInput(x.Child) {
+			return n, false
+		}
+		// A Filter's LeafLocal describes the coordinate convention of
+		// its whole predicate, so a conjunct may only join one whose
+		// convention already matches what this pass would have set.
+		// Fail-closed: a mismatch declines instead of mixing two
+		// coordinate spaces inside one AND-chain.
+		if x.LeafLocal != innerJoinPushLeafScan(x.Child) {
+			return n, false
+		}
+		// IDEMPOTENCE. A planned subtree is walked again when an
+		// enclosing scope's planSelect reaches this pass with the
+		// subtree already embedded, so without this guard the same
+		// conjunct ANDs in once per enclosing scope — TPC-DS Q69
+		// printed `d_year = 2002 AND d_moy >= 1 AND d_moy <= 3` TWICE
+		// on each date_dim scan. Harmless for the result set (a filter
+		// applied twice selects the same rows) but it costs a
+		// re-evaluation per row and diverges from PG's plan text.
+		// exprEqual is FAIL-CLOSED, so an undecidable conjunct degrades
+		// to the old duplicate, never to a dropped qual.
+		for _, have := range splitAnd(x.Predicate) {
+			if exprEqual(have, c) {
+				return n, true
+			}
+		}
+		x.Predicate = combineAnd([]Expr{x.Predicate, c})
+		return x, true
+
+	case *Join:
+		leftOK, rightOK, pushable := joinRestrictionSides(x)
+		if !pushable {
+			return n, false
+		}
+		leftWidth := len(x.Left.Output())
+		side, ok := innerJoinPushTarget(c, x, leftWidth)
 		if !ok {
-			continue
+			return n, false
 		}
-		target := j.Left
-		delta := 0
+		target, delta := x.Left, 0
 		if side == sideRight {
-			target = j.Right
-			delta = -leftWidth
-		}
-		// D2 scoping: a CTE reference or a base-relation leaf is a
-		// legal target (see innerJoinPushEligibleInput for why the
-		// leaf arm is safe here but not in Slice A). Unwrap one Filter
-		// level so a second eligible conjunct ANDs into the wrapper the
-		// first one created instead of stacking.
-		inner := target
-		if existing, isFilter := inner.(*Filter); isFilter {
-			inner = existing.Child
-		}
-		if !innerJoinPushEligibleInput(inner) {
-			continue
+			if !rightOK {
+				return n, false
+			}
+			target, delta = x.Right, -leftWidth
+		} else if !leftOK {
+			return n, false
 		}
 		local, ok := shiftConjunctForInput(c, delta)
 		if !ok {
-			continue
+			return n, false
 		}
-		if existing, isFilter := target.(*Filter); isFilter {
-			// IDEMPOTENCE. A planned subtree is walked again when an
-			// enclosing scope's planSelect reaches this pass with the
-			// subtree already embedded, so without this guard the same
-			// conjunct ANDs in once per enclosing scope — TPC-DS Q69
-			// printed `d_year = 2002 AND d_moy >= 1 AND d_moy <= 3`
-			// TWICE on each date_dim scan. Harmless for the result set
-			// (a filter applied twice selects the same rows) but it
-			// costs a re-evaluation per row and diverges from PG's
-			// plan text. exprEqual is FAIL-CLOSED, so an undecidable
-			// conjunct degrades to the old duplicate, never to a
-			// dropped qual.
-			dup := false
-			for _, have := range splitAnd(existing.Predicate) {
-				if exprEqual(have, local) {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				existing.Predicate = combineAnd([]Expr{existing.Predicate, local})
-			}
-			continue
-		}
-		// Property 2: the conjunct is DUPLICATED — f.Predicate is left
-		// untouched — so only the error behaviour changes.
-		//
-		// LeafLocal follows the target: above a base-relation leaf the
-		// shifted conjunct is in leaf coordinates (M0077-0001), which is
-		// exactly what the flag asserts. A CTE reference keeps the
-		// M0125-0004 behaviour (flag clear).
-		wrapped := &Filter{
-			pos:       c.Pos(),
-			Child:     target,
-			Predicate: local,
-			LeafLocal: innerJoinPushLeafScan(inner),
+		repl, ok := pushConjunctIntoSubtree(target, local)
+		if !ok {
+			return n, false
 		}
 		if side == sideRight {
-			j.Right = wrapped
+			x.Right = repl
 		} else {
-			j.Left = wrapped
+			x.Left = repl
 		}
+		return x, true
 	}
+
+	// D2 scoping: a CTE reference or a base-relation leaf is a legal
+	// terminal target (see innerJoinPushEligibleInput for why the leaf
+	// arm is safe here but not in Slice A).
+	if !innerJoinPushEligibleInput(n) {
+		return n, false
+	}
+	// LeafLocal follows the target: above a base-relation leaf the
+	// shifted conjunct is in leaf coordinates (M0077-0001), which is
+	// exactly what the flag asserts. A CTE reference keeps the
+	// M0125-0004 behaviour (flag clear).
+	return &Filter{
+		pos:       c.Pos(),
+		Child:     n,
+		Predicate: c,
+		LeafLocal: innerJoinPushLeafScan(n),
+	}, true
 }
 
 // innerJoinPushEligibleInput reports whether a Join input may be wrapped
