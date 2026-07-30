@@ -3450,7 +3450,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       own: accepted when C1's and C2's fixes hold under plan-diff
       `LABEL=tpcds-round2-head` without a hand-written override.
 
-- [ ] **M0125-0039 — diagnostics: EXPLAIN renders column references
+- [x] **M0125-0039 — diagnostics: EXPLAIN renders column references
       unqualified, so real correlations print as self-comparisons** (filed
       2026-07-31 by M0125-0026; evidence same README §"C4", closing paragraph).
       goopg prints `Filter: (ctr_state = ctr_state)` for Q30/Q81 where PG prints
@@ -3467,6 +3467,33 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Acceptance: Q30's filter prints as `ctr1.ctr_state = ctr2.ctr_state`, plus
       a unit test in `internal/executor` over a self-joined relation. Bar: unit
       gate + commit smoke; no plan-shape bar (renders only).
+      **↳ DONE 2026-07-31** (`docs/design/0125-0039-explain-column-qualification.md`).
+      Upstream's rule was captured from the oracle, not inferred, and it turned
+      out to be two mechanisms, not one: explain.c splits the prefix decision by
+      node kind (`show_scan_qual` renders a scan's `Filter:` BARE, while
+      `show_upper_qual`/`show_sort_group_keys` prefix once
+      `es->rtable_size > 1`), and ruleutils.c's `get_parameter` forces
+      prefixing for a Param's expansion — goopg's `OuterColumnRef`. Both are
+      implemented in `internal/executor/explain_names.go` +
+      `operators_explain.go`; nothing outside `internal/executor` changed.
+      **Acceptance met and then some: Q30 and Q81 now print
+      `Filter: (ctr1.ctr_state = ctr_state)`, BYTE-IDENTICAL to PG 18.3 on
+      :65438** (the item's predicted `ctr1.ctr_state = ctr2.ctr_state` was an
+      inference — PG leaves the local side bare because it is a scan qual, and
+      goopg now reproduces that asymmetry). Q64 → `(cd1.cd_marital_status <>
+      cd2.cd_marital_status)`, Q72's join filter names `d1`/`d2`. Arm:
+      `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0039/`; 8 tests in
+      `internal/executor/explain_qualify_test.go`.
+      Two findings worth carrying forward. **(1) A confidently wrong qualifier
+      would be worse than no qualifier**, and the naive implementation produced
+      one: `planner.go`'s `nextSourceIdx` restarts at 1 for every query level,
+      so an outer subquery binding collides with a base relation inside it
+      (probe: `(a.s1 <> a.s2)` where `s2` came from `b`). Contained by a
+      column-membership guard and a match-uniqueness gate; the real fix is a
+      globally unique range-table id (PG's `varno`) and is planner work — two
+      ledger rows, 2026-07-31. **(2) Q31 stays PARTIAL** for that same reason
+      (2 of 12 conjuncts qualify). VERBOSE-forced prefixing and `Output:` line
+      qualification are also still open (second ledger row).
 
 - [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
