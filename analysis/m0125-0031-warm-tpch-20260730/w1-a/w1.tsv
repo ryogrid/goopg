@@ -1,0 +1,20 @@
+# arm: w1  (GOOPG_RELSIZE_FALLBACK='0'  analyze=1)
+# started: 2026-07-30T21:34:01+09:00
+# engine-id: b1640d67666163a39b5f51d978e15d6ca0ac232c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc
+# engine-binary: on-disk=4b3e6cd9bfb4c15b (tmp/goopg-relsize-bin)
+# per-query cap: 300s (external clamp 360s); restart per query; NO re-ANALYZE
+# host: load4.68 7.54 4.68
+query	secs	rows	status	peak_rss_kb	running_engine
+Q1	4.90	4	ok	5219768	4b3e6cd9bfb4c15b
+Q2	2.74	455	ok	3791396	4b3e6cd9bfb4c15b
+Q3	12.95	11521	ok	11092896	4b3e6cd9bfb4c15b
+Q4	41.59	5	ok	6274856	4b3e6cd9bfb4c15b
+Q5	59.86	5	ok	9562416	4b3e6cd9bfb4c15b
+Q6	3.82	1	ok	5231876	4b3e6cd9bfb4c15b
+Q7	33.75	4	ok	10497548	4b3e6cd9bfb4c15b
+Q8	7.78	2	ok	6274420	4b3e6cd9bfb4c15b
+Q9	50.67	175	ok	10646372	4b3e6cd9bfb4c15b
+Q10	13.60	20501	ok	10273424	4b3e6cd9bfb4c15b
+Q11	1.96	819	ok	1569712	4b3e6cd9bfb4c15b
+# finished: 2026-07-30T21:38:36+09:00  wall=275s
+# engine-id at end: b1640d67666163a39b5f51d978e15d6ca0ac232c c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=e3b0c44298fc

@@ -5,10 +5,18 @@
 #
 #   arm | ANALYZE | GOOPG_RELSIZE_FALLBACK | what it measures
 #   ----+---------+-----------------------+---------------------------------
-#   c1  | no      | (unset)               | today's S-cold: RowCount=0, DP seed 1
+#   c1  | no      | 0                     | pre-M0125-0003 S-cold: RowCount=0, DP seed 1
 #   c2  | no      | 2                     | the change — the only interesting cell
-#   w1  | yes     | (unset)               | control; the regime every published number is in
+#   w1  | yes     | 0                     | control; the regime every published number is in
 #   w2  | yes     | 2                     | must equal w1 exactly — design §D3's invariant
+#
+# The flag values are set EXPLICITLY, never left unset (M0125-0031, 2026-07-30).
+# Until M0125-0005 (`d4071df4`) an unset GOOPG_RELSIZE_FALLBACK meant stage 0, so
+# the 2026-07-30 c1 arm's "(unset)" and an explicit "0" are the same measurement;
+# after the flip an unset variable means stage 2, which would have silently turned
+# c1 into a second c2 and w1 into a second w2. Explicit values keep every arm
+# well-defined across future default changes — the arm is the independent variable, not
+# the default.
 #
 # WHY NOT the ordinary power test (bench/tpch/run_power_test_goopg.sh):
 #
@@ -77,9 +85,9 @@ OUTDIR="${OUTDIR:-${REPO_ROOT}/analysis/tpch-relsize-fallback-$(date +%Y%m%d)}"
 # Arm -> (flag, analyze). An unknown arm must not silently become c1.
 ARM_FLAG=""; ARM_ANALYZE=0
 case "${ARM}" in
-    c1)            ARM_FLAG="";  ARM_ANALYZE=0 ;;
+    c1)            ARM_FLAG="0"; ARM_ANALYZE=0 ;;
     c2)            ARM_FLAG="2"; ARM_ANALYZE=0 ;;
-    w1)            ARM_FLAG="";  ARM_ANALYZE=1 ;;
+    w1)            ARM_FLAG="0"; ARM_ANALYZE=1 ;;
     w2)            ARM_FLAG="2"; ARM_ANALYZE=1 ;;
     probe-analyze) ;;
     *) echo "unknown arm '${ARM}' (want c1|c2|w1|w2|probe-analyze)" >&2; exit 2 ;;

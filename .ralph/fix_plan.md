@@ -212,7 +212,22 @@ started.
 >       see design §-0028a). NEXT SELECTION IS `M0125-0030`** per the (b)
 >       directive, now that -0029 landed (2026-07-30, loop #9). NEXT SELECTION IS
 >       `M0125-0031`** — the warm-stats planning line, now that -0030 landed
->       (2026-07-30, loop #10).** *(Stale
+>       (2026-07-30, loop #10).
+>       **↳ `M0125-0031`'s FIRST MOTION IS DONE (2026-07-30, loop #11,
+>       `analysis/m0125-0031-warm-tpch-20260730.md`): the warm TPC-H sweep at HEAD
+>       INVERTS round 4's sign — stream 494.0 → 420.1 s (−15.0 %), zero of round
+>       4's five regressions reproduce, and its 53× loss Q8 is the largest win
+>       (8.5×). Two by-products bind later loops: §D3's invariant is now MEASURED
+>       (warm + flag-off vs `warm-stats-base` = 22/22 MATCH `structural` AND
+>       `strict-text`, so the relsize fallback is an S-cold-only safety net), and
+>       **this harness's single-run per-query noise band is ~±17 %, not ±4 %** —
+>       identical plans moved 1.17×, so no sub-1.2× per-query ratio on a sub-20 s
+>       query is evidence. Q21 times out in ALL FOUR arms → shape class, filed as
+>       `M0125-0032`. **NEXT SELECTION: the TPC-DS half of -0031 goal (a) — one
+>       full warm SF0.5 gate run (quiet host, ~1 h, four chunks) to read the
+>       warm timeout class against the 13 baseline; if the host is BUSY take
+>       `M0125-0026` instead (host-independent, and it now gains the free warm
+>       arm -0031 promised it).*** *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -3161,6 +3176,46 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Every fix here is a plan-shape commit and inherits the full bar against
       the NEW label: plan-diff `LABEL=warm-stats-base`, timed 22-query TPC-H
       on a quiet host, full SF0.5 gate.
+      **↳ FIRST MOTION DISCHARGED 2026-07-30 (loop #11) —
+      `analysis/m0125-0031-warm-tpch-20260730.md`, design §-0031a.** The warm
+      TPC-H sweep at HEAD ran all four §D5.1 arms on a quiet host (one binary,
+      44 executions, per-query restart): **c1 693.8 → c2 494.0 → w1 413.3 →
+      w2 420.1 s**, i.e. **warm is 1.18× FASTER than S-cold at the shipped
+      default**, rows identical to the c-arms everywhere. **Round 4's trade-off
+      does not exist at HEAD**: none of Q22/Q4/Q2/Q12 regresses and Q8 (its 53×
+      loss) is the largest win at 8.5×; Q5's 22.8× win is gone because M0077
+      already fixed Q5. So (b)'s TPC-H work is optimization, not repair, and it
+      is scoped by measurement to **seven queries = 69 % of the stream**
+      (Q5 60.2, Q9 52.7, Q4 41.9, Q18 37.2, Q15 34.9, Q7 33.3, Q17 30.7) plus
+      Q21. Three findings that bind later loops: **§D3's invariant is MEASURED**
+      (warm + `GOOPG_RELSIZE_FALLBACK=0` vs `warm-stats-base` = 22/22 MATCH in
+      `structural` AND `strict-text` → the relsize line is an S-cold-only safety
+      net, and §D5.1's W-arms + ledger row 594 are discharged); **the harness's
+      single-run per-query noise band is ~±17 %** (identical plans moved 1.17×),
+      so the table's "Q10 1.24× slower" is NOT a regression claim; and **Q21
+      times out in all four arms** → shape class, filed as `M0125-0032`.
+      **STILL OWED by -0031: goal (a) entirely** — the warm SF0.5 gate has not
+      run, so the warm TPC-DS timeout class is unknown against the 13 baseline —
+      **and goal (b)'s actual fixes.** Do not read the TPC-H result as progress
+      on (a).
+
+- [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
+      cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
+      evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4). Q21 exceeds every
+      budget in **all four** §D5.1 arms — S-cold/off 612 s, S-cold/stage-2 672 s,
+      WARM/off 381 s, WARM/stage-2 384 s (300 s cap) — with peak RSS 14.4 GB,
+      i.e. it pins the 15 GB cgroup ceiling. Both cardinality inputs are therefore
+      **ruled out as the fix**: relation sizes alone (c1→c2) and full statistics
+      with MCVs/histograms (c2→w2) each fail to rescue it, which is exactly the
+      split -0031 predicted for shape-class members. It is TPC-H's ONLY member of
+      the timeout class. Next step: capture plain `EXPLAIN` (never `EXPLAIN
+      ANALYZE` — banned for the timeout set) for Q21 at HEAD against PG 18.3 and
+      classify the shape; M0077 already tuned Q21 once via `SourceTableIdx`
+      (0→381 rows), so start from that note and from the RC-8
+      rescan-per-outer-row / NOT EXISTS-over-`lineitem`-self-join suspects.
+      Coordinate the classification with `M0125-0026` — Q21 is the TPC-H
+      instance of the same question its capture asks of the 16 TPC-DS members,
+      and one shared root-cause taxonomy is the point.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

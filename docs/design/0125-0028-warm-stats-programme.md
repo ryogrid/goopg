@@ -319,6 +319,57 @@ because no cardinality input fixes a rescan-per-outer-row shape. Concrete fix
 tasks are filed from evidence (M0125-0032+, shared runway with -0026's
 per-class filings — coordinate the numbering).
 
+### §-0031a Execution record — the first motion is DONE (2026-07-30, loop #11)
+
+Report `analysis/m0125-0031-warm-tpch-20260730.md`; raw data
+`analysis/m0125-0031-warm-tpch-20260730/{w1-a,w1-b,w2-a,w2-b,w2-c}/*.tsv`.
+HEAD `f2a0522a`, engine `b1640d67…` (`diff=` empty), one binary
+`4b3e6cd9bfb4c15b` across all 44 executions, quiet host, per-query restart,
+`scripts/tpch-relsize-arm.sh` arms `w1`/`w2`.
+
+**The re-measurement the directive ordered is in, and it inverts round 4's
+sign.** The 21-query TPC-H stream, all four arms of §D5.1:
+
+| arm | stats | relsize | stream | vs c1 |
+|---|---|---|---:|---:|
+| c1 | S-cold | off | 693.8 s | 1.00× |
+| c2 | S-cold | stage 2 (default) | 494.0 s | 1.40× |
+| w1 | **WARM** | off | **413.3 s** | **1.68×** |
+| w2 | **WARM** | stage 2 (default) | **420.1 s** | **1.65×** |
+
+Warm vs S-cold at the shipped default: **−15.0 % (1.18× faster)**, rows identical
+to the c-arms on every completing query. **None of round 4's five regressions
+reproduces** (Q22 0.99×, Q4 0.96×, Q2 0.62×, Q12 0.97×) and **Q8 — round 4's 53×
+loss — is the sweep's largest win at 8.5×** (66.0 → 7.7 s). Round 4's expected
+win Q5 is neutral, for the reason already on record (M0077 fixed it in the
+interim). **The warm premise costs TPC-H nothing; -0031(b) starts from a better
+baseline than the directive assumed.**
+
+Three by-products, each of which changes how later loops must read evidence:
+
+1. **§D5.1's W-arms are delivered and §D3's invariant is MEASURED.** With the
+   server at `GOOPG_RELSIZE_FALLBACK=0` on the warm cluster, `plan-diff` against
+   `warm-stats-base` is **22/22 MATCH in *both* `structural` and `strict-text`**
+   mode. The fallback is byte-identically inert once relations are ANALYZEd, so
+   M0125-0003/-0005 is confirmed an **S-cold-only safety net** — never a
+   warm-cluster tuning knob. Ledger row 594 ("W1/W2 unconstructible") flips to
+   `resolved`; -0028/-0029 are what made it constructible, exactly as predicted.
+2. **The harness's per-query noise band is ~±17 %, not the ±4 % the c-arm doc
+   assumed.** w1 and w2 are provably the same plans, yet Q6 moved 1.17× and
+   Q10 1.16×. A single-run per-query ratio under ~1.2× on a sub-20 s query is
+   not evidence — which retires the "Q10 is 1.24× slower warm" reading of the
+   table. The large wins in both docs survive the wider band untouched.
+3. **Q21 is TPC-H's shape-class timeout.** It exceeds every budget in **all
+   four** arms (612 / 672 / 381 / 384 s, peak RSS 14.4 GB), so it is independent
+   of *both* cardinality inputs — sizes alone and full statistics each fail to
+   rescue it. This is the predicted split, measured: filed as **M0125-0032**.
+
+Remaining TPC-H time is concentrated — Q5 60.2, Q9 52.7, Q4 41.9, Q18 37.2,
+Q15 34.9, Q7 33.3, Q17 30.7 = **69 % of the stream in seven queries** — so
+-0031(b)'s TPC-H scope is those seven plus Q21. **Still owed by -0031: goal (a),
+the TPC-DS side** (SF0.5 timeout class 13 → 0, whose warm re-measurement has not
+run) and goal (b)'s actual fixes.
+
 ## Relation to the standing M0125 lines
 
 - **M0125-0026 (plan capture)**: unaffected and still owed — its OFF/relsize2

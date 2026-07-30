@@ -50,6 +50,14 @@ runtime configuration. C1 = `GOOPG_RELSIZE_FALLBACK` unset (today's default), C2
 Regressions: 0.** The largest adverse move is Q14 at 1.08× (0.43 s), inside the
 noise band that Q16/Q17/Q19 (1.02–1.04×) establishes for this harness.
 
+> **Noise band superseded (2026-07-30, `analysis/m0125-0031-warm-tpch-20260730.md`
+> §3):** the ±2–4 % band claimed below is too tight. The W-arms measured a
+> **provably identical-plan** pair (22/22 `strict-text` MATCH) whose per-query times
+> still moved up to **1.17×** on sub-20 s queries, so this harness's single-run band
+> is ~±17 % there. Every win and the zero-regression finding below is outside the
+> wider band as well, so the conclusions stand; only the "1.08× is a regression-free
+> noise reading" style of inference does not.
+
 **Row counts are identical on every completing query in both arms** — the fallback
 moved join order, never an answer. (The counts differ from round-5 §6's table
 because the TPC-H cluster was reloaded on 2026-07-27; anchors are load-dependent
