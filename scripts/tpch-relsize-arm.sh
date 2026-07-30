@@ -205,12 +205,13 @@ resolve_target() {
     return 1
 }
 
-# --- probe-analyze: decide the w-arms' fate by measurement ----------------
-# CLAUDE.md records that `ANALYZE <table>` inside database `tpch` errors
-# "relation does not exist" after the bench reorg (ledger bench-reorg
-# ANALYZE-scope), and goopg's stats are per-CONNECTION
-# (goopg_analyze_per_connection_stats). Both would make the w-arms
-# unconstructible rather than merely slow, so probe instead of assuming.
+# --- probe-analyze: verify the warm-stats state by measurement -------------
+# Historical context: `ANALYZE <table>` in database `tpch` used to error
+# 42P01 (fixed by M0125-0028) and stats were believed per-connection and
+# known non-durable (fixed by M0125-0029: pg_statistic + the goopg-private
+# relstats sidecar persist per-DB and reload for every connection). The
+# probe stays because it is the cheap way to re-verify all of that against
+# the REAL bench cluster after any reload/rebuild.
 if [[ "${ARM}" == "probe-analyze" ]]; then
     say "probe-analyze: starting server (no arm flag)"
     start_server || { say "server did not start; see ${SERVER_LOG}"; stop_server; exit 5; }
@@ -234,16 +235,39 @@ fi
 
 if [[ ${ARM_ANALYZE} -eq 1 && "${W_ARM_OK:-0}" != "1" ]]; then
     cat >&2 <<'EOF'
-The w-arms need an ANALYZE that reaches the planner, and two measured facts say
-that is a separate piece of work, not a flag on this script:
-  * `ANALYZE <table>` in database `tpch` errors after the bench reorg
-    (.ralph/deferral_ledger.md, `bench-reorg ANALYZE-scope`), and
-  * goopg's ANALYZE stats are PER-CONNECTION, so they must be issued in the same
-    session as the query — which cmd/tpch-runner cannot do today.
-Run `scripts/tpch-relsize-arm.sh probe-analyze` for the current status, and set
-W_ARM_OK=1 only once cmd/tpch-runner has an -analyze flag.
+W_ARM_OK=1 is required for the w-arms. They are CONSTRUCTIBLE since
+M0125-0028/-0029 (per-DB ANALYZE resolution; stats durable across restarts and
+visible to every connection — this script's own warm-up phase issues the
+one-time per-table ANALYZE), but a w-arm is still a timed multi-query
+measurement on the shared bench cluster: the flag is the explicit opt-in that
+you have a quiet host and mean to spend it. Run
+`scripts/tpch-relsize-arm.sh probe-analyze` first if in doubt.
 EOF
     exit 6
+fi
+
+# --- w-arms: one-time durable ANALYZE warm-up (M0125-0029) -----------------
+# Stats persist across restarts (pg_statistic + the goopg-private relstats
+# sidecar, both per-database) and are visible to every connection, so ONE
+# warm-up pass before the loop suffices — the per-query restarts that
+# isolate each measurement no longer wash the stats out. This replaces the
+# retired plan of teaching cmd/tpch-runner an -analyze flag (same-session
+# ANALYZE), which the durability work made unnecessary.
+if [[ ${ARM_ANALYZE} -eq 1 ]]; then
+    say "w-arm warm-up: one-time durable ANALYZE of the 8 TPC-H tables"
+    start_server || { say "warm-up server did not start; see ${SERVER_LOG}"; stop_server; exit 5; }
+    resolve_target || { say "warm-up: no reachable TPC-H data"; stop_server; exit 5; }
+    for wtbl in lineitem orders partsupp part customer supplier nation region; do
+        PGPASSWORD="${GATE_PASS}" psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${GATE_USER}" -d "${GATE_DB}" \
+            -v ON_ERROR_STOP=1 -c "ANALYZE ${wtbl}" >>"${LOG}" 2>&1 \
+            || { say "warm-up ANALYZE ${wtbl} FAILED"; stop_server; exit 5; }
+    done
+    say "w-arm warm-up: verifying reltuples survived into a fresh session"
+    PGPASSWORD="${GATE_PASS}" psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${GATE_USER}" -d "${GATE_DB}" -tA \
+        -c "select count(*) from pg_class where relname in ('lineitem','orders','partsupp','part','customer','supplier','nation','region') and reltuples > 0" \
+        | grep -qx 8 || { say "warm-up verification FAILED (reltuples not visible)"; stop_server; exit 5; }
+    stop_server
+    say "w-arm warm-up done; stats persist across the per-query restarts"
 fi
 
 # --- the arm ---------------------------------------------------------------

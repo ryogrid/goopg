@@ -3497,6 +3497,22 @@ const (
 	AggregateRelationId uint32 = 2600 // pg_aggregate
 )
 
+// GoopgRelStatsRelationId is the goopg-PRIVATE sidecar heap that persists a
+// relation's ANALYZE-measured size (reltuples/relpages) per database, beside
+// that database's pg_statistic heap (base/<dbOid>/9410 next to
+// base/<dbOid>/2619). PG has no such relation: upstream stores these counts
+// in pg_class, which goopg renders VIRTUALLY from Table.Stats, so the counts
+// had no durable home and every restart forgot them (ledger pq-P6). The
+// M0125-0029 user directive explicitly waives PG-faithfulness for this one
+// persistence: the sidecar has no pg_class row in any database, so a PG
+// standby (which only opens relations it finds in pg_class) never reads it,
+// and the pg_statistic rows it sits beside stay PG18-canonical. The OID is
+// from PG's 8000-9999 development range (unused by released PG18) and sits
+// beside goopg's existing private use of 9400. Layout:
+// executor.GoopgRelStatsColumns; writer: executor.persistStatsToPGStatistic;
+// reader: initdb.loadStatisticsFromHeapForDB.
+const GoopgRelStatsRelationId uint32 = 9410
+
 // FirstUserOID is the first OID handed out for user-created tables.
 // 16384 is upstream's `FirstNormalObjectId` — anything below is
 // reserved for system catalogs.

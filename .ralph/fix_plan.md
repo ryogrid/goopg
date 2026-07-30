@@ -209,8 +209,8 @@ started.
 >       named targets + bare `ANALYZE;` resolve in the connection's database;
 >       probe-analyze flipped (reltuples=5,997,241 in db `tpch`, and the
 >       SECOND session saw it too — -0029's gap-3 mechanism is now doubtful,
->       see design §-0028a). NEXT SELECTION IS `M0125-0029`** per the (b)
->       directive.** *(Stale
+>       see design §-0028a). NEXT SELECTION IS `M0125-0030`** per the (b)
+>       directive, now that -0029 landed (2026-07-30, loop #9).** *(Stale
 >       correction 2026-07-30: an earlier revision of this line said "take
 >       -0003 stage 1 first … still unlanded" — stages 1 AND 2 are landed per
 >       item 1 above; what -0003 still owes is the timed four-arm study and
@@ -3059,7 +3059,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       *relation does not exist* to populated `RowCount` on the bench cluster.
       Engine change: units suite + `scripts/tpch-spotcheck.sh`.
 
-- [ ] **M0125-0029 — statistics survive a restart, for EVERY database, visible
+- [x] **M0125-0029 — statistics survive a restart, for EVERY database, visible
       to EVERY connection** (USER DIRECTIVE 2026-07-30(b), item 1 of 4 — with
       an explicit waiver: this persistence does NOT have to be PG-spec-
       faithful; design `docs/design/0125-0028-warm-stats-programme.md` §-0029).

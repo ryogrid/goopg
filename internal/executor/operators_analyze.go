@@ -212,16 +212,42 @@ func (o *analyzeOp) Close() error { return nil }
 // written per column that has statistics. Existing rows for the same
 // (starelid, staattnum, stainherit) are not deleted first — the heap grows
 // monotonically; startup reads the most recent live tuple. Non-fatal on error.
+//
+// Both heaps route to the CONNECTION's database (tableCatalogHeapDBOid, the
+// same routing pg_class/pg_attribute writes use): pg_statistic is a per-
+// database catalog in PG, and until M0125-0029 this wrote every database's
+// rows into base/<DefaultDBOid>/2619, where the startup reload — which looks
+// relids up in the database it is scanning — could never resolve a per-DB
+// table's OID, so tpch/tpcds stats silently evaporated on restart.
+//
+// The relation's SIZE (reltuples/relpages) additionally lands in the
+// goopg-private per-DB sidecar heap (GoopgRelStatsRelationId): pg_statistic
+// has no slot for it and goopg's pg_class is virtual, so without the sidecar
+// the restored per-column stats rode on a RowCount=0 relation (ledger pq-P6).
+// M0125-0029, under the 2026-07-30(b) directive's PG-faithfulness waiver.
 func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.TableStats) error {
 	if ctx == nil || ctx.Pool == nil || tbl == nil || stats == nil {
 		return nil
 	}
+	dbOid := tableCatalogHeapDBOid(ctx)
 	statRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  dbOid,
 		RelOid: catalog.StatisticRelationId,
 		Fork:   storage.MainFork,
 	}
 	cols := pgStatisticColumnsPG18()
+	// One failing column must not sink the others or the size row below:
+	// a wide-text column's histogram (e.g. TPC-H partsupp.ps_comment,
+	// varchar(199) × up to 101 bounds) builds a pg_statistic tuple larger
+	// than a heap page, and goopg's catalog heap writer does not TOAST, so
+	// PageAddHeapTuple rejects it even on a fresh page. Real PG toasts these
+	// rows (pg_statistic has a toast relation, pg_statistic.h) — deferral-
+	// ledger row, M0125-0029. Measured on the TPC-H bench cluster
+	// 2026-07-30: the early return here left orders/customer/partsupp with
+	// NO trailing-column rows and no size row, while lineitem/part/… — whose
+	// comment histograms fit — persisted fully. Keep the first error for the
+	// caller's (non-fatal) bookkeeping, write everything that fits.
+	var firstErr error
 	for i, cs := range stats.Columns {
 		if i >= len(tbl.Columns) {
 			break
@@ -234,11 +260,41 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 		}
 		attNum := int16(col.Ordinal + 1)
 		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
-		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
-			return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
 		}
 	}
-	return nil
+	relStatsRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: catalog.GoopgRelStatsRelationId,
+		Fork:   storage.MainFork,
+	}
+	sizeRow := Row{
+		NewIntDatum(int64(tbl.OID)),     // starelid
+		NewIntDatum(stats.RowCount),     // rowcount (reltuples)
+		NewIntDatum(int64(stats.Pages)), // pages (relpages)
+	}
+	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
+	}
+	return firstErr
+}
+
+// GoopgRelStatsColumns is the row layout of the goopg-private relation-size
+// sidecar heap (catalog.GoopgRelStatsRelationId — see the constant's comment
+// for why it exists and why it is invisible to a PG standby). Exported for
+// initdb's startup reload, which decodes it with the generic
+// DecodeRowIntoMctxPGTuple exactly like any converted catalog. Append-only,
+// most recent live tuple per starelid wins — the same convention as the
+// pg_statistic writer above. AvgWidth is deliberately not persisted: nothing
+// reads TableStats.AvgWidth today, and a column added here later is a format
+// change to a goopg-private relation, which costs nothing PG-facing.
+func GoopgRelStatsColumns() []catalog.Column {
+	return []catalog.Column{
+		{Name: "starelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "rowcount", Type: catalog.Type{Name: "int8"}},
+		{Name: "pages", Type: catalog.Type{Name: "int8"}},
+	}
 }
 
 // upstreamDefaultStatsTarget mirrors upstream PG's

@@ -1,6 +1,6 @@
 # 0125-0028 — The warm-statistics programme: ANALYZE scope, restart persistence, bench warm-up, and the planning line they unlock
 
-Status: **-0028 LANDED (2026-07-30, execution record in §-0028a); -0029 … -0031 filed**
+Status: **-0028 LANDED (2026-07-30, execution record in §-0028a); -0029 LANDED (2026-07-30, execution record in §-0029a); -0030 … -0031 filed**
 Date: 2026-07-30 (filed by the user's interactive session, per user directive)
 Milestone: M0125
 Tasks: `M0125-0028` (ANALYZE per-DB scope) → `M0125-0029` (stats survive restart,
@@ -157,6 +157,77 @@ is in scope: `ARM_ANALYZE` performs no ANALYZE today (it only gates on
 after this task a documented one-time per-table psql ANALYZE before the run
 suffices, so add that step (or the documented pre-step) and retire the stale
 guard text as part of -0029.
+
+### §-0029a Execution record (2026-07-30)
+
+Three gaps closed end-to-end, each verified by the E2E restart-durability pins:
+
+**Gap 1 — Per-DB routing.** `persistStatsToPGStatistic` now routes both the
+pg_statistic heap and the new goopg-private relstats sidecar to the connection's
+database (`tableCatalogHeapDBOid(ctx)`), not `catalog.DefaultDBOid`. On the
+startup side, `loadStatisticsFromHeap` iterates every database (default → each
+`cat.ListDatabases()` entry) and reloads the heaps into that database's
+namespace — the same per-DB sweep as `loadUserTablesFromHeapForDB`. A distinct-
+dbOid ANALYZE now round-trips a restart without a single column-stat row
+evaporating.
+
+**Gap 2 — The size itself (reltuples/relpages).** A goopg-private sidecar heap
+(`GoopgRelStatsRelationId` = 9410, beside pg_statistic's 2619 in each database's
+base/<dbOid> directory) persists `(starelid, rowcount, pages)` per ANALYZE.
+Write side: `persistStatsToPGStatistic` appends one size row alongside the
+per-column pg_statistic rows; `GoopgRelStatsColumns()` defines the three-column
+layout. Read side: `loadStatisticsFromHeapForDB` scans the sidecar with
+`scanCatalogHeapRows` + `DecodeRowIntoMctxPGTuple`, fills `relSize{rowCount,
+pages}` into a map, and attaches the counts to the restored `TableStats`. Both
+heaps use the same append-only, last-live-tuple-wins convention. A sidecar size
+row without pg_statistic rows (every column at SET STATISTICS 0) still restores
+— the sidecar's relids join the `byRelid` key set so the apply loop reaches
+them. AvgWidth is deliberately not persisted (nothing reads it today).
+
+**Per-column resilience.** A wide-text column's histogram (e.g. TPC-H
+partsupp.ps_comment, varchar(199) × up to 101 bounds) produces a pg_statistic
+tuple larger than a heap page, and goopg's catalog heap writer has no TOAST
+support. Before this change, the first such oversized tuple aborted the entire
+`persistStatsToPGStatistic` call with a hard error — so `orders`, `customer`,
+and `partsupp` (whose comment histograms exceed 8192 bytes) had zero
+pg_statistic rows AND no size sidecar row. Now each column's write failure is
+recorded (the first error is kept for the caller's non-fatal bookkeeping) but
+does not prevent the remaining columns or the sidecar size row from being
+written. The TOAST gap itself is a ledger row (M0125-0029, see ledger).
+
+**Gap 3 — Cross-connection visibility.** The 2026-07-23 "per-connection stats"
+symptom did NOT reproduce once per-DB resolution was in place, consistent with
+`SetTableStats` mutating the shared live `catalog.Table` pointer. The restart-
+durability test (`TestAnalyzeStatsSurviveRestartPerDatabase`) additionally
+verifies a second, separately dialed connection reads the restored stats,
+closing the concern from both angles.
+
+**`tpch-relsize-arm.sh` w-arm warm-up.** The script now performs its own one-time
+durable ANALYZE of all 8 TPC-H tables when `ARM_ANALYZE=1`, eliminating the
+retired need for a `cmd/tpch-runner -analyze` flag. The warm-up step verifies
+reltuples > 0 in a fresh post-warm-up session, then stops — the stats persist
+across the per-query restarts that isolate each measurement. The stale guard
+text that claimed the w-arms were "unconstructible" is retired.
+
+**Verification.** Two E2E restart-durability pins in
+`internal/server/stats_dbid_restart_test.go`:
+`TestAnalyzeStatsSurviveRestartPerDatabase` (CREATE DATABASE → ANALYZE →
+restart → NEW connection reads reltuples/relpages > 0 AND plans identically to
+the pre-restart session, then a SECOND connection sees the same reltuples) and
+`TestAnalyzeStatsSurviveRestartDefaultDatabase` (same round-trip for the default
+`postgres` database). Both PASS; units precommit suite PASS. TPC-H spotcheck
+PASS (Q12=2/Q13=35).
+
+**Deferred (ledger 2026-07-30, one new row):** 
+
+- **TOAST gap for pg_statistic.** Wide histogram tuples (varchar(199) × 101
+  bounds) exceed a heap page; goopg's catalog heap writer has no TOAST, so they
+  are lost silently (first error is captured). Real PG has
+  `pg_statistic.h` (toast relation for 2619). Until goopg implements TOAST for
+  catalog heaps, `partsupp`, `orders`, and `customer` on the TPC-H bench cluster
+  have column statistics for their early (narrow) columns only — the comment
+  histograms that don't fit are absent, and the non-fatal skip means no error
+  reaches the operator.
 
 ### M0125-0030 — bench clusters get warm statistics + CHECKPOINT, at build time and once now
 

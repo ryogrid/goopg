@@ -3476,14 +3476,55 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	return nil
 }
 
-// loadStatisticsFromHeap restores per-column planner statistics from the
-// pg_statistic heap table (OID 2619). Called during startup after user tables
-// are loaded (M0112). Non-fatal: a missing or corrupt pg_statistic file is
-// silently ignored; the planner falls back to hard-coded defaults until the
-// next ANALYZE run.
+// loadStatisticsFromHeap restores planner statistics for EVERY database:
+// first the shared default namespace from base/<DefaultDBOid>, then each
+// distinct-dbOid database's own base/<dbOid>/2619 +
+// base/<dbOid>/9410 pair reloads into that database's namespace — the same
+// per-DB sweep (and the same skip set) as the loadUserTablesFromHeapForDB
+// loop in Open, which MUST have run first so the relids resolve. Before
+// M0125-0029 only the main pass existed, and since the writer also routes
+// per-DB now (persistStatsToPGStatistic), a tpch/tpcds ANALYZE would have
+// been written to a heap no reload pass ever scanned.
 func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// The main pass reads base/<DefaultDBOid>, NOT base/<cat.DBOID()>: the
+	// writer routes a default-namespace connection's stats to DefaultDBOid
+	// (tableCatalogHeapDBOid), while cat.DBOID() detects as 5 ("postgres")
+	// on any data dir whose pg_database heap lists that database — i.e. on
+	// every modern dir. pg_class survives that split only because DDL
+	// mirrors its pages to base/5 (mirrorTouchedCatalogsToPostgresDB);
+	// pg_statistic was never mirrored, so reading cat.DBOID() here meant
+	// the default database's stats reload has been DEAD in practice since
+	// M0112 — measured by TestAnalyzeStatsSurviveRestartDefaultDatabase,
+	// which fails in exactly this direction with cat.DBOID() restored.
+	// M0125-0029.
+	if err := loadStatisticsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadStatisticsFromHeapForDB(mgr, cat, clog, dbOid, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadStatisticsFromHeapForDB restores one database's per-column planner
+// statistics from its pg_statistic heap (OID 2619) and the relation sizes
+// (RowCount/Pages) from the goopg-private sidecar heap beside it
+// (catalog.GoopgRelStatsRelationId — see that constant for the mechanism
+// decision and the PG-faithfulness waiver). Called during startup after user
+// tables are loaded (M0112 / M0125-0029). Non-fatal: a missing or corrupt
+// file is silently ignored; the planner falls back to hard-coded defaults
+// until the next ANALYZE run. heapDBOid picks the base/<dbOid> directory,
+// nsDBOid the catalog namespace the relids resolve in.
+func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
 	statRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
+		DBOid:  heapDBOid,
 		RelOid: catalog.StatisticRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -3532,18 +3573,56 @@ func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		}
 	}
 
-	if len(statMap) == 0 {
+	// Relation sizes from the goopg-private sidecar heap beside pg_statistic
+	// (M0125-0029). Same last-live-tuple-wins convention: scanCatalogHeapRows
+	// yields block/slot ascending order, so overwriting the map entry keeps
+	// the most recent ANALYZE's counts.
+	type relSize struct {
+		rowCount int64
+		pages    int64
+	}
+	sizeMap := make(map[uint32]relSize)
+	relStatsRel := storage.RelFileNode{
+		DBOid:  heapDBOid,
+		RelOid: catalog.GoopgRelStatsRelationId,
+		Fork:   storage.MainFork,
+	}
+	relStatsCols := executor.GoopgRelStatsColumns()
+	sizeRows, _ := scanCatalogHeapRows(mgr, relStatsRel, clog, "goopg_relstats",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(relStatsCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, relStatsCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return [3]int64{decoded[0].Int, decoded[1].Int, decoded[2].Int}, false, nil
+		})
+	for _, r := range sizeRows {
+		v := r.([3]int64)
+		if v[0] >= int64(catalog.FirstUserOID) {
+			sizeMap[uint32(v[0])] = relSize{rowCount: v[1], pages: v[2]}
+		}
+	}
+
+	if len(statMap) == 0 && len(sizeMap) == 0 {
 		return nil
 	}
 
-	// Group rows by table OID and apply stats to the in-memory catalog.
+	// Group rows by table OID and apply stats to the in-memory catalog. A
+	// sidecar size row without any pg_statistic rows (every column at SET
+	// STATISTICS 0) must still restore, so the sidecar's relids join the set.
 	byRelid := make(map[uint32][]catalog.PGStatisticRow)
 	for _, row := range statMap {
 		byRelid[row.StaRelid] = append(byRelid[row.StaRelid], row)
 	}
+	for relid := range sizeMap {
+		if _, ok := byRelid[relid]; !ok {
+			byRelid[relid] = nil
+		}
+	}
 
 	for relid, rows := range byRelid {
-		tbl, ok := cat.LookupTableByOID(relid)
+		tbl, ok := cat.LookupTableByOID(relid, nsDBOid)
 		if !ok {
 			continue
 		}
@@ -3598,13 +3677,18 @@ func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			}
 			colStats[idx] = cs
 		}
-		// Analyzed is true even though RowCount/Pages stay zero: the
-		// presence of pg_statistic rows proves an ANALYZE ran, and only
-		// the per-column slots are persisted (ledger row pq-P6). Without
-		// this the planner's relation-size fallback would read an
-		// analyzed-then-restarted relation as "never analyzed" and apply
-		// upstream's 10-page floor to it. M0125-0003.
+		// Analyzed is true regardless of whether a sidecar size row exists:
+		// the presence of pg_statistic rows proves an ANALYZE ran. A heap
+		// written before M0125-0029 (or by a real PG) has no sidecar, so
+		// RowCount/Pages fall back to zero there — the pre--0029 behaviour
+		// (ledger row pq-P6). Without Analyzed the planner's relation-size
+		// fallback would read an analyzed-then-restarted relation as "never
+		// analyzed" and apply upstream's 10-page floor to it. M0125-0003.
 		stats := &catalog.TableStats{Columns: colStats, Analyzed: true}
+		if sz, ok := sizeMap[relid]; ok {
+			stats.RowCount = sz.rowCount
+			stats.Pages = int(sz.pages)
+		}
 		cat.SetTableStats(tbl, stats)
 	}
 	return nil
