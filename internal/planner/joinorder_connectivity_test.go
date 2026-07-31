@@ -41,6 +41,7 @@ func tpcdsConnCatalog(t *testing.T) catalog.Catalog {
 	mk("date_dim", 73049, "d_date_sk", "d_year")
 	mk("store_sales", 2880404, "ss_sold_date_sk", "ss_customer_sk", "ss_item_sk")
 	mk("item", 18000, "i_item_sk", "i_color")
+	mk("store", 12, "s_store_sk", "s_store_name")
 	return c
 }
 
@@ -174,22 +175,84 @@ func TestConnectivityOrderInertWhenAlreadyConnected(t *testing.T) {
 	}
 }
 
-// TestConnectivityOrderDeclinesDerivedTable pins the LATERAL bound.
-// The parser accepts LATERAL and discards it, so a derived table in
-// the FROM list may or may not reference an earlier item and nothing
-// in the AST says which. Permuting one could change what the query
-// means, so the pass declines the whole list — which is why TPC-DS
-// Q65, whose two inputs are derived aggregates rather than WITH
-// references, keeps its cross. Deferral ledger, M0125-0034.
-func TestConnectivityOrderDeclinesDerivedTable(t *testing.T) {
+// TestConnectivityOrderAdmitsNonLateralDerivedTable is the Q65 arm's
+// core claim: with laterality recorded in the AST, a derived table
+// WITHOUT the keyword provably cannot reference a sibling FROM item
+// (PG rejects the unmarked form with "invalid reference to FROM-clause
+// entry"), so permuting it is as safe as permuting a WITH reference.
+// The source order crosses customer_address with item before either
+// meets sc, the derived table both predicates reach.
+func TestConnectivityOrderAdmitsNonLateralDerivedTable(t *testing.T) {
 	c := tpcdsConnCatalog(t)
 	sql := `select 1 from customer_address, item,
 	             (select ss_store_sk, ss_item_sk from store_sales) sc
 	         where i_item_sk = sc.ss_item_sk
 	           and ca_address_sk = sc.ss_store_sk`
 	stmt := parseOne(t, sql).(*parser.SelectStmt)
+	_, newFR, rewrote := reorderCommaFromByCardinality(stmt, c)
+	if !rewrote {
+		t.Fatalf("expected the non-lateral derived-table list to be reordered")
+	}
+	assertOrder(t, fromNames(t, newFR), []string{"customer_address", "sc", "item"})
+}
+
+// TestConnectivityOrderQ65Shape is TPC-DS Q65's outer query: two
+// derived aggregates, `sb` and `sc`, joined to `store` and `item`.
+// The source order joins store × item first — no predicate connects
+// them — and that cross is what kept Q65 in the SF0.5 timeout class
+// after the WITH-reference arm landed. Every edge to `sc` is found
+// through its alias while `s_store_sk` / `i_item_sk` resolve as bare
+// catalog columns, the mixed form the query actually uses.
+func TestConnectivityOrderQ65Shape(t *testing.T) {
+	c := tpcdsConnCatalog(t)
+	sql := `select 1 from store, item,
+	             (select ss_store_sk, avg(ss_item_sk) as ave
+	                from store_sales group by ss_store_sk) sb,
+	             (select ss_store_sk, ss_item_sk, ss_sold_date_sk
+	                from store_sales) sc
+	         where sb.ss_store_sk = sc.ss_store_sk
+	           and s_store_sk = sc.ss_store_sk
+	           and i_item_sk = sc.ss_item_sk`
+	stmt := parseOne(t, sql).(*parser.SelectStmt)
+	_, newFR, rewrote := reorderCommaFromByCardinality(stmt, c)
+	if !rewrote {
+		t.Fatalf("expected the Q65-shape list to be reordered")
+	}
+	got := fromNames(t, newFR)
+	assertOrder(t, got, []string{"store", "sc", "item", "sb"})
+	assertNoAvoidableCross(t, stmt, c, newFR)
+}
+
+// TestConnectivityOrderDeclinesLateralDerivedTable pins the bound that
+// replaced the blanket decline: when the keyword IS written, the
+// derived table may reference an earlier FROM item, so moving it — or
+// anything around it — could change what the query means, and the
+// whole list declines. This is also the end-to-end pin that the parser
+// records the keyword rather than discarding it.
+func TestConnectivityOrderDeclinesLateralDerivedTable(t *testing.T) {
+	c := tpcdsConnCatalog(t)
+	sql := `select 1 from customer_address, item,
+	             lateral (select ss_store_sk, ss_item_sk from store_sales
+	                       where ss_item_sk = i_item_sk) sc
+	         where i_item_sk = sc.ss_item_sk
+	           and ca_address_sk = sc.ss_store_sk`
+	stmt := parseOne(t, sql).(*parser.SelectStmt)
 	if _, _, rewrote := reorderCommaFromByCardinality(stmt, c); rewrote {
-		t.Fatalf("a derived table may be LATERAL; the list must not be reordered")
+		t.Fatalf("a LATERAL derived table references an earlier item; the list must not be reordered")
+	}
+}
+
+// TestConnectivityOrderDeclinesTableFunc: a function in FROM may
+// reference earlier FROM items even without the LATERAL keyword (in PG
+// the keyword is noise before a function item), so no AST flag can
+// prove one independent and the pass must decline the whole list.
+func TestConnectivityOrderDeclinesTableFunc(t *testing.T) {
+	c := tpcdsConnCatalog(t)
+	sql := `select 1 from customer, generate_series(1, 2) g, customer_address
+	         where ca_address_sk = c_current_addr_sk`
+	stmt := parseOne(t, sql).(*parser.SelectStmt)
+	if _, _, rewrote := reorderCommaFromByCardinality(stmt, c); rewrote {
+		t.Fatalf("a table function may reference an earlier item; the list must not be reordered")
 	}
 }
 

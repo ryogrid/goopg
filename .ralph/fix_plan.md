@@ -468,9 +468,19 @@ started.
 >       blind key, so `count(d1.y)` and `count(d2.y)` dedup onto one aggregate
 >       slot (measured — both targets resolve to agg slot 0). That one is NOT
 >       gate-reachable (no SF0.5 query aggregates two aliases of one table), so
->       it ranks below the gate-visible items. **NEXT SELECTION: `-0034`'s Q65
+>       it ranks below the gate-visible items. ~~**NEXT SELECTION: `-0034`'s Q65
 >       remainder / `-0035`'s CTE-body arm, then `M0125-0045`, then
->       `M0125-0038` last.**
+>       `M0125-0038` last.**~~
+>       **↳ `-0034`'s Q65 REMAINDER LANDED 2026-07-31 (loop #17) and M0125-0034
+>       IS CLOSED.** Laterality is now recorded on `parser.RangeVar` and
+>       non-lateral derived tables enter connectivity-mode reordering; **Q65
+>       TIMEOUT → PASS 17 s, 100 rows = oracle**; full SF0.5 gate PASS=93
+>       MISMATCH=0, exactly 2/99 cells moved (the other is Q72's 309→314 s
+>       cap-straddle, unreachable by the pass — all-`JOIN…ON`); plan-diff
+>       22/22 MATCH. The gate-visible timeout class is down to **Q78 alone**,
+>       which is `-0035`'s CTE-body arm (single-reference CTE inlining +
+>       EC constant propagation). **NEXT SELECTION: `-0035`'s CTE-body arm,
+>       then `M0125-0045`, then `M0125-0038` last.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3699,7 +3709,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
      and the three plan arms beside it. Selection order is proposed in that
      README §"Step 4" and mirrored in the Current Priority banner. -->
 
-- [ ] **M0125-0034 — C1: goopg emits a Cartesian product whenever a join input
+- [x] **M0125-0034 — C1: goopg emits a Cartesian product whenever a join input
       is a subquery** (filed 2026-07-31 by M0125-0026; evidence
       `analysis/m0125-0026-timeout-plans/README.md` §"The dominant mechanism").
       `Nested Loop (CROSS)` (`planner.JoinTypeCross`) appears **14 times across
@@ -3826,13 +3836,39 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **byte-identical** wrong output. Three `date_dim` aliases collapse to one
       in projection resolution; filed as **`M0125-0044`**, a silent wrong
       answer, which this banner ranks above a timeout.
-      **THIS ITEM STAYS OPEN for Q65 only.** Its inputs are derived aggregates,
+      ~~**THIS ITEM STAYS OPEN for Q65 only.** Its inputs are derived aggregates,
       not WITH references, and the parser accepts `LATERAL` and discards it
       (`internal/parser/select.go`), so nothing in the AST can prove a derived
       table uncorrelated and the pass must decline the whole list. Resume point:
       record laterality on `parser.RangeVar`, then admit non-lateral derived
       tables as opaque relations exactly as WITH references are. Ledger row
-      2026-07-31.
+      2026-07-31.~~
+      **↳ THE Q65 ARM LANDED 2026-07-31 (loop #17) — ITEM CLOSED.** Design
+      `docs/design/0125-0034a-comma-from-connectivity-order.md` §7; tests
+      `internal/planner/joinorder_connectivity_test.go` (now 12, four new);
+      gate artefacts `analysis/m0125-0034c/gate/`. The resume point above was
+      followed exactly: `parser.RangeVar.Lateral` is set at BOTH accept sites
+      (`parseRangeVar` and the `JOIN LATERAL` path, which consumes the keyword
+      before `parseRangeVar` can see it), and the blanket `rv.Subquery != nil`
+      decline splits three ways — table functions still decline the whole list
+      (in PG the LATERAL keyword is *noise* before a function item, so its
+      absence proves nothing), `Lateral` derived tables decline, and a
+      non-lateral derived table is admitted as an opaque relation forcing
+      connectivity mode (PG rejects unmarked sibling references with "invalid
+      reference to FROM-clause entry", so the unmarked form is provably
+      independent — the same standing as a WITH reference). **Measured: Q65
+      TIMEOUT → PASS 17 s S-cold, 100 rows = the oracle.** Full 99-query SF0.5
+      gate, one binary, three chunks: **PASS=93 MISMATCH=0 CKMISMATCH=0
+      ERROR=0 TIMEOUT=2 SKIP=4**; cell-by-cell vs loop #16, **exactly 2 of 99
+      cells moved** — Q65's rescue, and Q72 PASS 309 s → TIMEOUT 314 s, which
+      is NOT this change *by construction* (Q72 is all `JOIN … ON`, declined at
+      the `fe.Joins` guard before this loop's code runs; it is the documented
+      cap-straddler at 307/309/314 s across three loops). Timeout class is now
+      **Q78** (-0035's CTE-body arm) + the Q72 straddle. TPC-H: spotcheck PASS
+      (Q12=2 Q13=35), plan-diff vs `m0125-0044-after` **22/22 MATCH**. Two
+      ledger motions: the Q65 row flipped to `resolved`; a new row records
+      that LATERAL *evaluation* (per-outer-row correlated rescan) remains
+      unimplemented — only the join-order pass reads the new flag.
 
 - [ ] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
       never to the base scan, and never pushed into a producing subquery**

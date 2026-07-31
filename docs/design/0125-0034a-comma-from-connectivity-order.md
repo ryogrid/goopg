@@ -1,6 +1,6 @@
 # M0125-0034a — a comma-FROM list with a WITH reference gets ordered for connectivity, not cardinality
 
-Status: landed 2026-07-31 (branch `tpcds-fix2`)
+Status: landed 2026-07-31 (branch `tpcds-fix2`); Q65 arm (§7) landed the same day, loop #17
 Task: `M0125-0034`, class C1's WITH-reference / derived-aggregate arm
 Evidence: `analysis/m0125-0034b/`
 Related: `docs/design/0125-0034-setop-join-promotion.md` (C1's set-operation arm),
@@ -139,7 +139,7 @@ to a sibling FROM item.
 
 **This is why Q65 keeps its crosses**: its two inputs are derived aggregates,
 not WITH references. Recording laterality in the AST is the resume point;
-deferral ledger, 2026-07-31.
+deferral ledger, 2026-07-31. **Discharged the same day — §7.**
 
 ### 3.4 One implementation trap, recorded because it is easy to repeat
 
@@ -221,10 +221,61 @@ instead of being hidden behind a 1848-second one.
 
 ## 6. What this does not do
 
-- Q65 keeps its crosses (§3.3, LATERAL bound).
+- ~~Q65 keeps its crosses (§3.3, LATERAL bound).~~ Closed by §7.
 - `tryBushyDP`'s leaf whitelist and its `> 12` relation limit are untouched.
   Nothing above chose *which* connected order is cheapest; for an 18-relation
   list PG would run GEQO here. `M0125-0038`.
 - Connectivity mode does not consult cost, so it cannot trade an avoidable
   cross against anything. On the evidence it never had to: 95 of 99 cells did
   not move.
+
+## 7. The Q65 arm (loop #17): laterality recorded, non-lateral derived tables admitted
+
+§3.3's bound was never about derived tables — it was about *not knowing*. A
+non-lateral derived table provably cannot reference a sibling FROM item (PG
+rejects the unmarked form with "invalid reference to FROM-clause entry",
+`parse_relation.c::errorMissingRTE`), so permuting one is exactly as safe as
+permuting a WITH reference. What made the pass decline was that goopg's parser
+consumed `LATERAL` and threw it away, leaving nothing in the AST to tell the
+two cases apart.
+
+Two changes, one per layer:
+
+- **Parser** (`parser.RangeVar.Lateral`, `select.go`): both `LATERAL` accept
+  sites — `parseRangeVar` for comma-FROM items and the `JOIN LATERAL` path,
+  which consumes the keyword *before* `parseRangeVar` can see it — now record
+  the keyword on the RangeVar. Evaluation is unchanged: goopg still runs a
+  lateral subquery as an ordinary derived table (deferral ledger — true
+  LATERAL evaluation remains unimplemented).
+- **Planner** (`joinorder.go`): the blanket `rv.Subquery != nil` decline is
+  split three ways. A table function still declines the whole list — in PG the
+  `LATERAL` keyword is *noise* before a function item ("LATERAL can also
+  precede a function-call FROM item, but in this case it is a noise word",
+  `official_docs_in_md` SELECT), so absence of the keyword proves nothing. A
+  `Lateral` derived table declines the whole list, as before in effect. A
+  non-lateral derived table is admitted and, having no catalog entry and no
+  possible row count, forces connectivity mode — the same standing as a WITH
+  reference. Its join edges are found through its alias (`relKeys`); it
+  contributes no bare-column entries.
+
+Q65's outer FROM is `store, item, (derived agg) sb, (derived agg) sc` with
+every predicate reaching `sc`: the source order crosses `store × item` first.
+The walk yields `store, sc, item, sb` — cross-free.
+`TestConnectivityOrderQ65Shape` pins the shape;
+`…AdmitsNonLateralDerivedTable`, `…DeclinesLateralDerivedTable` (also the
+end-to-end pin that the parser records the keyword) and `…DeclinesTableFunc`
+pin the boundary.
+
+Measured (full 99-query SF0.5 gate, one binary, three chunks,
+`analysis/m0125-0034c/gate/`): **PASS=93 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=2 SKIP=4**. Cell-by-cell against loop #16's capture: **exactly 2 of 99
+cells moved** — `Q65 TIMEOUT → PASS 17 s, 100 rows = the oracle` (this change;
+14.8 s on the warm probe), and `Q72 PASS 309 s → TIMEOUT 314 s`, which is
+**not this change by construction**: Q72 is entirely explicit `JOIN … ON`, so
+the pass declines at the `fe.Joins` guard before any of this loop's code runs;
+it is the documented cap-straddler oscillating around the 300 s cap
+(307/309/314 s across three loops). The timeout class is now **Q78** (-0035's
+CTE-body arm) plus the Q72 straddle. TPC-H: `tpch-spotcheck.sh` PASS
+(Q12=2 Q13=35), plan-diff vs `m0125-0044-after` **22/22 MATCH** — the TPC-H
+query set has no derived table in any ≥3-item comma FROM list, so inertness
+held empirically as well as by construction.

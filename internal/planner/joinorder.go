@@ -37,7 +37,9 @@
 //
 // Preconditions for applying the rewrite:
 //   - All tables in FROM have catalog statistics (ANALYZE has run).
-//   - Pure comma-FROM (no `JOIN ... ON` clauses, no derived tables).
+//   - Pure comma-FROM (no `JOIN ... ON` clauses, no table functions,
+//     no LATERAL derived tables; a non-lateral derived table is
+//     admitted and forces connectivity mode, like a WITH reference).
 //   - len(FROM) >= 3 (nothing to reorder for two-way joins; the
 //     hash-join-build-side selector already handles the binary case).
 //
@@ -58,9 +60,11 @@
 //
 // A missing row count blocks ranking connected orders; it does not
 // block telling a connected order from a disconnected one. So when the
-// list holds a WITH reference the pass switches objective — from "join
-// small relations first" to "never emit an avoidable cross" — and
-// breaks ties on source order. See orderByConnectivity and
+// list holds a WITH reference — or, since the Q65 arm, a non-lateral
+// derived table, which has the same standing (real join edges, no
+// possible row count) — the pass switches objective, from "join small
+// relations first" to "never emit an avoidable cross", and breaks ties
+// on source order. See orderByConnectivity and
 // docs/design/0125-0034a-comma-from-connectivity-order.md.
 package planner
 
@@ -101,16 +105,21 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 			return s.FromExprs, s.From, false
 		}
 		rv := fe.Base
-		// A derived table or a table function may be LATERAL, and
-		// nothing in the AST says whether it is: the parser accepts
-		// the keyword and throws it away (parser/select.go, "goopg
-		// treats it as a regular derived table"). A LATERAL item
-		// references an earlier FROM item, so moving it ahead of that
-		// item would change what the query means. Until the AST
-		// records laterality the whole reorder declines here. This is
-		// what leaves M0125-0034's Q65 (two derived aggregates) with
-		// its crosses — see the deferral ledger.
-		if rv.Subquery != nil || rv.TableFunc != nil {
+		// A table function in FROM may reference an earlier FROM item
+		// even WITHOUT the LATERAL keyword — in PG the keyword is
+		// noise before a function item — so no AST flag can prove one
+		// independent and the whole reorder declines.
+		if rv.TableFunc != nil {
+			return s.FromExprs, s.From, false
+		}
+		// A LATERAL derived table references an earlier FROM item, so
+		// moving it ahead of that item would change what the query
+		// means. The parser records the keyword on the RangeVar
+		// (M0125-0034's Q65 arm). A derived table WITHOUT it cannot
+		// see its siblings — PG rejects the unmarked form with
+		// "invalid reference to FROM-clause entry" — so it is admitted
+		// and sized (or not) below like any other relation.
+		if rv.Lateral {
 			return s.FromExprs, s.From, false
 		}
 		rels[i] = rv
@@ -118,13 +127,14 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 	// Size what can be sized, and record *why* an item could not be.
 	// The two reasons are not interchangeable:
 	//
-	//   unknown   — the catalog has no such relation, so this is a
-	//               WITH reference. It is a real relation with real
-	//               join edges; only its cardinality is unavailable
-	//               at parser level, and no ANALYZE will ever supply
-	//               one. Cardinality ordering is impossible *by
-	//               construction*, so the list runs in connectivity
-	//               mode below.
+	//   unknown   — the item is a WITH reference (the catalog has no
+	//               such relation) or a non-lateral derived table
+	//               (TPC-DS Q65's two aggregate inputs). Either is a
+	//               real relation with real join edges; only its
+	//               cardinality is unavailable at parser level, and
+	//               no ANALYZE will ever supply one. Cardinality
+	//               ordering is impossible *by construction*, so the
+	//               list runs in connectivity mode below.
 	//   unstatted — a base table that simply has not been ANALYZEd.
 	//               Here the cardinality signal is merely missing,
 	//               and the pass declines exactly as it always has.
@@ -132,6 +142,12 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 	tables := make([]*catalog.Table, len(rels))
 	unknown := false
 	for i, rv := range rels {
+		if rv.Subquery != nil {
+			// Non-lateral derived table: never in the catalog, and
+			// rv.Name is empty, so don't let the lookup below decide.
+			unknown = true
+			continue
+		}
 		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 		if !ok || tbl == nil {
 			unknown = true
@@ -227,7 +243,8 @@ func orderByCardinality(edges []map[int]struct{}, rowCounts []int64) []int {
 // Cartesian product that the join graph could have avoided.
 //
 // It deliberately makes no claim about *which* connected order is
-// cheapest. It runs only when the list holds a WITH reference, i.e.
+// cheapest. It runs only when the list holds a WITH reference or a
+// non-lateral derived table, i.e.
 // when at least one relation has no parser-level row count, so a cost
 // ranking would be inventing a number rather than reading one. Ties
 // therefore break on source order: the seed is the first FROM item and

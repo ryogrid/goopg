@@ -1,50 +1,42 @@
-Task: **M0125-0034's join-order arm** — LANDED and committed. The item stays
-UNCHECKED for Q65 only (derived tables; needs a parser change first).
+(idle — nothing in flight)
+
+M0125-0034's Q65 arm landed loop #17 (2026-07-31) — **M0125-0034 IS CLOSED**.
+Committed on `tpcds-fix2` (see git log for the loop-#17 commit), pushed.
 
 **Next loop: read the `## Current Priority` banner FIRST.** It now names
-**`M0125-0044`** as the next selection, on this milestone's own "a silent wrong
-answer outranks a timeout on severity" rule. Then `-0034`'s Q65 remainder /
-`-0035`'s CTE-body arm, then `M0125-0038` last.
+`-0035`'s CTE-body arm as the next selection (single-reference CTE inlining,
+PG `subselect.c::inline_cte`, + equivalence-class constant propagation
+`equivclass.c`; Q31's 6×-referenced `ws3` is the must-NOT-inline control),
+then `M0125-0045`, then `M0125-0038` last.
 
-Files: `internal/planner/joinorder.go` (connectivity mode);
-`internal/planner/joinorder_connectivity_test.go` (8 tests, new);
-`docs/design/0125-0034a-comma-from-connectivity-order.md` + README row;
-`analysis/m0125-0034b/` (gate + probes).
-Key symbols: `reorderCommaFromByCardinality`, `orderByConnectivity`,
-`orderByCardinality`, `firstUnused`.
+Findings worth not re-deriving (all in
+`docs/design/0125-0034a-comma-from-connectivity-order.md` §7):
+- `parser.RangeVar.Lateral` now exists. It is set at BOTH accept sites in
+  `internal/parser/select.go` — `parseRangeVar` AND the `JOIN LATERAL` path,
+  which consumes the keyword before `parseRangeVar` can see it. Only the
+  join-order pass reads it; LATERAL *evaluation* is still uncorrelated
+  (ledger row 2026-07-31).
+- `reorderCommaFromByCardinality`: table functions decline the whole list
+  (PG treats LATERAL as noise before a function item — absence proves
+  nothing); `Lateral` derived tables decline; non-lateral derived tables are
+  opaque relations → connectivity mode, same standing as WITH references.
+- Q72 straddles the 300 s cap (307/309/314 s over three loops) and flips
+  status noise-wise between sweeps; it is all-`JOIN…ON`, unreachable by the
+  comma-FROM pass — do not chase it as a regression.
+- SF0.5 timeout class is now Q78 (+ the Q72 straddle). Q78 = -0035 CTE-body.
+- Plan-diff baseline: use `m0125-0044-after` with `PLAN_DB=tpch
+  PLAN_USER=tpch` (needs the 65433 TPC-H server up: `bench/tpch/setup_goopg.sh`).
 
-Findings — do NOT re-derive:
-- **Both** join-order passes declined on any comma-FROM list holding a WITH
-  reference, neither of them deciding anything: `tryBushyDP` on its leaf
-  whitelist (`*SeqScan`/`*IndexScan`/`*MultiHashJoin`; `buildBindingsPosMap`
-  keys on scan identity) plus `len(tables) > 12`, and the comma-FROM greedy on
-  "not a base table with `Stats.RowCount`". Same shape as -0041.
-- Fix is at the **parser level** (permutes before column resolution → no
-  `ColumnRef.Index` remapping), which is why it costs none of the posmap risk.
-  Connectivity mode is a **fixed point on any cross-free source order**, so it
-  fires iff the source order has an avoidable cross.
-- **On the S-cold SF0.5 cluster, cardinality mode never fires at all** (goopg
-  drops `TableStats.RowCount` on restart), so every reorder measured is
-  connectivity mode.
-- Trap already paid for: `tables[]` feeds `buildBareColumnIndex`, which needs
-  **columns**, not `Stats` — gating it on stats silently empties the
-  bare-column map and kills every edge.
-- **`M0125-0044` is NEW and is the next selection**: three `date_dim` aliases
-  collapse to one in projection resolution (Q64 answers 0 vs oracle 2). Proven
-  pre-existing by a byte-identical A/B (arm A fires the pass, arm B declines);
-  reduced to 6 relations in `analysis/m0125-0034b/alias_a.sql`. Q64 does NOT
-  complete at HEAD in 1848 s — that is why it was invisible.
-- Q72's TIMEOUT → PASS (309 s) is NOT this change: Q72 has no `WITH`.
-- TPC-H inert **by construction** — the TPC-H query set has no `WITH … AS (`.
-
-Gates run this loop (all PASS): `go build ./...`; `go vet ./internal/planner/`;
-`go test ./internal/planner/... ./internal/executor/`;
+Gates run this loop (all PASS): `go build ./...`; `go vet
+./internal/planner/ ./internal/parser/`; `go test ./internal/planner/...
+./internal/executor/ ./internal/parser/`; full 99-query TPC-DS SF0.5 gate,
+one binary, 3 chunks (`analysis/m0125-0034c/gate/`) — PASS=93 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=2 (Q72 straddle, Q78) SKIP=4, exactly 2/99
+cells moved vs loop #16; `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2
+Q13=35, 40.5 s); `make plan-diff LABEL=m0125-0044-after` 22/22 MATCH;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
-`scripts/tpch-spotcheck.sh` (RESULT=PASS, Q12=2 Q13=35, 32.2 s);
-**full 99-query TPC-DS SF0.5 gate, one binary, 3 chunks — PASS=92 MISMATCH=1
-CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=4; exactly 4/99 cells moved vs
-`sweep-20260731-121447.txt`**; pre-commit pgbench smoke (hook);
 `make ralph-state-guard`.
 
-In-flight: none. All bench servers stopped (65433/65436/65437 down).
-PG oracle :65438 was already UP from a prior loop and is left UP, untouched.
+In-flight: none. All goopg bench servers stopped (65433/65436/65437 down;
+65433 was started for plan-diff and stopped after). PG oracle :65438 left as
+found. Private gate binary at `tmp/goopg-sf05-m0125-0034c-bin`.
