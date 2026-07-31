@@ -113,6 +113,18 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:visitColumnRefs":         walkerPending, // 7 of 32 arms
 	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
 	"bushy.go:visitColumnRefsForTable": walkerPending, // 12 of 32 arms
+	// Added by the M0125-0035 CTE-body arm. Both are built on the
+	// exprwalk primitives — walkExprRefs carries the recursion and
+	// cloneExprRefs the rewrite — and what the census sees is the
+	// bottom-up dispatch inside their Visit closures (veto
+	// *OuterColumnRef / *FuncCall, validate *ColumnRef), attributed to
+	// the enclosing function. Same demoted shape as
+	// nl_index_join.go:cloneExprShiftIdx. Fail-open is a DECLINE here:
+	// an unenumerated type passes the visitor and the conjunct is still
+	// only pushed if every ColumnRef validates, and property 2 keeps the
+	// residual copy either way.
+	"cte_inline_pushdown.go:remapConjunctThroughCTEOutput":  nonRecursiveClassifier,
+	"cte_inline_pushdown.go:remapConjunctThroughProjection": nonRecursiveClassifier,
 	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
 	// the transformation's NULL-semantics invariant, not an omission.
 	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,

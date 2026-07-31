@@ -1096,6 +1096,15 @@ type CTEScan struct {
 	Alias  string // alias used at this consumer site (defaults to Name)
 	Child  Node
 	schema Schema
+	// cte points back at the planner-side WITH-list entry this scan
+	// consumes. pushQualsThroughSingleRefCTEs reads its statement-wide
+	// reference count to decide whether Child is private to this one
+	// reference (PG 12+ `cte_inline` refcount==1 criterion) — both the
+	// plan Node and the executor's name-keyed CTERowCache are shared
+	// between references, so a per-reference qual may cross into the
+	// body only when no second reference exists. nil for scans built
+	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
+	cte *plannedCTE
 }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)

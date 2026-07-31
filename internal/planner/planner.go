@@ -99,6 +99,21 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	if costDrivenJoinOrder {
 		reconcileNLILayout(node)
 	}
+	// M0125-0035 CTE-body arm: carry a restriction sitting on a
+	// single-reference CTE's output through the reference into the body
+	// (PG 12+ cte_inline + subquery qual pushdown). Runs from Plan()'s
+	// tail because that is the first point where every reference has
+	// been planned and plannedCTE.refs is final — an inner scope's pass
+	// could see refs==1 while a later sibling subquery adds a second
+	// reference to the same shared body.
+	pushQualsThroughSingleRefCTEs(node)
+	// M0125-0035 EC arm follow-through: qual placement (the two passes
+	// above plus the per-scope join pass) can pin a hash join's key
+	// column to a constant on BOTH inputs, collapsing the hash table
+	// into one bucket (Q78's top spine). Re-pick the key pair from the
+	// join's remaining equalities where that happened — result-neutral,
+	// the executor enforces the full Predicate per match either way.
+	reselectDegenerateHashKeys(node)
 	// M0125-0036 (C3): turn a correlated EXISTS that no pass could make a
 	// semi-join into a hashable uncorrelated ANY sublink (upstream's
 	// convert_EXISTS_to_ANY). Must run AFTER every index-rewriting pass —
@@ -2321,12 +2336,20 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				}
 				return scan, b, nil
 			}
+			// Statement-wide reference count for the cte_inline decision.
+			// Every reference — FROM clauses and sublink subqueries alike —
+			// is planned through this one site, so the count can only be
+			// exact or an overcount (a replanned-and-discarded subtree
+			// increments too), never an undercount. Overcounting declines
+			// inlining, which is the safe direction. M0125-0035.
+			ce.refs++
 			scan := &CTEScan{
 				pos:    rv.Pos(),
 				Name:   ce.name,
 				Alias:  alias,
 				Child:  ce.body,
 				schema: ce.schema,
+				cte:    ce,
 			}
 			return scan, b, nil
 		}

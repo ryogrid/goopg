@@ -1,6 +1,10 @@
 package planner
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // pushSingleSideQualsIntoInnerJoinInputs is the binary-join sibling of
 // pushSingleSourceFiltersAfterRemap (mhj_input_rewrite.go) and the
@@ -269,6 +273,12 @@ func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
 		} else if !leftOK {
 			return n, false
 		}
+		// M0125-0035 EC arm: while c descends into its own side, a
+		// `col = const` conjunct also seeds the OTHER side through this
+		// join's own equality clauses (see deriveConstAcrossJoinEquality
+		// for why that is safe even on a nullable side this function
+		// would otherwise refuse to touch).
+		deriveConstAcrossJoinEquality(x, c, side, leftWidth)
 		local, ok := shiftConjunctForInput(c, delta)
 		if !ok {
 			return n, false
@@ -415,6 +425,317 @@ func innerJoinPushTarget(c Expr, j *Join, leftWidth int) (joinSide, bool) {
 		return sideUnknown, false
 	}
 	return target, true
+}
+
+// deriveConstAcrossJoinEquality is goopg's bounded analogue of PG's
+// equivalence-class constant propagation (postgres/src/backend/
+// optimizer/path/equivclass.c, generate_implied_equalities_for_column):
+// when a `col = const` restriction descends through a join whose own
+// predicate contains an equality `col = col'` linking it to a column of
+// the OTHER input, the matched pairs of this join provably satisfy
+// `col' = const` too, so a derived copy is seeded into that other input.
+//
+// TPC-DS Q78 is the witness and the reason the CTE-body pass alone
+// could not meet the item's acceptance: `ss_sold_year = 1998` descends
+// the preserved spine to the `ss` reference (and from there into the
+// body, down to `date_dim`), but the `ws` and `cs` channels hang off
+// the NULLABLE sides of two `LEFT JOIN ... ON ws_sold_year =
+// ss_sold_year AND ...`, which joinRestrictionSides rightly refuses for
+// the ORIGINAL conjunct. PG still filters all three channels by
+// `d_year = 1998`, and this derivation is how: `ws_sold_year = 1998`
+// holds for every ws row that can MATCH (matching requires
+// ws_sold_year = ss_sold_year, and c holds on the preserved side), so
+// pre-filtering the nullable input removes only rows that were headed
+// for no-match — the preserved rows they would not have matched are
+// null-extended exactly as before. This is the one shape where seeding
+// a nullable side needs no nullingrels model.
+//
+// Soundness at depth: c may have descended several joins below the
+// residual Filter that owns it. Property 2 (duplicate-never-move)
+// keeps the original conjunct in that residual, so any pair this join
+// emits whose preserved half violates c is discarded above regardless
+// of whether the derived filter changed a match into a null-extension
+// on the way.
+//
+// Fail-closed bounds: the conjunct must be a bare `ColumnRef = const`
+// (isConstantPlanExpr excludes ColumnRefs, sublinks and FuncCalls, so
+// no volatility or scope question arises); the join equality must be
+// between two bare ColumnRefs validated positionally by name (property
+// 1); and the two columns must agree on type name — goopg has no
+// opfamily model, and cross-type equality transitivity is exactly what
+// PG makes the opfamily prove.
+func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int) {
+	if j.Predicate == nil {
+		return
+	}
+	eq, ok := c.(*BinaryOp)
+	if !ok || eq.Op != parser.OpEq {
+		return
+	}
+	colRef, okc := eq.Left.(*ColumnRef)
+	constOperand := eq.Right
+	if !okc {
+		colRef, okc = eq.Right.(*ColumnRef)
+		constOperand = eq.Left
+	}
+	if !okc || !isConstantPlanExpr(constOperand) {
+		return
+	}
+	leftOut, rightOut := j.Left.Output(), j.Right.Output()
+	validRef := func(cr *ColumnRef) bool {
+		out, local := leftOut, cr.Index
+		if cr.Index >= leftWidth {
+			out, local = rightOut, cr.Index-leftWidth
+		}
+		if local < 0 || local >= len(out) {
+			return false
+		}
+		return cr.Name == "" || strings.EqualFold(out[local].Name, cr.Name)
+	}
+	for _, jc := range splitAnd(j.Predicate) {
+		peq, ok := jc.(*BinaryOp)
+		if !ok || peq.Op != parser.OpEq {
+			continue
+		}
+		a, aok := peq.Left.(*ColumnRef)
+		b, bok := peq.Right.(*ColumnRef)
+		if !aok || !bok {
+			continue
+		}
+		var match, other *ColumnRef
+		switch colRef.Index {
+		case a.Index:
+			match, other = a, b
+		case b.Index:
+			match, other = b, a
+		default:
+			continue
+		}
+		matchOnLeft := match.Index < leftWidth
+		otherOnLeft := other.Index < leftWidth
+		// The pair must span the two inputs, with the matched column on
+		// c's own side.
+		if matchOnLeft == otherOnLeft || (side == sideLeft) != matchOnLeft {
+			continue
+		}
+		if !validRef(match) || !validRef(other) {
+			continue
+		}
+		if !strings.EqualFold(match.Type.Name, other.Type.Name) {
+			continue
+		}
+		// Re-point c's single ColumnRef at the other side's column; the
+		// clone keeps the comparison node (and its ResultType) intact.
+		// The name is taken from the SCHEMA position, not the predicate's
+		// ref, so the deeper descent's positional-name validation checks
+		// something real even when the predicate ref carried no name.
+		var otherName string
+		if otherOnLeft {
+			otherName = leftOut[other.Index].Name
+		} else {
+			otherName = rightOut[other.Index-leftWidth].Name
+		}
+		derived, ok := cloneExprRefs(c, scopeVeto, exprRewriter{
+			Rewrite: func(e Expr) Expr {
+				if cr, isCR := e.(*ColumnRef); isCR {
+					cr.Index = other.Index
+					cr.Name = otherName
+					cr.Type = other.Type
+					cr.SourceTableIdx = other.SourceTableIdx
+				}
+				return e
+			},
+		})
+		if !ok {
+			continue
+		}
+		target, delta := j.Left, 0
+		if !otherOnLeft {
+			target, delta = j.Right, -leftWidth
+		}
+		local, ok := shiftConjunctForInput(derived, delta)
+		if !ok {
+			continue
+		}
+		if repl, ok := pushConjunctIntoSubtree(target, local); ok {
+			if otherOnLeft {
+				j.Left = repl
+			} else {
+				j.Right = repl
+			}
+		}
+	}
+}
+
+// reselectDegenerateHashKeys re-picks a hash join's key pair when the
+// pair it was built with has been made DEGENERATE by qual placement:
+// once `ws_sold_year = 1998` sits on both inputs of `... ON
+// ws_sold_year = ss_sold_year AND ws_item_sk = ss_item_sk AND ...`,
+// every surviving row carries the same key value, the entire build side
+// lands in ONE hash bucket, and each probe walks it end to end — the
+// join is quadratic with a hash table's overhead. TPC-DS Q78's top
+// spine is exactly this (245,587 probes × ~30k single-bucket entries
+// per LEFT join), and it is why the query still burned >300 s AFTER
+// its three channels were correctly pre-filtered to one year.
+//
+// PG never faces the choice: its Hash Cond keeps EVERY equi-pair, so a
+// constant-pinned column merely contributes nothing to bucket spread.
+// goopg's join carries ONE LeftKey/RightKey (splitEqualityForHash takes
+// the first disjoint-side pair, in ON-clause order) and evaluates the
+// remaining conjuncts as a per-match residual — which also makes this
+// swap RESULT-NEUTRAL: whichever pair is the key, the full Predicate
+// is still enforced on every emitted row (operators_join_agg.go's
+// post-hash filter), and a NULL in either pair fails its equality
+// conjunct on both routes. Only bucket distribution changes. The full
+// fix is PG-shaped multi-column keys, a planner+executor sibling-pair
+// change recorded in the ledger; this pass removes the pathological
+// case that qual placement itself creates.
+//
+// Degeneracy is judged against the join input's IMMEDIATE Filter —
+// which is precisely where this file's passes deposit a pushed
+// `col = const` — so the pass composes with them and stays bounded:
+// a constant hidden deeper (below a Project, inside a CTE body) is not
+// seen, and the key simply stays as chosen today. Both the current and
+// the replacement pair are validated positionally by name (property 1)
+// and the replacement is CLONED into the key slots (the M0097-0060
+// shared-pointer lesson).
+func reselectDegenerateHashKeys(n Node) {
+	if n == nil {
+		return
+	}
+	switch x := n.(type) {
+	case *Explain:
+		reselectDegenerateHashKeys(x.Child)
+	case *Filter:
+		reselectDegenerateHashKeys(x.Child)
+	case *Join:
+		reselectJoinHashKey(x)
+		reselectDegenerateHashKeys(x.Left)
+		reselectDegenerateHashKeys(x.Right)
+	case *NestedLoopIndexJoin:
+		reselectDegenerateHashKeys(x.Outer)
+		reselectDegenerateHashKeys(x.Inner)
+	case *MultiHashJoin:
+		for _, t := range x.Tables {
+			reselectDegenerateHashKeys(t)
+		}
+	case *CTEScan:
+		reselectDegenerateHashKeys(x.Child)
+	case *CTEDMLPrefix:
+		reselectDegenerateHashKeys(x.Body)
+	case *Project:
+		reselectDegenerateHashKeys(x.Child)
+	case *Sort:
+		reselectDegenerateHashKeys(x.Child)
+	case *Limit:
+		reselectDegenerateHashKeys(x.Child)
+	case *Aggregate:
+		reselectDegenerateHashKeys(x.Child)
+	case *WindowAgg:
+		reselectDegenerateHashKeys(x.Child)
+	case *Distinct:
+		reselectDegenerateHashKeys(x.Child)
+	case *DistinctOn:
+		reselectDegenerateHashKeys(x.Child)
+	case *SetOp:
+		reselectDegenerateHashKeys(x.Left)
+		reselectDegenerateHashKeys(x.Right)
+	case *RecursiveUnion:
+		reselectDegenerateHashKeys(x.Anchor)
+		reselectDegenerateHashKeys(x.Recursive)
+	case *Gather:
+		reselectDegenerateHashKeys(x.Child)
+	case *GatherMerge:
+		reselectDegenerateHashKeys(x.Child)
+	case *LockRows:
+		reselectDegenerateHashKeys(x.Child)
+	}
+}
+
+// reselectJoinHashKey applies reselectDegenerateHashKeys to one join.
+func reselectJoinHashKey(j *Join) {
+	if j == nil || j.Algo != JoinAlgoHash || j.Predicate == nil {
+		return
+	}
+	lk, ok1 := j.LeftKey.(*ColumnRef)
+	rk, ok2 := j.RightKey.(*ColumnRef)
+	if !ok1 || !ok2 {
+		return
+	}
+	leftWidth := len(j.Left.Output())
+	if !hashPairDegenerate(j, lk.Index, rk.Index, leftWidth) {
+		return
+	}
+	leftOut, rightOut := j.Left.Output(), j.Right.Output()
+	for _, jc := range splitAnd(j.Predicate) {
+		eq, ok := jc.(*BinaryOp)
+		if !ok || eq.Op != parser.OpEq {
+			continue
+		}
+		a, aok := eq.Left.(*ColumnRef)
+		b, bok := eq.Right.(*ColumnRef)
+		if !aok || !bok {
+			continue
+		}
+		if a.Index >= leftWidth { // normalize to (left, right)
+			a, b = b, a
+		}
+		if a.Index < 0 || a.Index >= leftWidth ||
+			b.Index < leftWidth || b.Index >= leftWidth+len(rightOut) {
+			continue
+		}
+		if a.Index == lk.Index && b.Index == rk.Index {
+			continue // the pair we are replacing
+		}
+		if a.Name != "" && !strings.EqualFold(leftOut[a.Index].Name, a.Name) {
+			continue
+		}
+		if b.Name != "" && !strings.EqualFold(rightOut[b.Index-leftWidth].Name, b.Name) {
+			continue
+		}
+		if hashPairDegenerate(j, a.Index, b.Index, leftWidth) {
+			continue
+		}
+		lc, rc := *a, *b
+		j.LeftKey, j.RightKey = &lc, &rc
+		return
+	}
+}
+
+// hashPairDegenerate reports whether either column of a candidate hash
+// pair (merged coordinates) is pinned to a constant by its input's
+// immediate Filter — the placement this file's passes produce.
+func hashPairDegenerate(j *Join, lIdx, rIdx, leftWidth int) bool {
+	return inputPinsColToConst(j.Left, lIdx) ||
+		inputPinsColToConst(j.Right, rIdx-leftWidth)
+}
+
+// inputPinsColToConst reports whether a join input's immediate Filter
+// carries a `col = const` conjunct on the given input-local column.
+func inputPinsColToConst(input Node, localIdx int) bool {
+	f, ok := input.(*Filter)
+	if !ok {
+		return false
+	}
+	for _, c := range splitAnd(f.Predicate) {
+		eq, ok := c.(*BinaryOp)
+		if !ok || eq.Op != parser.OpEq {
+			continue
+		}
+		cr, okc := eq.Left.(*ColumnRef)
+		constOperand := eq.Right
+		if !okc {
+			cr, okc = eq.Right.(*ColumnRef)
+			constOperand = eq.Left
+		}
+		if !okc || !isConstantPlanExpr(constOperand) {
+			continue
+		}
+		if cr.Index == localIdx {
+			return true
+		}
+	}
+	return false
 }
 
 // shiftConjunctForInput returns a deep copy of c with every

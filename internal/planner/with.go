@@ -31,6 +31,18 @@ type plannedCTE struct {
 	schema Schema
 	table  *catalog.Table
 	isDML  bool // data-modifying CTE; body is an INSERT/UPDATE/DELETE/MERGE plan
+	// refs counts the CTEScan nodes planned against this entry, i.e. how
+	// many times the statement references this CTE. Incremented at the
+	// single consumption site (planScanRangeVar), so sublink-subquery
+	// references are counted too. Final once the whole statement is
+	// planned, which is why pushQualsThroughSingleRefCTEs reads it only
+	// from Plan()'s tail. M0125-0035 CTE-body arm.
+	refs int
+	// inlineEligible marks a plain non-recursive SELECT body — the only
+	// kind whose Child a qual may descend into when refs==1. DML bodies
+	// (side effects run once, rows replayed) and recursive bodies
+	// (WorkTableScan protocol) never qualify.
+	inlineEligible bool
 }
 
 // planCTEs is the goroutine-thread-unsafe "current WITH-list"
@@ -200,6 +212,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 			body:   body,
 			schema: schema,
 			table:  &catalog.Table{Name: cte.Name, Columns: cols},
+			// Plain non-recursive SELECT body: the only shape whose Child
+			// a single-reference qual may descend into. The WITH RECURSIVE
+			// branch above and the DML branch never set this.
+			inlineEligible: true,
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}

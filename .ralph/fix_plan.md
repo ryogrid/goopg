@@ -479,8 +479,24 @@ started.
 >       cap-straddle, unreachable by the pass — all-`JOIN…ON`); plan-diff
 >       22/22 MATCH. The gate-visible timeout class is down to **Q78 alone**,
 >       which is `-0035`'s CTE-body arm (single-reference CTE inlining +
->       EC constant propagation). **NEXT SELECTION: `-0035`'s CTE-body arm,
->       then `M0125-0045`, then `M0125-0038` last.**
+>       EC constant propagation). ~~**NEXT SELECTION: `-0035`'s CTE-body arm,
+>       then `M0125-0045`, then `M0125-0038` last.**~~
+>       **↳ `-0035`'s CTE-BODY ARM LANDED 2026-08-01 (loop #18) and its
+>       ACCEPTANCE IS MET — M0125-0035 IS CLOSED** (arm (b) refiled as
+>       `M0125-0046`, arm (c) already = `M0125-0038`). Q78 TIMEOUT → **PASS
+>       24 s, 45 rows, ck = oracle**; full SF0.5 gate **PASS=95 MISMATCH=0
+>       CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4** — the gate-visible timeout
+>       class is EMPTY (Q72's 306 s flip is its documented straddle, not
+>       claimed). Three mechanisms were needed, the third invisible until
+>       the first two landed: CTE-body qual descent (refs==1, read from
+>       Plan()'s tail), one-hop join-equality constant derivation onto the
+>       nullable side, and degenerate hash-key re-selection (goopg hashes
+>       only the FIRST equi-pair; year=1998 on both sides collapsed the
+>       build side into one bucket — 245k × 30k probe walks). Design
+>       `docs/design/0125-0035b-cte-body-inline-ec-const-hash-key.md`;
+>       three ledger rows 2026-08-01 (multi-column hash keys, equivclass
+>       transitive closure, inline_cte volatility). **NEXT SELECTION:
+>       `M0125-0045`, then `M0125-0046`, then `M0125-0038` last.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3870,7 +3886,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       that LATERAL *evaluation* (per-outer-row correlated rescan) remains
       unimplemented — only the join-order pass reads the new flag.
 
-- [ ] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
+- [x] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
       never to the base scan, and never pushed into a producing subquery**
       (filed 2026-07-31 by M0125-0026; evidence same README §"C2 is pervasive").
       Across the 18 goopg plans, **2 of 68 `Filter:` lines sit on a `Seq Scan`**
@@ -3993,6 +4009,44 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       propagation** (`equivclass.c`) to carry the constant to `ws`/`cs`. Arms
       (b) and (c) remain untouched. Three ledger rows 2026-07-31; the earlier
       "declines every OUTER join" row is flipped to `resolved`.
+      **↳ DONE 2026-08-01 (loop #18) — the CTE-body half landed and the
+      acceptance is MET: Q78 TIMEOUT → PASS 24 s, 45 rows,
+      `ck=8f67acff3895183f` = the oracle.** Three mechanisms, in
+      `internal/planner/cte_inline_pushdown.go` +
+      `inner_join_qual_pushdown.go`: (1) single-reference CTE-body qual
+      descent (PG `inline_cte` + `subquery_push_qual`; refs==1 gate read
+      only from Plan()'s tail because the body Node AND the executor's
+      CTERowCache are shared between references; Q31's `ws3` control
+      unchanged); (2) `deriveConstAcrossJoinEquality`, a bounded
+      `equivclass.c`: a descending `col = const` seeds `col' = const`
+      through the join's own equality onto the OTHER input — including the
+      NULLABLE side, safe with no nullingrels model because a nullable row
+      failing the derived constant can never match, and property 2 keeps
+      the residual above; (3) `reselectDegenerateHashKeys`: with the plan
+      text already PG-identical, Q78 still burned >900 s because
+      `splitEqualityForHash` keys on the FIRST equi-pair — after (1)+(2)
+      pin `sold_year` to 1998 on both sides, the whole build side shared
+      ONE bucket (245,587 probes × ~30k entries). PG hashes every pair;
+      goopg now re-picks a non-pinned pair, result-neutral since the
+      executor enforces the full Predicate per match. Full SF0.5 gate
+      **PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0
+      SKIP=4**, exactly two cells moved vs loop #17 (Q78 claimed; Q72's
+      306 s flip is its straddle, NOT claimed), all 93 common PASSes
+      identical in rows and checksum; spotcheck PASS; plan-diff
+      `m0125-0044-after` 22/22 MATCH (zero TPC-H plan change); units
+      green. Pins `internal/planner/cte_inline_pushdown_test.go`. Design
+      `docs/design/0125-0035b-cte-body-inline-ec-const-hash-key.md`;
+      three ledger rows 2026-08-01. Arm (b) → `M0125-0046` below; arm (c)
+      = `M0125-0038`.
+
+- [ ] **M0125-0046 — MHJ IN-list qual placement: `pushSingleSourceFiltersIntoMHJTables`
+      disqualifies any conjunct containing an `InExpr`** (refiled 2026-08-01 from
+      M0125-0035 arm (b) at its closure; original evidence README §"C2 is
+      pervasive"). An IN-list restriction stays on the MultiHashJoin node instead
+      of reaching the member scan that could pre-filter its build input. Small,
+      but the walker is a planner/executor SIBLING PAIR — both sides must change
+      together (Hard-won Rule #2). Bar: spotcheck + SF0.5 subset probe of the
+      MHJ-heavy members, plan-diff.
 
 - [x] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
       no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same
