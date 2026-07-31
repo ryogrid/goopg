@@ -1,0 +1,20 @@
+/tmp/m42dbg5.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=2
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=23 pred colref name="ss_sold_date_sk" idx=0 src=1
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=23 pred colref name="d_date_sk" idx=23 src=2
+/tmp/m42dbg5.log:M42B: planInExpr bound operand name="c_customer_sk" idx=13 src=2
+/tmp/m42dbg5.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=2
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=34 pred colref name="ws_sold_date_sk" idx=0 src=1
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=34 pred colref name="d_date_sk" idx=34 src=2
+/tmp/m42dbg5.log:M42B: planInExpr bound operand name="c_customer_sk" idx=13 src=2
+/tmp/m42dbg5.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=2
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=34 pred colref name="ws_sold_date_sk" idx=0 src=1
+/tmp/m42dbg5.log:M42P: join=0 leftWidth=34 pred colref name="d_date_sk" idx=34 src=2
+/tmp/m42dbg5.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=3
+/tmp/m42dbg5.log:M42I: pre  InExpr operand name="c_customer_sk" idx=9 src=2 plan=true
+/tmp/m42dbg5.log:M42I: pre  InExpr operand name="c_customer_sk" idx=9 src=2 plan=true
+/tmp/m42dbg5.log:M42I: post InExpr operand name="c_customer_sk" idx=9 src=2 plan=true
+/tmp/m42dbg5.log:M42I: post InExpr operand name="c_customer_sk" idx=9 src=2 plan=true
+/tmp/m42dbg4.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=2
+/tmp/m42dbg4.log:M42P: join=0 leftWidth=23 pred colref name="ss_sold_date_sk" idx=0 src=1
+/tmp/m42dbg4.log:M42P: join=0 leftWidth=23 pred colref name="d_date_sk" idx=23 src=2
+/tmp/m42dbg4.log:M42R: remapWithBindings top=*planner.Filter posMapNil=false nbindings=2

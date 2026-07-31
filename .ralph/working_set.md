@@ -1,51 +1,56 @@
-(idle — nothing in flight)
+Task: **M0125-0042** — OR-ed `IN (subquery)` operand keeps a stale column index
+(silent wrong answer). **ROOT-CAUSED THIS LOOP; THE FIX IS NOT LANDED.**
+Committed as diagnosis only — no engine file changed.
 
-Loop #10 (2026-07-31) took **M0125-0036** (C3) per the banner. Landed, gated,
-committed and pushed (`cae0b44d` + the gate-evidence commit on top).
+Files: `analysis/m0125-0042/` (README + 9 probes + 2 traces),
+`docs/design/0125-0042-in-sublink-operand-stale-index.md`,
+`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-`internal/planner/exists_to_any.go` (new pass, `GOOPG_EXISTS_TO_ANY=off`),
-wired from `planner.Plan` between the last index-rewriting pass and
-`lowerSubPlanParams`. Design
-`docs/design/0125-0036-exists-to-any-hashed-subplan.md`, evidence
-`analysis/m0125-0036-exists-to-any/`. goopg now has PG's
-`convert_EXISTS_to_ANY`: an OR-ed, non-negated, single-equality correlated
-EXISTS becomes an uncorrelated `= ANY (SubPlan n)` that the Stage-11 hash
-probe builds once.
+Key symbols: `planner.InExpr.Operand`, `reresolveJoinByName` / `predRebind`,
+`applyJoinTreePosMap`, `buildBindingsPosMap`, `remapByPosMap`,
+`resolveHostOperandIdx` (exists_to_any.go), `evalInExpr` (executor/expr.go).
 
-Five findings the next loop should not rediscover:
-1. **The task's acceptance row was already green.** -0036 said "Q10 completes
-   and matches `10|OK|0|1f18d650…`"; the loop-#9 gate already had `Q10 PASS
-   35s`. The query that actually moves is **Q35, TIMEOUT 327 s → PASS 18 s**.
-   -0026's acceptance rows predate -0005/-0007/-0008/-0034/-0035a — re-read
-   the latest `sweep-*.txt` before treating one as a target (ledger row).
-2. **Q10's oracle is 0 rows, so it cannot detect an empty value set.** The
-   first version of the pass read a **stale post-MHJ column index** and
-   returned 0 rows for Q35's 100 while passing Q10. Fixed by
-   `resolveHostOperandIdx`; MHJ packing OID-re-sorts its output and treats a
-   sublink body as opaque, so an index recorded inside one is not trustworthy
-   after it (same class as M0071-0003).
-3. **A silent wrong answer was found while probing and is NOT mine**: two
-   hand-written OR-ed uncorrelated `IN (subquery)` sublinks under a
-   SEMI-over-MHJ answer 1329 where PG says 1294 (either alone is exact).
-   Filed **M0125-0042**; it outranks a timeout on severity.
-4. **Q30/Q81 are NOT closed** — C3's correlated-scalar-aggregate half. Filed
-   **M0125-0041** with a warning that this pass does not generalise (their
-   shareable object is a grouped aggregate, not a value set).
-5. Scope is bounded by NULL semantics (`IN` three-valued vs EXISTS
-   two-valued), pinned by a new `boundedQualSpine` walker role — widening the
-   AND/OR-only walk would make the pass WRONG, not merely incomplete.
+Findings — do NOT re-derive these:
+1. The operand carries the RIGHT `Name` and a STALE `Index`: bound **13**
+   (`c_customer_sk` under `ca ++ c`), **9** at remap time (under `cd ++ c`),
+   runtime needs **22** (under `ca ++ cd ++ c`). Index 9 is **`ca_zip`, a
+   string**; `compareEq`'s string↔int coercion answers instead of raising.
+2. Bisected by measurement: SEMI join exact (11996), value set exact (constant
+   operand 11996), each arm exact (377/950), OR without EXISTS exact (11127).
+   `A OR A` and `A OR ∅` are both 314 → one arm mis-evaluates.
+3. Only **10** of goopg's 314 rows are in PG's 377 — the filed "over-match of
+   35" is a cardinality coincidence, not the shape of the defect.
+4. The item's filed first suspicion (`visitColumnRefs` descending into
+   `*InExpr`) is **REFUTED** — that descent is correct.
+5. Ruled out by measurement, do not re-test: hashed probe
+   (`GOOPG_HASHED_SUBPLAN=off` identical), parallelism
+   (`max_parallel_workers_per_gather=0` identical), determinism (stable), and a
+   synthetic 6-table minimal case that reaches a **structurally identical plan
+   and still answers correctly** (trigger is binding history, not plan shape).
+6. Three maskings: `reresolveJoinByName` never fires (tree is
+   `Filter → MultiHashJoin`, no `*Join`); a single `IN` unnests and rebinds by
+   Name; and **EXPLAIN prints the right Name over the wrong index**.
 
-Gates (quiet host, nightly not running): units PASS; `tpch-spotcheck.sh`
-`RESULT=PASS` (Q12=2 Q13=35, 32.7 s); TPC-H plan-diff vs
-`m0125-0035-c2-qual-placement` **1/22 (Q17) and the SAME 1/22 with the switch
-OFF ⇒ plan-neutral on all 22** (Q17 is -0035a's); full 99-query SF0.5 gate
-**PASS=90 (54 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=4**, one
-changed cell out of 99, all 89 common PASSes identical in status AND checksum.
+Next step: implement the fix — generalise `resolveHostOperandIdx` to
+hand-written `InExpr` operands (re-resolve by Name against the host node's
+output schema after the last remap, under a `findUniqueColumnIndex`
+unique-match guard; do not descend into the sublink's own `Plan`). Acceptance:
+`probe35g.sql` → 1294 AND `analysis/m0125-0042/pAA.sql` → 377, plus a planner
+test asserting the operand index equals the host schema position. Bar: units +
+`tpch-spotcheck.sh` + TPC-H plan-diff + full 99-query SF0.5 gate.
 
-Per the banner the next selection is **`M0125-0037` stage (ii)**. Re-read the
-banner first; it outranks this note.
+Gates run: units PASS (`RALPH_PRECOMMIT_SCOPE=units`); pgbench smoke via the
+commit hook. Planner gates N/A — no engine file changed.
 
-Clusters: SF0.5 :65437 left UP (my binary `tmp/goopg-m0125-0036-bin`); TPC-H
-:65433 stopped; :65438 (PG) was already UP and is left UP.
-Filed this loop, unworked per the banner: nothing new — AI-20260731-001201-001
-was already on the M-NIGHTLY list at line 461.
+In-flight: none. All instrumentation reverted (`git checkout` of bushy.go,
+planner.go, expr.go); tree builds clean.
+
+Clusters: goopg :65437 and :65436 DOWN, throwaway :5533 stopped and its data
+dir removed; PG :65438 was already UP and is left UP. Nightly was NOT running.
+
+Also this loop: **`M0125-0037` stage (ii) was measured out before selection** —
+its acceptance `Q5 → 5|OK|100` is already green (Q8/Q14/Q54/Q71 too). Left
+unchecked; see its item body. Timeout class is now **Q30 Q64 Q65 Q78 Q81**.
+Banner order going forward: `-0042` (fix) → `-0041` → `-0034` join-order arm →
+`-0038` last. Filed, unworked per the banner: nothing new
+(AI-20260731-001201-001 was already on the M-NIGHTLY list).

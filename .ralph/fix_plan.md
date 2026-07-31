@@ -328,10 +328,36 @@ started.
 >       acceptance row a task names can be blind to its own defect** — Q10's
 >       oracle is 0 rows, so the first version of this pass (which read a stale
 >       post-MHJ column index) PASSED Q10 while returning 0 rows for Q35's 100.
->       Seven ledger rows 2026-07-31. **NEXT SELECTION: `M0125-0037` stage (ii)**
+>       Seven ledger rows 2026-07-31. ~~**NEXT SELECTION: `M0125-0037` stage (ii)**
 >       per the adopted order (`-0038` stays last); `-0041`/`-0042` and
 >       `-0034`'s join-order arm follow, and `-0042` outranks a timeout item on
->       severity whenever the banner is next revised.
+>       severity whenever the banner is next revised.~~
+>       **↳ REVISED 2026-07-31 (loop #11). `M0125-0037` stage (ii) was selected
+>       per this banner and then MEASURED OUT: its acceptance `Q5 → 5|OK|100` is
+>       ALREADY GREEN** (`Q5 PASS 40s 100 rows` in
+>       `analysis/m0125-0036-exists-to-any/sf05/`), as are Q8/Q14/Q54/Q71 —
+>       `-0034`'s set-op arm had already retired the crosses stage (ii) targeted.
+>       It stays unchecked because its *mechanism* claim is unverified, but it is
+>       NOT where a loop should be spent; see the -0037 item body. **This is the
+>       second consecutive item whose acceptance row predated its own fix** (the
+>       first was -0036's Q10) — re-read the latest `sweep-*.txt` before treating
+>       any -0026-era acceptance row as a target.
+>       The loop therefore took **`M0125-0042`**, per this banner's own "outranks
+>       a timeout on severity" note, and that is now the standing order:
+>       **`M0125-0042` (fix) → `M0125-0041` → `-0034`'s join-order arm →
+>       `M0125-0038` (last).**
+>       **`M0125-0042` IS ROOT-CAUSED BUT UNFIXED (loop #11, diagnosis only — no
+>       engine file changed).** The operand of an OR-ed `IN (subquery)` carries
+>       the right `Name` and a STALE `Index`: it reads `ca_zip` (a string) where
+>       `c_customer_sk` was meant, and `compareEq`'s string↔int coercion answers
+>       instead of raising. Only **10** of goopg's 314 rows are in PG's 377, so
+>       the filed "over-match of 35" was a coincidence of cardinality. Full
+>       diagnosis, the three independent reasons nothing catches it (including
+>       **EXPLAIN itself, which prints the right Name over the wrong index**),
+>       and an exact resume point are in the item body and
+>       `docs/design/0125-0042-in-sublink-operand-stale-index.md`. **The next
+>       loop should LAND that fix, not re-diagnose it.** Current timeout class:
+>       **Q30 Q64 Q65 Q78 Q81** (5). Four ledger rows 2026-07-31.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3717,6 +3743,23 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       and the three unclassified queries get a class. Acceptance for (ii):
       **Q5 completes and matches `5|OK|100`**. Bar for (ii): as -0034; (i) is
       EXPLAIN-only and needs only the unit gate plus the commit smoke.
+      **↳ STAGE (ii)'s ACCEPTANCE ROW IS ALREADY GREEN — MEASURED 2026-07-31
+      (loop #11), before selecting it.** The latest SF0.5 sweep
+      (`analysis/m0125-0036-exists-to-any/sf05/`) has **`Q5 PASS 40s 100 rows`**,
+      and Q8/Q14/Q54/Q71 — the other four queries whose `Nested Loop (CROSS)`
+      motivated this stage — all PASS too. `-0034`'s set-operation arm (loop #7:
+      30 Cartesian products gone, Q5/Q8/Q14/Q54/Q71 TIMEOUT → PASS) had already
+      retired the C1 crosses that stage (ii) was written to fix, so its stated
+      acceptance was green on arrival. **This is the SECOND consecutive item
+      whose acceptance row predated its own fix** (the first was -0036's Q10);
+      -0026's acceptance rows are all older than -0005/-0007/-0008/-0034/-0035a
+      and must be re-read against the latest `sweep-*.txt` before selection.
+      Left UNCHECKED deliberately: what is *measured* is the acceptance query,
+      not the item's mechanism claim ("the DP cannot see through a set-op node").
+      A later loop that wants to close -0037 should either verify that claim
+      directly or restate the acceptance — it must not re-derive the fix from a
+      timeout that no longer exists. The current timeout class is **Q30 Q64 Q65
+      Q78 Q81** (5), none of which is a set-op C1 shape.
 
 - [ ] **M0125-0038 — C5: no cost or cardinality propagation above base scans**
       (filed 2026-07-31 by M0125-0026; evidence same README §"C5"). Every
@@ -3856,6 +3899,65 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       answer**, so it outranks a timeout in severity even though no gate query
       currently exercises it. Acceptance: `probe35g.sql` answers 1294, plus a
       regression test at the planner or executor level. Bar: as `M0125-0034`.
+      **↳ ROOT-CAUSED 2026-07-31 (loop #11); THE FIX IS NOT LANDED.** Design
+      `docs/design/0125-0042-in-sublink-operand-stale-index.md`, evidence
+      `analysis/m0125-0042/` (nine probes + both traces). No engine file
+      changed this loop.
+      **The filed framing understates the defect: only 10 of goopg's 314 rows
+      appear in PG's 377** — the answer sets are nearly DISJOINT and merely
+      similar in size, so "an over-match of 35" is a coincidence of cardinality.
+      Bisected by measurement: the SEMI join is exact (EXISTS-only = 11996 = PG,
+      and all 314 emitted rows re-check as satisfying it), the value set is
+      exact (a CONSTANT operand over the same two sublinks = 11996 = PG, and
+      only 10 of 314 satisfy the IN), each arm alone is exact (377 / 950), and
+      the OR-ed pair WITHOUT the EXISTS is exact (11127) — **so the operand is
+      what is wrong**, and `A OR A` / `A OR ∅` are both wrong (314), so it is
+      one arm mis-evaluating, not an OR-combination defect.
+      **Mechanism:** the `InExpr.Operand` ColumnRef carries the correct `Name`
+      and a STALE `Index` — bound at **13** (`c_customer_sk` under `ca ++ c`),
+      **9** by `remapWithBindings` (under `cd ++ c`), where runtime needs **22**
+      (under `ca ++ cd ++ c`). Index 9 of the executed 40-wide layout is
+      **`ca_zip`, a string**; `compareEq`'s string↔int coercion answers instead
+      of raising, so a ZIP that numerically appears among the customer keys
+      admits the row. `posMap(27) = 9`, i.e. the remap treats 9 as final and is
+      NOT the broken part. **The item's filed first suspicion is REFUTED** —
+      `visitColumnRefs` descending into `*InExpr` is correct and is not the
+      cause; verify-before-designing paid off exactly as the item asked.
+      **Why nothing catches it (three independent maskings, all worth keeping in
+      mind for the fix):** (1) `reresolveJoinByName` — the ONLY by-Name rebind —
+      is driven from `applyJoinTreePosMap`'s `*Join` arm, and at remap time the
+      outer tree is `Filter → MultiHashJoin` with no `*Join`, so it never fires;
+      (2) a SINGLE `IN` is masked because it unnests to a semi-join whose keys
+      rebind by Name, and the Name is right — only the OR-ed form, which cannot
+      unnest, consumes the raw Index; (3) **EXPLAIN masks it too**, printing
+      `c.c_customer_sk` from the Name while the executor reads index 9, so no
+      plan reader can see this class of defect.
+      Ruled out BY MEASUREMENT, do not re-test: the hashed probe
+      (`GOOPG_HASHED_SUBPLAN=off` reproduces 314/1329 identically), parallelism
+      (`max_parallel_workers_per_gather=0` identical; deterministic across runs),
+      and **a synthetic minimal reproducer** — 6 tiny tables with OIDs ordered so
+      the MHJ re-sorts, SubPlan bodies made joins, projected column moved off
+      index 0 — which reaches a **structurally IDENTICAL plan and still answers
+      correctly**. The trigger is the binding history, not the plan shape, so the
+      regression test must assert the planner's operand index, not just a result
+      from a small fixture.
+      **RESUME POINT:** generalise `resolveHostOperandIdx`
+      (`internal/planner/exists_to_any.go`, M0125-0036) to hand-written
+      `InExpr` operands — after the last remap pass, re-resolve the operand
+      ColumnRef of every SubPlan-bearing `InExpr` by Name against the host
+      node's output schema, under a `findUniqueColumnIndex` unique-match guard
+      (leave the index untouched when absent/ambiguous; M0125-0039 showed a
+      confidently wrong qualifier is worse than none, and `SourceTableIdx` still
+      collides across query levels). Do NOT descend into the sublink's own
+      `Plan` (inner scope; `scopeIgnore`/`slotInnerPlan` already draw that line).
+      Bar: units + `tpch-spotcheck.sh` + TPC-H plan-diff + the full 99-query
+      SF0.5 gate. Acceptance: `probe35g.sql` → 1294 AND `pAA.sql` → 377.
+      **Adjacent latent defect found while reading, NOT the cause of this bug
+      and not yet filed as its own item:** `remapByPosMap`'s inner-plan switch
+      (bushy.go) handles `*ExistsExpr`, `*SubqueryExpr`, `*ArraySubqueryExpr`
+      and `MultiAssignSubq*` but has **no `*InExpr` arm**, so a *correlated*
+      `IN (subquery)`'s `OuterColumnRef`s are never translated through `posMap`.
+      Fold it into this fix or file it when the fix lands (ledger row).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
