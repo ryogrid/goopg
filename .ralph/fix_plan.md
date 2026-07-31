@@ -344,8 +344,22 @@ started.
 >       any -0026-era acceptance row as a target.
 >       The loop therefore took **`M0125-0042`**, per this banner's own "outranks
 >       a timeout on severity" note, and that is now the standing order:
->       **`M0125-0042` (fix) → `M0125-0041` → `-0034`'s join-order arm →
->       `M0125-0038` (last).**
+>       ~~**`M0125-0042` (fix) → `M0125-0041` → `-0034`'s join-order arm →
+>       `M0125-0038` (last).**~~
+>       **↳ AMENDED 2026-07-31 by the USER — `M0125-0043` PREEMPTS ALL OF THEM.**
+>       The new standing order inside M0125 is
+>       **`M0125-0043` (benchmark-name hardcoding: `operators_ddl.go` /
+>       `open.go` `SmallDimension` name tag) → `M0125-0042` (fix) →
+>       `M0125-0041` → `-0034`'s join-order arm → `M0125-0038` (last).**
+>       `-0043` is a *correctness/architecture* item — production planner
+>       behaviour currently keys off the literal strings `"region"` / `"nation"`
+>       — and the USER set it as this milestone's first pick. Its acceptance is
+>       a full 22-query TPC-H run with correct results and no query over 600 s;
+>       a slowdown within that budget is explicitly ACCEPTED. **The agent that
+>       takes it writes `docs/design/0125-0043-smalldimension-name-tag-extinction.md`
+>       in that same loop** (it does not exist yet) and the doc must list the
+>       affected TPC-H query numbers. Full item body at the head of the M0125
+>       section below.
 >       **`M0125-0042` IS ROOT-CAUSED BUT UNFIXED (loop #11, diagnosis only — no
 >       engine file changed).** The operand of an OR-ed `IN (subquery)` carries
 >       the right `Name` and a STALE `Index`: it reads `ca_zip` (a string) where
@@ -1527,6 +1541,91 @@ commits need a **timed** 22-query TPC-H run plus `make plan-diff
 LABEL=tpcds-round2-head`. Round-5's *absolute* seconds are not a valid baseline
 (the fix bundle moved the stream 1086 → 325 s with no plan changes) — M0124-0002
 arm B is. M0125-0002's gate budget alone is ~12–20 h.
+
+> **⚡ SELECT THIS FIRST WITHIN M0125 (added 2026-07-31 by the USER).**
+> **`M0125-0043` (benchmark-name hardcoding in `operators_ddl.go` / `open.go`)
+> is the top-priority item of this milestone** and outranks every other M0125
+> item — including the `M0125-0042` → `-0041` → `-0034` → `-0038` standing order
+> recorded in the Current Priority banner, which is hereby amended to run
+> **`M0125-0043` first**. Take it on the next selection; resume an already
+> in-flight task first, then come here.
+> **The design doc is NOT pre-written: the agent that starts `M0125-0043`
+> creates `docs/design/0125-0043-smalldimension-name-tag-extinction.md` as part
+> of that same loop** (and indexes it in `docs/design/README.md`), per the
+> AGENT.md rule that a non-trivial subsystem change lands its design doc in the
+> same commit. The doc MUST list the TPC-H query numbers affected by the change.
+
+- [ ] **M0125-0043 — remove the hardcoded TPC-H table names from
+      `operators_ddl.go` / `open.go` and keep TPC-H correct and in-budget**
+      (filed 2026-07-31 by the USER; **highest priority inside M0125**).
+      goopg branches production planner behaviour on **literal TPC-H table
+      names**. Two sites, and they are the sibling pair that must change
+      together (Hard-won Rule #2 — CREATE path ↔ catalog-reload path):
+      - `internal/executor/operators_ddl.go:3374-3377` — at `CREATE TABLE`:
+        `switch strings.ToLower(s.Name.Name) { case "region", "nation":
+        tbl.SmallDimension = true }` (tagged M0054-0010, comment openly says
+        "canonical TPC-H tiny tables: region 5 rows, nation 25 rows").
+      - `internal/initdb/open.go:2941` — at catalog reload from the pg_class
+        heap: `SmallDimension: tr.RelName == "region" || tr.RelName == "nation"`.
+      These are the **only** two writers of `catalog.Table.SmallDimension`
+      (`internal/catalog/catalog.go:410-418`) in non-test code;
+      `internal/initdb/catalog_cache.go:43/89/145` merely persists the flag and
+      `internal/testutil/tpch/tpch.go:34` sets it for fixtures. Everything else
+      in the repo that names a benchmark table is a **comment only** — verified
+      2026-07-31 across `internal/` and `cmd/`: no TPC-DS identifier
+      (`store_sales`, `date_dim`, …) reaches executable code at all, and the
+      TPC-H names in `bushy.go` / `unnest.go` / `nl_index_join.go` /
+      `equiv_class.go` / `joinorder.go` / `operators_analyze.go` are prose
+      explaining Q9/Q20/Q21 motivation. **So this one flag is the entire
+      benchmark-name-hardcoding surface.**
+      **Goal:** the flag must stop being a name lookup. Replace it with a
+      name-independent signal (relation size / `ANALYZE` reltuples / block-count
+      fallback à la `GOOPG_RELSIZE_FALLBACK`, or retire the flag where the cost
+      model already subsumes it — `internal/planner/pathgen.go:44-49` states the
+      hash-join build-side orientation "wins automatically", *"retiring the
+      SmallDimension name-tag as the primary rule (design ch. 06 §2.1)"*, so
+      the cost-model line is a candidate substitute, not a from-scratch design).
+      **Acceptance:** with zero benchmark table names left in executable code,
+      the full 22-query TPC-H stream runs to completion with **canonical row
+      counts and correct values**, no query exceeding a **600 s** timeout.
+      **Per the USER: being slower is acceptable as long as nothing times out**
+      — this is a correctness/architecture cleanup, not a perf task, so a
+      measured slowdown inside budget is an accepted outcome and must be
+      recorded rather than worked around.
+      **Consumers to audit before touching the writers** (each reads the flag
+      and can flip plan shape): `internal/planner/cardinality.go:140/163/186-206`
+      (`isSmallDimension`, `IsSmallDimensionSide`), `bushy.go:194/1383-1384`,
+      `pushdown.go:305-306`, `local_filters.go:140/175`,
+      `equiv_class.go:216/230/253`, `inner_join_qual_pushdown.go:74/310/324`,
+      `executor/parallel_hash_build.go:20`.
+      **Known hazard, do not rediscover it the hard way:**
+      `shouldAttachBeforeMHJ` (`local_filters.go:154-180`) gates on "the FROM
+      list contains at least one SmallDimension-flagged table", and its own
+      comment records that **without that guard M0077-0001 Slice A regressed
+      Q8 / Q21 from PASS to CANCEL**. A naive deletion of the flag therefore
+      re-opens a measured regression; the replacement signal must be available
+      at the same point in planning, or that gate needs its own substitute.
+      Note also that `costDrivenJoinOrder` already short-circuits this gate,
+      which is a hint about where the clean answer lives.
+      **Design doc — the working agent writes it, it does not exist yet:**
+      `docs/design/0125-0043-smalldimension-name-tag-extinction.md`, indexed in
+      `docs/design/README.md` in the same commit. **It MUST name the TPC-H query
+      numbers affected.** Starting set, from which of the 22 canonical queries
+      reference `nation` / `region` at all (`internal/testutil/tpch/tpch.go`
+      lines 112-133, checked 2026-07-31): **Q2, Q5, Q7, Q8, Q9, Q10, Q11, Q20,
+      Q21** — the other thirteen (Q1, Q3, Q4, Q6, Q12–Q19, Q22) never mention
+      either table. The doc must confirm or correct that list **by measurement**
+      (a plan A/B), not by inheriting it, and call out Q5 (leans on filtered
+      `region` as its MHJ anchor) and Q8 / Q21 (the CANCEL regression above)
+      as the three at real risk.
+      **Bar:** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` +
+      `scripts/tpch-spotcheck.sh` (canonical Q12=2 / Q13=35) + `make plan-diff
+      LABEL=tpcds-round2-head` + a **timed 22-query TPC-H run** — this is a
+      plan-shape change, and per this milestone's preamble every regression in
+      the historical table came with *identical row counts*, so the spot-check
+      alone cannot see this class. The TPC-DS SF0.5 gate is required too, since
+      the flag feeds shared planner code that TPC-DS also traverses. Deferral
+      ledger row if any consumer is left on a name-derived signal.
 
 - [x] **M0125-0004 — Q75 join-residual evaluation order** (§13.5 #3). *First: it
       is a live CI break* — `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46`
