@@ -5,9 +5,11 @@ Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
 Priority banner below or a dependency forces another order**. As of 2026-07-28
 the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
 `docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
-ahead of M0123 and every other milestone. **M-NIGHTLY no longer preempts it
-(amended 2026-07-28): nightly items are still FILED every loop, but they are not
-SELECTED until M0124 and M0125 close.** This banner is the sole ordering
+ahead of M0123 and every other milestone. **Amended 2026-07-31 (USER): M0126 —
+cost-driven planning made production-viable — is inserted directly after M0125,
+so the head of the roadmap is M0124 → M0125 → M0126.** **M-NIGHTLY no longer
+preempts it (amended 2026-07-28): nightly items are still FILED every loop, but
+they are not SELECTED until M0124, M0125 and (since 2026-07-31) M0126 close.** This banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
 
@@ -59,6 +61,21 @@ started.
 > filed as **M0124** (measurement baseline, regression-gate discharge, ledger
 > debt) and **M0125** (timeout class, Q75, walker extinction), and they are the
 > **top priority of this checkout**. Work in THIS order:
+>
+> **⚡ AMENDED 2026-07-31 (by the USER) — M0126 IS INSERTED BETWEEN M0125 AND
+> THE M-NIGHTLY BACKLOG.** The order below is amended to read: WIP recovery
+> (#1) → **M0124** (#2) → **M0125** (#3) → **M0126** (#4, NEW) → M-NIGHTLY
+> backlog (#5) → M0123 (#6). **M0126 — cost-driven planning made
+> production-viable** turns `analysis/cost-driven-second-try-200731/` into
+> shipped behaviour and ends with the conditional default flip of
+> `GOOPG_COST_DRIVEN_JOINORDER` (or a documented no-go; on a no-go, one
+> USER-filed conditional remediation — build-side memory-aware `hashJoinCost` —
+> then a re-measured final verdict). Milestone doc
+> `docs/milestones/0126-cost-driven-planning-production-viability.md`; the task
+> list is the `## M0126` section near the bottom of this file. It is **not**
+> selected while any M0125 item is open. The numbered list below is unchanged
+> and kept as filed; read it with this amendment applied.
+>
 > 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
 >    "WIP recovery" item directly under this banner) before anything else, never
 >    silently drop it. (Nothing outstanding as of 2026-07-28.)
@@ -506,14 +523,21 @@ started.
 >    capture stays valid and gains a free warm arm if -0029/-0030 land first.
 > 4. **M-NIGHTLY backlog** — the standing nightly-triage items below. Keep FILING
 >    them every loop (see the filing obligation above); work them only after M0124
->    and M0125 close, or under one of the two carve-outs. The TPC-DS **Q75** nightly
+>    and M0125 close, or under one of the two carve-outs.
+>    **↳ AMENDED 2026-07-31: M0126 sits ABOVE this item.** M-NIGHTLY work is now
+>    parked beneath **M0124 / M0125 / M0126**; the two carve-outs (build break,
+>    or a break in a gate those milestones depend on) are unchanged, and
+>    reversion stays automatic as soon as the banner stops naming them. The TPC-DS **Q75** nightly
 >    item is the exception that is already routed: it is in the qualifying set with
 >    `Q75,100,pinned` at `ci/batch/tpcds-row-anchors.csv:46` and no
 >    `expected-failures.csv` entry, and RC-1b turned it into a deterministic
 >    `division by zero` — that item IS **M0125-0004**, so it is worked as part of
 >    M0125 and never as a second workstream.
-> **Every other roadmap milestone — M0123 included — is parked below M0125 until
-> M0124 and M0125 are complete.** M0123 keeps its own branch (`wal-pg-nodetree`)
+> ~~**Every other roadmap milestone — M0123 included — is parked below M0125 until
+> M0124 and M0125 are complete.**~~ — **AMENDED 2026-07-31 (USER):** every other
+> roadmap milestone — M0123 included — is parked below **M0126**, and M0126 is
+> itself parked below M0125. Order: M0124 → M0125 → **M0126** → M-NIGHTLY →
+> M0123. M0123 keeps its own branch (`wal-pg-nodetree`)
 > and resumes there once this line is closed.
 >
 > Dependencies, stated narrowly: **M0124-0002 gates M0125-0002/-0004 and the
@@ -550,7 +574,8 @@ started.
 > The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
 > M0123 is complete.
 
-Work order: **M0124 → M0125** (this directive), then **M0123**, then the
+Work order: **M0124 → M0125 → M0126** (this directive as amended 2026-07-31),
+then **M0123**, then the
 pre-existing line — **M0117 → M0118** (both complete + archived), then resume
 **M0110** (its **M0119-0004/0005/0006/0007** spinoffs are the active,
 in-progress form of that work), with **M0095** parked (blocked on logical
@@ -4336,6 +4361,271 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `64|OK|2|<oracle ck>` in the SF0.5 gate. Bar: units +
       `tpch-spotcheck.sh` + TPC-H plan-diff + the full 99-query SF0.5 gate.
 
+## M0126 — Cost-driven planning made production-viable (filed 2026-07-31)
+
+Milestone: `docs/milestones/0126-cost-driven-planning-production-viability.md`.
+Source: `analysis/cost-driven-second-try-200731/` — README (verdict), **09**
+(stages + the UNITS/SMOKE/SPOT/PLAN/DS05/DIFF gate vocabulary every item below
+uses), **10** (kill switches + rollback), **07** (cost-model interaction). The
+bundle is the design of record; `docs/design/0126-*` are thin implementation
+specs.
+**Priority: immediately after M0125 (filed by the USER 2026-07-31)** — above
+the M-NIGHTLY backlog and above M0123. See the amended Current Priority banner.
+Not selected while any M0125 item is open.
+
+**Read before picking any task here.** (1) Dropping MultiHashJoin is not a
+neutral refactor: `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md:189-196`
+records Q5/Q21 HANG, Q9 timeout, Q10 11.4×, Q18 4.3×, Q7 1.9× — and Q2 18.8× /
+Q8 4.1× the other way. The direction is not predictable from the code change,
+so it is measured per commit, and `scripts/tpch-spotcheck.sh` (Q12/Q13 row
+counts) would have passed every completing one of those green. (2) **Q5
+contains no MultiHashJoin** (verified — `analysis/cost-driven-second-try-200731/evidence/judge-verifications-20260731.txt`
+V1/V7): the worst regression in the evidence set is an ORDER failure, not a
+fusion failure. (3) DS05 content-verifies **57 of 99** queries (42 are
+`ck=n/a`); the DIFF harness is the primary correctness instrument, not a
+supplement — record every DS05 result as "57/99 content-verified, 42/99
+count-only". (4) Every implementation task runs in a **git worktree off pinned
+clean HEAD**, staged by explicit pathspec, never `git add -A`, and re-runs its
+own named guard test after any rebase or handoff (bundle 10 §6).
+
+**Acceptance bar for the milestone (measured by M0126-0012, re-measured by
+-0013 if triggered):** TPC-H SF1 **22/22 complete** with zero hang/OOM/timeout;
+total wall time within **+20 %** of the FASTER of the pinned R0 integer-planner
+baseline (captured by -0001, before anything lands) and a contemporaneous
+final-HEAD integer arm; **no single query worse than 2×** the faster of those
+two baselines; TPC-DS SF0.5 gate with **zero row-count and zero checksum
+deltas**. If the bar is not met, -0012 completes as a **documented no-go** that
+triggers -0013; a no-go is a successful completion — an unmeasured outcome is
+the only failure.
+
+**Conditionality is entered by measurement, not judgement.** Three decision
+forks (plus -0004 gated by -0003's interim A/B, and -0009/-0010 gated by
+-0008's bar check):
+-0005's ~1.5× decision skips the fusion band (-0006/-0007) entirely — the
+bundle's best outcome; -0012 flips the default or records the no-go; -0013
+(USER-filed remediation) fires only on that no-go. A fork not entered is a
+recorded outcome, never a silent skip — each un-entered conditional task owes a
+deferral-ledger row (-0013's row must name bundle 07 §7, whose argument — the
+planner otherwise never learns the cascade is expensive — survives a passing
+bar).
+
+- [ ] **M0126-0001 — Pre-measurement confound removal + pinned R0 baseline.** Capture the R0 acceptance-bar baseline FIRST (timed
+      22-query TPC-H SF1 at default config on a verified quiet host →
+      `analysis/cost-driven-second-try-200731/evidence/r0-baseline.txt`, plus
+      `make plan-snapshot-capture LABEL=m0126-base`), then land bundle Stage −1
+      (packer guard `len(keys) != len(scans)-1` in `collectMultiHashTables`,
+      `internal/planner/bushy.go` — fails closed, declines to pack) and Stage
+      −1b (`VirtualSlot.Materialize()` at `internal/executor/slot.go:167-169`
+      must clone arena-backed Datums like `drainRowsBounded` does) as two
+      separate correctness commits, never folded into a perf commit.
+      Design `docs/design/0126-0001-packer-key-guard-and-slot-clone.md`.
+      Acceptance: guard + clone landed as two commits; both R0 artefacts
+      committed BEFORE either. A PLAN diff from the guard means that query was
+      returning wrong rows — record it prominently as a bug fix.
+      Bar: UNITS + SMOKE + SPOT + PLAN + DS05 per code commit (the R0 capture
+      commit is docs/evidence only).
+- [ ] **M0126-0002 — `EstimateRows` `*MultiHashJoin` arm + plan re-baseline.**
+      `internal/planner/cardinality.go:38+` has no `*MultiHashJoin` case, so
+      every packed MHJ estimates **0 rows** and every ancestor's
+      `BuildLeft`/algorithm decision above a packed chain is taken on that zero
+      — in the default configuration, today (`buildLeft` needs BOTH sides > 0,
+      `bushy.go:1375`). Add the arm (estimate consistently with the `*Join`
+      arm's method), hand-review the EXPECTED plan diffs, re-capture the
+      snapshot. **Blocking: no -0005 measurement before this is baselined** —
+      otherwise a packing A/B moves two variables.
+      Design `docs/design/0126-0002-mhj-cardinality-arm-and-plan-rebaseline.md`.
+      Acceptance: no MHJ estimates 0 rows; every PLAN hunk enumerated and
+      classified (improvement/regression/neutral) in the commit message;
+      snapshot re-captured; DS05 rows/checksums unchanged.
+      Bar: UNITS + SMOKE + SPOT + PLAN (diffs expected, hand-reviewed) + DS05.
+- [ ] **M0126-0003 — Live-path de-materialisation + slot-taking hash-key
+      evaluator.** Stage 0a-live: `*VirtualSlot` fast path in
+      `Slot.fillFromTupleSlot` (`internal/executor/opnode.go:129-150`) reading
+      `v.Get(i)` straight into `s.Cells` — kills the `acquireRow` + double copy
+      on the live path (`joinOpKernelNext`, `opnode.go:868-876`). Stage 0b:
+      extract `evalHashKeyDatumSlot` (from `evalHashKeyDatum`,
+      `operators_join_agg.go:960-968`, which takes a `Row` and cannot be reused
+      as-is) and evaluate keys against a `VirtualSlot` over
+      `{realSide, nullOtherSide}`, deleting the per-probe-row `lazyKeyRow`
+      memcpy (`:653-659`, `:1219-1232`) — build loops and probe path switch in
+      the SAME commit (sibling-path rule). 0b is a hard prerequisite of -0006.
+      Design `docs/design/0126-0003-live-path-dematerialisation-and-slot-key-eval.md`.
+      Acceptance: two commits (0a-live, 0b); zero plan diffs; never folded with
+      any cost-model change.
+      Bar: UNITS + SMOKE + SPOT + PLAN (ZERO diffs — any diff is a failure) +
+      DS05.
+- [ ] **M0126-0004 — Legacy `Build`-path slot chaining.** **CONDITIONAL on
+      -0003's interim A/B showing the legacy path still carries bench
+      traffic** (the decider is -0003 alone — -0005 runs after this task) (expected IN: `buildRec` migrates no `Aggregate`, so every
+      aggregate-topped TPC-H star runs its joins under legacy `Build` — bundle
+      02 §9). Hold the child's `TupleSlot` as a source of the join's output
+      `VirtualSlot`; the F7 contract is binding — the child does NOT return a
+      stable slot object (`lazyVirtualOut` / `lazyOuterOnlySlot` / fresh
+      `Materialize()` / fresh `asSlot`), so re-bind the source per probe pull
+      with a copy fallback, and ship a fan-out test (multiple matches per probe
+      row). If the slab serves every benchmarked query, close as
+      measured-unnecessary with a ledger row — no speculative lifetime work.
+      Design `docs/design/0126-0004-legacy-build-path-slot-chaining.md`.
+      Acceptance: chaining + fan-out test landed, or the measured-unnecessary
+      close with its ledger row.
+      Bar: UNITS + SMOKE + SPOT + PLAN (zero diffs) + DS05.
+- [ ] **M0126-0005 — Stage 0 A/B + fusion go/no-go decision.** No code. TPC-H
+      SF1 A/B (65433) with/without -0003(+-0004), **`mhjPackingEnabled` forced
+      off** (`SetMHJPackingEnabled`, `bushy.go:582-587`), matched server age /
+      GOGC / GOMEMLIMIT, plus an MHJ-on reference arm →
+      `analysis/cost-driven-second-try-200731/evidence/stage0-ab.txt`. **Derive
+      the packing query set at the measurement HEAD by EXPLAIN** — never
+      inherit a historical list (F15). **DECISION FORK: cascade within ~1.5× of
+      fused MHJ on the packing set → SKIP -0006 and -0007 entirely** (ledger
+      rows; the bundle's best outcome); else they are IN with the residual gap
+      quantified.
+      Design `docs/design/0126-0005-stage0-ab-and-fusion-decision.md`.
+      Acceptance: evidence file committed with per-query times, HEAD SHA, env,
+      and the written decision; an unwritten decision is an incomplete task.
+      Bar: SPOT per arm + DS05 at the measurement HEAD.
+- [ ] **M0126-0006 — Fusion scaffolding + differential harness (switch OFF).**
+      **CONDITIONAL on M0126-0005** ("a large gap remains"). `buildEnv`
+      threading through `Build`/`buildRec` (root, `inWorker` from
+      `newGatherOp`'s closure `executor.go:213-219`, under-instrumentation flag
+      from `explainOp.Open`, switch state, memoised Q0; `Build(plan)` stays a
+      wrapper — the largest single piece, budget it); new
+      `internal/executor/fused_hash_join.go` (`tryFuseHashCascade` per bundle
+      05 Q0–Q9 fail-closed, `fusedHashJoinOp` per 04 §5-7 incl. C15 re-entrant
+      Open), called FIRST in the `*planner.Join` arm of BOTH builders; KS1
+      `GOOPG_RUNTIME_JOIN_FUSION` (default OFF) + KS2 `…_MIN_LEVELS=3`; a
+      `collectShareableJoins` case or a never-coexist assertion (F4);
+      decline-reason counters (R10). Nine named tests incl.
+      `TestFusedCascadeMatchesUnfused` (ordered-text DIFF) and
+      `TestFusedSchemaElementWiseIdentity` (width alone must not gate — F1).
+      Design `docs/design/0126-0006-fusion-scaffolding-and-differential-harness.md`.
+      Acceptance: all nine tests present and green; with the switch off every
+      gate is bit-identical to the pre-task run (no-op in production by
+      construction).
+      Bar: UNITS + SMOKE + SPOT + PLAN + DS05 (all bit-identical) + DIFF.
+- [ ] **M0126-0007 — Fusion enablement and measurement.** **CONDITIONAL on
+      M0126-0006.** No new code: KS1 on in the measurement environment only.
+      **F12 trap: force `SetMHJPackingEnabled(false)` for every measurement —
+      never via `GOOPG_COST_DRIVEN_JOINORDER=1`, which conflates order into the
+      A/B.** Deliver the six-item matrix: DIFF over the whole corpus; DS05 zero
+      row AND checksum deltas; SPOT; a low-`work_mem` spill run identical
+      fused/unfused with non-zero temp files both sides (C8/R4); SF1 A/B →
+      `evidence/stage2-ab.txt` + decline histogram; SMOKE (R11). "Leave the
+      switch off permanently" is a legitimate recorded completion. KS1 flips
+      off without debate on any DS05/SPOT/DIFF delta, any new hang/OOM in a
+      previously-completing query, or any new pg-regress diff (bundle 10 §4).
+      Design `docs/design/0126-0007-fusion-enablement-measurement.md`.
+      Acceptance: matrix complete with zero correctness deltas, and either a
+      measured win exceeding Stage 0's or the recorded off-permanently verdict.
+      Bar: DIFF + DS05 + SPOT + low-work_mem run + SF1 A/B + SMOKE.
+- [ ] **M0126-0008 — Cost-driven order re-validation with symmetric
+      timeouts.** The 2026-07-24 A/B pair used 600 s vs 300 s and is invalid as
+      a comparison. Re-run `GOOPG_COST_DRIVEN_JOINORDER=1` vs default at
+      post-Stage-0 HEAD, SAME timeout both arms, matched fresh servers, →
+      `evidence/stage3-order-ab.txt` with the per-query table
+      `query | R0 s | integer s | cost-driven s | ratio | bar verdict
+      (clause-by-clause)`. Tests 07 §5's hypothesis: if Q9 collapses with no
+      planner change, the order was never wrong — the executor was. Prior
+      failure set to watch: Q5/Q21 HANG, Q9 timeout, Q7/Q10/Q18 2–11×.
+      **FORK: zero bar-clause failures → skip -0009/-0010** (ledger rows).
+      Design `docs/design/0126-0008-cost-driven-order-symmetric-revalidation.md`.
+      Acceptance: evidence file with clause-by-clause verdicts, not narrative.
+      Bar: SPOT per arm + DS05 at measurement HEAD.
+- [ ] **M0126-0009 — Order-failure attribution (diagnosis only, bounded).**
+      **CONDITIONAL: -0008 leaves ≥1 query failing.** Per failing query: ONE
+      attribution pass, ≤2 measured probes, `EXPLAIN ANALYZE` both arms, verdict
+      naming exactly one of — (a) cardinality estimate (cost-model 14's §2-§5
+      thesis is refuted, do not re-test), (b) join-order preference (doc 15),
+      (c) build-side memory not modelled (EXPECTED for Q5/Q9/Q21 — the planner
+      has no work_mem analogue; routes to -0013's evidence), (d) executor
+      per-row cost surviving Stage 0. NO code changes. Q5 is (a)/(b)/(c) by
+      construction — it contains no MHJ. Unattributed-after-budget → ledger row
+      + no-go input to -0012.
+      Design `docs/design/0126-0009-order-failure-attribution.md`.
+      Acceptance: one `evidence/order-attribution-Q<N>.txt` per failing query +
+      a summary table (query → class → routing).
+      Bar: evidence committed; SPOT hygiene after probe servers.
+- [ ] **M0126-0010 — Bounded order-quality / cardinality fixes.**
+      **CONDITIONAL: -0009 produced ≥1 class-(a)/(b) attribution.** ≤1 fix per
+      query, its own commit, A/B'd on its own query AND the full 22, reverted
+      if it does not move its own query. HARD PROHIBITIONS (07 §6 / doc 15): no
+      new penalty multiplier on cost totals, no shape preference, no global
+      NDistinct rewrite. STOP: bar met, or 2 attempts/query, or 4 landed
+      commits total — then close with residuals named and ledger rows filed.
+      Class-(c) work is NOT attempted here (it belongs to -0013; mixing it in
+      makes every A/B two-variable).
+      Design `docs/design/0126-0010-bounded-order-quality-fixes.md`.
+      Acceptance: each landed fix moved its own query; reverted attempts keep
+      their measurements under `evidence/`.
+      Bar: UNITS + SMOKE + SPOT + PLAN (cost-driven-arm diffs hand-reviewed) +
+      DS05 + per-query timed A/B, per commit.
+- [ ] **M0126-0011 — Retire `MultiHashJoin` as a plan node (default off, code
+      retained).** **UNCONDITIONAL (sequencing-gated: -0005 decided and -0007
+      green/declined/skipped — both resolve on every path); the bundle's
+      "packing queries no longer regress" precondition is demoted to a
+      REPORTING obligation (record any residual regression's magnitude; it
+      feeds -0012's verdict) because -0012 structurally requires this task
+      (single-variable A/B).** Flip
+      `mhjPackingEnabled` default → false (`bushy.go:580`); KEEP
+      `rewriteMultiWayChain`, the node and `multi_hash_join.go` in-tree,
+      reachable via `SetMHJPackingEnabled`, ≥1 full nightly cycle (deleting
+      code and changing behaviour in one commit is unbisectable). Four-step
+      snapshot procedure (bundle 06 §5): PLAN green → flip → HAND-REVIEW every
+      diff (each must be exactly one MHJ node expanding into N−1 Hash Joins
+      over the same scans) → `make plan-snapshot-capture LABEL=post-mhj-retire`.
+      Ship `scripts/pg-plan-shape-diff.sh` REPORT MODE ONLY. Settle
+      `generateMultiHashJoinPath` (`pathgen.go:100-105`) in writing. **MUST
+      precede -0012** (single-variable A/B — `GOOPG_COST_DRIVEN_JOINORDER=1`
+      sets `mhjPackingEnabled=false` as a side effect, `bushy.go:18-21`).
+      Design `docs/design/0126-0011-mhj-plan-node-retirement.md`.
+      Acceptance: default flipped; diffs hand-reviewed and enumerated; new
+      baseline captured; MHJ code still reachable; the pathgen decision written.
+      Bar: UNITS + SMOKE + SPOT + DS05 + PLAN (hand review) + full TPC-H SF1
+      sweep vs `sf1-r5-default-cb37d166.txt` and the -0005 prediction.
+- [ ] **M0126-0012 — Acceptance measurement + conditional default flip.**
+      Terminal fork, AFTER -0011. Measure ALL FOUR bar clauses at final HEAD vs
+      R0 (protocol = -0008's: symmetric timeouts, quiet host, matched fresh
+      servers) → `evidence/acceptance-run-1.txt`, clause-by-clause. **Bar met →
+      flip**: cost-driven join order default-on (`bushy.go:13-21`, env var
+      becomes opt-out; note — do not delete — the now-redundant
+      `mhjPackingEnabled=false` side-effect), re-snapshot, update every "ships
+      off by default" statement (enumerated in the commit message). **Bar
+      missed → documented no-go that TRIGGERS -0013** (failing clauses,
+      residual queries, their -0009 attributions). Both outcomes are successful
+      completions; an unmeasured outcome is the only failure. No partial flip.
+      Design `docs/design/0126-0012-cost-driven-order-default-flip.md`.
+      Acceptance: `acceptance-run-1.txt` with all four clauses judged; then the
+      flip commit or the no-go document.
+      Bar: full timed TPC-H SF1 acceptance run + DS05 (zero deltas) + SPOT +
+      PLAN re-snapshot with hand review + UNITS + SMOKE.
+- [ ] **M0126-0013 — Build-side memory-aware hash costing (conditional
+      remediation, filed by the USER 2026-07-31) + bar re-check.**
+      **CONDITIONAL: fires ONLY on an -0012 no-go.** The Q5/Q9/Q21 HANGs are
+      not a duration problem — the planner has NO work_mem/hash_mem analogue
+      and picks enormous build sides unpenalised (`hashJoinCost`,
+      `internal/planner/cost_funcs.go:100-112`, omits batching by its own
+      comment). Add the hash-table byte estimate + work_mem-overrun
+      penalty/spill cost — the analogue of PG `initial/final_cost_hashjoin`
+      (`postgres/src/backend/optimizer/path/costsize.c:4134,4160`) +
+      `ExecChooseHashTableSize` (`nodeHash.c:658`), budget =
+      `work_mem × hash_mem_multiplier` (`get_hash_memory_limit`,
+      `nodeHash.c:3622`). `goopg_hash_entry_width_multiplier` default 6.0
+      (48-byte Datum realism) applied to the MEMORY/SPILL DECISION ONLY — never
+      the cost total (doc 15's GOOPG_MAT_MULT lesson); a unit test proves a
+      non-spilling join's total is bit-identical under multiplier changes. Max
+      2 commits, never with an executor change. Then RE-RUN -0012's measurement
+      protocol unchanged → `evidence/acceptance-run-2.txt` with a delta column
+      vs run 1, and re-judge: pass → execute -0012's flip path; fail → the
+      milestone's final documented no-go. If -0012 passed and this never fires:
+      close as not-triggered with a ledger row naming bundle 07 §7 and a
+      successor owner — a silent skip is a bookkeeping defect.
+      Design `docs/design/0126-0013-build-side-memory-aware-hash-costing.md`.
+      Acceptance: either (model landed with the multiplier-placement unit test
+      green, default-config plans byte-identical, cost-driven-arm diffs
+      enumerated, acceptance-run-2 recorded with deltas, final verdict written)
+      or (the not-triggered close with its 07 §7 ledger row).
+      Bar: UNITS + SMOKE + SPOT + PLAN (default arm ZERO diffs) + DS05 + the
+      re-run acceptance protocol.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
@@ -5095,10 +5385,12 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 ## M0123 — Canonical `pg_node_tree` serialization (branch `wal-pg-nodetree`)
 
 **Priority: DEMOTED 2026-07-28, renumbered 2026-07-28(b) when M-NIGHTLY was
-parked: the order is WIP-recovery (#1), M0124 (#2), M0125 (#3), the M-NIGHTLY
-backlog (#4), and M0123 (#5). Superseded wording kept below for history: After
-WIP-recovery (#1), M-NIGHTLY (#2),
-M0124 (#3) and M0125 (#4), M0123 is #5.** It remains the active focus of branch
+parked, renumbered again 2026-07-31 when M0126 was filed: the order is
+WIP-recovery (#1), M0124 (#2), M0125 (#3), **M0126** (#4), the M-NIGHTLY
+backlog (#5), and M0123 (#6). Superseded wording kept below for history:
+~~the order is WIP-recovery (#1), M0124 (#2), M0125 (#3), the M-NIGHTLY
+backlog (#4), and M0123 (#5)~~; and before that: After WIP-recovery (#1),
+M-NIGHTLY (#2), M0124 (#3) and M0125 (#4), M0123 is #5.** It remains the active focus of branch
 `wal-pg-nodetree`, but this checkout (`tpcds-fix2`) closes the TPC-DS round-2
 plan first — see the Current Priority banner and
 `docs/design/tpcds-round2-fixes/README.md` §13.5. Milestone doc:
