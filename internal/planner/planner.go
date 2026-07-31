@@ -5339,7 +5339,17 @@ type aggregateSurface struct {
 	// t.f1 to also appear in GROUP BY — unlike non-USING GROUP BY c which satisfies
 	// SELECT t.c. M0097-0155.
 	groupByMergedByName map[string]bool
-	aggregateByKey      map[string]aggregateBinding
+	// groupByAmbiguous marks parserExprKey values claimed by more than one
+	// GROUP BY item. parserExprKey deliberately drops the table qualifier, so
+	// every alias of a self-joined table hashes to the same key and only the
+	// last one keeps the slot. Where that happens the name no longer identifies
+	// a slot and the target list must resolve by binding instead. M0125-0044.
+	groupByAmbiguous map[string]bool
+	// groupByExprQual is the same map as groupByExpr but keyed WITH the
+	// ColumnRef qualifiers, so d1.d_year and d2.d_year occupy separate
+	// entries. Consulted only for a contested key. M0125-0044.
+	groupByExprQual map[string]int
+	aggregateByKey  map[string]aggregateBinding
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -5949,6 +5959,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
+	groupByAmbiguous := map[string]bool{}
+	groupByExprQual := map[string]int{}
 	var groupByMergedByName map[string]bool // populated only when USING-join cols appear in GROUP BY
 	outputSchema := make(Schema, 0, len(s.GroupBy)+len(s.Targets))
 
@@ -5972,7 +5984,28 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			return nil, nil, nil, nil, err
 		}
 		idx := len(outputSchema)
-		groupByExpr[parserExprKey(g)] = idx
+		key := parserExprKey(g)
+		// M0125-0044: two GROUP BY items can collide on one qualifier-blind key
+		// — d1.d_year and d2.d_year over a self-joined date_dim both hash to
+		// "c:d_year" — and the map keeps only the last. Record the collision so
+		// the target list resolves such references by binding instead of by
+		// name. GROUP BY a, a is NOT ambiguous: it names one slot twice, which
+		// is why the check is "already bound to the same slot", not "duplicate
+		// key". groupByInputCol is read before this iteration writes to it, so
+		// the second alias is correctly seen as unbound rather than as slot 0.
+		if prev, dup := groupByExpr[key]; dup {
+			sameSlot := false
+			if c, isCol := r.(*ColumnRef); isCol {
+				if at, bound := groupByInputCol[c.Index]; bound && at == prev {
+					sameSlot = true
+				}
+			}
+			if !sameSlot {
+				groupByAmbiguous[key] = true
+			}
+		}
+		groupByExpr[key] = idx
+		groupByExprQual[qualifiedGroupKey(g)] = idx
 		if c, ok := r.(*ColumnRef); ok {
 			groupByInputCol[c.Index] = idx
 		}
@@ -6124,6 +6157,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr:         groupByExpr,
 		groupByInputCol:     groupByInputCol,
 		groupByMergedByName: groupByMergedByName,
+		groupByAmbiguous:    groupByAmbiguous,
+		groupByExprQual:     groupByExprQual,
 		aggregateByKey:      aggByKey,
 		node:                aggNode,
 		funcDepCols:         map[int]int{},
@@ -6268,8 +6303,60 @@ func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
 	}
 }
 
+// groupBySlotContested maps a target-list expression onto the GROUP BY slot it
+// occupies, for the case where parserExprKey alone cannot say which one that is.
+//
+// It exists because parserExprKey is deliberately qualifier-blind — GROUP BY c
+// has to satisfy SELECT t.c, and lower(c) has to satisfy lower(t.c), neither of
+// which the parser can tell apart before column resolution (M0097-0003). The
+// cost of that blindness is that every alias of a self-joined table collapses
+// onto one key: with GROUP BY d1.d_year, d2.d_year both items hash to
+// "c:d_year" and only the last keeps the slot, so the target list projects one
+// alias's value for both.
+//
+// Two answers are tried, in this order:
+//
+//   - the qualified key, which is what actually distinguishes d1.d_year from
+//     d2.d_year at parser level, and which covers computed keys (d1.y + 0) as
+//     well as bare columns;
+//   - failing that, for a bare column, the input-column map — this catches the
+//     mixed spelling GROUP BY y, d2.y, where SELECT d1.y is the unqualified
+//     item's column under a different spelling.
+//
+// Deliberately NOT tried: comparing resolved expressions against
+// Aggregate.GroupExprs. Those are indexed against the aggregate's CHILD schema,
+// which join reordering permutes, so a freshly resolved copy of the identical
+// expression can carry a different ColumnRef.Index and read unequal — measured,
+// not assumed (a d2.y whose group-key twin had been remapped from index 5 to 1).
+//
+// Returns found=false whenever it cannot place the expression; the caller then
+// stops trusting the contested key rather than falling back to it. Aggregate
+// calls are excluded — they are dispatched by aggregateByKey. M0125-0044.
+func groupBySlotContested(e parser.Expr, agg *aggregateSurface) (int, bool) {
+	if exprHasAggregate(e) {
+		return 0, false
+	}
+	if slot, ok := agg.groupByExprQual[qualifiedGroupKey(e)]; ok {
+		return slot, true
+	}
+	if cr, isColRef := e.(*parser.ColumnRef); isColRef {
+		resolved, err := resolveColumnRef(cr, agg.input)
+		if err != nil {
+			return 0, false
+		}
+		col, isCol := resolved.(*ColumnRef)
+		if !isCol {
+			return 0, false
+		}
+		slot, ok := agg.groupByInputCol[col.Index]
+		return slot, ok
+	}
+	return 0, false
+}
+
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
-	if idx, ok := agg.groupByExpr[parserExprKey(e)]; ok {
+	key := parserExprKey(e)
+	if idx, ok := agg.groupByExpr[key]; ok {
 		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
 		// GROUP BY entry was an unqualified USING-join merged column (GROUP BY f1),
 		// the two are semantically different — PostgreSQL requires the qualified column
@@ -6278,6 +6365,23 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		skipMatch := false
 		if cr, isColRef := e.(*parser.ColumnRef); isColRef && cr.Table != "" {
 			skipMatch = agg.groupByMergedByName[strings.ToLower(cr.Column)]
+		}
+		// M0125-0044: when several GROUP BY items share this key, the key names
+		// no slot in particular — a self-joined table's aliases all hash to it,
+		// and the map holds only the last one written. Re-resolve the expression
+		// and take the slot its *binding* owns.
+		if !skipMatch && agg.groupByAmbiguous[key] {
+			if bound, found := groupBySlotContested(e, agg); found {
+				idx = bound
+			} else {
+				// The key is contested and this expression is none of the
+				// contenders — SELECT d3.y under GROUP BY d1.y, d2.y. Keeping
+				// the name-keyed slot would project a different alias's value,
+				// so fall through and let the expression be resolved on its own
+				// terms: a functionally-determined column becomes a passthrough,
+				// and anything else raises the 42803 PostgreSQL raises here.
+				skipMatch = true
+			}
 		}
 		if !skipMatch {
 			return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil

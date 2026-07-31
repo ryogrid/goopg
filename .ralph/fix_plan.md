@@ -454,6 +454,23 @@ started.
 >       change, not a planner one. Standing order inside M0125 is therefore
 >       **`M0125-0044` → `-0034`'s Q65 remainder / `-0035`'s CTE-body arm →
 >       `M0125-0038` (last)**. Two ledger rows 2026-07-31.
+>       **↳ `M0125-0044` LANDED 2026-07-31 (loop #16) and is CHECKED.** Q64
+>       MISMATCH → **PASS, 2 rows, ck=31f0342ff9d55c4a**, and the full 99-query
+>       SF0.5 gate moved **exactly 1 of 99 cells** vs HEAD `d50c0b4a`
+>       (PASS=93 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=4). The
+>       collapse was in the **aggregate surface**, not projection resolution
+>       generally — without GROUP BY the same query projects correctly — and
+>       the cause is `parserExprKey`'s deliberate qualifier-blindness
+>       (M0097-0003) colliding every alias of a self-joined table onto one
+>       GROUP BY slot. Design
+>       `docs/design/0125-0044-groupby-alias-slot-collapse.md`, two ledger
+>       rows. It also FILED **`M0125-0045`**: `aggregateCallKey` shares the
+>       blind key, so `count(d1.y)` and `count(d2.y)` dedup onto one aggregate
+>       slot (measured — both targets resolve to agg slot 0). That one is NOT
+>       gate-reachable (no SF0.5 query aggregates two aliases of one table), so
+>       it ranks below the gate-visible items. **NEXT SELECTION: `-0034`'s Q65
+>       remainder / `-0035`'s CTE-body arm, then `M0125-0045`, then
+>       `M0125-0038` last.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -4323,8 +4340,35 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `IN (subquery)`'s `OuterColumnRef`s are never translated through `posMap`.
       Fold it into this fix or file it when the fix lands (ledger row).
 
-- [ ] **M0125-0044 — a SILENT WRONG ANSWER: multiple aliases of the same table
-      collapse to one alias in projection resolution** (filed 2026-07-31 by
+- [x] **M0125-0044 — a SILENT WRONG ANSWER: multiple aliases of the same table
+      collapse to one alias in projection resolution** — **FIXED and landed
+      2026-07-31.** The collapse was in the AGGREGATE SURFACE, not in projection
+      resolution generally: without GROUP BY the same query projects correctly.
+      `parserExprKey` drops a `ColumnRef`'s qualifier on purpose (GROUP BY `c`
+      must satisfy SELECT `t.c` — M0097-0003), so every alias of a self-joined
+      table hashes to one key, `groupByExpr[key] = idx` keeps only the LAST
+      GROUP BY item, and `resolveExprAfterAggregate` consults that name-keyed
+      map BEFORE its own correct index-keyed path. Grouping was never wrong
+      (`GroupExprs` holds two distinct resolved refs), which is why every
+      row-count gate stayed green. Fix leaves `parserExprKey` alone and adds a
+      qualifier-preserving key (`qualifiedGroupKey`,
+      `internal/planner/groupby_alias_key.go`) consulted only where the first is
+      contested — "contested" = already bound to a DIFFERENT slot, so
+      `GROUP BY a, a` is correctly not ambiguous. A contested key that places
+      nothing is abandoned, not fallen back on, so `SELECT d3.y` under
+      `GROUP BY d1.y, d2.y` now raises PG's 42803 instead of another alias's
+      value. **Recorded negative result:** matching resolved exprs against
+      `Aggregate.GroupExprs` with `exprEqual` was implemented and is WRONG —
+      those are indexed against the child schema, which join reordering
+      permutes (observed: a `d2.y` twin remapped from index 5 to 1). Measured:
+      Q64 → `64|OK|2|31f0342ff9d55c4a`; full 99-query SF0.5 gate PASS=93
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=4 with **exactly 1 of 99
+      cells moved** vs HEAD `d50c0b4a`; TPC-H 22/22 plans MATCH
+      (`m0125-0043-after`), `tpch-spotcheck.sh` PASS, units PASS. Design
+      `docs/design/0125-0044-groupby-alias-slot-collapse.md`; evidence
+      `analysis/m0125-0044/`; tests
+      `internal/planner/groupby_alias_collapse_test.go`. Two ledger rows
+      2026-07-31. (filed 2026-07-31 by
       `M0125-0034`'s connectivity arm; evidence
       `analysis/m0125-0034b/README.md` §"Q64's MISMATCH", probes
       `analysis/m0125-0034b/{q64body,alias_a,alias_b}.sql`).
@@ -4360,6 +4404,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Acceptance: `alias_a.sql` matches PG column-for-column, and Q64 →
       `64|OK|2|<oracle ck>` in the SF0.5 gate. Bar: units +
       `tpch-spotcheck.sh` + TPC-H plan-diff + the full 99-query SF0.5 gate.
+
+- [ ] **M0125-0045 — the same qualifier-blind key collapses AGGREGATE slots:
+      `count(d1.y)` and `count(d2.y)` dedup onto one** (filed 2026-07-31 by
+      `M0125-0044`, which fixed the GROUP-BY-key half of the identical cause).
+      `aggregateCallKey` builds its dedup key from `parserExprKey`, whose
+      ColumnRef arm drops the table qualifier, so two aggregates over two
+      aliases of one table hash equal and `buildAggregateStage`'s
+      `if _, exists := aggByKey[k]; exists { continue }` discards the second.
+      **Measured, not inferred:** a planner probe on
+      `SELECT count(d1.y), count(d2.y) FROM fact, dim d1, dim d2 WHERE …`
+      resolves BOTH targets to agg slot 0. PostgreSQL keys aggregate equality
+      on the resolved argument Vars (`equal()` over `Aggref->args`,
+      `postgres/src/backend/nodes/equalfuncs.c`), which separates them by
+      varno. Same right-cardinality/wrong-values signature as -0044,
+      M0125-0013 and M0125-0009. Resume point: give `aggregateCallKey` the
+      contested-key treatment -0044 gave GROUP BY — detect a collision on
+      `parserExprKey` where `qualifiedGroupKey` differs, and key those calls on
+      the qualified form. **No SF0.5 query exercises this**, so the gate can
+      neither prove nor disprove a change: acceptance must be a planner unit
+      test plus a PG-oracle diff on a hand-written query, NOT the sweep. Bar:
+      units + `tpch-spotcheck.sh` + the full 99-query SF0.5 gate (as a
+      no-regression check, not as evidence). Ledger row 2026-07-31.
 
 ## M0126 — Cost-driven planning made production-viable (filed 2026-07-31)
 
