@@ -397,6 +397,20 @@ started.
 >       variant — its body warns explicitly NOT to assume -0036's pass
 >       generalises), then `-0034`'s join-order arm, then `M0125-0038` last.
 >       Three ledger rows 2026-07-31.
+>       **↳ `M0125-0041` WAS WORKED 2026-07-31 (loop #14): its root cause is
+>       found, fixed and equivalence-tested, but the ITEM STAYS OPEN because its
+>       acceptance is a completing Q30 and Q30 still TIMEOUTs — at 300 s AND at
+>       1200 s.** The scalar pull-up never declined; it died on
+>       `clonePlanReplacingOuter`'s missing `*CTEScan` arm, so a capability gap
+>       wore the costume of a policy decision (design
+>       `docs/design/0125-0041-cte-scalar-sublink-decorrelation.md`, two ledger
+>       rows). The residual is C1 and it is now ISOLATED: the plan lost
+>       `SubPlan 1` but keeps a `Nested Loop (CROSS)` of ~2×10⁴ CTE rows × 5×10⁴
+>       `customer_address` rows = 10⁹ pairs. **NEXT SELECTION: `-0034`'s
+>       join-order arm** (which now also owns Q30/Q81's acceptance), then
+>       `M0125-0038` last. Its first probe on this query is written down in the
+>       -0041 item body: `ca_state = 'AR'` still does not reach the
+>       `customer_address` scan.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -1577,6 +1591,16 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 > M0125 IS `M0125-0041`**, per the standing order below (`-0043` → `-0042` →
 > `-0041` → `-0034`'s join-order arm → `-0038` last), since `-0042` landed in
 > loop #12. The historical wording of this block follows.
+>
+> **⚡ AMENDED 2026-07-31 (loop #14) — `M0125-0041` HAS BEEN WORKED; NEXT
+> SELECTION IS `M0125-0034`'s join-order arm.** -0041's root cause is fixed and
+> equivalence-tested (the scalar pull-up never declined — it died on
+> `clonePlanReplacingOuter`'s missing `*CTEScan` arm), but **the item stays
+> UNCHECKED**: its acceptance is a completing Q30, and Q30 still TIMEOUTs at
+> both 300 s and 1200 s on the C1 Cartesian product that `-0034` owns. Do not
+> re-select `-0041` to "finish" it by more decorrelation work — the measurement
+> says the remaining factor is join order. Design
+> `docs/design/0125-0041-cte-scalar-sublink-decorrelation.md`.
 >
 > **⚡ SELECT THIS FIRST WITHIN M0125 (added 2026-07-31 by the USER).**
 > **`M0125-0043` (benchmark-name hardcoding in `operators_ddl.go` / `open.go`)
@@ -4043,6 +4067,54 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       refuted the same way. Do NOT assume the -0036 pass generalises.
       Acceptance: **Q30 completes and matches `30|OK|31|f47a48499fd7e070`**.
       Bar: as `M0125-0034`.
+      **↳ ROOT CAUSE FOUND AND FIXED 2026-07-31 (loop #14) — but the item STAYS
+      OPEN, because its acceptance is a completing Q30 and Q30 still TIMEOUTs.**
+      Design doc `docs/design/0125-0041-cte-scalar-sublink-decorrelation.md`;
+      two ledger rows 2026-07-31. The filing's instruction ("find out why the
+      pull-up declines") was right and its answer is that **it never declined**:
+      a probe printing every gate's verdict for the Q30 skeleton shows
+      `canUnnestSubquery`=true, `avg` NULL-on-empty, the `*1.2` target strict,
+      the conjunct AND-reachable, 1 param / 0 residuals, inner not probe-cheap.
+      The pull-up then died in `clonePlanReplacingOuter`, which had **no switch
+      arm for `*planner.CTEScan`** — and a clone failure is a *bail*, so a
+      capability gap looked exactly like a policy decision, for every query
+      whose correlated sublink reads a CTE. Fixed by adding `*CTEScan` (body
+      shared verbatim — `WITH` is not `LATERAL`, so the correlation always sits
+      in a `Filter` above it, and sharing is what lets the executor's name-keyed
+      `ctx.CTERowCache` materialize the body once) + `*MaterializedCTEScan`,
+      guarded by `planSubtreeHasOuterRefDeep` (a body with an outer ref must not
+      be shared: it would collide with an un-rewritten consumer under the same
+      CTE name), with matching arms in the sibling `planCloneSupported`.
+      Equivalence-tested (pull-up on vs off, control arm asserts the SubPlan
+      path really ran, NULL correlation key included), not merely shape-tested.
+      **The remaining factor is C1 = `M0125-0034`, and it is now isolated:**
+      Q30's plan lost `SubPlan 1` but retains `Nested Loop (CROSS)` between the
+      ~2×10⁴-row CTE and a full 5×10⁴-row `customer_address` scan = **10⁹ pairs**,
+      each driving an index probe into `customer`. Q30 measured TIMEOUT at BOTH
+      **300 s and 1200 s** — a shape defect, not a budget crossing (same verdict
+      class as Q21/`M0125-0032`). §C3 had already named C1 as compounding this
+      class; the 2×10¹³ price is now factored, and this task removed its
+      CTE-rescan factor. **Next probe for whoever takes -0034 here:**
+      `ca_state = 'AR'` is a single-table local filter that would shrink
+      `customer_address` ~50×, yet it still sits in the top `Filter` beside the
+      (formerly sublink-bearing) conjunct instead of on the scan — find out
+      whether the sublink's presence in that predicate is what kept it there.
+      Also recorded (ledger): goopg's parser rejects `WITH` inside a sublink
+      where PG accepts it, which is why the outer-ref guard has no test.
+      **⚠ GATE HYGIENE, affects the bar for the next plan-shape task:
+      `make plan-diff LABEL=tpcds-round2-head` now reports 22/22 diverged, with
+      OR WITHOUT this change** — the same-cluster stash A/B shows the live plans
+      are byte-identical in both arms, so the label is STALE, not regressed. The
+      divergence is systematic (the snapshot has bare `Seq Scan on public.orders`
+      and no `Gather`; every live plan carries `(stats)`, real estimates and
+      parallel workers), i.e. a baseline captured S-cold against a cluster the
+      warm-stats programme (`M0125-0028`…`-0030`, which made the bench build
+      scripts ANALYZE) has since warmed. **Re-capture the label before relying on
+      it**; until then a stash A/B is the only meaningful TPC-H plan-shape
+      evidence. Gates this loop: full SF0.5 sweep PASS=89 MISMATCH=0 CKMISMATCH=0
+      ERROR=0 TIMEOUT=6 SKIP=4 with **all 99 cells identical in status, rows and
+      checksum** to the pre-change baseline; TPC-H plan A/B 0/22;
+      `tpch-spotcheck` PASS (Q12=2 Q13=35); units gate PASS.
 
 - [x] **M0125-0042 — two OR-ed uncorrelated `IN (subquery)` sublinks over-match
       under a SEMI join over an MHJ** (filed 2026-07-31 by `M0125-0036`, found

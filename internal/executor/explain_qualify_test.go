@@ -87,11 +87,21 @@ func TestExplainQualifiesUpperFilter(t *testing.T) {
 // `(ctr1.ctr_state = ctr_state)` — outer side qualified, inner side bare —
 // and that asymmetry is the whole diagnostic value, so the test pins both
 // halves.
+//
+// M0125-0041 note on the aggregate spelling: this fixture used `max(c2.id)`
+// until the scalar pull-up learned to clone a CTE reference, at which point
+// Q30's own spelling stopped producing a SubPlan at all — it decorrelates
+// into a GROUP BY + hash join, and the correlated Filter line under test
+// ceases to exist. The rule being pinned here belongs to the SubPlan path,
+// so the fixture pins it with `count(*)`: canUnnestSubquery rejects the Star
+// spelling permanently (count returns 0 over an empty group, so the
+// INNER-join rewrite would be wrong), which keeps this a correlated SubPlan
+// no matter how far decorrelation coverage grows.
 func TestExplainQualifiesCorrelatedOuterRef(t *testing.T) {
 	lines := qualifyExplainLines(t,
 		"EXPLAIN WITH c AS (SELECT id, st FROM eq_r) "+
 			"SELECT c1.id FROM c c1 "+
-			"WHERE c1.id > (SELECT max(c2.id) FROM c c2 WHERE c2.st = c1.st)")
+			"WHERE c1.id > (SELECT count(*) FROM c c2 WHERE c2.st = c1.st)")
 
 	got := findLine(lines, "st = ")
 	if got == "" {
@@ -116,8 +126,16 @@ func TestExplainQualifiesCorrelatedOuterRef(t *testing.T) {
 // that with explainNames.resolveInAncestor.
 //
 // Verified against PostgreSQL 18.3 on the TPC-DS SF=0.5 cluster (:65437 vs
-// :65438): TPC-DS Q30 and Q81 now render this line byte-identically to PG's
-// `Filter: (ctr1.ctr_state = ctr_state)`.
+// :65438): TPC-DS Q30 and Q81 render this line byte-identically to PG's
+// `Filter: (ctr1.ctr_state = ctr_state)` whenever they take the SubPlan path.
+//
+// M0125-0041: as in TestExplainQualifiesCorrelatedOuterRef, the aggregate is
+// `count(*)` rather than Q30's `max`/`avg` so the shape stays a SubPlan — the
+// pull-up now decorrelates the CTE-referencing scalar sublink, and a
+// decorrelated plan has no correlated Filter line to qualify. The wall this
+// test documents (a CTE body ending in an aggregate hands both sides
+// SourceTableIdx 0, so resolveInAncestor is the only way to name the outer
+// side) is unchanged by that.
 func TestExplainQualifiesOuterRefThroughAggregate(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
@@ -129,7 +147,7 @@ func TestExplainQualifiesOuterRefThroughAggregate(t *testing.T) {
 			"SELECT eq_x.st AS cst, sum(eq_y.amt) AS ctot FROM eq_x, eq_y "+
 			"WHERE eq_x.id = eq_y.id GROUP BY eq_x.st) "+
 			"SELECT c1.ctot FROM c c1 "+
-			"WHERE c1.ctot > (SELECT max(c2.ctot) FROM c c2 WHERE c2.cst = c1.cst)")
+			"WHERE c1.ctot > (SELECT count(*) FROM c c2 WHERE c2.cst = c1.cst)")
 
 	got := findLine(lines, "cst = ")
 	if got == "Filter: (cst = cst)" {

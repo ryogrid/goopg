@@ -1,57 +1,50 @@
-Task: **M0125-0042** — landed and committed this loop. See "In-flight" below for
-the one process note the NEXT loop must act on.
+Task: **M0125-0041** (correlated scalar-aggregate sublink over a WITH item,
+Q30/Q81) — root cause FIXED and committed; **the item stays UNCHECKED** because
+its acceptance is a completing Q30 and Q30 still TIMEOUTs. Nothing in flight.
 
-Files: `internal/planner/exists_to_any.go` (`fixInExprOperandIndex` +
-`resolveHostColumnIdx`, wired into `rewriteExistsToAnyNode`),
-`internal/planner/exists_to_any_test.go` (4 new pins),
-`docs/design/0125-0042-in-sublink-operand-stale-index.md` (status: FIXED),
-`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
+**Next loop: read the `## Current Priority` banner FIRST.** The banner's
+standing order is now `-0043`(done) → `-0042`(done) → `-0041`(worked, open) →
+**`M0125-0034`'s join-order arm** → `M0125-0038` (last). Expected selection is
+**`M0125-0034`**, which now also owns Q30/Q81's acceptance.
 
-Findings — do NOT re-derive: fix is landed and gate-verified (see design doc
-`## Bar for the fix — MET`). `probe35g.sql`→1294, `pAA.sql`→377, both = PG.
-TPC-DS SF0.5 full sweep: PASS=89 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6
-SKIP=4. Timeout class is now **Q30 Q64 Q65 Q72 Q78 Q81** (6 — Q72 newly
-confirmed this loop, add it to any future -0037/-0038 scoping).
-`make plan-diff LABEL=m0125-0005-relsize-default-stage2` shows 22/22 DIFFER
-— confirmed PRE-EXISTING (byte-identical with/without this change, via
-`git stash` A/B on the same cluster): an ANALYZE-stats drift on the current
-`bench/tpch` cluster (`Seq Scan … (stats) rows=1500000` vs the baseline's
-no-stats estimate), NOT a regression. Two adjacent gaps remain open in the
-ledger, NOT fixed this loop: (1) `remapByPosMap` has no `*InExpr` arm, so a
-*correlated* `IN (subquery)`'s `OuterColumnRef`s are never posMap-translated;
-(2) EXPLAIN prints a ColumnRef's Name even when its Index has drifted, so
-this whole defect class is invisible to plan-reading triage; (3, filed this
-loop) `rewriteExistsToAnyNode` never walks `*Project`/`*Aggregate` target
-lists, so a hand-written IN in a SELECT-list position is outside this fix's
-reach.
+Findings — do NOT re-derive:
+- The scalar pull-up **never declined** for Q30. Every gate accepts it
+  (`canUnnestSubquery`=true, avg NULL-on-empty, `*1.2` strict, AND-reachable,
+  1 param / 0 residuals, inner not probe-cheap). It died in
+  `clonePlanReplacingOuter` on the `default:` arm — no `*CTEScan` case — and a
+  clone failure is a *bail*, so the gap looked like policy. Fixed: `*CTEScan`
+  (body shared verbatim) + `*MaterializedCTEScan`, guarded by new
+  `planSubtreeHasOuterRefDeep`; matching arms in sibling `planCloneSupported`.
+- **Q30 TIMEOUTs at 300 s AND at 1200 s** after the fix → shape defect, not a
+  budget crossing (same class as Q21/`M0125-0032`). Residual = C1: the plan
+  keeps `Nested Loop (CROSS)` of ~2×10⁴ CTE rows × 5×10⁴ `customer_address`
+  rows = 10⁹ pairs, each an index probe into `customer`.
+- **First probe for `-0034` on this query:** `ca_state = 'AR'` is a single-table
+  local filter (~50× shrink) that STILL does not reach the `customer_address`
+  scan — it sits in the top `Filter` beside the formerly sublink-bearing
+  conjunct. Find out whether the sublink's presence kept it there.
+- **`make plan-diff LABEL=tpcds-round2-head` is STALE: 22/22 diverged, with or
+  without this change** (stash A/B proves the live plans are identical in both
+  arms). Snapshot is S-cold (bare `Seq Scan`, no `Gather`); live plans carry
+  `(stats)` + parallel workers since the warm-stats programme. Re-capture the
+  label before relying on it; use a stash A/B meanwhile.
+- goopg's parser rejects `WITH` inside a sublink (PG accepts it), so the
+  outer-ref guard is unreachable from SQL and has no test — ledger row.
+- TPC-DS SF0.5 timeout class unchanged: **Q30 Q64 Q65 Q72 Q78 Q81** (6).
+- Nightly triage: `ci/logs/action-items.md` still has only
+  AI-20260731-001201-001 (testport/TestE2E_FailoverGoopgToPG), ALREADY filed
+  under M-NIGHTLY. Nothing new to file; stays unselected per the 2026-07-28(b)
+  amendment (not a build break, not an M0124/M0125 gate).
 
-**Process note (read before selecting anything):** this loop opened by
-resuming the PREVIOUS loop's "Next step" (implement the M0125-0042 fix)
-without re-reading the Current Priority banner first. Commit `da882af6`
-(chore: file M0125-0043), already at HEAD before this loop started, had
-amended the banner so **`M0125-0043` outranks `M0125-0042`/`-0041`/`-0034`
-inside M0125** — see `.ralph/fix_plan.md` line ~1545 "⚡ SELECT THIS FIRST
-WITHIN M0125". The -0042 fix was kept and landed anyway because it was
-already root-caused, implemented, and fully gate-verified (silent-wrong-
-answer correctness fix; discarding verified work would have been worse than
-the ordering slip) — but this is a one-time exception, not a precedent.
-**Next loop: re-read the banner FIRST, every time**, then select
-`M0125-0043` (benchmark-name hardcoding: `internal/executor/operators_ddl.go`
-+ `internal/initdb/open.go`, `SmallDimension` name tag on literal "region"/
-"nation"). Its design doc does NOT exist yet — `docs/design/0125-0043-smalldimension-name-tag-extinction.md`
-must be created in the same loop that starts it, and must list the affected
-TPC-H query numbers. Full item body: `.ralph/fix_plan.md` search
-`M0125-0043`.
+Gates run this loop (all PASS): `go build ./...`; `go vet ./internal/planner/`;
+`go test ./internal/planner/... ./internal/executor/`;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
+`scripts/tpch-spotcheck.sh` (RESULT=PASS, Q12=2 Q13=35); TPC-H plan A/B
+(0/22, byte-identical, `plan_snapshots/m0125-0041-{before,after}.txt`);
+full 99-query TPC-DS SF0.5 sweep (PASS=89 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=6 SKIP=4, **all 99 cells identical in status/rows/ck** to
+`sweep-20260731-121447.txt`); pre-commit pgbench smoke (hook);
+`make ralph-state-guard` (repaired 1 stale marker, then OK).
 
-Gates run this loop (all PASS): `go build`/`go vet ./internal/planner/...`;
-`go test ./internal/planner/...`; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh`; `scripts/tpch-spotcheck.sh` (Q12=2/Q13=35);
-`make plan-diff LABEL=m0125-0005-relsize-default-stage2` (pre-existing
-divergence confirmed via A/B, not a regression); full 99-query TPC-DS SF0.5
-sweep via `scripts/tpcds-sf05-regression.sh sweep`.
-
-In-flight: none. All benchmark clusters started this loop were stopped
-afterward: TPC-H bench goopg (:65433, `bench/tpch/stop_goopg.sh`), TPC-DS
-sf05 goopg (:65437, stopped itself at the end of the sweep). PG oracle
-(:65438) was already UP from a prior loop and is left UP, unchanged. TPC-DS
-sf1 (:65436) stayed down throughout.
+In-flight: none. All bench servers stopped and verified down (65433/65436/65437).
+PG oracle :65438 was already UP from a prior loop and is left UP, untouched.

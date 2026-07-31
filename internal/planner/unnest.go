@@ -946,6 +946,27 @@ func planHasOuterRefRemaining(node Node) bool {
 	return found
 }
 
+// planSubtreeHasOuterRefDeep is planHasOuterRefRemaining with sublink
+// descent: it reports whether ANY OuterColumnRef appears in the subtree,
+// including inside the inner plan of a nested sublink.
+//
+// M0125-0041 uses it to decide whether a CTE body may be shared verbatim
+// by a decorrelated clone. The shallow walker is not enough there: a
+// correlated sublink *inside* the body holds its outer refs below a
+// `.Plan` boundary, and sharing such a body under the CTE's name would
+// let one consumer's row cache answer another consumer's scan. No
+// level/depth arithmetic is attempted — any outer ref at all is a bail,
+// which is the safe direction (the sublink stays a SubPlan).
+func planSubtreeHasOuterRefDeep(node Node) bool {
+	found := false
+	walkPlanExprsDeep(node, 0, func(e Expr, _ int) {
+		if _, ok := e.(*OuterColumnRef); ok {
+			found = true
+		}
+	})
+	return found
+}
+
 func extractEquijoinPair(a, b Expr) (*OuterColumnRef, *ColumnRef) {
 	// D3.3 (S4b): only a Level-1 ref is a decorrelation key. The unnest
 	// joins the sublink against its IMMEDIATE host; a Level-2 ref
@@ -1503,6 +1524,45 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 				c.Rows[i][j] = cloneExprReplacingOuter(e, replace)
 			}
 		}
+		return &c, nil
+	case *CTEScan:
+		// M0125-0041: a correlated scalar sublink whose FROM is a WITH
+		// reference — TPC-DS Q30/Q81's `(select avg(ctr_total_return)*1.2
+		// from customer_total_return ctr2 where ctr1.ctr_state =
+		// ctr2.ctr_state)`. Every earlier gate accepts these (avg is
+		// NULL-on-empty, the target list is strict, the conjunct is
+		// AND-reachable, one equijoin param, the inner is not
+		// probe-cheap); the pull-up died HERE, on the default arm, and
+		// the shape silently stayed a per-outer-row SubPlan.
+		//
+		// The correlation never lives inside the CTE body: WITH is not
+		// LATERAL, so the body is a closed query level and the
+		// correlation sits in a Filter *above* this node (the shape the
+		// probe measured). The body is therefore shared verbatim rather
+		// than rewritten — which is also what the CTE machinery already
+		// does for two consumers of the same WITH item (planner.go's
+		// Stage A inlining hands each consumer the same `ce.body`), and
+		// what makes the decorrelated form cheap: the executor's
+		// name-keyed ctx.CTERowCache materializes the body once and both
+		// the outer CTEScan and this one replay it.
+		//
+		// That name-keyed cache is exactly why a body carrying an outer
+		// reference must bail instead: a rewritten body and an
+		// un-rewritten consumer of the same CTE name would share one
+		// cache entry, so the second scan would replay the first's rows.
+		// A sublink nested inside the body can hold such a ref, so the
+		// check descends through sublink plans.
+		if planSubtreeHasOuterRefDeep(n.Child) {
+			return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: CTE body carries an outer reference"}
+		}
+		c := *n
+		return &c, nil
+	case *MaterializedCTEScan:
+		// Sibling of the CTEScan arm: a data-modifying WITH item's
+		// RETURNING rows, already materialized under the CTE name in
+		// ctx.MaterializedCTEs before the outer query runs. It is a leaf
+		// with no body to rewrite, so the copy is unconditional.
+		c := *n
 		return &c, nil
 	default:
 		return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: unsupported plan node"}
@@ -3432,6 +3492,15 @@ func planCloneSupported(node Node) bool {
 				walk(t)
 			}
 		case *Values:
+		case *CTEScan:
+			// M0125-0041 sibling of clonePlanReplacingOuter's CTEScan
+			// arm, and it must agree with it: the body is shared
+			// verbatim (so it is NOT walked as clonable structure), and
+			// only a body carrying an outer reference is unclonable.
+			if planSubtreeHasOuterRefDeep(x.Child) {
+				ok = false
+			}
+		case *MaterializedCTEScan:
 		default:
 			ok = false
 		}
