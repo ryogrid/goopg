@@ -360,18 +360,23 @@ started.
 >       in that same loop** (it does not exist yet) and the doc must list the
 >       affected TPC-H query numbers. Full item body at the head of the M0125
 >       section below.
->       **`M0125-0042` IS ROOT-CAUSED BUT UNFIXED (loop #11, diagnosis only — no
->       engine file changed).** The operand of an OR-ed `IN (subquery)` carries
->       the right `Name` and a STALE `Index`: it reads `ca_zip` (a string) where
->       `c_customer_sk` was meant, and `compareEq`'s string↔int coercion answers
->       instead of raising. Only **10** of goopg's 314 rows are in PG's 377, so
->       the filed "over-match of 35" was a coincidence of cardinality. Full
->       diagnosis, the three independent reasons nothing catches it (including
->       **EXPLAIN itself, which prints the right Name over the wrong index**),
->       and an exact resume point are in the item body and
->       `docs/design/0125-0042-in-sublink-operand-stale-index.md`. **The next
->       loop should LAND that fix, not re-diagnose it.** Current timeout class:
->       **Q30 Q64 Q65 Q78 Q81** (5). Four ledger rows 2026-07-31.
+>       **`M0125-0042` IS FIXED (root-caused loop #11, landed loop #12).** The
+>       operand of an OR-ed `IN (subquery)` carried the right `Name` and a STALE
+>       `Index`: it read `ca_zip` (a string) where `c_customer_sk` was meant, and
+>       `compareEq`'s string↔int coercion answered instead of raising.
+>       `internal/planner/exists_to_any.go`'s `fixInExprOperandIndex` now
+>       re-resolves it by Name against the host schema; `probe35g.sql` → 1294,
+>       full TPC-DS SF0.5 sweep MISMATCH=0. Diagnosis, the three independent
+>       reasons nothing caught it (including **EXPLAIN itself, which prints the
+>       right Name over the wrong index** — still unfixed, a separate ledger
+>       row), and the fix are in the item body and
+>       `docs/design/0125-0042-in-sublink-operand-stale-index.md`. **`M0125-0043`
+>       is the mandatory next selection inside M0125** — this loop reached
+>       `-0042` off a stale working-set baton and only landed it because it was
+>       already fully verified by the time the banner amendment (`da882af6`)
+>       was noticed; do not repeat that shortcut. Current timeout class:
+>       **Q30 Q64 Q65 Q72 Q78 Q81** (6, `Q72` confirmed in the loop #12 sweep).
+>       Four ledger rows 2026-07-31.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3977,7 +3982,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Acceptance: **Q30 completes and matches `30|OK|31|f47a48499fd7e070`**.
       Bar: as `M0125-0034`.
 
-- [ ] **M0125-0042 — two OR-ed uncorrelated `IN (subquery)` sublinks over-match
+- [x] **M0125-0042 — two OR-ed uncorrelated `IN (subquery)` sublinks over-match
       under a SEMI join over an MHJ** (filed 2026-07-31 by `M0125-0036`, found
       while probing; **pre-existing at HEAD, not caused by that change**).
       Reproducer and both arms in `analysis/m0125-0036-exists-to-any/`
@@ -3998,10 +4003,30 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       answer**, so it outranks a timeout in severity even though no gate query
       currently exercises it. Acceptance: `probe35g.sql` answers 1294, plus a
       regression test at the planner or executor level. Bar: as `M0125-0034`.
-      **↳ ROOT-CAUSED 2026-07-31 (loop #11); THE FIX IS NOT LANDED.** Design
-      `docs/design/0125-0042-in-sublink-operand-stale-index.md`, evidence
-      `analysis/m0125-0042/` (nine probes + both traces). No engine file
-      changed this loop.
+      **↳ ROOT-CAUSED 2026-07-31 (loop #11); FIXED 2026-07-31 (loop #12).**
+      Design `docs/design/0125-0042-in-sublink-operand-stale-index.md`
+      (`## The fix` + `## Bar for the fix — MET`), evidence
+      `analysis/m0125-0042/` (nine probes + both traces).
+      `internal/planner/exists_to_any.go`: new `fixInExprOperandIndex` /
+      `resolveHostColumnIdx` re-resolve a SubPlan-bearing `InExpr`'s operand
+      by Name against the host node's schema, wired into the existing
+      `rewriteExistsToAnyNode` walk (now unconditional — only the EXISTS→ANY
+      conversion itself stays behind `GOOPG_EXISTS_TO_ANY`). `probe35g.sql`
+      → 1294, `pAA.sql` → 377, both = PG. Four new unit pins in
+      `exists_to_any_test.go`. Full bar run and PASS: units,
+      `tpch-spotcheck.sh` (Q12=2/Q13=35), `make plan-diff
+      LABEL=m0125-0005-relsize-default-stage2` (22/22 DIFFER, confirmed
+      byte-identical with/without this change — pre-existing ANALYZE-stats
+      drift, not a regression), full 99-query TPC-DS SF0.5 sweep
+      (PASS=89 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=6 SKIP=4 — the 6
+      timeouts are the pre-existing M0125-0038-scoped performance class).
+      **Process note:** this loop selected `M0125-0042` per the stale
+      working-set baton before re-checking the Current Priority banner,
+      which the same-day commit `da882af6` had already amended to put
+      `M0125-0043` first inside M0125. The fix was already root-caused,
+      implemented and fully gate-verified by the time this was caught, so it
+      was landed rather than discarded; **`M0125-0043` is the mandatory next
+      selection**, not a fresh choice.
       **The filed framing understates the defect: only 10 of goopg's 314 rows
       appear in PG's 377** — the answer sets are nearly DISJOINT and merely
       similar in size, so "an over-match of 35" is a coincidence of cardinality.

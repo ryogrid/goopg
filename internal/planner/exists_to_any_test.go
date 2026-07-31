@@ -2,6 +2,9 @@ package planner
 
 import (
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0125-0036 (C3). The pins below are organised around the one question the
@@ -177,5 +180,120 @@ func TestExistsToAnyKillSwitch(t *testing.T) {
 	}
 	if findExistsExprIn(node) == nil {
 		t.Fatalf("switch off but the EXISTS was still converted:\n%s", planString(node))
+	}
+}
+
+// M0125-0042. A hand-written OR-ed `col IN (subquery)` cannot unnest, so its
+// operand ColumnRef keeps whatever Index the binder assigned against a
+// partial join layout — nothing else re-resolves it by Name the way an
+// unnested single IN's semi-join keys are (rebind/predRebind). Reaching this
+// naturally needs a specific binding history through a MultiHashJoin OID
+// re-sort; the design doc's synthetic 6-table case reaches the same plan
+// SHAPE without that history and still answers correctly, so this pins the
+// resolution mechanism (fixInExprOperandIndex) directly rather than a query
+// result that could pass for the wrong reason.
+func stubSubqueryPlan(t *testing.T) Node {
+	t.Helper()
+	tbl := &catalog.Table{Name: "t2", Columns: []catalog.Column{
+		{Name: "z", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}}
+	return &SeqScan{Table: tbl, schema: Schema{{Name: "z", Type: catalog.Type{Name: "int4"}}}}
+}
+
+func TestFixInExprOperandIndexReResolvesStaleIndex(t *testing.T) {
+	// hostRow mirrors the filed defect: index 0 is a same-typed DIFFERENT
+	// column left behind by an earlier partial-layout binding (goopg's
+	// ca_zip), index 1 is c_customer_sk's real, final position.
+	hostRow := Schema{
+		{Name: "other_col", Type: catalog.Type{Name: "text"}},
+		{Name: "c_customer_sk", Type: catalog.Type{Name: "int4"}},
+	}
+	in := &InExpr{
+		Operand: &ColumnRef{Name: "c_customer_sk", Index: 0, Type: catalog.Type{Name: "int4"}},
+		Plan:    stubSubqueryPlan(t),
+	}
+	fixInExprOperandIndex(in, hostRow)
+	op := in.Operand.(*ColumnRef)
+	if op.Index != 1 {
+		t.Fatalf("Operand.Index = %d, want 1 (c_customer_sk's position in hostRow); "+
+			"a stale index left at 0 reads other_col instead", op.Index)
+	}
+}
+
+// An ambiguous name must decline, not guess: M0125-0039 recorded that a
+// confidently wrong index is worse than a stale one left alone.
+func TestFixInExprOperandIndexDeclinesAmbiguousName(t *testing.T) {
+	hostRow := Schema{
+		{Name: "c_customer_sk", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		{Name: "c_customer_sk", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+	}
+	in := &InExpr{
+		Operand: &ColumnRef{Name: "c_customer_sk", Index: 5, Type: catalog.Type{Name: "int4"}},
+		Plan:    stubSubqueryPlan(t),
+	}
+	fixInExprOperandIndex(in, hostRow)
+	op := in.Operand.(*ColumnRef)
+	if op.Index != 5 {
+		t.Fatalf("Operand.Index = %d, want unchanged 5 — an ambiguous Name-only match must decline", op.Index)
+	}
+}
+
+// SourceTableIdx must disambiguate a self-join before falling back to Name
+// alone, matching resolveHostOperandIdx / resolveSide.
+func TestFixInExprOperandIndexDisambiguatesSelfJoinBySourceTableIdx(t *testing.T) {
+	hostRow := Schema{
+		{Name: "c_customer_sk", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		{Name: "c_customer_sk", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+	}
+	in := &InExpr{
+		Operand: &ColumnRef{Name: "c_customer_sk", Index: 5, Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+		Plan:    stubSubqueryPlan(t),
+	}
+	fixInExprOperandIndex(in, hostRow)
+	op := in.Operand.(*ColumnRef)
+	if op.Index != 1 {
+		t.Fatalf("Operand.Index = %d, want 1 (SourceTableIdx=2's position)", op.Index)
+	}
+}
+
+// TestRewriteExistsToAnyNodeFixesOrEdInOperandUnderFilter wires the fix into
+// the actual walk: a Filter's hostRow is n.Child.Output(), and an OR-ed
+// InExpr (which cannot unnest and so is never visited by rewriteExistsToAny's
+// own conversion) must still have its operand re-resolved by the fallback
+// branch of rewriteExistsToAnyQual.
+func TestRewriteExistsToAnyNodeFixesOrEdInOperandUnderFilter(t *testing.T) {
+	tbl := &catalog.Table{Name: "t1", Columns: []catalog.Column{
+		{Name: "other_col", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+		{Name: "x", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+	}}
+	child := &SeqScan{Table: tbl, schema: Schema{
+		{Name: "other_col", Type: catalog.Type{Name: "text"}},
+		{Name: "x", Type: catalog.Type{Name: "int4"}},
+	}}
+	filt := &Filter{
+		Child: child,
+		Predicate: &BinaryOp{
+			Op: parser.OpOr,
+			Left: &InExpr{
+				Operand: &ColumnRef{Name: "x", Index: 0, Type: catalog.Type{Name: "int4"}},
+				Plan:    stubSubqueryPlan(t),
+			},
+			Right: &InExpr{
+				Operand: &ColumnRef{Name: "x", Index: 0, Type: catalog.Type{Name: "int4"}},
+				Plan:    stubSubqueryPlan(t),
+			},
+		},
+	}
+	rewriteExistsToAnyNode(filt)
+	bin := filt.Predicate.(*BinaryOp)
+	for _, side := range []Expr{bin.Left, bin.Right} {
+		in, ok := side.(*InExpr)
+		if !ok {
+			t.Fatalf("side = %T, want *InExpr", side)
+		}
+		op := in.Operand.(*ColumnRef)
+		if op.Index != 1 {
+			t.Errorf("Operand.Index = %d, want 1 (x's position in child.Output())", op.Index)
+		}
 	}
 }

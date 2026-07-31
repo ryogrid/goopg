@@ -90,10 +90,14 @@ func existsToAnyEnabled() bool { return existsToAnyOn.Load() }
 // every rewrite that can reshape a sublink or renumber a ColumnRef: the
 // operand this pass synthesises is an ordinary host-scope ColumnRef, so
 // it must not be created while index-rewriting passes are still running.
+//
+// The walk always runs, independent of existsToAnyEnabled: besides the
+// gated EXISTS→ANY conversion it also re-resolves any SubPlan-bearing
+// InExpr's Operand index (fixInExprOperandIndex, M0125-0042), which is an
+// unconditional correctness fix, not an optimisation the kill switch should
+// disable. GOOPG_EXISTS_TO_ANY=off gates only the conversion itself, applied
+// at the *ExistsExpr case below.
 func rewriteExistsToAny(root Node) Node {
-	if !existsToAnyEnabled() {
-		return root
-	}
 	rewriteExistsToAnyNode(root)
 	return root
 }
@@ -212,7 +216,7 @@ func rewriteExistsToAnyQual(e Expr, hostRow Schema, underOr bool) Expr {
 			return x
 		}
 	case *ExistsExpr:
-		if underOr {
+		if underOr && existsToAnyEnabled() {
 			if in := existsToAny(x, hostRow); in != nil {
 				// The body is now uncorrelated; it may still
 				// host sublinks of its own.
@@ -231,6 +235,7 @@ func rewriteExistsToAnyQual(e Expr, hostRow Schema, underOr bool) Expr {
 		case *ExistsExpr:
 			rewriteExistsToAnyNode(s.Plan)
 		case *InExpr:
+			fixInExprOperandIndex(s, hostRow)
 			rewriteExistsToAnyNode(s.Plan)
 		case *SubqueryExpr:
 			rewriteExistsToAnyNode(s.Plan)
@@ -417,18 +422,29 @@ func joinedRowSchema(left, right Node) Schema {
 // time they resolve. This pass has not — declining leaves a correct, if
 // slow, SubPlan — so an ambiguous name is a decline, not a guess.
 func resolveHostOperandIdx(hostRow Schema, ref *OuterColumnRef) (int, bool) {
+	return resolveHostColumnIdx(hostRow, ref.Name, ref.Index, ref.SourceTableIdx)
+}
+
+// resolveHostColumnIdx is the shared core of resolveHostOperandIdx and
+// fixInExprOperandIndex: locate a column by (name, recorded index,
+// source-table id) in the row a qual is evaluated against, declining on
+// ambiguity rather than guessing. One implementation for both an
+// OuterColumnRef (correlated EXISTS→ANY) and a plain ColumnRef (hand-written
+// IN (subquery) operand, M0125-0042) — the resolution rule is identical,
+// only the caller's Expr type differs.
+func resolveHostColumnIdx(hostRow Schema, name string, idx int, srcIdx int16) (int, bool) {
 	// Exact hit at the recorded index, confirmed by name and (when the
 	// binder recorded one) by FROM-binding identity.
-	if ref.Index >= 0 && ref.Index < len(hostRow) &&
-		strings.EqualFold(hostRow[ref.Index].Name, ref.Name) &&
-		(ref.SourceTableIdx == 0 || hostRow[ref.Index].SourceTableIdx == ref.SourceTableIdx) {
-		return ref.Index, true
+	if idx >= 0 && idx < len(hostRow) &&
+		strings.EqualFold(hostRow[idx].Name, name) &&
+		(srcIdx == 0 || hostRow[idx].SourceTableIdx == srcIdx) {
+		return idx, true
 	}
 	// SourceTableIdx disambiguates self-joins, where Name alone cannot.
-	if ref.SourceTableIdx != 0 {
+	if srcIdx != 0 {
 		found, n := -1, 0
 		for i, c := range hostRow {
-			if strings.EqualFold(c.Name, ref.Name) && c.SourceTableIdx == ref.SourceTableIdx {
+			if strings.EqualFold(c.Name, name) && c.SourceTableIdx == srcIdx {
 				found, n = i, n+1
 			}
 		}
@@ -439,7 +455,7 @@ func resolveHostOperandIdx(hostRow Schema, ref *OuterColumnRef) (int, bool) {
 	}
 	found, n := -1, 0
 	for i, c := range hostRow {
-		if strings.EqualFold(c.Name, ref.Name) {
+		if strings.EqualFold(c.Name, name) {
 			found, n = i, n+1
 		}
 	}
@@ -447,6 +463,33 @@ func resolveHostOperandIdx(hostRow Schema, ref *OuterColumnRef) (int, bool) {
 		return found, true
 	}
 	return 0, false
+}
+
+// fixInExprOperandIndex re-resolves a SubPlan-bearing InExpr's Operand
+// ColumnRef Index by Name against hostRow — the row the qual holding this
+// InExpr is evaluated against.
+//
+// M0125-0042: a hand-written `col IN (subquery)` predicate that cannot
+// unnest (an OR-ed pair, e.g.) keeps whatever Index the binder assigned
+// against a partial join layout during planning. Unlike an unnested single
+// IN, nothing routes it through a Name-based rebind afterwards, so a later
+// MultiHashJoin OID re-sort or bindings remap can leave it stale: right
+// Name, wrong column, silently — EXPLAIN still prints the Name, and
+// compareEq's cross-type coercion answers instead of raising when the stale
+// slot lands on a column of a different type. Skip the sublink's own Plan
+// (in.Plan): its indices are inner-scope and rewriteExistsToAnyNode walks
+// it separately under its own hostRow.
+func fixInExprOperandIndex(in *InExpr, hostRow Schema) {
+	if in.Plan == nil {
+		return
+	}
+	ref, ok := in.Operand.(*ColumnRef)
+	if !ok {
+		return
+	}
+	if idx, ok := resolveHostColumnIdx(hostRow, ref.Name, ref.Index, ref.SourceTableIdx); ok {
+		ref.Index = idx
+	}
 }
 
 // existsBodySpineSimple reports whether the EXISTS body's own spine is a

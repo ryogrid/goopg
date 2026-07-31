@@ -1,6 +1,6 @@
 # 0125-0042 — an OR-ed `IN (subquery)` operand keeps a stale column index
 
-Status: **diagnosis complete, fix not landed** (2026-07-31, loop #11).
+Status: **FIXED and landed** (2026-07-31, loop #12; root-caused loop #11).
 Evidence: `analysis/m0125-0042/README.md`. Task: `.ralph/fix_plan.md` M0125-0042.
 
 ## Problem
@@ -58,14 +58,33 @@ It is also an instance of CLAUDE.md's "sibling paths must change together":
 the Name-based path and the Index-based path disagree, and only the Index-based
 one executes.
 
-## Proposed fix (not yet implemented)
+## The fix (landed loop #12)
 
-Generalise `resolveHostOperandIdx` (`internal/planner/exists_to_any.go`) to
-hand-written `InExpr` operands: after the last remap pass, re-resolve the
-operand ColumnRef of every SubPlan-bearing `InExpr` **by Name** against the
-output schema of the node whose predicate holds it.
+Generalised `resolveHostOperandIdx` (`internal/planner/exists_to_any.go`) to
+hand-written `InExpr` operands, as proposed. The shared resolution rule was
+factored out as `resolveHostColumnIdx(hostRow, name, idx, srcIdx)`, used by
+both `resolveHostOperandIdx` (an `*OuterColumnRef`, EXISTS→ANY) and the new
+`fixInExprOperandIndex(in *InExpr, hostRow Schema)` (a plain `*ColumnRef`,
+this defect) — one resolution rule, two callers.
 
-Guards this must keep, all learned from prior loops:
+`fixInExprOperandIndex` is invoked from the existing
+`rewriteExistsToAnyNode`/`rewriteExistsToAnyQual` walk, which already visits
+every qual-bearing node with the correct `hostRow` for that position
+(`Filter`: `n.Child.Output()`; `Join`/`NestedLoopIndexJoin`:
+`joinedRowSchema`; `MultiHashJoin`: `n.Output()`) — the walk's `case *InExpr:`
+arm (reached for any InExpr that is not itself a converted EXISTS, i.e.
+exactly the OR-ed, un-unnestable shape this defect lives in) now calls
+`fixInExprOperandIndex` before recursing into the sublink's own `Plan`.
+
+One decoupling was required: this walk previously ran only when
+`existsToAnyEnabled()` (`GOOPG_EXISTS_TO_ANY=off` short-circuited the whole
+pass). The operand-index fix is an unconditional correctness fix, not part of
+the EXISTS→ANY optimisation the kill switch guards, so `rewriteExistsToAny`
+now always walks; only the `*ExistsExpr` conversion branch itself stays
+gated. `TestExistsToAnyKillSwitch` still pins that the conversion is skipped
+with the switch off.
+
+Guards kept, all learned from prior loops:
 
 - **Unique-match only.** Use the `findUniqueColumnIndex` rule — leave the index
   untouched when the name is absent or ambiguous. M0125-0039 recorded that a
@@ -85,13 +104,44 @@ separately: `remapByPosMap`'s inner-plan switch handles `*ExistsExpr`,
 never translated through `posMap`. The query in this task is uncorrelated, so
 that gap is not what it hits — it is a separate latent defect of the same class.
 
-## Bar for the fix
+## Bar for the fix — MET (loop #12)
 
 Planner change ⇒ units, `scripts/tpch-spotcheck.sh` (canonical Q12=2/Q13=35),
 TPC-H `make plan-diff LABEL=m0125-0005-relsize-default-stage2`, and the full
 99-query TPC-DS SF0.5 gate. Acceptance: `probe35g.sql` answers **1294** and
 `pAA.sql` answers **377**, plus a planner-level regression test asserting the
 operand index equals the host schema position.
+
+Results:
+
+- `analysis/m0125-0036-exists-to-any/probe35g.sql` → **1294** (was 1329).
+- `analysis/m0125-0042/pAA.sql` → **377** (was 314).
+- All other probes in `analysis/m0125-0042/README.md`'s measurement table
+  re-run and match PG (`pAempty` 314→**377**, `psingleton` 0 rows→**1 row
+  (351)**; `pB`/`pOR_noexists`/`pE`/`pconstop` unchanged, already exact).
+- Units: `go test ./internal/planner/...` PASS, including four new pins in
+  `internal/planner/exists_to_any_test.go` —
+  `TestFixInExprOperandIndexReResolvesStaleIndex` (direct mechanism pin, the
+  design's acceptance test),
+  `TestFixInExprOperandIndexDeclinesAmbiguousName`,
+  `TestFixInExprOperandIndexDisambiguatesSelfJoinBySourceTableIdx`, and
+  `TestRewriteExistsToAnyNodeFixesOrEdInOperandUnderFilter` (wiring pin
+  through the actual `Filter` walk). `RALPH_PRECOMMIT_SCOPE=units
+  scripts/ralph-precommit-test.sh` PASS.
+- `scripts/tpch-spotcheck.sh`: Q12=2, Q13=35, PASS.
+- `make plan-diff LABEL=m0125-0005-relsize-default-stage2`: 22/22 queries
+  reported DIFFER both with and without this change, byte-identical in
+  content — confirmed pre-existing (an ANALYZE-stats environmental drift on
+  the current `bench/tpch` cluster, unrelated to this fix) by running the
+  gate against a `git stash`-reverted tree on the same cluster and diffing
+  the two reports. None of Q7/Q8/Q9 (the queries shown in the diff) contain
+  an EXISTS or IN sublink, so this pass cannot touch them regardless.
+- Full 99-query TPC-DS SF0.5 sweep (`scripts/tpcds-sf05-regression.sh
+  sweep`): **PASS=89 (54 checksum-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=6 SKIP=4**. The 6 timeouts (Q30/Q64/Q65/Q72/Q78/Q81) are the
+  pre-existing performance-class timeout set this milestone's later items
+  (`M0125-0038`, cost/cardinality propagation) are scoped to fix — zero
+  correctness regressions.
 
 ## Note on reproducing
 
