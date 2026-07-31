@@ -800,9 +800,16 @@ func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
 		if existing, ok := mh.Tables[idx].(*Filter); ok {
 			existing.Predicate = combineAnd([]Expr{existing.Predicate, local})
 		} else {
+			// LeafLocal: the shifted predicate is in Tables[idx]-local
+			// coordinates, which above a leaf scan IS the leaf-local
+			// convention. Stamping it lets the residual-Filter sibling
+			// (pushResidualQualsIntoMHJTables, M0125-0046) AND further
+			// conjuncts into this wrapper — pushConjunctIntoSubtree's
+			// coordinate-convention guard declines on a mismatch.
 			mh.Tables[idx] = &Filter{
 				Child:     mh.Tables[idx],
 				Predicate: local,
+				LeafLocal: innerJoinPushLeafScan(mh.Tables[idx]),
 			}
 		}
 	}

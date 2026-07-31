@@ -372,20 +372,48 @@ func (o *multiHashJoinOp) partitionFilters() {
 }
 
 // walkColumnRefs visits every ColumnRef.Index in e via onIdx.
-// Triggers onOuter for any reference that disqualifies pushdown
-// (OuterColumnRef, SubqueryExpr, ExistsExpr, InExpr). Mirrors the
-// planner's pushdown.go::walkColumnRefs walker so the executor does
-// not depend on internal/planner's package layout.
+// Triggers onOuter for any reference that disqualifies early
+// evaluation (OuterColumnRef, subquery-bearing kinds, and — new,
+// M0125-0046 — any UNENUMERATED kind, fail-closed). Mirrors the
+// planner's pushdown.go::walkColumnRefsImpl walker so the executor
+// does not depend on internal/planner's package layout — and the two
+// MUST stay in lockstep (Hard-won Rule #2): a kind the planner walks
+// but this misses either sent a classifiable filter to leafFilters
+// (slow) or, worse, hid its refs so the filter read as constant and
+// was evaluated at probe time with its columns unbound.
+//
+// An InExpr with Plan != nil is a subquery and vetoes; a literal
+// IN-list walks its Operand and List (M0125-0046, matching the
+// planner's M0061 distinction). Args accompany Plan only, so the veto
+// covers them.
+//
+// onOuter routes the filter to leafFilters, which evaluate only after
+// every table is bound — always safe, merely the latest possible
+// point. That is why the default arm is onOuter rather than silence:
+// silence must mean "refuse", not "safe" (tpcds-round2-fixes §0).
 func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 	switch x := e.(type) {
 	case nil:
 	case *planner.ColumnRef:
 		onIdx(x.Index)
+	case *planner.IntegerConst, *planner.StringConst, *planner.NumericConst,
+		*planner.TypedStringLit, *planner.IntervalLit, *planner.NullConst,
+		*planner.BooleanConst, *planner.ParamRef, *planner.ExecParamRef:
+		// childless leaves — no refs, no veto
 	case *planner.OuterColumnRef:
 		onOuter()
-	case *planner.SubqueryExpr, *planner.ExistsExpr, *planner.InExpr,
+	case *planner.SubqueryExpr, *planner.ExistsExpr,
 		*planner.MultiAssignSubqElem, *planner.MultiAssignSubqRow:
 		onOuter()
+	case *planner.InExpr:
+		if x.Plan != nil {
+			onOuter()
+			return
+		}
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+		for _, item := range x.List {
+			walkColumnRefs(item, onIdx, onOuter)
+		}
 	case *planner.BinaryOp:
 		walkColumnRefs(x.Left, onIdx, onOuter)
 		walkColumnRefs(x.Right, onIdx, onOuter)
@@ -404,6 +432,23 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 		walkColumnRefs(x.Else, onIdx, onOuter)
 	case *planner.ExtractExpr:
 		walkColumnRefs(x.Source, onIdx, onOuter)
+	case *planner.CastExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *planner.IsNullExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *planner.IsBoolExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *planner.IsDistinctFromExpr:
+		walkColumnRefs(x.Left, onIdx, onOuter)
+		walkColumnRefs(x.Right, onIdx, onOuter)
+	case *planner.CollateExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *planner.RowExpr:
+		for _, el := range x.Elems {
+			walkColumnRefs(el, onIdx, onOuter)
+		}
+	default:
+		onOuter()
 	}
 }
 

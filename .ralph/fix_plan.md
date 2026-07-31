@@ -500,8 +500,17 @@ started.
 >       **↳ `M0125-0045` LANDED 2026-08-01 (loop #19)** — contested-key
 >       treatment for aggregate slots, acceptance met by unit tests + a
 >       byte-identical PG-oracle diff; SF0.5 gate unchanged (PASS=95, zero
->       cell movement). **NEXT SELECTION: `M0125-0046`, then `M0125-0038`
->       last.**
+>       cell movement). ~~**NEXT SELECTION: `M0125-0046`, then `M0125-0038`
+>       last.**~~
+>       **↳ `M0125-0046` LANDED 2026-08-01 (loop #20)** — the filed
+>       "walker disqualifies InExpr" was a misdiagnosis; the residual
+>       WHERE conjunct was never in mh.Filters at all. New MHJ arm of
+>       pushInnerJoinInputQuals + executor walkColumnRefs sibling relaxed
+>       in lockstep; SF0.5 subset probe of 15 MHJ-heavy queries PASS=15
+>       MISMATCH=0; plan-diff 5/22 all benign (+Filter on member scans),
+>       row counts anchored. **NEXT SELECTION: `M0125-0038` (the last
+>       open M0125 task), then M0125 closes and M0126 (cost-driven
+>       planning) is next per the 2026-07-31 USER amendment.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -4044,14 +4053,47 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       three ledger rows 2026-08-01. Arm (b) → `M0125-0046` below; arm (c)
       = `M0125-0038`.
 
-- [ ] **M0125-0046 — MHJ IN-list qual placement: `pushSingleSourceFiltersIntoMHJTables`
+- [x] **M0125-0046 — MHJ IN-list qual placement: `pushSingleSourceFiltersIntoMHJTables`
       disqualifies any conjunct containing an `InExpr`** (refiled 2026-08-01 from
       M0125-0035 arm (b) at its closure; original evidence README §"C2 is
       pervasive"). An IN-list restriction stays on the MultiHashJoin node instead
       of reaching the member scan that could pre-filter its build input. Small,
       but the walker is a planner/executor SIBLING PAIR — both sides must change
       together (Hard-won Rule #2). Bar: spotcheck + SF0.5 subset probe of the
-      MHJ-heavy members, plan-diff.
+      MHJ-heavy members, plan-diff. **↳ DONE 2026-08-01 (loop #20), with the
+      diagnosis CORRECTED: the planner walker admits literal IN-lists (since
+      M0061) and the mh.Filters push handles them — the conjunct was never in
+      `mh.Filters` at all. It sits in the residual `*Filter` ABOVE the MHJ,
+      which neither MHJ pass reads and which the binary sibling
+      (`pushInnerJoinInputQuals`) declined for want of a `*Join` child. Fix:
+      new `pushResidualQualsIntoMHJTables` arm (fail-closed walkExprRefs
+      attribution by cumulative offset + positional name check, clone-shift to
+      leaf-local, descend via `pushConjunctIntoSubtree`; property-2 duplicate);
+      `pushSingleSourceFiltersIntoMHJTables`'s wrapper now stamps `LeafLocal`
+      so the two passes compose into one wrapper. The EXECUTOR half of the
+      filed claim WAS real: `multi_hash_join.go::walkColumnRefs` vetoed every
+      InExpr (literal IN-lists → leafFilters detour) and silently skipped
+      Cast/IsNull/IsBool/IsDistinctFrom/Collate/Row (an IS-NULL-only filter
+      read as constant = probe-time eval with unbound columns); it now mirrors
+      the planner walker and gains a fail-closed `default: onOuter()`. §2
+      probe: MHJ emits 11,049 = the answer (was 96,562), count = PG oracle.
+      Gates: units PASS; spotcheck PASS (Q12=2 Q13=35); SF0.5 subset probe
+      Q7,10,26,27,30,31,34,35,47,50,69,72,73,79,96 → PASS=15 MISMATCH=0
+      CKMISMATCH=0 (Q72 straddled 300 s on the nightly-saturated host, PASS
+      solo at 600 s; FORCE=1, no timings claimed); plan-diff vs
+      m0125-0044-after 5/22 DIFFER (Q2 Q3 Q10 Q11 Q21), every diff only
+      +Filter lines under MHJ member scans with zero structural change, and
+      row counts proven: Q3=11521 Q10=20501 Q11=819 Q21=405 = the pinned
+      anchors, Q2 (no anchor) md5-identical at 455 rows between a HEAD
+      worktree binary and the fix on the same data. Tests
+      `internal/planner/mhj_residual_qual_pushdown_test.go`,
+      `internal/executor/mhj_inlist_filter_test.go`. Design
+      `docs/design/0125-0046-mhj-residual-inlist-qual-placement.md`; ledger:
+      row 2026-07-31 (arm b) flipped resolved, two rows appended 2026-08-01
+      (duplicate-not-move vs PG's distribute_restrictinfo_to_rels; FuncCall
+      veto pending a provolatile model). The *Join-spine-descent-into-MHJ row
+      (2026-07-31) stays open — this fix covers the Filter-directly-above-MHJ
+      shape, which is every measured case.**
 
 - [x] **M0125-0036 — C3: a correlated SubPlan is re-evaluated per outer row with
       no hashing or caching** (filed 2026-07-31 by M0125-0026; evidence same

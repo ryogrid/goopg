@@ -137,6 +137,11 @@ var exprSwitchInventory = map[string]walkerRole{
 	"foldconst.go:FoldConstants":                                walkerPending, // 15 of 32 arms
 	"foldconst.go:toLiteralValue":                               nonRecursiveClassifier,
 	"inner_join_qual_pushdown.go:innerJoinPushTarget":           nonRecursiveClassifier,
+	// Added by M0125-0046: the MHJ analog of innerJoinPushTarget — the
+	// recursion is walkExprRefs (fail-closed), and the census sees the
+	// bottom-up dispatch inside the Visit closure (veto *OuterColumnRef /
+	// *FuncCall, validate *ColumnRef against the owning Tables[i] range).
+	"inner_join_qual_pushdown.go:mhjResidualConjunctTable":      nonRecursiveClassifier,
 	"local_filters.go:conjunctIsLocalEligible":                  walkerPending, // 9 of 32 arms, recurses via its `walk` closure
 	"local_filters.go:localizeExprToLeaf":                       walkerPending, // 7 of 32 arms
 	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms

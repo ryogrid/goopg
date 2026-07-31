@@ -128,20 +128,126 @@ func pushInnerJoinInputQuals(f *Filter) {
 	if f == nil || f.Predicate == nil {
 		return
 	}
-	j, ok := f.Child.(*Join)
-	if !ok {
+	switch child := f.Child.(type) {
+	case *Join:
+		if _, _, pushable := joinRestrictionSides(child); !pushable {
+			return
+		}
+		for _, c := range splitAnd(f.Predicate) {
+			// Property 2: the conjunct is DUPLICATED — f.Predicate is left
+			// untouched — so only the error behaviour changes.
+			if repl, ok := pushConjunctIntoSubtree(child, c); ok {
+				f.Child = repl
+			}
+		}
+	case *MultiHashJoin:
+		pushResidualQualsIntoMHJTables(f, child)
+	}
+}
+
+// pushResidualQualsIntoMHJTables is the *MultiHashJoin* arm of
+// pushInnerJoinInputQuals (M0125-0046). A WHERE conjunct that
+// pushOneConjunct never AND'd onto a join predicate is still sitting in
+// the residual Filter when MHJ packing replaces the join chain, so
+// neither collectMultiHashTables (which only captures join-predicate
+// extras into mh.Filters) nor pushSingleSourceFiltersIntoMHJTables
+// (which only reads mh.Filters) ever sees it — `ca_state IN
+// ('IL','TX','ME')` stayed above the MHJ and customer_address was
+// hashed whole (50,000 rows for an 11,049-row answer, design doc
+// 0125-0035 §2).
+//
+// The MHJ is all-INNER by construction (collectMultiHashTables requires
+// JoinTypeInner), so every member is a preserved side and the
+// joinRestrictionSides outer-join analysis has no analog here. The four
+// load-bearing properties of the binary arm carry over: MHJ-output
+// coordinates with positional name validation (property 1, enforced in
+// mhjResidualConjunctTable), the conjunct is DUPLICATED not moved
+// (property 2 — f.Predicate stays untouched), CTE bodies are never
+// rewritten (property 3 — Tables[i] members are base-relation scans),
+// and re-walk idempotence comes from pushConjunctIntoSubtree's
+// exprEqual guard.
+func pushResidualQualsIntoMHJTables(f *Filter, mh *MultiHashJoin) {
+	if len(mh.Tables) == 0 {
 		return
 	}
-	if _, _, pushable := joinRestrictionSides(j); !pushable {
-		return
+	// Cumulative offsets — the same arithmetic
+	// pushSingleSourceFiltersIntoMHJTables uses for mh.Filters, because
+	// the residual Filter's predicate and mh.Filters share the
+	// MHJ-output coordinate space once remapWithBindings has run.
+	offsets := make([]int, len(mh.Tables)+1)
+	for i, t := range mh.Tables {
+		offsets[i+1] = offsets[i] + len(t.Output())
 	}
 	for _, c := range splitAnd(f.Predicate) {
-		// Property 2: the conjunct is DUPLICATED — f.Predicate is left
-		// untouched — so only the error behaviour changes.
-		if repl, ok := pushConjunctIntoSubtree(j, c); ok {
-			f.Child = repl
+		t, ok := mhjResidualConjunctTable(mh, offsets, c)
+		if !ok {
+			continue
+		}
+		local, ok := shiftConjunctForInput(c, -offsets[t])
+		if !ok {
+			continue
+		}
+		if repl, ok := pushConjunctIntoSubtree(mh.Tables[t], local); ok {
+			mh.Tables[t] = repl
 		}
 	}
+}
+
+// mhjResidualConjunctTable attributes a residual conjunct to the unique
+// mh.Tables[t] whose [offsets[t], offsets[t+1]) column range covers
+// every ColumnRef, validating each ref positionally by name (property
+// 1). The veto set matches innerJoinPushTarget: OuterColumnRef and
+// FuncCall (no volatility model — a volatile call must not change its
+// evaluation count) disqualify, and walkExprRefs under scopeVeto
+// already aborts on any subquery-bearing kind (an InExpr with Plan !=
+// nil carries a slotInnerPlan child; a literal IN-list walks its
+// Operand and List as same-scope slots and is admitted).
+func mhjResidualConjunctTable(mh *MultiHashJoin, offsets []int, c Expr) (int, bool) {
+	target := -1
+	bad := false
+	okWalk := walkExprRefs(c, scopeVeto, exprVisitor{
+		Visit: func(e Expr) bool {
+			if bad {
+				return false
+			}
+			switch x := e.(type) {
+			case *OuterColumnRef, *FuncCall:
+				_ = x
+				bad = true
+				return false
+			case *ColumnRef:
+				idx := x.Index
+				t := -1
+				for i := 0; i < len(mh.Tables); i++ {
+					if idx >= offsets[i] && idx < offsets[i+1] {
+						t = i
+						break
+					}
+				}
+				if t < 0 {
+					bad = true
+					return false
+				}
+				out := mh.Tables[t].Output()
+				local := idx - offsets[t]
+				if x.Name != "" && !strings.EqualFold(out[local].Name, x.Name) {
+					bad = true
+					return false
+				}
+				if target < 0 {
+					target = t
+				} else if target != t {
+					bad = true
+					return false
+				}
+			}
+			return true
+		},
+	})
+	if !okWalk || bad || target < 0 {
+		return -1, false
+	}
+	return target, true
 }
 
 // joinRestrictionSides reports which of a join's inputs may receive a
