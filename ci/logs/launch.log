@@ -99,3 +99,8 @@
 2026-07-31T00:12:09+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-07-31T02:58:21+09:00 [RUN]	S1 barrier reached
 2026-07-31T04:06:46+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-31T04:08:29+09:00 [RUN]	log-push: committed + pushed batch logs to origin/tpcds-fix2
+2026-08-01T01:18:02+09:00 [RUN]	start run_id=20260801-011802 sha=99c6ea23 dirty=42 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-01T01:18:10+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-01T04:14:21+09:00 [RUN]	S1 barrier reached
+2026-08-01T05:31:53+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
