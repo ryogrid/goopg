@@ -1,0 +1,130 @@
+# Judge-pass verifications — 2026-07-31
+#
+# These checks were run by the synthesis pass (not by either panel) to resolve
+# points where the two independent design panels disagreed, or where a claim was
+# load-bearing enough that a second confirmation was warranted.
+#
+# Tree state: branch tpcds-fix2, HEAD 23a077ae (dirty — a concurrent Ralph loop
+# was editing internal/planner/ and internal/executor/ throughout).
+# No server was started; no benchmark was run. All checks are static.
+
+================================================================================
+V1/V7 — Which TPC-H queries actually contain a MultiHashJoin, at THIS HEAD
+================================================================================
+$ awk '/^=== Q/{q=$2} /Multi-Way Hash Join/{print q": "$0}' \
+      plan_snapshots/m0125-0043-after.txt | sed 's/(cost.*//'
+
+Q2:         ->  Multi-Way Hash Join (4 tables)
+Q3:       ->  Multi-Way Hash Join (3 tables)
+Q7:             ->  Multi-Way Hash Join (3 tables)
+Q9:             ->  Multi-Way Hash Join (3 tables)
+Q10:       ->  Multi-Way Hash Join (4 tables)
+Q11:             ->  Multi-Way Hash Join (3 tables)
+Q11:       ->  Multi-Way Hash Join (3 tables)
+Q18:         ->  Multi-Way Hash Join (3 tables)
+Q21:           ->  Multi-Way Hash Join (4 tables)
+
+$ sed -n '58,76p'   plan_snapshots/m0125-0043-after.txt | grep -c 'Multi-Way'   # Q5
+0
+$ sed -n '125,141p' plan_snapshots/m0125-0043-after.txt | grep -c 'Multi-Way'   # Q9
+1
+
+RESULT: the MHJ-shaped set at this HEAD is {Q2, Q3, Q7, Q9, Q10, Q11, Q18, Q21}.
+        Q5 contains NO MultiHashJoin.
+
+CONSEQUENCE (this is the decisive one): in the committed A/B
+(docs/design/cost-model/evidence/sf1-r5-*-cb37d166.txt) Q5 goes 6.43 s -> HANG,
+and it is the single worst regression in the set. Q5 has no MHJ, so its collapse
+CANNOT be attributed to MHJ removal. Symmetrically Q2 (MHJ-shaped) goes
+51.23 s -> 2.72 s. The "MHJ-shaped => collapses" partition is falsified in BOTH
+directions. What moves the numbers is join ORDER, not the presence of a fused
+operator.
+
+CAVEAT that must travel with this result: the snapshot is from 2026-07-31 while
+the A/B is from cb37d166 (2026-07-24). Plans may have shifted between the two.
+Re-derive the query set at the measurement HEAD before relying on it (this is
+the same discipline finding F15 imposes on Stage 0c).
+
+================================================================================
+V2 — Does goopg EXPLAIN ever emit PG's bare `Hash` node?
+================================================================================
+$ grep -cE '^[[:space:]]*->[[:space:]]+Hash[[:space:]]*$|^[[:space:]]*->[[:space:]]+Hash[[:space:]]+\(' \
+       plan_snapshots/m0125-0043-after.txt
+0
+$ grep -cE '^[[:space:]]*->[[:space:]]+Hash Join' plan_snapshots/m0125-0043-after.txt
+40
+
+RESULT: 40 `Hash Join` nodes, ZERO bare `Hash` nodes. PostgreSQL always prints a
+`Hash` node as the inner child of a `Hash Join`. Removing MultiHashJoin therefore
+does NOT by itself make goopg's plan text structurally comparable to PG's — a
+second, independent asymmetry remains. Folded into 06 §4.
+
+================================================================================
+V3 — EstimateRows has no *MultiHashJoin arm
+================================================================================
+$ sed -n '37,90p' internal/planner/cardinality.go | grep -n 'case \*'
+  case *SeqScan: / *IndexScan: / *Values: / *Filter: / *Limit: / *Sort:
+  case *Project: / *Distinct: / *WindowAgg: / *Join: / *OrdinalityWrap:
+  case *Aggregate: / *Insert: / *Update, *Delete, *DDL, ... / *Explain:
+
+RESULT: CONFIRMED — there is no `case *MultiHashJoin:` in EstimateRows
+(internal/planner/cardinality.go:38+). Every MHJ estimates 0 rows.
+
+This was surfaced by the second panel as a *measurement confound* for the
+Stage 0 A/B. The judge pass upgrades it: it is also a LIVE DEFECT IN THE DEFAULT
+CONFIGURATION, because mhjPackingEnabled defaults to true, so every ancestor of a
+packed MHJ makes its BuildLeft / algorithm decisions on rows=0 today. Filed as
+R18 in 08 and as its own pre-stage commit candidate in 09.
+
+================================================================================
+V4 — VirtualSlot.Materialize() does not clone arena-backed Datums
+================================================================================
+internal/executor/slot.go:159-169
+
+    func (s *VirtualSlot) Row() Row {
+        out := acquireRow(len(s.cols))
+        for i := range s.cols { out[i] = s.Get(i) }
+        return out
+    }
+    func (s *VirtualSlot) Materialize() *MaterializedSlot {
+        return &MaterializedSlot{schema: s.schema, row: s.Row()}
+    }
+
+RESULT: CONFIRMED — `Materialize()` copies Datum structs but does NOT call
+cloneRowOwned, so an arena-backed Datum keeps its ArenaID and dangles after the
+producer's next arena Reset. Contrast drainRowsBounded (V5), which does exactly
+that clone and documents why. Any slot-chaining work (Stage 0a-legacy / Stage 1)
+must treat this as a prerequisite fix, not a detail.
+
+================================================================================
+V5 — drainRowsBounded deep-copies, and the copy is REQUIRED
+================================================================================
+internal/executor/spill.go:384-402
+
+    // M0073-0004 retention boundary: arena-backed Datums must be promoted to
+    // owned []byte before we accumulate, since the producer's next Next may
+    // trigger arena.Reset and invalidate the previous page's bytes.
+    var dup Row
+    if rowHasArena(row) { dup = cloneRowOwned(row) } else { dup = make(Row, len(row)); copy(dup, row) }
+    rows = append(rows, dup)
+
+RESULT: CONFIRMED. The first draft of contract C13 told implementers NOT to copy
+build rows. That instruction would have introduced a silent corruption bug. C13
+now says the opposite, in bold. Retained as R15.
+
+================================================================================
+V6 — The MHJ-drop regression is already recorded in-repo
+================================================================================
+docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md:188-198
+
+    "dropping MultiHashJoin turns star/snowflake queries into binary cascades
+     that materialise wide intermediates a single MHJ probe pass would stream —
+     Q5 and Q21 hang, Q9 times out, Q10 11.4x, Q18 4.3x, Q7 1.9x.  The same
+     section shows the axis has a favourable direction too (Q2 18.8x, Q8 4.1x),
+     so 'any MHJ change is bad' is the wrong lesson. The right one: the
+     direction is not predictable from the code change, so it must be measured
+     per commit."
+
+RESULT: CONFIRMED verbatim. Note this pre-existing record independently reaches
+the same conclusion as V7 above: the axis moves in both directions and is not
+predictable from the shape. This design set must not re-derive it as new.
