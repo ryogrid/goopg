@@ -411,6 +411,32 @@ started.
 >       `M0125-0038` last. Its first probe on this query is written down in the
 >       -0041 item body: `ca_state = 'AR'` still does not reach the
 >       `customer_address` scan.
+>       **↳ `M0125-0034`'s JOIN-ORDER ARM LANDED 2026-07-31 (loop #15), and it
+>       closed `-0041`'s acceptance with it: Q30 TIMEOUT → PASS 1 s / 31 rows /
+>       ck = oracle, Q81 TIMEOUT → PASS 1 s.** Design
+>       `docs/design/0125-0034a-comma-from-connectivity-order.md`. Both
+>       join-order passes were declining on any comma-FROM list holding a WITH
+>       reference — `tryBushyDP` on its leaf whitelist, the comma-FROM greedy on
+>       "not a base table with stats" — so nothing reordered Q30/Q64/Q81 and the
+>       source-order CROSS chain survived. Connectivity mode reorders for
+>       cross-freedom instead of cardinality, and is a **fixed point on any
+>       cross-free source order**, which is why only **4 of 99 SF0.5 cells
+>       moved** (`PASS=92 TIMEOUT=2`, timeout class 6 → 2; the other 95
+>       identical in status, rows AND checksum). Q72's TIMEOUT → PASS is NOT
+>       claimed (no `WITH`; the documented cap-straddler).
+>       **Two things bind the next loops. (1) `M0125-0044` is NEW and is a
+>       SILENT WRONG ANSWER** — Q64 now completes and answers 0 where the
+>       oracle says 2, because three `date_dim` aliases collapse to one in
+>       projection resolution; proven pre-existing by a byte-identical A/B
+>       across an arm that fires the pass and an arm that declines it, and
+>       previously unreachable (Q64 does not complete at HEAD in **1848 s**).
+>       **By this banner's own "a silent wrong answer outranks a timeout on
+>       severity" rule, `M0125-0044` IS THE NEXT SELECTION.** (2) `-0034` stays
+>       unchecked for **Q65 only**, which needs laterality recorded on
+>       `parser.RangeVar` before a derived table can be admitted — a parser
+>       change, not a planner one. Standing order inside M0125 is therefore
+>       **`M0125-0044` → `-0034`'s Q65 remainder / `-0035`'s CTE-body arm →
+>       `M0125-0038` (last)**. Two ledger rows 2026-07-31.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -3710,6 +3736,61 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Four ledger rows 2026-07-31 (this arm; the untouched `JOIN … ON` guard;
       the NLI flip declined-not-fixed, where the flipped shape is PG's OWN
       plan; the enumeration's remaining blind kinds).
+      **↳ THE JOIN-ORDER ARM LANDED 2026-07-31 (loop #15).** Design
+      `docs/design/0125-0034a-comma-from-connectivity-order.md`; tests
+      `internal/planner/joinorder_connectivity_test.go` (8); evidence
+      `analysis/m0125-0034b/`. **The resume point above named the right file
+      and the wrong reason.** It asked whether an 18-relation FROM list trips a
+      collapse/greedy threshold — it does (`tryBushyDP`: `len(tables) > 12`),
+      but that is not what stranded Q30/Q81, whose lists hold THREE items. The
+      actual cause is shared by all of them and sits in **both** join-order
+      passes at once, neither of them deciding anything: `tryBushyDP` whitelists
+      its leaves to `*SeqScan`/`*IndexScan`/`*MultiHashJoin` because
+      `buildBindingsPosMap` keys on scan identity, and
+      `reorderCommaFromByCardinality` bailed the instant a FROM item was not a
+      base table carrying `Stats.RowCount` — and a WITH reference is not in the
+      catalog. Nothing reordered these lists at all, so the source-order CROSS
+      chain survived. Same shape as `M0125-0041`: a capability gap wearing the
+      costume of a cost decision.
+      **Fix:** separate two objectives one precondition had fused. A missing row
+      count blocks *ranking* connected orders; it does not block telling a
+      connected order from a disconnected one, and a Cartesian product is only
+      ever the second question. New `orderByConnectivity` runs when the list
+      holds a WITH reference and makes NO cost claim — ranking there would mean
+      inventing a number rather than reading one (that is `M0125-0038`). Ties
+      break on source order, which buys the property that bounds the blast
+      radius: **a cross-free source order is a fixed point**, so the pass
+      rewrites a FROM list *if and only if* the source order contains a cross
+      the join graph could have avoided. The parser-level seam is what makes
+      this safe — it permutes before column resolution, so no resolved
+      `ColumnRef.Index` needs remapping, which is exactly the machinery whose
+      absence forced `tryBushyDP`'s whitelist.
+      **Measured:** full 99-query SF0.5 gate on one binary, three chunks —
+      **`PASS=92 MISMATCH=1 CKMISMATCH=0 ERROR=0 TIMEOUT=2 SKIP=4`**, timeout
+      class **6 → 2** (`Q65`, `Q78`). Diffed cell by cell against loop #14's
+      `sweep-20260731-121447.txt`: **exactly 4 of 99 cells moved, the other 95
+      identical in status, rows AND checksum.** `Q30 TIMEOUT (at 300 s and at
+      1200 s) → PASS 1 s, 31 rows, ck=f47a48499fd7e070`; `Q81 TIMEOUT → PASS
+      1 s, 100 rows`. **Q72's TIMEOUT → PASS 309 s is explicitly NOT claimed** —
+      Q72 has no `WITH`, so the mode cannot fire on it; it is the cap-straddler
+      the banner already documents. TPC-H is inert **by construction, not by
+      sampling**: the mode needs a name the catalog does not know and the TPC-H
+      query set contains no `WITH … AS (` at all; `tpch-spotcheck.sh`
+      `RESULT=PASS` (Q12=2 Q13=35, query-phase 32.2 s), units PASS.
+      **Q64 went TIMEOUT → MISMATCH and that is a defect this arm EXPOSED, not
+      one it caused** — measured, not assumed: at HEAD Q64 does not complete in
+      **1848 s**, and an A/B differing only in where `customer` sits in the FROM
+      list (one arm fires the pass, one is a fixed point so it declines) returns
+      **byte-identical** wrong output. Three `date_dim` aliases collapse to one
+      in projection resolution; filed as **`M0125-0044`**, a silent wrong
+      answer, which this banner ranks above a timeout.
+      **THIS ITEM STAYS OPEN for Q65 only.** Its inputs are derived aggregates,
+      not WITH references, and the parser accepts `LATERAL` and discards it
+      (`internal/parser/select.go`), so nothing in the AST can prove a derived
+      table uncorrelated and the pass must decline the whole list. Resume point:
+      record laterality on `parser.RangeVar`, then admit non-lateral derived
+      tables as opaque relations exactly as WITH references are. Ledger row
+      2026-07-31.
 
 - [ ] **M0125-0035 — C2: single-table qualifiers are attached to the join node,
       never to the base scan, and never pushed into a producing subquery**
@@ -4216,6 +4297,44 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       and `MultiAssignSubq*` but has **no `*InExpr` arm**, so a *correlated*
       `IN (subquery)`'s `OuterColumnRef`s are never translated through `posMap`.
       Fold it into this fix or file it when the fix lands (ledger row).
+
+- [ ] **M0125-0044 — a SILENT WRONG ANSWER: multiple aliases of the same table
+      collapse to one alias in projection resolution** (filed 2026-07-31 by
+      `M0125-0034`'s connectivity arm; evidence
+      `analysis/m0125-0034b/README.md` §"Q64's MISMATCH", probes
+      `analysis/m0125-0034b/{q64body,alias_a,alias_b}.sql`).
+      When a FROM list names the same table more than once under different
+      aliases, goopg projects ONE alias's column value for all of them. TPC-DS
+      **Q64 answers 0 rows where the oracle says 2**: its `cross_sales` CTE
+      joins `date_dim` three times (`d1` on `ss_sold_date_sk`, `d2` on
+      `c_first_sales_date_sk`, `d3` on `c_first_shipto_date_sk`) and selects
+      `d1.d_year as syear, d2.d_year as fsyear, d3.d_year as s2year`. goopg and
+      PG return the **same 26 rows** — the 18-way join is correct — but goopg
+      spreads them over 9 `syear` values (1994–2002) against PG's 5
+      (1998–2002), reporting first-sales years as sold years. The outer query
+      then filters `cs1.syear = 1999 and cs2.syear = 2000`, so the wrong years
+      empty the answer.
+      **Reduced to six relations** in `alias_a.sql`: `y1 = y2 = y3` on every
+      row where PG gives `1998 | 1993 | 1993`. Note the query also emits five
+      separate `1993|1993|1993` groups under `GROUP BY 1,2,3` — **the grouping
+      keys are distinct while the projected columns are not**, which is the
+      same "right grouping, wrong projection" signature `M0125-0013` found in
+      Q47's CTE body and is the strongest single clue: start where the GROUP BY
+      key expressions and the target-list expressions are resolved against the
+      scan layout, not in the join.
+      **Ruled out BY MEASUREMENT, do not re-test:** it is NOT the connectivity
+      reorder that exposed it. `alias_a.sql` and `alias_b.sql` differ only in
+      where `customer` sits in the FROM list — arm A fires the pass, arm B is a
+      fixed point so the pass declines entirely — and goopg's output is
+      **byte-identical** in both. It reproduces with no Cartesian product in
+      the plan and is independent of FROM order.
+      **Severity:** this is a silent wrong answer, which this milestone's
+      banner ranks above a timeout item. It was previously unreachable — Q64
+      TIMEOUTs at HEAD even with a **1848 s** budget — and is now reachable by
+      a 20-second query, which is the only reason it is visible at all.
+      Acceptance: `alias_a.sql` matches PG column-for-column, and Q64 →
+      `64|OK|2|<oracle ck>` in the SF0.5 gate. Bar: units +
+      `tpch-spotcheck.sh` + TPC-H plan-diff + the full 99-query SF0.5 gate.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

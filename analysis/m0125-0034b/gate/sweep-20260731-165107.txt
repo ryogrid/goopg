@@ -1,0 +1,53 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T16:51:18+09:00
+# goopg: baf4e5cf planner(unnest)+docs: M0125-0041 — the scalar pull-up never declined, it hit a missing switch arm
+# engine-id: 957a59251753e5c0c1872be448582fbb1da8ea2f c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=2202d9413291
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=7a76b9a0a11954c6 on-disk=7a76b9a0a11954c6 (tmp/goopg-0034b-gate)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 ) — NOT a gate result; the summary below covers only these queries
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS       17s        0 rows  ck=1f18d650d205d71d
+Q38  PASS       17s        1 rows  ck=6f66a76c23e12a63
+Q39  PASS       65s       77 rows  ck=4db806a9a11fddfd
+Q40  PASS        2s      100 rows  ck=n/a
+Q41  PASS        8s        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        2s       10 rows  ck=5004612d9b837c34
+Q43  PASS        2s        6 rows  ck=b70a4026e9b9bb04
+Q44  PASS       26s       10 rows  ck=d76f8301addaff98
+Q45  PASS        8s        7 rows  ck=e09cf591997524ad
+Q46  PASS        7s      100 rows  ck=n/a
+Q47  PASS      277s      100 rows  ck=n/a
+Q48  PASS       13s        1 rows  ck=9a9ece15cb525a79
+Q49  PASS       17s       25 rows  ck=ccb0983b810cf1d0
+Q50  PASS        3s        6 rows  ck=3928ecee672e3992
+Q51  PASS       13s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS       20s      100 rows  ck=n/a
+Q54  PASS       40s        0 rows  ck=1f18d650d205d71d
+Q55  PASS        1s       73 rows  ck=46d35b957845db41
+Q56  PASS       32s      100 rows  ck=n/a
+Q57  PASS       57s      100 rows  ck=n/a
+Q58  PASS       19s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       19s      100 rows  ck=n/a
+Q60  PASS       31s      100 rows  ck=n/a
+Q61  PASS       14s        1 rows  ck=4766027020fae308
+Q62  PASS        5s      100 rows  ck=n/a
+Q63  PASS       20s      100 rows  ck=n/a
+Q64  MISMATCH   33s goopg=0 oracle=2
+Q65  TIMEOUT   308s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS        8s        5 rows  ck=f6613897dd73709a
+Q67  PASS      154s      100 rows  ck=n/a
+Q68  PASS       11s      100 rows  ck=n/a
+Q69  PASS       15s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       15s      580 rows  ck=521a7af7606d10c1
+Q72  PASS      309s      100 rows  ck=n/a
+Q73  PASS       15s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       14s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       34s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=36 (19 ck-verified, 17 ck=n/a) MISMATCH=1 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=2 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
