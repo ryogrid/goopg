@@ -5373,6 +5373,15 @@ type aggregateSurface struct {
 	// entries. Consulted only for a contested key. M0125-0044.
 	groupByExprQual map[string]int
 	aggregateByKey  map[string]aggregateBinding
+	// aggregateAmbiguous marks aggregateCallKey values claimed by more than
+	// one distinct aggregate call. The key builds its argument part on
+	// parserExprKey, so count(d1.y) and count(d2.y) over a self-joined table
+	// hash equal and only one kept a slot — right cardinality, wrong values,
+	// the aggregate half of the -0044 GROUP BY collapse. M0125-0045.
+	aggregateAmbiguous map[string]bool
+	// aggregateByKeyQual is aggregateByKey keyed WITH the ColumnRef
+	// qualifiers. Consulted only for a contested key. M0125-0045.
+	aggregateByKeyQual map[string]aggregateBinding
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -6055,11 +6064,54 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	var havingAggCalls []*parser.FuncCall
+	if s.Having != nil {
+		havingAggCalls = collectHavingSubqueryAggCalls(s.Having, cat)
+	}
+	// M0125-0045: mark blind keys claimed by more than one distinct call.
+	// aggregateCallKey drops ColumnRef qualifiers (its argument part is
+	// parserExprKey), so count(d1.y) and count(d2.y) over a self-joined table
+	// hash equal and the exists-check below discarded the second — right
+	// cardinality, wrong values, the aggregate half of -0044's GROUP BY
+	// collapse. A key is contested only when the QUALIFIED forms differ:
+	// count(y) written twice still shares one slot. Contested calls are keyed
+	// on the qualified form, which can split count(y)/count(t.y) of the same
+	// binding into two slots — redundant computation, never a wrong answer
+	// (PG merges those by equal() over the resolved Aggref args,
+	// src/backend/nodes/equalfuncs.c, which goopg has no resolved-form key
+	// for; ledger row 2026-08-01).
+	aggAmbiguous := map[string]bool{}
+	{
+		firstQual := map[string]string{}
+		markContested := func(fc *parser.FuncCall) {
+			k := aggregateCallKey(fc)
+			qk := qualifiedAggregateCallKey(fc)
+			if prev, seen := firstQual[k]; seen {
+				if prev != qk {
+					aggAmbiguous[k] = true
+				}
+				return
+			}
+			firstQual[k] = qk
+		}
+		for _, fc := range aggCalls {
+			markContested(fc)
+		}
+		for _, fc := range havingAggCalls {
+			markContested(fc)
+		}
+	}
 	aggByKey := make(map[string]aggregateBinding, len(aggCalls))
+	aggByKeyQual := make(map[string]aggregateBinding, len(aggCalls))
 	plannedAggs := make([]AggregateCall, 0, len(aggCalls))
 	for _, fc := range aggCalls {
 		k := aggregateCallKey(fc)
-		if _, exists := aggByKey[k]; exists {
+		qk := qualifiedAggregateCallKey(fc)
+		if aggAmbiguous[k] {
+			if _, exists := aggByKeyQual[qk]; exists {
+				continue
+			}
+		} else if _, exists := aggByKey[k]; exists {
 			continue
 		}
 		pa, err := buildAggregateCall(fc, inputCtx, cat)
@@ -6093,6 +6145,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		}
 		idx := len(outputSchema)
 		aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+		aggByKeyQual[qk] = aggregateBinding{index: idx, typ: pa.Type}
 		plannedAggs = append(plannedAggs, pa)
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 	}
@@ -6102,9 +6155,14 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// The sum(distinct a.four) is an outer aggregate reference that must be registered
 	// so resolveExprAfterAggregate (via resolveColumnRef → havingAgg lookup) can find it.
 	if s.Having != nil {
-		for _, fc := range collectHavingSubqueryAggCalls(s.Having, cat) {
+		for _, fc := range havingAggCalls {
 			k := aggregateCallKey(fc)
-			if _, exists := aggByKey[k]; exists {
+			qk := qualifiedAggregateCallKey(fc)
+			if aggAmbiguous[k] {
+				if _, exists := aggByKeyQual[qk]; exists {
+					continue
+				}
+			} else if _, exists := aggByKey[k]; exists {
 				continue
 			}
 			pa, err := buildAggregateCall(fc, inputCtx, cat)
@@ -6113,6 +6171,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			}
 			idx := len(outputSchema)
 			aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+			aggByKeyQual[qk] = aggregateBinding{index: idx, typ: pa.Type}
 			plannedAggs = append(plannedAggs, pa)
 			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 		}
@@ -6183,6 +6242,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByAmbiguous:    groupByAmbiguous,
 		groupByExprQual:     groupByExprQual,
 		aggregateByKey:      aggByKey,
+		aggregateAmbiguous:  aggAmbiguous,
+		aggregateByKeyQual:  aggByKeyQual,
 		node:                aggNode,
 		funcDepCols:         map[int]int{},
 		cat:                 cat,
@@ -6566,6 +6627,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if isAggregateFunc(x) || isUserAggregateFunc(x, agg.cat) {
 			k := aggregateCallKey(x)
 			b, ok := agg.aggregateByKey[k]
+			// M0125-0045: a contested key names no slot in particular —
+			// several distinct calls share it and the blind map holds only
+			// the last one written. The qualified key is what tells
+			// count(d1.y) from count(d2.y); on a miss keep the blind
+			// binding rather than failing.
+			if agg.aggregateAmbiguous[k] {
+				if qb, qok := agg.aggregateByKeyQual[qualifiedAggregateCallKey(x)]; qok {
+					b, ok = qb, true
+				}
+			}
 			if !ok {
 				return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "aggregate call could not be resolved"}
 			}
@@ -6878,7 +6949,11 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 					}
 				}
 			}
-			k := aggregateCallKey(fc)
+			// M0125-0045: dedup on the QUALIFIED key so count(d1.y) and
+			// count(d2.y) both survive collection. buildAggregateStage still
+			// merges same-blind-key calls onto one slot unless the blind key
+			// is contested, so plain repetition costs nothing extra.
+			k := qualifiedAggregateCallKey(fc)
 			if _, ok := seen[k]; ok {
 				return nil
 			}
@@ -11095,7 +11170,15 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				if p.havingAgg == nil {
 					continue
 				}
-				if b, ok := p.havingAgg.aggregateByKey[k]; ok {
+				b, ok := p.havingAgg.aggregateByKey[k]
+				// M0125-0045: contested blind key — dispatch on the
+				// qualified form, same as resolveExprAfterAggregate.
+				if p.havingAgg.aggregateAmbiguous[k] {
+					if qb, qok := p.havingAgg.aggregateByKeyQual[qualifiedAggregateCallKey(x)]; qok {
+						b, ok = qb, true
+					}
+				}
+				if ok {
 					// Count parent hops from current ctx to the context that owns havingAgg.
 					level := 0
 					for q := ctx; q != p; q = q.parent {

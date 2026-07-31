@@ -495,8 +495,13 @@ started.
 >       build side into one bucket — 245k × 30k probe walks). Design
 >       `docs/design/0125-0035b-cte-body-inline-ec-const-hash-key.md`;
 >       three ledger rows 2026-08-01 (multi-column hash keys, equivclass
->       transitive closure, inline_cte volatility). **NEXT SELECTION:
->       `M0125-0045`, then `M0125-0046`, then `M0125-0038` last.**
+>       transitive closure, inline_cte volatility). ~~**NEXT SELECTION:
+>       `M0125-0045`, then `M0125-0046`, then `M0125-0038` last.**~~
+>       **↳ `M0125-0045` LANDED 2026-08-01 (loop #19)** — contested-key
+>       treatment for aggregate slots, acceptance met by unit tests + a
+>       byte-identical PG-oracle diff; SF0.5 gate unchanged (PASS=95, zero
+>       cell movement). **NEXT SELECTION: `M0125-0046`, then `M0125-0038`
+>       last.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -4495,7 +4500,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `64|OK|2|<oracle ck>` in the SF0.5 gate. Bar: units +
       `tpch-spotcheck.sh` + TPC-H plan-diff + the full 99-query SF0.5 gate.
 
-- [ ] **M0125-0045 — the same qualifier-blind key collapses AGGREGATE slots:
+- [x] **M0125-0045 — the same qualifier-blind key collapses AGGREGATE slots:
       `count(d1.y)` and `count(d2.y)` dedup onto one** (filed 2026-07-31 by
       `M0125-0044`, which fixed the GROUP-BY-key half of the identical cause).
       `aggregateCallKey` builds its dedup key from `parserExprKey`, whose
@@ -4516,6 +4521,22 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       test plus a PG-oracle diff on a hand-written query, NOT the sweep. Bar:
       units + `tpch-spotcheck.sh` + the full 99-query SF0.5 gate (as a
       no-regression check, not as evidence). Ledger row 2026-07-31.
+      **↳ FIXED and landed 2026-08-01 (loop #19).** The -0044 contested-key
+      treatment applied to aggregates: `qualifiedAggregateCallKey` (same
+      reflective qualifier walk, over the whole FuncCall), collection dedups
+      on the qualified key, `buildAggregateStage` marks blind keys whose
+      qualified forms differ (`aggregateAmbiguous`) and keys contested calls
+      via `aggregateByKeyQual`, both resolution sites (post-aggregate +
+      havingAgg outer-ref) dispatch contested calls through it. Acceptance
+      met: 4 planner unit tests (aggregate_alias_collapse_test.go) +
+      byte-identical PG-oracle diff on hand-written asymmetric-NULL data
+      (count(d1.y)=3 vs count(d2.y)=1, three query shapes). No-regression:
+      units, tpch-spotcheck PASS, full SF0.5 gate PASS=95 MISMATCH=0
+      CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4 with ZERO cell movement vs loop
+      #18. Design `docs/design/0125-0045-aggregate-alias-slot-collapse.md`;
+      one ledger row 2026-08-01 (PG merges by resolved-form equality; the
+      parser-form key can split count(y)/count(t.y) of one binding —
+      redundant slot, never a wrong answer).
 
 ## M0126 — Cost-driven planning made production-viable (filed 2026-07-31)
 

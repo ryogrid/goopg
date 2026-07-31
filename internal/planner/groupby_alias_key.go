@@ -46,6 +46,20 @@ func qualifiedGroupKey(e parser.Expr) string {
 	return b.String()
 }
 
+// qualifiedAggregateCallKey is aggregateCallKey plus the table/schema
+// qualifiers of every ColumnRef inside the call — arguments, FILTER, the
+// in-argument ORDER BY — in walk order. aggregateCallKey builds its argument
+// keys from parserExprKey, so `count(d1.y)` and `count(d2.y)` share it and
+// differ only here. The aggregate half of the M0125-0044 collapse
+// (M0125-0045); consulted only where the blind key is contested.
+func qualifiedAggregateCallKey(fc *parser.FuncCall) string {
+	var b strings.Builder
+	b.WriteString(aggregateCallKey(fc))
+	b.WriteByte('#')
+	appendRefQualifiers(&b, reflect.ValueOf(fc), 0)
+	return b.String()
+}
+
 // appendRefQualifiers walks a parser expression and writes `|schema.table` for
 // each ColumnRef it reaches. Unexported fields are skipped for the same reason
 // structuralExprKey skips them: the only one in the parser AST is the source

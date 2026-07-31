@@ -1,42 +1,35 @@
 (idle — nothing in flight)
 
-M0125-0034's Q65 arm landed loop #17 (2026-07-31) — **M0125-0034 IS CLOSED**.
-Committed on `tpcds-fix2` (see git log for the loop-#17 commit), pushed.
+## Loop summary (loop #19, 2026-08-01)
+
+**M0125-0045 is CLOSED** — aggregate half of the -0044 qualifier-blind
+collapse. `count(d1.y)`/`count(d2.y)` now occupy distinct agg slots via the
+contested-key treatment: `qualifiedAggregateCallKey` (groupby_alias_key.go,
+reuses appendRefQualifiers over the whole FuncCall), collection dedups on the
+qualified key, `buildAggregateStage` marks `aggregateAmbiguous` blind keys +
+keys contested calls via `aggregateByKeyQual`, both resolution sites
+(resolveExprAfterAggregate + resolveExpr havingAgg arm) dispatch through it.
+
+Acceptance was NOT the sweep (no SF0.5 query reaches the defect): 4 planner
+unit tests (aggregate_alias_collapse_test.go) + byte-identical PG-oracle diff
+on hand-written asymmetric-NULL data (count(d1.y)=3 vs count(d2.y)=1; probe
+db on :65438 created and dropped). One ledger row 2026-08-01: PG merges by
+resolved-form equality (equal() over Aggref->args) — goopg's parser-form key
+can SPLIT count(y)/count(t.y) of one binding (redundant slot, never wrong).
 
 **Next loop: read the `## Current Priority` banner FIRST.** It now names
-`-0035`'s CTE-body arm as the next selection (single-reference CTE inlining,
-PG `subselect.c::inline_cte`, + equivalence-class constant propagation
-`equivclass.c`; Q31's 6×-referenced `ws3` is the must-NOT-inline control),
-then `M0125-0045`, then `M0125-0038` last.
+**`M0125-0046`** (MHJ InExpr qual placement — planner/executor SIBLING PAIR),
+then `M0125-0038` last; after M0125 closes, M0126 (cost-driven planning) is
+next per the 2026-07-31 USER amendment.
 
-Findings worth not re-deriving (all in
-`docs/design/0125-0034a-comma-from-connectivity-order.md` §7):
-- `parser.RangeVar.Lateral` now exists. It is set at BOTH accept sites in
-  `internal/parser/select.go` — `parseRangeVar` AND the `JOIN LATERAL` path,
-  which consumes the keyword before `parseRangeVar` can see it. Only the
-  join-order pass reads it; LATERAL *evaluation* is still uncorrelated
-  (ledger row 2026-07-31).
-- `reorderCommaFromByCardinality`: table functions decline the whole list
-  (PG treats LATERAL as noise before a function item — absence proves
-  nothing); `Lateral` derived tables decline; non-lateral derived tables are
-  opaque relations → connectivity mode, same standing as WITH references.
-- Q72 straddles the 300 s cap (307/309/314 s over three loops) and flips
-  status noise-wise between sweeps; it is all-`JOIN…ON`, unreachable by the
-  comma-FROM pass — do not chase it as a regression.
-- SF0.5 timeout class is now Q78 (+ the Q72 straddle). Q78 = -0035 CTE-body.
-- Plan-diff baseline: use `m0125-0044-after` with `PLAN_DB=tpch
-  PLAN_USER=tpch` (needs the 65433 TPC-H server up: `bench/tpch/setup_goopg.sh`).
+Gates run this loop (all PASS): go build; planner+executor+parser suites;
+`RALPH_PRECOMMIT_SCOPE=units`; `scripts/tpch-spotcheck.sh` RESULT=PASS
+(Q12=2 Q13=35); full 99-query SF0.5 gate, one binary
+`tmp/goopg-sf05-m0125-0045-bin`, 3 chunks
+(`analysis/tpcds-sf05-m0125-0045/gate/`) — PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0 SKIP=4, diffed cell-by-cell vs loop #18: ZERO movement;
+pre-commit pgbench smoke (hook); `make ralph-state-guard`.
 
-Gates run this loop (all PASS): `go build ./...`; `go vet
-./internal/planner/ ./internal/parser/`; `go test ./internal/planner/...
-./internal/executor/ ./internal/parser/`; full 99-query TPC-DS SF0.5 gate,
-one binary, 3 chunks (`analysis/m0125-0034c/gate/`) — PASS=93 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=2 (Q72 straddle, Q78) SKIP=4, exactly 2/99
-cells moved vs loop #16; `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2
-Q13=35, 40.5 s); `make plan-diff LABEL=m0125-0044-after` 22/22 MATCH;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
-`make ralph-state-guard`.
-
-In-flight: none. All goopg bench servers stopped (65433/65436/65437 down;
-65433 was started for plan-diff and stopped after). PG oracle :65438 left as
-found. Private gate binary at `tmp/goopg-sf05-m0125-0034c-bin`.
+Nightly AI-20260731-001201-001 already filed under M-NIGHTLY — parked per
+banner. In-flight: none. Throwaway goopg (5533) stopped and data dir removed;
+SF0.5 server lifecycle handled by the sweep script; PG :65438 left as found.
