@@ -649,6 +649,9 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		Alias:  innerScan.Alias,
 		Index:  idx,
 		schema: innerScan.Output(),
+		// M0125-0043: promoting the leaf to an index probe must not change
+		// the relation's small-dimension answer.
+		SmallDim: innerScan.SmallDim,
 	}
 	if len(keys) == 1 {
 		inner.Key = keys[0]

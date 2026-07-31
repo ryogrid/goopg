@@ -1422,6 +1422,11 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			schema:                n.schema,
 			PrivilegeCheckRole:    n.PrivilegeCheckRole,
 			PrivilegeCheckRoleSet: n.PrivilegeCheckRoleSet,
+			// M0125-0043: demoting the probe back to a full scan must not
+			// change the relation's small-dimension answer — the sibling of
+			// the promotions in nl_index_join.go / mhj_input_rewrite.go,
+			// which copy the tag in the other direction.
+			SmallDim: n.SmallDim,
 		}
 		// Preserve any non-correlation probe keys / range bounds as a
 		// Filter above the SeqScan. `indexColRef` resolves the index's

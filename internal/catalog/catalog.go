@@ -408,13 +408,25 @@ type Table struct {
 	OfTypeOID uint32
 
 	// SmallDimension flags a table whose row count is known to
-	// be ≤ a tiny constant — the canonical TPC-H examples are
-	// `region` (5 rows) and `nation` (25 rows). The planner uses
-	// the flag as a cardinality fallback when ANALYZE-derived
-	// stats are absent: a hash join with a SmallDimension side
-	// pins the small side as the build side regardless of the
-	// other side's estimated rows. See M0054-0010 / design doc
+	// be ≤ a tiny constant. The planner uses it as a cardinality
+	// fallback when ANALYZE-derived stats are absent: a hash join
+	// with a SmallDimension side pins the small side as the build
+	// side regardless of the other side's estimated rows. See
+	// M0054-0010 / design doc
 	// `docs/design/0054-0005-hash-join-small-side-build.md`.
+	//
+	// M0125-0043 RETIRED the two production writers of this field.
+	// They set it for a relation literally named `region` or
+	// `nation` — the tiny TPC-H dimension tables — which made a
+	// benchmark's schema part of the production planner and left
+	// every other tiny dimension untreated. The planner now DERIVES
+	// the property from the relation's size at plan time
+	// (`internal/planner/small_dimension.go`) and stamps it on the
+	// scan node. The field survives as an explicit hint for
+	// catalog-only fixtures with no heap to measure
+	// (`internal/testutil/tpch`); nothing in production sets it, so
+	// on a live server it is always false. See
+	// `docs/design/0125-0043-smalldimension-name-tag-extinction.md`.
 	SmallDimension bool
 
 	// RelFrozenXID is the minimum XID still present in the heap as an

@@ -3367,14 +3367,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		// they never hold rows directly — all data lives in children.
 		// But we still create a heap so the table exists for metadata.
 	}
-	// M0054-0010: tag known small dimension tables (canonical
-	// TPC-H tiny tables: region 5 rows, nation 25 rows). The flag
-	// lets the planner pin the small side as the hash-join build
-	// side regardless of stats availability.
-	switch strings.ToLower(s.Name.Name) {
-	case "region", "nation":
-		tbl.SmallDimension = true
-	}
+	// M0125-0043 removed a name lookup here. M0054-0010 used to set
+	// `tbl.SmallDimension = true` for a relation literally called `region` or
+	// `nation` — the two tiny TPC-H dimension tables — which made a benchmark's
+	// schema part of the production planner and gave every OTHER tiny dimension
+	// table none of the treatment. The property is now derived from the
+	// relation's size at plan time (internal/planner/small_dimension.go), which
+	// is the only point where a size is knowable: a table being CREATEd is
+	// empty, so this site never had the information it was guessing at.
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {

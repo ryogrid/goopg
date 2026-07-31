@@ -1,0 +1,28 @@
+[11:52:42] building engine -> /home/ryo/work/goopg/goopg/tmp/goopg-relsize-bin and runner -> /home/ryo/work/goopg/goopg/tmp/tpch-relsize-runner
+[11:52:43] arm c2: flag='2' queries=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22 per_q=600s -> /home/ryo/work/goopg/goopg/analysis/m0125-0043-tpch-20260731/c2.tsv
+[11:52:50] Q1 ok 6.47s rows=4 peakRSS=4179392kB
+[11:52:55] Q2 ok 3.26s rows=455 peakRSS=1892800kB
+[11:53:10] Q3 ok 12.96s rows=11521 peakRSS=11096100kB
+[11:53:58] Q4 ok 44.23s rows=5 peakRSS=8150624kB
+[11:55:01] Q5 ok 61.58s rows=5 peakRSS=9543532kB
+[11:55:07] Q6 ok 4.53s rows=1 peakRSS=4160828kB
+[11:55:45] Q7 ok 34.80s rows=4 peakRSS=10576540kB
+[11:55:56] Q8 ok 9.59s rows=2 peakRSS=6024276kB
+[11:56:51] Q9 ok 52.10s rows=175 peakRSS=11438708kB
+[11:57:06] Q10 ok 12.49s rows=20501 peakRSS=10978580kB
+[11:57:11] Q11 ok 1.89s rows=819 peakRSS=3527580kB
+[11:57:30] Q12 ok 16.52s rows=2 peakRSS=6310184kB
+[11:57:46] Q13 ok 12.90s rows=35 peakRSS=5701372kB
+[11:57:53] Q14 ok 5.07s rows=1 peakRSS=4368844kB
+[11:58:35] Q15 ok 36.19s rows=1 peakRSS=4254268kB
+[11:58:39] Q16 ok 1.43s rows=18213 peakRSS=3515712kB
+[11:59:11] Q17 ok 29.81s rows=1 peakRSS=4587836kB
+[11:59:50] Q18 ok 37.94s rows=10 peakRSS=10285800kB
+[11:59:59] Q19 ok 6.82s rows=1 peakRSS=4379768kB
+[12:00:26] Q20 ok 24.38s rows=76 peakRSS=5160044kB
+[12:11:28] Q21 timeout after 660s peakRSS=14831600kB
+[12:12:29]   stop: escalating to SIGKILL (pid 733767)
+scripts/tpch-relsize-arm.sh: line 167: 733767 Killed                  GOOPG_CG_UNIT="${CG_UNIT}" GOOPG_MEM_HIGH=13G GOOPG_MEM_MAX=15G GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=12GiB GOGC=100 GOOPG_PPROF_ADDR="${PPROF_ADDR}" GOOPG_RELSIZE_FALLBACK="${ARM_FLAG}" "${REPO_ROOT}/scripts/goopg-test-run.sh" "${GOOPG_BIN}" start -D "${PGDATA}" --listen "${PG_HOST}:${PG_PORT}" --hba "${PGDATA}/pg_hba.conf" >> "${SERVER_LOG}" 2>&1
+[12:12:30]   start attempt 1 failed; see /home/ryo/work/goopg/goopg/analysis/m0125-0043-tpch-20260731/c2.server.log
+[12:12:49] Q22 ok 12.64s rows=7 peakRSS=5127788kB
+[12:12:50] arm c2 done in 1207s -> /home/ryo/work/goopg/goopg/analysis/m0125-0043-tpch-20260731/c2.tsv

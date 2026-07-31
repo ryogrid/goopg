@@ -2938,7 +2938,13 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			Name:           tr.RelName,
 			Columns:        cols,
 			OID:            tr.OID,
-			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
+			// M0125-0043: the sibling of the CREATE-TABLE site in
+			// internal/executor/operators_ddl.go — this used to reload
+			// `SmallDimension` from the literal relation names "region" /
+			// "nation". The planner derives the property from the relation's
+			// size now (internal/planner/small_dimension.go), so nothing is
+			// restored here and a reloaded table gets the same answer as a
+			// freshly created one.
 			// IsMatView from relkind alone; View/ViewDef are restored afterward
 			// by loadViewsFromHeap re-parsing the pg_rewrite _RETURN rule's
 			// ev_action (B5 Slice C). matview IsPopulated defaults to populated on

@@ -155,7 +155,7 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// behaviour. See docs/design/fix-for-q5/01.
 	var locals relationLocalFilters
 	dpConjuncts := conjuncts
-	if shouldAttachBeforeMHJ(ctx.bindings) {
+	if shouldAttachBeforeMHJ(ctx.bindings, scans) {
 		// Build cumOffsets matching the bindings'
 		// FROM-cumulative output coordinates.
 		cumOffsets := make([]int, len(ctx.bindings)+1)

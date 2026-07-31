@@ -151,8 +151,11 @@ func TestLocalizeExprToLeafBinaryOpRecursive(t *testing.T) {
 
 // TestShouldAttachBeforeMHJGate pins design 01 §4.1:
 // pre-MHJ attachment fires when (a) FROM has ≥ 5 tables
-// AND (b) at least one binding is on a SmallDimension
-// table (region / nation). The SmallDim clause exists
+// AND (b) at least one binding is on a small-dimension
+// relation. M0125-0043: clause (b) is answered off the leaf
+// SCAN (size-derived) with the catalog flag surviving as an
+// explicit hint, so both spellings are exercised below. The
+// SmallDim clause exists
 // because Slice A regressed Q8 / Q21 from PASS to CANCEL
 // when fragmenting their MHJ shape — those queries
 // don't have a SmallDim local that would justify the
@@ -165,7 +168,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings4 := []rangeBinding{
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if shouldAttachBeforeMHJ(bindings4) {
+	if shouldAttachBeforeMHJ(bindings4, nil) {
 		t.Error("fromCount=4 should NOT trigger pre-MHJ attachment")
 	}
 
@@ -173,7 +176,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings5SmallDim := []rangeBinding{
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if !shouldAttachBeforeMHJ(bindings5SmallDim) {
+	if !shouldAttachBeforeMHJ(bindings5SmallDim, nil) {
 		t.Error("fromCount=5 with SmallDim binding should trigger pre-MHJ attachment (Q5 shape)")
 	}
 
@@ -181,7 +184,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings5NoSmallDim := []rangeBinding{
 		{table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if shouldAttachBeforeMHJ(bindings5NoSmallDim) {
+	if shouldAttachBeforeMHJ(bindings5NoSmallDim, nil) {
 		t.Error("fromCount=5 without SmallDim should NOT trigger pre-MHJ attachment (avoids Q7/Q8/Q21 regression)")
 	}
 
@@ -190,8 +193,30 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 		{table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if !shouldAttachBeforeMHJ(bindings8SmallDim) {
+	if !shouldAttachBeforeMHJ(bindings8SmallDim, nil) {
 		t.Error("fromCount=8 with SmallDim should trigger pre-MHJ attachment")
+	}
+
+	// M0125-0043: the same gate, answered by the SIZE-derived tag on the leaf
+	// scan instead of the catalog hint. No binding carries the flag; the tag
+	// rides on scans[0] the way plan-build stamps it, and the gate must fire.
+	// Without this the flag's extinction would silently disarm the guard that
+	// keeps Q8 / Q21 out of the CANCEL regression.
+	bindings5Derived := []rangeBinding{
+		{table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
+	}
+	scansDerived := []Node{
+		&SeqScan{Table: largeFact, SmallDim: true}, nil, nil, nil, nil,
+	}
+	if !shouldAttachBeforeMHJ(bindings5Derived, scansDerived) {
+		t.Error("fromCount=5 with a size-derived SmallDim leaf scan should trigger pre-MHJ attachment")
+	}
+	// And the negative: same bindings, same scans, tag off.
+	scansPlain := []Node{
+		&SeqScan{Table: largeFact}, nil, nil, nil, nil,
+	}
+	if shouldAttachBeforeMHJ(bindings5Derived, scansPlain) {
+		t.Error("fromCount=5 with no small-dimension leaf should NOT trigger pre-MHJ attachment")
 	}
 }
 

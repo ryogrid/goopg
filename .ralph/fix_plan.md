@@ -377,6 +377,26 @@ started.
 >       was noticed; do not repeat that shortcut. Current timeout class:
 >       **Q30 Q64 Q65 Q72 Q78 Q81** (6, `Q72` confirmed in the loop #12 sweep).
 >       Four ledger rows 2026-07-31.
+>       **↳ `M0125-0043` IS DONE (2026-07-31, loop #13) — the USER's preempting
+>       item is discharged.** The two `region`/`nation` name lookups are gone;
+>       the small-dimension property is derived from relation SIZE at plan-build
+>       time and stamped on the scan leaf (`internal/planner/small_dimension.go`,
+>       design `docs/design/0125-0043-smalldimension-name-tag-extinction.md`).
+>       **0/22 TPC-H plans changed — byte-identical snapshots in a same-cluster
+>       `git stash` A/B**, and that is the PROOF rather than a null result: the
+>       before-arm has the name tag ON, so identical plans mean the size
+>       derivation reproduces it exactly (Q5's `region` MHJ anchor and the
+>       Q8/Q21 `shouldAttachBeforeMHJ` CANCEL guard included). Timed 22-query
+>       acceptance: **21/22 ok with correct rows (Q12=2 Q13=35); Q21 timeout,
+>       PRE-EXISTING** (`timeout` in both cold arms at HEAD on 2026-07-30) and
+>       already filed as **`M0125-0032`** — newly established, it survives a
+>       DOUBLED 600 s budget, so -0032 is a shape defect, not a crossing near
+>       300 s. The catalog field survives as a fixture-only hint with **no
+>       production writer**; retiring it entirely is a ledger row. **NEXT
+>       SELECTION: `M0125-0041`** (Q30/Q81, -0036's correlated-scalar-aggregate
+>       variant — its body warns explicitly NOT to assume -0036's pass
+>       generalises), then `-0034`'s join-order arm, then `M0125-0038` last.
+>       Three ledger rows 2026-07-31.
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -1547,6 +1567,17 @@ LABEL=tpcds-round2-head`. Round-5's *absolute* seconds are not a valid baseline
 (the fix bundle moved the stream 1086 → 325 s with no plan changes) — M0124-0002
 arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
+> **⚡ DISCHARGED 2026-07-31 (loop #13) — `M0125-0043` IS DONE.** Its design doc
+> `docs/design/0125-0043-smalldimension-name-tag-extinction.md` exists and is
+> indexed, and it lists the affected TPC-H query numbers BY MEASUREMENT: the
+> nine candidates by text (Q2 Q5 Q7 Q8 Q9 Q10 Q11 Q20 Q21) are confirmed, and
+> the set that actually moves is **empty — 0/22, byte-identical plans**. The
+> timed 22-query acceptance is 21/22 correct with **Q21 timeout, pre-existing
+> and filed as `M0125-0032`** (see the item body). **NEXT SELECTION INSIDE
+> M0125 IS `M0125-0041`**, per the standing order below (`-0043` → `-0042` →
+> `-0041` → `-0034`'s join-order arm → `-0038` last), since `-0042` landed in
+> loop #12. The historical wording of this block follows.
+>
 > **⚡ SELECT THIS FIRST WITHIN M0125 (added 2026-07-31 by the USER).**
 > **`M0125-0043` (benchmark-name hardcoding in `operators_ddl.go` / `open.go`)
 > is the top-priority item of this milestone** and outranks every other M0125
@@ -1560,8 +1591,39 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 > AGENT.md rule that a non-trivial subsystem change lands its design doc in the
 > same commit. The doc MUST list the TPC-H query numbers affected by the change.
 
-- [ ] **M0125-0043 — remove the hardcoded TPC-H table names from
+- [x] **M0125-0043 — remove the hardcoded TPC-H table names from
       `operators_ddl.go` / `open.go` and keep TPC-H correct and in-budget**
+      **DONE 2026-07-31 (loop #13).** Design
+      `docs/design/0125-0043-smalldimension-name-tag-extinction.md`; new pass
+      `internal/planner/small_dimension.go`. Both production writers of
+      `catalog.Table.SmallDimension` are GONE — the property is derived from
+      relation SIZE at plan-build time and stamped on
+      `SeqScan.SmallDim`/`IndexScan.SmallDim` (beside `EstRelRows`, for the
+      recorded reason that consumers take only a `Node` and have no catalog in
+      scope). Threshold 1024 deliberately equals `smallAnchorRowsThreshold`;
+      cold, the never-analyzed 10-page floor puts `region`/`nation` at 170
+      estimated rows. **The A/B is the result: a same-cluster `git stash` A/B
+      on the loaded SF=1 cluster produced BYTE-IDENTICAL plan snapshots,
+      0/22 changed** (`plan_snapshots/m0125-0043-{before,after}.txt`) — a
+      POSITIVE result, since the before-arm has the name tag ON, so identical
+      plans prove the size derivation reproduces it exactly, Q5's `region` MHJ
+      anchor and the Q8/Q21 `shouldAttachBeforeMHJ` CANCEL guard included. The
+      nine candidates by text (Q2 Q5 Q7 Q8 Q9 Q10 Q11 Q20 Q21) are confirmed as
+      the candidate set; the set that actually moves is EMPTY. Timed 22-query
+      acceptance (arm c2, `PER_Q=600`, quiet host,
+      `analysis/m0125-0043-tpch-20260731/c2.tsv`): **21/22 ok with correct row
+      counts (Q12=2 Q13=35); Q21 timeout.** Q21 is PRE-EXISTING — `timeout` in
+      both cold arms at HEAD on 2026-07-30 (c1 305 s, c2 366 s), already filed
+      as **`M0125-0032`**, and unreachable by this change on a byte-identical
+      plan — but newly established: **at 600 s it STILL times out**, so -0032
+      is a shape defect, not a budget crossing near 300 s (ledger row).
+      `shouldAttachBeforeMHJ` took a signature change (it now receives the leaf
+      scans). One non-obvious sibling path was found by auditing construction
+      sites: `unnest.go`'s Index→Seq correlated-probe demotion dropped the tag.
+      `catalog.Table.SmallDimension` survives as an explicit hint with NO
+      production writer (catalog-only TPC-H fixtures have no heap to measure);
+      retiring the field entirely is a ledger row. Three ledger rows 2026-07-31.
+      Original wording follows.
       (filed 2026-07-31 by the USER; **highest priority inside M0125**).
       goopg branches production planner behaviour on **literal TPC-H table
       names**. Two sites, and they are the sibling pair that must change

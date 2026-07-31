@@ -159,8 +159,11 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		localFilter:    local,
 		hasLocalFilter: local != nil,
 	}
+	// M0125-0043: the small-dimension answer lives on the leaf scan now.
+	// `smallDimensionSide` keeps the catalog-hint reading for the bindings
+	// the bushy DP hands us with no scan of their own.
+	info.isSmallDimension = smallDimensionSide(scan, binding.table)
 	if binding.table != nil {
-		info.isSmallDimension = binding.table.SmallDimension
 		info.baseRows = tableRows(binding.table)
 	}
 	info.filteredRows = info.baseRows
@@ -184,20 +187,27 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 }
 
 // IsSmallDimensionSide (M0054-0010) returns true when the plan
-// node `n` reads from a `SmallDimension`-flagged catalog table
-// (or is trivially derived from one — Filter, Project, Sort
-// over such a scan). Used by the join build-side selector to
-// pin tiny dim-tables (region, nation) on the build side
-// regardless of stats availability.
+// node `n` reads from a relation the planner tagged as a small
+// dimension (or is trivially derived from one — Filter, Project,
+// Sort over such a scan). Used by the join build-side selector to
+// pin tiny dim-tables on the build side regardless of stats
+// availability.
+//
+// M0125-0043 moved the tag off `catalog.Table.SmallDimension` —
+// where it was a lookup of the literal names "region" / "nation" —
+// onto the scan node, stamped at plan-build time by
+// `smallDimensionTag` from the relation's SIZE. The read side is
+// unchanged in meaning; it now answers for every tiny dimension
+// table rather than for two TPC-H ones.
 func IsSmallDimensionSide(n Node) bool {
 	if n == nil {
 		return false
 	}
 	switch x := n.(type) {
 	case *SeqScan:
-		return x.Table != nil && x.Table.SmallDimension
+		return x.SmallDim
 	case *IndexScan:
-		return x.Table != nil && x.Table.SmallDimension
+		return x.SmallDim
 	case *Filter:
 		return IsSmallDimensionSide(x.Child)
 	case *Project:
