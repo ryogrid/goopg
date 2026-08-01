@@ -20,7 +20,10 @@
 // See docs/design/0003-0003-statistics-and-cardinality.md.
 package planner
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 const (
 	defaultEqSelectivity      = 0.005
@@ -41,6 +44,9 @@ func EstimateRows(n Node) int64 {
 		return seqScanRows(x)
 	case *IndexScan:
 		// Equality probe → 1 row per call site.
+		return 1
+	case *IndexOnlyScan:
+		// Same equality-probe convention as *IndexScan.
 		return 1
 	case *Values:
 		return int64(len(x.Rows))
@@ -80,8 +86,84 @@ func EstimateRows(n Node) int64 {
 		return 0
 	case *Explain:
 		return EstimateRows(x.Child)
+
+	// M0125-0038 (C5): pass-through wrappers. Before these arms existed,
+	// any one of them anywhere in a subtree zeroed every estimate above it
+	// (child <= 0 propagates as "no estimate"), which is why all 18 plans
+	// in the M0125-0026 capture rendered rows=1 on every non-leaf node.
+	case *Gather:
+		// Total-row estimate; the per-worker division PG shows under a
+		// Gather is a cost-model concern (the 0077 line), not a
+		// cardinality one.
+		return EstimateRows(x.Child)
+	case *GatherMerge:
+		return EstimateRows(x.Child)
+	case *LockRows:
+		return EstimateRows(x.Child)
+	case *Memoize:
+		return EstimateRows(x.Child)
+	case *CTEScan:
+		// Stage-A inlining clones the body per consumer, so Child is this
+		// reference's own subtree — its estimate IS this scan's output.
+		// (A recursive CTE plans as *RecursiveUnion + *WorkTableScan,
+		// neither of which recurses back here.)
+		return EstimateRows(x.Child)
+	case *CTEDMLPrefix:
+		return EstimateRows(x.Body)
+	case *SetOp:
+		return estimateSetOp(x)
+	case *NestedLoopIndexJoin:
+		return estimateNLIndexJoin(x)
+
+		// *MultiHashJoin is DELIBERATELY absent: M0126-0002 owns that arm,
+		// because every ancestor's BuildLeft/algorithm decision above a
+		// packed chain currently reads the 0 — adding the estimate flips
+		// plan shapes and requires that task's hand-reviewed plan
+		// re-baseline protocol. Do not add it here.
 	}
 	return 0
+}
+
+// estimateSetOp mirrors upstream's output-row rules
+// (prepunion.c:1146-1151): EXCEPT keeps the left input's count,
+// INTERSECT the smaller input's, UNION ALL the sum. For the
+// non-ALL forms upstream runs estimate_num_groups on the input;
+// goopg has no group estimator yet (the 0077 line), so the
+// dedup is approximated as /2 — the same convention
+// estimateAggregate already uses for multi-column GROUP BY.
+func estimateSetOp(s *SetOp) int64 {
+	l := EstimateRows(s.Left)
+	r := EstimateRows(s.Right)
+	if l <= 0 || r <= 0 {
+		return 0
+	}
+	var out int64
+	switch s.Op {
+	case parser.SetOpIntersect:
+		out = l
+		if r < out {
+			out = r
+		}
+	case parser.SetOpExcept:
+		out = l
+	default: // UNION
+		out = l + r
+	}
+	if !s.All {
+		out /= 2
+	}
+	if out < 1 {
+		return 1
+	}
+	return out
+}
+
+// estimateNLIndexJoin: the inner side is an equality index probe,
+// which this file already estimates at 1 row per call site
+// (*IndexScan above), so the join carries the outer's cardinality.
+// LEFT keeps the same count by null-extension.
+func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
+	return EstimateRows(j.Outer)
 }
 
 // seqScanRows is the base-relation row estimate for a scan leaf — the
@@ -293,9 +375,41 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 				return x.Table.Stats.Columns[idx].NDistinct
 			}
 		}
+	case *IndexScan:
+		// Heap-fetching probe: output schema is the table's column
+		// order, same as *SeqScan.
+		if x.Table != nil && x.Table.Stats != nil {
+			if idx >= 0 && idx < len(x.Table.Stats.Columns) {
+				return x.Table.Stats.Columns[idx].NDistinct
+			}
+		}
 	case *Filter:
 		return columnNDistinctForChild(idx, x.Child)
 	case *Sort:
+		return columnNDistinctForChild(idx, x.Child)
+
+	// M0125-0038 (C5): a join input is routinely Project-wrapped, and
+	// this lookup returning 0 through the wrapper is what made every
+	// such equi-join fall back to defaultEqSelectivity — the
+	// "equi-join key contributes no selectivity" symptom (Q10's
+	// rows=131280740 is exactly l·r·0.005).
+	case *Project:
+		if idx >= 0 && idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return columnNDistinctForChild(cr.Index, x.Child)
+			}
+		}
+	case *Limit:
+		return columnNDistinctForChild(idx, x.Child)
+	case *LockRows:
+		return columnNDistinctForChild(idx, x.Child)
+	case *Gather:
+		return columnNDistinctForChild(idx, x.Child)
+	case *GatherMerge:
+		return columnNDistinctForChild(idx, x.Child)
+	case *CTEScan:
+		// The scan's schema is the body's output schema, position for
+		// position.
 		return columnNDistinctForChild(idx, x.Child)
 	}
 	return 0

@@ -4211,7 +4211,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       timeout that no longer exists. The current timeout class is **Q30 Q64 Q65
       Q78 Q81** (5), none of which is a set-op C1 shape.
 
-- [ ] **M0125-0038 — C5: no cost or cardinality propagation above base scans**
+- [x] **M0125-0038 — C5: no cost or cardinality propagation above base scans**
       (filed 2026-07-31 by M0125-0026; evidence same README §"C5"). Every
       non-leaf node in all 18 goopg plans renders `cost=0.00..0.00 rows=1`,
       while leaves carry real warm statistics (`Seq Scan on public.store_sales
