@@ -19,6 +19,12 @@ func init() {
 		costDrivenJoinOrder = true
 		mhjPackingEnabled = false
 	}
+	// M0126-0005 measurement-only: force packing off independently of
+	// join-order, so the A/B measures the cascade cost without
+	// conflating two variables (F12 trap).
+	if os.Getenv("GOOPG_MHJ_PACKING_OFF") == "1" {
+		mhjPackingEnabled = false
+	}
 }
 
 // scanKey uniquely identifies a scan by its catalog table pointer and

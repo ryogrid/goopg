@@ -4628,7 +4628,7 @@ deferral-ledger row (-0013's row must name bundle 07 §7, whose argument — the
 planner otherwise never learns the cascade is expensive — survives a passing
 bar).
 
-- [ ] **M0126-0001 — Pre-measurement confound removal + pinned R0 baseline.** Capture the R0 acceptance-bar baseline FIRST (timed
+- [x] **M0126-0001 — Pre-measurement confound removal + pinned R0 baseline.** Capture the R0 acceptance-bar baseline FIRST (timed
       22-query TPC-H SF1 at default config on a verified quiet host →
       `analysis/cost-driven-second-try-200731/evidence/r0-baseline.txt`, plus
       `make plan-snapshot-capture LABEL=m0126-base`), then land bundle Stage −1
@@ -4643,7 +4643,7 @@ bar).
       returning wrong rows — record it prominently as a bug fix.
       Bar: UNITS + SMOKE + SPOT + PLAN + DS05 per code commit (the R0 capture
       commit is docs/evidence only).
-- [ ] **M0126-0002 — `EstimateRows` `*MultiHashJoin` arm + plan re-baseline.**
+- [x] **M0126-0002 — `EstimateRows` `*MultiHashJoin` arm + plan re-baseline.**
       `internal/planner/cardinality.go:38+` has no `*MultiHashJoin` case, so
       every packed MHJ estimates **0 rows** and every ancestor's
       `BuildLeft`/algorithm decision above a packed chain is taken on that zero
@@ -4657,7 +4657,7 @@ bar).
       classified (improvement/regression/neutral) in the commit message;
       snapshot re-captured; DS05 rows/checksums unchanged.
       Bar: UNITS + SMOKE + SPOT + PLAN (diffs expected, hand-reviewed) + DS05.
-- [ ] **M0126-0003 — Live-path de-materialisation + slot-taking hash-key
+- [x] **M0126-0003 — Live-path de-materialisation + slot-taking hash-key
       evaluator.** Stage 0a-live: `*VirtualSlot` fast path in
       `Slot.fillFromTupleSlot` (`internal/executor/opnode.go:129-150`) reading
       `v.Get(i)` straight into `s.Cells` — kills the `acquireRow` + double copy
