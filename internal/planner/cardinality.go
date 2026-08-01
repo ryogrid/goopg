@@ -115,11 +115,8 @@ func EstimateRows(n Node) int64 {
 	case *NestedLoopIndexJoin:
 		return estimateNLIndexJoin(x)
 
-		// *MultiHashJoin is DELIBERATELY absent: M0126-0002 owns that arm,
-		// because every ancestor's BuildLeft/algorithm decision above a
-		// packed chain currently reads the 0 — adding the estimate flips
-		// plan shapes and requires that task's hand-reviewed plan
-		// re-baseline protocol. Do not add it here.
+	case *MultiHashJoin:
+		return estimateMultiHashJoin(x)
 	}
 	return 0
 }
@@ -164,6 +161,58 @@ func estimateSetOp(s *SetOp) int64 {
 // LEFT keeps the same count by null-extension.
 func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
 	return EstimateRows(j.Outer)
+}
+
+// estimateMultiHashJoin mirrors the *Join arm's method: start from the
+// probe table's row count and walk the key chain, applying the same
+// binary-join selectivity formula (l·r / max(nd_l, nd_r)) at each step.
+//
+// Before this arm existed every packed MHJ estimated 0 rows, and every
+// ancestor's BuildLeft/algorithm decision above a packed chain was taken
+// on that zero (bushy.go:1375 requires BOTH sides > 0). M0126-0002.
+func estimateMultiHashJoin(mh *MultiHashJoin) int64 {
+	if len(mh.Tables) == 0 {
+		return 0
+	}
+	rows := EstimateRows(mh.Tables[mh.ProbeTable])
+	if rows <= 0 {
+		return 0
+	}
+	// Walk the key chain: each key joins a new table into the
+	// accumulated row count. Keys form a chain (verified by
+	// collectMultiHashTables's degree check); track which tables
+	// have been visited so the direction doesn't matter.
+	visited := make([]bool, len(mh.Tables))
+	visited[mh.ProbeTable] = true
+	for _, k := range mh.Keys {
+		var newTable int
+		if !visited[k.LeftTable] {
+			newTable = k.LeftTable
+		} else if !visited[k.RightTable] {
+			newTable = k.RightTable
+		} else {
+			continue
+		}
+		r := EstimateRows(mh.Tables[newTable])
+		if r <= 0 {
+			visited[newTable] = true
+			continue
+		}
+		nd := columnNDistinctForChild(k.LeftCol, mh.Tables[k.LeftTable])
+		if rnd := columnNDistinctForChild(k.RightCol, mh.Tables[k.RightTable]); rnd > nd {
+			nd = rnd
+		}
+		if nd > 0 {
+			rows = (rows * r) / nd
+		} else {
+			rows = scaleByFloat(rows*r, defaultEqSelectivity)
+		}
+		if rows < 1 {
+			rows = 1
+		}
+		visited[newTable] = true
+	}
+	return rows
 }
 
 // seqScanRows is the base-relation row estimate for a scan leaf — the

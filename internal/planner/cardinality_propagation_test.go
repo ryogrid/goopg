@@ -92,19 +92,44 @@ func TestEstimateRowsNLIndexJoinCarriesOuter(t *testing.T) {
 	}
 }
 
-// TestEstimateRowsMultiHashJoinStaysZero pins the M0125-0038/M0126-0002
-// boundary: the *MultiHashJoin arm is deliberately NOT implemented here,
-// because ancestors' BuildLeft/algorithm decisions above a packed chain
-// read the 0 today and adding the estimate requires M0126-0002's
-// hand-reviewed plan re-baseline. If this test fails because someone
-// added the arm, make sure that task's protocol ran — then update this
-// test, not the arm.
-func TestEstimateRowsMultiHashJoinStaysZero(t *testing.T) {
+// TestEstimateRowsMultiHashJoinChain mirrors the *Join arm's method:
+// probe rows × per-dim selectivity along the key chain.
+// M0126-0002 adds this arm (it was deliberately absent in M0125-0038
+// because ancestors read the 0 to decide BuildLeft/algorithm).
+func TestEstimateRowsMultiHashJoinChain(t *testing.T) {
+	// 2-table chain: probe a (100 rows, nd=100) joined to b (200 rows,
+	// nd=200) on a.col0 = b.col0. Binary formula: 100·200/max(100,200)=100.
 	a := &SeqScan{Table: statsTable("a", 100, 100)}
 	b := &SeqScan{Table: statsTable("b", 200, 200)}
-	mhj := &MultiHashJoin{Tables: []Node{a, b}}
-	if got := EstimateRows(mhj); got != 0 {
-		t.Fatalf("MultiHashJoin: EstimateRows = %d, want 0 (arm owned by M0126-0002)", got)
+	mhj := &MultiHashJoin{
+		Tables:     []Node{a, b},
+		Keys:       []MultiHashKey{{LeftTable: 0, LeftCol: 0, RightTable: 1, RightCol: 0}},
+		ProbeTable: 0,
+	}
+	if got := EstimateRows(mhj); got != 100 {
+		t.Fatalf("2-table MHJ: EstimateRows = %d, want 100 (l·r/max(nd)=100·200/200)", got)
+	}
+
+	// 3-table chain: probe a → b → c.
+	c := &SeqScan{Table: statsTable("c", 50, 50)}
+	mhj3 := &MultiHashJoin{
+		Tables: []Node{a, b, c},
+		Keys: []MultiHashKey{
+			{LeftTable: 0, LeftCol: 0, RightTable: 1, RightCol: 0},
+			{LeftTable: 1, LeftCol: 0, RightTable: 2, RightCol: 0},
+		},
+		ProbeTable: 0,
+	}
+	// Step 1: 100·200/200 = 100. Step 2: 100·50/max(200,50)=100·50/200=25.
+	if got := EstimateRows(mhj3); got != 25 {
+		t.Fatalf("3-table MHJ: EstimateRows = %d, want 25 (chain 100→100→25)", got)
+	}
+
+	// Also test that the arm produces > 0 for the simple no-key edge case
+	// (an MHJ with a single table).
+	single := &MultiHashJoin{Tables: []Node{a}, ProbeTable: 0}
+	if got := EstimateRows(single); got <= 0 {
+		t.Fatalf("single-table MHJ: EstimateRows = %d, want > 0", got)
 	}
 }
 
