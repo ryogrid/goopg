@@ -1611,6 +1611,15 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
 		return nil, nil, 0, nil
 	}
 
+	// M0126-0001 Stage −1: a tree of N scans must have exactly N−1
+	// join keys connecting them. Fewer keys means at least one table
+	// is unreached and would be silently NULL-padded — a
+	// silent-wrong-answer path (bundle Stage −1, risk R1). Fail
+	// closed: decline to pack.
+	if len(keys) != len(scans)-1 {
+		return nil, nil, 0, nil
+	}
+
 	// Verify the keys form a simple chain: each table may appear
 	// at most twice (once as "source", once as "destination").
 	// Star graphs (e.g. lineitem at the centre of Q9) cannot be
