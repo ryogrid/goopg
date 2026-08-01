@@ -19,6 +19,15 @@ import (
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
 func Build(plan planner.Node) (Operator, error) {
+	// M0126-0006: thread buildEnv through this Build call so
+	// tryFuseHashCascade can access root + inWorker + fusion config.
+	prevEnv := buildEnvInFlight
+	buildEnvInFlight = &buildEnv{
+		root:      plan,
+		fusionCfg: readFusionConfig(),
+	}
+	defer func() { buildEnvInFlight = prevEnv }()
+
 	switch p := plan.(type) {
 	case *planner.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
@@ -137,6 +146,11 @@ func Build(plan planner.Node) (Operator, error) {
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *planner.Join:
+		// M0126-0006: try fusion first; fall through to
+		// ordinary cascade when the predicate declines.
+		if fused, ok := tryFuseHashCascade(buildEnvInFlight, p); ok {
+			return maybeInstrument(p, fused), nil
+		}
 		left, err := Build(p.Left)
 		if err != nil {
 			return nil, err
@@ -532,6 +546,11 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
 	case *planner.Join:
+		// M0126-0006: try fusion first; fall through when declined.
+		if fused, ok := tryFuseHashCascade(buildEnvInFlight, p); ok {
+			return tree.add(OpNode{Kind: OpAdapter, childA: noChild, childB: noChild,
+				state: &opAdapterState{op: fused}}), nil
+		}
 		leftIdx, err := tree.buildRec(p.Left)
 		if err != nil {
 			return noChild, err
