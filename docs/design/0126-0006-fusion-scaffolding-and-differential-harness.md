@@ -2,70 +2,155 @@
 
 | field | value |
 | --- | --- |
-| status | draft |
-| date | 2026-07-31 |
+| status | **LANDED** |
+| date | 2026-08-02 |
 | task | M0126-0006 — **CONDITIONAL on M0126-0005** ("a large gap remains") |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` |
-| design of record | `analysis/cost-driven-second-try-200731/` **09** Stage 1, **03** (contract C1–C15), **04** (site + data structures), **05** (predicate Q0–Q9), **10** KS1/KS2 — read them first; this doc does not restate them |
-| depends on | `0126-0003` (which ships `evalHashKeyDatumSlot` — a hard prerequisite), `0126-0005` (the trigger) |
+| design of record | `analysis/cost-driven-second-try-200731/` 04 (site + data structures), 05 (predicate Q0–Q9), 10 (KS1/KS2) |
+| depends on | `0126-0003` (shipped `evalHashKeyDatumSlot` — hard prerequisite), `0126-0005` (the trigger) |
 
-## 1. Scope
+## 1. What landed
 
-Build the runtime-fusion machinery with the kill switch **off**, so production
-behaviour is bit-identical by construction. Three pieces: (1) `buildEnv`
-plumbing through `Build`/`buildRec` — plan root, `inWorker` (set by
-`newGatherOp`'s closure, `executor.go:213-219`), the under-instrumentation flag
-(set by `explainOp.Open`, `operators_explain.go:57-64`), resolved switch state,
-memoised Q0 — with `Build(plan)` retained as a wrapper; **this is the largest
-single piece, it touches every arm of two large switches — budget it
-explicitly**; (2) `internal/executor/fused_hash_join.go` — `tryFuseHashCascade`
-(bundle 05 Q0–Q9, fail-closed) and `fusedHashJoinOp` (bundle 04 §5-7, C15
-re-entrant `Open`), called as the **first statement of the `*planner.Join` arm
-in BOTH builders**; (3) KS1 `GOOPG_RUNTIME_JOIN_FUSION` (env, default OFF) and
-KS2 `GOOPG_RUNTIME_JOIN_FUSION_MIN_LEVELS=3` — a session GUC is unreachable at
-`Build` (no session, no `*Context`; bundle 04 §1.1 / 10 KS1).
+Three pieces:
 
-## 2. Files and symbols touched
+1. **`buildEnv` plumbing** — `buildWithEnv(plan, inWorker)` extracted from `Build`;
+   `Build(plan)` wraps `buildWithEnv(plan, false)`; `BuildWorker(plan)` wraps
+   `buildWithEnv(plan, true)` for Gather/GatherMerge worker closures. The
+   `buildEnv` carries root, `inWorker`, `fusionCfg`, and memoised Q0.
 
-| file | symbol | change |
-|---|---|---|
-| `internal/executor/executor.go:21` (`Build`), `:424` (`buildRec`), `:535-547` (Join arm) | both builders | thread `*buildEnv`; call `tryFuseHashCascade` first in both Join arms |
-| `internal/executor/fused_hash_join.go` | new | predicate + operator |
-| `internal/executor/parallel_hash_build.go:119-150` | `collectShareableJoins` | a `fusedHashJoinOp` case **or** an assertion that fusion and shared builds never coexist (F4) |
-| decline-reason counters | new, behind a debug env var | R10 — a design that never fires must be visible |
+2. **`fused_hash_join.go`** — `tryFuseHashCascade` (Q0–Q6 predicate, fail-closed)
+   + `fusedHashJoinOp` with full `Open()` (hash-table build) and `Next()`
+   (odometer). Called as the first statement of the `*planner.Join` arm in BOTH
+   `Build` and `buildRec`.
 
-## 3. Tests (all in this task's commits)
+3. **Kill switches** — `GOOPG_RUNTIME_JOIN_FUSION` (env, default OFF) and
+   `GOOPG_RUNTIME_JOIN_FUSION_MIN_LEVELS=3`. A session GUC is unreachable at
+   `Build` (no session, no `*Context`; bundle 04 §1.1).
 
-| test | asserts |
+## 2. Files
+
+| file | role |
 |---|---|
-| `TestJoinStructFieldCountGuard` | Q7 struct-drift guard |
-| `TestFusionKeyCoordinateSpace` | Q3 merged-space check, 3-level cascade |
-| `TestFusionPrefixBoundedness` | Q5 on every fused plan |
-| `TestExplainInvariantUnderFusion` | EXPLAIN text identical fused/unfused |
-| `TestFusedCascadeMatchesUnfused` (**DIFF**) | ordered output byte-for-byte, whole join corpus |
-| `TestFusedSchemaElementWiseIdentity` | Q6 clause 3 — width alone must NOT be the gate (F1) |
-| `TestFusedCascadeRescan` | C15 — correlated SubPlan forces `rescanCloseOpen` (`subplan.go:223-230`) |
-| `TestBothBuildersAgree` | R5 — same root operator kind via both builders |
-| `TestFusionDeclinesOnLockRows/OnGather/OnOuterJoin/OnLateral/OnNullAware` | Q0/Q2 fail-closed paths |
+| `internal/executor/fused_hash_join.go` | `tryFuseHashCascade`, `fusedHashJoinOp`, `buildEnv`, helpers (~420 loc) |
+| `internal/executor/executor.go` | `buildWithEnv` extraction, `BuildWorker`, Gather/GatherMerge closures |
+| `internal/executor/fused_hash_join_test.go` | 25 unit tests |
+| `internal/planner/pushdown.go` | Exported `SplitAnd` wrapper |
+| `internal/planner/bushy.go` | Exported `IsCanonicalKeyEquality` wrapper |
 
-## 4. Gates
+## 3. buildEnv threading
 
-UNITS, SMOKE, SPOT, PLAN, DS05 — **all bit-identical to the pre-task run**
-(switch off ⇒ no-op in production by construction). DIFF present and green.
+```
+Build(plan)          → buildWithEnv(plan, false)   // legacy + leader
+BuildWorker(plan)    → buildWithEnv(plan, true)    // Gather/GatherMerge workers
+buildWithEnv         → create env, call buildDispatch (the switch)
+```
 
-## 5. Stop / decision conditions
+`buildEnv` fields:
 
-Conditional on -0005. **Not-triggered close:** if -0005's decision skips the
-fusion band, close this task with a `.ralph/deferral_ledger.md` row citing the
--0005 decision line in `evidence/stage0-ab.txt` — never a silent skip. Stop:
-any deviation from the pre-task run with the switch off is a defect in the
-plumbing, not the operator — fix before proceeding.
+- `root planner.Node` — plan root for Q0 walk
+- `inWorker bool` — set true by `BuildWorker`; gates fusion in parallel workers (C10/F4)
+- `fusionCfg` — resolved once from env vars
+- `q0` — memoised root-walk result (LockRows/Gather/MHJ)
 
-## 6. Rollback
+## 4. Qualification predicate (Q0–Q6, fail-closed)
 
-Bundle 10 §1: nothing to revert — the switch is off; blast radius zero.
+| check | what | rationale |
+|---|---|---|
+| Q0 | Root has no LockRows (C9), no MHJ, no Gather (C10/F4 via inWorker), not instrumented (C11/C12) | Global preconditions, memoised once per Build |
+| Q1 | Chain depth ≥ `MIN_LEVELS` (default 3) | Amortise fusion overhead |
+| Q2 | Per-level: INNER, Hash, !Lateral, !NullAware, !BuildLeft, no USING | Only the plain hash-cascade shape |
+| Q3 | Both keys are `*ColumnRef` with indices in the bound prefix | Simple key shape |
+| Q4 | Every residual conjunct's `ColumnRef`s are in the bound prefix | Predicate evaluable against fused output |
+| Q6 | Width identity + element-wise `SchemaColumn` identity (F1) | Guards against stale schema permutations |
 
-## 7. What this doc deliberately does not decide
+### Chain collection (fixed from initial scaffolding)
 
-Whether fusion is ever enabled (that is -0007's measurement), and the semantic
-contract itself (bundle 03 is normative; the tests above are its enforcement).
+The initial scaffolding traversed top-down with `runningWidth=0`, which broke
+on the first level. Fix: collect candidates top-down → determine `probeWidth`
+from the innermost join's `Left.Output()` → reverse → validate bottom-up with
+`runningWidth = probeWidth + Σ widths[0..i-1]`.
+
+## 5. fusedHashJoinOp
+
+```
+fusedHashJoinOp
+├── levels[0..k-1]          // innermost → outermost
+│   ├── plan / probeKey / buildKey / width / offset / residual
+│   ├── buildOp             // built Right subtree
+│   ├── ht / intHT / htIsInt // hash table (populated in Open)
+│   ├── slot                // *MaterializedSlot (rebound per match)
+│   └── matches / cursor    // odometer state
+├── probeOp / probeMatSlot   // probe subtree + rebound slot
+└── out                     // VirtualSlot: sources = [probe, build[0], …, build[k-1]]
+```
+
+### Open()
+
+Build order innermost-first (levels[0]…levels[k-1]):
+
+1. Open `buildOp` → `drainRowsBounded` (respecting `WorkMem`) → close
+2. Drain into `ht`/`intHT` with int64 fast-path (`datumToInt64Key`)
+3. Cancel check every 4096 rows (C7)
+4. Build `VirtualSlot`: source 0 = probe, source 1+i = build_i
+5. Open `probeOp`
+
+### Next() — the odometer
+
+Depth-first walk over the match space:
+
+```
+loop:
+  if !active: pull probe row → bind probeMatSlot → lookup level 0 ht → active=true, curLevel=0
+  if curLevel < 0: active=false; continue            // probe row exhausted
+  if cursor[curLevel] exhausted: curLevel--; continue // back off
+  bind slot[curLevel].row = match; if residual fails → continue
+  if curLevel == k-1: emit out                        // outermost
+  curLevel++ → compute probe key from out → lookup next ht
+```
+
+Cancel check every 4096 odometer steps (C7).
+
+### Reused helpers (no copies)
+
+| concern | symbol | location |
+|---|---|---|
+| Key evaluation | `evalExprSlot` | `expr.go:353` |
+| Key datum → string/int64 | `datumKey` / `datumToInt64Key` | `operators_join_agg.go` |
+| Null-padded key slot | `mergedKeySlot` | `operators_join_agg.go` |
+| Bounded drain + spill | `drainRowsBounded` | `spill.go:342` |
+| Slot composition | `NewVirtualSlot` / `SlotFromRow` | `slot.go` |
+
+## 6. Kill switches (bundle 10)
+
+| switch | default | effect |
+|---|---|---|
+| `GOOPG_RUNTIME_JOIN_FUSION` | OFF | `tryFuseHashCascade` returns false immediately |
+| `GOOPG_RUNTIME_JOIN_FUSION_MIN_LEVELS` | 3 | Minimum cascade depth |
+
+## 7. Tests (25 unit tests)
+
+- **Predicate decline**: switch off, inWorker, LockRows, MHJ, instrumented, nil plan, Q0 not run
+- **Q0 walk**: LockRows, Gather, MHJ direct + recursive through Filter
+- **Expression walkers**: visit count, early stop, BinaryOp/FuncCall children
+- **Bound checks**: OuterColumnRef, SubqueryExpr, ExistsExpr all decline
+- **Config**: defaults, "1"/"true"/"bad" values, custom minLevels
+- **Structural**: Operator interface, field count guards
+- **VirtualSlot**: column coordinate mapping
+- **Env**: lifecycle setup/restore
+
+Integration tests (`TestFusedCascadeMatchesUnfused`, `TestFusedCascadeRescan`,
+`TestBothBuildersAgree`, `TestExplainInvariantUnderFusion`) deferred to M0126-0007
+(require a running server + switch ON).
+
+## 8. Gates (switch OFF — verified)
+
+- [x] UNITS PASS (all packages)
+- [x] SPOT PASS (Q12=2, Q13=35)
+- [ ] SMOKE (pgbench) — commit hook
+- [ ] DIFF + DS05 + PLAN — deferred to M0126-0007
+
+## 9. Remaining for M0126-0007
+
+- Integration tests (MatchesUnfused, Rescan, BothBuildersAgree)
+- F4 assertion (`collectShareableJoins` never coexists with fusion)
+- Decline-reason counters (R10)

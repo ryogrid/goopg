@@ -6,9 +6,10 @@
 // construction.
 //
 // Design of record: analysis/cost-driven-second-try-200731/
-//   04-fusion-site-and-data-structures.md (site + data structures)
-//   05-qualification-predicate.md (Q0-Q9 predicate)
-//   10-rollback-and-kill-switches.md (KS1/KS2)
+//
+//	04-fusion-site-and-data-structures.md (site + data structures)
+//	05-qualification-predicate.md (Q0-Q9 predicate)
+//	10-rollback-and-kill-switches.md (KS1/KS2)
 
 package executor
 
@@ -63,23 +64,284 @@ func readFusionConfig() fusionConfig {
 // ---- fusedLevel / fusedHashJoinOp ----
 
 type fusedLevel struct {
+	// Static (populated by tryFuseHashCascade)
 	plan     *planner.Join
-	probeKey *planner.ColumnRef
-	buildKey *planner.ColumnRef
-	width    int
-	offset   int
+	probeKey *planner.ColumnRef // plan.LeftKey
+	buildKey *planner.ColumnRef // plan.RightKey
+	width    int                // len(plan.Right.Output())
+	offset   int                // absolute offset of this build side in the top schema
+	residual []planner.Expr     // Predicate conjuncts minus the canonical key equality
+
+	// Built by tryFuseHashCascade (child Build of plan.Right)
+	buildOp Operator
+
+	// Hash table (populated in Open, read-only during Next)
+	ht      map[string][]Row
+	intHT   map[int64][]Row
+	htIsInt bool
+
+	// Rebound per emitted match; one source in the output VirtualSlot.
+	slot *MaterializedSlot
+
+	// Odometer state (mutates per probe row)
+	matches []Row
+	cursor  int
 }
 
 type fusedHashJoinOp struct {
-	levels  []fusedLevel
-	probeOp Operator
-	schema  planner.Schema
+	levels       []fusedLevel      // [0] = innermost, [k-1] = outermost (p)
+	probeOp      Operator          // built probe subtree
+	probeMatSlot *MaterializedSlot // rebound per probe row; source[0] in out
+	out          *VirtualSlot      // composed output: [probe, build[0], ..., build[k-1]]
+	schema       planner.Schema    // == levels[k-1].plan.Output()
+	ctx          *Context
+
+	// Odometer
+	active     bool
+	curLevel   int // current level being advanced (-1 = back off past 0)
+	probeWidth int // len(probeOp.Schema())
+	stepCount  int // cancellation check every 4096 steps
 }
 
-func (o *fusedHashJoinOp) Open(ctx *Context) error { return nil }
-func (o *fusedHashJoinOp) Next() (TupleSlot, error)  { return nil, nil }
-func (o *fusedHashJoinOp) Close() error               { return nil }
-func (o *fusedHashJoinOp) Schema() planner.Schema     { return o.schema }
+func (o *fusedHashJoinOp) Schema() planner.Schema { return o.schema }
+
+func (o *fusedHashJoinOp) Close() error {
+	var firstErr error
+	if o.probeOp != nil {
+		if err := o.probeOp.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for i := range o.levels {
+		if o.levels[i].buildOp != nil {
+			if err := o.levels[i].buildOp.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	o.ctx = nil
+	o.probeOp = nil
+	o.out = nil
+	for i := range o.levels {
+		o.levels[i].ht = nil
+		o.levels[i].intHT = nil
+		o.levels[i].slot = nil
+		o.levels[i].matches = nil
+	}
+	return firstErr
+}
+
+// ---- Open — build hash tables for every level, then open the probe ----
+
+func (o *fusedHashJoinOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.probeWidth = len(o.probeOp.Schema())
+
+	// Build hash tables innermost-first (levels[0] … levels[k-1]).
+	for i := range o.levels {
+		l := &o.levels[i]
+		if err := l.buildOp.Open(ctx); err != nil {
+			return err
+		}
+		budget := ctx.WorkMem
+		if budget <= 0 {
+			budget = 512 * 1024 * 1024 // default 512 MiB
+		}
+		bounded, err := drainRowsBounded(l.buildOp, budget)
+		_ = l.buildOp.Close()
+		if err != nil {
+			return err
+		}
+		if err := bounded.Open(ctx); err != nil {
+			return err
+		}
+		// Drain build rows into the hash table.
+		l.ht = make(map[string][]Row)
+		l.intHT = make(map[int64][]Row)
+		allInt64 := true
+		// runningWidth for this level's key evaluation =
+		// probeWidth + sum(widths[0..i-1]) = l.offset
+		runningWidth := l.offset
+		buildCount := 0
+		for {
+			// C7: ctx cancellation every 4096 rows.
+			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+				if err := ctx.Ctx.Err(); err != nil {
+					_ = bounded.Close()
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
+			buildCount++
+			rSlot, err := bounded.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				_ = bounded.Close()
+				return err
+			}
+			r := slotRow(rSlot)
+
+			// Evaluate the build key against {nullLeft, realBuildRow}.
+			keySlot := mergedKeySlot(rSlot, l.width, runningWidth, false)
+			kd, ok, kerr := evalKeyDatum(l.buildKey, keySlot, ctx)
+			if kerr != nil {
+				_ = bounded.Close()
+				return kerr
+			}
+			if !ok {
+				continue // NULL key → skip (hash join semantics)
+			}
+
+			// Insert into hash table (int64 fast-path aware).
+			sk := datumKey(kd)
+			l.ht[sk] = append(l.ht[sk], r)
+			if allInt64 {
+				if ik, iok := datumToInt64Key(kd); iok {
+					l.intHT[ik] = append(l.intHT[ik], r)
+				} else {
+					allInt64 = false
+					l.intHT = nil
+				}
+			}
+		}
+		_ = bounded.Close()
+
+		// Finalize: keep the int64 table only when every key was int64.
+		if allInt64 && len(l.intHT) > 0 {
+			l.htIsInt = true
+			l.ht = nil
+		} else {
+			l.intHT = nil
+		}
+
+		// Allocate the per-level MaterializedSlot (rebound per match in Next).
+		l.slot = SlotFromRow(nil, nil)
+	}
+
+	// Build the output VirtualSlot.
+	// Sources: [probeMatSlot, levels[0].slot, ..., levels[k-1].slot]
+	totalCols := o.probeWidth
+	for i := range o.levels {
+		totalCols += o.levels[i].width
+	}
+	sources := make([]TupleSlot, 1+len(o.levels))
+	o.probeMatSlot = SlotFromRow(nil, nil)
+	sources[0] = o.probeMatSlot
+	for i := range o.levels {
+		sources[1+i] = o.levels[i].slot
+	}
+	cols := make([]virtualCol, totalCols)
+	ci := 0
+	for i := 0; i < o.probeWidth; i++ {
+		cols[ci] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+		ci++
+	}
+	for li := range o.levels {
+		for i := 0; i < o.levels[li].width; i++ {
+			cols[ci] = virtualCol{sourceIdx: int16(1 + li), sourceCol: int16(i)}
+			ci++
+		}
+	}
+	o.out = NewVirtualSlot(o.schema, sources, cols)
+
+	// Open the probe side.
+	if err := o.probeOp.Open(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ---- Next — the odometer ----
+
+func (o *fusedHashJoinOp) Next() (TupleSlot, error) {
+	// C7: cancellation check every 4096 odometer steps.
+	o.stepCount++
+	if o.stepCount&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.Ctx.Err(); err != nil {
+			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+
+	for {
+		if !o.active {
+			// Pull next probe row.
+			probeSlot, err := o.probeOp.Next()
+			if err == EOF {
+				return nil, EOF
+			}
+			if err != nil {
+				return nil, err
+			}
+			o.probeMatSlot.row = slotRow(probeSlot)
+
+			// Look up level 0 (innermost) hash table.
+			keySlot := mergedKeySlot(probeSlot, o.probeWidth, o.levels[0].width, true)
+			kd, ok, kerr := evalKeyDatum(o.levels[0].probeKey, keySlot, o.ctx)
+			if kerr != nil {
+				return nil, kerr
+			}
+			o.levels[0].matches = nil
+			o.levels[0].cursor = 0
+			if ok {
+				o.levels[0].matches = fusedHashLookup(&o.levels[0], kd)
+			}
+			o.active = true
+			o.curLevel = 0
+		}
+
+		// Back off past level 0: probe row exhausted.
+		if o.curLevel < 0 {
+			o.active = false
+			continue
+		}
+
+		// Try to advance at the current level.
+		cur := &o.levels[o.curLevel]
+		if cur.cursor >= len(cur.matches) {
+			// Matches exhausted at this level → back off.
+			o.curLevel--
+			continue
+		}
+
+		// Bind next match at this level.
+		match := cur.matches[cur.cursor]
+		cur.cursor++
+		cur.slot.row = match
+
+		// Evaluate residual predicate at this level.
+		if len(cur.residual) > 0 {
+			pass, rerr := evalResidual(cur.residual, o.out, o.ctx)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if !pass {
+				continue // try next match at same level
+			}
+		}
+
+		if o.curLevel == len(o.levels)-1 {
+			// Outermost level: emit.
+			return o.out, nil
+		}
+
+		// Descend to the next level: compute key from the output so far
+		// and look up the next build side's hash table.
+		next := &o.levels[o.curLevel+1]
+		kd, ok, kerr := evalKeyDatum(next.probeKey, o.out, o.ctx)
+		if kerr != nil {
+			return nil, kerr
+		}
+		next.matches = nil
+		next.cursor = 0
+		if ok {
+			next.matches = fusedHashLookup(next, kd)
+		}
+		o.curLevel++
+		// Loop: try matches at the newly descended level.
+	}
+}
 
 // ---- tryFuseHashCascade — the qualification predicate + builder ----
 
@@ -106,10 +368,18 @@ func tryFuseHashCascade(env *buildEnv, p *planner.Join) (Operator, bool) {
 	if instrumentScope != nil {
 		return nil, false // C11/C12 (F8)
 	}
+	if p == nil {
+		return nil, false
+	}
 
-	// Q1/Q2 — collect the left-deep chain with per-level whitelist.
-	var levels []fusedLevel
-	runningWidth := 0
+	// Q1/Q2 — collect candidate joins top-down, then validate bottom-up.
+	// The chain is left-deep: p is the outermost join, p.Left is the next,
+	// ..., deepest .Left is the probe subtree.
+	type candidate struct {
+		join *planner.Join
+		rw   int // len(Right.Output())
+	}
+	var cand []candidate
 	for cur := p; ; {
 		if cur.Type != planner.JoinTypeInner ||
 			cur.Algo != planner.JoinAlgoHash ||
@@ -124,45 +394,20 @@ func tryFuseHashCascade(env *buildEnv, p *planner.Join) (Operator, bool) {
 		if cur.BuildLeft {
 			break
 		}
-
-		lk, lok := cur.LeftKey.(*planner.ColumnRef)
-		rk, rok := cur.RightKey.(*planner.ColumnRef)
+		_, lok := cur.LeftKey.(*planner.ColumnRef)
+		_, rok := cur.RightKey.(*planner.ColumnRef)
 		if !lok || !rok {
 			break
 		}
-
 		rw := len(cur.Right.Output())
-		if lk.Index < 0 || lk.Index >= runningWidth+rw {
+		if rw == 0 {
 			break
 		}
-		if rk.Index < 0 || rk.Index >= rw {
-			break
-		}
-
-		// Q6 structural assertions.
+		// Q6 width identity (cheap check, run top-down to fail early).
 		if len(cur.Output()) != len(cur.Left.Output())+rw {
 			break
 		}
-		if len(cur.Left.Output()) != runningWidth {
-			break
-		}
-		if !outputMatchesChildren(cur) {
-			break
-		}
-
-		// Q4 residual: every ColumnRef must be in the bound prefix.
-		if !residualInBound(cur, runningWidth+rw) {
-			break
-		}
-
-		levels = append(levels, fusedLevel{
-			plan:     cur,
-			probeKey: lk,
-			buildKey: rk,
-			width:    rw,
-			offset:   runningWidth,
-		})
-		runningWidth += rw
+		cand = append(cand, candidate{join: cur, rw: rw})
 
 		next, ok := cur.Left.(*planner.Join)
 		if !ok {
@@ -171,13 +416,92 @@ func tryFuseHashCascade(env *buildEnv, p *planner.Join) (Operator, bool) {
 		cur = next
 	}
 
-	if len(levels) < env.fusionCfg.minLevels {
+	if len(cand) < env.fusionCfg.minLevels {
 		return nil, false
+	}
+
+	// Bottom-up validation: the innermost join's Left is the probe subtree.
+	probePlan := cand[len(cand)-1].join.Left
+	probeWidth := len(probePlan.Output())
+	if probeWidth == 0 {
+		// Degenerate: probe has zero columns. Shouldn't happen but guard.
+		return nil, false
+	}
+
+	// Build levels bottom-up (innermost first → levels[0]).
+	levels := make([]fusedLevel, len(cand))
+	runningWidth := probeWidth
+	for i := len(cand) - 1; i >= 0; i-- {
+		cur := cand[i].join
+		rw := cand[i].rw
+		li := len(cand) - 1 - i // levels index: 0 = innermost
+
+		lk := cur.LeftKey.(*planner.ColumnRef)
+		rk := cur.RightKey.(*planner.ColumnRef)
+
+		// Q3: key indices in bound.
+		if lk.Index < 0 || lk.Index >= runningWidth {
+			return nil, false
+		}
+		if rk.Index < 0 || rk.Index >= rw {
+			return nil, false
+		}
+
+		// Q6: structural assertions (width check already done top-down,
+		// but re-verify len(Left.Output()) bottom-up since it depends
+		// on runningWidth).
+		if len(cur.Left.Output()) != runningWidth {
+			return nil, false
+		}
+		if !outputMatchesChildren(cur) {
+			return nil, false
+		}
+
+		// Q4: residual conjuncts in bound prefix.
+		if !residualInBound(cur, runningWidth+rw) {
+			return nil, false
+		}
+
+		// Extract non-key residual conjuncts.
+		var residual []planner.Expr
+		if cur.Predicate != nil {
+			for _, c := range planner.SplitAnd(cur.Predicate) {
+				if planner.IsCanonicalKeyEquality(c, cur.LeftKey, cur.RightKey) {
+					continue
+				}
+				residual = append(residual, c)
+			}
+		}
+
+		levels[li] = fusedLevel{
+			plan:     cur,
+			probeKey: lk,
+			buildKey: rk,
+			width:    rw,
+			offset:   runningWidth,
+			residual: residual,
+		}
+		runningWidth += rw
+	}
+
+	// Build the probe subtree.
+	probeOp, err := Build(probePlan)
+	if err != nil {
+		return nil, false
+	}
+
+	// Build each build-side subtree.
+	for i := range levels {
+		buildOp, err := Build(levels[i].plan.Right)
+		if err != nil {
+			return nil, false
+		}
+		levels[i].buildOp = buildOp
 	}
 
 	return &fusedHashJoinOp{
 		levels:  levels,
-		probeOp: nil,
+		probeOp: probeOp,
 		schema:  levels[len(levels)-1].plan.Output(),
 	}, true
 }
@@ -338,4 +662,46 @@ func exprChildren(e planner.Expr) []planner.Expr {
 		return append([]planner.Expr{x.Operand}, x.List...)
 	}
 	return nil
+}
+
+// ---- runtime helpers (called from Open / Next) ----
+
+// evalKeyDatum evaluates a hash-key expression against a slot and returns
+// the Datum. ok=false means NULL key (skip in both build and probe).
+func evalKeyDatum(keyExpr planner.Expr, slot SlotView, ctx *Context) (Datum, bool, error) {
+	v, err := evalExprSlot(keyExpr, slot, ctx)
+	if err != nil {
+		return Datum{}, false, err
+	}
+	if v.IsNull() {
+		return Datum{}, false, nil
+	}
+	return v, true, nil
+}
+
+// evalResidual returns true when every conjunct evaluates to true (non-null
+// boolean true) against the slot. nil/empty conjuncts → true.
+func evalResidual(conjuncts []planner.Expr, slot SlotView, ctx *Context) (bool, error) {
+	for _, c := range conjuncts {
+		v, err := evalExprSlot(c, slot, ctx)
+		if err != nil {
+			return false, err
+		}
+		if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// fusedHashLookup returns the match list for keyDatum from the level's hash
+// table, respecting the int64 fast-path.
+func fusedHashLookup(l *fusedLevel, keyDatum Datum) []Row {
+	if l.htIsInt {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			return l.intHT[ik]
+		}
+		return nil
+	}
+	return l.ht[datumKey(keyDatum)]
 }

@@ -19,11 +19,23 @@ import (
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
 func Build(plan planner.Node) (Operator, error) {
+	return buildWithEnv(plan, false)
+}
+
+// BuildWorker is the per-worker entry point for Gather/GatherMerge
+// closures. It sets inWorker=true so tryFuseHashCascade declines in
+// parallel workers (C10/F4).
+func BuildWorker(plan planner.Node) (Operator, error) {
+	return buildWithEnv(plan, true)
+}
+
+func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 	// M0126-0006: thread buildEnv through this Build call so
 	// tryFuseHashCascade can access root + inWorker + fusion config.
 	prevEnv := buildEnvInFlight
 	buildEnvInFlight = &buildEnv{
 		root:      plan,
+		inWorker:  inWorker,
 		fusionCfg: readFusionConfig(),
 	}
 	defer func() { buildEnvInFlight = prevEnv }()
@@ -228,13 +240,13 @@ func Build(plan planner.Node) (Operator, error) {
 		// wraps this in an OpAdapter, so the live BuildFastIterator path
 		// reaches it with no slab changes and no shared per-node state.
 		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
-			return Build(p.Child)
+			return BuildWorker(p.Child)
 		})), nil
 	case *planner.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams.
 		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
-			return Build(p.Child)
+			return BuildWorker(p.Child)
 		})), nil
 	case *planner.Distinct:
 		child, err := Build(p.Child)
