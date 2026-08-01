@@ -491,6 +491,10 @@ func splitAnd(e Expr) []Expr {
 	return out
 }
 
+// SplitAnd is the exported wrapper for the predicate splitter.
+// M0126-0006: the runtime fusion predicate in the executor needs it.
+func SplitAnd(e Expr) []Expr { return splitAnd(e) }
+
 // combineAnd is splitAnd's inverse: builds a left-associated
 // AND tree from the given conjuncts. nil/empty input returns nil.
 func combineAnd(conjuncts []Expr) Expr {
