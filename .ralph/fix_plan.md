@@ -7,9 +7,12 @@ the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
 `docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
 ahead of M0123 and every other milestone. **Amended 2026-07-31 (USER): M0126 —
 cost-driven planning made production-viable — is inserted directly after M0125,
-so the head of the roadmap is M0124 → M0125 → M0126.** **M-NIGHTLY no longer
+so the head of the roadmap is M0124 → M0125 → M0126.** **Amended 2026-08-03:
+M0126 is CLOSED as a documented no-go (milestone-terminal); M0127 — PG-shaped
+join search — is filed as its successor and inserted directly after M0125, so
+the head of the roadmap is M0124 → M0125 → M0127.** **M-NIGHTLY no longer
 preempts it (amended 2026-07-28): nightly items are still FILED every loop, but
-they are not SELECTED until M0124, M0125 and (since 2026-07-31) M0126 close.** This banner is the sole ordering
+they are not SELECTED until M0124, M0125 and (since 2026-08-03) M0127 close.** This banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
 
@@ -75,6 +78,30 @@ started.
 > list is the `## M0126` section near the bottom of this file. It is **not**
 > selected while any M0125 item is open. The numbered list below is unchanged
 > and kept as filed; read it with this amendment applied.
+>
+> **⚡ AMENDED 2026-08-03 (filed by the panel / USER directive 2026-08-02,
+> amended 2026-08-03) — M0127 IS INSERTED BETWEEN M0125 AND THE M-NIGHTLY
+> BACKLOG; M0126 IS CLOSED.** The order below is amended to read: WIP recovery
+> (#1) → **M0124** (#2, closed) → **M0125** (#3) → **M0127** (#4, NEW) →
+> M-NIGHTLY backlog (#5) → M0123 (#6). **M0126 — cost-driven planning made
+> production-viable — is TERMINAL as of 2026-08-03** (documented no-go,
+> `evidence/acceptance-run-2.txt`; all 13 tasks `[x]`). **M0127 — PG-shaped
+> join search** turns the `docs/design/leftdeep-joins/` design bundle (the
+> M0126-0013 successor) into shipped behaviour: the executor stages S0–S4
+> (seam de-materialisation, multi-column keys retiring
+> `reselectDegenerateHashKeys`, hybrid-hash spill, streaming merge/outer-fill/
+> Materialize) land first on the current planner's output, then the PG-shaped
+> three-phase DP (`GOOPG_PGSHAPED_DP`, replacing `GOOPG_COST_DRIVEN_JOINORDER`)
+> at S5, compiled key/residual eval at S6, and the S7 deletion of
+> `MultiHashJoin` + fusion + the old subset-bitmask DP. Milestone doc
+> `docs/milestones/0127-pg-shaped-join-search.md`; implementation plan
+> `docs/design/0127-pg-shaped-join-search.md`; the task list is the
+> `## M0127` section below the M0126 section. It is **not** selected while any
+> open M0125 item that M0127 needs first is open (exprwalk commits 5–8 =
+> M0125-0002, M0125-0047, M0125-0013; M0125-0040 ROLLUP is an independent
+> track outside the M0127 bundle, not a prerequisite). The M0125 items marked
+> numbered list below is unchanged and kept as filed; read it with this
+> amendment applied.
 >
 > 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
 >    "WIP recovery" item directly under this banner) before anything else, never
@@ -596,6 +623,11 @@ started.
 > itself parked below M0125. Order: M0124 → M0125 → **M0126** → M-NIGHTLY →
 > M0123. M0123 keeps its own branch (`wal-pg-nodetree`)
 > and resumes there once this line is closed.
+> **AMENDED 2026-08-03:** M0126 is closed (documented no-go); every other
+> roadmap milestone — M0123 included — is parked below **M0127**, and M0127 is
+> itself parked below M0125. Order: M0124 → M0125 → **M0127** → M-NIGHTLY →
+> M0123. M0123 keeps its own branch (`wal-pg-nodetree`) and resumes there once
+> this line is closed.
 >
 > Dependencies, stated narrowly: **M0124-0002 gates M0125-0002/-0004 and the
 > measurement half of M0125-0003** (it produces the plan snapshot they diff
@@ -631,7 +663,10 @@ started.
 > The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
 > M0123 is complete.
 
-Work order: **M0124 → M0125 → M0126** (this directive as amended 2026-07-31),
+Work order: **M0124 → M0125 → M0126 → M0127** (this directive as amended
+2026-07-31; M0126 closed 2026-08-03, M0127 filed as its successor per the
+2026-08-03 amendment — M0127 is selected after the M0125 items it needs are
+closed, and M0126 contributes nothing further),
 then **M0123**, then the
 pre-existing line — **M0117 → M0118** (both complete + archived), then resume
 **M0110** (its **M0119-0004/0005/0006/0007** spinoffs are the active,
@@ -2065,7 +2100,15 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Q72's unexplained 13 % and Q35's non-fix; a third records that the TPC-H
       harnesses still stamp no planner flags.
       **Still owed, which is why this box is unchecked:** stage 3
-      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms. The
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms.
+      **Re-scope note 2026-08-03 (M0127):** do NOT land stage 3 into the old
+      DP before checking it against M0127's P5.1/P5.6 — the new search
+      computes base rows once per `RelOptInfo` (`leftdeep-joins` 04 §2) and
+      P5.1's `buildInitialRels` redefines where the fallback feeds; the
+      fallback's documented role is an S-cold safety net (inert warm by its
+      `RowCount > 0` early return), and stage 3's consumer may be superseded
+      by the rows-once design rather than extended. Re-evaluate at M0127-P5.1.
+      The
       flag accepts `3` today and yields stage-2 behavior. **`M0125-0005`'s
       evidence is now COMPLETE in both benchmark families and both recommend the
       flip** — it is the next selection, and its commit must name Q72's 1.13× as
@@ -2110,6 +2153,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
 - [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
       #4, phase 2.2).
+      **↳ M0127 PREREQUISITE (2026-08-03): commits 5–8 are the walker
+      stabilisation M0127's qual plumbing builds on.** The M0127 banner lists
+      this item among the four M0125 items M0127 waits on, and M0127-P5.2
+      (restrictInfo + `hasRelevantJoinClause`) is specified as the first live
+      consumer of the exprwalk primitives. Commits 1–4 are landed; keep the
+      commit 5 (`exprSide`) → 6 (`conjunctIsLocalEligible` +
+      `localizeExprToLeaf`) → 7 (`visitColumnRefsByName`) order, with the
+      full timed run + SF0.5 sweep on any hunk.
       **STEP 0 DONE 2026-07-30 — the inventory is re-derived from source and now
       gate-pinned**, which M0125-0001's execution record required before any
       conversion ("§0 says fourteen, §13.4 says seven, and neither figure has
@@ -3335,6 +3386,13 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **STILL OPEN, split out as bookkeeping:** the STEP-0 runtime verdict
       (set A `OK 17 s` → HEAD `OK 142 s`) — no timing on this host can settle
       it, see the 2026-07-30 ledger row. Original text follows.
+      **↳ M0127 PREREQUISITE (2026-08-03): this verdict must be recorded
+      BEFORE M0127's plan-shape changes land.** The item itself warns the
+      EXPLAIN diff vs set A is only interpretable while the plan is unchanged,
+      and M0127 P5 re-plans every query — take the quiet-host reading before
+      M0127-P5.1 starts. It is bookkeeping, not engine work, and is one of the
+      four M0125 items the M0127 banner waits on (exprwalk commits 5–8,
+      -0047, -0040, -0013).
 
 - [ ] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
       (ledger rows `tpcds-round2 q47-q49-q51` 2026-07-29 and M0125-0013
@@ -3774,6 +3832,13 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
 - [ ] **M0125-0031 — the warm-stats planning line: eliminate the TPC-DS
       timeout class, then optimize and stabilize TPC-H/TPC-DS runtimes**
+      **[→ M0127: absorbed 2026-08-03]** — both remaining motions (goal (a)'s
+      outcome, goal (b)'s fixes) are M0127's own acceptance bar: timeout-class
+      elimination and the Q3/Q10/Q18/Q7/Q9/Q21 recoveries are the S1/S3/S5
+      exit gates of `docs/design/leftdeep-joins/` (09 §2-§3; 01 §6), so this
+      umbrella closes by reference when M0127-P1.3/P3.5/P5.9 land. Keep this
+      box unchecked as the standing record; do not select it as a standalone
+      repair track. (Historical motions below are discharged as recorded.)
       (USER DIRECTIVE 2026-07-30(b), item 4 of 4; **GATED on -0028 … -0030**;
       design `docs/design/0125-0028-warm-stats-programme.md` §-0031). Goal
       state per the directive, under the warm-statistics premise -0030
@@ -3845,7 +3910,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       motions are now discharged; what remains under this umbrella is repair.
 
 - [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
-      cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
+      cardinality regimes** **[→ M0127: absorbed 2026-08-03]** — Q21's
+      completion is M0127's S3 exit gate by name (`leftdeep-joins` 06:
+      hybrid-hash spill; 09 §2: "Q21 completes at SF1 under the standard
+      cgroup cap") and clause 1 of the S5 acceptance bar (22/22 complete,
+      09 §3); 01 §6(3) counts "Q21 stops OOMing at SF1 without MHJ" among the
+      bundle's recovery set. The plain-EXPLAIN classification this item asks
+      for is a useful P3 prerequisite, not a standalone fix track — fold it
+      into M0127-P3.2's design loop. (filed 2026-07-30 by M0125-0031's first motion;
       evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4; nightly keeps
       confirming: `tpch/Q21-timeout` AI-20260802-014405-018, also failed the
       previous run, and again 20260803 as AI-20260803-013955-020 — same
@@ -3865,7 +3937,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       instance of the same question its capture asks of the 16 TPC-DS members,
       and one shared root-cause taxonomy is the point.
 
-- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics** (filed
+- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics**
+      **[→ M0127: absorbed 2026-08-03]** — Q18 is in the S1 exit bar's named
+      set ("Q18 ≤ 1.2× its R0 27.58 s", `leftdeep-joins` 09 §2) and in
+      01 §6(1)'s recovery list; the seam de-materialisation (M0127-P1.1) and
+      the executor stages S0–S2 are the mechanism this item's fix would have
+      had to build. The Q18 EXPLAIN capture this item already owes was
+      blocked on M0125-0037's EXPLAIN half (done); fold the capture into
+      M0127-P1.3's S1 A/B instead. (filed
       2026-07-30 by M0125-0031 goal (a); evidence
       `analysis/m0125-0031-warm-sf05-20260730/README.md` §"Runtime"). At SF0.5,
       300 s cap, same arm (`GOOPG_RELSIZE_FALLBACK=2`), Q18 goes **117 s S-cold
@@ -4309,7 +4388,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       -0034.
 
 - [ ] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
-      planner** (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
+      planner** **[→ M0127: stage (ii) absorbed 2026-08-03]** — stage (i)
+      (EXPLAIN half) is done; stage (ii)'s mechanism claim ("the DP cannot see
+      through a set-op node") is closed by M0127-P5.1's `PathPrebuilt` leaves
+      (subquery/CTE/VALUES/pinned-unnest admission — `IMPLEMENTATION-TODO`
+      P5.1 "closes the leaf-whitelist gap"), and its acceptance row
+      (`Q5 5|OK|100`) has been green since 2026-07-31 by independent
+      measurement. Close on P5.1's landing; nothing in stage (ii) is owed
+      before it. (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
       **↳ STAGE (i) IS DONE (2026-07-31).** Design
       `docs/design/0125-0037-explain-set-operations.md`; tests
       `internal/executor/explain_setop_test.go`; re-capture
@@ -4452,6 +4538,13 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       carve-outs (the gates PASS; the flip is rare) — parked under M0125
       as instrument-integrity debt for the remaining walker commits 5–8,
       which lean on byte-identical EXPLAIN A/Bs.
+      **↳ M0127 PREREQUISITE (2026-08-03): close this BEFORE M0127-P5.4.**
+      The M0127 banner lists this item among the four M0125 items M0127 waits
+      on, and M0127-P5.4's "deterministic tie-break" is specified to build on
+      this item's fix — the 09 §4 plan-shape ratchet (a pinned mismatch
+      budget that must not grow across commits) cannot exist while plans flip
+      Q85-style across restarts. The unit-test search for the unstable site
+      (plan Q85 in-process ~20×) is host-independent and can run anytime.
 - [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
       (filed 2026-07-31 by `M0125-0037`(i); evidence
@@ -4480,9 +4573,26 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       both complete inside the warm gate's budget with matching row counts.
       Bar: as `M0125-0034` (plan-diff `LABEL=tpcds-round2-head` + the SF0.5
       regression gate), because (a) and (b) are both executor/planner changes.
+      **↳ INDEPENDENT OF M0127 (2026-08-03): neither absorbed nor a
+      prerequisite.** C6 is aggregate-side (grouping-sets expansion), outside
+      the leftdeep-joins bundle's scope (its out-of-scope list: no
+      `AGG_MIXED`/`AGG_SORTED` port). It may proceed before,
+      during, or after M0127 on its own track. Tracked via the M0125 section, not the M0127
+      wait list — it must not be silently closed. Its Q18/Q67 runtime
+      linkage is re-measured under M0127-P1.3/P5.9 (see the -0033 skip
+      note), but the ROLLUP fan-out fix itself is this item's alone.
 
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
-      re-evaluated per outer row** (filed 2026-07-31 by `M0125-0036`, which
+      re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
+      — the decorrelation root cause is fixed (loop #14); the remaining factor
+      is C1 = the `Nested Loop (CROSS)` shape, which M0127's P5 DP is the
+      documented successor of (`leftdeep-joins` 03 §4-§5: join methods are
+      costed paths generated inside the search — no post-DP rewrites; M0126-0013
+      named the bundle as the Q9-enumeration successor). Q30/Q81 complete
+      inside the SF0.5 gate under M0127's S5 acceptance (09 §3 clause 4's
+      zero-delta instrument covers them). The `ca_state = 'AR'` descent probe
+      this item names is a useful P5.4 qual-placement input — fold it in, do
+      not build a standalone join-order fix. (filed 2026-07-31 by `M0125-0036`, which
       closed C3's EXISTS half and deliberately did not touch this one).
       Members: **Q30 and Q81**, both still `TIMEOUT` at SF=0.5 after -0036
       (measured 345 s and 350 s, `analysis/m0125-0036-exists-to-any/README.md`).
@@ -5085,6 +5195,249 @@ bar).
       or (the not-triggered close with its 07 §7 ledger row).
       Bar: UNITS + SMOKE + SPOT + PLAN (default arm ZERO diffs) + DS05 + the
       re-run acceptance protocol.
+
+## M0127 — PG-shaped join search: PG-identical join search + fusion-free join executor (filed 2026-08-03)
+
+Milestone: `docs/milestones/0127-pg-shaped-join-search.md`. Implementation
+plan (the authoritative task decomposition): `docs/design/0127-pg-shaped-join-search.md`.
+Design of record: `docs/design/leftdeep-joins/` — README (scope + invariants),
+**01** (measured evidence + the exact recovery set), **02** (plan-shape
+contract), **03** (the `standard_join_search`/`join_search_one_level` analogue,
+all three phases), **04** (one cost currency, rows once, FK-aware selectivity),
+**05** (the fusion-free hash cascade), **06** (hybrid hash spill), **07** (the
+other join operators), **08** (stages/flags/removal inventory), **09**
+(verification + acceptance). **The bundle is the design; the task bodies below
+cite bundle sections instead of restating them.** Do not re-derive what the
+bundle settles. Never modify `docs/design/leftdeep-joins/` itself.
+**Priority: immediately after M0125's M0127-needed items** (filed by the
+panel per the user directive 2026-08-02, amended 2026-08-03; successor to the
+terminal M0126 no-go) — above the M-NIGHTLY backlog and above M0123. See the
+amended Current Priority banner. Not selected while M0125-0002 (exprwalk
+commits 5–8), M0125-0047, or M0125-0013 is open (M0125-0040 ROLLUP is an
+independent track outside bundle scope; see its item body).
+
+**Acceptance bar (09 §3 is normative):** TPC-H SF1 **22/22 complete** (zero
+hang/OOM/timeout/row-count mismatch); total wall time **≤ 1.2×** the faster of
+pinned R0 (493.31 s) and a contemporaneous integer arm; **no query > 2× R0 —
+Q9 explicitly ≤ 170.9 s** (2 × R0's 85.46 s); TPC-DS SF0.5 **zero row and
+checksum deltas**; **no `MultiHashJoin` in any emitted plan; fusion never
+triggers**; **bushy capability** — every bushy spine PG 18.3 can produce,
+goopg can produce (parity-gate spine diff; no `expected-bushy` category).
+Stage gates: S1 exit = Q3/Q10/Q18/Q7 each ≤ 1.2× their R0 times
+(8.46 / 6.04 / 27.58 / 25.13 s; R0 total 493.31 s); S3 exit = Q21 completes at
+SF1 under the cgroup cap at default `work_mem` + forced-spill run byte-identical
+to no-spill. A documented no-go with attribution (09 §6) is a successful S5
+outcome; an unmeasured outcome is the only failure.
+
+**Read before picking any task here.** (1) **Executor first, planner second,
+deletion last** (08 §1): the M0125-0002 lesson — regression direction is
+unpredictable per query, measure per commit; the executor stages improve the
+CURRENT default planner's output immediately (the MHJ-retirement seam costs
+Q3/Q10/Q18/Q7). (2) **Every P5 task lands dark** behind `GOOPG_PGSHAPED_DP`
+(OFF while soaking, flipped ON as the acceptance event); it **replaces**
+`GOOPG_COST_DRIVEN_JOINORDER` (retired at S5, 08 §6). Collapse-limit wiring has
+its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` and soaks separately (P5.8).
+(3) **Soak coexistence (08 §3):** non-searched shapes keep the current pipeline
+including `rewriteJoinsToNLI` and qual-placement passes; searched roots are
+tagged and the passes skip tagged subtrees; `reconcileNLILayout` must be a no-op
+on searched trees (assert, don't assume). (4) **S2 and S5 each re-baseline
+`plan_snapshots/` in the same commit** with the diff summarised in the commit
+message. (5) Every implementation task runs in a **git worktree off pinned clean
+HEAD**, staged by explicit pathspec, never `git add -A`, and re-runs its own
+named guard test after any rebase or handoff. (6) Timed measurements need a
+quiet host and constant server age (sweep-tail discipline); DS05 results record
+as "57/99 content-verified, 42/99 count-only".
+
+**M0125 items absorbed by this milestone (marked `→ M0127` in their bodies, do
+not select as standalone tracks):** M0125-0031 (warm-stats planning line —
+remaining repair = this milestone's acceptance), M0125-0032 (Q21 — S3 exit by
+name), M0125-0033 (Q18 warm regression — S1 exit set), M0125-0037 stage (ii)
+(set-op DP visibility — P5.1 `PathPrebuilt` leaves), M0125-0041's residual
+(C1 CROSS shape — P5 DP). **Closed mechanisms this milestone deletes:**
+M0125-0035b's `reselectDegenerateHashKeys` → P2.2 (same commit + Q78-class
+degeneracy regression test); M0126-0011's MHJ node/operator → P6.2;
+M0126-0006/-0007's fusion → P6.1; M0126-0004's slot-chaining deferral →
+un-deferred at P1.1. Supersession stamps at P6.4 (0034-0001, 0038-0001,
+cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
+
+- [ ] **M0127-P0.1 — `mergedKeySlot` hoist to `Open`.** Shape-invariant per
+      join; rebind `.row` per pull; zero steady-state allocs in the seam
+      microbench. IMPLEMENTATION-TODO P0.1; 05 §3 (E2). Files:
+      `internal/executor/operators_join_agg.go` (:986-1014, build :590/:646/:702,
+      probe :1266/:1269). Bar: UNITS + SPOT + BENCH.
+- [ ] **M0127-P0.2 — single-pass build.** Fold `drainRowsBounded`'s budget into
+      `buildLazyHashTable`'s build loop; delete the re-iteration
+      (`rowsOp`-per-row `MaterializedSlot` allocs). Keep owned-copy discipline
+      (M0097-0058). IMPLEMENTATION-TODO P0.2; 05 §4 (E3). Bar: UNITS + SPOT +
+      RACE (shared-build interplay).
+- [ ] **M0127-P0.3 — single-map build.** Planner threads key-type info on
+      `planner.Join`; executor picks int64 vs string map before build; extend
+      int64 path to Semi/Anti (CTID exception preserved); delete
+      `lazyHashFinalize`'s dual-map dance. IMPLEMENTATION-TODO P0.3; 05 §4 (E3).
+      Bar: UNITS + DS05.
+- [ ] **M0127-P1.1 — legacy-path slot chaining (the M0126-0004 deferral,
+      un-deferred).** Probe child slot as `lazyVirtualOut` source; rebind on
+      pointer change + copy fallback on type change; delete `slotRow(probeSlot)`
+      at :1254 and the vestigial `lazyKeyRow`. Env kill-switch
+      `GOOPG_JOIN_SLOT_CHAIN=off`. IMPLEMENTATION-TODO P1.1; 05 §2 (E1; F7
+      contract — children do not return a stable slot object; fan-out test
+      required). Bar: full REGRESS + DS05 + SPOT + seam microbench 0 allocs.
+- [ ] **M0127-P1.2 — worker-path exercise.** The P1.1 seam under `BuildWorker`
+      (`inWorker=true`) integration test — fusion's decline-in-worker precedent
+      says this path diverges silently. IMPLEMENTATION-TODO P1.2. Bar: RACE.
+- [ ] **M0127-P1.3 — S1 A/B evidence run.** Q3/Q10/Q18/Q7 ≤ 1.2× R0; no other
+      query > 1.2× vs pre-S1 HEAD; file `analysis/leftdeep-joins/<date>-s1-ab.txt`.
+      No code. Bar: bar met or attributed (09 §6) **before P2 starts**.
+      IMPLEMENTATION-TODO P1.3; 09 §2.
+- [ ] **M0127-P2.1 — `planner.Join.HashKeys []JoinKeyPair`.** Search/pushdown
+      fills all equality conjuncts; residual keeps non-equijoin only; EXPLAIN
+      key-list rendering; plan-snapshot re-baseline same commit.
+      IMPLEMENTATION-TODO P2.1; 05 §5 (E4 planner side). Bar: UNITS + SPOT +
+      DS05 + PLAN (snapshot diff reviewed).
+- [ ] **M0127-P2.2 — executor composite keys.** All-int64 fixed-width pack;
+      mixed → concatenated `datumKey`. **Delete `reselectDegenerateHashKeys` +
+      its planner pass (same commit)**; add a Q78-class degeneracy regression
+      test (constant-pinned first key column must not degrade to one bucket).
+      IMPLEMENTATION-TODO P2.2; 05 §5 (E4 executor side). Bar: UNITS + SPOT +
+      DS05 + SIBLING (planner keys ↔ executor key encode).
+- [ ] **M0127-P2.3 — merge-join multi-column keys** from the same list
+      (full-key comparator; residual non-equijoin only). IMPLEMENTATION-TODO
+      P2.3; 07 §2. Bar: UNITS + SPOT + DS05 + PLAN.
+- [ ] **M0127-P3.1 — `chooseHashTableSize`** (shared pkg importable by planner
+      and executor); goopg-width-aware (`48·c` + map overhead).
+      IMPLEMENTATION-TODO P3.1; 06 §2.1; 04 §4. Bar: UNITS + SPOT.
+- [ ] **M0127-P3.2 — batch build/probe.** Hashvalue-prefixed `spillWriter`
+      frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` state in
+      `nextLazy`, nbatch growth with capped give-up + WARNING. Fold
+      M0125-0032's Q21 plain-EXPLAIN classification into this design loop.
+      IMPLEMENTATION-TODO P3.2; 06 §2.2-2.4. Bar: UNITS + DS05 + RACE.
+- [ ] **M0127-P3.3 — temp-file registry.** Per-query registry on `Context`;
+      relocate to `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close`
+      unlink leak. Injected-crash test leaves no strays. IMPLEMENTATION-TODO
+      P3.3; 06 §3. Bar: UNITS + crash-injection test.
+- [ ] **M0127-P3.4 — Semi/Anti/LEFT per-batch semantics** (batch-global
+      `antiBuildHasNull`); shared build declines when nbatch > 1.
+      IMPLEMENTATION-TODO P3.4; 06 §2.5. Bar: UNITS + DS05 + RACE.
+- [ ] **M0127-P3.5 — EXPLAIN `Batches:`/memory lines + forced-spill identity
+      test** (low `work_mem` Q3 byte-identical to default). S3 exit evidence:
+      Q21 SF1 completes capped; file `analysis/leftdeep-joins/…-s3-spill.txt`.
+      IMPLEMENTATION-TODO P3.5; 06 §4; 09 §2. Bar: Q21 SF1 (capped) + DS05
+      zero-delta + RACE.
+- [ ] **M0127-P4.1 — streaming merge join** (duplicate-group buffering +
+      overflow file); delete full-drain `runMergeJoin`/`buildMergeSide`
+      accumulation. IMPLEMENTATION-TODO P4.1; 07 §2. Bar: UNITS + REGRESS +
+      DS05.
+- [ ] **M0127-P4.2 — hash outer-fill.** Matched bitmap per batch; RIGHT sweep;
+      FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL hash
+      paths). Regress-port outer-join files green. IMPLEMENTATION-TODO P4.2;
+      07 §3 (PG `HJ_FILL_INNER`). Bar: REGRESS outer-join files + DS05.
+- [ ] **M0127-P4.3 — `Materialize` operator** (plan node + path + rescan replay,
+      memory→spill); NL joins stream outer, inner under Materialize; delete
+      drain-both `runNestedLoop` buffering and `concatRows`-per-pair.
+      IMPLEMENTATION-TODO P4.3; 07 §4. Bar: UNITS + SPOT + DS05.
+- [ ] **M0127-P4.4 — lateral: outer streams** (per-outer re-execution stays),
+      output no longer accumulates into `o.rows`. IMPLEMENTATION-TODO P4.4;
+      07 §4. Bar: UNITS + DS05.
+- [ ] **M0127-P5.1 — `joinrels` level lists + relset map over `RelOptInfo`;**
+      `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
+      pinned-unnest rels (closes the leaf-whitelist gap — also closes
+      M0125-0037 stage (ii)). IMPLEMENTATION-TODO P5.1; 03 §1-§2. Bar: UNITS +
+      PLAN (default arm ZERO diffs — inert flag-off).
+- [ ] **M0127-P5.2 — restrictInfo list + `hasRelevantJoinClause`;**
+      equivalence-class selectivity rule (inferred edges admissible, no
+      double-count). IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5. Bar: UNITS + PLAN
+      (ZERO diffs).
+- [ ] **M0127-P5.3 — `joinSearchOneLevel` phases 1+3** (clause joins against
+      initial rels; disconnected cartesian; last-ditch); `makeJoinRel` with
+      PG's outer/inner printing convention (03 §4.4). IMPLEMENTATION-TODO P5.3;
+      03 §4.1-§4.2 (`joinrels.c:118`, `:200-256`). Bar: UNITS + SPOT + PLAN.
+- [ ] **M0127-P5.3a — phase 2, bushy joins, PG-verbatim** (03 §4.3,
+      `joinrels.c:141-198`): k-loop to the halfway point, clauseless rel skip
+      (:170-172), mirror-half `first_rel` rule (:174-177),
+      `have_relevant_joinclause` pair gate (:190-191). Pair-count verification
+      against 03 §7's arithmetic (connectivity-filtered).
+      IMPLEMENTATION-TODO P5.3a. Bar: UNITS + pair-count verification test.
+- [ ] **M0127-P5.4 — `addPathsToJoinrel`:** hash (both build sides), NLI+Memoize
+      parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
+      03 §5.3; FULL-without-usable-clause error contract), qual placement at
+      lowest covering level; deterministic tie-break (build on M0125-0047's
+      fix). Parameterisation discipline (03 §9: param-aware `setCheapest`,
+      `PATH_PARAM_BY_REL` refusal, `ppiRows`). NLI binding contract (03 §5.2:
+      shared eligibility fn; constructor failure on a DP-chosen path = loud
+      planner error). IMPLEMENTATION-TODO P5.4; 03 §5. Bar: UNITS + SPOT +
+      DS05.
+- [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
+      search-boundary coordinate map (03 §10: relid-order canonical layout —
+      one map composed from the final relset, or a relid-reordering root
+      Project; ColumnRef-in-schema plan-time assertion); pinned-spine
+      re-resolution consumes the map; searched-subtree tagging so legacy passes
+      skip; `reconcileNLILayout` no-op assertion on searched trees.
+      Plan-snapshot re-baseline same commit. IMPLEMENTATION-TODO P5.5; 03 §10;
+      02 §3. Bar: UNITS + SPOT + DS05 + PLAN (re-baseline).
+- [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
+      FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build
+      penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
+      joinrel). Re-evaluate M0125-0003 stage 3 here (rows-once per RelOptInfo,
+      04 §2). IMPLEMENTATION-TODO P5.6; 04 §3; 09 §5. Bar: UNITS + DS05 +
+      estimate audit run.
+- [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
+      Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
+      06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).
+- [ ] **M0127-P5.8 — collapse limits with PG's actual semantics** (03 §6: flat
+      comma lists are always ONE problem; limits govern sub-joinlists and
+      explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening
+      behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately,
+      08 §2); outer joins stay pinned until `join_is_legal` inference lands
+      (03 §4.4); delete the 12-table bail-out. IMPLEMENTATION-TODO P5.8; 03 §6.
+      Bar: UNITS + DS05 (sub-flag OFF and ON).
+- [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
+      once with collapse OFF, then with collapse ON) + plan-shape ratchet
+      baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and
+      retire `GOOPG_COST_DRIVEN_JOINORDER`, or record the documented no-go.
+      File `analysis/leftdeep-joins/…-s5-acceptance.txt`. IMPLEMENTATION-TODO
+      P5.9; 09 §3-§5; 08 §2. Bar: the full acceptance bar.
+- [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
+      conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
+      `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1
+      (first half); 05 §6 (E5). Bar: UNITS + BENCH (no alloc regression).
+- [ ] **M0127-PS6.2 — compiled ↔ interpreted sibling audit + parity spot-diffs**
+      on expression corpora incl. the overflow corpus (0097-0037 precedent).
+      IMPLEMENTATION-TODO PS6.1 (second half); 09 §1 SIBLING. Bar: parity corpus
+      + BENCH. (The release gate for E5.)
+- [ ] **M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
+      `executor.go:160-163`, env vars, orphan-export check —
+      `IsCanonicalKeyEquality` has no other caller). IMPLEMENTATION-TODO P6.1;
+      08 §4 "Fusion". Bar: grep-clean + UNITS + SPOT.
+- [ ] **M0127-P6.2 — delete MultiHashJoin** (fresh grep inventory at S7 time;
+      2026-08-02 count ~34 arms / 18 files: node, packer
+      `rewriteMultiWayChain`/`collectMultiHashTables`, `mhj_input_rewrite.go`,
+      posmaps, cost/cardinality arms, executor op `multi_hash_join.go`,
+      EXPLAIN arms, `generateMultiHashJoinPath`, flags). IMPLEMENTATION-TODO
+      P6.2; 08 §4 "MultiHashJoin". Bar: after S5-ON survives a clean nightly
+      cycle; grep-clean + UNITS + SPOT + DS05.
+- [ ] **M0127-P6.3 — delete the old subset-bitmask DP + layout/remap family**
+      (`enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/
+      `dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,
+      `attachUnusedCrossEdges`, `bushySeedRowCounts`, the 12-table cap,
+      `IsSmallDimensionSide` pinning, `chooseInnerJoinAlgo` searched,
+      `dpEntry.layout`/`remapKeyToLayout`/`mergeSubsetLayouts`); demote
+      `joinorder.go` to the over-limit sequencer. **`buildBindingsPosMap`/
+      `applyJoinTreePosMap` held back** until the 03 §10 boundary map is proven
+      in production (08 §4 — the S7 change most likely to regress).
+      IMPLEMENTATION-TODO P6.3; 08 §4. Bar: grep-clean + UNITS + SPOT + DS05.
+- [ ] **M0127-P6.4 — supersession stamps + ledger rows.** 0034-0001, 0038-0001,
+      cost-model/09 §3 allowance, 0043/0063/0125/0126 MHJ chapters get
+      `superseded by: leftdeep-joins/` headers; README index status flips;
+      ledger rows for every deliberately-skipped PG behaviour (GEQO, skew
+      buckets, SpecialJoinInfo in-DP — `join_is_legal`-inference-dependent
+      marker —, shared spilling builds, full join_order_restriction inference).
+      IMPLEMENTATION-TODO P6.4; 08 §5. Bar: doc review.
+
+**Order:** P0.1→P0.3 (S0) → P1.1→P1.3 (S1; P1.3's bar gates P2) →
+P2.1→P2.3 (S2) → P3.1→P3.5 (S3) → P4.1→P4.4 (S4) → P5.1→P5.9 incl. P5.3a
+(S5, each 1–2 loops) → PS6.1→PS6.2 (S6) → P6.1→P6.4 (S7, only after S5-ON
+survives a clean nightly cycle). No M0127 task may be selected while any
+M0125 item marked as a prerequisite above is open (Current Priority banner).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
