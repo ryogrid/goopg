@@ -1,181 +1,188 @@
-# 0127 — PG-shaped join search：実装計画（leftdeep-joins バンドルの Ralph タスク分解）
+# 0127 — PG-shaped join search: Implementation Plan (leftdeep-joins bundle Ralph task breakdown)
 
 | field | value |
 | --- | --- |
-| status | draft — **DESIGN ONLY**、実装未着手 |
+| status | draft — **DESIGN ONLY**, implementation not started |
 | date | 2026-08-03 |
 | milestone | `docs/milestones/0127-pg-shaped-join-search.md` |
-| design of record | `docs/design/leftdeep-joins/` — **この文書は設計の権威ではない。** 各タスクの指示はバンドル章（`README.md`、`01`–`09`、`IMPLEMENTATION-TODO.md`）が唯一の源であり、本計画は「詳細は XX §N を参照」の形で参照する。バンドル配下のファイルは参照のみ、変更しない |
-| convention | タスクは Ralph の 1 ループ（1 セッション）で完了可能なサイズ（`.ralph/PROMPT.md`「ONE task per loop」）。各タスクにゲート（完了条件）を明記。deferral = ledger 行 + unchecked box、黙って閉じない |
-| 分解源 | `IMPLEMENTATION-TODO.md` の P0–P6 構造をより細粒度に分割（P5 は 9 タスク + P5.3a bushy 位相、PS6 は 2 タスクに分割して計 34 タスク） |
+| design of record | `docs/design/leftdeep-joins/` — **This document is not the design authority.** Each task's instructions come solely from the bundle chapters (`README.md`, `01`–`09`, `IMPLEMENTATION-TODO.md`); this plan references them as "see XX §N for details." Files under the bundle directory are referenced only, never modified |
+| convention | Tasks are sized for one Ralph loop (one session) completion (`.ralph/PROMPT.md` "ONE task per loop"). Each task lists its gate (completion condition). Deferral = ledger row + unchecked box; never a silent close |
+| decomposition source | The `IMPLEMENTATION-TODO.md` P0–P6 structure, split to finer granularity (P5 = 9 tasks + P5.3a bushy phase, PS6 split into 2 tasks, total 34 tasks) |
 
-## 1. 位置づけ
+## 1. Positioning
 
-M0126 は 2026-08-03 に documented no-go として終了した。本マイルストーンは
-`docs/design/leftdeep-joins/` バンドル（ユーザー指示 2026-08-02、amended
-2026-08-03）を shipped behaviour に変換する。バンドルの stop conditions は
-拘束力を持つ（M0126 と同じ）。ステージ構成（S0–S7）、フラグ、rollback 契約は
-[08-migration-and-removal.md](leftdeep-joins/08-migration-and-removal.md) §2
-が規範。受け入れバーは [09-verification-and-acceptance.md](leftdeep-joins/09-verification-and-acceptance.md)
-§3 が規範。本計画はそれらへの索引である。
+M0126 terminated as a documented no-go on 2026-08-03. This milestone converts
+the `docs/design/leftdeep-joins/` bundle (user-directed 2026-08-02, amended
+2026-08-03) into shipped behaviour. The bundle's stop conditions are binding
+(same as M0126). The stage map (S0–S7), flags, and rollback contract are
+normative at [08-migration-and-removal.md](leftdeep-joins/08-migration-and-removal.md)
+§2. The acceptance bar is normative at
+[09-verification-and-acceptance.md](leftdeep-joins/09-verification-and-acceptance.md)
+§3. This plan is an index into both.
 
-**順序の原則（08 §1）：** executor first、planner second、deletion last。
-P0–P4（エグゼキュータ段）は現行デフォルトプランナの出力を即座に改善し、
-プランナリスクを運ばない。P5（DP）が着地する頃には、それが発行する
-バイナリカスケードはすべて修繕済みエグゼキュータ上を走る。
+**Ordering principle (08 §1):** executor first, planner second, deletion last.
+P0–P4 (executor stages) immediately improve the current default planner's output
+and carry no planner risk. By the time P5 (DP) lands, every binary cascade it
+emits runs on an already-fixed executor.
 
-## 2. 各タスクの共通ゲート語彙（09 §1、拘束力）
+## 2. Common gate vocabulary for all tasks (09 §1, binding)
 
-- **UNITS**：`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` green。
-- **SMOKE**：全コミットの pre-commit pgbench smoke（hook、決して `--no-verify`）。
-- **SPOT**：`scripts/tpch-spotcheck.sh`（Q12/Q13 canonical 行数、fresh capped server）
-  — 全 planner/executor/codec コミット。
-- **DS05**：`scripts/tpcds-sf05-regression.sh sweep` — row-count デルタも
-  checksum デルタも**ゼロ**（git-tracked oracle に対して）。fusion を捕まえた
-  ゲートであり、E1（seam）と S3（spill）の主たる正しさの計器。段ごとに、
-  末尾だけではなく実行する。
-- **PLAN**：plan-diff（`make plan-diff LABEL=…`、ラベルは現在の再ベースライン
-  を確認 — 2026-08-03 現在 `post-mhj-retire` 系統が最新）。
-- **REGRESS**：全 regress-port スイート（E1、E4、S3、S4 後 — M0106
-  six-silent-regressions 前例）。
-- **RACE**：`make race-gate`（共有状態に触れる段 — E3 の build 変更は
-  `parallel_hash_build.go` と相互作用、S3 の temp-file registry は
-  cancellation 下で Close が走る）。
-- **SIBLING**：sibling-path 監査をコードレビューで明示列挙 — E4
-  （planner keys ↔ executor key encode）、06 §2.1（planner nbatch ↔ executor
-  nbatch）、E5（compiled ↔ interpreted evaluators）。
-- **BENCH**：seam マイクロベンチ（3 段カスケード、1M 合成 probe 行 —
-  定常 alloc 0）等、09 §7 の fixtures。CI ゲートではなく tripwire。
+- **UNITS**: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` green.
+- **SMOKE**: pre-commit pgbench smoke on every commit (hook; never `--no-verify`).
+- **SPOT**: `scripts/tpch-spotcheck.sh` (Q12/Q13 canonical row counts, fresh
+  capped server) — every planner/executor/codec commit.
+- **DS05**: `scripts/tpcds-sf05-regression.sh sweep` — **zero** row-count deltas
+  and **zero** checksum deltas (against git-tracked oracle). This is the gate
+  that caught fusion; it is the primary correctness instrument for E1 (seam)
+  and S3 (spill). Run per stage, not just at the tail.
+- **PLAN**: plan-diff (`make plan-diff LABEL=…`; verify the label against the
+  current re-baseline — as of 2026-08-03 the `post-mhj-retire` lineage is
+  current).
+- **REGRESS**: full regress-port suite (after E1, E4, S3, S4 — M0106
+  six-silent-regressions precedent).
+- **RACE**: `make race-gate` (stages touching shared state — E3's build changes
+  interact with `parallel_hash_build.go`; S3's temp-file registry has Close
+  racing under cancellation).
+- **SIBLING**: sibling-path audit explicitly enumerated in code review — E4
+  (planner keys ↔ executor key encode), 06 §2.1 (planner nbatch ↔ executor
+  nbatch), E5 (compiled ↔ interpreted evaluators).
+- **BENCH**: seam microbench (3-level cascade, 1M synthetic probe rows —
+  steady-state 0 allocs) and other 09 §7 fixtures. A tripwire, not a CI gate.
 
-タイムド測定は **quiet host** でのみ（`pgrep -af run-nightly.sh` を先に確認）、
-サーバー年齢一定（sweep-tail 規律）。`-count=1` はゲートの `go test` に渡さない。
+Timed measurements only on a **quiet host** (check `pgrep -af run-nightly.sh`
+first), server age held constant (sweep-tail discipline). Never pass `-count=1`
+to gate `go test` invocations.
 
-## 3. タスク分解
+## 3. Task decomposition
 
-### P0 — Executor pure wins [S0]（3 タスク、各 1 ループ）
+### P0 — Executor pure wins [S0] (3 tasks, 1 loop each)
 
-無条件（フラグなし）、pure wins。S0 の出口 = units + spotcheck + pgbench smoke +
-stage0 流 A/B でどのクエリも悪化なし（08 §2）。
+Unconditional (no flag), pure wins. S0 exit = units + spotcheck + pgbench smoke +
+stage0-style A/B with no query worse (08 §2).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P0.1** | `mergedKeySlot` 構築を `Open` へ hoist（結合ごとに形状不変）；`.row` は pull ごとに rebind。seam マイクロベンチの定常 alloc をゼロに | IMPLEMENTATION-TODO P0.1；05 §3（E2） | `internal/executor/operators_join_agg.go`（:986-1014、build 側 :590/:646/:702、probe 側 :1266/:1269） | UNITS + SPOT + BENCH |
-| **P0.2** | Single-pass build：`drainRowsBounded` の予算を `buildLazyHashTable` の build ループに折り込み、再イテレーションを削除（`rowsOp` 毎の `MaterializedSlot` alloc）。owned-copy 規律（M0097-0058）を維持 | IMPLEMENTATION-TODO P0.2；05 §4（E3） | `internal/executor/operators_join_agg.go` | UNITS + SPOT + RACE（shared-build 相互作用） |
-| **P0.3** | Single-map build：planner が `planner.Join` にキー型情報を thread；executor は build 前に int64 map か string map かを選択。int64 経路を Semi/Anti に拡張（CTID 例外は維持）。`lazyHashFinalize` の dual-map ダンスを削除 | IMPLEMENTATION-TODO P0.3；05 §4（E3） | `internal/planner/`（キー型情報）+ `internal/executor/operators_join_agg.go` | UNITS + DS05 |
+| **P0.1** | Hoist `mergedKeySlot` construction to `Open` (shape-invariant per join); rebind `.row` per pull. Zero steady-state allocs in the seam microbench | IMPLEMENTATION-TODO P0.1; 05 §3 (E2) | `internal/executor/operators_join_agg.go` (:986-1014, build-side :590/:646/:702, probe-side :1266/:1269) | UNITS + SPOT + BENCH |
+| **P0.2** | Single-pass build: fold `drainRowsBounded`'s budget into the build loop of `buildLazyHashTable`; delete the re-iteration (`rowsOp`-per-row `MaterializedSlot` allocs). Keep owned-copy discipline (M0097-0058) | IMPLEMENTATION-TODO P0.2; 05 §4 (E3) | `internal/executor/operators_join_agg.go` | UNITS + SPOT + RACE (shared-build interaction) |
+| **P0.3** | Single-map build: planner threads key-type info on `planner.Join`; executor picks int64 map vs string map before build. Extend int64 path to Semi/Anti (CTID exception preserved). Delete `lazyHashFinalize`'s dual-map dance | IMPLEMENTATION-TODO P0.3; 05 §4 (E3) | `internal/planner/` (key-type info) + `internal/executor/operators_join_agg.go` | UNITS + DS05 |
 
-### P1 — The seam [S1]（3 タスク、各 1 ループ）
+### P1 — The seam [S1] (3 tasks, 1 loop each)
 
-S1 は `GOOPG_JOIN_SLOT_CHAIN`（既定 ON、env キルスイッチ OFF のみ）。
-出口 = 全 regress-port + TPC-H SF1 sweep + DS05；Q3/Q10/Q18/Q7 ≤ 1.2× R0
-（8.46 / 6.04 / 27.58 / 25.13 s）。
+S1 is behind `GOOPG_JOIN_SLOT_CHAIN` (default ON, env kill-switch OFF only).
+Exit = full regress-port + TPC-H SF1 sweep + DS05; Q3/Q10/Q18/Q7 ≤ 1.2× R0
+(8.46 / 6.04 / 27.58 / 25.13 s).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P1.1** | Legacy-path slot chaining（M0126-0004 の deferral を un-defer）：probe child slot を `lazyVirtualOut` のソースに。ポインタ変更で rebind + 型変更で copy fallback。`slotRow(probeSlot)`（:1254）と vestigial `lazyKeyRow` を削除。env キルスイッチ `GOOPG_JOIN_SLOT_CHAIN=off` | IMPLEMENTATION-TODO P1.1；05 §2（E1、F7 契約：child は安定 slot を返さない） | `internal/executor/operators_join_agg.go` | REGRESS 全 + DS05 + SPOT + BENCH（seam 0 alloc） |
-| **P1.2** | Worker-path 演習：P1.1 の seam を `BuildWorker`（`inWorker=true`）下の統合テストで確認 — fusion の decline-in-worker 前例がこの経路の黙った分岐を警告している | IMPLEMENTATION-TODO P1.2 | `internal/executor/`（worker テスト） | RACE |
-| **P1.3** | S1 A/B 証跡実行：Q3/Q10/Q18/Q7 ≤ 1.2× R0、他クエリは pre-S1 HEAD 比 ≤ 1.2×。証跡 `analysis/leftdeep-joins/<date>-s1-ab.txt`。バー達成または attribution（09 §6）までは P2 を開始しない | IMPLEMENTATION-TODO P1.3；09 §2/§6 | 証跡ファイルのみ（コードなし） | タイムド TPC-H SF1 A/B + SPOT per arm |
+| **P1.1** | Legacy-path slot chaining (un-defer M0126-0004): probe child slot as `lazyVirtualOut` source; rebind-on-pointer-change + copy-on-type-change fallback. Delete `slotRow(probeSlot)` (:1254) and vestigial `lazyKeyRow`. Env kill-switch `GOOPG_JOIN_SLOT_CHAIN=off` | IMPLEMENTATION-TODO P1.1; 05 §2 (E1, F7 contract: child does not return stable slots) | `internal/executor/operators_join_agg.go` | REGRESS full + DS05 + SPOT + BENCH (seam 0 alloc) |
+| **P1.2** | Worker-path exercise: integration test of the P1.1 seam under `BuildWorker` (`inWorker=true`) — fusion's decline-in-worker precedent warns this path diverges silently | IMPLEMENTATION-TODO P1.2 | `internal/executor/` (worker test) | RACE |
+| **P1.3** | S1 A/B evidence run: Q3/Q10/Q18/Q7 ≤ 1.2× R0, remaining queries ≤ 1.2× pre-S1 HEAD. Artefact `analysis/leftdeep-joins/<date>-s1-ab.txt`. Do not start P2 until bar met or attributed (09 §6) | IMPLEMENTATION-TODO P1.3; 09 §2/§6 | Artefact file only (no code) | Timed TPC-H SF1 A/B + SPOT per arm |
 
-### P2 — Multi-column keys [S2]（3 タスク、各 1–2 ループ；P2.1/P2.2 は sibling 対）
+### P2 — Multi-column keys [S2] (3 tasks, 1–2 loops each; P2.1/P2.2 are a sibling pair)
 
-S2 は plan 影響あり → plan-snapshot 再ベースラインを**同コミット**で。
-`reselectDegenerateHashKeys` は P2.2 で削除（M0125-0035b が導入した
-単一 equi-pair 縮退の回避策は、真の多列キーに置き換わる）。
+S2 is plan-affecting → plan-snapshot re-baseline **same commit**.
+`reselectDegenerateHashKeys` is deleted at P2.2 (the single-equi-pair degeneracy
+workaround introduced by M0125-0035b is replaced by true multi-column keys).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P2.1** | `planner.Join.HashKeys []JoinKeyPair`：探索/押下が全 equality conjunct を充填；residual は非等結合のみ。EXPLAIN のキーリスト描画。plan-snapshot 再ベースライン同コミット | IMPLEMENTATION-TODO P2.1；05 §5（E4 planner 側）；02 §2（BuildLeft = commutation） | `internal/planner/`（Join 構造体、探索/押下、EXPLAIN） | UNITS + SPOT + DS05 + PLAN（snapshot diff レビュー） |
-| **P2.2** | Executor 複合キー：全 int64 固定幅パック；mixed は concatenated `datumKey`。`reselectDegenerateHashKeys` + その planner pass を同コミット削除。Q78 クラス退化回帰テスト追加（最初のキー列が定数ピンされても 1 バケットに劣化しないこと） | IMPLEMENTATION-TODO P2.2；05 §5（E4 executor 側）；記憶：`goopg_hash_join_single_key_degeneracy` | `internal/executor/operators_join_agg.go` + `internal/planner/`（削除） | UNITS + SPOT + DS05 + SIBLING（planner keys ↔ executor encode） |
-| **P2.3** | Merge-join 多列キーを同じリストから（full-key comparator；residual は非等結合のみ） | IMPLEMENTATION-TODO P2.3；07 §2 | `internal/executor/`（merge join）+ `internal/planner/` | UNITS + SPOT + DS05 + PLAN |
+| **P2.1** | `planner.Join.HashKeys []JoinKeyPair`: search/pushdown fills all equality conjuncts; residual keeps non-equijoin only. EXPLAIN key-list rendering. Plan-snapshot re-baseline same commit | IMPLEMENTATION-TODO P2.1; 05 §5 (E4 planner half); 02 §2 (BuildLeft = commutation) | `internal/planner/` (Join struct, search/pushdown, EXPLAIN) | UNITS + SPOT + DS05 + PLAN (snapshot diff reviewed) |
+| **P2.2** | Executor composite keys: all-int64 fixed-width pack; mixed → concatenated `datumKey`. Delete `reselectDegenerateHashKeys` + its planner pass same commit. Add Q78-class degeneracy regression test (constant-pinned first key column must not degrade to one bucket) | IMPLEMENTATION-TODO P2.2; 05 §5 (E4 executor half); memory: `goopg_hash_join_single_key_degeneracy` | `internal/executor/operators_join_agg.go` + `internal/planner/` (deletion) | UNITS + SPOT + DS05 + SIBLING (planner keys ↔ executor encode) |
+| **P2.3** | Merge-join multi-column keys from the same list (full-key comparator; residual only non-equijoin) | IMPLEMENTATION-TODO P2.3; 07 §2 | `internal/executor/` (merge join) + `internal/planner/` | UNITS + SPOT + DS05 + PLAN |
 
-### P3 — Hybrid hash spill [S3]（5 タスク、各 1–2 ループ）
+### P3 — Hybrid hash spill [S3] (5 tasks, 1–2 loops each)
 
-S3 は `work_mem` 尊重 ON、`GOOPG_HASH_SPILL=off` 逃げ。出口 = Q21 SF1 完走
-（cgroup cap 下）+ forced-spill バイト同一（09 §2）。
+S3 is `work_mem`-honouring ON, `GOOPG_HASH_SPILL=off` escape. Exit = Q21 SF1
+completes (cgroup cap) + forced-spill byte-identical (09 §2).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P3.1** | `chooseHashTableSize`（planner と executor の両方から import 可能な共有 pkg）；goopg-width 認識（`48·c` + map オーバーヘッド） | IMPLEMENTATION-TODO P3.1；06 §2.1；04 §4 | 新 shared pkg（planner/executor から参照） | UNITS + SPOT |
-| **P3.2** | Batch build/probe：hashvalue 接頭辞付き `spillWriter` フレーム、batch ごとの inner/outer ファイル、`HJ_NEED_NEW_BATCH` 状態を `nextLazy` に、nbatch 成長 + 打ち切り give-up + WARNING | IMPLEMENTATION-TODO P3.2；06 §2.2-2.4 | `internal/executor/operators_join_agg.go` + spill 基盤 | UNITS + DS05 + RACE |
-| **P3.3** | クエリ毎 temp-file registry を `Context` に；`<datadir>/base/pgsql_tmp/` へ移設；起動時 sweep；`spillOp.Close` の unlink 漏れ修正。injected-crash テストで strays が残らないこと | IMPLEMENTATION-TODO P3.3；06 §3 | `internal/executor/`（spill registry）+ `internal/server/` | UNITS + クラッシュ注入テスト |
-| **P3.4** | Semi/Anti/LEFT の per-batch 意味論（batch グローバル `antiBuildHasNull`）；shared build は nbatch > 1 で decline | IMPLEMENTATION-TODO P3.4；06 §2.5 | `internal/executor/operators_join_agg.go` | UNITS + DS05 + RACE |
-| **P3.5** | EXPLAIN の `Batches:`/memory 行；forced-spill identity テスト（低 `work_mem` Q3 がデフォルトとバイト同一）。証跡 `analysis/leftdeep-joins/…-s3-spill.txt` | IMPLEMENTATION-TODO P3.5；06 §4；09 §2 | EXPLAIN + テスト + 証跡 | Q21 SF1 完走（capped）+ DS05 ゼロデルタ + RACE |
+| **P3.1** | `chooseHashTableSize` (shared pkg importable by both planner and executor); goopg-width-aware (`48·c` + map overhead) | IMPLEMENTATION-TODO P3.1; 06 §2.1; 04 §4 | New shared pkg (referenced from planner + executor) | UNITS + SPOT |
+| **P3.2** | Batch build/probe: hashvalue-prefixed `spillWriter` frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` state in `nextLazy`, nbatch growth + capped give-up + WARNING | IMPLEMENTATION-TODO P3.2; 06 §2.2-2.4 | `internal/executor/operators_join_agg.go` + spill substrate | UNITS + DS05 + RACE |
+| **P3.3** | Per-query temp-file registry on `Context`; relocate to `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close` unlink leak. Injected-crash test leaves no strays | IMPLEMENTATION-TODO P3.3; 06 §3 | `internal/executor/` (spill registry) + `internal/server/` | UNITS + crash-injection test |
+| **P3.4** | Semi/Anti/LEFT per-batch semantics (batch-global `antiBuildHasNull`); shared build declines when nbatch > 1 | IMPLEMENTATION-TODO P3.4; 06 §2.5 | `internal/executor/operators_join_agg.go` | UNITS + DS05 + RACE |
+| **P3.5** | EXPLAIN `Batches:`/memory lines; forced-spill identity test (low `work_mem` Q3 byte-identical to default). Artefact `analysis/leftdeep-joins/…-s3-spill.txt` | IMPLEMENTATION-TODO P3.5; 06 §4; 09 §2 | EXPLAIN + test + artefact | Q21 SF1 completes (capped) + DS05 zero deltas + RACE |
 
-### P4 — Other join operators [S4]（4 タスク、各 1–2 ループ）
+### P4 — Other join operators [S4] (4 tasks, 1–2 loops each)
 
-S4 は演算子ごと、plan 影響部は S5 のフラグに従う。出口 = regress-port
-outer-join ファイル green + DS05。
+S4 is per-operator; plan-affecting parts follow S5's flag. Exit = regress-port
+outer-join files green + DS05.
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P4.1** | Streaming merge join（duplicate-group バッファ + オーバーフローファイル）；全ドレインの `runMergeJoin`/`buildMergeSide` 蓄積を削除 | IMPLEMENTATION-TODO P4.1；07 §2 | `internal/executor/`（merge join） | UNITS + REGRESS + DS05 |
-| **P4.2** | Hash outer-fill：batch ごとの matched bitmap；RIGHT スイープ；FULL = LEFT fill + スイープ；planner legality 行列更新（RIGHT/FULL hash paths）。regress-port outer-join ファイル green | IMPLEMENTATION-TODO P4.2；07 §3（PG `HJ_FILL_INNER`） | `internal/executor/operators_join_agg.go` + `internal/planner/` | REGRESS outer-join ファイル + DS05 |
-| **P4.3** | `Materialize` 演算子（plan node + path + rescan replay、memory→spill）；NL join は outer を stream、inner は Materialize 下に。drain-both `runNestedLoop` バッファリングと `concatRows`-per-pair を削除 | IMPLEMENTATION-TODO P4.3；07 §4 | `internal/executor/`（materialize、nested loop）+ `internal/planner/` | UNITS + SPOT + DS05 |
-| **P4.4** | Lateral：outer は stream（per-outer 再実行は維持）、出力が `o.rows` に蓄積されない | IMPLEMENTATION-TODO P4.4；07 §4 | `internal/executor/`（nested loop） | UNITS + DS05 |
+| **P4.1** | Streaming merge join (duplicate-group buffering + overflow file); delete full-drain `runMergeJoin`/`buildMergeSide` accumulation | IMPLEMENTATION-TODO P4.1; 07 §2 | `internal/executor/` (merge join) | UNITS + REGRESS + DS05 |
+| **P4.2** | Hash outer-fill: per-batch matched bitmap; RIGHT sweep; FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL hash paths). Regress-port outer-join files green | IMPLEMENTATION-TODO P4.2; 07 §3 (PG `HJ_FILL_INNER`) | `internal/executor/operators_join_agg.go` + `internal/planner/` | REGRESS outer-join files + DS05 |
+| **P4.3** | `Materialize` operator (plan node + path + rescan replay, memory→spill); NL join streams outer, inner under Materialize. Delete drain-both `runNestedLoop` buffering and `concatRows`-per-pair | IMPLEMENTATION-TODO P4.3; 07 §4 | `internal/executor/` (materialize, nested loop) + `internal/planner/` | UNITS + SPOT + DS05 |
+| **P4.4** | Lateral: outer streams (per-outer re-execution kept), output no longer accumulates into `o.rows` | IMPLEMENTATION-TODO P4.4; 07 §4 | `internal/executor/` (nested loop) | UNITS + DS05 |
 
-### P5 — The DP [S5]（9 タスク + P5.3a、各 1–2 ループ）
+### P5 — The DP [S5] (9 tasks + P5.3a, 1–2 loops each)
 
-各タスクは `GOOPG_PGSHAPED_DP` の背後に dark 着地（soak 中 OFF）。
-collapse-limit 配線は独自サブフラグ `GOOPG_PGSHAPED_COLLAPSE`（P5.8）。
-soak 中の共存規則は 08 §3：searched 根はタグ付け、legacy passes はスキップ、
-`reconcileNLILayout` は searched 木で no-op を assert。
+Each task lands dark behind `GOOPG_PGSHAPED_DP` (OFF while soaking).
+Collapse-limit wiring gets its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (P5.8).
+Coexistence rules during soak are 08 §3: searched roots are tagged, legacy
+passes skip tagged subtrees, `reconcileNLILayout` asserts no-op on searched trees.
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P5.1** | `joinrels` level リスト + relset map（`RelOptInfo` 上）；`buildInitialRels` に `PathPrebuilt` leaves（subquery/CTE/VALUES/pinned unnest — leaf-whitelist ギャップを閉じる。M0125-0037(ii) の後継でもある） | IMPLEMENTATION-TODO P5.1；03 §1-§2 | `internal/planner/`（新 DP 基盤） | UNITS + PLAN（既定 arm ZERO 差分） |
-| **P5.2** | restrictInfo リスト + `hasRelevantJoinClause`；等価クラス選択度規則（推論辺：許容、二重計数なし） | IMPLEMENTATION-TODO P5.2；03 §3；04 §5 | `internal/planner/` | UNITS + PLAN（ZERO 差分） |
-| **P5.3** | `joinSearchOneLevel` の位相 1+3（initial rels への clause joins；非連結 cartesian；last-ditch）；`makeJoinRel` に PG の outer/inner 印刷規約 | IMPLEMENTATION-TODO P5.3；03 §4.1-§4.2（`joinrels.c:118`、`:200-256`） | `internal/planner/` | UNITS + SPOT + PLAN |
-| **P5.3a** | 位相 2 — bushy joins、PG-verbatim（03 §4.3、`joinrels.c:141-198`）：k ループは中間点まで、clauseless rel skip（:170-172）、mirror-half `first_rel` 規則（:174-177）、`have_relevant_joinclause` pair gate（:190-191）。ペア数検証（03 §7 の算術、connectivity フィルタ後） | IMPLEMENTATION-TODO P5.3a；03 §4.3 | `internal/planner/` | UNITS + ペア数検証テスト |
-| **P5.4** | `addPathsToJoinrel`：hash（両 build side）、NLI+Memoize parameterised paths、merge（pathkeys 経由）、NL fallback（jointype-legal のみ、03 §5.3；FULL-without-usable-clause の error 契約）、qual 配置は最小被覆レベル、決定的タイブレーク。Parameterisation 規律（03 §9：param-aware `setCheapest`、`PATH_PARAM_BY_REL` 拒否、`ppiRows`）。NLI 束縛契約（03 §5.2：共有 eligibility fn；DP 選択 path の constructor 失敗 = 明示的な planner error） | IMPLEMENTATION-TODO P5.4；03 §5 | `internal/planner/`（path generation） | UNITS + SPOT + DS05 |
-| **P5.5** | 全 live PathKinds の `createPlan` アーム → 既存 Nodes；**探索境界座標マップ**（03 §10：relid-order canonical layout — 最終 relset から合成する 1 つの map、または relid 並べ替え root Project；schema 内 ColumnRef の plan-time 断言）；pinned-spine 再解決が map を消費；searched-subtree タグ付けで legacy passes がスキップ；`reconcileNLILayout` no-op 断言 | IMPLEMENTATION-TODO P5.5；03 §10；02 §3 | `internal/planner/`（create_plan 相当）+ `internal/executor/` | UNITS + SPOT + DS05 + PLAN（snapshot 再ベースライン同コミット） |
-| **P5.6** | `calcJoinrelSize` + FK-superkey 一般化 + eqjoinsel + FK clamp（04 §3.1-3.3）；quadratic build penalty 削除；estimate audit tooling（09 §5 — Q9 の連鎖は最終 joinrel で ≤ 10²× を示す） | IMPLEMENTATION-TODO P5.6；04 §3；09 §5 | `internal/planner/cardinality.go` 系統 | UNITS + DS05 + estimate audit 実行 |
-| **P5.7** | nbatch 認識 `hashJoinCost`（共有 sizing fn）；LIMIT-over-join の Startup/Total 分割 | IMPLEMENTATION-TODO P5.7；04 §4；06 §5 | `internal/planner/cost_funcs.go` | UNITS + PLAN（既定 arm ZERO 差分） |
-| **P5.8** | Collapse limits を PG の実際の意味論で配線（03 §6：flat comma リストは常に 1 問題；limits は sub-joinlist と explicit JOIN のみを制御；=1 pin 意味論）；explicit INNER JOIN flattening は独自サブフラグ `GOOPG_PGSHAPED_COLLAPSE` の背後（enumerator と別 soak、08 §2）；outer joins は `join_is_legal` 推論が着地するまで pinned（03 §4.4）。12 テーブル bail-out 削除 | IMPLEMENTATION-TODO P5.8；03 §6 | `internal/planner/`（collapse）+ `joinorder.go`（sequencer 降格の準備） | UNITS + DS05（サブフラグ OFF/ON 両 arm） |
-| **P5.9** | S5 受け入れ実行：09 §3 の全バー（collapse OFF → ON の順に 2 回）+ plan-shape ratchet ベースライン（§4）+ estimate audit（§5）；フラグ flip または文書化 no-go。証跡 `analysis/leftdeep-joins/…-s5-acceptance.txt` | IMPLEMENTATION-TODO P5.9；09 §3-§5；08 §2 | 証跡 + フラグ flip コミット | 受け入れバー全条項 |
+| **P5.1** | `joinrels` level lists + relset map over `RelOptInfo`; `buildInitialRels` with `PathPrebuilt` leaves (subquery/CTE/VALUES/pinned unnest — closes the leaf-whitelist gap. Also the successor to M0125-0037(ii)) | IMPLEMENTATION-TODO P5.1; 03 §1-§2 | `internal/planner/` (new DP substrate) | UNITS + PLAN (default arm ZERO diff) |
+| **P5.2** | restrictInfo list + `hasRelevantJoinClause`; equivalence-class selectivity rule (inferred edges: admissible, no double-count) | IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5 | `internal/planner/` | UNITS + PLAN (ZERO diff) |
+| **P5.3** | `joinSearchOneLevel` phases 1+3 (clause joins against initial rels; disconnected cartesian; last-ditch); `makeJoinRel` with PG's outer/inner printing convention | IMPLEMENTATION-TODO P5.3; 03 §4.1-§4.2 (`joinrels.c:118`, `:200-256`) | `internal/planner/` | UNITS + SPOT + PLAN |
+| **P5.3a** | Phase 2 — bushy joins, PG-verbatim (03 §4.3, `joinrels.c:141-198`): k-loop to halfway, clauseless-rel skip (:170-172), mirror-half `first_rel` rule (:174-177), `have_relevant_joinclause` pair gate (:190-191). Pair-count verification (03 §7 arithmetic, after connectivity filter) | IMPLEMENTATION-TODO P5.3a; 03 §4.3 | `internal/planner/` | UNITS + pair-count verification test |
+| **P5.4** | `addPathsToJoinrel`: hash (both build sides), NLI+Memoize parameterised paths, merge (via pathkeys), NL fallback (jointype-legal only, 03 §5.3; FULL-without-usable-clause error contract), qual placement at lowest covering level, deterministic tie-break. Parameterisation discipline (03 §9: param-aware `setCheapest`, `PATH_PARAM_BY_REL` refusal, `ppiRows`). NLI binding contract (03 §5.2: shared eligibility fn; constructor failure on DP-chosen path = loud planner error) | IMPLEMENTATION-TODO P5.4; 03 §5 | `internal/planner/` (path generation) | UNITS + SPOT + DS05 |
+| **P5.5** | `createPlan` arms for all live PathKinds → existing Nodes; **search-boundary coordinate map** (03 §10: canonical relid-order layout — one map composed from the final relset, or a relid-reordering root Project; ColumnRef-in-schema plan-time assertion); pinned-spine re-resolution consumes the map; searched-subtree tagging so legacy passes skip; `reconcileNLILayout` no-op assertion | IMPLEMENTATION-TODO P5.5; 03 §10; 02 §3 | `internal/planner/` (create_plan equivalent) + `internal/executor/` | UNITS + SPOT + DS05 + PLAN (snapshot re-baseline same commit) |
+| **P5.6** | `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel + FK clamp (04 §3.1-3.3); delete quadratic build penalty; estimate audit tooling (09 §5 — Q9 chain must show final joinrel ≤ 10²× actual) | IMPLEMENTATION-TODO P5.6; 04 §3; 09 §5 | `internal/planner/cardinality.go` lineage | UNITS + DS05 + estimate audit run |
+| **P5.7** | nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total split for LIMIT-over-join | IMPLEMENTATION-TODO P5.7; 04 §4; 06 §5 | `internal/planner/cost_funcs.go` | UNITS + PLAN (default arm ZERO diff) |
+| **P5.8** | Wire collapse limits with PG's actual semantics (03 §6: flat comma lists are always ONE problem; limits govern sub-joinlists and explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately from the enumerator, 08 §2); outer joins stay pinned until `join_is_legal` inference lands (03 §4.4). Delete the 12-table bail-out | IMPLEMENTATION-TODO P5.8; 03 §6 | `internal/planner/` (collapse) + `joinorder.go` (prepare for sequencer demotion) | UNITS + DS05 (sub-flag OFF/ON both arms) |
+| **P5.9** | S5 acceptance run: full 09 §3 bar (collapse OFF → ON, two passes) + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or documented no-go. Artefact `analysis/leftdeep-joins/…-s5-acceptance.txt` | IMPLEMENTATION-TODO P5.9; 09 §3-§5; 08 §2 | Artefact + flag-flip commit | Full acceptance bar |
 
-### PS6 — Compiled key/residual evaluation [S6]（2 タスク、各 1 ループ）
+### PS6 — Compiled key/residual evaluation [S6] (2 tasks, 1 loop each)
 
-挙動中立、フラグなし。sibling-path 監査（compiled ↔ interpreted）が
-リリースゲート（09 §1）。
+Behaviour-neutral, no flag. Sibling-path audit (compiled ↔ interpreted) is the
+release gate (09 §1).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **PS6.1** | `HashKeys[i]` アクセサと residual conjunction を `Open` で `ExprNode` にコンパイル（`internal/executor/exprnode.go`）；未対応種は `ExprAdapter` fallback | IMPLEMENTATION-TODO PS6.1（前半）；05 §6（E5） | `internal/executor/exprnode.go` + `operators_join_agg.go` | UNITS + BENCH（alloc 後退なし） |
-| **PS6.2** | compiled ↔ interpreted の sibling 監査 + parity spot-diff（式コーパス、オーバーフローコーパス含む — 0097-0037 前例） | IMPLEMENTATION-TODO PS6.1（後半）；09 §1 SIBLING | テスト + 監査証跡 | parity コーパス + BENCH |
+| **PS6.1** | Compile `HashKeys[i]` accessors and the residual conjunction to `ExprNode` at `Open` (`internal/executor/exprnode.go`); `ExprAdapter` fallback for unsupported kinds | IMPLEMENTATION-TODO PS6.1 (first half); 05 §6 (E5) | `internal/executor/exprnode.go` + `operators_join_agg.go` | UNITS + BENCH (no alloc regression) |
+| **PS6.2** | compiled ↔ interpreted sibling audit + parity spot-diff (expression corpora, including overflow corpus — 0097-0037 precedent) | IMPLEMENTATION-TODO PS6.1 (second half); 09 §1 SIBLING | Tests + audit artefact | parity corpus + BENCH |
 
-### P6 — Deletion [S7]（4 タスク、各 1 ループ）
+### P6 — Deletion [S7] (4 tasks, 1 loop each)
 
-S5 既定 ON が clean nightly ≥ 1 サイクルを生きてから。削除インベントリは
-08 §4 が規範（S7 時に grep で再取得）。`buildBindingsPosMap`/
-`applyJoinTreePosMap` は 03 §10 の境界マップが production で実証されるまで
-保留（08 §4、S7 の中で最も回帰しやすい変更）。
+Only after S5 default-ON survives ≥ 1 clean nightly cycle. The deletion
+inventory is normative at 08 §4 (re-acquired via grep at S7 time).
+`buildBindingsPosMap`/`applyJoinTreePosMap` are **held back** until the 03 §10
+boundary map is proven in production (08 §4, the single most regression-prone
+change in S7).
 
-| ID | 内容 | 参照 | ファイル | ゲート |
+| ID | Content | Reference | Files | Gate |
 |---|---|---|---|---|
-| **P6.1** | Fusion 削除：`fused_hash_join.go`（707 行）、hook（`executor.go:160-163`）、env vars、planner 側孤児エクスポート検査（`IsCanonicalKeyEquality` の他 caller 確認） | IMPLEMENTATION-TODO P6.1；08 §4「Fusion」 | `internal/executor/fused_hash_join.go` 削除 + hook/env | grep-clean + UNITS + SPOT |
-| **P6.2** | MultiHashJoin 削除（S7 時点の fresh grep inventory；2026-08-02 時点 ~34 arms/18 files）：node、packer（`rewriteMultiWayChain`/`collectMultiHashTables`）、`mhj_input_rewrite.go`、posmaps、cost/cardinality arms、executor op（`multi_hash_join.go` 696 行）、EXPLAIN arms、`generateMultiHashJoinPath`、flags（`mhjPackingEnabled`/`GOOPG_MHJ_PACKING_OFF`） | IMPLEMENTATION-TODO P6.2；08 §4「MultiHashJoin」 | 上記 15+ ファイル | nightly green 後 + grep-clean + UNITS + SPOT + DS05 |
-| **P6.3** | 旧 subset-bitmask DP + 関連族削除：`enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/`dp map[uint16]dpEntry`、`estimateJoinCost` + integer weights、`attachUnusedCrossEdges`、`bushySeedRowCounts`、`len(tables) > 12` cap、`IsSmallDimensionSide` pinning、`chooseInnerJoinAlgo`（searched）；subset 内 layout/remap 族（`dpEntry.layout`、`remapKeyToLayout`、`mergeSubsetLayouts`）削除；`joinorder.go` は over-limit sequencer へ降格。**`buildBindingsPosMap`/`applyJoinTreePosMap` は保留** | IMPLEMENTATION-TODO P6.3；08 §4「Planner」「layout/remap 族」 | `internal/planner/bushy.go` 等 | grep-clean + UNITS + SPOT + DS05 |
-| **P6.4** | Supersession スタンプ（0034-0001、0038-0001、cost-model/09 §3 の allowance、0043/0063/0125/0126 の MHJ 章）；README 索引 status flips；skip された PG 挙動ごとの ledger 行（GEQO、skew buckets、SpecialJoinInfo in-DP — `join_is_legal` 推論依存マーカー付き —、shared spilling builds、full join_order_restriction 推論） | IMPLEMENTATION-TODO P6.4；08 §5 | 文書 + `.ralph/deferral_ledger.md` | 文書レビュー |
+| **P6.1** | Delete fusion: `fused_hash_join.go` (707 lines), hook (`executor.go:160-163`), env vars, planner-side orphan-export check (verify `IsCanonicalKeyEquality` has no other callers) | IMPLEMENTATION-TODO P6.1; 08 §4 "Fusion" | Delete `internal/executor/fused_hash_join.go` + hook/env | grep-clean + UNITS + SPOT |
+| **P6.2** | Delete MultiHashJoin (fresh grep inventory at S7 time; ~34 arms/18 files as of 2026-08-02): node, packer (`rewriteMultiWayChain`/`collectMultiHashTables`), `mhj_input_rewrite.go`, posmaps, cost/cardinality arms, executor op (`multi_hash_join.go` 696 lines), EXPLAIN arms, `generateMultiHashJoinPath`, flags (`mhjPackingEnabled`/`GOOPG_MHJ_PACKING_OFF`) | IMPLEMENTATION-TODO P6.2; 08 §4 "MultiHashJoin" | 15+ files as above | after nightly green + grep-clean + UNITS + SPOT + DS05 |
+| **P6.3** | Delete old subset-bitmask DP + related family: `enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/`dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights, `attachUnusedCrossEdges`, `bushySeedRowCounts`, `len(tables) > 12` cap, `IsSmallDimensionSide` pinning, `chooseInnerJoinAlgo` (searched); delete subset-internal layout/remap family (`dpEntry.layout`, `remapKeyToLayout`, `mergeSubsetLayouts`); demote `joinorder.go` to over-limit sequencer. **Hold back `buildBindingsPosMap`/`applyJoinTreePosMap`** | IMPLEMENTATION-TODO P6.3; 08 §4 "Planner" / "layout/remap family" | `internal/planner/bushy.go` et al. | grep-clean + UNITS + SPOT + DS05 |
+| **P6.4** | Supersession stamps (0034-0001, 0038-0001, cost-model/09 §3 allowance, 0043/0063/0125/0126 MHJ chapters); README index status flips; ledger rows for each deliberately-skipped PG behaviour (GEQO, skew buckets, SpecialJoinInfo in-DP — `join_is_legal`-inference-dependent marker —, shared spilling builds, full join_order_restriction inference) | IMPLEMENTATION-TODO P6.4; 08 §5 | Docs + `.ralph/deferral_ledger.md` | Doc review |
 
-## 4. 依存と順序の注記
+## 4. Dependency and ordering notes
 
-- **P1.3 の A/B 証跡は P2 開始の前提**（S1 exit バー、09 §2）。
-- **P2.1/P2.2 は sibling 対**（planner キー ↔ executor key encode）、一コミット。
-- **P5 の各タスクは既定 arm の plan 差分ゼロが基本**（flag OFF で inert である
-  ことの証明）。P5.5 は snapshot 再ベースラインを同コミットで。
-- **P5.8 は P5.3 の後に**（collapse は「何が探索に入るか」を変え、enumerator
-  と coupling すると S5 の回帰が attribution 不能になる — 08 §2）。
-- **P6 は S5 既定 ON が clean nightly ≥ 1 サイクルを経てから**（08 §2 S7）。
-- **M0125 の並行残タスク**：exprwalk commits 5–8（M0125-0002）は P5.5 の
-  searched-subtree タグ付けの基盤として先行して完了させる。M0125-0047
-  （決定的タイブレーク）は P5.4 の deterministic tie-break 設計と共用のため
-  先に閉じる。M0125-0040（ROLLUP）はバンドル外の独立トラック。
+- **P1.3's A/B artefact is a prerequisite for starting P2** (S1 exit bar, 09 §2).
+- **P2.1/P2.2 are a sibling pair** (planner keys ↔ executor key encode), one commit.
+- **Each P5 task fundamentally shows zero plan diff in the default arm** (proof
+  of inertness behind flag OFF). P5.5 does a snapshot re-baseline same commit.
+- **P5.8 follows P5.3** (collapse changes *which statements enter the search*;
+  coupling it to the enumerator swap would make S5 regressions unattributable —
+  08 §2).
+- **P6 only after S5 default-ON survives ≥ 1 clean nightly cycle** (08 §2 S7).
+- **Concurrent remaining M0125 items**: exprwalk commits 5–8 (M0125-0002) must
+  complete first as the substrate for P5.5's searched-subtree tagging.
+  M0125-0047 (deterministic tie-break) must close first as it shares design
+  with P5.4's deterministic tie-break. M0125-0040 (ROLLUP) is an independent
+  track outside bundle scope.
 
-## 5. 証跡規約
+## 5. Evidence conventions
 
-- 全証跡は `analysis/leftdeep-joins/` 配下にコミット（09 §2 の命名規約）：
-  `<date>-s1-ab.txt`、`<date>-s3-spill.txt`、`<date>-s5-acceptance.txt`、
-  estimate audit（09 §5）、parity gate mismatch 記録（ratchet）。
-- タイムド測定は quiet host・サーバー年齢一定・対称タイムアウト。
-- 各段の no-go/attribution は 09 §6 の分類学（(a) cardinality /
-  (b) plan shape / (c) cost-model realism / (d) executor）に従い、
-  定数変更は class 診断なしに認めない。
+- All artefacts committed under `analysis/leftdeep-joins/` (09 §2 naming
+  convention): `<date>-s1-ab.txt`, `<date>-s3-spill.txt`,
+  `<date>-s5-acceptance.txt`, estimate audit (09 §5), parity gate mismatch
+  records (ratchet).
+- Timed measurements on quiet host, server age held constant, symmetric timeouts.
+- Each stage's no-go/attribution follows the 09 §6 taxonomy ((a) cardinality /
+  (b) plan shape / (c) cost-model realism / (d) executor); constant changes
+  are not admitted without class diagnosis.
