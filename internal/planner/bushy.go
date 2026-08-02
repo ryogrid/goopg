@@ -583,7 +583,7 @@ func SetCostDrivenJoinOrder(v bool) bool {
 // regressed Q9 cannot recur. Default ON to preserve the current
 // (non-cost-driven) planner; SetCostDrivenJoinOrder(true) should be
 // paired with SetMHJPackingEnabled(false).
-var mhjPackingEnabled = true
+var mhjPackingEnabled = false
 
 // SetMHJPackingEnabled toggles MultiHashJoin packing. Returns the
 // previous value.

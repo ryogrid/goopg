@@ -94,6 +94,8 @@ where c.c_current_addr_sk = ca.ca_address_sk
   and ca.ca_state in ('IL','TX','ME')`
 
 func TestMHJResidualInListPushedToMemberScan(t *testing.T) {
+	SetMHJPackingEnabled(true)
+	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)
 	plan := planMHJResidualQuery(t, cat, mhjResidualInListQuery)
 
@@ -161,6 +163,8 @@ func TestMHJResidualInListPushedToMemberScan(t *testing.T) {
 // with the subtree embedded) must not AND the same conjunct in twice —
 // pushConjunctIntoSubtree's exprEqual guard owns this.
 func TestMHJResidualPushIdempotent(t *testing.T) {
+	SetMHJPackingEnabled(true)
+	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)
 	plan := planMHJResidualQuery(t, cat, mhjResidualInListQuery)
 	mh := findMHJ(plan)
@@ -183,6 +187,8 @@ func TestMHJResidualPushIdempotent(t *testing.T) {
 // A conjunct spanning two member tables is not a restriction clause and
 // must stay in the residual — attribution requires a UNIQUE table.
 func TestMHJResidualCrossTableConjunctStaysPut(t *testing.T) {
+	SetMHJPackingEnabled(true)
+	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)
 	plan := planMHJResidualQuery(t, cat, `select count(*)
 from customer c, customer_address ca, customer_demographics cd
