@@ -74,9 +74,9 @@ func TestHashJoinCost_BuildIsStartup(t *testing.T) {
 	outer := Cost{Startup: 0, Total: 500}
 	inner := Cost{Startup: 0, Total: 50}
 	c := hashJoinCost(cp, outer, inner, 10000, 1000, 8000, 1)
-	// build = (0.0025*1 + 0.01)*1000 + 50 = 12.5 + 50 = 62.5; startup = 0 + 62.5
-	if !approx(c.Startup, 62.5) {
-		t.Fatalf("hashjoin startup = %v, want 62.5 (build is startup-heavy)", c.Startup)
+	// build = (0.0025+0.01)*1000 + 50 + seqPageCost*(1000/100) = 12.5 + 50 + 10 = 72.5
+	if !approx(c.Startup, 72.5) {
+		t.Fatalf("hashjoin startup = %v, want 72.5 (build is startup-heavy, +I/O pages)", c.Startup)
 	}
 	if c.Total <= c.Startup {
 		t.Fatalf("hashjoin total must exceed the build-only startup")

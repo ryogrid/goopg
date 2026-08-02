@@ -104,6 +104,17 @@ func costSortRun(cp costParams, inputRows float64) Cost {
 func hashJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows float64, numHashClauses int) Cost {
 	// Build: read + hash every inner row, all before the first probe.
 	build := (cp.cpuOperatorCost*float64(numHashClauses)+cp.cpuTupleCost)*innerRows + inner.Total
+
+	// M0126-0013: add I/O cost proportional to the hash table's
+	// memory footprint. PG charges inner_pages * seq_page_cost
+	// (costsize.c:4166) for the pages the hash table occupies.
+	// This is the mechanism that penalises plans which build on
+	// large intermediate results — without it, building a hash
+	// table on 6M rows costs the same per row as building on 25.
+	const rowsPerPage = 100.0
+	hashPages := innerRows / rowsPerPage
+	build += cp.seqPageCost * hashPages
+
 	startup := outer.Startup + build
 	// Probe: hash each outer key and walk its bucket; emit each match.
 	probe := cp.cpuOperatorCost*float64(numHashClauses)*outerRows + cp.cpuTupleCost*outputRows
