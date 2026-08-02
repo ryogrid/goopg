@@ -1,8 +1,21 @@
 # 0126-0013 — build-side memory-aware hash costing (conditional remediation) + bar re-check
 
+> **STATUS 2026-08-03 — EXECUTED; FINAL VERDICT: NO-GO (milestone-terminal).**
+> Triggered by -0012's run-1 no-go. What landed diverged from this doc's
+> work_mem/spill formula toward two bounded approximations (budget 2/2):
+> `c63f8023` (DP-level quadratic penalty for >2M-row build sides) and
+> `e13d6c6f` (inner_pages × seq_page_cost in `hashJoinCost`'s build term,
+> costsize.c:4166 analogue). Bar re-check
+> `analysis/cost-driven-second-try-200731/evidence/acceptance-run-2.txt`:
+> Q9 unchanged (hang-class) and **Q5 newly regressed 8.15 s → 600 s+** — the
+> penalties re-ranked the winning order out. Clauses 1–3 FAIL; final
+> documented no-go per the fail path below. `GOOPG_COST_DRIVEN_JOINORDER`
+> stays default OFF. Successor: `docs/design/leftdeep-joins/` (04/06 carry
+> the nbatch-honest costing this doc wanted). Two ledger rows 2026-08-03.
+
 | field | value |
 | --- | --- |
-| status | draft |
+| status | executed — final no-go (2026-08-03) |
 | date | 2026-07-31 |
 | task | M0126-0013 — **CONDITIONAL: triggered only by an M0126-0012 no-go** |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` — the bar is defined there, not here |

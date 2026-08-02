@@ -1,0 +1,63 @@
+# M0126-0008 — Cost-driven order re-validation with symmetric timeouts
+#
+# HEAD: 0a2e7cb1 (default) + d3468aa1 (Q14 evidence)
+# Binary: tmp/goopg-fusion-ab-bin
+# TPC-H SF=1 cluster: 65433
+# Env: GOGC=off GOMEMLIMIT=12GiB (per env_goopg.sh)
+# Timeout: 600s both arms (SYMMETRIC)
+#
+# query         | default  | cost-driven | ratio  | verdict
+# --------------|----------|-------------|--------|--------
+  Q1              7.12       6.19          0.87x   OK
+  Q2              2.52       2.70          1.07x   OK
+  Q3              9.27       7.44          0.80x   OK
+  Q4             36.44      36.89          1.01x   OK
+  Q5             56.98       8.08          0.14x   WIN (7.1x faster) ✅
+  Q6              3.52       3.22          0.91x   OK
+  Q7             27.47      49.62          1.81x   REGRESSION
+  Q8              6.97       6.49          0.93x   OK
+  Q9             58.83  30+ min (killed)   30x+    PATHOLOGICAL REGRESSION ❌
+  Q10             6.52      12.53          1.92x   REGRESSION
+  Q11             1.40       2.18          1.56x   REGRESSION
+  Q12            13.25      13.46          1.02x   OK
+  Q13            10.46      10.79          1.03x   OK
+  Q14             3.60       3.71          1.03x   OK
+  Q15-CREATEVIEW  0.01       0.01          1.00x   OK
+  Q15a-VIEWBODY   3.89       3.98          1.02x   OK
+  Q15b-MAIN      34.15      34.30          1.00x   OK
+  Q16             0.97       1.01          1.04x   OK
+  Q17            20.38      20.98          1.03x   OK
+  Q18            29.43      36.66          1.25x   REGRESSION (mild)
+  Q19             6.17       6.15          1.00x   OK
+  Q20            17.39      17.06          0.98x   OK
+  Q21           138.46     189.88          1.37x   REGRESSION
+  Q22            11.94      11.49          0.96x   OK
+
+# All row counts match — no correctness regression.
+
+# Summary:
+#   WIN:       Q5 (7.1x faster — prior HANG was asymmetry artifact, REFUTED)
+#   OK (ratio 0.80-1.10):  15 of 24 query-steps (Q1-Q4, Q6, Q8, Q12-Q17, Q19, Q20, Q22)
+#   REGRESSION (1.10-2.0x): Q7 (1.81x), Q10 (1.92x), Q11 (1.56x), Q18 (1.25x), Q21 (1.37x)
+#   PATHOLOGICAL:           Q9 (30x+, killed at 30 min)
+#
+# Total wall-clock (excl Q9):
+#   default:      448s (507s - 59s Q9)
+#   cost-driven:  485s (Q1-8 + Q10-22, excl Q9)
+#   net: +8% slower even without Q9
+#
+# Total wall-clock (incl Q9 @30min):
+#   default:      507s
+#   cost-driven:  ~2285s (4.5x worse, dominated by Q9)
+#
+# Verdict:
+#   Q5's prior HANG was a 600s-vs-300s asymmetry artifact — REFUTED (7x faster now).
+#   Q9's timeout is CONFIRMED as a real cost-driven pathology (30x+) — NOT an artifact.
+#   Q7, Q10, Q11, Q18, Q21 are mild-to-moderate regressions (1.25x–1.92x).
+#   Even with Q9 excluded, cost-driven is +8% slower in aggregate.
+#   Q9 is the blocker — cost-driven is UNUSABLE until Q9 is fixed.
+#
+# FORK result: bar-clause failures present (Q7, Q9, Q10, Q11, Q18, Q21).
+# → M0126-0009 (order-failure attribution) and M0126-0010 (cardinality fixes) are IN.
+# → Q9 MUST be the first target for attribution per -0009.
+# → New regressions Q10 (1.92x) and Q11 (1.56x) also need investigation.

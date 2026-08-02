@@ -1025,6 +1025,47 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       (AI-20260725-011243-003/-005/-006/-007). **Stale — all 4 PASS at HEAD**
       (`e7d9b88e`: 0.66 s / 20.27 s / 1.92 s / 1.15 s, one run each). Same
       pre-merge-tip explanation as the executor items. No new work.
+- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED** — the root-0030
+      fix (checked item above) did not hold: FAILed in nightly runs 20260801
+      and `20260802-014405` (AI-20260802-014405-001; repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
+      evidence `ci/logs/20260802-014405/testport/go-test.log`).
+      **VERIFIED FAILING AT HEAD `e13d6c6f` in isolation (2026-08-02 loop #31,
+      21 s)** — not a co-load flake. The diff is DIFFERENT from root-0030's:
+      around L1027 the expected `step partiallock_ext: <... completed>` marker
+      is missing and output is one line short (1467 vs 1468) — goopg did NOT
+      BLOCK on `partiallock_ext` where PG blocks (the step completed
+      immediately instead of waiting). First failure night (20260801) is the
+      nightly at/after the M0126-0003 slot-path re-land (`d197365c`) — bisect
+      candidates: `5c1c0e21` (0a VirtualSlot fast path), `d197365c` (0b re-land).
+      FILED, NOT SELECTED per the 2026-07-28(b) amendment.
+- [ ] **regress/{btree_index,char,delete,int2,int4,int8,limit,numerology,
+      portals_p2,prepare,select,select_into,text,union,varchar} — 15 baseline-pass
+      cases diverged in ONE night, all "output mismatch; normalization rules
+      need extension"** (AI-20260802-014405-002..-016, all first-seen 20260802;
+      evidence `ci/logs/20260802-014405/testport/go-test.log`). **Six sampled
+      cases (btree_index, char, int2, select, text, union) PASS in ISOLATION at
+      HEAD `e13d6c6f` (2026-08-02 loop #31, 3.2 s total)** — so this is almost
+      certainly the known phantom-divergence-after-cluster-restart pattern
+      (cf. the closed "19 phantom regressions from ONE wedged cluster" item),
+      downstream of the suite-wedge item below, NOT 15 real regressions.
+      Subjects limit/numerology/portals_p2/select overlap the older parked
+      suite-ordering task above — do not double-work them. Triage the wedge
+      first; only if a case still diverges in a wedge-free full-suite run does
+      it become real. FILED, NOT SELECTED per the 2026-07-28(b) amendment.
+- [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
+      timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
+      (AI-20260802-014405-017, first-seen 20260802; repro:
+      `go test -v -run 'TestPort_RegressSuite/aggregates' ./internal/testport/`;
+      evidence `ci/logs/20260802-014405/testport/go-test.log`). Output truncated
+      ⇒ NOT an output divergence — investigate what wedged the cluster at
+      `aggregates` (orphaned backend holding locks, or GC-thrashing server).
+      Likely the ROOT CAUSE of the 15 phantom divergences above (same night).
+      Note the nightly ran while the interactive M0126 acceptance measurement
+      held the host (armB Q9 600 s timeout ~16:27 JST — but the nightly ran at
+      01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
+      check the run's launch window against host state first). FILED, NOT
+      SELECTED per the 2026-07-28(b) amendment.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -3694,7 +3735,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
 - [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
       cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
-      evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4). Q21 exceeds every
+      evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4; nightly keeps
+      confirming: `tpch/Q21-timeout` AI-20260802-014405-018, also failed the
+      previous run — same subject, no separate M-NIGHTLY task). Q21 exceeds every
       budget in **all four** §D5.1 arms — S-cold/off 612 s, S-cold/stage-2 672 s,
       WARM/off 381 s, WARM/stage-2 384 s (300 s cap) — with peak RSS 14.4 GB,
       i.e. it pins the 15 GB cgroup ceiling. Both cardinality inputs are therefore
@@ -4592,6 +4635,19 @@ specs.
 the M-NIGHTLY backlog and above M0123. See the amended Current Priority banner.
 Not selected while any M0125 item is open.
 
+**⚑ MILESTONE TERMINAL 2026-08-03 (loop #31) — COMPLETE AS DOCUMENTED NO-GO.**
+All 13 tasks are closed. `GOOPG_COST_DRIVEN_JOINORDER` remains DEFAULT OFF:
+acceptance run 1 (`evidence/acceptance-run-1.txt`) failed clauses 1–3 on Q9
+alone and triggered -0013; the -0013 remediation (2 commits) did not fix Q9
+and newly regressed Q5 into hang-class, so run 2
+(`evidence/acceptance-run-2.txt`) is the milestone's final documented no-go —
+per the acceptance-bar paragraph above, a measured no-go is a successful
+completion. What ships ON by default from this milestone: MHJ retirement
+(-0011, `mhjPackingEnabled=false`), the estimateJoin max(l,r) fallback cap
+(-0010), and the Stage-0 executor de-materialisation (-0003). Fusion (KS1) is
+permanently off (-0007, DS05 correctness). Successor design:
+`docs/design/leftdeep-joins/` (user-directed, 2026-08-02).
+
 **Read before picking any task here.** (1) Dropping MultiHashJoin is not a
 neutral refactor: `docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md:189-196`
 records Q5/Q21 HANG, Q9 timeout, Q10 11.4×, Q18 4.3×, Q7 1.9× — and Q2 18.8× /
@@ -4673,7 +4729,14 @@ bar).
       any cost-model change.
       Bar: UNITS + SMOKE + SPOT + PLAN (ZERO diffs — any diff is a failure) +
       DS05.
-- [ ] **M0126-0004 — Legacy `Build`-path slot chaining.** **CONDITIONAL on
+- [x] **M0126-0004 — Legacy `Build`-path slot chaining.** **CLOSED 2026-08-03
+      without implementation — deferred 2026-08-01 (loop #25 ledger row: deep
+      nextLazy rewrite judged too fragile after 0b's Q12=0 scare), then
+      ABSORBED by the `docs/design/leftdeep-joins/` bundle (05-executor-
+      pipeline-rework carries the slot-chaining work as part of the probe-seam
+      de-materialisation; the milestone is terminal per -0013's final no-go,
+      so no further M0126 measurement depends on it).** Original filing:
+      **CONDITIONAL on
       -0003's interim A/B showing the legacy path still carries bench
       traffic** (the decider is -0003 alone — -0005 runs after this task) (expected IN: `buildRec` migrates no `Aggregate`, so every
       aggregate-topped TPC-H star runs its joins under legacy `Build` — bundle
@@ -4688,7 +4751,7 @@ bar).
       Acceptance: chaining + fan-out test landed, or the measured-unnecessary
       close with its ledger row.
       Bar: UNITS + SMOKE + SPOT + PLAN (zero diffs) + DS05.
-- [ ] **M0126-0005 — Stage 0 A/B + fusion go/no-go decision.** No code. TPC-H
+- [x] **M0126-0005 — Stage 0 A/B + fusion go/no-go decision.** No code. TPC-H
       SF1 A/B (65433) with/without -0003(+-0004), **`mhjPackingEnabled` forced
       off** (`SetMHJPackingEnabled`, `bushy.go:582-587`), matched server age /
       GOGC / GOMEMLIMIT, plus an MHJ-on reference arm →
@@ -4702,7 +4765,7 @@ bar).
       Acceptance: evidence file committed with per-query times, HEAD SHA, env,
       and the written decision; an unwritten decision is an incomplete task.
       Bar: SPOT per arm + DS05 at the measurement HEAD.
-- [ ] **M0126-0006 — Fusion scaffolding + differential harness (switch OFF).**
+- [x] **M0126-0006 — Fusion scaffolding + differential harness (switch OFF).**
       **CONDITIONAL on M0126-0005** ("a large gap remains"). `buildEnv`
       threading through `Build`/`buildRec` (root, `inWorker` from
       `newGatherOp`'s closure `executor.go:213-219`, under-instrumentation flag
@@ -4721,7 +4784,15 @@ bar).
       gate is bit-identical to the pre-task run (no-op in production by
       construction).
       Bar: UNITS + SMOKE + SPOT + PLAN + DS05 (all bit-identical) + DIFF.
-- [ ] **M0126-0007 — Fusion enablement and measurement.** **CONDITIONAL on
+- [x] **M0126-0007 — Fusion enablement and measurement.** **DONE 2026-08-02 —
+      `evidence/stage2-fusion-verdict.txt`: KS1 PERMANENTLY OFF** (DS05 Q14
+      returns 100 rows vs oracle 200 with fusion ON — correctness delta, KS1
+      flips off without debate per bundle 10 §4; fusion code stays in-tree,
+      never enabled; "leave the switch off permanently" is a recorded
+      completion per the task spec). Root-cause hypothesis (fused-cascade
+      duplicate-elimination/key-collision) recorded in the verdict file; the
+      leftdeep-joins bundle makes `fusedHashJoinOp` deletable (S7 inventory).
+      Original filing: **CONDITIONAL on
       M0126-0006.** No new code: KS1 on in the measurement environment only.
       **F12 trap: force `SetMHJPackingEnabled(false)` for every measurement —
       never via `GOOPG_COST_DRIVEN_JOINORDER=1`, which conflates order into the
@@ -4736,8 +4807,13 @@ bar).
       Acceptance: matrix complete with zero correctness deltas, and either a
       measured win exceeding Stage 0's or the recorded off-permanently verdict.
       Bar: DIFF + DS05 + SPOT + low-work_mem run + SF1 A/B + SMOKE.
-- [ ] **M0126-0008 — Cost-driven order re-validation with symmetric
-      timeouts.** The 2026-07-24 A/B pair used 600 s vs 300 s and is invalid as
+- [x] **M0126-0008 — Cost-driven order re-validation with symmetric
+      timeouts.** **DONE 2026-08-02 — `evidence/stage3-order-ab.txt`.** 600 s
+      symmetric, 65433, fresh servers. Q5 prior HANG **REFUTED as asymmetry
+      artifact** (7.1× WIN, 8.08 s); Q9 PATHOLOGICAL (30 min+, killed);
+      regressions Q7 1.81× / Q10 1.92× / Q11 1.56× / Q18 1.25× / Q21 1.37×;
+      row counts all match. Fork ENTERED → -0009/-0010.
+      Original filing: The 2026-07-24 A/B pair used 600 s vs 300 s and is invalid as
       a comparison. Re-run `GOOPG_COST_DRIVEN_JOINORDER=1` vs default at
       post-Stage-0 HEAD, SAME timeout both arms, matched fresh servers, →
       `evidence/stage3-order-ab.txt` with the per-query table
@@ -4749,7 +4825,13 @@ bar).
       Design `docs/design/0126-0008-cost-driven-order-symmetric-revalidation.md`.
       Acceptance: evidence file with clause-by-clause verdicts, not narrative.
       Bar: SPOT per arm + DS05 at measurement HEAD.
-- [ ] **M0126-0009 — Order-failure attribution (diagnosis only, bounded).**
+- [x] **M0126-0009 — Order-failure attribution (diagnosis only, bounded).**
+      **DONE 2026-08-02 — `evidence/order-attribution-{summary.md,Q9.txt,
+      residuals.txt,ds05-sampling.txt}`.** All regressions attributed
+      class-(a) cardinality (FK-chain ndistinct-product explosion; Q9 the
+      demonstrator: 5.9e15 estimate), routed to -0010. (-0012's run-1 later
+      RE-classified Q9's surviving residual as class-(c) build-side memory,
+      which triggered -0013 — both classifications are on record.)
       **CONDITIONAL: -0008 leaves ≥1 query failing.** Per failing query: ONE
       attribution pass, ≤2 measured probes, `EXPLAIN ANALYZE` both arms, verdict
       naming exactly one of — (a) cardinality estimate (cost-model 14's §2-§5
@@ -4763,7 +4845,11 @@ bar).
       Acceptance: one `evidence/order-attribution-Q<N>.txt` per failing query +
       a summary table (query → class → routing).
       Bar: evidence committed; SPOT hygiene after probe servers.
-- [ ] **M0126-0010 — Bounded order-quality / cardinality fixes.**
+- [x] **M0126-0010 — Bounded order-quality / cardinality fixes.**
+      **DONE 2026-08-02 — commit `be1f88d5`** (cap estimateJoin fallback at
+      max(l,r), preventing the FK-chain explosion; 1 landed commit of the
+      4-commit budget; STOP taken at -0012's measurement). Q9 not rescued by
+      cardinality alone (see -0012/-0013).
       **CONDITIONAL: -0009 produced ≥1 class-(a)/(b) attribution.** ≤1 fix per
       query, its own commit, A/B'd on its own query AND the full 22, reverted
       if it does not move its own query. HARD PROHIBITIONS (07 §6 / doc 15): no
@@ -4777,8 +4863,10 @@ bar).
       their measurements under `evidence/`.
       Bar: UNITS + SMOKE + SPOT + PLAN (cost-driven-arm diffs hand-reviewed) +
       DS05 + per-query timed A/B, per commit.
-- [ ] **M0126-0011 — Retire `MultiHashJoin` as a plan node (default off, code
-      retained).** **UNCONDITIONAL (sequencing-gated: -0005 decided and -0007
+- [x] **M0126-0011 — Retire `MultiHashJoin` as a plan node (default off, code
+      retained).** **DONE 2026-08-02 — commit `e85e5347`** (`mhjPackingEnabled`
+      default → false; MHJ code retained and reachable via
+      `SetMHJPackingEnabled`; SPOTCHECK PASS). **UNCONDITIONAL (sequencing-gated: -0005 decided and -0007
       green/declined/skipped — both resolve on every path); the bundle's
       "packing queries no longer regress" precondition is demoted to a
       REPORTING obligation (record any residual regression's magnitude; it
@@ -4800,7 +4888,12 @@ bar).
       baseline captured; MHJ code still reachable; the pathgen decision written.
       Bar: UNITS + SMOKE + SPOT + DS05 + PLAN (hand review) + full TPC-H SF1
       sweep vs `sf1-r5-default-cb37d166.txt` and the -0005 prediction.
-- [ ] **M0126-0012 — Acceptance measurement + conditional default flip.**
+- [x] **M0126-0012 — Acceptance measurement + conditional default flip.**
+      **DONE 2026-08-02 — `evidence/acceptance-run-1.txt`: documented NO-GO,
+      TRIGGERED -0013.** Clauses 1–3 FAIL on Q9 alone (600 s+ vs 52.18 s
+      baseline, 11.5×; 21/22 pass everything); clause 4 deferred as moot.
+      Q9's residual re-classified class-(c) build-side memory. No flip;
+      cost-driven stays default-off.
       Terminal fork, AFTER -0011. Measure ALL FOUR bar clauses at final HEAD vs
       R0 (protocol = -0008's: symmetric timeouts, quiet host, matched fresh
       servers) → `evidence/acceptance-run-1.txt`, clause-by-clause. **Bar met →
@@ -4816,9 +4909,24 @@ bar).
       flip commit or the no-go document.
       Bar: full timed TPC-H SF1 acceptance run + DS05 (zero deltas) + SPOT +
       PLAN re-snapshot with hand review + UNITS + SMOKE.
-- [ ] **M0126-0013 — Build-side memory-aware hash costing (conditional
+- [x] **M0126-0013 — Build-side memory-aware hash costing (conditional
       remediation, filed by the USER 2026-07-31) + bar re-check.**
-      **CONDITIONAL: fires ONLY on an -0012 no-go.** The Q5/Q9/Q21 HANGs are
+      **DONE 2026-08-03 (loop #31) — FINAL NO-GO, milestone-terminal.**
+      Both budget commits landed 2026-08-02 (`c63f8023` DP large-build
+      penalty >2M rows; `e13d6c6f` inner_pages I/O charge in hashJoinCost;
+      SPOTCHECK PASS both, default-arm plans unchanged). Bar re-check
+      `evidence/acceptance-run-2.txt` (per -0012's protocol, deviations
+      recorded in-file): **Q9 UNCHANGED at hang-class AND Q5 NEWLY
+      REGRESSED 8.15 s → 600 s+** — the penalties re-ranked the winning
+      Q5 order out (the DP now routes the 6M-row lineitem⋈orders
+      intermediate through two probe passes to dodge build charges).
+      Run 2 strictly worse than run 1 (2 timeouts vs 1); clauses 1–3 FAIL,
+      clause 4 moot. `GOOPG_COST_DRIVEN_JOINORDER` remains DEFAULT OFF.
+      Arm A' control: 22/22 in 589.0 s, canonical row counts. Successor:
+      `docs/design/leftdeep-joins/` (join-search restructure; absorbs the
+      Q9 enumeration blocker). Two ledger rows 2026-08-03 (revert-or-keep
+      of the two -0013 commits; uncancellable cost-driven joins).
+      Original filing: **CONDITIONAL: fires ONLY on an -0012 no-go.** The Q5/Q9/Q21 HANGs are
       not a duration problem — the planner has NO work_mem/hash_mem analogue
       and picks enormous build sides unpenalised (`hashJoinCost`,
       `internal/planner/cost_funcs.go:100-112`, omits batching by its own

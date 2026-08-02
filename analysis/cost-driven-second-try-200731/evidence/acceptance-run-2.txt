@@ -1,0 +1,107 @@
+# M0126-0013 — Acceptance measurement run 2 (post-remediation bar re-check)
+#
+# Protocol: -0012's, unchanged in intent: symmetric 600s timeouts, quiet host,
+#           matched fresh servers, GOGC=off GOMEMLIMIT=12GiB MemoryHigh=14G,
+#           runner cmd/tpch-runner (db tpch, user tpch, port 65433).
+# HEAD: e13d6c6f (= run-1 HEAD e85e5347 + M0126-0013 attempt 1 c63f8023
+#       [DP large-build penalty >2M rows] + attempt 2 e13d6c6f
+#       [inner_pages*seq_page_cost in hashJoinCost build term])
+# Binary: tmp/goopg-run2-bin (built from e13d6c6f)
+# Measured: 2026-08-02 22:42 – 2026-08-03 00:22 JST (loop #31)
+#
+# PROTOCOL DEVIATIONS (recorded, with why):
+# 1. Arm B ran per-query (one runner invocation per query) instead of one
+#    stream: cost-driven Q5 ignored both the runner's 600s context-cancel AND
+#    an explicit CancelRequest (server logged "cancel request handled" at
+#    23:06:58, query kept executing at 241% CPU / 11.1GB RSS for 50+ min until
+#    SIGKILL). A single stream therefore cannot advance past an uncancellable
+#    query. After each hang the server was SIGKILLed and restarted (restarts=3
+#    total: initial + after Q5 + after Q9), so Q6 and Q10 ran on a
+#    freshly-restarted (cold) server — their small deltas vs run-1 are not
+#    bar-relevant.
+# 2. Host carried the standing TPC-DS SF0.5 server at 12.4GB RSS during BOTH
+#    arms (it was absent during run-1). Control: Arm A' (default) still
+#    completed 22/22 in 589.0s vs run-1 Arm A 609s (-3%), so host pressure
+#    does not explain a >73x Q5 regression in Arm B.
+
+## Arm A' (integer default, MHJ=OFF, cost-driven=OFF) — 22/22 complete, 589.0s
+
+Q1 6.84  Q2 2.82  Q3 33.10  Q4 34.38  Q5 55.74  Q6 3.21  Q7 37.26  Q8 6.53
+Q9 49.94  Q10 22.13  Q11 1.60  Q12 13.25  Q13 10.23  Q14 3.39
+Q15-CREATEVIEW 0.01  Q15a-VIEWBODY 3.62  Q15b-MAIN 33.41  Q16 0.94
+Q17 20.09  Q18 76.58  Q19 6.00  Q20 17.42  Q21 139.28  Q22 11.25
+(row counts all canonical: Q9=175, Q12=2, Q13=35, Q21=405)
+
+## Arm B' (cost-driven=ON) — 20/22 complete; Q5 AND Q9 hang-class
+
+query           | run-1 B  | run-2 B'  | delta      | note
+----------------|----------|-----------|------------|-----------------------------
+Q1                6.34       7.00       +0.66
+Q2                2.88       2.71       -0.17
+Q3                7.44       7.08       -0.36
+Q4               35.66      35.94       +0.28
+Q5                8.15     600+ ❌      **NEW FAIL** | was the 6x WIN; killed by -0013
+Q6                3.34       5.54       +2.20       | post-restart cold server
+Q7               49.58      49.21       -0.37
+Q8                6.55       6.56       +0.01
+Q9              600+       600+         unchanged   | -0013's own target, NOT fixed
+Q10               6.82      10.70       +3.88       | post-restart cold server
+Q11               1.79       1.83       +0.04
+Q12              13.85      13.53       -0.32
+Q13              10.59      10.35       -0.24
+Q14               3.59       3.46       -0.13
+Q15-CREATEVIEW    0.01       0.01        0
+Q15a-VIEWBODY     3.98       3.90       -0.08
+Q15b-MAIN        34.28      33.31       -0.97
+Q16               1.04       0.96       -0.08
+Q17              20.59      20.50       -0.09
+Q18              36.69      36.60       -0.09
+Q19               6.36       5.66       -0.70
+Q20              17.24      17.02       -0.22
+Q21             186.56     186.85       +0.29
+Q22              11.38      11.27       -0.11
+
+Arm B' total (Q5,Q9 @600s): ~1670s   (run-1: ~1075s with one 600s failure)
+Arm B' total excl Q5/Q9:     ~470.0s (run-1 excl Q9: ~475s — flat)
+
+## Q5 regression mechanism (-0013 self-inflicted)
+
+Cost-driven Q5 EXPLAIN at this HEAD (captured post-run, byte-stable across two
+probes): top HashJoin probes the FULL 6M-row (lineitem ⋈ orders) intermediate
+against the 37.5K dim tree — i.e. all 6M rows cross TWO binary hash-join
+operators. At the profiled ~117µs/row binary-HJ cost (see memory/evidence for
+Q9, 02-premise-audit) that is ~700s — consistent with the >600s hang. Run-1's
+8.15s winner joined the selective dim tree BEFORE expanding to the full
+lineitem stream. Attempt 1's >2M-row DP build penalty + attempt 2's
+inner_pages I/O charge re-ranked exactly that winning order out: the 6M-row
+intermediate is now preferred as PROBE side (penalties charge builds, not
+probes), so the DP dodges large builds by routing the large stream through
+extra probe passes — the pathology the penalty was meant to prevent, relocated.
+
+## Bar clause judgment (baseline = min(R0 493.31s, Arm A' 589.0s) = R0)
+
+1. 22/22 complete, zero hang/OOM/timeout  → **FAIL** (Q5, Q9 — TWO timeouts;
+   run-1 had one)
+2. Total ≤ +20% of baseline (591.97s)     → **FAIL** (~1670s)
+3. No single query > 2× per-query baseline → **FAIL**
+   (Q5 ≥12.4× min(48.53,55.74); Q9 ≥12.0× min(85.46,49.94))
+4. TPC-DS SF0.5 zero deltas               → NOT RUN (clauses 1–3 already fail;
+   same deferral as run-1)
+
+## Verdict: FINAL NO-GO (milestone-terminal, per -0013's fail path)
+
+The -0013 remediation did not fix its target (Q9 unchanged at hang-class) and
+newly destroyed the bundle's best win (Q5 8.15s → 600+). Run 2 is strictly
+worse than run 1: 2 hang-class queries vs 1. GOOPG_COST_DRIVEN_JOINORDER
+remains DEFAULT OFF. Default-arm safety is proven independently: Arm A'
+22/22 in 589.0s with canonical row counts, spotcheck green on both -0013
+commits.
+
+Follow-ups filed (see deferral ledger 2026-08-03):
+- consider reverting c63f8023 + e13d6c6f (flag-gated only, but they make the
+  experimental arm strictly worse; keeping them poisons any future cost-driven
+  measurement baseline);
+- cost-driven Q5/Q9 are UNCANCELLABLE (CancelRequest handled but the executing
+  join loop has no cancel point) — engine defect, independent of the planner;
+- Q9's real fix remains join-enumeration / fusion-integration work
+  (docs/design/leftdeep-joins/, docs/design/cost-model/15).

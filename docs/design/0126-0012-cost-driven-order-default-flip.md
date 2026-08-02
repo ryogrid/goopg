@@ -1,8 +1,16 @@
 # 0126-0012 — acceptance measurement and the conditional default flip
 
+> **STATUS 2026-08-03 — EXECUTED; OUTCOME: DOCUMENTED NO-GO (run 1), CONFIRMED
+> BY -0013's RE-CHECK (run 2).** Run 1
+> (`analysis/cost-driven-second-try-200731/evidence/acceptance-run-1.txt`,
+> HEAD e85e5347) failed clauses 1–3 on Q9 alone → triggered -0013. Run 2
+> (`evidence/acceptance-run-2.txt`, HEAD e13d6c6f) is strictly worse (Q5 also
+> hang-class) and is the milestone's FINAL no-go. No flip;
+> `GOOPG_COST_DRIVEN_JOINORDER` remains default OFF.
+
 | field | value |
 | --- | --- |
-| status | draft |
+| status | executed — documented no-go (2026-08-03) |
 | date | 2026-07-31 |
 | task | M0126-0012 — terminal task; **flip-or-documented-no-go, by construction** |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` — §"The acceptance bar" is normative and is NOT restated here |

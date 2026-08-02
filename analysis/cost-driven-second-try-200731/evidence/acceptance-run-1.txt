@@ -1,0 +1,81 @@
+# M0126-0012 — Acceptance measurement run 1
+#
+# Protocol: symmetric 600s timeouts, quiet host, matched fresh servers
+# HEAD: e85e5347 (M0126-0011 MHJ retired) + be1f88d5 (M0126-0010 cap fix)
+# Binary: tmp/goopg-m01211-mhjoff-bin
+# Measured: 2026-08-02
+
+## Baselines
+
+R0 (integer, MHJ=ON, captured before M0126 bundle):
+  HEAD: 0459be86
+  Total: 493.31s, 22/22 complete
+
+Arm A (integer, MHJ=OFF, final HEAD, cost-driven=OFF):
+  HEAD: e85e5347
+  Total: ~609s, 22/22 complete
+
+## Arm B (cost-driven, MHJ=OFF, final HEAD, cost-driven=ON)
+  HEAD: e85e5347
+  Q9: TIMEOUT (killed at 10+ min)
+
+## Per-query comparison
+
+query           | R0       | Arm A    | Arm B (cd) | baseline | B/baseline | bar(2x)?
+----------------|----------|----------|------------|----------|------------|--------
+Q1                6.59       6.95       6.34        6.59      0.96        PASS
+Q2                2.42       2.96       2.88        2.42      1.19        PASS
+Q3                8.46      32.46       7.44        8.46      0.88        PASS WIN
+Q4               32.90      35.14      35.66       32.90      1.08        PASS
+Q5               48.53      56.26       8.15       48.53      0.17        PASS WIN (6x)
+Q6                3.22       3.63       3.34        3.22      1.04        PASS
+Q7               25.13      41.91      49.58       25.13      1.97        PASS (barely)
+Q8                5.99       7.21       6.55        5.99      1.09        PASS
+Q9               85.46      52.18      600+        52.18     11.50×      **FAIL** ❌
+Q10               6.04      22.81       6.82        6.04      1.13        PASS
+Q11               1.40       1.62       1.79        1.40      1.28        PASS
+Q12              12.30      13.83      13.85       12.30      1.13        PASS
+Q13               9.70      10.36      10.59        9.70      1.09        PASS
+Q14               3.31       3.44       3.59        3.31      1.08        PASS
+Q15-CREATEVIEW    0.01       0.02       0.01        0.01      1.00        PASS
+Q15a-VIEWBODY     3.58       3.91       3.98        3.58      1.11        PASS
+Q15b-MAIN        32.95      34.89      34.28       32.95      1.04        PASS
+Q16               0.91       1.00       1.04        0.91      1.14        PASS
+Q17              19.57      20.82      20.59       19.57      1.05        PASS
+Q18              27.58      79.26      36.69       27.58      1.33        PASS
+Q19               5.14       6.14       6.36        5.14      1.24        PASS
+Q20              16.54      17.54      17.24       16.54      1.04        PASS
+Q21             125.01     143.49     186.56      125.01      1.49        PASS
+Q22              10.57      11.40      11.38       10.57      1.08        PASS
+
+baseline = min(R0, Arm A)
+Arm B total (Q9@600s): ~1075s
+Arm B total (excl Q9):  ~475s  ← would pass the +20% bar (591.97s)
+
+## Bar clause judgment
+
+1. **22/22 complete, zero hang/OOM/timeout** → **FAIL**
+   Q9: TIMEOUT (killed after 10+ min under cost-driven).
+   21/22 complete; Q9 is the sole failure.
+
+2. **Total wall time ≤ +20% of min(R0, Arm A)** → **FAIL**
+   Baseline (R0): 493.31s. Bar: 591.97s.
+   Arm B: ~1075s (dominated by Q9).
+   Without Q9: ~475s — WOULD PASS.
+
+3. **No single query > 2× baseline** → **FAIL**
+   21/22 queries pass. Q9: 11.5× baseline — sole failure.
+   Q7 is close (1.97×) but passes.
+
+4. **TPC-DS SF0.5 gate zero regressions** → NOT YET RUN
+   Deferred — clauses 1-3 already fail.
+
+## Verdict: NO-GO
+
+All three measured bar clauses fail due to a single query: Q9.
+21/22 queries pass all clauses. Q9's cost-driven plan is pathological:
+the DP picks a small-dimension-first join order that builds three
+consecutive 6M-row intermediate hash tables, each taking minutes.
+This is class-(c) build-side memory not modeled.
+
+→ **TRIGGERS M0126-0013**: Build-side memory-aware hash costing.
