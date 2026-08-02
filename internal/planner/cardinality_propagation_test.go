@@ -179,3 +179,85 @@ func TestEstimateRowsPropagatesAboveWrappedChain(t *testing.T) {
 		t.Fatalf("Aggregate over Gather over Join: EstimateRows = %d, want > 0", got)
 	}
 }
+
+// TestEstimateJoinCapFallback pins M0126-0010: when NDistinct is
+// unavailable for both join keys and the estimator falls back to
+// l·r·0.005, the result must not exceed max(l, r) — the FK-PK
+// invariant that a non-cross equi-join never fans out past the
+// larger input.
+func TestEstimateJoinCapFallback(t *testing.T) {
+	// Two tables without stats — keyNDistinct returns 0 for both.
+	noStats := &SeqScan{Table: &catalog.Table{Name: "t", Columns: []catalog.Column{{Name: "c"}}}}
+	large := &SeqScan{Table: &catalog.Table{
+		Name:    "large",
+		Columns: []catalog.Column{{Name: "c"}},
+		Stats:   &catalog.TableStats{RowCount: 6000000, Columns: []catalog.ColumnStats{{NDistinct: -1}}},
+	}}
+
+	// Case 1: Join with no stats on either side → fallback to
+	// l·r·0.005 capped at max(l,r).
+	j1 := &Join{
+		Type: JoinTypeInner, Algo: JoinAlgoHash,
+		Left: noStats, Right: noStats,
+		LeftKey:  &ColumnRef{Index: 0, Name: "k"},
+		RightKey: &ColumnRef{Index: 0, Name: "k"},
+	}
+	got1 := EstimateRows(j1)
+	// l=0, r=0 → EstimateRows returns 0. The cap doesn't fire.
+	if got1 != 0 {
+		t.Errorf("no-stats join: EstimateRows = %d, want 0 (zero inputs)", got1)
+	}
+
+	// Case 2: One side has NDistinct=-1 (stats available but unknown
+	// ndistinct), both sides have row count. The formula uses the
+	// non-negative ndistinct (0 from the left, 0 from the right since
+	// NDistinct=-1 is not > 0). Fallback: l·r·0.005, then cap.
+	j2 := &Join{
+		Type: JoinTypeInner, Algo: JoinAlgoHash,
+		Left: large, Right: noStats,
+		LeftKey:  &ColumnRef{Index: 0, Name: "k"},
+		RightKey: &ColumnRef{Index: 0, Name: "k"},
+	}
+	got2 := EstimateRows(j2)
+	// l=6M, r=0 → EstimateRows returns 0 (r <= 0).
+	if got2 != 0 {
+		t.Errorf("zero-right join: EstimateRows = %d, want 0", got2)
+	}
+
+	// Case 3: Both sides have row counts but no usable NDistinct.
+	// Fallback gives l·r·0.005 = 6000000*100000*0.005 = 3e9.
+	// Cap at max(l,r) = 6000000.
+	fact := &SeqScan{Table: &catalog.Table{
+		Name:    "fact",
+		Columns: []catalog.Column{{Name: "c"}},
+		Stats:   &catalog.TableStats{RowCount: 100000, Columns: []catalog.ColumnStats{{NDistinct: -1}}},
+	}}
+	j3 := &Join{
+		Type: JoinTypeInner, Algo: JoinAlgoHash,
+		Left: large, Right: fact,
+		LeftKey:  &ColumnRef{Index: 0, Name: "k"},
+		RightKey: &ColumnRef{Index: 0, Name: "k"},
+	}
+	got3 := EstimateRows(j3)
+	want3 := int64(6000000) // max(6M, 100K) = 6M
+	if got3 != want3 {
+		t.Errorf("cap-fallback join: EstimateRows = %d, want %d (capped at max(l,r))", got3, want3)
+	}
+
+	// Case 4: When NDistinct IS available, the cap must NOT fire.
+	// ndistinct-based formula gives correct result.
+	statsL := &SeqScan{Table: statsTable("l", 10000, 100)}
+	statsR := &SeqScan{Table: statsTable("r", 50000, 500)}
+	j4 := &Join{
+		Type: JoinTypeInner, Algo: JoinAlgoHash,
+		Left: statsL, Right: statsR,
+		LeftKey:  &ColumnRef{Index: 0, Name: "k"},
+		RightKey: &ColumnRef{Index: 0, Name: "k"},
+	}
+	got4 := EstimateRows(j4)
+	// (10000 * 50000) / max(100, 500) = 500M / 500 = 1M
+	want4 := int64(1000000)
+	if got4 != want4 {
+		t.Errorf("with-stats join: EstimateRows = %d, want %d (nd-based, cap must NOT fire)", got4, want4)
+	}
+}

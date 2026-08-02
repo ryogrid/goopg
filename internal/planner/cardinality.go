@@ -355,6 +355,21 @@ func IsSmallDimensionSide(n Node) bool {
 // keys. Falls back to the generic equality selectivity when
 // either NDistinct is unavailable. CROSS join is the cartesian
 // product.
+//
+// M0126-0010: when NDistinct is unavailable for the join key
+// and we fall back to the generic 0.5% selectivity, cap the
+// output at max(|outer|, |inner|). Without this, FK-PK join
+// chains compound the multiplicative selectivity at every level,
+// producing absurd row-count estimates (e.g. Q9's 5-level chain
+// estimated 5.9e15 rows against an actual of 175). The cap
+// codifies the invariant that a non-cross equi-join never
+// produces more rows than the larger of its two inputs when
+// the join key is a FK referencing a PK — the worst case
+// without fan-out is the probe-side row count. The cap is
+// conservative: it may under-estimate for genuine many-to-many
+// joins, but the existing NDistinct-driven formula handles
+// those correctly when stats are available; the cap only fires
+// in the stats-unavailable fallback path.
 func estimateJoin(j *Join) int64 {
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
@@ -380,6 +395,14 @@ func estimateJoin(j *Join) int64 {
 	est := scaleByFloat(l*r, defaultEqSelectivity)
 	if est < 1 {
 		return 1
+	}
+	// M0126-0010: cap fallback estimate at max input size.
+	mx := l
+	if r > mx {
+		mx = r
+	}
+	if est > mx {
+		est = mx
 	}
 	return est
 }
