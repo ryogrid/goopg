@@ -52,6 +52,15 @@ held constant across arms (sweep-tail discipline):
 4. TPC-DS SF0.5: zero deltas (as §1).
 5. **No `MultiHashJoin` in any emitted plan; fusion never triggers**
    (assert via EXPLAIN sweep over both suites).
+6. **Bushy-plan capability (PG-identical search):** on every searched query
+   where PG 18.3's EXPLAIN shows a bushy join spine (composite ⋈ composite),
+   goopg must be able to produce the same bushy tree shape — the same
+   composite⋈composite pairing over the same relset partition — verified
+   through the §4 parity gate's spine diff. Alternative shapes chosen on
+   cost-constant or stats-fidelity grounds stay admitted under the ratchet;
+   a bushy shape PG can produce that the goopg search *cannot express* is a
+   hard failure (the [02](02-plan-shape-contract.md) contract is
+   PG-identical shape, not a trade).
 
 A documented no-go with attribution (§6) is an acceptable S5 outcome — the
 flag then stays OFF and the bundle's planner half returns to design. The
@@ -59,8 +68,9 @@ executor stages S0–S4 stand on their own gates regardless.
 
 ## 4. The PG plan-shape parity gate (new instrument)
 
-Once P-LD holds, goopg's join spines are structurally comparable to PG's for
-the first time. Add `scripts/pg-plan-shape-diff.sh --strict` (the existing
+Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),
+goopg's join spines are structurally comparable to PG's for the first time.
+Add `scripts/pg-plan-shape-diff.sh --strict` (the existing
 script is report-only): normalise both EXPLAIN outputs to a join-spine
 skeleton — node type, join type, build/probe side (PG: which child is under
 `Hash`; goopg: `BuildLeft`), base-rel leaf names — and diff.
@@ -72,10 +82,13 @@ skeleton — node type, join type, build/probe side (PG: which child is under
   across subsequent commits (ratchet). A hard match-all bar is wrong while
   cost constants and stats fidelity still differ; the ratchet makes drift
   visible without blocking on estimator parity.
-- Divergences PG-explains (bushy spines PG chose where we cannot) are
-  annotated `expected-bushy` in the pin list — they are the measured cost of
-  the [02](02-plan-shape-contract.md) trade and reviewed at each ratchet
-  update.
+- **There is no `expected-bushy` category.** goopg implements PG's full
+  three-phase search, bushy phase included
+  ([03](03-join-search-pg-dp.md) §4.3), so a bushy spine PG chose and goopg
+  cannot produce is a genuine divergence, not an accepted trade — it is
+  classed per §6 (usually (b) plan shape) and fixed. Spine mismatches driven
+  by cost-constant or stats fidelity stay under the ratchet as usual, and
+  are re-reviewed at each ratchet update.
 
 ## 5. Estimate audit (class-(a) regression tripwire)
 

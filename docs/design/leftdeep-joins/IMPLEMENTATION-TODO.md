@@ -79,15 +79,21 @@
 - [ ] **P4.4** Lateral: outer streams (per-outer re-execution stays), output
   no longer accumulates into `o.rows`.
 
-## P5 — The DP [S5] (each task lands dark behind `GOOPG_LEFTDEEP_DP`)
+## P5 — The DP [S5] (each task lands dark behind `GOOPG_PGSHAPED_DP`)
 
 - [ ] **P5.1** `joinrels` level lists + relset map over `RelOptInfo`;
   `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
   pinned unnest rels (closes the leaf-whitelist gap).
 - [ ] **P5.2** restrictInfo list + `hasRelevantJoinClause`; equivalence-class
   selectivity rule (inferred edges: admissible, no double-count).
-- [ ] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins; disconnected
-  cartesian; last-ditch); `makeJoinRel` with composite-left convention.
+- [ ] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins against initial
+  rels; disconnected cartesian; last-ditch); `makeJoinRel` with PG's
+  outer/inner printing convention (03 §4.4).
+- [ ] **P5.3a** Phase 2 — bushy joins, PG-verbatim (03 §4.3,
+  `joinrels.c:141-198`): k-loop to the halfway point, clause-less rel skip
+  (`:170-172`), mirror-half `first_rel` rule (`:174-177`),
+  `have_relevant_joinclause` pair gate (`:190-191`). Pair-count
+  verification against 03 §7's arithmetic (connectivity-filtered).
 - [ ] **P5.4** `addPathsToJoinrel`: hash (both build sides), NLI+Memoize
   parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
   03 §5.3; FULL-without-usable-clause error contract), qual placement at
@@ -97,11 +103,11 @@
   shared eligibility fn; constructor failure on a DP-chosen path = loud
   planner error.
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
-  **search-boundary coordinate map** (03 §10: single π prefix-sum map or
-  identity-restoring root Project; ColumnRef-in-schema plan-time
-  assertion); pinned-spine re-resolution consumes the map;
-  searched-subtree tagging so legacy passes skip; `reconcileNLILayout`
-  no-op assertion on searched trees.
+  **search-boundary coordinate map** (03 §10: relid-order canonical
+  layout — one map composed from the final relset, or a relid-reordering
+  root Project; ColumnRef-in-schema plan-time assertion); pinned-spine
+  re-resolution consumes the map; searched-subtree tagging so legacy
+  passes skip; `reconcileNLILayout` no-op assertion on searched trees.
 - [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling
@@ -111,9 +117,9 @@
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
   flat comma lists are always ONE problem; limits govern sub-joinlists and
   explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening
-  behind its own sub-flag `GOOPG_LEFTDEEP_COLLAPSE` (soaked separately from
-  the enumerator, 08 §2); outer joins stay pinned (03 §4.4). Delete the
-  12-table bail-out.
+  behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately from
+  the enumerator, 08 §2); outer joins stay pinned until `join_is_legal`
+  constraint inference lands (03 §4.4). Delete the 12-table bail-out.
 - [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.
@@ -135,23 +141,29 @@
 - [ ] **P6.2** Delete MultiHashJoin (fresh grep inventory; expect ~28 arms /
   15 files: node, packer, `mhj_input_rewrite.go`, posmaps, cost/cardinality
   arms, executor op, EXPLAIN arms, `generateMultiHashJoinPath`, flags).
-- [ ] **P6.3** Delete bushy DP + layout/remap family + integer cost +
-  `IsSmallDimensionSide` pinning + `chooseInnerJoinAlgo` (searched);
-  demote `joinorder.go` to over-limit sequencer.
+- [ ] **P6.3** Delete the old subset-bitmask DP + the per-subset
+  layout/remap family (`dpEntry.layout`, `remapKeyToLayout`,
+  `mergeSubsetLayouts`) + integer cost + `IsSmallDimensionSide` pinning +
+  `chooseInnerJoinAlgo` (searched); demote `joinorder.go` to over-limit
+  sequencer. Held back until the 03 §10 relid-order boundary map is
+  proven: `buildBindingsPosMap`/`applyJoinTreePosMap` (08 §4).
 - [ ] **P6.4** Supersession stamps (0034-0001, 0038-0001, cost-model/09 §3
   allowance, 0125/0126 MHJ chapters); README index status flips; ledger
-  rows for every deliberately-skipped PG behaviour (bushy phase, GEQO, skew
-  buckets, SpecialJoinInfo in-DP, shared spilling builds, full
+  rows for every deliberately-skipped PG behaviour (GEQO, skew buckets,
+  SpecialJoinInfo in-DP — now unblocked by the bushy phase, still gated on
+  `join_is_legal` inference —, shared spilling builds, full
   join_order_restriction inference).
 
 ## Standing deferral pointers (file rows when their stage lands)
 
-bushy phase (03 §4.3) · GEQO (03 §7) · skew buckets (06 §6) · parallel/shared
-spilling builds (06 §6) · hash-agg spill (06 §6) ·
-semi/anti in-DP (07 §5 — **bushy-phase-dependent**) ·
-outer-join `join_order_restriction` inference (03 §6 —
-**bushy-phase-dependent**) · tuplestore mark/restore merge join (07 §2) ·
-Materialize under merge inner (07 §4) · session cost-GUC threading (04 §1,
-pre-existing C3.2/C4 TODO) · slab `Aggregate` migration (05 §2, independent
-track) · `buildBindingsPosMap`/`applyJoinTreePosMap` deletion (08 §4 — held
-until the 03 §10 boundary map is proven)
+GEQO (03 §7) · skew buckets (06 §6) · parallel/shared spilling builds (06 §6)
+· hash-agg spill (06 §6) ·
+semi/anti in-DP (07 §5 — **implementable now that the bushy phase exists
+(03 §4.3); staged behind `join_is_legal` constraint inference**) ·
+outer-join `join_order_restriction` inference (03 §6 — same standing: the
+bushy phase is in place, so this awaits `join_is_legal` inference only) ·
+tuplestore mark/restore merge join (07 §2) · Materialize under merge inner
+(07 §4) · session cost-GUC threading (04 §1, pre-existing C3.2/C4 TODO) ·
+slab `Aggregate` migration (05 §2, independent track) ·
+`buildBindingsPosMap`/`applyJoinTreePosMap` deletion (08 §4 — held until
+the 03 §10 boundary map is proven)

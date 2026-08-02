@@ -122,7 +122,7 @@ the double-counting it papered over.
 
 | query | required emergent behaviour | mechanism |
 |---|---|---|
-| Q9 | fact-outermost left-deep order (lineitem streams; dimensions build) beats dimension-first by a wide margin | §3 FK clamps kill the fake intermediate explosions; §4 nbatch pricing penalises 6M-row builds |
+| Q9 | fact-outermost order (lineitem streams; dimensions build) beats dimension-first by a wide margin | §3 FK clamps kill the fake intermediate explosions; §4 nbatch pricing penalises 6M-row builds |
 | Q5 | keep the 7.1× cost-driven win (`stage3-order-ab.txt`); allow `BuildLeft` at the deep level where the composite (1.99M) < base (6.0M) | §1 currency + [02](02-plan-shape-contract.md) §2 commutation paths |
 | Q2 | no cross products; small-dimension chain order | connectivity rule ([03](03-join-search-pg-dp.md) §4) + honest small-build costs (replaces `IsSmallDimensionSide` pinning, `cardinality.go:333` — the 1024-row heuristic retires with the bushy DP's `buildJoinFromDP`) |
 | Q21 | order unchanged (neutral in stage0 A/B) but survives via spill | [06](06-hash-spill-and-memory.md) |

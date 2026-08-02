@@ -1,22 +1,25 @@
-# 03 — The Join Search: a `standard_join_search` Analogue, Left-Deep Restricted
+# 03 — The Join Search: a `standard_join_search` Analogue with All Three PG Phases
 
 | field | value |
 | --- | --- |
 | status | draft (DESIGN ONLY) |
 | date | 2026-08-02 |
-| PG oracle | `postgres/src/backend/optimizer/path/allpaths.c:3457` (`standard_join_search`), `:3352` (`make_rel_from_joinlist`); `postgres/src/backend/optimizer/path/joinrels.c:73` (`join_search_one_level`), `:118` (`make_rels_by_clause_joins`), `:696` (`make_join_rel`); `postgres/src/backend/optimizer/path/joinpath.c:124` (`add_paths_to_joinrel`); `postgres/src/backend/optimizer/plan/initsplan.c:39-40` (collapse limits) |
+| PG oracle | `postgres/src/backend/optimizer/path/allpaths.c:3457` (`standard_join_search`), `:3352` (`make_rel_from_joinlist`); `postgres/src/backend/optimizer/path/joinrels.c:73` (`join_search_one_level`), `:118` (`make_rels_by_clause_joins`), `:141-198` (phase 2 — bushy), `:200-256` (phase 3 — last-ditch), `:350` (`join_is_legal`), `:696` (`make_join_rel`), `:1066` (`have_join_order_restriction`); `postgres/src/backend/optimizer/path/joinpath.c:124` (`add_paths_to_joinrel`); `postgres/src/backend/optimizer/plan/initsplan.c:39-40` (collapse limits) |
 | replaces | `enumerateBushyPlans` (`internal/planner/bushy.go:722`), `enumerateSubsets`/`enumerateSplits` (`:976`/`:994`), the `dp map[uint16]dpEntry` table (`:741`), `reorderCommaFromByCardinality` as an ordering authority (`internal/planner/joinorder.go:83` — demoted to over-ceiling fallback, §7), MHJ packing entirely, and `rewriteJoinsToNLI` **as decision authority** for searched joins (it remains the constructor — §5.2) |
 
 ## 1. Architecture
 
-The search is PG's, minus the bushy phase:
+The search is PG's, all three phases:
 
 ```
 planSelect
   └─ joinSearch(root *searchCtx) *RelOptInfo          // standard_join_search analogue
        joinrels[1] = buildInitialRels(root)            // one RelOptInfo per base rel, pathlist populated
        for lev := 2; lev <= n; lev++ {
-           joinSearchOneLevel(root, lev)               // LEFT-DEEP ONLY: (lev-1) ⋈ initial rel
+           joinSearchOneLevel(root, lev)               // PG's three phases, verbatim (§4):
+                                                       //   phase 1: (lev-1) ⋈ initial rels
+                                                       //   phase 2: (k) ⋈ (lev−k) composite pairs, k ≥ 2
+                                                       //   phase 3: last-ditch clauseless pass
            for each rel in joinrels[lev] { setCheapest(rel) }
        }
        return joinrels[n][0]                           // exactly one final rel
@@ -76,12 +79,12 @@ The join-clause bookkeeping generalises today's `joinEdge` list
   both sides and are covered by their union — PG's
   `have_relevant_joinclause`.
 
-## 4. `joinSearchOneLevel` — the left-deep restriction
+## 4. `joinSearchOneLevel` — PG's three phases, all implemented
 
-PG's `join_search_one_level` has three phases; we implement **1 and 3**,
-omit 2:
+PG's `join_search_one_level` (`joinrels.c:73`) has three phases; goopg
+implements **all three**, PG-verbatim in structure:
 
-### 4.1 Phase 1 — clause joins against initial rels (kept; this IS the search)
+### 4.1 Phase 1 — clause joins against initial rels
 
 ```
 for each old := joinrels[lev-1]:
@@ -94,65 +97,116 @@ for each old := joinrels[lev-1]:
             makeJoinRel(root, old, base)     // joinrels.c:120-137 — cartesian, every level
 ```
 
-Mirrors `make_rels_by_clause_joins` (`joinrels.c:118`, `:280`) except the
-iteration pairs `(lev-1, 1)` only — PG additionally pairs `(lev-k, k)` for
-composites in its phase 2. `joinOrderRestricted` is **reserved, constant
-false in v1** — see §4.4. The clauseless else-branch is PG's own
-(`joinrels.c:120-137`): a rel with no join clause or restriction at all is
-crossed in eagerly at every level (so a 1-row disconnected dimension can
-join at level 2, not only at the end), costed honestly.
+Mirrors `make_rels_by_clause_joins` (`joinrels.c:118`, `:280`) exactly.
+`joinOrderRestricted` is **reserved, constant false in v1** — see §4.4.
+The clauseless else-branch is PG's own (`joinrels.c:120-137`): a rel with
+no join clause or restriction at all is crossed in eagerly at every level
+(so a 1-row disconnected dimension can join at level 2, not only at the
+end), costed honestly. At level 2, PG starts the inner loop after the
+current rel to avoid duplicate pairs (`joinrels.c:113-116`); goopg mirrors
+that.
 
-### 4.2 Phase 3 — the last-ditch fallback (kept, PG-verbatim)
+### 4.2 Phase 3 — the last-ditch fallback (PG-verbatim)
 
-PG's rule (`joinrels.c:216-258`): if a level came up empty (possible only
+PG's rule (`joinrels.c:200-256`): if a level came up empty (possible only
 when join-order restrictions starved it), retry phase 1 without the clause
-requirement. PG notes it never considers bushy here either (`joinrels.c:216`).
+requirement. PG notes it never considers bushy here either
+(`joinrels.c:215-216`).
 The `elog(ERROR)` contract must be quoted **with PG's condition**: PG errors
 on a still-empty level only when `join_info_list == NIL && !hasLateralRTEs`
-(`joinrels.c:249-253`) — with special joins in the mix, an empty level can
+(`joinrels.c:252-255`) — with special joins in the mix, an empty level can
 be *legal* (see §4.4). goopg v1: since special joins never enter the search
 (§4.4), an empty level after last-ditch is a planner bug and errors; if a
 future change lets restrictions in, the required behaviour is **fall back to
 syntactic shape for the whole search problem, never error**.
 
-### 4.3 Phase 2 — bushy joins: DELIBERATELY OMITTED
+### 4.3 Phase 2 — bushy joins: IMPLEMENTED
 
-PG pairs composite rels of sizes (k, lev−k), k ≥ 2, requiring a connecting
-clause (`joinrels.c:141-175`). Per the user directive this phase is not
-implemented. The hook stays structural: re-admitting bushy later is inserting
-this one loop — no data-structure or costing change, since `RelOptInfo`,
-`makeJoinRel`, and `addPathsToJoinrel` are shape-agnostic. If re-admitted,
-its flag default must be decided by the acceptance bars of that future
-change, not this bundle.
+PG pairs composite rels of sizes (k, lev−k), 2 ≤ k ≤ lev−2
+(`joinrels.c:141-198`). goopg implements the loop verbatim:
 
-**But note what the bushy phase is load-bearing for in PG**: with
-SpecialJoinInfo ordering restrictions, some level-N joins have *no legal
-left-deep extension at all* — PG's own comment documents accepting failure
-at level 4 and recovering with a bushy plan at level 5
-(`joinrels.c:225-250`; shape: `(A JOIN B) LEFT JOIN (C JOIN D)`). This is
-why §4.4 pins such joins out of the search in v1, and why the two staged
-follow-ups that would let restrictions in (§6 outer-join restriction
-inference; [07](07-other-join-operators.md) §5 semi/anti in-DP) are
-**bushy-phase-dependent**, not independent increments.
+```
+for k := 2; k <= lev-k; k++ {          // PG: for (k = 2;; k++) { other_level = level-k;
+                                       //      if (k > other_level) break; }
+    for each old := joinrels[k]:
+        if old has no join clauses and no restrictions: continue   // joinrels.c:170-172
+        first := 0
+        if k == lev-k: first = index(old) + 1                     // mirror-image rule, :174-177
+        for each new := joinrels[lev-k], starting at first:
+            if old.relids ∩ new.relids ≠ ∅: continue
+            if hasRelevantJoinClause(old, new) || joinOrderRestricted(old, new):
+                makeJoinRel(root, old, new)                       // :190-194
+```
 
-### 4.4 v1 pinning rule for special joins
+Keyed details, all from `joinrels.c:141-198`:
 
-Any outer/semi/anti join construct whose right-hand requirement spans more
-than one base rel — and, in v1, every outer join, full stop — stays a
+- The k-loop runs only to the halfway point (`k ≤ lev−k`): `make_join_rel`
+  is symmetric, so pairing past halfway would duplicate work; at the
+  halfway level the `first_rel` offset skips already-considered mirror
+  pairs (`:153-157`, `:174-177`).
+- Rels with no join clauses (and, later, no restrictions) are skipped
+  entirely (`:170-172`) — the phase exists for connected pairs only, which
+  is what keeps the search space from exploding (§7).
+- The pair condition is `have_relevant_joinclause` **or**
+  `have_join_order_restriction` (`:190-191`); v1 has `joinOrderRestricted`
+  constant false (§4.4), so the effective condition is the connecting-clause
+  test.
+
+No data-structure or costing change is needed over phase 1:
+`RelOptInfo`, `makeJoinRel`, and `addPathsToJoinrel` are shape-agnostic — a
+composite input is just another RelOptInfo with a pathlist. `RelSet`
+remains `uint16`, unchanged.
+
+**Why this phase is load-bearing in PG**: with SpecialJoinInfo ordering
+restrictions, some level-N joins have *no legal left-deep extension at
+all* — PG's own comment documents accepting failure at level 4 and
+recovering with a bushy plan at level 5 (`joinrels.c:234-251`; shape:
+`(A JOIN B) LEFT JOIN (C JOIN D)`). With phase 2 in place, goopg has the
+structural half PG relies on for that recovery; the remaining half —
+`join_is_legal` constraint inference — is what §4.4's pin awaits before
+letting restrictions into the search.
+
+### 4.4 v1 pinning rule for special joins (temporary, until `join_is_legal` inference)
+
+In v1, any outer/semi/anti join construct whose right-hand requirement spans
+more than one base rel — and, in v1, every outer join, full stop — stays a
 **pinned opaque input**: its subtree plans exactly as today and enters the
 search (if at all) as a `PathPrebuilt` initial rel. Only INNER-joinable
 comma-FROM / flattened-INNER-JOIN rels are searched. This is the coherence
 condition that keeps §4.2's error contract sound.
 
-`makeJoinRel` also enforces P-LD's printing convention: the composite is
-always the **left** input of the emitted `Join` node; input-order variants
-surface as `BuildLeft`/outer-inner path attributes, not tree shapes
-([02](02-plan-shape-contract.md) §2).
+This pin is a **temporary measure, not a design commitment**: PG admits
+outer/semi/anti joins into the DP and governs them with `join_is_legal`
+ordering-constraint inference over `SpecialJoinInfo` entries
+(`joinrels.c:350`). The bushy phase (now implemented, §4.3) is
+precisely the machinery PG relies on to make restriction-constrained levels
+plannable — its "accept failure at level 4, recover bushy at level 5"
+recovery (`joinrels.c:234-251`) is available to goopg. The missing
+prerequisite is the inference itself: until `join_is_legal`-equivalent
+legality checks land, pinned joins cannot be searched, because an
+unconstrained search could emit an illegal join order (e.g. crossing an
+outer join's boundary). When the inference lands, the pin relaxes to PG's
+actual scope: join-order restrictions enter the search via
+`joinOrderRestricted` (`have_join_order_restriction`, `joinrels.c:1066`),
+and §4.2's error contract becomes PG's condition-only form. The staged
+follow-ups that depend on this — §6 outer-join restriction inference and
+[07](07-other-join-operators.md) §5 semi/anti in-DP — are therefore
+**implementable now that the bushy phase exists**; what blocks them is the
+constraint inference, not the search shape.
+
+`makeJoinRel` also enforces the PG printing convention: the join's inputs
+appear as the emitted `Join` node's children in the path's outer/inner
+order; input-order variants surface as `BuildLeft`/outer-inner path
+attributes, not tree re-shapes ([02](02-plan-shape-contract.md) §2).
 
 ## 5. `addPathsToJoinrel` — methods live INSIDE the search
 
-For each `(outer=composite, inner=base)` pair, generate paths (analogue of
-`joinpath.c:124`, restricted to goopg's operator inventory):
+For each `(outer, inner)` pair the search admits — `(composite, base)` from
+phase 1, `(composite, composite)` from phase 2 — generate paths (analogue
+of `joinpath.c:124`, restricted to goopg's operator inventory). Both sides
+of a bushy pair go through the same path generation: a composite input is
+just a RelOptInfo with a pathlist, and `addPathsToJoinrel` tries both input
+orders for every jointype it supports:
 
 ### 5.1 Hash join paths
 - `(outer streams, build inner)` — the default pipelining shape; cost =
@@ -233,20 +287,29 @@ wires them with PG semantics (`initsplan.c:1081-1238`, `deconstruct_jointree`)
   `join_collapse_limit`; setting it to 1 pins syntactic order — PG's
   standard escape hatch, which goopg has never had;
 - outer joins do **not** flatten and do **not** enter the search in v1
-  (§4.4 pinning rule). The PG endgame — flattening them with
+  (§4.4 pinning rule — temporary until `join_is_legal` constraint
+  inference lands). The PG endgame — flattening them with
   `SpecialJoinInfo` ordering restrictions (`joinOrderRestricted`) — is
-  staged behind a ledger row **and is bushy-phase-dependent** (§4.3): PG
-  itself needs bushy shapes to guarantee plannability under restrictions.
+  staged behind a ledger row: the bushy phase (now implemented, §4.3) is
+  the structural half PG needs to guarantee plannability under
+  restrictions; the remaining prerequisite is the constraint inference
+  itself, not the search shape.
 
 ## 7. Search-size policy (the GEQO question)
 
 PG switches to GEQO at `geqo_threshold` (12) rels (`allpaths.c:3420`). goopg
 ports no GEQO. Policy:
 
-- up to the `RelSet` ceiling (16 rels, `path.go:29`): full left-deep DP.
-  Worst-case join-pair evaluations are Σ_{k=2..n} C(n,k)·k = n·2ⁿ⁻¹ − n —
-  ~1k `makeJoinRel` calls at n=8, ~245k at n=15; affordable, unlike the
-  bushy 3ⁿ subset-split space that makes PG reach for GEQO.
+- up to the `RelSet` ceiling (16 rels, `path.go:29`): full PG-shaped DP
+  (left-deep + bushy). The worst-case number of disjoint rel pairs over
+  all levels is (3ⁿ − 2ⁿ⁺¹ + 1)/2 — ~3k at n=8, ~7M at n=15 — but phase 2
+  skips clause-less rels (`joinrels.c:170-172`) and only calls
+  `makeJoinRel` on clause-connected pairs (`:190-191`), which on real
+  workloads prunes the count to PG's own scale: PG runs this identical
+  enumeration up to `geqo_threshold − 1` = 11 rels without incident (PG switches to GEQO at 12, `allpaths.c:3420`)
+  (`allpaths.c:3420`). This is a different and far smaller space than the
+  old subset-bitmask DP's 3ⁿ subset-split enumeration, which enumerated
+  every split of every subset regardless of connectivity.
 - beyond 16 rels: the search problem is chunked; the greedy connectivity
   order (`reorderCommaFromByCardinality`, `joinorder.go:83`) survives ONLY
   as this over-ceiling sequencer. Documented as
@@ -293,24 +356,35 @@ throughout. Three binding rules:
 ## 10. Coordinate translation at the search boundary (owned here, not hoped away)
 
 [02](02-plan-shape-contract.md) §3 deletes the *internal* layout machinery —
-but the chain order π is still a cost-chosen permutation of syntactic order,
-and everything **above** the searched subtree (Aggregate/projection/Sort
-expressions, retained Filters, the pinned unnest spine) references
+but the search's chosen tree is still a cost-chosen reordering of syntactic
+order, and everything **above** the searched subtree (Aggregate/projection/
+Sort expressions, retained Filters, the pinned unnest spine) references
 pre-search coordinates. That translation is currently done by
 `buildBindingsPosMap`/`applyJoinTreePosMap` and the predp spine
 re-resolution — the family the project's own analysis calls its index-skew
 bug generator. The replacement must be named, not implied:
 
-- `createPlan` computes **one boundary map** at the search root:
-  syntactic (binding-order) column index → chain-order output index. It is
-  a pure prefix-sum composition over π — no per-subset layouts, no
-  per-node remaps, computed once.
+- `createPlan` computes **one boundary map** at the search root. With the
+  bushy phase, a single prefix-sum composition over a chain order π is no
+  longer sufficient — a composite can be assembled from any split — so
+  goopg adopts a **canonical relid-order layout** — a design choice
+  stricter than PG's ([02](02-plan-shape-contract.md) §3): every joinrel's
+  output columns are in relid order of its relset, a pure function of the
+  relset. PG's `build_joinrel_tlist` appends outer-then-inner and resolves
+  ordering later in `setrefs` (see the NOTE at
+  `postgres/src/backend/optimizer/util/relnode.c:780-782`); goopg resolves
+  at construction time. The
+  boundary map is then the single composition relid-order output index →
+  syntactic (binding-order) column index — no per-subset layouts, no
+  per-node remaps, computed once from the final relset.
 - Every enclosing-tree expression is rewritten through that single map at
   plan-creation time (the `setrefs.c` moment, at our fidelity level), OR —
   the simpler v1, decided at implementation — `createPlan` emits one
-  `Project` at the search root restoring syntactic order, making the map
-  invisible to the enclosing tree at the cost of one narrow pass-through
-  node (fused away by the existing projection elision if it is an identity).
+  `Project` at the search root that **reorders the final rel's output from
+  canonical relid order into the syntactic (binding) order the enclosing
+  tree expects**, so the map is invisible above the search root; the cost
+  is one narrow pass-through node (fused away by the existing projection
+  elision if the two orders happen to coincide).
 - The pinned-spine re-resolution in `predp.go` survives and consumes this
   map; it is NOT in the deletion inventory until the boundary map is proven
   ([08](08-migration-and-removal.md) §4 note).
