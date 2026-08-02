@@ -3513,7 +3513,33 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       inherit the full bar (plan-diff `LABEL=tpcds-round2-head`, timed TPC-H on
       a quiet host, full SF0.5 gate).
 
-- [ ] **M0125-0027 — the SF=1 harness reports a DEAD SERVER as `OK`**
+- [x] **M0125-0027 — the SF=1 harness reports a DEAD SERVER as `OK`** —
+      **DONE 2026-08-03 (loop #33).** Only `qex==0` may be `OK` now: a non-zero
+      exit that is neither 124 nor `ERROR:`-bearing becomes `NOCONN`
+      (output contains `connection to server`) or `UNKNOWN`, carrying
+      `exit=<qex>` + first output line; a goopg-lane `NOCONN` bounces the
+      server like a TIMEOUT (same `RESTART_AFTER_TIMEOUT` knob) so a dead
+      server cannot cascade. Measured repro: dead port →
+      `goopg Q99  NOCONN  0s  0  exit=2 psql: error: connection to server …`
+      (was `OK 0s 2`); happy-path control `pg Q3 OK 0s 31` against live 65438.
+      The SF0.5 script got the owed explicit arms and one step more: not just
+      the sweep (`cmd_sweep`'s ERROR arm now also fires on `rc != 0`, routing
+      connection-refused through the pg_isready-probe-and-restart path) but
+      also `cmd_oracle`, where the same catch-all could capture the error
+      text's "row count" into the GIT-TRACKED oracle as `OK` — new
+      `PG_NOCONN` status, consumed by the sweep's existing `!= "OK"` skip arm.
+      **The owed board audit is done and the board is CLEAN**: every
+      `OK` cell at ≤1 s with ≤5 rows in the 16 resweep chunks is a PG cell
+      with a genuine `(N rows)` block (the two `rows=2` candidates Q82/Q85
+      spot-checked against their result files — real 2-row results); ZERO
+      goopg cells bear the signature; the merged report's cells all carry
+      substantial runtimes or `= PG` value checks; Q99's real cell is
+      `OK 23 s / 90 = PG` (chunk-97-99 — its result FILE was overwritten by
+      the 2026-07-30 discovery probe, the only defect artefact in the wild).
+      No published SF=1 claim is affected. Design: §D6b added to
+      `docs/design/0124-0001-tpcds-sf1-head-resweep-protocol.md` per this
+      item's "no new doc" directive; README row 0125-0027 points there.
+      *(Original item body follows.)*
       (found 2026-07-30 while validating M0125-0011's provenance follow-up;
       ledger row 2026-07-30. **Numbering note (updated 2026-07-30): `M0125-0028`
       … `-0031` are taken by the warm-statistics programme (user directive —

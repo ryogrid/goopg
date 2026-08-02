@@ -487,6 +487,11 @@ cmd_oracle() {
             reap_pg_orphans >/dev/null
         elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):' "$res"; then
             status="PG_ERROR"; rows=0
+        elif [[ $rc -ne 0 ]]; then
+            # M0125-0027 sibling: a psql that never connected exits non-zero
+            # with no ERROR:/FATAL: prefix — it must not be captured as an OK
+            # oracle cell with the error text's "row count". Only rc==0 is OK.
+            status="PG_NOCONN"; rows=0
         else
             status="OK"; read -r rows ck < <(result_rows_ck "$res" "$qf")
             okc=$((okc+1)); [[ "$rows" == "0" ]] && zero=$((zero+1))
@@ -579,10 +584,13 @@ cmd_sweep() {
                 echo "      (restarting goopg to drop accumulated heap)" | tee -a "$report"
                 sf05_goopg_start
             fi
-        elif grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):|connection to server was lost|server closed the connection' "$resfile"; then
+        elif [[ $rc -ne 0 ]] || grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):|connection to server was lost|server closed the connection' "$resfile"; then
+            # rc!=0 arm added for M0125-0027: connection-refused (dead server,
+            # psql exit 2) carries no ERROR: prefix and previously fell through
+            # to the row-count comparison below — judging error text as rows.
             verdict="ERROR"; gerr=$((gerr+1))
             printf "Q%-3s ERROR    %4ss %s\n" "$q" "$secs" \
-                "$(grep -E '(ERROR|FATAL|PANIC):' "$resfile" | head -1 | cut -c1-90)" | tee -a "$report"
+                "$(grep -E '(ERROR|FATAL|PANIC):|connection to server' "$resfile" | head -1 | cut -c1-90)" | tee -a "$report"
             # A dead server presents as a connection error on the NEXT query;
             # probe and restart so one crash doesn't cascade.
             pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || sf05_goopg_start

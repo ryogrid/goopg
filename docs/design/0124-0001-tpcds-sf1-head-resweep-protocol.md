@@ -271,6 +271,57 @@ signature attributes 14 of the 23 cells on its own. Guard against its one false 
 result whose columns are all NULL/empty (Q16/Q94/Q95 return `0||`) matches the replication test
 trivially and is an *empty-result* defect, not a replication one.
 
+### D6b. No execution at all must not present as a successful cell (M0125-0027)
+
+**Added 2026-08-03 (M0125-0027), from a measured failure one step worse than
+D6a's.** The harness's status ladder ended in a catch-all `else status="OK";
+rows=$(wc -l <<<"$qout")`. A `psql` that never connected (dead server, refused
+port) emits no `ERROR:`/`FATAL:` prefix and no `(N rows)` block, so it fell
+into that arm and was recorded as **`OK`, with the line count of the
+connection-error text as its ROW COUNT**. Measured 2026-07-30: with nothing
+listening on 65436, `scripts/tpcds-bench-compare.sh 99` printed
+`goopg Q99  OK  0s  2` while the result file held only `psql: error:
+connection to server at "127.0.0.1", port 65436 failed: Connection refused`.
+D6a says a matching row count is not agreement; this is the degenerate case —
+**no execution at all presented as a successful cell**, in the harness that
+produced this protocol's SF=1 board.
+
+The rule, landed 2026-08-03 in `scripts/tpcds-bench-compare.sh`: **only
+`qex == 0` may fall through to `OK`** (a 0-row `\d`-style output legitimately
+has no `(N rows)` block, and psql exits 0 for it). A non-zero exit that is
+neither 124 (TIMEOUT) nor `ERROR:`-bearing becomes **`NOCONN`** (output
+contains `connection to server` — psql's phrasing for both "failed: Connection
+refused" and "was lost") or **`UNKNOWN`** otherwise, both carrying
+`exit=<qex>` plus the first output line in the error column, `rows=0`. A
+goopg-lane `NOCONN` additionally bounces the server exactly like a TIMEOUT
+(same `RESTART_AFTER_TIMEOUT` knob): a dead server would otherwise cascade
+`NOCONN` through every remaining cell.
+
+Siblings hardened in the same commit (Hard-won Rule #2 — the SF0.5 gate does
+not share the false-`OK` bug because its ladder ends in an oracle comparison,
+but it detected a dead server only as a MISMATCH/garbage-judged cell):
+`tpcds-sf05-regression.sh cmd_oracle` gains a `PG_NOCONN` arm (was: the
+connection-error text's "row count" captured into the **git-tracked oracle**
+as `OK`; the sweep's `!= "OK"` skip arm consumes the new status with no reader
+change), and `cmd_sweep`'s ERROR arm now also fires on `rc != 0`, routing
+connection-refused through the existing `pg_isready`-probe-and-restart path
+instead of the row-count comparison.
+
+Verification: `bash -n` both scripts; measured repro of the exact defect
+scenario (`ENGINES=goopg TPCDS_PORT=5533`, nothing listening →
+`goopg Q99  NOCONN  0s  0  exit=2 psql: error: connection to server …`);
+happy-path control (`ENGINES=pg` Q3 against live 65438 → `OK 0s 31`). The two
+sf05 arms are verified by inspection + syntax only; the next real
+oracle/sweep run exercises them. Consumers audited: `LAST_STATUS` is read only
+for the TIMEOUT bounce (now TIMEOUT|NOCONN); nothing under `ci/` or `scripts/`
+parses this harness's report — it is read by humans into analysis docs, where
+a new status string is strictly more informative than a false `OK`.
+
+**Board audit (the item's "owed as verification, not assumption"):** see the
+M0125-0027 closing note in `.ralph/fix_plan.md` for the re-read of
+`analysis/tpcds-sf1-goopg-20260728.md` / `analysis/tpcds-sf1-resweep-20260728/`
+for the defect's signature (`OK`, ~0 s, suspiciously tiny row count).
+
 ### D7. Deliverable
 
 > **LANDED 2026-07-29 — `analysis/tpcds-sf1-goopg-20260728.md`.** All 13

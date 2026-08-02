@@ -135,6 +135,19 @@ run_one() {
         rows=$(( $(grep -oP '\(\d+ rows?\)' <<<"$qout" | grep -oP '\d+' | paste -sd+ -) ))
         # Show the breakdown only when there is more than one block.
         [[ "$blocks" == *+* ]] || blocks=""
+    elif [[ $qex -ne 0 ]]; then
+        # M0125-0027: a psql that never connected exits non-zero with neither
+        # an ERROR:/FATAL: prefix nor a "(N rows)" block, so it used to fall
+        # into the catch-all below and be recorded as OK — with the line count
+        # of the connection-error text as its ROW COUNT. No execution at all
+        # must never present as a successful cell; only qex==0 may be OK.
+        if grep -q 'connection to server' <<<"$qout"; then
+            status="NOCONN"
+        else
+            status="UNKNOWN"
+        fi
+        rows=0; blocks=""
+        err="exit=${qex} $(head -1 <<<"$qout" | tr -d '|' | cut -c1-160)"
     else
         status="OK"; rows=$(wc -l <<<"$qout"); blocks=""; err=""
     fi
@@ -286,7 +299,9 @@ for q in $(parse_qlist "${1:-}"); do
             run_one "goopg" "${GOOPG_PSQL}" "${q}"
             # A goopg TIMEOUT means a 600 s query just built an enormous
             # intermediate; bounce the server before it poisons the rest.
-            [[ "${LAST_STATUS}" == "TIMEOUT" ]] && restart_goopg
+            # A NOCONN means the server is DEAD (M0125-0027) — without a
+            # restart every remaining cell would be NOCONN too.
+            [[ "${LAST_STATUS}" == "TIMEOUT" || "${LAST_STATUS}" == "NOCONN" ]] && restart_goopg
             ;;
         pg)
             if ! grep -qw "${q}" <<<"${PG_SKIP}"; then
