@@ -632,6 +632,22 @@ func isProbableInnerScan(n Node) bool {
 func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRows int64, cat catalog.Catalog) Cost {
 	hashCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
 		float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+
+	// M0126-0013: penalise hash joins that build on more than
+	// largeBuildThreshold rows. Building an N-row hash table
+	// consumes O(N) memory and, when N exceeds ~2 M rows (576 MB
+	// at 288 bytes/row), the hash table no longer fits comfortably
+	// in the GOMEMLIMIT headroom, causing GC pressure + cache
+	// thrash. The penalty is quadratic in the overshoot so that
+	// the DP avoids join orders that chain multiple 6 M-row
+	// intermediate builds (Q9's cost-driven pathology).
+	const largeBuildThreshold = 2_000_000.0
+	innerR := float64(entryB.rows)
+	if innerR > largeBuildThreshold {
+		overshoot := (innerR - largeBuildThreshold) / largeBuildThreshold
+		hashCost.Total += overshoot * overshoot * cp.cpuTupleCost * innerR
+	}
+
 	if !nliCostDelegation || cat == nil || join == nil {
 		return hashCost
 	}

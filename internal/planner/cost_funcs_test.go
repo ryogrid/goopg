@@ -155,3 +155,32 @@ func TestCostParamsMatchConfigDefaults(t *testing.T) {
 		}
 	}
 }
+
+// TestCostJoinCandidateLargeBuildPressure pins M0126-0013: building on more
+// than largeBuildThreshold rows adds a quadratic penalty that makes the DP
+// avoid enormous intermediate hash tables.
+func TestCostJoinCandidateLargeBuildPressure(t *testing.T) {
+	cp := defaultCostParams()
+	outer := dpEntry{rows: 6_000_000, pgCost: Cost{Startup: 10, Total: 100}}
+	inner := dpEntry{rows: 6_000_000, pgCost: Cost{Startup: 5, Total: 50}}
+
+	// 6M build: overshoot = (6M-2M)/2M = 2, penalty = 4 * 0.01 * 6M = 240K
+	penalty := costJoinCandidate(cp, nil, outer, inner, 6_000_000, nil)
+
+	// Small build (below threshold): no penalty.
+	innerSmall := dpEntry{rows: 500_000, pgCost: Cost{Startup: 5, Total: 50}}
+	noPenalty := costJoinCandidate(cp, nil, outer, innerSmall, 500_000, nil)
+
+	if penalty.Total <= noPenalty.Total {
+		t.Errorf("6M build Total=%v must exceed 500K build Total=%v",
+			penalty.Total, noPenalty.Total)
+	}
+
+	// 10M build: overshoot = (10M-2M)/2M = 4, penalty = 16 * 0.01 * 10M = 1.6M
+	innerHuge := dpEntry{rows: 10_000_000, pgCost: Cost{Startup: 5, Total: 50}}
+	huge := costJoinCandidate(cp, nil, outer, innerHuge, 10_000_000, nil)
+	if huge.Total <= penalty.Total {
+		t.Errorf("10M build Total=%v must exceed 6M build Total=%v",
+			huge.Total, penalty.Total)
+	}
+}
