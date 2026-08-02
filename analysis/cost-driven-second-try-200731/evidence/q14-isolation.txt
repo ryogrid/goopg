@@ -1,0 +1,26 @@
+# Q14 performance isolation — 2026-08-02
+#
+# Purpose: determine whether Q14's slowdown in the M0126-0007 DS05 sweep
+# (270s+ vs historical 158-191s) is caused by fusion or by MHJ packing off.
+#
+# HEAD: 0a2e7cb1 executor(fusion): M0126-0006 — Open/Next + fixed predicate + inWorker threading
+# Binary: /home/ryo/work/goopg/goopg/tmp/goopg-fusion-ab-bin
+# Cluster: TPC-DS SF0.5 (65437)
+# Env: GOGC=off GOMEMLIMIT=12GiB (per env_tpcds.sh defaults)
+
+# config | fusion | MHJ    | elapsed | result
+# -------|--------|--------|---------|-------
+  A       OFF      ON       168s      200 rows (correct)
+  B       OFF      OFF      213s      200 rows (correct)
+  C       ON       OFF      212s      200 rows (correct)
+
+# Conclusion:
+# - Baseline (A): 168s — within historical range (158-191s).
+# - MHJ off (B): 213s — +27% regression from disabling MHJ packing.
+# - Fusion ON (C): 212s — NO additional slowdown vs B. Fusion is neutral.
+#
+# Q14 does NOT trigger fusion (its hash join cascade fails Q1-Q6 predicate),
+# so tryFuseHashCascade returns false and the binary cascade runs as-is.
+# The DS05 sweep's slowdown is explained by GOOPG_MHJ_PACKING_OFF=1 alone.
+#
+# Verdict: NOT a fusion regression. M0126-0007 "KS1 flips off" rule does NOT apply.
