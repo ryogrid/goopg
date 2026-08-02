@@ -415,53 +415,44 @@ func tableForCol(e Expr, cumOffsets []int) int {
 	return result
 }
 
-// visitColumnRefsForTable is a local helper that visits ColumnRef
-// nodes in an expression tree. Mirrors pushdown.go's visitColumnRefs
-// but uses planner Expr instead of parser Expr.
+// visitColumnRefsForTable invokes onIdx with the Index of every
+// same-scope *ColumnRef in e. Its one live consumer is tableForCol.
+//
+// M0125-0002 commit 4: built on walkExprRefs / exprChildSlots instead
+// of its own 12-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a cast, a row constructor
+// or IS DISTINCT FROM — all silently skipped by the old arms — now
+// contributes its index, and tableForCol attributes the conjunct
+// correctly instead of answering -1 from a partial reference set.
+//
+// Scope policy: scopeIgnore. tableForCol's cumOffsets attribution is
+// only meaningful for indices in THIS scope's coordinate space: an
+// inner plan's ColumnRefs index the subplan's own schema and an
+// *OuterColumnRef names a scope above, so neither reaches onIdx (the
+// old walker's documented declines, preserved — see
+// visit_refs_for_table_arms_test.go). A subquery node's PARAM_EXEC
+// Args are same-scope slots and ARE visited now, as is the Operand of
+// a Plan-carrying InExpr — the old arm returned before visiting
+// anything when Plan != nil, so `col IN (subquery)` read as "no
+// table" even though col is an ordinary same-scope reference.
+//
+// An unenumerated type panics, matching PG's
+// expression_tree_walker_impl (nodeFuncs.c:2667); a silent skip means
+// tableForCol partitions on an incomplete reference set (RC-1a).
 func visitColumnRefsForTable(e Expr, onIdx func(int)) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		onIdx(x.Index)
-	case *OuterColumnRef, *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
-		// outer refs and subqueries → out of scope
-	case *InExpr:
-		// `col IN (subquery)` (Plan != nil) references an enclosing
-		// scope → out of scope, like the subquery nodes above. But a
-		// literal-list `col IN (a, b, ...)` is an ordinary single-table
-		// predicate; descend so tableForCol can resolve it to its
-		// relation and the relation-local partition can push it onto the
-		// leaf scan (TPC-H Q12's l_shipmode IN ('MAIL','SHIP'), the query's
-		// most selective restriction, was otherwise stranded at the top
-		// Filter). conjunctIsLocalEligible already rejects the subquery form.
-		if x.Plan != nil {
-			return
-		}
-		visitColumnRefsForTable(x.Operand, onIdx)
-		for _, item := range x.List {
-			visitColumnRefsForTable(item, onIdx)
-		}
-	case *BinaryOp:
-		visitColumnRefsForTable(x.Left, onIdx)
-		visitColumnRefsForTable(x.Right, onIdx)
-	case *UnaryOp:
-		visitColumnRefsForTable(x.Operand, onIdx)
-	case *FuncCall:
-		for _, a := range x.Args {
-			visitColumnRefsForTable(a, onIdx)
-		}
-	case *CaseExpr:
-		visitColumnRefsForTable(x.Operand, onIdx)
-		for _, w := range x.Whens {
-			visitColumnRefsForTable(w.When, onIdx)
-			visitColumnRefsForTable(w.Then, onIdx)
-		}
-		visitColumnRefsForTable(x.Else, onIdx)
-	case *ExtractExpr:
-		visitColumnRefsForTable(x.Source, onIdx)
-	}
+	walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool {
+			if cr, ok := x.(*ColumnRef); ok {
+				onIdx(cr.Index)
+			}
+			return true
+		},
+		OnUnknown: func(x Expr) {
+			panic(fmt.Sprintf("visitColumnRefsForTable: unrecognized expression type %T — "+
+				"teach exprChildSlots (exprwalk.go) about it; a silent skip makes "+
+				"tableForCol partition on an incomplete reference set", x))
+		},
+	})
 }
 
 // isConnectedMask checks whether the subset mask is connected.
@@ -1700,7 +1691,6 @@ func IsCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 // belongs to the MHJ's subset before capturing it.
 func extraInScans(c Expr, scans []Node) bool {
 	allMatched := true
-	visitColumnRefsForTable(c, func(idx int) {})
 	visitColumnRefsByName(c, func(name string) {
 		found := false
 		for _, s := range scans {

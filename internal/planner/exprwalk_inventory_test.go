@@ -27,12 +27,13 @@ package planner
 // classifiers. Those two were the only census members whose fail-open
 // CONFLATES instead of no-opping, because both compute an identity.
 // M0125-0002 commits 1-2 then DEMOTED remapByPosMap and cloneExprShiftIdx
-// (dispatch switches survive inside their Rewrite closures), and commit 3
-// (2026-08-03) DELETED bushy.go:visitColumnRefs outright — its switch
-// vanished; the *ColumnRef filter in the new body is a type assertion, not
-// a switch. The pinned walkerPending population stood at 48 after that
-// deletion (new pinned sites had joined since the 2026-07-30 census; the
-// map below, not this comment, is the authoritative count).
+// (dispatch switches survive inside their Rewrite closures), and commits 3
+// and 4 (2026-08-03) DELETED bushy.go:visitColumnRefs and
+// bushy.go:visitColumnRefsForTable outright — their switches vanished; the
+// *ColumnRef filter in each new body is a type assertion, not a switch. The
+// pinned walkerPending population stood at 47 after those deletions (new
+// pinned sites had joined since the 2026-07-30 census; the map below, not
+// this comment, is the authoritative count).
 //
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
@@ -118,7 +119,6 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
 	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
 	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
-	"bushy.go:visitColumnRefsForTable": walkerPending, // 12 of 32 arms
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and
 	// cloneExprRefs the rewrite — and what the census sees is the

@@ -488,3 +488,56 @@ had been red at HEAD since `e85e5347`, which updated the three planner-side MHJ 
 the retired default but missed `internal/executor/parallel_mhj_test.go` — the units
 pre-commit gate was broken for every commit until repaired. Both tests in that file now opt
 in via `SetMHJPackingEnabled(true)` (the identity test had gone silently vacuous).
+
+### Commit 4 of 8 — `visitColumnRefsForTable` re-based onto `walkExprRefs` (2026-08-03)
+
+Measured in `analysis/m0125-0002-c4-plans-20260803/` (QUIET host — the nightly batch
+`20260803-013955` ended at 03:52, its scheduler asleep ~22 h; this is the first commit in
+the series measured without co-load).
+
+**D2 row 4's prediction ("a first-order shape mover") is REFUTED by measurement.** TPC-H is
+22/22 byte-identical (`plan_snapshots/m0125-0002-c4-before.txt` vs `-after.txt`,
+same-cluster fresh-server arms; both == the `post-mhj-retire` lineage, verified against
+`m0125-0002-c3-after.txt`), TPC-DS SF0.5 is 96/96 byte-identical `EXPLAIN` (`head/` vs
+`c4/`), and the divergence probe closed the residual hole: a measurement-only binary
+(throwaway worktree, never committed) computed `tableForCol` — the walker's ONE live
+consumer — with BOTH bodies and logged `C4DELTA` on any disagreement in the returned table
+attribution. Planning all 118 benchmark queries produced **zero deltas**. Identical
+attributions ⇒ identical local-filter partitioning and join-edge classification ⇒ the
+zero-hunk plan diffs are load-bearing, not lucky. The headline semantic change —
+`col IN (subquery)` now attributes to col's table instead of -1, because the old `InExpr`
+arm returned before visiting ANYTHING when `Plan != nil` — evidently never decides a
+partition on either benchmark today.
+
+**D3's scope policy for this walker: `scopeIgnore`.** `tableForCol`'s cumOffsets
+attribution is only meaningful for indices in the current scope's coordinate space; an
+inner plan's ColumnRefs index the subplan's own schema and an `*OuterColumnRef` names a
+scope above, so neither reaches `onIdx` (the old walker's documented declines, preserved).
+A subquery node's PARAM_EXEC `Args` are same-scope and now contribute, as does the Operand
+of a Plan-carrying `InExpr`. Unknown types PANIC (commit 1's convention).
+
+**Census pin DELETED (second deletion in the series; RC-1a pinned population 48 → 47)** —
+no dispatch switch survives; the `*ColumnRef` filter is a type assertion.
+`internal/planner/visit_refs_for_table_arms_test.go` pins the surface: 11 newly-visited
+kinds, preserved arms (including the Q12 `IN`-list descent), both scope declines, the
+`tableForCol` IN-subquery behaviour pin, and the panic — 15 subtests proved to FAIL against
+the old walker before conversion. Also removed: the DEAD `visitColumnRefsForTable` call in
+`extraInScans` (`bushy.go:1703`) — a pure traversal with an empty callback; walker #7's
+site (`visitColumnRefsByName`, same function) is untouched.
+
+**En-route discovery — SF0.5 Q85's alias order is restart-nondeterministic (filed
+`M0125-0047`).** The probe arm's Q85 EXPLAIN swapped `cd1`/`cd2` (two scans of
+`customer_demographics`, identical estimated rows) relative to the head/c4 arms; 3 restarts
+of the SAME after-binary reproduced the flip (2× cd2-first, 1× cd1-first), so it is
+pre-existing tie-break instability, not a walker effect (the probe logged 0 deltas). It is
+an instrument hazard for commits 5–8: an EXPLAIN A/B can report a phantom Q85 hunk. Until
+-0047 lands, treat a Q85-only alias-swap hunk as suspected noise and confirm by restarting
+the SAME binary before attributing it to the commit under test.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; TPC-H A/B byte-identical 22/22; SF0.5
+EXPLAIN A/B 96/96; probe 0 deltas / 118 queries; `tpch-spotcheck.sh` RESULT=PASS (Q12=2
+Q13=35, 34.5 s); pgbench smoke via the commit hook. **D4 deviations (ledger row):** the
+timed TPC-H run and the SF0.5 answer sweep were again NOT executed — zero hunks + a
+zero-delta probe on the sole consumer; the walker is read-only, so commit 2's
+metadata-loss class cannot arise. Both become mandatory at the first commit with a
+non-empty diff. Next: commit 5, `exprSide`.

@@ -1026,8 +1026,9 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       (`e7d9b88e`: 0.66 s / 20.27 s / 1.92 s / 1.15 s, one run each). Same
       pre-merge-tip explanation as the executor items. No new work.
 - [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED** — the root-0030
-      fix (checked item above) did not hold: FAILed in nightly runs 20260801
-      and `20260802-014405` (AI-20260802-014405-001; repro:
+      fix (checked item above) did not hold: FAILed in nightly runs 20260801,
+      `20260802-014405`, and `20260803-013955`
+      (AI-20260802-014405-001, AI-20260803-013955-003; repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`).
       **VERIFIED FAILING AT HEAD `e13d6c6f` in isolation (2026-08-02 loop #31,
@@ -1043,6 +1044,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       portals_p2,prepare,select,select_into,text,union,varchar} — 15 baseline-pass
       cases diverged in ONE night, all "output mismatch; normalization rules
       need extension"** (AI-20260802-014405-002..-016, all first-seen 20260802;
+      recurred 20260803 as AI-20260803-013955-004..-018 — the SAME 15 subjects,
+      again alongside the suite-wedge below;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). **Six sampled
       cases (btree_index, char, int2, select, text, union) PASS in ISOLATION at
       HEAD `e13d6c6f` (2026-08-02 loop #31, 3.2 s total)** — so this is almost
@@ -1055,7 +1058,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       it become real. FILED, NOT SELECTED per the 2026-07-28(b) amendment.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
-      (AI-20260802-014405-017, first-seen 20260802; repro:
+      (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
+      AI-20260803-013955-019, same 3 cases aggregates/jsonb/misc; repro:
       `go test -v -run 'TestPort_RegressSuite/aggregates' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). Output truncated
       ⇒ NOT an output divergence — investigate what wedged the cluster at
@@ -1066,6 +1070,34 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
+- [ ] **units/internal/executor + race/internal/executor — REOPENED, new causes**
+      — both lanes failed in nightly `20260803-013955` at sha `1a589c23`
+      (AI-20260803-013955-001/-002, both first-seen tonight; evidence
+      `ci/logs/20260803-013955/{units,race}/go-test.log`). Triaged 2026-08-03
+      loop #35 — TWO distinct causes, do not conflate:
+      (a) **units: stale — already fixed at HEAD.** The only failure is
+      `TestMHJParallelNoDuplicates`, the known e85e5347 miss; the nightly sha
+      `1a589c23` predates the fix `4fb87456` (loop #34). Next nightly should
+      clear the units lane; no work.
+      (b) **race: GENUINE data race, still present at HEAD.**
+      `buildEnvInFlight` (`internal/executor/executor.go:35-41`, introduced by
+      M0126-0006) is a package-level global written by EVERY
+      `buildWithEnv` call, and `BuildWorker` is called concurrently from
+      Gather workers (`operators_gather.go:210` → `executor.go:29`), so any
+      parallel-query worker build races (12 FAILs: TestPartialFinalizeIdentity,
+      TestPartialAggregateRefusals, TestPartialAggregateAccumulatorRetracted —
+      all "race detected during execution of test"). Beyond the detector, it is
+      a correctness hazard: concurrent workers can observe each other's env
+      (root/fusionCfg) in `tryFuseHashCascade`, and the deferred prevEnv
+      restore is order-dependent across goroutines. The single-threaded
+      save/restore was fine when M0126-0006 landed behind the cost-driven flag;
+      the parallel-worker path hits it unconditionally. Fix direction: thread
+      the env as an explicit parameter / builder receiver through the build
+      recursion instead of a package global (NOT a quick patch — every
+      recursive Build site in the operator constructors participates). Until
+      fixed the nightly race lane stays red every night. FILED, NOT SELECTED
+      per the 2026-07-28(b) amendment — the race lane is not on the banner's
+      carve-out gate list and units/tpch-spotcheck/SF0.5 all pass at HEAD.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -2213,10 +2245,37 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `analysis/m0125-0002-c3-plans-20260803/`. En route, the units gate
       was found RED at HEAD (`TestMHJParallelNoDuplicates`, missed by
       `e85e5347`'s test opt-ins) and repaired in `4fb87456`.
-      **Next in THIS task is commit 4 (`visitColumnRefsForTable`) — a
-      first-order shape mover (feeds `tableForCol`, local-filter
-      partitioning and join-edge classification); expect hunks and carry
-      the full timed run + SF0.5 sweep, which needs a QUIET host.**
+      **COMMIT 4 of 8 DONE 2026-08-03 — `visitColumnRefsForTable` re-based
+      onto `walkExprRefs` (`scopeIgnore`; unknown panics), and D2 row 4's
+      "first-order shape mover" prediction is REFUTED by measurement**:
+      TPC-H A/B 22/22 byte-identical (== `post-mhj-retire` lineage), SF0.5
+      EXPLAIN A/B 96/96 byte-identical, AND a `tableForCol` divergence
+      probe (both walker bodies computing the table attribution
+      side-by-side in a measurement-only worktree binary) logged **zero
+      `C4DELTA` disagreements across all 118 planned queries** — so every
+      partitioning/join-edge decision the sole consumer makes is
+      unchanged on both benchmarks. The headline semantic change —
+      `col IN (subquery)` now attributes to col's table instead of -1
+      (the old arm returned before visiting ANYTHING when Plan != nil) —
+      is pinned as a deliberate behaviour pin in
+      `visit_refs_for_table_arms_test.go` (`TestTableForCol_InSubquery…`)
+      but evidently never fires on either benchmark today. Census pin
+      DELETED (second deletion; RC-1a 48 → 47); 11 newly-visited kinds +
+      preserved arms + scope declines + panic pinned, each proved to fail
+      against the old walker first (15 failing subtests recorded). The
+      dead empty-callback call in `extraInScans` (`bushy.go:1703`) was
+      removed — pure traversal with a no-op callback, walker #7's site is
+      untouched. Timed TPC-H run + SF0.5 answer sweep skipped (ledger
+      row; zero hunks + zero-delta probe — the walker is read-only, no
+      commit-2-style metadata loss is possible). **En-route discovery,
+      filed as `M0125-0047` below: SF0.5 Q85's plan alias order
+      (`cd1`/`cd2`) is restart-nondeterministic with an IDENTICAL binary**
+      — surfaced as a probe-arm-only EXPLAIN diff, confirmed by 3
+      restarts of the same after-binary (2 runs cd2-first, 1 run
+      cd1-first). Evidence `analysis/m0125-0002-c4-plans-20260803/`.
+      **Next in THIS task is commit 5 (`exprSide`) — decides which side a
+      conjunct is pushed to; expect hunks and carry the full timed run +
+      SF0.5 sweep on any hunk.**
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
@@ -3789,7 +3848,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
       evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4; nightly keeps
       confirming: `tpch/Q21-timeout` AI-20260802-014405-018, also failed the
-      previous run — same subject, no separate M-NIGHTLY task). Q21 exceeds every
+      previous run, and again 20260803 as AI-20260803-013955-020 — same
+      subject, no separate M-NIGHTLY task). Q21 exceeds every
       budget in **all four** §D5.1 arms — S-cold/off 612 s, S-cold/stage-2 672 s,
       WARM/off 381 s, WARM/stage-2 384 s (300 s cap) — with peak RSS 14.4 GB,
       i.e. it pins the 15 GB cgroup ceiling. Both cardinality inputs are therefore
@@ -4371,6 +4431,27 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (2 of 12 conjuncts qualify). VERBOSE-forced prefixing and `Output:` line
       qualification are also still open (second ledger row).
 
+- [ ] **M0125-0047 — goopg's plan is restart-NONDETERMINISTIC for self-joined
+      identical relations: SF0.5 Q85 tie-swaps `cd1`/`cd2` between server
+      starts of the SAME binary** (filed 2026-08-03 by M0125-0002 commit 4;
+      evidence `analysis/m0125-0002-c4-plans-20260803/README.md` §"q85").
+      Q85 scans `customer_demographics` twice (aliases cd1/cd2, identical
+      estimated rows); which alias lands in which join slot flips across
+      restarts — 3 restarts of one binary produced cd2-first twice and
+      cd1-first once. PG's planner is deterministic (`add_path` tie-breaks
+      are stable given identical inputs), so any flip is a PG-divergence and,
+      worse, an INSTRUMENT hazard: every EXPLAIN-based A/B in this repo
+      (plan-snapshot, the SF0.5 capture, `make plan-diff`) can report a
+      phantom hunk on Q85-shaped queries — commit 4's arms happened to
+      agree, and the flip surfaced only in the probe arm. Suspect: map
+      iteration order in join-graph construction or a non-stable sort over
+      equal-cost/equal-size candidates (tie-break lacks a total order over
+      table indices). Next step: plan Q85 in-process ~20× in a unit test to
+      find the unstable site; fix = deterministic tie-break (compare FROM
+      indices last), then 3-restart re-check. NOT one of the banner's
+      carve-outs (the gates PASS; the flip is rare) — parked under M0125
+      as instrument-integrity debt for the remaining walker commits 5–8,
+      which lean on byte-identical EXPLAIN A/Bs.
 - [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
       (filed 2026-07-31 by `M0125-0037`(i); evidence
