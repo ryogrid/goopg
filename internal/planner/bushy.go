@@ -3038,40 +3038,40 @@ func reresolveJoinByName(j *Join) {
 	visitColumnRefs(j.Predicate, predRebind)
 }
 
-// visitColumnRefs invokes fn on every ColumnRef (and OuterColumnRef
-// via type fallthrough — left out: outer refs reach a different
-// scope) found in the expression tree, including arms of CaseExpr
-// and arguments of FuncCall, BinaryOp, UnaryOp, ExtractExpr.
+// visitColumnRefs invokes fn on every same-scope *ColumnRef in e.
+//
+// M0125-0002 commit 3: built on walkExprRefs / exprChildSlots instead
+// of its own 7-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a cast, a row constructor,
+// an IN-list element or a subquery node's PARAM_EXEC Args — all
+// silently skipped by the old arms — is now visited, and every rebind
+// call site (reresolveExprByName, reresolveJoinByName's predRebind,
+// nl_index_join.go's leftover rebind) re-resolves it instead of leaving
+// its pre-rewrite Index behind (RC-1a).
+//
+// Scope policy: scopeIgnore. All three call sites rebind SAME-SCOPE
+// indices; an inner plan's ColumnRefs live in the subplan's own
+// coordinate space and an *OuterColumnRef names a scope above this
+// one, so neither is handed to fn (both were the old walker's
+// documented declines, preserved — see visit_refs_arms_test.go). A
+// subquery node's Args are same-scope slots (evaluated against the
+// current outer row) and ARE visited.
+//
+// An unenumerated type panics, matching PG's
+// expression_tree_walker_impl (nodeFuncs.c:2667); a silent skip is the
+// RC-1a defect this conversion exists to remove.
 func visitColumnRefs(e Expr, fn func(Expr)) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		fn(x)
-	case *BinaryOp:
-		visitColumnRefs(x.Left, fn)
-		visitColumnRefs(x.Right, fn)
-	case *UnaryOp:
-		visitColumnRefs(x.Operand, fn)
-	case *FuncCall:
-		for _, a := range x.Args {
-			visitColumnRefs(a, fn)
-		}
-	case *ExtractExpr:
-		visitColumnRefs(x.Source, fn)
-	case *CaseExpr:
-		if x.Operand != nil {
-			visitColumnRefs(x.Operand, fn)
-		}
-		for _, w := range x.Whens {
-			visitColumnRefs(w.When, fn)
-			visitColumnRefs(w.Then, fn)
-		}
-		if x.Else != nil {
-			visitColumnRefs(x.Else, fn)
-		}
-	case *InExpr:
-		visitColumnRefs(x.Operand, fn)
-	}
+	walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool {
+			if cr, ok := x.(*ColumnRef); ok {
+				fn(cr)
+			}
+			return true
+		},
+		OnUnknown: func(x Expr) {
+			panic(fmt.Sprintf("visitColumnRefs: unrecognized expression type %T — teach "+
+				"exprChildSlots (exprwalk.go) about it; a silent skip leaves a stale "+
+				"column index behind every rebind site", x))
+		},
+	})
 }

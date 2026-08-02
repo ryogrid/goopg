@@ -2191,6 +2191,32 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       newest-by-mtime), and it carries the timed TPC-H run the moment its plan
       diff is non-empty — commit 2 excused that run only because its diff was
       byte-empty.
+      **COMMIT 3 of 8 DONE 2026-08-03 — `visitColumnRefs` re-based onto
+      `walkExprRefs` (`scopeIgnore`; unknown panics), and D2 row 3's "changes
+      which refs get re-resolved" is REFUTED by a STRONGER instrument than a
+      plan diff**: TPC-H A/B 22/22 byte-identical (== `post-mhj-retire`),
+      SF0.5 EXPLAIN A/B 96/96 byte-identical, AND a divergence probe (both
+      walker bodies run side-by-side in a measurement-only binary) logged
+      **zero visited-set deltas across all 118 planned queries** — needed
+      because EXPLAIN prints Name over Index (M0125-0042) and Index mutation
+      is this commit's only behavioural surface, so a byte-identical plan
+      diff alone cannot excuse the answer sweep here. **Census pin DELETED
+      (the first deletion in the series — no dispatch switch survives)**;
+      11 newly-visited kinds pinned in `visit_refs_arms_test.go`, each
+      proved to fail against the old walker first. Timed TPC-H run skipped
+      again (ledger row); SF0.5 answer sweep not owed (zero hunks + probe;
+      the old body was read-only so commit 2's metadata-loss concern does
+      not arise). **Label note: `m0125-0005-relsize-default-stage2` is now
+      itself stale — `e85e5347` (M0126-0011, MHJ retire) moved 19/22 TPC-H
+      plans; commits 4–8 must diff against `post-mhj-retire` or,
+      preferably, a same-cluster A/B.** Evidence
+      `analysis/m0125-0002-c3-plans-20260803/`. En route, the units gate
+      was found RED at HEAD (`TestMHJParallelNoDuplicates`, missed by
+      `e85e5347`'s test opt-ins) and repaired in `4fb87456`.
+      **Next in THIS task is commit 4 (`visitColumnRefsForTable`) — a
+      first-order shape mover (feeds `tableForCol`, local-filter
+      partitioning and join-edge classification); expect hunks and carry
+      the full timed run + SF0.5 sweep, which needs a QUIET host.**
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`

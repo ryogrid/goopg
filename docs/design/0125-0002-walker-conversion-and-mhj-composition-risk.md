@@ -431,3 +431,60 @@ opposite of the regime it measured — the M0125-0011 defect class (a report nam
 never ran) in its labelling form. Corrected to `unset(2)` in
 `scripts/tpcds-sf05-regression.sh` in this commit. The four raw chunk files are left as the
 harness wrote them and the merged report carries the correction as a note.
+
+### Commit 3 of 8 — `visitColumnRefs` re-based onto `walkExprRefs` (2026-08-03)
+
+Measured in `analysis/m0125-0002-c3-plans-20260803/` (LOADED host — the nightly TPC-DS stage
+ran on :65435 throughout; every instrument here is EXPLAIN-only or a unit test, so nothing is
+a timing).
+
+**D2 row 3's prediction ("changes which refs get re-resolved by name") is REFUTED by
+measurement, by a stronger instrument than commit 2 needed.** TPC-H is 22/22 byte-identical
+(`plan_snapshots/m0125-0002-c3-before.txt` vs `-after.txt`, same-cluster fresh-server arms —
+both also equal to `post-mhj-retire`, the 2026-08-02 baseline) and TPC-DS SF0.5 is 96/96
+byte-identical `EXPLAIN`. But for THIS commit a plan diff cannot carry the verdict alone:
+M0125-0042 established that EXPLAIN prints a predicate's Name over its Index, and Index
+mutation is this conversion's only behavioural surface. So a **divergence probe** closed the
+hole: a measurement-only binary (throwaway worktree, never committed) ran BOTH walker bodies
+inside `visitColumnRefs` and logged any difference in the visited `*ColumnRef` stream
+(pointer-for-pointer, in order). All three rebind call sites run at plan time; planning all
+118 benchmark queries produced **zero deltas**. Identical visit sets ⇒ identical Index
+mutations ⇒ identical executed plans, not merely identically printed ones. The ~10
+newly-visited same-scope shapes (refs under IS NULL, casts, row constructors, IN-list
+elements, subquery-node PARAM_EXEC Args, …) evidently never reach these sites on either
+benchmark today — the walker's incompleteness was load-bearing for correctness nowhere in
+the two workloads, and the conversion removes the latency of that defect class rather than a
+live defect.
+
+**D3's scope policy for this walker: `scopeIgnore`.** All three call sites rebind SAME-scope
+indices; an inner plan's ColumnRefs live in the subplan's own coordinate space (rebinding
+them against the outer child schema is the mirror-image of RC-1a), and an `*OuterColumnRef`
+names a scope above. A subquery node's `Args` ARE same-scope (evaluated against the current
+outer row) and are now visited — the old walker missed them. Unknown types PANIC
+(commit 1's convention, PG's `elog(ERROR, "unrecognized node type")`, nodeFuncs.c:2667);
+a silent skip is the RC-1a defect itself, and the void-visitor signature has no decline path.
+
+**Census pin DELETED, not demoted** — unlike commits 1–2, no dispatch switch survives: the
+`*ColumnRef` filter in the new body is a type assertion. This is the first deletion the
+milestone's audit trail records for the eight named sites.
+`internal/planner/visit_refs_arms_test.go` pins the surface: 11 newly-visited kinds (each
+proved to FAIL against the old walker before conversion), the preserved arms, both scope
+declines (inner plans, outer refs), and the panic — mirroring `remap_arms_test.go`.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; TPC-H A/B byte-identical 22/22; SF0.5 EXPLAIN
+A/B 96/96; probe 0 deltas / 118 queries; `tpch-spotcheck.sh` RESULT=PASS (Q12=2 Q13=35);
+pgbench smoke via the commit hook. **D4 deviations:** the timed TPC-H run was again NOT
+executed (byte-identical plans + zero-delta probe; ledger row 2026-08-03) and the SF0.5
+answer sweep was not run — D4 owes it on "first/last/any-hunk" commits, commit 3 has zero
+hunks, and the probe additionally shows the callback stream is unchanged (commit 2's
+metadata-loss concern does not arise: the old body was read-only, it rebuilt nothing).
+**Label note for commits 4–8:** `m0125-0005-relsize-default-stage2` is itself stale now —
+`e85e5347` (M0126-0011) retired MHJ packing and moved 19/22 TPC-H plans; the current
+baseline label is **`post-mhj-retire`**, and a same-cluster A/B remains the
+staleness-immune instrument.
+
+**Found and fixed en route (separate commit `4fb87456`):** `TestMHJParallelNoDuplicates`
+had been red at HEAD since `e85e5347`, which updated the three planner-side MHJ tests for
+the retired default but missed `internal/executor/parallel_mhj_test.go` — the units
+pre-commit gate was broken for every commit until repaired. Both tests in that file now opt
+in via `SetMHJPackingEnabled(true)` (the identity test had gone silently vacuous).
