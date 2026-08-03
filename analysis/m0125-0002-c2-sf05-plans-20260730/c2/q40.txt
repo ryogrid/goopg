@@ -1,0 +1,16 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: w_state, i_item_id
+    ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+            Workers Planned: 3
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=324869610652 width=0)
+              Filter: ((((i_current_price >= 0.99) AND (i_current_price <= 1.49)) AND (d_date >= ('2001-05-02' - '30 day'::interval))) AND (d_date <= ('2001-05-02' + '30 day'::interval)))
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2371657254 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=40279505 width=0)
+              ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=42399479 width=0)
+                ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=266890 width=0)
+                ->  Seq Scan on public.catalog_returns  (cost=0.00..0.00 rows=31773 width=0)
+              ->  Seq Scan on public.warehouse  (cost=0.00..0.00 rows=190 width=0)
+            ->  Seq Scan on public.item  (cost=0.00..0.00 rows=11776 width=0)
+          ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=27396 width=0)

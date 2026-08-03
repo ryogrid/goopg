@@ -646,6 +646,9 @@ type RangeVar struct {
 	Subquery  *SelectStmt
 	TableFunc *TableFuncRef // M0096-0006: table-valued function (e.g. generate_series)
 	Only      bool          // FROM ONLY tablename — skip inheritance children
+	Lateral   bool          // the LATERAL keyword was written before this item; it may
+	// reference earlier FROM items, which is what makes a FROM
+	// permutation unsafe (planner/joinorder.go, M0125-0034)
 }
 
 // TableFuncRef is a table-valued function used in the FROM clause.

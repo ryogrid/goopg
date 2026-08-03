@@ -1,0 +1,13 @@
+-- M0125-0026 capture  arm=goopg-relsize0  engine=goopg  query=67
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query67.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+     ->  WindowAgg (1 funcs)  (cost=0.00..0.00 rows=1 width=0)
+           Filter: (rk <= 100)
+       ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(6 rows)
+

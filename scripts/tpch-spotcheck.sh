@@ -22,6 +22,16 @@
 #     against bench/tpch/spotcheck_expected.env, stops the server.
 #   - Exits 1 on any row-count mismatch or operational failure, 0 on PASS.
 #
+# Cost reporting (added by M0125-0005, the GOOPG_RELSIZE_FALLBACK default
+# flip): the gate is not only a correctness check — every future commit pays
+# its wall clock, and it runs S-cold, which is exactly the state the relation
+# -size fallback changes. So the run also prints the planner-flag state it
+# started the server with, the query-phase wall clock, and the peak memory of
+# the capped scope (cgroup v2 memory.peak — the whole server tree, not one
+# RSS sample). Those three lines are what makes a "did the default flip make
+# the mandatory gate worse?" question answerable from an artefact instead of
+# a re-run. See docs/design/0125-0005-relsize-fallback-default-flip.md.
+#
 # Expected counts live in bench/tpch/spotcheck_expected.env
 # (Q12_EXPECTED / Q13_EXPECTED). Q13 is load-dependent: re-pin it after
 # every fresh build_schema_goopg.sh (see comments in that file).
@@ -106,6 +116,13 @@ rm -f "${SPOT_PIDFILE}"
 # collide with Ralph / manual test scopes.
 # ---------------------------------------------------------------------------
 echo "tpch-spotcheck: starting fresh goopg on ${PG_HOST}:${PG_PORT} (scope ${CG_UNIT}, log ${SPOT_LOG})"
+# Record the planner-flag state IN the artefact. A timing/RSS number whose arm
+# is only known from the shell that produced it is not reproducible evidence —
+# the same omission was repaired in scripts/tpcds-sf05-regression.sh (M0125-0011).
+# "unset(build default)" rather than "unset(off)": M0125-0005 flipped
+# GOOPG_RELSIZE_FALLBACK's default to stage 2, so spelling the unset case "off"
+# in the artefact would make every future run of this gate misreport its own arm.
+echo "tpch-spotcheck: planner-flags: GOOPG_RELSIZE_FALLBACK=${GOOPG_RELSIZE_FALLBACK:-unset(build default)} GOOPG_COST_DRIVEN_JOINORDER=${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)} GOMEMLIMIT=${GOMEMLIMIT:-unset} GOGC=${GOGC:-unset}"
 GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${PGDATA}" \
     --listen "${PG_HOST}:${PG_PORT}" \
@@ -185,16 +202,46 @@ echo "tpch-spotcheck: data target = ${GATE_USER}@${GATE_DB}"
 # Run Q12 + Q13 via the canonical runner (same HammerDB SQL text as the
 # power test: internal/testutil/tpch.Queries()).
 # ---------------------------------------------------------------------------
+
+# Peak memory of the capped scope, in bytes. cgroup v2 `memory.peak` is a
+# high-water mark maintained by the kernel over the scope's whole lifetime,
+# so it needs no sampling loop and cannot miss a spike between polls — the
+# way a /proc/<pid>/status VmHWM read would if the server had already been
+# stopped. Prints nothing when the run is UNCAPPED (no systemd delegation).
+scope_mem_peak_mb() {
+    local cg peak
+    cg="$(systemctl --user show -p ControlGroup --value "${CG_UNIT}.scope" 2>/dev/null || true)"
+    [[ -n "${cg}" ]] || return 1
+    peak="$(cat "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null || true)"
+    [[ "${peak}" =~ ^[0-9]+$ ]] || return 1
+    awk -v b="${peak}" 'BEGIN { printf "%.0f", b / 1048576 }'
+}
+report_cost() {  # args: phase-wall-clock-seconds
+    local peak_mb
+    echo "tpch-spotcheck: cost: query-phase wall clock ${1}s"
+    if peak_mb="$(scope_mem_peak_mb)"; then
+        echo "tpch-spotcheck: cost: peak scope memory ${peak_mb} MB (cgroup memory.peak, scope ${CG_UNIT})"
+    else
+        echo "tpch-spotcheck: cost: peak scope memory UNAVAILABLE (uncapped run or no cgroup v2 memory.peak)"
+    fi
+}
+
 echo "tpch-spotcheck: running Q12 + Q13 (per-query timeout ${QUERY_TIMEOUT})"
+phase_start_ms="$(date +%s%3N)"
+runner_rc=0
 runner_out="$("${RUNNER_BIN}" \
     --host="${PG_HOST}" --port="${PG_PORT}" \
     --db="${GATE_DB}" --user="${GATE_USER}" --password="${GATE_PASS}" \
-    --queries=12,13 --per-query-timeout="${QUERY_TIMEOUT}" 2>&1)" || {
-        echo "tpch-spotcheck: FATAL — tpch-runner failed:" >&2
-        echo "${runner_out}" >&2
-        exit 1
-    }
+    --queries=12,13 --per-query-timeout="${QUERY_TIMEOUT}" 2>&1)" || runner_rc=$?
+phase_secs="$(awk -v a="${phase_start_ms}" -v b="$(date +%s%3N)" 'BEGIN { printf "%.1f", (b - a) / 1000 }')"
+if (( runner_rc != 0 )); then
+    echo "tpch-spotcheck: FATAL — tpch-runner failed:" >&2
+    echo "${runner_out}" >&2
+    report_cost "${phase_secs}" >&2
+    exit 1
+fi
 echo "${runner_out}"
+report_cost "${phase_secs}"
 
 # Lines look like: "Q12: OK elapsed=78.93s rows=2" / "Q12: ERROR after ..."
 extract_rows() {

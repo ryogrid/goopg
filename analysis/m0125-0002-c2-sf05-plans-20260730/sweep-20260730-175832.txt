@@ -1,0 +1,65 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T17:58:41+09:00
+# goopg: d4071df4 planner(costmodel): M0125-0005 — the relation-size fallback is now the default, and the gate it was feared to degrade got 2.43x cheaper
+# engine-id: 14da0579dab0d1c8b16a827eba614ff0f0c19997 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=099046e8717a
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=6fdcebecd86cf04c on-disk=6fdcebecd86cf04c (/home/ryo/work/goopg/goopg/tmp/goopg-c2-new)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(off) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75) — NOT a gate result; the summary below covers only these queries
+Q51  PASS       14s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS       20s      100 rows  ck=n/a
+Q54  TIMEOUT   313s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q55  PASS        4s       73 rows  ck=46d35b957845db41
+Q56  PASS       29s      100 rows  ck=n/a
+Q57  PASS       57s      100 rows  ck=n/a
+Q58  PASS       20s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       18s      100 rows  ck=n/a
+Q60  PASS       29s      100 rows  ck=n/a
+Q61  PASS       52s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       19s      100 rows  ck=n/a
+Q64  TIMEOUT   315s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   315s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS       16s        5 rows  ck=f6613897dd73709a
+Q67  PASS      155s      100 rows  ck=n/a
+Q68  PASS       23s      100 rows  ck=n/a
+Q69  PASS       16s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  TIMEOUT   313s (oracle 580 rows)
+      (restarting goopg to drop accumulated heap)
+Q72  PASS      313s      100 rows  ck=n/a
+Q73  PASS       16s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       13s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       34s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=20 (6 ck-verified, 14 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=4 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

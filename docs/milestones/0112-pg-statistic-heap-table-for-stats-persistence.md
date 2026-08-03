@@ -1,6 +1,6 @@
 # Milestone 0112 — pg_statistic Heap Table for ANALYZE Statistics Persistence
 
-**Status:** planned
+**Status:** planned (partially landed — see "Status update 2026-07-30" below)
 **Filed:** 2026-05-26
 **Depends on:** M0111 (PG-format codec parity, accepted), M0030 (catalog persistence and DDL WAL, accepted)
 **Reference plan:** `.ralph/fix_plan.md` (M0112 section)
@@ -52,3 +52,29 @@ established for `pg_attribute` in M0111.
 - Full `pg_statistic_ext` (extended statistics) support.
 - `pg_statistic` visibility via SQL `SELECT` (system catalog SeqScan) can be
   a follow-up once the physical format is correct.
+
+## Status update 2026-07-30
+
+**Partially landed.** The write and reload halves exist:
+`persistStatsToPGStatistic` (`internal/executor/operators_analyze.go:184`)
+writes PG18-canonical per-column rows on every ANALYZE, and
+`loadStatisticsFromHeap` (`internal/initdb/open.go:3479`) restores them at
+startup. Three gaps remain, measured and recorded in
+`docs/design/0125-0028-warm-stats-programme.md`:
+
+1. Both halves are wired to the **default database only** (`DefaultDBOid` /
+   `cat.DBOID()`), so per-DB tables never round-trip.
+2. `RowCount`/`Pages` (reltuples/relpages) are **not persisted at all**
+   (ledger `pq-P6`) — pg_statistic has no slot for them and goopg's
+   `pg_class` is virtual, so the planner's size consumers stay blind after a
+   restart even where column stats return.
+3. ANALYZE results were measured invisible across connections (2026-07-23),
+   which defeats persistence end-to-end.
+
+**M0125-0029 (user directive 2026-07-30) closes all three as an authorized
+interim**: the user explicitly waived the PG-faithfulness bar for the
+RowCount/Pages persistence mechanism, so it may land goopg-private — with the
+constraint that the PG-scannable pg_statistic rows stay PG18-canonical
+(additive only). This milestone stays open as the **PG-faithful end-state**
+(standby-readable statistics story, full `anyarray` fidelity) and must not be
+marked complete by M0125-0029's landing.

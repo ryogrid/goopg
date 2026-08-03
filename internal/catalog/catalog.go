@@ -408,13 +408,25 @@ type Table struct {
 	OfTypeOID uint32
 
 	// SmallDimension flags a table whose row count is known to
-	// be ≤ a tiny constant — the canonical TPC-H examples are
-	// `region` (5 rows) and `nation` (25 rows). The planner uses
-	// the flag as a cardinality fallback when ANALYZE-derived
-	// stats are absent: a hash join with a SmallDimension side
-	// pins the small side as the build side regardless of the
-	// other side's estimated rows. See M0054-0010 / design doc
+	// be ≤ a tiny constant. The planner uses it as a cardinality
+	// fallback when ANALYZE-derived stats are absent: a hash join
+	// with a SmallDimension side pins the small side as the build
+	// side regardless of the other side's estimated rows. See
+	// M0054-0010 / design doc
 	// `docs/design/0054-0005-hash-join-small-side-build.md`.
+	//
+	// M0125-0043 RETIRED the two production writers of this field.
+	// They set it for a relation literally named `region` or
+	// `nation` — the tiny TPC-H dimension tables — which made a
+	// benchmark's schema part of the production planner and left
+	// every other tiny dimension untreated. The planner now DERIVES
+	// the property from the relation's size at plan time
+	// (`internal/planner/small_dimension.go`) and stamps it on the
+	// scan node. The field survives as an explicit hint for
+	// catalog-only fixtures with no heap to measure
+	// (`internal/testutil/tpch`); nothing in production sets it, so
+	// on a live server it is always false. See
+	// `docs/design/0125-0043-smalldimension-name-tag-extinction.md`.
 	SmallDimension bool
 
 	// RelFrozenXID is the minimum XID still present in the heap as an
@@ -3496,6 +3508,22 @@ const (
 	StatisticRelationId uint32 = 2619 // pg_statistic
 	AggregateRelationId uint32 = 2600 // pg_aggregate
 )
+
+// GoopgRelStatsRelationId is the goopg-PRIVATE sidecar heap that persists a
+// relation's ANALYZE-measured size (reltuples/relpages) per database, beside
+// that database's pg_statistic heap (base/<dbOid>/9410 next to
+// base/<dbOid>/2619). PG has no such relation: upstream stores these counts
+// in pg_class, which goopg renders VIRTUALLY from Table.Stats, so the counts
+// had no durable home and every restart forgot them (ledger pq-P6). The
+// M0125-0029 user directive explicitly waives PG-faithfulness for this one
+// persistence: the sidecar has no pg_class row in any database, so a PG
+// standby (which only opens relations it finds in pg_class) never reads it,
+// and the pg_statistic rows it sits beside stay PG18-canonical. The OID is
+// from PG's 8000-9999 development range (unused by released PG18) and sits
+// beside goopg's existing private use of 9400. Layout:
+// executor.GoopgRelStatsColumns; writer: executor.persistStatsToPGStatistic;
+// reader: initdb.loadStatisticsFromHeapForDB.
+const GoopgRelStatsRelationId uint32 = 9410
 
 // FirstUserOID is the first OID handed out for user-created tables.
 // 16384 is upstream's `FirstNormalObjectId` — anything below is
@@ -20377,6 +20405,29 @@ func (c *InMemory) AllTables(dbOid ...uint32) []*Table {
 		cp := *t
 		cp.Columns = append([]Column(nil), t.Columns...)
 		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// UserTableHandles returns the live *Table handles of every non-virtual
+// relation registered under dbOid, in OID order. Sibling of AllTables with a
+// deliberately different ownership contract: AllTables deep-copies because the
+// logical-decoding snapshot builder must freeze the schema, while bare
+// `ANALYZE` (M0125-0028) needs the canonical catalog pointers —
+// SetTableStats's contract is "the Table came from LookupTable/CreateTable on
+// this catalog", and publishing stats onto a copy would silently discard the
+// whole ANALYZE scan.
+func (c *InMemory) UserTableHandles(dbOid ...uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0, len(ns.tables))
+	for _, t := range ns.tables {
+		if t.Virtual {
+			continue
+		}
+		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out

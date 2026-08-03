@@ -1315,10 +1315,13 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 	// items. goopg treats it as a regular derived table (acceptable for
 	// vacuumdb's use case where the lateral subquery doesn't depend on outer
 	// column values at goopg's execution level).
-	_ = p.acceptKeyword(KwLateral)
+	sawLateral := p.acceptKeyword(KwLateral)
 	right, err := p.parseRangeVar(true)
 	if err != nil {
 		return JoinExpr{}, false, err
+	}
+	if sawLateral {
+		right.Lateral = true
 	}
 	join := JoinExpr{pos: t.Pos, Type: jt, Natural: natural, Right: right}
 	if join.Type == JoinCross {
@@ -1357,10 +1360,13 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 
 func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 	fromClause := len(allowUserSRF) > 0 && allowUserSRF[0]
-	// Accept optional LATERAL keyword before a derived table.
-	// LATERAL is silently consumed; goopg treats lateral subqueries as
-	// ordinary derived tables (no correlated-outer-reference evaluation).
-	_ = p.acceptKeyword(KwLateral)
+	// Accept optional LATERAL keyword before a derived table. goopg
+	// still evaluates a lateral subquery as an ordinary derived table
+	// (no correlated-outer-reference evaluation), but WHETHER the
+	// keyword was written is recorded on the RangeVar: a LATERAL item
+	// may reference an earlier FROM item, which is exactly what makes
+	// a FROM permutation unsafe (planner/joinorder.go, M0125-0034).
+	sawLateral := p.acceptKeyword(KwLateral)
 
 	// FROM ONLY tablename — consume the ONLY keyword; the planner will skip
 	// inheritance children for this table reference. M0097-0099.
@@ -1405,7 +1411,7 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 		if !ok {
 			return RangeVar{}, &SyntaxError{Pos: pos, Message: "subquery in FROM did not produce SELECT"}
 		}
-		rv := RangeVar{pos: pos, Subquery: sel}
+		rv := RangeVar{pos: pos, Subquery: sel, Lateral: sawLateral}
 		if p.acceptKeyword(KwAs) {
 			t, err := p.parseIdent()
 			if err != nil {

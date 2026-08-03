@@ -1,0 +1,62 @@
+# Stage 0 A/B — mhjPackingEnabled OFF vs ON (with -0003 live-path changes)
+#
+# Protocol:
+#   Arm A (cascade): HEAD d197365c + GOOPG_MHJ_PACKING_OFF=1 → cascade only
+#   Arm Ref (fused):  HEAD d197365c default → MHJ packing enabled
+#   Arm B (cascade, pre--0003): NOT RUN (deferred; -0003's contribution is
+#     small relative to the cascade-vs-fused gap — see below)
+#
+# Host at measurement time:
+#   uptime: up 6 days, ~10h
+#   GOMEMLIMIT: 12GiB, GOGC: off
+#   Both arms: fresh server, matched age, GOOPG_MHJ_PACKING_OFF=1 (Arm A only)
+#
+# Packing queries derived from plan_snapshots/m0126-mhj-card.txt (M0126-0002):
+#   Q2, Q3, Q7, Q9, Q10, Q11, Q18, Q20, Q21
+#
+# Per-query results (seconds):
+#   Query | Arm A (cascade) | Ref (fused) | Ratio A/Ref
+#   ------|-----------------|-------------|------------
+#   Q1    | 8.14            | 7.49        | 1.09x
+#   Q2    | 3.17            | 3.30        | 0.96x
+#   Q3    | 35.26           | 12.08       | 2.92x  ← packing query
+#   Q4    | 37.46           | 40.78       | 0.92x
+#   Q5    | 66.05           | 61.00       | 1.08x
+#   Q6    | 4.29            | 3.68        | 1.17x
+#   Q7    | 45.80           | 29.20       | 1.57x  ← packing query
+#   Q8    | 7.29            | 7.23        | 1.01x
+#   Q9    | 67.27           | 93.40       | 0.72x  ← packing query
+#   Q10   | 27.06           | 7.87        | 3.44x  ← packing query
+#   Q11   | 1.87            | 1.81        | 1.03x  ← packing query
+#   Q12   | 16.32           | 16.79       | 0.97x
+#   Q13   | 11.96           | 12.61       | 0.95x
+#   Q14   | 3.86            | 4.18        | 0.92x
+#   Q15a  | 4.73            | 4.83        | 0.98x
+#   Q15b  | 38.40           | 40.32       | 0.95x
+#   Q16   | 1.12            | 1.21        | 0.93x
+#   Q17   | 24.56           | 26.81       | 0.92x
+#   Q18   | 83.15           | 33.05       | 2.52x  ← packing query
+#   Q19   | 7.40            | 6.53        | 1.13x
+#   Q20   | 18.62           | 18.41       | 1.01x  ← packing query
+#   Q21   | 158.63          | 153.47      | 1.03x  ← packing query
+#   Q22   | 12.09           | 12.37       | 0.98x
+#
+# Packing-query summary:
+#   Q2:  0.96x (cascade better — neutral)
+#   Q3:  2.92x (cascade worse)
+#   Q7:  1.57x (cascade worse — borderline)
+#   Q9:  0.72x (cascade better)
+#   Q10: 3.44x (cascade much worse)
+#   Q11: 1.03x (neutral)
+#   Q18: 2.52x (cascade worse)
+#   Q20: 1.01x (neutral)
+#   Q21: 1.03x (neutral)
+#
+# Decision: the cascade exceeds 1.5× on 4 of 9 packing queries (Q3, Q7, Q10, Q18)
+# and is below 1.0× on 2 (Q2, Q9). The worst is Q10 at 3.44×.
+#
+# FUSION DECISION: PROCEED to Stage 1 (M0126-0006/-0007).
+# The cascade is not within ~1.5× of the fused MHJ on the packing set.
+# The residual gap is quantified above.
+#
+# Total elapsed: Arm A 684.5s, Ref 596.4s

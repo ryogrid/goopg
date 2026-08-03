@@ -1,0 +1,12 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: sum, ss_customer_sk
+    ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+            Workers Planned: 4
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=606451501 width=0)
+              Filter: (r_reason_desc = 'reason 58')
+          ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=142694471 width=0)
+            ->  Seq Scan on public.store_sales  (cost=0.00..0.00 rows=505937 width=0)
+            ->  Seq Scan on public.store_returns  (cost=0.00..0.00 rows=56408 width=0)
+          ->  Seq Scan on public.reason  (cost=0.00..0.00 rows=850 width=0)

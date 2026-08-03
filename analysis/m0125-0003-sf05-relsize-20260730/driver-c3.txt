@@ -1,0 +1,32 @@
+===== CHUNK Q54-Q72 begins 2026-07-30T14:50:22+09:00 =====
+[14:50:22] goopg SF0.5 sweep (timeout 300s/query, S-cold) -> analysis/m0125-0003-sf05-relsize-20260730/sweep-20260730-145022.txt
+[14:50:22] building goopg -> /home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin (tree 8453037b)
+Q54  TIMEOUT   307s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q55  PASS        2s       73 rows  ck=46d35b957845db41
+Q56  PASS       31s      100 rows  ck=n/a
+Q57  PASS       56s      100 rows  ck=n/a
+Q58  PASS       20s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       18s      100 rows  ck=n/a
+Q60  PASS       29s      100 rows  ck=n/a
+Q61  PASS       52s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       20s      100 rows  ck=n/a
+Q64  TIMEOUT   308s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   306s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q66  PASS       16s        5 rows  ck=f6613897dd73709a
+Q67  PASS      157s      100 rows  ck=n/a
+Q68  PASS       22s      100 rows  ck=n/a
+Q69  PASS       17s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  TIMEOUT   306s (oracle 580 rows)
+      (restarting goopg to drop accumulated heap)
+Q72  TIMEOUT   307s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+
+=== SUMMARY: PASS=13 (4 ck-verified, 9 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=5 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+[15:24:40] sweep report: analysis/m0125-0003-sf05-relsize-20260730/sweep-20260730-145022.txt
+===== CHUNK Q54-Q72 rc=0 ends 2026-07-30T15:24:40+09:00 =====

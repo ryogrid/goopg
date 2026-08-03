@@ -1,0 +1,12 @@
+Sort  (cost=0.00..0.00 rows=100 width=0)
+  Sort Key: i_product_name
+  ->  Unique  (cost=0.00..0.00 rows=100 width=0)
+    ->  Limit  (cost=0.00..0.00 rows=100 width=0)
+      ->  Sort  (cost=0.00..0.00 rows=666 width=0)
+            Sort Key: i_product_name
+        ->  Seq Scan on public.item i1 (stats)  (cost=0.00..0.00 rows=18000 width=0)
+              Filter: (((i_manufact_id >= 704) AND (i_manufact_id <= 744)) AND ((SubPlan 1) > 0))
+              SubPlan 1
+                ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                  ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                        Filter: (((i_manufact = $0) AND (((((((i_category = 'Women') AND ((i_color = 'forest') OR (i_color = 'lime'))) AND ((i_units = 'Pallet') OR (i_units = 'Pound'))) AND ((i_size = 'economy') OR (i_size = 'small'))) OR ((((i_category = 'Women') AND ((i_color = 'navy') OR (i_color = 'slate'))) AND ((i_units = 'Gross') OR (i_units = 'Bunch'))) AND ((i_size = 'extra large') OR (i_size = 'petite')))) OR ((((i_category = 'Men') AND ((i_color = 'powder') OR (i_color = 'sky'))) AND ((i_units = 'Dozen') OR (i_units = 'Lb'))) AND ((i_size = 'N/A') OR (i_size = 'large')))) OR ((((i_category = 'Men') AND ((i_color = 'maroon') OR (i_color = 'smoke'))) AND ((i_units = 'Ounce') OR (i_units = 'Case'))) AND ((i_size = 'economy') OR (i_size = 'small'))))) OR ((i_manufact = $0) AND (((((((i_category = 'Women') AND ((i_color = 'dark') OR (i_color = 'aquamarine'))) AND ((i_units = 'Ton') OR (i_units = 'Tbl'))) AND ((i_size = 'economy') OR (i_size = 'small'))) OR ((((i_category = 'Women') AND ((i_color = 'frosted') OR (i_color = 'plum'))) AND ((i_units = 'Dram') OR (i_units = 'Box'))) AND ((i_size = 'extra large') OR (i_size = 'petite')))) OR ((((i_category = 'Men') AND ((i_color = 'papaya') OR (i_color = 'peach'))) AND ((i_units = 'Bundle') OR (i_units = 'Carton'))) AND ((i_size = 'N/A') OR (i_size = 'large')))) OR ((((i_category = 'Men') AND ((i_color = 'firebrick') OR (i_color = 'sienna'))) AND ((i_units = 'Cup') OR (i_units = 'Each'))) AND ((i_size = 'economy') OR (i_size = 'small'))))))

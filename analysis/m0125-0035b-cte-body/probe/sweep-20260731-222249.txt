@@ -1,0 +1,15 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T22:23:09+09:00
+# goopg: a7a45eaa planner(joinorder)+parser+docs: M0125-0034 Q65 arm — a derived table without LATERAL provably cannot see its siblings, so it reorders like a WITH reference
+# engine-id: 83247a9924548f0d3262dcc9c4a5dfc2217ea2f4 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=459d171e93cc
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=1580a0f823a018b3 on-disk=1580a0f823a018b3 (tmp/goopg-sf05-m0125-0035b-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=31 78) — NOT a gate result; the summary below covers only these queries
+Q31  PASS       11s       19 rows  ck=2a74acfb556c21a7
+Q78  TIMEOUT   320s (oracle 45 rows)
+      (restarting goopg to drop accumulated heap)
+
+=== SUMMARY: PASS=1 (1 ck-verified, 0 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

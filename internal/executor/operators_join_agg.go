@@ -560,8 +560,6 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if err := buildOp.Open(ctx); err != nil {
 		return false, err
 	}
-		var nullRight Row
-		var keyRow Row
 		buildCount := 0
 		for {
 			// M0062-followup: ctx check inside the build loop. With
@@ -586,15 +584,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			if leftWidth == 0 && len(l) > 0 {
 				leftWidth = len(l); o.lazyLW = leftWidth
 			}
-			if nullRight == nil {
-				nullRight = nullRow(rightWidth)
-			}
-			if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
-				keyRow = make(Row, leftWidth+rightWidth)
-			}
-			copy(keyRow[:leftWidth], l)
-			copy(keyRow[leftWidth:], nullRight)
-			kd, ok, err := o.evalHashKeyDatum(o.plan.LeftKey, keyRow)
+			// M0126-0003 0b: evaluate the key against a VirtualSlot
+			// over {lSlot, nullRight} instead of copying into a
+			// merged keyRow.
+			keySlot := mergedKeySlot(lSlot, leftWidth, rightWidth, true)
+			kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
 			if err != nil {
 			return false, err
 		}
@@ -626,8 +620,6 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	if err := buildOp.Open(ctx); err != nil {
 		return false, err
 	}
-	var nullLeft Row
-	var keyRow Row
 	buildCount := 0
 	for {
 		// M0062-followup: same ctx check on the build-right path.
@@ -648,15 +640,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r); o.lazyRW = rightWidth
 		}
-		if nullLeft == nil {
-			nullLeft = nullRow(leftWidth)
-		}
-		if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
-			keyRow = make(Row, leftWidth+rightWidth)
-		}
-		copy(keyRow[:leftWidth], nullLeft)
-		copy(keyRow[leftWidth:], r)
-		kd, ok, err := o.evalHashKeyDatum(o.plan.RightKey, keyRow)
+		// M0126-0003 0b: evaluate the key against a VirtualSlot
+		// over {nullLeft, rSlot} instead of copying into a
+		// merged keyRow.
+		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.RightKey, keySlot)
 		if err != nil {
 			return false, err
 		}
@@ -703,22 +691,16 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 	}
 	o.preserveBuildSide = true
 	o.lazyHashCTID = make(map[string][]joinRowCTID)
-	var nullLeft Row
-	var keyRow Row
 	for i, r := range rows {
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r)
 			o.lazyRW = rightWidth
 		}
-		if nullLeft == nil {
-			nullLeft = nullRow(leftWidth)
-		}
-		if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
-			keyRow = make(Row, leftWidth+rightWidth)
-		}
-		copy(keyRow[:leftWidth], nullLeft)
-		copy(keyRow[leftWidth:], r)
-		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
+		// M0126-0003 0b: slot-based key evaluation — skip the
+		// merged keyRow copy.
+		rSlot := SlotFromRow(nil, r)
+		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
+		key, ok, err := o.evalHashKeySlot(o.plan.RightKey, keySlot)
 		if err != nil {
 			return err
 		}
@@ -968,6 +950,65 @@ func (o *joinOp) evalHashKeyDatum(keyExpr planner.Expr, row Row) (Datum, bool, e
 	return v, true, nil
 }
 
+// evalHashKeyDatumSlot is the SlotView variant of evalHashKeyDatum.
+// M0126-0003 Stage 0b: evaluates the key expression against a slot
+// instead of a merged Row, so callers can pass a VirtualSlot over
+// {realSide, nullOtherSide} and skip the per-row merged-Row copy.
+func (o *joinOp) evalHashKeyDatumSlot(keyExpr planner.Expr, slot SlotView) (Datum, bool, error) {
+	v, err := evalExprSlot(keyExpr, slot, o.ctx)
+	if err != nil {
+		return Datum{}, false, err
+	}
+	if v.IsNull() {
+		return Datum{}, false, nil
+	}
+	return v, true, nil
+}
+
+// evalHashKeySlot is the SlotView variant of evalHashKey.
+func (o *joinOp) evalHashKeySlot(keyExpr planner.Expr, slot SlotView) (string, bool, error) {
+	v, err := evalExprSlot(keyExpr, slot, o.ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if v.IsNull() {
+		return "", false, nil
+	}
+	return datumKey(v), true, nil
+}
+
+// mergedKeySlot builds a VirtualSlot that presents the merged
+// (left+right) column space for hash-key evaluation. realSlot
+// contributes realWidth columns; the other nullWidth columns are NULL.
+// realOnLeft=true means realSlot occupies indices [0, realWidth).
+// The returned slot satisfies SlotView and is valid until the next
+// probe/build pull (the realSlot source must outlive it).
+func mergedKeySlot(realSlot TupleSlot, realWidth, nullWidth int, realOnLeft bool) *VirtualSlot {
+	total := realWidth + nullWidth
+	nullRow := make(Row, nullWidth)
+	nullSlot := SlotFromRow(nil, nullRow)
+	var sources []TupleSlot
+	cols := make([]virtualCol, total)
+	if realOnLeft {
+		sources = []TupleSlot{realSlot, nullSlot}
+		for i := 0; i < realWidth; i++ {
+			cols[i] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+		}
+		for i := 0; i < nullWidth; i++ {
+			cols[realWidth+i] = virtualCol{sourceIdx: 1, sourceCol: int16(i)}
+		}
+	} else {
+		sources = []TupleSlot{nullSlot, realSlot}
+		for i := 0; i < nullWidth; i++ {
+			cols[i] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+		}
+		for i := 0; i < realWidth; i++ {
+			cols[nullWidth+i] = virtualCol{sourceIdx: 1, sourceCol: int16(i)}
+		}
+	}
+	return &VirtualSlot{sources: sources, cols: cols}
+}
+
 // lazyHashInsertDatum inserts a build row keyed by keyDatum. It always
 // populates lazyHash (string) and, while every key so far has been
 // int64-representable, also lazyIntHash. The first non-int64 key drops the
@@ -1114,7 +1155,6 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	if o.lazyNullRight == nil || len(o.lazyNullRight) != o.lazyRW {
 		o.lazyNullRight = nullRow(o.lazyRW)
 	}
-	nullLeft := o.lazyNullLeft
 	nullRight := o.lazyNullRight
 	o.ensureLazyVirtual()
 	// Cancellation: cheap ctx check per Next() call so a long
@@ -1213,31 +1253,30 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		}
 		r := slotRow(probeSlot)
 		o.lazyRow = r
-		// M0054-0005b: reuse a single keyRow buffer across probe
-		// rows. evalHashKey only reads the column slot the join key
-		// references, so the throwaway buffer is safe.
-		w := o.lazyLW + o.lazyRW
-		if o.lazyKeyRow == nil || len(o.lazyKeyRow) != w {
-			o.lazyKeyRow = make(Row, w)
+		// M0126-0003 0b: evaluate the probe key against a
+		// VirtualSlot over {probeSlot, nullOtherSide} instead
+		// of copying into lazyKeyRow.
+		//
+		// realWidth must match the probe side's width:
+		//   BuildLeft=true  → probe is right side → realWidth=lazyRW
+		//   BuildLeft=false → probe is left side  → realWidth=lazyLW
+		var keySlot *VirtualSlot
+		var probeKeyExpr planner.Expr
+		if o.plan.BuildLeft {
+			keySlot = mergedKeySlot(probeSlot, o.lazyRW, o.lazyLW, false)
+			probeKeyExpr = o.plan.RightKey
+		} else {
+			keySlot = mergedKeySlot(probeSlot, o.lazyLW, o.lazyRW, true)
+			probeKeyExpr = o.plan.LeftKey
 		}
 		var key string // used only by the string path + the CTID lookup
 		var ok bool
-		var probeKeyExpr planner.Expr
-		if o.plan.BuildLeft {
-			copy(o.lazyKeyRow[:o.lazyLW], nullLeft)
-			copy(o.lazyKeyRow[o.lazyLW:], r)
-			probeKeyExpr = o.plan.RightKey
-		} else {
-			copy(o.lazyKeyRow[:o.lazyLW], r)
-			copy(o.lazyKeyRow[o.lazyLW:], nullRight)
-			probeKeyExpr = o.plan.LeftKey
-		}
 		var matches []Row
 		if o.lazyHashIsInt {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatum(probeKeyExpr, o.lazyKeyRow)
+			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyExpr, keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -1251,7 +1290,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// Assign the OUTER key: the preserveBuildSide CTID lookup
 			// below reads o.lazyHashCTID[key], so a shadowing inner
 			// declaration would leave it empty for FOR UPDATE joins.
-			key, ok, err = o.evalHashKey(probeKeyExpr, o.lazyKeyRow)
+			key, ok, err = o.evalHashKeySlot(probeKeyExpr, keySlot)
 			if err != nil {
 				return nil, err
 			}

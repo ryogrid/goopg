@@ -1,0 +1,18 @@
+Limit  (cost=0.00..0.00 rows=1 width=0)
+  ->  Finalize Aggregate  (cost=0.00..0.00 rows=1 width=0)
+    ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+          Workers Planned: 3
+      ->  Partial Aggregate  (cost=0.00..0.00 rows=1 width=0)
+        ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+              Filter: ((((i_manufact_id = 722) AND (d_date >= '2001-03-09')) AND (d_date <= ('2001-03-09' + '90 day'::interval))) AND (cs_ext_discount_amt > (SubPlan 1)))
+              SubPlan 1
+                ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                  ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                        Filter: ((d_date >= '2001-03-09') AND (d_date <= ('2001-03-09' + '90 day'::interval)))
+                    ->  Index Scan using public.catalog_sales_pkey on public.catalog_sales  (cost=0.00..0.00 rows=1 width=0)
+                          Index Cond: (cs_item_sk = $0)
+                    ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+                          Index Cond: (d_date_sk = cs_sold_date_sk)
+          ->  Seq Scan on public.date_dim  (cost=0.00..0.00 rows=27396 width=0)
+          ->  Seq Scan on public.item  (cost=0.00..0.00 rows=11776 width=0)
+          ->  Seq Scan on public.catalog_sales  (cost=0.00..0.00 rows=266890 width=0)

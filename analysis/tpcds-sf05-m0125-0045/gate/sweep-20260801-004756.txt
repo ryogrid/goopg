@@ -1,0 +1,45 @@
+# TPC-DS SF0.5 goopg sweep — 2026-08-01T00:48:05+09:00
+# goopg: 433bfddd planner(cte+joins)+docs: M0125-0035 CTE-body arm — the plan was PG-identical and still quadratic, because the hash key was the one column every row now agreed on
+# engine-id: 6ad8fdf2545fb91b9785f399d43ccb3a0075deb9 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=dc2b443621ff
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=88deed1d2a992498 on-disk=88deed1d2a992498 (/home/ryo/work/goopg/goopg/tmp/goopg-sf05-m0125-0045-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 ) — NOT a gate result; the summary below covers only these queries
+Q67  PASS      156s      100 rows  ck=n/a
+Q68  PASS       12s      100 rows  ck=n/a
+Q69  PASS       15s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       17s      580 rows  ck=521a7af7606d10c1
+Q72  PASS      308s      100 rows  ck=n/a
+Q73  PASS       15s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       12s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       34s      100 rows  ck=n/a
+Q76  PASS       17s      100 rows  ck=n/a
+Q77  PASS       17s       44 rows  ck=2afe8ddcd18fad9c
+Q78  PASS       24s       45 rows  ck=8f67acff3895183f
+Q79  PASS       14s      100 rows  ck=n/a
+Q80  PASS       27s      100 rows  ck=n/a
+Q81  PASS        0s      100 rows  ck=n/a
+Q82  PASS       31s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        3s        3 rows  ck=9504298446f22ddc
+Q84  PASS        1s        6 rows  ck=073898a18264bd8e
+Q85  PASS        4s        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       18s        1 rows  ck=b363a9287bdd0920
+Q88  PASS      111s        1 rows  ck=272de7cd629d9033
+Q89  PASS       20s      100 rows  ck=n/a
+Q90  PASS        9s        1 rows  ck=66ceccaa8ce9d2cf
+Q91  PASS        2s        1 rows  ck=88b9d5fffed589f8
+Q92  PASS        1s        1 rows  ck=26c02866b1827f1b
+Q93  PASS        3s        0 rows  ck=1f18d650d205d71d
+Q94  PASS       10s        1 rows  ck=04afc1b69831a5ea
+Q95  PASS       18s        1 rows  ck=e498634c02595c29
+Q96  PASS       12s        1 rows  ck=5923f3c62773e705
+Q97  PASS       16s        1 rows  ck=65725195ebe13a3b
+Q98  PASS        9s     2128 rows  ck=be1b9a6d08cb1a3d
+Q99  PASS        8s       90 rows  ck=b10fd5001836fcfb
+
+=== SUMMARY: PASS=31 (21 ck-verified, 10 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=2 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

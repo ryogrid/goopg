@@ -99,6 +99,28 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	if costDrivenJoinOrder {
 		reconcileNLILayout(node)
 	}
+	// M0125-0035 CTE-body arm: carry a restriction sitting on a
+	// single-reference CTE's output through the reference into the body
+	// (PG 12+ cte_inline + subquery qual pushdown). Runs from Plan()'s
+	// tail because that is the first point where every reference has
+	// been planned and plannedCTE.refs is final — an inner scope's pass
+	// could see refs==1 while a later sibling subquery adds a second
+	// reference to the same shared body.
+	pushQualsThroughSingleRefCTEs(node)
+	// M0125-0035 EC arm follow-through: qual placement (the two passes
+	// above plus the per-scope join pass) can pin a hash join's key
+	// column to a constant on BOTH inputs, collapsing the hash table
+	// into one bucket (Q78's top spine). Re-pick the key pair from the
+	// join's remaining equalities where that happened — result-neutral,
+	// the executor enforces the full Predicate per match either way.
+	reselectDegenerateHashKeys(node)
+	// M0125-0036 (C3): turn a correlated EXISTS that no pass could make a
+	// semi-join into a hashable uncorrelated ANY sublink (upstream's
+	// convert_EXISTS_to_ANY). Must run AFTER every index-rewriting pass —
+	// it synthesises a host-scope ColumnRef out of the body's
+	// OuterColumnRef — and BEFORE lowering, which is what would otherwise
+	// bind that correlation to a PARAM_EXEC slot.
+	node = rewriteExistsToAny(node)
 	return lowerSubPlanParams(node), nil
 }
 
@@ -2314,12 +2336,20 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				}
 				return scan, b, nil
 			}
+			// Statement-wide reference count for the cte_inline decision.
+			// Every reference — FROM clauses and sublink subqueries alike —
+			// is planned through this one site, so the count can only be
+			// exact or an overcount (a replanned-and-discarded subtree
+			// increments too), never an undercount. Overcounting declines
+			// inlining, which is the safe direction. M0125-0035.
+			ce.refs++
 			scan := &CTEScan{
 				pos:    rv.Pos(),
 				Name:   ce.name,
 				Alias:  alias,
 				Child:  ce.body,
 				schema: ce.schema,
+				cte:    ce,
 			}
 			return scan, b, nil
 		}
@@ -2483,7 +2513,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
 					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
-						EstRelRows: stage1RelSizeRows(cat, leaf)}
+						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2520,7 +2550,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-				EstRelRows: stage1RelSizeRows(cat, tbl)}
+				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
 			var root Node = parentWrapped
@@ -2534,7 +2564,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
 				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
-					EstRelRows: stage1RelSizeRows(cat, child)}
+					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2555,7 +2585,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-		EstRelRows: stage1RelSizeRows(cat, tbl)}, b, nil
+		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}, b, nil
 }
 
 // stage1RelSizeRows is the single stamping point for the relation-size
@@ -5332,7 +5362,26 @@ type aggregateSurface struct {
 	// t.f1 to also appear in GROUP BY — unlike non-USING GROUP BY c which satisfies
 	// SELECT t.c. M0097-0155.
 	groupByMergedByName map[string]bool
-	aggregateByKey      map[string]aggregateBinding
+	// groupByAmbiguous marks parserExprKey values claimed by more than one
+	// GROUP BY item. parserExprKey deliberately drops the table qualifier, so
+	// every alias of a self-joined table hashes to the same key and only the
+	// last one keeps the slot. Where that happens the name no longer identifies
+	// a slot and the target list must resolve by binding instead. M0125-0044.
+	groupByAmbiguous map[string]bool
+	// groupByExprQual is the same map as groupByExpr but keyed WITH the
+	// ColumnRef qualifiers, so d1.d_year and d2.d_year occupy separate
+	// entries. Consulted only for a contested key. M0125-0044.
+	groupByExprQual map[string]int
+	aggregateByKey  map[string]aggregateBinding
+	// aggregateAmbiguous marks aggregateCallKey values claimed by more than
+	// one distinct aggregate call. The key builds its argument part on
+	// parserExprKey, so count(d1.y) and count(d2.y) over a self-joined table
+	// hash equal and only one kept a slot — right cardinality, wrong values,
+	// the aggregate half of the -0044 GROUP BY collapse. M0125-0045.
+	aggregateAmbiguous map[string]bool
+	// aggregateByKeyQual is aggregateByKey keyed WITH the ColumnRef
+	// qualifiers. Consulted only for a contested key. M0125-0045.
+	aggregateByKeyQual map[string]aggregateBinding
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -5942,6 +5991,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
+	groupByAmbiguous := map[string]bool{}
+	groupByExprQual := map[string]int{}
 	var groupByMergedByName map[string]bool // populated only when USING-join cols appear in GROUP BY
 	outputSchema := make(Schema, 0, len(s.GroupBy)+len(s.Targets))
 
@@ -5965,7 +6016,28 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			return nil, nil, nil, nil, err
 		}
 		idx := len(outputSchema)
-		groupByExpr[parserExprKey(g)] = idx
+		key := parserExprKey(g)
+		// M0125-0044: two GROUP BY items can collide on one qualifier-blind key
+		// — d1.d_year and d2.d_year over a self-joined date_dim both hash to
+		// "c:d_year" — and the map keeps only the last. Record the collision so
+		// the target list resolves such references by binding instead of by
+		// name. GROUP BY a, a is NOT ambiguous: it names one slot twice, which
+		// is why the check is "already bound to the same slot", not "duplicate
+		// key". groupByInputCol is read before this iteration writes to it, so
+		// the second alias is correctly seen as unbound rather than as slot 0.
+		if prev, dup := groupByExpr[key]; dup {
+			sameSlot := false
+			if c, isCol := r.(*ColumnRef); isCol {
+				if at, bound := groupByInputCol[c.Index]; bound && at == prev {
+					sameSlot = true
+				}
+			}
+			if !sameSlot {
+				groupByAmbiguous[key] = true
+			}
+		}
+		groupByExpr[key] = idx
+		groupByExprQual[qualifiedGroupKey(g)] = idx
 		if c, ok := r.(*ColumnRef); ok {
 			groupByInputCol[c.Index] = idx
 		}
@@ -5992,11 +6064,54 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	var havingAggCalls []*parser.FuncCall
+	if s.Having != nil {
+		havingAggCalls = collectHavingSubqueryAggCalls(s.Having, cat)
+	}
+	// M0125-0045: mark blind keys claimed by more than one distinct call.
+	// aggregateCallKey drops ColumnRef qualifiers (its argument part is
+	// parserExprKey), so count(d1.y) and count(d2.y) over a self-joined table
+	// hash equal and the exists-check below discarded the second — right
+	// cardinality, wrong values, the aggregate half of -0044's GROUP BY
+	// collapse. A key is contested only when the QUALIFIED forms differ:
+	// count(y) written twice still shares one slot. Contested calls are keyed
+	// on the qualified form, which can split count(y)/count(t.y) of the same
+	// binding into two slots — redundant computation, never a wrong answer
+	// (PG merges those by equal() over the resolved Aggref args,
+	// src/backend/nodes/equalfuncs.c, which goopg has no resolved-form key
+	// for; ledger row 2026-08-01).
+	aggAmbiguous := map[string]bool{}
+	{
+		firstQual := map[string]string{}
+		markContested := func(fc *parser.FuncCall) {
+			k := aggregateCallKey(fc)
+			qk := qualifiedAggregateCallKey(fc)
+			if prev, seen := firstQual[k]; seen {
+				if prev != qk {
+					aggAmbiguous[k] = true
+				}
+				return
+			}
+			firstQual[k] = qk
+		}
+		for _, fc := range aggCalls {
+			markContested(fc)
+		}
+		for _, fc := range havingAggCalls {
+			markContested(fc)
+		}
+	}
 	aggByKey := make(map[string]aggregateBinding, len(aggCalls))
+	aggByKeyQual := make(map[string]aggregateBinding, len(aggCalls))
 	plannedAggs := make([]AggregateCall, 0, len(aggCalls))
 	for _, fc := range aggCalls {
 		k := aggregateCallKey(fc)
-		if _, exists := aggByKey[k]; exists {
+		qk := qualifiedAggregateCallKey(fc)
+		if aggAmbiguous[k] {
+			if _, exists := aggByKeyQual[qk]; exists {
+				continue
+			}
+		} else if _, exists := aggByKey[k]; exists {
 			continue
 		}
 		pa, err := buildAggregateCall(fc, inputCtx, cat)
@@ -6030,6 +6145,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		}
 		idx := len(outputSchema)
 		aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+		aggByKeyQual[qk] = aggregateBinding{index: idx, typ: pa.Type}
 		plannedAggs = append(plannedAggs, pa)
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 	}
@@ -6039,9 +6155,14 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// The sum(distinct a.four) is an outer aggregate reference that must be registered
 	// so resolveExprAfterAggregate (via resolveColumnRef → havingAgg lookup) can find it.
 	if s.Having != nil {
-		for _, fc := range collectHavingSubqueryAggCalls(s.Having, cat) {
+		for _, fc := range havingAggCalls {
 			k := aggregateCallKey(fc)
-			if _, exists := aggByKey[k]; exists {
+			qk := qualifiedAggregateCallKey(fc)
+			if aggAmbiguous[k] {
+				if _, exists := aggByKeyQual[qk]; exists {
+					continue
+				}
+			} else if _, exists := aggByKey[k]; exists {
 				continue
 			}
 			pa, err := buildAggregateCall(fc, inputCtx, cat)
@@ -6050,6 +6171,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			}
 			idx := len(outputSchema)
 			aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+			aggByKeyQual[qk] = aggregateBinding{index: idx, typ: pa.Type}
 			plannedAggs = append(plannedAggs, pa)
 			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 		}
@@ -6117,7 +6239,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr:         groupByExpr,
 		groupByInputCol:     groupByInputCol,
 		groupByMergedByName: groupByMergedByName,
+		groupByAmbiguous:    groupByAmbiguous,
+		groupByExprQual:     groupByExprQual,
 		aggregateByKey:      aggByKey,
+		aggregateAmbiguous:  aggAmbiguous,
+		aggregateByKeyQual:  aggByKeyQual,
 		node:                aggNode,
 		funcDepCols:         map[int]int{},
 		cat:                 cat,
@@ -6261,8 +6387,60 @@ func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
 	}
 }
 
+// groupBySlotContested maps a target-list expression onto the GROUP BY slot it
+// occupies, for the case where parserExprKey alone cannot say which one that is.
+//
+// It exists because parserExprKey is deliberately qualifier-blind — GROUP BY c
+// has to satisfy SELECT t.c, and lower(c) has to satisfy lower(t.c), neither of
+// which the parser can tell apart before column resolution (M0097-0003). The
+// cost of that blindness is that every alias of a self-joined table collapses
+// onto one key: with GROUP BY d1.d_year, d2.d_year both items hash to
+// "c:d_year" and only the last keeps the slot, so the target list projects one
+// alias's value for both.
+//
+// Two answers are tried, in this order:
+//
+//   - the qualified key, which is what actually distinguishes d1.d_year from
+//     d2.d_year at parser level, and which covers computed keys (d1.y + 0) as
+//     well as bare columns;
+//   - failing that, for a bare column, the input-column map — this catches the
+//     mixed spelling GROUP BY y, d2.y, where SELECT d1.y is the unqualified
+//     item's column under a different spelling.
+//
+// Deliberately NOT tried: comparing resolved expressions against
+// Aggregate.GroupExprs. Those are indexed against the aggregate's CHILD schema,
+// which join reordering permutes, so a freshly resolved copy of the identical
+// expression can carry a different ColumnRef.Index and read unequal — measured,
+// not assumed (a d2.y whose group-key twin had been remapped from index 5 to 1).
+//
+// Returns found=false whenever it cannot place the expression; the caller then
+// stops trusting the contested key rather than falling back to it. Aggregate
+// calls are excluded — they are dispatched by aggregateByKey. M0125-0044.
+func groupBySlotContested(e parser.Expr, agg *aggregateSurface) (int, bool) {
+	if exprHasAggregate(e) {
+		return 0, false
+	}
+	if slot, ok := agg.groupByExprQual[qualifiedGroupKey(e)]; ok {
+		return slot, true
+	}
+	if cr, isColRef := e.(*parser.ColumnRef); isColRef {
+		resolved, err := resolveColumnRef(cr, agg.input)
+		if err != nil {
+			return 0, false
+		}
+		col, isCol := resolved.(*ColumnRef)
+		if !isCol {
+			return 0, false
+		}
+		slot, ok := agg.groupByInputCol[col.Index]
+		return slot, ok
+	}
+	return 0, false
+}
+
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
-	if idx, ok := agg.groupByExpr[parserExprKey(e)]; ok {
+	key := parserExprKey(e)
+	if idx, ok := agg.groupByExpr[key]; ok {
 		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
 		// GROUP BY entry was an unqualified USING-join merged column (GROUP BY f1),
 		// the two are semantically different — PostgreSQL requires the qualified column
@@ -6271,6 +6449,23 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		skipMatch := false
 		if cr, isColRef := e.(*parser.ColumnRef); isColRef && cr.Table != "" {
 			skipMatch = agg.groupByMergedByName[strings.ToLower(cr.Column)]
+		}
+		// M0125-0044: when several GROUP BY items share this key, the key names
+		// no slot in particular — a self-joined table's aliases all hash to it,
+		// and the map holds only the last one written. Re-resolve the expression
+		// and take the slot its *binding* owns.
+		if !skipMatch && agg.groupByAmbiguous[key] {
+			if bound, found := groupBySlotContested(e, agg); found {
+				idx = bound
+			} else {
+				// The key is contested and this expression is none of the
+				// contenders — SELECT d3.y under GROUP BY d1.y, d2.y. Keeping
+				// the name-keyed slot would project a different alias's value,
+				// so fall through and let the expression be resolved on its own
+				// terms: a functionally-determined column becomes a passthrough,
+				// and anything else raises the 42803 PostgreSQL raises here.
+				skipMatch = true
+			}
 		}
 		if !skipMatch {
 			return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
@@ -6432,6 +6627,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if isAggregateFunc(x) || isUserAggregateFunc(x, agg.cat) {
 			k := aggregateCallKey(x)
 			b, ok := agg.aggregateByKey[k]
+			// M0125-0045: a contested key names no slot in particular —
+			// several distinct calls share it and the blind map holds only
+			// the last one written. The qualified key is what tells
+			// count(d1.y) from count(d2.y); on a miss keep the blind
+			// binding rather than failing.
+			if agg.aggregateAmbiguous[k] {
+				if qb, qok := agg.aggregateByKeyQual[qualifiedAggregateCallKey(x)]; qok {
+					b, ok = qb, true
+				}
+			}
 			if !ok {
 				return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "aggregate call could not be resolved"}
 			}
@@ -6744,7 +6949,11 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 					}
 				}
 			}
-			k := aggregateCallKey(fc)
+			// M0125-0045: dedup on the QUALIFIED key so count(d1.y) and
+			// count(d2.y) both survive collection. buildAggregateStage still
+			// merges same-blind-key calls onto one slot unless the blind key
+			// is contested, so plain repetition costs nothing extra.
+			k := qualifiedAggregateCallKey(fc)
 			if _, ok := seen[k]; ok {
 				return nil
 			}
@@ -7727,11 +7936,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 				return nil, false, nil
 			}
 			return &IndexScan{
-				pos:    where.Pos(),
-				Table:  tbl,
-				Index:  idx,
-				Key:    resolvedKey,
-				schema: ctx.schema,
+				pos:      where.Pos(),
+				Table:    tbl,
+				Index:    idx,
+				Key:      resolvedKey,
+				schema:   ctx.schema,
+				SmallDim: smallDimensionTag(cat, tbl),
 			}, true, nil
 		}
 		return nil, false, nil
@@ -7797,11 +8007,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	return &IndexScan{
-		pos:    where.Pos(),
-		Table:  tbl,
-		Index:  idx,
-		Key:    resolvedKey,
-		schema: ctx.schema,
+		pos:      where.Pos(),
+		Table:    tbl,
+		Index:    idx,
+		Key:      resolvedKey,
+		schema:   ctx.schema,
+		SmallDim: smallDimensionTag(cat, tbl),
 	}, true, nil
 }
 
@@ -8036,12 +8247,13 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	}
 
 	scan := &IndexScan{
-		pos:     where.Pos(),
-		Table:   tbl,
-		Index:   chosenIdx,
-		LowKey:  loKey,
-		HighKey: hiKey,
-		schema:  ctx.schema,
+		pos:      where.Pos(),
+		Table:    tbl,
+		Index:    chosenIdx,
+		LowKey:   loKey,
+		HighKey:  hiKey,
+		schema:   ctx.schema,
+		SmallDim: smallDimensionTag(cat, tbl),
 	}
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
@@ -10958,7 +11170,15 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				if p.havingAgg == nil {
 					continue
 				}
-				if b, ok := p.havingAgg.aggregateByKey[k]; ok {
+				b, ok := p.havingAgg.aggregateByKey[k]
+				// M0125-0045: contested blind key — dispatch on the
+				// qualified form, same as resolveExprAfterAggregate.
+				if p.havingAgg.aggregateAmbiguous[k] {
+					if qb, qok := p.havingAgg.aggregateByKeyQual[qualifiedAggregateCallKey(x)]; qok {
+						b, ok = qb, true
+					}
+				}
+				if ok {
 					// Count parent hops from current ctx to the context that owns havingAgg.
 					level := 0
 					for q := ctx; q != p; q = q.parent {

@@ -328,7 +328,7 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, &subPlanReg{})
+	walkPlanFiltered(n, depth, rows, opts, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
@@ -394,10 +394,16 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 
 	// Sublinks referenced by this node's detail lines print their
 	// inner plan as an indented `SubPlan N` subtree, as upstream's
-	// ExplainSubPlans does.
+	// ExplainSubPlans does. n becomes the ancestor plan node for the
+	// duration (upstream's push_ancestor_plan): a correlated reference
+	// inside the sublink is deparsed against THIS node's namespace, not
+	// the relation the sublink itself scans.
+	prevAncestor := reg.ancestor
+	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub planner.Node, subDepth int) {
 		walkPlanFiltered(sub, subDepth, rows, opts, nil, reg)
 	})
+	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
 		walkPlanFiltered(c, depth+1, rows, opts, nil, reg)
@@ -430,6 +436,13 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 			}
 			*rows = append(*rows, Row{NewStringDatum(line)})
 			if sp.plan != nil {
+				// A sublink body brings its own range-table entries
+				// (Q30's `ctr2` lives only inside SubPlan 1), and they
+				// must be named before any of its detail lines render.
+				// Registering here rather than in one root-level pass
+				// keeps the walk to the tree planChildren exposes —
+				// sublink plans hang off expressions, not off it.
+				reg.names().collect(sp.plan)
 				// Indent the sublink's plan one "->" level under the
 				// `SubPlan N` line, matching upstream's shape. A node
 				// rendered at depth d starts its "->" at 2*d columns,
@@ -449,6 +462,16 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 // is a Filter.Predicate from a Filter wrapper above n that was
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
 func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
+	// M0125-0039: whether this node's detail lines print qualified column
+	// references. Upstream splits the decision by node kind — show_scan_qual
+	// deparses a scan's `Filter:`/`Index Cond:` with varprefix=false, while
+	// show_upper_qual and show_sort_group_keys use
+	// `es->rtable_size > 1`. Reproducing that split is what keeps a
+	// single-table plan's output byte-identical while a join's
+	// `Filter: (cd_marital_status <> cd_marital_status)` becomes the
+	// readable `(cd1.cd_marital_status <> cd2.cd_marital_status)`.
+	// (VERBOSE does not force prefixing here yet — see the deferral row.)
+	qualify := reg.names().qualify() && !explainIsScanNode(n)
 	switch p := n.(type) {
 	case *planner.Gather:
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
@@ -467,7 +490,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
 			for _, k := range p.Keys {
-				s := formatExprPGReg(k.Expr, reg)
+				s := formatExprQual(k.Expr, reg, qualify)
 				if k.Desc {
 					s += " DESC"
 				}
@@ -487,7 +510,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	case *planner.NestedLoopIndexJoin:
 		// The NLI's residual predicate (conjuncts the index probe does not
@@ -497,23 +520,23 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		// mis-resolution during the Q7 alias/residual fix (deferral ledger,
 		// csq-S6). Render it as a Filter: line, house style.
 		if p.Predicate != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(p.Predicate, reg)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(p.Predicate, reg, qualify)))})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	case *planner.Memoize:
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
 		if len(p.KeyExprs) > 0 {
 			parts := make([]string, 0, len(p.KeyExprs))
 			for _, ke := range p.KeyExprs {
-				parts = append(parts, formatExprPGReg(ke, reg))
+				parts = append(parts, formatExprQual(ke, reg, qualify))
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 		}
 	case *planner.SeqScan:
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	default:
 		// Non-scan nodes keep an attached Filter alive — render it
@@ -522,7 +545,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		// Aggregate). Matches PG's behaviour of rendering Filter on
 		// the node it most directly applies to.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	}
 }
@@ -609,6 +632,37 @@ func wrapParen(s string) string {
 type subPlanReg struct {
 	num     map[planner.Expr]int
 	pending []subPlanEntry
+	// rel is the render's range-table name table (M0125-0039). It lives
+	// here rather than in its own parameter because subPlanReg is already
+	// the one piece of per-EXPLAIN state threaded through every walker and
+	// every expression-render site, and the two have the same lifetime.
+	// nil is safe: explainNames' methods are nil-receiver tolerant, so a
+	// registry-less caller renders bare column names as before.
+	rel *explainNames
+	// ancestor is the plan node whose detail lines are currently being
+	// rendered — upstream's push_ancestor_plan target, used to name a
+	// correlated reference whose binding id was erased on the way up
+	// (an aggregate zeroes SourceTableIdx). Set by the walkers around
+	// each node's render; nil outside one.
+	ancestor planner.Node
+}
+
+// ancestorNode returns the plan node currently being rendered, or nil.
+func (r *subPlanReg) ancestorNode() planner.Node {
+	if r == nil {
+		return nil
+	}
+	return r.ancestor
+}
+
+// names returns the render's range-table name table, or nil when the caller
+// has no registry (formatExprPG's direct users). Both are safe to call
+// methods on.
+func (r *subPlanReg) names() *explainNames {
+	if r == nil {
+		return nil
+	}
+	return r.rel
 }
 
 // subPlanEntry is one assigned-but-not-yet-emitted sublink. expr
@@ -668,6 +722,15 @@ func formatExprPG(e planner.Expr) string {
 	return formatExprPGReg(e, nil)
 }
 
+// formatExprPGReg renders e with bare (unqualified) column names — the
+// rendering every EXPLAIN detail line used before M0125-0039, and still the
+// right one for a scan-node qual, which upstream deparses with
+// varprefix=false (explain.c show_scan_qual). Call formatExprQual directly
+// with qualify=true for the upper-node quals PG prefixes.
+func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
+	return formatExprQual(e, reg, false)
+}
+
 // formatExprPGReg renders a planner expression in upstream PG's
 // EXPLAIN style: column names, integer/string/numeric literals,
 // and infix operators. Sublinks (EXISTS / IN / scalar subquery)
@@ -675,14 +738,37 @@ func formatExprPG(e planner.Expr) string {
 // compact `<type>` token for expression kinds we don't yet render
 // (sufficient for the isolation specs that pass through
 // `EXPLAIN (COSTS OFF)`; the detail line is informational).
-func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
+func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 	if e == nil {
 		return ""
 	}
 	switch x := e.(type) {
 	case *planner.ColumnRef:
-		return x.Name
+		// qualify is upstream's deparse_context.varprefix
+		// (ruleutils.c get_variable's need_prefix): a plain Var is
+		// printed bare on a scan qual and qualified everywhere else
+		// once the query has more than one range-table entry.
+		return reg.names().column(x.SourceTableIdx, x.Name, qualify)
 	case *planner.OuterColumnRef:
+		// A correlated reference is always prefixed, even inside a
+		// scan qual. Upstream reaches the same output through
+		// get_parameter, which forces varprefix=true while deparsing
+		// a Param's expansion "since they won't belong to the
+		// relation being scanned in the original plan node" — which
+		// is what makes PG print Q30's filter as
+		// `(ctr1.ctr_state = ctr_state)` rather than the
+		// self-comparison goopg used to print.
+		if s := reg.names().column(x.SourceTableIdx, x.Name, true); s != x.Name {
+			return s
+		}
+		// SourceTableIdx could not name it — the common case when the
+		// correlation runs through an aggregate, which zeroes the
+		// binding id. Fall back to upstream's own mechanism and
+		// resolve the name against the ancestor plan node
+		// (push_ancestor_plan).
+		if rel := reg.names().resolveInAncestor(reg.ancestorNode(), x.Name); rel != "" {
+			return rel + "." + x.Name
+		}
 		return x.Name
 	case *planner.IntegerConst:
 		return fmt.Sprintf("%d", x.Value)
@@ -700,15 +786,15 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 	case *planner.NullConst:
 		return "NULL"
 	case *planner.BinaryOp:
-		return "(" + formatExprPGReg(x.Left, reg) + " " + x.Op.String() + " " + formatExprPGReg(x.Right, reg) + ")"
+		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
 	case *planner.UnaryOp:
-		return "(" + x.Op.String() + " " + formatExprPGReg(x.Operand, reg) + ")"
+		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
 	case *planner.CastExpr:
-		return formatExprPGReg(x.Operand, reg)
+		return formatExprQual(x.Operand, reg, qualify)
 	case *planner.FuncCall:
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
-			args[i] = formatExprPGReg(a, reg)
+			args[i] = formatExprQual(a, reg, qualify)
 		}
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
 	case *planner.ParamRef:
@@ -746,13 +832,13 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 		// ARRAY_SUBLINK: upstream prints `ARRAY(<plan_name>)`.
 		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"
 	case *planner.InExpr:
-		return formatInExprPG(x, reg)
+		return formatInExprPG(x, reg, qualify)
 	case *planner.IsNullExpr:
 		// ruleutils.c get_rule_expr, T_NullTest.
 		if x.Negated {
-			return "(" + formatExprPGReg(x.Operand, reg) + " IS NOT NULL)"
+			return "(" + formatExprQual(x.Operand, reg, qualify) + " IS NOT NULL)"
 		}
-		return "(" + formatExprPGReg(x.Operand, reg) + " IS NULL)"
+		return "(" + formatExprQual(x.Operand, reg, qualify) + " IS NULL)"
 	case *planner.IsBoolExpr:
 		// T_BooleanTest. TestTrue/TestFalse both false means IS UNKNOWN
 		// (see evalExprSlot's IsBoolExpr arm).
@@ -766,41 +852,41 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 		if x.Negated {
 			not = "NOT "
 		}
-		return "(" + formatExprPGReg(x.Operand, reg) + " IS " + not + what + ")"
+		return "(" + formatExprQual(x.Operand, reg, qualify) + " IS " + not + what + ")"
 	case *planner.IsDistinctFromExpr:
 		op := " IS DISTINCT FROM "
 		if x.Negated {
 			op = " IS NOT DISTINCT FROM "
 		}
-		return "(" + formatExprPGReg(x.Left, reg) + op + formatExprPGReg(x.Right, reg) + ")"
+		return "(" + formatExprQual(x.Left, reg, qualify) + op + formatExprQual(x.Right, reg, qualify) + ")"
 	case *planner.CaseExpr:
 		// T_CaseExpr. Simple form keeps the operand after CASE.
 		var b strings.Builder
 		b.WriteString("CASE")
 		if x.Operand != nil {
 			b.WriteString(" ")
-			b.WriteString(formatExprPGReg(x.Operand, reg))
+			b.WriteString(formatExprQual(x.Operand, reg, qualify))
 		}
 		for _, w := range x.Whens {
 			b.WriteString(" WHEN ")
-			b.WriteString(formatExprPGReg(w.When, reg))
+			b.WriteString(formatExprQual(w.When, reg, qualify))
 			b.WriteString(" THEN ")
-			b.WriteString(formatExprPGReg(w.Then, reg))
+			b.WriteString(formatExprQual(w.Then, reg, qualify))
 		}
 		if x.Else != nil {
 			b.WriteString(" ELSE ")
-			b.WriteString(formatExprPGReg(x.Else, reg))
+			b.WriteString(formatExprQual(x.Else, reg, qualify))
 		}
 		b.WriteString(" END")
 		return b.String()
 	case *planner.ExtractExpr:
-		return "EXTRACT(" + x.Field + " FROM " + formatExprPGReg(x.Source, reg) + ")"
+		return "EXTRACT(" + x.Field + " FROM " + formatExprQual(x.Source, reg, qualify) + ")"
 	case *planner.CollateExpr:
-		return "(" + formatExprPGReg(x.Operand, reg) + " COLLATE " + x.CollationName + ")"
+		return "(" + formatExprQual(x.Operand, reg, qualify) + " COLLATE " + x.CollationName + ")"
 	case *planner.RowExpr:
 		elems := make([]string, len(x.Elems))
 		for i, el := range x.Elems {
-			elems[i] = formatExprPGReg(el, reg)
+			elems[i] = formatExprQual(el, reg, qualify)
 		}
 		return "ROW(" + strings.Join(elems, ", ") + ")"
 	case *planner.TableOidExpr:
@@ -822,7 +908,7 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 		// One column of the multi-assignment row. PG renders these as
 		// PARAM_EXEC slots; goopg has no slot number here, so name the
 		// owning subplan and the 1-based column.
-		return formatExprPGReg(x.Row, reg) + fmt.Sprintf(".%d", x.ColIdx+1)
+		return formatExprQual(x.Row, reg, qualify) + fmt.Sprintf(".%d", x.ColIdx+1)
 	}
 	return fmt.Sprintf("<%T>", e)
 }
@@ -836,8 +922,8 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 // no param slots yet, so the operand and the SubPlan reference are
 // rendered side by side instead; this converges on PG's form when
 // D4.1 lands param slots.
-func formatInExprPG(x *planner.InExpr, reg *subPlanReg) string {
-	operand := formatExprPGReg(x.Operand, reg)
+func formatInExprPG(x *planner.InExpr, reg *subPlanReg, qualify bool) string {
+	operand := formatExprQual(x.Operand, reg, qualify)
 
 	// Comparison spelling: default `=` for IN, or the explicit
 	// operator when the parser recorded one (`col < ALL (...)`).
@@ -860,7 +946,7 @@ func formatInExprPG(x *planner.InExpr, reg *subPlanReg) string {
 	} else {
 		parts := make([]string, len(x.List))
 		for i, v := range x.List {
-			parts[i] = formatExprPGReg(v, reg)
+			parts[i] = formatExprQual(v, reg, qualify)
 		}
 		rhs = strings.Join(parts, ", ")
 	}
@@ -893,7 +979,7 @@ func schemaColumnNames(n planner.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, nil, &subPlanReg{})
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
 func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, attachedFilter planner.Expr, reg *subPlanReg) {
@@ -982,9 +1068,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
+	prevAncestor := reg.ancestor
+	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
 		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, nil, reg)
 	})
+	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
 		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, nil, reg)
@@ -1082,6 +1171,18 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
 	obj := map[string]any{
 		"Node Type": describePlan(n),
+	}
+	// M0125-0037(i): upstream's non-text formats do NOT fold the set-op
+	// command into the node name the way the text format does. Verified
+	// against PG 18.3 `EXPLAIN (FORMAT JSON)` on an INTERSECT ALL:
+	// "Node Type": "SetOp", "Strategy": "Hashed", "Command": "Intersect All"
+	// (explain.c uses `sname` for the property and `pname` for the text
+	// line). A UNION ALL has no SetOp node upstream at all, so it keeps
+	// the plain "Append" describePlan gives it.
+	if p, ok := n.(*planner.SetOp); ok && !setOpRendersAsAppend(p) {
+		obj["Node Type"] = "SetOp"
+		obj["Strategy"] = "Hashed"
+		obj["Command"] = setOpCommandName(p)
 	}
 	if est := planner.EstimateRows(n); est > 0 {
 		obj["Plan Rows"] = est
@@ -1301,8 +1402,86 @@ func describePlan(n planner.Node) string {
 		return "CTE DML"
 	case *planner.MaterializedCTEScan:
 		return fmt.Sprintf("CTE %s", p.Name)
+	case *planner.SetOp:
+		// M0125-0037(i): this node used to fall through to the `%T`
+		// default and print the raw Go type name `*planner.SetOp` —
+		// with no children, because planChildren had no case for it
+		// either. TPC-DS Q5/Q18/Q67 therefore rendered as four-line
+		// plans with the whole query body invisible, and M0125-0026
+		// could not classify them at all.
+		//
+		// PG's vocabulary (explain.c ExplainNode, T_SetOp) is:
+		//   UNION ALL          -> Append          (no SetOp node at all)
+		//   UNION (distinct)   -> HashAggregate over Append
+		//   INTERSECT / EXCEPT -> "HashSetOp <cmd>" (SETOP_HASHED),
+		//                         cmd one of Intersect / Intersect All /
+		//                         Except / Except All
+		// goopg has ONE fused node for all of these (operators_setop.go:
+		// `streaming` for UNION ALL, buffered multiset otherwise), so the
+		// two exact mappings are used verbatim and the UNION-distinct case
+		// prints `HashSetOp Union` — a spelling PG never emits, chosen
+		// because it cannot be confused with a PG node that means
+		// something else (PG's SetOpCmd has no Union member). The
+		// two-node HashAggregate/Append shape PG uses there is a
+		// deferral-ledger row, not a silent divergence.
+		return setOpNodeName(p)
 	}
 	return fmt.Sprintf("%T", n)
+}
+
+// setOpNodeName renders a SetOp's PG-style label — see the
+// describePlan case above for the mapping rationale.
+func setOpNodeName(p *planner.SetOp) string {
+	if setOpRendersAsAppend(p) {
+		return "Append"
+	}
+	return "HashSetOp " + setOpCommandName(p)
+}
+
+// setOpRendersAsAppend reports whether p is a UNION ALL, which PG
+// plans as a plain Append with no SetOp node. This is also the shape
+// the planner builds for partition / inheritance expansion
+// (planner.go:2495 and :2545 construct `SetOp{All: true}` chains),
+// so getting this branch right is what keeps a partitioned scan from
+// printing as a set operation.
+func setOpRendersAsAppend(p *planner.SetOp) bool {
+	return p.All && p.Op == parser.SetOpUnion
+}
+
+// setOpCommandName mirrors explain.c's SETOPCMD_* text (the token PG
+// appends after the node name, and its JSON "Command" property).
+func setOpCommandName(p *planner.SetOp) string {
+	var cmd string
+	switch p.Op {
+	case parser.SetOpIntersect:
+		cmd = "Intersect"
+	case parser.SetOpExcept:
+		cmd = "Except"
+	default:
+		cmd = "Union"
+	}
+	if p.All {
+		cmd += " All"
+	}
+	return cmd
+}
+
+// setOpAppendBranches flattens a left-deep chain of UNION ALL SetOps
+// into the flat child list PG's single Append carries. goopg builds
+// `a UNION ALL b UNION ALL c` as SetOp(SetOp(a,b),c); without this,
+// EXPLAIN would print nested Appends where PG prints one with three
+// children, and TPC-DS Q5's five-branch union would render five levels
+// deep. Only ALL-union links are absorbed — an INTERSECT or EXCEPT in
+// the chain is a real node and keeps its own line.
+func setOpAppendBranches(p *planner.SetOp, out []planner.Node) []planner.Node {
+	for _, side := range [...]planner.Node{p.Left, p.Right} {
+		if inner, ok := side.(*planner.SetOp); ok && setOpRendersAsAppend(inner) {
+			out = setOpAppendBranches(inner, out)
+			continue
+		}
+		out = append(out, side)
+	}
+	return out
 }
 
 func joinTypeName(t planner.JoinType) string {
@@ -1407,6 +1586,17 @@ func planChildren(n planner.Node) []planner.Node {
 		out = append(out, p.DMls...)
 		out = append(out, p.Body)
 		return out
+	case *planner.SetOp:
+		// M0125-0037(i): the missing case that truncated Q5/Q18/Q67 to a
+		// four-line plan. A UNION ALL chain collapses into one Append's
+		// child list the way PG plans it; every other set operation is a
+		// binary HashSetOp whose two inputs render directly beneath it
+		// (verified against PG 18.3: `HashSetOp Intersect` carries two
+		// Seq Scan children, not an Append).
+		if setOpRendersAsAppend(p) {
+			return setOpAppendBranches(p, nil)
+		}
+		return []planner.Node{p.Left, p.Right}
 	}
 	return nil
 }

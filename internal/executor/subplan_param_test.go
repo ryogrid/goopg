@@ -79,6 +79,10 @@ func TestLoweredScalarProjectedKeyHits(t *testing.T) {
 // TestLoweredExplainRendersParam: the SubPlan subtree's correlation
 // now prints as a PG-style $N exec param instead of a bare column name.
 func TestLoweredExplainRendersParam(t *testing.T) {
+	// M0125-0036: this probe's `= -999 OR EXISTS (…)` shape is what the
+	// EXISTS→ANY conversion consumes; the correlated-SubPlan path it
+	// grades is still live for every EXISTS the conversion declines.
+	pinCorrelatedSubPlanPath(t)
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
 

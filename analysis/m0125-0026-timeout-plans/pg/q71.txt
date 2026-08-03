@@ -1,0 +1,45 @@
+-- M0125-0026 capture  arm=pg  engine=pg  query=71
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query71.sql
+-- psql -h 127.0.0.1 -p 65438 -U ryo -d tpcds05 
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=72727.29..72727.30 rows=5 width=95)
+   Sort Key: (sum("*SELECT* 3".ext_price)) DESC, item.i_brand_id
+   ->  GroupAggregate  (cost=72727.10..72727.23 rows=5 width=95)
+         Group Key: item.i_brand, item.i_brand_id, time_dim.t_hour, time_dim.t_minute
+         ->  Sort  (cost=72727.10..72727.11 rows=5 width=69)
+               Sort Key: item.i_brand, item.i_brand_id, time_dim.t_hour, time_dim.t_minute
+               ->  Gather  (cost=3069.36..72727.04 rows=5 width=69)
+                     Workers Planned: 3
+                     ->  Nested Loop  (cost=2069.36..71726.54 rows=2 width=69)
+                           ->  Nested Loop  (cost=2069.06..71701.62 rows=6 width=65)
+                                 ->  Parallel Append  (cost=2068.78..70577.14 rows=335 width=14)
+                                       ->  Subquery Scan on "*SELECT* 3"  (cost=2068.78..33861.64 rows=188 width=14)
+                                             ->  Parallel Hash Join  (cost=2068.78..33859.76 rows=188 width=18)
+                                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=18)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=18 width=4)
+                                                               Filter: ((d_moy = 12) AND (d_year = 2002))
+                                       ->  Subquery Scan on "*SELECT* 2"  (cost=2068.78..23764.72 rows=98 width=14)
+                                             ->  Parallel Hash Join  (cost=2068.78..23763.74 rows=98 width=18)
+                                                   Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_1.d_date_sk)
+                                                   ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=18)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                         ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2068.55 rows=18 width=4)
+                                                               Filter: ((d_moy = 12) AND (d_year = 2002))
+                                       ->  Subquery Scan on "*SELECT* 1"  (cost=2068.78..12949.10 rows=49 width=14)
+                                             ->  Parallel Hash Join  (cost=2068.78..12948.61 rows=49 width=18)
+                                                   Hash Cond: (web_sales.ws_sold_date_sk = date_dim_2.d_date_sk)
+                                                   ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=18)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                         ->  Parallel Seq Scan on date_dim date_dim_2  (cost=0.00..2068.55 rows=18 width=4)
+                                                               Filter: ((d_moy = 12) AND (d_year = 2002))
+                                 ->  Index Scan using item_pkey on item  (cost=0.29..3.36 rows=1 width=59)
+                                       Index Cond: (i_item_sk = "*SELECT* 3".sold_item_sk)
+                                       Filter: (i_manager_id = 1)
+                           ->  Index Scan using time_dim_pkey on time_dim  (cost=0.29..4.15 rows=1 width=12)
+                                 Index Cond: (t_time_sk = "*SELECT* 3".time_sk)
+                                 Filter: ((t_meal_time = 'breakfast'::bpchar) OR (t_meal_time = 'dinner'::bpchar))
+(38 rows)
+

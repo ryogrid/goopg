@@ -165,7 +165,13 @@ func (s *VirtualSlot) Row() Row {
 }
 
 func (s *VirtualSlot) Materialize() *MaterializedSlot {
-	return &MaterializedSlot{schema: s.schema, row: s.Row()}
+	// M0126-0001 Stage −1b: clone arena-backed Datums so the
+	// materialised row owns its storage independently of any
+	// resettable producer arena. Before this fix, VirtualSlot
+	// skipped the MaterializeArena step that MaterializedSlot's
+	// own Materialize and drainRowsBounded both perform
+	// (datum.go:425-434 cloneRowOwned; spill.go:395).
+	return &MaterializedSlot{schema: s.schema, row: cloneRowOwned(s.Row())}
 }
 
 // Release on a VirtualSlot is a no-op — backing storage lives in

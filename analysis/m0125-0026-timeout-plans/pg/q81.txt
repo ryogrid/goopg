@@ -1,0 +1,37 @@
+-- M0125-0026 capture  arm=pg  engine=pg  query=81
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query81.sql
+-- psql -h 127.0.0.1 -p 65438 -U ryo -d tpcds05 
+                                                                                                                                                                                                                        QUERY PLAN                                                                                                                                                                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8609.37..8609.37 rows=3 width=236)
+   CTE customer_total_return
+     ->  GroupAggregate  (cost=4888.00..4895.90 rows=351 width=39)
+           Group Key: catalog_returns.cr_returning_customer_sk, customer_address_1.ca_state
+           ->  Sort  (cost=4888.00..4888.88 rows=351 width=13)
+                 Sort Key: catalog_returns.cr_returning_customer_sk, customer_address_1.ca_state
+                 ->  Nested Loop  (cost=2341.95..4873.16 rows=351 width=13)
+                       ->  Hash Join  (cost=2341.66..4737.69 rows=358 width=14)
+                             Hash Cond: (catalog_returns.cr_returned_date_sk = date_dim.d_date_sk)
+                             ->  Seq Scan on catalog_returns  (cost=0.00..2207.22 rows=71922 width=18)
+                             ->  Hash  (cost=2337.11..2337.11 rows=364 width=4)
+                                   ->  Seq Scan on date_dim  (cost=0.00..2337.11 rows=364 width=4)
+                                         Filter: (d_year = 2001)
+                       ->  Index Scan using customer_address_pkey on customer_address customer_address_1  (cost=0.29..0.38 rows=1 width=7)
+                             Index Cond: (ca_address_sk = catalog_returns.cr_returning_addr_sk)
+   ->  Sort  (cost=3713.47..3713.48 rows=3 width=236)
+         Sort Key: customer.c_customer_id, customer.c_salutation, customer.c_first_name, customer.c_last_name, customer_address.ca_street_number, customer_address.ca_street_name, customer_address.ca_street_type, customer_address.ca_suite_number, customer_address.ca_city, customer_address.ca_county, customer_address.ca_zip, customer_address.ca_country, customer_address.ca_gmt_offset, customer_address.ca_location_type, ctr1.ctr_total_return
+         ->  Nested Loop  (cost=0.58..3713.45 rows=3 width=236)
+               ->  Nested Loop  (cost=0.29..3671.21 rows=117 width=116)
+                     ->  CTE Scan on customer_total_return ctr1  (cost=0.00..2786.94 rows=117 width=36)
+                           Filter: (ctr_total_return > (SubPlan 2))
+                           SubPlan 2
+                             ->  Aggregate  (cost=7.91..7.92 rows=1 width=32)
+                                   ->  CTE Scan on customer_total_return ctr2  (cost=0.00..7.90 rows=2 width=32)
+                                         Filter: (ctr1.ctr_state = ctr_state)
+                     ->  Index Scan using customer_pkey on customer  (cost=0.29..7.56 rows=1 width=88)
+                           Index Cond: (c_customer_sk = ctr1.ctr_customer_sk)
+               ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=128)
+                     Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                     Filter: (ca_state = 'TN'::bpchar)
+(30 rows)
+

@@ -74,9 +74,9 @@ func TestHashJoinCost_BuildIsStartup(t *testing.T) {
 	outer := Cost{Startup: 0, Total: 500}
 	inner := Cost{Startup: 0, Total: 50}
 	c := hashJoinCost(cp, outer, inner, 10000, 1000, 8000, 1)
-	// build = (0.0025*1 + 0.01)*1000 + 50 = 12.5 + 50 = 62.5; startup = 0 + 62.5
-	if !approx(c.Startup, 62.5) {
-		t.Fatalf("hashjoin startup = %v, want 62.5 (build is startup-heavy)", c.Startup)
+	// build = (0.0025+0.01)*1000 + 50 + seqPageCost*(1000/100) = 12.5 + 50 + 10 = 72.5
+	if !approx(c.Startup, 72.5) {
+		t.Fatalf("hashjoin startup = %v, want 72.5 (build is startup-heavy, +I/O pages)", c.Startup)
 	}
 	if c.Total <= c.Startup {
 		t.Fatalf("hashjoin total must exceed the build-only startup")
@@ -153,5 +153,34 @@ func TestCostParamsMatchConfigDefaults(t *testing.T) {
 		if !approx(boot, c.val) {
 			t.Errorf("GUC %q: costParams has %v but config BootVal is %v — drift", c.name, c.val, boot)
 		}
+	}
+}
+
+// TestCostJoinCandidateLargeBuildPressure pins M0126-0013: building on more
+// than largeBuildThreshold rows adds a quadratic penalty that makes the DP
+// avoid enormous intermediate hash tables.
+func TestCostJoinCandidateLargeBuildPressure(t *testing.T) {
+	cp := defaultCostParams()
+	outer := dpEntry{rows: 6_000_000, pgCost: Cost{Startup: 10, Total: 100}}
+	inner := dpEntry{rows: 6_000_000, pgCost: Cost{Startup: 5, Total: 50}}
+
+	// 6M build: overshoot = (6M-2M)/2M = 2, penalty = 4 * 0.01 * 6M = 240K
+	penalty := costJoinCandidate(cp, nil, outer, inner, 6_000_000, nil)
+
+	// Small build (below threshold): no penalty.
+	innerSmall := dpEntry{rows: 500_000, pgCost: Cost{Startup: 5, Total: 50}}
+	noPenalty := costJoinCandidate(cp, nil, outer, innerSmall, 500_000, nil)
+
+	if penalty.Total <= noPenalty.Total {
+		t.Errorf("6M build Total=%v must exceed 500K build Total=%v",
+			penalty.Total, noPenalty.Total)
+	}
+
+	// 10M build: overshoot = (10M-2M)/2M = 4, penalty = 16 * 0.01 * 10M = 1.6M
+	innerHuge := dpEntry{rows: 10_000_000, pgCost: Cost{Startup: 5, Total: 50}}
+	huge := costJoinCandidate(cp, nil, outer, innerHuge, 10_000_000, nil)
+	if huge.Total <= penalty.Total {
+		t.Errorf("10M build Total=%v must exceed 6M build Total=%v",
+			huge.Total, penalty.Total)
 	}
 }

@@ -138,6 +138,25 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.hasCTID = false
 		return
 	}
+	// M0126-0003 Stage 0a-live: *VirtualSlot fast path. The generic path
+	// calls ts.Row() (which for VirtualSlot is acquireRow + per-column
+	// 48-byte Datum copy, pooled row then dropped without releaseRow)
+	// followed by a second copy(s.Cells, row). Read columns directly
+	// instead — one copy, no pool churn.
+	if vs, ok := ts.(*VirtualSlot); ok {
+		n := vs.Width()
+		if cap(s.Cells) < n {
+			s.Cells = make([]Datum, n)
+		}
+		s.Cells = s.Cells[:n]
+		for i := 0; i < n; i++ {
+			s.Cells[i] = vs.Get(i)
+		}
+		s.schema = vs.Schema()
+		s.HasRow = true
+		s.hasCTID = false
+		return
+	}
 	row := ts.Row()
 	if cap(s.Cells) < len(row) {
 		s.Cells = make([]Datum, len(row))

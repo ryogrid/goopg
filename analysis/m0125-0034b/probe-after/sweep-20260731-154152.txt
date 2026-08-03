@@ -1,0 +1,21 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T15:42:05+09:00
+# goopg: baf4e5cf planner(unnest)+docs: M0125-0041 — the scalar pull-up never declined, it hit a missing switch arm
+# engine-id: 957a59251753e5c0c1872be448582fbb1da8ea2f c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=2202d9413291
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=7a76b9a0a11954c6 on-disk=7a76b9a0a11954c6 (tmp/goopg-0034b-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=30 64 65 81 71 5 31 47) — NOT a gate result; the summary below covers only these queries
+Q30  PASS        1s       31 rows  ck=f47a48499fd7e070
+Q64  MISMATCH   32s goopg=0 oracle=2
+Q65  TIMEOUT   309s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q81  PASS        1s      100 rows  ck=n/a
+Q71  PASS       14s      580 rows  ck=521a7af7606d10c1
+Q5   PASS       44s      100 rows  ck=n/a
+Q31  PASS       10s       19 rows  ck=2a74acfb556c21a7
+Q47  PASS      277s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=6 (3 ck-verified, 3 ck=n/a) MISMATCH=1 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

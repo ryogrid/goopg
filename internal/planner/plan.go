@@ -595,6 +595,13 @@ type SeqScan struct {
 	// answers it with plan invalidation, which goopg does not have yet — see
 	// the deferral ledger row for M0125-0003.
 	EstRelRows int64
+	// SmallDim is the small-dimension property of Table, derived from its size
+	// by `smallDimensionTag` and stamped here at plan-build time for the same
+	// reason EstRelRows is (see above: the consumers take a Node and have no
+	// catalog in scope). Before M0125-0043 this was a name lookup living on
+	// `catalog.Table.SmallDimension`; see
+	// docs/design/0125-0043-smalldimension-name-tag-extinction.md.
+	SmallDim bool
 	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
 	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
 	// parent takes AccessShare on the parent relation too (PostgreSQL locks the
@@ -667,6 +674,11 @@ type IndexScan struct {
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string
 	PrivilegeCheckRoleSet bool
+	// SmallDim — see SeqScan's field of the same name (M0125-0043). An
+	// IndexScan substituted for a SeqScan by a later pass copies it from the
+	// scan it replaces, so promoting a leaf to an index probe never changes
+	// the relation's small-dimension answer.
+	SmallDim bool
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -1084,6 +1096,15 @@ type CTEScan struct {
 	Alias  string // alias used at this consumer site (defaults to Name)
 	Child  Node
 	schema Schema
+	// cte points back at the planner-side WITH-list entry this scan
+	// consumes. pushQualsThroughSingleRefCTEs reads its statement-wide
+	// reference count to decide whether Child is private to this one
+	// reference (PG 12+ `cte_inline` refcount==1 criterion) — both the
+	// plan Node and the executor's name-keyed CTERowCache are shared
+	// between references, so a per-reference qual may cross into the
+	// body only when no second reference exists. nil for scans built
+	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
+	cte *plannedCTE
 }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)

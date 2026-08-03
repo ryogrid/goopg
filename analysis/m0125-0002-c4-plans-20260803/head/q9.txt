@@ -1,0 +1,2 @@
+Index Scan using public.reason_pkey on public.reason  (cost=0.00..0.00 rows=1 width=0)
+  Index Cond: (r_reason_sk = 1)

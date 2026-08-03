@@ -1,0 +1,13 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: c_customer_id
+    ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (((ca_city = 'Woodland') AND (ib_lower_bound >= 60306)) AND (ib_upper_bound <= 110306))
+      ->  Multi-Way Hash Join (5 tables)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on public.customer_demographics  (cost=0.00..0.00 rows=857302 width=0)
+        ->  Seq Scan on public.income_band  (cost=0.00..0.00 rows=2040 width=0)
+        ->  Seq Scan on public.customer  (cost=0.00..0.00 rows=47058 width=0)
+        ->  Seq Scan on public.store_returns  (cost=0.00..0.00 rows=56408 width=0)
+        ->  Seq Scan on public.household_demographics  (cost=0.00..0.00 rows=5350 width=0)
+      ->  Index Scan using public.customer_address_pkey on public.customer_address  (cost=0.00..0.00 rows=1 width=0)
+            Index Cond: (ca_address_sk = c_current_addr_sk)

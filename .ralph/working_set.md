@@ -1,53 +1,45 @@
-(idle — nothing in flight)
+Task: M0125-0002 commit 3 of 8 — `visitColumnRefs` re-based onto
+`walkExprRefs` — **DONE, committed + pushed** (loop #34, 2026-08-03), plus a
+separate gate repair `4fb87456` (units gate was RED at HEAD:
+`TestMHJParallelNoDuplicates` missed by `e85e5347`'s MHJ-retire test opt-ins).
 
-Last loop: **M0125-0024's owed executor-side value gate CLOSED**. New file
-`internal/executor/agg_state_sharing_value_test.go` (3 tests); design §5.1;
-ledger row 587 flipped `resolved`; one new ledger row appended.
+Files: internal/planner/bushy.go (new driver body; scopeIgnore; panic on
+unknown), internal/planner/exprwalk_inventory_test.go (census pin DELETED —
+first deletion in the series; header note), internal/planner/
+visit_refs_arms_test.go (NEW: 11 newly-visited-kind pins, preserved arms,
+scope declines, panic — all proved-fail-first), internal/executor/
+parallel_mhj_test.go (opt-in, separate commit), design doc 0125-0002 §"Commit
+3 of 8", analysis/m0125-0002-c3-plans-20260803/, plan_snapshots/
+m0125-0002-c3-{before,after}.txt, fix_plan item + ledger row.
 
-Files: the new test file, `docs/design/0125-0024-expression-identity-collisions.md`
-(§5.1 + §6), `docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
+Key findings:
+- All A/B instruments empty: TPC-H 22/22 byte-identical (== post-mhj-retire),
+  SF0.5 EXPLAIN 96/96 byte-identical, and a side-by-side divergence probe
+  (both walker bodies in one measurement binary) logged 0 deltas over all 118
+  planned queries. The probe matters because EXPLAIN prints Name over Index
+  (M0125-0042), and Index mutation is this commit's only behavioural surface.
+- Label hygiene: `m0125-0005-relsize-default-stage2` is STALE (e85e5347 MHJ
+  retire moved 19/22 plans). Current baseline label: `post-mhj-retire`.
+  Same-cluster A/B remains the staleness-immune instrument.
+- Timed TPC-H run skipped (ledger row; zero-hunk + probe). SF0.5 answer sweep
+  not owed (zero hunks; old body was read-only — no commit-2-style metadata
+  loss possible).
 
-## Facts the next loop should NOT re-derive
+Next step: re-read the banner. Inside M0125-0002 the next slice is **commit 4
+(`visitColumnRefsForTable`) — a first-order SHAPE mover; expect hunks, carry
+the timed TPC-H run + SF0.5 sweep ⇒ needs a QUIET host** (nightly was live
+all of loop #34). If the host is still busy next loop, other host-independent
+M0125 items: -0041 is arguably closeable as bookkeeping (its acceptance Q30
+PASS 1s/31 rows/ck=oracle was met by -0034's join-order arm per the banner,
+loop #15, but the box was never checked — verify the sweep row then check
+it), or -0040 (ROLLUP grouping-sets — big, code-heavy, acceptance needs
+timed runs though).
 
-- **A user-defined sfunc IS reachable from the in-package executor harness.**
-  The ledger row had budgeted a new fixture for this; it was not needed.
-  `executeSFuncCall` falls back to `executeStoredRoutine`
-  (`operators_join_agg.go:3633`) and `RAISE NOTICE` lands in `ctx.Notices`, so
-  a plpgsql sfunc + `newDDLFixture` + `runQuery` (with_compat_test.go) is the
-  whole recipe. Tests can COUNT sfunc calls, not just assert values.
-- **The M0125-0024 verdict is now "wrong answer AND wrong error".** At
-  `da6d2c0c`: `ua_sum(a+b), ua_sum(a-b)` → `(77, 77)` (PG: `(77, -63)`), and
-  `DISTINCT ON (CASE …) … ORDER BY CASE …` was **rejected** `42P10` although PG
-  18.3 accepts it (measured on the 65438 oracle). Do not re-argue the laxer
-  direction from `equalfuncs.c` — it is measured.
-- **PG oracle access:** 65438 is up; the role is **`ryo`, not `postgres`**
-  (`-U postgres` → `FATAL: role "postgres" does not exist`), dbs `tpcds`/`tpcds05`.
-  Read-only `VALUES`-derived queries need no DDL on the oracle cluster.
-- **Pre/post-fix proof without a worktree:** `git checkout da6d2c0c --
-  internal/planner/exprwalk.go internal/planner/planner.go`, run the *executor*
-  package, then `git checkout HEAD -- <same two>`. Planner _test.go files are
-  not compiled for another package, so this compiles cleanly. Cheap and exact.
-- **Host was NOT quiet** (nightly `run-nightly.sh` PID 3541516 since 01:51, its
-  TPC-DS stage on 65435 at ~11 GB RSS / ~590 % CPU, load ~12, budget-left ~78 min
-  at 06:59; Q18 TIMEOUT at 06:53). No timing was attempted. A goroutine dump was
-  taken from its pprof (6161) → `/tmp/nightly-goroutines-0713.txt`: it shows the
-  CURRENT query in `multiHashJoinOp.Open`, **no** orphaned-backend evidence, so
-  it is not the stack the parked shutdown-hang item wants.
+Gates run: units precommit ×2 (first run caught the RED MHJ test at HEAD →
+repaired; second run PASS exit 0); TPC-H plan A/B byte-identical; SF0.5
+EXPLAIN A/B 96/96; probe 0/118; tpch-spotcheck RESULT=PASS (Q12=2 Q13=35,
+35.2s); pgbench smoke ×2 via hook (both commits, 0 failed).
 
-## NEXT (banner order — M0124 closed, M0125 first, M-NIGHTLY filed-only)
-
-1. **The owed SF0.5 gate, on a QUIET host** (`scripts/tpcds-sf05-regression.sh
-   sweep`, ~1 h). Owed three times over and it **must precede M0125-0002
-   commit 2**. Check `ci/batch/run-nightly.sh` is absent first.
-2. `M0125-0002` **commit 2 — `cloneExprShiftIdx`** (`nl_index_join.go:777`),
-   first commit expecting hunks; carries the full timed 22-query TPC-H run
-   (`scripts/goopg-test-run.sh`, `GOGC=100` / `GOMEMLIMIT=12GiB`).
-3. Then `M0125-0003` stage 2's TIMED arm, stage 3, `M0125-0005`.
-
-Gates run: `go build ./...` clean; the 3 new tests proved to FAIL at `da6d2c0c`
-and PASS at HEAD; `./internal/executor/` + `./internal/planner/` PASS; units
-suite PASS (all cached); pgbench smoke via the commit hook; `make
-ralph-state-guard`. NOT run (host): SF0.5 sweep, any timed TPC-H, plan-diff
-(no planner/executor *product* code changed this loop — test-only).
-
-In-flight: none.
+In-flight: none. (Do NOT `git stash` in this tree — loop #34's attempted
+pathspec stash aborted on the untracked test file and the reflex `stash pop`
+nearly applied a FOREIGN 2026-07-29 stash@{0}; use a HEAD worktree instead.)

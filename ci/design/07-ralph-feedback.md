@@ -130,6 +130,17 @@ task done with a note "already fixed / stale item" instead of investigating.
 > header + charter rule 2) and `.ralph/PROMPT.md` objective 2, which also gained a
 > precedence rule: the banner outranks `.ralph/working_set.md`'s "NEXT LOOP" note.
 
+> **AMENDMENT 2026-07-31 — the parking set gains M0126.** The USER filed
+> **M0126** (cost-driven planning made production-viable,
+> `docs/milestones/0126-cost-driven-planning-production-viability.md`) directly
+> after M0125 and above this backlog. The 2026-07-28(b) amendment above is
+> unchanged in every respect except its milestone list: M-NIGHTLY is parked
+> beneath **M0124 / M0125 / M0126**, and the automatic-reversion clause now
+> reads "as soon as the banner stops naming M0124/M0125/M0126". Filing stays
+> unconditional; the two carve-outs are unchanged. Live wording:
+> `.ralph/fix_plan.md` (banner amendment + the `## M0126` section),
+> `.ralph/AGENT.md` loop discipline, `.ralph/PROMPT.md` objective 2.
+
 Implementation adds this block **at the top of the milestone list** in
 `.ralph/fix_plan.md` (and keeps it there permanently — it is a standing
 milestone, never completed, never deleted; the driver's completion detector

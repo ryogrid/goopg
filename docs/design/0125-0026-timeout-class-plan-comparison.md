@@ -1,6 +1,8 @@
 # 0125-0026 — The 15-query timeout class: capture both engines' EXPLAIN, classify, and file the planner fixes
 
-Status: **filed (work plan — no fix content here by design)**
+Status: **EXECUTED 2026-07-31** — capture, classification and fix-task filing
+all complete. Results: `analysis/m0125-0026-timeout-plans/README.md`.
+Execution record at the end of this document.
 Date: 2026-07-30 (filed by the user's interactive session, per user directive)
 Milestone: M0125 (the timeout class this milestone is *named* after)
 Depends on: nothing — the capture half is host-independent (EXPLAIN only, no execution)
@@ -21,6 +23,7 @@ time out on goopg while PG answers them in seconds. Per the git-tracked oracle
 | Q30 | 31 | f47a4849… | 4 | CTE + **correlated scalar agg** (`> (select avg(…)*1.2 … where ctr_state = ctr1.ctr_state)`) |
 | Q31 | 19 | 2a74acfb… | 4 | 1 CTE referenced **6×** (ss/ws × 3 quarters) |
 | Q35 | 100 | n/a | 0 | **3× EXISTS** — the measured RC-8 instance (see below) |
+| Q47 | 100 | n/a | 2 | **added 2026-07-30** — CTE + `rank()` window + 3-way self-join on `rn = rn±1` |
 | Q54 | 0 | 1f18d650… | 10 | CTE, cross-channel customer set, month-range scalar subqueries |
 | Q64 | 2 | 31f0342f… | 0 | 1 big CTE self-joined (two-phase, cnt>1) |
 | Q65 | 100 | n/a | 0 | two derived aggregates over store_sales, `<= 0.1*avg` |
@@ -32,6 +35,18 @@ time out on goopg while PG answers them in seconds. Per the git-tracked oracle
 
 goopg's side: all 15 are `TIMEOUT` at the gate's 300 s cap (merged sweep at
 `50cf7c5f`), i.e. **≥ 20–300× slower than PG on the same data and query text**.
+
+**The class is SIXTEEN as of 2026-07-30, and the sixteenth arrived by being
+repaired.** The full 99-query gate at `e29faca9`
+(`analysis/m0125-sf05-fullgate-20260730/`) reports `PASS=79 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=16 SKIP=4`: Q47 moved `MISMATCH → TIMEOUT` because
+M0125-0013 fixed its row count (0 → 100 = oracle) and the query now does the real
+work. Capture it in all three arms with the rest. But it must **not** be
+pre-classified as unbounded-above: its one completion reading is `OK 142 s` at
+SF=1 (M0125-0013's open bookkeeping half), so a 300 s cap on *half* the data is
+not obviously a hard cut, and `0124-0001` §D6 forbids reporting a
+budget-marginal member and an unbounded one as a single class. Q47's own reading
+comes first; only then does it join a root-cause bucket below.
 Q35 additionally has a measured floor: outer cardinality 96,562 × 8.16 s per
 buffer-warm `EXISTS` evaluation ≈ **9.1 days at SF=1** (`0124-0004` §"Execution
 record"), so at least one member cannot complete under ANY budget with the
@@ -88,7 +103,16 @@ estimate per-node work as `outer_rows × per-rescan_cost` (rescan shapes) or
 unreachable** — e.g. Q35's 96,562 × full-fact-scan makes the budget short by
 ~3 orders of magnitude. The number needs one significant digit, not a model.
 
-### Step 4 — File the fix tasks (M0125-0027+), one per CLASS
+### Step 4 — File the fix tasks (M0125-0032+), one per CLASS
+
+(Numbering updated 2026-07-30: `M0125-0027` was taken by the SF=1 harness
+dead-server defect and `-0028` … `-0031` by the warm-statistics programme
+(`docs/design/0125-0028-warm-stats-programme.md`), so per-class tasks file
+from `M0125-0032` onward — shared runway with M0125-0031's evidence-filed
+fixes; whichever files first takes the next free id. If the warm-up
+(-0029/-0030) lands before this capture runs, add a fourth **warm** arm
+(`goopg-warm/qN.txt`) — it is free and it directly previews which members
+-0031 gets for free.)
 
 Each with: member queries, the plan evidence (file paths from step 1), the
 arithmetic from step 3, the suspected code site, and acceptance =
@@ -168,3 +192,81 @@ before stage 3 lands" ordering is unaffected.
 - The fix tasks filed by step 4 are planner changes: they inherit the standing
   bar for plan-shape commits (plan-diff `LABEL=tpcds-round2-head`, timed
   22-query TPC-H run on a quiet host, full SF0.5 gate).
+
+## Execution record — 2026-07-31 (loop #4, branch `tpcds-fix2`, HEAD `927742f8`)
+
+Full results, per-query classification table and per-class arithmetic:
+**`analysis/m0125-0026-timeout-plans/README.md`**. This section records only
+what the executing loop did differently from the plan above, and what the plan
+got wrong.
+
+### Deviations from the work plan
+
+1. **The three arms were re-chosen, because the warm flip landed first.** The
+   plan's arms were "goopg default (= fallback OFF)", "goopg
+   `GOOPG_RELSIZE_FALLBACK=2`", "PG". Between the filing and the execution,
+   `M0125-0005` flipped the fallback default to stage 2 and `M0125-0029`/`-0030`
+   gave the bench clusters persistent warm statistics, so "default" no longer
+   means what the plan assumed. The arms captured were **`goopg-warm/`** (the
+   shipped regime: warm statistics + fallback stage 2), **`goopg-relsize0/`**
+   (`GOOPG_RELSIZE_FALLBACK=0`, same warm cluster) and **`pg/`**. The plan's
+   suggested fourth "warm" arm is therefore the *first* arm, not an extra one.
+2. **18 queries, not 13/15/16/17.** The thirteen at `relsize=2`, minus Q10/Q47/
+   Q67/Q69 (which the fallback answers) kept anyway as a **contrast set**, plus
+   Q72 and plus Q18 (`M0125-0033`, which the banner asked to fold in). The
+   contrast set earned its place: **Q69 is what proved C3 is specifically about
+   `OR`-ed `EXISTS`**, because its `AND NOT EXISTS` siblings unnest correctly
+   and it completes.
+3. **TPC-H Q21 was NOT captured.** The banner asked for it so one taxonomy would
+   cover both benchmark families. Both TPC-H clusters (:65432, :65433) were
+   down, and standing them up is not host-independent work
+   (`bench/tpch/setup_goopg.sh` rebuilds the shared `tmp/goopg-bench-bin`).
+   Q21's capture stays with `M0125-0032`; deferral-ledger row 2026-07-31.
+
+### Where this document's hypotheses were wrong
+
+- **Suspect (b) — "join order chosen with no cardinality signal" — is REFUTED.**
+  All 18 plans are **byte-identical** between `GOOPG_RELSIZE_FALLBACK=2` and
+  `=0`. The fallback never fires on an ANALYZEd relation by construction
+  (`internal/planner/plan.go:580`), so on a warm cluster the flag is inert. The
+  arm-ON/arm-OFF experiment §"Relation to M0125-0003" hoped would split the
+  class does not split anything; `M0125-0031` reached the same conclusion from
+  runtime.
+- **Suspect (d) — "CTE referenced N times = body executed N times" — is
+  REFUTED.** The EXPLAIN repetition is real (Q31 ×6, Q47 ×3, Q64 ×2 of an
+  18-relation subtree) but it is Stage-A clone-per-consumer *labelling*
+  (`internal/planner/plan.go:1071`). At runtime `*planner.CTEScan` routes to
+  `newCteScanOp`, which materializes once into `ctx.CTERowCache` keyed by CTE
+  name and replays (`internal/executor/executor.go:75-85`,
+  `internal/executor/context.go:537`). The document pointed at
+  `internal/planner/with.go`; the answer was in the executor. What *is* wrong
+  with Q31 is where the qualifiers land — suspect (c)'s territory, not (d)'s.
+- **Suspect (e) — "no LIMIT/TopN pushdown through window/rollup" — is NOT
+  CONFIRMED.** Q67's `rank() ≤ 100` filter is present on the `WindowAgg` node,
+  and Q67 is not a hard member. Q65, the one hard member (e) named, is a C1
+  cross-product query. No hard member is owned by (e).
+- **Suspect (a) — RC-8 — is CONFIRMED but narrower than described.** It owns
+  Q10/Q35/Q30/Q81, and PG's own plan for Q10 uses `hashed SubPlan`, which
+  independently corroborates `0124-0004` §D4's "caching, not decorrelation"
+  rule. Q69 was listed as a candidate and is not one.
+- **Suspect (c) — RC-5 — is CONFIRMED and is far broader than "an
+  aggravator".** 66 of 68 `Filter:` lines in the goopg capture sit on join
+  nodes rather than scans.
+- **The mechanism the document did not anticipate at all is C1**: goopg emits
+  `Nested Loop (CROSS)` — a genuine Cartesian product, `planner.JoinTypeCross` —
+  at 14 sites across 8 of the 18 queries, at every site where a join input is a
+  subquery. It is the largest class and the first fix.
+- **A structural blocker the document did not anticipate**: goopg prints
+  `*planner.SetOp` with **no children**, so Q5, Q14 and Q18 have four-line
+  plans and three queries could not be classified at all. Step 2's instruction
+  to produce "one row per query" was not fully satisfiable, and the fix for that
+  (`M0125-0037` stage (i)) is now the milestone's next selection.
+
+### Filed tasks
+
+`M0125-0034` (C1, Cartesian join over subquery inputs) · `M0125-0035` (C2,
+qualifier placement / RC-5) · `M0125-0036` (C3, uncached correlated SubPlan) ·
+`M0125-0037` (C4, set operations opaque to EXPLAIN and to the planner) ·
+`M0125-0038` (C5, no cost/cardinality propagation above base scans) ·
+`M0125-0039` (diagnostics, unqualified column references in EXPLAIN).
+Selection order and rationale are in the Current Priority banner.

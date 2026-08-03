@@ -151,7 +151,14 @@ func conjunctIsLocalEligible(e Expr) bool {
 // guard cheap (table-flag check, no row-count math).
 //
 // (M0077-0001.)
-func shouldAttachBeforeMHJ(bindings []rangeBinding) bool {
+// M0125-0043 added the `scans` parameter. The gate's second clause asks
+// whether the FROM list contains a small-dimension relation, and that answer
+// moved off `catalog.Table.SmallDimension` (a lookup of the literal names
+// "region"/"nation") onto the leaf scan, where it is derived from the
+// relation's size. `scans[i]` is the leaf built for `bindings[i]`; a binding
+// with no scan falls back to the catalog hint, which is what the TPC-H unit
+// fixtures set.
+func shouldAttachBeforeMHJ(bindings []rangeBinding, scans []Node) bool {
 	// Cost-driven order builds a binary Join tree (no MultiHashJoin), so a
 	// single-table restriction that isn't routed to its leaf scan here
 	// filters the full-table join output at the top instead — e.g. TPC-H
@@ -171,8 +178,12 @@ func shouldAttachBeforeMHJ(bindings []rangeBinding) bool {
 	if len(bindings) < 5 {
 		return false
 	}
-	for _, b := range bindings {
-		if b.table != nil && b.table.SmallDimension {
+	for i, b := range bindings {
+		var scan Node
+		if i < len(scans) {
+			scan = scans[i]
+		}
+		if smallDimensionSide(scan, b.table) {
 			return true
 		}
 	}

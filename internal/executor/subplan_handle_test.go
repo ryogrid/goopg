@@ -159,6 +159,10 @@ func TestHandleStableInnerCached(t *testing.T) {
 // pre-Stage-9 lifecycle is byte-for-byte back — a correlated EXISTS
 // rebuilds on every call and never rescans.
 func TestHandleKillSwitchLegacyLifecycle(t *testing.T) {
+	// M0125-0036: this probe's `= -999 OR EXISTS (…)` shape is what the
+	// EXISTS→ANY conversion consumes; the correlated-SubPlan path it
+	// grades is still live for every EXISTS the conversion declines.
+	pinCorrelatedSubPlanPath(t)
 	SetSubPlanRescanEnabled(false)
 	t.Cleanup(func() { SetSubPlanRescanEnabled(true) }) // restore the ON default
 

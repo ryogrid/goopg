@@ -94,3 +94,23 @@
 2026-07-30T01:17:17+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-07-30T04:08:31+09:00 [RUN]	S1 barrier reached
 2026-07-30T08:22:53+09:00 [RUN]	end status_rc=1 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-30T08:24:38+09:00 [RUN]	log-push: committed + pushed batch logs to origin/tpcds-fix2
+2026-07-31T00:12:02+09:00 [RUN]	start run_id=20260731-001201 sha=927742f8 dirty=43 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-07-31T00:12:09+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-31T02:58:21+09:00 [RUN]	S1 barrier reached
+2026-07-31T04:06:46+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-31T04:08:29+09:00 [RUN]	log-push: committed + pushed batch logs to origin/tpcds-fix2
+2026-08-01T01:18:02+09:00 [RUN]	start run_id=20260801-011802 sha=99c6ea23 dirty=42 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-01T01:18:10+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-01T04:14:21+09:00 [RUN]	S1 barrier reached
+2026-08-01T05:31:53+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-01T05:33:34+09:00 [RUN]	log-push: committed + pushed batch logs to origin/tpcds-fix2
+2026-08-02T01:44:05+09:00 [RUN]	start run_id=20260802-014405 sha=d197365c dirty=46 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-02T01:44:12+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-02T02:19:53+09:00 [RUN]	S1 barrier reached
+2026-08-02T03:41:17+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-02T03:42:54+09:00 [RUN]	log-push: committed + pushed batch logs to origin/tpcds-fix2
+2026-08-03T01:39:55+09:00 [RUN]	start run_id=20260803-013955 sha=1a589c23 dirty=43 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-03T01:40:01+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-03T02:16:51+09:00 [RUN]	S1 barrier reached
+2026-08-03T03:52:28+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md

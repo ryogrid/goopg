@@ -1,0 +1,37 @@
+# M0126-0010 — Close-out residuals
+
+## Landed
+- `be1f88d5` planner(cardinality): cap estimateJoin fallback at max(l,r)
+  - Prevents FK-chain cardinality explosion (Q9: 5.9e15 → 6M in EXPLAIN)
+  - SPOTCHECK PASS, SMOKE PASS, unit tests green (incl. new TestEstimateJoinCapFallback)
+
+## NOT moved
+- Q9: 14+ min (killed) vs default 58.83s — 12x+ regression persists
+- Root cause: the DP path (bushy.go estimateJoinCost) uses accurateKeyDistinct
+  and already had correct cardinality estimates. The plan's slowness is from
+  the join ORDER (small-dimension-first, building 3×6M-row intermediate hash
+  tables), not from bad cardinality estimates.
+
+## Classification of remaining regressions
+All regressions are actually class-(c) build-side memory not modeled:
+- Q9:  3 intermediate hash builds on 6M rows
+- Q10: intermediate hash build on 166K rows
+- Q11: CTE cardinality + self-join
+- Q7:  intermediate hash builds
+- Q18: intermediate hash builds
+- Q21: intermediate hash builds
+
+The cap fix makes EXPLAIN display correct estimates, which is a prerequisite
+for any future cost-model work. But the plans themselves need the cost model
+to understand that building large intermediate hash tables is expensive.
+
+## Routing
+→ M0126-0013: Build-side memory-aware hash costing
+  (CONDITIONAL: fires if -0012 no-go)
+
+## Budget
+- 1/4 commits used
+- Q9 attempt #1 used (didn't move query)
+- Q9 attempt #2: deferred to M0126-0013 scope
+- 3 commits remaining: not needed — the cardinality path is fixed;
+  remaining issues are cost-model, not cardinality

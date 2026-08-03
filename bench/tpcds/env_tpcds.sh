@@ -30,7 +30,14 @@ export PATH="${PG_PREFIX}/bin:${PATH}"
 export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
 # goopg bench binary (shared with the TPC-H bench; rebuilt by server.sh start).
-GOOPG_BIN="${REPO_ROOT}/tmp/goopg-bench-bin"
+#
+# Env-overridable for the same reason the results dirs below are (2026-07-30):
+# this ONE path is shared with the nightly CI batch's clone lanes, which both
+# rebuild it (bench/tpch/setup_goopg.sh:28) and run servers from it for hours.
+# A loop that needs a binary at its own HEAD while the nightly holds the host
+# must be able to build somewhere private instead of clobbering the nightly's
+# binary mid-run — `GOOPG_BIN=tmp/goopg-sf05-bin scripts/tpcds-sf05-regression.sh …`.
+GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-bench-bin}"
 
 # --- Directories -----------------------------------------------------------
 TPCDS_RUNTIME_DIR="${TPCDS_BENCH_DIR}/runtime_goopg"
@@ -77,6 +84,24 @@ bench_foreign_procs() {
     local skip; skip=$(IFS='|'; echo "${pids[*]}")
     ps -eo pid,args --no-headers | awk -v skip="^(${skip})$" '$1 !~ skip { $1=""; print }'
 }
+
+# --- Engine provenance (design 0124-0001 rule D4a) -------------------------
+# Which engine actually answered a sweep is load-bearing evidence, because every
+# M0124/M0125 acceptance is a verdict read off a sweep report. `git log -1`
+# cannot carry it: it moves for a docs commit (false alarm) and stays put when
+# an uncommitted engine edit enters the sweep at the next rebuild (silent
+# mis-provenance — the mechanism behind sweep-20260727-214619's wrong label).
+#
+# The three helpers moved to scripts/lib/bench-engine-id.sh on 2026-07-30, when
+# the TPC-H relation-size arm harness (M0125-0003) became the third reader:
+# D4a's fields must mean the SAME thing in the SF=1 board, the SF0.5 gate and
+# the TPC-H arms, and a third ad-hoc copy would drift. Sourcing it here keeps
+# every TPC-DS harness working through this one env file. Both print them as
+#   # engine-id: <trees> diff=<digest>
+#   # engine-binary: running=<sha> on-disk=<sha> (<path>)
+# Callers own the *policy* (when to warn, when to declare a sweep void).
+# shellcheck source=../../scripts/lib/bench-engine-id.sh
+source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
 
 TPCDS_GOOPG_LOG="${TPCDS_RUNTIME_DIR}/goopg.tpcds.log"
 SF05_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf05.log"

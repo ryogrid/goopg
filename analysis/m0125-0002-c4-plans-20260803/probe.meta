@@ -1,0 +1,6 @@
+# arm:      probe
+# binary:   /tmp/goopg-c4-probe
+# bin-sha:  5b78ca153d16a59f
+# captured: 2026-08-03T04:38:37+09:00
+# note:     GOOPG_RELSIZE_FALLBACK left UNSET — since M0125-0005 the
+#           default IS stage 2, so unset is the shipped planner.

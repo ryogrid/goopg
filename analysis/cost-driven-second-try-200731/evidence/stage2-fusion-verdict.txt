@@ -1,0 +1,51 @@
+# M0126-0007 — Fusion enablement measurement matrix
+
+## Verdict: KS1 PERMANENTLY OFF
+
+Reason: TPC-DS SF0.5 Q14 row count mismatch.
+
+| Test | Fusion OFF | Fusion ON | Oracle |
+|------|-----------|-----------|--------|
+| Q14 rows | **200** (correct) | **100** (wrong) | 200 |
+
+Q14 with fusion ON returns exactly half the expected rows (100 vs 200).
+With fusion OFF, the correct 200 rows are returned. This is a correctness
+regression caused by fusion.
+
+Per M0126-0007 acceptance rules (bundle 10 §4): "KS1 flips off without
+debate on any DS05 delta." Fusion is permanently OFF.
+
+## Measurement matrix
+
+| Item | Status | Detail |
+|------|--------|--------|
+| **SPOT** | PASS | Q12=2, Q13=35 (fusion ON, no delta) |
+| **DS05** | FAIL | Q14 MISMATCH (100 vs 200), Q22 MISMATCH (0 vs 100) with fusion ON. Q14 verified pre-existing: fusion OFF returns correct 200 rows |
+| **DIFF** | N/A | Executor-only change, no plan diffs expected |
+| **SF1 A/B** | PARTIAL | Arm A (fusion OFF): Q1-Q20 complete, Q21 OOM (MHJ=OFF issue). Arm B not run (KS1 already OFF) |
+| **Low-work_mem** | NOT RUN | KS1 OFF verdict makes this unnecessary |
+| **SMOKE** | PASS | 506/688/13902 tps (fusion ON, from spotcheck binary) |
+
+## Arm A (fusion OFF, MHJ=OFF) — partial TPC-H SF1 timings
+
+Q1: 6.43s, Q2: 3.39s, Q3: 42.85s, Q4: 39.17s, Q5: 59.76s, Q6: 3.70s,
+Q7: 40.46s, Q8: 7.28s, Q9: 56.62s, Q10: 23.93s, Q11: 1.73s, Q12: 14.37s,
+Q13: 11.67s, Q14: 3.88s, Q15-CREATEVIEW: 0.05s, Q15a: 4.14s, Q15b: 35.62s,
+Q16: 1.08s, Q17: 22.28s, Q18: 83.44s, Q19: 6.36s, Q20: 18.48s,
+Q21: ERROR (OOM at 244s), Q22: ERROR (server dead)
+
+## Root cause hypothesis for Q14 fusion bug
+
+Q14 is a TPC-DS query with a hash join chain. The fusion operator
+(tryFuseHashCascade) fuses consecutive binary HashJoin nodes into a
+single fusedHashJoinOp. The 100 vs 200 row discrepancy (exactly half)
+suggests a duplicate-elimination or key-collision bug in the fused
+operator — possibly the fused hash lookup is dropping rows when the
+same hash key appears in multiple levels of the cascade.
+
+## Disposition
+
+- KS1 (GOOPG_RUNTIME_JOIN_FUSION) remains default-OFF
+- The fusion code stays in-tree but is never enabled
+- M0126-0007 is COMPLETE — "leave the switch off permanently" is a
+  legitimate recorded completion per the task spec

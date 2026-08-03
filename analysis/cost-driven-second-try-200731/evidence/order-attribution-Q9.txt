@@ -1,0 +1,104 @@
+# M0126-0009 — Q9 Order-failure attribution
+#
+# HEAD: 0a2e7cb1 (default) + d3468aa1 (Q14 evidence)
+# Binary: tmp/goopg-fusion-ab-bin
+# TPC-H SF=1 cluster: 65433
+# Env: GOGC=off GOMEMLIMIT=12GiB
+# Measurement: EXPLAIN (no ANALYZE) both arms — plan shape + cardinality estimates
+# Measured: 2026-08-02
+
+## Default-arm EXPLAIN (MHJ=ON, cost-driven=OFF)
+```
+ Sort  (cost=0.00..0.00 rows=3)
+   Sort Key: nation, o_year DESC
+   ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=3)
+     ->  Gather  (rows=6, Workers: 4)
+       ->  Hash Join (INNER)  (rows=6)              ← nation (25 rows)
+         ->  Hash Join (INNER)  (rows=50)            ← supplier (10K)
+           ->  Hash Join (INNER)  (rows=1)           ← part (200K, filter 'green%')
+             ->  Multi-Way Hash Join (3 tables)  (rows=1.8e14)  ← orders ⋈ partsupp ⋈ lineitem
+               ->  Seq Scan orders  (rows=1.5M)
+               ->  Seq Scan partsupp (rows=800K)
+               ->  Seq Scan lineitem (rows=6M)
+             ->  Seq Scan part (rows=200K, filter: p_name LIKE '%green%')
+           ->  Seq Scan supplier (rows=10K)
+         ->  Seq Scan nation (rows=25)
+```
+Join order: big-fact-first (MHJ) → dimension filters last
+Top cardinality: 3 rows (close to actual 175 → reasonable)
+
+## Cost-driven-arm EXPLAIN (MHJ=OFF, cost-driven=ON)
+```
+ Sort  (rows=2.9e15)
+   ->  HashAggregate (rows=2.9e15)
+     ->  Gather  (rows=5.9e15, Workers: 2)
+       ->  Hash Join (INNER)  (rows=5.9e15)          ← outermost: part (200K)
+         ->  Seq Scan part (rows=200K, filter green)
+         ->  Hash Join (INNER)  (rows=1.1e15)         ← orders (1.5M)
+           ->  Seq Scan orders (rows=1.5M)
+           ->  Hash Join (INNER)  (rows=1.5e11)       ← partsupp (800K)
+             ->  Seq Scan partsupp (rows=800K)
+             ->  Hash Join (INNER)  (rows=3.7e7)      ← lineitem (6M)
+               ->  Seq Scan lineitem (rows=6M)
+               ->  Hash Join (INNER)  (rows=1250)     ← innermost: supplier ⋈ nation
+                 ->  Seq Scan supplier (rows=10K)
+                 ->  Seq Scan nation (rows=25)
+```
+Join order: small-dimension-first (nation ⋈ supplier) → chain through fact tables
+Top cardinality: 2.9e15 rows (actual = 175 → absurd, 1.7e13x off)
+
+## Cardinality chain analysis
+
+| Join step | Default estimate | Cost-driven estimate | Actual (from exec) |
+|-----------|-----------------|---------------------|---------------------|
+| nation ⋈ supplier | — (last) | 1,250 | ~10K |
+| … ⋈ lineitem | — | 37,482,756 | ~6M |
+| … ⋈ partsupp | — | 149,931,024,000 | ? (FK-constrained) |
+| … ⋈ orders | — | 1,124,482,680,000,000 | ? (FK-constrained) |
+| … ⋈ part | — | 5,888,930,250,208,968 | 175 |
+| orders ⋈ partsupp ⋈ lineitem (MHJ) | 179,917,230,000,000 | — | ? |
+
+Key observation: In the cost-driven plan, each successive FK join MULTIPLIES the
+estimated cardinality instead of joining on a key. The chain:
+  nation(25) × supplier(10K) / ndistinct = 1250         (OK)
+  1250 × lineitem(6M) / ndistinct = 37M                   (already ~6x too high)
+  37M × partsupp(800K) / ndistinct = 1.5e11              (explosion)
+  1.5e11 × orders(1.5M) / ndistinct = 1.1e15             (further explosion)
+  1.1e15 × part(200K) / ndistinct = 5.9e15               (final absurdity)
+
+The default MHJ plan masks this: the single MHJ estimate (1.8e14) is equally
+wrong, but the subsequent dimension joins (part, supplier, nation) with filters
+bring it down: 1.8e14 → 1 → 50 → 6 → 3.
+
+## Root cause
+
+The join cardinality estimator computes NDistinct-based selectivity without
+accounting for foreign-key constraints. When a FK-PK join chains N tables, the
+estimator treats each join column as an independent random variable, causing
+multiplicative error amplification.
+
+In the cost-driven plan the small dimension tables are joined first, so the
+"base" cardinality starts reasonable (1250) but then each successive FK join
+with a large fact table appears to explode the row count. The cost model sees
+each intermediate hash table as impossibly large, which should make this plan
+look terrible — yet the planner still picks it, suggesting the cost model's
+alternative (big-tables-first) has even worse estimates, OR the cost of the
+alternative path is dominated by the MHJ's own absurd estimate.
+
+## Classification: (a) cardinality estimate
+
+Specifically: **multi-level FK join cardinality compounding**. The ndistinct-based
+selectivity formula does not recognize that joins on FK-PK columns are
+semantically constrained (each fact row matches exactly one dimension row),
+so the estimator treats them as independent Bernoulli trials across the
+Cartesian product, causing O(n^k) blowup for k-level chains.
+
+## Routing
+
+→ M0126-0010: bounded cardinality fix. Candidate approaches (constrained by
+  M0126-0010 prohibitions — no global NDistinct rewrite, no penalty multipliers):
+  1. FK-aware join selectivity: when a join column is a FK referencing the other
+     side's PK, the selectivity should be 1/max(ndistinct_probe, ndistinct_build)
+     rather than the product formula.
+  2. Join-key ndistinct cap: the estimated output rows of a hash join should
+     never exceed max(|outer|, |inner|) for a FK-PK join.

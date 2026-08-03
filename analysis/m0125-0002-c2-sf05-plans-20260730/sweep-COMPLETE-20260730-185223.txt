@@ -1,0 +1,116 @@
+# TPC-DS SF0.5 goopg sweep — MERGED from 4 contiguous QUERIES= chunks (17:02–18:52, 2026-07-30)
+# arm: M0125-0002 commit 2 (cloneExprShiftIdx on cloneExprRefs), GOOPG_RELSIZE_FALLBACK UNSET = stage 2 since M0125-0005
+# goopg: d4071df4 planner(costmodel): M0125-0005 — the relation-size fallback is now the default, and the gate it was feared to degrade got 2.43x cheaper
+# engine-id: 14da0579dab0d1c8b16a827eba614ff0f0c19997 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=099046e8717a
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=6fdcebecd86cf04c on-disk=6fdcebecd86cf04c (/home/ryo/work/goopg/goopg/tmp/goopg-c2-new)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(off) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=1
+# chunks: sweep-20260730-170204.txt sweep-20260730-173021.txt sweep-20260730-175832.txt sweep-20260730-183511.txt 
+# every chunk ran on the SAME engine-id and the SAME binary sha (6fdcebecd86cf04c); each started a fresh S-cold server
+# NOTE: the per-chunk headers say 'GOOPG_RELSIZE_FALLBACK=unset(off)'. That label was STALE — M0125-0005
+#       flipped the default to stage 2 and the reporter still spelled unset 'off'. Fixed in
+#       scripts/tpcds-sf05-regression.sh in the same commit as this artefact; the regime measured here is stage 2.
+Q1   PASS       62s      100 rows  ck=n/a
+Q2   PASS       17s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        2s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   TIMEOUT   312s (oracle 100 rows)
+Q6   PASS       27s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       27s      100 rows  ck=n/a
+Q8   TIMEOUT   311s (oracle 0 rows)
+Q9   PASS       72s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       39s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       14s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       31s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  TIMEOUT   311s (oracle 200 rows)
+Q15  PASS        3s      100 rows  ck=n/a
+Q16  PASS       19s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       25s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      118s      100 rows  ck=n/a
+Q19  PASS       29s      100 rows  ck=n/a
+Q20  PASS        7s      100 rows  ck=n/a
+Q21  PASS       32s      100 rows  ck=n/a
+Q22  PASS       21s      100 rows  ck=n/a
+Q23  PASS       83s        1 rows  ck=00f53003bda23764
+Q24  PASS       34s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       26s        0 rows  ck=1f18d650d205d71d
+Q26  PASS       15s      100 rows  ck=n/a
+Q27  PASS       73s      100 rows  ck=n/a
+Q28  PASS       42s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       27s        0 rows  ck=1f18d650d205d71d
+Q30  TIMEOUT   312s (oracle 31 rows)
+Q31  TIMEOUT   312s (oracle 19 rows)
+Q32  PASS        1s        1 rows  ck=a55f36d3bf196bce
+Q33  PASS       30s      100 rows  ck=n/a
+Q34  PASS       16s      187 rows  ck=c83808417d7a81d8
+Q35  TIMEOUT   312s (oracle 100 rows)
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS       18s        0 rows  ck=1f18d650d205d71d
+Q38  PASS       16s        1 rows  ck=6f66a76c23e12a63
+Q39  PASS       65s       77 rows  ck=4db806a9a11fddfd
+Q40  PASS        3s      100 rows  ck=n/a
+Q41  PASS       10s        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        1s       10 rows  ck=5004612d9b837c34
+Q43  PASS        2s        6 rows  ck=b70a4026e9b9bb04
+Q44  PASS       27s       10 rows  ck=d76f8301addaff98
+Q45  PASS        9s        7 rows  ck=e09cf591997524ad
+Q46  PASS       21s      100 rows  ck=n/a
+Q47  PASS      280s      100 rows  ck=n/a
+Q48  PASS       21s        1 rows  ck=9a9ece15cb525a79
+Q49  PASS       22s       25 rows  ck=ccb0983b810cf1d0
+Q50  PASS        8s        6 rows  ck=3928ecee672e3992
+Q51  PASS       14s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS       20s      100 rows  ck=n/a
+Q54  TIMEOUT   313s (oracle 0 rows)
+Q55  PASS        4s       73 rows  ck=46d35b957845db41
+Q56  PASS       29s      100 rows  ck=n/a
+Q57  PASS       57s      100 rows  ck=n/a
+Q58  PASS       20s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       18s      100 rows  ck=n/a
+Q60  PASS       29s      100 rows  ck=n/a
+Q61  PASS       52s        1 rows  ck=4766027020fae308
+Q62  PASS        6s      100 rows  ck=n/a
+Q63  PASS       19s      100 rows  ck=n/a
+Q64  TIMEOUT   315s (oracle 2 rows)
+Q65  TIMEOUT   315s (oracle 100 rows)
+Q66  PASS       16s        5 rows  ck=f6613897dd73709a
+Q67  PASS      155s      100 rows  ck=n/a
+Q68  PASS       23s      100 rows  ck=n/a
+Q69  PASS       16s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  TIMEOUT   313s (oracle 580 rows)
+Q72  PASS      313s      100 rows  ck=n/a
+Q73  PASS       16s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       13s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       34s      100 rows  ck=n/a
+Q76  PASS       14s      100 rows  ck=n/a
+Q77  PASS       19s       44 rows  ck=2afe8ddcd18fad9c
+Q78  TIMEOUT   314s (oracle 45 rows)
+Q79  PASS       14s      100 rows  ck=n/a
+Q80  PASS       41s      100 rows  ck=n/a
+Q81  TIMEOUT   315s (oracle 100 rows)
+Q82  PASS       32s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        3s        3 rows  ck=9504298446f22ddc
+Q84  PASS        3s        6 rows  ck=073898a18264bd8e
+Q85  PASS        3s        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       17s        1 rows  ck=b363a9287bdd0920
+Q88  PASS      110s        1 rows  ck=272de7cd629d9033
+Q89  PASS       18s      100 rows  ck=n/a
+Q90  PASS       10s        1 rows  ck=66ceccaa8ce9d2cf
+Q91  PASS        2s        1 rows  ck=88b9d5fffed589f8
+Q92  PASS        1s        1 rows  ck=26c02866b1827f1b
+Q93  PASS        3s        0 rows  ck=1f18d650d205d71d
+Q94  PASS       10s        1 rows  ck=04afc1b69831a5ea
+Q95  PASS       18s        1 rows  ck=e498634c02595c29
+Q96  PASS       13s        1 rows  ck=5923f3c62773e705
+Q97  PASS       15s        1 rows  ck=65725195ebe13a3b
+Q98  PASS       10s     2128 rows  ck=be1b9a6d08cb1a3d
+Q99  PASS       12s       90 rows  ck=b10fd5001836fcfb
+
+=== SUMMARY: PASS=83 (50 ck-verified, 33 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=12 SKIP=4 ===

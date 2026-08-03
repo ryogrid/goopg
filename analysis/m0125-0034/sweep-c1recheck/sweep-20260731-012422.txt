@@ -1,0 +1,25 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T01:24:33+09:00
+# goopg: ccab6d80 executor(explain)+bench(tpcds): M0125-0039 — a correlation stops reading as a self-comparison
+# engine-id: bf2d4c58dedf6c9551bf79d8414f11448a7d53ac c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=f020f3a632ae
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=e033eea10806b929 on-disk=e033eea10806b929 (/home/ryo/work/goopg/goopg/tmp/goopg-m0125-0034-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=5 8 14 54 30 64 65 81) — NOT a gate result; the summary below covers only these queries
+Q5   PASS       45s      100 rows  ck=n/a
+Q8   PASS        7s        0 rows  ck=1f18d650d205d71d
+Q14  PASS      183s      200 rows  ck=n/a
+Q54  PASS       44s        0 rows  ck=1f18d650d205d71d
+Q30  TIMEOUT   323s (oracle 31 rows)
+      (restarting goopg to drop accumulated heap)
+Q64  TIMEOUT   323s (oracle 2 rows)
+      (restarting goopg to drop accumulated heap)
+Q65  TIMEOUT   325s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q81  TIMEOUT   325s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+
+=== SUMMARY: PASS=4 (2 ck-verified, 2 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=4 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

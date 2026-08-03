@@ -26,6 +26,14 @@ package planner
 // joined), 48 walkerPending (exprEqual and planExprContentKey converted), 12
 // classifiers. Those two were the only census members whose fail-open
 // CONFLATES instead of no-opping, because both compute an identity.
+// M0125-0002 commits 1-2 then DEMOTED remapByPosMap and cloneExprShiftIdx
+// (dispatch switches survive inside their Rewrite closures), and commits 3
+// and 4 (2026-08-03) DELETED bushy.go:visitColumnRefs and
+// bushy.go:visitColumnRefsForTable outright — their switches vanished; the
+// *ColumnRef filter in each new body is a type assertion, not a switch. The
+// pinned walkerPending population stood at 47 after those deletions (new
+// pinned sites had joined since the 2026-07-30 census; the map below, not
+// this comment, is the authoritative count).
 //
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
@@ -81,6 +89,16 @@ const (
 	// for correctness — but it is still counted here, because "does not
 	// recurse" is a property that a later edit can quietly take away.
 	nonRecursiveClassifier walkerRole = "classifier"
+
+	// boundedQualSpine recurses, but over a CLOSED set of node types chosen
+	// for a semantic reason rather than for coverage: completing it would
+	// make it WRONG. Added by M0125-0036, whose EXISTS→ANY conversion walks
+	// only the AND/OR spine of a qual, because every other position — NOT,
+	// CASE, a function argument — is one where the ANY form's NULL is
+	// distinguishable from the EXISTS form's FALSE. An exprwalk driver is
+	// therefore not the fix for these; the closed set IS the invariant, and
+	// pinning it here is how a later edit that widens the set gets audited.
+	boundedQualSpine walkerRole = "bounded-qual-spine"
 )
 
 // exprSwitchInventory pins every Expr type switch in package planner, keyed
@@ -100,10 +118,23 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:remapByPosMap":           nonRecursiveClassifier,
 	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
 	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
-	"bushy.go:visitColumnRefs":         walkerPending, // 7 of 32 arms
 	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
-	"bushy.go:visitColumnRefsForTable": walkerPending, // 12 of 32 arms
-	"exprwalk.go:exprChildSlots":       exprwalkPrimitive,
+	// Added by the M0125-0035 CTE-body arm. Both are built on the
+	// exprwalk primitives — walkExprRefs carries the recursion and
+	// cloneExprRefs the rewrite — and what the census sees is the
+	// bottom-up dispatch inside their Visit closures (veto
+	// *OuterColumnRef / *FuncCall, validate *ColumnRef), attributed to
+	// the enclosing function. Same demoted shape as
+	// nl_index_join.go:cloneExprShiftIdx. Fail-open is a DECLINE here:
+	// an unenumerated type passes the visitor and the conjunct is still
+	// only pushed if every ColumnRef validates, and property 2 keeps the
+	// residual copy either way.
+	"cte_inline_pushdown.go:remapConjunctThroughCTEOutput":  nonRecursiveClassifier,
+	"cte_inline_pushdown.go:remapConjunctThroughProjection": nonRecursiveClassifier,
+	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
+	// the transformation's NULL-semantics invariant, not an omission.
+	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,
+	"exprwalk.go:exprChildSlots":              exprwalkPrimitive,
 	// Added by M0125-0024: the per-node half of the identity key, complete
 	// over all 32 types and gated with the other two by
 	// exprwalk_exhaustive_test.go.
@@ -112,12 +143,23 @@ var exprSwitchInventory = map[string]walkerRole{
 	"foldconst.go:FoldConstants":                                walkerPending, // 15 of 32 arms
 	"foldconst.go:toLiteralValue":                               nonRecursiveClassifier,
 	"inner_join_qual_pushdown.go:innerJoinPushTarget":           nonRecursiveClassifier,
+	// Added by M0125-0046: the MHJ analog of innerJoinPushTarget — the
+	// recursion is walkExprRefs (fail-closed), and the census sees the
+	// bottom-up dispatch inside the Visit closure (veto *OuterColumnRef /
+	// *FuncCall, validate *ColumnRef against the owning Tables[i] range).
+	"inner_join_qual_pushdown.go:mhjResidualConjunctTable":      nonRecursiveClassifier,
 	"local_filters.go:conjunctIsLocalEligible":                  walkerPending, // 9 of 32 arms, recurses via its `walk` closure
 	"local_filters.go:localizeExprToLeaf":                       walkerPending, // 7 of 32 arms
 	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
 	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
 	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
-	"nl_index_join.go:cloneExprShiftIdx":                        walkerPending, // 12 of 32 arms
+	// CONVERTED by M0125-0002 commit 2, and DEMOTED for the same reason
+	// commit 1's remapByPosMap was: the recursion and the exhaustiveness
+	// moved to exprChildSlots (via cloneExprRefs), but a two-arm bottom-up
+	// dispatch survives inside the Rewrite closure — shift a *ColumnRef,
+	// veto *OuterColumnRef / *CTIDExpr — and the census attributes a
+	// closure's switch to its enclosing function. RC-1a class 48 → 47.
+	"nl_index_join.go:cloneExprShiftIdx":                        nonRecursiveClassifier,
 	"nl_index_join.go:residualCostMultiplier":                   nonRecursiveClassifier,
 	// planner.go:exprEqual and planner.go:planExprContentKey were CONVERTED by
 	// M0125-0024 and their pins are DELETED, not demoted: unlike commit 1's
@@ -299,7 +341,7 @@ func TestExprSwitchInventoryIsPinned(t *testing.T) {
 
 	for key, role := range exprSwitchInventory {
 		switch role {
-		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier:
+		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier, boundedQualSpine:
 		default:
 			t.Errorf("%s: unknown walkerRole %q", key, role)
 		}

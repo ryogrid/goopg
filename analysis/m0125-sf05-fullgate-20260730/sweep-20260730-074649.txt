@@ -1,0 +1,71 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-30T07:47:01+09:00
+# binary: /home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin
+# binary-id: sha256=adcdc29b0c77eb6d mtime=2026-07-30T07:46:50+09:00 (rebuilt from tree)
+# tree: 7fc4875b executor(agg): M0125-0025 — a raising sfunc answered the query anyway
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30) — NOT a gate result; the summary below covers only these queries
+Q1   PASS       67s      100 rows  ck=n/a
+Q2   PASS       20s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        8s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   ERROR     138s 
+Q6   PASS       31s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       35s      100 rows  ck=n/a
+Q8   ERROR     152s 
+Q9   PASS       78s        1 rows  ck=63ffce9ca5245d88
+Q10  TIMEOUT   335s (oracle 0 rows)
+      (restarting goopg to drop accumulated heap)
+Q11  PASS       14s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        4s      100 rows  ck=n/a
+Q13  PASS       32s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  ERROR     126s 
+Q15  PASS        8s      100 rows  ck=n/a
+Q16  PASS       23s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       29s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      160s      100 rows  ck=n/a
+Q19  PASS       32s      100 rows  ck=n/a
+Q20  PASS        7s      100 rows  ck=n/a
+Q21  PASS       22s      100 rows  ck=n/a
+Q22  PASS       28s      100 rows  ck=n/a
+Q23  PASS      105s        1 rows  ck=00f53003bda23764
+Q24  PASS       37s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       24s        0 rows  ck=1f18d650d205d71d
+Q26  PASS       19s      100 rows  ck=n/a
+Q27  PASS       91s      100 rows  ck=n/a
+Q28  PASS       49s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       25s        0 rows  ck=1f18d650d205d71d
+Q30  ERROR      89s 
+
+=== SUMMARY: PASS=24 (13 ck-verified, 11 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=4 TIMEOUT=1 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

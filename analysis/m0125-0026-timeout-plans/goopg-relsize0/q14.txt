@@ -1,0 +1,59 @@
+-- M0125-0026 capture  arm=goopg-relsize0  engine=goopg  query=14
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query14.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: channel, i_brand_id, i_class_id, i_category_id
+     ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(4 rows)
+
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=100 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: channel, i_brand_id, i_class_id, i_category_id
+     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+       ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (sum > (SubPlan 1))
+             SubPlan 1
+               ->  CTE Scan on avg_sales  (cost=0.00..0.00 rows=1 width=0)
+                 ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                   ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+         ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (d_week_seq = (SubPlan 2))
+               SubPlan 2
+                 ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                       Filter: (((d_year = 2000) AND (d_moy = 12)) AND (d_dom = 3))
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+             ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+             ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+           ->  CTE Scan on cross_items  (cost=0.00..0.00 rows=1 width=0)
+             ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=1 width=0)
+                   Filter: (((i_brand_id = brand_id) AND (i_class_id = class_id)) AND (i_category_id = category_id))
+               ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+               ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+       ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+             Filter: (sum > (SubPlan 3))
+             SubPlan 3
+               ->  CTE Scan on avg_sales  (cost=0.00..0.00 rows=1 width=0)
+                 ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                   ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+         ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=1 width=0)
+               Filter: (d_week_seq = (SubPlan 4))
+               SubPlan 4
+                 ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                       Filter: (((d_year = 1999) AND (d_moy = 12)) AND (d_dom = 3))
+           ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+             ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+             ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+             ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+           ->  CTE Scan on cross_items  (cost=0.00..0.00 rows=1 width=0)
+             ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=1 width=0)
+                   Filter: (((i_brand_id = brand_id) AND (i_class_id = class_id)) AND (i_category_id = category_id))
+               ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+               ->  *planner.SetOp  (cost=0.00..0.00 rows=1 width=0)
+(44 rows)
+

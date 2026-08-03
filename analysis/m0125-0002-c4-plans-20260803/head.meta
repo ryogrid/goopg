@@ -1,0 +1,6 @@
+# arm:      head
+# binary:   tmp/goopg-c4-before
+# bin-sha:  c75278fc24e94fbd
+# captured: 2026-08-03T04:28:15+09:00
+# note:     GOOPG_RELSIZE_FALLBACK left UNSET — since M0125-0005 the
+#           default IS stage 2, so unset is the shipped planner.

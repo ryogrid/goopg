@@ -1,0 +1,24 @@
+go build -o "/home/ryo/work/goopg/goopg/tmp/plan-snapshot" ./cmd/plan-snapshot
+plan-gate: diffing against baseline m0125-0005-relsize-default-stage2 (mode=structural)
+Q1: MATCH
+Q10: MATCH
+Q11: MATCH
+Q12: MATCH
+Q13: MATCH
+Q14: MATCH
+Q15a-VIEWBODY: MATCH
+Q16: MATCH
+Q17: MATCH
+Q18: MATCH
+Q19: MATCH
+Q2: MATCH
+Q20: MATCH
+Q21: MATCH
+Q22: MATCH
+Q3: MATCH
+Q4: MATCH
+Q5: MATCH
+Q6: MATCH
+Q7: MATCH
+Q8: MATCH
+Q9: MATCH

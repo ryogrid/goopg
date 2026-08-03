@@ -1,0 +1,26 @@
+-- M0125-0026 capture  arm=goopg-warm  engine=goopg  query=65
+-- source: bench/tpcds/runtime_goopg/tpcds-data/queries/query65.sql
+-- psql -h 127.0.0.1 -p 65437 -U postgres -d postgres 
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.00 rows=1 width=0)
+   ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+         Sort Key: s_store_name, i_item_desc
+     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+       ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=3154857552000 width=0)
+         ->  Nested Loop (CROSS)  (cost=0.00..0.00 rows=216000 width=0)
+           ->  Seq Scan on public.store (stats)  (cost=0.00..0.00 rows=12 width=0)
+           ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+         ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=14605822 width=0)
+           ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=29211645 width=0)
+             ->  Hash Join (INNER)  (cost=0.00..0.00 rows=525809623 width=0)
+                   Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+               ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+               ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+       ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=29211645 width=0)
+         ->  Hash Join (INNER)  (cost=0.00..0.00 rows=525809623 width=0)
+               Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+           ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+           ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+(19 rows)
+

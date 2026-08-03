@@ -16,7 +16,17 @@ HAMMERDB_HOME="${REPO_ROOT}/HammerDB-5.0"
 
 # Goopg build artefact and runtime tree. Kept under `runtime_goopg/`
 # so a parallel upstream-PG run can use `runtime/` undisturbed.
-GOOPG_BIN="${REPO_ROOT}/tmp/goopg-bench-bin"
+#
+# Env-overridable for the same reason bench/tpcds/env_tpcds.sh is (that
+# file took this fix on 2026-07-30; this one was missed): this ONE path
+# is shared with the nightly CI batch's TPC-H clone lane, which both
+# rebuilds it (bench/tpch/setup_goopg.sh) and runs servers from it for
+# hours. scripts/tpch-spotcheck.sh unconditionally `go build -o
+# "${GOOPG_BIN}"`, so a loop running the mandatory spotcheck gate while
+# the nightly holds the host used to clobber the nightly's binary
+# mid-run. Build somewhere private instead —
+# `GOOPG_BIN=$PWD/tmp/goopg-my-bin scripts/tpch-spotcheck.sh`.
+GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-bench-bin}"
 RUNTIME_DIR="${BENCH_DIR}/runtime_goopg"
 PGDATA="${RUNTIME_DIR}/data"
 PG_LOG="${RUNTIME_DIR}/goopg.log"

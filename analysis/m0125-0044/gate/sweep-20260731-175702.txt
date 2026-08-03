@@ -1,0 +1,45 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T17:57:11+09:00
+# goopg: d50c0b4a planner(joinorder)+docs: M0125-0034 — a cross is a connectivity question, and no row count was needed to answer it
+# engine-id: 44e371bd2c8ab5dde3bb5d346a7422b04c3412e9 c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=0d8d49b94a3d
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=f219f61f846ab0d6 on-disk=f219f61f846ab0d6 (/home/ryo/work/goopg/goopg/tmp/goopg-m0125-0044-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# SUBSET PROBE (QUERIES=1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 ) — NOT a gate result; the summary below covers only these queries
+Q1   PASS        1s      100 rows  ck=n/a
+Q2   PASS       19s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        2s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   PASS       41s      100 rows  ck=n/a
+Q6   PASS       20s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS        9s      100 rows  ck=n/a
+Q8   PASS        4s        0 rows  ck=1f18d650d205d71d
+Q9   PASS       66s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       16s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       13s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       13s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  PASS      160s      200 rows  ck=n/a
+Q15  PASS        3s      100 rows  ck=n/a
+Q16  PASS       19s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       17s        0 rows  ck=1f18d650d205d71d
+Q18  PASS      251s      100 rows  ck=n/a
+Q19  PASS        8s      100 rows  ck=n/a
+Q20  PASS        6s      100 rows  ck=n/a
+Q21  PASS       32s      100 rows  ck=n/a
+Q22  PASS       22s      100 rows  ck=n/a
+Q23  PASS       82s        1 rows  ck=00f53003bda23764
+Q24  PASS       21s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       17s        0 rows  ck=1f18d650d205d71d
+Q26  PASS        8s      100 rows  ck=n/a
+Q27  PASS       29s      100 rows  ck=n/a
+Q28  PASS       43s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       25s        0 rows  ck=1f18d650d205d71d
+Q30  PASS        1s       31 rows  ck=f47a48499fd7e070
+Q31  PASS       11s       19 rows  ck=2a74acfb556c21a7
+Q32  PASS        1s        1 rows  ck=a55f36d3bf196bce
+Q33  PASS       32s      100 rows  ck=n/a
+
+=== SUMMARY: PASS=32 (18 ck-verified, 14 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

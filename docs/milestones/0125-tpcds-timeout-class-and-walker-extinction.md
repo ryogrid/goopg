@@ -33,6 +33,7 @@ having drifted:
 | **M0124-0006 attribution** | M0125-0009 (10 queries), **-0010** (4 queries, NEW) | Same cause — 23 of 99 `OK`/`OK` equal-row-count cells diverged by value; 18 were real defects |
 | **M0125-0009 acceptance run** | M0125-0011 (Q97) | A residual isolated only after -0009 removed the collapse masking it |
 | **2026-07-29, this milestone doc** | **M0125-0012 (Q8), -0013 (Q47), -0014 (Q49), -0015 (Q51)** | The last four TPC-DS defects with **no owning task**. See below |
+| **USER directives, 2026-07-30** | M0125-0026 (plan capture); **M0125-0028 … -0031 (the warm-statistics programme)** | Filed by the user's interactive session. -0026 adds the missing instrument (goopg-vs-PG EXPLAIN). -0028 … -0031 flip the milestone's standing premise: statistics become durable (restart-surviving, with an explicit user waiver on PG-faithfulness for the persistence mechanism), `ANALYZE <table>` works in per-DB databases, the bench clusters get warm stats + CHECKPOINT — and all later measurement assumes WARM statistics. -0031 then owes the timeout class **elimination**, not just a verdict. Design: `docs/design/0125-0028-warm-stats-programme.md` |
 
 ### Why Q8 / Q47 / Q49 / Q51 moved from "ledger row" to "task"
 
@@ -277,6 +278,10 @@ and on any commit whose plan-diff shows a hunk — not on all eight.
     unvalidatable"** — if either completes, it must be validated on **row count**, not on
     the fact that it finished, because their pre-existing row gaps became unobservable when
     they entered the timeout class.
+    **Raised 2026-07-30 (user directive):** M0125-0031 lifts this DoD from *verdict* to
+    **elimination** — zero goopg-only TIMEOUTs at the SF0.5 gate under the warm-statistics
+    premise (-0028 … -0030). The (a)/(b) classification above remains the intermediate
+    deliverable, and both re-measurement constraints still apply.
 
 ## Out of scope
 
@@ -289,9 +294,14 @@ and on any commit whose plan-diff shows a hunk — not on all eight.
   walkers and the gate that masks them at once is the one experiment guaranteed to be
   uninterpretable.
 - **`pg_class.reltuples` rendering 0.** §7.1 lists it as a consequence, but it reads
-  `t.Stats.RowCount` directly (`internal/catalog/catalog.go:6946`), so a planner-side
+  `t.Stats.RowCount` directly (`internal/catalog/catalog.go:6977`), so a planner-side
   fallback cannot fix it and must not promise to.
-- Persisting `reltuples`/`relpages` (`pq-P10` option (a)) — still the alternative to 6.1.
+- ~~Persisting `reltuples`/`relpages` (`pq-P10` option (a)) — still the alternative to 6.1.~~ —
+  **MOVED INTO SCOPE 2026-07-30** as **M0125-0029** by user directive, which also waives the
+  PG-faithfulness bar for the persistence mechanism (goopg's `pg_class` is virtual, so
+  `reltuples` has no faithful heap home; a goopg-private mechanism is authorized). The
+  relation-size fallback (6.1, M0125-0003/-0005) is thereby re-scoped from primary line to
+  **S-cold safety net** — inert on warm clusters by its `RowCount > 0` early-return.
 - ~~**Q47's downstream windowed self-join defect, Q49's one-row gap, Q51**~~ — **MOVED INTO
   SCOPE 2026-07-29** as M0125-0013 / -0014 / -0015. See "Why Q8 / Q47 / Q49 / Q51 moved from
   'ledger row' to 'task'" above. Their ledger rows stay as the evidence record; the tasks

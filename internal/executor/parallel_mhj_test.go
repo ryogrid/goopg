@@ -93,6 +93,11 @@ func mhjQueries() []string {
 
 // TestMHJSerialParallelIdentity is the gate.
 func TestMHJSerialParallelIdentity(t *testing.T) {
+	// M0126-0011 retired MHJ packing as the default; these tests exercise
+	// the MHJ executor and must opt back in (e85e5347 updated the three
+	// planner-side MHJ tests but missed this file).
+	planner.SetMHJPackingEnabled(true)
+	defer planner.SetMHJPackingEnabled(false)
 	ctx, cleanup := mhjFixture(t)
 	defer cleanup()
 
@@ -121,6 +126,8 @@ func TestMHJSerialParallelIdentity(t *testing.T) {
 // join result ONCE. This is the shape that would reproduce the duplicate-rows
 // bug if attachParallelScan failed to reach the probe scan under the MHJ.
 func TestMHJParallelNoDuplicates(t *testing.T) {
+	planner.SetMHJPackingEnabled(true)
+	defer planner.SetMHJPackingEnabled(false)
 	ctx, cleanup := mhjFixture(t)
 	defer cleanup()
 

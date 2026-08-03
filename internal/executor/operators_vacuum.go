@@ -227,8 +227,15 @@ type vacuumTarget struct {
 // list plus the partitioned parents encountered, which the caller uses to drive
 // the inheritance-statistics AccessShare scan when ANALYZE is requested.
 func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, []*catalog.Table) {
-	cat := o.ctx.Catalog
-	im, _ := cat.(*catalog.InMemory)
+	// Named targets resolve through ctxPlanCatalog — the per-connection,
+	// DB-scoped catalog SELECT plans against — mirroring expandAnalyzeTargets
+	// (sibling paths change together): a raw ctx.Catalog.LookupTable keys off
+	// DefaultDBOid, so `VACUUM lineitem` in db tpch silently skipped its
+	// target. The database-wide arm below still enumerates DefaultDBOid's
+	// namespace via deep copies (deferred; see ledger M0125-0028). M0125-0028.
+	cat := ctxPlanCatalog(o.ctx)
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	nsOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	var out []vacuumTarget
 	var parents []*catalog.Table
 	var add func(tbl *catalog.Table, explicit bool)
@@ -240,7 +247,7 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			// Partitioned table: expand to children (silent skip on lock), and
 			// remember it for the inheritance ANALYZE pass.
 			parents = append(parents, tbl)
-			for _, child := range im.PartitionChildren(tbl.OID) {
+			for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
 				add(child, false)
 			}
 			return
@@ -292,7 +299,7 @@ func analyzeInheritanceWait(ctx *Context, parent *catalog.Table) {
 	if !ok {
 		return
 	}
-	for _, child := range im.PartitionChildren(parent.OID) {
+	for _, child := range im.PartitionChildren(parent.OID, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if child.PartitionMethod != "" {
 			analyzeInheritanceWait(ctx, child) // sub-partitioned: recurse
 			continue
@@ -334,7 +341,12 @@ func relationStillExists(ctx *Context, tbl *catalog.Table) bool {
 	if !ok {
 		return true
 	}
-	_, exists := im.LookupTableByOID(tbl.OID)
+	// Table OIDs come from the single cluster-wide counter, so the AllDBs
+	// variant is exact — and required: the dbOid-pinned LookupTableByOID keys
+	// off DefaultDBOid, which never holds a non-default database's tables, so
+	// every per-DB ANALYZE/VACUUM target read as "concurrently dropped" and
+	// was silently skipped right after taking its lock. M0125-0028.
+	_, _, exists := im.LookupTableByOIDAllDBs(tbl.OID)
 	return exists
 }
 
@@ -375,7 +387,10 @@ func isNailedCatalogOID(oid uint32) bool {
 // vacuumTableTargets resolves the *catalog.Table list to vacuum (so we can
 // update RelFrozenXID after each pass).
 func (o *vacuumOp) vacuumTableTargets(vs *parser.VacuumStmt) []*catalog.Table {
-	cat := o.ctx.Catalog
+	// Same per-connection DB-scoped resolution as expandVacuumTargets; the two
+	// walk the same target list and must agree on what it resolves to.
+	// M0125-0028.
+	cat := ctxPlanCatalog(o.ctx)
 	if len(vs.Targets) > 0 {
 		var out []*catalog.Table
 		for _, name := range vs.Targets {

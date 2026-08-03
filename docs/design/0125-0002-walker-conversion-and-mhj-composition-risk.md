@@ -354,3 +354,190 @@ to move a plan.
 The running nightly server survived (Go's linker unlinks and recreates, so the live inode stays),
 but any nightly stage that starts a server *after* such a rebuild silently picks up the new
 binary mid-run. Use a private `-o` path when a nightly may be in flight.
+
+### Commit 2 of 8 — `cloneExprShiftIdx` re-based onto `cloneExprRefs` (2026-07-30)
+
+Measured in `analysis/m0125-0002-c2-sf05-plans-20260730/` (quiet host).
+
+**D2 row 2's prediction is REFUTED, and it was refuted by measurement rather than argued away.**
+The row said commit 2 is "not inert … it does move plans", and the reasoning was right in every
+step: `cloneExprShiftIdx` fails *closed*, its caller abandons the whole inner-`Filter{SeqScan}`
+unwrap on a `false`, so teaching it 20 more kinds can only *open* the unwrap on shapes that
+declined before. What the row could not know is whether any such shape reaches this site. None
+does. TPC-H is **22/22 MATCH in `MODE=strict-text`** — byte-identical, not merely structurally
+equal — and TPC-DS SF0.5 is **96/96 byte-identical `EXPLAIN`**. The conjuncts that actually
+arrive on an inner `Filter{SeqScan}` at a Semi/Anti/Inner join were already inside the old
+12-arm set on both benchmarks. This is a negative result with teeth: goopg's `EXPLAIN` prints
+residual predicates in full, so a flipped unwrap decision would have shown as a conjunct moving
+from a leaf scan's `Filter:` onto the `Nested Loop`'s.
+
+**The SF0.5 answer sweep still ran, because the plan gate is blind to what the conversion
+actually changed on the queries it does touch.** The old arms *rebuilt* `*BinaryOp`, `*UnaryOp`
+and `*FuncCall` from a field list instead of copying the struct, and the lists were stale:
+`BinaryOp.ResultType`, `FuncCall.Variadic` and `FuncCall.ReturnType` were **dropped on every
+hoisted conjunct**. `shallowCloneExpr` copies the whole struct, so they now survive — a silent
+type-metadata loss removed, on a path where `EXPLAIN` renders both versions identically because
+it prints predicates by name. 99 cells, **PASS 83 / TIMEOUT 12 / MISMATCH 0 / CKMISMATCH 0 /
+ERROR 0**, 50 value checksums, every one equal to the `m0125-0003-sf05-relsize-20260730`
+baseline. The single differing cell is **Q72 `TIMEOUT 307 s` → `PASS 313 s`**, which is a cap
+flap and **not a rescue**: the newer run is slower, still over the 300 s cap, and Q72's plan is
+one of the 96 that are byte-identical. Q72 remains M0125-0005's unexplained 1.13× carried cost.
+
+**Completeness is not the same as admission, and this commit is where that distinction had to be
+written down.** `exprChildSlots` reports `*OuterColumnRef` and `*CTIDExpr` as childless leaves —
+a correct description of their child structure — so a conversion driven only by "the primitive
+knows this type" would have *admitted* both. Both are wrong-answer shapes here.
+`*OuterColumnRef` names a scope above this join that a flat outer++inner row cannot supply (the
+original walker's own documented decline, preserved). `*CTIDExpr` is worse than unsupported:
+`seqScanOp` injects the block/offset pair into the *scanned* row's slot
+(`MaterializedSlot.hasCTID`), so hoisting it to the NLI residual re-points it at the joined row
+and it reads the **outer** side's ctid. Both are vetoed explicitly, and
+`TestCloneExprShiftIdx_DeclinesRowBoundLeaves` was proved to fail with the veto arm removed
+before it was trusted.
+
+**D3's scope policy for this walker: `scopeVeto`.** Any node carrying an inner `Plan`
+(`*SubqueryExpr`, `*ExistsExpr`, a lowered `*InExpr`, `*ArraySubqueryExpr`,
+`*MultiAssignSubq*`) aborts the clone. The subplan's `OuterColumnRef`s are resolved against the
+*inner scan's* scope; the hoist moves the conjunct one level out and silently changes what
+Level 1 names, which no positional shift of the enclosing expression can repair. A Plan-*less*
+`*InExpr` — `col IN (1,2,3)` — is pure same-scope and is admitted.
+
+**Census pin DEMOTED, not deleted**, for exactly commit 1's reason: a two-arm bottom-up dispatch
+survives inside the `Rewrite` closure (shift a `*ColumnRef`; veto the two row-bound leaves) and
+the census attributes a closure's switch to its enclosing function. RC-1a class 48 → 47.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`make plan-diff LABEL=m0125-0005-relsize-default-stage2` 22/22 MATCH in both `structural` and
+`strict-text`; TPC-DS SF0.5 `EXPLAIN` 96/96 identical; TPC-DS SF0.5 answer sweep 99/99 as above;
+new pins in `internal/planner/nli_shift_arms_test.go`, every one proved to fail before the change
+(the admission pins against `HEAD`'s walker, the veto pins against a veto-less conversion);
+pgbench smoke via the commit hook.
+
+**Two deviations from D4, both deliberate and both recorded as ledger rows.** *Item 3's timed
+22-query TPC-H power run was NOT executed*: with `strict-text` reporting byte-identical plans the
+arms are the same plan on the same engine, and a published timing could only be host noise that
+a later loop would read as an effect. If any later commit in this series moves a TPC-H plan the
+timed run is owed again — this reasoning does not carry over. *Item 2's
+`LABEL=tpcds-round2-head` was retargeted* to `m0125-0005-relsize-default-stage2`, because
+`tpcds-round2-head` predates the M0125-0005 default flip and that flip moves 22/22 TPC-H plans by
+itself; diffing against it would bury this commit's signal under a previous commit's. D4's real
+requirement — name the label explicitly, never let `plan-gate`'s newest-by-mtime choose it — is
+kept. **Every remaining commit in this series must use the same retargeted label.**
+
+**A false line this commit found in the gate itself.** Every SF0.5 report header captured after
+M0125-0005 said `# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(off)`. The flip made unset mean
+*stage 2* and `=0` the opt-out; the reporter was never updated, so the artefact stated the
+opposite of the regime it measured — the M0125-0011 defect class (a report naming a binary it
+never ran) in its labelling form. Corrected to `unset(2)` in
+`scripts/tpcds-sf05-regression.sh` in this commit. The four raw chunk files are left as the
+harness wrote them and the merged report carries the correction as a note.
+
+### Commit 3 of 8 — `visitColumnRefs` re-based onto `walkExprRefs` (2026-08-03)
+
+Measured in `analysis/m0125-0002-c3-plans-20260803/` (LOADED host — the nightly TPC-DS stage
+ran on :65435 throughout; every instrument here is EXPLAIN-only or a unit test, so nothing is
+a timing).
+
+**D2 row 3's prediction ("changes which refs get re-resolved by name") is REFUTED by
+measurement, by a stronger instrument than commit 2 needed.** TPC-H is 22/22 byte-identical
+(`plan_snapshots/m0125-0002-c3-before.txt` vs `-after.txt`, same-cluster fresh-server arms —
+both also equal to `post-mhj-retire`, the 2026-08-02 baseline) and TPC-DS SF0.5 is 96/96
+byte-identical `EXPLAIN`. But for THIS commit a plan diff cannot carry the verdict alone:
+M0125-0042 established that EXPLAIN prints a predicate's Name over its Index, and Index
+mutation is this conversion's only behavioural surface. So a **divergence probe** closed the
+hole: a measurement-only binary (throwaway worktree, never committed) ran BOTH walker bodies
+inside `visitColumnRefs` and logged any difference in the visited `*ColumnRef` stream
+(pointer-for-pointer, in order). All three rebind call sites run at plan time; planning all
+118 benchmark queries produced **zero deltas**. Identical visit sets ⇒ identical Index
+mutations ⇒ identical executed plans, not merely identically printed ones. The ~10
+newly-visited same-scope shapes (refs under IS NULL, casts, row constructors, IN-list
+elements, subquery-node PARAM_EXEC Args, …) evidently never reach these sites on either
+benchmark today — the walker's incompleteness was load-bearing for correctness nowhere in
+the two workloads, and the conversion removes the latency of that defect class rather than a
+live defect.
+
+**D3's scope policy for this walker: `scopeIgnore`.** All three call sites rebind SAME-scope
+indices; an inner plan's ColumnRefs live in the subplan's own coordinate space (rebinding
+them against the outer child schema is the mirror-image of RC-1a), and an `*OuterColumnRef`
+names a scope above. A subquery node's `Args` ARE same-scope (evaluated against the current
+outer row) and are now visited — the old walker missed them. Unknown types PANIC
+(commit 1's convention, PG's `elog(ERROR, "unrecognized node type")`, nodeFuncs.c:2667);
+a silent skip is the RC-1a defect itself, and the void-visitor signature has no decline path.
+
+**Census pin DELETED, not demoted** — unlike commits 1–2, no dispatch switch survives: the
+`*ColumnRef` filter in the new body is a type assertion. This is the first deletion the
+milestone's audit trail records for the eight named sites.
+`internal/planner/visit_refs_arms_test.go` pins the surface: 11 newly-visited kinds (each
+proved to FAIL against the old walker before conversion), the preserved arms, both scope
+declines (inner plans, outer refs), and the panic — mirroring `remap_arms_test.go`.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; TPC-H A/B byte-identical 22/22; SF0.5 EXPLAIN
+A/B 96/96; probe 0 deltas / 118 queries; `tpch-spotcheck.sh` RESULT=PASS (Q12=2 Q13=35);
+pgbench smoke via the commit hook. **D4 deviations:** the timed TPC-H run was again NOT
+executed (byte-identical plans + zero-delta probe; ledger row 2026-08-03) and the SF0.5
+answer sweep was not run — D4 owes it on "first/last/any-hunk" commits, commit 3 has zero
+hunks, and the probe additionally shows the callback stream is unchanged (commit 2's
+metadata-loss concern does not arise: the old body was read-only, it rebuilt nothing).
+**Label note for commits 4–8:** `m0125-0005-relsize-default-stage2` is itself stale now —
+`e85e5347` (M0126-0011) retired MHJ packing and moved 19/22 TPC-H plans; the current
+baseline label is **`post-mhj-retire`**, and a same-cluster A/B remains the
+staleness-immune instrument.
+
+**Found and fixed en route (separate commit `4fb87456`):** `TestMHJParallelNoDuplicates`
+had been red at HEAD since `e85e5347`, which updated the three planner-side MHJ tests for
+the retired default but missed `internal/executor/parallel_mhj_test.go` — the units
+pre-commit gate was broken for every commit until repaired. Both tests in that file now opt
+in via `SetMHJPackingEnabled(true)` (the identity test had gone silently vacuous).
+
+### Commit 4 of 8 — `visitColumnRefsForTable` re-based onto `walkExprRefs` (2026-08-03)
+
+Measured in `analysis/m0125-0002-c4-plans-20260803/` (QUIET host — the nightly batch
+`20260803-013955` ended at 03:52, its scheduler asleep ~22 h; this is the first commit in
+the series measured without co-load).
+
+**D2 row 4's prediction ("a first-order shape mover") is REFUTED by measurement.** TPC-H is
+22/22 byte-identical (`plan_snapshots/m0125-0002-c4-before.txt` vs `-after.txt`,
+same-cluster fresh-server arms; both == the `post-mhj-retire` lineage, verified against
+`m0125-0002-c3-after.txt`), TPC-DS SF0.5 is 96/96 byte-identical `EXPLAIN` (`head/` vs
+`c4/`), and the divergence probe closed the residual hole: a measurement-only binary
+(throwaway worktree, never committed) computed `tableForCol` — the walker's ONE live
+consumer — with BOTH bodies and logged `C4DELTA` on any disagreement in the returned table
+attribution. Planning all 118 benchmark queries produced **zero deltas**. Identical
+attributions ⇒ identical local-filter partitioning and join-edge classification ⇒ the
+zero-hunk plan diffs are load-bearing, not lucky. The headline semantic change —
+`col IN (subquery)` now attributes to col's table instead of -1, because the old `InExpr`
+arm returned before visiting ANYTHING when `Plan != nil` — evidently never decides a
+partition on either benchmark today.
+
+**D3's scope policy for this walker: `scopeIgnore`.** `tableForCol`'s cumOffsets
+attribution is only meaningful for indices in the current scope's coordinate space; an
+inner plan's ColumnRefs index the subplan's own schema and an `*OuterColumnRef` names a
+scope above, so neither reaches `onIdx` (the old walker's documented declines, preserved).
+A subquery node's PARAM_EXEC `Args` are same-scope and now contribute, as does the Operand
+of a Plan-carrying `InExpr`. Unknown types PANIC (commit 1's convention).
+
+**Census pin DELETED (second deletion in the series; RC-1a pinned population 48 → 47)** —
+no dispatch switch survives; the `*ColumnRef` filter is a type assertion.
+`internal/planner/visit_refs_for_table_arms_test.go` pins the surface: 11 newly-visited
+kinds, preserved arms (including the Q12 `IN`-list descent), both scope declines, the
+`tableForCol` IN-subquery behaviour pin, and the panic — 15 subtests proved to FAIL against
+the old walker before conversion. Also removed: the DEAD `visitColumnRefsForTable` call in
+`extraInScans` (`bushy.go:1703`) — a pure traversal with an empty callback; walker #7's
+site (`visitColumnRefsByName`, same function) is untouched.
+
+**En-route discovery — SF0.5 Q85's alias order is restart-nondeterministic (filed
+`M0125-0047`).** The probe arm's Q85 EXPLAIN swapped `cd1`/`cd2` (two scans of
+`customer_demographics`, identical estimated rows) relative to the head/c4 arms; 3 restarts
+of the SAME after-binary reproduced the flip (2× cd2-first, 1× cd1-first), so it is
+pre-existing tie-break instability, not a walker effect (the probe logged 0 deltas). It is
+an instrument hazard for commits 5–8: an EXPLAIN A/B can report a phantom Q85 hunk. Until
+-0047 lands, treat a Q85-only alias-swap hunk as suspected noise and confirm by restarting
+the SAME binary before attributing it to the commit under test.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; TPC-H A/B byte-identical 22/22; SF0.5
+EXPLAIN A/B 96/96; probe 0 deltas / 118 queries; `tpch-spotcheck.sh` RESULT=PASS (Q12=2
+Q13=35, 34.5 s); pgbench smoke via the commit hook. **D4 deviations (ledger row):** the
+timed TPC-H run and the SF0.5 answer sweep were again NOT executed — zero hunks + a
+zero-delta probe on the sole consumer; the walker is read-only, so commit 2's
+metadata-loss class cannot arise. Both become mandatory at the first commit with a
+non-empty diff. Next: commit 5, `exprSide`.

@@ -1,0 +1,52 @@
+# R0 Baseline — TPC-H SF1 timed 22-query run (captured BEFORE any M0126 code changes)
+#
+# Protocol:
+#   1. build goopg at HEAD, tmp/goopg-r0-bin
+#   2. start fresh capped server on :65433 (scope goopg-r0, GOOPG_MEM_HIGH=20G GOOPG_MEM_MAX=24G GOOPG_MEM_SWAP_MAX=0)
+#   3. per-query timeout 600 s, serial execution via cmd/tpch-runner
+#   4. capture EXACTLY ONCE — no retry, no warmup
+#
+# Host at capture time:
+#   uptime: 16:23:00 up 6 days, 49 min, 8 users
+#   load average: 0.44, 0.86, 0.58
+#   Mem: 31Gi total, 22Gi free, 4.1Gi swap used of 64Gi
+#
+# Server config:
+#   HEAD: 0459be8665db07f9fa8b58eab706ec8ca7997291
+#   GOMEMLIMIT: 12GiB
+#   GOGC: off
+#   GOOPG_COST_DRIVEN_JOINORDER: unset (off, default)
+#   GOOPG_RELSIZE_FALLBACK: unset (build default)
+#   shared_buffers: 262144 slots (~2 GiB)
+#   max_parallel_workers_per_gather: server default (-1)
+#
+# Plan snapshot: plan_snapshots/m0126-base.txt (22 queries, captured same session)
+#
+# Per-query results:
+#   Q1:  6.59s rows=4
+#   Q2:  2.42s rows=455
+#   Q3:  8.46s rows=11521
+#   Q4:  32.90s rows=5
+#   Q5:  48.53s rows=5
+#   Q6:  3.22s rows=1
+#   Q7:  25.13s rows=4
+#   Q8:  5.99s rows=2
+#   Q9:  85.46s rows=175
+#   Q10: 6.04s rows=20501
+#   Q11: 1.40s rows=819
+#   Q12: 12.30s rows=2
+#   Q13: 9.70s rows=35
+#   Q14: 3.31s rows=1
+#   Q15-CREATEVIEW: 0.01s
+#   Q15a-VIEWBODY: 3.58s rows=10000
+#   Q15b-MAIN: 32.95s rows=1
+#   Q16: 0.91s rows=18213
+#   Q17: 19.57s rows=1
+#   Q18: 27.58s rows=10
+#   Q19: 5.14s rows=1
+#   Q20: 16.54s rows=76
+#   Q21: 125.01s rows=405
+#   Q22: 10.57s rows=7
+#
+# Total elapsed: 493.31 s (~8.2 min)
+# All 22 queries COMPLETE — zero hang, zero OOM, zero timeout

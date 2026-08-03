@@ -19,6 +19,12 @@ func init() {
 		costDrivenJoinOrder = true
 		mhjPackingEnabled = false
 	}
+	// M0126-0005 measurement-only: force packing off independently of
+	// join-order, so the A/B measures the cascade cost without
+	// conflating two variables (F12 trap).
+	if os.Getenv("GOOPG_MHJ_PACKING_OFF") == "1" {
+		mhjPackingEnabled = false
+	}
 }
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
@@ -155,7 +161,7 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// behaviour. See docs/design/fix-for-q5/01.
 	var locals relationLocalFilters
 	dpConjuncts := conjuncts
-	if shouldAttachBeforeMHJ(ctx.bindings) {
+	if shouldAttachBeforeMHJ(ctx.bindings, scans) {
 		// Build cumOffsets matching the bindings'
 		// FROM-cumulative output coordinates.
 		cumOffsets := make([]int, len(ctx.bindings)+1)
@@ -409,53 +415,44 @@ func tableForCol(e Expr, cumOffsets []int) int {
 	return result
 }
 
-// visitColumnRefsForTable is a local helper that visits ColumnRef
-// nodes in an expression tree. Mirrors pushdown.go's visitColumnRefs
-// but uses planner Expr instead of parser Expr.
+// visitColumnRefsForTable invokes onIdx with the Index of every
+// same-scope *ColumnRef in e. Its one live consumer is tableForCol.
+//
+// M0125-0002 commit 4: built on walkExprRefs / exprChildSlots instead
+// of its own 12-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a cast, a row constructor
+// or IS DISTINCT FROM — all silently skipped by the old arms — now
+// contributes its index, and tableForCol attributes the conjunct
+// correctly instead of answering -1 from a partial reference set.
+//
+// Scope policy: scopeIgnore. tableForCol's cumOffsets attribution is
+// only meaningful for indices in THIS scope's coordinate space: an
+// inner plan's ColumnRefs index the subplan's own schema and an
+// *OuterColumnRef names a scope above, so neither reaches onIdx (the
+// old walker's documented declines, preserved — see
+// visit_refs_for_table_arms_test.go). A subquery node's PARAM_EXEC
+// Args are same-scope slots and ARE visited now, as is the Operand of
+// a Plan-carrying InExpr — the old arm returned before visiting
+// anything when Plan != nil, so `col IN (subquery)` read as "no
+// table" even though col is an ordinary same-scope reference.
+//
+// An unenumerated type panics, matching PG's
+// expression_tree_walker_impl (nodeFuncs.c:2667); a silent skip means
+// tableForCol partitions on an incomplete reference set (RC-1a).
 func visitColumnRefsForTable(e Expr, onIdx func(int)) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		onIdx(x.Index)
-	case *OuterColumnRef, *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
-		// outer refs and subqueries → out of scope
-	case *InExpr:
-		// `col IN (subquery)` (Plan != nil) references an enclosing
-		// scope → out of scope, like the subquery nodes above. But a
-		// literal-list `col IN (a, b, ...)` is an ordinary single-table
-		// predicate; descend so tableForCol can resolve it to its
-		// relation and the relation-local partition can push it onto the
-		// leaf scan (TPC-H Q12's l_shipmode IN ('MAIL','SHIP'), the query's
-		// most selective restriction, was otherwise stranded at the top
-		// Filter). conjunctIsLocalEligible already rejects the subquery form.
-		if x.Plan != nil {
-			return
-		}
-		visitColumnRefsForTable(x.Operand, onIdx)
-		for _, item := range x.List {
-			visitColumnRefsForTable(item, onIdx)
-		}
-	case *BinaryOp:
-		visitColumnRefsForTable(x.Left, onIdx)
-		visitColumnRefsForTable(x.Right, onIdx)
-	case *UnaryOp:
-		visitColumnRefsForTable(x.Operand, onIdx)
-	case *FuncCall:
-		for _, a := range x.Args {
-			visitColumnRefsForTable(a, onIdx)
-		}
-	case *CaseExpr:
-		visitColumnRefsForTable(x.Operand, onIdx)
-		for _, w := range x.Whens {
-			visitColumnRefsForTable(w.When, onIdx)
-			visitColumnRefsForTable(w.Then, onIdx)
-		}
-		visitColumnRefsForTable(x.Else, onIdx)
-	case *ExtractExpr:
-		visitColumnRefsForTable(x.Source, onIdx)
-	}
+	walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool {
+			if cr, ok := x.(*ColumnRef); ok {
+				onIdx(cr.Index)
+			}
+			return true
+		},
+		OnUnknown: func(x Expr) {
+			panic(fmt.Sprintf("visitColumnRefsForTable: unrecognized expression type %T — "+
+				"teach exprChildSlots (exprwalk.go) about it; a silent skip makes "+
+				"tableForCol partition on an incomplete reference set", x))
+		},
+	})
 }
 
 // isConnectedMask checks whether the subset mask is connected.
@@ -577,7 +574,7 @@ func SetCostDrivenJoinOrder(v bool) bool {
 // regressed Q9 cannot recur. Default ON to preserve the current
 // (non-cost-driven) planner; SetCostDrivenJoinOrder(true) should be
 // paired with SetMHJPackingEnabled(false).
-var mhjPackingEnabled = true
+var mhjPackingEnabled = false
 
 // SetMHJPackingEnabled toggles MultiHashJoin packing. Returns the
 // previous value.
@@ -626,6 +623,22 @@ func isProbableInnerScan(n Node) bool {
 func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRows int64, cat catalog.Catalog) Cost {
 	hashCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
 		float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+
+	// M0126-0013: penalise hash joins that build on more than
+	// largeBuildThreshold rows. Building an N-row hash table
+	// consumes O(N) memory and, when N exceeds ~2 M rows (576 MB
+	// at 288 bytes/row), the hash table no longer fits comfortably
+	// in the GOMEMLIMIT headroom, causing GC pressure + cache
+	// thrash. The penalty is quadratic in the overshoot so that
+	// the DP avoids join orders that chain multiple 6 M-row
+	// intermediate builds (Q9's cost-driven pathology).
+	const largeBuildThreshold = 2_000_000.0
+	innerR := float64(entryB.rows)
+	if innerR > largeBuildThreshold {
+		overshoot := (innerR - largeBuildThreshold) / largeBuildThreshold
+		hashCost.Total += overshoot * overshoot * cp.cpuTupleCost * innerR
+	}
+
 	if !nliCostDelegation || cat == nil || join == nil {
 		return hashCost
 	}
@@ -1611,6 +1624,15 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
 		return nil, nil, 0, nil
 	}
 
+	// M0126-0001 Stage −1: a tree of N scans must have exactly N−1
+	// join keys connecting them. Fewer keys means at least one table
+	// is unreached and would be silently NULL-padded — a
+	// silent-wrong-answer path (bundle Stage −1, risk R1). Fail
+	// closed: decline to pack.
+	if len(keys) != len(scans)-1 {
+		return nil, nil, 0, nil
+	}
+
 	// Verify the keys form a simple chain: each table may appear
 	// at most twice (once as "source", once as "destination").
 	// Star graphs (e.g. lineitem at the centre of Q9) cannot be
@@ -1657,13 +1679,18 @@ func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 	return bin.Left == leftKey && bin.Right == rightKey
 }
 
+// IsCanonicalKeyEquality is the exported wrapper.
+// M0126-0006: the runtime fusion predicate in the executor needs it.
+func IsCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
+	return isCanonicalKeyEquality(c, leftKey, rightKey)
+}
+
 // extraInScans reports whether every ColumnRef in c references a
 // column name that appears in the output schema of at least one
 // scan in scans. Used to validate that an MHJ.Filters extra
 // belongs to the MHJ's subset before capturing it.
 func extraInScans(c Expr, scans []Node) bool {
 	allMatched := true
-	visitColumnRefsForTable(c, func(idx int) {})
 	visitColumnRefsByName(c, func(name string) {
 		found := false
 		for _, s := range scans {
@@ -3001,40 +3028,40 @@ func reresolveJoinByName(j *Join) {
 	visitColumnRefs(j.Predicate, predRebind)
 }
 
-// visitColumnRefs invokes fn on every ColumnRef (and OuterColumnRef
-// via type fallthrough — left out: outer refs reach a different
-// scope) found in the expression tree, including arms of CaseExpr
-// and arguments of FuncCall, BinaryOp, UnaryOp, ExtractExpr.
+// visitColumnRefs invokes fn on every same-scope *ColumnRef in e.
+//
+// M0125-0002 commit 3: built on walkExprRefs / exprChildSlots instead
+// of its own 7-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a cast, a row constructor,
+// an IN-list element or a subquery node's PARAM_EXEC Args — all
+// silently skipped by the old arms — is now visited, and every rebind
+// call site (reresolveExprByName, reresolveJoinByName's predRebind,
+// nl_index_join.go's leftover rebind) re-resolves it instead of leaving
+// its pre-rewrite Index behind (RC-1a).
+//
+// Scope policy: scopeIgnore. All three call sites rebind SAME-SCOPE
+// indices; an inner plan's ColumnRefs live in the subplan's own
+// coordinate space and an *OuterColumnRef names a scope above this
+// one, so neither is handed to fn (both were the old walker's
+// documented declines, preserved — see visit_refs_arms_test.go). A
+// subquery node's Args are same-scope slots (evaluated against the
+// current outer row) and ARE visited.
+//
+// An unenumerated type panics, matching PG's
+// expression_tree_walker_impl (nodeFuncs.c:2667); a silent skip is the
+// RC-1a defect this conversion exists to remove.
 func visitColumnRefs(e Expr, fn func(Expr)) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		fn(x)
-	case *BinaryOp:
-		visitColumnRefs(x.Left, fn)
-		visitColumnRefs(x.Right, fn)
-	case *UnaryOp:
-		visitColumnRefs(x.Operand, fn)
-	case *FuncCall:
-		for _, a := range x.Args {
-			visitColumnRefs(a, fn)
-		}
-	case *ExtractExpr:
-		visitColumnRefs(x.Source, fn)
-	case *CaseExpr:
-		if x.Operand != nil {
-			visitColumnRefs(x.Operand, fn)
-		}
-		for _, w := range x.Whens {
-			visitColumnRefs(w.When, fn)
-			visitColumnRefs(w.Then, fn)
-		}
-		if x.Else != nil {
-			visitColumnRefs(x.Else, fn)
-		}
-	case *InExpr:
-		visitColumnRefs(x.Operand, fn)
-	}
+	walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool {
+			if cr, ok := x.(*ColumnRef); ok {
+				fn(cr)
+			}
+			return true
+		},
+		OnUnknown: func(x Expr) {
+			panic(fmt.Sprintf("visitColumnRefs: unrecognized expression type %T — teach "+
+				"exprChildSlots (exprwalk.go) about it; a silent skip leaves a stale "+
+				"column index behind every rebind site", x))
+		},
+	})
 }

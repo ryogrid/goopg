@@ -1,0 +1,17 @@
+Limit  (cost=0.00..0.00 rows=80 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=80 width=0)
+        Sort Key: warehouse.w_warehouse_name, i_item_id
+    ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=726 width=0)
+          Filter: ((CASE WHEN (inv_before > 0) THEN (inv_after / inv_before) ELSE NULL END >= 0.6666666666666666) AND (CASE WHEN (inv_before > 0) THEN (inv_after / inv_before) ELSE NULL END <= 1.5))
+      ->  Gather  (cost=0.00..0.00 rows=1453 width=0)
+            Workers Planned: 3
+        ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=117750 width=0)
+              Filter: ((((item.i_current_price >= 0.99) AND (item.i_current_price <= 1.49)) AND (date_dim.d_date >= ('1999-06-22' - '30 day'::interval))) AND (date_dim.d_date <= ('1999-06-22' + '30 day'::interval)))
+          ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                Filter: ((d_date >= ('1999-06-22' - '30 day'::interval)) AND (d_date <= ('1999-06-22' + '30 day'::interval)))
+          ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=117750 width=0)
+            ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                  Filter: ((i_current_price >= 0.99) AND (i_current_price <= 1.49))
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=117750 width=0)
+              ->  Seq Scan on public.inventory (stats)  (cost=0.00..0.00 rows=4710000 width=0)
+              ->  Seq Scan on public.warehouse (stats)  (cost=0.00..0.00 rows=5 width=0)

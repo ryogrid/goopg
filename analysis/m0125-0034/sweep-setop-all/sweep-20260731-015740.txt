@@ -1,0 +1,29 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-31T01:57:50+09:00
+# goopg: ccab6d80 executor(explain)+bench(tpcds): M0125-0039 — a correlation stops reading as a self-comparison
+# engine-id: bf2d4c58dedf6c9551bf79d8414f11448a7d53ac c47d4ed683a0ac63d56c7f755e70892a635f3a42  diff=f020f3a632ae
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=e033eea10806b929 on-disk=e033eea10806b929 (/home/ryo/work/goopg/goopg/tmp/goopg-m0125-0034-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+# SUBSET PROBE (QUERIES=2 4 11 23 33 38 49 56 60 66 74 75 76 77 80 87) — NOT a gate result; the summary below covers only these queries
+Q2   PASS       18s     2513 rows  ck=3553210cd5579ce8
+Q4   SKIP (oracle: TIMEOUT)
+Q11  PASS       19s        8 rows  ck=3567170dea89bdc1
+Q23  PASS       92s        1 rows  ck=00f53003bda23764
+Q33  PASS       35s      100 rows  ck=n/a
+Q38  PASS       17s        1 rows  ck=6f66a76c23e12a63
+Q49  PASS       24s       25 rows  ck=ccb0983b810cf1d0
+Q56  PASS       35s      100 rows  ck=n/a
+Q60  PASS       36s      100 rows  ck=n/a
+Q66  PASS       23s        5 rows  ck=f6613897dd73709a
+Q74  PASS       14s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       37s      100 rows  ck=n/a
+Q76  PASS       18s      100 rows  ck=n/a
+Q77  PASS       19s       44 rows  ck=2afe8ddcd18fad9c
+Q80  PASS       46s      100 rows  ck=n/a
+Q87  PASS       17s        1 rows  ck=b363a9287bdd0920
+
+=== SUMMARY: PASS=15 (9 ck-verified, 6 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=1 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

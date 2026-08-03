@@ -69,6 +69,10 @@ func onlyStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
 // counter shape (Rebuilds == Calls) is pinned separately by the
 // kill-switch test in subplan_handle_test.go.
 func TestSubPlanStatsCorrelatedExistsRescans(t *testing.T) {
+	// M0125-0036: this probe's `= -999 OR EXISTS (…)` shape is what the
+	// EXISTS→ANY conversion consumes; the correlated-SubPlan path it
+	// grades is still live for every EXISTS the conversion declines.
+	pinCorrelatedSubPlanPath(t)
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
 

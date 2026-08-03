@@ -1,0 +1,39 @@
+# M0126-0009 — TPC-DS SF0.5 cost-driven sampling (8 queries)
+#
+# HEAD: 0a2e7cb1
+# Binary: tmp/goopg-fusion-ab-bin
+# Cluster: TPC-DS SF0.5 (65437)
+# Env: GOGC=off GOMEMLIMIT=12GiB GOOPG_COST_DRIVEN_JOINORDER=1
+# Default baseline: sweep-20260802-084440.txt (same HEAD, default settings)
+# Measured: 2026-08-02
+
+query | cost-driven | default (sweep) | ratio  | verdict
+------|------------|-----------------|--------|--------
+Q1      0.93s         2s               0.47x    WIN (2.1x faster)
+Q3      1.79s         2s               0.89x    OK (1.1x faster)
+Q6      4.95s        24s               0.21x    WIN (4.8x faster)
+Q9     67.3s         75s               0.90x    OK (1.1x faster)
+Q11    490s (killed) 27s              18x+      PATHOLOGICAL REGRESSION
+Q12     3.87s         3s               1.29x    mild regression
+Q28    41.6s         N/A               —         not in default sweep
+Q42     9.46s        N/A               —         not in default sweep
+
+# Q11 EXPLAIN analysis:
+# CTE `year_total` (UNION ALL of store_sales + web_sales, each GROUP BY customer-level
+# columns with date_dim join).
+# Planner estimates each CTE Scan at 164,272,591,200 rows (164 billion).
+# Actual: GROUP BY on customer columns with year filter → at most ~200K rows.
+# 4-way self-join: Nested Loop between CTE scans → 192,403,337,308,562 rows (192 trillion).
+# Plan shape: Nested Loop where Hash Join would be appropriate — cost model
+# chose NL because cardinality estimates are absurd for both sides.
+#
+# Root cause: same as TPC-H Q9 — class (a) cardinality estimate.
+# The CTE's GROUP BY cardinality is overestimated by ~6 orders of magnitude
+# (164B vs ~200K), and the self-join compounds the error.
+
+# Verdict:
+# - 4/6 measurable queries are neutral or FASTER with cost-driven
+# - Q11 is a TPC-DS pathology mirroring TPC-H Q9's cardinality explosion
+# - The pathology is not TPC-H specific — it affects any query with multi-level
+#   joins where cardinality estimation compounds
+# - Q6 (4.8x faster) and Q1 (2.1x faster) show cost-driven can win big on TPC-DS too

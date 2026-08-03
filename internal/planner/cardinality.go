@@ -20,7 +20,10 @@
 // See docs/design/0003-0003-statistics-and-cardinality.md.
 package planner
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 const (
 	defaultEqSelectivity      = 0.005
@@ -41,6 +44,9 @@ func EstimateRows(n Node) int64 {
 		return seqScanRows(x)
 	case *IndexScan:
 		// Equality probe → 1 row per call site.
+		return 1
+	case *IndexOnlyScan:
+		// Same equality-probe convention as *IndexScan.
 		return 1
 	case *Values:
 		return int64(len(x.Rows))
@@ -80,8 +86,133 @@ func EstimateRows(n Node) int64 {
 		return 0
 	case *Explain:
 		return EstimateRows(x.Child)
+
+	// M0125-0038 (C5): pass-through wrappers. Before these arms existed,
+	// any one of them anywhere in a subtree zeroed every estimate above it
+	// (child <= 0 propagates as "no estimate"), which is why all 18 plans
+	// in the M0125-0026 capture rendered rows=1 on every non-leaf node.
+	case *Gather:
+		// Total-row estimate; the per-worker division PG shows under a
+		// Gather is a cost-model concern (the 0077 line), not a
+		// cardinality one.
+		return EstimateRows(x.Child)
+	case *GatherMerge:
+		return EstimateRows(x.Child)
+	case *LockRows:
+		return EstimateRows(x.Child)
+	case *Memoize:
+		return EstimateRows(x.Child)
+	case *CTEScan:
+		// Stage-A inlining clones the body per consumer, so Child is this
+		// reference's own subtree — its estimate IS this scan's output.
+		// (A recursive CTE plans as *RecursiveUnion + *WorkTableScan,
+		// neither of which recurses back here.)
+		return EstimateRows(x.Child)
+	case *CTEDMLPrefix:
+		return EstimateRows(x.Body)
+	case *SetOp:
+		return estimateSetOp(x)
+	case *NestedLoopIndexJoin:
+		return estimateNLIndexJoin(x)
+
+	case *MultiHashJoin:
+		return estimateMultiHashJoin(x)
 	}
 	return 0
+}
+
+// estimateSetOp mirrors upstream's output-row rules
+// (prepunion.c:1146-1151): EXCEPT keeps the left input's count,
+// INTERSECT the smaller input's, UNION ALL the sum. For the
+// non-ALL forms upstream runs estimate_num_groups on the input;
+// goopg has no group estimator yet (the 0077 line), so the
+// dedup is approximated as /2 — the same convention
+// estimateAggregate already uses for multi-column GROUP BY.
+func estimateSetOp(s *SetOp) int64 {
+	l := EstimateRows(s.Left)
+	r := EstimateRows(s.Right)
+	if l <= 0 || r <= 0 {
+		return 0
+	}
+	var out int64
+	switch s.Op {
+	case parser.SetOpIntersect:
+		out = l
+		if r < out {
+			out = r
+		}
+	case parser.SetOpExcept:
+		out = l
+	default: // UNION
+		out = l + r
+	}
+	if !s.All {
+		out /= 2
+	}
+	if out < 1 {
+		return 1
+	}
+	return out
+}
+
+// estimateNLIndexJoin: the inner side is an equality index probe,
+// which this file already estimates at 1 row per call site
+// (*IndexScan above), so the join carries the outer's cardinality.
+// LEFT keeps the same count by null-extension.
+func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
+	return EstimateRows(j.Outer)
+}
+
+// estimateMultiHashJoin mirrors the *Join arm's method: start from the
+// probe table's row count and walk the key chain, applying the same
+// binary-join selectivity formula (l·r / max(nd_l, nd_r)) at each step.
+//
+// Before this arm existed every packed MHJ estimated 0 rows, and every
+// ancestor's BuildLeft/algorithm decision above a packed chain was taken
+// on that zero (bushy.go:1375 requires BOTH sides > 0). M0126-0002.
+func estimateMultiHashJoin(mh *MultiHashJoin) int64 {
+	if len(mh.Tables) == 0 {
+		return 0
+	}
+	rows := EstimateRows(mh.Tables[mh.ProbeTable])
+	if rows <= 0 {
+		return 0
+	}
+	// Walk the key chain: each key joins a new table into the
+	// accumulated row count. Keys form a chain (verified by
+	// collectMultiHashTables's degree check); track which tables
+	// have been visited so the direction doesn't matter.
+	visited := make([]bool, len(mh.Tables))
+	visited[mh.ProbeTable] = true
+	for _, k := range mh.Keys {
+		var newTable int
+		if !visited[k.LeftTable] {
+			newTable = k.LeftTable
+		} else if !visited[k.RightTable] {
+			newTable = k.RightTable
+		} else {
+			continue
+		}
+		r := EstimateRows(mh.Tables[newTable])
+		if r <= 0 {
+			visited[newTable] = true
+			continue
+		}
+		nd := columnNDistinctForChild(k.LeftCol, mh.Tables[k.LeftTable])
+		if rnd := columnNDistinctForChild(k.RightCol, mh.Tables[k.RightTable]); rnd > nd {
+			nd = rnd
+		}
+		if nd > 0 {
+			rows = (rows * r) / nd
+		} else {
+			rows = scaleByFloat(rows*r, defaultEqSelectivity)
+		}
+		if rows < 1 {
+			rows = 1
+		}
+		visited[newTable] = true
+	}
+	return rows
 }
 
 // seqScanRows is the base-relation row estimate for a scan leaf — the
@@ -159,8 +290,11 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		localFilter:    local,
 		hasLocalFilter: local != nil,
 	}
+	// M0125-0043: the small-dimension answer lives on the leaf scan now.
+	// `smallDimensionSide` keeps the catalog-hint reading for the bindings
+	// the bushy DP hands us with no scan of their own.
+	info.isSmallDimension = smallDimensionSide(scan, binding.table)
 	if binding.table != nil {
-		info.isSmallDimension = binding.table.SmallDimension
 		info.baseRows = tableRows(binding.table)
 	}
 	info.filteredRows = info.baseRows
@@ -184,20 +318,27 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 }
 
 // IsSmallDimensionSide (M0054-0010) returns true when the plan
-// node `n` reads from a `SmallDimension`-flagged catalog table
-// (or is trivially derived from one — Filter, Project, Sort
-// over such a scan). Used by the join build-side selector to
-// pin tiny dim-tables (region, nation) on the build side
-// regardless of stats availability.
+// node `n` reads from a relation the planner tagged as a small
+// dimension (or is trivially derived from one — Filter, Project,
+// Sort over such a scan). Used by the join build-side selector to
+// pin tiny dim-tables on the build side regardless of stats
+// availability.
+//
+// M0125-0043 moved the tag off `catalog.Table.SmallDimension` —
+// where it was a lookup of the literal names "region" / "nation" —
+// onto the scan node, stamped at plan-build time by
+// `smallDimensionTag` from the relation's SIZE. The read side is
+// unchanged in meaning; it now answers for every tiny dimension
+// table rather than for two TPC-H ones.
 func IsSmallDimensionSide(n Node) bool {
 	if n == nil {
 		return false
 	}
 	switch x := n.(type) {
 	case *SeqScan:
-		return x.Table != nil && x.Table.SmallDimension
+		return x.SmallDim
 	case *IndexScan:
-		return x.Table != nil && x.Table.SmallDimension
+		return x.SmallDim
 	case *Filter:
 		return IsSmallDimensionSide(x.Child)
 	case *Project:
@@ -214,6 +355,21 @@ func IsSmallDimensionSide(n Node) bool {
 // keys. Falls back to the generic equality selectivity when
 // either NDistinct is unavailable. CROSS join is the cartesian
 // product.
+//
+// M0126-0010: when NDistinct is unavailable for the join key
+// and we fall back to the generic 0.5% selectivity, cap the
+// output at max(|outer|, |inner|). Without this, FK-PK join
+// chains compound the multiplicative selectivity at every level,
+// producing absurd row-count estimates (e.g. Q9's 5-level chain
+// estimated 5.9e15 rows against an actual of 175). The cap
+// codifies the invariant that a non-cross equi-join never
+// produces more rows than the larger of its two inputs when
+// the join key is a FK referencing a PK — the worst case
+// without fan-out is the probe-side row count. The cap is
+// conservative: it may under-estimate for genuine many-to-many
+// joins, but the existing NDistinct-driven formula handles
+// those correctly when stats are available; the cap only fires
+// in the stats-unavailable fallback path.
 func estimateJoin(j *Join) int64 {
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
@@ -239,6 +395,14 @@ func estimateJoin(j *Join) int64 {
 	est := scaleByFloat(l*r, defaultEqSelectivity)
 	if est < 1 {
 		return 1
+	}
+	// M0126-0010: cap fallback estimate at max input size.
+	mx := l
+	if r > mx {
+		mx = r
+	}
+	if est > mx {
+		est = mx
 	}
 	return est
 }
@@ -283,9 +447,41 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 				return x.Table.Stats.Columns[idx].NDistinct
 			}
 		}
+	case *IndexScan:
+		// Heap-fetching probe: output schema is the table's column
+		// order, same as *SeqScan.
+		if x.Table != nil && x.Table.Stats != nil {
+			if idx >= 0 && idx < len(x.Table.Stats.Columns) {
+				return x.Table.Stats.Columns[idx].NDistinct
+			}
+		}
 	case *Filter:
 		return columnNDistinctForChild(idx, x.Child)
 	case *Sort:
+		return columnNDistinctForChild(idx, x.Child)
+
+	// M0125-0038 (C5): a join input is routinely Project-wrapped, and
+	// this lookup returning 0 through the wrapper is what made every
+	// such equi-join fall back to defaultEqSelectivity — the
+	// "equi-join key contributes no selectivity" symptom (Q10's
+	// rows=131280740 is exactly l·r·0.005).
+	case *Project:
+		if idx >= 0 && idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return columnNDistinctForChild(cr.Index, x.Child)
+			}
+		}
+	case *Limit:
+		return columnNDistinctForChild(idx, x.Child)
+	case *LockRows:
+		return columnNDistinctForChild(idx, x.Child)
+	case *Gather:
+		return columnNDistinctForChild(idx, x.Child)
+	case *GatherMerge:
+		return columnNDistinctForChild(idx, x.Child)
+	case *CTEScan:
+		// The scan's schema is the body's output schema, position for
+		// position.
 		return columnNDistinctForChild(idx, x.Child)
 	}
 	return 0
