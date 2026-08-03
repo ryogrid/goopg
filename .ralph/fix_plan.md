@@ -6591,17 +6591,42 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       call site, `GOOPG_PGSHAPED_DP` OFF. 3 ledger rows. Bar met: UNITS
       (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no row
       can move).
-- [ ] **M0127-P5.4c-ii — `generate_mergejoin_paths`** (joinpath.c:1564) inside
+- [x] **M0127-P5.4c-ii-a — `build_index_pathkeys`: the ordering a B-tree index
+      path delivers.** DONE 2026-08-04 (`internal/planner/pathkeysindex.go` +
+      `pathparamindex.go`). The first of the three pieces P5.4c-ii was one
+      item for. PG's `build_index_pathkeys` (pathkeys.c:740) with each of its
+      loop rules pinned separately: INCLUDE columns excluded (:763-764),
+      per-column `reverse_sort`/`nulls_first` (:775-776), backward inversion of
+      BOTH (:770-774), STOP-not-skip on an unusable column (:815-822),
+      non-orderable AM (:748 — for goopg also `USING hash`, which rides the
+      B-tree substrate but is not orderable in PG), and `pathkey_is_redundant`'s
+      already-in-list half (:800). Wired into `addOneParameterizedIndexPath`,
+      the only index-path constructor there is, so `addPath`'s pathkey dimension
+      stops being a constant `dimEqual` — PG passes the same `useful_pathkeys`
+      to the parameterised path as to the plain one (indxpath.c:750-800).
+      **The finding: this does NOT unblock the merge arm.** `addMergeJoinPath`
+      refuses a parameterised path (joinpath.c:1073-1081) and every ordered
+      index path today is parameterised, so an ordered merge OUTER still needs
+      the unparameterised arm — now split out as P5.4c-ii-b. IMPLEMENTATION-TODO
+      P5.4c-ii-a; 03 §5.3, 04 §2.1. 4 ledger rows. Bar met: UNITS.
+- [ ] **M0127-P5.4c-ii-b — UNPARAMETERISED ordered index paths:**
+      `build_index_paths`' `useful_pathkeys != NIL` arm (indxpath.c:750-800)
+      over `cost_index` (costsize.c:520) with the index-correlation model. This
+      is what actually makes an ordered merge outer reachable (see the ii-a
+      finding). Split from ii-a because it needs a real index cost model and
+      04 §1 forbids a second independently-calibrated one being smuggled in
+      beside a pathkey builder — `paramIndexScanCost` prices ONE probe and is
+      not it. IMPLEMENTATION-TODO P5.4c-ii-b; 04 §1. Bar: UNITS + SPOT.
+- [ ] **M0127-P5.4c-ii-c — `generate_mergejoin_paths`** (joinpath.c:1564) inside
       `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered
       outer instead of sorting, with mergeclause-list truncation and the
-      materialize-inner decision. Its prerequisite is a PRODUCER of ordering —
-      neither `generateScanPaths` nor `pathparamindex.go` records an index's
-      own order today — which is why P5.4c-i landed the consumer side first.
-      Also carries the jointype gauntlet (`nestjoinOK`, joinpath.c:1833-1852)
-      and the FULL-without-usable-clause error contract (joinrels.c:961-964);
-      both stay unreachable while 03 §4.4 pins every non-INNER construct
-      outside the search, and both are ledgered. IMPLEMENTATION-TODO P5.4c-ii;
-      03 §5.3. Bar: UNITS + SPOT + DS05.
+      materialize-inner decision. Needs P5.4c-ii-b's producer; P5.4c-i already
+      landed the consumer (`addMergeJoinPath`'s sort-skip) as a tested but
+      unreachable branch. Also carries the jointype gauntlet (`nestjoinOK`,
+      joinpath.c:1833-1852) and the FULL-without-usable-clause error contract
+      (joinrels.c:961-964); both stay unreachable while 03 §4.4 pins every
+      non-INNER construct outside the search, and both are ledgered.
+      IMPLEMENTATION-TODO P5.4c-ii-c; 03 §5.3. Bar: UNITS + SPOT + DS05.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

@@ -318,6 +318,38 @@ unreachable while §4.4 pins every non-INNER construct outside the search).
 Landing the consumer first means P5.4c-ii adds a producer rather than both
 halves of an untested interface.
 
+**Status (P5.4c-ii-a, 2026-08-04) — the producer is TWO things, not one.**
+`build_index_pathkeys` (pathkeys.c:740) landed as `pathkeysindex.go`, and
+`addOneParameterizedIndexPath` now records the order its index delivers, so
+`addPath`'s pathkey dimension (`comparePathkeysDim`) stops being a constant
+`dimEqual` and a better-ordered index path survives a cheaper rival — which is
+what PG does, since `build_index_paths` (indxpath.c:750-800) hands the SAME
+`useful_pathkeys` to the parameterised path and to the plain one.
+
+The finding is what that does NOT buy. `addMergeJoinPath` refuses a
+parameterised path outright (`try_mergejoin_path` :1073-1081), and every ordered
+path goopg now has is parameterised, because goopg builds index paths only from
+join clauses. An ordered merge OUTER therefore still does not exist. PG's other
+half is a plain index path created for its ORDERING ALONE — `build_index_paths`
+emits one whenever `useful_pathkeys != NIL` even with no index clauses at all —
+and that needs `cost_index` (costsize.c:520) with the correlation model, not
+`paramIndexScanCost`, which prices one bound probe and is calibrated off
+`indexProbeCost`. Deriving a second index cost model inside a pathkey slice is
+the "two cost models inside one comparison" failure [04](04-cost-and-cardinality.md)
+§1 forbids, so the split is now **P5.4c-ii-a** (this, the ordering function),
+**P5.4c-ii-b** (unparameterised ordered index paths over `cost_index`) and
+**P5.4c-ii-c** (`generate_mergejoin_paths` itself).
+
+One representational note that binds the rest of the chain: goopg's pathkeys are
+syntactic ([04](04-cost-and-cardinality.md) §2.1), so an index pathkey must BE
+the `*ColumnRef` the query's own clauses carry — a re-synthesised, same-named
+ColumnRef has a different `Index`/`SourceTableIdx` and `exprEqual` reads it as a
+different column. `buildIndexPathkeys` therefore takes the column expressions
+from its caller (`paramIndexClause` now keeps the inner operand beside the
+column name) instead of manufacturing them, and P5.4c-ii-b's unparameterised
+path must find the same expressions from the rel's own binding rather than
+inventing them.
+
 ### 5.4 Qual placement
 Every clause attaches at the lowest level whose relids it covers — decided
 once, in path generation. The post-hoc placement passes

@@ -38,9 +38,15 @@ import (
 // `clause_relids` minus the rel itself (indxpath.c:519), which for goopg's
 // two-sided operand split is simply the other operand's relids.
 type paramIndexClause struct {
-	ri        *restrictInfo
-	innerCol  string // the base rel's column name; matched against Index.Columns
-	outerKey  Expr   // the value the outer side supplies for the probe
+	ri       *restrictInfo
+	innerCol string // the base rel's column name; matched against Index.Columns
+	// innerKey is the `*ColumnRef` `innerCol` was read off. Kept beside the
+	// name because `buildIndexPathkeys` (P5.4c-ii-a) needs the very expression
+	// the query's clauses carry — goopg's pathkeys are syntactic, so a
+	// re-synthesised ColumnRef with a different `Index`/`SourceTableIdx` would
+	// read as a different column under `exprEqual`.
+	innerKey  Expr
+	outerKey  Expr // the value the outer side supplies for the probe
 	outerRels RelSet
 }
 
@@ -84,6 +90,7 @@ func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramInde
 		out = append(out, paramIndexClause{
 			ri:        ri,
 			innerCol:  col.Name,
+			innerKey:  col,
 			outerKey:  outerKey,
 			outerRels: outerRels,
 		})
@@ -245,6 +252,10 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 // Returns whether a path was added.
 func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, cands []paramIndexClause, req RelSet) bool {
 	innerToOuter := make(map[string]Expr, len(cands))
+	// The inner-side operand of the same clauses, keyed the same way — the
+	// column expressions `buildIndexPathkeys` names the index's key columns
+	// with (P5.4c-ii-a).
+	innerExprs := make(map[string]Expr, len(cands))
 	var bound []paramIndexClause
 	for _, c := range cands {
 		if !relsSubset(c.outerRels, req) {
@@ -256,6 +267,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 			continue
 		}
 		innerToOuter[c.innerCol] = c.outerKey
+		innerExprs[c.innerCol] = c.innerKey
 		bound = append(bound, c)
 	}
 	if len(bound) == 0 {
@@ -275,10 +287,19 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	}
 	rows := parameterizedBaserelRows(rel, tbl, idx, bound)
 	addPath(rel, &Path{
-		Kind:          PathIndexScan,
-		Rel:           rel,
-		Rows:          rows,
-		Cost:          paramIndexScanCost(s.cp, rows),
+		Kind: PathIndexScan,
+		Rel:  rel,
+		Rows: rows,
+		Cost: paramIndexScanCost(s.cp, rows),
+		// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740).
+		// PG passes the same `useful_pathkeys` to the parameterised path that it
+		// passes to the plain one (`build_index_paths`, indxpath.c:750-800), so
+		// this is not a special case for parameterisation — it is simply the
+		// only index path goopg builds today. Forward scan only: goopg's index
+		// scan has no backward mode to select, and PG's own
+		// `pathkeys_possibly_useful` gate needs `query_pathkeys`, which this
+		// seam does not have (03 §10). Both ledgered.
+		Pathkeys:      buildIndexPathkeys(idx, innerExprs, false),
 		RequiredOuter: req,
 	})
 	return true
