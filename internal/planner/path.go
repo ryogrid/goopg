@@ -69,6 +69,21 @@ type Path struct {
 	Rel  *RelOptInfo
 
 	Cost Cost
+
+	// Rows is THIS path's row count, which is the rel's row count for an
+	// ordinary path and the per-outer-row count for a parameterised one. It is
+	// PG's `path->rows`, and for a parameterised path PG sets it from
+	// `param_info->ppi_rows` (`create_index_path`, pathnode.c) — so Rows is
+	// goopg's `ppiRows` carrier, not a second field (leftdeep-joins 03 §9
+	// rule 3). This is the one structured exception to 04 §2's "rows once per
+	// RelOptInfo": `Rel.Rows` stays canonical for the relation as a whole, and
+	// each parameterisation carries its own count beside it.
+	//
+	// Consequence for costing, and the reason §9 says NLI costing is otherwise
+	// garbage: a join's cost primitives must read the CHILD PATH's Rows, never
+	// `child.Rel.Rows`. An index path parameterised by the outer produces a
+	// handful of rows per probe; charging the rel's full post-filter count for
+	// it would price an NLI as if it re-scanned the whole inner every time.
 	Rows float64
 
 	// Pathkeys is the ordering this path guarantees (design ch. 04). Empty in
@@ -126,6 +141,13 @@ type RelOptInfo struct {
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
+
+	// CheapestParameterized is PG's `cheapest_parameterized_paths`
+	// (pathnode.c:255): every parameterised path that survived the addPath
+	// tournament, with the cheapest UNparameterised path (if any) prepended —
+	// PG's callers find that inclusion more convenient, and the NLI arm of
+	// P5.4b-ii reads exactly this list. Empty until parameterised paths exist.
+	CheapestParameterized []*Path
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.
@@ -327,19 +349,137 @@ func addToPathlist(list []*Path, newPath *Path) []*Path {
 	return append(survivors, newPath)
 }
 
-// setCheapest reproduces set_cheapest (pathnode.c:272): pick the minimum-total
-// and minimum-startup path for the rel. Ties are broken deterministically by
-// pathlist position (the earliest-added wins), so plan choice is stable across
-// runs.
-func setCheapest(rel *RelOptInfo) {
-	rel.CheapestTotal = nil
-	rel.CheapestStartup = nil
-	for _, p := range rel.Pathlist {
-		if rel.CheapestTotal == nil || p.Cost.Total < rel.CheapestTotal.Cost.Total {
-			rel.CheapestTotal = p
+// costSelector is PG's CostSelector (pathnodes.h): which axis compare_path_costs
+// orders on first.
+type costSelector int
+
+const (
+	totalCost costSelector = iota
+	startupCost
+)
+
+// comparePathCosts is compare_path_costs (pathnode.c:69): an EXACT (unfuzzed)
+// three-way order, unlike comparePathCostsFuzzily above. disabled_nodes trumps
+// all else; then the selected axis; then the other axis as the tie-break.
+//
+// Both comparators exist in PG and they are not interchangeable: add_path uses
+// the fuzzy one so that near-ties are decided on the non-cost dimensions, while
+// set_cheapest uses this exact one so that a genuinely equal cost falls through
+// to the pathkey tie-break rather than being swallowed by the fuzz band.
+func comparePathCosts(p1, p2 *Path, criterion costSelector) int {
+	if p1.DisabledNodes != p2.DisabledNodes {
+		if p1.DisabledNodes < p2.DisabledNodes {
+			return -1
 		}
-		if rel.CheapestStartup == nil || p.Cost.Startup < rel.CheapestStartup.Cost.Startup {
-			rel.CheapestStartup = p
+		return +1
+	}
+	first, second := p1.Cost.Total, p2.Cost.Total
+	tieFirst, tieSecond := p1.Cost.Startup, p2.Cost.Startup
+	if criterion == startupCost {
+		first, second = p1.Cost.Startup, p2.Cost.Startup
+		tieFirst, tieSecond = p1.Cost.Total, p2.Cost.Total
+	}
+	switch {
+	case first < second:
+		return -1
+	case first > second:
+		return +1
+	case tieFirst < tieSecond:
+		return -1
+	case tieFirst > tieSecond:
+		return +1
+	}
+	return 0
+}
+
+// setCheapest reproduces set_cheapest (pathnode.c:272) INCLUDING its
+// parameterisation discipline (leftdeep-joins 03 §9 rule 1), which the previous
+// test-only version did not have:
+//
+//   - CheapestStartup and CheapestTotal are chosen among UNPARAMETERISED paths
+//     only. A parameterised path cannot stand in for the rel in general — it
+//     only produces rows once some particular outer relation supplies its
+//     parameter — so handing one to a join that cannot supply that parameter
+//     produces a plan that cannot be built.
+//   - CheapestTotal falls back to the best (cheapest of the LEAST
+//     parameterised) parameterised path when there is no unparameterised path
+//     at all, since the rel must still have a representative. CheapestStartup
+//     does NOT: PG leaves it nil in that case.
+//   - CheapestParameterized collects every parameterised survivor, with the
+//     cheapest unparameterised path prepended (PG's `lcons`, :375).
+//
+// This ordering is not optional and it is why the discipline lands BEFORE the
+// paths: the moment a RequiredOuter path enters a pathlist, a parameterisation-
+// blind minimum would let it win CheapestTotal and be handed to a join that
+// cannot bind it. The dominance side was already parameterisation-aware
+// (addPath's outerDim) — selection was the only gap.
+//
+// Ties are broken PG's way: on an exactly equal cost the better-sorted path
+// wins (:358-369), and failing that the earliest-added one, so plan choice
+// stays stable across runs.
+//
+// An empty pathlist is where PG elogs "could not devise a query plan"
+// (:282). goopg's callers check that themselves before calling — level 1 in
+// buildInitialRels always adds a path first, and joinSearch rejects an empty
+// joinrel pathlist explicitly (joinsearchlevel.go:110-112) — so this leaves
+// every field nil and lets addPathsToJoinrel's loud nil-cheapest error be the
+// single place the failure is reported.
+func setCheapest(rel *RelOptInfo) {
+	var cheapestStartup, cheapestTotal, bestParam *Path
+	var parameterized []*Path
+
+	for _, path := range rel.Pathlist {
+		if path.RequiredOuter != 0 {
+			parameterized = append(parameterized, path)
+			// Once an unparameterised cheapest-total exists the best
+			// parameterised path is no longer needed (pathnode.c:301-305).
+			if cheapestTotal != nil {
+				continue
+			}
+			if bestParam == nil {
+				bestParam = path
+				continue
+			}
+			// Least parameterised wins; among equal parameterisations, the
+			// cheaper total (pathnode.c:312-334, bms_subset_compare).
+			switch outerDim(path.RequiredOuter, bestParam.RequiredOuter) {
+			case dimEqual:
+				if comparePathCosts(path, bestParam, totalCost) < 0 {
+					bestParam = path
+				}
+			case dimBetter1:
+				bestParam = path
+			default:
+				// dimBetter2: the incumbent is less parameterised, keep it.
+				// dimIncomparable: neither has the least possible
+				// parameterisation for this rel, so PG sits on the old path
+				// until something better comes along (:335-343).
+			}
+			continue
+		}
+
+		if cheapestTotal == nil {
+			cheapestStartup, cheapestTotal = path, path
+			continue
+		}
+		if cmp := comparePathCosts(cheapestStartup, path, startupCost); cmp > 0 ||
+			(cmp == 0 && comparePathkeysDim(cheapestStartup.Pathkeys, path.Pathkeys) == dimBetter2) {
+			cheapestStartup = path
+		}
+		if cmp := comparePathCosts(cheapestTotal, path, totalCost); cmp > 0 ||
+			(cmp == 0 && comparePathkeysDim(cheapestTotal.Pathkeys, path.Pathkeys) == dimBetter2) {
+			cheapestTotal = path
 		}
 	}
+
+	if cheapestTotal != nil {
+		// PG prepends, so the list stays "cheapest unparameterised first".
+		parameterized = append([]*Path{cheapestTotal}, parameterized...)
+	} else {
+		cheapestTotal = bestParam
+	}
+
+	rel.CheapestStartup = cheapestStartup
+	rel.CheapestTotal = cheapestTotal
+	rel.CheapestParameterized = parameterized
 }

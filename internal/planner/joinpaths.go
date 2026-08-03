@@ -21,11 +21,13 @@ package planner
 // Three parts of P5.4 are deliberately NOT here, each because it needs a
 // mechanism this slice does not have, and each carries a deferral-ledger row:
 //
-//   - parameterised NLI + Memoize paths and the 03 §9 parameterisation
-//     discipline (param-aware `setCheapest`, `PATH_PARAM_BY_REL` refusal,
-//     `ppiRows`) — P5.4b. `generateNLIPath` (pathgen.go) is the primitive
-//     waiting for it; the binding contract of 03 §5.2 (shared eligibility with
-//     `tryBuildNLI`) is what that slice must establish.
+//   - parameterised NLI + Memoize PATHS — P5.4b-ii. `generateNLIPath`
+//     (pathgen.go) is the primitive waiting for it; the binding contract of
+//     03 §5.2 (shared eligibility with `tryBuildNLI`) is what that slice must
+//     establish, and it also needs P5.1's deferred parameterised base index
+//     paths before an inner can be parameterised at all. The 03 §9
+//     DISCIPLINE those paths require landed ahead of them in P5.4b-i — see
+//     `pathparam.go` and the PATH_PARAM_BY_REL refusal below.
 //   - merge paths — P5.4c. They need explicit Sort paths and pathkey
 //     propagation, not just `mergeJoinCost`.
 //   - the jointype gauntlet and the FULL-without-usable-clause error contract
@@ -133,13 +135,47 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 		return fmt.Errorf("join paths: inner rel %#04x has no cheapest path", uint16(inner.Relids))
 	}
 
-	keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
-	if len(keys) > 0 {
-		addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
+	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
+	// are refused for genuinely different reasons, so they are named
+	// separately rather than folded into one predicate:
+	//
+	//   - An OUTER parameterised by the inner is impossible in any join order.
+	//     The outer is evaluated first, so the inner has produced nothing that
+	//     could bind it. PG refuses it for every method (:1398 merge, :1911
+	//     nestloop, :2297 hash), and it is also the precondition
+	//     `calc_nestloop_required_outer` asserts rather than corrects.
+	//   - An INNER parameterised by the outer is refused only by the methods
+	//     that cannot supply the parameter. A hash build is materialised in
+	//     full before the probe begins, so there is no per-outer-row binding
+	//     available and the hash arm is skipped whole (:2297) — PG does not
+	//     look for a substitute input, since the cheapest-total path is
+	//     already the least-parameterised one available. A plain nested loop
+	//     could bind it but would cost it wrongly, rescanning the inner from
+	//     scratch as though the parameter were free, so PG drops it from THIS
+	//     arm (:1874) and reconsiders it through `cheapest_parameterized_paths`
+	//     in the NLI arm — which is P5.4b-ii's.
+	//
+	// Consequence, stated so it is not discovered later: until that NLI arm
+	// exists, a pair whose inner cheapest-total is parameterised by the outer
+	// yields NO path from this function. Unreachable today, because nothing
+	// generates a parameterised path yet — which is exactly why the discipline
+	// is landed ahead of the paths instead of behind them. A
+	// parameterisation-blind consumer meeting its first parameterised path
+	// does not produce a slow plan, it produces an unbuildable one.
+	o, i := outer.CheapestTotal, inner.CheapestTotal
+	outerNeedsInner := pathParamByRel(o, inner)
+	innerNeedsOuter := pathParamByRel(i, outer)
+
+	if !outerNeedsInner && !innerNeedsOuter {
+		keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
+		if len(keys) > 0 {
+			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
+		}
+		// The nested loop keys on nothing, so the key set rejoins the
+		// residual: it evaluates every clause, on every pair. Passing
+		// `clauses` whole rather than `append(keys, residual...)` also keeps
+		// the input order.
+		addNestLoopPath(joinrel, outer, inner, cp, clauses)
 	}
-	// The nested loop keys on nothing, so the key set rejoins the residual: it
-	// evaluates every clause, on every pair. Passing `clauses` whole rather
-	// than `append(keys, residual...)` also keeps the input order.
-	addNestLoopPath(joinrel, outer, inner, cp, clauses)
 	return nil
 }

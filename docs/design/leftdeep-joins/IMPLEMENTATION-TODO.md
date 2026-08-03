@@ -277,11 +277,33 @@
   4 ledger rows — merge paths, parameterised paths (with the param-BLIND
   `setCheapest` they would corrupt), the jointype gauntlet, and
   `cost_qual_eval`'s expression walk. UNITS PASS.)*
-- [ ] **P5.4b** Parameterised paths: NLI + Memoize (03 §5.2), parameterisation
-  discipline (03 §9) — param-aware `setCheapest`, `PATH_PARAM_BY_REL` refusal
-  for hash/merge inputs, `ppiRows`. NLI binding contract (03 §5.2): shared
-  eligibility fn with `tryBuildNLI`; constructor failure on a DP-chosen path
-  = loud planner error.
+- [x] **P5.4b-i** The parameterisation DISCIPLINE (03 §9), landed ahead of the
+  paths it governs. *(DONE 2026-08-04 — `internal/planner/pathparam.go` +
+  `path.go` / `pathgen.go` / `joinpaths.go`. Rule 1: `setCheapest` is
+  `set_cheapest` (pathnode.c:272) in full — unparameterised-only cheapest
+  slots, `CheapestParameterized` with the cheapest unparameterised path
+  prepended, and the best-parameterised fallback filling the total slot but
+  never the startup one. Its two non-obvious arms are reproduced: subset
+  comparison runs BEFORE cost, and incomparable parameterisations keep the
+  incumbent rather than picking the cheaper. Rule 2: `pathParamByRel` is
+  PATH_PARAM_BY_REL (joinpath.c:46) and `addPathsToJoinrel` refuses both
+  directions — an outer parameterised by the inner is impossible in any join
+  order, an inner parameterised by the outer belongs to the NLI arm that is
+  P5.4b-ii's. Rule 3: PG's `ppi_rows` needs no new field because PG carries it
+  in `path->rows`, so the rule is a discipline on the COST primitives, which
+  now read the child PATH's `Rows` and never `child.Rel.Rows`. And the fourth
+  thing 03 §9 does not enumerate: a join path computes its own `RequiredOuter`
+  from its children's, which for a nested loop is a SUBTRACTION
+  (`calc_nestloop_required_outer`, pathnode.c:2592) — `generateNLIPath` had
+  declared `RequiredOuter: inner.Relids`, reading the field as "what I depend
+  on below" when it means "what I still need from above", and naming a
+  relation the joinrel contains. Still inert — no `planSelect` call site,
+  `GOOPG_PGSHAPED_DP` OFF. UNITS PASS.)*
+- [ ] **P5.4b-ii** Parameterised PATHS: NLI + Memoize (03 §5.2). NLI binding
+  contract: shared eligibility fn with `tryBuildNLI`; constructor failure on a
+  DP-chosen path = loud planner error. Consumes P5.4b-i's
+  `CheapestParameterized`; needs P5.1's deferred parameterised base index
+  paths before an inner can be parameterised at all.
 - [ ] **P5.4c** Merge paths via pathkeys (03 §5.3): explicit Sort paths,
   pathkey propagation through the join, `mergeJoinCost` on equal footing.
   With them the jointype gauntlet and the FULL-without-usable-clause error

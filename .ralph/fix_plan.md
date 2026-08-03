@@ -6444,17 +6444,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `planSelect` (`sizeJoinRel` is P5.6's); `GOOPG_PGSHAPED_DP` OFF. 4
       ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no `planSelect`
       call site, flag OFF, so no plan and no row can move).
-- [ ] **M0127-P5.4b — parameterised paths:** NLI + Memoize (03 §5.2) and the
-      03 §9 parameterisation discipline — param-aware `setCheapest`,
-      `PATH_PARAM_BY_REL` refusal for hash/merge inputs, `ppiRows`. NLI
-      binding contract (03 §5.2): shared eligibility fn with `tryBuildNLI`;
-      constructor failure on a DP-chosen path = loud planner error. **Order
-      matters:** `setCheapest` is parameterisation-BLIND today
-      (`path.go:319` ranks the whole pathlist on cost), so it must be fixed
-      in the same slice that first puts a `RequiredOuter` path in a pathlist
-      — see the P5.4a ledger row. Also needs P5.1's deferred parameterised
-      base index paths. IMPLEMENTATION-TODO P5.4b; 03 §5.2, §9. Bar: UNITS +
-      SPOT + DS05.
+- [x] **M0127-P5.4b-i — the 03 §9 parameterisation discipline.**
+      **DONE 2026-08-04 (loop #65)**, `internal/planner/pathparam.go` (+
+      `path.go` / `pathgen.go` / `joinpaths.go`). Landed AHEAD of the paths it
+      governs, which was the forced ordering the P5.4a ledger row named: a
+      parameterisation-blind consumer meeting its first `RequiredOuter` path
+      produces an unbuildable plan, not a slow one. Rule 1 — `setCheapest` is
+      `set_cheapest` (pathnode.c:272) in full: unparameterised-only cheapest
+      slots, `CheapestParameterized` with the cheapest unparameterised path
+      prepended, best-parameterised fallback filling the total slot but never
+      the startup one, plus the two arms a reimplementation would plausibly
+      get wrong — subset comparison runs BEFORE cost, and incomparable
+      parameterisations keep the incumbent rather than picking the cheaper.
+      Rule 2 — `pathParamByRel` (PATH_PARAM_BY_REL, joinpath.c:46) refuses
+      both directions in `addPathsToJoinrel`, for different reasons: an outer
+      parameterised by the inner is impossible in any join order; an inner
+      parameterised by the outer belongs to the NLI arm (P5.4b-ii). Rule 3 —
+      PG's `ppi_rows` needs no new field because PG carries it in
+      `path->rows`, so the rule is a discipline on the COST primitives, which
+      now read the child PATH's `Rows` and never `child.Rel.Rows`. **The
+      finding is a fourth rule 03 §9 does not enumerate:** a join path
+      computes its own `RequiredOuter` from its children's, and for a nested
+      loop that is a SUBTRACTION (`calc_nestloop_required_outer`,
+      pathnode.c:2592) — a nested loop DISCHARGES an inner parameterised by
+      the outer, so an NLI subtree over unparameterised inputs is itself
+      unparameterised, which is exactly what lets it be a hash-join input
+      instead of being refused by rule 2. `generateNLIPath` had declared
+      `RequiredOuter: inner.Relids`, reading the field as "what I depend on
+      below" when it means "what I still need from above", and naming a
+      relation the joinrel contains. Still inert — no `planSelect` call site,
+      `GOOPG_PGSHAPED_DP` OFF. 1 ledger row. Bar met: UNITS (SPOT/DS05 not
+      applicable — no call site, flag OFF, so no plan and no row can move).
+- [ ] **M0127-P5.4b-ii — parameterised PATHS:** NLI + Memoize (03 §5.2). NLI
+      binding contract: shared eligibility fn with `tryBuildNLI`;
+      constructor failure on a DP-chosen path = loud planner error. Consumes
+      P5.4b-i's `CheapestParameterized` (the discipline is already in place,
+      so this slice adds paths rather than paths + rules). Needs P5.1's
+      deferred parameterised base index paths before an inner can be
+      parameterised at all — that is this item's first sub-step, not a
+      prerequisite someone else supplies. Note the consequence P5.4b-i
+      deliberately left: until this arm exists, a pair whose inner
+      cheapest-total is parameterised by the outer yields NO path from
+      `addPathsToJoinrel` (unreachable today — nothing generates one).
+      IMPLEMENTATION-TODO P5.4b-ii; 03 §5.2. Bar: UNITS + SPOT + DS05.
 - [ ] **M0127-P5.4c — merge paths via pathkeys** (03 §5.3): explicit Sort
       paths, pathkey propagation through the join, `mergeJoinCost` on equal
       footing with hash. With them the jointype gauntlet (`nestjoinOK`,

@@ -61,19 +61,25 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	if p == nil || b == nil {
 		return
 	}
-	cost := hashJoinCost(cp, p.Cost, b.Cost, probe.Rows, build.Rows, joinRel.Rows, len(keys))
+	// Row counts come from the CHILD PATHS, not their RelOptInfos: for a
+	// parameterised path the two differ, and the path's own count is the
+	// per-parameterisation one (PG's ppi_rows; cost_hashjoin reads
+	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
+	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
+	cost := hashJoinCost(cp, p.Cost, b.Cost, p.Rows, b.Rows, joinRel.Rows, len(keys))
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
 	// `hashjointuples`, costsize.c:4432).
 	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
 	addPath(joinRel, &Path{
-		Kind:     PathHashJoin,
-		Rel:      joinRel,
-		Rows:     joinRel.Rows,
-		Cost:     cost,
-		Children: []*Path{p, b},
-		HashKeys: keys,
-		Residual: residual,
+		Kind:          PathHashJoin,
+		Rel:           joinRel,
+		Rows:          joinRel.Rows,
+		Cost:          cost,
+		Children:      []*Path{p, b},
+		HashKeys:      keys,
+		Residual:      residual,
+		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
 	})
 }
 
@@ -93,8 +99,12 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	if o == nil || i == nil {
 		return
 	}
-	cost := nestloopCost(cp, o.Cost, i.Cost, outer.Rows, joinRel.Rows, i.Cost.Total)
-	cost.Total += qualEvalCost(cp, len(quals), outer.Rows*inner.Rows)
+	// Child-path row counts, per 03 §9 rule 3 (see addHashJoinPath). The cross
+	// product a plain nested loop evaluates its quals on is therefore
+	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
+	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
+	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinRel.Rows, i.Cost.Total)
+	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:     PathNestLoop,
 		Rel:      joinRel,
@@ -102,6 +112,9 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 		Cost:     cost,
 		Children: []*Path{o, i},
 		Residual: quals,
+		// A nested loop DISCHARGES an inner parameterised by the outer, so
+		// this is a subtraction, not a union (pathnode.c:2592).
+		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
 	})
 }
 
@@ -128,8 +141,23 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, key
 // rewriteJoinsToNLI's conversion conditions, nl_index_join.go). It is cheap only
 // when the outer side is small — for a large outer this cost is correctly ruinous,
 // which is what a binary-hash-only cost model could not see (ch. 07 §4.5). The
-// path is parameterized by the inner's index dependency on the outer key
-// (RequiredOuter), design ch. 03 §3.1.
+// path is parameterized by the inner's index dependency on the outer key,
+// design ch. 03 §3.1.
+//
+// Parameterisation (M0127-P5.4b-i, leftdeep-joins 03 §9): this path used to
+// declare `RequiredOuter: inner.Relids`, which was wrong in both directions.
+// RequiredOuter is what a path still needs from ABOVE, not what it consumes
+// below; and `inner.Relids` names a relation this join CONTAINS, which no path
+// over `joinRel` can ever require. What is actually parameterised is the inner
+// INDEX path (by the outer's key column) — and a nested loop is the operator
+// that discharges exactly that, so the join above it is typically
+// unparameterised. `calc_nestloop_required_outer` (pathnode.c:2592) is that
+// subtraction, and it is what lets an NLI subtree be a hash-join input under
+// §9 rule 2 instead of being refused by it.
+//
+// Until P5.4b-ii gives the inner a genuinely parameterised index path (which
+// needs P5.1's deferred parameterised base index paths), `i.RequiredOuter` is
+// zero and this correctly reduces to the outer's own parameterisation.
 func generateNLIPath(joinRel, outer, inner *RelOptInfo, cp costParams) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
@@ -139,9 +167,9 @@ func generateNLIPath(joinRel, outer, inner *RelOptInfo, cp costParams) {
 		Kind:          PathNestLoop,
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
-		Cost:          nestloopCost(cp, o.Cost, i.Cost, outer.Rows, joinRel.Rows, indexProbeCost(cp)),
+		Cost:          nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinRel.Rows, indexProbeCost(cp)),
 		Children:      []*Path{o, i},
-		RequiredOuter: inner.Relids, // the inner index depends on the outer key
+		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
 	})
 }
 

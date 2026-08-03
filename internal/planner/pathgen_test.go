@@ -108,9 +108,20 @@ func TestGenerateNLIPath_RuinousForLargeOuter(t *testing.T) {
 	if nliLarge < 1e6 {
 		t.Fatalf("NLI over a 6M-row outer must be very expensive, got %v", nliLarge)
 	}
-	// The parameterized path records its outer dependency.
-	if jLarge.CheapestTotal.RequiredOuter != bigInner.Relids {
-		t.Fatalf("NLI path must record RequiredOuter = the indexed inner's relids")
+	// M0127-P5.4b-i corrected this assertion. It used to demand
+	// `RequiredOuter == bigInner.Relids`, which read RequiredOuter as "what
+	// this path depends on below" — but it means "what this path still needs
+	// supplied from ABOVE", and a path over a joinrel can never require a
+	// relation that joinrel contains. A nested loop is precisely the operator
+	// that DISCHARGES an inner's parameterisation by the outer
+	// (`calc_nestloop_required_outer`, pathnode.c:2592), so with
+	// unparameterised inputs the NLI join path is unparameterised — which is
+	// what lets it be a hash-join input higher up instead of being refused by
+	// the PATH_PARAM_BY_REL rule. The parameterisation this test's name is
+	// about lives on the inner INDEX path, and giving the inner one is
+	// P5.4b-ii's (it needs P5.1's deferred parameterised base index paths).
+	if jLarge.CheapestTotal.RequiredOuter != 0 {
+		t.Fatalf("NLI over unparameterised inputs must itself be unparameterised, got %#04b", jLarge.CheapestTotal.RequiredOuter)
 	}
 }
 

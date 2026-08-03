@@ -345,13 +345,12 @@ A parameterised path (an NLI inner: index scan keyed by the outer's column)
 is not interchangeable with an unparameterised one, and PG segregates them
 throughout. Three binding rules:
 
-1. **`setCheapest` is parameterisation-aware.** The current test-only
-   `setCheapest` (`path.go:319`) minimises Total over the whole pathlist; it
-   must instead track `cheapestTotal` among **unparameterised** paths and a
-   separate `cheapestParameterized` list (PG's
-   `cheapest_parameterized_paths`). Note the dominance side is already
-   param-aware (`addPath`'s `outerDim`, `path.go:254`) — the gap is only
-   selection.
+1. **`setCheapest` is parameterisation-aware.** The former test-only
+   `setCheapest` minimised Total over the whole pathlist; it must instead
+   track `cheapestTotal` among **unparameterised** paths and a separate
+   `cheapestParameterized` list (PG's `cheapest_parameterized_paths`). Note
+   the dominance side is already param-aware (`addPath`'s `outerDim`) — the
+   gap was only selection.
 2. **Hash and merge paths consume only unparameterised inputs.** A path
    parameterised by the rel it is being joined to is illegal as a build or
    sort input — PG's `PATH_PARAM_BY_REL` refusal in `hash_inner_and_outer`
@@ -363,6 +362,32 @@ throughout. Three binding rules:
    "rows once per RelOptInfo": the RelOptInfo row estimate stays canonical
    for the rel as a whole; each parameterisation carries its own
    `ppiRows` beside it.
+
+**Status (M0127-P5.4b-i, 2026-08-04): all three landed**, in
+`internal/planner/pathparam.go` and the three consumers they govern, ahead of
+the NLI/Memoize paths of §5.2 (P5.4b-ii) rather than beside them. The ordering
+is forced: a parameterisation-blind consumer meeting its first parameterised
+path does not produce a slow plan, it produces an unbuildable one.
+
+Two refinements the rules above did not say, both found while implementing them:
+
+- **Rule 3 needs no new field.** PG's `ppi_rows` is carried in `path->rows`
+  (`create_index_path` assigns it there), so the rule is really a discipline on
+  the COST primitives: they must read the child PATH's rows, never
+  `child.Rel.Rows`. `Path.Rows` is goopg's carrier and `addHashJoinPath` /
+  `addNestLoopPath` / `generateNLIPath` read it.
+- **There is a fourth rule, implicit in PG because it is just how the
+  constructors work: a join path computes its own parameterisation from its
+  children's, and for a nested loop that is a SUBTRACTION.** A nested loop is
+  precisely the operator that discharges an inner parameterised by the outer
+  (`calc_nestloop_required_outer`, `pathnode.c:2592`), so an NLI subtree over
+  unparameterised inputs is itself unparameterised — which is what makes it a
+  legal hash-join input under rule 2 rather than something rule 2 forbids.
+  Merge and hash discharge nothing and simply union
+  (`calc_non_nestloop_required_outer`, `:2618`). Miss this and `RequiredOuter`
+  is read as "what I depend on below" instead of "what I still need supplied
+  from above" — which is how `generateNLIPath` came to declare
+  `RequiredOuter: inner.Relids`, naming a relation the joinrel contains.
 
 ## 10. Coordinate translation at the search boundary (owned here, not hoped away)
 
