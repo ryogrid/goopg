@@ -538,6 +538,27 @@ started.
 >       row counts anchored. **NEXT SELECTION: `M0125-0038` (the last
 >       open M0125 task), then M0125 closes and M0126 (cost-driven
 >       planning) is next per the 2026-07-31 USER amendment.**
+>       **↳ SUPERSEDED 2026-08-03 (loop #40). `M0125-0038` IS `[x]`, and
+>       M0126 IS CLOSED (terminal no-go) — read the 2026-08-03 amendment at
+>       the head of this banner, not this line. `M0125-0002` (loop #39) and
+>       `M0125-0047` (loop #40) are both discharged, so of the three M0125
+>       items M0127 waits on, exactly one remains: `M0125-0013`'s
+>       BOOKKEEPING half (Q47's 8.4x runtime verdict — a documentation
+>       contradiction between `RESULTS.md` chunk 49-56 / the RC-1b ledger row
+>       and `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6, not engine work).
+>       **NEXT SELECTION: `M0125-0013` (bookkeeping half) — it NEEDS A QUIET
+>       HOST** (`pgrep -af run-nightly.sh` first; every timing taken on
+>       2026-07-30 was under the nightly batch at load ~10), **then M0127
+>       opens.** `M0125-0040` (ROLLUP) is an independent track OUTSIDE the
+>       M0127 bundle and is explicitly not a prerequisite; the other open
+>       M0125 items (`-0003` stage 3, `-0031`, `-0032`, `-0033`, `-0037`,
+>       `-0041`) are likewise not on M0127's waiting list — `-0032` (Q21) was
+>       absorbed INTO M0127-P3.2. One instrument fact `M0125-0047` leaves for
+>       M0127: the plan-snapshot nondeterminism floor that made every
+>       single-sweep A/B suspect is now MEASURED AT ZERO for the join-order
+>       passes (3 restarts x 96 SF0.5 queries byte-identical), and the fix
+>       converges on the plans the baselines already hold, so no baseline
+>       needs re-pinning.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -4677,9 +4698,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (2 of 12 conjuncts qualify). VERBOSE-forced prefixing and `Output:` line
       qualification are also still open (second ledger row).
 
-- [ ] **M0125-0047 — goopg's plan is restart-NONDETERMINISTIC for self-joined
+- [x] **M0125-0047 — goopg's plan is restart-NONDETERMINISTIC for self-joined
       identical relations: SF0.5 Q85 tie-swaps `cd1`/`cd2` between server
-      starts of the SAME binary** (filed 2026-08-03 by M0125-0002 commit 4;
+      starts of the SAME binary** **DONE 2026-08-03 (loop #40)** (filed 2026-08-03 by M0125-0002 commit 4;
       evidence `analysis/m0125-0002-c4-plans-20260803/README.md` §"q85").
       Q85 scans `customer_demographics` twice (aliases cd1/cd2, identical
       estimated rows); which alias lands in which join slot flips across
@@ -4705,6 +4726,52 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       budget that must not grow across commits) cannot exist while plans flip
       Q85-style across restarts. The unit-test search for the unstable site
       (plan Q85 in-process ~20×) is host-independent and can run anytime.
+      **↳ CLOSED 2026-08-03 (loop #40).** Design
+      `docs/design/0125-0047-joinorder-tiebreak-determinism.md`; evidence
+      `analysis/m0125-0047/`. The unstable site is `pickNextByEdge`
+      (`internal/planner/joinorder.go`), the greedy comma-FROM reorder's
+      "take the smallest edge-connected relation" step: it ranked candidates
+      while ranging over `edges[j]`, a `map[int]struct{}`, with a **strict**
+      `rowCounts[k] < rowCounts[best]`. A strict comparison keeps the
+      incumbent on a tie, so the winner was whichever candidate Go's
+      per-`range` randomiser yielded first — the tie-break had no total order
+      over relation indices. The suspicion filed with this item ("map
+      iteration order … or a non-stable sort") was right on the first branch;
+      there is no non-stable sort (`sort.Slice` appears nowhere in the
+      planner's non-test files). A query that scans one table twice makes the
+      tie **unavoidable** — the two aliases are the same relation, so their
+      statistics are identical by construction and no `ANALYZE` can separate
+      them. Fix = compare FROM indices last, which resolves ties to source
+      order and matches the rule `smallestUnused` and `orderByConnectivity`
+      already used, so all three pickers in the file now share one tie-break.
+      **Audited and found already deterministic:** `smallestUnused` (slice
+      walk), `orderByConnectivity` (`k < next` is total — its documented
+      "cross-free source order is a fixed point" property holds *because* of
+      that), and the bushy DP (`g.edges` is a slice, subsets/splits come from
+      the `enumerateSubsets`/`enumerateSplits` generators, `dp` is lookup-only).
+      **Measured:** 96-query SF0.5 EXPLAIN capture, 3 restarts of the fixed
+      binary → **all 96 byte-identical pairwise** (the item's acceptance), and
+      **before vs after 96 byte-identical** — the fix converges on the plan
+      the baselines ALREADY contain (Q85 keeps its `cd2`-first shape,
+      `6fb943ca2c7aa936`), so **no snapshot needs re-pinning and no earlier
+      A/B is invalidated**. A 10-restart Q85 probe reproduced the flip at HEAD
+      (1 divergence in 10 pre-fix; 0 in 10 post-fix) — the two binaries differ
+      in nothing but that comparison, so it reads causally. **Two things bind
+      later loops:** (1) the restart probe is UNDERPOWERED and must not be
+      cited as a determinism gate — at the observed ~10% flip rate, 10 clean
+      restarts happen by chance ~35% of the time; the proof is the unit test,
+      which samples Go's per-`range` randomiser 200× in-process at zero
+      restart cost (ledger row). (2) **This is NOT a proof that the planner is
+      deterministic overall** — the audit covered the join-order passes, not
+      every map; `TestPlanQ85IsDeterministic` (100 whole-`Plan()` runs
+      compared by an alias-bearing REFLECTIVE fingerprint, because the
+      existing `planShapeString` renders scans as `x.Table.Name` and
+      `cd1`/`cd2` share one `*catalog.Table`, so it prints the two
+      permutations identically and cannot see this defect at all) is the
+      harness shape a corpus-wide sweep should generalise, and M0127-P5.4's
+      plan-shape ratchet is its consumer (ledger row). All four guards in
+      `internal/planner/joinorder_determinism_test.go` were proven to FAIL
+      against the pre-fix body before the fix landed.
 - [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
       (filed 2026-07-31 by `M0125-0037`(i); evidence
