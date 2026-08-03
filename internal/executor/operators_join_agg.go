@@ -492,8 +492,9 @@ func (o *joinOp) coalesceUsingRow(merged Row) {
 }
 
 // openLazyHashJoin builds a hash table from the build side and sets
-// up lazy output. When ctx.WorkMem > 0, the build side uses
-// drainRowsBounded to spill to disk if row data exceeds the budget.
+// up lazy output. The build side is consumed in a single pass — the
+// rows land in the hash table as they arrive (M0127-P0.2; see
+// buildLazyHashTable).
 // openLazyHashJoin builds the hash table (or adopts a shared one) and opens
 // the probe side.
 //
@@ -531,6 +532,20 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 
 // buildLazyHashTable drains the build side into o.lazyHash and reports which
 // side is left for probing. It does NOT open the probe side.
+//
+// M0127-P0.2 (design leftdeep-joins/05 §4, stage E3): the build is a SINGLE
+// pass. It used to be drain-to-`[]Row` (drainRowsBounded) and then re-iterate
+// the drained operator, which cost a `MaterializedSlot` allocation per row on
+// the way back out (spill.go rowsOp.Next) plus a second traversal of the whole
+// build side. Rows are now keyed and inserted as they arrive from the child.
+//
+// The drain's `ctx.WorkMem` budget went with it, and deliberately so: that
+// budget bounded only the intermediate `[]Row`, never the hash table it was
+// feeding — every spilled row was read straight back in and inserted, so peak
+// memory was the finished table either way. Real work_mem enforcement for hash
+// join is the batched hybrid-hash spill (06 / P3.2), which partitions rows at
+// insert time and therefore *requires* this single-pass shape. Until it lands,
+// this path is unbounded (deferral ledger 2026-08-03 M0127-P0.2).
 func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
@@ -538,10 +553,6 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.lazyRW = rightWidth
 	o.antiBuildRows = 0
 	o.antiBuildHasNull = false
-	budget := ctx.WorkMem
-	if budget <= 0 {
-		budget = 512 * 1024 * 1024 // default 512 MiB
-	}
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -562,50 +573,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
 		}
-		buildOp, err := drainRowsBounded(o.left, budget)
+		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
 			return false, err
 		}
-		if err := buildOp.Open(ctx); err != nil {
-		return false, err
-	}
-		buildCount := 0
-		for {
-			// M0062-followup: ctx check inside the build loop. With
-			// 6M-row build inputs (Q21's anti-join lineitem) the
-			// build alone runs minutes; without this check the
-			// cancel-after deadline can be exceeded by 100+ s
-			// while build keeps draining.
-			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
-				if err := ctx.Ctx.Err(); err != nil {
-					return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			buildCount++
-			lSlot, err := buildOp.Next()
-			if err == EOF {
-			break
-		}
-			if err != nil {
-			return false, err
-		}
-			l := slotRow(lSlot)
-			if leftWidth == 0 && len(l) > 0 {
-				leftWidth = len(l); o.lazyLW = leftWidth
-			}
-			// M0126-0003 0b: evaluate the key against a VirtualSlot
-			// over {lSlot, nullRight} instead of copying into a
-			// merged keyRow.
-			keySlot := o.lazyBuildKeySlot.rebind(lSlot, leftWidth, rightWidth, true)
-			kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
-			if err != nil {
-			return false, err
-		}
-			if !ok { continue }
-			o.lazyHashInsertDatum(kd, l)
-		}
-		_ = buildOp.Close()
 		o.lazyHashFinalize()
 		return false, nil
 	}
@@ -622,33 +594,83 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			return true, nil
 		}
 	}
-	buildOp, err := drainRowsBounded(o.right, budget)
+	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
-			return false, err
-		}
-	if err := buildOp.Open(ctx); err != nil {
 		return false, err
 	}
-	buildCount := 0
-	for {
+	if o.plan.Type == planner.JoinTypeInner {
+		o.lazyHashFinalize()
+	}
+	return true, nil
+}
+
+// buildLoopLeft is the single-pass build loop for the BuildLeft orientation
+// (M0127-P0.2; 05 §4 stage E3). o.left is already Open and is closed by the
+// caller. rightWidth is the null-side width of the merged key column space.
+func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
+	leftWidth := o.lazyLW
+	for buildCount := 0; ; buildCount++ {
+		// M0062-followup: ctx check inside the build loop. With
+		// 6M-row build inputs (Q21's anti-join lineitem) the
+		// build alone runs minutes; without this check the
+		// cancel-after deadline can be exceeded by 100+ s
+		// while build keeps draining.
+		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		lSlot, err := o.left.Next()
+		if err == EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		l := slotRow(lSlot)
+		if leftWidth == 0 && len(l) > 0 {
+			leftWidth = len(l)
+			o.lazyLW = leftWidth
+		}
+		// M0126-0003 0b: evaluate the key against a VirtualSlot
+		// over {lSlot, nullRight} instead of copying into a
+		// merged keyRow.
+		keySlot := o.lazyBuildKeySlot.rebind(lSlot, leftWidth, rightWidth, true)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		o.lazyHashInsertDatum(kd, ownedBuildRow(l))
+	}
+}
+
+// buildLoopRight is the single-pass build loop for the (default) BuildRight
+// orientation, including the Semi/Anti string-map lane and the NullAware
+// bookkeeping. o.right is already Open and is closed by the caller.
+func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
+	rightWidth := o.lazyRW
+	for buildCount := 0; ; buildCount++ {
 		// M0062-followup: same ctx check on the build-right path.
 		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 			if err := ctx.Ctx.Err(); err != nil {
-				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		buildCount++
-		rSlot, err := buildOp.Next()
+		rSlot, err := o.right.Next()
 		if err == EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return false, err
+			return err
 		}
 		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
-			rightWidth = len(r); o.lazyRW = rightWidth
+			rightWidth = len(r)
+			o.lazyRW = rightWidth
 		}
 		// M0126-0003 0b: evaluate the key against a VirtualSlot
 		// over {nullLeft, rSlot} instead of copying into a
@@ -656,7 +678,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
 		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.RightKey, keySlot)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if o.plan.NullAware {
 			o.antiBuildRows++
@@ -670,20 +692,31 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		// int64 fast-path is INNER-only; semi/anti keep the string map so
 		// their NullAware / no-fan-out invariants are untouched.
 		if o.plan.Type == planner.JoinTypeInner {
-			o.lazyHashInsertDatum(kd, r)
+			o.lazyHashInsertDatum(kd, ownedBuildRow(r))
 		} else {
 			sk := datumKey(kd)
 			if o.lazyHash == nil {
 				o.lazyHash = make(map[string][]Row)
 			}
-			o.lazyHash[sk] = append(o.lazyHash[sk], r)
+			o.lazyHash[sk] = append(o.lazyHash[sk], ownedBuildRow(r))
 		}
 	}
-	_ = buildOp.Close()
-	if o.plan.Type == planner.JoinTypeInner {
-		o.lazyHashFinalize()
+}
+
+// ownedBuildRow copies a build-side row into storage the hash table can hold
+// for the life of the join. This is the copy drainRowsBounded used to perform
+// (spill.go, M0073-0004 retention boundary) before M0127-P0.2 folded the drain
+// into the build loop: arena-backed Datums must be promoted to owned []byte
+// because the producer's next Next may Reset the arena, while the non-arena
+// case keeps the cheap O(width) struct copy. Dropping either half re-opens the
+// M0097-0058 aliasing class — build rows must never alias a scan buffer.
+func ownedBuildRow(row Row) Row {
+	if rowHasArena(row) {
+		return cloneRowOwned(row)
 	}
-	return true, nil
+	dup := make(Row, len(row))
+	copy(dup, row)
+	return dup
 }
 
 // buildHashRightWithCTID is the ctid-preserving variant of the !BuildLeft build

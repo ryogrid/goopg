@@ -5551,11 +5551,34 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       change, 0-alloc `AllocsPerRun`). UNITS PASS, SPOT PASS (Q12=2/Q13=35),
       SMOKE via hook. Out of scope by design (05 §3): `fused_hash_join.go`'s
       two call sites — fusion dies at P6.1. Progress log: design doc §6.
-- [ ] **M0127-P0.2 — single-pass build.** Fold `drainRowsBounded`'s budget into
+- [x] **M0127-P0.2 — single-pass build.** Fold `drainRowsBounded`'s budget into
       `buildLazyHashTable`'s build loop; delete the re-iteration
       (`rowsOp`-per-row `MaterializedSlot` allocs). Keep owned-copy discipline
       (M0097-0058). IMPLEMENTATION-TODO P0.2; 05 §4 (E3). Bar: UNITS + SPOT +
       RACE (shared-build interplay).
+      **↳ DONE 2026-08-03.** The two build loops moved into
+      `joinOp.buildLoopLeft` / `buildLoopRight`, which pull straight from the
+      child, key off the P0.1 hoisted slot and insert — no `drainRowsBounded`,
+      no re-iteration, no `MaterializedSlot` per build row, and no temp-file
+      round trip. The drain's owned-copy became `ownedBuildRow`
+      (`rowHasArena` → `cloneRowOwned`, else the O(width) struct copy) and now
+      runs only for rows that survive the NULL-key check. **`ctx.WorkMem` went
+      with the drain deliberately** — it bounded the intermediate `[]Row`, never
+      the hash table it fed (every spilled row was read straight back in and
+      inserted), so peak memory is unchanged; real work_mem enforcement is the
+      batched hybrid hash at P3.2, whose stated prerequisite is this shape.
+      Ledger row `2026-08-03 M0127-P0.2` records the gap vs
+      `nodeHash.c: ExecHashIncreaseNumBatches`. Guards
+      (`join_single_pass_build_test.go`): both loops over a child that reuses
+      ONE buffer (the M0097-0058 aliasing class the drain used to absorb),
+      INNER + SEMI lanes + BuildLeft orientation + NullAware bookkeeping;
+      verified they bite (stub `ownedBuildRow` → all three fail). UNITS PASS;
+      SPOT PASS (Q12=2 / Q13=35, 18.4 s query phase vs P0.1's 32.3 s, peak
+      10,332 MB vs 10,767 MB — single uncontrolled runs); SMOKE via hook.
+      **RACE: `make race-gate` is red at clean HEAD too** for the unrelated
+      pre-existing `buildEnvInFlight` global (M0126-0006) already filed in
+      M-NIGHTLY above — reproduced in a HEAD worktree; every race frame is
+      `buildWithEnv`, none in the new build loops. Progress log: design doc §6.
 - [ ] **M0127-P0.3 — single-map build.** Planner threads key-type info on
       `planner.Join`; executor picks int64 vs string map before build; extend
       int64 path to Semi/Anti (CTID exception preserved); delete
