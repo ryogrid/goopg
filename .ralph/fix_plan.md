@@ -6169,10 +6169,69 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       Gates: UNITS PASS; REGRESS **zero delta** vs a HEAD-worktree baseline on
       `join`/`join_hash`/`select`/`subselect`/`union`; DS05 run with the gate
       ON so the new path is exercised. Progress log: design doc §6.
-- [ ] **M0127-P4.3 — `Materialize` operator** (plan node + path + rescan replay,
+- [x] **M0127-P4.3 — `Materialize` operator** (plan node + path + rescan replay,
       memory→spill); NL joins stream outer, inner under Materialize; delete
       drain-both `runNestedLoop` buffering and `concatRows`-per-pair.
       IMPLEMENTATION-TODO P4.3; 07 §4. Bar: UNITS + SPOT + DS05.
+      **DONE 2026-08-04.** The nested loop is the executor's *universal
+      fallback* — every join that is neither hash nor merge lands on it — and
+      it ran entirely inside `Open`: both children drained to `[]Row`, all
+      N×M candidate pairs built with `concatRows`, every survivor pushed into
+      `o.rows` before `Next` returned its first tuple. Three copies of the
+      join's data for an operator `nodeNestloop.c` runs with one tuple per
+      side. The missing piece was never the loop but the absence of a
+      **rescannable** subtree: an `Operator` can be walked once, and the inner
+      side must be walked once per outer tuple. `operators_material.go` adds
+      it — `Materialize`, PG's `nodeMaterial.c` analogue: `materialBuffer` is
+      the `work_mem`-resident prefix plus one sequentially-replayed overflow
+      file, `materializeOp.Rescan` replays the cache without touching the
+      child. `join_nl_stream.go` is then PG's shape directly (outer streams,
+      inner under the Materialize, emit as `Next` asks) and `runNestedLoop`
+      is deleted. Two properties are load-bearing, not incidental: the cache
+      fills **lazily** and keeps PG's `eof_underlying` resume, because a
+      keyless Semi/Anti breaks out of its inner scan on the first qualifying
+      tuple and an eagerly-draining Materialize would have silently truncated
+      the inner side for every later outer tuple; and the unmatched-inner
+      bitmap is indexed by **ordinal** (replay order is insertion order), so
+      the RIGHT/FULL sweep needs no key and no map — and that sweep drains the
+      cache itself, which is the path a RIGHT join over an *empty* outer side
+      takes. `concatRows`-per-pair dies with it: the predicate is evaluated
+      against one reusable merged buffer, so allocation now tracks OUTPUT, not
+      N×M. The spill reader is opened when the writer is created, on an empty
+      file, because P3.3's ledger row named the hazard (registry releases at
+      the statement, PG at the resource owner) and an fd survives an unlink
+      where a path does not. **Deferred, 3 ledger rows:** the
+      `planner.Materialize` plan node + path + EXPLAIN line (PG places
+      `Material` by `cost_rescan`, which needs doc 04's currency → P5.4, so
+      the operator is executor-constructed meanwhile); `mergeJoinStream`'s
+      hand-rolled twin of `materialBuffer` (P4.1's ledger row #3, still open);
+      and `costInnerNestLoop` having no `cost_rescan` term, so a plan whose
+      inner spills is priced as if the replay were free (→ P5.7).
+      **The third deferral is a MEASURED decline, not caution.** The inner
+      cache's `work_mem` bound is implemented and unit-tested but ships OFF
+      (`GOOPG_NL_MATERIALIZE_WORK_MEM=1`), because the first full DS05 sweep
+      found exactly one regression and it was that bound: **Q54** plans a
+      nested loop whose inner is a 1.44M-row `store_sales` seq scan (~1.6 GB
+      as `[]Datum`), so the bounded cache spills and every outer tuple replays
+      the whole file with full datum decoding — 144 s → TIMEOUT. Unbounded,
+      Q54 runs in **95 s with a matching checksum**, i.e. *faster* than the
+      144 s the drain-both implementation took: the streaming outer and the
+      reused slot/pair buffers are a net win once the spill is out of the way.
+      PG never meets that wall because `cost_rescan` prices a materialized
+      inner at `cpu_operator_cost` per tuple **plus `seq_page_cost` over the
+      spilled pages**, which is what makes `final_cost_nestloop` lose to hash
+      or merge there — so the bound is a plan-quality cliff until the planner
+      can see it, the same trade P4.2's `GOOPG_HASH_OUTER_JOIN` gate records.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / 15.2 s, Q13=35 / 11.5 s, query
+      phase 27.9 s, peak 10,840 MB); DS05
+      `analysis/leftdeep-joins/2026-08-04-p43-ds05-sweep.txt`. Six new tests
+      separate the two independently-falsifiable claims (replay-without-
+      re-execution vs. lazy-outer/once-read-inner); the join's OUTPUT is
+      already covered from the other direction, since `join_outer_fill_test.go`
+      uses the nested loop as the ORACLE for the hash path.
+      **Next M0127 selection is P4.4 (lateral: outer streams, output no longer
+      accumulates into `o.rows` — the last `o.rows` user in `joinOp`).**
+      Progress log: design doc §6.
 - [ ] **M0127-P4.4 — lateral: outer streams** (per-outer re-execution stays),
       output no longer accumulates into `o.rows`. IMPLEMENTATION-TODO P4.4;
       07 §4. Bar: UNITS + DS05.

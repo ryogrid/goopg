@@ -238,6 +238,11 @@ type joinOp struct {
 	sweepRows      []Row
 	sweepMatched   []bool
 	probeEOF       bool
+
+	// M0127-P4.3 (07 §4): the streaming nested loop. Non-nil for every
+	// non-lateral NL join; see join_nl_stream.go. Its presence is what routes
+	// Next away from the o.rows array, exactly as mergeStream does for merge.
+	nlStream *nlJoinStream
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -278,30 +283,11 @@ func (o *joinOp) Open(ctx *Context) error {
 				// it (unnestExistsExpr's belt); refuse loudly.
 				return fmt.Errorf("internal error: nested-loop semi/anti join without a predicate")
 			}
-			if err := o.left.Open(ctx); err != nil {
-				return err
-			}
-			if err := o.right.Open(ctx); err != nil {
-				_ = o.left.Close()
-				return err
-			}
-			leftRows, err := drainRowsCtx(o.left, ctx)
-			if err != nil {
-				return err
-			}
-			rightRows, err := drainRowsCtx(o.right, ctx)
-			if err != nil {
-				return err
-			}
-			leftWidth := len(o.left.Schema())
-			if leftWidth == 0 && len(leftRows) > 0 {
-				leftWidth = len(leftRows[0])
-			}
-			rightWidth := len(o.right.Schema())
-			if rightWidth == 0 && len(rightRows) > 0 {
-				rightWidth = len(rightRows[0])
-			}
-			return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+			// M0127-P4.3: streams, like every other nested loop. The old
+			// drain of BOTH sides is gone; the keyless early-out is what the
+			// Materialize's lazy fill exists for (07 §4). No ctid capture —
+			// the array path never captured one here either.
+			return o.openNestedLoop(ctx, false)
 		default:
 			return fmt.Errorf("internal error: semi/anti join requires hash or nested-loop algorithm, got %d", o.plan.Algo)
 		}
@@ -325,35 +311,11 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Algo == planner.JoinAlgoMerge {
 		return o.openMergeJoin(ctx)
 	}
-	if err := o.left.Open(ctx); err != nil {
-		return err
-	}
-	if err := o.right.Open(ctx); err != nil {
-		_ = o.left.Close()
-		return err
-	}
-
-	leftScanLeaf := findScanLeaf(o.left)
-	leftRows, leftCTIDs, err := drainRowsCtxCTID(o.left, ctx, leftScanLeaf)
-	if err != nil {
-		return err
-	}
-	o.leftCTIDs = leftCTIDs
-	rightRows, err := drainRowsCtx(o.right, ctx)
-	if err != nil {
-		return err
-	}
-
-	leftWidth := len(o.left.Schema())
-	rightWidth := len(o.right.Schema())
-	if leftWidth == 0 && len(leftRows) > 0 {
-		leftWidth = len(leftRows[0])
-	}
-	if rightWidth == 0 && len(rightRows) > 0 {
-		rightWidth = len(rightRows[0])
-	}
-
-	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+	// M0127-P4.3 (07 §4): the universal fallback streams too. The outer side
+	// is pulled one tuple at a time and the inner side sits under a
+	// Materialize that replays it per outer tuple; nothing is drained into an
+	// array and nothing accumulates in o.rows.
+	return o.openNestedLoop(ctx, true)
 }
 
 // openMergeJoin builds the streaming merge join (M0127-P4.1; design
@@ -553,120 +515,6 @@ func (o *joinOp) openLateral(ctx *Context) error {
 		// no right row satisfied the join predicate.
 		if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
 			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	return nil
-}
-
-// runNestedLoop is the universal fallback. O(N*M) over the two
-// drained sides; supports INNER / LEFT / RIGHT / FULL / CROSS.
-//
-// Cancellation: ctx.Err() is checked once per outer-row loop so a
-// CancelRequest interrupts a long join even when the inner side has
-// no per-row hooks. (M0058-0005.) Q5 and Q13 ran 60+ minutes without
-// responding to cancellation before this check existed.
-func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	rightMatched := make([]bool, len(rightRows))
-	for i, l := range leftRows {
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		matched := false
-		semiAnti := o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti
-		for j, r := range rightRows {
-			// M0062-followup: also check ctx.Err() inside the inner
-			// loop, every 4096 iterations. Q13 (customer LEFT JOIN
-			// orders, 150K × 1.5M with a NOT LIKE residual) ran 300 s
-			// past --cancel-after=600s in the M0061-0003 sweep
-			// because the *outer* check (every 256 outer rows) only
-			// fired between full passes of the 1.5M-row inner.
-			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			joined := concatRows(l, r)
-			ok, err := o.joinPredicateMatch(joined)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				// NULL predicate results count as no-match
-				// (joinPredicateMatch), which is exactly the
-				// semi/anti contract too.
-				continue
-			}
-			matched = true
-			if semiAnti {
-				// S4a (D3.2): keyless semi/anti — one qualifying
-				// inner row decides this outer row; never emit the
-				// joined row (the join's schema is outer-only) and
-				// never scan further inner rows.
-				break
-			}
-			rightMatched[j] = true
-			o.rows = append(o.rows, joined)
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, i)
-			}
-		}
-		if semiAnti {
-			// Semi emits the left row exactly once iff a qualifying
-			// inner row exists; Anti iff none does.
-			hit := matched
-			if o.plan.Type == planner.JoinTypeAnti {
-				hit = !matched
-			}
-			if hit {
-				o.rows = append(o.rows, append(Row(nil), l...))
-				if o.leftCTIDs != nil {
-					o.rowSourceLeft = append(o.rowSourceLeft, i)
-				}
-			}
-			continue
-		}
-		if !matched && (o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull) {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, i)
-			}
-		}
-	}
-
-	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-		for j, r := range rightRows {
-			// M0062-followup: ctx check inside the unmatched-right
-			// emission loop too. RIGHT/FULL join over a multi-million-
-			// row right side could otherwise stall cancel here even
-			// after the join body has finished.
-			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			if rightMatched[j] {
-				continue
-			}
-			// M0097-0060: FULL JOIN USING coalescing. For unmatched
-			// right rows the left side is all NULL; copy each USING
-			// column value from the right position to the left position
-			// so `SELECT *` sees COALESCE(left.col, right.col) = right.col.
-			merged := concatRows(nullLeft, r)
-			for k, lIdx := range o.plan.UsingLeftCols {
-				rIdx := o.plan.UsingRightCols[k]
-				if rIdx < len(merged) {
-					merged[lIdx] = merged[rIdx]
-				}
-			}
-			o.rows = append(o.rows, merged)
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, -1) // no left source
-			}
 		}
 	}
 	return nil
@@ -1528,6 +1376,11 @@ func (o *joinOp) Next() (TupleSlot, error) {
 	if o.mergeStream != nil {
 		return o.nextMerge()
 	}
+	// M0127-P4.3: and so does the nested loop. What is left below is the
+	// lateral path's o.rows accumulation, which P4.4 removes.
+	if o.nlStream != nil {
+		return o.nextNL()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -1941,6 +1794,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 func (o *joinOp) Close() error {
 	o.releaseBatches()
 	o.closeMergeStream()
+	o.closeNLStream()
 	o.rows = nil
 	o.leftCTIDs = nil
 	o.rowSourceLeft = nil

@@ -134,6 +134,13 @@ func (w *spillWriter) writeFrame() error {
 	return err2
 }
 
+// Flush pushes the write buffer to the file without closing it. It exists for
+// materialBuffer (M0127-P4.3), whose writer stays open across replays: a
+// Materialize can be rescanned and then asked to grow, so the reader on the
+// same path has to be able to see rows the buffer has not yet handed to the
+// OS. Every other spill user writes the whole file, closes it, then reads.
+func (w *spillWriter) Flush() error { return w.bw.Flush() }
+
 func (w *spillWriter) Close() error {
 	if err := w.bw.Flush(); err != nil {
 		w.f.Close()

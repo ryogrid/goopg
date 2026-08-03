@@ -105,9 +105,27 @@
   `costInnerMerge` prices an 11-row sort like a real one while PG picks
   Merge Right/Full Join there. Default flip is P5's, with doc 04's cost
   currency: 2 ledger rows.)*
-- [ ] **P4.3** `Materialize` operator (plan node + path + rescan replay,
+- [x] **P4.3** `Materialize` operator (plan node + path + rescan replay,
   memory→spill); NL join streams outer, inner under Materialize; delete
   drain-both `runNestedLoop` buffering and `concatRows`-per-pair.
+  *(2026-08-04. `operators_material.go`: `materialBuffer` (work_mem-resident
+  prefix + one sequentially-replayed overflow file) under `materializeOp`,
+  which fills LAZILY and keeps PG's `eof_underlying` resume so a keyless
+  Semi/Anti early-out cannot truncate the inner side. `join_nl_stream.go`
+  replaces `runNestedLoop` with PG's `nodeNestloop.c` shape: outer streams,
+  inner under the Materialize, RIGHT/FULL swept via an ORDINAL bitmap, and
+  the predicate evaluated against one reusable merged buffer so allocation
+  tracks output rather than N×M. The `planner.Materialize` plan node, its
+  path and the EXPLAIN line are NOT here — PG places `Material` by
+  `cost_rescan`, which needs doc 04's cost currency, so the node is P5.4's
+  and the operator is executor-constructed meanwhile. The inner cache's
+  work_mem bound is likewise implemented and tested but gated OFF
+  (`GOOPG_NL_MATERIALIZE_WORK_MEM=1`) on measurement, not caution: DS05 Q54
+  is a nested loop over a 1.44M-row `store_sales` seq scan, the bounded
+  cache spills, and replaying it per outer tuple went 144 s → TIMEOUT;
+  unbounded it runs in 95 s — faster than the drain-both path — because
+  `costInnerNestLoop` has no `cost_rescan` term to steer away from the plan:
+  3 ledger rows.)*
 - [ ] **P4.4** Lateral: outer streams (per-outer re-execution stays), output
   no longer accumulates into `o.rows`.
 
