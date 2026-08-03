@@ -30,10 +30,12 @@ package planner
 // (dispatch switches survive inside their Rewrite closures), and commits 3
 // and 4 (2026-08-03) DELETED bushy.go:visitColumnRefs and
 // bushy.go:visitColumnRefsForTable outright — their switches vanished; the
-// *ColumnRef filter in each new body is a type assertion, not a switch. The
-// pinned walkerPending population stood at 47 after those deletions (new
-// pinned sites had joined since the 2026-07-30 census; the map below, not
-// this comment, is the authoritative count).
+// *ColumnRef filter in each new body is a type assertion, not a switch.
+// Commit 5 (2026-08-03) then DEMOTED planner.go:exprSide — its body is
+// walkExprRefs now, but a two-arm dispatch survives in the Visit closure —
+// leaving the pinned walkerPending population at 46 (new pinned sites had
+// joined since the 2026-07-30 census; the map below, not this comment, is
+// the authoritative count).
 //
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
@@ -169,7 +171,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	// than no-ops (an identity function's unenumerated type is not skipped, it
 	// is asserted equal to every other node of its Go type), so the RC-1a
 	// class shrinks 50 → 48 and the census 64 → 63.
-	"planner.go:exprSide":                        walkerPending, // 15 of 32 arms
+	// CONVERTED by M0125-0002 commit 5, and DEMOTED for the same reason
+	// commits 1-2 demoted remapByPosMap and cloneExprShiftIdx: the
+	// recursion and the exhaustiveness moved to exprChildSlots (via
+	// walkExprRefs), but a two-arm bottom-up dispatch survives inside the
+	// Visit closure — classify a *ColumnRef by leftWidth, veto
+	// *OuterColumnRef / *CTIDExpr — and the census attributes a closure's
+	// switch to its enclosing function. RC-1a class 47 → 46.
+	"planner.go:exprSide":                        nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
 	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
 	"planner.go:inferExprType":                   nonRecursiveClassifier,

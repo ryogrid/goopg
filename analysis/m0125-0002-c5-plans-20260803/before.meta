@@ -1,0 +1,6 @@
+# arm:      before
+# binary:   /home/ryo/work/goopg/goopg/tmp/goopg-c5-before
+# bin-sha:  10a943c6442ef7c3
+# captured: 2026-08-03T08:32:42+09:00
+# note:     GOOPG_RELSIZE_FALLBACK left UNSET — since M0125-0005 the
+#           default IS stage 2, so unset is the shipped planner.

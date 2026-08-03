@@ -2324,9 +2324,48 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       — surfaced as a probe-arm-only EXPLAIN diff, confirmed by 3
       restarts of the same after-binary (2 runs cd2-first, 1 run
       cd1-first). Evidence `analysis/m0125-0002-c4-plans-20260803/`.
-      **Next in THIS task is commit 5 (`exprSide`) — decides which side a
-      conjunct is pushed to; expect hunks and carry the full timed run +
-      SF0.5 sweep on any hunk.**
+      **COMMIT 5 of 8 DONE 2026-08-03 — `exprSide` re-based onto
+      `walkExprRefs` (`scopeVeto`; unknown stays `sideMixed`, NOT a panic —
+      this walker has always failed CLOSED, so a decline costs an
+      optimisation, never a wrong answer), and D2 row 5's "expect hunks"
+      prediction is REFUTED by measurement.** The instrument had to be
+      extended first: `exprSide`'s ONLY caller is `splitEqualityForHash`,
+      and **goopg's EXPLAIN never prints hash keys** (`grep -c 'Hash Cond'`
+      = 0 over all 22 TPC-H + 96 SF0.5 plans), so a change in WHICH conjunct
+      becomes `LeftKey`/`RightKey` is invisible to a plan A/B unless it also
+      flips the printed algorithm — commit 3's hole in a new place. A
+      divergence probe on the CONSUMER (both `exprSide` bodies computing
+      `splitEqualityForHash`'s `(leftKey, rightKey, ok)` triple, live path
+      keeping the OLD answer) logged **0 `C5DELTA` / 0 `C5SIDE` over 232
+      calls** (223 TPC-DS + 9 TPC-H) — the COMPLETE live decision population,
+      not a sample, with a `C5CALL` positive control so the zero cannot be
+      vacuous. TPC-H A/B 22/22 byte-identical (before arm re-derived
+      `m0125-0002-c4-after.txt` byte-for-byte); SF0.5 EXPLAIN A/B 96/96.
+      **`M0125-0047` fired on its first use and the protocol held:** the lone
+      differing SF0.5 cell was q85's `cd1`/`cd2` alias tie-swap; the before
+      binary restarted 3× and the after binary restarted 4× produced
+      byte-identical plans (md5 `b1bc99cf`), so the captured before-arm was
+      the outlier and the hunk is instrument noise. Census pin DEMOTED, not
+      deleted (RC-1a 47 → 46) — a two-arm dispatch survives in the `Visit`
+      closure. `expr_side_arms_test.go` pins newly-classified containers (one
+      case per kind), row-independent leaves (`ExecParamRef`/`TableOidExpr`/
+      `Merge*` join the ParamRef class), every preserved arm, both classes of
+      preserved decline (`scopeVeto` on inner plans — a one-sided `Args` must
+      NOT rescue a `SubqueryExpr` — plus the explicit `*OuterColumnRef` /
+      `*CTIDExpr` vetoes, which a completeness-driven conversion would have
+      ADMITTED since `exprChildSlots` correctly calls both childless leaves),
+      the fail-closed unknown, and the headline semantic pin: `(l IS NULL) = r`
+      now yields a hash key pair instead of being stranded on the NL path.
+      Timed TPC-H run + SF0.5 answer sweep skipped (ledger row; zero hunks +
+      zero-delta probe over the complete consumer population, and the walker
+      is read-only returning an enum). Evidence
+      `analysis/m0125-0002-c5-plans-20260803/`.
+      **Next in THIS task is commit 6 (`conjunctIsLocalEligible` +
+      `localizeExprToLeaf`) — the first PAIR in the series and the first where
+      a fail-open ADMITS a predicate rather than declining one (`extraInScans`
+      starts `allMatched := true`), so completing the walker can REMOVE
+      predicates: assume the timed run + SF0.5 sweep are owed until the diff
+      says otherwise.**
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`

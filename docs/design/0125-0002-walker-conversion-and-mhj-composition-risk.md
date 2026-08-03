@@ -541,3 +541,74 @@ timed TPC-H run and the SF0.5 answer sweep were again NOT executed — zero hunk
 zero-delta probe on the sole consumer; the walker is read-only, so commit 2's
 metadata-loss class cannot arise. Both become mandatory at the first commit with a
 non-empty diff. Next: commit 5, `exprSide`.
+
+### Commit 5 of 8 — `exprSide` re-based onto `walkExprRefs` (2026-08-03)
+
+D2 row 5, "decides which side a conjunct is pushed to". Measured in
+`analysis/m0125-0002-c5-plans-20260803/`.
+
+**The instrument had to be extended before the result meant anything.** `exprSide` has
+exactly ONE caller — `splitEqualityForHash` — and **goopg's EXPLAIN never prints hash
+keys**: `grep -c 'Hash Cond'` is 0 across all 22 TPC-H and 96 SF0.5 plans. So a change in
+*which* conjunct is promoted to `LeftKey`/`RightKey` is invisible to a plan-snapshot A/B
+unless it also flips the printed join algorithm. This is commit 3's hole in a new place
+(there: `Index` mutation hidden behind EXPLAIN's Name-over-Index printing), and it is
+closed the same way — a divergence probe on the consumer, not on the walker.
+
+**D2 row 5's "expect hunks" prediction is REFUTED by measurement**, as commit 4's was.
+TPC-H is 22/22 byte-identical (the before arm re-derived `m0125-0002-c4-after.txt`
+byte-for-byte, confirming the lineage and the instrument), SF0.5 is 96/96 once q85 is
+attributed (below), and the probe — a measurement-only binary computing
+`splitEqualityForHash`'s `(leftKey, rightKey, ok)` triple with BOTH `exprSide` bodies while
+the live path keeps the OLD answer — logged **0 `C5DELTA` and 0 `C5SIDE` over 232 calls**
+(223 TPC-DS + 9 TPC-H). Because `splitEqualityForHash` is the walker's only caller, 232 is
+the COMPLETE live decision population on these benchmarks, not a sample; a `C5CALL`
+positive control was added precisely so the zero could not be vacuous, and the probe arm's
+TPC-H snapshot is byte-identical to the before arm (the probe is pure observation). The
+newly-admitted shapes are real and unit-pinned — `IS NULL`, `IS BOOL`, `CollateExpr`,
+`RowExpr`, `IS DISTINCT FROM`, literal-list `IN`, plus the row-independent leaves — but no
+`=` conjunct on either benchmark carries one in an operand position today.
+
+**D3's scope policy for this walker: `scopeVeto`** — the first in the series. A node
+carrying an inner `Plan` is not a per-row hashable key, and the veto preserves the old
+fall-through decline regardless of what the node's same-scope `Args` merged to (pinned:
+`SubqueryExpr` with a one-sided `Args` must NOT be rescued). `*OuterColumnRef` and
+`*CTIDExpr` are vetoed explicitly for the reason commit 4 recorded — `exprChildSlots`
+correctly reports both as childless leaves, so a completeness-driven conversion would
+ADMIT them: an outer ref is fixed only per outer binding, so a cached hash table would go
+stale across re-executions, and ctid is injected into the scanned row's slot, so a side
+misattribution would hash the WRONG side's ctid. Unknown types resolve `sideMixed`, NOT
+the panic of commits 3–4: this walker has always failed CLOSED (a decline costs an
+optimisation, never a wrong answer), so `sideMixed` preserves the old contract while the
+panic would invent a new crash surface. `*ExecParamRef`, `*TableOidExpr` and the `Merge*`
+leaves join the `ParamRef` class as `sideUnknown` — commit 2's row-independence argument.
+
+**Census pin DEMOTED, not deleted (RC-1a pinned population 47 → 46)** — for commits 1–2's
+reason: the recursion and the exhaustiveness moved to `exprChildSlots`, but a two-arm
+bottom-up dispatch survives inside the `Visit` closure and the census attributes a
+closure's switch to its enclosing function. `internal/planner/expr_side_arms_test.go` pins
+the surface: newly-classified containers (one case per kind — `IsNullExpr` proves nothing
+about `CollateExpr`, which is how the original hole survived), the row-independent leaves,
+every preserved arm, both classes of preserved decline, the fail-closed unknown, and — the
+headline — a semantic pin on the live consumer showing `(l IS NULL) = r` now yields a hash
+key pair instead of being stranded on the NL path.
+
+**q85: the M0125-0047 hazard fired on its first use, and the protocol held.** The lone
+differing SF0.5 cell was q85's `cd1`/`cd2` alias tie-swap. Commit 4 told commits 5–8 to
+confirm with a same-binary restart before attributing such a hunk; doing so showed the
+BEFORE binary restarted 3× and the AFTER binary restarted 4× all produce byte-identical
+plans (md5 `b1bc99cf`) — the captured before-arm's ordering is the outlier, so the hunk is
+instrument noise, not commit 5's effect.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` package green;
+TPC-H A/B 22/22 byte-identical; SF0.5 EXPLAIN A/B 96/96 (q85 attributed); probe 232 calls
+/ 0 deltas; `tpch-spotcheck.sh` RESULT=PASS (Q12=2 Q13=35, 35.5 s); pgbench smoke via the
+commit hook. **D4 deviations (ledger row):** the timed TPC-H run and the SF0.5 answer
+sweep were again NOT executed — zero hunks on both benchmarks plus a zero-delta probe over
+the walker's COMPLETE consumer population; `exprSide` is read-only and returns an enum, so
+commit 2's metadata-loss class cannot arise. Both become mandatory at the first commit with
+a genuine non-empty diff. Next: commit 6, `conjunctIsLocalEligible` + `localizeExprToLeaf`
+— the first pair in the series, and the first where a fail-open ADMITS a predicate rather
+than declining one (`extraInScans` starts `allMatched := true`), so completing the walker
+can REMOVE predicates and the timed run should be assumed owed until the diff says
+otherwise.

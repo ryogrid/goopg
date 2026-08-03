@@ -1,0 +1,17 @@
+Limit  (cost=0.00..0.00 rows=9 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=9 width=0)
+        Sort Key: i_item_id
+    ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=9 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=19 width=0)
+            Workers Planned: 3
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=720657 width=0)
+              Filter: (((((((item.i_current_price >= 29) AND (item.i_current_price <= 59)) AND (date_dim.d_date >= '2002-03-29')) AND (date_dim.d_date <= ('2002-03-29' + '60 day'::interval))) AND (item.i_manufact_id = ANY (705, 742, 777, 944))) AND (inventory.inv_quantity_on_hand >= 100)) AND (inventory.inv_quantity_on_hand <= 500))
+          ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=122983 width=0)
+            ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                  Filter: ((d_date >= '2002-03-29') AND (d_date <= ('2002-03-29' + '60 day'::interval)))
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=122983 width=0)
+              ->  Seq Scan on public.inventory (stats)  (cost=0.00..0.00 rows=4710000 width=0)
+                    Filter: ((inv_quantity_on_hand >= 100) AND (inv_quantity_on_hand <= 500))
+              ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                    Filter: (((i_current_price >= 29) AND (i_current_price <= 59)) AND (i_manufact_id = ANY (705, 742, 777, 944)))
+          ->  Seq Scan on public.catalog_sales (stats)  (cost=0.00..0.00 rows=720657 width=0)

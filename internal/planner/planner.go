@@ -5275,47 +5275,60 @@ const (
 )
 
 // exprSide classifies which join input(s) e references. Pure
-// constants resolve as sideUnknown and combine with anything;
-// references to the left input are sideLeft, to the right are
-// sideRight; if both appear the result is sideMixed.
+// constants and row-independent leaves resolve as sideUnknown and
+// combine with anything; references to the left input are sideLeft, to
+// the right are sideRight; if both appear — or e names a value the
+// composed row cannot cleanly supply — the result is sideMixed, which
+// splitEqualityForHash reads as "not a hash key".
+//
+// M0125-0002 commit 5: built on walkExprRefs / exprChildSlots instead
+// of its own 15-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a collation, a row
+// constructor, IS DISTINCT FROM or a literal-list IN — all fallen
+// through to sideMixed by the old arms — now classifies the conjunct,
+// and an `=` over such shapes can reach the hash path instead of
+// silently declining. Like cloneExprShiftIdx (commit 2) and unlike the
+// visitors of commits 3–4, this walker has always failed CLOSED — an
+// unenumerated kind cost an optimisation, never a wrong answer — so an
+// unknown type still resolves sideMixed rather than panicking.
+//
+// Scope policy: scopeVeto. A node carrying an inner Plan
+// (*SubqueryExpr / *ExistsExpr / a lowered *InExpr /
+// *ArraySubqueryExpr / *MultiAssignSubq*) is not a per-row hashable
+// key; the veto preserves the old fall-through decline regardless of
+// what the node's same-scope Args merged to. *OuterColumnRef and
+// *CTIDExpr are vetoed explicitly, because exprChildSlots correctly
+// reports both as childless leaves and a completeness-driven
+// conversion would otherwise ADMIT them: an outer ref is fixed only
+// per outer binding (a cached hash table would go stale across
+// re-executions), and ctid is injected into the scanned row's slot
+// (MaterializedSlot.hasCTID) so a side misattribution would hash the
+// wrong side's ctid. *ExecParamRef, *TableOidExpr (OID fixed at plan
+// time) and the Merge* leaves (executor-ctx-driven) join the ParamRef
+// class instead — commit 2's row-independence argument.
 func exprSide(e Expr, leftWidth int) joinSide {
-	switch x := e.(type) {
-	case *ColumnRef:
-		if x.Index < leftWidth {
-			return sideLeft
-		}
-		return sideRight
-	case *IntegerConst, *NumericConst, *StringConst, *NullConst, *BooleanConst, *ParamRef, *TypedStringLit, *IntervalLit:
-		return sideUnknown
-	case *BinaryOp:
-		return mergeSides(exprSide(x.Left, leftWidth), exprSide(x.Right, leftWidth))
-	case *UnaryOp:
-		return exprSide(x.Operand, leftWidth)
-	case *CastExpr:
-		return exprSide(x.Operand, leftWidth)
-	case *FuncCall:
-		side := sideUnknown
-		for _, a := range x.Args {
-			side = mergeSides(side, exprSide(a, leftWidth))
-		}
-		return side
-	case *CaseExpr:
-		side := sideUnknown
-		if x.Operand != nil {
-			side = mergeSides(side, exprSide(x.Operand, leftWidth))
-		}
-		for _, w := range x.Whens {
-			side = mergeSides(side, exprSide(w.When, leftWidth))
-			side = mergeSides(side, exprSide(w.Then, leftWidth))
-		}
-		if x.Else != nil {
-			side = mergeSides(side, exprSide(x.Else, leftWidth))
-		}
-		return side
-	case *ExtractExpr:
-		return exprSide(x.Source, leftWidth)
+	side := sideUnknown
+	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+		Visit: func(x Expr) bool {
+			switch ref := x.(type) {
+			case *ColumnRef:
+				if ref.Index < leftWidth {
+					side = mergeSides(side, sideLeft)
+				} else {
+					side = mergeSides(side, sideRight)
+				}
+			case *OuterColumnRef, *CTIDExpr:
+				side = sideMixed // absorbing under mergeSides
+			}
+			return true
+		},
+	})
+	if !ok {
+		// Aborted: an inner-plan child (scopeVeto) or an unenumerated
+		// type. Both were sideMixed under the old switch.
+		return sideMixed
 	}
-	return sideMixed
+	return side
 }
 
 func mergeSides(a, b joinSide) joinSide {

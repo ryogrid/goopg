@@ -1,0 +1,20 @@
+Limit  (cost=0.00..0.00 rows=1 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: ca_zip, ca_city
+    ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+            Workers Planned: 1
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=18000 width=0)
+              Filter: ((((substr(customer_address.ca_zip, 1, 5) = ANY ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')) OR (item.i_item_id = ANY (SubPlan 1))) AND (date_dim.d_qoy = 1)) AND (date_dim.d_year = 2000))
+              SubPlan 1
+                ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                      Filter: (i_item_sk = ANY (2, 3, 5, 7, 11, 13, 17, 19, 23, 29))
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1797 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=359432 width=0)
+              ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=100000 width=0)
+                ->  Seq Scan on public.customer_address (stats)  (cost=0.00..0.00 rows=50000 width=0)
+                ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=100000 width=0)
+              ->  Seq Scan on public.web_sales (stats)  (cost=0.00..0.00 rows=359432 width=0)
+            ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                  Filter: ((d_qoy = 1) AND (d_year = 2000))
+          ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
