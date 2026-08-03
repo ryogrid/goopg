@@ -168,6 +168,17 @@ type joinOp struct {
 	lazyBuildKeySlot mergedKeySlotCache
 	lazyProbeKeySlot mergedKeySlotCache
 
+	// M0127-P3.2 (06 §2.2-2.4): hybrid-hash batching state. nil means the
+	// build was projected to fit work_mem, or batching was declined for this
+	// join shape (joinBatchEligible) — either way every path below behaves as
+	// it did before batching existed. noBatch is the caller-side decline used
+	// by the shared (parallel) build, whose published table workers read
+	// without ever seeing this state. batchKeySlot re-presents a row reloaded
+	// from an inner batch file to the build key expression.
+	batches      *hashBatchState
+	noBatch      bool
+	batchKeySlot *MaterializedSlot
+
 	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
 	// computed once in openLazyHashJoin's build loop. Real NOT IN
 	// three-valued-NULL semantics only depend on whether the
@@ -606,6 +617,13 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 		return err
 	}
 	o.lazyProbe = probe
+	// M0127-P3.2: the build is finished, so nbatch is now the count the outer
+	// scan starts from. nextBatch compares against it to tell a genuinely
+	// empty batch from one whose saved rows a later doubling has re-assigned
+	// (PG's nbatch_outstart, nodeHashjoin.c rule 3).
+	if o.batches != nil {
+		o.batches.nbatchOutstart = o.batches.nbatch
+	}
 	return nil
 }
 
@@ -630,6 +648,9 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// because prebuildSharedHashJoins (parallel_hash_build.go) runs the build
 	// phase alone, without ever opening the operator.
 	o.initExecKeys()
+	// A second build on the same operator (a re-Open that skipped Close)
+	// must not inherit the previous run's batch files or its curBatch.
+	o.releaseBatches()
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
@@ -666,10 +687,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
 		}
-		o.presizeLazyHash(ctx, o.plan.Left, leftWidth)
+		o.presizeLazyHash(ctx, o.plan.Left, leftWidth, true)
 		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
+			o.releaseBatches()
 			return false, err
 		}
 		return false, nil
@@ -691,13 +713,25 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			return true, nil
 		}
 	}
-	o.presizeLazyHash(ctx, o.plan.Right, rightWidth)
+	o.presizeLazyHash(ctx, o.plan.Right, rightWidth, false)
 	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
+		o.releaseBatches()
 		return false, err
 	}
 	return true, nil
+}
+
+// releaseBatches drops the batch files a failed or finished join still owns.
+// M0127-P3.2: this is the join's half of the temp-file hygiene obligation;
+// the per-query registry that makes it unconditional (including the paths
+// where the operator is never Closed at all) is P3.3.
+func (o *joinOp) releaseBatches() {
+	if o.batches != nil {
+		o.batches.close()
+		o.batches = nil
+	}
 }
 
 // maxPresizeBuckets caps how many buckets presizeLazyHash will pre-allocate.
@@ -713,9 +747,15 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 //
 // The cap is presize policy, deliberately NOT part of hashsize.Choose: the
 // sizing function must keep returning PG's geometry so the planner and the
-// executor agree on it. It goes away with M0127-P3.2, where nbatch makes the
-// in-memory table genuinely bounded and the full bucket count becomes safe to
-// allocate.
+// executor agree on it.
+//
+// M0127-P3.2 was expected to retire it — nbatch now bounds the ROWS that stay
+// resident — and it does not, because the bucket ARRAY is not what nbatch
+// bounds. Once the geometry goes multi-batch, hashsize.Choose re-derives
+// nbuckets from the full budget (PG's own rule), so a build over-estimated by
+// 100x would allocate a map sized for a memory-full table and hold it for a
+// hundred rows. Retiring the cap needs the presize to be revisable downward,
+// not just the row set to be bounded. Deferral ledger 2026-08-03 M0127-P3.2.
 const maxPresizeBuckets = 1 << 20
 
 // presizeLazyHash allocates the build-side table with its bucket count already
@@ -736,7 +776,7 @@ const maxPresizeBuckets = 1 << 20
 //
 // Not called for the FOR-UPDATE ctid build (buildHashRightWithCTID): that path
 // materialises its rows first and its result sets are small by construction.
-func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int) {
+func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) {
 	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
 		return
 	}
@@ -751,6 +791,19 @@ func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidt
 	// NBuckets is consumed. Deferral ledger 2026-08-03 M0127-P3.1.
 	sizing := hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
 		hashsize.EffectiveMemLimit(workMem))
+	// M0127-P3.2: the geometry's NBatch half is honoured now instead of
+	// ignored — and the state is installed even when it comes out as ONE.
+	//
+	// That is not over-eagerness, it is the only way the bound is real here.
+	// goopg's row estimates are absent far more often than PG's (stats are
+	// per-connection, so an unANALYZEd relation estimates at the floor), and
+	// an under-estimate is precisely the case where the build overruns memory.
+	// PG has the same shape: ExecHashTableCreate may choose nbatch = 1 and
+	// ExecHashTableInsert still grows it when spaceUsed passes spaceAllowed.
+	// A single-batch state costs one add and one compare per build row.
+	if o.joinBatchEligible() {
+		o.batches = newHashBatchState(sizing, buildIsLeft)
+	}
 	n := sizing.NBuckets
 	if n > maxPresizeBuckets {
 		n = maxPresizeBuckets
@@ -820,8 +873,20 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		if !ok {
 			continue
 		}
-		o.lazyHashInsertDatum(kd, ownedBuildRow(l))
+		if err := o.insertBuildRow(kd, ownedBuildRow(l)); err != nil {
+			return err
+		}
 	}
+}
+
+// insertBuildRow files one build row: straight into the hash table when the
+// join is not batching, through the batch router when it is (M0127-P3.2).
+func (o *joinOp) insertBuildRow(kd Datum, row Row) error {
+	if o.batches != nil {
+		return o.batches.insertBuildRow(o, kd, row)
+	}
+	o.lazyHashInsertDatum(kd, row)
+	return nil
 }
 
 // buildLoopRight is the single-pass build loop for the (default) BuildRight
@@ -886,7 +951,9 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		// made up front there is nothing left for them to opt out of.
 		// Their NullAware / emit-once invariants live in the counters above
 		// and in nextLazy, neither of which reads the key representation.
-		o.lazyHashInsertDatum(kd, ownedBuildRow(r))
+		if err := o.insertBuildRow(kd, ownedBuildRow(r)); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1704,10 +1771,39 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// Pull next probe row.
 		probeSlot, err := o.lazyProbe.Next()
 		if err == EOF {
+			// M0127-P3.2 (06 §2.3): PG's HJ_NEED_NEW_BATCH. The probe stream
+			// ending means this batch is done, not that the join is — load
+			// the next batch's build side and replay its saved probe rows.
+			if o.batches != nil {
+				more, berr := o.batches.nextBatch(o)
+				if berr != nil {
+					return nil, berr
+				}
+				if more {
+					continue
+				}
+				// Release the files as soon as the last batch drains, but
+				// keep the state itself: Close() is what retires it, and the
+				// counters are what EXPLAIN reads (P3.5).
+				o.batches.close()
+			}
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
+		}
+		// A replayed outer row re-checks its batch (PG rule 3,
+		// nodeHashjoin.c:1172-1202): a doubling since it was saved may have
+		// pushed it past the current batch. The stored hash settles it
+		// without evaluating a key expression.
+		if bs := o.batches; bs != nil && bs.replaying {
+			routed, rerr := bs.routeProbeRow(bs.replayHash, slotRow(probeSlot))
+			if rerr != nil {
+				return nil, rerr
+			}
+			if routed {
+				continue
+			}
 		}
 		// M0127-P1.1 (05 §2, stage E1): bind the child's slot as the
 		// probe source instead of flattening it with slotRow.
@@ -1752,6 +1848,20 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			}
 			ok = kok
 			if kok {
+				// M0127-P3.2: route before looking up. A probe row belonging
+				// to a later batch can never match the resident one (equal
+				// keys hash equal, so they batch together), and the lookup
+				// would be a wasted map probe on the majority of rows while
+				// batch 0 is being probed.
+				if bs := o.batches; bs != nil && bs.nbatch > 1 {
+					routed, rerr := bs.routeProbeRow(joinBatchHash(kd), slotRow(probeSlot))
+					if rerr != nil {
+						return nil, rerr
+					}
+					if routed {
+						continue
+					}
+				}
 				if ik, iok := datumToInt64Key(kd); iok {
 					matches = o.lazyIntHash[ik]
 				}
@@ -1763,6 +1873,17 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			key, ok, err = o.evalHashKeySlot(probeKeyExpr, keySlot)
 			if err != nil {
 				return nil, err
+			}
+			// M0127-P3.2: `key` IS the canonical form joinBatchHash hashes,
+			// so the string lane routes without re-deriving anything.
+			if bs := o.batches; ok && bs != nil && bs.nbatch > 1 {
+				routed, rerr := bs.routeProbeRow(hashKeyString(key), slotRow(probeSlot))
+				if rerr != nil {
+					return nil, rerr
+				}
+				if routed {
+					continue
+				}
 			}
 			matches = o.lazyHash[key]
 		}
@@ -1856,6 +1977,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 }
 
 func (o *joinOp) Close() error {
+	o.releaseBatches()
 	o.rows = nil
 	o.leftCTIDs = nil
 	o.rowSourceLeft = nil
@@ -4033,9 +4155,22 @@ func datumKey(d Datum) string {
 // to the same canonical form. v0 never produces negative scales,
 // but the helper is kept robust.
 func canonicalNumericKey(mantissa int64, scale int) string {
+	var buf [32]byte
+	return string(appendCanonicalNumericKey(buf[:0], mantissa, scale))
+}
+
+// appendCanonicalNumericKey is canonicalNumericKey's allocation-free half.
+//
+// M0127-P3.2 split it out so the batch hash can hash the canonical key BYTES
+// of an int64 key without materialising the string (join_batch.go,
+// joinBatchHash). The split is what keeps the two consistent: routing a row to
+// a batch by one canonical form while filing it in the map under another would
+// send equal keys to different batches, which is a silently-lost match — and
+// the string map is reachable from the int lane at any time via demoteIntHash.
+func appendCanonicalNumericKey(b []byte, mantissa int64, scale int) []byte {
 	// Special case: 0 at any scale collapses to a single value.
 	if mantissa == 0 {
-		return "m:0:0"
+		return append(b, 'm', ':', '0', ':', '0')
 	}
 	for scale > 0 && mantissa%10 == 0 {
 		mantissa /= 10
@@ -4043,12 +4178,11 @@ func canonicalNumericKey(mantissa int64, scale int) string {
 	}
 	// Use strconv.AppendInt instead of fmt.Sprintf to avoid format-string
 	// parsing overhead on the string-key hot path.
-	var buf [32]byte
-	b := append(buf[:0], 'm', ':')
+	b = append(b, 'm', ':')
 	b = strconv.AppendInt(b, mantissa, 10)
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(scale), 10)
-	return string(b)
+	return b
 }
 
 // canonicalBigNumericKey is canonicalNumericKey's big.Int lane. It

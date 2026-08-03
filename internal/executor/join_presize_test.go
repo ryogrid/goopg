@@ -41,7 +41,7 @@ func TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo(t *testing.T) {
 	t.Run("string lane", func(t *testing.T) {
 		o := &joinOp{plan: twoKeyJoinPlan(2)}
 		o.lazyHashIsInt = false
-		o.presizeLazyHash(nil, valuesNode(5000), 4)
+		o.presizeLazyHash(nil, valuesNode(5000), 4, false)
 		if o.lazyHash == nil {
 			t.Fatalf("string table was not presized")
 		}
@@ -52,7 +52,7 @@ func TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo(t *testing.T) {
 	t.Run("int lane", func(t *testing.T) {
 		o := &joinOp{plan: twoKeyJoinPlan(2)}
 		o.lazyHashIsInt = true
-		o.presizeLazyHash(nil, valuesNode(5000), 4)
+		o.presizeLazyHash(nil, valuesNode(5000), 4, false)
 		if o.lazyIntHash == nil {
 			t.Fatalf("int table was not presized")
 		}
@@ -78,7 +78,7 @@ func TestPresizeLazyHashSkipsWhenSizeIsUnknownOrTiny(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			o := &joinOp{plan: twoKeyJoinPlan(2)}
-			o.presizeLazyHash(nil, c.node, 4)
+			o.presizeLazyHash(nil, c.node, 4, false)
 			if o.lazyHash != nil || o.lazyIntHash != nil {
 				t.Fatalf("presized a table for %q (lazyHash=%v lazyIntHash=%v)",
 					c.name, o.lazyHash != nil, o.lazyIntHash != nil)
@@ -93,7 +93,7 @@ func TestPresizeLazyHashSkipsWhenSizeIsUnknownOrTiny(t *testing.T) {
 func TestPresizeLazyHashKeepsAnExistingTable(t *testing.T) {
 	o := &joinOp{plan: twoKeyJoinPlan(2)}
 	o.lazyHash = map[string][]Row{"k": {Row{NewIntDatum(7)}}}
-	o.presizeLazyHash(nil, valuesNode(5000), 4)
+	o.presizeLazyHash(nil, valuesNode(5000), 4, false)
 	if len(o.lazyHash) != 1 || len(o.lazyHash["k"]) != 1 {
 		t.Fatalf("presize replaced a populated table: %v", o.lazyHash)
 	}
@@ -106,7 +106,7 @@ func TestPresizeLazyHashKeepsAnExistingTable(t *testing.T) {
 func TestPresizedIntTableStillDemotes(t *testing.T) {
 	o := &joinOp{plan: twoKeyJoinPlan(2)}
 	o.lazyHashIsInt = true
-	o.presizeLazyHash(nil, valuesNode(5000), 1)
+	o.presizeLazyHash(nil, valuesNode(5000), 1, false)
 	if o.lazyIntHash == nil {
 		t.Fatalf("precondition: int table was not presized")
 	}

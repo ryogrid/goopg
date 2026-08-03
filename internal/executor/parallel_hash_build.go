@@ -150,6 +150,13 @@ func prebuildSharedHashJoins(ctx *Context, plan planner.Node, buildChild func() 
 	out := make(map[*planner.Join]*sharedHashBuild, len(joins))
 	for _, j := range joins {
 		j.ctx = ctx
+		// M0127-P3.2: a shared build must not spill. What gets published to
+		// the workers is the finished in-memory table (captureSharedBuild);
+		// the batch files and the per-batch probe replay live on THIS
+		// operator, which no worker ever runs. 06 §6 records the decline, and
+		// making it honest — a shared build that would spill re-planning as a
+		// private one — is P3.4's half.
+		j.noBatch = true
 		probeIsLeft, err := j.buildLazyHashTable(ctx)
 		if err != nil {
 			return nil, err

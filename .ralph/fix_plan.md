@@ -1135,7 +1135,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
-- [ ] **units/internal/executor + race/internal/executor — REOPENED, new causes**
+- [x] **units/internal/executor + race/internal/executor — REOPENED, new causes**
       — both lanes failed in nightly `20260803-013955` at sha `1a589c23`
       (AI-20260803-013955-001/-002, both first-seen tonight; evidence
       `ci/logs/20260803-013955/{units,race}/go-test.log`). Triaged 2026-08-03
@@ -1181,6 +1181,11 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       one. `make race-gate` now passes end-to-end (EXIT=0, all packages),
       first time since M0126-0006 landed. Nightly's race lane should clear on
       the next run; item (a) remains stale-only.
+      **CHECKED OFF 2026-08-03 (M0127-P3.2 loop).** Both causes are discharged
+      and re-confirmed at HEAD by that task's own bar: UNITS green (item (a)'s
+      `TestMHJParallelNoDuplicates` fixed by `4fb87456`) and `make race-gate`
+      green across every package (item (b)). Left for the next nightly run to
+      confirm from its own log.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -5892,11 +5897,52 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       so `m0127-p21-hashkeys` stays the PLAN baseline for S3.
       **Next M0127 selection is P3.2 (batch build/probe).**
       Progress log: design doc §6.
-- [ ] **M0127-P3.2 — batch build/probe.** Hashvalue-prefixed `spillWriter`
+- [x] **M0127-P3.2 — batch build/probe.** Hashvalue-prefixed `spillWriter`
       frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` state in
       `nextLazy`, nbatch growth with capped give-up + WARNING. Fold
       M0125-0032's Q21 plain-EXPLAIN classification into this design loop.
       IMPLEMENTATION-TODO P3.2; 06 §2.2-2.4. Bar: UNITS + DS05 + RACE.
+      **DONE 2026-08-03.** New `internal/executor/join_batch.go`
+      (`hashBatchState`) + a hashed frame on the shared spill primitive
+      (`WriteRowHashed` / `ReadRowHashedInto`). `ctx.WorkMem` now BOUNDS a
+      hash join instead of describing it: batch 0 stays in the map, later
+      batches are inner/outer file pairs, `batchno = (hash >> log2(nbuckets))
+      & (nbatch-1)`, and probe EOF becomes "this batch is done" via
+      `nextBatch` (= `HJ_NEED_NEW_BATCH`). PG's skip rules 2 and 3 come with
+      their counters (`origNBatch`, `nbatchOutstart`) — a one-sided batch is
+      skippable UNLESS nbatch has grown since the file was written, or its
+      rows are lost silently. Growth is `ExecHashIncreaseNumBatches` including
+      the freeze (`nfreed == 0 || nfreed == ninmemory`), evicting per KEY
+      rather than per tuple because every row under one map key shares that
+      key's hash.
+      **Two decisions carry the risk.** (1) The state is installed even when
+      the geometry says NBatch == 1 — goopg's estimates are absent far more
+      often than PG's, and an under-estimate is exactly the case that
+      overruns memory, so the bound must come from growth, not the estimate
+      (single-batch cost: one add + one compare per build row; the routing
+      hash is skipped entirely while nbatch == 1). (2) Routing hashes the
+      key's CANONICAL bytes (`appendCanonicalNumericKey`, split out of
+      `canonicalNumericKey`), never "the int64 if it is one": the executor
+      can fall from the int lane to the string lane mid-build
+      (`demoteIntHash`), and routing by one canonical form while filing under
+      another sends equal keys to different batches — a lost match, not an
+      error. Scope: INNER + single-key + private build; LEFT/Semi/Anti and
+      the composite lane are P3.4, and `prebuildSharedHashJoins` sets
+      `noBatch`. `spillWriter` gained the `hashsize.FileBufferBytes` write
+      buffer the P3.1 walk-back already priced.
+      **Six ledger rows** (`2026-08-03 M0127-P3.2`): the four declined join
+      shapes, the composite lane, the shared-build implicit decline, the
+      un-retired `maxPresizeBuckets` (nbatch bounds resident ROWS, not the
+      bucket ARRAY), no temp-file registry (P3.3), and no EXPLAIN counters
+      (P3.5).
+      Gates: UNITS PASS; RACE PASS (`make race-gate`, all packages); SPOT
+      PASS (Q12=2 / Q13=35, 15.8 s, peak 10,224 MB vs 17.0 s / 11,461 MB at
+      P3.1); DS05 across slices 1-50 / 51-72 / 73-99 MISMATCH=0 CKMISMATCH=0
+      ERROR=0 (Q72's TIMEOUT is pre-existing — 300 s here vs 315 s / 317 s on
+      earlier commits). No plan surface touched; `m0127-p21-hashkeys` stays
+      the PLAN baseline.
+      **Next M0127 selection is P3.3 (temp-file registry).**
+      Progress log: design doc §6.
 - [ ] **M0127-P3.3 — temp-file registry.** Per-query registry on `Context`;
       relocate to `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close`
       unlink leak. Injected-crash test leaves no strays. IMPLEMENTATION-TODO

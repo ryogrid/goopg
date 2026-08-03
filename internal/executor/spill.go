@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -16,6 +18,7 @@ import (
 // format. Each row is prefixed with a 4-byte little-endian length.
 type spillWriter struct {
 	f    *os.File
+	bw   *bufio.Writer
 	path string
 	buf  []byte // reusable encode buffer
 
@@ -27,6 +30,12 @@ type spillWriter struct {
 	reg     *activity.ActivityRegistry
 	procNum int32
 	hasReg  bool
+
+	// lenBuf is the 4-byte frame header. It is a field rather than a
+	// local because it is handed to w.f.Write as an io.Writer argument,
+	// which makes a local array escape and cost one allocation per
+	// spilled row.
+	lenBuf [4]byte
 }
 
 func newSpillWriter(dir string) (*spillWriter, error) {
@@ -34,7 +43,13 @@ func newSpillWriter(dir string) (*spillWriter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spillWriter: create temp file: %w", err)
 	}
-	w := &spillWriter{f: f, path: f.Name()}
+	// M0127-P3.2: the write buffer hashsize's walk-back already assumes.
+	// hashsize.FileBufferBytes prices one BLCKSZ-sized buffer per batch file
+	// when it decides whether more batches are worth their I/O (P3.1's
+	// deferral row noted the buffer did not exist yet); sizing the buffer at
+	// exactly that constant makes the assumption true instead of aspirational.
+	// It also collapses the two write syscalls WriteRow used to make per row.
+	w := &spillWriter{f: f, path: f.Name(), bw: bufio.NewWriterSize(f, hashsize.FileBufferBytes)}
 	// Cache the registry reference once at construction time instead
 	// of calling LookupCurrentGoroutine (→ runtime.Stack) on every
 	// spilled row.  See docs/design/tpch-round5-fixes/01.
@@ -48,18 +63,43 @@ func newSpillWriter(dir string) (*spillWriter, error) {
 
 func (w *spillWriter) WriteRow(row Row) error {
 	w.buf = w.buf[:0]
-	w.buf = binary.AppendUvarint(w.buf, uint64(len(row)))
+	w.buf = appendRowPayload(w.buf, row)
+	return w.writeFrame()
+}
+
+// WriteRowHashed writes a row preceded by its 32-bit join hash value
+// (M0127-P3.2; design leftdeep-joins/06 §2.2). It is the analogue of PG's
+// ExecHashJoinSaveTuple (nodeHashjoin.c:1414), which stores the hashvalue
+// ahead of the MinimalTuple so a reloaded tuple never has to re-evaluate the
+// join keys to learn which batch it belongs to.
+//
+// The two writers share appendRowPayload/writeFrame on purpose: a hashed frame
+// is a plain frame with four leading bytes, and the encode/decode pair here is
+// exactly the sibling-path class that has to change together.
+func (w *spillWriter) WriteRowHashed(hashValue uint32, row Row) error {
+	w.buf = w.buf[:0]
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, hashValue)
+	w.buf = appendRowPayload(w.buf, row)
+	return w.writeFrame()
+}
+
+// appendRowPayload encodes one Row (column count + datums) onto buf.
+func appendRowPayload(buf []byte, row Row) []byte {
+	buf = binary.AppendUvarint(buf, uint64(len(row)))
 	for _, d := range row {
-		w.buf = encodeDatum(d, w.buf)
+		buf = encodeDatum(d, buf)
 	}
-	// Prefix with total length for framing.
-	lenBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
+	return buf
+}
+
+// writeFrame emits w.buf prefixed by its little-endian 4-byte length.
+func (w *spillWriter) writeFrame() error {
+	binary.LittleEndian.PutUint32(w.lenBuf[:], uint32(len(w.buf)))
 	if w.hasReg {
 		w.reg.WaitEventStart(w.procNum, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
-	_, err1 := w.f.Write(lenBuf)
-	_, err2 := w.f.Write(w.buf)
+	_, err1 := w.bw.Write(w.lenBuf[:])
+	_, err2 := w.bw.Write(w.buf)
 	if w.hasReg {
 		w.reg.WaitEventEnd(w.procNum)
 	}
@@ -70,6 +110,10 @@ func (w *spillWriter) WriteRow(row Row) error {
 }
 
 func (w *spillWriter) Close() error {
+	if err := w.bw.Flush(); err != nil {
+		w.f.Close()
+		return err
+	}
 	return w.f.Close()
 }
 
@@ -129,6 +173,37 @@ func (r *spillReader) ReadRow() (Row, error) {
 // the result. Pipeline-pass callers pass a single reusable `dst`
 // across calls.
 func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
+	data, err := r.readFrame()
+	if err != nil {
+		return nil, err
+	}
+	return decodeRowPayload(data, dst)
+}
+
+// ReadRowHashedInto is ReadRowInto for frames written by WriteRowHashed
+// (M0127-P3.2): it returns the stored 32-bit hash value alongside the row.
+// The hash is what lets a reloaded batch tuple be re-routed to a later batch
+// (design leftdeep-joins/06 §2.3, PG's nodeHashjoin.c:1172-1202 rules 2 and 3)
+// without evaluating a single key expression.
+func (r *spillReader) ReadRowHashedInto(dst Row) (uint32, Row, error) {
+	data, err := r.readFrame()
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(data) < 4 {
+		return 0, nil, fmt.Errorf("spillReader: hashed frame shorter than its hash prefix")
+	}
+	hashValue := binary.LittleEndian.Uint32(data[:4])
+	row, err := decodeRowPayload(data[4:], dst)
+	if err != nil {
+		return 0, nil, err
+	}
+	return hashValue, row, nil
+}
+
+// readFrame reads one length-prefixed frame into r.dataBuf and returns it.
+// The returned slice is only valid until the next readFrame call.
+func (r *spillReader) readFrame() ([]byte, error) {
 	var lenBuf [4]byte
 	if r.hasReg {
 		r.reg.WaitEventStart(r.procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
@@ -159,6 +234,12 @@ func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 	if errData != nil {
 		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)
 	}
+	return data, nil
+}
+
+// decodeRowPayload decodes a column count + datums payload into dst when dst
+// has the capacity, else into a fresh Row.
+func decodeRowPayload(data []byte, dst Row) (Row, error) {
 	nCols, n := binary.Uvarint(data)
 	if n <= 0 {
 		return nil, fmt.Errorf("spillReader: invalid column count")
