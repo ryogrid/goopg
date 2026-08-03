@@ -1,0 +1,29 @@
+=== arm=s1 bin=/home/ryo/work/goopg/goopg/tmp/goopg-m0127-s1-bin ===
+# target: tpch@tpch
+# server started 2026-08-03T15:49:27+09:00; age at sweep start: 0s
+Q1: OK elapsed=6.52s rows=4
+Q2: OK elapsed=2.62s rows=455
+Q3: OK elapsed=16.72s rows=11521
+Q4: OK elapsed=16.28s rows=5
+Q5: OK elapsed=18.76s rows=5
+Q6: OK elapsed=3.31s rows=1
+Q7: OK elapsed=18.72s rows=4
+Q8: OK elapsed=6.23s rows=2
+Q9: OK elapsed=39.47s rows=175
+Q10: OK elapsed=15.14s rows=20501
+Q11: OK elapsed=1.45s rows=819
+Q12: OK elapsed=6.45s rows=2
+Q13: OK elapsed=3.94s rows=35
+Q14: OK elapsed=3.39s rows=1
+Q15-CREATEVIEW: OK elapsed=0.01s rows=0
+Q15a-VIEWBODY: OK elapsed=3.80s rows=10000
+Q15b-MAIN: OK elapsed=34.83s rows=1
+Q16: OK elapsed=0.95s rows=18213
+Q17: OK elapsed=20.94s rows=1
+Q18: OK elapsed=34.77s rows=10
+Q19: OK elapsed=5.51s rows=1
+Q20: OK elapsed=17.47s rows=76
+Q21: OK elapsed=79.09s rows=405
+Q22: OK elapsed=4.45s rows=7
+# arm=s1 runner-rc=0 server-peak-VmHWM=14510576 kB
+# arm=s1 finished 2026-08-03T15:55:43+09:00

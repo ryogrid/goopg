@@ -5704,10 +5704,35 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `2026-08-03 M0127-P1.2` records the un-audited remainder: only this one
       global was removed, not the package's build/exec-time globals as a
       class. Progress log: design doc §6.
-- [ ] **M0127-P1.3 — S1 A/B evidence run.** Q3/Q10/Q18/Q7 ≤ 1.2× R0; no other
+- [x] **M0127-P1.3 — S1 A/B evidence run.** Q3/Q10/Q18/Q7 ≤ 1.2× R0; no other
       query > 1.2× vs pre-S1 HEAD; file `analysis/leftdeep-joins/<date>-s1-ab.txt`.
       No code. Bar: bar met or attributed (09 §6) **before P2 starts**.
       IMPLEMENTATION-TODO P1.3; 09 §2.
+      **↳ DONE 2026-08-03 — bar ATTRIBUTED (the gate's second leg), evidence
+      `analysis/leftdeep-joins/2026-08-03-s1-ab.txt` + 5 raw artefacts.**
+      pre-S1 HEAD = `766d2cdb`; S1 = `99951944`. **Clause (2) met outright: not
+      one query in the suite is slower under S1 than under pre-S1 HEAD** (max
+      ratio 1.00); total 619.26 s → 360.82 s (0.58×), = 0.73× R0's 493.31 s.
+      Clause (1): Q7 PASSES (0.74× R0); **Q3 (1.98×), Q10 (2.51×), Q18 (1.26×)
+      MISS — attributed class (b) plan shape, INHERITED, not caused by S1.**
+      Two facts exclude S1: (i) EXPLAIN for all 22 queries is **byte-identical**
+      between arms, estimates included → every S1 delta is class (d) at constant
+      plan, and all are wins or a wash; (ii) the deficit is there with S1 absent
+      — pre-S1 HEAD alone is 4.08×/3.89×/2.92× R0 on Q3/Q10/Q18. The cause is
+      **MHJ de-selection between R0's HEAD and pre-S1 HEAD**: R0's snapshot has
+      9 `Multi-Way Hash Join` nodes (Q2/Q3/Q7/Q9/Q10/Q11/Q18/Q21), both arms
+      today have zero, and the estimates moved off R0's degenerate `rows=1` —
+      the M0125 estimate work stopped picking the shape R0 was pinned to. S1
+      still recovered 68/147/48/86 % of the Q3/Q7/Q10/Q18 deficit from the
+      executor alone. **The residual is the bundle's thesis, not S1's bug:**
+      09 §3 item 5 requires ZERO MHJ at S5 and P6.2 deletes it, so restoring
+      R0's shape would move away from the endpoint. **Q3/Q10/Q18 are carried
+      into P5 as named regression witnesses** (P5.3a bushy enumeration +
+      P5.6/P5.7 sizing/cost are the tasks that must clear them). Order control:
+      arms ran pre-S1(cold) → S1 → pre-S1(warm); the warm replicate reproduced
+      the cold one within 7.1 % on every query > 0.5 s, and S1 is compared
+      against the warm one. 22/22 complete in all three arms, row counts
+      identical across arms and to R0. No code landed. **P2 may start.**
 - [ ] **M0127-P2.1 — `planner.Join.HashKeys []JoinKeyPair`.** Search/pushdown
       fills all equality conjuncts; residual keeps non-equijoin only; EXPLAIN
       key-list rendering; plan-snapshot re-baseline same commit.
