@@ -91,6 +91,16 @@ type joinOp struct {
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
 
+	// M0127-P0.1 (design leftdeep-joins/05 §3, stage E2): hoisted
+	// merged-key slots. mergedKeySlot allocated five objects per BUILD
+	// row and per PROBE row (the null Row, its MaterializedSlot, the
+	// []virtualCol, the sources slice, the VirtualSlot). That composed
+	// shape is invariant for a given (realWidth, nullWidth, realOnLeft)
+	// triple, and the child schemas fix those at Open — so each side
+	// builds its slot once and rebinds the real source per pull.
+	lazyBuildKeySlot mergedKeySlotCache
+	lazyProbeKeySlot mergedKeySlotCache
+
 	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
 	// computed once in openLazyHashJoin's build loop. Real NOT IN
 	// three-valued-NULL semantics only depend on whether the
@@ -587,7 +597,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			// M0126-0003 0b: evaluate the key against a VirtualSlot
 			// over {lSlot, nullRight} instead of copying into a
 			// merged keyRow.
-			keySlot := mergedKeySlot(lSlot, leftWidth, rightWidth, true)
+			keySlot := o.lazyBuildKeySlot.rebind(lSlot, leftWidth, rightWidth, true)
 			kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
 			if err != nil {
 			return false, err
@@ -643,7 +653,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		// M0126-0003 0b: evaluate the key against a VirtualSlot
 		// over {nullLeft, rSlot} instead of copying into a
 		// merged keyRow.
-		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
+		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
 		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.RightKey, keySlot)
 		if err != nil {
 			return false, err
@@ -699,7 +709,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 		// M0126-0003 0b: slot-based key evaluation — skip the
 		// merged keyRow copy.
 		rSlot := SlotFromRow(nil, r)
-		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
+		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
 		key, ok, err := o.evalHashKeySlot(o.plan.RightKey, keySlot)
 		if err != nil {
 			return err
@@ -1009,6 +1019,45 @@ func mergedKeySlot(realSlot TupleSlot, realWidth, nullWidth int, realOnLeft bool
 	return &VirtualSlot{sources: sources, cols: cols}
 }
 
+// mergedKeySlotCache holds one hoisted merged-key VirtualSlot together
+// with the shape it was built for (M0127-P0.1; design
+// leftdeep-joins/05 §3, stage E2). The build and probe loops call
+// rebind once per row; in steady state that swaps a single interface
+// word inside slot.sources and allocates nothing, where the previous
+// per-row mergedKeySlot call allocated five objects.
+type mergedKeySlotCache struct {
+	slot       *VirtualSlot
+	realWidth  int
+	nullWidth  int
+	realOnLeft bool
+	realIdx    int // position of the real source inside slot.sources
+}
+
+// rebind returns the cached slot presenting realSlot in the merged
+// (left+right) column space. It rebuilds only when the requested shape
+// differs from the cached one. Child schemas fix the widths at Open, so
+// the rebuild fires at most once per operator in practice — the build
+// loops' `width == 0 && len(row) > 0` first-row fallback (an empty child
+// schema) is the only case that can change the shape mid-loop, and it
+// can fire only once.
+//
+// The returned slot is valid until the next rebind on the same cache;
+// like the slot mergedKeySlot returned before, it must not be retained
+// past the key evaluation it was built for.
+func (c *mergedKeySlotCache) rebind(realSlot TupleSlot, realWidth, nullWidth int, realOnLeft bool) *VirtualSlot {
+	if c.slot == nil || c.realWidth != realWidth || c.nullWidth != nullWidth || c.realOnLeft != realOnLeft {
+		c.slot = mergedKeySlot(realSlot, realWidth, nullWidth, realOnLeft)
+		c.realWidth, c.nullWidth, c.realOnLeft = realWidth, nullWidth, realOnLeft
+		c.realIdx = 1
+		if realOnLeft {
+			c.realIdx = 0
+		}
+		return c.slot
+	}
+	c.slot.sources[c.realIdx] = realSlot
+	return c.slot
+}
+
 // lazyHashInsertDatum inserts a build row keyed by keyDatum. It always
 // populates lazyHash (string) and, while every key so far has been
 // int64-representable, also lazyIntHash. The first non-int64 key drops the
@@ -1263,10 +1312,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		var keySlot *VirtualSlot
 		var probeKeyExpr planner.Expr
 		if o.plan.BuildLeft {
-			keySlot = mergedKeySlot(probeSlot, o.lazyRW, o.lazyLW, false)
+			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyRW, o.lazyLW, false)
 			probeKeyExpr = o.plan.RightKey
 		} else {
-			keySlot = mergedKeySlot(probeSlot, o.lazyLW, o.lazyRW, true)
+			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyLW, o.lazyRW, true)
 			probeKeyExpr = o.plan.LeftKey
 		}
 		var key string // used only by the string path + the CTID lookup

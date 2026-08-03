@@ -1,50 +1,45 @@
 (idle — nothing in flight)
 
-M0125-0047 is CLOSED (loop #40, 2026-08-03), committed and pushed.
-The comma-FROM join order was decided by Go's map-iteration
-randomiser: `pickNextByEdge` ranked candidates while ranging over
-`edges[j]` (a map) with a STRICT `<` on row count, so a tie kept
-whichever candidate the map yielded first. Fix = compare FROM indices
-last (a total order). Design
-`docs/design/0125-0047-joinorder-tiebreak-determinism.md`, evidence
-`analysis/m0125-0047/`.
+M0127-P0.1 is CLOSED (loop #42, 2026-08-03) — the first M0127 task, and the
+first code of the leftdeep-joins bundle.
 
-NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
-note). As of this loop it selects **`M0125-0013` (bookkeeping half)** —
-the LAST of the three M0125 items M0127 waits on. It is a documentation
-contradiction about Q47's 8.4x runtime, not engine work, but it **NEEDS
-A QUIET HOST** (`pgrep -af run-nightly.sh` first). M0127 opens after it.
+**NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
+note). It parks M-NIGHTLY below M0127, so the banner selects the next
+unchecked M0127 item — `M0127-P0.2` (single-pass build: fold
+`drainRowsBounded`'s budget into `buildLazyHashTable`'s build loop, delete
+the re-iteration's per-row `MaterializedSlot`; keep the M0097-0058
+owned-copy discipline). Bar: UNITS + SPOT + RACE.**
 
 Carry-over facts a next loop should not re-derive:
 
-- The plan-snapshot nondeterminism floor the last several loops worried
-  about is now MEASURED AT ZERO for the join-order passes: 3 restarts x
-  96 SF0.5 EXPLAINs byte-identical pairwise. before-vs-after is also
-  96/96 identical, so **no plan snapshot needs re-pinning** and no
-  earlier A/B is invalidated by this commit.
-- The 10-restart probe (`analysis/m0125-0047/probe-q85-restarts.sh`) is
-  UNDERPOWERED — the flip rate is ~10%, so 10 clean restarts happen by
-  chance ~35% of the time. Do not cite "N restarts agreed" as a
-  determinism gate without stating its power. The in-process unit test
-  is the strong instrument: Go re-randomises map order on every
-  `range`, so 200 iterations sample it 200x at zero restart cost.
-- Determinism is NOT proven planner-wide — only the join-order passes
-  were audited (`smallestUnused`, `orderByConnectivity` and the bushy DP
-  were already deterministic). `TestPlanQ85IsDeterministic` is the
-  harness shape to generalise to a corpus; M0127-P5.4's plan-shape
-  ratchet is its consumer. Ledger row 2026-08-03.
-- `planShapeString` (predp_test.go) CANNOT see alias-order defects: it
-  renders scans as `x.Table.Name` and self-join aliases share one
-  `*catalog.Table`. Use the reflective fingerprint in
-  joinorder_determinism_test.go instead.
-- One SF0.5 EXPLAIN capture arm costs 2m43s (96 queries);
-  `analysis/m0125-0047/capture-plans.sh <arm> <binary>` is the driver.
+- **P0.1 shape:** `mergedKeySlotCache` in
+  `internal/executor/operators_join_agg.go` (type + `rebind`, next to
+  `mergedKeySlot`), two instances per `joinOp` (`lazyBuildKeySlot`,
+  `lazyProbeKeySlot`). `rebind` swaps `slot.sources[realIdx]` — one
+  interface word, no alloc — and rebuilds only when
+  `(realWidth, nullWidth, realOnLeft)` changes.
+- **Widths are known at `Open`**, from `len(o.left.Schema())` /
+  `len(o.right.Schema())` at the top of `buildLazyHashTable`. The
+  `width == 0 && len(row) > 0` lines inside the build loops are an
+  empty-child-schema fallback, not the normal source of the width — that is
+  why the hoist is legal and why the cache still needs a shape guard.
+- **Microbench numbers (this host):** cached 4.10 ns/op, 0 allocs; uncached
+  185.8 ns/op, 344 B, 5 allocs. `BenchmarkMergedKeySlotSeam[Uncached]` in
+  `internal/executor/join_merged_key_slot_test.go` — reuse this file as the
+  seam-microbench home for P1.1's 0-alloc bar.
+- **Bundle discipline:** `docs/design/leftdeep-joins/**` is NEVER modified
+  (including its IMPLEMENTATION-TODO checkboxes). Landed-task tracking goes
+  in `docs/design/0127-pg-shaped-join-search.md` §6 (progress log, added
+  this loop) + the fix_plan checkbox + the README index status.
+- **Deliberately out of scope at P0.1:** `fused_hash_join.go:186,:280` keep
+  the per-row `mergedKeySlot` (05 §3 — fusion dies at P6.1);
+  `buildHashRightWithCTID`'s per-row `SlotFromRow` (FOR-UPDATE-only path).
+- Nightly triage: the 20 `AI-20260803-013955-*` subjects are all already
+  filed under M-NIGHTLY. Nothing new to file this loop.
 
-Gates run this loop: full `internal/planner` green; 4 new determinism
-guards proved to FAIL against the pre-fix body first; units precommit
-PASS; `tpch-spotcheck.sh` RESULT=PASS (Q12=2 / 22.5 s, Q13=35 / 11.4 s);
-SF0.5 EXPLAIN A/B 96/96 byte-identical across 3 fixed-binary restarts
-AND before-vs-after; 10-restart Q85 probe 1/10 flip pre-fix, 0/10
-post-fix; pgbench smoke via the commit hook; `make ralph-state-guard` OK.
+Gates run this loop: UNITS precommit PASS; SPOT `scripts/tpch-spotcheck.sh`
+PASS (Q12 rows=2, Q13 rows=35, 32.3 s query phase, peak 10,767 MB); BENCH as
+above; pgbench smoke via the commit hook; `make ralph-state-guard` OK
+(auto-repaired a stale progress marker).
 
 In-flight: none.

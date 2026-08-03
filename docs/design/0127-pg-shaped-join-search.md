@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | draft — **DESIGN ONLY**, implementation not started |
+| status | **in progress** — implementation started 2026-08-03; P0.1 landed (see §6). The bundle chapters remain design-only; this row tracks the plan's execution |
 | date | 2026-08-03 |
 | milestone | `docs/milestones/0127-pg-shaped-join-search.md` |
 | design of record | `docs/design/leftdeep-joins/` — **This document is not the design authority.** Each task's instructions come solely from the bundle chapters (`README.md`, `01`–`09`, `IMPLEMENTATION-TODO.md`); this plan references them as "see XX §N for details." Files under the bundle directory are referenced only, never modified |
@@ -186,3 +186,13 @@ change in S7).
 - Each stage's no-go/attribution follows the 09 §6 taxonomy ((a) cardinality /
   (b) plan shape / (c) cost-model realism / (d) executor); constant changes
   are not admitted without class diagnosis.
+
+## 6. Progress log
+
+One row per landed task. Records what shipped and the evidence, so a later
+loop does not re-derive it; the bundle files stay untouched (they are the
+design, not the tracker).
+
+| task | date | landed | evidence |
+|---|---|---|---|
+| **P0.1** | 2026-08-03 | `mergedKeySlotCache` (`operators_join_agg.go`) holds one hoisted merged-key `VirtualSlot` per side (`joinOp.lazyBuildKeySlot` / `lazyProbeKeySlot`); the five build/probe call sites call `rebind` instead of `mergedKeySlot`. Rebind swaps one interface word in `slot.sources`; it rebuilds only when `(realWidth, nullWidth, realOnLeft)` changes, which the child schemas fix at `Open` — the build loops' `width == 0 && len(row) > 0` empty-schema fallback is the only mid-loop shape change and can fire once. `mergedKeySlot` itself is kept as the constructor (and as the microbench's uncached arm). | Seam microbench `BenchmarkMergedKeySlotSeam` **4.10 ns/op, 0 B, 0 allocs/op** vs `…Uncached` **185.8 ns/op, 344 B, 5 allocs/op** (45×; the five allocations are the null `Row`, its `MaterializedSlot`, the `[]virtualCol`, the sources slice and the `VirtualSlot`). Guards in `join_merged_key_slot_test.go`: cached-vs-fresh slot equality both orientations, source rebinding (a stale source would key every row off the first row), shape-change rebuild, and a 0-alloc `AllocsPerRun` assertion. UNITS PASS; SPOT PASS (Q12 rows=2 / Q13 rows=35, 32.3 s query phase); SMOKE via the commit hook. **Not in scope:** `fused_hash_join.go`'s two `mergedKeySlot` call sites (:186, :280) stay per-row — fusion is deleted at P6.1 (05 §3 says so explicitly); `buildHashRightWithCTID`'s per-row `SlotFromRow` is a pre-existing alloc on the FOR-UPDATE-only path, untouched. |

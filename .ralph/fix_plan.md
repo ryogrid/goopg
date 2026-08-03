@@ -5532,11 +5532,25 @@ M0126-0006/-0007's fusion → P6.1; M0126-0004's slot-chaining deferral →
 un-deferred at P1.1. Supersession stamps at P6.4 (0034-0001, 0038-0001,
 cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
 
-- [ ] **M0127-P0.1 — `mergedKeySlot` hoist to `Open`.** Shape-invariant per
+- [x] **M0127-P0.1 — `mergedKeySlot` hoist to `Open`.** Shape-invariant per
       join; rebind `.row` per pull; zero steady-state allocs in the seam
       microbench. IMPLEMENTATION-TODO P0.1; 05 §3 (E2). Files:
       `internal/executor/operators_join_agg.go` (:986-1014, build :590/:646/:702,
       probe :1266/:1269). Bar: UNITS + SPOT + BENCH.
+      **↳ DONE 2026-08-03.** `mergedKeySlotCache` (two per `joinOp`:
+      `lazyBuildKeySlot`, `lazyProbeKeySlot`) holds the hoisted `VirtualSlot`;
+      all five call sites call `rebind`, which swaps one interface word and
+      rebuilds only on a `(realWidth, nullWidth, realOnLeft)` change — the
+      child schemas fix those at `Open`, so the build loops' empty-schema
+      `width == 0` fallback is the only mid-loop rebuild and fires at most
+      once. Seam microbench `BenchmarkMergedKeySlotSeam` **4.10 ns/op, 0
+      allocs** vs the uncached arm's **185.8 ns/op, 344 B, 5 allocs** (the
+      null `Row`, its `MaterializedSlot`, the `[]virtualCol`, the sources
+      slice, the `VirtualSlot`). Guards: `join_merged_key_slot_test.go`
+      (cached-vs-fresh equality both orientations, source rebinding, shape
+      change, 0-alloc `AllocsPerRun`). UNITS PASS, SPOT PASS (Q12=2/Q13=35),
+      SMOKE via hook. Out of scope by design (05 §3): `fused_hash_join.go`'s
+      two call sites — fusion dies at P6.1. Progress log: design doc §6.
 - [ ] **M0127-P0.2 — single-pass build.** Fold `drainRowsBounded`'s budget into
       `buildLazyHashTable`'s build loop; delete the re-iteration
       (`rowsOp`-per-row `MaterializedSlot` allocs). Keep owned-copy discipline
