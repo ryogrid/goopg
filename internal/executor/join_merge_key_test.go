@@ -66,9 +66,46 @@ func twoKeyMergePlan(jt planner.JoinType, leftWidth int, withPredicate bool) *pl
 	return j
 }
 
+// drainMergeSide keys and sorts one side through the streaming source the
+// merge join actually uses (M0127-P4.1 replaced buildMergeSide's arrays with
+// it) and returns the ordered stream.
+func drainMergeSide(t *testing.T, o *joinOp, child Operator, isLeft bool, selfWidth, otherWidth int) []mergeStreamRow {
+	t.Helper()
+	if o.ctx == nil {
+		o.ctx = NewContext()
+	}
+	if err := child.Open(o.ctx); err != nil {
+		t.Fatalf("child Open: %v", err)
+	}
+	src, err := newMergeSortedSource(o, child, isLeft)
+	if err != nil {
+		t.Fatalf("newMergeSortedSource: %v", err)
+	}
+	if _, err := src.prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	src.selfWidth, src.otherWidth = selfWidth, otherWidth
+	if err := src.fill(o.ctx); err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	var out []mergeStreamRow
+	for {
+		r, err := src.next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, r)
+	}
+	src.close()
+	return out
+}
+
 // countMergeGroups walks a keyed side and counts equal-key runs with the same
 // comparator the merge advance uses.
-func countMergeGroups(t *testing.T, keyed []mergeKeyedRow) int {
+func countMergeGroups(t *testing.T, keyed []mergeStreamRow) int {
 	t.Helper()
 	if len(keyed) == 0 {
 		return 0
@@ -105,12 +142,11 @@ func TestMergeKeyTupleSplitsPinnedLeadColumnGroups(t *testing.T) {
 	for i := 0; i < nRows; i++ {
 		rows = append(rows, Row{NewIntDatum(1998), NewIntDatum(int64(i))})
 	}
-	keyed, nullKey, err := o.buildMergeSide(rows, true, leftWidth, 2)
-	if err != nil {
-		t.Fatalf("buildMergeSide: %v", err)
-	}
-	if len(nullKey) != 0 {
-		t.Fatalf("no key column is NULL, yet %d row(s) were filed as NULL-keyed", len(nullKey))
+	keyed := drainMergeSide(t, o, &rowsOp{rows: rows}, true, leftWidth, 2)
+	for _, r := range keyed {
+		if r.nullKey {
+			t.Fatalf("no key column is NULL, yet a row was filed as NULL-keyed")
+		}
 	}
 	if got := countMergeGroups(t, keyed); got != nRows {
 		t.Fatalf("keyed side formed %d equal-key group(s) for %d distinct key tuples — "+
@@ -137,16 +173,21 @@ func TestMergeJoinFullKeyLeftOuterNullSecondKey(t *testing.T) {
 	}
 
 	for _, withPredicate := range []bool{true, false} {
-		o := &joinOp{plan: twoKeyMergePlan(planner.JoinTypeLeft, width, withPredicate)}
-		if err := o.runMergeJoin(leftRows, rightRows, width, width); err != nil {
-			t.Fatalf("residual=%v: runMergeJoin: %v", withPredicate, err)
+		o := &joinOp{
+			plan:  twoKeyMergePlan(planner.JoinTypeLeft, width, withPredicate),
+			left:  &rowsOp{rows: leftRows},
+			right: &rowsOp{rows: rightRows},
 		}
-		if len(o.rows) != len(leftRows) {
+		out, err := Run(o, NewContext())
+		if err != nil {
+			t.Fatalf("residual=%v: merge join: %v", withPredicate, err)
+		}
+		if len(out) != len(leftRows) {
 			t.Fatalf("residual=%v: LEFT join emitted %d row(s), want %d (one per left row)",
-				withPredicate, len(o.rows), len(leftRows))
+				withPredicate, len(out), len(leftRows))
 		}
 		matched, extended := 0, 0
-		for _, r := range o.rows {
+		for _, r := range out {
 			if len(r) != 2*width {
 				t.Fatalf("residual=%v: emitted row width %d, want %d", withPredicate, len(r), 2*width)
 			}

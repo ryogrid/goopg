@@ -78,8 +78,19 @@
 
 ## P4 — Other join operators [S4]
 
-- [ ] **P4.1** Streaming merge join (group buffering + overflow file);
+- [x] **P4.1** Streaming merge join (group buffering + overflow file);
   delete full-drain `runMergeJoin`/`buildMergeSide` accumulation.
+  *(2026-08-04. `join_merge_stream.go`: each side is a `mergeSortedSource`
+  — a `work_mem`-bounded external key-sort over the merged-key slot, N-way
+  merged back — and `mergeJoinStream` is PG's state machine with the inner
+  equal-key group as the only buffer, overflowing to a spill file past the
+  budget. `runMergeJoin`/`buildMergeSide`/`mergeKeyedRow` deleted; `o.rows`
+  is never touched. Emission order is byte-identical to the array
+  implementation by construction, including NULL-keyed rows last, which is
+  what the forced-spill identity test (work_mem=1 vs unbounded, 4 join
+  types × 2 residual regimes) pins. Inputs are still sorted BY the operator
+  — pathkey-fed inputs are P5 — and the emit is still `concatRows`, not the
+  E1 slot seam: 4 ledger rows.)*
 - [ ] **P4.2** Hash outer-fill: matched bitmap per batch; RIGHT sweep;
   FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL
   hash paths). Regress-port outer-join files green.

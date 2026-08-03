@@ -297,6 +297,24 @@ func (r *spillReader) Close() error {
 	return err
 }
 
+// rewind repositions the reader on the first frame so the same file can be
+// replayed more than once. M0127-P4.1 (07 §2): a merge join whose inner
+// equal-key group overflowed to disk re-reads that file once per outer row of
+// the group — the analogue of PG's ExecRestrPos, which rewinds the inner side
+// to the marked position instead (nodeMergejoin.c EXEC_MJ_TESTOUTER).
+func (r *spillReader) rewind() error {
+	_, err := r.f.Seek(0, io.SeekStart)
+	return err
+}
+
+// closeKeepFile closes the descriptor WITHOUT unlinking. Close's unlink is the
+// right default for a file a single reader consumes, but a caller that manages
+// the path itself — because it opened several readers over one file, or
+// because it deregisters the path from the statement registry
+// (Context.removeSpillFile) — must not have the path removed out from under
+// that bookkeeping.
+func (r *spillReader) closeKeepFile() error { return r.f.Close() }
+
 // encodeDatum serialises one Datum into buf, returning the extended slice.
 func encodeDatum(d Datum, buf []byte) []byte {
 	// Kind byte.

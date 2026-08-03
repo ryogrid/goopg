@@ -6079,10 +6079,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       node; batch-ineligible joins print no line at all).
       Gates: UNITS PASS; RACE PASS (all packages); DS05 slices 1-50 / 51-99
       MISMATCH=0 CKMISMATCH=0 ERROR=0 over all 99 (Q72 TIMEOUT pre-existing).
-- [ ] **M0127-P4.1 — streaming merge join** (duplicate-group buffering +
+- [x] **M0127-P4.1 — streaming merge join** (duplicate-group buffering +
       overflow file); delete full-drain `runMergeJoin`/`buildMergeSide`
       accumulation. IMPLEMENTATION-TODO P4.1; 07 §2. Bar: UNITS + REGRESS +
       DS05.
+      **DONE 2026-08-04. S4 is OPEN; P4.2 is next.** The merge join held
+      THREE full copies of its working set — both children drained into
+      `[]Row` by `Open`, both keyed sides `sort.SliceStable`-d into a second
+      pair of arrays by `buildMergeSide`, and the ENTIRE output appended into
+      `o.rows` before `Next` returned its first tuple — for an operator whose
+      upstream analogue holds one tuple per side plus the current inner
+      group. `internal/executor/join_merge_stream.go` replaces all three.
+      Each side is a **`mergeSortedSource`**: a key-ordered stream whose
+      resident set is bounded by `work_mem`, chunks past the budget sorted
+      and written to a spill run and freed, the runs N-way merged on the way
+      out — `sortOp`'s M0068-0006 shape, keyed on the merge key TUPLE instead
+      of a SortKey list, because the key expressions live in the merged
+      left++right space and only a `mergedKeySlot` (the P0.1 hoisted cache)
+      can present a bare child row in it. That also retires
+      `buildMergeSide`'s `concatRows`-per-row padding. The join is
+      **`mergeJoinStream`**, PG's `EXEC_MJ_SKIP` advance with the INNER
+      equal-key group as the only buffer: resident while it fits `work_mem`,
+      overflowing to a spill file replayed once per outer row (and once more
+      for the RIGHT/FULL sweep, over a `groupMatched` bitmap sized by row
+      COUNT so it stays small even when the rows are on disk).
+      **Emission order is byte-identical to the array implementation by
+      construction** — that is why a NULL key is carried as a per-row flag
+      that sorts AFTER every real key rather than being filed in a side list:
+      a stream cannot come back for a side list, but it can be told the null
+      rows are last, and a four-state tail then walks
+      left-real → right-real → left-null → right-null holding one row per
+      side. The guard that matters is the **forced-spill identity test**
+      (P3.5's hash-side property applied to merge): `work_mem=1` — every
+      input row in its own run, the 4-row inner group overflowed after its
+      first — against unbounded, over all four join types × both residual
+      regimes, compared row-by-row. Disabling the group replay's rewind makes
+      it fail. Six tests total, incl. a 40,000-row join that asserts `o.rows`
+      stays empty for the whole drain and a Close-releases-every-spill-file
+      test. **Four ledger rows** (`2026-08-04 M0127-P4.1`): the operator
+      still SORTS its own inputs (07 §2's pathkey-fed premise is P5's, not
+      this slice's); the emit is still `concatRows`, not the E1 composed-slot
+      seam; goopg has no operator-level mark/restore, so a group is buffered
+      where PG rewinds (schedule with P4.3, which brings `Materialize`); and
+      the merge path's dead ctid side-channel is now structurally absent
+      rather than one missing assignment.
+      Gates: UNITS PASS; DS05 PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 over
+      all 99 (Q72 TIMEOUT pre-existing); REGRESS zero delta vs a HEAD
+      worktree baseline on `join`/`join_hash`/`select`/`subselect`/`union`
+      (diff bodies byte-identical after path normalisation); SPOT PASS
+      (Q12=2 / Q13=35, 28.0 s). Progress log: design doc §6.
 - [ ] **M0127-P4.2 — hash outer-fill.** Matched bitmap per batch; RIGHT sweep;
       FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL hash
       paths). Regress-port outer-join files green. IMPLEMENTATION-TODO P4.2;

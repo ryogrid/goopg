@@ -88,6 +88,12 @@ type joinOp struct {
 	// wrong-key join. See join_merge_key.go.
 	mergeKeys     []planner.JoinKeyPair
 	mergeResidual planner.Expr
+
+	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
+	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
+	// merge output is pulled from this state machine instead of being
+	// pre-computed into o.rows. See join_merge_stream.go.
+	mergeStream *mergeJoinStream
 	lazyProbe    Operator         // probe side (streaming)
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
@@ -286,6 +292,14 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
+	// M0127-P4.1 (07 §2): merge join no longer shares the eager both-sides
+	// drain below. It opens its children and streams them through
+	// work_mem-bounded sorted sources instead; the CTID side-channel the
+	// drain captures is nested-loop-only anyway (rowSourceLeft, which
+	// runMergeJoin never populated, is what Next needs to use it).
+	if o.plan.Algo == planner.JoinAlgoMerge {
+		return o.openMergeJoin(ctx)
+	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -314,10 +328,80 @@ func (o *joinOp) Open(ctx *Context) error {
 		rightWidth = len(rightRows[0])
 	}
 
-	if o.plan.Algo == planner.JoinAlgoMerge {
-		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
-	}
 	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+}
+
+// openMergeJoin builds the streaming merge join (M0127-P4.1; design
+// leftdeep-joins/07 §2). Both children are opened, keyed and sorted into
+// work_mem-bounded streams; nothing is joined until Next asks.
+//
+// The one thing that has to happen here rather than inside the sources is
+// resolving the two widths: the key expressions index the MERGED left++right
+// column space, so keying either side needs the OTHER side's width, and a
+// child with an empty Schema() (a Values node, a subplan built without one)
+// only reveals its width when its first row arrives. Priming one row per side
+// is the streaming form of the array path's `width == 0 && len(rows) > 0`
+// fallback.
+func (o *joinOp) openMergeJoin(ctx *Context) error {
+	o.closeMergeStream()
+	if err := o.left.Open(ctx); err != nil {
+		return err
+	}
+	if err := o.right.Open(ctx); err != nil {
+		_ = o.left.Close()
+		return err
+	}
+	// The key list and residual are resolved before either side is keyed:
+	// the two sides must produce the same key arity in the same order.
+	o.initMergeKeys()
+	left, err := newMergeSortedSource(o, o.left, true)
+	if err != nil {
+		return err
+	}
+	right, err := newMergeSortedSource(o, o.right, false)
+	if err != nil {
+		return err
+	}
+	leftWidth := len(o.left.Schema())
+	rightWidth := len(o.right.Schema())
+	firstLeft, err := left.prime()
+	if err != nil {
+		return err
+	}
+	firstRight, err := right.prime()
+	if err != nil {
+		return err
+	}
+	if leftWidth == 0 && firstLeft != nil {
+		leftWidth = len(firstLeft)
+	}
+	if rightWidth == 0 && firstRight != nil {
+		rightWidth = len(firstRight)
+	}
+	left.selfWidth, left.otherWidth = leftWidth, rightWidth
+	right.selfWidth, right.otherWidth = rightWidth, leftWidth
+	m := newMergeJoinStream(o, leftWidth, rightWidth, left, right)
+	o.mergeStream = m
+	if err := left.fill(ctx); err != nil {
+		return err
+	}
+	return right.fill(ctx)
+}
+
+func (o *joinOp) closeMergeStream() {
+	if o.mergeStream != nil {
+		o.mergeStream.close()
+		o.mergeStream = nil
+	}
+}
+
+// nextMerge yields the streaming merge join's next row.
+func (o *joinOp) nextMerge() (TupleSlot, error) {
+	row, err := o.mergeStream.next()
+	if err != nil {
+		return nil, err
+	}
+	return asSlot(o.Schema(), row), nil
 }
 
 // lateralBindable is implemented by FROM-clause SRFs that can have
@@ -1043,250 +1127,6 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 	return nil
 }
 
-// mergeKeyedRow is one side's row plus its evaluated merge key TUPLE.
-//
-// M0127-P2.3 widened `key Datum` to a slice: the key is the whole
-// `Join.HashKeys` list the planner accepted for merge, not just its head. The
-// slice is a window into buildMergeSide's one flat backing array, so a
-// materialised side still costs a single allocation for all its keys.
-type mergeKeyedRow struct {
-	row  Row
-	keys []Datum
-}
-
-// runMergeJoin sorts both sides on their join keys and merges the
-// two ordered streams. NULL keys never match (same as hash join).
-// Supports INNER / LEFT / RIGHT / FULL outer semantics.
-func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	// M0127-P2.3: resolve the full key list + residual before either side is
-	// keyed — both sides must produce the same key arity in the same order.
-	o.initMergeKeys()
-
-	leftKeyed, leftNull, err := o.buildMergeSide(leftRows, true, leftWidth, rightWidth)
-	if err != nil {
-		return err
-	}
-	rightKeyed, rightNull, err := o.buildMergeSide(rightRows, false, leftWidth, rightWidth)
-	if err != nil {
-		return err
-	}
-
-	i, j := 0, 0
-	for i < len(leftKeyed) && j < len(rightKeyed) {
-		// M0058-0005: cheap ctx check every 256 left-side rows so a
-		// CancelRequest interrupts a long sort-merge join promptly.
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		cmp, err := compareMergeKeys(leftKeyed[i].keys, rightKeyed[j].keys, o.plan.Pos())
-		if err != nil {
-			return err
-		}
-		switch {
-		case cmp < 0:
-			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-				o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
-			}
-			i++
-		case cmp > 0:
-			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				merged := concatRows(nullLeft, rightKeyed[j].row)
-				o.coalesceUsingRow(merged)
-				o.rows = append(o.rows, merged)
-			}
-			j++
-		default:
-			li := i
-			for i < len(leftKeyed) {
-				eq, err := compareMergeKeys(leftKeyed[li].keys, leftKeyed[i].keys, o.plan.Pos())
-				if err != nil {
-					return err
-				}
-				if eq != 0 {
-					break
-				}
-				i++
-			}
-			rj := j
-			for j < len(rightKeyed) {
-				eq, err := compareMergeKeys(rightKeyed[rj].keys, rightKeyed[j].keys, o.plan.Pos())
-				if err != nil {
-					return err
-				}
-				if eq != 0 {
-					break
-				}
-				j++
-			}
-			// The residual is what remains of the ON clause once the
-			// merge key has located the group — PostgreSQL's
-			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)
-			// (postgres/src/backend/executor/nodeMergejoin.c).
-			//
-			// M0125-0011 first put this check here: the merge key was
-			// only the FIRST equality conjunct, so without a per-pair
-			// re-check a two-conjunct FULL OUTER JOIN degenerated into
-			// its single-key counterpart (TPC-DS Q97: 2131274 rows
-			// instead of 836302), and RIGHT OUTER JOIN was wrong the
-			// same way. M0127-P2.3 removed the CAUSE rather than the
-			// check: the key is now the whole accepted pair list, so on
-			// an all-equijoin join mergeResidual is nil and this loop
-			// does no evaluator work at all — the group it walks is
-			// already the exact match set. A conjunct whose pair the
-			// planner declined (non-merge-safe type) or a genuinely
-			// non-equijoin conjunct still lands here, which is why the
-			// check stays.
-			leftMatched := make([]bool, i-li)
-			rightMatched := make([]bool, j-rj)
-			for a := li; a < i; a++ {
-				for b := rj; b < j; b++ {
-					joined := concatRows(leftKeyed[a].row, rightKeyed[b].row)
-					ok, perr := o.mergeResidualMatch(joined)
-					if perr != nil {
-						return perr
-					}
-					if !ok {
-						continue
-					}
-					leftMatched[a-li] = true
-					rightMatched[b-rj] = true
-					o.rows = append(o.rows, joined)
-				}
-			}
-			// A row whose merge key matched but whose residual did not
-			// is still an UNMATCHED row for outer-join purposes, so it
-			// must be null-extended here; the cmp<0 / cmp>0 arms only
-			// see rows whose key itself found no partner.
-			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-				for a := li; a < i; a++ {
-					if !leftMatched[a-li] {
-						o.rows = append(o.rows, concatRows(leftKeyed[a].row, nullRight))
-					}
-				}
-			}
-			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				for b := rj; b < j; b++ {
-					if !rightMatched[b-rj] {
-						merged := concatRows(nullLeft, rightKeyed[b].row)
-						o.coalesceUsingRow(merged)
-						o.rows = append(o.rows, merged)
-					}
-				}
-			}
-		}
-	}
-
-	for ; i < len(leftKeyed); i++ {
-		if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-			o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
-		}
-	}
-	for ; j < len(rightKeyed); j++ {
-		if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-			merged := concatRows(nullLeft, rightKeyed[j].row)
-			o.coalesceUsingRow(merged)
-			o.rows = append(o.rows, merged)
-		}
-	}
-
-	if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-		for _, l := range leftNull {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-		for _, r := range rightNull {
-			merged := concatRows(nullLeft, r)
-			o.coalesceUsingRow(merged)
-			o.rows = append(o.rows, merged)
-		}
-	}
-
-	return nil
-}
-
-func (o *joinOp) buildMergeSide(rows []Row, isLeft bool, leftWidth, rightWidth int) ([]mergeKeyedRow, []Row, error) {
-	var paddedLeft, paddedRight Row
-	if isLeft {
-		paddedRight = nullRow(rightWidth)
-	} else {
-		paddedLeft = nullRow(leftWidth)
-	}
-	keyExprs := o.mergeSideKeyExprs(isLeft)
-	if len(keyExprs) == 0 {
-		return nil, nil, fmt.Errorf("merge join key is nil")
-	}
-	for _, e := range keyExprs {
-		if e == nil {
-			return nil, nil, fmt.Errorf("merge join key is nil")
-		}
-	}
-
-	keyed := make([]mergeKeyedRow, 0, len(rows))
-	nullKey := make([]Row, 0)
-	// One flat backing array for every kept row's key tuple. Sized exactly,
-	// and never appended to, so the sub-slices handed to mergeKeyedRow can
-	// never be invalidated by a reallocation.
-	n := len(keyExprs)
-	store := make([]Datum, len(rows)*n)
-	used := 0
-	for _, row := range rows {
-		var evalRow Row
-		if isLeft {
-			evalRow = concatRows(row, paddedRight)
-		} else {
-			evalRow = concatRows(paddedLeft, row)
-		}
-		base := used
-		haveKey := true
-		for _, keyExpr := range keyExprs {
-			v, err := evalExpr(keyExpr, evalRow, o.ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			if v.IsNull() {
-				// A NULL in ANY key column makes that column's equality
-				// NULL, so the row can match nothing — the single-key
-				// rule applied componentwise. Before P2.3 such a row was
-				// grouped on the non-NULL leading column and then
-				// rejected by the residual; both routes reach the same
-				// emit decision (dropped for INNER, null-extended for the
-				// outer side), which is what keeps this a cost change.
-				haveKey = false
-				break
-			}
-			store[used] = v
-			used++
-		}
-		if !haveKey {
-			used = base
-			nullKey = append(nullKey, row)
-			continue
-		}
-		keyed = append(keyed, mergeKeyedRow{row: row, keys: store[base:used:used]})
-	}
-
-	var sortErr error
-	sort.SliceStable(keyed, func(i, j int) bool {
-		cmp, err := compareMergeKeys(keyed[i].keys, keyed[j].keys, o.plan.Pos())
-		if err != nil {
-			sortErr = err
-			return false
-		}
-		return cmp < 0
-	})
-	if sortErr != nil {
-		return nil, nil, sortErr
-	}
-
-	return keyed, nullKey, nil
-}
-
 // evalHashKey evaluates one side of the hash-join key against a
 // padded row and returns its canonical key string. The boolean
 // is false when the key evaluated to NULL (never matches).
@@ -1637,6 +1477,10 @@ func (o *joinOp) Next() (TupleSlot, error) {
 	// M0036 lazy output: yield joined rows on demand.
 	if o.lazyProbe != nil {
 		return o.nextLazy()
+	}
+	// M0127-P4.1: so does the merge join, from its own state machine.
+	if o.mergeStream != nil {
+		return o.nextMerge()
 	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -1990,6 +1834,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 
 func (o *joinOp) Close() error {
 	o.releaseBatches()
+	o.closeMergeStream()
 	o.rows = nil
 	o.leftCTIDs = nil
 	o.rowSourceLeft = nil
