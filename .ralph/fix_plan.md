@@ -5843,9 +5843,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       CKMISMATCH=0 / ERROR=0 across all 99 (Q97 checksum unchanged; timings
       flat vs P2.2 — no DS05 query is currently governed by this class).
       **S2 IS CLOSED; the next M0127 selection is P3.1.**
-- [ ] **M0127-P3.1 — `chooseHashTableSize`** (shared pkg importable by planner
+- [x] **M0127-P3.1 — `chooseHashTableSize`** (shared pkg importable by planner
       and executor); goopg-width-aware (`48·c` + map overhead).
       IMPLEMENTATION-TODO P3.1; 06 §2.1; 04 §4. Bar: UNITS + SPOT.
+      **DONE 2026-08-03.** New leaf package `internal/hashsize`:
+      `Choose(ntuples, ncols, avgVarBytes, memLimit) Sizing{NBuckets, NBatch,
+      SpaceAllowed, EntryBytes}` plus `EntryBytes` / `EffectiveMemLimit`. It is
+      a PACKAGE, not a function, because the import direction forces it: the
+      executor imports the planner and the planner imports the executor
+      nowhere, so the one rule both must obey has to sit below both. PG gets
+      this for free — `final_cost_hashjoin` and `ExecHashTableCreate` call the
+      same `ExecChooseHashTableSize` (`nodeHash.c:658`) — and a cost model that
+      believes a build fits while the executor spills is precisely the
+      sibling-path class this project keeps paying for.
+      **The width substitution is the content, not a detail.** PG measures an
+      entry as `HJTUPLE_OVERHEAD + MAXALIGN(SizeofMinimalTupleHeader) +
+      MAXALIGN(tupwidth)`; goopg holds `map[K][]Row` over `[]Datum` at 48
+      bytes per Datum, so the same row costs `48·c + 24` and a bucket slot
+      costs 48 where PG's is an 8-byte pointer. PG's constants would predict
+      `nbatch` low by about the width ratio — the trap `04 §4` names — and
+      `TestChooseGoopgWidthForcesBatchesPGWouldNotSee` pins one instance
+      (300k × 10 cols: ~2.9 MB of MinimalTuple, ~150 MB of Datum). Three PG
+      subtleties are carried deliberately: the 1024-bucket floor, the
+      re-derivation of nbuckets from the FULL budget once multi-batch is
+      forced (buckets sized for a memory-full table, not for ntuples), and the
+      closing walk-back. One PG assertion became a clamp —
+      `Assert(bucket_bytes <= hash_table_bytes/2)` holds for 8-byte pointers,
+      but 48-byte slots make "buckets alone exhaust work_mem" reachable.
+      **First consumer: `joinOp.presizeLazyHash`** (`operators_join_agg.go`) —
+      the build table is allocated with its bucket count already chosen
+      instead of a nil map doubling its way up a multi-million-row build. Rows
+      come from `planner.EstimateRows(o.plan.Left/Right)` (the executor cannot
+      count a side it has not drained); the presize is capped at
+      `maxPresizeBuckets = 1<<20` because an estimate is not a measurement,
+      and the 1024-bucket floor is read as "no information" (every unANALYZEd
+      relation returns it) so tiny/unknown builds presize nothing. The
+      FOR-UPDATE ctid build is left alone — it materialises first and its
+      result sets are small by construction. `NBatch` is computed and IGNORED:
+      honouring it means partitioning at insert time, which is P3.2.
+      **Four ledger rows** (`2026-08-03 M0127-P3.1`): `hashJoinCost` still
+      does not call `Choose` (the batch-I/O term moves plans; 06 §5 / P5.7 own
+      it); `avgVarBytes` is 0 because goopg collects no per-column width
+      statistic, biasing NBatch low; the walk-back's `FileBufferBytes = 8192`
+      assumes a per-batch write buffer `spillWriter` does not have yet; and
+      `maxPresizeBuckets` is a goopg-only cap that P3.2 should delete.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 17.0 s, peak 11,461 MB —
+      vs 18.1 s / 11,573 MB at P2.3, within noise). No plan surface touched,
+      so `m0127-p21-hashkeys` stays the PLAN baseline for S3.
+      **Next M0127 selection is P3.2 (batch build/probe).**
+      Progress log: design doc §6.
 - [ ] **M0127-P3.2 — batch build/probe.** Hashvalue-prefixed `spillWriter`
       frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` state in
       `nextLazy`, nbatch growth with capped give-up + WARNING. Fold

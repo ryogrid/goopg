@@ -1,39 +1,39 @@
 (idle — nothing in flight)
 
-M0127-P2.3 is CLOSED and pushed. **S2 IS CLOSED (P2.1+P2.2+P2.3).**
+M0127-P3.1 is CLOSED and pushed. **S3 IS OPEN; P3.1 is its first landed task.**
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
 note). It parks M-NIGHTLY below M0127, so the banner selects the next
-unchecked M0127 item — `M0127-P3.1` (`chooseHashTableSize` in a shared pkg
-importable by planner AND executor; goopg-width-aware `48·c` + map
-overhead). Bar: UNITS + SPOT.**
+unchecked M0127 item — `M0127-P3.2` (batch build/probe: hashvalue-prefixed
+`spillWriter` frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` in
+`nextLazy`, nbatch growth with capped give-up + WARNING; fold M0125-0032's
+Q21 plain-EXPLAIN classification into its design loop). Bar: UNITS + DS05 +
+RACE.**
 
 Carry-over facts a next loop should not re-derive:
 
-- **There are now FOUR key views, do not confuse them.**
-  `Join.HashKeys` = the plan's truth (every equi-pair; what EXPLAIN renders
-  as `Hash Cond:`/`Merge Cond:`, filled for `JoinAlgoMerge` too).
-  `Join.ExecHashKeyPlan()` = the hash executor's narrower
-  `{Keys, Residual, Int64Keys}`. `Join.ExecMergeKeyPlan()` (NEW, P2.3) =
-  the merge executor's; same `pairIsHashSafe` filter, `Int64Keys` always
-  false (it selects the hash packing lane). `Join.Residual()` = the
-  projection against the FULL list, used by nothing in the executor.
-- **Merge and hash key state are separate joinOp fields ON PURPOSE.**
-  `mergeKeys`/`mergeResidual` (set by `initMergeKeys`, top of
-  `runMergeJoin`) vs `execKeys`/`execResidual` (set by `initExecKeys`, the
-  lazy-hash Opens). One joinOp runs one algorithm; separate slots make a
-  cross-read a compile error. `joinPredicateMatch` (row-based, reads the
-  FULL `plan.Predicate`) is still what runNestedLoop uses — merge now uses
-  `mergeResidualMatch`.
-- **`pairIsHashSafe` is still the single load-bearing guard**, now for two
-  callers. float4/float8 are TEXT datums; enum/toast have no `datumKey`
-  arm. New for P2.3: `compareDatum`'s `KindString` arm CONTENT-SNIFFS
-  (pg_lsn → uint64, UUID normalisation, `(`/`{` → element-wise numeric),
-  so text equality is not strictly `=`. Ledger row `2026-08-03 M0127-P2.3`.
-- **P2.3 moved no plan and no DS05 timing.** `make plan-diff
-  LABEL=m0127-p21-hashkeys` = MATCH 22/22, so that baseline still stands
-  for P3. DS05 timings flat vs P2.2 (Q47 30 s, Q54 145 s, Q67 231 s,
-  Q78 20 s, Q88 156 s, Q97 13 s / checksum unchanged).
+- **`internal/hashsize` is a LEAF package on purpose.** executor → planner,
+  planner → executor NEVER, so the shared sizing rule sits below both. Do not
+  "simplify" it into either package. `Choose` returns
+  `Sizing{NBuckets, NBatch, SpaceAllowed, EntryBytes}`; only `NBuckets` has a
+  consumer today (`joinOp.presizeLazyHash`). **`NBatch` is computed and
+  ignored — wiring it IS P3.2.**
+- **Four P3.1 ledger rows are P3.2's actual worklist.** (1) `hashJoinCost`
+  still uses `rowsPerPage = 100` and has no batch-I/O term and no work_mem
+  input at all (`costParams` has no memory field); (2) `avgVarBytes` is
+  hard-0 because goopg collects no per-column width stat → NBatch biases LOW;
+  (3) `FileBufferBytes = 8192` assumes a per-batch write buffer that
+  `spillWriter` does not have (it writes frame + payload straight to the fd);
+  (4) `maxPresizeBuckets = 1<<20` in `operators_join_agg.go` is a goopg-only
+  cap that P3.2 should DELETE once NBatch bounds the table.
+- **PG's `Assert(bucket_bytes <= hash_table_bytes/2)` does not hold in
+  goopg** — a map slot is ~48 B vs PG's 8 B pointer, so "buckets alone
+  exhaust work_mem" is reachable at small work_mem and `Choose` clamps the
+  batch divisor instead of trusting it.
+- **`Context.WorkMem == 0` means UNLIMITED**, not zero. `Choose(…, 0)` is
+  NBatch=1 / SpaceAllowed=0; use `hashsize.EffectiveMemLimit` (→ 512 MiB)
+  wherever a finite budget is needed to size a real allocation.
+- **P3.1 moved no plan.** `m0127-p21-hashkeys` is still the PLAN baseline.
 - **DS05 post-TIMEOUT restart hazard is still live** — the sweep dies after
   Q72 on a `systemd-run` scope-name collision. Recovery: `systemctl --user
   reset-failed`, `bench/tpcds/server.sh start sf05`, then
@@ -43,10 +43,9 @@ Carry-over facts a next loop should not re-derive:
   Tracking = `docs/design/0127-pg-shaped-join-search.md` §6 + fix_plan
   checkbox + README index status.
 
-Gates run this loop: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 18.1 s);
-PLAN MATCH 22/22; DS05 MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99
-(Q1-Q72 `sweep-20260803-184827.txt` 68 PASS / 3 SKIP / Q72 TIMEOUT 315 s;
-Q73-Q99 `sweep-20260803-192520.txt` 26 PASS / 1 SKIP / TIMEOUT=0);
-SMOKE via the commit hook; `make ralph-state-guard` OK.
+Gates run this loop: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 17.0 s, peak
+11,461 MB); SMOKE via the commit hook; `make ralph-state-guard` OK (after its
+own auto-repair of the previous loop's clean-exit marker). DS05/PLAN not run
+— P3.1's bar is UNITS + SPOT and no plan surface was touched.
 
 In-flight: none.

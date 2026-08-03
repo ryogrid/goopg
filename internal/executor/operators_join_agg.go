@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -665,6 +666,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
 		}
+		o.presizeLazyHash(ctx, o.plan.Left, leftWidth)
 		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
@@ -689,12 +691,81 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			return true, nil
 		}
 	}
+	o.presizeLazyHash(ctx, o.plan.Right, rightWidth)
 	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// maxPresizeBuckets caps how many buckets presizeLazyHash will pre-allocate.
+//
+// The cap exists because the bucket count comes from planner.EstimateRows,
+// and an estimate is not a measurement: a 100× over-estimate on a join that
+// really holds a thousand rows would otherwise reserve a map big enough for
+// the imagined build and hold it for the query's life. Go maps grow by
+// doubling with incremental rehash, so past roughly a million buckets the
+// presize buys progressively less anyway — the allocation it saves is the one
+// the table would have grown into regardless. 1<<20 slots is about 48 MB of
+// map metadata worst case, which is a bounded loss if the estimate is wrong.
+//
+// The cap is presize policy, deliberately NOT part of hashsize.Choose: the
+// sizing function must keep returning PG's geometry so the planner and the
+// executor agree on it. It goes away with M0127-P3.2, where nbatch makes the
+// in-memory table genuinely bounded and the full bucket count becomes safe to
+// allocate.
+const maxPresizeBuckets = 1 << 20
+
+// presizeLazyHash allocates the build-side table with its bucket count already
+// chosen, instead of letting an empty map grow by rehashing.
+//
+// M0127-P3.1 (design leftdeep-joins/06 §2.1): PG picks (nbuckets, nbatch) once
+// via ExecChooseHashTableSize and ExecHashTableCreate allocates the bucket
+// array up front (nodeHash.c:446). goopg built every hash table from a nil map
+// and let it double its way up — for a multi-million-row build that is a
+// couple of dozen rehashes of the whole table. hashsize.Choose is the shared
+// planner↔executor sizing rule; this is its first caller, and it uses only the
+// NBuckets half. NBatch is computed and currently ignored: honouring it means
+// partitioning rows at insert time, which is P3.2.
+//
+// buildNode is the plan node feeding the build side — the row estimate has to
+// come from the plan because the executor cannot know the count before it has
+// drained the side it is about to build.
+//
+// Not called for the FOR-UPDATE ctid build (buildHashRightWithCTID): that path
+// materialises its rows first and its result sets are small by construction.
+func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int) {
+	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
+		return
+	}
+	var workMem int64
+	if ctx != nil {
+		workMem = ctx.WorkMem
+	}
+	// avgVarBytes is 0: goopg has no per-column average-width statistic to
+	// feed it, so a text-heavy build is under-counted and its geometry is
+	// sized as if only the 48-byte Datum array were resident. That biases
+	// NBatch low, which is the risk 04 §4 names; it is harmless while only
+	// NBuckets is consumed. Deferral ledger 2026-08-03 M0127-P3.1.
+	sizing := hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
+		hashsize.EffectiveMemLimit(workMem))
+	n := sizing.NBuckets
+	if n > maxPresizeBuckets {
+		n = maxPresizeBuckets
+	}
+	if n <= hashsize.MinBuckets {
+		// hashsize floors nbuckets at 1024 even for a three-row build, and
+		// that floor is also what an unestimated relation returns. Both mean
+		// "no useful information", so allocate nothing and let the map grow.
+		return
+	}
+	if o.lazyHashIsInt {
+		o.lazyIntHash = make(map[int64][]Row, n)
+		return
+	}
+	o.lazyHash = make(map[string][]Row, n)
 }
 
 // buildLoopLeft is the single-pass build loop for the BuildLeft orientation
