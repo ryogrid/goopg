@@ -758,6 +758,28 @@ func (o *joinOp) releaseBatches() {
 // not just the row set to be bounded. Deferral ledger 2026-08-03 M0127-P3.2.
 const maxPresizeBuckets = 1 << 20
 
+// buildGeometry is the ONE derivation of a hash join's (nbuckets, nbatch)
+// geometry. Three callers read it and must not disagree about whether a build
+// fits: presizeLazyHash sizes the bucket array from it, newHashBatchState takes
+// its memory budget from it, and prebuildSharedHashJoins decides from it
+// whether a shared build would spill (M0127-P3.4). Three separate
+// hashsize.Choose calls would be three chances to drift.
+//
+// avgVarBytes is 0: goopg has no per-column average-width statistic to feed it,
+// so a text-heavy build is under-counted and its geometry is sized as if only
+// the 48-byte Datum array were resident. That biases NBatch low, which is the
+// risk 04 §4 names — and is why the batch state also grows on measured
+// overrun rather than trusting this number. Deferral ledger 2026-08-03
+// M0127-P3.1.
+func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int) hashsize.Sizing {
+	var workMem int64
+	if ctx != nil {
+		workMem = ctx.WorkMem
+	}
+	return hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
+		hashsize.EffectiveMemLimit(workMem))
+}
+
 // presizeLazyHash allocates the build-side table with its bucket count already
 // chosen, instead of letting an empty map grow by rehashing.
 //
@@ -780,17 +802,7 @@ func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidt
 	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
 		return
 	}
-	var workMem int64
-	if ctx != nil {
-		workMem = ctx.WorkMem
-	}
-	// avgVarBytes is 0: goopg has no per-column average-width statistic to
-	// feed it, so a text-heavy build is under-counted and its geometry is
-	// sized as if only the 48-byte Datum array were resident. That biases
-	// NBatch low, which is the risk 04 §4 names; it is harmless while only
-	// NBuckets is consumed. Deferral ledger 2026-08-03 M0127-P3.1.
-	sizing := hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
-		hashsize.EffectiveMemLimit(workMem))
+	sizing := o.buildGeometry(ctx, buildNode, buildWidth)
 	// M0127-P3.2: the geometry's NBatch half is honoured now instead of
 	// ignored — and the state is installed even when it comes out as ONE.
 	//

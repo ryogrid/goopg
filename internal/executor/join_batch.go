@@ -25,11 +25,13 @@ package executor
 //     grow the batch count in the middle of a build whose earlier rows are
 //     already on disk: nothing that has been processed can need to move back.
 //
-// Scope (P3.2): INNER, single-key joins with a private build. LEFT/Semi/Anti
-// per-batch semantics and the shared (parallel) build's decline are P3.4;
-// the composite-key lane keeps its own maps and is not batched yet. Every
-// declined case behaves exactly as it did before this file existed —
-// `o.batches` stays nil and not one line of the old path changes.
+// Scope (P3.2 + P3.4): INNER / Semi / Anti / probe-filling LEFT, single-key,
+// with a private build. The composite-key lane keeps its own maps and is not
+// batched yet, and a LEFT join built on the left side needs the build-side
+// sweep of P4.2. Every declined case behaves exactly as it did before this
+// file existed — `o.batches` stays nil and not one line of the old path
+// changes. A shared (parallel) build no longer declines the SPILL; it declines
+// the SHARE (parallel_hash_build.go, M0127-P3.4).
 
 import (
 	"fmt"
@@ -125,26 +127,66 @@ type hashBatchState struct {
 
 // joinBatchEligible reports whether this join may spill its build.
 //
-// Everything excluded here is excluded because its correctness argument is a
-// separate slice, not because batching is hard for it:
+// M0127-P3.4 admits LEFT (probe-side fill), Semi and Anti. The argument that
+// lets them in is one sentence from 06 §2.5: **a probe row belongs to exactly
+// one batch, and so does every build row that could match it** — equal keys
+// hash equal, so they route together. Every per-probe-row decision these join
+// types make (emit-at-most-once for Semi, emit-iff-no-match for Anti, null-pad
+// on miss for LEFT) is therefore decidable inside the row's own batch, with no
+// cross-batch state. The two things that are NOT batch-local are handled
+// elsewhere: `antiBuildHasNull`/`antiBuildRows` are maintained by the build
+// loop before any row is routed, so they are batch-global by construction; and
+// the batch-SKIP rule stops being "one side empty ⇒ no output" (see
+// `batchSkippable`).
 //
-//   - LEFT/Semi/Anti need the fill-aware batch-skip rules of 06 §2.3 and the
-//     batch-global `antiBuildHasNull` of §2.5 — M0127-P3.4;
+// Still excluded, each because its correctness argument is a separate slice:
+//
+//   - a LEFT join built on the LEFT side fills from the BUILD side, which needs
+//     the post-replay unmatched sweep of 07 §3 — M0127-P4.2 (the executor has
+//     no build-side fill at all today, batched or not);
 //   - the composite-key lane keys its own maps (join_composite_key.go) and
-//     would need its packed key hashed the same way on both sides — P3.4;
+//     would need its packed key hashed the same way on both sides (deferral
+//     ledger 2026-08-03 M0127-P3.2);
 //   - the FOR-UPDATE ctid build keeps `lazyHashCTID` in lockstep with
 //     `lazyHash`, so spilling one without the other would lose the tid a
 //     downstream LockRows needs;
-//   - a shared (parallel) build publishes a frozen table to workers that never
-//     see this operator's batch state — 06 §6 and P3.4 make it decline
-//     explicitly; here it simply never batches.
+//   - `noBatch` is the caller-side decline; nothing sets it now that
+//     `prebuildSharedHashJoins` declines the SHARE instead of the SPILL
+//     (parallel_hash_build.go), and it is kept as the knob that decline would
+//     otherwise have to re-invent.
 func (o *joinOp) joinBatchEligible() bool {
-	return !o.noBatch &&
-		o.plan.Type == planner.JoinTypeInner &&
-		!o.plan.NullAware &&
-		!o.multiKey() &&
-		!o.preserveBuildSide &&
-		o.preserveCTIDRel == nil
+	if o.noBatch || o.multiKey() || o.preserveBuildSide || o.preserveCTIDRel != nil {
+		return false
+	}
+	switch o.plan.Type {
+	case planner.JoinTypeInner, planner.JoinTypeSemi, planner.JoinTypeAnti:
+		// NullAware (NOT IN) rides along: its two short-circuits read the
+		// build-global counters above and fire before nextLazy probes
+		// anything, so they are unaffected by how the build was partitioned.
+		return true
+	case planner.JoinTypeLeft:
+		return !o.plan.BuildLeft
+	}
+	return false
+}
+
+// probeFillsUnmatched reports whether a probe row that matches nothing still
+// produces output. It is PG's `HJ_FILL_OUTER` in the shape goopg's executor
+// expresses it (nodeHashjoin.c's HJ_FILL_OUTER_TUPLE macro), and the batch-skip
+// rule of 06 §2.3 turns on it: for a filling join an outer-only batch is NOT
+// skippable, because every probe row it holds emits — null-padded under LEFT,
+// as-is under ANTI. Skipping it loses rows silently, which is exactly the
+// failure mode 06 §2.3 warns "the SF0.5 gate would catch only late".
+func (o *joinOp) probeFillsUnmatched() bool {
+	switch o.plan.Type {
+	case planner.JoinTypeAnti:
+		return true
+	case planner.JoinTypeLeft:
+		// The build-left orientation fills from the build side instead; it is
+		// declined by joinBatchEligible, so this is a guard, not a case.
+		return !o.plan.BuildLeft
+	}
+	return false
 }
 
 // newHashBatchState installs batching for a build whose geometry came out
@@ -323,31 +365,50 @@ func (bs *hashBatchState) freezeGrowth(why string) {
 		"space_used", bs.spaceUsed, "space_allowed", bs.spaceAllowed)
 }
 
+// batchSkippable reports whether batch b can be dropped unread — PG's three
+// skip rules from ExecHashJoinNewBatch (nodeHashjoin.c:1141-1160), which are
+// far easier to state than to get right:
+//
+//	rule 1  a batch empty on one side produces no output — UNLESS the join
+//	        fills from the side that does have rows. An outer-only batch under
+//	        LEFT/ANTI emits every row it holds (M0127-P3.4); an inner-only
+//	        batch under RIGHT/FULL would emit on the unmatched sweep, which
+//	        goopg does not have yet (P4.2), so only the outer arm exists here.
+//	rule 2  an inner file written before a doubling may hold rows that now
+//	        belong to a LATER batch; it has to be read so they can be
+//	        re-routed forward, even with nothing to probe it with.
+//	rule 3  the same for an outer file written before a doubling that happened
+//	        after the outer scan began.
+//
+// Rules 2 and 3 are what make "empty on one side" insufficient on its own:
+// dropping such a file unread loses its rows silently.
+func (bs *hashBatchState) batchSkippable(o *joinOp, b int) bool {
+	hasInner, hasOuter := bs.inner[b] != nil, bs.outer[b] != nil
+	if hasInner && hasOuter {
+		return false
+	}
+	if hasInner && bs.nbatch != bs.origNBatch {
+		return false // rule 2
+	}
+	if hasOuter && bs.nbatch != bs.nbatchOutstart {
+		return false // rule 3
+	}
+	if hasOuter && o.probeFillsUnmatched() {
+		return false // rule 1, fill arm
+	}
+	return true
+}
+
 // nextBatch advances to the next batch that has work: it clears the in-memory
 // table, reloads that batch's inner file into it, and points o.lazyProbe at a
 // replay of the batch's outer file. Returns false when every batch is done.
 //
 // This is PG's HJ_NEED_NEW_BATCH state (ExecHashJoinNewBatch,
-// nodeHashjoin.c:1130). The skip rule is the INNER-join half of PG's rule 1: a
-// batch with no rows on one side produces no output, so both files are
-// dropped unread. (LEFT/FULL/RIGHT fill make that rule conditional — the
-// reason batching is INNER-only until P3.4.)
+// nodeHashjoin.c:1130); the skip decision is factored into batchSkippable.
 func (bs *hashBatchState) nextBatch(o *joinOp) (bool, error) {
 	bs.closeReplay()
 	bs.curBatch++
-	// PG's skip loop, minus its rule 1 (fill joins are not batched yet).
-	// Rules 2 and 3 are the ones that are easy to get wrong: a batch that is
-	// empty on one side is normally skippable, but NOT if nbatch has grown
-	// since the file was written — the file may hold rows that now belong to
-	// a later batch, and dropping it unread loses them silently.
-	for bs.curBatch < bs.nbatch &&
-		(bs.outer[bs.curBatch] == nil || bs.inner[bs.curBatch] == nil) {
-		if bs.inner[bs.curBatch] != nil && bs.nbatch != bs.origNBatch {
-			break // rule 2: inner rows may need reassigning
-		}
-		if bs.outer[bs.curBatch] != nil && bs.nbatch != bs.nbatchOutstart {
-			break // rule 3: outer rows may need reassigning
-		}
+	for bs.curBatch < bs.nbatch && bs.batchSkippable(o, bs.curBatch) {
 		bs.discard(bs.curBatch)
 		bs.curBatch++
 	}

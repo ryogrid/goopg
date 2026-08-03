@@ -5985,9 +5985,65 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       and `TestWorkerContextSharesTheLeaderRegistry`.
       **Next M0127 selection is P3.4 (Semi/Anti/LEFT per-batch semantics).**
       Progress log: design doc §6.
-- [ ] **M0127-P3.4 — Semi/Anti/LEFT per-batch semantics** (batch-global
+- [x] **M0127-P3.4 — Semi/Anti/LEFT per-batch semantics** (batch-global
       `antiBuildHasNull`); shared build declines when nbatch > 1.
       IMPLEMENTATION-TODO P3.4; 06 §2.5. Bar: UNITS + DS05 + RACE.
+      **DONE 2026-08-03.** `joinBatchEligible` admits SEMI, ANTI and the
+      probe-filling LEFT on one sentence from 06 §2.5: **a probe row belongs to
+      exactly one batch, and so does every build row that could match it** —
+      equal keys hash equal, so they route together, and every per-probe-row
+      verdict (emit-at-most-once, emit-iff-no-match, null-pad-on-miss) is
+      decidable inside the row's own batch. That is why NOT ONE LINE of
+      `nextLazy`'s emit logic changed. The admitted set is character-for-
+      character `hashJoinIsPartialCapable`'s (planner/parallel.go): the same
+      "per-probe-row verdict is worker-local" property decides which joins may
+      take a partial probe side and which may be partitioned by batch.
+      **What did have to change is the SKIP rule.** P3.2 dropped any batch
+      empty on one side; under LEFT/ANTI that silently discards every probe row
+      in an outer-only batch. `batchSkippable` now states PG's three rules as a
+      table (nodeHashjoin.c:1141-1160) with rule 1's fill arm
+      (`probeFillsUnmatched`). Rule 1's INNER-only arm is deliberately absent —
+      it belongs to the RIGHT/FULL unmatched sweep goopg does not have (P4.2),
+      which is also why a LEFT join built on the LEFT side is still declined.
+      `antiBuildHasNull`/`antiBuildRows` needed no work: the build loop
+      maintains them before any row is routed, so they are batch-global by
+      construction and NOT IN's short-circuits fire before any probe.
+      **The shared build now declines the SHARE, not the SPILL.** P3.2's
+      `noBatch` made it the one hash build in the executor with no work_mem
+      bound at all, because `captureSharedBuild` freezes the in-memory table
+      alone — publishing a spilled build hands each worker one partition. The
+      decline is taken twice: from the ESTIMATE before the build (common case
+      wastes no pass) and from the MEASUREMENT after it (goopg's estimates are
+      absent often enough that only growth bounds anything), with
+      `buildGeometry` factored out of `presizeLazyHash` so the presize, the
+      batch state and the decline cannot disagree about whether a build fits.
+      **The cost is real and was isolated, not averaged away.** SPOT rows PASS
+      (Q12=2 / Q13=35) but the query phase went 15.7 s → 28.3 s. A three-arm
+      A/B on the same host splits it exactly: HEAD Q12 11.58 / Q13 4.14;
+      shared-decline alone Q12 15.84 / Q13 3.89; full P3.4 Q12 16.39 / Q13
+      11.89. So Q12's +4.3 s is N private builds replacing one shared one, and
+      Q13's +7.8 s is its LEFT join (`customer ⟕ orders`, 1.5M-row build) now
+      honouring `work_mem` — at goopg's 512 MB default, i.e. 128× PG's, so PG
+      spills this join harder than goopg now does. Both are the design's
+      mandate (06 §6 / 06 §2), the alternative being the unbounded builds this
+      milestone exists to close, so they are LEDGERED for the S1/S5 acceptance
+      measurement rather than tuned away here.
+      **Three ledger rows** (`2026-08-03 M0127-P3.4`): the build-side fill arm
+      (RIGHT/FULL/LEFT-on-BuildLeft → P4.2), the repeated private builds (only
+      real parallel hash fixes it, 06 §6), and `hashJoinCost` still not pricing
+      the nbatch I/O term (→ P5.7) now that more join types spill. Also flips
+      two P3.2 rows to `resolved` (LEFT/Semi/Anti decline; shared-build
+      `noBatch`).
+      Gates: UNITS PASS; RACE PASS (`make race-gate`, all packages); DS05
+      across slices 1-50 / 51-75 / 76-99 MISMATCH=0 CKMISMATCH=0 ERROR=0 over
+      all 99 (Q72's TIMEOUT pre-existing); SPOT PASS on rows with the timing
+      regression above. Three new tests, incl. the negative-controlled
+      `TestFillingJoinsKeepOuterOnlyBatches` (fill arm disabled ⇒ LEFT emits 72
+      of 1,239 rows). No plan surface touched; `m0127-p21-hashkeys` stays the
+      PLAN baseline.
+      **Next M0127 selection is P3.5 (EXPLAIN `Batches:` + forced-spill
+      identity; S3 exit evidence).**
+      Progress log: design doc §6.
 - [ ] **M0127-P3.5 — EXPLAIN `Batches:`/memory lines + forced-spill identity
       test** (low `work_mem` Q3 byte-identical to default). S3 exit evidence:
       Q21 SF1 completes capped; file `analysis/leftdeep-joins/…-s3-spill.txt`.

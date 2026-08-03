@@ -294,9 +294,9 @@ func TestHashJoinSpillFilesRemovedOnEarlyClose(t *testing.T) {
 	_ = os.Getenv("TMPDIR")
 }
 
-// Join shapes P3.2 does not cover must not batch at all — a half-implemented
-// LEFT or Semi batch would drop fill rows, which no row count on the INNER
-// tests would ever notice.
+// Join shapes the batching still does not cover must not batch at all — a
+// half-implemented fill rule drops rows, which no row count on the INNER tests
+// would ever notice.
 func TestBatchingDeclinesShapesItDoesNotYetSupport(t *testing.T) {
 	const lw, rw = 2, 2
 	buildRows := intKeyRows(4000, 700, "b")
@@ -305,9 +305,13 @@ func TestBatchingDeclinesShapesItDoesNotYetSupport(t *testing.T) {
 		name  string
 		mutet func(*planner.Join)
 	}{
-		{"left join", func(p *planner.Join) { p.Type = planner.JoinTypeLeft }},
-		{"semi join", func(p *planner.Join) { p.Type = planner.JoinTypeSemi }},
-		{"anti join", func(p *planner.Join) { p.Type = planner.JoinTypeAnti }},
+		// A LEFT join built on the LEFT side fills from the BUILD side, which
+		// needs the post-replay unmatched sweep (M0127-P4.2); the probe-side
+		// LEFT that P3.4 does batch is covered by TestFillingJoinsKeepOuterOnlyBatches.
+		{"build-left outer join", func(p *planner.Join) {
+			p.Type = planner.JoinTypeLeft
+			p.BuildLeft = true
+		}},
 		{"composite key", func(p *planner.Join) {
 			col := func(i int) *planner.ColumnRef {
 				return &planner.ColumnRef{Index: i, Type: catalog.Type{Name: "int4"}}
@@ -323,11 +327,164 @@ func TestBatchingDeclinesShapesItDoesNotYetSupport(t *testing.T) {
 			tc.mutet(plan)
 			_, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 512<<10)
 			if bs != nil {
-				t.Fatalf("%s installed batch state (nbatch=%d) — P3.4 owns its per-batch semantics",
+				t.Fatalf("%s installed batch state (nbatch=%d) — its per-batch semantics are a later slice",
 					tc.name, bs.nbatch)
 			}
 		})
 	}
+}
+
+// M0127-P3.4 — the fill arm of PG's batch-skip rule 1 (06 §2.3).
+//
+// The fixture is built so exactly ONE batch can ever hold an inner row: the
+// build side carries a single distinct key, while the geometry is sized from an
+// estimate 5,000× larger, so nbatch comes out big from the ESTIMATE and no
+// growth ever fires. Every other batch is outer-only.
+//
+// Under INNER and SEMI those batches produce nothing and are dropped unread.
+// Under LEFT and ANTI every probe row in them EMITS — null-padded or as-is —
+// so skipping them is a silent loss of ~all the join's output. The assertion is
+// the identity against the unbounded arm, which is what makes the difference
+// between the two groups visible at all: a row count on the INNER case would
+// look perfect either way.
+func TestFillingJoinsKeepOuterOnlyBatches(t *testing.T) {
+	const lw, rw = 2, 2
+	buildRows := intKeyRows(40, 1, "b")      // every build row keys on 0
+	probeRows := intKeyRows(1200, 1200, "p") // 1200 distinct probe keys
+
+	for _, tc := range []struct {
+		name string
+		typ  planner.JoinType
+	}{
+		{"inner", planner.JoinTypeInner},
+		{"semi", planner.JoinTypeSemi},
+		{"left", planner.JoinTypeLeft},
+		{"anti", planner.JoinTypeAnti},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := batchJoinPlan(lw, len(probeRows), 200000)
+			plan.Type = tc.typ
+
+			want, memBS := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+			if memBS != nil && memBS.nbatch != 1 {
+				t.Fatalf("precondition: the default-work_mem arm batched (nbatch=%d)", memBS.nbatch)
+			}
+			if len(want) == 0 {
+				t.Fatalf("precondition: the in-memory %s join emitted nothing", tc.name)
+			}
+
+			got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 512<<10)
+			if bs == nil {
+				t.Fatalf("%s join did not batch — work_mem is not being honoured", tc.name)
+			}
+			if bs.nbatch < 8 {
+				t.Fatalf("precondition: nbatch=%d, too few batches to leave any outer-only", bs.nbatch)
+			}
+			if bs.outerSpilled == 0 {
+				t.Fatalf("precondition: no probe row reached a batch file")
+			}
+			assertSameRows(t, want, got)
+		})
+	}
+}
+
+// The three skip rules stated as a table. The identity tests above prove the
+// mechanism end to end but cannot isolate WHICH rule fired; this pins each arm
+// directly, including the two (rules 2 and 3) that only matter after a doubling
+// and are therefore invisible in any fixture whose estimate was right.
+func TestBatchSkipRulesRespectFillAndReassignment(t *testing.T) {
+	skippable := func(typ planner.JoinType, buildLeft, hasInner, hasOuter bool, nbatch, orig, outstart int) bool {
+		o := &joinOp{plan: &planner.Join{Type: typ, Algo: planner.JoinAlgoHash, BuildLeft: buildLeft}}
+		bs := &hashBatchState{
+			nbatch: nbatch, origNBatch: orig, nbatchOutstart: outstart,
+			inner: make([]*joinBatchFile, nbatch), outer: make([]*joinBatchFile, nbatch),
+		}
+		if hasInner {
+			bs.inner[1] = &joinBatchFile{}
+		}
+		if hasOuter {
+			bs.outer[1] = &joinBatchFile{}
+		}
+		return bs.batchSkippable(o, 1)
+	}
+	cases := []struct {
+		name                          string
+		typ                           planner.JoinType
+		buildLeft, hasInner, hasOuter bool
+		nbatch, orig, outstart        int
+		want                          bool
+	}{
+		{"both sides present", planner.JoinTypeInner, false, true, true, 4, 4, 4, false},
+		{"empty batch", planner.JoinTypeInner, false, false, false, 4, 4, 4, true},
+		{"inner: outer-only is dead", planner.JoinTypeInner, false, false, true, 4, 4, 4, true},
+		{"semi: outer-only is dead", planner.JoinTypeSemi, false, false, true, 4, 4, 4, true},
+		{"left: outer-only fills", planner.JoinTypeLeft, false, false, true, 4, 4, 4, false},
+		{"anti: outer-only fills", planner.JoinTypeAnti, false, false, true, 4, 4, 4, false},
+		{"left: inner-only needs no sweep yet", planner.JoinTypeLeft, false, true, false, 4, 4, 4, true},
+		{"rule 2: inner file predates a doubling", planner.JoinTypeInner, false, true, false, 8, 4, 8, false},
+		{"rule 3: outer file predates a doubling", planner.JoinTypeInner, false, false, true, 8, 8, 4, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := skippable(c.typ, c.buildLeft, c.hasInner, c.hasOuter, c.nbatch, c.orig, c.outstart)
+			if got != c.want {
+				t.Fatalf("batchSkippable = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// M0127-P3.4 — a shared (parallel) build that would spill declines the SHARE,
+// not the SPILL.
+//
+// captureSharedBuild freezes the in-memory table alone; the batch files and the
+// per-batch replay stay on the leader's operator, which no worker ever runs. So
+// publishing a spilled build would hand every worker one partition of the table
+// and lose the rest — silently. P3.2 sidestepped it by disabling the spill,
+// which left the shared build the one hash build in the executor with no
+// work_mem bound at all.
+//
+// Three arms, because the decision is made twice: from the estimate before the
+// build (so the common case wastes no pass) and from the measurement after it
+// (because goopg's estimates are absent often enough that only growth bounds
+// anything).
+func TestSharedHashBuildDeclinesWhenItWouldSpill(t *testing.T) {
+	const lw, rw = 2, 2
+	buildRows := intKeyRows(4000, 700, "b")
+	probeRows := intKeyRows(2000, 700, "p")
+
+	prebuild := func(t *testing.T, estRight int, workMem int64) map[*planner.Join]*sharedHashBuild {
+		t.Helper()
+		plan := batchJoinPlan(lw, len(probeRows), estRight)
+		tree := newJoinOp(plan,
+			&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
+			&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
+		t.Cleanup(func() { _ = tree.Close() })
+		out, err := prebuildSharedHashJoins(&Context{WorkMem: workMem}, plan,
+			func() (Operator, error) { return tree, nil })
+		if err != nil {
+			t.Fatalf("prebuild: %v", err)
+		}
+		return out
+	}
+
+	t.Run("a build that fits is shared", func(t *testing.T) {
+		if n := len(prebuild(t, len(buildRows), 0)); n != 1 {
+			t.Fatalf("published %d builds, want 1 — the sharing regressed", n)
+		}
+	})
+	t.Run("an estimate that says spill declines before building", func(t *testing.T) {
+		if n := len(prebuild(t, 200000, 512<<10)); n != 0 {
+			t.Fatalf("published %d builds for a build sized at 200k rows under 512 KiB", n)
+		}
+	})
+	t.Run("an estimate that lied declines after building", func(t *testing.T) {
+		// The estimate says a hundred rows; four thousand arrive. Growth is
+		// what discovers it, so only the post-build check can catch this one.
+		if n := len(prebuild(t, 100, 256<<10)); n != 0 {
+			t.Fatalf("published %d builds after the build outgrew work_mem", n)
+		}
+	})
 }
 
 // The batch hash must be a function of the key's VALUE, not of the datum kind

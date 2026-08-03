@@ -60,8 +60,12 @@
 - [ ] **P3.3** Per-query temp-file registry on `Context`; relocate to
   `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close` unlink
   leak. Gate: injected-crash test leaves no strays.
-- [ ] **P3.4** Semi/Anti/LEFT per-batch semantics (batch-global
+- [x] **P3.4** Semi/Anti/LEFT per-batch semantics (batch-global
   `antiBuildHasNull`); shared-build declines when nbatch > 1.
+  *(2026-08-03. `joinBatchEligible` admits Semi/Anti/probe-filling LEFT;
+  `batchSkippable` carries PG's three skip rules with the fill arm;
+  `prebuildSharedHashJoins` declines the SHARE rather than the SPILL.
+  Build-side fill — LEFT-on-BuildLeft, RIGHT, FULL — stays with P4.2.)*
 - [ ] **P3.5** EXPLAIN `Batches:`/memory lines; forced-spill identity test
   (low `work_mem` Q3 byte-identical to default). Gate for P3.*: Q21 SF1
   completes capped; SF0.5 zero-delta; race-gate.
