@@ -353,11 +353,29 @@
   `tryBuildNLI`; constructor failure on a DP-chosen path = loud planner error.
   Both need a Node rather than a Path — `tryBuildNLI` analyses a built `*Join`
   — so they bind to P5.5's `createPlan` arms, not to path generation.
-- [ ] **P5.4c** Merge paths via pathkeys (03 §5.3): explicit Sort paths,
-  pathkey propagation through the join, `mergeJoinCost` on equal footing.
-  With them the jointype gauntlet and the FULL-without-usable-clause error
-  contract become expressible — both are unreachable while 03 §4.4 pins
-  every non-INNER construct outside the search.
+- [x] **P5.4c-i** `sort_inner_and_outer` (joinpath.c:1357) — the merge arm that
+  sorts BOTH inputs, plus the pathkey machinery it needs.
+  *(DONE 2026-08-04, `internal/planner/joinpathsmerge.go` + `joinpaths.go`,
+  `path.go`. Per-equivalence-class sort-key reduction
+  (`select_outer_pathkeys_for_merge`, pathkeys.c:1697-1704), pair-local key
+  orientation, the one-path-per-ordering loop (:1447-1466),
+  `make_inner_pathkeys_for_merge`'s direction copy (:1911-1915),
+  `build_join_pathkeys` (pathkeys.c:1295) as the join's output ordering,
+  `try_mergejoin_path`'s sort-skip (:1091-1097) and still-parameterised refusal
+  (:1073-1081), and `create_sort_path`/`cost_sort` as an explicit child
+  `PathSort` — the kind's first producer. Split from P5.4c-ii because this arm
+  needs NOTHING from its inputs, while the other one is dead until some path
+  carries pathkeys. Still inert — no `planSelect` call site,
+  `GOOPG_PGSHAPED_DP` OFF. 3 ledger rows. UNITS PASS.)*
+- [ ] **P5.4c-ii** `generate_mergejoin_paths` (joinpath.c:1564) inside
+  `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered outer
+  instead of sorting, with mergeclause-list truncation and the materialize-inner
+  decision. Needs ordered index paths to exist first (`generateScanPaths` /
+  `pathparamindex.go` record no ordering today), which is why the sort-skip
+  branch landed in P5.4c-i as a tested but unreachable consumer. Carries the
+  jointype gauntlet (`nestjoinOK`, joinpath.c:1833-1852) and the
+  FULL-without-usable-clause error contract (joinrels.c:961-964) — both still
+  unreachable while 03 §4.4 pins every non-INNER construct outside the search.
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

@@ -18,18 +18,22 @@ package planner
 // nothing calls this from `planSelect` yet either, and `GOOPG_PGSHAPED_DP`
 // stays OFF; it is validated in isolation by `joinpaths_test.go`.
 //
-// Two parts of P5.4 are still deliberately NOT here, each because it needs a
-// mechanism this slice does not have, and each carries a deferral-ledger row.
-// (The third, the parameterised NLI arm, arrived in P5.4b-ii-b-1 and lives in
-// `joinpathsnli.go`; what remains of it is Memoize and the 03 §5.2 constructor
-// binding contract, both of which need a Node rather than a Path.)
+// The arms have arrived one slice at a time and each lives beside its oracle:
+// hash and plain nested loop here (P5.4a), the parameterised NLI arm in
+// `joinpathsnli.go` (P5.4b-ii-b-1), the explicit-sort merge arm in
+// `joinpathsmerge.go` (P5.4c-i). What is still deliberately NOT generated, each
+// because it needs a mechanism the search does not yet have, and each carrying a
+// deferral-ledger row:
 //
 //   - Memoize paths — P5.4b-ii-b-2. `get_memoize_path` (joinpath.c:562) wraps
 //     an NLI inner in a cache when the outer key's distinct count is low
 //     enough that the cache pays for itself; goopg has the executor operator
 //     (`operators_memoize.go`) but no path-level eligibility or cost for it.
-//   - merge paths — P5.4c. They need explicit Sort paths and pathkey
-//     propagation, not just `mergeJoinCost`.
+//     It and the 03 §5.2 constructor binding contract both need a built Node
+//     rather than a Path, so they attach to P5.5's `createPlan` arms.
+//   - `generate_mergejoin_paths` (joinpath.c:1564) — P5.4c-ii, the merge arm
+//     that exploits an ALREADY-ordered outer instead of sorting. Dead until
+//     some path carries pathkeys, which no path in the search does yet.
 //   - the jointype gauntlet and the FULL-without-usable-clause error contract
 //     (03 §5.3). 03 §4.4 pins every outer/semi/anti construct OUTSIDE the
 //     search as an opaque `PathPrebuilt` initial rel, so the only jointype that
@@ -167,7 +171,13 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 	}
 	if !pathParamByRel(i, outer) {
 		keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
+		// PG's order inside `add_paths_to_joinrel`: `sort_inner_and_outer`
+		// (:180) before `hash_inner_and_outer` (:212). It is followed here
+		// because `addPath` keeps the INCUMBENT on an exact cost tie, so the
+		// order arms are offered in IS the tie-break, and a tie between a merge
+		// and a hash path must resolve the way PG resolves it.
 		if len(keys) > 0 {
+			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual)
 			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the

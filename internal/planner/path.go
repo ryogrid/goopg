@@ -114,8 +114,10 @@ type Path struct {
 	// join is a qual evaluated on more tuples) instead of being invisible to
 	// the search.
 	//
-	// Only a keyed operator (hash today, merge from P5.4c) fills HashKeys; a
+	// Only a keyed operator (hash, and merge since P5.4c-i) fills HashKeys; a
 	// plain nested loop keys on nothing and carries every clause in Residual.
+	// For a merge join the list is ORDERED: clauses are grouped by the sort key
+	// they serve, in the path's own pathkey order (`joinpathsmerge.go`).
 	// P5.5's createPlan reads the pair to emit the executor Join's key
 	// expressions and its residual predicate.
 	HashKeys []*restrictInfo

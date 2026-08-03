@@ -6552,14 +6552,56 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       (`internal/executor/operators_memoize.go`); what is missing is the
       path-level eligibility and cost. IMPLEMENTATION-TODO P5.4b-ii-b-2; 03
       §5.2. Bar: UNITS + SPOT + DS05.
-- [ ] **M0127-P5.4c — merge paths via pathkeys** (03 §5.3): explicit Sort
-      paths, pathkey propagation through the join, `mergeJoinCost` on equal
-      footing with hash. With them the jointype gauntlet (`nestjoinOK`,
-      joinpath.c:1833-1852) and the FULL-without-usable-clause error contract
-      (joinrels.c:961-964) become expressible — both are unreachable while 03
-      §4.4 pins every non-INNER construct outside the search, and both are
-      ledgered against this item. IMPLEMENTATION-TODO P5.4c; 03 §5.3. Bar:
-      UNITS + SPOT + DS05.
+      **↳ DEPENDENCY-DEFERRED 2026-08-04 (loop #69), not skipped.** The item's
+      own body states the blocker: both halves need a built `*Join` NODE, and
+      `createPlan` does not build one for a searched subtree until **P5.5**.
+      Per this file's own selection rule ("topmost unchecked item *unless* the
+      banner or a DEPENDENCY forces another order") loop #69 took the next
+      dependency-free P5 item instead (`P5.4c-i`). Re-select this AFTER P5.5
+      lands its `createPlan` arms; nothing else about it has changed.
+- [x] **M0127-P5.4c-i — `sort_inner_and_outer`, the merge arm that sorts BOTH
+      inputs.** **DONE 2026-08-04 (loop #69)**, `internal/planner/joinpathsmerge.go`
+      (+ `joinpaths.go`, `path.go`). PG has TWO merge arms and they need
+      different things, which is where P5.4c splits: this one
+      (joinpath.c:1357) takes the two cheapest-total paths and sorts both, so
+      it needs NOTHING from its inputs and is expressible in full today;
+      `generate_mergejoin_paths` (:1564) exploits an already-ordered outer and
+      is dead until some path carries pathkeys. Landed with it: the
+      **per-equivalence-class sort-key reduction**
+      (`select_outer_pathkeys_for_merge`, pathkeys.c:1697-1704) — at ({a,b},{c})
+      with `a.x = c.x` and `b.x = c.x` the two clauses are ONE restriction,
+      `a.x = b.x` already holds inside the outer, so one sort key orders it for
+      both while both stay merge clauses; the **pair-local key orientation**
+      (the same clause faces the other way when the sides swap, exactly as
+      `isKeyableFor`'s split does — trusting `leftKey` to be the outer operand
+      is a WRONG PLAN, not a slow one); the **one-path-per-ordering loop**
+      (:1447-1466), whose point is that this join's OUTPUT order decides whether
+      a merge above it needs a sort at all; `build_join_pathkeys`
+      (pathkeys.c:1295); and `try_mergejoin_path`'s sort-skip (:1091-1097) and
+      still-parameterised refusal (:1073-1081 — merge has no
+      `allow_star_schema_join` escape, so P5.4b-ii-b-1's "every join path is
+      unparameterised" invariant is untouched). **`PathSort` finally has a
+      producer**: the Sort is an explicit child path rather than PG's
+      `MergePath.outersortkeys` field — same plan, same cost, and what 03 §5.3
+      asks for by name. **The finding: the sort-SKIP branch is the CONSUMER
+      half of P5.4c-ii and was worth landing before its producer** — written
+      and tested here against a hand-ordered rel, it means the next slice adds
+      ordered index paths and gets the saving, instead of adding both halves of
+      an interface neither side has exercised. Still inert: no `planSelect`
+      call site, `GOOPG_PGSHAPED_DP` OFF. 3 ledger rows. Bar met: UNITS
+      (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no row
+      can move).
+- [ ] **M0127-P5.4c-ii — `generate_mergejoin_paths`** (joinpath.c:1564) inside
+      `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered
+      outer instead of sorting, with mergeclause-list truncation and the
+      materialize-inner decision. Its prerequisite is a PRODUCER of ordering —
+      neither `generateScanPaths` nor `pathparamindex.go` records an index's
+      own order today — which is why P5.4c-i landed the consumer side first.
+      Also carries the jointype gauntlet (`nestjoinOK`, joinpath.c:1833-1852)
+      and the FULL-without-usable-clause error contract (joinrels.c:961-964);
+      both stay unreachable while 03 §4.4 pins every non-INNER construct
+      outside the search, and both are ledgered. IMPLEMENTATION-TODO P5.4c-ii;
+      03 §5.3. Bar: UNITS + SPOT + DS05.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

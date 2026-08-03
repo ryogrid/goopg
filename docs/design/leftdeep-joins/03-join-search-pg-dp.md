@@ -290,6 +290,34 @@ join path and the only parameterised paths in play are base index scans.
   (`joinrels.c:961-964`). Within supported jointypes NL is always generated
   so a path always exists; usually dominated and pruned by `addPath`.
 
+**Status (P5.4c-i, 2026-08-04).** PG has TWO merge arms and they need different
+things, so P5.4c was split along that seam. The one that landed is
+`sort_inner_and_outer` (joinpath.c:1357) — `joinpathsmerge.go`: it takes the two
+cheapest-total paths, sorts BOTH, and needs nothing from the inputs, so it is
+expressible in full against the search as it stands. It brings with it the
+per-equivalence-class sort-key reduction (`select_outer_pathkeys_for_merge`,
+pathkeys.c:1697-1704 — two clauses of one class sort on ONE column and both stay
+merge clauses), the pair-local key orientation (the same clause faces the other
+way when the sides swap, exactly as `isKeyableFor`'s split does), the
+one-path-per-ordering loop (:1447-1466), the outer's ordering as the join's
+output ordering (`build_join_pathkeys`, pathkeys.c:1295), and the
+still-parameterised refusal (:1073-1081 — merge has no `allow_star_schema_join`
+escape, so P5.4b-ii-b-1's "every join path is unparameterised" invariant holds
+unchanged). `PathSort` finally has a producer: goopg makes the Sort a real child
+path rather than PG's `MergePath.outersortkeys` field, which is the same plan at
+the same cost and is what §5.3 asks for by name.
+
+The sort-SKIP branch (`try_mergejoin_path` :1091-1097) is written and tested but
+unreachable from the live search, because no path in the search carries pathkeys
+yet. That is the deliberate boundary: `generate_mergejoin_paths`
+(joinpath.c:1564), inside `match_unsorted_outer`, is the arm that exploits an
+already-ordered outer and truncates the mergeclause list to find a cheaper
+inner — it needs ordered index paths to exist first, and is **P5.4c-ii**, along
+with the jointype gauntlet and the FULL error contract above (both still
+unreachable while §4.4 pins every non-INNER construct outside the search).
+Landing the consumer first means P5.4c-ii adds a producer rather than both
+halves of an untested interface.
+
 ### 5.4 Qual placement
 Every clause attaches at the lowest level whose relids it covers — decided
 once, in path generation. The post-hoc placement passes

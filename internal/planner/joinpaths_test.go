@@ -27,18 +27,30 @@ func relsetOf(idx ...int) RelSet {
 }
 
 // equiClause is a canonical two-sided equality whose operands live on the given
-// relsets — the shape `restrictInfo` records for a hashable clause. The
-// expression itself is nil: nothing in the key/residual split reads it (P5.5's
-// createPlan is what consumes `clause`), so leaving it out keeps these tests
-// independent of the parser.
+// relsets — the shape `restrictInfo` records for a hashable clause. The operand
+// expressions are synthetic ColumnRefs keyed off the relset, which is enough for
+// every consumer at this seam: the key/residual split reads only the relsets,
+// and the merge arm reads the operands solely to compare them for identity
+// (`mergeKeyGroups`). Two clauses over the same pair therefore look like the
+// same sort key, which is what a caller wanting distinct keys must override.
 func equiClause(left, right RelSet) *restrictInfo {
 	return &restrictInfo{
 		relids:      left | right,
+		leftKey:     col(int(left)),
+		rightKey:    col(int(right)),
 		leftRelids:  left,
 		rightRelids: right,
 		isEquijoin:  true,
 		ecID:        noEquivClass,
 	}
+}
+
+// equiClauseOn is equiClause with explicit operand expressions, for the cases
+// where two clauses over one pair must be distinguishable sort keys.
+func equiClauseOn(left, right RelSet, leftCol, rightCol int) *restrictInfo {
+	ri := equiClause(left, right)
+	ri.leftKey, ri.rightKey = col(leftCol), col(rightCol)
+	return ri
 }
 
 // plainClause is a join qual with no two-sided operand split: an inequality, or
