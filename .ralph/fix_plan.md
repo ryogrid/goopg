@@ -5820,9 +5820,29 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       lead key — a row-count test cannot see this defect, the results were
       always right. **Next is P2.3, merge-join multi-column keys.**
       Progress log: design doc §6.
-- [ ] **M0127-P2.3 — merge-join multi-column keys** from the same list
+- [x] **M0127-P2.3 — merge-join multi-column keys** from the same list
       (full-key comparator; residual non-equijoin only). IMPLEMENTATION-TODO
       P2.3; 07 §2. Bar: UNITS + SPOT + DS05 + PLAN.
+      **DONE 2026-08-03.** `planner.Join.ExecMergeKeyPlan` +
+      `internal/executor/join_merge_key.go`; `mergeKeyedRow.key Datum` →
+      `keys []Datum` over one flat backing array. The planner half was
+      already P2.1's (`fillOneJoinHashKeys` fills `JoinAlgoMerge`, EXPLAIN
+      renders `Merge Cond:` over the list) — the executor was still reading
+      `plan.LeftKey`/`RightKey`, so grouping on the lead column alone made a
+      pinned lead ONE group whose cartesian product was walked pair by pair
+      (M0125-0011 / Q97 is the recorded instance; its residual re-check kept
+      the answer right at O(n·m)). Now the group IS the match set and
+      `mergeResidual` is nil on an all-equijoin join = PG's empty `joinqual`.
+      `pairIsHashSafe` governs the fold-in for merge too (same one-
+      canonicalisation-vs-opfamily question); ledger row `2026-08-03
+      M0127-P2.3` records that `compareDatum`'s `KindString` arm content-
+      sniffs (pg_lsn / UUID / composite / array literal), which the dropped
+      conjunct now widens from the lead key to every folded text pair.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 18.1 s); PLAN MATCH 22/22
+      against `m0127-p21-hashkeys` (no re-baseline needed); DS05 MISMATCH=0 /
+      CKMISMATCH=0 / ERROR=0 across all 99 (Q97 checksum unchanged; timings
+      flat vs P2.2 — no DS05 query is currently governed by this class).
+      **S2 IS CLOSED; the next M0127 selection is P3.1.**
 - [ ] **M0127-P3.1 — `chooseHashTableSize`** (shared pkg importable by planner
       and executor); goopg-width-aware (`48·c` + map overhead).
       IMPLEMENTATION-TODO P3.1; 06 §2.1; 04 §4. Bar: UNITS + SPOT.

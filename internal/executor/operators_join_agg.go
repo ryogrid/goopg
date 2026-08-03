@@ -78,6 +78,15 @@ type joinOp struct {
 	probeKeyExprs  []planner.Expr
 	execKeyPackInt bool
 	execKeyBuf     []byte
+
+	// M0127-P2.3 (07 §2): the same split for the MERGE algorithm, taken
+	// from planner.Join.ExecMergeKeyPlan by initMergeKeys. Deliberately
+	// NOT the execKeys/execResidual slots above: those are filled on the
+	// lazy-hash path only, and a joinOp runs one algorithm, so keeping the
+	// two apart makes a cross-read a compile error rather than a silent
+	// wrong-key join. See join_merge_key.go.
+	mergeKeys     []planner.JoinKeyPair
+	mergeResidual planner.Expr
 	lazyProbe    Operator         // probe side (streaming)
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
@@ -884,10 +893,15 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 	return nil
 }
 
+// mergeKeyedRow is one side's row plus its evaluated merge key TUPLE.
+//
+// M0127-P2.3 widened `key Datum` to a slice: the key is the whole
+// `Join.HashKeys` list the planner accepted for merge, not just its head. The
+// slice is a window into buildMergeSide's one flat backing array, so a
+// materialised side still costs a single allocation for all its keys.
 type mergeKeyedRow struct {
-	row    Row
-	key    Datum
-	hasKey bool
+	row  Row
+	keys []Datum
 }
 
 // runMergeJoin sorts both sides on their join keys and merges the
@@ -896,6 +910,10 @@ type mergeKeyedRow struct {
 func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
 	nullLeft := nullRow(leftWidth)
 	nullRight := nullRow(rightWidth)
+
+	// M0127-P2.3: resolve the full key list + residual before either side is
+	// keyed — both sides must produce the same key arity in the same order.
+	o.initMergeKeys()
 
 	leftKeyed, leftNull, err := o.buildMergeSide(leftRows, true, leftWidth, rightWidth)
 	if err != nil {
@@ -915,7 +933,7 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		cmp, err := compareDatum(leftKeyed[i].key, rightKeyed[j].key, o.plan.Pos())
+		cmp, err := compareMergeKeys(leftKeyed[i].keys, rightKeyed[j].keys, o.plan.Pos())
 		if err != nil {
 			return err
 		}
@@ -935,7 +953,7 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 		default:
 			li := i
 			for i < len(leftKeyed) {
-				eq, err := compareDatum(leftKeyed[li].key, leftKeyed[i].key, o.plan.Pos())
+				eq, err := compareMergeKeys(leftKeyed[li].keys, leftKeyed[i].keys, o.plan.Pos())
 				if err != nil {
 					return err
 				}
@@ -946,7 +964,7 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 			}
 			rj := j
 			for j < len(rightKeyed) {
-				eq, err := compareDatum(rightKeyed[rj].key, rightKeyed[j].key, o.plan.Pos())
+				eq, err := compareMergeKeys(rightKeyed[rj].keys, rightKeyed[j].keys, o.plan.Pos())
 				if err != nil {
 					return err
 				}
@@ -955,25 +973,30 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 				}
 				j++
 			}
-			// M0125-0011: the merge key is only the FIRST equality
-			// conjunct of the ON clause — splitEqualityForHash
-			// (internal/planner/planner.go) returns a single
-			// left/right pair and discards the rest. Every remaining
-			// conjunct is residual and MUST still be evaluated per
-			// candidate pair, exactly as PostgreSQL evaluates a merge
-			// join's joinqual once its mergeclauses have located the
-			// group (postgres/src/backend/executor/nodeMergejoin.c,
-			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)). Without this
-			// the residual was silently dropped, so a two-conjunct
-			// FULL OUTER JOIN degenerated into its single-key
-			// counterpart (TPC-DS Q97: 2131274 rows instead of
-			// 836302) and RIGHT OUTER JOIN was wrong the same way.
+			// The residual is what remains of the ON clause once the
+			// merge key has located the group — PostgreSQL's
+			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)
+			// (postgres/src/backend/executor/nodeMergejoin.c).
+			//
+			// M0125-0011 first put this check here: the merge key was
+			// only the FIRST equality conjunct, so without a per-pair
+			// re-check a two-conjunct FULL OUTER JOIN degenerated into
+			// its single-key counterpart (TPC-DS Q97: 2131274 rows
+			// instead of 836302), and RIGHT OUTER JOIN was wrong the
+			// same way. M0127-P2.3 removed the CAUSE rather than the
+			// check: the key is now the whole accepted pair list, so on
+			// an all-equijoin join mergeResidual is nil and this loop
+			// does no evaluator work at all — the group it walks is
+			// already the exact match set. A conjunct whose pair the
+			// planner declined (non-merge-safe type) or a genuinely
+			// non-equijoin conjunct still lands here, which is why the
+			// check stays.
 			leftMatched := make([]bool, i-li)
 			rightMatched := make([]bool, j-rj)
 			for a := li; a < i; a++ {
 				for b := rj; b < j; b++ {
 					joined := concatRows(leftKeyed[a].row, rightKeyed[b].row)
-					ok, perr := o.joinPredicateMatch(joined)
+					ok, perr := o.mergeResidualMatch(joined)
 					if perr != nil {
 						return perr
 					}
@@ -1044,16 +1067,24 @@ func (o *joinOp) buildMergeSide(rows []Row, isLeft bool, leftWidth, rightWidth i
 	} else {
 		paddedLeft = nullRow(leftWidth)
 	}
-	keyExpr := o.plan.RightKey
-	if isLeft {
-		keyExpr = o.plan.LeftKey
-	}
-	if keyExpr == nil {
+	keyExprs := o.mergeSideKeyExprs(isLeft)
+	if len(keyExprs) == 0 {
 		return nil, nil, fmt.Errorf("merge join key is nil")
+	}
+	for _, e := range keyExprs {
+		if e == nil {
+			return nil, nil, fmt.Errorf("merge join key is nil")
+		}
 	}
 
 	keyed := make([]mergeKeyedRow, 0, len(rows))
 	nullKey := make([]Row, 0)
+	// One flat backing array for every kept row's key tuple. Sized exactly,
+	// and never appended to, so the sub-slices handed to mergeKeyedRow can
+	// never be invalidated by a reallocation.
+	n := len(keyExprs)
+	store := make([]Datum, len(rows)*n)
+	used := 0
 	for _, row := range rows {
 		var evalRow Row
 		if isLeft {
@@ -1061,20 +1092,38 @@ func (o *joinOp) buildMergeSide(rows []Row, isLeft bool, leftWidth, rightWidth i
 		} else {
 			evalRow = concatRows(paddedLeft, row)
 		}
-		v, err := evalExpr(keyExpr, evalRow, o.ctx)
-		if err != nil {
-			return nil, nil, err
+		base := used
+		haveKey := true
+		for _, keyExpr := range keyExprs {
+			v, err := evalExpr(keyExpr, evalRow, o.ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			if v.IsNull() {
+				// A NULL in ANY key column makes that column's equality
+				// NULL, so the row can match nothing — the single-key
+				// rule applied componentwise. Before P2.3 such a row was
+				// grouped on the non-NULL leading column and then
+				// rejected by the residual; both routes reach the same
+				// emit decision (dropped for INNER, null-extended for the
+				// outer side), which is what keeps this a cost change.
+				haveKey = false
+				break
+			}
+			store[used] = v
+			used++
 		}
-		if v.IsNull() {
+		if !haveKey {
+			used = base
 			nullKey = append(nullKey, row)
 			continue
 		}
-		keyed = append(keyed, mergeKeyedRow{row: row, key: v, hasKey: true})
+		keyed = append(keyed, mergeKeyedRow{row: row, keys: store[base:used:used]})
 	}
 
 	var sortErr error
 	sort.SliceStable(keyed, func(i, j int) bool {
-		cmp, err := compareDatum(keyed[i].key, keyed[j].key, o.plan.Pos())
+		cmp, err := compareMergeKeys(keyed[i].keys, keyed[j].keys, o.plan.Pos())
 		if err != nil {
 			sortErr = err
 			return false

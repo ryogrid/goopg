@@ -103,9 +103,77 @@ func (n *Join) ExecHashKeyPlan() JoinExecKeys {
 	return out
 }
 
+// ExecMergeKeyPlan derives the MERGE join's key/residual split from the same
+// published `HashKeys` list (M0127-P2.3, design `leftdeep-joins/07` §2).
+//
+// goopg's merge join has been the single-pair shape's worst case. It sorts both
+// sides on the ONE key, then evaluates the whole `Predicate` against every pair
+// in an equal-key group — so a two-conjunct join whose leading column is
+// low-cardinality builds one enormous group and runs the group's cartesian
+// product through the interpreted evaluator. That is the same degeneracy P2.2
+// removed from hash join, except merge pays it as O(n·m) work rather than as
+// one long bucket chain. PG never faces it: `mergeclauses` is a list and
+// `MJCompare` walks all of them before declaring two tuples equal
+// (postgres/src/backend/executor/nodeMergejoin.c), leaving `joinqual` with the
+// genuinely non-equijoin conjuncts only.
+//
+// Why the hash-safety predicate governs here too. The executor's merge
+// comparator is `compareDatum`, not a type's btree opclass, so the fold-in
+// question is again "does goopg's one canonicalisation answer the same question
+// as `=`". `pairIsHashSafe`'s rule — both sides resolve to the SAME whitelisted
+// scalar type, with the machine-integer family treated as one — is exactly the
+// set for which `compareDatum` returns 0 iff the operator is true: numeric goes
+// through `numericCmp`, the int lane through `Int`, bytea through
+// `bytes.Compare`, timestamps through the `KindTime` arm. The types that would
+// break it (float's `-0.0`, bpchar's trailing spaces, arrays, composites) are
+// already excluded there for the identical reason, so a second whitelist would
+// be a second thing to keep in sync rather than a sharper rule.
+//
+// `Int64Keys` is left false: it selects the hash path's fixed-width packing,
+// which has no analogue in a comparator-driven merge.
+func (n *Join) ExecMergeKeyPlan() JoinExecKeys {
+	out := JoinExecKeys{}
+	if n == nil {
+		return out
+	}
+	out.Residual = n.Predicate
+	if n.LeftKey == nil || n.RightKey == nil {
+		return out
+	}
+	pairs := n.HashKeys
+	if len(pairs) == 0 {
+		// A merge join assembled outside Plan()'s tail never saw
+		// fillJoinHashKeys; fall back to the pair it has always sorted on.
+		pairs = []JoinKeyPair{{Left: n.LeftKey, Right: n.RightKey}}
+	}
+	if n.NullAware && len(pairs) > 1 {
+		// Same conservatism as the hash plan: the three-valued-NULL
+		// bookkeeping of `NOT IN` is defined over one key column.
+		pairs = pairs[:1]
+	}
+	keys := make([]JoinKeyPair, 0, len(pairs))
+	safe := make([]JoinKeyPair, 0, len(pairs))
+	for i, p := range pairs {
+		mergeSafe := n.pairIsHashSafe(p)
+		if i == 0 || mergeSafe {
+			// Keys[0] leads unconditionally: it is the pair goopg has
+			// sorted on since M0003, and an exotic-typed lead key keeps
+			// its per-pair residual re-check exactly as today.
+			keys = append(keys, p)
+		}
+		if mergeSafe {
+			safe = append(safe, p)
+		}
+	}
+	out.Keys = keys
+	out.Residual = n.residualExcluding(safe)
+	return out
+}
+
 // pairIsHashSafe reports whether folding this equi-pair into the hash key is
 // equality-exact — i.e. whether `datumKey(l) == datumKey(r)` is the same
-// question as `l = r`.
+// question as `l = r`. `ExecMergeKeyPlan` reuses it for the merge comparator;
+// the doc comment there explains why the same set answers both questions.
 //
 // The rule is "both sides resolve to the SAME scalar type, and that type is on
 // the whitelist", with the machine-integer family treated as one type because
