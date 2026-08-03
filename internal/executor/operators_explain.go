@@ -512,6 +512,31 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
+	case *planner.Join:
+		// M0127-P2.1: render the join's equi-key list, upstream's
+		// `Hash Cond:` / `Merge Cond:`. explain.c reaches these through
+		// show_upper_qual (T_HashJoin → hashclauses, T_MergeJoin →
+		// mergeclauses), which is why `qualify` — the rtable_size > 1
+		// rule — is the right prefixing decision here and not the
+		// scan-node one.
+		//
+		// goopg emitted NO condition line for joins at all before this,
+		// so a plan's key choice was invisible in EXPLAIN — the very
+		// property M0125-0035b's degeneracy bug turned on (a
+		// constant-pinned key column produced a PG-identical-looking
+		// plan that ran quadratically). The list now shows every pair
+		// the planner found, so `Hash Cond: ((a = b) AND (c = d))` is
+		// readable against PG's own output for the same query.
+		if cond := formatJoinKeyCond(p, reg, qualify); cond != "" {
+			label := "Hash Cond: "
+			if p.Algo == planner.JoinAlgoMerge {
+				label = "Merge Cond: "
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + label + cond)})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 	case *planner.NestedLoopIndexJoin:
 		// The NLI's residual predicate (conjuncts the index probe does not
 		// enforce — hoisted inner filters, OR-factoring residuals,
@@ -548,6 +573,45 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	}
+}
+
+// formatJoinKeyCond renders a hash/merge join's key list the way
+// upstream's show_qual does: each pair as its own parenthesised
+// equality, and — when there is more than one — the whole list
+// re-parenthesised as an explicit AND chain (make_ands_explicit).
+// A single pair therefore reads `(a.x = b.x)` and two read
+// `((a.x = b.x) AND (a.y = b.y))`, matching PG byte for byte.
+//
+// Falls back to the single (LeftKey, RightKey) pair when HashKeys is
+// empty — a join built outside Plan()'s tail never gets the list, and an
+// unrendered condition would be a silent regression against the pre-P2.1
+// output for exactly those plans.
+func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
+	if p.Algo != planner.JoinAlgoHash && p.Algo != planner.JoinAlgoMerge {
+		return ""
+	}
+	pairs := p.HashKeys
+	if len(pairs) == 0 {
+		if p.LeftKey == nil || p.RightKey == nil {
+			return ""
+		}
+		pairs = []planner.JoinKeyPair{{Left: p.LeftKey, Right: p.RightKey}}
+	}
+	parts := make([]string, 0, len(pairs))
+	for _, k := range pairs {
+		if k.Left == nil || k.Right == nil {
+			continue
+		}
+		parts = append(parts, formatExprQual(
+			&planner.BinaryOp{Op: parser.OpEq, Left: k.Left, Right: k.Right}, reg, qualify))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
 }
 
 // formatIndexCond renders the equality / range condition of an

@@ -5733,11 +5733,50 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       the cold one within 7.1 % on every query > 0.5 s, and S1 is compared
       against the warm one. 22/22 complete in all three arms, row counts
       identical across arms and to R0. No code landed. **P2 may start.**
-- [ ] **M0127-P2.1 — `planner.Join.HashKeys []JoinKeyPair`.** Search/pushdown
+- [x] **M0127-P2.1 — `planner.Join.HashKeys []JoinKeyPair`.** Search/pushdown
       fills all equality conjuncts; residual keeps non-equijoin only; EXPLAIN
       key-list rendering; plan-snapshot re-baseline same commit.
       IMPLEMENTATION-TODO P2.1; 05 §5 (E4 planner side). Bar: UNITS + SPOT +
       DS05 + PLAN (snapshot diff reviewed).
+      **↳ DONE 2026-08-03.** `JoinKeyPair` + `Join.HashKeys` publish EVERY
+      usable equi-pair (PG's `hashclauses`/`mergeclauses`), where goopg has
+      carried exactly one pair since M0003. New
+      `internal/planner/join_hash_keys.go`. **The list is derived by ONE late
+      pass at the tail of `Plan()`, not filled at the nine construction
+      sites** — six later passes rewrite key/predicate expressions in place
+      (`reresolveJoinByName`'s predRebind, bushy `subRemap`, `FoldConstants`,
+      `lowerSubPlanParams`, qual placement, `reselectDegenerateHashKeys`), so
+      an early field is one all six must maintain, and the one time that was
+      missed a shared ColumnRef pointer got mutated under the keys
+      (M0097-0060). `HashKeys[0]` is `(LeftKey, RightKey)` **by pointer**;
+      extras are cloned. `splitEqualityForHash` now delegates to the shared
+      `forEachEqualityForHash` core (behaviour byte-identical), so the
+      single-pair and full-list views cannot drift —
+      `TestSplitEqualityForHashMatchesFirstPair` is the anti-drift guard.
+      `(*Join).Residual()` is the non-equijoin projection P2.2 consumes.
+      EXPLAIN grew `Hash Cond:` / `Merge Cond:` (`formatJoinKeyCond`),
+      upstream's `show_upper_qual` shape incl. the `rtable_size > 1`
+      prefixing rule and `make_ands_explicit`'s `((a = b) AND (c = d))` —
+      goopg emitted NO join condition line at all before this, which is why
+      M0125-0035b's degeneracy bug looked PG-identical while running
+      quadratically. **`Predicate` is deliberately NOT trimmed** (the
+      executor is still single-key; trimming would drop the second equality
+      from enforcement) — ledger row `2026-08-03 M0127-P2.1`, discharged by
+      P2.2. Gates: **PLAN re-baseline `plan_snapshots/m0127-p21-hashkeys.txt`
+      — IDENTICAL to `m0125-0002-c7-after` once the new key-condition lines
+      are filtered out, i.e. ZERO plan-shape change across all 22 TPC-H
+      queries**; 61 `Hash Cond:` lines, **2 true multi-column lists** (Q9's
+      and Q20's partsupp⋈lineitem, the exact shape M-NIGHTLY
+      tpch/Q20-timeout named). UNITS PASS. SPOT PASS (Q12=2 / Q13=35, 15.6 s
+      query phase, peak 10,230 MB). **DS05 MISMATCH=0 / CKMISMATCH=0 /
+      ERROR=0 across all 99** (Q1-Q72 `sweep-20260803-162954.txt` 67 PASS +
+      Q73-Q99 `sweep-20260803-171238.txt` 26 PASS; the tail is a stamped
+      subset probe after the same post-TIMEOUT `systemd-run` scope collision
+      P0.3/P1.1 hit; Q47/Q72 = the known 300 s boundary pair). SMOKE via the
+      commit hook. `TestExprSwitchInventoryIsPinned` (M0125-0001's RC-1a
+      gate) forced the sublink descent onto `walkExprRefs` + `scopeDescend`
+      instead of a hand-written 5-arm Expr switch. **Next is P2.2, the
+      executor half of the sibling pair.** Progress log: design doc §6.
 - [ ] **M0127-P2.2 — executor composite keys.** All-int64 fixed-width pack;
       mixed → concatenated `datumKey`. **Delete `reselectDegenerateHashKeys` +
       its planner pass (same commit)**; add a Q78-class degeneracy regression

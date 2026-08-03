@@ -832,6 +832,16 @@ type Join struct {
 	Predicate Expr
 	LeftKey   Expr // populated when Algo == JoinAlgoHash
 	RightKey  Expr
+	// HashKeys holds EVERY usable equi-pair of this join, not just the
+	// one (LeftKey, RightKey) the executor currently hashes on — PG's
+	// `hashclauses` / `mergeclauses` list. HashKeys[0] IS
+	// (LeftKey, RightKey), by pointer. Populated for JoinAlgoHash and
+	// JoinAlgoMerge by fillJoinHashKeys, a single late pass at the tail
+	// of Plan() (see join_hash_keys.go for why it is derived once at the
+	// end rather than maintained at the nine construction sites). Empty
+	// means "no list available" and every consumer must fall back to the
+	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
+	HashKeys  []JoinKeyPair
 	BuildLeft bool // hash join: build on left input instead of right
 	// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
 	// indices (relative to the merged schema) of the USING

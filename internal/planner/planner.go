@@ -121,7 +121,16 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	// OuterColumnRef — and BEFORE lowering, which is what would otherwise
 	// bind that correlation to a PARAM_EXEC slot.
 	node = rewriteExistsToAny(node)
-	return lowerSubPlanParams(node), nil
+	node = lowerSubPlanParams(node)
+	// M0127-P2.1: publish every hash/merge join's FULL equi-pair list on
+	// Join.HashKeys. Deliberately the LAST thing Plan() does — the list
+	// aliases expressions the passes above rewrite in place, so deriving
+	// it after the final rewriter (lowerSubPlanParams, which rebinds
+	// correlated refs to PARAM_EXEC slots) is what makes staleness
+	// impossible rather than a maintenance obligation on every pass.
+	// See join_hash_keys.go.
+	fillJoinHashKeys(node)
+	return node, nil
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
@@ -5247,22 +5256,24 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 // l_partkey, l_suppkey)`) forced a Nested Loop that recomputed the
 // GROUP BY aggregate once per outer partsupp row (M-NIGHTLY
 // tpch/Q20-timeout).
+//
+// M0127-P2.1: the conjunct walk itself now lives in
+// `forEachEqualityForHash` (join_hash_keys.go), which
+// `splitAllEqualitiesForHash` uses to publish the FULL pair list on
+// `Join.HashKeys`. Stopping at the first pair here keeps this function's
+// behaviour byte-identical to its pre-P2.1 form, and sharing the core
+// means the single-pair and full-list views cannot drift apart about
+// what counts as a hash key.
 func splitEqualityForHash(pred Expr, leftWidth int) (Expr, Expr, bool) {
-	for _, conjunct := range splitAnd(pred) {
-		bin, ok := conjunct.(*BinaryOp)
-		if !ok || bin.Op != parser.OpEq {
-			continue
-		}
-		lSide := exprSide(bin.Left, leftWidth)
-		rSide := exprSide(bin.Right, leftWidth)
-		switch {
-		case lSide == sideLeft && rSide == sideRight:
-			return bin.Left, bin.Right, true
-		case lSide == sideRight && rSide == sideLeft:
-			return bin.Right, bin.Left, true
-		}
+	var l, r Expr
+	forEachEqualityForHash(pred, leftWidth, func(le, re Expr) bool {
+		l, r = le, re
+		return false
+	})
+	if l == nil {
+		return nil, nil, false
 	}
-	return nil, nil, false
+	return l, r, true
 }
 
 type joinSide int
