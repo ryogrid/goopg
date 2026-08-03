@@ -18,16 +18,16 @@ package planner
 // nothing calls this from `planSelect` yet either, and `GOOPG_PGSHAPED_DP`
 // stays OFF; it is validated in isolation by `joinpaths_test.go`.
 //
-// Three parts of P5.4 are deliberately NOT here, each because it needs a
-// mechanism this slice does not have, and each carries a deferral-ledger row:
+// Two parts of P5.4 are still deliberately NOT here, each because it needs a
+// mechanism this slice does not have, and each carries a deferral-ledger row.
+// (The third, the parameterised NLI arm, arrived in P5.4b-ii-b-1 and lives in
+// `joinpathsnli.go`; what remains of it is Memoize and the 03 §5.2 constructor
+// binding contract, both of which need a Node rather than a Path.)
 //
-//   - parameterised NLI + Memoize PATHS — P5.4b-ii. `generateNLIPath`
-//     (pathgen.go) is the primitive waiting for it; the binding contract of
-//     03 §5.2 (shared eligibility with `tryBuildNLI`) is what that slice must
-//     establish, and it also needs P5.1's deferred parameterised base index
-//     paths before an inner can be parameterised at all. The 03 §9
-//     DISCIPLINE those paths require landed ahead of them in P5.4b-i — see
-//     `pathparam.go` and the PATH_PARAM_BY_REL refusal below.
+//   - Memoize paths — P5.4b-ii-b-2. `get_memoize_path` (joinpath.c:562) wraps
+//     an NLI inner in a cache when the outer key's distinct count is low
+//     enough that the cache pays for itself; goopg has the executor operator
+//     (`operators_memoize.go`) but no path-level eligibility or cost for it.
 //   - merge paths — P5.4c. They need explicit Sort paths and pathkey
 //     propagation, not just `mergeJoinCost`.
 //   - the jointype gauntlet and the FULL-without-usable-clause error contract
@@ -153,20 +153,19 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 	//     could bind it but would cost it wrongly, rescanning the inner from
 	//     scratch as though the parameter were free, so PG drops it from THIS
 	//     arm (:1874) and reconsiders it through `cheapest_parameterized_paths`
-	//     in the NLI arm — which is P5.4b-ii's.
+	//     in the NLI arm — `addNLIPaths` (joinpathsnli.go), landed in
+	//     P5.4b-ii-b-1.
 	//
-	// Consequence, stated so it is not discovered later: until that NLI arm
-	// exists, a pair whose inner cheapest-total is parameterised by the outer
-	// yields NO path from this function. Unreachable today, because nothing
-	// generates a parameterised path yet — which is exactly why the discipline
-	// is landed ahead of the paths instead of behind them. A
-	// parameterisation-blind consumer meeting its first parameterised path
-	// does not produce a slow plan, it produces an unbuildable one.
+	// The two refusals therefore have DIFFERENT scopes, which is why PG writes
+	// them as an early `return` and a nulled-out variable rather than as one
+	// condition: an outer parameterised by the inner kills this direction
+	// outright, while an inner parameterised by the outer kills only the hash
+	// and plain-NL arms and is precisely what the NLI arm is for.
 	o, i := outer.CheapestTotal, inner.CheapestTotal
-	outerNeedsInner := pathParamByRel(o, inner)
-	innerNeedsOuter := pathParamByRel(i, outer)
-
-	if !outerNeedsInner && !innerNeedsOuter {
+	if pathParamByRel(o, inner) {
+		return nil
+	}
+	if !pathParamByRel(i, outer) {
 		keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
 		if len(keys) > 0 {
 			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
@@ -177,5 +176,9 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 		// the input order.
 		addNestLoopPath(joinrel, outer, inner, cp, clauses)
 	}
+	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
+	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
+	// admits — which under 03 §4.4's INNER-only pin is all of them.
+	addNLIPaths(joinrel, outer, inner, cp, clauses)
 	return nil
 }

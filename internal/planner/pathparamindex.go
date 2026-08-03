@@ -91,27 +91,103 @@ func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramInde
 	return out
 }
 
-// consideredParameterizations is PG's `considered_relids` list
-// (indxpath.c:446-:544) at the fidelity this slice implements: one candidate
-// parameterisation per DISTINCT outer relset among the usable clauses, in first
-// -appearance order so path generation is deterministic.
+// consideredParameterizations is PG's `considered_relids` list, built by
+// `consider_index_join_outer_rels` (indxpath.c:503-591): every candidate outer
+// relset worth offering the index, which is each clause's own outer relids PLUS
+// the union of that clause's relids with each set already considered.
 //
-// PG then extends the list with the pairwise UNIONS of the sets already
-// considered (`consider_index_join_outer_rels`, :541-:544), which is how a
-// two-column index whose keys come from two different outer rels gets a path.
-// goopg stops at the singletons; the omission is ledgered against P5.4b-ii-b,
-// where the NLI arm that would consume such a path lands.
+// The unions are what make a COMPOSITE index reachable from a join. A
+// two-column index whose columns are equated to two DIFFERENT outer rels — the
+// composite-FK shape, `lineitem(l_partkey, l_suppkey)` probed from `part` and
+// `supplier` — has no single clause that binds it, so a singleton-only list
+// offers the index two half-bound key sets and
+// `pickIndexCoveringAllLeadingColumns` correctly declines both. Only the union
+// {part, supplier} binds the whole key. This half was ledgered against
+// P5.4b-ii-b, deliberately: until the NLI arm existed to consume a
+// parameterised path, the extra sets would have been generated, priced, and
+// never read. It lands with the arm.
+//
+// Three details of PG's loop are reproduced because each is load-bearing:
+//
+//   - The unions are generated against a SNAPSHOT of the list (PG's
+//     `num_considered_relids`, :540), not against the growing list. Unions of
+//     unions are already covered by pairing the newest clause with each
+//     earlier singleton, and iterating the live list would compound
+//     exponentially.
+//   - A pair where one set contains the other is skipped (`bms_subset_compare
+//     != BMS_DIFFERENT`, :552): the union is then just the larger set, already
+//     present.
+//   - The equivalence-class skip (:562, `eclassAlreadyUsed` below).
+//   - The `10 * considered_clauses` valve (:571): PG stops COMBINING once the
+//     list outgrows the number of clauses that produced it, but still offers
+//     each clause's own set. goopg's ceiling of 16 relations makes the valve
+//     nearly unreachable, but reproducing it keeps the path count bounded by
+//     the same arithmetic PG's is.
+//
+// The order is PG's — for each clause, its unions with earlier sets first, then
+// the clause's own set — so path generation stays deterministic.
+//
+// Representation note: PG's `considered_relids` entries INCLUDE the indexed rel
+// itself (they are maximal `clause_relids` sets), while goopg's carry only the
+// outer part. The two differ by the same constant rel in every entry, so subset
+// and union comparisons agree; keeping the rel out is what lets the result be
+// used directly as a `RequiredOuter`.
 func consideredParameterizations(cands []paramIndexClause) []RelSet {
 	var out []RelSet
 	seen := make(map[RelSet]bool, len(cands))
-	for _, c := range cands {
+	add := func(rels RelSet) {
+		if rels == 0 || seen[rels] {
+			return
+		}
+		seen[rels] = true
+		out = append(out, rels)
+	}
+	for n, c := range cands {
 		if seen[c.outerRels] {
 			continue
 		}
-		seen[c.outerRels] = true
-		out = append(out, c.outerRels)
+		snapshot := len(out)
+		for pos := 0; pos < snapshot; pos++ {
+			old := out[pos]
+			if relsSubset(c.outerRels, old) || relsSubset(old, c.outerRels) {
+				continue
+			}
+			if eclassAlreadyUsed(c.ri.ecID, old, cands) {
+				continue
+			}
+			// `n+1` clauses have been considered by the time this one is
+			// processed, mirroring PG's running `considered_clauses`.
+			if len(out) >= 10*(n+1) {
+				break
+			}
+			add(c.outerRels | old)
+		}
+		add(c.outerRels)
 	}
 	return out
+}
+
+// eclassAlreadyUsed is `eclass_already_used` (indxpath.c:600): would combining
+// this clause with `oldRels` produce a usefully different parameterisation, or
+// is some OTHER clause from the same equivalence class already usable at
+// `oldRels`?
+//
+// The case it prevents: `a.x = c.x` and `b.x = c.x` are one equivalence class,
+// so at a parameterisation of {a} the rel `c` is already probed on column `x`.
+// Offering {a,b} as well would generate a second path with a strictly larger
+// `RequiredOuter` and the same index key set — dominated, but only after being
+// built and priced, and a needless extra parameterisation for every join level
+// above to consider.
+func eclassAlreadyUsed(ecID int, oldRels RelSet, cands []paramIndexClause) bool {
+	if ecID == noEquivClass {
+		return false
+	}
+	for _, c := range cands {
+		if c.ri != nil && c.ri.ecID == ecID && relsSubset(c.outerRels, oldRels) {
+			return true
+		}
+	}
+	return false
 }
 
 // addParameterizedIndexPaths is `create_index_paths`' join half for every base

@@ -220,11 +220,23 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		if err := addPathsToJoinrel(joinrel, outer, inner, nil, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
-		// Hash refuses it outright; the plain nested loop declines because it
-		// would mis-cost the rescan. The NLI arm that DOES accept this shape is
-		// P5.4b-ii's, so today the answer is legitimately "no path here".
-		if len(joinrel.Pathlist) != 0 {
-			t.Fatalf("got %d paths, want 0 until the P5.4b-ii NLI arm lands", len(joinrel.Pathlist))
+		// Hash refuses it outright and the plain nested loop declines because
+		// it would mis-cost the rescan — but this is exactly the shape the NLI
+		// arm exists for, and since P5.4b-ii-b-1 that arm supplies the one
+		// path. Between P5.4b-i and that slice this assertion read "want 0";
+		// the hole was knowingly opened and is now closed.
+		if len(joinrel.Pathlist) != 1 {
+			t.Fatalf("got %d paths, want exactly the NLI path", len(joinrel.Pathlist))
+		}
+		p := joinrel.Pathlist[0]
+		if p.Kind != PathNestLoop {
+			t.Fatalf("got kind %v, want PathNestLoop: PG has no separate NLI path type", p.Kind)
+		}
+		if p.RequiredOuter != 0 {
+			t.Fatalf("got RequiredOuter %#04b, want 0: the nested loop discharges the inner's parameterisation", p.RequiredOuter)
+		}
+		if len(p.Children) != 2 || p.Children[1].RequiredOuter != relA {
+			t.Fatal("the NLI path's inner child must be the parameterised path itself")
 		}
 	})
 

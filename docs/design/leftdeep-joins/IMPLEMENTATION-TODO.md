@@ -325,13 +325,34 @@
   constructor's own function: the first half of §5.2's binding contract.
   Still inert — no `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger
   rows. UNITS PASS.)*
-- [ ] **P5.4b-ii-b** Parameterised JOIN paths: the NLI arm of
-  `add_paths_to_joinrel` over `inner.CheapestParameterized`
-  (joinpath.c:1874-2010) + Memoize (`get_memoize_path`, :562). NLI binding
-  contract: shared eligibility fn with `tryBuildNLI`; constructor failure on a
-  DP-chosen path = loud planner error. This is what makes the pair P5.4b-i
-  deliberately left pathless — inner cheapest-total parameterised by the outer
-  — reachable again.
+- [x] **P5.4b-ii-b-1** Parameterised JOIN paths: the NLI arm itself.
+  *(DONE 2026-08-04 — `internal/planner/joinpathsnli.go`
+  (+ `joinpaths.go`, `pathparamindex.go`, `pathgen.go`).
+  `match_unsorted_outer`'s loop over `innerrel->cheapest_parameterized_paths`
+  (joinpath.c:1949-1975), `try_nestloop_path`'s admission test (:882-889) with
+  `allow_star_schema_join` (:363) and the constant-empty `param_source_rels`
+  that 03 §4.4's INNER-only pin derives, and `create_nestloop_path`'s
+  restrict-clause drop (pathnode.c:2478-2500) so a clause already enforced as
+  an index qual is not charged again on the cross product. This CLOSES the
+  hole P5.4b-i knowingly opened: a pair whose inner cheapest-total is
+  parameterised by the outer had no path at all, and now has exactly the one
+  PG recovers here. `addPathsToJoinrel`'s two PATH_PARAM_BY_REL refusals were
+  split apart to match PG's control flow — an outer parameterised by the inner
+  kills the direction outright, an inner parameterised by the outer kills only
+  the hash and plain-NL arms. Also landed: PG's pairwise-UNION
+  parameterisations (`consider_index_join_outer_rels`, indxpath.c:531-583,
+  with the snapshot rule, the subset skip, the equivalence-class skip and the
+  `10 * considered_clauses` valve), which is what finally binds a COMPOSITE
+  index from two different outer rels — the ii-a ledger row's deferral, landed
+  with its consumer as planned. The C1-era `generateNLIPath` is RETIRED: it
+  charged a flat `indexProbeCost` per outer row regardless of the inner path,
+  and one NLI constructor is the §5.2 rule. Still inert — no `planSelect` call
+  site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger rows. UNITS PASS.)*
+- [ ] **P5.4b-ii-b-2** Memoize paths (`get_memoize_path`, joinpath.c:562) and
+  the §5.2 constructor binding contract: shared eligibility fn with
+  `tryBuildNLI`; constructor failure on a DP-chosen path = loud planner error.
+  Both need a Node rather than a Path — `tryBuildNLI` analyses a built `*Join`
+  — so they bind to P5.5's `createPlan` arms, not to path generation.
 - [ ] **P5.4c** Merge paths via pathkeys (03 §5.3): explicit Sort paths,
   pathkey propagation through the join, `mergeJoinCost` on equal footing.
   With them the jointype gauntlet and the FULL-without-usable-clause error

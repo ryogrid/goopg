@@ -6508,22 +6508,50 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       contract. Still inert: no `planSelect` call site, `GOOPG_PGSHAPED_DP`
       OFF. 2 ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no call
       site, flag OFF, so no plan and no row can move).
-- [ ] **M0127-P5.4b-ii-b — parameterised JOIN paths:** the NLI arm of
-      `add_paths_to_joinrel` over `inner.CheapestParameterized`
-      (joinpath.c:1874-2010) + Memoize (`get_memoize_path`, :562). NLI
-      binding contract: shared eligibility fn with `tryBuildNLI`; constructor
-      failure on a DP-chosen path = loud planner error. Its input now exists
-      (P5.4b-ii-a) and the discipline governing it already does (P5.4b-i), so
-      this slice adds one arm rather than arm + paths + rules. It is also what
-      makes the pair P5.4b-i deliberately left pathless reachable again: a
-      pair whose inner cheapest-total is parameterised by the outer yields NO
-      path from `addPathsToJoinrel` today, and PG recovers it precisely here
-      (:1874 drops it from the plain-NL arm because that arm would mis-cost
-      the rescan). Also due here: PG's pairwise-union parameterisations
-      (`consider_index_join_outer_rels`, indxpath.c:541) and
-      `generateNLIPath` reading the inner PATH's cost as the rescan cost
-      instead of a bare `indexProbeCost` — both ledgered against this item.
-      IMPLEMENTATION-TODO P5.4b-ii-b; 03 §5.2. Bar: UNITS + SPOT + DS05.
+- [x] **M0127-P5.4b-ii-b-1 — parameterised JOIN paths: the NLI arm.**
+      **DONE 2026-08-04 (loop #68)**, `internal/planner/joinpathsnli.go`
+      (+ `joinpaths.go`, `pathparamindex.go`, `pathgen.go`).
+      `match_unsorted_outer`'s loop over
+      `innerrel->cheapest_parameterized_paths` (joinpath.c:1949-1975),
+      `try_nestloop_path`'s admission test (:882-889) with
+      `allow_star_schema_join` (:363), and `create_nestloop_path`'s
+      restrict-clause drop (pathnode.c:2478-2500). **It closes the hole
+      P5.4b-i knowingly opened**: a pair whose inner cheapest-total is
+      parameterised by the outer had NO path at all, and now has exactly the
+      one PG recovers here — hash cannot bind the parameter and a plain nested
+      loop would price the rescan as if it were free, which is why PG drops
+      the pair at :1874 specifically to re-cost it from the inner PATH's own
+      cost. `addPathsToJoinrel`'s two PATH_PARAM_BY_REL refusals were split to
+      match PG's control flow: they have different scopes and folding them
+      into one condition was what hid the arm-shaped hole. Also landed, from
+      the ii-a ledger row: PG's **pairwise-union parameterisations**
+      (`consider_index_join_outer_rels`, indxpath.c:531-583 — snapshot rule,
+      subset skip, equivalence-class skip, `10 * considered_clauses` valve),
+      which is the only way a COMPOSITE index equated to two DIFFERENT outer
+      rels is ever fully bound. **The C1-era `generateNLIPath` is RETIRED** —
+      it charged a flat `indexProbeCost` per outer row regardless of which
+      inner path was rescanned, and two NLI path constructors is exactly the
+      drift 03 §5.2's one-constructor rule forbids. **The finding: admitting
+      only fully-discharged parameterisations buys an invariant the rest of
+      the search silently leans on** — every JOIN path in the search is
+      unparameterised, so `Path.Rows == Rel.Rows` for every join path and the
+      only parameterised paths in play are base index scans, which is what
+      lets `addNestLoopPath`/`addHashJoinPath` set `Rows: joinRel.Rows`
+      without a `ppi_rows` of their own. Still inert: no `planSelect` call
+      site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger rows. Bar met: UNITS
+      (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no
+      row can move).
+- [ ] **M0127-P5.4b-ii-b-2 — Memoize paths + the §5.2 binding contract:**
+      `get_memoize_path` (joinpath.c:562) — wrap an NLI inner in a cache when
+      the outer key's distinct count makes it pay — plus the NLI binding
+      contract (shared eligibility fn with `tryBuildNLI`; constructor failure
+      on a DP-chosen path = loud planner error). Split out of P5.4b-ii-b
+      because both need a built `*Join` NODE rather than a Path —
+      `tryBuildNLI` analyses one — so they attach to P5.5's `createPlan` arms,
+      not to path generation. goopg already has the executor operator
+      (`internal/executor/operators_memoize.go`); what is missing is the
+      path-level eligibility and cost. IMPLEMENTATION-TODO P5.4b-ii-b-2; 03
+      §5.2. Bar: UNITS + SPOT + DS05.
 - [ ] **M0127-P5.4c — merge paths via pathkeys** (03 §5.3): explicit Sort
       paths, pathkey propagation through the join, `mergeJoinCost` on equal
       footing with hash. With them the jointype gauntlet (`nestjoinOK`,

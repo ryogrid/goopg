@@ -255,6 +255,27 @@ class this architecture exists to kill). `nliEnabled` /
 `enable_nestloop_index` act at **path generation only** for searched joins —
 never as construction-time declines.
 
+**Status (P5.4b-ii-b-1, 2026-08-04).** The arm exists:
+`addNLIPaths` (`internal/planner/joinpathsnli.go`) iterates
+`inner.CheapestParameterized` and prices the rescan from the parameterised
+inner PATH's own cost, which is PG's `cost_rescan` for an index scan and the
+reason PG moves this pair out of the plain-nestloop arm (joinpath.c:1874)
+instead of costing it there. Two things named above are NOT in it and are
+P5.4b-ii-b-2's: **Memoize**, and the **binding contract** — both need a built
+`*Join` Node, since `tryBuildNLI` analyses one, so they attach to P5.5's
+`createPlan` arms rather than to path generation. The half of the contract that
+IS expressible on paths landed in P5.4b-ii-a: index eligibility goes through
+`pickIndexCoveringAllLeadingColumns`, the constructor's own function.
+
+One further gap is deliberate and sized rather than forgotten: PG admits a
+still-parameterised JOIN path in the star-schema case
+(`allow_star_schema_join`), and such a path needs its own `ppi_rows` from
+`get_parameterized_joinrel_size` (costsize.c:5473). goopg's joinrel sizer is
+P5.6's, so the arm admits only fully-discharged parameterisations for now. That
+restriction buys an invariant the rest of the search leans on: **every join path
+in the search is unparameterised**, so `Path.Rows == Rel.Rows` holds for every
+join path and the only parameterised paths in play are base index scans.
+
 ### 5.3 Merge join / plain nested loop
 - Merge path when both sides can be sorted on the key (explicit Sort paths;
   pathkey propagation via the existing `pathkeys.go`); required for

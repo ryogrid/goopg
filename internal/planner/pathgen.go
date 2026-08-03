@@ -135,43 +135,15 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, key
 	addHashJoinPath(joinRel, inner, outer, cp, keys, residual)
 }
 
-// generateNLIPath adds a nested-loop-index-join path to joinRel: for each outer
-// row, one index probe of the inner. `inner` must be a base relation the executor
-// can index-probe on the join key (the DP checks this before calling, matching
-// rewriteJoinsToNLI's conversion conditions, nl_index_join.go). It is cheap only
-// when the outer side is small — for a large outer this cost is correctly ruinous,
-// which is what a binary-hash-only cost model could not see (ch. 07 §4.5). The
-// path is parameterized by the inner's index dependency on the outer key,
-// design ch. 03 §3.1.
-//
-// Parameterisation (M0127-P5.4b-i, leftdeep-joins 03 §9): this path used to
-// declare `RequiredOuter: inner.Relids`, which was wrong in both directions.
-// RequiredOuter is what a path still needs from ABOVE, not what it consumes
-// below; and `inner.Relids` names a relation this join CONTAINS, which no path
-// over `joinRel` can ever require. What is actually parameterised is the inner
-// INDEX path (by the outer's key column) — and a nested loop is the operator
-// that discharges exactly that, so the join above it is typically
-// unparameterised. `calc_nestloop_required_outer` (pathnode.c:2592) is that
-// subtraction, and it is what lets an NLI subtree be a hash-join input under
-// §9 rule 2 instead of being refused by it.
-//
-// Until P5.4b-ii gives the inner a genuinely parameterised index path (which
-// needs P5.1's deferred parameterised base index paths), `i.RequiredOuter` is
-// zero and this correctly reduces to the outer's own parameterisation.
-func generateNLIPath(joinRel, outer, inner *RelOptInfo, cp costParams) {
-	o, i := outer.CheapestTotal, inner.CheapestTotal
-	if o == nil || i == nil {
-		return
-	}
-	addPath(joinRel, &Path{
-		Kind:          PathNestLoop,
-		Rel:           joinRel,
-		Rows:          joinRel.Rows,
-		Cost:          nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinRel.Rows, indexProbeCost(cp)),
-		Children:      []*Path{o, i},
-		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
-	})
-}
+// The C1-era `generateNLIPath` used to live here. It was retired by
+// M0127-P5.4b-ii-b-1: it priced every rescan at a flat `indexProbeCost`
+// regardless of which inner path was actually being rescanned, which was the
+// best a path-level NLI could do while no inner could be parameterised. The
+// real arm is `addNLIPaths` (joinpathsnli.go), which reads the parameterised
+// inner PATH's own cost — PG's `cost_rescan` — and there is deliberately only
+// one NLI path constructor now, for the same reason 03 §5.2 insists on one
+// operator constructor: two of them drift, and the drift is invisible until a
+// plan is costed by one and built by the other.
 
 // generateMultiHashJoinPath adds a MultiHashJoin path to joinRel over one driving
 // (probe) rel and several dimension (build) rels, under the ch. 06 §4.1
