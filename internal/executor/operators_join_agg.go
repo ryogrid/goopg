@@ -60,6 +60,24 @@ type joinOp struct {
 	// column yields a datum that is not int64-representable.
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
+
+	// M0127-P2.2 (05 §5, stage E4): the executor's key plan, resolved once
+	// per Open from planner.Join.ExecHashKeyPlan. execKeys holds EVERY
+	// equi-pair the hash table is keyed on — goopg carried one since M0003 —
+	// and execResidual is what is left of Predicate once those pairs are
+	// enforced by the hash itself, which on an all-equijoin join is nothing
+	// at all. buildKeyExprs/probeKeyExprs are the same list already split by
+	// side, so the two loops cannot disagree about orientation.
+	//
+	// execKeyPackInt selects the fixed-width int64 lane of the composite
+	// encoding (join_composite_key.go); execKeyBuf is its per-row scratch,
+	// reused so the probe side allocates nothing.
+	execKeys       []planner.JoinKeyPair
+	execResidual   planner.Expr
+	buildKeyExprs  []planner.Expr
+	probeKeyExprs  []planner.Expr
+	execKeyPackInt bool
+	execKeyBuf     []byte
 	lazyProbe    Operator         // probe side (streaming)
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
@@ -176,7 +194,14 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 		schema = append(schema, left.Schema()...)
 		schema = append(schema, right.Schema()...)
 	}
-	return &joinOp{plan: plan, left: left, right: right, schema: schema}
+	// M0127-P2.2: the residual defaults to the full Predicate, which is what
+	// every non-hash algorithm evaluates. openLazyHashJoin narrows it to the
+	// conjuncts the hash key does NOT already enforce.
+	var residual planner.Expr
+	if plan != nil {
+		residual = plan.Predicate
+	}
+	return &joinOp{plan: plan, left: left, right: right, schema: schema, execResidual: residual}
 }
 
 func (o *joinOp) Open(ctx *Context) error {
@@ -545,6 +570,11 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// A Gather pre-builds the shared table in the leader and publishes it
 	// before fan-out. It is frozen at that point and never written again,
 	// which is the whole reason workers can read it with no lock.
+	// M0127-P2.2: resolve the key plan before either branch. The shared-build
+	// branch skips buildLazyHashTable entirely, and the probe half needs the
+	// same key list the leader built with — deriving it from the plan (rather
+	// than shipping it in sharedHashBuild) makes that agreement structural.
+	o.initExecKeys()
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
@@ -586,6 +616,10 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 // insert time and therefore *requires* this single-pass shape. Until it lands,
 // this path is unbounded (deferral ledger 2026-08-03 M0127-P0.2).
 func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
+	// M0127-P2.2: idempotent, and needed here as well as in openLazyHashJoin
+	// because prebuildSharedHashJoins (parallel_hash_build.go) runs the build
+	// phase alone, without ever opening the operator.
+	o.initExecKeys()
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
@@ -611,7 +645,13 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
 	// from the plan's key types. Everything downstream of this line inserts
 	// into exactly one map.
-	o.lazyHashIsInt = o.plan.HashKeysAreInt64()
+	//
+	// M0127-P2.2: the int64 MAP lane is the single-key representation. A
+	// multi-column key is packed into the string map instead (its own
+	// fixed-width int64 lane lives in join_composite_key.go), so a
+	// map[int64] table can never be built for a join that probes with a
+	// composite key.
+	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
@@ -652,6 +692,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 // (M0127-P0.2; 05 §4 stage E3). o.left is already Open and is closed by the
 // caller. rightWidth is the null-side width of the merged key column space.
 func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
+	o.ensureExecKeys()
 	leftWidth := o.lazyLW
 	for buildCount := 0; ; buildCount++ {
 		// M0062-followup: ctx check inside the build loop. With
@@ -680,7 +721,19 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		// over {lSlot, nullRight} instead of copying into a
 		// merged keyRow.
 		keySlot := o.lazyBuildKeySlot.rebind(lSlot, leftWidth, rightWidth, true)
-		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
+		// M0127-P2.2: a multi-column key is encoded and filed as one
+		// composite; the single-key lanes are untouched.
+		if o.multiKey() {
+			ok, err := o.encodeBuildCompositeKey(keySlot)
+			if err != nil {
+				return err
+			}
+			if ok {
+				o.fileCompositeBuildRow(ownedBuildRow(l))
+			}
+			continue
+		}
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -695,6 +748,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 // orientation, including the Semi/Anti string-map lane and the NullAware
 // bookkeeping. o.right is already Open and is closed by the caller.
 func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
+	o.ensureExecKeys()
 	rightWidth := o.lazyRW
 	for buildCount := 0; ; buildCount++ {
 		// M0062-followup: same ctx check on the build-right path.
@@ -719,7 +773,20 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		// over {nullLeft, rSlot} instead of copying into a
 		// merged keyRow.
 		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
-		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.RightKey, keySlot)
+		// M0127-P2.2: composite lane. NullAware joins are forced single-key
+		// by ExecHashKeyPlan (their antiBuildHasNull rule is defined over one
+		// key column), so this branch never has to maintain those counters.
+		if o.multiKey() {
+			ok, err := o.encodeBuildCompositeKey(keySlot)
+			if err != nil {
+				return err
+			}
+			if ok {
+				o.fileCompositeBuildRow(ownedBuildRow(r))
+			}
+			continue
+		}
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -768,6 +835,7 @@ func ownedBuildRow(row Row) Row {
 // drainRowsCtxCTID consumes it to EOF without an extra Close. The materialising
 // drain (no spill) is acceptable because FOR UPDATE result sets are small.
 func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvider, leftWidth, rightWidth int) error {
+	o.ensureExecKeys()
 	rows, ctids, err := drainRowsCtxCTID(o.right, ctx, scanLeaf)
 	if err != nil {
 		return err
@@ -783,9 +851,24 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 		// merged keyRow copy.
 		rSlot := SlotFromRow(nil, r)
 		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
-		key, ok, err := o.evalHashKeySlot(o.plan.RightKey, keySlot)
-		if err != nil {
-			return err
+		// M0127-P2.2: this path keys lazyHashCTID in lockstep with lazyHash,
+		// so it must use the SAME encoding the probe will — composite when
+		// the join has more than one key pair.
+		var key string
+		var ok bool
+		if o.multiKey() {
+			var kerr error
+			ok, kerr = o.encodeBuildCompositeKey(keySlot)
+			if kerr != nil {
+				return kerr
+			}
+			key = string(o.execKeyBuf)
+		} else {
+			var kerr error
+			key, ok, kerr = o.evalHashKeySlot(o.buildKeyExprs[0], keySlot)
+			if kerr != nil {
+				return kerr
+			}
 		}
 		if !ok {
 			continue
@@ -1199,11 +1282,17 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 // joinPredicateMatchSlot evaluates plan.Predicate against a slot
 // (typically o.lazyVirtualOut). Caller must update the source-slot
 // .row fields before invocation.
+// M0127-P2.2 narrowed the expression from `plan.Predicate` to `execResidual`:
+// a conjunct the hash key already enforces must not be re-evaluated per match.
+// The narrowing is exactly the set of pairs the key encoding folded in
+// (planner.Join.ExecHashKeyPlan), so a pair the planner declined as not
+// hash-safe still gets its per-match check — which is why this is a pure
+// saving and not a semantic change.
 func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
-	if o.plan.Predicate == nil {
+	if o.execResidual == nil {
 		return true, nil
 	}
-	v, err := evalExprSlot(o.plan.Predicate, slot, o.ctx)
+	v, err := evalExprSlot(o.execResidual, slot, o.ctx)
 	if err != nil {
 		return false, err
 	}
@@ -1393,6 +1482,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	}
 	nullRight := o.lazyNullRight
 	o.ensureLazyVirtual()
+	// M0127-P2.2: same lazy guard the build loops use — a probe-only unit
+	// test reaches nextLazy without ever running Open's key resolution.
+	o.ensureExecKeys()
 	// Cancellation: cheap ctx check per Next() call so a long
 	// probe-only join responds promptly to CancelRequest.
 	// (M0058-0005.)
@@ -1511,18 +1603,26 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		//   BuildLeft=true  → probe is right side → realWidth=lazyRW
 		//   BuildLeft=false → probe is left side  → realWidth=lazyLW
 		var keySlot *VirtualSlot
-		var probeKeyExpr planner.Expr
 		if o.plan.BuildLeft {
 			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyRW, o.lazyLW, false)
-			probeKeyExpr = o.plan.RightKey
 		} else {
 			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyLW, o.lazyRW, true)
-			probeKeyExpr = o.plan.LeftKey
 		}
+		probeKeyExpr := o.probeKeyExprs[0]
 		var key string // used only by the string path + the CTID lookup
 		var ok bool
 		var matches []Row
-		if o.lazyHashIsInt {
+		if o.multiKey() {
+			// M0127-P2.2 (05 §5, stage E4): every equi-pair is in the key, so
+			// a column the qual placement pinned to a constant no longer
+			// collapses the bucket space — and the conjuncts folded into the
+			// key are gone from execResidual, which is what makes the
+			// all-equijoin join do zero interpreted work per match.
+			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide)
+			if err != nil {
+				return nil, err
+			}
+		} else if o.lazyHashIsInt {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.

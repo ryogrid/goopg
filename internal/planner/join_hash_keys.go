@@ -18,18 +18,20 @@ import "github.com/goopg/goopg/internal/parser"
 //   - the degeneracy trap (M0125-0035b): when qual placement pins the
 //     chosen key column to a constant on BOTH inputs, the whole build
 //     side lands in one bucket and the join goes quadratic even though
-//     the plan looks PG-identical. `reselectDegenerateHashKeys` swaps the
+//     the plan looks PG-identical. `reselectDegenerateHashKeys` swapped the
 //     pair away from the pinned column as a workaround; with the full
 //     list there is nothing to swap, because the other columns still
-//     spread the buckets. PG never faces the choice.
+//     spread the buckets. PG never faces the choice. (That pass was
+//     retired by P2.2, which made the full list the executor's key.)
 //   - a per-match interpreted residual call for every extra conjunct
 //     (`joinPredicateMatchSlot`), on the all-equijoin common case where
 //     PG does no residual work at all.
 //
 // P2.1 is the planner half of the sibling pair: it publishes the list.
-// P2.2 is the executor half (composite key encoding), and is where the
-// list becomes the thing the hash table is actually keyed on and
-// `reselectDegenerateHashKeys` retires.
+// P2.2 is the executor half (composite key encoding): it is where the
+// list became the thing the hash table is actually keyed on (see
+// `ExecHashKeyPlan`, join_exec_keys.go) and where
+// `reselectDegenerateHashKeys` retired.
 type JoinKeyPair struct {
 	Left  Expr
 	Right Expr
@@ -86,20 +88,21 @@ func splitAllEqualitiesForHash(pred Expr, leftWidth int) []JoinKeyPair {
 // bushy.go, unnest.go ×5, inner_join_qual_pushdown.go) and at least six
 // later passes REWRITE the key or predicate expressions in place —
 // `reresolveJoinByName`'s predRebind, bushy's subRemap, FoldConstants,
-// `lowerSubPlanParams`, the qual-placement passes, and
-// `reselectDegenerateHashKeys`, which re-picks the pair outright. A
-// field filled early is a field those passes must all be taught to
+// `lowerSubPlanParams`, the qual-placement passes, and (until P2.2
+// retired it) `reselectDegenerateHashKeys`, which re-picked the pair
+// outright. A field filled early is a field those passes must all be taught to
 // maintain, and the one time that was not done the shared ColumnRef
 // pointer got mutated under the keys and chained NATURAL JOINs probed
 // the wrong column (M0097-0060). Deriving the list once, after the last
 // rewriter has run, makes staleness structurally impossible instead of a
 // maintenance obligation.
 //
-// The pass is idempotent (it recomputes from scratch) and result-neutral
-// at P2.1: nothing executes off `HashKeys` yet — EXPLAIN renders it, and
-// P2.2's executor consumes it. `Predicate` is left holding the FULL
-// conjunction, including the equalities now also published as keys; see
-// `(*Join).Residual` for the non-equijoin projection.
+// The pass is idempotent (it recomputes from scratch). `Predicate` is left
+// holding the FULL conjunction, including the equalities also published as
+// keys — roughly fifteen planner consumers read it as the join's complete
+// condition. `(*Join).Residual` is the non-equijoin projection; since P2.2
+// the executor takes its own narrower split from `ExecHashKeyPlan`
+// (join_exec_keys.go), which is what the hash table is keyed on.
 func fillJoinHashKeys(root Node) {
 	fillJoinHashKeysNodes(root)
 	// Sublink bodies are plans of their own hanging off expressions, not
@@ -119,8 +122,9 @@ func fillJoinHashKeys(root Node) {
 }
 
 // fillJoinHashKeysNodes is fillJoinHashKeys' plan-node recursion. The
-// arms mirror `reselectDegenerateHashKeys` — the other late pass over
-// join keys — so the two agree on which subtrees are reachable.
+// arms were mirrored from `reselectDegenerateHashKeys` — the other late
+// pass over join keys, retired by P2.2 — so this pass reaches exactly the
+// subtrees key rewriting always did.
 func fillJoinHashKeysNodes(n Node) {
 	if n == nil {
 		return
@@ -178,9 +182,10 @@ func fillJoinHashKeysNodes(n Node) {
 //
 // `HashKeys[0]` is pinned to the join's existing (LeftKey, RightKey) BY
 // POINTER, not by re-deriving it: that pair is the one the executor
-// hashes on today, `reselectDegenerateHashKeys` may have deliberately
-// moved it off the first ON-clause conjunct, and `IsCanonicalKeyEquality`
-// identifies the canonical conjunct by pointer identity. Everything after
+// hashes on today (`reselectDegenerateHashKeys` could deliberately move
+// it off the first ON-clause conjunct until P2.2 retired that pass), and
+// `IsCanonicalKeyEquality` identifies the canonical conjunct by pointer
+// identity. Everything after
 // index 0 is the remaining usable equalities in conjunct order.
 //
 // The extra pairs are CLONED when they are ColumnRefs (the M0097-0060
@@ -237,16 +242,25 @@ func cloneKeyExpr(e Expr) Expr {
 // fill pass ran) the residual is the whole predicate, which is exactly
 // today's behaviour.
 func (n *Join) Residual() Expr {
+	return n.residualExcluding(n.HashKeys)
+}
+
+// residualExcluding is Residual's core, parameterised by which pairs count as
+// discharged. `Residual` passes the full published list; the executor's
+// `ExecHashKeyPlan` passes only the pairs it is actually going to fold into
+// the key encoding (M0127-P2.2), which is a subset — a conjunct whose pair was
+// declined must keep being evaluated per match.
+func (n *Join) residualExcluding(keys []JoinKeyPair) Expr {
 	if n == nil || n.Predicate == nil {
 		return nil
 	}
-	if len(n.HashKeys) == 0 || n.Left == nil {
+	if len(keys) == 0 || n.Left == nil {
 		return n.Predicate
 	}
 	leftWidth := len(n.Left.Output())
 	var keep []Expr
 	for _, c := range splitAnd(n.Predicate) {
-		if n.conjunctIsHashKey(c, leftWidth) {
+		if conjunctIsOneOfKeys(c, keys, leftWidth) {
 			continue
 		}
 		keep = append(keep, c)
@@ -257,9 +271,9 @@ func (n *Join) Residual() Expr {
 	return combineAnd(keep)
 }
 
-// conjunctIsHashKey reports whether c is one of the equalities published
-// in HashKeys, in either operand order.
-func (n *Join) conjunctIsHashKey(c Expr, leftWidth int) bool {
+// conjunctIsOneOfKeys reports whether c is one of the given equi-pairs, in
+// either operand order.
+func conjunctIsOneOfKeys(c Expr, keys []JoinKeyPair, leftWidth int) bool {
 	bin, ok := c.(*BinaryOp)
 	if !ok || bin.Op != parser.OpEq {
 		return false
@@ -268,7 +282,7 @@ func (n *Join) conjunctIsHashKey(c Expr, leftWidth int) bool {
 	if exprSide(l, leftWidth) == sideRight && exprSide(r, leftWidth) == sideLeft {
 		l, r = r, l
 	}
-	for _, k := range n.HashKeys {
+	for _, k := range keys {
 		if exprEqual(k.Left, l) && exprEqual(k.Right, r) {
 			return true
 		}

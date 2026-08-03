@@ -44,20 +44,16 @@ func (n *Join) HashKeysAreInt64() bool {
 // so a bare ColumnRef falls back to the column it indexes. Hash keys are
 // resolved against the MERGED (Left ++ Right) key column space, which is the
 // space `mergedKeyColumn` indexes.
+// M0127-P2.2 folded the resolution half into `keyExprType` (join_exec_keys.go)
+// so the int64 question and the hash-safety question read the same type, and
+// added the IsArray guard: `Type.Name` on an array column holds the ELEMENT
+// name, so an `int4[]` key used to answer true here.
 func (n *Join) hashKeyIsInt64(key Expr) bool {
-	t := exprType(key)
-	if t.Name == "" {
-		cr, ok := key.(*ColumnRef)
-		if !ok {
-			return false
-		}
-		sc, ok := n.mergedKeyColumn(cr.Index)
-		if !ok {
-			return false
-		}
-		t = sc.Type
+	t, ok := n.keyExprType(key)
+	if !ok || t.IsArray {
+		return false
 	}
-	return isMachineIntTypeName(t.Name)
+	return isMachineIntTypeName(strings.ToLower(t.Name))
 }
 
 // mergedKeyColumn resolves an index in the merged (Left ++ Right) key column

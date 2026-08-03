@@ -5777,12 +5777,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       gate) forced the sublink descent onto `walkExprRefs` + `scopeDescend`
       instead of a hand-written 5-arm Expr switch. **Next is P2.2, the
       executor half of the sibling pair.** Progress log: design doc §6.
-- [ ] **M0127-P2.2 — executor composite keys.** All-int64 fixed-width pack;
+- [x] **M0127-P2.2 — executor composite keys.** All-int64 fixed-width pack;
       mixed → concatenated `datumKey`. **Delete `reselectDegenerateHashKeys` +
       its planner pass (same commit)**; add a Q78-class degeneracy regression
       test (constant-pinned first key column must not degrade to one bucket).
       IMPLEMENTATION-TODO P2.2; 05 §5 (E4 executor side). Bar: UNITS + SPOT +
       DS05 + SIBLING (planner keys ↔ executor key encode).
+      **↳ DONE 2026-08-03.** New `internal/planner/join_exec_keys.go`
+      (`Join.ExecHashKeyPlan` → `{Keys, Residual, Int64Keys}`) and
+      `internal/executor/join_composite_key.go`. `reselectDegenerateHashKeys`
+      and its three helpers plus the `Plan()` call site are GONE.
+      **The executor's key list is deliberately NARROWER than `HashKeys`.**
+      `HashKeys` stays the plan's truth (what EXPLAIN renders); a pair may be
+      folded into the KEY only where `datumKey` equality provably agrees with
+      `=`, because goopg has one canonicalisation where PG has a hash opfamily
+      per type. `pairIsHashSafe` requires both sides to resolve to the same
+      non-array scalar type from a whitelist (machine ints are one family).
+      The exclusions are wrong-results risks, not missed optimisations —
+      **float4/float8 are stored as TEXT datums** (`floatTextDatum(PGFloatOut
+      (...))`), so `-0.0` and `0.0` are `=`-equal but key differently; enum and
+      toast-pointer datums have NO `datumKey` arm and would collide into one
+      key, which with the conjunct also dropped from the residual would
+      OVER-emit. A declined pair keeps today's behaviour exactly (out of the
+      key, in the residual). Encoding: n int64s packed big-endian into a fixed
+      8n-byte buffer (probe lookups as `m[string(buf)]` → zero allocations),
+      else **length-prefixed** `datumKey` parts — the prefix, not this
+      package's usual NUL separator, is what makes it injective, since a text
+      `datumKey` can itself contain NUL. `demoteCompositeIntKeys` mirrors
+      `demoteIntHash`. NULL is componentwise. `joinPredicateMatchSlot` now
+      evaluates `execResidual`, discharging the FIRST half of ledger row
+      `2026-08-03 M0127-P2.1` (the physical `Predicate` trim is the second
+      half and stays open). NullAware `NOT IN` stays single-key — ledger.
+      Gates: **DS05 MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99, and
+      Q78 — the query the retired pass existed for — PASSes in 19 s / 45 rows
+      / matching checksum** (`sweep-20260803-174443.txt` Q1-Q72 68 PASS +
+      `sweep-20260803-182129.txt` Q73-Q99 26 PASS TIMEOUT=0; Q72 TIMEOUT at
+      317 s is the known 300 s boundary pair). **PLAN: `make plan-diff
+      LABEL=m0127-p21-hashkeys` MATCH on all 22** — retiring the reselect pass
+      moved no key in TPC-H, so P2.1's baseline stands. UNITS PASS. SPOT PASS
+      (Q12=2 / Q13=35, 16.5 s, peak 11,573 MB). SMOKE via the commit hook.
+      The degeneracy witness asserts 64 buckets for 64 rows sharing a pinned
+      lead key — a row-count test cannot see this defect, the results were
+      always right. **Next is P2.3, merge-join multi-column keys.**
+      Progress log: design doc §6.
 - [ ] **M0127-P2.3 — merge-join multi-column keys** from the same list
       (full-key comparator; residual non-equijoin only). IMPLEMENTATION-TODO
       P2.3; 07 §2. Bar: UNITS + SPOT + DS05 + PLAN.

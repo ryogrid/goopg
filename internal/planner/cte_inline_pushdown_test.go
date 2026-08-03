@@ -207,13 +207,19 @@ func TestJoinEqualityConstDerivationDeclines(t *testing.T) {
 	}
 }
 
-// TestReselectDegenerateHashKey pins the follow-through: once qual
-// placement pins `y = 1998` on both inputs of a hash join keyed on y,
-// the whole build side shares one bucket and every probe walks it end
-// to end (Q78's top spine, 245k × 30k). The pass must move the key to
-// the remaining non-pinned pair; with no constant filters in place it
-// must leave the planner's original choice alone.
-func TestReselectDegenerateHashKey(t *testing.T) {
+// TestDegenerateHashKeyCoveredByFullKeyList is the successor to
+// TestReselectDegenerateHashKey, which pinned the M0125-0035b workaround
+// pass that M0127-P2.2 retired.
+//
+// The shape is the same one: qual placement pins `y = 1998` on BOTH inputs
+// of a hash join keyed on y, so the whole build side used to share one
+// bucket and every probe walked it end to end (Q78's top spine, 245k × 30k
+// entries). The old pass moved the single key off the pinned column. The
+// fix is now structural — the executor keys on EVERY equi-pair, so `cnt`
+// spreads the buckets whether or not `y` is pinned — and what must be
+// pinned is that the executor's key plan actually contains both pairs, in
+// the pinned case and the unpinned one alike.
+func TestDegenerateHashKeyCoveredByFullKeyList(t *testing.T) {
 	mk := func(pinned bool) *Join {
 		ss, ws := ijCTEScan("ss"), ijCTEScan("ws")
 		var l, r Node = ss, ws
@@ -239,19 +245,39 @@ func TestReselectDegenerateHashKey(t *testing.T) {
 		}
 	}
 
-	j := mk(true)
-	reselectDegenerateHashKeys(j)
-	lk, _ := j.LeftKey.(*ColumnRef)
-	rk, _ := j.RightKey.(*ColumnRef)
-	if lk == nil || rk == nil || lk.Index != 1 || rk.Index != 3 {
-		t.Errorf("degenerate y-key not moved to the cnt pair: LeftKey=%v RightKey=%v", j.LeftKey, j.RightKey)
-	}
-
-	j = mk(false)
-	reselectDegenerateHashKeys(j)
-	lk, _ = j.LeftKey.(*ColumnRef)
-	if lk == nil || lk.Index != 0 {
-		t.Errorf("non-degenerate key was moved: LeftKey=%v", j.LeftKey)
+	for _, pinned := range []bool{true, false} {
+		j := mk(pinned)
+		fillOneJoinHashKeys(j)
+		ek := j.ExecHashKeyPlan()
+		if len(ek.Keys) != 2 {
+			t.Fatalf("pinned=%v: executor keys on %d pair(s), want both (y, cnt): %+v",
+				pinned, len(ek.Keys), ek.Keys)
+		}
+		gotIdx := [][2]int{}
+		for _, k := range ek.Keys {
+			l, lok := k.Left.(*ColumnRef)
+			r, rok := k.Right.(*ColumnRef)
+			if !lok || !rok {
+				t.Fatalf("pinned=%v: non-ColumnRef key pair %+v", pinned, k)
+			}
+			gotIdx = append(gotIdx, [2]int{l.Index, r.Index})
+		}
+		want := [][2]int{{0, 2}, {1, 3}}
+		for i := range want {
+			if gotIdx[i] != want[i] {
+				t.Errorf("pinned=%v: key pair %d = %v, want %v", pinned, i, gotIdx[i], want[i])
+			}
+		}
+		// Both equalities are now enforced by the hash itself, so the
+		// per-match residual has nothing left to evaluate — the second
+		// half of what P2.2 buys (the first being bucket spread).
+		if res := ek.Residual; res != nil {
+			t.Errorf("pinned=%v: residual should be empty once both equalities are keys, got %v", pinned, res)
+		}
+		// The lead pair is unchanged: P2.2 adds keys, it does not re-pick.
+		if lk, _ := j.LeftKey.(*ColumnRef); lk == nil || lk.Index != 0 {
+			t.Errorf("pinned=%v: lead key moved: LeftKey=%v", pinned, j.LeftKey)
+		}
 	}
 }
 
