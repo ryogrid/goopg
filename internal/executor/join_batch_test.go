@@ -305,13 +305,11 @@ func TestBatchingDeclinesShapesItDoesNotYetSupport(t *testing.T) {
 		name  string
 		mutet func(*planner.Join)
 	}{
-		// A LEFT join built on the LEFT side fills from the BUILD side, which
-		// needs the post-replay unmatched sweep (M0127-P4.2); the probe-side
-		// LEFT that P3.4 does batch is covered by TestFillingJoinsKeepOuterOnlyBatches.
-		{"build-left outer join", func(p *planner.Join) {
-			p.Type = planner.JoinTypeLeft
-			p.BuildLeft = true
-		}},
+		// The build-left outer join used to be declined here: it fills from
+		// the BUILD side, which needs the post-replay unmatched sweep.
+		// M0127-P4.2 landed that sweep, so the shape now batches like any
+		// other — TestHashOuterFillSweepsEveryBatch is its per-batch identity
+		// test and TestBuildOnlyBatchIsNotSkippedWhenBuildFills its skip rule.
 		{"composite key", func(p *planner.Join) {
 			col := func(i int) *planner.ColumnRef {
 				return &planner.ColumnRef{Index: i, Type: catalog.Type{Name: "int4"}}

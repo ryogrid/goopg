@@ -2238,8 +2238,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// predicate decomposes into disjoint-side keys:
 		//   - INNER / LEFT: hash join (M0003 rule); cost-driven
 		//     override for INNER when stats are present (M0006).
-		//   - RIGHT / FULL: merge join (semantics-driven; stays
-		//     rules-based regardless of stats).
+		//   - RIGHT / FULL: hash join too since M0127-P4.2 — the merge
+		//     pin they used to carry was an executor gap (no outer
+		//     fill), not a semantic one.
 		// CROSS and non-equality predicates stay on nested-loop.
 		leftWidth := len(leftCtx.schema)
 		if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
@@ -2283,7 +2284,31 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
 			case JoinTypeRight, JoinTypeFull:
+				// M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL
+				// are no longer PINNED to merge. The pin was never a
+				// semantic requirement — it was the absence of outer fill in
+				// the hash executor — and it charged every RIGHT/FULL join a
+				// sort of BOTH inputs whatever the inputs looked like.
+				//
+				// What replaces it is a choice, not a new pin: merge stays
+				// the answer when neither side has an estimate (which is
+				// what PG picks there too), and hash wins as soon as the
+				// sorts can be priced. chooseOuterFillJoinAlgo carries the
+				// reasoning.
 				jn.Algo = JoinAlgoMerge
+				if algo, ok := chooseOuterFillJoinAlgo(EstimateRows(jn.Left), EstimateRows(jn.Right)); ok {
+					jn.Algo = algo
+				}
+				if jn.Algo == JoinAlgoHash && jn.Type == JoinTypeRight {
+					// Build on the LEFT (non-preserved) side so the
+					// preserved right side streams as the probe: the mirror
+					// image of the LEFT default, and the orientation whose
+					// fill is per-probe-row (PG HJ_FILL_OUTER) rather than a
+					// post-probe sweep. FULL needs both halves whichever way
+					// it is oriented, so it keeps build-on-the-right and pays
+					// for the sweep (PG HJ_FILL_INNER_TUPLES).
+					jn.BuildLeft = true
+				}
 			}
 			// INNER joins: let the cost model pick when both sides
 			// have row estimates. Hash stays the M0003 fallback

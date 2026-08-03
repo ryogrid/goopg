@@ -91,9 +91,20 @@
   types × 2 residual regimes) pins. Inputs are still sorted BY the operator
   — pathkey-fed inputs are P5 — and the emit is still `concatRows`, not the
   E1 slot seam: 4 ledger rows.)*
-- [ ] **P4.2** Hash outer-fill: matched bitmap per batch; RIGHT sweep;
+- [x] **P4.2** Hash outer-fill: matched bitmap per batch; RIGHT sweep;
   FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL
   hash paths). Regress-port outer-join files green.
+  *(2026-08-04. `join_outer_fill.go`: `fillProbeSide`/`fillBuildSide` derived
+  from Type + the EFFECTIVE build side, per-bucket `[]bool` bitmap written
+  AFTER the residual, sweep per batch in `nextLazy`'s probe-EOF arm,
+  NULL-keyed build rows retained and swept last. `batchSkippable` grows
+  rule 1's INNER arm; every outer orientation now batches. The planner's
+  merge PIN becomes a merge DEFAULT via `chooseOuterFillJoinAlgo`, gated
+  behind `GOOPG_HASH_OUTER_JOIN=1` — an unconditional flip reorders
+  unordered rows and costs regress `join` 210 diff lines, because
+  `costInnerMerge` prices an 11-row sort like a real one while PG picks
+  Merge Right/Full Join there. Default flip is P5's, with doc 04's cost
+  currency: 2 ledger rows.)*
 - [ ] **P4.3** `Materialize` operator (plan node + path + rescan replay,
   memory→spill); NL join streams outer, inner under Materialize; delete
   drain-both `runNestedLoop` buffering and `concatRows`-per-pair.

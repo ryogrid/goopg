@@ -246,8 +246,12 @@ func (o *joinOp) joinBatchEligible() bool {
 		// build-global counters above and fire before nextLazy probes
 		// anything, so they are unaffected by how the build was partitioned.
 		return true
-	case planner.JoinTypeLeft:
-		return !o.plan.BuildLeft
+	case planner.JoinTypeLeft, planner.JoinTypeRight, planner.JoinTypeFull:
+		// M0127-P4.2 (07 §3): every outer-join orientation batches now. The
+		// probe-fill half was always per-row; the build-fill half is per-batch
+		// because the sweep runs while that batch's table is still resident
+		// (nextLazy's probe-EOF arm), so no unmatched row outlives its batch.
+		return true
 	}
 	return false
 }
@@ -260,15 +264,21 @@ func (o *joinOp) joinBatchEligible() bool {
 // as-is under ANTI. Skipping it loses rows silently, which is exactly the
 // failure mode 06 §2.3 warns "the SF0.5 gate would catch only late".
 func (o *joinOp) probeFillsUnmatched() bool {
-	switch o.plan.Type {
-	case planner.JoinTypeAnti:
+	if o.plan.Type == planner.JoinTypeAnti {
 		return true
-	case planner.JoinTypeLeft:
-		// The build-left orientation fills from the build side instead; it is
-		// declined by joinBatchEligible, so this is a guard, not a case.
-		return !o.plan.BuildLeft
 	}
-	return false
+	// M0127-P4.2: the outer-join half is now one shared decision (07 §3), so
+	// the batch-skip rule and the emit path cannot disagree about which side
+	// fills.
+	return o.fillProbeSide()
+}
+
+// buildFillsUnmatched is the same rule for the other side, PG's
+// `HJ_FILL_INNER`. It gives batchSkippable the arm 06 §2.3 left implicit: for a
+// build-filling join an INNER-only batch is not skippable either, because every
+// build row it holds is unmatched by construction and therefore emits.
+func (o *joinOp) buildFillsUnmatched() bool {
+	return o.fillBuildSide()
 }
 
 // newHashBatchState installs batching for a build whose geometry came out
@@ -486,7 +496,10 @@ func (bs *hashBatchState) batchSkippable(o *joinOp, b int) bool {
 		return false // rule 3
 	}
 	if hasOuter && o.probeFillsUnmatched() {
-		return false // rule 1, fill arm
+		return false // rule 1, fill arm (outer side)
+	}
+	if hasInner && o.buildFillsUnmatched() {
+		return false // rule 1, fill arm (inner side) — M0127-P4.2
 	}
 	return true
 }
@@ -570,7 +583,10 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 		if !ok {
 			// A NULL key cannot match anything; it was only spilled because
 			// the build loop files rows before it knows that. Dropping it
-			// here matches the in-memory build, which never inserts it.
+			// here matches the in-memory build, which never inserts it —
+			// and, since M0127-P4.2, retains it for the fill sweep on the
+			// two join types where "matches nothing" still emits.
+			o.recordBuildNullKey(owned)
 			continue
 		}
 		o.lazyHashInsertDatum(kd, owned)
@@ -677,6 +693,12 @@ func (op *batchReplayOp) Close() error {
 // resetHashTable empties the build table between batches, keeping whichever
 // representation the build chose.
 func (o *joinOp) resetHashTable() {
+	// M0127-P4.2 (07 §3): the matched bitmaps are parallel to the table, so
+	// they are per-batch too — the outgoing batch has already been swept by the
+	// time nextBatch calls this.
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
 	if o.lazyIntHash != nil {
 		o.lazyIntHash = make(map[int64][]Row)
 	}

@@ -1093,7 +1093,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED** — the root-0030
       fix (checked item above) did not hold: FAILed in nightly runs 20260801,
       `20260802-014405`, and `20260803-013955`
-      (AI-20260802-014405-001, AI-20260803-013955-003; repro:
+      (AI-20260802-014405-001, AI-20260803-013955-003,
+      AI-20260804-005028-001; repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`).
       **VERIFIED FAILING AT HEAD `e13d6c6f` in isolation (2026-08-02 loop #31,
@@ -1109,8 +1110,9 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       portals_p2,prepare,select,select_into,text,union,varchar} — 15 baseline-pass
       cases diverged in ONE night, all "output mismatch; normalization rules
       need extension"** (AI-20260802-014405-002..-016, all first-seen 20260802;
-      recurred 20260803 as AI-20260803-013955-004..-018 — the SAME 15 subjects,
-      again alongside the suite-wedge below;
+      recurred 20260803 as AI-20260803-013955-004..-018 and again 20260804 as
+      AI-20260804-005028-002..-016 — the SAME 15 subjects three nights running,
+      each time alongside the suite-wedge below;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). **Six sampled
       cases (btree_index, char, int2, select, text, union) PASS in ISOLATION at
       HEAD `e13d6c6f` (2026-08-02 loop #31, 3.2 s total)** — so this is almost
@@ -1124,7 +1126,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
-      AI-20260803-013955-019, same 3 cases aggregates/jsonb/misc; repro:
+      AI-20260803-013955-019 and 20260804 as AI-20260804-005028-017, same 3
+      cases aggregates/jsonb/misc every time; repro:
       `go test -v -run 'TestPort_RegressSuite/aggregates' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). Output truncated
       ⇒ NOT an output divergence — investigate what wedged the cluster at
@@ -6128,10 +6131,44 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       worktree baseline on `join`/`join_hash`/`select`/`subselect`/`union`
       (diff bodies byte-identical after path normalisation); SPOT PASS
       (Q12=2 / Q13=35, 28.0 s). Progress log: design doc §6.
-- [ ] **M0127-P4.2 — hash outer-fill.** Matched bitmap per batch; RIGHT sweep;
+- [x] **M0127-P4.2 — hash outer-fill.** Matched bitmap per batch; RIGHT sweep;
       FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL hash
       paths). Regress-port outer-join files green. IMPLEMENTATION-TODO P4.2;
       07 §3 (PG `HJ_FILL_INNER`). Bar: REGRESS outer-join files + DS05.
+      **DONE 2026-08-04. P4.3 is next.** The hash join could not null-pad a
+      side that matched nothing, and that gap — not any semantics — is why
+      RIGHT/FULL were pinned onto merge and inherited its sort of BOTH inputs.
+      `internal/executor/join_outer_fill.go` adds PG's `HJ_FILL_INNER` half
+      next to the `HJ_FILL_OUTER` goopg already had. Both are named for their
+      ROLE (`fillProbeSide`/`fillBuildSide`) and derived from `Type` + the
+      EFFECTIVE build side — Semi/Anti are forced build-right inside
+      `buildLazyHashTable`, so the raw `BuildLeft` lies — which is what lets
+      **RIGHT reuse the LEFT fill path unchanged** (build the non-preserved
+      left, probe the preserved right, no sweep); FULL is both halves and pays
+      for the sweep. Three properties each got their own test: the bitmap is
+      written AFTER the residual predicate (an early mark silently drops
+      residual-rejected build rows from the sweep); the sweep runs PER BATCH in
+      `nextLazy`'s probe-EOF arm while that table is still resident, so
+      `joinBatchEligible` accepts every outer orientation and `batchSkippable`
+      grows rule 1's INNER arm; and a NULL-keyed build row — dropped by every
+      build loop since a NULL key has no canonical bucket form — is retained
+      and swept, where PG gets there via `hashtable->keepNulls`.
+      **Planner: the merge PIN became a merge DEFAULT, gated OFF.**
+      `chooseOuterFillJoinAlgo` prices hash against merge (never nested loop —
+      legal but it drains both inputs) behind `GOOPG_HASH_OUTER_JOIN=1`. The
+      gate is a MEASUREMENT, not caution: an unconditional flip keeps every row
+      but reorders unordered ones and moves regress `join` **210 diff lines
+      further** from upstream, because `costInnerMerge` charges an 11-row sort
+      like a real one while PG 18.3 — asked directly on J1_TBL/J2_TBL — picks
+      Merge Right/Full Join there. The default flip belongs to P5 with doc 04's
+      cost currency. **Three ledger rows** (`2026-08-04 M0127-P4.2`):
+      NULL-key build rows are held unbounded instead of spilling like PG's
+      keepNulls tuples; the planner default is gated; and parallel hash join
+      still refuses RIGHT/FULL for want of a shared matched bitmap
+      (PG 16+ `ExecParallelScanHashTableForUnmatched`).
+      Gates: UNITS PASS; REGRESS **zero delta** vs a HEAD-worktree baseline on
+      `join`/`join_hash`/`select`/`subselect`/`union`; DS05 run with the gate
+      ON so the new path is exercised. Progress log: design doc §6.
 - [ ] **M0127-P4.3 — `Materialize` operator** (plan node + path + rescan replay,
       memory→spill); NL joins stream outer, inner under Materialize; delete
       drain-both `runNestedLoop` buffering and `concatRows`-per-pair.

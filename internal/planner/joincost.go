@@ -10,7 +10,10 @@
 // cost units and the explicit out-of-scope items.
 package planner
 
-import "math"
+import (
+	"math"
+	"os"
+)
 
 // chooseInnerJoinAlgo returns the cheapest INNER-join algorithm
 // for the given input row counts. The second return value is
@@ -34,6 +37,55 @@ func chooseInnerJoinAlgo(leftRows, rightRows int64) (JoinAlgo, bool) {
 		best = JoinAlgoNestedLoop
 	}
 	return best, true
+}
+
+// hashOuterJoinEnabled gates whether the planner may SELECT a hash
+// path for RIGHT/FULL. The executor's ability to run one is
+// unconditional as of M0127-P4.2; what is gated is the default
+// plan-shape change, and the reason is measured rather than
+// cautious — see chooseOuterFillJoinAlgo's second paragraph.
+//
+// GOOPG_HASH_OUTER_JOIN=1 turns it on for the A/B; the default
+// flip is M0127-P5's, once doc 04's cost currency can say when a
+// sort is actually cheaper (deferral ledger 2026-08-04
+// M0127-P4.2).
+var hashOuterJoinEnabled = os.Getenv("GOOPG_HASH_OUTER_JOIN") == "1"
+
+// chooseOuterFillJoinAlgo is the same decision for the two join
+// types whose preserved side the hash executor could not fill
+// until M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL.
+//
+// It scores only hash against merge. Nested loop is excluded on
+// purpose — it is legal for these types (runNestedLoop implements
+// both) but it drains BOTH inputs into memory, and the unit-row
+// model that lets costInnerNestLoop win on tiny inputs does not
+// know that. Unpinning RIGHT/FULL from merge is this milestone's
+// point; unpinning them onto an unbounded operator is not.
+//
+// Declining (ok=false) leaves the caller on merge.
+//
+// The gate is what the MEASUREMENT said, not caution. Flipping the
+// default outright keeps every row (the multisets are identical —
+// that is what the executor tests assert) but changes their ORDER
+// on unordered queries, and PG 18.3 picks `Merge Right Join` /
+// `Merge Full Join` for exactly the fixtures the regress `join`
+// test is built from (verified directly against the oracle on
+// J1_TBL/J2_TBL). Measured on the regress outer-join files, an
+// unconditional flip moves `join` 210 diff lines FURTHER from
+// upstream's expected output, all of it row order. goopg picks
+// hash there because costInnerMerge charges a full sort of both
+// sides with no constant factors, so an 11-row sort prices like a
+// real one; PG's model knows better. Closing that gap is doc 04's
+// "one cost currency", i.e. M0127-P5 — until then the capability
+// ships and the default does not.
+func chooseOuterFillJoinAlgo(leftRows, rightRows int64) (JoinAlgo, bool) {
+	if !hashOuterJoinEnabled || leftRows <= 0 || rightRows <= 0 {
+		return JoinAlgoMerge, false
+	}
+	if costInnerHash(leftRows, rightRows) <= costInnerMerge(leftRows, rightRows) {
+		return JoinAlgoHash, true
+	}
+	return JoinAlgoMerge, true
 }
 
 // costInnerHash: build on the smaller side (matches the

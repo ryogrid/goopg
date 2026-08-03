@@ -213,6 +213,31 @@ type joinOp struct {
 	preserveBuildSide bool
 	lazyHashCTID      map[string][]joinRowCTID
 	lazyMatchCTIDs    []joinRowCTID
+
+	// M0127-P4.2 (07 §3): outer-join fill — PG's HJ_FILL_INNER half. See
+	// join_outer_fill.go for the whole mechanism; these are its state.
+	//
+	// lazyMatched{S,I} are the per-batch matched bitmaps, parallel to
+	// lazyHash / lazyIntHash and created per bucket on its first probe;
+	// lazyMatchedCur is the bucket the current probe row is draining, so the
+	// emit loop marks a match with one indexed store and no map lookup.
+	// fillNullBuild holds the build rows whose key was NULL (they never enter
+	// a bucket). sweep* is the cursor fillSweepNext walks after each batch's
+	// probe replay ends; probeEOF latches that end so the sweep can return
+	// row by row without re-pulling an exhausted probe.
+	lazyMatchedS   map[string][]bool
+	lazyMatchedI   map[int64][]bool
+	lazyMatchedCur []bool
+	fillNullBuild  []Row
+	fillNullIdx    int
+	sweepInit      bool
+	sweepKeysS     []string
+	sweepKeysI     []int64
+	sweepKeyIdx    int
+	sweepRowIdx    int
+	sweepRows      []Row
+	sweepMatched   []bool
+	probeEOF       bool
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -701,6 +726,8 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 		return err
 	}
 	o.lazyProbe = probe
+	o.probeEOF = false
+	o.fillSweepReset()
 	// M0127-P3.2: the build is finished, so nbatch is now the count the outer
 	// scan starts from. nextBatch compares against it to tell a genuinely
 	// empty batch from one whose saved rows a later doubling has re-assigned
@@ -741,6 +768,15 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.lazyRW = rightWidth
 	o.antiBuildRows = 0
 	o.antiBuildHasNull = false
+	// M0127-P4.2: a re-Open that skipped Close must not inherit the previous
+	// run's matched bitmaps or its retained NULL-key build rows.
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
+	o.fillNullBuild = nil
+	o.fillNullIdx = 0
+	o.probeEOF = false
+	o.fillSweepReset()
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -959,6 +995,8 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 			}
 			if ok {
 				o.fileCompositeBuildRow(ownedBuildRow(l))
+			} else {
+				o.recordBuildNullKey(ownedBuildRow(l))
 			}
 			continue
 		}
@@ -967,6 +1005,9 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 			return err
 		}
 		if !ok {
+			// M0127-P4.2: a NULL key matches nothing, which under RIGHT/FULL
+			// is precisely why the row has to be kept.
+			o.recordBuildNullKey(ownedBuildRow(l))
 			continue
 		}
 		if err := o.insertBuildRow(kd, ownedBuildRow(l)); err != nil {
@@ -1024,6 +1065,8 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			if ok {
 				o.fileCompositeBuildRow(ownedBuildRow(r))
+			} else {
+				o.recordBuildNullKey(ownedBuildRow(r))
 			}
 			continue
 		}
@@ -1038,6 +1081,9 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			if o.plan.NullAware {
 				o.antiBuildHasNull = true
 			}
+			// M0127-P4.2: see buildLoopLeft — under RIGHT/FULL the NULL-key
+			// row is unmatched by construction, not absent.
+			o.recordBuildNullKey(ownedBuildRow(r))
 			continue
 		}
 		// M0127-P0.3 (05 §4, stage E3): Semi/Anti go through the same
@@ -1523,7 +1569,15 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	if o.lazyNullRight == nil || len(o.lazyNullRight) != o.lazyRW {
 		o.lazyNullRight = nullRow(o.lazyRW)
 	}
-	nullRight := o.lazyNullRight
+	// M0127-P4.2 (07 §3): the null padding an unmatched PROBE row is emitted
+	// against is the BUILD side's, which is the right side only in the default
+	// orientation. Naming it after its role rather than its side is what lets
+	// RIGHT (build on the left, probe the preserved right) reuse the LEFT fill
+	// path unchanged.
+	nullBuild := o.lazyNullRight
+	if o.hashBuildIsLeft() {
+		nullBuild = o.lazyNullLeft
+	}
 	o.ensureLazyVirtual()
 	// M0127-P2.2: same lazy guard the build loops use — a probe-only unit
 	// test reaches nextLazy without ever running Open's key resolution.
@@ -1592,6 +1646,13 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				continue
 			}
 			o.lazyProbeMatched = true
+			// M0127-P4.2 (07 §3): PG's HeapTupleHeaderSetMatch — the build
+			// tuple is marked here, AFTER the residual predicate, because a
+			// hash-key hit that the residual rejects is not a match and must
+			// not suppress the row from the RIGHT/FULL sweep.
+			if mi < len(o.lazyMatchedCur) {
+				o.lazyMatchedCur[mi] = true
+			}
 			// M0118-0009 (eval-plan-qual): stamp the matched build row's heap
 			// ctid onto the emitted slot so a downstream LockRows can recover
 			// the TID of a locked relation on the build side (whose scan was
@@ -1616,17 +1677,36 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// predicate-level one, so without this check the outer row
 			// is silently dropped instead of null-padded.
 			o.lazyActive = false
-			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft && !o.lazyProbeMatched {
+			if o.fillProbeSide() && !o.lazyProbeMatched {
 				// The probe source is still bound to this row; only
 				// the build side changes to the NULL padding.
-				o.lazyBuildSlot.row = nullRight
+				o.lazyBuildSlot.row = nullBuild
 				o.lazyProbeSrc = nil
 				return o.lazyVirtualOut, nil
 			}
 		}
-		// Pull next probe row.
-		probeSlot, err := o.lazyProbe.Next()
+		// Pull next probe row. M0127-P4.2: once the probe has reported EOF the
+		// sweep returns one row per Next() call, and each of those calls
+		// re-enters here — the latch is what keeps it from pulling an
+		// exhausted operator again (an Operator's post-EOF behaviour is not
+		// part of its contract).
+		var probeSlot TupleSlot
+		var err error
+		if o.probeEOF {
+			err = EOF
+		} else {
+			probeSlot, err = o.lazyProbe.Next()
+		}
 		if err == EOF {
+			o.probeEOF = true
+			// M0127-P4.2 (07 §3): PG's HJ_FILL_INNER_TUPLES. This batch's
+			// build side is still resident, so sweep its unmatched rows
+			// BEFORE the next batch overwrites the table (06 §2.5).
+			if o.fillBuildSide() {
+				if s := o.fillSweepNext(); s != nil {
+					return s, nil
+				}
+			}
 			// M0127-P3.2 (06 §2.3): PG's HJ_NEED_NEW_BATCH. The probe stream
 			// ending means this batch is done, not that the join is — load
 			// the next batch's build side and replay its saved probe rows.
@@ -1636,12 +1716,21 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					return nil, berr
 				}
 				if more {
+					o.probeEOF = false
+					o.fillSweepReset()
 					continue
 				}
 				// Release the files as soon as the last batch drains, but
 				// keep the state itself: Close() is what retires it, and the
 				// counters are what EXPLAIN reads (P3.5).
 				o.batches.close()
+			}
+			// The NULL-keyed build rows belong to no batch, so they are swept
+			// exactly once, after the last one.
+			if o.fillBuildSide() {
+				if s := o.fillNullKeyNext(); s != nil {
+					return s, nil
+				}
 			}
 			return nil, EOF
 		}
@@ -1684,13 +1773,20 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		var key string // used only by the string path + the CTID lookup
 		var ok bool
 		var matches []Row
+		// M0127-P4.2: the int lane never materialises `key`, so the matched
+		// bitmap needs the int64 it looked up under.
+		var matchIntKey int64
+		var haveIntKey bool
 		if o.multiKey() {
 			// M0127-P2.2 (05 §5, stage E4): every equi-pair is in the key, so
 			// a column the qual placement pinned to a constant no longer
 			// collapses the bucket space — and the conjuncts folded into the
 			// key are gone from execResidual, which is what makes the
 			// all-equijoin join do zero interpreted work per match.
-			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide)
+			// M0127-P4.2: a fill-build join needs the key materialised for
+			// the same reason FOR UPDATE does — its parallel map is keyed
+			// alongside lazyHash.
+			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.fillBuildSide())
 			if err != nil {
 				return nil, err
 			}
@@ -1720,6 +1816,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				}
 				if ik, iok := datumToInt64Key(kd); iok {
 					matches = o.lazyIntHash[ik]
+					matchIntKey, haveIntKey = ik, true
 				}
 			}
 		} else {
@@ -1809,19 +1906,28 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
 		if len(matches) == 0 {
-			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
-				// LEFT JOIN: preserve unmatched left rows. The probe
-				// source is already bound; bind the build slot to the
-				// nullRight padding. virtualOut already composes
-				// [probe, build] for !BuildLeft.
+			if o.fillProbeSide() {
+				// The preserved side is the PROBE side: emit the row with
+				// the build side null-padded. The probe source is already
+				// bound; virtualOut composes the two in plan order.
 				o.lazyProbeSrc = nil
-				o.lazyBuildSlot.row = nullRight
+				o.lazyBuildSlot.row = nullBuild
 				return o.lazyVirtualOut, nil
 			}
-			// No matches, not LEFT — skip this probe row.
+			// No matches and nothing to preserve — skip this probe row.
 			continue
 		}
 		o.lazyMatches = matches
+		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
+		// successful match is one indexed store. A join that fills neither
+		// build side keeps lazyMatchedCur nil and pays nothing.
+		if o.fillBuildSide() {
+			if haveIntKey {
+				o.lazyMatchedCur = o.matchedIntBucket(matchIntKey, len(matches))
+			} else {
+				o.lazyMatchedCur = o.matchedStrBucket(key, len(matches))
+			}
+		}
 		if o.preserveBuildSide {
 			o.lazyMatchCTIDs = o.lazyHashCTID[key]
 		}
@@ -1845,6 +1951,14 @@ func (o *joinOp) Close() error {
 	o.lazyMatches = nil
 	o.lazyMatchIdx = 0
 	o.lazyActive = false
+	// M0127-P4.2: the fill state is per-run, exactly like the hash table.
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
+	o.fillNullBuild = nil
+	o.fillNullIdx = 0
+	o.probeEOF = false
+	o.fillSweepReset()
 	o.ctx = nil
 	o.idx = 0
 	errL := o.left.Close()

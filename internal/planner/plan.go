@@ -818,11 +818,14 @@ const (
 // input (matches the executor's historical convention); the
 // planner sets BuildLeft=true when EstimateRows says the left
 // side is smaller — building on the smaller relation cuts both
-// memory and hash-table population time. BuildLeft is INNER-only
-// because LEFT JOIN's outer-row preservation depends on which
-// side drives the probe loop. Merge join sorts both sides on
-// their keys and merges the two ordered streams, preserving
-// RIGHT/FULL outer-row semantics.
+// memory and hash-table population time. Since M0127-P4.2 the
+// executor fills EITHER side (07 §3), so BuildLeft is no longer
+// INNER-only: RIGHT sets it deliberately (build the non-preserved
+// left, probe the preserved right), and an outer join's
+// preservation follows from Type plus BuildLeft rather than from
+// the build side alone. Semi/Anti remain build-right by contract.
+// Merge join sorts both sides on their keys and merges the two
+// ordered streams.
 type Join struct {
 	pos       int
 	Type      JoinType
