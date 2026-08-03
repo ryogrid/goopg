@@ -5615,13 +5615,47 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       Q72 alone reads 273/263/308/480 s/TIMEOUT across five prior sweeps at
       unchanged code). SMOKE via the commit hook. Progress log: design doc §6.
       **P0 is now CLOSED — next is P1.1.**
-- [ ] **M0127-P1.1 — legacy-path slot chaining (the M0126-0004 deferral,
+- [x] **M0127-P1.1 — legacy-path slot chaining (the M0126-0004 deferral,
       un-deferred).** Probe child slot as `lazyVirtualOut` source; rebind on
       pointer change + copy fallback on type change; delete `slotRow(probeSlot)`
       at :1254 and the vestigial `lazyKeyRow`. Env kill-switch
       `GOOPG_JOIN_SLOT_CHAIN=off`. IMPLEMENTATION-TODO P1.1; 05 §2 (E1; F7
       contract — children do not return a stable slot object; fan-out test
       required). Bar: full REGRESS + DS05 + SPOT + seam microbench 0 allocs.
+      **↳ DONE 2026-08-03.** `bindProbe` binds the probe child's own
+      `TupleSlot` into `lazyVirtualOut.sources[lazyProbeSrcIdx]` on **every**
+      pull, and `outerOnlyEmit` composes the Semi/Anti emit through a new
+      `lazyOuterOnlyOut` VirtualSlot instead of `lazyOuterOnlySlot`. Both
+      `slotRow(probeSlot)` sites and the `lazyRow` / `lazyKeyRow` fields are
+      gone. **F7 is handled structurally, not by a type check:** rebinding
+      unconditionally per pull is correct for *any* concrete slot the child
+      returns, so there is nothing to detect — the copy fallback exists for the
+      kill switch and for a slot that cannot serve the composed shape. The one
+      place the width test changes an observable result is the Semi/Anti emit,
+      where the probe slot IS the whole tuple: an over-wide probe keeps its
+      pre-P1.1 width via the copy rather than being silently narrowed to
+      `len(o.schema)` (ledger row `2026-08-03 M0127-P1.1`; PG cannot produce
+      that shape because `ExecHashJoin` projects through `ps_ProjInfo`).
+      The aliasing is safe by control flow only — a probe row is pulled after
+      every match of the previous one has drained — so `bindProbe` asserts
+      exactly that (`lazyActive` must be false) rather than trusting it.
+      Guards (`join_slot_chain_test.go`): the mandatory fan-out test, run over
+      FOUR probe-child slot shapes including one that **rotates shape per
+      pull** (the F7 case), plus Semi/Anti, both LEFT null-pad exits
+      (hash-level and predicate-level), the over-wide copy fallback, the
+      kill-switch arm, and the rebind assertion. **Seam: 0 B / 0 allocs**
+      (`BenchmarkProbeSeam/chained` 58.7 µs per 1024-row pass) vs the
+      kill-switch arm's **172,179 B / 2,048 allocs, 221.3 µs** — 2 allocations
+      per probe row removed, 3.8× on the seam; `TestProbeSeamZeroAllocs` pins
+      it with `AllocsPerRun`. REGRESS (full `TestPort_RegressSuite`) PASS in
+      659 s; UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 17.8 s query phase, peak
+      11,594 MB); **DS05 MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99**
+      (Q1-Q72 + a Q73-Q99 subset probe — the first run died after Q72 on the
+      same post-TIMEOUT `systemd-run` scope collision P0.3 hit, and Q47/Q72 are
+      the known 300 s boundary pair). SMOKE via the commit hook.
+      **Not in scope:** the slab/`buildRec` path (`fillFromTupleSlot` already
+      had its VirtualSlot fast path from M0126-0003) and `fused_hash_join.go`,
+      which dies at P6.1.
 - [ ] **M0127-P1.2 — worker-path exercise.** The P1.1 seam under `BuildWorker`
       (`inWorker=true`) integration test — fusion's decline-in-worker precedent
       says this path diverges silently. IMPLEMENTATION-TODO P1.2. Bar: RACE.

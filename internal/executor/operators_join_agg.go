@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -59,7 +61,6 @@ type joinOp struct {
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
 	lazyProbe    Operator         // probe side (streaming)
-	lazyRow      Row              // current probe row
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
 	lazyActive   bool // true between probeRow and last match
@@ -80,7 +81,6 @@ type joinOp struct {
 	// pair, so a single allocation per side is enough.
 	lazyNullLeft  Row
 	lazyNullRight Row
-	lazyKeyRow    Row
 
 	// M0071-0014 Stage D-2: VirtualSlot composition replaces the
 	// nextLazy concatRows allocations. lazyBuildSlot's .row holds
@@ -92,10 +92,43 @@ type joinOp struct {
 	// Allocated lazily on first nextLazy invocation (Open path is
 	// shared with non-hash joinOp algorithms which don't need the
 	// virtual composition).
+	//
+	// M0127-P1.1 (leftdeep-joins/05 §2, stage E1) demoted both
+	// MaterializedSlots to the COPY FALLBACK: in steady state the probe
+	// child's own slot is bound directly as the probe source, and these
+	// two carry a row only when chaining is off or the child's slot
+	// cannot serve the composed shape.
 	lazyBuildSlot     *MaterializedSlot
 	lazyProbeSlot     *MaterializedSlot
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
+
+	// M0127-P1.1 (design leftdeep-joins/05 §2, stage E1; the un-deferred
+	// 0126-0004): probe-side slot chaining. nextLazy used to flatten the
+	// probe child's slot with `r := slotRow(probeSlot)` — for a
+	// VirtualSlot child that is a pooled acquireRow plus a width-wide
+	// 48-byte-Datum copy per probe row, and the pooled row was never
+	// released. Every aggregate-topped query runs its whole join subtree
+	// on this legacy path, so it, not the slab, governs the analytic
+	// workload. The child's slot is now bound straight into
+	// lazyVirtualOut.sources (and lazyOuterOnlyOut for Semi/Anti), so an
+	// emitted tuple reads through to the child's storage with no copy.
+	//
+	// The F7 contract (0126-0004 §2): a child does NOT return a stable
+	// slot object — the same child may hand back its own lazyVirtualOut,
+	// its lazyOuterOnlySlot, a fresh Materialize() (FOR UPDATE), or a
+	// fresh asSlot per call (rowsOp/spillOp, spill.go). bindProbe
+	// therefore rebinds on EVERY pull instead of caching, and falls back
+	// to one copy when the slot cannot serve the composed shape.
+	//
+	// Lifetime is safe by control flow, not by construction: nextLazy
+	// pulls a new probe row only after every match of the current one has
+	// been drained (lazyActive false). bindProbe asserts exactly that.
+	lazyProbeSrc     TupleSlot    // probe slot bound for the current row (nil = none)
+	lazyProbeSrcIdx  int          // its position inside lazyVirtualOut.sources
+	lazyProbeWidth   int          // columns lazyVirtualOut reads from it
+	lazyOuterOnlyOut *VirtualSlot // Semi/Anti emit slot, chained to the probe
+	lazyChainProbe   bool         // seam enabled (GOOPG_JOIN_SLOT_CHAIN=off disables)
 
 	// M0127-P0.1 (design leftdeep-joins/05 §3, stage E2): hoisted
 	// merged-key slots. mergedKeySlot allocated five objects per BUILD
@@ -1177,6 +1210,25 @@ func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
+// joinSlotChainOn is M0127-P1.1's operational kill switch. Default ON;
+// GOOPG_JOIN_SLOT_CHAIN=off at server start (or
+// SetJoinSlotChainEnabled(false) from tests) restores the pre-P1.1 seam
+// that flattened the probe child's slot into a Row on every pull. Same
+// pattern as GOOPG_HASHED_SUBPLAN (subplan_hash.go).
+var joinSlotChainOn atomic.Bool
+
+func init() {
+	joinSlotChainOn.Store(os.Getenv("GOOPG_JOIN_SLOT_CHAIN") != "off")
+}
+
+// SetJoinSlotChainEnabled toggles probe-side slot chaining. Test-only
+// API; the operational switch is the environment variable read at init.
+// It is read once per joinOp in ensureLazyVirtual, so a toggle takes
+// effect from the next Open, not mid-scan.
+func SetJoinSlotChainEnabled(on bool) { joinSlotChainOn.Store(on) }
+
+func joinSlotChainEnabled() bool { return joinSlotChainOn.Load() }
+
 // ensureLazyVirtual lazily builds the persistent VirtualSlot used
 // by nextLazy to emit joined rows without per-match concat. Source
 // order depends on BuildLeft so plan.Output()'s left++right column
@@ -1190,6 +1242,17 @@ func (o *joinOp) ensureLazyVirtual() {
 	o.lazyBuildSlot = SlotFromRow(nil, nil)
 	o.lazyProbeSlot = SlotFromRow(nil, nil)
 	o.lazyOuterOnlySlot = SlotFromRow(o.schema, nil)
+	// M0127-P1.1: the Semi/Anti emit slot has the probe as its only
+	// source, so its column map is the identity over o.schema (which
+	// Join.Output() derives from Left for those two types — the probe
+	// side, by the buildLazyHashTable contract).
+	outerCols := make([]virtualCol, len(o.schema))
+	for i := range outerCols {
+		outerCols[i] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+	}
+	o.lazyOuterOnlyOut = NewVirtualSlot(o.schema,
+		[]TupleSlot{o.lazyProbeSlot}, outerCols)
+	o.lazyChainProbe = joinSlotChainEnabled()
 	cols := make([]virtualCol, 0, o.lazyLW+o.lazyRW)
 	if o.plan.BuildLeft {
 		// Output is left ++ right; build side is left → sources
@@ -1204,6 +1267,8 @@ func (o *joinOp) ensureLazyVirtual() {
 		}
 		o.lazyVirtualOut = NewVirtualSlot(o.schema,
 			[]TupleSlot{o.lazyBuildSlot, o.lazyProbeSlot}, cols)
+		// BuildLeft → the probe is the RIGHT side, at sources[1].
+		o.lazyProbeSrcIdx, o.lazyProbeWidth = 1, o.lazyRW
 		return
 	}
 	// !BuildLeft: probe is left, build is right → sources
@@ -1216,6 +1281,68 @@ func (o *joinOp) ensureLazyVirtual() {
 	}
 	o.lazyVirtualOut = NewVirtualSlot(o.schema,
 		[]TupleSlot{o.lazyProbeSlot, o.lazyBuildSlot}, cols)
+	o.lazyProbeSrcIdx, o.lazyProbeWidth = 0, o.lazyLW
+}
+
+// bindProbe points the join's output composition at the probe child's
+// current slot (M0127-P1.1; design leftdeep-joins/05 §2, stage E1).
+//
+// Steady state writes one interface word into lazyVirtualOut.sources and
+// copies nothing. Two conditions fall back to the pre-P1.1 copy through
+// lazyProbeSlot, so the seam can never be the reason a row is wrong:
+//
+//   - the kill switch is off (GOOPG_JOIN_SLOT_CHAIN=off), and
+//   - the child's slot is narrower than the columns lazyVirtualOut reads
+//     from it. That is the F7 type-change fallback in its observable
+//     form: what matters about "the child returned a different slot" is
+//     only whether the new slot can still serve the composed shape.
+//     (A WIDER slot needs no fallback — the extra columns are simply
+//     never addressed, exactly as the flattened Row's were not.)
+//
+// The returned bool reports whether chaining took effect; Semi/Anti uses
+// it to pick between the chained and the copied outer-only emit slot.
+//
+// Aliasing the child's storage is safe only because nextLazy pulls a new
+// probe row after draining every match of the previous one. Nothing in
+// the type system enforces that, so assert it here rather than trust it
+// (bundle 02 §2.4's honesty note).
+func (o *joinOp) bindProbe(probeSlot TupleSlot) (bool, error) {
+	if o.lazyActive {
+		return false, &ExecError{Code: "XX000", Message: "join probe rebound while matches were still draining"}
+	}
+	if o.lazyChainProbe && probeSlot != nil && probeSlot.Width() >= o.lazyProbeWidth {
+		o.lazyVirtualOut.sources[o.lazyProbeSrcIdx] = probeSlot
+		o.lazyProbeSrc = probeSlot
+		return true, nil
+	}
+	o.lazyProbeSlot.row = slotRow(probeSlot)
+	o.lazyVirtualOut.sources[o.lazyProbeSrcIdx] = o.lazyProbeSlot
+	o.lazyProbeSrc = o.lazyProbeSlot
+	return false, nil
+}
+
+// outerOnlyEmit returns the Semi/Anti emit slot for the probe row bound
+// by bindProbe. chained reports bindProbe's verdict for the INNER
+// composition; the outer-only slot needs the STRICTER width test because
+// here the probe slot is the whole emitted tuple, so its width is the
+// tuple's width. Pre-P1.1 an over-wide probe child emitted all of its
+// columns (slotRow handed the full Row to lazyOuterOnlySlot) — chaining
+// would silently narrow that to len(o.schema). P1.1 rewrites the seam, not
+// the semantics, so a width mismatch takes the copy and keeps the old
+// shape; a later stage may narrow it deliberately.
+func (o *joinOp) outerOnlyEmit(probeSlot TupleSlot, chained bool) TupleSlot { //nolint:ireturn
+	if chained {
+		if probeSlot.Width() == len(o.schema) {
+			o.lazyOuterOnlyOut.sources[0] = probeSlot
+			return o.lazyOuterOnlyOut
+		}
+		o.lazyOuterOnlySlot.row = slotRow(probeSlot)
+		return o.lazyOuterOnlySlot
+	}
+	// bindProbe already flattened the child's slot into lazyProbeSlot —
+	// reuse that Row rather than materialise the child a second time.
+	o.lazyOuterOnlySlot.row = o.lazyProbeSlot.row
+	return o.lazyOuterOnlySlot
 }
 
 func (o *joinOp) Next() (TupleSlot, error) {
@@ -1295,8 +1422,15 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if err != nil {
 				return nil, err
 			}
-			o.lazyOuterOnlySlot.row = slotRow(probeSlot)
-			return o.lazyOuterOnlySlot, nil
+			// M0127-P1.1: same chained seam as the main loop — this
+			// branch emits the probe row untouched, which is exactly
+			// what outerOnlyEmit composes.
+			chained, err := o.bindProbe(probeSlot)
+			if err != nil {
+				return nil, err
+			}
+			o.lazyProbeSrc = nil
+			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
 	}
 	for {
@@ -1312,7 +1446,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			m := o.lazyMatches[mi]
 			o.lazyMatchIdx++
 			o.lazyBuildSlot.row = m
-			o.lazyProbeSlot.row = o.lazyRow
+			// M0127-P1.1: the probe source stays bound from bindProbe
+			// for the whole drain of this probe row — no per-match
+			// re-binding, and no flattened Row to re-bind from.
 			ok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
 			if err != nil {
 				return nil, err
@@ -1346,9 +1482,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// is silently dropped instead of null-padded.
 			o.lazyActive = false
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft && !o.lazyProbeMatched {
-				o.lazyProbeSlot.row = o.lazyRow
+				// The probe source is still bound to this row; only
+				// the build side changes to the NULL padding.
 				o.lazyBuildSlot.row = nullRight
-				o.lazyRow = nil
+				o.lazyProbeSrc = nil
 				return o.lazyVirtualOut, nil
 			}
 		}
@@ -1360,11 +1497,15 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if err != nil {
 			return nil, err
 		}
-		r := slotRow(probeSlot)
-		o.lazyRow = r
+		// M0127-P1.1 (05 §2, stage E1): bind the child's slot as the
+		// probe source instead of flattening it with slotRow.
+		chained, err := o.bindProbe(probeSlot)
+		if err != nil {
+			return nil, err
+		}
 		// M0126-0003 0b: evaluate the probe key against a
 		// VirtualSlot over {probeSlot, nullOtherSide} instead
-		// of copying into lazyKeyRow.
+		// of copying into a merged key Row.
 		//
 		// realWidth must match the probe side's width:
 		//   BuildLeft=true  → probe is right side → realWidth=lazyRW
@@ -1443,7 +1584,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
-				o.lazyProbeSlot.row = r
+				// Probe source already bound by bindProbe.
 				for _, m := range matches {
 					o.lazyBuildSlot.row = m
 					pok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
@@ -1460,25 +1601,23 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				if !anyMatch {
 					continue
 				}
-				o.lazyRow = nil
-				o.lazyOuterOnlySlot.row = r
-				return o.lazyOuterOnlySlot, nil
+				o.lazyProbeSrc = nil
+				return o.outerOnlyEmit(probeSlot, chained), nil
 			}
 			// Anti: keep iff no match passed the predicate.
 			if anyMatch {
 				continue
 			}
-			o.lazyRow = nil
-			o.lazyOuterOnlySlot.row = r
-			return o.lazyOuterOnlySlot, nil
+			o.lazyProbeSrc = nil
+			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
-				// LEFT JOIN: preserve unmatched left rows. Bind
-				// build slot to nullRight padding; virtualOut
-				// already composes [probe, build] for !BuildLeft.
-				o.lazyRow = nil
-				o.lazyProbeSlot.row = r
+				// LEFT JOIN: preserve unmatched left rows. The probe
+				// source is already bound; bind the build slot to the
+				// nullRight padding. virtualOut already composes
+				// [probe, build] for !BuildLeft.
+				o.lazyProbeSrc = nil
 				o.lazyBuildSlot.row = nullRight
 				return o.lazyVirtualOut, nil
 			}
@@ -1503,7 +1642,7 @@ func (o *joinOp) Close() error {
 	o.lazyHash = nil
 	o.lazyIntHash = nil
 	o.lazyProbe = nil
-	o.lazyRow = nil
+	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
 	o.lazyMatchIdx = 0
 	o.lazyActive = false
