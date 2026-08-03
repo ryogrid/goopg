@@ -546,10 +546,19 @@ started.
 >       BOOKKEEPING half (Q47's 8.4x runtime verdict — a documentation
 >       contradiction between `RESULTS.md` chunk 49-56 / the RC-1b ledger row
 >       and `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6, not engine work).
->       **NEXT SELECTION: `M0125-0013` (bookkeeping half) — it NEEDS A QUIET
+>       **↳ SUPERSEDED 2026-08-03 (loop #41): `M0125-0013`'s bookkeeping half
+>       IS `[x]`.** All three M0125 items M0127 waited on are discharged, so
+>       **M0127 IS NOW OPEN and is the NEXT SELECTION.** Two facts it inherits:
+>       Q47 is measured at **537.55 s vs PG 3.38 s (159×)** with a
+>       byte-identical answer, and ~485 s of that is one self-join whose hash
+>       key degenerates to `i_category` (10 distinct over 63,745 rows, vs 5,667
+>       for the 4-key composite PG merge-joins on) — i.e. the single-key hash
+>       deferral `M0125-0011`/`M0125-0035` is worth far more than those rows
+>       implied, and Q47 is its sharpest witness.
+>       ~~**NEXT SELECTION: `M0125-0013` (bookkeeping half) — it NEEDS A QUIET
 >       HOST** (`pgrep -af run-nightly.sh` first; every timing taken on
 >       2026-07-30 was under the nightly batch at load ~10), **then M0127
->       opens.** `M0125-0040` (ROLLUP) is an independent track OUTSIDE the
+>       opens.**~~ `M0125-0040` (ROLLUP) is an independent track OUTSIDE the
 >       M0127 bundle and is explicitly not a prerequisite; the other open
 >       M0125 items (`-0003` stage 3, `-0031`, `-0032`, `-0033`, `-0037`,
 >       `-0041`) are likewise not on M0127's waiting list — `-0032` (Q21) was
@@ -3575,7 +3584,43 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       four M0125 items the M0127 banner waits on (exprwalk commits 5–8,
       -0047, -0040, -0013).
 
-- [ ] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
+- [x] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict** —
+      **DONE 2026-08-03, SETTLED BY MEASUREMENT.** Quiet host verified
+      (`pgrep -af run-nightly.sh` empty, load 0.28–1.21 vs the load ~10 every
+      2026-07-30 timing was taken under), HEAD `374dc60e`, both engines back to
+      back. Evidence `analysis/m0125-0013-q47-verdict/`.
+      **By-value acceptance MET**: Q47 = **100 rows, byte-identical to PG** at
+      SF=1. **Runtime: goopg 537.55 s vs PG 3.38 s = 159×** — so the 142 s this
+      item argues about is itself superseded (and the SF0.5 `TIMEOUT` sighting
+      is explained, not anomalous).
+      **Both primary sources are REFUTED, in opposite directions.** `RESULTS.md`
+      chunk 49–56's *"the 8.4× is the expected cost of real work, Q47 is NOT a
+      regression"* cannot survive a 3.4 s PG reading — and neither can the
+      `tpcds-round2 RC-1b` ledger row's *"(14s->143s confirms real work)"* it
+      cites; the merged deliverable's §3.2 had the right **direction** for a
+      since-falsified **reason** ("the row count did not move" — it moved to 100
+      and the query got *slower*), and §6 item 2's "bounded but unattributed" is
+      wrong on both words. Verdicts written into all four documents (both
+      analysis reports, design doc § Q47, `docs/design/README.md`); the two
+      refuted ledger rows are marked in place.
+      **The runtime is ATTRIBUTED and needs no Q47-specific task.** The CTE is
+      neither the cost nor recomputed (`cteScanOp.Open` keys `ctx.CTERowCache`
+      on the CTE *name*, so `v1`/`v1_lag`/`v1_lead` share one evaluation even
+      though EXPLAIN renders the body 3×; standalone **52.28 s / 63,745 rows**),
+      leaving ~485 s in the `v2` three-way self-join — whose hash key degenerates
+      to `i_category` because `splitEqualityForHash` returns only the FIRST
+      disjoint equality. Measured over v1: `i_category` **10** distinct,
+      `i_brand` 704, `s_store_name` 6, `s_company_name` **1**, vs **5,667** for
+      the 4-key composite PG merge-joins on = a **~567× over-scan per probe**,
+      twice. That is the pre-existing single-`LeftKey`/`RightKey` deferral
+      (ledger `M0125-0011` / `M0125-0035`), **not** an RC-1b regression: RC-1b
+      only made an already-defective join *reachable*, which is why runtime went
+      17 s (empty) → 142 s (partial) → 537 s (fully correct) as the answer
+      improved. **Q47 is now the sharpest known benchmark witness for that
+      deferral** — hand it to M0127/M0125-0035, not to a new task.
+      Anchor **`Q47,100,pinned` ADDED** to `ci/batch/tpcds-row-anchors.csv`.
+      *(Original task text below.)*
+      **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
       (ledger rows `tpcds-round2 q47-q49-q51` 2026-07-29 and M0125-0013
       2026-07-30; §13.4 item 2). The ROW defect is closed — Q47 returns 100
       rows = oracle as of 2026-07-30. What remains is purely a documentation

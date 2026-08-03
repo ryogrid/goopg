@@ -1,0 +1,3 @@
+== PG 18.3, port 65438, db tpcds, SF=1, user ryo ==
+2026-08-03T10:45:40+09:00
+PG wall: 3.38 s

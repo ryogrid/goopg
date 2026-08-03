@@ -120,6 +120,72 @@ grows beyond a diff and a paragraph.
 sees the row gap today and will register the fix; the nightly anchors will not — **add** a
 Q47 row to `ci/batch/tpcds-row-anchors.csv` on close.
 
+### ✅ Execution record (2026-08-03) — the contradiction is SETTLED by measurement
+
+Taken on a **verified quiet host** (`pgrep -af run-nightly.sh` empty; load 0.28–1.21,
+against the load ~10 under which every 2026-07-30 timing was taken), HEAD `374dc60e`,
+one binary, both engines on the same host back to back. Evidence
+`analysis/m0125-0013-q47-verdict/`.
+
+| reading | goopg SF=1 (:65436) | PG 18.3 SF=1 (:65438 `tpcds`) |
+|---|---|---|
+| Q47 wall | **537.55 s** | **3.38 s** |
+| rows | 100 | 100 |
+| values | **byte-identical** (`diff` clean, `q47-value-diff.txt`) | — |
+
+**Row/value acceptance is met**: 100 rows = PG *and* the full 100-row output diffs clean
+at SF=1, which is the bar this section set.
+
+**The runtime verdict is that BOTH primary sources are wrong, in opposite directions.**
+
+1. `RESULTS.md` chunk 49–56 — "*Q47 is NOT a regression … the 8.4× is the **expected
+   cost** of real work*" — is **REFUTED**. PG runs the identical query over the identical
+   data in 3.38 s. goopg is **159×** slower. No amount of newly-correct input makes 537 s
+   the expected cost of a 3.4 s query. The same refutation lands on the `tpcds-round2
+   RC-1b` ledger row's parenthetical "*(14s->143s confirms real work)*".
+2. `analysis/tpcds-sf1-goopg-20260728.md` §3.2 reached the **right direction** ("a
+   slowdown, not the cost of a newly-correct plan") for the **wrong reason** ("the row
+   count did not move" — it has since moved to 100 and the runtime got *worse*), and §6
+   item 2's "**bounded** but **unattributed**" is now wrong on both words: the figure is
+   537 s, not the 142 s it bounds, and it is attributed below.
+
+**Attribution — measured, not argued.**
+
+- The CTE is *not* the cost and is *not* recomputed. `internal/executor/operators_cte_dml.go:214`
+  (`cteScanOp.Open`) keys `ctx.CTERowCache` on the **CTE name**, so `v1`, `v1_lag` and
+  `v1_lead` share one evaluation even though `EXPLAIN` renders the body under all three
+  `CTE Scan` nodes. Measured standalone on a fresh server: **52.28 s / 63,745 rows**
+  (`goopg-v1-only.txt`). So ~485 s of the 537 s is the three-way self-join alone.
+- That join degenerates to a **single low-cardinality hash key**.
+  `internal/planner/planner.go:5249` (`splitEqualityForHash`) returns on the **first**
+  disjoint-side equality conjunct, which for Q47's `v2` is `v1.i_category =
+  v1_lag.i_category`. Measured cardinalities over v1's 63,745 rows
+  (`q47-key-cardinality.txt`): `i_category` **10**, `i_brand` 704, `s_store_name` 6,
+  `s_company_name` **1**, and the 4-key composite PG joins on **5,667**. goopg therefore
+  probes ~6,374-row buckets where a composite key would probe ~11 — a **~567× over-scan
+  per probe**, twice (two nested hash joins). PG's plan instead uses two **Merge Joins
+  over all four keys** with `rn` as the join filter, and materializes the CTE once.
+- **This is a pre-existing, already-filed defect, not an RC-1b regression.** The
+  single-`LeftKey`/`RightKey` limitation is ledger rows `M0125-0011` (2026-07-29) and
+  `M0125-0035` (2026-08-01), whose shared resume point is exactly
+  `splitEqualityForHash` → return every disjoint-side equality, with the
+  `lazyHash`/`lazyIntHash` build+probe sibling hashing the datum vector.
+  What RC-1b changed was **reachability**: at set A the CTE body was empty, so the
+  self-join did nothing and cost 17 s. Each subsequent fix let more of the pipeline
+  actually execute (17 s empty → 142 s partial → 537 s fully correct), which is why the
+  runtime kept climbing while the answer kept improving. So the RC-1b reading was
+  directionally right that more work is being done — it was wrong to call that work
+  *expected*, because 567× of it is over-scan.
+
+**Consequence for the runtime half.** It needs no Q47-specific task: it is discharged
+into the existing multi-column-hash-key deferral. Q47 is the sharpest known benchmark
+witness for it (159× PG, and it is what pushes Q47 past the SF0.5 gate's 300 s cap on
+*half* the data). The step-0 ordering constraint this section imposed is satisfied — the
+attribution was taken before any plan-shape change.
+
+**Anchor added**: `Q47,100,pinned` in `ci/batch/tpcds-row-anchors.csv` (an addition, not a
+re-pin — the file had no Q47 row).
+
 ---
 
 ## § Q49 — M0125-0014: 30 rows where PG returns 34, and 30 is suspiciously 3 × 10

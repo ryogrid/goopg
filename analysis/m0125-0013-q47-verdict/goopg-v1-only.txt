@@ -1,0 +1,9 @@
+== v1 CTE body ALONE, one evaluation, goopg SF=1, fresh server ==
+2026-08-03T10:56:31+09:00
+ 10:56:31 up 7 days, 16:46, 13 users,  load average: 1.21, 1.08, 1.02
+ count 
+-------
+ 63745
+(1 row)
+
+goopg v1-only wall: 52.28 s
