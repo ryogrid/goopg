@@ -278,22 +278,29 @@ func TestVirtualSlotColMapping(t *testing.T) {
 // ---- buildEnv round-trip ----
 
 func TestBuildEnvSetup(t *testing.T) {
-	// Verify that Build sets up the env correctly and restores it.
-	prevEnv := buildEnvInFlight
+	// M0127-P1.2 rewrote this. It used to assign the package global
+	// buildEnvInFlight and read it back, which asserted only that Go
+	// variables hold what is stored in them — and the global it exercised
+	// was the source of the parallel-build data race. The env is now a
+	// local of buildWithEnv, so what is worth pinning is that a fresh env
+	// carries the three fields tryFuseHashCascade reads, and that the
+	// worker flag is the one thing that distinguishes the two entry
+	// points (C10/F4: fusion declines in a worker).
+	leader := &buildEnv{root: nil, inWorker: false, fusionCfg: readFusionConfig()}
+	worker := &buildEnv{root: nil, inWorker: true, fusionCfg: readFusionConfig()}
 
-	// We can't call Build directly without a real plan that would
-	// succeed, but we can verify the env lifecycle pattern.
-	env := &buildEnv{
-		root:      nil,
-		fusionCfg: readFusionConfig(),
+	if leader.inWorker {
+		t.Error("leader env must not be marked inWorker")
 	}
-	buildEnvInFlight = env
-	if buildEnvInFlight != env {
-		t.Error("buildEnvInFlight should be env")
+	if !worker.inWorker {
+		t.Error("worker env must be marked inWorker")
 	}
-	buildEnvInFlight = prevEnv
-	if buildEnvInFlight != prevEnv {
-		t.Error("buildEnvInFlight should be restored")
+	if leader.q0.ran || worker.q0.ran {
+		t.Error("a fresh env must have an unmemoised Q0")
+	}
+	if leader.fusionCfg.minLevels != worker.fusionCfg.minLevels {
+		t.Errorf("fusion config differs between entry points: %d vs %d",
+			leader.fusionCfg.minLevels, worker.fusionCfg.minLevels)
 	}
 }
 

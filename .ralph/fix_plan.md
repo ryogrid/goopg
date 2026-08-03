@@ -1163,6 +1163,24 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       fixed the nightly race lane stays red every night. FILED, NOT SELECTED
       per the 2026-07-28(b) amendment — the race lane is not on the banner's
       carve-out gate list and units/tpch-spotcheck/SF0.5 all pass at HEAD.
+      **↳ (b) FIXED 2026-08-03 by M0127-P1.2** (whose own bar is RACE, and
+      which could not be met while this was red — the item was reached as
+      P1.2's blocker, not selected out of order). **The "NOT a quick patch"
+      prediction was wrong, and why is worth keeping:** the global never
+      needed to survive the recursion. `buildWithEnv` sets it at the top of
+      the switch and the ONLY read in that function is the `*planner.Join`
+      arm's `tryFuseHashCascade`, which runs before any recursive `Build`
+      could overwrite it — so the value read was always the one this very
+      invocation stored, i.e. already a local in disguise. Making it an actual
+      local (`executor.go`) is behaviour-identical and removes the sharing.
+      The second read, `buildRec`'s Join arm, is now the explicit nil field
+      `opTreeSlab.env`: `BuildFast` is a top-level entry (dispatch's
+      simple-query path) with no `buildWithEnv` frame above it, so the global
+      it used to read there was ALWAYS nil — fusion has never been reachable
+      from the slab path, only from the extended-protocol `executor.Build`
+      one. `make race-gate` now passes end-to-end (EXIT=0, all packages),
+      first time since M0126-0006 landed. Nightly's race lane should clear on
+      the next run; item (a) remains stale-only.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -5656,9 +5674,36 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Not in scope:** the slab/`buildRec` path (`fillFromTupleSlot` already
       had its VirtualSlot fast path from M0126-0003) and `fused_hash_join.go`,
       which dies at P6.1.
-- [ ] **M0127-P1.2 — worker-path exercise.** The P1.1 seam under `BuildWorker`
+- [x] **M0127-P1.2 — worker-path exercise.** The P1.1 seam under `BuildWorker`
       (`inWorker=true`) integration test — fusion's decline-in-worker precedent
       says this path diverges silently. IMPLEMENTATION-TODO P1.2. Bar: RACE.
+      **↳ DONE 2026-08-03.** `join_worker_path_test.go` asserts three claims
+      that do not imply one another: (1) the seam **engages** under
+      `BuildWorker` — structural, not by result, because a declined seam
+      returns identical rows (that is the copy fallback's whole design, and
+      the reason fusion's `inWorker` decline went unnoticed); (2) rows
+      produced by a chained emit and **retained** across later pulls survive
+      `MaterializeForTransfer` + `AssertTransferable` — the worker batches 256
+      rows before sending, so a probe source the next pull overwrites corrupts
+      every row but the last, while a serial consumer formatting each row on
+      arrival never notices; (3) real-Gather identity over the P8 corpus in
+      BOTH seam arms × leader-participation on/off × 2 and 4 workers — the
+      leader-off arm is the one where EVERY row crosses the goroutine
+      boundary. All three bite: `GOOPG_JOIN_SLOT_CHAIN=off` fails (1), and a
+      stubbed shallow `MaterializeForTransfer` fails (2) and (3) (`got
+      "NULL|NULL|NULL"`, `"2|d-2"` vs `"200|d-0"` — `VirtualSlot.Row()` hands
+      back a POOLED row, so the corruption is real, not theoretical).
+      **The exercise found the divergence it was written to look for, in the
+      BUILD path rather than the seam:** `buildEnvInFlight` — see the
+      M-NIGHTLY race item above, fixed here, `make race-gate` green
+      end-to-end for the first time since M0126-0006. The seam itself did NOT
+      diverge in a worker. Gates: RACE (`make race-gate` EXIT=0, all
+      packages; the same executor tests were red at HEAD with every frame in
+      `buildWithEnv`), UNITS PASS, SPOT PASS (Q12=2 / Q13=35, 17.8 s query
+      phase, peak 11,597 MB), SMOKE via the commit hook. Ledger row
+      `2026-08-03 M0127-P1.2` records the un-audited remainder: only this one
+      global was removed, not the package's build/exec-time globals as a
+      class. Progress log: design doc §6.
 - [ ] **M0127-P1.3 — S1 A/B evidence run.** Q3/Q10/Q18/Q7 ≤ 1.2× R0; no other
       query > 1.2× vs pre-S1 HEAD; file `analysis/leftdeep-joins/<date>-s1-ab.txt`.
       No code. Bar: bar met or attributed (09 §6) **before P2 starts**.

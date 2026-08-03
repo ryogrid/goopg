@@ -32,13 +32,21 @@ func BuildWorker(plan planner.Node) (Operator, error) {
 func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 	// M0126-0006: thread buildEnv through this Build call so
 	// tryFuseHashCascade can access root + inWorker + fusion config.
-	prevEnv := buildEnvInFlight
-	buildEnvInFlight = &buildEnv{
+	//
+	// M0127-P1.2: this is a LOCAL, not a package global. It used to be
+	// `buildEnvInFlight`, saved and restored around the switch — which
+	// read identically here (the *planner.Join case below reads it
+	// before any recursive Build could overwrite it) but was written
+	// concurrently by every Gather worker, since gatherOp.runWorker
+	// calls BuildWorker from its own goroutine while the leader builds
+	// its own child tree. That made `go test -race` red for EVERY
+	// parallel-join test, with the whole race confined to this one
+	// variable. A local removes the sharing outright.
+	env := &buildEnv{
 		root:      plan,
 		inWorker:  inWorker,
 		fusionCfg: readFusionConfig(),
 	}
-	defer func() { buildEnvInFlight = prevEnv }()
 
 	switch p := plan.(type) {
 	case *planner.Values:
@@ -160,7 +168,7 @@ func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 	case *planner.Join:
 		// M0126-0006: try fusion first; fall through to
 		// ordinary cascade when the predicate declines.
-		if fused, ok := tryFuseHashCascade(buildEnvInFlight, p); ok {
+		if fused, ok := tryFuseHashCascade(env, p); ok {
 			return maybeInstrument(p, fused), nil
 		}
 		left, err := Build(p.Left)
@@ -559,7 +567,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 
 	case *planner.Join:
 		// M0126-0006: try fusion first; fall through when declined.
-		if fused, ok := tryFuseHashCascade(buildEnvInFlight, p); ok {
+		if fused, ok := tryFuseHashCascade(tree.env, p); ok {
 			return tree.add(OpNode{Kind: OpAdapter, childA: noChild, childB: noChild,
 				state: &opAdapterState{op: fused}}), nil
 		}
