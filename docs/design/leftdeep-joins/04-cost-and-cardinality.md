@@ -36,6 +36,53 @@ currency). Two M0126-0013 artifacts get opposite treatment:
 GUC threading (`seq_page_cost` etc.) remains the C3.2/C4 TODO it already is
 — out of scope here, unchanged.
 
+### 1.1 The index-scan currency: `cost_index` and one calibration knob
+
+*(Added by P5.4c-ii-b, `internal/planner/costindex.go`.)*
+
+goopg prices index access in **two** places, and the rule that keeps them one
+currency is that only one of them is calibrated:
+
+| | what it prices | PG oracle |
+|---|---|---|
+| `paramIndexScanCost` (`pathparamindex.go`) | ONE bound probe of a parameterised path; the join above multiplies it | `cost_index` at `loop_count > 1`, by convention "cost one execution" |
+| `costIndexScan` (`costindex.go`) | a whole scan of the relation through the index | `cost_index` (costsize.c:520) at `loop_count == 1` |
+
+The first is built on `indexProbeCost` × `indexProbeCostMultiplier`
+(`cost_funcs.go`), a knob measured because goopg materialises the entire TID
+list per probe and so runs slower than `random_page_cost` predicts. The second
+is a faithful transcription of `cost_index` — Mackert-Lohman page estimation
+(`index_pages_fetched`, costsize.c:906), `genericcostestimate`'s index-side
+charge, `btcostestimate`'s 50 × `cpu_operator_cost` per descended page, and the
+csquared interpolation between the all-random and mostly-sequential I/O cases
+— **with the same multiplier applied to every random-page term**. Sequential
+fetches and per-tuple CPU stay PG-native, because that is not what the
+multiplier was measured against.
+
+That is the whole discipline: one knob, reaching both models. A second
+independently-derived index cost model beside the first is the failure §1
+forbids — raising the knob would then make a probe expensive while leaving a
+full index scan untouched, and the two would be compared inside one `addPath`.
+
+**Correlation.** The interpolation reads `indexCorrelation`, which PG takes
+from `STATISTIC_KIND_CORRELATION` on the index's leading column (negated for a
+DESC key, × 0.75 for a multi-column index — `btcost_correlation`,
+selfuncs.c:7305). goopg's ANALYZE collects no correlation slot, so
+`indexCorrelationFor` returns 0 — which is not a stub but exactly what PG
+charges for an index with no correlation statistic (`genericcostestimate`:
+"generic assumption about index correlation: there isn't any"). The practical
+consequence is that a full ordered index scan always prices at
+`max_IO_cost` and normally loses to a sort over a sequential scan; it survives
+in the pathlist only on the strength of its pathkeys. Collecting the statistic
+is a separate slice (ledgered), not a tuning constant to invent here.
+
+**Index geometry.** `cost_index` reads `index->pages`, `index->tuples` and
+`index->tree_height` off the index relation. goopg's `catalog.Index` has none
+of them — ANALYZE does not visit indexes — so `estimateIndexGeometry` derives
+them from the heap's row count and the declared key width at the B-tree default
+fillfactor. Ledgered; the resume point is index-level catalog statistics, not a
+better formula.
+
 ## 2. Rows once: `RelOptInfo.rows` is the single source
 
 Each `RelOptInfo` carries `rows` set exactly once:

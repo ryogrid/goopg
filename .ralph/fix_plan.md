@@ -6609,14 +6609,36 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       index path today is parameterised, so an ordered merge OUTER still needs
       the unparameterised arm — now split out as P5.4c-ii-b. IMPLEMENTATION-TODO
       P5.4c-ii-a; 03 §5.3, 04 §2.1. 4 ledger rows. Bar met: UNITS.
-- [ ] **M0127-P5.4c-ii-b — UNPARAMETERISED ordered index paths:**
-      `build_index_paths`' `useful_pathkeys != NIL` arm (indxpath.c:750-800)
-      over `cost_index` (costsize.c:520) with the index-correlation model. This
-      is what actually makes an ordered merge outer reachable (see the ii-a
-      finding). Split from ii-a because it needs a real index cost model and
-      04 §1 forbids a second independently-calibrated one being smuggled in
-      beside a pathkey builder — `paramIndexScanCost` prices ONE probe and is
-      not it. IMPLEMENTATION-TODO P5.4c-ii-b; 04 §1. Bar: UNITS + SPOT.
+- [x] **M0127-P5.4c-ii-b — UNPARAMETERISED ordered index paths.** DONE
+      2026-08-04 (`internal/planner/costindex.go` + `pathindexordered.go`,
+      `cost_funcs.go`). `build_index_paths`' `useful_pathkeys != NIL` arm
+      (indxpath.c:750-800) over a real `cost_index` (costsize.c:520): an index
+      path with the index's ordering, NO index quals and an **empty
+      `RequiredOuter`** — the only shape `try_mergejoin_path` accepts
+      (joinpath.c:1073-1081), so P5.4c-i's sort-skip branch finally has a
+      producer. `cost_index`'s `loop_count == 1` arm is transcribed whole:
+      Mackert-Lohman `index_pages_fetched` (costsize.c:906) in both regimes,
+      `genericcostestimate` reduced to the no-qual case, `btcostestimate`'s
+      50 × `cpu_operator_cost` descent charged at STARTUP (what lets an
+      ordered scan beat a sort under LIMIT), and the csquared interpolation
+      between all-random and one-random-then-sequential I/O. **The one-currency
+      discipline 04 §1 demanded is met by tying it to the EXISTING
+      `indexProbeCostMultiplier` on every random-page term** rather than
+      calibrating a second model — a test pins that raising the knob scales
+      both. `indexCorrelationFor` returns 0 because goopg collects no
+      `STATISTIC_KIND_CORRELATION`, which is what PG itself charges for a
+      missing slot; consequence: an ordered scan prices at `max_IO_cost` and
+      survives only on its pathkeys (pinned by a test). Two gate findings:
+      `has_useful_pathkeys` reduces to its join-clause arm (§10 carries no
+      query/group pathkeys), and building the ordering + truncating it to the
+      merge-useful prefix is provably ONE left-to-right loop, because with
+      syntactic pathkeys there is no EC object to name a column no clause
+      mentions. `effective_cache_size` joins `costParams` in PAGES with its own
+      drift guard. `addBaseRelIndexPaths` combines both halves of
+      `create_index_paths` so a caller cannot wire up one. Still inert. 7
+      ledger rows — one ("`Path` names no index or scan direction") is a stated
+      **P5.5 prerequisite**. IMPLEMENTATION-TODO P5.4c-ii-b; 03 §5.3, 04 §1.1.
+      Bar met: UNITS + SPOT.
 - [ ] **M0127-P5.4c-ii-c — `generate_mergejoin_paths`** (joinpath.c:1564) inside
       `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered
       outer instead of sorting, with mergeclause-list truncation and the

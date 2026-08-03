@@ -386,12 +386,32 @@
   `cost_index`, and 04 §1 forbids a second independently-calibrated index cost
   model being smuggled in beside a pathkey builder. Still inert — no
   `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF. 4 ledger rows. UNITS PASS.)*
-- [ ] **P5.4c-ii-b** UNPARAMETERISED ordered index paths — `build_index_paths`'
+- [x] **P5.4c-ii-b** UNPARAMETERISED ordered index paths — `build_index_paths`'
   `useful_pathkeys != NIL` arm (indxpath.c:750-800) over `cost_index`
   (costsize.c:520) with the index-correlation model. This, not P5.4c-ii-a, is
   what makes an ordered MERGE OUTER reachable: `addMergeJoinPath` refuses a
   parameterised path outright (joinpath.c:1073-1081), so today's ordered index
   paths — all parameterised — can never satisfy its sort-skip branch.
+  *(DONE 2026-08-04, `internal/planner/costindex.go` +
+  `pathindexordered.go`, `cost_funcs.go`. `cost_index` transcribed for the
+  `loop_count == 1` arm: Mackert-Lohman `index_pages_fetched`
+  (costsize.c:906) in both regimes, `genericcostestimate`'s index-side charge
+  reduced to the no-qual case, `btcostestimate`'s 50 × `cpu_operator_cost`
+  descent (charged at startup, which is what lets an ordered scan beat a sort
+  under LIMIT), and the csquared interpolation between the all-random and
+  one-random-then-sequential I/O cases. Tied to the EXISTING
+  `indexProbeCostMultiplier` on every random-page term rather than to a second
+  calibration — 04 §1.1. `indexCorrelationFor` returns 0 because goopg has no
+  `STATISTIC_KIND_CORRELATION` slot, which is what PG itself charges for a
+  missing slot, so an ordered scan prices at `max_IO_cost` and survives only on
+  its pathkeys. The generation gate is `has_useful_pathkeys`' join-clause arm
+  alone (§10 has no query/group pathkeys), and building-plus-truncating the
+  ordering is provably ONE left-to-right loop. `effective_cache_size` joins
+  `costParams` (in PAGES, as PG's variable is) with its own drift guard.
+  Combined entry point `addBaseRelIndexPaths` so a caller cannot wire up one
+  half of `create_index_paths`. Still inert — no `planSelect` call site,
+  `GOOPG_PGSHAPED_DP` OFF. 7 ledger rows, one of which (`Path` names no index)
+  is a stated PREREQUISITE of P5.5. UNITS + SPOT PASS.)*
 - [ ] **P5.4c-ii-c** `generate_mergejoin_paths` (joinpath.c:1564) inside
   `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered outer
   instead of sorting, with mergeclause-list truncation and the materialize-inner

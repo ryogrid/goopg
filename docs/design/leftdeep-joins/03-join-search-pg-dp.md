@@ -350,6 +350,38 @@ column name) instead of manufacturing them, and P5.4c-ii-b's unparameterised
 path must find the same expressions from the rel's own binding rather than
 inventing them.
 
+**Status (P5.4c-ii-b, 2026-08-04) — the merge outer now exists.**
+`pathindexordered.go` builds `build_index_paths`' `useful_pathkeys != NIL` arm
+(indxpath.c:750-800): for each base rel, an index path with the index's
+ordering, **no index quals, and an empty `RequiredOuter`**. That last property
+is the whole slice — it is the only shape `try_mergejoin_path` (:1073-1081)
+will accept, so the sort-skip branch P5.4c-i landed as an unreachable consumer
+finally has a producer. It is priced by `costIndexScan`, a real `cost_index`
+tied to the existing probe calibration
+([04](04-cost-and-cardinality.md) §1.1), never by `paramIndexScanCost`.
+
+Two things about the gate are worth recording, because both look like
+shortcuts and are not:
+
+- **`has_useful_pathkeys` reduces to its join-clause arm.** PG's other two arms
+  read `root->group_pathkeys` and `root->query_pathkeys`; the search boundary
+  carries neither (§10), so a rel with no join clause produces nothing — which
+  is also what `truncate_useless_pathkeys` would reduce it to.
+- **Building the ordering and truncating it are ONE loop, exactly.**
+  `pathkeys_useful_for_merging` (pathkeys.c:2166) scans left to right and
+  BREAKS at the first key with no mergeable clause, because a merge join can
+  only exploit a prefix; `buildIndexPathkeys` scans the index's columns left to
+  right and breaks at the first column absent from the map it was handed
+  (PG's own STOP-not-skip rule, pathkeys.c:815-822). Handing it a map whose
+  keys are exactly the merge-useful columns makes the two breaks the same
+  break. goopg could not separate them even if it wanted to: with syntactic
+  pathkeys there is no equivalence-class object to name a column no clause
+  mentions.
+
+What remains for **P5.4c-ii-c** is unchanged: `generate_mergejoin_paths` inside
+`match_unsorted_outer`, with the mergeclause-list truncation and the
+materialize-inner decision.
+
 ### 5.4 Qual placement
 Every clause attaches at the lowest level whose relids it covers — decided
 once, in path generation. The post-hoc placement passes

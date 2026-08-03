@@ -40,6 +40,16 @@ type costParams struct {
 	cpuOperatorCost   float64
 	parallelSetupCost float64
 	parallelTupleCost float64
+
+	// effectiveCacheSize is the `effective_cache_size` GUC in PAGES, which is
+	// the unit PG's own variable carries (`effective_cache_size` is declared
+	// `int` and set from a GUC with GUC_UNIT_BLOCKS, cost.h:33). It is not a
+	// per-tuple or per-page price like the fields above — it is the cache
+	// budget the Mackert-Lohman formula pro-rates between the relations of a
+	// query (`index_pages_fetched`, costsize.c:906), so it belongs to the same
+	// struct only because it is a planner GUC the index cost model reads.
+	// M0127-P5.4c-ii-b.
+	effectiveCacheSize float64
 }
 
 func defaultCostParams() costParams {
@@ -51,6 +61,10 @@ func defaultCostParams() costParams {
 		cpuOperatorCost:   0.0025,
 		parallelSetupCost: 1000.0,
 		parallelTupleCost: 0.1,
+		// PG 18's boot value is "4GB" (guc_tables.c), which in 8 kB blocks is
+		// 524288. config/defaults.go registers the string form; the unit
+		// conversion is pinned by TestEffectiveCacheSizeMatchesConfigDefault.
+		effectiveCacheSize: 4 * 1024 * 1024 * 1024 / blockSizeBytes,
 	}
 }
 
