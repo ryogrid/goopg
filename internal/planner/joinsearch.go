@@ -75,6 +75,17 @@ type searchCtx struct {
 
 	// cp is the cost currency every path in this search is priced in (04 §1).
 	cp costParams
+
+	// clauses is the join-clause bookkeeping the enumerator gates on — PG's
+	// per-rel `joininfo` lists, flattened (joinrestrict.go:91). nil is legal
+	// and means "no join qual anywhere", which phase 1's clauseless branch
+	// handles; every predicate on it is nil-safe. Set by `joinSearch`.
+	clauses *restrictInfoList
+
+	// builder is the sizing-and-costing collaborator `makeJoinRel` calls —
+	// P5.6's calcJoinrelSize and P5.4's add_paths_to_joinrel
+	// (joinsearchlevel.go:36). Set by `joinSearch`, which refuses a nil one.
+	builder joinRelBuilder
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.

@@ -199,9 +199,27 @@
   EC the way `create_join_clause` does). Nothing calls it: `GOOPG_PGSHAPED_DP`
   is still OFF and P5.3's enumerator is the first consumer. UNITS PASS; PLAN
   22/22 MATCH vs `m0127-p21-hashkeys`.)*
-- [ ] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins against initial
+- [x] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins against initial
   rels; disconnected cartesian; last-ditch); `makeJoinRel` with PG's
   outer/inner printing convention (03 §4.4).
+  *(Landed 2026-08-04, `internal/planner/joinsearchlevel.go`. PG's branch is
+  per OLD REL, not per pair — `old_rel->joininfo != NIL || has_eclass_joins ||
+  has_join_restriction` at joinrels.c:96 — and that placement is what makes the
+  level-2 `first_rel` offset (:112-116) apply to the clause branch ONLY; the
+  clauseless branch deliberately re-pairs both directions (PG's own note,
+  :127-136). 03 §4.1's pseudocode pushes the branch inside the inner loop,
+  which is the same enumeration except for that offset, so the code follows the
+  oracle's shape and the doc's equivalence is recorded inline. `makeJoinRel` is
+  find-or-create over the P5.1 relset map plus PG's two-call
+  `populate_joinrel_with_paths` tail (:809-816) — one RelOptInfo per relset,
+  sized ONCE from the first pair that reaches it, with both outer/inner orders
+  offered as paths: that is 03 §4.4's printing convention enforced
+  structurally. Sizing (P5.6) and path generation (P5.4) stay behind a
+  `joinRelBuilder` seam so this task is verified on the pair SEQUENCE alone.
+  1 ledger row (no dummy-rel concept: PG's `is_dummy_rel` /
+  `restriction_is_constant_false` short circuit is absent). Still nothing calls
+  it from `planSelect`; `GOOPG_PGSHAPED_DP` OFF. UNITS PASS; PLAN 22/22 MATCH;
+  SPOT PASS (Q12=2, Q13=35).)*
 - [ ] **P5.3a** Phase 2 — bushy joins, PG-verbatim (03 §4.3,
   `joinrels.c:141-198`): k-loop to the halfway point, clause-less rel skip
   (`:170-172`), mirror-half `first_rel` rule (`:174-177`),

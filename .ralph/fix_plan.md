@@ -6368,10 +6368,30 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Next M0127 selection is P5.3** (`joinSearchOneLevel` phases 1+3 +
       `makeJoinRel`); its `hasNoJoinClauseAtAll` gate landed here with the
       list. Progress log: design doc §6.
-- [ ] **M0127-P5.3 — `joinSearchOneLevel` phases 1+3** (clause joins against
+- [x] **M0127-P5.3 — `joinSearchOneLevel` phases 1+3** (clause joins against
       initial rels; disconnected cartesian; last-ditch); `makeJoinRel` with
       PG's outer/inner printing convention (03 §4.4). IMPLEMENTATION-TODO P5.3;
       03 §4.1-§4.2 (`joinrels.c:118`, `:200-256`). Bar: UNITS + SPOT + PLAN.
+      **↳ DONE 2026-08-04** — `internal/planner/joinsearchlevel.go` (+ 9 tests).
+      The finding: PG's clause/clauseless branch is per OLD REL
+      (`joinrels.c:96`), not per pair, and that placement is what confines the
+      level-2 `first_rel` offset (`:112-116`) to the clause branch — the
+      clauseless branch deliberately re-pairs both directions (PG's own note,
+      `:127-136`). 03 §4.1's pseudocode moves the branch inside the inner loop,
+      which enumerates identically EXCEPT for that offset; the code follows the
+      oracle and records the equivalence inline. `makeJoinRel` = find-or-create
+      over P5.1's relset map + `populate_joinrel_with_paths`' JOIN_INNER arm
+      (`:809-816`): one rel per relset, sized once, both outer/inner orders
+      offered as paths — 03 §4.4's printing convention enforced structurally.
+      P5.6 sizing and P5.4 path generation stay behind a `joinRelBuilder` seam
+      so the task is verified on the pair SEQUENCE alone. Phase 2's insertion
+      point is marked between phases 1 and 3 (phase 3's emptiness test must see
+      the bushy pairs) = P5.3a. **One ledger row** (`2026-08-04 M0127-P5.3`):
+      goopg has no dummy-rel concept, so PG's `is_dummy_rel` /
+      `restriction_is_constant_false` short circuit is absent; resume at P5.4.
+      Still inert — no `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF.
+      Gates: UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`; SPOT PASS
+      (Q12=2, Q13=35).
 - [ ] **M0127-P5.3a — phase 2, bushy joins, PG-verbatim** (03 §4.3,
       `joinrels.c:141-198`): k-loop to the halfway point, clauseless rel skip
       (:170-172), mirror-half `first_rel` rule (:174-177),
