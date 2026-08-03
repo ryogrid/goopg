@@ -126,8 +126,29 @@
   unbounded it runs in 95 s — faster than the drain-both path — because
   `costInnerNestLoop` has no `cost_rescan` term to steer away from the plan:
   3 ledger rows.)*
-- [ ] **P4.4** Lateral: outer streams (per-outer re-execution stays), output
+- [x] **P4.4** Lateral: outer streams (per-outer re-execution stays), output
   no longer accumulates into `o.rows`.
+  *(2026-08-04. `join_lateral_stream.go`: `lateralJoinStream`, a two-phase
+  machine (pull one outer tuple + re-open the right subtree under it → walk
+  that subtree one tuple at a time) with `nlJoinStream`'s reusable pair
+  buffer, so a rejected candidate allocates nothing and the emitted row is the
+  only copy. The LEFT null-pad now keys on `matched` alone — the eager form's
+  `len(rightRows) == 0 || !matched` was the same predicate spelled with a
+  drained array. What streaming FORCED, and what the eager form got for free:
+  correlation-context hygiene. The old loop could hold `ctx.OuterRows` pushed
+  for a whole iteration because that iteration ran to completion inside
+  `Open`; a streaming inner side yields to the PARENT between tuples, so the
+  binding is installed and removed around each individual right-side call
+  (`Open`, each `Next`, `Close`) — `bindOuter`/`unbindOuter`. The
+  per-outer-tuple `CTERowCache` rides the same window, which additionally
+  stops the lateral's CTE materialisations leaking into the enclosing scope
+  (the eager loop left the last iteration's cache installed on return).
+  With LATERAL — the last writer — converted, `joinOp.rows`/`idx` and the
+  never-repopulated `leftCTIDs`/`rowSourceLeft` ctid side-channel are DELETED,
+  and `Next`'s array tail with them: every arm now streams. Note this does
+  NOT close S4: the stage exit also wants the regress-port outer-join files
+  green, which stays gated on P4.2's `GOOPG_HASH_OUTER_JOIN` flip (P5).
+  2 ledger rows.)*
 
 ## P5 — The DP [S5] (each task lands dark behind `GOOPG_PGSHAPED_DP`)
 

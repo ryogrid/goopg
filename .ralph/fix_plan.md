@@ -6232,9 +6232,40 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Next M0127 selection is P4.4 (lateral: outer streams, output no longer
       accumulates into `o.rows` — the last `o.rows` user in `joinOp`).**
       Progress log: design doc §6.
-- [ ] **M0127-P4.4 — lateral: outer streams** (per-outer re-execution stays),
+- [x] **M0127-P4.4 — lateral: outer streams** (per-outer re-execution stays),
       output no longer accumulates into `o.rows`. IMPLEMENTATION-TODO P4.4;
-      07 §4. Bar: UNITS + DS05.
+      07 §4. Bar: UNITS + DS05. **DONE 2026-08-04.**
+      `internal/executor/join_lateral_stream.go`: `lateralJoinStream`, a
+      two-phase machine in `nlJoinStream`'s shape — pull one outer tuple,
+      re-open the right subtree under it, walk that subtree one tuple at a
+      time, emit as `Next` asks, predicate evaluated against a reusable
+      outer++inner buffer. The LEFT null-pad keys on `matched` alone (the
+      eager `len(rightRows) == 0 || !matched` was the same predicate spelled
+      with a drained array). What streaming FORCED: correlation-context
+      hygiene — a streaming inner side yields to the PARENT between tuples, so
+      the `ctx.OuterRows` push (and the per-outer-tuple `CTERowCache`) is
+      installed and removed around each individual right-side call rather than
+      held for a whole iteration, or a parent's own `OuterColumnRef` would
+      resolve against this join's outer tuple. **With LATERAL — the last
+      writer — converted, `joinOp.rows`/`idx` and the writer-less
+      `leftCTIDs`/`rowSourceLeft` ctid side-channel are DELETED, and `Next`'s
+      array tail with them: every arm streams.** All four P4 tasks have now
+      landed, but **S4's stage exit is NOT met**: §3 requires the regress-port
+      outer-join files green, and those stay pinned to merge until P4.2's
+      `GOOPG_HASH_OUTER_JOIN` default flip, which needs doc 04's cost
+      currency and is P5's. Gates: UNITS PASS;
+      SPOT PASS (Q12=2 / 15.8 s, Q13=35 / 11.4 s, query phase 28.7 s, peak
+      11,662 MB); DS05 PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 (Q72,
+      pre-existing) SKIP=4, **all 94 passing queries byte-identical to the
+      P4.3 sweep in row count AND checksum**, no query slower by >20%, total
+      2310 s → 2332 s
+      (`analysis/leftdeep-joins/2026-08-04-p44-ds05-sweep.txt`). **Two ledger
+      rows** (`2026-08-04 M0127-P4.4`): PG rescans a LATERAL RHS with changed
+      `PARAM_EXEC` values instead of re-executing it (goopg has no parameter
+      machinery, so `Materialize`/Memoize still cannot sit under a LATERAL
+      RHS — P5.4); and a LATERAL join drops the outer relation's ctid, so
+      `FOR UPDATE OF <outer>` above one cannot stamp a tuple lock
+      (pre-existing, preserved deliberately).
 - [ ] **M0127-P5.1 — `joinrels` level lists + relset map over `RelOptInfo`;**
       `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
       pinned-unnest rels (closes the leaf-whitelist gap — also closes

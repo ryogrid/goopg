@@ -17,7 +17,10 @@ package executor
 //     the overflow replay at all.
 //   - OUTPUT DOES NOT ACCUMULATE. `o.rows` was the merge join's output
 //     buffer; a 40,000-row join must now leave it empty at every point in
-//     the drain, or the streaming is cosmetic.
+//     the drain, or the streaming is cosmetic. (M0127-P4.4 deleted the field
+//     itself once LATERAL — its last writer — started streaming too, so what
+//     the test can still check is that Open engages the streaming arm and
+//     produces nothing until Next asks.)
 //   - THE SPILL FILES ARE RELEASED. A merge join that spilled must leave the
 //     statement's temp-file registry empty at Close, not at statement end
 //     (the M0127-P3.3 rule).
@@ -233,8 +236,14 @@ func TestMergeJoinInnerAnswersArePGShaped(t *testing.T) {
 // TestMergeJoinDoesNotAccumulateOutput is the structural half of the slice.
 // One key, 200 rows a side: the join emits 40,000 rows, which the array
 // implementation held in o.rows all at once before Next returned its first
-// tuple. The streaming operator must leave that buffer empty for the whole
-// drain.
+// tuple.
+//
+// M0127-P4.4 removed `joinOp.rows` outright, so "the buffer stays empty" is
+// now enforced by the type system rather than by an assertion. What is left to
+// assert is the property that made the buffer removable: Open engages the
+// merge stream and joins NOTHING — every one of the 40,000 rows is produced by
+// a Next call, and the count is exact (a partial stream would be a silent
+// row-count regression, this project's most expensive failure mode).
 func TestMergeJoinDoesNotAccumulateOutput(t *testing.T) {
 	const n = 200
 	left := make([]Row, 0, n)
@@ -254,8 +263,13 @@ func TestMergeJoinDoesNotAccumulateOutput(t *testing.T) {
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if len(o.rows) != 0 {
-		t.Fatalf("Open pre-computed %d output row(s); the join must not join before Next asks", len(o.rows))
+	if o.mergeStream == nil {
+		t.Fatalf("Open did not engage the streaming merge arm")
+	}
+	// `steps` counts state-machine iterations, i.e. join work. Open primes one
+	// row per side (input, not output) and must run the machine zero times.
+	if o.mergeStream.steps != 0 {
+		t.Fatalf("Open ran %d join step(s); the join must not join before Next asks", o.mergeStream.steps)
 	}
 	emitted := 0
 	for {
@@ -268,8 +282,12 @@ func TestMergeJoinDoesNotAccumulateOutput(t *testing.T) {
 		}
 		_ = slot
 		emitted++
-		if len(o.rows) != 0 {
-			t.Fatalf("after %d row(s) the join had accumulated %d row(s) in o.rows", emitted, len(o.rows))
+		// The machine cannot run ahead of demand: one Next returns as soon as
+		// it has a row, so total steps stay proportional to rows delivered
+		// rather than to the 40,000-row product still owed.
+		if o.mergeStream.steps > emitted*4 {
+			t.Fatalf("after %d Next call(s) the join had run %d step(s); output is running ahead of demand",
+				emitted, o.mergeStream.steps)
 		}
 	}
 	if emitted != n*n {

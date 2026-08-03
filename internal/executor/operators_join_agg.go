@@ -28,18 +28,20 @@ type joinRowCTID struct {
 }
 
 // joinOp is a join operator that dispatches on plan.Algo.
-// Hash joins use lazy materialization (M0036): joined rows are
-// yielded on demand via Next() instead of pre-computed in o.rows.
-// Merge and nested-loop still materialize in o.rows.
+//
+// Every algorithm now yields on demand. Hash was first (M0036's lazy
+// materialization), then M0127's P4 slice converted the rest: merge (P4.1),
+// the hash outer fill (P4.2), the nested loop (P4.3) and LATERAL (P4.4). With
+// the last of them the `rows []Row` / `idx int` output buffer that used to
+// back Next left the struct entirely — see the four `*Stream` fields below,
+// exactly one of which is non-nil between Open and Close.
 type joinOp struct {
 	plan   *planner.Join
 	left   Operator
 	right  Operator
 	schema planner.Schema
 
-	ctx  *Context
-	rows []Row
-	idx  int
+	ctx *Context
 
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
@@ -92,7 +94,7 @@ type joinOp struct {
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
 	// merge output is pulled from this state machine instead of being
-	// pre-computed into o.rows. See join_merge_stream.go.
+	// pre-computed into an array. See join_merge_stream.go.
 	mergeStream *mergeJoinStream
 	lazyProbe    Operator         // probe side (streaming)
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
@@ -195,11 +197,6 @@ type joinOp struct {
 	antiBuildRows     int  // total right-side rows seen during build
 	antiBuildHasNull  bool // any right-side row's join key was NULL
 
-	// M0100-0010: ctid captured per left-row during eager NL drain so
-	// lockRowsOp can stamp tuple locks after the scan is closed.
-	leftCTIDs     []joinRowCTID
-	rowSourceLeft []int
-
 	// M0118-0009 (eval-plan-qual): when a downstream LockRows (FOR UPDATE OF
 	// <rel>) needs to lock a relation that ends up on the BUILD side of a lazy
 	// hash join, the build scan is drained + closed at Open so its currentTID
@@ -241,8 +238,15 @@ type joinOp struct {
 
 	// M0127-P4.3 (07 §4): the streaming nested loop. Non-nil for every
 	// non-lateral NL join; see join_nl_stream.go. Its presence is what routes
-	// Next away from the o.rows array, exactly as mergeStream does for merge.
+	// Next away from the eager path, exactly as mergeStream does for merge.
 	nlStream *nlJoinStream
+
+	// M0127-P4.4 (07 §4): the streaming LATERAL join. Non-nil for every
+	// `Join.Lateral` join; see join_lateral_stream.go. It was the last operator
+	// holding the output in an array, and its removal is what let the
+	// `rows`/`idx` pair (and the never-repopulated `leftCTIDs`/`rowSourceLeft`
+	// side-channel that rode along with it) leave joinOp entirely.
+	latStream *lateralJoinStream
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -314,7 +318,7 @@ func (o *joinOp) Open(ctx *Context) error {
 	// M0127-P4.3 (07 §4): the universal fallback streams too. The outer side
 	// is pulled one tuple at a time and the inner side sits under a
 	// Materialize that replays it per outer tuple; nothing is drained into an
-	// array and nothing accumulates in o.rows.
+	// array and nothing accumulates in the operator.
 	return o.openNestedLoop(ctx, true)
 }
 
@@ -396,128 +400,6 @@ func (o *joinOp) nextMerge() (TupleSlot, error) {
 // by a parent Join.Lateral. M0103-0008.
 type lateralBindable interface {
 	BindLateralOuter(slot SlotView)
-}
-
-// openLateral handles `Join.Lateral == true`: drain the left, then
-// for each left row re-run the right side with the left row in scope.
-// Concatenated rows accumulate in o.rows and are emitted via the
-// existing Next() path.
-//
-// Two paths:
-//   - If the right child implements lateralBindable (e.g. pg_get_publication_tables):
-//     use BindLateralOuter to pass the outer row directly.
-//   - Otherwise: push the left row onto ctx.OuterRows so OuterColumnRef
-//     expressions inside the right subtree can resolve correlated refs.
-//     The CTERowCache is saved/cleared per iteration so LATERAL CTEs that
-//     depend on the outer row (e.g. WITH RECURSIVE inside LATERAL) are
-//     re-evaluated for each outer row, not served from a stale cache.
-//
-// LEFT lateral joins emit a null-padded row when the right side yields
-// zero rows; CROSS / INNER drop the outer row.
-func (o *joinOp) openLateral(ctx *Context) error {
-	if err := o.left.Open(ctx); err != nil {
-		return err
-	}
-	leftRows, err := drainRowsCtx(o.left, ctx)
-	if err != nil {
-		_ = o.left.Close()
-		return err
-	}
-	leftWidth := len(o.left.Schema())
-	if leftWidth == 0 && len(leftRows) > 0 {
-		leftWidth = len(leftRows[0])
-	}
-	rightWidth := len(o.right.Schema())
-	nullRight := nullRow(rightWidth)
-
-	bindable, isSRF := o.right.(lateralBindable)
-	if isSRF {
-		outerSlot := SlotFromRow(o.left.Schema(), nil)
-		bindable.BindLateralOuter(outerSlot)
-		defer bindable.BindLateralOuter(nil)
-		for i, l := range leftRows {
-			if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			outerSlot.row = l
-			if err := o.right.Open(ctx); err != nil {
-				return err
-			}
-			rightRows, err := drainRowsCtx(o.right, ctx)
-			_ = o.right.Close()
-			if err != nil {
-				return err
-			}
-			matched := false
-			for _, r := range rightRows {
-				joined := concatRows(l, r)
-				ok, perr := o.joinPredicateMatch(joined)
-				if perr != nil {
-					return perr
-				}
-				if !ok {
-					continue
-				}
-				matched = true
-				o.rows = append(o.rows, joined)
-			}
-			// LEFT JOIN: null-extend when the right side produced no rows or
-			// no right row satisfied the join predicate.
-			if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
-				o.rows = append(o.rows, concatRows(l, nullRight))
-			}
-		}
-		return nil
-	}
-
-	// General LATERAL: push each left row as an outer row context so
-	// OuterColumnRef (level=1) expressions in the right subtree resolve
-	// against it. Also clear CTERowCache per iteration so LATERAL CTEs
-	// whose content depends on the outer row are re-materialised.
-	savedCTECache := ctx.CTERowCache
-	for i, l := range leftRows {
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		ctx.OuterRows = append(ctx.OuterRows, l)
-		ctx.CTERowCache = nil // clear per-iteration so outer-dependent CTEs recompute
-		var rightRows []Row
-		if openErr := o.right.Open(ctx); openErr == nil {
-			rightRows, err = drainRowsCtx(o.right, ctx)
-			_ = o.right.Close()
-		} else {
-			err = openErr
-		}
-		ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1]
-		if err != nil {
-			ctx.CTERowCache = savedCTECache
-			return err
-		}
-		matched := false
-		for _, r := range rightRows {
-			joined := concatRows(l, r)
-			ok, perr := o.joinPredicateMatch(joined)
-			if perr != nil {
-				ctx.CTERowCache = savedCTECache
-				return perr
-			}
-			if !ok {
-				continue
-			}
-			matched = true
-			o.rows = append(o.rows, joined)
-		}
-		// LEFT JOIN: null-extend when the right side produced no rows or
-		// no right row satisfied the join predicate.
-		if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	return nil
 }
 
 // coalesceUsingRow applies FULL JOIN USING coalescing: for each USING
@@ -1376,33 +1258,18 @@ func (o *joinOp) Next() (TupleSlot, error) {
 	if o.mergeStream != nil {
 		return o.nextMerge()
 	}
-	// M0127-P4.3: and so does the nested loop. What is left below is the
-	// lateral path's o.rows accumulation, which P4.4 removes.
+	// M0127-P4.3: and so does the nested loop.
 	if o.nlStream != nil {
 		return o.nextNL()
 	}
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	// M0127-P4.4: and so does LATERAL, which was the last one left. Every arm
+	// of this switch now streams, so there is no array tail below it — a
+	// joinOp that reached Next with no stream at all never opened, and EOF is
+	// the only honest answer.
+	if o.latStream != nil {
+		return o.nextLateral()
 	}
-	row := o.rows[o.idx]
-	idx := o.idx
-	o.idx++
-	// M0100-0010: propagate left-side ctid through the join so lockRowsOp
-	// can stamp tuple locks even after the scan was eagerly drained/closed.
-	if o.leftCTIDs != nil && idx < len(o.rowSourceLeft) {
-		li := o.rowSourceLeft[idx]
-		if li >= 0 && li < len(o.leftCTIDs) {
-			lc := o.leftCTIDs[li]
-			if lc.hasCTID {
-				ms := SlotFromRow(o.Schema(), row)
-				ms.hasCTID = true
-				ms.ctidBlock = uint32(lc.ptr.Block)
-				ms.ctidOff = lc.ptr.Offset
-				return ms, nil
-			}
-		}
-	}
-	return asSlot(o.Schema(), row), nil
+	return nil, EOF
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
@@ -1795,9 +1662,7 @@ func (o *joinOp) Close() error {
 	o.releaseBatches()
 	o.closeMergeStream()
 	o.closeNLStream()
-	o.rows = nil
-	o.leftCTIDs = nil
-	o.rowSourceLeft = nil
+	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
 	o.lazyProbe = nil
@@ -1814,7 +1679,6 @@ func (o *joinOp) Close() error {
 	o.probeEOF = false
 	o.fillSweepReset()
 	o.ctx = nil
-	o.idx = 0
 	errL := o.left.Close()
 	errR := o.right.Close()
 	if errL != nil {
