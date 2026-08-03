@@ -220,11 +220,31 @@
   `restriction_is_constant_false` short circuit is absent). Still nothing calls
   it from `planSelect`; `GOOPG_PGSHAPED_DP` OFF. UNITS PASS; PLAN 22/22 MATCH;
   SPOT PASS (Q12=2, Q13=35).)*
-- [ ] **P5.3a** Phase 2 — bushy joins, PG-verbatim (03 §4.3,
+- [x] **P5.3a** Phase 2 — bushy joins, PG-verbatim (03 §4.3,
   `joinrels.c:141-198`): k-loop to the halfway point, clause-less rel skip
   (`:170-172`), mirror-half `first_rel` rule (`:174-177`),
   `have_relevant_joinclause` pair gate (`:190-191`). Pair-count
   verification against 03 §7's arithmetic (connectivity-filtered).
+  *(Landed 2026-08-04, `internal/planner/joinsearchlevel.go`, ~40 lines
+  between phases 1 and 3. PG's `:182-194` is `make_rels_by_clause_joins`
+  verbatim — non-overlap, then `have_relevant_joinclause ||
+  have_join_order_restriction` — so the phase reuses P5.3's helper and adds
+  only the k-loop, the halfway break and the mirror-image offset. Neither
+  iterated list can grow while phase 2 runs: `makeJoinRel` appends at `lev`
+  and both k and lev−k are strictly below it. With phase 2 in place the
+  enumeration is complete in PG's sense — every unordered split of a level's
+  relset into two non-empty parts is reachable — and that is now checked
+  arithmetically, not by example: on a complete clause graph the search must
+  make exactly (3ⁿ − 2ⁿ⁺¹ + 1)/2 `makeJoinRel` calls, 03 §7's closed form,
+  verified for n = 2..7. The clause-less rel skip (`:170-172`) is a pure
+  short-circuit while `hasJoinRestriction` is constant false — a rel with no
+  join clause cannot satisfy the clause-only pair gate for any partner — so
+  no test can observe it; it is kept verbatim and the redundancy is recorded
+  at the site, because the `has_join_restriction` disjunct makes it
+  semantically live the moment restrictions enter. 1 ledger row: landing the
+  full bushy space is what makes the absence of GEQO real (PG switches at 12
+  rels, goopg searches to its 16-rel `RelSet` ceiling). Still nothing calls
+  it from `planSelect`; `GOOPG_PGSHAPED_DP` OFF. UNITS PASS.)*
 - [ ] **P5.4** `addPathsToJoinrel`: hash (both build sides), NLI+Memoize
   parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
   03 §5.3; FULL-without-usable-clause error contract), qual placement at

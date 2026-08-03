@@ -1,19 +1,22 @@
 package planner
 
-// M0127-P5.3 — `joinSearchOneLevel` phases 1 and 3, `makeJoinRel`, and the
-// `standard_join_search` driver that runs the levels.
+// M0127-P5.3 / P5.3a — `joinSearchOneLevel` phases 1, 2 and 3, `makeJoinRel`,
+// and the `standard_join_search` driver that runs the levels.
 //
 // PG oracle: `join_search_one_level` (joinrels.c:73) — phase 1 at :85-137,
-// phase 3 (last-ditch) at :200-256; `make_rels_by_clause_joins` (:118/:280),
+// phase 2 (bushy) at :141-198, phase 3 (last-ditch) at :200-256;
+// `make_rels_by_clause_joins` (:118/:280),
 // `make_rels_by_clauseless_joins` (:300); `make_join_rel` (:696) and
 // `populate_joinrel_with_paths` (:786); the level loop and per-level
 // `set_cheapest` in `standard_join_search` (allpaths.c:3483-3525). Design:
-// leftdeep-joins 03 §1, §4.1, §4.2, §4.4.
+// leftdeep-joins 03 §1, §4.1, §4.2, §4.3, §4.4.
 //
-// Phase 2 (bushy, joinrels.c:141-198) is deliberately NOT here: it is P5.3a,
-// and its insertion point is marked below. Levels are still complete without
-// it — every left-deep and right-deep shape is reachable from phase 1 — so the
-// enumerator this file lands is correct-but-narrower, not partial.
+// With phase 2 in place (P5.3a) the enumeration is PG's in full: every
+// unordered split of a level's relset into two non-empty parts is reachable —
+// the (lev−1, 1) splits from phase 1, the (k, lev−k) splits for
+// 2 ≤ k ≤ lev−2 from phase 2 — subject to PG's connectivity filters. That
+// completeness is what the pair-count test in `joinsearchlevel_test.go` checks
+// against 03 §7's closed form.
 //
 // Two seams stay open on purpose, because their owners are later tasks and a
 // stand-in would be a second cost model to unpick later:
@@ -165,10 +168,56 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 		}
 	}
 
-	// Phase 2 — bushy joins (joinrels.c:141-198) — is P5.3a and belongs
-	// HERE, between phases 1 and 3: phase 3's "did this level come up empty"
-	// test must see the bushy pairs too, or it would force cartesian products
-	// for a level a bushy pair had already populated.
+	// Phase 2 — bushy plans (joinrels.c:141-198): rels of k initial rels
+	// joined to rels of lev−k, for 2 ≤ k ≤ lev−2. It belongs HERE, between
+	// phases 1 and 3, because phase 3's "did this level come up empty" test
+	// must see the bushy pairs too, or it would force cartesian products for a
+	// level a bushy pair had already populated.
+	//
+	// Unlike phase 1 there is no clauseless branch: a bushy pair is built ONLY
+	// when a join clause (or, later, an order restriction) connects the two
+	// composites. PG's stated reason is planning time (:144-146) — the
+	// unfiltered space is (3ⁿ − 2ⁿ⁺¹ + 1)/2 pairs, ~7M at n=15 — and the
+	// filter is what keeps goopg's ceiling-16 no-GEQO policy (03 §7) tenable.
+	for k := 2; ; k++ {
+		otherLevel := lev - k
+		// make_join_rel(x, y) already handles y,x, so the k-loop only has to
+		// reach the halfway point (joinrels.c:148-157). At lev 2 and 3 this
+		// breaks on the first iteration — there is no bushy shape below 4.
+		if k > otherLevel {
+			break
+		}
+		// Both lists are strictly below `lev`, so neither can grow while it is
+		// being iterated: makeJoinRel only ever appends at `lev`.
+		kRels := s.levelRels(k)
+		otherRels := s.levelRels(otherLevel)
+		for i, old := range kRels {
+			// A composite with no join clause at all is skipped outright
+			// (:165-172). In v1 this changes cost, not results: the pair gate
+			// below is clause-only while `joinOrderRestricted` is false, so a
+			// clauseless rel could not have produced a pair anyway — which is
+			// why no test can observe the skip and this comment stands in for
+			// one. It is kept verbatim because the `has_join_restriction`
+			// disjunct makes it semantically live the moment restrictions
+			// enter the search: then a clauseless rel CAN be forced into a
+			// bushy plan, and the skip is what decides which ones are.
+			if s.clauses.hasNoJoinClauseAtAll(old) && !hasJoinRestriction(old) {
+				continue
+			}
+			// At the halfway level the two lists are the SAME list, so every
+			// pair before this one has already been considered from the other
+			// side; the mirror-image offset drops the duplicate (:174-177).
+			first := 0
+			if k == otherLevel {
+				first = i + 1
+			}
+			// :182-194 is makeRelsByClauseJoins verbatim — non-overlap, then
+			// `have_relevant_joinclause || have_join_order_restriction`.
+			if err := s.makeRelsByClauseJoins(old, otherRels, first); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Phase 3 — last-ditch (joinrels.c:200-256). A level can come up empty
 	// when every rel in the sub-problem has join clauses, but only to rels

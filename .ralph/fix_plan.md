@@ -6392,12 +6392,34 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       Still inert — no `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF.
       Gates: UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`; SPOT PASS
       (Q12=2, Q13=35).
-- [ ] **M0127-P5.3a — phase 2, bushy joins, PG-verbatim** (03 §4.3,
+- [x] **M0127-P5.3a — phase 2, bushy joins, PG-verbatim** (03 §4.3,
       `joinrels.c:141-198`): k-loop to the halfway point, clauseless rel skip
       (:170-172), mirror-half `first_rel` rule (:174-177),
       `have_relevant_joinclause` pair gate (:190-191). Pair-count verification
       against 03 §7's arithmetic (connectivity-filtered).
       IMPLEMENTATION-TODO P5.3a. Bar: UNITS + pair-count verification test.
+      **↳ DONE 2026-08-04** — ~40 lines in `internal/planner/joinsearchlevel.go`
+      at the point P5.3 marked. PG's inner block (:182-194) is
+      `make_rels_by_clause_joins` verbatim, so the phase reuses P5.3's helper
+      and adds only the halfway break, the mirror-image offset and the
+      clauseless skip. Phase 2 has NO clauseless else-branch (unlike phase 1) —
+      a bushy pair needs a connecting clause, PG's planning-time defence
+      (:144-146) and what makes 03 §7's no-GEQO policy tenable. With phases 1+2
+      the enumeration is complete in PG's sense, and that is now verified
+      ARITHMETICALLY: on a complete clause graph the search must make exactly
+      (3ⁿ − 2ⁿ⁺¹ + 1)/2 `makeJoinRel` calls (03 §7's closed form), tested for
+      n=2..7 — the check a fixed chain sequence cannot make, because
+      connectivity masks most of the space. The finding: the clauseless-rel
+      skip is UNOBSERVABLE in v1 (a rel with no join clause cannot satisfy the
+      clause-only pair gate for any partner), mutation-confirmed; kept verbatim
+      with the redundancy recorded at the site because `has_join_restriction`
+      makes it live at P5.8. **One ledger row** (`2026-08-04 M0127-P5.3a`):
+      landing the full bushy space is what makes the absence of GEQO real —
+      PG switches at 12 rels, goopg searches to its 16-rel `RelSet` ceiling.
+      P5.3's `…IsLeftDeepOnly` guard is FLIPPED to
+      `TestJoinSearchFourRelChainOffersBushyPair`. Still inert — no `planSelect`
+      call site, `GOOPG_PGSHAPED_DP` OFF. Gates: UNITS PASS (PLAN/SPOT not
+      re-run: no call site + flag OFF ⇒ no plan and no row can move).
 - [ ] **M0127-P5.4 — `addPathsToJoinrel`:** hash (both build sides), NLI+Memoize
       parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
       03 §5.3; FULL-without-usable-clause error contract), qual placement at

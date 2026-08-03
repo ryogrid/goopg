@@ -1,6 +1,6 @@
 package planner
 
-// M0127-P5.3 tests. The subject is ENUMERATION — which pairs the search offers
+// M0127-P5.3 / P5.3a tests. The subject is ENUMERATION — which pairs the search offers
 // and in which order — so every test asserts on the pair sequence a recording
 // builder captures, never on a cost. That separation is the point of the
 // `joinRelBuilder` seam: P5.4's costing and P5.6's sizing can change freely
@@ -19,7 +19,11 @@ package planner
 //     it, so phase 1 produces nothing;
 //  4. find-or-create (`build_join_rel`): one RelOptInfo per relset, sized
 //     once, with paths offered in both outer/inner orders by every pair that
-//     spans it.
+//     spans it;
+//  5. phase 2 (joinrels.c:141-198, added at P5.3a) — the bushy pair a chain
+//     only reaches at k == lev−k, the clauseless-composite skip (:170-172),
+//     and, on a complete clause graph, the whole enumeration counted against
+//     03 §7's closed form.
 
 import (
 	"fmt"
@@ -257,12 +261,18 @@ func TestJoinSearchNoClausesAtAll(t *testing.T) {
 	wantSets(t, levelSets(s, 3), []RelSet{rA | rB | rC}, "level 3")
 }
 
-// TestJoinSearchFourRelChainIsLeftDeepOnly pins what phase 1 alone can reach.
-// Over the chain a-b-c-d, level 3 holds {a,b,c} and {b,c,d} but the level-4
-// rel is built only from a level-3 rel plus an initial rel. The bushy pair
-// ({a,b}, {c,d}) is NOT offered — that is phase 2, M0127-P5.3a — and this
-// test is what will catch its arrival.
-func TestJoinSearchFourRelChainIsLeftDeepOnly(t *testing.T) {
+// TestJoinSearchFourRelChainOffersBushyPair is the arrival test for phase 2
+// (M0127-P5.3a) — it was `…IsLeftDeepOnly` at P5.3, asserting the bushy pair
+// was ABSENT, and flipping it is what proves phase 2 actually runs. Over the
+// chain a-b-c-d the level-4 rel is reachable three ways: {a,b,c}⋈d and
+// {b,c,d}⋈a from phase 1, and ({a,b},{c,d}) from phase 2 — the last one at
+// k == lev−k, so the mirror-image offset (joinrels.c:174-177) is exercised
+// too: without it the same pair would be offered again from old={c,d}.
+//
+// The pair sequence is pinned whole, because phase 2's position in the
+// function is itself load-bearing: its pairs must land after phase 1's and
+// before phase 3 can test the level for emptiness.
+func TestJoinSearchFourRelChainOffersBushyPair(t *testing.T) {
 	s := jslCtx(t, 4)
 	b := &recordingBuilder{}
 	if _, err := s.joinSearch(jslClauses(rA|rB, rB|rC, rC|rD), b); err != nil {
@@ -272,14 +282,133 @@ func TestJoinSearchFourRelChainIsLeftDeepOnly(t *testing.T) {
 	wantSets(t, levelSets(s, 3), []RelSet{rA | rB | rC, rB | rC | rD}, "level 3")
 	wantSets(t, levelSets(s, 4), []RelSet{rA | rB | rC | rD}, "level 4")
 
+	ab, bc, cd := rA|rB, rB|rC, rC|rD
+	abc, bcd, abcd := rA|rB|rC, rB|rC|rD, rA|rB|rC|rD
+	want := []recordedPair{
+		// Level 2, phase 1: the chain's three adjacent pairs.
+		{ab, rA, rB}, {ab, rB, rA},
+		{bc, rB, rC}, {bc, rC, rB},
+		{cd, rC, rD}, {cd, rD, rC},
+		// Level 3, phase 1. {a,b}⋈c and {b,c}⋈a reach the same relset; note
+		// {c,d}⋈a is skipped — no clause spans {c,d} and a.
+		{abc, ab, rC}, {abc, rC, ab},
+		{abc, bc, rA}, {abc, rA, bc},
+		{bcd, bc, rD}, {bcd, rD, bc},
+		{bcd, cd, rB}, {bcd, rB, cd},
+		// Level 4, phase 1 first…
+		{abcd, abc, rD}, {abcd, rD, abc},
+		{abcd, bcd, rA}, {abcd, rA, bcd},
+		// …then phase 2's single surviving bushy pair. old={b,c} and
+		// old={c,d} both overlap their only candidate, so this is the whole
+		// phase.
+		{abcd, ab, cd}, {abcd, cd, ab},
+	}
+	wantPairs(t, b.pairs, want)
+
+	// Find-or-create still holds across the phase boundary: {a,b,c,d} was
+	// reached from three different pairs, two of them in a different phase,
+	// and is sized once.
+	if len(b.sized) != 6 {
+		t.Fatalf("sizeJoinRel called %d times (%#b), want 6", len(b.sized), b.sized)
+	}
+}
+
+// TestJoinSearchBushyIsClauseOnly pins the one asymmetry between phase 1 and
+// phase 2: phase 1 has a clauseless else-branch that cross-joins eagerly,
+// phase 2 has NONE (joinrels.c:190-191 is the whole gate). PG's reason is
+// planning time — the unfiltered bushy space is what 03 §7's closed form
+// counts — and without the gate a disconnected level-2 rel would be crossed
+// into every other level-2 rel at every level above.
+//
+// The setup is a-b connected and c, d connected to nothing, so level 2 is
+// mostly cartesian: [{a,b},{a,c},{b,c},{c,d},{a,d},{b,d}]. Exactly two bushy
+// pairs are clause-connected — a is in {a,c} and b is in {b,d}, so the a=b
+// clause spans them, and likewise for {b,c}/{a,d}. Everything else at that
+// level either overlaps or is unconnected, so the expectation is exact.
+//
+// Note what this test does NOT claim to cover: the clauseless-composite skip
+// at :170-172 is unobservable in v1 — with `hasJoinRestriction` constant
+// false, a rel with no join clause at all cannot satisfy the pair gate for any
+// partner, so removing the skip changes performance and nothing else. It is
+// kept verbatim because it becomes load-bearing the moment restrictions enter
+// the search; see the comment at its site.
+func TestJoinSearchBushyIsClauseOnly(t *testing.T) {
+	s := jslCtx(t, 4)
+	b := &recordingBuilder{}
+	if _, err := s.joinSearch(jslClauses(rA|rB), b); err != nil {
+		t.Fatalf("joinSearch: %v", err)
+	}
+	var bushy []recordedPair
 	for _, p := range b.pairs {
-		if p.outer == rA|rB && p.inner == rC|rD {
-			t.Fatalf("phase 2 (bushy) pair offered at P5.3: %v", p)
-		}
-		if p.outer == rC|rD && p.inner == rA|rB {
-			t.Fatalf("phase 2 (bushy) pair offered at P5.3: %v", p)
+		// A pair whose two sides are both composites can only be phase 2's.
+		if relLevel(p.outer) >= 2 && relLevel(p.inner) >= 2 {
+			bushy = append(bushy, p)
 		}
 	}
+	want := []recordedPair{
+		{rA | rB | rC | rD, rA | rC, rB | rD}, {rA | rB | rC | rD, rB | rD, rA | rC},
+		{rA | rB | rC | rD, rB | rC, rA | rD}, {rA | rB | rC | rD, rA | rD, rB | rC},
+	}
+	wantPairs(t, bushy, want)
+	for _, p := range bushy {
+		if !s.clauses.hasRelevantJoinClauseRelids(p.outer, p.inner) {
+			t.Fatalf("phase 2 offered an unconnected pair: %v", p)
+		}
+	}
+}
+
+// TestJoinSearchPairCountMatchesClosedForm is P5.3a's arithmetic check against
+// 03 §7. On a COMPLETE clause graph — one clause spanning every rel, so every
+// disjoint pair is relevant and no connectivity filter fires — phases 1 and 2
+// together must enumerate every unordered split of every subset into two
+// non-empty parts, and that count has a closed form: (3ⁿ − 2ⁿ⁺¹ + 1)/2. (Each
+// element is in the left part, the right part, or neither: 3ⁿ ordered
+// assignments; subtract the 2ⁿ with an empty left and the 2ⁿ with an empty
+// right, add back the once-doubly-subtracted empty/empty; halve for order.)
+//
+// This is the test that would catch a phase-2 k-loop that stopped short, an
+// off-by-one in the mirror-image offset (which would double-count the halfway
+// level), or a phase-1 regression that lost the (lev−1, 1) splits — none of
+// which the fixed chain sequences above can see, because a chain's
+// connectivity filter masks most of the space.
+//
+// makeJoinRel calls, not addPaths calls, are the unit: each pair is offered in
+// both directions (03 §4.4), so the recorded sequence is exactly twice as long.
+func TestJoinSearchPairCountMatchesClosedForm(t *testing.T) {
+	for n := 2; n <= 7; n++ {
+		var all RelSet
+		for i := 0; i < n; i++ {
+			all |= RelSet(1) << uint(i)
+		}
+		s := jslCtx(t, n)
+		b := &recordingBuilder{}
+		// One clause referencing every rel: hasRelevantJoinClause is then
+		// true for any pair, so nothing is filtered out.
+		if _, err := s.joinSearch(jslClauses(all), b); err != nil {
+			t.Fatalf("n=%d: joinSearch: %v", n, err)
+		}
+		want := (pow(3, n) - 2*pow(2, n) + 1) / 2
+		if got := len(b.pairs) / 2; got != want {
+			t.Errorf("n=%d: %d makeJoinRel calls, want (3^%d - 2^%d + 1)/2 = %d",
+				n, got, n, n+1, want)
+		}
+		if len(b.pairs)%2 != 0 {
+			t.Errorf("n=%d: %d addPaths calls is odd; every pair is offered in both directions",
+				n, len(b.pairs))
+		}
+		// Every subset of size ≥ 2 is built exactly once (find-or-create).
+		if got, want := len(b.sized), pow(2, n)-n-1; got != want {
+			t.Errorf("n=%d: %d joinrels sized, want 2^%d - %d - 1 = %d", n, got, n, n, want)
+		}
+	}
+}
+
+func pow(base, exp int) int {
+	out := 1
+	for i := 0; i < exp; i++ {
+		out *= base
+	}
+	return out
 }
 
 // TestMakeJoinRelRejectsOverlap: PG asserts non-overlap (joinrels.c:706);
