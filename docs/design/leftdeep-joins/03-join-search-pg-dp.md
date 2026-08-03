@@ -76,8 +76,19 @@ The join-clause bookkeeping generalises today's `joinEdge` list
   producing derived clauses, tagged inferred (selectivity treatment moves to
   [04](04-cost-and-cardinality.md) §5 — no admissibility penalty);
 - `hasRelevantJoinClause(joinrel, baserel)` = ∃ clause whose relids intersect
-  both sides and are covered by their union — PG's
-  `have_relevant_joinclause`.
+  BOTH sides — PG's `have_relevant_joinclause` (`joininfo.c:39`), which is two
+  `bms_overlap` tests and **not** a coverage test. *(Corrected at P5.2: this
+  bullet previously read "and are covered by their union", which is a
+  different rule. A three-rel qual `a.x = b.y + c.z` makes `a ⋈ b` relevant
+  upstream even though the qual cannot be evaluated there — it is the "are
+  these two worth joining" heuristic, not a placement test. Requiring coverage
+  here would push that pair onto the cartesian/last-ditch path and enumerate
+  differently from PG.)*
+- the coverage rule is a **separate** predicate, `clausesFor(outer, inner)` —
+  PG's `build_joinrel_restrictlist` (`relnode.c`): `required_relids` must be a
+  subset of the join's relids and must touch both sides. It answers "which
+  quals does this joinrel apply", which is §5.4's qual placement, and it is
+  what §5's selectivity work reads.
 
 ## 4. `joinSearchOneLevel` — PG's three phases, all implemented
 

@@ -171,8 +171,34 @@
   are deferred to P5.4 — 1 ledger row. Nothing calls it: gated behind
   `GOOPG_PGSHAPED_DP` (default OFF, pinned by a test) and unreferenced from
   `planSelect`. UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`.)*
-- [ ] **P5.2** restrictInfo list + `hasRelevantJoinClause`; equivalence-class
+- [x] **P5.2** restrictInfo list + `hasRelevantJoinClause`; equivalence-class
   selectivity rule (inferred edges: admissible, no double-count).
+  *(DONE 2026-08-04 — `internal/planner/joinrestrict.go`. `restrictInfo`
+  generalises `joinEdge` (bushy.go:40) from a PAIR of FROM positions to a
+  `relids RelSet`, so a three-rel qual is one clause with three bits instead of
+  something the edge list cannot express; non-equality join quals are kept too,
+  since P5.4's qual placement has to put them somewhere. The key split is
+  stored as relsets (`leftRelids`/`rightRelids`), which is what lets
+  `a.x = b.y + c.z` be a legal hash/merge clause keying {a} against {b,c}.
+  **The task's real content is that §3's one-liner had fused two different PG
+  rules**: `have_relevant_joinclause` (`joininfo.c:39`) is two `bms_overlap`
+  tests with NO coverage requirement — the enumerator's "worth joining?"
+  heuristic — while `build_joinrel_restrictlist` (`relnode.c`) IS a subset
+  test, because a qual is applied at the lowest level that can evaluate it.
+  They are now `hasRelevantJoinClause` and `clausesFor`, and 03 §3 is corrected
+  to match the oracle. `selectivityClauses` is 04 §5: per
+  `generate_join_implied_equalities_normal` an equivalence class emits exactly
+  ONE clause per (outer, inner) split ("we can equate any one outer member to
+  any one inner member"), so an EC of n members yields n−1 clauses over a whole
+  tree, never C(n,2) — the double-count the ×2.0 `inferredEdgePenalty` was
+  compensating for in the cost dimension instead of the cardinality one where
+  the error lives. Class ids are dense and sorted by `compareColumnIdent`, not
+  map order: the id decides which member carries the selectivity, so a
+  randomised id would move plans between identical runs. 1 ledger row (goopg
+  classifies the conjuncts it is handed; it never SYNTHESISES a clause from an
+  EC the way `create_join_clause` does). Nothing calls it: `GOOPG_PGSHAPED_DP`
+  is still OFF and P5.3's enumerator is the first consumer. UNITS PASS; PLAN
+  22/22 MATCH vs `m0127-p21-hashkeys`.)*
 - [ ] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins against initial
   rels; disconnected cartesian; last-ditch); `makeJoinRel` with PG's
   outer/inner printing convention (03 §4.4).

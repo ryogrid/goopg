@@ -6319,10 +6319,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Next M0127 selection is P5.2** (restrictInfo list +
       `hasRelevantJoinClause`; equivalence-class selectivity rule).
       Progress log: design doc §6.
-- [ ] **M0127-P5.2 — restrictInfo list + `hasRelevantJoinClause`;**
+- [x] **M0127-P5.2 — restrictInfo list + `hasRelevantJoinClause`;**
       equivalence-class selectivity rule (inferred edges admissible, no
       double-count). IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5. Bar: UNITS + PLAN
       (ZERO diffs).
+      **↳ DONE 2026-08-04.** New `internal/planner/joinrestrict.go`.
+      `restrictInfo` generalises `joinEdge` (bushy.go:40) from a PAIR of FROM
+      positions to a `relids RelSet` (PG's `required_relids`): the edge list is
+      structurally blind to a qual spanning three relations, a relset is not,
+      so `a.x = b.y + c.z` is one clause with three bits instead of something
+      silently dropped. Non-equality join quals are kept as well — P5.4 has to
+      PLACE them and can only place clauses the search knows about — and the
+      key split is stored as `leftRelids`/`rightRelids`, which is what lets
+      that same three-rel equality be a legal hash/merge clause keying {a}
+      against {b,c}. Single-rel quals are deliberately excluded: P5.1 already
+      folded their selectivity into the initial rel's row count.
+      **The finding: 03 §3 defined `hasRelevantJoinClause` as "intersects both
+      sides AND is covered by their union", and the oracle does not.**
+      `have_relevant_joinclause` (joininfo.c:39) is two `bms_overlap` tests
+      with NO coverage requirement; the coverage test is a DIFFERENT function,
+      `build_joinrel_restrictlist` (relnode.c), because a qual is applied at
+      the lowest level that can EVALUATE it. Under the coverage reading a pair
+      connected only by a three-rel qual is not "relevant", so phase 1 refuses
+      to form it and it reaches the search only via cartesian/last-ditch — a
+      different enumeration from PG's. Now two predicates
+      (`hasRelevantJoinClause` / `clausesFor`); 03 §3 corrected against the
+      oracle. `selectivityClauses` is 04 §5:
+      `generate_join_implied_equalities_normal` emits exactly ONE clause per EC
+      per (outer, inner) split, so an EC of n members yields n−1 clauses over a
+      tree, never C(n,2) — with `a=b`, `b=c`, inferred `a=c`, two clauses cross
+      the {a,b}⋈{c} boundary and charging both squares one restriction. That
+      double-count is what the ×2.0 `inferredEdgePenalty` (bushy.go:67) was
+      compensating for in the COST dimension rather than the cardinality one;
+      inferred clauses carry no penalty here and `inferred` survives only as
+      the tie-break for which member carries the selectivity. Class ids are
+      dense in `compareColumnIdent` order, not map order — the id picks that
+      member, so a map-ordered id would move plans between identical runs.
+      Gates: UNITS PASS; **PLAN 22/22 MATCH** vs `m0127-p21-hashkeys`
+      (structural, live 65433). 8 tests in `joinrestrict_test.go` (incl. a
+      20-run id-determinism guard and a refuse-don't-guess guard on foreign
+      coordinates); mutation-checked — adding coverage to
+      `hasRelevantJoinClause` and removing the EC dedup each fail their own
+      guard. **One ledger row** (`2026-08-04 M0127-P5.2`): goopg CLASSIFIES the
+      conjuncts it is handed and never SYNTHESISES a clause from a class the
+      way `create_join_clause` does, so an EC edge `inferAnchoredEqualities`
+      declined to emit stays invisible to the search; resume at P5.4/P5.6.
+      Inert as P5.1 was (no `planSelect` reference, `GOOPG_PGSHAPED_DP` OFF).
+      **Next M0127 selection is P5.3** (`joinSearchOneLevel` phases 1+3 +
+      `makeJoinRel`); its `hasNoJoinClauseAtAll` gate landed here with the
+      list. Progress log: design doc §6.
 - [ ] **M0127-P5.3 — `joinSearchOneLevel` phases 1+3** (clause joins against
       initial rels; disconnected cartesian; last-ditch); `makeJoinRel` with
       PG's outer/inner printing convention (03 §4.4). IMPLEMENTATION-TODO P5.3;
