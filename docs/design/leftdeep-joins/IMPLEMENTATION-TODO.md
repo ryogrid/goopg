@@ -299,11 +299,39 @@
   on below" when it means "what I still need from above", and naming a
   relation the joinrel contains. Still inert — no `planSelect` call site,
   `GOOPG_PGSHAPED_DP` OFF. UNITS PASS.)*
-- [ ] **P5.4b-ii** Parameterised PATHS: NLI + Memoize (03 §5.2). NLI binding
+- [x] **P5.4b-ii-a** Parameterised BASE INDEX paths — P5.1's deferred half, and
+  this sub-item's own first step rather than a prerequisite someone else
+  supplies.
+  *(DONE 2026-08-04 — `internal/planner/pathparamindex.go` (+ `joinsearch.go`).
+  `create_index_paths`' join arm (indxpath.c:446) per base rel: the equijoin
+  clauses whose inner operand is a bare column of THIS rel, one candidate
+  parameterisation per distinct outer relset, the longest B-tree index those
+  clauses fully cover, and one `PathIndexScan` with a `RequiredOuter` — the
+  first path in the search to have one, which is what makes P5.4b-i's
+  discipline reachable instead of merely tested. `ppi_rows` needed no
+  `eqjoinsel`: `get_parameterized_baserel_size` (costsize.c:5379) passes
+  `varRelid = rel->relid`, which forces every clause to be estimated as a
+  RESTRICTION on this rel, so the answer is `var_eq_non_const` — non-null
+  fraction over the rel's own ndistinct, clamped to MCV[0] — and no
+  both-sides join estimator is consulted. PG's `rel->tuples * sel(param ∪
+  baserestrict)` equals goopg's `rel.Rows * sel(param)` because `rel.Rows`
+  already carries the baserestrict selectivity. A fully-bound unique index
+  short-circuits to one row (PG's `vardata->isunique`). Cost is built FROM
+  `indexProbeCost` so the `indexProbeCostMultiplier` calibration is not
+  duplicated. It is a separate step between `buildInitialRels` and
+  `joinSearch` because it reads the clause list — PG's own ordering
+  (`set_base_rel_pathlists` runs after `deconstruct_jointree`). Index
+  eligibility calls `pickIndexCoveringAllLeadingColumns`, the NLI
+  constructor's own function: the first half of §5.2's binding contract.
+  Still inert — no `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger
+  rows. UNITS PASS.)*
+- [ ] **P5.4b-ii-b** Parameterised JOIN paths: the NLI arm of
+  `add_paths_to_joinrel` over `inner.CheapestParameterized`
+  (joinpath.c:1874-2010) + Memoize (`get_memoize_path`, :562). NLI binding
   contract: shared eligibility fn with `tryBuildNLI`; constructor failure on a
-  DP-chosen path = loud planner error. Consumes P5.4b-i's
-  `CheapestParameterized`; needs P5.1's deferred parameterised base index
-  paths before an inner can be parameterised at all.
+  DP-chosen path = loud planner error. This is what makes the pair P5.4b-i
+  deliberately left pathless — inner cheapest-total parameterised by the outer
+  — reachable again.
 - [ ] **P5.4c** Merge paths via pathkeys (03 §5.3): explicit Sort paths,
   pathkey propagation through the join, `mergeJoinCost` on equal footing.
   With them the jointype gauntlet and the FULL-without-usable-clause error

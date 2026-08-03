@@ -76,6 +76,14 @@ type searchCtx struct {
 	// cp is the cost currency every path in this search is priced in (04 §1).
 	cp costParams
 
+	// relInfos is the per-initial-rel estimate `buildInitialRels` was handed,
+	// kept because the parameterised index paths of P5.4b-ii-a need each base
+	// rel's `catalog.Table` and cannot be built until the clause list exists
+	// (pathparamindex.go). Index i corresponds to `joinrels[1][i]`, which is
+	// FROM order — the same correspondence `buildInitialRels` established when
+	// it derived relid `1<<i` from position i.
+	relInfos []baseRelInfo
+
 	// clauses is the join-clause bookkeeping the enumerator gates on — PG's
 	// per-rel `joininfo` lists, flattened (joinrestrict.go:91). nil is legal
 	// and means "no join qual anywhere", which phase 1's clauseless branch
@@ -189,9 +197,16 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 // P5.5's createPlan re-emit an `*IndexScan` leaf as an index scan instead of
 // silently demoting it to a seq scan. Its COST, however, is re-derived here in
 // the search's own currency (04 §1) rather than inherited, because the two
-// cost models must not be mixed inside one comparison. Real per-index path
-// generation and the parameterised index paths NLI needs (03 §2's base-table
-// row, §5.2) are P5.4's, and are ledgered as deferred.
+// cost models must not be mixed inside one comparison.
+//
+// The parameterised index paths NLI needs (03 §2's base-table row, §5.2) are
+// NOT added here, and their absence is not the deferral it once was: they
+// depend on the clause list, which is built after the initial rels, so they are
+// a separate step — `addParameterizedIndexPaths` (pathparamindex.go), run
+// between this and `joinSearch`. That mirrors PG, where `set_base_rel_pathlists`
+// (allpaths.c:191) likewise runs only once `deconstruct_jointree` has produced
+// the `joininfo` lists `create_index_paths` reads. Real UNPARAMETERISED
+// per-index path generation is still P5.4's and still ledgered as deferred.
 func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams) (*searchCtx, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("join search: empty FROM list")
@@ -204,6 +219,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 	if err != nil {
 		return nil, err
 	}
+	s.relInfos = relInfos
 	for i := range bindings {
 		leaf := scans[i]
 		if leaf == nil {

@@ -6475,18 +6475,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       relation the joinrel contains. Still inert — no `planSelect` call site,
       `GOOPG_PGSHAPED_DP` OFF. 1 ledger row. Bar met: UNITS (SPOT/DS05 not
       applicable — no call site, flag OFF, so no plan and no row can move).
-- [ ] **M0127-P5.4b-ii — parameterised PATHS:** NLI + Memoize (03 §5.2). NLI
-      binding contract: shared eligibility fn with `tryBuildNLI`;
-      constructor failure on a DP-chosen path = loud planner error. Consumes
-      P5.4b-i's `CheapestParameterized` (the discipline is already in place,
-      so this slice adds paths rather than paths + rules). Needs P5.1's
-      deferred parameterised base index paths before an inner can be
-      parameterised at all — that is this item's first sub-step, not a
-      prerequisite someone else supplies. Note the consequence P5.4b-i
-      deliberately left: until this arm exists, a pair whose inner
-      cheapest-total is parameterised by the outer yields NO path from
-      `addPathsToJoinrel` (unreachable today — nothing generates one).
-      IMPLEMENTATION-TODO P5.4b-ii; 03 §5.2. Bar: UNITS + SPOT + DS05.
+- [x] **M0127-P5.4b-ii-a — parameterised BASE INDEX paths.**
+      **DONE 2026-08-04 (loop #66)**, `internal/planner/pathparamindex.go`
+      (+ `joinsearch.go`). P5.4b-ii's own named first sub-step, split out and
+      landed alone for the reason P5.4b itself was split: the NLI arm iterates
+      `inner.CheapestParameterized`, which is empty in every query until some
+      path carries a `RequiredOuter`, so path and consumer are separately
+      falsifiable. Lands `create_index_paths`' join arm (indxpath.c:446) per
+      base rel — the equijoin clauses whose inner operand is a bare column of
+      THIS rel, one candidate parameterisation per distinct outer relset, the
+      longest B-tree index those clauses fully cover, one `PathIndexScan` with
+      a `RequiredOuter`. **The finding: `ppi_rows` does not need P5.6's
+      `eqjoinsel`, which had looked like a blocking dependency.**
+      `get_parameterized_baserel_size` (costsize.c:5379) passes
+      `varRelid = rel->relid` to `clauselist_selectivity`, which forces every
+      clause to be estimated as a RESTRICTION on this rel — so the answer is
+      `var_eq_non_const` (selfuncs.c): non-null fraction over the rel's own
+      ndistinct, clamped to MCV[0]'s frequency because a uniformly-drawn probe
+      value cannot be commoner than the commonest one. No both-sides join
+      estimator is consulted anywhere. PG's `rel->tuples * sel(param ∪
+      baserestrict)` is algebraically goopg's `rel.Rows * sel(param)` since
+      `rel.Rows` already carries the baserestrict selectivity — and that form
+      cannot double-count the local quals. A fully-bound unique index
+      short-circuits to one row (PG's `vardata->isunique`). Cost is built FROM
+      `indexProbeCost` rather than beside it, so the
+      `indexProbeCostMultiplier` calibration is not duplicated (04 §1's
+      one-currency rule). It is a THIRD step between `buildInitialRels` and
+      `joinSearch` because it reads the clause list, mirroring PG, where
+      `set_base_rel_pathlists` runs only after `deconstruct_jointree`. Index
+      eligibility calls `pickIndexCoveringAllLeadingColumns` — the NLI
+      constructor's own function, the first half of 03 §5.2's binding
+      contract. Still inert: no `planSelect` call site, `GOOPG_PGSHAPED_DP`
+      OFF. 2 ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no call
+      site, flag OFF, so no plan and no row can move).
+- [ ] **M0127-P5.4b-ii-b — parameterised JOIN paths:** the NLI arm of
+      `add_paths_to_joinrel` over `inner.CheapestParameterized`
+      (joinpath.c:1874-2010) + Memoize (`get_memoize_path`, :562). NLI
+      binding contract: shared eligibility fn with `tryBuildNLI`; constructor
+      failure on a DP-chosen path = loud planner error. Its input now exists
+      (P5.4b-ii-a) and the discipline governing it already does (P5.4b-i), so
+      this slice adds one arm rather than arm + paths + rules. It is also what
+      makes the pair P5.4b-i deliberately left pathless reachable again: a
+      pair whose inner cheapest-total is parameterised by the outer yields NO
+      path from `addPathsToJoinrel` today, and PG recovers it precisely here
+      (:1874 drops it from the plain-NL arm because that arm would mis-cost
+      the rescan). Also due here: PG's pairwise-union parameterisations
+      (`consider_index_join_outer_rels`, indxpath.c:541) and
+      `generateNLIPath` reading the inner PATH's cost as the rescan cost
+      instead of a bare `indexProbeCost` — both ledgered against this item.
+      IMPLEMENTATION-TODO P5.4b-ii-b; 03 §5.2. Bar: UNITS + SPOT + DS05.
 - [ ] **M0127-P5.4c — merge paths via pathkeys** (03 §5.3): explicit Sort
       paths, pathkey propagation through the join, `mergeJoinCost` on equal
       footing with hash. With them the jointype gauntlet (`nestjoinOK`,
