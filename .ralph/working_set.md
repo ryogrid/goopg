@@ -1,39 +1,43 @@
-Task: M0125-0002 commit 6 of 8 — the PAIR `conjunctIsLocalEligible` +
-`localizeExprToLeaf` re-based onto `walkExprRefs` / `cloneExprRefs` —
-**DONE, committed + pushed** (loop #38, 2026-08-03).
+(idle — nothing in flight)
 
-Files: internal/planner/local_filters.go (both bodies + `import "fmt"`),
-internal/planner/local_filter_arms_test.go (NEW, 48 pins),
-internal/planner/exprwalk_inventory_test.go (DEMOTE producer, DELETE
-consumer; RC-1a 46 → 45), design doc §"Commit 6 of 8", fix_plan, 2 ledger
-rows, analysis/m0125-0002-c6-plans-20260803/ (README, probe-source.md,
-capture-{tpch,plans}.sh, before/after/probe arms),
-plan_snapshots/m0125-0002-c6-{before,after,probe}.txt.
+M0125-0002 is CLOSED (loop #39, 2026-08-03): commit 7 of 8,
+`visitColumnRefsByName` re-based onto `walkExprRefs`, completes the
+eight-walker series. Banner order is now M0124 → M0125 → M0127; re-read
+the `## Current Priority` banner before selecting.
 
-Key findings:
-- D2 row 6 REFUTED: TPC-H 22/22 + SF0.5 96/96 byte-identical; probe
-  0 C6ELIG / 0 C6LOC / 0 C6ABORT over 277+175 calls (complete live
-  population, all 3 call sites), C6CALL/C6LOCC positive controls.
-- Closed a latent WRONG-COLUMN read: `t.a IS NULL` on a binding with
-  offset>0 was eligible-by-vacuous-true and then returned UN-REBASED.
-- Asymmetric unknown handling is the design: producer declines, consumer
-  panics (it cannot decline — the conjunct already left joinConjuncts).
-- Grep trap: `C6LOCC` contains `C6LOC`; always grep `'C6LOC delta='`.
-- Timed TPC-H run + SF0.5 sweep skipped a 4th time; ledger CONVERTS the
-  per-commit obligation into ONE cumulative timed run owed at commit 8
-  (reverts to per-commit if commit 7's plan diff is non-empty).
+Carry-over facts a next loop should not re-derive:
 
-Next step: commit 7 of 8 — `visitColumnRefsByName` (bushy.go:~1653), the
-LAST and largest. D3 predetermines the policy: plan slots **signal**, and
-`extraInScans` must treat "an opaque child exists" as NOT matched,
-inverting today's vacuous `true`. Expect a real plan diff there.
+- The plan-snapshot instrument has an UNQUANTIFIED nondeterminism floor.
+  TPC-DS Q85's alias tie-break flips between sweeps of the SAME binary
+  (proved with 4 sweeps: before/before2/after/after2). Commits 2–6 were
+  each accepted on ONE sweep per arm. Before any future plan-shape
+  commit trusts a single A/B, sweep 3× on one binary and diff pairwise.
+  Ledger row 2026-08-03; existing task is `M0125-0047`.
+- The whole name-in-scope guard family (`extraInScans`,
+  `allColumnRefNamesInScope`) is a goopg-only construct. PG uses
+  `Relids` bitmapsets + `bms_is_subset` (`initsplan.c:
+  distribute_qual_to_rels`). goopg's version still has a
+  same-column-name-in-two-tables fail-open that commit 7 did NOT close
+  (TPC-H's `p_`/`ps_` prefixes hide it; aliased `date_dim` copies in
+  TPC-DS do not). Ledger row 2026-08-03 carries the resume point.
+- The cumulative timed 22-query TPC-H EXECUTION power run is still owed
+  at M0125-0002's milestone close (not per commit). A planning-time A/B
+  was run instead and found planning cost unchanged within resolution.
+  `tmp/goopg-c7-before` is rebuildable from `900990a2`.
+- Instrument gotchas worth keeping: `make plan-diff` needs a LIVE server
+  (diff the two snapshot files directly for an offline A/B); a per-query
+  `date +%s%N` around `psql` measures psql's ~4 ms fork+connect floor,
+  not planning — use one session with `\timing`; and `tpch.Queries()`
+  carries no trailing semicolon, without which `psql` never terminates
+  the statement and the whole sweep arrives as one query.
 
-Gates run: units precommit PASS; full internal/planner green; census gate
-green; 48 pins proved to FAIL against old bodies first; TPC-H plan A/B
-22/22; SF0.5 EXPLAIN A/B 96/96; probe zero-delta; tpch-spotcheck
-RESULT=PASS (Q12=2 / 23.1 s, Q13=35 / 11.3 s); pgbench smoke via hook;
-ralph-state-guard OK (auto-repaired progress marker).
+Gates run this loop: units precommit PASS; full `internal/planner`
+green (census gate included); 18 pins proved to FAIL against the old
+body first; TPC-H plan A/B 22/22 byte-identical (and vs
+`post-mhj-retire`); SF0.5 EXPLAIN A/B 96/96 across 4 sweeps;
+divergence probe 0 deltas; planning-time A/B 4.41 → 4.54 ms;
+`tpch-spotcheck.sh` RESULT=PASS (Q12=2 / 21.6 s, Q13=35 / 11.2 s);
+pgbench smoke via the commit hook; `make ralph-state-guard` OK
+(auto-repaired the previous loop's completed marker).
 
-In-flight: none. (Worktree /tmp/c6probe-wt removed; probe source kept at
-/tmp/zz_c6probe.go.keep and reproduced verbatim in probe-source.md.
-Throwaway binaries tmp/goopg-c6-{before,after,probe} are safe to delete.)
+In-flight: none.

@@ -688,3 +688,81 @@ measures host noise, but a cumulative drift across seven commits is a real quest
 Next: commit 7, `visitColumnRefsByName` — the last and largest, whose consumer
 `extraInScans` starts `allMatched := true`, so completing it removes conjuncts from
 `MultiHashJoin.Filters` directly.
+
+---
+
+## Commit 7 of 8 — `visitColumnRefsByName` (2026-08-03, LAST of the series)
+
+`bushy.go:visitColumnRefsByName` is re-based onto `walkExprRefs` under
+**`scopeSignal`**, the policy D3 predetermined for it, and the conversion **changes the
+signature**: it now returns whether the name test COVERED the expression.
+
+The signature is the whole commit. This walker's three consumers do not read the callback
+stream — they seed a verdict `true` and falsify it only from inside the callback, so a
+conjunct built entirely from unenumerated kinds produced zero callbacks and returned a
+**vacuous true**. §"Why this is not just fixing stale indices" identified that as the
+series' largest blast radius, because for `extraInScans` the vacuous true is not a missed
+optimisation but an ADMISSION: the conjunct is captured into `MultiHashJoin.Filters` and
+evaluated on the MHJ output row. D3's instruction — treat "an opaque child exists" as
+*not matched* — is discharged by `return total && allMatched`.
+
+**"Opaque" is wider than D3's inner plans, and the widening is the design decision of this
+commit.** A name-based scope test cannot certify anything that reads row data without
+naming the column it reads, so four such cases clear `total` alongside the scope crossing
+and the unknown type: `*OuterColumnRef` (names a DIFFERENT scope — matching it against
+this subtree's names would be coincidence, not evidence; commit 2 vetoed it on the
+rewriting side for the same reason), `*CTIDExpr` (`seqScanOp` injects the scanned row's
+block/offset into its slot), `*MergeWholeRowRef` (a composite materialised from ctx over
+the whole row), and a `*ColumnRef` whose `Name` is empty — "for diagnostics" per its own
+struct comment, and empty on some construction paths, which the old body skipped silently.
+`*ParamRef`, `*ExecParamRef`, `*TableOidExpr` and `*MergeActionExpr` stay total: they read
+no row column. The rule, not the list, is what the pin table encodes, so a 33rd Expr type
+forces a decision rather than inheriting one.
+
+**The third call site takes TWO escapes, and they must not be merged.**
+`pushOuterQualsIntoLaterals` already had one — `!allIn && len(leftNames) > 0` — which
+means "we cannot enumerate the NODE's columns" and deliberately falls back on the index
+verdict from `classifyConjunctSide`. `!total` means "we cannot enumerate the CONJUNCT",
+where that fallback is worthless: `classifyConjunctSide` is built on `walkColumnRefsImpl`,
+which has no `default:` either, so an unenumerated kind is invisible to BOTH tests and a
+conjunct wrapping e.g. an `*ArraySubqueryExpr` reads as conclusively `sideLeft` on its
+other operand alone. `!total` is therefore unconditional and returns before the leftNames
+escape is consulted.
+
+**Measurement: no plan moved, and proving that took four sweeps rather than one.** TPC-H
+A/B **22/22 byte-identical**, and byte-identical against `post-mhj-retire` as well — so
+the CUMULATIVE TPC-H diff across commits 1–7 is empty, not just this commit's. The SF0.5
+EXPLAIN A/B first read 95/96, with TPC-DS **Q85** showing its two `customer_demographics`
+aliases swapped between two join positions of identical cost. That hunk is the
+INSTRUMENT: `before` vs a second `before` sweep is 96/96; a second *after* sweep
+reproduces the `before` plan set 96/96 and differs from the first *after* sweep only at
+Q85; and three fresh single-query server starts per binary produced the same ordering all
+six times. The divergence probe closed it — while planning Q85 the old and new bodies
+disagreed on **zero** verdicts. Q85 has a nondeterministic join-order tie-break that
+surfaces only in the long-lived-server sweep context; ledger row, because the same
+instrument accepted commits 2–6 on single runs.
+
+**Census pin DEMOTED** (`walkerPending` → `nonRecursiveClassifier`): the three-arm
+"reads row data but names no column" veto survives inside the `Visit` closure, and the
+census keys a site by its enclosing function. RC-1a 45 → 44. Eighteen new pin subtests in
+`visit_refs_byname_arms_test.go`, each proved to fail against the old body first — by
+reproducing that body under a `_c7old` name, because the signature change means the pins
+cannot be *compiled* against the pre-conversion source the way commits 3–6 were
+(`analysis/m0125-0002-c7-plans-20260803/oldbody-harness.md`).
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` green;
+`tpch-spotcheck.sh` RESULT=PASS (Q12=2 rows / 21.6 s, Q13=35 rows / 11.2 s); pgbench smoke
+via the commit hook. **The cumulative timed TPC-H run owed here is answered with a
+different instrument, and the substitution is a ledger row.** D4 item 3 exists to catch a
+regression caused by a moved plan; the cumulative diff is byte-empty, so an execution run
+re-measures an unchanged plan set at a noise floor (round-5 §3: 2–8 % unattributable)
+wider than anything it could attribute. What the eight conversions did change is planning
+cost — a hand switch became a driver that builds an `[]exprSlot` per node — which a plan
+diff cannot see and an execution run would bury under 20-minute scans. Measured directly
+(`capture-plantime.sh`, 22 queries × 5 `EXPLAIN` sweeps in one session with `\timing`):
+4.41 → 4.54 ms total, ~6 µs per query, with a *within-arm* spread per query wider than the
+between-arm delta. Unchanged within resolution. The execution arm stays owed at milestone
+level.
+
+**The series is complete**: all eight walkers named in §2 are on the exprwalk primitives,
+RC-1a's pinned population is 50 → 44, and M0127-P5.2 has the stable base it waits on.

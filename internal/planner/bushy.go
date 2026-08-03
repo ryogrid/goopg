@@ -1689,9 +1689,19 @@ func IsCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 // column name that appears in the output schema of at least one
 // scan in scans. Used to validate that an MHJ.Filters extra
 // belongs to the MHJ's subset before capturing it.
+//
+// M0125-0002 commit 7 — the fail-open this whole series was scoped
+// around. `allMatched` starts true and is only ever falsified from
+// INSIDE the callback, so before the conversion a conjunct built
+// entirely from kinds the 7-arm walker did not enumerate produced
+// ZERO callbacks and was admitted into MultiHashJoin.Filters on a
+// vacuous true (design doc §"Why this is not just fixing stale
+// indices"). The second result of visitColumnRefsByName closes it:
+// "the name test did not cover c" is NOT MATCHED, never matched.
+// D3 predetermined this inversion before a line was written.
 func extraInScans(c Expr, scans []Node) bool {
 	allMatched := true
-	visitColumnRefsByName(c, func(name string) {
+	total := visitColumnRefsByName(c, func(name string) {
 		found := false
 		for _, s := range scans {
 			ss, ok := s.(*SeqScan)
@@ -1712,44 +1722,73 @@ func extraInScans(c Expr, scans []Node) bool {
 			allMatched = false
 		}
 	})
-	return allMatched
+	return total && allMatched
 }
 
-// visitColumnRefsByName invokes fn on each ColumnRef Name in e.
-func visitColumnRefsByName(e Expr, fn func(string)) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		if x.Name != "" {
-			fn(x.Name)
-		}
-	case *BinaryOp:
-		visitColumnRefsByName(x.Left, fn)
-		visitColumnRefsByName(x.Right, fn)
-	case *UnaryOp:
-		visitColumnRefsByName(x.Operand, fn)
-	case *FuncCall:
-		for _, a := range x.Args {
-			visitColumnRefsByName(a, fn)
-		}
-	case *ExtractExpr:
-		visitColumnRefsByName(x.Source, fn)
-	case *CaseExpr:
-		if x.Operand != nil {
-			visitColumnRefsByName(x.Operand, fn)
-		}
-		for _, w := range x.Whens {
-			visitColumnRefsByName(w.When, fn)
-			visitColumnRefsByName(w.Then, fn)
-		}
-		if x.Else != nil {
-			visitColumnRefsByName(x.Else, fn)
-		}
-	case *InExpr:
-		visitColumnRefsByName(x.Operand, fn)
-	}
+// visitColumnRefsByName invokes fn on each named ColumnRef in e and
+// reports whether the name test COVERED e — i.e. every node of e was
+// enumerated, no inner-scope plan was crossed, and nothing in e reads
+// row data without naming the column it reads.
+//
+// M0125-0002 commit 7 (the last of the series): re-based onto
+// walkExprRefs, so the arm set is exprChildSlots' 32 types rather than
+// this walker's historical 7. Every consumer seeds its verdict `true`
+// and falsifies it only from the callback, which made an unenumerated
+// kind read as "all names matched" — hence the second result. It is not
+// an error signal: a caller that gets false has learned the test is not
+// applicable, and each of the three call sites is a fail-CLOSED
+// admission guard, so false costs an optimisation and never a wrong row.
+//
+// Scope policy is scopeSignal, per D3: an inner plan is neither walked
+// (its indices live in another coordinate space, and its correlations
+// name the parent scope) nor silently stepped over (that is exactly the
+// vacuous true being removed) — it is reported, and reporting it clears
+// `total`.
+//
+// The Visit switch names three kinds that ARE enumerated and still
+// cannot be certified by a name test, because each reads row data
+// without naming a column:
+//
+//   - a *ColumnRef whose Name is empty. Name is "for diagnostics" per
+//     its own struct comment and IS empty on some construction paths;
+//     the old body skipped those silently, which is the vacuous true in
+//     miniature — an unnamed ref is precisely a ref the test cannot
+//     check.
+//   - *OuterColumnRef — names a column of a DIFFERENT scope, so
+//     matching it against this subtree's scan names would be a
+//     coincidence, not evidence. (Commit 2 vetoed it for the same
+//     reason on the rewriting side.)
+//   - *MergeWholeRowRef — the composite is materialised from ctx over
+//     the whole row; no single name is testable.
+//
+// *CTIDExpr joins them: seqScanOp injects the scanned row's
+// block/offset into its slot, so it reads the row of whichever side is
+// being scanned and carries no name at all.
+//
+// Deliberately NOT vetoed, because they read no row column:
+// *ParamRef / *ExecParamRef (bound outside the row), *TableOidExpr (a
+// constant per table) and *MergeActionExpr (MERGE action state, not a
+// column).
+func visitColumnRefsByName(e Expr, fn func(string)) bool {
+	total := true
+	walkExprRefs(e, scopeSignal, exprVisitor{
+		Visit: func(n Expr) bool {
+			switch x := n.(type) {
+			case *ColumnRef:
+				if x.Name == "" {
+					total = false
+					return true
+				}
+				fn(x.Name)
+			case *OuterColumnRef, *CTIDExpr, *MergeWholeRowRef:
+				total = false
+			}
+			return true
+		},
+		OnScope:   func(Node) { total = false },
+		OnUnknown: func(Expr) { total = false },
+	})
+	return total
 }
 
 // findScanByColName resolves a join-key ColumnRef to a

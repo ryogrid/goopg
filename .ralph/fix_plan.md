@@ -2151,8 +2151,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       reads `Stats.RowCount` directly (`internal/catalog/catalog.go:6946`) and
       CANNOT be fixed here. Phase 6.2 out of scope (B3: does not fix Q64 alone).
       Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
-- [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
-      #4, phase 2.2).
+- [x] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
+      #4, phase 2.2). **CLOSED 2026-08-03 — all eight walkers converted in seven
+      commits; see COMMIT 7 below.**
       **↳ M0127 PREREQUISITE (2026-08-03): commits 5–8 are the walker
       stabilisation M0127's qual plumbing builds on.** The M0127 banner lists
       this item among the four M0125 items M0127 waits on, and M0127-P5.2
@@ -2411,14 +2412,81 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       subplans only for pushdown INTO a subquery RTE (`allpaths.c:3934`,
       `qual_is_pushdown_safe`). Evidence
       `analysis/m0125-0002-c6-plans-20260803/` (incl. `probe-source.md`).
-      **Next in THIS task is commit 7 of 8 (`visitColumnRefsByName`) — the
+      **COMMIT 7 of 8 DONE 2026-08-03 — `visitColumnRefsByName` re-based onto
+      `walkExprRefs` (`scopeSignal`), and D2 row 7's "largest and least
+      predictable effect" is REFUTED: no plan moved on either benchmark.**
+      This is the commit that CHANGED A SIGNATURE rather than an arm set. Its
+      three consumers — `extraInScans`, `allColumnRefNamesInScope`,
+      `pushOuterQualsIntoLaterals` — never read the callback stream; each seeds
+      a verdict `true` and falsifies it only from inside the callback, so a
+      conjunct built entirely from unenumerated kinds produced ZERO callbacks
+      and returned a vacuous `true`. For `extraInScans` that is an ADMISSION,
+      not a missed optimisation: the conjunct is captured into
+      `MultiHashJoin.Filters` and evaluated on the MHJ output row. The walker
+      now returns whether the name test COVERED the expression, and D3's
+      inversion is `return total && allMatched`. **"Opaque" is wider than D3's
+      inner plans, and that widening is this commit's design decision:** a name
+      test cannot certify anything that reads row data WITHOUT NAMING the
+      column it reads, so `*OuterColumnRef` (names a different scope),
+      `*CTIDExpr` (`seqScanOp` injects the scanned row's block/offset),
+      `*MergeWholeRowRef` (composite from ctx) and an empty-`Name` `*ColumnRef`
+      (`Name` is "for diagnostics" and IS empty on some construction paths —
+      the old body skipped those silently) clear `total` alongside the scope
+      crossing and the unknown type. `*ParamRef`/`*ExecParamRef`/
+      `*TableOidExpr`/`*MergeActionExpr` stay total: they read no row column.
+      **`pushOuterQualsIntoLaterals` now takes TWO escapes that must not be
+      merged** — its existing `!allIn && len(leftNames) > 0` means "cannot
+      enumerate the NODE's columns" and falls back on the index verdict;
+      `!total` means "cannot enumerate the CONJUNCT", where that fallback is
+      worthless (`classifyConjunctSide` rides `walkColumnRefsImpl`, which has no
+      `default:` either, so an unenumerated kind is invisible to BOTH tests and
+      a conjunct wrapping an `*ArraySubqueryExpr` reads as conclusively
+      `sideLeft` on its other operand alone).
+      **Measurement, and it took four sweeps instead of two.** TPC-H A/B
+      **22/22 byte-identical** AND byte-identical against `post-mhj-retire` —
+      so the CUMULATIVE TPC-H diff across commits 1–7 is empty, not just this
+      one's. SF0.5 EXPLAIN A/B first read 95/96 with TPC-DS **Q85** swapping its
+      two `customer_demographics` aliases between join positions of identical
+      cost; **that hunk is the INSTRUMENT, not the change**: `before` vs
+      `before2` = 96/96, `after2` vs `before` = 96/96, `after2` vs `after` =
+      95/96 differing only at Q85 (the same binary produced both orderings),
+      three fresh single-query starts per binary gave the same ordering all six
+      times, and the divergence probe logged **0 verdict deltas** at all three
+      call sites while planning Q85. This is `M0125-0047` measured properly, and
+      it carries a consequence worth more than the commit: **the plan-snapshot
+      instrument accepted commits 2–6 on a SINGLE sweep per arm and has an
+      unquantified nondeterminism floor** — ledger row, with "sweep 3× on one
+      binary and diff pairwise" as the resume point.
+      **Census pin DEMOTED** (the three-arm veto survives in the `Visit`
+      closure); RC-1a 45 → 44. 18 pins in `visit_refs_byname_arms_test.go`,
+      each proved to FAIL against the old body first — by reproducing that body
+      under `_c7old` names, because the signature change means the pins cannot
+      be COMPILED against the pre-conversion source the way commits 3–6 were.
+      **Ledger rows: (a)** the cumulative timed TPC-H execution power run that
+      commit 6 scheduled for exactly this commit was NOT run; a planning-time
+      A/B was run instead (22 queries × 5 `EXPLAIN` sweeps in one session with
+      `\timing`: 4.41 → 4.54 ms, ~6 µs/query, within-arm spread wider than the
+      between-arm delta) because the plan set is byte-identical and what the
+      conversions actually changed is planning cost, which an execution run
+      would bury under 20-minute scans — execution arm owed at milestone close;
+      **(b)** the Q85 instrument finding above; **(c)** the whole name-matching
+      scope test is a goopg-only construct — PG carries `Relids` bitmapsets and
+      answers containment with `bms_is_subset` (`initsplan.c:
+      distribute_qual_to_rels`), which is immune to BOTH fail-opens goopg's
+      version has, including a same-column-name-in-two-tables one that no pin
+      here closes and that TPC-H's `p_`/`ps_` prefixes hide. Evidence
+      `analysis/m0125-0002-c7-plans-20260803/`.
+      **THE SERIES IS COMPLETE**: all eight walkers named in §2 are on the
+      exprwalk primitives, RC-1a's pinned population is 50 → 44, and M0127-P5.2
+      has the stable base it waits on.
+      ~~**Next in THIS task is commit 7 of 8 (`visitColumnRefsByName`) — the
       LAST and largest, and the one D2 row 7 names as the least predictable:
       its consumer `extraInScans` starts `allMatched := true` and only
       falsifies from inside the callback, so completing it removes conjuncts
       from `MultiHashJoin.Filters` directly. D3 predetermines its policy:
       plan slots SIGNAL, and the caller must treat "an opaque child exists"
       as NOT matched, inverting today's vacuous `true`. Assume the timed run
-      + SF0.5 answer sweep are owed until the diff proves empty.**
+      + SF0.5 answer sweep are owed until the diff proves empty.**~~
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`

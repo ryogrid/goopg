@@ -173,12 +173,27 @@ func pushOuterQualsIntoLaterals(node Node) Node {
 		// the left output; the name check is only an extra safety, so a
 		// node whose columns we can't enumerate (empty leftNames) still
 		// pushes on the conclusive index classification.
+		//
+		// M0125-0002 commit 7: `total` is a SECOND and unconditional
+		// escape, and the two must not be confused. The leftNames
+		// escape covers "we cannot enumerate the NODE's columns" and
+		// deliberately falls back on the index verdict; `total` covers
+		// "we cannot enumerate the CONJUNCT", where the index verdict
+		// is no fallback at all — classifyConjunctSide is built on
+		// walkColumnRefsImpl, which has no `default:` either, so an
+		// unenumerated kind is invisible to BOTH tests and a conjunct
+		// wrapping e.g. an *ArraySubqueryExpr reads as conclusively
+		// sideLeft on its other operand alone.
 		allIn := true
-		visitColumnRefsByName(c, func(name string) {
+		total := visitColumnRefsByName(c, func(name string) {
 			if !leftNames[name] {
 				allIn = false
 			}
 		})
+		if !total {
+			remaining = append(remaining, c)
+			continue
+		}
 		if !allIn && len(leftNames) > 0 {
 			remaining = append(remaining, c)
 			continue
@@ -207,12 +222,12 @@ func allColumnRefNamesInScope(c Expr, j *Join) bool {
 	collectScanOutputNames(j.Left, names)
 	collectScanOutputNames(j.Right, names)
 	allIn := true
-	visitColumnRefsByName(c, func(name string) {
+	total := visitColumnRefsByName(c, func(name string) {
 		if !names[name] {
 			allIn = false
 		}
 	})
-	return allIn
+	return total && allIn
 }
 
 // pushOneConjunct attempts to push a single conjunct down the join

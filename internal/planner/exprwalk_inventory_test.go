@@ -124,7 +124,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:remapByPosMap":           nonRecursiveClassifier,
 	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
 	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
-	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
+	// CONVERTED by M0125-0002 commit 7, the LAST of the series. The
+	// recursion is walkExprRefs (scopeSignal); the surviving switch is the
+	// three-arm "reads row data but names no column" veto inside the Visit
+	// closure (*OuterColumnRef / *CTIDExpr / *MergeWholeRowRef, plus the
+	// empty-Name *ColumnRef), attributed by the census to its enclosing
+	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
+	// RC-1a class 45 -> 44.
+	"bushy.go:visitColumnRefsByName": nonRecursiveClassifier,
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and
 	// cloneExprRefs the rewrite — and what the census sees is the

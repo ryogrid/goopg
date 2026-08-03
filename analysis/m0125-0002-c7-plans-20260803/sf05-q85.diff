@@ -1,0 +1,8 @@
+15c15
+<                       ->  Seq Scan on public.customer_demographics cd2 (stats)  (cost=0.00..0.00 rows=1920800 width=0)
+---
+>                       ->  Seq Scan on public.customer_demographics cd1 (stats)  (cost=0.00..0.00 rows=1920800 width=0)
+17c17
+<                     ->  Seq Scan on public.customer_demographics cd1 (stats)  (cost=0.00..0.00 rows=1920800 width=0)
+---
+>                     ->  Seq Scan on public.customer_demographics cd2 (stats)  (cost=0.00..0.00 rows=1920800 width=0)
