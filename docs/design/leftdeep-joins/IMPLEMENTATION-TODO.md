@@ -152,9 +152,25 @@
 
 ## P5 — The DP [S5] (each task lands dark behind `GOOPG_PGSHAPED_DP`)
 
-- [ ] **P5.1** `joinrels` level lists + relset map over `RelOptInfo`;
+- [x] **P5.1** `joinrels` level lists + relset map over `RelOptInfo`;
   `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
   pinned unnest rels (closes the leaf-whitelist gap).
+  *(DONE 2026-08-04 — `internal/planner/joinsearch.go`. `searchCtx` holds
+  `joinrels [][]*RelOptInfo` (PG's `join_rel_level`) and `relMap
+  map[RelSet]*RelOptInfo` (PG's `join_rel_hash`) as TWO indexes over one set
+  of rels: `addRel` derives the level from `bits.OnesCount16(relids)` rather
+  than taking it as an argument, and rejects a duplicate relset, so the two
+  cannot disagree about where a rel lives. `buildInitialRels` takes the same
+  three per-FROM-item slices `tryBushyDP` already assembles and admits EVERY
+  item — the whitelist gap closes here — with rows post-local-filter for a
+  base table and `EstimateRows(leaf)` for every other leaf class, floored at
+  1. Each rel gets one `PathPrebuilt` over the already-planned leaf, re-costed
+  via `costSeqscan` over `estScanPages`: the node is carried whole so P5.5's
+  createPlan can re-emit an index-scan leaf, but its cost comes from the
+  search's own currency, never inherited. Per-index and parameterised paths
+  are deferred to P5.4 — 1 ledger row. Nothing calls it: gated behind
+  `GOOPG_PGSHAPED_DP` (default OFF, pinned by a test) and unreferenced from
+  `planSelect`. UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`.)*
 - [ ] **P5.2** restrictInfo list + `hasRelevantJoinClause`; equivalence-class
   selectivity rule (inferred edges: admissible, no double-count).
 - [ ] **P5.3** `joinSearchOneLevel` phases 1+3 (clause joins against initial

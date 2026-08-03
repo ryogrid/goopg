@@ -1,52 +1,50 @@
 (idle — nothing in flight)
 
-M0127-P4.4 is CLOSED, committed and pushed. **All four P4 tasks have landed;
-S4's stage exit is NOT met** (§3 also wants the regress-port outer-join files
-green, which stays gated on P4.2's `GOOPG_HASH_OUTER_JOIN` flip = P5).
+M0127-P5.1 is CLOSED, committed and pushed. M0125-0037 was ticked with it
+(its own body pre-authorised "close on P5.1's landing"; no new work).
 
-**NEXT LOOP: re-read the `## Current Priority` banner (it wins over this note).
-It parks M-NIGHTLY below M0127, so the banner selects the next unchecked M0127
-item — `M0127-P5.1` (joinrels level lists + relset map over `RelOptInfo`;
-`buildInitialRels` incl. `PathPrebuilt` leaves — also closes M0125-0037 stage
-(ii)). IMPLEMENTATION-TODO P5.1; 03 §1-§2. Bar: UNITS + PLAN (default arm ZERO
-diffs — the task lands dark behind `GOOPG_PGSHAPED_DP`).**
+**NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
+note). It parks M-NIGHTLY below M0127, so the banner selects the next
+unchecked M0127 item — `M0127-P5.2` (restrictInfo list +
+`hasRelevantJoinClause`; equivalence-class selectivity rule — inferred edges
+admissible, no double-count). IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5. Bar:
+UNITS + PLAN (ZERO diffs).**
 
 Carry-over facts a next loop should not re-derive:
 
-- **`joinOp` no longer has `rows`/`idx`/`leftCTIDs`/`rowSourceLeft`.** Every
-  arm of `Next` streams; a joinOp with no `*Stream` set returns EOF. Tests that
-  asserted "output did not accumulate" by reading `o.rows` had to move to the
-  stream's own counters (`join_merge_stream_test.go` now checks
-  `mergeStream.steps`).
-- **LATERAL correlation binding is per-CALL, not per-iteration**
-  (`bindOuter`/`unbindOuter`, `join_lateral_stream.go`). This is load-bearing:
-  a streaming inner side yields to the PARENT between tuples, so a held
-  `ctx.OuterRows` push would capture the parent's own `OuterColumnRef`.
-  `CTERowCache` rides the same window.
-- **P4.4 ledger row #1 (PARAM_EXEC rescan) is what blocks Materialize/Memoize
-  under a LATERAL RHS.** goopg re-Opens/Closes the whole right subtree per
-  outer tuple because there is no changed-param signal. → P5.4.
+- **`internal/planner/joinsearch.go` is the new file P5.2–P5.5 all extend.**
+  `searchCtx{joinrels, relMap, nrels, cp}`; `addRel` derives the level from
+  `bits.OnesCount16` and errors on a duplicate relset; `levelRels` returns the
+  LIVE slice (phase 2 indexes into it — never reorder); `finalRel` returns an
+  error rather than asserting.
+- **`buildInitialRels(bindings, scans, relInfos, cp)`** takes the three
+  positionally-aligned slices `tryBushyDP` assembles at `bushy.go:184-196`.
+  P5.3's entry point should collect them the same way.
+- **Every initial rel has exactly ONE `PathPrebuilt`** over the leaf node,
+  cost re-derived via `costSeqscan(cp, estScanPages(rows,width), rows, 0)`.
+  Per-index + `PATH_PARAM_BY_REL` parameterised paths are DEFERRED to P5.4
+  (ledger row `2026-08-04 M0127-P5.1`) — `cost_funcs.go` has no `cost_index`.
+- **`GOOPG_PGSHAPED_DP` is read once into `pgShapedDP`**; read it via
+  `pgShapedDPEnabled()`. `TestPgShapedDPDefaultsOff` pins it OFF until P5.9.
+- **Non-table leaves need `EstimateRows(leaf)`, not `filteredRows`** — a
+  subquery binding's `catalog.Table` is synthetic (row count 0 → floors to 1).
 - **P4.1's ledger row #3 is STILL OPEN**: `mergeJoinStream.bufferGroup` keeps
   its hand-rolled twin of `materialBuffer`.
-- **NL inner work_mem bound stays OFF** (`GOOPG_NL_MATERIALIZE_WORK_MEM=1`) on
-  DS05 Q54 measurement; the flip needs `cost_rescan` in `costInnerNestLoop`
-  (`internal/planner/joincost.go:115`) = P5.7.
+- **NL inner work_mem bound stays OFF** (`GOOPG_NL_MATERIALIZE_WORK_MEM=1`);
+  the flip needs `cost_rescan` in `costInnerNestLoop` (`joincost.go:115`) = P5.7.
 - **Repo gofmt baseline is go1.25; local gofmt is 1.26** — never `gofmt -w`.
-  `operators_join_agg.go` is gofmt-dirty AT HEAD under the local tool; verify
-  you added none with the before/after drift diff (see this loop's method).
 - **Do NOT `git stash`** in this tree (9+ unrelated entries).
 - **Bundle discipline:** `docs/design/leftdeep-joins/**` is only ever touched
   at its IMPLEMENTATION-TODO checkboxes. Tracker = `docs/design/0127-pg-shaped-join-search.md` §6.
+- **PLAN gate recipe:** `bench/tpch/setup_goopg.sh` (no --reset), then
+  `PATH=$PWD/postgres/local_install/bin:$PATH make plan-gate`, then
+  `bench/tpch/stop_goopg.sh`. Verify no nightly batch is live first
+  (`tmp/goopg-bench-bin` is shared with that lane).
 
-Gates run this loop: UNITS PASS; SPOT PASS (Q12=2 / 15.8 s, Q13=35 / 11.4 s,
-query phase 28.7 s, peak 11,662 MB); DS05 PASS=94 MISMATCH=0 CKMISMATCH=0
-ERROR=0 TIMEOUT=1 (Q72, pre-existing) SKIP=4 — all 94 passing queries
-byte-identical to the P4.3 sweep in row count AND checksum, no query slower by
->20%, total 2310 s → 2332 s
-(`analysis/leftdeep-joins/2026-08-04-p44-ds05-sweep.txt`); SMOKE via the commit
-hook. REGRESS not run — no plan surface changed (no new plan node, no EXPLAIN
-line, no planner edit). RACE not run — no new shared state (the stream is
-per-joinOp; the only ctx mutation is the push/pop already done by the eager
-path).
+Gates run this loop: UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`
+(structural); SMOKE via the commit hook. SPOT/DS05/REGRESS/RACE not run — the
+change adds an unreferenced file (no `planSelect` call site, flag OFF), so no
+plan, no row, and no shared state can move; PLAN's 22/22 is the empirical
+confirmation of that.
 
 In-flight: none.

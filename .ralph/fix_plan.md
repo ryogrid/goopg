@@ -4639,8 +4639,17 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `M0125-0003`'s acceptance row — coordinate, do not duplicate it.** Bar: as
       -0034.
 
-- [ ] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
-      planner** **[→ M0127: stage (ii) absorbed 2026-08-03]** — stage (i)
+- [x] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
+      planner** **[→ M0127: stage (ii) absorbed 2026-08-03]**
+      **↳ CLOSED 2026-08-04 by M0127-P5.1's landing**, exactly as this item
+      pre-authorised below ("Close on P5.1's landing; nothing in stage (ii) is
+      owed before it"). `buildInitialRels`
+      (`internal/planner/joinsearch.go`) admits a set-op / subquery / CTE /
+      VALUES leaf as an initial rel with a `PathPrebuilt` path instead of
+      abandoning the search, so the DP is no longer blind to a rel behind a
+      set-op node; stage (i) (the EXPLAIN half) has been done since
+      2026-07-31 and the acceptance row `Q5 5|OK|100` green since then. No
+      new work was performed for this item this loop. — stage (i)
       (EXPLAIN half) is done; stage (ii)'s mechanism claim ("the DP cannot see
       through a set-op node") is closed by M0127-P5.1's `PathPrebuilt` leaves
       (subquery/CTE/VALUES/pinned-unnest admission — `IMPLEMENTATION-TODO`
@@ -6266,11 +6275,50 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       RHS — P5.4); and a LATERAL join drops the outer relation's ctid, so
       `FOR UPDATE OF <outer>` above one cannot stamp a tuple lock
       (pre-existing, preserved deliberately).
-- [ ] **M0127-P5.1 — `joinrels` level lists + relset map over `RelOptInfo`;**
+- [x] **M0127-P5.1 — `joinrels` level lists + relset map over `RelOptInfo`;**
       `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
       pinned-unnest rels (closes the leaf-whitelist gap — also closes
       M0125-0037 stage (ii)). IMPLEMENTATION-TODO P5.1; 03 §1-§2. Bar: UNITS +
       PLAN (default arm ZERO diffs — inert flag-off).
+      **↳ DONE 2026-08-04.** New `internal/planner/joinsearch.go`. `searchCtx`
+      carries PG's two indexes over one set of rels — `joinrels
+      [][]*RelOptInfo` (`root->join_rel_level`, allpaths.c:3475-3496) and
+      `relMap map[RelSet]*RelOptInfo` (`join_rel_hash`). They are two VIEWS of
+      one thing, so `addRel` **derives** the level from
+      `bits.OnesCount16(relids)` rather than taking it as an argument and
+      rejects a duplicate relset: two `RelOptInfo`s over one relset would split
+      the pathlist `addPath` prunes within, and a rel filed at the wrong level
+      would let phase 2 pair it with itself. `finalRel` states PG's
+      one-rel-at-the-top contract (allpaths.c:3508-3512) as a returned error,
+      not an assert — P5.3's answer to a failed search is the syntactic shape.
+      **`buildInitialRels` is where the leaf-whitelist gap closes**: it takes
+      the same three positionally-aligned per-FROM-item slices `tryBushyDP`
+      assembles (bushy.go:184-196) and admits EVERY item, where the old DP
+      abandons reordering for the whole statement on one VALUES/CTE/subquery
+      leaf (bushy.go:116-123). Rows are `filteredRows` for a base-table leaf
+      (post-local-filter, 03 §2) and `EstimateRows(leaf)` for every other
+      class — a subquery binding's `catalog.Table` is synthetic and its count
+      means nothing (the guard pins a VALUES rel at 3 and a CTE rel at its
+      body's 4242; both read 1 if `filteredRows` is believed) — floored at 1,
+      since a 0-row initial rel makes every join above it free. Each rel gets
+      one `PathPrebuilt` over the already-chosen leaf (carried whole so P5.5's
+      createPlan re-emits an `*IndexScan` leaf as an index scan rather than
+      demoting it) whose COST is re-derived via `costSeqscan`/`estScanPages` in
+      the search's own currency, because two cost models must not meet inside
+      one `addPath` comparison. **Inert twice over**: no `planSelect`
+      reference, and `GOOPG_PGSHAPED_DP` defaults OFF (pinned by a test).
+      Gates: UNITS PASS; **PLAN 22/22 MATCH** vs `m0127-p21-hashkeys`
+      (structural, live 65433). 7 tests in `joinsearch_test.go` separating the
+      two-indexes-agree invariant from the leaf admission; mutation-checked
+      (dropping the duplicate check / the non-table row rule each fail their
+      own guard). **One ledger row** (`2026-08-04 M0127-P5.1`): a base rel
+      contributes no per-index scan paths and no `PATH_PARAM_BY_REL`
+      parameterised paths — PG's `create_index_paths` — so the search cannot
+      trade access methods as the order changes; blocked on there being no
+      `cost_index` in the search's currency, resume at P5.4.
+      **Next M0127 selection is P5.2** (restrictInfo list +
+      `hasRelevantJoinClause`; equivalence-class selectivity rule).
+      Progress log: design doc §6.
 - [ ] **M0127-P5.2 — restrictInfo list + `hasRelevantJoinClause`;**
       equivalence-class selectivity rule (inferred edges admissible, no
       double-count). IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5. Bar: UNITS + PLAN
