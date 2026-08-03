@@ -33,9 +33,13 @@ package planner
 // *ColumnRef filter in each new body is a type assertion, not a switch.
 // Commit 5 (2026-08-03) then DEMOTED planner.go:exprSide — its body is
 // walkExprRefs now, but a two-arm dispatch survives in the Visit closure —
-// leaving the pinned walkerPending population at 46 (new pinned sites had
+// leaving the pinned walkerPending population at 46. Commit 6 (2026-08-03)
+// handled the producer/consumer pair in local_filters.go both ways at once:
+// conjunctIsLocalEligible DEMOTED (its veto dispatch survives in the Visit
+// closure) and localizeExprToLeaf DELETED (cloneExprRefs left it with a
+// *ColumnRef type assertion, no switch), leaving 45. (New pinned sites had
 // joined since the 2026-07-30 census; the map below, not this comment, is
-// the authoritative count).
+// the authoritative count.)
 //
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
@@ -150,8 +154,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	// bottom-up dispatch inside the Visit closure (veto *OuterColumnRef /
 	// *FuncCall, validate *ColumnRef against the owning Tables[i] range).
 	"inner_join_qual_pushdown.go:mhjResidualConjunctTable":      nonRecursiveClassifier,
-	"local_filters.go:conjunctIsLocalEligible":                  walkerPending, // 9 of 32 arms, recurses via its `walk` closure
-	"local_filters.go:localizeExprToLeaf":                       walkerPending, // 7 of 32 arms
+	// M0125-0002 commit 6 DEMOTED this one: the body is walkExprRefs
+	// (scopeVeto) now, but a two-arm veto dispatch survives in the Visit
+	// closure, so the census still keys a site to this function.
+	// localizeExprToLeaf, its consumer, was DELETED from this map in the
+	// same commit — cloneExprRefs left it with a *ColumnRef type
+	// assertion and no switch at all.
+	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
 	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
 	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
 	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms

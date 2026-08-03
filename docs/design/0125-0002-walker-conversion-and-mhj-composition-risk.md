@@ -612,3 +612,79 @@ a genuine non-empty diff. Next: commit 6, `conjunctIsLocalEligible` + `localizeE
 than declining one (`extraInScans` starts `allMatched := true`), so completing the walker
 can REMOVE predicates and the timed run should be assumed owed until the diff says
 otherwise.
+
+## Commit 6 of 8 — `conjunctIsLocalEligible` + `localizeExprToLeaf` (2026-08-03)
+
+**Landed as one commit, as D2 row 6 requires**, because the two functions are a
+producer/consumer pair with a shared invariant:
+`partitionConjunctsForJoinPlanning` *moves* an eligible conjunct out of
+`joinConjuncts` into `locals.byBinding`, and `attachRelationLocalFilters` is the only
+thing that puts it back into the plan. The producer's admission is therefore a promise
+that the consumer can rebase it; splitting the commit would have left a window where a
+conjunct is judged eligible and cannot be rebased — i.e. a dropped or mis-indexed
+predicate.
+
+**Scope policy: `scopeVeto` on both sides, with asymmetric unknown handling.**
+
+- The producer does **not** panic on an unenumerated type — it declines. A decline costs
+  an optimisation (the conjunct stays in the join residual and is evaluated above the
+  join), never a wrong answer, so this is the commit-5 `exprSide` treatment, not the
+  commit-3/4 `visitColumnRefs*` treatment. Three declines are explicit rather than
+  inherited from `scopeVeto`, because `exprChildSlots` emits `slotInnerPlan` **only when
+  `Plan != nil`**: `*OuterColumnRef` (a childless leaf), and the subquery-bearing kinds
+  in their unplanned form. `*ArraySubqueryExpr` / `*MultiAssignSubqRow` /
+  `*MultiAssignSubqElem` join `*SubqueryExpr` / `*ExistsExpr` in that set — the old
+  switch never named them, so they were admitted by accident.
+- The consumer **panics** on an abort. By the time it runs, the producer has already
+  accepted the conjunct over the SAME primitive with the SAME policy, so an abort means
+  the pair has diverged. It cannot decline: the predicate is no longer in
+  `joinConjuncts`, so returning it un-rebased or dropping it would be a wrong answer.
+  `TestLeafLocalPairAgreesOnEveryExprKind` pins the invariant over all 32 kinds, which is
+  what makes the panic unreachable by construction rather than by argument.
+
+**The latent defect this closes.** Both functions were incomplete in the same direction,
+which is precisely why it stayed latent — the producer usually declined what the consumer
+could not rebase. `WHERE t.a IS NULL`, on a binding with `offset > 0`, in a query passing
+`shouldAttachBeforeMHJ`, was judged eligible (the old 9-arm switch never descended
+`*IsNullExpr`, so the walk produced zero callbacks and `eligible` stayed `true`), moved
+into `locals`, then returned **unchanged** by `localizeExprToLeaf` — whose trailing
+pass-through ("Constants … no ColumnRef; pass through") was true of the seven kinds it
+knew and a silent lie about the other twenty-five. The leaf `Filter` then carried
+FROM-cumulative indices and read the wrong column. Commit 4 widened the reachability
+rather than creating it: a complete `tableForCol` attributes `t.a IS NULL` to a binding
+where the old one answered −1.
+
+**D2 row 6's shape-move prediction is REFUTED by measurement** — TPC-H A/B **22/22
+byte-identical** (the before arm re-derived `m0125-0002-c5-after.txt` byte-for-byte, so
+the instrument is stable across loops), SF0.5 `EXPLAIN` A/B **96/96 byte-identical**, and
+a divergence probe on BOTH functions at all three live call sites logged **0 `C6ELIG` /
+0 `C6LOC` / 0 `C6ABORT`** over **277 eligibility calls + 175 localization calls** across
+118 planned queries, with `C6CALL`/`C6LOCC` positive controls so the zeros cannot be
+vacuous. The probe was mandatory, not belt-and-braces: eligibility changes ARE visible in
+the plan text (a leaf `Filter` appears or disappears), but the `Index` rebase is
+**invisible** — goopg's EXPLAIN prints column names (M0125-0042) — so the probe compares
+localized trees by `exprIdentityKey`, which includes `Index`. Commit 2's metadata-loss
+class cannot arise here: `shallowCloneExpr` is a whole-struct copy, where commit 2's old
+arms rebuilt nodes from stale field lists. Evidence
+`analysis/m0125-0002-c6-plans-20260803/` (incl. `probe-source.md`).
+
+**Census pins moved in BOTH directions in one commit** — the first time in the series.
+`conjunctIsLocalEligible` DEMOTED (`walkerPending` → `nonRecursiveClassifier`: its veto
+dispatch survives inside the `Visit` closure, and the census keys a site by its enclosing
+function) and `localizeExprToLeaf` DELETED (`cloneExprRefs` left it with a `*ColumnRef`
+type assertion and no switch at all). RC-1a 46 → 45.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` package green; 48
+new pin subtests proved to FAIL against the old bodies first; `tpch-spotcheck.sh`
+RESULT=PASS (Q12=2 rows / 23.1 s, Q13=35 rows / 11.3 s); pgbench smoke via the commit
+hook. **D4 deviation (ledger row):** the timed 22-query TPC-H run and the SF0.5 answer
+sweep were again not executed — commit 5 declared them mandatory *here*, and the
+measurement discharged the premise that made them so (zero hunks on both benchmarks plus
+a zero-delta probe over the complete live population of both functions, including the
+index field EXPLAIN hides). Because that is now four consecutive byte-plan-identical
+commits, the ledger converts the per-commit obligation into **one cumulative timed TPC-H
+run at commit 8**, covering commits 2–8 as a block: a per-commit run over identical plans
+measures host noise, but a cumulative drift across seven commits is a real question.
+Next: commit 7, `visitColumnRefsByName` — the last and largest, whose consumer
+`extraInScans` starts `allMatched := true`, so completing it removes conjuncts from
+`MultiHashJoin.Filters` directly.

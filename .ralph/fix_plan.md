@@ -2360,12 +2360,65 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       zero-delta probe over the complete consumer population, and the walker
       is read-only returning an enum). Evidence
       `analysis/m0125-0002-c5-plans-20260803/`.
-      **Next in THIS task is commit 6 (`conjunctIsLocalEligible` +
-      `localizeExprToLeaf`) — the first PAIR in the series and the first where
-      a fail-open ADMITS a predicate rather than declining one (`extraInScans`
-      starts `allMatched := true`), so completing the walker can REMOVE
-      predicates: assume the timed run + SF0.5 sweep are owed until the diff
-      says otherwise.**
+      **COMMIT 6 of 8 DONE 2026-08-03 — the PAIR: `conjunctIsLocalEligible`
+      re-based onto `walkExprRefs` and `localizeExprToLeaf` onto
+      `cloneExprRefs` (both `scopeVeto`), and D2 row 6's shape-move
+      prediction is REFUTED by measurement.** One commit because
+      `partitionConjunctsForJoinPlanning` MOVES an eligible conjunct out of
+      `joinConjuncts`, so the producer's admission is a promise the consumer
+      can rebase it — split, the window is a dropped or mis-indexed
+      predicate. Unknown handling is deliberately ASYMMETRIC: the producer
+      declines (a decline costs an optimisation, never a wrong answer —
+      commit 5's treatment, not commit 3/4's panic), the consumer PANICS (it
+      cannot decline; the conjunct has already left `joinConjuncts`).
+      **The latent defect closed:** `WHERE t.a IS NULL` on a binding with
+      `offset > 0` under `shouldAttachBeforeMHJ` was judged eligible by a
+      walk that produced ZERO callbacks (the 9-arm switch never descended
+      `*IsNullExpr`), moved into `locals`, then returned UN-REBASED by a
+      consumer whose trailing pass-through ("Constants … no ColumnRef")
+      covered 7 of 32 kinds — a leaf `Filter` carrying FROM-cumulative
+      indices, i.e. **the wrong column**. Commit 4 widened its reachability
+      (a complete `tableForCol` attributes `t.a IS NULL` to a binding where
+      the old one answered −1) rather than creating it. Measurement: TPC-H
+      A/B **22/22 byte-identical** (before arm re-derived
+      `m0125-0002-c5-after.txt` byte-for-byte — the instrument is stable
+      across loops), SF0.5 EXPLAIN A/B **96/96**, and a divergence probe on
+      BOTH functions at ALL THREE live call sites logged **0 `C6ELIG` / 0
+      `C6LOC` / 0 `C6ABORT` over 277 eligibility + 175 localization calls**
+      across 118 planned queries, with `C6CALL`/`C6LOCC` positive controls.
+      The probe was mandatory: eligibility IS visible in the plan text (a
+      leaf `Filter` appears/disappears) but the `Index` rebase is NOT
+      (M0125-0042 — EXPLAIN prints names), so the probe compares localized
+      trees by `exprIdentityKey`, which includes `Index`. Commit 2's
+      metadata-loss class cannot arise — `shallowCloneExpr` is a whole-struct
+      copy. **Census pins moved BOTH ways in one commit, a series first:**
+      `conjunctIsLocalEligible` DEMOTED (its veto dispatch survives in the
+      `Visit` closure), `localizeExprToLeaf` DELETED (no switch survives);
+      RC-1a 46 → 45. 48 new pin subtests in
+      `local_filter_arms_test.go`, each proved to FAIL against the old
+      bodies first, including `TestLeafLocalPairAgreesOnEveryExprKind` —
+      the pair invariant over all 32 kinds, which is what makes the
+      consumer's panic unreachable by construction rather than by argument.
+      **Ledger rows: (a)** the timed TPC-H run + SF0.5 answer sweep were
+      skipped a fourth time, and the per-commit obligation is CONVERTED into
+      one cumulative timed run owed at **commit 8** (covering commits 2–8 as
+      a block; it reverts to per-commit if commit 7 moves a plan) — commit 5
+      declared them mandatory here on the premise that the fail-open would
+      remove predicates, and the measurement discharged the premise;
+      **(b)** goopg's now-total decline of subquery-bearing conjuncts is
+      broader than PG, which places a SubPlan-bearing qual at a baserel by
+      relid set (`initsplan.c: distribute_qual_to_rels`) and refuses
+      subplans only for pushdown INTO a subquery RTE (`allpaths.c:3934`,
+      `qual_is_pushdown_safe`). Evidence
+      `analysis/m0125-0002-c6-plans-20260803/` (incl. `probe-source.md`).
+      **Next in THIS task is commit 7 of 8 (`visitColumnRefsByName`) — the
+      LAST and largest, and the one D2 row 7 names as the least predictable:
+      its consumer `extraInScans` starts `allMatched := true` and only
+      falsifies from inside the callback, so completing it removes conjuncts
+      from `MultiHashJoin.Filters` directly. D3 predetermines its policy:
+      plan slots SIGNAL, and the caller must treat "an opaque child exists"
+      as NOT matched, inverting today's vacuous `true`. Assume the timed run
+      + SF0.5 answer sweep are owed until the diff proves empty.**
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
