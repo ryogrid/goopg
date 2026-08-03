@@ -6420,15 +6420,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `TestJoinSearchFourRelChainOffersBushyPair`. Still inert — no `planSelect`
       call site, `GOOPG_PGSHAPED_DP` OFF. Gates: UNITS PASS (PLAN/SPOT not
       re-run: no call site + flag OFF ⇒ no plan and no row can move).
-- [ ] **M0127-P5.4 — `addPathsToJoinrel`:** hash (both build sides), NLI+Memoize
-      parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
-      03 §5.3; FULL-without-usable-clause error contract), qual placement at
-      lowest covering level; deterministic tie-break (build on M0125-0047's
-      fix). Parameterisation discipline (03 §9: param-aware `setCheapest`,
-      `PATH_PARAM_BY_REL` refusal, `ppiRows`). NLI binding contract (03 §5.2:
-      shared eligibility fn; constructor failure on a DP-chosen path = loud
-      planner error). IMPLEMENTATION-TODO P5.4; 03 §5. Bar: UNITS + SPOT +
-      DS05.
+- [x] **M0127-P5.4a — `addPathsToJoinrel`, the unparameterised core.**
+      **DONE 2026-08-04 (loop #64)**, `internal/planner/joinpaths.go` (+
+      `pathgen.go` / `cost_funcs.go` / `path.go`). PG's per-PAIR
+      `clause_sides_match_join` key/residual split (joinpath.c:2205), hash
+      paths keyed on the full usable equality set (05 §5), an unconditional
+      plain nested loop, and qual placement carried on the `Path`
+      (`HashKeys`/`Residual`) so it is costed. The split is per pair and not
+      per clause: `a.x = b.y + c.z` keys {a} against {b,c}, so it is a hash
+      key at ({a},{b,c}) and an ordinary qual at ({a,b},{c}) — the same
+      clause, both placements correct, both reachable in one search. "Lowest
+      covering level" was already `clausesFor`'s coverage rule and is now an
+      invariant, not an example: over every spanning shape of a 3-relation
+      triangle each clause is applied exactly once. The nested loop is
+      unconditional because phase 1's clauseless branch and phase 3 offer
+      pairs with an EMPTY clause list and `joinSearch` treats an empty
+      pathlist as a hard failure. Deterministic tie-break rides M0125-0047's
+      rule via `addPath`: a self-join's two aliases are identical by
+      construction, so both hash orientations tie and the incumbent (the
+      first-offered order) wins. `generateHashJoinPaths` was refactored to a
+      single-orientation primitive so ONE hash-path generator exists —
+      `makeJoinRel` already calls per direction. Nothing calls it from
+      `planSelect` (`sizeJoinRel` is P5.6's); `GOOPG_PGSHAPED_DP` OFF. 4
+      ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no `planSelect`
+      call site, flag OFF, so no plan and no row can move).
+- [ ] **M0127-P5.4b — parameterised paths:** NLI + Memoize (03 §5.2) and the
+      03 §9 parameterisation discipline — param-aware `setCheapest`,
+      `PATH_PARAM_BY_REL` refusal for hash/merge inputs, `ppiRows`. NLI
+      binding contract (03 §5.2): shared eligibility fn with `tryBuildNLI`;
+      constructor failure on a DP-chosen path = loud planner error. **Order
+      matters:** `setCheapest` is parameterisation-BLIND today
+      (`path.go:319` ranks the whole pathlist on cost), so it must be fixed
+      in the same slice that first puts a `RequiredOuter` path in a pathlist
+      — see the P5.4a ledger row. Also needs P5.1's deferred parameterised
+      base index paths. IMPLEMENTATION-TODO P5.4b; 03 §5.2, §9. Bar: UNITS +
+      SPOT + DS05.
+- [ ] **M0127-P5.4c — merge paths via pathkeys** (03 §5.3): explicit Sort
+      paths, pathkey propagation through the join, `mergeJoinCost` on equal
+      footing with hash. With them the jointype gauntlet (`nestjoinOK`,
+      joinpath.c:1833-1852) and the FULL-without-usable-clause error contract
+      (joinrels.c:961-964) become expressible — both are unreachable while 03
+      §4.4 pins every non-INNER construct outside the search, and both are
+      ledgered against this item. IMPLEMENTATION-TODO P5.4c; 03 §5.3. Bar:
+      UNITS + SPOT + DS05.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

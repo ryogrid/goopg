@@ -91,6 +91,21 @@ type Path struct {
 	// every ordinary path; non-empty only for an NLI inner index path (C3).
 	RequiredOuter RelSet
 
+	// HashKeys / Residual are this join path's qual placement (leftdeep-joins
+	// 03 §5.4): the equality clauses the operator KEYS on, and the clauses it
+	// must evaluate per tuple. Both are nil for a non-join path. They are
+	// decided once, here in path generation, rather than by a post-hoc pass —
+	// which is what lets the placement be COSTED (a qual deferred to a higher
+	// join is a qual evaluated on more tuples) instead of being invisible to
+	// the search.
+	//
+	// Only a keyed operator (hash today, merge from P5.4c) fills HashKeys; a
+	// plain nested loop keys on nothing and carries every clause in Residual.
+	// P5.5's createPlan reads the pair to emit the executor Join's key
+	// expressions and its residual predicate.
+	HashKeys []*restrictInfo
+	Residual []*restrictInfo
+
 	Children []*Path
 
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.

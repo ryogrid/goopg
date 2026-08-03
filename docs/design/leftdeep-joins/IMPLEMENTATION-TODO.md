@@ -245,14 +245,48 @@
   full bushy space is what makes the absence of GEQO real (PG switches at 12
   rels, goopg searches to its 16-rel `RelSet` ceiling). Still nothing calls
   it from `planSelect`; `GOOPG_PGSHAPED_DP` OFF. UNITS PASS.)*
-- [ ] **P5.4** `addPathsToJoinrel`: hash (both build sides), NLI+Memoize
-  parameterised paths, merge via pathkeys, NL fallback (jointype-legal only,
-  03 §5.3; FULL-without-usable-clause error contract), qual placement at
-  lowest covering level; deterministic tie-break. Parameterisation
-  discipline (03 §9): param-aware `setCheapest`, `PATH_PARAM_BY_REL`
-  refusal for hash/merge inputs, `ppiRows`. NLI binding contract (03 §5.2):
-  shared eligibility fn; constructor failure on a DP-chosen path = loud
-  planner error.
+- [x] **P5.4a** `addPathsToJoinrel`, the unparameterised core (03 §5.1, §5.3,
+  §5.4; `joinpath.c:124`): the per-pair key/residual split
+  (`clause_sides_match_join`, `:2205`), hash paths with the FULL usable
+  equality set as a multi-column key (05 §5), an unconditional plain nested
+  loop, and qual placement carried ON the path.
+  *(Landed 2026-08-04, `internal/planner/joinpaths.go` +
+  `pathgen.go`/`cost_funcs.go`/`path.go`. The split is per PAIR, not per
+  clause, and that is the whole content of the task: `a.x = b.y + c.z` keys
+  {a} against {b,c}, so it is a hash key at the pair ({a},{b,c}) and an
+  ordinary qual at ({a,b},{c}) — the same clause, both placements correct,
+  both reachable in one search. Placement itself (WHICH join applies a
+  clause) was already `clausesFor`'s coverage rule, and the "lowest covering
+  level" property is now stated as an invariant rather than an example: over
+  every spanning shape of a 3-relation triangle each clause is applied
+  exactly once. `Path` gained `HashKeys`/`Residual` so the placement is
+  COSTED — a nested loop pays its quals on the full cross product, a hash
+  join only on the tuples that survived the key match, which is what stops a
+  cartesian nested loop from looking free. The nested loop is generated
+  unconditionally because phase 1's clauseless branch and phase 3's
+  last-ditch pass both offer pairs with an EMPTY clause list, and
+  `joinSearch` treats an empty pathlist as a hard failure. `addPath` is left
+  to break the mirror-image tie: a self-join's two aliases are statistically
+  identical by construction, both hash orientations cost the same, and
+  keeping the incumbent resolves it to the first-offered order (M0125-0047's
+  rule). `generateHashJoinPaths` was refactored to a single-orientation
+  primitive so there is ONE hash-path generator — `makeJoinRel` already
+  calls per direction. Still nothing calls it from `planSelect`
+  (`sizeJoinRel`, the other half of the `joinRelBuilder` seam, is P5.6's and
+  a stand-in sizer would be a second cost model); `GOOPG_PGSHAPED_DP` OFF.
+  4 ledger rows — merge paths, parameterised paths (with the param-BLIND
+  `setCheapest` they would corrupt), the jointype gauntlet, and
+  `cost_qual_eval`'s expression walk. UNITS PASS.)*
+- [ ] **P5.4b** Parameterised paths: NLI + Memoize (03 §5.2), parameterisation
+  discipline (03 §9) — param-aware `setCheapest`, `PATH_PARAM_BY_REL` refusal
+  for hash/merge inputs, `ppiRows`. NLI binding contract (03 §5.2): shared
+  eligibility fn with `tryBuildNLI`; constructor failure on a DP-chosen path
+  = loud planner error.
+- [ ] **P5.4c** Merge paths via pathkeys (03 §5.3): explicit Sort paths,
+  pathkey propagation through the join, `mergeJoinCost` on equal footing.
+  With them the jointype gauntlet and the FULL-without-usable-clause error
+  contract become expressible — both are unreachable while 03 §4.4 pins
+  every non-INNER construct outside the search.
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

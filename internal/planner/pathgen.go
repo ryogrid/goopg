@@ -42,36 +42,84 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 	}
 }
 
+// addHashJoinPath adds ONE hash-join orientation: `probe` streams, `build` is
+// hashed. `keys` is the equality clause set the hash keys on (all of them —
+// multi-column keys are the rule, not a special case, leftdeep-joins 05 §5) and
+// `residual` the clauses the join evaluates on the tuples that survive the key
+// match.
+//
+// Single-orientation is the primitive because that is the granularity the join
+// search offers pairs at: `makeJoinRel` calls `add_paths_to_joinrel` once per
+// input order (joinsearchlevel.go:335-340), so generating both here would
+// produce each path twice. `generateHashJoinPaths` below is the two-orientation
+// wrapper for callers that own both directions themselves.
+//
+// Child convention: Children[0] is the probe (outer) side, Children[1] is the
+// build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+	p, b := probe.CheapestTotal, build.CheapestTotal
+	if p == nil || b == nil {
+		return
+	}
+	cost := hashJoinCost(cp, p.Cost, b.Cost, probe.Rows, build.Rows, joinRel.Rows, len(keys))
+	// The residual is evaluated only on tuples that already matched on the
+	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
+	// `hashjointuples`, costsize.c:4432).
+	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
+	addPath(joinRel, &Path{
+		Kind:     PathHashJoin,
+		Rel:      joinRel,
+		Rows:     joinRel.Rows,
+		Cost:     cost,
+		Children: []*Path{p, b},
+		HashKeys: keys,
+		Residual: residual,
+	})
+}
+
+// addNestLoopPath adds a plain nested loop with `outer` driving: for every
+// outer row the inner path is rescanned from scratch. It keys on nothing, so
+// EVERY clause is residual — and it is evaluated on the full cross product,
+// which is what makes this path correctly ruinous for two large inputs and the
+// only available path for a cartesian pair.
+//
+// The inner rescan cost is the inner path's own total: no `Material` is
+// interposed, because Material is a plan node placed by `cost_rescan` and is
+// P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
+// over-charges a rescan of a cheap inner, which biases against nested loops —
+// the safe direction.
+func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*restrictInfo) {
+	o, i := outer.CheapestTotal, inner.CheapestTotal
+	if o == nil || i == nil {
+		return
+	}
+	cost := nestloopCost(cp, o.Cost, i.Cost, outer.Rows, joinRel.Rows, i.Cost.Total)
+	cost.Total += qualEvalCost(cp, len(quals), outer.Rows*inner.Rows)
+	addPath(joinRel, &Path{
+		Kind:     PathNestLoop,
+		Rel:      joinRel,
+		Rows:     joinRel.Rows,
+		Cost:     cost,
+		Children: []*Path{o, i},
+		Residual: quals,
+	})
+}
+
 // generateHashJoinPaths adds both build-side orientations of a hash join over the
 // two child rels' cheapest paths to joinRel, and add_path keeps the cheaper. The
 // build side is charged as startup, so the orientation with the smaller inner
 // side wins automatically — retiring the SmallDimension name-tag as the primary
 // rule (design ch. 06 §2.1). setCheapest must have been called on the child rels.
-func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, numHashClauses int) {
-	o, i := outer.CheapestTotal, inner.CheapestTotal
-	if o == nil || i == nil {
-		return
-	}
-	// Child convention for a hash-join path: Children[0] is the probe (outer)
-	// side, Children[1] is the build (inner) side. createPlan (C4) reads it to set
-	// the executor Join's BuildLeft.
+//
+// The key set is orientation-independent — PG's `clause_sides_match_join`
+// (joinpath.c:2205) accepts an equality whose operands land on the two sides in
+// either order — so both calls pass the same `keys`/`residual`.
+func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
 	// Orientation 1: build the inner side.
-	addPath(joinRel, &Path{
-		Kind:     PathHashJoin,
-		Rel:      joinRel,
-		Rows:     joinRel.Rows,
-		Cost:     hashJoinCost(cp, o.Cost, i.Cost, outer.Rows, inner.Rows, joinRel.Rows, numHashClauses),
-		Children: []*Path{o, i},
-	})
+	addHashJoinPath(joinRel, outer, inner, cp, keys, residual)
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addPath(joinRel, &Path{
-		Kind:     PathHashJoin,
-		Rel:      joinRel,
-		Rows:     joinRel.Rows,
-		Cost:     hashJoinCost(cp, i.Cost, o.Cost, inner.Rows, outer.Rows, joinRel.Rows, numHashClauses),
-		Children: []*Path{i, o},
-	})
+	addHashJoinPath(joinRel, inner, outer, cp, keys, residual)
 }
 
 // generateNLIPath adds a nested-loop-index-join path to joinRel: for each outer

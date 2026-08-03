@@ -1,0 +1,145 @@
+package planner
+
+// M0127-P5.4a — `add_paths_to_joinrel`, the unparameterised core: which quals a
+// join applies for a given input order, and the hash / plain-nested-loop paths
+// that go with them.
+//
+// PG oracle: `add_paths_to_joinrel` (joinpath.c:124), `hash_inner_and_outer`
+// (:2220) with its `clause_sides_match_join` operand test (:2205-2231),
+// `match_unsorted_outer`'s plain-nestloop arm and the `nestjoinOK` jointype
+// gauntlet (:1833-1852), `build_joinrel_restrictlist` (relnode.c). Design:
+// leftdeep-joins 03 §5.1, §5.3, §5.4; 05 §5 (multi-column hash keys).
+//
+// This is the OTHER half of the `joinRelBuilder` seam `makeJoinRel` calls
+// (joinsearchlevel.go:52-57): `addPaths`. The interface's remaining method,
+// `sizeJoinRel`, is still P5.6's, and the concrete builder that binds the two
+// together arrives with it — a stand-in sizer here would be a second cost model
+// to unpick later, which is the exact thing the seam exists to avoid. So
+// nothing calls this from `planSelect` yet either, and `GOOPG_PGSHAPED_DP`
+// stays OFF; it is validated in isolation by `joinpaths_test.go`.
+//
+// Three parts of P5.4 are deliberately NOT here, each because it needs a
+// mechanism this slice does not have, and each carries a deferral-ledger row:
+//
+//   - parameterised NLI + Memoize paths and the 03 §9 parameterisation
+//     discipline (param-aware `setCheapest`, `PATH_PARAM_BY_REL` refusal,
+//     `ppiRows`) — P5.4b. `generateNLIPath` (pathgen.go) is the primitive
+//     waiting for it; the binding contract of 03 §5.2 (shared eligibility with
+//     `tryBuildNLI`) is what that slice must establish.
+//   - merge paths — P5.4c. They need explicit Sort paths and pathkey
+//     propagation, not just `mergeJoinCost`.
+//   - the jointype gauntlet and the FULL-without-usable-clause error contract
+//     (03 §5.3). 03 §4.4 pins every outer/semi/anti construct OUTSIDE the
+//     search as an opaque `PathPrebuilt` initial rel, so the only jointype that
+//     can reach this function is INNER — for which `nestjoinOK` is
+//     unconditionally true and a path therefore always exists. The gauntlet
+//     becomes reachable code the moment `join_is_legal` inference lands, which
+//     is the same event that relaxes the pin.
+
+import "fmt"
+
+// splitJoinClauses divides a joinrel's restriction list into the clauses a
+// keyed operator can KEY on for this pair of input relsets, and the residual
+// the operator must evaluate per tuple.
+//
+// The test is PG's `clause_sides_match_join` (joinpath.c:2205): an equality is
+// usable as a hash clause only when one operand is computable entirely on one
+// side and the other operand entirely on the other. goopg's `restrictInfo`
+// already carries that operand split (`leftRelids`/`rightRelids`, set only for
+// an `isEquijoin`), so the test is a containment check rather than a re-walk of
+// the expression.
+//
+// Why the split is per PAIR and not per clause: the same clause can be a key at
+// one join and a residual at another. `a.x = b.y + c.z` keys {a} against {b,c},
+// so at the pair ({a}, {b,c}) it is a hash clause; at ({a,b}, {c}) its right
+// operand straddles both sides and no hash key can be formed, so it must be
+// evaluated as an ordinary qual. Both placements are correct and both are
+// reachable in the same search — which is why the key set cannot be computed
+// once when the clause is built.
+//
+// Note what this function does NOT decide: WHETHER the clause applies at this
+// join at all. That is `clausesFor`'s coverage rule (joinrestrict.go), applied
+// by `makeJoinRel` before it ever calls here, and it is what implements 03
+// §5.4's "lowest level whose relids it covers" — a clause fully contained in
+// one side does not overlap the other and is therefore already gone. The two
+// predicates are distinct and neither substitutes for the other, the same way
+// `hasRelevantJoinClause` (the pair gate) is distinct from `clausesFor` (the
+// placement test).
+//
+// Order is preserved from the input list, so the key set is deterministic.
+func splitJoinClauses(outer, inner RelSet, clauses []*restrictInfo) (keys, residual []*restrictInfo) {
+	for _, ri := range clauses {
+		if ri == nil {
+			continue
+		}
+		if isKeyableFor(ri, outer, inner) {
+			keys = append(keys, ri)
+			continue
+		}
+		residual = append(residual, ri)
+	}
+	return keys, residual
+}
+
+// isKeyableFor is `clause_sides_match_join` for one clause: the equality's two
+// operands must land on opposite sides of this join, in either order.
+//
+// A non-equality join qual (`a.x < b.y`) and an equality whose operands share a
+// relation (`a.x = a.y + b.z`) never set `isEquijoin` and so are never keys —
+// correctly, since neither has a two-sided operand split to hash on.
+func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
+	if !ri.isEquijoin || ri.leftRelids == 0 || ri.rightRelids == 0 {
+		return false
+	}
+	if relsSubset(ri.leftRelids, outer) && relsSubset(ri.rightRelids, inner) {
+		return true
+	}
+	return relsSubset(ri.leftRelids, inner) && relsSubset(ri.rightRelids, outer)
+}
+
+// addPathsToJoinrel is `add_paths_to_joinrel` (joinpath.c:124) for ONE input
+// order: `outer` drives, `inner` is probed or built. `clauses` is the joinrel's
+// own restriction list — what `build_joinrel_restrictlist` produced, which for
+// goopg is `clausesFor(outer.Relids, inner.Relids)`.
+//
+// It generates, for this direction:
+//
+//   - a hash join building `inner`, whenever the pair has at least one usable
+//     equality (the multi-column key set is ALL of them, 05 §5); and
+//   - a plain nested loop, always.
+//
+// The nested loop is not a formality. A pair with no usable equality — a
+// cartesian product from phase 1's clauseless branch or phase 3's last-ditch
+// pass, or a join whose only qual is `a.x < b.y` — has no hash path at all, and
+// `joinSearch` treats a joinrel with an empty pathlist as a hard failure
+// (joinsearchlevel.go:110-112). Generating NL unconditionally for the jointypes
+// that support it is what makes that failure unreachable, and is exactly why PG
+// does the same (:1833-1852). Being usually dominated, it is then pruned by
+// `addPath` and costs nothing.
+//
+// A missing cheapest path on either input is a LOUD error rather than a silent
+// skip. Every rel the search offers has been through `setCheapest` — level 1 in
+// `buildInitialRels`, every higher level at the end of its own level pass — so
+// a nil here means the search's own invariant broke, and swallowing it would
+// surface much later as an unexplained empty pathlist at the top level.
+func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams) error {
+	if joinrel == nil || outer == nil || inner == nil {
+		return fmt.Errorf("join paths: nil input rel")
+	}
+	if outer.CheapestTotal == nil {
+		return fmt.Errorf("join paths: outer rel %#04x has no cheapest path", uint16(outer.Relids))
+	}
+	if inner.CheapestTotal == nil {
+		return fmt.Errorf("join paths: inner rel %#04x has no cheapest path", uint16(inner.Relids))
+	}
+
+	keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
+	if len(keys) > 0 {
+		addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
+	}
+	// The nested loop keys on nothing, so the key set rejoins the residual: it
+	// evaluates every clause, on every pair. Passing `clauses` whole rather
+	// than `append(keys, residual...)` also keeps the input order.
+	addNestLoopPath(joinrel, outer, inner, cp, clauses)
+	return nil
+}

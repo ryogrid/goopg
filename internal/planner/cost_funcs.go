@@ -82,6 +82,30 @@ func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps in
 	return Cost{Startup: 0, Total: run}
 }
 
+// qualEvalCost is `cost_qual_eval`'s contribution to a join (costsize.c:4700):
+// the per-tuple operator cost of a qual list, times the number of tuples the
+// operator actually evaluates it on. PG folds this into `cpu_per_tuple` inside
+// each final_cost_* function; goopg adds it at the path-generation site
+// (pathgen.go) so the same term serves hash, nested loop and — from P5.4c —
+// merge without three signature changes.
+//
+// numQuals counts CONJUNCTS, not operator nodes: one restrictInfo is one
+// charge. That matches how `numHashClauses` is already counted by
+// hashJoinCost, so the two terms of a hash path's cost use one currency; the
+// refinement to a real operator walk belongs with the estimate-audit tooling
+// (leftdeep-joins 09 §5), not here.
+//
+// The tuple count is the CALLER's choice and it is the whole point of the
+// function: a nested loop evaluates its quals on the full cross product, a
+// hash join only on the tuples that survived the key match. Charging both on
+// the join's OUTPUT rows would make a cartesian nested loop look free.
+func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
+	if numQuals <= 0 || !(tuples > 0) {
+		return 0
+	}
+	return cp.cpuOperatorCost * float64(numQuals) * tuples
+}
+
 // costSortRun reproduces the comparison term of cost_sort (costsize.c:2144) for
 // an in-memory sort of n rows: an n*log2(n) comparison cost, charged as startup
 // (the sort must complete before the first row), plus a per-row emit at run. The
