@@ -108,7 +108,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -189,6 +189,27 @@ func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 // branch in postgres/src/backend/commands/explain.c), omitting the whole
 // line when all four counters are zero and omitting each individual
 // hit=/read=/dirtied=/written= term when that counter is zero.
+// formatHashJoinInfoLine renders PG's hash-table line verbatim from
+// show_hash_info (explain.c): the two forms differ only in whether the
+// originals are shown, and PG shows BOTH originals as soon as EITHER count
+// moved. `nbatch > 0` is upstream's whole gate — a join whose build never ran
+// (no batch state, so no geometry was chosen) prints nothing at all, which is
+// also how goopg represents "this hash join declined batching".
+//
+// kB rounds UP, PG's BYTES_TO_KILOBYTES.
+func formatHashJoinInfoLine(hs *HashJoinStats) string {
+	if hs == nil || hs.NBatch <= 0 {
+		return ""
+	}
+	kb := (hs.SpacePeak + 1023) / 1024
+	if hs.NBatch != hs.OrigNBatch || hs.NBuckets != hs.OrigNBuckets {
+		return fmt.Sprintf("Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %dkB",
+			hs.NBuckets, hs.OrigNBuckets, hs.NBatch, hs.OrigNBatch, kb)
+	}
+	return fmt.Sprintf("Buckets: %d  Batches: %d  Memory Usage: %dkB",
+		hs.NBuckets, hs.NBatch, kb)
+}
+
 func formatBuffersLine(s *nodeStats) string {
 	if s.bufHit == 0 && s.bufRead == 0 && s.bufDirtied == 0 && s.bufWritten == 0 {
 		return ""
@@ -1042,13 +1063,13 @@ func schemaColumnNames(n planner.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, nil, &subPlanReg{rel: newExplainNames(n)})
+func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, attachedFilter planner.Expr, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, attachedFilter, reg)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -1056,7 +1077,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, next, reg)
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, reg)
 		return
 	}
 
@@ -1108,6 +1129,15 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
+	// off the HASH node; goopg has no Hash node (the build lives inside
+	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
+	if j, isJoin := n.(*planner.Join); isJoin && j.Algo == planner.JoinAlgoHash {
+		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+		}
+	}
+
 	// EXPLAIN (ANALYZE, BUFFERS) emits a "Buffers: shared hit=N read=N"
 	// detail line per node (design 0122-0003 BUFFERS slice). Shared-only,
 	// hit/read-only for now — local/temp buffers and dirtied/written
@@ -1135,12 +1165,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, nil, reg)
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, nil, reg)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
 	}
 }
 

@@ -6044,11 +6044,41 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Next M0127 selection is P3.5 (EXPLAIN `Batches:` + forced-spill
       identity; S3 exit evidence).**
       Progress log: design doc §6.
-- [ ] **M0127-P3.5 — EXPLAIN `Batches:`/memory lines + forced-spill identity
+- [x] **M0127-P3.5 — EXPLAIN `Batches:`/memory lines + forced-spill identity
       test** (low `work_mem` Q3 byte-identical to default). S3 exit evidence:
       Q21 SF1 completes capped; file `analysis/leftdeep-joins/…-s3-spill.txt`.
       IMPLEMENTATION-TODO P3.5; 06 §4; 09 §2. Bar: Q21 SF1 (capped) + DS05
       zero-delta + RACE.
+      **DONE 2026-08-03. S3 (P3.1–P3.5) CLOSED.** `HashJoinStats` map on
+      `Context` keyed by plan node (the `SubPlanStats`/`MemoizeStats` shape);
+      `hashBatchState.publish()` max-merges into it when the geometry is
+      chosen, when nbatch doubles and at close — peak memory flushed at close
+      rather than maintained in `insertBuildRow`'s per-row path.
+      `formatHashJoinInfoLine` is `show_hash_info` (explain.c) VERBATIM,
+      including that PG prints BOTH originals once EITHER count moved, and
+      `BYTES_TO_KILOBYTES`'s round-up. The line hangs off the **Hash Join**,
+      not off a Hash node, because goopg has none — the build lives inside
+      `joinOp`.
+      **S3 exit: both clauses MET**
+      (`analysis/leftdeep-joins/2026-08-03-s3-spill.txt`) — Q21 at SF1 rc=0 in
+      132 s / 405 rows / peak VmHWM 16.7 GB inside the 20G/24G cap; Q3 at
+      `work_mem=512kB` (nbatch 512, grown from 256) **byte-identical** to Q3 at
+      6 GB (nbatch 1), 11,521 rows, sha256 `066af3df…dc16dc8`.
+      **Finding for P5.7:** goopg's 512 MB default is NOT a no-spill setting —
+      Q3's lineitem build still reports `Batches: 8 (originally 4)  Memory
+      Usage: 475137kB` there and needs 6 GB to reach one batch, because a build
+      row is `[]Datum` (48 B/column) where PG's is a packed MinimalTuple. At
+      SF1 with default settings a TPC-H hash join SPILLS, so an nbatch-blind
+      `hashJoinCost` will keep choosing hash.
+      Five new tests (`internal/executor/join_batch_explain_test.go`), three of
+      them driving the property through SQL — that `SET work_mem` reaches the
+      batch state at all is not something P3.2's operator-level fixtures could
+      assert. **Three ledger rows** (`2026-08-03 M0127-P3.5`): non-TEXT EXPLAIN
+      formats emit nothing; a parallel worker's counters die with the worker
+      (PG merges via `SharedHashInfo`); and the two shape divergences (no Hash
+      node; batch-ineligible joins print no line at all).
+      Gates: UNITS PASS; RACE PASS (all packages); DS05 slices 1-50 / 51-99
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 over all 99 (Q72 TIMEOUT pre-existing).
 - [ ] **M0127-P4.1 — streaming merge join** (duplicate-group buffering +
       overflow file); delete full-drain `runMergeJoin`/`buildMergeSide`
       accumulation. IMPLEMENTATION-TODO P4.1; 07 §2. Bar: UNITS + REGRESS +

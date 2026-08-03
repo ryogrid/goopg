@@ -180,6 +180,11 @@ type Context struct {
 	// SubPlanStats. Lazily allocated by memoizeStat. S7.
 	MemoizeStats map[*planner.Memoize]*MemoizeStats
 
+	// HashJoinStats carries the per-hash-join ANALYZE counters
+	// (buckets / batches / peak memory), keyed by plan node like the two
+	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
+	HashJoinStats map[*planner.Join]*HashJoinStats
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of

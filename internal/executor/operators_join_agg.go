@@ -814,7 +814,7 @@ func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidt
 	// ExecHashTableInsert still grows it when spaceUsed passes spaceAllowed.
 	// A single-batch state costs one add and one compare per build row.
 	if o.joinBatchEligible() {
-		o.batches = newHashBatchState(ctx, sizing, buildIsLeft)
+		o.batches = newHashBatchState(ctx, o.plan, sizing, buildIsLeft)
 	}
 	n := sizing.NBuckets
 	if n > maxPresizeBuckets {

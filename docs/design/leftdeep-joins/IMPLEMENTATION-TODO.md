@@ -66,9 +66,15 @@
   `batchSkippable` carries PG's three skip rules with the fill arm;
   `prebuildSharedHashJoins` declines the SHARE rather than the SPILL.
   Build-side fill — LEFT-on-BuildLeft, RIGHT, FULL — stays with P4.2.)*
-- [ ] **P3.5** EXPLAIN `Batches:`/memory lines; forced-spill identity test
+- [x] **P3.5** EXPLAIN `Batches:`/memory lines; forced-spill identity test
   (low `work_mem` Q3 byte-identical to default). Gate for P3.*: Q21 SF1
   completes capped; SF0.5 zero-delta; race-gate.
+  *(2026-08-03. `HashJoinStats` per plan node on `Context`, published from
+  `hashBatchState`; `formatHashJoinInfoLine` is `show_hash_info` verbatim,
+  attached to the Hash Join because goopg has no `Hash` node. S3 exit met:
+  `analysis/leftdeep-joins/2026-08-03-s3-spill.txt` — Q21 SF1 rc=0 in 132 s
+  capped, Q3 at 512 kB (nbatch 512) byte-identical to Q3 at 6 GB (nbatch 1).
+  **S3 CLOSED.**)*
 
 ## P4 — Other join operators [S4]
 

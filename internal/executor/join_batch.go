@@ -123,6 +123,88 @@ type hashBatchState struct {
 
 	innerSpilled int64
 	outerSpilled int64
+
+	// nbuckets is the bucket count hashsize.Choose picked for this build —
+	// the CHOSEN geometry, which is what PG's nbuckets reports too, not a
+	// measurement of the Go map. Two divergences follow and both are
+	// deliberate: goopg has no bucket ARRAY that could be resized, so there is
+	// no ExecHashIncreaseNumBuckets and the reported original never differs;
+	// and presizeLazyHash caps its allocation at maxPresizeBuckets, so on a
+	// large build this number is bigger than the slots actually reserved (the
+	// SF1 evidence run shows 2,097,152 against a 1<<20 cap). Retiring that gap
+	// means making the presize revisable, which is the same deferral
+	// maxPresizeBuckets already carries.
+	nbuckets int
+
+	// stats is the EXPLAIN (ANALYZE) sink for this join, owned by the
+	// statement's Context and keyed by the plan node. nil when the operator
+	// was built without one (unit fixtures, and any path that never went
+	// through NewContext).
+	stats *HashJoinStats
+}
+
+// HashJoinStats is the per-plan-node hash-join instrumentation EXPLAIN
+// (ANALYZE) reports, PG's HashInstrumentation (nodeHash.h) minus the fields
+// goopg has no analogue for.
+//
+// PG attaches this to the HASH node, which is a separate plan node under the
+// Hash Join. goopg has no Hash node — the build lives inside joinOp — so the
+// line attaches to the Hash Join node itself. That is the one deliberate
+// divergence in the output shape; the line's own text is PG's, verbatim from
+// show_hash_info (explain.c).
+//
+// Values merge by MAXIMUM across re-Opens, which is PG's rule too
+// (ExecHashAccumInstrumentation, nodeHash.c): a rescanned hash join reports the
+// largest table it ever held rather than the last one.
+type HashJoinStats struct {
+	NBuckets     int
+	OrigNBuckets int
+	NBatch       int
+	OrigNBatch   int
+	SpacePeak    int64
+}
+
+// hashJoinStat returns the instrumentation sink for one hash-join plan node,
+// creating it on first use. Mirrors Context.memoizeStat.
+func (c *Context) hashJoinStat(j *planner.Join) *HashJoinStats {
+	if c == nil || j == nil {
+		return nil
+	}
+	if c.HashJoinStats == nil {
+		c.HashJoinStats = make(map[*planner.Join]*HashJoinStats)
+	}
+	st, ok := c.HashJoinStats[j]
+	if !ok {
+		st = &HashJoinStats{}
+		c.HashJoinStats[j] = st
+	}
+	return st
+}
+
+// publish max-merges the live counters into the statement's instrumentation.
+// Called at the two moments the reported numbers can change — the geometry is
+// chosen, and nbatch grows — plus once at close, which is where peak memory is
+// flushed (keeping it out of insertBuildRow's per-row path).
+func (bs *hashBatchState) publish() {
+	st := bs.stats
+	if st == nil {
+		return
+	}
+	if bs.nbuckets > st.NBuckets {
+		st.NBuckets = bs.nbuckets
+	}
+	if bs.nbuckets > st.OrigNBuckets {
+		st.OrigNBuckets = bs.nbuckets
+	}
+	if bs.nbatch > st.NBatch {
+		st.NBatch = bs.nbatch
+	}
+	if bs.origNBatch > st.OrigNBatch {
+		st.OrigNBatch = bs.origNBatch
+	}
+	if bs.peakSpace > st.SpacePeak {
+		st.SpacePeak = bs.peakSpace
+	}
 }
 
 // joinBatchEligible reports whether this join may spill its build.
@@ -192,7 +274,7 @@ func (o *joinOp) probeFillsUnmatched() bool {
 // newHashBatchState installs batching for a build whose geometry came out
 // multi-batch. buildIsLeft says which side the build drains, so a reloaded row
 // can have its key re-evaluated exactly the way the original insert did.
-func newHashBatchState(ctx *Context, sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
+func newHashBatchState(ctx *Context, plan *planner.Join, sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
 	nbatch := sizing.NBatch
 	if nbatch > maxJoinBatches {
 		nbatch = maxJoinBatches
@@ -213,9 +295,15 @@ func newHashBatchState(ctx *Context, sizing hashsize.Sizing, buildIsLeft bool) *
 		growEnabled:    true,
 		buildIsLeft:    buildIsLeft,
 		ctx:            ctx,
+		nbuckets:       sizing.NBuckets,
+		stats:          ctx.hashJoinStat(plan),
 	}
 	bs.inner = make([]*joinBatchFile, nbatch)
 	bs.outer = make([]*joinBatchFile, nbatch)
+	// Publish before a single row arrives: a build that produces no output at
+	// all still chose a geometry, and PG reports it (nbatch > 0 is the only
+	// gate show_hash_info applies).
+	bs.publish()
 	return bs
 }
 
@@ -352,6 +440,10 @@ func (bs *hashBatchState) increaseNumBatches(o *joinOp) error {
 	if freed == 0 || freed == inMemory {
 		bs.freezeGrowth("hash values too few to subdivide")
 	}
+	// The doubling is the only thing that makes EXPLAIN's "Batches: N
+	// (originally M)" form appear, so publish it here rather than waiting for
+	// close — a query cancelled mid-build has still already paid for it.
+	bs.publish()
 	return nil
 }
 
@@ -529,6 +621,11 @@ func (bs *hashBatchState) closeReplay() {
 
 // close releases every file the join still owns. Safe to call twice.
 func (bs *hashBatchState) close() {
+	// Peak memory is flushed here instead of from insertBuildRow, which is the
+	// per-build-row hot path. Close is reached on every path that produces
+	// EXPLAIN output — EXPLAIN ANALYZE drains and Closes the inner plan before
+	// it renders a single line (operators_explain.go).
+	bs.publish()
 	bs.closeReplay()
 	for b := range bs.inner {
 		bs.discard(b)
