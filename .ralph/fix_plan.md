@@ -5943,10 +5943,48 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       the PLAN baseline.
       **Next M0127 selection is P3.3 (temp-file registry).**
       Progress log: design doc §6.
-- [ ] **M0127-P3.3 — temp-file registry.** Per-query registry on `Context`;
+- [x] **M0127-P3.3 — temp-file registry.** Per-query registry on `Context`;
       relocate to `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close`
       unlink leak. Injected-crash test leaves no strays. IMPLEMENTATION-TODO
       P3.3; 06 §3. Bar: UNITS + crash-injection test.
+      **DONE 2026-08-03.** New leaf package `internal/pgtemp` (PG's
+      `PG_TEMP_FILES_DIR`/`PG_TEMP_FILE_PREFIX`, `Dir`/`EnsureDir`/
+      `FilePattern`/`RemoveStrayFiles`) + `internal/executor/tempfiles.go`
+      (`tempFileRegistry` on `Context`). Spill files became the STATEMENT's
+      property instead of each operator's good intentions: the registry is
+      allocated by `NewContext`, shared BY POINTER with every parallel worker
+      (`NewWorkerContext`) and with the `synthCtx := *ctx` copies, and
+      `executeOneSimpleStmt` / the extended dispatch `defer
+      ctx.ReleaseSpillFiles()`. Operators still unlink eagerly (sortOp chunks,
+      `hashBatchState.discard`, and now `spillOp.Close` — the leak 06 §3 named)
+      and deregister when they do, so a 1024-batch join does not hold 1024
+      paths to statement end; what the registry adds is that ownership no
+      longer DEPENDS on Close being reached.
+      **The relocation is what makes the sweep possible.** Files moved from
+      `os.TempDir()`/`goopg-spill-*.tmp` to
+      `<datadir>/base/pgsql_tmp/pgsql_tmp<pid>.*`; the prefix is load-bearing,
+      not cosmetic — PG's `RemovePgTempFilesInDir` (fd.c) filters on it so a
+      sweep can never mistake a neighbouring file for a stray. `Server.Run`
+      sweeps before `close(s.ready)`, on the reasoning that a live backend
+      unlinks at statement end, so anything present at startup is by definition
+      a crash leftover.
+      **Sibling-path find:** the extended protocol never set `ectx.DataDir`
+      (the simple path always did), so extended-protocol spills would have
+      resolved outside the cluster even after the relocation.
+      **Four ledger rows** (`2026-08-03 M0127-P3.3`): `temp_tablespaces`
+      unimplemented (one directory, no per-tablespace sweep arm);
+      `temp_file_limit`/`log_temp_files` accounting absent (the registry knows
+      paths, never bytes); release point is the STATEMENT where PG's is the
+      RESOURCE OWNER (safe today only because cursors materialise — P4.3's
+      `Materialize` must revisit it); PG's `RemovePgTempRelationFiles` not
+      ported (goopg temp-relation files carry no backend id to recognise).
+      Also flips P3.2's "no per-query registry" row to `resolved`.
+      Gates: UNITS PASS; RACE PASS; SPOT PASS. Six new tests, incl. the
+      crash-injection gate `TestStartupSweepReclaimsCrashedQueryFiles` (four
+      files survive a context that never releases; the sweep reclaims all four)
+      and `TestWorkerContextSharesTheLeaderRegistry`.
+      **Next M0127 selection is P3.4 (Semi/Anti/LEFT per-batch semantics).**
+      Progress log: design doc §6.
 - [ ] **M0127-P3.4 — Semi/Anti/LEFT per-batch semantics** (batch-global
       `antiBuildHasNull`); shared build declines when nbatch > 1.
       IMPLEMENTATION-TODO P3.4; 06 §2.5. Bar: UNITS + DS05 + RACE.

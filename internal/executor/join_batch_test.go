@@ -364,7 +364,7 @@ func TestJoinBatchHashFollowsTheCanonicalKey(t *testing.T) {
 // come back byte-identical alongside its hash, and the hashed and unhashed
 // framings must stay distinguishable (they share writeFrame).
 func TestSpillHashedFrameRoundTrips(t *testing.T) {
-	w, err := newSpillWriter(t.TempDir())
+	w, err := newSpillWriterInDir(t.TempDir())
 	if err != nil {
 		t.Fatalf("newSpillWriter: %v", err)
 	}

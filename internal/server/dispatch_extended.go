@@ -162,6 +162,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// Stage 9 (D4.2): tear down SubPlan rescan handles with the
 	// statement's Context (see dispatch.go for rationale).
 	defer ectx.CloseSubPlans()
+	// M0127-P3.3: the extended protocol's twin of the simple path's
+	// per-statement spill-file release (dispatch.go). Extended Execute is
+	// one statement, so the dispatch scope IS the statement scope here.
+	defer ectx.ReleaseSpillFiles()
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog
@@ -172,6 +176,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Snap = snap
 	ectx.Params = datums
 	ectx.Checkpointer = s.cfg.Checkpointer
+	// M0127-P3.3: the simple path has always set this (dispatch.go); the
+	// extended path never did, so an extended-protocol query's spill files
+	// resolved to os.TempDir() instead of <datadir>/base/pgsql_tmp — the
+	// sibling-path divergence class again. DataDir is read-only state here.
+	ectx.DataDir = s.cfg.DataDir
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
 	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)

@@ -36,7 +36,6 @@ import (
 	"io"
 	"log/slog"
 	"math/bits"
-	"os"
 
 	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/planner"
@@ -106,7 +105,12 @@ type hashBatchState struct {
 	// schema only reveals its width once the build's first row arrives.
 	buildIsLeft bool
 
-	tmpDir string
+	// ctx is the statement's context: the owner of the spill-file registry
+	// every batch file is registered with (M0127-P3.3). It is stored rather
+	// than passed because a batch file is created deep inside the build and
+	// probe hot paths, where threading a Context argument through would buy
+	// nothing.
+	ctx *Context
 
 	// replaying is true while o.lazyProbe is a batch replay operator rather
 	// than the real probe child; replayHash is the hash value stored with the
@@ -146,7 +150,7 @@ func (o *joinOp) joinBatchEligible() bool {
 // newHashBatchState installs batching for a build whose geometry came out
 // multi-batch. buildIsLeft says which side the build drains, so a reloaded row
 // can have its key re-evaluated exactly the way the original insert did.
-func newHashBatchState(sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
+func newHashBatchState(ctx *Context, sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
 	nbatch := sizing.NBatch
 	if nbatch > maxJoinBatches {
 		nbatch = maxJoinBatches
@@ -162,11 +166,11 @@ func newHashBatchState(sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState
 		nbatch:         nbatch,
 		origNBatch:     nbatch,
 		nbatchOutstart: nbatch,
-		bucketBits:   uint(bits.Len(uint(sizing.NBuckets)) - 1),
-		spaceAllowed: space,
-		growEnabled:  true,
-		buildIsLeft:  buildIsLeft,
-		tmpDir:       os.TempDir(),
+		bucketBits:     uint(bits.Len(uint(sizing.NBuckets)) - 1),
+		spaceAllowed:   space,
+		growEnabled:    true,
+		buildIsLeft:    buildIsLeft,
+		ctx:            ctx,
 	}
 	bs.inner = make([]*joinBatchFile, nbatch)
 	bs.outer = make([]*joinBatchFile, nbatch)
@@ -185,7 +189,7 @@ func (bs *hashBatchState) batchOf(h uint32) int {
 func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row) error {
 	f := files[b]
 	if f == nil {
-		w, err := newSpillWriter(bs.tmpDir)
+		w, err := newSpillWriter(bs.ctx)
 		if err != nil {
 			return err
 		}
@@ -445,7 +449,10 @@ func (bs *hashBatchState) discard(b int) {
 	for _, files := range [][]*joinBatchFile{bs.inner, bs.outer} {
 		if f := files[b]; f != nil {
 			f.w.Close()
-			os.Remove(f.w.Path())
+			// Eager unlink + deregister: a 1024-batch join must not
+			// hold 1024 files open-and-linked to statement end just
+			// because the registry would eventually reclaim them.
+			bs.ctx.removeSpillFile(f.w.Path())
 			files[b] = nil
 		}
 	}

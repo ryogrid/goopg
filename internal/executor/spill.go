@@ -11,6 +11,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/pgtemp"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -38,8 +39,32 @@ type spillWriter struct {
 	lenBuf [4]byte
 }
 
-func newSpillWriter(dir string) (*spillWriter, error) {
-	f, err := os.CreateTemp(dir, "goopg-spill-*.tmp")
+// newSpillWriter creates one spill file for ctx's statement.
+//
+// M0127-P3.3: the directory and the file name both come from PG's convention
+// now (`<datadir>/base/pgsql_tmp/pgsql_tmp<pid>.*`, see internal/pgtemp) and
+// the path is registered with ctx so the statement's end unlinks it even if
+// this writer's owner never reaches Close. A nil ctx — unit-test operators
+// built without one — keeps the old behaviour: the OS temp directory and no
+// registration, so the caller stays responsible for its own file.
+func newSpillWriter(ctx *Context) (*spillWriter, error) {
+	dir, err := ctx.spillDir()
+	if err != nil {
+		return nil, err
+	}
+	w, err := newSpillWriterInDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	ctx.registerSpillFile(w.path)
+	return w, nil
+}
+
+// newSpillWriterInDir is the directory-explicit form. It exists for the
+// registry itself (which resolves the directory once per statement) and for
+// tests that want a t.TempDir() with no Context at all.
+func newSpillWriterInDir(dir string) (*spillWriter, error) {
+	f, err := os.CreateTemp(dir, pgtemp.FilePattern(os.Getpid()))
 	if err != nil {
 		return nil, fmt.Errorf("spillWriter: create temp file: %w", err)
 	}
@@ -420,7 +445,7 @@ func estimatedRowBytes(row Row) int64 {
 // file and the in-memory slice is freed. Returns an operator that
 // yields rows either from memory (if no spill occurred) or from the
 // spill file.
-func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
+func drainRowsBounded(ctx *Context, op Operator, maxBytes int64) (Operator, error) {
 	if maxBytes <= 0 {
 		return drainRowsToOp(op)
 	}
@@ -428,7 +453,6 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 	var totalBytes int64
 	spilled := false
 	var w *spillWriter
-	tmpDir := os.TempDir()
 
 	for {
 		slot, err := op.Next()
@@ -438,6 +462,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 		if err != nil {
 			if w != nil {
 				w.Close()
+				ctx.removeSpillFile(w.Path())
 			}
 			return nil, err
 		}
@@ -446,13 +471,14 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 		if totalBytes > maxBytes && !spilled {
 			// Flush accumulated rows to spill file.
 			var werr error
-			w, werr = newSpillWriter(tmpDir)
+			w, werr = newSpillWriter(ctx)
 			if werr != nil {
 				return nil, werr
 			}
 			for _, r := range rows {
 				if werr = w.WriteRow(r); werr != nil {
 					w.Close()
+					ctx.removeSpillFile(w.Path())
 					return nil, werr
 				}
 			}
@@ -462,6 +488,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 		if spilled {
 			if err := w.WriteRow(row); err != nil {
 				w.Close()
+				ctx.removeSpillFile(w.Path())
 				return nil, err
 			}
 			continue
@@ -483,13 +510,18 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 
 	if spilled {
 		if err := w.Close(); err != nil {
+			ctx.removeSpillFile(w.Path())
 			return nil, err
 		}
 		r, err := newSpillReader(w.Path())
 		if err != nil {
+			ctx.removeSpillFile(w.Path())
 			return nil, err
 		}
-		return &spillOp{r: r}, nil
+		// The spillOp inherits the file: its Close unlinks it (M0127-P3.3
+		// — before this it closed the reader and left the file behind for
+		// the OS tempdir cleaner, which is the leak 06 §3 names).
+		return &spillOp{r: r, ctx: ctx}, nil
 	}
 	// No spill — return a simple in-memory operator.
 	return &rowsOp{rows: rows}, nil
@@ -549,7 +581,15 @@ func (o *spillOp) Next() (TupleSlot, error) {
 	return asSlot(nil, cloneRow(row)), nil
 }
 func (o *spillOp) Close() error {
+	// M0127-P3.3: unlink, not just close. The file is this operator's
+	// alone — drainRowsBounded handed it over — and before the fix the
+	// reader was closed while the file stayed on disk until the OS
+	// tempdir cleaner (or never, once the files moved into the datadir).
+	// The registry would still reclaim it at statement end; doing it here
+	// keeps a long statement from accumulating one file per bounded drain.
+	path := o.r.path
 	o.r.Close()
 	o.r = nil
+	o.ctx.removeSpillFile(path)
 	return nil
 }

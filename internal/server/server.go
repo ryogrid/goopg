@@ -60,6 +60,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/pgtemp"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
@@ -521,6 +522,24 @@ func (s *Server) Run(ctx context.Context) error {
 	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
 		s.addr.Store(tcpAddr)
 	}
+	// M0127-P3.3: sweep spill files a previous crash left in
+	// <datadir>/base/pgsql_tmp before any backend can create new ones. PG
+	// does the same in RemovePgTempFiles (storage/file/fd.c), called from
+	// startup before connections are accepted: a live backend unlinks its
+	// own temp files at statement end, so anything present at startup is by
+	// definition a stray. Sweeping BEFORE close(s.ready) keeps a test that
+	// connects the instant the server is ready from racing the sweep.
+	if s.cfg.DataDir != "" {
+		if n, err := pgtemp.RemoveStrayFiles(s.cfg.DataDir); err != nil {
+			// Non-fatal, exactly as PG logs and continues: a stray temp
+			// file wastes space, it does not threaten correctness.
+			s.cfg.Logger.Warn("removing stray temp files failed", "err", err)
+		} else if n > 0 {
+			s.cfg.Logger.Info("removed stray temporary files", "count", n,
+				"dir", pgtemp.Dir(s.cfg.DataDir))
+		}
+	}
+
 	close(s.ready)
 	s.cfg.Logger.Info("goopg listener bound", "address", ln.Addr().String())
 

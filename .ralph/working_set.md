@@ -1,51 +1,51 @@
 (idle — nothing in flight)
 
-M0127-P3.2 is CLOSED and committed. **S3 continues; P3.3 is next.**
+M0127-P3.3 is CLOSED and committed. **S3 continues; P3.4 is next.**
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
 note). It parks M-NIGHTLY below M0127, so the banner selects the next
-unchecked M0127 item — `M0127-P3.3` (per-query temp-file registry on
-`Context`; relocate spill files to `<datadir>/base/pgsql_tmp/`; startup
-sweep; fix the `spillOp.Close` unlink leak). Bar: UNITS + crash-injection
-test.**
+unchecked M0127 item — `M0127-P3.4` (Semi/Anti/LEFT per-batch semantics,
+batch-global `antiBuildHasNull`; shared build declines when nbatch > 1).
+Bar: UNITS + DS05 + RACE.**
 
 Carry-over facts a next loop should not re-derive:
 
-- **`ctx.WorkMem` now really bounds an INNER single-key hash join.**
-  `internal/executor/join_batch.go` (`hashBatchState`) + hashed spill frames
-  (`spillWriter.WriteRowHashed` / `spillReader.ReadRowHashedInto`). goopg's
-  `work_mem` BootVal is **512MB** (not PG's 4MB), so nothing spills in the
-  TPC-H/TPC-DS gates today — the mechanism is proved by unit identity tests,
-  not by the sweeps.
-- **The batch state is installed even at NBatch == 1** — deliberately. Bound
-  comes from growth, not the estimate. `nbatch > 1` guards every hot-path
-  hash computation.
-- **Routing hashes the key's CANONICAL bytes** (`appendCanonicalNumericKey`).
-  Never re-introduce "hash the int64 if it is one": `demoteIntHash` can move
-  a build to the string lane mid-run, and mismatched routing is a LOST MATCH,
-  not an error.
-- **Declined shapes (still unbounded): LEFT / Semi / Anti / composite-key /
-  shared (parallel) build / FOR-UPDATE ctid.** `joinBatchEligible` is the one
-  gate. P3.4 owns opening them — it needs PG's fill-aware skip rule 1.
-- **Q21 is an ANTI join**, so S3's Q21 exit evidence needs P3.4 before P3.5.
-- **Six P3.2 ledger rows** are P3.3/P3.4/P3.5's worklist (declined shapes,
-  composite lane, implicit shared-build decline, un-retired
-  `maxPresizeBuckets`, no temp-file registry, no EXPLAIN counters).
-- **DS05 post-TIMEOUT restart hazard is still live** — Q72 TIMEOUTs (300 s;
-  pre-existing, 315/317 s on earlier commits) and the restart then fails on a
-  `systemd-run` scope collision. Recovery that worked this loop:
-  `systemctl --user reset-failed`, `bench/tpcds/server.sh start sf05`, then
-  `QUERIES="$(seq 73 99)" scripts/tpcds-sf05-regression.sh sweep`.
+- **Spill files now live in `<datadir>/base/pgsql_tmp/pgsql_tmp<pid>.*`**
+  (`internal/pgtemp`), owned by a per-statement `tempFileRegistry` on
+  `Context` (`internal/executor/tempfiles.go`), allocated in `NewContext`
+  and shared BY POINTER with worker contexts. Release points:
+  `executeOneSimpleStmt` + `dispatch_extended`. Startup sweep in
+  `Server.Run` before `close(s.ready)`.
+- **A new spill file MUST be created via `newSpillWriter(ctx)`** —
+  `newSpillWriterInDir(dir)` is the registry-less form for tests only.
+  Eager unlink is `ctx.removeSpillFile(path)` (unlinks AND deregisters).
+- **Four P3.3 ledger rows** are future worklist: `temp_tablespaces`,
+  `temp_file_limit`/`log_temp_files` byte accounting (P3.5 surfaces
+  counters), statement-vs-resource-owner release scope (**P4.3
+  `Materialize` MUST revisit this** — a cross-statement spill holder would
+  be unlinked underneath), and PG's un-ported `RemovePgTempRelationFiles`.
+- **Declined join shapes are still P3.4's:** LEFT / Semi / Anti /
+  composite-key / shared (parallel) build / FOR-UPDATE ctid;
+  `joinBatchEligible` is the one gate. Q21 is an ANTI join, so S3's Q21
+  exit evidence needs P3.4 before P3.5.
+- **Nightly triage 2026-08-03:** all 20 `AI-20260803-013955-*` items were
+  already filed by loop #35. AI-001/002 (units+race internal/executor)
+  re-verified STALE at HEAD this loop (`TestMHJParallelNoDuplicates` ok,
+  `-race` clean) — the nightly sha predates the fixes.
+- **Repo gofmt baseline is go1.25; local gofmt is 1.26** — ~70 files show
+  as unformatted at HEAD. Never `gofmt -w`; match alignment manually.
 - **Do NOT `git stash`** in this tree (9+ unrelated entries).
-- **Bundle discipline:** `docs/design/leftdeep-joins/**` is NEVER modified
-  (an edit to its IMPLEMENTATION-TODO was reverted this loop). Tracking =
-  `docs/design/0127-pg-shaped-join-search.md` §6 + fix_plan checkbox +
-  README index status.
+- **Bundle discipline:** `docs/design/leftdeep-joins/**` is NEVER modified.
+  Tracking = `docs/design/0127-pg-shaped-join-search.md` §6 + fix_plan
+  checkbox + README index status.
 
-Gates run this loop: UNITS PASS; RACE PASS (`make race-gate`, all packages);
-SPOT PASS (Q12=2 / Q13=35, 15.8 s, peak 10,224 MB); DS05 slices 1-50 /
-51-72 / 73-99 MISMATCH=0 CKMISMATCH=0 ERROR=0; SMOKE via the commit hook;
-`make ralph-state-guard` OK (after auto-repair of the previous loop's
-clean-exit marker). PLAN not run — no plan surface touched.
+Gates run this loop: UNITS PASS (`RALPH_PRECOMMIT_SCOPE=units`, incl. new
+`internal/pgtemp`); RACE PASS (`make race-gate` + `go test -race
+./internal/server/`); SPOT PASS (Q12=2 / Q13=35, 16.6 s, peak 11,596 MB);
+crash-injection gate PASS (`TestStartupSweepReclaimsCrashedQueryFiles`);
+SMOKE via the commit hook; `make ralph-state-guard` OK (after auto-repair
+of the previous loop's clean-exit marker). DS05 not run — P3.3's bar is
+UNITS + crash-injection, and no join semantics changed. PLAN not run — no
+plan surface touched.
 
 In-flight: none.

@@ -794,17 +794,22 @@ func (o *sortOp) flushChunk() error {
 	if o.sortErr != nil {
 		return o.sortErr
 	}
-	w, err := newSpillWriter(os.TempDir())
+	// M0127-P3.3: the sort's chunks go to <datadir>/base/pgsql_tmp via the
+	// statement's registry, so a sort that errors between flushChunk and
+	// Close no longer strands them (o.ctx is set in Open).
+	w, err := newSpillWriter(o.ctx)
 	if err != nil {
 		return err
 	}
 	for _, r := range o.rows {
 		if werr := w.WriteRow(r); werr != nil {
 			w.Close()
+			o.ctx.removeSpillFile(w.Path())
 			return werr
 		}
 	}
 	if err := w.Close(); err != nil {
+		o.ctx.removeSpillFile(w.Path())
 		return err
 	}
 	o.spillFiles = append(o.spillFiles, w.Path())
@@ -813,6 +818,9 @@ func (o *sortOp) flushChunk() error {
 
 func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
 func (o *sortOp) Close() error {
+	// Captured before o.ctx is cleared: the spill-file unlink below has to
+	// tell the statement's registry it no longer owns these paths.
+	ctx := o.ctx
 	o.rows = nil
 	o.ctids = nil
 	o.idx = 0
@@ -827,6 +835,7 @@ func (o *sortOp) Close() error {
 	}
 	for _, p := range o.spillFiles {
 		_ = os.Remove(p)
+		ctx.forgetSpillFile(p)
 	}
 	o.spillFiles = nil
 	return o.child.Close()

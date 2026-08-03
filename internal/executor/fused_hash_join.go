@@ -152,7 +152,7 @@ func (o *fusedHashJoinOp) Open(ctx *Context) error {
 		if budget <= 0 {
 			budget = 512 * 1024 * 1024 // default 512 MiB
 		}
-		bounded, err := drainRowsBounded(l.buildOp, budget)
+		bounded, err := drainRowsBounded(ctx, l.buildOp, budget)
 		_ = l.buildOp.Close()
 		if err != nil {
 			return err
