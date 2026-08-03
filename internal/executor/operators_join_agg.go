@@ -40,18 +40,24 @@ type joinOp struct {
 
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
-	// int64 fast-path (cost-model ch.14): when every build-side key is
+	// int64 fast-path (cost-model ch.14): when the build-side keys are
 	// int64-representable, lazyIntHash replaces lazyHash so the probe hot
 	// path (e.g. Q9's ~6M lineitem rows) hashes an int64 instead of
 	// allocating a datumKey string per row — the GC-heavy cost that made
 	// the binary hash cascade slow where MultiHashJoin's int64 keys are
-	// fast (multi_hash_join.go M0043-0003). Only the plain INNER build
-	// paths opt in; CTID-preserving and semi/anti builds keep the string
-	// map (lazyHashIsInt stays false). lazyBuildAllInt64 tracks whether an
-	// int64 table is still viable during the build.
-	lazyIntHash       map[int64][]Row
-	lazyHashIsInt     bool
-	lazyBuildAllInt64 bool
+	// fast (multi_hash_join.go M0043-0003).
+	//
+	// M0127-P0.3 (05 §4, stage E3): exactly ONE of the two maps is built.
+	// lazyHashIsInt is decided BEFORE the build from the plan's key types
+	// (planner.Join.HashKeysAreInt64) instead of being discovered by
+	// populating both maps and dropping the loser at the end — which used
+	// to double peak build memory for every int-keyed join. Semi/Anti
+	// builds now opt in too; the CTID-preserving build is the one exception
+	// and stays on the string map, because lazyHashCTID is keyed alongside
+	// it. demoteIntHash covers the residual case where an integer-typed
+	// column yields a datum that is not int64-representable.
+	lazyIntHash   map[int64][]Row
+	lazyHashIsInt bool
 	lazyProbe    Operator         // probe side (streaming)
 	lazyRow      Row              // current probe row
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
@@ -569,6 +575,10 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
 		buildLeft = false
 	}
+	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
+	// from the plan's key types. Everything downstream of this line inserts
+	// into exactly one map.
+	o.lazyHashIsInt = o.plan.HashKeysAreInt64()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
@@ -578,7 +588,6 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		o.lazyHashFinalize()
 		return false, nil
 	}
 	if err := o.right.Open(ctx); err != nil {
@@ -588,6 +597,10 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
 		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
+			// The CTID exception: lazyHashCTID is a map[string] keyed in
+			// lockstep with lazyHash, so this build stays on the string map
+			// whatever the key types say (M0127-P0.3).
+			o.lazyHashIsInt = false
 			if err := o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth); err != nil {
 				return false, err
 			}
@@ -598,9 +611,6 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	_ = o.right.Close()
 	if err != nil {
 		return false, err
-	}
-	if o.plan.Type == planner.JoinTypeInner {
-		o.lazyHashFinalize()
 	}
 	return true, nil
 }
@@ -689,17 +699,14 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			continue
 		}
-		// int64 fast-path is INNER-only; semi/anti keep the string map so
-		// their NullAware / no-fan-out invariants are untouched.
-		if o.plan.Type == planner.JoinTypeInner {
-			o.lazyHashInsertDatum(kd, ownedBuildRow(r))
-		} else {
-			sk := datumKey(kd)
-			if o.lazyHash == nil {
-				o.lazyHash = make(map[string][]Row)
-			}
-			o.lazyHash[sk] = append(o.lazyHash[sk], ownedBuildRow(r))
-		}
+		// M0127-P0.3 (05 §4, stage E3): Semi/Anti go through the same
+		// insert as INNER now. The old INNER-only gate existed because the
+		// representation was DISCOVERED during the build and semi/anti
+		// never ran the finalize step that committed it; with the choice
+		// made up front there is nothing left for them to opt out of.
+		// Their NullAware / emit-once invariants live in the counters above
+		// and in nextLazy, neither of which reads the key representation.
+		o.lazyHashInsertDatum(kd, ownedBuildRow(r))
 	}
 }
 
@@ -1091,38 +1098,58 @@ func (c *mergedKeySlotCache) rebind(realSlot TupleSlot, realWidth, nullWidth int
 	return c.slot
 }
 
-// lazyHashInsertDatum inserts a build row keyed by keyDatum. It always
-// populates lazyHash (string) and, while every key so far has been
-// int64-representable, also lazyIntHash. The first non-int64 key drops the
-// int table. lazyHashFinalize then keeps whichever survives.
+// lazyHashInsertDatum inserts a build row keyed by keyDatum into whichever of
+// the two tables buildLazyHashTable selected (M0127-P0.3, 05 §4 stage E3).
+//
+// keyDatum is never NULL here: both build loops skip a NULL key before calling
+// (that is what the `ok` return of evalHashKeyDatumSlot means), so a
+// datumToInt64Key miss really does mean "an integer-typed key produced a
+// non-integer datum" and not "this row has no key".
 func (o *joinOp) lazyHashInsertDatum(keyDatum Datum, row Row) {
+	if o.lazyHashIsInt {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			if o.lazyIntHash == nil {
+				o.lazyIntHash = make(map[int64][]Row)
+			}
+			o.lazyIntHash[ik] = append(o.lazyIntHash[ik], row)
+			return
+		}
+		o.demoteIntHash()
+	}
 	if o.lazyHash == nil {
 		o.lazyHash = make(map[string][]Row)
-		o.lazyIntHash = make(map[int64][]Row)
-		o.lazyBuildAllInt64 = true
 	}
 	sk := datumKey(keyDatum)
 	o.lazyHash[sk] = append(o.lazyHash[sk], row)
-	if o.lazyBuildAllInt64 {
-		if ik, ok := datumToInt64Key(keyDatum); ok {
-			o.lazyIntHash[ik] = append(o.lazyIntHash[ik], row)
-		} else {
-			o.lazyBuildAllInt64 = false
-			o.lazyIntHash = nil
-		}
-	}
 }
 
-// lazyHashFinalize commits the int64 table (and frees the string table)
-// when every build key was int64-representable. Called once after the
-// build loop of a plain INNER hash join.
-func (o *joinOp) lazyHashFinalize() {
-	if o.lazyBuildAllInt64 && len(o.lazyIntHash) > 0 {
-		o.lazyHashIsInt = true
-		o.lazyHash = nil // free the string map; KEEP lazyIntHash
-	} else {
-		o.lazyIntHash = nil
+// demoteIntHash abandons the int64 representation mid-build and re-keys
+// everything inserted so far into the general string table.
+//
+// This is the safety net under the planner's static type decision: the plan
+// says both key columns are machine integers, so every key datum should be
+// int64-representable, but a type is a promise about a column and the executor
+// deals in datums. Rather than have a broken promise silently drop rows (an
+// int64-only table cannot hold a key it cannot represent), the build degrades
+// to the always-correct representation and continues.
+//
+// The re-key is exact rather than approximate: datumKey(KindInt(v)) is
+// canonicalNumericKey(v, 0) by construction, which is the same canonical form
+// this rebuild produces, so a row inserted before the demotion lands under the
+// identical string key as one inserted after it.
+func (o *joinOp) demoteIntHash() {
+	o.lazyHashIsInt = false
+	if o.lazyIntHash == nil {
+		return
 	}
+	if o.lazyHash == nil {
+		o.lazyHash = make(map[string][]Row, len(o.lazyIntHash))
+	}
+	for ik, rows := range o.lazyIntHash {
+		sk := canonicalNumericKey(ik, 0)
+		o.lazyHash[sk] = append(o.lazyHash[sk], rows...)
+	}
+	o.lazyIntHash = nil
 }
 
 func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {

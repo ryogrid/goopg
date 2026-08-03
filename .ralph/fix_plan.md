@@ -5579,11 +5579,42 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       pre-existing `buildEnvInFlight` global (M0126-0006) already filed in
       M-NIGHTLY above — reproduced in a HEAD worktree; every race frame is
       `buildWithEnv`, none in the new build loops. Progress log: design doc §6.
-- [ ] **M0127-P0.3 — single-map build.** Planner threads key-type info on
+- [x] **M0127-P0.3 — single-map build.** Planner threads key-type info on
       `planner.Join`; executor picks int64 vs string map before build; extend
       int64 path to Semi/Anti (CTID exception preserved); delete
       `lazyHashFinalize`'s dual-map dance. IMPLEMENTATION-TODO P0.3; 05 §4 (E3).
       Bar: UNITS + DS05.
+      **↳ DONE 2026-08-03.** `planner.Join.HashKeysAreInt64`
+      (`internal/planner/join_hashkey.go`) types both key exprs — `exprType`,
+      falling back to the merged key column space for a ColumnRef whose `Type`
+      was left zero — and `buildLazyHashTable` sets `lazyHashIsInt` from it
+      BEFORE the first build row. `lazyHashInsertDatum` fills that map only;
+      `lazyHashFinalize` and `lazyBuildAllInt64` are gone. The dual-map build
+      cost every int-keyed join a second full copy of its build side held
+      *simultaneously* with the first (the string map was freed at finalize —
+      after peak). Semi/Anti now reach the int64 lane (the old INNER-only gate
+      existed only because they never ran finalize); the CTID build is the
+      exception and stays on the string map, since `lazyHashCTID` is keyed in
+      lockstep with it. `numeric` is deliberately excluded from the int64
+      promise (values, not the type, decide representability there) — ledger
+      row `2026-08-03 M0127-P0.3`; `demoteIntHash` re-keys mid-build if a
+      typed-integer column ever yields a non-int64 datum, exactly (because
+      `datumKey(KindInt(v))` *is* `canonicalNumericKey(v, 0)`). Guards:
+      `join_hashkey_test.go` (real SQL → plan → every hash join reports true,
+      incl. mixed int widths; text/numeric false; nil/non-hash/missing-key
+      guards) and `join_single_map_build_test.go` (the OTHER map is never
+      allocated; Semi + Anti lanes; demotion preserves every row and payload).
+      UNITS PASS. **DS05: MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99** —
+      Q1-Q72 (66 PASS, `sweep-20260803-114208.txt`) + Q73-Q99 (26 PASS,
+      `sweep-20260803-122614.txt`). The first run aborted after Q72 on a
+      transient `systemd-run` scope-name collision (previous scope not yet
+      released when the post-timeout restart re-created it → 180 s readiness
+      timeout), NOT a code failure; the tail was re-run as a subset probe, so
+      the two halves together are the coverage rather than one stamped gate.
+      Q47/Q72 TIMEOUT = the known boundary pair (263-308 s vs the 300 s cap;
+      Q72 alone reads 273/263/308/480 s/TIMEOUT across five prior sweeps at
+      unchanged code). SMOKE via the commit hook. Progress log: design doc §6.
+      **P0 is now CLOSED — next is P1.1.**
 - [ ] **M0127-P1.1 — legacy-path slot chaining (the M0126-0004 deferral,
       un-deferred).** Probe child slot as `lazyVirtualOut` source; rebind on
       pointer change + copy fallback on type change; delete `slotRow(probeSlot)`
