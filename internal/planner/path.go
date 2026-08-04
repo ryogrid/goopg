@@ -135,10 +135,18 @@ type Path struct {
 	// (pathindexcarrier.go, M0127-P5.5-a) so the direction can never disagree
 	// with `Pathkeys`. P5.5's createPlan arm reads them.
 	//
-	// What is deliberately NOT here yet is `IndexPath.indexclauses`: the quals
-	// pushed into the probe. Ledgered — see pathindexcarrier.go's header.
+	// IndexClauses is `IndexPath.indexclauses` (pathnodes.h:1846): the quals
+	// pushed INTO the probe, in INDEX-COLUMN order — the order PG's own list is
+	// in (indxpath.c:1042) and the order goopg's executor needs, since
+	// `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Empty on the
+	// unparameterised ordered path, which is pathnodes.h:1817's "an empty list
+	// implies a full index scan" rather than an omission. Built only by
+	// `indexPathClauses` (pathindexclauses.go, M0127-P5.5-b), which is what
+	// makes the ordering structural. P5.5's createPlan arm reads it to build
+	// `Keys` and to drop the pushed clauses from the node's filter quals.
 	IndexInfo    *catalog.Index
 	IndexScanDir ScanDirection
+	IndexClauses []indexPathClause
 
 	Children []*Path
 

@@ -466,6 +466,36 @@
   index-column order while goopg's `bound` is in candidate order, and the
   executor's `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Still
   inert. 2 ledger rows. 6 new tests. Bar met: UNITS + SPOT.)*
+- [x] **P5.5-b** `IndexPath.indexclauses` (pathnodes.h:1846) on goopg's `Path`,
+  in INDEX-COLUMN order — the second half of the index carrier, ledgered at
+  P5.5-a. *(DONE 2026-08-04, `internal/planner/pathindexclauses.go` + `path.go`,
+  `pathparamindex.go`, `pathindexordered.go`. A parameterised index path was
+  built from `bound []paramIndexClause` and then DISCARDED them once cost and
+  rows were computed, but `createPlan` needs them twice over:
+  `fix_indexqual_references` (createplan.c:5121) builds the scan's keys from the
+  list, and `is_redundant_with_indexclauses` (createplan.c:3075) uses it to DROP
+  those clauses from the node's filter quals — which is why the carrier holds the
+  `*restrictInfo` by identity and not just the probe value. **The order is the
+  whole difficulty**: PG's list is ordered by index column because
+  `build_index_paths`' outer loop runs over `indexcol` ("this order is depended
+  on by btree", indxpath.c:1042), goopg's `bound` is in the search's CANDIDATE
+  order, and `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally — so a
+  verbatim copy would compare the wrong pair of columns on any composite index
+  whose clauses arrived out of order. `indexPathClauses` therefore loops over
+  `idx.Columns` and looks the clause up per column, PG's own loop shape; a sort
+  would be a second statement of the same fact that a later edit could
+  contradict (rule #2). Its keys agree with
+  `pickIndexCoveringAllLeadingColumns`' ordered list by construction, since both
+  read the same first-wins clause set in the same column order — the path cannot
+  be costed for one probe and built as another. Two narrowings are ledgered
+  rather than written, each a shape goopg's executor cannot represent: PG's list
+  is NONdecreasing in `indexcol` (`x > 1 AND x < 5` gives two clauses at one
+  column) while goopg carries one equality per column, and PG's gapped/prefix
+  probe (`amoptionalkey`) is DECLINED outright — nil, not a shortened list, since
+  a shortened list silently re-indexes every position after the gap. The ordered
+  unparameterised path carries an EMPTY list, which is pathnodes.h:1817's "an
+  empty indexclauses list implies a full index scan" and not an omission. Still
+  inert. 3 ledger rows. 7 new tests. Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

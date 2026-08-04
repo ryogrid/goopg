@@ -167,6 +167,11 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		// of what P5.5's createPlan needs to rebuild it.
 		IndexInfo:    idx,
 		IndexScanDir: dir,
+		// `IndexPath.indexclauses` stays EMPTY, which is a statement and not an
+		// omission: "an empty indexclauses list implies a full index scan"
+		// (pathnodes.h:1817) is exactly the object this arm builds
+		// (M0127-P5.5-b, pathindexclauses.go).
+		//
 		// Empty, and that is the entire point of the slice.
 		RequiredOuter: 0,
 	})

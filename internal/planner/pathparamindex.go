@@ -305,8 +305,16 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849): the
 		// index this path's cost and rows were computed FOR, named so P5.5's
 		// createPlan can re-emit exactly this probe rather than re-deriving one.
-		IndexInfo:     idx,
-		IndexScanDir:  dir,
+		IndexInfo:    idx,
+		IndexScanDir: dir,
+		// `IndexPath.indexclauses` (pathnodes.h:1846), re-presented in
+		// INDEX-COLUMN order by `indexPathClauses` (M0127-P5.5-b). `bound` is in
+		// the search's candidate order and `IndexScan.Keys[i]` binds
+		// `Index.Columns[i]` positionally, so the reordering is the difference
+		// between the right answer and a probe that compares the wrong pair of
+		// columns. Never nil here: `pickIndexCoveringAllLeadingColumns` accepted
+		// `idx` only because every one of its columns is bound.
+		IndexClauses:  indexPathClauses(idx, bound),
 		RequiredOuter: req,
 	})
 	return true

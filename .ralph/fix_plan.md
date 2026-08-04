@@ -6721,6 +6721,41 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       Bar met: UNITS + SPOT. DS05 not applicable — the fields are written by a
       search with no `planSelect` caller and `GOOPG_PGSHAPED_DP` is OFF, so no
       plan and no row can move.
+- [x] **M0127-P5.5-b — `IndexPath.indexclauses` on `Path`, in INDEX-COLUMN
+      order.** DONE 2026-08-04 (`internal/planner/pathindexclauses.go` +
+      `path.go`, `pathparamindex.go`, `pathindexordered.go`). The second half of
+      the index carrier, ledgered at P5.5-a: a parameterised index path was built
+      from `bound []paramIndexClause` and then DISCARDED them once cost and rows
+      were computed. `createPlan` needs them twice —
+      `fix_indexqual_references` (createplan.c:5121) builds the scan's keys from
+      the list, and `is_redundant_with_indexclauses` (createplan.c:3075) uses it
+      to DROP those same clauses from the node's filter quals, which is why the
+      carrier holds the `*restrictInfo` by identity and not just the probe value.
+      **The ORDER is the whole difficulty.** PG's list is ordered by index column
+      because `build_index_paths`' outer loop runs over `indexcol` ("this order
+      is depended on by btree", indxpath.c:1042); goopg's `bound` is in the
+      search's CANDIDATE order — the order the user wrote the join conditions in —
+      and the executor's `IndexScan.Keys[i]` binds `Index.Columns[i]`
+      POSITIONALLY, so a verbatim copy would make a composite probe compare the
+      wrong pair of columns: a wrong answer, not a slow plan. `indexPathClauses`
+      holds the order STRUCTURALLY by looping over `idx.Columns` and looking the
+      clause up per column (PG's own loop shape) rather than by sorting, which
+      would be a second statement of the same fact that a later edit could
+      contradict (rule #2). Its keys agree with
+      `pickIndexCoveringAllLeadingColumns`' ordered list by construction — both
+      read the same first-wins clause set in the same column order — so the path
+      cannot be costed for one probe and built as another. Two narrowings are
+      ledgered rather than written, each a shape goopg's executor cannot express:
+      PG's list is NONdecreasing in `indexcol` (`x > 1 AND x < 5` puts two
+      clauses on one column) while goopg carries one equality per column, and
+      PG's gapped/prefix probe (`amoptionalkey`) is DECLINED outright — nil, not
+      a shortened list, because a shortened list silently re-indexes every
+      position after the gap. The unparameterised ordered path carries an EMPTY
+      list, which is pathnodes.h:1817's "an empty indexclauses list implies a
+      full index scan" and not an omission. Still inert. 3 ledger rows. 7 new
+      tests. IMPLEMENTATION-TODO P5.5-b; 03 §10; 04 §1.1. Bar met: UNITS + SPOT.
+      DS05 not applicable — the field is written by a search with no `planSelect`
+      caller and `GOOPG_PGSHAPED_DP` is OFF, so no plan and no row can move.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root
