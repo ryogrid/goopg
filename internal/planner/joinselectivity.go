@@ -125,43 +125,71 @@ type joinVarStats struct {
 // through, for the same reason.
 func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	var v joinVarStats
-	if s == nil || key == nil {
-		return v
+	i, cr, ok := s.resolveJoinVarColumn(key, relids)
+	if cr != nil {
+		// PG's BOOLOID arm of `get_variable_numdistinct`: a boolean column has
+		// two values whether or not anyone has analysed it. Recorded even for
+		// an operand that did NOT resolve to a relation, because the type is on
+		// the operand rather than on the statistics.
+		v.isBool = cr.Type.Name == "bool"
 	}
-	cr, ok := key.(*ColumnRef)
 	if !ok {
 		return v
 	}
-	// PG's BOOLOID arm of `get_variable_numdistinct`: a boolean column has two
-	// values whether or not anyone has analysed it. Recorded here because the
-	// type is on the operand, not on the statistics.
-	v.isBool = cr.Type.Name == "bool"
-	// Exactly one base relation, i.e. a power of two. A zero relset (a Const,
-	// or an operand the clause builder could not attribute) and a multi-rel
-	// relset both take the unresolved door.
-	if relids == 0 || relids&(relids-1) != 0 {
-		return v
-	}
-	i := bits.TrailingZeros16(uint16(relids))
-	if i >= len(s.relInfos) {
-		return v
-	}
 	info := s.relInfos[i]
-	if info.table == nil {
-		// A subquery / CTE / VALUES leaf: it is a relation of the search
-		// (`buildInitialRels` admits every FROM item) but not one with a
-		// catalog table behind it, so there is no per-column statistic to
-		// read. PG digs into the subquery's own targetlist here
-		// (`examine_simple_variable`'s RTE_SUBQUERY arm); goopg's leaf is an
-		// already-planned opaque subtree. Ledgered.
-		return v
-	}
-	if cr.Name == "" {
-		return v
-	}
 	v.tuples = float64(info.baseRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
 	return v
+}
+
+// resolveJoinVarColumn is the operand-RESOLUTION half of `examine_variable`:
+// which base relation of the search an operand belongs to, and which column of
+// it. Split out from `examineJoinVar` because the sizer's superkey test
+// (joinrelsize.go, P5.6-b) needs the same answer in the (relation, column)
+// form rather than as statistics, and two resolutions that could disagree
+// about which relation an operand belongs to would let a uniqueness proof fire
+// against a different relation's statistics (hard-won rule #2).
+//
+// It answers `ok` only when the relset names exactly ONE base relation, that
+// relation has a catalog table, and the expression is a bare named column.
+// Every requirement is a real case rather than a formality:
+//
+//   - a multi-rel operand (`b.y + c.z` in `a.x = b.y + c.z`) has no single
+//     relation whose statistics could describe it, which is exactly the case
+//     upstream leaves `vardata->rel` NULL for; a zero relset (a Const, or an
+//     operand the clause builder could not attribute) takes the same door;
+//   - a subquery / CTE / VALUES leaf IS a relation of the search
+//     (`buildInitialRels` admits every FROM item) but has no catalog table
+//     behind it, so there is no per-column statistic to read. PG digs into the
+//     subquery's own targetlist here (`examine_simple_variable`'s RTE_SUBQUERY
+//     arm); goopg's leaf is an already-planned opaque subtree. Ledgered.
+//   - an expression operand over one relation (`upper(b.y)`) could in
+//     principle be described by an expression index's statistics, which
+//     goopg's catalog does not have.
+//
+// The `*ColumnRef` is returned even when resolution fails, because the caller
+// may still want the operand's TYPE (the boolean arm above) — a fact that does
+// not depend on which relation the column came from.
+func (s *searchCtx) resolveJoinVarColumn(key Expr, relids RelSet) (int, *ColumnRef, bool) {
+	if s == nil || key == nil {
+		return -1, nil, false
+	}
+	cr, ok := key.(*ColumnRef)
+	if !ok {
+		return -1, nil, false
+	}
+	// Exactly one base relation, i.e. a power of two.
+	if relids == 0 || relids&(relids-1) != 0 {
+		return -1, cr, false
+	}
+	i := bits.TrailingZeros16(uint16(relids))
+	if i >= len(s.relInfos) {
+		return -1, cr, false
+	}
+	if s.relInfos[i].table == nil || cr.Name == "" {
+		return -1, cr, false
+	}
+	return i, cr, true
 }
 
 // getVariableNumDistinct is `get_variable_numdistinct` (selfuncs.c), including

@@ -315,36 +315,13 @@ func (l *restrictInfoList) clausesFor(outer, inner RelSet) []*restrictInfo {
 // versus synthesised — and the written clause is the one the estimator has
 // statistics for and the user's own predicate. Explicit therefore beats
 // inferred; ties go to list order, so the answer does not move between runs.
+//
+// The reduction itself lives in `oneClausePerEquivClass` (joinrelsize.go),
+// because `calcJoinrelSize` is handed the joinrel's FULL restriction list —
+// what the path generators must evaluate — and has to apply the same rule from
+// the other direction.
 func (l *restrictInfoList) selectivityClauses(outer, inner RelSet) []*restrictInfo {
-	applicable := l.clausesFor(outer, inner)
-	if len(applicable) == 0 {
-		return nil
-	}
-	// winner[ecID] = index into `applicable` of the member that carries the
-	// class's selectivity at this join.
-	winner := make(map[int]int, len(applicable))
-	for i, ri := range applicable {
-		if ri.ecID == noEquivClass {
-			continue
-		}
-		prev, seen := winner[ri.ecID]
-		if !seen {
-			winner[ri.ecID] = i
-			continue
-		}
-		// Explicit beats inferred; otherwise the earlier clause keeps it.
-		if applicable[prev].inferred && !ri.inferred {
-			winner[ri.ecID] = i
-		}
-	}
-	out := make([]*restrictInfo, 0, len(applicable))
-	for i, ri := range applicable {
-		if ri.ecID != noEquivClass && winner[ri.ecID] != i {
-			continue
-		}
-		out = append(out, ri)
-	}
-	return out
+	return oneClausePerEquivClass(l.clausesFor(outer, inner))
 }
 
 // relidsOfExpr is the set of FROM positions an expression references, in the

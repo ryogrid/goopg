@@ -93,6 +93,13 @@ Each `RelOptInfo` carries `rows` set exactly once:
   in `makeJoinRel` — **before** any path is generated, so every method's
   paths for one relset share one output-row figure, PG's
   `set_joinrel_size_estimates` discipline.
+  *(Landed as P5.6-b, `internal/planner/joinrelsize.go`, together with the
+  concrete `joinRelBuilder` — `searchJoinRelBuilder` — that binds this sizer
+  to `addPathsToJoinrel` and closes the last seam `makeJoinRel` left open.
+  The joinrel's WIDTH is the sum of the input widths: PG's
+  `build_joinrel_tlist` instead sums only the columns needed above the join,
+  which the search has no projection information to reproduce — 03 §10's
+  boundary map is built over the full concatenation. Ledgered.)*
 
 Costing never calls the tree-walking `EstimateRows`
 (`cardinality.go:41`) — that walker remains only for EXPLAIN of non-searched
@@ -117,6 +124,21 @@ ndistinct error. The remedy set, in mandatory order:
    it moves into `calcJoinrelSize` and must fire on **clause subsets** too
    (composite FKs matched partially), per
    [cost-model/14](../cost-model/14-fk-aware-and-mcv-join-selectivity.md) §2.
+   *(Landed as P5.6-b, `superkeyJoinSelectivity`. It is
+   `get_foreign_key_join_selectivity`'s structure — REMOVE the covered clauses
+   from the restriction list and substitute one `1/raw-tuples` — rather than a
+   divisor bolted onto the per-clause estimate, because that structure is what
+   stops the covered clauses being charged twice. Three properties are
+   upstream's and load-bearing: the divisor is the RAW count (a filtered key
+   side then yields a real match fraction); the WHOLE key must be covered
+   (`⊆` is the test on the key's columns, not on the clause list, so extra
+   equated columns stay residual and are charged by eqjoinsel on top); and a
+   clause is consumed once, so two overlapping keys cannot both charge for it.
+   The one asymmetry: a UNIQUE index makes ITS OWN relation the key side, but a
+   declared FK makes its relation the CHILD, so the divisor is the PARENT's raw
+   count — `1.0/ref_tuples`, costsize.c:5847. The legacy
+   `uniqueNoFanoutRawCount` reads that backwards, dividing by whichever table
+   carried the constraint; ledgered, and it dies with P6.3.)*
 2. **eqjoinsel semantics** for the residual clauses: selectivity
    `1/max(nd_left, nd_right)` with NULL-fraction correction
    (`selfuncs.c eqjoinsel_inner`), replacing per-edge products of

@@ -795,11 +795,40 @@
     mechanism; `examine_variable`'s subquery/expression arms). 17 tests
     (`joinselectivity_test.go`). Still inert — `sizeJoinRel` has no
     production implementation until P5.6-b.)*
-  - [ ] **P5.6-b** `calcJoinrelSize` + the concrete `joinRelBuilder`:
+  - [x] **P5.6-b** `calcJoinrelSize` + the concrete `joinRelBuilder`:
     04 §3.1's FK/unique-superkey generalisation over clause SUBSETS
     (`get_variable_numdistinct`'s `isunique` arm, replacing
     `uniqueNoFanoutRawCount`'s edge-list form) driving the rows-once
-    discipline of 04 §2.
+    discipline of 04 §2. *(DONE 2026-08-04 —
+    `internal/planner/joinrelsize.go`: `calcJoinrelSize`,
+    `superkeyJoinSelectivity` and `searchJoinRelBuilder`, the concrete builder
+    that finally binds sizing to `addPathsToJoinrel` at `makeJoinRel`.
+    **The finding that shaped the mechanism:** the no-fan-out cannot be a
+    divisor bolted onto the per-clause estimate, it has to be PG's
+    remove-and-substitute — `get_foreign_key_join_selectivity` takes the
+    covered clauses OUT of the restriction list and puts one `1/raw-tuples`
+    in their place, and it is the removal that stops those clauses being
+    charged a second time by `eqjoinsel`. On a two-column key the difference
+    is not cosmetic: the marginals price the join at `1/nd_a · 1/nd_b`, which
+    on the test's `partsupp` shape is 2.5e6× tighter than the `1/800000` the
+    key actually implies. **The asymmetry that is easy to get backwards:** a
+    UNIQUE index makes its OWN relation the key side, but a declared FK makes
+    its relation the CHILD, so the divisor is the PARENT's raw count
+    (`1.0/ref_tuples`, costsize.c:5847) — the legacy
+    `uniqueNoFanoutRawCount` divides by whichever table carried the
+    constraint, which on a fact-to-dimension join divides the fact table's own
+    cardinality out of the estimate (ledgered; it dies with P6.3). Three
+    further upstream properties reproduced deliberately: the RAW (not
+    filtered) divisor, whole-key cover (`⊆` is the test on the KEY's columns —
+    extra equated columns stay residual and are charged on top), and a clause
+    consumed at most once. `selectivityClauses`'s EC winner rule was factored
+    into `oneClausePerEquivClass` rather than copied, because the sizer is
+    handed the joinrel's FULL restriction list and has to apply the same rule
+    from the other direction (rule #2). 4 ledger rows (joinrel width = sum of
+    input widths vs `build_joinrel_tlist`; `vardata->isunique` still unset in
+    `examineJoinVar`; the legacy child-divisor defect; `nconst_ec`). 12 tests
+    (`joinrelsize_test.go`). Still inert — `GOOPG_PGSHAPED_DP` is OFF and
+    nothing calls `joinSearch` from `planSelect`.)*
   - [ ] **P5.6-c** 04 §3.3's clamp discipline: the FK-implied bound, and the
     `max(l,r)` non-FK fallback cap kept beside it.
   - [ ] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once

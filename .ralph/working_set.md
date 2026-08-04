@@ -1,38 +1,36 @@
 (idle — nothing in flight)
 
-M0127-P5.6 is DECOMPOSED into -a…-e (fix_plan + IMPLEMENTATION-TODO), and
-**P5.6-a is DONE**: `internal/planner/joinselectivity.go` (new) +
-`catalog.ColumnStats.StaDistinct` (new, its two open-coded copies switched).
-`examine_variable` / `get_variable_numdistinct` / `eqjoinsel`'s no-MCV arm /
-the clause dispatcher, over `restrictInfo` operands. Inert.
+M0127-P5.6-b is DONE and committed: `internal/planner/joinrelsize.go` (new) —
+`calcJoinrelSize`, `superkeyJoinSelectivity`, `oneClausePerEquivClass`, and
+`searchJoinRelBuilder`, the concrete `joinRelBuilder`. `selectivityClauses`
+(joinrestrict.go) now delegates to `oneClausePerEquivClass`; `examineJoinVar`
+(joinselectivity.go) now delegates its operand resolution to
+`resolveJoinVarColumn`, which the superkey test reads too. Still inert.
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this note).
-It parks M-NIGHTLY below M0127, so the banner selects `M0127-P5.6-b` —
-`calcJoinrelSize` + the concrete `joinRelBuilder`: 04 §3.1's FK/unique-superkey
-generalisation over clause SUBSETS (the `isunique` arm of
-`getVariableNumDistinct`, replacing `uniqueNoFanoutRawCount`'s edge-list form)
-driving 04 §2's rows-once discipline — `sizeJoinRel` at find-or-create time,
-BEFORE any path is generated. Bar: UNITS.**
+It parks M-NIGHTLY below M0127, so the banner selects `M0127-P5.6-c` — 04 §3.3's
+clamp discipline: the FK-implied bound when a validated FK covers the join, with
+M0126-0010's `max(l,r)` cap (cardinality.go:400-406) kept beside it for the
+non-FK fallback. IMPLEMENTATION-TODO P5.6-c. Bar: UNITS.**
 
 Carry-over facts a next loop should not re-derive:
 
-- `sizeJoinRel` still has NO production implementor (only
-  `joinsearchlevel_test.go`'s `recordingBuilder`). P5.6-b writes both it and
-  the concrete `joinRelBuilder` that binds it to `addPathsToJoinrel`.
-- Base-rel resolution inside the search: relid bit i → `s.relInfos[i]`
-  (FROM order); `.table` is nil for a subquery/CTE/VALUES leaf; `.baseRows` is
-  the RAW (pre-filter) count = PG's `rel->tuples`.
-- Column stats resolve by **NAME** (`columnStatsByName`, pathparamindex.go).
-  `ColumnRef.Index` is a GLOBAL offset in the pre-search concatenation — a
-  positional read of `Stats.Columns` reads the wrong column.
-- goopg splits PG's signed `stadistinct` into `NDistinct` + `NDistinctFrac`;
-  the fraction wins. ONE reduction now: `catalog.ColumnStats.StaDistinct()`,
-  read by the pg_statistic heap row, the pg_stats view and the estimator.
-- Dispatch on the OPERATOR, not `isEquijoin`: `a.x = b.y + c.z` is priced by
-  eqjoinsel (0.005) not by the 0.5 unhandled default. `isEquijoin` governs only
-  which operands are examined (leftKey pairs with leftRelids, never bo.Left).
-- 3 new ledger rows: eqjoinsel MCV arm; `vardata->isunique` (= P5.6-b);
-  `examine_variable`'s subquery/expression arms.
+- The sizer's signature is `s.calcJoinrelSize(cat, outer, inner, clauses)`; the
+  catalog is NOT on `searchCtx` — the builder holds it (`newJoinRelBuilder`).
+  `addParameterizedIndexPaths(cat)` still takes its own; both must be the
+  planner's `SearchPathCatalog` (dbOid hazard).
+- `superkeyJoinSelectivity` returns `(sel, residual)`; P5.6-c's clamp goes in
+  `calcJoinrelSize` AFTER the residual product, and needs to know WHETHER a key
+  fired (today that fact is only implicit in `sel`) — plan to return it.
+- Divisor rule: UNIQUE index ⇒ its OWN relation's raw count; declared FK ⇒ the
+  PARENT's (`1.0/ref_tuples`). Legacy `uniqueNoFanoutRawCount` gets that
+  backwards — ledgered, dies with P6.3, do NOT "fix" it in the live planner.
+- Raw counts come from `relInfos[i].baseRows` (PG's `rel->tuples`), never from
+  `RelOptInfo.Rows` (post-filter).
+- Column stats/keys resolve by NAME (`columnStatsByName`); `ColumnRef.Index` is
+  a GLOBAL pre-search offset (03 §10).
+- 4 new ledger rows: joinrel width = sum of inputs; `vardata->isunique` still
+  unset in `examineJoinVar`; the legacy child-divisor defect; `nconst_ec`.
 - Still open from earlier: P4.1 ledger row #3 (`mergeJoinStream.bufferGroup`
   twin); `pushOneConjunct` not taught the searched tag; `walkPlanExprs` misses
   `Aggregate.Passthrough`/`AggregateCall.Filter`/`WindowFunc`.
@@ -43,11 +41,9 @@ Carry-over facts a next loop should not re-derive:
   `bench/tpch/setup_goopg.sh` → `PATH=$PWD/postgres/local_install/bin:$PATH
   make plan-gate` → `bench/tpch/stop_goopg.sh`.
 
-Gates run this loop: build+vet clean; 17 new tests PASS; UNITS PASS (exit 0,
-0 FAILs, `/tmp/units_p56a.log`); SPOT PASS (`/tmp/spot_p56a.log`, Q12=2 Q13=35
-canonical, 25.7 s); pgbench SMOKE via the commit hook. DS05 + PLAN not
-applicable — the planner half has no production caller, and the catalog half is
-an identity refactor of one two-field reduction.
+Gates run this loop: build+vet clean; 12 new tests PASS; UNITS PASS (exit 0,
+0 FAILs, `/tmp/units_p56b.log`); pgbench SMOKE via the commit hook. DS05 + SPOT
++ PLAN not applicable — the sizer has no production caller, so no plan can move.
 
 Nightly triage: still the same 17 `AI-20260804-005028-*` subjects from run
 20260804-005028, all already filed under M-NIGHTLY. Nothing new to file.

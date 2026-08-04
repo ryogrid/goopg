@@ -7074,12 +7074,43 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `sizeJoinRel` still has no production implementation).
       IMPLEMENTATION-TODO P5.6-a; 04 §3.2. Bar met: UNITS. DS05 + SPOT + PLAN
       not applicable — no production caller exists, so no plan can move.
-- [ ] **M0127-P5.6-b — `calcJoinrelSize` + the concrete `joinRelBuilder`.**
-      04 §3.1's FK/unique-superkey generalisation over clause SUBSETS
-      (`get_variable_numdistinct`'s `isunique` arm, replacing
-      `uniqueNoFanoutRawCount`'s edge-list form) driving 04 §2's rows-once
-      discipline: `sizeJoinRel` at find-or-create time, before any path is
-      generated. IMPLEMENTATION-TODO P5.6-b; 04 §2, §3.1. Bar: UNITS.
+- [x] **M0127-P5.6-b — `calcJoinrelSize` + the concrete `joinRelBuilder`.**
+      DONE 2026-08-04 (`internal/planner/joinrelsize.go` new;
+      `selectivityClauses`' winner rule factored out into
+      `oneClausePerEquivClass`; `examineJoinVar`'s operand resolution factored
+      into `resolveJoinVarColumn`, which the superkey test reads too).
+      04 §3.1's FK/unique-superkey generalisation over clause SUBSETS driving
+      04 §2's rows-once discipline: `sizeJoinRel` at find-or-create time,
+      before any path is generated, through `searchJoinRelBuilder` — the
+      concrete builder that binds sizing to `addPathsToJoinrel` and closes the
+      last seam `makeJoinRel` left open.
+      **The finding that shaped the mechanism:** the no-fan-out cannot be a
+      divisor bolted onto the per-clause estimate; it has to be PG's
+      remove-and-substitute. `get_foreign_key_join_selectivity` takes the
+      covered clauses OUT of the restriction list and puts one `1/raw-tuples`
+      in their place, and it is the REMOVAL that stops those clauses being
+      charged a second time by eqjoinsel. On a composite key the difference is
+      not cosmetic: the per-column marginals price the join at
+      `1/nd_a · 1/nd_b`, on the test's `partsupp` shape 2.5e6× tighter than the
+      `1/800000` the key implies — the compounding P5.6 exists to end.
+      **Second finding (the asymmetry that is easy to get backwards):** a
+      UNIQUE index makes its OWN relation the key side, but a declared FK makes
+      its relation the CHILD, so the divisor is the PARENT's raw count
+      (`1.0/ref_tuples`, costsize.c:5847). The legacy `uniqueNoFanoutRawCount`
+      divides by whichever table carried the constraint, which on a
+      fact-to-dimension join divides the fact table's own cardinality out of
+      the estimate; ledgered rather than fixed, because that estimator belongs
+      to the other cost model and P6.3 deletes it. Three further upstream
+      properties reproduced deliberately: the RAW (not filtered) divisor,
+      whole-key cover (`⊆` tests the KEY's columns — extra equated columns stay
+      residual and are charged on top), and a clause consumed at most once.
+      4 ledger rows (joinrel width = sum of input widths vs
+      `build_joinrel_tlist`; `vardata->isunique` still unset in
+      `examineJoinVar`; the legacy child-divisor defect; the `nconst_ec`
+      correction). 12 tests (`joinrelsize_test.go`). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no production caller).
+      IMPLEMENTATION-TODO P5.6-b; 04 §2, §3.1. Bar met: UNITS. DS05 + SPOT +
+      PLAN not applicable — no production caller exists, so no plan can move.
 - [ ] **M0127-P5.6-c — the clamp discipline** (04 §3.3): the FK-implied bound
       when a validated FK covers the join, with M0126-0010's `max(l,r)` cap
       kept beside it for the non-FK fallback. IMPLEMENTATION-TODO P5.6-c.
