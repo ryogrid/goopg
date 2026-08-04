@@ -2549,7 +2549,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
 					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
-						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf)}
+						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2586,7 +2586,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}
+				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
 			var root Node = parentWrapped
@@ -2600,7 +2600,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
 				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
-					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child)}
+					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2621,7 +2621,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}, b, nil
+		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}, b, nil
 }
 
 // stage1RelSizeRows is the single stamping point for the relation-size
@@ -7987,12 +7987,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 				return nil, false, nil
 			}
 			return &IndexScan{
-				pos:      where.Pos(),
-				Table:    tbl,
-				Index:    idx,
-				Key:      resolvedKey,
-				schema:   ctx.schema,
-				SmallDim: smallDimensionTag(cat, tbl),
+				pos:        where.Pos(),
+				Table:      tbl,
+				Index:      idx,
+				Key:        resolvedKey,
+				schema:     ctx.schema,
+				SmallDim:   smallDimensionTag(cat, tbl),
+				UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 			}, true, nil
 		}
 		return nil, false, nil
@@ -8058,12 +8059,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	return &IndexScan{
-		pos:      where.Pos(),
-		Table:    tbl,
-		Index:    idx,
-		Key:      resolvedKey,
-		schema:   ctx.schema,
-		SmallDim: smallDimensionTag(cat, tbl),
+		pos:        where.Pos(),
+		Table:      tbl,
+		Index:      idx,
+		Key:        resolvedKey,
+		schema:     ctx.schema,
+		SmallDim:   smallDimensionTag(cat, tbl),
+		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 	}, true, nil
 }
 
@@ -8298,13 +8300,14 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	}
 
 	scan := &IndexScan{
-		pos:      where.Pos(),
-		Table:    tbl,
-		Index:    chosenIdx,
-		LowKey:   loKey,
-		HighKey:  hiKey,
-		schema:   ctx.schema,
-		SmallDim: smallDimensionTag(cat, tbl),
+		pos:        where.Pos(),
+		Table:      tbl,
+		Index:      chosenIdx,
+		LowKey:     loKey,
+		HighKey:    hiKey,
+		schema:     ctx.schema,
+		SmallDim:   smallDimensionTag(cat, tbl),
+		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 	}
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }

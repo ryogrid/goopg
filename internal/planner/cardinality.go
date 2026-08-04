@@ -21,6 +21,8 @@
 package planner
 
 import (
+	"math"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -446,21 +448,49 @@ func estimateJoin(j *Join) int64 {
 		return scaleByFloat(l, sel)
 	}
 	if j.Algo == JoinAlgoHash || j.Algo == JoinAlgoMerge {
-		// M0127-P5.6-e-iii: the right key is resolved in the MERGED
-		// left‖right space it is written in (`rightKeyNDistinct`), the
-		// same shift the SEMI/ANTI path has used since P5.6-e-ii. Before
-		// this the right side of an equi-join never entered `max(nd)` at
-		// all, so a PK-FK join divided by the FK side's ndistinct only.
-		nd := keyNDistinct(j.LeftKey, j.Left)
-		if rnd := rightKeyNDistinct(j); rnd > nd {
-			nd = rnd
-		}
-		if nd > 0 {
-			est := scaleByFloat((l*r)/nd, joinResidualSelectivity(j))
-			if est < 1 {
-				return 1
+		// M0127-P5.6-f: EVERY equi-pair is priced, and the pairs a proven
+		// key covers are priced by the key instead. See the function header
+		// and joinkeyproof.go for why the two are one change.
+		pairs := joinEquiPairs(j)
+		sk := superkeyJoinEstimate(j, pairs)
+		sel := sk.sel
+		measured := sk.fired
+		for i, p := range pairs {
+			if i < len(sk.covered) && sk.covered[i] {
+				continue
 			}
-			return est
+			// M0127-P5.6-e-iii: the right key is resolved in the MERGED
+			// left‖right space it is written in, the same shift the
+			// SEMI/ANTI path has used since P5.6-e-ii. Before that the
+			// right side of an equi-join never entered `max(nd)` at all,
+			// so a PK-FK join divided by the FK side's ndistinct only.
+			if nd := pairNDistinct(j, p); nd > 0 {
+				sel /= float64(nd)
+				measured = true
+			} else {
+				// `clauselist_selectivity` charges an unmeasurable
+				// equijoin the selfuncs.h constant and multiplies it in
+				// with the rest; it does not abandon the measured pairs.
+				sel *= defaultEqSelectivity
+			}
+		}
+		if measured {
+			// Computed in float64 and saturated rather than as the former
+			// `(l*r)/nd`: with the divisors now applied AFTER the product,
+			// a deep chain's `l*r` would wrap int64 negative before the
+			// divide and `clampRowEst` would pin the garbage to 1. Same
+			// reason `satRowsMulDiv` exists on the DP side (bushy.go).
+			rows := float64(l) * float64(r) * sel * joinResidualSelectivity(j)
+			// The key-implied bound (04 §3.3). `rowsBound` is +Inf unless a
+			// proven key makes one side's rows an upper bound on the
+			// output, so this is a no-op on every join that proved nothing.
+			// It is STRUCTURAL — a counting argument, not a heuristic —
+			// which is why, unlike the max(l,r) cap below, it is allowed to
+			// touch a measured estimate.
+			if rows > sk.rowsBound {
+				rows = sk.rowsBound
+			}
+			return saturateRowEst(rows)
 		}
 	}
 	est := scaleByFloat(l*r, defaultEqSelectivity)
@@ -480,26 +510,40 @@ func estimateJoin(j *Join) int64 {
 
 // semiJoinMatchFraction is the fraction of OUTER rows expected to have
 // at least one join partner — upstream's `eqjoinsel_semi`
-// (selfuncs.c), reduced to the branch goopg can actually evaluate.
+// (selfuncs.c) over the join's whole equi-key list.
 //
-// goopg keeps no MCV list for a join key here (`columnStatsForChild`
-// answers per column, not per join), so this implements the
-// `else` branch of eqjoinsel_semi verbatim: with reliable ndistinct on
-// both sides, `nd1 <= nd2` means every outer row is assumed to match
-// and otherwise the match fraction is `nd2/nd1`; with either side
-// unknown, upstream punts to 0.5 rather than guessing, and so does
-// this.
-//
-// The nd2 clamp is load-bearing and asymmetric, for the reason
-// upstream states: it is the ONLY pathway by which a restriction on
-// the inner relation reaches a SEMI/ANTI size estimate, since the
-// inner's row count is otherwise unused. Clamping nd1 as well would
-// double-count the outer's own restrictions. A clamped nd2 also stops
-// being "default": an inner relation smaller than
-// `defaultNumDistinct` bounds its own distinct count exactly.
+// M0127-P5.6-f made it fold over EVERY equi-pair rather than only
+// (LeftKey, RightKey). `clauselist_selectivity` multiplies the per-clause
+// `eqjoinsel_semi` results, and the residual now excludes every pair
+// (`joinEquiPairs`), so a second equated column that used to be priced by
+// `clauseSelectivity` inside the residual is priced by its own match fraction
+// here instead. Pricing it in neither place is the defect this closes.
 func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
-	nd1 := float64(keyNDistinct(j.LeftKey, j.Left))
-	nd2 := float64(rightKeyNDistinct(j))
+	sel := 1.0
+	for _, p := range joinEquiPairs(j) {
+		sel *= semiPairMatchFraction(j, p, innerRows)
+	}
+	return sel
+}
+
+// semiPairMatchFraction is `eqjoinsel_semi` (selfuncs.c) for ONE pair, reduced
+// to the branch goopg can actually evaluate.
+//
+// goopg keeps no MCV list for a join key here (`columnStatsForChild` answers
+// per column, not per join), so this implements the `else` branch verbatim:
+// with reliable ndistinct on both sides, `nd1 <= nd2` means every outer row is
+// assumed to match and otherwise the match fraction is `nd2/nd1`; with either
+// side unknown, upstream punts to 0.5 rather than guessing, and so does this.
+//
+// The nd2 clamp is load-bearing and asymmetric, for the reason upstream states:
+// it is the ONLY pathway by which a restriction on the inner relation reaches a
+// SEMI/ANTI size estimate, since the inner's row count is otherwise unused.
+// Clamping nd1 as well would double-count the outer's own restrictions. A
+// clamped nd2 also stops being "default": an inner relation smaller than
+// `defaultNumDistinct` bounds its own distinct count exactly.
+func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
+	nd1 := float64(keyNDistinct(p.Left, j.Left))
+	nd2 := float64(rightExprNDistinct(j, p.Right))
 	nd2Known := nd2 > 0
 	if !nd2Known {
 		nd2 = defaultNumDistinct
@@ -517,19 +561,20 @@ func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
 	return nd2 / nd1
 }
 
-// rightKeyNDistinct resolves the RIGHT key's ndistinct in the coordinate
-// space the key is actually written in: `RightKey.Index` counts from the
-// start of the MERGED left‖right schema, so it has to be shifted down by
-// the left input's width before it means anything to the right child.
+// rightExprNDistinct resolves a RIGHT-side operand's ndistinct in the
+// coordinate space it is actually written in: the operand's `Index` counts
+// from the start of the MERGED left‖right schema, so it has to be shifted down
+// by the left input's width before it means anything to the right child.
 //
-// It exists only on the SEMI/ANTI path. The equi-join formula above
-// keeps its historical (wrong) lookup on purpose — correcting it there
-// removes the M0126-0010 cap from joins whose nd is saturated by ANALYZE
-// and compounds upward, which the P5.6-e-ii audit measured. Nothing
-// compounds here: a semi/anti estimate is bounded by its outer input by
-// construction, so a better nd can only move it toward the truth.
-func rightKeyNDistinct(j *Join) int64 {
-	cr, ok := j.RightKey.(*ColumnRef)
+// It arrived as `rightKeyNDistinct` on the SEMI/ANTI path only (P5.6-e-ii),
+// while the equi-join formula deliberately kept its historical wrong lookup:
+// correcting it there removed the M0126-0010 cap from joins whose nd was
+// saturated by ANALYZE, and those compound upward. P5.6-e-iii de-saturated
+// ANALYZE and moved the equi arm onto this lookup too; P5.6-f generalised it
+// from `j.RightKey` to any pair's right operand, which is all the single-key
+// wrapper had left to do.
+func rightExprNDistinct(j *Join, key Expr) int64 {
+	cr, ok := key.(*ColumnRef)
 	if !ok || j.Left == nil {
 		return 0
 	}
@@ -538,6 +583,49 @@ func rightKeyNDistinct(j *Join) int64 {
 		idx -= lw
 	}
 	return columnNDistinctForChild(idx, j.Right)
+}
+
+// pairNDistinct is `eqjoinsel`'s divisor for ONE equi-pair: the larger of the
+// two sides' ndistinct, which is upstream's `MIN(1/nd1, 1/nd2)` written the
+// other way up (selfuncs.c). A key on either side bounds the join's size and
+// the estimate is the tighter of the two bounds.
+func pairNDistinct(j *Join, p JoinKeyPair) int64 {
+	nd := keyNDistinct(p.Left, j.Left)
+	if rnd := rightExprNDistinct(j, p.Right); rnd > nd {
+		nd = rnd
+	}
+	return nd
+}
+
+// joinEquiPairs is the join's FULL equi-key list in the coordinate space
+// `Predicate` is written in — the list `clauselist_selectivity` would price and
+// `Join.Residual` excludes.
+//
+// `HashKeys` is authoritative when present, but it is filled by a single late
+// pass at the tail of `Plan()` (join_hash_keys.go), so it is EMPTY for every
+// estimate taken during join-order search — which is most of them, and the ones
+// that decide plan shape. Deriving the same list from `Predicate` in that
+// window is what keeps the search's estimate and the finished plan's estimate
+// answering the same question; `splitAllEqualitiesForHash` is literally the
+// function `fillOneJoinHashKeys` uses, so the two cannot disagree about what
+// counts as a key. The single (LeftKey, RightKey) pair remains the last resort
+// for a join whose Predicate was consumed elsewhere.
+func joinEquiPairs(j *Join) []JoinKeyPair {
+	if j == nil {
+		return nil
+	}
+	if len(j.HashKeys) > 0 {
+		return j.HashKeys
+	}
+	if j.Left != nil && j.Predicate != nil {
+		if pairs := splitAllEqualitiesForHash(j.Predicate, len(j.Left.Output())); len(pairs) > 0 {
+			return pairs
+		}
+	}
+	if j.LeftKey != nil && j.RightKey != nil {
+		return []JoinKeyPair{{Left: j.LeftKey, Right: j.RightKey}}
+	}
+	return nil
 }
 
 // joinResidualSelectivity prices the conjuncts of the join's ON clause
@@ -569,11 +657,13 @@ func joinResidualSelectivity(j *Join) float64 {
 	if j == nil || j.Predicate == nil || j.Left == nil {
 		return 1.0
 	}
-	keys := j.HashKeys
-	if len(keys) == 0 && j.LeftKey != nil && j.RightKey != nil {
-		keys = []JoinKeyPair{{Left: j.LeftKey, Right: j.RightKey}}
-	}
-	res := j.residualExcluding(keys)
+	// M0127-P5.6-f: the exclusion list is `joinEquiPairs`, the SAME list the
+	// estimators above price. It used to be `HashKeys` with a single-pair
+	// fallback while `estimateJoin` priced exactly one pair, so a two-pair
+	// join like Q9's `l_suppkey = ps_suppkey AND l_partkey = ps_partkey` had
+	// its second pair excluded here AND unpriced there — the clause vanished
+	// from the estimate entirely (09 §5.4).
+	res := j.residualExcluding(joinEquiPairs(j))
 	if res == nil {
 		return 1.0
 	}
@@ -626,89 +716,38 @@ func keyNDistinct(key Expr, side Node) int64 {
 	return columnNDistinctForChild(cr.Index, side)
 }
 
+// columnNDistinctForChild answers the ANALYZE distinct count for the column at
+// logical index `idx` of a plan subtree.
+//
+// M0127-P5.6-f: the whole walk moved to `resolveBaseColumn` (joinkeyproof.go),
+// which resolves the same coordinate to the same base relation and publishes
+// the distinct count alongside the uniqueness evidence the superkey prover
+// needs. Two lookups over one arm list cannot drift; two arm lists over one
+// question demonstrably do (M0125-0038's `*Project` remap and P5.6-e-iii's
+// `*Join` arm each went into ONE of the resolvers first, and both divergences
+// were live defects). The arm-by-arm history is preserved on the arms
+// themselves, where it now lives.
 func columnNDistinctForChild(idx int, child Node) int64 {
-	switch x := child.(type) {
-	case *SeqScan:
-		if x.Table != nil && x.Table.Stats != nil {
-			if idx >= 0 && idx < len(x.Table.Stats.Columns) {
-				return x.Table.Stats.Columns[idx].NDistinct
-			}
-		}
-	case *IndexScan:
-		// Heap-fetching probe: output schema is the table's column
-		// order, same as *SeqScan.
-		if x.Table != nil && x.Table.Stats != nil {
-			if idx >= 0 && idx < len(x.Table.Stats.Columns) {
-				return x.Table.Stats.Columns[idx].NDistinct
-			}
-		}
-	case *Filter:
-		return columnNDistinctForChild(idx, x.Child)
-	case *Sort:
-		return columnNDistinctForChild(idx, x.Child)
-
-	// M0125-0038 (C5): a join input is routinely Project-wrapped, and
-	// this lookup returning 0 through the wrapper is what made every
-	// such equi-join fall back to defaultEqSelectivity — the
-	// "equi-join key contributes no selectivity" symptom (Q10's
-	// rows=131280740 is exactly l·r·0.005).
-	case *Project:
-		if idx >= 0 && idx < len(x.Targets) {
-			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
-				return columnNDistinctForChild(cr.Index, x.Child)
-			}
-		}
-	case *Limit:
-		return columnNDistinctForChild(idx, x.Child)
-	case *LockRows:
-		return columnNDistinctForChild(idx, x.Child)
-	case *Gather:
-		return columnNDistinctForChild(idx, x.Child)
-	case *GatherMerge:
-		return columnNDistinctForChild(idx, x.Child)
-	case *CTEScan:
-		// The scan's schema is the body's output schema, position for
-		// position.
-		return columnNDistinctForChild(idx, x.Child)
-
-	// M0127-P5.6-e-iii: the *Join arm this function was missing, and its
-	// `columnStatsForChild` twin (selectivity.go) already had. Upstream
-	// resolves a join-level Var straight to its base relation's
-	// pg_statistic row (`examine_variable`, selfuncs.c) and so does this,
-	// by walking down the side the merged coordinate lands in.
-	//
-	// It is what makes a multi-level PK-FK chain size correctly rather
-	// than compounding: `(lineitem ⋈ orders) ⋈ customer` on custkey needs
-	// `orders.custkey`'s ndistinct from BELOW the first join, and reading
-	// 0 there made the whole chain fall through to defaultEqSelectivity.
-	//
-	// It was withheld through P5.6-e-ii because the estimate audit
-	// measured it as a large REGRESSION in isolation (Q9 124.7× →
-	// 176 424× over, `2026-08-04-p56eii-postfix.txt`). That was never
-	// this arm's fault: it fed `l·r/nd` a SAMPLE-saturated nd, which
-	// ANALYZE now scales up with Haas-Stokes
-	// (`executor.ndistinctEstimate`). The prerequisite landed with this
-	// arm, in this loop, exactly as P5.6-e-iii specified.
-	//
-	// Coordinate rule (identical to the twin): a `*Join`'s Predicate and
-	// key coordinates count from the start of the merged left‖right
-	// schema, so an index at or past the left input's width belongs to
-	// the right child, shifted down. A SEMI/ANTI join's Output() is
-	// left-only, so its indices never reach the shift.
-	case *Join:
-		if x.Left == nil || x.Right == nil {
-			return 0
-		}
-		lw := len(x.Left.Output())
-		if lw == 0 {
-			return 0
-		}
-		if idx >= lw {
-			return columnNDistinctForChild(idx-lw, x.Right)
-		}
-		return columnNDistinctForChild(idx, x.Left)
+	if ref, ok := resolveBaseColumn(idx, child); ok {
+		return ref.ndistinct
 	}
 	return 0
+}
+
+// saturateRowEst converts a float row estimate to the int64 the planner
+// carries, clamping to [1, MaxInt64]. `clamp_row_est` (costsize.c) does the
+// same at the bottom; the top clamp is goopg's, because its estimates are
+// int64 rather than double and a `float64 → int64` conversion out of range is
+// implementation-defined in Go (in practice MinInt64 — a negative row count
+// that then reads as "1" and poisons every cost above it).
+func saturateRowEst(rows float64) int64 {
+	if math.IsNaN(rows) || rows < 1 {
+		return 1
+	}
+	if rows >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(rows)
 }
 
 func scaleByFloat(n int64, sel float64) int64 {

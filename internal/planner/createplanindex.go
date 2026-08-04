@@ -84,11 +84,15 @@ type scanLeafRewrap func(Node) Node
 // must survive the rewrite is a compile-visible edit here, not an omission
 // noticed at run time.
 type scanIdentity struct {
-	pos                   int
-	table                 *catalog.Table
-	alias                 string
-	schema                Schema
-	smallDim              bool
+	pos      int
+	table    *catalog.Table
+	alias    string
+	schema   Schema
+	smallDim bool
+	// uniqueKeys is the leaf's uniqueness evidence (M0127-P5.6-f), carried
+	// for the same reason smallDim is: it is a property of the RELATION, so
+	// a leaf rebuilt as a different physical scan must not lose it.
+	uniqueKeys            [][]string
 	privilegeCheckRole    string
 	privilegeCheckRoleSet bool
 
@@ -202,6 +206,7 @@ func scanIdentityOf(n Node) *scanIdentity {
 			alias:                 s.Alias,
 			schema:                s.Output(),
 			smallDim:              s.SmallDim,
+			uniqueKeys:            s.UniqueKeys,
 			privilegeCheckRole:    s.PrivilegeCheckRole,
 			privilegeCheckRoleSet: s.PrivilegeCheckRoleSet,
 			estRelRows:            s.EstRelRows,
@@ -220,6 +225,7 @@ func scanIdentityOf(n Node) *scanIdentity {
 			alias:                 s.Alias,
 			schema:                s.Output(),
 			smallDim:              s.SmallDim,
+			uniqueKeys:            s.UniqueKeys,
 			privilegeCheckRole:    s.PrivilegeCheckRole,
 			privilegeCheckRoleSet: s.PrivilegeCheckRoleSet,
 		}
@@ -289,10 +295,11 @@ func createIndexScanPlan(p *Path) Node {
 		Table: id.table,
 		// The alias, the schema and the small-dimension answer are the leaf's,
 		// not re-derived — see the file header for what each one's loss costs.
-		Alias:    id.alias,
-		Index:    p.IndexInfo,
-		schema:   id.schema,
-		SmallDim: id.smallDim,
+		Alias:      id.alias,
+		Index:      p.IndexInfo,
+		schema:     id.schema,
+		SmallDim:   id.smallDim,
+		UniqueKeys: id.uniqueKeys,
 		// Carried although `mhj_input_rewrite`'s equivalent substitution does
 		// not: the check role is what a view-owner scan is authorised AS
 		// (M0122-0008), and a scan that loses it is checked against the wrong

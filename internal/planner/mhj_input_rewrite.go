@@ -227,13 +227,13 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 		if ch.isEquality {
 			newScan = &IndexScan{
 				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
-				Key: ch.bounds.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim,
+				Key: ch.bounds.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 			}
 		} else {
 			newScan = &IndexScan{
 				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
 				LowKey: ch.bounds.loKey, HighKey: ch.bounds.hiKey,
-				schema: ss.Output(), SmallDim: ss.SmallDim,
+				schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 			}
 		}
 		if !replaceNodeAtParentSlot(ch.bounds.parent, ss, newScan) {
@@ -583,13 +583,13 @@ func rewriteMHJInputsWithSingleTablePredicates(mh *MultiHashJoin, cat catalog.Ca
 			if isEq {
 				mh.Tables[k.idx] = &IndexScan{
 					pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
-					Key: b.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim,
+					Key: b.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 				}
 			} else {
 				mh.Tables[k.idx] = &IndexScan{
 					pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
 					LowKey: b.loKey, HighKey: b.hiKey,
-					schema: ss.Output(), SmallDim: ss.SmallDim,
+					schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 				}
 			}
 			rewroteIdx[k.idx] = true

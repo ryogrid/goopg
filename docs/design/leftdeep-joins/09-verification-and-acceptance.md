@@ -319,6 +319,90 @@ Q9's deepest joins are now exact (`5 997 241` on both), which is the evidence
 that the ndistinct itself is right and the remaining error is the multi-key
 pricing above it.
 
+### 5.5 The multi-key cause closed, 2026-08-04 (P5.6-f)
+
+`analysis/leftdeep-joins/2026-08-04-p56f.txt`, LEGACY planner
+(`GOOPG_PGSHAPED_DP` OFF) as before — but **on a different schema from every
+audit before it**, so it is diffed against a re-baseline rather than against
+§5.4.
+
+**Step 0: the baseline moved.** M0127-P5.6-f-pre proved goopg's `tpch` database
+carried 0 user indexes against the PG 18.3 reference's 16, and its fix is
+forward-only. Since half 2 of P5.6-f reads a UNIQUE index, the eight UNIQUE
+indexes the reference declares were re-created before anything was measured
+(`partsupp_pk (ps_partkey, ps_suppkey)` is the one Q9 turns on), and confirmed
+to survive a restart — the first end-to-end validation of the P5.6-f-pre fix on
+a real cluster. The eight NON-unique FK indexes were deliberately left out:
+they carry no uniqueness evidence and would have moved plan SHAPE inside a
+cardinality measurement, which §6 forbids.
+`2026-08-04-p56f-baseline-idx.txt` is that cluster with the OLD planner, and it
+reports the identical two violations and the identical UNMEASURED Q9 as §5.4 —
+so the index creation contributed nothing to the delta below.
+
+What landed (`internal/planner/joinkeyproof.go`, `cardinality.go`):
+
+- **Every equi-pair is priced.** `estimateJoin` charged ONE pair while
+  `Join.Residual()` excluded them all, so Q9's second equated column vanished
+  from the estimate entirely. The pair list is `joinEquiPairs`, and the same
+  list is now what `joinResidualSelectivity` excludes — the two can no longer
+  disagree. It is derived from `Predicate` when `Join.HashKeys` is empty, which
+  is the state EVERY estimate taken during join-order search sees
+  (`fillJoinHashKeys` is one late pass at the tail of `Plan()`).
+- **`get_foreign_key_join_selectivity` (costsize.c:5651) for the legacy
+  estimator.** The same algorithm as `superkeyJoinSelectivity`
+  (joinrelsize.go), arm for arm, over `*Join` nodes instead of `RelOptInfo`s:
+  the covered pairs are removed and ONE `1/raw_ntuples` substituted for the key
+  as a whole, largest divisor first, whole key or nothing. Half 1 alone prices
+  Q9's composite key as `1/(200 000 · 10 000)` — 2 400 rows against 5 997 241
+  actual, a bigger error than the defect and in the other direction. This is
+  why the item always said the halves must land together.
+- **The evidence reaches a catalog-free estimator by being stamped.** A table's
+  indexes live only in the catalog, and `estimateJoin` takes a bare `Node`
+  (EXPLAIN in the executor calls it too). `SeqScan.UniqueKeys` /
+  `IndexScan.UniqueKeys` are stamped at the sites that already stamp
+  `SmallDim`, through the planner's own `cat` — which also settles the dbOid
+  hazard of cost-model/14 §2 that a bare `InMemory` lookup would reintroduce.
+- **The proof resolves each end independently.** Requiring BOTH ends of a pair
+  to reach a base relation was the mechanism's first shape and was measured
+  wrong: Q20's `partsupp ⋈ (SELECT … GROUP BY …)` has a HashAggregate on one
+  side that no resolver sees through, the proof went unmade, and the joinrel
+  read 283 against 236 624. The uniqueness argument only ever concerns the KEY
+  side. Only the declared-FK arm needs the far end, because it has to name the
+  referenced parent.
+
+Violations: **2 → 2** — Q18's final SEMI (42 837× over) and Q21's final ANTI
+(4 003× under), both owned by P5.6-g and both untouched. **No joinrel got
+worse.**
+
+| query | joinrel | re-baseline | now |
+|---|---|---|---|
+| Q9 | `lineitem ⋈ partsupp` | 479 779 280 (80× over) | **5 997 241 — exact** |
+| Q20 | d3 INNER (`partsupp ⋈ agg`) | 12.2× over | 3.1× over |
+| Q20 | d2 SEMI | 125.0× over | 31.7× over |
+| Q5 | d6 INNER | 5 996 041 | 5 997 241 — exact |
+
+Everything else moved by under 2 %, which is the residual-accounting half.
+
+**Q9 is measurable again — at 291.8 s, not within the audit's 150 s.** The
+sequence is 93.9 s (§5.3) → unmeasured (§5.4) → 291.8 s. Its cardinality defect
+is closed and the remaining error is class (b), plan shape: all three hash
+joins carry the full 5 997 241 rows because the `part` filter (5.3 % selective)
+is applied ABOVE them, where PG filters `part` first and index-scans lineitem
+through `lineitem_part_supp_fkidx`.
+
+**Why an exact estimate did not move the shape, and what owns that.** The
+legacy planner does not size its join-order search with `estimateJoin` at all.
+`estimateJoinCost` (bushy.go:1257) has its own cardinality arm, and its
+PRODUCTION branch — the integer DP, `costDrivenJoinOrder` OFF — computes `ndv`
+as the maximum NDistinct over *every column of the edge's two tables*, ignoring
+the join key. The multi-edge enumeration and superkey probe that do exist there
+(`crossEdgesBetween` + `uniqueNoFanoutRawCount`, whose FK arm additionally
+divides by the CHILD's count where upstream divides by the parent's) sit in the
+`costDrivenJoinOrder` branch that M0126 closed as a no-go and left OFF. So
+P5.6-f reaches every printed estimate and every post-search decision, and the
+search itself not at all. Filed as **P5.6-f-ii**; P5.9 still cannot certify
+Q9's ≤ 10² runtime bar, but it can now certify its cardinality.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

@@ -98,6 +98,7 @@ func createSeqScanPlan(p *Path) Node {
 		schema:                id.schema,
 		EstRelRows:            id.estRelRows,
 		SmallDim:              id.smallDim,
+		UniqueKeys:            id.uniqueKeys,
 		LockParentOID:         id.lockParentOID,
 		SkipIfVanished:        id.skipIfVanished,
 		InheritParentOID:      id.inheritParentOID,

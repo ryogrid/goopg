@@ -894,11 +894,30 @@
     **P5.6-f** (multi-key pricing + `fkselec`; owns Q9, which went
     UNMEASURED) and **P5.6-g** (`eqjoinsel_semi`'s MCV arm; owns the
     SEMI/ANTI `est=1` collapse).
-- [ ] **P5.6-f** price EVERY `HashKeys` pair (`clauselist_selectivity`) AND
+- [x] **P5.6-f** price EVERY `HashKeys` pair (`clauselist_selectivity`) AND
   add the `get_foreign_key_join_selectivity` analogue — the two halves must
   land together; the first alone estimates Q9's 2-pair join at ≈2 rows.
   P5.9 cannot certify Q9's ≤10² bar until this lands. Bar: UNITS + DS05 +
   audit run with Q9 measurable.
+  **DONE 2026-08-04** — `joinkeyproof.go` (the superkey prover +
+  `resolveBaseColumn`) + `joinEquiPairs` on both the estimator and the
+  residual + `SeqScan/IndexScan.UniqueKeys` stamped where `SmallDim` is.
+  Preceded by step 0: the eight UNIQUE indexes re-created on the bench
+  cluster and the audit re-baselined on them (09 §5.5). Violations 2 → 2, no
+  joinrel worse, Q9's target joinrel 80× over → EXACT, Q20 12.2× → 3.1×.
+  Q9 measurable again at 291.8 s but still over the audit's 150 s: its
+  cardinality is closed, its SHAPE is not, and the reason is a separate
+  mechanism — spun out as **P5.6-f-ii**.
+- [ ] **P5.6-f-ii** the legacy join-order SEARCH does not use `estimateJoin`.
+  `estimateJoinCost`'s production branch (bushy.go:1257, `costDrivenJoinOrder`
+  OFF) computes `ndv` as max NDistinct over EVERY column of the edge's two
+  tables, ignoring the join key; the multi-edge + superkey arm beside it is
+  gated on the flag M0126 left OFF, and its FK case divides by the CHILD's
+  raw count where upstream divides by the parent's (costsize.c:5847). Result:
+  P5.6-f reaches every printed estimate and the search not at all, which is
+  why Q9's exact joinrel still yields a plan applying the 5.3 %-selective
+  `part` filter ABOVE three full-cardinality hash joins. Bar: UNITS + DS05 +
+  audit run with Q9 inside the 150 s timeout.
 - [ ] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor;
   closes the SEMI/ANTI `est=1` collapse (Q21 4003× under is an audit
   violation). Bar: UNITS + DS05 + audit run.

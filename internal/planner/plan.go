@@ -604,6 +604,27 @@ type SeqScan struct {
 	// `catalog.Table.SmallDimension`; see
 	// docs/design/0125-0043-smalldimension-name-tag-extinction.md.
 	SmallDim bool
+	// UniqueKeys is Table's uniqueness evidence: the column-name list of every
+	// UNIQUE index on the relation, stamped at plan-build time by
+	// `uniqueKeyColumnSets` (joinkeyproof.go).
+	//
+	// It exists for the same reason EstRelRows and SmallDim do, and the reason
+	// is sharper here. `estimateJoin` is the only place goopg can reproduce
+	// `get_foreign_key_join_selectivity` (costsize.c:5651) on the legacy
+	// planner, and it takes a bare `Node` — no catalog — because EXPLAIN in
+	// the executor calls it too. The index LIST is the one piece of the
+	// evidence that is not already reachable from the node: raw tuple counts
+	// come from `Table.Stats.RowCount` and declared FKs from
+	// `Table.ForeignKeys`, but a table's indexes live only in the catalog, and
+	// resolving them there per estimate call would additionally reintroduce
+	// the dbOid hazard (a bare `InMemory` answers for `DefaultDBOid` whatever
+	// database is active, so a uniqueness proof could fire off another
+	// database's index — cost-model/14 §2). Stamping through the planner's own
+	// `cat`, once, at the site that already stamps SmallDim, settles both.
+	//
+	// Same cached-plan exposure as EstRelRows: a plan carries the index set
+	// that was live when it was planned. M0127-P5.6-f.
+	UniqueKeys [][]string
 	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
 	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
 	// parent takes AccessShare on the parent relation too (PostgreSQL locks the
@@ -683,6 +704,11 @@ type IndexScan struct {
 	// scan it replaces, so promoting a leaf to an index probe never changes
 	// the relation's small-dimension answer.
 	SmallDim bool
+	// UniqueKeys — see SeqScan's field of the same name (M0127-P5.6-f).
+	// Copied, like SmallDim, by every pass that substitutes an IndexScan for
+	// a SeqScan: the relation's uniqueness evidence is a property of the
+	// relation, not of how this plan chose to read it.
+	UniqueKeys [][]string
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }

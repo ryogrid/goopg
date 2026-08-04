@@ -7249,37 +7249,64 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `0122-0018` new section; ledger row dated 2026-08-04. Bar met: UNITS +
       SPOT (Q12=2, Q13=35) + DS05 + the four affected packages.
       **Forward-only — see P5.6-f's step 0.**
-- [ ] **M0127-P5.6-f — multi-key equi-join pricing + `fkselec`, the two
-      halves that must land together.** Q9's `l_suppkey = ps_suppkey AND
-      l_partkey = ps_partkey` is priced on ONE pair while `Join.Residual()`
-      excludes BOTH, so it reads 481 M and the DP puts it under the `part`
-      filter — this is the whole cause of Q9's P5.6-e-iii regression
-      (attributed per 09 §6 before landing: reverting only the planner half
-      reproduces the identical plan). Folding `max(nd)` over every `HashKeys`
-      pair alone swings it to ≈2 rows, so it needs the
-      `get_foreign_key_join_selectivity` analogue (costsize.c) in the same
-      change. **P5.9 cannot certify Q9's ≤10² bar until this lands.**
-      09 §5.4; two ledger rows dated 2026-08-04. Bar: UNITS + DS05 + audit
-      run with Q9 measurable again.
-      **↳ STEP 0, ADDED 2026-08-04 (do this FIRST, it is not optional).**
-      M0127-P5.6-f-pre proved the bench cluster carries NO unique-index and NO
-      FK evidence at all, and its fix is forward-only. Until `partsupp_pk`
-      exists in db `tpch`, `fkselec` cannot fire and the multi-key half ALONE
-      takes Q9 from 80× over to ≈2.5 M× UNDER (`5 997 241 · 800 000 /
-      (200 000 · 10 000)` ≈ 2 rows) — i.e. landing half 1 without step 0 is a
-      guaranteed measured regression, which is precisely why this item says
-      the two halves must land together. Step 0 is:
-      `CREATE UNIQUE INDEX partsupp_pk ON public.partsupp USING btree
-      (ps_partkey, ps_suppkey)` (plus, ideally, the other 15 read off the PG
-      reference with `SELECT indexdef FROM pg_indexes WHERE
-      schemaname='public'` on 65432). **This MOVES the estimate-audit
-      baseline** — every audit from `2026-08-03-*` through
-      `2026-08-04-p56eiii` was taken on an index-free cluster — so re-baseline
-      the audit in the same loop and say so in the evidence file, rather than
-      diffing against a run taken under different schema. Also note goopg's
-      TPC-H cluster still cannot get the 8 FK CONSTRAINTS back: those ride
-      `pg_constraint`, whose per-DB routing is the (b) half still deferred on
-      the P5.6-f-pre ledger row.
+- [x] **M0127-P5.6-f — multi-key equi-join pricing + `fkselec`, the two
+      halves that must land together (DONE 2026-08-04).** Q9's
+      `l_suppkey = ps_suppkey AND l_partkey = ps_partkey` was priced on ONE
+      pair while `Join.Residual()` excluded BOTH. Landed together, as the item
+      required: `joinEquiPairs` folded over every pair AND the same list
+      excluded by `joinResidualSelectivity`; plus
+      `get_foreign_key_join_selectivity` (costsize.c:5651) for the legacy
+      estimator in `internal/planner/joinkeyproof.go`, reading uniqueness
+      evidence stamped on the leaf scans (`SeqScan/IndexScan.UniqueKeys`,
+      stamped where `SmallDim` already is, through the planner's own `cat`).
+      Step 0 was done FIRST and is recorded: the eight UNIQUE indexes the PG
+      reference declares were re-created on the bench cluster (they survive a
+      restart — first real-cluster validation of the P5.6-f-pre fix) and the
+      audit was RE-BASELINED on them
+      (`analysis/leftdeep-joins/2026-08-04-p56f-baseline-idx.txt`), which
+      reports the identical two violations as the index-free `p56eiii` run —
+      so the whole delta is the planner change. Result: violations 2 → 2,
+      **no joinrel worse**, Q9's target joinrel 479 779 280 (80× over) →
+      **5 997 241, exact**; Q20 d3 12.2× → 3.1× over, d2 SEMI 125× → 31.7×
+      over. 09 §5.5; three ledger rows dated 2026-08-04. Bar met: UNITS +
+      SPOT (Q12=2, Q13=35) + DS05 + the re-baselined audit run.
+      **Q9 is measurable again — at 291.8 s, not inside the audit's 150 s.**
+      Its cardinality defect is closed; the residue is class (b) and is
+      P5.6-f-ii below.
+- [ ] **M0127-P5.6-f-ii — the legacy join-order SEARCH does not use
+      `estimateJoin`, so P5.6-f never reached plan shape.** Measured, not
+      inferred: with Q9's joinrel now EXACT its plan is byte-identical, still
+      applying the 5.3 %-selective `part` filter ABOVE three hash joins that
+      each carry the full 5 997 241 rows (PG filters `part` first and index-
+      scans lineitem via `lineitem_part_supp_fkidx`). The cause is a second
+      cardinality implementation: `estimateJoinCost` (bushy.go:1257). Its
+      PRODUCTION branch — the integer DP, `costDrivenJoinOrder` OFF — computes
+      `ndv` as the maximum NDistinct over EVERY column of the edge's two
+      tables, ignoring the join key entirely; the multi-edge enumeration and
+      superkey probe beside it (`crossEdgesBetween` +
+      `uniqueNoFanoutRawCount`) are gated on the flag M0126 closed as a no-go
+      and left OFF, and that probe's FK arm divides by the CHILD's raw count
+      where upstream divides by the PARENT's (costsize.c:5847). Resume point:
+      enumerate `crossEdgesBetween` unconditionally and run a
+      `joinkeyproof.go`-shaped prover over `g.tables` (the catalog is already
+      in scope there). **P5.9 can now certify Q9's cardinality but still not
+      its ≤10² runtime bar.** Ledger row dated 2026-08-04. Bar: UNITS + DS05 +
+      PLAN + audit run with Q9 inside the 150 s timeout.
+- [ ] **M0127-P5.6-f-iii — the TPC-DS SF0.5 gate's single TIMEOUT hopped
+      from Q72 to Q47 (2026-08-04), unattributed.** The sweep's summary line
+      is identical to the three before it (PASS=94, MISMATCH=0, CKMISMATCH=0,
+      ERROR=0, TIMEOUT=1, SKIP=4) — correctness did not move — but Q47 went
+      31 s → 332 s timeout while Q72 went 328 s timeout → 166 s, Q57 15 s →
+      81 s and Q53 28 s → 6 s. Swings in both directions plus a hopping
+      victim match the documented sweep-tail confound (a server that just ran
+      a timeout query sits at GOMEMLIMIT with GOGC=off and thrashes). Checked,
+      not assumed: Q47's only multi-pair join is the 5-pair `v1 ⋈ v1` between
+      two CTE scans whose ndistinct resolves on NEITHER side, so it lands on
+      the same `defaultEqSelectivity` fallback as before (`EXPLAIN` shows
+      `rows=1`); every other joinrel is single-pair and unchanged by
+      construction. Resume: run the sweep twice at this commit and once at
+      `HEAD~1` and see whether the TIMEOUT hops without a code change.
+      Ledger row dated 2026-08-04.
 - [ ] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
       factor.** With a truthful ndistinct the no-MCV branch's `nd1 <= nd2`
       test succeeds on real data, the match fraction is exactly 1.0, and
