@@ -5979,9 +5979,47 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	nullsNotDistinct bool,
 	tablespace uint32,
 ) {
+	c.RegisterIndexDuringRecoveryForDB(DefaultDBOid, schema, name, tableOID, cols, unique, method, primary, oid,
+		colDescending, colNullsFirst, hasPredicate, predicateString, includeColumns, colOpClasses, colCollations,
+		fillfactor, deduplicateItems, nullsNotDistinct, tablespace)
+}
+
+// RegisterIndexDuringRecoveryForDB is RegisterIndexDuringRecovery keyed to ONE
+// database's catalog namespace instead of the DefaultDBOid one.
+//
+// It exists because an index on a distinct-dbOid database has its owning table
+// registered in that database's namespace (loadUserTablesFromHeapForDB's
+// `nsDBOid`), so the DefaultDBOid-only `tableByOID` probe below could never
+// resolve it and the whole registration silently returned — the catalog half of
+// the durability gap M0127-P5.6-f-pre closes. Every namespace-keyed access in
+// the body (the owning-table probe, the duplicate check, and both index maps)
+// takes `dbOid`; passing DefaultDBOid reproduces the historical behaviour
+// exactly, which is what the wrapper above does.
+func (c *InMemory) RegisterIndexDuringRecoveryForDB(
+	dbOid uint32,
+	schema string,
+	name string,
+	tableOID uint32,
+	cols []string,
+	unique bool,
+	method string,
+	primary bool,
+	oid uint32,
+	colDescending []bool,
+	colNullsFirst []bool,
+	hasPredicate bool,
+	predicateString string,
+	includeColumns []string,
+	colOpClasses []string,
+	colCollations []string,
+	fillfactor int,
+	deduplicateItems *bool,
+	nullsNotDistinct bool,
+	tablespace uint32,
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
+	tbl, ok := c.tableByOID(tableOID, dbOid)
 	if !ok {
 		// Owning table not yet recovered — caller must run
 		// `loadUserTablesFromHeap` (or equivalent) before
@@ -6004,7 +6042,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	// follow-up). lookupIndexLocked already implements the same "" vs
 	// "public." collision fallback reads rely on, so reusing it here keeps
 	// recovery's notion of "same index" consistent with LookupIndex's.
-	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid); dup {
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, dbOid); dup {
 		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
@@ -6040,12 +6078,23 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		DeduplicateItems: deduplicateItems,
 		NullsNotDistinct: nullsNotDistinct,
 		Tablespace:       tablespace,
+		// The physical-file routing CreateIndex stamps on the live path
+		// (Index.DBOid, read by IndexRelFileNode). Recovery never set it, so a
+		// reloaded index on a distinct-dbOid database pointed
+		// IndexRelFileNode at the process-wide InMemory.dbOid — base/5 — where
+		// its btree file does not exist. The catalog row was therefore
+		// restored while the index silently stopped ENFORCING and stopped
+		// being scannable: a UNIQUE index that accepts duplicates after a
+		// restart is worse than one that vanished. Caught by
+		// TestDistinctDatabaseIndexSurvivesRestartInOwnNamespace's duplicate
+		// insert, which the metadata assertions alone all passed.
+		DBOid: dbOid,
 	}
-	c.ns(DefaultDBOid).indexes[k] = idx
-	if c.ns(DefaultDBOid).byTable[tbl.OID] == nil {
-		c.ns(DefaultDBOid).byTable[tbl.OID] = map[string]*Index{}
+	c.ns(dbOid).indexes[k] = idx
+	if c.ns(dbOid).byTable[tbl.OID] == nil {
+		c.ns(dbOid).byTable[tbl.OID] = map[string]*Index{}
 	}
-	c.ns(DefaultDBOid).byTable[tbl.OID][k] = idx
+	c.ns(dbOid).byTable[tbl.OID][k] = idx
 	c.advanceNextOIDLocked(oid)
 }
 

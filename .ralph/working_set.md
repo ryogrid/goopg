@@ -1,55 +1,69 @@
-(idle — nothing in flight)
+Task: M0127-P5.6-f-pre — DONE and committed. Selected M0127-P5.6-f per the
+banner, found a hard blocker in front of it, fixed the blocker.
 
-M0127-P5.6-e-iii is DONE and committed. All three parts landed and were
-measured together: Haas–Stokes in ANALYZE (`executor.ndistinctEstimate`),
-the merged-coordinate right-key lookup + `columnNDistinctForChild`'s `*Join`
-arm, and the M0126-0010 cap re-examined (left fallback-only, deliberately).
-Estimate-audit violations **5 → 2**.
+**The finding (do not re-derive).** goopg's TPC-H bench cluster (db `tpch`,
+65433) carries **0 user indexes and 0 constraints**; the PG 18.3 reference
+(65432, same schema) carries **16 and 8**. HammerDB DID create them (names are
+still in that data dir's pg_wal) — they were lost at the first restart. Root
+cause is a composed regression: 4e follow-up 39 deferred index catalog rows
+because `RecordKindCreateIndex(20)`/`DropIndex(21)` still carried them, then B5
+Slice A retired 20/21 on the premise `loadUserIndexesFromHeap` replaced them —
+but the write went to `base/<DefaultDBOid>` and that reload scans only
+`cat.DBOID()`, resolving the owning table in the wrong namespace. So on ANY
+non-default database, CREATE INDEX / PRIMARY KEY / ADD CONSTRAINT was durable
+nowhere.
+
+Files: `internal/executor/operators_ddl.go` (write routing +
+BOTH DROP INDEX stamp sites), `internal/initdb/open.go`
+(`loadUserIndexesFromHeapForDB` + per-DB sweep),
+`internal/catalog/catalog.go` (`RegisterIndexDuringRecoveryForDB` +
+`Index.DBOid`), `internal/server/index_dbid_restart_test.go` (new),
+`docs/design/0122-0018-per-database-catalog-namespace.md` + README row.
+
+Key symbols: `tableCatalogHeapDBOid` / `tableCatalogDBOids` (the routing pair
+follow-up 39 introduced for tables — index rows now use both),
+`loadUserIndexesFromHeapForDB(heapDBOid, nsDBOid)`, `IndexRelFileNode`.
+
+Gotcha worth keeping: fixing only the ROUTING made every metadata assertion
+pass while the index silently stopped ENFORCING — `IndexRelFileNode` read the
+process-wide `InMemory.dbOid` because recovery never stamped `Index.DBOid`, so
+a reloaded UNIQUE index accepted duplicates. Only the duplicate-insert
+assertion caught it. Any similar "reloaded catalog object" work should assert
+behaviour, not just catalog visibility.
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this
-note). It parks M-NIGHTLY below M0127, so the banner selects the next open
-M0127 item. Three are ready, and `M0127-P5.6-f` is the highest-value one —
-it OWNS the Q9 regression this loop attributed and is a hard blocker on
-P5.9's Q9 ≤10² certification. The others: `M0127-P5.6-g` (eqjoinsel_semi's
-MCV arm; owns the SEMI/ANTI `est=1` collapse, incl. Q21's new audit
-violation) and `M0127-P5.7` (nbatch-aware `hashJoinCost`, also unblocks the
-still-blocked P5.6-d).**
+note). It should still select `M0127-P5.6-f`, which now carries a STEP 0.**
+Step 0 is mandatory and is written out in the fix_plan item: the fix that
+landed is FORWARD-ONLY (the bench cluster's old index rows sit in a heap the
+new per-DB sweep does not read for db `tpch`), so `partsupp_pk` must be
+re-created before `fkselec` has anything to fire on:
+`CREATE UNIQUE INDEX partsupp_pk ON public.partsupp USING btree (ps_partkey,
+ps_suppkey)`. Landing the multi-key half WITHOUT step 0 is a guaranteed
+regression — it takes Q9 from 80× over to ≈2.5 M× under (≈2 rows). Creating
+the index MOVES the estimate-audit baseline (every audit through
+`2026-08-04-p56eiii` was index-free) — re-baseline in the same loop and say so.
 
-Carry-over facts a next loop should not re-derive:
+Carried over, still true: Q9's bad joinrel is `lineitem ⋈ partsupp` on
+`(l_suppkey=ps_suppkey AND l_partkey=ps_partkey)`, EXPLAIN shows
+`rows=480067320` where truth is `5 997 241`; `estimateJoin` (cardinality.go
+:448-465) prices ONE pair while `joinResidualSelectivity` excludes BOTH.
+`joinrelsize.go`'s `superkeyJoinSelectivity`/`keysCovering` is the already
+reviewed implementation of the fix — but it lives on the PG-shaped DP path
+(`GOOPG_PGSHAPED_DP` OFF), so P5.6-f has to bring the same two halves into the
+legacy `estimateJoin`, which has NO catalog in scope (see plan.go:589-593 —
+`EstRelRows`/`SmallDim` are the stamp-at-plan-build precedent to follow).
+PG's own Q9 plan filters `part` first and index-scans lineitem via
+`lineitem_part_supp_fkidx`.
 
-- **Q9 is UNMEASURED** in the new audit (93.9 s → >150 s). Attribution was
-  taken per 09 §6 BEFORE landing: reverting ONLY the planner half reproduces
-  the identical plan shape (481 222 948 vs 479 779 280), so the de-saturated
-  ANALYZE is the whole cause. Mechanism: `l_suppkey = ps_suppkey AND
-  l_partkey = ps_partkey` is a TWO-pair equi-join priced on ONE pair while
-  `Join.Residual()` excludes BOTH → 481 M, so the DP puts it UNDER the
-  `part` filter. Folding `max(nd)` over all pairs alone gives ≈2 rows —
-  P5.6-f must land the `get_foreign_key_join_selectivity` analogue in the
-  SAME change. Do not re-derive this; it is in 09 §5.4 + two ledger rows +
-  `2026-08-04-p56eiii-README.md`.
-- Q9's two deepest joins are now EXACT (5 997 241 both) — the ndistinct is
-  right; the error is entirely the multi-key pricing above it.
-- `NDistinct` and `NDistinctFrac` are now two renderings of ONE estimate;
-  `StaDistinct()` picks with upstream's 10%-of-rows rule. `parallel_agg.go`
-  still needs frac populated for every column — do not switch it to PG's
-  "absolute below 10%, fraction above" storage or the split gate refuses.
-- Still open from earlier: P4.1 ledger row #3 (`mergeJoinStream.bufferGroup`
-  twin); `pushOneConjunct` not taught the searched tag; `walkPlanExprs`
-  misses `Aggregate.Passthrough`/`AggregateCall.Filter`/`WindowFunc`.
-- Audit re-run recipe: `go build -o /tmp/estimate-audit ./cmd/estimate-audit`
-  → `GOGC=100 GOMEMLIMIT=12GiB bench/tpch/setup_goopg.sh` →
-  `/tmp/estimate-audit --label <date>-<slug> --timeout 150s` →
-  `bench/tpch/stop_goopg.sh`. ~13 min. DB/user are `tpch`/`tpch` (NOT
-  postgres); `actual rows=` is CUMULATIVE.
-- Do NOT `git stash`; gofmt baseline go1.25 (never wholesale `-w`).
+Also still open: `pg_constraint` per-DB routing (the (b) half of this loop's
+ledger row) — goopg's `tpch` cannot get the 8 FKs back until that lands.
 
-Gates run this loop: UNITS PASS (exit 0, `/tmp/units_p56eiii.log`); SPOT PASS
-(Q12=2, Q13=35); DS05 PASS (PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0
-TIMEOUT=1 SKIP=4 — identical summary to the three prior sweeps); the audit
-run (2 violations, three fewer than baseline, one new: Q21). pgbench SMOKE
-via the commit hook.
+Gates run this loop: build + vet clean; `go test` on catalog/initdb/executor/
+server PASS; UNITS PASS (exit 0, `/tmp/units_p56fpre.log`); SPOT PASS (Q12=2,
+Q13=35, `/tmp/spot_p56fpre.log`); DS05 sweep (`/tmp/ds05_p56fpre.log`);
+pgbench smoke via the commit hook.
 
-Nightly triage: still the same 17 `AI-20260804-005028-*` subjects, all
-already filed under M-NIGHTLY. Nothing new to file.
+Nightly triage: same 17 `AI-20260804-005028-*` subjects, all already filed
+under M-NIGHTLY. Nothing new to file.
 
 In-flight: none.
