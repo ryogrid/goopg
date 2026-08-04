@@ -888,6 +888,80 @@ channel (§5.11) was read *before* the sweep rather than after — the 20 s
 capture scoped the blast radius, and caught the Q77 impossibility early enough
 that the floor shipped in the same change.
 
+### 5.13 Q18's residual is not a defect, and the instrument was off by one selectivity, 2026-08-05 (P5.6-g-v)
+
+The item asked one question — is Q18's residual the group estimate or the
+HAVING selectivity? — and required it be answered by measurement before
+anything was touched. One `EXPLAIN` of the bare subquery on each engine
+answers it:
+
+| | group estimate | after `HAVING sum(l_quantity) > 313` | factor |
+|---|---|---|---|
+| PG 18.3 | 339 423 | 113 141 | ÷3 |
+| goopg | 1 150 720 | 383 573 | ÷3 |
+
+**Both engines apply exactly the same HAVING selectivity.** `113 141 =
+339 423 / 3` and `383 573 = 1 150 720 / 3` are both DEFAULT_INEQ_SEL over an
+aggregate for which neither engine has statistics — upstream `cost_agg`
+(costsize.c) scales `output_tuples` by `clauselist_selectivity(quals)` and
+goopg's `*Filter` wrapper over the `*Aggregate` does the identical thing.
+There is no HAVING defect.
+
+The entire 3.39× gap is the **group estimate**, and it is the direction the
+item warned about: goopg's `l_orderkey` ndistinct (1 150 720) is *more*
+accurate than PG's (339 423) against a truth of 1 500 000 — PG is 4.4× LOW.
+Q18's inner is larger than PG's *because goopg's statistics are better*.
+Closing the parity gap here would mean deliberately degrading ndistinct
+accuracy, so **P5.6-g-v closes with no estimator change**: Q18's standing
+audit violation is inherent to pricing an aggregate with no statistics, a
+defect goopg shares with upstream and is only visibly worse at because
+upstream's compensating ndistinct error happens to point the other way.
+
+**What the measurement did find.** Reading the two EXPLAINs side by side
+exposed a defect in the instrument itself. goopg keeps a qual and the rows it
+filters on two different plan nodes: the predicate lives on a `*Filter`
+wrapper which `walkPlanFiltered` (operators_explain.go) collapses onto the
+child below it, so the rendered node set matches PG's. The collapsed line
+kept printing `EstimateRows(child)` — the **PRE-qual** count — beside a
+`Filter:` detail the estimator had already applied. Upstream has no
+equivalent gap because the two live on one struct:
+`set_baserel_size_estimates` stores `rel->rows` already scaled by
+`clauselist_selectivity(baserestrictinfo)`, and `cost_agg` sets `path->rows`
+only after the HAVING scaling.
+
+The estimator was always right — a *parent* node reads
+`EstimateRows(*Filter)` and sees the filtered count, which is why a `Gather`
+above a filtered scan reported the correct number while the scan under it did
+not. Only the collapsed line lied, by exactly the filter's selectivity:
+
+| | before | after | PG 18.3 |
+|---|---|---|---|
+| `lineitem WHERE l_shipdate <= '1994-01-01'` | 5 997 241 | 1 689 312 | 1 673 754 |
+| `nation WHERE n_regionkey = 1` | 25 | 4 | 5 |
+| TPC-DS `date_dim WHERE d_year = 2000` | 73 049 | 365 | 365 |
+
+This is a **P5.6-g-iii-class instrument defect, not a cosmetic one**. Both
+acceptance instruments read that field: `internal/estimateaudit` parses it
+with `nodeLineRe` (audit.go), and §5.11's DS05 plan-shape channel captures
+it. Every filtered base relation in every capture taken before this commit
+reports its unfiltered size. Conclusions drawn from plan *text* about how
+large goopg believes a filtered relation to be — the M0125-0026 ledger row's
+"`date_dim` is costed at 73 049 rows" among them — were reading the renderer,
+not the estimator; C2's qual *placement* finding is unaffected (the predicate
+genuinely renders above the scan), but the row-count half of that evidence
+was an artifact.
+
+**Gates.** UNITS green. Audit: 1 violation (Q18), unchanged from the
+`p56gii` baseline — every joinrel diff is sub-1 % ANALYZE sampling noise
+(316 634 → 311 456, ratios 10.4×→10.2×, 6.2×→6.4×) and no joinrel moved to a
+worse class; join nodes carry no collapsed `*Filter` in TPC-H, which is why
+the fix leaves them untouched. DS05 `plans`: **95 of 99 captures changed, and
+with `rows=` normalised the diff is 6 lines — a psql column-width header, and
+nothing else.** Zero structural movement across the corpus, which is the
+proof the change is confined to rendering: it cannot reach plan selection.
+3 regression tests (`explain_collapsed_filter_rows_test.go`), each verified
+to fail without the fix (1000→100, 10→3).
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

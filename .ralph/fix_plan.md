@@ -7507,16 +7507,60 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       worse). Evidence `analysis/leftdeep-joins/2026-08-05-p56gii-*`; doc 09
       §5.12; IMPLEMENTATION-TODO P5.6-g-ii. 3 ledger rows. Successor:
       **M0127-P5.6-g-v** below.
-- [ ] **M0127-P5.6-g-v — Q18's residual, which is a HAVING problem.**
-      After P5.6-g-ii the joinrel is 24 242× over and every join-selectivity
-      mechanism in it is now PG-faithful; what is left is the inner's own size.
-      goopg prices `HAVING sum(l_quantity) > 313` at DEFAULT_INEQ_SEL over a
-      group estimate of 1 210 559 (→ ~403 500) where PG lands on 113 141, and
-      the difference is NOT a goopg defect in the usual direction — goopg's
-      `l_orderkey` ndistinct is the more accurate of the two. Establish first
-      whether the gap is the group estimate or the HAVING selectivity (one
-      `EXPLAIN` of the bare subquery on each engine answers it) before touching
-      either. Bar: UNITS + DS05 `plans` + audit run.
+- [x] **M0127-P5.6-g-v — Q18's residual, which is NOT a HAVING problem.**
+      DONE 2026-08-05, and the answer is "neither engine differs on HAVING".
+      The one `EXPLAIN` the item prescribed settled it: PG 339 423 → **113 141**
+      and goopg 1 150 720 → **383 573** are both exactly ÷3 — DEFAULT_INEQ_SEL
+      over an aggregate neither engine has statistics for, upstream via
+      `cost_agg`'s `clauselist_selectivity(quals)` scaling of `output_tuples`,
+      goopg via the `*Filter` wrapper over the `*Aggregate`. **The HAVING
+      mechanism is already identical; the whole 3.39× gap is the group
+      estimate**, and goopg's ndistinct is the *more* accurate one (1 150 720
+      vs PG's 339 423 against a truth of 1 500 000 — PG is 4.4× LOW). Q18's
+      inner is bigger than PG's *because goopg's statistics are better*, so
+      closing the gap would mean degrading them: **closed with no estimator
+      change.** Q18's standing violation is inherent to pricing an aggregate
+      blind, shared with upstream.
+      **The measurement found a real defect elsewhere — in the instrument.**
+      goopg splits a qual from the rows it filters: the predicate rides a
+      `*Filter` wrapper that `walkPlanFiltered` collapses onto the child below
+      it, and the collapsed line printed `EstimateRows(child)` — the PRE-qual
+      count — beside a `Filter:` the estimator had already applied. Upstream
+      cannot have this gap (`set_baserel_size_estimates` stores `rel->rows`
+      post-`clauselist_selectivity`; `cost_agg` sets `path->rows` post-HAVING).
+      The estimator was always right — a *parent* reads `EstimateRows(*Filter)`
+      and sees the filtered count, which is why a `Gather` over a filtered scan
+      was correct while the scan under it was not. Fixed by rendering the
+      collapsed wrapper's own estimate: `lineitem` filtered scan
+      **5 997 241 → 1 689 312** (PG 1 673 754), `nation` 25 → 4 (PG 5), TPC-DS
+      `date_dim WHERE d_year = 2000` **73 049 → 365** (PG 365, one year of
+      days). This is P5.6-g-iii-class, not cosmetic: `estimateaudit` parses
+      that field (`nodeLineRe`) and §5.11's DS05 plans channel captures it, so
+      **every capture taken before this commit reports unfiltered sizes for
+      filtered relations** — including the row-count half of M0125-0026's
+      "`date_dim` is costed at 73 049" evidence (C2's qual-*placement* finding
+      stands; its row-count reading was a renderer artifact).
+      Bar met: UNITS green; audit **1 violation (Q18), unchanged** from the
+      p56gii baseline with every joinrel diff sub-1 % ANALYZE noise and none
+      worse; DS05 `plans` **95 of 99 changed, but with `rows=` normalised the
+      diff is 6 lines — a psql header width, nothing else**, i.e. zero
+      structural movement (the proof it cannot reach plan selection). 3
+      regression tests, each verified failing without the fix. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56gv-postfix.*`; doc 09 §5.13;
+      IMPLEMENTATION-TODO P5.6-g-v. 2 ledger rows. Successor:
+      **M0127-P5.6-g-vi** below.
+- [ ] **M0127-P5.6-g-vi — re-read the pre-fix plan-text conclusions.**
+      P5.6-g-v proved every plan capture before it under-reported filtered
+      relations at their unfiltered size, and the corpus captures committed
+      under `analysis/leftdeep-joins/` are the evidence base several closed
+      findings rest on. Re-read the ones whose reasoning quotes a *scan or
+      aggregate* row count from plan text — M0125-0026/M0125-0035 (C2) is the
+      known one, and its row-count claim is already known to be an artifact —
+      and record which conclusions survive on their own evidence and which
+      need re-deriving from a post-fix capture. Cheap: the `plans` channel is
+      a 20 s capture and the post-fix baseline already exists. This is
+      bookkeeping over a corrupted instrument, not new estimator work.
+      Bar: no code change expected; if one is implied, file it separately.
 - [x] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
       DONE 2026-08-05. `estimateaudit.Q21AntiJoinMax` (5 000×) beside Q9's bar,
       both now rendering their justification into the artifact instead of being

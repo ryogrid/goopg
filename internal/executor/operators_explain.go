@@ -349,34 +349,40 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, &subPlanReg{rel: newExplainNames(n)})
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
 // is a Filter.Predicate carried down from a Filter wrapper that
 // was skipped above us — it is rendered as `Filter:` detail under
-// the next scan-like node we render.
-func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, reg *subPlanReg) {
+// the next scan-like node we render. attachedFilterNode is that same
+// wrapper's plan node, carried so the collapsed line can report the
+// wrapper's POST-qual row estimate (see below).
+func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, attachedFilterNode planner.Node, reg *subPlanReg) {
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, reg)
+		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, attachedFilterNode, reg)
 		return
 	}
 	// Skip Filter wrappers and push their predicate down to be
 	// rendered as `Filter:` detail under the next scan node.
 	if f, ok := n.(*planner.Filter); ok {
 		next := f.Predicate
+		nextNode := planner.Node(f)
 		// If multiple Filter wrappers stack, render only the
 		// outermost predicate to keep the detail line readable.
 		// Inner Filter predicates collapse with the outer via
 		// short-circuit AND — but PG's Filter detail is a single
 		// expression line; chaining is uncommon so prefer the
-		// outermost predicate for v0.
+		// outermost predicate for v0. The outermost wrapper is also
+		// the right one to take rows from: its estimate already
+		// scales through every inner wrapper below it.
 		if attachedFilter != nil {
 			next = attachedFilter
+			nextNode = attachedFilterNode
 		}
-		walkPlanFiltered(f.Child, depth, rows, opts, next, reg)
+		walkPlanFiltered(f.Child, depth, rows, opts, next, nextNode, reg)
 		return
 	}
 
@@ -390,7 +396,32 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
 	showCosts := !opts.Set.Costs || opts.Costs
 	if showCosts {
-		est := planner.EstimateRows(n)
+		// The row count belongs to the qual that is rendered ON this line.
+		// When a `*Filter` wrapper was collapsed into us above, its
+		// predicate prints here as `Filter:`, so its POST-qual estimate is
+		// what this line must report — `EstimateRows(n)` is the child's
+		// PRE-qual count and understates nothing, it overstates by exactly
+		// the filter's selectivity.
+		//
+		// Upstream never has this gap because the qual and the rowcount
+		// live on one struct: `set_baserel_size_estimates` (costsize.c)
+		// stores `rel->rows` already multiplied by
+		// `clauselist_selectivity(baserestrictinfo)`, and `cost_agg`
+		// likewise sets `path->rows` only after scaling `output_tuples` by
+		// the HAVING quals' selectivity. goopg splits the two across a
+		// wrapper node, so the renderer has to put them back together.
+		//
+		// goopg's ESTIMATOR was always right here — a parent node reads
+		// `EstimateRows(*Filter)` and sees the filtered count. Only the
+		// collapsed line lied, which made EXPLAIN (the acceptance
+		// instrument for the DS05 `plans` channel and estimate-audit)
+		// disagree with PG by one selectivity factor on every filtered
+		// scan and every HAVING.
+		rowSrc := n
+		if attachedFilterNode != nil {
+			rowSrc = attachedFilterNode
+		}
+		est := planner.EstimateRows(rowSrc)
 		if est <= 0 {
 			est = 1
 		}
@@ -422,12 +453,12 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub planner.Node, subDepth int) {
-		walkPlanFiltered(sub, subDepth, rows, opts, nil, reg)
+		walkPlanFiltered(sub, subDepth, rows, opts, nil, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
-		walkPlanFiltered(c, depth+1, rows, opts, nil, reg)
+		walkPlanFiltered(c, depth+1, rows, opts, nil, nil, reg)
 	}
 }
 

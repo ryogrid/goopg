@@ -1012,6 +1012,39 @@
   (violations 2 → 1, no joinrel worse). Evidence
   `analysis/leftdeep-joins/2026-08-05-p56gii-*`;
   [09](09-verification-and-acceptance.md) §5.12. 3 ledger rows.
+- [x] **P5.6-g-v** Q18's residual, which is NOT a HAVING problem.
+  **DONE 2026-08-05** — the prescribed `EXPLAIN` settled it: PG 339 423 →
+  **113 141** and goopg 1 150 720 → **383 573** are both exactly ÷3, i.e.
+  DEFAULT_INEQ_SEL over an aggregate neither engine has statistics for
+  (upstream via `cost_agg`'s `clauselist_selectivity(quals)` scaling of
+  `output_tuples`, goopg via the `*Filter` over the `*Aggregate`). **The
+  HAVING mechanism is already identical; the whole 3.39× gap is the group
+  estimate, and goopg's ndistinct is the MORE accurate one** (1 150 720 vs
+  339 423, truth 1 500 000 — PG is 4.4× low). Closing the gap would mean
+  degrading goopg's statistics, so the item **closes with no estimator
+  change**; Q18's violation is inherent to pricing an aggregate blind and is
+  shared with upstream.
+  **What the measurement found instead — an instrument defect.** goopg splits
+  a qual from the rows it filters: the predicate rides a `*Filter` wrapper
+  that `walkPlanFiltered` collapses onto the child below it, and the collapsed
+  line printed `EstimateRows(child)`, the PRE-qual count, beside a `Filter:`
+  the estimator had already applied. Upstream cannot have this gap — the qual
+  and the rowcount share one struct. The estimator was always right (a
+  *parent* reads `EstimateRows(*Filter)`, which is why a `Gather` over a
+  filtered scan was correct while the scan under it was not); only the
+  rendered line lied, by exactly the selectivity. Filtered `lineitem` scan
+  **5 997 241 → 1 689 312** (PG 1 673 754), `nation` 25 → 4 (PG 5), TPC-DS
+  `date_dim WHERE d_year = 2000` **73 049 → 365** (PG 365). P5.6-g-iii-class:
+  `estimateaudit` parses that field and §5.11's plans channel captures it, so
+  every pre-fix capture reports filtered relations at unfiltered size.
+  Bar met: UNITS + audit (**1 violation, Q18, unchanged**; all joinrel diffs
+  sub-1 % ANALYZE noise, none worse) + DS05 `plans` (**95 of 99 changed, but
+  with `rows=` normalised the diff is 6 lines — a psql header width — i.e.
+  zero structural movement**). 3 regression tests, each verified failing
+  without the fix. Evidence
+  `analysis/leftdeep-joins/2026-08-05-p56gv-postfix.*`;
+  [09](09-verification-and-acceptance.md) §5.13. 2 ledger rows.
+  Successor **P5.6-g-vi** (re-read pre-fix plan-text conclusions).
 - [x] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
   equally wrong there, by design), and §4's ratchet restated as per-joinrel
   parity against the PG 18.3 reference rather than an absolute factor — PG
