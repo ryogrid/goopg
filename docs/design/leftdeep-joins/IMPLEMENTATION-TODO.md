@@ -627,14 +627,62 @@
   nulls-first result pathkey; a non-ascending or nulls-first absorbed sort key.
   Still inert. 4 new tests (`createplanjoin_test.go`) + 1 strengthened
   (`createplansimple_test.go`). 2 ledger rows. Bar met: UNITS + SPOT.)*
-- [ ] **P5.5-e-ii-b** `create_nestloop_plan` (createplan.c:4322) — the
-  nested-loop arms (`PathNestLoop` plain and NLI). Reuses P5.5-e-ii-a's
-  `joinInputsFor` / `keyPairs` / `joinPredicate` whole; what is its own is the
-  parameter-binding contract with a parameterised inner index path —
-  `*NestedLoopIndexJoin` plus the P5.4b-ii-b-2 Memoize/binding contract, and the
-  residual DROP via `indexPathClause.ri` / `ecID` that the P5.5-c ledger row is
-  waiting on (a clause the inner probe already enforces must not be re-evaluated
-  as a join qual, or its selectivity is double-counted above).
+- [x] **P5.5-e-ii-b** `create_nestloop_plan` (createplan.c:4322) — the
+  nested-loop arms (`PathNestLoop` plain and NLI). *(DONE 2026-08-04,
+  `internal/planner/createplannl.go` (new) + `createplan.go`,
+  `createplanindex.go`, `pathparamindex.go`, `joinpathsnli.go`. The prologue is
+  P5.5-e-ii-a's, reused verbatim; three things are this arm's own.*
+  *(1) **One path kind, two executor nodes.** `PathNestLoop` is produced by
+  `addNestLoopPath` (plain — keys on nothing, every clause residual) and by
+  `addNLIPaths` (the inner is a parameterised index path). goopg's nodes for
+  those are `*Join{JoinAlgoNestedLoop}` and `*NestedLoopIndexJoin`, which is a
+  different TYPE, not a flag — its `Inner` is a `*IndexScan` because the driver
+  calls `Rescan` on it. The arm dispatches on the INNER CHILD's
+  `RequiredOuter`, the same fact PG dispatches on when it emits `NestLoopParam`,
+  and it is read off the child rather than carried as a second field that could
+  disagree with it.*
+  *(2) **The parameter-binding contract is TWO coordinate spaces, not one** —
+  the finding that makes this arm different from hash and merge, where every
+  expression lives on the merged row. `indexScanOp.Rescan` (operators_index.go:345)
+  evaluates `IndexScan.Key`/`Keys` against the slot the parent bound
+  (`nestedLoopIndexJoinOp.outerMS`), which holds the OUTER ROW ALONE — the inner
+  row does not exist yet, producing it is what the probe is for. So the probe
+  keys are re-based onto the outer layout (the prefix of the merged one, taken
+  rather than re-derived so the two maps cannot disagree) while the residual
+  `Predicate` is re-based onto the merged layout, which is what the operator's
+  `virtualOut` spans. On a two-relation query with the outer first in binding
+  order the two spaces COINCIDE, so a single-space arm passes every small test
+  and reads the wrong column the moment the search reorders the join;
+  `createplannl_test.go` puts the outer second for exactly that reason. No key
+  conjuncts are folded into the NLI predicate — unlike a hash bucket, an index
+  probe enforces its keys exactly.*
+  *(3) **goopg's residual DROP must be NARROWER than PG's, and the old one was
+  a wrong answer.** `create_nestloop_path` (pathnode.c:2478-2500) drops every
+  clause movable into the parameterised inner, because a PG parameterised path
+  really does apply them all: movability builds `ppi_clauses`, the index
+  consumes what it can, and `create_indexscan_plan` puts the remainder in the
+  scan's `qpqual`. goopg's parameterised index path carries only the equalities
+  in `Path.IndexClauses`, and goopg's `*IndexScan` has NO qual field — so
+  `b.y > a.x` at inner `{b}` under parameterisation `{a}` was movable, dropped
+  from the join residual, and enforced by nothing. `nestloopResidualClauses` now
+  drops only clauses the probe demonstrably enforces (`probeEnforcedClauses`,
+  by `restrictInfo` identity — the same list `createPlan` turns into
+  `IndexScan.Keys`, so one definition serves costing and building). The EC half
+  of `is_redundant_with_indexclauses` is deliberately not reproduced:
+  `selectivityClauses` already reduced each class to one member, and the
+  asymmetry decides the residue (keeping a redundant qual costs an evaluation,
+  dropping a live one deletes a restriction).*
+  *Also: `addParameterizedIndexPaths` now declines a leaf with `*Filter`
+  wrappers (`scanLeafIsBare`), because `NestedLoopIndexJoin.Inner` cannot carry
+  them and hoisting them onto the residual is the D6.3b Q9 blowup — the same
+  producer/consumer agreement P5.5-c established for non-scan leaves. Memoize
+  stays nil: there is no `PathMemoize`, so inserting one here would be an
+  uncosted opinion. Panics: ≠2 children; hash keys on a nested loop; a
+  parameterised result; a parameterised non-index inner; an outer that does not
+  supply the inner's parameterisation; lost index-column order; a probe with no
+  key; a wrapped inner leaf. Still inert. 6 new tests
+  (`createplannl_test.go`) + 1 rewritten (`joinpathsnli_test.go`). 3 ledger
+  rows. Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

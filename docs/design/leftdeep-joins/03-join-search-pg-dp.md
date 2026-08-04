@@ -494,6 +494,58 @@ construct outside the search, so `addPathsToJoinrel` carries no jointype to
 switch on. Both are ledgered rather than written as dead branches over a value
 that does not exist. Still inert — `GOOPG_PGSHAPED_DP` is OFF.
 
+**Status (P5.5-e-ii-b, 2026-08-04) — `create_nestloop_plan`: the arm that
+writes into TWO coordinate spaces, and the residual drop that was deleting a
+restriction.** `createNestLoopPlan` (`internal/planner/createplannl.go`) closes
+the join arms. One path kind, `PathNestLoop`, is produced by two different arms
+and emits two different executor nodes: `addNestLoopPath`'s plain loop becomes a
+`*Join{JoinAlgoNestedLoop}`, and `addNLIPaths`' parameterised-inner pair becomes
+a `*NestedLoopIndexJoin` — a different TYPE, not a flag, because its `Inner`
+field is a `*IndexScan` the join driver calls `Rescan` on. The arm dispatches on
+the inner child's `RequiredOuter`, which is the same fact PG dispatches on when
+it decides to emit `NestLoopParam` entries.
+
+The finding is that **an NLI is the first node in this seam whose expressions do
+not all live in one coordinate space.** Every `*Join` predicate — hash, merge,
+plain nested loop — is evaluated once per candidate pair against the merged
+`outer ++ inner` row, so `joinInputs.index` re-bases all of it. An NLI's probe
+key is not evaluated there: `indexScanOp.Rescan`
+(`internal/executor/operators_index.go:345`) evaluates `IndexScan.Key`/`Keys`
+against the slot the parent bound (`nestedLoopIndexJoinOp.outerMS`), which holds
+the OUTER row alone — the inner row does not exist yet, and producing it is what
+the probe is for. So the arm translates the probe keys onto the outer layout and
+the residual onto the merged layout, and the outer layout is taken as the PREFIX
+of the merged one rather than re-derived, so the two maps cannot disagree with
+the schema that was actually concatenated. This is worth stating because on a
+two-relation query whose outer happens to be first in binding order the two
+spaces COINCIDE: a single-space arm builds a runnable node, passes every small
+test, and probes the wrong column the first time the search reorders the join.
+
+The second finding is a correctness defect this arm made visible in the
+PRODUCER. `create_nestloop_path` (pathnode.c:2478-2500) drops from the join's
+restrict clauses every clause movable into the parameterised inner, and
+`nestloopResidualClauses` reproduced that test. PG may drop on movability alone
+because a PG parameterised path applies every movable clause — movability is
+what builds `ppi_clauses`, the index consumes what it can, and
+`create_indexscan_plan` places the remainder in the scan's `qpqual`. goopg's
+parameterised index path applies only the equalities in `Path.IndexClauses`, and
+goopg's `*IndexScan` has no qual field for a remainder to live in. `b.y > a.x`
+at inner `{b}` under parameterisation `{a}` was therefore movable, dropped from
+the join residual, and enforced by nothing at all. The drop is now narrowed to
+the clauses the probe demonstrably enforces (`probeEnforcedClauses`, matched by
+`restrictInfo` identity against the same list `createPlan` turns into
+`IndexScan.Keys`), with movability kept as the frame it is checked inside.
+
+Two narrowings are ledgered rather than written. `addParameterizedIndexPaths`
+now declines a leaf carrying `*Filter` wrappers (`scanLeafIsBare`), because
+`NestedLoopIndexJoin.Inner` cannot carry them and hoisting them onto the join
+residual is the D6.3b Q9 blowup — the same producer/consumer agreement §5.2's
+`scanLeafFor` gate established for non-scan leaves, and it costs goopg every
+searched NLI over a filtered leaf. And `InnerMemo` stays nil: Memoize is
+`get_memoize_path`'s cost decision and there is no `PathMemoize`, so inserting
+one here would be exactly the uncosted opinion 06 §2.1 retires. Still inert —
+`GOOPG_PGSHAPED_DP` is OFF.
+
 ### 5.4 Qual placement
 Every clause attaches at the lowest level whose relids it covers — decided
 once, in path generation. The post-hoc placement passes

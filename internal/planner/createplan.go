@@ -78,10 +78,17 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		// `PathSort` children goopg's merge operator makes redundant.
 		// createplanjoin.go.
 		return createMergeJoinPlan(p)
+	case PathNestLoop:
+		// The third join arm (M0127-P5.5-e-ii-b), and the only one that BINDS a
+		// parameter: it emits a plain `*Join` or a `*NestedLoopIndexJoin`
+		// depending on whether the inner child is parameterised, and the two
+		// shapes translate their expressions onto DIFFERENT layouts — the probe
+		// keys onto the outer alone, the residual onto the merged row.
+		// createplannl.go.
+		return createNestLoopPlan(p)
 	default:
-		// PathNestLoop / PathMultiHash / … do not have arms yet (the nested
-		// loops are P5.5-e-ii-b). Reaching here means a phase constructed a
-		// path kind without teaching createPlan to translate it.
+		// PathMultiHash / … do not have arms yet. Reaching here means a phase
+		// constructed a path kind without teaching createPlan to translate it.
 		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (P5.5)", p.Kind))
 	}
 }

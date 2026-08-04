@@ -6880,15 +6880,38 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       through the same `translateToLayout` (rule #2). 2 ledger rows. Still inert
       (`GOOPG_PGSHAPED_DP` OFF). 4 new tests + 1 strengthened. Bar met: UNITS +
       SPOT.
-- [ ] **M0127-P5.5-e-ii-b — `create_nestloop_plan`: the nested-loop arms.**
-      Reuses P5.5-e-ii-a's `joinInputsFor`/`keyPairs`/`joinPredicate` whole;
-      what is its own is the parameter-binding contract with a parameterised
-      inner index path (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2
-      Memoize/binding contract, and the residual DROP via
-      `indexPathClause.ri`/`ecID` that the P5.5-c ledger row waits on — a clause
-      the inner probe already enforces must not be re-evaluated as a join qual,
-      or its selectivity is double-counted above). IMPLEMENTATION-TODO
-      P5.5-e-ii-b; 03 §5.2, §5.4. Bar: UNITS + SPOT.
+- [x] **M0127-P5.5-e-ii-b — `create_nestloop_plan`: the nested-loop arms.**
+      DONE 2026-08-04 (`internal/planner/createplannl.go` new, +
+      `createplan.go`, `createplanindex.go`, `pathparamindex.go`,
+      `joinpathsnli.go`). One path kind, TWO executor nodes: the arm dispatches
+      on the INNER CHILD's `RequiredOuter` (the same fact PG dispatches on when
+      it emits `NestLoopParam`), so `addNestLoopPath`'s plain loop becomes a
+      `*Join{JoinAlgoNestedLoop}` and `addNLIPaths`' pair becomes a
+      `*NestedLoopIndexJoin` — a different TYPE, not a flag, because its `Inner`
+      is a `*IndexScan` the driver calls `Rescan` on. **The finding: an NLI is
+      the first node here whose expressions live in TWO coordinate spaces.**
+      `indexScanOp.Rescan` evaluates the probe keys against the slot the parent
+      bound — the OUTER row alone, since the inner row does not exist yet — while
+      the residual is evaluated through `virtualOut` over `outer ++ inner`. So
+      the keys are re-based onto the outer layout (taken as the PREFIX of the
+      merged one, not re-derived) and the residual onto the merged one. On a
+      two-rel query with the outer first in binding order the two spaces
+      coincide, so a single-space arm builds a runnable node and probes the
+      wrong column the moment the search reorders the join — the tests put the
+      outer second for exactly that reason. **Second finding, a live defect in
+      the producer:** `nestloopResidualClauses` reproduced PG's movability drop,
+      but PG may drop on movability alone only because `ppi_clauses` +
+      `qpqual` really do apply every movable clause down there. goopg's
+      parameterised inner applies only `Path.IndexClauses` and its `*IndexScan`
+      has no qual field, so `b.y > a.x` was dropped from the join residual and
+      enforced by NOTHING. Narrowed to `probeEnforcedClauses` (by `restrictInfo`
+      identity, against the same list `createPlan` turns into `IndexScan.Keys`);
+      the EC half is not reproduced because `selectivityClauses` already reduced
+      each class to one member. Also: `addParameterizedIndexPaths` now declines
+      a `*Filter`-wrapped leaf (`scanLeafIsBare`) — `NestedLoopIndexJoin.Inner`
+      cannot carry it and hoisting is the D6.3b Q9 blowup. 3 ledger rows. Still
+      inert (`GOOPG_PGSHAPED_DP` OFF). 6 new tests + 1 rewritten. Bar met:
+      UNITS + SPOT.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

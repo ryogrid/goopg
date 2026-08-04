@@ -102,19 +102,67 @@ func joinClauseIsMovableInto(ri *restrictInfo, currentRelids, currentAndOuter Re
 //
 // `innerAndOuter` is PG's `bms_union(inner_path->parent->relids,
 // inner_req_outer)` — what the parameterised inner scan can see.
-func nestloopResidualClauses(clauses []*restrictInfo, innerRelids, innerParam RelSet) []*restrictInfo {
+//
+// # goopg drops a NARROWER set than PG, and the difference is a wrong answer
+//
+// (M0127-P5.5-e-ii-b.) PG may drop on movability ALONE because a PG
+// parameterised path really does apply every movable clause: movability is what
+// `get_baserel_parampathinfo` (relnode.c:1580) uses to build `ppi_clauses`, the
+// index consumes what it can, and `create_indexscan_plan` places the remainder
+// into the scan's `qpqual` (createplan.c:3075's `is_redundant_with_indexclauses`
+// is the filter for that split). Every dropped clause is therefore enforced
+// somewhere below.
+//
+// goopg's parameterised index path applies only the equalities
+// `pickIndexCoveringAllLeadingColumns` accepted — `Path.IndexClauses`
+// (pathindexclauses.go) — and goopg's `*IndexScan` has NO qual field for a
+// remainder to live in. `b.y > a.x` at inner `{b}` under parameterisation `{a}`
+// is movable by the test above and enforced by nothing at all: dropping it here
+// deletes the restriction from the plan. So the drop is narrowed to the clauses
+// the probe demonstrably enforces, and movability survives as the frame it is
+// checked inside rather than as the whole test.
+//
+// Matching is by `restrictInfo` IDENTITY. PG's redundancy test also matches a
+// clause DERIVED from the same equivalence class, and that half is deliberately
+// not reproduced: `selectivityClauses` (joinrestrict.go:319-348) has already
+// reduced each equivalence class to one member before this list is built, so
+// there is no same-EC sibling left to match — and were one to appear, keeping it
+// costs a redundant qual evaluation while dropping it would lose a restriction.
+// The asymmetry decides it. Ledgered.
+func nestloopResidualClauses(clauses []*restrictInfo, innerPath *Path, innerRelids, innerParam RelSet) []*restrictInfo {
 	innerAndOuter := innerRelids | innerParam
+	enforced := probeEnforcedClauses(innerPath)
 	var residual []*restrictInfo
 	for _, ri := range clauses {
 		if ri == nil {
 			continue
 		}
-		if joinClauseIsMovableInto(ri, innerRelids, innerAndOuter) {
+		if joinClauseIsMovableInto(ri, innerRelids, innerAndOuter) && enforced[ri] {
 			continue
 		}
 		residual = append(residual, ri)
 	}
 	return residual
+}
+
+// probeEnforcedClauses is `is_redundant_with_indexclauses` (createplan.c:3075)
+// as a set: the clauses this path's index probe applies itself.
+//
+// It reads `Path.IndexClauses`, which is exactly the list `createPlan`'s NLI arm
+// turns into `IndexScan.Keys` — so "what the probe enforces" has ONE definition
+// shared by the costing side and the building side, rather than two that could
+// drift into a clause charged twice or enforced never (rule #2).
+func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
+	if p == nil || len(p.IndexClauses) == 0 {
+		return nil
+	}
+	enforced := make(map[*restrictInfo]bool, len(p.IndexClauses))
+	for _, c := range p.IndexClauses {
+		if c.ri != nil {
+			enforced[c.ri] = true
+		}
+	}
+	return enforced
 }
 
 // addNLIPaths is the NLI arm: for the cheapest-total outer, every
@@ -177,7 +225,7 @@ func addNLIPaths(joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*re
 		if req != 0 {
 			continue
 		}
-		residual := nestloopResidualClauses(clauses, inner.Relids, i.RequiredOuter)
+		residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
 		// `i.Cost` prices ONE execution with the parameter bound and `i.Rows`
 		// is its `ppi_rows` (03 §9 rule 3), so the inner's own total IS the
 		// per-outer-row rescan cost — PG's `cost_rescan` default for an index

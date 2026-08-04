@@ -24,13 +24,27 @@ import (
 // expensive unparameterised seq scan (what a plain nested loop would rescan)
 // and a cheap parameterised index path (what the NLI arm probes).
 func nliInnerRel(relids RelSet, rows float64, param RelSet, probeCost float64) *RelOptInfo {
+	return nliInnerRelBinding(relids, rows, param, probeCost)
+}
+
+// nliInnerRelBinding is nliInnerRel with the clauses the probe ENFORCES named
+// (M0127-P5.5-e-ii-b). The real producer records them in `Path.IndexClauses`,
+// and `nestloopResidualClauses` now drops only those — so a helper that left the
+// list empty would model a probe that enforces nothing, which is a different
+// path from the one under test.
+func nliInnerRelBinding(relids RelSet, rows float64, param RelSet, probeCost float64, enforced ...*restrictInfo) *RelOptInfo {
 	rel := newRelOptInfo(relids, rows, 32)
 	generateScanPaths(rel, defaultCostParams(), estScanPages(rows, 32), 0, 0, true)
+	cls := make([]indexPathClause, 0, len(enforced))
+	for i, ri := range enforced {
+		cls = append(cls, indexPathClause{ri: ri, indexCol: i, key: &ColumnRef{Index: 0}})
+	}
 	addPath(rel, &Path{
 		Kind:          PathIndexScan,
 		Rel:           rel,
 		Rows:          1,
 		Cost:          Cost{Total: probeCost},
+		IndexClauses:  cls,
 		RequiredOuter: param,
 	})
 	setCheapest(rel)
@@ -204,6 +218,10 @@ func TestNLIArmAdmission(t *testing.T) {
 // the inner is being enforced down there as an index qual; carrying it at the
 // join too would charge `cost_qual_eval` for it on the full cross product,
 // which is precisely the charge that would keep the NLI from winning.
+//
+// M0127-P5.5-e-ii-b narrowed the drop from "movable" to "movable AND actually
+// in the probe's `IndexClauses`", because goopg's parameterised inner enforces
+// nothing else — see `nestloopResidualClauses`' doc.
 func TestNLIArmDropsClausesMovableIntoTheInner(t *testing.T) {
 	cp := defaultCostParams()
 	a, b, c := relsetOf(0), relsetOf(1), relsetOf(2)
@@ -212,21 +230,32 @@ func TestNLIArmDropsClausesMovableIntoTheInner(t *testing.T) {
 	local := plainClause(b)         // a qual on the inner alone
 	elsewhere := plainClause(b | c) // references a rel the inner cannot see
 
-	got := nestloopResidualClauses([]*restrictInfo{bound, local, elsewhere}, b, a)
-	if len(got) != 1 || got[0] != elsewhere {
-		t.Fatalf("residual = %d clauses, want only the one referencing {c}", len(got))
+	probe := &Path{IndexClauses: []indexPathClause{{ri: bound, key: &ColumnRef{}}}}
+	got := nestloopResidualClauses([]*restrictInfo{bound, local, elsewhere}, probe, b, a)
+	// `local` SURVIVES: it is movable, but goopg's `*IndexScan` has no qual
+	// field and `addParameterizedIndexPaths` only builds over a leaf with no
+	// `*Filter` above it, so nothing below this join applies it. PG would drop
+	// it (its scan's qpqual would carry it); goopg dropping it would delete the
+	// restriction from the plan.
+	if len(got) != 2 || got[0] != local || got[1] != elsewhere {
+		t.Fatalf("residual = %d clauses, want the inner-local one and the {c} one", len(got))
 	}
 
 	// And the same list at a plain nested loop, where the inner is
-	// unparameterised: nothing has been pushed down, so nothing is dropped
-	// except what the inner could already see on its own.
-	if got := nestloopResidualClauses([]*restrictInfo{bound}, b, 0); len(got) != 1 {
+	// unparameterised: nothing has been pushed down, so nothing is dropped.
+	if got := nestloopResidualClauses([]*restrictInfo{bound}, nil, b, 0); len(got) != 1 {
 		t.Fatal("an unparameterised inner cannot enforce a two-rel clause, so it must stay residual")
+	}
+
+	// A probe that enforces NOTHING drops nothing, even though the clause is
+	// movable — the whole point of the narrowing.
+	if got := nestloopResidualClauses([]*restrictInfo{bound}, &Path{}, b, a); len(got) != 1 {
+		t.Fatal("a probe with no index clauses enforces nothing, so a movable clause must stay residual")
 	}
 
 	// The cost consequence, measured rather than asserted by inspection.
 	outer := scanRel(a, 100, estScanPages(100, 32))
-	inner := nliInnerRel(b, 1000, a, indexProbeCost(cp))
+	inner := nliInnerRelBinding(b, 1000, a, indexProbeCost(cp), bound)
 	withDrop := newRelOptInfo(a|b, 100, 64)
 	if err := addPathsToJoinrel(withDrop, outer, inner, []*restrictInfo{bound}, cp); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)

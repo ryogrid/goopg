@@ -165,6 +165,32 @@ func scanLeafFor(leaf Node) (*scanIdentity, scanLeafRewrap, bool) {
 	return id, rewrap, true
 }
 
+// scanLeafIsBare reports whether `leaf` is a base scan with NOTHING above it —
+// no `*Filter` wrappers, so `scanLeafFor`'s rewrapper is the identity.
+//
+// It exists for the one consumer that cannot carry the wrappers
+// (M0127-P5.5-e-ii-b): `NestedLoopIndexJoin.Inner` is typed `*IndexScan`, not
+// `Node`, because the join driver calls `Rescan` on it directly. A leaf with
+// local quals therefore has nowhere to put them, and hoisting them onto the
+// join's residual is the D6.3b blowup (`innerUnwrapCostAccepts`,
+// nl_index_join.go:345-380) — a qual the path was costed as applying once per
+// inner row, re-evaluated once per probed pair instead.
+//
+// Like `scanLeafFor` itself this is applied at the PRODUCER
+// (`addParameterizedIndexPaths`) as well as at the consumer, so the DP never
+// prices a parameterised path the NLI arm would then refuse (rule #2). It is
+// phrased as "the rewrapper is the identity" rather than as a second walk of the
+// wrapper chain for the same reason: a second walk is a second statement of the
+// same fact, and a later edit could contradict it.
+func scanLeafIsBare(leaf Node) bool {
+	_, rewrap, ok := scanLeafFor(leaf)
+	if !ok {
+		return false
+	}
+	probe := &SeqScan{}
+	return rewrap(probe) == Node(probe)
+}
+
 // scanIdentityOf reads the copied-forward state off a base scan node, or nil
 // when the node is not one.
 func scanIdentityOf(n Node) *scanIdentity {

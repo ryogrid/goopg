@@ -235,6 +235,19 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
+		// And the NLI arm's stricter half (M0127-P5.5-e-ii-b): the ONLY consumer
+		// of a parameterised index path is `createNestLoopIndexJoinPlan`, whose
+		// `NestedLoopIndexJoin.Inner` is typed `*IndexScan` and so cannot carry
+		// the `*Filter` wrappers a leaf's local quals live in. Costing a path
+		// here whose only consumer must refuse it would let the DP choose a plan
+		// the builder cannot honour — and the two alternatives are both worse
+		// than declining: dropping the wrappers loses the quals outright (a wrong
+		// answer), and hoisting them onto the join residual is the D6.3b Q9
+		// blowup. Ledgered: this costs goopg every NLI over a filtered leaf,
+		// which the legacy `tryBuildNLI` still serves.
+		if !scanLeafIsBare(rel.baseLeaf) {
+			continue
+		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
 		if len(cands) == 0 {
 			continue
