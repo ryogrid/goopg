@@ -933,6 +933,32 @@
   runtime regressions, stream 546.8 s → 445.1 s (0.81×). Two ledger rows
   (uncovered-edge selectivity; the coordinate space fixed at the reader, not
   the writer). PLAN re-pinned to `plan_snapshots/m0127-p56fii.txt`.
+- [x] **P5.6-f-iii** the DS05 gate's single TIMEOUT "hopped" Q72 → Q47.
+  **DONE 2026-08-05 (09 §5.15) — the sweep-tail-confound reading is REFUTED;
+  the TIMEOUT was MOVED by `ce027cee` (P5.6-f) itself.** Answered without the
+  three ~1 h sweeps the item asked for: an eight-sweep/four-sweep step function
+  (±3 s within regime, not noise); the confound is structurally unable to reach
+  Q47, which runs at position 47 BEFORE Q72 and is itself the first timeout in
+  the new regime, and a fresher post-restart server cannot explain Q57 getting
+  5× SLOWER; solo quiet-host runs at `TIMEOUT_SEC=900` giving **Q47 523 s** and
+  Q57 81 s outside any sweep tail where the hypothesis predicted ≈31 s; and a
+  bisect against a 2.3 G COPY of the cluster (live dir never at risk) giving
+  `30293f78` 31 s, `29daeb72` 30 s with a byte-identical plan, HEAD 523 s —
+  the old binary on TODAY's data is fast, exonerating the cluster data too.
+  `29daeb72..ce027cee` is one commit; the boundary sweep only *looks* like
+  `29daeb72` because its header says `[tree DIRTY in Go sources]` /
+  `diff=129e691bd41a` (that binary was `29daeb72` + uncommitted P5.6-f WIP).
+  Mechanism: P5.6-f folds EVERY equi-pair under **independence**
+  (`cardinality.go:457-483`), and Q47's outermost join has five, two of them
+  strongly correlated (`i_category`↔`i_brand`,
+  `s_store_name`↔`s_company_name`), so it degrades from a 5-pair `Hash Join`
+  to a `Nested Loop` with no join condition. **P5.6-f stays** — net win
+  (+Q72 timeout→166 s, +Q53 28→6 s, +Q9), correctness never moved. Successors
+  **P5.6-f-iv** (the functional-dependency arm: PG's `clauselist_selectivity` /
+  `dependencies.c`, which goopg lacks — it landed only the FK arm) and
+  **P5.6-f-v** (the sweep must diff the TIMEOUT SET, not its cardinality:
+  `TIMEOUT=1` stayed byte-identical across a 17× re-pricing for four sweeps).
+  `analysis/m0127-p56fiii/README.md`; 1 ledger row.
 - [x] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor.
   **DONE 2026-08-05** — both arms landed verbatim from selfuncs.c (matched-MCV
   mass exact, nd heuristic on the discounted remainder only, `CLAMP_PROBABILITY`,

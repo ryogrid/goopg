@@ -7347,7 +7347,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       re-pinned to `plan_snapshots/m0127-p56fii.txt`, then 22/22 MATCH) + the
       audit run. **P5.9 can now certify Q9's ≤10² runtime bar as well as its
       cardinality.**
-- [ ] **M0127-P5.6-f-iii — the TPC-DS SF0.5 gate's single TIMEOUT hopped
+- [x] **M0127-P5.6-f-iii — the TPC-DS SF0.5 gate's single TIMEOUT hopped
       from Q72 to Q47 (2026-08-04), unattributed.** The sweep's summary line
       is identical to the three before it (PASS=94, MISMATCH=0, CKMISMATCH=0,
       ERROR=0, TIMEOUT=1, SKIP=4) — correctness did not move — but Q47 went
@@ -7362,6 +7362,69 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       construction. Resume: run the sweep twice at this commit and once at
       `HEAD~1` and see whether the TIMEOUT hops without a code change.
       Ledger row dated 2026-08-04.
+      **↳ ANSWERED 2026-08-05 — the confound hypothesis is REFUTED and the
+      filed "checked, not assumed" paragraph above is WRONG on its own terms.**
+      The TIMEOUT does not hop without a code change: it was moved by
+      **`ce027cee` (P5.6-f)**. Answered without the three ~1 h sweeps the
+      resume point asked for. (1) *Step function, not noise*: eight consecutive
+      sweeps hold the old regime, four hold the new, spread ±3 s. (2) *The
+      confound cannot reach Q47*: it runs at position 47, BEFORE Q72 — in the
+      old regime no timeout had yet occurred, in the new one Q47 is itself the
+      first — and a fresher post-restart server cannot explain Q57 getting 5×
+      SLOWER. (3) *Solo, quiet host, `TIMEOUT_SEC=900`*: **Q47 523 s**, Q57
+      81 s, both reproducing the new regime outside any sweep tail (the
+      hypothesis predicted ≈31 s). (4) *Bisect on a 2.3 G COPY of the cluster*
+      so the live dir was never at risk: `30293f78` 31 s, `29daeb72` 30 s with
+      a **byte-identical plan**, HEAD 523 s — and the old binary on TODAY's
+      data is fast, exonerating the cluster data too. `29daeb72..ce027cee` is
+      exactly one commit. The boundary sweep is labelled `29daeb72` only
+      because its header says `[tree DIRTY in Go sources]` / `diff=129e691bd41a`
+      — that binary was `29daeb72` + uncommitted P5.6-f WIP. **Read the `diff=`
+      field before the commit subject when attributing a sweep.**
+      **Mechanism**: Q47's outermost join has FIVE equi-pairs; P5.6-f folds
+      every pair under independence (`cardinality.go:457-483`,
+      `sel /= pairNDistinct` multiplied across pairs), two of them strongly
+      correlated (`i_category`↔`i_brand`, `s_store_name`↔`s_company_name`), so
+      the joinrel collapses and the plan degrades from a 5-pair **Hash Join**
+      to a **Nested Loop with no join condition**. The filed claim that this
+      join "lands on the same `defaultEqSelectivity` fallback as before" is
+      exactly what the plan diff disproves. **P5.6-f stays** — net win (+Q72
+      timeout→166 s, +Q53 28→6 s, +Q9's exact joinrel), correctness never moved
+      (`PASS=94 MISMATCH=0 CKMISMATCH=0`, Q47 returns its 100 oracle rows in
+      every regime); what it lacks is PG's correlation defence. Successor
+      **M0127-P5.6-f-iv**. `analysis/m0127-p56fiii/README.md`; 09 §5.15;
+      1 ledger row dated 2026-08-05.
+- [ ] **M0127-P5.6-f-iv — the functional-dependency arm P5.6-f left out.**
+      P5.6-f prices every equi-pair under **independence**, which is right for
+      independent pairs (Q9, Q72, Q53 all improved) and badly wrong for
+      correlated ones (Q47 31 s → 523 s, Q57 15 s → 81 s; §5.15). PG does not
+      multiply blind: `clauselist_selectivity`
+      (`postgres/src/backend/optimizer/path/clausesel.c`) consults extended
+      statistics first — `dependencies_clauselist_selectivity` /
+      `statext_clauselist_selectivity`
+      (`postgres/src/backend/statistics/dependencies.c`, `extended_stats.c`) —
+      and `get_foreign_key_join_selectivity` (`costsize.c:5651`) short-circuits
+      the collapse when the pairs are an FK's columns. goopg landed the FK arm
+      in P5.6-f; the **functional-dependency arm is missing**, so a correlated
+      NON-FK composite still multiplies out. Resume:
+      `internal/planner/cardinality.go:465-483` — before dividing by each
+      pair's ndistinct, damp pairs whose columns are functionally dependent
+      (PG's `dependencies.c` degree, or as a first cut the
+      `min(nd)`-dominates-the-product rule the superkey path already models in
+      `superkeyJoinEstimate`). Acceptance: Q47 back under the DS05 cap WITHOUT
+      losing P5.6-f's Q9/Q72/Q53 wins, verified as a named-victim TIMEOUT-set
+      diff, not a `TIMEOUT=` count. Bar: UNITS + DS05 + the estimate audit.
+- [ ] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
+      cardinality.** §5.15's regression survived four sweeps because
+      `TIMEOUT=1` is invariant to WHICH query timed out; the summary line was
+      byte-identical across a 17× re-pricing. P5.6-g-i-b gave the gate a
+      plan-shape channel, which covers plan drift but is non-blocking and was
+      not read per-query either. Resume:
+      `scripts/tpcds-sf05-regression.sh` — record the per-query status/runtime
+      vector against the previous report and print a NAMED delta line
+      (`TIMEOUT +Q47 -Q72`, plus any query whose runtime moved >2×), so a
+      traded timeout can never again present as an unchanged summary.
+      Harness-only; no PG behaviour involved. Bar: UNITS + one DS05 sweep.
 - [x] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
       factor.** Both landed verbatim from selfuncs.c in
       `internal/planner/cardinality.go`: the matched-MCV frequency mass is

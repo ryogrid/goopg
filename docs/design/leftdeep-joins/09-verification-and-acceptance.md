@@ -1026,6 +1026,78 @@ post-qual number all along and only the rendered line disagreed.
 Pre-fix captures are **not** being re-captured — they stay as the historical
 record. Apply the rule above when reading one.
 
+### 5.15 The DS05 TIMEOUT did not hop, it was moved, 2026-08-05 (P5.6-f-iii)
+
+Working notes + full evidence: `analysis/m0127-p56fiii/README.md`.
+
+P5.6-f-iii was filed on the reading that the SF0.5 gate's single TIMEOUT
+"hopped from Q72 to Q47 (2026-08-04), unattributed", provisionally blamed on
+the documented sweep-tail confound. **That reading is refuted.** The move is a
+real re-pricing introduced by **`ce027cee` (P5.6-f)**.
+
+**The gate's summary line cannot distinguish the two.** `TIMEOUT=1` is
+invariant to *which* query timed out, so a re-pricing that trades one timeout
+for another is indistinguishable from noise at the summary level. Across the
+boundary the summary was byte-identical (`PASS=94 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=1 SKIP=4`) while four queries moved by 4–17×.
+
+**Evidence, in the order it decides the question:**
+
+1. *Not noise — a step function.* Eight consecutive sweeps hold the old regime
+   (Q47 ≈30 s, Q72 timeout), four hold the new (Q47 timeout, Q72 ≈166 s),
+   within-regime spread ±3 s. A GC/state confound is unrepeatable; this is not.
+2. *The confound is structurally inapplicable to Q47.* Q47 runs at position 47,
+   **before** Q72: in the old regime no timeout had yet occurred, and in the new
+   regime Q47 is itself the first. Nothing preceded it to thrash the heap. And
+   a *fresher* post-restart server cannot explain Q57 getting 5× slower.
+3. *Solo runs reproduce the new regime.* Quiet host, fresh S-cold server,
+   `TIMEOUT_SEC=900` to recover the true runtime instead of the clipped cap:
+   **Q47 523 s**, **Q57 81 s**, both with correct row counts. The confound
+   hypothesis predicted Q47 ≈ 31 s.
+4. *Bisect on a copy of the cluster*, so the live SF0.5 dir was never at risk
+   and code was the only variable: `30293f78` → 31 s, `29daeb72` → 30 s with a
+   **byte-identical plan**, HEAD → 523 s. Old binary on *today's* data is fast,
+   which exonerates the cluster data as well as `29daeb72`.
+5. `29daeb72..ce027cee` is **one commit**, P5.6-f. P5.6-g-i's four corpus
+   captures corroborate for free: Q47's degraded top join is already present in
+   A=`ce027cee`.
+
+**Why the boundary sweep is mislabelled `29daeb72`:** its header carries
+`build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this
+commit alone]` and `diff=129e691bd41a`. That binary was `29daeb72` **plus
+uncommitted P5.6-f WIP**. The harness printed the warning and a content hash;
+the warning was correct and was not read. **When attributing any sweep, read
+the `diff=` field before the commit subject.**
+
+**Mechanism.** Q47's outermost join carries five equi-pairs
+(`i_category`, `i_brand`, `s_store_name`, `s_company_name`, `rn = rn-1`).
+P5.6-f moved pricing from one pair to every pair
+(`internal/planner/cardinality.go:457-483`), folding them under
+**independence** — `sel /= pairNDistinct(...)` multiplied across all pairs.
+Two of the five are strongly correlated (`i_category`↔`i_brand`,
+`s_store_name`↔`s_company_name`), so the joinrel is under-estimated by orders
+of magnitude, a tiny inner estimate makes a nested loop look free, and the plan
+degrades from a 5-pair **Hash Join** to a **Nested Loop with no join
+condition** — quadratic on real CTE volume. The same fold pointed the right way
+is why Q9/Q72/Q53 improved. This is the **inverse** of the single-key
+degeneracy trap: the fix for under-pricing over-corrected into
+under-estimation. Only structural facts (join method, `Hash Cond` arity) are
+cited here — per §5.14 the `rows=` on `Filter:`-carrying lines is not evidence.
+
+**P5.6-f stays.** It is a net win (+Q72, +Q53, +Q9's exact joinrel) and
+correctness never moved. What it lacks is PG's correlation defence:
+`clauselist_selectivity` (`clausesel.c`) consults extended statistics —
+`dependencies_clauselist_selectivity`, `statext_clauselist_selectivity` — before
+multiplying, and `get_foreign_key_join_selectivity` (`costsize.c:5651`)
+short-circuits the collapse for FK columns. goopg landed the FK arm in P5.6-f
+but has **no functional-dependency arm**, so a correlated *non-FK* composite
+still multiplies out. Successor **M0127-P5.6-f-iv**; ledger row 2026-08-05.
+
+**Gate lesson (actionable):** the plan-shape channel (§5.11) catches plan
+drift, but a *named-victim* timeout comparison would have caught this on the
+night it landed. The sweep report should diff the TIMEOUT **set**, not its
+cardinality.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
