@@ -949,7 +949,10 @@ large goopg believes a filtered relation to be — the M0125-0026 ledger row's
 "`date_dim` is costed at 73 049 rows" among them — were reading the renderer,
 not the estimator; C2's qual *placement* finding is unaffected (the predicate
 genuinely renders above the scan), but the row-count half of that evidence
-was an artifact.
+was an artifact. **↳ NARROWED by §5.14 — that last clause is too broad: the
+artifact reading only applies to a line that carries a collapsed `Filter:`,
+and C2's cited `date_dim` scans do not. Read §5.14 before re-using this
+paragraph.**
 
 **Gates.** UNITS green. Audit: 1 violation (Q18), unchanged from the
 `p56gii` baseline — every joinrel diff is sub-1 % ANALYZE sampling noise
@@ -961,6 +964,67 @@ nothing else.** Zero structural movement across the corpus, which is the
 proof the change is confined to rendering: it cannot reach plan selection.
 3 regression tests (`explain_collapsed_filter_rows_test.go`), each verified
 to fail without the fix (1000→100, 10→3).
+
+### 5.14 Which pre-fix plan-text conclusions survive, 2026-08-05 (P5.6-g-vi)
+
+§5.13 corrupted the evidence base retroactively: every capture under
+`analysis/` taken before `20e17fa5` reports some node lines at their pre-qual
+row count. This section is the re-read — how wide the damage is, and which
+closed findings quoted the damaged field. Full working:
+`analysis/leftdeep-joins/2026-08-05-p56gvi-README.md`. **No code changed.**
+
+**The blast radius, measured.** The two DS05 corpus captures that bracket the
+fix are line-aligned (5 962 lines each), so a positional diff isolates exactly
+what moved. Of **3 283** node lines carrying `rows=`, **836 changed (25.5 %)**,
+across **96 of 99 queries** — and the split is clean:
+
+| population | count | changed |
+|---|---|---|
+| node lines carrying a `Filter:` detail | 966 | **836** |
+| node lines with **no** `Filter:` detail | 2 317 | **0** |
+
+**So the rule for reading any pre-`20e17fa5` capture is exact: a `rows=` is
+trustworthy iff its node line has no `Filter:` detail beneath it.** Nothing
+without a `Filter:` moved anywhere in the corpus. (The 130 `Filter:`-carrying
+lines that did not move are details that never came from a collapsed
+wrapper — a scan's own qual field, `Filter: (true)` on a CTE scan, an index
+recheck.) Where the field is wrong it is badly wrong: overstatement **median
+9×, p90 18 000×, max 1 920 800×**. And the rule covers **join nodes**, not
+only scans — Q1's `Hash Join (INNER) … Filter: (date_dim.d_year = 2000)` went
+`rows=716` → `rows=3`. §5.13's "join nodes carry no collapsed `*Filter`" holds
+for TPC-H only; TPC-DS is where the join-level qual placement of C2 lives.
+
+**Verdicts.** Every closed finding whose reasoning quotes a scan or aggregate
+row count from plan text was checked against the capture it cites:
+**M0125-0026 C2** (pervasive form and the Q5 form), **M0125-0038 (C5)**,
+**M0125-0040 (C6)**, **M0125-0031**, and the `estimate-audit` joinrel
+conclusions of §5.3–§5.12 — **all survive on their own evidence; none needs
+re-deriving.** The audit conclusions survive by direct re-measurement (§5.13's
+run: 1 violation, unchanged); the rest survive because the lines they quote
+are bare. That is not luck: C2, C5 and C6 are *about* relations goopg failed
+to filter, so the numbers they quote are the ones the renderer had no filter
+to mis-scale.
+
+**One correction owed, and it runs the other way.** §5.13 called the row-count
+half of M0125-0026's "`date_dim` is costed at 73 049" an artifact. It is not.
+C2's own measurement is that **66 of 68** qualifying `Filter:` lines sit on a
+join node, so the `date_dim` scans carry no filter and 73 049 is what the
+estimator genuinely used — the row-count claim is faithful for exactly the
+reason the placement claim is true. The two corrupted captures are C2's two
+named exceptions (the scalar-SubPlan `date_dim` scans in Q14/Q54, printing
+`rows=73049` beside a scan-level `Filter:`), and they are cited only as
+placement exceptions; no conclusion rests on their row counts.
+
+**C5 corroborates the fix rather than falling to it.** C5 read
+`359 432 (web_sales) × 365.25 (date_dim after d_year) = 131 280 738` against a
+rendered `rows=131280740`. But 365.25 appears nowhere in that plan text — the
+`date_dim` line reads 73 049. It is `73 049 × 0.005` (`DEFAULT_EQ_SEL`), which
+C5 recovered by *dividing* the join estimate. C5 therefore observed, without
+naming it, precisely what §5.13 later proved: the estimator was carrying the
+post-qual number all along and only the rendered line disagreed.
+
+Pre-fix captures are **not** being re-captured — they stay as the historical
+record. Apply the rule above when reading one.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 

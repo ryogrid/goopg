@@ -1,51 +1,45 @@
 (idle — nothing in flight)
 
-Last loop: M0127-P5.6-g-v — DONE, documented, committed, pushed. Facts the
+Last loop: M0127-P5.6-g-vi — DONE (docs-only), committed, pushed. Facts the
 next loop should NOT re-derive:
 
-1. **Q18's residual is NOT a HAVING problem, and not a goopg defect.**
-   Measured: PG 339 423 → 113 141, goopg 1 150 720 → 383 573 — both exactly
-   ÷3 (DEFAULT_INEQ_SEL over an aggregate neither engine has stats for;
-   upstream `cost_agg` scales `output_tuples` by
-   `clauselist_selectivity(quals)`, goopg via the `*Filter` over the
-   `*Aggregate`). The HAVING mechanism is ALREADY identical. The whole
-   3.39× gap is the group estimate, and **goopg's ndistinct is the more
-   accurate one** (truth 1 500 000; PG is 4.4× LOW). Closed with no
-   estimator change. Do NOT "fix" Q18 toward PG — that degrades statistics.
-2. **EXPLAIN's collapsed `Filter:` line printed PRE-qual rows** (fixed this
-   loop). goopg splits a qual (`*Filter` wrapper) from the rows it filters;
-   `walkPlanFiltered` collapsed the wrapper onto the child and printed
-   `EstimateRows(child)`. The ESTIMATOR was always right — a parent reads
-   `EstimateRows(*Filter)`, which is why a `Gather` over a filtered scan
-   was correct while the scan under it was not. Only the rendered line lied.
-3. **Every plan capture taken before commit reports filtered relations at
-   UNFILTERED size.** `estimateaudit` parses that field (`nodeLineRe`) and
-   the DS05 plans channel captures it. `date_dim WHERE d_year = 2000` went
-   73 049 → 365 (PG 365). M0125-0026's "date_dim is costed at 73 049" was
-   reading the renderer; C2's qual-PLACEMENT finding still stands. This is
-   what successor P5.6-g-vi is for.
-4. **Rendering changes cannot move plan shape — and that is provable
-   cheaply.** Normalising `rows=` before diffing the two DS05 captures
-   reduced 95 changed plans to a 6-line psql header diff. Reuse that
-   technique for any render-only change.
+1. **Reading any plan capture taken before `20e17fa5`: a `rows=` is
+   trustworthy iff its node line has NO `Filter:` detail beneath it.** Proven
+   over the DS05 corpus, not argued: the two line-aligned captures bracketing
+   the fix differ on **836 of 3 283** `rows=` node lines (25.5 %, 96/99
+   queries) — **836 of the 966 `Filter:`-carrying lines, 0 of the 2 317 bare
+   ones**. Overstatement median 9×, p90 18 000×, max 1 920 800×.
+2. **The rule covers JOIN nodes too.** Q1's `Hash Join (INNER) … Filter:
+   (date_dim.d_year = 2000)` went `rows=716 → 3`. P5.6-g-v's "join nodes carry
+   no collapsed `*Filter`" is a TPC-H-only fact.
+3. **Every audited closed finding SURVIVES** — M0125-0026 C2 (both forms),
+   M0125-0038 (C5), M0125-0040 (C6), M0125-0031, and the §5.3–§5.12 audit
+   joinrel conclusions. Nothing needs re-deriving. Do not re-open them.
+4. **C2's row-count claim was NOT an artifact** (P5.6-g-v's wording was too
+   broad and is now narrowed in place at 09 §5.13). C2 measured 66 of 68 quals
+   on join nodes ⇒ the `date_dim` scans carry no filter ⇒ 73 049 is the number
+   the estimator really used. Only C2's two named exceptions (Q14/Q54 scalar
+   SubPlans) are corrupted, and they are cited for placement, not rows.
+5. **C5 corroborated the renderer bug days early**: its `365.25` is
+   `73 049 × DEFAULT_EQ_SEL`, divided out of the join estimate — nowhere in
+   the plan text. The estimator held the post-qual number all along.
 
-Gates run: UNITS (green, exit 0); **tpch-spotcheck PASS** (Q12=2, Q13=35
-canonical); `estimate-audit` **1 violation (Q18), unchanged from the p56gii
-baseline** — all joinrel diffs sub-1 % ANALYZE sampling noise, none worse;
-DS05 `plans` 95/99 changed but structurally identical (see 4); 3 new
-regression tests each verified failing without the fix; pgbench smoke via
-the commit hook.
+Method worth reusing: when a render-only change lands, diff the bracketing
+captures POSITIONALLY (they stay line-aligned) and classify changed lines by a
+structural predicate. It converts "which conclusions are corrupt?" from a
+judgement call into a two-population count.
 
-Nightly triage 20260805-014309: unchanged — the same 2 items
-(pgbench/nightly aborted txn, IsolationEvalPlanQual) stay filed under
-M-NIGHTLY and unchecked per the banner. No new run since.
+Gates run: docs-only loop, no Go source touched ⇒ no unit/spotcheck/DS05 run
+(none applies). `make ralph-state-guard` green; commit-hook pgbench smoke
+green.
 
-Next step: per the banner (M0124 → M0125 → M0127), the successor filed this
-loop is **M0127-P5.6-g-vi** — re-read the closed findings whose reasoning
-quotes a scan/aggregate row count from pre-fix plan text (M0125-0026 /
-M0125-0035 C2 is the known one) and record which survive. Bookkeeping over a
-corrupted instrument; no code change expected. The post-fix DS05 baseline
-already exists at
-`analysis/leftdeep-joins/2026-08-05-p56gv-ds05-plans-after.txt`.
+Nightly triage 20260805-014309: unchanged — both items (AI-…-001
+IsolationEvalPlanQual, AI-…-002 pgbench/nightly) were already filed under
+M-NIGHTLY and stay unchecked per the banner. No new nightly run since.
+
+Next step: per the banner (M0124 → M0125 → M0127), the P5.6-g series is now
+closed. Remaining open P5.6 tail, in doc order: **M0127-P5.6-d** (delete the
+quadratic build penalty, bushy.go:632) and **M0127-P5.6-f-iii** (the DS05
+SF0.5 gate's single TIMEOUT hop). Re-read the banner before selecting.
 
 In-flight: none.

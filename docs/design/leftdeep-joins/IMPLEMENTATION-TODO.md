@@ -1045,6 +1045,34 @@
   `analysis/leftdeep-joins/2026-08-05-p56gv-postfix.*`;
   [09](09-verification-and-acceptance.md) §5.13. 2 ledger rows.
   Successor **P5.6-g-vi** (re-read pre-fix plan-text conclusions).
+- [x] **P5.6-g-vi** re-read the conclusions drawn from pre-fix plan text.
+  Done 2026-08-05, **no code change** ([09](09-verification-and-acceptance.md)
+  §5.14; working
+  `analysis/leftdeep-joins/2026-08-05-p56gvi-README.md`). The two DS05 corpus
+  captures bracketing `20e17fa5` are line-aligned, so a positional diff gives
+  the blast radius exactly: **836 of 3 283 node lines (25.5 %) changed, across
+  96 of 99 queries** — and the split is clean, **836 of 966** `Filter:`-carrying
+  lines moved against **0 of 2 317** bare ones. **The rule for reading any
+  pre-fix capture is therefore exact: a `rows=` is trustworthy iff its node
+  line has no `Filter:` detail.** Where it is wrong it is badly wrong
+  (overstatement median 9×, p90 18 000×, max 1 920 800×), and it covers **join
+  nodes** too — Q1's `Hash Join … Filter: (d_year = 2000)` went 716 → 3, so
+  P5.6-g-v's "join nodes carry no collapsed `*Filter`" is a TPC-H fact, not a
+  general one. **Verdict: M0125-0026 C2 (both forms), M0125-0038 (C5),
+  M0125-0040 (C6), M0125-0031 and the §5.3–§5.12 audit joinrel conclusions all
+  SURVIVE; none needs re-deriving** — the audit ones by direct re-measurement,
+  the rest because the lines they quote are bare (C2/C5/C6 are *about*
+  relations goopg failed to filter). **One correction, running the other way:**
+  P5.6-g-v's "the row-count half of M0125-0026's `date_dim` 73 049 was an
+  artifact" is too broad — C2 measured 66 of 68 quals on join nodes, so those
+  scans carry no filter and 73 049 is what the estimator genuinely used; only
+  C2's two named exceptions (Q14/Q54 scalar SubPlans) are corrupted, and they
+  are cited for placement, not rows. C5's `365.25 = 73 049 × DEFAULT_EQ_SEL`
+  was *divided out* of the join estimate, i.e. C5 independently observed the
+  estimator holding the post-qual number the renderer hid. Pre-fix captures
+  stay as-is; the rule is recorded so it is not re-derived a third time.
+  No ledger row: bookkeeping over an instrument, no PG behaviour left
+  unimplemented.
 - [x] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
   equally wrong there, by design), and §4's ratchet restated as per-joinrel
   parity against the PG 18.3 reference rather than an absolute factor — PG

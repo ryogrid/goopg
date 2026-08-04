@@ -7549,18 +7549,54 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `analysis/leftdeep-joins/2026-08-05-p56gv-postfix.*`; doc 09 §5.13;
       IMPLEMENTATION-TODO P5.6-g-v. 2 ledger rows. Successor:
       **M0127-P5.6-g-vi** below.
-- [ ] **M0127-P5.6-g-vi — re-read the pre-fix plan-text conclusions.**
-      P5.6-g-v proved every plan capture before it under-reported filtered
-      relations at their unfiltered size, and the corpus captures committed
-      under `analysis/leftdeep-joins/` are the evidence base several closed
-      findings rest on. Re-read the ones whose reasoning quotes a *scan or
-      aggregate* row count from plan text — M0125-0026/M0125-0035 (C2) is the
-      known one, and its row-count claim is already known to be an artifact —
-      and record which conclusions survive on their own evidence and which
-      need re-deriving from a post-fix capture. Cheap: the `plans` channel is
-      a 20 s capture and the post-fix baseline already exists. This is
-      bookkeeping over a corrupted instrument, not new estimator work.
-      Bar: no code change expected; if one is implied, file it separately.
+- [x] **M0127-P5.6-g-vi — re-read the pre-fix plan-text conclusions.**
+      **DONE 2026-08-05, no code change, and every audited conclusion
+      SURVIVES.** The two DS05 corpus captures bracketing `20e17fa5` are
+      line-aligned (5 962 lines each), so a positional diff gives the blast
+      radius as a measurement rather than an argument: **836 of 3 283 node
+      lines carrying `rows=` changed — 25.5 %, across 96 of 99 queries** — and
+      the split is clean: **836 of the 966 lines that carry a `Filter:` detail
+      moved, against 0 of the 2 317 that do not.** That makes the rule for
+      reading any pre-fix capture exact and cheap: **a `rows=` is trustworthy
+      iff its node line has no `Filter:` beneath it.** Where it is wrong it is
+      badly wrong (overstatement median **9×**, p90 **18 000×**, max
+      **1 920 800×**), and it reaches **join nodes**, not just scans — Q1's
+      `Hash Join (INNER) … Filter: (date_dim.d_year = 2000)` went `rows=716` →
+      `rows=3`, so P5.6-g-v's "join nodes carry no collapsed `*Filter`" is a
+      TPC-H fact, not a general one.
+      **Verdicts** (each checked against the capture the finding itself
+      cites): **M0125-0026 C2** (pervasive form *and* the Q5 form),
+      **M0125-0038 (C5)**, **M0125-0040 (C6)**, **M0125-0031**, and the
+      `estimate-audit` joinrel conclusions of doc 09 §5.3–§5.12 — **all
+      survive; none needs re-deriving.** The audit ones by direct
+      re-measurement (P5.6-g-v's run: 1 violation, Q18, unchanged); the rest
+      because every line they quote is bare. Not luck: C2/C5/C6 are *about*
+      relations goopg failed to filter, so the numbers they cite are precisely
+      the ones the renderer had no filter to mis-scale.
+      **One correction, and it runs opposite to the filing.** This item was
+      filed saying C2's row-count claim "is already known to be an artifact" —
+      **it is not.** C2's own measurement is that **66 of 68** qualifying
+      `Filter:` lines sit on a join node, so the `date_dim` scans carry no
+      filter and 73 049 is what the estimator genuinely used: the row-count
+      claim is faithful for exactly the reason the placement claim is true.
+      P5.6-g-v's blanket wording is narrowed in place (09 §5.13 now carries a
+      `↳ NARROWED by §5.14` pointer). The only corrupted captures are C2's two
+      named exceptions — the Q14/Q54 scalar-SubPlan `date_dim` scans printing
+      `rows=73049` beside a scan-level `Filter:` — cited for placement, not
+      rows. Separately, **C5 corroborates the fix instead of falling to it**:
+      its `365.25` for `date_dim after d_year` appears nowhere in that plan
+      text (the line reads 73 049) — it is `73 049 × 0.005` (`DEFAULT_EQ_SEL`),
+      recovered by *dividing* the join estimate, i.e. C5 observed the estimator
+      holding the post-qual number the renderer hid, days before P5.6-g-v
+      proved it.
+      Pre-fix captures are deliberately **not** re-captured; they stay as the
+      historical record and the rule is recorded so it is not re-derived a
+      third time. Doc 09 **§5.14**; IMPLEMENTATION-TODO P5.6-g-vi; working
+      `analysis/leftdeep-joins/2026-08-05-p56gvi-README.md` (carries the
+      reproducible classifier script). No ledger row: bookkeeping over an
+      instrument, no PG behaviour left unimplemented. Bar met — docs-only, so
+      the commit-hook pgbench smoke plus `make ralph-state-guard` is the whole
+      gate set that applies.
 - [x] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
       DONE 2026-08-05. `estimateaudit.Q21AntiJoinMax` (5 000×) beside Q9's bar,
       both now rendering their justification into the artifact instead of being
