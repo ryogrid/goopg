@@ -825,3 +825,55 @@ order costs PG nothing in plan shape. goopg emits one narrow pass-through
 (deferral-ledger row, 2026-08-04). Rewriting the enclosing expressions instead
 remains available and is what closes that gap; the map this task builds is
 exactly its input.
+
+**Amendment 2026-08-04 (P5.5-f-ii-b) — the two consumers this section named are
+closed, and the tripwire's real difficulty turned out to be its own honesty.**
+`internal/planner/enclosingtree.go` adds both halves and `predp.go` calls them.
+
+*The pinned spine.* This section says the `predp.go` re-resolution "survives and
+consumes this map". It now does so explicitly: when the subtree spliced under
+the pinned spine carries the searched-subtree tag,
+`assertSpineConsumesIdentityBoundaryMap` checks — column by column, by (Name,
+SourceTableIdx) — that the boundary republished exactly the concatenation the
+spine was resolved against, and the re-resolution then returns without rebinding
+anything. **The finding that decided how it is written:** reading
+`layoutPosMap(old, new) == nil` as "the map is the identity" would have been
+wrong. That helper returns nil for TWO reasons — "identical, nothing to remap"
+and "widths differ, refuse to remap rather than corrupt" — so a boundary that
+lost or gained a column takes the second door and is indistinguishable from
+success, while the enclosing tree goes on referencing columns that moved. That
+is the M0097-0058 shape that `bindingWidth`-as-a-parameter exists to prevent,
+arriving through a different door; the assertion therefore compares the schemas
+itself and never consults `pm`.
+
+*The tripwire, widened.* `assertEnclosingTreeColumnRefs` runs
+`assertColumnRefsWithinSchema` at every node between the enclosing root and the
+searched subtree, with one switch (`enclosingNodeScopeOf`) answering "which
+expressions, against what width, and which children continue the walk" — one
+fact about a node, so one switch, per rule #2. Two entries carry the
+correctness argument: a `*Join`'s predicate and BOTH keys index the merged
+`Left ++ Right` row even for Semi/Anti (whose `Output()` is Left only, which is
+why `reresolveJoinByName` rebinds the right side at `offset = leftWidth`), so
+checking join expressions against `Output()` would reject every legal
+right-side key on the pinned spine; and a `*NestedLoopIndexJoin` is descended
+on the OUTER side only, because the inner `*IndexScan`'s probe keys are written
+in the outer row's coordinates.
+
+**The finding that shaped it, and the one to carry forward:** goopg has 53 node
+kinds, and a walk that enumerates a subset and stops at the rest is *correct* in
+the sense that it never accuses an innocent tree — while checking NOTHING, and
+returning normally, whenever the kind it stops at happens to sit on the path to
+the searched subtree. That is P5.5-f-ii-a's vacuity finding (an assertion that
+abstains on unnamed operands passes for the wrong reason) repeated one level up,
+and it is harder to see because a tree walk looks exhaustive. So the guard is
+placed on the partiality rather than on the enumeration: an unenumerated kind is
+a STOP, not a panic, but the walk must REACH a searched subtree and the
+assertion fails — naming every kind it stopped at — when it did not. Enumerating
+all 53 kinds would have traded a real check for a maintenance surface, and would
+have turned a coverage gap into a crash on a valid query.
+
+Recorded while enumerating: `walkPlanExprs` (unnest.go) does not visit
+`Aggregate.Passthrough`, `AggregateCall.Filter`, `WindowFunc.Args/Filter` or the
+window frame offsets. The tripwire's switch does; the shallow walker's omission
+is a deferral-ledger row rather than a change made here, because its callers are
+rewriters and widening a rewriter's reach is not a P5.5-f change.

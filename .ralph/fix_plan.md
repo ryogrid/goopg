@@ -6983,14 +6983,48 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       later simplification can see which half was already covered. Still inert
       (`GOOPG_PGSHAPED_DP` OFF). IMPLEMENTATION-TODO P5.5-f-ii-a; 03 §10; 02 §3.
       Bar met: UNITS + SPOT.
-- [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing
-      Nodes;** pinned-spine re-resolution consumes the boundary map (`predp.go`:
-      the map is the identity above the root, so `layoutPosMap` should come out
-      nil and the spine re-resolution be provably skipped, not merely
-      unexercised); `assertColumnRefsWithinSchema` widened from the boundary
-      node to the whole enclosing tree. Plan-snapshot re-baseline same commit.
-      IMPLEMENTATION-TODO P5.5-f-ii-b; 03 §10; 02 §3. Bar: UNITS + SPOT +
-      DS05 + PLAN (re-baseline).
+- [x] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing
+      Nodes** (closed by its last sub-item, P5.5-f-ii-b: the pinned-spine
+      re-resolution consumes the boundary map and the tripwire is widened from
+      the boundary node to the enclosing tree). DONE 2026-08-04
+      (`internal/planner/enclosingtree.go` new, `predp.go` call site).
+      When the subtree spliced under the pinned spine carries the
+      searched-subtree tag, `assertSpineConsumesIdentityBoundaryMap` checks
+      column-by-column (Name, SourceTableIdx) that the boundary republished the
+      concatenation the spine was resolved against, and the re-resolution
+      returns without rebinding — the skip is now proved, not argued.
+      **The finding that decided how it is written:** reading
+      `layoutPosMap == nil` as "the map is the identity" would have been WRONG.
+      That helper returns nil for two different reasons — "identical, nothing to
+      remap" and "widths differ, refuse to remap rather than corrupt" — so a
+      boundary that lost or gained a column takes the second door and is
+      indistinguishable from success while the enclosing tree goes on
+      referencing columns that moved (the M0097-0058 shape through a different
+      door). The assertion compares the schemas itself and never consults `pm`.
+      The tripwire is `assertEnclosingTreeColumnRefs` over ONE switch
+      (`enclosingNodeScopeOf`) answering which expressions / against what width /
+      which children continue the walk, because those are one fact about a node
+      (rule #2): a `*Join`'s predicate and BOTH keys index the merged
+      `Left ++ Right` row even for Semi/Anti — whose `Output()` is Left only, so
+      checking against `Output()` would reject every legal right-side key on the
+      pinned spine — and a `*NestedLoopIndexJoin` is descended on the OUTER side
+      only, its inner probe keys living in the outer's coordinate space.
+      **Second finding:** with 53 node kinds, a partial walk that stops at
+      unenumerated kinds checks NOTHING and returns normally whenever the kind it
+      stops at sits on the path to the searched subtree — P5.5-f-ii-a's vacuity
+      finding one level up, and harder to see because a tree walk looks
+      exhaustive. The guard is therefore on the partiality, not the enumeration:
+      a stop is not a panic, but the walk must REACH a searched subtree or the
+      assertion fails naming every kind it stopped at. 2 ledger rows (the
+      partial enumeration + `walkPlanExprs`'s missing
+      `Aggregate.Passthrough`/`AggregateCall.Filter`/`WindowFunc` expressions;
+      and `pushOneConjunct` as the fourth legacy family member not taught about
+      the tag). 12 new tests (`enclosingtree_test.go`). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). IMPLEMENTATION-TODO P5.5-f-ii-b; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT. DS05 + PLAN re-baseline not applicable — the whole
+      change is reachable only from a tagged node, and only
+      `createPlanAtSearchRoot` tags, which nothing calls from `planSelect`; no
+      plan can move.
 - [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
       FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build
       penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final

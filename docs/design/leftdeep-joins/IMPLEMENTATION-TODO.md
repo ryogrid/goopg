@@ -735,12 +735,33 @@
   `searchedtree_test.go` supplies its own named-clause helper. 2 ledger rows.
   10 new tests, two of which pin PRE-task behaviour so a later simplification
   can see which half was already covered. Still inert.)*
-- [ ] **P5.5-f-ii-b** pinned-spine re-resolution consumes the boundary map
-  (`predp.go`: the map is the identity above the root, so `layoutPosMap` should
-  come out nil and the spine re-resolution should be provably skipped, not
-  merely unexercised); `assertColumnRefsWithinSchema` widened from the boundary
-  node to the whole enclosing tree. Plan-snapshot re-baseline in the same
-  commit.
+- [x] **P5.5-f-ii-b** pinned-spine re-resolution consumes the boundary map;
+  `assertColumnRefsWithinSchema` widened from the boundary node to the whole
+  enclosing tree. *(DONE 2026-08-04, `internal/planner/enclosingtree.go` new +
+  `predp.go` call site. When the subtree spliced under the pinned spine carries
+  the searched-subtree tag, `assertSpineConsumesIdentityBoundaryMap` checks
+  column-by-column that the boundary republished the concatenation the spine was
+  resolved against, and the re-resolution returns without rebinding.
+  **The finding that decided how it is written:** reading `layoutPosMap == nil`
+  as "the map is the identity" would have been WRONG — that helper returns nil
+  for two different reasons, "identical" and "widths differ, refuse to remap",
+  so a boundary that lost a column takes the second door and is
+  indistinguishable from success while the enclosing tree references columns
+  that moved. The assertion compares the schemas itself and never consults `pm`.
+  The tripwire is `assertEnclosingTreeColumnRefs` over one switch
+  (`enclosingNodeScopeOf`) answering which expressions / against what width /
+  which children — a `*Join`'s predicate and both keys index the MERGED row even
+  for Semi/Anti (whose `Output()` is Left only), and a `*NestedLoopIndexJoin` is
+  descended on the outer side only. **Second finding:** with 53 node kinds, a
+  partial walk that stops at unenumerated kinds checks NOTHING and returns
+  normally whenever the kind it stops at sits on the path — P5.5-f-ii-a's
+  vacuity finding one level up, and harder to see because a tree walk looks
+  exhaustive. The guard is therefore on the partiality: a stop is not a panic,
+  but the walk must REACH a searched subtree or the assertion fails naming every
+  kind it stopped at. 2 ledger rows (`walkPlanExprs` misses
+  `Aggregate.Passthrough` / `AggregateCall.Filter` / `WindowFunc.Args|Filter` /
+  frame offsets; `pushOneConjunct` is the fourth legacy family member and is not
+  taught about the tag). 12 new tests (`enclosingtree_test.go`). Still inert.)*
 - [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling
