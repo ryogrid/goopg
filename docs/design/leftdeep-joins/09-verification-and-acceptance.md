@@ -403,6 +403,56 @@ P5.6-f reaches every printed estimate and every post-search decision, and the
 search itself not at all. Filed as **P5.6-f-ii**; P5.9 still cannot certify
 Q9's ≤ 10² runtime bar, but it can now certify its cardinality.
 
+### 5.6 The search reached, 2026-08-05 (P5.6-f-ii)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56fii{,-halfway}.txt`,
+`-README.md`. Same cluster and schema as §5.5, so the diff carries no schema
+variable.
+
+§5.5 named one cause — the integer DP's `ndv` being a table-wide maximum. It was
+real and it was not sufficient. Instrumenting the DP (rather than reading it)
+surfaced two more, both of which had been latent for as long as the accurate
+path existed and neither of which any unit test could have caught, because both
+concern how a coordinate is *interpreted* rather than what is computed from it:
+
+1. **A `joinEdge`'s key expressions are in GLOBAL FROM-list coordinates.**
+   `accurateKeyDistinct` indexed `Stats.Columns` with `ColumnRef.Index`, so on
+   Q5 it read out of range for *every* join key (`c_nationkey` is `Index: 16`
+   against 8 columns) and returned 0 — silently handing the search back to the
+   table-wide maximum it was supposed to replace. On `nation`, `Index: 3` was in
+   range and answered with `n_comment`'s distinct count for `n_nationkey`.
+   `edgeColName`'s `cr.Name` fallback masked the whole thing by still returning
+   the right *name*. Third instance of the P5.6-e-ii `RightKey` class.
+2. **`accurateKeyDistinct` bypassed `StaDistinct()`**, multiplying
+   `NDistinctFrac × RowCount` unconditionally — the branch P5.6-e-iii created
+   `StaDistinct()` to arbitrate (`get_variable_numdistinct`, selfuncs.c).
+
+**The half-fix is recorded because it is the argument for the whole one.**
+Landing only the superkey proof made Q5's `lineitem ⋈ supplier` truthful
+(39 981 → 5 997 241) while its rival `customer ⋈ supplier` kept reading 10 000
+against a real 60 000 000; the DP took the cartesian product and Q5 went 65.9 s →
+over the 150 s timeout. A search selects on *comparisons*, so a partially
+truthful estimator is not a partial fix — it is a new class-(b) defect. This is
+the §6 protocol's own logic applied to the estimator: the class was (b) both
+before and after, and only a uniform divisor closes it.
+
+Landed together: one divisor for both search modes (`graphJoinKeyDivisor`, the
+graph-space twin of P5.6-f's `superkeyJoinEstimate`, plus the §4 per-clause
+product for the unproven remainder); name-based column resolution;
+`StaDistinct()` rendering. `uniqueNoFanoutRawCount` is deleted — its FK arm
+divided by the child's raw count where costsize.c:5847 divides by the parent's.
+
+Result: violations **2 → 2** (Q18, Q21 — both P5.6-g's), **no joinrel worse**,
+and **Q9 measured for the first time**: UNMEASURED (>150 s) → 6.3× over, inside
+its `≤100×` override. Runtime, which is what class (b) is judged on: **zero
+regressions across 22 queries**, Q5 65.9 s → 17.1 s, Q7 38.9 → 27.2, Q21 125.1 →
+90.5, common-measured total 546.8 s → 445.1 s (**0.81×**), and Q9 291.8 s →
+16.6 s off-instrument. Plan-gate diverged 19/22 against the old baseline — the
+intended outcome — and is 22/22 MATCH against the re-pinned
+`plan_snapshots/m0127-p56fii.txt`.
+
+**P5.9 can now certify Q9's ≤ 10² runtime bar as well as its cardinality.**
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

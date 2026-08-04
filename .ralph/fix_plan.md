@@ -7273,7 +7273,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       **Q9 is measurable again — at 291.8 s, not inside the audit's 150 s.**
       Its cardinality defect is closed; the residue is class (b) and is
       P5.6-f-ii below.
-- [ ] **M0127-P5.6-f-ii — the legacy join-order SEARCH does not use
+- [x] **M0127-P5.6-f-ii — the legacy join-order SEARCH does not use
       `estimateJoin`, so P5.6-f never reached plan shape.** Measured, not
       inferred: with Q9's joinrel now EXACT its plan is byte-identical, still
       applying the 5.3 %-selective `part` filter ABOVE three hash joins that
@@ -7289,9 +7289,38 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       where upstream divides by the PARENT's (costsize.c:5847). Resume point:
       enumerate `crossEdgesBetween` unconditionally and run a
       `joinkeyproof.go`-shaped prover over `g.tables` (the catalog is already
-      in scope there). **P5.9 can now certify Q9's cardinality but still not
-      its ≤10² runtime bar.** Ledger row dated 2026-08-04. Bar: UNITS + DS05 +
+      in scope there). Ledger row dated 2026-08-04. Bar: UNITS + DS05 +
       PLAN + audit run with Q9 inside the 150 s timeout.
+      **DONE 2026-08-05.** The named cause was real and NOT sufficient; two
+      more were found by instrumenting the DP, and all three had to land
+      together. (1) `graphJoinKeyDivisor` (joinkeyproof.go) is
+      `superkeyJoinEstimate`'s algorithm arm-for-arm in the join-GRAPH
+      coordinate space, and now feeds BOTH search modes — `uniqueNoFanoutRawCount`
+      is deleted with its child-vs-parent FK inversion. (2) **A `joinEdge`'s key
+      `ColumnRef.Index` is in GLOBAL FROM-list coordinates** (Q5's `c_nationkey`
+      is `Index: 16` against an 8-column `customer`), so `accurateKeyDistinct`
+      returned 0 for every join key in the query and `sideKeyDistinct` served
+      the table-wide max instead — or, in range by accident, answered with
+      `n_comment` for `n_nationkey`. Third instance of the P5.6-e-ii `RightKey`
+      class; fixed by resolving through the NAME (`edgeColName` preference
+      inverted, `tableColumnIndex` added). (3) `accurateKeyDistinct` now renders
+      through `StaDistinct()` rather than multiplying `NDistinctFrac`
+      unconditionally. **The rejected half-fix is kept as evidence**
+      (`2026-08-05-p56fii-halfway.txt`): adding only the proof made Q5's
+      `lineitem ⋈ supplier` truthful while its rival `customer ⋈ supplier` kept
+      reading 10 000 against 60 000 000, the DP took the cartesian product, and
+      Q5 went 65.9 s → over the timeout. A search selects on comparisons, so a
+      partially truthful estimator is a new defect, not half a fix. Result:
+      violations 2 → 2, no joinrel worse, **Q9 UNMEASURED (>150 s) → 6.3× over**
+      (inside its ≤100× override) and **291.8 s → 16.6 s**; **zero runtime
+      regressions** over 22 queries, Q5 65.9→17.1 s, Q7 38.9→27.2 s,
+      Q21 125.1→90.5 s, stream total 546.8→445.1 s (0.81×). 09 §5.6; two ledger
+      rows dated 2026-08-05. Bar met: UNITS + SPOT (Q12=2, Q13=35) + DS05
+      (PASS=94/MISMATCH=0/CKMISMATCH=0/ERROR=0/TIMEOUT=1 Q47/SKIP=4, summary
+      identical to the four prior sweeps) + PLAN (19/22 diverged as intended,
+      re-pinned to `plan_snapshots/m0127-p56fii.txt`, then 22/22 MATCH) + the
+      audit run. **P5.9 can now certify Q9's ≤10² runtime bar as well as its
+      cardinality.**
 - [ ] **M0127-P5.6-f-iii — the TPC-DS SF0.5 gate's single TIMEOUT hopped
       from Q72 to Q47 (2026-08-04), unattributed.** The sweep's summary line
       is identical to the three before it (PASS=94, MISMATCH=0, CKMISMATCH=0,

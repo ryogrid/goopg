@@ -908,8 +908,8 @@
   Q9 measurable again at 291.8 s but still over the audit's 150 s: its
   cardinality is closed, its SHAPE is not, and the reason is a separate
   mechanism — spun out as **P5.6-f-ii**.
-- [ ] **P5.6-f-ii** the legacy join-order SEARCH does not use `estimateJoin`.
-  `estimateJoinCost`'s production branch (bushy.go:1257, `costDrivenJoinOrder`
+- [x] **P5.6-f-ii** the legacy join-order SEARCH does not use `estimateJoin`.
+  `estimateJoinCost`'s production branch (bushy.go, `costDrivenJoinOrder`
   OFF) computes `ndv` as max NDistinct over EVERY column of the edge's two
   tables, ignoring the join key; the multi-edge + superkey arm beside it is
   gated on the flag M0126 left OFF, and its FK case divides by the CHILD's
@@ -918,6 +918,21 @@
   why Q9's exact joinrel still yields a plan applying the 5.3 %-selective
   `part` filter ABOVE three full-cardinality hash joins. Bar: UNITS + DS05 +
   audit run with Q9 inside the 150 s timeout.
+  **DONE 2026-08-05 (09 §5.6).** That cause was real and insufficient. Two
+  more, both found by instrumenting the DP: a `joinEdge`'s key
+  `ColumnRef.Index` is in GLOBAL FROM-list coordinates, so
+  `accurateKeyDistinct` returned 0 for every join key in Q5 (or, in range by
+  accident, `n_comment`'s count for `n_nationkey`) — the P5.6-e-ii `RightKey`
+  class a third time; and it bypassed `StaDistinct()`. All three landed
+  together because the proof ALONE was measured worse than the bug: Q5's
+  `lineitem ⋈ supplier` went truthful while `customer ⋈ supplier` kept reading
+  10 000 against 60 000 000, and Q5 went 65.9 s → over the timeout
+  (`2026-08-05-p56fii-halfway.txt`). `uniqueNoFanoutRawCount` deleted for
+  `graphJoinKeyDivisor`, now on both search modes. Violations 2 → 2, no
+  joinrel worse, **Q9 UNMEASURED → 6.3× over and 291.8 s → 16.6 s**, zero
+  runtime regressions, stream 546.8 s → 445.1 s (0.81×). Two ledger rows
+  (uncovered-edge selectivity; the coordinate space fixed at the reader, not
+  the writer). PLAN re-pinned to `plan_snapshots/m0127-p56fii.txt`.
 - [ ] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor;
   closes the SEMI/ANTI `est=1` collapse (Q21 4003× under is an audit
   violation). Bar: UNITS + DS05 + audit run.

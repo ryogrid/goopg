@@ -513,3 +513,263 @@ func fkParentScan(resolved []resolvedPair, covered []bool, child Node, fk catalo
 	}
 	return baseColumnRef{}, false
 }
+
+// ---------------------------------------------------------------------------
+// M0127-P5.6-f-ii — the same proof, in the join-GRAPH coordinate space.
+//
+// Everything above proves keys over a FINISHED `*Join`, which is the space
+// `estimateJoin` (cardinality.go) works in. The legacy join-order SEARCH never
+// reaches that space: `estimateJoinCost` (bushy.go) runs DURING enumeration,
+// over subset bitmasks and `joinEdge`s, and no `*Join` exists yet for the
+// candidate it is pricing. That is why P5.6-f made Q9's joinrel estimate exact
+// without moving its plan by a single node (09 §5.5) — the number the search
+// selected on was computed by a DIFFERENT estimator, whose production branch
+// (the integer DP) took `ndv` to be the maximum NDistinct across EVERY column
+// of the edge's two tables, ignoring the join key entirely.
+//
+// The functions below are `superkeyJoinEstimate` / `bestProvableJoinKey` /
+// `coveringJoinPairs` / `fkParentScan`, arm for arm, with the evidence reached
+// differently: a relation instance is the graph's table INDEX rather than a
+// leaf-scan pointer (which is the STRONGER identity — two arms of a self-join
+// occupy two FROM-list positions and therefore two indices, so the `n1.a = x
+// AND n2.b = y` confusion `baseColumnRef.scan` exists to prevent cannot arise
+// here at all), and a key column is named by `edgeColName` off the edge's key
+// expression instead of by walking a plan tree. Both must move together — this
+// is the sibling-paths rule (#2), and the trio of column resolvers in this same
+// file is the standing evidence of what happens when they don't.
+//
+// TWO DELIBERATE DIFFERENCES from the `*Join` sibling, both because the graph
+// space supplies less:
+//
+//   - No `covered` list is returned. The `*Join` estimator hands its back to
+//     `joinResidualSelectivity` so a proven pair is not ALSO priced as a
+//     residual conjunct; the integer DP has no per-clause pricing to exclude
+//     from — its non-proof path is a single table-wide maximum — so there is
+//     nothing to subtract. Edges left uncovered by a proven key therefore
+//     contribute no selectivity of their own (ledgered).
+//   - No `rowsBound`. 04 §3.3's bound (the join cannot emit more rows than the
+//     non-key side brings) is already IMPLIED here whenever it is valid: it
+//     needs the key relation to BE the whole side, and in that case the side's
+//     `dpEntry.rows` is that relation's own filtered count, which is ≤ its raw
+//     count — so `leftRows·rightRows/raw ≤ rightRows` falls out of the divide.
+//     When the key relation sits inside a larger subset the bound does not hold
+//     anyway, which is exactly what `soleBaseScan` tests for over there.
+//
+// This replaces `uniqueNoFanoutRawCount` (deleted from bushy.go), whose FK arm
+// divided by the CHILD's raw count where upstream divides by the PARENT's
+// (`1.0 / ref_tuples`, costsize.c:5847) — dividing the fact table's own
+// cardinality out of the join.
+
+// graphKeyEnd is one END of a join edge resolved to (relation instance, base
+// column name). `ok` false means the end named no base-table column, which
+// disqualifies it as evidence without disqualifying the edge's other end.
+type graphKeyEnd struct {
+	ti  int
+	col string
+	ok  bool
+}
+
+// graphEndOf resolves one edge end. `ti` indexes `g.tables`.
+func graphEndOf(ti int, key Expr, g *joinGraph) graphKeyEnd {
+	if g == nil || ti < 0 || ti >= len(g.tables) || g.tables[ti] == nil {
+		return graphKeyEnd{}
+	}
+	name, ok := edgeColName(key, g.tables[ti])
+	if !ok {
+		return graphKeyEnd{}
+	}
+	return graphKeyEnd{ti: ti, col: name, ok: true}
+}
+
+// graphProvenKey is one applicable key: which edges it covers and what to
+// divide by. Unlike `provenJoinKey` it carries no key-relation identity,
+// because the row bound that field feeds is implied here (see the header).
+type graphProvenKey struct {
+	edges     []int
+	rawTuples int64
+}
+
+// graphJoinKeyDivisor is `superkeyJoinEstimate` for the search: it returns the
+// product of the RAW tuple counts of every key it can prove over `edges`,
+// consuming each edge once so two overlapping keys cannot both charge for it.
+//
+// The three upstream properties hold as they do in the `*Join` sibling: the
+// divisor is the RAW, unfiltered count ("we should use the raw table tuple
+// count, not any estimate of its filtered or joined size", costsize.c:5852);
+// the WHOLE key must be covered or the proof chickens out (costsize.c:5760);
+// and the largest divisor is taken first, because a key on either side gives an
+// upper bound and the estimate is the minimum of the available bounds.
+func graphJoinKeyDivisor(edges []*joinEdge, g *joinGraph, cat catalog.Catalog) (int64, bool) {
+	if cat == nil || g == nil || len(edges) == 0 {
+		return 0, false
+	}
+	ends := make([][2]graphKeyEnd, len(edges))
+	for i, e := range edges {
+		if e == nil {
+			continue
+		}
+		ends[i][0] = graphEndOf(e.leftTable, e.leftKey, g)
+		ends[i][1] = graphEndOf(e.rightTable, e.rightKey, g)
+	}
+	covered := make([]bool, len(edges))
+	divisor := int64(1)
+	fired := false
+	for {
+		key, ok := bestProvableGraphKey(ends, covered, g, cat)
+		if !ok {
+			break
+		}
+		for _, i := range key.edges {
+			covered[i] = true
+		}
+		divisor = satMul(divisor, key.rawTuples)
+		fired = true
+	}
+	if !fired {
+		return 0, false
+	}
+	return divisor, true
+}
+
+// bestProvableGraphKey finds the key with the largest divisor over the edges
+// not yet consumed. Relations are visited in edge order and each relation's
+// candidate keys in catalog order, so the answer does not move between runs.
+func bestProvableGraphKey(ends [][2]graphKeyEnd, covered []bool, g *joinGraph, cat catalog.Catalog) (graphProvenKey, bool) {
+	// equated[ti] = the columns of relation instance ti which a still
+	// available edge equates to something on the other side of this join.
+	order := make([]int, 0, 2*len(ends))
+	equated := make(map[int]map[string]bool, 2*len(ends))
+	note := func(e graphKeyEnd) {
+		if !e.ok {
+			return
+		}
+		if equated[e.ti] == nil {
+			equated[e.ti] = map[string]bool{}
+			order = append(order, e.ti)
+		}
+		equated[e.ti][e.col] = true
+	}
+	for i := range ends {
+		if covered[i] {
+			continue
+		}
+		note(ends[i][0])
+		note(ends[i][1])
+	}
+
+	var best graphProvenKey
+	found := false
+	consider := func(cand graphProvenKey) {
+		if cand.rawTuples < 1 || len(cand.edges) == 0 {
+			return
+		}
+		if !found || cand.rawTuples > best.rawTuples {
+			best, found = cand, true
+		}
+	}
+	for _, ti := range order {
+		tbl := g.tables[ti]
+		if tbl == nil {
+			continue
+		}
+		cols := equated[ti]
+		// A UNIQUE index on this relation makes the relation itself the key
+		// side: each row of the other side matches at most one of its rows,
+		// so the divisor is its OWN raw count. Read through the planner's own
+		// catalog so the active database's index set is used (the dbOid
+		// hazard, cost-model/14 §2).
+		if tbl.Stats != nil && tbl.Stats.RowCount >= 1 {
+			for _, key := range uniqueKeyColumnSets(cat, tbl) {
+				if !columnsSubset(key, cols) {
+					continue
+				}
+				consider(graphProvenKey{
+					edges:     coveringGraphEdges(ends, covered, ti, key),
+					rawTuples: tbl.Stats.RowCount,
+				})
+			}
+		}
+		// A FOREIGN KEY declared ON this relation makes it the CHILD side.
+		// Each child row matches exactly one PARENT row, so the divisor is the
+		// PARENT's raw count — the arm `uniqueNoFanoutRawCount` had backwards.
+		for _, fk := range tbl.ForeignKeys {
+			if fk.NotValid || fk.NotEnforced || !columnsSubset(fk.Columns, cols) {
+				continue
+			}
+			parentRaw, ok := graphFKParentRaw(ends, covered, ti, fk, g)
+			if !ok {
+				continue
+			}
+			consider(graphProvenKey{
+				edges:     coveringGraphEdges(ends, covered, ti, fk.Columns),
+				rawTuples: parentRaw,
+			})
+		}
+	}
+	return best, found
+}
+
+// coveringGraphEdges returns the indexes of the still-available edges that
+// equate relation instance ti's column set `key` to the other side, or nil
+// unless EVERY key column has such an edge behind it — PG's chicken-out branch
+// (costsize.c:5760), which is what makes a partial cover prove nothing.
+func coveringGraphEdges(ends [][2]graphKeyEnd, covered []bool, ti int, key []string) []int {
+	want := make(map[string]bool, len(key))
+	for _, c := range key {
+		want[c] = true
+	}
+	var out []int
+	seen := make(map[string]bool, len(key))
+	for i := range ends {
+		if covered[i] {
+			continue
+		}
+		for _, end := range ends[i] {
+			if !end.ok || end.ti != ti || !want[end.col] {
+				continue
+			}
+			out = append(out, i)
+			seen[end.col] = true
+			break
+		}
+	}
+	if len(seen) != len(want) {
+		return nil
+	}
+	return out
+}
+
+// graphFKParentRaw resolves a declared FK's referenced side to a relation
+// instance this join actually equates the child against, and returns that
+// PARENT's raw tuple count. Matching through the edges rather than through
+// `fk.RefTable` alone keeps the proof tied to the join being priced: a query
+// may join the child to a DIFFERENT table of the same name, or not to the
+// parent at all.
+func graphFKParentRaw(ends [][2]graphKeyEnd, covered []bool, child int, fk catalog.ForeignKey, g *joinGraph) (int64, bool) {
+	for i := range ends {
+		if covered[i] {
+			continue
+		}
+		l, r := ends[i][0], ends[i][1]
+		// Both ends must resolve here: this arm has to NAME the referenced
+		// parent relation, which the unique-index arm never needs to.
+		if !l.ok || !r.ok {
+			continue
+		}
+		var other graphKeyEnd
+		switch {
+		case l.ti == child:
+			other = r
+		case r.ti == child:
+			other = l
+		default:
+			continue
+		}
+		tbl := g.tables[other.ti]
+		if tbl == nil || tbl.Name != fk.RefTable || tbl.Stats == nil || tbl.Stats.RowCount < 1 {
+			continue
+		}
+		return tbl.Stats.RowCount, true
+	}
+	return 0, false
+}
