@@ -7201,7 +7201,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       evidence. IMPLEMENTATION-TODO P5.6-e-ii. Bar met: UNITS + DS05
       (PASS=94/MISMATCH=0, identical to the two prior sweeps) + SPOT
       (Q12=2, Q13=35) + the audit run.
-- [ ] **M0127-P5.6-e-iii — de-saturate ANALYZE's ndistinct, then fix the
+- [x] **M0127-P5.6-e-iii — de-saturate ANALYZE's ndistinct, then fix the
       join-key coordinate space.** Haas–Stokes in `compute_distinct_stats`
       terms (`internal/executor/operators_analyze.go`, upstream analyze.c):
       goopg stores the SAMPLE's distinct count, so a 1.5 M-row unique key
@@ -7214,6 +7214,44 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       nd-unavailable path, so it silently disappears the moment nd resolves.
       Evidence: `analysis/leftdeep-joins/2026-08-04-p56eii-postfix.txt`,
       09 §5.3. IMPLEMENTATION-TODO P5.6-e-iii. Bar: UNITS + DS05 + audit run.
+      **DONE 2026-08-04.** Landed: `executor.ndistinctEstimate` (mirrors
+      `compute_scalar_stats`'s three ndistinct branches, analyze.c:2588-2648);
+      `NDistinct`/`NDistinctFrac` are now two renderings of ONE estimate and
+      `StaDistinct()` picks between them with upstream's 10%-of-rows rule;
+      `estimateJoin`'s equi arm reads the right key through
+      `rightKeyNDistinct`; `columnNDistinctForChild` gained its `*Join` arm and
+      the divergence tripwire is retired. Cap re-examined and deliberately
+      left fallback-only (it stands in for upstream's FK `fkselec`; a real
+      many-to-many join legitimately exceeds max(|l|,|r|)). Audit violations
+      **5 → 2** — Q3 2967× → 10.4×, Q5 447× → 1.5×, Q7 1190× under → 1.4×,
+      Q8 20.7× → 1.3×, Q17 7.5× → 1.0×, Q18 1.26e7× → 42837×, Q20-inner
+      1311× → 129×. Two regressions FILED, not papered over (09 §5.4 + three
+      ledger rows): SEMI/ANTI collapse to `est=1` (Q21 final ANTI is a new
+      violation, 9.7× → 4003× under; needs `eqjoinsel_semi`'s MCV arm) and
+      **Q9 UNMEASURED** (93.9 s → >150 s). Bar met: UNITS + DS05 (PASS=94/
+      MISMATCH=0/CKMISMATCH=0, identical to the three prior sweeps) + SPOT
+      (Q12=2, Q13=35) + the audit run.
+- [ ] **M0127-P5.6-f — multi-key equi-join pricing + `fkselec`, the two
+      halves that must land together.** Q9's `l_suppkey = ps_suppkey AND
+      l_partkey = ps_partkey` is priced on ONE pair while `Join.Residual()`
+      excludes BOTH, so it reads 481 M and the DP puts it under the `part`
+      filter — this is the whole cause of Q9's P5.6-e-iii regression
+      (attributed per 09 §6 before landing: reverting only the planner half
+      reproduces the identical plan). Folding `max(nd)` over every `HashKeys`
+      pair alone swings it to ≈2 rows, so it needs the
+      `get_foreign_key_join_selectivity` analogue (costsize.c) in the same
+      change. **P5.9 cannot certify Q9's ≤10² bar until this lands.**
+      09 §5.4; two ledger rows dated 2026-08-04. Bar: UNITS + DS05 + audit
+      run with Q9 measurable again.
+- [ ] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
+      factor.** With a truthful ndistinct the no-MCV branch's `nd1 <= nd2`
+      test succeeds on real data, the match fraction is exactly 1.0, and
+      JOIN_ANTI's `outer · (1 - jselec)` floors at 1: Q21 final ANTI 4003×
+      under (audit violation), Q19 131× under, Q16 85× under. Upstream takes
+      the MCV arm first and estimates only the uncertain remainder;
+      `columnStatsForChild` already resolves a join-level column to its base
+      MCV list, so the matcher has its inputs. 09 §5.4; ledger row dated
+      2026-08-04. Bar: UNITS + DS05 + audit run.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

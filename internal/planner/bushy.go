@@ -1028,9 +1028,13 @@ const (
 //
 // (M0077-0003 / Slice C per design 02 §3.)
 // accurateKeyDistinct returns the distinct-value count of a single join-key
-// column, preferring the UNSATURATED estimate NDistinctFrac × RowCount (PG's
-// negative stadistinct fraction) over the raw sample NDistinct (saturates
-// ~30000). It resolves the SPECIFIC key column (not the table max) because an
+// column, preferring the estimate NDistinctFrac × RowCount (PG's negative
+// stadistinct fraction) over NDistinct. The two agree since
+// M0127-P5.6-e-iii — ANALYZE now scales the sample's distinct count up to the
+// relation (Haas-Stokes) and writes both renderings of that one estimate — so
+// this preference no longer picks a winner; before it, NDistinct was the raw
+// sample count and saturated at ~30000. It resolves the SPECIFIC key column
+// (not the table max) because an
 // equijoin's selectivity is governed by the joined columns only. Mirrors
 // cardinality.go's columnNDistinctForChild resolution (ColumnRef.Index indexes
 // the base table's positional Stats.Columns). Returns 0 when unresolvable.
@@ -1054,8 +1058,12 @@ func accurateKeyDistinct(key Expr, tbl *catalog.Table) int64 {
 }
 
 // maxColSaturatedDistinct is the historical fallback: the largest per-column
-// SAMPLE NDistinct across the table. Used when the join key does not resolve to
+// NDistinct across the table. Used when the join key does not resolve to
 // a base-table ColumnRef, so keyless/degenerate edges estimate as before.
+// The name predates M0127-P5.6-e-iii, when NDistinct held the raw SAMPLE count
+// and therefore saturated at the statistics target; it is now the Haas-Stokes
+// table-wide estimate. Kept as-is because the fallback's CALLERS are what the
+// name warns about — a table max is not the join key's ndistinct.
 func maxColSaturatedDistinct(tbl *catalog.Table) int64 {
 	if tbl == nil || tbl.Stats == nil {
 		return 0

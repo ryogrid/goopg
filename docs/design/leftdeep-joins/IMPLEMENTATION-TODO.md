@@ -877,7 +877,7 @@
     `columnStatsForChild` to resolve through a join AND to remap through a
     Project's targets — the latter a silent sibling divergence that had been
     answering with another column's MCV list. Spun out: **P5.6-e-iii**.)*
-  - [ ] **P5.6-e-iii** de-saturate ANALYZE's ndistinct (Haas–Stokes,
+  - [x] **P5.6-e-iii** de-saturate ANALYZE's ndistinct (Haas–Stokes,
     upstream `compute_distinct_stats`, analyze.c), THEN resolve the join keys
     in the merged left‖right coordinate space they are written in and let
     `columnNDistinctForChild` resolve through a join. The order is forced by
@@ -887,6 +887,21 @@
     because a saturated `nd` compounds up the chain and because supplying
     `nd` removes the M0126-0010 `max(|l|,|r|)` cap, which fires only on the
     nd-unavailable path. Bar: UNITS + DS05 + audit run.
+    **DONE 2026-08-04** — `executor.ndistinctEstimate` +
+    `rightKeyNDistinct` on the equi arm + the `*Join` arm on
+    `columnNDistinctForChild`; cap left fallback-only. Violations 5 → 2
+    (09 §5.4). Two regressions spun out rather than absorbed:
+    **P5.6-f** (multi-key pricing + `fkselec`; owns Q9, which went
+    UNMEASURED) and **P5.6-g** (`eqjoinsel_semi`'s MCV arm; owns the
+    SEMI/ANTI `est=1` collapse).
+- [ ] **P5.6-f** price EVERY `HashKeys` pair (`clauselist_selectivity`) AND
+  add the `get_foreign_key_join_selectivity` analogue — the two halves must
+  land together; the first alone estimates Q9's 2-pair join at ≈2 rows.
+  P5.9 cannot certify Q9's ≤10² bar until this lands. Bar: UNITS + DS05 +
+  audit run with Q9 measurable.
+- [ ] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor;
+  closes the SEMI/ANTI `est=1` collapse (Q21 4003× under is an audit
+  violation). Bar: UNITS + DS05 + audit run.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

@@ -208,38 +208,63 @@ func TestSemiJoinResolvesTheRightKeyInMergedCoordinates(t *testing.T) {
 	}
 }
 
-func TestEstimateJoinLeavesTheEquiKeyNDistinctGapOpen(t *testing.T) {
-	// A TRIPWIRE for the deferral, not an endorsement: the INNER/equi arm
-	// still resolves RightKey against j.Right without shifting, so the
-	// right side contributes nothing to max(nd) and the join divides by
-	// nd_l alone. Correcting it in isolation was measured as a large net
-	// regression (estimateJoin's header; P5.6-e-iii owns the fix, which
-	// lands together with a de-saturated ANALYZE ndistinct). When that
-	// task lands, this expectation becomes 1000 and the test's name and
-	// body should change with it.
+func TestEstimateJoinResolvesTheRightKeyInMergedCoordinates(t *testing.T) {
+	// M0127-P5.6-e-iii closed the gap the former
+	// TestEstimateJoinLeavesTheEquiKeyNDistinctGapOpen tripwire pinned.
+	// The right key names the right input's column 2, which `keyed` writes
+	// as the MERGED index 2+2 = 4 — a coordinate a 3-column child cannot
+	// hold. The old lookup handed 4 straight to `j.Right`, read out of
+	// range, and took the "nd unavailable" branch, so the right side never
+	// entered max(nd) and the join divided by nd_l = 100 alone:
+	// 1000*900/100 = 9000.
+	//
+	// Shifted down by the left's width it resolves to nd_r = 900, which
+	// wins max(nd): 1000*900/900 = 1000. That is the PK-side ndistinct an
+	// FK-PK join must divide by, and reading it is what stops a join chain
+	// from compounding.
 	left := scanWithStats("l", 1000, 100, 100)
 	right := scanWithStats("r", 900, 5, 7, 900)
 	j := keyed(mergedJoin(JoinTypeInner, left, right), 0, 2)
-	if got, want := EstimateRows(j), int64(9000); got != want {
-		t.Fatalf("estimate = %d, want %d (nd_l=100 only; nd_r deliberately unresolved)", got, want)
+	if got, want := EstimateRows(j), int64(1000); got != want {
+		t.Fatalf("estimate = %d, want %d (nd_r=900 must win max(nd))", got, want)
+	}
+
+	// The other direction: the left key's ndistinct still wins when it is
+	// the larger, so the shift did not simply replace one side with the
+	// other. Right column 0 has nd 5; max(100, 5) = 100 → 1000*900/100.
+	left2 := scanWithStats("l", 1000, 100, 100)
+	right2 := scanWithStats("r", 900, 5, 7, 900)
+	j2 := keyed(mergedJoin(JoinTypeInner, left2, right2), 0, 0)
+	if got, want := EstimateRows(j2), int64(9000); got != want {
+		t.Fatalf("estimate = %d, want %d (nd_l=100 still wins max(nd))", got, want)
 	}
 }
 
-func TestColumnNDistinctDeliberatelyStopsAtAJoin(t *testing.T) {
-	// The one sanctioned divergence between the two column lookups. The
-	// ndistinct twin feeds the UNCAPPED `l·r/nd` formula, where a
-	// saturated ANALYZE ndistinct compounds up a join chain (Q9: 124.7× →
-	// 176 424× over when this arm existed); the stats twin feeds
-	// clauseSelectivity, whose output is bounded by 1. So the stats twin
-	// resolves through a join and this one does not — yet.
+func TestColumnNDistinctResolvesThroughJoin(t *testing.T) {
+	// M0127-P5.6-e-iii: the two column lookups no longer diverge. The
+	// ndistinct twin was withheld from descending through a *Join while
+	// ANALYZE stored a SAMPLE-saturated ndistinct, because it feeds the
+	// uncapped `l·r/nd` formula and a saturated nd compounds up a join
+	// chain (Q9: 124.7× → 176 424× over). Haas-Stokes scaling landed with
+	// this arm, so both twins now resolve a merged coordinate to the base
+	// relation's stats — upstream's `examine_variable` behaviour.
 	left := scanWithStats("l", 1000, 11, 12)
 	right := scanWithStats("r", 900, 21, 22)
 	j := mergedJoin(JoinTypeInner, left, right)
-	if got := columnNDistinctForChild(1, j); got != 0 {
-		t.Fatalf("columnNDistinctForChild(1, join) = %d, want 0 (P5.6-e-iii owns this arm)", got)
+	if got := columnNDistinctForChild(1, j); got != 12 {
+		t.Fatalf("columnNDistinctForChild(1, join) = %d, want 12 (left col 1)", got)
 	}
 	if st := columnStatsForChild(1, j); st == nil || st.NDistinct != 12 {
 		t.Fatalf("columnStatsForChild(1, join) did not resolve through the join: %+v", st)
+	}
+	// Right side, merged coordinate: left is 2 wide, so index 3 is the
+	// right's column 1. Both twins must agree.
+	lw := len(left.Output())
+	if got := columnNDistinctForChild(lw+1, j); got != 22 {
+		t.Fatalf("columnNDistinctForChild(right.c1, join) = %d, want 22", got)
+	}
+	if st := columnStatsForChild(lw+1, j); st == nil || st.NDistinct != 22 {
+		t.Fatalf("stats/ndistinct siblings disagree through a join: %+v", st)
 	}
 }
 

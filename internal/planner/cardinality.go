@@ -386,36 +386,41 @@ func IsSmallDimensionSide(n Node) bool {
 //     4.3 × 10⁷ against 131 actual rows. Upstream feeds the entire
 //     restrictlist to `clauselist_selectivity`.
 //
-// A THIRD cause surfaced while fixing those two and is deliberately NOT
-// fixed here — see P5.6-e-iii and the deferral ledger. `LeftKey` and
-// `RightKey` live in the MERGED left‖right coordinate space
+// M0127-P5.6-e-iii closes the THIRD cause that surfaced while fixing those
+// two, together with the two defects that made it unlandable on its own.
+// `LeftKey` and `RightKey` live in the MERGED left‖right coordinate space
 // (`splitEqualityForHash` classifies operands by `Index < leftWidth`, and
-// the executor evaluates them against a `mergedKeySlot`), so
-// `keyNDistinct(j.RightKey, j.Right)` below hands a merged index to the
-// right child's OWN schema: it reads out of range — 0, the "nd
-// unavailable" path — or, on a right input wider than the left, silently
-// reads another column's ndistinct. The right side of an equi-join has
-// therefore never contributed to `nd` here.
+// the executor evaluates them against a `mergedKeySlot`), so the old
+// `keyNDistinct(j.RightKey, j.Right)` handed a merged index to the right
+// child's OWN schema: it read out of range — 0, the "nd unavailable" path
+// — or, on a right input wider than the left, silently read another
+// column's ndistinct. The right side of an equi-join never contributed to
+// `nd`.
 //
-// It stays broken this loop because correcting it is MEASURABLY worse in
-// isolation. The audit was re-run with the correction in place
+// Correcting that alone was measured and REJECTED
 // (`2026-08-04-p56eii-postfix.txt`): every joinrel it touched became more
 // accurate — Q9's two deepest joins landed exactly on their actuals — and
 // the queries above them got far worse, Q9's final joinrel going from
 // 124.7× over to 176 424× and Q8's from 1.9× under to 2 171× over. Two
-// pre-existing defects were being cancelled by the missing nd:
+// pre-existing defects were being cancelled by the missing nd, and both are
+// addressed here:
 //
-//   - goopg's ANALYZE reports the SAMPLE's distinct count with no
-//     Haas-Stokes scale-up (`compute_distinct_stats`, analyze.c), so a
-//     1 500 000-row unique key reads as ~30 000 and the joins above it
-//     divide by a number 50× too small;
-//   - the M0126-0010 cap that bounds a join at max(|l|, |r|) fires only
-//     on the nd-unavailable path, so supplying nd also REMOVES the bound
-//     that was holding those estimates down (Q8 d4: 5 997 241 capped →
-//     624 279 803 uncapped).
-//
-// De-saturating ANALYZE is the prerequisite; the coordinate correction
-// and the through-a-join nd lookup land with it, not before.
+//   - ANALYZE reported the SAMPLE's distinct count with no Haas-Stokes
+//     scale-up, so a 1 500 000-row unique key read as ~30 000 and every
+//     join above it divided by a number 50× too small. Fixed in
+//     `executor.ndistinctEstimate` (mirroring `compute_scalar_stats`,
+//     analyze.c) — the prerequisite, landed in the same commit.
+//   - the M0126-0010 cap that bounds a join at max(|l|, |r|) fires only on
+//     the nd-unavailable path, so supplying nd also removed the bound that
+//     was holding those estimates down (Q8 d4: 5 997 241 capped →
+//     624 279 803 uncapped). Re-examined here and deliberately LEFT on the
+//     fallback path only: it is a non-PG heuristic standing in for
+//     upstream's FK-driven `fkselec` (`get_foreign_key_join_selectivity`,
+//     costsize.c), and a real many-to-many join legitimately exceeds
+//     max(|l|, |r|). What made it look load-bearing was the saturated nd
+//     it was compensating for, not a missing bound. Extending it to the
+//     nd-driven path would silently truncate genuine fan-out; the audit is
+//     what certifies that judgement (09 §5.3).
 func estimateJoin(j *Join) int64 {
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
@@ -441,11 +446,13 @@ func estimateJoin(j *Join) int64 {
 		return scaleByFloat(l, sel)
 	}
 	if j.Algo == JoinAlgoHash || j.Algo == JoinAlgoMerge {
-		// Both lookups are left exactly as they were — see the
-		// coordinate note above. `j.RightKey` against `j.Right` is the
-		// known-wrong one.
+		// M0127-P5.6-e-iii: the right key is resolved in the MERGED
+		// left‖right space it is written in (`rightKeyNDistinct`), the
+		// same shift the SEMI/ANTI path has used since P5.6-e-ii. Before
+		// this the right side of an equi-join never entered `max(nd)` at
+		// all, so a PK-FK join divided by the FK side's ndistinct only.
 		nd := keyNDistinct(j.LeftKey, j.Left)
-		if rnd := keyNDistinct(j.RightKey, j.Right); rnd > nd {
+		if rnd := rightKeyNDistinct(j); rnd > nd {
 			nd = rnd
 		}
 		if nd > 0 {
@@ -664,19 +671,42 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 		// position.
 		return columnNDistinctForChild(idx, x.Child)
 
-	// DELIBERATELY NO *Join ARM — and this is the one place where this
-	// function and its `columnStatsForChild` twin (selectivity.go) are
-	// allowed to differ. Upstream resolves a join-level Var straight to
-	// its base relation's pg_statistic row (`examine_variable`,
-	// selfuncs.c) and this lookup should too; the P5.6-e-ii audit shows
-	// it cannot yet. Supplying nd through a join feeds the UNCAPPED
-	// `l·r/nd` formula in estimateJoin, where a saturated ANALYZE
-	// ndistinct compounds upward — measured on Q9 (124.7× → 176 424×
-	// over) and Q8 (1.9× under → 2 171× over) in
-	// `analysis/leftdeep-joins/2026-08-04-p56eii-postfix.txt`. The stats
-	// twin has no such amplifier: it feeds `clauseSelectivity`, whose
-	// output is a probability in [0, 1]. See estimateJoin's header for
-	// the full diagnosis and P5.6-e-iii for the resume point.
+	// M0127-P5.6-e-iii: the *Join arm this function was missing, and its
+	// `columnStatsForChild` twin (selectivity.go) already had. Upstream
+	// resolves a join-level Var straight to its base relation's
+	// pg_statistic row (`examine_variable`, selfuncs.c) and so does this,
+	// by walking down the side the merged coordinate lands in.
+	//
+	// It is what makes a multi-level PK-FK chain size correctly rather
+	// than compounding: `(lineitem ⋈ orders) ⋈ customer` on custkey needs
+	// `orders.custkey`'s ndistinct from BELOW the first join, and reading
+	// 0 there made the whole chain fall through to defaultEqSelectivity.
+	//
+	// It was withheld through P5.6-e-ii because the estimate audit
+	// measured it as a large REGRESSION in isolation (Q9 124.7× →
+	// 176 424× over, `2026-08-04-p56eii-postfix.txt`). That was never
+	// this arm's fault: it fed `l·r/nd` a SAMPLE-saturated nd, which
+	// ANALYZE now scales up with Haas-Stokes
+	// (`executor.ndistinctEstimate`). The prerequisite landed with this
+	// arm, in this loop, exactly as P5.6-e-iii specified.
+	//
+	// Coordinate rule (identical to the twin): a `*Join`'s Predicate and
+	// key coordinates count from the start of the merged left‖right
+	// schema, so an index at or past the left input's width belongs to
+	// the right child, shifted down. A SEMI/ANTI join's Output() is
+	// left-only, so its indices never reach the shift.
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return 0
+		}
+		lw := len(x.Left.Output())
+		if lw == 0 {
+			return 0
+		}
+		if idx >= lw {
+			return columnNDistinctForChild(idx-lw, x.Right)
+		}
+		return columnNDistinctForChild(idx, x.Left)
 	}
 	return 0
 }

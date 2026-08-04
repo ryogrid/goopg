@@ -1663,8 +1663,13 @@ type ColumnStats struct {
 	// works on a freshly started server, where TableStats.RowCount is still
 	// zero because it is never restored (ledger row pq-P6).
 	//
-	// NDistinct above remains the absolute SAMPLE count every existing
-	// consumer already reads; this field is additive and does not change it.
+	// Since M0127-P5.6-e-iii the two fields are two renderings of ONE
+	// estimate: ANALYZE computes the Haas-Stokes table-wide distinct count
+	// (executor.ndistinctEstimate, upstream compute_scalar_stats) and stores
+	// it absolutely in NDistinct and as NDistinct/RowCount here. Before that
+	// NDistinct held the raw SAMPLE count and this field the raw sample
+	// ratio, so the two disagreed by the sampling factor — a 1.5 M-row unique
+	// key read as NDistinct=30,000 with NDistinctFrac=1.0.
 	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
 }
 
@@ -1683,15 +1688,26 @@ type ColumnStats struct {
 // `NDistinct` first and a catalog row writing `-NDistinctFrac` first would
 // report one number to the user and plan on another.
 //
-// The fraction wins when both are present because it is the one that survives
-// a restart usefully — the absolute count cannot be interpreted without a row
-// count, and the row count is not restored (ledger row pq-P6).
+// Which form wins is upstream's rule, not a goopg preference (analyze.c:2650-
+// 2658): "if we estimated the number of distinct values at more than 10% of
+// the total row count then assume stadistinct should scale with the row count
+// rather than be a fixed value". NDistinctFrac IS that ratio, so the 10% test
+// is a comparison against 0.1 here. Below the threshold the absolute count is
+// the PG-faithful answer AND the more useful one — a boolean column has two
+// distinct values whatever the relation grows to.
+//
+// The fraction still wins when the absolute count is absent, which is how
+// statistics restored from a real PG heap arrive: initdb's pg_statistic reload
+// can recover a negative stadistinct only as a fraction, because converting it
+// to a count needs a row count the reload does not have (ledger row pq-P6).
 func (cs ColumnStats) StaDistinct() float64 {
 	switch {
-	case cs.NDistinctFrac > 0:
+	case cs.NDistinctFrac > 0.1:
 		return -cs.NDistinctFrac
 	case cs.NDistinct > 0:
 		return float64(cs.NDistinct)
+	case cs.NDistinctFrac > 0:
+		return -cs.NDistinctFrac
 	default:
 		return 0
 	}

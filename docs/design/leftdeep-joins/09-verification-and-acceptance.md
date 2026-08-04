@@ -247,6 +247,78 @@ with its own mechanism, filed as **P5.6-e-iii**: de-saturate ANALYZE, then
 land the coordinate correction with it. The rejected run is committed
 because the conclusion is only defensible with its numbers present.
 
+### 5.4 The third cause closed, 2026-08-04 (P5.6-e-iii)
+
+`analysis/leftdeep-joins/2026-08-04-p56eiii.txt`, same instrument and same run
+conditions, LEGACY planner still (`GOOPG_PGSHAPED_DP` OFF).
+
+What landed:
+
+- **ANALYZE de-saturated** (`internal/executor/operators_analyze.go`,
+  `ndistinctEstimate`). goopg stored the SAMPLE's distinct count as the
+  table's ndistinct, so with the default statistics target a 1.5 M-row unique
+  key read as ≈ 30 000. `ndistinctEstimate` mirrors `compute_scalar_stats`'s
+  ndistinct block (analyze.c:2588-2648) branch for branch: the
+  `nmultiple == 0` unique-column arm, the `nmultiple == ndistinct`
+  whole-value-set arm, and Haas–Stokes Duj1 `n·d/(n − f1 + f1·n/N)` clamped to
+  `[d, N]`. `ColumnStats.NDistinct` and `NDistinctFrac` are now two renderings
+  of that one estimate, and `StaDistinct()` picks between them with upstream's
+  own 10 %-of-rows rule instead of always preferring the fraction.
+- **The join keys resolve in the merged coordinate space**
+  (`internal/planner/cardinality.go`). `estimateJoin`'s equi arm reads the
+  right key through `rightKeyNDistinct`, the same left-width shift the
+  SEMI/ANTI path has used since §5.3, and `columnNDistinctForChild` gained the
+  `*Join` arm its `columnStatsForChild` twin already had. The two column
+  lookups no longer diverge; the divergence tripwire test is retired.
+- **The M0126-0010 cap was re-examined and deliberately left alone** — it
+  still fires only on the nd-unavailable fallback path. It is a non-PG
+  heuristic standing in for upstream's FK-driven `fkselec`
+  (`get_foreign_key_join_selectivity`), and a genuine many-to-many join
+  legitimately exceeds `max(|l|,|r|)`. What made it look load-bearing in §5.3
+  was the saturated `nd` it was compensating for.
+
+Violations: **5 → 2.** Q3, Q7 and Q20's inner SEMI are closed outright; Q18's
+final SEMI improved by 293× and still violates.
+
+| query | joinrel | §5.3 | now |
+|---|---|---|---|
+| Q3 | final | 2 967× over | 10.4× over |
+| Q5 | d4 | 447.7× over | 1.5× over |
+| Q7 | d4 | 1 190× under | 1.4× over |
+| Q8 | d3 | 20.7× over | 1.3× over |
+| Q17 | final | 7.5× over | 1.0× under |
+| Q18 | final (SEMI) | 1.26 × 10⁷ over | 42 837× over |
+| Q20 | inner SEMI | 1 311× over | 129× over |
+| Q16 | final (ANTI) | 16.0× under | 85.1× under |
+| Q19 | final | 13.1× under | 131× under |
+| Q21 | final (ANTI) | 9.7× under | 4 003× under |
+
+Two regressions came out of it, both filed rather than papered over:
+
+- **SEMI/ANTI collapse to `est=1`** (Q21, Q19, Q16, and Q21's inner SEMI). A
+  truthful `nd` makes `eqjoinsel_semi`'s `nd1 ≤ nd2` test succeed, the match
+  fraction becomes exactly 1.0, and JOIN_ANTI's `outer · (1 − jselec)` floors
+  at `clamp_row_est`'s 1. Upstream reaches 1.0 far less often because it takes
+  the MCV branch of `eqjoinsel_semi` first, which goopg has no join-level MCV
+  list for.
+- **Q9 is UNMEASURED** — it exceeded the audit's 150 s timeout where §5.3
+  measured it at 93.9 s. Attributed per §6 before anything landed: the
+  ANALYZE half is the whole cause (reverting only the planner half reproduces
+  the identical plan shape, `rows=160406045` vs `159924827`). The mechanism is
+  a class-(a) defect this change UNMASKED rather than introduced — Q9's
+  `l_suppkey = ps_suppkey AND l_partkey = ps_partkey` is a TWO-pair equi-join
+  that `estimateJoin` prices on ONE pair while excluding BOTH from the
+  residual, so it reads `6 M · 800 k / 10 000 = 481 M` and the DP puts it
+  under the `part` filter instead of above it. Pricing every pair the way
+  `clauselist_selectivity` does swings it the other way (≈ 2 rows) without
+  upstream's FK selectivity to bound it, so the fix is
+  `get_foreign_key_join_selectivity`, not a constant. **P5.9 cannot certify
+  Q9's ≤ 10² bar until this lands.**
+
+Q9's deepest joins are now exact (`5 997 241` on both), which is the evidence
+that the ndistinct itself is right and the remaining error is the multi-key
+pricing above it.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
