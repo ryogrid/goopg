@@ -739,3 +739,50 @@ Two consequences for the rest of this section:
   the root's `outputLayout`, which the recursion now hands back. The canonical
   relid-order commitment above therefore remains a decision about what the
   search root PUBLISHES, not about how each joinrel is assembled internally.
+
+**Amendment 2026-08-04 (P5.5-f-i) — the variant is decided: the reordering
+`Project`, and it is the canonical layout rather than a way around it.**
+`createPlanAtSearchRoot(p, bindingWidth)`
+(`internal/planner/createplanroot.go`) is now the only `createPlan` entry point
+the search's caller may use; `createPlanNode` returns the search's own
+cost-chosen column order, which is right for a child of another join arm and
+wrong for anything else.
+
+The reason the second variant is not merely the cheaper one rests on a fact this
+section could not state before the layout existed:
+
+> At the SEARCH ROOT, this section's canonical **relid** order and the
+> pre-search **binding** order are the same sequence.
+
+`buildInitialRels` assigns relid `1<<i` to FROM item `i` and records
+`baseOffset = bindings[i].offset`, which ascends with `i`; the root's relset is
+the FULL set. So ordering the final relset's base rels by relid and
+concatenating their columns reproduces exactly the pre-search concatenation.
+Publishing relid order at the root *is* publishing binding order — which means
+the `Project` materialises the canonical layout at the one place this section
+requires it to be observable, and simultaneously collapses the boundary map to
+the identity for every consumer above. The enclosing tree needs no rewrite at
+all, and the map survives in exactly one place: that node's target list. The
+`Project` is elided when the search left the columns where the bindings put them
+(the leading left-deep case), which is the elision this section anticipated.
+
+Two consequences worth recording:
+
+- **`bindingWidth` is a parameter, not `len(layout)`.** A FROM item that never
+  entered the search yields a root that is self-consistent and permutation-clean
+  *judged against its own width* — and missing columns the enclosing tree still
+  references. Only the caller holds the width of the concatenation the tree was
+  resolved against, so only the caller can state it; `boundaryMap` refuses the
+  hole (and out-of-range and duplicate coordinates) against that number.
+- **The tripwire above is now real code** — `assertColumnRefsWithinSchema` — but
+  applied so far only to the boundary node's own targets. Running it over the
+  whole enclosing tree, together with the searched-subtree tagging that makes
+  the `buildBindingsPosMap` / `reconcileNLILayout` family skip, is P5.5-f-ii.
+
+Divergence from PG worth naming: PG has no node here. `set_upper_references`
+(setrefs.c:2214) renumbers the upper plan's Vars in place, so a reordered join
+order costs PG nothing in plan shape. goopg emits one narrow pass-through
+`Project`, which will show up in `EXPLAIN` as a node PG does not print
+(deferral-ledger row, 2026-08-04). Rewriting the enclosing expressions instead
+remains available and is what closes that gap; the map this task builds is
+exactly its input.

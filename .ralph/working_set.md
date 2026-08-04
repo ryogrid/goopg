@@ -1,56 +1,53 @@
 (idle — nothing in flight)
 
-M0127-P5.5-e-ii-a is CLOSED and committed. **The merge-join `createPlan` arm
-exists, and with it the finding that goopg must DELETE the Sort nodes PG's
-arm creates.**
+M0127-P5.5-f-i is CLOSED. **The search boundary now exists**
+(`internal/planner/createplanroot.go`): `createPlanAtSearchRoot(p,
+bindingWidth)` is the only `createPlan` entry point a search caller may use, and
+it republishes the root's row in pre-search BINDING order.
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this note).
 It parks M-NIGHTLY below M0127, so the banner selects the next unchecked M0127
-item — `P5.5-e-ii-b`: `create_nestloop_plan` (createplan.c:4322) for
-`PathNestLoop` (plain, `pathgen.go:109`) and the NLI paths
-(`joinpathsnli.go:191`). It reuses `joinInputsFor`/`keyPairs`/`joinPredicate`
-whole; what is its own is the parameter-binding contract with a parameterised
-inner index path (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2 Memoize/binding
-contract) and the residual DROP via `indexPathClause.ri`/`ecID` the P5.5-c
-ledger row waits on.**
+item — the P5.5 PARENT, i.e. `P5.5-f-ii` (IMPLEMENTATION-TODO): pinned-spine
+re-resolution (`predp.go`) consumes the boundary map; searched-subtree TAGGING
+so the `buildBindingsPosMap` / `applyJoinTreePosMap` family skips;
+`reconcileNLILayout` no-op assertion on searched trees;
+`assertColumnRefsWithinSchema` widened from the boundary node to the whole
+enclosing tree. Plan-snapshot re-baseline in the SAME commit. Bar: UNITS + SPOT
++ DS05 + PLAN (re-baseline).**
 
 Carry-over facts a next loop should not re-derive:
 
-- **Clause coordinates are BINDING coordinates** (pre-search concatenation of
-  every FROM item's schema). `relidsOfExpr` (joinrestrict.go:357) buckets
-  `ColumnRef.Index` against those same offsets, so any new translator must use
-  `scopeIgnore` to keep agreeing with it (rule #2).
-- The join prologue is now ONE function: `joinInputsFor(p, kind, outerPath,
-  innerPath)` → `joinInputs{outer,inner,outerRelids,innerRelids,merged,lay,
-  index}`, plus `keyPairs` (orientation + translation, ORDER PRESERVED) and
-  `joinPredicate` (keys + residual folded into `Join.Predicate`). The NL arm
-  should not re-write any of it.
-- **`Join.HashKeys` order IS the merge sort order** (`mergeSideKeyExprs` →
-  `mergeSortedSource.less`), and `fillJoinHashKeys` REBUILDS that list from
-  `Predicate` at the tail of `Plan()` — so key conjuncts must be appended in
-  key order or the rebuild re-orders the sort.
-- **goopg's `JoinAlgoMerge` sorts both inputs itself** (`openMergeJoin`), fixed
-  ascending / NULL-keys-last. Hence `absorbMergeSort` + the two ordering
-  refusals. NL has no such absorption question.
-- `createSortPlan` now TRANSLATES its pathkey exprs onto the child layout (was
-  a latent P5.5-d defect: untranslated keys sorted by whatever sat at that
-  binding index). Nil child layout still passes through — ledgered.
-- **P5.5-f still open** (03 §10 boundary map); **P5.6 `sizeJoinRel` still
-  open**. `GOOPG_PGSHAPED_DP` stays OFF. **P4.1 ledger row #3 still open**
-  (`mergeJoinStream.bufferGroup` twin).
-- Do NOT `git stash`; repo gofmt baseline go1.25 (never wholesale `-w`);
-  `cd` persists across Bash calls — use absolute paths.
-- Gate recipes — SPOT: `scripts/tpch-spotcheck.sh`. DS05:
+- **At the search ROOT, canonical relid order == pre-search binding order.**
+  `buildInitialRels` gives FROM item i relid `1<<i` with ascending
+  `baseOffset`, and the root relset is full. That is why the boundary `Project`
+  IS 03 §10's canonical layout, not a detour around it — and why nothing above
+  the root needs rewriting.
+- `bindingWidth` is a PARAMETER, never `len(layout)`: a FROM item that never
+  entered the search yields a root that is permutation-clean against its own
+  width and short of columns the enclosing tree references (M0097-0058 shape).
+- Clause coordinates are BINDING coordinates; `relidsOfExpr`
+  (joinrestrict.go:357) buckets `ColumnRef.Index` against the same offsets, so
+  any new translator must use `scopeIgnore` (rule #2).
+- The join prologue is ONE function: `joinInputsFor` + `keyPairs` +
+  `joinPredicate`; all three arms reuse it. NLI is the only node with TWO
+  coordinate spaces (`createplannl.go`).
+- `boundaryMap`'s duplicate branch is defensive: `joinInputsFor`'s
+  `bindingIndex()` already panics on a duplicate before the root sees it.
+- **P5.6 `sizeJoinRel` open**; `GOOPG_PGSHAPED_DP` stays OFF. **P4.1 ledger row
+  #3 still open** (`mergeJoinStream.bufferGroup` twin).
+- Do NOT `git stash`; gofmt baseline go1.25 (never wholesale `-w`); `cd`
+  persists across Bash calls — use absolute paths.
+- Gate recipes — SPOT: `scripts/tpch-spotcheck.sh` (~30 s + build). DS05:
   `scripts/tpcds-sf05-regression.sh sweep` (~1 h). PLAN:
   `bench/tpch/setup_goopg.sh` → `PATH=$PWD/postgres/local_install/bin:$PATH
   make plan-gate` → `bench/tpch/stop_goopg.sh`.
 
-Gates run this loop: UNITS PASS (exit 0, 0 FAILs, `/tmp/units_p55eiia.log`);
-SPOT PASS (`/tmp/spot_p55eiia.log`, Q12=2 Q13=35 canonical, 28.5s); pgbench
-SMOKE via the commit hook. DS05 not applicable — the arm is reachable only from
-the inert search.
+Gates run this loop: build+vet clean; the 8 new boundary tests PASS; UNITS PASS
+(exit 0, 0 FAILs, `/tmp/units_p55fi.log`); SPOT PASS (`/tmp/spot_p55fi.log`,
+Q12=2 Q13=35 canonical, 28.9 s); pgbench SMOKE via the commit hook. DS05 not
+applicable — the boundary is reachable only from the inert search.
 
-Nightly triage: the same 17 `AI-20260804-005028-*` subjects, all already filed.
-Nothing new.
+Nightly triage: still the same 17 `AI-20260804-005028-*` subjects from run
+20260804-005028, all already filed under M-NIGHTLY. Nothing new to file.
 
 In-flight: none.

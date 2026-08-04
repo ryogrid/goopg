@@ -683,12 +683,36 @@
   key; a wrapped inner leaf. Still inert. 6 new tests
   (`createplannl_test.go`) + 1 rewritten (`joinpathsnli_test.go`). 3 ledger
   rows. Bar met: UNITS + SPOT.)*
-- [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
-  **search-boundary coordinate map** (03 §10: relid-order canonical
-  layout — one map composed from the final relset, or a relid-reordering
-  root Project; ColumnRef-in-schema plan-time assertion); pinned-spine
-  re-resolution consumes the map; searched-subtree tagging so legacy
-  passes skip; `reconcileNLILayout` no-op assertion on searched trees.
+- [x] **P5.5-f-i** the search boundary: 03 §10's coordinate map and the one
+  node that makes it invisible above the search root
+  (`internal/planner/createplanroot.go`).
+  *(DONE 2026-08-04. `createPlanAtSearchRoot(p, bindingWidth)` is now the only
+  `createPlan` entry point a search caller may use — `createPlanNode` returns
+  the search's own cost-chosen column order, which is right for a child of
+  another join arm and wrong for anything else. **The finding that decided
+  §10's open variant:** at the search root, §10's canonical RELID order and the
+  pre-search BINDING order are the same sequence — `buildInitialRels` assigns
+  relid `1<<i` to FROM item `i` with an ascending `baseOffset`, and the root's
+  relset is the FULL set. So the reordering `Project` is not a way around the
+  canonical layout, it IS that layout materialised at the one place §10
+  requires it observable, and it collapses the boundary map to the identity for
+  every consumer above: the enclosing tree needs no rewrite and the map
+  survives only as that node's target list. Elided when the search left the
+  columns where the bindings put them (the leading left-deep case).
+  **Second finding:** `bindingWidth` must be a PARAMETER, not `len(layout)` — a
+  FROM item that never entered the search yields a root that is
+  self-consistent and permutation-clean judged against its OWN width, and
+  missing columns the enclosing tree still references; that is the M0097-0058
+  shape, and it is detectable only from outside. §10's tripwire is real code
+  now (`assertColumnRefsWithinSchema`) but applied to the boundary node alone.
+  2 ledger rows — PG adds NO node here (`set_upper_references`, setrefs.c:2214,
+  renumbers upper Vars in place), and the tripwire's one-node scope. Still
+  inert. 8 new tests (`createplanroot_test.go`). Bar met: UNITS + SPOT.)*
+- [ ] **P5.5-f-ii** pinned-spine re-resolution consumes the boundary map;
+  searched-subtree tagging so the `buildBindingsPosMap` / `applyJoinTreePosMap`
+  family skips; `reconcileNLILayout` no-op assertion on searched trees;
+  `assertColumnRefsWithinSchema` widened from the boundary node to the whole
+  enclosing tree. Plan-snapshot re-baseline in the same commit.
 - [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling

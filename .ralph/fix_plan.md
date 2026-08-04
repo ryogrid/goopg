@@ -6912,14 +6912,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       cannot carry it and hoisting is the D6.3b Q9 blowup. 3 ledger rows. Still
       inert (`GOOPG_PGSHAPED_DP` OFF). 6 new tests + 1 rewritten. Bar met:
       UNITS + SPOT.
-- [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
-      search-boundary coordinate map (03 §10: relid-order canonical layout —
-      one map composed from the final relset, or a relid-reordering root
-      Project; ColumnRef-in-schema plan-time assertion); pinned-spine
-      re-resolution consumes the map; searched-subtree tagging so legacy passes
-      skip; `reconcileNLILayout` no-op assertion on searched trees.
-      Plan-snapshot re-baseline same commit. IMPLEMENTATION-TODO P5.5; 03 §10;
-      02 §3. Bar: UNITS + SPOT + DS05 + PLAN (re-baseline).
+- [x] **M0127-P5.5-f-i — the search boundary: 03 §10's coordinate map, and the
+      one node that makes it invisible above the search root.** DONE 2026-08-04
+      (`internal/planner/createplanroot.go` new).
+      `createPlanAtSearchRoot(p, bindingWidth)` is now the only `createPlan`
+      entry point a search caller may use: `createPlanNode` returns the search's
+      own cost-chosen column order, which is correct for a child of another join
+      arm and wrong for everything else — and the enclosing tree (top Project
+      targets, retained Filters, Sort keys, Aggregate arguments, the pinned
+      unnest spine) is written in PRE-SEARCH BINDING coordinates because that is
+      the space `planSelect` resolved it in. **The finding that decided the
+      variant 03 §10 left open:** at the search root, §10's canonical RELID
+      order and the pre-search BINDING order are THE SAME SEQUENCE —
+      `buildInitialRels` assigns relid `1<<i` to FROM item `i` and records an
+      ascending `baseOffset`, and the root's relset is the FULL set. So the
+      reordering `Project` is not a way around the canonical layout, it IS that
+      layout materialised at the one place §10 requires it observable; it
+      collapses the boundary map to the identity for every consumer above (the
+      enclosing tree needs no rewrite at all), and the map survives in exactly
+      one place — that node's target list. It is elided when the search left the
+      columns where the bindings put them, the leading left-deep case.
+      **Second finding, from a test that failed:** `bindingWidth` must be a
+      PARAMETER, not `len(layout)`. A FROM item that never entered the search
+      yields a root that is entirely self-consistent and permutation-clean when
+      judged against its OWN width, while missing columns the enclosing tree
+      still references — the M0097-0058 shape exactly, and detectable only from
+      outside. `boundaryMap` refuses holes, out-of-range coordinates and
+      duplicates against the caller's number. §10's plan-time tripwire is real
+      code now (`assertColumnRefsWithinSchema`, turning that class from an
+      execution-time slice panic into an attributable planner bug) but is
+      applied to the boundary node alone. 2 ledger rows: PG adds NO node here
+      (`set_upper_references`, setrefs.c:2214, renumbers upper Vars in place, so
+      the boundary `Project` is a node PG never prints), and the tripwire's
+      one-node scope. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests
+      (`createplanroot_test.go`). IMPLEMENTATION-TODO P5.5-f-i; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT.
+- [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing
+      Nodes;** pinned-spine re-resolution consumes the boundary map;
+      searched-subtree tagging so the `buildBindingsPosMap` /
+      `applyJoinTreePosMap` family skips; `reconcileNLILayout` no-op assertion
+      on searched trees; `assertColumnRefsWithinSchema` widened from the
+      boundary node to the whole enclosing tree. Plan-snapshot re-baseline same
+      commit. IMPLEMENTATION-TODO P5.5-f-ii; 03 §10; 02 §3. Bar: UNITS + SPOT +
+      DS05 + PLAN (re-baseline).
 - [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
       FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build
       penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
