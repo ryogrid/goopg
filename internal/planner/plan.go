@@ -571,6 +571,8 @@ func (*FuncCall) exprNode()  {}
 
 // SeqScan — full heap scan of a single relation.
 type SeqScan struct {
+	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
+	searchedTree
 	pos    int
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
@@ -653,6 +655,8 @@ func (n *SeqScan) Output() Schema { return n.schema }
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
+	// searchedTree: see *SeqScan above (searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	Alias string // FROM-clause alias; empty when not specified. M0062-0002
@@ -697,6 +701,8 @@ func (n *IndexScan) Output() Schema { return n.schema }
 // inner probe yields no rows, the operator emits `outer ++
 // nullRow(innerWidth)` to preserve outer rows.
 type NestedLoopIndexJoin struct {
+	// searchedTree: the parameterised arm of createNestLoopPlan (searchedtree.go).
+	searchedTree
 	pos       int
 	Type      JoinType
 	Outer     Node
@@ -827,6 +833,9 @@ const (
 // Merge join sorts both sides on their keys and merges the two
 // ordered streams.
 type Join struct {
+	// searchedTree: the usual search root — every join arm but the
+	// parameterised nested loop emits one (searchedtree.go).
+	searchedTree
 	pos       int
 	Type      JoinType
 	Algo      JoinAlgo
@@ -1058,6 +1067,10 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// searchedTree: the scan arms' leaf rewrapper can restore the leaf's
+	// original *Filter around a rebuilt scan, so a one-relation search root
+	// can be a Filter (searchedtree.go).
+	searchedTree
 	pos       int
 	Child     Node
 	Predicate Expr
@@ -1076,6 +1089,10 @@ func (n *Filter) Output() Schema { return n.Child.Output() }
 
 // Project — evaluates the target list against its child's rows.
 type Project struct {
+	// searchedTree: the boundary node P5.5-f-i emits is a *Project, and it is
+	// the node the legacy posmap family must most carefully not walk into
+	// (searchedtree.go).
+	searchedTree
 	pos     int
 	Child   Node
 	Targets []Expr
@@ -1160,6 +1177,8 @@ type SortKey struct {
 }
 
 type Sort struct {
+	// searchedTree: the PathSort arm's root (searchedtree.go).
+	searchedTree
 	pos   int
 	Child Node
 	Keys  []SortKey

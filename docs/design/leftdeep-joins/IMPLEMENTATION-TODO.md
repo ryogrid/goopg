@@ -708,11 +708,39 @@
   2 ledger rows — PG adds NO node here (`set_upper_references`, setrefs.c:2214,
   renumbers upper Vars in place), and the tripwire's one-node scope. Still
   inert. 8 new tests (`createplanroot_test.go`). Bar met: UNITS + SPOT.)*
-- [ ] **P5.5-f-ii** pinned-spine re-resolution consumes the boundary map;
-  searched-subtree tagging so the `buildBindingsPosMap` / `applyJoinTreePosMap`
-  family skips; `reconcileNLILayout` no-op assertion on searched trees;
-  `assertColumnRefsWithinSchema` widened from the boundary node to the whole
-  enclosing tree. Plan-snapshot re-baseline in the same commit.
+- [x] **P5.5-f-ii-a** searched-subtree tagging so the `buildBindingsPosMap` /
+  `applyJoinTreePosMap` family skips, plus the `reconcileNLILayout` no-op
+  assertion. *(DONE 2026-08-04, `internal/planner/searchedtree.go` new.
+  `searchedTree` is an embedded one-bit tag on the seven node kinds
+  `createPlanAtSearchRoot` can return as a root; `markSearchedTree` PANICS on
+  any other kind, so a future arm that returns a new root kind cannot leave a
+  silently untagged subtree. **The measured finding that reshaped the task:**
+  HALF of this was already true and nobody had written it down. M0125-0012
+  (TPC-DS Q8) made every `*Project` in a join tree an opaque scope boundary on
+  BOTH sides of the map — `collect` advances past one, `applyJoinTreePosMap`
+  returns at one — so the boundary `Project` inherited its protection for free;
+  a probe confirms `buildBindingsPosMap` returns nil over it and no target
+  moves. The hole is the **ELIDED** root: when the search's order already is
+  binding order there is no Project to stop at and both passes walk into a bare
+  `*Join`. The numeric half of that is provably harmless (identity layout ⇒
+  identity map, since `collect`'s DFS order over a join IS its output order) —
+  but `applyJoinTreePosMap`'s `*Join` arm calls `reresolveJoinByName`, and
+  `reconcileNLILayout` is name resolution end to end, and those rebind the
+  searched joins' keys by NAME over a layout derived by COORDINATE one node
+  earlier. **Second finding:** that name-resolution check is not free evidence.
+  It abstains on an unnamed operand (`reresolveJoinByName` returns immediately),
+  on an ambiguous name (-1, left alone), and on everything it does not rebind —
+  and the P5.5-e unit fixtures build clause operands with `col(i)`, i.e.
+  UNNAMED, so reusing them would have made every assertion pass vacuously.
+  `searchedtree_test.go` supplies its own named-clause helper. 2 ledger rows.
+  10 new tests, two of which pin PRE-task behaviour so a later simplification
+  can see which half was already covered. Still inert.)*
+- [ ] **P5.5-f-ii-b** pinned-spine re-resolution consumes the boundary map
+  (`predp.go`: the map is the identity above the root, so `layoutPosMap` should
+  come out nil and the spine re-resolution should be provably skipped, not
+  merely unexercised); `assertColumnRefsWithinSchema` widened from the boundary
+  node to the whole enclosing tree. Plan-snapshot re-baseline in the same
+  commit.
 - [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling

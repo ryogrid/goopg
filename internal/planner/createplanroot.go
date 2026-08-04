@@ -99,13 +99,25 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 	if len(lay) != len(n.Output()) {
 		panic(fmt.Sprintf("createPlan: search root layout is %d columns but its output is %d", len(lay), len(n.Output())))
 	}
+	// M0127-P5.5-f-ii-a: the independent cross-check on the arms' coordinate
+	// arithmetic, run on the join tree BEFORE the boundary Project goes on top
+	// — on the Project itself the claim is false by design (searchedtree.go
+	// explains why that is the sharpest argument for the tag).
+	assertSearchedTreeNeedsNoReconcile(n)
 	m := boundaryMap(lay, bindingWidth)
 	if boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
 		// case. Emitting a Project here would be a pure copy of every row.
-		return n
+		//
+		// The tag still goes on: the legacy posmap family must skip this
+		// subtree whether or not a Project was needed. In the identity case
+		// its map would come out the identity too and the skip would look
+		// optional — but only for the shapes where it does, and
+		// `reconcileNLILayout`'s name resolution can move a self-join's keys
+		// regardless of layout.
+		return markSearchedTree(n)
 	}
-	return projectToBindingOrder(n, m)
+	return markSearchedTree(projectToBindingOrder(n, m))
 }
 
 // boundaryMap composes 03 §10's map from the search root's layout: entry `b` is

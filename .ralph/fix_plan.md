@@ -6947,13 +6947,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       one-node scope. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests
       (`createplanroot_test.go`). IMPLEMENTATION-TODO P5.5-f-i; 03 §10; 02 §3.
       Bar met: UNITS + SPOT.
+- [x] **M0127-P5.5-f-ii-a — the searched-subtree tag: making the legacy
+      layout-correction family skip, and finding out that half of it already
+      did.** DONE 2026-08-04 (`internal/planner/searchedtree.go` new).
+      `searchedTree` is a one-bit embedded tag on the seven node kinds
+      `createPlanAtSearchRoot` can return as a root; `markSearchedTree` PANICS
+      on any other kind, because the failure mode of a future arm returning an
+      untaught root kind is a SILENTLY untagged subtree — a plan that runs and
+      returns wrong rows. Three skips consume it: `buildBindingsPosMap`'s
+      collector treats a tagged root as an opaque leaf (advance past its width,
+      record no scan entry, so every binding inside it falls through the
+      returned closure unchanged — the identity, which is the truth),
+      `applyJoinTreePosMap` returns at one, `reconcileNLILayout` returns at one.
+      **The measured finding that reshaped the task:** the boundary `Project`
+      was ALREADY opaque to the whole family — not for search reasons, but
+      because M0125-0012 (TPC-DS Q8) made every `*Project` in a join tree a
+      scope boundary on both sides of the map so that build and apply stop at
+      the same nodes. A probe confirms `buildBindingsPosMap` returns nil over it
+      and no target moves. The hole was the **elided** root: with the columns
+      already in binding order there is no Project to stop at and both passes
+      walk into a bare `*Join`. The numeric half of that is provably harmless
+      (identity layout ⇒ identity map, since `collect`'s DFS order over a join
+      IS its output order) — but `applyJoinTreePosMap`'s `*Join` arm calls
+      `reresolveJoinByName` and `reconcileNLILayout` is name resolution end to
+      end, and those rebind the searched joins' keys by NAME over a layout
+      derived by COORDINATE one node earlier. **Second finding:**
+      `assertSearchedTreeNeedsNoReconcile` (the no-op assertion — it runs the
+      real pass over the join tree below the boundary and panics if any
+      `ColumnRef` moved) is weaker evidence than it looks: it abstains on an
+      unnamed operand, on an ambiguous name, and on everything the pass does not
+      rebind — and the P5.5-e fixtures build operands with `col(i)`, i.e.
+      UNNAMED, so reusing them would have made every assertion pass vacuously.
+      The tests supply their own named-clause helper. 2 ledger rows. 10 new
+      tests (`searchedtree_test.go`), two of which pin PRE-task behaviour so a
+      later simplification can see which half was already covered. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). IMPLEMENTATION-TODO P5.5-f-ii-a; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing
-      Nodes;** pinned-spine re-resolution consumes the boundary map;
-      searched-subtree tagging so the `buildBindingsPosMap` /
-      `applyJoinTreePosMap` family skips; `reconcileNLILayout` no-op assertion
-      on searched trees; `assertColumnRefsWithinSchema` widened from the
-      boundary node to the whole enclosing tree. Plan-snapshot re-baseline same
-      commit. IMPLEMENTATION-TODO P5.5-f-ii; 03 §10; 02 §3. Bar: UNITS + SPOT +
+      Nodes;** pinned-spine re-resolution consumes the boundary map (`predp.go`:
+      the map is the identity above the root, so `layoutPosMap` should come out
+      nil and the spine re-resolution be provably skipped, not merely
+      unexercised); `assertColumnRefsWithinSchema` widened from the boundary
+      node to the whole enclosing tree. Plan-snapshot re-baseline same commit.
+      IMPLEMENTATION-TODO P5.5-f-ii-b; 03 §10; 02 §3. Bar: UNITS + SPOT +
       DS05 + PLAN (re-baseline).
 - [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
       FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build

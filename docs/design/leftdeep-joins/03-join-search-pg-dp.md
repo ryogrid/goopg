@@ -779,6 +779,45 @@ Two consequences worth recording:
   whole enclosing tree, together with the searched-subtree tagging that makes
   the `buildBindingsPosMap` / `reconcileNLILayout` family skip, is P5.5-f-ii.
 
+**Amendment 2026-08-04 (P5.5-f-ii-a) — the tagging is in, and half of it turned
+out to already exist.** `internal/planner/searchedtree.go` adds `searchedTree`,
+a one-bit embedded tag on the seven node kinds `createPlanAtSearchRoot` can
+return as a root, and three skips: `buildBindingsPosMap`'s collector treats a
+tagged root as an opaque leaf (advance past its width, record no scan entry, so
+every binding inside it falls through the returned closure unchanged — the
+identity, which is the truth), `applyJoinTreePosMap` returns at one, and
+`reconcileNLILayout` returns at one. `markSearchedTree` panics on any node kind
+that cannot carry the tag, because the failure mode of forgetting is a silently
+untagged subtree — a plan that runs and returns wrong rows.
+
+What the implementation measured, and what this section had not distinguished:
+
+- **The boundary `Project` was already opaque, and not for search reasons.**
+  M0125-0012 (TPC-DS Q8) made EVERY `*Project` in a join tree a scope boundary
+  on both sides of the map, precisely so build and apply stop at the same nodes.
+  A probe confirms `buildBindingsPosMap` returns nil over a boundary Project and
+  that no target index moves. The search inherited that protection for free — and
+  inheriting it silently is the risk, since that rule can be revised for
+  FROM-subquery reasons by someone who has never read this chapter.
+- **The hole was the ELIDED root.** With the columns already in binding order
+  there is no Project to stop at, and both passes walk into a bare `*Join`. The
+  numeric half is provably harmless (identity layout ⇒ identity map, because
+  `collect`'s DFS order over a join *is* its output order) — but
+  `applyJoinTreePosMap`'s `*Join` arm calls `reresolveJoinByName`, and
+  `reconcileNLILayout` is name resolution end to end. Those rebind the searched
+  joins' keys by NAME over a layout derived by COORDINATE one node earlier.
+- **The no-op assertion is real but abstains more than it looks.**
+  `assertSearchedTreeNeedsNoReconcile` runs the real reconciliation over the
+  join tree (below the boundary Project) and panics if any `ColumnRef` moved —
+  an independent cross-check on the arms' layout arithmetic, by a different
+  mechanism. It is blind to an UNNAMED operand (`reresolveJoinByName` returns
+  immediately on one), to an AMBIGUOUS name (resolves to -1, left alone), and to
+  every expression it does not rebind. The P5.5-e unit fixtures build clause
+  operands with `col(i)` — unnamed — so reusing them would have made every
+  assertion about this pass succeed vacuously; the tests supply their own named
+  clause helper. The structural checks in `boundaryMap` remain the primary
+  guard and are not replaceable by name agreement.
+
 Divergence from PG worth naming: PG has no node here. `set_upper_references`
 (setrefs.c:2214) renumbers the upper plan's Vars in place, so a reordered join
 order costs PG nothing in plan shape. goopg emits one narrow pass-through

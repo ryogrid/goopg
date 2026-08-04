@@ -2486,6 +2486,26 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		if n == nil {
 			return
 		}
+		// M0127-P5.5-f-ii-a: a subtree the PG-shaped search built already
+		// publishes its columns at the positions the bindings put them —
+		// createplanroot.go's boundary is what guarantees it. Treat it as an
+		// opaque leaf, the same treatment the *Project / *CTEScan / SRF arms
+		// below get: advance past its width so scans to its RIGHT keep correct
+		// offsets, record NO scan entry, and let every binding inside it fall
+		// through this function's returned closure unchanged — the identity,
+		// which is the truth.
+		//
+		// When the boundary emitted a Project this arm is redundant with the
+		// *Project arm below, which already stops there (M0125-0012). It is
+		// here for the ELIDED case — a search whose order already was binding
+		// order returns a bare *Join, which `collect` descends into. That
+		// descent is numerically harmless (identity layout ⇒ identity map),
+		// but it is what puts the searched joins in `applyJoinTreePosMap`'s
+		// path, and that pass does more than arithmetic. See searchedtree.go.
+		if isSearchedTree(n) {
+			off += searchedTreeWidth(n)
+			return
+		}
 		switch x := n.(type) {
 		case *SeqScan:
 			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
@@ -2670,6 +2690,16 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 // inadvertently remapped.
 func applyJoinTreePosMap(node Node, posMap func(int) int) {
 	if node == nil {
+		return
+	}
+	// M0127-P5.5-f-ii-a: stop at a searched subtree, for the same reason the
+	// *Project arm below stops at a Project — build and apply must stop at the
+	// same nodes (`collect` now stops here too). The searched tree's quals were
+	// translated onto their own merged row by the `createPlan` arm that built
+	// it, so there is no correction to make; and this arm does not only apply
+	// posMap, it calls `reresolveJoinByName`, which would rebind those quals by
+	// NAME over a layout that was just derived by coordinate. searchedtree.go.
+	if isSearchedTree(node) {
 		return
 	}
 	switch n := node.(type) {
@@ -2882,6 +2912,27 @@ func reresolveNLIKeysByName(nli *NestedLoopIndexJoin) {
 // (Plan), so only the experimental cost path — where NLI is being re-enabled
 // — pays for it; production is untouched.
 func reconcileNLILayout(node Node) {
+	// M0127-P5.5-f-ii-a: never reconcile a searched subtree. This pass exists
+	// because the integer DP and the MHJ packer reorder a tree in place and
+	// leave stale indices behind; the search leaves none, so every rebind it
+	// would perform is at best a no-op re-derivation of the layout, by a weaker
+	// mechanism (names) than the one that produced it (coordinates).
+	// `assertSearchedTreeNeedsNoReconcile` (searchedtree.go) is what turns
+	// "at best a no-op" from an assumption into a per-plan check at the
+	// boundary. searchedtree.go also records why this must not reach the
+	// boundary Project, whose target list is the map rather than a reference.
+	if isSearchedTree(node) {
+		return
+	}
+	reconcileNLILayoutBody(node)
+}
+
+// reconcileNLILayoutBody is `reconcileNLILayout` without the searched-subtree
+// guard, so the assertion in searchedtree.go can run the real pass over a tree
+// the guard would otherwise skip. Its recursive calls go back through the
+// guarded entry point, so a searched subtree nested inside a non-searched one is
+// still skipped.
+func reconcileNLILayoutBody(node Node) {
 	switch n := node.(type) {
 	case *Join:
 		reconcileNLILayout(n.Left)
