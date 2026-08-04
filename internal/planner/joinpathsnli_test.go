@@ -332,6 +332,7 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 		setCheapest(rel)
 	}
 	s.relInfos = []baseRelInfo{{}, {}, {table: lineitem}}
+	s.levelRels(1)[2].baseLeaf = &SeqScan{Table: lineitem}
 	s.clauses = &restrictInfoList{all: []*restrictInfo{
 		ppiEquiClause(part, "p_partkey", fact, "l_partkey"),
 		ppiEquiClause(supplier, "s_suppkey", fact, "l_suppkey"),

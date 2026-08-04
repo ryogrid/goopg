@@ -496,6 +496,33 @@
   unparameterised path carries an EMPTY list, which is pathnodes.h:1817's "an
   empty indexclauses list implies a full index scan" and not an omission. Still
   inert. 3 ledger rows. 7 new tests. Bar met: UNITS + SPOT.)*
+- [x] **P5.5-c** `create_indexscan_plan` (createplan.c:3006) — the FIRST real
+  `createPlan` arm, consuming the carrier P5.5-a/-b landed. *(DONE 2026-08-04,
+  `internal/planner/createplanindex.go` + `createplan.go`, `path.go`,
+  `joinsearch.go`, `pathparamindex.go`, `pathindexordered.go`. The seam problem
+  is not the index but everything else the leaf carries: PG's arm reaches the
+  relation, alias, target list and `baserestrictinfo` through `RelOptInfo`'s
+  range-table entry, and goopg's search-only rel has none of that. The answer is
+  to record WHAT THE SEARCH WAS HANDED — `RelOptInfo.baseLeaf` carries the leaf
+  `Node` `buildInitialRels` received (the search boundary's half of 03 §10's
+  coordinate map: what a base relid MEANS), and the arm re-emits from it:
+  the SCHEMA is the leaf's (a fresh target list would renumber the columns under
+  every clause), the ALIAS survives (self-join disambiguation, the M0062-0002
+  finding), and the local quals survive because goopg's `*IndexScan` has no
+  `qpqual` — they live in `*Filter` wrappers above the scan, which
+  `indexScanLeafFor` peels, remembers, and reproduces as NEW nodes over the
+  replacement scan (the originals are matched by pointer identity elsewhere;
+  `LeafLocal` rides along or a posMap pass renumbers leaf-local ColumnRefs).
+  The same `indexScanLeafFor` is the eligibility gate at BOTH index-path
+  producers: a leaf that cannot be rebuilt must not have an index path COSTED
+  over it, or the DP prices a plan the builder then refuses — one predicate,
+  two callers, no drift (rule #2). Every arm precondition panics with the
+  specific wrong answer behind it; the dangerous one is a parameterised path
+  with an EMPTY clause list, since empty means FULL INDEX SCAN
+  (pathnodes.h:1817) and building it would silently turn a costed point probe
+  into a whole-relation scan. `Key` vs `Keys` follows the executor's own
+  convention (single-column probes use `Key`, nl_index_join.go:656). Still
+  inert. 2 ledger rows. 9 new tests. Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

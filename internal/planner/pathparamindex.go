@@ -227,6 +227,14 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 		if tbl == nil {
 			continue
 		}
+		// The CONSUMER's eligibility test, applied at the producer
+		// (M0127-P5.5-c): a leaf `createPlan` cannot rebuild as an `*IndexScan`
+		// must not have an index path costed over it either, or the DP prices a
+		// plan the builder then refuses. One predicate, two callers, no drift
+		// (rule #2; createplanindex.go).
+		if _, _, ok := indexScanLeafFor(rel.baseLeaf); !ok {
+			continue
+		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
 		if len(cands) == 0 {
 			continue

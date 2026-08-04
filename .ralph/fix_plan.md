@@ -6756,6 +6756,38 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       tests. IMPLEMENTATION-TODO P5.5-b; 03 §10; 04 §1.1. Bar met: UNITS + SPOT.
       DS05 not applicable — the field is written by a search with no `planSelect`
       caller and `GOOPG_PGSHAPED_DP` is OFF, so no plan and no row can move.
+- [x] **M0127-P5.5-c — `create_indexscan_plan`: the first real `createPlan`
+      arm.** DONE 2026-08-04 (`internal/planner/createplanindex.go` +
+      `createplan.go`, `path.go`, `joinsearch.go`, `pathparamindex.go`,
+      `pathindexordered.go`). The consumer of the carrier P5.5-a/-b landed: the
+      arm that turns a chosen `PathIndexScan` back into the `*IndexScan` node
+      goopg's executor runs (createplan.c:3006). The difficulty is not the index
+      but everything else the leaf carries — PG's arm reaches relation, alias,
+      target list and `baserestrictinfo` through `RelOptInfo`'s range-table
+      entry, and goopg's search-only rel knows none of that. Resolved by
+      recording WHAT THE SEARCH WAS HANDED: `RelOptInfo.baseLeaf` carries the
+      leaf `Node` `buildInitialRels` received (the search boundary's half of
+      03 §10's coordinate map — what a base relid MEANS), and the arm re-emits
+      from it. The schema is the LEAF's (a synthesised target list would
+      renumber columns under the quals that reference them); the alias survives
+      (self-join disambiguation, M0062-0002); the local quals survive as
+      re-created `*Filter` wrappers — goopg's `*IndexScan` has no `qpqual`
+      field — rebuilt as NEW nodes because the originals are matched by POINTER
+      identity elsewhere, with `LeafLocal` intact or a posMap pass renumbers the
+      predicate's leaf-local ColumnRefs. `indexScanLeafFor` is ONE predicate
+      with two callers (rule #2): the arm's resolver and the eligibility gate
+      now applied at BOTH index-path producers, so a leaf that cannot be rebuilt
+      as an index scan never has an index path COSTED over it — otherwise the
+      DP prices a plan the builder then refuses. Preconditions panic with the
+      wrong answer named; the dangerous case is a parameterised path with an
+      EMPTY clause list, because empty means FULL INDEX SCAN (pathnodes.h:1817)
+      and building it would silently turn a costed point probe into a
+      whole-relation scan. Still inert (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
+      caller). 2 ledger rows (join-arm residual drop via
+      `is_redundant_with_indexclauses`; `*IndexOnlyScan` leaf declined). 9 new
+      tests (`createplanindex_test.go`). IMPLEMENTATION-TODO P5.5-c; 03 §10;
+      02 §3. Bar met: UNITS + SPOT. DS05 not applicable — the arm is reachable
+      only from the inert search, so no plan and no row can move.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

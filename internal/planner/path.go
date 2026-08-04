@@ -175,6 +175,18 @@ type RelOptInfo struct {
 	// PG's callers find that inclusion more convenient, and the NLI arm of
 	// P5.4b-ii reads exactly this list. Empty until parameterised paths exist.
 	CheapestParameterized []*Path
+
+	// baseLeaf is the executor Node the pre-search pipeline handed
+	// `buildInitialRels` for this FROM item — the search boundary's half of
+	// 03 §10's coordinate map, recording what a base relid MEANS: the relation,
+	// the alias, the output schema and the local quals, all already resolved
+	// (M0127-P5.5-c). Set only on level-1 rels; nil on every join rel. It is
+	// what PG reaches through `RelOptInfo`'s range-table entry and goopg's
+	// search-only rel cannot: `createPlan`'s scan arms re-emit from it
+	// (createplanindex.go), and the index-path producers gate on it through the
+	// same `indexScanLeafFor` predicate, so a path is never COSTED over a leaf
+	// the builder cannot rebuild.
+	baseLeaf Node
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.

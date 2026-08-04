@@ -228,6 +228,13 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		rows := initialRelRows(leaf, relInfos[i])
 		width := nodeTupleWidth(leaf)
 		rel := newRelOptInfo(RelSet(1)<<uint(i), rows, width)
+		// The leaf is recorded on the rel as well as inside the PathPrebuilt
+		// below, because two different consumers need it two different ways:
+		// createPlan's PathPrebuilt arm returns the node it wrapped, while the
+		// index-scan arm (M0127-P5.5-c) rebuilds a DIFFERENT node and needs the
+		// original leaf's identity — alias, schema, local-qual wrappers — to
+		// copy forward (createplanindex.go).
+		rel.baseLeaf = leaf
 		if err := s.addRel(rel); err != nil {
 			return nil, err
 		}

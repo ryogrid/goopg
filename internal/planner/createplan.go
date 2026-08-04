@@ -30,11 +30,16 @@ func createPlan(p *Path) Node {
 	case PathPrebuilt:
 		// The DP-built subtree, carried whole. Nothing to reconstruct.
 		return p.node
+	case PathIndexScan:
+		// The first real arm (M0127-P5.5-c): the probe the search costed,
+		// rebuilt from the carrier P5.5-a/-b landed on the path and the leaf
+		// `buildInitialRels` recorded on the rel. createplanindex.go.
+		return createIndexScanPlan(p)
 	default:
-		// PathSeqScan / PathHashJoin / … are not generated until C3/C4. Reaching
-		// here means a later phase constructed a path kind without teaching
-		// createPlan to translate it.
-		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (C3/C4)", p.Kind))
+		// PathSeqScan / PathHashJoin / … do not have arms yet (they are the
+		// remainder of P5.5). Reaching here means a phase constructed a path
+		// kind without teaching createPlan to translate it.
+		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (P5.5)", p.Kind))
 	}
 }
 

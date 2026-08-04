@@ -84,6 +84,9 @@ func ppiCtx(t *testing.T, inner *catalog.Table, innerRows float64, clauses ...*r
 		setCheapest(rel)
 	}
 	s.relInfos = []baseRelInfo{{}, {table: inner}}
+	// The rebuildable leaf the producers' eligibility gate requires
+	// (M0127-P5.5-c): production rels get theirs from `buildInitialRels`.
+	s.levelRels(1)[1].baseLeaf = &SeqScan{Table: inner}
 	s.clauses = &restrictInfoList{all: clauses}
 	return s
 }
@@ -295,6 +298,7 @@ func TestAddParameterizedIndexPathsOneParameterizationPerOuterRelset(t *testing.
 	}
 	relA, relO, relC := relsetOf(0), relsetOf(1), relsetOf(2)
 	s.relInfos = []baseRelInfo{{}, {table: orders}, {}}
+	s.levelRels(1)[1].baseLeaf = &SeqScan{Table: orders}
 	s.clauses = &restrictInfoList{all: []*restrictInfo{
 		ppiEquiClause(relA, "l_orderkey", relO, "o_orderkey"),
 		ppiEquiClause(relC, "c_custkey", relO, "o_custkey"),
