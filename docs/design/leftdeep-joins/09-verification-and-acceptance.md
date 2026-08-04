@@ -99,6 +99,97 @@ run; flag any joinrel whose estimate is > 10³× off. Q9's chain must show the
 joinrel). Runs at S5 and on any later selectivity change; output committed
 under `analysis/leftdeep-joins/`.
 
+### 5.1 The instrument (P5.6-e-i, landed 2026-08-04)
+
+`cmd/estimate-audit` + `internal/estimateaudit`. One `EXPLAIN ANALYZE` per
+query supplies BOTH sides of the comparison (the `rows=` of the cost
+parenthetical and the `actual rows=` of the instrumentation), so the "one-off
+instrumented run" above is not a separate build:
+
+```
+go build -o /tmp/estimate-audit ./cmd/estimate-audit
+bench/tpch/setup_goopg.sh                 # cluster on 65433
+/tmp/estimate-audit --label <YYYY-MM-DD>-<slug>   # all 22, ~13 min
+bench/tpch/stop_goopg.sh
+```
+
+It writes `analysis/leftdeep-joins/<label>.txt` (the audit) and
+`<label>.plans.txt` (the raw plans, so a later reader can re-derive any row),
+and exits 1 when a joinrel is over threshold — instrument and tripwire in one
+binary. The unit of audit is the JOINREL: a badly misestimated *scan* is not
+a §5 violation, because §5's criterion is stated at join levels.
+
+Three measurement conditions are forced by goopg-specific behaviour, and each
+would silently corrupt the audit if left alone:
+
+- **`--serial` (default).** goopg does not propagate worker instrumentation
+  out of a `Gather` (upstream merges it in `execParallel.c`
+  `ExecParallelRetrieveInstrumentation`), so in a parallel plan every node
+  *below* the Gather reports estimates only. Q9 — the query this section
+  states its acceptance criterion on — plans entirely below a Gather, so it
+  is **unmeasurable in parallel**. The first run of the instrument recorded
+  exactly that and is kept as evidence:
+  `analysis/leftdeep-joins/2026-08-04-p56e-parallel-uninstrumented.txt`.
+  The flag sets `max_parallel_workers_per_gather = 0`; the join tree under
+  audit is the same one, minus the Gather.
+- **`--warm-stats` (default).** goopg's ANALYZE statistics are
+  per-connection and bare `ANALYZE;` is a no-op, so the run holds one
+  stats-warmed session (explicit `ANALYZE <table>` per table) for every
+  query. Without it the audit measures the no-stats planner.
+- **Cumulative, not per-loop, actuals.** goopg's `actual rows=` is a raw
+  cumulative counter (`instrumentedOp.stats.rowsOut`), where upstream prints
+  the per-loop average. The tool consumes the printed value as-is; a reader
+  who assumes PG semantics and multiplies by `loops` inflates every
+  nested-loop inner node by exactly the loop count. Ledgered.
+
+### 5.2 Baseline, 2026-08-04 (pre-flip, `GOOPG_PGSHAPED_DP` OFF)
+
+`analysis/leftdeep-joins/2026-08-04-p56e-baseline.txt`, all 22 queries, TPC-H
+SF=1. Five joinrels over the 10³ tripwire, all but one an OVER-estimate:
+
+| query | joinrel | est | actual | factor |
+|---|---|---|---|---|
+| Q18 | final (SEMI) | 1 756 987 324 | 70 | 2.5 × 10⁷ over |
+| Q19 | final | 43 060 427 | 131 | 3.3 × 10⁵ over |
+| Q3 | final | 91 875 163 | 30 401 | 3.0 × 10³ over |
+| Q20 | inner (SEMI) | 6 772 315 | 2 568 | 2.6 × 10³ over |
+| Q7 | inner (build=left) | 126 | 150 000 | 1.2 × 10³ **under** |
+
+**Q9's final joinrel is 124.7× over (est 39 447 200 vs actual 316 264)** —
+just outside this section's ≤ 10² bar, and the number P5.9 re-measures once
+[04](04-cost-and-cardinality.md) §3's sizing is on the live path. The shape
+of the miss is the compounding §3 exists to end: Q9's three outermost
+joinrels all carry the SAME estimate (39 447 200) while the actual collapses
+from 5 997 241 to 316 264 across them — two joins that cost nothing in the
+estimate.
+
+The violations split into two class-(a) causes, both filed as P5.6-e-ii and
+neither fixed here — §6 forbids a constant moving without its class
+diagnosis, and these need the diagnosis first:
+
+- **A SEMI/ANTI joinrel is priced at its outer input verbatim.** Q18's final
+  SEMI carries the identical estimate to the join beneath it
+  (1 756 987 324), against 70 actual rows: the match fraction is not applied
+  at all, where `calc_joinrel_size_estimate`'s JOIN_SEMI arm (costsize.c)
+  scales the outer's rows by the semi-join selectivity. Q20's inner SEMI
+  (2.6 × 10³ over) and Q22's ANTI final (643×, under the tripwire) share the
+  shape. Note that Q18's outer is *itself* 293× over — the
+  `lineitem ⋈ orders` FK equality priced at 1.76 × 10⁹ against 5 997 241
+  actual, which is the eqjoinsel/FK-superkey miss P5.6-a…-c reproduce
+  upstream's answer for; the SEMI defect stacks on top of it rather than
+  causing it.
+- **A joinrel's non-equi restriction contributes no selectivity.** Q19's
+  final joinrel is a plain INNER over two *unfiltered* scans (5 997 241 ×
+  200 000) whose entire WHERE is one three-branch OR over `part` and
+  `lineitem` columns; the plan shows only the `Hash Cond`, and the estimate
+  (4.3 × 10⁷) credits the OR nothing, against 131 actual rows. Q3's final
+  (3.0 × 10³ over) is the same omission over the three-conjunct `Filter:`
+  the plan re-applies at the join.
+
+Two instrumentation gaps the run surfaced, both ledgered and neither fixed
+here: the Gather gap above, and Q11's `InitPlan`/`SubPlan` joins, which
+report no `actual rows=` even in serial mode.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

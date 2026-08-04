@@ -7151,10 +7151,37 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
 - [ ] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
       once 04 §4's honest batch-I/O term prices what it stood in for.
       IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.
-- [ ] **M0127-P5.6-e — the estimate audit** (09 §5): Q9's estimate chain within
-      2 orders of magnitude of actual (175) at the final joinrel, checked by
-      tooling rather than by eye. IMPLEMENTATION-TODO P5.6-e. Bar: UNITS +
-      DS05 + the audit run.
+- [x] **M0127-P5.6-e-i — the estimate-audit INSTRUMENT + pre-flip baseline**
+      (09 §5.1/§5.2): `cmd/estimate-audit` + `internal/estimateaudit`. One
+      `EXPLAIN ANALYZE` per query supplies both sides (cost `rows=` and
+      `actual rows=`); the unit of audit is the JOINREL, not the node; the
+      binary exits non-zero on a violation, so it is instrument and tripwire
+      in one. **The finding that shaped it: the audit was unrunnable on the
+      query 09 §5 names.** goopg does not propagate worker instrumentation
+      out of a `Gather` (upstream merges it in `execParallel.c`
+      `ExecParallelRetrieveInstrumentation`), and Q9 plans entirely below
+      one — the first run measured `(no ANALYZE)` for every joinrel of 10 of
+      12 queries. Hence `--serial`. Two further conditions are load-bearing:
+      per-connection ANALYZE stats (`--warm-stats`, ONE session for the whole
+      run — a pooled connection measures the blind planner) and goopg's
+      CUMULATIVE `actual rows=` where PG prints the per-loop average (a
+      PG-calibrated reader multiplying by `loops` inflates every nested-loop
+      inner node by exactly the loop count). Baseline (legacy planner, all 22
+      queries, 12 min): five joinrels over 10³, worst Q18's final SEMI at
+      2.5 × 10⁷ over; **Q9's final joinrel 124.7× over** — just outside §5's
+      ≤ 10² bar, its three outermost joinrels all carrying the same estimate
+      while the actual collapses 19× across them. Output committed under
+      `analysis/leftdeep-joins/` (+ a provenance README). 12 tests. 4 ledger
+      rows. IMPLEMENTATION-TODO P5.6-e-i; 09 §5.1/§5.2. Bar met: UNITS + the
+      audit run. DS05 not applicable — new tool + new package with no
+      importer in the engine; zero planner/executor lines changed.
+- [ ] **M0127-P5.6-e-ii — close the two class-(a) causes the baseline
+      isolated** (09 §5.2): a SEMI/ANTI joinrel priced at its outer input
+      verbatim (`calc_joinrel_size_estimate`'s JOIN_SEMI arm, costsize.c —
+      Q18/Q20/Q22), and a joinrel's non-equi restriction contributing no
+      selectivity (Q19's three-branch OR, Q3's re-applied `Filter:`); then
+      re-run the audit. Q9's ≤ 10² bar is P5.9's to certify on the post-flip
+      planner. IMPLEMENTATION-TODO P5.6-e-ii. Bar: UNITS + DS05 + audit run.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

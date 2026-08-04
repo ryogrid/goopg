@@ -840,9 +840,34 @@
     absence from upstream). 7 new tests. Bar met: UNITS.
   - [ ] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once
     04 §4's honest batch-I/O term prices what it was standing in for.
-  - [ ] **P5.6-e** the estimate audit ([09](09-verification-and-acceptance.md)
-    §5): Q9's chain within 2 orders of magnitude of actual at the final
-    joinrel, checked by tooling rather than by eye.
+  - [x] **P5.6-e-i** the estimate-audit INSTRUMENT + the pre-flip baseline
+    ([09](09-verification-and-acceptance.md) §5.1/§5.2). `cmd/estimate-audit`
+    + `internal/estimateaudit`: one `EXPLAIN ANALYZE` per query supplies both
+    sides of the comparison, the unit of audit is the joinrel, and the binary
+    exits non-zero on a violation so it is instrument and tripwire at once.
+    *(DONE 2026-08-04. **The finding that shaped the tool:** the audit is
+    unrunnable on the query §5 names. goopg never propagates worker
+    instrumentation out of a `Gather` — upstream merges it in
+    `execParallel.c` `ExecParallelRetrieveInstrumentation` — and TPC-H Q9
+    plans entirely below one, so the first run measured `(no ANALYZE)` for
+    every joinrel of 10 of 12 queries. Hence `--serial`. Two more conditions
+    are load-bearing for the same reason: per-connection ANALYZE stats
+    (`--warm-stats`, one session for the whole run) and goopg's cumulative —
+    not per-loop-average — `actual rows=`, which a PG-calibrated reader would
+    multiply by `loops`. **Baseline, legacy planner, all 22 queries:** five
+    joinrels over 10³, worst Q18's final SEMI at 2.5 × 10⁷ over; **Q9's final
+    joinrel 124.7× over (est 39 447 200 vs 316 264 actual)** — just outside
+    §5's ≤ 10² bar, with its three outermost joinrels all carrying the SAME
+    estimate while the actual collapses 19× across them. 12 tests
+    (`internal/estimateaudit/audit_test.go`). 4 ledger rows: the Gather gap,
+    the per-loop divergence, `InitPlan`/`SubPlan` joins uninstrumented even
+    in serial, and P5.6-e's acceptance check itself deferred to P5.9.)*
+  - [ ] **P5.6-e-ii** close the two class-(a) causes the baseline isolated
+    (09 §5.2) — a SEMI/ANTI joinrel priced at its outer input verbatim
+    (`calc_joinrel_size_estimate`'s JOIN_SEMI arm, costsize.c), and a
+    joinrel's non-equi restriction contributing no selectivity (Q19's OR,
+    Q3's re-applied `Filter:`) — then re-run the audit. Q9's ≤ 10² bar is
+    P5.9's to certify, on the post-flip planner.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
