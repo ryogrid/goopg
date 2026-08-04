@@ -359,3 +359,56 @@ func TestClampSelectivity(t *testing.T) {
 		}
 	}
 }
+
+// TestEqJoinSelectivityIsDefaultFollowsTheDenominator (M0127-P5.6-c): the
+// "this factor is a guess" bit belongs to the side whose ndistinct actually
+// divided, not to the disjunction of both operands.
+//
+// The middle case is the one that matters. An equality between a column with a
+// million measured distinct values and an unanalysed one divides by the
+// million; the unanalysed operand contributed nothing to the answer, so calling
+// the estimate a default would make `calcJoinrelSize` cap a number it has every
+// reason to trust (04 §3.3).
+func TestEqJoinSelectivityIsDefaultFollowsTheDenominator(t *testing.T) {
+	measuredBig := joinVarStats{stats: &catalog.ColumnStats{NDistinct: 1000000}, tuples: 6000000}
+	measuredSmall := joinVarStats{stats: &catalog.ColumnStats{NDistinct: 5}, tuples: 6000000}
+	unanalysed := joinVarStats{tuples: 6000000} // -> DEFAULT_NUM_DISTINCT
+
+	for _, tc := range []struct {
+		what          string
+		v1, v2        joinVarStats
+		wantSel       float64
+		wantIsDefault bool
+	}{
+		{"both unanalysed", unanalysed, unanalysed, 1.0 / defaultNumDistinct, true},
+		{"measured wins the denominator", measuredBig, unanalysed, 1.0 / 1000000.0, false},
+		{"the default wins the denominator", measuredSmall, unanalysed, 1.0 / defaultNumDistinct, true},
+		{"both measured", measuredBig, measuredSmall, 1.0 / 1000000.0, false},
+	} {
+		sel, isDefault := eqJoinSelectivityExt(tc.v1, tc.v2)
+		if math.Abs(sel-tc.wantSel) > 1e-15 || isDefault != tc.wantIsDefault {
+			t.Fatalf("%s: sel=%v isdefault=%v; want %v / %v", tc.what, sel, isDefault, tc.wantSel, tc.wantIsDefault)
+		}
+	}
+}
+
+// TestJoinClauseSelectivityExtConstantArmsAreDefaults: every arm that answers
+// with a selfuncs.h constant reports itself as a guess, which is what makes
+// 04 §3.3's fallback cap fire on an inequality join between two fully analysed
+// columns.
+func TestJoinClauseSelectivityExtConstantArmsAreDefaults(t *testing.T) {
+	s := jsCtx(t)
+	for _, op := range []parser.OpCode{parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe} {
+		if sel, isDefault := s.joinClauseSelectivityExt(jsEqui(op)); sel != defaultIneqJoinSel || !isDefault {
+			t.Fatalf("%v: sel=%v isdefault=%v; want %v / true", op, sel, isDefault, defaultIneqJoinSel)
+		}
+	}
+	if sel, isDefault := s.joinClauseSelectivityExt(nil); sel != defaultUnhandledClauseSel || !isDefault {
+		t.Fatalf("nil clause: sel=%v isdefault=%v; want %v / true", sel, isDefault, defaultUnhandledClauseSel)
+	}
+	// The equality arm over analysed columns is a MEASUREMENT, and must not be
+	// swept into the same bucket.
+	if _, isDefault := s.joinClauseSelectivityExt(jsEqui(parser.OpEq)); isDefault {
+		t.Fatal("an equality between two analysed columns was reported as a default")
+	}
+}

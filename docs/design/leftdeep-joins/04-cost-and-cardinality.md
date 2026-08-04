@@ -155,6 +155,28 @@ ndistinct error. The remedy set, in mandatory order:
    validated FK covers the join (rows ≤ referencing side's rows), the
    structural analogue of M0126-0010's `max(l,r)` fallback cap
    (`cardinality.go:400-406`) — keep that cap too for the non-FK fallback.
+   *(Landed as P5.6-c, `keyImpliedRowsBound` + `calcJoinrelSize`'s two clamps.
+   The two are deliberately not one mechanism. The key-implied bound is a
+   COUNTING argument and is always sound: a proven key means each row of the
+   other side matches at most one row of the key side, so the output cannot
+   exceed the other side's rows whatever the selectivities multiplied out to —
+   which is why it is generalised beyond declared FKs to every key the P5.6-b
+   superkey pass proves, and why it is taken only when the key relation is the
+   WHOLE of its side (inside a multi-rel input a lower join may already have
+   duplicated its rows; ledgered). With consistent inputs the product lands
+   exactly ON the bound, so what the clamp actually catches is the two
+   disagreeing: a key side whose row ESTIMATE has outgrown its ANALYZE-time raw
+   count divides by a tenth of what it will read and claims a 10× fan-out from
+   a join that cannot fan out at all. The `max(l,r)` cap is the opposite kind of
+   thing — a heuristic backstop with no upstream counterpart — so it fires only
+   where M0126-0010's does: nothing proven AND every residual clause priced by
+   a selfuncs.h constant, which is PG's `*isdefault` carried out of
+   `get_variable_numdistinct` to the caller that finally uses it. Capping a
+   MEASURED estimate would truncate genuine many-to-many joins, whose blow-up
+   the planner must see; capping a clause-less join would truncate a cross
+   product, where |L|·|R| is the answer. Both are ledgered as divergences: the
+   cap dies when eqjoinsel's MCV arm makes the residual estimator trustworthy
+   on skewed keys.)*
 4. **MCV join selectivity** (doc 14 §3) — staged after 1–3; ledger row if it
    slips past this bundle's implementation window.
 

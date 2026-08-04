@@ -829,8 +829,15 @@
     `examineJoinVar`; the legacy child-divisor defect; `nconst_ec`). 12 tests
     (`joinrelsize_test.go`). Still inert — `GOOPG_PGSHAPED_DP` is OFF and
     nothing calls `joinSearch` from `planSelect`.)*
-  - [ ] **P5.6-c** 04 §3.3's clamp discipline: the FK-implied bound, and the
-    `max(l,r)` non-FK fallback cap kept beside it.
+  - [x] **P5.6-c** 04 §3.3's clamp discipline: the FK-implied bound, and the
+    `max(l,r)` non-FK fallback cap kept beside it. `keyImpliedRowsBound` +
+    the two clamps in `calcJoinrelSize`; `superkeyJoinSelectivity` now answers
+    a `superkeyEstimate` (sel, residual, fired, rowsBound) because "a key was
+    proven" cannot be recovered from the selectivity afterwards, and
+    `joinClauseSelectivityExt`/`eqJoinSelectivityExt` carry PG's `*isdefault`
+    out to the fallback condition. Bound taken only when the key relation is
+    the whole of its side (2 ledger rows: the multi-rel case, and the cap's
+    absence from upstream). 7 new tests. Bar met: UNITS.
   - [ ] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once
     04 §4's honest batch-I/O term prices what it was standing in for.
   - [ ] **P5.6-e** the estimate audit ([09](09-verification-and-acceptance.md)

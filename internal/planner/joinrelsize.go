@@ -41,11 +41,27 @@ package planner
 // The declared-FK arm is implemented beside it for schemas that do declare
 // them.
 //
+// M0127-P5.6-c added the two CLAMPS that sit after that product (04 §3.3), and
+// they are deliberately not one mechanism:
+//
+//   - the key-implied bound is STRUCTURAL and always sound — a proven key means
+//     each row of the other side matches at most one row of the key side, so the
+//     output cannot exceed the other side's rows, whatever the selectivities
+//     multiplied out to (`keyImpliedRowsBound`);
+//   - the `max(l, r)` cap is a HEURISTIC backstop inherited from M0126-0010
+//     (cardinality.go:400-406) and fires only where that one does: when nothing
+//     was proven AND every surviving clause was priced by a selfuncs.h constant.
+//     Applying it to a measured estimate would truncate genuine many-to-many
+//     joins, whose blow-up is a fact about the data rather than an artefact of
+//     compounding.
+//
 // Still inert: `GOOPG_PGSHAPED_DP` is OFF (joinsearch.go:44) and nothing calls
 // `joinSearch` from `planSelect`, so this builder is reachable only from tests
 // until P5.9. Validated by `joinrelsize_test.go`.
 
 import (
+	"math"
+
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -110,11 +126,56 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 	// function — but it has to be applied HERE too, because `makeJoinRel`
 	// hands the sizer the joinrel's full restriction list (what the path
 	// generators must evaluate), not the selectivity subset.
-	sel, residual := s.superkeyJoinSelectivity(cat, outer, inner, oneClausePerEquivClass(clauses))
-	for _, ri := range residual {
-		sel *= s.joinClauseSelectivity(ri)
+	est := s.superkeyJoinSelectivity(cat, outer, inner, oneClausePerEquivClass(clauses))
+	sel := est.sel
+	// `allDefault` is 04 §3.3's fallback condition, and it is the residual
+	// clauses' property rather than the join's: an estimate every one of whose
+	// factors was a constant from selfuncs.h has not measured this join at all.
+	allDefault := len(est.residual) > 0
+	for _, ri := range est.residual {
+		clauseSel, isdefault := s.joinClauseSelectivityExt(ri)
+		sel *= clauseSel
+		if !isdefault {
+			allDefault = false
+		}
 	}
-	return clampRowEst(outer.Rows * inner.Rows * sel), width
+
+	rows := outer.Rows * inner.Rows * sel
+
+	// Clamp 1 — the key-implied bound. `rowsBound` is +Inf unless a proven key
+	// makes one side's rows an upper bound on the output, so this is a no-op on
+	// every join that proved nothing.
+	if rows > est.rowsBound {
+		rows = est.rowsBound
+	}
+	// Clamp 2 — M0126-0010's `max(l,r)` cap (cardinality.go:400-406), kept for
+	// the non-key fallback and, as there, fired ONLY when the estimate was a
+	// pure guess. The condition is what keeps it from breaking honest
+	// many-to-many joins, whose blow-up is real and measured; and `len(residual)
+	// > 0` is what keeps it off a CROSS product, where |L|·|R| is not an error
+	// but the answer.
+	if !est.fired && allDefault {
+		if mx := math.Max(outer.Rows, inner.Rows); rows > mx {
+			rows = mx
+		}
+	}
+	return clampRowEst(rows), width
+}
+
+// superkeyEstimate is what the superkey pass tells the sizer. `sel` and
+// `residual` are `get_foreign_key_join_selectivity`'s two outputs; `fired` and
+// `rowsBound` are P5.6-c's, and both exist because the fact that a key was
+// proven cannot be recovered from `sel` afterwards — a 1/6000000 divisor and a
+// per-clause eqjoinsel that happens to land on the same number are the same
+// float and mean opposite things about how much the estimate can be trusted.
+type superkeyEstimate struct {
+	sel      float64
+	residual []*restrictInfo
+	// fired reports that at least one key was proven and its clauses removed.
+	fired bool
+	// rowsBound is the tightest STRUCTURAL upper bound on the joinrel's output
+	// implied by the proven keys, or +Inf when none is provable.
+	rowsBound float64
 }
 
 // superkeyJoinSelectivity is `get_foreign_key_join_selectivity` (costsize.c:5651)
@@ -148,10 +209,10 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 // same choice `eqjoinsel` makes when it divides by max(nd_l, nd_r) (P5.6-a): a
 // key on either side gives an upper bound on the join's size and the estimate
 // is the minimum of the bounds, not their average.
-func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, []*restrictInfo) {
-	sel := 1.0
+func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *RelOptInfo, clauses []*restrictInfo) superkeyEstimate {
+	est := superkeyEstimate{sel: 1.0, residual: clauses, rowsBound: math.Inf(1)}
 	if cat == nil || len(clauses) == 0 {
-		return sel, clauses
+		return est
 	}
 
 	pairs := make([]joinKeyPair, len(clauses))
@@ -166,7 +227,7 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 		live = true
 	}
 	if !live {
-		return sel, clauses
+		return est
 	}
 
 	// Greedy, largest-divisor-first, until no further key can be proven over
@@ -179,7 +240,11 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 		for _, i := range best.clauses {
 			removed[i] = true
 		}
-		sel *= 1.0 / best.rawTuples
+		est.sel *= 1.0 / best.rawTuples
+		est.fired = true
+		if b, ok := keyImpliedRowsBound(outer, inner, best.keyRel); ok && b < est.rowsBound {
+			est.rowsBound = b
+		}
 	}
 
 	residual := make([]*restrictInfo, 0, len(clauses))
@@ -188,7 +253,47 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 			residual = append(residual, ri)
 		}
 	}
-	return clampSelectivity(sel), residual
+	est.sel = clampSelectivity(est.sel)
+	est.residual = residual
+	return est
+}
+
+// keyImpliedRowsBound is 04 §3.3's clamp: the structural upper bound a proven
+// key puts on the joinrel's output.
+//
+// The argument is a counting one, not a statistical one. `keyRel` is the
+// relation the key makes unique over the equated columns — the relation
+// carrying the UNIQUE index, or, for a declared FK, the PARENT (a child row
+// matches exactly one parent row, so the bound is "the referencing side's
+// rows", 04 §3.3's own words). Every row of the OTHER side therefore matches at
+// most one row of `keyRel`, and an inner join cannot emit more rows than the
+// other side brings. The bound is that side's `Rows` — its POST-filter estimate,
+// because the rows it will actually bring are the ones that survived its quals,
+// and unlike the superkey DIVISOR (which must be the raw count, since it is
+// converting to a match fraction) this is a count of probes, not a fraction.
+//
+// The bound only holds when the key side is that ONE base relation. If `keyRel`
+// sits inside a multi-relation side, a join below may already have duplicated
+// its rows — an outer row matching a single `keyRel` row can then match several
+// rows of the side — and the counting argument gives nothing. Reporting no
+// bound there is the difference between a clamp that is always sound and one
+// that quietly truncates a correct estimate; the general case (scaling by the
+// side's own fan-out) needs a per-relation duplication factor the search does
+// not carry, and is ledgered rather than guessed at.
+func keyImpliedRowsBound(outer, inner *RelOptInfo, keyRel int) (float64, bool) {
+	if keyRel < 0 {
+		return 0, false
+	}
+	// `RelSet(1)<<i` is `buildInitialRels`' relid convention (joinsearch.go:230).
+	key := RelSet(1) << uint(keyRel)
+	switch {
+	case outer.Relids == key:
+		return inner.Rows, true
+	case inner.Relids == key:
+		return outer.Rows, true
+	default:
+		return 0, false
+	}
 }
 
 // joinKeyPair is one clause reduced to what the superkey test reads: the two
@@ -236,11 +341,18 @@ func (s *searchCtx) joinKeyPairOf(ri *restrictInfo, outer, inner RelSet) (joinKe
 	return p, true
 }
 
-// provenKey is one applicable key: which clauses it covers and what to divide
-// by.
+// provenKey is one applicable key: which clauses it covers, what to divide by,
+// and which base relation the key makes unique.
+//
+// `keyRel` is NOT always the relation the constraint was declared on — for a
+// declared FK it is the referenced PARENT, since that is the side the key makes
+// unique — and it is the field P5.6-c's clamp reads, so the same asymmetry
+// `rawTuples` encodes has to be encoded here too or the bound would be taken
+// against the wrong side.
 type provenKey struct {
 	clauses   []int
 	rawTuples float64
+	keyRel    int
 }
 
 // bestProvableKey finds the key with the largest divisor over the clauses that
@@ -316,7 +428,7 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 			if len(covered) == 0 {
 				continue
 			}
-			out = append(out, provenKey{clauses: covered, rawTuples: rawTuples})
+			out = append(out, provenKey{clauses: covered, rawTuples: rawTuples, keyRel: r})
 		}
 	}
 
@@ -324,7 +436,7 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 		if fk.NotValid || fk.NotEnforced || !columnsSubset(fk.Columns, cols) {
 			continue
 		}
-		parentRows, ok := s.fkParentRel(fk, pairs, removed, r)
+		parent, parentRows, ok := s.fkParentRel(fk, pairs, removed, r)
 		if !ok || parentRows < 1 {
 			continue
 		}
@@ -335,7 +447,7 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 		if len(covered) == 0 {
 			continue
 		}
-		out = append(out, provenKey{clauses: covered, rawTuples: parentRows})
+		out = append(out, provenKey{clauses: covered, rawTuples: parentRows, keyRel: parent})
 	}
 	return out
 }
@@ -371,7 +483,7 @@ func coveringClauses(pairs []joinKeyPair, removed []bool, r int, key []string) [
 }
 
 // fkParentRel resolves the referenced side of a declared FK to a base relation
-// of this search, and returns its RAW tuple count.
+// of this search, and returns that relation's index and its RAW tuple count.
 //
 // The parent must be a relation the still-available clauses actually equate
 // this key against: a `ForeignKey` names its parent by table name, and a query
@@ -379,7 +491,7 @@ func coveringClauses(pairs []joinKeyPair, removed []bool, r int, key []string) [
 // or may not join it to the parent at all. Matching through the clause pairs
 // rather than through the name alone is what keeps the proof tied to the join
 // in front of us.
-func (s *searchCtx) fkParentRel(fk catalog.ForeignKey, pairs []joinKeyPair, removed []bool, child int) (float64, bool) {
+func (s *searchCtx) fkParentRel(fk catalog.ForeignKey, pairs []joinKeyPair, removed []bool, child int) (int, float64, bool) {
 	for i, p := range pairs {
 		if removed[i] || !p.usable {
 			continue
@@ -396,10 +508,10 @@ func (s *searchCtx) fkParentRel(fk catalog.ForeignKey, pairs []joinKeyPair, remo
 			if tbl == nil || tbl.Name != fk.RefTable {
 				continue
 			}
-			return float64(s.relInfos[other].baseRows), true
+			return other, float64(s.relInfos[other].baseRows), true
 		}
 	}
-	return 0, false
+	return -1, 0, false
 }
 
 // oneClausePerEquivClass is 04 §5's equivalence-class reduction over an

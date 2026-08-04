@@ -258,8 +258,29 @@ func getVariableNumDistinct(v joinVarStats) (float64, bool) {
 // of correlated equalities the product compounds one restriction several times,
 // which is the mechanism behind Q9's 13-order-of-magnitude estimate error.
 func eqJoinSelectivity(v1, v2 joinVarStats) float64 {
-	nd1, _ := getVariableNumDistinct(v1)
-	nd2, _ := getVariableNumDistinct(v2)
+	sel, _ := eqJoinSelectivityExt(v1, v2)
+	return sel
+}
+
+// eqJoinSelectivityExt is the same estimate with PG's `*isdefault` carried out
+// to the caller (P5.6-c): "the number in the denominator was a guess, not a
+// measurement".
+//
+// The flag reported is the one belonging to the side whose ndistinct ACTUALLY
+// ended up in the denominator, not the disjunction of the two. That is the only
+// reading that matches what the flag is used for: an equality between a column
+// with 1,000,000 measured distinct values and an unanalysed one divides by
+// 1,000,000 — a measured number — and the presence of the unanalysed operand
+// changed nothing about the answer. Reporting "default" there would make
+// `calcJoinrelSize` clamp an estimate it has every reason to trust.
+//
+// Upstream computes both flags in `eqjoinsel` and uses them in the MCV and semi
+// arms rather than in this one; carrying it out of the no-MCV branch is goopg's
+// own, and exists because 04 §3.3's fallback cap has to know whether the
+// estimate it is about to cap was derived from statistics at all.
+func eqJoinSelectivityExt(v1, v2 joinVarStats) (float64, bool) {
+	nd1, isdefault1 := getVariableNumDistinct(v1)
+	nd2, isdefault2 := getVariableNumDistinct(v2)
 	nullfrac1, nullfrac2 := 0.0, 0.0
 	if v1.stats != nil {
 		nullfrac1 = v1.stats.NullFrac
@@ -268,12 +289,14 @@ func eqJoinSelectivity(v1, v2 joinVarStats) float64 {
 		nullfrac2 = v2.stats.NullFrac
 	}
 	selec := (1.0 - nullfrac1) * (1.0 - nullfrac2)
+	isdefault := isdefault2
 	if nd1 > nd2 {
 		selec /= nd1
+		isdefault = isdefault1
 	} else {
 		selec /= nd2
 	}
-	return clampSelectivity(selec)
+	return clampSelectivity(selec), isdefault
 }
 
 // joinClauseSelectivity is `clause_selectivity_ext`'s join arm for the clause
@@ -297,22 +320,40 @@ func eqJoinSelectivity(v1, v2 joinVarStats) float64 {
 // subtracted from one. Its semi/anti arm (`1 - nullfrac`) is not reachable
 // while 03 §4.4's pin keeps special joins out of the search.
 func (s *searchCtx) joinClauseSelectivity(ri *restrictInfo) float64 {
+	sel, _ := s.joinClauseSelectivityExt(ri)
+	return sel
+}
+
+// joinClauseSelectivityExt is the same dispatch with the "this factor is a
+// guess" bit `calcJoinrelSize`'s fallback cap reads (04 §3.3).
+//
+// Every arm that returns a CONSTANT is a guess by construction: DEFAULT_INEQ_SEL
+// is what upstream returns unconditionally for an ordering comparison
+// (selfuncs.c:2908 has no model at all), and the unhandled-clause 0.5 is a
+// literal in `clause_selectivity_ext`. Only the equality arms can be
+// measurements, and only when the ndistinct they divided by came from ANALYZE.
+//
+// `<>` inherits its operand's flag rather than being called a guess outright:
+// `1 - eqjoinsel` over two measured ndistincts is as measured as the equality
+// it negates.
+func (s *searchCtx) joinClauseSelectivityExt(ri *restrictInfo) (float64, bool) {
 	if ri == nil || ri.clause == nil {
-		return defaultUnhandledClauseSel
+		return defaultUnhandledClauseSel, true
 	}
 	bo, ok := ri.clause.(*BinaryOp)
 	if !ok {
-		return defaultUnhandledClauseSel
+		return defaultUnhandledClauseSel, true
 	}
 	switch bo.Op {
 	case parser.OpEq:
-		return eqJoinSelectivity(s.joinClauseOperands(ri, bo))
+		return eqJoinSelectivityExt(s.joinClauseOperands(ri, bo))
 	case parser.OpNe:
-		return clampSelectivity(1.0 - eqJoinSelectivity(s.joinClauseOperands(ri, bo)))
+		sel, isdefault := eqJoinSelectivityExt(s.joinClauseOperands(ri, bo))
+		return clampSelectivity(1.0 - sel), isdefault
 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
-		return defaultIneqJoinSel
+		return defaultIneqJoinSel, true
 	default:
-		return defaultUnhandledClauseSel
+		return defaultUnhandledClauseSel, true
 	}
 }
 

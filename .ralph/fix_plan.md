@@ -7111,10 +7111,43 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       (`GOOPG_PGSHAPED_DP` OFF, no production caller).
       IMPLEMENTATION-TODO P5.6-b; 04 §2, §3.1. Bar met: UNITS. DS05 + SPOT +
       PLAN not applicable — no production caller exists, so no plan can move.
-- [ ] **M0127-P5.6-c — the clamp discipline** (04 §3.3): the FK-implied bound
+- [x] **M0127-P5.6-c — the clamp discipline** (04 §3.3): the FK-implied bound
       when a validated FK covers the join, with M0126-0010's `max(l,r)` cap
-      kept beside it for the non-FK fallback. IMPLEMENTATION-TODO P5.6-c.
-      Bar: UNITS.
+      kept beside it for the non-FK fallback. Landed 2026-08-04 as
+      `keyImpliedRowsBound` + two clamps in `calcJoinrelSize`
+      (`internal/planner/joinrelsize.go`).
+      The two clamps are deliberately different in kind. The key-implied bound
+      is a COUNTING argument — a proven key means each row of the other side
+      matches at most one row of the key side, so the output cannot exceed the
+      other side's rows, whatever the selectivities multiplied out to — and it
+      is therefore generalised beyond declared FKs to every key P5.6-b's
+      superkey pass proves. It is taken only when the key relation is the WHOLE
+      of its side: inside a multi-relation input a lower join may already have
+      duplicated its rows, and the counting argument then gives nothing
+      (ledgered). With consistent inputs the product lands exactly ON the
+      bound, so what the clamp catches is the two disagreeing — a key side
+      whose row estimate has outgrown its ANALYZE-time raw count divides by a
+      tenth of what it will read and claims a 10× fan-out from a join that
+      cannot fan out at all.
+      The `max(l,r)` cap is a heuristic with NO upstream counterpart
+      (`calc_joinrel_size_estimate` never bounds an inner join by its inputs),
+      so it fires only where M0126-0010's does: nothing proven AND every
+      residual clause priced by a selfuncs.h constant. That condition is PG's
+      `*isdefault` finally consumed — `eqJoinSelectivityExt` reports the flag
+      of the side whose ndistinct actually divided, not the disjunction, so an
+      equality against one unanalysed operand is still a measurement when the
+      other side's million distinct values won the denominator. Capping a
+      measured estimate would truncate genuine many-to-many joins; capping a
+      clause-less join would truncate a cross product.
+      `superkeyJoinSelectivity` now returns a `superkeyEstimate` (sel,
+      residual, fired, rowsBound) because "a key fired" cannot be recovered
+      from the selectivity afterwards. 7 new tests, incl. the two that pin the
+      soundness restriction and the not-capped cases. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no production caller). 2 ledger rows: the
+      multi-rel key side, and the cap's divergence from upstream (it dies with
+      eqjoinsel's MCV arm). IMPLEMENTATION-TODO P5.6-c; 04 §3.3.
+      Bar met: UNITS. DS05 + SPOT + PLAN not applicable — no plan can move
+      while the sizer has no production caller.
 - [ ] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
       once 04 §4's honest batch-I/O term prices what it stood in for.
       IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.

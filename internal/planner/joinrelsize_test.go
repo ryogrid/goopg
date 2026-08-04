@@ -409,3 +409,183 @@ func TestJoinRelBuilderSizesOnceAndAddsPaths(t *testing.T) {
 	}
 	wantRows(t, again.Rows, 6000000, "joinrel after the mirror pair")
 }
+
+// ---------------------------------------------------------------------------
+// M0127-P5.6-c — the clamp discipline (04 §3.3).
+//
+// Two clamps sit after `outer × inner × fkselec × jselec`, and the tests below
+// pin them apart, because their justifications are different in kind: the
+// key-implied bound is a counting argument that is always true, and the
+// `max(l, r)` cap is a heuristic that must NOT fire on an estimate derived from
+// statistics.
+// ---------------------------------------------------------------------------
+
+// TestCalcJoinrelSizeKeyBoundClampsStaleStats: the case the structural bound
+// exists for. A proven key normally makes the product land exactly ON the bound
+// (`|L|·|R_raw|/R_raw`), so the clamp is invisible — until the key side's row
+// ESTIMATE and its ANALYZE-time raw count disagree. Here `partsupp` has grown
+// 10× since it was analysed, so the divisor is a tenth of the rows the search
+// thinks it will read and the product claims 60M rows from a join in which each
+// of 6M `lineitem` rows can match at most one `partsupp` row.
+//
+// 6M is not a tighter guess than 60M; it is the largest number the join can
+// possibly produce.
+func TestCalcJoinrelSizeKeyBoundClampsStaleStats(t *testing.T) {
+	c, partsupp, lineitem := jrsCatalog(t)
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
+		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	s := jrsCtx(t, lineitem, partsupp)
+	outer, inner := jrsRels(6000000, 8000000) // partsupp analysed at 800k, now 8M
+
+	clauses := []*restrictInfo{
+		jrsEq("l_partkey", "ps_partkey", noEquivClass),
+		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
+	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	wantRows(t, rows, 6000000, "stale key-side statistics")
+
+	if unclamped := clampRowEst(6000000.0 * 8000000.0 / 800000.0); rows >= unclamped {
+		t.Fatalf("rows=%v was not clamped below the raw product %v", rows, unclamped)
+	}
+}
+
+// TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide: the soundness restriction,
+// and the reason the clamp is not simply "the other side's rows".
+//
+// This is the previous test with ONE difference — the key relation now sits
+// inside a two-relation side. The counting argument no longer holds: a join
+// below may already have duplicated `partsupp`'s rows, so an outer row matching
+// a single `partsupp` row can match several rows of that side, and the output
+// may legitimately exceed the outer's row count. The estimate must be left
+// alone rather than truncated to a bound that is not a bound.
+func TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide(t *testing.T) {
+	c, partsupp, lineitem := jrsCatalog(t)
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
+		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	supplier := jsTable(t, c, "supplier", []catalog.Column{
+		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}},
+	}, 10000, catalog.ColumnStats{NDistinct: 10000})
+
+	s, err := newSearchCtx(3, defaultCostParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: lineitem, baseRows: 6000000},
+		{table: partsupp, baseRows: 800000},
+		{table: supplier, baseRows: 10000},
+	}
+	outer := newRelOptInfo(relsetOf(0), 6000000, 40)
+	inner := newRelOptInfo(relsetOf(1, 2), 8000000, 24) // partsupp ⋈ supplier
+
+	clauses := []*restrictInfo{
+		jrsEq("l_partkey", "ps_partkey", noEquivClass),
+		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
+	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	wantRows(t, rows, clampRowEst(6000000.0*8000000.0/800000.0), "key relation inside a joinrel")
+}
+
+// jrsUnanalysed is two tables with a `RowCount` but no per-column statistics —
+// the state a table is in before anyone has run ANALYZE, and the only state in
+// which 04 §3.3's fallback cap is allowed to fire.
+func jrsUnanalysed(t *testing.T) (catalog.Catalog, *searchCtx) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	orders := jsTable(t, c, "orders", []catalog.Column{
+		{Name: "o_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 800000)
+	lineitem := jsTable(t, c, "lineitem", []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 6000000)
+	s, err := newSearchCtx(2, defaultCostParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: lineitem, baseRows: 6000000},
+		{table: orders, baseRows: 800000},
+	}
+	return c, s
+}
+
+// TestCalcJoinrelSizeFallbackCapWithoutStats: M0126-0010's cap
+// (cardinality.go:400-406), carried into the new sizer for the case it was
+// written for. Neither column is analysed, so both ndistincts are
+// DEFAULT_NUM_DISTINCT and the whole estimate is a constant from selfuncs.h;
+// 24 billion rows is not a measurement of anything, and the cap replaces it
+// with the invariant a non-cross equi-join obeys — no more rows than the larger
+// input.
+func TestCalcJoinrelSizeFallbackCapWithoutStats(t *testing.T) {
+	c, s := jrsUnanalysed(t)
+	outer, inner := jrsRels(6000000, 800000)
+
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	wantRows(t, rows, 6000000, "two unanalysed columns")
+
+	if uncapped := clampRowEst(6000000.0 * 800000.0 / defaultNumDistinct); rows >= uncapped {
+		t.Fatalf("rows=%v was not capped below the default-selectivity product %v", rows, uncapped)
+	}
+}
+
+// TestCalcJoinrelSizeInequalityIsCapped: the fallback condition is a property of
+// the CLAUSE ARM, not merely of missing statistics. Both columns here are
+// analysed, but `scalarltjoinsel` has no model at all (selfuncs.c:2908 returns
+// DEFAULT_INEQ_SEL unconditionally), so the statistics never entered the
+// answer and the estimate is as much a guess as the unanalysed case above.
+func TestCalcJoinrelSizeInequalityIsCapped(t *testing.T) {
+	c, partsupp, lineitem := jrsCatalog(t)
+	s := jrsCtx(t, lineitem, partsupp)
+	outer, inner := jrsRels(6000000, 800000)
+
+	ri := jrsEq("l_partkey", "ps_partkey", noEquivClass)
+	ri.clause.(*BinaryOp).Op = parser.OpLt
+	ri.isEquijoin = false
+
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri})
+	wantRows(t, rows, 6000000, "inequality join clause")
+}
+
+// TestCalcJoinrelSizeMeasuredBlowUpIsNotCapped: the other half of the cap's
+// condition, and the reason it cannot simply always fire. 100 distinct values
+// on each side of 6M and 800k rows is a genuine many-to-many join that really
+// does produce billions of rows; capping it at 6M would hide a blow-up the
+// planner must see in order to avoid it.
+func TestCalcJoinrelSizeMeasuredBlowUpIsNotCapped(t *testing.T) {
+	c := catalog.NewInMemory()
+	orders := jsTable(t, c, "orders", []catalog.Column{
+		{Name: "o_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 800000, catalog.ColumnStats{NDistinct: 100})
+	lineitem := jsTable(t, c, "lineitem", []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 6000000, catalog.ColumnStats{NDistinct: 100})
+	s, err := newSearchCtx(2, defaultCostParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: lineitem, baseRows: 6000000},
+		{table: orders, baseRows: 800000},
+	}
+	outer, inner := jrsRels(6000000, 800000)
+
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0/100.0), "a measured many-to-many join")
+}
+
+// TestCalcJoinrelSizeCrossProductIsNotCapped: with no restriction clauses at
+// all the product IS the answer, so the cap must not read "no measured clause"
+// as "guess". The legacy cap guards the same case by excluding
+// `JoinTypeCross` explicitly (cardinality.go:383); here the empty residual is
+// what carries it.
+func TestCalcJoinrelSizeCrossProductIsNotCapped(t *testing.T) {
+	c, s := jrsUnanalysed(t)
+	outer, inner := jrsRels(6000000, 800000)
+
+	rows, _ := s.calcJoinrelSize(c, outer, inner, nil)
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0), "cross product")
+}
