@@ -1668,6 +1668,35 @@ type ColumnStats struct {
 	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
 }
 
+// StaDistinct returns these statistics in PostgreSQL's SIGNED `stadistinct`
+// convention (pg_statistic.stadistinct, read by `get_variable_numdistinct`,
+// selfuncs.c): POSITIVE is an absolute distinct-value count, NEGATIVE is a
+// fraction of the relation's row count, and zero means "unknown".
+//
+// goopg splits what upstream packs into one signed float across two fields —
+// `NDistinct` (the absolute sample count) and `NDistinctFrac` (the scale-free
+// fraction) — so every consumer that has to speak PG's convention needs the
+// same two-line reduction. It had been open-coded three times (the
+// pg_statistic heap row, the pg_stats view, and now the join-selectivity
+// estimator), which is the sibling-path shape that goes silently wrong the
+// first time one copy learns something the others don't: an estimator reading
+// `NDistinct` first and a catalog row writing `-NDistinctFrac` first would
+// report one number to the user and plan on another.
+//
+// The fraction wins when both are present because it is the one that survives
+// a restart usefully — the absolute count cannot be interpreted without a row
+// count, and the row count is not restored (ledger row pq-P6).
+func (cs ColumnStats) StaDistinct() float64 {
+	switch {
+	case cs.NDistinctFrac > 0:
+		return -cs.NDistinctFrac
+	case cs.NDistinct > 0:
+		return float64(cs.NDistinct)
+	default:
+		return 0
+	}
+}
+
 // MCVEntry is one entry in a per-column MCV list. Frequency is
 // the sample frequency (0..1). Mirrors a single (stavalues,
 // stanumbers) pair in upstream's pg_statistic MCV slot.

@@ -7030,7 +7030,67 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
       joinrel). Re-evaluate M0125-0003 stage 3 here (rows-once per RelOptInfo,
       04 §2). IMPLEMENTATION-TODO P5.6; 04 §3; 09 §5. Bar: UNITS + DS05 +
-      estimate audit run.
+      estimate audit run. **DECOMPOSED into -a … -e below** (04 §3's remedy set
+      is four mechanisms and a measurement, in a mandatory order).
+- [x] **M0127-P5.6-a — the per-clause selectivity substrate: `examine_variable`,
+      `get_variable_numdistinct`, `eqjoinsel`'s no-MCV arm.** DONE 2026-08-04
+      (`internal/planner/joinselectivity.go` new,
+      `internal/catalog/catalog.go` `ColumnStats.StaDistinct` new, its two
+      existing open-coded copies switched over).
+      The compounding P5.6 exists to end has a specific source: the legacy
+      `estimateJoinCost` divides |L|·|R| by the PRODUCT of every spanning
+      edge's per-side NDV (bushy.go:1266-1301), where PG divides by ONE
+      ndistinct — the LARGER of the two sides' — per clause, because
+      upstream's estimate is the MINIMUM of two upper bounds rather than a
+      per-edge product. Over a chain of correlated equalities the product
+      charges one restriction several times; that is the same double-count
+      04 §5 says the ×2.0 `inferredEdgePenalty` was papering over, in the cost
+      dimension instead of the cardinality one where the error lives.
+      **The finding that decided the dispatcher:** the OPERATOR decides which
+      estimator runs, `isEquijoin` does not. `a.x = b.y + c.z` is an equality
+      that splits into no two one-sided operands, so it can key no hash join
+      and the flag is false — but PG still prices it with `eqjoinsel`, and
+      sending it to `clause_selectivity`'s 0.5 fall-through would charge 100×
+      the 0.005 upstream charges, on every joinrel above it. What the flag
+      does govern is only which OPERANDS are examined: `restrictInfo.leftKey`
+      is the canonical left of the SPLIT, which the builder is free to have
+      taken from the clause's right-hand side, so pairing `bo.Left` with
+      `ri.leftRelids` would read one relation's column against another
+      relation's statistics.
+      **Second finding:** goopg splits upstream's one signed `stadistinct`
+      into `NDistinct` + `NDistinctFrac`, and the reduction back to PG's
+      convention was open-coded twice already (the pg_statistic heap row and
+      the pg_stats view). A third copy inside the estimator is precisely the
+      sibling shape where the planner plans on a different number than the one
+      it publishes to the user, so it became `ColumnStats.StaDistinct` and all
+      three read it (rule #2). Resolution is by column NAME, not by
+      `ColumnRef.Index` — the search's clauses live in the pre-search
+      concatenation's coordinate space (03 §10), so a positional read of
+      `Stats.Columns` would pick a different column for every relation that is
+      not first in the FROM list. 3 ledger rows (eqjoinsel's MCV arm;
+      `vardata->isunique`, which is P5.6-b's own mechanism;
+      `examine_variable`'s subquery / expression-operand arms). 17 tests
+      (`joinselectivity_test.go`). Still inert (`GOOPG_PGSHAPED_DP` OFF and
+      `sizeJoinRel` still has no production implementation).
+      IMPLEMENTATION-TODO P5.6-a; 04 §3.2. Bar met: UNITS. DS05 + SPOT + PLAN
+      not applicable — no production caller exists, so no plan can move.
+- [ ] **M0127-P5.6-b — `calcJoinrelSize` + the concrete `joinRelBuilder`.**
+      04 §3.1's FK/unique-superkey generalisation over clause SUBSETS
+      (`get_variable_numdistinct`'s `isunique` arm, replacing
+      `uniqueNoFanoutRawCount`'s edge-list form) driving 04 §2's rows-once
+      discipline: `sizeJoinRel` at find-or-create time, before any path is
+      generated. IMPLEMENTATION-TODO P5.6-b; 04 §2, §3.1. Bar: UNITS.
+- [ ] **M0127-P5.6-c — the clamp discipline** (04 §3.3): the FK-implied bound
+      when a validated FK covers the join, with M0126-0010's `max(l,r)` cap
+      kept beside it for the non-FK fallback. IMPLEMENTATION-TODO P5.6-c.
+      Bar: UNITS.
+- [ ] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
+      once 04 §4's honest batch-I/O term prices what it stood in for.
+      IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.
+- [ ] **M0127-P5.6-e — the estimate audit** (09 §5): Q9's estimate chain within
+      2 orders of magnitude of actual (175) at the final joinrel, checked by
+      tooling rather than by eye. IMPLEMENTATION-TODO P5.6-e. Bar: UNITS +
+      DS05 + the audit run.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

@@ -121,6 +121,14 @@ ndistinct error. The remedy set, in mandatory order:
    `1/max(nd_left, nd_right)` with NULL-fraction correction
    (`selfuncs.c eqjoinsel_inner`), replacing per-edge products of
    `1/nd_side` (`bushy.go:1266-1301`) which double-counts correlated edges.
+   *(Landed as P5.6-a, `internal/planner/joinselectivity.go`, together with
+   `examine_variable` / `get_variable_numdistinct`. The MAX is not pessimism:
+   each side gives an upper bound on the join's selectivity, so the estimate
+   is the MINIMUM of the two bounds, which is the one with the larger nd in
+   the denominator. Dispatch is on the clause's OPERATOR, not on
+   `restrictInfo.isEquijoin` — `a.x = b.y + c.z` has no two-sided split and so
+   keys no hash join, but PG prices it with eqjoinsel all the same, and the
+   0.5 unhandled-clause fall-through would be 100× upstream's answer.)*
 3. **Clamp discipline**: joinrel rows clamp to the FK-implied bound when a
    validated FK covers the join (rows ≤ referencing side's rows), the
    structural analogue of M0126-0010's `max(l,r)` fallback cap

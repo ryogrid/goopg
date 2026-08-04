@@ -1,42 +1,41 @@
 (idle — nothing in flight)
 
-M0127-P5.5 is CLOSED — its last sub-item P5.5-f-ii-b landed
-(`internal/planner/enclosingtree.go` new + the `predp.go` call site): the
-pinned spine asserts the boundary map is the identity and skips its
-re-resolution, and 03 §10's tripwire is widened from the boundary node to the
-enclosing tree.
+M0127-P5.6 is DECOMPOSED into -a…-e (fix_plan + IMPLEMENTATION-TODO), and
+**P5.6-a is DONE**: `internal/planner/joinselectivity.go` (new) +
+`catalog.ColumnStats.StaDistinct` (new, its two open-coded copies switched).
+`examine_variable` / `get_variable_numdistinct` / `eqjoinsel`'s no-MCV arm /
+the clause dispatcher, over `restrictInfo` operands. Inert.
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this note).
-It parks M-NIGHTLY below M0127, so the banner selects the next unchecked M0127
-item — `M0127-P5.6`: `calcJoinrelSize` + FK-superkey generalisation +
-eqjoinsel + FK clamp (04 §3.1-3.3, the Q9 class-(a) fix); delete the quadratic
-build penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
-joinrel). Re-evaluate M0125-0003 stage 3 there (rows-once per RelOptInfo,
-04 §2). Bar: UNITS + DS05 + estimate audit run. It is LARGER than one loop —
-decompose it the way P5.5-e/-f were decomposed.**
+It parks M-NIGHTLY below M0127, so the banner selects `M0127-P5.6-b` —
+`calcJoinrelSize` + the concrete `joinRelBuilder`: 04 §3.1's FK/unique-superkey
+generalisation over clause SUBSETS (the `isunique` arm of
+`getVariableNumDistinct`, replacing `uniqueNoFanoutRawCount`'s edge-list form)
+driving 04 §2's rows-once discipline — `sizeJoinRel` at find-or-create time,
+BEFORE any path is generated. Bar: UNITS.**
 
 Carry-over facts a next loop should not re-derive:
 
-- **`layoutPosMap` returns nil for TWO reasons** — "identical" and "widths
-  differ, refuse to remap". Never read nil as "the map is the identity";
-  `assertSpineConsumesIdentityBoundaryMap` compares schemas itself.
-- **`enclosingNodeScopeOf` enumerates 11 of 53 node kinds** and STOPS at the
-  rest; the vacuity guard (walk must reach a tagged subtree, else panic naming
-  `stoppedAt`) is what keeps that honest. Extend it kind by kind as the S5 soak
-  reports stops.
-- A `*Join`'s predicate AND both keys index the MERGED `Left ++ Right` row —
-  including Semi/Anti, whose `Output()` is Left only. Checking join
-  expressions against `Output()` rejects every legal right-side key.
-- `walkPlanExprs` (unnest.go) misses `Aggregate.Passthrough`,
-  `AggregateCall.Filter`, `WindowFunc.Args/Filter`, frame offsets (ledger row).
-- `pushOneConjunct` is the FOURTH legacy family member and is NOT taught about
-  the searched tag (ledger row); it descends into any `*Join`'s children.
-- P5.5-e fixtures build operands with `col(i)` — UNNAMED, so name-resolution
-  assertions over them pass VACUOUSLY. Use `stNamedEqui` / `stHashRoot`.
-- `tryBushyDP` returns immediately when `ctx == nil` — that is how
-  `enclosingtree_test.go` drives `runJoinSearchBelowPinned` with no catalog.
-- **P5.6 `sizeJoinRel` open**; `GOOPG_PGSHAPED_DP` stays OFF. **P4.1 ledger row
-  #3 still open** (`mergeJoinStream.bufferGroup` twin).
+- `sizeJoinRel` still has NO production implementor (only
+  `joinsearchlevel_test.go`'s `recordingBuilder`). P5.6-b writes both it and
+  the concrete `joinRelBuilder` that binds it to `addPathsToJoinrel`.
+- Base-rel resolution inside the search: relid bit i → `s.relInfos[i]`
+  (FROM order); `.table` is nil for a subquery/CTE/VALUES leaf; `.baseRows` is
+  the RAW (pre-filter) count = PG's `rel->tuples`.
+- Column stats resolve by **NAME** (`columnStatsByName`, pathparamindex.go).
+  `ColumnRef.Index` is a GLOBAL offset in the pre-search concatenation — a
+  positional read of `Stats.Columns` reads the wrong column.
+- goopg splits PG's signed `stadistinct` into `NDistinct` + `NDistinctFrac`;
+  the fraction wins. ONE reduction now: `catalog.ColumnStats.StaDistinct()`,
+  read by the pg_statistic heap row, the pg_stats view and the estimator.
+- Dispatch on the OPERATOR, not `isEquijoin`: `a.x = b.y + c.z` is priced by
+  eqjoinsel (0.005) not by the 0.5 unhandled default. `isEquijoin` governs only
+  which operands are examined (leftKey pairs with leftRelids, never bo.Left).
+- 3 new ledger rows: eqjoinsel MCV arm; `vardata->isunique` (= P5.6-b);
+  `examine_variable`'s subquery/expression arms.
+- Still open from earlier: P4.1 ledger row #3 (`mergeJoinStream.bufferGroup`
+  twin); `pushOneConjunct` not taught the searched tag; `walkPlanExprs` misses
+  `Aggregate.Passthrough`/`AggregateCall.Filter`/`WindowFunc`.
 - Do NOT `git stash`; gofmt baseline go1.25 (never wholesale `-w`); `cd`
   persists across Bash calls — use absolute paths.
 - Gate recipes — SPOT: `scripts/tpch-spotcheck.sh` (~30 s + build). DS05:
@@ -44,12 +43,11 @@ Carry-over facts a next loop should not re-derive:
   `bench/tpch/setup_goopg.sh` → `PATH=$PWD/postgres/local_install/bin:$PATH
   make plan-gate` → `bench/tpch/stop_goopg.sh`.
 
-Gates run this loop: build+vet clean; 12 new tests PASS; UNITS PASS (exit 0,
-0 FAILs, `/tmp/units_p55fiib.log`); SPOT PASS (`/tmp/spot_p55fiib.log`, Q12=2
-Q13=35 canonical, 28.0 s); pgbench SMOKE via the commit hook. DS05 + PLAN
-re-baseline NOT applicable and not run — every new line is reachable only from
-a tagged node, and only `createPlanAtSearchRoot` tags, which nothing calls from
-`planSelect`; no plan can move.
+Gates run this loop: build+vet clean; 17 new tests PASS; UNITS PASS (exit 0,
+0 FAILs, `/tmp/units_p56a.log`); SPOT PASS (`/tmp/spot_p56a.log`, Q12=2 Q13=35
+canonical, 25.7 s); pgbench SMOKE via the commit hook. DS05 + PLAN not
+applicable — the planner half has no production caller, and the catalog half is
+an identity refactor of one two-field reduction.
 
 Nightly triage: still the same 17 `AI-20260804-005028-*` subjects from run
 20260804-005028, all already filed under M-NIGHTLY. Nothing new to file.

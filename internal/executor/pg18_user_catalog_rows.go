@@ -1305,14 +1305,10 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 	// The fraction is preferred when available because it is scale-free and so
 	// survives a restart usefully — the absolute count cannot be interpreted
 	// without a row count, and the row count is not restored (ledger pq-P6).
-	var distinctF64 float64
-	switch {
-	case stats.NDistinctFrac > 0:
-		distinctF64 = -stats.NDistinctFrac
-	case stats.NDistinct > 0:
-		distinctF64 = float64(stats.NDistinct)
-	}
-	distinctStr := strconv.FormatFloat(distinctF64, 'g', -1, 32)
+	// The reduction itself lives on `ColumnStats` (M0127-P5.6-a) so this row,
+	// the pg_stats view and the planner's join estimator cannot disagree about
+	// which field wins.
+	distinctStr := strconv.FormatFloat(stats.StaDistinct(), 'g', -1, 32)
 
 	var stakind1, stakind2 int16
 	var staop1 uint32

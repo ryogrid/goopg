@@ -765,7 +765,48 @@
 - [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling
-  ([09](09-verification-and-acceptance.md) §5).
+  ([09](09-verification-and-acceptance.md) §5). Decomposed, because 04 §3's
+  remedy set is four mechanisms and a measurement, not one edit:
+  - [x] **P5.6-a** the per-clause substrate: `examine_variable`,
+    `get_variable_numdistinct` and `eqjoinsel`'s no-MCV arm over
+    `restrictInfo` operands. *(DONE 2026-08-04 —
+    `internal/planner/joinselectivity.go` + `catalog.ColumnStats.StaDistinct`.
+    The compounding this exists to end is specific: the legacy
+    `estimateJoinCost` divides |L|·|R| by the PRODUCT of every spanning edge's
+    per-side NDV (bushy.go:1266-1301) where PG divides by ONE ndistinct — the
+    LARGER of the two sides' — per clause, because upstream's estimate is the
+    MINIMUM of two upper bounds, not a per-edge product. **The finding that
+    shaped the dispatcher:** the operator decides, `isEquijoin` does not.
+    `a.x = b.y + c.z` is an equality that splits into no two one-sided
+    operands, so it can key no hash join and `isEquijoin` is false — but PG
+    still prices it with `eqjoinsel`, and routing it to
+    `clause_selectivity`'s 0.5 fall-through instead would charge 100× the
+    0.005 upstream charges, on every joinrel above it. What the flag governs
+    is only which OPERANDS are examined, since pairing `bo.Left` with
+    `ri.leftRelids` — the two are free to be different sides — would read one
+    relation's column against another's statistics. **Second finding:** goopg
+    splits upstream's one signed `stadistinct` into `NDistinct` +
+    `NDistinctFrac`, and the reduction back to PG's convention was
+    open-coded at the pg_statistic heap row and the pg_stats view; a third
+    copy in the estimator is the shape where the planner silently plans on a
+    different number than the one it shows the user, so it became
+    `ColumnStats.StaDistinct` and all three now read it. 3 ledger rows
+    (eqjoinsel's MCV arm; `vardata->isunique`, which is P5.6-b's own
+    mechanism; `examine_variable`'s subquery/expression arms). 17 tests
+    (`joinselectivity_test.go`). Still inert — `sizeJoinRel` has no
+    production implementation until P5.6-b.)*
+  - [ ] **P5.6-b** `calcJoinrelSize` + the concrete `joinRelBuilder`:
+    04 §3.1's FK/unique-superkey generalisation over clause SUBSETS
+    (`get_variable_numdistinct`'s `isunique` arm, replacing
+    `uniqueNoFanoutRawCount`'s edge-list form) driving the rows-once
+    discipline of 04 §2.
+  - [ ] **P5.6-c** 04 §3.3's clamp discipline: the FK-implied bound, and the
+    `max(l,r)` non-FK fallback cap kept beside it.
+  - [ ] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once
+    04 §4's honest batch-I/O term prices what it was standing in for.
+  - [ ] **P5.6-e** the estimate audit ([09](09-verification-and-acceptance.md)
+    §5): Q9's chain within 2 orders of magnitude of actual at the final
+    joinrel, checked by tooling rather than by eye.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

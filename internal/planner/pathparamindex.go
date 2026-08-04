@@ -394,9 +394,9 @@ func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.
 //
 // With no statistics PG falls back to `get_variable_numdistinct`'s default
 // (DEFAULT_NUM_DISTINCT = 200, selfuncs.h), which is what the zero-stats branch
-// returns here.
+// returns here — through the package-level `defaultNumDistinct`
+// (joinselectivity.go), so this arm and the join estimator's cannot drift apart.
 func varEqNonConstSelectivity(stats *catalog.ColumnStats) float64 {
-	const defaultNumDistinct = 200.0
 	if stats == nil || stats.NDistinct <= 0 {
 		return 1.0 / defaultNumDistinct
 	}
