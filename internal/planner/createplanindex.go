@@ -51,12 +51,13 @@ package planner
 //     PG's `qpqual` has no analogue on the node — so a base relation's
 //     restriction clauses live in a `*Filter` ABOVE the scan. Re-emitting the
 //     leaf therefore means re-emitting that `Filter` too, which is why
-//     `indexScanLeafFor` returns a rewrapper rather than just the scan.
+//     `scanLeafFor` returns a rewrapper rather than just the scan.
 //
-// The producers and this consumer share `indexScanLeafFor` for the eligibility
+// The producers and this consumer share `scanLeafFor` for the eligibility
 // test, which is rule #2 in the form it takes here: a leaf that cannot be
 // rebuilt as an index scan must not have an index path COSTED over it either,
-// or the DP prices a plan the builder then refuses. One predicate, two callers,
+// or the DP prices a plan the builder then refuses. One predicate — since
+// M0127-P5.5-d also the seq-scan arm's resolver (createplansimple.go) — and
 // no drift.
 //
 // Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
@@ -69,9 +70,12 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// indexScanLeafRewrap rebuilds the wrappers that sat above a base relation's
+// scanLeafRewrap rebuilds the wrappers that sat above a base relation's
 // scan node, over a replacement scan. It is the identity for a bare leaf.
-type indexScanLeafRewrap func(*IndexScan) Node
+// Generic over the replacement (M0127-P5.5-d): the index arm passes an
+// `*IndexScan`, the seq-scan arm a `*SeqScan`, and the wrappers are the same
+// either way.
+type scanLeafRewrap func(Node) Node
 
 // scanIdentity is the leaf scan's copied-forward state. `*SeqScan` and
 // `*IndexScan` both yield one (`scanIdentityOf`); nothing else does, and that
@@ -87,9 +91,23 @@ type scanIdentity struct {
 	smallDim              bool
 	privilegeCheckRole    string
 	privilegeCheckRoleSet bool
+
+	// The `*SeqScan`-only fields (M0127-P5.5-d). Populated only when the leaf's
+	// base scan IS a `*SeqScan`; zero when it is an `*IndexScan`, which never
+	// carried them — the pass that promoted the leaf to an index probe dropped
+	// them at substitution time, so a seq scan rebuilt from such a leaf loses
+	// nothing NEW (`createSeqScanPlan`). `estRelRows` at zero merely re-enables
+	// `EstimateRows`' stats fallback; the three inheritance/lock fields exist
+	// only on scans produced by inheritance expansion (planner.go:2551, :2602),
+	// and any substitution that had replaced such a scan with an `*IndexScan`
+	// dropped them then — the loss, if any, predates this seam.
+	estRelRows       int64
+	lockParentOID    uint32
+	skipIfVanished   bool
+	inheritParentOID uint32
 }
 
-// indexScanLeafFor resolves the base scan inside a search leaf and returns the
+// scanLeafFor resolves the base scan inside a search leaf and returns the
 // rewrapper that reproduces the leaf's structure over a replacement scan.
 //
 // The recognised shapes are exactly the ones the pre-search pipeline produces
@@ -108,7 +126,7 @@ type scanIdentity struct {
 // passes that the predicate is in leaf-local coordinates (plan.go:1064-1071);
 // a Filter that loses the flag has its ColumnRefs renumbered by a pass that
 // assumes cumulative coordinates.
-func indexScanLeafFor(leaf Node) (*scanIdentity, indexScanLeafRewrap, bool) {
+func scanLeafFor(leaf Node) (*scanIdentity, scanLeafRewrap, bool) {
 	if leaf == nil {
 		return nil, nil, false
 	}
@@ -131,8 +149,8 @@ func indexScanLeafFor(leaf Node) (*scanIdentity, indexScanLeafRewrap, bool) {
 	if id == nil {
 		return nil, nil, false
 	}
-	rewrap := func(is *IndexScan) Node {
-		var out Node = is
+	rewrap := func(scan Node) Node {
+		out := scan
 		for i := len(wrappers) - 1; i >= 0; i-- {
 			w := wrappers[i]
 			out = &Filter{
@@ -160,6 +178,10 @@ func scanIdentityOf(n Node) *scanIdentity {
 			smallDim:              s.SmallDim,
 			privilegeCheckRole:    s.PrivilegeCheckRole,
 			privilegeCheckRoleSet: s.PrivilegeCheckRoleSet,
+			estRelRows:            s.EstRelRows,
+			lockParentOID:         s.LockParentOID,
+			skipIfVanished:        s.SkipIfVanished,
+			inheritParentOID:      s.InheritParentOID,
 		}
 	case *IndexScan:
 		// The pipeline had already chosen an index for this leaf. Replacing it
@@ -212,7 +234,7 @@ func createIndexScanPlan(p *Path) Node {
 	if p.Rel == nil {
 		panic("createPlan: PathIndexScan with no RelOptInfo")
 	}
-	id, rewrap, ok := indexScanLeafFor(p.Rel.baseLeaf)
+	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
 		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#04x whose leaf is not a rebuildable base scan", uint16(p.Rel.Relids)))
 	}

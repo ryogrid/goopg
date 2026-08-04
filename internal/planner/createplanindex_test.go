@@ -52,7 +52,7 @@ func TestIndexScanLeafForBareScans(t *testing.T) {
 		PrivilegeCheckRole:    "view_owner",
 		PrivilegeCheckRoleSet: true,
 	}
-	id, rewrap, ok := indexScanLeafFor(seq)
+	id, rewrap, ok := scanLeafFor(seq)
 	if !ok {
 		t.Fatal("a bare *SeqScan must be rebuildable")
 	}
@@ -67,7 +67,7 @@ func TestIndexScanLeafForBareScans(t *testing.T) {
 
 	// An *IndexScan leaf (the pipeline already chose an index) resolves too:
 	// replacing its index with the search's choice is the point of the arm.
-	if _, _, ok := indexScanLeafFor(&IndexScan{Table: tbl, Alias: "o2"}); !ok {
+	if _, _, ok := scanLeafFor(&IndexScan{Table: tbl, Alias: "o2"}); !ok {
 		t.Fatal("a bare *IndexScan must be rebuildable")
 	}
 }
@@ -81,7 +81,7 @@ func TestIndexScanLeafForFilterWrappers(t *testing.T) {
 	tbl := &catalog.Table{Name: "orders"}
 	inner := &Filter{Child: &SeqScan{Table: tbl}, Predicate: &ColumnRef{Name: "p_inner"}, LeafLocal: true}
 	outer := &Filter{Child: inner, Predicate: &ColumnRef{Name: "p_outer"}}
-	id, rewrap, ok := indexScanLeafFor(outer)
+	id, rewrap, ok := scanLeafFor(outer)
 	if !ok || id.table != tbl {
 		t.Fatalf("wrapped leaf did not resolve: ok=%v id=%+v", ok, id)
 	}
@@ -127,7 +127,7 @@ func TestIndexScanLeafForDeclines(t *testing.T) {
 		"filter over nil":  &Filter{},
 		"filter over join": &Filter{Child: &Join{}},
 	} {
-		if _, _, ok := indexScanLeafFor(leaf); ok {
+		if _, _, ok := scanLeafFor(leaf); ok {
 			t.Errorf("%s: not a rebuildable base scan, but accepted", name)
 		}
 	}

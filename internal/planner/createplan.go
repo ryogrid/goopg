@@ -35,10 +35,19 @@ func createPlan(p *Path) Node {
 		// rebuilt from the carrier P5.5-a/-b landed on the path and the leaf
 		// `buildInitialRels` recorded on the rel. createplanindex.go.
 		return createIndexScanPlan(p)
+	case PathSeqScan:
+		// The index arm's mirror (M0127-P5.5-d): the same leaf resolver with
+		// the probe machinery removed. createplansimple.go.
+		return createSeqScanPlan(p)
+	case PathSort:
+		// The first arm with a child path (M0127-P5.5-d): P5.4c's merge paths
+		// carry Sort children, so this must exist before the join arms do.
+		// createplansimple.go.
+		return createSortPlan(p)
 	default:
-		// PathSeqScan / PathHashJoin / … do not have arms yet (they are the
-		// remainder of P5.5). Reaching here means a phase constructed a path
-		// kind without teaching createPlan to translate it.
+		// PathHashJoin / PathMergeJoin / PathNestLoop / … do not have arms yet
+		// (they are the remainder of P5.5). Reaching here means a phase
+		// constructed a path kind without teaching createPlan to translate it.
 		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (P5.5)", p.Kind))
 	}
 }

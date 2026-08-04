@@ -523,6 +523,35 @@
   into a whole-relation scan. `Key` vs `Keys` follows the executor's own
   convention (single-column probes use `Key`, nl_index_join.go:656). Still
   inert. 2 ledger rows. 9 new tests. Bar met: UNITS + SPOT.)*
+- [x] **P5.5-d** `create_seqscan_plan` (createplan.c:2910) + `create_sort_plan`
+  (createplan.c:2177) — the two structurally simple arms. *(DONE 2026-08-04,
+  `internal/planner/createplansimple.go` + `createplan.go`,
+  `createplanindex.go`. The seq-scan arm is the index arm's mirror over the
+  SAME leaf resolver — `indexScanLeafFor` is renamed `scanLeafFor` and its
+  rewrapper generalised from `*IndexScan` to `Node`, since the predicate now
+  serves two arms; `scanIdentity` gains the four `*SeqScan`-only fields
+  (EstRelRows, LockParentOID, SkipIfVanished, InheritParentOID) so the rebuild
+  is LOSSLESS, honouring the struct's stated purpose that a field added to the
+  node is a compile-visible edit there. The arm rebuilds a FRESH node even when
+  the leaf's base scan already is a `*SeqScan` (the emitted tree must never
+  alias nodes the pipeline still owns — `attachRelationLocalFilters` matches by
+  pointer), and DEMOTES an `*IndexScan` leaf when the search costed the
+  sequential scan cheaper. Its panics: a parameterised seq scan is
+  undischargeable, claimed pathkeys are an ordering a heap scan does not
+  deliver, index detail means a costed probe was mislabelled. The sort arm is
+  the first arm with a CHILD path — it recurses via `createPlan`, so it must
+  exist before P5.5-e's join arms (P5.4c's merge paths carry `PathSort`
+  children) — translating `PathKey.SortAsc` to the executor's `SortKey.Desc`
+  by negation, NullsFirst unchanged. Deliberately NOT reproduced, each
+  ledgered or filed: CP_SMALL_TLIST width trim before the sort
+  (createplan.c:2188 — goopg nodes have no tlist negotiation); the
+  `prepare_sort_from_pathkeys` EC/resjunk column resolution (goopg's Sort
+  evaluates the key EXPRESSION against child rows; coordinate correctness is
+  P5.5-f's map assertion); `generateScanPaths` does not yet gate on
+  `scanLeafFor` (it is C3.2 test-only — the gate must be applied when C4
+  wires it into the live search, or the DP prices a seq path over a subquery
+  leaf and the builder panics). Still inert. 2 ledger rows. 7 new tests
+  (`createplansimple_test.go`). Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

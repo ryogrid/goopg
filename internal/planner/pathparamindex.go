@@ -232,7 +232,7 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 		// must not have an index path costed over it either, or the DP prices a
 		// plan the builder then refuses. One predicate, two callers, no drift
 		// (rule #2; createplanindex.go).
-		if _, _, ok := indexScanLeafFor(rel.baseLeaf); !ok {
+		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)

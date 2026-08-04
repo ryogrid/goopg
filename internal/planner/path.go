@@ -184,7 +184,7 @@ type RelOptInfo struct {
 	// what PG reaches through `RelOptInfo`'s range-table entry and goopg's
 	// search-only rel cannot: `createPlan`'s scan arms re-emit from it
 	// (createplanindex.go), and the index-path producers gate on it through the
-	// same `indexScanLeafFor` predicate, so a path is never COSTED over a leaf
+	// same `scanLeafFor` predicate, so a path is never COSTED over a leaf
 	// the builder cannot rebuild.
 	baseLeaf Node
 }

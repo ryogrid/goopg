@@ -75,7 +75,7 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		}
 		// Same consumer-side eligibility gate as `addParameterizedIndexPaths`
 		// (M0127-P5.5-c): no index path over a leaf `createPlan` cannot rebuild.
-		if _, _, ok := indexScanLeafFor(rel.baseLeaf); !ok {
+		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
 		colExprs := mergeableColumnExprsFor(rel.Relids, s.clauses.all)

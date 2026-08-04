@@ -6788,6 +6788,37 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       tests (`createplanindex_test.go`). IMPLEMENTATION-TODO P5.5-c; 03 §10;
       02 §3. Bar met: UNITS + SPOT. DS05 not applicable — the arm is reachable
       only from the inert search, so no plan and no row can move.
+- [x] **M0127-P5.5-d — `create_seqscan_plan` + `create_sort_plan`: the two
+      structurally simple arms.** DONE 2026-08-04
+      (`internal/planner/createplansimple.go` + `createplan.go`,
+      `createplanindex.go`). The seq-scan arm (createplan.c:2910) is the index
+      arm's mirror over the SAME leaf resolver: `indexScanLeafFor` is renamed
+      `scanLeafFor` and its rewrapper generalised from `*IndexScan` to `Node`
+      (one predicate now serving two arms, rule #2), and `scanIdentity` gains
+      the four `*SeqScan`-only fields (EstRelRows, LockParentOID,
+      SkipIfVanished, InheritParentOID) so the rebuild is LOSSLESS — honouring
+      the struct's stated purpose that a `*SeqScan` field addition is a
+      compile-visible edit there. The arm rebuilds a FRESH node even when the
+      leaf's base scan already is a `*SeqScan` (the emitted tree must never
+      alias nodes the pipeline still owns — `attachRelationLocalFilters`
+      matches leaves by POINTER identity) and DEMOTES an `*IndexScan` leaf when
+      the search costed the sequential scan cheaper. Panics: a parameterised
+      seq scan is undischargeable (nothing above it can ever bind
+      `RequiredOuter`); claimed pathkeys are an ordering a heap scan does not
+      deliver (a merge above would trust it and emit wrong rows); index detail
+      means a costed probe was mislabelled. The sort arm (createplan.c:2177) is
+      the first arm with a CHILD path — it recurses via `createPlan`, which is
+      why it lands BEFORE P5.5-e's join arms: P5.4c's merge paths already carry
+      `PathSort` children (`sortPathFor`), so the merge arm cannot be written
+      until this one exists. Key translation is direction-only
+      (`PathKey.SortAsc` negated into the executor's `SortKey.Desc`,
+      NullsFirst carried through). 2 ledger rows (`generateScanPaths` lacks the
+      shared `scanLeafFor` gate — must be applied at C4 wiring;
+      CP_SMALL_TLIST width trim before the sort has no analogue). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no `planSelect` caller). 7 new tests
+      (`createplansimple_test.go`). IMPLEMENTATION-TODO P5.5-d; 03 §3, §5.3,
+      §10. Bar met: UNITS + SPOT. DS05 not applicable — the arms are reachable
+      only from the inert search, so no plan and no row can move.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root
