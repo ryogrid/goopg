@@ -591,15 +591,50 @@
   SubPlan arguments not re-based). 1 inventory pin
   (`createplanjoin.go:translateToLayout`). Still inert. 8 new tests
   (`createplanjoin_test.go`). Bar met: UNITS + SPOT.)*
-- [ ] **P5.5-e-ii** `create_mergejoin_plan` (createplan.c:4444) +
-  `create_nestloop_plan` (createplan.c:4322) — the remaining join arms. They
-  reuse P5.5-e-i's recursion, `outputLayout` and `translateToLayout` whole and
-  add their own: the merge arm's ORDERED key list (`Path.HashKeys` is grouped by
-  sort key in the path's own pathkey order) over children that are already
-  `PathSort` paths, and the nested-loop arms' parameter-binding contract with a
-  parameterised inner index path — `*NestedLoopIndexJoin` plus the
-  P5.4b-ii-b-2 Memoize/binding contract, and the residual DROP via
-  `indexPathClause.ri` / `ecID` that the P5.5-c ledger row is waiting on.
+- [x] **P5.5-e-ii-a** `create_mergejoin_plan` (createplan.c:4444) — the second
+  join arm. *(DONE 2026-08-04, `internal/planner/createplanjoin.go` +
+  `createplan.go`, `createplansimple.go`. The prologue P5.5-e-i wrote inline was
+  lifted into `joinInputsFor` / `joinInputs.keyPairs` / `joinInputs.joinPredicate`
+  in the same commit, so both arms build the merged row from ONE piece of code —
+  two arms concatenating schema and layout separately would drift, and the drift
+  is a wrong-column join that still runs. What is merge-only is two things.
+  (1) **The key list IS the sort order.** `sortInnerAndOuter` concatenates the
+  merge key GROUPS in the pathkey order it chose, and goopg's merge executor
+  sorts each side by the key TUPLE in `Join.HashKeys` order
+  (`mergeSideKeyExprs` → `mergeSortedSource.less`), so that list is
+  `outersortkeys`/`innersortkeys` rather than a set of clauses — `keyPairs`
+  preserves the order it is given, and the keys must become `Predicate`
+  conjuncts in that same order because `fillJoinHashKeys` REBUILDS the published
+  list from `Predicate` at the tail of `Plan()`. A group serving several clauses
+  contributes several pairs with EC-equivalent outer operands, so the tuple can
+  be longer than `outersortkeys` — PG's shape too
+  (`find_mergeclauses_for_outer_pathkeys`, pathkeys.c:1670). (2) **The explicit
+  `PathSort` children are ABSORBED, not emitted.** PG materialises a Sort here
+  because `nodeMergejoin` requires sorted input; goopg's `JoinAlgoMerge`
+  operator sorts BOTH inputs itself, unconditionally (`openMergeJoin`), so
+  emitting the child Sort would sort each side twice — a cost
+  `tryMergeJoinPath` never charged. `absorbMergeSort` steps over the `PathSort`
+  and emits its child, which is coordinate-neutral (a sort passes its layout
+  through) and reproduces the costed plan exactly. Its guard, and the arm's
+  result-ordering guard, are for P5.4c-ii's ordered inputs: goopg's merge
+  comparator is fixed ascending / NULL-keyed-rows-last, so any other claimed
+  ordering is a promise the emitted node will not keep. Also fixed here, a
+  latent P5.5-d defect the merge arm made reachable: `createSortPlan` emitted
+  its `PathKey.Expr`s UNTRANSLATED, so a sort over a rel that was not first in
+  binding order ordered by whichever column sat at that index — now re-based
+  onto the child's layout through the same `translateToLayout`, rule #2. Panics:
+  <2 children; no merge clause; a parameterised merge path; a non-ascending or
+  nulls-first result pathkey; a non-ascending or nulls-first absorbed sort key.
+  Still inert. 4 new tests (`createplanjoin_test.go`) + 1 strengthened
+  (`createplansimple_test.go`). 2 ledger rows. Bar met: UNITS + SPOT.)*
+- [ ] **P5.5-e-ii-b** `create_nestloop_plan` (createplan.c:4322) — the
+  nested-loop arms (`PathNestLoop` plain and NLI). Reuses P5.5-e-ii-a's
+  `joinInputsFor` / `keyPairs` / `joinPredicate` whole; what is its own is the
+  parameter-binding contract with a parameterised inner index path —
+  `*NestedLoopIndexJoin` plus the P5.4b-ii-b-2 Memoize/binding contract, and the
+  residual DROP via `indexPathClause.ri` / `ecID` that the P5.5-c ledger row is
+  waiting on (a clause the inner probe already enforces must not be re-evaluated
+  as a join qual, or its selectivity is double-counted above).
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

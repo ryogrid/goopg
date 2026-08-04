@@ -6851,16 +6851,44 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       an outer join enters the search; SubPlan args not re-based). 1 inventory
       pin. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests. Bar met: UNITS +
       SPOT. DS05 not applicable — reachable only from the inert search.
-- [ ] **M0127-P5.5-e-ii — `create_mergejoin_plan` + `create_nestloop_plan`: the
-      remaining join arms.** They reuse P5.5-e-i's recursion, `outputLayout` and
-      `translateToLayout` whole and add their own: the merge arm's ORDERED key
-      list (`Path.HashKeys` grouped by sort key in the path's pathkey order)
-      over children that are already `PathSort` paths, and the nested-loop arms'
-      parameter-binding contract with a parameterised inner index path
-      (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2 Memoize/binding contract, and
-      the residual DROP via `indexPathClause.ri`/`ecID` that the P5.5-c ledger
-      row waits on). IMPLEMENTATION-TODO P5.5-e-ii; 03 §5.2, §5.3, §5.4.
-      Bar: UNITS + SPOT.
+- [x] **M0127-P5.5-e-ii-a — `create_mergejoin_plan`: the second join arm, and
+      the sort nodes goopg must DELETE where PG creates them.** DONE 2026-08-04
+      (`internal/planner/createplanjoin.go` + `createplan.go`,
+      `createplansimple.go`). P5.5-e-i's prologue was lifted into
+      `joinInputsFor` / `keyPairs` / `joinPredicate` in the same commit so both
+      arms build the merged row from ONE piece of code — two arms concatenating
+      schema and layout separately drift, and the drift is a wrong-column join
+      that still runs. Merge-only fact 1: **the key list IS the sort order.**
+      `sortInnerAndOuter` concatenates the key GROUPS in the pathkey order it
+      chose and `mergeSideKeyExprs` sorts each side by the tuple in
+      `Join.HashKeys` order, so that list is `outersortkeys`/`innersortkeys`,
+      not a set — the arm preserves the given order AND folds the keys into
+      `Predicate` in it, because `fillJoinHashKeys` rebuilds the published list
+      from `Predicate` at the tail of `Plan()`, so re-ordering there re-orders
+      the SORT. Merge-only fact 2: **the explicit `PathSort` children are
+      absorbed.** PG materialises a Sort here because `nodeMergejoin` requires
+      sorted input; goopg's `JoinAlgoMerge` operator sorts both inputs itself,
+      unconditionally (`openMergeJoin`), so emitting the child Sort sorts each
+      side twice — a cost `tryMergeJoinPath` never charged. `absorbMergeSort`
+      steps over it (coordinate-neutral: a sort passes its layout through) and
+      the arm refuses any descending/nulls-first result or absorbed-sort key,
+      because goopg's merge comparator is fixed ascending/NULL-keys-last — a
+      standing guard for P5.4c-ii's ordered index paths. Also fixed: a latent
+      P5.5-d defect this arm made reachable — `createSortPlan` emitted its
+      pathkey expressions UNTRANSLATED, so a sort over a rel not first in
+      binding order ordered by whichever column sat at that index; now re-based
+      through the same `translateToLayout` (rule #2). 2 ledger rows. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). 4 new tests + 1 strengthened. Bar met: UNITS +
+      SPOT.
+- [ ] **M0127-P5.5-e-ii-b — `create_nestloop_plan`: the nested-loop arms.**
+      Reuses P5.5-e-ii-a's `joinInputsFor`/`keyPairs`/`joinPredicate` whole;
+      what is its own is the parameter-binding contract with a parameterised
+      inner index path (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2
+      Memoize/binding contract, and the residual DROP via
+      `indexPathClause.ri`/`ecID` that the P5.5-c ledger row waits on — a clause
+      the inner probe already enforces must not be re-evaluated as a join qual,
+      or its selectivity is double-counted above). IMPLEMENTATION-TODO
+      P5.5-e-ii-b; 03 §5.2, §5.4. Bar: UNITS + SPOT.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root

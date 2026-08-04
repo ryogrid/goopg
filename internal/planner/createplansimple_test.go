@@ -205,20 +205,43 @@ func TestCreateSortPlanOverPrebuilt(t *testing.T) {
 // TestCreateSortPlanOverSeqScanPath: the recursion reaches a REAL child arm,
 // not just the prebuilt unwrap — the shape `sortPathFor` produces once the
 // child is a searched path rather than a wrapped node.
+//
+// The rel is deliberately NOT first in binding order (offset 4), which is what
+// makes the key translation observable (M0127-P5.5-e-ii-a). A pathkey is written
+// in the search's binding coordinates like every other expression it holds; the
+// emitted `*Sort` evaluates it against its CHILD's row. Untranslated, this sort
+// would order by index 4 — a column the child does not even have.
 func TestCreateSortPlanOverSeqScanPath(t *testing.T) {
-	leaf := &SeqScan{Table: &catalog.Table{Name: "orders"}, Alias: "o"}
+	leaf := &SeqScan{
+		Table:  &catalog.Table{Name: "orders"},
+		Alias:  "o",
+		schema: Schema{{Name: "o_orderkey"}, {Name: "o_orderdate"}},
+	}
+	child := cpsSeqPath(leaf)
+	child.Rel.baseOffset = 4
 	p := &Path{
-		Kind:     PathSort,
-		Pathkeys: []PathKey{{Expr: &ColumnRef{Name: "o_orderdate"}, SortAsc: true}},
-		Children: []*Path{cpsSeqPath(leaf)},
+		Kind: PathSort,
+		// Binding column 5 is `o_orderdate`, the leaf's SECOND column.
+		Pathkeys: []PathKey{{Expr: &ColumnRef{Name: "o_orderdate", Index: 5}, SortAsc: true}},
+		Children: []*Path{child},
 	}
 	s, ok := createPlan(p).(*Sort)
 	if !ok {
 		t.Fatalf("createPlan(PathSort) = %T, want *Sort", createPlan(p))
 	}
-	child, ok := s.Child.(*SeqScan)
-	if !ok || child == leaf || child.Alias != "o" {
-		t.Fatalf("child arm not applied: %T (reused=%v)", s.Child, child == leaf)
+	scan, ok := s.Child.(*SeqScan)
+	if !ok || scan == leaf || scan.Alias != "o" {
+		t.Fatalf("child arm not applied: %T (reused=%v)", s.Child, scan == leaf)
+	}
+	key, ok := s.Keys[0].Expr.(*ColumnRef)
+	if !ok {
+		t.Fatalf("sort key = %T, want *ColumnRef", s.Keys[0].Expr)
+	}
+	if key.Index != 1 {
+		t.Fatalf("sort key index = %d, want 1 (binding 5 = the child's second column)", key.Index)
+	}
+	if p.Pathkeys[0].Expr.(*ColumnRef).Index != 5 {
+		t.Fatal("the arm mutated the path's own pathkey expression")
 	}
 }
 

@@ -448,6 +448,44 @@ for duplicate inner groups, plus the group file — is charged by nothing.
 cost work rather than approximated, because inventing a rescan factor without
 `mergejoinscansel`'s duplicate estimate would move plans on a guess.
 
+**Status (P5.5-e-ii-a, 2026-08-04) — `create_mergejoin_plan`, and why goopg's
+arm DELETES the Sort nodes PG's arm creates.** `createMergeJoinPlan`
+(`internal/planner/createplanjoin.go`) is the plan-time counterpart of the two
+arms above, and it inverts PG's central move. PG's `create_mergejoin_plan`
+(createplan.c:4444) MATERIALISES a Sort from `outersortkeys`/`innersortkeys`,
+because `nodeMergejoin` requires sorted inputs and cannot produce them. goopg's
+`JoinAlgoMerge` operator sorts BOTH inputs itself, unconditionally, into
+`work_mem`-bounded runs (`openMergeJoin`,
+`internal/executor/operators_join_agg.go:315`) — it is a Sort⋈Sort in one node.
+So the explicit `PathSort` children this section's arms build (`sortPathFor`,
+which exist so `addPath` can compare a candidate that needs a sort against one
+that does not) must be ABSORBED at plan time, not emitted: emitting them would
+sort each side twice, a cost `tryMergeJoinPath` never charged and a plan no
+producer asked for. `absorbMergeSort` steps over the `PathSort` and emits its
+child, which is coordinate-neutral because a sort passes its `outputLayout`
+through unchanged.
+
+The absorption is only sound while the merge operator's own ordering is the one
+the path promised, and goopg's is FIXED: `mergeSortedSource.less`
+(`internal/executor/join_merge_stream.go:280`) compares ascending with
+NULL-keyed rows last. The arm therefore refuses a result pathkey or an absorbed
+sort key that is descending or nulls-first — unreachable from
+`sort_inner_and_outer`, whose keys are ascending by construction, and a standing
+guard for P5.4c-ii's ordered index paths, which are the first producer that can
+offer a merge input ordered any other way. Ledgered: a P5.4c-ii outer that is
+already ordered gets no `PathSort` at all, so the operator re-sorts it and the
+result's claimed ordering (`merge_pathkeys` = the outer's FULL ordering, which
+may be longer than the merge keys) can outrun what the node delivers.
+
+The second merge-only fact this arm pins is that **`Path.HashKeys` order IS the
+sort order**. `sortInnerAndOuter` concatenates the key groups in the pathkey
+order it chose; `mergeSideKeyExprs` (`internal/executor/join_merge_key.go`)
+sorts each side by the key TUPLE in `Join.HashKeys` order. The published list is
+therefore `outersortkeys`/`innersortkeys`, which is why the arm preserves the
+order it was given AND folds the keys into `Join.Predicate` in that same order —
+`fillJoinHashKeys` rebuilds the published list from `Predicate` at the tail of
+`Plan()`, so a re-ordering there would re-order the sort.
+
 The jointype gauntlet (`nestjoinOK` / `useallclauses`, joinpath.c:1833-1852 —
 RIGHT/RIGHT-ANTI/FULL must use *all* mergeclauses, so the truncation loop is
 skipped for them entirely) and the FULL-without-usable-clause contract above

@@ -1,54 +1,56 @@
 (idle — nothing in flight)
 
-M0127-P5.5-a is CLOSED and committed. **P5.5's stated prerequisite is now met.**
+M0127-P5.5-e-ii-a is CLOSED and committed. **The merge-join `createPlan` arm
+exists, and with it the finding that goopg must DELETE the Sort nodes PG's
+arm creates.**
 
 **NEXT LOOP: re-read the `## Current Priority` banner (it wins over this note).
 It parks M-NIGHTLY below M0127, so the banner selects the next unchecked M0127
-item, which is `P5.5` proper (`createPlan` arms + the 03 §10 search-boundary
-coordinate map).**
+item — `P5.5-e-ii-b`: `create_nestloop_plan` (createplan.c:4322) for
+`PathNestLoop` (plain, `pathgen.go:109`) and the NLI paths
+(`joinpathsnli.go:191`). It reuses `joinInputsFor`/`keyPairs`/`joinPredicate`
+whole; what is its own is the parameter-binding contract with a parameterised
+inner index path (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2 Memoize/binding
+contract) and the residual DROP via `indexPathClause.ri`/`ecID` the P5.5-c
+ledger row waits on.**
 
 Carry-over facts a next loop should not re-derive:
 
-- **P5.5-a landed the index/direction half only.** `Path.IndexInfo` +
-  `Path.IndexScanDir` are filled at BOTH index-path constructors via
-  `indexPathOrdering` (`pathindexcarrier.go`), which returns pathkeys AND
-  direction together so they cannot drift. `ScanDirection` uses PG's -1/0/+1
-  encoding; the zero value means "not an index path".
-- **`IndexPath.indexclauses` is STILL not carried** (new ledger row). The
-  blocker found this loop: PG's `indexclauses` are in INDEX-COLUMN order
-  (`match_clauses_to_index`), goopg's `bound []paramIndexClause` is in
-  CANDIDATE order, and the executor's `IndexScan.Keys[i]` binds
-  `Index.Columns[i]` POSITIONALLY — a verbatim copy would bind the wrong
-  column. P5.5's createPlan arm needs this sorted carrier to build `Keys`.
-- **`createPlan` today handles `PathPrebuilt` only** and panics on every other
-  kind (`createplan.go:37`). Live kinds it must grow arms for: PathIndexScan,
-  PathSeqScan, PathHashJoin, PathMergeJoin, PathNestLoop, PathSort.
-- **Merge path anatomy for the createPlan arm:** `Children[0]` = outer,
-  `Children[1]` = inner (a `PathSort` child when that side needed sorting);
-  `HashKeys` = the ORDERED merge clauses; `Residual` = everything else,
-  INCLUDING clauses a truncated merge demoted. `Pathkeys` is the OUTER PATH's
-  full ordering, which may be longer than the merge key list.
-- **`P5.4b-ii-b-2` stays DEPENDENCY-DEFERRED until after P5.5** (needs a built
-  `*Join` NODE).
-- **An ordered index path is never `CheapestTotal`** (`indexCorrelationFor` is
-  0). Anything wanting one must walk `rel.Pathlist`.
-- **`sizeJoinRel` is STILL the open half of the `joinRelBuilder` seam** (P5.6).
-  `GOOPG_PGSHAPED_DP` stays OFF. Do not write a stand-in sizer.
-- **P4.1 ledger row #3 still open**: `mergeJoinStream.bufferGroup` twin.
-- **Repo gofmt baseline is go1.25; local gofmt is 1.26** — never wholesale `-w`.
-- **Do NOT `git stash`** in this tree (9+ unrelated entries).
-- **Gate recipes** — SPOT: `scripts/tpch-spotcheck.sh`. DS05:
+- **Clause coordinates are BINDING coordinates** (pre-search concatenation of
+  every FROM item's schema). `relidsOfExpr` (joinrestrict.go:357) buckets
+  `ColumnRef.Index` against those same offsets, so any new translator must use
+  `scopeIgnore` to keep agreeing with it (rule #2).
+- The join prologue is now ONE function: `joinInputsFor(p, kind, outerPath,
+  innerPath)` → `joinInputs{outer,inner,outerRelids,innerRelids,merged,lay,
+  index}`, plus `keyPairs` (orientation + translation, ORDER PRESERVED) and
+  `joinPredicate` (keys + residual folded into `Join.Predicate`). The NL arm
+  should not re-write any of it.
+- **`Join.HashKeys` order IS the merge sort order** (`mergeSideKeyExprs` →
+  `mergeSortedSource.less`), and `fillJoinHashKeys` REBUILDS that list from
+  `Predicate` at the tail of `Plan()` — so key conjuncts must be appended in
+  key order or the rebuild re-orders the sort.
+- **goopg's `JoinAlgoMerge` sorts both inputs itself** (`openMergeJoin`), fixed
+  ascending / NULL-keys-last. Hence `absorbMergeSort` + the two ordering
+  refusals. NL has no such absorption question.
+- `createSortPlan` now TRANSLATES its pathkey exprs onto the child layout (was
+  a latent P5.5-d defect: untranslated keys sorted by whatever sat at that
+  binding index). Nil child layout still passes through — ledgered.
+- **P5.5-f still open** (03 §10 boundary map); **P5.6 `sizeJoinRel` still
+  open**. `GOOPG_PGSHAPED_DP` stays OFF. **P4.1 ledger row #3 still open**
+  (`mergeJoinStream.bufferGroup` twin).
+- Do NOT `git stash`; repo gofmt baseline go1.25 (never wholesale `-w`);
+  `cd` persists across Bash calls — use absolute paths.
+- Gate recipes — SPOT: `scripts/tpch-spotcheck.sh`. DS05:
   `scripts/tpcds-sf05-regression.sh sweep` (~1 h). PLAN:
   `bench/tpch/setup_goopg.sh` → `PATH=$PWD/postgres/local_install/bin:$PATH
   make plan-gate` → `bench/tpch/stop_goopg.sh`.
 
-Gates run this loop: UNITS PASS (exit 0, 0 FAILs, `/tmp/units_p55a.log`); SPOT
-PASS (`/tmp/spot_p55a.log`, Q12=2 Q13=35, canonical); pgbench SMOKE PASS via the
-commit hook; build + `go vet ./internal/planner` + gofmt clean on every touched
-file. DS05 not applicable — the new fields are written by a search with no
-`planSelect` caller and `GOOPG_PGSHAPED_DP` is OFF.
+Gates run this loop: UNITS PASS (exit 0, 0 FAILs, `/tmp/units_p55eiia.log`);
+SPOT PASS (`/tmp/spot_p55eiia.log`, Q12=2 Q13=35 canonical, 28.5s); pgbench
+SMOKE via the commit hook. DS05 not applicable — the arm is reachable only from
+the inert search.
 
-Nightly triage: the same 17 `AI-20260804-005028-*` subjects, all already filed
-(001 individually, 002..016 as a batch, 017 individually). Nothing new.
+Nightly triage: the same 17 `AI-20260804-005028-*` subjects, all already filed.
+Nothing new.
 
 In-flight: none.

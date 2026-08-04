@@ -128,6 +128,22 @@ func createSeqScanPlan(p *Path) Node {
 // never columns, so output column i is still the child's column i and still the
 // same pre-search binding coordinate. Returning it rather than nil is what lets
 // a merge join sit above a sorted child and still re-base its keys.
+//
+// The KEYS, however, do not pass through: they are `PathKey.Expr`s, written like
+// every other expression the search reasons about in pre-search BINDING
+// coordinates, while the emitted `*Sort` evaluates them against its CHILD's row.
+// For a child whose `baseOffset` is 0 those coincide, which is why P5.5-d could
+// ship without noticing; for a rel that was not first in binding order they do
+// not, and the sort silently orders by whichever column landed at that index.
+// `translateToLayout` (createplanjoin.go) re-bases them, the same function and
+// therefore the same `scopeIgnore` policy the join arms use — rule #2, sibling
+// paths must agree about what a coordinate means.
+//
+// A nil child layout means the coordinates are unknown (the C0 bridge's prebuilt
+// subtree — see `outputLayout`'s doc). There is nothing to translate against, so
+// the keys are emitted as written; the only producer that can reach this is the
+// bridge, whose subtree was never expressed in binding coordinates in the first
+// place.
 func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))
@@ -139,12 +155,20 @@ func createSortPlan(p *Path) (Node, outputLayout) {
 	if child == nil {
 		panic("createPlan: PathSort over a child path that built no node")
 	}
+	var index map[int]int
+	if childLayout != nil {
+		index = childLayout.bindingIndex()
+	}
 	keys := make([]SortKey, len(p.Pathkeys))
 	for i, pk := range p.Pathkeys {
 		if pk.Expr == nil {
 			panic(fmt.Sprintf("createPlan: PathSort pathkey %d has no expression", i))
 		}
-		keys[i] = SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
+		e := pk.Expr
+		if index != nil {
+			e = translateToLayout("sort key", e, childLayout, index)
+		}
+		keys[i] = SortKey{Expr: e, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
 	}
 	return &Sort{pos: child.Pos(), Child: child, Keys: keys}, childLayout
 }

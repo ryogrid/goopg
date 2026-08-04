@@ -72,10 +72,16 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		// The first join arm (M0127-P5.5-e-i) and the first consumer of the
 		// layout above. createplanjoin.go.
 		return createHashJoinPlan(p)
+	case PathMergeJoin:
+		// The second join arm (M0127-P5.5-e-ii-a): the same prologue, plus the
+		// ORDERED key list a merge sorts by and the absorption of the explicit
+		// `PathSort` children goopg's merge operator makes redundant.
+		// createplanjoin.go.
+		return createMergeJoinPlan(p)
 	default:
-		// PathMergeJoin / PathNestLoop / … do not have arms yet (they are
-		// P5.5-e-ii). Reaching here means a phase constructed a path kind
-		// without teaching createPlan to translate it.
+		// PathNestLoop / PathMultiHash / … do not have arms yet (the nested
+		// loops are P5.5-e-ii-b). Reaching here means a phase constructed a
+		// path kind without teaching createPlan to translate it.
 		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (P5.5)", p.Kind))
 	}
 }
