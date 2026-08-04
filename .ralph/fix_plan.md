@@ -7175,13 +7175,45 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       rows. IMPLEMENTATION-TODO P5.6-e-i; 09 §5.1/§5.2. Bar met: UNITS + the
       audit run. DS05 not applicable — new tool + new package with no
       importer in the engine; zero planner/executor lines changed.
-- [ ] **M0127-P5.6-e-ii — close the two class-(a) causes the baseline
+- [x] **M0127-P5.6-e-ii — close the two class-(a) causes the baseline
       isolated** (09 §5.2): a SEMI/ANTI joinrel priced at its outer input
       verbatim (`calc_joinrel_size_estimate`'s JOIN_SEMI arm, costsize.c —
       Q18/Q20/Q22), and a joinrel's non-equi restriction contributing no
       selectivity (Q19's three-branch OR, Q3's re-applied `Filter:`); then
       re-run the audit. Q9's ≤ 10² bar is P5.9's to certify on the post-flip
-      planner. IMPLEMENTATION-TODO P5.6-e-ii. Bar: UNITS + DS05 + audit run.
+      planner. Landed in `internal/planner/cardinality.go` +
+      `selectivity.go`: the JOIN_SEMI/JOIN_ANTI arms with `eqjoinsel_semi`'s
+      no-MCV match fraction (incl. its asymmetric nd2-to-inner-rows clamp),
+      and `clauseSelectivity` over the conjuncts `HashKeys` does not answer —
+      BOTH-sided ones only, since a single-sided conjunct is a
+      baserestrictinfo already priced into the component rel even though
+      goopg leaves a copy on the join. Audit: Q19 328 705× → 13.1× under,
+      Q20-final 891× → 9.5× under, Q21 499× → 9.7× under, Q22 643× → 1.8×,
+      Q4 485× → 7.3×; Q18 halved; **Q9 unchanged at 124.7×**; no new
+      violations (09 §5.3, `analysis/leftdeep-joins/2026-08-04-p56eii*`).
+      **The finding that shaped the scope:** the join-key ndistinct lookup is
+      ALSO wrong (`RightKey.Index` is a MERGED index resolved against the
+      right child's own schema, so the right side of an equi-join never
+      entered `max(nd)`), and correcting it was measured as a large net
+      REGRESSION — Q9's final 124.7× → 176 424× over — because a saturated
+      ANALYZE ndistinct compounds and because supplying `nd` removes the
+      M0126-0010 cap. Spun out as P5.6-e-iii with the rejected run kept as
+      evidence. IMPLEMENTATION-TODO P5.6-e-ii. Bar met: UNITS + DS05
+      (PASS=94/MISMATCH=0, identical to the two prior sweeps) + SPOT
+      (Q12=2, Q13=35) + the audit run.
+- [ ] **M0127-P5.6-e-iii — de-saturate ANALYZE's ndistinct, then fix the
+      join-key coordinate space.** Haas–Stokes in `compute_distinct_stats`
+      terms (`internal/executor/operators_analyze.go`, upstream analyze.c):
+      goopg stores the SAMPLE's distinct count, so a 1.5 M-row unique key
+      reads as ≈ 30 000 and every join above it divides by a number 50× too
+      small. Only then resolve `LeftKey`/`RightKey` in the merged left‖right
+      space and give `columnNDistinctForChild` its `*Join` arm (its
+      `columnStatsForChild` twin already has one — the divergence is
+      deliberate and commented at both ends). Re-examine the M0126-0010 cap
+      in the same loop: it bounds a join at max(|l|,|r|) only on the
+      nd-unavailable path, so it silently disappears the moment nd resolves.
+      Evidence: `analysis/leftdeep-joins/2026-08-04-p56eii-postfix.txt`,
+      09 §5.3. IMPLEMENTATION-TODO P5.6-e-iii. Bar: UNITS + DS05 + audit run.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

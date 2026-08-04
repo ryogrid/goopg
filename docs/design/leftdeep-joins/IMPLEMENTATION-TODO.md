@@ -862,12 +862,31 @@
     (`internal/estimateaudit/audit_test.go`). 4 ledger rows: the Gather gap,
     the per-loop divergence, `InitPlan`/`SubPlan` joins uninstrumented even
     in serial, and P5.6-e's acceptance check itself deferred to P5.9.)*
-  - [ ] **P5.6-e-ii** close the two class-(a) causes the baseline isolated
+  - [x] **P5.6-e-ii** close the two class-(a) causes the baseline isolated
     (09 §5.2) — a SEMI/ANTI joinrel priced at its outer input verbatim
     (`calc_joinrel_size_estimate`'s JOIN_SEMI arm, costsize.c), and a
     joinrel's non-equi restriction contributing no selectivity (Q19's OR,
     Q3's re-applied `Filter:`) — then re-run the audit. Q9's ≤ 10² bar is
     P5.9's to certify, on the post-flip planner.
+    *(Landed 2026-08-04, `internal/planner/cardinality.go` +
+    `selectivity.go`. 09 §5.3 and
+    `analysis/leftdeep-joins/2026-08-04-p56eii-README.md` carry the
+    before/after. Q19 328 705× → 13.1× under, Q20-final 891× → 9.5× under,
+    Q21 499× → 9.7× under, Q22 643× → 1.8×, Q4 485× → 7.3×; Q9 unchanged at
+    124.7×; no new violations. 10 tests. The residual pricing needed
+    `columnStatsForChild` to resolve through a join AND to remap through a
+    Project's targets — the latter a silent sibling divergence that had been
+    answering with another column's MCV list. Spun out: **P5.6-e-iii**.)*
+  - [ ] **P5.6-e-iii** de-saturate ANALYZE's ndistinct (Haas–Stokes,
+    upstream `compute_distinct_stats`, analyze.c), THEN resolve the join keys
+    in the merged left‖right coordinate space they are written in and let
+    `columnNDistinctForChild` resolve through a join. The order is forced by
+    measurement, not preference: the coordinate correction alone was run and
+    rejected (09 §5.3, `2026-08-04-p56eii-postfix.txt`) — it made every
+    joinrel it touched more accurate and Q9's final 124.7× → 176 424× over,
+    because a saturated `nd` compounds up the chain and because supplying
+    `nd` removes the M0126-0010 `max(|l|,|r|)` cap, which fires only on the
+    nd-unavailable path. Bar: UNITS + DS05 + audit run.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

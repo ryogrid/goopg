@@ -190,6 +190,63 @@ Two instrumentation gaps the run surfaced, both ledgered and neither fixed
 here: the Gather gap above, and Q11's `InitPlan`/`SubPlan` joins, which
 report no `actual rows=` even in serial mode.
 
+### 5.3 Both causes closed, 2026-08-04 (P5.6-e-ii)
+
+`analysis/leftdeep-joins/2026-08-04-p56eii.txt`, same instrument and same run
+conditions, LEGACY planner still (`GOOPG_PGSHAPED_DP` OFF) — only
+`estimateJoin` changed. Provenance and the full before/after table:
+`2026-08-04-p56eii-README.md`.
+
+What landed, both in `internal/planner/cardinality.go`:
+
+- **SEMI/ANTI are sized from the OUTER.** `estimateJoin` gained the arms
+  `calc_joinrel_size_estimate` has: `outer_rows · jselec` for JOIN_SEMI and
+  `outer_rows · (1 − jselec)` for JOIN_ANTI, with the match fraction from
+  `eqjoinsel_semi`'s no-MCV branch — `nd1 ≤ nd2 → 1.0`, else `nd2/nd1`, and
+  0.5 when either side is a default. `nd2` carries upstream's asymmetric
+  clamp to the inner relation's row count (the only pathway by which an
+  inner-side restriction reaches a semi/anti estimate; clamping `nd1` too
+  would double-count the outer's own restrictions).
+- **The non-equi restriction is priced.** The conjuncts of `Predicate` that
+  `HashKeys` does not already answer are run through `clauseSelectivity`,
+  which required `columnStatsForChild` to resolve a column THROUGH a join
+  (`Predicate` is written in the merged left‖right space) and to remap
+  through a `Project`'s target list, as its ndistinct twin already did.
+  Only conjuncts referencing BOTH sides count: a single-sided conjunct is a
+  baserestrictinfo upstream and is already priced into the component rel's
+  size, even though goopg also leaves a copy on the join for the executor.
+
+| query | joinrel | §5.2 baseline | now |
+|---|---|---|---|
+| Q19 | final | 328 705× over | 13.1× under |
+| Q20 | final (SEMI) | 891× over | 9.5× under |
+| Q21 | final (ANTI) | 499× over | 9.7× under |
+| Q22 | final (ANTI) | 643× over | 1.8× over |
+| Q4 | final (SEMI) | 485× over | 7.3× over |
+| Q18 | final (SEMI) | 2.5 × 10⁷ over | 1.26 × 10⁷ over |
+| Q9 | final | 124.7× over | 124.7× over |
+
+Five joinrels remain over threshold, one fewer than the baseline and with no
+new ones. Q18, Q3 and Q20's inner SEMI all still fail for a cause §5.2 named
+but did not own: their OUTER input is 293× / 5.8× / 86× over on its own.
+
+**Why the third cause is NOT fixed here.** The first cut also corrected the
+join-key ndistinct lookup — `RightKey.Index` is a MERGED index and was being
+resolved against the right child's own schema, so the right side of an
+equi-join never entered `max(nd)` — and let both column lookups resolve
+through a join, which is what `examine_variable` does. Measured
+(`2026-08-04-p56eii-postfix.txt`), every joinrel it touched got more accurate
+and the queries above them got far worse: **Q9's final 124.7× → 176 424×
+over, Q8's final 1.9× under → 2 171× over**, with Q9's two deepest joins
+landing exactly on their actuals. The missing `nd` was cancelling two
+pre-existing defects — ANALYZE storing a SAMPLE distinct count with no
+Haas–Stokes scale-up (a 1.5 M-row unique key reads as ≈ 30 000), and the
+M0126-0010 `max(|l|,|r|)` cap firing only on the nd-unavailable path, so
+supplying `nd` also removes the bound. Per §6 that is a class-(a) diagnosis
+with its own mechanism, filed as **P5.6-e-iii**: de-saturate ANALYZE, then
+land the coordinate correction with it. The rejected run is committed
+because the conclusion is only defensible with its numbers present.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
