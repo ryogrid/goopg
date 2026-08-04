@@ -132,6 +132,15 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
 	// RC-1a class 45 -> 44.
 	"bushy.go:visitColumnRefsByName": nonRecursiveClassifier,
+	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
+	// recursion and the exhaustiveness); what the census sees is the
+	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,
+	// refuse *OuterColumnRef / *CTIDExpr — attributed to the enclosing
+	// function. Same demoted shape as nl_index_join.go:cloneExprShiftIdx,
+	// whose two-arm veto set this one's is a superset of. Fail-open is not a
+	// hazard here: an unenumerated type aborts cloneExprRefs itself, and the
+	// arm panics on the `!ok`.
+	"createplanjoin.go:translateToLayout": nonRecursiveClassifier,
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and
 	// cloneExprRefs the rewrite — and what the census sees is the

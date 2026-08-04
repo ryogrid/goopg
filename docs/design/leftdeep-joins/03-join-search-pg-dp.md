@@ -615,3 +615,37 @@ bug generator. The replacement must be named, not implied:
 Debug tripwire: a build-mode assertion that every `ColumnRef` above the
 search root resolves within its input schema — the M0097-0058
 out-of-bounds class must fail loudly at plan time, never at execution.
+
+**Amendment 2026-08-04 (P5.5-e-i) — the map's INPUT now exists, and it is
+produced by the recursion rather than re-derived.** The scan and sort arms
+could ignore coordinates entirely (a scan's schema is its leaf's; a sort moves
+no column), but the hash-join arm is the first that MERGES two schemas, and it
+cannot emit a key without answering the question. So `createPlan` gained a
+layout-carrying sibling, `createPlanNode(p) (Node, outputLayout)`
+(`internal/planner/createplanjoin.go`), where `outputLayout[i]` is the
+**pre-search binding coordinate of the emitted node's output column `i`** — the
+inverse of the map this section asks for. It is built the one way that cannot
+drift from the tree: a base rel's layout is the range `RelOptInfo.baseOffset`
+recorded at `buildInitialRels` (the companion field to `baseLeaf` — `baseLeaf`
+says what a relid MEANS, `baseOffset` says where it USED TO BE), a sort passes
+its child's through unchanged, and a join concatenates its children's in the
+same statement that concatenates the schema.
+
+Two consequences for the rest of this section:
+
+- The **inside-the-tree** half of the translation is now done, per node, by
+  `translateToLayout` — `set_join_references` (setrefs.c:2557) at goopg's
+  fidelity. PG rewrites a join qual's Vars into OUTER_VAR/INNER_VAR because its
+  executor addresses the two input slots separately; goopg's evaluates one
+  merged `outer ++ inner` row, so the same job is a single renumbering. This is
+  what the section above did not say out loud: the clauses the search reasons
+  about are written in binding coordinates *by construction* — `relidsOfExpr`
+  DECIDES a clause's relset by bucketing its `ColumnRef.Index` against those
+  same offsets — so a join arm that copied a clause across unchanged would key
+  on whichever column happened to land at that index.
+- The **above-the-search-root** half is still P5.5-f's, and this amendment does
+  not pre-empt its choice. Whichever variant is taken — rewriting the enclosing
+  expressions, or emitting one reordering `Project` at the root — its input is
+  the root's `outputLayout`, which the recursion now hands back. The canonical
+  relid-order commitment above therefore remains a decision about what the
+  search root PUBLISHES, not about how each joinrel is assembled internally.

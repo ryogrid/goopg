@@ -122,14 +122,20 @@ func createSeqScanPlan(p *Path) Node {
 // does not check it either, and the refusal belongs to the JOIN that would
 // have to discharge it (`tryMergeJoinPath` already refuses a parameterised
 // merge input before ever wrapping it in a sort, joinpathsmerge.go:344).
-func createSortPlan(p *Path) Node {
+//
+// The child's `outputLayout` (M0127-P5.5-e-i) passes through UNCHANGED, and
+// that is the whole content of a sort's coordinate story: a sort reorders rows,
+// never columns, so output column i is still the child's column i and still the
+// same pre-search binding coordinate. Returning it rather than nil is what lets
+// a merge join sit above a sorted child and still re-base its keys.
+func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))
 	}
 	if len(p.Pathkeys) == 0 {
 		panic("createPlan: PathSort with no pathkeys; a sort that orders by nothing")
 	}
-	child := createPlan(p.Children[0])
+	child, childLayout := createPlanNode(p.Children[0])
 	if child == nil {
 		panic("createPlan: PathSort over a child path that built no node")
 	}
@@ -140,5 +146,5 @@ func createSortPlan(p *Path) Node {
 		}
 		keys[i] = SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
 	}
-	return &Sort{pos: child.Pos(), Child: child, Keys: keys}
+	return &Sort{pos: child.Pos(), Child: child, Keys: keys}, childLayout
 }

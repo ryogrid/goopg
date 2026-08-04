@@ -187,6 +187,26 @@ type RelOptInfo struct {
 	// same `scanLeafFor` predicate, so a path is never COSTED over a leaf
 	// the builder cannot rebuild.
 	baseLeaf Node
+
+	// baseOffset is WHERE this base relation's columns sat before the search
+	// ran: the index, in the pre-search "binding" coordinate space, of the
+	// leaf's first output column (`rangeBinding.offset`, planner.go:354). It is
+	// `baseLeaf`'s companion and the other half of 03 §10's coordinate map —
+	// `baseLeaf` records what a relid MEANS, `baseOffset` records where it USED
+	// TO BE. Set only on level-1 rels, beside `baseLeaf`, and meaningful only
+	// when that field is non-nil (0 is a legitimate offset for the first FROM
+	// item, so the nil check is the discriminator, not the value).
+	//
+	// Why the search needs it at all: every `restrictInfo.clause` the search
+	// reasons about carries ColumnRefs in exactly this space — `relidsOfExpr`
+	// (joinrestrict.go:357) decides a clause's relset by bucketing each
+	// ColumnRef.Index against the same `cumOffsets` — while the tree
+	// `createPlan` emits is a cost-chosen reordering whose columns sit
+	// somewhere else entirely. A join arm that copied a clause across
+	// unchanged would key on whatever column happened to land at that index.
+	// `outputLayout` (createplanjoin.go) is the per-node translation built
+	// from this field.
+	baseOffset int
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.

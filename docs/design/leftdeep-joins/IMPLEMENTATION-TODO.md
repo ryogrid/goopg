@@ -552,6 +552,54 @@
   wires it into the live search, or the DP prices a seq path over a subquery
   leaf and the builder panics). Still inert. 2 ledger rows. 7 new tests
   (`createplansimple_test.go`). Bar met: UNITS + SPOT.)*
+- [x] **P5.5-e-i** the coordinate carrier + `create_hashjoin_plan`
+  (createplan.c:4633) — the first join arm. *(DONE 2026-08-04,
+  `internal/planner/createplanjoin.go` + `createplan.go`, `createplansimple.go`,
+  `path.go`, `joinsearch.go`. A join is the first arm that MERGES two schemas,
+  which makes the coordinate question unavoidable: every `restrictInfo.clause`
+  is written in pre-search BINDING coordinates — not incidentally, but because
+  `relidsOfExpr` DECIDES a clause's relset by bucketing its `ColumnRef.Index`
+  against exactly those offsets — while the emitted tree is a cost-chosen
+  reordering, so a clause copied across unchanged keys on whichever column
+  happened to land at that index. Resolved by carrying the map through the
+  recursion: `createPlanNode(p) (Node, outputLayout)` where `outputLayout[i]` is
+  output column i's binding coordinate, built from `RelOptInfo.baseOffset`
+  (recorded beside `baseLeaf` at `buildInitialRels` — `baseLeaf` says what a
+  relid MEANS, `baseOffset` where it USED TO BE), passed through unchanged by a
+  sort (which moves rows, not columns) and concatenated by a join in the same
+  statement that concatenates the schema, so it cannot drift from the tree.
+  `translateToLayout` is `set_join_references` (setrefs.c:2557) at goopg's
+  fidelity — one renumbering onto the merged row rather than PG's
+  OUTER_VAR/INNER_VAR split, since goopg's executor evaluates one merged row —
+  built on `cloneExprRefs` so the search's own clause nodes are never mutated,
+  stepping over inner plans (`scopeIgnore`, agreeing with `relidsOfExpr`) and
+  refusing `*OuterColumnRef`/`*CTIDExpr`, neither of which is positional.
+  `BuildLeft` is deliberately never set: `generateHashJoinPaths` adds both
+  orientations as separate paths and `add_path` keeps the cheaper, so the build
+  side was already decided BY COST in the child order the arm receives — setting
+  it here would be the uncosted name-tag rule 06 §2.1 retires. The predicate
+  carries every key equality as well as the residual, matching `buildJoinFromDP`
+  + `attachExtraEdgesLocal`: goopg hashes on one pair and evaluates `Predicate`
+  per matched pair, so a key omitted from it is enforced by nothing (the Q9
+  multi-equality case). Panics: <2 children; no hash key; a parameterised hash
+  path (undischargeable — a hash join propagates rather than binds, and no
+  producer builds one today); a non-equijoin key; a key whose sides do not match
+  the join (`clause_sides_match_join`, joinpath.c:2205); a child whose
+  coordinates are unknown; a clause naming a column outside the join. 2 ledger
+  rows (PG's `joinqual`/`qpqual` split folded into one `Predicate` — equivalent
+  for inner joins, a wrong answer the moment an outer join enters the search;
+  SubPlan arguments not re-based). 1 inventory pin
+  (`createplanjoin.go:translateToLayout`). Still inert. 8 new tests
+  (`createplanjoin_test.go`). Bar met: UNITS + SPOT.)*
+- [ ] **P5.5-e-ii** `create_mergejoin_plan` (createplan.c:4444) +
+  `create_nestloop_plan` (createplan.c:4322) — the remaining join arms. They
+  reuse P5.5-e-i's recursion, `outputLayout` and `translateToLayout` whole and
+  add their own: the merge arm's ORDERED key list (`Path.HashKeys` is grouped by
+  sort key in the path's own pathkey order) over children that are already
+  `PathSort` paths, and the nested-loop arms' parameter-binding contract with a
+  parameterised inner index path — `*NestedLoopIndexJoin` plus the
+  P5.4b-ii-b-2 Memoize/binding contract, and the residual DROP via
+  `indexPathClause.ri` / `ecID` that the P5.5-c ledger row is waiting on.
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

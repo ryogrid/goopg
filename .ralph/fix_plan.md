@@ -6819,6 +6819,48 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       (`createplansimple_test.go`). IMPLEMENTATION-TODO P5.5-d; 03 §3, §5.3,
       §10. Bar met: UNITS + SPOT. DS05 not applicable — the arms are reachable
       only from the inert search, so no plan and no row can move.
+- [x] **M0127-P5.5-e-i — the coordinate carrier + `create_hashjoin_plan`: the
+      first join arm.** DONE 2026-08-04 (`internal/planner/createplanjoin.go` +
+      `createplan.go`, `createplansimple.go`, `path.go`, `joinsearch.go`). The
+      scan and sort arms could ignore coordinates — a scan's schema is its
+      leaf's, a sort moves rows not columns — but a join MERGES two schemas and
+      cannot emit a key without answering the question. And the question has
+      teeth: every `restrictInfo.clause` is written in pre-search BINDING
+      coordinates, not incidentally but because `relidsOfExpr` DECIDES a
+      clause's relset by bucketing its `ColumnRef.Index` against exactly those
+      offsets, while the emitted tree is a cost-chosen reordering — so a clause
+      copied across unchanged keys on whichever column happened to land at that
+      index, which runs and returns wrong rows. Resolved by carrying the map
+      through the recursion rather than re-deriving it:
+      `createPlanNode(p) (Node, outputLayout)`, `outputLayout[i]` = output
+      column i's binding coordinate, seeded by `RelOptInfo.baseOffset`
+      (recorded beside `baseLeaf` at `buildInitialRels` — `baseLeaf` says what a
+      relid MEANS, `baseOffset` where it USED TO BE), passed through by a sort
+      and concatenated by a join in the SAME statement that concatenates the
+      schema, so it cannot drift from the tree. `translateToLayout` is
+      `set_join_references` (setrefs.c:2557) at goopg's fidelity — one
+      renumbering onto the merged row, not PG's OUTER_VAR/INNER_VAR split, since
+      goopg's executor evaluates one merged row — on `cloneExprRefs` so the
+      search's own clauses are never mutated, `scopeIgnore` to agree with
+      `relidsOfExpr` (rule #2), refusing the two non-positional references.
+      `BuildLeft` is never set: `generateHashJoinPaths` adds both orientations
+      as paths and `add_path` keeps the cheaper, so the build side was decided
+      BY COST in the child order — a second opinion here is the uncosted
+      name-tag rule 06 §2.1 retires. 2 ledger rows (`joinqual`/`qpqual` split
+      folded into one `Predicate` — equivalent for inner joins, wrong the moment
+      an outer join enters the search; SubPlan args not re-based). 1 inventory
+      pin. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests. Bar met: UNITS +
+      SPOT. DS05 not applicable — reachable only from the inert search.
+- [ ] **M0127-P5.5-e-ii — `create_mergejoin_plan` + `create_nestloop_plan`: the
+      remaining join arms.** They reuse P5.5-e-i's recursion, `outputLayout` and
+      `translateToLayout` whole and add their own: the merge arm's ORDERED key
+      list (`Path.HashKeys` grouped by sort key in the path's pathkey order)
+      over children that are already `PathSort` paths, and the nested-loop arms'
+      parameter-binding contract with a parameterised inner index path
+      (`*NestedLoopIndexJoin` + the P5.4b-ii-b-2 Memoize/binding contract, and
+      the residual DROP via `indexPathClause.ri`/`ecID` that the P5.5-c ledger
+      row waits on). IMPLEMENTATION-TODO P5.5-e-ii; 03 §5.2, §5.3, §5.4.
+      Bar: UNITS + SPOT.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root
