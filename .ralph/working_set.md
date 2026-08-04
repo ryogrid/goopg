@@ -44,8 +44,16 @@ Carry-over facts a next loop should not re-derive:
 
 Gates run this loop: build+vet clean; the 8 new boundary tests PASS; UNITS PASS
 (exit 0, 0 FAILs, `/tmp/units_p55fi.log`); SPOT PASS (`/tmp/spot_p55fi.log`,
-Q12=2 Q13=35 canonical, 28.9 s); pgbench SMOKE via the commit hook. DS05 not
-applicable — the boundary is reachable only from the inert search.
+Q12=2 Q13=35 canonical, 28.9 s); pgbench SMOKE PASS via the commit hook (0 failed
+on all 3 scripts, 13.9k TPS select-only). DS05 not applicable — the boundary is
+reachable only from the inert search. Committed + pushed as `8f1ae13d`.
+
+**Smoke flake, second sighting:** the FIRST hook attempt failed with 1 failed txn
+in 14417 (`client 1 script 0 aborted … current transaction is aborted`) and ZERO
+ERROR lines in the gate server log. Identical to the 2026-08-03 ledger row
+(M0125-0027) — appended a second-sighting note there; it is recurring, not a
+one-off, and stays undiagnosable until goopg logs statement-level ERRORs the way
+PG's `errstart` does. Retry was clean. Do not re-bisect it blind.
 
 Nightly triage: still the same 17 `AI-20260804-005028-*` subjects from run
 20260804-005028, all already filed under M-NIGHTLY. Nothing new to file.
