@@ -60,12 +60,25 @@ var actualRe = regexp.MustCompile(`\(actual (?:time=[0-9.]+\.\.[0-9.]+ )?rows=([
 // Join" is goopg's own MultiHashJoin rendering and is included deliberately:
 // while it survives it is a joinrel like any other and its estimate is as
 // auditable as a two-way join's.
+//
+// goopg spells the join type in a parenthetical ("Hash Join (ANTI)") while
+// upstream spells it in the label itself ("Hash Anti Join", "Merge Left
+// Join", "Nested Loop Semi Join" — explain.c's `ExplainNode`). Both must
+// classify, because §4's parity gate audits a PG 18.3 plan through this same
+// parser: a reference plan whose joins did not classify would read as a query
+// PG estimated perfectly.
 var joinLabels = []string{
 	"Nested Loop",
 	"Hash Join",
 	"Merge Join",
 	"Multi-Way Hash Join",
 }
+
+// upstreamJoinPrefixes are the label prefixes under which upstream may spell a
+// join type before the word "Join" ("Hash Anti Join"). The word itself is
+// required, so PG's bare "Hash" (the hash-build node) and "Merge Append" do
+// not classify, and neither does goopg's "HashAggregate" (no space).
+var upstreamJoinPrefixes = []string{"Hash ", "Merge "}
 
 // Node is one plan node parsed out of an EXPLAIN ANALYZE rendering.
 type Node struct {
@@ -77,7 +90,18 @@ type Node struct {
 	Loops   int64
 	HasAct  bool // false when the plan was captured without ANALYZE
 	IsJoin  bool
+
+	// Rels is the node's joinrel identity: the sorted set of base-relation
+	// leaves underneath it, which is what upstream calls `RelOptInfo.relids`
+	// and the only key under which a goopg joinrel and a PG joinrel are the
+	// SAME estimation problem (§4's parity gate). Populated by Audit; see
+	// attachRels in parity.go.
+	Rels []string
 }
+
+// RelKey is the canonical form of Rels — the map key §4's parity gate joins
+// the two engines' plans on.
+func (n Node) RelKey() string { return strings.Join(n.Rels, "+") }
 
 // ActualTotal is the total row count the node emitted. See the package
 // comment: goopg's printed value is already cumulative, so this is the
@@ -175,12 +199,18 @@ func isJoinLabel(label string) bool {
 			return true
 		}
 	}
+	for _, p := range upstreamJoinPrefixes {
+		if strings.HasPrefix(label, p) && strings.Contains(label, "Join") {
+			return true
+		}
+	}
 	return false
 }
 
 // Audit builds the report for one query's captured plan text.
 func Audit(name, text string) QueryReport {
 	r := QueryReport{Name: name, Nodes: Parse(text)}
+	attachRels(r.Nodes)
 	if len(r.Nodes) == 0 {
 		r.Err = "no plan nodes parsed (captured with COSTS OFF, or the query errored)"
 		return r
@@ -239,6 +269,30 @@ func (v Violation) String() string {
 		v.Query, where, v.Node.Label, v.Node.EstRows, v.Node.ActualTotal(), v.Node.Ratio(), dir, v.Threshold)
 }
 
+// Q21AntiJoinMax is the per-query bar on Q21's final joinrel. It is NOT an
+// estimator target: PG 18.3 estimates `rows=1` for the same anti-join against
+// the same actual of 4 003 (measured on the reference cluster 2026-08-05,
+// analysis/leftdeep-joins/2026-08-05-p56g-README.md §3). Upstream does not
+// price a `<>` clause through eqjoinsel for JOIN_SEMI/JOIN_ANTI at all —
+// `neqjoinsel` (selfuncs.c) returns `1 - nullfrac` by documented design — and
+// Q21's eq clause is a self-join on lineitem.l_orderkey, so nd1 = nd2 and
+// every branch returns 1.0 in both engines. Holding goopg to the absolute
+// tripwire here would demand a DIVERGENCE from PG in a PG-parity milestone.
+//
+// The bar is a bar and not an exemption on purpose: at 4 003× measured on both
+// engines, 5 000× leaves room for ANALYZE's ~5 % resampling noise and nothing
+// more, so a real regression of this joinrel still trips it.
+const Q21AntiJoinMax = 5000.0
+
+// FinalBar is a per-query bar on the final joinrel, carrying the reason it
+// differs from the default. The reason is rendered into the committed
+// artifact: a bare number in a map is indistinguishable from a muted alarm six
+// months later.
+type FinalBar struct {
+	Max float64
+	Why string
+}
+
 // Thresholds parameterises the two bars of §5.
 type Thresholds struct {
 	// Tripwire applies to every joinrel (default 10³).
@@ -250,22 +304,27 @@ type Thresholds struct {
 	// their baselines.
 	FinalJoin float64
 	// FinalJoinPerQuery overrides FinalJoin for named queries.
-	FinalJoinPerQuery map[string]float64
+	FinalJoinPerQuery map[string]FinalBar
 }
 
 // DefaultThresholds is §5 as written: 10³ everywhere, with Q9's final joinrel
-// held to 10².
+// held to 10² — plus Q21's PG-parity bar (see Q21AntiJoinMax), which §5 could
+// not state before the reference measurement existed.
 func DefaultThresholds() Thresholds {
 	return Thresholds{
-		Tripwire:          DefaultTripwire,
-		FinalJoin:         DefaultTripwire,
-		FinalJoinPerQuery: map[string]float64{"Q9": DefaultFinalJoinMax},
+		Tripwire:  DefaultTripwire,
+		FinalJoin: DefaultTripwire,
+		FinalJoinPerQuery: map[string]FinalBar{
+			"Q9": {DefaultFinalJoinMax, "09 §5's stated demonstration that 04 §3's sizing mechanisms worked"},
+			"Q21": {Q21AntiJoinMax, "PG 18.3 estimates rows=1 for the same ANTI against the same actual " +
+				"(neqjoinsel returns 1-nullfrac for JOIN_ANTI by design); closing it would diverge from PG"},
+		},
 	}
 }
 
 func (t Thresholds) finalFor(query string) float64 {
 	if v, ok := t.FinalJoinPerQuery[query]; ok {
-		return v
+		return v.Max
 	}
 	if t.FinalJoin > 0 {
 		return t.FinalJoin
@@ -362,13 +421,24 @@ func Render(reports []QueryReport, t Thresholds) string {
 	for _, u := range Unmeasured(reports) {
 		fmt.Fprintf(&b, "  UNMEASURED %s: %s\n", u.Name, u.Err)
 	}
+	for _, k := range sortedKeys(t.FinalJoinPerQuery) {
+		fmt.Fprintf(&b, "  OVERRIDE %s final joinrel <=%.0fx — %s\n", k, t.FinalJoinPerQuery[k].Max, t.FinalJoinPerQuery[k].Why)
+	}
 	return b.String()
 }
 
-func sortedOverrides(m map[string]float64) []string {
+func sortedOverrides(m map[string]FinalBar) []string {
 	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, fmt.Sprintf("%s<=%.0fx", k, v))
+	for _, k := range sortedKeys(m) {
+		out = append(out, fmt.Sprintf("%s<=%.0fx", k, m[k].Max))
+	}
+	return out
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	sort.Strings(out)
 	return out

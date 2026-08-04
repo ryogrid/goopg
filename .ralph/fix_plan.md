@@ -7389,13 +7389,35 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       2.99 M); it pays off only with the other half — PG's dedup of a
       `GROUP BY`-unique subquery into a plain INNER join with a unique inner.
       Both halves together, as with P5.6-f. Bar: UNITS + DS05 + audit run.
-- [ ] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
-      A Q21 per-query override in `internal/estimateaudit` beside Q9's (PG is
-      equally "wrong" there, by design), and 09 §4's ratchet restated as
-      per-joinrel parity against the PG 18.3 reference rather than an absolute
-      factor — PG trips the current 1 000× tripwire on Q18 at 1 674×. Without
-      this, P5.9 cannot pass without diverging from PG. Ledger row dated
-      2026-08-05. Bar: UNITS + an audit run that reports the parity column.
+- [x] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
+      DONE 2026-08-05. `estimateaudit.Q21AntiJoinMax` (5 000×) beside Q9's bar,
+      both now rendering their justification into the artifact instead of being
+      bare numbers; and 09 §4's ratchet restated as **per-joinrel parity**
+      (`internal/estimateaudit/parity.go`): a joinrel is its base-relation SET
+      (`RelOptInfo.relids`) rebuilt from the printed plan, so two engines that
+      reached it by different join ORDERS still compare, and the ratchet fires
+      only on excess > 10× AND goopg's own factor > 100×. `--from-plans` /
+      `--reference` / `--ref-port` apply a new instrument to old committed
+      evidence — this run replayed the P5.6-g capture, so NO estimator code
+      changed. Absolute violations 2 → 1 (Q21 is measured parity: 4 003× vs
+      PG's own 4 178×, excess 1.0×). Baseline pinned:
+      `parity_violations=1 shape_mismatches=67`. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56giii-parity{.txt,.pg.plans.txt,-README.md}`,
+      docs 09 §4.1 + §5.8. Bar met: UNITS + audit run with the parity column.
+      Successors: **P5.6-g-iv** below and a ledger row (2026-08-05) for the
+      EXPLAIN rendering gap the gate exposed.
+- [ ] **M0127-P5.6-g-iv — Q19, the only estimator defect TPC-H can prove.**
+      `{lineitem,part}`: goopg est 1 vs actual 131 where PG 18.3 estimates 116
+      vs 112 — 126.5× worse than the reference, and *invisible* to the absolute
+      tripwire (131× < 1 000×), which is precisely why g-iii had to land first.
+      Measured from the committed plan: neither scan carries a filter, so Q19's
+      three OR'd `(p_brand … AND p_container … AND l_quantity … AND p_size …)`
+      groups all ride as the join's residual and price at the join level,
+      landing on the 1-row clamp. First question — which step collapses: the
+      disjunction, the per-group conjunction, or a residual not priced at all.
+      Watch list from the same run (>10× the reference, under the 100× floor):
+      Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
+      Bar: UNITS + an audit run reporting the parity column.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

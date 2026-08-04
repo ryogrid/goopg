@@ -955,10 +955,28 @@
   real shape: PG dedups a `GROUP BY`-unique subquery and joins it as an INNER
   rel (117 159 est) where goopg keeps a SEMI and punts at 0.5 (2 998 620).
   Bar: UNITS + DS05 + audit run.
-- [ ] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
+- [x] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
   equally wrong there, by design), and §4's ratchet restated as per-joinrel
   parity against the PG 18.3 reference rather than an absolute factor — PG
   trips the current 1 000× tripwire on Q18 at 1 674×.
+  Landed 2026-08-05 (09 §4.1 + §5.8): `estimateaudit.Q21AntiJoinMax` beside
+  Q9's bar (both now carry their justification into the artifact), and
+  `internal/estimateaudit/parity.go` — joinrel identity = the base-relation
+  SET (`RelOptInfo.relids`) reconstructed from the printed plan, so different
+  join ORDERS still compare; ratchet fires on excess >10× **and** goopg's own
+  factor >100×. `--from-plans` / `--reference` / `--ref-port` let a new
+  instrument be applied to old committed evidence. Baseline pinned:
+  `parity_violations=1 shape_mismatches=67`; absolute violations 2 → 1.
+  Successors **P5.6-g-iv** (Q19, the only proved estimator defect) and a
+  ledgered EXPLAIN rendering gap (no `lineitem_1` deduplication).
+  Bar met: UNITS + an audit run reporting the parity column.
+- [ ] **P5.6-g-iv** Q19 `{lineitem,part}`: goopg est 1 vs actual 131 where PG
+  estimates 116 vs 112 — the one TPC-H joinrel the parity gate proves goopg
+  estimates worse than PG (126.5× excess), and invisible to the absolute
+  tripwire. Neither scan is filtered, so the three OR'd conjunction groups all
+  ride as the join residual and price at the join level. First question: which
+  step collapses to the 1-row clamp — the disjunction, the per-group
+  conjunction, or an unpriced residual. Bar: UNITS + audit run (parity column).
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

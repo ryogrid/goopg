@@ -64,28 +64,84 @@ import (
 const defaultOutDir = "analysis/leftdeep-joins"
 
 type flags struct {
-	host     string
-	port     int
-	db       string
-	user     string
-	pass     string
-	label    string
-	queries  string
-	outDir   string
-	timeout  time.Duration
-	tripwire float64
-	finalMax float64
-	failOn   bool
-	keepPlan bool
-	analyze  bool
-	serial   bool
+	host      string
+	port      int
+	db        string
+	user      string
+	pass      string
+	label     string
+	queries   string
+	outDir    string
+	timeout   time.Duration
+	tripwire  float64
+	finalMax  float64
+	failOn    bool
+	keepPlan  bool
+	analyze   bool
+	serial    bool
+	fromPlans string
+	refPlans  string
+	refPort   int
+	refDB     string
+	refUser   string
+	refPass   string
+	slack     float64
+	floor     float64
 }
 
 func main() {
 	f := parseFlags(os.Args[1:])
-	db := openDB(f)
+
+	var reports []estimateaudit.QueryReport
+	var plans string
+	if f.fromPlans != "" {
+		// Offline replay of a committed .plans.txt. The estimator is not
+		// consulted, so this re-derives an old run's audit exactly — which
+		// is how a NEW instrument (the §4 parity column) gets applied to
+		// evidence captured before it existed, without a 13-minute rerun.
+		reports = replayPlans(f.fromPlans)
+	} else {
+		reports, plans = capture(f, f.port, f.db, f.user, f.pass, "goopg")
+	}
+
+	th := estimateaudit.Thresholds{
+		Tripwire:          f.tripwire,
+		FinalJoin:         f.tripwire,
+		FinalJoinPerQuery: estimateaudit.DefaultThresholds().FinalJoinPerQuery,
+	}
+	th.FinalJoinPerQuery["Q9"] = estimateaudit.FinalBar{Max: f.finalMax, Why: th.FinalJoinPerQuery["Q9"].Why}
+	out := estimateaudit.Render(reports, th)
+
+	// §4's parity column, when a PG 18.3 reference is available.
+	ref, refPlans, haveRef := referenceReports(f)
+	if haveRef {
+		bar := estimateaudit.ParityBar{Slack: f.slack, Floor: f.floor}
+		rows := estimateaudit.Parity(reports, ref)
+		out += "\n" + estimateaudit.RenderParity(reports, ref, rows, bar)
+	}
+
+	writeReport(f, out, plans, refPlans)
+	fmt.Print(out)
+
+	v := estimateaudit.Violations(reports, th)
+	if f.failOn && len(v) > 0 {
+		fmt.Fprintf(os.Stderr, "estimate-audit: %d joinrel(s) over threshold\n", len(v))
+		os.Exit(1)
+	}
+}
+
+// capture runs the audit against a live server. label is only for progress
+// output — the same function drives goopg and the PG 18.3 reference, because
+// the reference has to be measured the same way (same queries, same serial
+// setting, ANALYZE first) or the comparison is between two protocols rather
+// than two planners.
+func capture(f *flags, port int, dbName, user, pass, engine string) ([]estimateaudit.QueryReport, string) {
+	db := openDB(f, port, dbName, user, pass)
 	defer db.Close()
 
+	// The per-connection-stats warmup is a goopg property (see the package
+	// comment); on upstream ANALYZE is global and persistent, so re-running
+	// it per session is merely redundant, not wrong.
 	s := &session{db: db, warmup: f.analyze, serial: f.serial, timeout: f.timeout}
 	defer s.close()
 
@@ -97,7 +153,7 @@ func main() {
 			reports = append(reports, estimateaudit.AuditError(name, "query SQL not found in tpch.Queries()"))
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "%s ... ", name)
+		fmt.Fprintf(os.Stderr, "[%s] %s ... ", engine, name)
 		start := time.Now()
 		text, err := s.explainAnalyze(sqlText)
 		if err != nil {
@@ -108,25 +164,39 @@ func main() {
 		r := estimateaudit.Audit(name, text)
 		fmt.Fprintf(os.Stderr, "%d joins in %.0fs\n", len(r.Joins), time.Since(start).Seconds())
 		reports = append(reports, r)
-		if f.keepPlan {
-			fmt.Fprintf(&plans, "=== %s\n%s\n\n", name, text)
-		}
+		fmt.Fprintf(&plans, "=== %s\n%s\n\n", name, text)
 	}
+	if !f.keepPlan {
+		return reports, ""
+	}
+	return reports, plans.String()
+}
 
-	th := estimateaudit.Thresholds{
-		Tripwire:          f.tripwire,
-		FinalJoin:         f.tripwire,
-		FinalJoinPerQuery: map[string]float64{"Q9": f.finalMax},
+// referenceReports supplies the PG 18.3 side of the parity gate, either from a
+// committed plans file (--reference) or by capturing it now (--ref-port). A
+// freshly captured reference is written next to the report so the comparison
+// stays re-derivable from committed evidence.
+func referenceReports(f *flags) ([]estimateaudit.QueryReport, string, bool) {
+	if f.refPlans != "" {
+		return replayPlans(f.refPlans), "", true
 	}
-	out := estimateaudit.Render(reports, th)
-	writeReport(f, out, plans.String())
-	fmt.Print(out)
+	if f.refPort == 0 {
+		return nil, "", false
+	}
+	reports, plans := capture(f, f.refPort, f.refDB, f.refUser, f.refPass, "pg18.3")
+	return reports, plans, true
+}
 
-	v := estimateaudit.Violations(reports, th)
-	if f.failOn && len(v) > 0 {
-		fmt.Fprintf(os.Stderr, "estimate-audit: %d joinrel(s) over threshold\n", len(v))
-		os.Exit(1)
+func replayPlans(path string) []estimateaudit.QueryReport {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fatal("read %s: %v", path, err)
 	}
+	r := estimateaudit.SplitPlansFile(string(b))
+	if len(r) == 0 {
+		fatal("no `=== <query>` blocks in %s — is it a .plans.txt artifact?", path)
+	}
+	return r
 }
 
 func parseFlags(args []string) *flags {
@@ -147,6 +217,14 @@ func parseFlags(args []string) *flags {
 	fs.BoolVar(&f.keepPlan, "keep-plans", true, "also write the raw EXPLAIN ANALYZE text next to the report")
 	fs.BoolVar(&f.serial, "serial", true, "disable parallel workers (nodes under a Gather report no actual rows)")
 	fs.BoolVar(&f.analyze, "warm-stats", true, "ANALYZE each TPC-H table on the audit session first (goopg stats are per-connection)")
+	fs.StringVar(&f.fromPlans, "from-plans", "", "replay a committed <label>.plans.txt instead of connecting to goopg")
+	fs.StringVar(&f.refPlans, "reference", "", "PG 18.3 reference plans file for the 09 §4 parity gate")
+	fs.IntVar(&f.refPort, "ref-port", 0, "capture the PG 18.3 reference from this port instead (65432 = TPC-H reference cluster; 0 = off)")
+	fs.StringVar(&f.refDB, "ref-db", "tpch", "reference database name")
+	fs.StringVar(&f.refUser, "ref-user", "tpch", "reference user")
+	fs.StringVar(&f.refPass, "ref-password", "tpch", "reference password")
+	fs.Float64Var(&f.slack, "parity-slack", estimateaudit.DefaultParitySlack, "09 §4 ratchet: how many times worse than PG a joinrel may be")
+	fs.Float64Var(&f.floor, "parity-floor", estimateaudit.DefaultParityFloor, "09 §4 ratchet: goopg's own ratio must also exceed this")
 	fs.Parse(args)
 	if f.label == "" {
 		fmt.Fprintln(os.Stderr, "--label is required")
@@ -247,23 +325,23 @@ func (s *session) explainAnalyze(query string) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func writeReport(f *flags, report, plans string) {
+func writeReport(f *flags, report, plans, refPlans string) {
 	if err := os.MkdirAll(f.outDir, 0o755); err != nil {
 		fatal("mkdir %s: %v", f.outDir, err)
 	}
-	path := filepath.Join(f.outDir, f.label+".txt")
-	if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
-		fatal("write %s: %v", path, err)
+	write := func(suffix, content string) {
+		if content == "" {
+			return
+		}
+		path := filepath.Join(f.outDir, f.label+suffix)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			fatal("write %s: %v", path, err)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s\n", path)
 	}
-	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
-	if plans == "" {
-		return
-	}
-	planPath := filepath.Join(f.outDir, f.label+".plans.txt")
-	if err := os.WriteFile(planPath, []byte(plans), 0o644); err != nil {
-		fatal("write %s: %v", planPath, err)
-	}
-	fmt.Fprintf(os.Stderr, "wrote %s\n", planPath)
+	write(".txt", report)
+	write(".plans.txt", plans)
+	write(".pg.plans.txt", refPlans)
 }
 
 func selectQueries(spec string) []int {
@@ -300,15 +378,15 @@ func selectQueries(spec string) []int {
 	return out
 }
 
-func openDB(f *flags) *sql.DB {
+func openDB(f *flags, port int, dbName, user, pass string) *sql.DB {
 	connStr := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
-		f.host, f.port, f.db, f.user, f.pass)
+		f.host, port, dbName, user, pass)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		fatal("sql.Open: %v", err)
 	}
 	if err := db.Ping(); err != nil {
-		fatal("ping: %v (is the TPC-H bench cluster up on %s:%d? bench/tpch/setup_goopg.sh)", err, f.host, f.port)
+		fatal("ping: %v (is the cluster up on %s:%d? bench/tpch/setup_goopg.sh / setup_pg.sh)", err, f.host, port)
 	}
 	return db
 }

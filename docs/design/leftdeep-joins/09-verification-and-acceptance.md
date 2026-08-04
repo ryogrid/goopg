@@ -90,6 +90,48 @@ skeleton — node type, join type, build/probe side (PG: which child is under
   by cost-constant or stats fidelity stay under the ratchet as usual, and
   are re-reviewed at each ratchet update.
 
+### 4.1 The ratchet is per-joinrel PARITY, not an absolute factor (P5.6-g-iii, landed 2026-08-05)
+
+§5's absolute tripwire answers "is this estimate good?". The question this
+milestone has to answer is "**is this estimate worse than PG's?**". On TPC-H
+the two questions disagree on every joinrel the absolute bar flags — measured,
+`analysis/leftdeep-joins/2026-08-05-p56giii-parity-README.md` §1:
+
+| joinrel | goopg | PG 18.3 | absolute bar | parity bar |
+|---|---|---|---|---|
+| Q18 final | 42 837× over | **5 387× over** | violation | PG trips the 10³ tripwire too |
+| Q21 final | 4 003× under | **4 178× under** | violation | excess **1.0×** — parity |
+| Q19 final | 131× under | 1.0× | *silent* (<10³) | **violation, 126.5× worse** |
+
+The absolute bar flagged the one joinrel where goopg matches PG exactly and
+stayed silent on the one where goopg is two orders of magnitude worse. So the
+bar P5.9 certifies is:
+
+- **Unit of comparison: the joinrel, identified by its base-relation SET**
+  (upstream's `RelOptInfo.relids`), reconstructed from the printed plan. Two
+  engines that reach `{customer,orders}` by different join orders still built
+  the same joinrel, and its ACTUAL row count is a property of the query and the
+  data, not of the plan — so the misestimate factors are directly comparable.
+- **Two conditions, both required** (`estimateaudit.ParityBar`): goopg's factor
+  exceeds the reference's by more than `Slack` (default 10×, because this §
+  already declines a match-all bar while cost constants and stats fidelity
+  differ) **and** goopg's own factor exceeds `Floor` (default 100×, so a
+  joinrel PG nails and goopg gets within 20× does not enter the ratchet).
+- **A joinrel only one engine built is a SHAPE divergence**, counted separately
+  and classed per §6 — there is nothing to compare it against. This is the
+  spine-mismatch budget above, now countable per joinrel rather than per query.
+- The absolute tripwire of §5 **stays**, as a coarse tripwire and as the home
+  of the per-query bars (Q9's ≤10², Q21's PG-parity 5 000×).
+
+**Baseline pinned 2026-08-05** (TPC-H 22, LEGACY planner, goopg plans replayed
+from the committed P5.6-g capture, PG 18.3 reference captured live on 65432):
+`parity_violations=1 shape_mismatches=67`, 21 joinrels matched, 3 ambiguous.
+The single violation is Q19 `{lineitem,part}`. **`shape_mismatches` is an upper
+bound**: goopg's EXPLAIN does not deduplicate repeated relation names the way
+`select_rtable_names` (ruleutils.c) does (`lineitem_1`, `n1`/`n2`), so Q8, Q17
+and Q18 lose their final-joinrel comparison to a rendering gap rather than a
+planning difference (deferral-ledger row, 2026-08-05).
+
 ## 5. Estimate audit (class-(a) regression tripwire)
 
 Automate the order-attribution methodology: for each TPC-H query, EXPLAIN
@@ -141,6 +183,27 @@ would silently corrupt the audit if left alone:
   the per-loop average. The tool consumes the printed value as-is; a reader
   who assumes PG semantics and multiplies by `loops` inflates every
   nested-loop inner node by exactly the loop count. Ledgered.
+
+Two modes were added by P5.6-g-iii (2026-08-05) and are what make §4.1
+runnable:
+
+```
+# capture the reference in the same run (PG 18.3 on 65432, bench/tpch/setup_pg.sh)
+/tmp/estimate-audit --label <label> --ref-port 65432
+
+# or apply a NEW instrument to OLD committed evidence — no 13-minute rerun
+/tmp/estimate-audit --label <label> \
+    --from-plans analysis/leftdeep-joins/<earlier>.plans.txt \
+    --reference  analysis/leftdeep-joins/<earlier>.pg.plans.txt
+```
+
+`--from-plans` replays a committed `.plans.txt` instead of connecting: the
+estimator is not consulted, so the replayed audit is bit-identical to the
+original run's. A freshly captured reference is written to
+`<label>.pg.plans.txt` so the comparison stays re-derivable. The reference is
+captured through the same code path as goopg (same queries, same `--serial`,
+ANALYZE first) — a reference measured under a different protocol would compare
+two protocols rather than two planners.
 
 ### 5.2 Baseline, 2026-08-04 (pre-flip, `GOOPG_PGSHAPED_DP` OFF)
 
@@ -510,6 +573,40 @@ DS05 could not run: the gate self-refuses while the nightly CI batch holds the
 host (`FATAL: the nightly CI batch is running`), and the batch was mid-run with
 a wedged testport stage for this loop's whole duration. Carried, with the exact
 command, in `.ralph/working_set.md`.
+
+### 5.8 The instrument corrected, 2026-08-05 (P5.6-g-iii)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56giii-parity.txt` (+
+`.pg.plans.txt`, `-README.md`). **No estimator code changed**: the goopg side is
+the committed P5.6-g capture replayed with `--from-plans`, so every goopg number
+is bit-identical to §5.7's. The only new measurement is the PG 18.3 reference.
+
+Landed: Q21's per-query bar beside Q9's (`estimateaudit.Q21AntiJoinMax`, 5 000×,
+with its justification rendered into the artifact rather than left as a bare
+number), and §4.1's per-joinrel parity gate (`internal/estimateaudit/parity.go`).
+Absolute violations on TPC-H **2 → 1**: Q18 stays, Q21 is measured parity
+(excess 1.0× against PG's own 4 178×).
+
+Two findings the parity column produced on its first run:
+
+- **Q19 `{lineitem,part}` is the only estimator defect TPC-H can prove**:
+  goopg est 1 vs actual 131, PG est 116 vs actual 112 — 126.5× worse than the
+  reference, and *invisible* to the absolute tripwire at 131× < 10³. Neither
+  scan carries a filter, so Q19's three OR'd conjunction groups all ride as the
+  join's residual and the whole predicate is priced at the join level, landing
+  on the 1-row clamp. Filed as **P5.6-g-iv**.
+- **goopg's EXPLAIN cannot name a repeated relation.** Upstream deduplicates
+  printed relation names (`select_rtable_names`, ruleutils.c): a subquery's
+  second scan of `lineitem` prints as `lineitem_1`, Q8's two `nation` RTEs as
+  `n1`/`n2`. goopg prints the bare name, so two range-table entries are
+  indistinguishable in the text and Q8/Q17/Q18 lose their final-joinrel
+  comparison to a rendering gap. The gate reports the collision (`~` marker,
+  `N ambiguous`) instead of silently picking one; the fix is in the renderer.
+  Ledgered 2026-08-05.
+
+Watch list (>10× the reference but under the 100× floor, so not yet ratcheted):
+Q16 `{part,partsupp,supplier}` 84.9× vs 2.0×, Q20 `{lineitem,part,partsupp}`
+32.1× vs 1.1×, Q14 `{lineitem,part}` 12.4× vs 1.0×.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 
