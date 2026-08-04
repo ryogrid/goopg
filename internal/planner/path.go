@@ -16,6 +16,8 @@ package planner
 // startup cost, each within a multiplicative STD_FUZZ_FACTOR (:50) tolerance.
 // add_path (:464) folds in pathkeys, parallel_safe, and required-outer relids.
 
+import "github.com/goopg/goopg/internal/catalog"
+
 // stdFuzzFactor is PG's STD_FUZZ_FACTOR (pathnode.c:50): two costs within 1% are
 // treated as equal, and the tie is broken on the non-cost dimensions. This is the
 // determinism mechanism the integer->float migration needs (design ch. 07 §4).
@@ -122,6 +124,21 @@ type Path struct {
 	// expressions and its residual predicate.
 	HashKeys []*restrictInfo
 	Residual []*restrictInfo
+
+	// IndexInfo / IndexScanDir are `IndexPath.indexinfo` and
+	// `IndexPath.indexscandir` (pathnodes.h:1845/1849), the two facts
+	// `create_indexscan_plan` needs to re-emit the scan the search chose. They
+	// are set on a `PathIndexScan` and on nothing else: `IndexInfo` is nil and
+	// `IndexScanDir` is `NoMovementScanDirection` — the zero value — for every
+	// other kind, which is why the flat struct can carry them without a second
+	// discriminator. Both are filled through `indexPathOrdering`
+	// (pathindexcarrier.go, M0127-P5.5-a) so the direction can never disagree
+	// with `Pathkeys`. P5.5's createPlan arm reads them.
+	//
+	// What is deliberately NOT here yet is `IndexPath.indexclauses`: the quals
+	// pushed into the probe. Ledgered — see pathindexcarrier.go's header.
+	IndexInfo    *catalog.Index
+	IndexScanDir ScanDirection
 
 	Children []*Path
 

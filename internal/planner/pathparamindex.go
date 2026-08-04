@@ -286,20 +286,27 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		return false
 	}
 	rows := parameterizedBaserelRows(rel, tbl, idx, bound)
+	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
+	// direction it was computed for, taken together so they cannot disagree
+	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
+	// to the parameterised path that it passes to the plain one
+	// (`build_index_paths`, indxpath.c:750-800), so this is not a special case
+	// for parameterisation — it is simply the only index path goopg builds
+	// today. Forward scan only: goopg's index scan has no backward mode to
+	// select, and PG's own `pathkeys_possibly_useful` gate needs
+	// `query_pathkeys`, which this seam does not have (03 §10). Both ledgered.
+	keys, dir := indexPathOrdering(idx, innerExprs, false)
 	addPath(rel, &Path{
-		Kind: PathIndexScan,
-		Rel:  rel,
-		Rows: rows,
-		Cost: paramIndexScanCost(s.cp, rows),
-		// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740).
-		// PG passes the same `useful_pathkeys` to the parameterised path that it
-		// passes to the plain one (`build_index_paths`, indxpath.c:750-800), so
-		// this is not a special case for parameterisation — it is simply the
-		// only index path goopg builds today. Forward scan only: goopg's index
-		// scan has no backward mode to select, and PG's own
-		// `pathkeys_possibly_useful` gate needs `query_pathkeys`, which this
-		// seam does not have (03 §10). Both ledgered.
-		Pathkeys:      buildIndexPathkeys(idx, innerExprs, false),
+		Kind:     PathIndexScan,
+		Rel:      rel,
+		Rows:     rows,
+		Cost:     paramIndexScanCost(s.cp, rows),
+		Pathkeys: keys,
+		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849): the
+		// index this path's cost and rows were computed FOR, named so P5.5's
+		// createPlan can re-emit exactly this probe rather than re-deriving one.
+		IndexInfo:     idx,
+		IndexScanDir:  dir,
 		RequiredOuter: req,
 	})
 	return true

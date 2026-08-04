@@ -443,6 +443,29 @@
   guessed. The jointype gauntlet and the FULL contract are ledgered, not written:
   `addPathsToJoinrel` carries no jointype to switch on. Still inert. 3 ledger rows.
   10 new tests. Bar met: UNITS + SPOT.)*
+- [x] **P5.5-a** `IndexPath.indexinfo` + `indexscandir` (pathnodes.h:1845/1849)
+  on goopg's `Path` — the stated PREREQUISITE of P5.5, ledgered at P5.4c-ii-b.
+  *(DONE 2026-08-04, `internal/planner/pathindexcarrier.go` + `path.go`,
+  `pathparamindex.go`, `pathindexordered.go`. goopg's `Path` is one flat struct
+  with a `Kind` discriminator, and `PathIndexScan` recorded the ordering, cost
+  and rows of a specific index scan without recording WHICH index produced
+  them — so the DP could choose a path no `*IndexScan` node can be built from.
+  `ScanDirection` reproduces PG's exact -1/0/+1 encoding (access/sdir.h:24),
+  which buys the zero value as "not an index path" and needs no second
+  discriminator on the flat struct. The direction is carried even though only
+  `ForwardScanDirection` is ever produced, for the reason `DisabledNodes` is
+  carried at a constant 0: a path that does not SAY which direction it means is
+  one that silently means forward, and the backward arm would then be a change
+  to every reader rather than to the producer. The one invariant with teeth —
+  the recorded direction and the recorded pathkeys must describe the SAME scan,
+  since `build_index_pathkeys` inverts direction AND null placement
+  (pathkeys.c:770-774) — is held structurally: `indexPathOrdering` returns the
+  pair and is the ONLY way either constructor obtains either half, so they
+  cannot drift (rule #2). `IndexPath.indexclauses` is deliberately NOT carried
+  and is ledgered with the finding that blocks a verbatim copy: PG's list is in
+  index-column order while goopg's `bound` is in candidate order, and the
+  executor's `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Still
+  inert. 2 ledger rows. 6 new tests. Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering

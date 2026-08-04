@@ -119,8 +119,12 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	}
 
 	// Steps 2 and 2b of `build_index_paths`, fused — see the note below on why
-	// the fusion is exact rather than a shortcut.
-	keys := buildIndexPathkeys(idx, colExprs, false)
+	// the fusion is exact rather than a shortcut. The scan direction those keys
+	// describe comes back with them (M0127-P5.5-a, pathindexcarrier.go); PG's
+	// backward arm (indxpath.c:1010-1050) would be a second call here with
+	// `true`, and is ledgered rather than written because goopg's executor
+	// `IndexScan` has no direction to set.
+	keys, dir := indexPathOrdering(idx, colExprs, false)
 	if len(keys) == 0 {
 		return false
 	}
@@ -156,6 +160,13 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		Rows:     rel.Rows,
 		Cost:     cost,
 		Pathkeys: keys,
+		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849). This
+		// path is a FULL scan of `idx` — no quals were pushed into it, which is
+		// exactly what PG's "an empty indexclauses list implies a full index
+		// scan" (pathnodes.h:1817) describes — so naming the index is the whole
+		// of what P5.5's createPlan needs to rebuild it.
+		IndexInfo:    idx,
+		IndexScanDir: dir,
 		// Empty, and that is the entire point of the slice.
 		RequiredOuter: 0,
 	})

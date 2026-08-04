@@ -6694,6 +6694,33 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       search-boundary coordinate map), whose stated prerequisite is the
       P5.4c-ii-b ledger row: `Path` names neither its index nor its scan
       direction.
+- [x] **M0127-P5.5-a — `IndexPath.indexinfo` + `indexscandir` on `Path`.** DONE
+      2026-08-04 (`internal/planner/pathindexcarrier.go` + `path.go`,
+      `pathparamindex.go`, `pathindexordered.go`). The stated PREREQUISITE of
+      P5.5, ledgered at P5.4c-ii-b: goopg's `Path` is one flat struct with a
+      `Kind` discriminator, and `PathIndexScan` recorded the ordering, cost and
+      rows of a specific index scan without recording WHICH index produced
+      them — so the DP could choose a path that no `*IndexScan` node can be
+      built from. `ScanDirection` reproduces PG's exact -1/0/+1 encoding
+      (access/sdir.h:24), which buys the zero value as "not an index path" and
+      so needs no second discriminator on the flat struct. The direction is
+      carried although only `ForwardScanDirection` is ever produced, for the
+      same reason `DisabledNodes` is carried at a constant 0: a path that does
+      not SAY its direction silently means forward, and adding the backward arm
+      later would then be a change to every reader rather than to the producer.
+      The invariant with teeth — the recorded direction and the recorded
+      pathkeys must describe the SAME scan, since `build_index_pathkeys`
+      inverts direction AND null placement (pathkeys.c:770-774) — is held
+      STRUCTURALLY: `indexPathOrdering` returns the pair and is the only way
+      either constructor obtains either half, so the two cannot drift (rule
+      #2). `IndexPath.indexclauses` is deliberately NOT carried, ledgered with
+      the finding that blocks a verbatim copy: PG's list is in index-column
+      order while goopg's `bound` is in candidate order, and the executor's
+      `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Still inert.
+      2 ledger rows. 6 new tests. IMPLEMENTATION-TODO P5.5-a; 03 §10; 04 §1.1.
+      Bar met: UNITS + SPOT. DS05 not applicable — the fields are written by a
+      search with no `planSelect` caller and `GOOPG_PGSHAPED_DP` is OFF, so no
+      plan and no row can move.
 - [ ] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing Nodes;**
       search-boundary coordinate map (03 §10: relid-order canonical layout —
       one map composed from the final relset, or a relid-reordering root
