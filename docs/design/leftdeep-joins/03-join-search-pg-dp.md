@@ -382,6 +382,80 @@ What remains for **P5.4c-ii-c** is unchanged: `generate_mergejoin_paths` inside
 `match_unsorted_outer`, with the mergeclause-list truncation and the
 materialize-inner decision.
 
+**Status (P5.4c-ii-c, 2026-08-04) — P5.4c is CLOSED.**
+`joinpathsmergeouter.go` lands `generate_mergejoin_paths` (joinpath.c:1564) and
+the merge half of `match_unsorted_outer` (:1998-2013), wired into
+`addPathsToJoinrel` at PG's arm-2 position — after `sort_inner_and_outer`, before
+the hash arm, so a merge over an already-ordered outer wins an exact tie against
+a hash path exactly as it does in PG.
+
+The arm iterates `outer.Pathlist`, and that is not incidental. An ordered index
+path is by construction NOT the cheapest total (P5.4c-ii-b: `indexCorrelationFor`
+returns 0, so it prices at `max_IO_cost` and survives `addPath` only on its
+pathkeys), so a version of this arm keyed to `CheapestTotal` would find nothing
+at all. Three behaviours are transcribed because each changes which plan wins:
+
+- **The mergeclause list is a PREFIX of the outer's ordering, and stops.**
+  `find_mergeclauses_for_outer_pathkeys` (pathkeys.c:1631) walks the outer's
+  pathkeys and ends at the first with no clause, because a merge consumes its
+  input in sort order and cannot skip a leading column. An outer sorted
+  `(x, y)` joined only on `y` is therefore unusable — not usable on `y`.
+- **The clause list is TRUNCATED to reach a cheaper inner** (:1685-1782), on
+  BOTH cost axes, under PG's strictly-cheaper rule. The rule is not an
+  optimisation: a shorter key prefix demotes a merge clause to a per-tuple
+  qual, so a prefix must buy something to be worth generating.
+- **The result carries the outer's FULL ordering**, not the merge keys
+  (`merge_pathkeys` = `build_join_pathkeys` of `outerpath->pathkeys`). A merge
+  on `(x)` over an outer sorted `(x, y)` emits an `(x, y)`-ordered result that a
+  merge above it can consume — the compounding effect the arm exists for. This
+  is why `tryMergeJoinPath` now takes the result ordering separately from the
+  two sort-key lists.
+
+Two findings, both of which changed code rather than only documentation:
+
+- **A truncated merge must DEMOTE its dropped clauses to residual.** PG carries
+  the whole restrictlist to plan time and `create_mergejoin_plan` subtracts the
+  mergeclauses to get the qpqual, so the demotion is automatic there. goopg
+  decides the key/residual split in path generation (§5.4), so a dropped merge
+  clause would have been evaluated by nothing — a wrong answer, not a slower
+  plan. `demoteDroppedMergeClauses` is that subtraction, and running it through
+  `qualEvalCost` is also what puts a price on the trade the strictly-cheaper
+  rule is weighing.
+- **One outer sort key can owe SEVERAL inner sort keys**, which P5.4c-i's
+  one-inner-key-per-group model could not express. `a.x = c.x AND a.x = c.y` is
+  one outer key and two inner ones; both clauses stay merge clauses, so an inner
+  sorted only by `c.x` would be handed to an operator comparing on `(c.x, c.y)`.
+  PG carries `outersortkeys`/`innersortkeys` as independent lists precisely so
+  they may differ in length (`make_inner_pathkeys_for_merge`, pathkeys.c:1858,
+  and `find_mergeclauses_for_outer_pathkeys`' note at :1670-1674).
+  `mergeInnerSortKeys` is now the single builder used by BOTH merge arms, so the
+  siblings cannot drift.
+
+**The materialize-inner decision has no goopg analogue, and that is a finding
+rather than an omission.** PG's mergejoin executor rewinds the inner with
+mark/restore, so `final_cost_mergejoin` (costsize.c:3986-4040) must decide
+whether to interpose a Material node — mandatorily when the inner is used
+unsorted and its node type cannot mark/restore. goopg's merge executor never
+rewinds: `mergeJoinStream.bufferGroup`
+(`internal/executor/join_merge_stream.go:616`) consumes each inner equal-key
+group into memory, spilling past `work_mem` to an overflow file, and replays from
+there. The materialisation PG chooses per PLAN is already made per GROUP,
+unconditionally, in the executor. Two consequences: any presorted inner path is
+consumable here regardless of its kind (no `PathMaterial` is introduced, and one
+would double-buffer), and the COST of that buffering — PG's `rescanratio` term
+for duplicate inner groups, plus the group file — is charged by nothing.
+`mergeJoinCost` prices one pass over each input. That is ledgered against the
+cost work rather than approximated, because inventing a rescan factor without
+`mergejoinscansel`'s duplicate estimate would move plans on a guess.
+
+The jointype gauntlet (`nestjoinOK` / `useallclauses`, joinpath.c:1833-1852 —
+RIGHT/RIGHT-ANTI/FULL must use *all* mergeclauses, so the truncation loop is
+skipped for them entirely) and the FULL-without-usable-clause contract above
+remain unwritten, as this section already anticipated: §4.4 pins every non-INNER
+construct outside the search, so `addPathsToJoinrel` carries no jointype to
+switch on. Both are ledgered rather than written as dead branches over a value
+that does not exist. Still inert — `GOOPG_PGSHAPED_DP` is OFF.
+
 ### 5.4 Qual placement
 Every clause attaches at the lowest level whose relids it covers — decided
 once, in path generation. The post-hoc placement passes

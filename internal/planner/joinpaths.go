@@ -178,6 +178,14 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 		// and a hash path must resolve the way PG resolves it.
 		if len(keys) > 0 {
 			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual)
+			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
+			// and arm 4 — so a merge over an already-ordered outer is offered
+			// to `addPath` BEFORE the hash path, and wins an exact tie against
+			// it exactly as it does in PG. Only the merge half of that arm is
+			// here; goopg's nested-loop halves (`addNestLoopPath` /
+			// `addNLIPaths`) were landed separately and still run after the
+			// hash arm, which can only change a hash-vs-nestloop exact tie.
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual)
 			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the

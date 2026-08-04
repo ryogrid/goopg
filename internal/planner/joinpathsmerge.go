@@ -139,6 +139,79 @@ func indexOfOuterKey(groups []mergeKeyGroup, expr Expr) int {
 	return -1
 }
 
+// mergeInnerExpr re-derives one clause's INNER-side operand at this pair, the
+// mirror of the orientation `mergeKeyGroups` computes for the outer side. It is
+// recomputed rather than stored for the same reason the orientation itself is:
+// the same clause faces the other way at a different pair.
+func mergeInnerExpr(ri *restrictInfo, outer RelSet) Expr {
+	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
+		return nil
+	}
+	if relsSubset(ri.leftRelids, outer) {
+		return ri.rightKey
+	}
+	return ri.leftKey
+}
+
+// mergeInnerSortKeys is `make_inner_pathkeys_for_merge` (pathkeys.c:1858): the
+// ordering the INNER input must deliver, derived from the merge clauses and the
+// OUTER pathkey that selected each group.
+//
+// Two things it does that a naive "one inner key per group" does not, and both
+// are the difference between a valid merge and a wrong one:
+//
+//   - It emits one key per DISTINCT inner operand, not one per group. A group is
+//     one outer sort key, and PG is explicit that several clauses on one outer
+//     key may carry different inner operands ("multiple matching clauses might
+//     have different ECs on the other side", `find_mergeclauses_for_outer_pathkeys`,
+//     pathkeys.c:1670-1674) — `a.x = c.x AND a.x = c.y` is one outer key `a.x`
+//     and two inner keys. Both clauses stay merge clauses, so the merge compares
+//     on both; an inner sorted only by `c.x` would then be fed to an operator
+//     that expects `(c.x, c.y)` order. Sorting the outer by `a.x` orders it by
+//     `(a.x, a.x)` for free, which is why the two lists legitimately differ in
+//     LENGTH — PG carries `outersortkeys` and `innersortkeys` as independent
+//     lists for exactly this reason.
+//   - It copies the direction and null placement from the OUTER pathkey
+//     (:1911-1915) rather than assuming ascending/nulls-last. A merge join needs
+//     only that the two sides AGREE, so when the outer's ordering is given —
+//     P5.4c-ii-c's already-ordered outer, which may be any direction the index
+//     provides — the inner must be sorted to match it, not to a default.
+//
+// `outerKeys[i]` supplies that direction for `groups[i]`; a short list falls back
+// to the group's own default, which is what `sort_inner_and_outer` uses (it
+// chooses both orderings itself, so they are ascending by construction).
+//
+// The dedupe is PG's `pathkey_is_redundant` (:1922) reached through pathkey
+// identity rather than equivalence-class identity, the same one-level-down
+// substitution `mergeKeyGroups` makes.
+func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSet) []PathKey {
+	var keys []PathKey
+	for i, g := range groups {
+		dir := g.outerKey
+		if i < len(outerKeys) {
+			dir = outerKeys[i]
+		}
+		for _, ri := range g.clauses {
+			e := mergeInnerExpr(ri, outer)
+			if e == nil {
+				continue
+			}
+			pk := PathKey{Expr: e, SortAsc: dir.SortAsc, NullsFirst: dir.NullsFirst}
+			redundant := false
+			for _, have := range keys {
+				if pathKeyEqual(have, pk) {
+					redundant = true
+					break
+				}
+			}
+			if !redundant {
+				keys = append(keys, pk)
+			}
+		}
+	}
+	return keys
+}
+
 // sortInnerAndOuter is `sort_inner_and_outer` (joinpath.c:1357): one merge path
 // per available sort ordering, each sorting both inputs explicitly.
 //
@@ -173,13 +246,16 @@ func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, r
 	for front := range groups {
 		ordered := rotateToFront(groups, front)
 		outerKeys := make([]PathKey, len(ordered))
-		innerKeys := make([]PathKey, len(ordered))
 		var mergeClauses []*restrictInfo
 		for i, g := range ordered {
 			outerKeys[i] = g.outerKey
-			innerKeys[i] = g.innerKey
 			mergeClauses = append(mergeClauses, g.clauses...)
 		}
+		// `make_inner_pathkeys_for_merge` rather than one key per group: a
+		// group that serves several clauses with DIFFERENT inner operands owes
+		// the inner an ordering on each of them, or the merge compares on a
+		// column the inner is not sorted by. See mergeInnerSortKeys.
+		innerKeys := mergeInnerSortKeys(ordered, outerKeys, outer.Relids)
 		// PG asserts here that the reordering used every mergeclause
 		// (`find_mergeclauses_for_outer_pathkeys`, :1500-1501). Building the
 		// clause list BY the groups rather than re-deriving it from the
@@ -235,6 +311,31 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 	if o == nil || i == nil {
 		return
 	}
+	// `sort_inner_and_outer` chooses the result ordering itself, so the outer
+	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
+	// did not choose (P5.4c-ii-c) passes a different pair, which is why
+	// `tryMergeJoinPath` takes the two separately.
+	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual)
+}
+
+// tryMergeJoinPath is `try_mergejoin_path` proper (joinpath.c:1029) over two
+// chosen PATHS, split out of `addMergeJoinPath` by P5.4c-ii-c.
+//
+// `resultKeys` is `merge_pathkeys` — the ordering the JOIN delivers, which is
+// `build_join_pathkeys` of the outer PATH's ordering. It is separate from
+// `outerSortKeys` because the two arms disagree about it: `sort_inner_and_outer`
+// sorts the outer to an ordering of its own choosing, so they coincide, while
+// `generate_mergejoin_paths` takes an outer that is already ordered and merges on
+// a PREFIX of that ordering — the result keeps the outer's full, longer ordering,
+// which is what lets a merge one level up skip its own sort.
+//
+// `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
+// with PG's NIL convention: an empty list means "this side needs no sort". The
+// explicit re-check below (:1091-1097) makes passing them harmless either way.
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo) {
+	if o == nil || i == nil {
+		return
+	}
 	// `calc_non_nestloop_required_outer` (:1071): a merge join discharges
 	// nothing, so the result is parameterised by the union of its inputs'
 	// requirements. With an empty `param_source_rels` that is only acceptable
@@ -245,11 +346,11 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 	}
 
 	op, ip := o, i
-	if !pathkeysContainedIn(o.Pathkeys, outerKeys) {
-		op = sortPathFor(o, outerKeys, cp)
+	if len(outerSortKeys) > 0 && !pathkeysContainedIn(o.Pathkeys, outerSortKeys) {
+		op = sortPathFor(o, outerSortKeys, cp)
 	}
-	if !pathkeysContainedIn(i.Pathkeys, innerKeys) {
-		ip = sortPathFor(i, innerKeys, cp)
+	if len(innerSortKeys) > 0 && !pathkeysContainedIn(i.Pathkeys, innerSortKeys) {
+		ip = sortPathFor(i, innerSortKeys, cp)
 	}
 
 	// Row counts from the CHILD PATHS (03 §9 rule 3), as everywhere else in
@@ -269,7 +370,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,
-		Pathkeys: outerKeys,
+		Pathkeys: resultKeys,
 		// Children[0] is the outer (streaming left) side, Children[1] the
 		// inner — the same convention the hash and nested-loop arms use, so
 		// P5.5's createPlan reads one layout for every join kind. When a side

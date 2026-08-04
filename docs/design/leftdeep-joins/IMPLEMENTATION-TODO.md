@@ -412,14 +412,37 @@
   half of `create_index_paths`. Still inert — no `planSelect` call site,
   `GOOPG_PGSHAPED_DP` OFF. 7 ledger rows, one of which (`Path` names no index)
   is a stated PREREQUISITE of P5.5. UNITS + SPOT PASS.)*
-- [ ] **P5.4c-ii-c** `generate_mergejoin_paths` (joinpath.c:1564) inside
+- [x] **P5.4c-ii-c** `generate_mergejoin_paths` (joinpath.c:1564) inside
   `match_unsorted_outer`: the merge arm that exploits an ALREADY-ordered outer
   instead of sorting, with mergeclause-list truncation and the materialize-inner
-  decision. Needs P5.4c-ii-b's ordered unparameterised paths, which is why the
-  sort-skip branch landed in P5.4c-i as a tested but unreachable consumer. Carries the
-  jointype gauntlet (`nestjoinOK`, joinpath.c:1833-1852) and the
-  FULL-without-usable-clause error contract (joinrels.c:961-964) — both still
-  unreachable while 03 §4.4 pins every non-INNER construct outside the search.
+  decision. *(DONE 2026-08-04 — `internal/planner/joinpathsmergeouter.go` +
+  `joinpathsmerge.go`, `joinpaths.go`. **P5.4c is CLOSED.** Wired at PG's arm-2
+  position, between `sort_inner_and_outer` and the hash arm, so a merge over an
+  ordered outer wins an exact tie against a hash path as it does in PG. It
+  iterates `outer.Pathlist` and that is the slice: an ordered index path is never
+  the cheapest total (P5.4c-ii-b — `indexCorrelationFor` is 0, so it prices at
+  `max_IO_cost` and survives only on its pathkeys), so a `CheapestTotal`-keyed arm
+  would find nothing. Three transcribed behaviours, each of which changes which
+  plan wins: the mergeclause list is a PREFIX of the outer's ordering and STOPS at
+  the first unserved position (`find_mergeclauses_for_outer_pathkeys` — an outer
+  sorted `(x,y)` joined only on `y` is unusable, not usable on `y`); the clause
+  list is TRUNCATED on both cost axes under PG's strictly-cheaper rule; and the
+  result carries the outer's FULL ordering, not the merge keys, which is what lets
+  a merge above it skip its own sort. Two findings that changed code: a truncated
+  merge must **DEMOTE its dropped clauses to residual** — PG subtracts them at
+  plan time, goopg splits key/residual during path generation (03 §5.4), so a
+  dropped merge clause would have been evaluated by nothing, a wrong answer rather
+  than a slow plan — and **one outer sort key can owe SEVERAL inner sort keys**
+  (`a.x = c.x AND a.x = c.y`), which P5.4c-i's one-inner-key-per-group model could
+  not express; `mergeInnerSortKeys` is now the single builder both arms use.
+  **PG's materialize-inner decision has no goopg analogue at all**:
+  `mergeJoinStream.bufferGroup` already buffers each inner equal-key group,
+  spilling past `work_mem`, so the choice PG makes per PLAN goopg makes per GROUP
+  in the executor — any presorted inner is consumable, no `PathMaterial` is wanted
+  (it would double-buffer), and the cost of that buffering is ledgered rather than
+  guessed. The jointype gauntlet and the FULL contract are ledgered, not written:
+  `addPathsToJoinrel` carries no jointype to switch on. Still inert. 3 ledger rows.
+  10 new tests. Bar met: UNITS + SPOT.)*
 - [ ] **P5.5** `createPlan` arms for all live PathKinds → existing Nodes;
   **search-boundary coordinate map** (03 §10: relid-order canonical
   layout — one map composed from the final relset, or a relid-reordering
