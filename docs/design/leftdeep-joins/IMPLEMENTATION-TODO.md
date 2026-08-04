@@ -967,6 +967,23 @@
   `analysis/leftdeep-joins/2026-08-05-p56gi-*`;
   [09](09-verification-and-acceptance.md) §5.10. Successor filed: the gate has
   no plan-shape channel of its own.
+- [x] **P5.6-g-i-b** the DS05 gate's plan-shape channel, landed 2026-08-05 —
+  P5.6-g-i's successor, and the answer to "74 plans moved and the gate said
+  nothing". `scripts/tpcds-plan-diff.py` + a `plans` subcommand and a sweep tail
+  stage in `scripts/tpcds-sf05-regression.sh`: one `EXPLAIN`-only pass over all
+  99 (nothing executes), `plans-<stamp>.txt` written beside `sweep-<stamp>.txt`,
+  and a per-query diff against the previous capture appended to the report.
+  **Strictly a second column** — row counts and checksums still decide the
+  verdict, and a sweep run with a deliberately broken `PLAN_DIFF` still exits 0.
+  Full corpus always, even under `QUERIES=` (14 s). Validated without re-running
+  the sweep: three consecutive captures at one commit → `changed=0`, and against
+  P5.6-g-i's four committed corpus captures the new path reproduces §5.10's
+  table exactly (D→0, C→4 = Q13/41/48/85, B→5 = +Q83, A→75). Found and fixed one
+  real defect — psql's error prefix embeds the script PATH, so Q36/Q70/Q86 (the
+  dsqgen artefacts, whose block is an error not a plan) were three permanent
+  false positives on any directory change. Evidence
+  `analysis/leftdeep-joins/2026-08-05-p56gib-README.md`;
+  [09](09-verification-and-acceptance.md) §5.11.
 - [ ] **P5.6-g-ii** the `*HashAggregate` arm for `resolveBaseColumn`, and Q18's
   real shape: PG dedups a `GROUP BY`-unique subquery and joins it as an INNER
   rel (117 159 est) where goopg keeps a SEMI and punts at 0.5 (2 998 620).

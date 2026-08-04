@@ -750,6 +750,72 @@ is filed as a follow-up under M0127, not fixed here. Q13's new plan also hashes
 all 1 920 800 `customer_demographics` rows: free at SF0.5 (20 s → 21 s), and no
 SF=1 sweep has run since.
 
+### 5.11 The DS05 gate gets a plan-shape channel, 2026-08-05 (P5.6-g-i-b)
+
+Evidence `analysis/leftdeep-joins/2026-08-05-p56gib-README.md`. Closes §5.10's
+"what this leaves open": the 74-query plan change that passed the gate in
+silence is now something the gate itself reports.
+
+**The primary bar is untouched.** Row counts and value checksums still decide
+pass/fail, and nothing in this channel can change the exit status — verified by
+running a sweep with `PLAN_DIFF` pointed at a nonexistent file: the gate still
+exits 0 and the report says so out loud. A plan that moves is *information about
+a planner change*, not a failure; only rows and checksums are correctness.
+
+**The channel.** `scripts/tpcds-sf05-regression.sh` gained a `plans`
+subcommand and a tail stage on `sweep`:
+
+- one `EXPLAIN`-only pass over all 99 queries on a freshly started server,
+  written to `plans-<stamp>.txt` beside `sweep-<stamp>.txt` (same stamp — the
+  two artefacts of one run pair by name);
+- every statement in a file is `EXPLAIN`-prefixed, so Q14/23/24/39's second
+  statement is never executed and no query runs for real;
+- `scripts/tpcds-plan-diff.py OLD NEW` diffs it per query against the previous
+  capture and appends `=== PLAN-SHAPE: queries=99 same=N changed=N … ===` plus
+  the changed query list to the report. `--verbose` prints the unified diff.
+
+Three properties make the output readable as signal:
+
+1. **Noise floor zero**, re-confirmed here — three consecutive captures at the
+   same commit, `changed=0` each time. `EXPLAIN` without `ANALYZE` emits no
+   timings and no actual rows, which is what makes the file byte-stable.
+2. **The capture is always the full corpus**, even under `QUERIES=` (which turns
+   the *sweep* into a subset probe). A plan file exists to be diffed against
+   every other plan file; a subset would report the other 98 as `removed`. The
+   full pass costs **14 s**, so there is nothing to save by narrowing it.
+3. **The flags line is stamped into the capture**, not only the sweep report. A
+   plan diff between two arms run under different planner flags is meaningless,
+   and the file has to be able to say which arm it is on its own face.
+
+**Validation — the instrument reproduces §5.10's table without re-running
+anything.** The file format is deliberately identical to the hand-rolled
+predecessor (`2026-08-05-p56gi-capture.sh`), so the four committed corpus
+captures are valid baselines. A capture taken through the new gate path at
+`b2d82285` (whose Go code is `f8338a09` verbatim — the two commits since are
+docs and CI logs) diffs against them as:
+
+| baseline | changed | expected |
+|---|---|---|
+| D `f8338a09` | **0** | 0 — same engine code, different harness and directory |
+| C `8ce056ff` | **4** — Q13, Q41, Q48, Q85 | §5.10's P5.6-g-iv set, exactly |
+| B `4b820ab8` | **5** — + Q83 | + §5.10's P5.6-g set |
+| A `ce027cee` | **75** | §5.10's A→D net |
+
+The D row is the load-bearing one: it is the cross-harness compatibility proof,
+and it only passes because of one normalisation. psql stamps errors with the
+*path* of the script it was reading (`psql:/tmp/xyz.sql:29: ERROR: …`), and
+TPC-DS Q36/Q70/Q86 are dsqgen artefacts whose block is an error message rather
+than a plan. Before the fix every capture written to a different directory
+reported all three as changed — three permanent false positives in a channel
+whose entire value rests on a zero noise floor. `tpcds-plan-diff.py`
+canonicalises that prefix to `psql:<script>:<line>:` and keeps the line number,
+which moves only when the query file itself does.
+
+**Scope.** This channel is goopg-against-goopg over time: it answers "did this
+commit move a plan?", not "is the plan PG's". The second question is §4's
+per-joinrel parity instrument, and the two are deliberately separate — one runs
+on the SF0.5 cluster in 14 s with no PG instance, the other needs the oracle.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

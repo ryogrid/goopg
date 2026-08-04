@@ -230,6 +230,36 @@ but non-fatal, so the gate is a *correctness* gate and perf is tracked, not
 enforced. Run it after any planner/executor change, alongside (not instead of)
 `scripts/tpch-spotcheck.sh`.
 
+## Plan-shape channel (second column, non-blocking)
+
+```bash
+scripts/tpcds-sf05-regression.sh plans        # capture + diff on its own, ~14 s
+SF05_NO_PLANS=1 scripts/…-regression.sh sweep # skip the tail stage
+```
+
+Every sweep now ends with one `EXPLAIN`-only pass over all 99 queries on a
+freshly started server, written to `tpcds-results-sf05/plans-<timestamp>.txt`
+(same timestamp as its `sweep-` report), plus a per-query diff against the
+previous capture appended to the report:
+
+```
+=== PLAN-SHAPE: queries=99 same=95 changed=4 added=0 removed=0 ===
+changed (4): Q13 Q41 Q48 Q85
+```
+
+Why it exists: on 2026-08-05 one commit re-ordered **74 of 99** TPC-DS plans
+while the gate reported a verdict identical to the previous baseline line for
+line. Row counts and checksums are still the *only* thing that can fail the gate
+— a plan that moves is information about a planner change, not an error, and the
+channel is engineered so a failure inside it cannot change the exit status.
+
+Nothing is executed (`EXPLAIN` without `ANALYZE`, every statement prefixed, so
+Q14/23/24/39's second statement never runs), which is what makes the file
+byte-stable; the measured noise floor is zero. The capture is always the full
+corpus even under `QUERIES=`, so any two captures are comparable. Diff two by
+hand — including the committed baselines under `analysis/leftdeep-joins/` — with
+`scripts/tpcds-plan-diff.py OLD NEW [--verbose]`.
+
 ## Oracle file format
 
 `tpcds-results-sf05/oracle.txt`, one line per query: `q|status|rows|secs`
@@ -285,3 +315,6 @@ same plan line carries the planner's *estimated* `rows=` first.
 | `TIMEOUT_SEC` | `300` | per-query timeout for the goopg sweep |
 | `RESTART_AFTER_TIMEOUT` | `1` | bounce goopg after each goopg TIMEOUT |
 | `FORCE` | unset | run even while the SF=1 sweep harness is active |
+| `SF05_NO_PLANS` | unset | skip the plan-shape channel appended to a sweep |
+| `PLAN_TIMEOUT` | `180` | per-query timeout for the EXPLAIN-only plan capture |
+| `SF05_PLANS_BASELINE` | newest `plans-*.txt` | capture to diff against; `none` skips the diff |

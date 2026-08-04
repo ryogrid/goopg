@@ -1094,7 +1094,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       fix (checked item above) did not hold: FAILed in nightly runs 20260801,
       `20260802-014405`, and `20260803-013955`
       (AI-20260802-014405-001, AI-20260803-013955-003,
-      AI-20260804-005028-001; repro:
+      AI-20260804-005028-001, AI-20260805-014309-001 — five nights running;
+      repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`).
       **VERIFIED FAILING AT HEAD `e13d6c6f` in isolation (2026-08-02 loop #31,
@@ -1189,6 +1190,31 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       `TestMHJParallelNoDuplicates` fixed by `4fb87456`) and `make race-gate`
       green across every package (item (b)). Left for the next nightly run to
       confirm from its own log.
+
+### Nightly run 20260805-014309 (2 items, sha `ce027cee` — status fail)
+
+**The run shrank 17 → 2.** The 15 `regress/*` "output mismatch" subjects and the
+`regress/suite-wedge` item filed for 20260802/03/04 are ABSENT tonight, which is
+the first independent evidence for the phantom-divergence-downstream-of-the-wedge
+reading recorded above (they were never 15 regressions). Their tasks stay open —
+one clean night is not a fix — but do not re-file them per night.
+
+- [x] **pgbench/nightly — recurrence of the documented non-FIFO tuple-lock tail**
+      (AI-20260805-014309-002, first-seen tonight; evidence
+      `ci/logs/20260805-014309/pgbench/pgbench.log`). **1 failed transaction**,
+      same signature as the closed 20260720 item above: `client 61 script 0
+      aborted in command 4 query 0: ERROR: current transaction is aborted,
+      commands ignored`. Command 4 is TPC-B's `UPDATE pgbench_branches`; 100
+      clients contend 50 branch rows and goopg raises instead of queuing —
+      `goopg_dml_conflict_no_fifo_tuple_lock` / deferral row 0021-0012 (route
+      tuple locks through `tableLockMgr` for FIFO waits). Checked off as a
+      recurrence, not new work: 1 aborted txn is a *smaller* tail than the
+      4/19.5M already triaged, the error string and command index are identical,
+      and the fix is the existing ledger row, not a new task. Re-open only if a
+      night shows a different command index or a non-abort error class.
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001)** —
+      fifth consecutive night; already tracked by the REOPENED item above, which
+      now carries this run's id. No separate task.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -7407,7 +7433,32 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       script); doc 09 §5.10; IMPLEMENTATION-TODO P5.6-g-i. No ledger row: this
       loop implemented nothing and left no PG behaviour unimplemented.
       Successor **M0127-P5.6-g-i-b** below.
-- [ ] **M0127-P5.6-g-i-b — give the DS05 gate a plan-shape channel.**
+- [x] **M0127-P5.6-g-i-b — give the DS05 gate a plan-shape channel.**
+      DONE 2026-08-05. `scripts/tpcds-plan-diff.py` (per-query diff of two plan
+      captures) + `scripts/tpcds-sf05-regression.sh`: a `plans` subcommand and a
+      tail stage on `sweep` that writes `plans-<stamp>.txt` beside
+      `sweep-<stamp>.txt` and appends `=== PLAN-SHAPE: queries=99 same=N
+      changed=N … ===` with the changed query list. **The primary bar is not
+      weakened and cannot be**: a sweep run with `PLAN_DIFF` pointed at a
+      nonexistent file still exits 0, and the report says the channel is
+      non-blocking. The capture is the FULL corpus even under `QUERIES=` (a plan
+      file exists to be diffed against every other one; 14 s for all 99), and it
+      stamps the planner-flags arm label — a plan diff across different flags is
+      meaningless. **Bar met, without re-running the ~1 h sweep**: three
+      consecutive captures at one commit → `changed=0` each time, and against
+      P5.6-g-i's four committed corpus captures (the format is deliberately
+      diff-compatible with `2026-08-05-p56gi-capture.sh`) the new gate path
+      reproduces 09 §5.10's attribution exactly — D `f8338a09` → 0 (same Go code,
+      different harness/dir), C `8ce056ff` → 4 (Q13 Q41 Q48 Q85), B `4b820ab8` →
+      5 (+Q83), A `ce027cee` → 75. One real defect found on the way: psql stamps
+      errors with the script PATH, so Q36/Q70/Q86 — the dsqgen artefacts whose
+      block is an error message, not a plan — were three permanent false
+      positives on any results-dir change; the diff tool canonicalises the prefix
+      to `psql:<script>:<line>:`. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56gib-README.md`; doc 09 §5.11;
+      IMPLEMENTATION-TODO P5.6-g-i-b. No ledger row: harness-only, no PG
+      behaviour left unimplemented. Successor stays **M0127-P5.6-g-ii**.
+      ~~Original filing:~~
       P5.6-g-i's four corpus captures were built by hand for that loop, and a
       74-query plan change passed the gate in silence: it compares row counts
       and checksums only. That is the right PRIMARY bar and must not be
