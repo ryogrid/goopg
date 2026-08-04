@@ -1,0 +1,13 @@
+=== Q19
+Aggregate  (cost=0.00..0.00 rows=1 width=0) (actual time=25179.674..25179.674 rows=1.00 loops=1)
+  ->  Hash Join (INNER)  (cost=0.00..0.00 rows=277 width=0) (actual time=440.146..24740.257 rows=131.00 loops=1)
+        Hash Cond: (lineitem.l_partkey = part.p_partkey)
+        Filter: (((part.p_size >= 1) AND (lineitem.l_shipmode = ANY ('AIR', 'AIR REG'))) AND (lineitem.l_shipinstruct = 'DELIVER IN PERSON'))
+        Buckets: 262144  Batches: 1  Memory Usage: 108159kB
+    ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.095..24751.700 rows=5997241.00 loops=1)
+          Filter: ((l_shipmode = ANY ('AIR', 'AIR REG')) AND (l_shipinstruct = 'DELIVER IN PERSON'))
+    ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0) (actual time=2.568..427.837 rows=200000.00 loops=1)
+          Filter: (p_size >= 1)
+Planning Time: 0.011 ms
+Execution Time: 25179.689 ms
+

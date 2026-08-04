@@ -109,6 +109,30 @@ func funcCallTailKey(fc *parser.FuncCall) string {
 	return b.String()
 }
 
+// strictParserExprKey is structuralExprKey with the parserExprKey handoff
+// disabled at every level, so the key is a faithful rendering of the node and
+// NOTHING is normalised away.
+//
+// It exists because parserExprKey deliberately drops a ColumnRef's table
+// qualifier (M0097-0003), which is right for GROUP BY matching and wrong for
+// any caller asking "are these two expressions the same expression". The
+// caller that needs the strict answer is canonicalizeQual (qual_canonical.go):
+// it hoists a conjunct out of an OR only when that conjunct appears in EVERY
+// arm, which is PG's `equal()` test (prepqual.c's list_member over
+// equalfuncs.c). Under the normalising key `(a.x = 1) OR (b.x = 1)` would
+// compare equal and be rewritten to the FALSE-preserving-but-wrong `a.x = 1`,
+// turning a qual that admits rows into one that rejects them.
+func strictParserExprKey(e parser.Expr) string {
+	if e == nil {
+		return "nil"
+	}
+	var b strings.Builder
+	b.WriteString("strict:")
+	w := &structuralKeyWriter{b: &b, onPath: make(map[uintptr]bool, 8), strict: true}
+	w.write(reflect.ValueOf(e), 0)
+	return b.String()
+}
+
 type structuralKeyWriter struct {
 	b *strings.Builder
 	// onPath holds the pointers currently on the recursion path. Marking on
@@ -116,6 +140,9 @@ type structuralKeyWriter struct {
 	// (the same node pointer reachable twice, which planner rewrites do
 	// produce) for one.
 	onPath map[uintptr]bool
+	// strict suppresses the parserExprKey handoff below, keeping the walk
+	// purely structural. See strictParserExprKey.
+	strict bool
 }
 
 func (w *structuralKeyWriter) write(v reflect.Value, depth int) {
@@ -145,7 +172,7 @@ func (w *structuralKeyWriter) write(v reflect.Value, depth int) {
 		// cases (and their normalisations) win over the structural walk. depth
 		// > 0 keeps the root — which arrived here precisely because it has no
 		// explicit case — from recursing into itself forever.
-		if depth > 0 && v.Type().Implements(parserExprType) {
+		if !w.strict && depth > 0 && v.Type().Implements(parserExprType) {
 			w.b.WriteString(parserExprKey(v.Interface().(parser.Expr)))
 			return
 		}
@@ -200,10 +227,10 @@ func (w *structuralKeyWriter) write(v reflect.Value, depth int) {
 		rendered := make([]string, 0, len(keys))
 		for _, k := range keys {
 			var sub strings.Builder
-			ksub := &structuralKeyWriter{b: &sub, onPath: w.onPath}
+			ksub := &structuralKeyWriter{b: &sub, onPath: w.onPath, strict: w.strict}
 			ksub.write(k, depth+1)
 			var vsub strings.Builder
-			vsubw := &structuralKeyWriter{b: &vsub, onPath: w.onPath}
+			vsubw := &structuralKeyWriter{b: &vsub, onPath: w.onPath, strict: w.strict}
 			vsubw.write(v.MapIndex(k), depth+1)
 			rendered = append(rendered, sub.String()+":"+vsub.String())
 		}

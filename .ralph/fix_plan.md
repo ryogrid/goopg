@@ -7377,11 +7377,16 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       batch holds the host (`FATAL: the nightly CI batch is running`), and the
       batch was mid-run with a wedged testport stage for this loop's whole
       duration. Carried in `.ralph/working_set.md` with the exact command.
-- [ ] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g.** Carried, not skipped:
-      `scripts/tpcds-sf05-regression.sh sweep` on a host the nightly batch is
-      not holding. It matters here specifically because TPC-DS, unlike TPC-H,
-      has nullable join keys, so `(1 - nullfrac1)` can move estimates and
-      therefore plan shape there even though it moved nothing on TPC-H.
+- [ ] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g *and* P5.6-g-iv.**
+      Carried, not skipped: `scripts/tpcds-sf05-regression.sh sweep` on a host
+      the nightly batch is not holding. It matters for P5.6-g because TPC-DS,
+      unlike TPC-H, has nullable join keys, so `(1 - nullfrac1)` can move
+      estimates and therefore plan shape there even though it moved nothing on
+      TPC-H. **Raised in priority 2026-08-05 by P5.6-g-iv**, which added a qual
+      canonicalisation pass (`canonicalizeQual`) that fires on every OR-bearing
+      WHERE: TPC-H has exactly two such queries and TPC-DS has many, so this
+      sweep — not the TPC-H audit — is where that change's plan-shape blast
+      radius actually gets measured. Attribute any diff to BOTH changes.
 - [ ] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
       `resolveBaseColumn` (joinkeyproof.go) resolves no column through an
       aggregate, so Q18's SEMI has no `nd2` and punts at 0.5. The arm ALONE
@@ -7406,18 +7411,35 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       docs 09 §4.1 + §5.8. Bar met: UNITS + audit run with the parity column.
       Successors: **P5.6-g-iv** below and a ledger row (2026-08-05) for the
       EXPLAIN rendering gap the gate exposed.
-- [ ] **M0127-P5.6-g-iv — Q19, the only estimator defect TPC-H can prove.**
-      `{lineitem,part}`: goopg est 1 vs actual 131 where PG 18.3 estimates 116
-      vs 112 — 126.5× worse than the reference, and *invisible* to the absolute
-      tripwire (131× < 1 000×), which is precisely why g-iii had to land first.
-      Measured from the committed plan: neither scan carries a filter, so Q19's
-      three OR'd `(p_brand … AND p_container … AND l_quantity … AND p_size …)`
-      groups all ride as the join's residual and price at the join level,
-      landing on the 1-row clamp. First question — which step collapses: the
-      disjunction, the per-group conjunction, or a residual not priced at all.
-      Watch list from the same run (>10× the reference, under the 100× floor):
-      Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
-      Bar: UNITS + an audit run reporting the parity column.
+- [x] **M0127-P5.6-g-iv — Q19, the only estimator defect TPC-H can prove.**
+      DONE 2026-08-05. The answer to "which step collapses" was none of the
+      three: the defect was one level earlier, in a preprocessing pass goopg
+      never had. **goopg did not run PG's `canonicalize_qual`**
+      (`process_duplicate_ors`, prepqual.c), so Q19's thrice-repeated join
+      clause `p_partkey = l_partkey` stayed inside every OR arm — charged once
+      as the equi-join key and again per arm at DEFAULT_EQ_SEL — and the three
+      single-relation conjuncts common to all arms (`l_shipmode IN`,
+      `l_shipinstruct =`, `p_size >= 1`) stayed trapped where NOTHING priced
+      them. M0058-0004's `commonEquijoinsAcrossOr` had already computed the
+      same intersection and used it for the join EDGE only.
+      Landed: `internal/planner/qual_canonical.go` (`canonicalizeQual`), applied
+      in `planSelect` at upstream's placement, parse tree not mutated;
+      `strictParserExprKey` (exprkey.go) as the equality test, because
+      `parserExprKey` drops table qualifiers and would hoist across `a.x = 1` /
+      `b.x = 1`. 9 tests. Q19 `{lineitem,part}` est 1 → 309 vs actual 131
+      (131.0× → 2.4×), parity excess 126.5× → 2.3×, `parity_violations=0
+      shape_mismatches=0`; the plan now carries PG's own shape (both scans
+      filtered, reduced OR at the join). Q12 — the only other OR-bearing TPC-H
+      query — bit-identical. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56giv{.txt,.plans.txt,-README.md}`
+      (+ the Q19-only `-q19` pair); doc 09 §5.9. Bar met and exceeded: UNITS +
+      audit with the parity column + **tpch-spotcheck PASS** (Q12 rows=2,
+      Q13 rows=35). **DS05 NOT RUN** — nightly batch held the host all loop;
+      carried on P5.6-g-i, and it matters MORE for this item than for P5.6-g
+      because TPC-DS has many OR-bearing queries. 1 ledger row (3 deferrals:
+      constant handling, UPDATE/DELETE quals, `extract_restriction_or_clauses`).
+      Watch list still open from g-iii (>10× the reference, under the 100×
+      floor): Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

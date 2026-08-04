@@ -1054,23 +1054,35 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
+		// M0127-P5.6-g-iv: PG's `canonicalize_qual` (prepqual.c), which
+		// upstream runs from `preprocess_expression` at exactly this point —
+		// after parse analysis, before the qual is distributed to
+		// baserestrictinfo / joinquals. It hoists the conjuncts common to
+		// every arm of an OR out of the OR, so TPC-H Q19's thrice-repeated
+		// `p_partkey = l_partkey` becomes one top-level join clause instead of
+		// three residual ones the estimator charges DEFAULT_EQ_SEL for on top
+		// of the equi-join key it already priced. See qual_canonical.go for
+		// the full statement of why. `s` itself is NOT mutated: the parse tree
+		// is shared with the view/rule deparsers, which must keep rendering
+		// the query as written.
+		whereQual := canonicalizeQual(s.Where)
 		if isSimpleSingle {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
-			whereForIndex := injectLikeRangePredicates(s.Where)
+			whereForIndex := injectLikeRangePredicates(whereQual)
 			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
 			} else {
-				pred, err := resolveExpr(s.Where, ctx)
+				pred, err := resolveExpr(whereQual, ctx)
 				if err != nil {
 					return nil, err
 				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
 		} else {
-			pred, err := resolveExpr(s.Where, ctx)
+			pred, err := resolveExpr(whereQual, ctx)
 			if err != nil {
 				return nil, err
 			}

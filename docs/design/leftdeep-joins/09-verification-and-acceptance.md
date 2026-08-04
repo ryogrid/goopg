@@ -608,6 +608,85 @@ Watch list (>10× the reference but under the 100× floor, so not yet ratcheted)
 Q16 `{part,partsupp,supplier}` 84.9× vs 2.0×, Q20 `{lineitem,part,partsupp}`
 32.1× vs 1.1×, Q14 `{lineitem,part}` 12.4× vs 1.0×.
 
+### 5.9 The Q19 defect closed — a missing preprocessing pass, 2026-08-05 (P5.6-g-iv)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56giv.txt` (+ `.plans.txt`,
+`-README.md`). Q12 and Q19 measured; see "why only two queries" below.
+
+§5.8 predicted the defect was in how the residual was priced. It was one level
+earlier than that: **goopg never ran PG's `canonicalize_qual`**
+(`process_duplicate_ors`, prepqual.c), so the OR was never reduced before the
+qual was distributed.
+
+Q19's whole WHERE is `(A ∧ …) ∨ (A ∧ …) ∨ (A ∧ …)` where `A` is the join clause
+`p_partkey = l_partkey`, repeated verbatim in every arm. Upstream hoists `A` —
+along with `l_shipmode IN (…)`, `l_shipinstruct = '…'` and `p_size >= 1`, which
+are also in all three arms — leaving `A ∧ (rest₁ ∨ rest₂ ∨ rest₃)`. goopg did
+not, with three consequences that compounded:
+
+1. **The join clause was priced twice.** Once as the equi-join key
+   (`l·r/nd` = 1/200 000), and again inside each OR arm, where
+   `eqOpSelectivity` sees two columns and no constant and returns
+   DEFAULT_EQ_SEL. Three arms at ~5·10⁻⁹ apiece drove the product to ~0.1 rows,
+   i.e. the 1-row clamp.
+2. **Three real restrictions were priced nowhere.** The single-relation
+   conjuncts common to all arms stayed trapped inside the OR, so neither scan
+   could be filtered and `joinResidualSelectivity` — which correctly skips
+   single-sided conjuncts as "already priced at the scan" — had nothing to skip
+   and nothing had been priced.
+3. **M0058-0004 had already computed the intersection and thrown it away.**
+   `commonEquijoinsAcrossOr` (joinorder.go) extracts exactly `A` so the join
+   EDGE exists, which is why goopg emitted a Hash Join at all; the qual itself
+   stayed opaque. That workaround is the same computation as
+   `process_duplicate_ors`, applied to one consumer instead of to the qual.
+
+Landed: `internal/planner/qual_canonical.go` (`canonicalizeQual`, upstream's
+`find_duplicate_ors` over goopg's binary AND/OR tree), applied in `planSelect`
+at upstream's own placement — after parse analysis, before the qual is
+distributed. The parse tree is **not** mutated; it is shared with the view/rule
+deparsers, which must keep rendering the query as written.
+
+The equality test is `strictParserExprKey` (exprkey.go), not `parserExprKey`.
+That distinction is load-bearing: `parserExprKey` deliberately drops a
+ColumnRef's table qualifier (M0097-0003), under which `a.x = 1` and `b.x = 1`
+compare equal, and hoisting one of them out of an OR rewrites a qual that admits
+rows from either table into one that demands both. Pinned by
+`TestCanonicalizeQualDoesNotHoistAcrossTableQualifiers`.
+
+Result — Q19 `{lineitem, part}`:
+
+| | est | actual | ratio | PG 18.3 | excess |
+|---|---|---|---|---|---|
+| before (§5.8) | 1 | 131 | 131.0× under | 1.0× | **126.5×** |
+| after | 309 | 131 | 2.4× over | 1.0× | **2.3×** |
+
+`RATCHET parity_violations=0 shape_mismatches=0`. The plan now shows PG's own
+Q19 shape: `Filter: (l_shipmode = ANY …) AND (l_shipinstruct = …)` on the
+lineitem scan, `Filter: (p_size >= 1)` on part, the reduced OR at the join.
+
+**Why only Q12 and Q19 were measured.** This pass can only change a query whose
+WHERE contains an OR; on every other input `canonicalizeQual` returns its
+argument unchanged. Exactly three of the 22 TPC-H texts contain `or`, and Q15's
+is `CREATE OR REPLACE VIEW`. Q12 is therefore the control, and it is
+bit-identical to §5.7's baseline (1.5× / excess 1.3×; est 45 793 → 46 222 is
+ANALYZE sampling noise between sessions) — its OR is a two-arm disjunction of
+bare equalities with no common conjunct, so it correctly finds no winners. The
+19 OR-free queries were not re-run and are not claimed to have moved; the claim
+is that the pass is a structural no-op on them.
+
+**What is deliberately not reproduced.** `find_duplicate_ors` also drops
+constant TRUE/FALSE/NULL inputs as it recurses, with different rules for WHERE
+quals and CHECK constraints. goopg folds constants in `FoldConstants`, and
+duplicating that logic here would give two passes an opportunity to disagree
+about three-valued logic. The pass is also applied to SELECT only, not to
+UPDATE/DELETE quals (planner.go:9167ff). Both ledgered 2026-08-05.
+
+**Not yet discharged:** the TPC-DS SF0.5 gate. TPC-DS has far more OR-bearing
+queries than TPC-H, so it — not TPC-H — is where this pass's plan-shape blast
+radius actually gets measured. It self-refuses while the nightly CI batch holds
+the host, and is carried on `M0127-P5.6-g-i` together with P5.6-g's own
+undischarged sweep.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

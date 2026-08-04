@@ -970,13 +970,22 @@
   Successors **P5.6-g-iv** (Q19, the only proved estimator defect) and a
   ledgered EXPLAIN rendering gap (no `lineitem_1` deduplication).
   Bar met: UNITS + an audit run reporting the parity column.
-- [ ] **P5.6-g-iv** Q19 `{lineitem,part}`: goopg est 1 vs actual 131 where PG
-  estimates 116 vs 112 — the one TPC-H joinrel the parity gate proves goopg
-  estimates worse than PG (126.5× excess), and invisible to the absolute
-  tripwire. Neither scan is filtered, so the three OR'd conjunction groups all
-  ride as the join residual and price at the join level. First question: which
-  step collapses to the 1-row clamp — the disjunction, the per-group
-  conjunction, or an unpriced residual. Bar: UNITS + audit run (parity column).
+- [x] **P5.6-g-iv** Q19 `{lineitem,part}` closed 2026-08-05 — and the collapsing
+  step was none of the three candidates. It was a preprocessing pass goopg never
+  had: **PG's `canonicalize_qual` / `process_duplicate_ors` (prepqual.c)**, which
+  hoists the conjuncts common to every arm of an OR out of the OR before the qual
+  is distributed. Without it Q19's thrice-repeated join clause was priced once as
+  the equi-join key and again per arm at DEFAULT_EQ_SEL, and the three
+  single-relation conjuncts common to all arms were priced nowhere at all.
+  Landed as `internal/planner/qual_canonical.go` (`canonicalizeQual`) applied in
+  `planSelect` at upstream's placement, with `strictParserExprKey` (exprkey.go)
+  as the equality test — `parserExprKey` normalises table qualifiers away and
+  would hoist across `a.x = 1` / `b.x = 1`. 9 tests. est 1 → 309 vs actual 131,
+  parity excess 126.5× → 2.3×, `parity_violations=0`; Q12 (the only other
+  OR-bearing TPC-H query) bit-identical. [09](09-verification-and-acceptance.md)
+  §5.9. Bar met: UNITS + audit (parity column) + tpch-spotcheck PASS. **DS05
+  carried on P5.6-g-i** — it is where this pass's blast radius actually gets
+  measured, since TPC-DS has many OR-bearing queries and TPC-H has two.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
