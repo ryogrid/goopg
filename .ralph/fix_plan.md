@@ -7377,16 +7377,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       batch holds the host (`FATAL: the nightly CI batch is running`), and the
       batch was mid-run with a wedged testport stage for this loop's whole
       duration. Carried in `.ralph/working_set.md` with the exact command.
-- [ ] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g *and* P5.6-g-iv.**
-      Carried, not skipped: `scripts/tpcds-sf05-regression.sh sweep` on a host
-      the nightly batch is not holding. It matters for P5.6-g because TPC-DS,
-      unlike TPC-H, has nullable join keys, so `(1 - nullfrac1)` can move
-      estimates and therefore plan shape there even though it moved nothing on
-      TPC-H. **Raised in priority 2026-08-05 by P5.6-g-iv**, which added a qual
-      canonicalisation pass (`canonicalizeQual`) that fires on every OR-bearing
-      WHERE: TPC-H has exactly two such queries and TPC-DS has many, so this
-      sweep — not the TPC-H audit — is where that change's plan-shape blast
-      radius actually gets measured. Attribute any diff to BOTH changes.
+      **↳ DISCHARGED 2026-08-05 by M0127-P5.6-g-i**: no row/checksum change,
+      and this commit moves exactly ONE TPC-DS plan (Q83) — the nullable-key
+      premise for the carry is measured false (09 §5.10).
+- [x] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g *and* P5.6-g-iv.**
+      DONE 2026-08-05, on a host the nightly batch had cleared (05:18). The
+      sweep owed **three** commits a gate, not two: the last DS05 baseline is
+      `ce027cee` (P5.6-f) and `4b820ab8` (P5.6-f-ii) landed after it, ungated.
+      **Gate: `PASS=94 (57 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=1 SKIP=4` — identical to the baseline line for line**, including
+      every value checksum and the single Q47 TIMEOUT. Total seconds 1828 →
+      1788, NOT claimed (the baseline's back half ran under the nightly).
+      Then a whole-corpus `EXPLAIN` A/B/C/D at `ce027cee` → `4b820ab8` →
+      `8ce056ff` → `f8338a09`, S-cold, noise floor measured at zero (same
+      binary twice = byte-identical plans for all 99): **P5.6-f-ii moved 74 of
+      99 plans, P5.6-g moved 1 (Q83), P5.6-g-iv moved 4 (Q13, Q41, Q48, Q85)**;
+      75 net, nothing changed and changed back. **The premise that raised this
+      item is measured false** — `(1 - nullfrac1)` + the MCV arm move estimates
+      but almost never the search's choice; the corpus-wide re-ordering belongs
+      to P5.6-f-ii, the commit that taught the search to read the join key at
+      all, and 74 plans moving with zero rows moving is the strongest evidence
+      available that it is a re-ordering and not a semantic change. Q41 is
+      `canonicalizeQual`'s pure case (`(A∧X)∨(A∧Y)` → `A∧(X∨Y)` in one filter);
+      Q13 is the load-bearing one (three join clauses + `ca_country` hoisted
+      out of all three OR arms → hash joins where a nested loop carried the
+      disjunction, PG's own Q13 shape). 27 of 99 texts contain an OR vs 2 in
+      all of TPC-H. Evidence `analysis/leftdeep-joins/2026-08-05-p56gi-*`
+      (README + both sweep reports + four corpus plan captures + the capture
+      script); doc 09 §5.10; IMPLEMENTATION-TODO P5.6-g-i. No ledger row: this
+      loop implemented nothing and left no PG behaviour unimplemented.
+      Successor **M0127-P5.6-g-i-b** below.
+- [ ] **M0127-P5.6-g-i-b — give the DS05 gate a plan-shape channel.**
+      P5.6-g-i's four corpus captures were built by hand for that loop, and a
+      74-query plan change passed the gate in silence: it compares row counts
+      and checksums only. That is the right PRIMARY bar and must not be
+      weakened — the ask is a second, non-blocking column. Concretely: an
+      `EXPLAIN`-only pass (every statement prefixed, so Q14/23/24/39's second
+      statement is never executed) writing one plan file per run beside the
+      sweep report, plus a diff against the previous run's file in the summary.
+      The noise floor is already known to be zero at S-cold (measured
+      2026-08-05), so a diff there is signal, not flake. Start from
+      `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh`, which is that pass
+      in throwaway form. Bar: two consecutive sweeps at the same commit report
+      zero plan diffs, and one at a different commit reports the expected set.
 - [ ] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
       `resolveBaseColumn` (joinkeyproof.go) resolves no column through an
       aggregate, so Q18's SEMI has no `nd2` and punts at 0.5. The arm ALONE
@@ -7436,7 +7469,9 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       audit with the parity column + **tpch-spotcheck PASS** (Q12 rows=2,
       Q13 rows=35). **DS05 NOT RUN** — nightly batch held the host all loop;
       carried on P5.6-g-i, and it matters MORE for this item than for P5.6-g
-      because TPC-DS has many OR-bearing queries. 1 ledger row (3 deferrals:
+      because TPC-DS has many OR-bearing queries. **↳ DISCHARGED 2026-08-05 by
+      M0127-P5.6-g-i**: no row/checksum change; 4 of the 27 OR-bearing TPC-DS
+      plans move (Q13, Q41, Q48, Q85), Q13 into PG's own hash-join shape. 1 ledger row (3 deferrals:
       constant handling, UPDATE/DELETE quals, `extract_restriction_or_clauses`).
       Watch list still open from g-iii (>10× the reference, under the 100×
       floor): Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.

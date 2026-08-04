@@ -951,6 +951,22 @@
   Successors **P5.6-g-ii** / **P5.6-g-iii**. Bar met: UNITS + SPOT + audit run
   + two real-data probes. DS05 blocked by the live nightly batch (the gate
   self-refuses); carried.
+- [x] **P5.6-g-i** the carried TPC-DS SF0.5 gate, run 2026-08-05 on a host the
+  nightly batch had cleared — and it turned out to owe **three** commits a gate,
+  not two: `4b820ab8` (P5.6-f-ii) also landed after the last DS05 baseline
+  (`ce027cee`). Result: `PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1
+  SKIP=4`, identical to the baseline line for line — not one row count and not
+  one of the 57 value checksums moved. Whole-corpus `EXPLAIN` captures at all
+  four arms then attributed the plan churn exactly (noise floor measured at
+  zero: the same binary twice gives byte-identical plans for all 99):
+  **P5.6-f-ii moved 74 of 99 plans, P5.6-g moved 1 (Q83), P5.6-g-iv moved 4**
+  (Q13, Q41, Q48, Q85). The reason the item was raised in priority — TPC-DS's
+  nullable join keys should let `(1 - nullfrac1)` move plan shape — is
+  **measured false**; the corpus-wide re-ordering is the search finally reading
+  the join key (§5.6), 74 plans moved with zero rows moved. Evidence
+  `analysis/leftdeep-joins/2026-08-05-p56gi-*`;
+  [09](09-verification-and-acceptance.md) §5.10. Successor filed: the gate has
+  no plan-shape channel of its own.
 - [ ] **P5.6-g-ii** the `*HashAggregate` arm for `resolveBaseColumn`, and Q18's
   real shape: PG dedups a `GROUP BY`-unique subquery and joins it as an INNER
   rel (117 159 est) where goopg keeps a SEMI and punts at 0.5 (2 998 620).

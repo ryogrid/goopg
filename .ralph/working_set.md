@@ -1,50 +1,35 @@
-Task: M0127-P5.6-g-iv — Q19, the only estimator defect TPC-H could prove. DONE,
-documented, committed. Nothing in flight.
+(idle — nothing in flight)
 
-Files: internal/planner/qual_canonical.go (NEW, `canonicalizeQual` =
-PG `find_duplicate_ors`/`process_duplicate_ors`, prepqual.c), qual_canonical_test.go
-(NEW, 9 tests), exprkey.go (`strictParserExprKey` + `structuralKeyWriter.strict`),
-planner.go `planSelect` (one call site, parse tree NOT mutated).
+Last loop: M0127-P5.6-g-i (the carried TPC-DS SF0.5 gate) — DONE, documented,
+committed. Four facts the next loop should NOT re-derive:
 
-Four things the next loop should NOT re-derive:
+1. **The gate is clean and the carry is discharged.** `PASS=94 MISMATCH=0
+   CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`, identical to the `ce027cee`
+   baseline line for line (all 57 checksums, the single Q47 TIMEOUT).
+2. **Three commits owed a gate, not two** — `4b820ab8` (P5.6-f-ii) landed after
+   the last DS05 baseline and was never swept either.
+3. **Attribution (whole-corpus EXPLAIN, four arms, noise floor zero):
+   P5.6-f-ii moved 74 of 99 plans, P5.6-g moved 1 (Q83), P5.6-g-iv moved 4**
+   (Q13, Q41, Q48, Q85). The nullable-key premise that raised this item is
+   MEASURED FALSE. Do not re-run the sweep to "check P5.6-g on TPC-DS".
+4. **The capture harness is committed** —
+   `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh` runs an EXPLAIN-only
+   pass over all 99 (every statement prefixed, so Q14/23/24/39's second
+   statement never executes). Reuse it instead of rewriting it; it is the
+   starting point for the successor P5.6-g-i-b.
 
-1. **The defect was a missing preprocessing pass, not a selectivity bug.** Q19's
-   join clause `p_partkey = l_partkey` is repeated in all three OR arms;
-   uncanonicalised it is priced twice (equi-key + DEFAULT_EQ_SEL per arm) and
-   the three single-relation conjuncts common to all arms are priced NOWHERE.
-   est 1 → 309 vs actual 131; parity excess 126.5× → 2.3×; ratchet
-   `parity_violations=0 shape_mismatches=0`.
-2. **TPC-H can only reach Q12 and Q19** — they are the only two texts with an
-   OR in the WHERE (Q15's `or` is `CREATE OR REPLACE VIEW`). Q12 is the
-   no-winners control and came back bit-identical. Do NOT read the 2-query
-   audit as a full sweep; the other 19 were not re-run.
-3. **`strictParserExprKey` exists for a reason** — `parserExprKey` drops table
-   qualifiers (M0097-0003), so `a.x = 1` and `b.x = 1` compare equal under it
-   and hoisting one would silently lose rows. Pinned by a test.
-4. **M0058-0004's `commonEquijoinsAcrossOr` (joinorder.go) is now redundant in
-   principle** — it computes the same intersection for the join EDGE only. Left
-   in place deliberately (it runs before `planSelect`'s canonicalisation);
-   removing it is a separate, measurable change.
+Gates run: DS05 sweep PASS (evidence committed); plan A/B ×4 arms + a
+same-binary noise-floor capture; pgbench smoke via the commit hook.
+No Go code changed this loop, so no UNITS/spotcheck run and no ledger row.
 
-Evidence: `analysis/leftdeep-joins/2026-08-05-p56giv{.txt,.plans.txt,-README.md}`
-plus the Q19-only `-q19` pair. Docs: 09 §5.9, IMPLEMENTATION-TODO P5.6-g-iv,
-design README index. 1 ledger row (3 deferrals: constant handling,
-UPDATE/DELETE quals, `extract_restriction_or_clauses`).
-
-Next step: per the banner, the next M0127 item. **M0127-P5.6-g-i (the carried
-DS05 sweep) still goes first and now matters MORE** — it must attribute to BOTH
-P5.6-g and this pass, and TPC-DS is where a qual-canonicalisation change's
-plan-shape blast radius is actually measured. Blocked again this loop: the
-nightly CI batch ran the whole loop (testport stage wedged for ~2 h, then
-pgbench) and `scripts/tpcds-sf05-regression.sh` self-refuses while it holds the
-host. Then P5.6-g-ii (HashAggregate arm + Q18 dedup shape).
-
-Gates run: build + vet; planner `go test` PASS (9 new); UNITS PASS
-(`/tmp/units_p56giv.log`, 38 pkgs); **tpch-spotcheck PASS** (Q12 rows=2,
-Q13 rows=35 — `/tmp/spot_p56giv.log`); audit with the parity column on Q12+Q19;
-pgbench smoke via the commit hook. No DS05 (see above).
-
-Nightly triage: the same 17 `AI-20260804-005028-*` subjects, all already filed
-under M-NIGHTLY. Nothing new to file.
+Next step: per the banner, **M0127-P5.6-g-ii** (the `*HashAggregate` arm for
+`resolveBaseColumn` + PG's dedup of a `GROUP BY`-unique subquery into an INNER
+join — `reduce_unique_semijoins`, analyzejoins.c). Both halves together; the
+arm alone measures worse. Its bar (UNITS + DS05 + audit) is now runnable: the
+nightly clears around 05:20 and the DS05 baseline to diff against is
+`analysis/leftdeep-joins/2026-08-05-p56gi-ds05-sweep.txt`.
+Caution for that item: in goopg a SEMI `*Join`'s `Output()` is left-only, so a
+literal SEMI→INNER node swap changes the output width — read the plan-shape
+implications before copying PG's rewrite verbatim.
 
 In-flight: none.

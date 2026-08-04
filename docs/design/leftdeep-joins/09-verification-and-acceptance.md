@@ -685,7 +685,70 @@ UPDATE/DELETE quals (planner.go:9167ff). Both ledgered 2026-08-05.
 queries than TPC-H, so it — not TPC-H — is where this pass's plan-shape blast
 radius actually gets measured. It self-refuses while the nightly CI batch holds
 the host, and is carried on `M0127-P5.6-g-i` together with P5.6-g's own
-undischarged sweep.
+undischarged sweep. **Discharged 2026-08-05 — see §5.10.**
+
+### 5.10 The DS05 gate for three commits, and which one actually moved the corpus, 2026-08-05 (P5.6-g-i)
+
+Evidence `analysis/leftdeep-joins/2026-08-05-p56gi-*` (README, the two sweep
+reports, four whole-corpus plan captures, the capture script).
+
+`scripts/tpcds-sf05-regression.sh sweep` had last run at `ce027cee` (P5.6-f).
+Between that report and HEAD sit **three** estimator commits, not the two this
+item was filed for — `4b820ab8` (P5.6-f-ii) landed after the baseline sweep and
+was never gated either. Arms: **A** `ce027cee` (P5.6-f) → **B** `4b820ab8`
+(+f-ii) → **C** `8ce056ff` (+g; g-iii is instrument-only) → **D** `f8338a09`
+(+g-iv).
+
+**The gate.** At D the summary is `PASS=94 (57 ck-verified, 37 ck=n/a)
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4` — identical to the A baseline
+line for line, including the 57 value checksums and the single TIMEOUT (Q47).
+Not one query changed its row count or its checksum. Total sweep seconds
+1828 → 1788, but that comparison is **not** claimed: the A sweep ran
+01:23→01:59 and the nightly batch fired at 01:43, so its back half carries load
+this run did not.
+
+**The blast radius.** `EXPLAIN` (no ANALYZE) over all 99 queries at each arm,
+S-cold, one binary at a time. Noise floor measured first — the same binary
+captured twice gives byte-identical plans for all 99, so M0125-0047's
+plan-snapshot nondeterminism does not contaminate the attribution.
+
+| step | plans changed |
+|---|---|
+| A→B **P5.6-f-ii** | **74** of 99 |
+| B→C **P5.6-g** | **1** (Q83) |
+| C→D **P5.6-g-iv** | **4** (Q13, Q41, Q48, Q85) |
+| A→D net | 75 (nothing changed and changed back) |
+
+**§5.7's hypothesis is measured false.** The reason this sweep was raised in
+priority — TPC-DS has nullable join keys, so `(1 - nullfrac1)` and the MCV arm
+should move plan shape where TPC-H showed nothing — does not survive
+measurement: P5.6-g moves **one** plan in the corpus. Its estimates move; the
+search's *choice* almost never does. The 74-query churn is **P5.6-f-ii**, the
+commit that taught the join-order search to read the join key at all (§5.6):
+before it the integer DP priced an edge by the maximum NDistinct over every
+column of the two tables, so nearly every multi-way join in the corpus was
+ordered on a number unrelated to the key being joined on. 74 plans moved, zero
+rows moved. That is the strongest available evidence that §5.6's change is a
+re-ordering and not a semantic one — and it is evidence P5.6-f-ii shipped
+without.
+
+P5.6-g-iv's four are `canonicalizeQual` behaving as specified. Q41 is the pure
+case: `(A AND X) OR (A AND Y)` → `A AND (X OR Y)` inside one scan's filter,
+nothing else moves. Q13 is the load-bearing one — the three join clauses
+repeated in all three OR arms plus `ca_country = 'United States'` are hoisted
+out, so the planner sees join clauses where it previously saw an opaque OR and
+builds hash joins in place of a nested loop carrying the whole disjunction as a
+filter, which is PG's own Q13 shape. 27 of the 99 texts contain an OR (against
+2 in all of TPC-H); the pass fires on the other 23 without changing what the
+search picks.
+
+**What this leaves open.** The gate has no plan-shape channel: the four captures
+above were built by hand for this loop, and a 74-query plan change passed the
+gate in silence because it compares row counts and checksums only. That is the
+correct *primary* bar — but a search change of this size being invisible to it
+is filed as a follow-up under M0127, not fixed here. Q13's new plan also hashes
+all 1 920 800 `customer_demographics` rows: free at SF0.5 (20 s → 21 s), and no
+SF=1 sweep has run since.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 
