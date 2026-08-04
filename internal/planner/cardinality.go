@@ -526,14 +526,7 @@ func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
 	return sel
 }
 
-// semiPairMatchFraction is `eqjoinsel_semi` (selfuncs.c) for ONE pair, reduced
-// to the branch goopg can actually evaluate.
-//
-// goopg keeps no MCV list for a join key here (`columnStatsForChild` answers
-// per column, not per join), so this implements the `else` branch verbatim:
-// with reliable ndistinct on both sides, `nd1 <= nd2` means every outer row is
-// assumed to match and otherwise the match fraction is `nd2/nd1`; with either
-// side unknown, upstream punts to 0.5 rather than guessing, and so does this.
+// semiPairMatchFraction is `eqjoinsel_semi` (selfuncs.c) for ONE pair.
 //
 // The nd2 clamp is load-bearing and asymmetric, for the reason upstream states:
 // it is the ONLY pathway by which a restriction on the inner relation reaches a
@@ -541,9 +534,42 @@ func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
 // Clamping nd1 as well would double-count the outer's own restrictions. A
 // clamped nd2 also stops being "default": an inner relation smaller than
 // `defaultNumDistinct` bounds its own distinct count exactly.
+//
+// M0127-P5.6-g added the two pieces the first cut left out, and they are one
+// change because they fail in the same direction (09 §5.7):
+//
+//   - **The MCV arm.** Upstream takes it FIRST when both sides have an MCV
+//     list, matches the two lists against each other, and estimates only the
+//     UNCERTAIN remainder with the nd heuristic. The heuristic alone is a
+//     rounding function on real data: with a truthful ndistinct (P5.6-e-iii)
+//     the `nd1 <= nd2` test succeeds on every PK-FK-shaped semi-join, the
+//     fraction is exactly 1.0, and JOIN_ANTI's `outer · (1 - jselec)` then
+//     floors at 1 row — Q21's final ANTI read 4 003× under, Q19 131× under,
+//     Q16 85× under. A matched-MCV mass is a MEASURED lower bound on the match
+//     fraction, so it is also the only thing that can pull the estimate off
+//     those two rails.
+//   - **`(1 - nullfrac1)`.** A NULL outer row matches nothing in a semi-join;
+//     upstream multiplies every branch's result by the outer's null fraction
+//     complement, including the punt. goopg dropped the factor entirely, which
+//     is a pure over-estimate whenever the outer key is nullable.
+//
+// Divergences from upstream, both recorded in the ledger: MCV equality is
+// TEXT equality over the stored renderings rather than a call through the
+// operator's `oprcode` (goopg stores MCVs as strings — same convention as
+// `eqSelectivityForColumn`), and only the inner INPUT's rows clamp nd2, not
+// also `vardata2->rel->rows`.
 func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 	nd1 := float64(keyNDistinct(p.Left, j.Left))
 	nd2 := float64(rightExprNDistinct(j, p.Right))
+	st1 := keyColumnStats(p.Left, j.Left)
+	st2 := rightExprStats(j, p.Right)
+
+	nullfrac1 := 0.0
+	if st1 != nil {
+		nullfrac1 = st1.NullFrac
+	}
+
+	nd1Known := nd1 > 0
 	nd2Known := nd2 > 0
 	if !nd2Known {
 		nd2 = defaultNumDistinct
@@ -552,13 +578,109 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 		nd2 = float64(innerRows)
 		nd2Known = true
 	}
-	if nd1 <= 0 || !nd2Known {
-		return 0.5
+
+	if st1 != nil && st2 != nil && len(st1.MCV) > 0 && len(st2.MCV) > 0 {
+		// "The clamping above could have resulted in nd2 being less than
+		// sslot2->nvalues; in which case, we assume that precisely the nd2 most
+		// common values in the relation will appear in the join input"
+		// (selfuncs.c) — the MCV list is frequency-ordered, so the prefix is
+		// the right truncation.
+		clamped2 := len(st2.MCV)
+		if float64(clamped2) > nd2 {
+			clamped2 = int(nd2)
+		}
+		matched2 := make([]bool, clamped2)
+		matchFreq1, nmatches := 0.0, 0
+		for i := range st1.MCV {
+			// "we assume that each MCV will match at most one member of the
+			// other MCV list" — hence the used-up flags and the break.
+			for k := 0; k < clamped2; k++ {
+				if matched2[k] || st1.MCV[i].Value != st2.MCV[k].Value {
+					continue
+				}
+				matched2[k] = true
+				nmatches++
+				matchFreq1 += st1.MCV[i].Frequency
+				break
+			}
+		}
+		matchFreq1 = clampProbability(matchFreq1)
+
+		// The matched MCVs are known to have partners, so they are discounted
+		// from BOTH distinct counts before the heuristic prices the rest.
+		uncertainFrac := 0.5
+		if nd1Known && nd2Known {
+			rem1, rem2 := nd1-float64(nmatches), nd2-float64(nmatches)
+			if rem1 <= rem2 || rem2 < 0 {
+				uncertainFrac = 1.0
+			} else {
+				uncertainFrac = rem2 / rem1
+			}
+		}
+		uncertain := clampProbability(1.0 - matchFreq1 - nullfrac1)
+		return matchFreq1 + uncertainFrac*uncertain
+	}
+
+	// Without MCV lists on both sides, only the nd heuristic is available.
+	if !nd1Known || !nd2Known {
+		return 0.5 * (1.0 - nullfrac1)
 	}
 	if nd1 <= nd2 {
-		return 1.0
+		return 1.0 - nullfrac1
 	}
-	return nd2 / nd1
+	return (nd2 / nd1) * (1.0 - nullfrac1)
+}
+
+// clampProbability is `CLAMP_PROBABILITY` (selfuncs.h): a probability that
+// escaped [0, 1] through accumulated float error or through a stale statistic
+// is pinned rather than propagated, because a negative one flips the sign of
+// everything multiplied by it.
+func clampProbability(p float64) float64 {
+	if math.IsNaN(p) || p < 0 {
+		return 0
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
+}
+
+// keyColumnStats is `keyNDistinct`'s whole-row twin: the ANALYZE statistics of
+// the base column a LEFT-side key operand resolves to, nil when it resolves to
+// no base column or the relation was never analysed.
+//
+// It goes through `resolveBaseColumn` — the canonical resolver — rather than
+// `columnStatsForChild`, for the reason recorded on `baseColumnRef.stats`.
+func keyColumnStats(key Expr, side Node) *catalog.ColumnStats {
+	cr, ok := key.(*ColumnRef)
+	if !ok {
+		return nil
+	}
+	return columnStatsForChildBase(cr.Index, side)
+}
+
+// rightExprStats is `rightExprNDistinct`'s whole-row twin, and repeats its
+// coordinate shift for the same reason: a RIGHT-side operand's `Index` counts
+// from the start of the merged left‖right schema. The two must agree on which
+// column they are describing — reading nd from one column and the MCV list of
+// another is the P5.6-e-ii/-e-iii defect class in a new place.
+func rightExprStats(j *Join, key Expr) *catalog.ColumnStats {
+	cr, ok := key.(*ColumnRef)
+	if !ok || j.Left == nil {
+		return nil
+	}
+	idx := cr.Index
+	if lw := len(j.Left.Output()); lw > 0 && idx >= lw {
+		idx -= lw
+	}
+	return columnStatsForChildBase(idx, j.Right)
+}
+
+func columnStatsForChildBase(idx int, child Node) *catalog.ColumnStats {
+	if ref, ok := resolveBaseColumn(idx, child); ok {
+		return ref.stats
+	}
+	return nil
 }
 
 // rightExprNDistinct resolves a RIGHT-side operand's ndistinct in the

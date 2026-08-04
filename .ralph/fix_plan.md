@@ -7336,15 +7336,66 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       construction. Resume: run the sweep twice at this commit and once at
       `HEAD~1` and see whether the TIMEOUT hops without a code change.
       Ledger row dated 2026-08-04.
-- [ ] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
-      factor.** With a truthful ndistinct the no-MCV branch's `nd1 <= nd2`
-      test succeeds on real data, the match fraction is exactly 1.0, and
-      JOIN_ANTI's `outer · (1 - jselec)` floors at 1: Q21 final ANTI 4003×
-      under (audit violation), Q19 131× under, Q16 85× under. Upstream takes
-      the MCV arm first and estimates only the uncertain remainder;
-      `columnStatsForChild` already resolves a join-level column to its base
-      MCV list, so the matcher has its inputs. 09 §5.4; ledger row dated
-      2026-08-04. Bar: UNITS + DS05 + audit run.
+- [x] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
+      factor.** Both landed verbatim from selfuncs.c in
+      `internal/planner/cardinality.go`: the matched-MCV frequency mass is
+      exact, the nd heuristic prices only the uncertain remainder with both
+      distinct counts discounted by the match count, the inner list is
+      truncated to the clamped `nd2`, each inner MCV is consumed once, and
+      `CLAMP_PROBABILITY` guards both terms. Statistics are read through
+      `resolveBaseColumn` (which now publishes the whole `*catalog.ColumnStats`)
+      rather than `columnStatsForChild`, so the match fraction cannot depend on
+      which scan the planner picked. 13 tests.
+      **Measured NO-OP on TPC-H** — violations 2 → 2, both bit-identical; every
+      other joinrel moved under 5 % in both directions on INNER joins this
+      change cannot reach, which is ANALYZE's sampling noise and is now the
+      documented noise floor for the instrument. A no-op is indistinguishable
+      from a broken wire, so both halves were proven on real data with the same
+      binary: **20 → 5 010 against an actual 5 010** once the inner has an MCV
+      list (uniform data gets none — upstream discards a list whose values are
+      not more common than average), and **1 000 → 750 against an actual 750**
+      at 25 % outer nulls. TPC-H's near-uniform surrogate keys and NOT NULL
+      join columns cannot exercise either.
+      **The finding that reframes the milestone: the premise was wrong, and the
+      oracle says so.** Both violations were re-measured on the PG 18.3
+      reference. Q21's ANTI — **PG estimates `rows=1` too** against the same
+      actual 4003: `neqjoinsel` returns `1 - nullfrac` for SEMI/ANTI by
+      documented design, and the eq clause is a self-join on
+      `lineitem.l_orderkey` so `nd1 = nd2` in every branch including the new
+      one. Closing it means diverging from PG; it is an audit override, not an
+      estimator task. Q18's SEMI is a real divergence of another mechanism —
+      PG dedups the `GROUP BY`-unique subquery to an INNER join (117 159 est)
+      while goopg keeps the SEMI and lands on the **0.5 punt** (2 998 620 =
+      exactly half the outer) because `resolveBaseColumn` has no
+      `*HashAggregate` arm. And at 1 674× on Q18 **PG itself trips the audit's
+      1 000× tripwire**, so the absolute factor is the wrong acceptance bar for
+      a PG-parity milestone. Q19's `d1` is an INNER join and was never this
+      item's; Q16 moved 1397 → 1401 (noise). Successors P5.6-g-ii / -g-iii.
+      2 ledger rows. IMPLEMENTATION-TODO P5.6-g; 09 §5.7.
+      Bar met: UNITS + SPOT (Q12=2, Q13=35) + audit run + the two real-data
+      probes. **DS05 NOT RUN** — the gate self-refuses while the nightly CI
+      batch holds the host (`FATAL: the nightly CI batch is running`), and the
+      batch was mid-run with a wedged testport stage for this loop's whole
+      duration. Carried in `.ralph/working_set.md` with the exact command.
+- [ ] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g.** Carried, not skipped:
+      `scripts/tpcds-sf05-regression.sh sweep` on a host the nightly batch is
+      not holding. It matters here specifically because TPC-DS, unlike TPC-H,
+      has nullable join keys, so `(1 - nullfrac1)` can move estimates and
+      therefore plan shape there even though it moved nothing on TPC-H.
+- [ ] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
+      `resolveBaseColumn` (joinkeyproof.go) resolves no column through an
+      aggregate, so Q18's SEMI has no `nd2` and punts at 0.5. The arm ALONE
+      measures worse (nd2 = 1 210 559 against nd1 = 1 500 000 → 4.84 M, up from
+      2.99 M); it pays off only with the other half — PG's dedup of a
+      `GROUP BY`-unique subquery into a plain INNER join with a unique inner.
+      Both halves together, as with P5.6-f. Bar: UNITS + DS05 + audit run.
+- [ ] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
+      A Q21 per-query override in `internal/estimateaudit` beside Q9's (PG is
+      equally "wrong" there, by design), and 09 §4's ratchet restated as
+      per-joinrel parity against the PG 18.3 reference rather than an absolute
+      factor — PG trips the current 1 000× tripwire on Q18 at 1 674×. Without
+      this, P5.9 cannot pass without diverging from PG. Ledger row dated
+      2026-08-05. Bar: UNITS + an audit run that reports the parity column.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).

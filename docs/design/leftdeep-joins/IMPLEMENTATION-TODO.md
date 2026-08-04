@@ -933,9 +933,32 @@
   runtime regressions, stream 546.8 s → 445.1 s (0.81×). Two ledger rows
   (uncovered-edge selectivity; the coordinate space fixed at the reader, not
   the writer). PLAN re-pinned to `plan_snapshots/m0127-p56fii.txt`.
-- [ ] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor;
-  closes the SEMI/ANTI `est=1` collapse (Q21 4003× under is an audit
-  violation). Bar: UNITS + DS05 + audit run.
+- [x] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor.
+  **DONE 2026-08-05** — both arms landed verbatim from selfuncs.c (matched-MCV
+  mass exact, nd heuristic on the discounted remainder only, `CLAMP_PROBABILITY`,
+  the factor on every branch incl. the punt), reading statistics through
+  `resolveBaseColumn` rather than `columnStatsForChild` so the answer does not
+  depend on which scan the planner picked. 13 tests.
+  **Measured no-op on TPC-H** (violations 2 → 2, bit-identical; everything else
+  inside ANALYZE's ±5 % sampling noise), and both halves separately proven on
+  real data: 20 → 5 010 against actual 5 010 when the inner has an MCV list,
+  1 000 → 750 against actual 750 at 25 % outer nulls.
+  **The premise was wrong, and the oracle says so** (09 §5.7): PG 18.3
+  estimates `rows=1` for Q21's anti-join too — `neqjoinsel` returns
+  `1 - nullfrac` for SEMI/ANTI by design — so Q21 is an audit override, not an
+  estimator defect; and Q18's SEMI is the **0.5 punt** caused by a missing
+  `*HashAggregate` arm in `resolveBaseColumn`, which neither new arm reaches.
+  Successors **P5.6-g-ii** / **P5.6-g-iii**. Bar met: UNITS + SPOT + audit run
+  + two real-data probes. DS05 blocked by the live nightly batch (the gate
+  self-refuses); carried.
+- [ ] **P5.6-g-ii** the `*HashAggregate` arm for `resolveBaseColumn`, and Q18's
+  real shape: PG dedups a `GROUP BY`-unique subquery and joins it as an INNER
+  rel (117 159 est) where goopg keeps a SEMI and punts at 0.5 (2 998 620).
+  Bar: UNITS + DS05 + audit run.
+- [ ] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
+  equally wrong there, by design), and §4's ratchet restated as per-joinrel
+  parity against the PG 18.3 reference rather than an absolute factor — PG
+  trips the current 1 000× tripwire on Q18 at 1 674×.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

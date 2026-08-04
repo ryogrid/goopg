@@ -453,6 +453,64 @@ intended outcome — and is 22/22 MATCH against the re-pinned
 
 **P5.9 can now certify Q9's ≤ 10² runtime bar as well as its cardinality.**
 
+### 5.7 The semi-join arms completed, and what the two violations actually are, 2026-08-05 (P5.6-g)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56g.txt`, `-README.md`. Same
+cluster and schema as §5.5/§5.6.
+
+Landed in `internal/planner/cardinality.go` (+ `joinkeyproof.go` publishing the
+whole statistics row): `eqjoinsel_semi`'s **MCV arm** — match the two MCV lists,
+take the matched frequency mass as exact, and run the nd heuristic only on the
+uncertain remainder with both distinct counts discounted by the match count —
+and the **`(1 - nullfrac1)` factor** on every branch including the 0.5 punt.
+`CLAMP_PROBABILITY` came with them. 13 tests.
+
+**Result: a measured no-op on TPC-H.** Violations 2 → 2, both bit-identical;
+every other joinrel moved under 5 %, in both directions, on INNER joins this
+change cannot reach — ANALYZE's sampling noise between runs, which is now the
+documented noise floor for reading this instrument.
+
+**A no-op is indistinguishable from a broken wire until you separate them.**
+Both halves were probed on a throwaway cluster with the same binary, varying
+only the data: a semi-join whose inner has an MCV list estimates **5 010 against
+an actual 5 010**, and the identical join whose inner ANALYZE gave no MCV list
+(uniform data — upstream discards a list whose values are not more common than
+average) estimates **20**. A 25 %-NULL outer key estimates **750 against an
+actual 750** where it previously said 1 000. The mechanism works; TPC-H's
+near-uniform surrogate keys and NOT NULL join columns cannot exercise it.
+
+**The finding that reframes the milestone: neither violation belongs to this
+item, and one of them is not a defect.** Both were re-measured against the PG
+18.3 reference (port 65432, same dataset), which nobody had done:
+
+- **Q21's ANTI — PG 18.3 estimates `rows=1` too**, against the same actual of
+  4 003. `neqjoinsel` (selfuncs.c) does not price a `<>` clause through
+  `eqjoinsel` for `JOIN_SEMI`/`JOIN_ANTI` at all; it returns `1 - nullfrac` by
+  documented design. The eq clause is a self-join on `lineitem.l_orderkey`, so
+  `nd1 = nd2` and every branch — including the new MCV one, whose
+  `uncertainfrac` is then exactly 1.0 — returns 1.0, and `outer · (1 - jselec)`
+  floors at one row in both engines. **Closing this would mean diverging from
+  PG.** It is an audit-override, not an estimator task.
+- **Q18's SEMI is a real divergence of a different mechanism.** PG never plans
+  it as a semi-join: `GROUP BY l_orderkey` makes the subquery unique on the
+  join key, so PG dedups to a plain inner join and estimates 117 159 (1 674×
+  over). goopg keeps the SEMI and lands on the **0.5 punt** — `5 997 241 × 0.5`
+  exactly — because `resolveBaseColumn` has no `*HashAggregate` arm and the
+  inner's 1 210 559-row estimate is far above `defaultNumDistinct`, so the
+  clamp never rescues `nd2`. Neither new arm participates.
+
+**Consequence for §4 and P5.9: at 1 674× PG itself trips this audit's 1 000×
+tripwire on Q18.** An absolute factor is the wrong bar for a PG-parity
+milestone; the ratchet P5.9 certifies should be per-joinrel parity against the
+reference, with the absolute tripwire kept only as a coarse tripwire. Filed as
+**P5.6-g-ii** (the `*HashAggregate` arm and Q18's dedup-to-inner shape) and
+**P5.6-g-iii** (the Q21 override + the parity bar).
+
+DS05 could not run: the gate self-refuses while the nightly CI batch holds the
+host (`FATAL: the nightly CI batch is running`), and the batch was mid-run with
+a wedged testport stage for this loop's whole duration. Carried, with the exact
+command, in `.ralph/working_set.md`.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

@@ -1,40 +1,54 @@
-(idle — nothing in flight)
+Task: M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + `(1 - nullfrac1)`. Code is
+DONE, documented and committed; ONE gate is carried (see In-flight).
 
-M0127-P5.6-f-ii is DONE, gated and committed.
+Files: internal/planner/cardinality.go (`semiPairMatchFraction`,
+`clampProbability`, `keyColumnStats`, `rightExprStats`,
+`columnStatsForChildBase`); joinkeyproof.go (`baseColumnRef.stats`);
+cardinality_semimcv_test.go (13 tests, new).
 
-Two things the next loop should NOT re-derive:
+Three things the next loop should NOT re-derive:
 
-1. **A `joinEdge`'s key `ColumnRef.Index` is in GLOBAL FROM-list coordinates**,
-   not table-relative. Q5's `c_nationkey` arrives as `Index: 16` against an
-   8-column `customer`. This loop fixed it at the READER (`edgeColName` now
-   prefers the NAME, `accurateKeyDistinct` resolves via `tableColumnIndex`);
-   the WRITER still emits the global index and nothing marks it. Ledger row
-   dated 2026-08-05 — the next reader to index a per-column slice with it
-   reproduces the defect silently.
-2. **The plan-shape baseline was re-pinned** to
-   `plan_snapshots/m0127-p56fii.txt` (19/22 diverged from `m0127-p21-hashkeys`
-   by design; every divergence verified neutral-or-faster by wall time). Any
-   plan-gate diff against an older snapshot is comparing across planners.
-   P5.9's §4 ratchet baseline supersedes it at the flag flip.
+1. **PG 18.3 estimates `rows=1` for Q21's anti-join too**, against the same
+   actual 4003 — measured on the reference cluster, not inferred.
+   `neqjoinsel` returns `1 - nullfrac` for SEMI/ANTI by design. Q21 is an
+   AUDIT-OVERRIDE task (P5.6-g-iii), not an estimator one. And PG's Q18
+   estimate is 1674× over, which trips this audit's own 1000× tripwire — the
+   absolute factor is the wrong bar for a PG-parity milestone.
+2. **Q18's SEMI est=2 998 620 is the 0.5 punt** (exactly half the outer). Cause:
+   `resolveBaseColumn` has no `*HashAggregate` arm → nd2 unknown, and the
+   inner's 1 210 559-row estimate is far above `defaultNumDistinct` so the
+   clamp never fires. The arm ALONE measures worse (4.84 M); it needs Q18's
+   dedup-to-INNER shape with it (P5.6-g-ii).
+3. **The audit's noise floor is ±5 %** — two runs re-ANALYZE and resample, so
+   INNER joins this change cannot reach moved by up to 5 % in both directions.
+   A SEMI/ANTI delta under that is not evidence.
 
-Estimate-audit baseline for the next loop:
-`analysis/leftdeep-joins/2026-08-05-p56fii.txt` (+ `-README.md`). The rejected
-half-fix is kept beside it as `-halfway.txt` and is the argument for why a
-partially truthful estimator is a new defect rather than half a fix.
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56g.txt` + `-README.md` (§2 has
+the two real-data probes that separate "no-op" from "broken wire": 20 → 5 010
+vs actual 5 010 with an inner MCV list; 1 000 → 750 vs actual 750 at 25 %
+nulls).
 
-Next in the M0127 order (the banner selects, not this note): **P5.6-g** —
-`eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor, which owns both
-remaining audit violations (Q18 SEMI 42837× over, Q21 ANTI 4003× under).
-P5.6-f-iii (the DS05 TIMEOUT attribution) is still open and still needs two
-sweeps, not a code fix — note that Q47 stayed the victim this sweep.
+Next step: per the banner, the next M0127 item. **M0127-P5.6-g-i (the carried
+DS05 run) should go first** — it is one command and it gates nothing else.
+P5.6-f-iii is still open and still needs two sweeps, not a code fix.
 
-Gates run: build + vet + gofmt-clean; planner `go test` PASS; UNITS PASS
-(`/tmp/units_p56fii.log`); SPOT PASS Q12=2 Q13=35 (`/tmp/spot_p56fii.log`);
-DS05 PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 (Q47) SKIP=4
-(`/tmp/ds05_p56fii.log`); PLAN 22/22 MATCH after re-pin; estimate audit
-(violations 2 → 2, Q9 measured); pgbench smoke via the commit hook.
+Gates run: build + vet + gofmt-clean; planner `go test` PASS (13 new);
+UNITS PASS (`/tmp/units_p56g.log`); SPOT PASS Q12=2 Q13=35
+(`/tmp/spot_p56g.log`); estimate audit run (violations 2 → 2, bit-identical —
+the intended reading, see above); PG 18.3 oracle cross-check on Q18/Q21;
+pgbench smoke via the commit hook.
 
 Nightly triage: the same 17 `AI-20260804-005028-*` subjects, all already filed
-under M-NIGHTLY. Nothing new to file.
+under M-NIGHTLY. Nothing new to file. Live observation worth keeping: the
+2026-08-05 batch wedged in `testport` (hash_index timeout → cluster restart →
+no log output for 100+ min) with two orphaned `goopg` processes at 335 % and
+80 % CPU — that is AI-...-017 `suite-wedge` reproducing, and it is what blocked
+DS05 below.
 
-In-flight: none.
+In-flight: `scripts/tpcds-sf05-regression.sh sweep` NEVER STARTED — it exits
+rc=1 immediately with `FATAL: the nightly CI batch is running (ci/batch) — its
+TPC-H stage saturates CPU/RAM for hours and would contaminate these timings
+(FORCE=1 to override)`. No PID, no partial log. Re-run it (filed as
+M0127-P5.6-g-i) once `pgrep -f ci/batch/run-nightly` is empty; expected
+PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4. It matters for THIS
+change because TPC-DS has nullable join keys where TPC-H has none.

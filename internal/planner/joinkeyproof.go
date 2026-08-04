@@ -91,6 +91,18 @@ type baseColumnRef struct {
 	// ndistinct is the column's ANALYZE distinct count, 0 when unavailable —
 	// what `columnNDistinctForChild` publishes.
 	ndistinct int64
+	// stats is the column's whole pg_statistic-equivalent row (nil when the
+	// relation was never ANALYZEd), carried so a caller that needs a slot
+	// this struct does not flatten — the MCV list and the null fraction,
+	// which M0127-P5.6-g's `eqjoinsel_semi` MCV arm reads — does not have to
+	// go through `columnStatsForChild` to get it.
+	//
+	// That distinction is the point: `columnStatsForChild` is the third
+	// member of the resolver family described on `resolveBaseColumn`, and it
+	// is the one still missing the `*IndexScan` arm. Reading MCVs through it
+	// would make a semi-join's match fraction depend on whether the planner
+	// happened to pick an index scan for the input. Reading them here cannot.
+	stats *catalog.ColumnStats
 }
 
 // resolveBaseColumn walks a child plan tree to the base relation behind the
@@ -190,6 +202,7 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 		}
 		if idx < len(tbl.Stats.Columns) {
 			ref.ndistinct = tbl.Stats.Columns[idx].NDistinct
+			ref.stats = &tbl.Stats.Columns[idx]
 		}
 	}
 	return ref, true
