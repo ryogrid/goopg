@@ -190,6 +190,130 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 	return baseColumnRef{}, false
 }
 
+// groupUniqueNDistinct is `examine_simple_variable`'s GROUP-BY / DISTINCT arm
+// (selfuncs.c) followed by `get_variable_numdistinct`'s `isunique` branch
+// (selfuncs.c:6338) — the ONLY thing upstream is willing to learn about a
+// column that comes out of a grouped subquery.
+//
+// M0127-P5.6-g-ii. The item was filed as "the `*HashAggregate` arm for
+// `resolveBaseColumn`", and the reason the arm as filed measured WORSE is that
+// upstream does not have it. `examine_simple_variable`, having walked into a
+// subquery RTE, reaches:
+//
+//	/* The same idea as with DISTINCT clause works for a GROUP-BY too */
+//	if (subquery->groupClause)
+//	{
+//	    if (list_length(subquery->groupClause) == 1 &&
+//	        targetIsInSortList(ste, InvalidOid, subquery->groupClause))
+//	        vardata->isunique = true;
+//	    /* cannot go further */
+//	    return;
+//	}
+//
+// — it propagates UNIQUENESS and refuses to propagate STATISTICS. Grouping
+// mashes the underlying column's distribution beyond recognition (the MCV list
+// and the histogram describe the pre-grouping multiset), but it cannot destroy
+// the fact that one row survives per distinct group value. A resolver arm that
+// handed the base column's `ndistinct` and `stats` up through the aggregate
+// would be answering with the wrong relation's distribution, which is the
+// P5.6-e-ii defect class in a new place. This function therefore does not
+// return a `baseColumnRef` at all: there is no base column to return.
+//
+// What upstream then does with `isunique` is the second half:
+//
+//	if (vardata->isunique)
+//	    stadistinct = -1.0 * (1.0 - stanullfrac);
+//
+// A negative `stadistinct` is a FRACTION of the relation's rows, so the answer
+// is `rel->tuples · (1 - nullfrac)`, and `stanullfrac` is 0 here because there
+// is no statistics tuple (upstream returned before finding one). The distinct
+// count of the grouped output is therefore exactly its row count — which is the
+// truth, not a heuristic: `GROUP BY c` emits one row per distinct `c`.
+//
+// The row count is this subtree's own `EstimateRows`, which is upstream's
+// `vardata->rel->tuples` — the SUBQUERY relation's size,
+// i.e. after its HAVING qual. That is what makes this arm carry a restriction
+// on the inner side into a semi-join estimate: Q18's inner is
+// `lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 313`, whose HAVING is
+// a `*Filter` above the `*Aggregate`, and the filter's selectivity reaches the
+// join only through this number.
+//
+// The single-grouping-column restriction is upstream's and is load-bearing, not
+// conservatism: with two grouping columns neither one is unique on its own
+// (Q20's `GROUP BY ps_partkey, ps_suppkey` is exactly that shape), so the
+// counting argument does not exist.
+// The structural walk runs BEFORE `EstimateRows`, not after: this is called
+// from `columnNDistinctForChild`, which the join search runs on every candidate
+// pair, and an unconditional `EstimateRows` would re-walk the whole child
+// subtree on every coordinate that resolves to no base column at all.
+func groupUniqueNDistinct(idx int, child Node) (int64, bool) {
+	if !resolvesToGroupUniqueColumn(idx, child) {
+		return 0, false
+	}
+	rows := EstimateRows(child)
+	if rows <= 0 {
+		return 0, false
+	}
+	return rows, true
+}
+
+// resolvesToGroupUniqueColumn walks the same wrapper arms `resolveBaseColumn`
+// walks — the two must agree about which node a coordinate lands on, or they
+// would be describing different columns (hard-won rule #2) — and reports
+// whether the coordinate lands on the sole grouping/DISTINCT key of a node that
+// makes it unique.
+//
+// It deliberately does NOT recurse through `*Join`: upstream's comment on the
+// recursive call says so ("even if the underlying column is unique, the
+// subquery may have joined to other tables in a way that creates duplicates"),
+// and a join below a grouping node is on the far side of the grouping anyway.
+func resolvesToGroupUniqueColumn(idx int, child Node) bool {
+	switch x := child.(type) {
+	case *Filter:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *Sort:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *Limit:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *LockRows:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *Gather:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *GatherMerge:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *CTEScan:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *Project:
+		if idx >= 0 && idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return resolvesToGroupUniqueColumn(cr.Index, x.Child)
+			}
+		}
+	case *Aggregate:
+		// `Aggregate`'s output is [group exprs..., aggregate calls...,
+		// passthrough...], so the sole grouping column is output index 0 —
+		// `targetIsInSortList(ste, InvalidOid, subquery->groupClause)` with a
+		// one-element groupClause. A partial/final split does not change which
+		// output column the grouping key is, but a PARTIAL node's rows are one
+		// worker's share rather than the group count, so only a whole-input
+		// aggregate can answer.
+		return x.Mode != AggModePartial && len(x.GroupExprs) == 1 && idx == 0
+	case *Distinct:
+		// The DISTINCT half of the same upstream test: `list_length(
+		// subquery->distinctClause) == 1`. goopg's `*Distinct` is whole-row
+		// over its output schema, so "exactly one DISTINCT column" is a
+		// one-column output.
+		return len(x.Output()) == 1 && idx == 0
+	case *DistinctOn:
+		// "We do the test this way so that it works for cases involving
+		// DISTINCT ON" — `SELECT DISTINCT ON (a) a, b` has a one-element
+		// distinctClause naming `a`, so `a` is unique in the output while `b`
+		// is not. `KeyCols` is that clause in goopg's coordinates.
+		return len(x.KeyCols) == 1 && x.KeyCols[0] == idx
+	}
+	return false
+}
+
 // baseColumnOfTable is the leaf arm shared by the two scan node types.
 func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) (baseColumnRef, bool) {
 	if tbl == nil || idx < 0 || idx >= len(tbl.Columns) {

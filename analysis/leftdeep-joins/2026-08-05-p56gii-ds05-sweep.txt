@@ -1,0 +1,118 @@
+# TPC-DS SF0.5 goopg sweep — 2026-08-05T06:52:58+09:00
+# goopg: 483f6ca4 planner(gate): M0127-P5.6-g-i-b — the 74 plans the SF0.5 gate changed in silence now have a column
+# engine-id: 15341dd6c8d3050bf8e9ab0a020784095312c81c 5e51b46d60fb641e1b3a5bb1ded2d95595441f2d  diff=08cdd807545d
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=45f0744a3046c554 on-disk=45f0744a3046c554 (/home/ryo/work/goopg/goopg/tmp/goopg-sf05-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+Q1   PASS        1s      100 rows  ck=n/a
+Q2   PASS       13s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        1s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   PASS       19s      100 rows  ck=n/a
+Q6   PASS        4s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS        8s      100 rows  ck=n/a
+Q8   PASS        8s        0 rows  ck=1f18d650d205d71d
+Q9   PASS       68s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       19s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       11s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        3s      100 rows  ck=n/a
+Q13  PASS       22s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  PASS      155s      200 rows  ck=n/a
+Q15  PASS        2s      100 rows  ck=n/a
+Q16  PASS       11s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       12s        0 rows  ck=1f18d650d205d71d
+Q18  PASS       67s      100 rows  ck=n/a
+Q19  PASS        7s      100 rows  ck=n/a
+Q20  PASS        4s      100 rows  ck=n/a
+Q21  PASS        2s      100 rows  ck=n/a
+Q22  PASS       18s      100 rows  ck=n/a
+Q23  PASS       78s        1 rows  ck=00f53003bda23764
+Q24  PASS       15s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       15s        0 rows  ck=1f18d650d205d71d
+Q26  PASS        7s      100 rows  ck=n/a
+Q27  PASS       29s      100 rows  ck=n/a
+Q28  PASS       42s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       12s        0 rows  ck=1f18d650d205d71d
+Q30  PASS        0s       31 rows  ck=f47a48499fd7e070
+Q31  PASS       13s       19 rows  ck=2a74acfb556c21a7
+Q32  PASS        1s        1 rows  ck=a55f36d3bf196bce
+Q33  PASS       13s      100 rows  ck=n/a
+Q34  PASS        8s      187 rows  ck=c83808417d7a81d8
+Q35  PASS       19s      100 rows  ck=n/a
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS        7s        0 rows  ck=1f18d650d205d71d
+Q38  PASS       17s        1 rows  ck=6f66a76c23e12a63
+Q39  PASS       22s       77 rows  ck=4db806a9a11fddfd
+Q40  PASS        2s      100 rows  ck=n/a
+Q41  PASS       11s        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        1s       10 rows  ck=5004612d9b837c34
+Q43  PASS        2s        6 rows  ck=b70a4026e9b9bb04
+Q44  PASS       24s       10 rows  ck=d76f8301addaff98
+Q45  PASS        4s        7 rows  ck=e09cf591997524ad
+Q46  PASS        8s      100 rows  ck=n/a
+Q47  TIMEOUT   329s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q48  PASS       23s        1 rows  ck=9a9ece15cb525a79
+Q49  PASS       16s       25 rows  ck=ccb0983b810cf1d0
+Q50  PASS       10s        6 rows  ck=3928ecee672e3992
+Q51  PASS       12s      100 rows  ck=n/a
+Q52  PASS        1s      100 rows  ck=n/a
+Q53  PASS        7s      100 rows  ck=n/a
+Q54  PASS       93s        0 rows  ck=1f18d650d205d71d
+Q55  PASS        2s       73 rows  ck=46d35b957845db41
+Q56  PASS       13s      100 rows  ck=n/a
+Q57  PASS       84s      100 rows  ck=n/a
+Q58  PASS       14s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       16s      100 rows  ck=n/a
+Q60  PASS       17s      100 rows  ck=n/a
+Q61  PASS       13s        1 rows  ck=4766027020fae308
+Q62  PASS        3s      100 rows  ck=n/a
+Q63  PASS       10s      100 rows  ck=n/a
+Q64  PASS       34s        2 rows  ck=31f0342ff9d55c4a
+Q65  PASS       14s      100 rows  ck=n/a
+Q66  PASS        7s        5 rows  ck=f6613897dd73709a
+Q67  PASS       78s      100 rows  ck=n/a
+Q68  PASS       11s      100 rows  ck=n/a
+Q69  PASS       15s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       17s      580 rows  ck=521a7af7606d10c1
+Q72  PASS      161s      100 rows  ck=n/a
+Q73  PASS        7s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       14s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       16s      100 rows  ck=n/a
+Q76  PASS       17s      100 rows  ck=n/a
+Q77  PASS       14s       44 rows  ck=2afe8ddcd18fad9c
+Q78  PASS       17s       45 rows  ck=8f67acff3895183f
+Q79  PASS       11s      100 rows  ck=n/a
+Q80  PASS       14s      100 rows  ck=n/a
+Q81  PASS        1s      100 rows  ck=n/a
+Q82  PASS       10s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        7s        3 rows  ck=9504298446f22ddc
+Q84  PASS        3s        6 rows  ck=073898a18264bd8e
+Q85  PASS        4s        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       14s        1 rows  ck=b363a9287bdd0920
+Q88  PASS       57s        1 rows  ck=272de7cd629d9033
+Q89  PASS        7s      100 rows  ck=n/a
+Q90  PASS        4s        1 rows  ck=66ceccaa8ce9d2cf
+Q91  PASS        3s        1 rows  ck=88b9d5fffed589f8
+Q92  PASS        1s        1 rows  ck=26c02866b1827f1b
+Q93  PASS        2s        0 rows  ck=1f18d650d205d71d
+Q94  PASS        4s        1 rows  ck=04afc1b69831a5ea
+Q95  PASS       12s        1 rows  ck=e498634c02595c29
+Q96  PASS        2s        1 rows  ck=5923f3c62773e705
+Q97  PASS       11s        1 rows  ck=65725195ebe13a3b
+Q98  PASS        6s     2128 rows  ck=be1b9a6d08cb1a3d
+Q99  PASS       11s       90 rows  ck=b10fd5001836fcfb
+
+=== SUMMARY: PASS=94 (57 ck-verified, 37 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+
+# plan-diff: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-064051.txt -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-065245.txt
+#   old: 483f6ca4 planner(gate): M0127-P5.6-g-i-b — the 74 plans the SF0.5 gate changed in silence now have a column
+#   new: 483f6ca4 planner(gate): M0127-P5.6-g-i-b — the 74 plans the SF0.5 gate changed in silence now have a column
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+# plan shapes identical (noise floor is zero — see header)
+# The plan channel is NON-BLOCKING: it never changes this gate's exit status.

@@ -7471,13 +7471,52 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh`, which is that pass
       in throwaway form. Bar: two consecutive sweeps at the same commit report
       zero plan diffs, and one at a different commit reports the expected set.
-- [ ] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
-      `resolveBaseColumn` (joinkeyproof.go) resolves no column through an
-      aggregate, so Q18's SEMI has no `nd2` and punts at 0.5. The arm ALONE
-      measures worse (nd2 = 1 210 559 against nd1 = 1 500 000 → 4.84 M, up from
-      2.99 M); it pays off only with the other half — PG's dedup of a
-      `GROUP BY`-unique subquery into a plain INNER join with a unique inner.
-      Both halves together, as with P5.6-f. Bar: UNITS + DS05 + audit run.
+- [x] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
+      DONE 2026-08-05, and the item as filed was the wrong half of itself. The
+      arm alone measures worse because **upstream does not have it**:
+      `examine_simple_variable` (selfuncs.c) reaches
+      `if (subquery->groupClause)`, sets `vardata->isunique` when the referenced
+      output is the sole grouping column, and returns "cannot go further"
+      *without* a statistics tuple — what crosses a grouping node is
+      UNIQUENESS, never a distribution (grouping mashes the MCV list and
+      histogram; it cannot destroy one-row-per-group). The consumer is
+      `get_variable_numdistinct`'s negative `stadistinct`, i.e. the grouped
+      relation's own row count. Landed as `resolvesToGroupUniqueColumn` /
+      `groupUniqueNDistinct` (joinkeyproof.go) consumed **only** by
+      `columnNDistinctForChild`; `resolveBaseColumn` still refuses to walk a
+      grouping node and a test pins that MCVs do not leak up. DISTINCT /
+      DISTINCT ON are the same upstream test's other halves.
+      **Q18 42 837× → 24 242×** (2 998 620 → 1 696 939 — the `5 997 241 × 0.5`
+      punt is gone), parity excess vs PG 8.0× → 4.5×. It stays the corpus's one
+      absolute violation, but the residual is now attributable: goopg's
+      `l_orderkey` ndistinct is *more* accurate than PG's (1 210 559 vs
+      ~339 000, truth 1 500 000), which makes its post-HAVING inner 3.6× larger.
+      **The second half was measured INERT, not skipped**:
+      `reduce_unique_semijoins` fires in PG's Q18 plan, but for an inner unique
+      on the join key `inner_rows` = nd2, so the INNER and SEMI formulas agree
+      term for term — it buys join-order freedom, not a number. Ledger row.
+      **Found and fixed what the arm exposed:** `estimateJoin` had no
+      outer-join arm at all — LEFT/RIGHT/FULL took the INNER product and
+      stopped before `calc_joinrel_size_estimate`'s "the output must be at
+      least as large as the non-nullable input"; TPC-DS Q77 estimated 885 rows
+      for a join whose outer alone is 8 885. 12 tests.
+      Bar met: UNITS + **DS05 sweep identical to baseline**
+      (`PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`; 12 of 99
+      plans moved, zero rows; stream 2 116 s → 2 074 s with Q80 41→14 s,
+      Q40 16→2 s, Q78 29→17 s) + audit run (violations 2 → 1, no joinrel
+      worse). Evidence `analysis/leftdeep-joins/2026-08-05-p56gii-*`; doc 09
+      §5.12; IMPLEMENTATION-TODO P5.6-g-ii. 3 ledger rows. Successor:
+      **M0127-P5.6-g-v** below.
+- [ ] **M0127-P5.6-g-v — Q18's residual, which is a HAVING problem.**
+      After P5.6-g-ii the joinrel is 24 242× over and every join-selectivity
+      mechanism in it is now PG-faithful; what is left is the inner's own size.
+      goopg prices `HAVING sum(l_quantity) > 313` at DEFAULT_INEQ_SEL over a
+      group estimate of 1 210 559 (→ ~403 500) where PG lands on 113 141, and
+      the difference is NOT a goopg defect in the usual direction — goopg's
+      `l_orderkey` ndistinct is the more accurate of the two. Establish first
+      whether the gap is the group estimate or the HAVING selectivity (one
+      `EXPLAIN` of the bare subquery on each engine answers it) before touching
+      either. Bar: UNITS + DS05 `plans` + audit run.
 - [x] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
       DONE 2026-08-05. `estimateaudit.Q21AntiJoinMax` (5 000×) beside Q9's bar,
       both now rendering their justification into the artifact instead of being

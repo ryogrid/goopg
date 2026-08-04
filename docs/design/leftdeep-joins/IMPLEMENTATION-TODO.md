@@ -984,10 +984,34 @@
   false positives on any directory change. Evidence
   `analysis/leftdeep-joins/2026-08-05-p56gib-README.md`;
   [09](09-verification-and-acceptance.md) §5.11.
-- [ ] **P5.6-g-ii** the `*HashAggregate` arm for `resolveBaseColumn`, and Q18's
-  real shape: PG dedups a `GROUP BY`-unique subquery and joins it as an INNER
-  rel (117 159 est) where goopg keeps a SEMI and punts at 0.5 (2 998 620).
-  Bar: UNITS + DS05 + audit run.
+- [x] **P5.6-g-ii** the `*HashAggregate` arm for `resolveBaseColumn`, and Q18's
+  real shape. **DONE 2026-08-05** — and the item as filed was the wrong half of
+  itself. The arm alone measures worse because **upstream does not have it**:
+  `examine_simple_variable` (selfuncs.c) hits `if (subquery->groupClause)`, sets
+  `vardata->isunique` when the referenced output is the sole grouping column,
+  and returns "cannot go further" *without* a statistics tuple. What crosses a
+  grouping node is UNIQUENESS, never a distribution. Landed as
+  `resolvesToGroupUniqueColumn` / `groupUniqueNDistinct` consumed only by
+  `columnNDistinctForChild`, with `resolveBaseColumn` still refusing to walk a
+  grouping node and a test pinning that MCVs do not leak up; DISTINCT /
+  DISTINCT ON are the same upstream test's other halves.
+  **Q18 42 837× → 24 242×** (2 998 620 → 1 696 939, the `× 0.5` punt gone),
+  parity excess vs PG 8.0× → 4.5×; still the corpus's one violation, but the
+  residual is now attributable to goopg's *more* accurate `l_orderkey`
+  ndistinct making its post-HAVING inner 3.6× larger than PG's.
+  **`reduce_unique_semijoins` measured INERT** at goopg's join order (for a
+  unique inner, `inner_rows` = nd2 and the INNER and SEMI formulas agree term
+  for term); it buys join-order freedom, not a number — ledger row.
+  **Found and fixed what it exposed: `estimateJoin` had no outer-join arm** —
+  LEFT/RIGHT/FULL took the INNER product and stopped before
+  `calc_joinrel_size_estimate`'s "at least as large as the non-nullable input".
+  Q77 estimated 885 rows for a join whose outer is 8 885. 12 tests.
+  Bar met: UNITS + **DS05 sweep `PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=1 SKIP=4`, identical to baseline** (12 of 99 plans moved, zero rows;
+  stream 2 116 s → 2 074 s, Q80 41→14 s, Q40 16→2 s, Q78 29→17 s) + audit run
+  (violations 2 → 1, no joinrel worse). Evidence
+  `analysis/leftdeep-joins/2026-08-05-p56gii-*`;
+  [09](09-verification-and-acceptance.md) §5.12. 3 ledger rows.
 - [x] **P5.6-g-iii** the audit's bar itself: a Q21 per-query override (PG is
   equally wrong there, by design), and §4's ratchet restated as per-joinrel
   parity against the PG 18.3 reference rather than an absolute factor — PG

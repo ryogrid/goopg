@@ -816,6 +816,78 @@ commit move a plan?", not "is the plan PG's". The second question is §4's
 per-joinrel parity instrument, and the two are deliberately separate — one runs
 on the SF0.5 cluster in 14 s with no PG instance, the other needs the oracle.
 
+### 5.12 What crosses a grouping node, 2026-08-05 (P5.6-g-ii)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p56gii{.txt,.plans.txt,-README.md}`,
+`-ds05-sweep.txt`, `-plans-{before,after}.txt`.
+
+**The item was filed as the wrong half of itself, and the oracle is why.**
+P5.6-g-ii asked for a `*HashAggregate` arm on `resolveBaseColumn`, and §5.7 had
+already measured that the arm alone reads *worse* (Q18 2.99 M → 4.84 M). It
+reads worse because upstream does not have it. `examine_simple_variable`
+(selfuncs.c), inside a subquery RTE, hits `if (subquery->groupClause)`, sets
+`vardata->isunique` when the referenced output is the sole grouping column, and
+returns — "cannot go further" — *without* a statistics tuple. What crosses a
+grouping node upstream is **uniqueness, never a distribution**: grouping mashes
+the underlying column's MCV list and histogram beyond recognition, but it
+cannot destroy the fact that one row survives per distinct group value. The
+consumer is `get_variable_numdistinct`'s `if (vardata->isunique) stadistinct =
+-1.0 * (1.0 - stanullfrac)` — a negative `stadistinct` is a fraction of the
+relation's rows, and `stanullfrac` is 0 because there is no statistics tuple,
+so the answer is the grouped relation's own row count.
+
+Landed accordingly: `resolvesToGroupUniqueColumn` / `groupUniqueNDistinct`
+(joinkeyproof.go), consumed **only** by `columnNDistinctForChild`.
+`resolveBaseColumn` still has no grouping arm and `columnStatsForChildBase`
+still answers nil through one; a test pins that, because handing the base
+column's MCV list up would make `eqjoinsel_semi` take its MCV arm on the wrong
+relation's frequencies — the P5.6-e-ii defect class in a new place. Upstream's
+`list_length(...) == 1` restriction is kept and is load-bearing: with two
+grouping columns the pair is unique but neither column is (Q20's
+`GROUP BY ps_partkey, ps_suppkey`). The DISTINCT / DISTINCT ON halves of the
+same test are the `*Distinct` / `*DistinctOn` arms.
+
+**Q18: 42 837× → 24 242×** (est 2 998 620 → 1 696 939 against an actual 70).
+The old number was `5 997 241 × 0.5` exactly — `eqjoinsel_semi`'s punt, taken
+because `defaultNumDistinct` sat far below the inner's rows so the nd2 clamp
+never fired. Parity excess against PG's own 5 387× drops 8.0× → 4.5×. It
+remains this corpus's one absolute violation, and the residual is now
+attributable rather than mysterious: goopg's `l_orderkey` ndistinct (~1 210 559)
+is *more* accurate than PG's (~339 000, against a truth of 1 500 000), which is
+what makes goopg's post-HAVING inner ~3.6× larger than PG's 113 141. Closing
+the rest is a HAVING-selectivity problem, not a join-selectivity one.
+
+**`reduce_unique_semijoins` was measured inert, not skipped.** PG's Q18 plan
+confirms the SEMI→INNER conversion fires. At goopg's join order it changes no
+number: for an inner unique on the join key, `inner_rows` equals nd2, so
+`outer · inner / max(nd1, nd2)` and `outer · min(1, nd2/nd1)` agree term for
+term. What it buys upstream is join-order freedom — PG joins `orders ⋈ agg`
+first (113 141) where goopg joins `orders ⋈ lineitem` first (5 997 241). Ledger
+row; deferred rather than guessed, because a goopg SEMI `*Join`'s `Output()` is
+left-only and a node-type swap changes the output width of everything above it.
+
+**The defect the arm exposed: `estimateJoin` had no outer-join arm at all.**
+LEFT / RIGHT / FULL took the INNER product — upstream's first line for each of
+them — and stopped before the second, "the output must be at least as large as
+the non-nullable input" (`calc_joinrel_size_estimate`, costsize.c). It was
+unreachable while a LEFT join's key resolved to nothing, because the
+`defaultEqSelectivity` fallback caps at `max(l, r)`. With the keys resolvable,
+TPC-DS Q77's `store LEFT JOIN (… GROUP BY s_store_sk)` estimated 885 rows for a
+join whose outer alone is 8 885. `outerJoinRowFloor` is that clamp, RIGHT
+included (goopg keeps JOIN_RIGHT where upstream has already commuted it, so its
+non-nullable input is the inner).
+
+**DS05: 12 of 99 plans moved, zero rows moved.** `PASS=94 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`, identical to the `ce027cee` baseline
+line for line. Five plans from the grouping arm (joins between grouped CTEs on
+the group key, whose estimate goes from `l` to `min(l, r)`), seven from the
+floor; Q77 moved under the arm and moved *back* once the floor landed. Stream
+2 116 s → 2 074 s with three real wins, all from the floor: **Q80 41 s → 14 s,
+Q40 16 s → 2 s, Q78 29 s → 17 s**. This is the first commit whose plan-shape
+channel (§5.11) was read *before* the sweep rather than after — the 20 s
+capture scoped the blast radius, and caught the Q77 impossibility early enough
+that the floor shipped in the same change.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

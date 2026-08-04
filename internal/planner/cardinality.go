@@ -72,6 +72,13 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	case *Distinct:
 		return EstimateRows(x.Child)
+	case *DistinctOn:
+		// M0127-P5.6-g-ii: another of the pass-through wrappers whose absence
+		// zeroes every estimate above it (the M0125-0038 class documented
+		// below). Neither this nor `*Distinct` is SIZED — upstream runs
+		// `estimate_num_groups` over the DISTINCT clause and goopg does not —
+		// which is a ledgered gap, not this arm's business.
+		return EstimateRows(x.Child)
 	case *WindowAgg:
 		return EstimateRows(x.Child)
 	case *Join:
@@ -490,7 +497,7 @@ func estimateJoin(j *Join) int64 {
 			if rows > sk.rowsBound {
 				rows = sk.rowsBound
 			}
-			return saturateRowEst(rows)
+			return saturateRowEst(outerJoinRowFloor(j, rows, l, r))
 		}
 	}
 	est := scaleByFloat(l*r, defaultEqSelectivity)
@@ -505,7 +512,52 @@ func estimateJoin(j *Join) int64 {
 	if est > mx {
 		est = mx
 	}
-	return est
+	// Upstream applies the outer-join clamp to whatever `jselec` produced, not
+	// only to a measured one, so the unmeasurable fallback gets it too.
+	return saturateRowEst(outerJoinRowFloor(j, float64(est), l, r))
+}
+
+// outerJoinRowFloor is `calc_joinrel_size_estimate`'s outer-join clamp
+// (costsize.c): "the joinqual selectivity has to be clamped using the knowledge
+// that the output must be at least as large as the non-nullable input".
+//
+//	case JOIN_LEFT:  if (nrows < outer_rows) nrows = outer_rows;
+//	case JOIN_FULL:  if (nrows < outer_rows) nrows = outer_rows;
+//	                 if (nrows < inner_rows) nrows = inner_rows;
+//
+// goopg keeps JOIN_RIGHT as its own type where upstream has already commuted it
+// into a JOIN_LEFT, so RIGHT's non-nullable input is the INNER one — the same
+// rule read from the other side.
+//
+// M0127-P5.6-g-ii. `estimateJoin` has never had an outer-join arm: LEFT / RIGHT
+// / FULL fall through to the INNER product, which is upstream's first line for
+// all of them, and the clamp was the missing second line. It stayed invisible
+// because a LEFT join's key column typically resolved to nothing, so the
+// estimate came out of the `defaultEqSelectivity` fallback below, which caps at
+// `max(l, r)` and could not go under the outer's own count by accident. The
+// grouping-node arm above made those keys resolvable, and Q77's
+// `store LEFT JOIN (… GROUP BY s_store_sk)` immediately estimated 885 rows for
+// a join that emits at least its outer's 8 885 — an impossible number, and a
+// pre-existing defect this exposed rather than caused.
+func outerJoinRowFloor(j *Join, rows float64, l, r int64) float64 {
+	switch j.Type {
+	case JoinTypeLeft:
+		if rows < float64(l) {
+			return float64(l)
+		}
+	case JoinTypeRight:
+		if rows < float64(r) {
+			return float64(r)
+		}
+	case JoinTypeFull:
+		if rows < float64(l) {
+			rows = float64(l)
+		}
+		if rows < float64(r) {
+			rows = float64(r)
+		}
+	}
+	return rows
 }
 
 // semiJoinMatchFraction is the fraction of OUTER rows expected to have
@@ -849,9 +901,20 @@ func keyNDistinct(key Expr, side Node) int64 {
 // `*Join` arm each went into ONE of the resolvers first, and both divergences
 // were live defects). The arm-by-arm history is preserved on the arms
 // themselves, where it now lives.
+// M0127-P5.6-g-ii added the second answer `get_variable_numdistinct` knows:
+// a column that resolves to no base relation because a grouping node stands in
+// the way is still UNIQUE in that node's output when it is the sole grouping
+// key, and its distinct count is then the node's own row count. The order is
+// upstream's — `isunique` overrides `stadistinct` ("assume it is unique no
+// matter what pg_statistic says", selfuncs.c:6332) — but the two arms cannot
+// both fire here, because `resolveBaseColumn` has no arm that walks through a
+// grouping node in the first place, deliberately (see `groupUniqueNDistinct`).
 func columnNDistinctForChild(idx int, child Node) int64 {
 	if ref, ok := resolveBaseColumn(idx, child); ok {
 		return ref.ndistinct
+	}
+	if nd, ok := groupUniqueNDistinct(idx, child); ok {
+		return nd
 	}
 	return 0
 }
