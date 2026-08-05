@@ -1,33 +1,45 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-l-ii CLOSED — clause 6 MEASURED and PASSES (09 §3.13).**
-`enum_controls=2/2 enum_controls_oos=1 enum_candidates_offered=2/2` — Q7's
-`{customer+lineitem+n2+orders} ⋈ {n1+supplier}` and Q8's
-`{lineitem+orders+part} ⋈ {customer+n1+region}` were both OFFERED to
-`makeJoinRel` at phase=2, so the divergence is cost/stats, which §4 admits.
-P5.9-l and P5.9-l-ii ticked in fix_plan + IMPLEMENTATION-TODO; 1 ledger row.
+Last loop: **M0127-P5.9-n CLOSED — the post-flip DS05 arm is GREEN** (09 §3.15).
+`PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`, identical
+to run 4; `STATUS-DELTA: verdict-changes=none runtime-moves=0`. P5.9 does not
+reopen. Report `bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260806-022814.txt`.
+Ran 02:28→02:56 (28 min, not ~1 h — the timeout class is empty).
+
+Two things the gate run produced that the gate was not asked for:
+
+1. The plan channel's "changed (33)" was NOT the flip. Its baseline
+   `plans-20260805-222627.txt` is stamped `GOOPG_PGSHAPED_DP=1` — an ON-arm
+   capture — so the 33 measured ON→ON across the -j/-k cost terms.
+2. `sf05_planner_flags_line` kept its pre-flip `unset(off)` label, so every
+   artefact since `b92582fb` states the OPPOSITE of the regime it measured —
+   the exact defect its own comment records happening to `GOOPG_RELSIZE_FALLBACK`
+   at M0125-0005. Fixed (`unset(on)`; `GOOPG_COST_DRIVEN_JOINORDER` →
+   `retired(M0127-P5.9)`). Two artefacts stay mis-stamped and are annotated in
+   09 §3.15 rather than rewritten (untracked run output).
+
+The real blast radius, measured at a FIXED binary (only the flag differs):
+**86 of 99 plans change, 13 identical** (3 of those are the Q36/Q70/Q86 dsqgen
+parse-error blocks → 10 real). 22 differ in join-operator multiset, 64 keep the
+inventory and differ in order/qual placement/estimates. The acceptance bar said
+"nothing changed": true of every result, false of 87% of the plans.
 
 NEXT LOOP (subject to the fix_plan `## Current Priority` banner, which wins):
-with clause 6 discharged, all six acceptance clauses of 09 §4 now read PASS at
-run 4 — the remaining P5.9 step is the **flip decision** for
-`GOOPG_PGSHAPED_DP` (re-run clause 6 alone / attribute, per the P5.9 item).
-Check fix_plan for the successor item before assuming it.
+M0127-P5.9 successors remain — **-m** (collapse-ON acceptance pass, gates the
+COLLAPSE flip), **-o** (EXPLAIN prints no `Join Filter:` line), **-p**
+(searched-arm batch-growth fixture), **-q** (NEW this loop: no test ties a
+provenance label to the default it names — the same mis-stamp has now shipped
+twice).
 
-Two things a later loop may want:
-- a plan-only 22-query sweep is now cheap (`PLAN_ONLY=1 DP_TRACE=1 PGSHAPED=1
-  scripts/tpch-estimate-audit-arm.sh <label>` with no `--queries`); this run
-  swept only §3.11's 3-query candidate set. Ledger row 2026-08-06.
-- the `CROSS-QUERY-LEVEL` **candidate** branch is unit-tested only — no such
-  candidate occurred live.
+Nightly triage filed (unconditional, not selected): tonight's 18 AI items are
+1 EvalPlanQual recurrence (6th night), 3 regress recurrences, and **14 phantom
+testport regressions from ONE compile error** — the nightly built the DIRTY
+tree mid-edit (`s.traceFailed undefined`, added by `bf52391e` minutes later).
+`go build ./...` is clean at HEAD. Filed as a new M-NIGHTLY harness item.
 
-Gates run: `go build ./...`; `go vet` (cmd/estimate-audit, internal/estimateaudit);
-`go test ./internal/estimateaudit/ ./internal/planner/` PASS;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` no FAIL;
-pgbench smoke via the commit hook; `make ralph-state-guard` OK (auto-repaired).
-No planner/executor behaviour change (the trace gate stays off by default and
-`--plan-only` is a tool flag), so no spotcheck/DS05 arm.
+Gates run: `go build ./...`; `go vet ./internal/planner/`; `bash -n` on the
+gate script; **TPC-DS SF0.5 sweep PASS**; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (rc=0); pgbench smoke via the commit
+hook; `make ralph-state-guard` (INCONSISTENT → auto-REPAIRED → OK).
 
-In-flight: none. The measurement arm ran to completion in ~4 min beside the
-nightly CI batch — legitimately, because `PLAN_ONLY=1` executes nothing and
-records no timing (see the arm script's PLAN_ONLY header note). The throwaway
-server was stopped by the script's own trap.
+In-flight: none.

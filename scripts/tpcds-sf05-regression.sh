@@ -619,13 +619,25 @@ sf05_status_delta_channel() {
 # gate was first used as an ARM of a planner A/B (09 §3 clause 4). Without them
 # a flag-ON sweep is byte-indistinguishable from a flag-OFF one — precisely the
 # failure this function exists to prevent, one flag generation later.
+#
+# M0127-P5.9-n (2026-08-06) then walked straight into the RELSIZE defect the
+# paragraph above describes, one flag generation later still. The DP flip
+# (`b92582fb`) made `GOOPG_PGSHAPED_DP` default-ON with `=0` as the opt-out, and
+# the `unset(off)` label survived it — so every artefact captured between the
+# flip and this fix (`sweep-20260806-022814.txt`, `plans-20260806-022814.txt`)
+# states the OPPOSITE of the regime it measured. The label is now `unset(on)`.
+# Same commit retired `GOOPG_COST_DRIVEN_JOINORDER` entirely: no code reads it
+# any more (`internal/planner/bushy.go:13`), so printing it as a live flag
+# invited a later loop to A/B a variable the binary cannot see. It is stamped
+# `retired` rather than dropped, because dropping it would make old artefacts
+# that DO carry it look like they were captured by this version of the gate.
 sf05_planner_flags_line() {
     printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s GOOPG_PGSHAPED_DP=%s GOOPG_PGSHAPED_COLLAPSE=%s\n' \
         "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
-        "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
+        "retired(M0127-P5.9)" \
         "${GOOPG_MEMOIZE:-unset(on)}" \
         "${GOOPG_PARALLEL:-unset(on)}" \
-        "${GOOPG_PGSHAPED_DP:-unset(off)}" \
+        "${GOOPG_PGSHAPED_DP:-unset(on)}" \
         "${GOOPG_PGSHAPED_COLLAPSE:-unset(off)}"
 }
 

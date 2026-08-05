@@ -157,8 +157,9 @@ descend:
 	// same claim (03 §10's build-mode assertion, widened from the boundary
 	// node in P5.5-f-i to the tree it guards).
 	//
-	// Inert today: `GOOPG_PGSHAPED_DP` is OFF, nothing calls the search
-	// from tryBushyDP, so splicedSearchedRoot never finds a tagged root.
+	// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` is ON by
+	// default, so splicedSearchedRoot DOES find tagged roots in production
+	// and both assertions below run on real plans.
 	if splicedSearchedRoot(newTarget) != nil {
 		assertSpineConsumesIdentityBoundaryMap(oldSchema, newSchema)
 		assertEnclosingTreeColumnRefs("pinned-spine enclosing tree", newRoot)

@@ -1094,7 +1094,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       fix (checked item above) did not hold: FAILed in nightly runs 20260801,
       `20260802-014405`, and `20260803-013955`
       (AI-20260802-014405-001, AI-20260803-013955-003,
-      AI-20260804-005028-001, AI-20260805-014309-001 — five nights running;
+      AI-20260804-005028-001, AI-20260805-014309-001,
+      AI-20260806-011323-001 — six nights running;
       repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`).
@@ -1113,7 +1114,10 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       need extension"** (AI-20260802-014405-002..-016, all first-seen 20260802;
       recurred 20260803 as AI-20260803-013955-004..-018 and again 20260804 as
       AI-20260804-005028-002..-016 — the SAME 15 subjects three nights running,
-      each time alongside the suite-wedge below;
+      each time alongside the suite-wedge below; 20260806 recurred with only
+      THREE of the 15 — delete/portals_p2/select, AI-20260806-011323-016..-018
+      — and, notably, WITHOUT the suite-wedge item below, which weakens the
+      "all downstream of one wedge" reading for at least those three;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). **Six sampled
       cases (btree_index, char, int2, select, text, union) PASS in ISOLATION at
       HEAD `e13d6c6f` (2026-08-02 loop #31, 3.2 s total)** — so this is almost
@@ -1139,6 +1143,37 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
+- [ ] **nightly builds the DIRTY WORKING TREE, so an in-flight Ralph edit files
+      itself as 14 phantom testport regressions.** NEW 2026-08-06
+      (AI-20260806-011323-002..-015: PgBasebackup010{FetchWAL,Manifest,
+      ManifestChecksums}, PgBasebackup011InPlaceTablespace, PgReceivewal020,
+      PgoutputInteropGoopgToPG, PgDump{ConnectionSetup,DatabaseGrantACL,
+      DatabaseConfigSet,RoleConfigSet}, PgDumpall{ParameterACL,GlobalsOnly,
+      RoleMembership,PredefinedRoleMembership} — all "new tonight", all in one
+      contiguous block). **Not 14 regressions — ONE compile error**, visible in
+      the evidence log: `init: init failed: # github.com/goopg/goopg/internal/
+      planner … joinsearchlevel.go:109:6: s.traceFailed undefined (type
+      *searchCtx has no field or method traceFailed)`
+      (`ci/logs/20260806-011323/testport/go-test.log:13849`). `traceFailed` was
+      added by M0127-P5.9-l-ii (`bf52391e`, committed 2026-08-06 01:2x) and the
+      nightly fired at 01:13:23 with `dirty=50`, i.e. it compiled the tree at an
+      instant when the CALL existed and the METHOD did not. The eight
+      `pg_dump*` rows are the same cause one layer down — those fixtures start a
+      cluster from a freshly built binary, so the compile failure surfaces as
+      `start failed; process exited early`. `go build ./...` is clean at HEAD
+      `b92582fb` and `traceFailed` is defined at
+      `internal/planner/joinsearchlevel.go:138`, so all 14 are already gone.
+      The DEFECT worth fixing is the harness one: the nightly's own log records
+      `dirty=<n>` but nothing acts on it, so any night that overlaps an active
+      Ralph loop can manufacture an arbitrary number of unattributable
+      "regressions" and burn a later loop's triage on them. Options, cheapest
+      first: (a) build once in `preflight` and abort the run when the build
+      fails, attributing it to the dirty tree rather than to N specs;
+      (b) snapshot to a git worktree at the recorded sha and run from there.
+      Files: `ci/batch/run-nightly.sh` (preflight stage), `ci/batch/lib/`.
+      Repro: none needed — the evidence log is self-describing. FILED, NOT
+      SELECTED per the 2026-07-28(b) amendment (it breaks no build and no gate
+      M0124/M0125/M0127 depends on).
 - [x] **units/internal/executor + race/internal/executor — REOPENED, new causes**
       — both lanes failed in nightly `20260803-013955` at sha `1a589c23`
       (AI-20260803-013955-001/-002, both first-seen tonight; evidence
@@ -8096,7 +8131,34 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       plus the DS05 clause, then flip `pgShapedCollapse` or record the no-go.
       Files: `internal/planner/collapse.go`, the two arm scripts. 08 §2; 09 §3.
       Bar: the full acceptance bar with collapse ON.
-- [ ] **M0127-P5.9-n — the post-flip DS05 arm.** NEW 2026-08-06. The one gate
+- [x] **M0127-P5.9-n — the post-flip DS05 arm.** **DONE 2026-08-06 — GREEN,
+      and the plan channel's headline number was measuring the wrong thing**
+      (09 §3.15). Ran on a quiet host 02:28→02:56 (28 min, not the budgeted
+      ~1 h — the empty timeout class is the difference):
+      `PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0 SKIP=4`, byte-identical to run 4, plus
+      `STATUS-DELTA: verdict-changes=none runtime-moves=0` against
+      `sweep-20260806-002849` (`9e0cfe67`). **P5.9 does not reopen.** Report
+      `bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260806-022814.txt`.
+      Two findings the gate run itself produced: (1) the plan channel's
+      "changed (33)" is NOT the flip — its baseline
+      `plans-20260805-222627.txt` is stamped `GOOPG_PGSHAPED_DP=1`, so the 33
+      measure ON→ON across the -j/-k cost terms with the enumerator held
+      constant; (2) `sf05_planner_flags_line` kept the pre-flip
+      `unset(off)` label, so every artefact captured since `b92582fb` states
+      the OPPOSITE of the regime it measured — the same defect its own comment
+      block records happening to `GOOPG_RELSIZE_FALLBACK` at M0125-0005.
+      FIXED: label is `unset(on)`, and the retired
+      `GOOPG_COST_DRIVEN_JOINORDER` is stamped `retired(M0127-P5.9)`.
+      The flip's real blast radius, measured at a FIXED binary (only the flag
+      differs): **86 of 99 plans change, 13 are identical** (3 of those 13 are
+      the Q36/Q70/Q86 dsqgen parse-error blocks, so 10 real queries) — 22 with
+      a different join-operator multiset, 64 with the same inventory but
+      different order/qual placement/estimates. The acceptance bar said
+      "nothing changed"; that was true of every result and false of 87% of the
+      plans. Successor filed: **M0127-P5.9-q** (no test ties a provenance
+      label to the default it names).
+- [x] **M0127-P5.9-n — SUPERSEDED HISTORY (kept for attribution).** The one gate
       the flip commit could not pay: `scripts/tpcds-sf05-regression.sh sweep`
       refused with `FATAL: the nightly CI batch is running (ci/batch)`, and
       `FORCE=1` would have bought a run whose TIMEOUT column is contaminated by
@@ -8137,6 +8199,28 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       production-realistic trigger). Files:
       `internal/executor/join_batch_explain_test.go`. Bar: UNITS, growth
       asserted on the default enumerator.
+- [ ] **M0127-P5.9-q — no test ties a gate's provenance label to the default it
+      names, and the same defect has now shipped twice.** NEW 2026-08-06, found
+      by P5.9-n (09 §3.15). `sf05_planner_flags_line`
+      (`scripts/tpcds-sf05-regression.sh`) stamps every sweep and plan capture
+      with the planner flags in force, so that a diff between two captures is
+      attributable. The labels for UNSET variables are hand-written strings —
+      `unset(2)`, `unset(on)`, `unset(off)` — and nothing checks them against
+      the Go defaults they claim to describe. M0125-0005 flipped
+      `GOOPG_RELSIZE_FALLBACK`'s default and the `unset(off)` label survived
+      (fixed then, and the fix's own comment predicted the recurrence);
+      M0127-P5.9 flipped `GOOPG_PGSHAPED_DP` and `unset(off)` survived again,
+      mis-stamping `sweep-20260806-022814.txt` and `plans-20260806-022814.txt`.
+      A mis-stamped artefact is worse than an unstamped one: it is the record a
+      later loop reads to decide what an A/B measured, and P5.9-n lost a turn
+      to exactly that. The fix is a unit test that reads the label table and
+      asserts each entry against the package-level default constant
+      (`planner.defaultPGShapedJoinSearch`, `defaultRelSizeFallbackStage`, …),
+      which requires the labels to move out of the printf into a declared
+      table the test can import — e.g. a tiny `cmd/gen-planner-flag-labels` or
+      a checked-in `planner-flags.env` generated from Go. Files:
+      `scripts/tpcds-sf05-regression.sh`, `internal/planner/` defaults. Bar:
+      UNITS — flipping a default in Go and not the label fails a test.
 - [x] **M0127-P5.9 — SUPERSEDED HISTORY (kept for attribution; the item itself is ticked above).** The full 09 §3 bar (run
       once with collapse OFF, then with collapse ON) + plan-shape ratchet
       baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and

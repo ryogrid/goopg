@@ -2726,3 +2726,77 @@ gives the sub-flag a separate soak precisely so the enumerator swap and the
 population change do not land as one unattributable diff, which makes the
 collapse-ON pass the gate on the COLLAPSE flip rather than on this one. It is
 filed as its own item.
+
+### 3.15 The post-flip DS05 arm: zero correctness movement, 86 of 99 plans re-planned (P5.9-n, 2026-08-06)
+
+The one gate the flip commit could not pay. `b92582fb` landed with the DS05
+clause unrun because `scripts/tpcds-sf05-regression.sh sweep` refused —
+`FATAL: the nightly CI batch is running (ci/batch)` — and `FORCE=1` would have
+bought a TIMEOUT column contaminated by a CPU-saturated host, which is the
+confound the refusal exists to prevent. It was run here on a quiet host (load
+1.27 falling, nightly `20260806-011323` exited at 02:25, no orphaned bench
+servers), 02:28:14 → 02:56:15, **28 minutes** rather than the ~1 h the README
+budgets — the timeout class being empty is most of that difference.
+
+**The verdict is green and byte-identical to run 4's:**
+
+```
+=== SUMMARY: PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4 ===
+=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=0 (>=2.0x, floor 5s) ===
+```
+
+against `sweep-20260806-002849.txt` (`9e0cfe67`). Report:
+`bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260806-022814.txt`. So
+P5.9 does not reopen: no MISMATCH, no CKMISMATCH, no query lost or gained a
+verdict, and nothing moved 2× in either direction.
+
+**The plan channel's "changed (33)" is not the flip, and the reason is a stale
+label.** The channel diffed against `plans-20260805-222627.txt`, and that
+capture is stamped `GOOPG_PGSHAPED_DP=1` — it is an ON-arm capture taken during
+P5.9-h's acceptance work. The 33 therefore measure ON@`2f13e13e` → ON@`13009c0c`,
+i.e. the P5.9-j and P5.9-k cost terms, with the enumerator held constant. The
+flip's own effect was not in that number at all.
+
+Worse, the new capture was stamped `GOOPG_PGSHAPED_DP=unset(off)` while running
+ON. `sf05_planner_flags_line` had kept the pre-flip label through the flip —
+**the exact defect its own comment block documents happening to
+`GOOPG_RELSIZE_FALLBACK` at M0125-0005**, one flag generation later. Two
+artefacts state the opposite of the regime they measured:
+`sweep-20260806-022814.txt:8` and `plans-20260806-022814.txt:5`. Both are
+untracked run output, so they are annotated here rather than rewritten. The
+label is now `unset(on)`, and `GOOPG_COST_DRIVEN_JOINORDER` — which `b92582fb`
+retired, no code reads it (`internal/planner/bushy.go:13`) — is stamped
+`retired(M0127-P5.9)` rather than dropped, so an old artefact that carries a
+real value for it stays distinguishable from one captured by this version.
+
+**The flip's real plan blast radius, measured at a fixed binary.** Same
+`13009c0c` build, same cost model, same stats, same S-cold server; only
+`GOOPG_PGSHAPED_DP` differs (default vs `=0`):
+
+| | queries |
+|---|---|
+| identical on both enumerators | **13** — Q9 Q28 Q36 Q40 Q41 Q44 Q49 Q70 Q72 Q78 Q80 Q86 Q93 |
+| different plan text | **86** |
+| └ of those, a different join-operator multiset | 22 |
+| └ of those, same operator inventory, different order / qual placement / row estimates | 64 |
+
+Three of the 13 (Q36, Q70, Q86) are the dsqgen artefacts whose block is a parse
+error on PG too, so **10 real queries plan identically and 86 do not**. At a
+fixed binary the two captures can only differ by the enumerator's choice, so
+this is signal at the channel's measured zero noise floor (§5.11).
+
+Q1 is representative of the 22: the searched arm (shipped default) picks
+`Gather Merge` over `Sort` over three hash joins with `s_state = 'TN'` pushed
+down to the `store` scan and `rows=238` at the top; the legacy arm picks two
+nested loops driven by `store_pkey` and `customer_pkey` index scans, no Gather,
+`s_state = 'TN'` pulled up into the top join's `Filter:`, and `rows=1`. Both
+return the same rows and the same checksum.
+
+**What this establishes that run 4's cells could not.** The acceptance bar
+reported "nothing changed", and that was true of every result and false of 87%
+of the plans. The flip is not a marginal re-ranking that happens to tie: it
+re-plans nearly the whole corpus, and the corpus is exactly as correct
+afterwards. That is the strongest available statement about the flip's risk
+profile on this benchmark, and it took the fixed-binary A/B to make it — the
+cross-commit diff the gate runs by default cannot separate an enumerator change
+from a cost-term change, which is how the 33 came to look like the answer.
