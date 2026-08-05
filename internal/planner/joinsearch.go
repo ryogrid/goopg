@@ -33,8 +33,16 @@ import (
 
 // maxSearchRels is the relset width. `RelSet` is a uint16 (path.go:29), so the
 // search can address 16 base relations — above the level the collapse limits
-// admit (03 §7), and above the old DP's own 12-table bail-out (bushy.go:99),
-// which P5.8 deletes.
+// admit (03 §7), and above the old DP's own 12-table bail-out (bushy.go:99).
+//
+// This constant is that bail-out's REPLACEMENT, not its executioner: it is a
+// representation limit on the new search, while `bushy.go:99` is a runtime
+// guard on the old subset-bitmask DP, whose enumeration is 3ⁿ over splits of
+// subsets (3¹⁶ ≈ 43 M) rather than this search's clause-connected pair
+// enumeration. Deleting the old guard while the old DP is still the production
+// path would hand it 13-16-relation queries it cannot finish, so the deletion
+// happens WITH that DP in P6.3 — which is what 03 §7 says ("deleted with the
+// bushy DP"), and which the P5.8 TODO line stated more loosely. M0127-P5.8.
 const maxSearchRels = 16
 
 // pgShapedDP gates the whole PG-shaped search (08 §2, S5). It is OFF by default

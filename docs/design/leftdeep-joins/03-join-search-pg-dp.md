@@ -553,7 +553,7 @@ once, in path generation. The post-hoc placement passes
 stop running on searched subtrees ([08](08-migration-and-removal.md) §3 keeps
 them for non-searched shapes).
 
-## 6. What enters the search: collapse limits, explicit JOINs
+## 6. What enters the search: collapse limits, explicit JOINs — IMPLEMENTED
 
 Today only comma-FROM lists of whitelisted leaves reach the DP; explicit
 `JOIN … ON` trees are never reordered, and the registered
@@ -583,6 +583,47 @@ wires them with PG semantics (`initsplan.c:1081-1238`, `deconstruct_jointree`)
   restrictions; the remaining prerequisite is the constraint inference
   itself, not the search shape.
 
+### 6.1 As implemented (M0127-P5.8) — `internal/planner/collapse.go`
+
+`deconstructJointree` ports the joinlist half of `deconstruct_recurse`
+(`initsplan.c:1148-1452`) and nothing else: the `JoinDomain`s, `qualscope` /
+`inner_join_rels` / `nonnullable_rels` sets and the `JoinTreeItem` list that
+phase 2 walks have no reader in goopg, which places quals in the pre-search
+pipeline (`planJoinPredicate`, `inner_join_qual_pushdown.go`) and does not let
+outer joins into the search at all. What is ported is the part
+`make_rel_from_joinlist` (`allpaths.c:3391`) consumes.
+
+Three things the port settled that the plan above had left as prose:
+
+- **the =1 pin is weaker than the folklore, and the recursion says where.** At
+  a two-way `a JOIN b` the "cannot combine" branch emits `[a, b]` — identical
+  to the collapsed answer, because a one-element side is unwrapped rather than
+  wrapped (`initsplan.c:1428-1436`). The pin first bites at the third relation:
+  `(a JOIN b) JOIN c` → `[[a,b], c]`. So `join_collapse_limit = 1` restricts
+  the order of the syntactic tree's own nodes; it never forbids commuting a
+  single join.
+- **outer joins take upstream's FULL treatment, not a new mechanism.** §4.4's
+  pin is exactly `list_make1(list_make2(l, r))` (`initsplan.c:1414-1418`) — one
+  joinlist member, so the enclosing `FromExpr` always absorbs it
+  (`sub_members <= 1`), whose subproblem is the forced order. RIGHT is included
+  because goopg has no `reduce_outer_joins` to rewrite it to a LEFT.
+- **the leaf numbering is the binding order, by construction.** A joinlist leaf
+  is an index into `resolveContext.bindings`, so a consumer subscripts
+  `bindings` / `scans` / `relInfos` for `buildInitialRels` with no name
+  matching. That only holds because the pass is computed inside
+  `planFromClause` / `planFromRangeVars` (`planner.go:1920`/`:1968`), the two
+  places where the FROM walk that numbers leaves *is* the walk that appends
+  bindings; `TestJoinlistLeavesMatchBindings` pins it through the production
+  entry point rather than through the pure function.
+
+Two limits of the landed state, both ledgered: the per-session GUC values do
+not reach the planner (`Plan` takes no session — the same gap
+`costParams.workMem` and `ParallelSettings` record), so `SET
+join_collapse_limit = 1` is still a no-op in a real session even though the
+semantics are implemented and tested; and nothing READS
+`resolveContext.joinlist` yet — `GOOPG_PGSHAPED_DP` is OFF and P5.9 is the
+wiring, so the pass runs on every planned SELECT and changes no plan.
+
 ## 7. Search-size policy (the GEQO question)
 
 PG switches to GEQO at `geqo_threshold` (12) rels (`allpaths.c:3420`). goopg
@@ -606,7 +647,13 @@ ports no GEQO. Policy:
   workloads hit this.
 
 The hardcoded `len(tables) > 12` bail-out (`bushy.go:99`) is deleted with the
-bushy DP.
+bushy DP — i.e. in P6.3, not in P5.8. The two are not the same guard: the
+bail-out bounds the OLD subset-bitmask DP, whose enumeration is 3ⁿ over splits
+of subsets (3¹⁶ ≈ 43 M), while `maxSearchRels` (16, `joinsearch.go`) is the
+`RelSet` representation limit on the new search's clause-connected pair
+enumeration. Removing the bail-out while the old DP is still the production
+path would hand it 13-16-relation queries it cannot finish. P5.8's TODO line
+stated this more loosely; this section is the authority.
 
 ## 8. Determinism and tie-breaking
 

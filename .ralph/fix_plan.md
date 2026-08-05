@@ -7940,13 +7940,46 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       as P5.7-a — every consumer is behind an OFF-by-default gate
       (`GOOPG_PGSHAPED_DP`, and the search has no `planSelect` caller at all),
       so the default arm has zero reachable plan movement.
-- [ ] **M0127-P5.8 — collapse limits with PG's actual semantics** (03 §6: flat
-      comma lists are always ONE problem; limits govern sub-joinlists and
-      explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening
-      behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately,
-      08 §2); outer joins stay pinned until `join_is_legal` inference lands
-      (03 §4.4); delete the 12-table bail-out. IMPLEMENTATION-TODO P5.8; 03 §6.
-      Bar: UNITS + DS05 (sub-flag OFF and ON).
+- [x] **M0127-P5.8 — collapse limits with PG's actual semantics.**
+      DONE 2026-08-05. `internal/planner/collapse.go` ports the JOINLIST half of
+      `deconstruct_recurse` (initsplan.c:1148-1452) — and only that half: the
+      `JoinDomain`s, `qualscope`/`inner_join_rels`/`nonnullable_rels` sets and
+      the `JoinTreeItem` list phase 2 walks have no reader in goopg, which
+      places quals in the pre-search pipeline and does not let outer joins into
+      the search at all. `deconstructJointree` is computed inside
+      `planFromClause`/`planFromRangeVars` onto `resolveContext.joinlist`.
+      **The finding: neither GUC is a search-size cap, and reading them as one
+      would have re-introduced the greedy pre-reorder for wide comma joins**
+      (03 §6's documented Q2 failure mode). PG applies them to the join tree's
+      SHAPE: `sub_members <= 1` collapses every single-baserel FROM item
+      unconditionally, so `FROM a,…,o` is one 15-way problem with both limits
+      at 8; `from_collapse_limit` governs merging MULTI-relation sub-joinlists
+      and `join_collapse_limit` governs explicit JOIN constructs, nothing else.
+      A cap belongs at the `RelSet` ceiling (`maxSearchRels`), a representation
+      limit, not a user knob. Two more findings: **the =1 pin does not bite
+      until the third relation** — at `a JOIN b` the "cannot combine" branch
+      emits `[a, b]`, identical to the collapsed answer, because a one-element
+      side is unwrapped rather than wrapped (initsplan.c:1428-1436), so =1
+      orders the syntactic tree's own nodes and never forbids commuting a
+      single join; and a joinlist leaf is a direct `resolveContext.bindings`
+      subscript, which holds only because the pass runs in the two functions
+      where the FROM walk that numbers leaves IS the walk that appends bindings.
+      Outer joins take upstream's FULL treatment verbatim
+      (`list_make1(list_make2(l,r))`, initsplan.c:1414-1418) per 03 §4.4, RIGHT
+      included because goopg has no `reduce_outer_joins`. 8 tests; acceptance is
+      `TestFlatCommaListIsOneProblemAtAnyWidth`. IMPLEMENTATION-TODO P5.8;
+      03 §6.1 (new). **The 12-table bail-out is deliberately NOT deleted**: the
+      TODO line said to, but 03 §7 says it dies *with the bushy DP* (P6.3) and
+      §7 is right — it guards the OLD 3ⁿ subset-bitmask DP (3¹⁶ ≈ 43 M splits),
+      which is still the production path, so deleting it now would hand that DP
+      13-16-relation queries it cannot finish. §7 and the `maxSearchRels`
+      comment now say so explicitly. **2 ledger rows** (per-session collapse
+      GUCs do not reach `Plan`, so `SET join_collapse_limit = 1` is still a
+      no-op in a real session; no joinlist CONSUMER yet — that is P5.9).
+      Bar met: UNITS. DS05/PLAN not applicable for the same structural reason as
+      P5.7-a/-b: `GOOPG_PGSHAPED_COLLAPSE` is OFF, so production joinlists pin
+      explicit JOINs exactly as today, and nothing reads the result under either
+      flag setting — the default arm is byte-identical.
 - [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
       once with collapse OFF, then with collapse ON) + plan-shape ratchet
       baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and

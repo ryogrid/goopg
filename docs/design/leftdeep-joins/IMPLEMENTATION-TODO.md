@@ -1219,12 +1219,21 @@
   `GOOPG_PGSHAPED_DP` OFF. Bar met: UNITS. PLAN not applicable for the same
   structural reason as P5.7-a: every consumer is behind an OFF-by-default gate.)*
   [04](04-cost-and-cardinality.md) §4.3.
-- [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
+- [x] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
   flat comma lists are always ONE problem; limits govern sub-joinlists and
   explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening
   behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately from
   the enumerator, 08 §2); outer joins stay pinned until `join_is_legal`
-  constraint inference lands (03 §4.4). Delete the 12-table bail-out.
+  constraint inference lands (03 §4.4).
+  DONE 2026-08-05 — `internal/planner/collapse.go` ports the joinlist half of
+  `deconstruct_recurse` (initsplan.c:1148-1452); computed in
+  `planFromClause`/`planFromRangeVars` onto `resolveContext.joinlist`, read by
+  nobody until P5.9. 8 tests; acceptance is
+  `TestFlatCommaListIsOneProblemAtAnyWidth`. See 03 §6.1 for the three
+  findings. **The 12-table bail-out is NOT deleted here** — 03 §7 says it dies
+  *with the bushy DP* (P6.3), and it must: it guards the old 3ⁿ subset-bitmask
+  DP, which is still the production path. Ledger rows: per-session collapse
+  GUCs unreachable; no joinlist consumer yet.
 - [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.

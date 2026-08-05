@@ -346,6 +346,20 @@ type resolveContext struct {
 	// row (fewer columns than the input) and resolving the outer column
 	// ref at its input-schema index fails with "out of range". M0097-0035.
 	havingAgg *aggregateSurface
+
+	// joinlist is what `deconstruct_jointree` decided about this FROM
+	// clause: which of its relations belong to ONE join search problem and
+	// which are subproblems planned separately (collapse.go, 03 §6). Its
+	// leaf indices subscript `bindings` directly, which is why it is
+	// computed in `planFromClause`/`planFromRangeVars` beside the bindings
+	// rather than re-derived later from a parse tree that is no longer in
+	// scope — those are the only two places where the FROM order and the
+	// binding order are the same walk.
+	//
+	// M0127-P5.8: nil in every context that is not a FROM clause (subquery
+	// scopes, ON CONFLICT's `excluded`, DML targets), and read by nobody
+	// until P5.9 wires the search into `planSelect`.
+	joinlist joinlist
 }
 
 type rangeBinding struct {
@@ -1962,7 +1976,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	if root == nil {
 		return nil, nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	return root, newResolveContext(bindings, root.Output()), nil
+	rctx := newResolveContext(bindings, root.Output())
+	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
+	// walk that numbered these bindings is still the current walk (collapse.go).
+	// Inert until P5.9 — nothing reads `joinlist` yet.
+	rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	return root, rctx, nil
 }
 
 func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *resolveContext, error) {
@@ -2004,7 +2023,12 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	if root == nil {
 		return nil, nil, &PlanError{Pos: 0, Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	return root, newResolveContext(bindings, root.Output()), nil
+	rctx := newResolveContext(bindings, root.Output())
+	// M0127-P5.8: a JOIN-free FROM list is one search problem of `len(from)`
+	// relations whatever the collapse GUCs say — upstream's unconditional
+	// `sub_members <= 1` merge (collapse.go, 03 §6).
+	rctx.joinlist = deconstructRangeVars(len(bindings))
+	return root, rctx, nil
 }
 
 // nodeReferencesOuter reports whether the planned right-side FROM item
