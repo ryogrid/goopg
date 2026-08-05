@@ -1,51 +1,48 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-j CLOSED** — Q47's 40× was ONE cost term charged on the
-wrong tuple count. Do NOT re-derive:
+Last loop: **M0127-P5.9-h CLOSED** (via new slice **P5.9-k**). The TPC-H clause
+2/3 timing gap was a MISSING cost term, not a mispriced one. Do NOT re-derive:
 
-1. **The estimate is not the bug.** `{v1,v1_lag}` sizes to 1 row (four
-   `DEFAULT_EQ_SEL`s over stats-less CTE columns: 7193² × 0.005⁴ → clamp 1).
-   **PG estimates `rows=1` too** — verified on the 65438 oracle, db `tpcds05`,
-   same data. Do not "fix" it; both engines are ~7193× under actuals here and
-   beating PG would be a divergence. Ledgered to §4.1's ratchet.
-2. PG escapes via a mechanism goopg lacks: its CTE scan publishes the
-   WindowAgg's ordering as pathkeys ⇒ merge at 375.55 with **no Sort**.
-   goopg sorts twice (1393.36), so hash (968.55) vs plain NL (**968.53**)
-   decided it at a margin of **0.02**. CTE pathkey propagation = P5.4c-ii,
-   ledgered.
-3. Root cause: `final_cost_nestloop` charges `cpu_per_tuple` on
-   `ntuples = outer_path_rows * inner_path_rows` — PG comments it in place,
-   "number of tuples processed (not number emitted!)". goopg splits that sum
-   (qual half = caller's `qualEvalCost`, already on the cross product) and the
-   `cpu_tuple_cost` half landed on OUTPUT rows — smallest exactly on the plans
-   the term deters. Fix in `nestloopCost` + `innerRows` threaded to 3 sites.
-   Hash/merge siblings UNTOUCHED (PG charges those on `hashjointuples` /
-   `mergejointuples`, which really are output counts).
-4. **Reduction technique that cracked it**: the threshold is on ARITY, not
-   columns — 3 join keys hash, 4 fall to NL, whichever columns. That ruled out
-   the P5.9-i binding family in one EXPLAIN.
-5. **Measured**: Q47 flag-ON 8m40s → **13 s**; DS05 subset (Q6/30/47/54/58/
-   83/84) ON `PASS=6 TIMEOUT=1` → **`PASS=7 TIMEOUT=0`**; OFF subset unchanged,
-   checksums identical.
+1. **The suspect P5.9-h named was innocent.** `costIndexScan` at
+   selectivity 1.0 is roughly what PG charges. The defect was on the OTHER side
+   of the `addPath` comparison.
+2. `costSortRun` implemented only `cost_sort`'s COMPARISON term; its own
+   comment justified skipping the external-merge arm with "TPC-H sorts are
+   small dimension outputs". This phase invalidates that: a merge join sorts a
+   JOIN INPUT, and Q12's is 5 997 241 lineitem rows (~4.7 GB).
+3. **Why it is a defect and not an approximation**: the hash rival has been
+   charged its spill since P5.7-a, so Q12's two candidates were billed
+   **1 326 616** and **0** for spilling the same bytes through the same
+   work_mem — the asymmetry 04 §1 forbids, as an entire missing term.
+4. Fix: `cost_tuplesort`'s disk branch reproduced term for term, sized through
+   `hashsize.EntryBytes` (the SAME model `spillPages` uses, so both charges are
+   in one currency); `ncols==0` ⇒ no disk term (matches `hashJoinCost`'s zero
+   `innerCols`); PG's `tuples<2 ⇒ 2` clamp replaces `return Cost{}`.
+5. **Measured** (5 queries, one binary, both arms one session): Q7 26.71→16.29,
+   Q9 54.95→15.86, Q10 22.93→5.65, Q12 20.79→9.82, Q18 74.71→29.79 s;
+   **ON/OFF 2.61× → 1.007×**; all digests identical to run 3; Q12 back to Hash
+   Join over two Seq Scans; §5 audit ON arm reduced to the OFF arm's single
+   pre-existing Q18 violation; §4 `parity_violations=0`.
 
-Files: `internal/planner/cost_funcs.go`, `pathgen.go`, `joinpathsnli.go`,
-`bushy.go`, `nestloop_ntuples_test.go` (new, 5 tests). Docs: 09 §3.8, bundle
-README, docs/design/README.md, IMPLEMENTATION-TODO P5.9-j [x], fix_plan P5.9-j
-[x], 2 ledger rows, `analysis/leftdeep-joins/2026-08-05-p59j-ds05-{on,off}.txt`.
+Files: `internal/planner/cost_funcs.go` (`costSortRun`, new
+`tuplesortMergeOrder`), `joinpathsmerge.go` (`sortPathFor` threads
+`relNCols`), `cost_sort_external_test.go` (new, 6 tests), 2 test call-site
+updates. Docs: 09 §3.9, bundle README, docs/design/README.md,
+IMPLEMENTATION-TODO P5.9-h [x] + P5.9-k [x], fix_plan same, 2 ledger rows,
+`analysis/leftdeep-joins/2026-08-05-p59k-{on,off}.txt` + `-audit-on.{txt,plans.txt}`.
 
-Gates run: `go test ./internal/planner/` (green), UNITS precommit (green),
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35), DS05 subset sweep
-BOTH arms (7 queries each, all PASS), pgbench smoke via the commit hook, `make
-ralph-state-guard` (repaired a stale progress marker). **NOT run: full DS05
-`sweep` (~1 h) and `make plan-diff`** — still ledgered from P5.9-h, discharge
-at run 4.
+Gates run: `go test ./internal/planner/` green, UNITS precommit green,
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35), DS05 subset probe
+under the flag `PASS=7 MISMATCH=0 ERROR=0 TIMEOUT=0`, pgbench smoke via the
+commit hook, `make ralph-state-guard` (repaired a stale progress marker).
+**NOT run: full DS05 `sweep` (~1 h) and `make plan-diff`** — ledgered since
+P5.9-h, discharge at run 4.
 
 Nightly triage 20260805-014309: unchanged run, both items already filed under
 M-NIGHTLY, left unchecked per the banner.
 
-Next step: **M0127-P5.9-h's cost half** — the last named S5 defect: why a
-bound-less ordered index scan of `orders` + merge beats Seq Scan + hash under
-the flag (`costIndexScan` at selectivity 1.0, `pathindexordered.go`). Then run 4
-of the bar, with the DS05 clause no longer optional.
+Next step: **M0127-P5.9 run 4** — the full S5 acceptance bar (09 §3), now with
+NO known flag-owned defect outstanding. Its clause-4 DS05 clause is no longer
+optional.
 
 In-flight: none.

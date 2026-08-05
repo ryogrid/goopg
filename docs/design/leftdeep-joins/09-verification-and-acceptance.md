@@ -623,6 +623,104 @@ stays P5.4c-ii's. And the 1-row collapse on stats-less CTE columns is faithful
 to PG but is still a 7 193× error against actuals on both arms; it is the
 §4.1 parity ratchet's subject, not this one's.
 
+### 3.9 The sort was the only spill nobody charged for (P5.9-k, 2026-08-05)
+
+§3.6 closed P5.9-h's cardinality half and, in doing so, refuted its own
+headline: the five queries' estimates became right and their plans and timings
+did not move at all. What was left was named there as a cost question — reading
+1.5 M rows of `orders` through the primary-key index to save a sort — and the
+suspect was named as `costIndexScan` at `selectivity = 1.0`. **The suspect was
+innocent.** The index scan's price is roughly what PG would charge for it; the
+defect is on the other side of the comparison, and it is not a mispricing so
+much as a MISSING price.
+
+`costSortRun` implemented only the comparison term of `cost_sort`. Its own
+comment said so and gave the reason — "width participates in the external-merge
+arm (not modelled at the milestone; TPC-H sorts are small dimension outputs)".
+That premise was true when it was written and is exactly what this phase
+invalidates: a merge join sorts a **join input**, and Q12's is 5 997 241
+`lineitem` rows. So a sort that will certainly write ~4.7 GB of runs was priced
+as though it fit in memory.
+
+The reason that is a defect and not an approximation is the rival it competes
+against. Since P5.7-a the hash join HAS been charged its spill in full
+(`hashJoinCost`'s `NBatch > 1` term). Both operators spill the same rows
+through the same `work_mem` budget in the same executor; only one of them was
+billed. Design [04](04-cost-and-cardinality.md) §1 forbids exactly this — two
+independently calibrated models competing inside one `addPath` comparison — and
+here the asymmetry is not a calibration constant but an entire term. Q12's two
+candidates, at the default 512 MB budget:
+
+| | bytes spilled | charged before P5.9-k |
+|---|---|---|
+| Hash Join (`orders` build, `lineitem` probe) | 0.68 GB + 4.75 GB | **1 326 616** |
+| Merge Join (sort of `lineitem`) | 4.75 GB | **0** |
+
+With 4.75 GB priced at zero the merge arm wins on a rounding difference, which
+is precisely what the five queries did.
+
+The fix is `cost_tuplesort`'s disk branch (costsize.c:2144), reproduced term for
+term: `npages = ceil(input_bytes / BLCKSZ)`, `nruns = input_bytes /
+sort_mem_bytes`, `log_runs = ceil(log(nruns) / log(mergeorder))` with
+`mergeorder` from `tuplesort_merge_order` (`MINORDER` 6, `MAXORDER` 500), and
+`2 * npages * log_runs` page accesses at PG's stated ¾-sequential/¼-random mix.
+Two details are goopg's rather than PG's, and both are chosen for symmetry with
+the rival rather than for fidelity to upstream in isolation:
+
+- the row width comes from `hashsize.EntryBytes`, the same model `spillPages`
+  uses for the hash side's batch files, so the two charges are denominated in
+  one currency (this is the point of the change; a byte model that disagreed
+  with the hash side's would have re-created the defect with different
+  numbers);
+- `ncols == 0` means "width unknown" and suppresses the disk term, which is the
+  same reading `hashJoinCost` already gives a zero `innerCols`. An unknown
+  width must not invent an I/O charge for one candidate and excuse the other.
+
+Upstream's middle branch — the bounded heap-sort for a useful `limit_tuples` —
+is unreachable from here and is not written: goopg has no LIMIT-aware sort
+path, so `output_bytes == input_bytes` identically and that branch's guard is
+false whenever the disk branch did not already fire. Ledgered with the LIMIT
+push-down. PG's `tuples < 2 ⇒ 2` clamp IS adopted, replacing a `return Cost{}`:
+a sort of a collapsed 1-row estimate must not be free, which is the same
+failure mode §3.8 closed on the nested-loop side.
+
+Measured, five queries, one binary, both arms in one session
+(`scripts/tpch-acceptance-arm.sh`,
+`analysis/leftdeep-joins/2026-08-05-p59k-{on,off}.txt`):
+
+| query | run 3 ON | run 3 OFF | P5.9-k ON | P5.9-k OFF |
+|---|---|---|---|---|
+| Q7 | 26.71 s | 12.92 s | **16.29 s** | 16.50 s |
+| Q9 | 54.95 s | 17.57 s | **15.86 s** | 16.11 s |
+| Q10 | 22.93 s | 5.86 s | **5.65 s** | 5.70 s |
+| Q12 | 20.79 s | 10.02 s | **9.82 s** | 9.56 s |
+| Q18 | 74.71 s | 30.19 s | **29.79 s** | 29.03 s |
+| total | 200.09 s | 76.56 s | **77.41 s** | 76.90 s |
+| ON/OFF | **2.61×** | | **1.007×** | |
+
+Every digest (`colsig`/`ordered`/`unordered`) is identical to run 3's on both
+arms, so nothing about the result set moved. Q12's plan is now `Hash Join` over
+two `Seq Scan`s — the OFF arm's shape — and the full ordered index scan of
+`orders` is gone from all five. The §5 audit's ON arm
+(`analysis/leftdeep-joins/2026-08-05-p59k-audit-on.txt`) now reports the SAME
+single violation as the OFF arm, Q18's `Hash Join (SEMI)` at 22 285× — the
+one §3.6 already excluded from this class because it is present in both arms —
+and the §4 ratchet holds at `parity_violations=0`.
+
+Two things this did not settle. The five queries no longer choose an ordered
+index scan, but nothing has yet shown that goopg would ever be right to: its
+merge operator sorts BOTH inputs unconditionally (`newMergeSortedSource`,
+`join_merge_stream.go`), so the sort a pre-ordered input is credited with
+skipping (`tryMergeJoinPath`'s `pathkeysContainedIn` branch) is not actually
+skipped at run time. That credit is now the only remaining fiction in the merge
+arm's cost, and it is filed rather than fixed here because closing it means
+teaching the executor to stream a pre-sorted side, not adjusting a constant.
+And the fix reaches exactly one producer: `sortPathFor` is `costSortRun`'s only
+caller, because the query's own ORDER BY never enters the path model at all
+(§10 of [03](03-join-search-pg-dp.md) defers query pathkeys past the search
+boundary). A final `Sort` that spills is therefore still unpriced — it just has
+no rival to be unfair to yet.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

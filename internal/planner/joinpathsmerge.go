@@ -404,7 +404,14 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 	// `cost_sort` charges the comparison work as STARTUP — nothing emerges
 	// until the sort is complete — on top of the subpath's total, and the
 	// per-row emit at run.
-	s := costSortRun(cp, sub.Rows)
+	//
+	// The column count is what decides whether this sort spills (M0127-P5.9-k):
+	// `costSortRun` sizes the input through the same `hashsize.EntryBytes` model
+	// `hashJoinCost` prices its batch files with, so the merge candidate and the
+	// hash candidate for one joinrel are charged for the same bytes at the same
+	// rate. Passing `relNCols(sub.Rel)` rather than the SORT path's own width is
+	// exact: a Sort projects nothing, so its output rows are its input's.
+	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel))
 	return &Path{
 		Kind:          PathSort,
 		Rel:           sub.Rel,

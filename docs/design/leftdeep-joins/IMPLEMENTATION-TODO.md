@@ -1352,7 +1352,7 @@
   (`c8fe0d352d75b67e`) → `tpch-runner -diff` `Q2 MATCH rows=455`
   **VERDICT: PASS**, with PG 18.3 agreeing tuple-for-tuple on the fixture.
   3 ledger rows. **Run 3 of the bar is unblocked.**
-- [ ] **P5.9-h** The clause 2/3 timing gap — **RE-SPECIFIED at run 3 (09 §3.5)
+- [x] **P5.9-h** The clause 2/3 timing gap — **RE-SPECIFIED at run 3 (09 §3.5)
   as an ESTIMATE COLLAPSE, no longer a search for a bisect.** Run 3 measured
   (Q10 3.91×, Q9 3.13×, Q18 2.47×, Q7 2.07×, Q12 2.07×, total 1.362×) and the
   §4 parity ratchet ran on both arms for the first time: `parity_violations`
@@ -1384,6 +1384,10 @@
   (pathindexordered.go) vs `costSeqscan` plus the avoided sort — and is what is
   left of this item. `joinsearchlevel.go:324-330`'s `rows < 1` clamp is NOT
   implicated and needs no change.
+  **CLOSED 2026-08-05 by P5.9-k (09 §3.9)** — and the named suspect was
+  innocent: `costIndexScan` is roughly right, the defect was the missing
+  external-merge term on the OTHER side of the comparison. ON/OFF on the five
+  carrying queries 2.61× → **1.007×**.
   **Q18 is NOT in this class** and must not be bisected with it: its final
   joinrel is ~23 400× over in BOTH arms (OFF est=1 568 274, ON est=1 642 632,
   actual 70), so its 2.47× is a plan choice made on an equally bad estimate.
@@ -1446,6 +1450,33 @@
   versus 11–13 s on the flag-OFF arm. ON/OFF plan pair:
   `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-222627.txt`
   (ON) against `plans-20260805-220059.txt` (OFF).
+- [x] **P5.9-k** The clause 2/3 timing gap is a MISSING cost term, not a
+  mispriced one (successor to P5.9-h's cost half, 09 §3.9). **DONE
+  2026-08-05.** `costSortRun` implemented only `cost_sort`'s comparison term;
+  its own comment justified the omission with "TPC-H sorts are small dimension
+  outputs", which this phase invalidates — a merge join sorts a JOIN INPUT, and
+  Q12's is 5 997 241 `lineitem` rows (~4.7 GB). The hash rival in the same
+  `addPath` comparison HAS been charged its spill since P5.7-a, so one operator
+  was billed 1 326 616 for spilling those bytes and the other 0: the asymmetry
+  design 04 §1 forbids, as a whole missing term rather than a constant. Fix:
+  `cost_tuplesort`'s disk branch reproduced term for term (`npages`, `nruns`,
+  `log_runs` via `tuplesort_merge_order` with MINORDER 6 / MAXORDER 500,
+  `2*npages*log_runs` accesses at ¾ seq + ¼ random), sized through
+  `hashsize.EntryBytes` — the SAME byte model `spillPages` uses for the hash
+  side — and `ncols == 0` suppresses the disk term exactly as a zero
+  `innerCols` does in `hashJoinCost`. PG's `tuples < 2 ⇒ 2` clamp adopted,
+  replacing a `return Cost{}`. `sortPathFor` threads `relNCols(sub.Rel)`.
+  Measured (five carrying queries, one binary, both arms one session):
+  Q7 26.71→**16.29**, Q9 54.95→**15.86**, Q10 22.93→**5.65**,
+  Q12 20.79→**9.82**, Q18 74.71→**29.79**; ON/OFF **2.61× → 1.007×**; all
+  digests unchanged; Q12 now Hash Join over two Seq Scans; §5 audit ON arm
+  reduced to the OFF arm's single pre-existing Q18 violation;
+  §4 `parity_violations=0`. Tests:
+  `internal/planner/cost_sort_external_test.go` (6, incl. the one-currency
+  invariant against `spillPages`). NOT fixed, filed: goopg's merge operator
+  sorts BOTH inputs unconditionally (`newMergeSortedSource`), so
+  `tryMergeJoinPath`'s `pathkeysContainedIn` sort-skip credit is a fiction at
+  run time — the last one left in the merge arm's cost.
   Historical statement of the original defect follows. Q11, Q31, Q47, Q57, Q58,
   Q74, Q83 abort at plan time — `searchedtree.go:205`, reached from
   `createPlanAtSearchRootRange` (createplanroot.go:130) via

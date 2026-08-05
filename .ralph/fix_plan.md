@@ -8180,7 +8180,10 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       MISMATCH=0, CKMISMATCH=0, plans 99/99 same). 3 ledger rows — the
       producer still has no scope contract, the fixture's PKs are
       load-bearing, and `DROP INDEX` fails on a restart-surviving index.
-- [ ] **M0127-P5.9-h — the clause 2/3 timing gap is an ESTIMATE COLLAPSE.**
+- [x] **M0127-P5.9-h — the clause 2/3 timing gap is an ESTIMATE COLLAPSE.**
+      **CLOSED 2026-08-05 by M0127-P5.9-k below** — the cost half landed and
+      the suspect this item named (`costIndexScan` at selectivity 1.0) was
+      innocent. ON/OFF on the five carrying queries 2.61× → 1.007×.
       UNBLOCKED and RE-SPECIFIED by run 3 (09 §3.5) — this is no longer a
       search for a bisect. Measured at HEAD `1964333a`: Q10 3.91×, Q9 3.13×,
       Q18 2.47×, Q7 2.07×, Q12 2.07×, total 1.362×. The §4 parity ratchet ran
@@ -8310,6 +8313,45 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       (P5.4c-ii's `generate_mergejoin_paths`); and the 1-row collapse, while
       PG-faithful, is still ~7 193× off actuals on both arms (§4.1's ratchet).
       09 §3.8; IMPLEMENTATION-TODO P5.9-j.
+- [x] **M0127-P5.9-k — the timing gap was a MISSING cost term, not a mispriced
+      one.** **DONE 2026-08-05** — successor to P5.9-h's cost half, and it
+      exonerates the suspect that item named. `costIndexScan` at
+      selectivity 1.0 is roughly what PG would charge; the defect was on the
+      other side of the comparison. `costSortRun` implemented only
+      `cost_sort`'s COMPARISON term, justified in its own comment by "TPC-H
+      sorts are small dimension outputs" — a premise this phase invalidates,
+      because a merge join sorts a JOIN INPUT and Q12's is 5 997 241 lineitem
+      rows (~4.7 GB). The hash rival in the SAME `addPath` comparison has been
+      charged its spill in full since P5.7-a, so the two candidates for Q12
+      were billed **1 326 616** and **0** for spilling the same data through
+      the same work_mem budget — the asymmetry 04 §1 forbids, as an entire
+      missing term rather than a calibration constant. With 4.7 GB priced at
+      zero the merge arm wins on a rounding difference, which is what all five
+      queries did.
+      Fix: `cost_tuplesort`'s disk branch (costsize.c:2144) reproduced term for
+      term — `npages`, `nruns`, `log_runs = ceil(log(nruns)/log(mergeorder))`
+      with `tuplesort_merge_order` (MINORDER 6, MAXORDER 500), `2*npages*
+      log_runs` accesses at PG's ¾-sequential/¼-random mix. Row width comes
+      from `hashsize.EntryBytes`, the SAME model `spillPages` uses for the hash
+      side, so the two spill charges are in one currency; `ncols == 0` means
+      "width unknown" and suppresses the disk term, matching `hashJoinCost`'s
+      reading of a zero `innerCols`. PG's `tuples < 2 ⇒ 2` clamp adopted in
+      place of a `return Cost{}` (a sort of a collapsed estimate must not be
+      free — §3.8's failure mode). `sortPathFor` threads `relNCols(sub.Rel)`.
+      Measured, five queries, one binary, both arms in one session
+      (`analysis/leftdeep-joins/2026-08-05-p59k-{on,off}.txt`): Q7 26.71→16.29,
+      Q9 54.95→15.86, Q10 22.93→5.65, Q12 20.79→9.82, Q18 74.71→29.79 s;
+      **ON/OFF 2.61× → 1.007×**; every digest identical to run 3 on both arms;
+      Q12 now plans Hash Join over two Seq Scans and no ordered index scan
+      survives in any of the five. §5 audit ON arm now reports the SAME single
+      violation as OFF (Q18's SEMI joinrel, pre-existing in both);
+      §4 `parity_violations=0`.
+      Tests: `internal/planner/cost_sort_external_test.go` (6 new).
+      **NOT fixed, ledgered:** goopg's merge operator sorts BOTH inputs
+      unconditionally (`newMergeSortedSource`), so `tryMergeJoinPath`'s
+      `pathkeysContainedIn` sort-skip credit is a fiction at run time; and PG's
+      bounded heap-sort branch stays unwritten until a LIMIT reaches the sort.
+      09 §3.9; IMPLEMENTATION-TODO P5.9-k.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =
