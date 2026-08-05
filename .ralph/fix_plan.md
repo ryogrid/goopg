@@ -8228,8 +8228,12 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       reverting the guard: `… RIGHT JOIN rj_c … WHERE rj_a.id IS NULL` returns
       all three `rj_c` rows null-extended instead of the one. Four guards
       (two planner, two end-to-end row-set), all proven to bite. Gates: full
-      units 0 FAIL, `tpch-spotcheck` Q12=2 Q13=35 PASS, DS05 SF0.5 sweep — a
-      no-regression reading, since the corpus contains no RIGHT JOIN at all.
+      units 0 FAIL, `tpch-spotcheck` Q12=2 Q13=35 PASS, DS05 SF0.5 sweep
+      `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`,
+      `STATUS-DELTA verdict-changes=none runtime-moves=0`, `PLAN-SHAPE same=99
+      changed=0` (report `sweep-20260806-080412.txt`) — a no-regression reading,
+      not a demonstration, since the corpus contains no RIGHT JOIN at all; the
+      demonstration is the four reverted-guard probes.
       Deferred (ledger row P5.9-t): `reduce_outer_joins`' actual REDUCTIONS (the
       strict-qual RIGHT→INNER proof that would let the qual push — a
       pessimization, never a wrong answer) and FULL spines.

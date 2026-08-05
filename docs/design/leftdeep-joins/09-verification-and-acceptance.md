@@ -3390,10 +3390,13 @@ leaf-local filters were installed; `TestPGShapedSeamHoldsTheWholeWhereBelowAMixe
 covers `… RIGHT JOIN c LEFT JOIN d`, where reading only the topmost link would
 conclude "push freely". Both were proven to bite.
 
-Gates: full units (0 FAIL); `tpch-spotcheck` Q12=2 Q13=35 PASS; the TPC-DS SF0.5
-sweep. The corpus contains **no** RIGHT JOIN — `grep` over the TPC-DS and TPC-H
-query sets finds none — so the sweep is a no-regression reading rather than a
-demonstration, and the demonstration is the two guards above.
+Gates: full units (0 FAIL); `tpch-spotcheck` Q12=2 Q13=35 PASS; TPC-DS SF0.5
+`PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`,
+`STATUS-DELTA verdict-changes=none runtime-moves=0`, `PLAN-SHAPE same=99
+changed=0` (report `sweep-20260806-080412.txt`). The corpus contains **no**
+RIGHT JOIN — `grep` over the TPC-DS and TPC-H query sets finds none — so the
+sweep is a no-regression reading rather than a demonstration, and the
+demonstration is the four reverted-guard probes above.
 
 **Still open** (ledger row P5.9-t): `reduce_outer_joins`' actual *reductions* are
 still unported. PG turns `a ⋈ b RIGHT JOIN c WHERE a.x = 5` into an INNER join

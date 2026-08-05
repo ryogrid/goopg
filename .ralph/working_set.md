@@ -1,57 +1,53 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-u CLOSED** — commit `53863272`, pushed. No orphaned
-servers. `Datum.Flags` was a serialization contract nobody declared.
+Last loop: **M0127-P5.9-t CLOSED** — commit `bcb630fc`, pushed. No orphaned
+servers. The filed task was wrong twice, and that is the whole finding.
 
-**What landed.** `flagDate` is retired for `Datum.TimeSub` (`TimeSubtype`:
-Timestamp/Date/TimestampTZ/Time/TimeTZ), carved out of the existing alignment
-pad so Datum stays 48 B. The rename is not the point — a *field* with a declared
-value space can be enumerated, a flag bit cannot.
+**(1) The `reduce_outer_joins` RIGHT→LEFT flip cannot be represented.**
+`parser.FromExpr` is a `Base RangeVar` plus a FLAT `[]JoinExpr` whose every right
+side is a single range var — a strictly left-deep chain with no node for a nested
+join — so the flipped shape of `a ⋈ b ⋈ c RIGHT JOIN d`, which is
+`d LEFT JOIN (a ⋈ b ⋈ c)`, has nowhere to live. Flipping inside the planner's own
+tree is a *different* change: a `Join`'s schema is the positional concatenation of
+its inputs, so swapping arms renumbers every binding offset and reorders
+`SELECT *`. Upstream escapes that only because its Vars are varno-addressed and
+`*` was expanded at parse analysis.
 
-**The audit found two more breaks, not one.** The spill codec is goopg's ONLY
-Datum-level serializer (storage/wire codecs read a declared column type
-alongside the bytes and re-derive the type; a spill frame comes back as a bare
-`Row`). Beyond P5.9-s's lost DATE flag:
-- **`timetz` lost its UTC offset** (`Datum.Scale`, minutes). SILENT and a live
-  wrong answer: `compareDatum` normalises to UTC through it (upstream
-  `timetz_cmp`), so spilled timetz sorted by LOCAL time. Measured — with the
-  `Scale` write reverted, the guard's compare of `12:00-07` vs `13:00+00` flips
-  `+1`→`-1`.
-- **`KindEnum` / `KindToastPointer` had no arm at all** — encode wrote a bare
-  kind byte, decode rejected the frame. Loud, but a query spilling an enum
-  column simply could not run.
+**(2) The flip was never what the seam needed.** Because the chain is left-deep, a
+RIGHT JOIN's multi-relation side is on the LEFT of the pin — exactly where a LEFT
+JOIN's is — so `splitOuterSpine` needed no change at all. What differs is
+NULLABILITY: the prefix's ORDER is searchable either way (`deconstruct_recurse`
+builds a sub-joinlist for an outer join's nullable arm), but the `WHERE` is not
+pushable into it (`check_outerjoin_delay`, initsplan.c).
 
-**The fix is the contract.** `TestSpillDatumRoundTripCoversEveryKind` /
-`…EveryTimeSubtype` walk `datumKindCount` / `timeSubtypeCount` and FAIL on any
-kind or subtype the codec has no arm for; `decodeDatum` REJECTS an out-of-range
-subtype instead of quietly widening it to a bare timestamp. `Datum.Flags` stays
-unserialized on purpose — `flagBigNumeric` is *representation* state the decoder
-re-establishes (`newNumeric`), and carrying it would forge an arena mantissa.
-Both new guards were proven to bite by reverting each fix in turn.
+**Landed.** `spineLinkSearchable` admits a MATCHED LEFT/LEFT or RIGHT/RIGHT pair;
+new `prefixNullable` scans the WHOLE spine so one RIGHT link anywhere holds the
+entire `WHERE` in the residual above it. Prefix `ON` quals unaffected (they
+originate below the join). FULL still declined.
 
-Files: `internal/executor/{datum,spill,expr,codec,copy_text}.go`, new
-`spill_datum_contract_test.go`, 4 touched test files; `09-verification-and-
-acceptance.md` §3.21 + `docs/design/README.md`; ledger row + fix_plan.
+Files: `internal/planner/joinsearchseam.go`, `joinsearchspine_test.go`, new
+`internal/executor/right_join_spine_rows_test.go`; 09 §3.22 + `docs/design/
+README.md`; ledger row P5.9-t + fix_plan.
 
-Gates run: `go build ./...`; units (0 FAIL); regress-port BASELINE-RELATIVE in a
-worktree off clean HEAD — 56 tests, **identical verdicts and diff line counts on
-both arms** (absolute parity is 1/52 and means nothing; the worktree needs the
-untracked `postgres` symlink or `pg_isready` is missing); `tpch-spotcheck` Q12=2
-Q13=35 PASS; pgbench smoke via the commit hook (612/637 write TPS, 12.6k
-read-only). DS05 SF0.5 `sweep`: `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0
-ERROR=0 TIMEOUT=0 SKIP=4`, `STATUS-DELTA verdict-changes=none runtime-moves=0`,
-`PLAN-SHAPE same=99 changed=0` — nothing moved, which is the correct reading for
-a serialization fix whose only behaviour changes are on types the corpus has
-none of (timetz/enum). Report `sweep-20260806-072019.txt`.
+Gates run: full units 0 FAIL; `tpch-spotcheck` Q12=2 Q13=35 PASS; pgbench smoke
+via the hook (470/641 write TPS, 12.7k read-only); DS05 SF0.5 `PASS=95 (57 ck)
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`, `STATUS-DELTA
+verdict-changes=none runtime-moves=0`, `PLAN-SHAPE same=99 changed=0` (report
+`sweep-20260806-080412.txt`). The corpus has NO RIGHT JOIN, so the sweep is a
+no-regression reading; the demonstration is four reverted-guard probes — with
+`prefixNullable` disabled, `… RIGHT JOIN rj_c … WHERE rj_a.id IS NULL` returns
+all three `rj_c` rows null-extended instead of the one.
 
-NEXT LOOP (banner in `.ralph/fix_plan.md` wins — M0127 is #4 and current):
-**-t** (port `reduce_outer_joins` so a RIGHT arrives as a LEFT, then widen
-`spineLinkSearchable`; full 09 §3 bar), **-p** (searched-arm hash batch-growth
-fixture, units only). Larger: 03 §4.4 `SpecialJoinInfo` inference for the outer
-link buried below an inner one (Q78). Ledger P5.9-u follow-up: populate
-`TimeSubTime`/`TimeSubTimestampTZ` at their producers and switch `compareDatum`
-off the `Scale != 0` timetz inference (it mis-reads a `+00` timetz as a plain
-`time`) — behaviour change, own bar.
+NEXT LOOP (banner in `.ralph/fix_plan.md` wins — M0127 is #3 and current):
+**-p** (searched-arm hash batch-growth fixture, units only). Larger: 03 §4.4
+`SpecialJoinInfo` inference for the outer link buried below an inner one (Q78).
+Ledger P5.9-t follow-up: port `reduce_outer_joins`' actual REDUCTIONS — a strict
+`WHERE` qual on the nullable side proves no null-extended row survives, so the
+join goes INNER and the qual pushes freely; representable as a TYPE downgrade
+(no side swap) in a prep pass before `planFromClause`. Fires on LEFT joins too,
+so it is the whole corpus and needs its own bar. Ledger P5.9-u follow-up
+(unchanged): populate `TimeSubTime`/`TimeSubTimestampTZ` at their producers and
+switch `compareDatum` off the `Scale != 0` timetz inference.
 
 Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323; all 18
 subjects already filed under M-NIGHTLY. Nothing new.
