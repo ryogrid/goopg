@@ -826,7 +826,7 @@ func parseTimestampInfinityLiteral(s string) (Datum, bool) {
 // parseTimestampInfinityLiteral: PG's date_in (DecodeDateTime with the same
 // DTK_LATE / DTK_EARLY RESERV tokens) maps 'infinity'/'+infinity' →
 // DATEVAL_NOEND and '-infinity' → DATEVAL_NOBEGIN. Returns the matching
-// ±infinity DATE sentinel Datum (flagDate set) and true, or (zero, false).
+// ±infinity DATE sentinel Datum (TimeSubDate set) and true, or (zero, false).
 // (unimplemented_feat #5(d-iv))
 func parseDateInfinityLiteral(s string) (Datum, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {

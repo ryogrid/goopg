@@ -9,7 +9,7 @@ import (
 
 // TestDateDecodeCarriesDateFlag pins the M0003 / 0003-0013 fix: a date value
 // round-tripped through the on-disk physical codec must come back tagged as a
-// DATE (flagDate), not a bare timestamp. Date and timestamp share the KindTime
+// DATE (TimeSubDate), not a bare timestamp. Date and timestamp share the KindTime
 // carrier; only the flag distinguishes them in type-agnostic rendering
 // (Datum.Format(), used by text casts, string concat, and array/composite
 // element rendering). Before the fix, decodePhysicalPGValueMctx returned a
@@ -18,7 +18,7 @@ import (
 func TestDateDecodeCarriesDateFlag(t *testing.T) {
 	dateType := catalog.Type{Name: "date"}
 
-	// A date literal (via the parser/expr path) carries flagDate; a decoded
+	// A date literal (via the parser/expr path) carries TimeSubDate; a decoded
 	// date must be byte-identical so downstream Format() paths can't tell them
 	// apart.
 	lit := NewDateDatum(time.Date(2001, 2, 16, 0, 0, 0, 0, time.UTC))
@@ -34,8 +34,8 @@ func TestDateDecodeCarriesDateFlag(t *testing.T) {
 	if n != 4 {
 		t.Errorf("date decode consumed %d bytes, want 4", n)
 	}
-	if dec.Flags&flagDate == 0 {
-		t.Fatalf("decoded date lost flagDate; Format()=%q, want date shape", dec.Format())
+	if !dec.IsDate() {
+		t.Fatalf("decoded date lost TimeSubDate; Format()=%q, want date shape", dec.Format())
 	}
 	if got, want := dec.Format(), lit.Format(); got != want {
 		t.Errorf("decoded date Format()=%q, want %q (identical to literal)", got, want)
@@ -51,7 +51,7 @@ func TestDateDecodeCarriesDateFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodePhysicalPGValueMctx timestamp: %v", err)
 	}
-	if tsDec.Flags&flagDate != 0 {
-		t.Errorf("decoded timestamp wrongly tagged flagDate; Format()=%q", tsDec.Format())
+	if tsDec.IsDate() {
+		t.Errorf("decoded timestamp wrongly tagged TimeSubDate; Format()=%q", tsDec.Format())
 	}
 }

@@ -52,7 +52,7 @@ func TestInsertCoercesDateLiteralBeforeFKCheck(t *testing.T) {
 	// the German (DD.MM.YYYY) datestyle. After the fix, must render
 	// "15.07.2026" — and, since the coerced value must be tagged as a DATE
 	// (not a bare timestamp), must NOT carry a spurious "00:00:00" suffix
-	// (regression for the sibling evalCast "date"-case flagDate bug this
+	// (regression for the sibling evalCast "date"-case TimeSubDate bug this
 	// same loop uncovered and fixed).
 	if !strings.Contains(execErr.Detail, "(15.07.2026)") {
 		t.Errorf("Detail = %q, want it to contain \"(15.07.2026)\" (German DateStyle, date-only)", execErr.Detail)

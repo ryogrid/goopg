@@ -346,27 +346,35 @@ func encodeDatum(d Datum, buf []byte) []byte {
 	case KindTime:
 		n := d.TimeValue().UTC().UnixNano()
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(n))
-		// The DATE/timestamp discriminator travels WITH the value, because
-		// nothing downstream can re-derive it: a spilled row is read back as a
-		// bare `Row` with no column types in reach, and `flagDate` is what
-		// `date + integer` (expr.go:1454 — upstream `date_pli`), `Format()`'s
-		// MDY rendering and the `date`-typed cast arms all dispatch on.
+		// The SQL subtype travels WITH the value, because nothing downstream
+		// can re-derive it: a spilled row is read back as a bare `Row` with no
+		// column types in reach, and TimeSubDate is what `date + integer`
+		// (expr.go — upstream `date_pli`), `Format()`'s MDY rendering and the
+		// `date`-typed cast arms all dispatch on.
 		//
 		// M0127-P5.9-s found it the expensive way: TPC-DS Q72's
 		// `d3.d_date > d1.d_date + 5` failed with `operator + requires integer
 		// operands` once the searched prefix put a spilling hash join under the
 		// join that evaluates it, and the SAME query at `work_mem = '2GB'`
-		// answered correctly — the flag, not the value, was what the round trip
+		// answered correctly — the type, not the value, was what the round trip
 		// dropped. A comparison of two spilled dates still worked, which is why
 		// the loss had gone unmeasured: `Int` survives and only the TYPE is
 		// forgotten.
 		//
-		// Only `flagDate` is written. `flagBigNumeric` is the other bit, and it
-		// describes a REPRESENTATION the numeric arm below re-establishes for
-		// itself (`newNumeric` decides the fast/big path from the mantissa it
-		// decodes), so carrying it across would let a decoded numeric claim an
-		// arena mantissa it does not have.
-		buf = append(buf, d.Flags&flagDate)
+		// Scale is written for the same reason and was the SECOND casualty,
+		// found by M0127-P5.9-u's audit rather than by a query: a `timetz`
+		// carries its offset east of UTC there (NewTimeTZDatum, minutes), and
+		// compareDatum normalises to UTC through it. Dropping it silently
+		// re-sorted spilled timetz values by local time and rendered them in
+		// the wrong zone.
+		//
+		// Datum.Flags is deliberately NOT written. Its one remaining bit,
+		// flagBigNumeric, describes a REPRESENTATION the numeric arm below
+		// re-establishes for itself (`newNumeric` picks the fast/big path from
+		// the mantissa it decodes), so carrying it across would let a decoded
+		// numeric claim an arena mantissa it does not have.
+		buf = append(buf, byte(d.TimeSub))
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.Scale))
 	case KindInterval:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonthsValue()))
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDaysValue()))
@@ -387,6 +395,24 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(mag)))
 		buf = append(buf, signByte)
 		buf = append(buf, mag...)
+	case KindEnum:
+		// Int is the sort order (compareDatum orders by it); Buf is the label
+		// (Format/StringValue render it). Both are needed — an enum that came
+		// back with only one of them would either sort wrong or print wrong.
+		// M0127-P5.9-u: this arm and KindToastPointer's were MISSING, so
+		// encodeDatum wrote a bare kind byte and decodeDatum then failed the
+		// whole spill with "unknown datum kind". Loud rather than silent, but a
+		// query grouping or sorting an enum column simply could not spill.
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.Buf)))
+		buf = append(buf, d.Buf...)
+	case KindToastPointer:
+		// The 12-byte on-disk pointer [toast_oid|total_len|num_chunks]. Length
+		// prefixed rather than fixed-width so a future pointer layout does not
+		// silently truncate here.
+		b := d.BytesValue()
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(b)))
+		buf = append(buf, b...)
 	}
 	return buf
 }
@@ -435,18 +461,24 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		copy(b, data[pos:pos+int(blen)])
 		return NewBytesDatum(b), pos + int(blen), nil
 	case KindTime:
-		if pos+9 > len(data) {
+		if pos+11 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated time at %d", pos)
 		}
 		n := int64(binary.LittleEndian.Uint64(data[pos:]))
 		d := NewTimeDatum(time.Unix(0, n).UTC())
-		// The flags byte the encoder wrote; see there for why it exists and why
-		// it is masked. Masking on READ as well means a frame written by a
-		// future encoder that carries another bit cannot smuggle it into a
-		// KindTime datum, which is the direction that produces a wrong answer
-		// rather than an error.
-		d.Flags |= data[pos+8] & flagDate
-		return d, pos + 9, nil
+		// The subtype byte and Scale the encoder wrote; see there for why they
+		// travel with the value. An out-of-range subtype is REJECTED rather
+		// than clamped: a frame written by a future encoder that knows a
+		// subtype this reader does not must fail loudly, because the quiet
+		// alternative — decoding it as TimeSubTimestamp — is exactly the
+		// wrong-answer mode this whole arm exists to close.
+		sub := TimeSubtype(data[pos+8])
+		if sub >= timeSubtypeCount {
+			return Datum{}, 0, fmt.Errorf("unknown time subtype %d at %d", sub, pos+8)
+		}
+		d.TimeSub = sub
+		d.Scale = int16(binary.LittleEndian.Uint16(data[pos+9:]))
+		return d, pos + 11, nil
 	case KindInterval:
 		if pos+16 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated interval at %d", pos)
@@ -474,6 +506,32 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		}
 		pos += mlen
 		return newNumeric(mag, int(s)), pos, nil
+	case KindEnum:
+		if pos+12 > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated enum at %d", pos)
+		}
+		order := int64(binary.LittleEndian.Uint64(data[pos:]))
+		pos += 8
+		llen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		if pos+llen > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated enum label at %d (want %d)", pos, llen)
+		}
+		label := make([]byte, llen)
+		copy(label, data[pos:pos+llen])
+		return Datum{Kind: KindEnum, Int: order, Buf: label}, pos + llen, nil
+	case KindToastPointer:
+		if pos+4 > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated toast pointer len at %d", pos)
+		}
+		plen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		if pos+plen > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated toast pointer at %d (want %d)", pos, plen)
+		}
+		ptr := make([]byte, plen)
+		copy(ptr, data[pos:pos+plen])
+		return Datum{Kind: KindToastPointer, Buf: ptr}, pos + plen, nil
 	default:
 		return Datum{}, 0, fmt.Errorf("unknown datum kind %d", kind)
 	}

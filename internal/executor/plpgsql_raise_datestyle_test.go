@@ -14,11 +14,11 @@ import "testing"
 //
 // The DATE value is sourced via `SELECT ... INTO` from a real table column
 // (bindSelectIntoRow copies the heap-decoded Datum straight into the frame,
-// preserving its KindTime/flagDate) rather than a `declare d date := '...'`
+// preserving its KindTime/TimeSubDate) rather than a `declare d date := '...'`
 // default: the latter routes through coerceDatumToType's string-literal
 // coercion (isTimeTypeName branch, plpgsql_runtime.go), which was found
 // during this audit to always call tryParseStringAs(KindTime, ...) and
-// therefore mint a TIMESTAMP-shaped datum (flagDate unset, "00:00:00" tail)
+// therefore mint a TIMESTAMP-shaped datum (TimeSub left at TimeSubTimestamp, "00:00:00" tail)
 // even for a `date`-typed declaration — a separate, pre-existing PG-parity
 // gap logged in the deferral ledger rather than fixed here (out of scope for
 // this RAISE-formatting slice).

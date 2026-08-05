@@ -8219,8 +8219,8 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `spineLinkSearchable`; FULL stays out (both sides nullable). Files:
       `internal/planner/collapse.go`, `joinsearchseam.go`, a new prep pass.
       Bar: the full 09 §3 bar — it changes which rows survive.
-- [ ] **M0127-P5.9-u — `Datum.Flags` is a serialization contract nobody
-      declared.** NEW 2026-08-06 (09 §3.20, ledger row P5.9-s). goopg carries the
+- [x] **M0127-P5.9-u — `Datum.Flags` is a serialization contract nobody
+      declared.** DONE 2026-08-06 (09 §3.21, ledger row P5.9-u). goopg carries the
       DATE/TIMESTAMP distinction in a per-value FLAG rather than a type, so every
       serializer must remember it — PG cannot have this bug, because a tuple
       travels with its `TupleDesc`. The spill pair now carries `flagDate`, but the
@@ -8232,6 +8232,27 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       carrier gap noted at codec.go:1100, M0003 / 0003-0013), `spill.go`.
       Bar: full units + the regress-port suite (Hard-won Rule #5 — this is a
       Datum-layout change).
+      **LANDED.** `flagDate` retired for `Datum.TimeSub` (`TimeSubtype`:
+      Timestamp/Date/TimestampTZ/Time/TimeTZ), carved out of the alignment pad
+      so Datum stays 48 B. **The audit found two MORE breaks, not one:** a
+      `timetz`'s UTC offset (`Datum.Scale`) was dropped, so spilled timetz
+      values sorted by LOCAL time — a live wrong answer, and the guard's
+      comparison flips +1→-1 with the fix reverted — and `KindEnum` /
+      `KindToastPointer` had NO arm at all, so a query spilling an enum column
+      failed with "unknown datum kind". The real fix is the CONTRACT: guards
+      walk `datumKindCount`/`timeSubtypeCount` and FAIL on any kind or subtype
+      the codec has no arm for, and `decodeDatum` REJECTS an unknown subtype
+      rather than quietly widening it to a bare timestamp. `Datum.Flags` stays
+      unserialized on purpose (`flagBigNumeric` is representation state the
+      decoder re-establishes). Gates: units 0 FAIL; regress-port run
+      BASELINE-RELATIVE in a worktree off clean HEAD — 56 tests, identical
+      verdicts and identical diff line counts on both arms (absolute parity is
+      1/52 and means nothing here); `tpch-spotcheck` Q12=2 Q13=35 PASS; both new
+      guards proven to bite by reverting each fix. Deferred (ledger row P5.9-u):
+      `TimeSubTime`/`TimeSubTimestampTZ` are declared but unpopulated, and
+      `compareDatum` still infers timetz from `Scale != 0` — which mis-reads a
+      `+00` timetz as a plain `time`. That switch is a behaviour change and
+      needs its own bar.
 - [x] **M0127-P5.9-r — SUPERSEDED FILING (kept for attribution).** NEW 2026-08-06 (09 §3.18, ledger row P5.9-m).
       `extractScans` (`internal/planner/bushy.go:261`) descends `JoinTypeCross`
       and nothing else, so `tryPGShapedJoinSearch` declines every FROM clause

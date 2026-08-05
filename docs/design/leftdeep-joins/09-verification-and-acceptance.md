@@ -3236,3 +3236,79 @@ the next re-run of §3.18's protocol is measuring a real difference for the firs
 time. The remaining reorderability gap is 03 §4.4's `SpecialJoinInfo` inference —
 an outer join that must be *reordered* rather than *pinned above a searched
 prefix* — which is where Q78's buried outer link lives.
+
+### 3.21 The spill frame is a serialization contract, and it was broken three ways (P5.9-u, 2026-08-06)
+
+§3.20 closed a wrong-answer bug by adding one byte to the spill frame: TPC-DS
+Q72's `d3.d_date > d1.d_date + 5` raised `operator + requires integer operands`
+only at the `work_mem` where the join under it spilled, because `encodeDatum`
+(`internal/executor/spill.go`) wrote a `KindTime` datum's value and never its
+`flagDate`. This item audited the rest of that frame, and the fix turned out to
+be the smaller half of the finding.
+
+**Why goopg can have this bug and PG cannot.** A PG Datum never travels alone —
+it moves with the `TupleDesc` that names its type OID, and `date`, `timestamp`
+and `timetz` are separate types with separate `typoutput` functions
+(`postgres/src/backend/utils/adt/date.c`, `timestamp.c`). goopg instead carries
+five SQL types on the one `KindTime` carrier and distinguishes them with
+per-value state, so **every** serializer has to remember that state. The spill
+codec is the only Datum-level serializer in the tree (the storage and wire
+codecs both read a declared column type alongside the bytes and can re-derive
+what a value is), and it is exactly the one that had forgotten.
+
+**What the audit found.** Three breaks, not one:
+
+| # | lost | shape | how it showed |
+|---|---|---|---|
+| 1 | the DATE discriminator | **silent** | §3.20, found in production by Q72 |
+| 2 | a `timetz`'s UTC offset (`Datum.Scale`, minutes — `NewTimeTZDatum`) | **silent** | found by this audit |
+| 3 | `KindEnum` and `KindToastPointer` had no arm at all | loud | found by this audit |
+
+Breaks 1 and 2 share the dangerous shape: `Int` survives, so the value still
+*compares* against itself correctly and only its type is gone. That is why
+`TestSpillRoundTrip` stayed green for as long as it did — it compared values.
+Break 2 is a genuine wrong answer, not a latent one: `compareDatum` normalises a
+timetz to UTC through `Scale` (matching upstream `timetz_cmp`), so a spilled
+timetz sorted by *local* time against unspilled peers and rendered in the wrong
+zone. Measured, not argued — with the `Scale` write removed, the guard's
+comparison of `12:00-07` against `13:00+00` flips from `+1` to `-1`.
+
+Break 3 is loud (`decodeDatum` rejects the frame with "unknown datum kind"), so
+it is not a wrong answer — but a query that had to spill an enum column simply
+could not run.
+
+**The fix is the contract, not the three patches.** `flagDate` is retired;
+`Datum.TimeSub` (a `TimeSubtype`, carved out of the existing alignment pad so
+the 48-byte layout of `docs/design/perf-optimize/02-datum-pointer-free.md` is
+unchanged) replaces it. The point is not the rename — it is that a *field* with
+a declared value space can be enumerated, and a flag bit cannot. So the guards
+walk the space rather than a hand-picked sample:
+
+- `TestSpillDatumRoundTripCoversEveryKind` iterates `0..datumKindCount` and
+  **fails on a kind with no case**, so a new `DatumKind` cannot reach the tree
+  without an arm in both halves of the codec.
+- `TestSpillDatumRoundTripCoversEveryTimeSubtype` does the same over
+  `0..timeSubtypeCount`.
+- `decodeDatum` **rejects** an out-of-range subtype instead of clamping it.
+  Quietly widening an unknown subtype to "bare timestamp" is precisely the
+  failure mode the contract exists to close, so the reader fails loudly in the
+  one direction that would otherwise produce a wrong answer.
+
+`Datum.Flags` is deliberately still not serialized. Its one remaining bit,
+`flagBigNumeric`, describes a *representation* the decoder re-establishes for
+itself (`newNumeric` picks the fast/big mantissa path from what it decodes);
+carrying it across would let a decoded numeric claim an arena mantissa it does
+not have. That distinction — type state must travel, representation state must
+not — is the rule the codec now states in comments at both halves.
+
+**Verification.** Units (0 FAIL) plus the regress-port suite run
+baseline-relative in a worktree off clean HEAD: 56 tests, **identical verdicts
+and identical diff line counts** on both arms, which is the only meaningful
+reading of a runner sitting at 1/52 absolute parity. `tpch-spotcheck` Q12=2
+Q13=35 PASS. Both new guards were proven to bite by reverting each fix in turn.
+
+**Still open** (ledger row P5.9-u): `TimeSubTime` and `TimeSubTimestampTZ` are
+declared but not populated by their producers, and `compareDatum` still infers
+"is a timetz" from `Scale != 0` — which mis-reads a genuine `+00` timetz as a
+plain `time`. Wiring the producers and switching that test to `TimeSub` is the
+follow-up; it is a behaviour change and needs its own bar.

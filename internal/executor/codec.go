@@ -1097,7 +1097,7 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return NewDateInfinity(false), 4, nil
 		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
-		// Tag as DATE (flagDate) so a storage-decoded date renders identically
+		// Tag as DATE (TimeSubDate) so a storage-decoded date renders identically
 		// to a date literal in type-agnostic paths (Datum.Format(): text casts,
 		// string concat, array/composite element rendering). The wire path
 		// (server dispatch) re-derives date formatting from the column type and

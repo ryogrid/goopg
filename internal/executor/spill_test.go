@@ -66,18 +66,18 @@ func TestSpillRoundTrip(t *testing.T) {
 
 // TestSpillPreservesTheDateDiscriminator is the regression guard for the defect
 // M0127-P5.9-s found in TPC-DS Q72: a spilled DATE came back as a bare
-// timestamp, because `encodeDatum` wrote the value and never the `Flags` byte.
+// timestamp, because `encodeDatum` wrote the value and never the subtype.
 //
 // The two assertions are the two halves of the bug's signature, and the second
-// is the one that let it hide for so long. `flagDate` gone means `date + integer`
+// is the one that let it hide for so long. a lost subtype means `date + integer`
 // raises `operator + requires integer operands` (expr.go's `date_pli` arm
-// dispatches on the flag) and `Format()` renders MDY as ISO — while a COMPARISON
+// dispatches on it) and `Format()` renders MDY as ISO — while a COMPARISON
 // of two spilled dates keeps working, because `Int` survives intact. So a
 // round-trip test that only compared values reported success on a datum that had
 // lost its type.
 //
 // Both spellings are exercised: an ordinary date and the `±infinity` sentinel,
-// whose carrier IS `KindTime + flagDate` with an out-of-range `Int`
+// whose carrier IS `KindTime + TimeSubDate` with an out-of-range `Int`
 // (`NewDateInfinity`) — it would decode as a timestamp far past the end of time.
 func TestSpillPreservesTheDateDiscriminator(t *testing.T) {
 	day := NewDateDatum(time.Date(1998, 3, 15, 0, 0, 0, 0, time.UTC))
@@ -104,8 +104,8 @@ func TestSpillPreservesTheDateDiscriminator(t *testing.T) {
 			if got.Kind != KindTime || got.Int != tc.in.Int {
 				t.Fatalf("round trip = %v/%d, want KindTime/%d", got.Kind, got.Int, tc.in.Int)
 			}
-			if isDate := got.Flags&flagDate != 0; isDate != tc.date {
-				t.Fatalf("flagDate = %v, want %v — a spilled date that forgets it is a date "+
+			if isDate := got.IsDate(); isDate != tc.date {
+				t.Fatalf("IsDate() = %v, want %v — a spilled date that forgets it is a date "+
 					"fails `d_date + 5` with \"operator + requires integer operands\" and "+
 					"renders in the wrong DateStyle, while still comparing correctly",
 					isDate, tc.date)

@@ -1450,11 +1450,11 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// date ± integer → date (days arithmetic).
 		// Mirrors upstream date_pli / date_mi: the integer operand is
 		// treated as a day count.  Requires the left datum to carry
-		// flagDate (a bare timestamp+int would be ambiguous).
-		if left.Kind == KindTime && left.Flags&flagDate != 0 && right.Kind == KindInt {
+		// TimeSubDate (a bare timestamp+int would be ambiguous).
+		if left.IsDate() && right.Kind == KindInt {
 			return addDateTimeInt(left, right, op == parser.OpSub, pos)
 		}
-		if op == parser.OpAdd && left.Kind == KindInt && right.Kind == KindTime && right.Flags&flagDate != 0 {
+		if op == parser.OpAdd && left.Kind == KindInt && right.IsDate() {
 			return addDateTimeInt(right, left, false, pos)
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
@@ -3215,7 +3215,7 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 
 // formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
 // honoring the session DateStyle GUC. Mirrors Datum.Format()'s ±infinity and
-// flagDate branching, but dispatches DATE vs TIMESTAMP/TIMESTAMPTZ through
+// TimeSubDate branching, but dispatches DATE vs TIMESTAMP/TIMESTAMPTZ through
 // config.FormatDate/FormatTimestamp instead of Format()'s hardcoded
 // Postgres-MDY-only / fixed-ISO layouts, so callers (CAST-to-text, FK
 // violation DETAIL messages, ...) agree with SELECT/COPY output on the
@@ -3227,7 +3227,7 @@ func formatTimeDatumDateStyle(d Datum, style, order string) string {
 	if d.Int == math.MinInt64 {
 		return "-infinity"
 	}
-	if d.Flags&flagDate != 0 {
+	if d.TimeSub == TimeSubDate {
 		return config.FormatDate(d.TimeValue(), style, order)
 	}
 	return config.FormatTimestamp(d.TimeValue(), style, order)
@@ -4436,7 +4436,7 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 			return int64DivFastToNumeric(epochMicros, 6), nil
 		case srcType == "time":
 			return int64DivFastToNumeric(timeOfDayMicros(u), 6), nil
-		case srcType == "date" || src.Flags&flagDate != 0:
+		case srcType == "date" || src.IsDate():
 			return int64DivFastToNumeric(u.Unix(), 0), nil
 		default: // timestamp / timestamptz
 			epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
@@ -6138,7 +6138,7 @@ func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
 // (postgres/src/backend/utils/adt/{date,timestamp}.c): the result is FALSE
 // only for a ±infinity sentinel (DATE_NOT_FINITE / TIMESTAMP_NOT_FINITE /
 // INTERVAL_NOT_FINITE), TRUE for every other finite value. goopg carries the
-// timestamp/date ±infinity sentinels on KindTime (INT64 extremes, flagDate-
+// timestamp/date ±infinity sentinels on KindTime (INT64 extremes, TimeSubDate-
 // agnostic) and the interval sentinels on KindInterval (unimplemented_feat
 // #5(d-iv)), so both must be checked. NULL input propagates to NULL (isfinite
 // is strict — no NotStrict marker on its pg_proc OIDs; see isfinite_test.go).
@@ -12310,7 +12310,7 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	year, month, day := t.UTC().Date()
 	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 	d := NewTimeDatum(out)
-	d.Flags |= flagDate // mark as DATE type for Postgres MDY display. M0097-0063.
+	d.TimeSub = TimeSubDate // mark as DATE type for Postgres MDY display. M0097-0063.
 	return d, nil
 }
 

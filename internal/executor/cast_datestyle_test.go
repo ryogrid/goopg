@@ -66,14 +66,14 @@ func TestEvalCastTimeToTextNilCtxDefaultsISO(t *testing.T) {
 
 // TestEvalCastToDateSetsFlagDate pins a sibling bug uncovered while wiring
 // insertOp's literal coercion (2026-07-15): evalCast's "date" case built its
-// result via NewTimeDatum, which leaves flagDate unset, instead of
+// result via NewTimeDatum, which leaves TimeSub at TimeSubTimestamp, instead of
 // NewDateDatum ("Use this at every date-producing site", datum.go). Every
-// other date-producing site (storage decode, date literals) sets flagDate so
+// other date-producing site (storage decode, date literals) sets TimeSubDate so
 // type-agnostic renderers (Datum.Format(), fkValsForDetail's
 // formatTimeDatumDateStyle) can tell a DATE apart from a TIMESTAMP sharing
 // the same KindTime carrier. Without the flag, a freshly-cast date datum
 // rendered with a spurious "00:00:00" time-of-day suffix wherever a
-// downstream consumer branches on d.Flags&flagDate instead of separately
+// downstream consumer branches on d.TimeSub == TimeSubDate instead of separately
 // tracked column-type context.
 func TestEvalCastToDateSetsFlagDate(t *testing.T) {
 	// String source (e.g. an INSERT literal coerced via evalCast(..., "date", ...)).
@@ -81,8 +81,8 @@ func TestEvalCastToDateSetsFlagDate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evalCast(date) from string: unexpected error: %v", err)
 	}
-	if got.Flags&flagDate == 0 {
-		t.Errorf("evalCast(date) from string did not set flagDate; Format()=%q", got.Format())
+	if !got.IsDate() {
+		t.Errorf("evalCast(date) from string did not set TimeSubDate; Format()=%q", got.Format())
 	}
 
 	// KindTime (timestamp) source, e.g. `some_timestamp_col::date`.
@@ -91,7 +91,7 @@ func TestEvalCastToDateSetsFlagDate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evalCast(date) from timestamp: unexpected error: %v", err)
 	}
-	if got2.Flags&flagDate == 0 {
-		t.Errorf("evalCast(date) from timestamp did not set flagDate; Format()=%q", got2.Format())
+	if !got2.IsDate() {
+		t.Errorf("evalCast(date) from timestamp did not set TimeSubDate; Format()=%q", got2.Format())
 	}
 }

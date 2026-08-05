@@ -1,47 +1,52 @@
-(idle — nothing in flight)
+Task: **M0127-P5.9-u** — `Datum.Flags` was a serialization contract nobody
+declared. COMMITTED; DS05 SF0.5 confirmation run is the only thing outstanding.
 
-Last loop: **M0127-P5.9-o CLOSED** (09 §3.17) — EXPLAIN prints a join's
-RESIDUAL qual as PG's `Join Filter:` line. Before this, `ON jl.a = jr.a AND
-jl.v < jr.w` showed the key as `Hash Cond:` and the second conjunct **nowhere
-in the plan text**, on either arm — the same blind spot `Hash Cond:` closed at
-P2.1, stopping one conjunct short.
+**What landed.** `flagDate` is retired for `Datum.TimeSub` (`TimeSubtype`:
+Timestamp/Date/TimestampTZ/Time/TimeTZ), carved out of the existing alignment
+pad so Datum stays 48 B. The rename is not the point — a *field* with a declared
+value space can be enumerated, a flag bit cannot.
 
-`formatJoinFilter` (`internal/executor/operators_explain.go`) emits it in
-upstream's slot (after `Hash Cond:`/`Merge Cond:`, before the node's own
-`Filter:` — `ExplainNode`'s order for all three join arms) and gets the split
-from `ExecHashKeyPlan`/`ExecMergeKeyPlan`, **the same methods the executor
-uses** to decide what it re-checks per match (upstream's own
-`list_difference(joinclauses, hashclauses)`). Consequence worth keeping: every
-conjunct prints exactly once — in the Cond line if a key enforces it, as
-`Join Filter` otherwise. Nested loop has no key list ⇒ whole Predicate.
+**The audit found two more breaks, not one.** The spill codec is goopg's ONLY
+Datum-level serializer (storage/wire codecs read a declared column type
+alongside the bytes and re-derive the type; a spill frame comes back as a bare
+`Row`). Beyond P5.9-s's lost DATE flag:
+- **`timetz` lost its UTC offset** (`Datum.Scale`, minutes). SILENT and a live
+  wrong answer: `compareDatum` normalises to UTC through it (upstream
+  `timetz_cmp`), so spilled timetz sorted by LOCAL time. Measured — with the
+  `Scale` write reverted, the guard's compare of `12:00-07` vs `13:00+00` flips
+  `+1`→`-1`.
+- **`KindEnum` / `KindToastPointer` had no arm at all** — encode wrote a bare
+  kind byte, decode rejected the frame. Loud, but a query spilling an enum
+  column simply could not run.
 
-Verified byte-for-byte against a throwaway PostgreSQL 18.3 cluster
-(`initdb` → :5533, removed afterwards) on four shapes: one residual conjunct;
-two, as `((jl.v < jr.w) AND (jl.b <> jr.b))`; all-equijoin two-key, where PG
-prints **no** line; merge join.
+**The fix is the contract.** `TestSpillDatumRoundTripCoversEveryKind` /
+`…EveryTimeSubtype` walk `datumKindCount` / `timeSubtypeCount` and FAIL on any
+kind or subtype the codec has no arm for; `decodeDatum` REJECTS an out-of-range
+subtype instead of quietly widening it to a bare timestamp. `Datum.Flags` stays
+unserialized on purpose — `flagBigNumeric` is *representation* state the decoder
+re-establishes (`newNumeric`), and carrying it would forge an arena mantissa.
+Both new guards were proven to bite by reverting each fix in turn.
 
-`TestExplainQualifiesUpperFilter` is unpinned back onto the DEFAULT enumerator
-(the pin existed only because the cross-relation residual — the one shape a
-searched arm leaves at the join node — had no line). New:
-`TestExplainRendersJoinFilterResidual`,
-`TestExplainNoJoinFilterWhenKeysCoverThePredicate`.
+Files: `internal/executor/{datum,spill,expr,codec,copy_text}.go`, new
+`spill_datum_contract_test.go`, 4 touched test files; `09-verification-and-
+acceptance.md` §3.21 + `docs/design/README.md`; ledger row + fix_plan.
 
-**Read the next plan diff with this in mind:** every captured plan whose join
-carries a non-key conjunct grows one line, so the SF0.5 **plan channel** will
-report those queries `changed` with no planner change behind it; `make
-plan-diff` (vs PG) should move the other way. 1 ledger row, 3 deferrals.
+Gates run: `go build ./...`; units (0 FAIL); regress-port BASELINE-RELATIVE in a
+worktree off clean HEAD — 56 tests, **identical verdicts and diff line counts on
+both arms** (absolute parity is 1/52 and means nothing; the worktree needs the
+untracked `postgres` symlink or `pg_isready` is missing); `tpch-spotcheck` Q12=2
+Q13=35 PASS; pgbench smoke via the commit hook.
 
-NEXT LOOP (subject to the fix_plan `## Current Priority` banner, which wins):
-M0127-P5.9 successors — **-m** (collapse-ON acceptance pass, gates the COLLAPSE
-flip; it runs the ~28 min SF0.5 sweep two loops have now deferred to it) and
-**-p** (searched-arm batch-growth fixture).
+NEXT LOOP (banner in `.ralph/fix_plan.md` wins — M0127 is #4 and current):
+**-t** (port `reduce_outer_joins` so a RIGHT arrives as a LEFT, then widen
+`spineLinkSearchable`; full 09 §3 bar), **-p** (searched-arm hash batch-growth
+fixture, units only). Larger: 03 §4.4 `SpecialJoinInfo` inference for the outer
+link buried below an inner one (Q78). Ledger P5.9-u follow-up: populate
+`TimeSubTime`/`TimeSubTimestampTZ` at their producers and switch `compareDatum`
+off the `Scale != 0` timetz inference (it mis-reads a `+00` timetz as a plain
+`time`) — behaviour change, own bar.
 
-Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323, already
-filed as an M-NIGHTLY harness item. Nothing new.
+Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323; all 18
+subjects already filed under M-NIGHTLY. Nothing new.
 
-Gates run: `go build ./...`; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (no FAIL lines);
-`scripts/tpch-spotcheck.sh` **PASS** (Q12=2, Q13=35, 28.3 s query phase);
-pgbench smoke via the commit hook; `make ralph-state-guard`.
-
-In-flight: none.
+In-flight: see the status block — DS05 SF0.5 result is recorded there.
