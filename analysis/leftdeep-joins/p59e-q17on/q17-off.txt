@@ -1,0 +1,8 @@
+# arm=q17off GOOPG_PGSHAPED_DP=0 GOOPG_PGSHAPED_COLLAPSE=0
+# started 2026-08-05T17:12:25+09:00
+# engine-id: 6cc666e77391ed46dc3185b154986ce70858489e 9b06b5433a2c1807361b57dcf6f4cecceb222f7d  diff=1447578f5be4
+# engine-binary: on-disk=c3bb4efa88fd4982 (tmp/goopg-acceptance-bin)
+# per-query cap 180s, serial, digest=1, queries=17
+# host: load0.86 0.83 1.02
+Q17: OK elapsed=33.17s colsig=d54de0dda81daf86 ordered=acb1af46ffdeef81 unordered=acb1af46ffdeef81 rows=1
+# finished 2026-08-05T17:13:00+09:00

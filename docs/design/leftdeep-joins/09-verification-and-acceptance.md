@@ -1586,6 +1586,65 @@ the default), and the volatile-grouping-expression arm that returns
 as grouping expressions over each input, and wiring it would put a second
 variable into this sweep.
 
+### 5.20 Q17 never hung — a Gather swallowed its error, 2026-08-05 (P5.9-e)
+
+Q17 at flag ON was carried for two loops as ">1200 s at 3.8 % CPU vs 20.93 s
+flag-OFF, cause unidentified", with a standing hypothesis that the boundary
+rotation fed the hash join a rotated key column and degenerated it to one
+bucket. **The hypothesis is refuted and the runtime figure was never a runtime
+figure.** Re-measured on the P5.9-c engine, profiled rather than re-EXPLAINed
+per the item's own instruction (`analysis/leftdeep-joins/2026-08-05-p59e-q17-hang.txt`):
+
+| t | RSS | CPU since previous sample | goroutines | statement goroutine |
+|---|---|---|---|---|
+| 60 s | 8.8 GB | 10 % | 19 | `gatherOp.Close` → chan receive |
+| 180 s | 8.8 GB | **0.8 %** | 19 | `gatherOp.Close` → chan receive |
+
+Not one worker goroutine was alive, RSS did not move between the samples, and
+the statement had already left the executor loop. A degenerate hash join is a
+*spin*; this was a *park*. The backend was deadlocked in `gatherOp.Close`
+(`internal/executor/operators_gather.go:374`, `for range o.ch`) — the drain that
+lets a worker blocked mid-send observe cancellation.
+
+**The defect is in `Open`, not in `Close`, and it is not new and not
+flag-specific.** `Open` created `o.ch`, launched the workers, built the leader's
+own child, and started the goroutine that closes `o.ch` **last**. Every error
+return before that line — `prebuildHashJoins`, the leader's `buildChild`, the
+leader's `child.Open` — therefore returned an error while leaving a live channel
+with nobody to close it. The workers exited; the closer never existed; `Close`
+drained forever. The statement's real error never reached the client, so the
+symptom presented as an unbounded runtime with nothing in EXPLAIN to explain it.
+The invariant is now explicit and pinned: **once `o.ch` exists, a closer for it
+exists on every path out of `Open`** (`startChannelCloser`, idempotent, called
+after the last `group.Go` — earlier would close the channel under a worker that
+has not sent yet, and a send on a closed channel panics a goroutine that
+`serveConn`'s recover does not cover).
+`TestGatherCloseTerminatesAfterOpenError` fails on all three arms without the
+fix (30 s watchdog each) and passes with it. The sibling `gatherMergeOp` is
+**structurally immune** and was left alone: its channels are closed by each
+worker's own `defer close(o.chans[idx])`, so the closer is created atomically
+with the goroutine that owns it — the very property plain Gather lacked.
+
+With the error no longer swallowed, Q17 at flag ON says what was actually wrong,
+in *less* wall-clock than the flag-OFF arm takes to succeed:
+
+| arm (same engine `c3bb4efa88fd4982`) | result |
+|---|---|
+| `GOOPG_PGSHAPED_DP=1` | **`ERROR after 28.73s — column ref l_quantity/30 out of VirtualSlot range 27 (chained-NLI?)` (XX000)** |
+| `GOOPG_PGSHAPED_DP=0` | `OK elapsed=33.17s rows=1` |
+
+So P5.9-e's bar is met by its second clause (an attributed finding), and the
+"157×" line in the S5 write-up is withdrawn: there is no Q17 *timing* regression
+to explain. What remains is a plain correctness defect — a column reference
+resolved to index 30 against a 27-wide `VirtualSlot`
+(`internal/executor/expr.go:366`), i.e. an expression whose var indexes do not
+match the tuple layout at the node the PG-shaped search built. That is the same
+family as P5.9-c's rotated coordinate map, one level further out, and it is
+filed as **P5.9-f**; the full bar re-run stays blocked on it. Note what the
+sequence cost: the acceptance bar's per-query timeout could not fire either,
+because the hang is *after* the row stream, in the server, where a client-side
+cancel has nothing to interrupt — a bounded arm is not a bounded server.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

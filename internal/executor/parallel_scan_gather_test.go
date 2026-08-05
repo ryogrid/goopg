@@ -427,3 +427,62 @@ func TestGatherZeroWorkersRunsSerially(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+// TestGatherCloseTerminatesAfterOpenError pins the invariant that M0127-P5.9's
+// Q17 "hang" violated: once Open has created o.ch, EVERY path out of Open must
+// leave a goroutine that will close it, because Close drains that channel
+// unconditionally.
+//
+// The failure this protects against is not a slow query — it is a permanently
+// wedged backend. Open returned an error (leader child build/Open failed), the
+// closer goroutine at the end of Open was skipped, the workers all exited, and
+// Close then sat in `for range o.ch` forever at 0 % CPU. The statement's real
+// error never reached the client, so the symptom presented as "Q17 takes >20
+// min at flag ON" with nothing in EXPLAIN to explain it.
+//
+// Each case runs under a watchdog because the regression is a deadlock: a
+// plain t.Fatalf would never be reached.
+func TestGatherCloseTerminatesAfterOpenError(t *testing.T) {
+	buildErr := errors.New("build refused")
+
+	cases := []struct {
+		name    string
+		workers int
+		mk      func() (Operator, error)
+	}{
+		// Zero workers forces leader participation, so the leader's own
+		// buildChild call is the one that fails — deterministically.
+		{"zero workers, builder fails", 0, func() (Operator, error) { return nil, buildErr }},
+		// With workers launched the same builder fails in every goroutine too,
+		// so the group carries an error AND Open returns one.
+		{"workers launched, builder fails", 2, func() (Operator, error) { return nil, buildErr }},
+		// The second error return in Open: the child builds but refuses Open.
+		{"child Open fails", 0, func() (Operator, error) {
+			return &scriptedOp{schema: planner.Schema{{Name: "n"}}, openErr: buildErr}, nil
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g, _ := newTestGather(tc.workers, tc.mk)
+			ctx := gatherTestCtx(t)
+			// PG's parallel_leader_participation default. It is what makes the
+			// leader build a child of its own in the workers>0 case, and thus
+			// what makes Open able to fail there at all.
+			ctx.ParallelLeaderParticipation = true
+
+			if err := g.Open(ctx); err == nil {
+				t.Fatalf("Open: want error, got nil")
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- g.Close() }()
+			select {
+			case <-done:
+				// Close returned; whatever it returned, it did not deadlock.
+			case <-time.After(30 * time.Second):
+				t.Fatalf("Close deadlocked after a failed Open — o.ch has no closer")
+			}
+		})
+	}
+}

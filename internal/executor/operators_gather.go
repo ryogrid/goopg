@@ -69,6 +69,10 @@ type gatherOp struct {
 	drainErr error
 	launched int
 
+	// closerStarted records that the goroutine which closes o.ch is running.
+	// Open guarantees it before returning on ANY path — see startChannelCloser.
+	closerStarted bool
+
 	// leaderRuns / leaderChild implement parallel_leader_participation: the
 	// leader executes a share of the partial plan itself before falling back
 	// to draining worker output.
@@ -150,6 +154,9 @@ func (o *gatherOp) Open(ctx *Context) error {
 	// and the goroutine launches (which is the publication edge that makes
 	// unlocked reads of the tables safe).
 	if err := o.prebuildHashJoins(ctx); err != nil {
+		// No worker has been launched yet, so Wait returns at once — but the
+		// closer still has to run, or Close's drain has nothing to end it.
+		o.startChannelCloser()
 		return err
 	}
 
@@ -179,6 +186,20 @@ func (o *gatherOp) Open(ctx *Context) error {
 		})
 	}
 
+	// Close the channel once every worker has finished, so Next() sees a clean
+	// end-of-stream rather than having to count workers.
+	//
+	// This starts HERE — after the last group.Go, before anything that can
+	// still fail — and not at the end of Open, because Close's drain loop
+	// (`for range o.ch`) terminates only when someone closes o.ch. When the
+	// closer was started last, every error return below skipped it and left a
+	// live channel with no closer: the statement then hung forever INSIDE
+	// Close, at 0 % CPU, with the real error never reaching the client. That
+	// is what M0127-P5.9's Q17 "hang" was — >20 min parked in gatherOp.Close
+	// while the workers had all exited. The invariant is now: once o.ch
+	// exists, a closer for it exists on every path out of Open.
+	o.startChannelCloser()
+
 	if o.leaderRuns {
 		child, err := o.buildChild()
 		if err != nil {
@@ -194,14 +215,27 @@ func (o *gatherOp) Open(ctx *Context) error {
 		o.leaderChild = child
 	}
 
-	// Close the channel once every worker has finished, so Next() sees a
-	// clean end-of-stream rather than having to count workers.
+	return nil
+}
+
+// startChannelCloser closes o.ch once every launched worker has finished, so
+// Next() sees a clean end-of-stream rather than having to count workers, and so
+// Close's drain always terminates.
+//
+// Idempotent, and it MUST be called after the last group.Go: an empty group's
+// Wait returns immediately, so starting it earlier would close the channel out
+// from under a worker that has not sent yet (a send on a closed channel panics
+// the process, since the panic happens in a goroutine the connection's
+// recover() does not cover).
+func (o *gatherOp) startChannelCloser() {
+	if o.closerStarted {
+		return
+	}
+	o.closerStarted = true
 	go func() {
 		_ = o.group.Wait()
 		close(o.ch)
 	}()
-
-	return nil
 }
 
 // runWorker builds this worker's own operator tree and streams materialised

@@ -8070,7 +8070,11 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `extract(year from …)` is merely the only TPC-H construct that
       type-checks at run time, which is why exactly three queries were loud.
       Re-run the whole bar after P5.9-c/-d/-e. 3 ledger rows.
-      **-c and -d are DONE (2026-08-05); the re-run is blocked only on P5.9-e.**
+      **-c, -d and -e are DONE (2026-08-05); the re-run is now blocked only on
+      P5.9-f.** Two of run 1's clause-1 counts are already re-attributed by -e:
+      Q17's ">3300 s" was never a runtime — it was a Gather that swallowed the
+      query's error — so it belongs with the wrong-answer counts, not the
+      timing ones.
       When it runs: drive both arms with `scripts/tpch-acceptance-arm.sh` and
       `-digest`, and discharge clause 1 with `tpch-runner -diff <off> <on>`
       reporting `VERDICT: PASS` — a row-count table is no longer evidence
@@ -8136,18 +8140,39 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       digest too, so a clean run produces no spurious `ORDER-DIFF`. Cost 389 s
       vs run 1's digest-less 380.1 s (~2 %, ~61k rows scanned).
       Evidence: `analysis/leftdeep-joins/2026-08-05-p59d-digest-selfdiff.txt`.
-- [ ] **M0127-P5.9-e — Q17 hangs at flag ON and the cause is unidentified.**
-      Re-measured in isolation (fresh server, age 0, only Q17): >1200 s at 3.8%
-      CPU / ~8.7 GB RSS vs 20.93 s flag-OFF, so the documented sweep-tail /
-      `GOGC=off` confound is REFUTED. Its flag-ON EXPLAIN differs from flag-OFF
-      by one line (a duplicated `part` qual no longer re-applied at the top
-      join), so nothing printed predicts 157×. Standing hypothesis, UNTESTED:
-      the boundary rotation feeds the hash join a rotated key column and
-      degenerates it to one bucket (the known single-key-degeneracy shape).
-      **Re-measure after P5.9-c lands before opening any separate work** — if it
-      still hangs, profile it (low CPU + large heap points at allocation, not a
-      spin) rather than re-reading EXPLAIN. 09 §5 (of the acceptance file).
-      Bar: Q17 ≤ 2× its flag-OFF 20.93 s, or an attributed finding.
+- [x] **M0127-P5.9-e — Q17 never hung; a Gather swallowed its error.**
+      DONE 2026-08-05 — bar met by its second clause (an attributed finding).
+      Profiled instead of re-read: 19 goroutines, ZERO workers, RSS flat at
+      8.8 GB, 0.8% CPU, the statement parked in `gatherOp.Close`'s drain. A
+      park, not a spin — so the single-key-degeneracy hypothesis is REFUTED.
+      `gatherOp.Open` started the goroutine that closes `o.ch` LAST, so each of
+      its three error returns left a live channel with no closer and `Close`
+      blocked forever in `for range o.ch`, delivering neither rows nor the
+      error (a pre-existing, flag-independent wedge). Fix:
+      `startChannelCloser`, idempotent, called after the last `group.Go` on
+      every path out of `Open`;
+      `TestGatherCloseTerminatesAfterOpenError` deadlocks all three arms
+      without it. Sibling `gatherMergeOp` is structurally immune (per-worker
+      `defer close(o.chans[idx])`) and unchanged. With the error surfaced,
+      flag-ON Q17 **errors at 28.73 s** vs the flag-OFF control's 33.17 s
+      success on the same engine — there is no Q17 timing regression and the
+      "157×" figure is withdrawn. 09 §5.20; parallel-query/05 §3;
+      `analysis/leftdeep-joins/2026-08-05-p59e-q17-hang.txt`. Bar met: UNITS +
+      SPOT + the two arms above. 1 ledger row (the residue → P5.9-f).
+- [ ] **M0127-P5.9-f — flag-ON Q17 addresses a column past the tuple width.**
+      `column ref l_quantity/30 out of VirtualSlot range 27 (chained-NLI?)`
+      (XX000, `internal/executor/expr.go:366`) after 28.7 s, discovered by
+      P5.9-e once the Gather stopped swallowing it. An expression whose Var
+      indexes exceed the schema width at a node the PG-shaped search built —
+      the P5.9-c family (a coordinate map correct at the boundary, wrong above
+      it) one level further out. Q17 is the correlated-aggregate subquery
+      shape and the message's own guess names the chained NLI. Start by
+      dumping the failing node's schema width against the Var indexes its
+      residual carries; do NOT start from EXPLAIN (P5.9-e's lesson: the plan
+      text differed by one line and predicted nothing). **P5.9's full bar
+      re-run is blocked on this.** 09 §5.20; IMPLEMENTATION-TODO P5.9-f.
+      Bar: flag-ON Q17 returns rows matching the flag-OFF arm under
+      `tpch-runner -diff`.
 - [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
       conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
       `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1

@@ -1299,9 +1299,10 @@
   clause 3 on two, and every clause-1 failure is the ONE defect below. §4/§5
   and the DS05 gate were deliberately not run — they score plan QUALITY on a
   build whose plans compute the wrong answer. Re-run the whole bar after
-  P5.9-c/-d/-e. **-c and -d are now done: the re-run is blocked only on P5.9-e,
-  and it must be driven by `scripts/tpch-acceptance-arm.sh` with `-digest` on
-  both arms, discharging clause 1 through `tpch-runner -diff` (09 §3.3).**
+  P5.9-c/-d/-e. **-c, -d and -e are now done: the re-run is blocked only on
+  P5.9-f (the Q17 correctness defect that -e attributed), and it must be driven
+  by `scripts/tpch-acceptance-arm.sh` with `-digest` on both arms, discharging
+  clause 1 through `tpch-runner -diff` (09 §3.3).**
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is
@@ -1343,14 +1344,34 @@
   Q3/Q10/Q16/Q15a matched on the ORDERED digest too, so a clean run yields no
   spurious `ORDER-DIFF`). Cost ~2 % of arm wall time. Ledger row: the diff
   compares two goopg arms, never the PG oracle.
-- [ ] **P5.9-e** Q17 hangs at flag ON, cause unidentified. Isolated re-run
-  (fresh server, age 0, Q17 alone) still exceeded 1200 s at 3.8% CPU / ~8.7 GB
-  RSS vs 20.93 s flag-OFF, refuting the sweep-tail / `GOGC=off` confound. Its
-  EXPLAIN differs by one line. Untested hypothesis: the P5.9-c rotation feeds
-  the hash join a rotated key column → one bucket (single-key degeneracy).
-  Re-measure after P5.9-c before opening separate work; profile rather than
-  re-read EXPLAIN if it survives. Gate: Q17 ≤ 2× 20.93 s, or an attributed
-  finding.
+- [x] **P5.9-e** Q17 never hung — a Gather swallowed its error. DONE 2026-08-05
+  (bar met by its second clause, an attributed finding; 09 §5.20;
+  `analysis/leftdeep-joins/2026-08-05-p59e-q17-hang.txt`). Profiled per the
+  item's own instruction instead of re-reading EXPLAIN: 19 goroutines, ZERO
+  workers, RSS flat, 0.8 % CPU, the statement parked in `gatherOp.Close`'s
+  drain — a park, not the spin a degenerate hash join would show, so the
+  single-key-degeneracy hypothesis is REFUTED. `gatherOp.Open` started the
+  goroutine that closes `o.ch` LAST, so its three error returns left a live
+  channel with no closer and `Close` drained forever, delivering neither rows
+  nor the error. Fix: `startChannelCloser` (idempotent, after the last
+  `group.Go`) invoked on every path out of `Open`;
+  `TestGatherCloseTerminatesAfterOpenError` fails all three arms without it.
+  `gatherMergeOp` is structurally immune (per-worker `defer close`) and
+  unchanged. With the error surfaced, flag-ON Q17 **errors at 28.73 s** —
+  `column ref l_quantity/30 out of VirtualSlot range 27` (expr.go:366) — while
+  the flag-OFF control on the same engine takes 33.17 s to succeed, so there is
+  no Q17 timing regression at all and the "157×" figure is withdrawn. The
+  residue is a correctness defect, filed as P5.9-f.
+- [ ] **P5.9-f** Flag-ON Q17 raises `column ref l_quantity/30 out of
+  VirtualSlot range 27 (chained-NLI?)` (`internal/executor/expr.go:366`) after
+  28.7 s: an expression whose var indexes exceed the tuple width at the node
+  the PG-shaped search built — the P5.9-c family (a coordinate map that is
+  right at the boundary and wrong above it) one level further out. Q17 is the
+  correlated-aggregate subquery shape, and the message's own guess names the
+  chained NLI. Start by dumping the failing node's schema width against the
+  Var indexes the residual carries. **P5.9's full bar re-run is blocked on
+  this.** Gate: Q17 flag-ON returns rows matching the flag-OFF arm under
+  `tpch-runner -diff`.
 
 ## P-S6 — Compiled key/residual evaluation [S6]
 
