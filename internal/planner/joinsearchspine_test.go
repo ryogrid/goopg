@@ -286,27 +286,128 @@ func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 	}
 }
 
-// TestPGShapedSeamDeclinesANonLeftSpine: RIGHT and FULL nullify the LEFT side,
-// which is the side the search plans and the side the seam pushes conjuncts into,
-// so neither may be peeled. goopg has no `reduce_outer_joins` pass to rewrite a
-// RIGHT into a LEFT with swapped sides (collapse.go), so RIGHT reaches the seam
-// as itself and must be declined rather than swapped.
-func TestPGShapedSeamDeclinesANonLeftSpine(t *testing.T) {
+// TestPGShapedSeamDeclinesAFullSpine: FULL null-extends BOTH of its inputs, and
+// its USING coalescing (`UsingLeftCols`/`UsingRightCols`, planner.go) names
+// merged-var positions that a re-associated input would have to be re-checked
+// against. It stays declined — the one join type `spineLinkSearchable` still
+// refuses — and the fixture checks the tree came back untouched rather than
+// half-spliced.
+func TestPGShapedSeamDeclinesAFullSpine(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
-	for _, spelling := range []string{"RIGHT", "FULL"} {
-		t.Run(spelling, func(t *testing.T) {
-			node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
-				"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x "+spelling+" JOIN d ON c.x = d.x")
-			pred := seamLocal(names, 0)
-			out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
-			if used {
-				t.Fatalf("the seam searched the NULLABLE side of a %s JOIN", spelling)
-			}
-			if out != node || residual != pred {
-				t.Fatal("the seam altered its inputs while declining")
-			}
-		})
+	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
+		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x FULL JOIN d ON c.x = d.x")
+	pred := seamLocal(names, 0)
+	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
+	if used {
+		t.Fatal("the seam searched an input of a FULL JOIN")
+	}
+	if out != node || residual != pred {
+		t.Fatal("the seam altered its inputs while declining")
+	}
+}
+
+// TestPGShapedSeamSearchesTheNullablePrefixBelowARightJoinSpine is P5.9-t's
+// subject. `a ⋈ b ⋈ c RIGHT JOIN d` puts the three-relation subproblem on the
+// LEFT of the pin — goopg's FROM chain is left-deep and a join's right side is a
+// single range var, so that is where a RIGHT JOIN's multi-relation side always
+// is — and upstream searches it: `deconstruct_recurse` builds a sub-joinlist for
+// an outer join's nullable arm and `make_rel_from_joinlist` recurses into it.
+//
+// The ORDER is searchable; the `WHERE` is not pushable. Both halves are asserted
+// here, because getting only the first is a wrong answer rather than a slow plan.
+func TestPGShapedSeamSearchesTheNullablePrefixBelowARightJoinSpine(t *testing.T) {
+	withPGShapedDP(t)
+	names := []string{"a", "b", "c", "d"}
+	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
+		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x RIGHT JOIN d ON c.x = d.x")
+	spine, isJoin := node.(*Join)
+	if !isJoin || spine.Type != JoinTypeRight {
+		t.Fatalf("fixture root is %T, want the RIGHT spine link", node)
+	}
+	spineQual := spine.Predicate
+	pred := seamLocal(names, 0) // `a1 > 5`, on the null-extended prefix
+
+	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
+	if !used {
+		t.Fatal("the seam declined a 3-relation prefix below a RIGHT JOIN — the order of an " +
+			"outer join's nullable arm is a subproblem upstream searches")
+	}
+	// The spine link is the returned root, by identity, and still a RIGHT join.
+	if out != Node(spine) {
+		t.Fatalf("the seam returned %T, want the original RIGHT join node — the spine must be "+
+			"spliced, not rebuilt", out)
+	}
+	if spine.Type != JoinTypeRight {
+		t.Fatalf("the spine link is now %v, want RIGHT — the seam changed which rows survive",
+			spine.Type)
+	}
+	if spine.Predicate != spineQual {
+		t.Fatal("the spine's ON qual was replaced; it is enforced by the outer join itself")
+	}
+	if !isSearchedTree(spine.Left) {
+		t.Fatalf("the spine's left input is %T and untagged — the prefix was not searched",
+			spine.Left)
+	}
+	// The prefix's own ON quals still reach the search: they originate BELOW the
+	// outer join, so upstream distributes them normally and dropping them would
+	// be a cross product.
+	got := seamEqualities(spine.Left)
+	for _, want := range []string{"a0=b0", "b0=c0"} {
+		if !got[want] {
+			t.Fatalf("the searched prefix does not enforce %s (enforces %v) — the prefix's own "+
+				"ON quals are not delayed by the outer join above it", want, got)
+		}
+	}
+	if got["c0=d0"] {
+		t.Fatalf("the searched prefix enforces the SPINE's qual c0=d0 (enforces %v)", got)
+	}
+	// …and the WHERE does not. This is the half that is a wrong answer if missed:
+	// `a1 > 5` under a RIGHT JOIN must see the null-extended rows.
+	if residual != pred {
+		t.Fatalf("residual = %v, want the WHERE conjunct itself — a qual from above a RIGHT "+
+			"JOIN may not be evaluated on its nullable input", residual)
+	}
+	if n := len(seamLeafLocalFilters(spine.Left)); n != 0 {
+		t.Fatalf("found %d leaf-local filters in the searched prefix, want 0 — a WHERE qual was "+
+			"pushed below the join that null-extends that relation", n)
+	}
+	rfjAssertBindingOrder(t, out, names)
+	if n := len(rfjJoins(spine.Left)); n != 2 {
+		t.Fatalf("searched prefix has %d joins, want 2 for its 3 relations", n)
+	}
+}
+
+// TestPGShapedSeamHoldsTheWholeWhereBelowAMixedSpine: one RIGHT link anywhere on
+// the spine nullifies the prefix for every link above it, so the suppression is a
+// property of the SPINE and not of its topmost link. Without `prefixNullable`
+// scanning the whole stack, a `… RIGHT JOIN c LEFT JOIN d` spine would read as
+// "topmost link is LEFT, push freely" and push `a1 > 5` below the RIGHT join.
+func TestPGShapedSeamHoldsTheWholeWhereBelowAMixedSpine(t *testing.T) {
+	withPGShapedDP(t)
+	names := []string{"a", "b", "c", "d"}
+	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
+		"a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
+	pred := seamLocal(names, 0)
+
+	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
+	if !used {
+		t.Fatal("the seam declined a two-link LEFT-over-RIGHT spine")
+	}
+	if residual != pred {
+		t.Fatalf("residual = %v, want the WHERE conjunct itself — the RIGHT link BELOW the "+
+			"topmost LEFT one still null-extends `a`", residual)
+	}
+	top := out.(*Join)
+	if top.Type != JoinTypeLeft {
+		t.Fatalf("top spine link is %v, want LEFT", top.Type)
+	}
+	low := top.Left.(*Join)
+	if low.Type != JoinTypeRight {
+		t.Fatalf("lower spine link is %v, want RIGHT", low.Type)
+	}
+	if n := len(seamLeafLocalFilters(low.Left)); n != 0 {
+		t.Fatalf("found %d leaf-local filters below the RIGHT link, want 0", n)
 	}
 }
 

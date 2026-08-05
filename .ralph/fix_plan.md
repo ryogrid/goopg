@@ -8207,8 +8207,33 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       spelling failed identically, and `work_mem='2GB'` answered correctly).
       Fixed in both halves of the pair, with `flagBigNumeric` deliberately not
       carried; the flag-vs-type carrier gap is ledgered. Successors below.
-- [ ] **M0127-P5.9-t — a RIGHT JOIN reaches the planner as itself, so its
-      spine cannot be peeled.** NEW 2026-08-06 (09 §3.20, ledger row P5.9-s).
+- [x] **M0127-P5.9-t — a RIGHT JOIN reaches the planner as itself, so its
+      spine cannot be peeled.** DONE 2026-08-06 (09 §3.22, ledger row P5.9-t).
+      **The filing below was wrong twice, and that is the finding.** (1) The
+      `reduce_outer_joins` flip CANNOT be represented: `parser.FromExpr` is a
+      `Base RangeVar` plus a FLAT `[]JoinExpr` with single-range-var right
+      sides, so the flipped `d LEFT JOIN (a ⋈ b ⋈ c)` has no node; flipping
+      inside the planner's own tree instead would renumber every binding offset
+      and reorder `SELECT *`, which upstream escapes only because its Vars are
+      varno-addressed. (2) The flip was never what the seam needed — a left-deep
+      chain already puts a RIGHT JOIN's multi-relation side on the LEFT of the
+      pin, exactly where a LEFT JOIN's is, so `splitOuterSpine` needed no change
+      at all. What differs is NULLABILITY: the prefix's ORDER is searchable
+      either way (`deconstruct_recurse` builds a sub-joinlist for an outer
+      join's nullable arm), but the `WHERE` is not pushable into it
+      (`check_outerjoin_delay`). **LANDED:** `spineLinkSearchable` admits a
+      MATCHED LEFT/LEFT or RIGHT/RIGHT pair, and the new `prefixNullable` scans
+      the whole spine so one RIGHT link anywhere holds the entire `WHERE` in the
+      residual above it; the prefix's own `ON` quals are unaffected. Measured by
+      reverting the guard: `… RIGHT JOIN rj_c … WHERE rj_a.id IS NULL` returns
+      all three `rj_c` rows null-extended instead of the one. Four guards
+      (two planner, two end-to-end row-set), all proven to bite. Gates: full
+      units 0 FAIL, `tpch-spotcheck` Q12=2 Q13=35 PASS, DS05 SF0.5 sweep — a
+      no-regression reading, since the corpus contains no RIGHT JOIN at all.
+      Deferred (ledger row P5.9-t): `reduce_outer_joins`' actual REDUCTIONS (the
+      strict-qual RIGHT→INNER proof that would let the qual push — a
+      pessimization, never a wrong answer) and FULL spines.
+      **↳ SUPERSEDED FILING BELOW (kept for attribution).** (09 §3.20, ledger row P5.9-s).
       `spineLinkSearchable` (joinsearchseam.go) admits `JoinTypeLeft` alone,
       because the peeled link's LEFT side is what the search plans and what the
       seam pushes conjuncts into — for RIGHT that side is the NULLABLE one, so

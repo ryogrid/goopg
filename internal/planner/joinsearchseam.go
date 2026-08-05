@@ -239,7 +239,23 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// inner join's qual has no other property to distinguish it — which is why
 	// a single-relation `ON` qual becomes a leaf-local filter here exactly as a
 	// single-relation `WHERE` qual does.
-	conjuncts := splitAnd(pred)
+	//
+	// M0127-P5.9-t: unless the prefix is NULLABLE. A RIGHT link nullifies its
+	// left input — the prefix — so a `WHERE` conjunct reading a prefix relation
+	// is a test on null-extended rows and may not be evaluated below the join
+	// that produces the NULLs. That is `check_outerjoin_delay` (initsplan.c):
+	// a qual from ABOVE an outer join whose relids reach the nullable side is
+	// delayed to the join itself, and here "delayed" is spelled as "held in the
+	// residual `Filter` the caller puts above the spine". The prefix's OWN `ON`
+	// quals are unaffected — they originate BELOW the outer join, so upstream
+	// distributes them normally, and suppressing them would cost a cross
+	// product rather than a wrong answer.
+	var conjuncts, heldAbovePrefix []Expr
+	if prefixNullable(spine) {
+		heldAbovePrefix = splitAnd(pred)
+	} else {
+		conjuncts = splitAnd(pred)
+	}
 	for _, q := range onQuals {
 		conjuncts = append(conjuncts, splitAnd(q)...)
 	}
@@ -294,7 +310,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		return node, pred, false
 	}
 
-	var left []Expr
+	// The held-back `WHERE` conjuncts lead, so a statement whose whole `WHERE`
+	// is held comes back with `residual == pred` by identity (`combineAnd` of
+	// one element is that element) rather than a re-associated copy.
+	left := append([]Expr(nil), heldAbovePrefix...)
 	for _, c := range searchConjuncts {
 		if !searchConsumes(c, cumOffsets) {
 			left = append(left, c)
@@ -344,19 +363,38 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 // `ok == true` with an empty spine is the no-outer-link case, where `chain` is
 // `node` and `prefix` is `jl` — the identity, so P5.9-r's shapes are unaffected.
 //
-// # Only LEFT, and the reason is what gets pushed below it
+// # LEFT and RIGHT, and the difference is what may be pushed below the link
 //
-// `spineLinkSearchable` admits `JoinTypeLeft` alone. The prefix is that link's
-// LEFT side, which for a LEFT JOIN is the non-nullable one, and the search does
-// not merely reorder it: the seam attaches single-relation conjuncts to prefix
-// leaves and lets the search place spanning ones INSIDE the prefix, i.e. BELOW
-// the outer join. Upstream does the same for the same set —
-// `check_outerjoin_delay` (initsplan.c) delays a qual only when its relids reach
-// the NULLABLE side — and for RIGHT the nullable side IS the left one, so the
-// same push would turn `WHERE a.x IS NULL` from a test on null-extended rows into
-// a test on `a`'s own rows. FULL nullifies both sides. goopg has no
-// `reduce_outer_joins` pass to rewrite RIGHT into LEFT (collapse.go), so RIGHT
-// reaches here as itself and is declined rather than swapped.
+// The prefix is always the link's LEFT side, whichever way the link points —
+// goopg's FROM chain is left-deep and a `JoinExpr`'s right side is a single
+// range var, so the multi-relation subproblem is on the left of a RIGHT JOIN
+// exactly as it is on the left of a LEFT JOIN. What changes is NULLABILITY:
+// a LEFT link preserves its left input, a RIGHT link null-extends it.
+//
+// That matters because the search does not merely reorder the prefix: the seam
+// attaches single-relation conjuncts to prefix leaves and lets the search place
+// spanning ones INSIDE the prefix, i.e. BELOW the outer join. Upstream's rule is
+// `check_outerjoin_delay` (initsplan.c) — a qual coming from ABOVE an outer join
+// is delayed when its relids reach the NULLABLE side — so under a RIGHT link the
+// `WHERE` may not be pushed at all, or `WHERE a.x IS NULL` would turn from a test
+// on null-extended rows into a test on `a`'s own rows. `prefixNullable` decides
+// that, and `tryPGShapedJoinSearch` holds the whole `WHERE` in the residual when
+// it answers true; the ORDER search is legal either way, because it is upstream's
+// own sub-joinlist for the nullable side (`deconstruct_recurse` on a JoinExpr's
+// nullable arm builds one, and `make_rel_from_joinlist` recurses into it).
+//
+// FULL stays out: both of its inputs are null-extended, and its `UsingLeftCols`
+// / `UsingRightCols` coalescing names merged-var positions that a re-associated
+// input would have to be checked against. Ledgered, not forgotten.
+//
+// This is deliberately NOT upstream's `reduce_outer_joins` RIGHT→LEFT flip
+// (prepjointree.c:3360). That flip swaps a `JoinExpr`'s arms, which goopg's
+// `parser.FromExpr` — a `Base` range var plus a FLAT `[]JoinExpr` — cannot
+// represent: the flipped shape is `d LEFT JOIN (a ⋈ b ⋈ c)`, a nested join on
+// the right side, and there is no node for it. Flipping inside the planner's own
+// tree instead would renumber every binding offset and reorder `SELECT *`, which
+// upstream avoids only because its Vars are varno-addressed. The flip is a
+// representation change; what the seam actually needed was the delay rule.
 //
 // Semi/anti spines are declined too, and are not a gap: `runJoinSearchBelowPinned`
 // (predp.go) already descends those before the seam is called, so the `node` the
@@ -378,10 +416,28 @@ func splitOuterSpine(node Node, jl joinlist) (chain Node, spine []*Join, prefix 
 	return chain, spine, prefix, true
 }
 
+// prefixNullable reports whether the peeled spine null-extends the prefix below
+// it, i.e. whether a `WHERE` conjunct reading a prefix relation would be a test
+// on null-extended rows.
+//
+// ONE nullifying link anywhere on the spine is enough, and it is the LINK's own
+// left input that is nullified: the spine is a stack, so a RIGHT link's NULLs
+// flow up through every link above it whatever those links are. Written as
+// "anything that is not LEFT" rather than "RIGHT" so a join type added to
+// `spineLinkSearchable` later is nullable until someone says otherwise.
+func prefixNullable(spine []*Join) bool {
+	for _, j := range spine {
+		if j.Type != JoinTypeLeft {
+			return true
+		}
+	}
+	return false
+}
+
 // spineLinkSearchable reports whether one peeled link may stay pinned above a
 // searched prefix: the plan node and the joinlist must name the same join type,
-// that type must be LEFT (see `splitOuterSpine`), and the link must carry no
-// LATERAL dependency.
+// that type must be LEFT or RIGHT (see `splitOuterSpine`), and the link must
+// carry no LATERAL dependency.
 //
 // LATERAL is checked on both spellings for the reason `chainCarriesLateral`
 // states — `planFromClause` marks the join it builds while a FROM-clause SRF's
@@ -390,7 +446,14 @@ func splitOuterSpine(node Node, jl joinlist) (chain Node, spine []*Join, prefix 
 // one shape whose correctness depends on more than the left side's column
 // layout, which is all this splice preserves.
 func spineLinkSearchable(j *Join, t parser.JoinType) bool {
-	if j.Type != JoinTypeLeft || t != parser.JoinLeft {
+	// The two spellings must AGREE, not merely both be admissible: which member
+	// of the pin is the left side is the whole question the splice answers, and
+	// a plan node saying LEFT under a joinlist saying RIGHT means one of them is
+	// not describing this statement.
+	switch {
+	case j.Type == JoinTypeLeft && t == parser.JoinLeft:
+	case j.Type == JoinTypeRight && t == parser.JoinRight:
+	default:
 		return false
 	}
 	return !j.Lateral && !nodeReferencesOuter(j.Right)

@@ -3312,3 +3312,93 @@ declared but not populated by their producers, and `compareDatum` still infers
 "is a timetz" from `Scale != 0` — which mis-reads a genuine `+00` timetz as a
 plain `time`. Wiring the producers and switching that test to `TimeSub` is the
 follow-up; it is a behaviour change and needs its own bar.
+
+### 3.22 A RIGHT JOIN's nullable arm may be REORDERED but not PUSHED INTO — and the flip that was supposed to enable it cannot be represented (P5.9-t, 2026-08-06)
+
+P5.9-s peeled the pinned outer spine off the top of a FROM chain and searched
+the prefix below it, but `spineLinkSearchable` admitted `JoinTypeLeft` alone.
+The follow-up was filed as "port `reduce_outer_joins`
+(postgres/src/backend/optimizer/prep/prepjointree.c:3360) so a RIGHT arrives as
+a LEFT with swapped sides, then widen the check". **Both halves of that filing
+turned out to be wrong, and the second one is the interesting half.**
+
+**The flip cannot be represented.** Upstream's flip swaps a `JoinExpr`'s `larg`
+and `rarg`. goopg's `parser.FromExpr` is a `Base RangeVar` plus a **flat**
+`[]JoinExpr` whose every right side is a single range var — a strictly left-deep
+chain with no node for a nested join. The flipped shape of
+`a ⋈ b ⋈ c RIGHT JOIN d` is `d LEFT JOIN (a ⋈ b ⋈ c)`, which that AST cannot
+spell. Performing the swap inside the planner's own tree instead is not a
+workaround but a different change: a `Join`'s schema is the positional
+concatenation of its inputs, so swapping arms renumbers every binding offset and
+reorders `SELECT *`. Upstream is free of that only because its Vars are
+varno-addressed and `SELECT *` was expanded against the range table at parse
+analysis, before the planner ever sees the jointree.
+
+**The flip was never what the seam needed.** Because the chain is left-deep, a
+RIGHT JOIN's multi-relation side is on the **left** of the pin — exactly where a
+LEFT JOIN's is. `splitOuterSpine` already walks `j.Left`; nothing structural
+distinguishes the two cases. What distinguishes them is **nullability**, and
+therefore what may be pushed *into* the prefix:
+
+- the ORDER of the prefix is searchable either way. Upstream builds a
+  sub-joinlist for an outer join's nullable arm (`deconstruct_recurse`) and
+  `make_rel_from_joinlist` recurses into it — the relations inside a nullable arm
+  may be joined in any order among themselves;
+- the `WHERE` is not pushable. `check_outerjoin_delay` (initsplan.c) delays a
+  qual coming from *above* an outer join whenever its relids reach the nullable
+  side. Under a RIGHT link the prefix **is** the nullable side, so the whole
+  `WHERE` is delayed.
+
+So the landed change is: `spineLinkSearchable` admits a matched LEFT/LEFT or
+RIGHT/RIGHT pair (the plan node and the joinlist must **agree** — which member of
+the pin is the left side is the entire question the splice answers), and
+`prefixNullable` scans the whole spine so that one RIGHT link anywhere holds the
+entire `WHERE` in the residual `Filter` above the spine. The prefix's own `ON`
+quals are unaffected: they originate *below* the outer join, upstream distributes
+them normally, and suppressing them would cost a cross product rather than a
+wrong answer.
+
+`prefixNullable` is written as "anything that is not LEFT" rather than "is
+RIGHT", so a join type added to `spineLinkSearchable` later is nullable until
+someone argues otherwise.
+
+FULL stays declined. Both of its inputs are null-extended, and its USING
+coalescing (`UsingLeftCols`/`UsingRightCols`, planner.go) names merged-var
+positions a re-associated input would have to be re-checked against.
+
+**Verification.** The wrong answer is not hypothetical and is not subtle. The
+executor-level guard runs
+
+```sql
+SELECT rj_c.id, rj_a.id, rj_b.id
+  FROM rj_a JOIN rj_b ON rj_a.id = rj_b.aid
+  RIGHT JOIN rj_c ON rj_b.cid = rj_c.id
+ WHERE rj_a.id IS NULL
+```
+
+which must answer the single null-extended row. With `prefixNullable` disabled
+the seam attaches `rj_a.id IS NULL` to the `rj_a` leaf, that leaf yields nothing,
+and **all three** `rj_c` rows come back null-extended — measured, by reverting
+the guard. `TestRightJoinSpineAgreesAcrossEnumerators` additionally pins the
+unrestricted join's rows against both enumerators, so a lost prefix `ON` qual (a
+cross product, which the restricted form cannot see) fails too.
+
+Planner-side: `TestPGShapedSeamSearchesTheNullablePrefixBelowARightJoinSpine`
+asserts the spine node's identity, type and `ON` qual survive the splice, that
+the prefix enforces its own two `ON` quals and not the spine's, and that zero
+leaf-local filters were installed; `TestPGShapedSeamHoldsTheWholeWhereBelowAMixedSpine`
+covers `… RIGHT JOIN c LEFT JOIN d`, where reading only the topmost link would
+conclude "push freely". Both were proven to bite.
+
+Gates: full units (0 FAIL); `tpch-spotcheck` Q12=2 Q13=35 PASS; the TPC-DS SF0.5
+sweep. The corpus contains **no** RIGHT JOIN — `grep` over the TPC-DS and TPC-H
+query sets finds none — so the sweep is a no-regression reading rather than a
+demonstration, and the demonstration is the two guards above.
+
+**Still open** (ledger row P5.9-t): `reduce_outer_joins`' actual *reductions* are
+still unported. PG turns `a ⋈ b RIGHT JOIN c WHERE a.x = 5` into an INNER join
+(the strict qual on the nullable side proves no null-extended row survives) and
+then pushes `a.x = 5` down freely; goopg keeps the RIGHT and holds the qual
+above it. That is a pessimization, never a wrong answer, and it is the reduction
+half — not the flip half — that is worth porting, since the flip is unrepresentable
+and unnecessary.
