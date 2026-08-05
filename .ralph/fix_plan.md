@@ -7462,8 +7462,14 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       per-query verdicts BYTE-IDENTICAL to the `f05b5329` baseline, named
       TIMEOUT set still exactly `{Q47}` — **50 of 99 plan shapes changed** (the
       previous sweep changed 0), so the blast radius is real and cost 0
-      verdicts. It did NOT un-time-out Q47; that stays open under -f-vii and
-      the successor below. New tests
+      verdicts. Estimate audit
+      `analysis/leftdeep-joins/2026-08-05-p56fvi-postfix.txt`: no new
+      violation, per-joinrel moves ±1–4 %, and the corpus's one standing
+      violation (Q18's final SEMI) IMPROVED 25 182× → 23 433×. That check was
+      load-bearing, not a formality — the fix removes a downward correction, so
+      every affected estimate moves UP into a corpus already dominated by
+      over-estimates. It did NOT un-time-out Q47; that stays open under -f-vii
+      and the successor below. New tests
       `internal/planner/cardinality_pusheddown_test.go` (3).
 - [ ] **M0127-P5.6-f-viii — Q47 still takes the nested loop with `v1` at
       3 626.** With -f-vi landed the 425× under-estimate is gone (18 → 3 626

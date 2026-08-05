@@ -1337,6 +1337,20 @@ nested loop. Stated plainly because §5.17's chain predicted the estimate fix
 would be *necessary*, not that it would be *sufficient*, and only the first half
 is now evidence.
 
+**The estimate audit is the load-bearing check here, not a formality.** The fix
+*removes* a downward correction, so every affected joinrel estimate moves UP —
+and §5's TPC-H corpus is dominated by OVER-estimates (Q3's `d2` sat at 10.2×
+over). A broad upward shift could therefore have pushed a joinrel through the
+10³ tripwire. It did not:
+`analysis/leftdeep-joins/2026-08-05-p56fvi-postfix.txt` vs the `p56gv-postfix`
+baseline shows per-joinrel moves of **±1–4 %** and no new violation. The corpus
+keeps its single standing violation, Q18's final SEMI, which *improved*
+25 182× → 23 433× (still the aggregate-result-statistics gap ledgered under
+P5.6-g-v, not a joinrel-sizing defect). TPC-H barely moves because its
+single-relation restrictions mostly reach their leaves through Slice A
+(`attachRelationLocalFilters`), which partitions them out pre-DP and never
+leaves a duplicate; `pushInnerJoinInputQuals` is the TPC-DS-shaped path.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
