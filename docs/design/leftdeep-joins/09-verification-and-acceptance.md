@@ -3405,3 +3405,58 @@ then pushes `a.x = 5` down freely; goopg keeps the RIGHT and holds the qual
 above it. That is a pessimization, never a wrong answer, and it is the reduction
 half — not the flip half — that is worth porting, since the flip is unrepresentable
 and unnecessary.
+
+### 3.23 A hash join's geometry cannot see a scan's quals, so the growth path's fixture is a WIDTH mis-estimate, not a selectivity one (P5.9-p, 2026-08-06)
+
+`TestExplainAnalyzeHashJoinReportsGrownBatches` is the only coverage of
+`hashBatchState.increaseNumBatches` — the path that doubles nbatch when a build
+overruns the budget its geometry chose. nbatch grows **only** when that geometry
+was sized too small, so the test needs a build the planner under-estimates.
+
+It used to get one by accident. `newDDLFixture` installed no block-count reader,
+so every never-ANALYZEd fixture relation sized at the 1-row floor and a 4 000-row
+build looked like one row. P5.9 installed the reader (the server has one; a
+fixture without it plans nothing like production) and the accident went away —
+correct planner behaviour, zero executor coverage. The stopgap blinded the
+fixture again (`SetRelationSizer(nil)`) **and** pinned the legacy enumerator,
+because a blind searched arm costs a nested loop rather than a hash join and so
+produces nothing to grow. P5.9-p's filing asked for the honest replacement: "a
+deliberately mis-estimated selectivity on the build side is the
+production-realistic trigger."
+
+**That proposal does not work, and why it does not is the finding.** The
+geometry is `hashsize.Choose(planner.EstimateRows(buildNode), buildWidth, 0, …)`
+(`buildGeometry`, operators_join_agg.go). For a searched scan the base
+restrictions ride **on the scan node**, not in a `*Filter` wrapper, and
+`seqScanRows` (cardinality.go) returns the relation's row count and ignores
+them. So a `WHERE` on the build side is invisible to the hash table's sizing no
+matter how badly it is estimated. Measured directly: with `b.k = b.kdup` (a
+column-column equality, `defaultEqSelectivity` = 0.005, true for every row) the
+**join** line moved from `rows=1840` to `rows=171` — the search prices the
+clause in `makeJoinRel` — while `Batches: 4` did not move at all, and no
+`(originally …)` form ever appeared. Two estimates for one scan, and the
+executor reads the one that did not change.
+
+The route that does work is the **width**. `buildGeometry` passes
+`avgVarBytes = 0` because goopg has no per-column average-width statistic, so a
+build is priced as if only its fixed-width Datum array were resident and a
+text-heavy one is under-counted by the whole size of its values (deferral ledger
+2026-08-03 M0127-P3.1). This is the one mis-estimate that leaves the **row**
+counts — and therefore the join algorithm — untouched, which is exactly the
+property the pinned legacy arm existed to work around. 400 rows of 2 kB text
+price at ~19 kB and occupy ~800 kB: the search still costs a hash join with the
+sizer installed, and the batch state grows on the measured overrun. Measured:
+`Buckets: 1024 (originally 1024)  Batches: 32 (originally 4)`.
+
+So the test now asserts growth on the **default enumerator** with the sizer
+installed, no flag pin and no blinded fixture, and the trigger is executor-side
+and therefore arm-independent. The negative control is the fixture at its
+ordinary 48-byte width: `Batches: 4` chosen up front and never moved, which is
+what a right-sized plan should do.
+
+**Tripwire, stated in the test.** P3.1 tolerated the low bias precisely because
+the batch state grows on measured overrun rather than trusting the number; this
+test is that safety net under test. When `avgVarBytes` is populated the geometry
+will pick the final nbatch up front and this test will fail with "nbatch never
+grew". That is the correct outcome to see, not a flake — the fixture is
+re-derived then, against whatever estimate remains wrong.

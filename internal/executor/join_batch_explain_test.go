@@ -16,9 +16,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
 )
 
 // hashJoinInfoRe matches the two forms of PG's show_hash_info line, capturing
@@ -30,6 +28,15 @@ var hashJoinInfoRe = regexp.MustCompile(
 // context. `build` rows go into the table the planner will hash (the right
 // side of the join text below), `probe` into the other.
 func spillFixture(t *testing.T, probeRows, buildRows, distinct int) *Context {
+	t.Helper()
+	return spillFixtureWidth(t, probeRows, buildRows, distinct, 48)
+}
+
+// spillFixtureWidth is spillFixture with the text column's width under the
+// caller's control. Only the growth test needs a value other than the default
+// — see TestExplainAnalyzeHashJoinReportsGrownBatches for why the width is the
+// lever that makes a hash table overrun a budget the geometry thought it fit.
+func spillFixtureWidth(t *testing.T, probeRows, buildRows, distinct, padBytes int) *Context {
 	t.Helper()
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
@@ -48,7 +55,7 @@ func spillFixture(t *testing.T, probeRows, buildRows, distinct int) *Context {
 			t.Fatalf("table %s not found after CREATE", name)
 		}
 		rel := ctx.Catalog.RelFileNode(tbl)
-		pad := strings.Repeat("x", 48)
+		pad := strings.Repeat("x", padBytes)
 		for i := 0; i < n; i++ {
 			row := Row{
 				NewIntDatum(int64(i % distinct)),
@@ -161,33 +168,52 @@ func TestExplainAnalyzeHashJoinReportsBucketsBatchesMemory(t *testing.T) {
 // line switches to showing both — with BOTH originals, buckets included, as
 // show_hash_info does.
 func TestExplainAnalyzeHashJoinReportsGrownBatches(t *testing.T) {
-	ctx := spillFixture(t, 200, 4000, 400)
-	ctx.WorkMem = 64 << 10
-	// M0127-P5.9: nbatch GROWS only when the plan UNDER-ESTIMATES the build
-	// side — a right-sized plan picks its final nbatch up front and never
-	// moves it, which is what the operator should do. This fixture used to
-	// under-estimate by accident: `newDDLFixture` installed no block-count
-	// reader, so every never-ANALYZEd relation was sized at the 1-row floor.
-	// P5.9 installed the reader (the server has one, so a fixture that does
-	// not plans nothing like production) and the accident went away.
+	// M0127-P5.9-p: this fixture mis-estimates ON PURPOSE, and it does so in
+	// the one dimension that leaves the ROW counts — and therefore the join
+	// algorithm — untouched, so growth is asserted on the DEFAULT enumerator
+	// with the block-count sizer installed. No flag pin, no blinded fixture.
 	//
-	// So the mis-estimate is now made ON PURPOSE, and only for this test:
-	// clearing the sizer after the rows are on disk leaves the planner blind
-	// in exactly the way a stale-statistics relation leaves it blind in
-	// production, which is the real-world trigger for the growth path under
-	// test. Nothing else about the fixture changes.
-	ctx.Catalog.(*catalog.InMemory).SetRelationSizer(nil)
-	// A blind planner is necessary but not sufficient: the PG-shaped search
-	// costs its operator, and at the 1-row floor the cheapest join really is a
-	// nested loop, so a blind searched arm produces no hash join to grow. The
-	// old enumerator promotes the hash join by RULE and therefore still gives
-	// one. Both halves are needed, and both go away together — the searched
-	// arm needs a growth fixture that mis-estimates while still costing a hash
-	// join. Deferral ledger row 2026-08-06 (M0127-P5.9).
-	prevSearch := planner.SetPGShapedJoinSearch(false)
-	defer planner.SetPGShapedJoinSearch(prevSearch)
+	// Why the width and not a selectivity. nbatch grows only when the build
+	// overruns a budget the geometry thought it fit, so the test needs the
+	// estimate that sizes the hash table to be low. Two routes were measured
+	// and only this one works:
+	//
+	//   - A deliberately mis-estimated WHERE on the build side (P5.9-p's
+	//     filed proposal) never reaches the geometry at all. `buildGeometry`
+	//     sizes from `planner.EstimateRows(buildNode)`, and for a searched
+	//     scan the base restrictions ride on the scan node rather than in a
+	//     `*Filter` wrapper — `seqScanRows` returns the relation's row count
+	//     and ignores them. The clause does move the JOIN's estimate (the
+	//     search prices it in `makeJoinRel`), so EXPLAIN's join line reacts
+	//     while the hash table is still sized for the unfiltered relation.
+	//     Deferral ledger row 2026-08-06 M0127-P5.9-p.
+	//   - Cutting the row count itself is what the blinded-fixture version of
+	//     this test did, and it is why that version had to pin the legacy
+	//     enumerator: at a low row count the cheapest join really is a nested
+	//     loop, so the searched arm produced no hash join to grow.
+	//
+	// The width gap is left. `buildGeometry` passes avgVarBytes = 0 because
+	// goopg has no per-column average-width statistic, so a build is sized as
+	// if only its fixed-width Datum array were resident and a text-heavy one
+	// is under-counted by however wide its values are (operators_join_agg.go,
+	// deferral ledger 2026-08-03 M0127-P3.1). 400 rows of 2 kB text price as
+	// ~19 kB and occupy ~800 kB, so the geometry picks its nbatch from the
+	// former and the batch state grows on the measured overrun — which is the
+	// safety net P3.1 documented as the reason the low bias is tolerable, now
+	// under test.
+	//
+	// TRIPWIRE: when avgVarBytes is populated the geometry will pick the final
+	// nbatch up front and this test will fail with "nbatch never grew". That
+	// is the correct outcome to see, not a flake — re-derive the fixture then,
+	// against whatever estimate remains wrong.
+	ctx := spillFixtureWidth(t, 100, 400, 400, 2000)
+	ctx.WorkMem = 64 << 10
 
 	joined := strings.Join(runExplainRows(t, ctx, "EXPLAIN ANALYZE "+spillJoinSQL), "\n")
+	if !strings.Contains(joined, "Hash Join") {
+		t.Fatalf("the fixture must still COST a hash join — that is the half the "+
+			"blinded version could not keep. Plan was:\n%s", joined)
+	}
 	m := hashJoinInfoRe.FindStringSubmatch(joined)
 	if m == nil {
 		t.Fatalf("no hash-table line in ANALYZE output:\n%s", joined)

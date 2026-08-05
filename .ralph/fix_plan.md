@@ -8375,8 +8375,39 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       goopg emits none anywhere; the structured formats, which carry no qual
       properties at all; and `NestedLoopIndexJoin`'s mixed-provenance
       `Predicate`, which keeps `Filter:` deliberately).
-- [ ] **M0127-P5.9-p — the hash-join batch-growth path has no searched-arm
-      fixture.** NEW 2026-08-06 (09 §3.14). nbatch GROWS only when the plan
+- [x] **M0127-P5.9-p — the hash-join batch-growth path has no searched-arm
+      fixture.** **DONE 2026-08-06 (09 §3.23, ledger row P5.9-p).** Growth is
+      now asserted on the DEFAULT enumerator with the block-count sizer
+      installed — no `SetRelationSizer(nil)`, no legacy-arm pin — and the test
+      additionally asserts the plan really is a `Hash Join`, which is the half
+      the blinded version could not keep. **The proposal filed below was
+      measured and does NOT work, and that is the finding:** `buildGeometry`
+      sizes from `planner.EstimateRows(buildNode)`, and for a searched scan the
+      base restrictions ride on the scan node rather than in a `*Filter`
+      wrapper, so `seqScanRows` returns the relation's row count and ignores
+      them. With `b.k = b.kdup` (column-column equality, `defaultEqSelectivity`
+      = 0.005, true for every row) the JOIN line moved `rows=1840`→`rows=171` —
+      the search prices the clause in `makeJoinRel` — while `Batches: 4` did not
+      move and no `(originally …)` form ever appeared. Two estimates for one
+      scan, and the executor reads the one that does not change. The lever that
+      DOES work is the WIDTH: `buildGeometry` passes `avgVarBytes = 0` because
+      goopg has no per-column average-width statistic (ledger 2026-08-03
+      M0127-P3.1), so a text-heavy build is priced as if only its Datum array
+      were resident — the one mis-estimate that leaves the ROW counts, and
+      therefore the join algorithm, untouched. New `spillFixtureWidth`
+      parameterizes the width; 400 rows of 2 kB text price at ~19 kB and occupy
+      ~800 kB → `Buckets: 1024 (originally 1024)  Batches: 32 (originally 4)`.
+      Negative control at the ordinary 48-byte width: `Batches: 4` up front,
+      never moved. The test is P3.1's grow-on-measured-overrun safety net under
+      test and carries the tripwire — populating `avgVarBytes` will make it fail
+      with "nbatch never grew", which is the correct outcome to see. Deferred
+      (ledger row P5.9-p): a scan's base-restriction quals do not reduce
+      `EstimateRows`, so every consumer sizing off a plan node (hash geometry,
+      Memoize, the NLI/hash choice) sees the UNFILTERED relation — the same
+      propagation shape M0125-0038 and P5.9-h fixed for wrappers and full-range
+      index leaves, reached from a third direction. Files:
+      `internal/executor/join_batch_explain_test.go`. Bar MET: UNITS.
+      **↳ ORIGINAL FILING (kept for attribution).** NEW 2026-08-06 (09 §3.14). nbatch GROWS only when the plan
       under-estimates its build side, and
       `TestExplainAnalyzeHashJoinReportsGrownBatches` used to get that
       under-estimate by accident (a fixture with no block-count sizer sized
