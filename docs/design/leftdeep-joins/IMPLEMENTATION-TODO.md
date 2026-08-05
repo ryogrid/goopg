@@ -1300,18 +1300,24 @@
   and the DS05 gate were deliberately not run — they score plan QUALITY on a
   build whose plans compute the wrong answer. Re-run the whole bar after
   P5.9-c/-d/-e.
-- [ ] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
-  P5.9 blocker. `projectToBindingOrder` (createplanroot.go:240) is
-  self-consistent, so the bad map comes from the `outputLayout` returned by
-  `createPlanNode` for the winning join arm (createplanjoin.go:
-  `createHashJoinPlan` / `createMergeJoinPlan` / `createNestLoopPlan` /
-  `baseRelLayout`). `boundaryMapIsIdentity` is the sweep's discriminator.
-  Reproducer: `select * from orders, customer where o_custkey = c_custkey and
-  o_orderkey = 1` at `GOOPG_PGSHAPED_DP=1` on SF1. Then strengthen `boundaryMap`
-  (createplanroot.go:174) from a permutation test to an identity test against
-  each leaf's `baseOffset`/width — §10's tripwire tests HOLE / OUT OF RANGE /
-  DUPLICATE, all of which are ways of not being a permutation, and a rotation
-  is one. Gate: units + a regression test on the reproducer + SPOT.
+- [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
+  P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
+  `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is
+  applied AFTER the boundary by `remapTopProjection` (bushy.go), which locates
+  the join tree to derive its posMap from by walking down past `*Project` /
+  `*Sort` wrappers — and the boundary IS a `*Project`. It therefore built the
+  map from a node inside the searched subtree (so `collect`'s guard never
+  fired) and applied it to the boundary's own target list, composing two
+  permutations. Fix: `isSearchedTree` guard on that descent — the eighth member
+  of 08 §3's skip list, and the first that neither rewrites nor renumbers a join
+  tree. The proposed `boundaryMap` strengthening was NOT done and is explicitly
+  refuted in 09 §3.2: it is a producer-side check and the producer was right.
+  The consumer-side invariant replaces it — `assertSearchedBoundariesIntact`
+  (createplanroot.go) at the tail of `Plan()`: a boundary target names the very
+  column it addresses, so a later permutation moves the indices and leaves the
+  names behind. 09 §3.2; 03 §10 (2026-08-05 amendment); 08 §3 (amended).
+  Bar met: UNITS + `internal/planner/joinsearchboundary_test.go` (fails without
+  the fix) + SPOT (Q12 2 rows, Q13 35 rows).
 - [ ] **P5.9-d** Result-digest mode for `cmd/tpch-runner` (per-row hash in scan
   order + an order-independent digest for queries without a total `ORDER BY`),
   and diff the two arms. 09 §3.1 amends clause 1 from row counts to VALUE

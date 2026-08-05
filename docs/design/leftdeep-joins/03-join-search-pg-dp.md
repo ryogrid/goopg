@@ -866,6 +866,31 @@ Debug tripwire: a build-mode assertion that every `ColumnRef` above the
 search root resolves within its input schema — the M0097-0058
 out-of-bounds class must fail loudly at plan time, never at execution.
 
+**Amendment 2026-08-05 (P5.9-c) — the tripwire above is necessary and not
+sufficient, and the missing half is about WHEN it runs.** Every check this
+section specifies is a PRODUCER-side check: `boundaryMap`'s hole /
+out-of-range / duplicate refusals, `assertColumnRefsWithinSchema`,
+`assertSearchedTreeNeedsNoReconcile`. All of them run while the boundary node
+is being built, and P5.9's acceptance run failed on a defect that happened
+*after* that — a legacy pass renumbered the boundary `Project`'s own target
+list, which is the map rather than a reference into it
+([09](09-verification-and-acceptance.md) §3.2). The composed result stayed a
+permutation of `[0,width)`, stayed in range, and joined on the right columns;
+only the top projection read the wrong ones. So:
+
+> The boundary map has a consumer-side invariant, and it must be checked on the
+> FINISHED tree: **target `i` of the boundary `Project` is a bare `ColumnRef`
+> naming exactly the column it addresses, and the node's `schema[i]` is that
+> same column.** `projectToBindingOrder` establishes it by construction; any
+> permutation applied later breaks it, because the indices move and the names
+> do not.
+
+`assertSearchedBoundariesIntact` (createplanroot.go) runs it at the tail of
+`Plan()`, gated on `GOOPG_PGSHAPED_DP`. The generalised rule it backstops is
+in [08](08-migration-and-removal.md) §3: a legacy pass must skip a searched
+subtree not only when it REWRITES a join tree, but whenever it DESCENDS
+THROUGH a node kind the boundary can be.
+
 **Amendment 2026-08-04 (P5.5-e-i) — the map's INPUT now exists, and it is
 produced by the recursion rather than re-derived.** The scan and sort arms
 could ignore coordinates entirely (a scan's schema is its leaf's; a sort moves

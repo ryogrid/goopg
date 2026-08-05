@@ -54,6 +54,19 @@ M0126-0011.
   COORDINATES, not duplication: each addresses a join tree in the statement's
   FROM-cumulative space, and only a searched tree's ROOT is in that space
   ([03](03-join-search-pg-dp.md) §10).
+  **Amended (M0127-P5.9-c): EIGHT skips.** The eighth is `remapTopProjection`
+  (bushy.go), and its omission is what made the P5.9 acceptance run a no-go —
+  see [09](09-verification-and-acceptance.md) §3.2. It belongs to neither of the
+  two families above, which is why the P5.9-b audit missed it: it does not
+  rewrite a join tree and it does not renumber one, it renumbers the WRAPPERS
+  above one. It nonetheless reaches into a searched subtree, because it locates
+  the tree to derive its posMap from by walking down past `*Project` / `*Sort`
+  wrappers — and the search boundary is a `*Project` (or, for an elided
+  boundary over a sorted root, a `*Sort`). The `collect`-side guard cannot
+  help: it is never asked about the root. The generalised rule is therefore
+  **any pass that DESCENDS THROUGH a node kind the boundary can be, not only a
+  pass that rewrites one**; the standing tripwire for the class is
+  `assertSearchedBoundariesIntact` at the tail of `Plan()`.
 - `reconcileNLILayout` (`planner.go:99`) keeps running until S7 confirms no
   searched plan needs it (the canonical relid-ordered layouts of
   [02](02-plan-shape-contract.md) §3 should make it a no-op on searched

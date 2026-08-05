@@ -8070,24 +8070,33 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `extract(year from …)` is merely the only TPC-H construct that
       type-checks at run time, which is why exactly three queries were loud.
       Re-run the whole bar after P5.9-c/-d/-e. 3 ledger rows.
-- [ ] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
-      The P5.9 blocker. `projectToBindingOrder`
-      (`internal/planner/createplanroot.go:240`) is self-consistent, so the bad
-      map arrives from the `outputLayout` returned by `createPlanNode` for the
-      winning join arm (`createplanjoin.go`: `createHashJoinPlan` /
-      `createMergeJoinPlan` / `createNestLoopPlan` / `baseRelLayout`).
-      Discriminator across the sweep is `boundaryMapIsIdentity` — an
-      already-binding-order winner takes the early return and is correct.
-      **Reproducer (2 relations, 1 predicate):** `select * from orders, customer
-      where o_custkey = c_custkey and o_orderkey = 1` under
-      `GOOPG_PGSHAPED_DP=1` on SF1; flag-OFF is correct. Second half:
-      strengthen `boundaryMap` (`createplanroot.go:174`) from a PERMUTATION test
-      to an identity test against each leaf's recorded `baseOffset`/width — its
-      three documented failure modes (HOLE / OUT OF RANGE / DUPLICATE) are all
-      ways of not being a permutation, and a rotation is one, so the 03 §10
-      tripwire is blind to the one M0097-0058-class instance the search actually
-      produced. 09 §3.1; 03 §10. Bar: UNITS + a regression test on the
-      reproducer + SPOT.
+- [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
+      DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
+      Reproduced in-process (`select * from customer, orders where o_custkey =
+      c_custkey and o_orderkey = 1`, the cheap side OUTER so the boundary must
+      emit its Project): the layout, `boundaryMap` and `projectToBindingOrder`
+      all produce the CORRECT map `[4 5 6 0 1 2 3]`. The rotation is applied
+      afterwards by **`remapTopProjection`** (`internal/planner/bushy.go`),
+      which finds the join tree to derive its posMap from by walking DOWN past
+      `*Project` / `*Sort` / `*Limit` / `*LockRows` wrappers — and the search
+      boundary is a `*Project`. So it handed `buildBindingsPosMap` a node
+      *inside* the searched subtree, where `collect`'s `isSearchedTree` guard
+      is never asked, and applied the search's own binding→plan-position
+      permutation to the boundary's target list — which is the map, not a
+      reference into it. Two permutations composed → every column's value one
+      relation-block from its name. Fix: `isSearchedTree` guard on that descent
+      (the EIGHTH member of 08 §3's skip list, and the first that neither
+      rewrites nor renumbers a join tree — which is why the P5.9-b audit missed
+      it; it also latently covered an elided boundary whose root is a `*Sort`).
+      The proposed `boundaryMap` strengthening was deliberately NOT done and is
+      refuted in 09 §3.2 — it is a producer-side check and the producer was
+      right. Replaced by the consumer-side invariant
+      `assertSearchedBoundariesIntact` (`createplanroot.go`, tail of `Plan()`,
+      flag-gated): a boundary target is a bare `ColumnRef` naming the very
+      column it addresses, so a permutation applied later moves the indices and
+      leaves the names behind. 09 §3.2; 03 §10 (2026-08-05 amendment); 08 §3.
+      Bar met: UNITS + `internal/planner/joinsearchboundary_test.go` (verified
+      to FAIL without the bushy.go guard) + SPOT (Q12 2, Q13 35). 1 ledger row.
 - [ ] **M0127-P5.9-d — the acceptance harness compares row counts, not values.**
       `cmd/tpch-runner` reports `rows=N` only, so five ON-arm queries "matched"
       without their tuples ever being compared, and the bar detected the defect

@@ -2206,6 +2206,33 @@ func remapTopProjection(out Node, bindings []rangeBinding) {
 	// Limit / LockRows wrappers until we hit it.
 	root := out
 	for {
+		// M0127-P5.9-c (08 §3): this descent is the one place the
+		// searched-subtree opacity could be walked THROUGH rather than
+		// stopped at, and it was. The boundary is a `*Project`
+		// (createplanroot.go) and an elided boundary over a sorted root
+		// is a `*Sort`, so both arms below step over the search root and
+		// hand `buildBindingsPosMap` a node INSIDE it. `collect`'s own
+		// guard (bushy.go:2563) then never fires — it is asked about the
+		// searched join, not about the searched root — and the map that
+		// comes back is the search's binding→plan-position permutation.
+		//
+		// Applied to the wrappers, that map is a second permutation on
+		// top of the one the boundary already performed: the enclosing
+		// Project's targets are written in binding coordinates and the
+		// boundary republishes binding order, so the correct action here
+		// is NOTHING. Measured on `select * from customer, orders where
+		// o_custkey = c_custkey and o_orderkey = 1` (P5.9 run 1's
+		// reproducer): every column's value came back one relation-block
+		// away from its name, and the boundary Project's OWN target list
+		// — which is the coordinate map, not a reference into it — was
+		// rewritten along with the targets above it.
+		//
+		// Stopping here rather than teaching `collect` is the correct
+		// half: `collect` is already right, and what was wrong is asking
+		// it a question about the inside of an opaque subtree.
+		if isSearchedTree(root) {
+			return
+		}
 		switch n := root.(type) {
 		case *Project:
 			root = n.Child

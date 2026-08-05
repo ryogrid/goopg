@@ -1,52 +1,55 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-b** — LANDED, gates green (UNITS + SPOT), committed + pushed.
-Facts the next loop must NOT re-derive:
+Last loop: **M0127-P5.9-c CLOSED** — the P5.9 blocker is attributed and fixed.
+Committed + pushed. Facts the next loop must NOT re-derive:
 
-1. `internal/planner/joinsearchseam.go` is new and is the ONLY production
-   reader of `GOOPG_PGSHAPED_DP`: `tryPGShapedJoinSearch` (entered from the
-   FIRST line of `tryBushyDP`, so both call sites reach it), `searchConsumes`,
-   `chainCarriesLateral`, `searchTupleFraction` / `limitParseConst`.
-2. `resolveContext.tupleFraction` is new, set in `planSelect` right after the
-   WHERE `*Filter` is built, from the UNRESOLVED `s.Limit`/`s.Offset` — the
-   `*Limit` node is built ~350 lines later and resolving early would plan a
-   `LIMIT (SELECT …)` subquery twice.
-3. Residual rule: consumed ⟺ `buildRestrictInfos([]Expr{c},0,cum)` emits a
-   clause whose `.clause == c` (pointer). Never re-derive it — an OR-of-ANDs
-   reaches two relations but the producer emits the equalities COMMON to its
-   branches, so the OR must stay in the `Filter`. `cum` is the FULL
-   per-FROM-item space, not the per-joinlist-item one.
-4. Locals go into the LEAF before the search (`Filter{LeafLocal:true}`), never
-   onto the tree after it — `attachRelationLocalFilters` matches by POINTER
-   identity and P5.5-c's index arm rebuilds leaves. Needed `leafBaseScan` in
-   `initialRelRows` so a filter-wrapped base table is not re-estimated by
-   `EstimateRows`.
-5. 08 §3 is now FULLY enforced: 7 `isSearchedTree` skips — 3 renumbering
-   (P5.5-f-ii-a) + 4 rewriting (`pushOneConjunct`, `walkRewriteNLI`,
-   `rewriteMultiWayChain`, `rewriteScanInputsWithSingleTablePredicates`).
-6. The seam DECLINES explicit-`JOIN` FROM items in BOTH collapse regimes (one
-   node, several bindings; the `ON` quals are not in the WHERE `Filter`), so
-   09 §3's collapse-ON arm currently measures the SAME population as
-   collapse-OFF. Ledgered — read that row before running the acceptance bar.
-7. Flag-on probe (informational, `GOOPG_PGSHAPED_DP=1 go test ./internal/planner/`):
-   19 failures, all plan-shape assertions on STATISTICS-FREE fixtures — with
-   1 row per side the cost model correctly prefers a nested loop where the
-   legacy pipeline always built a hash join. Not a defect; it is why the seam
-   applies `relSizeFallbackRows` tier 3 (`estimateBaseRelInfo` lacks it).
+1. **Run 1's attribution was WRONG.** The `outputLayout` / `boundaryMap` /
+   `projectToBindingOrder` producer chain is CORRECT; it builds `[4 5 6 0 1 2 3]`
+   for the reproducer. Do not go looking in `createplanjoin.go` again.
+2. **Real cause:** `remapTopProjection` (`internal/planner/bushy.go:2204`) finds
+   the join tree to derive its posMap from by walking DOWN past `*Project` /
+   `*Sort` / `*Limit` / `*LockRows` wrappers — and the search boundary IS a
+   `*Project`. It handed `buildBindingsPosMap` a node INSIDE the searched
+   subtree (so `collect`'s `isSearchedTree` guard was never asked) and applied
+   the search's binding→plan-position permutation to the boundary's own target
+   list, which is the map, not a reference into it. Two permutations composed.
+   Fix = one `isSearchedTree(root)` guard on that descent.
+3. It is the **eighth** member of 08 §3's skip list and the first that neither
+   rewrites nor renumbers a join tree — that is why the P5.9-b audit missed it.
+   Generalised rule now in 08 §3: skip a searched subtree whenever a pass
+   DESCENDS THROUGH a node kind the boundary can be.
+4. The proposed `boundaryMap` strengthening was **deliberately not done** and is
+   refuted in 09 §3.2 — producer-side check, innocent producer. Replaced by
+   `assertSearchedBoundariesIntact` (`createplanroot.go`, tail of `Plan()`,
+   flag-gated): a boundary target is a bare `ColumnRef` naming the very column
+   it addresses, so a later permutation moves indices and leaves names behind.
+5. In-process reproduction beats the SF1 cluster here: `Plan(stmt, cat)` with
+   `pgShapedDP = true` set directly (package var) on a 2-table `catalog.NewInMemory`
+   with `tbl.Stats` set. `select * from customer, orders where o_custkey =
+   c_custkey and o_orderkey = 1` — FROM order must be customer-first or the
+   winner is already binding order and the boundary elides its Project.
+6. Blind spot (ledgered): the tripwire only checks a MATERIALISED boundary. An
+   ELIDED boundary has no target list, so a pass renumbering an elided searched
+   subtree's internal joins is still uncaught. Resume point in the ledger row.
 
-Gates run: UNITS green (`/tmp/units-p59b.log`, exit 0, zero FAIL lines);
-SPOT green (`/tmp/spot-p59b.log`, Q12 2 rows / Q13 35 rows, RESULT=PASS);
-planner package green; gofmt clean on the new files (the two pre-existing
-gofmt-version diffs in `mhj_input_rewrite.go`/`planner.go` predate HEAD);
-commit-hook pgbench smoke. No orphaned servers.
+Files: `internal/planner/bushy.go` (guard), `createplanroot.go`
+(`assertSearchedBoundariesIntact` + `boundaryWalkChildren`), `planner.go`
+(call site at `Plan()`'s tail), `internal/planner/joinsearchboundary_test.go` (new).
+Docs: 09 §3.1 (attribution corrected) + new §3.2, 03 §10 amendment, 08 §3
+amendment, docs/design/README.md, IMPLEMENTATION-TODO P5.9-c, 1 ledger row.
+
+Gates run: UNITS (`RALPH_PRECOMMIT_SCOPE=units`) PASS; SPOT
+(`scripts/tpch-spotcheck.sh`) PASS (Q12 rows=2, Q13 rows=35, 27.5 s);
+`go test ./internal/planner/` PASS; new test verified to FAIL with the bushy.go
+guard stashed; `make ralph-state-guard` (repaired progress marker, then OK);
+pgbench smoke via the commit hook.
 
 Nightly triage 20260805-014309: unchanged, both items already filed under
-M-NIGHTLY (fix_plan lines ~1097/1203/1215), left unchecked per the banner.
+M-NIGHTLY, left unchecked per the banner.
 
-Next step: **M0127-P5.9** — the S5 acceptance run. 09 §3 bar with collapse OFF
-then ON + plan-shape ratchet baseline (§4) + estimate audit (§5), filed as
-`analysis/leftdeep-joins/…-s5-acceptance.txt`; then flip `GOOPG_PGSHAPED_DP`
-ON and retire `GOOPG_COST_DRIVEN_JOINORDER`, or record the documented no-go.
-Read ledger row 6 above first — the collapse-ON arm may not be measurable yet.
+Next step: **M0127-P5.9-d** — result-digest mode for `cmd/tpch-runner` (per-row
+hash in scan order + an order-independent digest for queries without a total
+`ORDER BY`), diffed across the two arms. It must land BEFORE P5.9 is re-run.
+P5.9-e (Q17) is re-measured only after -d, on top of this fix.
 
 In-flight: none.

@@ -80,12 +80,14 @@ bar is not failing for want of a contemporaneous baseline.
 
 All of clause 1's failures are **one defect**, attribution class (c): the search
 boundary publishes a coordinate map that is a **rotation** of the correct
-permutation. `projectToBindingOrder` (`createplanroot.go:240`) is
-self-consistent, so the wrong map arrives from the `outputLayout` that
-`createPlanNode` returns for the winning join arm. The discriminator across the
-sweep is `boundaryMapIsIdentity`: a winner that is already left-deep in binding
-order takes the early return and is correct; a winner that reorders the leaves
-gets the rotation.
+permutation. The discriminator across the sweep is `boundaryMapIsIdentity`: a
+winner that is already left-deep in binding order takes the early return and is
+correct; a winner that reorders the leaves gets the rotation.
+
+*(Run 1's write-up attributed the rotation to the `outputLayout` that
+`createPlanNode` returns for the winning join arm. That attribution is
+**refuted** — see §3.2. The layout and the map built from it are correct; the
+map is rewritten afterwards.)*
 
 Two things this bar has to learn from it, both binding on the re-run:
 
@@ -95,7 +97,8 @@ Two things this bar has to learn from it, both binding on the re-run:
   each of which is a way of *not* being a permutation of `[0,width)`. A
   rotation is a permutation, so the check passes on the one instance of the
   class the search actually produced. A permutation test is not a correctness
-  test for a map whose contract is *which* permutation.
+  test for a map whose contract is *which* permutation. §3.2 adds the reason
+  that observation, though true, is not where the fix goes.
 - **Clause 1's row-count comparison cannot see this defect.** The reproducer
   returns the right number of rows with every column value shifted one position
   from its name. Five queries in the ON arm "matched" on count and were not
@@ -110,6 +113,68 @@ Clauses 4 and 6, the §4 parity gate and the §5 estimate audit all score plan
 QUALITY, and were deliberately not run: they compare plans from a build whose
 plans compute the wrong answer. They are the first instruments to re-run once
 the rotation is fixed, and they remain part of the bar P5.9 must clear.
+
+### 3.2 The rotation, attributed (P5.9-c, 2026-08-05)
+
+The producer was innocent. Reproduced in-process against a two-relation
+catalog — `select * from customer, orders where o_custkey = c_custkey and
+o_orderkey = 1`, which puts the cheap side (`orders`, restricted to one row)
+OUTER while the bindings are `customer ++ orders`, so the boundary must emit
+its Project — the tree that leaves `createPlanAtSearchRoot` is **correct**:
+the join publishes `orders ++ customer`, the layout says so, `boundaryMap`
+inverts it, and `projectToBindingOrder` emits `[4 5 6 0 1 2 3]` with each
+target naming the column it addresses.
+
+The rotation is applied **after** the boundary, by `remapTopProjection`
+(bushy.go). That function finds the join tree to derive its posMap from by
+walking DOWN past `*Project` / `*Sort` / `*Limit` / `*LockRows` wrappers — and
+the search boundary IS a `*Project`. So the descent stepped over the search
+root, handed `buildBindingsPosMap` a node *inside* the searched subtree, and
+`collect`'s searched-subtree guard (P5.5-f-ii-a) never fired, because it was
+never asked about the root. The map that came back was the search's own
+binding→plan-position permutation, and it was then applied to every wrapper
+above — including the boundary Project's own target list, which is not a
+reference into the map but the map itself. Two permutations composed:
+`[4 5 6 0 1 2 3]` became `[1 2 3 4 5 6 0]`, i.e. every column's value one
+relation-block from its name. Exactly the reported symptom.
+
+This is the fifth member of 08 §3's skip list, missed at P5.9-b because the
+four that were added (`pushPredicatesIntoCrossJoins`, `rewriteJoinsToNLI`,
+`rewriteMultiWayChain`, `rewriteScanInputsWithSingleTablePredicates`) all
+REWRITE a join tree, while this one only renumbers wrappers — and the
+`collect`-side guard made it look already covered. It also latently covers a
+second shape: an elided boundary whose root is a `*Sort` was stepped over the
+same way.
+
+**What the bar takes from this, and it is not "strengthen `boundaryMap`".**
+Run 1's write-up proposed promoting `boundaryMap` from a permutation test to a
+per-leaf identity test against each leaf's recorded `baseOffset`/width. That
+check would have been silent here: it runs at the producer, and the producer
+was right. The invariant that catches a *post hoc* permutation is a
+consumer-side one, and `projectToBindingOrder` already makes it hold by
+construction —
+
+> target `i` is a bare `ColumnRef` naming the very column it addresses
+> (`child.Output()[target[i].Index]`), and the node's own `schema[i]` is that
+> same column.
+
+— because a permutation moves the indices and leaves the names behind.
+`assertSearchedBoundariesIntact` (createplanroot.go) checks it over the
+FINISHED tree at the tail of `Plan()`, after every rewriter, gated on
+`GOOPG_PGSHAPED_DP` so the default arm pays one boolean. Verified
+non-vacuous both ways: it fires on the unfixed `remapTopProjection`, and
+`TestAssertBoundaryProjectionIntactCatchesARotation` rotates a real boundary
+node by one and requires the panic.
+
+Regression cover: `internal/planner/joinsearchboundary_test.go`. It asserts on
+the column each `select *` target RESOLVES TO rather than on indices (an index
+expectation would encode the search's chosen order and then fail for cost-model
+changes), and a companion test asserts the fixture still produces a
+non-binding-order winner — otherwise the boundary would elide its Project and
+the regression test would be green for the wrong reason.
+
+Still open before the bar can be re-run: P5.9-d (the harness compares row
+counts, not values) and P5.9-e (Q17, to be re-measured on top of this fix).
 
 ## 4. The PG plan-shape parity gate (new instrument)
 

@@ -132,6 +132,11 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	// impossible rather than a maintenance obligation on every pass.
 	// See join_hash_keys.go.
 	fillJoinHashKeys(node)
+	// M0127-P5.9-c: the search boundary's coordinate map, re-checked on the
+	// FINISHED tree. Every producer-side guard in createplanroot.go runs before
+	// the passes that turned out to be able to rewrite the map; this one runs
+	// after all of them. A no-op boolean test with `GOOPG_PGSHAPED_DP` off.
+	assertSearchedBoundariesIntact(node)
 	return node, nil
 }
 
