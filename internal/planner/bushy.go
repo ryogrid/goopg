@@ -643,21 +643,19 @@ func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRow
 		outerCols: entryNCols(entryA), innerCols: entryNCols(entryB),
 	})
 
-	// M0126-0013: penalise hash joins that build on more than
-	// largeBuildThreshold rows. Building an N-row hash table
-	// consumes O(N) memory and, when N exceeds ~2 M rows (576 MB
-	// at 288 bytes/row), the hash table no longer fits comfortably
-	// in the GOMEMLIMIT headroom, causing GC pressure + cache
-	// thrash. The penalty is quadratic in the overshoot so that
-	// the DP avoids join orders that chain multiple 6 M-row
-	// intermediate builds (Q9's cost-driven pathology).
-	const largeBuildThreshold = 2_000_000.0
-	innerR := float64(entryB.rows)
-	if innerR > largeBuildThreshold {
-		overshoot := (innerR - largeBuildThreshold) / largeBuildThreshold
-		hashCost.Total += overshoot * overshoot * cp.cpuTupleCost * innerR
-	}
-
+	// M0127-P5.6-d: the quadratic large-build penalty that used to be added
+	// here is GONE. M0126-0013 charged `overshoot² × cpu_tuple_cost ×
+	// innerRows` above a fixed 2 M-row threshold as a stand-in deterrent
+	// against join orders that chain enormous intermediate builds (Q9's
+	// cost-driven pathology). It stood in for the batch I/O of a build that
+	// does not fit memory, which M0127-P5.7-a now charges honestly inside
+	// hashJoinCost — and charges better, because the stand-in's threshold was
+	// a fixed ROW COUNT while whether a build fits depends on its width: at
+	// one column, 6 M rows fit the default budget and were penalised anyway;
+	// at forty columns, 1 M rows spill and were not penalised at all. The
+	// spill term asks `hashsize.Choose` — the executor's own geometry
+	// function — so the deterrent now fires exactly when the executor will
+	// really write batch files. leftdeep-joins 04 §4; 06 §5.
 	if !nliCostDelegation || cat == nil || join == nil {
 		return hashCost
 	}

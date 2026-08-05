@@ -7174,7 +7174,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       eqjoinsel's MCV arm). IMPLEMENTATION-TODO P5.6-c; 04 §3.3.
       Bar met: UNITS. DS05 + SPOT + PLAN not applicable — no plan can move
       while the sizer has no production caller.
-- [ ] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
+- [x] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
       once 04 §4's honest batch-I/O term prices what it stood in for.
       IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.
       **UNBLOCKED 2026-08-05 by M0127-P5.7-a**: the honest term now exists and
@@ -7186,6 +7186,18 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       the row's width. Note when doing it: the penalty lives on the
       `costDrivenJoinOrder` arm, so DS05 will show no movement unless the sweep
       runs with that flag ON.
+      **DONE 2026-08-05.** The block is gone; `costJoinCandidate`'s hash cost is
+      now exactly `hashJoinCost`. The width point above is the measured one:
+      against the 512 MB default budget a 4 M-row 1-column build FITS and the
+      row-count form charged it 40 000, while a 1 M-row 40-column build spills
+      to 4 batches and it charged nothing. `TestCostJoinCandidateLargeBuildPressure`
+      is replaced by `TestCostJoinCandidateHasNoRowCountPenalty` (equality with
+      the bare cost function — fails if a penalty is re-added) and
+      `TestCostJoinCandidateStillDetersHugeBuilds` (the defence survives via the
+      spill term). No deferral row: upstream has no such penalty, so nothing PG
+      does is left unimplemented. Bar met: UNITS + SPOT. DS05 not run — as the
+      note predicted, the arm is OFF by default, so the default planner is
+      byte-identical; 04 §4.2 records the same scope note for benchmark readers.
 - [x] **M0127-P5.6-e-i — the estimate-audit INSTRUMENT + pre-flip baseline**
       (09 §5.1/§5.2): `cmd/estimate-audit` + `internal/estimateaudit`. One
       `EXPLAIN ANALYZE` per query supplies both sides (cost `rows=` and

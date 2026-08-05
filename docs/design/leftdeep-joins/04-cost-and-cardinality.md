@@ -30,7 +30,8 @@ currency). Two M0126-0013 artifacts get opposite treatment:
 - **Delete** `c63f8023`: the quadratic `largeBuildThreshold = 2M` penalty in
   `costJoinCandidate` — it is exactly the unfalsifiable shape-nudging the
   second-try bundle prohibited, and it becomes redundant once nbatch-aware
-  costing (§4) prices big builds honestly.
+  costing (§4) prices big builds honestly. *(DONE — M0127-P5.6-d, 2026-08-05,
+  the commit after §4's term landed. See §4.2.)*
 
 `defaultCostParams` (`cost_funcs.go:45`) stays at PG 18 boot values; session
 GUC threading (`seq_page_cost` etc.) remains the C3.2/C4 TODO it already is
@@ -254,6 +255,38 @@ Two parts of the section did **not** land and are ledgered (2026-08-05):
   48-byte structs, so `spillPages` over-states the I/O of a wide build. That is
   the safe direction (it deters spilling) but it is an approximation, not the
   measurement.
+
+### 4.2 The second stand-in, deleted (M0127-P5.6-d)
+
+§1's delete-list had **two** entries for the same missing term, and §4.1 only
+retired one of them. The other lived a level up, in `costJoinCandidate`
+(`bushy.go`): above a fixed `largeBuildThreshold = 2_000_000` rows it added
+`overshoot² · cpu_tuple_cost · innerRows` to whatever `hashJoinCost` had
+returned. M0127-P5.6-d deletes it, so the bushy DP's hash cost is now *exactly*
+the cost function, with no second deterrent of a different shape layered on
+top.
+
+The reason the honest term is not merely a like-for-like replacement is that
+the two key on different quantities. The penalty's threshold was a **row
+count**; whether a build spills is decided by **bytes**, and the same 2 M rows
+of entries is 144 MB at one column and 3.9 GB at forty. So the stand-in was wrong in both
+directions at once against the 512 MB default budget: a 4 M-row single-column
+build fits comfortably and was charged 40 000 anyway, while a 1 M-row
+forty-column build spills to four batches and was charged nothing. The spill
+term asks `hashsize.Choose`, the executor's own geometry function, so the
+deterrent now fires on precisely the builds that will really write batch files.
+
+Both halves are pinned:
+`TestCostJoinCandidateHasNoRowCountPenalty` asserts `costJoinCandidate` returns
+the bare `hashJoinCost` for a 4 M-row build that fits (the case the row-count
+form got wrong, and the assertion that fails if any penalty is re-added), and
+`TestCostJoinCandidateStillDetersHugeBuilds` asserts the defence the penalty
+existed for survives — a spilling 6 M-row build still ranks above a fitting
+500 K-row one.
+
+Scope note for anyone reading a benchmark for movement: `costJoinCandidate` is
+only reached under `costDrivenJoinOrder`, which is OFF by default, so the
+default planner arm is byte-identical across this change.
 
 The **Startup/Total split for LIMIT-over-join** — the second half of P5.7 — is
 untouched here: `hashJoinCost` has always returned both numbers and now moves

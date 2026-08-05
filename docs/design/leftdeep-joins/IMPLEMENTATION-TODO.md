@@ -838,8 +838,24 @@
     out to the fallback condition. Bound taken only when the key relation is
     the whole of its side (2 ledger rows: the multi-rel case, and the cap's
     absence from upstream). 7 new tests. Bar met: UNITS.
-  - [ ] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once
+  - [x] **P5.6-d** delete the quadratic build penalty (bushy.go:632) once
     04 §4's honest batch-I/O term prices what it was standing in for.
+    *(DONE 2026-08-05, the loop after P5.7-a supplied that term. §1's
+    delete-list had two entries for one missing term; P5.7-a retired the one
+    inside `hashJoinCost`, this one retires `costJoinCandidate`'s. **Why it is
+    not a like-for-like swap:** the penalty's threshold was a fixed ROW COUNT
+    and spilling is decided in BYTES, so against the 512 MB default budget it
+    was wrong in both directions — a 4 M-row single-column build fits and was
+    charged 40 000 anyway, a 1 M-row 40-column build spills to 4 batches and
+    was charged nothing. Two tests replace the one that pinned the penalty:
+    `TestCostJoinCandidateHasNoRowCountPenalty` (the DP's hash cost is now
+    EXACTLY `hashJoinCost` — fails if any penalty returns) and
+    `TestCostJoinCandidateStillDetersHugeBuilds` (the defence survives via the
+    spill term). No ledger row: nothing PG does is left unimplemented by this —
+    upstream has no such penalty, which is the point. Bar met: UNITS. DS05 not
+    run and not skipped: `costJoinCandidate` is reachable only under
+    `costDrivenJoinOrder`, OFF by default, so the default arm is byte-identical
+    — 04 §4.2.)*
   - [x] **P5.6-e-i** the estimate-audit INSTRUMENT + the pre-flip baseline
     ([09](09-verification-and-acceptance.md) §5.1/§5.2). `cmd/estimate-audit`
     + `internal/estimateaudit`: one `EXPLAIN ANALYZE` per query supplies both

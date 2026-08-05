@@ -1,51 +1,47 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.7-a** — LANDED, gates green, committed + pushed.
-It also decomposed P5.7 and UNBLOCKED P5.6-d.
+Last loop: **M0127-P5.6-d** — LANDED, gates green, committed + pushed.
 Facts the next loop must NOT re-derive:
 
-1. `hashJoinCost` (`internal/planner/cost_funcs.go`) now takes a
-   `hashJoinInputs` struct and calls `hashsize.Choose` — the executor's own
-   geometry function (`joinOp.buildGeometry`, operators_join_agg.go:624) with
-   the executor's own argument shape. `NBatch > 1` applies PG's charge verbatim
-   (costsize.c:4239-4248): `seq*innerPages` at STARTUP, `seq*(innerPages +
-   2*outerPages)` at run. `spillPages` = `page_size` with
-   `relation_byte_size` → `hashsize.EntryBytes`.
-2. **M0126-0013's `seq_page_cost * innerRows/100` is GONE.** It cited
-   costsize.c:4166 for a charge upstream does not make there — PG charges
-   pages only under `numbatches > 1`, and for the SPILL, not the resident
-   table. Do not re-add it.
-3. **The finding is the width that crosses the sibling boundary.** PG passes a
-   BYTE width (packed MinimalTuple); goopg's entry is a `[]Datum` of 48-byte
-   structs, so size follows the COLUMN count and the executor passes
-   `len(schema)`. Hence new `RelOptInfo.NCols` (leaf schema for a base rel,
-   sum of inputs for a join rel) + `relNCols` / `entryNCols` accessors.
-   Feeding the byte-valued `Width` here would mis-size the same build ~25×.
-4. **PLAN was not run and that is not a skip.** Both `hashJoinCost` callers
-   are behind OFF-by-default gates: `costJoinCandidate` only runs under
-   `costDrivenJoinOrder` (bushy.go:785), and the PG-shaped DP's `pathgen.go`
-   has NO `planSelect` caller at all. The default arm has zero *reachable*
-   plan movement — verified structurally, then empirically by SPOT.
-5. Ledgered, NOT implemented (4 rows): per-session `work_mem` never reaches
-   the planner (`costParams.workMem` pinned at `hashsize.DefaultMemLimitBytes`
-   = the executor's own fallback, so the two agree at the default and ONLY
-   there); `spillPages` prices the in-memory footprint, not `spillWriter`'s
-   narrower uvarint encoding; `nbatch` unexposed on `Path` for EXPLAIN;
-   the LIMIT `tuple_fraction` → new item **M0127-P5.7-b**.
+1. `costJoinCandidate` (`internal/planner/bushy.go`) no longer adds anything to
+   `hashJoinCost`. M0126-0013's `overshoot² × cpu_tuple_cost × innerRows` above
+   a fixed `largeBuildThreshold = 2_000_000` is DELETED. Do not re-add it: a
+   comment at the deletion site says why, and
+   `TestCostJoinCandidateHasNoRowCountPenalty` fails if anything is layered back
+   on top of the cost function.
+2. **The measurement that justifies it.** The penalty keyed on a ROW COUNT;
+   spilling is decided in BYTES. Against the 512 MB default budget: a 4 M-row
+   1-column build FITS (NBatch=1) and the penalty charged it 40 000 anyway; a
+   1 M-row 40-column build spills to 4 batches and the penalty charged it
+   nothing. P5.7-a's `hashsize.Choose` term fires on exactly the builds the
+   executor batches.
+3. Fit boundary for writing future tests (probed, `DefaultMemLimitBytes`
+   = 512 MB): at ncols=1, 4 M rows fits and 5 M spills — the bucket array
+   (48 B/slot, power-of-two) is what tips it, not the 72 B entries. A
+   zero-column entry is 24 B but still allocates that array, so ncols=0 is NOT
+   a "no-spill baseline".
+4. Test helper added: `dpEntryOfWidth(rows, ncols, cost)` in
+   `cost_funcs_test.go` — a `dpEntry` whose plan is `&SeqScan{schema:
+   make(Schema, ncols)}`, because `entryNCols` reads only `len(plan.Output())`.
+5. **DS05 not run and that is not a skip** (same reasoning as P5.7-a):
+   `costJoinCandidate` is reachable only under `costDrivenJoinOrder`, OFF by
+   default, so the default planner arm is byte-identical. SPOT was run anyway
+   and confirms it empirically.
+6. No deferral row: upstream has no such penalty, so nothing PG does is left
+   unimplemented by removing it.
 
-Gates run: UNITS green (`/tmp/units-p57a.log`, exit 0, zero FAIL lines,
-executor re-ran at 6.17 s); SPOT `scripts/tpch-spotcheck.sh` RESULT=PASS
-(`/tmp/spot-p57a.log`, Q12 rows=2, Q13 rows=35, both canonical, 27.7 s query
-phase, peak 10 638 MB); commit-hook pgbench smoke. No orphaned servers.
+Gates run: UNITS green (`/tmp/units-p56d.log`, exit 0, zero FAIL lines, planner
+re-ran at 0.65 s); SPOT `scripts/tpch-spotcheck.sh` RESULT=PASS
+(`/tmp/spot-p56d.log`, Q12 rows=2 in 16.0 s, Q13 rows=35 in 12.0 s, both
+canonical, peak 10 833 MB); commit-hook pgbench smoke. No orphaned servers.
 
 Nightly triage 20260805-014309: unchanged, both items already filed under
-M-NIGHTLY and left unchecked per the banner. No new nightly run since.
+M-NIGHTLY (fix_plan lines 1097/1203/1215) and left unchecked per the banner.
+No new nightly run since.
 
-Next step: per the banner (M0124 → M0125 → M0127), the head of open M0127
-work is **M0127-P5.6-d** (now unblocked — delete `costJoinCandidate`'s
-`largeBuildThreshold` quadratic overshoot, which the `NBatch > 1` charge
-supersedes and prices better, since 2 M rows is a fixed count while the real
-threshold depends on width). Note: it lives on the `costDrivenJoinOrder` arm,
-so DS05 shows no movement unless that flag is ON.
+Next step: per the banner (M0124 → M0125 → M0127), the head of open M0127 work
+is **M0127-P5.7-b** — plumb PG's `tuple_fraction` into `grouping_planner`'s
+choice between `CheapestTotal` and `CheapestStartup`, so the Startup/Total split
+P5.7-a made meaningful actually SELECTS a plan under LIMIT. 04 §4.1 end.
 
 In-flight: none.
