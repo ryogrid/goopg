@@ -7394,26 +7394,66 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       every regime); what it lacks is PG's correlation defence. Successor
       **M0127-P5.6-f-iv**. `analysis/m0127-p56fiii/README.md`; 09 §5.15;
       1 ledger row dated 2026-08-05.
-- [ ] **M0127-P5.6-f-iv — the functional-dependency arm P5.6-f left out.**
-      P5.6-f prices every equi-pair under **independence**, which is right for
-      independent pairs (Q9, Q72, Q53 all improved) and badly wrong for
-      correlated ones (Q47 31 s → 523 s, Q57 15 s → 81 s; §5.15). PG does not
-      multiply blind: `clauselist_selectivity`
-      (`postgres/src/backend/optimizer/path/clausesel.c`) consults extended
-      statistics first — `dependencies_clauselist_selectivity` /
-      `statext_clauselist_selectivity`
-      (`postgres/src/backend/statistics/dependencies.c`, `extended_stats.c`) —
-      and `get_foreign_key_join_selectivity` (`costsize.c:5651`) short-circuits
-      the collapse when the pairs are an FK's columns. goopg landed the FK arm
-      in P5.6-f; the **functional-dependency arm is missing**, so a correlated
-      NON-FK composite still multiplies out. Resume:
-      `internal/planner/cardinality.go:465-483` — before dividing by each
-      pair's ndistinct, damp pairs whose columns are functionally dependent
-      (PG's `dependencies.c` degree, or as a first cut the
-      `min(nd)`-dominates-the-product rule the superkey path already models in
-      `superkeyJoinEstimate`). Acceptance: Q47 back under the DS05 cap WITHOUT
-      losing P5.6-f's Q9/Q72/Q53 wins, verified as a named-victim TIMEOUT-set
-      diff, not a `TIMEOUT=` count. Bar: UNITS + DS05 + the estimate audit.
+- [x] **M0127-P5.6-f-iv — REFUTED as filed: PG has no functional-dependency arm
+      for JOIN clauses.** The item asked for a correlation damper on
+      `internal/planner/cardinality.go:465-483`, citing
+      `dependencies_clauselist_selectivity` / `statext_clauselist_selectivity`.
+      Checked against the oracle, that citation does not reach join clauses:
+      `clauselist_selectivity_ext` (clausesel.c) gates the whole
+      extended-statistics branch on `find_single_rel_for_clauses`, which returns
+      `NULL` as soon as any clause carries two relids — so the dependency arm
+      **never runs on a join clause list** in any PG that has this gate.
+      Extended statistics are a *restriction*-clause mechanism upstream.
+      Measured confirmation: plain `EXPLAIN` of `query47.sql` against the PG
+      18.3 SF0.5 oracle (:65438) estimates **both** correlated 5-pair joins at
+      `rows=1` — PG collapses them exactly as goopg does. Implementing the item
+      would have added a non-PG heuristic under an upstream citation.
+      **What actually differs is the size of the join's INPUTS**: `CTE Scan on
+      v1` is 7 643 in PG and **18** in goopg, so PG refuses the nested loop
+      (rescanning 7 643 rows is expensive) where goopg accepts it. That 425×
+      under-estimate predates P5.6-f — `30293f78` carries the same 18 and still
+      picks the Hash Join — so P5.6-f only tipped an already-mispriced
+      comparison. Isolated to a **pushed-down restriction being charged a second
+      time at the join above it** (five-row probe table in the notes: no
+      restriction ⇒ factor 1.0; any restriction ⇒ the factor the scan already
+      applied). Doc 09 **§5.17** + a correction box on §5.15;
+      `analysis/m0127-p56fiv/README.md`; §6 of `analysis/m0127-p56fiii/README.md`
+      retracted in place; 2 ledger rows. Successors **P5.6-f-vi** / **-f-vii**
+      below. Bar: UNITS (no Go source changed).
+- [ ] **M0127-P5.6-f-vi — a pushed-down restriction is priced twice.** The
+      real Q47 defect (§5.17). A join above a filtered scan is multiplied by the
+      selectivity the scan **already applied**: on SF0.5, the row-preserving
+      `store_sales ⋈ store` (unique `s_store_sk`, 12 rows) returns its left
+      input unchanged with no `date_dim` restriction present (1 439 608 →
+      1 439 608) and is scaled by ≈1/205 with `d_year = 2000`, ≈1/205 with
+      `d_dom = 15`, ≈0.505 with `d_year > 1999` — each time the scan's own
+      factor. PG does not (2 583 → 2 465). This is the double-count
+      `joinResidualSelectivity`'s header says it prevents, and it under-sizes
+      **every join above every filtered scan**, not just Q47's.
+      Already ruled out: `exprSide` is correct in isolation (`col = const` →
+      `sideLeft`, `col = col` → `sideMixed`), so the residual guard as written is
+      not the leak. Resume: `internal/planner/cardinality.go` `estimateJoin`'s
+      pair loop — check whether `joinEquiPairs` →
+      `splitAllEqualitiesForHash` admits a `col = const` conjunct as an
+      equi-pair (note the `d_year > 1999` row is neither `1/nd` nor
+      `defaultEqSelectivity`, so that arm alone cannot explain every row).
+      Instrument, and the acceptance test: a planner unit test building a join
+      whose left input is a `*Filter` over a scan with the same conjunct still
+      in `Predicate`, asserting the estimate equals the unfiltered estimate
+      scaled **once**. Bar: UNITS + the estimate audit + DS05 (named-victim
+      TIMEOUT-set diff, not a `TIMEOUT=` count) — this moves plan shape broadly,
+      so capture `plans` before and after.
+- [ ] **M0127-P5.6-f-vii — `estimateAggregate` is `child/2`, upstream is
+      `estimate_num_groups`.** A multi-key GROUP BY returns `child/2`
+      (`internal/planner/cardinality.go` `estimateAggregate`); PG runs
+      `estimate_num_groups` (selfuncs.c) — per-relation products of the grouping
+      columns' ndistinct, clamped to the input row count. Filed from §5.17 as a
+      second, independent gap on Q47's path and explicitly **not** load-bearing
+      for it (with Q47's input corrected to ~7 600, `child/2` gives ~3 800,
+      already the same order as PG's 7 643), so it must not be folded into
+      P5.6-f-vi — one variable per measurement, per §6. Note the sibling gap
+      already ledgered on the `*Distinct` / `*DistinctOn` arms, which run no
+      group estimate at all. Bar: UNITS + the estimate audit + DS05.
 - [x] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
       cardinality.** §5.15's regression survived four sweeps because
       `TIMEOUT=1` is invariant to WHICH query timed out; the summary line was

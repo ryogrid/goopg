@@ -145,7 +145,19 @@ arity of `Hash Cond`) are filter-independent and safe; the `rows=` figures on
 
 ## 6. What PG does that goopg does not
 
-PG does not fold a multi-column clause list under independence when it has
+> **⚠ RETRACTED 2026-08-05 — see `analysis/m0127-p56fiv/README.md`.** The
+> paragraph below is wrong. `clauselist_selectivity_ext` gates the whole
+> extended-statistics branch on `find_single_rel_for_clauses`, which returns
+> `NULL` as soon as any clause has two relids — so
+> `dependencies_clauselist_selectivity` **never runs on a join clause list**.
+> PG multiplies multi-pair join clauses blind, exactly as goopg does, and
+> measured on the SF0.5 oracle PG estimates Q47's two correlated 5-pair joins
+> at `rows=1` itself. The real divergence is a **425× under-estimate of the
+> `v1` subtree** (goopg 18 rows vs PG 7 643), which is what makes the nested
+> loop look free; it traces to a pushed-down restriction being charged a second
+> time at the join above it. Sections 1–5 above are unaffected.
+
+~~PG does not fold a multi-column clause list under independence when it has
 better information: `clauselist_selectivity`
 (`postgres/src/backend/optimizer/path/clausesel.c`) consults extended
 statistics first — `dependencies_clauselist_selectivity` and
@@ -154,7 +166,7 @@ statistics first — `dependencies_clauselist_selectivity` and
 `get_foreign_key_join_selectivity` (`costsize.c:5651`) short-circuits the
 multiplicative collapse when the pairs are an FK's columns. goopg has the FK
 arm (P5.6-f landed it) but no functional-dependency arm, so a correlated
-non-FK composite still multiplies out. Ledger row dated 2026-08-05.
+non-FK composite still multiplies out. Ledger row dated 2026-08-05.~~
 
 ## 7. Verdict on the filed item
 

@@ -1,43 +1,49 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.6-f-v** — DONE (harness + docs), committed, pushed.
-Facts the next loop should NOT re-derive:
+Last loop: **M0127-P5.6-f-iv** — REFUTED as filed, closed, successors filed.
+Committed + pushed. Facts the next loop must NOT re-derive:
 
-1. The DS05 gate now has a **third, non-blocking channel**: a named per-query
-   status/runtime delta printed under the SUMMARY.
-   `scripts/tpcds-sweep-diff.py OLD NEW` (+ `tpcds-sf05-regression.sh delta
-   [OLD [NEW]]`, `SF05_NO_DELTA=1`, `SF05_SWEEP_BASELINE=<path|none>`).
-   It parses the **sweep report itself**, so all ~90 archived reports are
-   valid baselines — use `delta` to attribute any past regression for free.
-2. Channel semantics worth remembering before changing it: both arms compare
-   the INTERSECTION; TIMEOUT readings are the CAP and are excluded from the
-   runtime arm; a runtime move needs ≥2× AND ≥5 s on the larger side; the
-   default baseline SKIPS subset probes (a probe is "NOT a gate result").
-3. Replay over all 87 adjacent archived pairs: 0 parse failures, 17 pairs with
-   a verdict change; on the §5.15 pair (`sweep-20260804-214607` →
-   `-232914`, identical SUMMARY lines) it prints `TIMEOUT +Q47 -Q72` and
-   `SLOWER Q57 15s->81s (5.4x)`.
-4. HEAD DS05 baseline refreshed: `sweep-20260805-090258` — PASS=94
-   (57 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 (Q47) SKIP=4,
-   plan-shape `changed=0`, delta `verdict-changes=none`. A full sweep is
-   ~35 min of query time (~40 min wall) — it fits a foreground Bash call.
-5. A full-corpus EXPLAIN plan capture is ~14 s; `plans` + `delta` together
-   answer "did this commit move anything?" without the 40-min sweep.
+1. **PG has NO functional-dependency arm for JOIN clauses.**
+   `clauselist_selectivity_ext` (clausesel.c) gates extended statistics on
+   `find_single_rel_for_clauses`, which returns NULL at the first clause whose
+   `clause_relids` is not a singleton. A join clause has 2 relids ⇒
+   `dependencies_clauselist_selectivity` never runs on one. Extended stats are
+   a RESTRICTION-clause mechanism. Do not re-file a correlation damper.
+2. **Measured:** PG 18.3 SF0.5 (`EXPLAIN query47.sql` on :65438 db `tpcds05`)
+   estimates BOTH correlated 5-pair joins at `rows=1` — same collapse as goopg.
+   PG still picks Merge Join because its `CTE Scan on v1` is **7 643 rows**;
+   goopg's is **18**, so a nested loop looks free. The 425× predates P5.6-f
+   (`30293f78` has the same 18 and still picks Hash Join).
+3. **The real defect (→ P5.6-f-vi):** a pushed-down restriction is charged a
+   SECOND time at the join above it. Probe table (goopg SF0.5, :65437, db
+   `postgres`, 4-table item/store_sales/date_dim/store join, row-preserving
+   `⋈ store`): none ⇒ 1 439 608→1 439 608 (×1.0); `d_year=2000` ⇒ 7 193→35;
+   `d_dom=15` ⇒ 7 193→35; Q47's OR ⇒ 7 252→36; `d_year>1999` ⇒
+   726 987→367 128 (×0.505 = the scan's own factor). PG: 2 583→2 465.
+4. **Ruled out, do not re-walk:** `exprSide` is correct in isolation
+   (`col = const`→sideLeft, `col = col`→sideMixed), so
+   `joinResidualSelectivity`'s guard is not the leak. Prime suspect:
+   `joinEquiPairs`→`splitAllEqualitiesForHash` admitting `col = const` as an
+   equi-pair. Caveat: `d_year > 1999`'s 0.505 is neither `1/nd` nor
+   `defaultEqSelectivity`, so that arm alone can't explain every row.
+5. goopg SF0.5 probes need NO `ANALYZE` preamble (stats persist, M0125-0028/-0029),
+   which is why `sf05_capture_plans` has none. db name is `postgres`, not `tpcds05`.
 
-Gates run: UNITS green (cached — no Go source changed); full DS05 sweep green
-with the channel live; `make ralph-state-guard` green (auto-repaired the
-previous loop's completed marker); commit-hook pgbench smoke green.
+Files: doc 09 §5.17 (+ correction box on §5.15), `analysis/m0127-p56fiv/README.md`,
+§6 of `analysis/m0127-p56fiii/README.md` retracted in place, fix_plan
+(P5.6-f-iv [x], P5.6-f-vi / -f-vii filed), 2 ledger rows. No Go source changed.
 
-Nightly triage 20260805-014309: unchanged — both items (AI-…-001
-IsolationEvalPlanQual, AI-…-002 pgbench/nightly) already filed under M-NIGHTLY
-and left unchecked per the banner. No new nightly run since.
+Gates run: UNITS green (planner 0.588s, rest cached); `make ralph-state-guard`;
+commit-hook pgbench smoke. No DS05 sweep — nothing executable changed.
 
-Next step: per the banner (M0124 closed → M0125 → M0127), the open P5.6
-successor is **M0127-P5.6-f-iv** — the functional-dependency arm PG has and
-goopg lacks (`clauselist_selectivity`/`dependencies.c`), the real fix for
-Q47 523 s / Q57 81 s. Its acceptance instrument now exists (item 1 above):
-verify as a named-victim TIMEOUT-set diff, never a `TIMEOUT=` count.
-**M0127-P5.6-d** stays BLOCKED on P5.7's batch-I/O term. Re-read the banner
-before selecting.
+Nightly triage 20260805-014309: unchanged, both items already filed under
+M-NIGHTLY and left unchecked per the banner. No new nightly run since.
+
+Next step: per the banner (M0124 → M0125 → M0127), take **M0127-P5.6-f-vi** —
+the double-charge. Start with the discriminating unit test named in the item
+(join whose LEFT is a `*Filter` over a scan, same conjunct still in
+`Predicate`; assert the estimate is scaled exactly once), then fix
+`estimateJoin`'s pair loop. It moves plan shape broadly, so capture `plans`
+before and after and accept on a named-victim TIMEOUT-set diff.
 
 In-flight: none.

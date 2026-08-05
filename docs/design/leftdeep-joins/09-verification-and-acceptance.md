@@ -1085,13 +1085,21 @@ under-estimation. Only structural facts (join method, `Hash Cond` arity) are
 cited here — per §5.14 the `rows=` on `Filter:`-carrying lines is not evidence.
 
 **P5.6-f stays.** It is a net win (+Q72, +Q53, +Q9's exact joinrel) and
-correctness never moved. What it lacks is PG's correlation defence:
-`clauselist_selectivity` (`clausesel.c`) consults extended statistics —
-`dependencies_clauselist_selectivity`, `statext_clauselist_selectivity` — before
-multiplying, and `get_foreign_key_join_selectivity` (`costsize.c:5651`)
-short-circuits the collapse for FK columns. goopg landed the FK arm in P5.6-f
-but has **no functional-dependency arm**, so a correlated *non-FK* composite
-still multiplies out. Successor **M0127-P5.6-f-iv**; ledger row 2026-08-05.
+correctness never moved.
+
+> **⚠ Corrected by §5.17 (2026-08-05).** This section originally closed by
+> attributing the regression to a missing **functional-dependency arm**, on the
+> reading that `clauselist_selectivity` (`clausesel.c`) consults
+> `dependencies_clauselist_selectivity` / `statext_clauselist_selectivity`
+> before multiplying. **That is false for join clauses**:
+> `clauselist_selectivity_ext` gates the whole extended-statistics branch on
+> `find_single_rel_for_clauses`, which returns `NULL` as soon as any clause has
+> two relids. PG multiplies multi-pair join clauses blind, exactly as goopg
+> does — and, measured, PG estimates Q47's two correlated 5-pair joins at
+> `rows=1` itself. The successor **M0127-P5.6-f-iv** filed from this paragraph
+> is refuted in §5.17, which names the divergence that *is* real. Everything
+> above this box (the attribution to `ce027cee`, the bisect, the plan
+> degradation) stands unchanged.
 
 **Gate lesson (actionable):** the plan-shape channel (§5.11) catches plan
 drift, but a *named-victim* timeout comparison would have caught this on the
@@ -1157,6 +1165,93 @@ creeps in below 2× per run stays unnamed, and it still cannot *fail* the gate o
 a traded timeout — it only makes one impossible to miss in the report. Making a
 named-victim regression fatal needs a curated per-query budget file, which is
 not filed: the timeout set is still moving under active planner work.
+
+### 5.17 PG has no functional-dependency arm for join clauses, 2026-08-05 (P5.6-f-iv)
+
+Working notes + full evidence: `analysis/m0127-p56fiv/README.md`.
+
+§5.15 attributed Q47's 31 s → 523 s regression correctly to `ce027cee`, then
+filed the wrong repair: **M0127-P5.6-f-iv**, "damp correlated equi-pairs the way
+`dependencies_clauselist_selectivity` does". Read against the oracle, that
+resume point is refuted on two independent grounds.
+
+**1. The upstream citation does not apply to join clauses.**
+`clauselist_selectivity_ext` (clausesel.c) gates extended statistics on
+`find_single_rel_for_clauses`, and that helper returns `NULL` the moment a
+clause carries two relids:
+
+```c
+	if (!bms_get_singleton_member(rinfo->clause_relids, &relid))
+		return NULL;		/* multiple relations in this clause */
+```
+
+A join clause has two relids by construction, so
+`statext_clauselist_selectivity` — and `dependencies_clauselist_selectivity`
+behind it — **never runs on a join clause list**. Extended statistics are a
+*restriction-clause* mechanism upstream. What PG has left for a multi-pair join
+is per-pair `eqjoinsel` multiplied blind, minus whatever
+`get_foreign_key_join_selectivity` removed — which is exactly the shape P5.6-f
+landed. Implementing the filed item would have moved goopg **away** from PG
+while citing PG for it.
+
+**2. Measured: PG collapses the same join.** Plain `EXPLAIN` of `query47.sql`
+verbatim against the PG 18.3 SF0.5 oracle (:65438, `tpcds05`) gives `rows=1` on
+*both* correlated 5-pair joins — `Merge Join … rows=1` over an inner
+`Merge Join … rows=1`. The collapse is not the divergence.
+
+**What differs is the size of the join's INPUTS.** Same query, same scale:
+
+| node | PG 18.3 | goopg `096d3949` |
+|---|---|---|
+| `CTE Scan on v1` | **7 643** | **18** |
+| top join estimate | rows=1 | rows=1 |
+| top join method | **Merge Join** | **Nested Loop** |
+
+PG refuses the nested loop from an estimate of 1 because rescanning a
+7 643-row CTE per outer row is expensive. goopg accepts it because its inner is
+18 rows. The plan flip is downstream of a **425× under-estimate of the `v1`
+subtree**, and that under-estimate predates P5.6-f (`30293f78` carries the same
+18 and still picks the Hash Join) — P5.6-f only tipped an already-mispriced
+comparison.
+
+**The 425×, isolated.** goopg's `HashAggregate rows=18` is `child/2` over a
+`Hash Join rows=36`, so the error is in that join. Holding the four-table join
+fixed on the live SF0.5 cluster and varying only the `date_dim` restriction:
+
+| restriction | `date_dim` scan | join below `store` | join **above** `store` | extra factor |
+|---|---|---|---|---|
+| *(none)* | 73 049 | 1 439 608 | 1 439 608 | **1.0** |
+| `d_year = 2000` | 365 | 7 193 | 35 | **≈ 1/205** |
+| `d_dom = 15` | 365 | 7 193 | 35 | **≈ 1/205** |
+| Q47's three-branch OR | 368 | 7 252 | 36 | **≈ 1/201** |
+| `d_year > 1999` | 36 889 | 726 987 | 367 128 | **≈ 0.505** |
+
+`store.s_store_sk` is unique over a 12-row relation, so that join is
+row-preserving by construction and must return its left input unchanged. The
+extra factor instead reproduces, per row, **the selectivity the `date_dim` scan
+had already applied** (0.505 for the inequality; 365/73 049 = 0.005 for each
+equality). With no restriction present it is exactly 1.0. That is a
+double-count of a pushed-down baserestrictinfo — the trap
+`joinResidualSelectivity`'s own header says it prevents — and PG does not do it
+(its `store` join is 2 583 → 2 465).
+
+**Ruled out, so the next loop does not re-walk it.** `joinResidualSelectivity`'s
+guard (`exprSide(c, leftWidth) != sideMixed → continue`) is *correct in
+isolation*: a throwaway probe gives `sideLeft` for `col = const` and `sideMixed`
+for `col = col` across the width, so a one-sided conjunct is skipped there. The
+leak is elsewhere in `estimateJoin`'s pair list — most likely
+`splitAllEqualitiesForHash` admitting a `col = const` restriction as an
+equi-*pair*, though the `d_year > 1999` row (factor 0.505, which is neither
+`1/nd` nor `defaultEqSelectivity`) shows that arm cannot explain every row.
+
+**Successors.** **M0127-P5.6-f-vi** (the double-charge, with a unit test as its
+discriminating instrument — build a join whose left is a `*Filter` over a scan
+with the same conjunct still in `Predicate`, assert the estimate equals the
+unfiltered one scaled once) and **M0127-P5.6-f-vii** (`estimateAggregate`'s
+`child/2` vs upstream `estimate_num_groups`, a second and independent gap on the
+same path, *not* load-bearing for Q47 and therefore not to be folded in).
+Correctness never moved in any regime: Q47 returns its 100 oracle rows
+throughout. 2 ledger rows.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 
