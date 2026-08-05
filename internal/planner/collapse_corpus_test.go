@@ -318,54 +318,157 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 		total, len(unparsed), unparsed, got)
 }
 
-// TestCollapseDoesNotReachTheSearch is the measured no-go of M0127-P5.9-m,
-// pinned so the flip cannot be attempted again on the strength of a green bar.
+// chainIsInnerOnly reports whether EVERY explicit `JOIN` in this statement's
+// FROM clauses is INNER or CROSS — the property `extractSearchLeaves`
+// (joinsearchseam.go) needs to flatten a chain, since the walk stops at an outer
+// link and hands the whole chain back as one leaf.
+//
+// A statement with no explicit JOIN at all answers false: it has no chain for
+// the walk to flatten, so it is not a member of the population this measures.
+func chainIsInnerOnly(sql string) (innerOnly bool, err error) {
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return false, err
+	}
+	sawJoin := false
+	for _, st := range stmts {
+		for _, sel := range selectLevels(st) {
+			for _, item := range sel.FromExprs {
+				for _, j := range item.Joins {
+					sawJoin = true
+					if j.Type != parser.JoinInner && j.Type != parser.JoinCross {
+						return false, nil
+					}
+				}
+			}
+		}
+	}
+	return sawJoin, nil
+}
+
+// TestNoCorpusQueryHasAnInnerOnlyJoinChain is the measurement that explains why
+// M0127-P5.9-r changed no plan, and it is the fact the next attempt on the
+// collapse flip has to start from.
+//
+// P5.9-r lifted the precondition P5.9-m recorded: the seam now flattens an
+// explicit INNER chain and routes its `ON` quals into the search's clause list,
+// which `TestCollapseReachesTheSearch` demonstrates on a three-relation chain.
+// The DS05 plan A/B nevertheless reported `queries=99 same=99 changed=0` under
+// collapse OFF *and* ON, and this is why: of the 99 TPC-DS queries, **twelve**
+// spell an explicit JOIN and **every one of the twelve** contains an outer join.
+// The walk stops at the outer link, the leaf count disagrees with the binding
+// count (`DPTRACE seam-decline reason=leaf-count nrels=11 nleaves=1` on Q72),
+// and the statement falls back to the syntactic shape exactly as before. TPC-H
+// is the same story with one query: Q13's only explicit join is a LEFT OUTER.
+//
+// So the corpus contains NO statement this walk can act on, and the collapse
+// flip stays a no-go for a NEW reason — one level deeper than P5.9-m's. The
+// remaining blocker is that `joinlistItem` (collapse.go) carries no join TYPE:
+// `joinPinned` correctly wraps an outer join into its own two-member
+// subproblem, but nothing downstream could rebuild it AS an outer join, so
+// admitting one would silently plan a LEFT JOIN as an INNER JOIN. The leaf-count
+// decline is what stands between that latent shape and a wrong answer today,
+// which is why P5.9-r kept it rather than widening the walk further.
+//
+// This test fails the day a corpus query is written INNER-only — which is the
+// day a corpus measurement can move, and therefore the day 09 §3.18's protocol
+// is worth re-running.
+func TestNoCorpusQueryHasAnInnerOnlyJoinChain(t *testing.T) {
+	entries, err := os.ReadDir(tpcdsCorpusDir)
+	if err != nil {
+		t.Skipf("TPC-DS corpus not present (%v)", err)
+	}
+	nameRE := regexp.MustCompile(`^query([0-9]+)\.sql$`)
+	var innerOnly, withJoin []int
+	total := 0
+	for _, e := range entries {
+		m := nameRE.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		qn, _ := strconv.Atoi(m[1])
+		sql, err := os.ReadFile(filepath.Join(tpcdsCorpusDir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		total++
+		ok, perr := chainIsInnerOnly(string(sql))
+		if perr != nil {
+			continue
+		}
+		if ok {
+			innerOnly = append(innerOnly, qn)
+		}
+		if _, _, perr := collapseEligible(string(sql)); perr == nil {
+			withJoin = append(withJoin, qn)
+		}
+	}
+	sort.Ints(innerOnly)
+	if len(innerOnly) != 0 {
+		t.Errorf("TPC-DS queries with an INNER-only explicit-JOIN chain = {%s}, want none (of %d).\n"+
+			"A corpus query the seam can now flatten means the DS05 plan A/B can finally move, so "+
+			"09 §3.18's collapse protocol should be re-run and M0127-P5.9-m's no-go re-decided.",
+			sprintInts(innerOnly), total)
+	}
+	t.Logf("TPC-DS corpus: %d queries, %d inner-only explicit-JOIN chains", total, len(innerOnly))
+}
+
+// TestCollapseReachesTheSearch is the INVERSION of M0127-P5.9-m's
+// `TestCollapseDoesNotReachTheSearch`, and it is the fact that makes 03 §6's
+// collapse pass a decidable question again.
 //
 // The flag's whole purpose is to feed explicit-JOIN chains into the PG-shaped
-// search: it flattens `a JOIN b ON … JOIN c ON …` into one flat joinlist
-// instead of one opaque pinned item. But `ctx.joinlist` is only ever read AFTER
-// `tryPGShapedJoinSearch`'s preconditions pass, and one of those preconditions
-// is that the pre-search node's leaves enumerate to the binding count —
-// `extractScans` (bushy.go:261) descends `JoinTypeCross` and nothing else, so an
-// explicit JOIN arrives as ONE node for N bindings and the seam declines before
-// the joinlist is consulted (`TestPGShapedSeamDeclines/leaf count disagrees
-// with binding count` is the same gate from the other side).
+// search: it flattens `a JOIN b ON … JOIN c ON …` into one flat joinlist instead
+// of one opaque pinned item. Under P5.9-m that was unobservable, because
+// `ctx.joinlist` is only read AFTER `tryPGShapedJoinSearch`'s preconditions
+// pass, and `extractScans` descended `JoinTypeCross` and nothing else — so an
+// explicit JOIN arrived as ONE node for N bindings and the seam declined before
+// the joinlist was consulted, with the flag on OR off. Both arms planned the
+// identical tree, which is what the DS05 plan A/B measured across the whole
+// TPC-DS corpus (`same=99 changed=0`) and what the empty enumeration trace on
+// Q72's eleven-way level explained.
 //
-// So collapse ON and collapse OFF plan the identical tree for every statement
-// the flag acts on, which is what the DS05 plan A/B measured across the whole
-// TPC-DS corpus at a fixed binary (`same=99 changed=0`) and what the
-// enumeration trace explains: on Q72's eleven-way explicit-JOIN level the
-// search emitted no trace at all, in either regime.
+// M0127-P5.9-r lifted that precondition (`extractSearchLeaves`,
+// joinsearchseam.go). This test pins the consequence from the collapse side:
+// BOTH regimes now reach the search, so the flag decides a join ORDER rather
+// than deciding nothing, and M0127-P5.9-m's no-go — which was a statement about
+// a flag that could not move a plan — no longer stands on its own evidence and
+// has to be re-measured by 09 §3.18's protocol.
 //
-// Flipping the default on that evidence would advance 08 §2's S5 row with a
-// change that cannot move a plan. The unblock is the seam, not the collapse
-// pass — see the deferral-ledger row for the resume point.
-func TestCollapseDoesNotReachTheSearch(t *testing.T) {
+// What it deliberately does NOT assert is that the two regimes differ on THIS
+// fixture: three relations under `join_collapse_limit` is a shape where the
+// pinned order and a searched order can legitimately coincide. The claim under
+// test is reachability, which is what was false before.
+//
+// Reachability in the PLANNER is not reachability in the CORPUS, and the two
+// must not be confused — confusing them is the exact defect P5.9-m recorded.
+// `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above measures the second: no
+// TPC-DS or TPC-H query is written INNER-only, so the re-run of 09 §3.18's
+// protocol still reports `same=99 changed=0` and the flip is still a no-go.
+// This test says the door is open; that one says nobody walks through it yet.
+func TestCollapseReachesTheSearch(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	for _, collapse := range []bool{false, true} {
 		prev := pgShapedCollapse
 		pgShapedCollapse = collapse
-		node, ctx := seamFixture(names, []int64{100, 100, 100})
-		// What `planFromItem` builds for `a JOIN b ON … JOIN c ON …`: the
-		// chain is INNER joins carrying their own ON quals, not the CROSS
-		// chain a comma FROM list produces.
-		chain := node.(*Join)
-		chain.Left.(*Join).Type = JoinTypeInner
-		fused := &Join{Type: JoinTypeInner, Left: chain.Left, Right: chain.Right,
-			schema: append(Schema(nil), chain.Output()...)}
-		// The joinlist the flag actually produces for that FROM clause,
-		// so the only thing varying between the two arms is the regime.
-		ctx.joinlist = deconstructJointree(
-			parseFrom(t, "a JOIN b ON a.a0 = b.b0 JOIN c ON b.b0 = c.c0"),
-			defaultCollapseLimits(), collapse)
-		_, _, used := tryPGShapedJoinSearch(fused, rfjEq(names, 0, 1), ctx, nil)
+		// The chain `planFromItem` builds for that FROM clause, and the
+		// joinlist the flag actually produces for it — so the only thing
+		// varying between the two arms is the regime.
+		node, ctx := seamInnerChain(t, names, []int64{100, 100, 100})
+		out, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
 		pgShapedCollapse = prev
-		if used {
-			t.Fatalf("collapse=%v: the seam searched an explicit-JOIN chain — the "+
-				"precondition this milestone recorded as the collapse flip's blocker "+
-				"has been lifted, so M0127-P5.9-m's no-go should be re-measured",
+		if !used {
+			t.Fatalf("collapse=%v: the seam declined an explicit-JOIN chain — the "+
+				"P5.9-r walk has regressed and the collapse flag is unobservable again",
 				collapse)
+		}
+		got := seamEqualities(out)
+		for _, want := range []string{"a0=b0", "b0=c0"} {
+			if !got[want] {
+				t.Fatalf("collapse=%v: the searched tree does not enforce %s (enforces %v)",
+					collapse, want, got)
+			}
 		}
 	}
 }

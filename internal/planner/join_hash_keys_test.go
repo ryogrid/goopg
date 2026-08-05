@@ -9,23 +9,40 @@ import (
 
 // hashKeysFixture builds two tables that can be joined on two columns
 // with a third, non-equijoin conjunct available for the residual tests.
+// hashKeysFixture is two int4 relations joinable on two columns.
+//
+// The row counts are not decoration. Since M0127-P5.9-r the PG-shaped search
+// reaches a FROM clause written `JOIN … ON` as well as a comma one, and it picks
+// the join ALGORITHM from cost rather than from the predicate's shape. A
+// relation whose size the planner cannot see is estimated at the one-row floor,
+// and at one row per side a nested loop is the cheaper plan — so a fixture with
+// no statistics would silently stop producing the hash join every test in this
+// file is about. Sizing the fixture keeps the subject under test (which pairs a
+// hash join PUBLISHES) separate from a cardinality question it does not ask.
 func hashKeysFixture(t *testing.T) catalog.Catalog {
 	t.Helper()
 	c := catalog.NewInMemory()
-	if _, err := c.CreateTable(parser.ObjectName{Name: "l"}, []catalog.Column{
+	mk := func(name string, cols []catalog.Column) {
+		tb, err := c.CreateTable(parser.ObjectName{Name: name}, cols)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb.Stats = &catalog.TableStats{RowCount: 100_000}
+		tb.Stats.Columns = make([]catalog.ColumnStats, len(cols))
+		for i := range cols {
+			tb.Stats.Columns[i] = catalog.ColumnStats{NDistinct: 100_000}
+		}
+	}
+	mk("l", []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
 		{Name: "b", Type: catalog.Type{Name: "int4"}},
 		{Name: "v", Type: catalog.Type{Name: "int4"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.CreateTable(parser.ObjectName{Name: "r"}, []catalog.Column{
+	})
+	mk("r", []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
 		{Name: "b", Type: catalog.Type{Name: "int4"}},
 		{Name: "w", Type: catalog.Type{Name: "int4"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	return c
 }
 

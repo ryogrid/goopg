@@ -8150,8 +8150,52 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       1 ledger row. Artefacts: `analysis/leftdeep-joins/2026-08-06-p59m-*`,
       `p59m-collapse-probe.sh`, `sweep-20260806-035500.txt`,
       `plans-20260806-042316.txt`.
-- [ ] **M0127-P5.9-r — the seam cannot walk an INNER-join chain, so no explicit
-      JOIN is ever reordered.** NEW 2026-08-06 (09 §3.18, ledger row P5.9-m).
+- [x] **M0127-P5.9-r — the seam cannot walk an INNER-join chain, so no explicit
+      JOIN is ever reordered.** **DONE 2026-08-06 — the walk landed and MEASURED
+      that the corpus blocker is one level deeper (09 §3.19).**
+      `extractSearchLeaves` (`internal/planner/joinsearchseam.go`) replaces
+      `extractScans` at the seam: it descends `JoinTypeInner` as well as
+      `JoinTypeCross` and returns the `ON` quals of every link it flattened,
+      which the seam appends to the `WHERE` conjuncts and partitions with the
+      same rule (upstream's `distribute_qual_to_rels`). Routing them is not
+      optional — the seam DISCARDS the pre-search chain and carries only its
+      leaves, so a dropped `ON` qual is a cross product, not a slow plan.
+      `chainCarriesLateral` extended to INNER links. New instrument:
+      `DPTRACE seam-decline reason=… nrels=… nleaves=…`
+      (`joinsearchtrace.go`), which separates "the seam declined" from "the
+      search enumerated nothing" — the ambiguity that cost P5.9-m a whole pass.
+      `TestCollapseDoesNotReachTheSearch` inverted into
+      `TestCollapseReachesTheSearch`; `TestPGShapedSeamSearchesAnExplicitInnerChain`
+      asserts all three qual destinations at once.
+      **09 §3.18's protocol re-run: `queries=99 same=99 changed=0` under
+      collapse OFF *and* ON, and the flip is STILL a NO-GO — for a new cause.**
+      `DPTRACE seam-decline reason=leaf-count nrels=11 nleaves=1` on Q72,
+      because its chain ends `left outer join promotion … left outer join
+      catalog_returns …`. 12 of 99 TPC-DS queries spell an explicit JOIN and
+      **all 12** contain an outer join, so **0 are INNER-only**
+      (`TestNoCorpusQueryHasAnInnerOnlyJoinChain`); TPC-H is the same with Q13.
+      The remaining blocker: `joinlistItem` carries no join TYPE, so admitting
+      an outer link would plan a LEFT JOIN as an INNER JOIN — the leaf-count
+      decline is what stands between that and a wrong answer. Successor:
+      **M0127-P5.9-s**. 2 ledger rows.
+- [ ] **M0127-P5.9-s — the joinlist carries no join TYPE, so an outer link
+      cannot enter the search and the whole statement is declined.** NEW
+      2026-08-06 (09 §3.19, ledger row P5.9-r). `joinPinned` (collapse.go)
+      correctly wraps an outer join into its own two-member subproblem, but
+      `makeRelFromJoinlist` (`relfromjoinlist.go`) has no type to rebuild it
+      with, so the seam's leaf-count decline is the only thing preventing a LEFT
+      JOIN from being planned as an INNER JOIN. Every explicit-JOIN query in
+      both corpora is topped by an outer link, so this — not the INNER walk —
+      is what keeps goopg from reordering any real `JOIN … ON` clause.
+      Smaller half first: add `joinlistItem.jointype` and search the INNER
+      PREFIX below the pinned outer spine, splicing the outer links back above
+      it, exactly as `runJoinSearchBelowPinned` (`internal/planner/predp.go:73`)
+      already does for the semi/anti spine. Larger half is 03 §4.4's
+      `SpecialJoinInfo` inference (real outer-join reordering). Files:
+      `internal/planner/collapse.go`, `relfromjoinlist.go`, `joinsearchseam.go`.
+      Bar: the full 09 §3 bar — this changes which quals are enforced where AND
+      which rows survive; then re-run 09 §3.19's protocol and re-decide COLLAPSE.
+- [x] **M0127-P5.9-r — SUPERSEDED FILING (kept for attribution).** NEW 2026-08-06 (09 §3.18, ledger row P5.9-m).
       `extractScans` (`internal/planner/bushy.go:261`) descends `JoinTypeCross`
       and nothing else, so `tryPGShapedJoinSearch` declines every FROM clause
       written with `JOIN … ON` — measured, not inferred: the DP trace is empty on

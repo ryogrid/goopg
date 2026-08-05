@@ -3045,3 +3045,97 @@ cannot move a plan, which is the §3.15/§3.16 defect one flag generation later:
 a gate reporting a number about a variable it did not vary. The unblock is a
 seam that admits an INNER-join chain (ledger row, 2026-08-06); collapse becomes
 measurable the moment it lands, and this section is the protocol to re-run.
+
+### 3.19 The seam learns to walk an INNER chain, and the corpus turns out to have none (P5.9-r, 2026-08-06)
+
+§3.18 named the collapse flip's blocker — the seam declined every FROM clause
+written `JOIN … ON` — and filed the unblock as P5.9-r. It has landed, the
+protocol above has been re-run, and the verdict is unchanged with a **different
+and more precise cause**: the door is open and the corpus has nobody to walk
+through it.
+
+**What landed.** `extractSearchLeaves` (`internal/planner/joinsearchseam.go`)
+replaces `extractScans` at the seam. It descends INNER links as well as CROSS
+ones and returns the `ON` quals of every link it flattened, which the seam then
+appends to the `WHERE` conjuncts and partitions with the same rule — upstream's
+shape, where `distribute_qual_to_rels` places a qual by the relids it reads and
+an inner join's qual has no other property to distinguish it. Routing the quals
+is not optional: the seam DISCARDS the pre-search chain and carries only its
+leaves, so an `ON` qual the walk failed to hand over would not be demoted to a
+slower plan, it would vanish and the statement would return the cross product.
+`TestPGShapedSeamSearchesAnExplicitInnerChain` asserts all three destinations at
+once (both equalities enforced in the searched tree, the WHERE restriction on
+its leaf, empty residual), and `TestCollapseDoesNotReachTheSearch` is inverted
+into `TestCollapseReachesTheSearch`.
+
+An `ON` qual may be moved at all only because the link is INNER — an inner
+join's qual is semantically a `WHERE` qual, so a conjunct the search does not
+place is still correct in the residual `Filter` above the searched tree. That
+equivalence is the whole licence, and it is why the walk stops at every other
+join type.
+
+**Three shapes stay declined, each for a correctness reason.** An OUTER (or
+semi/anti) link stops the walk; an `ON` qual on a non-first comma FROM item is
+written in that item's own coordinates and re-basing it needs a rewriter that
+answers "unchanged" for an expression kind it does not know (`shiftColumnRefsBy`,
+planner.go), so the seam admits the shift-free case and declines the rest; a
+LATERAL marker on an INNER link is now read before the link is flattened, which
+it had to be — checking only CROSS links would have let the one shape the search
+must never reorder in through the new door.
+
+**The re-run.** DS05 plan capture, one binary, `COLLAPSE` the only variable:
+
+| arm | result |
+|---|---|
+| collapse OFF vs the `d867ae03` baseline | `queries=99 same=99 changed=0` |
+| collapse ON vs collapse OFF, fixed binary | `queries=99 same=99 changed=0` |
+| DS05 SF0.5 row/value sweep (default regime) | `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` |
+| ↳ vs §3.18's own sweep | `STATUS-DELTA compared=99 verdict-changes=none runtime-moves=0` |
+
+Artefacts: `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260806-{051002,051102,051234,051536}.txt`,
+`sweep-20260806-051536.txt`.
+
+The sweep is the correctness clause, and it is the one that would have caught a
+mis-routed `ON` qual: a qual dropped on the way into the clause list produces a
+cross product, which is a row-count MISMATCH, not a plan-shape difference. It
+reports zero — against a git-tracked PG oracle, with 57 of the 95 passes
+verified on a value checksum and not merely on a count.
+
+**Why it is still zero, measured rather than inferred.** This pass adds the
+instrument §3.18 lacked: `DPTRACE seam-decline reason=… nrels=… nleaves=…`
+(`internal/planner/joinsearchtrace.go`), which distinguishes "the seam declined
+the statement" from "the search ran and enumerated nothing" — two facts that
+produced the identical silence in §3.18's log and cost that pass a synthetic
+control to separate. Q72 answers immediately:
+
+```
+DPTRACE seam-decline reason=leaf-count nrels=11 nleaves=1
+```
+
+One leaf for eleven bindings, because Q72's chain ENDS in
+`left outer join promotion … left outer join catalog_returns …` and the walk
+stops at the first outer link it meets from the top. Q75 is the same at
+`nrels=4 nleaves=1`, Q78 at `nrels=3 nleaves=2`. Generalised at the parse level
+by `TestNoCorpusQueryHasAnInnerOnlyJoinChain`: of 99 TPC-DS queries, **twelve**
+spell an explicit JOIN and **all twelve** contain an outer join, so **zero** are
+INNER-only. TPC-H is the same with one query — Q13's only explicit join is a
+LEFT OUTER. The corpus contains no statement this walk can act on, and the plan
+A/B could not have moved.
+
+**The blocker, one level deeper.** `joinlistItem` (`internal/planner/collapse.go`)
+carries no join TYPE. `joinPinned` correctly wraps an outer join into its own
+two-member subproblem, but nothing downstream could rebuild it AS an outer join
+— `makeRelFromJoinlist` joins its items and the type is simply not in the data —
+so admitting an outer link would silently plan a LEFT JOIN as an INNER JOIN.
+**The leaf-count decline is what stands between that latent shape and a wrong
+answer today**, which is why P5.9-r kept it rather than widening the walk
+further. Making an outer join reorderable is 03 §4.4's `SpecialJoinInfo` work;
+making it merely *representable* below a pinned spine is the smaller successor,
+and it is the one the corpus needs — `runJoinSearchBelowPinned` already does
+exactly that for the semi/anti spine.
+
+**Verdict: `pgShapedCollapse` stays default OFF, and 08 §2's S5 collapse gate is
+still run-but-NOT-discharged.** §3.18's no-go stands; its stated cause does not.
+The protocol to re-run is this section, and the signal to re-run it is
+`TestNoCorpusQueryHasAnInnerOnlyJoinChain` going red — the day a measurable
+query exists — or the outer-link successor landing, whichever comes first.

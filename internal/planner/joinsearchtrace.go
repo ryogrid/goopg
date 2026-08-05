@@ -240,3 +240,24 @@ func (t *searchTrace) emit() {
 	}
 	fmt.Fprint(os.Stderr, t.render())
 }
+
+// traceSeamDecline is the trace's OTHER half, added by M0127-P5.9-r: the record
+// of a statement that never became a problem at all.
+//
+// The blocks above describe a search that RAN. When `tryPGShapedJoinSearch`
+// declines, no `searchTrace` is ever constructed, so the channel says nothing —
+// and "nothing" is exactly what a search that ran and enumerated no pair also
+// says. M0127-P5.9-m spent a whole measurement pass on that ambiguity: Q72's
+// eleven-way explicit-JOIN level emitted no trace, and separating "the seam
+// declined it" from "the search enumerated nothing" took a synthetic control
+// and a unit test to settle. This line settles it in the log.
+//
+// `reason` is a fixed vocabulary, not a message: it names the precondition, so
+// a reader can grep one arm's log for `reason=leaf-count` and get a count.
+func traceSeamDecline(reason string, nrels, nleaves int) {
+	if !dpTraceEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s seam-decline reason=%s nrels=%d nleaves=%d\n",
+		traceTag, reason, nrels, nleaves)
+}

@@ -177,6 +177,120 @@ func TestPGShapedSeamResidualIsWhatTheSearchDidNotPlace(t *testing.T) {
 	rfjAssertBindingOrder(t, out, names)
 }
 
+// seamLeaves takes the three `*SeqScan` leaves back out of `seamFixture`'s CROSS
+// chain, so a test can rebuild them into a different chain shape without
+// duplicating the fixture's catalog/statistics setup.
+func seamLeaves(t *testing.T, node Node) (Node, Node, Node) {
+	t.Helper()
+	top, ok := node.(*Join)
+	if !ok {
+		t.Fatalf("fixture root is %T, want the CROSS chain", node)
+	}
+	left, ok := top.Left.(*Join)
+	if !ok {
+		t.Fatalf("fixture root's left is %T, want the CROSS chain's lower link", top.Left)
+	}
+	return left.Left, left.Right, top.Right
+}
+
+// seamInnerChain builds what `planFromItem` produces for ONE comma-separated
+// FROM item written `n0 JOIN n1 ON n0.x = n1.x JOIN n2 ON n1.x = n2.x`: a
+// left-deep chain of INNER links, each carrying its own `ON` qual, with the
+// joinlist the real producer computes for that FROM clause.
+//
+// The quals are in the statement's coordinates because the item is the FIRST
+// one — which is exactly the case the seam admits, and the reason the fixture
+// does not have to model a shift the seam refuses to perform.
+func seamInnerChain(t *testing.T, names []string, rows []int64) (Node, *resolveContext) {
+	t.Helper()
+	node, ctx := seamFixture(names, rows)
+	a, b, c := seamLeaves(t, node)
+	lower := &Join{Type: JoinTypeInner, Left: a, Right: b,
+		schema: appendSchema(a.Output(), b.Output()), Predicate: rfjEq(names, 0, 1)}
+	root := &Join{Type: JoinTypeInner, Left: lower, Right: c,
+		schema: appendSchema(lower.Output(), c.Output()), Predicate: rfjEq(names, 1, 2)}
+	ctx.joinlist = deconstructJointree(
+		parseFrom(t, "a JOIN b ON a.a0 = b.b0 JOIN c ON b.b0 = c.c0"),
+		defaultCollapseLimits(), pgShapedCollapseEnabled())
+	return root, ctx
+}
+
+// seamEqualities is the set of equi-join clauses a plan tree actually enforces,
+// keyed by COLUMN NAME because the fixture's names are globally unique and a
+// searched tree's internal joins are written in the search's own per-joinrel
+// layouts, where an index means nothing to a caller.
+//
+// Both spellings are collected: the residual `Predicate` and the `LeftKey` /
+// `RightKey` pair a hash path decomposes the same equality into.
+func seamEqualities(n Node) map[string]bool {
+	out := map[string]bool{}
+	add := func(l, r Expr) {
+		lc, lok := l.(*ColumnRef)
+		rc, rok := r.(*ColumnRef)
+		if !lok || !rok {
+			return
+		}
+		lo, hi := lc.Name, rc.Name
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		out[lo+"="+hi] = true
+	}
+	for _, j := range rfjJoins(n) {
+		if j.LeftKey != nil && j.RightKey != nil {
+			add(j.LeftKey, j.RightKey)
+		}
+		for _, c := range splitAnd(j.Predicate) {
+			if bo, isBin := c.(*BinaryOp); isBin && bo.Op == parser.OpEq {
+				add(bo.Left, bo.Right)
+			}
+		}
+	}
+	return out
+}
+
+// TestPGShapedSeamSearchesAnExplicitInnerChain is M0127-P5.9-r's subject: the
+// seam admits a FROM clause written `JOIN … ON` and routes the `ON` quals into
+// the search's clause list.
+//
+// The assertion that matters is not "used == true" — it is that every qual is
+// still enforced afterwards. The pre-search chain is DISCARDED by the seam (only
+// its leaves are carried into the search), so an `ON` qual the walk failed to
+// hand over would not be demoted to a slower plan, it would vanish and the
+// statement would return the cross product. Hence: both equalities are found in
+// the searched tree, the WHERE restriction is found on its leaf, and the
+// residual is empty — the three destinations, all three checked at once.
+func TestPGShapedSeamSearchesAnExplicitInnerChain(t *testing.T) {
+	withPGShapedDP(t)
+	names := []string{"a", "b", "c"}
+	node, ctx := seamInnerChain(t, names, []int64{1_000_000, 500_000, 10})
+
+	out, residual, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
+	if !used {
+		t.Fatal("the seam declined an explicit 3-relation INNER JOIN chain")
+	}
+	if residual != nil {
+		t.Fatalf("residual = %v, want nil: the ON quals are join clauses and the WHERE restriction is leaf-local", residual)
+	}
+	if !isSearchedTree(out) {
+		t.Fatalf("root %T is untagged; the legacy posmap passes would walk into it", out)
+	}
+	got := seamEqualities(out)
+	for _, want := range []string{"a0=b0", "b0=c0"} {
+		if !got[want] {
+			t.Fatalf("the searched tree does not enforce %s (enforces %v) — an ON qual was dropped, "+
+				"which is a cross product, not a slow plan", want, got)
+		}
+	}
+	if n := len(seamLeafLocalFilters(out)); n != 1 {
+		t.Fatalf("found %d leaf-local filters, want 1 (the WHERE `a1 > 5` restriction)", n)
+	}
+	rfjAssertBindingOrder(t, out, names)
+	if n := len(rfjJoins(out)); n != 2 {
+		t.Fatalf("searched tree has %d joins, want 2 for 3 relations", n)
+	}
+}
+
 // TestSearchConsumesAsksTheProducer pins the residual rule against
 // `buildRestrictInfos` itself, one conjunct class per case. The OR row is the
 // one that would be wrong under any re-derived "does it reach two relations"
@@ -227,16 +341,54 @@ func TestPGShapedSeamDeclines(t *testing.T) {
 
 	t.Run("leaf count disagrees with binding count", func(t *testing.T) {
 		node, ctx := seamFixture(names, []int64{100, 100, 100})
-		// What an explicit `b JOIN c ON …` FROM item looks like on entry: ONE
-		// node for TWO bindings. The joinlist's leaf indices no longer
-		// subscript anything, and the `ON` conjuncts are on the node rather
-		// than in the WHERE predicate the seam is handed.
+		// `a LEFT JOIN b ON … JOIN c ON …`. M0127-P5.9-r taught the walk to
+		// descend INNER links, but an OUTER one still stops it: its qual is
+		// not a WHERE qual and reordering across it changes the rows. So the
+		// LEFT node comes back as ONE leaf for TWO bindings, the leaf count
+		// disagrees with the binding count, and the statement is declined
+		// whole — the joinlist's leaf indices would otherwise subscript
+		// bindings the leaves do not correspond to.
 		chain := node.(*Join)
-		chain.Left.(*Join).Type = JoinTypeInner
-		fused := &Join{Type: JoinTypeInner, Left: chain.Left, Right: chain.Right,
-			schema: append(Schema(nil), chain.Output()...)}
-		if _, _, used := tryPGShapedJoinSearch(fused, rfjEq(names, 0, 1), ctx, nil); used {
+		chain.Left.(*Join).Type = JoinTypeLeft
+		chain.Left.(*Join).Predicate = rfjEq(names, 0, 1)
+		chain.Type = JoinTypeInner
+		chain.Predicate = rfjEq(names, 1, 2)
+		if _, _, used := tryPGShapedJoinSearch(chain, seamLocal(names, 0), ctx, nil); used {
 			t.Fatal("the seam searched a FROM list whose leaves it cannot enumerate")
+		}
+	})
+
+	t.Run("lateral on an explicit JOIN link", func(t *testing.T) {
+		node, ctx := seamInnerChain(t, names, []int64{100, 100, 100})
+		// `planFromItem` marks the INNER node it builds when the right side
+		// references the left (planner.go:2261-2270). The walk flattens that
+		// node away, so the marker has to be read from the chain before it is
+		// flattened or the search would be free to reorder across it.
+		node.(*Join).Lateral = true
+		if _, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil); used {
+			t.Fatal("the seam reordered an explicit JOIN chain with a LATERAL right side")
+		}
+	})
+
+	t.Run("ON qual on a non-first FROM item", func(t *testing.T) {
+		// `FROM a, b JOIN c ON b.b0 = c.c0`: the ON qual was resolved in the
+		// SECOND item's own coordinates, where `b0` is index 0, while the
+		// statement's space puts it at `rfjWidth`. Re-basing it needs a
+		// rewriter that answers "unchanged" for an expression kind it does not
+		// know, so the seam declines instead of shifting — see the file header.
+		node, ctx := seamFixture(names, []int64{100, 100, 100})
+		a, b, c := seamLeaves(t, node)
+		item := &Join{Type: JoinTypeInner, Left: b, Right: c,
+			schema: appendSchema(b.Output(), c.Output()),
+			Predicate: &BinaryOp{Op: parser.OpEq,
+				Left:  &ColumnRef{Name: "b0", Index: 0, SourceTableIdx: 1},
+				Right: &ColumnRef{Name: "c0", Index: rfjWidth, SourceTableIdx: 2}}}
+		root := &Join{Type: JoinTypeCross, Left: a, Right: item,
+			schema: appendSchema(a.Output(), item.Output())}
+		ctx.joinlist = deconstructJointree(
+			parseFrom(t, "a, b JOIN c ON b.b0 = c.c0"), defaultCollapseLimits(), pgShapedCollapseEnabled())
+		if _, _, used := tryPGShapedJoinSearch(root, seamLocal(names, 0), ctx, nil); used {
+			t.Fatal("the seam searched a chain whose ON qual it cannot re-base")
 		}
 	})
 

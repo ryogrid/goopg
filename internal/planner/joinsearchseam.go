@@ -22,30 +22,65 @@ package planner
 // ## 1. Which statements enter the search
 //
 // The search wants ONE leaf per FROM binding, in binding order, with no
-// execution-time dependency between them. `extractScans` over the pre-search
-// CROSS chain supplies exactly that for a comma-FROM list — including the
-// subquery / VALUES / function-scan leaves the old DP's whitelist refused
-// (joinsearch.go:20), which is the leaf-whitelist gap closing at the seam
-// rather than only in principle. Three shapes are declined and each decline is
-// a correctness statement, not a tuning knob:
+// execution-time dependency between them. `extractSearchLeaves` over the
+// pre-search chain supplies exactly that — including the subquery / VALUES /
+// function-scan leaves the old DP's whitelist refused (joinsearch.go:20), which
+// is the leaf-whitelist gap closing at the seam rather than only in principle.
 //
-//   - a FROM item that is itself an explicit `JOIN` produces ONE node and
-//     SEVERAL bindings, so the leaf count disagrees with the binding count and
-//     the joinlist's leaf indices no longer subscript anything. Flattening
-//     those into the search additionally needs the `ON` conjuncts — which live
-//     on the `*Join` node, not in the `WHERE` `*Filter` this seam is handed —
-//     to reach the clause list. That is the collapse-ON population of 08 §2 and
-//     it is ledgered, not silently half-done: with `GOOPG_PGSHAPED_COLLAPSE` on
-//     the joinlist flattens but this seam still declines, so the flag pair
-//     cannot produce a plan that reorders around a qual nobody placed;
+// M0127-P5.9-r: it walks the INNER links too, not only the CROSS ones a
+// comma-FROM list produces, and that is what makes an explicit `JOIN … ON`
+// reorderable at all. Before it, `extractScans` (bushy.go) descended
+// `JoinTypeCross` and nothing else, so an explicit JOIN arrived as ONE node for
+// N bindings, the leaf count disagreed with the binding count, and the seam
+// declined the whole statement before `ctx.joinlist` was ever consulted — with
+// `GOOPG_PGSHAPED_COLLAPSE` on OR off, which is why the collapse flip was
+// measured as a no-go about a flag that could not move a plan (09 §3.18).
+// Upstream has no such restriction: `deconstruct_recurse` (initsplan.c:1250)
+// walks the `JoinExpr` chain and `distribute_qual_to_rels` puts each `ON` qual
+// into the enclosing problem's clause list, which is exactly what the walk's
+// third return value carries here.
+//
+// An `ON` qual may be routed that way only because the link is INNER: an inner
+// join's qual is semantically a `WHERE` qual, so a conjunct the search does not
+// place is still correct in the residual `Filter` above the searched tree. That
+// equivalence is the whole licence for this, and it is why the walk descends
+// INNER and CROSS and stops at every other join type.
+//
+// Four shapes are declined and each decline is a correctness statement, not a
+// tuning knob:
+//
+//   - a FROM item whose chain contains an OUTER (or semi/anti) join. The walk
+//     stops there and returns that node as a leaf, so the leaf count disagrees
+//     with the binding count and the statement falls back to the syntactic
+//     shape. `a LEFT JOIN b ON … JOIN c ON …` is therefore declined whole,
+//     rather than searched from a joinlist whose leaf indices would subscript
+//     bindings the leaves do not correspond to;
+//   - an `ON` qual on an item that is not the FIRST comma-separated FROM item.
+//     `planFromItem` resolves a chain's quals in that ITEM's coordinates
+//     (planner.go:2178-2190 — `mergedCtx` is built from the item's own
+//     `leftCtx`), while `planFromClause` shifts only the BINDINGS when it
+//     crosses items (planner.go:1985-1999). Re-basing the qual is one call to
+//     `shiftColumnRefsBy`, but that rewriter answers `return e` for an
+//     expression kind it does not know, which would leave a ColumnRef reading
+//     the wrong column instead of failing — a wrong answer, and the class this
+//     milestone exists to remove. So the seam admits the shift-free case (base
+//     0) and declines the rest; ledgered, not silently half-done;
 //   - a LATERAL item, whose rows depend on an item to its left. The search
 //     chooses an order, so admitting one would be a wrong answer, not a slow
-//     one. `extractScans` cannot see it — it flattens the CROSS chain that
-//     carries the marker — so the chain is walked for it explicitly;
+//     one. The flattened leaf list cannot see the marker — it lives on the
+//     chain node — so the chain is walked for it explicitly;
 //   - bindings whose offsets do not agree with the concatenation of the leaf
 //     widths. Every coordinate in the clause list is written in that one space
 //     (03 §6.2), so a disagreement means the caller's map is not the map the
 //     search would use.
+//
+// What the joinlist does with an admitted chain is the collapse flag's
+// business, not this walk's: with `GOOPG_PGSHAPED_COLLAPSE` off every INNER
+// `JoinExpr` is still pinned into its own two-member subproblem
+// (`joinPinned`, collapse.go), so the written order survives and only the PATHS
+// are chosen; with it on the chain flattens into one problem and the order is
+// searched. Both regimes now reach the search, which is what makes 03 §6's
+// collapse pass a decidable question instead of a dead one.
 //
 // ## 2. Which conjuncts the search consumed
 //
@@ -109,22 +144,31 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// past `maxSearchRels` the RelSet cannot address the problem at all, and
 	// the joinlist's own leaf indices would exceed the clause list's bit width.
 	if nrels < 2 || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
+		traceSeamDecline("size-or-no-joinlist", nrels, len(ctx.joinlist))
 		return node, pred, false
 	}
-	scans, widths := extractScans(node)
+	scans, widths, onQuals, ok := extractSearchLeaves(node)
+	if !ok {
+		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
+		return node, pred, false
+	}
 	if len(scans) != nrels {
+		traceSeamDecline("leaf-count", nrels, len(scans))
 		return node, pred, false
 	}
 	if chainCarriesLateral(node) {
+		traceSeamDecline("lateral", nrels, len(scans))
 		return node, pred, false
 	}
 	cumOffsets := make([]int, nrels+1)
 	for i := range scans {
 		if scans[i] == nil {
+			traceSeamDecline("nil-leaf", nrels, len(scans))
 			return node, pred, false
 		}
 		cumOffsets[i+1] = cumOffsets[i] + widths[i]
 		if ctx.bindings[i].offset != cumOffsets[i] {
+			traceSeamDecline("offset-disagreement", nrels, len(scans))
 			return node, pred, false
 		}
 	}
@@ -139,7 +183,17 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// has, which a searched tree cannot honour: the index arm REBUILDS a leaf
 	// (P5.5-c), so a leaf matched by identity afterwards could be missed and its
 	// qual lost.
+	// M0127-P5.9-r: the `ON` quals of the INNER links the walk descended join
+	// the `WHERE` conjuncts in ONE list, split with the same `splitAnd` and
+	// partitioned by the same rule. That is upstream's shape, not a shortcut:
+	// `distribute_qual_to_rels` places a qual by the relids it reads, and an
+	// inner join's qual has no other property to distinguish it — which is why
+	// a single-relation `ON` qual becomes a leaf-local filter here exactly as a
+	// single-relation `WHERE` qual does.
 	conjuncts := splitAnd(pred)
+	for _, q := range onQuals {
+		conjuncts = append(conjuncts, splitAnd(q)...)
+	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	leaves := make([]Node, nrels)
 	relInfos := make([]baseRelInfo, nrels)
@@ -224,22 +278,87 @@ func searchConsumes(c Expr, cumOffsets []int) bool {
 	return false
 }
 
-// chainCarriesLateral reports whether the pre-search CROSS chain contains a
+// extractSearchLeaves flattens the pre-search join chain into the one-leaf-per-
+// FROM-binding list the search takes, and returns the `ON` quals of the links it
+// flattened, re-expressed in the statement's binding coordinates.
+//
+// It is the seam's own walk rather than `extractScans` (bushy.go) because the
+// two answer different questions. `extractScans` feeds the legacy bushy DP,
+// which reads its predicates from the `WHERE` `*Filter` alone and rebuilds a
+// tree over the leaves it is given; flattening an INNER link for THAT consumer
+// would drop the link's qual on the floor. This walk hands the qual back, so the
+// caller can place it — see the file header for why an INNER link's qual may be
+// placed anywhere at or above the join and an outer link's may not.
+//
+// `ok` is false when the chain cannot be flattened without moving a qual the
+// walk cannot re-base (the non-first-item case of the file header) or when a
+// CROSS link carries a qual — which `planFromClause`/`planFromItem` never build
+// (a `CROSS JOIN` has no `ON` clause and `planJoinPredicate` answers nil), so it
+// is a shape from some later rewrite and not one this walk may reinterpret.
+// A false `ok` is a decline, never a partial answer: the caller falls back to
+// the syntactic tree, which still carries every qual on its own nodes.
+//
+// Leaves are appended in chain order, which is binding order — `planFromItem`
+// numbers a chain's bindings left to right and `planFromClause` appends items
+// in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
+// before Right at every level.
+func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr, ok bool) {
+	width := 0
+	var walk func(Node) bool
+	walk = func(n Node) bool {
+		if n == nil {
+			return false
+		}
+		j, isJoin := n.(*Join)
+		if !isJoin || (j.Type != JoinTypeCross && j.Type != JoinTypeInner) {
+			scans = append(scans, n)
+			widths = append(widths, len(n.Output()))
+			width += len(n.Output())
+			return true
+		}
+		// The link's own coordinate origin: the leaves to its left have already
+		// been counted, and its qual was resolved against a schema that starts
+		// at its leftmost leaf, so this is the delta between the two spaces.
+		base := width
+		if !walk(j.Left) || !walk(j.Right) {
+			return false
+		}
+		if j.Predicate == nil {
+			return true
+		}
+		if j.Type != JoinTypeInner || base != 0 {
+			return false
+		}
+		onQuals = append(onQuals, j.Predicate)
+		return true
+	}
+	if !walk(node) {
+		return nil, nil, nil, false
+	}
+	return scans, widths, onQuals, true
+}
+
+// chainCarriesLateral reports whether the pre-search join chain contains a
 // LATERAL dependency — an item whose rows are computed per row of an item to
 // its left.
 //
 // The join search chooses an order, so a LATERAL item may not enter it: the
 // dependency is not expressible as a clause and reordering across it produces
 // wrong rows rather than slow ones. Both spellings are checked because
-// `planFromClause` marks the CROSS join it builds (`Join.Lateral`) while a
-// FROM-clause SRF's outer references live on the leaf itself
-// (`nodeReferencesOuter`), and `extractScans` — which flattens the chain —
-// discards the first of those.
+// `planFromClause`/`planFromItem` mark the join they build (`Join.Lateral`)
+// while a FROM-clause SRF's outer references live on the leaf itself
+// (`nodeReferencesOuter`), and `extractSearchLeaves` — which flattens the chain
+// — discards the first of those.
+//
+// M0127-P5.9-r: it descends exactly the links that walk flattens. A LATERAL on
+// the right of an explicit `JOIN` is marked on the INNER node
+// (planner.go:2261-2270), so checking only CROSS links would have let the one
+// shape the search must never reorder in through the new door.
 func chainCarriesLateral(n Node) bool {
 	if n == nil {
 		return false
 	}
-	if j, ok := n.(*Join); ok && j.Type == JoinTypeCross {
+	if j, ok := n.(*Join); ok && (j.Type == JoinTypeCross || j.Type == JoinTypeInner) {
 		return j.Lateral || chainCarriesLateral(j.Left) || chainCarriesLateral(j.Right)
 	}
 	return nodeReferencesOuter(n)
