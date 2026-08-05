@@ -109,7 +109,7 @@ func TestAdjudicateVerdicts(t *testing.T) {
 		{Query: "Qmissing", Kind: "candidate", Key: "{customer+orders} | {lineitem}"},
 		{Query: "Qforeign", Kind: "candidate", Key: "{part} | {partsupp}"},
 	}
-	want := []EnumVerdict{EnumOffered, EnumDeclined, EnumUnbuiltSide, EnumMissing, EnumNoProblem}
+	want := []EnumVerdict{EnumOffered, EnumDeclined, EnumUnbuiltSide, EnumMissing, EnumCrossLevel}
 	got := tr.Adjudicate(checks)
 	for i := range checks {
 		if got[i].Verdict != want[i] {
@@ -122,6 +122,66 @@ func TestAdjudicateVerdicts(t *testing.T) {
 	}
 	if got[1].Passed() || got[3].Passed() {
 		t.Error("a candidate the search never offered must not pass clause 6")
+	}
+	if !strings.Contains(got[4].Detail, "part") || !strings.Contains(got[4].Detail, "partsupp") {
+		t.Errorf("CROSS-QUERY-LEVEL must name the relations that entered no join problem, got %q", got[4].Detail)
+	}
+
+	// The same key against a log with NO blocks at all is the OTHER verdict:
+	// nothing was harvested, so nothing can be said about query levels either.
+	// Separating these is the whole point — one voids the run, one does not.
+	empty := ParseEnumTrace(strings.NewReader("LOG:  no trace here\n"))
+	if v := empty.Adjudicate(checks[4:])[0].Verdict; v != EnumNoProblem {
+		t.Errorf("an unharvested log gave %s, want %s", v, EnumNoProblem)
+	}
+}
+
+// TestCrossQueryLevelControlIsOutOfScope pins the fix the channel's first live
+// run forced (2026-08-06, TPC-H Q20): goopg's own printed pairing
+// `{nation+supplier} ⋈ {lineitem+part+partsupp}` straddles a SubPlan boundary,
+// so its only traced problem is `{nation,supplier}` and demanding the pairing be
+// OFFERED voided a run whose two real candidates had both come back OFFERED.
+//
+// The asymmetry is the property: out of scope as a CONTROL (no search ever saw
+// it), a hard clause-6 FAILURE as a CANDIDATE (PG reached the shape inside one
+// join problem; goopg cannot reach it at all).
+func TestCrossQueryLevelControlIsOutOfScope(t *testing.T) {
+	tr := parseTestLog(t, traceLog)
+
+	out := RenderEnum(tr, tr.Adjudicate([]EnumCheck{
+		{Query: "Q20", Kind: "control", Key: "{part} | {partsupp}"},
+		{Query: "Q7", Kind: "control", Key: "{customer+orders} | {lineitem+supplier}"},
+		{Query: "Q7", Kind: "candidate", Key: "{customer+orders} | {lineitem+supplier}"},
+	}))
+	if strings.Contains(out, "HARNESS FAULT") {
+		t.Errorf("a cross-query-level control voided a sound run:\n%s", out)
+	}
+	if !strings.Contains(out, "Clause 6 passes") {
+		t.Errorf("all-offered candidates did not pass:\n%s", out)
+	}
+	if !strings.Contains(out, "enum_controls=1/1 enum_controls_oos=1") {
+		t.Errorf("the set-aside control must stay visible in the ratchet line:\n%s", out)
+	}
+
+	// A control that IS in scope and not offered still voids the run.
+	out = RenderEnum(tr, tr.Adjudicate([]EnumCheck{
+		{Query: "Q7", Kind: "control", Key: "{customer+orders} | {lineitem}"},
+		{Query: "Q7", Kind: "candidate", Key: "{customer+orders} | {lineitem+supplier}"},
+	}))
+	if !strings.Contains(out, "HARNESS FAULT") {
+		t.Errorf("an in-scope failing control no longer indicts the harness:\n%s", out)
+	}
+
+	// A cross-query-level CANDIDATE fails clause 6, and says why.
+	out = RenderEnum(tr, tr.Adjudicate([]EnumCheck{
+		{Query: "Q7", Kind: "control", Key: "{customer+orders} | {lineitem+supplier}"},
+		{Query: "Q20", Kind: "candidate", Key: "{part} | {partsupp}"},
+	}))
+	if !strings.Contains(out, "Clause 6 fails") || !strings.Contains(out, "spans TWO goopg join problems") {
+		t.Errorf("a cross-query-level candidate must fail as unreachable:\n%s", out)
+	}
+	if !strings.Contains(out, "enum_candidates_crosslevel=1") {
+		t.Errorf("ratchet line lost the cross-level candidate count:\n%s", out)
 	}
 }
 
@@ -163,7 +223,7 @@ func TestRenderEnumVerdicts(t *testing.T) {
 	// A control the trace does not know about indicts the harness, and no
 	// candidate verdict from that run is admissible.
 	broken := tr.Adjudicate([]EnumCheck{
-		{Query: "Q20", Kind: "control", Key: "{part} | {partsupp}"},
+		{Query: "Q20", Kind: "control", Key: "{customer+supplier} | {lineitem+orders}"},
 		{Query: "Q7", Kind: "candidate", Key: "{customer+orders} | {lineitem}"},
 	})
 	out := RenderEnum(tr, broken)
@@ -183,7 +243,7 @@ func TestRenderEnumVerdicts(t *testing.T) {
 	if !strings.Contains(out, "Clause 6 passes") {
 		t.Errorf("all-offered did not pass clause 6:\n%s", out)
 	}
-	if !strings.Contains(out, "enum_controls=1/1 enum_candidates_offered=1/1") {
+	if !strings.Contains(out, "enum_controls=1/1 enum_controls_oos=0 enum_candidates_offered=1/1") {
 		t.Errorf("ratchet line wrong:\n%s", out)
 	}
 

@@ -36,6 +36,15 @@
 #              use --ref-port 65432 in the args to capture live instead.
 #   PER_Q      per-query EXPLAIN ANALYZE timeout (default 600s). The query is
 #              EXECUTED, serially, with max_parallel_workers_per_gather = 0.
+#   PLAN_ONLY  1 = pass --plan-only: EXPLAIN without ANALYZE, so the run yields
+#              the §4 clause-6 channel (spine diff + enumeration provenance)
+#              and NOT the §5 audit or the §4 parity ratchet. This also LIFTS
+#              the nightly-batch refusal below, deliberately: that refusal
+#              protects a TIMING measurement, and a plan-only run neither
+#              produces one (nothing is executed or timed) nor can be spoiled
+#              by one. It still competes for CPU, so it is a few EXPLAINs plus
+#              the stats warmup, not a power run. Never use it to sneak a §5
+#              arm past the refusal — --plan-only cannot produce one.
 #   GOOPG_BIN  engine image (default tmp/goopg-acceptance-bin, built here).
 #              NEVER tmp/goopg-bench-bin (nightly lane; see the arm script).
 #   NO_BUILD   1 = trust the existing images (use this to hold ONE binary
@@ -78,9 +87,14 @@ if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
 fi
 [[ -s "${PGDATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${PGDATA}" >&2; exit 3; }
 # Bracketed first character: a bare pattern self-matches this very shell.
-if [[ "${FORCE:-0}" != "1" ]] && pgrep -f "[c]i/batch/run-nightly.sh" >/dev/null 2>&1; then
-    echo "the nightly CI batch is running — refusing (FORCE=1 overrides)." >&2
-    exit 3
+if pgrep -f "[c]i/batch/run-nightly.sh" >/dev/null 2>&1; then
+    if [[ "${PLAN_ONLY:-0}" == "1" ]]; then
+        echo "# NOTE: the nightly CI batch is running; proceeding because PLAN_ONLY=1" \
+             "measures no timing (see the PLAN_ONLY note in this script's header)." >&2
+    elif [[ "${FORCE:-0}" != "1" ]]; then
+        echo "the nightly CI batch is running — refusing (PLAN_ONLY=1 is exempt; FORCE=1 overrides)." >&2
+        exit 3
+    fi
 fi
 
 mkdir -p "${REPO_ROOT}/tmp"
@@ -120,8 +134,9 @@ audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "
 # The server log IS the trace channel, and the tool reads it after the last
 # query has been planned, so no extra synchronisation is needed here.
 [[ "${GOOPG_PGSHAPED_DP_TRACE}" == "1" ]] && audit_args+=(--enum-trace "${SRV_LOG}")
+[[ "${PLAN_ONLY:-0}" == "1" ]] && audit_args+=(--plan-only)
 
-echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} started $(date -Is)"
+echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} PLAN_ONLY=${PLAN_ONLY:-0} started $(date -Is)"
 ( cd "${REPO_ROOT}" && "${AUDIT_BIN}" "${audit_args[@]}" "$@" )
 rc=$?
 echo "# audit ${LABEL} finished $(date -Is) rc=${rc}"

@@ -733,13 +733,16 @@ Evidence: `analysis/leftdeep-joins/2026-08-05-p59run4-s5-acceptance.txt`
 | 3 — no query > 2× | FAIL (5 cells) | **PASS**, worst 1.36× (Q2); Q9 15.83 s ≤ 170.9 s |
 | 4 — TPC-DS SF0.5 | FAIL (7 ERROR, 5 TIMEOUT) | **PASS** `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0` |
 | 5 — no `MultiHashJoin`/fusion | PASS | **PASS** (fourth consecutive) |
-| 6 — bushy-plan capability | PARTIAL | **UNDISCHARGED** (§3.11: measured, 2 candidates left) |
+| 6 — bushy-plan capability | PARTIAL | **PASS** — §3.13 measured both remaining candidates `OFFERED` (was UNDISCHARGED at §3.11) |
 | §4 ratchet `parity_violations` | 0 OFF / **6** ON | **0 OFF / 0 ON** |
 | §5 absolute tripwire | 1 violation per arm (Q18) | 1 violation per arm (Q18), ON the smaller |
 
 Every clause runs 1–3 failed on is green, and no defect anywhere in the run is
 attributed to `GOOPG_PGSHAPED_DP`. **The flip is still held, by clause 6 —
 and clause 6 is a gate on the harness before it is a gate on the planner.**
+(Discharged two channels later: §3.11 built the spine diff, §3.12 the
+enumeration trace, and §3.13 measured clause 6 green on 2026-08-06. What
+follows is the state at run 4, kept as written.)
 
 §4 specifies the check as "verified through the §4 parity gate's spine diff".
 That spine diff does not exist: `cmd/estimate-audit` contains zero occurrences
@@ -903,7 +906,8 @@ diff and answers each one:
 | `DECLINED` | reached and refused by the connectivity gate | a named gap, **fails** |
 | `SIDE-NOT-BUILT` | one side was never built as a joinrel — a gap one level below | a named gap, **fails** |
 | `NOT-ENUMERATED` | both sides exist, the pair was neither offered nor declined | a named gap, **fails** |
-| `NO-TRACE` | no traced problem spans it — a statement about the HARVEST, not the search | inadmissible |
+| `NO-TRACE` | no DPTRACE block was harvested at all — a statement about the HARVEST, not the search | inadmissible |
+| `CROSS-QUERY-LEVEL` | the trace was harvested, and the pairing's two sides were planned at different query levels (§3.13) | control: out of scope · candidate: **fails** |
 
 **Controls are part of the instrument, not of the report.** Every bushy pairing
 goopg itself chose was by construction offered to `makeJoinRel`, so it must come
@@ -923,9 +927,65 @@ relset first — which is itself the proof that "relset built" and "partition
 offered" are different questions), the alias `n1` survives, and an unconnected
 partition adjudicates to `SIDE-NOT-BUILT` with the side named.
 
-**Not yet measured**: Q7's and Q8's candidates on TPC-H SF=1. The arm is
-`DP_TRACE=1 PGSHAPED=1 scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20`;
-it was blocked on the nightly CI batch holding the host.
+Measured on TPC-H SF=1 in §3.13.
+
+### 3.13 Clause 6, measured — both candidates were OFFERED (P5.9-l-ii, 2026-08-06)
+
+Arm: `PLAN_ONLY=1 DP_TRACE=1 PGSHAPED=1 PER_Q=180s
+scripts/tpch-estimate-audit-arm.sh 2026-08-06-p59lii-enum-on --queries 7,8,20`.
+Evidence: `analysis/leftdeep-joins/2026-08-06-p59lii-enum-on.{txt,plans.txt,dptrace.txt}`
+plus its README; the verdict is re-derivable offline from the two committed
+inputs with `--from-plans … --enum-trace …`, no cluster required.
+
+```
+controls (goopg's OWN bushy pairings, must all be OFFERED): 2/2
+controls set aside as CROSS-QUERY-LEVEL (a SubPlan boundary, not a partition): 1
+candidates (PG-only bushy pairings): 2/2 offered by the goopg search
+RATCHET enum_controls=2/2 enum_controls_oos=1 enum_candidates_offered=2/2
+        enum_candidates_crosslevel=0 enum_problems=3 enum_malformed=0
+```
+
+Both partitions §3.11 left open were **offered to `makeJoinRel`** — Q7's
+`{customer+lineitem+n2+orders} ⋈ {n1+supplier}` and Q8's
+`{lineitem+orders+part} ⋈ {customer+n1+region}`, each at `phase=2` (the bushy
+pass), each with `created=false` because another pairing reached that relset
+first. goopg's search **can express both shapes and chose otherwise on cost**.
+That is the reading §4 admits: clause 6 is discharged as a cost/stats question
+and routes to the §4 parity ratchet, not to a search defect. Clause 6 **passes**.
+
+**Two instrument changes this measurement forced.**
+
+*A plan-only mode.* The first arm needed the host to itself for a full power
+run, and the host was held by the nightly batch for two loops running. But
+every question clause 6 asks — which pairings a plan contains, which the search
+was offered — is decided before a tuple moves. `--plan-only` (arm: `PLAN_ONLY=1`)
+runs plain `EXPLAIN`, drops §5 and the §4 parity column *by omission rather than
+by printing them empty* (a §5 table of `actual=? (no ANALYZE)` rows ends in a
+clean verdict, which is the one way the artifact could lie), and finishes in
+about four minutes. Because it produces and consumes no timing, it is exempt
+from the arm script's nightly-batch refusal — that refusal protects timings, and
+this run has none to protect or to spoil.
+
+*Cross-query-level pairings are not partitions.* The first run came back
+`VERDICT: HARNESS FAULT` on a control: goopg's own Q20 plan prints
+`{nation+supplier} ⋈ {lineitem+part+partsupp}`, but Q20's only traced join
+problem is `{nation,supplier}` — the other three relations live under SubPlans,
+separate planning contexts. `Spine` reads a pairing at that node because a
+printed plan does not mark query levels; no join search of either engine ever
+partitioned that relset. Adjudicating it as a control voided a run whose two real
+candidates had both come back `OFFERED`.
+
+The fix is not to relax the control guard — a failing in-scope control still
+voids the run — but to classify the case, and the classification is
+*asymmetric*: as a **control** it is out of scope (goopg's search legitimately
+never saw it, and the count is printed, never silently dropped); as a
+**candidate** it is a clause-6 **failure**, and a sharper one than
+`NOT-ENUMERATED` — a partition PG reached inside one join problem is one goopg
+cannot reach *at all* when it did not flatten the sublink into the same problem,
+so the shape is unreachable rather than merely unchosen. The discriminator is
+positive evidence, not absence: a relation that entered **no** traced problem was
+planned somewhere else, whereas a log with no blocks at all is still `NO-TRACE`
+and still voids the run.
 
 ## 4. The PG plan-shape parity gate (new instrument)
 

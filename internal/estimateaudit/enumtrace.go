@@ -277,6 +277,23 @@ const (
 	// EnumNoProblem: no traced problem covers this relset at all — the trace
 	// was not harvested for this query, NOT a statement about the search.
 	EnumNoProblem EnumVerdict = "NO-TRACE"
+	// EnumCrossLevel: the trace WAS harvested, and no single join problem spans
+	// the partition because its two sides were planned at different query
+	// levels. TPC-H Q20 is the standing example: goopg's only traced problem is
+	// `{nation,supplier}`, and `{lineitem,part,partsupp}` live under SubPlans
+	// that are separate planning contexts. The printed plan still shows a node
+	// joining the two, so `Spine` reads a pairing there, but no join search of
+	// either engine ever chose it — a SubPlan boundary is not a partition.
+	//
+	// Which side the check came from decides what this means, and the two are
+	// opposite (see `RenderEnum`): for a CONTROL it is out of scope, because
+	// goopg's own search legitimately never saw its own printed "pairing"; for a
+	// CANDIDATE it is a clause-6 FAILURE, because a partition PG enumerated
+	// inside one join problem is one goopg cannot reach at all when it did not
+	// flatten the sublink into the same problem. Collapsing that into NO-TRACE —
+	// which is what this channel did on its first run, 2026-08-06 — voids a
+	// sound run on a control and mislabels a real search gap as a harness gap.
+	EnumCrossLevel EnumVerdict = "CROSS-QUERY-LEVEL"
 )
 
 // EnumCheck is one adjudicated partition.
@@ -295,6 +312,15 @@ type EnumCheck struct {
 // control indicts the HARNESS rather than the search — goopg's own chosen
 // pairing must be in its own trace.
 func (c EnumCheck) Passed() bool { return c.Verdict == EnumOffered }
+
+// InScope reports whether this check is a statement about the join SEARCH at
+// all. A control whose two sides were planned at different query levels is not:
+// no search enumerated it, in goopg or in PG, so demanding it be OFFERED indicts
+// a harness that is working. Candidates stay in scope in every verdict —
+// CROSS-QUERY-LEVEL is a real answer for them, not an exemption.
+func (c EnumCheck) InScope() bool {
+	return c.Kind != "control" || c.Verdict != EnumCrossLevel
+}
 
 // EnumChecks derives the partitions to adjudicate from a spine diff:
 //
@@ -357,8 +383,18 @@ func (t EnumTrace) verdict(c EnumCheck) EnumCheck {
 		}
 	}
 	if best == nil {
-		c.Verdict = EnumNoProblem
-		c.Detail = "no traced join problem spans this partition"
+		if len(t.Problems) == 0 {
+			c.Verdict = EnumNoProblem
+			c.Detail = "no DPTRACE block was harvested at all — wrong log, or the gate was off"
+			return c
+		}
+		c.Verdict = EnumCrossLevel
+		if unseen := t.unseenRels(sides); len(unseen) > 0 {
+			c.Detail = fmt.Sprintf("%s entered no traced join problem — planned at another query level (SubPlan/CTE), so this pairing is a planning boundary, not a partition",
+				strings.Join(unseen, ", "))
+			return c
+		}
+		c.Detail = "every relation is traced, but never in one problem — the two sides belong to different join problems"
 		return c
 	}
 	if d, ok := best.Declined[c.Key]; ok {
@@ -376,6 +412,36 @@ func (t EnumTrace) verdict(c EnumCheck) EnumCheck {
 	c.Verdict = EnumMissing
 	c.Detail = fmt.Sprintf("both sides built, pair neither offered nor declined (top=%s)", best.Top)
 	return c
+}
+
+// unseenRels lists the partition members that appear in NO traced join problem,
+// sorted. That is the positive evidence separating a planning boundary from a
+// lost trace: a relation the search never had is a relation planned somewhere
+// else, whereas a relation present in a problem that still failed to span the
+// pair points at the trace, not at the query structure.
+//
+// The union is over the WHOLE log, not the query's own blocks, because the trace
+// carries no query attribution (see the package comment). The list is therefore
+// a lower bound — Q20's `lineitem` and `part` are omitted because Q8's problem in
+// the same run contains those names — and it is used only to word the detail
+// line, never to decide the verdict, which `best == nil` has already settled.
+func (t EnumTrace) unseenRels(sides []string) []string {
+	seen := map[string]bool{}
+	for i := range t.Problems {
+		for _, r := range t.Problems[i].Rels {
+			seen[r] = true
+		}
+	}
+	var out []string
+	for _, s := range sides {
+		for _, m := range relsetMembers(s) {
+			if !seen[m] {
+				out = append(out, m)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // problemCovers reports whether a traced problem's relation set contains every
@@ -415,14 +481,25 @@ func RenderEnum(t EnumTrace, checks []EnumCheck) string {
 		b.WriteString("  no bushy partition to adjudicate (no clause-6 candidate, no bushy control)\n")
 	}
 
-	var candTotal, candOK, ctlTotal, ctlOK int
+	var candTotal, candOK, candCross, ctlTotal, ctlOK, ctlOOS int
 	for _, c := range checks {
-		fmt.Fprintf(&b, "  %-9s %-4s %-14s %s\n      %s\n", c.Kind, c.Query, c.Verdict, c.Partition, c.Detail)
+		note := ""
+		if !c.InScope() {
+			note = "  (out of scope)"
+		}
+		fmt.Fprintf(&b, "  %-9s %-4s %-17s %s%s\n      %s\n", c.Kind, c.Query, c.Verdict, c.Partition, note, c.Detail)
 		if c.Kind == "candidate" {
 			candTotal++
-			if c.Passed() {
+			switch {
+			case c.Passed():
 				candOK++
+			case c.Verdict == EnumCrossLevel:
+				candCross++
 			}
+			continue
+		}
+		if !c.InScope() {
+			ctlOOS++
 			continue
 		}
 		ctlTotal++
@@ -433,6 +510,11 @@ func RenderEnum(t EnumTrace, checks []EnumCheck) string {
 
 	b.WriteString("\n=== ENUMERATION SUMMARY (09 §4 clause 6)\n")
 	fmt.Fprintf(&b, "  controls (goopg's OWN bushy pairings, must all be OFFERED): %d/%d\n", ctlOK, ctlTotal)
+	if ctlOOS > 0 {
+		// Printed, never silent: a control set that shrank is the one change
+		// that could turn a voided run into a green one without anyone noticing.
+		fmt.Fprintf(&b, "  controls set aside as CROSS-QUERY-LEVEL (a SubPlan boundary, not a partition): %d\n", ctlOOS)
+	}
 	fmt.Fprintf(&b, "  candidates (PG-only bushy pairings): %d/%d offered by the goopg search\n", candOK, candTotal)
 	switch {
 	case ctlTotal > 0 && ctlOK < ctlTotal:
@@ -440,14 +522,24 @@ func RenderEnum(t EnumTrace, checks []EnumCheck) string {
 			"           trace, so no candidate verdict in this run is admissible.\n")
 	case candTotal == 0:
 		b.WriteString("  VERDICT: clause 6 has nothing to adjudicate in this run.\n")
+	case ctlTotal == 0 && candOK < candTotal:
+		// No in-scope control means nothing independently proves the channel
+		// live, so only an all-OFFERED result is self-evidencing (every OFFERED
+		// verdict IS a trace hit). A negative one is not.
+		b.WriteString("  VERDICT: INCONCLUSIVE — no in-scope control backs this run, and the negative\n" +
+			"           candidate verdicts below cannot be told from an unharvested trace.\n")
 	case candOK == candTotal:
 		b.WriteString("  VERDICT: every PG-only bushy partition WAS enumerated — the divergence is\n" +
 			"           cost/stats, which 09 §4's ratchet admits. Clause 6 passes.\n")
+	case candCross > 0:
+		b.WriteString("  VERDICT: a PG-only bushy partition spans TWO goopg join problems — PG flattened\n" +
+			"           a sublink goopg did not, so the shape is unreachable rather than\n" +
+			"           merely unchosen. 09 §4 reserves hard failure for that. Clause 6 fails.\n")
 	default:
 		b.WriteString("  VERDICT: a PG-only bushy partition was NOT enumerated — a named gap in the\n" +
 			"           search, which 09 §4 reserves hard failure for. Clause 6 fails.\n")
 	}
-	fmt.Fprintf(&b, "  RATCHET enum_controls=%d/%d enum_candidates_offered=%d/%d enum_problems=%d enum_malformed=%d\n",
-		ctlOK, ctlTotal, candOK, candTotal, len(t.Problems), t.Malformed)
+	fmt.Fprintf(&b, "  RATCHET enum_controls=%d/%d enum_controls_oos=%d enum_candidates_offered=%d/%d enum_candidates_crosslevel=%d enum_problems=%d enum_malformed=%d\n",
+		ctlOK, ctlTotal, ctlOOS, candOK, candTotal, candCross, len(t.Problems), t.Malformed)
 	return b.String()
 }

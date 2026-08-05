@@ -1492,7 +1492,7 @@
   never saw it. Reproduce: `GOOPG_PGSHAPED_DP=1 bench/tpcds/server.sh start
   sf05`, then `psql -p 65437 -f
   bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql`.
-- [ ] **P5.9-l** Clause 6 has no instrument — build the spine/pairing channel
+- [x] **P5.9-l** Clause 6 has no instrument — build the spine/pairing channel
   §4 names (NEW at P5.9 run 4, 09 §3.10). Run 4 passed clauses 1, 2, 3, 4 and 5
   with zero defects attributed to `GOOPG_PGSHAPED_DP`, and the flip is held by
   clause 6 alone. §4 specifies the check as "verified through the §4 parity
@@ -1519,8 +1519,9 @@
   on Q7, Q8 and Q20 — pass (divergence attributed to cost or stats, admitted
   under the ratchet) or a named gap in the bushy phase. Then P5.9 re-runs
   clause 6 alone and flips or attributes.
-  **↳ SPLIT 2026-08-06. The plan-side half is DONE (P5.9-l-i below); the
-  search-provenance half is P5.9-l-ii.** This item stays open until -ii lands.
+  **↳ SPLIT 2026-08-06. Both halves are DONE (P5.9-l-i, P5.9-l-ii below) and
+  clause 6 was measured GREEN 2026-08-06 (09 §3.13), so this umbrella item is
+  discharged by them.**
 - [x] **P5.9-l-i** The spine/pairing channel, built and measured (09 §3.11).
   DONE 2026-08-06. `internal/estimateaudit/spine.go` computes, for every join
   node of a captured plan, the relsets of its immediate children, and classes
@@ -1544,7 +1545,7 @@
   (`{customer+lineitem+n2+orders} ⋈ {n1+supplier}`) and Q8
   (`{lineitem+orders+part} ⋈ {customer+n1+region}`). Evidence:
   `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` + `-README.md`.
-- [ ] **P5.9-l-ii** The SEARCH-side half: enumeration provenance (NEW
+- [x] **P5.9-l-ii** The SEARCH-side half: enumeration provenance (NEW
   2026-08-06, 09 §3.11). P5.9-l-i reads CHOSEN spines on both sides, so for Q7
   and Q8 "enumerated by the DP and lost on cost" and "never enumerated" still
   predict the identical observable. Record what `makeJoinRel` was actually
@@ -1579,10 +1580,27 @@
   in a live server (`analysis/leftdeep-joins/2026-08-06-p59lii-dptrace-*`): a
   bushy chosen plan recorded at `phase=2` with `created=0`, alias `n1`
   preserved, an unconnected partition adjudicated `SIDE-NOT-BUILT`.
-  **REMAINING: the TPC-H arm.** `DP_TRACE=1 PGSHAPED=1
-  scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20` — not run
-  2026-08-06 because the nightly CI batch held the host and the arm script
-  refuses beside it (correctly: concurrent runs contaminate both).
+  **↳ MEASURED 2026-08-06 — CLAUSE 6 PASSES (09 §3.13).** `PLAN_ONLY=1
+  DP_TRACE=1 PGSHAPED=1 scripts/tpch-estimate-audit-arm.sh
+  2026-08-06-p59lii-enum-on --queries 7,8,20`: `enum_controls=2/2
+  enum_controls_oos=1 enum_candidates_offered=2/2 enum_problems=3
+  enum_malformed=0`. Both candidates were OFFERED at `phase=2` with
+  `created=false` — the search can express both shapes and lost them on cost,
+  which §4's ratchet admits. Evidence and an offline re-derivation recipe:
+  `analysis/leftdeep-joins/2026-08-06-p59lii-enum-on*`.
+  Two instrument changes the run forced. **`--plan-only`** (arm: `PLAN_ONLY=1`)
+  runs plain `EXPLAIN` and omits §5 and the §4 parity column rather than
+  printing them empty — a §5 table of `actual=? (no ANALYZE)` rows ends in a
+  clean verdict, the one way the artifact could lie — which took the run from a
+  power run to four minutes and, having no timing to protect or spoil, exempted
+  it from the arm's nightly-batch refusal that had blocked this measurement for
+  two loops. **`CROSS-QUERY-LEVEL`** classes a pairing whose sides were planned
+  at different query levels: goopg's Q20 plan prints `{nation+supplier} ⋈
+  {lineitem+part+partsupp}` across a SubPlan boundary, and scoring that as a
+  control voided the first run with `HARNESS FAULT`. Out of scope as a control
+  (counted, never silently dropped); a clause-6 FAILURE as a candidate, sharper
+  than `NOT-ENUMERATED` — the shape is unreachable, not merely unchosen.
+  A failing IN-SCOPE control still voids the run.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

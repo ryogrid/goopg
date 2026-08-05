@@ -8172,7 +8172,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       term for term with three unit tests) — but "enumerated and lost on cost"
       and "never enumerated" predict the same observable, so run 4 cannot tell
       them apart. → **M0127-P5.9-l** (new). 3 ledger rows.
-- [ ] **M0127-P5.9-l — clause 6 has no instrument.** NEW 2026-08-06 at run 4;
+- [x] **M0127-P5.9-l — clause 6 has no instrument.** NEW 2026-08-06 at run 4;
       the last thing between the bar and the flip. Build the spine/pairing
       channel 09 §4 names but never got: the search records, per query, the
       joinrel pairings the DP actually built (phase-1 vs phase-2 provenance,
@@ -8188,8 +8188,10 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `cmd/estimate-audit/`, `internal/planner/joinsearchlevel.go` (the
       provenance channel), `scripts/tpch-estimate-audit-arm.sh`. 09 §3.10, §4;
       IMPLEMENTATION-TODO P5.9-l.
-      **↳ SPLIT 2026-08-06 — the PLAN-side half is DONE (P5.9-l-i); this item
-      stays open on the SEARCH-side half (P5.9-l-ii).**
+      **↳ SPLIT 2026-08-06 — the PLAN-side half is DONE (P5.9-l-i), the
+      SEARCH-side half is DONE (P5.9-l-ii), and clause 6 was MEASURED GREEN on
+      2026-08-06 (09 §3.13). This umbrella item is discharged by its two
+      halves.**
 - [x] **M0127-P5.9-l-i — the spine/pairing channel, built, and run 4's manual
       clause-6 reading refuted.** DONE 2026-08-06 (09 §3.11).
       `internal/estimateaudit/spine.go`: for every join node of a captured plan
@@ -8219,7 +8221,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` +
       `-README.md`. 2 ledger rows (the enumeration gap; the EXPLAIN
       alias-dedup gap that makes 5 queries' pairings unadjudicable).
-- [ ] **M0127-P5.9-l-ii — the SEARCH-side half: enumeration provenance.** NEW
+- [x] **M0127-P5.9-l-ii — the SEARCH-side half: enumeration provenance.** NEW
       2026-08-06 (09 §3.11). P5.9-l-i reads CHOSEN spines on both sides, so for
       Q7 and Q8 "enumerated by the DP and lost on cost" and "never enumerated"
       still predict the identical observable. Record what `makeJoinRel` was
@@ -8247,10 +8249,23 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       goopg's own bushy pairings as derived CONTROLS — a failing control prints
       `VERDICT: HARNESS FAULT` and voids the run. 11 unit tests + a live-server
       smoke (`analysis/leftdeep-joins/2026-08-06-p59lii-dptrace-*`).
-      **NEXT: run `DP_TRACE=1 PGSHAPED=1
-      scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20`** and read
-      the ENUMERATION SUMMARY — blocked 2026-08-06 by the nightly CI batch
-      holding the host. 2 ledger rows.
+      **↳ MEASURED 2026-08-06 — CLAUSE 6 PASSES (09 §3.13).**
+      `PLAN_ONLY=1 DP_TRACE=1 PGSHAPED=1 scripts/tpch-estimate-audit-arm.sh
+      2026-08-06-p59lii-enum-on --queries 7,8,20`:
+      `enum_controls=2/2 enum_controls_oos=1 enum_candidates_offered=2/2
+      enum_problems=3 enum_malformed=0`. Both PG-only bushy partitions — Q7's
+      `{customer+lineitem+n2+orders} ⋈ {n1+supplier}` and Q8's
+      `{lineitem+orders+part} ⋈ {customer+n1+region}` — were OFFERED to
+      `makeJoinRel` at phase=2 with `created=false`: the search CAN express both
+      shapes and lost them on cost, which is the reading 09 §4's ratchet admits.
+      Two instrument changes the run forced: `estimate-audit --plan-only`
+      (EXPLAIN without ANALYZE — a planning-time question no longer costs a
+      power run, and it carries no timing, so it is exempt from the arm's
+      nightly-batch refusal) and the `CROSS-QUERY-LEVEL` verdict (goopg's Q20
+      plan prints `{nation+supplier} ⋈ {lineitem+part+partsupp}` across a
+      SubPlan boundary; out of scope as a control, a clause-6 FAILURE as a
+      candidate). Evidence + offline re-derivation:
+      `analysis/leftdeep-joins/2026-08-06-p59lii-enum-on*`. 3 ledger rows.
 - [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
       scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
       and it was NOT the splice arithmetic this item predicted. At 4-under-5
