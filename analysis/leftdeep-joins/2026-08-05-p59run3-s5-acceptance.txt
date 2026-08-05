@@ -1,0 +1,351 @@
+# M0127-P5.9 — S5 acceptance RUN 3 (TPC-H SF1), `GOOPG_PGSHAPED_DP` OFF vs ON
+#
+# Bar: docs/design/leftdeep-joins/09-verification-and-acceptance.md §3.
+# Predecessors: 2026-08-05-p59-s5-acceptance.txt      (run 1, HEAD 1bb24984)
+#               2026-08-05-p59run2-s5-acceptance.txt  (run 2, HEAD c00db762)
+#
+# VERDICT: **NO-GO #3. The flag stays OFF.** But run 3 is the first run of this
+#          bar that measured what it was built to measure, and it found the
+#          thing the two previous no-goes could only name as "the timing gap":
+#
+#          **CLAUSE 1 PASSES for the first time** — 23 MATCH, and the single
+#          non-MATCH (Q5) is the BASELINE's defect, already adjudicated against
+#          PG 18.3 and excluded by clause 1's own second amendment. No
+#          flag-owned wrong answer survives anywhere in TPC-H.
+#
+#          **AND, because clause 1 passed, clauses 4/5/6 and the §4/§5
+#          instruments ran on a correct build for the first time — and the
+#          §4 parity ratchet went from 0 violations (flag OFF) to 6 (flag ON),
+#          every one of them a joinrel the PG-shaped search estimates at
+#          `rows=1` against actuals of 5 869 … 1 999 080.** The five queries
+#          carrying those violations are, cell for cell, the five queries that
+#          fail clause 3. The timing gap is not a costing-constant gap; it is
+#          an ESTIMATE COLLAPSE, and §5 below names its likely origin with a
+#          two-table reproducer.
+#
+#          Clause 2 FAIL 1.362x. Clause 3 FAIL (Q10 3.91x, Q9 3.13x, Q18 2.47x,
+#          Q7 2.07x, Q12 2.07x; Q5 struck per 09 §3.4). Clause 5 PASS (third
+#          consecutive). Clause 4 measured separately (§7).
+#
+# ---------------------------------------------------------------------------
+# 1. Protocol
+# ---------------------------------------------------------------------------
+#   - HEAD 1964333a (M0127-P5.9-g), ONE binary for both arms:
+#     tmp/goopg-acceptance-bin (on-disk 9f9d622e1c48a042),
+#     engine-id baa431c3d3be0e0f63c107a92b2249015e1fbfc1 (diff clean),
+#     runner tmp/tpch-acceptance-runner (cmd/tpch-runner).
+#   - value arms (driver: scripts/tpch-acceptance-arm.sh, the P5.9-d harness):
+#       NO_BUILD=1 PGSHAPED=0 scripts/tpch-acceptance-arm.sh p59run3-off \
+#           analysis/leftdeep-joins/2026-08-05-p59run3-off.txt
+#       NO_BUILD=1 PGSHAPED=1 scripts/tpch-acceptance-arm.sh p59run3-on  \
+#           analysis/leftdeep-joins/2026-08-05-p59run3-on.txt
+#     Fresh capped server per arm (scope goopg-tpch-acceptance-<arm>),
+#     GOMEMLIMIT=12GiB GOGC=off GOOPG_MEM_HIGH=20G GOOPG_MEM_MAX=24G
+#     GOOPG_MEM_SWAP_MAX=0, per-query cap 600 s, serial, `-digest`, sweep at
+#     server age 0 s. The arms differ ONLY in GOOPG_PGSHAPED_DP.
+#     GOOPG_PGSHAPED_COLLAPSE=0 in both (as runs 1 and 2).
+#   - EXPLAIN arms (clause 5): same driver, DIGEST=0 PER_Q=120 `-explain`.
+#   - §4/§5 arms (new driver, promoted this run — see §6):
+#       NO_BUILD=1 PGSHAPED=0|1 PER_Q=600s \
+#           scripts/tpch-estimate-audit-arm.sh 2026-08-05-p59run3-audit-{off,on} \
+#           --fail-on-violation=false
+#     PG 18.3 reference: the COMMITTED capture
+#     2026-08-05-p56giii-parity.pg.plans.txt, so run 3's ratchet is directly
+#     comparable to the baseline 09 §4.1 pinned rather than to a fresh
+#     reference measured under different host conditions.
+#   - host 2026-08-05 19:57-20:35 JST, quiet: no nightly CI batch (checked with
+#     the bracketed pattern the arm script now uses — a bare
+#     `pgrep -f ci/batch/run-nightly.sh` self-matches, run 2 §1).
+#     Caveat recorded honestly: the OFF value arm started at load 0.60 and the
+#     ON arm, run immediately after it, at load 7.92 (1-min average still
+#     carrying the OFF arm's teardown). This is the same ordering runs 1 and 2
+#     used, so the comparison across runs is consistent; it is a reason to
+#     treat the total-time ratio as an upper bound on the ON arm, not to
+#     re-attribute any clause-3 cell (§5 supplies a mechanism, and the
+#     mechanism is not host load).
+#   - raw arms:  2026-08-05-p59run3-off.txt / -on.txt
+#     diff:      2026-08-05-p59run3-diff.txt
+#     EXPLAIN:   2026-08-05-p59run3-explain-off.txt / -on.txt
+#     §4/§5:     2026-08-05-p59run3-audit-off.txt / -on.txt (+ .plans.txt)
+#
+# ---------------------------------------------------------------------------
+# 2. Clause 1 — 22/22 complete AND value-level equality — **PASS**
+# ---------------------------------------------------------------------------
+# `tmp/tpch-acceptance-runner -diff <off> <on>`:
+#
+#   SUMMARY: 23 MATCH, 1 VALUE-DIFF
+#   VERDICT: FAIL            <- the tool's verdict, on agreement alone
+#
+#   Q5  VALUE-DIFF  same 5 rows, different tuples
+#                   (unordered A=783749cf0cf09b4e B=724af4147aec4771)
+#   all 23 others MATCH, ordered AND unordered digests.
+#
+# Adjudication of the one non-MATCH, as clause 1's second amendment (09 §3.4)
+# requires before any cell is attributed:
+#
+#   **Q5 is the BASELINE's defect (M0119-0011), not the flag's.** Run 2
+#   measured all three engines on this query: PG 18.3 revenue 5.59e7, goopg
+#   flag-ON 5.73e7, goopg flag-OFF 1.34e9 (~24x inflated, because flag-OFF
+#   emits only one of the two equality clauses its own equivalence class over
+#   {c_nationkey, s_nationkey, n_nationkey} implies, never nation-constraining
+#   `supplier`). Run 3's Q5 digests are BYTE-IDENTICAL to run 2's on both arms
+#   (ordered a31aebedf76625b2 / a73f016b577bbd65, unordered
+#   783749cf0cf09b4e / 724af4147aec4771), so run 2's adjudication carries
+#   verbatim — no re-measurement against PG was needed, and none is claimed.
+#
+#   Per the amendment: "a cell where flag-ON agrees with PG and flag-OFF does
+#   not is a baseline defect, filed outside this bundle, and does not count
+#   against the flip."
+#
+# **Therefore clause 1 has NO flag-owned failure, and passes.** This is the
+# first time in three runs. The progression is worth stating plainly, because
+# it is the bundle's whole correctness argument:
+#
+#   run 1: 4 failures (Q2 0 rows; Q7/Q8/Q9 ERROR 42883; Q17 "hang")
+#   run 2: 2 failures (Q2 0 rows; Q5 VALUE-DIFF)
+#   run 3: 0 flag-owned failures (Q5 remains, attributed to the baseline)
+#
+# ---------------------------------------------------------------------------
+# 3. Clause 2 — total wall time <= 1.2x — **FAIL, 1.362x**
+# ---------------------------------------------------------------------------
+#   flag-OFF total  378.21 s   (contemporaneous integer arm, same binary)
+#   flag-ON  total  515.06 s
+#   basis           min(pinned R0 493.31 s, contemporaneous 378.21 s) = 378.21 s
+#   allowance       453.85 s      ON exceeds it by 61.21 s
+#   ratio           1.362x        (run 2: 1.36x — unmoved)
+#
+# Excluding Q5 from both arms (the arms compute different result sets there,
+# 09 §3.4): OFF 372.13 s, ON 489.36 s, ratio 1.315x. Still FAIL. The basis
+# caveat run 2 recorded — the OFF total is inflated-fast by a Q5 that is fast
+# because it is wrong — is therefore not what decides this clause either way.
+#
+# ---------------------------------------------------------------------------
+# 4. Clause 3 — no single query > 2x — **FAIL on five**
+# ---------------------------------------------------------------------------
+# Ratio = ON/OFF on the contemporaneous arms (the convention runs 1 and 2 used;
+# Q9's absolute R0 bar is scored separately below).
+#
+#   Q10   5.86 ->  22.93 s   3.91x   <== (run 2: 3.78x, run 1: 3.83x)
+#   Q9   17.57 ->  54.95 s   3.13x   <== (run 2: 3.23x)
+#   Q18  30.19 ->  74.71 s   2.47x   <== (run 2: 2.42x)
+#   Q7   12.92 ->  26.71 s   2.07x   <== (run 2: 2.14x)
+#   Q12  10.02 ->  20.79 s   2.07x   <== (run 2: 2.00x, borderline; now over)
+#   Q5    6.08 ->  25.70 s   4.23x   -- STRUCK (09 §3.4: different result sets)
+#
+#   everything else within noise: 19 of 24 cells between 0.84x and 1.25x,
+#   including Q21 (0.96x, the memory-heaviest query) and Q17 (0.98x).
+#
+#   **Q9's named absolute bar PASSES again**: 54.95 s <= 170.9 s, and again
+#   beats 01 §5's aspirational 58.83 s (run 2: 53.56 s).
+#
+# ---------------------------------------------------------------------------
+# 5. §5 estimate audit + §4 parity ratchet — THE FINDING OF THIS RUN
+# ---------------------------------------------------------------------------
+# First execution of these instruments on a build whose plans compute the right
+# answers (runs 1 and 2 deliberately skipped them for exactly that reason), and
+# first execution of either instrument against the flag-ON planner at all.
+# Both arms, same HEAD, same binary, same per-session ANALYZE warmup, same
+# committed PG 18.3 reference:
+#
+#                             flag OFF        flag ON
+#   absolute violations (§5)     1               13
+#   RATCHET parity_violations     0                6
+#   RATCHET shape_mismatches     67               46
+#   joinrels compared         21 matched      32 matched
+#
+# Two opposite movements, and both matter:
+#
+#   * **Shape got BETTER.** Matched joinrels 21 -> 32, shape divergences
+#     67 -> 46. The PG-shaped search reaches materially more of the joinrels PG
+#     builds — which is the [02] contract's whole claim, measured for the first
+#     time. (09 §4.1's caveat still applies: `shape_mismatches` is an upper
+#     bound while goopg's EXPLAIN does not deduplicate repeated relation names.)
+#
+#   * **Estimates got CATASTROPHICALLY worse**, and only on the flag-ON arm:
+#
+#     PARITY-VIOLATION Q9  {lineitem,nation,orders,part,partsupp,supplier}
+#                          goopg est=1 actual=316264   vs PG 1.7x  -> 184922.9x worse
+#     PARITY-VIOLATION Q10 {customer,lineitem,nation,orders}
+#                          goopg est=1 actual=114106   vs PG 2.1x  ->  54658.3x worse
+#     PARITY-VIOLATION Q10 {lineitem,orders}
+#                          goopg est=1 actual=114106   vs PG 2.1x  ->  54658.3x worse
+#     PARITY-VIOLATION Q12 {lineitem,orders}
+#                          goopg est=1 actual=31354    vs PG 1.1x  ->  28421.0x worse
+#     PARITY-VIOLATION Q5  {customer,lineitem,nation,orders,region,supplier}
+#                          goopg est=1 actual=7411     vs PG 1.0x  ->   7339.2x worse
+#     PARITY-VIOLATION Q7  {customer,lineitem,n1,n2,orders,supplier}
+#                          goopg est=1 actual=5869     vs PG 1.0x  ->   5868.0x worse
+#
+#     The same joinrels on the flag-OFF arm, same HEAD, same session:
+#       Q5  final  est=278582 (1.6x over)      Q9  final  est=1999060 (6.3x over)
+#       Q7  final  est=8011   (1.4x over)      Q10 final  est=363354  (3.2x over)
+#       Q12 final  est=46155  (1.5x over)
+#     None of them within two orders of magnitude of a violation.
+#
+# **The five queries carrying parity violations are the five queries that fail
+# clause 3** (Q5 struck from clause 3 but violating here; Q7, Q9, Q10, Q12).
+# The one clause-3 failure with no parity violation is Q18 — and Q18's final
+# joinrel is misestimated ~23 400x OVER in BOTH arms (OFF 1568274, ON 1642632,
+# actual 70), so Q18's 2.47x is a plan choice made on an equally bad estimate
+# in both arms and is a SEPARATE question from the rest of the clause-3 list.
+#
+# ### Where the est=1 comes from — a two-table reproducer
+#
+# Q12 joins exactly two relations, so there is no search-order confound. Same
+# HEAD, same stats, same session; only the flag differs:
+#
+#   flag OFF:  Hash Join (INNER, build=left)   rows=21154
+#                -> Seq Scan on orders          rows=1500000
+#                -> Seq Scan on lineitem        rows=21154   Filter: (l_shipmode …)
+#
+#   flag ON:   Merge Join (INNER)               rows=1
+#                Merge Cond: (orders.o_orderkey = lineitem.l_orderkey)
+#                -> Index Scan using orders_pk on orders   rows=1
+#                     (NO index condition — the o_orderdate/l_* predicates are
+#                      not here; this is a full ordered scan of `orders`)
+#                -> Seq Scan on lineitem        rows=21154   Filter: (l_shipmode …)
+#
+# The join is not mis-sized by a join-selectivity error: its OUTER INPUT is
+# sized at ONE ROW. An unparameterized index scan — the path the PG-shaped
+# search adds for its sortedness, so that a Merge Join becomes available — is
+# carrying the row estimate of a parameterized single-row lookup. Every joinrel
+# above it then inherits `rows=1` (Q12 has one join level; Q7 and Q9 show the
+# same 1 propagating up three and four levels), the cost model can no longer
+# rank anything, and the search commits to merge-join spines over full tables.
+# Q10's flag-ON plan shows the identical signature: `Index Scan using orders_pk
+# on orders  rows=1  Filter: (o_orderdate >= …)`, feeding a Merge Join at
+# rows=1 and a Hash Join at rows=1 above it, against 114 106 actual.
+#
+# The flag-OFF arm also prints `rows=1` on its index scans, but there all 11 of
+# them are inner sides of nested loops — genuine one-row lookups — so the
+# rendering is correct in that arm and the defect does not surface. The
+# discriminator is an index scan used as a full ordered scan, which only the
+# PG-shaped search produces.
+#
+# Not attributed further here: whether the 1 is created when the index path is
+# BUILT (a sizing path that assumes an index qual), or whether it is a correct
+# path size mis-consumed by `makeJoinRel`/`sizeJoinRel`
+# (internal/planner/joinsearchlevel.go:324-330 already clamps `rows < 1` to 1,
+# which would MASK a zero as a one). Bisecting that is M0127-P5.9-h's first
+# action, and it now has a two-table reproducer instead of a 6-relation one.
+#
+# ---------------------------------------------------------------------------
+# 6. Clause 5, clause 6, and the harness promoted this run
+# ---------------------------------------------------------------------------
+# Clause 5 (no `MultiHashJoin`; fusion never triggers): **PASS**, third
+# consecutive. EXPLAIN sweep over all 22 in both arms, 0 hits for
+# `MultiHashJoin` and 0 for `fus*` in either file, 0 errors.
+#
+# Clause 6 (bushy capability via the §4 spine diff): **PARTIAL — first
+# evidence, not yet a verdict.** The §4 parity run is the instrument clause 6
+# is specified on, and it ran on both arms for the first time: shape
+# divergences 67 -> 46 under the flag, matched joinrels 21 -> 32. That is
+# direct evidence the PG-shaped search expresses join shapes the legacy search
+# cannot, which is what clause 6 asks. It is not yet a discharge: clause 6's
+# bar is "every bushy spine PG can produce, goopg can produce", and the
+# residual 46 divergences have not been classified one by one (09 §4.1 says
+# some of them are the EXPLAIN alias-rendering gap, not planning). Classifying
+# them is the natural successor to P5.9-h, not a blocker for it — the estimate
+# collapse changes which plans the search picks, so any spine classification
+# done before it is fixed would have to be redone.
+#
+# Harness promoted this run: **scripts/tpch-estimate-audit-arm.sh**, for the
+# reason P5.9-d promoted scripts/tpch-acceptance-arm.sh. cmd/estimate-audit was
+# already in-repo, but its server bring-up was not, so the §4 RATCHET — a
+# number whose entire purpose is to be comparable across commits — was produced
+# by an ad-hoc command line each time. A ratchet with an ephemeral driver
+# drifts by construction.
+#
+# ---------------------------------------------------------------------------
+# 7. Clause 4 (TPC-DS SF0.5, zero deltas)
+# ---------------------------------------------------------------------------
+# See the CLAUSE-4 ADDENDUM appended at the end of this file.
+#
+# ---------------------------------------------------------------------------
+# 8. Disposition
+# ---------------------------------------------------------------------------
+#   M0127-P5.9      stays OPEN. Flag stays OFF. NO-GO #3 — but the first no-go
+#                   that fails on PERFORMANCE ALONE. Correctness is discharged.
+#   M0127-P5.9-h    OWNS the whole remaining gap, and is no longer a search for
+#                   a bisect: §5 above hands it an est=1 estimate collapse with
+#                   a two-table reproducer (Q12) and two candidate mechanisms.
+#                   Its old plan ("Q10 is the natural first bisect") is
+#                   superseded — Q10 and Q12 are the same defect, and Q12 is
+#                   four relations smaller.
+#   M0119-0011      unchanged, outside this bundle: Q5 wrong on the DEFAULT
+#                   planner. Clause 2's basis is still contaminated by it.
+#   Q18             a separate question from the clause-3 list: equally bad
+#                   estimate in both arms, different plan chosen. Filed as a
+#                   note under P5.9-h, not a new item.
+#
+# ===========================================================================
+# CLAUSE-4 ADDENDUM — TPC-DS SF0.5, flag ON — **FAIL (0 wrong answers)**
+# ===========================================================================
+# Command (the gate's own driver; the flag reaches the server it starts):
+#   GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=0 SF05_NO_PLANS=1 \
+#       bash scripts/tpcds-sf05-regression.sh sweep
+# Reports (the results dir is gitignored, so both are copied in beside this
+# file — the originals are sweep-20260805-204014.txt / -192044.txt):
+#            2026-08-05-p59run3-ds05-on.txt   (flag ON,  this run)
+#            2026-08-05-p59run3-ds05-off.txt  (flag OFF, same HEAD, prev loop)
+#
+#   flag OFF: PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4
+#   flag ON:  PASS=83 (52 ck) MISMATCH=0 CKMISMATCH=0 ERROR=7 TIMEOUT=5 SKIP=4
+#
+# **Zero MISMATCH and zero CKMISMATCH under the flag.** Not one of the 83
+# queries that completed returned a wrong row count or a wrong checksum. This
+# is the second corpus (after TPC-H's 23/23) on which the PG-shaped search
+# computes right answers, and it is 99 queries wide.
+#
+# The 12 regressions are exactly two defects, and neither is a wrong answer:
+#
+# **(A) 7 ERROR — one flag-owned planner assertion, firing on 7 queries.**
+#   Q11 Q31 Q47 Q57 Q58 Q74 Q83, all in 0 s (plan time), all identical:
+#
+#     panic: createPlan: searched subtree needed reconciliation — name
+#     resolution moves "item_id" from column 0 to 4; the createPlan arm that
+#     bound it and reconcileNLILayout disagree about the layout
+#       internal/planner/searchedtree.go:205  assertSearchedTreeNeedsNoReconcile
+#       internal/planner/createplanroot.go:130 createPlanAtSearchRootRange
+#       internal/planner/relfromjoinlist.go:315 searchOneProblem
+#
+#   Distinct instances in the server log (one per query, name + move):
+#     ca_county 0->8, customer_id 0->12, customer_id 0->20, i_category 0->16,
+#     i_category 0->18, item_id 0->4, item_id 2->0
+#
+#   This is the P5.5-f-ii-a cross-check doing its job: an independent
+#   verifier of the arms' coordinate arithmetic, deliberately fatal, catching
+#   a layout disagreement that TPC-H's 22 queries never produced. It aborts the
+#   backend goroutine (recovered at server.go:801 — the connection dies, the
+#   server does not), so it presents as `ERROR` and not as a wrong answer,
+#   which is the outcome the assertion was designed for. The two arms of a
+#   `0->N` move say the searched subtree believes a name lives at position 0
+#   while name resolution places it at N; `item_id 2->0` is the same
+#   disagreement in the other direction.
+#
+#   Note what this says about coverage: TPC-H, the corpus every P5.9-x defect
+#   so far was found and fixed on, does not exercise this path at all. The
+#   7 queries are TPC-DS's CTE/UNION-ALL-heavy family (11, 31, 47, 57, 58, 74,
+#   83), where the same base relation is scanned repeatedly under different
+#   aliases inside separate WITH arms.
+#
+# **(B) 5 TIMEOUT at 320 s — the §5 estimate collapse, on the second corpus.**
+#   Q7 Q26 Q27 Q53 Q63, all `select ... from store_sales, item, ...` star
+#   joins with no flag-OFF timing problem whatsoever (each ran in seconds).
+#   Consistent with §5's finding and not separately attributed here — the
+#   status-delta channel also reports 16 queries 2.0x-20.0x SLOWER under the
+#   flag (Q52 1->20 s, Q45 1->12 s, Q8 4->41 s, Q42 2->20 s, Q55 2->19 s …),
+#   which is the same signature TPC-H's clause 3 shows.
+#
+#   (12 queries also read FASTER, six of them "0 s" — those are the 7 ERROR
+#   queries failing at plan time, not speedups. The status-delta channel is
+#   non-blocking and does not distinguish; read it with the verdict table.)
+#
+# Harness change this addendum forced: `sf05_planner_flags_line` did not print
+# GOOPG_PGSHAPED_DP, so a flag-ON sweep was byte-indistinguishable from a
+# flag-OFF one — exactly the failure that function exists to prevent, one flag
+# generation later. Both PGSHAPED flags now appear on the line, and this run's
+# report carries `GOOPG_PGSHAPED_DP=1`.
+#
+# Clause 4 disposition: **FAIL**, and it adds a NEW flag-owned defect (A) that
+# is not P5.9-h's timing subject. Filed as M0127-P5.9-i.

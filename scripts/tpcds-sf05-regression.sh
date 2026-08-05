@@ -614,12 +614,19 @@ sf05_status_delta_channel() {
 #
 # A plan diff between two captures taken under different flags is meaningless,
 # which is why the capture stamps this too and not just the sweep.
+#
+# GOOPG_PGSHAPED_DP/_COLLAPSE joined the line at M0127-P5.9 run 3, when this
+# gate was first used as an ARM of a planner A/B (09 §3 clause 4). Without them
+# a flag-ON sweep is byte-indistinguishable from a flag-OFF one — precisely the
+# failure this function exists to prevent, one flag generation later.
 sf05_planner_flags_line() {
-    printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
+    printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s GOOPG_PGSHAPED_DP=%s GOOPG_PGSHAPED_COLLAPSE=%s\n' \
         "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
         "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
         "${GOOPG_MEMOIZE:-unset(on)}" \
-        "${GOOPG_PARALLEL:-unset(on)}"
+        "${GOOPG_PARALLEL:-unset(on)}" \
+        "${GOOPG_PGSHAPED_DP:-unset(off)}" \
+        "${GOOPG_PGSHAPED_COLLAPSE:-unset(off)}"
 }
 
 # sf05_plan_baseline — the capture this run is diffed against: the newest

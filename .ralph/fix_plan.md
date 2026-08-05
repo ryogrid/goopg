@@ -8116,6 +8116,35 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       still FAIL: the timing gap is untouched and is P5.9-h's subject, so run
       3's likely outcome is a THIRD documented no-go whose value is the
       first-ever §4/§5 measurement on a build that computes right answers.
+      **↳ RUN 3 EXECUTED 2026-08-05 (HEAD `1964333a`) — THIRD DOCUMENTED
+      NO-GO (09 §3.5);
+      `analysis/leftdeep-joins/2026-08-05-p59run3-s5-acceptance.txt`.** Flag
+      stays OFF, item stays OPEN — but this is the first no-go that fails on
+      PERFORMANCE ALONE. **Clause 1 PASSES**: `23 MATCH, 1 VALUE-DIFF`, and
+      that cell is Q5, whose digests are byte-identical to run 2's on both
+      arms, so run 2's PG adjudication carries verbatim and §3.4's amendment
+      excludes it. Flag-owned wrong answers: 4 → 2 → **0**. Clause 5 PASS
+      (third consecutive, zero `MultiHashJoin`, zero fusion). Clause 2 FAIL
+      1.362× (OFF 378.21 s, ON 515.06 s, allowance 453.85 s); clause 3 FAIL on
+      Q10 3.91× / Q9 3.13× / Q18 2.47× / Q7 2.07× / Q12 2.07×, **Q9's named
+      ≤ 170.9 s bar PASSES at 54.95 s**. Clause 4 (TPC-DS SF0.5 under the
+      flag, first ever): **MISMATCH=0 CKMISMATCH=0 across 99 queries** but
+      PASS=83 vs 95 — 7 ERROR + 5 TIMEOUT → FAIL. Clause 6 PARTIAL (shape
+      divergences 67 → 46, matched joinrels 21 → 32 — the first measurement of
+      02's shape claim).
+      **The run's finding: §4/§5 ran for the first time and named the timing
+      gap.** `parity_violations` 0 (flag OFF) → 6 (flag ON), and every one is a
+      joinrel the PG-shaped search sizes at `rows=1` against actuals of
+      5 869–1 999 080 (Q9 316 264×, Q10 114 106× twice, Q12 31 354×, Q5
+      7 411×, Q7 5 869×) where the OFF arm is within 1.4–6.3×. **Those five
+      queries ARE the clause-3 failures.** Reproducer Q12 (two relations):
+      under the flag its outer input is an `Index Scan using orders_pk on
+      orders` with NO index condition, carrying `rows=1`. → P5.9-h,
+      re-specified. Clause 4's 7 ERRORs are a SECOND, separate flag-owned
+      defect → **P5.9-i** (new). Two harness gaps closed in the same loop:
+      `scripts/tpch-estimate-audit-arm.sh` (new; the §4/§5 ratchet had no
+      in-repo driver) and `sf05_planner_flags_line` (a flag-ON DS05 sweep was
+      byte-indistinguishable from a flag-OFF one). 3 ledger rows.
 - [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
       scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
       and it was NOT the splice arithmetic this item predicted. At 4-under-5
@@ -8151,14 +8180,51 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       MISMATCH=0, CKMISMATCH=0, plans 99/99 same). 3 ledger rows — the
       producer still has no scope contract, the fixture's PKs are
       load-bearing, and `DROP INDEX` fails on a restart-surviving index.
-- [ ] **M0127-P5.9-h — the clause 2/3 timing gap.** DEFERRED until P5.9-g
-      closes, deliberately: a build whose Q2 computes the wrong answer is not
-      a timing baseline, and run 2's OFF total is itself inflated-fast by the
-      wrong Q5 (M0119-0011). Targets as measured in run 2: Q7 2.14×, Q9
-      3.23×, Q10 3.78×, Q12 2.00×, Q18 2.42×, total 1.36×. Q10 is the one
-      that has not moved at all (run 1: 3.83×) and is the natural first
-      bisect. Do NOT re-base off run 2's numbers — re-measure both arms after
-      P5.9-g and M0119-0011 land. 09 §3.4; IMPLEMENTATION-TODO P5.9-h.
+- [ ] **M0127-P5.9-h — the clause 2/3 timing gap is an ESTIMATE COLLAPSE.**
+      UNBLOCKED and RE-SPECIFIED by run 3 (09 §3.5) — this is no longer a
+      search for a bisect. Measured at HEAD `1964333a`: Q10 3.91×, Q9 3.13×,
+      Q18 2.47×, Q7 2.07×, Q12 2.07×, total 1.362×. The §4 parity ratchet ran
+      on both arms for the first time and went 0 → 6 violations under the
+      flag; every violation is a joinrel the PG-shaped search sizes at
+      **`rows=1`** against actuals of 5 869–1 999 080, where the flag-OFF arm
+      estimates within 1.4–6.3×. **The five queries carrying violations ARE
+      the clause-3 failures**, so this is one defect, not five.
+      **Reproducer: Q12**, two relations, no search-order confound. Flag ON its
+      outer input is `Index Scan using orders_pk on orders` with NO index
+      condition — a full ordered scan the search adds for merge-join
+      sortedness — carrying `rows=1`; flag OFF the same relation is a
+      `Seq Scan` at `rows=1500000` and the join estimates 21 154 against
+      31 354 actual. First bisect: is the 1 created when the index path is
+      BUILT (sized as a parameterized lookup), or is a correct size
+      mis-consumed by `makeJoinRel`/`sizeJoinRel`?
+      `internal/planner/joinsearchlevel.go:324-330` clamps `rows < 1` to 1 and
+      would MASK a zero as a one.
+      **Q18 is NOT in this class** — its final joinrel is ~23 400× over in
+      BOTH arms (actual 70) — so its 2.47× is a plan choice on an equally bad
+      estimate and must not be bisected together with the rest.
+      Evidence: `analysis/leftdeep-joins/2026-08-05-p59run3-audit-{off,on}.txt`.
+      09 §3.5, §4.1; IMPLEMENTATION-TODO P5.9-h.
+- [ ] **M0127-P5.9-i — `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
+      queries under the flag.** NEW at run 3 (09 §3.5), and the first
+      flag-owned defect TPC-H structurally cannot find. Q11, Q31, Q47, Q57,
+      Q58, Q74, Q83 abort at plan time (0 s) — `internal/planner/
+      searchedtree.go:205`, reached from `createPlanAtSearchRootRange`
+      (createplanroot.go:130) via `searchOneProblem` — each with a distinct
+      layout disagreement: `ca_county 0→8`, `customer_id 0→12`,
+      `customer_id 0→20`, `i_category 0→16`, `i_category 0→18`,
+      `item_id 0→4`, `item_id 2→0`. The P5.5-f-ii-a cross-check is doing its
+      job: it turns a wrong-column plan into a dead connection (panic recovered
+      per-connection at `internal/server/server.go:801`; the server stays up),
+      which is why clause 4 reads `ERROR=7` with `MISMATCH=0 CKMISMATCH=0`.
+      All seven are the CTE/UNION-ALL family where one base relation is
+      scanned repeatedly under different aliases inside separate WITH arms —
+      a shape TPC-H's 22 queries never produce, which is why three acceptance
+      runs missed it. Reproduce: `GOOPG_PGSHAPED_DP=1 bench/tpcds/server.sh
+      start sf05` then `psql -h 127.0.0.1 -p 65437 -U postgres -d postgres -f
+      bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql`. Evidence:
+      `analysis/leftdeep-joins/2026-08-05-p59run3-ds05-on.txt` (a copy of the
+      gitignored `tpcds-results-sf05/sweep-20260805-204014.txt`) +
+      `bench/tpcds/runtime_goopg/goopg.sf05.log`. IMPLEMENTATION-TODO P5.9-i.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =

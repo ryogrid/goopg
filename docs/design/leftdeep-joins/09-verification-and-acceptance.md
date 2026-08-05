@@ -315,6 +315,83 @@ Two consequences for the timing clauses, both binding on run 3:
   fast because it is wrong. The basis is kept as measured and the failure
   recorded honestly, but run 3 recomputes it post-M0119-0011.
 
+### 3.5 Run 3 — correctness discharged, and the timing gap named (P5.9, 2026-08-05)
+
+**Run 3 is a third documented NO-GO, and the first one that fails on
+performance alone.** `GOOPG_PGSHAPED_DP` stays OFF. Evidence:
+`analysis/leftdeep-joins/2026-08-05-p59run3-s5-acceptance.txt` (HEAD
+`1964333a`, one binary, two arms, `scripts/tpch-acceptance-arm.sh`).
+
+**Clause 1 PASSES.** `tpch-runner -diff` reports 23 MATCH and one VALUE-DIFF,
+and that one cell is Q5 — whose digests are byte-identical to run 2's on both
+arms, so run 2's PG adjudication carries verbatim: flag-ON agrees with PG 18.3,
+flag-OFF does not, and §3.4's second amendment excludes it. Three runs:
+4 flag-owned failures → 2 → **0**.
+
+Because clause 1 passed, the instruments runs 1 and 2 deliberately withheld
+finally ran. What they found is the run's contribution:
+
+| clause | run 3 | note |
+|---|---|---|
+| 1 value equality | **PASS** | 23 MATCH; Q5 adjudicated to the baseline (M0119-0011) |
+| 2 total ≤ 1.2× | FAIL 1.362× | OFF 378.21 s, ON 515.06 s, allowance 453.85 s |
+| 3 no query > 2× | FAIL ×5 | Q10 3.91, Q9 3.13, Q18 2.47, Q7 2.07, Q12 2.07; **Q9's absolute bar ≤ 170.9 s PASSES at 54.95 s** |
+| 4 TPC-DS SF0.5 | FAIL | **MISMATCH=0, CKMISMATCH=0**; 7 ERROR (one assertion) + 5 TIMEOUT |
+| 5 no MultiHashJoin/fusion | PASS | third consecutive, both arms |
+| 6 bushy capability | PARTIAL | first evidence: shape divergences 67 → 46, matched joinrels 21 → 32 under the flag |
+
+**The §4/§5 finding, which supersedes P5.9-h's plan.** Both arms audited at the
+same HEAD against the same committed PG reference:
+
+| | flag OFF | flag ON |
+|---|---|---|
+| absolute violations (§5) | 1 | 13 |
+| `parity_violations` (§4) | **0** | **6** |
+| `shape_mismatches` (§4) | 67 | 46 |
+
+Every one of the six parity violations is a joinrel the PG-shaped search sizes
+at **`rows=1`** against actuals of 5 869 – 1 999 080 (Q9 316 264×, Q10 114 106×
+twice, Q12 31 354×, Q5 7 411×, Q7 5 869×); the same joinrels on the flag-OFF
+arm estimate within 1.4–6.3× of actual. **The five queries carrying parity
+violations are the five queries that fail clause 3.** The timing gap is not a
+cost-constant gap — it is an estimate collapse, and the cost model cannot rank
+anything once every joinrel above the collapse is 1 row.
+
+Q12 is the reproducer, because it joins exactly two relations and so has no
+search-order confound. Under the flag its outer input is
+`Index Scan using orders_pk on orders` with **no index condition** — a full
+ordered scan the search adds for merge-join sortedness — carrying `rows=1`,
+the row estimate of a parameterized single-row lookup. Under the flag-OFF arm
+the same relation is a `Seq Scan` at `rows=1500000` and the join estimates
+21 154. Whether the 1 is created when the path is built or is a correct path
+size mis-consumed by `makeJoinRel`/`sizeJoinRel`
+(`internal/planner/joinsearchlevel.go:324-330` clamps `rows < 1` to 1, which
+would mask a zero as a one) is P5.9-h's first bisect. Q18 is *not* part of this
+class — its final joinrel is ~23 400× over in **both** arms — and is tracked
+separately.
+
+**Clause 4 found a defect TPC-H cannot reach.** Zero MISMATCH and zero
+CKMISMATCH across 99 queries under the flag — but 7 queries (Q11, Q31, Q47,
+Q57, Q58, Q74, Q83) abort at plan time on
+`assertSearchedTreeNeedsNoReconcile` (`searchedtree.go:205`, the P5.5-f-ii-a
+cross-check) with a layout disagreement — `ca_county 0→8`,
+`customer_id 0→12`, `customer_id 0→20`, `i_category 0→16`, `i_category 0→18`,
+`item_id 0→4`, `item_id 2→0` — and 5 more (Q7, Q26, Q27, Q53, Q63) time out at
+320 s in the §5 estimate-collapse pattern. The assertion is doing exactly what
+it was built for: it converts a wrong-column plan into a dead connection
+instead of a wrong answer. Filed **M0127-P5.9-i**. The lesson for this bar is
+that TPC-H — the corpus every P5.9-x defect so far was found on — does not
+exercise the repeated-alias CTE/UNION-ALL family at all, so clause 4 must run
+on **every** future acceptance run, not only after clause 1 is clean.
+
+Harness changes forced by run 3, both for the P5.9-d reason (an evidence file
+whose driver is ephemeral, or which cannot name its own arm, is not evidence):
+`scripts/tpch-estimate-audit-arm.sh` (new — the §4/§5 instruments had no
+in-repo server bring-up, so the ratchet was produced by an ad-hoc command line
+each time) and `sf05_planner_flags_line` in
+`scripts/tpcds-sf05-regression.sh`, which did not print the PGSHAPED flags and
+so made a flag-ON sweep byte-indistinguishable from a flag-OFF one.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),
@@ -380,6 +457,24 @@ bound**: goopg's EXPLAIN does not deduplicate repeated relation names the way
 `select_rtable_names` (ruleutils.c) does (`lineitem_1`, `n1`/`n2`), so Q8, Q17
 and Q18 lose their final-joinrel comparison to a rendering gap rather than a
 planning difference (deferral-ledger row, 2026-08-05).
+
+**Re-pinned 2026-08-05 at P5.9 run 3, now as a two-arm ratchet** (HEAD
+`1964333a`, one binary, both arms measured LIVE via the new
+`scripts/tpch-estimate-audit-arm.sh`, same committed PG reference):
+
+| arm | `parity_violations` | `shape_mismatches` | joinrels matched |
+|---|---|---|---|
+| `GOOPG_PGSHAPED_DP=0` | **0** | 67 | 21 |
+| `GOOPG_PGSHAPED_DP=1` | **6** | 46 | 32 |
+
+The live flag-OFF arm reproduces the baseline above exactly on shape (67
+divergences, 21 matched) and drops its one parity violation: Q19
+`{lineitem,part}` now reads `est=286 actual=131` (2.2× over, excess 2.1×)
+where the replayed P5.6-g capture read `est=1 actual=131`. The 1-row clamp on
+Q19 is gone, so the LEGACY arm carries **zero** parity violations, and that is
+what future commits ratchet against on the OFF arm. The ON arm's 6 are §3.5's
+estimate collapse and are P5.9-h's to clear; the ON arm's 46 is the first
+measurement of the shape claim [02](02-plan-shape-contract.md) makes.
 
 ## 5. Estimate audit (class-(a) regression tripwire)
 

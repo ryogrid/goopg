@@ -1312,6 +1312,20 @@
   Clauses 4/6 again not reached. The two surviving cells split: **Q2 is the
   flag's (→ P5.9-g); Q5 is the BASELINE's (→ M0119-0011)** — flag-ON agrees
   with PG 18.3, the default path is wrong by ~24×. Run 3 after P5.9-g.
+  **Run 3 executed 2026-08-05 at HEAD `1964333a` — THIRD DOCUMENTED NO-GO**
+  (09 §3.5; `analysis/leftdeep-joins/2026-08-05-p59run3-s5-acceptance.txt`),
+  and the first that fails on PERFORMANCE ALONE. **Clause 1 PASSES**: 23 MATCH,
+  1 VALUE-DIFF, and that cell is Q5, whose digests are byte-identical to run 2's
+  on both arms so run 2's PG adjudication carries — 4 flag-owned failures → 2
+  → **0**. Clause 5 PASS (third). Clause 2 FAIL 1.362×; clause 3 FAIL on
+  Q10 3.91 / Q9 3.13 / Q18 2.47 / Q7 2.07 / Q12 2.07, **Q9's ≤ 170.9 s bar
+  PASSES at 54.95 s**. Clause 4 (DS05, flag ON, first ever): **MISMATCH=0
+  CKMISMATCH=0** but 7 ERROR + 5 TIMEOUT → FAIL. Clause 6 PARTIAL.
+  **§4/§5 ran for the first time and named the timing gap**: parity violations
+  0 (OFF) → 6 (ON), every one a joinrel the PG-shaped search sizes at `rows=1`
+  against actuals of 5 869–1 999 080, and those five queries ARE the clause-3
+  failures. Two-table reproducer + resume point in 09 §3.5; successors P5.9-h
+  (estimate collapse) and P5.9-i (the DS05 assertion).
 - [x] **P5.9-g** The decorrelated GROUP BY key was recorded in the scope it was
   FOUND in, not the one it is READ in. DONE 2026-08-05 (09 §5.22) — and not
   where this item predicted. At 4-under-5 the splice's
@@ -1338,12 +1352,42 @@
   (`c8fe0d352d75b67e`) → `tpch-runner -diff` `Q2 MATCH rows=455`
   **VERDICT: PASS**, with PG 18.3 agreeing tuple-for-tuple on the fixture.
   3 ledger rows. **Run 3 of the bar is unblocked.**
-- [ ] **P5.9-h** The clause 2/3 timing gap (Q7 2.14×, Q9 3.23×, Q10 3.78×,
-  Q12 2.00×, Q18 2.42×, total 1.36×). DEFERRED until P5.9-g closes: a build
-  whose Q2 is wrong is not a timing baseline, and run 2's OFF total is itself
-  inflated-fast by the wrong Q5 (M0119-0011). Q10 has not moved since run 1
-  (3.83×) and is the natural first bisect. Re-measure both arms rather than
-  re-basing off run 2's numbers.
+- [ ] **P5.9-h** The clause 2/3 timing gap — **RE-SPECIFIED at run 3 (09 §3.5)
+  as an ESTIMATE COLLAPSE, no longer a search for a bisect.** Run 3 measured
+  (Q10 3.91×, Q9 3.13×, Q18 2.47×, Q7 2.07×, Q12 2.07×, total 1.362×) and the
+  §4 parity ratchet ran on both arms for the first time: `parity_violations`
+  0 (OFF) → 6 (ON), and every violation is a joinrel the PG-shaped search sizes
+  at `rows=1` (Q9 316 264×, Q10 114 106× twice, Q12 31 354×, Q5 7 411×,
+  Q7 5 869×) where the OFF arm is within 1.4–6.3× of actual. The five queries
+  carrying violations ARE the clause-3 failures.
+  **Reproducer: Q12** — two relations, no search-order confound. Flag ON, its
+  outer input is `Index Scan using orders_pk on orders` with NO index condition
+  (a full ordered scan the search adds for merge-join sortedness) carrying
+  `rows=1`; flag OFF the same relation is a `Seq Scan` at `rows=1500000` and
+  the join estimates 21 154 (actual 31 354). First bisect: does the index path
+  get sized as a parameterized lookup when it is built, or is a correct size
+  mis-consumed by `makeJoinRel`/`sizeJoinRel`? Note
+  `internal/planner/joinsearchlevel.go:324-330` clamps `rows < 1` to 1 and
+  would MASK a zero as a one.
+  **Q18 is NOT in this class** and must not be bisected with it: its final
+  joinrel is ~23 400× over in BOTH arms (OFF est=1 568 274, ON est=1 642 632,
+  actual 70), so its 2.47× is a plan choice made on an equally bad estimate.
+- [ ] **P5.9-i** `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
+  queries under the flag (NEW at run 3, 09 §3.5). Q11, Q31, Q47, Q57, Q58,
+  Q74, Q83 abort at plan time — `searchedtree.go:205`, reached from
+  `createPlanAtSearchRootRange` (createplanroot.go:130) via
+  `searchOneProblem` — each with a distinct layout disagreement:
+  `ca_county 0→8`, `customer_id 0→12`, `customer_id 0→20`, `i_category 0→16`,
+  `i_category 0→18`, `item_id 0→4`, `item_id 2→0`. The P5.5-f-ii-a cross-check
+  is doing its job: it converts a wrong-column plan into a dead connection
+  (the panic is recovered per-connection at server.go:801; the server stays
+  up), which is why clause 4 shows `ERROR=7` and `MISMATCH=0`. All seven are
+  TPC-DS's CTE/UNION-ALL family, where one base relation is scanned repeatedly
+  under different aliases inside separate WITH arms — a shape TPC-H's 22
+  queries never produce, which is why three acceptance runs on TPC-H alone
+  never saw it. Reproduce: `GOOPG_PGSHAPED_DP=1 bench/tpcds/server.sh start
+  sf05`, then `psql -p 65437 -f
+  bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql`.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is
