@@ -8084,6 +8084,54 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       reporting `VERDICT: PASS` — a row-count table is no longer evidence
       (09 §3.3). Adjudicate any `ORDER-DIFF` individually against that query's
       `ORDER BY` in the write-up.
+      **↳ RUN 2 EXECUTED 2026-08-05 (HEAD `c00db762`) — SECOND DOCUMENTED
+      NO-GO (09 §3.4);
+      `analysis/leftdeep-joins/2026-08-05-p59run2-s5-acceptance.txt`.** Flag
+      stays OFF, item stays OPEN. Clause 1: four failures → two
+      (`22 MATCH, 1 ROWS-DIFF, 1 VALUE-DIFF`). **Q7/Q8/Q9 and Q17 all MATCH on
+      values** — -c and -e/-f held. Clause 5 PASS again (zero `MultiHashJoin`,
+      zero fusion, both arms). Clause 2 FAIL 1.36× (OFF 372.50 s, ON 506.45 s,
+      allowance 447.00 s); clause 3 FAIL on Q7 2.14× / Q9 3.23× / Q10 3.78× /
+      Q18 2.42× (Q12 2.00× borderline) — but **Q9's named absolute bar
+      ≤ 170.9 s PASSES at 53.56 s**, beating even 01 §5's aspirational
+      58.83 s. Clauses 4 and 6 again not reached (they score plan quality; Q2
+      is still wrong under the flag). The two surviving clause-1 cells are
+      NOT the same kind of thing: Q2 is the flag's (→ P5.9-g), Q5 is the
+      **baseline's** (→ M0119-0011) — flag-ON agrees with PG 18.3 and
+      flag-OFF is wrong by ~24×. That forced a second amendment to clause 1
+      (09 §3.4): every non-MATCH cell is adjudicated against PostgreSQL
+      before it is attributed, and a cell where ON agrees with PG does not
+      count against the flip. Q5's 4.09× is struck from clause 3 (the arms
+      compute different result sets). 3 ledger rows. **Run 3 after P5.9-g.**
+- [ ] **M0127-P5.9-g — Q2's decorrelated aggregate splice returns 0 rows.**
+      The LAST clause-1 failure that is actually the flag's, and the only
+      thing between here and run 3. Under `GOOPG_PGSHAPED_DP=1` Q2 returns 0
+      rows against 455 (flag-OFF keeps the correlated SubPlan and is right);
+      unchanged across runs 1 and 2, so it was never the P5.9-c rotation it
+      was provisionally attributed to. The ON plan
+      (`analysis/leftdeep-joins/2026-08-05-p59run2-explain-on.txt`) is
+      the shape P5.9-f fixed for Q17 — a decorrelated `HashAggregate` spliced
+      in as a foreign coordinate scope under
+      `Hash Cond: (part.p_partkey = partsupp.ps_partkey)` +
+      `Filter: (partsupp.ps_supplycost = min)` — but with a 4-relation inner
+      (partsupp/supplier/nation/region clone) under a 5-relation outer, where
+      Q17's was 2-under-2. Start at `unnestSubquery`'s `outerWidth` splice
+      (internal/planner/unnest.go, the P5.9-f fix) and ask whether the key or
+      the `= min` residual addresses the clone's scope or the outer's; the
+      P5.9-f fixture recipe in `analysis/leftdeep-joins/p59f/README.md`
+      generalises (a ~1 s throwaway 5533 cluster, NOT the 28 s SF1 arm).
+      09 §3.4; IMPLEMENTATION-TODO P5.9-g. Bar: UNITS + SPOT + DS05 (the
+      P5.9-f fixes changed flag-OFF planning, so DS05 is required not
+      optional) + Q2 arms ON/OFF on ONE binary → `tpch-runner -diff`
+      `VERDICT: PASS`.
+- [ ] **M0127-P5.9-h — the clause 2/3 timing gap.** DEFERRED until P5.9-g
+      closes, deliberately: a build whose Q2 computes the wrong answer is not
+      a timing baseline, and run 2's OFF total is itself inflated-fast by the
+      wrong Q5 (M0119-0011). Targets as measured in run 2: Q7 2.14×, Q9
+      3.23×, Q10 3.78×, Q12 2.00×, Q18 2.42×, total 1.36×. Q10 is the one
+      that has not moved at all (run 1: 3.83×) and is the natural first
+      bisect. Do NOT re-base off run 2's numbers — re-measure both arms after
+      P5.9-g and M0119-0011 land. 09 §3.4; IMPLEMENTATION-TODO P5.9-h.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =
@@ -8384,6 +8432,37 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       pre-restart against a post-restart `catalog.Table` column-by-column.
       Bar: the repro's second INSERT succeeds, plus a regression test that
       round-trips a multi-column `char(N)`/`varchar(N)` table through a restart.
+- [ ] **M0119-0011 — the DEFAULT planner drops an equivalence-class join
+      clause across three relations; TPC-H Q5 is wrong by ~24×** (source:
+      M0127-P5.9 run 2, ledger row 2026-08-05). **This is a wrong answer on
+      goopg's shipped default path, not a flag-ON regression**, and it is
+      independent of M0127 — it is filed here because the acceptance bar is
+      what found it, not because the bundle owns it. Q5's WHERE puts
+      `{c_nationkey, s_nationkey, n_nationkey}` in ONE equivalence class over
+      three relations, so a correct plan emits TWO clauses from it; the
+      flag-OFF plan emits one (`c_nationkey = n_nationkey`) and never
+      nation-constrains `supplier`, which is joined solely on
+      `l_suppkey = s_suppkey`. That join is 1:1, so rows are not multiplied —
+      the plan simply ADMITS the ~24-in-25 lineitems whose supplier nation
+      differs from the customer's, and `sum(l_extendedprice*(1-l_discount))`
+      inflates ~24×. Measured 2026-08-05 on the SF1 clusters: PG 18.3
+      `5.59e7`, goopg default `1.34e9`, goopg `GOOPG_PGSHAPED_DP=1` `5.73e7`.
+      **Re-stating the dropped equality redundantly in the SQL does NOT bring
+      it back** (three spellings, incl. all three equalities written out, all
+      return `1.34e9`), so the class is formed and then under-emitted: this is
+      not written-order sensitivity and not a "spell out the transitive
+      closure" user error. PG generates one clause per EC member pair needed
+      to connect the class's relations —
+      `postgres/src/backend/optimizer/path/equivclass.c`,
+      `generate_join_implied_equalities` / `create_join_clause`. Start at the
+      legacy join-order path's EC handling (`internal/planner/joinorder.go`,
+      `bushy.go`) and ask how many clauses a 3-relation class emits.
+      Full evidence, plan text and the A/B/C probe:
+      `analysis/leftdeep-joins/2026-08-05-p59run2-s5-acceptance.txt` §4 and §7;
+      09 §3.4. Bar: Q5 on the default path returns ~5.7e7 and MATCHes the
+      `GOOPG_PGSHAPED_DP=1` arm under `tpch-runner -diff`; a planner unit test
+      that pins clause COUNT for a 3-relation equivalence class; plus SPOT +
+      DS05, since this touches default-path join-clause generation.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over

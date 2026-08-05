@@ -1,53 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-f CLOSED**. Facts the next loop must NOT re-derive:
+Last loop: **M0127-P5.9 acceptance bar RUN 2 executed** (HEAD `c00db762`).
+Second documented NO-GO, flag stays OFF, P5.9 stays OPEN. Do NOT re-derive:
 
-1. **P5.9-f was TWO defects, both now fixed and pinned.** (a)
-   `buildBindingsPosMap`'s `collect` descended into a join-input `*Aggregate`
-   while `applyJoinTreePosMap` has always stopped there — with the flag ON the
-   searched outer side records no entries, so the decorrelated HashAggregate's
-   lineitem CLONE became the only `lineitem` entry (offset 25) and the residual
-   `l_quantity/4` became `/29`. Fixed as an opaque leaf. (b) With the remap
-   correctly declining, `reresolveJoinByName` stopped running and Q17 returned
-   **0 rows**: `unnestSubquery` built the splice's `RightKey` at the
-   inner-relative `0` while `Predicate`/`LeftKey` used merged coordinates.
-   Fixed at `outerWidth`. Do NOT "simplify" either back.
-2. **The reproducer is ~1 s, not the 28 s SF1 arm** — a 3000-row lineitem /
-   200-row part fixture on a throwaway 5533 cluster; recipe in
-   `analysis/leftdeep-joins/p59f/README.md`. Note the fixture trap recorded
-   there: `l_quantity` must NOT be a function of `l_partkey` or nothing matches
-   and the fixture cannot fail.
-3. **P5.9's full bar re-run is UNBLOCKED and is M0127's next action.** Run 1's
-   remaining clause-1 counts (Q2 0 rows; Q7/Q8/Q9 `42883`; Q5/Q10 timing) were
-   all attributed to the rotation P5.9-c fixed — **re-measure before
-   re-diagnosing any of them.** Protocol: `NO_BUILD=1 PGSHAPED=0|1
-   scripts/tpch-acceptance-arm.sh <name> <out>` holding ONE binary across arms,
-   then `tmp/tpch-acceptance-runner -diff <off> <on>` (clause 1 is values, not
-   row counts).
-4. Two ledger rows filed. The generalisations deliberately NOT done: the
-   twin-walker node-set agreement (`collect` vs `applyJoinTreePosMap` — third
-   divergence found) and an audit of the nine `&Join{}` construction sites for
-   keys that depend on `reresolveJoinByName`'s by-name repair.
-5. Incidental, unrelated discovery filed as **M0119-0010**: `char(N)` typmods
-   are not restored per column on catalog reload (same INSERT succeeds before a
-   restart, `ERROR: value too long for type character(1)` after, while `\d`
-   still reports the right types). Three-statement repro in the same README.
+1. **Clause 1 went four failures → two.** `22 MATCH, 1 ROWS-DIFF, 1 VALUE-DIFF`.
+   Q7/Q8/Q9 and Q17 now MATCH on full digests — -c/-e/-f all held. Clause 5
+   PASS again (0 `MultiHashJoin`, 0 fusion, both arms). Clause 2 FAIL 1.36×
+   (OFF 372.50 s / ON 506.45 s / allowance 447.00 s); clause 3 FAIL Q7 2.14×,
+   Q9 3.23×, Q10 3.78×, Q18 2.42× — **but Q9's named ≤170.9 s bar PASSES at
+   53.56 s.** Clauses 4/6 again not reached (they score plan quality; Q2 is
+   still wrong under the flag).
+2. **THE HEADLINE: goopg's DEFAULT planner returns a wrong answer for TPC-H
+   Q5, ~24× inflated.** PG 18.3 `5.59e7`, goopg default `1.34e9`, goopg
+   flag-ON `5.73e7`. `{c_nationkey,s_nationkey,n_nationkey}` is one EC over
+   three relations; the default plan emits ONE clause from it and never
+   nation-constrains `supplier`. Writing all three equalities out redundantly
+   does NOT bring it back. Filed **M0119-0011** (independent of M0127). This
+   forced clause 1's second amendment: adjudicate every non-MATCH cell
+   against PostgreSQL before attributing it (09 §3.4).
+3. **The only blocker on run 3 is M0127-P5.9-g (Q2 = 0 rows vs 455).** It is
+   P5.9-f's Q17 shape with a 4-relation inner under a 5-relation outer;
+   start at `unnestSubquery`'s `outerWidth` splice. It was NEVER the P5.9-c
+   rotation — unchanged across runs 1 and 2. Timing work is P5.9-h and is
+   deliberately deferred behind it (bisect Q10 first: the only ratio that did
+   not move between runs).
+4. Harness: the arm script's nightly interlock `pgrep -f
+   ci/batch/run-nightly.sh` SELF-MATCHED and refused on a quiet host. Fixed
+   in place (`[c]i/...`); the scripts-wide sweep for the same shape is a
+   ledger row.
+5. Reproduce the whole bar: `NO_BUILD=1 PGSHAPED=0|1
+   scripts/tpch-acceptance-arm.sh <name> <out>` on ONE binary, then
+   `tmp/tpch-acceptance-runner -diff <off> <on>`.
 
-Files: `internal/planner/bushy.go`, `internal/planner/unnest.go`,
-`internal/planner/joinsearchunnest_test.go` (new).
-Docs: leftdeep-joins/09 §5.21 (new), bundle README status, IMPLEMENTATION-TODO
-P5.9-f, fix_plan P5.9-f + parent + M0119-0010, 2 ledger rows,
-`analysis/leftdeep-joins/p59f/`.
+Files: `scripts/tpch-acceptance-arm.sh` (1-line guard fix).
+Docs: 09 §3.4 (new), bundle README status, IMPLEMENTATION-TODO P5.9 + new
+P5.9-g/-h, fix_plan P5.9 + P5.9-g/-h + M0119-0011, 4 ledger rows,
+`analysis/leftdeep-joins/2026-08-05-p59run2-*` (arms, diff, EXPLAINs, write-up).
 
-Gates run: UNITS PASS; SPOT PASS (Q12 rows=2, Q13 rows=35, 28.9 s); **DS05 sweep
-PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan shapes 99/99 identical**
-(both fixes change flag-OFF planning, so this was required, not optional);
-Q17 arms ON/OFF on one binary → `tpch-runner -diff` **VERDICT: PASS**;
-pgbench smoke via the commit hook; `make ralph-state-guard` (self-repaired).
+Gates run: **both acceptance arms + `tpch-runner -diff` (the loop's own gate)**;
+EXPLAIN sweep both arms (clause 5 PASS); PG-oracle Q5 comparison on :65432
+(cluster started and stopped again); pgbench smoke via the commit hook;
+`make ralph-state-guard` (self-repaired). No Go code changed, so UNITS/SPOT/DS05
+were not applicable.
 
 Nightly triage 20260805-014309: unchanged run, both items already filed under
 M-NIGHTLY, left unchecked per the banner.
 
-Next step: **M0127-P5.9** — the full S5 acceptance bar re-run + flag flip.
+Next step: **M0127-P5.9-g** — Q2's decorrelated-aggregate splice returns 0 rows.
 
 In-flight: none.

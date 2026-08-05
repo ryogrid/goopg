@@ -246,6 +246,75 @@ right. A value wrong in both arms is invisible to it; only the PG oracle can
 see that, and wiring one in is a ledger row (2026-08-05, M0127-P5.9-d), not
 part of this instrument.
 
+### 3.4 Run 2, and the arm that turned out not to be an oracle (P5.9, 2026-08-05)
+
+**Run 2 of the bar is a second documented NO-GO.** `GOOPG_PGSHAPED_DP` stays
+OFF. Evidence: `analysis/leftdeep-joins/2026-08-05-p59run2-s5-acceptance.txt`
+(HEAD `c00db762`, one binary, two arms, both driven by
+`scripts/tpch-acceptance-arm.sh` as §3.3 clause 2 requires — the first
+execution of this bar a clean checkout can reproduce).
+
+Clause 1 went from four failures to two: **Q7/Q8/Q9 and Q17 all MATCH on
+values now**, and they match on the full digest, not merely on the columns
+that happened to type-check. Clause 5 passed for the second time (zero
+`MultiHashJoin`, zero fusion, both arms). Clauses 2 (1.36×) and 3
+(Q7 2.14× / Q9 3.23× / Q10 3.78× / Q18 2.42×) fail; clauses 4 and 6 were
+again not reached, for §3.1's unchanged reason — Q2 still computes the wrong
+answer under the flag, and plan QUALITY cannot be scored on a build whose
+plans are wrong. The one absolute target the bundle set, Q9 ≤ 170.9 s, is
+**met** at 53.56 s.
+
+The two surviving clause-1 cells are not two of a kind, and the difference is
+what this run adds to the bar:
+
+- **Q2 (`ROWS-DIFF A=455 B=0`) is the flag's.** The decorrelated aggregate is
+  spliced in as a foreign coordinate scope joined on `p_partkey =
+  ps_partkey` — the shape [P5.9-f](#) fixed for Q17 at `outerWidth`, here
+  with a 4-relation inner under a 5-relation outer. Filed M0127-P5.9-g.
+- **Q5 (`VALUE-DIFF`, 5 rows both arms) is the BASELINE's.** Q5's WHERE puts
+  `{c_nationkey, s_nationkey, n_nationkey}` in one equivalence class over
+  three relations, so a correct plan emits two clauses from it. The flag-OFF
+  plan emits one (`c_nationkey = n_nationkey`) and never nation-constrains
+  `supplier` at all; since `l_suppkey = s_suppkey` is 1:1 this does not
+  multiply rows, it admits the ~24-in-25 lineitems whose supplier nation
+  differs from the customer's, and revenue inflates ~24×. Measured: PG 18.3
+  `5.59e7`, goopg flag-OFF `1.34e9`, goopg flag-ON `5.73e7`. Re-stating the
+  dropped equality **redundantly in the SQL does not bring it back** — the
+  class is formed and then under-emitted — which rules out both written-order
+  sensitivity and "the user must spell out the transitive closure". Filed
+  **M0119-0011**, independent of this bundle: it is a wrong answer on goopg's
+  *default* planner.
+
+**The amendment this forces on clause 1.** §3.3 closed by warning that the
+diff "certifies that two goopg arms AGREE, not that either is right", and
+named the PG oracle as the missing instrument. Run 2 hit that limit on its
+second run — but from the unexpected side. The instrument was not blind here;
+it was *directionally misread by its own specification*, which scores a
+non-MATCH as a flag-ON failure. Clause 1 is therefore amended a second time:
+
+> **22/22 complete plus value-level equality with the flag-OFF arm; and every
+> non-MATCH cell is ADJUDICATED AGAINST POSTGRESQL before it is attributed.**
+> A cell where flag-ON agrees with PG and flag-OFF does not is a baseline
+> defect, filed outside this bundle, and does not count against the flip.
+
+Q5 remains a *bookkeeping* failure of run 2 (the arms disagree, and the bar
+is specified on agreement) while being a correctness *win* for the flag. It is
+also the only finding the value-level amendment has produced so far that run
+1's row-count table could never have produced at all — Q5 returns five rows in
+both arms.
+
+Two consequences for the timing clauses, both binding on run 3:
+
+- **Q5's 4.09× is struck from clause 3.** The arms compute different result
+  sets; flag-OFF admits ~25× more joined rows and is still 4× faster because
+  it keeps a 4-worker `Gather` over a hash pipeline while flag-ON picks a
+  serial `Merge Join` over an `orders` index scan. Re-base only once
+  M0119-0011 lands and both arms compute the same answer.
+- **Clause 2's "contemporaneous integer-arm run" is only a valid basis where
+  that arm is correct.** Run 2's OFF total (372.50 s) includes a Q5 that is
+  fast because it is wrong. The basis is kept as measured and the failure
+  recorded honestly, but run 3 recomputes it post-M0119-0011.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

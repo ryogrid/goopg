@@ -82,7 +82,12 @@ if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     exit 3
 fi
 [[ -s "${PGDATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${PGDATA}" >&2; exit 3; }
-if [[ "${FORCE:-0}" != "1" ]] && pgrep -f "ci/batch/run-nightly.sh" >/dev/null 2>&1; then
+# The bracket around the first character keeps this pattern from matching the
+# guard's OWN command line — a bare `pgrep -f ci/batch/run-nightly.sh` self-
+# matches and refuses on a quiet host (observed at P5.9 run 2). Same class as
+# CLAUDE.md's `pkill -f goopg` rule, one level up: it applies to every guard
+# that greps for a peer workload, not just to process kills.
+if [[ "${FORCE:-0}" != "1" ]] && pgrep -f "[c]i/batch/run-nightly.sh" >/dev/null 2>&1; then
     echo "the nightly CI batch is running — every timing in this arm would be void. Refusing (FORCE=1 overrides; legitimate only for a values-only run)." >&2
     exit 3
 fi

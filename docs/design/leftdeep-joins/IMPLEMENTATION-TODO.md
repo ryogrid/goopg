@@ -1303,6 +1303,34 @@
   P5.9-f (the Q17 correctness defect that -e attributed), and it must be driven
   by `scripts/tpch-acceptance-arm.sh` with `-digest` on both arms, discharging
   clause 1 through `tpch-runner -diff` (09 §3.3).**
+  **Run 2 executed 2026-08-05 at HEAD `c00db762` — SECOND DOCUMENTED NO-GO**
+  (09 §3.4; `analysis/leftdeep-joins/2026-08-05-p59run2-s5-acceptance.txt`),
+  and the first run of this bar a clean checkout can reproduce. Clause 1:
+  four failures → two (`22 MATCH, 1 ROWS-DIFF, 1 VALUE-DIFF`) — Q7/Q8/Q9 and
+  Q17 all MATCH on values. Clause 5 PASS again. Clause 2 FAIL 1.36×, clause 3
+  FAIL on Q7/Q9/Q10/Q18, **but Q9's named ≤ 170.9 s bar PASSES at 53.56 s**.
+  Clauses 4/6 again not reached. The two surviving cells split: **Q2 is the
+  flag's (→ P5.9-g); Q5 is the BASELINE's (→ M0119-0011)** — flag-ON agrees
+  with PG 18.3, the default path is wrong by ~24×. Run 3 after P5.9-g.
+- [ ] **P5.9-g** Q2's decorrelated aggregate splice returns 0 rows — the last
+  clause-1 failure that is the flag's, and the only blocker on run 3.
+  Unchanged across runs 1 and 2, so it was never the P5.9-c rotation it was
+  provisionally attributed to. The ON plan is P5.9-f's Q17 shape (a
+  decorrelated `HashAggregate` as a foreign coordinate scope under
+  `Hash Cond: (part.p_partkey = partsupp.ps_partkey)` +
+  `Filter: (partsupp.ps_supplycost = min)`) but with a 4-relation inner under
+  a 5-relation outer, where Q17's was 2-under-2. Start at `unnestSubquery`'s
+  `outerWidth` splice (the P5.9-f fix) and establish whether the key or the
+  `= min` residual addresses the clone's scope or the outer's; the P5.9-f
+  fixture recipe (`analysis/leftdeep-joins/p59f/README.md`, ~1 s) generalises.
+  Bar: UNITS + SPOT + DS05 + Q2 arms on ONE binary → `tpch-runner -diff`
+  `VERDICT: PASS`.
+- [ ] **P5.9-h** The clause 2/3 timing gap (Q7 2.14×, Q9 3.23×, Q10 3.78×,
+  Q12 2.00×, Q18 2.42×, total 1.36×). DEFERRED until P5.9-g closes: a build
+  whose Q2 is wrong is not a timing baseline, and run 2's OFF total is itself
+  inflated-fast by the wrong Q5 (M0119-0011). Q10 has not moved since run 1
+  (3.83×) and is the natural first bisect. Re-measure both arms rather than
+  re-basing off run 2's numbers.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

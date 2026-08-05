@@ -1,0 +1,27 @@
+digest diff: A=analysis/leftdeep-joins/2026-08-05-p59run2-off.txt B=analysis/leftdeep-joins/2026-08-05-p59run2-on.txt
+  Q1              MATCH        rows=4
+  Q2              ROWS-DIFF    A=455 B=0
+  Q3              MATCH        rows=11521
+  Q4              MATCH        rows=5
+  Q5              VALUE-DIFF   same 5 rows, different tuples (unordered A=783749cf0cf09b4e B=724af4147aec4771)
+  Q6              MATCH        rows=1
+  Q7              MATCH        rows=4
+  Q8              MATCH        rows=2
+  Q9              MATCH        rows=175
+  Q10             MATCH        rows=20501
+  Q11             MATCH        rows=819
+  Q12             MATCH        rows=2
+  Q13             MATCH        rows=35
+  Q14             MATCH        rows=1
+  Q15-CREATEVIEW  MATCH        rows=0
+  Q15a-VIEWBODY   MATCH        rows=10000
+  Q15b-MAIN       MATCH        rows=1
+  Q16             MATCH        rows=18213
+  Q17             MATCH        rows=1
+  Q18             MATCH        rows=10
+  Q19             MATCH        rows=1
+  Q20             MATCH        rows=76
+  Q21             MATCH        rows=405
+  Q22             MATCH        rows=7
+SUMMARY: 22 MATCH, 1 ROWS-DIFF, 1 VALUE-DIFF
+VERDICT: FAIL
