@@ -678,7 +678,15 @@ func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRow
 	if !isProbableInnerScan(entryB.plan) {
 		outerCost, outerRows, innerCost = entryB.pgCost, entryB.rows, entryA.pgCost
 	}
-	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), float64(outRows), indexProbeCost(cp))
+	// innerRows is `inner_path->rows` — for the index probe this arm costs
+	// (one `indexProbeCost` per outer row) that is the PER-PROBE count, which
+	// this DP models as a single matched row, not the probed relation's total.
+	// M0127-P5.9-j moved the `cpu_tuple_cost` charge onto `outer × inner`
+	// tuples processed; passing 1 here keeps this arm's per-outer-row charge
+	// exactly what `outRows` used to buy it whenever the join emits about one
+	// row per outer row, and unlike `outRows` it does not vary with a
+	// downstream cardinality this arm cannot see.
+	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), 1, indexProbeCost(cp))
 }
 
 // bushySeedRowCounts computes the per-relation row count the bushy DP seeds its

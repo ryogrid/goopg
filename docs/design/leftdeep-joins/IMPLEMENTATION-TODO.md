@@ -1412,15 +1412,38 @@
   checksums. **Q47 is the TIMEOUT and is a NEW defect, not this one's
   remainder** — correct 100 rows in 8 m 40 s against 11–13 s flag-OFF; filed
   as P5.9-j.
-- [ ] **P5.9-j** Q47 costs ~40× under the flag (NEW at P5.9-i, 09 §3.7).
-  Uncovered, not caused, by P5.9-i: the query aborted at plan time before it
-  could be timed. Correct answer (100 rows, matching the oracle row count;
-  the oracle carries `ck=n/a` because its LIMIT window saturates), 8 m 40 s
-  timed alone on a freshly restarted SF0.5 server versus 11–13 s on the
-  flag-OFF arm, so it TIMEOUTs the DS05 gate's 300 s bound and keeps clause 4
-  red. Same class as P5.9-h's remainder — a plan the search prefers and should
-  not — and the two should be bisected together rather than separately: start
-  from the ON/OFF plan pair for Q47 in
+- [x] **P5.9-j** Q47 costs ~40× under the flag (NEW at P5.9-i, 09 §3.7).
+  **DONE 2026-08-05 (09 §3.8) — one cost term charged on the wrong tuple
+  count.** Not a search-order defect and not an estimate defect: the 1-row
+  estimate for `{v1,v1_lag}` (four stats-less equalities over CTE scans ⇒ four
+  `DEFAULT_EQ_SEL`s ⇒ 7 193² × 0.005⁴ → clamp 1) is what **PG estimates too**,
+  verified against the oracle on the same data. Reduce the query and the
+  threshold is on ARITY, not on columns: three join keys hash, four fall to a
+  nested loop. At the top pair the hash costs 968.55 and the loop 968.53 — the
+  loop wins by 0.02 because its outer is that 1-row rel, then rescans 7 193
+  inner rows per actual outer row. `final_cost_nestloop` charges
+  `cpu_per_tuple` on `ntuples = outer_path_rows * inner_path_rows`, commented
+  in place as "number of tuples processed (not number emitted!)"; goopg splits
+  that sum, the qual half already rode the cross product, and the
+  `cpu_tuple_cost` half was landing on the join's OUTPUT rows — smallest
+  exactly on the plans the term exists to deter. Fix: `nestloopCost`
+  (`cost_funcs.go`) charges `cpu_tuple_cost * outerRows * innerRows` with PG's
+  one-tuple clamp on each side, and `innerRows` is threaded to the three call
+  sites (`addNestLoopPath` / `addNLIPaths` pass the inner PATH's own count, the
+  legacy bushy NLI-delegation site passes the per-probe 1). The hash and merge
+  siblings are untouched — PG charges those on `hashjointuples` /
+  `mergejointuples`, which really are output counts. Measured: Q47 flag-ON
+  8 m 40 s → **13 s**, ON subset `PASS=6 TIMEOUT=1` → **`PASS=7 TIMEOUT=0`**,
+  OFF subset unchanged with identical checksums. Tests:
+  `internal/planner/nestloop_ntuples_test.go` (5, incl. the clauseless-pair
+  counterweight). NOT fixed and still owed: goopg's CTE scans publish no
+  pathkeys, which is the real reason it cannot reach the free merge PG picks
+  here (375.55, no sort) — P5.4c-ii's; and the 1-row collapse is PG-faithful
+  but still 7 193× off actuals on both arms — §4.1's ratchet.
+  Historical statement of the original 40× report: correct answer (100 rows,
+  matching the oracle row count; the oracle carries `ck=n/a` because its LIMIT
+  window saturates), 8 m 40 s timed alone on a freshly restarted SF0.5 server
+  versus 11–13 s on the flag-OFF arm. ON/OFF plan pair:
   `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-222627.txt`
   (ON) against `plans-20260805-220059.txt` (OFF).
   Historical statement of the original defect follows. Q11, Q31, Q47, Q57, Q58,

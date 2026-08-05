@@ -1,0 +1,25 @@
+# TPC-DS SF0.5 goopg sweep — 2026-08-05T23:19:17+09:00
+# goopg: 04dab910 planner(joinsearch): M0127-P5.9-i — the assertion was right to fire, and the disagreement was the checker's
+# engine-id: aabced41058fa6577a8681f0f80ccdaae8351405 9b06b5433a2c1807361b57dcf6f4cecceb222f7d  diff=48756d65575f
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=c14755ed6ea36584 on-disk=c14755ed6ea36584 (/tmp/goopg-p59j)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on) GOOPG_PGSHAPED_DP=unset(off) GOOPG_PGSHAPED_COLLAPSE=unset(off)
+# SUBSET PROBE (QUERIES=6 30 47 54 58 83 84) — NOT a gate result; the summary below covers only these queries
+Q6   PASS        4s       37 rows  ck=5ab14f7c6fb803d7
+Q30  PASS        0s       31 rows  ck=f47a48499fd7e070
+Q47  PASS       12s      100 rows  ck=n/a
+Q54  PASS       90s        0 rows  ck=1f18d650d205d71d
+Q58  PASS       15s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        3s        3 rows  ck=9504298446f22ddc
+Q84  PASS        3s        6 rows  ck=073898a18264bd8e
+
+=== SUMMARY: PASS=7 (6 ck-verified, 1 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+
+# status-delta: no previous sweep report to diff against (first run, or SF05_SWEEP_BASELINE=none)
+# The status-delta channel is NON-BLOCKING: it never changes this gate's exit status.
+
+# plan-shape: captured /tmp/p59j-ds05-off/plans-20260805-231904.txt (no baseline to diff against yet)
+# The plan channel is NON-BLOCKING: it never changes this gate's exit status.

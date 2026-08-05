@@ -257,9 +257,41 @@ func spillPages(rows float64, ncols int) float64 {
 // row, pay the inner path's per-rescan cost. innerRescanTotal is the cost of one
 // inner scan (one parameterised index probe for an NLI). Cheap for a selective
 // outer side.
-func nestloopCost(cp costParams, outer, inner Cost, outerRows, outputRows, innerRescanTotal float64) Cost {
+//
+// M0127-P5.9-j — the per-tuple CPU charge rides `ntuples`, the number of pairs
+// the loop PROCESSES, not the number it emits. PG is explicit about the
+// distinction at the assignment ("Compute number of tuples processed (not
+// number emitted!)", costsize.c) and then charges the combined
+// `cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple` on it:
+//
+//	ntuples = outer_path_rows * inner_path_rows;
+//	cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
+//	run_cost += cpu_per_tuple * ntuples;
+//
+// goopg splits that sum across two sites — the qual half is the caller's
+// `qualEvalCost(cp, len(quals), outerRows*innerRows)` — and the
+// `cpu_tuple_cost` half was landing on the join's OUTPUT rows instead. That is
+// the one direction the error cannot be tolerated in: a nested loop is chosen
+// precisely when its output is small, so charging the tuple cost on the output
+// makes a cartesian loop over a collapsed estimate look free. Q47's
+// `{v1,v1_lag} ⋈ v1_lead` (three CTE self-scans, four stats-less equalities ⇒
+// the outer sizes to 1 row) priced NL at 968.53 against a hash at 968.55 and
+// won by 0.02, then rescanned 7 193 rows per outer row at runtime: 8 m 40 s
+// against 11–13 s. Charged on `ntuples` the same NL is 1040.45 and the hash
+// wins. The hash and merge siblings are NOT affected — PG charges those on
+// `hashjointuples` / `mergejointuples`, which really are output counts.
+//
+// innerRows is the INNER PATH's own row count (`inner_path->rows`), so for a
+// parameterised NLI inner it is the per-probe count (`ppi_rows`), not the
+// relation's total — the same number the caller's `qualEvalCost` uses.
+func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanTotal float64) Cost {
 	startup := outer.Startup + inner.Startup
-	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*outputRows
+	// PG's clamp sits at the top of final_cost_nestloop and so reaches only
+	// the tuple count, not the rescan term `initial_cost_nestloop` already
+	// accumulated: a zero path row count would otherwise zero the whole
+	// per-tuple charge.
+	ntuples := math.Max(outerRows, 1) * math.Max(innerRows, 1)
+	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*ntuples
 	return Cost{Startup: startup, Total: startup + run}
 }
 

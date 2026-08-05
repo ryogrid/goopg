@@ -534,6 +534,95 @@ should not. It was invisible until now only because the query used to abort
 before it could run, which is the honest form of "P5.9-i uncovered it". Filed
 as **P5.9-j**, ledgered, and it keeps DS05 clause 4 red for run 4.
 
+### 3.8 Q47's 40× was one term charged on the wrong tuple count (P5.9-j, 2026-08-05)
+
+§3.7 left Q47 as the flag-ON arm's only TIMEOUT: correct 100 rows in **8 m
+40 s** against 11–13 s flag-OFF. It is not a search-order defect and not an
+estimate defect — **the estimate is PG-faithful and PG makes the same one.**
+It is a single cost term charged on the wrong number of tuples.
+
+The subject is Q47's `v2`, which self-joins the `v1` CTE three ways on four
+equalities plus an offset (`v1.rn = v1_lead.rn - 1`). Reduced to its skeleton
+the defect is reproducible on SF0.5 in one EXPLAIN, and the reduction is the
+useful part: with **three** join keys the top join is a Hash Join, with
+**four** it becomes a Nested Loop, and *which* columns they are does not
+matter. That is a threshold on a count, which pointed at cost rather than at
+binding — the P5.9-i family this query came from would have been indifferent to
+arity.
+
+Instrumenting `addPathsToJoinrel` at the top pair (`{v1,v1_lag} ⋈ v1_lead`)
+gave the whole answer in two lines:
+
+| | startup | total |
+|---|---|---|
+| hash (build the 1-row side) | 669.68 | **968.55** |
+| plain nested loop | 370.79 | **968.53** |
+
+The loop wins by **0.02** on total and by 300 on startup, so `addPath` drops
+the hash as strictly dominated — correctly, on those numbers. Neither input is
+misjudged: both sides carry 7 193 rows, all four clauses are found and all four
+are keyable (`clauses=4 keys=4 residual=0`).
+
+What makes the loop look free is that its outer is the already-collapsed
+joinrel. Four independent equalities over CTE scans that carry no statistics
+multiply four `DEFAULT_EQ_SEL`s: 7 193² × 0.005⁴ = 0.03, clamped to **1 row**
+(at three keys the same arithmetic gives 6, which is why three keys still hash).
+A one-row outer rescans the inner exactly once, so the loop's rescan term
+vanishes. **PG estimates `rows=1` here too** — verified directly against the
+oracle on the same data — so the collapse is not the bug. PG escapes it by a
+different route: its CTE scan publishes the WindowAgg's ordering as pathkeys, so
+the merge join it picks costs 375.55 with **no sort at all**. goopg's paths
+carry no pathkeys out of a CTE scan (the `generate_mergejoin_paths` gap already
+recorded in [03](03-join-search-pg-dp.md) §5), so its merge arm must pay for two
+sorts and lands at 1393.36 — out of contention, leaving the hash and the loop to
+decide it between them at a margin of 0.02.
+
+The defect is in that margin. `final_cost_nestloop` (`costsize.c`) charges the
+per-tuple CPU on the pairs the loop *walks*, and PG comments the distinction at
+the assignment because it is exactly the one that gets lost:
+
+```c
+/* Compute number of tuples processed (not number emitted!) */
+ntuples = outer_path_rows * inner_path_rows;
+...
+cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
+run_cost += cpu_per_tuple * ntuples;
+```
+
+goopg splits that sum across two sites — the qual half is the caller's
+`qualEvalCost(cp, len(quals), o.Rows*i.Rows)`, already on the cross product —
+and the `cpu_tuple_cost` half was landing on the join's **output** rows inside
+`nestloopCost` (`cost_funcs.go`). The error is invisible almost everywhere,
+because a nested loop is preferred precisely when its output is small: the term
+is smallest on exactly the plans it exists to deter. Here it charged 0.01 × 1
+where PG charges 0.01 × 7 193, and 71.92 of missing cost decided a 0.02 race.
+
+The fix is the one line, plus PG's clamp of either side to one tuple, and
+`innerRows` threaded to the three call sites — `addNestLoopPath` and
+`addNLIPaths` pass the inner PATH's own count (`ppi_rows` for a parameterised
+inner, the same number their `qualEvalCost` already uses), and the legacy
+bushy NLI-delegation site passes 1, the per-probe count its `indexProbeCost`
+rescan term already assumes. **The hash and merge siblings are deliberately
+untouched**: PG charges those on `hashjointuples` / `mergejointuples`, which
+really are output counts, so this is not a symmetric slip.
+
+Measured, SF0.5 subset sweep, both arms, `/tmp` scratch results:
+
+| | before | after |
+|---|---|---|
+| Q47, flag ON | TIMEOUT (>300 s); 8 m 40 s solo | **PASS 13 s**, 100 rows |
+| ON subset (Q6/30/47/54/58/83/84) | `PASS=6 TIMEOUT=1` | **`PASS=7 TIMEOUT=0`** |
+| OFF subset, same seven | `PASS=7` | `PASS=7`, checksums identical |
+
+The top join of Q47 is now a five-key Hash Join on both arms, and the loop
+costs 1040.45 against the hash's 968.55 — the ordering PG's own formula gives.
+
+Two things this did **not** fix, both already on the books. The CTE-scan
+pathkey gap is the real reason goopg cannot reach PG's free merge here, and it
+stays P5.4c-ii's. And the 1-row collapse on stats-less CTE columns is faithful
+to PG but is still a 7 193× error against actuals on both arms; it is the
+§4.1 parity ratchet's subject, not this one's.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

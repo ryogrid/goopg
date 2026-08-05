@@ -8259,19 +8259,57 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `psql -p 65437 -f .../query47.sql` reproducer) survives verbatim in
       IMPLEMENTATION-TODO under P5.9-j and in 09 §3.5; run-3 evidence is
       `analysis/leftdeep-joins/2026-08-05-p59run3-ds05-on.txt`.
-- [ ] **M0127-P5.9-j — Q47 costs ~40× under the flag.** NEW at P5.9-i
-      (09 §3.7). Uncovered, not caused, by it: Q47 aborted at plan time before
-      it could ever be timed. Under `GOOPG_PGSHAPED_DP=1` it now returns the
-      correct 100 rows (oracle row count; the oracle's `ck` is `n/a` because
-      its LIMIT window saturates) in **8 m 40 s** timed alone on a freshly
-      restarted SF0.5 server, versus **11–13 s** on the flag-OFF arm
-      (`sweep-20260805-1{74711,92044}.txt`). It therefore TIMEOUTs the DS05
-      gate's 300 s bound and keeps clause 4 red for run 4. Same class as
-      P5.9-h's remainder — a plan the search prefers and should not — and the
-      two are worth bisecting together. Start from the ON/OFF plan pair for
-      Q47: `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-222627.txt`
-      (ON) against `plans-20260805-220059.txt` (OFF).
-      09 §3.7; IMPLEMENTATION-TODO P5.9-j.
+- [x] **M0127-P5.9-j — Q47 costs ~40× under the flag.** **DONE 2026-08-05
+      (09 §3.8) — one cost term charged on the wrong tuple count, and the
+      estimate everyone would have blamed is PG-faithful.** Uncovered, not
+      caused, by P5.9-i: Q47 aborted at plan time before it could ever be
+      timed. Reducing the query localised it to ARITY, not to columns — the
+      top join of `v2` hash-joins on three keys and falls to a nested loop on
+      four, whichever columns they are. Instrumented at the pair
+      `{v1,v1_lag} ⋈ v1_lead`: hash 968.55, plain nested loop **968.53**, so
+      `addPath` drops the hash as dominated, correctly, on those numbers. The
+      loop looks free because its outer is a joinrel collapsed to **1 row** —
+      four independent equalities over CTE scans with no statistics multiply
+      four `DEFAULT_EQ_SEL`s, 7 193² × 0.005⁴ → clamp 1 (at three keys the same
+      arithmetic gives 6, which is the whole threshold) — and **PG estimates
+      `rows=1` here too**, verified against the 65438 oracle on the same data.
+      PG escapes by a route goopg does not have: its CTE scan publishes the
+      WindowAgg's ordering as pathkeys, so PG's merge costs 375.55 with NO
+      sort, while goopg's merge must sort twice and lands at 1393.36 — out of
+      contention, leaving hash and loop to decide it at a margin of 0.02.
+      The defect is in that margin. `final_cost_nestloop` charges
+      `cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple` on
+      `ntuples = outer_path_rows * inner_path_rows`, which PG comments in place
+      as "number of tuples processed (not number emitted!)". goopg splits the
+      sum across two sites — the qual half is the caller's `qualEvalCost`, on
+      the cross product already — and the `cpu_tuple_cost` half was landing on
+      the join's OUTPUT rows: an error that is smallest exactly on the plans
+      the term exists to deter, since a nested loop is preferred when its
+      output is small. It charged 0.01 × 1 where PG charges 0.01 × 7 193, and
+      the missing 71.92 decided a 0.02 race.
+      Fix: `nestloopCost` (`internal/planner/cost_funcs.go`) charges
+      `cpuTupleCost * outerRows * innerRows` with PG's one-tuple clamp per
+      side, and `innerRows` is threaded to the three call sites —
+      `addNestLoopPath` (pathgen.go) and `addNLIPaths` (joinpathsnli.go) pass
+      the inner PATH's own count, which for a parameterised inner is `ppi_rows`
+      and is the same number their `qualEvalCost` already uses; the legacy
+      bushy NLI-delegation site (bushy.go) passes the per-probe 1 its
+      `indexProbeCost` rescan term already assumes. The hash and merge siblings
+      are deliberately UNTOUCHED: PG charges those on `hashjointuples` /
+      `mergejointuples`, which really are output counts.
+      Measured (SF0.5 subset sweep, both arms): Q47 flag-ON 8 m 40 s → **13 s**
+      with the correct 100 rows; ON subset (Q6/30/47/54/58/83/84)
+      `PASS=6 TIMEOUT=1` → **`PASS=7 MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`**; OFF subset unchanged, checksums identical. Q47's top join
+      is now a five-key Hash Join on both arms.
+      Files: `internal/planner/cost_funcs.go`, `pathgen.go`,
+      `joinpathsnli.go`, `bushy.go`,
+      `internal/planner/nestloop_ntuples_test.go` (new, 5 tests).
+      **Two gaps this did NOT close, both ledgered:** goopg's CTE scans publish
+      no pathkeys, which is the real reason it cannot reach PG's free merge
+      (P5.4c-ii's `generate_mergejoin_paths`); and the 1-row collapse, while
+      PG-faithful, is still ~7 193× off actuals on both arms (§4.1's ratchet).
+      09 §3.8; IMPLEMENTATION-TODO P5.9-j.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =

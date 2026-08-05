@@ -111,7 +111,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinRel.Rows, i.Cost.Total)
+	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, i.Cost.Total)
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:     PathNestLoop,

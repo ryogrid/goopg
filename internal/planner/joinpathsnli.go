@@ -233,7 +233,7 @@ func addNLIPaths(joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*re
 		// is the whole reason PG re-costs the pair here instead of in the
 		// plain-NL arm, where the inner's unparameterised total would be
 		// charged per outer row.
-		cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinrel.Rows, i.Cost.Total)
+		cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, i.Cost.Total)
 		cost.Total += qualEvalCost(cp, len(residual), o.Rows*i.Rows)
 		addPath(joinrel, &Path{
 			Kind:     PathNestLoop,
