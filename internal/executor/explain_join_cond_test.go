@@ -79,6 +79,82 @@ func TestExplainRendersMultiColumnHashCond(t *testing.T) {
 	}
 }
 
+// TestExplainRendersJoinFilterResidual pins M0127-P5.9-o. `Hash Cond:`
+// (P2.1) made the join's KEY visible; the conjuncts the key does not
+// enforce stayed invisible, so `ON jl.a = jr.a AND jl.v < jr.w` printed
+// a plan in which the second conjunct appeared nowhere — the rows were
+// right, but nothing in the text said the join re-checks anything.
+//
+// Both the label and the slot are upstream's: ExplainNode prints
+// show_upper_qual(join.joinqual, "Join Filter") immediately after the
+// Cond line for T_HashJoin / T_MergeJoin / T_NestLoop
+// (postgres/src/backend/commands/explain.c). Verified against PostgreSQL
+// 18.3 (throwaway 5533 cluster, same DDL, enable_mergejoin/nestloop off):
+//
+//	Hash Join
+//	  Hash Cond: (jl.a = jr.a)
+//	  Join Filter: (jl.v < jr.w)
+//
+// goopg now emits those two lines byte-for-byte.
+func TestExplainRendersJoinFilterResidual(t *testing.T) {
+	ctx, cleanup := joinCondFixture(t)
+	defer cleanup()
+
+	lines := runExplainRows(t, ctx,
+		"EXPLAIN (COSTS OFF) SELECT jl.v FROM jl JOIN jr ON jl.a = jr.a AND jl.v < jr.w")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Hash Join") {
+		t.Skipf("planner did not pick a hash join; got:\n%s", joined)
+	}
+	if got := condLine(t, joined, "Hash Cond: "); got != "(jl.a = jr.a)" {
+		t.Errorf("Hash Cond = %q, want %q\nplan:\n%s", got, "(jl.a = jr.a)", joined)
+	}
+	if got := condLine(t, joined, "Join Filter: "); got != "(jl.v < jr.w)" {
+		t.Errorf("Join Filter = %q, want %q (PG 18.3's line)\nplan:\n%s",
+			got, "(jl.v < jr.w)", joined)
+	}
+	// Slot order is part of the parity: Cond first, residual second.
+	if strings.Index(joined, "Hash Cond:") > strings.Index(joined, "Join Filter:") {
+		t.Errorf("Join Filter printed above Hash Cond; explain.c emits it after:\n%s", joined)
+	}
+	// Two residual conjuncts render as make_ands_explicit's chain, the
+	// same shape the multi-pair Hash Cond uses. PG 18.3 prints
+	// `Join Filter: ((jl.v < jr.w) AND (jl.b <> jr.b))`.
+	lines = runExplainRows(t, ctx,
+		"EXPLAIN (COSTS OFF) SELECT jl.v FROM jl JOIN jr ON jl.a = jr.a AND jl.v < jr.w AND jl.b <> jr.b")
+	joined = strings.Join(lines, "\n")
+	if got := condLine(t, joined, "Join Filter: "); got != "((jl.v < jr.w) AND (jl.b <> jr.b))" {
+		t.Errorf("two-conjunct Join Filter = %q, want %q\nplan:\n%s",
+			got, "((jl.v < jr.w) AND (jl.b <> jr.b))", joined)
+	}
+}
+
+// TestExplainNoJoinFilterWhenKeysCoverThePredicate is the other half of
+// the rule, and the one that keeps the new line honest: every conjunct
+// must print exactly ONCE. `create_hashjoin_plan` builds joinqual as
+// `list_difference(joinclauses, hashclauses)` (createplan.c), so an
+// all-equijoin join has an empty joinqual and PG prints no Join Filter
+// line at all — verified on 18.3 for this exact two-key query.
+//
+// goopg derives the same split from `ExecHashKeyPlan`, the method the
+// EXECUTOR uses to decide what it re-checks per match; a residual that
+// printed here but was not evaluated (or vice versa) would reintroduce
+// the disagreement the line exists to expose.
+func TestExplainNoJoinFilterWhenKeysCoverThePredicate(t *testing.T) {
+	ctx, cleanup := joinCondFixture(t)
+	defer cleanup()
+
+	lines := runExplainRows(t, ctx,
+		"EXPLAIN (COSTS OFF) SELECT jl.v FROM jl JOIN jr ON jl.a = jr.a AND jl.b = jr.b")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Hash Join") {
+		t.Skipf("planner did not pick a hash join; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "Join Filter") {
+		t.Errorf("all-equijoin join printed a residual it does not evaluate:\n%s", joined)
+	}
+}
+
 // TestExplainNoHashCondForNestedLoop — a join with no usable equality
 // must not grow a condition line out of nowhere.
 func TestExplainNoHashCondForNestedLoop(t *testing.T) {

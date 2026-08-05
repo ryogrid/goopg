@@ -3,8 +3,6 @@ package executor
 import (
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/planner"
 )
 
 // M0125-0039 — EXPLAIN printed column references unqualified, so a real
@@ -67,39 +65,36 @@ func TestExplainQualifiesUpperQualOnSelfJoin(t *testing.T) {
 	}
 }
 
-// TestExplainQualifiesUpperFilter: a Filter that survives above a join is an
+// TestExplainQualifiesUpperFilter: a qual that survives ON a join node is an
 // upper qual (show_upper_qual), so its column references carry the alias.
 //
-// M0127-P5.9 pinned this to the legacy enumerator, and the reason is worth
-// stating because it is NOT "the new plan is wrong".
+// M0127-P5.9 pinned this to the legacy enumerator and P5.9-o unpins it, which
+// is worth spelling out because the pin was never "the new plan is wrong".
 //
-// `a.st = 'x'` names one relation, so the PG-shaped search pushes it down to
-// the scan — which is what upstream does. Once it is a SCAN qual, upstream's
-// `show_scan_qual` (explain.c:2540) deparses it with
-// `useprefix = (IsA(SubqueryScan) || es->verbose)`, i.e. UNQUALIFIED. So the
-// searched arm's `Filter: (st = 'x')` is PG-faithful, and asserting a prefix
-// on it would assert the opposite of PostgreSQL.
+// The original fixture's `a.st = 'x'` names ONE relation, so the PG-shaped
+// search pushes it down to the scan — what upstream does. Once it is a SCAN
+// qual, upstream's `show_scan_qual` (explain.c:2540) deparses it with
+// `useprefix = (IsA(SubqueryScan) || es->verbose)`, i.e. UNQUALIFIED, so
+// asserting a prefix on the searched arm's `Filter: (st = 'x')` would have
+// asserted the opposite of PostgreSQL. The repair — a conjunct spanning both
+// relations, which no scan can absorb — was unavailable only because goopg
+// printed no `Join Filter:` line for a join's residual.
 //
-// The obvious repair — a conjunct spanning both relations, which cannot be
-// pushed into either scan — does not work either, and for a reason that is a
-// separate gap: goopg prints no `Join Filter:` line at all for a hash join's
-// residual qual, on EITHER arm, so the predicate the test wants to read is
-// simply not in the output. Both arms compute the right rows; only the line is
-// missing. Deferral ledger row 2026-08-06 (M0127-P5.9). Until that lands there
-// is no searched-arm shape that exercises `show_upper_qual`'s prefixing on
-// this fixture, so the test stays on the arm that has one.
+// P5.9-o prints it, so the fixture is now that cross-relation shape and the
+// test runs on the DEFAULT enumerator. `Join Filter` is emitted through the
+// same `es->rtable_size > 1` rule as `Hash Cond`, which is exactly the
+// prefixing decision under test here. PG 18.3 prints
+// `Join Filter: (a.st < b.st)` for this query.
 func TestExplainQualifiesUpperFilter(t *testing.T) {
-	prev := planner.SetPGShapedJoinSearch(false)
-	defer planner.SetPGShapedJoinSearch(prev)
 	lines := qualifyExplainLines(t,
-		"EXPLAIN SELECT a.id FROM eq_r a, eq_r b WHERE a.id = b.id AND a.st = 'x'")
+		"EXPLAIN SELECT a.id FROM eq_r a, eq_r b WHERE a.id = b.id AND a.st < b.st")
 
-	got := findLine(lines, "Filter:")
+	got := findLine(lines, "Join Filter:")
 	if got == "" {
-		t.Fatalf("no Filter line in plan:\n%s", strings.Join(lines, "\n"))
+		t.Fatalf("no Join Filter line in plan:\n%s", strings.Join(lines, "\n"))
 	}
-	if !strings.Contains(got, "a.st") {
-		t.Errorf("upper Filter left its column unqualified: %q\nplan:\n%s",
+	if !strings.Contains(got, "a.st") || !strings.Contains(got, "b.st") {
+		t.Errorf("upper qual left a column unqualified: %q\nplan:\n%s",
 			got, strings.Join(lines, "\n"))
 	}
 }

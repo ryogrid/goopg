@@ -1,49 +1,47 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-q CLOSED** (09 §3.16) — the gates' `planner-flags:`
-provenance stamp is now GENERATED from the Go defaults it names, after the same
-hand-written `unset(off)` label outlived two default flips (M0125-0005,
-M0127-P5.9) and mis-stamped the acceptance run of the second one.
+Last loop: **M0127-P5.9-o CLOSED** (09 §3.17) — EXPLAIN prints a join's
+RESIDUAL qual as PG's `Join Filter:` line. Before this, `ON jl.a = jr.a AND
+jl.v < jr.w` showed the key as `Hash Cond:` and the second conjunct **nowhere
+in the plan text**, on either arm — the same blind spot `Hash Cond:` closed at
+P2.1, stopping one conjunct short.
 
-Chain: `internal/planner/flaglabels.go` (each label computed by the SAME
-resolver production uses at process start) → `cmd/gen-planner-flag-labels` →
-`scripts/planner-flags.env` (generated, checked in — a gate host needs no Go) →
-`scripts/planner-flags.sh: planner_flags_body`, sourced by BOTH
-`tpcds-sf05-regression.sh` and `tpch-spotcheck.sh`. Several `FromEnv` helpers
-were factored out of their `init()` so nothing restates a default.
+`formatJoinFilter` (`internal/executor/operators_explain.go`) emits it in
+upstream's slot (after `Hash Cond:`/`Merge Cond:`, before the node's own
+`Filter:` — `ExplainNode`'s order for all three join arms) and gets the split
+from `ExecHashKeyPlan`/`ExecMergeKeyPlan`, **the same methods the executor
+uses** to decide what it re-checks per match (upstream's own
+`list_difference(joinclauses, hashclauses)`). Consequence worth keeping: every
+conjunct prints exactly once — in the Cond line if a key enforces it, as
+`Join Filter` otherwise. Nested loop has no key list ⇒ whole Predicate.
 
-Four guards (`internal/planner/flaglabels_test.go`), two verified by NEGATIVE
-probe: checked-in env file == what the defaults render (the stated bar; probe:
-flipping `pgShapedCollapseFromEnv` fails it); every `unset(<tok>)` round-trips
-through the flag's own parser; every `os.Getenv("GOOPG_*")` in the package is
-stamped or exempt with a reason (probe: a scratch flag fails it); neither gate
-may hand-write `unset(`.
+Verified byte-for-byte against a throwaway PostgreSQL 18.3 cluster
+(`initdb` → :5533, removed afterwards) on four shapes: one residual conjunct;
+two, as `((jl.v < jr.w) AND (jl.b <> jr.b))`; all-equijoin two-key, where PG
+prints **no** line; merge join.
 
-Coverage guard's first finding: the stamp named **6** flags, the planner reads
-**12**. EXISTS_TO_ANY / UNNEST_PREDP / INDEXKEY_HARVEST / NLI_COSTGATE /
-HASH_OUTER_JOIN / MHJ_PACKING_OFF were in no artefact ever captured, and
-`tpch-spotcheck` — the gate every planner commit pays — named no enumerator
-flag at all. The 6 pre-existing labels are byte-identical, so the capture
-corpus stays comparable.
+`TestExplainQualifiesUpperFilter` is unpinned back onto the DEFAULT enumerator
+(the pin existed only because the cross-relation residual — the one shape a
+searched arm leaves at the join node — had no line). New:
+`TestExplainRendersJoinFilterResidual`,
+`TestExplainNoJoinFilterWhenKeysCoverThePredicate`.
 
-The plan channel reproduced the hazard live: its DEFAULT baseline picked the
-fixed-binary **OFF** arm and printed `same=13 changed=86` (an exact replication
-of §3.15's flip blast radius) — only the header says which arm that was.
+**Read the next plan diff with this in mind:** every captured plan whose join
+carries a non-key conjunct grows one line, so the SF0.5 **plan channel** will
+report those queries `changed` with no planner change behind it; `make
+plan-diff` (vs PG) should move the other way. 1 ledger row, 3 deferrals.
 
 NEXT LOOP (subject to the fix_plan `## Current Priority` banner, which wins):
-M0127-P5.9 successors remain — **-m** (collapse-ON acceptance pass, gates the
-COLLAPSE flip; it runs the SF0.5 sweep this loop deferred), **-o** (EXPLAIN
-prints no `Join Filter:` line), **-p** (searched-arm batch-growth fixture).
+M0127-P5.9 successors — **-m** (collapse-ON acceptance pass, gates the COLLAPSE
+flip; it runs the ~28 min SF0.5 sweep two loops have now deferred to it) and
+**-p** (searched-arm batch-growth fixture).
 
-Nightly triage: tonight's action-items file is the SAME run (20260806-011323)
-the previous loop already filed as an M-NIGHTLY harness item (14 of its 18 AI
-items are phantom testport regressions from one compile error in a dirty-tree
-build). Nothing new to file.
+Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323, already
+filed as an M-NIGHTLY harness item. Nothing new.
 
-Gates run: `go build ./...`; `go vet ./internal/planner ./cmd/gen-planner-flag-labels`;
-`bash -n` on all three scripts; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` **PASS**
-(Q12=2, Q13=35); SF0.5 **plan channel** `queries=99 same=99 changed=0` vs the
-ON-arm baseline; pgbench smoke via the commit hook; `make ralph-state-guard`.
+Gates run: `go build ./...`; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (no FAIL lines);
+`scripts/tpch-spotcheck.sh` **PASS** (Q12=2, Q13=35, 28.3 s query phase);
+pgbench smoke via the commit hook; `make ralph-state-guard`.
 
 In-flight: none.

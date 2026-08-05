@@ -586,6 +586,20 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + label + cond)})
 		}
+		// M0127-P5.9-o: the join's RESIDUAL qual — upstream's
+		// `join.joinqual`, printed as `Join Filter:` immediately after the
+		// Cond line and before the node's own `Filter:`
+		// (explain.c:ExplainNode, T_NestLoop / T_MergeJoin / T_HashJoin all
+		// call show_upper_qual(joinqual, "Join Filter", …) in that slot).
+		//
+		// Before this, `… ON a.id = b.id AND a.st < b.st` printed its second
+		// conjunct NOWHERE: the hash key showed up as `Hash Cond:` and the
+		// conjunct the executor re-checks per match was invisible, so a plan
+		// could not be read against PG's output for the same query — the
+		// same class of blind spot `Hash Cond:` itself closed at P2.1.
+		if jf := formatJoinFilter(p, reg, qualify); jf != "" {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
+		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -664,6 +678,40 @@ func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
 		return parts[0]
 	}
 	return "(" + strings.Join(parts, " AND ") + ")"
+}
+
+// formatJoinFilter renders the conjuncts of a join's Predicate that the
+// Cond line above it does NOT already account for — upstream's
+// `join.joinqual`, which `create_hashjoin_plan` builds as
+// `list_difference(joinclauses, hashclauses)` (createplan.c) and
+// `ExplainNode` prints as `Join Filter:`.
+//
+// The split is asked of the planner rather than recomputed here, and from the
+// SAME method the executor uses to decide what it re-checks per match
+// (`ExecHashKeyPlan` / `ExecMergeKeyPlan`, join_exec_keys.go). That is the
+// point: a residual EXPLAIN derived independently could disagree with the one
+// the executor evaluates, which is precisely the invisibility this line
+// exists to remove. Every conjunct therefore prints exactly once — as part of
+// the Cond line if a key enforces it, as Join Filter otherwise.
+//
+// Nested loop has no key list, so its whole Predicate is the residual; that
+// matches upstream, where a NestLoop's joinqual is the full set of join
+// clauses the inner index scan did not consume.
+func formatJoinFilter(p *planner.Join, reg *subPlanReg, qualify bool) string {
+	if p == nil || p.Predicate == nil {
+		return ""
+	}
+	residual := p.Predicate
+	switch p.Algo {
+	case planner.JoinAlgoHash:
+		residual = p.ExecHashKeyPlan().Residual
+	case planner.JoinAlgoMerge:
+		residual = p.ExecMergeKeyPlan().Residual
+	}
+	if residual == nil {
+		return ""
+	}
+	return wrapParen(formatExprQual(residual, reg, qualify))
 }
 
 // formatIndexCond renders the equality / range condition of an

@@ -1646,6 +1646,30 @@
   comparable; the line grows to the right. Ledgered: the registry covers
   `internal/planner` only, so executor kill-switches (`GOOPG_HASHED_SUBPLAN`)
   re-open the same hole one layer down.
+- [x] **P5.9-o** EXPLAIN printed no `Join Filter:` line (NEW at P5.9, 09 §3.14).
+  **DONE 2026-08-06 (09 §3.17).** `Hash Cond:` (P2.1) made the join's KEY
+  visible and stopped one conjunct short: `ON jl.a = jr.a AND jl.v < jr.w`
+  printed the second conjunct **nowhere**, on either arm, so the conjunct the
+  executor re-checks per candidate match could not be read against PG's output
+  for the same query. `formatJoinFilter`
+  (`internal/executor/operators_explain.go`) emits it in upstream's slot —
+  after `Hash Cond:`/`Merge Cond:`, before the node's own `Filter:`, the order
+  `ExplainNode` uses for T_HashJoin / T_MergeJoin / T_NestLoop alike — and asks
+  `ExecHashKeyPlan`/`ExecMergeKeyPlan` for the split, i.e. **the same methods
+  the executor uses** to decide what it re-checks. `joinqual` is
+  `list_difference(joinclauses, hashclauses)` upstream (`createplan.c`), which
+  is the same subtraction; the property that follows is that every conjunct
+  prints exactly ONCE, and a residual that printed but was not evaluated would
+  be the same invisibility mirrored. Byte-verified against a throwaway
+  PostgreSQL 18.3 cluster on four shapes (one conjunct; two, as
+  `((jl.v < jr.w) AND (jl.b <> jr.b))`; all-equijoin two-key, where PG prints
+  no line at all; merge join). Unpins `TestExplainQualifiesUpperFilter` back
+  onto the DEFAULT enumerator — the pin existed because the only shape a search
+  arm leaves at the join node is the cross-relation residual, and that line did
+  not exist. Ledgered: ANALYZE's `Rows Removed by …` counters (goopg emits none
+  anywhere), the structured formats (no qual properties at all), and
+  `NestedLoopIndexJoin`'s mixed-provenance `Predicate`, which keeps `Filter:`
+  deliberately.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

@@ -2875,3 +2875,86 @@ exactly, which is a clean independent replication of the flip's blast radius and
 would have been a terrifying false regression for anyone who read the number
 without opening the header. That is the whole argument for this task in one
 command: the header is what makes a diff attributable, so it has to be true.
+
+### 3.17 `Join Filter:` — the conjunct that was in no line (P5.9-o, 2026-08-06)
+
+§3.14 filed three residues rather than fixing them. This closes the first:
+goopg printed **no `Join Filter:` line at all**, so for
+
+```sql
+SELECT jl.v FROM jl JOIN jr ON jl.a = jr.a AND jl.v < jr.w
+```
+
+the second conjunct appeared **nowhere in the plan text**. The key printed as
+`Hash Cond:` (P2.1) and the conjunct the executor re-checks once per candidate
+match was invisible on both arms. The rows were always right; what was missing
+was the ability to read the plan against PostgreSQL's own output for the same
+query — the exact reading P2.1 built `Hash Cond:` to restore, stopping one
+conjunct short.
+
+**Upstream's rule, and where it lives.** `ExplainNode` prints
+`show_upper_qual(join.joinqual, "Join Filter", …)` immediately after the Cond
+line, identically for `T_HashJoin`, `T_MergeJoin` and `T_NestLoop`
+(`postgres/src/backend/commands/explain.c`). `joinqual` is not a separate
+planner concept: `create_hashjoin_plan` builds it as
+`list_difference(joinclauses, hashclauses)` (`createplan.c`) — the join's quals
+**minus** whatever the key list already enforces. A nested loop has no key
+list, so its whole qual set is the residual.
+
+**Why the split is asked of the planner rather than recomputed.**
+`formatJoinFilter` (`internal/executor/operators_explain.go`) calls
+`ExecHashKeyPlan` / `ExecMergeKeyPlan` — *the same methods the executor uses*
+to decide what it re-checks per match (`join_exec_keys.go`, P2.2/P2.3). An
+EXPLAIN that derived the residual independently could disagree with the one
+actually evaluated, which is precisely the invisibility this line exists to
+remove. The consequence is the property worth stating: **every conjunct prints
+exactly once** — inside the Cond line when a key enforces it, as `Join Filter`
+when it does not.
+
+**Verified against PostgreSQL 18.3, not against a reading of explain.c.** A
+throwaway 18.3 cluster (`initdb` → :5533, same DDL, `enable_mergejoin`/
+`enable_nestloop` off to pin the operator) produced these, and goopg's text is
+byte-identical on all four:
+
+| shape | PG 18.3 / goopg |
+|---|---|
+| one residual conjunct | `Hash Cond: (jl.a = jr.a)` + `Join Filter: (jl.v < jr.w)` |
+| two residual conjuncts | `Join Filter: ((jl.v < jr.w) AND (jl.b <> jr.b))` |
+| all-equijoin two-key | `Hash Cond: ((jl.a = jr.a) AND (jl.b = jr.b))`, **no** Join Filter line |
+| merge join | `Merge Cond: (a.id = b.id)` + `Join Filter: (a.st < b.st)` |
+
+(PG's nested-loop arm prints the whole conjunction —
+`Join Filter: ((a.st < b.st) AND (a.id = b.id))` — which is what goopg's
+no-key-list branch emits too.)
+
+**What it unpins.** `TestExplainQualifiesUpperFilter` was pinned to the legacy
+enumerator by §3.14 and is now back on the **default** arm. The pin was never
+"the new plan is wrong": its fixture's `a.st = 'x'` names one relation, the
+searched arm pushes it to the scan as upstream does, and `show_scan_qual`
+deparses a scan qual **unqualified** — so asserting a prefix there would have
+asserted the opposite of PostgreSQL. The repair (a conjunct spanning both
+relations, which no scan can absorb) was unavailable only because the line did
+not exist. It exists now, it is emitted through the same `es->rtable_size > 1`
+rule as `Hash Cond`, and that rule is what the test asserts.
+
+Two new tests hold the pair: `TestExplainRendersJoinFilterResidual` (the line,
+its text, its two-conjunct AND chain, and its slot *after* the Cond line) and
+`TestExplainNoJoinFilterWhenKeysCoverThePredicate` (the all-equijoin case
+prints nothing — the half that keeps "exactly once" honest, since a residual
+that printed but was not evaluated is the same defect mirrored).
+
+**Blast radius, stated so the next plan diff is attributable.** Every captured
+plan whose join carries a non-key conjunct grows one line. The SF0.5 **plan
+channel** compares goopg text to a previous goopg capture, so its next run will
+report those queries as `changed` with no planner change behind it; the
+`make plan-diff` channel compares against PG and should move the other way.
+Neither is a regression, and this paragraph is the header to read it by — the
+lesson §3.16 was filed for.
+
+**Still deferred** (ledger rows, 2026-08-06): the ANALYZE counters
+`Rows Removed by Join Filter` / `by Filter` (goopg emits no `Rows Removed by …`
+line at all), the structured formats (`FORMAT JSON`/`XML`/`YAML` carry no qual
+properties whatsoever — not `Join Filter`, not `Hash Cond`, not `Filter`), and
+`NestedLoopIndexJoin`'s residual, which keeps its `Filter:` label because its
+`Predicate` mixes hoisted inner scan filters with join residuals and would be
+*less* faithful relabelled wholesale.

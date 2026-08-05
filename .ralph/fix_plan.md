@@ -8169,21 +8169,33 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       the flip apart from the default and the trace channel. A non-zero
       MISMATCH/CKMISMATCH is a flip-owned correctness regression and reopens
       P5.9. Bar: DS05 SF0.5 gate green on a quiet host.
-- [ ] **M0127-P5.9-o — EXPLAIN prints no `Join Filter:` line.** NEW 2026-08-06,
-      found while re-pointing `TestExplainQualifiesUpperFilter` (09 §3.14).
-      goopg prints a hash join's `Hash Cond:` but never its RESIDUAL qual: for
-      `… WHERE a.id = b.id AND a.st < b.st` the second conjunct appears nowhere
-      in the plan text, on EITHER arm. The rows are right — both arms compute
-      the same, correct answer — so this is a diagnostic gap, not a
-      correctness one, and it predates the flip; the flip only made it load
-      bearing, because a single-relation qual now pushes down to the scan (as
-      upstream does) and the join-node residual is the only upper-qual shape
-      left to assert `show_upper_qual`'s prefixing on. PG emits it from
-      `show_upper_qual` with `useprefix = es->rtable_size > 1`
-      (`postgres/src/backend/commands/explain.c:2554`). Files:
-      `internal/executor/operators_explain.go`; unpins
-      `TestExplainQualifiesUpperFilter`. Bar: UNITS + a plan-text diff against
-      PG 18.3 on the two-relation residual shape.
+- [x] **M0127-P5.9-o — EXPLAIN prints no `Join Filter:` line.** **DONE
+      2026-08-06** (09 §3.17). It does now: `formatJoinFilter`
+      (`internal/executor/operators_explain.go`) emits the join's residual in
+      upstream's slot — after `Hash Cond:`/`Merge Cond:`, before the node's own
+      `Filter:`, which is how `ExplainNode` orders all three join arms
+      (`postgres/src/backend/commands/explain.c`) — and derives the residual
+      from `ExecHashKeyPlan`/`ExecMergeKeyPlan`, **the same methods the
+      executor uses** to decide what it re-checks per match. So every conjunct
+      prints exactly once: inside the Cond line when a key enforces it, as
+      `Join Filter` when it does not. Nested loop has no key list, so its whole
+      Predicate is the residual — as upstream's joinqual is. Verified
+      byte-for-byte against a throwaway PostgreSQL 18.3 cluster (`initdb` →
+      :5533) on four shapes: one residual conjunct, two AND-ed
+      (`((jl.v < jr.w) AND (jl.b <> jr.b))`), all-equijoin two-key (PG prints
+      **no** line; `list_difference(joinclauses, hashclauses)` is empty), and
+      merge join. `TestExplainQualifiesUpperFilter` is unpinned back onto the
+      DEFAULT enumerator with the cross-relation fixture the line makes
+      possible; `TestExplainRendersJoinFilterResidual` and
+      `TestExplainNoJoinFilterWhenKeysCoverThePredicate` are new. Gates: full
+      units, `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35), pgbench smoke.
+      **Read the next plan diff with this in mind:** every captured plan whose
+      join carries a non-key conjunct grows one line, so the SF0.5 plan channel
+      will report those queries `changed` with no planner change behind it.
+      3 deferrals in one ledger row (ANALYZE's `Rows Removed by …` counters —
+      goopg emits none anywhere; the structured formats, which carry no qual
+      properties at all; and `NestedLoopIndexJoin`'s mixed-provenance
+      `Predicate`, which keeps `Filter:` deliberately).
 - [ ] **M0127-P5.9-p — the hash-join batch-growth path has no searched-arm
       fixture.** NEW 2026-08-06 (09 §3.14). nbatch GROWS only when the plan
       under-estimates its build side, and
