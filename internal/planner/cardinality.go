@@ -177,10 +177,16 @@ func filterSelectivity(f *Filter) float64 {
 // estimateSetOp mirrors upstream's output-row rules
 // (prepunion.c:1146-1151): EXCEPT keeps the left input's count,
 // INTERSECT the smaller input's, UNION ALL the sum. For the
-// non-ALL forms upstream runs estimate_num_groups on the input;
-// goopg has no group estimator yet (the 0077 line), so the
-// dedup is approximated as /2 — the same convention
-// estimateAggregate already uses for multi-column GROUP BY.
+// non-ALL forms upstream runs estimate_num_groups on the input
+// (prepunion.c `estimate_size`), and the dedup here is still
+// approximated as /2.
+//
+// M0127-P5.6-f-vii built that estimator — `estimateNumGroups`
+// below — but wiring it here needs the set-op's output columns
+// expressed as grouping expressions over EACH input, which this
+// node does not carry. Ledgered as `estimate-num-groups setop-dedup`
+// rather than folded in: the sweep that measures the aggregate
+// change must not also be measuring a set-op change.
 func estimateSetOp(s *SetOp) int64 {
 	l := EstimateRows(s.Left)
 	r := EstimateRows(s.Right)
@@ -902,28 +908,326 @@ func joinResidualSelectivity(j *Join) float64 {
 	return sel
 }
 
-// estimateAggregate returns the group count. With a single
-// ColumnRef GROUP BY against a stats-bearing table, that's the
-// column's NDistinct. Otherwise child / 2 — conservative.
+// groupVarKey identifies one grouping variable for the duplicate check.
+//
+// The relation half is the LEAF SCAN NODE, not the `*catalog.Table`, for the
+// reason `baseColumnRef.scan` documents: a self-join puts one table pointer
+// behind two scans, and `GROUP BY n1.name, n2.name` is two variables of two
+// relations, not one repeated variable.
+type groupVarKey struct {
+	rel Node
+	col string
+	// idx distinguishes variables that resolved to no base relation; their
+	// only identity is the coordinate they occupy in the child's schema.
+	idx int
+}
+
+// groupVarInfo is upstream's GroupVarInfo (selfuncs.c:3310) minus `isdefault`,
+// which only feeds the SELFLAG_USED_DEFAULT bit no goopg caller reads yet.
+type groupVarInfo struct {
+	// rel is the leaf scan the variable resolved to, nil when it resolved to
+	// no base relation. A nil-rel variable skips the per-relation clamp
+	// (there is no `rel->tuples` to clamp against) and multiplies straight
+	// into the total, bounded only by the closing input-rows clamp.
+	rel       Node
+	ndistinct float64
+	// rawRows is the relation's unfiltered tuple count — upstream's
+	// `rel->tuples`, the clamp denominator.
+	rawRows float64
+}
+
+// estimateAggregate returns the group count via `estimateNumGroups`.
+//
+// M0127-P5.6-f-vii. What stood here was `child / 2` for anything but a
+// single-ColumnRef GROUP BY, and the single-key arm returned the column's
+// NDistinct with NO clamp to the input row count. Both halves were wrong in
+// the same direction on the TPC-DS corpus: `/2` makes a two-key GROUP BY over
+// a wide join look like half the join, and an unclamped NDistinct lets a
+// grouped scan of 6 surviving rows claim its column's whole-table 18 000
+// distinct values.
 func estimateAggregate(a *Aggregate) int64 {
-	child := EstimateRows(a.Child)
-	if len(a.GroupExprs) == 0 {
+	return estimateNumGroups(a.GroupExprs, a.Child, EstimateRows(a.Child))
+}
+
+// estimateNumGroups is `estimate_num_groups` (selfuncs.c:3449): the number of
+// distinct combinations of `groupExprs` among `inputRows` rows arriving from
+// `child`.
+//
+// The method is upstream's five numbered steps, and the two that carry the
+// weight are 4 and the closing clamp:
+//
+//   - Reduce the expressions to their unique variables (step 2): `f(x)` is
+//     treated as `x`, because a function cannot increase the distinct count
+//     and rarely reduces it much.
+//   - Per SOURCE RELATION, multiply the variables' distinct counts, then clamp
+//     to the relation's tuple count — divided by 10 when more than one
+//     variable, since the worst-case product assumes independence the columns
+//     usually do not have, but never below the largest single ndistinct
+//     (step 4).
+//   - Multiply across relations (step 5), then clamp the whole thing to
+//     `inputRows`. That last clamp is what the old `/2` was a crude stand-in
+//     for, and it is strictly better: a group count can never exceed the rows
+//     being grouped, but it also has no reason to be exactly half of them.
+//
+// Three upstream refinements are deliberately absent and ledgered rather than
+// faked: the equivalence-class de-duplication of step 3 (goopg's planner has
+// no EC structure at estimate time), extended-statistics ndistinct
+// (`estimate_multivariate_ndistinct` — goopg collects no multivariate stats),
+// and the boolean short-circuit ("a boolean expression contributes 2 groups"),
+// which needs an `exprType` this package does not have. A boolean COLUMN still
+// answers 2 through its own ANALYZE ndistinct; only boolean-valued
+// EXPRESSIONS fall through to the default.
+func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
+	rows := float64(inputRows)
+	if rows < 1 {
+		// clamp_row_est: never estimate zero groups, it divides by zero
+		// upstream in every consumer.
+		rows = 1
+	}
+	if len(groupExprs) == 0 {
 		return 1
 	}
-	if len(a.GroupExprs) == 1 {
-		if cr, ok := a.GroupExprs[0].(*ColumnRef); ok {
-			if nd := columnNDistinctForChild(cr.Index, a.Child); nd > 0 {
-				return nd
+
+	var varinfos []groupVarInfo
+	seen := make(map[groupVarKey]bool)
+	for i, ge := range groupExprs {
+		vars, enumerated := groupVarsOfExpr(ge)
+		if len(vars) == 0 && !enumerated {
+			// An expression this package cannot decompose is still a
+			// grouping variable; it just has no statistics. Keyed by its
+			// POSITION so two opaque expressions count as two variables.
+			varinfos = append(varinfos, groupVarInfo{ndistinct: defaultNumDistinct})
+			seen[groupVarKey{idx: -1 - i}] = true
+			continue
+		}
+		for _, cr := range vars {
+			key, info := examineGroupVar(cr, child)
+			if seen[key] {
+				// "Drop exact duplicates" (add_unique_group_var):
+				// GROUP BY a, a + b is GROUP BY a, b.
+				continue
 			}
+			seen[key] = true
+			varinfos = append(varinfos, info)
 		}
 	}
-	if child <= 0 {
-		return 0
+	// An all-constant GROUP BY list is one group. (Upstream also returns
+	// `input_rows` here when the expression contains a volatile function;
+	// goopg has no volatility catalog in the planner, so that arm is the
+	// ledgered gap `estimate-num-groups volatile-groupexpr`.)
+	if len(varinfos) == 0 {
+		return 1
 	}
-	if child < 2 {
-		return child
+
+	numdistinct := 1.0
+	relOrder := make([]Node, 0, len(varinfos))
+	byRel := make(map[Node][]groupVarInfo, len(varinfos))
+	for _, vi := range varinfos {
+		if vi.rel == nil {
+			numdistinct *= vi.ndistinct
+			continue
+		}
+		if _, ok := byRel[vi.rel]; !ok {
+			relOrder = append(relOrder, vi.rel)
+		}
+		byRel[vi.rel] = append(byRel[vi.rel], vi)
 	}
-	return child / 2
+
+	for _, rel := range relOrder {
+		vis := byRel[rel]
+		reldistinct := 1.0
+		relmax := 1.0
+		for _, vi := range vis {
+			reldistinct *= vi.ndistinct
+			if relmax < vi.ndistinct {
+				relmax = vi.ndistinct
+			}
+		}
+		tuples := vis[0].rawRows
+		if tuples <= 0 {
+			// "Sanity check --- don't divide by zero if empty relation":
+			// upstream skips the relation's whole contribution.
+			continue
+		}
+		clamp := tuples
+		if len(vis) > 1 {
+			clamp *= 0.1
+			if clamp < relmax {
+				clamp = relmax
+				if clamp > tuples {
+					clamp = tuples
+				}
+			}
+		}
+		if reldistinct > clamp {
+			reldistinct = clamp
+		}
+		if filtered, ok := relFilteredRows(child, rel); ok && reldistinct > 0 && filtered < tuples {
+			// Yao/Dell'Era: selecting p of N rows from n uniformly
+			// distributed distinct values is expected to yield
+			// n·(1 - ((N-p)/N)^(N/n)) of them. This is the only term that
+			// knows the relation was FILTERED, and it is why grouping a
+			// heavily restricted relation inside a fan-out join does not
+			// claim the whole table's distinct count.
+			reldistinct *= 1 - math.Pow((tuples-filtered)/tuples, tuples/reldistinct)
+		}
+		numdistinct *= clampRowEstF(reldistinct)
+	}
+
+	numdistinct = math.Ceil(numdistinct)
+	if numdistinct > rows {
+		numdistinct = rows
+	}
+	return saturateRowEst(numdistinct)
+}
+
+// groupVarsOfExpr is `pull_var_clause` for one GROUP BY item: the ColumnRefs
+// the expression reads, in order, plus whether the walk was EXHAUSTIVE.
+//
+// The second return is what separates upstream's two variable-free cases. A
+// fully enumerated expression that yielded no ColumnRef genuinely has no
+// variables — a literal, or `date '2000-01-01'` — and upstream ignores it
+// ("either it is a constant (and we can ignore it) or it contains a volatile
+// function"; the volatile arm, which returns `input_rows`, is the ledgered gap
+// `estimate-num-groups volatile-groupexpr`). An expression `exprChildSlots`
+// does not enumerate yielded nothing only because the walk gave up, and
+// ignoring THAT would silently drop a grouping key; the caller gives it
+// DEFAULT_NUM_DISTINCT instead.
+//
+// `scopeIgnore` matches upstream's treatment of a sub-select inside a grouping
+// expression: by the time `estimate_num_groups` runs it is a SubPlan, which
+// `pull_var_clause` does not descend into.
+func groupVarsOfExpr(e Expr) ([]*ColumnRef, bool) {
+	var out []*ColumnRef
+	enumerated := walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(n Expr) bool {
+			if cr, ok := n.(*ColumnRef); ok {
+				out = append(out, cr)
+			}
+			return true
+		},
+	})
+	return out, enumerated
+}
+
+// examineGroupVar is `examine_variable` + `get_variable_numdistinct` for one
+// grouping variable.
+func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
+	if cr.Index >= 0 {
+		if ref, ok := resolveBaseColumn(cr.Index, child); ok {
+			return groupVarKey{rel: ref.scan, col: ref.col},
+				groupVarInfo{
+					rel:       ref.scan,
+					ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
+					rawRows:   ref.rawRows,
+				}
+		}
+		// `get_variable_numdistinct`'s isunique branch: a column that is the
+		// sole grouping key of an intervening grouped node is unique in that
+		// node's output, so its distinct count is that node's row count. No
+		// base relation means no per-relation clamp — see groupVarInfo.rel.
+		if nd, ok := groupUniqueNDistinct(cr.Index, child); ok && nd > 0 {
+			return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: float64(nd)}
+		}
+	}
+	return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: defaultNumDistinct}
+}
+
+// groupVarNDistinct is the tail of `get_variable_numdistinct` (selfuncs.c:6341)
+// for goopg's stats shape, where `ColumnStats.NDistinct` is already the
+// ABSOLUTE count (the negative-fraction form lives in `NDistinctFrac` and is
+// scaled out before it reaches `baseColumnRef`).
+func groupVarNDistinct(nd, rawRows float64) float64 {
+	if nd > 0 {
+		return nd
+	}
+	if rawRows <= 0 {
+		return defaultNumDistinct
+	}
+	// "With no data, estimate ndistinct = ntuples if the table is small,
+	// else use default. We use DEFAULT_NUM_DISTINCT as the cutoff for
+	// 'small' so that the behavior isn't discontinuous."
+	if rawRows < defaultNumDistinct {
+		return rawRows
+	}
+	return defaultNumDistinct
+}
+
+// relFilteredRows answers upstream's `rel->rows` — the estimated row count of
+// ONE source relation after its own restriction clauses — for the leaf scan
+// `rel` somewhere under `root`.
+//
+// goopg has no RelOptInfo to read it off, so it is recovered from the plan
+// tree: the topmost node whose subtree contains `rel` AND NOTHING ELSE still
+// describes that one relation, and its row estimate is the filtered count.
+// The moment the walk crosses a join the count stops being single-relation,
+// so a join arm SEALS the answer found below it and passes it up unchanged.
+//
+// Returning false (an unrecognised node on the path, or no path at all) means
+// "unknown", and the caller then treats the relation as unfiltered — the same
+// conservative direction the pre-M0127-P5.6-f-vii code took by never
+// considering restriction at all.
+func relFilteredRows(root, rel Node) (float64, bool) {
+	rows, found, _ := relFilteredRowsWalk(root, rel)
+	return rows, found
+}
+
+func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
+	if n == nil {
+		return 0, false, false
+	}
+	if n == rel {
+		return float64(EstimateRows(n)), true, false
+	}
+	// passthrough: n still describes a single relation if its child does.
+	passthrough := func(child Node) (float64, bool, bool) {
+		r, f, s := relFilteredRowsWalk(child, rel)
+		if !f {
+			return 0, false, false
+		}
+		if s {
+			return r, true, true
+		}
+		return float64(EstimateRows(n)), true, false
+	}
+	// join: whichever side holds `rel`, its answer is final.
+	joinSide := func(children ...Node) (float64, bool, bool) {
+		for _, c := range children {
+			if r, f, _ := relFilteredRowsWalk(c, rel); f {
+				return r, true, true
+			}
+		}
+		return 0, false, false
+	}
+
+	switch x := n.(type) {
+	case *Filter:
+		return passthrough(x.Child)
+	case *Project:
+		return passthrough(x.Child)
+	case *Sort:
+		return passthrough(x.Child)
+	case *Limit:
+		return passthrough(x.Child)
+	case *LockRows:
+		return passthrough(x.Child)
+	case *Gather:
+		return passthrough(x.Child)
+	case *GatherMerge:
+		return passthrough(x.Child)
+	case *CTEScan:
+		return passthrough(x.Child)
+	case *Join:
+		return joinSide(x.Left, x.Right)
+	case *NestedLoopIndexJoin:
+		if x.Inner != nil {
+			return joinSide(x.Outer, x.Inner)
+		}
+		return joinSide(x.Outer)
+	case *MultiHashJoin:
+		return joinSide(x.Tables...)
+	}
+	return 0, false, false
 }
 
 func keyNDistinct(key Expr, side Node) int64 {
@@ -961,6 +1265,17 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 		return nd
 	}
 	return 0
+}
+
+// clampRowEstF is `clamp_row_est` (costsize.c:213) in the float domain the
+// group estimator works in: at least one row, otherwise rounded to an integer.
+// (Upstream's `rint` breaks ties to even and Go's `math.Round` away from zero;
+// that differs only on an exact .5 and never by more than one row.)
+func clampRowEstF(rows float64) float64 {
+	if math.IsNaN(rows) || rows <= 1 {
+		return 1
+	}
+	return math.Round(rows)
 }
 
 // saturateRowEst converts a float row estimate to the int64 the planner

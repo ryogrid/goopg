@@ -7471,8 +7471,18 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       over-estimates. It did NOT un-time-out Q47; that stays open under -f-vii
       and the successor below. New tests
       `internal/planner/cardinality_pusheddown_test.go` (3).
-- [ ] **M0127-P5.6-f-viii — Q47 still takes the nested loop with `v1` at
-      3 626.** With -f-vi landed the 425× under-estimate is gone (18 → 3 626
+- [x] **M0127-P5.6-f-viii — Q47 still takes the nested loop with `v1` at
+      3 626.** CLOSED 2026-08-05 by **M0127-P5.6-f-vii**, at the resume point
+      this item named. The `CTE Scan on v1 rows=6` outer was 6 because the
+      `v1` body's 6-key GROUP BY was estimated `child/2` = 3 626 rather than
+      7 252; with `estimate_num_groups` the body is 7 252 (PG 7 643), the outer
+      is 12, and the `Nested Loop (INNER) rows=1958` is now a `Hash Join
+      (INNER, build=left) rows=7252`. **Q47 completes in 12 s** (was TIMEOUT at
+      300 s), 100 rows against the PG oracle, and the DS05 named TIMEOUT set is
+      EMPTY for the first time since §5.15. No rescan-cost term was needed —
+      the alternative hypothesis in this item ("the rescan is unpriced") was
+      not reached and stays unmeasured; doc 09 §5.19. Original text below.
+      With -f-vi landed the 425× under-estimate is gone (18 → 3 626
       against PG's 7 643) and Q47 *still* TIMEOUTs at 300 s: the top block
       plans `Nested Loop (INNER) rows=1958` over a 5-pair `Hash Join rows=108`
       and a `CTE Scan on v1 v1_lag rows=3626`, where PG picks a Merge Join.
@@ -7484,17 +7494,28 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       instance of the same double-charge class through a `*CTEScan`. Do
       -f-vii first — one variable per measurement, per §6. Bar: UNITS + the
       estimate audit + DS05 (named-victim TIMEOUT-set diff).
-- [ ] **M0127-P5.6-f-vii — `estimateAggregate` is `child/2`, upstream is
-      `estimate_num_groups`.** A multi-key GROUP BY returns `child/2`
-      (`internal/planner/cardinality.go` `estimateAggregate`); PG runs
-      `estimate_num_groups` (selfuncs.c) — per-relation products of the grouping
-      columns' ndistinct, clamped to the input row count. Filed from §5.17 as a
-      second, independent gap on Q47's path and explicitly **not** load-bearing
-      for it (with Q47's input corrected to ~7 600, `child/2` gives ~3 800,
-      already the same order as PG's 7 643), so it must not be folded into
-      P5.6-f-vi — one variable per measurement, per §6. Note the sibling gap
-      already ledgered on the `*Distinct` / `*DistinctOn` arms, which run no
-      group estimate at all. Bar: UNITS + the estimate audit + DS05.
+- [x] **M0127-P5.6-f-vii — `estimateAggregate` is `child/2`, upstream is
+      `estimate_num_groups`.** LANDED 2026-08-05 (doc 09 §5.19).
+      `estimateNumGroups` (`internal/planner/cardinality.go`) is the port of
+      `estimate_num_groups` (selfuncs.c:3449): unique variables per grouping
+      expression, per-relation product of ndistinct clamped to that relation's
+      tuples (÷10 above one variable, floored at the largest single ndistinct),
+      the Yao/Dell'Era restriction correction (new `relFilteredRows` recovers
+      upstream's `rel->rows` from the plan tree), the product across relations,
+      and the closing clamp to `input_rows` — which is what the old `child/2`
+      was a crude stand-in for. Also ports `get_variable_numdistinct`'s
+      no-stats tail and `clamp_row_est`. The item was filed as explicitly NOT
+      load-bearing for Q47 and it is what **closed Q47** (see -f-viii). Gates:
+      UNITS green; estimate audit `2026-08-05-p56fvii.txt` — no new violation,
+      all TPC-H joinrels <1 % except Q20 which IMPROVED (30.2× → 24.9× over),
+      Q18's standing violation 23 433× → 23 015×; DS05 sweep
+      `sweep-20260805-112902.txt` exit 0, **TIMEOUT=0**, PASS 94 → 95,
+      MISMATCH=0 CKMISMATCH=0 ERROR=0. 10 new tests
+      (`internal/planner/cardinality_numgroups_test.go`). Four upstream
+      refinements ledgered, not faked: EC de-duplication (step 3), extended-stats
+      multivariate ndistinct, the boolean short-circuit, the volatile arm — plus
+      the standing sibling gap on `estimateSetOp` / `*Distinct` / `*DistinctOn`,
+      which still run no group estimate.
 - [x] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
       cardinality.** §5.15's regression survived four sweeps because
       `TIMEOUT=1` is invariant to WHICH query timed out; the summary line was

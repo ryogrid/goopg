@@ -1351,6 +1351,61 @@ single-relation restrictions mostly reach their leaves through Slice A
 (`attachRelationLocalFilters`), which partitions them out pre-DP and never
 leaves a duplicate; `pushInnerJoinInputQuals` is the TPC-DS-shaped path.
 
+### 5.19 `estimate_num_groups`, and the end of the DS05 TIMEOUT set, 2026-08-05 (P5.6-f-vii, closing -f-viii)
+
+`estimateAggregate` answered `child / 2` for any GROUP BY that was not a single
+bare ColumnRef, and for the one that was, the column's whole-table NDistinct
+with **no clamp at all**. Both halves are now `estimateNumGroups`
+(`internal/planner/cardinality.go`), which is `estimate_num_groups`
+(`utils/adt/selfuncs.c:3449`): unique variables per grouping expression, the
+per-relation product of their distinct counts clamped to that relation's
+`tuples` (÷ 10 when more than one variable, never below the largest single
+ndistinct), the Yao/Dell'Era correction for a relation the plan RESTRICTED, the
+product across relations, and the closing clamp to `input_rows`.
+
+**The item was filed as explicitly NOT load-bearing for Q47.** It is what
+closed it. Q47's `v1` body is a 6-key GROUP BY over 7 252 rows; the two numbers
+that moved are one line apart in the plan:
+
+| node | before (`child/2`) | after (`estimate_num_groups`) | PG 18.3 |
+|---|---|---|---|
+| `HashAggregate (6 keys)` (the `v1` body) | 3 626 | **7 252** | 7 643 |
+| `CTE Scan on v1` (post `d_year = 2000 AND avg_monthly_sales > 0`) | 6 | **12** | — |
+| top block | `Nested Loop rows=1958` over `Hash Join rows=108` | **`Hash Join (INNER, build=left) rows=7252`** | Merge Join |
+
+There is no new formula behind the 7 252: six grouping keys over 7 252 input
+rows cannot produce more than 7 252 groups, so the answer is the `input_rows`
+clamp, and halving it was arbitrary. Halving it twice — the CTE body is scanned
+three times (`v1`, `v1_lag`, `v1_lead`) — is what made the 6-row outer look
+like a free rescan driver, which is precisely the resume point -f-viii had
+written down ("the `CTE Scan on v1 rows=6` outer is what makes rescanning 3 626
+rows look free"). The nested loop is gone and **Q47 completes in 12 s against
+its 300 s timeout, 100 rows, matching the PG oracle.**
+
+**The DS05 named TIMEOUT set is now empty** — `TIMEOUT=0`, PASS 94 → **95**,
+`MISMATCH=0 CKMISMATCH=0 ERROR=0`, the first sweep since §5.15 with no timing-out
+query at all. Per §5.16 the delta is stated by NAME: `PASS +Q47 / TIMEOUT −Q47`,
+59 of 99 plan shapes changed, no other verdict move.
+
+**Estimate audit** (`analysis/leftdeep-joins/2026-08-05-p56fvii.txt`, vs the
+`p56fvi-postfix` baseline): no new violation. Every TPC-H joinrel moves under
+1 % except Q20, which *improves* — its `d2` SEMI 77 462 → 63 875 (30.2× → 24.9×
+over) and its `d3` INNER 715 931 → 561 004 (3.0× → 2.4× over), because Q20's
+inner aggregate no longer feeds a halved row count into the joins above it.
+Q18's standing final-SEMI violation improved again, 23 433× → 23 015×.
+
+**Four upstream refinements are deliberately absent**, each ledgered rather than
+faked, because each needs machinery goopg's planner does not have at estimate
+time: the equivalence-class de-duplication of step 3 (no EC structure),
+`estimate_multivariate_ndistinct` (no extended statistics), the boolean
+short-circuit (`exprType` is not available in this package — a boolean *column*
+still answers 2 through its own ndistinct, only boolean *expressions* fall to
+the default), and the volatile-grouping-expression arm that returns
+`input_rows`. `estimateSetOp`'s non-ALL `/2` is left alone for the same reason
+§5.18's change was measured alone: the set-op's output columns are not carried
+as grouping expressions over each input, and wiring it would put a second
+variable into this sweep.
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
