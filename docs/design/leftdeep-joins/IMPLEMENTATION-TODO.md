@@ -1387,8 +1387,43 @@
   **Q18 is NOT in this class** and must not be bisected with it: its final
   joinrel is ~23 400× over in BOTH arms (OFF est=1 568 274, ON est=1 642 632,
   actual 70), so its 2.47× is a plan choice made on an equally bad estimate.
-- [ ] **P5.9-i** `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
-  queries under the flag (NEW at run 3, 09 §3.5). Q11, Q31, Q47, Q57, Q58,
+- [x] **P5.9-i** `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
+  queries under the flag. **DONE 2026-08-05 (09 §3.7) — the disagreement was
+  the CHECKER's.** `reresolveJoinByName`'s `predRebind` resolves a predicate
+  operand against the side its index suggests and falls back to the other side
+  on a -1, but `resolveSide` returned -1 both for "the name is not here" (a
+  miss, where crossing over is right) and for "the name is here twice" (an
+  ambiguity, where crossing over is a guess). `SourceTableIdx` does not
+  separate them across scopes: M0071-0009 added it for Q21's three `lineitem`
+  aliases, three range-table entries of ONE scope, while Q83's three `item_id`s
+  each descend from `item.i_item_id` inside a SEPARATE WITH arm and every arm
+  numbers its own range table — so all three carry the same source identity.
+  The correct side then answers -1 and the other side answers with its single
+  match, rebinding a correctly-bound reference onto another relation's column
+  of the same name: a predicate comparing a column to itself, i.e. a cross
+  product, and a SILENT wrong answer on the untagged cost path since
+  M0071-0009. Fix: `lookupColumnIndexByName` /
+  `lookupColumnIndexByNameAndSource` (bushy.go) report the duplicate case
+  separately and `predRebind` abstains on it; the miss fallback is untouched
+  (`TestReresolveStillCrossesSidesOnAPlainMiss` pins it), and the two old
+  helpers survive as wrappers so the forced-side rebind sites are unchanged.
+  Measured (DS05 subset sweep, flag ON): `ERROR=7` → `PASS=6 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=1`, five of the six with PG-identical value
+  checksums. **Q47 is the TIMEOUT and is a NEW defect, not this one's
+  remainder** — correct 100 rows in 8 m 40 s against 11–13 s flag-OFF; filed
+  as P5.9-j.
+- [ ] **P5.9-j** Q47 costs ~40× under the flag (NEW at P5.9-i, 09 §3.7).
+  Uncovered, not caused, by P5.9-i: the query aborted at plan time before it
+  could be timed. Correct answer (100 rows, matching the oracle row count;
+  the oracle carries `ck=n/a` because its LIMIT window saturates), 8 m 40 s
+  timed alone on a freshly restarted SF0.5 server versus 11–13 s on the
+  flag-OFF arm, so it TIMEOUTs the DS05 gate's 300 s bound and keeps clause 4
+  red. Same class as P5.9-h's remainder — a plan the search prefers and should
+  not — and the two should be bisected together rather than separately: start
+  from the ON/OFF plan pair for Q47 in
+  `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-222627.txt`
+  (ON) against `plans-20260805-220059.txt` (OFF).
+  Historical statement of the original defect follows. Q11, Q31, Q47, Q57, Q58,
   Q74, Q83 abort at plan time — `searchedtree.go:205`, reached from
   `createPlanAtSearchRootRange` (createplanroot.go:130) via
   `searchOneProblem` — each with a distinct layout disagreement:

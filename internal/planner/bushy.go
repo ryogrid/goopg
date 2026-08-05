@@ -2926,16 +2926,31 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 // closure (M0063-0001) so the NLI rewrite path can re-bind a
 // derived-table outer's Key index by Name.
 func findUniqueColumnIndex(schema Schema, name string, offset int) int {
+	idx, _ := lookupColumnIndexByName(schema, name, offset)
+	return idx
+}
+
+// lookupColumnIndexByName is `findUniqueColumnIndex` with the two ways of
+// failing told apart: it returns (-1, true) when the name appears more than
+// once and (-1, false) when it does not appear at all.
+//
+// M0127-P5.9-i: the distinction is not decoration. A caller that may consult a
+// SECOND schema after a miss — `reresolveJoinByName`'s `predRebind` is the only
+// one — must treat ambiguity as "stop", because the reference demonstrably
+// belongs to THIS side and the resolver simply cannot say where. Conflating the
+// two makes it walk to the other side and rebind a correctly-bound reference
+// onto a different relation's column of the same name.
+func lookupColumnIndexByName(schema Schema, name string, offset int) (int, bool) {
 	hit := -1
 	for i, c := range schema {
 		if c.Name == name {
 			if hit >= 0 {
-				return -1 // duplicate
+				return -1, true // ambiguous
 			}
 			hit = i + offset
 		}
 	}
-	return hit
+	return hit, false
 }
 
 // findColumnIndexByNameAndSource (M0071-0009) returns the index
@@ -2949,16 +2964,35 @@ func findUniqueColumnIndex(schema Schema, name string, offset int) int {
 // callers must not invoke this helper with a zero source idx;
 // they should fall back to findUniqueColumnIndex instead.
 func findColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx int16, offset int) int {
+	idx, _ := lookupColumnIndexByNameAndSource(schema, name, sourceTableIdx, offset)
+	return idx
+}
+
+// lookupColumnIndexByNameAndSource is `findColumnIndexByNameAndSource` with the
+// duplicate case reported instead of folded into the miss — see
+// `lookupColumnIndexByName` for why the difference matters.
+//
+// M0127-P5.9-i also settled what the duplicate case IS. The old comment called
+// it "shouldn't happen in well-formed schemas": that is true only within one
+// query scope, which is the case M0071-0009 was written for (Q21's `l1/l2/l3`
+// are three range-table entries of ONE scope, so three distinct source
+// indices). It is false across scopes. TPC-DS Q83 joins three CTE scans whose
+// `item_id` each descends from `item.i_item_id` inside a separate WITH arm;
+// every arm numbers its own range table, so all three columns carry the same
+// source identity and the pair (Name, SourceTableIdx) is genuinely ambiguous.
+// Seven TPC-DS queries are in this family (Q11, Q31, Q47, Q57, Q58, Q74, Q83) —
+// a shape none of TPC-H's 22 queries produce.
+func lookupColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx int16, offset int) (int, bool) {
 	hit := -1
 	for i, c := range schema {
 		if c.Name == name && c.SourceTableIdx == sourceTableIdx {
 			if hit >= 0 {
-				return -1 // duplicate (same name + same source twice — shouldn't happen in well-formed schemas, but guard)
+				return -1, true // ambiguous — the same name from the same source twice
 			}
 			hit = i + offset
 		}
 	}
-	return hit
+	return hit, false
 }
 
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
@@ -3162,21 +3196,29 @@ func reresolveJoinByName(j *Join) {
 		j.schema = merged
 	}
 
-	findUnique := findUniqueColumnIndex
-
 	// resolveSide tries SourceTableIdx-aware lookup first when
 	// the ColumnRef carries a known source identity (M0071-0009);
 	// falls back to Name-only when source identity is unknown.
-	// Returns -1 on miss.
-	resolveSide := func(schema Schema, cr *ColumnRef, offset int) int {
+	// Returns (-1, false) on miss and (-1, true) when the name is
+	// present but ambiguous — a distinction only `predRebind` acts
+	// on (M0127-P5.9-i).
+	//
+	// An ambiguous (Name, SourceTableIdx) does NOT fall back to the
+	// Name-only lookup: dropping the disambiguator can only match
+	// the same columns or more of them, so the answer would be
+	// ambiguous again.
+	resolveSide := func(schema Schema, cr *ColumnRef, offset int) (int, bool) {
 		if cr.SourceTableIdx != 0 {
-			if newIdx := findColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); newIdx >= 0 {
-				return newIdx
+			if newIdx, ambiguous := lookupColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); newIdx >= 0 || ambiguous {
+				return newIdx, ambiguous
 			}
 		}
-		return findUnique(schema, cr.Name, offset)
+		return lookupColumnIndexByName(schema, cr.Name, offset)
 	}
 
+	// rebind resolves a join key against the side it is already known
+	// to belong to, so an ambiguous name is simply left alone — there
+	// is no other side to be wrongly tempted by.
 	rebind := func(e Expr, leftSide bool) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
@@ -3184,9 +3226,9 @@ func reresolveJoinByName(j *Join) {
 		}
 		var newIdx int
 		if leftSide {
-			newIdx = resolveSide(leftSchema, cr, 0)
+			newIdx, _ = resolveSide(leftSchema, cr, 0)
 		} else {
-			newIdx = resolveSide(rightSchema, cr, leftWidth)
+			newIdx, _ = resolveSide(rightSchema, cr, leftWidth)
 		}
 		if newIdx >= 0 {
 			cr.Index = newIdx
@@ -3208,27 +3250,38 @@ func reresolveJoinByName(j *Join) {
 	// resolveSide prefers the (Name, SourceTableIdx) match — Q21's
 	// 3 lineitem aliases all named `l_suppkey` are no longer
 	// "ambiguous"; each disambiguates by its source.
+	//
+	// M0127-P5.9-i: the fallback is for a MISS, never for an
+	// AMBIGUITY. A miss says "this name is not on this side", which
+	// is real evidence the side classification was wrong; an
+	// ambiguity says "this name is on this side more than once",
+	// which is evidence of nothing except that the resolver cannot
+	// finish. Crossing over on the second is how a correctly-bound
+	// reference to one of three repeated CTE scans (TPC-DS Q83's
+	// `item_id`) got rebound onto a different scan's column of the
+	// same name — a predicate comparing a column to itself, hence a
+	// cross product, and under GOOPG_PGSHAPED_DP a plan-time abort in
+	// `assertSearchedTreeNeedsNoReconcile`. Abstaining leaves the
+	// index the coordinate arithmetic bound, which is the answer.
 	predRebind := func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
 			return
 		}
-		tryLeftFirst := cr.Index < leftWidth
-		if tryLeftFirst {
-			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
-				cr.Index = newIdx
+		type side struct {
+			schema Schema
+			offset int
+		}
+		order := [2]side{{leftSchema, 0}, {rightSchema, leftWidth}}
+		if cr.Index >= leftWidth {
+			order[0], order[1] = order[1], order[0]
+		}
+		for _, s := range order {
+			newIdx, ambiguous := resolveSide(s.schema, cr, s.offset)
+			if ambiguous {
 				return
 			}
-			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
-				cr.Index = newIdx
-				return
-			}
-		} else {
-			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
-				cr.Index = newIdx
-				return
-			}
-			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
+			if newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}

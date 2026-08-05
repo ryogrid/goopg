@@ -8223,27 +8223,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       estimate and must not be bisected together with the rest.
       Evidence: `analysis/leftdeep-joins/2026-08-05-p59run3-audit-{off,on}.txt`.
       09 §3.5, §4.1; IMPLEMENTATION-TODO P5.9-h.
-- [ ] **M0127-P5.9-i — `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
-      queries under the flag.** NEW at run 3 (09 §3.5), and the first
-      flag-owned defect TPC-H structurally cannot find. Q11, Q31, Q47, Q57,
-      Q58, Q74, Q83 abort at plan time (0 s) — `internal/planner/
-      searchedtree.go:205`, reached from `createPlanAtSearchRootRange`
-      (createplanroot.go:130) via `searchOneProblem` — each with a distinct
-      layout disagreement: `ca_county 0→8`, `customer_id 0→12`,
-      `customer_id 0→20`, `i_category 0→16`, `i_category 0→18`,
-      `item_id 0→4`, `item_id 2→0`. The P5.5-f-ii-a cross-check is doing its
-      job: it turns a wrong-column plan into a dead connection (panic recovered
-      per-connection at `internal/server/server.go:801`; the server stays up),
-      which is why clause 4 reads `ERROR=7` with `MISMATCH=0 CKMISMATCH=0`.
-      All seven are the CTE/UNION-ALL family where one base relation is
-      scanned repeatedly under different aliases inside separate WITH arms —
-      a shape TPC-H's 22 queries never produce, which is why three acceptance
-      runs missed it. Reproduce: `GOOPG_PGSHAPED_DP=1 bench/tpcds/server.sh
-      start sf05` then `psql -h 127.0.0.1 -p 65437 -U postgres -d postgres -f
-      bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql`. Evidence:
-      `analysis/leftdeep-joins/2026-08-05-p59run3-ds05-on.txt` (a copy of the
-      gitignored `tpcds-results-sf05/sweep-20260805-204014.txt`) +
-      `bench/tpcds/runtime_goopg/goopg.sf05.log`. IMPLEMENTATION-TODO P5.9-i.
+- [x] **M0127-P5.9-i — `assertSearchedTreeNeedsNoReconcile` fires on 7 TPC-DS
+      queries under the flag.** **DONE 2026-08-05 (09 §3.7) — the assertion was
+      right to fire and the arms were innocent; the disagreement belonged to
+      the CHECKER.** `reresolveJoinByName`'s `predRebind` (bushy.go) tries the
+      side a reference's index suggests and falls back to the other side on a
+      -1 — but `resolveSide` returned -1 both for a MISS ("the name is not on
+      this side", where crossing over is the point of the fallback) and for an
+      AMBIGUITY ("the name is on this side twice", where crossing over is a
+      guess). `SourceTableIdx` does not separate the two across scopes:
+      M0071-0009 added it for Q21's three `lineitem` aliases — three
+      range-table entries of ONE scope, hence three distinct source indices —
+      while Q83's three `item_id` columns each descend from `item.i_item_id`
+      inside a SEPARATE WITH arm, and each arm numbers its own range table, so
+      all three carry the SAME source identity. The correct side answers -1,
+      the other side answers with its single match, and a reference correctly
+      bound to column 0 is rebound to column 4: a predicate comparing a column
+      to itself, i.e. a cross product — a plan-time abort under the flag and a
+      SILENT wrong answer on the untagged cost path ever since M0071-0009.
+      Fix: `lookupColumnIndexByName` / `lookupColumnIndexByNameAndSource`
+      report the duplicate case separately, `predRebind` abstains on it, the
+      miss fallback is untouched (`TestReresolveStillCrossesSidesOnAPlainMiss`
+      pins that half), and the two original helpers survive as wrappers so the
+      forced-side join-key/NLI rebind sites keep their exact prior behaviour.
+      Measured (DS05 subset sweep, flag ON, `sweep-20260805-222627.txt`):
+      `ERROR=7` → `PASS=6 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1`, with
+      five of the six carrying value checksums identical to PG's.
+      **Q47 is the TIMEOUT and is a NEW defect, not this item's remainder** —
+      it returns the correct 100 rows in 8 m 40 s against 11–13 s flag-OFF;
+      filed as M0127-P5.9-j.
+      Files: `internal/planner/bushy.go`,
+      `internal/planner/reconcile_ambiguousside_test.go` (new, 4 tests).
+      The original run-3 statement of the defect (all seven column moves, the
+      per-connection panic recovery at `internal/server/server.go:801`, the
+      `psql -p 65437 -f .../query47.sql` reproducer) survives verbatim in
+      IMPLEMENTATION-TODO under P5.9-j and in 09 §3.5; run-3 evidence is
+      `analysis/leftdeep-joins/2026-08-05-p59run3-ds05-on.txt`.
+- [ ] **M0127-P5.9-j — Q47 costs ~40× under the flag.** NEW at P5.9-i
+      (09 §3.7). Uncovered, not caused, by it: Q47 aborted at plan time before
+      it could ever be timed. Under `GOOPG_PGSHAPED_DP=1` it now returns the
+      correct 100 rows (oracle row count; the oracle's `ck` is `n/a` because
+      its LIMIT window saturates) in **8 m 40 s** timed alone on a freshly
+      restarted SF0.5 server, versus **11–13 s** on the flag-OFF arm
+      (`sweep-20260805-1{74711,92044}.txt`). It therefore TIMEOUTs the DS05
+      gate's 300 s bound and keeps clause 4 red for run 4. Same class as
+      P5.9-h's remainder — a plan the search prefers and should not — and the
+      two are worth bisecting together. Start from the ON/OFF plan pair for
+      Q47: `bench/tpcds/runtime_goopg/tpcds-results-sf05/plans-20260805-222627.txt`
+      (ON) against `plans-20260805-220059.txt` (OFF).
+      09 §3.7; IMPLEMENTATION-TODO P5.9-j.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =

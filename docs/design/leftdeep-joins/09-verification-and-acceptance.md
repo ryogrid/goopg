@@ -455,6 +455,85 @@ re-ANALYZE, which samples: same ratios to one decimal, identical shapes, and
 Q9 — whose estimates are driven by relation sizes rather than NDistinct —
 byte-identical.
 
+### 3.7 The seven TPC-DS aborts were the CHECKER's disagreement (P5.9-i, 2026-08-05)
+
+§3.5 filed seven TPC-DS queries — Q11, Q31, Q47, Q57, Q58, Q74, Q83 — that
+abort at plan time under the flag inside
+`assertSearchedTreeNeedsNoReconcile` (`internal/planner/searchedtree.go:205`),
+each reporting a distinct column moving: `ca_county 0→8`, `customer_id 0→12`,
+`customer_id 0→20`, `i_category 0→16`, `i_category 0→18`, `item_id 0→4`,
+`item_id 2→0`. The assertion's contract is that two unrelated mechanisms — the
+arms' coordinate arithmetic over `outputLayout` and `reconcileNLILayout`'s name
+resolution — reach the same index, so a disagreement is a bug in one of them.
+**It was in the second one**, and it was not new: the same defect had been a
+silent wrong-column join on the cost path since M0071-0009.
+
+The reproducer is Q83's outer query, which joins three CTE scans —
+`sr_items`, `cr_items`, `wr_items` — each publishing a column named `item_id`.
+`reresolveJoinByName`'s `predRebind` resolves a predicate operand against the
+side its current index suggests and **falls back to the other side when the
+name is not found there**, a fallback written for `pushOneConjunct`'s residuals
+(whose side classification an earlier pass may have invalidated). `resolveSide`
+returned -1 for two different situations, and the fallback could not tell them
+apart:
+
+- **miss** — the name is not on this side. Real evidence the classification
+  was wrong; crossing over is correct.
+- **ambiguous** — the name is on this side more than once. Evidence of nothing
+  except that the resolver cannot finish; crossing over is a guess, and on
+  these seven queries it was the wrong one.
+
+`SourceTableIdx` did not rescue it, and the reason is the discovery worth
+keeping. M0071-0009 added the (Name, SourceTableIdx) lookup for Q21's three
+`lineitem` aliases — three range-table entries of **one** scope, hence three
+distinct source indices — and its comment called a duplicate "shouldn't happen
+in well-formed schemas". That is true within a scope and false across them.
+Every `item_id` above descends from `item.i_item_id` inside a **separate** WITH
+arm, each arm numbers its own range table, so all three columns carry the same
+source identity. Both lookups are therefore ambiguous, the correct side answers
+-1, the other side answers with its single match, and a reference correctly
+bound to column 0 is rebound to column 4 — a predicate comparing a column to
+itself, i.e. a cross product. This is the CTE/UNION-ALL family that TPC-H's 22
+queries never produce, which is why three acceptance runs and the whole TPC-H
+bar could not reach it.
+
+The fix is in the resolver, not the arms: `lookupColumnIndexByName` and
+`lookupColumnIndexByNameAndSource` (`bushy.go`) report the duplicate case
+separately, `predRebind` abstains on it, and the miss fallback is untouched —
+`TestReresolveStillCrossesSidesOnAPlainMiss` pins that half so the fix cannot
+silently widen. An ambiguous (Name, SourceTableIdx) does not retry Name-only:
+dropping a disambiguator can only match the same columns or more.
+`findUniqueColumnIndex` / `findColumnIndexByNameAndSource` survive as
+one-line wrappers, so the NLI and join-key rebind sites keep their exact prior
+behaviour (they force a side, and an ambiguous name there was already left
+alone).
+
+Measured, SF0.5 subset sweep under `GOOPG_PGSHAPED_DP=1`
+(`sweep-20260805-222627.txt`, oracle = PG 18.3):
+
+| | run 3 (ON) | P5.9-i (ON) |
+|---|---|---|
+| Q11 | ERROR 0s | PASS 20s, 8 rows, ck matches |
+| Q31 | ERROR 0s | PASS 14s, 19 rows, ck matches |
+| Q57 | ERROR 0s | PASS 81s, 100 rows (ck=n/a) |
+| Q58 | ERROR 0s | PASS 22s, 0 rows, ck matches |
+| Q74 | ERROR 0s | PASS 88s, 7 rows, ck matches |
+| Q83 | ERROR 0s | PASS 3s, 3 rows, ck matches |
+| Q47 | ERROR 0s | **TIMEOUT** at the 300s gate |
+| summary | `ERROR=7` | `PASS=6 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1` |
+
+Five of the six carry a value checksum identical to PG's, so this is an answer
+match and not a row-count coincidence.
+
+**Q47 is a new, separate defect and must not be booked as this one's
+remainder.** It now plans and returns the correct 100 rows — timed alone on a
+freshly restarted server, **8 m 40 s** — where the flag-OFF arm passes in
+11–13 s (`sweep-20260805-1{74711,92044}.txt`). A ~40× cost regression on one
+query is the same class as §3.6's leftover: a plan the search prefers and
+should not. It was invisible until now only because the query used to abort
+before it could run, which is the honest form of "P5.9-i uncovered it". Filed
+as **P5.9-j**, ledgered, and it keeps DS05 clause 4 red for run 4.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),
