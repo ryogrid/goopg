@@ -116,6 +116,18 @@ type searchCtx struct {
 	// P5.6's calcJoinrelSize and P5.4's add_paths_to_joinrel
 	// (joinsearchlevel.go:36). Set by `joinSearch`, which refuses a nil one.
 	builder joinRelBuilder
+
+	// trace is the enumeration-provenance record (M0127-P5.9-l-ii,
+	// joinsearchtrace.go) — nil unless `GOOPG_PGSHAPED_DP_TRACE=1`, and read
+	// only through its own nil-safe methods. It answers the one question the
+	// chosen plan cannot: whether a pairing PG chose was ever OFFERED here.
+	trace *searchTrace
+
+	// tracePhase is which `join_search_one_level` pass is currently
+	// enumerating, so `makeJoinRel` can record a pair's provenance without
+	// being handed a phase argument it would otherwise ignore. Meaningless
+	// while `trace` is nil.
+	tracePhase int
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.
@@ -278,6 +290,11 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 	}
 	s.relInfos = relInfos
 	s.tupleFraction = tupleFraction
+	// The relid → relation-name map has to be taken HERE, from the same
+	// `bindings` slice whose position i defines relid `1<<i` below: taking it
+	// anywhere else would be a second derivation of the correspondence the
+	// whole trace is read through (M0127-P5.9-l-ii). nil unless the gate is on.
+	s.trace = newSearchTrace(bindings)
 	for i := range bindings {
 		leaf := scans[i]
 		if leaf == nil {

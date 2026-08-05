@@ -860,6 +860,73 @@ Two limits of the channel, both printed rather than silent:
 Evidence: `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` and
 `-README.md`.
 
+### 3.12 The enumeration-provenance channel (P5.9-l-ii, built 2026-08-06)
+
+§3.11 ends on a question a chosen plan cannot answer, so this channel reads the
+other end: the join search's own record of what it was OFFERED.
+
+**Writer** — `internal/planner/joinsearchtrace.go`, gated on
+`GOOPG_PGSHAPED_DP_TRACE=1` (read once at process start, like every other
+planner gate) and nil when off, so production is untouched. `joinSearch` emits
+one block per join problem to stderr — the server log — in a single write:
+
+```
+DPTRACE problem nrels=4 rels=n1,supplier,customer,orders
+DPTRACE pair phase=2 lev=4 created=0 pair={customer+orders} | {n1+supplier} outer={n1+supplier} inner={customer+orders}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={customer} | {supplier}
+DPTRACE end top={customer+n1+orders+supplier} pairs=10 declined=5 status=ok
+```
+
+Three decisions carry the channel:
+
+1. **The pair key is `SpineJoin.PairKey`'s string, byte for byte** — members
+   sorted by NAME, sides sorted among themselves. The plan side sorts, so a key
+   equal only up to a permutation is not a key, and a drift here would turn
+   every candidate into a false NOT-ENUMERATED.
+2. **Names are the FROM item's alias when it has one**, else its unqualified
+   catalog name — `estimateaudit.leafRel`'s rule (parity.go). Without it Q7's
+   `nation n1` / `nation n2` collapse into one member on the search side while
+   staying distinct on the plan side.
+3. **Refusals are recorded, not just acceptances.** The connectivity gate
+   (`hasRelevantJoinClause`, joinsearchlevel.go) is the one place a partition PG
+   chose can be silently withheld; logging only the accepted pairs would report
+   "declined for want of a join clause" and "never reached" as the same silence.
+
+**Reader** — `internal/estimateaudit/enumtrace.go`, driven by
+`estimate-audit --enum-trace <server log>` (the arm script passes it whenever
+`DP_TRACE=1`). It derives the partitions to adjudicate from the §3.11 spine
+diff and answers each one:
+
+| verdict | meaning | clause 6 |
+|---|---|---|
+| `OFFERED` | the search produced this pairing | divergence is cost/stats — §4 admits it, **passes** |
+| `DECLINED` | reached and refused by the connectivity gate | a named gap, **fails** |
+| `SIDE-NOT-BUILT` | one side was never built as a joinrel — a gap one level below | a named gap, **fails** |
+| `NOT-ENUMERATED` | both sides exist, the pair was neither offered nor declined | a named gap, **fails** |
+| `NO-TRACE` | no traced problem spans it — a statement about the HARVEST, not the search | inadmissible |
+
+**Controls are part of the instrument, not of the report.** Every bushy pairing
+goopg itself chose was by construction offered to `makeJoinRel`, so it must come
+back `OFFERED`; §3.11 names Q20's matched pairing as exactly this control. The
+reader derives the control set from the diff rather than hard-coding Q20, and a
+failing control prints `VERDICT: HARNESS FAULT` and voids every candidate
+verdict in that run — the guard that stops an unharvested log (wrong path, flag
+off, wrong arm) from being reported as a planner defect.
+
+Ratchet line:
+`RATCHET enum_controls= enum_candidates_offered= enum_problems= enum_malformed=`.
+
+**Live smoke, 2026-08-06** (`analysis/leftdeep-joins/2026-08-06-p59lii-dptrace-*`):
+on a throwaway 4-relation cluster the chosen plan is bushy, the trace records
+that partition at `phase=2` with `created=0` (a phase-1 pair reached the top
+relset first — which is itself the proof that "relset built" and "partition
+offered" are different questions), the alias `n1` survives, and an unconnected
+partition adjudicates to `SIDE-NOT-BUILT` with the side named.
+
+**Not yet measured**: Q7's and Q8's candidates on TPC-H SF=1. The arm is
+`DP_TRACE=1 PGSHAPED=1 scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20`;
+it was blocked on the nightly CI batch holding the host.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

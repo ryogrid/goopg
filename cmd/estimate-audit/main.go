@@ -87,6 +87,7 @@ type flags struct {
 	refPass   string
 	slack     float64
 	floor     float64
+	enumTrace string
 }
 
 func main() {
@@ -122,7 +123,17 @@ func main() {
 		// the parity column above cannot answer: it keys on the relset a node
 		// builds, and two engines that partition the same relset differently
 		// both report it MATCHED (09 §3.10, M0127-P5.9-l).
-		out += "\n" + estimateaudit.RenderSpine(reports, ref, estimateaudit.SpineDiff(reports, ref))
+		spine := estimateaudit.SpineDiff(reports, ref)
+		out += "\n" + estimateaudit.RenderSpine(reports, ref, spine)
+		// …and the SEARCH side of the same clause, when the arm was run with
+		// `GOOPG_PGSHAPED_DP_TRACE=1` and its server log is handed over. The
+		// spine diff can only NAME the bushy partitions PG chose and goopg did
+		// not; whether the goopg search ever OFFERED them — cost divergence,
+		// which §4 admits, versus a shape it cannot enumerate, which §4 fails —
+		// is only in the search's own record (M0127-P5.9-l-ii).
+		if f.enumTrace != "" {
+			out += "\n" + renderEnum(f.enumTrace, spine)
+		}
 	}
 
 	writeReport(f, out, plans, refPlans)
@@ -192,6 +203,23 @@ func referenceReports(f *flags) ([]estimateaudit.QueryReport, string, bool) {
 	return reports, plans, true
 }
 
+// renderEnum harvests the join search's own enumeration record from an arm's
+// server log and adjudicates clause 6's bushy partitions against it.
+//
+// An unreadable log is reported into the artifact rather than fatal: the audit
+// this section hangs off is a 13-minute measurement, and losing it because a
+// secondary channel's path was mistyped would be the expensive failure.
+func renderEnum(path string, spine []estimateaudit.SpineRow) string {
+	fh, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("=== JOIN-SEARCH ENUMERATION PROVENANCE (09 §4 clause 6, P5.9-l-ii)\n"+
+			"  NOT HARVESTED: open %s: %v\n", path, err)
+	}
+	defer fh.Close()
+	t := estimateaudit.ParseEnumTrace(fh)
+	return estimateaudit.RenderEnum(t, t.Adjudicate(estimateaudit.EnumChecks(spine)))
+}
+
 func replayPlans(path string) []estimateaudit.QueryReport {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -230,6 +258,7 @@ func parseFlags(args []string) *flags {
 	fs.StringVar(&f.refPass, "ref-password", "tpch", "reference password")
 	fs.Float64Var(&f.slack, "parity-slack", estimateaudit.DefaultParitySlack, "09 §4 ratchet: how many times worse than PG a joinrel may be")
 	fs.Float64Var(&f.floor, "parity-floor", estimateaudit.DefaultParityFloor, "09 §4 ratchet: goopg's own ratio must also exceed this")
+	fs.StringVar(&f.enumTrace, "enum-trace", "", "goopg server log from a GOOPG_PGSHAPED_DP_TRACE=1 arm; adjudicates clause 6's bushy partitions against what the join search actually enumerated")
 	fs.Parse(args)
 	if f.label == "" {
 		fmt.Fprintln(os.Stderr, "--label is required")

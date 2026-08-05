@@ -1560,6 +1560,29 @@
   passes and P5.9 flips) or the bushy phase has a named gap on them (a new
   slice). Files: `internal/planner/joinsearchlevel.go`, `joinsearch.go`,
   `cmd/estimate-audit/`, `scripts/tpch-estimate-audit-arm.sh`.
+  **↳ THE CHANNEL IS BUILT (2026-08-06, 09 §3.12); the item stays open on the
+  MEASUREMENT.** Writer: `internal/planner/joinsearchtrace.go`, gated on
+  `GOOPG_PGSHAPED_DP_TRACE=1` (nil `searchCtx.trace` when off, so production is
+  untouched), emitting one whole-block `DPTRACE` write per join problem to
+  stderr — the relid → name map, every offered `(outer, inner, phase)` triple
+  with a `created` bit, and every pair the connectivity gate declined with its
+  reason. Reader: `internal/estimateaudit/enumtrace.go` +
+  `estimate-audit --enum-trace <server log>` (`DP_TRACE=1` in the arm script
+  passes it), which derives the partitions to adjudicate from the P5.9-l-i
+  spine diff and answers `OFFERED` / `DECLINED` / `SIDE-NOT-BUILT` /
+  `NOT-ENUMERATED` / `NO-TRACE`. Two decisions are load-bearing: the pair key
+  is `SpineJoin.PairKey`'s string byte for byte and names follow `leafRel`'s
+  alias-first rule (else Q7's two `nation` scans collapse on one side only),
+  and goopg's OWN bushy pairings are derived as controls — a control that is
+  not `OFFERED` prints `VERDICT: HARNESS FAULT` and voids the run.
+  Unit-tested on both sides (5 planner tests, 6 audit tests) and smoke-verified
+  in a live server (`analysis/leftdeep-joins/2026-08-06-p59lii-dptrace-*`): a
+  bushy chosen plan recorded at `phase=2` with `created=0`, alias `n1`
+  preserved, an unconnected partition adjudicated `SIDE-NOT-BUILT`.
+  **REMAINING: the TPC-H arm.** `DP_TRACE=1 PGSHAPED=1
+  scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20` — not run
+  2026-08-06 because the nightly CI batch held the host and the arm script
+  refuses beside it (correctly: concurrent runs contaminate both).
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

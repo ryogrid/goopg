@@ -8236,6 +8236,21 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `internal/planner/joinsearchlevel.go`, `joinsearch.go`,
       `cmd/estimate-audit/`, `scripts/tpch-estimate-audit-arm.sh`.
       09 §3.11; IMPLEMENTATION-TODO P5.9-l-ii.
+      **↳ THE CHANNEL IS BUILT 2026-08-06 (09 §3.12); this item stays open on
+      the MEASUREMENT only.** `internal/planner/joinsearchtrace.go` emits a
+      `DPTRACE` block per join problem under `GOOPG_PGSHAPED_DP_TRACE=1` (the
+      relid→name map, every offered `(outer, inner, phase)` triple, every
+      connectivity-gate refusal with its reason); `internal/estimateaudit/
+      enumtrace.go` + `estimate-audit --enum-trace <server log>` (passed by
+      `DP_TRACE=1` in the arm script) adjudicates each spine-diff candidate as
+      OFFERED / DECLINED / SIDE-NOT-BUILT / NOT-ENUMERATED / NO-TRACE, with
+      goopg's own bushy pairings as derived CONTROLS — a failing control prints
+      `VERDICT: HARNESS FAULT` and voids the run. 11 unit tests + a live-server
+      smoke (`analysis/leftdeep-joins/2026-08-06-p59lii-dptrace-*`).
+      **NEXT: run `DP_TRACE=1 PGSHAPED=1
+      scripts/tpch-estimate-audit-arm.sh <label> --queries 7,8,20`** and read
+      the ENUMERATION SUMMARY — blocked 2026-08-06 by the nightly CI batch
+      holding the host. 2 ledger rows.
 - [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
       scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
       and it was NOT the splice arithmetic this item predicted. At 4-under-5

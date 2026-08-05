@@ -25,6 +25,11 @@
 #              both arms — see tpch-acceptance-arm.sh's note on why an unset
 #              flag stops being a well-defined arm the day the default flips.
 #   COLLAPSE   GOOPG_PGSHAPED_COLLAPSE (default 0)
+#   DP_TRACE   1 = run the server with GOOPG_PGSHAPED_DP_TRACE=1 and hand its
+#              log to the audit tool as --enum-trace, which adds the clause-6
+#              enumeration-provenance section (M0127-P5.9-l-ii). Only
+#              meaningful with PGSHAPED=1: the trace is written by the
+#              PG-shaped search, so a PGSHAPED=0 arm produces an empty one.
 #   REFERENCE  PG 18.3 reference plans file for the §4 parity gate. Default is
 #              the committed capture, so the ratchet stays comparable to the
 #              baseline §4.1 pinned; pass empty to skip the parity column, or
@@ -65,6 +70,7 @@ export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-2
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_COLLAPSE="${COLLAPSE:-0}"
+export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
 
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     echo "something is already listening on ${PG_HOST}:${PG_PORT} — stop it first (bench/tpch/stop_goopg.sh)" >&2
@@ -111,8 +117,11 @@ done
 
 audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "${PER_Q}")
 [[ -n "${REFERENCE}" ]] && audit_args+=(--reference "${REFERENCE}")
+# The server log IS the trace channel, and the tool reads it after the last
+# query has been planned, so no extra synchronisation is needed here.
+[[ "${GOOPG_PGSHAPED_DP_TRACE}" == "1" ]] && audit_args+=(--enum-trace "${SRV_LOG}")
 
-echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE} started $(date -Is)"
+echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} started $(date -Is)"
 ( cd "${REPO_ROOT}" && "${AUDIT_BIN}" "${audit_args[@]}" "$@" )
 rc=$?
 echo "# audit ${LABEL} finished $(date -Is) rc=${rc}"
