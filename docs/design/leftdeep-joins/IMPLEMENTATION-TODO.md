@@ -1362,16 +1362,35 @@
   the flag-OFF control on the same engine takes 33.17 s to succeed, so there is
   no Q17 timing regression at all and the "157×" figure is withdrawn. The
   residue is a correctness defect, filed as P5.9-f.
-- [ ] **P5.9-f** Flag-ON Q17 raises `column ref l_quantity/30 out of
-  VirtualSlot range 27 (chained-NLI?)` (`internal/executor/expr.go:366`) after
-  28.7 s: an expression whose var indexes exceed the tuple width at the node
-  the PG-shaped search built — the P5.9-c family (a coordinate map that is
-  right at the boundary and wrong above it) one level further out. Q17 is the
-  correlated-aggregate subquery shape, and the message's own guess names the
-  chained NLI. Start by dumping the failing node's schema width against the
-  Var indexes the residual carries. **P5.9's full bar re-run is blocked on
-  this.** Gate: Q17 flag-ON returns rows matching the flag-OFF arm under
-  `tpch-runner -diff`.
+- [x] **P5.9-f** The decorrelated aggregate is a foreign coordinate scope, and
+  the splice's join key relied on a repair pass. DONE 2026-08-05 — **two
+  independent defects**, the second uncovered by fixing the first.
+  (1) `buildBindingsPosMap`'s `collect` DESCENDED into a join-input
+  `*Aggregate` while its twin `applyJoinTreePosMap` has always STOPPED at one;
+  with the flag on, the searched outer side records no entries, so the
+  decorrelated `HashAggregate`'s lineitem CLONE became the first and only
+  `lineitem` entry — at offset 25 — and the residual's `l_quantity/4` was
+  remapped to `l_quantity/29` against a 27-wide slot. Fix: opaque leaf
+  (`off += len(x.Output())`), the third instance of "build and apply must stop
+  at the same nodes" (`*Project` M0125-0012, `*SetOp`/`*WindowAgg` RC-2); the
+  descent was also advancing `off` by the CHILD's width, `*WindowAgg`'s
+  original defect. (2) With the remap correctly declining,
+  `reresolveJoinByName` stopped running and flag-ON Q17 returned **0 rows** vs
+  the control's 5: `unnestSubquery` built the splice's `RightKey` with the
+  inner-relative index `0` while its `Predicate`/`LeftKey` used merged
+  coordinates, so the executor's merged-slot key eval hashed
+  `part.p_partkey` against `lineitem.l_orderkey`. Latent since the splice was
+  written, masked because the name-rebind repaired it on every path that
+  reached it. Fix: build it at `outerWidth`. Reproducer is a 3000-row fixture
+  (~1 s), not the 28 s SF1 arm. Regression tests:
+  `TestQ17DecorrelatedAggregateCoordinates` (both flag settings),
+  `TestBuildBindingsPosMapStopsAtJoinInputAggregate`.
+  [09](09-verification-and-acceptance.md) §5.21;
+  `analysis/leftdeep-joins/p59f/`. Gate MET: one binary, both arms,
+  `tpch-runner -diff` → `Q17 MATCH rows=1`, **VERDICT: PASS** (33.46 s ON /
+  32.98 s OFF). Also UNITS, SPOT, and DS05 (PASS=95, MISMATCH=0, plan shapes
+  99/99 identical) — both fixes change flag-OFF planning for every
+  correlated-aggregate decorrelation. **P5.9's full bar re-run is unblocked.**
 
 ## P-S6 — Compiled key/residual evaluation [S6]
 

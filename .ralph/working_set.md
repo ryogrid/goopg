@@ -1,53 +1,53 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-d CLOSED** — clause 1's instrument exists and is
-calibrated. Committed + pushed. Facts the next loop must NOT re-derive:
+Last loop: **M0127-P5.9-f CLOSED**. Facts the next loop must NOT re-derive:
 
-1. `cmd/tpch-runner -digest` emits `colsig` / `ordered` / `unordered` per result
-   set; `-diff A.log B.log` compares two arms and exits 1 on any non-MATCH.
-   `NO-DIGEST` and `BOTH-ERROR` are FAILING verdicts by design.
-2. **`rows=N` must stay the LAST token on the OK line.** Three gate scripts
-   (`tpch-spotcheck.sh:249`, `stage-tpch.sh:193`, `tpch-relsize-arm.sh:323`)
-   extract it with an end-of-line-anchored regex. Digests go BEFORE it.
-   `TestOKLineKeepsRowsTerminal` pins this with the gates' own regex — do not
-   "tidy" the token order.
-3. Calibration DONE: flag-OFF arm vs itself = **24/24 MATCH**, four server
-   processes, two engine images. Tie-prone Q3/Q10/Q16/Q15a matched on the
-   ORDERED digest too → a clean run yields no spurious `ORDER-DIFF`. `-digest`
-   costs ~2 % (389 s vs 380.1 s). Evidence:
-   `analysis/leftdeep-joins/2026-08-05-p59d-digest-selfdiff.txt`.
-4. `scripts/tpch-acceptance-arm.sh` is now IN THE REPO (promoted from tmp/).
-   Use it for both arms of the re-run; it refuses a busy port and a live
-   nightly, and builds to `tmp/goopg-acceptance-bin` (never the shared
-   `tmp/goopg-bench-bin`). Pass `NO_BUILD=1` on the second arm to hold ONE
-   binary across both — that is what makes the arms comparable.
-5. Digest design decisions that are load-bearing (all test-pinned): SUM not XOR
-   for the multiset digest (XOR cancels a duplicated row); length-prefixed
-   fields not delimiters (a text column can contain any delimiter); an explicit
-   NULL marker byte (else NULL hashes as `''`).
-6. Ledgered blind spot: the diff compares two GOOPG arms, never PG. A value
-   wrong in both arms reports MATCH. Oracle arm + rendering canonicalisation is
-   the resume point in the ledger row.
+1. **P5.9-f was TWO defects, both now fixed and pinned.** (a)
+   `buildBindingsPosMap`'s `collect` descended into a join-input `*Aggregate`
+   while `applyJoinTreePosMap` has always stopped there — with the flag ON the
+   searched outer side records no entries, so the decorrelated HashAggregate's
+   lineitem CLONE became the only `lineitem` entry (offset 25) and the residual
+   `l_quantity/4` became `/29`. Fixed as an opaque leaf. (b) With the remap
+   correctly declining, `reresolveJoinByName` stopped running and Q17 returned
+   **0 rows**: `unnestSubquery` built the splice's `RightKey` at the
+   inner-relative `0` while `Predicate`/`LeftKey` used merged coordinates.
+   Fixed at `outerWidth`. Do NOT "simplify" either back.
+2. **The reproducer is ~1 s, not the 28 s SF1 arm** — a 3000-row lineitem /
+   200-row part fixture on a throwaway 5533 cluster; recipe in
+   `analysis/leftdeep-joins/p59f/README.md`. Note the fixture trap recorded
+   there: `l_quantity` must NOT be a function of `l_partkey` or nothing matches
+   and the fixture cannot fail.
+3. **P5.9's full bar re-run is UNBLOCKED and is M0127's next action.** Run 1's
+   remaining clause-1 counts (Q2 0 rows; Q7/Q8/Q9 `42883`; Q5/Q10 timing) were
+   all attributed to the rotation P5.9-c fixed — **re-measure before
+   re-diagnosing any of them.** Protocol: `NO_BUILD=1 PGSHAPED=0|1
+   scripts/tpch-acceptance-arm.sh <name> <out>` holding ONE binary across arms,
+   then `tmp/tpch-acceptance-runner -diff <off> <on>` (clause 1 is values, not
+   row counts).
+4. Two ledger rows filed. The generalisations deliberately NOT done: the
+   twin-walker node-set agreement (`collect` vs `applyJoinTreePosMap` — third
+   divergence found) and an audit of the nine `&Join{}` construction sites for
+   keys that depend on `reresolveJoinByName`'s by-name repair.
+5. Incidental, unrelated discovery filed as **M0119-0010**: `char(N)` typmods
+   are not restored per column on catalog reload (same INSERT succeeds before a
+   restart, `ERROR: value too long for type character(1)` after, while `\d`
+   still reports the right types). Three-statement repro in the same README.
 
-Files: `cmd/tpch-runner/{digest.go,digestdiff.go,main.go,README.md}` + two new
-test files; `scripts/tpch-acceptance-arm.sh` (new).
-Docs: 09 §3.3 (new) + §3 clause 1 amended, leftdeep-joins/README.md,
-IMPLEMENTATION-TODO P5.9-d, fix_plan P5.9-d + P5.9 parent, 1 ledger row.
+Files: `internal/planner/bushy.go`, `internal/planner/unnest.go`,
+`internal/planner/joinsearchunnest_test.go` (new).
+Docs: leftdeep-joins/09 §5.21 (new), bundle README status, IMPLEMENTATION-TODO
+P5.9-f, fix_plan P5.9-f + parent + M0119-0010, 2 ledger rows,
+`analysis/leftdeep-joins/p59f/`.
 
-Gates run: UNITS (`RALPH_PRECOMMIT_SCOPE=units`) PASS incl. cmd/tpch-runner;
-SPOT (`scripts/tpch-spotcheck.sh`, private GOOPG_BIN) PASS — Q12 rows=2,
-Q13 rows=35, 28.2 s — which is also the proof the changed output format still
-parses in the real gate; the SF1 self-diff above; `make ralph-state-guard`
-(repaired the stale progress marker, then OK); pgbench smoke via the commit hook.
+Gates run: UNITS PASS; SPOT PASS (Q12 rows=2, Q13 rows=35, 28.9 s); **DS05 sweep
+PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan shapes 99/99 identical**
+(both fixes change flag-OFF planning, so this was required, not optional);
+Q17 arms ON/OFF on one binary → `tpch-runner -diff` **VERDICT: PASS**;
+pgbench smoke via the commit hook; `make ralph-state-guard` (self-repaired).
 
-Nightly triage 20260805-014309: unchanged, both items already filed under
+Nightly triage 20260805-014309: unchanged run, both items already filed under
 M-NIGHTLY, left unchecked per the banner.
 
-Next step: **M0127-P5.9-e** — Q17 at flag ON, re-measured on top of the P5.9-c
-fix. Run it ALONE on a fresh server (`QUERIES=17 PGSHAPED=1
-scripts/tpch-acceptance-arm.sh q17on /tmp/q17-on.txt`) against the same
-flag-OFF arm. Bar: ≤ 2× its flag-OFF 20.93 s, or an attributed finding — if it
-still hangs, PROFILE it (low CPU + large heap ⇒ allocation, not a spin) rather
-than re-reading EXPLAIN. P5.9 (the full bar re-run + flip) comes after -e.
+Next step: **M0127-P5.9** — the full S5 acceptance bar re-run + flag flip.
 
 In-flight: none.

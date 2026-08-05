@@ -2103,9 +2103,32 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 		// Hash key uses the FIRST param's pair. The remaining
 		// per-pair equalities are enforced as residuals via the
 		// Predicate above.
-		LeftKey:  outerKeyExprs[0],
-		RightKey: &ColumnRef{pos: sub.Pos(), Index: 0, Name: params[0].SubCol.Name, Type: params[0].SubCol.Type},
-		schema:   mergedSchema,
+		//
+		// M0127-P5.9-f: RightKey is `innerKeyExprs[0]`'s coordinate —
+		// `outerWidth`, the group-by column's position in the MERGED
+		// schema — not the inner-relative `0` it used to carry. The
+		// executor evaluates both join keys against a merged slot
+		// (`mergedKeySlot`, operators_join_agg.go), so `0` addressed the
+		// OUTER side's first column: TPC-H Q17 hashed `part.p_partkey`
+		// against `lineitem.l_orderkey` and the join matched nothing.
+		// It was invisible because `reresolveJoinByName`
+		// (applyJoinTreePosMap, bushy.go) rebinds join keys by NAME and
+		// silently repaired it on every path that reached it — an
+		// undeclared dependency on a later pass. P5.9-f's `*Aggregate`
+		// opacity fix makes `buildBindingsPosMap` decline on this shape,
+		// so that pass no longer runs and the latent index surfaced.
+		// A separate ColumnRef (not the `innerKeyExprs[0]` pointer) so
+		// key and Predicate stay independently rewritable, matching the
+		// LeftKey line above.
+		LeftKey: outerKeyExprs[0],
+		RightKey: &ColumnRef{
+			pos:            sub.Pos(),
+			Index:          outerWidth,
+			Name:           params[0].SubCol.Name,
+			Type:           params[0].SubCol.Type,
+			SourceTableIdx: params[0].SubCol.SourceTableIdx,
+		},
+		schema: mergedSchema,
 	}
 	filter.Child = join
 	return outer, nil

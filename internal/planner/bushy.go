@@ -2656,7 +2656,43 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Sort:
 			collect(x.Child)
 		case *Aggregate:
-			collect(x.Child)
+			// M0127-P5.9-f (TPC-H Q17): opaque leaf, NOT a descent.
+			// `applyJoinTreePosMap` has always stopped at *Aggregate
+			// ("aggregate expressions are a different scope"), so the
+			// entries this arm used to record were never applied inside
+			// the aggregate's own subtree — they only leaked into
+			// `scanMap` and mis-addressed the SAME table elsewhere in the
+			// tree. Build and apply must stop at the same nodes; this is
+			// the third instance of that rule (*Project M0125-0012,
+			// *SetOp/*WindowAgg RC-2).
+			//
+			// The descent was also numerically wrong on its own terms: an
+			// Aggregate's output is group keys + agg results, so
+			// descending advanced `off` by the CHILD's width instead of
+			// the aggregate's, leaving every node to its RIGHT short by
+			// the difference — the identical defect *WindowAgg was moved
+			// out of the descend set for.
+			//
+			// Q17 is where it became visible. `unnestSubquery` (unnest.go)
+			// decorrelates `l_quantity < (select 0.2*avg(l_quantity) from
+			// lineitem where l_partkey = p_partkey)` into a hash join whose
+			// INNER side is a HashAggregate over a CLONE of lineitem — a
+			// separate planning scope. With `GOOPG_PGSHAPED_DP` on, the
+			// outer side is a searched subtree and so records no entries
+			// (the arm above), which left that clone as the FIRST and only
+			// `lineitem` entry, at offset 25. Every outer `lineitem`
+			// binding was then remapped to `25 + col`, and the residual
+			// `l_quantity/4` became `l_quantity/29` against a 27-wide
+			// composed slot: "column ref l_quantity/29 out of VirtualSlot
+			// range 27". Flag OFF hid it only by accident — the untagged
+			// outer join recorded `lineitem` at offset 0 first, and
+			// "first occurrence wins" (below) discarded the clone.
+			//
+			// With this arm opaque, Q17 collects no entries at all and the
+			// remap declines — which is the truth: the search boundary
+			// already publishes binding order, so there is nothing to
+			// correct. See 09 §5.21.
+			off += len(x.Output())
 		case *Values:
 			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
 			// Advance off by the output width so sibling scans stay aligned.

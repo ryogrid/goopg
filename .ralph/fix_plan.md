@@ -8070,11 +8070,15 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `extract(year from …)` is merely the only TPC-H construct that
       type-checks at run time, which is why exactly three queries were loud.
       Re-run the whole bar after P5.9-c/-d/-e. 3 ledger rows.
-      **-c, -d and -e are DONE (2026-08-05); the re-run is now blocked only on
-      P5.9-f.** Two of run 1's clause-1 counts are already re-attributed by -e:
-      Q17's ">3300 s" was never a runtime — it was a Gather that swallowed the
-      query's error — so it belongs with the wrong-answer counts, not the
-      timing ones.
+      **-c, -d, -e AND -f are all DONE (2026-08-05) — the re-run is
+      UNBLOCKED and is this milestone's next action.** Two of run 1's clause-1
+      counts were re-attributed by -e: Q17's ">3300 s" was never a runtime — it
+      was a Gather that swallowed the query's error — so it belongs with the
+      wrong-answer counts, not the timing ones; -f then fixed the two defects
+      behind that error and Q17 now MATCHes the flag-OFF arm on values.
+      Expect run 1's remaining clause-1 counts to move as well: -c fixed the
+      rotation all four were attributed to, so re-measure before re-diagnosing
+      any of them.
       When it runs: drive both arms with `scripts/tpch-acceptance-arm.sh` and
       `-digest`, and discharge clause 1 with `tpch-runner -diff <off> <on>`
       reporting `VERDICT: PASS` — a row-count table is no longer evidence
@@ -8159,20 +8163,39 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       "157×" figure is withdrawn. 09 §5.20; parallel-query/05 §3;
       `analysis/leftdeep-joins/2026-08-05-p59e-q17-hang.txt`. Bar met: UNITS +
       SPOT + the two arms above. 1 ledger row (the residue → P5.9-f).
-- [ ] **M0127-P5.9-f — flag-ON Q17 addresses a column past the tuple width.**
-      `column ref l_quantity/30 out of VirtualSlot range 27 (chained-NLI?)`
-      (XX000, `internal/executor/expr.go:366`) after 28.7 s, discovered by
-      P5.9-e once the Gather stopped swallowing it. An expression whose Var
-      indexes exceed the schema width at a node the PG-shaped search built —
-      the P5.9-c family (a coordinate map correct at the boundary, wrong above
-      it) one level further out. Q17 is the correlated-aggregate subquery
-      shape and the message's own guess names the chained NLI. Start by
-      dumping the failing node's schema width against the Var indexes its
-      residual carries; do NOT start from EXPLAIN (P5.9-e's lesson: the plan
-      text differed by one line and predicted nothing). **P5.9's full bar
-      re-run is blocked on this.** 09 §5.20; IMPLEMENTATION-TODO P5.9-f.
-      Bar: flag-ON Q17 returns rows matching the flag-OFF arm under
-      `tpch-runner -diff`.
+- [x] **M0127-P5.9-f — the decorrelated aggregate is a foreign coordinate
+      scope, and the splice's join key relied on a repair pass.** DONE
+      2026-08-05 — **two independent defects**, the second uncovered by fixing
+      the first, and only the first was the reported symptom.
+      (1) `buildBindingsPosMap`'s `collect` DESCENDED into a join-input
+      `*Aggregate` while its twin `applyJoinTreePosMap` has always STOPPED at
+      one (M0041 arm, no recorded motivation). With the flag ON the searched
+      outer side records no scan entries, so the decorrelated `HashAggregate`'s
+      **clone** of lineitem became the first and only `lineitem` entry, at
+      offset 25; "first occurrence wins" made the map read `lineitem[i] →
+      25+i` and the residual's `l_quantity/4` became `l_quantity/29` against a
+      27-wide slot. Flag OFF hid it by accident (the untagged outer join
+      recorded lineitem at 0 first). Fix: opaque leaf — the THIRD instance of
+      "build and apply must stop at the same nodes" (`*Project` M0125-0012,
+      `*SetOp`/`*WindowAgg` RC-2); the descent also advanced `off` by the
+      CHILD's width, `*WindowAgg`'s own original defect.
+      (2) With the remap correctly declining, `reresolveJoinByName` stopped
+      running and flag-ON Q17 returned **0 rows** against the control's 5:
+      `unnestSubquery` built the splice's `RightKey` with the inner-relative
+      index `0` while its `Predicate`/`LeftKey` used merged coordinates, and
+      the executor evaluates keys against a MERGED slot — so Q17 hashed
+      `part.p_partkey` against `lineitem.l_orderkey`. Latent since the splice
+      was written, masked because the by-name rebind repaired it on every path
+      that reached it. Fix: build it at `outerWidth`.
+      Reproducer: a 3000-row Q17 fixture (~1 s), not the 28 s SF1 arm.
+      Tests: `TestQ17DecorrelatedAggregateCoordinates` (both flag settings),
+      `TestBuildBindingsPosMapStopsAtJoinInputAggregate`.
+      09 §5.21; IMPLEMENTATION-TODO P5.9-f; `analysis/leftdeep-joins/p59f/`.
+      Bar MET: one binary, both arms, `tpch-runner -diff` → `Q17 MATCH rows=1`
+      **VERDICT: PASS** (33.46 s ON / 32.98 s OFF). Also UNITS, SPOT, and DS05
+      (PASS=95 MISMATCH=0 ERROR=0, plan shapes 99/99 identical) — both fixes
+      change flag-OFF planning for every correlated-aggregate decorrelation.
+      **P5.9's full bar re-run is now unblocked.** 2 ledger rows.
 - [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
       conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
       `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1
@@ -8343,6 +8366,24 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
+
+- [ ] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
+      reload** (source: M0127-P5.9-f, ledger row 2026-08-05). A table created at
+      runtime accepts `insert into ct values ('N','DELIVER IN PERSON')` into
+      `ct(a char(1), b char(25))` and **rejects the identical statement after a
+      restart** with `ERROR: value too long for type character(1)` — every
+      length-checked column is validated against the first column's typmod (or
+      against 1) once the catalog comes back from disk, while `\d ct` still
+      reports `character(1)` / `character(25)` correctly. So the catalog reports
+      the right typmods and the coercion path applies the wrong one. PG restores
+      `atttypmod` per attribute from `pg_attribute`
+      (`postgres/src/backend/utils/adt/varchar.c`, `bpchar()`). Three-statement
+      repro + resume point: `analysis/leftdeep-joins/p59f/README.md` and the
+      ledger row. Start at the reload that rebuilds `catalog.Column.Type` from
+      the on-disk `pg_attribute` heap (`internal/catalog`) and diff a
+      pre-restart against a post-restart `catalog.Table` column-by-column.
+      Bar: the repro's second INSERT succeeds, plus a regression test that
+      round-trips a multi-column `char(N)`/`varchar(N)` table through a restart.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over

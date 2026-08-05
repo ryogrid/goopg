@@ -1645,6 +1645,105 @@ sequence cost: the acceptance bar's per-query timeout could not fire either,
 because the hang is *after* the row stream, in the server, where a client-side
 cancel has nothing to interrupt — a bounded arm is not a bounded server.
 
+### 5.21 The decorrelated aggregate is a foreign scope, and the join key relied on a repair pass, 2026-08-05 (P5.9-f)
+
+P5.9-e handed this item one symptom — `column ref l_quantity/30 out of
+VirtualSlot range 27` at flag ON — and one instruction: dump the failing node's
+schema width against the Var indexes its residual carries, and do **not** start
+from EXPLAIN. Both were followed, and the item turned out to contain **two
+independent defects on the same seam**. Only the first is the reported symptom;
+the second was uncovered by fixing the first, and would have shipped a silently
+wrong answer.
+
+**Reproducer, ~1 s.** The 28.7 s SF1 arm is not the instrument. Q17's shape on a
+3000-row, 200-part fixture in a throwaway cluster reproduces the error verbatim
+(`l_quantity/29`, the same 25-offset one plan-shape apart) and turns each
+iteration from half a minute into a second. Evidence:
+`analysis/leftdeep-joins/p59f/`.
+
+**The shape.** Q17's WHERE carries a correlated scalar aggregate, so
+`whereEligibleForPreDPUnnest` (predp.go) declines the pre-DP position and the
+legacy order runs: **search first, decorrelate second**. `unnestSubquery`
+(unnest.go) then splices a hash join on top of the finished searched tree whose
+inner side is a `HashAggregate` over a **clone** of `lineitem`:
+
+```
+Filter{ l_quantity/4 < 0.2 * avg/26 }
+  Join{INNER hash, width 27}          <- NOT tagged searchedTree
+    Left : <searched tree, 25 cols>   <- tagged; lineitem(0..15) ++ part(16..24)
+    Right: Aggregate{ group l_partkey, avg }   <- 2 cols, a SEPARATE scope
+             Filter -> SeqScan lineitem        <- a CLONE
+```
+
+**Defect 1 — build and apply disagreed about `*Aggregate`.**
+`applyJoinTreePosMap` (bushy.go) has always returned at an `*Aggregate`
+("aggregate expressions are a different scope"). Its build-side twin,
+`buildBindingsPosMap`'s `collect`, **descended** into one — an arm that has been
+there since M0041 with no recorded motivation. With the flag on, the outer side
+is a searched subtree and so records *no* scan entries (P5.5-f-ii-a's opacity),
+which left the aggregate's clone as the **first and only** `lineitem` entry, at
+offset 25. "First occurrence wins" then made the map read `lineitem[i] → 25 + i`,
+and the residual's `l_quantity/4` became `l_quantity/29` against a 27-wide
+composed slot. Flag OFF hid it by **accident**, not by design: the untagged outer
+join recorded `lineitem` at offset 0 first, and the clone's entry was discarded.
+
+The descent was also wrong on its own arithmetic. An `*Aggregate`'s output is
+group keys + agg results, so descending advanced `off` by the *child's* width
+(16) instead of the aggregate's (2), leaving anything to its right short by 14 —
+the identical defect `*WindowAgg` was moved out of the descend set for in RC-2.
+The fix is one line of behaviour: `off += len(x.Output())`, record nothing. This
+is the **third** instance of the same rule (`*Project` M0125-0012, `*SetOp` /
+`*WindowAgg` RC-2), and the rule is now worth stating without a node list:
+**`collect` and `applyJoinTreePosMap` must stop at the same nodes; a node whose
+output is not the ordered concatenation of its children's outputs is an opaque
+leaf to both.**
+
+On Q17 the corrected walk collects *nothing* — the outer side is opaque and the
+inner side is a foreign scope — so the remap declines. That is the truth, not a
+loss: the search boundary already republishes binding order, so there was never
+anything to correct.
+
+**Defect 2 — the join key was being repaired by a pass nobody declared.**
+Declining the remap also stops `applyJoinTreePosMap`, and with it
+`reresolveJoinByName`. Flag-ON Q17 then stopped erroring and started returning
+**zero rows** against the flag-OFF control's five. The cause was in the splice
+itself (unnest.go): its `Predicate` and `LeftKey` used merged coordinates
+(`p_partkey/16 = l_partkey/25`) while its `RightKey` was built with the
+inner-relative index **`0`**. The executor evaluates both keys against a *merged*
+slot (`mergedKeySlot`, operators_join_agg.go), so `0` addressed the outer side's
+first column: Q17 hashed `part.p_partkey` against `lineitem.l_orderkey`. The
+plan dump shows the wreckage precisely — `LeftKey=p_partkey/16
+RightKey=l_partkey/0` with `fillJoinHashKeys` deriving a **second**, correct pair
+from the Predicate, which EXPLAIN rendered as a two-condition `Hash Cond`.
+
+This had been latent since the splice was written, invisible because
+`reresolveJoinByName` rebinds join keys **by name** and silently repaired it on
+every path that reached it. That is the transferable finding: *a construction
+site that emits coordinates in one space and depends on a later name-rebind to
+translate them has no contract, only a habit* — and the habit broke the first
+time a legitimate change made the later pass decline. `RightKey` is now built at
+`outerWidth`, the same coordinate its own `Predicate` uses.
+
+**Result.** Both arms, one binary (`69b9f548e04161c8`), TPC-H SF1:
+
+| arm | result |
+|---|---|
+| `GOOPG_PGSHAPED_DP=1` | `OK elapsed=33.46s ordered=acb1af46ffdeef81 rows=1` |
+| `GOOPG_PGSHAPED_DP=0` | `OK elapsed=32.98s ordered=acb1af46ffdeef81 rows=1` |
+| `tpch-runner -diff` | `Q17 MATCH rows=1` — **VERDICT: PASS** |
+
+Compared on values, not row counts (P5.9-d), which is what makes the second
+defect detectable at all: a zero-row Q17 and a one-row Q17 differ in row count,
+but a *wrongly keyed* Q17 that still returns one row would not. The 28.73 s
+"error" and the 33 s success were never a timing story — the arms are within 1.5 %
+of each other, closing the last thread of the withdrawn "157×" figure.
+
+Blast radius is wider than the flag: both fixes change flag-OFF planning for
+every correlated-aggregate decorrelation. Gates run: UNITS; SPOT (Q12 rows=2,
+Q13 rows=35, 28.9 s); **DS05 sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0, plan shapes 99/99 identical, no verdict changes and no runtime moves**;
+the two arms above. **P5.9's full bar re-run is now unblocked.**
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:
