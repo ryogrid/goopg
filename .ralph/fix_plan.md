@@ -8070,6 +8070,12 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `extract(year from …)` is merely the only TPC-H construct that
       type-checks at run time, which is why exactly three queries were loud.
       Re-run the whole bar after P5.9-c/-d/-e. 3 ledger rows.
+      **-c and -d are DONE (2026-08-05); the re-run is blocked only on P5.9-e.**
+      When it runs: drive both arms with `scripts/tpch-acceptance-arm.sh` and
+      `-digest`, and discharge clause 1 with `tpch-runner -diff <off> <on>`
+      reporting `VERDICT: PASS` — a row-count table is no longer evidence
+      (09 §3.3). Adjudicate any `ORDER-DIFF` individually against that query's
+      `ORDER BY` in the write-up.
 - [x] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
       DONE 2026-08-05 — the P5.9 blocker, and the producer was innocent.
       Reproduced in-process (`select * from customer, orders where o_custkey =
@@ -8097,15 +8103,39 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       leaves the names behind. 09 §3.2; 03 §10 (2026-08-05 amendment); 08 §3.
       Bar met: UNITS + `internal/planner/joinsearchboundary_test.go` (verified
       to FAIL without the bushy.go guard) + SPOT (Q12 2, Q13 35). 1 ledger row.
-- [ ] **M0127-P5.9-d — the acceptance harness compares row counts, not values.**
-      `cmd/tpch-runner` reports `rows=N` only, so five ON-arm queries "matched"
-      without their tuples ever being compared, and the bar detected the defect
-      only through three queries that happened to raise. Add a result-digest
-      mode (stable per-row hash in scan order, plus an order-independent digest
-      for queries without a total `ORDER BY`) and diff the arms' digests. Must
-      land BEFORE P5.9 is re-run — the re-run's whole question is whether the
-      quiet queries are corrupt too. 09 §3.1 (clause 1 as amended). Bar: UNITS +
-      a two-arm digest diff on the flag-OFF arm against itself.
+- [x] **M0127-P5.9-d — the acceptance harness compares row counts, not values.**
+      DONE 2026-08-05 — clause 1's instrument now exists and is calibrated.
+      `cmd/tpch-runner -digest` emits three digests per result set: `colsig`
+      (column names), `ordered` (values in scan order), `unordered` (the
+      wrapping SUM of per-row hashes — a MULTISET digest; SUM not XOR, because
+      XOR cancels an identical pair and a doubled row would digest like a
+      missing one). Fields are LENGTH-PREFIXED, not delimited: a TPC-H text
+      column can contain any delimiter, so `("a","b")` would collide with
+      `("ab","")`. `-diff A.log B.log` compares two arms; `NO-DIGEST` and
+      `BOTH-ERROR` are FAILING verdicts, so a run made without `-digest` cannot
+      read as "everything matched" — precisely how run 1's five corrupt queries
+      passed. `ORDER-DIFF` is reported as a QUESTION, not absolved: the differ
+      has no model of which queries have a total `ORDER BY` (Q3/Q10/Q18 have
+      ties).
+      **One non-obvious constraint discovered:** `rows=N` had to stay the LAST
+      token on the line. `scripts/tpch-spotcheck.sh:249`,
+      `ci/batch/stages/stage-tpch.sh:193` and `scripts/tpch-relsize-arm.sh:323`
+      all extract the row count with an end-of-line-anchored regex, so
+      appending digests after it would have made three existing gates silently
+      extract the empty string the first time anyone ran one with `-digest` —
+      a new instrument disarming three old ones. Digests go before the count;
+      `TestOKLineKeepsRowsTerminal` pins it with the gates' own regex.
+      Also promoted `scripts/tpch-acceptance-arm.sh` out of `tmp/`: run 1's
+      driver was untracked, so the protocol 09 §3.1 documents could not be
+      re-executed from the clean checkout §3.1 itself demands.
+      09 §3.3 (new), §3 clause 1 (now executable); IMPLEMENTATION-TODO P5.9-d;
+      1 ledger row (the diff compares two goopg arms, never the PG oracle).
+      Bar met: UNITS + the OFF-arm self-diff **24/24 MATCH**, repeated across
+      four server processes and two independently built engine images; the
+      tie-prone 10k–20k-row results (Q3, Q10, Q16, Q15a) matched on the ORDERED
+      digest too, so a clean run produces no spurious `ORDER-DIFF`. Cost 389 s
+      vs run 1's digest-less 380.1 s (~2 %, ~61k rows scanned).
+      Evidence: `analysis/leftdeep-joins/2026-08-05-p59d-digest-selfdiff.txt`.
 - [ ] **M0127-P5.9-e — Q17 hangs at flag ON and the cause is unidentified.**
       Re-measured in isolation (fresh server, age 0, only Q17): >1200 s at 3.8%
       CPU / ~8.7 GB RSS vs 20.93 s flag-OFF, so the documented sweep-tail /

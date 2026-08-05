@@ -23,7 +23,7 @@
 | 06 | [06-hash-spill-and-memory.md](06-hash-spill-and-memory.md) | PG hybrid hash join: `ExecChooseHashTableSize` analogue, batch partitioning over `spillWriter`, dynamic nbatch growth, work_mem enforcement; what stays deferred (skew optimisation) |
 | 07 | [07-other-join-operators.md](07-other-join-operators.md) | merge join → streaming with duplicate-group buffering; nested loop → streaming outer + Materialize inner; RIGHT/FULL as hash joins with a matched-bitmap (PG `HJ_FILL_INNER`); semi/anti/null-aware; NLI + Memoize as DP paths; parallel interplay |
 | 08 | [08-migration-and-removal.md](08-migration-and-removal.md) | staged rollout behind flags, plan-snapshot re-baselines, deletion inventory for `MultiHashJoin` (28 non-test arms / 15 files) and `fusedHashJoinOp`, rollback story |
-| 09 | [09-verification-and-acceptance.md](09-verification-and-acceptance.md) | acceptance bars (TPC-H SF1 22/22, per-query and total-time bars, TPC-DS SF0.5 checksum gate), the PG plan-shape parity gate, measurement hygiene |
+| 09 | [09-verification-and-acceptance.md](09-verification-and-acceptance.md) | acceptance bars (TPC-H SF1 22/22, per-query and total-time bars, TPC-DS SF0.5 checksum gate), the PG plan-shape parity gate, measurement hygiene, and §3.3's two-arm result-digest instrument — clause 1 is VALUE equality via `tpch-runner -diff`, not row counts |
 | — | [IMPLEMENTATION-TODO.md](IMPLEMENTATION-TODO.md) | phased task ledger (P0…P6) with gates and deferral pointers |
 
 ## The design in one paragraph

@@ -1299,7 +1299,9 @@
   clause 3 on two, and every clause-1 failure is the ONE defect below. §4/§5
   and the DS05 gate were deliberately not run — they score plan QUALITY on a
   build whose plans compute the wrong answer. Re-run the whole bar after
-  P5.9-c/-d/-e.
+  P5.9-c/-d/-e. **-c and -d are now done: the re-run is blocked only on P5.9-e,
+  and it must be driven by `scripts/tpch-acceptance-arm.sh` with `-digest` on
+  both arms, discharging clause 1 through `tpch-runner -diff` (09 §3.3).**
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is
@@ -1318,12 +1320,29 @@
   names behind. 09 §3.2; 03 §10 (2026-08-05 amendment); 08 §3 (amended).
   Bar met: UNITS + `internal/planner/joinsearchboundary_test.go` (fails without
   the fix) + SPOT (Q12 2 rows, Q13 35 rows).
-- [ ] **P5.9-d** Result-digest mode for `cmd/tpch-runner` (per-row hash in scan
-  order + an order-independent digest for queries without a total `ORDER BY`),
-  and diff the two arms. 09 §3.1 amends clause 1 from row counts to VALUE
-  equality: this run produced a query with the right count and every value one
-  position off, and was saved only by `extract()`'s run-time type check. Must
-  land before P5.9 is re-run. Gate: units + a digest self-diff on the OFF arm.
+- [x] **P5.9-d** Result-digest mode for `cmd/tpch-runner` + a two-arm diff.
+  DONE 2026-08-05 (09 §3.3;
+  `analysis/leftdeep-joins/2026-08-05-p59d-digest-selfdiff.txt`). `-digest`
+  emits three digests per result set — `colsig` (column names), `ordered`
+  (rows in scan order), `unordered` (the wrapping SUM of per-row hashes: a
+  MULTISET digest, sum not XOR so a duplicated row cannot cancel itself) — and
+  `-diff A.log B.log` compares two arms on them. Fields are length-prefixed,
+  not delimited: a text column can contain any delimiter, so `("a","b")` and
+  `("ab","")` would otherwise collide. `NO-DIGEST` and `BOTH-ERROR` are
+  FAILING verdicts — a run without `-digest` must not read as "everything
+  matched", which is exactly how run 1's five corrupt queries passed.
+  `rows=N` deliberately stays the last token on the line: `tpch-spotcheck.sh`,
+  `stage-tpch.sh` and `tpch-relsize-arm.sh` all extract it with an
+  end-of-line-anchored regex, so digests go BEFORE it and `-digest` composes
+  with the existing gates instead of disarming them
+  (`TestOKLineKeepsRowsTerminal`). Also promoted `scripts/tpch-acceptance-arm.sh`
+  out of `tmp/` — run 1's driver was untracked, so the protocol 09 §3.1
+  documents could not be re-executed from a clean checkout.
+  Bar met: UNITS + the OFF-arm self-diff **24/24 MATCH** (repeated across four
+  server processes and two engine images; the tie-prone 10k-20k-row results
+  Q3/Q10/Q16/Q15a matched on the ORDERED digest too, so a clean run yields no
+  spurious `ORDER-DIFF`). Cost ~2 % of arm wall time. Ledger row: the diff
+  compares two goopg arms, never the PG oracle.
 - [ ] **P5.9-e** Q17 hangs at flag ON, cause unidentified. Isolated re-run
   (fresh server, age 0, Q17 alone) still exceeded 1200 s at 3.8% CPU / ~8.7 GB
   RSS vs 20.93 s flag-OFF, refuting the sweep-tail / `GOGC=off` confound. Its

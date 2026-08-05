@@ -43,7 +43,10 @@ binding numeric ones:
 TPC-H SF1, fresh capped server per arm, symmetric 600 s timeouts, server age
 held constant across arms (sweep-tail discipline):
 
-1. **22/22 complete** — zero hang / OOM / timeout / row-count mismatch.
+1. **22/22 complete** — zero hang / OOM / timeout / row-count mismatch. **As
+   amended by §3.1 and made executable by §3.3: plus VALUE-level equality
+   against the flag-OFF arm, evidenced by `tpch-runner -diff` reporting
+   `VERDICT: PASS`. Row counts alone do not discharge this clause.**
 2. **Total wall time ≤ 1.2×** the better of pinned R0 (493.31 s) and a
    contemporaneous integer-arm run at the same HEAD.
 3. **No single query > 2× its R0 time** — Q9 explicitly: ≤ 170.9 s
@@ -175,6 +178,73 @@ the regression test would be green for the wrong reason.
 
 Still open before the bar can be re-run: P5.9-d (the harness compares row
 counts, not values) and P5.9-e (Q17, to be re-measured on top of this fix).
+
+### 3.3 Clause 1's instrument, built and calibrated (P5.9-d, 2026-08-05)
+
+§3.1 amended clause 1 to demand VALUE-level equality and left the harness
+unable to supply it. `cmd/tpch-runner` now computes three digests per result
+set and `-diff` compares two arms on them. Evidence:
+`analysis/leftdeep-joins/2026-08-05-p59d-digest-selfdiff.txt`.
+
+| digest | what it is | what it answers |
+|---|---|---|
+| `colsig` | FNV-1a/64 over the column NAMES in order | did the output header move? |
+| `ordered` | FNV-1a/64 chained over the rows in scan order | same tuples, same sequence? |
+| `unordered` | the wrapping SUM of the per-row hashes | same MULTISET of tuples? |
+
+Three choices in there are load-bearing, and each is pinned by a test in
+`cmd/tpch-runner/digest_test.go`:
+
+- **Sum, not XOR, for the order-independent digest.** XOR cancels an identical
+  pair, so a query that emitted a row twice would digest like a query that
+  emitted it zero times. Sum is commutative *and* duplicate-sensitive, which is
+  what "multiset" requires.
+- **Length-prefixed field encoding, not delimiters.** A TPC-H text column may
+  contain any byte, so a delimiter is forgeable: `("a","b")` and `("ab","")`
+  would collide. NULL gets its own marker byte so it cannot hash as `''`.
+- **`rows=N` stays the LAST token on the line.** `scripts/tpch-spotcheck.sh`,
+  `ci/batch/stages/stage-tpch.sh` and `scripts/tpch-relsize-arm.sh` all extract
+  the row count with an end-of-line-anchored regex. Appending digests after the
+  count would have made all three silently extract the empty string the first
+  time anyone ran a gate with `-digest` — a new instrument that disarms three
+  existing ones. The digests go before the count instead, so `-digest` composes.
+
+The verdicts are deliberately unequal in strength. `VALUE-DIFF` is decisive.
+`ORDER-DIFF` (multisets agree, scan order does not) is a **question**: for a
+query whose `ORDER BY` is a total order it is a defect, and for one with ties —
+Q3, Q10, Q18 — two correct arms may legitimately differ. The differ has no
+model of which query is which, so it reports the distinction rather than
+absolving it. `NO-DIGEST` **fails**: it is how a run made without `-digest` is
+stopped from reading as "everything matched", which is precisely how run 1's
+five silently-corrupt queries passed. `BOTH-ERROR` fails too — a query neither
+arm answered was not compared.
+
+**Calibration — the flag-OFF arm against itself: 24/24 MATCH.** Two arms,
+identical by construction, differing only in the server process and the wall
+clock. All four large tie-prone results (Q3 11521 rows, Q10 20501, Q16 18213,
+Q15a 10000) matched on the *ordered* digest too, so at a fixed plan scan order
+is reproducible and a clean run yields no spurious `ORDER-DIFF`. Repeated across
+four server processes and two independently built engine images. Cost: 389 s vs
+run 1's digest-less 380.1 s, ~2 % over ~61k scanned rows — inside arm-to-arm
+noise. `-digest` still defaults OFF so an R0-comparable timing needs no
+argument.
+
+**The bar itself takes two amendments from this.**
+
+1. Clause 1 is now *executable*: the re-run must produce `VERDICT: PASS` from
+   `tpch-runner -diff <off-arm> <on-arm>`, with every `ORDER-DIFF` — if any —
+   individually adjudicated against that query's `ORDER BY` in the write-up.
+   A row-count table is no longer sufficient evidence for clause 1.
+2. Both arms of the re-run must be driven by **`scripts/tpch-acceptance-arm.sh`**,
+   promoted into the repo this task. Run 1 was driven by an untracked `tmp/`
+   script, so the protocol §3.1 documents could not be re-executed from a clean
+   checkout — and §3.1 ends by requiring exactly that re-execution.
+
+What this does NOT establish, and the re-run must not read into it: both arms
+are goopg. The diff certifies that two goopg arms AGREE, not that either is
+right. A value wrong in both arms is invisible to it; only the PG oracle can
+see that, and wiring one in is a ledger row (2026-08-05, M0127-P5.9-d), not
+part of this instrument.
 
 ## 4. The PG plan-shape parity gate (new instrument)
 
