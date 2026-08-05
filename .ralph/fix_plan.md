@@ -8194,11 +8194,30 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       condition — a full ordered scan the search adds for merge-join
       sortedness — carrying `rows=1`; flag OFF the same relation is a
       `Seq Scan` at `rows=1500000` and the join estimates 21 154 against
-      31 354 actual. First bisect: is the 1 created when the index path is
-      BUILT (sized as a parameterized lookup), or is a correct size
-      mis-consumed by `makeJoinRel`/`sizeJoinRel`?
-      `internal/planner/joinsearchlevel.go:324-330` clamps `rows < 1` to 1 and
-      would MASK a zero as a one.
+      31 354 actual.
+      **HALF LANDED 2026-08-05 (09 §3.6, commit below) — the bisect answered
+      NEITHER branch.** The search's own numbers were always right
+      (`addOneOrderedIndexPath` sets `Path.Rows = rel.Rows`; `makeJoinRel`
+      sizes off that). The 1 was minted AFTER the search by `EstimateRows`
+      (`internal/planner/cardinality.go`), which answered 1 for every
+      `*IndexScan`/`*IndexOnlyScan` on the equality-probe convention — wrong
+      for the bound-less full scan P5.4c-ii-b introduced (`pathnodes.h:1817`,
+      "an empty indexclauses list implies a full index scan"). One arm now
+      returns `tableRows(Table)` when no `Key`/`Keys`/`LowKey`/`HighKey` is
+      bound; anything that binds the index keeps the old answer.
+      Re-measured on the five carrying queries: `parity_violations` **6 → 0**;
+      Q12's `orders` leaf `rows=1` → `rows=1500000` (exactly actual) and its
+      joinrel est 1 → 46 001 against 31 354.
+      `joinsearchlevel.go:324-330`'s clamp is NOT implicated.
+      **REMAINING — and it REFUTES this item's own headline.** Plan shapes and
+      timings are byte-identical before and after (Q12 20.83 s → 20.21 s,
+      Q7 27.47 s → 26.85 s under EXPLAIN ANALYZE). The timing gap is not the
+      estimate collapse. The five still plan a Merge Join over a full ordered
+      index scan of `orders` where the OFF arm plans a Hash Join over a Seq
+      Scan, so what is left is a COST question: `costIndexScan` at
+      `selectivity = 1.0` (`pathindexordered.go`) against `costSeqscan` plus
+      the sort the merge arm avoids. Evidence:
+      `analysis/leftdeep-joins/2026-08-05-p59h-audit-{on,off}.txt`.
       **Q18 is NOT in this class** — its final joinrel is ~23 400× over in
       BOTH arms (actual 70) — so its 2.47× is a plan choice on an equally bad
       estimate and must not be bisected together with the rest.

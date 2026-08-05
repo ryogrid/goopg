@@ -1364,11 +1364,26 @@
   outer input is `Index Scan using orders_pk on orders` with NO index condition
   (a full ordered scan the search adds for merge-join sortedness) carrying
   `rows=1`; flag OFF the same relation is a `Seq Scan` at `rows=1500000` and
-  the join estimates 21 154 (actual 31 354). First bisect: does the index path
-  get sized as a parameterized lookup when it is built, or is a correct size
-  mis-consumed by `makeJoinRel`/`sizeJoinRel`? Note
-  `internal/planner/joinsearchlevel.go:324-330` clamps `rows < 1` to 1 and
-  would MASK a zero as a one.
+  the join estimates 21 154 (actual 31 354).
+  **HALF LANDED 2026-08-05 (09 §3.6) — the bisect answered NEITHER branch.**
+  The search's own numbers were right: `addOneOrderedIndexPath` sets
+  `Path.Rows = rel.Rows` and `makeJoinRel` sizes off that. The 1 was minted
+  after the search, by `EstimateRows` (`cardinality.go`), which answered 1 for
+  EVERY `*IndexScan`/`*IndexOnlyScan` on the equality-probe convention — wrong
+  for the bound-less full scan P5.4c-ii-b introduced. One arm now returns
+  `tableRows(Table)` when no `Key`/`Keys`/`LowKey`/`HighKey` is bound.
+  Re-measured on the five carrying queries: `parity_violations` **6 → 0**,
+  Q12's `orders` leaf `rows=1` → `rows=1500000`, its joinrel est 1 → 46 001
+  (actual 31 354).
+  **REMAINING, and it refutes §3.5's headline:** plan shapes and timings are
+  byte-identical before and after (Q12 20.83 s → 20.21 s). The timing gap was
+  NOT the estimate collapse. The five queries still plan a Merge Join over a
+  full ordered index scan of `orders` where the OFF arm plans a Hash Join over
+  a Seq Scan; whether reading 1.5 M rows through the PK index to save a sort is
+  worth it is a COST question — `costIndexScan` at `selectivity = 1.0`
+  (pathindexordered.go) vs `costSeqscan` plus the avoided sort — and is what is
+  left of this item. `joinsearchlevel.go:324-330`'s `rows < 1` clamp is NOT
+  implicated and needs no change.
   **Q18 is NOT in this class** and must not be bisected with it: its final
   joinrel is ~23 400× over in BOTH arms (OFF est=1 568 274, ON est=1 642 632,
   actual 70), so its 2.47× is a plan choice made on an equally bad estimate.

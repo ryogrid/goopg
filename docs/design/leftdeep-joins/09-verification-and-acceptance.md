@@ -392,6 +392,69 @@ each time) and `sf05_planner_flags_line` in
 `scripts/tpcds-sf05-regression.sh`, which did not print the PGSHAPED flags and
 so made a flag-ON sweep byte-indistinguishable from a flag-OFF one.
 
+### 3.6 The estimate collapse, closed — and what it was not (P5.9-h, 2026-08-05)
+
+§3.5 ended on a bisect question: is the `rows=1` minted when the ordered index
+path is BUILT, or is a correct size mis-consumed by `makeJoinRel` /
+`sizeJoinRel`? **The answer is neither.** The search's own numbers were right
+all along — `addOneOrderedIndexPath` sets `Path.Rows = rel.Rows` (the
+relation's post-restriction estimate, 1 500 000 for `orders`) and `makeJoinRel`
+sizes the joinrel off that. The 1 is minted AFTER the search, when the finished
+plan tree is re-estimated: `EstimateRows` (`internal/planner/cardinality.go`)
+answered **1 for every `*IndexScan` and `*IndexOnlyScan`**, on the convention
+that such a node is an equality probe — one row per call site.
+
+That convention was true of every index scan goopg emitted before
+P5.4c-ii-b. Each one carries an Index Cond binding the index columns, and the
+executor probes it once per outer row. P5.4c-ii-b introduced the second shape
+PG has always had — an index path with an EMPTY `indexclauses` list, which
+"implies a full index scan" (`pathnodes.h:1817`), generated so a merge join
+above it can skip a sort — and for that node the answer is the relation's
+cardinality. The fix is one arm: a node with no `Key`, no `Keys` and no
+`LowKey`/`HighKey` estimates `tableRows(Table)`; anything that binds the index
+keeps the old answer verbatim.
+
+It was never a display defect. `EstimateRows` is what EXPLAIN prints, but it is
+also what sizes a hash table (`operators_join_agg.go:629`), picks a join
+algorithm (`planner.go:2360`) and decides a Memoize (`memoize.go:114`) — and a
+leaf that under-reports by the size of the table under-reports every join above
+it, the same propagation shape M0125-0038 fixed for the pass-through wrappers.
+
+Measured on the five queries that carried all six violations
+(`scripts/tpch-estimate-audit-arm.sh`, `--queries 5,7,9,10,12`, same cluster,
+`analysis/leftdeep-joins/2026-08-05-p59h-audit-{on,off}.txt`):
+
+| | run 3 (ON) | P5.9-h (ON) |
+|---|---|---|
+| `parity_violations` (§4) | **6** | **0** |
+| Q12 `{lineitem,orders}` | est 1 / actual 31 354 | est 46 001 / actual 31 354 (1.5×) |
+| Q5 final joinrel | est 1 / actual 7 411 | 7.0× |
+| Q7 final joinrel | est 1 / actual 5 869 | 2.1× |
+| Q9 final joinrel | est 1 / actual 316 264 | 6.3× |
+| Q10 final joinrel | est 1 / actual 114 106 | 1.4× |
+| Q12's `orders` leaf | `rows=1` | `rows=1500000` (exactly actual) |
+
+**What it did NOT fix, and this is the part that re-opens P5.9-h rather than
+closing it: the plan shapes are byte-identical before and after, and so are the
+timings** (Q12 20.83 s → 20.21 s, Q7 27.47 s → 26.85 s under `EXPLAIN
+ANALYZE`). §3.5 asserted "the timing gap is an estimate collapse"; that
+assertion is **refuted**. The collapse was real and is now gone, and the five
+queries still plan a Merge Join over a full ordered index scan of `orders`
+where the flag-OFF arm plans a Hash Join over a Seq Scan. Choosing to read
+1.5 M rows through a primary-key index to save a sort is a COST question — the
+ordered path's `costIndexScan` at `selectivity = 1.0` against `costSeqscan`
+plus the sort the merge arm avoids — not a cardinality one. That is the
+remaining half of P5.9-h.
+
+Blast radius, measured rather than argued: the flag-OFF TPC-H arm emits **no**
+bound-less index scan at all (the audit's `.plans.txt` for the same five
+queries contains zero `Index Scan` lines), and the TPC-DS SF0.5 plan-shape
+capture reads `queries=99 same=99 changed=0`. The ≤0.6 % drift in the OFF
+arm's `est=` column between run 3 and this run is the audit's own `--warm-stats`
+re-ANALYZE, which samples: same ratios to one decimal, identical shapes, and
+Q9 — whose estimates are driven by relation sizes rather than NDistinct —
+byte-identical.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),
@@ -475,6 +538,13 @@ Q19 is gone, so the LEGACY arm carries **zero** parity violations, and that is
 what future commits ratchet against on the OFF arm. The ON arm's 6 are §3.5's
 estimate collapse and are P5.9-h's to clear; the ON arm's 46 is the first
 measurement of the shape claim [02](02-plan-shape-contract.md) makes.
+
+**Amended 2026-08-05 (P5.9-h, §3.6): the ON arm's 6 are CLEARED.** Re-measured
+on the five queries that carried them, `parity_violations=0` on both arms, so
+the ratchet the ON arm carries forward is **0**, the same number as the OFF
+arm, and any future commit that reintroduces one is a regression on either arm.
+`shape_mismatches` is unchanged (24 on the five-query subset, both arms) — the
+fix moved estimates, not shapes.
 
 ## 5. Estimate audit (class-(a) regression tripwire)
 
