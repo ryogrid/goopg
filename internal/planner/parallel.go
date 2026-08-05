@@ -40,8 +40,12 @@ import (
 var parallelOn atomic.Bool
 
 func init() {
-	parallelOn.Store(os.Getenv("GOOPG_PARALLEL") != "off")
+	parallelOn.Store(parallelFromEnv(os.Getenv("GOOPG_PARALLEL")))
 }
+
+// parallelFromEnv is the kill-switch's polarity, factored out of init for the
+// provenance table (flaglabels.go); see memoizeFromEnv.
+func parallelFromEnv(v string) bool { return v != "off" }
 
 // SetParallelEnabled toggles Gather insertion process-wide.
 func SetParallelEnabled(on bool) { parallelOn.Store(on) }

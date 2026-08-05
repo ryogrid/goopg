@@ -135,7 +135,12 @@ func defaultCollapseLimits() collapseLimits {
 //
 // Read once at process start, like `pgShapedDP`, so a plan cannot change shape
 // mid-statement.
-var pgShapedCollapse = os.Getenv("GOOPG_PGSHAPED_COLLAPSE") == "1"
+var pgShapedCollapse = pgShapedCollapseFromEnv(os.Getenv("GOOPG_PGSHAPED_COLLAPSE"))
+
+// pgShapedCollapseFromEnv is the flag's polarity, factored out so the
+// provenance table (flaglabels.go) can render the unset default from the same
+// function production resolves it with — mirrors pgShapedDPFromEnv.
+func pgShapedCollapseFromEnv(v string) bool { return v == "1" }
 
 // pgShapedCollapseEnabled reports whether explicit INNER JOIN chains flatten
 // into the enclosing search problem. Exposed as a function so the flag keeps a

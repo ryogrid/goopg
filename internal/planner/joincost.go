@@ -49,7 +49,12 @@ func chooseInnerJoinAlgo(leftRows, rightRows int64) (JoinAlgo, bool) {
 // flip is M0127-P5's, once doc 04's cost currency can say when a
 // sort is actually cheaper (deferral ledger 2026-08-04
 // M0127-P4.2).
-var hashOuterJoinEnabled = os.Getenv("GOOPG_HASH_OUTER_JOIN") == "1"
+var hashOuterJoinEnabled = hashOuterJoinFromEnv(os.Getenv("GOOPG_HASH_OUTER_JOIN"))
+
+// hashOuterJoinFromEnv is the flag's polarity, factored out so the provenance
+// table (flaglabels.go) renders the unset default from the same function
+// production resolves it with; see memoizeFromEnv.
+func hashOuterJoinFromEnv(v string) bool { return v == "1" }
 
 // chooseOuterFillJoinAlgo is the same decision for the two join
 // types whose preserved side the hash executor could not fill

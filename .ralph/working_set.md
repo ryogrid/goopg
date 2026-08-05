@@ -1,45 +1,49 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-n CLOSED — the post-flip DS05 arm is GREEN** (09 §3.15).
-`PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`, identical
-to run 4; `STATUS-DELTA: verdict-changes=none runtime-moves=0`. P5.9 does not
-reopen. Report `bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260806-022814.txt`.
-Ran 02:28→02:56 (28 min, not ~1 h — the timeout class is empty).
+Last loop: **M0127-P5.9-q CLOSED** (09 §3.16) — the gates' `planner-flags:`
+provenance stamp is now GENERATED from the Go defaults it names, after the same
+hand-written `unset(off)` label outlived two default flips (M0125-0005,
+M0127-P5.9) and mis-stamped the acceptance run of the second one.
 
-Two things the gate run produced that the gate was not asked for:
+Chain: `internal/planner/flaglabels.go` (each label computed by the SAME
+resolver production uses at process start) → `cmd/gen-planner-flag-labels` →
+`scripts/planner-flags.env` (generated, checked in — a gate host needs no Go) →
+`scripts/planner-flags.sh: planner_flags_body`, sourced by BOTH
+`tpcds-sf05-regression.sh` and `tpch-spotcheck.sh`. Several `FromEnv` helpers
+were factored out of their `init()` so nothing restates a default.
 
-1. The plan channel's "changed (33)" was NOT the flip. Its baseline
-   `plans-20260805-222627.txt` is stamped `GOOPG_PGSHAPED_DP=1` — an ON-arm
-   capture — so the 33 measured ON→ON across the -j/-k cost terms.
-2. `sf05_planner_flags_line` kept its pre-flip `unset(off)` label, so every
-   artefact since `b92582fb` states the OPPOSITE of the regime it measured —
-   the exact defect its own comment records happening to `GOOPG_RELSIZE_FALLBACK`
-   at M0125-0005. Fixed (`unset(on)`; `GOOPG_COST_DRIVEN_JOINORDER` →
-   `retired(M0127-P5.9)`). Two artefacts stay mis-stamped and are annotated in
-   09 §3.15 rather than rewritten (untracked run output).
+Four guards (`internal/planner/flaglabels_test.go`), two verified by NEGATIVE
+probe: checked-in env file == what the defaults render (the stated bar; probe:
+flipping `pgShapedCollapseFromEnv` fails it); every `unset(<tok>)` round-trips
+through the flag's own parser; every `os.Getenv("GOOPG_*")` in the package is
+stamped or exempt with a reason (probe: a scratch flag fails it); neither gate
+may hand-write `unset(`.
 
-The real blast radius, measured at a FIXED binary (only the flag differs):
-**86 of 99 plans change, 13 identical** (3 of those are the Q36/Q70/Q86 dsqgen
-parse-error blocks → 10 real). 22 differ in join-operator multiset, 64 keep the
-inventory and differ in order/qual placement/estimates. The acceptance bar said
-"nothing changed": true of every result, false of 87% of the plans.
+Coverage guard's first finding: the stamp named **6** flags, the planner reads
+**12**. EXISTS_TO_ANY / UNNEST_PREDP / INDEXKEY_HARVEST / NLI_COSTGATE /
+HASH_OUTER_JOIN / MHJ_PACKING_OFF were in no artefact ever captured, and
+`tpch-spotcheck` — the gate every planner commit pays — named no enumerator
+flag at all. The 6 pre-existing labels are byte-identical, so the capture
+corpus stays comparable.
+
+The plan channel reproduced the hazard live: its DEFAULT baseline picked the
+fixed-binary **OFF** arm and printed `same=13 changed=86` (an exact replication
+of §3.15's flip blast radius) — only the header says which arm that was.
 
 NEXT LOOP (subject to the fix_plan `## Current Priority` banner, which wins):
 M0127-P5.9 successors remain — **-m** (collapse-ON acceptance pass, gates the
-COLLAPSE flip), **-o** (EXPLAIN prints no `Join Filter:` line), **-p**
-(searched-arm batch-growth fixture), **-q** (NEW this loop: no test ties a
-provenance label to the default it names — the same mis-stamp has now shipped
-twice).
+COLLAPSE flip; it runs the SF0.5 sweep this loop deferred), **-o** (EXPLAIN
+prints no `Join Filter:` line), **-p** (searched-arm batch-growth fixture).
 
-Nightly triage filed (unconditional, not selected): tonight's 18 AI items are
-1 EvalPlanQual recurrence (6th night), 3 regress recurrences, and **14 phantom
-testport regressions from ONE compile error** — the nightly built the DIRTY
-tree mid-edit (`s.traceFailed undefined`, added by `bf52391e` minutes later).
-`go build ./...` is clean at HEAD. Filed as a new M-NIGHTLY harness item.
+Nightly triage: tonight's action-items file is the SAME run (20260806-011323)
+the previous loop already filed as an M-NIGHTLY harness item (14 of its 18 AI
+items are phantom testport regressions from one compile error in a dirty-tree
+build). Nothing new to file.
 
-Gates run: `go build ./...`; `go vet ./internal/planner/`; `bash -n` on the
-gate script; **TPC-DS SF0.5 sweep PASS**; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (rc=0); pgbench smoke via the commit
-hook; `make ralph-state-guard` (INCONSISTENT → auto-REPAIRED → OK).
+Gates run: `go build ./...`; `go vet ./internal/planner ./cmd/gen-planner-flag-labels`;
+`bash -n` on all three scripts; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` **PASS**
+(Q12=2, Q13=35); SF0.5 **plan channel** `queries=99 same=99 changed=0` vs the
+ON-arm baseline; pgbench smoke via the commit hook; `make ralph-state-guard`.
 
 In-flight: none.

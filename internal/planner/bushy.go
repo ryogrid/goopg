@@ -27,10 +27,16 @@ func init() {
 	// M0126-0005 measurement-only: force packing off independently of
 	// join-order, so the A/B measures the cascade cost without
 	// conflating two variables (F12 trap).
-	if os.Getenv("GOOPG_MHJ_PACKING_OFF") == "1" {
+	if mhjPackingOffFromEnv(os.Getenv("GOOPG_MHJ_PACKING_OFF")) {
 		mhjPackingEnabled = false
 	}
 }
+
+// mhjPackingOffFromEnv is the measurement switch's polarity, factored out of
+// init for the provenance table (flaglabels.go); see memoizeFromEnv. Note the
+// inverted name: this variable turns packing OFF, so its unset label reads
+// `unset(off)` for "the off-switch is not engaged".
+func mhjPackingOffFromEnv(v string) bool { return v == "1" }
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
 // FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)

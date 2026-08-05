@@ -2800,3 +2800,78 @@ afterwards. That is the strongest available statement about the flip's risk
 profile on this benchmark, and it took the fixed-binary A/B to make it — the
 cross-commit diff the gate runs by default cannot separate an enumerator change
 from a cost-term change, which is how the 33 came to look like the answer.
+
+### 3.16 The provenance label is now generated from the default it names (P5.9-q, 2026-08-06)
+
+§3.15 fixed a mis-stamped label by hand for the **second** time. That is the
+finding: `sf05_planner_flags_line` had documented, in its own comment block, the
+M0125-0005 flip that outlived its `unset(off)` label — and then outlived the
+M0127-P5.9 flip the same way, mis-stamping the acceptance run of the flip
+itself (`sweep-20260806-022814.txt:8`, `plans-20260806-022814.txt:5`). A defect
+whose repair consists of a comment predicting its own recurrence is not
+repaired.
+
+The reason is structural, not attentional: the label for an UNSET variable is a
+claim about a **Go default**, and it lived in a **bash printf**. Nothing that
+compiles, runs, or diffs could relate the two. So the two halves are joined:
+
+```
+internal/planner/flaglabels.go     flagResolvedState[env]("")  -> "on" | "off" | "2" | "current"
+  → cmd/gen-planner-flag-labels    renders the shell fragment
+  → scripts/planner-flags.env      GENERATED, checked in (a gate host needs no Go)
+  → scripts/planner-flags.sh       planner_flags_body(), sourced by both gates
+```
+
+Each label is computed by the *same function that resolves the default at
+process start* — `pgShapedDPFromEnv`, `parseRelSizeFallbackStage`,
+`memoizeFromEnv`, … — several of which were factored out of their `init()` in
+this commit for exactly that purpose. Nothing in the chain restates a default.
+
+**Four guards, and what each one catches** (`internal/planner/flaglabels_test.go`):
+
+| test | catches |
+|---|---|
+| `TestFlagProvenanceEnvIsGenerated` | the P5.9/M0125-0005 defect itself: a default flipped, the label not regenerated. Verified by probe — flipping `pgShapedCollapseFromEnv` to default-on fails it with the two labels side by side. |
+| `TestFlagLabelsRoundTrip` | a label that reads well but is not runnable. The token inside `unset(…)` must resolve, through the flag's own parser, back to the same state — so `GOOPG_PGSHAPED_DP=unset(on)` is an instruction an operator can paste. |
+| `TestFlagProvenanceTableCoversPlannerEnv` | the silent half: a plan-shaping flag the artefacts never name. Every `os.Getenv("GOOPG_*")` in the package must be stamped or explicitly exempt with a reason. Verified by probe. |
+| `TestGateScriptsUseGeneratedFlagLabels` | the labels creeping back into the shell — no non-comment `unset(` in either gate. |
+
+The coverage guard immediately produced its first finding. The stamp named
+**six** flags; the planner reads **twelve**. `GOOPG_EXISTS_TO_ANY`,
+`GOOPG_UNNEST_PREDP`, `GOOPG_INDEXKEY_HARVEST`, `GOOPG_NLI_COSTGATE`,
+`GOOPG_HASH_OUTER_JOIN` and `GOOPG_MHJ_PACKING_OFF` all change plan shape and
+appeared in no artefact goopg has ever captured — an A/B across any of them
+would have produced two byte-indistinguishable reports, which is the precise
+failure `sf05_planner_flags_line` was written to prevent. They are stamped now,
+at no shell cost, because the gates iterate the table.
+
+`scripts/tpch-spotcheck.sh` — the gate every planner commit pays — is on the
+same table. Its line previously hedged `GOOPG_RELSIZE_FALLBACK=unset(build
+default)` (honest, but not diffable), named `GOOPG_COST_DRIVEN_JOINORDER`,
+which no code reads, and **did not name `GOOPG_PGSHAPED_DP` at all** — so since
+`b92582fb` its timings could not say which enumerator produced them.
+
+The six pre-existing labels are byte-identical before and after
+(`unset(2)`, `retired(M0127-P5.9)`, `unset(on)` ×3, `unset(off)`), so captures
+from this version stay comparable with the corpus taken since §3.15's fix; the
+line grows to the right.
+
+One boundary is deliberate and ledgered: the guard scans `internal/planner`
+only. Executor-side kill switches (`GOOPG_HASHED_SUBPLAN` and its siblings)
+also move measured runtime and remain unstamped.
+
+**Verification of the change itself.** Units pass; `scripts/tpch-spotcheck.sh`
+is green with canonical rows (Q12=2, Q13=35, 26.1 s query phase) and its new
+line names the enumerator for the first time. The SF0.5 **plan channel** was
+run as the planner-neutrality proxy and reports `queries=99 same=99 changed=0`
+against `plans-20260806-022814.txt` — the true ON-arm capture — so nothing in
+this commit moves a plan, and the row-count sweep §3.15 ran 40 minutes earlier
+still describes this plan set.
+
+The channel's *default* baseline selection walked straight into the hazard this
+task is about: it auto-picked `plans-20260806-025726.txt`, the fixed-binary
+**OFF** arm, and reported `same=13 changed=86` — reproducing §3.15's 86/13 split
+exactly, which is a clean independent replication of the flip's blast radius and
+would have been a terrifying false regression for anyone who read the number
+without opening the header. That is the whole argument for this task in one
+command: the header is what makes a diff attributable, so it has to be true.

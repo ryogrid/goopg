@@ -1617,6 +1617,35 @@
   (counted, never silently dropped); a clause-6 FAILURE as a candidate, sharper
   than `NOT-ENUMERATED` — the shape is unreachable, not merely unchosen.
   A failing IN-SCOPE control still voids the run.
+- [x] **P5.9-q** No test tied a gate's provenance label to the default it names,
+  and the same defect had shipped twice (NEW at P5.9-n, 09 §3.15). **DONE
+  2026-08-06 (09 §3.16).** `sf05_planner_flags_line` hand-wrote the label for an
+  UNSET variable — a claim about a **Go default** living in a **bash printf** —
+  so M0125-0005's `GOOPG_RELSIZE_FALLBACK` flip and M0127-P5.9's
+  `GOOPG_PGSHAPED_DP` flip each left every later artefact stating the OPPOSITE of
+  the regime it measured, the second one mis-stamping the acceptance run of the
+  flip itself. The chain is now
+  `internal/planner/flaglabels.go` → `cmd/gen-planner-flag-labels` →
+  `scripts/planner-flags.env` (generated, checked in) →
+  `scripts/planner-flags.sh: planner_flags_body`, sourced by BOTH the SF0.5 gate
+  and `tpch-spotcheck.sh`. Every label is computed by the same resolver
+  production uses at process start (`pgShapedDPFromEnv`,
+  `parseRelSizeFallbackStage`, `memoizeFromEnv`, `unnestPreDPFromEnv`, … —
+  several factored out of their `init()` here); nothing restates a default.
+  Four guards (`flaglabels_test.go`), two verified by negative probe: the
+  checked-in fragment must equal what the defaults render (the stated bar); each
+  `unset(<tok>)` must round-trip through the flag's own parser, so the artefact
+  is a runnable instruction; every `os.Getenv("GOOPG_*")` in the package must be
+  stamped or exempt with a reason; and neither gate may hand-write `unset(`.
+  The coverage guard's first finding: the stamp named **6** flags, the planner
+  reads **12** — `GOOPG_EXISTS_TO_ANY`, `GOOPG_UNNEST_PREDP`,
+  `GOOPG_INDEXKEY_HARVEST`, `GOOPG_NLI_COSTGATE`, `GOOPG_HASH_OUTER_JOIN`,
+  `GOOPG_MHJ_PACKING_OFF` were named by no artefact goopg had ever captured, and
+  `tpch-spotcheck.sh` named no enumerator flag at all. The six pre-existing
+  labels are byte-identical before and after, so the capture corpus stays
+  comparable; the line grows to the right. Ledgered: the registry covers
+  `internal/planner` only, so executor kill-switches (`GOOPG_HASHED_SUBPLAN`)
+  re-open the same hole one layer down.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

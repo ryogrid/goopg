@@ -52,8 +52,14 @@ func init() {
 	// D6.3a escape hatch: GOOPG_NLI_COSTGATE=legacy restores the
 	// stats-blind semi/anti gate for one stage (deleted in R2-8 if
 	// unused).
-	nliCostGateLegacy.Store(os.Getenv("GOOPG_NLI_COSTGATE") == "legacy")
+	nliCostGateLegacy.Store(nliCostGateLegacyFromEnv(os.Getenv("GOOPG_NLI_COSTGATE")))
 }
+
+// nliCostGateLegacyFromEnv is the escape hatch's polarity, factored out of init
+// for the provenance table (flaglabels.go); see memoizeFromEnv. Unlike the
+// boolean kill switches this one is a MODE — the label spells `legacy` or
+// `current`, not on/off.
+func nliCostGateLegacyFromEnv(v string) bool { return v == "legacy" }
 
 // SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
 // only API; the production toggle path is the GUC mentioned above.

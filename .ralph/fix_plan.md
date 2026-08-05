@@ -8199,8 +8199,37 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       production-realistic trigger). Files:
       `internal/executor/join_batch_explain_test.go`. Bar: UNITS, growth
       asserted on the default enumerator.
-- [ ] **M0127-P5.9-q — no test ties a gate's provenance label to the default it
-      names, and the same defect has now shipped twice.** NEW 2026-08-06, found
+- [x] **M0127-P5.9-q — no test ties a gate's provenance label to the default it
+      names, and the same defect has now shipped twice.** **DONE 2026-08-06**
+      (09 §3.16). The label chain is now
+      `internal/planner/flaglabels.go` (each label computed by the SAME resolver
+      production uses at process start — `pgShapedDPFromEnv`,
+      `parseRelSizeFallbackStage`, `memoizeFromEnv`, … , several factored out of
+      their `init()` for this) → `cmd/gen-planner-flag-labels` →
+      `scripts/planner-flags.env` (generated, checked in so a gate host needs no
+      Go) → `scripts/planner-flags.sh: planner_flags_body`, sourced by BOTH
+      `tpcds-sf05-regression.sh` and `tpch-spotcheck.sh`. Four guards in
+      `internal/planner/flaglabels_test.go`: the checked-in env file must equal
+      what the Go defaults render (the stated bar — verified by negative probe:
+      flipping `pgShapedCollapseFromEnv` to default-on fails it); every
+      `unset(<tok>)` token must resolve back through the flag's own parser to the
+      same state (a label an operator can paste); every
+      `os.Getenv("GOOPG_*")` in the planner must be stamped or exempt with a
+      reason (verified by negative probe); and neither gate may hand-write
+      `unset(` again. **The coverage guard's first finding:** the stamp named 6
+      flags and the planner reads 12 — `GOOPG_EXISTS_TO_ANY`,
+      `GOOPG_UNNEST_PREDP`, `GOOPG_INDEXKEY_HARVEST`, `GOOPG_NLI_COSTGATE`,
+      `GOOPG_HASH_OUTER_JOIN`, `GOOPG_MHJ_PACKING_OFF` all change plan shape and
+      appeared in no artefact goopg has ever captured. `tpch-spotcheck.sh`, the
+      gate every planner commit pays, hedged RELSIZE as `unset(build default)`,
+      named the retired `GOOPG_COST_DRIVEN_JOINORDER`, and did not name
+      `GOOPG_PGSHAPED_DP` at all — since `b92582fb` its timings could not say
+      which enumerator produced them. The six pre-existing labels are
+      byte-identical before and after, so the capture corpus stays comparable.
+      1 ledger row (the registry covers `internal/planner` only; executor
+      kill-switches such as `GOOPG_HASHED_SUBPLAN` remain unstamped).
+      **↳ SUPERSEDED DESCRIPTION BELOW (kept for attribution).**
+      NEW 2026-08-06, found
       by P5.9-n (09 §3.15). `sf05_planner_flags_line`
       (`scripts/tpcds-sf05-regression.sh`) stamps every sweep and plan capture
       with the planner flags in force, so that a diff between two captures is

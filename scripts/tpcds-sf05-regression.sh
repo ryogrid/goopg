@@ -91,6 +91,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
+# planner_flags_body — the generated provenance stamp (M0127-P5.9-q); see
+# sf05_planner_flags_line below.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/planner-flags.sh"
 
 # Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF05_DATA_DIR,
 # SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
@@ -631,14 +635,18 @@ sf05_status_delta_channel() {
 # invited a later loop to A/B a variable the binary cannot see. It is stamped
 # `retired` rather than dropped, because dropping it would make old artefacts
 # that DO carry it look like they were captured by this version of the gate.
+#
+# M0127-P5.9-q (2026-08-06) took the labels away from this printf. Fixing the
+# same defect by hand for the second time is evidence that hand-written labels
+# do not survive a flip, so the list and its unset-labels now come from
+# `scripts/planner-flags.env`, GENERATED from the Go defaults
+# (internal/planner/flaglabels.go) and guarded by a unit test. Adding a
+# plan-shaping flag in Go now stamps it here with no edit to this file — which
+# is how the six flags this function never named (EXISTS_TO_ANY, UNNEST_PREDP,
+# INDEXKEY_HARVEST, NLI_COSTGATE, HASH_OUTER_JOIN, MHJ_PACKING_OFF) joined the
+# line in the same commit.
 sf05_planner_flags_line() {
-    printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s GOOPG_PGSHAPED_DP=%s GOOPG_PGSHAPED_COLLAPSE=%s\n' \
-        "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
-        "retired(M0127-P5.9)" \
-        "${GOOPG_MEMOIZE:-unset(on)}" \
-        "${GOOPG_PARALLEL:-unset(on)}" \
-        "${GOOPG_PGSHAPED_DP:-unset(on)}" \
-        "${GOOPG_PGSHAPED_COLLAPSE:-unset(off)}"
+    printf '# planner-flags: %s\n' "$(planner_flags_body)"
 }
 
 # sf05_plan_baseline — the capture this run is diffed against: the newest
