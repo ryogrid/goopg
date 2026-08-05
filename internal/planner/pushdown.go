@@ -234,6 +234,15 @@ func allColumnRefNamesInScope(c Expr, j *Join) bool {
 // tree. Returns true when the conjunct landed on a Join — the
 // caller drops it from the residual filter list.
 func pushOneConjunct(node Node, c Expr) bool {
+	// M0127-P5.9-b (08 §3): a searched subtree is opaque to this pass. Its
+	// INTERNAL joins address their own per-joinrel layouts — only its root is
+	// republished in the statement's binding order (03 §10) — while `c` is
+	// written in FROM-cumulative coordinates, so rehoming it onto one of them
+	// would evaluate it against the wrong columns. The search has already
+	// placed every clause it admitted; what reaches here is what it left.
+	if isSearchedTree(node) {
+		return false
+	}
 	j, ok := node.(*Join)
 	if !ok {
 		return false

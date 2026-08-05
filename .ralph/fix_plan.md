@@ -8012,14 +8012,43 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       IMPLEMENTATION-TODO P5.9-a. Bar met: UNITS. DS05/PLAN not applicable for
       the same structural reason as P5.7-a/-b and P5.8: `GOOPG_PGSHAPED_DP` is
       OFF and no `planSelect` call site reaches the new code.
-- [ ] **M0127-P5.9-b — the `planSelect` seam.** `tryBushyDP` /
-      `runJoinSearchBelowPinned` hand `resolveContext.joinlist` +
-      `preprocessLimit`'s fraction to `planJoinlistSearch` under
-      `GOOPG_PGSHAPED_DP`, and decide which conjuncts the search consumed
-      before the residual `Filter` above it is rebuilt (the recursion
-      deliberately does not answer that — the residual belongs to the
-      pre-search pipeline that owns the `Filter`). 03 §6.2; 08 §2.
-      Bar: UNITS + SPOT + DS05 flag-off inertness.
+- [x] **M0127-P5.9-b — the `planSelect` seam.** DONE 2026-08-05 — the PG-shaped
+      search has a production caller: `tryPGShapedJoinSearch`
+      (`internal/planner/joinsearchseam.go`), entered from the FIRST line of
+      `tryBushyDP` so both join-search positions (`planSelect`'s legacy one and
+      `runJoinSearchBelowPinned`'s pinned-spine one) reach it through one door
+      and the old DP stays the fallback S5's rollback story needs.
+      `preprocessLimit`'s fraction rides on `resolveContext.tupleFraction`, set
+      in `planSelect` from the UNRESOLVED LIMIT/OFFSET — the `*Limit` node is
+      built ~350 lines later, and resolving early would plan a
+      `LIMIT (SELECT …)` subquery twice. The residual is not re-derived:
+      `searchConsumes` asks `buildRestrictInfos` whether THIS conjunct becomes a
+      clause, which is the only formulation that keeps an OR-of-ANDs in the
+      `Filter` (it reaches two relations, but the producer emits the equalities
+      COMMON to its branches, not the OR). **Three findings.** (i) The two
+      cardinality entry points had different tier ladders and the search was on
+      the shorter one — `estimateBaseRelInfo` has no `estimate_rel_size`
+      fallback, so on a cold server every initial rel floors at 1 row and the
+      cost model then correctly prefers a NESTED LOOP where the legacy pipeline
+      built a hash join unconditionally. (ii) Local quals must enter the LEAF
+      before the search rather than the tree after it —
+      `attachRelationLocalFilters` matches by pointer identity and P5.5-c's
+      index arm rebuilds a leaf, so a qual attached afterwards can be attached
+      to nothing; `initialRelRows` needed one arm (`leafBaseScan`) so a
+      filter-wrapped base table is not re-estimated by `EstimateRows`. (iii)
+      LATERAL must be declined explicitly, because `extractScans` flattens the
+      CROSS chain that carries the marker. Four `isSearchedTree` skips added, so
+      08 §3's coexistence rule is now fully enforced (seven total). 9 tests;
+      acceptance is `TestPGShapedSeamResidualIsWhatTheSearchDidNotPlace`.
+      **3 ledger rows** (explicit-`JOIN` items still decline in BOTH collapse
+      regimes, so 09 §3's collapse-ON arm cannot yet differ from collapse-OFF;
+      `estimateBaseRelInfo`'s missing tier patched at the seam not the shared
+      entry point; local quals costed at the leaf but the seam does not re-cost
+      the leaf's access method for them). 03 §6.3; 08 §2-§3.
+      Bar met: UNITS + SPOT (Q12 2 rows / Q13 35 rows). DS05 not run: the
+      flag-off arm is byte-identical by construction — the seam declines on its
+      first line, no tree carries the searched tag, and all seven skips are
+      unreachable.
 - [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
       once with collapse OFF, then with collapse ON) + plan-shape ratchet
       baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and

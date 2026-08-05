@@ -83,6 +83,14 @@ type joinGraph struct {
 // is the Filter predicate with consumed equalities removed (may be nil).
 // On failure, returns (originalNode, originalPred) unchanged.
 func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) (Node, Expr) {
+	// M0127-P5.9-b: under `GOOPG_PGSHAPED_DP` the PG-shaped search gets the
+	// statement first, and this DP is what it falls back to — the coexistence
+	// rule of 08 §2, which keeps `tryBushyDP` callable so the flag is a real
+	// rollback and not a one-way door. The seam declines on its own first line
+	// with the flag off, so nothing below changes.
+	if searched, residual, used := tryPGShapedJoinSearch(node, pred, ctx, cat); used {
+		return searched, residual
+	}
 	if ctx == nil || len(ctx.bindings) < 3 {
 		return node, pred
 	}
@@ -1866,6 +1874,14 @@ func findScanByColName(scans []Node, start, end int, key Expr) (scanIdx int, col
 func rewriteMultiWayChain(node Node, cat catalog.Catalog) Node {
 	if node == nil {
 		return nil
+	}
+	// M0127-P5.9-b (08 §3): never pack a searched tree. PG has no MHJ, the
+	// search's binary cascade IS the plan it costed, and the packer re-sorts
+	// the leaf layout — the order-then-rewrite mismatch that regressed Q9
+	// (ch. 12 §3). `mhjPackingEnabled` is off by default, so this guard is for
+	// the env that turns it back on.
+	if isSearchedTree(node) {
+		return node
 	}
 	scans, keys, probeIdx, extras := collectMultiHashTables(node)
 	if scans == nil {

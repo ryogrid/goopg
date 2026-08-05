@@ -55,6 +55,14 @@ func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Nod
 	if n == nil || cat == nil {
 		return n
 	}
+	// M0127-P5.9-b (08 §3): a searched subtree keeps its own leaves. This pass
+	// absorbs conjuncts DOWNWARD out of a `*Filter` into the scan below it,
+	// addressing both in FROM-cumulative coordinates; inside a searched tree
+	// the leaf's quals are already leaf-local (`LeafLocal`, attached before the
+	// search ran) and the joins between are not in that space at all.
+	if isSearchedTree(n) {
+		return n
+	}
 	switch x := n.(type) {
 	case *Filter:
 		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)

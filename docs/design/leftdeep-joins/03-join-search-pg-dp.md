@@ -665,12 +665,77 @@ Three things the port settled:
   CONTIGUOUS run of FROM items — deconstruction never reorders — which
   `leafRange` CHECKS per item rather than assumes.
 
-Still inert: `GOOPG_PGSHAPED_DP` is OFF and no `planSelect` call site reaches
-`planJoinlistSearch`. The seam (`tryBushyDP` / `runJoinSearchBelowPinned`) is
-P5.9-b, which must also decide which conjuncts the search consumed before the
-residual `Filter` above it is rebuilt — the one piece of the wiring the
-recursion deliberately does not answer, because the residual belongs to the
-pre-search pipeline that owns that `Filter`, not to the search.
+Superseded by §6.3: `planJoinlistSearch` has a production caller since P5.9-b.
+The seam (`tryBushyDP` / `runJoinSearchBelowPinned`) also had to decide which
+conjuncts the search consumed before the residual `Filter` above it is rebuilt —
+the one piece of the wiring the recursion deliberately does not answer, because
+the residual belongs to the pre-search pipeline that owns that `Filter`, not to
+the search.
+
+### 6.3 As implemented (M0127-P5.9-b) — the SEAM, `internal/planner/joinsearchseam.go`
+
+`tryPGShapedJoinSearch` is the production caller, entered from the first line of
+`tryBushyDP` so that both call sites (`planSelect`'s legacy position and
+`runJoinSearchBelowPinned`'s pinned-spine position) reach it through one door and
+the old DP remains the fallback the S5 rollback story ([08](08-migration-and-removal.md) §2)
+requires. It answers the three questions the recursion does not.
+
+**Which statements enter the search.** The search wants one leaf per binding, in
+binding order, with no execution-time dependency between them; `extractScans`
+over the pre-search CROSS chain supplies exactly that for a comma-FROM list —
+including the subquery / VALUES / function-scan leaves the old DP's whitelist
+refused, so the leaf-whitelist gap closes in production and not only in
+principle. Three shapes are declined, each for a correctness reason: a FROM item
+that is itself an explicit `JOIN` (one node, several bindings — see the ledger
+row below), a LATERAL item (the search chooses an order; the dependency is not a
+clause), and bindings whose offsets disagree with the concatenation of the leaf
+widths (the clause list is written in that one space).
+
+**Which conjuncts survive.** `searchConsumes` puts the question to
+`buildRestrictInfos` — the search's own producer — and treats a conjunct as
+consumed only when the producer emits THAT conjunct as a clause. Re-deriving the
+rule ("does it reach two relations?") would be wrong for exactly one shape and
+silently: an OR-of-ANDs contributes the equalities COMMON to its branches and not
+itself (`joinrestrict.go`), so the OR reaches two relations and must still stay
+in the `Filter`. The question is asked in the FULL per-FROM-item coordinate
+space rather than the per-joinlist-item space one problem uses, because two
+distinct leaves must separate at some level of the recursion, and the problem
+where they separate is the one that places the clause.
+
+**What the legacy passes may still do.** [08](08-migration-and-removal.md) §3's
+coexistence rule is now enforced for the four passes that REWRITE a join tree —
+`pushPredicatesIntoCrossJoins`, `rewriteJoinsToNLI`, `rewriteMultiWayChain`,
+`rewriteScanInputsWithSingleTablePredicates` — joining the three that renumber
+one (P5.5-f-ii-a). The reason is coordinates: those passes address a tree in the
+statement's FROM-cumulative space, while a searched tree's INTERNAL joins carry
+the search's own per-joinrel layouts and only its ROOT is republished in binding
+order (§10).
+
+Two things the port settled that the plan above had not:
+
+- **the two cardinality entry points had different tier ladders, and the search
+  was on the shorter one.** `bushySeedRowCounts` (bushy.go) falls back to the
+  `estimate_rel_size` row estimate (M0125-0003 stage 3) when a relation has no
+  `TableStats`; `estimateBaseRelInfo` — the only cardinality the search sees —
+  does not, because `tableRows` answers 0 and stops. `TableStats.RowCount` does
+  not survive a restart (ledger pq-P6), so on a cold server every initial rel
+  floors at one row, and at one row per side the cost model correctly prefers a
+  NESTED LOOP where the legacy pipeline built a hash join unconditionally. The
+  seam applies the same tier locally; the shared entry point is ledgered.
+- **local quals go into the leaf BEFORE the search, not onto the tree after
+  it.** `attachRelationLocalFilters` matches leaves by POINTER identity, and the
+  search's index arm REBUILDS a leaf (P5.5-c), so a qual attached afterwards
+  could be attached to nothing and lost. Attaching first also gives the search
+  the leaf shape it already expects (`scanLeafFor`, createplanindex.go) and puts
+  the relation's post-filter cardinality where `initialRelRows` reads it —
+  which needed one arm there, since a filter-wrapped base table was previously
+  re-estimated by `EstimateRows`, a second and different selectivity computation
+  over the predicate `estimateBaseRelInfo` had already applied.
+
+The flag stays OFF: this is its only production reader, and with it off the seam
+declines on its first line, no tree carries the searched tag, and all seven skips
+are unreachable — the default arm is byte-identical. The acceptance run and the
+flip are P5.9.
 
 ## 7. Search-size policy (the GEQO question)
 

@@ -357,9 +357,21 @@ type resolveContext struct {
 	// binding order are the same walk.
 	//
 	// M0127-P5.8: nil in every context that is not a FROM clause (subquery
-	// scopes, ON CONFLICT's `excluded`, DML targets), and read by nobody
-	// until P5.9 wires the search into `planSelect`.
+	// scopes, ON CONFLICT's `excluded`, DML targets), and read by
+	// `tryPGShapedJoinSearch` (joinsearchseam.go) since P5.9-b.
 	joinlist joinlist
+
+	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
+	// will actually be fetched, which decides whether a fast-start path may
+	// win at the search root (`finalPath`) and whether one is worth keeping
+	// at all (`RelOptInfo.ConsiderStartup`).
+	//
+	// It lives on the context for the same reason `joinlist` does — the join
+	// search runs from `tryBushyDP` / `runJoinSearchBelowPinned`, neither of
+	// which is handed the statement — and it is set where PG sets it, before
+	// the first rel exists. 0 (fetch everything) in every context that is not
+	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
+	tupleFraction float64
 }
 
 type rangeBinding struct {
@@ -1101,6 +1113,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			// M0127-P5.9-b: `root->tuple_fraction`, fixed before the join
+			// search below builds its first rel — upstream's order
+			// (`preprocess_limit` in `subquery_planner`, before
+			// `query_planner`). The `*Limit` node is built ~350 lines below,
+			// far too late to influence which path the search selects, so the
+			// fraction is derived from the unresolved clauses; see
+			// `searchTupleFraction` for why they are not resolved early.
+			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-

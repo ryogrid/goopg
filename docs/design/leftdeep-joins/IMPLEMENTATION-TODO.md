@@ -1254,11 +1254,41 @@
   site, `GOOPG_PGSHAPED_DP` OFF. Bar met: UNITS. 2 ledger rows: the
   pathlist-and-rows collapse at a sub-problem boundary; no residual-conjunct
   accounting yet (P5.9-b's job).
-- [ ] **P5.9-b** the `planSelect` seam: `tryBushyDP` /
+- [x] **P5.9-b** the `planSelect` seam: `tryBushyDP` /
   `runJoinSearchBelowPinned` hand `resolveContext.joinlist` +
   `preprocessLimit`'s fraction to `planJoinlistSearch` under
   `GOOPG_PGSHAPED_DP`, and decide which conjuncts the search consumed before
   the residual `Filter` above it is rebuilt.
+  **DONE 2026-08-05 (03 §6.3)** — `internal/planner/joinsearchseam.go`:
+  `tryPGShapedJoinSearch`, entered from the FIRST line of `tryBushyDP` so both
+  join-search positions reach it through one door and the old DP stays the
+  fallback S5's rollback needs. The fraction rides on
+  `resolveContext.tupleFraction`, set in `planSelect` from the UNRESOLVED
+  LIMIT/OFFSET (`searchTupleFraction`) because the `*Limit` node is built ~350
+  lines later and resolving early would plan a `LIMIT (SELECT …)` subquery
+  twice. Residual: `searchConsumes` asks `buildRestrictInfos` whether THIS
+  conjunct becomes a clause — re-deriving it would drop an OR-of-ANDs, which
+  reaches two relations but is not what the producer emits. **Three findings.**
+  (i) the two cardinality entry points had different tier ladders and the search
+  was on the shorter one — `estimateBaseRelInfo` has no `estimate_rel_size`
+  fallback, so on a cold server every initial rel floors at 1 row and the cost
+  model then correctly prefers a NESTED LOOP where the legacy pipeline built a
+  hash join unconditionally; the seam applies the tier locally and the shared
+  entry point is ledgered. (ii) local quals must enter the LEAF before the
+  search, not the tree after it: `attachRelationLocalFilters` matches by pointer
+  identity and P5.5-c's index arm rebuilds a leaf, so a qual attached afterwards
+  can be attached to nothing; this needed one arm in `initialRelRows`
+  (`leafBaseScan`), since a filter-wrapped base table was otherwise re-estimated
+  by `EstimateRows` — a second, different selectivity over the same predicate.
+  (iii) LATERAL has to be declined explicitly: `extractScans` flattens the CROSS
+  chain that carries the marker, so the search would silently reorder around a
+  dependency that is not a clause. Four `isSearchedTree` skips added (08 §3 now
+  fully enforced, seven total). 9 tests; acceptance is
+  `TestPGShapedSeamResidualIsWhatTheSearchDidNotPlace` (three conjunct classes,
+  three destinations, asserted together — the failure mode is a conjunct that
+  reaches none). Bar met: UNITS + SPOT (Q12 2 rows / Q13 35 rows). 3 ledger
+  rows. Flag still OFF; the flag-off arm is byte-identical by construction (the
+  seam declines on its first line and nothing else reads the new state).
 - [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.

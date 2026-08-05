@@ -45,6 +45,15 @@ M0126-0011.
   the current pipeline **including** `rewriteJoinsToNLI` and the qual-
   placement passes — those passes must not double-fire on searched subtrees
   (searched roots are tagged; the passes skip tagged subtrees).
+  **Landed (M0127-P5.9-b):** seven skips, all keyed on `isSearchedTree`. Three
+  RENUMBER a tree and were done at P5.5-f-ii-a (`buildBindingsPosMap`'s
+  collector, `applyJoinTreePosMap`, `reconcileNLILayout`); four REWRITE one and
+  are done here (`pushOneConjunct` — hence `pushPredicatesIntoCrossJoins`,
+  `walkRewriteNLI` — hence `rewriteJoinsToNLI`, `rewriteMultiWayChain`,
+  `rewriteScanInputsWithSingleTablePredicates`). The rule they enforce is about
+  COORDINATES, not duplication: each addresses a join tree in the statement's
+  FROM-cumulative space, and only a searched tree's ROOT is in that space
+  ([03](03-join-search-pg-dp.md) §10).
 - `reconcileNLILayout` (`planner.go:99`) keeps running until S7 confirms no
   searched plan needs it (the canonical relid-ordered layouts of
   [02](02-plan-shape-contract.md) §3 should make it a no-op on searched

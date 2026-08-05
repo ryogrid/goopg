@@ -96,6 +96,14 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 	if n == nil {
 		return nil
 	}
+	// M0127-P5.9-b (08 §3): the PG-shaped search already chose the join
+	// METHOD, NLI included (`joinpathsnli.go`), and costed the choice against
+	// every alternative. Re-deciding it here with the legacy pass would both
+	// override that choice and rebuild the join's keys in FROM-cumulative
+	// coordinates a searched join does not use (03 §10).
+	if isSearchedTree(n) {
+		return n
+	}
 	switch x := n.(type) {
 	case *Join:
 		x.Left = walkRewriteNLI(x.Left, cat)

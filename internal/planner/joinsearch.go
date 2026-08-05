@@ -330,7 +330,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 // here because a 0-row initial rel would make every join above it free.
 func initialRelRows(leaf Node, info baseRelInfo) float64 {
 	rows := info.filteredRows
-	switch leaf.(type) {
+	switch leafBaseScan(leaf).(type) {
 	case *SeqScan, *IndexScan, *IndexOnlyScan:
 		// Base-table leaf: `filteredRows` is the authority.
 	default:
@@ -343,4 +343,26 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		return 1
 	}
 	return float64(rows)
+}
+
+// leafBaseScan peels the `*Filter` wrappers off a search leaf and returns what
+// is underneath — the same peel `scanLeafFor` (createplanindex.go) does, and
+// for the same reason: a base-relation leaf whose local quals have been pushed
+// into it is a `*Filter` over a scan, not a scan (M0127-P5.9-b attaches them
+// before the search rather than after it, joinsearchseam.go).
+//
+// It matters HERE because the wrapper decides which cardinality is believed. A
+// filter-wrapped base table reaching `initialRelRows`' default arm would be
+// re-estimated by `EstimateRows` — a second selectivity computation over the
+// same predicate `estimateBaseRelInfo` already applied to produce
+// `filteredRows`, and a different one, which is the sibling-divergence shape
+// this planner keeps paying for.
+func leafBaseScan(n Node) Node {
+	for {
+		f, ok := n.(*Filter)
+		if !ok || f.Child == nil {
+			return n
+		}
+		n = f.Child
+	}
 }
