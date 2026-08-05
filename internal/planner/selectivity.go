@@ -396,8 +396,55 @@ func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
 		return columnStatsForChild(idx, x.Child)
 	case *Sort:
 		return columnStatsForChild(idx, x.Child)
+
+	// M0127-P5.6-e-ii: the Project arm used to pass `idx` straight
+	// through, which is only right when the target list is the
+	// identity — its ndistinct twin has remapped through `Targets`
+	// since M0125-0038. A reordering or narrowing Project therefore
+	// returned ANOTHER column's MCV list and histogram, which is worse
+	// than returning none. The divergence became reachable far more
+	// often with the *Join arm below, since a join input is routinely
+	// Project-wrapped.
 	case *Project:
+		if idx >= 0 && idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return columnStatsForChild(cr.Index, x.Child)
+			}
+		}
+		return nil
+
+	// The remaining pass-through wrappers, kept in step with
+	// `columnNDistinctForChild`'s arm list (hard-won rule: sibling
+	// paths change together). Each preserves its child's schema
+	// position for position.
+	case *Limit:
 		return columnStatsForChild(idx, x.Child)
+	case *LockRows:
+		return columnStatsForChild(idx, x.Child)
+	case *Gather:
+		return columnStatsForChild(idx, x.Child)
+	case *GatherMerge:
+		return columnStatsForChild(idx, x.Child)
+	case *CTEScan:
+		return columnStatsForChild(idx, x.Child)
+
+	// M0127-P5.6-e-ii: the *Join twin of `columnNDistinctForChild`'s
+	// arm — see the long comment there for the coordinate rule. Without
+	// it a join-level restriction (Q19's three-branch OR over `part` and
+	// `lineitem`) resolved no stats at all and every one of its branches
+	// collapsed to the `defaultEq`/`defaultIneq` constants.
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return nil
+		}
+		lw := len(x.Left.Output())
+		if lw == 0 {
+			return nil
+		}
+		if idx >= lw {
+			return columnStatsForChild(idx-lw, x.Right)
+		}
+		return columnStatsForChild(idx, x.Left)
 	}
 	return nil
 }

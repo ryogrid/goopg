@@ -4,6 +4,8 @@ import (
 	"math"
 	"os"
 	"strconv"
+
+	"github.com/goopg/goopg/internal/hashsize"
 )
 
 // envFloatDefault reads a float from the environment, returning def when unset
@@ -40,6 +42,32 @@ type costParams struct {
 	cpuOperatorCost   float64
 	parallelSetupCost float64
 	parallelTupleCost float64
+
+	// effectiveCacheSize is the `effective_cache_size` GUC in PAGES, which is
+	// the unit PG's own variable carries (`effective_cache_size` is declared
+	// `int` and set from a GUC with GUC_UNIT_BLOCKS, cost.h:33). It is not a
+	// per-tuple or per-page price like the fields above — it is the cache
+	// budget the Mackert-Lohman formula pro-rates between the relations of a
+	// query (`index_pages_fetched`, costsize.c:906), so it belongs to the same
+	// struct only because it is a planner GUC the index cost model reads.
+	// M0127-P5.4c-ii-b.
+	effectiveCacheSize float64
+
+	// workMem is the in-memory budget one hash build may occupy, in BYTES —
+	// the `work_mem` GUC, and the fourth argument `hashJoinCost` hands
+	// `hashsize.Choose`. It is a budget rather than a price, so like
+	// effectiveCacheSize it belongs to this struct only because a cost
+	// function reads it.
+	//
+	// The default is `hashsize.DefaultMemLimitBytes`, which is the SAME
+	// fallback the executor applies when a session has no work_mem set
+	// (`hashsize.EffectiveMemLimit`, called from `joinOp.buildGeometry`). The
+	// two must agree or the planner prices a geometry the executor will not
+	// build — the whole reason the sizing lives in a shared leaf package.
+	// The per-session value does not reach the planner yet: cost time has no
+	// session in scope (the same gap `ParallelSettings` exists to bridge for
+	// the parallel post-pass). Deferral ledger 2026-08-05 M0127-P5.7-a.
+	workMem int64
 }
 
 func defaultCostParams() costParams {
@@ -51,6 +79,11 @@ func defaultCostParams() costParams {
 		cpuOperatorCost:   0.0025,
 		parallelSetupCost: 1000.0,
 		parallelTupleCost: 0.1,
+		// PG 18's boot value is "4GB" (guc_tables.c), which in 8 kB blocks is
+		// 524288. config/defaults.go registers the string form; the unit
+		// conversion is pinned by TestEffectiveCacheSizeMatchesConfigDefault.
+		effectiveCacheSize: 4 * 1024 * 1024 * 1024 / blockSizeBytes,
+		workMem:            hashsize.DefaultMemLimitBytes,
 	}
 }
 
@@ -82,6 +115,30 @@ func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps in
 	return Cost{Startup: 0, Total: run}
 }
 
+// qualEvalCost is `cost_qual_eval`'s contribution to a join (costsize.c:4700):
+// the per-tuple operator cost of a qual list, times the number of tuples the
+// operator actually evaluates it on. PG folds this into `cpu_per_tuple` inside
+// each final_cost_* function; goopg adds it at the path-generation site
+// (pathgen.go) so the same term serves hash, nested loop and — from P5.4c —
+// merge without three signature changes.
+//
+// numQuals counts CONJUNCTS, not operator nodes: one restrictInfo is one
+// charge. That matches how `numHashClauses` is already counted by
+// hashJoinCost, so the two terms of a hash path's cost use one currency; the
+// refinement to a real operator walk belongs with the estimate-audit tooling
+// (leftdeep-joins 09 §5), not here.
+//
+// The tuple count is the CALLER's choice and it is the whole point of the
+// function: a nested loop evaluates its quals on the full cross product, a
+// hash join only on the tuples that survived the key match. Charging both on
+// the join's OUTPUT rows would make a cartesian nested loop look free.
+func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
+	if numQuals <= 0 || !(tuples > 0) {
+		return 0
+	}
+	return cp.cpuOperatorCost * float64(numQuals) * tuples
+}
+
 // costSortRun reproduces the comparison term of cost_sort (costsize.c:2144) for
 // an in-memory sort of n rows: an n*log2(n) comparison cost, charged as startup
 // (the sort must complete before the first row), plus a per-row emit at run. The
@@ -96,30 +153,104 @@ func costSortRun(cp costParams, inputRows float64) Cost {
 	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*inputRows}
 }
 
+// hashJoinInputs is everything hashJoinCost needs that is not a GUC — the
+// argument set of `initial_cost_hashjoin`, named for the upstream fields it
+// stands in for. It is a struct rather than eight positional parameters because
+// three of them are counts (`numHashClauses`, `outerCols`, `innerCols`) that no
+// compiler check would keep in order.
+type hashJoinInputs struct {
+	// outer / inner are the two input paths' costs; outerRows / innerRows are
+	// those paths' OWN row counts (`outer_path->rows` / `inner_path->rows`,
+	// costsize.c:4170-4171), which for a parameterised inner is the per-probe
+	// count and not the rel's total. See Path.Rows.
+	outer, inner         Cost
+	outerRows, innerRows float64
+
+	// outputRows is the join's result cardinality (PG's `hashjointuples`).
+	outputRows float64
+
+	// numHashClauses is `list_length(hashclauses)`: one cpu_operator_cost per
+	// clause is charged per input row on both sides.
+	numHashClauses int
+
+	// outerCols / innerCols are the COLUMN COUNTS of the two sides' rows.
+	//
+	// PG passes `pathtarget->width` in bytes here, because a PG hash entry is a
+	// packed MinimalTuple whose size follows the byte width. goopg's is a
+	// `[]Datum` of 48-byte structs, so its size follows the COLUMN COUNT — and
+	// the executor's own call (`joinOp.buildGeometry`) passes exactly
+	// `len(schema)`. Passing anything else here (a byte width, say) would size
+	// the same build differently on the two sides of the sibling-path rule and
+	// reintroduce the divergence `internal/hashsize` exists to prevent: a cost
+	// model that believes a build fits and an executor that spills.
+	//
+	// Zero means "unknown", and prices the join as never spilling — the
+	// pre-P5.7 behaviour. `relNCols` is the production source and never
+	// returns zero for a rel the search built.
+	outerCols, innerCols int
+}
+
 // hashJoinCost reproduces initial_cost_hashjoin + final_cost_hashjoin
-// (costsize.c:4160/:4275) at milestone fidelity: build the inner side (charged as
-// startup — the hash table must be complete before probing) and probe the outer.
-// numHashClauses is the number of hash conditions. outputRows is the join's
-// result cardinality. Batching/spill I/O is omitted (design ch. 06 §5).
-func hashJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows float64, numHashClauses int) Cost {
+// (costsize.c:4160/:4275) at milestone fidelity: build the inner side (charged
+// as startup — the hash table must be complete before probing) and probe the
+// outer, plus the batch I/O of the spill the executor will actually perform.
+//
+// M0127-P5.7-a: the spill term. `hashsize.Choose` is the SAME function
+// `joinOp.buildGeometry` calls, so `NBatch > 1` here means the executor will
+// really write batch files, and PG's charge for them applies verbatim
+// (costsize.c:4239-4248): the inner is written once (startup — it happens
+// during the build) and then the inner is read back and the outer is written
+// and read, all at seq_page_cost.
+//
+// It REPLACES an unconditional `seq_page_cost * innerRows/100` charge added by
+// M0126-0013 as a stand-in deterrent against building on huge intermediates.
+// That term cited costsize.c:4166 for a page charge PG does not make there:
+// upstream charges pages only under `numbatches > 1`, and charges them for the
+// SPILL, not for the resident table. Its stand-in was also monotone in
+// innerRows, so it penalised a 6 M-row build that fits work_mem exactly as much
+// as one that does not — which is the distinction that decides the plan.
+// leftdeep-joins 04 §4, 06 §5.
+func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// Build: read + hash every inner row, all before the first probe.
-	build := (cp.cpuOperatorCost*float64(numHashClauses)+cp.cpuTupleCost)*innerRows + inner.Total
+	build := (cp.cpuOperatorCost*float64(in.numHashClauses)+cp.cpuTupleCost)*in.innerRows + in.inner.Total
 
-	// M0126-0013: add I/O cost proportional to the hash table's
-	// memory footprint. PG charges inner_pages * seq_page_cost
-	// (costsize.c:4166) for the pages the hash table occupies.
-	// This is the mechanism that penalises plans which build on
-	// large intermediate results — without it, building a hash
-	// table on 6M rows costs the same per row as building on 25.
-	const rowsPerPage = 100.0
-	hashPages := innerRows / rowsPerPage
-	build += cp.seqPageCost * hashPages
-
-	startup := outer.Startup + build
+	startup := in.outer.Startup + build
 	// Probe: hash each outer key and walk its bucket; emit each match.
-	probe := cp.cpuOperatorCost*float64(numHashClauses)*outerRows + cp.cpuTupleCost*outputRows
-	total := startup + (outer.Total - outer.Startup) + probe
-	return Cost{Startup: startup, Total: total}
+	run := (in.outer.Total - in.outer.Startup) +
+		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows +
+		cp.cpuTupleCost*in.outputRows
+
+	// The geometry the executor will pick for this build. Skew buckets and the
+	// parallel combined budget are absent on both sides alike (06 §6).
+	sizing := hashsize.Choose(in.innerRows, in.innerCols, 0, cp.workMem)
+	if sizing.NBatch > 1 {
+		innerPages := spillPages(in.innerRows, in.innerCols)
+		outerPages := spillPages(in.outerRows, in.outerCols)
+		startup += cp.seqPageCost * innerPages
+		run += cp.seqPageCost * (innerPages + 2*outerPages)
+	}
+
+	return Cost{Startup: startup, Total: startup + run}
+}
+
+// spillPages is `page_size` (costsize.c:6464) in goopg's width model: how many
+// BLCKSZ pages `rows` rows of `ncols` columns occupy when written to a batch
+// file. `relation_byte_size`'s MinimalTuple math is replaced by
+// `hashsize.EntryBytes`, the one place goopg's per-row footprint is defined, so
+// the pages this charge prices and the bytes the geometry above solved for come
+// from the same model.
+//
+// The batch FILE encoding is narrower than the in-memory footprint
+// (`spillWriter.WriteRow` frames datums with uvarint lengths rather than
+// storing 48-byte structs), so this over-states the I/O of a wide build. That
+// is deliberate for now and it is the safe direction — it deters spilling — but
+// it is a real approximation and is recorded as such (deferral ledger
+// 2026-08-05 M0127-P5.7-a).
+func spillPages(rows float64, ncols int) float64 {
+	if !(rows > 0) {
+		return 0
+	}
+	return math.Ceil(rows * hashsize.EntryBytes(ncols, 0) / blockSizeBytes)
 }
 
 // nestloopCost reproduces final_cost_nestloop (costsize.c:3349): for each outer

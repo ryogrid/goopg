@@ -3243,9 +3243,50 @@ func verifyInitialized(dir string) error {
 // Non-fatal: if pg_index is absent or malformed, this function returns an error
 // and the caller falls back to WAL-replay-based index recovery.
 func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// The main pass keeps its historical asymmetry: it READS base/<cat.DBOID()>
+	// (which detects as 5/"postgres" on any modern data dir, and receives the
+	// default namespace's rows through mirrorTouchedCatalogsToPostgresDB) while
+	// REGISTERING into the DefaultDBOid namespace, where the default database's
+	// tables live.
+	if err := loadUserIndexesFromHeapForDB(mgr, cat, clog, cat.DBOID(), catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	// M0127-P5.6-f-pre: every OTHER database's indexes reload from its own
+	// base/<dbOid>/1259|2610 pair — the same per-DB sweep (and the same skip
+	// set) as Open's loadUserTablesFromHeapForDB loop and
+	// loadStatisticsFromHeap's, both of which must already have run so the
+	// owning tables and their OIDs resolve.
+	//
+	// Without this pass an index created on a distinct-dbOid database was
+	// durable NOWHERE: B5 Slice A retired RecordKindCreateIndex(20)/
+	// DropIndex(21) on the premise that this heap reload replaced them, but
+	// the reload only ever scanned one database. The TPC-H bench cluster is
+	// the measured casualty — all 16 HammerDB-created indexes on db `tpch`
+	// (including the composite `partsupp_pk` that PG's own Q9 plan turns on)
+	// were absent from the catalog after its first restart.
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadUserIndexesFromHeapForDB(mgr, cat, clog, dbOid, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadUserIndexesFromHeapForDB is loadUserIndexesFromHeap restricted to ONE
+// database's catalog heaps, with the same two-OID split
+// loadUserTablesFromHeapForDB uses: `heapDBOid` picks the base/<dbOid>
+// directory the pg_class / pg_index pages are read from, `nsDBOid` the catalog
+// namespace the owning table is resolved in and the recovered index is
+// registered into. They differ only on the main pass — see its call site.
+func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
 	// --- Pass 1: collect index rows from pg_class (relkind='i') ---
 	classRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
+		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -3316,7 +3357,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 
 	// --- Pass 2: scan pg_index for matching rows ---
 	pgIndexRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
+		DBOid:  heapDBOid,
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -3390,7 +3431,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			// No pg_index row yet — this cluster predates M0113; WAL fallback handles it.
 			continue
 		}
-		tbl, ok := cat.LookupTableByOID(pgIdx.indRelid)
+		tbl, ok := cat.LookupTableByOID(pgIdx.indRelid, nsDBOid)
 		if !ok {
 			continue
 		}
@@ -3467,14 +3508,14 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		// Fillfactor/DeduplicateItems are restored via the separate
 		// ApplyIndexReloptions call just below (reads pg_class.reloptions
 		// text), not through this call.
-		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, colOpClasses, colCollations, 0, nil, pgIdx.nullsNotDistinct, ir.tablespace)
+		cat.RegisterIndexDuringRecoveryForDB(nsDBOid, schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, colOpClasses, colCollations, 0, nil, pgIdx.nullsNotDistinct, ir.tablespace)
 		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
 		// pages_per_range/autosummarize from the heap-persisted pg_class row —
 		// without this they silently revert to defaults across every restart
 		// (M0119-0004 index-reloptions follow-up, sibling of loadUserTablesFromHeap's
 		// catalog.ApplyTableReloptions call for tables/views).
 		if ir.relOptions != "" {
-			if newIdx, ok := cat.LookupIndexByOID(ir.oid); ok {
+			if newIdx, ok := cat.LookupIndexByOID(ir.oid, nsDBOid); ok {
 				catalog.ApplyIndexReloptions(newIdx, ir.relOptions)
 			}
 		}

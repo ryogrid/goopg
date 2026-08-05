@@ -1,0 +1,60 @@
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/IsNullExpr
+    zz_c7_oldbody_test.go:135: old body skipped IsNullExpr (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/IsBoolExpr
+    zz_c7_oldbody_test.go:135: old body skipped IsBoolExpr (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/CollateExpr
+    zz_c7_oldbody_test.go:135: old body skipped CollateExpr (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/CastExpr
+    zz_c7_oldbody_test.go:135: old body skipped CastExpr (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/IsDistinctFromExpr/Left
+    zz_c7_oldbody_test.go:135: old body skipped IsDistinctFromExpr/Left (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/IsDistinctFromExpr/Right
+    zz_c7_oldbody_test.go:135: old body skipped IsDistinctFromExpr/Right (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/RowExpr
+    zz_c7_oldbody_test.go:135: old body skipped RowExpr (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/InExpr/List
+    zz_c7_oldbody_test.go:135: old body skipped InExpr/List (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/InExpr/Args
+    zz_c7_oldbody_test.go:135: old body skipped InExpr/Args (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/ExistsExpr/Args
+    zz_c7_oldbody_test.go:135: old body skipped ExistsExpr/Args (pin would fail) — OK
+=== RUN   TestC7Old_NewlyCollectedKindsWereSkipped/SubqueryExpr/Args
+    zz_c7_oldbody_test.go:135: old body skipped SubqueryExpr/Args (pin would fail) — OK
+--- PASS: TestC7Old_NewlyCollectedKindsWereSkipped (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/IsNullExpr (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/IsBoolExpr (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/CollateExpr (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/CastExpr (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/IsDistinctFromExpr/Left (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/IsDistinctFromExpr/Right (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/RowExpr (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/InExpr/List (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/InExpr/Args (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/ExistsExpr/Args (0.00s)
+    --- PASS: TestC7Old_NewlyCollectedKindsWereSkipped/SubqueryExpr/Args (0.00s)
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/SubqueryExpr
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED SubqueryExpr into MHJ.Filters — pin would fail
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/ExistsExpr
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED ExistsExpr into MHJ.Filters — pin would fail
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/ArraySubqueryExpr
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED ArraySubqueryExpr into MHJ.Filters — pin would fail
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/OuterColumnRef
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED OuterColumnRef into MHJ.Filters — pin would fail
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/CTIDExpr
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED CTIDExpr into MHJ.Filters — pin would fail
+=== RUN   TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/unnamed_ColumnRef
+    zz_c7_oldbody_test.go:168: old extraInScans ADMITTED unnamed ColumnRef into MHJ.Filters — pin would fail
+--- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/SubqueryExpr (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/ExistsExpr (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/ArraySubqueryExpr (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/OuterColumnRef (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/CTIDExpr (0.00s)
+    --- PASS: TestC7Old_ExtraInScansAdmittedOpaqueConjuncts/unnamed_ColumnRef (0.00s)
+=== RUN   TestC7Old_AllColumnRefNamesInScopeCertifiedOpaque
+    zz_c7_oldbody_test.go:181: old allColumnRefNamesInScope CERTIFIED an unlooked-at subquery — pin would fail
+--- PASS: TestC7Old_AllColumnRefNamesInScopeCertifiedOpaque (0.00s)
+PASS
+ok  	github.com/goopg/goopg/internal/planner	(cached)

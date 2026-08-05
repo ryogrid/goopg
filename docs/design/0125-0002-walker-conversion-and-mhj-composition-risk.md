@@ -541,3 +541,228 @@ timed TPC-H run and the SF0.5 answer sweep were again NOT executed — zero hunk
 zero-delta probe on the sole consumer; the walker is read-only, so commit 2's
 metadata-loss class cannot arise. Both become mandatory at the first commit with a
 non-empty diff. Next: commit 5, `exprSide`.
+
+### Commit 5 of 8 — `exprSide` re-based onto `walkExprRefs` (2026-08-03)
+
+D2 row 5, "decides which side a conjunct is pushed to". Measured in
+`analysis/m0125-0002-c5-plans-20260803/`.
+
+**The instrument had to be extended before the result meant anything.** `exprSide` has
+exactly ONE caller — `splitEqualityForHash` — and **goopg's EXPLAIN never prints hash
+keys**: `grep -c 'Hash Cond'` is 0 across all 22 TPC-H and 96 SF0.5 plans. So a change in
+*which* conjunct is promoted to `LeftKey`/`RightKey` is invisible to a plan-snapshot A/B
+unless it also flips the printed join algorithm. This is commit 3's hole in a new place
+(there: `Index` mutation hidden behind EXPLAIN's Name-over-Index printing), and it is
+closed the same way — a divergence probe on the consumer, not on the walker.
+
+**D2 row 5's "expect hunks" prediction is REFUTED by measurement**, as commit 4's was.
+TPC-H is 22/22 byte-identical (the before arm re-derived `m0125-0002-c4-after.txt`
+byte-for-byte, confirming the lineage and the instrument), SF0.5 is 96/96 once q85 is
+attributed (below), and the probe — a measurement-only binary computing
+`splitEqualityForHash`'s `(leftKey, rightKey, ok)` triple with BOTH `exprSide` bodies while
+the live path keeps the OLD answer — logged **0 `C5DELTA` and 0 `C5SIDE` over 232 calls**
+(223 TPC-DS + 9 TPC-H). Because `splitEqualityForHash` is the walker's only caller, 232 is
+the COMPLETE live decision population on these benchmarks, not a sample; a `C5CALL`
+positive control was added precisely so the zero could not be vacuous, and the probe arm's
+TPC-H snapshot is byte-identical to the before arm (the probe is pure observation). The
+newly-admitted shapes are real and unit-pinned — `IS NULL`, `IS BOOL`, `CollateExpr`,
+`RowExpr`, `IS DISTINCT FROM`, literal-list `IN`, plus the row-independent leaves — but no
+`=` conjunct on either benchmark carries one in an operand position today.
+
+**D3's scope policy for this walker: `scopeVeto`** — the first in the series. A node
+carrying an inner `Plan` is not a per-row hashable key, and the veto preserves the old
+fall-through decline regardless of what the node's same-scope `Args` merged to (pinned:
+`SubqueryExpr` with a one-sided `Args` must NOT be rescued). `*OuterColumnRef` and
+`*CTIDExpr` are vetoed explicitly for the reason commit 4 recorded — `exprChildSlots`
+correctly reports both as childless leaves, so a completeness-driven conversion would
+ADMIT them: an outer ref is fixed only per outer binding, so a cached hash table would go
+stale across re-executions, and ctid is injected into the scanned row's slot, so a side
+misattribution would hash the WRONG side's ctid. Unknown types resolve `sideMixed`, NOT
+the panic of commits 3–4: this walker has always failed CLOSED (a decline costs an
+optimisation, never a wrong answer), so `sideMixed` preserves the old contract while the
+panic would invent a new crash surface. `*ExecParamRef`, `*TableOidExpr` and the `Merge*`
+leaves join the `ParamRef` class as `sideUnknown` — commit 2's row-independence argument.
+
+**Census pin DEMOTED, not deleted (RC-1a pinned population 47 → 46)** — for commits 1–2's
+reason: the recursion and the exhaustiveness moved to `exprChildSlots`, but a two-arm
+bottom-up dispatch survives inside the `Visit` closure and the census attributes a
+closure's switch to its enclosing function. `internal/planner/expr_side_arms_test.go` pins
+the surface: newly-classified containers (one case per kind — `IsNullExpr` proves nothing
+about `CollateExpr`, which is how the original hole survived), the row-independent leaves,
+every preserved arm, both classes of preserved decline, the fail-closed unknown, and — the
+headline — a semantic pin on the live consumer showing `(l IS NULL) = r` now yields a hash
+key pair instead of being stranded on the NL path.
+
+**q85: the M0125-0047 hazard fired on its first use, and the protocol held.** The lone
+differing SF0.5 cell was q85's `cd1`/`cd2` alias tie-swap. Commit 4 told commits 5–8 to
+confirm with a same-binary restart before attributing such a hunk; doing so showed the
+BEFORE binary restarted 3× and the AFTER binary restarted 4× all produce byte-identical
+plans (md5 `b1bc99cf`) — the captured before-arm's ordering is the outlier, so the hunk is
+instrument noise, not commit 5's effect.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` package green;
+TPC-H A/B 22/22 byte-identical; SF0.5 EXPLAIN A/B 96/96 (q85 attributed); probe 232 calls
+/ 0 deltas; `tpch-spotcheck.sh` RESULT=PASS (Q12=2 Q13=35, 35.5 s); pgbench smoke via the
+commit hook. **D4 deviations (ledger row):** the timed TPC-H run and the SF0.5 answer
+sweep were again NOT executed — zero hunks on both benchmarks plus a zero-delta probe over
+the walker's COMPLETE consumer population; `exprSide` is read-only and returns an enum, so
+commit 2's metadata-loss class cannot arise. Both become mandatory at the first commit with
+a genuine non-empty diff. Next: commit 6, `conjunctIsLocalEligible` + `localizeExprToLeaf`
+— the first pair in the series, and the first where a fail-open ADMITS a predicate rather
+than declining one (`extraInScans` starts `allMatched := true`), so completing the walker
+can REMOVE predicates and the timed run should be assumed owed until the diff says
+otherwise.
+
+## Commit 6 of 8 — `conjunctIsLocalEligible` + `localizeExprToLeaf` (2026-08-03)
+
+**Landed as one commit, as D2 row 6 requires**, because the two functions are a
+producer/consumer pair with a shared invariant:
+`partitionConjunctsForJoinPlanning` *moves* an eligible conjunct out of
+`joinConjuncts` into `locals.byBinding`, and `attachRelationLocalFilters` is the only
+thing that puts it back into the plan. The producer's admission is therefore a promise
+that the consumer can rebase it; splitting the commit would have left a window where a
+conjunct is judged eligible and cannot be rebased — i.e. a dropped or mis-indexed
+predicate.
+
+**Scope policy: `scopeVeto` on both sides, with asymmetric unknown handling.**
+
+- The producer does **not** panic on an unenumerated type — it declines. A decline costs
+  an optimisation (the conjunct stays in the join residual and is evaluated above the
+  join), never a wrong answer, so this is the commit-5 `exprSide` treatment, not the
+  commit-3/4 `visitColumnRefs*` treatment. Three declines are explicit rather than
+  inherited from `scopeVeto`, because `exprChildSlots` emits `slotInnerPlan` **only when
+  `Plan != nil`**: `*OuterColumnRef` (a childless leaf), and the subquery-bearing kinds
+  in their unplanned form. `*ArraySubqueryExpr` / `*MultiAssignSubqRow` /
+  `*MultiAssignSubqElem` join `*SubqueryExpr` / `*ExistsExpr` in that set — the old
+  switch never named them, so they were admitted by accident.
+- The consumer **panics** on an abort. By the time it runs, the producer has already
+  accepted the conjunct over the SAME primitive with the SAME policy, so an abort means
+  the pair has diverged. It cannot decline: the predicate is no longer in
+  `joinConjuncts`, so returning it un-rebased or dropping it would be a wrong answer.
+  `TestLeafLocalPairAgreesOnEveryExprKind` pins the invariant over all 32 kinds, which is
+  what makes the panic unreachable by construction rather than by argument.
+
+**The latent defect this closes.** Both functions were incomplete in the same direction,
+which is precisely why it stayed latent — the producer usually declined what the consumer
+could not rebase. `WHERE t.a IS NULL`, on a binding with `offset > 0`, in a query passing
+`shouldAttachBeforeMHJ`, was judged eligible (the old 9-arm switch never descended
+`*IsNullExpr`, so the walk produced zero callbacks and `eligible` stayed `true`), moved
+into `locals`, then returned **unchanged** by `localizeExprToLeaf` — whose trailing
+pass-through ("Constants … no ColumnRef; pass through") was true of the seven kinds it
+knew and a silent lie about the other twenty-five. The leaf `Filter` then carried
+FROM-cumulative indices and read the wrong column. Commit 4 widened the reachability
+rather than creating it: a complete `tableForCol` attributes `t.a IS NULL` to a binding
+where the old one answered −1.
+
+**D2 row 6's shape-move prediction is REFUTED by measurement** — TPC-H A/B **22/22
+byte-identical** (the before arm re-derived `m0125-0002-c5-after.txt` byte-for-byte, so
+the instrument is stable across loops), SF0.5 `EXPLAIN` A/B **96/96 byte-identical**, and
+a divergence probe on BOTH functions at all three live call sites logged **0 `C6ELIG` /
+0 `C6LOC` / 0 `C6ABORT`** over **277 eligibility calls + 175 localization calls** across
+118 planned queries, with `C6CALL`/`C6LOCC` positive controls so the zeros cannot be
+vacuous. The probe was mandatory, not belt-and-braces: eligibility changes ARE visible in
+the plan text (a leaf `Filter` appears or disappears), but the `Index` rebase is
+**invisible** — goopg's EXPLAIN prints column names (M0125-0042) — so the probe compares
+localized trees by `exprIdentityKey`, which includes `Index`. Commit 2's metadata-loss
+class cannot arise here: `shallowCloneExpr` is a whole-struct copy, where commit 2's old
+arms rebuilt nodes from stale field lists. Evidence
+`analysis/m0125-0002-c6-plans-20260803/` (incl. `probe-source.md`).
+
+**Census pins moved in BOTH directions in one commit** — the first time in the series.
+`conjunctIsLocalEligible` DEMOTED (`walkerPending` → `nonRecursiveClassifier`: its veto
+dispatch survives inside the `Visit` closure, and the census keys a site by its enclosing
+function) and `localizeExprToLeaf` DELETED (`cloneExprRefs` left it with a `*ColumnRef`
+type assertion and no switch at all). RC-1a 46 → 45.
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` package green; 48
+new pin subtests proved to FAIL against the old bodies first; `tpch-spotcheck.sh`
+RESULT=PASS (Q12=2 rows / 23.1 s, Q13=35 rows / 11.3 s); pgbench smoke via the commit
+hook. **D4 deviation (ledger row):** the timed 22-query TPC-H run and the SF0.5 answer
+sweep were again not executed — commit 5 declared them mandatory *here*, and the
+measurement discharged the premise that made them so (zero hunks on both benchmarks plus
+a zero-delta probe over the complete live population of both functions, including the
+index field EXPLAIN hides). Because that is now four consecutive byte-plan-identical
+commits, the ledger converts the per-commit obligation into **one cumulative timed TPC-H
+run at commit 8**, covering commits 2–8 as a block: a per-commit run over identical plans
+measures host noise, but a cumulative drift across seven commits is a real question.
+Next: commit 7, `visitColumnRefsByName` — the last and largest, whose consumer
+`extraInScans` starts `allMatched := true`, so completing it removes conjuncts from
+`MultiHashJoin.Filters` directly.
+
+---
+
+## Commit 7 of 8 — `visitColumnRefsByName` (2026-08-03, LAST of the series)
+
+`bushy.go:visitColumnRefsByName` is re-based onto `walkExprRefs` under
+**`scopeSignal`**, the policy D3 predetermined for it, and the conversion **changes the
+signature**: it now returns whether the name test COVERED the expression.
+
+The signature is the whole commit. This walker's three consumers do not read the callback
+stream — they seed a verdict `true` and falsify it only from inside the callback, so a
+conjunct built entirely from unenumerated kinds produced zero callbacks and returned a
+**vacuous true**. §"Why this is not just fixing stale indices" identified that as the
+series' largest blast radius, because for `extraInScans` the vacuous true is not a missed
+optimisation but an ADMISSION: the conjunct is captured into `MultiHashJoin.Filters` and
+evaluated on the MHJ output row. D3's instruction — treat "an opaque child exists" as
+*not matched* — is discharged by `return total && allMatched`.
+
+**"Opaque" is wider than D3's inner plans, and the widening is the design decision of this
+commit.** A name-based scope test cannot certify anything that reads row data without
+naming the column it reads, so four such cases clear `total` alongside the scope crossing
+and the unknown type: `*OuterColumnRef` (names a DIFFERENT scope — matching it against
+this subtree's names would be coincidence, not evidence; commit 2 vetoed it on the
+rewriting side for the same reason), `*CTIDExpr` (`seqScanOp` injects the scanned row's
+block/offset into its slot), `*MergeWholeRowRef` (a composite materialised from ctx over
+the whole row), and a `*ColumnRef` whose `Name` is empty — "for diagnostics" per its own
+struct comment, and empty on some construction paths, which the old body skipped silently.
+`*ParamRef`, `*ExecParamRef`, `*TableOidExpr` and `*MergeActionExpr` stay total: they read
+no row column. The rule, not the list, is what the pin table encodes, so a 33rd Expr type
+forces a decision rather than inheriting one.
+
+**The third call site takes TWO escapes, and they must not be merged.**
+`pushOuterQualsIntoLaterals` already had one — `!allIn && len(leftNames) > 0` — which
+means "we cannot enumerate the NODE's columns" and deliberately falls back on the index
+verdict from `classifyConjunctSide`. `!total` means "we cannot enumerate the CONJUNCT",
+where that fallback is worthless: `classifyConjunctSide` is built on `walkColumnRefsImpl`,
+which has no `default:` either, so an unenumerated kind is invisible to BOTH tests and a
+conjunct wrapping e.g. an `*ArraySubqueryExpr` reads as conclusively `sideLeft` on its
+other operand alone. `!total` is therefore unconditional and returns before the leftNames
+escape is consulted.
+
+**Measurement: no plan moved, and proving that took four sweeps rather than one.** TPC-H
+A/B **22/22 byte-identical**, and byte-identical against `post-mhj-retire` as well — so
+the CUMULATIVE TPC-H diff across commits 1–7 is empty, not just this commit's. The SF0.5
+EXPLAIN A/B first read 95/96, with TPC-DS **Q85** showing its two `customer_demographics`
+aliases swapped between two join positions of identical cost. That hunk is the
+INSTRUMENT: `before` vs a second `before` sweep is 96/96; a second *after* sweep
+reproduces the `before` plan set 96/96 and differs from the first *after* sweep only at
+Q85; and three fresh single-query server starts per binary produced the same ordering all
+six times. The divergence probe closed it — while planning Q85 the old and new bodies
+disagreed on **zero** verdicts. Q85 has a nondeterministic join-order tie-break that
+surfaces only in the long-lived-server sweep context; ledger row, because the same
+instrument accepted commits 2–6 on single runs.
+
+**Census pin DEMOTED** (`walkerPending` → `nonRecursiveClassifier`): the three-arm
+"reads row data but names no column" veto survives inside the `Visit` closure, and the
+census keys a site by its enclosing function. RC-1a 45 → 44. Eighteen new pin subtests in
+`visit_refs_byname_arms_test.go`, each proved to fail against the old body first — by
+reproducing that body under a `_c7old` name, because the signature change means the pins
+cannot be *compiled* against the pre-conversion source the way commits 3–6 were
+(`analysis/m0125-0002-c7-plans-20260803/oldbody-harness.md`).
+
+**Gates.** `RALPH_PRECOMMIT_SCOPE=units` PASS; full `internal/planner` green;
+`tpch-spotcheck.sh` RESULT=PASS (Q12=2 rows / 21.6 s, Q13=35 rows / 11.2 s); pgbench smoke
+via the commit hook. **The cumulative timed TPC-H run owed here is answered with a
+different instrument, and the substitution is a ledger row.** D4 item 3 exists to catch a
+regression caused by a moved plan; the cumulative diff is byte-empty, so an execution run
+re-measures an unchanged plan set at a noise floor (round-5 §3: 2–8 % unattributable)
+wider than anything it could attribute. What the eight conversions did change is planning
+cost — a hand switch became a driver that builds an `[]exprSlot` per node — which a plan
+diff cannot see and an execution run would bury under 20-minute scans. Measured directly
+(`capture-plantime.sh`, 22 queries × 5 `EXPLAIN` sweeps in one session with `\timing`):
+4.41 → 4.54 ms total, ~6 µs per query, with a *within-arm* spread per query wider than the
+between-arm delta. Unchanged within resolution. The execution arm stays owed at milestone
+level.
+
+**The series is complete**: all eight walkers named in §2 are on the exprwalk primitives,
+RC-1a's pinned population is 50 → 44, and M0127-P5.2 has the stable base it waits on.

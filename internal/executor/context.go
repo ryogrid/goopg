@@ -180,6 +180,11 @@ type Context struct {
 	// SubPlanStats. Lazily allocated by memoizeStat. S7.
 	MemoizeStats map[*planner.Memoize]*MemoizeStats
 
+	// HashJoinStats carries the per-hash-join ANALYZE counters
+	// (buckets / batches / peak memory), keyed by plan node like the two
+	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
+	HashJoinStats map[*planner.Join]*HashJoinStats
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of
@@ -327,6 +332,17 @@ type Context struct {
 	// spill-to-disk. Zero means unlimited (no spill). Defaults to
 	// 512 MiB when the GUC is active. See milestone 0037.
 	WorkMem int64
+
+	// tempFiles owns every spill file WorkMem's budget forces to disk, so
+	// the statement's end unlinks them whether or not the operator that
+	// created them ever reached Close (M0127-P3.3; see tempfiles.go). It is
+	// a POINTER on purpose: this struct is copied by value in a few places
+	// (`synthCtx := *ctx` in the FK and partition-DDL paths) and shared by
+	// reference with every parallel worker, and all of those must land in
+	// ONE registry — a per-copy registry is a leak with extra steps.
+	// NewContext installs it; a bare &Context{} literal (unit tests) has
+	// none and every registry call degrades to a no-op.
+	tempFiles *tempFileRegistry
 
 	// GetSetting returns the effective session GUC value for the given
 	// name. Wired by the server from the per-connection SessionRegistry;
@@ -1559,7 +1575,11 @@ type Checkpointer interface {
 // NewContext builds a Context with sensible defaults: a fresh
 // timestamp and no bind parameters. Tests use this directly.
 func NewContext() *Context {
-	return &Context{Now: time.Now()}
+	// M0127-P3.3: every context that can run a query owns a spill-file
+	// registry from birth. Allocating here rather than lazily is what makes
+	// it safe to share with parallel workers — a lazily-installed registry
+	// would be a write to a field those workers read concurrently.
+	return &Context{Now: time.Now(), tempFiles: newTempFileRegistry()}
 }
 
 // MaterializeWriterXID ensures the context's transaction has a real

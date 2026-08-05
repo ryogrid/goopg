@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -450,7 +451,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 		if !ok {
 			continue
 		}
-		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, dsCtx)
+		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, stats.RowCount, dsCtx)
 		// Honor a per-column `n_distinct` attribute option, mirroring
 		// upstream's override in compute_index_stats/do_analyze_rel
 		// (postgres/src/backend/commands/analyze.c:571-581): a manual
@@ -523,11 +524,92 @@ func columnStatsTarget(col *catalog.Column, tableTarget int) (target int, ok boo
 	return *col.StatTarget, true
 }
 
+// ndistinctEstimate scales a sample's distinct-value count up to the whole
+// relation, mirroring upstream's `compute_scalar_stats` ndistinct block
+// (postgres/src/backend/commands/analyze.c:2588-2648) branch for branch. It
+// returns the ABSOLUTE estimate; PG's signed stadistinct convention (negative
+// = a fraction of the row count) is reconstructed by the caller, which stores
+// both forms — see catalog.ColumnStats.StaDistinct.
+//
+// Why this exists (M0127-P5.6-e-iii): goopg used to store `len(freq)` — the
+// raw SAMPLE distinct count — as the table's ndistinct. With the default
+// stats target that caps at ~30,000, so a 1.5 M-row unique key read as 30,000
+// and every join above it divided |L|*|R| by a number 50x too small. The
+// estimate audit (09 §5.3) traced Q9's 124.7x over-estimate through exactly
+// that saturation, and it is why the join-key coordinate correction measured
+// as a regression when applied on its own: a saturated nd compounds up the
+// join chain.
+//
+// The three branches upstream distinguishes matter, and none is a rounding
+// detail:
+//
+//   - nmultiple == 0: nothing repeated in the sample, so assume a unique
+//     column and scale with the row count (discounted for NULLs). This is the
+//     case that was 50x wrong before.
+//   - nmultiple == ndistinct: every sampled value repeated, so assume the
+//     column really does have only these values (boolean/enum shapes). The
+//     sample count IS the answer here — do not scale it.
+//   - otherwise: the Haas-Stokes Duj1 estimator n*d / (n - f1 + f1*n/N),
+//     clamped to [d, N]. f1 is the number of values seen exactly once.
+//
+// goopg has no `toowide_cnt` (no width-truncated sample values), so upstream's
+// toowide terms are constant-folded to zero.
+func ndistinctEstimate(sampleDistinct, nmultiple, nonNull int, nullFrac float64, totalRows int64) float64 {
+	if sampleDistinct == 0 || nonNull == 0 {
+		return 0
+	}
+	// N: the relation's non-NULL row count. Upstream's
+	// `totalrows * (1.0 - stats->stanullfrac)`.
+	N := float64(totalRows) * (1.0 - nullFrac)
+	if totalRows <= 0 {
+		// No measured row count (the test-only wrapper, or a relation whose
+		// scan produced no count). Fall back to the sample's own distinct
+		// count — the pre-M0127 behaviour, which is at least a lower bound.
+		return float64(sampleDistinct)
+	}
+
+	switch {
+	case nmultiple == 0:
+		// Unique column: upstream stores -1.0 * (1 - nullfrac), i.e. one
+		// distinct value per non-NULL row.
+		return N
+	case nmultiple == sampleDistinct:
+		// Every sampled value repeated — the column's whole value set is in
+		// the sample.
+		return float64(sampleDistinct)
+	}
+
+	f1 := float64(sampleDistinct - nmultiple)
+	d := f1 + float64(nmultiple)
+	// n = samplerows - null_cnt, which is exactly the non-NULL sample count.
+	n := float64(nonNull)
+	var est float64
+	if N > 0 {
+		denom := (n - f1) + f1*n/N
+		if denom > 0 {
+			est = (n * d) / denom
+		}
+	}
+	// Clamp to sane range in case of roundoff error (upstream's wording).
+	if est < d {
+		est = d
+	}
+	if est > N {
+		est = N
+	}
+	return math.Floor(est + 0.5)
+}
+
 // computeColumnStats derives the per-column NDistinct / NullFrac
 // / MCV / Histogram from the sample. Mirrors the bookkeeping in
 // upstream's `compute_scalar_stats` while staying within the v0
 // type set.
-func computeColumnStats(sample []Row, colIdx int, statsTarget int, dsCtx *Context) catalog.ColumnStats {
+//
+// totalRows is the relation's FULL live-row count (goopg's ANALYZE walks every
+// block and reservoir-samples, so the caller has measured it exactly). It is
+// what turns the sample's distinct count into a table-wide estimate — see
+// ndistinctEstimate. M0127-P5.6-e-iii.
+func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int64, dsCtx *Context) catalog.ColumnStats {
 	stats := catalog.ColumnStats{}
 	if len(sample) == 0 {
 		return stats
@@ -563,19 +645,23 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, dsCtx *Contex
 	}
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
-	stats.NDistinct = int64(len(freq))
-	// The distinct-to-rows RATIO, measured on the sample.
-	//
-	// Deliberately NOT scaled up to the table (no Haas-Stokes): the ratio is
-	// what the parallel-aggregate split gate consumes, and its sampling bias
-	// runs in the safe direction. For a low-cardinality column the sample
-	// over-states the fraction (6 distinct in 30,000 sampled rows reads as
-	// 2e-4 where the truth over 6M rows is 5e-7), which over-states the
-	// gate's reduction ratio and therefore makes it MORE likely to refuse.
-	// For a near-unique column every sampled value is distinct and the ratio
-	// is 1.0, which is exactly right and is the case the gate exists to catch.
-	if nonNull > 0 {
-		stats.NDistinctFrac = float64(len(freq)) / float64(nonNull)
+
+	// Number of sampled values seen more than once — upstream's `nmultiple`
+	// (compute_scalar_stats, analyze.c). Everything else appeared exactly once
+	// and is upstream's `f1`.
+	nmultiple := 0
+	for _, b := range freq {
+		if b.count > 1 {
+			nmultiple++
+		}
+	}
+	ndAbs := ndistinctEstimate(len(freq), nmultiple, nonNull, stats.NullFrac, totalRows)
+	stats.NDistinct = int64(ndAbs + 0.5)
+	if totalRows > 0 {
+		stats.NDistinctFrac = ndAbs / float64(totalRows)
+		if stats.NDistinctFrac > 1 {
+			stats.NDistinctFrac = 1
+		}
 	}
 
 	if nonNull == 0 {

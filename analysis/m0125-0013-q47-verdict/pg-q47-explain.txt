@@ -1,0 +1,43 @@
+                                                                                                                       QUERY PLAN                                                                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=70298.02..70298.03 rows=1 width=400)
+   CTE v1
+     ->  WindowAgg  (cost=65698.13..68801.62 rows=15346 width=418)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+           ->  WindowAgg  (cost=65698.13..68417.97 rows=15346 width=386)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=65698.13..67995.96 rows=15346 width=378)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=65698.13..67535.58 rows=15346 width=352)
+                             Workers Planned: 4
+                             ->  Sort  (cost=64698.07..64707.66 rows=3836 width=352)
+                                   Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                                   ->  Nested Loop  (cost=2405.15..64469.73 rows=3836 width=352)
+                                         ->  Hash Join  (cost=2404.86..63292.63 rows=3836 width=254)
+                                               Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                               ->  Parallel Hash Join  (cost=2393.96..63270.12 rows=4016 width=22)
+                                                     Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                     ->  Parallel Seq Scan on store_sales  (cost=0.00..58985.63 rows=720163 width=18)
+                                                     ->  Parallel Hash  (cost=2390.82..2390.82 rows=251 width=12)
+                                                           ->  Parallel Seq Scan on date_dim  (cost=0.00..2390.82 rows=251 width=12)
+                                                                 Filter: ((d_year = 2000) OR ((d_year = 1999) AND (d_moy = 12)) OR ((d_year = 2001) AND (d_moy = 1)))
+                                               ->  Hash  (cost=10.40..10.40 rows=40 width=240)
+                                                     ->  Seq Scan on store  (cost=0.00..10.40 rows=40 width=240)
+                                         ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
+                                               Index Cond: (i_item_sk = store_sales.ss_item_sk)
+   ->  Sort  (cost=1496.40..1496.41 rows=1 width=400)
+         Sort Key: ((v1.sum_sales - v1.avg_monthly_sales)), v1_lead.sum_sales
+         ->  Merge Join  (cost=0.00..1496.39 rows=1 width=400)
+               Merge Cond: ((v1_lead.i_category = v1.i_category) AND (v1_lead.i_brand = v1.i_brand) AND ((v1_lead.s_store_name)::text = (v1.s_store_name)::text) AND ((v1_lead.s_company_name)::text = (v1.s_company_name)::text))
+               Join Filter: (v1.rn = (v1_lead.rn - 1))
+               ->  CTE Scan on v1 v1_lead  (cost=0.00..306.92 rows=15346 width=684)
+               ->  Materialize  (cost=0.00..1035.99 rows=1 width=1404)
+                     ->  Merge Join  (cost=0.00..1035.98 rows=1 width=1404)
+                           Merge Cond: ((v1_lag.i_category = v1.i_category) AND (v1_lag.i_brand = v1.i_brand) AND ((v1_lag.s_store_name)::text = (v1.s_store_name)::text) AND ((v1_lag.s_company_name)::text = (v1.s_company_name)::text))
+                           Join Filter: (v1.rn = (v1_lag.rn + 1))
+                           ->  CTE Scan on v1 v1_lag  (cost=0.00..306.92 rows=15346 width=684)
+                           ->  Materialize  (cost=0.00..575.50 rows=9 width=720)
+                                 ->  CTE Scan on v1  (cost=0.00..575.48 rows=9 width=720)
+                                       Filter: ((avg_monthly_sales > '0'::numeric) AND (d_year = 2000) AND (CASE WHEN (avg_monthly_sales > '0'::numeric) THEN (abs((sum_sales - avg_monthly_sales)) / avg_monthly_sales) ELSE NULL::numeric END > 0.1))
+(39 rows)
+

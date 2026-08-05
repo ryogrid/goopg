@@ -49,6 +49,11 @@
 #   scripts/tpcds-sf05-regression.sh oracle        # PG plain run -> oracle.txt (rows+ck)
 #   scripts/tpcds-sf05-regression.sh load-goopg    # init+load goopg cluster on :65437
 #   scripts/tpcds-sf05-regression.sh sweep         # goopg run vs oracle (the recurring gate)
+#   scripts/tpcds-sf05-regression.sh plans         # EXPLAIN-only plan capture + diff (~20 s)
+#   scripts/tpcds-sf05-regression.sh delta [OLD [NEW]]  # named per-query status/runtime
+#                                                  # delta between two archived reports
+#                                                  # (defaults: the two newest); runs
+#                                                  # nothing, costs nothing
 #   scripts/tpcds-sf05-regression.sh all           # everything above, in order
 #   scripts/tpcds-sf05-regression.sh status
 #
@@ -66,6 +71,14 @@
 #   SF05_ORACLE=<path>      read/write the oracle fixture elsewhere
 #   SF05_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
 #                           fixture stays where SF05_ORACLE points
+#   SF05_NO_PLANS=1         skip the plan-shape channel appended to a sweep
+#   SF05_NO_DELTA=1         skip the status-delta channel appended to a sweep
+#   SF05_SWEEP_BASELINE=<p> diff the sweep's per-query status/runtime vector
+#                           against <p> instead of the newest sweep-*.txt in the
+#                           results dir; `none` skips the delta
+#   PLAN_TIMEOUT=180        per-query timeout for the EXPLAIN-only plan capture
+#   SF05_PLANS_BASELINE=<p> diff the capture against <p> instead of the newest
+#                           plans-*.txt in the results dir; `none` skips the diff
 #   SF05_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
 #                           rebuilding from the tree (bisect probes); the report
 #                           says its provenance is unknown — see sf05_ensure_bin
@@ -505,12 +518,222 @@ cmd_oracle() {
     true
 }
 
+# -------------------------------------------------------------- plan channel
+#
+# Why the gate needs one (M0127-P5.6-g-i-b, 2026-08-05). The row-count +
+# checksum verdict above is the PRIMARY bar and is not weakened by anything in
+# this section — nothing here can fail the gate. But it is blind to plan shape,
+# and P5.6-g-i measured how blind: commit `4b820ab8` re-ordered **74 of 99**
+# TPC-DS plans while the sweep reported a verdict identical to the previous
+# baseline line for line (PASS=94, the same 57 checksums, the same single Q47
+# TIMEOUT). For a milestone whose whole subject is the join search, 74 plans
+# moving in silence is the event we most want the artefact to record.
+#
+# The channel is EXPLAIN-without-ANALYZE, so it executes nothing: no timings and
+# no actual rows enter the file, which is what makes the capture byte-stable.
+# P5.6-g-i measured that noise floor directly — the same binary captured twice
+# produced byte-identical plans for all 99 queries — so a diff here is signal.
+#
+# Every statement in a query file is EXPLAIN-prefixed (Q14/23/24/39 hold two),
+# so the second statement of those four is never executed either. The file
+# format is deliberately identical to the hand-rolled capture that preceded this
+# (`analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh`), so the four committed
+# corpus captures from that loop remain valid baselines for
+# `scripts/tpcds-plan-diff.py`.
+PLAN_TIMEOUT="${PLAN_TIMEOUT:-180}"
+PLAN_DIFF="${PLAN_DIFF:-${SCRIPT_DIR}/tpcds-plan-diff.py}"
+
+# ------------------------------------------------------------ status channel
+#
+# Why the gate needs this one too (M0127-P5.6-f-v, 2026-08-05). The SUMMARY line
+# is a set of COUNTS, and `TIMEOUT=1` is invariant to WHICH query timed out. On
+# 2026-08-04/05 commit `ce027cee` traded Q72's timeout for Q47's (31 s -> 523 s)
+# and the summary was byte-identical across FOUR sweeps; it took a bisect
+# against a copy of the cluster to find (analysis/m0127-p56fiii/README.md,
+# design 09 §5.15). The plan channel above would not have caught it either: it
+# reports that a shape moved, not that a query stopped finishing.
+#
+# So the sweep also diffs its own per-query STATUS/RUNTIME VECTOR against the
+# previous report and prints what moved BY NAME (`TIMEOUT +Q47 -Q72`). Input is
+# the report itself, so no new artefact is produced and every archived report is
+# a valid baseline. Non-blocking, exactly like the plan channel: performance
+# never fails this gate, only correctness does.
+SWEEP_DIFF="${SWEEP_DIFF:-${SCRIPT_DIR}/tpcds-sweep-diff.py}"
+
+# sf05_sweep_baseline — the report this run is diffed against, chosen BEFORE the
+# new one is created so it can never select itself (same rule, and the same
+# hazard, as sf05_plan_baseline). Unlike the plan baseline it skips SUBSET
+# PROBES: a probe covers a handful of queries and is stamped "NOT a gate
+# result", so diffing a full sweep against one would compare 3 queries and stay
+# silent about the other 96. The newest FULL report is the last comparable gate
+# run. SF05_SWEEP_BASELINE overrides it; `none` suppresses.
+sf05_sweep_baseline() {
+    if [[ -n "${SF05_SWEEP_BASELINE:-}" ]]; then
+        [[ "${SF05_SWEEP_BASELINE}" == "none" ]] || echo "${SF05_SWEEP_BASELINE}"
+        return 0
+    fi
+    local f
+    for f in $(ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null); do
+        grep -q '^# SUBSET PROBE' "$f" || { echo "$f"; return 0; }
+    done
+    # Only probes exist (or nothing does): fall back to the newest, whatever it
+    # is — the diff itself labels a probe baseline out loud.
+    ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -1 || true
+}
+
+# sf05_status_delta_channel <report> <baseline> — append the named delta to the
+# report. Swallows every failure: a broken delta must not turn a passing
+# correctness gate red.
+sf05_status_delta_channel() {
+    local report="$1" baseline="$2"
+    {
+        echo ""
+        if [[ -n "${baseline}" && -f "${baseline}" ]]; then
+            python3 "${SWEEP_DIFF}" "${baseline}" "${report}" 2>&1 || true
+        else
+            echo "# status-delta: no previous sweep report to diff against (first run, or SF05_SWEEP_BASELINE=none)"
+        fi
+        echo "# The status-delta channel is NON-BLOCKING: it never changes this gate's exit status."
+    } | tee -a "${report}"
+}
+
+# sf05_planner_flags_line — the arm label, shared by the sweep report and the
+# plan capture. D4a made the report say which ENGINE ran; a planner A/B
+# additionally needs it to say which FLAGS ran, or two arms of the same commit
+# produce artefacts that are indistinguishable on their face and the comparison
+# rests on the operator's memory of what was exported. Every flag is printed
+# even when unset, so "off" is a positive statement in the file rather than the
+# absence of a line.
+#
+# RELSIZE's unset label says `unset(2)`, not `unset(off)`, from 2026-07-30:
+# M0125-0005 flipped defaultRelSizeFallbackStage to 2 and `=0` became the
+# explicit opt-out. The old label survived the flip and made every artefact
+# captured after it state the OPPOSITE of the regime it measured — the same
+# defect class M0125-0011 fixed when the report could still name a binary it had
+# never run.
+#
+# A plan diff between two captures taken under different flags is meaningless,
+# which is why the capture stamps this too and not just the sweep.
+sf05_planner_flags_line() {
+    printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
+        "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
+        "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
+        "${GOOPG_MEMOIZE:-unset(on)}" \
+        "${GOOPG_PARALLEL:-unset(on)}"
+}
+
+# sf05_plan_baseline — the capture this run is diffed against: the newest
+# plans-*.txt already in the results dir, chosen BEFORE the new file is created
+# so it can never select itself. SF05_PLANS_BASELINE overrides it (point it at
+# one of the committed corpus captures to attribute a change to a specific
+# commit); `none` suppresses the diff for a first capture on a fresh dir.
+sf05_plan_baseline() {
+    if [[ -n "${SF05_PLANS_BASELINE:-}" ]]; then
+        [[ "${SF05_PLANS_BASELINE}" == "none" ]] || echo "${SF05_PLANS_BASELINE}"
+        return 0
+    fi
+    ls -t "${OUTDIR}"/plans-*.txt 2>/dev/null | head -1 || true
+}
+
+# sf05_capture_plans <outfile> — one EXPLAIN pass over the corpus on the
+# server that is currently up. The caller owns the server's lifecycle: the
+# capture must run on a FRESHLY started instance so a sweep's accumulated heap
+# (and any RESTART_AFTER_TIMEOUT bounce it took) cannot be confused for a
+# planner input.
+#
+# The capture is ALWAYS the full 1..99 corpus, even under QUERIES= — unlike the
+# sweep, which a subset turns into a probe. A plan file's whole purpose is to be
+# diffable against every other plan file, and a subset capture would report the
+# other 98 queries as `removed` against any real baseline. At 14 s for the full
+# corpus there is nothing to save by narrowing it.
+sf05_capture_plans() {
+    local out="$1" q f rc
+    [[ -n "${QUERIES:-}" ]] && log "  (plan capture ignores QUERIES= — it is always the full corpus)"
+    {
+        echo "# TPC-DS SF0.5 plan-shape capture — $(date -Iseconds)"
+        echo "${sf05_bin_provenance}"
+        sf05_planner_flags_line
+        echo "# EXPLAIN only (no ANALYZE): nothing in this file was executed."
+        echo "# diff with: scripts/tpcds-plan-diff.py OLD NEW [--verbose]"
+    } > "${out}"
+    for q in $(seq 1 99); do
+        f="${QDIR}/query${q}.sql"
+        [[ -f "$f" ]] || continue
+        echo "===== Q${q} =====" >> "${out}"
+        python3 - "$f" > "${OUTDIR}/.explain_all.sql" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+for stmt in src.split(';'):
+    if stmt.strip():
+        print("EXPLAIN " + stmt.strip() + ";")
+PY
+        timeout "${PLAN_TIMEOUT}" ${GOOPG_PSQL} -f "${OUTDIR}/.explain_all.sql" >> "${out}" 2>&1 \
+            || { rc=$?; echo "(explain rc=${rc})" >> "${out}"; }
+    done
+    rm -f "${OUTDIR}/.explain_all.sql"
+}
+
+# cmd_plans — the channel on its own, without the ~1 h sweep in front of it.
+# A plan-only pass is ~20 s (14 s of EXPLAIN plus the server bounce), which is
+# what makes "did this commit move any plan?" a question a loop can afford to
+# ask before it asks the expensive one.
+cmd_plans() {
+    guard_sf1_sweep
+    [[ -d "${SF05_GOOPG_DATA}" ]] || die "run load-goopg first"
+    mkdir -p "${OUTDIR}"
+    sf05_ensure_bin
+    sf05_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    local baseline plans
+    baseline=$(sf05_plan_baseline)
+    plans="${OUTDIR}/plans-$(date +%Y%m%d-%H%M%S).txt"
+    log "plan-shape capture (EXPLAIN only, timeout ${PLAN_TIMEOUT}s/query) -> ${plans}"
+    sf05_goopg_start
+    sf05_capture_plans "${plans}"
+    sf05_goopg_stop
+    if [[ -n "${baseline}" && -f "${baseline}" ]]; then
+        python3 "${PLAN_DIFF}" "${baseline}" "${plans}"
+    else
+        log "no baseline capture to diff against (first run, or SF05_PLANS_BASELINE=none)"
+    fi
+    log "plans: ${plans}"
+}
+
+# sf05_plan_channel <report> — the sweep's tail. Restarts the server so the
+# capture is S-cold like the sweep itself, captures, diffs, and appends the
+# result to the sweep report. Runs in a subshell and swallows every failure:
+# a broken plan pass must not turn a passing correctness gate red.
+sf05_plan_channel() {
+    local report="$1" baseline plans rc=0
+    baseline=$(sf05_plan_baseline)
+    plans="${report%/*}/plans-${report##*/sweep-}"
+    (
+        sf05_goopg_start
+        sf05_capture_plans "${plans}"
+        sf05_goopg_stop
+    ) >> "${SF05_LOG}" 2>&1 || rc=$?
+    {
+        echo ""
+        if [[ "${rc}" -ne 0 ]]; then
+            echo "=== PLAN-SHAPE: capture FAILED (rc=${rc}) — see ${SF05_LOG}; the verdict above is unaffected ==="
+        elif [[ -n "${baseline}" && -f "${baseline}" ]]; then
+            python3 "${PLAN_DIFF}" "${baseline}" "${plans}" 2>&1 || true
+        else
+            echo "# plan-shape: captured ${plans} (no baseline to diff against yet)"
+        fi
+        echo "# The plan channel is NON-BLOCKING: it never changes this gate's exit status."
+    } | tee -a "${report}"
+}
+
 # -------------------------------------------------------------------- sweep
 cmd_sweep() {
     guard_sf1_sweep
     [[ -s "${ORACLE}" ]] || die "run oracle first"
     [[ -d "${SF05_GOOPG_DATA}" ]] || die "run load-goopg first"
     mkdir -p "${OUTDIR}"
+    # Chosen BEFORE the new report exists, or the status channel would diff the
+    # run against itself (sf05_plan_baseline has the same ordering constraint).
+    local delta_baseline
+    delta_baseline=$(sf05_sweep_baseline)
     local report="${OUTDIR}/sweep-$(date +%Y%m%d-%H%M%S).txt"
     log "goopg SF0.5 sweep (timeout ${TIMEOUT_SEC}s/query, S-cold) -> ${report}"
     sf05_ensure_bin
@@ -532,26 +755,10 @@ cmd_sweep() {
         sf05_engine_binary_line
         echo "# oracle: ${ORACLE} (PG 18.3 plain-run row counts + value checksums)"
         echo "# timeout: ${TIMEOUT_SEC}s"
-        # The arm label. D4a made the report say which ENGINE ran; a planner
-        # A/B additionally needs it to say which FLAGS ran, or two arms of the
-        # same commit produce artefacts that are indistinguishable on their face
-        # and the comparison rests on the operator's memory of what was exported.
-        # Every flag is printed even when unset, so "off" is a positive
-        # statement in the file rather than the absence of a line.
-        #
-        # RELSIZE's unset label says `unset(2)`, not `unset(off)`, from
-        # 2026-07-30: M0125-0005 flipped defaultRelSizeFallbackStage to 2 and
-        # `=0` became the explicit opt-out. The old label survived the flip and
-        # made every artefact captured after it state the OPPOSITE of the
-        # regime it measured — the same defect class M0125-0011 fixed when the
-        # report could still name a binary it had never run. Corrected while
-        # capturing M0125-0002 commit 2's gate, whose own header was the first
-        # to carry the false line.
-        printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
-            "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
-            "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
-            "${GOOPG_MEMOIZE:-unset(on)}" \
-            "${GOOPG_PARALLEL:-unset(on)}"
+        # The arm label — see sf05_planner_flags_line for why a flags line is
+        # load-bearing evidence and why RELSIZE's unset label reads `unset(2)`.
+        # Shared with the plan capture so the two artefacts of one run agree.
+        sf05_planner_flags_line
         [[ "${FORCE:-0}" == "1" ]] && \
             echo "# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT"
         [[ -n "${QUERIES:-}" ]] && \
@@ -630,11 +837,45 @@ cmd_sweep() {
         # only "N right row counts" (round-2 README §13.4 item 3).
         echo "# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set."
     } | tee -a "$report"
+    # The status-delta channel (P5.6-f-v) — the counts above cannot say WHICH
+    # query owns them, so the named delta goes directly under them, before the
+    # (slower) plan pass. It reads the report just written; nothing it does can
+    # perturb the verdict or the exit status below.
+    if [[ "${SF05_NO_DELTA:-0}" == "1" ]]; then
+        echo "# status-delta: skipped (SF05_NO_DELTA=1)" | tee -a "$report"
+    else
+        sf05_status_delta_channel "$report" "${delta_baseline}"
+    fi
+    # The plan-shape channel (P5.6-g-i-b) — second, NON-BLOCKING column. It runs
+    # after the verdict is written, on its own fresh server, so nothing it does
+    # can perturb the per-query seconds above or the exit status below.
+    if [[ "${SF05_NO_PLANS:-0}" == "1" ]]; then
+        echo "# plan-shape: skipped (SF05_NO_PLANS=1)" | tee -a "$report"
+    else
+        sf05_plan_channel "$report"
+    fi
     log "sweep report: ${report}"
     # Gate semantics: correctness failures are fatal; timeouts are reported but
     # non-fatal (perf tracking, not a correctness gate). CKMISMATCH is a
     # correctness failure — the right number of wrong rows.
     [[ $((mismatch + ckmismatch + gerr)) -eq 0 ]]
+}
+
+# cmd_delta [OLD [NEW]] — the status channel on its own, over reports that
+# already exist. Costs nothing and touches no server, so "what actually moved
+# between those two sweeps?" is answerable at any time, including for the ~90
+# reports archived before this channel existed.
+cmd_delta() {
+    local old="${1:-}" new="${2:-}"
+    if [[ -z "${new}" ]]; then
+        new=$(ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -1 || true)
+        [[ -n "${new}" ]] || die "no sweep reports in ${OUTDIR}"
+    fi
+    if [[ -z "${old}" ]]; then
+        old=$(ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | sed -n 2p || true)
+        [[ -n "${old}" ]] || die "only one sweep report in ${OUTDIR} — nothing to diff against"
+    fi
+    python3 "${SWEEP_DIFF}" "${old}" "${new}"
 }
 
 # ------------------------------------------------------------------- status
@@ -644,6 +885,7 @@ cmd_status() {
     echo "goopg cluster: $([[ -d ${SF05_GOOPG_DATA} ]] && echo present || echo absent) (${SF05_GOOPG_DATA}, port ${SF05_PORT})"
     echo "oracle       : $([[ -s ${ORACLE} ]] && grep -c '|OK|' "${ORACLE}" || echo 0) OK entries (${ORACLE})"
     ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -3 | sed 's/^/last sweeps  : /' || true
+    ls -t "${OUTDIR}"/plans-*.txt 2>/dev/null | head -3 | sed 's/^/last plans   : /' || true
 }
 
 case "${1:-status}" in
@@ -652,7 +894,9 @@ load-pg)     cmd_load_pg ;;
 load-goopg)  cmd_load_goopg ;;
 oracle)      cmd_oracle ;;
 sweep)       cmd_sweep ;;
+plans)       cmd_plans ;;
+delta)       shift; cmd_delta "${1:-}" "${2:-}" ;;
 all)         cmd_build_data && cmd_load_pg && cmd_oracle && cmd_load_goopg && cmd_sweep ;;
 status)      cmd_status ;;
-*)           die "unknown subcommand '$1' (build-data|load-pg|load-goopg|oracle|sweep|all|status)" ;;
+*)           die "unknown subcommand '$1' (build-data|load-pg|load-goopg|oracle|sweep|plans|delta|all|status)" ;;
 esac

@@ -2509,6 +2509,15 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint
 // cachedNode, when non-nil, is a pre-validated plan from the cross-session
 // plan cache — planner.Plan is skipped. M0098-0005.
 func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool, cachedNode ...planner.Node) error {
+	// M0127-P3.3: unlink whatever spill files this statement still owns,
+	// success or failure. Operators unlink eagerly when they can, but an
+	// Open that errors after a build spilled — or a cancelled query — never
+	// reaches the Close that would do it. Per STATEMENT rather than per
+	// dispatch: a batch of 100 statements must not accumulate 100
+	// statements' worth of temp files. Cursors are safe because they
+	// materialise their rows (cursorEntry.Rows) instead of holding an open
+	// operator across statements.
+	defer ctx.ReleaseSpillFiles()
 	// LISTEN / NOTIFY / UNLISTEN are handled at the server layer: the
 	// notification hub is cross-session server state, not an executor operator,
 	// and NOTIFY buffers until the transaction commits. Handle before planning

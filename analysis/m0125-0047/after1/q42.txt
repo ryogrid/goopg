@@ -1,0 +1,14 @@
+Limit  (cost=0.00..0.00 rows=1 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: sum DESC, d_year, i_category_id, i_category
+    ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Gather  (cost=0.00..0.00 rows=1 width=0)
+            Workers Planned: 4
+        ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=3239 width=0)
+              Filter: (((item.i_manager_id = 1) AND (dt.d_moy = 11)) AND (dt.d_year = 1998))
+          ->  Seq Scan on public.date_dim dt (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                Filter: ((d_moy = 11) AND (d_year = 1998))
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=647823 width=0)
+            ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+            ->  Seq Scan on public.item (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                  Filter: (i_manager_id = 1)

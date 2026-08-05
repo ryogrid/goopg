@@ -114,6 +114,13 @@ func NewWorkerContext(leader *Context, workerMctx *mctx.Context, workerCtx conte
 	// this worker — each accumulator serialises its own merges.
 	w.PartialAggStates = leader.PartialAggStates
 
+	// M0127-P3.3: the spill-file registry, by reference and WRITTEN by this
+	// worker (mutex-guarded). A worker's spill files belong to the LEADER's
+	// statement — the worker's Context dies when its goroutine returns,
+	// which is exactly the moment a per-worker registry would lose track of
+	// a file whose operator Close never ran (a cancelled fan-out).
+	w.tempFiles = leader.tempFiles
+
 	// ── per-worker: cancellation and arena ───────────────────────────────
 	w.Ctx = workerCtx
 	w.Mctx = workerMctx

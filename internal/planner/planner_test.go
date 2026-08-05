@@ -149,7 +149,12 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON h.aid = a.aid", true},
 		// LEFT join also takes the hash path.
 		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", true},
-		// RIGHT/FULL use merge join, not hash.
+		// RIGHT/FULL are no longer PINNED to merge (M0127-P4.2 gave the hash
+		// executor outer fill on either side, design leftdeep-joins/07 §3) —
+		// but this catalog carries no row estimates, and with none the
+		// planner keeps merge, which is what PG picks on unanalysed inputs
+		// too. TestPlanJoinRightFullTakesHashOnceCostable covers the other
+		// regime.
 		{"SELECT a.aid FROM pgbench_accounts a RIGHT JOIN pgbench_history h ON a.aid = h.aid", false},
 		{"SELECT a.aid FROM pgbench_accounts a FULL JOIN pgbench_history h ON a.aid = h.aid", false},
 		// Inequality predicate → nested-loop fallback.
@@ -466,7 +471,13 @@ func TestPlanGroupByAliasAndPositional(t *testing.T) {
 	})
 }
 
-func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
+// M0127-P4.2 (design leftdeep-joins/07 §3) turned the RIGHT/FULL merge PIN
+// into a merge DEFAULT: with no row estimates on either side there is nothing
+// to price the sorts against, so merge stands — which is also what PG 18.3
+// picks for these very tables (Merge Right Join / Merge Full Join, verified
+// against the oracle). The pin's retirement is asserted by
+// TestPlanJoinRightFullTakesHashOnceCostable, not here.
+func TestPlanJoinKeepsMergeForRightFullWithoutStats(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	cases := []struct {
 		sql string
@@ -1454,6 +1465,59 @@ func TestPromoteIntTypeSerialFamily(t *testing.T) {
 	for _, tc := range cases {
 		if got := promoteIntType(tc.a, tc.b); got.Name != tc.want {
 			t.Errorf("promoteIntType(%q, %q) = %q, want %q", tc.a, tc.b, got.Name, tc.want)
+		}
+	}
+}
+
+// M0127-P4.2 (design leftdeep-joins/07 §3): the RIGHT/FULL merge PIN is gone —
+// with the gate on and both sides costable, the planner selects hash, and it
+// selects the ORIENTATION the executor's cheap fill half needs. RIGHT builds on
+// the non-preserved LEFT so the preserved right side streams as the probe (a
+// per-probe-row fill, PG's HJ_FILL_OUTER); FULL keeps build-on-the-right and
+// pays for the post-probe sweep of unmatched build rows, because it fills both
+// sides whichever way it is turned.
+func TestPlanJoinRightFullTakesHashOnceCostable(t *testing.T) {
+	defer func(prev bool) { hashOuterJoinEnabled = prev }(hashOuterJoinEnabled)
+	hashOuterJoinEnabled = true
+	cat := pgbenchCatalog(t)
+	for _, name := range []string{"pgbench_accounts", "pgbench_history"} {
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s not in catalog", name)
+		}
+		tbl.Stats = &catalog.TableStats{RowCount: 100_000}
+	}
+	for _, tc := range []struct {
+		sql           string
+		wantBuildLeft bool
+	}{
+		{"SELECT a.aid FROM pgbench_accounts a RIGHT JOIN pgbench_history h ON a.aid = h.aid", true},
+		{"SELECT a.aid FROM pgbench_accounts a FULL JOIN pgbench_history h ON h.aid = a.aid", false},
+	} {
+		node, err := Plan(parseOne(t, tc.sql), cat)
+		if err != nil {
+			t.Errorf("Plan(%q): %v", tc.sql, err)
+			continue
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Errorf("%q: root=%T want *Project", tc.sql, node)
+			continue
+		}
+		j, ok := proj.Child.(*Join)
+		if !ok {
+			t.Errorf("%q: child=%T want *Join", tc.sql, proj.Child)
+			continue
+		}
+		if j.Algo != JoinAlgoHash {
+			t.Errorf("%q: Algo=%v want JoinAlgoHash", tc.sql, j.Algo)
+			continue
+		}
+		if j.BuildLeft != tc.wantBuildLeft {
+			t.Errorf("%q: BuildLeft=%v want %v", tc.sql, j.BuildLeft, tc.wantBuildLeft)
+		}
+		if j.LeftKey == nil || j.RightKey == nil {
+			t.Errorf("%q: hash algo but LeftKey/RightKey nil", tc.sql)
 		}
 	}
 }

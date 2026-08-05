@@ -1,0 +1,12 @@
+# binary:  /home/ryo/work/goopg/goopg/tmp/goopg-0047-before (75cd737152d87572)
+# label:   before   restarts: 10
+restart 1: cd-order=cd1,cd2, plan-sha=72d79302aff389ab
+restart 2: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 3: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 4: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 5: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 6: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 7: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 8: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 9: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936
+restart 10: cd-order=cd2,cd1, plan-sha=6fb943ca2c7aa936

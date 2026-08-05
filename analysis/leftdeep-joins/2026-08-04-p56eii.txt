@@ -1,0 +1,114 @@
+=== Q1
+  (no join nodes; 3 plan nodes)
+
+=== Q2
+  F d1  Hash Join (INNER)                        est=5          actual=632        ratio=126.4x under
+    d2  Hash Join (INNER)                        est=22         actual=632        ratio=28.7x under
+    d3  Hash Join (INNER)                        est=4443       actual=3080       ratio=1.4x over
+    d4  Hash Join (INNER)                        est=100000     actual=800000     ratio=8.0x under
+    d5  Hash Join (INNER)                        est=800000     actual=800000     ratio=1.0x under
+    d3  Hash Join (INNER)                        est=500        actual=163440     ratio=326.9x under
+    d4  Hash Join (INNER)                        est=100000     actual=800000     ratio=8.0x under
+    d5  Hash Join (INNER)                        est=800000     actual=800000     ratio=1.0x under
+
+=== Q3
+  F d2  Hash Join (INNER, build=left)            est=90209271   actual=30401      ratio=2967.3x over
+    d3  Hash Join (INNER)                        est=840764     actual=145757     ratio=5.8x over
+
+=== Q4
+  F d2  Hash Join (SEMI)                         est=384811     actual=52806      ratio=7.3x over
+
+=== Q5
+  F d2  Hash Join (INNER)                        est=2040757    actual=178512     ratio=11.4x over
+    d3  Hash Join (INNER)                        est=2040757    actual=178512     ratio=11.4x over
+    d4  Hash Join (INNER)                        est=408151508  actual=911633     ratio=447.7x over
+    d5  Hash Join (INNER)                        est=2023185    actual=227883     ratio=8.9x over
+    d6  Hash Join (INNER)                        est=150000     actual=150000     ratio=1.0x under
+
+=== Q6
+  (no join nodes; 2 plan nodes)
+
+=== Q7
+  F d2  Hash Join (INNER)                        est=945000     actual=5869       ratio=161.0x over
+    d3  Hash Join (INNER, build=left)            est=945000     actual=1500000    ratio=1.6x under
+    d4  Hash Join (INNER, build=left)            est=126        actual=150000     ratio=1190.5x under
+    d3  Hash Join (INNER)                        est=332331     actual=1820702    ratio=5.5x under
+    d4  Hash Join (INNER)                        est=2658650    actual=1820702    ratio=1.5x over
+
+=== Q8
+  F d2  Hash Join (INNER)                        est=1332       actual=2555       ratio=1.9x under
+    d3  Hash Join (INNER)                        est=266477     actual=12862      ratio=20.7x over
+    d4  Hash Join (INNER)                        est=5997241    actual=1818964    ratio=3.3x over
+    d5  Hash Join (INNER, build=left)            est=5997241    actual=5997241    ratio=1.0x under
+    d6  Hash Join (INNER, build=left)            est=5997241    actual=5997241    ratio=1.0x under
+    d5  Hash Join (INNER)                        est=3622627    actual=455441     ratio=8.0x over
+    d6  Hash Join (INNER)                        est=150000     actual=150000     ratio=1.0x under
+
+=== Q9
+  F d2  Hash Join (INNER)                        est=39430600   actual=316264     ratio=124.7x over
+    d3  Hash Join (INNER)                        est=39430600   actual=316264     ratio=124.7x over
+    d4  Hash Join (INNER)                        est=39430600   actual=5997241    ratio=6.6x over
+    d5  Hash Join (INNER)                        est=788612     actual=5997241    ratio=7.6x under
+    d6  Hash Join (INNER)                        est=6308900    actual=5997241    ratio=1.1x over
+
+=== Q10
+  F d2  Hash Join (INNER)                        est=107386098  actual=114106     ratio=941.1x over
+    d3  Hash Join (INNER)                        est=2141363    actual=57233      ratio=37.4x over
+    d4  Hash Join (INNER)                        est=150000     actual=150000     ratio=1.0x under
+
+=== Q11
+    d6  Hash Join (INNER)                        est=4000       actual=?        (no ANALYZE)
+    d7  Hash Join (INNER)                        est=800000     actual=?        (no ANALYZE)
+  F d2  Hash Join (INNER)                        est=4000       actual=32560      ratio=8.1x under
+    d3  Hash Join (INNER)                        est=800000     actual=800000     ratio=1.0x under
+
+=== Q12
+  F d2  Hash Join (INNER, build=left)            est=2309900    actual=31354      ratio=73.7x over
+
+=== Q13
+  F d3  Hash Join (LEFT)                         est=2500000    actual=1528411    ratio=1.6x over
+
+=== Q14
+  F d1  Hash Join (INNER)                        est=6640341    actual=74763      ratio=88.8x over
+
+=== Q15a-VIEWBODY
+  (no join nodes; 2 plan nodes)
+
+=== Q16
+  F d2  Hash Join (ANTI NULL-AWARE)              est=7409       actual=118892     ratio=16.0x under
+    d3  Hash Join (INNER)                        est=289418     actual=118892     ratio=2.4x over
+
+=== Q17
+  F d1  Hash Join (INNER)                        est=43080      actual=5763       ratio=7.5x over
+    d2  Hash Join (INNER)                        est=43080      actual=5763       ratio=7.5x over
+
+=== Q18
+  F d2  Hash Join (SEMI)                         est=878748017  actual=70         ratio=12553543.1x over
+    d3  Hash Join (INNER, build=left)            est=1757496034 actual=5997241    ratio=293.1x over
+    d4  Hash Join (INNER)                        est=8711813    actual=1500000    ratio=5.8x over
+
+=== Q19
+  F d1  Hash Join (INNER)                        est=10         actual=131        ratio=13.1x under
+
+=== Q20
+  F d1  Hash Join (SEMI)                         est=8          actual=76         ratio=9.5x under
+    d2  Hash Join (INNER)                        est=400        actual=374        ratio=1.1x over
+    d2  Hash Join (SEMI)                         est=3366745    actual=2568       ratio=1311.0x over
+    d3  Hash Join (INNER)                        est=20200473   actual=236624     ratio=85.4x over
+
+=== Q21
+  F d2  Hash Join (ANTI)                         est=412        actual=4003       ratio=9.7x under
+    d3  Hash Join (SEMI)                         est=820        actual=71824      ratio=87.6x under
+    d4  Hash Join (INNER)                        est=255069     actual=74546      ratio=3.4x over
+    d5  Hash Join (INNER)                        est=10514      actual=153894     ratio=14.6x under
+    d6  Hash Join (INNER)                        est=2102966    actual=3794015    ratio=1.8x under
+
+=== Q22
+  F d2  Hash Join (ANTI)                         est=6955       actual=3884       ratio=1.8x over
+
+=== SUMMARY (tripwire 1000x; final joinrel 1000x, per-query overrides [Q9<=100x])
+  VIOLATION Q18: FINAL joinrel "Hash Join (SEMI)" est=878748017 actual=70 ratio=12553543.1x (overestimated, threshold 1000x)
+  VIOLATION Q3: FINAL joinrel "Hash Join (INNER, build=left)" est=90209271 actual=30401 ratio=2967.3x (overestimated, threshold 1000x)
+  VIOLATION Q20: joinrel "Hash Join (SEMI)" est=3366745 actual=2568 ratio=1311.0x (overestimated, threshold 1000x)
+  VIOLATION Q7: joinrel "Hash Join (INNER, build=left)" est=126 actual=150000 ratio=1190.5x (underestimated, threshold 1000x)
+  VIOLATION Q9: FINAL joinrel "Hash Join (INNER)" est=39430600 actual=316264 ratio=124.7x (overestimated, threshold 100x)

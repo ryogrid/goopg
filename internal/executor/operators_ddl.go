@@ -6827,7 +6827,12 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 	if catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(o.ctx) {
+			// tableCatalogDBOids, not catalogDBOids — the immediate-drop twin
+			// of ApplyPendingIndexDrops' own stamp set. Since M0127-P5.6-f-pre
+			// an index's rows are written to the connection database's own
+			// heap, so a distinct-dbOid index has nothing to stamp in
+			// DefaultDBOid and its real row would survive the drop.
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
 				for _, oid := range droppedOIDs {
 					deleteCatalogRowsForOID(o.ctx, dbOid, oid, xmax)
 				}
@@ -6876,7 +6881,12 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 	if catalogHeapSyncAvailable(ctx) {
 		if err := ctx.MaterializeWriterXID(); err == nil {
 			xmax := ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(ctx) {
+			// tableCatalogDBOids, not catalogDBOids: since M0127-P5.6-f-pre an
+			// index's pg_class/pg_index rows are written to the connection
+			// database's own heap, so a distinct-dbOid index's rows exist only
+			// there — stamping DefaultDBOid+mirror would leave a dropped index
+			// live and it would come back on the next restart.
+			for _, dbOid := range tableCatalogDBOids(ctx) {
 				for _, oid := range droppedOIDs {
 					deleteCatalogRowsForOID(ctx, dbOid, oid, xmax)
 				}
@@ -13459,9 +13469,14 @@ func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
 	if !catalogHeapSyncAvailable(ctx) {
 		return nil
 	}
+	// The stamp set is `tableCatalogDBOids`, not `catalogDBOids`: since the
+	// write below routes per-database, a distinct-dbOid index's old row lives
+	// ONLY in its own heap, and stamping the DefaultDBOid+mirror pair would
+	// leave it live (M0127-P5.6-f-pre; the sibling reasoning is on
+	// tableCatalogDBOids itself).
 	if err := ctx.MaterializeWriterXID(); err == nil {
 		xmax := ctx.Tx.XID
-		for _, dbOid := range catalogDBOids(ctx) {
+		for _, dbOid := range tableCatalogDBOids(ctx) {
 			classRel := storage.RelFileNode{
 				DBOid:  dbOid,
 				RelOid: catalog.RelationRelationId,
@@ -13473,8 +13488,9 @@ func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
 			})
 		}
 	}
+	heapDBOid := tableCatalogHeapDBOid(ctx)
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -13489,8 +13505,10 @@ func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index resync for index: %w", err)
 	}
-	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
-		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	if heapDBOid == catalog.DefaultDBOid {
+		if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+			return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+		}
 	}
 	return nil
 }
@@ -13505,9 +13523,11 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 	if !catalogHeapSyncAvailable(ctx) {
 		return nil
 	}
+	// tableCatalogDBOids for the same reason resyncIndexClassHeapRow uses it:
+	// the pg_index write below is per-database now (M0127-P5.6-f-pre).
 	if err := ctx.MaterializeWriterXID(); err == nil {
 		xmax := ctx.Tx.XID
-		for _, dbOid := range catalogDBOids(ctx) {
+		for _, dbOid := range tableCatalogDBOids(ctx) {
 			indexRel := storage.RelFileNode{
 				DBOid:  dbOid,
 				RelOid: catalog.IndexRelationId,
@@ -13542,8 +13562,24 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 // layouts match PG18 canonical format so the index is visible to an attaching
 // PG18 standby and is recoverable via heap scan on restart (M0113).
 func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
+	// M0127-P5.6-f-pre: route to the connection database's OWN catalog heap,
+	// the same `tableCatalogHeapDBOid` routing syncTableToCatalogHeap has used
+	// since follow-up 39. Until this, every index row went to DefaultDBOid's
+	// heap while `loadUserIndexesFromHeapForDB`'s only pass reads cat.DBOID()
+	// — so an index created on a distinct-dbOid database was recoverable from
+	// NEITHER, and vanished on restart. That was survivable while
+	// RecordKindCreateIndex(20) still journalled the index separately, which
+	// is what follow-up 39's row meant by "index rows have a working
+	// WAL-replay durability path already"; B5 Slice A retired kinds 20/21 on
+	// the premise that the heap reload replaced them, and the two changes
+	// together left non-default databases with no durability path at all. The
+	// TPC-H bench cluster (db `tpch`) is the measured casualty: all 16
+	// HammerDB indexes — `partsupp_pk` among them — were gone after the first
+	// restart, which is why goopg's plans for it can never match the PG
+	// reference's.
+	heapDBOid := tableCatalogHeapDBOid(ctx)
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -13562,7 +13598,7 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	// M0113: write pg_index row so the index is recoverable from the heap
 	// on restart without relying on goopg-private WAL records.
 	pgIndexRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  heapDBOid,
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -13582,8 +13618,13 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	// database) so a PG18 standby connecting via `dbname=postgres` reads
 	// the runtime-written rows. Multi-level descent+rebuild in
 	// `insertCanonicalSysBtreeLeaf` keeps the source layout consistent.
-	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
-		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	// A distinct-dbOid write touched only its own database's catalog files, so
+	// the DefaultDBOid→postgres mirror has nothing new to copy — skip it, the
+	// same guard syncTableToCatalogHeap carries (follow-up 39).
+	if heapDBOid == catalog.DefaultDBOid {
+		if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+			return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+		}
 	}
 	return nil
 }

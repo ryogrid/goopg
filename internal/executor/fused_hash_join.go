@@ -35,7 +35,12 @@ type buildEnv struct {
 	}
 }
 
-var buildEnvInFlight *buildEnv
+// There is deliberately no package-level "env in flight" variable here.
+// M0126-0006 had one (`buildEnvInFlight`, saved/restored around Build's
+// switch); M0127-P1.2 replaced it with a local in buildWithEnv after the
+// worker-path exercise showed every Gather worker writing it from its own
+// goroutine — a data race on the one variable, reported for every
+// parallel-join test under `go test -race`.
 
 // ---- kill switches (bundle 10) ----
 
@@ -147,7 +152,7 @@ func (o *fusedHashJoinOp) Open(ctx *Context) error {
 		if budget <= 0 {
 			budget = 512 * 1024 * 1024 // default 512 MiB
 		}
-		bounded, err := drainRowsBounded(l.buildOp, budget)
+		bounded, err := drainRowsBounded(ctx, l.buildOp, budget)
 		_ = l.buildOp.Close()
 		if err != nil {
 			return err

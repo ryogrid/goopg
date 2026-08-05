@@ -1,0 +1,107 @@
+=== Q1
+  (no join nodes; 3 plan nodes)
+
+=== Q2
+  F d1  Hash Join (INNER)                        est=1066       actual=632        ratio=1.7x over
+    d6  Nested Loop (INNER)                      est=1          actual=?        (no ANALYZE)
+    d7  Nested Loop (INNER)                      est=1          actual=?        (no ANALYZE)
+    d8  Nested Loop (INNER)                      est=1          actual=?        (no ANALYZE)
+    d2  Nested Loop (INNER)                      est=5332       actual=3080       ratio=1.7x over
+    d3  Nested Loop (INNER)                      est=5332       actual=3080       ratio=1.7x over
+    d4  Hash Join (INNER, build=left)            est=5332       actual=3080       ratio=1.7x over
+
+=== Q3
+  F d2  Hash Join (INNER)                        est=307246     actual=30401      ratio=10.1x over
+    d3  Hash Join (INNER)                        est=1536234    actual=149645     ratio=10.3x over
+
+=== Q4
+  F d2  Hash Join (SEMI)                         est=318773     actual=52806      ratio=6.0x over
+
+=== Q5
+  F d2  Hash Join (INNER)                        est=279058     actual=189451     ratio=1.5x over
+    d3  Hash Join (INNER)                        est=1395290    actual=911633     ratio=1.5x over
+    d4  Hash Join (INNER, build=left)            est=1395290    actual=911633     ratio=1.5x over
+    d5  Hash Join (INNER, build=left)            est=1395290    actual=911633     ratio=1.5x over
+    d6  Hash Join (INNER)                        est=5997241    actual=5997241    ratio=1.0x under
+
+=== Q6
+  (no join nodes; 2 plan nodes)
+
+=== Q7
+  F d2  Hash Join (INNER)                        est=7921       actual=5869       ratio=1.3x over
+    d3  Hash Join (INNER, build=left)            est=2477516    actual=1820702    ratio=1.4x over
+    d4  Hash Join (INNER)                        est=2477516    actual=1820702    ratio=1.4x over
+    d5  Hash Join (INNER, build=left)            est=1500000    actual=1500000    ratio=1.0x under
+    d5  Hash Join (INNER)                        est=2477516    actual=1820702    ratio=1.4x over
+
+=== Q8
+  F d2  Hash Join (INNER)                        est=3304       actual=2555       ratio=1.3x over
+    d3  Hash Join (INNER, build=left)            est=16522      actual=12862      ratio=1.3x over
+    d4  Nested Loop (INNER)                      est=39971      actual=42336      ratio=1.1x under
+    d5  Nested Loop (INNER)                      est=39971      actual=42336      ratio=1.1x under
+    d6  Hash Join (INNER, build=left)            est=39971      actual=42336      ratio=1.1x under
+    d4  Hash Join (INNER)                        est=620038     actual=455441     ratio=1.4x over
+    d5  Hash Join (INNER)                        est=620038     actual=455441     ratio=1.4x over
+
+=== Q9
+  UNMEASURED: pq: canceling statement due to user request (57014)
+
+=== Q10
+  F d2  Hash Join (INNER)                        est=361396     actual=114106     ratio=3.2x over
+    d3  Hash Join (INNER)                        est=361396     actual=114106     ratio=3.2x over
+    d4  Hash Join (INNER)                        est=361396     actual=114106     ratio=3.2x over
+
+=== Q11
+    d6  Hash Join (INNER)                        est=32000      actual=?        (no ANALYZE)
+    d7  Hash Join (INNER)                        est=800000     actual=?        (no ANALYZE)
+  F d2  Hash Join (INNER)                        est=32000      actual=32560      ratio=1.0x under
+    d3  Hash Join (INNER)                        est=800000     actual=800000     ratio=1.0x under
+
+=== Q12
+  F d2  Hash Join (INNER, build=left)            est=46004      actual=31354      ratio=1.5x over
+
+=== Q13
+  F d3  Hash Join (LEFT)                         est=500000     actual=1528411    ratio=3.1x under
+
+=== Q14
+  F d1  Hash Join (INNER)                        est=932249     actual=74763      ratio=12.5x over
+
+=== Q15a-VIEWBODY
+  (no join nodes; 2 plan nodes)
+
+=== Q16
+  F d2  Hash Join (ANTI NULL-AWARE)              est=1397       actual=118892     ratio=85.1x under
+    d3  Hash Join (INNER)                        est=40960      actual=118892     ratio=2.9x under
+
+=== Q17
+  F d1  Hash Join (INNER)                        est=5913       actual=5763       ratio=1.0x over
+    d2  Hash Join (INNER)                        est=5997       actual=5763       ratio=1.0x over
+
+=== Q18
+  F d2  Hash Join (SEMI)                         est=2998620    actual=70         ratio=42837.4x over
+    d3  Hash Join (INNER)                        est=5997241    actual=5997241    ratio=1.0x under
+    d4  Hash Join (INNER)                        est=5997241    actual=5997241    ratio=1.0x under
+
+=== Q19
+  F d1  Hash Join (INNER)                        est=1          actual=131        ratio=131.0x under
+
+=== Q20
+  F d1  Hash Join (SEMI)                         est=25         actual=76         ratio=3.0x under
+    d2  Nested Loop (INNER)                      est=10000      actual=10000      ratio=1.0x under
+    d2  Hash Join (SEMI)                         est=81522      actual=2568       ratio=31.7x over
+    d3  Hash Join (INNER)                        est=723168     actual=236624     ratio=3.1x over
+
+=== Q21
+  F d2  Hash Join (ANTI)                         est=1          actual=4003       ratio=4003.0x under
+    d3  Hash Join (SEMI)                         est=253        actual=71824      ratio=283.9x under
+    d4  Hash Join (INNER)                        est=39117      actual=74546      ratio=1.9x under
+    d5  Hash Join (INNER)                        est=977949     actual=1831186    ratio=1.9x under
+    d6  Hash Join (INNER)                        est=1999080    actual=3794015    ratio=1.9x under
+
+=== Q22
+  F d2  Hash Join (ANTI)                         est=17814      actual=3884       ratio=4.6x over
+
+=== SUMMARY (tripwire 1000x; final joinrel 1000x, per-query overrides [Q9<=100x])
+  VIOLATION Q18: FINAL joinrel "Hash Join (SEMI)" est=2998620 actual=70 ratio=42837.4x (overestimated, threshold 1000x)
+  VIOLATION Q21: FINAL joinrel "Hash Join (ANTI)" est=1 actual=4003 ratio=4003.0x (underestimated, threshold 1000x)
+  UNMEASURED Q9: pq: canceling statement due to user request (57014)

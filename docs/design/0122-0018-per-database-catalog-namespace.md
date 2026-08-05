@@ -2804,3 +2804,132 @@ Gates: `go build ./...` clean; `go test ./internal/catalog/...
   audited this loop — the DU-002 probe no longer points at them since it is
   now blocked on the parser gap instead, so their priority is unclear until
   that parser fix lands and the probe can run further.
+
+## Index catalog rows dbOid scoping — LANDED (2026-08-04, M0127-P5.6-f-pre)
+
+The index half of follow-up 39, which that row deferred and whose safety
+argument silently expired.
+
+### How a deferral turned into a regression
+
+Follow-up 39 (2026-07-10) routed a user TABLE's `pg_class`/`pg_attribute` rows
+to the connection database's own catalog heap and left index rows pinned to
+`DefaultDBOid`. Its ledger row justified the split explicitly:
+
+> index/type rows have a working WAL-replay durability path already
+
+— `RecordKindCreateIndex(20)` / `RecordKindDropIndex(21)`. That was true when
+written. **B5 Slice A then retired kinds 20/21** (`internal/wal/recovery.go`
+:145) on the premise that `loadUserIndexesFromHeap` had replaced them, because
+M0113 had given goopg a real `pg_index` heap. Neither change was wrong on its
+own; composed, they deleted index durability for every non-default database:
+
+- the WRITE (`syncIndexToCatalogHeap`) went to `base/<DefaultDBOid>/1259|2610`
+  (plus the `postgres` mirror), while the owning TABLE's rows went to
+  `base/<dbOid>/…`;
+- the RELOAD (`loadUserIndexesFromHeap`) read exactly ONE database —
+  `cat.DBOID()` — and registered into the `DefaultDBOid` namespace, where its
+  `tableByOID(indrelid, DefaultDBOid)` probe could not find the owning table
+  (that table lives in `ns(dbOid)`, put there by `loadUserTablesFromHeapForDB`)
+  and returned without registering anything.
+
+So the rows were written to a heap nothing read, and the heap that was read
+resolved nothing. `CREATE INDEX`, the unique index behind a `PRIMARY KEY`, and
+`ALTER TABLE ADD CONSTRAINT` were all durable **nowhere** on a non-default
+database.
+
+### The measurement that found it
+
+Not hypothesised — measured on the TPC-H bench cluster while investigating
+M0127-P5.6-f's missing FK/unique evidence:
+
+| cluster (db) | user indexes | PK/FK constraints |
+|---|---|---|
+| PG 18.3 reference, `tpch` @65432 | 16 | 8 |
+| goopg bench, `tpch` @65433 | **0** | **0** |
+
+Every one of HammerDB's `partsupp_pk`, `lineitem_part_supp_fkidx`, `orders_pk`
+&c. WAS created during the 2026-07-27 load — their names are still recoverable
+from that cluster's `pg_wal` — and all were absent from the catalog by the
+first restart. This is why goopg's Q9 plan cannot resemble PG's, which reaches
+`lineitem` by `Index Scan using lineitem_part_supp_fkidx` under an
+`(l_partkey, l_suppkey)` index condition, and why `M0127-P5.6-f`'s
+`get_foreign_key_join_selectivity` analogue had no evidence to fire on: the
+composite `partsupp_pk` it is designed to read did not exist in the catalog.
+
+Reproduced minimally: `CREATE UNIQUE INDEX` in db `postgres` survives a
+restart; the identical statement in a `CREATE DATABASE`-created database does
+not.
+
+### What landed
+
+Write side (`internal/executor/operators_ddl.go`), mirroring
+`syncTableToCatalogHeap` exactly:
+
+- `syncIndexToCatalogHeap` routes both the `pg_class` and the `pg_index` row
+  through `tableCatalogHeapDBOid(ctx)`, and skips the
+  `mirrorTouchedCatalogsToPostgresDB` step for a distinct-dbOid write (nothing
+  new landed in `DefaultDBOid` to mirror) — the same guard the table path
+  carries.
+- `resyncIndexClassHeapRow` / `resyncIndexHeapRow` route their rewrite the same
+  way, and switch their xmax stamp set from `catalogDBOids` to
+  `tableCatalogDBOids`.
+- Both DROP INDEX stamp sites — the immediate path and
+  `ApplyPendingIndexDrops`' deferred-to-COMMIT twin (see the "DROP INDEX
+  deferred removal" note: this pairing must change together) — switch to
+  `tableCatalogDBOids`. Missing this resurrects a dropped index on the next
+  restart, which is exactly how the new test failed on its first run.
+
+Read side (`internal/initdb/open.go`):
+
+- `loadUserIndexesFromHeapForDB(mgr, cat, clog, heapDBOid, nsDBOid)` — the same
+  two-OID split `loadUserTablesFromHeapForDB` and `loadStatisticsFromHeapForDB`
+  use. `loadUserIndexesFromHeap` keeps the historical main pass verbatim
+  (`heapDBOid = cat.DBOID()`, `nsDBOid = DefaultDBOid`) and adds the per-DB
+  sweep over `cat.ListDatabases()` with the same skip set as the two loops
+  beside it.
+
+Catalog side (`internal/catalog/catalog.go`):
+
+- `RegisterIndexDuringRecoveryForDB(dbOid, …)`; the old
+  `RegisterIndexDuringRecovery` is now a `DefaultDBOid` wrapper, so every
+  existing caller is bit-identical. Every namespace-keyed access in the body —
+  the owning-table probe, the `lookupIndexLocked` duplicate check, and both the
+  `indexes` and `byTable` maps — takes `dbOid`.
+- **The recovered `Index` now carries `DBOid`.** This was the subtler half and
+  it is worth stating separately: with only the routing fixed, the catalog row
+  came back correctly (right name, `Unique`, right composite key order, and it
+  showed up in `pg_indexes`) while `IndexRelFileNode` still resolved the
+  index's file against the process-wide `InMemory.dbOid` — `base/5`, where the
+  btree does not exist. The index reloaded as **metadata that no longer
+  enforced anything**: a `UNIQUE` index that accepts duplicates after a restart,
+  which is a worse failure than one that vanished. All the metadata assertions
+  in the new test passed while this was broken; only the duplicate-insert
+  assertion caught it.
+
+### Test
+
+`internal/server/index_dbid_restart_test.go`
+(`TestDistinctDatabaseIndexSurvivesRestartInOwnNamespace`), shaped after
+`table_dbid_restart_test.go`: real wire protocol + real data-dir round trip;
+asserts a composite `UNIQUE` index (the `partsupp_pk` shape), a plain index, a
+dropped sibling that must stay dropped, the surviving `UNIQUE` flag and key
+columns, and — separately from the metadata — that the reloaded index still
+REJECTS a duplicate.
+
+### What this does NOT do
+
+It makes index DDL durable **going forward**. It does not resurrect indexes
+created before it: the TPC-H bench cluster's 16 index rows were written to
+`base/<DefaultDBOid>/…`, which the new per-DB sweep does not read for db
+`tpch`. Re-creating them is a deliberate, baseline-moving act on a shared gate
+cluster and is left as the first step of the `M0127-P5.6-f` loop, whose
+`fkselec` half needs `partsupp_pk` to exist before it can be measured at all.
+
+### Still deferred
+
+Type, sequence and constraint catalog rows keep the `DefaultDBOid`(+mirror)
+routing — `pg_constraint` in particular, which is why the FK half of the
+TPC-H schema is still absent from goopg's cluster even though `ALTER TABLE ADD
+CONSTRAINT ... FOREIGN KEY` executes fine at runtime. Same shape, same fix;
+scoped out here to keep one verifiable change per loop.

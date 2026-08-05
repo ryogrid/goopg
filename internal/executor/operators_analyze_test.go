@@ -215,15 +215,18 @@ func TestAnalyzeRespectsStatsTarget(t *testing.T) {
 	}
 
 	// target=1 → reservoir cap 300; full table is 400 rows.
-	// With reservoir sampling, the per-id sample count is ≤300,
-	// so NDistinct(id) ≤ 300 even though every row's id is
-	// unique.
+	// With reservoir sampling only 300 of the 400 ids are SEEN, but every
+	// one of them is seen exactly once, so upstream's `nmultiple == 0` arm
+	// declares the column unique and scales to the relation: 400, not the
+	// sample's 300. That scale-up is the whole point of M0127-P5.6-e-iii —
+	// before it, a 1.5 M-row unique key reported the 30 000-row sample's
+	// count and every join above it divided by a number 50× too small.
 	_, smallStats := seedRowsAndAnalyze(t, 400, makeRow, 1)
 	if smallStats.RowCount != 400 {
 		t.Errorf("RowCount=%d want 400", smallStats.RowCount)
 	}
-	if smallStats.Columns[0].NDistinct > 300 {
-		t.Errorf("with statsTarget=1, NDistinct(id)=%d want <=300", smallStats.Columns[0].NDistinct)
+	if got := smallStats.Columns[0].NDistinct; got != 400 {
+		t.Errorf("with statsTarget=1, NDistinct(id)=%d want 400 (Haas-Stokes unique-column arm)", got)
 	}
 
 	// target=upstream-default (100*300=30000), N=400 → full

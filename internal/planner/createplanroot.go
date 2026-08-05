@@ -1,0 +1,274 @@
+package planner
+
+// M0127-P5.5-f-i — the search boundary: 03 §10's coordinate map, and the one
+// node that makes it invisible to everything above the search root.
+//
+// PG oracle: `set_plan_references` / `set_upper_references` (setrefs.c:2214) —
+// the pass that re-points an upper node's expressions at its subplan's actual
+// output. Design: leftdeep-joins 03 §10, 02 §3.
+//
+// # What was left open
+//
+// P5.5-c…-e-ii-b built every `createPlan` arm, and P5.5-e-i gave the recursion
+// its `outputLayout`: for the node an arm emits, `layout[i]` is the PRE-SEARCH
+// BINDING coordinate of output column `i`. That solved the INSIDE-the-tree half
+// of the translation — a join re-bases its own quals onto its own merged row.
+// It did nothing for the ABOVE-the-tree half. The enclosing tree — the top
+// Project's targets, retained Filters, Sort keys, Aggregate arguments, the
+// pinned unnest spine — is written in binding coordinates, because that is the
+// space `planSelect` resolved it in. The search's chosen tree is a cost-chosen
+// reordering. Hand one to the other unchanged and every reference above the
+// search root reads whichever column happened to land at that index.
+//
+// # The choice 03 §10 left to this task, and why it is not a shortcut
+//
+// §10 offers two variants: rewrite every enclosing expression through the map,
+// or emit ONE `Project` at the search root that reorders the final rel's output
+// back into binding order. This task takes the second — and the reason is
+// stronger than "simpler v1", because of a fact §10 could not state before the
+// layout existed:
+//
+//	At the SEARCH ROOT, §10's canonical RELID order and the pre-search
+//	BINDING order are the same sequence.
+//
+// `buildInitialRels` (joinsearch.go:210) assigns relid `1<<i` to FROM item `i`
+// and records `baseOffset = bindings[i].offset`, which ascends with `i`. So
+// ordering the final relset's base rels by relid, and concatenating each one's
+// columns, reproduces exactly the pre-search concatenation. The root relset is
+// the FULL set, so this is not a coincidence of some subsets: publishing
+// relid order at the root IS publishing binding order.
+//
+// That makes the reordering Project the *materialisation* of §10's canonical
+// layout rather than a way around it, and it collapses the boundary map to the
+// identity for every consumer above: the enclosing tree needs no rewrite, the
+// `reconcileNLILayout` / `buildBindingsPosMap` family has nothing left to
+// correct (P5.5-f-ii asserts that, and tags the subtree so those passes skip),
+// and the map survives in exactly one place — here, as the Project's target
+// list.
+//
+// The cost is one narrow pass-through node, and only when the search actually
+// reordered: `createPlanAtSearchRoot` elides the Project when the root's layout
+// is already binding order (the leading case — a left-deep tree whose outer
+// spine starts at FROM item 0), which is the projection elision §10 anticipated.
+//
+// # Still inert
+//
+// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
+// no plan and no row can move. `createplanroot_test.go` is this file's only
+// observer.
+
+import (
+	"fmt"
+	"sort"
+)
+
+// createPlanAtSearchRoot builds the plan for the search's chosen top-level path
+// and returns it in PRE-SEARCH BINDING ORDER — the row shape the enclosing tree
+// was resolved against.
+//
+// This is the ONLY `createPlan` entry point the search's caller may use.
+// `createPlanNode` returns a node in the search's own (cost-chosen) column
+// order, which is correct for a child of another join arm and wrong for anything
+// else; the difference between the two is precisely this function.
+//
+// `bindingWidth` is the width of that pre-search concatenation, and it is passed
+// in rather than inferred from the root because the root cannot know it. A FROM
+// item that never entered the search produces a root that is simply NARROWER —
+// self-consistent, permutation-clean, and missing columns the enclosing tree
+// still references. The caller holds the only copy of that number (the schema of
+// the join subtree the search replaced), so it is the caller that must state it.
+func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
+	if p == nil {
+		panic("createPlan: search root has no path")
+	}
+	if bindingWidth <= 0 {
+		panic(fmt.Sprintf("createPlan: search root asked to reproduce a %d-column binding concatenation", bindingWidth))
+	}
+	n, lay := createPlanNode(p)
+	if n == nil {
+		panic("createPlan: search root path built no node")
+	}
+	if lay == nil {
+		// Only the C0 bridge's `PathPrebuilt` over an empty `RelOptInfo` can
+		// produce this, and that path never reaches the search boundary — it IS
+		// the pre-search tree. Reaching here means a searched root was assembled
+		// from a leaf whose `baseOffset` was never recorded, and the enclosing
+		// tree is about to be handed a row whose column order nobody knows.
+		panic("createPlan: search root's column coordinates are unknown; the boundary map cannot be composed")
+	}
+	if len(lay) != len(n.Output()) {
+		panic(fmt.Sprintf("createPlan: search root layout is %d columns but its output is %d", len(lay), len(n.Output())))
+	}
+	// M0127-P5.5-f-ii-a: the independent cross-check on the arms' coordinate
+	// arithmetic, run on the join tree BEFORE the boundary Project goes on top
+	// — on the Project itself the claim is false by design (searchedtree.go
+	// explains why that is the sharpest argument for the tag).
+	assertSearchedTreeNeedsNoReconcile(n)
+	m := boundaryMap(lay, bindingWidth)
+	if boundaryMapIsIdentity(m) {
+		// The search's order already IS binding order — the common left-deep
+		// case. Emitting a Project here would be a pure copy of every row.
+		//
+		// The tag still goes on: the legacy posmap family must skip this
+		// subtree whether or not a Project was needed. In the identity case
+		// its map would come out the identity too and the skip would look
+		// optional — but only for the shapes where it does, and
+		// `reconcileNLILayout`'s name resolution can move a self-join's keys
+		// regardless of layout.
+		return markSearchedTree(n)
+	}
+	return markSearchedTree(projectToBindingOrder(n, m))
+}
+
+// boundaryMap composes 03 §10's map from the search root's layout: entry `b` is
+// the root output column holding binding coordinate `b`. It is the inverse of
+// `outputLayout`, and it is a plain slice rather than `bindingIndex`'s map
+// because at the root the domain is provably dense — which is the thing this
+// function checks.
+//
+// The check is the point. The root's layout must be a PERMUTATION of
+// `[0, bindingWidth)`: the search's final relset spans every FROM item, so the
+// columns it publishes are exactly the columns the binding concatenation had.
+// Three ways that can fail, all of which otherwise produce a plan that runs:
+//
+//   - a HOLE — some binding coordinate is absent because a FROM item never
+//     entered the search, so a reference above the root indexes past the end of
+//     the row (the M0097-0058 out-of-bounds class) or lands on a neighbour that
+//     shifted into the gap;
+//   - a coordinate OUT OF RANGE — a leaf's `baseOffset` disagrees with the
+//     binding concatenation the enclosing tree was resolved against, e.g. a leaf
+//     rebuilt at a different width than the one recorded;
+//   - a DUPLICATE — one base relation reached the root through two children,
+//     which the enumerator's disjointness rule exists to prevent.
+//
+// All three are producer bugs, and all three are cheaper to fail on here than to
+// debug as a wrong row count six gates later.
+func boundaryMap(lay outputLayout, bindingWidth int) []int {
+	if len(lay) == 0 {
+		panic("createPlan: search root publishes no columns")
+	}
+	m := make([]int, bindingWidth)
+	for i := range m {
+		m[i] = -1
+	}
+	for out, bind := range lay {
+		if bind < 0 || bind >= bindingWidth {
+			panic(fmt.Sprintf("createPlan: search root output column %d carries binding coordinate %d, outside the %d-column binding concatenation it must reproduce",
+				out, bind, bindingWidth))
+		}
+		if prev := m[bind]; prev != -1 {
+			panic(fmt.Sprintf("createPlan: search root output columns %d and %d both claim binding coordinate %d; a base relation reached the root through two children",
+				prev, out, bind))
+		}
+		m[bind] = out
+	}
+	if missing := missingBindingCoords(m); len(missing) > 0 {
+		panic(fmt.Sprintf("createPlan: search root does not publish binding coordinate(s) %v; the enclosing tree references columns the searched subtree cannot supply",
+			missing))
+	}
+	return m
+}
+
+// missingBindingCoords lists the holes in a boundary map, for the diagnostic
+// above. Separate so the message names every gap rather than the first — a
+// whole missing relation shows up as a run, which says "a FROM item never
+// entered the search" far more legibly than a single index.
+func missingBindingCoords(m []int) []int {
+	var missing []int
+	for bind, out := range m {
+		if out == -1 {
+			missing = append(missing, bind)
+		}
+	}
+	sort.Ints(missing)
+	return missing
+}
+
+// boundaryMapIsIdentity reports whether the search left the columns where the
+// bindings put them, in which case no reordering node is needed.
+func boundaryMapIsIdentity(m []int) bool {
+	for bind, out := range m {
+		if bind != out {
+			return false
+		}
+	}
+	return true
+}
+
+// projectToBindingOrder emits the reordering node: one `*Project` whose target
+// `b` is a bare `ColumnRef` at the root output column holding binding
+// coordinate `b`.
+//
+// Every target is a pass-through `ColumnRef`, never a computed expression, so
+// the node adds a slice permutation per row and nothing else. The schema is
+// permuted from the child's by the SAME map in the same loop — the invariant
+// "schema[b] describes Targets[b]" is structural here rather than asserted
+// afterwards, the discipline `joinInputsFor` established for the merged row.
+//
+// `SourceTableIdx` is carried across because it is the identity self-join
+// disambiguation rides on (`findColumnIndexByNameAndSource`, `predRebind`):
+// dropping it here would make Q21's three `lineitem` aliases indistinguishable
+// to every pass above the search root.
+func projectToBindingOrder(child Node, m []int) Node {
+	in := child.Output()
+	targets := make([]Expr, len(m))
+	out := make(Schema, len(m))
+	for bind, col := range m {
+		c := in[col]
+		targets[bind] = &ColumnRef{
+			pos:            child.Pos(),
+			Index:          col,
+			Name:           c.Name,
+			Type:           c.Type,
+			SourceTableIdx: c.SourceTableIdx,
+		}
+		out[bind] = c
+	}
+	p := &Project{pos: child.Pos(), Child: child, Targets: targets, schema: out}
+	// 03 §10's debug tripwire, applied to the node that is by construction the
+	// last chance to catch the class: everything above the root indexes into
+	// THIS schema.
+	assertColumnRefsWithinSchema("search-boundary projection", targets, len(in))
+	return p
+}
+
+// assertColumnRefsWithinSchema is 03 §10's plan-time tripwire: every
+// `ColumnRef` in `exprs` must address a column that exists in a row `width`
+// columns wide.
+//
+// §10 asks for it because the M0097-0058 class — an index-skew bug from the
+// `buildBindingsPosMap` family this work replaces — surfaced as an
+// out-of-bounds slice access DURING EXECUTION, i.e. as a query that had already
+// been accepted, costed and started. Failing at plan time turns that into a
+// loud, attributable planner bug.
+//
+// It deliberately does NOT descend into inner scopes (`scopeIgnore`): a
+// subquery's ColumnRefs index into that subquery's own row, and checking them
+// against this width would be checking the wrong schema — the same boundary
+// `translateToLayout` and `relidsOfExpr` draw, for the same reason (rule #2).
+//
+// Exported to the package rather than inlined because P5.5-f-ii runs it over
+// the whole enclosing tree once the search is spliced in; here it guards the one
+// node this file builds.
+func assertColumnRefsWithinSchema(what string, exprs []Expr, width int) {
+	for i, e := range exprs {
+		var bad *ColumnRef
+		ok := walkExprRefs(e, scopeIgnore, exprVisitor{
+			Visit: func(n Expr) bool {
+				if cr, isCol := n.(*ColumnRef); isCol && bad == nil {
+					if cr.Index < 0 || cr.Index >= width {
+						bad = cr
+					}
+				}
+				return true
+			},
+		})
+		if !ok {
+			panic(fmt.Sprintf("createPlan: %s expression %d (%T) contains a node the walker does not enumerate; teach exprChildSlots about it", what, i, e))
+		}
+		if bad != nil {
+			panic(fmt.Sprintf("createPlan: %s expression %d references column %d (%s) of a %d-column row",
+				what, i, bad.Index, bad.Name, width))
+		}
+	}
+}

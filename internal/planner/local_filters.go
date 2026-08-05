@@ -1,5 +1,7 @@
 package planner
 
+import "fmt"
+
 // M0077-0001 (Slice A): relation-local predicate
 // partition + attachment.
 //
@@ -85,48 +87,66 @@ func partitionConjunctsForJoinPlanning(
 // is INELIGIBLE — those nodes carry execution-time
 // dependencies that the leaf attachment cannot honour.
 //
+// M0125-0002 commit 6 (with localizeExprToLeaf — producer and
+// consumer land together): built on walkExprRefs / exprChildSlots
+// instead of its own 9-of-32 type switch. The old switch had no
+// default and only descended BinaryOp / UnaryOp / FuncCall /
+// CaseExpr / ExtractExpr / InExpr, so a conjunct whose subquery or
+// outer reference sat under any OTHER container — `(x IS NULL) =
+// true`, `CAST(x AS int) > (subq)`, `ROW(x, (subq))`, `x IS
+// DISTINCT FROM (subq)`, a COLLATE, an IS TRUE — produced zero
+// callbacks below that container and returned a VACUOUS true. That
+// is the fail-open direction: the conjunct was moved out of
+// joinConjuncts into locals and pushed to a leaf, where
+// localizeExprToLeaf (equally incomplete) left its ColumnRef
+// indices in FROM-cumulative coordinates. Completing the pair
+// therefore REMOVES predicates from the leaf-local set rather than
+// adding any.
+//
+// Scope policy: scopeVeto. An inner plan is precisely the
+// execution-time dependency §3.1.3 declines, so the abort IS the
+// answer; an unenumerated type aborts too, which turns the old
+// silent admission into a decline (fail closed). Declining costs an
+// optimisation — the conjunct stays in the join residual and is
+// evaluated above the join — never a wrong answer, so unlike
+// commits 3/4 this walker must NOT panic on an unknown type.
+//
 // (M0077-0001.)
 func conjunctIsLocalEligible(e Expr) bool {
 	eligible := true
-	var walk func(Expr)
-	walk = func(n Expr) {
-		if !eligible || n == nil {
-			return
-		}
-		switch x := n.(type) {
-		case *OuterColumnRef, *SubqueryExpr, *ExistsExpr:
-			eligible = false
-		case *InExpr:
-			if x.Plan != nil {
+	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+		Visit: func(n Expr) bool {
+			switch n.(type) {
+			case *OuterColumnRef:
+				// A childless leaf: exprChildSlots reports no slots
+				// for it, so scopeVeto can never fire on its behalf
+				// and the decline has to be explicit. Same shape as
+				// commit 5's exprSide veto.
 				eligible = false
-				return
+				return false
+			case *SubqueryExpr, *ExistsExpr, *ArraySubqueryExpr,
+				*MultiAssignSubqRow, *MultiAssignSubqElem:
+				// Declined whether or not Plan is set. exprChildSlots
+				// emits the slotInnerPlan slot ONLY when Plan != nil,
+				// so scopeVeto alone would admit an unplanned subquery
+				// node — and the old switch declined SubqueryExpr /
+				// ExistsExpr unconditionally, which is the behaviour
+				// design 01 §3.1.3 states. The three Array/MultiAssign
+				// kinds join them: they carry the same execution-time
+				// dependency and were admitted by accident before.
+				eligible = false
+				return false
 			}
-			walk(x.Operand)
-			for _, item := range x.List {
-				walk(item)
-			}
-		case *BinaryOp:
-			walk(x.Left)
-			walk(x.Right)
-		case *UnaryOp:
-			walk(x.Operand)
-		case *FuncCall:
-			for _, a := range x.Args {
-				walk(a)
-			}
-		case *CaseExpr:
-			walk(x.Operand)
-			for _, w := range x.Whens {
-				walk(w.When)
-				walk(w.Then)
-			}
-			walk(x.Else)
-		case *ExtractExpr:
-			walk(x.Source)
-		}
-	}
-	walk(e)
-	return eligible
+			return true
+		},
+	})
+	// ok == false means the walk ABORTED: either a slotInnerPlan child
+	// under scopeVeto (an InExpr/SubqueryExpr/ExistsExpr that carries a
+	// Plan) or a type exprChildSlots does not know. Both are declines —
+	// the old switch had no default, so a conjunct built entirely from
+	// unenumerated kinds returned a vacuous true and was pushed to a
+	// leaf that localizeExprToLeaf could not rebase.
+	return eligible && ok
 }
 
 // shouldAttachBeforeMHJ is the rollout gate per
@@ -275,64 +295,52 @@ func attachRelationLocalFilters(
 // SourceTableIdx is preserved unchanged (the relation
 // identity doesn't change when we rebase).
 //
+// M0125-0002 commit 6: built on cloneExprRefs / exprChildSlots
+// instead of its own 7-of-32 type switch, whose trailing
+// pass-through ("Constants … no ColumnRef; pass through") was a
+// claim about the seven kinds it knew and a silent lie about the
+// other twenty-five: an IsNullExpr, CastExpr, RowExpr, IsBoolExpr,
+// CollateExpr or IsDistinctFromExpr wrapping a ColumnRef was
+// returned UNCHANGED, i.e. attached to a leaf Filter still carrying
+// FROM-cumulative indices. With binding.offset > 0 that reads the
+// wrong column at execution time. conjunctIsLocalEligible was the
+// only thing keeping it rare, and it was fail-open in the same
+// places — the two are one commit for that reason.
+//
+// Scope policy: scopeVeto, which is unreachable by construction:
+// every conjunct arriving here has passed conjunctIsLocalEligible,
+// whose own scopeVeto already declined inner plans and unknown
+// types over the SAME primitive. An abort therefore means the pair
+// has diverged, and that is a planner bug, not a shape this
+// function may decline: the caller has already removed the conjunct
+// from joinConjuncts, so returning it un-rebased (or dropping it)
+// would be a wrong answer. Hence the panic.
+//
 // (M0077-0001.)
 func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 	if e == nil {
 		return nil
 	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		// Defensive copy — the caller's expression tree
-		// may be reused by other planner stages.
-		out := *x
-		out.Index = x.Index - binding.offset
-		return &out
-	case *BinaryOp:
-		out := *x
-		out.Left = localizeExprToLeaf(x.Left, binding)
-		out.Right = localizeExprToLeaf(x.Right, binding)
-		return &out
-	case *UnaryOp:
-		out := *x
-		out.Operand = localizeExprToLeaf(x.Operand, binding)
-		return &out
-	case *FuncCall:
-		out := *x
-		newArgs := make([]Expr, len(x.Args))
-		for i, a := range x.Args {
-			newArgs[i] = localizeExprToLeaf(a, binding)
-		}
-		out.Args = newArgs
-		return &out
-	case *CaseExpr:
-		out := *x
-		out.Operand = localizeExprToLeaf(x.Operand, binding)
-		newWhens := make([]CaseWhen, len(x.Whens))
-		for i, w := range x.Whens {
-			newWhens[i] = CaseWhen{
-				When: localizeExprToLeaf(w.When, binding),
-				Then: localizeExprToLeaf(w.Then, binding),
+	out, ok := cloneExprRefs(e, scopeVeto, exprRewriter{
+		Rewrite: func(n Expr) Expr {
+			// n is the CLONE — cloneExprRefs shallow-copies every
+			// node, leaves included — so mutating it in place leaves
+			// the caller's tree untouched. That is the defensive copy
+			// the old *ColumnRef arm made by hand, now uniform across
+			// all 32 kinds instead of the 7 it enumerated.
+			if cr, isCol := n.(*ColumnRef); isCol {
+				cr.Index -= binding.offset
 			}
-		}
-		out.Whens = newWhens
-		out.Else = localizeExprToLeaf(x.Else, binding)
-		return &out
-	case *InExpr:
-		out := *x
-		out.Operand = localizeExprToLeaf(x.Operand, binding)
-		newList := make([]Expr, len(x.List))
-		for i, item := range x.List {
-			newList[i] = localizeExprToLeaf(item, binding)
-		}
-		out.List = newList
-		return &out
-	case *ExtractExpr:
-		out := *x
-		out.Source = localizeExprToLeaf(x.Source, binding)
-		return &out
+			return n
+		},
+	})
+	if !ok {
+		panic(fmt.Sprintf("localizeExprToLeaf: cannot rebase %T — "+
+			"conjunctIsLocalEligible must decline every conjunct this "+
+			"driver aborts on (an inner plan under scopeVeto, or a type "+
+			"exprChildSlots does not know). The producer and the consumer "+
+			"are one commit for exactly this reason; a silent pass-through "+
+			"here leaves FROM-cumulative indices on a leaf-local Filter", e))
 	}
-	// Constants, NullConst, BooleanConst, IntegerConst,
-	// NumericConst, StringConst, TypedStringLit,
-	// IntervalLit — no ColumnRef; pass through.
-	return e
+	return out
 }

@@ -108,7 +108,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -189,6 +189,27 @@ func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 // branch in postgres/src/backend/commands/explain.c), omitting the whole
 // line when all four counters are zero and omitting each individual
 // hit=/read=/dirtied=/written= term when that counter is zero.
+// formatHashJoinInfoLine renders PG's hash-table line verbatim from
+// show_hash_info (explain.c): the two forms differ only in whether the
+// originals are shown, and PG shows BOTH originals as soon as EITHER count
+// moved. `nbatch > 0` is upstream's whole gate — a join whose build never ran
+// (no batch state, so no geometry was chosen) prints nothing at all, which is
+// also how goopg represents "this hash join declined batching".
+//
+// kB rounds UP, PG's BYTES_TO_KILOBYTES.
+func formatHashJoinInfoLine(hs *HashJoinStats) string {
+	if hs == nil || hs.NBatch <= 0 {
+		return ""
+	}
+	kb := (hs.SpacePeak + 1023) / 1024
+	if hs.NBatch != hs.OrigNBatch || hs.NBuckets != hs.OrigNBuckets {
+		return fmt.Sprintf("Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %dkB",
+			hs.NBuckets, hs.OrigNBuckets, hs.NBatch, hs.OrigNBatch, kb)
+	}
+	return fmt.Sprintf("Buckets: %d  Batches: %d  Memory Usage: %dkB",
+		hs.NBuckets, hs.NBatch, kb)
+}
+
 func formatBuffersLine(s *nodeStats) string {
 	if s.bufHit == 0 && s.bufRead == 0 && s.bufDirtied == 0 && s.bufWritten == 0 {
 		return ""
@@ -328,34 +349,40 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, &subPlanReg{rel: newExplainNames(n)})
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
 // is a Filter.Predicate carried down from a Filter wrapper that
 // was skipped above us — it is rendered as `Filter:` detail under
-// the next scan-like node we render.
-func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, reg *subPlanReg) {
+// the next scan-like node we render. attachedFilterNode is that same
+// wrapper's plan node, carried so the collapsed line can report the
+// wrapper's POST-qual row estimate (see below).
+func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, attachedFilterNode planner.Node, reg *subPlanReg) {
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, reg)
+		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, attachedFilterNode, reg)
 		return
 	}
 	// Skip Filter wrappers and push their predicate down to be
 	// rendered as `Filter:` detail under the next scan node.
 	if f, ok := n.(*planner.Filter); ok {
 		next := f.Predicate
+		nextNode := planner.Node(f)
 		// If multiple Filter wrappers stack, render only the
 		// outermost predicate to keep the detail line readable.
 		// Inner Filter predicates collapse with the outer via
 		// short-circuit AND — but PG's Filter detail is a single
 		// expression line; chaining is uncommon so prefer the
-		// outermost predicate for v0.
+		// outermost predicate for v0. The outermost wrapper is also
+		// the right one to take rows from: its estimate already
+		// scales through every inner wrapper below it.
 		if attachedFilter != nil {
 			next = attachedFilter
+			nextNode = attachedFilterNode
 		}
-		walkPlanFiltered(f.Child, depth, rows, opts, next, reg)
+		walkPlanFiltered(f.Child, depth, rows, opts, next, nextNode, reg)
 		return
 	}
 
@@ -369,7 +396,32 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
 	showCosts := !opts.Set.Costs || opts.Costs
 	if showCosts {
-		est := planner.EstimateRows(n)
+		// The row count belongs to the qual that is rendered ON this line.
+		// When a `*Filter` wrapper was collapsed into us above, its
+		// predicate prints here as `Filter:`, so its POST-qual estimate is
+		// what this line must report — `EstimateRows(n)` is the child's
+		// PRE-qual count and understates nothing, it overstates by exactly
+		// the filter's selectivity.
+		//
+		// Upstream never has this gap because the qual and the rowcount
+		// live on one struct: `set_baserel_size_estimates` (costsize.c)
+		// stores `rel->rows` already multiplied by
+		// `clauselist_selectivity(baserestrictinfo)`, and `cost_agg`
+		// likewise sets `path->rows` only after scaling `output_tuples` by
+		// the HAVING quals' selectivity. goopg splits the two across a
+		// wrapper node, so the renderer has to put them back together.
+		//
+		// goopg's ESTIMATOR was always right here — a parent node reads
+		// `EstimateRows(*Filter)` and sees the filtered count. Only the
+		// collapsed line lied, which made EXPLAIN (the acceptance
+		// instrument for the DS05 `plans` channel and estimate-audit)
+		// disagree with PG by one selectivity factor on every filtered
+		// scan and every HAVING.
+		rowSrc := n
+		if attachedFilterNode != nil {
+			rowSrc = attachedFilterNode
+		}
+		est := planner.EstimateRows(rowSrc)
 		if est <= 0 {
 			est = 1
 		}
@@ -401,12 +453,12 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub planner.Node, subDepth int) {
-		walkPlanFiltered(sub, subDepth, rows, opts, nil, reg)
+		walkPlanFiltered(sub, subDepth, rows, opts, nil, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
-		walkPlanFiltered(c, depth+1, rows, opts, nil, reg)
+		walkPlanFiltered(c, depth+1, rows, opts, nil, nil, reg)
 	}
 }
 
@@ -512,6 +564,31 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
+	case *planner.Join:
+		// M0127-P2.1: render the join's equi-key list, upstream's
+		// `Hash Cond:` / `Merge Cond:`. explain.c reaches these through
+		// show_upper_qual (T_HashJoin → hashclauses, T_MergeJoin →
+		// mergeclauses), which is why `qualify` — the rtable_size > 1
+		// rule — is the right prefixing decision here and not the
+		// scan-node one.
+		//
+		// goopg emitted NO condition line for joins at all before this,
+		// so a plan's key choice was invisible in EXPLAIN — the very
+		// property M0125-0035b's degeneracy bug turned on (a
+		// constant-pinned key column produced a PG-identical-looking
+		// plan that ran quadratically). The list now shows every pair
+		// the planner found, so `Hash Cond: ((a = b) AND (c = d))` is
+		// readable against PG's own output for the same query.
+		if cond := formatJoinKeyCond(p, reg, qualify); cond != "" {
+			label := "Hash Cond: "
+			if p.Algo == planner.JoinAlgoMerge {
+				label = "Merge Cond: "
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + label + cond)})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 	case *planner.NestedLoopIndexJoin:
 		// The NLI's residual predicate (conjuncts the index probe does not
 		// enforce — hoisted inner filters, OR-factoring residuals,
@@ -548,6 +625,45 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	}
+}
+
+// formatJoinKeyCond renders a hash/merge join's key list the way
+// upstream's show_qual does: each pair as its own parenthesised
+// equality, and — when there is more than one — the whole list
+// re-parenthesised as an explicit AND chain (make_ands_explicit).
+// A single pair therefore reads `(a.x = b.x)` and two read
+// `((a.x = b.x) AND (a.y = b.y))`, matching PG byte for byte.
+//
+// Falls back to the single (LeftKey, RightKey) pair when HashKeys is
+// empty — a join built outside Plan()'s tail never gets the list, and an
+// unrendered condition would be a silent regression against the pre-P2.1
+// output for exactly those plans.
+func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
+	if p.Algo != planner.JoinAlgoHash && p.Algo != planner.JoinAlgoMerge {
+		return ""
+	}
+	pairs := p.HashKeys
+	if len(pairs) == 0 {
+		if p.LeftKey == nil || p.RightKey == nil {
+			return ""
+		}
+		pairs = []planner.JoinKeyPair{{Left: p.LeftKey, Right: p.RightKey}}
+	}
+	parts := make([]string, 0, len(pairs))
+	for _, k := range pairs {
+		if k.Left == nil || k.Right == nil {
+			continue
+		}
+		parts = append(parts, formatExprQual(
+			&planner.BinaryOp{Op: parser.OpEq, Left: k.Left, Right: k.Right}, reg, qualify))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
 }
 
 // formatIndexCond renders the equality / range condition of an
@@ -978,13 +1094,13 @@ func schemaColumnNames(n planner.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, nil, &subPlanReg{rel: newExplainNames(n)})
+func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, &subPlanReg{rel: newExplainNames(n)})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, attachedFilter planner.Expr, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, attachedFilter, reg)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -992,7 +1108,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, next, reg)
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, reg)
 		return
 	}
 
@@ -1044,6 +1160,15 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
+	// off the HASH node; goopg has no Hash node (the build lives inside
+	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
+	if j, isJoin := n.(*planner.Join); isJoin && j.Algo == planner.JoinAlgoHash {
+		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+		}
+	}
+
 	// EXPLAIN (ANALYZE, BUFFERS) emits a "Buffers: shared hit=N read=N"
 	// detail line per node (design 0122-0003 BUFFERS slice). Shared-only,
 	// hit/read-only for now — local/temp buffers and dirtied/written
@@ -1071,12 +1196,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, nil, reg)
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range planChildren(n) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, nil, reg)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
 	}
 }
 

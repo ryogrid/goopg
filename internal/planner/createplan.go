@@ -23,18 +23,73 @@ import "fmt"
 // real path kinds as those kinds are introduced. In C0 the wrapped subtree
 // already carries every such detail, so createPlan is an unwrap.
 func createPlan(p *Path) Node {
+	n, _ := createPlanNode(p)
+	return n
+}
+
+// createPlanNode is createPlan with the coordinate map the join arms need
+// (M0127-P5.5-e-i). It returns the emitted node together with its
+// `outputLayout` — for each output column, the pre-search binding coordinate it
+// came from — because a join is the first arm that merges two schemas and
+// therefore the first that must re-base its quals onto the merged row
+// (createplanjoin.go explains why the alternative silently reads wrong
+// columns).
+//
+// The layout is threaded through the recursion rather than recomputed at each
+// node, so it cannot drift from the tree: it is built where the schema is built,
+// from the same children, in the same statement. `createPlan` above is the entry
+// point for every caller that only wants the node; the layout leaves this
+// package only once P5.5-f composes 03 §10's boundary map from the search
+// root's.
+func createPlanNode(p *Path) (Node, outputLayout) {
 	if p == nil {
-		return nil
+		return nil, nil
 	}
 	switch p.Kind {
 	case PathPrebuilt:
-		// The DP-built subtree, carried whole. Nothing to reconstruct.
-		return p.node
+		// The DP-built subtree, carried whole. Nothing to reconstruct — and
+		// its coordinates are known only when it is a level-1 leaf
+		// (`buildInitialRels`); the C0 bridge's join subtree was laid out by
+		// the integer DP and has no relationship to this map.
+		return p.node, baseRelLayout(p.Rel, p.node)
+	case PathIndexScan:
+		// The first real arm (M0127-P5.5-c): the probe the search costed,
+		// rebuilt from the carrier P5.5-a/-b landed on the path and the leaf
+		// `buildInitialRels` recorded on the rel. createplanindex.go.
+		n := createIndexScanPlan(p)
+		return n, baseRelLayout(p.Rel, n)
+	case PathSeqScan:
+		// The index arm's mirror (M0127-P5.5-d): the same leaf resolver with
+		// the probe machinery removed. createplansimple.go.
+		n := createSeqScanPlan(p)
+		return n, baseRelLayout(p.Rel, n)
+	case PathSort:
+		// The first arm with a child path (M0127-P5.5-d): P5.4c's merge paths
+		// carry Sort children, so this must exist before the join arms do.
+		// createplansimple.go.
+		return createSortPlan(p)
+	case PathHashJoin:
+		// The first join arm (M0127-P5.5-e-i) and the first consumer of the
+		// layout above. createplanjoin.go.
+		return createHashJoinPlan(p)
+	case PathMergeJoin:
+		// The second join arm (M0127-P5.5-e-ii-a): the same prologue, plus the
+		// ORDERED key list a merge sorts by and the absorption of the explicit
+		// `PathSort` children goopg's merge operator makes redundant.
+		// createplanjoin.go.
+		return createMergeJoinPlan(p)
+	case PathNestLoop:
+		// The third join arm (M0127-P5.5-e-ii-b), and the only one that BINDS a
+		// parameter: it emits a plain `*Join` or a `*NestedLoopIndexJoin`
+		// depending on whether the inner child is parameterised, and the two
+		// shapes translate their expressions onto DIFFERENT layouts — the probe
+		// keys onto the outer alone, the residual onto the merged row.
+		// createplannl.go.
+		return createNestLoopPlan(p)
 	default:
-		// PathSeqScan / PathHashJoin / … are not generated until C3/C4. Reaching
-		// here means a later phase constructed a path kind without teaching
-		// createPlan to translate it.
-		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (C3/C4)", p.Kind))
+		// PathMultiHash / … do not have arms yet. Reaching here means a phase
+		// constructed a path kind without teaching createPlan to translate it.
+		panic(fmt.Sprintf("createPlan: path kind %d not yet translatable (P5.5)", p.Kind))
 	}
 }
 

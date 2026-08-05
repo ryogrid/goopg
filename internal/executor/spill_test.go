@@ -12,7 +12,7 @@ func TestSpillRoundTrip(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	w, err := newSpillWriter(dir)
+	w, err := newSpillWriterInDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,10 @@ func TestDrainRowsBoundedNoSpill(t *testing.T) {
 		rows[i] = Row{Datum{Kind: KindInt, Int: int64(i)}}
 	}
 	op := &rowsOp{rows: rows}
-	result, err := drainRowsBounded(op, 100*1024*1024) // 100 MB
+	ctx := NewContext()
+	ctx.DataDir = t.TempDir()
+	defer ctx.ReleaseSpillFiles()
+	result, err := drainRowsBounded(ctx, op, 100*1024*1024) // 100 MB
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +95,10 @@ func TestDrainRowsBoundedSpill(t *testing.T) {
 		rows[i] = Row{NewStringDatum(makeString(512))}
 	}
 	op := &rowsOp{rows: rows}
-	result, err := drainRowsBounded(op, 1024) // 1 KB — tiny budget forces spill
+	ctx := NewContext()
+	ctx.DataDir = t.TempDir()
+	defer ctx.ReleaseSpillFiles()
+	result, err := drainRowsBounded(ctx, op, 1024) // 1 KB — tiny budget forces spill
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +106,6 @@ func TestDrainRowsBoundedSpill(t *testing.T) {
 		t.Error("large data with tiny budget should have spilled")
 	}
 	// Read back and verify.
-	ctx := &Context{}
 	result.Open(ctx)
 	var count int
 	for {

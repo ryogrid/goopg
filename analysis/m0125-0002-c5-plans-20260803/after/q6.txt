@@ -1,0 +1,25 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=399 width=0)
+        Sort Key: count, ca_state
+    ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1199 width=0)
+          Filter: (count >= 10)
+      ->  Gather  (cost=0.00..0.00 rows=2399 width=0)
+            Workers Planned: 1
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1439608 width=0)
+              Filter: ((d.d_month_seq = (SubPlan 1)) AND (i.i_current_price > (1.2 * (SubPlan 2))))
+              SubPlan 1
+                ->  Unique  (cost=0.00..0.00 rows=1 width=0)
+                  ->  Seq Scan on public.date_dim (stats)  (cost=0.00..0.00 rows=73049 width=0)
+                        Filter: ((d_year = 2002) AND (d_moy = 3))
+              SubPlan 2
+                ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                  ->  Seq Scan on public.item j (stats)  (cost=0.00..0.00 rows=18000 width=0)
+                        Filter: (i_category = $0)
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1439608 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1439608 width=0)
+              ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=100000 width=0)
+                ->  Seq Scan on public.customer_address a (stats)  (cost=0.00..0.00 rows=50000 width=0)
+                ->  Seq Scan on public.customer c (stats)  (cost=0.00..0.00 rows=100000 width=0)
+              ->  Seq Scan on public.store_sales s (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+            ->  Seq Scan on public.date_dim d (stats)  (cost=0.00..0.00 rows=73049 width=0)
+          ->  Seq Scan on public.item i (stats)  (cost=0.00..0.00 rows=18000 width=0)

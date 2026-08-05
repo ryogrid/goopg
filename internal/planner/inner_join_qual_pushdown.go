@@ -138,6 +138,11 @@ func pushInnerJoinInputQuals(f *Filter) {
 			// untouched — so only the error behaviour changes.
 			if repl, ok := pushConjunctIntoSubtree(child, c); ok {
 				f.Child = repl
+				// …only the error behaviour, and (until M0127-P5.6-f-vi)
+				// the estimate: the copy below is priced by the node it
+				// was attached to AND the original is priced here. Record
+				// the duplication so `filterSelectivity` charges it once.
+				f.notePushedBelow(c)
 			}
 		}
 	case *MultiHashJoin:
@@ -189,8 +194,40 @@ func pushResidualQualsIntoMHJTables(f *Filter, mh *MultiHashJoin) {
 		}
 		if repl, ok := pushConjunctIntoSubtree(mh.Tables[t], local); ok {
 			mh.Tables[t] = repl
+			// Same duplication, same double-charge — the binary arm's
+			// sibling (M0127-P5.6-f-vi). `estimateMultiHashJoin` walks
+			// mh.Tables, so the copy IS priced down there.
+			f.notePushedBelow(c)
 		}
 	}
+}
+
+// notePushedBelow records that conjunct `c` of f.Predicate has been
+// duplicated onto a descendant, so the descendant's own estimate already
+// charges it. Idempotent: both pushdown passes are re-walk safe
+// (pushConjunctIntoSubtree's exprEqual guard), so a second walk must not
+// grow the list.
+func (f *Filter) notePushedBelow(c Expr) {
+	for _, seen := range f.PushedBelow {
+		if seen == c || exprEqual(seen, c) {
+			return
+		}
+	}
+	f.PushedBelow = append(f.PushedBelow, c)
+}
+
+// pricedBelow reports whether conjunct c is one this Filter has already
+// charged at a descendant. Matched by `exprEqual` rather than pointer
+// identity because a later rewriter may clone the predicate wholesale
+// (cloneExprForShift and the posMap passes both do); identity alone would
+// silently go stale and restore the double-charge.
+func (f *Filter) pricedBelow(c Expr) bool {
+	for _, seen := range f.PushedBelow {
+		if seen == c || exprEqual(seen, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // mhjResidualConjunctTable attributes a residual conjunct to the unique
@@ -671,177 +708,6 @@ func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int
 			}
 		}
 	}
-}
-
-// reselectDegenerateHashKeys re-picks a hash join's key pair when the
-// pair it was built with has been made DEGENERATE by qual placement:
-// once `ws_sold_year = 1998` sits on both inputs of `... ON
-// ws_sold_year = ss_sold_year AND ws_item_sk = ss_item_sk AND ...`,
-// every surviving row carries the same key value, the entire build side
-// lands in ONE hash bucket, and each probe walks it end to end — the
-// join is quadratic with a hash table's overhead. TPC-DS Q78's top
-// spine is exactly this (245,587 probes × ~30k single-bucket entries
-// per LEFT join), and it is why the query still burned >300 s AFTER
-// its three channels were correctly pre-filtered to one year.
-//
-// PG never faces the choice: its Hash Cond keeps EVERY equi-pair, so a
-// constant-pinned column merely contributes nothing to bucket spread.
-// goopg's join carries ONE LeftKey/RightKey (splitEqualityForHash takes
-// the first disjoint-side pair, in ON-clause order) and evaluates the
-// remaining conjuncts as a per-match residual — which also makes this
-// swap RESULT-NEUTRAL: whichever pair is the key, the full Predicate
-// is still enforced on every emitted row (operators_join_agg.go's
-// post-hash filter), and a NULL in either pair fails its equality
-// conjunct on both routes. Only bucket distribution changes. The full
-// fix is PG-shaped multi-column keys, a planner+executor sibling-pair
-// change recorded in the ledger; this pass removes the pathological
-// case that qual placement itself creates.
-//
-// Degeneracy is judged against the join input's IMMEDIATE Filter —
-// which is precisely where this file's passes deposit a pushed
-// `col = const` — so the pass composes with them and stays bounded:
-// a constant hidden deeper (below a Project, inside a CTE body) is not
-// seen, and the key simply stays as chosen today. Both the current and
-// the replacement pair are validated positionally by name (property 1)
-// and the replacement is CLONED into the key slots (the M0097-0060
-// shared-pointer lesson).
-func reselectDegenerateHashKeys(n Node) {
-	if n == nil {
-		return
-	}
-	switch x := n.(type) {
-	case *Explain:
-		reselectDegenerateHashKeys(x.Child)
-	case *Filter:
-		reselectDegenerateHashKeys(x.Child)
-	case *Join:
-		reselectJoinHashKey(x)
-		reselectDegenerateHashKeys(x.Left)
-		reselectDegenerateHashKeys(x.Right)
-	case *NestedLoopIndexJoin:
-		reselectDegenerateHashKeys(x.Outer)
-		reselectDegenerateHashKeys(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			reselectDegenerateHashKeys(t)
-		}
-	case *CTEScan:
-		reselectDegenerateHashKeys(x.Child)
-	case *CTEDMLPrefix:
-		reselectDegenerateHashKeys(x.Body)
-	case *Project:
-		reselectDegenerateHashKeys(x.Child)
-	case *Sort:
-		reselectDegenerateHashKeys(x.Child)
-	case *Limit:
-		reselectDegenerateHashKeys(x.Child)
-	case *Aggregate:
-		reselectDegenerateHashKeys(x.Child)
-	case *WindowAgg:
-		reselectDegenerateHashKeys(x.Child)
-	case *Distinct:
-		reselectDegenerateHashKeys(x.Child)
-	case *DistinctOn:
-		reselectDegenerateHashKeys(x.Child)
-	case *SetOp:
-		reselectDegenerateHashKeys(x.Left)
-		reselectDegenerateHashKeys(x.Right)
-	case *RecursiveUnion:
-		reselectDegenerateHashKeys(x.Anchor)
-		reselectDegenerateHashKeys(x.Recursive)
-	case *Gather:
-		reselectDegenerateHashKeys(x.Child)
-	case *GatherMerge:
-		reselectDegenerateHashKeys(x.Child)
-	case *LockRows:
-		reselectDegenerateHashKeys(x.Child)
-	}
-}
-
-// reselectJoinHashKey applies reselectDegenerateHashKeys to one join.
-func reselectJoinHashKey(j *Join) {
-	if j == nil || j.Algo != JoinAlgoHash || j.Predicate == nil {
-		return
-	}
-	lk, ok1 := j.LeftKey.(*ColumnRef)
-	rk, ok2 := j.RightKey.(*ColumnRef)
-	if !ok1 || !ok2 {
-		return
-	}
-	leftWidth := len(j.Left.Output())
-	if !hashPairDegenerate(j, lk.Index, rk.Index, leftWidth) {
-		return
-	}
-	leftOut, rightOut := j.Left.Output(), j.Right.Output()
-	for _, jc := range splitAnd(j.Predicate) {
-		eq, ok := jc.(*BinaryOp)
-		if !ok || eq.Op != parser.OpEq {
-			continue
-		}
-		a, aok := eq.Left.(*ColumnRef)
-		b, bok := eq.Right.(*ColumnRef)
-		if !aok || !bok {
-			continue
-		}
-		if a.Index >= leftWidth { // normalize to (left, right)
-			a, b = b, a
-		}
-		if a.Index < 0 || a.Index >= leftWidth ||
-			b.Index < leftWidth || b.Index >= leftWidth+len(rightOut) {
-			continue
-		}
-		if a.Index == lk.Index && b.Index == rk.Index {
-			continue // the pair we are replacing
-		}
-		if a.Name != "" && !strings.EqualFold(leftOut[a.Index].Name, a.Name) {
-			continue
-		}
-		if b.Name != "" && !strings.EqualFold(rightOut[b.Index-leftWidth].Name, b.Name) {
-			continue
-		}
-		if hashPairDegenerate(j, a.Index, b.Index, leftWidth) {
-			continue
-		}
-		lc, rc := *a, *b
-		j.LeftKey, j.RightKey = &lc, &rc
-		return
-	}
-}
-
-// hashPairDegenerate reports whether either column of a candidate hash
-// pair (merged coordinates) is pinned to a constant by its input's
-// immediate Filter — the placement this file's passes produce.
-func hashPairDegenerate(j *Join, lIdx, rIdx, leftWidth int) bool {
-	return inputPinsColToConst(j.Left, lIdx) ||
-		inputPinsColToConst(j.Right, rIdx-leftWidth)
-}
-
-// inputPinsColToConst reports whether a join input's immediate Filter
-// carries a `col = const` conjunct on the given input-local column.
-func inputPinsColToConst(input Node, localIdx int) bool {
-	f, ok := input.(*Filter)
-	if !ok {
-		return false
-	}
-	for _, c := range splitAnd(f.Predicate) {
-		eq, ok := c.(*BinaryOp)
-		if !ok || eq.Op != parser.OpEq {
-			continue
-		}
-		cr, okc := eq.Left.(*ColumnRef)
-		constOperand := eq.Right
-		if !okc {
-			cr, okc = eq.Right.(*ColumnRef)
-			constOperand = eq.Left
-		}
-		if !okc || !isConstantPlanExpr(constOperand) {
-			continue
-		}
-		if cr.Index == localIdx {
-			return true
-		}
-	}
-	return false
 }
 
 // shiftConjunctForInput returns a deep copy of c with every

@@ -1,25 +1,25 @@
-# Left-Deep Binary Joins, PG-Style DP, and a Fusion-Free Join Executor — Design Bundle
+# PG-Shaped Binary Joins (Left-Deep + Bushy), PG-Style DP, and a Fusion-Free Join Executor — Design Bundle
 
 | field | value |
 | --- | --- |
 | status | draft — **DESIGN ONLY**, implementation not started |
 | date | 2026-08-02 |
-| scope | (a) restrict every emitted plan tree to **left-deep binary joins** (`*planner.Join` only; `MultiHashJoin` deleted as a plan node), (b) replace the bushy subset-bitmask DP with a **PostgreSQL-shaped level-wise DP** (`standard_join_search` / `join_search_one_level` analogue over `RelOptInfo` pathlists), and (c) rework the join operators so a binary hash-join cascade executes with **PG-grade efficiency** — streaming probe, zero per-level intermediate materialisation, multi-column keys, work_mem-bounded hybrid-hash spill — making both `MultiHashJoin` and the runtime fusion operator (`fusedHashJoinOp`) permanently unnecessary |
+| scope | (a) restrict every emitted plan tree to **PG-shaped binary joins** — left-deep chains *and* bushy composite-composite joins, exactly the shapes PG 18.3's `join_search_one_level` can produce (`*planner.Join` only; `MultiHashJoin` deleted as a plan node), (b) replace the subset-bitmask DP with a **PostgreSQL-shaped level-wise DP** (`standard_join_search` / `join_search_one_level` analogue over `RelOptInfo` pathlists, all three phases — clause joins, bushy, last-ditch), and (c) rework the join operators so a binary hash-join cascade executes with **PG-grade efficiency** — streaming probe, zero per-level intermediate materialisation, multi-column keys, work_mem-bounded hybrid-hash spill — making both `MultiHashJoin` and the runtime fusion operator (`fusedHashJoinOp`) permanently unnecessary |
 | non-goals | GEQO (genetic search) port; parallel hash **build** (leader-serial shared build stays, [parallel-query/](../parallel-query/README.md) owns it); extended statistics; bitmap heap scans; a new executor IR (`create_plan` still translates Paths to the existing `Operator` nodes) |
 | baseline | PostgreSQL 18.3 under `postgres/` (read-only oracle) |
 | depends on | [cost-model/](../cost-model/README.md) (the Path substrate and cost-function designs are adopted, not re-designed here); [analysis/cost-driven-second-try-200731/](../../../analysis/cost-driven-second-try-200731/README.md) (premise audit + evidence, adopted as factual record) |
 | supersedes | [0034-0001-bushy-join-planning.md](../0034-0001-bushy-join-planning.md) (the bushy DP itself); [cost-model/07](../cost-model/07-cost-driven-join-order.md) §"DP over pathlists" (kept in spirit, re-shaped to PG's level-list form); [analysis/cost-driven-second-try-200731/07-cost-model-interaction.md](../../../analysis/cost-driven-second-try-200731/07-cost-model-interaction.md) §6's prohibition "no shape preference for left-deep-with-fact-outermost" (see [02](02-plan-shape-contract.md) §6 — the restriction here is a *search-space contract*, not a cost-side thumb on the scale); [0038-0001-multi-way-hash-join.md](../0038-0001-multi-way-hash-join.md) (retired on implementation of [08](08-migration-and-removal.md)) |
-| directive | user (2026-08-02): plan trees are left-deep binary only; the DP searches the PG way, not bushy; the executor must run the plans that previously needed fusion as efficiently as PG does; join-operator rework is in scope |
+| directive | user (2026-08-02, amended 2026-08-03): **PG-identical join search** — plan trees are PG-shaped binary joins (left-deep + bushy) exactly as PG's `join_search_one_level` produces them, with PG's full three-phase DP; the executor must run the plans that previously needed fusion as efficiently as PG does; join-operator rework is in scope |
 
 ## Chapters
 
 | # | file | contents |
 |---|---|---|
 | 01 | [01-motivation-and-evidence.md](01-motivation-and-evidence.md) | why now: the M0126 NO-GO, the MHJ/fusion dead ends, the measured cascade seam cost, and the exact queries this bundle must recover |
-| 02 | [02-plan-shape-contract.md](02-plan-shape-contract.md) | the left-deep binary plan-shape invariant; `BuildLeft` = PG's commuted inner/outer; why connected graphs never need an avoidable cross product; what the restriction deletes (layout remapping, MHJ coordinate round-trip) |
-| 03 | [03-join-search-pg-dp.md](03-join-search-pg-dp.md) | the `standard_join_search` analogue: level-indexed joinrel lists, `join_search_one_level` restricted to its clause-join phase, `RelOptInfo` + `add_path`/`set_cheapest` on the existing `path.go` substrate, join methods generated **inside** the search, collapse limits, explicit-JOIN flattening, over-limit fallback |
+| 02 | [02-plan-shape-contract.md](02-plan-shape-contract.md) | the PG-shaped binary plan-shape invariant (left-deep + bushy); `BuildLeft` = PG's commuted inner/outer; why connected graphs never need an avoidable cross product; what PG-shaped binary trees simplify (relid-order canonical layout replacing the remap family) |
+| 03 | [03-join-search-pg-dp.md](03-join-search-pg-dp.md) | the `standard_join_search` analogue: level-indexed joinrel lists, all three `join_search_one_level` phases (clause joins, bushy composite-composite joins, last-ditch), `RelOptInfo` + `add_path`/`set_cheapest` on the existing `path.go` substrate, join methods generated **inside** the search, collapse limits, explicit-JOIN flattening, over-limit fallback |
 | 04 | [04-cost-and-cardinality.md](04-cost-and-cardinality.md) | one cost currency; rows computed once per RelOptInfo; FK-aware join selectivity (the Q9 class-(a) fix); build-side memory realism kept PG-faithful; retirement of the integer heuristic and the ad-hoc quadratic penalty |
-| 05 | [05-executor-pipeline-rework.md](05-executor-pipeline-rework.md) | the fusion-free hash cascade: probe-seam de-materialisation on the legacy Build path, `mergedKeySlot` hoisting, single-pass build, single hash map, multi-column hash keys, compiled key/residual evaluation; the equivalence argument (left-deep cascade ≡ MHJ execution pattern) |
+| 05 | [05-executor-pipeline-rework.md](05-executor-pipeline-rework.md) | the fusion-free hash cascade: probe-seam de-materialisation on the legacy Build path, `mergedKeySlot` hoisting, single-pass build, single hash map, multi-column hash keys, compiled key/residual evaluation; the equivalence argument (any PG-shaped binary cascade ≡ MHJ execution pattern) |
 | 06 | [06-hash-spill-and-memory.md](06-hash-spill-and-memory.md) | PG hybrid hash join: `ExecChooseHashTableSize` analogue, batch partitioning over `spillWriter`, dynamic nbatch growth, work_mem enforcement; what stays deferred (skew optimisation) |
 | 07 | [07-other-join-operators.md](07-other-join-operators.md) | merge join → streaming with duplicate-group buffering; nested loop → streaming outer + Materialize inner; RIGHT/FULL as hash joins with a matched-bitmap (PG `HJ_FILL_INNER`); semi/anti/null-aware; NLI + Memoize as DP paths; parallel interplay |
 | 08 | [08-migration-and-removal.md](08-migration-and-removal.md) | staged rollout behind flags, plan-snapshot re-baselines, deletion inventory for `MultiHashJoin` (28 non-test arms / 15 files) and `fusedHashJoinOp`, rollback story |
@@ -38,11 +38,14 @@ Both workarounds are now dead ends by evidence: MHJ is retired
 (`bushy.go:586`, commit `e85e5347`) and fusion is permanently disabled for
 correctness (`analysis/cost-driven-second-try-200731/evidence/stage2-fusion-verdict.txt`).
 This bundle removes the *cause* instead of re-enabling either workaround: the
-planner enumerates **only left-deep binary trees** through a PG-shaped
-level-wise DP in which every join **method** is a costed path generated inside
-the search (no post-DP method rewrites), and the executor's binary hash join
-is upgraded until a left-deep cascade is executionally identical to what MHJ
-did — N base-relation hash tables built at `Open`, one streaming probe pass,
+planner enumerates **PG-shaped binary trees** — left-deep chains plus the
+bushy composite-composite phase — through a level-wise DP that mirrors PG's
+`join_search_one_level` in all three of its phases (clause joins against
+initial rels, bushy joins of composite rels, and the last-ditch clauseless
+fallback), and in which every join **method** is a costed path generated
+inside the search (no post-DP method rewrites). The executor's binary hash
+join is upgraded until a cascade is executionally identical to what MHJ
+did — N hash tables built at `Open`, one streaming probe pass,
 zero intermediate materialisation — plus PG's hybrid-hash spill so large
 builds degrade gracefully instead of OOMing.
 
@@ -55,9 +58,11 @@ builds degrade gracefully instead of OOMing.
 2. **Rows are computed once** — each `RelOptInfo` carries its row estimate;
    costing never re-walks the plan tree via `EstimateRows`
    ([04](04-cost-and-cardinality.md) §2).
-3. **Plan shape is a contract, not a preference** — left-deep binary is
-   enforced by the enumerator's shape, never by penalty terms in the cost
-   model ([02](02-plan-shape-contract.md) §6).
+3. **Plan shape is a contract, not a preference** — **binary join trees,
+   PG-identical shape**: the enumerator can express exactly the tree shapes
+   PG's `join_search_one_level` can produce (left-deep chains and bushy
+   composite-composite joins), enforced by the enumerator's shape, never by
+   penalty terms in the cost model ([02](02-plan-shape-contract.md) §6).
 4. **Method selection happens inside the search** — a join order is never
    chosen under one method's cost and executed under another's
    ([03](03-join-search-pg-dp.md) §5; this is the doc-12 lesson: "order first,
@@ -70,16 +75,22 @@ builds degrade gracefully instead of OOMing.
    operator, the reference behaviour is the named `postgres/` function, and
    any deliberately skipped piece gets a `.ralph/deferral_ledger.md` row.
 
-## Deliberate divergence from PostgreSQL (read this first)
+## PG fidelity (read this first)
 
-PostgreSQL's `join_search_one_level` **does** consider bushy plans — the
-explicit bushy phase at `postgres/src/backend/optimizer/path/joinrels.c:141`
-joins pairs of composite rels. This bundle deliberately **omits that phase**
-(user directive): goopg enumerates only the clause-join phase against initial
-rels (`make_rels_by_clause_joins`, `joinrels.c:118`), i.e. strictly left-deep
-trees. Everything else follows PG's structure, so re-admitting the bushy
-phase later is a bounded, additive change (one extra loop in
-[03](03-join-search-pg-dp.md) §4.3), not a rewrite. The cost of the
-divergence is bounded and analysed in [02](02-plan-shape-contract.md) §5
-(the Q5 build-side-subjoin case is the known casualty; the measured stake is
-small next to what the executor stages recover).
+PG's `join_search_one_level`
+(`postgres/src/backend/optimizer/path/joinrels.c:73`) has **three phases**:
+(1) clause joins of level-(lev−1) rels against initial rels
+(`make_rels_by_clause_joins`, `joinrels.c:118`, with the per-rel clauseless
+cartesian branch at `joinrels.c:120-137`), (2) **bushy joins** of composite
+rel pairs (k, lev−k) for 2 ≤ k ≤ lev−2, gated on a connecting join clause or
+join-order restriction (`joinrels.c:141-198`), and (3) the last-ditch
+clauseless pass when a level came up empty (`joinrels.c:200-256`). This
+bundle implements **all three phases**, PG-verbatim in structure — the
+search space goopg enumerates is exactly PG's, so any binary tree PG can
+emit, goopg can emit (modulo cost/stats fidelity, measured by the
+[09](09-verification-and-acceptance.md) §4 parity gate). Two deliberate,
+bounded scope choices remain (both recorded in
+[03](03-join-search-pg-dp.md) §4.4): `join_is_legal` constraint inference is
+not implemented in v1, so outer/semi/anti joins stay pinned opaque inputs as
+a *temporary* measure, and GEQO is not ported ([03](03-join-search-pg-dp.md)
+§7) — neither is a shape divergence.

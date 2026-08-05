@@ -16,6 +16,8 @@ package planner
 // startup cost, each within a multiplicative STD_FUZZ_FACTOR (:50) tolerance.
 // add_path (:464) folds in pathkeys, parallel_safe, and required-outer relids.
 
+import "github.com/goopg/goopg/internal/catalog"
+
 // stdFuzzFactor is PG's STD_FUZZ_FACTOR (pathnode.c:50): two costs within 1% are
 // treated as equal, and the tie is broken on the non-cost dimensions. This is the
 // determinism mechanism the integer->float migration needs (design ch. 07 §4).
@@ -69,6 +71,21 @@ type Path struct {
 	Rel  *RelOptInfo
 
 	Cost Cost
+
+	// Rows is THIS path's row count, which is the rel's row count for an
+	// ordinary path and the per-outer-row count for a parameterised one. It is
+	// PG's `path->rows`, and for a parameterised path PG sets it from
+	// `param_info->ppi_rows` (`create_index_path`, pathnode.c) — so Rows is
+	// goopg's `ppiRows` carrier, not a second field (leftdeep-joins 03 §9
+	// rule 3). This is the one structured exception to 04 §2's "rows once per
+	// RelOptInfo": `Rel.Rows` stays canonical for the relation as a whole, and
+	// each parameterisation carries its own count beside it.
+	//
+	// Consequence for costing, and the reason §9 says NLI costing is otherwise
+	// garbage: a join's cost primitives must read the CHILD PATH's Rows, never
+	// `child.Rel.Rows`. An index path parameterised by the outer produces a
+	// handful of rows per probe; charging the rel's full post-filter count for
+	// it would price an NLI as if it re-scanned the whole inner every time.
 	Rows float64
 
 	// Pathkeys is the ordering this path guarantees (design ch. 04). Empty in
@@ -91,6 +108,46 @@ type Path struct {
 	// every ordinary path; non-empty only for an NLI inner index path (C3).
 	RequiredOuter RelSet
 
+	// HashKeys / Residual are this join path's qual placement (leftdeep-joins
+	// 03 §5.4): the equality clauses the operator KEYS on, and the clauses it
+	// must evaluate per tuple. Both are nil for a non-join path. They are
+	// decided once, here in path generation, rather than by a post-hoc pass —
+	// which is what lets the placement be COSTED (a qual deferred to a higher
+	// join is a qual evaluated on more tuples) instead of being invisible to
+	// the search.
+	//
+	// Only a keyed operator (hash, and merge since P5.4c-i) fills HashKeys; a
+	// plain nested loop keys on nothing and carries every clause in Residual.
+	// For a merge join the list is ORDERED: clauses are grouped by the sort key
+	// they serve, in the path's own pathkey order (`joinpathsmerge.go`).
+	// P5.5's createPlan reads the pair to emit the executor Join's key
+	// expressions and its residual predicate.
+	HashKeys []*restrictInfo
+	Residual []*restrictInfo
+
+	// IndexInfo / IndexScanDir are `IndexPath.indexinfo` and
+	// `IndexPath.indexscandir` (pathnodes.h:1845/1849), the two facts
+	// `create_indexscan_plan` needs to re-emit the scan the search chose. They
+	// are set on a `PathIndexScan` and on nothing else: `IndexInfo` is nil and
+	// `IndexScanDir` is `NoMovementScanDirection` — the zero value — for every
+	// other kind, which is why the flat struct can carry them without a second
+	// discriminator. Both are filled through `indexPathOrdering`
+	// (pathindexcarrier.go, M0127-P5.5-a) so the direction can never disagree
+	// with `Pathkeys`. P5.5's createPlan arm reads them.
+	//
+	// IndexClauses is `IndexPath.indexclauses` (pathnodes.h:1846): the quals
+	// pushed INTO the probe, in INDEX-COLUMN order — the order PG's own list is
+	// in (indxpath.c:1042) and the order goopg's executor needs, since
+	// `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Empty on the
+	// unparameterised ordered path, which is pathnodes.h:1817's "an empty list
+	// implies a full index scan" rather than an omission. Built only by
+	// `indexPathClauses` (pathindexclauses.go, M0127-P5.5-b), which is what
+	// makes the ordering structural. P5.5's createPlan arm reads it to build
+	// `Keys` and to drop the pushed clauses from the node's filter quals.
+	IndexInfo    *catalog.Index
+	IndexScanDir ScanDirection
+	IndexClauses []indexPathClause
+
 	Children []*Path
 
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.
@@ -106,16 +163,92 @@ type RelOptInfo struct {
 	Rows   float64
 	Width  int
 
+	// NCols is how many COLUMNS a row of this relation carries. It sits beside
+	// Width (which is bytes) because goopg has two different width models and
+	// they answer two different questions: Width feeds the page math PG feeds
+	// with `pathtarget->width`, while NCols feeds `hashsize.Choose`, whose
+	// per-row footprint is `48·columns` because a goopg hash entry is a []Datum
+	// and not a packed MinimalTuple. Deriving one from the other is not
+	// possible and guessing is not safe — see hashJoinInputs.innerCols.
+	//
+	// Set by the two production constructors (`buildInitialRels` from the
+	// leaf's schema, `makeJoinRel` as the sum over the two inputs, which is
+	// what the executor's Join concatenates). Zero on a rel built by a test
+	// that does not care, which `relNCols` reads as "unknown".
+	NCols int
+
 	Pathlist        []*Path
 	PartialPathlist []*Path
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
+
+	// CheapestParameterized is PG's `cheapest_parameterized_paths`
+	// (pathnode.c:255): every parameterised path that survived the addPath
+	// tournament, with the cheapest UNparameterised path (if any) prepended —
+	// PG's callers find that inclusion more convenient, and the NLI arm of
+	// P5.4b-ii reads exactly this list. Empty until parameterised paths exist.
+	CheapestParameterized []*Path
+
+	// baseLeaf is the executor Node the pre-search pipeline handed
+	// `buildInitialRels` for this FROM item — the search boundary's half of
+	// 03 §10's coordinate map, recording what a base relid MEANS: the relation,
+	// the alias, the output schema and the local quals, all already resolved
+	// (M0127-P5.5-c). Set only on level-1 rels; nil on every join rel. It is
+	// what PG reaches through `RelOptInfo`'s range-table entry and goopg's
+	// search-only rel cannot: `createPlan`'s scan arms re-emit from it
+	// (createplanindex.go), and the index-path producers gate on it through the
+	// same `scanLeafFor` predicate, so a path is never COSTED over a leaf
+	// the builder cannot rebuild.
+	baseLeaf Node
+
+	// baseOffset is WHERE this base relation's columns sat before the search
+	// ran: the index, in the pre-search "binding" coordinate space, of the
+	// leaf's first output column (`rangeBinding.offset`, planner.go:354). It is
+	// `baseLeaf`'s companion and the other half of 03 §10's coordinate map —
+	// `baseLeaf` records what a relid MEANS, `baseOffset` records where it USED
+	// TO BE. Set only on level-1 rels, beside `baseLeaf`, and meaningful only
+	// when that field is non-nil (0 is a legitimate offset for the first FROM
+	// item, so the nil check is the discriminator, not the value).
+	//
+	// Why the search needs it at all: every `restrictInfo.clause` the search
+	// reasons about carries ColumnRefs in exactly this space — `relidsOfExpr`
+	// (joinrestrict.go:357) decides a clause's relset by bucketing each
+	// ColumnRef.Index against the same `cumOffsets` — while the tree
+	// `createPlan` emits is a cost-chosen reordering whose columns sit
+	// somewhere else entirely. A join arm that copied a clause across
+	// unchanged would key on whatever column happened to land at that index.
+	// `outputLayout` (createplanjoin.go) is the per-node translation built
+	// from this field.
+	baseOffset int
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.
 func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 	return &RelOptInfo{Relids: relids, Rows: rows, Width: width}
+}
+
+// relNCols is the column count the hash-join cost model must feed
+// `hashsize.Choose` for this relation (M0127-P5.7-a).
+//
+// It prefers the field the search set, and falls back to the base leaf's own
+// schema — the rel and its leaf cannot disagree about how many columns a scan
+// of it produces, and the fallback keeps a rel constructed without the field
+// (every test that calls newRelOptInfo directly) priced correctly whenever it
+// is a base rel. Zero is returned only when neither is available, and
+// hashJoinCost reads that as "assume no spill", which is what it did before
+// this function existed.
+func relNCols(r *RelOptInfo) int {
+	if r == nil {
+		return 0
+	}
+	if r.NCols > 0 {
+		return r.NCols
+	}
+	if r.baseLeaf != nil {
+		return len(r.baseLeaf.Output())
+	}
+	return 0
 }
 
 // newPrebuiltPath wraps an already-built executor Node as a Path over rel. Cost
@@ -312,19 +445,137 @@ func addToPathlist(list []*Path, newPath *Path) []*Path {
 	return append(survivors, newPath)
 }
 
-// setCheapest reproduces set_cheapest (pathnode.c:272): pick the minimum-total
-// and minimum-startup path for the rel. Ties are broken deterministically by
-// pathlist position (the earliest-added wins), so plan choice is stable across
-// runs.
-func setCheapest(rel *RelOptInfo) {
-	rel.CheapestTotal = nil
-	rel.CheapestStartup = nil
-	for _, p := range rel.Pathlist {
-		if rel.CheapestTotal == nil || p.Cost.Total < rel.CheapestTotal.Cost.Total {
-			rel.CheapestTotal = p
+// costSelector is PG's CostSelector (pathnodes.h): which axis compare_path_costs
+// orders on first.
+type costSelector int
+
+const (
+	totalCost costSelector = iota
+	startupCost
+)
+
+// comparePathCosts is compare_path_costs (pathnode.c:69): an EXACT (unfuzzed)
+// three-way order, unlike comparePathCostsFuzzily above. disabled_nodes trumps
+// all else; then the selected axis; then the other axis as the tie-break.
+//
+// Both comparators exist in PG and they are not interchangeable: add_path uses
+// the fuzzy one so that near-ties are decided on the non-cost dimensions, while
+// set_cheapest uses this exact one so that a genuinely equal cost falls through
+// to the pathkey tie-break rather than being swallowed by the fuzz band.
+func comparePathCosts(p1, p2 *Path, criterion costSelector) int {
+	if p1.DisabledNodes != p2.DisabledNodes {
+		if p1.DisabledNodes < p2.DisabledNodes {
+			return -1
 		}
-		if rel.CheapestStartup == nil || p.Cost.Startup < rel.CheapestStartup.Cost.Startup {
-			rel.CheapestStartup = p
+		return +1
+	}
+	first, second := p1.Cost.Total, p2.Cost.Total
+	tieFirst, tieSecond := p1.Cost.Startup, p2.Cost.Startup
+	if criterion == startupCost {
+		first, second = p1.Cost.Startup, p2.Cost.Startup
+		tieFirst, tieSecond = p1.Cost.Total, p2.Cost.Total
+	}
+	switch {
+	case first < second:
+		return -1
+	case first > second:
+		return +1
+	case tieFirst < tieSecond:
+		return -1
+	case tieFirst > tieSecond:
+		return +1
+	}
+	return 0
+}
+
+// setCheapest reproduces set_cheapest (pathnode.c:272) INCLUDING its
+// parameterisation discipline (leftdeep-joins 03 §9 rule 1), which the previous
+// test-only version did not have:
+//
+//   - CheapestStartup and CheapestTotal are chosen among UNPARAMETERISED paths
+//     only. A parameterised path cannot stand in for the rel in general — it
+//     only produces rows once some particular outer relation supplies its
+//     parameter — so handing one to a join that cannot supply that parameter
+//     produces a plan that cannot be built.
+//   - CheapestTotal falls back to the best (cheapest of the LEAST
+//     parameterised) parameterised path when there is no unparameterised path
+//     at all, since the rel must still have a representative. CheapestStartup
+//     does NOT: PG leaves it nil in that case.
+//   - CheapestParameterized collects every parameterised survivor, with the
+//     cheapest unparameterised path prepended (PG's `lcons`, :375).
+//
+// This ordering is not optional and it is why the discipline lands BEFORE the
+// paths: the moment a RequiredOuter path enters a pathlist, a parameterisation-
+// blind minimum would let it win CheapestTotal and be handed to a join that
+// cannot bind it. The dominance side was already parameterisation-aware
+// (addPath's outerDim) — selection was the only gap.
+//
+// Ties are broken PG's way: on an exactly equal cost the better-sorted path
+// wins (:358-369), and failing that the earliest-added one, so plan choice
+// stays stable across runs.
+//
+// An empty pathlist is where PG elogs "could not devise a query plan"
+// (:282). goopg's callers check that themselves before calling — level 1 in
+// buildInitialRels always adds a path first, and joinSearch rejects an empty
+// joinrel pathlist explicitly (joinsearchlevel.go:110-112) — so this leaves
+// every field nil and lets addPathsToJoinrel's loud nil-cheapest error be the
+// single place the failure is reported.
+func setCheapest(rel *RelOptInfo) {
+	var cheapestStartup, cheapestTotal, bestParam *Path
+	var parameterized []*Path
+
+	for _, path := range rel.Pathlist {
+		if path.RequiredOuter != 0 {
+			parameterized = append(parameterized, path)
+			// Once an unparameterised cheapest-total exists the best
+			// parameterised path is no longer needed (pathnode.c:301-305).
+			if cheapestTotal != nil {
+				continue
+			}
+			if bestParam == nil {
+				bestParam = path
+				continue
+			}
+			// Least parameterised wins; among equal parameterisations, the
+			// cheaper total (pathnode.c:312-334, bms_subset_compare).
+			switch outerDim(path.RequiredOuter, bestParam.RequiredOuter) {
+			case dimEqual:
+				if comparePathCosts(path, bestParam, totalCost) < 0 {
+					bestParam = path
+				}
+			case dimBetter1:
+				bestParam = path
+			default:
+				// dimBetter2: the incumbent is less parameterised, keep it.
+				// dimIncomparable: neither has the least possible
+				// parameterisation for this rel, so PG sits on the old path
+				// until something better comes along (:335-343).
+			}
+			continue
+		}
+
+		if cheapestTotal == nil {
+			cheapestStartup, cheapestTotal = path, path
+			continue
+		}
+		if cmp := comparePathCosts(cheapestStartup, path, startupCost); cmp > 0 ||
+			(cmp == 0 && comparePathkeysDim(cheapestStartup.Pathkeys, path.Pathkeys) == dimBetter2) {
+			cheapestStartup = path
+		}
+		if cmp := comparePathCosts(cheapestTotal, path, totalCost); cmp > 0 ||
+			(cmp == 0 && comparePathkeysDim(cheapestTotal.Pathkeys, path.Pathkeys) == dimBetter2) {
+			cheapestTotal = path
 		}
 	}
+
+	if cheapestTotal != nil {
+		// PG prepends, so the list stays "cheapest unparameterised first".
+		parameterized = append([]*Path{cheapestTotal}, parameterized...)
+	} else {
+		cheapestTotal = bestParam
+	}
+
+	rel.CheapestStartup = cheapestStartup
+	rel.CheapestTotal = cheapestTotal
+	rel.CheapestParameterized = parameterized
 }

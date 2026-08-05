@@ -1,0 +1,6 @@
+# arm:      after3
+# binary:   /home/ryo/work/goopg/goopg/tmp/goopg-0047-after
+# bin-sha:  54c053ddac78fca0
+# captured: 2026-08-03T10:25:33+09:00
+# note:     GOOPG_RELSIZE_FALLBACK left UNSET — since M0125-0005 the
+#           default IS stage 2, so unset is the shipped planner.

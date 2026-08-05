@@ -7,9 +7,12 @@ the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
 `docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
 ahead of M0123 and every other milestone. **Amended 2026-07-31 (USER): M0126 —
 cost-driven planning made production-viable — is inserted directly after M0125,
-so the head of the roadmap is M0124 → M0125 → M0126.** **M-NIGHTLY no longer
+so the head of the roadmap is M0124 → M0125 → M0126.** **Amended 2026-08-03:
+M0126 is CLOSED as a documented no-go (milestone-terminal); M0127 — PG-shaped
+join search — is filed as its successor and inserted directly after M0125, so
+the head of the roadmap is M0124 → M0125 → M0127.** **M-NIGHTLY no longer
 preempts it (amended 2026-07-28): nightly items are still FILED every loop, but
-they are not SELECTED until M0124, M0125 and (since 2026-07-31) M0126 close.** This banner is the sole ordering
+they are not SELECTED until M0124, M0125 and (since 2026-08-03) M0127 close.** This banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
 
@@ -75,6 +78,30 @@ started.
 > list is the `## M0126` section near the bottom of this file. It is **not**
 > selected while any M0125 item is open. The numbered list below is unchanged
 > and kept as filed; read it with this amendment applied.
+>
+> **⚡ AMENDED 2026-08-03 (filed by the panel / USER directive 2026-08-02,
+> amended 2026-08-03) — M0127 IS INSERTED BETWEEN M0125 AND THE M-NIGHTLY
+> BACKLOG; M0126 IS CLOSED.** The order below is amended to read: WIP recovery
+> (#1) → **M0124** (#2, closed) → **M0125** (#3) → **M0127** (#4, NEW) →
+> M-NIGHTLY backlog (#5) → M0123 (#6). **M0126 — cost-driven planning made
+> production-viable — is TERMINAL as of 2026-08-03** (documented no-go,
+> `evidence/acceptance-run-2.txt`; all 13 tasks `[x]`). **M0127 — PG-shaped
+> join search** turns the `docs/design/leftdeep-joins/` design bundle (the
+> M0126-0013 successor) into shipped behaviour: the executor stages S0–S4
+> (seam de-materialisation, multi-column keys retiring
+> `reselectDegenerateHashKeys`, hybrid-hash spill, streaming merge/outer-fill/
+> Materialize) land first on the current planner's output, then the PG-shaped
+> three-phase DP (`GOOPG_PGSHAPED_DP`, replacing `GOOPG_COST_DRIVEN_JOINORDER`)
+> at S5, compiled key/residual eval at S6, and the S7 deletion of
+> `MultiHashJoin` + fusion + the old subset-bitmask DP. Milestone doc
+> `docs/milestones/0127-pg-shaped-join-search.md`; implementation plan
+> `docs/design/0127-pg-shaped-join-search.md`; the task list is the
+> `## M0127` section below the M0126 section. It is **not** selected while any
+> open M0125 item that M0127 needs first is open (exprwalk commits 5–8 =
+> M0125-0002, M0125-0047, M0125-0013; M0125-0040 ROLLUP is an independent
+> track outside the M0127 bundle, not a prerequisite). The M0125 items marked
+> numbered list below is unchanged and kept as filed; read it with this
+> amendment applied.
 >
 > 1. **WIP recovery** — one-time; restore & resolve any pre-switch WIP (the
 >    "WIP recovery" item directly under this banner) before anything else, never
@@ -511,6 +538,36 @@ started.
 >       row counts anchored. **NEXT SELECTION: `M0125-0038` (the last
 >       open M0125 task), then M0125 closes and M0126 (cost-driven
 >       planning) is next per the 2026-07-31 USER amendment.**
+>       **↳ SUPERSEDED 2026-08-03 (loop #40). `M0125-0038` IS `[x]`, and
+>       M0126 IS CLOSED (terminal no-go) — read the 2026-08-03 amendment at
+>       the head of this banner, not this line. `M0125-0002` (loop #39) and
+>       `M0125-0047` (loop #40) are both discharged, so of the three M0125
+>       items M0127 waits on, exactly one remains: `M0125-0013`'s
+>       BOOKKEEPING half (Q47's 8.4x runtime verdict — a documentation
+>       contradiction between `RESULTS.md` chunk 49-56 / the RC-1b ledger row
+>       and `analysis/tpcds-sf1-goopg-20260728.md` §3.2/§6, not engine work).
+>       **↳ SUPERSEDED 2026-08-03 (loop #41): `M0125-0013`'s bookkeeping half
+>       IS `[x]`.** All three M0125 items M0127 waited on are discharged, so
+>       **M0127 IS NOW OPEN and is the NEXT SELECTION.** Two facts it inherits:
+>       Q47 is measured at **537.55 s vs PG 3.38 s (159×)** with a
+>       byte-identical answer, and ~485 s of that is one self-join whose hash
+>       key degenerates to `i_category` (10 distinct over 63,745 rows, vs 5,667
+>       for the 4-key composite PG merge-joins on) — i.e. the single-key hash
+>       deferral `M0125-0011`/`M0125-0035` is worth far more than those rows
+>       implied, and Q47 is its sharpest witness.
+>       ~~**NEXT SELECTION: `M0125-0013` (bookkeeping half) — it NEEDS A QUIET
+>       HOST** (`pgrep -af run-nightly.sh` first; every timing taken on
+>       2026-07-30 was under the nightly batch at load ~10), **then M0127
+>       opens.**~~ `M0125-0040` (ROLLUP) is an independent track OUTSIDE the
+>       M0127 bundle and is explicitly not a prerequisite; the other open
+>       M0125 items (`-0003` stage 3, `-0031`, `-0032`, `-0033`, `-0037`,
+>       `-0041`) are likewise not on M0127's waiting list — `-0032` (Q21) was
+>       absorbed INTO M0127-P3.2. One instrument fact `M0125-0047` leaves for
+>       M0127: the plan-snapshot nondeterminism floor that made every
+>       single-sweep A/B suspect is now MEASURED AT ZERO for the join-order
+>       passes (3 restarts x 96 SF0.5 queries byte-identical), and the fix
+>       converges on the plans the baselines already hold, so no baseline
+>       needs re-pinning.**
 >       ~~its classification is now
 >       the ONLY path to goal (a), it is host-independent, and it should absorb
 >       Q18 (-0033) and TPC-H Q21 (-0032) into its capture set so one taxonomy
@@ -596,6 +653,11 @@ started.
 > itself parked below M0125. Order: M0124 → M0125 → **M0126** → M-NIGHTLY →
 > M0123. M0123 keeps its own branch (`wal-pg-nodetree`)
 > and resumes there once this line is closed.
+> **AMENDED 2026-08-03:** M0126 is closed (documented no-go); every other
+> roadmap milestone — M0123 included — is parked below **M0127**, and M0127 is
+> itself parked below M0125. Order: M0124 → M0125 → **M0127** → M-NIGHTLY →
+> M0123. M0123 keeps its own branch (`wal-pg-nodetree`) and resumes there once
+> this line is closed.
 >
 > Dependencies, stated narrowly: **M0124-0002 gates M0125-0002/-0004 and the
 > measurement half of M0125-0003** (it produces the plan snapshot they diff
@@ -631,7 +693,10 @@ started.
 > The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
 > M0123 is complete.
 
-Work order: **M0124 → M0125 → M0126** (this directive as amended 2026-07-31),
+Work order: **M0124 → M0125 → M0126 → M0127** (this directive as amended
+2026-07-31; M0126 closed 2026-08-03, M0127 filed as its successor per the
+2026-08-03 amendment — M0127 is selected after the M0125 items it needs are
+closed, and M0126 contributes nothing further),
 then **M0123**, then the
 pre-existing line — **M0117 → M0118** (both complete + archived), then resume
 **M0110** (its **M0119-0004/0005/0006/0007** spinoffs are the active,
@@ -1028,7 +1093,9 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED** — the root-0030
       fix (checked item above) did not hold: FAILed in nightly runs 20260801,
       `20260802-014405`, and `20260803-013955`
-      (AI-20260802-014405-001, AI-20260803-013955-003; repro:
+      (AI-20260802-014405-001, AI-20260803-013955-003,
+      AI-20260804-005028-001, AI-20260805-014309-001 — five nights running;
+      repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`).
       **VERIFIED FAILING AT HEAD `e13d6c6f` in isolation (2026-08-02 loop #31,
@@ -1044,8 +1111,9 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       portals_p2,prepare,select,select_into,text,union,varchar} — 15 baseline-pass
       cases diverged in ONE night, all "output mismatch; normalization rules
       need extension"** (AI-20260802-014405-002..-016, all first-seen 20260802;
-      recurred 20260803 as AI-20260803-013955-004..-018 — the SAME 15 subjects,
-      again alongside the suite-wedge below;
+      recurred 20260803 as AI-20260803-013955-004..-018 and again 20260804 as
+      AI-20260804-005028-002..-016 — the SAME 15 subjects three nights running,
+      each time alongside the suite-wedge below;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). **Six sampled
       cases (btree_index, char, int2, select, text, union) PASS in ISOLATION at
       HEAD `e13d6c6f` (2026-08-02 loop #31, 3.2 s total)** — so this is almost
@@ -1059,7 +1127,8 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
-      AI-20260803-013955-019, same 3 cases aggregates/jsonb/misc; repro:
+      AI-20260803-013955-019 and 20260804 as AI-20260804-005028-017, same 3
+      cases aggregates/jsonb/misc every time; repro:
       `go test -v -run 'TestPort_RegressSuite/aggregates' ./internal/testport/`;
       evidence `ci/logs/20260802-014405/testport/go-test.log`). Output truncated
       ⇒ NOT an output divergence — investigate what wedged the cluster at
@@ -1070,7 +1139,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
-- [ ] **units/internal/executor + race/internal/executor — REOPENED, new causes**
+- [x] **units/internal/executor + race/internal/executor — REOPENED, new causes**
       — both lanes failed in nightly `20260803-013955` at sha `1a589c23`
       (AI-20260803-013955-001/-002, both first-seen tonight; evidence
       `ci/logs/20260803-013955/{units,race}/go-test.log`). Triaged 2026-08-03
@@ -1098,6 +1167,54 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       fixed the nightly race lane stays red every night. FILED, NOT SELECTED
       per the 2026-07-28(b) amendment — the race lane is not on the banner's
       carve-out gate list and units/tpch-spotcheck/SF0.5 all pass at HEAD.
+      **↳ (b) FIXED 2026-08-03 by M0127-P1.2** (whose own bar is RACE, and
+      which could not be met while this was red — the item was reached as
+      P1.2's blocker, not selected out of order). **The "NOT a quick patch"
+      prediction was wrong, and why is worth keeping:** the global never
+      needed to survive the recursion. `buildWithEnv` sets it at the top of
+      the switch and the ONLY read in that function is the `*planner.Join`
+      arm's `tryFuseHashCascade`, which runs before any recursive `Build`
+      could overwrite it — so the value read was always the one this very
+      invocation stored, i.e. already a local in disguise. Making it an actual
+      local (`executor.go`) is behaviour-identical and removes the sharing.
+      The second read, `buildRec`'s Join arm, is now the explicit nil field
+      `opTreeSlab.env`: `BuildFast` is a top-level entry (dispatch's
+      simple-query path) with no `buildWithEnv` frame above it, so the global
+      it used to read there was ALWAYS nil — fusion has never been reachable
+      from the slab path, only from the extended-protocol `executor.Build`
+      one. `make race-gate` now passes end-to-end (EXIT=0, all packages),
+      first time since M0126-0006 landed. Nightly's race lane should clear on
+      the next run; item (a) remains stale-only.
+      **CHECKED OFF 2026-08-03 (M0127-P3.2 loop).** Both causes are discharged
+      and re-confirmed at HEAD by that task's own bar: UNITS green (item (a)'s
+      `TestMHJParallelNoDuplicates` fixed by `4fb87456`) and `make race-gate`
+      green across every package (item (b)). Left for the next nightly run to
+      confirm from its own log.
+
+### Nightly run 20260805-014309 (2 items, sha `ce027cee` — status fail)
+
+**The run shrank 17 → 2.** The 15 `regress/*` "output mismatch" subjects and the
+`regress/suite-wedge` item filed for 20260802/03/04 are ABSENT tonight, which is
+the first independent evidence for the phantom-divergence-downstream-of-the-wedge
+reading recorded above (they were never 15 regressions). Their tasks stay open —
+one clean night is not a fix — but do not re-file them per night.
+
+- [x] **pgbench/nightly — recurrence of the documented non-FIFO tuple-lock tail**
+      (AI-20260805-014309-002, first-seen tonight; evidence
+      `ci/logs/20260805-014309/pgbench/pgbench.log`). **1 failed transaction**,
+      same signature as the closed 20260720 item above: `client 61 script 0
+      aborted in command 4 query 0: ERROR: current transaction is aborted,
+      commands ignored`. Command 4 is TPC-B's `UPDATE pgbench_branches`; 100
+      clients contend 50 branch rows and goopg raises instead of queuing —
+      `goopg_dml_conflict_no_fifo_tuple_lock` / deferral row 0021-0012 (route
+      tuple locks through `tableLockMgr` for FIFO waits). Checked off as a
+      recurrence, not new work: 1 aborted txn is a *smaller* tail than the
+      4/19.5M already triaged, the error string and command index are identical,
+      and the fix is the existing ledger row, not a new task. Re-open only if a
+      night shows a different command index or a non-abort error class.
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001)** —
+      fifth consecutive night; already tracked by the REOPENED item above, which
+      now carries this run's id. No separate task.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -2065,7 +2182,15 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Q72's unexplained 13 % and Q35's non-fix; a third records that the TPC-H
       harnesses still stamp no planner flags.
       **Still owed, which is why this box is unchecked:** stage 3
-      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms. The
+      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms.
+      **Re-scope note 2026-08-03 (M0127):** do NOT land stage 3 into the old
+      DP before checking it against M0127's P5.1/P5.6 — the new search
+      computes base rows once per `RelOptInfo` (`leftdeep-joins` 04 §2) and
+      P5.1's `buildInitialRels` redefines where the fallback feeds; the
+      fallback's documented role is an S-cold safety net (inert warm by its
+      `RowCount > 0` early return), and stage 3's consumer may be superseded
+      by the rows-once design rather than extended. Re-evaluate at M0127-P5.1.
+      The
       flag accepts `3` today and yields stage-2 behavior. **`M0125-0005`'s
       evidence is now COMPLETE in both benchmark families and both recommend the
       flip** — it is the next selection, and its commit must name Q72's 1.13× as
@@ -2108,8 +2233,17 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       reads `Stats.RowCount` directly (`internal/catalog/catalog.go:6946`) and
       CANNOT be fixed here. Phase 6.2 out of scope (B3: does not fix Q64 alone).
       Design `docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md`.
-- [ ] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
-      #4, phase 2.2).
+- [x] **M0125-0002 — convert the seven remaining walkers, one per commit** (§13.5
+      #4, phase 2.2). **CLOSED 2026-08-03 — all eight walkers converted in seven
+      commits; see COMMIT 7 below.**
+      **↳ M0127 PREREQUISITE (2026-08-03): commits 5–8 are the walker
+      stabilisation M0127's qual plumbing builds on.** The M0127 banner lists
+      this item among the four M0125 items M0127 waits on, and M0127-P5.2
+      (restrictInfo + `hasRelevantJoinClause`) is specified as the first live
+      consumer of the exprwalk primitives. Commits 1–4 are landed; keep the
+      commit 5 (`exprSide`) → 6 (`conjunctIsLocalEligible` +
+      `localizeExprToLeaf`) → 7 (`visitColumnRefsByName`) order, with the
+      full timed run + SF0.5 sweep on any hunk.
       **STEP 0 DONE 2026-07-30 — the inventory is re-derived from source and now
       gate-pinned**, which M0125-0001's execution record required before any
       conversion ("§0 says fourteen, §13.4 says seven, and neither figure has
@@ -2273,9 +2407,168 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       — surfaced as a probe-arm-only EXPLAIN diff, confirmed by 3
       restarts of the same after-binary (2 runs cd2-first, 1 run
       cd1-first). Evidence `analysis/m0125-0002-c4-plans-20260803/`.
-      **Next in THIS task is commit 5 (`exprSide`) — decides which side a
-      conjunct is pushed to; expect hunks and carry the full timed run +
-      SF0.5 sweep on any hunk.**
+      **COMMIT 5 of 8 DONE 2026-08-03 — `exprSide` re-based onto
+      `walkExprRefs` (`scopeVeto`; unknown stays `sideMixed`, NOT a panic —
+      this walker has always failed CLOSED, so a decline costs an
+      optimisation, never a wrong answer), and D2 row 5's "expect hunks"
+      prediction is REFUTED by measurement.** The instrument had to be
+      extended first: `exprSide`'s ONLY caller is `splitEqualityForHash`,
+      and **goopg's EXPLAIN never prints hash keys** (`grep -c 'Hash Cond'`
+      = 0 over all 22 TPC-H + 96 SF0.5 plans), so a change in WHICH conjunct
+      becomes `LeftKey`/`RightKey` is invisible to a plan A/B unless it also
+      flips the printed algorithm — commit 3's hole in a new place. A
+      divergence probe on the CONSUMER (both `exprSide` bodies computing
+      `splitEqualityForHash`'s `(leftKey, rightKey, ok)` triple, live path
+      keeping the OLD answer) logged **0 `C5DELTA` / 0 `C5SIDE` over 232
+      calls** (223 TPC-DS + 9 TPC-H) — the COMPLETE live decision population,
+      not a sample, with a `C5CALL` positive control so the zero cannot be
+      vacuous. TPC-H A/B 22/22 byte-identical (before arm re-derived
+      `m0125-0002-c4-after.txt` byte-for-byte); SF0.5 EXPLAIN A/B 96/96.
+      **`M0125-0047` fired on its first use and the protocol held:** the lone
+      differing SF0.5 cell was q85's `cd1`/`cd2` alias tie-swap; the before
+      binary restarted 3× and the after binary restarted 4× produced
+      byte-identical plans (md5 `b1bc99cf`), so the captured before-arm was
+      the outlier and the hunk is instrument noise. Census pin DEMOTED, not
+      deleted (RC-1a 47 → 46) — a two-arm dispatch survives in the `Visit`
+      closure. `expr_side_arms_test.go` pins newly-classified containers (one
+      case per kind), row-independent leaves (`ExecParamRef`/`TableOidExpr`/
+      `Merge*` join the ParamRef class), every preserved arm, both classes of
+      preserved decline (`scopeVeto` on inner plans — a one-sided `Args` must
+      NOT rescue a `SubqueryExpr` — plus the explicit `*OuterColumnRef` /
+      `*CTIDExpr` vetoes, which a completeness-driven conversion would have
+      ADMITTED since `exprChildSlots` correctly calls both childless leaves),
+      the fail-closed unknown, and the headline semantic pin: `(l IS NULL) = r`
+      now yields a hash key pair instead of being stranded on the NL path.
+      Timed TPC-H run + SF0.5 answer sweep skipped (ledger row; zero hunks +
+      zero-delta probe over the complete consumer population, and the walker
+      is read-only returning an enum). Evidence
+      `analysis/m0125-0002-c5-plans-20260803/`.
+      **COMMIT 6 of 8 DONE 2026-08-03 — the PAIR: `conjunctIsLocalEligible`
+      re-based onto `walkExprRefs` and `localizeExprToLeaf` onto
+      `cloneExprRefs` (both `scopeVeto`), and D2 row 6's shape-move
+      prediction is REFUTED by measurement.** One commit because
+      `partitionConjunctsForJoinPlanning` MOVES an eligible conjunct out of
+      `joinConjuncts`, so the producer's admission is a promise the consumer
+      can rebase it — split, the window is a dropped or mis-indexed
+      predicate. Unknown handling is deliberately ASYMMETRIC: the producer
+      declines (a decline costs an optimisation, never a wrong answer —
+      commit 5's treatment, not commit 3/4's panic), the consumer PANICS (it
+      cannot decline; the conjunct has already left `joinConjuncts`).
+      **The latent defect closed:** `WHERE t.a IS NULL` on a binding with
+      `offset > 0` under `shouldAttachBeforeMHJ` was judged eligible by a
+      walk that produced ZERO callbacks (the 9-arm switch never descended
+      `*IsNullExpr`), moved into `locals`, then returned UN-REBASED by a
+      consumer whose trailing pass-through ("Constants … no ColumnRef")
+      covered 7 of 32 kinds — a leaf `Filter` carrying FROM-cumulative
+      indices, i.e. **the wrong column**. Commit 4 widened its reachability
+      (a complete `tableForCol` attributes `t.a IS NULL` to a binding where
+      the old one answered −1) rather than creating it. Measurement: TPC-H
+      A/B **22/22 byte-identical** (before arm re-derived
+      `m0125-0002-c5-after.txt` byte-for-byte — the instrument is stable
+      across loops), SF0.5 EXPLAIN A/B **96/96**, and a divergence probe on
+      BOTH functions at ALL THREE live call sites logged **0 `C6ELIG` / 0
+      `C6LOC` / 0 `C6ABORT` over 277 eligibility + 175 localization calls**
+      across 118 planned queries, with `C6CALL`/`C6LOCC` positive controls.
+      The probe was mandatory: eligibility IS visible in the plan text (a
+      leaf `Filter` appears/disappears) but the `Index` rebase is NOT
+      (M0125-0042 — EXPLAIN prints names), so the probe compares localized
+      trees by `exprIdentityKey`, which includes `Index`. Commit 2's
+      metadata-loss class cannot arise — `shallowCloneExpr` is a whole-struct
+      copy. **Census pins moved BOTH ways in one commit, a series first:**
+      `conjunctIsLocalEligible` DEMOTED (its veto dispatch survives in the
+      `Visit` closure), `localizeExprToLeaf` DELETED (no switch survives);
+      RC-1a 46 → 45. 48 new pin subtests in
+      `local_filter_arms_test.go`, each proved to FAIL against the old
+      bodies first, including `TestLeafLocalPairAgreesOnEveryExprKind` —
+      the pair invariant over all 32 kinds, which is what makes the
+      consumer's panic unreachable by construction rather than by argument.
+      **Ledger rows: (a)** the timed TPC-H run + SF0.5 answer sweep were
+      skipped a fourth time, and the per-commit obligation is CONVERTED into
+      one cumulative timed run owed at **commit 8** (covering commits 2–8 as
+      a block; it reverts to per-commit if commit 7 moves a plan) — commit 5
+      declared them mandatory here on the premise that the fail-open would
+      remove predicates, and the measurement discharged the premise;
+      **(b)** goopg's now-total decline of subquery-bearing conjuncts is
+      broader than PG, which places a SubPlan-bearing qual at a baserel by
+      relid set (`initsplan.c: distribute_qual_to_rels`) and refuses
+      subplans only for pushdown INTO a subquery RTE (`allpaths.c:3934`,
+      `qual_is_pushdown_safe`). Evidence
+      `analysis/m0125-0002-c6-plans-20260803/` (incl. `probe-source.md`).
+      **COMMIT 7 of 8 DONE 2026-08-03 — `visitColumnRefsByName` re-based onto
+      `walkExprRefs` (`scopeSignal`), and D2 row 7's "largest and least
+      predictable effect" is REFUTED: no plan moved on either benchmark.**
+      This is the commit that CHANGED A SIGNATURE rather than an arm set. Its
+      three consumers — `extraInScans`, `allColumnRefNamesInScope`,
+      `pushOuterQualsIntoLaterals` — never read the callback stream; each seeds
+      a verdict `true` and falsifies it only from inside the callback, so a
+      conjunct built entirely from unenumerated kinds produced ZERO callbacks
+      and returned a vacuous `true`. For `extraInScans` that is an ADMISSION,
+      not a missed optimisation: the conjunct is captured into
+      `MultiHashJoin.Filters` and evaluated on the MHJ output row. The walker
+      now returns whether the name test COVERED the expression, and D3's
+      inversion is `return total && allMatched`. **"Opaque" is wider than D3's
+      inner plans, and that widening is this commit's design decision:** a name
+      test cannot certify anything that reads row data WITHOUT NAMING the
+      column it reads, so `*OuterColumnRef` (names a different scope),
+      `*CTIDExpr` (`seqScanOp` injects the scanned row's block/offset),
+      `*MergeWholeRowRef` (composite from ctx) and an empty-`Name` `*ColumnRef`
+      (`Name` is "for diagnostics" and IS empty on some construction paths —
+      the old body skipped those silently) clear `total` alongside the scope
+      crossing and the unknown type. `*ParamRef`/`*ExecParamRef`/
+      `*TableOidExpr`/`*MergeActionExpr` stay total: they read no row column.
+      **`pushOuterQualsIntoLaterals` now takes TWO escapes that must not be
+      merged** — its existing `!allIn && len(leftNames) > 0` means "cannot
+      enumerate the NODE's columns" and falls back on the index verdict;
+      `!total` means "cannot enumerate the CONJUNCT", where that fallback is
+      worthless (`classifyConjunctSide` rides `walkColumnRefsImpl`, which has no
+      `default:` either, so an unenumerated kind is invisible to BOTH tests and
+      a conjunct wrapping an `*ArraySubqueryExpr` reads as conclusively
+      `sideLeft` on its other operand alone).
+      **Measurement, and it took four sweeps instead of two.** TPC-H A/B
+      **22/22 byte-identical** AND byte-identical against `post-mhj-retire` —
+      so the CUMULATIVE TPC-H diff across commits 1–7 is empty, not just this
+      one's. SF0.5 EXPLAIN A/B first read 95/96 with TPC-DS **Q85** swapping its
+      two `customer_demographics` aliases between join positions of identical
+      cost; **that hunk is the INSTRUMENT, not the change**: `before` vs
+      `before2` = 96/96, `after2` vs `before` = 96/96, `after2` vs `after` =
+      95/96 differing only at Q85 (the same binary produced both orderings),
+      three fresh single-query starts per binary gave the same ordering all six
+      times, and the divergence probe logged **0 verdict deltas** at all three
+      call sites while planning Q85. This is `M0125-0047` measured properly, and
+      it carries a consequence worth more than the commit: **the plan-snapshot
+      instrument accepted commits 2–6 on a SINGLE sweep per arm and has an
+      unquantified nondeterminism floor** — ledger row, with "sweep 3× on one
+      binary and diff pairwise" as the resume point.
+      **Census pin DEMOTED** (the three-arm veto survives in the `Visit`
+      closure); RC-1a 45 → 44. 18 pins in `visit_refs_byname_arms_test.go`,
+      each proved to FAIL against the old body first — by reproducing that body
+      under `_c7old` names, because the signature change means the pins cannot
+      be COMPILED against the pre-conversion source the way commits 3–6 were.
+      **Ledger rows: (a)** the cumulative timed TPC-H execution power run that
+      commit 6 scheduled for exactly this commit was NOT run; a planning-time
+      A/B was run instead (22 queries × 5 `EXPLAIN` sweeps in one session with
+      `\timing`: 4.41 → 4.54 ms, ~6 µs/query, within-arm spread wider than the
+      between-arm delta) because the plan set is byte-identical and what the
+      conversions actually changed is planning cost, which an execution run
+      would bury under 20-minute scans — execution arm owed at milestone close;
+      **(b)** the Q85 instrument finding above; **(c)** the whole name-matching
+      scope test is a goopg-only construct — PG carries `Relids` bitmapsets and
+      answers containment with `bms_is_subset` (`initsplan.c:
+      distribute_qual_to_rels`), which is immune to BOTH fail-opens goopg's
+      version has, including a same-column-name-in-two-tables one that no pin
+      here closes and that TPC-H's `p_`/`ps_` prefixes hide. Evidence
+      `analysis/m0125-0002-c7-plans-20260803/`.
+      **THE SERIES IS COMPLETE**: all eight walkers named in §2 are on the
+      exprwalk primitives, RC-1a's pinned population is 50 → 44, and M0127-P5.2
+      has the stable base it waits on.
+      ~~**Next in THIS task is commit 7 of 8 (`visitColumnRefsByName`) — the
+      LAST and largest, and the one D2 row 7 names as the least predictable:
+      its consumer `extraInScans` starts `allMatched := true` and only
+      falsifies from inside the callback, so completing it removes conjuncts
+      from `MultiHashJoin.Filters` directly. D3 predetermines its policy:
+      plan slots SIGNAL, and the caller must treat "an opaque child exists"
+      as NOT matched, inverting today's vacuous `true`. Assume the timed run
+      + SF0.5 answer sweep are owed until the diff proves empty.**~~
       Original scope follows. `visitColumnRefsForTable` (`bushy.go:415`),
       `visitColumnRefsByName` (`:1653`), `visitColumnRefs` (`:2932`),
       `conjunctIsLocalEligible` (`local_filters.go:89`), `localizeExprToLeaf`
@@ -3335,8 +3628,51 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       **STILL OPEN, split out as bookkeeping:** the STEP-0 runtime verdict
       (set A `OK 17 s` → HEAD `OK 142 s`) — no timing on this host can settle
       it, see the 2026-07-30 ledger row. Original text follows.
+      **↳ M0127 PREREQUISITE (2026-08-03): this verdict must be recorded
+      BEFORE M0127's plan-shape changes land.** The item itself warns the
+      EXPLAIN diff vs set A is only interpretable while the plan is unchanged,
+      and M0127 P5 re-plans every query — take the quiet-host reading before
+      M0127-P5.1 starts. It is bookkeeping, not engine work, and is one of the
+      four M0125 items the M0127 banner waits on (exprwalk commits 5–8,
+      -0047, -0040, -0013).
 
-- [ ] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
+- [x] **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict** —
+      **DONE 2026-08-03, SETTLED BY MEASUREMENT.** Quiet host verified
+      (`pgrep -af run-nightly.sh` empty, load 0.28–1.21 vs the load ~10 every
+      2026-07-30 timing was taken under), HEAD `374dc60e`, both engines back to
+      back. Evidence `analysis/m0125-0013-q47-verdict/`.
+      **By-value acceptance MET**: Q47 = **100 rows, byte-identical to PG** at
+      SF=1. **Runtime: goopg 537.55 s vs PG 3.38 s = 159×** — so the 142 s this
+      item argues about is itself superseded (and the SF0.5 `TIMEOUT` sighting
+      is explained, not anomalous).
+      **Both primary sources are REFUTED, in opposite directions.** `RESULTS.md`
+      chunk 49–56's *"the 8.4× is the expected cost of real work, Q47 is NOT a
+      regression"* cannot survive a 3.4 s PG reading — and neither can the
+      `tpcds-round2 RC-1b` ledger row's *"(14s->143s confirms real work)"* it
+      cites; the merged deliverable's §3.2 had the right **direction** for a
+      since-falsified **reason** ("the row count did not move" — it moved to 100
+      and the query got *slower*), and §6 item 2's "bounded but unattributed" is
+      wrong on both words. Verdicts written into all four documents (both
+      analysis reports, design doc § Q47, `docs/design/README.md`); the two
+      refuted ledger rows are marked in place.
+      **The runtime is ATTRIBUTED and needs no Q47-specific task.** The CTE is
+      neither the cost nor recomputed (`cteScanOp.Open` keys `ctx.CTERowCache`
+      on the CTE *name*, so `v1`/`v1_lag`/`v1_lead` share one evaluation even
+      though EXPLAIN renders the body 3×; standalone **52.28 s / 63,745 rows**),
+      leaving ~485 s in the `v2` three-way self-join — whose hash key degenerates
+      to `i_category` because `splitEqualityForHash` returns only the FIRST
+      disjoint equality. Measured over v1: `i_category` **10** distinct,
+      `i_brand` 704, `s_store_name` 6, `s_company_name` **1**, vs **5,667** for
+      the 4-key composite PG merge-joins on = a **~567× over-scan per probe**,
+      twice. That is the pre-existing single-`LeftKey`/`RightKey` deferral
+      (ledger `M0125-0011` / `M0125-0035`), **not** an RC-1b regression: RC-1b
+      only made an already-defective join *reachable*, which is why runtime went
+      17 s (empty) → 142 s (partial) → 537 s (fully correct) as the answer
+      improved. **Q47 is now the sharpest known benchmark witness for that
+      deferral** — hand it to M0127/M0125-0035, not to a new task.
+      Anchor **`Q47,100,pinned` ADDED** to `ci/batch/tpcds-row-anchors.csv`.
+      *(Original task text below.)*
+      **M0125-0013 (bookkeeping half) — Q47's 8.4x runtime verdict**
       (ledger rows `tpcds-round2 q47-q49-q51` 2026-07-29 and M0125-0013
       2026-07-30; §13.4 item 2). The ROW defect is closed — Q47 returns 100
       rows = oracle as of 2026-07-30. What remains is purely a documentation
@@ -3774,6 +4110,13 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
 
 - [ ] **M0125-0031 — the warm-stats planning line: eliminate the TPC-DS
       timeout class, then optimize and stabilize TPC-H/TPC-DS runtimes**
+      **[→ M0127: absorbed 2026-08-03]** — both remaining motions (goal (a)'s
+      outcome, goal (b)'s fixes) are M0127's own acceptance bar: timeout-class
+      elimination and the Q3/Q10/Q18/Q7/Q9/Q21 recoveries are the S1/S3/S5
+      exit gates of `docs/design/leftdeep-joins/` (09 §2-§3; 01 §6), so this
+      umbrella closes by reference when M0127-P1.3/P3.5/P5.9 land. Keep this
+      box unchecked as the standing record; do not select it as a standalone
+      repair track. (Historical motions below are discharged as recorded.)
       (USER DIRECTIVE 2026-07-30(b), item 4 of 4; **GATED on -0028 … -0030**;
       design `docs/design/0125-0028-warm-stats-programme.md` §-0031). Goal
       state per the directive, under the warm-statistics premise -0030
@@ -3845,7 +4188,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       motions are now discharged; what remains under this umbrella is repair.
 
 - [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
-      cardinality regimes** (filed 2026-07-30 by M0125-0031's first motion;
+      cardinality regimes** **[→ M0127: absorbed 2026-08-03]** — Q21's
+      completion is M0127's S3 exit gate by name (`leftdeep-joins` 06:
+      hybrid-hash spill; 09 §2: "Q21 completes at SF1 under the standard
+      cgroup cap") and clause 1 of the S5 acceptance bar (22/22 complete,
+      09 §3); 01 §6(3) counts "Q21 stops OOMing at SF1 without MHJ" among the
+      bundle's recovery set. The plain-EXPLAIN classification this item asks
+      for is a useful P3 prerequisite, not a standalone fix track — fold it
+      into M0127-P3.2's design loop. (filed 2026-07-30 by M0125-0031's first motion;
       evidence `analysis/m0125-0031-warm-tpch-20260730.md` §4; nightly keeps
       confirming: `tpch/Q21-timeout` AI-20260802-014405-018, also failed the
       previous run, and again 20260803 as AI-20260803-013955-020 — same
@@ -3865,7 +4215,14 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       instance of the same question its capture asks of the 16 TPC-DS members,
       and one shared root-cause taxonomy is the point.
 
-- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics** (filed
+- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics**
+      **[→ M0127: absorbed 2026-08-03]** — Q18 is in the S1 exit bar's named
+      set ("Q18 ≤ 1.2× its R0 27.58 s", `leftdeep-joins` 09 §2) and in
+      01 §6(1)'s recovery list; the seam de-materialisation (M0127-P1.1) and
+      the executor stages S0–S2 are the mechanism this item's fix would have
+      had to build. The Q18 EXPLAIN capture this item already owes was
+      blocked on M0125-0037's EXPLAIN half (done); fold the capture into
+      M0127-P1.3's S1 A/B instead. (filed
       2026-07-30 by M0125-0031 goal (a); evidence
       `analysis/m0125-0031-warm-sf05-20260730/README.md` §"Runtime"). At SF0.5,
       300 s cap, same arm (`GOOPG_RELSIZE_FALLBACK=2`), Q18 goes **117 s S-cold
@@ -4308,8 +4665,24 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `M0125-0003`'s acceptance row — coordinate, do not duplicate it.** Bar: as
       -0034.
 
-- [ ] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
-      planner** (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
+- [x] **M0125-0037 — C4: set operations are opaque to EXPLAIN and to the
+      planner** **[→ M0127: stage (ii) absorbed 2026-08-03]**
+      **↳ CLOSED 2026-08-04 by M0127-P5.1's landing**, exactly as this item
+      pre-authorised below ("Close on P5.1's landing; nothing in stage (ii) is
+      owed before it"). `buildInitialRels`
+      (`internal/planner/joinsearch.go`) admits a set-op / subquery / CTE /
+      VALUES leaf as an initial rel with a `PathPrebuilt` path instead of
+      abandoning the search, so the DP is no longer blind to a rel behind a
+      set-op node; stage (i) (the EXPLAIN half) has been done since
+      2026-07-31 and the acceptance row `Q5 5|OK|100` green since then. No
+      new work was performed for this item this loop. — stage (i)
+      (EXPLAIN half) is done; stage (ii)'s mechanism claim ("the DP cannot see
+      through a set-op node") is closed by M0127-P5.1's `PathPrebuilt` leaves
+      (subquery/CTE/VALUES/pinned-unnest admission — `IMPLEMENTATION-TODO`
+      P5.1 "closes the leaf-whitelist gap"), and its acceptance row
+      (`Q5 5|OK|100`) has been green since 2026-07-31 by independent
+      measurement. Close on P5.1's landing; nothing in stage (ii) is owed
+      before it. (filed 2026-07-31 by M0125-0026; evidence same README §"C4").
       **↳ STAGE (i) IS DONE (2026-07-31).** Design
       `docs/design/0125-0037-explain-set-operations.md`; tests
       `internal/executor/explain_setop_test.go`; re-capture
@@ -4431,9 +4804,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (2 of 12 conjuncts qualify). VERBOSE-forced prefixing and `Output:` line
       qualification are also still open (second ledger row).
 
-- [ ] **M0125-0047 — goopg's plan is restart-NONDETERMINISTIC for self-joined
+- [x] **M0125-0047 — goopg's plan is restart-NONDETERMINISTIC for self-joined
       identical relations: SF0.5 Q85 tie-swaps `cd1`/`cd2` between server
-      starts of the SAME binary** (filed 2026-08-03 by M0125-0002 commit 4;
+      starts of the SAME binary** **DONE 2026-08-03 (loop #40)** (filed 2026-08-03 by M0125-0002 commit 4;
       evidence `analysis/m0125-0002-c4-plans-20260803/README.md` §"q85").
       Q85 scans `customer_demographics` twice (aliases cd1/cd2, identical
       estimated rows); which alias lands in which join slot flips across
@@ -4452,6 +4825,59 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       carve-outs (the gates PASS; the flip is rare) — parked under M0125
       as instrument-integrity debt for the remaining walker commits 5–8,
       which lean on byte-identical EXPLAIN A/Bs.
+      **↳ M0127 PREREQUISITE (2026-08-03): close this BEFORE M0127-P5.4.**
+      The M0127 banner lists this item among the four M0125 items M0127 waits
+      on, and M0127-P5.4's "deterministic tie-break" is specified to build on
+      this item's fix — the 09 §4 plan-shape ratchet (a pinned mismatch
+      budget that must not grow across commits) cannot exist while plans flip
+      Q85-style across restarts. The unit-test search for the unstable site
+      (plan Q85 in-process ~20×) is host-independent and can run anytime.
+      **↳ CLOSED 2026-08-03 (loop #40).** Design
+      `docs/design/0125-0047-joinorder-tiebreak-determinism.md`; evidence
+      `analysis/m0125-0047/`. The unstable site is `pickNextByEdge`
+      (`internal/planner/joinorder.go`), the greedy comma-FROM reorder's
+      "take the smallest edge-connected relation" step: it ranked candidates
+      while ranging over `edges[j]`, a `map[int]struct{}`, with a **strict**
+      `rowCounts[k] < rowCounts[best]`. A strict comparison keeps the
+      incumbent on a tie, so the winner was whichever candidate Go's
+      per-`range` randomiser yielded first — the tie-break had no total order
+      over relation indices. The suspicion filed with this item ("map
+      iteration order … or a non-stable sort") was right on the first branch;
+      there is no non-stable sort (`sort.Slice` appears nowhere in the
+      planner's non-test files). A query that scans one table twice makes the
+      tie **unavoidable** — the two aliases are the same relation, so their
+      statistics are identical by construction and no `ANALYZE` can separate
+      them. Fix = compare FROM indices last, which resolves ties to source
+      order and matches the rule `smallestUnused` and `orderByConnectivity`
+      already used, so all three pickers in the file now share one tie-break.
+      **Audited and found already deterministic:** `smallestUnused` (slice
+      walk), `orderByConnectivity` (`k < next` is total — its documented
+      "cross-free source order is a fixed point" property holds *because* of
+      that), and the bushy DP (`g.edges` is a slice, subsets/splits come from
+      the `enumerateSubsets`/`enumerateSplits` generators, `dp` is lookup-only).
+      **Measured:** 96-query SF0.5 EXPLAIN capture, 3 restarts of the fixed
+      binary → **all 96 byte-identical pairwise** (the item's acceptance), and
+      **before vs after 96 byte-identical** — the fix converges on the plan
+      the baselines ALREADY contain (Q85 keeps its `cd2`-first shape,
+      `6fb943ca2c7aa936`), so **no snapshot needs re-pinning and no earlier
+      A/B is invalidated**. A 10-restart Q85 probe reproduced the flip at HEAD
+      (1 divergence in 10 pre-fix; 0 in 10 post-fix) — the two binaries differ
+      in nothing but that comparison, so it reads causally. **Two things bind
+      later loops:** (1) the restart probe is UNDERPOWERED and must not be
+      cited as a determinism gate — at the observed ~10% flip rate, 10 clean
+      restarts happen by chance ~35% of the time; the proof is the unit test,
+      which samples Go's per-`range` randomiser 200× in-process at zero
+      restart cost (ledger row). (2) **This is NOT a proof that the planner is
+      deterministic overall** — the audit covered the join-order passes, not
+      every map; `TestPlanQ85IsDeterministic` (100 whole-`Plan()` runs
+      compared by an alias-bearing REFLECTIVE fingerprint, because the
+      existing `planShapeString` renders scans as `x.Table.Name` and
+      `cd1`/`cd2` share one `*catalog.Table`, so it prints the two
+      permutations identically and cannot see this defect at all) is the
+      harness shape a corpus-wide sweep should generalise, and M0127-P5.4's
+      plan-shape ratchet is its consumer (ledger row). All four guards in
+      `internal/planner/joinorder_determinism_test.go` were proven to FAIL
+      against the pre-fix body before the fix landed.
 - [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
       (filed 2026-07-31 by `M0125-0037`(i); evidence
@@ -4480,9 +4906,26 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       both complete inside the warm gate's budget with matching row counts.
       Bar: as `M0125-0034` (plan-diff `LABEL=tpcds-round2-head` + the SF0.5
       regression gate), because (a) and (b) are both executor/planner changes.
+      **↳ INDEPENDENT OF M0127 (2026-08-03): neither absorbed nor a
+      prerequisite.** C6 is aggregate-side (grouping-sets expansion), outside
+      the leftdeep-joins bundle's scope (its out-of-scope list: no
+      `AGG_MIXED`/`AGG_SORTED` port). It may proceed before,
+      during, or after M0127 on its own track. Tracked via the M0125 section, not the M0127
+      wait list — it must not be silently closed. Its Q18/Q67 runtime
+      linkage is re-measured under M0127-P1.3/P5.9 (see the -0033 skip
+      note), but the ROLLUP fan-out fix itself is this item's alone.
 
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
-      re-evaluated per outer row** (filed 2026-07-31 by `M0125-0036`, which
+      re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
+      — the decorrelation root cause is fixed (loop #14); the remaining factor
+      is C1 = the `Nested Loop (CROSS)` shape, which M0127's P5 DP is the
+      documented successor of (`leftdeep-joins` 03 §4-§5: join methods are
+      costed paths generated inside the search — no post-DP rewrites; M0126-0013
+      named the bundle as the Q9-enumeration successor). Q30/Q81 complete
+      inside the SF0.5 gate under M0127's S5 acceptance (09 §3 clause 4's
+      zero-delta instrument covers them). The `ca_state = 'AR'` descent probe
+      this item names is a useful P5.4 qual-placement input — fold it in, do
+      not build a standalone join-order fix. (filed 2026-07-31 by `M0125-0036`, which
       closed C3's EXISTS half and deliberately did not touch this one).
       Members: **Q30 and Q81**, both still `TIMEOUT` at SF=0.5 after -0036
       (measured 345 s and 350 s, `analysis/m0125-0036-exists-to-any/README.md`).
@@ -5085,6 +5528,2440 @@ bar).
       or (the not-triggered close with its 07 §7 ledger row).
       Bar: UNITS + SMOKE + SPOT + PLAN (default arm ZERO diffs) + DS05 + the
       re-run acceptance protocol.
+
+## M0127 — PG-shaped join search: PG-identical join search + fusion-free join executor (filed 2026-08-03)
+
+Milestone: `docs/milestones/0127-pg-shaped-join-search.md`. Implementation
+plan (the authoritative task decomposition): `docs/design/0127-pg-shaped-join-search.md`.
+Design of record: `docs/design/leftdeep-joins/` — README (scope + invariants),
+**01** (measured evidence + the exact recovery set), **02** (plan-shape
+contract), **03** (the `standard_join_search`/`join_search_one_level` analogue,
+all three phases), **04** (one cost currency, rows once, FK-aware selectivity),
+**05** (the fusion-free hash cascade), **06** (hybrid hash spill), **07** (the
+other join operators), **08** (stages/flags/removal inventory), **09**
+(verification + acceptance). **The bundle is the design; the task bodies below
+cite bundle sections instead of restating them.** Do not re-derive what the
+bundle settles. Never modify `docs/design/leftdeep-joins/` itself.
+**Priority: immediately after M0125's M0127-needed items** (filed by the
+panel per the user directive 2026-08-02, amended 2026-08-03; successor to the
+terminal M0126 no-go) — above the M-NIGHTLY backlog and above M0123. See the
+amended Current Priority banner. Not selected while M0125-0002 (exprwalk
+commits 5–8), M0125-0047, or M0125-0013 is open (M0125-0040 ROLLUP is an
+independent track outside bundle scope; see its item body).
+
+**Acceptance bar (09 §3 is normative):** TPC-H SF1 **22/22 complete** (zero
+hang/OOM/timeout/row-count mismatch); total wall time **≤ 1.2×** the faster of
+pinned R0 (493.31 s) and a contemporaneous integer arm; **no query > 2× R0 —
+Q9 explicitly ≤ 170.9 s** (2 × R0's 85.46 s); TPC-DS SF0.5 **zero row and
+checksum deltas**; **no `MultiHashJoin` in any emitted plan; fusion never
+triggers**; **bushy capability** — every bushy spine PG 18.3 can produce,
+goopg can produce (parity-gate spine diff; no `expected-bushy` category).
+Stage gates: S1 exit = Q3/Q10/Q18/Q7 each ≤ 1.2× their R0 times
+(8.46 / 6.04 / 27.58 / 25.13 s; R0 total 493.31 s); S3 exit = Q21 completes at
+SF1 under the cgroup cap at default `work_mem` + forced-spill run byte-identical
+to no-spill. A documented no-go with attribution (09 §6) is a successful S5
+outcome; an unmeasured outcome is the only failure.
+
+**Read before picking any task here.** (1) **Executor first, planner second,
+deletion last** (08 §1): the M0125-0002 lesson — regression direction is
+unpredictable per query, measure per commit; the executor stages improve the
+CURRENT default planner's output immediately (the MHJ-retirement seam costs
+Q3/Q10/Q18/Q7). (2) **Every P5 task lands dark** behind `GOOPG_PGSHAPED_DP`
+(OFF while soaking, flipped ON as the acceptance event); it **replaces**
+`GOOPG_COST_DRIVEN_JOINORDER` (retired at S5, 08 §6). Collapse-limit wiring has
+its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` and soaks separately (P5.8).
+(3) **Soak coexistence (08 §3):** non-searched shapes keep the current pipeline
+including `rewriteJoinsToNLI` and qual-placement passes; searched roots are
+tagged and the passes skip tagged subtrees; `reconcileNLILayout` must be a no-op
+on searched trees (assert, don't assume). (4) **S2 and S5 each re-baseline
+`plan_snapshots/` in the same commit** with the diff summarised in the commit
+message. (5) Every implementation task runs in a **git worktree off pinned clean
+HEAD**, staged by explicit pathspec, never `git add -A`, and re-runs its own
+named guard test after any rebase or handoff. (6) Timed measurements need a
+quiet host and constant server age (sweep-tail discipline); DS05 results record
+as "57/99 content-verified, 42/99 count-only".
+
+**M0125 items absorbed by this milestone (marked `→ M0127` in their bodies, do
+not select as standalone tracks):** M0125-0031 (warm-stats planning line —
+remaining repair = this milestone's acceptance), M0125-0032 (Q21 — S3 exit by
+name), M0125-0033 (Q18 warm regression — S1 exit set), M0125-0037 stage (ii)
+(set-op DP visibility — P5.1 `PathPrebuilt` leaves), M0125-0041's residual
+(C1 CROSS shape — P5 DP). **Closed mechanisms this milestone deletes:**
+M0125-0035b's `reselectDegenerateHashKeys` → P2.2 (same commit + Q78-class
+degeneracy regression test); M0126-0011's MHJ node/operator → P6.2;
+M0126-0006/-0007's fusion → P6.1; M0126-0004's slot-chaining deferral →
+un-deferred at P1.1. Supersession stamps at P6.4 (0034-0001, 0038-0001,
+cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
+
+- [x] **M0127-P0.1 — `mergedKeySlot` hoist to `Open`.** Shape-invariant per
+      join; rebind `.row` per pull; zero steady-state allocs in the seam
+      microbench. IMPLEMENTATION-TODO P0.1; 05 §3 (E2). Files:
+      `internal/executor/operators_join_agg.go` (:986-1014, build :590/:646/:702,
+      probe :1266/:1269). Bar: UNITS + SPOT + BENCH.
+      **↳ DONE 2026-08-03.** `mergedKeySlotCache` (two per `joinOp`:
+      `lazyBuildKeySlot`, `lazyProbeKeySlot`) holds the hoisted `VirtualSlot`;
+      all five call sites call `rebind`, which swaps one interface word and
+      rebuilds only on a `(realWidth, nullWidth, realOnLeft)` change — the
+      child schemas fix those at `Open`, so the build loops' empty-schema
+      `width == 0` fallback is the only mid-loop rebuild and fires at most
+      once. Seam microbench `BenchmarkMergedKeySlotSeam` **4.10 ns/op, 0
+      allocs** vs the uncached arm's **185.8 ns/op, 344 B, 5 allocs** (the
+      null `Row`, its `MaterializedSlot`, the `[]virtualCol`, the sources
+      slice, the `VirtualSlot`). Guards: `join_merged_key_slot_test.go`
+      (cached-vs-fresh equality both orientations, source rebinding, shape
+      change, 0-alloc `AllocsPerRun`). UNITS PASS, SPOT PASS (Q12=2/Q13=35),
+      SMOKE via hook. Out of scope by design (05 §3): `fused_hash_join.go`'s
+      two call sites — fusion dies at P6.1. Progress log: design doc §6.
+- [x] **M0127-P0.2 — single-pass build.** Fold `drainRowsBounded`'s budget into
+      `buildLazyHashTable`'s build loop; delete the re-iteration
+      (`rowsOp`-per-row `MaterializedSlot` allocs). Keep owned-copy discipline
+      (M0097-0058). IMPLEMENTATION-TODO P0.2; 05 §4 (E3). Bar: UNITS + SPOT +
+      RACE (shared-build interplay).
+      **↳ DONE 2026-08-03.** The two build loops moved into
+      `joinOp.buildLoopLeft` / `buildLoopRight`, which pull straight from the
+      child, key off the P0.1 hoisted slot and insert — no `drainRowsBounded`,
+      no re-iteration, no `MaterializedSlot` per build row, and no temp-file
+      round trip. The drain's owned-copy became `ownedBuildRow`
+      (`rowHasArena` → `cloneRowOwned`, else the O(width) struct copy) and now
+      runs only for rows that survive the NULL-key check. **`ctx.WorkMem` went
+      with the drain deliberately** — it bounded the intermediate `[]Row`, never
+      the hash table it fed (every spilled row was read straight back in and
+      inserted), so peak memory is unchanged; real work_mem enforcement is the
+      batched hybrid hash at P3.2, whose stated prerequisite is this shape.
+      Ledger row `2026-08-03 M0127-P0.2` records the gap vs
+      `nodeHash.c: ExecHashIncreaseNumBatches`. Guards
+      (`join_single_pass_build_test.go`): both loops over a child that reuses
+      ONE buffer (the M0097-0058 aliasing class the drain used to absorb),
+      INNER + SEMI lanes + BuildLeft orientation + NullAware bookkeeping;
+      verified they bite (stub `ownedBuildRow` → all three fail). UNITS PASS;
+      SPOT PASS (Q12=2 / Q13=35, 18.4 s query phase vs P0.1's 32.3 s, peak
+      10,332 MB vs 10,767 MB — single uncontrolled runs); SMOKE via hook.
+      **RACE: `make race-gate` is red at clean HEAD too** for the unrelated
+      pre-existing `buildEnvInFlight` global (M0126-0006) already filed in
+      M-NIGHTLY above — reproduced in a HEAD worktree; every race frame is
+      `buildWithEnv`, none in the new build loops. Progress log: design doc §6.
+- [x] **M0127-P0.3 — single-map build.** Planner threads key-type info on
+      `planner.Join`; executor picks int64 vs string map before build; extend
+      int64 path to Semi/Anti (CTID exception preserved); delete
+      `lazyHashFinalize`'s dual-map dance. IMPLEMENTATION-TODO P0.3; 05 §4 (E3).
+      Bar: UNITS + DS05.
+      **↳ DONE 2026-08-03.** `planner.Join.HashKeysAreInt64`
+      (`internal/planner/join_hashkey.go`) types both key exprs — `exprType`,
+      falling back to the merged key column space for a ColumnRef whose `Type`
+      was left zero — and `buildLazyHashTable` sets `lazyHashIsInt` from it
+      BEFORE the first build row. `lazyHashInsertDatum` fills that map only;
+      `lazyHashFinalize` and `lazyBuildAllInt64` are gone. The dual-map build
+      cost every int-keyed join a second full copy of its build side held
+      *simultaneously* with the first (the string map was freed at finalize —
+      after peak). Semi/Anti now reach the int64 lane (the old INNER-only gate
+      existed only because they never ran finalize); the CTID build is the
+      exception and stays on the string map, since `lazyHashCTID` is keyed in
+      lockstep with it. `numeric` is deliberately excluded from the int64
+      promise (values, not the type, decide representability there) — ledger
+      row `2026-08-03 M0127-P0.3`; `demoteIntHash` re-keys mid-build if a
+      typed-integer column ever yields a non-int64 datum, exactly (because
+      `datumKey(KindInt(v))` *is* `canonicalNumericKey(v, 0)`). Guards:
+      `join_hashkey_test.go` (real SQL → plan → every hash join reports true,
+      incl. mixed int widths; text/numeric false; nil/non-hash/missing-key
+      guards) and `join_single_map_build_test.go` (the OTHER map is never
+      allocated; Semi + Anti lanes; demotion preserves every row and payload).
+      UNITS PASS. **DS05: MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99** —
+      Q1-Q72 (66 PASS, `sweep-20260803-114208.txt`) + Q73-Q99 (26 PASS,
+      `sweep-20260803-122614.txt`). The first run aborted after Q72 on a
+      transient `systemd-run` scope-name collision (previous scope not yet
+      released when the post-timeout restart re-created it → 180 s readiness
+      timeout), NOT a code failure; the tail was re-run as a subset probe, so
+      the two halves together are the coverage rather than one stamped gate.
+      Q47/Q72 TIMEOUT = the known boundary pair (263-308 s vs the 300 s cap;
+      Q72 alone reads 273/263/308/480 s/TIMEOUT across five prior sweeps at
+      unchanged code). SMOKE via the commit hook. Progress log: design doc §6.
+      **P0 is now CLOSED — next is P1.1.**
+- [x] **M0127-P1.1 — legacy-path slot chaining (the M0126-0004 deferral,
+      un-deferred).** Probe child slot as `lazyVirtualOut` source; rebind on
+      pointer change + copy fallback on type change; delete `slotRow(probeSlot)`
+      at :1254 and the vestigial `lazyKeyRow`. Env kill-switch
+      `GOOPG_JOIN_SLOT_CHAIN=off`. IMPLEMENTATION-TODO P1.1; 05 §2 (E1; F7
+      contract — children do not return a stable slot object; fan-out test
+      required). Bar: full REGRESS + DS05 + SPOT + seam microbench 0 allocs.
+      **↳ DONE 2026-08-03.** `bindProbe` binds the probe child's own
+      `TupleSlot` into `lazyVirtualOut.sources[lazyProbeSrcIdx]` on **every**
+      pull, and `outerOnlyEmit` composes the Semi/Anti emit through a new
+      `lazyOuterOnlyOut` VirtualSlot instead of `lazyOuterOnlySlot`. Both
+      `slotRow(probeSlot)` sites and the `lazyRow` / `lazyKeyRow` fields are
+      gone. **F7 is handled structurally, not by a type check:** rebinding
+      unconditionally per pull is correct for *any* concrete slot the child
+      returns, so there is nothing to detect — the copy fallback exists for the
+      kill switch and for a slot that cannot serve the composed shape. The one
+      place the width test changes an observable result is the Semi/Anti emit,
+      where the probe slot IS the whole tuple: an over-wide probe keeps its
+      pre-P1.1 width via the copy rather than being silently narrowed to
+      `len(o.schema)` (ledger row `2026-08-03 M0127-P1.1`; PG cannot produce
+      that shape because `ExecHashJoin` projects through `ps_ProjInfo`).
+      The aliasing is safe by control flow only — a probe row is pulled after
+      every match of the previous one has drained — so `bindProbe` asserts
+      exactly that (`lazyActive` must be false) rather than trusting it.
+      Guards (`join_slot_chain_test.go`): the mandatory fan-out test, run over
+      FOUR probe-child slot shapes including one that **rotates shape per
+      pull** (the F7 case), plus Semi/Anti, both LEFT null-pad exits
+      (hash-level and predicate-level), the over-wide copy fallback, the
+      kill-switch arm, and the rebind assertion. **Seam: 0 B / 0 allocs**
+      (`BenchmarkProbeSeam/chained` 58.7 µs per 1024-row pass) vs the
+      kill-switch arm's **172,179 B / 2,048 allocs, 221.3 µs** — 2 allocations
+      per probe row removed, 3.8× on the seam; `TestProbeSeamZeroAllocs` pins
+      it with `AllocsPerRun`. REGRESS (full `TestPort_RegressSuite`) PASS in
+      659 s; UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 17.8 s query phase, peak
+      11,594 MB); **DS05 MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99**
+      (Q1-Q72 + a Q73-Q99 subset probe — the first run died after Q72 on the
+      same post-TIMEOUT `systemd-run` scope collision P0.3 hit, and Q47/Q72 are
+      the known 300 s boundary pair). SMOKE via the commit hook.
+      **Not in scope:** the slab/`buildRec` path (`fillFromTupleSlot` already
+      had its VirtualSlot fast path from M0126-0003) and `fused_hash_join.go`,
+      which dies at P6.1.
+- [x] **M0127-P1.2 — worker-path exercise.** The P1.1 seam under `BuildWorker`
+      (`inWorker=true`) integration test — fusion's decline-in-worker precedent
+      says this path diverges silently. IMPLEMENTATION-TODO P1.2. Bar: RACE.
+      **↳ DONE 2026-08-03.** `join_worker_path_test.go` asserts three claims
+      that do not imply one another: (1) the seam **engages** under
+      `BuildWorker` — structural, not by result, because a declined seam
+      returns identical rows (that is the copy fallback's whole design, and
+      the reason fusion's `inWorker` decline went unnoticed); (2) rows
+      produced by a chained emit and **retained** across later pulls survive
+      `MaterializeForTransfer` + `AssertTransferable` — the worker batches 256
+      rows before sending, so a probe source the next pull overwrites corrupts
+      every row but the last, while a serial consumer formatting each row on
+      arrival never notices; (3) real-Gather identity over the P8 corpus in
+      BOTH seam arms × leader-participation on/off × 2 and 4 workers — the
+      leader-off arm is the one where EVERY row crosses the goroutine
+      boundary. All three bite: `GOOPG_JOIN_SLOT_CHAIN=off` fails (1), and a
+      stubbed shallow `MaterializeForTransfer` fails (2) and (3) (`got
+      "NULL|NULL|NULL"`, `"2|d-2"` vs `"200|d-0"` — `VirtualSlot.Row()` hands
+      back a POOLED row, so the corruption is real, not theoretical).
+      **The exercise found the divergence it was written to look for, in the
+      BUILD path rather than the seam:** `buildEnvInFlight` — see the
+      M-NIGHTLY race item above, fixed here, `make race-gate` green
+      end-to-end for the first time since M0126-0006. The seam itself did NOT
+      diverge in a worker. Gates: RACE (`make race-gate` EXIT=0, all
+      packages; the same executor tests were red at HEAD with every frame in
+      `buildWithEnv`), UNITS PASS, SPOT PASS (Q12=2 / Q13=35, 17.8 s query
+      phase, peak 11,597 MB), SMOKE via the commit hook. Ledger row
+      `2026-08-03 M0127-P1.2` records the un-audited remainder: only this one
+      global was removed, not the package's build/exec-time globals as a
+      class. Progress log: design doc §6.
+- [x] **M0127-P1.3 — S1 A/B evidence run.** Q3/Q10/Q18/Q7 ≤ 1.2× R0; no other
+      query > 1.2× vs pre-S1 HEAD; file `analysis/leftdeep-joins/<date>-s1-ab.txt`.
+      No code. Bar: bar met or attributed (09 §6) **before P2 starts**.
+      IMPLEMENTATION-TODO P1.3; 09 §2.
+      **↳ DONE 2026-08-03 — bar ATTRIBUTED (the gate's second leg), evidence
+      `analysis/leftdeep-joins/2026-08-03-s1-ab.txt` + 5 raw artefacts.**
+      pre-S1 HEAD = `766d2cdb`; S1 = `99951944`. **Clause (2) met outright: not
+      one query in the suite is slower under S1 than under pre-S1 HEAD** (max
+      ratio 1.00); total 619.26 s → 360.82 s (0.58×), = 0.73× R0's 493.31 s.
+      Clause (1): Q7 PASSES (0.74× R0); **Q3 (1.98×), Q10 (2.51×), Q18 (1.26×)
+      MISS — attributed class (b) plan shape, INHERITED, not caused by S1.**
+      Two facts exclude S1: (i) EXPLAIN for all 22 queries is **byte-identical**
+      between arms, estimates included → every S1 delta is class (d) at constant
+      plan, and all are wins or a wash; (ii) the deficit is there with S1 absent
+      — pre-S1 HEAD alone is 4.08×/3.89×/2.92× R0 on Q3/Q10/Q18. The cause is
+      **MHJ de-selection between R0's HEAD and pre-S1 HEAD**: R0's snapshot has
+      9 `Multi-Way Hash Join` nodes (Q2/Q3/Q7/Q9/Q10/Q11/Q18/Q21), both arms
+      today have zero, and the estimates moved off R0's degenerate `rows=1` —
+      the M0125 estimate work stopped picking the shape R0 was pinned to. S1
+      still recovered 68/147/48/86 % of the Q3/Q7/Q10/Q18 deficit from the
+      executor alone. **The residual is the bundle's thesis, not S1's bug:**
+      09 §3 item 5 requires ZERO MHJ at S5 and P6.2 deletes it, so restoring
+      R0's shape would move away from the endpoint. **Q3/Q10/Q18 are carried
+      into P5 as named regression witnesses** (P5.3a bushy enumeration +
+      P5.6/P5.7 sizing/cost are the tasks that must clear them). Order control:
+      arms ran pre-S1(cold) → S1 → pre-S1(warm); the warm replicate reproduced
+      the cold one within 7.1 % on every query > 0.5 s, and S1 is compared
+      against the warm one. 22/22 complete in all three arms, row counts
+      identical across arms and to R0. No code landed. **P2 may start.**
+- [x] **M0127-P2.1 — `planner.Join.HashKeys []JoinKeyPair`.** Search/pushdown
+      fills all equality conjuncts; residual keeps non-equijoin only; EXPLAIN
+      key-list rendering; plan-snapshot re-baseline same commit.
+      IMPLEMENTATION-TODO P2.1; 05 §5 (E4 planner side). Bar: UNITS + SPOT +
+      DS05 + PLAN (snapshot diff reviewed).
+      **↳ DONE 2026-08-03.** `JoinKeyPair` + `Join.HashKeys` publish EVERY
+      usable equi-pair (PG's `hashclauses`/`mergeclauses`), where goopg has
+      carried exactly one pair since M0003. New
+      `internal/planner/join_hash_keys.go`. **The list is derived by ONE late
+      pass at the tail of `Plan()`, not filled at the nine construction
+      sites** — six later passes rewrite key/predicate expressions in place
+      (`reresolveJoinByName`'s predRebind, bushy `subRemap`, `FoldConstants`,
+      `lowerSubPlanParams`, qual placement, `reselectDegenerateHashKeys`), so
+      an early field is one all six must maintain, and the one time that was
+      missed a shared ColumnRef pointer got mutated under the keys
+      (M0097-0060). `HashKeys[0]` is `(LeftKey, RightKey)` **by pointer**;
+      extras are cloned. `splitEqualityForHash` now delegates to the shared
+      `forEachEqualityForHash` core (behaviour byte-identical), so the
+      single-pair and full-list views cannot drift —
+      `TestSplitEqualityForHashMatchesFirstPair` is the anti-drift guard.
+      `(*Join).Residual()` is the non-equijoin projection P2.2 consumes.
+      EXPLAIN grew `Hash Cond:` / `Merge Cond:` (`formatJoinKeyCond`),
+      upstream's `show_upper_qual` shape incl. the `rtable_size > 1`
+      prefixing rule and `make_ands_explicit`'s `((a = b) AND (c = d))` —
+      goopg emitted NO join condition line at all before this, which is why
+      M0125-0035b's degeneracy bug looked PG-identical while running
+      quadratically. **`Predicate` is deliberately NOT trimmed** (the
+      executor is still single-key; trimming would drop the second equality
+      from enforcement) — ledger row `2026-08-03 M0127-P2.1`, discharged by
+      P2.2. Gates: **PLAN re-baseline `plan_snapshots/m0127-p21-hashkeys.txt`
+      — IDENTICAL to `m0125-0002-c7-after` once the new key-condition lines
+      are filtered out, i.e. ZERO plan-shape change across all 22 TPC-H
+      queries**; 61 `Hash Cond:` lines, **2 true multi-column lists** (Q9's
+      and Q20's partsupp⋈lineitem, the exact shape M-NIGHTLY
+      tpch/Q20-timeout named). UNITS PASS. SPOT PASS (Q12=2 / Q13=35, 15.6 s
+      query phase, peak 10,230 MB). **DS05 MISMATCH=0 / CKMISMATCH=0 /
+      ERROR=0 across all 99** (Q1-Q72 `sweep-20260803-162954.txt` 67 PASS +
+      Q73-Q99 `sweep-20260803-171238.txt` 26 PASS; the tail is a stamped
+      subset probe after the same post-TIMEOUT `systemd-run` scope collision
+      P0.3/P1.1 hit; Q47/Q72 = the known 300 s boundary pair). SMOKE via the
+      commit hook. `TestExprSwitchInventoryIsPinned` (M0125-0001's RC-1a
+      gate) forced the sublink descent onto `walkExprRefs` + `scopeDescend`
+      instead of a hand-written 5-arm Expr switch. **Next is P2.2, the
+      executor half of the sibling pair.** Progress log: design doc §6.
+- [x] **M0127-P2.2 — executor composite keys.** All-int64 fixed-width pack;
+      mixed → concatenated `datumKey`. **Delete `reselectDegenerateHashKeys` +
+      its planner pass (same commit)**; add a Q78-class degeneracy regression
+      test (constant-pinned first key column must not degrade to one bucket).
+      IMPLEMENTATION-TODO P2.2; 05 §5 (E4 executor side). Bar: UNITS + SPOT +
+      DS05 + SIBLING (planner keys ↔ executor key encode).
+      **↳ DONE 2026-08-03.** New `internal/planner/join_exec_keys.go`
+      (`Join.ExecHashKeyPlan` → `{Keys, Residual, Int64Keys}`) and
+      `internal/executor/join_composite_key.go`. `reselectDegenerateHashKeys`
+      and its three helpers plus the `Plan()` call site are GONE.
+      **The executor's key list is deliberately NARROWER than `HashKeys`.**
+      `HashKeys` stays the plan's truth (what EXPLAIN renders); a pair may be
+      folded into the KEY only where `datumKey` equality provably agrees with
+      `=`, because goopg has one canonicalisation where PG has a hash opfamily
+      per type. `pairIsHashSafe` requires both sides to resolve to the same
+      non-array scalar type from a whitelist (machine ints are one family).
+      The exclusions are wrong-results risks, not missed optimisations —
+      **float4/float8 are stored as TEXT datums** (`floatTextDatum(PGFloatOut
+      (...))`), so `-0.0` and `0.0` are `=`-equal but key differently; enum and
+      toast-pointer datums have NO `datumKey` arm and would collide into one
+      key, which with the conjunct also dropped from the residual would
+      OVER-emit. A declined pair keeps today's behaviour exactly (out of the
+      key, in the residual). Encoding: n int64s packed big-endian into a fixed
+      8n-byte buffer (probe lookups as `m[string(buf)]` → zero allocations),
+      else **length-prefixed** `datumKey` parts — the prefix, not this
+      package's usual NUL separator, is what makes it injective, since a text
+      `datumKey` can itself contain NUL. `demoteCompositeIntKeys` mirrors
+      `demoteIntHash`. NULL is componentwise. `joinPredicateMatchSlot` now
+      evaluates `execResidual`, discharging the FIRST half of ledger row
+      `2026-08-03 M0127-P2.1` (the physical `Predicate` trim is the second
+      half and stays open). NullAware `NOT IN` stays single-key — ledger.
+      Gates: **DS05 MISMATCH=0 / CKMISMATCH=0 / ERROR=0 across all 99, and
+      Q78 — the query the retired pass existed for — PASSes in 19 s / 45 rows
+      / matching checksum** (`sweep-20260803-174443.txt` Q1-Q72 68 PASS +
+      `sweep-20260803-182129.txt` Q73-Q99 26 PASS TIMEOUT=0; Q72 TIMEOUT at
+      317 s is the known 300 s boundary pair). **PLAN: `make plan-diff
+      LABEL=m0127-p21-hashkeys` MATCH on all 22** — retiring the reselect pass
+      moved no key in TPC-H, so P2.1's baseline stands. UNITS PASS. SPOT PASS
+      (Q12=2 / Q13=35, 16.5 s, peak 11,573 MB). SMOKE via the commit hook.
+      The degeneracy witness asserts 64 buckets for 64 rows sharing a pinned
+      lead key — a row-count test cannot see this defect, the results were
+      always right. **Next is P2.3, merge-join multi-column keys.**
+      Progress log: design doc §6.
+- [x] **M0127-P2.3 — merge-join multi-column keys** from the same list
+      (full-key comparator; residual non-equijoin only). IMPLEMENTATION-TODO
+      P2.3; 07 §2. Bar: UNITS + SPOT + DS05 + PLAN.
+      **DONE 2026-08-03.** `planner.Join.ExecMergeKeyPlan` +
+      `internal/executor/join_merge_key.go`; `mergeKeyedRow.key Datum` →
+      `keys []Datum` over one flat backing array. The planner half was
+      already P2.1's (`fillOneJoinHashKeys` fills `JoinAlgoMerge`, EXPLAIN
+      renders `Merge Cond:` over the list) — the executor was still reading
+      `plan.LeftKey`/`RightKey`, so grouping on the lead column alone made a
+      pinned lead ONE group whose cartesian product was walked pair by pair
+      (M0125-0011 / Q97 is the recorded instance; its residual re-check kept
+      the answer right at O(n·m)). Now the group IS the match set and
+      `mergeResidual` is nil on an all-equijoin join = PG's empty `joinqual`.
+      `pairIsHashSafe` governs the fold-in for merge too (same one-
+      canonicalisation-vs-opfamily question); ledger row `2026-08-03
+      M0127-P2.3` records that `compareDatum`'s `KindString` arm content-
+      sniffs (pg_lsn / UUID / composite / array literal), which the dropped
+      conjunct now widens from the lead key to every folded text pair.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 18.1 s); PLAN MATCH 22/22
+      against `m0127-p21-hashkeys` (no re-baseline needed); DS05 MISMATCH=0 /
+      CKMISMATCH=0 / ERROR=0 across all 99 (Q97 checksum unchanged; timings
+      flat vs P2.2 — no DS05 query is currently governed by this class).
+      **S2 IS CLOSED; the next M0127 selection is P3.1.**
+- [x] **M0127-P3.1 — `chooseHashTableSize`** (shared pkg importable by planner
+      and executor); goopg-width-aware (`48·c` + map overhead).
+      IMPLEMENTATION-TODO P3.1; 06 §2.1; 04 §4. Bar: UNITS + SPOT.
+      **DONE 2026-08-03.** New leaf package `internal/hashsize`:
+      `Choose(ntuples, ncols, avgVarBytes, memLimit) Sizing{NBuckets, NBatch,
+      SpaceAllowed, EntryBytes}` plus `EntryBytes` / `EffectiveMemLimit`. It is
+      a PACKAGE, not a function, because the import direction forces it: the
+      executor imports the planner and the planner imports the executor
+      nowhere, so the one rule both must obey has to sit below both. PG gets
+      this for free — `final_cost_hashjoin` and `ExecHashTableCreate` call the
+      same `ExecChooseHashTableSize` (`nodeHash.c:658`) — and a cost model that
+      believes a build fits while the executor spills is precisely the
+      sibling-path class this project keeps paying for.
+      **The width substitution is the content, not a detail.** PG measures an
+      entry as `HJTUPLE_OVERHEAD + MAXALIGN(SizeofMinimalTupleHeader) +
+      MAXALIGN(tupwidth)`; goopg holds `map[K][]Row` over `[]Datum` at 48
+      bytes per Datum, so the same row costs `48·c + 24` and a bucket slot
+      costs 48 where PG's is an 8-byte pointer. PG's constants would predict
+      `nbatch` low by about the width ratio — the trap `04 §4` names — and
+      `TestChooseGoopgWidthForcesBatchesPGWouldNotSee` pins one instance
+      (300k × 10 cols: ~2.9 MB of MinimalTuple, ~150 MB of Datum). Three PG
+      subtleties are carried deliberately: the 1024-bucket floor, the
+      re-derivation of nbuckets from the FULL budget once multi-batch is
+      forced (buckets sized for a memory-full table, not for ntuples), and the
+      closing walk-back. One PG assertion became a clamp —
+      `Assert(bucket_bytes <= hash_table_bytes/2)` holds for 8-byte pointers,
+      but 48-byte slots make "buckets alone exhaust work_mem" reachable.
+      **First consumer: `joinOp.presizeLazyHash`** (`operators_join_agg.go`) —
+      the build table is allocated with its bucket count already chosen
+      instead of a nil map doubling its way up a multi-million-row build. Rows
+      come from `planner.EstimateRows(o.plan.Left/Right)` (the executor cannot
+      count a side it has not drained); the presize is capped at
+      `maxPresizeBuckets = 1<<20` because an estimate is not a measurement,
+      and the 1024-bucket floor is read as "no information" (every unANALYZEd
+      relation returns it) so tiny/unknown builds presize nothing. The
+      FOR-UPDATE ctid build is left alone — it materialises first and its
+      result sets are small by construction. `NBatch` is computed and IGNORED:
+      honouring it means partitioning at insert time, which is P3.2.
+      **Four ledger rows** (`2026-08-03 M0127-P3.1`): `hashJoinCost` still
+      does not call `Choose` (the batch-I/O term moves plans; 06 §5 / P5.7 own
+      it); `avgVarBytes` is 0 because goopg collects no per-column width
+      statistic, biasing NBatch low; the walk-back's `FileBufferBytes = 8192`
+      assumes a per-batch write buffer `spillWriter` does not have yet; and
+      `maxPresizeBuckets` is a goopg-only cap that P3.2 should delete.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / Q13=35, 17.0 s, peak 11,461 MB —
+      vs 18.1 s / 11,573 MB at P2.3, within noise). No plan surface touched,
+      so `m0127-p21-hashkeys` stays the PLAN baseline for S3.
+      **Next M0127 selection is P3.2 (batch build/probe).**
+      Progress log: design doc §6.
+- [x] **M0127-P3.2 — batch build/probe.** Hashvalue-prefixed `spillWriter`
+      frames, per-batch inner/outer files, `HJ_NEED_NEW_BATCH` state in
+      `nextLazy`, nbatch growth with capped give-up + WARNING. Fold
+      M0125-0032's Q21 plain-EXPLAIN classification into this design loop.
+      IMPLEMENTATION-TODO P3.2; 06 §2.2-2.4. Bar: UNITS + DS05 + RACE.
+      **DONE 2026-08-03.** New `internal/executor/join_batch.go`
+      (`hashBatchState`) + a hashed frame on the shared spill primitive
+      (`WriteRowHashed` / `ReadRowHashedInto`). `ctx.WorkMem` now BOUNDS a
+      hash join instead of describing it: batch 0 stays in the map, later
+      batches are inner/outer file pairs, `batchno = (hash >> log2(nbuckets))
+      & (nbatch-1)`, and probe EOF becomes "this batch is done" via
+      `nextBatch` (= `HJ_NEED_NEW_BATCH`). PG's skip rules 2 and 3 come with
+      their counters (`origNBatch`, `nbatchOutstart`) — a one-sided batch is
+      skippable UNLESS nbatch has grown since the file was written, or its
+      rows are lost silently. Growth is `ExecHashIncreaseNumBatches` including
+      the freeze (`nfreed == 0 || nfreed == ninmemory`), evicting per KEY
+      rather than per tuple because every row under one map key shares that
+      key's hash.
+      **Two decisions carry the risk.** (1) The state is installed even when
+      the geometry says NBatch == 1 — goopg's estimates are absent far more
+      often than PG's, and an under-estimate is exactly the case that
+      overruns memory, so the bound must come from growth, not the estimate
+      (single-batch cost: one add + one compare per build row; the routing
+      hash is skipped entirely while nbatch == 1). (2) Routing hashes the
+      key's CANONICAL bytes (`appendCanonicalNumericKey`, split out of
+      `canonicalNumericKey`), never "the int64 if it is one": the executor
+      can fall from the int lane to the string lane mid-build
+      (`demoteIntHash`), and routing by one canonical form while filing under
+      another sends equal keys to different batches — a lost match, not an
+      error. Scope: INNER + single-key + private build; LEFT/Semi/Anti and
+      the composite lane are P3.4, and `prebuildSharedHashJoins` sets
+      `noBatch`. `spillWriter` gained the `hashsize.FileBufferBytes` write
+      buffer the P3.1 walk-back already priced.
+      **Six ledger rows** (`2026-08-03 M0127-P3.2`): the four declined join
+      shapes, the composite lane, the shared-build implicit decline, the
+      un-retired `maxPresizeBuckets` (nbatch bounds resident ROWS, not the
+      bucket ARRAY), no temp-file registry (P3.3), and no EXPLAIN counters
+      (P3.5).
+      Gates: UNITS PASS; RACE PASS (`make race-gate`, all packages); SPOT
+      PASS (Q12=2 / Q13=35, 15.8 s, peak 10,224 MB vs 17.0 s / 11,461 MB at
+      P3.1); DS05 across slices 1-50 / 51-72 / 73-99 MISMATCH=0 CKMISMATCH=0
+      ERROR=0 (Q72's TIMEOUT is pre-existing — 300 s here vs 315 s / 317 s on
+      earlier commits). No plan surface touched; `m0127-p21-hashkeys` stays
+      the PLAN baseline.
+      **Next M0127 selection is P3.3 (temp-file registry).**
+      Progress log: design doc §6.
+- [x] **M0127-P3.3 — temp-file registry.** Per-query registry on `Context`;
+      relocate to `<datadir>/base/pgsql_tmp/`; startup sweep; fix `spillOp.Close`
+      unlink leak. Injected-crash test leaves no strays. IMPLEMENTATION-TODO
+      P3.3; 06 §3. Bar: UNITS + crash-injection test.
+      **DONE 2026-08-03.** New leaf package `internal/pgtemp` (PG's
+      `PG_TEMP_FILES_DIR`/`PG_TEMP_FILE_PREFIX`, `Dir`/`EnsureDir`/
+      `FilePattern`/`RemoveStrayFiles`) + `internal/executor/tempfiles.go`
+      (`tempFileRegistry` on `Context`). Spill files became the STATEMENT's
+      property instead of each operator's good intentions: the registry is
+      allocated by `NewContext`, shared BY POINTER with every parallel worker
+      (`NewWorkerContext`) and with the `synthCtx := *ctx` copies, and
+      `executeOneSimpleStmt` / the extended dispatch `defer
+      ctx.ReleaseSpillFiles()`. Operators still unlink eagerly (sortOp chunks,
+      `hashBatchState.discard`, and now `spillOp.Close` — the leak 06 §3 named)
+      and deregister when they do, so a 1024-batch join does not hold 1024
+      paths to statement end; what the registry adds is that ownership no
+      longer DEPENDS on Close being reached.
+      **The relocation is what makes the sweep possible.** Files moved from
+      `os.TempDir()`/`goopg-spill-*.tmp` to
+      `<datadir>/base/pgsql_tmp/pgsql_tmp<pid>.*`; the prefix is load-bearing,
+      not cosmetic — PG's `RemovePgTempFilesInDir` (fd.c) filters on it so a
+      sweep can never mistake a neighbouring file for a stray. `Server.Run`
+      sweeps before `close(s.ready)`, on the reasoning that a live backend
+      unlinks at statement end, so anything present at startup is by definition
+      a crash leftover.
+      **Sibling-path find:** the extended protocol never set `ectx.DataDir`
+      (the simple path always did), so extended-protocol spills would have
+      resolved outside the cluster even after the relocation.
+      **Four ledger rows** (`2026-08-03 M0127-P3.3`): `temp_tablespaces`
+      unimplemented (one directory, no per-tablespace sweep arm);
+      `temp_file_limit`/`log_temp_files` accounting absent (the registry knows
+      paths, never bytes); release point is the STATEMENT where PG's is the
+      RESOURCE OWNER (safe today only because cursors materialise — P4.3's
+      `Materialize` must revisit it); PG's `RemovePgTempRelationFiles` not
+      ported (goopg temp-relation files carry no backend id to recognise).
+      Also flips P3.2's "no per-query registry" row to `resolved`.
+      Gates: UNITS PASS; RACE PASS; SPOT PASS. Six new tests, incl. the
+      crash-injection gate `TestStartupSweepReclaimsCrashedQueryFiles` (four
+      files survive a context that never releases; the sweep reclaims all four)
+      and `TestWorkerContextSharesTheLeaderRegistry`.
+      **Next M0127 selection is P3.4 (Semi/Anti/LEFT per-batch semantics).**
+      Progress log: design doc §6.
+- [x] **M0127-P3.4 — Semi/Anti/LEFT per-batch semantics** (batch-global
+      `antiBuildHasNull`); shared build declines when nbatch > 1.
+      IMPLEMENTATION-TODO P3.4; 06 §2.5. Bar: UNITS + DS05 + RACE.
+      **DONE 2026-08-03.** `joinBatchEligible` admits SEMI, ANTI and the
+      probe-filling LEFT on one sentence from 06 §2.5: **a probe row belongs to
+      exactly one batch, and so does every build row that could match it** —
+      equal keys hash equal, so they route together, and every per-probe-row
+      verdict (emit-at-most-once, emit-iff-no-match, null-pad-on-miss) is
+      decidable inside the row's own batch. That is why NOT ONE LINE of
+      `nextLazy`'s emit logic changed. The admitted set is character-for-
+      character `hashJoinIsPartialCapable`'s (planner/parallel.go): the same
+      "per-probe-row verdict is worker-local" property decides which joins may
+      take a partial probe side and which may be partitioned by batch.
+      **What did have to change is the SKIP rule.** P3.2 dropped any batch
+      empty on one side; under LEFT/ANTI that silently discards every probe row
+      in an outer-only batch. `batchSkippable` now states PG's three rules as a
+      table (nodeHashjoin.c:1141-1160) with rule 1's fill arm
+      (`probeFillsUnmatched`). Rule 1's INNER-only arm is deliberately absent —
+      it belongs to the RIGHT/FULL unmatched sweep goopg does not have (P4.2),
+      which is also why a LEFT join built on the LEFT side is still declined.
+      `antiBuildHasNull`/`antiBuildRows` needed no work: the build loop
+      maintains them before any row is routed, so they are batch-global by
+      construction and NOT IN's short-circuits fire before any probe.
+      **The shared build now declines the SHARE, not the SPILL.** P3.2's
+      `noBatch` made it the one hash build in the executor with no work_mem
+      bound at all, because `captureSharedBuild` freezes the in-memory table
+      alone — publishing a spilled build hands each worker one partition. The
+      decline is taken twice: from the ESTIMATE before the build (common case
+      wastes no pass) and from the MEASUREMENT after it (goopg's estimates are
+      absent often enough that only growth bounds anything), with
+      `buildGeometry` factored out of `presizeLazyHash` so the presize, the
+      batch state and the decline cannot disagree about whether a build fits.
+      **The cost is real and was isolated, not averaged away.** SPOT rows PASS
+      (Q12=2 / Q13=35) but the query phase went 15.7 s → 28.3 s. A three-arm
+      A/B on the same host splits it exactly: HEAD Q12 11.58 / Q13 4.14;
+      shared-decline alone Q12 15.84 / Q13 3.89; full P3.4 Q12 16.39 / Q13
+      11.89. So Q12's +4.3 s is N private builds replacing one shared one, and
+      Q13's +7.8 s is its LEFT join (`customer ⟕ orders`, 1.5M-row build) now
+      honouring `work_mem` — at goopg's 512 MB default, i.e. 128× PG's, so PG
+      spills this join harder than goopg now does. Both are the design's
+      mandate (06 §6 / 06 §2), the alternative being the unbounded builds this
+      milestone exists to close, so they are LEDGERED for the S1/S5 acceptance
+      measurement rather than tuned away here.
+      **Three ledger rows** (`2026-08-03 M0127-P3.4`): the build-side fill arm
+      (RIGHT/FULL/LEFT-on-BuildLeft → P4.2), the repeated private builds (only
+      real parallel hash fixes it, 06 §6), and `hashJoinCost` still not pricing
+      the nbatch I/O term (→ P5.7) now that more join types spill. Also flips
+      two P3.2 rows to `resolved` (LEFT/Semi/Anti decline; shared-build
+      `noBatch`).
+      Gates: UNITS PASS; RACE PASS (`make race-gate`, all packages); DS05
+      across slices 1-50 / 51-75 / 76-99 MISMATCH=0 CKMISMATCH=0 ERROR=0 over
+      all 99 (Q72's TIMEOUT pre-existing); SPOT PASS on rows with the timing
+      regression above. Three new tests, incl. the negative-controlled
+      `TestFillingJoinsKeepOuterOnlyBatches` (fill arm disabled ⇒ LEFT emits 72
+      of 1,239 rows). No plan surface touched; `m0127-p21-hashkeys` stays the
+      PLAN baseline.
+      **Next M0127 selection is P3.5 (EXPLAIN `Batches:` + forced-spill
+      identity; S3 exit evidence).**
+      Progress log: design doc §6.
+- [x] **M0127-P3.5 — EXPLAIN `Batches:`/memory lines + forced-spill identity
+      test** (low `work_mem` Q3 byte-identical to default). S3 exit evidence:
+      Q21 SF1 completes capped; file `analysis/leftdeep-joins/…-s3-spill.txt`.
+      IMPLEMENTATION-TODO P3.5; 06 §4; 09 §2. Bar: Q21 SF1 (capped) + DS05
+      zero-delta + RACE.
+      **DONE 2026-08-03. S3 (P3.1–P3.5) CLOSED.** `HashJoinStats` map on
+      `Context` keyed by plan node (the `SubPlanStats`/`MemoizeStats` shape);
+      `hashBatchState.publish()` max-merges into it when the geometry is
+      chosen, when nbatch doubles and at close — peak memory flushed at close
+      rather than maintained in `insertBuildRow`'s per-row path.
+      `formatHashJoinInfoLine` is `show_hash_info` (explain.c) VERBATIM,
+      including that PG prints BOTH originals once EITHER count moved, and
+      `BYTES_TO_KILOBYTES`'s round-up. The line hangs off the **Hash Join**,
+      not off a Hash node, because goopg has none — the build lives inside
+      `joinOp`.
+      **S3 exit: both clauses MET**
+      (`analysis/leftdeep-joins/2026-08-03-s3-spill.txt`) — Q21 at SF1 rc=0 in
+      132 s / 405 rows / peak VmHWM 16.7 GB inside the 20G/24G cap; Q3 at
+      `work_mem=512kB` (nbatch 512, grown from 256) **byte-identical** to Q3 at
+      6 GB (nbatch 1), 11,521 rows, sha256 `066af3df…dc16dc8`.
+      **Finding for P5.7:** goopg's 512 MB default is NOT a no-spill setting —
+      Q3's lineitem build still reports `Batches: 8 (originally 4)  Memory
+      Usage: 475137kB` there and needs 6 GB to reach one batch, because a build
+      row is `[]Datum` (48 B/column) where PG's is a packed MinimalTuple. At
+      SF1 with default settings a TPC-H hash join SPILLS, so an nbatch-blind
+      `hashJoinCost` will keep choosing hash.
+      Five new tests (`internal/executor/join_batch_explain_test.go`), three of
+      them driving the property through SQL — that `SET work_mem` reaches the
+      batch state at all is not something P3.2's operator-level fixtures could
+      assert. **Three ledger rows** (`2026-08-03 M0127-P3.5`): non-TEXT EXPLAIN
+      formats emit nothing; a parallel worker's counters die with the worker
+      (PG merges via `SharedHashInfo`); and the two shape divergences (no Hash
+      node; batch-ineligible joins print no line at all).
+      Gates: UNITS PASS; RACE PASS (all packages); DS05 slices 1-50 / 51-99
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 over all 99 (Q72 TIMEOUT pre-existing).
+- [x] **M0127-P4.1 — streaming merge join** (duplicate-group buffering +
+      overflow file); delete full-drain `runMergeJoin`/`buildMergeSide`
+      accumulation. IMPLEMENTATION-TODO P4.1; 07 §2. Bar: UNITS + REGRESS +
+      DS05.
+      **DONE 2026-08-04. S4 is OPEN; P4.2 is next.** The merge join held
+      THREE full copies of its working set — both children drained into
+      `[]Row` by `Open`, both keyed sides `sort.SliceStable`-d into a second
+      pair of arrays by `buildMergeSide`, and the ENTIRE output appended into
+      `o.rows` before `Next` returned its first tuple — for an operator whose
+      upstream analogue holds one tuple per side plus the current inner
+      group. `internal/executor/join_merge_stream.go` replaces all three.
+      Each side is a **`mergeSortedSource`**: a key-ordered stream whose
+      resident set is bounded by `work_mem`, chunks past the budget sorted
+      and written to a spill run and freed, the runs N-way merged on the way
+      out — `sortOp`'s M0068-0006 shape, keyed on the merge key TUPLE instead
+      of a SortKey list, because the key expressions live in the merged
+      left++right space and only a `mergedKeySlot` (the P0.1 hoisted cache)
+      can present a bare child row in it. That also retires
+      `buildMergeSide`'s `concatRows`-per-row padding. The join is
+      **`mergeJoinStream`**, PG's `EXEC_MJ_SKIP` advance with the INNER
+      equal-key group as the only buffer: resident while it fits `work_mem`,
+      overflowing to a spill file replayed once per outer row (and once more
+      for the RIGHT/FULL sweep, over a `groupMatched` bitmap sized by row
+      COUNT so it stays small even when the rows are on disk).
+      **Emission order is byte-identical to the array implementation by
+      construction** — that is why a NULL key is carried as a per-row flag
+      that sorts AFTER every real key rather than being filed in a side list:
+      a stream cannot come back for a side list, but it can be told the null
+      rows are last, and a four-state tail then walks
+      left-real → right-real → left-null → right-null holding one row per
+      side. The guard that matters is the **forced-spill identity test**
+      (P3.5's hash-side property applied to merge): `work_mem=1` — every
+      input row in its own run, the 4-row inner group overflowed after its
+      first — against unbounded, over all four join types × both residual
+      regimes, compared row-by-row. Disabling the group replay's rewind makes
+      it fail. Six tests total, incl. a 40,000-row join that asserts `o.rows`
+      stays empty for the whole drain and a Close-releases-every-spill-file
+      test. **Four ledger rows** (`2026-08-04 M0127-P4.1`): the operator
+      still SORTS its own inputs (07 §2's pathkey-fed premise is P5's, not
+      this slice's); the emit is still `concatRows`, not the E1 composed-slot
+      seam; goopg has no operator-level mark/restore, so a group is buffered
+      where PG rewinds (schedule with P4.3, which brings `Materialize`); and
+      the merge path's dead ctid side-channel is now structurally absent
+      rather than one missing assignment.
+      Gates: UNITS PASS; DS05 PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 over
+      all 99 (Q72 TIMEOUT pre-existing); REGRESS zero delta vs a HEAD
+      worktree baseline on `join`/`join_hash`/`select`/`subselect`/`union`
+      (diff bodies byte-identical after path normalisation); SPOT PASS
+      (Q12=2 / Q13=35, 28.0 s). Progress log: design doc §6.
+- [x] **M0127-P4.2 — hash outer-fill.** Matched bitmap per batch; RIGHT sweep;
+      FULL = LEFT fill + sweep; planner legality matrix update (RIGHT/FULL hash
+      paths). Regress-port outer-join files green. IMPLEMENTATION-TODO P4.2;
+      07 §3 (PG `HJ_FILL_INNER`). Bar: REGRESS outer-join files + DS05.
+      **DONE 2026-08-04. P4.3 is next.** The hash join could not null-pad a
+      side that matched nothing, and that gap — not any semantics — is why
+      RIGHT/FULL were pinned onto merge and inherited its sort of BOTH inputs.
+      `internal/executor/join_outer_fill.go` adds PG's `HJ_FILL_INNER` half
+      next to the `HJ_FILL_OUTER` goopg already had. Both are named for their
+      ROLE (`fillProbeSide`/`fillBuildSide`) and derived from `Type` + the
+      EFFECTIVE build side — Semi/Anti are forced build-right inside
+      `buildLazyHashTable`, so the raw `BuildLeft` lies — which is what lets
+      **RIGHT reuse the LEFT fill path unchanged** (build the non-preserved
+      left, probe the preserved right, no sweep); FULL is both halves and pays
+      for the sweep. Three properties each got their own test: the bitmap is
+      written AFTER the residual predicate (an early mark silently drops
+      residual-rejected build rows from the sweep); the sweep runs PER BATCH in
+      `nextLazy`'s probe-EOF arm while that table is still resident, so
+      `joinBatchEligible` accepts every outer orientation and `batchSkippable`
+      grows rule 1's INNER arm; and a NULL-keyed build row — dropped by every
+      build loop since a NULL key has no canonical bucket form — is retained
+      and swept, where PG gets there via `hashtable->keepNulls`.
+      **Planner: the merge PIN became a merge DEFAULT, gated OFF.**
+      `chooseOuterFillJoinAlgo` prices hash against merge (never nested loop —
+      legal but it drains both inputs) behind `GOOPG_HASH_OUTER_JOIN=1`. The
+      gate is a MEASUREMENT, not caution: an unconditional flip keeps every row
+      but reorders unordered ones and moves regress `join` **210 diff lines
+      further** from upstream, because `costInnerMerge` charges an 11-row sort
+      like a real one while PG 18.3 — asked directly on J1_TBL/J2_TBL — picks
+      Merge Right/Full Join there. The default flip belongs to P5 with doc 04's
+      cost currency. **Three ledger rows** (`2026-08-04 M0127-P4.2`):
+      NULL-key build rows are held unbounded instead of spilling like PG's
+      keepNulls tuples; the planner default is gated; and parallel hash join
+      still refuses RIGHT/FULL for want of a shared matched bitmap
+      (PG 16+ `ExecParallelScanHashTableForUnmatched`).
+      Gates: UNITS PASS; REGRESS **zero delta** vs a HEAD-worktree baseline on
+      `join`/`join_hash`/`select`/`subselect`/`union`; DS05 run with the gate
+      ON so the new path is exercised. Progress log: design doc §6.
+- [x] **M0127-P4.3 — `Materialize` operator** (plan node + path + rescan replay,
+      memory→spill); NL joins stream outer, inner under Materialize; delete
+      drain-both `runNestedLoop` buffering and `concatRows`-per-pair.
+      IMPLEMENTATION-TODO P4.3; 07 §4. Bar: UNITS + SPOT + DS05.
+      **DONE 2026-08-04.** The nested loop is the executor's *universal
+      fallback* — every join that is neither hash nor merge lands on it — and
+      it ran entirely inside `Open`: both children drained to `[]Row`, all
+      N×M candidate pairs built with `concatRows`, every survivor pushed into
+      `o.rows` before `Next` returned its first tuple. Three copies of the
+      join's data for an operator `nodeNestloop.c` runs with one tuple per
+      side. The missing piece was never the loop but the absence of a
+      **rescannable** subtree: an `Operator` can be walked once, and the inner
+      side must be walked once per outer tuple. `operators_material.go` adds
+      it — `Materialize`, PG's `nodeMaterial.c` analogue: `materialBuffer` is
+      the `work_mem`-resident prefix plus one sequentially-replayed overflow
+      file, `materializeOp.Rescan` replays the cache without touching the
+      child. `join_nl_stream.go` is then PG's shape directly (outer streams,
+      inner under the Materialize, emit as `Next` asks) and `runNestedLoop`
+      is deleted. Two properties are load-bearing, not incidental: the cache
+      fills **lazily** and keeps PG's `eof_underlying` resume, because a
+      keyless Semi/Anti breaks out of its inner scan on the first qualifying
+      tuple and an eagerly-draining Materialize would have silently truncated
+      the inner side for every later outer tuple; and the unmatched-inner
+      bitmap is indexed by **ordinal** (replay order is insertion order), so
+      the RIGHT/FULL sweep needs no key and no map — and that sweep drains the
+      cache itself, which is the path a RIGHT join over an *empty* outer side
+      takes. `concatRows`-per-pair dies with it: the predicate is evaluated
+      against one reusable merged buffer, so allocation now tracks OUTPUT, not
+      N×M. The spill reader is opened when the writer is created, on an empty
+      file, because P3.3's ledger row named the hazard (registry releases at
+      the statement, PG at the resource owner) and an fd survives an unlink
+      where a path does not. **Deferred, 3 ledger rows:** the
+      `planner.Materialize` plan node + path + EXPLAIN line (PG places
+      `Material` by `cost_rescan`, which needs doc 04's currency → P5.4, so
+      the operator is executor-constructed meanwhile); `mergeJoinStream`'s
+      hand-rolled twin of `materialBuffer` (P4.1's ledger row #3, still open);
+      and `costInnerNestLoop` having no `cost_rescan` term, so a plan whose
+      inner spills is priced as if the replay were free (→ P5.7).
+      **The third deferral is a MEASURED decline, not caution.** The inner
+      cache's `work_mem` bound is implemented and unit-tested but ships OFF
+      (`GOOPG_NL_MATERIALIZE_WORK_MEM=1`), because the first full DS05 sweep
+      found exactly one regression and it was that bound: **Q54** plans a
+      nested loop whose inner is a 1.44M-row `store_sales` seq scan (~1.6 GB
+      as `[]Datum`), so the bounded cache spills and every outer tuple replays
+      the whole file with full datum decoding — 144 s → TIMEOUT. Unbounded,
+      Q54 runs in **95 s with a matching checksum**, i.e. *faster* than the
+      144 s the drain-both implementation took: the streaming outer and the
+      reused slot/pair buffers are a net win once the spill is out of the way.
+      PG never meets that wall because `cost_rescan` prices a materialized
+      inner at `cpu_operator_cost` per tuple **plus `seq_page_cost` over the
+      spilled pages**, which is what makes `final_cost_nestloop` lose to hash
+      or merge there — so the bound is a plan-quality cliff until the planner
+      can see it, the same trade P4.2's `GOOPG_HASH_OUTER_JOIN` gate records.
+      Gates: UNITS PASS; SPOT PASS (Q12=2 / 15.2 s, Q13=35 / 11.5 s, query
+      phase 27.9 s, peak 10,840 MB); DS05
+      `analysis/leftdeep-joins/2026-08-04-p43-ds05-sweep.txt`. Six new tests
+      separate the two independently-falsifiable claims (replay-without-
+      re-execution vs. lazy-outer/once-read-inner); the join's OUTPUT is
+      already covered from the other direction, since `join_outer_fill_test.go`
+      uses the nested loop as the ORACLE for the hash path.
+      **Next M0127 selection is P4.4 (lateral: outer streams, output no longer
+      accumulates into `o.rows` — the last `o.rows` user in `joinOp`).**
+      Progress log: design doc §6.
+- [x] **M0127-P4.4 — lateral: outer streams** (per-outer re-execution stays),
+      output no longer accumulates into `o.rows`. IMPLEMENTATION-TODO P4.4;
+      07 §4. Bar: UNITS + DS05. **DONE 2026-08-04.**
+      `internal/executor/join_lateral_stream.go`: `lateralJoinStream`, a
+      two-phase machine in `nlJoinStream`'s shape — pull one outer tuple,
+      re-open the right subtree under it, walk that subtree one tuple at a
+      time, emit as `Next` asks, predicate evaluated against a reusable
+      outer++inner buffer. The LEFT null-pad keys on `matched` alone (the
+      eager `len(rightRows) == 0 || !matched` was the same predicate spelled
+      with a drained array). What streaming FORCED: correlation-context
+      hygiene — a streaming inner side yields to the PARENT between tuples, so
+      the `ctx.OuterRows` push (and the per-outer-tuple `CTERowCache`) is
+      installed and removed around each individual right-side call rather than
+      held for a whole iteration, or a parent's own `OuterColumnRef` would
+      resolve against this join's outer tuple. **With LATERAL — the last
+      writer — converted, `joinOp.rows`/`idx` and the writer-less
+      `leftCTIDs`/`rowSourceLeft` ctid side-channel are DELETED, and `Next`'s
+      array tail with them: every arm streams.** All four P4 tasks have now
+      landed, but **S4's stage exit is NOT met**: §3 requires the regress-port
+      outer-join files green, and those stay pinned to merge until P4.2's
+      `GOOPG_HASH_OUTER_JOIN` default flip, which needs doc 04's cost
+      currency and is P5's. Gates: UNITS PASS;
+      SPOT PASS (Q12=2 / 15.8 s, Q13=35 / 11.4 s, query phase 28.7 s, peak
+      11,662 MB); DS05 PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 (Q72,
+      pre-existing) SKIP=4, **all 94 passing queries byte-identical to the
+      P4.3 sweep in row count AND checksum**, no query slower by >20%, total
+      2310 s → 2332 s
+      (`analysis/leftdeep-joins/2026-08-04-p44-ds05-sweep.txt`). **Two ledger
+      rows** (`2026-08-04 M0127-P4.4`): PG rescans a LATERAL RHS with changed
+      `PARAM_EXEC` values instead of re-executing it (goopg has no parameter
+      machinery, so `Materialize`/Memoize still cannot sit under a LATERAL
+      RHS — P5.4); and a LATERAL join drops the outer relation's ctid, so
+      `FOR UPDATE OF <outer>` above one cannot stamp a tuple lock
+      (pre-existing, preserved deliberately).
+- [x] **M0127-P5.1 — `joinrels` level lists + relset map over `RelOptInfo`;**
+      `buildInitialRels` incl. `PathPrebuilt` leaves for subquery/CTE/VALUES/
+      pinned-unnest rels (closes the leaf-whitelist gap — also closes
+      M0125-0037 stage (ii)). IMPLEMENTATION-TODO P5.1; 03 §1-§2. Bar: UNITS +
+      PLAN (default arm ZERO diffs — inert flag-off).
+      **↳ DONE 2026-08-04.** New `internal/planner/joinsearch.go`. `searchCtx`
+      carries PG's two indexes over one set of rels — `joinrels
+      [][]*RelOptInfo` (`root->join_rel_level`, allpaths.c:3475-3496) and
+      `relMap map[RelSet]*RelOptInfo` (`join_rel_hash`). They are two VIEWS of
+      one thing, so `addRel` **derives** the level from
+      `bits.OnesCount16(relids)` rather than taking it as an argument and
+      rejects a duplicate relset: two `RelOptInfo`s over one relset would split
+      the pathlist `addPath` prunes within, and a rel filed at the wrong level
+      would let phase 2 pair it with itself. `finalRel` states PG's
+      one-rel-at-the-top contract (allpaths.c:3508-3512) as a returned error,
+      not an assert — P5.3's answer to a failed search is the syntactic shape.
+      **`buildInitialRels` is where the leaf-whitelist gap closes**: it takes
+      the same three positionally-aligned per-FROM-item slices `tryBushyDP`
+      assembles (bushy.go:184-196) and admits EVERY item, where the old DP
+      abandons reordering for the whole statement on one VALUES/CTE/subquery
+      leaf (bushy.go:116-123). Rows are `filteredRows` for a base-table leaf
+      (post-local-filter, 03 §2) and `EstimateRows(leaf)` for every other
+      class — a subquery binding's `catalog.Table` is synthetic and its count
+      means nothing (the guard pins a VALUES rel at 3 and a CTE rel at its
+      body's 4242; both read 1 if `filteredRows` is believed) — floored at 1,
+      since a 0-row initial rel makes every join above it free. Each rel gets
+      one `PathPrebuilt` over the already-chosen leaf (carried whole so P5.5's
+      createPlan re-emits an `*IndexScan` leaf as an index scan rather than
+      demoting it) whose COST is re-derived via `costSeqscan`/`estScanPages` in
+      the search's own currency, because two cost models must not meet inside
+      one `addPath` comparison. **Inert twice over**: no `planSelect`
+      reference, and `GOOPG_PGSHAPED_DP` defaults OFF (pinned by a test).
+      Gates: UNITS PASS; **PLAN 22/22 MATCH** vs `m0127-p21-hashkeys`
+      (structural, live 65433). 7 tests in `joinsearch_test.go` separating the
+      two-indexes-agree invariant from the leaf admission; mutation-checked
+      (dropping the duplicate check / the non-table row rule each fail their
+      own guard). **One ledger row** (`2026-08-04 M0127-P5.1`): a base rel
+      contributes no per-index scan paths and no `PATH_PARAM_BY_REL`
+      parameterised paths — PG's `create_index_paths` — so the search cannot
+      trade access methods as the order changes; blocked on there being no
+      `cost_index` in the search's currency, resume at P5.4.
+      **Next M0127 selection is P5.2** (restrictInfo list +
+      `hasRelevantJoinClause`; equivalence-class selectivity rule).
+      Progress log: design doc §6.
+- [x] **M0127-P5.2 — restrictInfo list + `hasRelevantJoinClause`;**
+      equivalence-class selectivity rule (inferred edges admissible, no
+      double-count). IMPLEMENTATION-TODO P5.2; 03 §3; 04 §5. Bar: UNITS + PLAN
+      (ZERO diffs).
+      **↳ DONE 2026-08-04.** New `internal/planner/joinrestrict.go`.
+      `restrictInfo` generalises `joinEdge` (bushy.go:40) from a PAIR of FROM
+      positions to a `relids RelSet` (PG's `required_relids`): the edge list is
+      structurally blind to a qual spanning three relations, a relset is not,
+      so `a.x = b.y + c.z` is one clause with three bits instead of something
+      silently dropped. Non-equality join quals are kept as well — P5.4 has to
+      PLACE them and can only place clauses the search knows about — and the
+      key split is stored as `leftRelids`/`rightRelids`, which is what lets
+      that same three-rel equality be a legal hash/merge clause keying {a}
+      against {b,c}. Single-rel quals are deliberately excluded: P5.1 already
+      folded their selectivity into the initial rel's row count.
+      **The finding: 03 §3 defined `hasRelevantJoinClause` as "intersects both
+      sides AND is covered by their union", and the oracle does not.**
+      `have_relevant_joinclause` (joininfo.c:39) is two `bms_overlap` tests
+      with NO coverage requirement; the coverage test is a DIFFERENT function,
+      `build_joinrel_restrictlist` (relnode.c), because a qual is applied at
+      the lowest level that can EVALUATE it. Under the coverage reading a pair
+      connected only by a three-rel qual is not "relevant", so phase 1 refuses
+      to form it and it reaches the search only via cartesian/last-ditch — a
+      different enumeration from PG's. Now two predicates
+      (`hasRelevantJoinClause` / `clausesFor`); 03 §3 corrected against the
+      oracle. `selectivityClauses` is 04 §5:
+      `generate_join_implied_equalities_normal` emits exactly ONE clause per EC
+      per (outer, inner) split, so an EC of n members yields n−1 clauses over a
+      tree, never C(n,2) — with `a=b`, `b=c`, inferred `a=c`, two clauses cross
+      the {a,b}⋈{c} boundary and charging both squares one restriction. That
+      double-count is what the ×2.0 `inferredEdgePenalty` (bushy.go:67) was
+      compensating for in the COST dimension rather than the cardinality one;
+      inferred clauses carry no penalty here and `inferred` survives only as
+      the tie-break for which member carries the selectivity. Class ids are
+      dense in `compareColumnIdent` order, not map order — the id picks that
+      member, so a map-ordered id would move plans between identical runs.
+      Gates: UNITS PASS; **PLAN 22/22 MATCH** vs `m0127-p21-hashkeys`
+      (structural, live 65433). 8 tests in `joinrestrict_test.go` (incl. a
+      20-run id-determinism guard and a refuse-don't-guess guard on foreign
+      coordinates); mutation-checked — adding coverage to
+      `hasRelevantJoinClause` and removing the EC dedup each fail their own
+      guard. **One ledger row** (`2026-08-04 M0127-P5.2`): goopg CLASSIFIES the
+      conjuncts it is handed and never SYNTHESISES a clause from a class the
+      way `create_join_clause` does, so an EC edge `inferAnchoredEqualities`
+      declined to emit stays invisible to the search; resume at P5.4/P5.6.
+      Inert as P5.1 was (no `planSelect` reference, `GOOPG_PGSHAPED_DP` OFF).
+      **Next M0127 selection is P5.3** (`joinSearchOneLevel` phases 1+3 +
+      `makeJoinRel`); its `hasNoJoinClauseAtAll` gate landed here with the
+      list. Progress log: design doc §6.
+- [x] **M0127-P5.3 — `joinSearchOneLevel` phases 1+3** (clause joins against
+      initial rels; disconnected cartesian; last-ditch); `makeJoinRel` with
+      PG's outer/inner printing convention (03 §4.4). IMPLEMENTATION-TODO P5.3;
+      03 §4.1-§4.2 (`joinrels.c:118`, `:200-256`). Bar: UNITS + SPOT + PLAN.
+      **↳ DONE 2026-08-04** — `internal/planner/joinsearchlevel.go` (+ 9 tests).
+      The finding: PG's clause/clauseless branch is per OLD REL
+      (`joinrels.c:96`), not per pair, and that placement is what confines the
+      level-2 `first_rel` offset (`:112-116`) to the clause branch — the
+      clauseless branch deliberately re-pairs both directions (PG's own note,
+      `:127-136`). 03 §4.1's pseudocode moves the branch inside the inner loop,
+      which enumerates identically EXCEPT for that offset; the code follows the
+      oracle and records the equivalence inline. `makeJoinRel` = find-or-create
+      over P5.1's relset map + `populate_joinrel_with_paths`' JOIN_INNER arm
+      (`:809-816`): one rel per relset, sized once, both outer/inner orders
+      offered as paths — 03 §4.4's printing convention enforced structurally.
+      P5.6 sizing and P5.4 path generation stay behind a `joinRelBuilder` seam
+      so the task is verified on the pair SEQUENCE alone. Phase 2's insertion
+      point is marked between phases 1 and 3 (phase 3's emptiness test must see
+      the bushy pairs) = P5.3a. **One ledger row** (`2026-08-04 M0127-P5.3`):
+      goopg has no dummy-rel concept, so PG's `is_dummy_rel` /
+      `restriction_is_constant_false` short circuit is absent; resume at P5.4.
+      Still inert — no `planSelect` call site, `GOOPG_PGSHAPED_DP` OFF.
+      Gates: UNITS PASS; PLAN 22/22 MATCH vs `m0127-p21-hashkeys`; SPOT PASS
+      (Q12=2, Q13=35).
+- [x] **M0127-P5.3a — phase 2, bushy joins, PG-verbatim** (03 §4.3,
+      `joinrels.c:141-198`): k-loop to the halfway point, clauseless rel skip
+      (:170-172), mirror-half `first_rel` rule (:174-177),
+      `have_relevant_joinclause` pair gate (:190-191). Pair-count verification
+      against 03 §7's arithmetic (connectivity-filtered).
+      IMPLEMENTATION-TODO P5.3a. Bar: UNITS + pair-count verification test.
+      **↳ DONE 2026-08-04** — ~40 lines in `internal/planner/joinsearchlevel.go`
+      at the point P5.3 marked. PG's inner block (:182-194) is
+      `make_rels_by_clause_joins` verbatim, so the phase reuses P5.3's helper
+      and adds only the halfway break, the mirror-image offset and the
+      clauseless skip. Phase 2 has NO clauseless else-branch (unlike phase 1) —
+      a bushy pair needs a connecting clause, PG's planning-time defence
+      (:144-146) and what makes 03 §7's no-GEQO policy tenable. With phases 1+2
+      the enumeration is complete in PG's sense, and that is now verified
+      ARITHMETICALLY: on a complete clause graph the search must make exactly
+      (3ⁿ − 2ⁿ⁺¹ + 1)/2 `makeJoinRel` calls (03 §7's closed form), tested for
+      n=2..7 — the check a fixed chain sequence cannot make, because
+      connectivity masks most of the space. The finding: the clauseless-rel
+      skip is UNOBSERVABLE in v1 (a rel with no join clause cannot satisfy the
+      clause-only pair gate for any partner), mutation-confirmed; kept verbatim
+      with the redundancy recorded at the site because `has_join_restriction`
+      makes it live at P5.8. **One ledger row** (`2026-08-04 M0127-P5.3a`):
+      landing the full bushy space is what makes the absence of GEQO real —
+      PG switches at 12 rels, goopg searches to its 16-rel `RelSet` ceiling.
+      P5.3's `…IsLeftDeepOnly` guard is FLIPPED to
+      `TestJoinSearchFourRelChainOffersBushyPair`. Still inert — no `planSelect`
+      call site, `GOOPG_PGSHAPED_DP` OFF. Gates: UNITS PASS (PLAN/SPOT not
+      re-run: no call site + flag OFF ⇒ no plan and no row can move).
+- [x] **M0127-P5.4a — `addPathsToJoinrel`, the unparameterised core.**
+      **DONE 2026-08-04 (loop #64)**, `internal/planner/joinpaths.go` (+
+      `pathgen.go` / `cost_funcs.go` / `path.go`). PG's per-PAIR
+      `clause_sides_match_join` key/residual split (joinpath.c:2205), hash
+      paths keyed on the full usable equality set (05 §5), an unconditional
+      plain nested loop, and qual placement carried on the `Path`
+      (`HashKeys`/`Residual`) so it is costed. The split is per pair and not
+      per clause: `a.x = b.y + c.z` keys {a} against {b,c}, so it is a hash
+      key at ({a},{b,c}) and an ordinary qual at ({a,b},{c}) — the same
+      clause, both placements correct, both reachable in one search. "Lowest
+      covering level" was already `clausesFor`'s coverage rule and is now an
+      invariant, not an example: over every spanning shape of a 3-relation
+      triangle each clause is applied exactly once. The nested loop is
+      unconditional because phase 1's clauseless branch and phase 3 offer
+      pairs with an EMPTY clause list and `joinSearch` treats an empty
+      pathlist as a hard failure. Deterministic tie-break rides M0125-0047's
+      rule via `addPath`: a self-join's two aliases are identical by
+      construction, so both hash orientations tie and the incumbent (the
+      first-offered order) wins. `generateHashJoinPaths` was refactored to a
+      single-orientation primitive so ONE hash-path generator exists —
+      `makeJoinRel` already calls per direction. Nothing calls it from
+      `planSelect` (`sizeJoinRel` is P5.6's); `GOOPG_PGSHAPED_DP` OFF. 4
+      ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no `planSelect`
+      call site, flag OFF, so no plan and no row can move).
+- [x] **M0127-P5.4b-i — the 03 §9 parameterisation discipline.**
+      **DONE 2026-08-04 (loop #65)**, `internal/planner/pathparam.go` (+
+      `path.go` / `pathgen.go` / `joinpaths.go`). Landed AHEAD of the paths it
+      governs, which was the forced ordering the P5.4a ledger row named: a
+      parameterisation-blind consumer meeting its first `RequiredOuter` path
+      produces an unbuildable plan, not a slow one. Rule 1 — `setCheapest` is
+      `set_cheapest` (pathnode.c:272) in full: unparameterised-only cheapest
+      slots, `CheapestParameterized` with the cheapest unparameterised path
+      prepended, best-parameterised fallback filling the total slot but never
+      the startup one, plus the two arms a reimplementation would plausibly
+      get wrong — subset comparison runs BEFORE cost, and incomparable
+      parameterisations keep the incumbent rather than picking the cheaper.
+      Rule 2 — `pathParamByRel` (PATH_PARAM_BY_REL, joinpath.c:46) refuses
+      both directions in `addPathsToJoinrel`, for different reasons: an outer
+      parameterised by the inner is impossible in any join order; an inner
+      parameterised by the outer belongs to the NLI arm (P5.4b-ii). Rule 3 —
+      PG's `ppi_rows` needs no new field because PG carries it in
+      `path->rows`, so the rule is a discipline on the COST primitives, which
+      now read the child PATH's `Rows` and never `child.Rel.Rows`. **The
+      finding is a fourth rule 03 §9 does not enumerate:** a join path
+      computes its own `RequiredOuter` from its children's, and for a nested
+      loop that is a SUBTRACTION (`calc_nestloop_required_outer`,
+      pathnode.c:2592) — a nested loop DISCHARGES an inner parameterised by
+      the outer, so an NLI subtree over unparameterised inputs is itself
+      unparameterised, which is exactly what lets it be a hash-join input
+      instead of being refused by rule 2. `generateNLIPath` had declared
+      `RequiredOuter: inner.Relids`, reading the field as "what I depend on
+      below" when it means "what I still need from above", and naming a
+      relation the joinrel contains. Still inert — no `planSelect` call site,
+      `GOOPG_PGSHAPED_DP` OFF. 1 ledger row. Bar met: UNITS (SPOT/DS05 not
+      applicable — no call site, flag OFF, so no plan and no row can move).
+- [x] **M0127-P5.4b-ii-a — parameterised BASE INDEX paths.**
+      **DONE 2026-08-04 (loop #66)**, `internal/planner/pathparamindex.go`
+      (+ `joinsearch.go`). P5.4b-ii's own named first sub-step, split out and
+      landed alone for the reason P5.4b itself was split: the NLI arm iterates
+      `inner.CheapestParameterized`, which is empty in every query until some
+      path carries a `RequiredOuter`, so path and consumer are separately
+      falsifiable. Lands `create_index_paths`' join arm (indxpath.c:446) per
+      base rel — the equijoin clauses whose inner operand is a bare column of
+      THIS rel, one candidate parameterisation per distinct outer relset, the
+      longest B-tree index those clauses fully cover, one `PathIndexScan` with
+      a `RequiredOuter`. **The finding: `ppi_rows` does not need P5.6's
+      `eqjoinsel`, which had looked like a blocking dependency.**
+      `get_parameterized_baserel_size` (costsize.c:5379) passes
+      `varRelid = rel->relid` to `clauselist_selectivity`, which forces every
+      clause to be estimated as a RESTRICTION on this rel — so the answer is
+      `var_eq_non_const` (selfuncs.c): non-null fraction over the rel's own
+      ndistinct, clamped to MCV[0]'s frequency because a uniformly-drawn probe
+      value cannot be commoner than the commonest one. No both-sides join
+      estimator is consulted anywhere. PG's `rel->tuples * sel(param ∪
+      baserestrict)` is algebraically goopg's `rel.Rows * sel(param)` since
+      `rel.Rows` already carries the baserestrict selectivity — and that form
+      cannot double-count the local quals. A fully-bound unique index
+      short-circuits to one row (PG's `vardata->isunique`). Cost is built FROM
+      `indexProbeCost` rather than beside it, so the
+      `indexProbeCostMultiplier` calibration is not duplicated (04 §1's
+      one-currency rule). It is a THIRD step between `buildInitialRels` and
+      `joinSearch` because it reads the clause list, mirroring PG, where
+      `set_base_rel_pathlists` runs only after `deconstruct_jointree`. Index
+      eligibility calls `pickIndexCoveringAllLeadingColumns` — the NLI
+      constructor's own function, the first half of 03 §5.2's binding
+      contract. Still inert: no `planSelect` call site, `GOOPG_PGSHAPED_DP`
+      OFF. 2 ledger rows. Bar met: UNITS (SPOT/DS05 not applicable — no call
+      site, flag OFF, so no plan and no row can move).
+- [x] **M0127-P5.4b-ii-b-1 — parameterised JOIN paths: the NLI arm.**
+      **DONE 2026-08-04 (loop #68)**, `internal/planner/joinpathsnli.go`
+      (+ `joinpaths.go`, `pathparamindex.go`, `pathgen.go`).
+      `match_unsorted_outer`'s loop over
+      `innerrel->cheapest_parameterized_paths` (joinpath.c:1949-1975),
+      `try_nestloop_path`'s admission test (:882-889) with
+      `allow_star_schema_join` (:363), and `create_nestloop_path`'s
+      restrict-clause drop (pathnode.c:2478-2500). **It closes the hole
+      P5.4b-i knowingly opened**: a pair whose inner cheapest-total is
+      parameterised by the outer had NO path at all, and now has exactly the
+      one PG recovers here — hash cannot bind the parameter and a plain nested
+      loop would price the rescan as if it were free, which is why PG drops
+      the pair at :1874 specifically to re-cost it from the inner PATH's own
+      cost. `addPathsToJoinrel`'s two PATH_PARAM_BY_REL refusals were split to
+      match PG's control flow: they have different scopes and folding them
+      into one condition was what hid the arm-shaped hole. Also landed, from
+      the ii-a ledger row: PG's **pairwise-union parameterisations**
+      (`consider_index_join_outer_rels`, indxpath.c:531-583 — snapshot rule,
+      subset skip, equivalence-class skip, `10 * considered_clauses` valve),
+      which is the only way a COMPOSITE index equated to two DIFFERENT outer
+      rels is ever fully bound. **The C1-era `generateNLIPath` is RETIRED** —
+      it charged a flat `indexProbeCost` per outer row regardless of which
+      inner path was rescanned, and two NLI path constructors is exactly the
+      drift 03 §5.2's one-constructor rule forbids. **The finding: admitting
+      only fully-discharged parameterisations buys an invariant the rest of
+      the search silently leans on** — every JOIN path in the search is
+      unparameterised, so `Path.Rows == Rel.Rows` for every join path and the
+      only parameterised paths in play are base index scans, which is what
+      lets `addNestLoopPath`/`addHashJoinPath` set `Rows: joinRel.Rows`
+      without a `ppi_rows` of their own. Still inert: no `planSelect` call
+      site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger rows. Bar met: UNITS
+      (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no
+      row can move).
+- [ ] **M0127-P5.4b-ii-b-2 — Memoize paths + the §5.2 binding contract:**
+      `get_memoize_path` (joinpath.c:562) — wrap an NLI inner in a cache when
+      the outer key's distinct count makes it pay — plus the NLI binding
+      contract (shared eligibility fn with `tryBuildNLI`; constructor failure
+      on a DP-chosen path = loud planner error). Split out of P5.4b-ii-b
+      because both need a built `*Join` NODE rather than a Path —
+      `tryBuildNLI` analyses one — so they attach to P5.5's `createPlan` arms,
+      not to path generation. goopg already has the executor operator
+      (`internal/executor/operators_memoize.go`); what is missing is the
+      path-level eligibility and cost. IMPLEMENTATION-TODO P5.4b-ii-b-2; 03
+      §5.2. Bar: UNITS + SPOT + DS05.
+      **↳ DEPENDENCY-DEFERRED 2026-08-04 (loop #69), not skipped.** The item's
+      own body states the blocker: both halves need a built `*Join` NODE, and
+      `createPlan` does not build one for a searched subtree until **P5.5**.
+      Per this file's own selection rule ("topmost unchecked item *unless* the
+      banner or a DEPENDENCY forces another order") loop #69 took the next
+      dependency-free P5 item instead (`P5.4c-i`). Re-select this AFTER P5.5
+      lands its `createPlan` arms; nothing else about it has changed.
+- [x] **M0127-P5.4c-i — `sort_inner_and_outer`, the merge arm that sorts BOTH
+      inputs.** **DONE 2026-08-04 (loop #69)**, `internal/planner/joinpathsmerge.go`
+      (+ `joinpaths.go`, `path.go`). PG has TWO merge arms and they need
+      different things, which is where P5.4c splits: this one
+      (joinpath.c:1357) takes the two cheapest-total paths and sorts both, so
+      it needs NOTHING from its inputs and is expressible in full today;
+      `generate_mergejoin_paths` (:1564) exploits an already-ordered outer and
+      is dead until some path carries pathkeys. Landed with it: the
+      **per-equivalence-class sort-key reduction**
+      (`select_outer_pathkeys_for_merge`, pathkeys.c:1697-1704) — at ({a,b},{c})
+      with `a.x = c.x` and `b.x = c.x` the two clauses are ONE restriction,
+      `a.x = b.x` already holds inside the outer, so one sort key orders it for
+      both while both stay merge clauses; the **pair-local key orientation**
+      (the same clause faces the other way when the sides swap, exactly as
+      `isKeyableFor`'s split does — trusting `leftKey` to be the outer operand
+      is a WRONG PLAN, not a slow one); the **one-path-per-ordering loop**
+      (:1447-1466), whose point is that this join's OUTPUT order decides whether
+      a merge above it needs a sort at all; `build_join_pathkeys`
+      (pathkeys.c:1295); and `try_mergejoin_path`'s sort-skip (:1091-1097) and
+      still-parameterised refusal (:1073-1081 — merge has no
+      `allow_star_schema_join` escape, so P5.4b-ii-b-1's "every join path is
+      unparameterised" invariant is untouched). **`PathSort` finally has a
+      producer**: the Sort is an explicit child path rather than PG's
+      `MergePath.outersortkeys` field — same plan, same cost, and what 03 §5.3
+      asks for by name. **The finding: the sort-SKIP branch is the CONSUMER
+      half of P5.4c-ii and was worth landing before its producer** — written
+      and tested here against a hand-ordered rel, it means the next slice adds
+      ordered index paths and gets the saving, instead of adding both halves of
+      an interface neither side has exercised. Still inert: no `planSelect`
+      call site, `GOOPG_PGSHAPED_DP` OFF. 3 ledger rows. Bar met: UNITS
+      (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no row
+      can move).
+- [x] **M0127-P5.4c-ii-a — `build_index_pathkeys`: the ordering a B-tree index
+      path delivers.** DONE 2026-08-04 (`internal/planner/pathkeysindex.go` +
+      `pathparamindex.go`). The first of the three pieces P5.4c-ii was one
+      item for. PG's `build_index_pathkeys` (pathkeys.c:740) with each of its
+      loop rules pinned separately: INCLUDE columns excluded (:763-764),
+      per-column `reverse_sort`/`nulls_first` (:775-776), backward inversion of
+      BOTH (:770-774), STOP-not-skip on an unusable column (:815-822),
+      non-orderable AM (:748 — for goopg also `USING hash`, which rides the
+      B-tree substrate but is not orderable in PG), and `pathkey_is_redundant`'s
+      already-in-list half (:800). Wired into `addOneParameterizedIndexPath`,
+      the only index-path constructor there is, so `addPath`'s pathkey dimension
+      stops being a constant `dimEqual` — PG passes the same `useful_pathkeys`
+      to the parameterised path as to the plain one (indxpath.c:750-800).
+      **The finding: this does NOT unblock the merge arm.** `addMergeJoinPath`
+      refuses a parameterised path (joinpath.c:1073-1081) and every ordered
+      index path today is parameterised, so an ordered merge OUTER still needs
+      the unparameterised arm — now split out as P5.4c-ii-b. IMPLEMENTATION-TODO
+      P5.4c-ii-a; 03 §5.3, 04 §2.1. 4 ledger rows. Bar met: UNITS.
+- [x] **M0127-P5.4c-ii-b — UNPARAMETERISED ordered index paths.** DONE
+      2026-08-04 (`internal/planner/costindex.go` + `pathindexordered.go`,
+      `cost_funcs.go`). `build_index_paths`' `useful_pathkeys != NIL` arm
+      (indxpath.c:750-800) over a real `cost_index` (costsize.c:520): an index
+      path with the index's ordering, NO index quals and an **empty
+      `RequiredOuter`** — the only shape `try_mergejoin_path` accepts
+      (joinpath.c:1073-1081), so P5.4c-i's sort-skip branch finally has a
+      producer. `cost_index`'s `loop_count == 1` arm is transcribed whole:
+      Mackert-Lohman `index_pages_fetched` (costsize.c:906) in both regimes,
+      `genericcostestimate` reduced to the no-qual case, `btcostestimate`'s
+      50 × `cpu_operator_cost` descent charged at STARTUP (what lets an
+      ordered scan beat a sort under LIMIT), and the csquared interpolation
+      between all-random and one-random-then-sequential I/O. **The one-currency
+      discipline 04 §1 demanded is met by tying it to the EXISTING
+      `indexProbeCostMultiplier` on every random-page term** rather than
+      calibrating a second model — a test pins that raising the knob scales
+      both. `indexCorrelationFor` returns 0 because goopg collects no
+      `STATISTIC_KIND_CORRELATION`, which is what PG itself charges for a
+      missing slot; consequence: an ordered scan prices at `max_IO_cost` and
+      survives only on its pathkeys (pinned by a test). Two gate findings:
+      `has_useful_pathkeys` reduces to its join-clause arm (§10 carries no
+      query/group pathkeys), and building the ordering + truncating it to the
+      merge-useful prefix is provably ONE left-to-right loop, because with
+      syntactic pathkeys there is no EC object to name a column no clause
+      mentions. `effective_cache_size` joins `costParams` in PAGES with its own
+      drift guard. `addBaseRelIndexPaths` combines both halves of
+      `create_index_paths` so a caller cannot wire up one. Still inert. 7
+      ledger rows — one ("`Path` names no index or scan direction") is a stated
+      **P5.5 prerequisite**. IMPLEMENTATION-TODO P5.4c-ii-b; 03 §5.3, 04 §1.1.
+      Bar met: UNITS + SPOT.
+- [x] **M0127-P5.4c-ii-c — `generate_mergejoin_paths`.** DONE 2026-08-04
+      (`internal/planner/joinpathsmergeouter.go` + `joinpathsmerge.go`,
+      `joinpaths.go`). **P5.4c is CLOSED.** joinpath.c:1564 plus the merge half
+      of `match_unsorted_outer` (:1998-2013), wired at PG's arm-2 position —
+      between `sort_inner_and_outer` and the hash arm — so a merge over an
+      already-ordered outer wins an exact tie against a hash path exactly as it
+      does in PG. **It iterates `outer.Pathlist`, and that is the slice**: an
+      ordered index path is by construction NOT the cheapest total (P5.4c-ii-b:
+      `indexCorrelationFor` is 0, so it prices at `max_IO_cost` and survives
+      `addPath` only on its pathkeys), so an arm keyed to `CheapestTotal` would
+      find nothing at all. Three behaviours transcribed because each changes
+      which plan wins: the mergeclause list is a **PREFIX** of the outer's
+      ordering and stops at the first unserved position
+      (`find_mergeclauses_for_outer_pathkeys` — an outer sorted `(x,y)` joined
+      only on `y` is unusable, not usable on `y`, because a merge cannot skip a
+      leading sort column); the clause list is **TRUNCATED** to reach a cheaper
+      presorted inner, searched on BOTH cost axes under PG's strictly-cheaper
+      rule (a shorter prefix demotes a merge clause to per-tuple work, so it
+      must buy something); and the result carries the outer's **FULL** ordering
+      rather than the merge keys, which is the compounding effect the arm exists
+      for. **Two findings that changed code, not just docs.** (1) A truncated
+      merge must **demote its dropped clauses to residual** — PG carries the
+      whole restrictlist to plan time and `create_mergejoin_plan` subtracts,
+      while goopg fixes the key/residual split during path generation (03 §5.4),
+      so a dropped merge clause would have been evaluated by NOTHING: a wrong
+      answer, not a slower plan. Running the demotion through `qualEvalCost` is
+      also what puts a price on the trade the strictly-cheaper rule weighs.
+      (2) **One outer sort key can owe SEVERAL inner sort keys** (`a.x = c.x AND
+      a.x = c.y` is one outer key and two inner ones; both stay merge clauses,
+      so an inner sorted only by `c.x` would be handed to an operator comparing
+      on `(c.x, c.y)`) — P5.4c-i's one-inner-key-per-group model could not
+      express it, and `mergeInnerSortKeys` is now the single
+      `make_inner_pathkeys_for_merge` BOTH merge arms use, so the siblings
+      cannot drift (Rule #2). **PG's materialize-inner decision has NO goopg
+      analogue**, and that is a finding rather than an omission: PG's mergejoin
+      rewinds the inner with mark/restore so `final_cost_mergejoin` must decide
+      whether to interpose a `Material`, while `mergeJoinStream.bufferGroup`
+      (`internal/executor/join_merge_stream.go:616`) already buffers each inner
+      equal-key group unconditionally, spilling past `work_mem`. Consequences:
+      any presorted inner path is consumable here regardless of kind, no
+      `PathMaterial` is introduced (it would double-buffer), and the COST of
+      that buffering — PG's `rescanratio` plus the group file — is charged by
+      nothing and is LEDGERED rather than guessed. The jointype gauntlet
+      (`nestjoinOK` / `useallclauses`) and the FULL-without-usable-clause
+      contract are ledgered, not written as dead branches:
+      `addPathsToJoinrel` carries no jointype to switch on while 03 §4.4 pins
+      non-INNER outside the search. Still inert (`GOOPG_PGSHAPED_DP` OFF, no
+      `planSelect` caller). 3 ledger rows. 10 new tests.
+      IMPLEMENTATION-TODO P5.4c-ii-c; 03 §5.3. Bar met: UNITS + SPOT. DS05 not
+      applicable and not run — the arm adds paths to a search with no caller, so
+      no plan and no row can move.
+      **Next M0127 selection is P5.5** (`createPlan` arms + the 03 §10
+      search-boundary coordinate map), whose stated prerequisite is the
+      P5.4c-ii-b ledger row: `Path` names neither its index nor its scan
+      direction.
+- [x] **M0127-P5.5-a — `IndexPath.indexinfo` + `indexscandir` on `Path`.** DONE
+      2026-08-04 (`internal/planner/pathindexcarrier.go` + `path.go`,
+      `pathparamindex.go`, `pathindexordered.go`). The stated PREREQUISITE of
+      P5.5, ledgered at P5.4c-ii-b: goopg's `Path` is one flat struct with a
+      `Kind` discriminator, and `PathIndexScan` recorded the ordering, cost and
+      rows of a specific index scan without recording WHICH index produced
+      them — so the DP could choose a path that no `*IndexScan` node can be
+      built from. `ScanDirection` reproduces PG's exact -1/0/+1 encoding
+      (access/sdir.h:24), which buys the zero value as "not an index path" and
+      so needs no second discriminator on the flat struct. The direction is
+      carried although only `ForwardScanDirection` is ever produced, for the
+      same reason `DisabledNodes` is carried at a constant 0: a path that does
+      not SAY its direction silently means forward, and adding the backward arm
+      later would then be a change to every reader rather than to the producer.
+      The invariant with teeth — the recorded direction and the recorded
+      pathkeys must describe the SAME scan, since `build_index_pathkeys`
+      inverts direction AND null placement (pathkeys.c:770-774) — is held
+      STRUCTURALLY: `indexPathOrdering` returns the pair and is the only way
+      either constructor obtains either half, so the two cannot drift (rule
+      #2). `IndexPath.indexclauses` is deliberately NOT carried, ledgered with
+      the finding that blocks a verbatim copy: PG's list is in index-column
+      order while goopg's `bound` is in candidate order, and the executor's
+      `IndexScan.Keys[i]` binds `Index.Columns[i]` positionally. Still inert.
+      2 ledger rows. 6 new tests. IMPLEMENTATION-TODO P5.5-a; 03 §10; 04 §1.1.
+      Bar met: UNITS + SPOT. DS05 not applicable — the fields are written by a
+      search with no `planSelect` caller and `GOOPG_PGSHAPED_DP` is OFF, so no
+      plan and no row can move.
+- [x] **M0127-P5.5-b — `IndexPath.indexclauses` on `Path`, in INDEX-COLUMN
+      order.** DONE 2026-08-04 (`internal/planner/pathindexclauses.go` +
+      `path.go`, `pathparamindex.go`, `pathindexordered.go`). The second half of
+      the index carrier, ledgered at P5.5-a: a parameterised index path was built
+      from `bound []paramIndexClause` and then DISCARDED them once cost and rows
+      were computed. `createPlan` needs them twice —
+      `fix_indexqual_references` (createplan.c:5121) builds the scan's keys from
+      the list, and `is_redundant_with_indexclauses` (createplan.c:3075) uses it
+      to DROP those same clauses from the node's filter quals, which is why the
+      carrier holds the `*restrictInfo` by identity and not just the probe value.
+      **The ORDER is the whole difficulty.** PG's list is ordered by index column
+      because `build_index_paths`' outer loop runs over `indexcol` ("this order
+      is depended on by btree", indxpath.c:1042); goopg's `bound` is in the
+      search's CANDIDATE order — the order the user wrote the join conditions in —
+      and the executor's `IndexScan.Keys[i]` binds `Index.Columns[i]`
+      POSITIONALLY, so a verbatim copy would make a composite probe compare the
+      wrong pair of columns: a wrong answer, not a slow plan. `indexPathClauses`
+      holds the order STRUCTURALLY by looping over `idx.Columns` and looking the
+      clause up per column (PG's own loop shape) rather than by sorting, which
+      would be a second statement of the same fact that a later edit could
+      contradict (rule #2). Its keys agree with
+      `pickIndexCoveringAllLeadingColumns`' ordered list by construction — both
+      read the same first-wins clause set in the same column order — so the path
+      cannot be costed for one probe and built as another. Two narrowings are
+      ledgered rather than written, each a shape goopg's executor cannot express:
+      PG's list is NONdecreasing in `indexcol` (`x > 1 AND x < 5` puts two
+      clauses on one column) while goopg carries one equality per column, and
+      PG's gapped/prefix probe (`amoptionalkey`) is DECLINED outright — nil, not
+      a shortened list, because a shortened list silently re-indexes every
+      position after the gap. The unparameterised ordered path carries an EMPTY
+      list, which is pathnodes.h:1817's "an empty indexclauses list implies a
+      full index scan" and not an omission. Still inert. 3 ledger rows. 7 new
+      tests. IMPLEMENTATION-TODO P5.5-b; 03 §10; 04 §1.1. Bar met: UNITS + SPOT.
+      DS05 not applicable — the field is written by a search with no `planSelect`
+      caller and `GOOPG_PGSHAPED_DP` is OFF, so no plan and no row can move.
+- [x] **M0127-P5.5-c — `create_indexscan_plan`: the first real `createPlan`
+      arm.** DONE 2026-08-04 (`internal/planner/createplanindex.go` +
+      `createplan.go`, `path.go`, `joinsearch.go`, `pathparamindex.go`,
+      `pathindexordered.go`). The consumer of the carrier P5.5-a/-b landed: the
+      arm that turns a chosen `PathIndexScan` back into the `*IndexScan` node
+      goopg's executor runs (createplan.c:3006). The difficulty is not the index
+      but everything else the leaf carries — PG's arm reaches relation, alias,
+      target list and `baserestrictinfo` through `RelOptInfo`'s range-table
+      entry, and goopg's search-only rel knows none of that. Resolved by
+      recording WHAT THE SEARCH WAS HANDED: `RelOptInfo.baseLeaf` carries the
+      leaf `Node` `buildInitialRels` received (the search boundary's half of
+      03 §10's coordinate map — what a base relid MEANS), and the arm re-emits
+      from it. The schema is the LEAF's (a synthesised target list would
+      renumber columns under the quals that reference them); the alias survives
+      (self-join disambiguation, M0062-0002); the local quals survive as
+      re-created `*Filter` wrappers — goopg's `*IndexScan` has no `qpqual`
+      field — rebuilt as NEW nodes because the originals are matched by POINTER
+      identity elsewhere, with `LeafLocal` intact or a posMap pass renumbers the
+      predicate's leaf-local ColumnRefs. `indexScanLeafFor` is ONE predicate
+      with two callers (rule #2): the arm's resolver and the eligibility gate
+      now applied at BOTH index-path producers, so a leaf that cannot be rebuilt
+      as an index scan never has an index path COSTED over it — otherwise the
+      DP prices a plan the builder then refuses. Preconditions panic with the
+      wrong answer named; the dangerous case is a parameterised path with an
+      EMPTY clause list, because empty means FULL INDEX SCAN (pathnodes.h:1817)
+      and building it would silently turn a costed point probe into a
+      whole-relation scan. Still inert (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
+      caller). 2 ledger rows (join-arm residual drop via
+      `is_redundant_with_indexclauses`; `*IndexOnlyScan` leaf declined). 9 new
+      tests (`createplanindex_test.go`). IMPLEMENTATION-TODO P5.5-c; 03 §10;
+      02 §3. Bar met: UNITS + SPOT. DS05 not applicable — the arm is reachable
+      only from the inert search, so no plan and no row can move.
+- [x] **M0127-P5.5-d — `create_seqscan_plan` + `create_sort_plan`: the two
+      structurally simple arms.** DONE 2026-08-04
+      (`internal/planner/createplansimple.go` + `createplan.go`,
+      `createplanindex.go`). The seq-scan arm (createplan.c:2910) is the index
+      arm's mirror over the SAME leaf resolver: `indexScanLeafFor` is renamed
+      `scanLeafFor` and its rewrapper generalised from `*IndexScan` to `Node`
+      (one predicate now serving two arms, rule #2), and `scanIdentity` gains
+      the four `*SeqScan`-only fields (EstRelRows, LockParentOID,
+      SkipIfVanished, InheritParentOID) so the rebuild is LOSSLESS — honouring
+      the struct's stated purpose that a `*SeqScan` field addition is a
+      compile-visible edit there. The arm rebuilds a FRESH node even when the
+      leaf's base scan already is a `*SeqScan` (the emitted tree must never
+      alias nodes the pipeline still owns — `attachRelationLocalFilters`
+      matches leaves by POINTER identity) and DEMOTES an `*IndexScan` leaf when
+      the search costed the sequential scan cheaper. Panics: a parameterised
+      seq scan is undischargeable (nothing above it can ever bind
+      `RequiredOuter`); claimed pathkeys are an ordering a heap scan does not
+      deliver (a merge above would trust it and emit wrong rows); index detail
+      means a costed probe was mislabelled. The sort arm (createplan.c:2177) is
+      the first arm with a CHILD path — it recurses via `createPlan`, which is
+      why it lands BEFORE P5.5-e's join arms: P5.4c's merge paths already carry
+      `PathSort` children (`sortPathFor`), so the merge arm cannot be written
+      until this one exists. Key translation is direction-only
+      (`PathKey.SortAsc` negated into the executor's `SortKey.Desc`,
+      NullsFirst carried through). 2 ledger rows (`generateScanPaths` lacks the
+      shared `scanLeafFor` gate — must be applied at C4 wiring;
+      CP_SMALL_TLIST width trim before the sort has no analogue). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no `planSelect` caller). 7 new tests
+      (`createplansimple_test.go`). IMPLEMENTATION-TODO P5.5-d; 03 §3, §5.3,
+      §10. Bar met: UNITS + SPOT. DS05 not applicable — the arms are reachable
+      only from the inert search, so no plan and no row can move.
+- [x] **M0127-P5.5-e-i — the coordinate carrier + `create_hashjoin_plan`: the
+      first join arm.** DONE 2026-08-04 (`internal/planner/createplanjoin.go` +
+      `createplan.go`, `createplansimple.go`, `path.go`, `joinsearch.go`). The
+      scan and sort arms could ignore coordinates — a scan's schema is its
+      leaf's, a sort moves rows not columns — but a join MERGES two schemas and
+      cannot emit a key without answering the question. And the question has
+      teeth: every `restrictInfo.clause` is written in pre-search BINDING
+      coordinates, not incidentally but because `relidsOfExpr` DECIDES a
+      clause's relset by bucketing its `ColumnRef.Index` against exactly those
+      offsets, while the emitted tree is a cost-chosen reordering — so a clause
+      copied across unchanged keys on whichever column happened to land at that
+      index, which runs and returns wrong rows. Resolved by carrying the map
+      through the recursion rather than re-deriving it:
+      `createPlanNode(p) (Node, outputLayout)`, `outputLayout[i]` = output
+      column i's binding coordinate, seeded by `RelOptInfo.baseOffset`
+      (recorded beside `baseLeaf` at `buildInitialRels` — `baseLeaf` says what a
+      relid MEANS, `baseOffset` where it USED TO BE), passed through by a sort
+      and concatenated by a join in the SAME statement that concatenates the
+      schema, so it cannot drift from the tree. `translateToLayout` is
+      `set_join_references` (setrefs.c:2557) at goopg's fidelity — one
+      renumbering onto the merged row, not PG's OUTER_VAR/INNER_VAR split, since
+      goopg's executor evaluates one merged row — on `cloneExprRefs` so the
+      search's own clauses are never mutated, `scopeIgnore` to agree with
+      `relidsOfExpr` (rule #2), refusing the two non-positional references.
+      `BuildLeft` is never set: `generateHashJoinPaths` adds both orientations
+      as paths and `add_path` keeps the cheaper, so the build side was decided
+      BY COST in the child order — a second opinion here is the uncosted
+      name-tag rule 06 §2.1 retires. 2 ledger rows (`joinqual`/`qpqual` split
+      folded into one `Predicate` — equivalent for inner joins, wrong the moment
+      an outer join enters the search; SubPlan args not re-based). 1 inventory
+      pin. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests. Bar met: UNITS +
+      SPOT. DS05 not applicable — reachable only from the inert search.
+- [x] **M0127-P5.5-e-ii-a — `create_mergejoin_plan`: the second join arm, and
+      the sort nodes goopg must DELETE where PG creates them.** DONE 2026-08-04
+      (`internal/planner/createplanjoin.go` + `createplan.go`,
+      `createplansimple.go`). P5.5-e-i's prologue was lifted into
+      `joinInputsFor` / `keyPairs` / `joinPredicate` in the same commit so both
+      arms build the merged row from ONE piece of code — two arms concatenating
+      schema and layout separately drift, and the drift is a wrong-column join
+      that still runs. Merge-only fact 1: **the key list IS the sort order.**
+      `sortInnerAndOuter` concatenates the key GROUPS in the pathkey order it
+      chose and `mergeSideKeyExprs` sorts each side by the tuple in
+      `Join.HashKeys` order, so that list is `outersortkeys`/`innersortkeys`,
+      not a set — the arm preserves the given order AND folds the keys into
+      `Predicate` in it, because `fillJoinHashKeys` rebuilds the published list
+      from `Predicate` at the tail of `Plan()`, so re-ordering there re-orders
+      the SORT. Merge-only fact 2: **the explicit `PathSort` children are
+      absorbed.** PG materialises a Sort here because `nodeMergejoin` requires
+      sorted input; goopg's `JoinAlgoMerge` operator sorts both inputs itself,
+      unconditionally (`openMergeJoin`), so emitting the child Sort sorts each
+      side twice — a cost `tryMergeJoinPath` never charged. `absorbMergeSort`
+      steps over it (coordinate-neutral: a sort passes its layout through) and
+      the arm refuses any descending/nulls-first result or absorbed-sort key,
+      because goopg's merge comparator is fixed ascending/NULL-keys-last — a
+      standing guard for P5.4c-ii's ordered index paths. Also fixed: a latent
+      P5.5-d defect this arm made reachable — `createSortPlan` emitted its
+      pathkey expressions UNTRANSLATED, so a sort over a rel not first in
+      binding order ordered by whichever column sat at that index; now re-based
+      through the same `translateToLayout` (rule #2). 2 ledger rows. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). 4 new tests + 1 strengthened. Bar met: UNITS +
+      SPOT.
+- [x] **M0127-P5.5-e-ii-b — `create_nestloop_plan`: the nested-loop arms.**
+      DONE 2026-08-04 (`internal/planner/createplannl.go` new, +
+      `createplan.go`, `createplanindex.go`, `pathparamindex.go`,
+      `joinpathsnli.go`). One path kind, TWO executor nodes: the arm dispatches
+      on the INNER CHILD's `RequiredOuter` (the same fact PG dispatches on when
+      it emits `NestLoopParam`), so `addNestLoopPath`'s plain loop becomes a
+      `*Join{JoinAlgoNestedLoop}` and `addNLIPaths`' pair becomes a
+      `*NestedLoopIndexJoin` — a different TYPE, not a flag, because its `Inner`
+      is a `*IndexScan` the driver calls `Rescan` on. **The finding: an NLI is
+      the first node here whose expressions live in TWO coordinate spaces.**
+      `indexScanOp.Rescan` evaluates the probe keys against the slot the parent
+      bound — the OUTER row alone, since the inner row does not exist yet — while
+      the residual is evaluated through `virtualOut` over `outer ++ inner`. So
+      the keys are re-based onto the outer layout (taken as the PREFIX of the
+      merged one, not re-derived) and the residual onto the merged one. On a
+      two-rel query with the outer first in binding order the two spaces
+      coincide, so a single-space arm builds a runnable node and probes the
+      wrong column the moment the search reorders the join — the tests put the
+      outer second for exactly that reason. **Second finding, a live defect in
+      the producer:** `nestloopResidualClauses` reproduced PG's movability drop,
+      but PG may drop on movability alone only because `ppi_clauses` +
+      `qpqual` really do apply every movable clause down there. goopg's
+      parameterised inner applies only `Path.IndexClauses` and its `*IndexScan`
+      has no qual field, so `b.y > a.x` was dropped from the join residual and
+      enforced by NOTHING. Narrowed to `probeEnforcedClauses` (by `restrictInfo`
+      identity, against the same list `createPlan` turns into `IndexScan.Keys`);
+      the EC half is not reproduced because `selectivityClauses` already reduced
+      each class to one member. Also: `addParameterizedIndexPaths` now declines
+      a `*Filter`-wrapped leaf (`scanLeafIsBare`) — `NestedLoopIndexJoin.Inner`
+      cannot carry it and hoisting is the D6.3b Q9 blowup. 3 ledger rows. Still
+      inert (`GOOPG_PGSHAPED_DP` OFF). 6 new tests + 1 rewritten. Bar met:
+      UNITS + SPOT.
+- [x] **M0127-P5.5-f-i — the search boundary: 03 §10's coordinate map, and the
+      one node that makes it invisible above the search root.** DONE 2026-08-04
+      (`internal/planner/createplanroot.go` new).
+      `createPlanAtSearchRoot(p, bindingWidth)` is now the only `createPlan`
+      entry point a search caller may use: `createPlanNode` returns the search's
+      own cost-chosen column order, which is correct for a child of another join
+      arm and wrong for everything else — and the enclosing tree (top Project
+      targets, retained Filters, Sort keys, Aggregate arguments, the pinned
+      unnest spine) is written in PRE-SEARCH BINDING coordinates because that is
+      the space `planSelect` resolved it in. **The finding that decided the
+      variant 03 §10 left open:** at the search root, §10's canonical RELID
+      order and the pre-search BINDING order are THE SAME SEQUENCE —
+      `buildInitialRels` assigns relid `1<<i` to FROM item `i` and records an
+      ascending `baseOffset`, and the root's relset is the FULL set. So the
+      reordering `Project` is not a way around the canonical layout, it IS that
+      layout materialised at the one place §10 requires it observable; it
+      collapses the boundary map to the identity for every consumer above (the
+      enclosing tree needs no rewrite at all), and the map survives in exactly
+      one place — that node's target list. It is elided when the search left the
+      columns where the bindings put them, the leading left-deep case.
+      **Second finding, from a test that failed:** `bindingWidth` must be a
+      PARAMETER, not `len(layout)`. A FROM item that never entered the search
+      yields a root that is entirely self-consistent and permutation-clean when
+      judged against its OWN width, while missing columns the enclosing tree
+      still references — the M0097-0058 shape exactly, and detectable only from
+      outside. `boundaryMap` refuses holes, out-of-range coordinates and
+      duplicates against the caller's number. §10's plan-time tripwire is real
+      code now (`assertColumnRefsWithinSchema`, turning that class from an
+      execution-time slice panic into an attributable planner bug) but is
+      applied to the boundary node alone. 2 ledger rows: PG adds NO node here
+      (`set_upper_references`, setrefs.c:2214, renumbers upper Vars in place, so
+      the boundary `Project` is a node PG never prints), and the tripwire's
+      one-node scope. Still inert (`GOOPG_PGSHAPED_DP` OFF). 8 new tests
+      (`createplanroot_test.go`). IMPLEMENTATION-TODO P5.5-f-i; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT.
+- [x] **M0127-P5.5-f-ii-a — the searched-subtree tag: making the legacy
+      layout-correction family skip, and finding out that half of it already
+      did.** DONE 2026-08-04 (`internal/planner/searchedtree.go` new).
+      `searchedTree` is a one-bit embedded tag on the seven node kinds
+      `createPlanAtSearchRoot` can return as a root; `markSearchedTree` PANICS
+      on any other kind, because the failure mode of a future arm returning an
+      untaught root kind is a SILENTLY untagged subtree — a plan that runs and
+      returns wrong rows. Three skips consume it: `buildBindingsPosMap`'s
+      collector treats a tagged root as an opaque leaf (advance past its width,
+      record no scan entry, so every binding inside it falls through the
+      returned closure unchanged — the identity, which is the truth),
+      `applyJoinTreePosMap` returns at one, `reconcileNLILayout` returns at one.
+      **The measured finding that reshaped the task:** the boundary `Project`
+      was ALREADY opaque to the whole family — not for search reasons, but
+      because M0125-0012 (TPC-DS Q8) made every `*Project` in a join tree a
+      scope boundary on both sides of the map so that build and apply stop at
+      the same nodes. A probe confirms `buildBindingsPosMap` returns nil over it
+      and no target moves. The hole was the **elided** root: with the columns
+      already in binding order there is no Project to stop at and both passes
+      walk into a bare `*Join`. The numeric half of that is provably harmless
+      (identity layout ⇒ identity map, since `collect`'s DFS order over a join
+      IS its output order) — but `applyJoinTreePosMap`'s `*Join` arm calls
+      `reresolveJoinByName` and `reconcileNLILayout` is name resolution end to
+      end, and those rebind the searched joins' keys by NAME over a layout
+      derived by COORDINATE one node earlier. **Second finding:**
+      `assertSearchedTreeNeedsNoReconcile` (the no-op assertion — it runs the
+      real pass over the join tree below the boundary and panics if any
+      `ColumnRef` moved) is weaker evidence than it looks: it abstains on an
+      unnamed operand, on an ambiguous name, and on everything the pass does not
+      rebind — and the P5.5-e fixtures build operands with `col(i)`, i.e.
+      UNNAMED, so reusing them would have made every assertion pass vacuously.
+      The tests supply their own named-clause helper. 2 ledger rows. 10 new
+      tests (`searchedtree_test.go`), two of which pin PRE-task behaviour so a
+      later simplification can see which half was already covered. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). IMPLEMENTATION-TODO P5.5-f-ii-a; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT.
+- [x] **M0127-P5.5 — `createPlan` arms for all live PathKinds → existing
+      Nodes** (closed by its last sub-item, P5.5-f-ii-b: the pinned-spine
+      re-resolution consumes the boundary map and the tripwire is widened from
+      the boundary node to the enclosing tree). DONE 2026-08-04
+      (`internal/planner/enclosingtree.go` new, `predp.go` call site).
+      When the subtree spliced under the pinned spine carries the
+      searched-subtree tag, `assertSpineConsumesIdentityBoundaryMap` checks
+      column-by-column (Name, SourceTableIdx) that the boundary republished the
+      concatenation the spine was resolved against, and the re-resolution
+      returns without rebinding — the skip is now proved, not argued.
+      **The finding that decided how it is written:** reading
+      `layoutPosMap == nil` as "the map is the identity" would have been WRONG.
+      That helper returns nil for two different reasons — "identical, nothing to
+      remap" and "widths differ, refuse to remap rather than corrupt" — so a
+      boundary that lost or gained a column takes the second door and is
+      indistinguishable from success while the enclosing tree goes on
+      referencing columns that moved (the M0097-0058 shape through a different
+      door). The assertion compares the schemas itself and never consults `pm`.
+      The tripwire is `assertEnclosingTreeColumnRefs` over ONE switch
+      (`enclosingNodeScopeOf`) answering which expressions / against what width /
+      which children continue the walk, because those are one fact about a node
+      (rule #2): a `*Join`'s predicate and BOTH keys index the merged
+      `Left ++ Right` row even for Semi/Anti — whose `Output()` is Left only, so
+      checking against `Output()` would reject every legal right-side key on the
+      pinned spine — and a `*NestedLoopIndexJoin` is descended on the OUTER side
+      only, its inner probe keys living in the outer's coordinate space.
+      **Second finding:** with 53 node kinds, a partial walk that stops at
+      unenumerated kinds checks NOTHING and returns normally whenever the kind it
+      stops at sits on the path to the searched subtree — P5.5-f-ii-a's vacuity
+      finding one level up, and harder to see because a tree walk looks
+      exhaustive. The guard is therefore on the partiality, not the enumeration:
+      a stop is not a panic, but the walk must REACH a searched subtree or the
+      assertion fails naming every kind it stopped at. 2 ledger rows (the
+      partial enumeration + `walkPlanExprs`'s missing
+      `Aggregate.Passthrough`/`AggregateCall.Filter`/`WindowFunc` expressions;
+      and `pushOneConjunct` as the fourth legacy family member not taught about
+      the tag). 12 new tests (`enclosingtree_test.go`). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF). IMPLEMENTATION-TODO P5.5-f-ii-b; 03 §10; 02 §3.
+      Bar met: UNITS + SPOT. DS05 + PLAN re-baseline not applicable — the whole
+      change is reachable only from a tagged node, and only
+      `createPlanAtSearchRoot` tags, which nothing calls from `planSelect`; no
+      plan can move.
+- [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
+      FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build
+      penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
+      joinrel). Re-evaluate M0125-0003 stage 3 here (rows-once per RelOptInfo,
+      04 §2). IMPLEMENTATION-TODO P5.6; 04 §3; 09 §5. Bar: UNITS + DS05 +
+      estimate audit run. **DECOMPOSED into -a … -e below** (04 §3's remedy set
+      is four mechanisms and a measurement, in a mandatory order).
+- [x] **M0127-P5.6-a — the per-clause selectivity substrate: `examine_variable`,
+      `get_variable_numdistinct`, `eqjoinsel`'s no-MCV arm.** DONE 2026-08-04
+      (`internal/planner/joinselectivity.go` new,
+      `internal/catalog/catalog.go` `ColumnStats.StaDistinct` new, its two
+      existing open-coded copies switched over).
+      The compounding P5.6 exists to end has a specific source: the legacy
+      `estimateJoinCost` divides |L|·|R| by the PRODUCT of every spanning
+      edge's per-side NDV (bushy.go:1266-1301), where PG divides by ONE
+      ndistinct — the LARGER of the two sides' — per clause, because
+      upstream's estimate is the MINIMUM of two upper bounds rather than a
+      per-edge product. Over a chain of correlated equalities the product
+      charges one restriction several times; that is the same double-count
+      04 §5 says the ×2.0 `inferredEdgePenalty` was papering over, in the cost
+      dimension instead of the cardinality one where the error lives.
+      **The finding that decided the dispatcher:** the OPERATOR decides which
+      estimator runs, `isEquijoin` does not. `a.x = b.y + c.z` is an equality
+      that splits into no two one-sided operands, so it can key no hash join
+      and the flag is false — but PG still prices it with `eqjoinsel`, and
+      sending it to `clause_selectivity`'s 0.5 fall-through would charge 100×
+      the 0.005 upstream charges, on every joinrel above it. What the flag
+      does govern is only which OPERANDS are examined: `restrictInfo.leftKey`
+      is the canonical left of the SPLIT, which the builder is free to have
+      taken from the clause's right-hand side, so pairing `bo.Left` with
+      `ri.leftRelids` would read one relation's column against another
+      relation's statistics.
+      **Second finding:** goopg splits upstream's one signed `stadistinct`
+      into `NDistinct` + `NDistinctFrac`, and the reduction back to PG's
+      convention was open-coded twice already (the pg_statistic heap row and
+      the pg_stats view). A third copy inside the estimator is precisely the
+      sibling shape where the planner plans on a different number than the one
+      it publishes to the user, so it became `ColumnStats.StaDistinct` and all
+      three read it (rule #2). Resolution is by column NAME, not by
+      `ColumnRef.Index` — the search's clauses live in the pre-search
+      concatenation's coordinate space (03 §10), so a positional read of
+      `Stats.Columns` would pick a different column for every relation that is
+      not first in the FROM list. 3 ledger rows (eqjoinsel's MCV arm;
+      `vardata->isunique`, which is P5.6-b's own mechanism;
+      `examine_variable`'s subquery / expression-operand arms). 17 tests
+      (`joinselectivity_test.go`). Still inert (`GOOPG_PGSHAPED_DP` OFF and
+      `sizeJoinRel` still has no production implementation).
+      IMPLEMENTATION-TODO P5.6-a; 04 §3.2. Bar met: UNITS. DS05 + SPOT + PLAN
+      not applicable — no production caller exists, so no plan can move.
+- [x] **M0127-P5.6-b — `calcJoinrelSize` + the concrete `joinRelBuilder`.**
+      DONE 2026-08-04 (`internal/planner/joinrelsize.go` new;
+      `selectivityClauses`' winner rule factored out into
+      `oneClausePerEquivClass`; `examineJoinVar`'s operand resolution factored
+      into `resolveJoinVarColumn`, which the superkey test reads too).
+      04 §3.1's FK/unique-superkey generalisation over clause SUBSETS driving
+      04 §2's rows-once discipline: `sizeJoinRel` at find-or-create time,
+      before any path is generated, through `searchJoinRelBuilder` — the
+      concrete builder that binds sizing to `addPathsToJoinrel` and closes the
+      last seam `makeJoinRel` left open.
+      **The finding that shaped the mechanism:** the no-fan-out cannot be a
+      divisor bolted onto the per-clause estimate; it has to be PG's
+      remove-and-substitute. `get_foreign_key_join_selectivity` takes the
+      covered clauses OUT of the restriction list and puts one `1/raw-tuples`
+      in their place, and it is the REMOVAL that stops those clauses being
+      charged a second time by eqjoinsel. On a composite key the difference is
+      not cosmetic: the per-column marginals price the join at
+      `1/nd_a · 1/nd_b`, on the test's `partsupp` shape 2.5e6× tighter than the
+      `1/800000` the key implies — the compounding P5.6 exists to end.
+      **Second finding (the asymmetry that is easy to get backwards):** a
+      UNIQUE index makes its OWN relation the key side, but a declared FK makes
+      its relation the CHILD, so the divisor is the PARENT's raw count
+      (`1.0/ref_tuples`, costsize.c:5847). The legacy `uniqueNoFanoutRawCount`
+      divides by whichever table carried the constraint, which on a
+      fact-to-dimension join divides the fact table's own cardinality out of
+      the estimate; ledgered rather than fixed, because that estimator belongs
+      to the other cost model and P6.3 deletes it. Three further upstream
+      properties reproduced deliberately: the RAW (not filtered) divisor,
+      whole-key cover (`⊆` tests the KEY's columns — extra equated columns stay
+      residual and are charged on top), and a clause consumed at most once.
+      4 ledger rows (joinrel width = sum of input widths vs
+      `build_joinrel_tlist`; `vardata->isunique` still unset in
+      `examineJoinVar`; the legacy child-divisor defect; the `nconst_ec`
+      correction). 12 tests (`joinrelsize_test.go`). Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no production caller).
+      IMPLEMENTATION-TODO P5.6-b; 04 §2, §3.1. Bar met: UNITS. DS05 + SPOT +
+      PLAN not applicable — no production caller exists, so no plan can move.
+- [x] **M0127-P5.6-c — the clamp discipline** (04 §3.3): the FK-implied bound
+      when a validated FK covers the join, with M0126-0010's `max(l,r)` cap
+      kept beside it for the non-FK fallback. Landed 2026-08-04 as
+      `keyImpliedRowsBound` + two clamps in `calcJoinrelSize`
+      (`internal/planner/joinrelsize.go`).
+      The two clamps are deliberately different in kind. The key-implied bound
+      is a COUNTING argument — a proven key means each row of the other side
+      matches at most one row of the key side, so the output cannot exceed the
+      other side's rows, whatever the selectivities multiplied out to — and it
+      is therefore generalised beyond declared FKs to every key P5.6-b's
+      superkey pass proves. It is taken only when the key relation is the WHOLE
+      of its side: inside a multi-relation input a lower join may already have
+      duplicated its rows, and the counting argument then gives nothing
+      (ledgered). With consistent inputs the product lands exactly ON the
+      bound, so what the clamp catches is the two disagreeing — a key side
+      whose row estimate has outgrown its ANALYZE-time raw count divides by a
+      tenth of what it will read and claims a 10× fan-out from a join that
+      cannot fan out at all.
+      The `max(l,r)` cap is a heuristic with NO upstream counterpart
+      (`calc_joinrel_size_estimate` never bounds an inner join by its inputs),
+      so it fires only where M0126-0010's does: nothing proven AND every
+      residual clause priced by a selfuncs.h constant. That condition is PG's
+      `*isdefault` finally consumed — `eqJoinSelectivityExt` reports the flag
+      of the side whose ndistinct actually divided, not the disjunction, so an
+      equality against one unanalysed operand is still a measurement when the
+      other side's million distinct values won the denominator. Capping a
+      measured estimate would truncate genuine many-to-many joins; capping a
+      clause-less join would truncate a cross product.
+      `superkeyJoinSelectivity` now returns a `superkeyEstimate` (sel,
+      residual, fired, rowsBound) because "a key fired" cannot be recovered
+      from the selectivity afterwards. 7 new tests, incl. the two that pin the
+      soundness restriction and the not-capped cases. Still inert
+      (`GOOPG_PGSHAPED_DP` OFF, no production caller). 2 ledger rows: the
+      multi-rel key side, and the cap's divergence from upstream (it dies with
+      eqjoinsel's MCV arm). IMPLEMENTATION-TODO P5.6-c; 04 §3.3.
+      Bar met: UNITS. DS05 + SPOT + PLAN not applicable — no plan can move
+      while the sizer has no production caller.
+- [x] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
+      once 04 §4's honest batch-I/O term prices what it stood in for.
+      IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.
+      **UNBLOCKED 2026-08-05 by M0127-P5.7-a**: the honest term now exists and
+      the penalty's sibling inside `hashJoinCost` (M0126-0013's
+      `seq_page_cost × innerRows/100`) is already gone. What remains at
+      `costJoinCandidate` is the separate `largeBuildThreshold` quadratic
+      overshoot, which the `NBatch > 1` charge now covers — and covers better,
+      since 2 M rows is a fixed row count while the real threshold depends on
+      the row's width. Note when doing it: the penalty lives on the
+      `costDrivenJoinOrder` arm, so DS05 will show no movement unless the sweep
+      runs with that flag ON.
+      **DONE 2026-08-05.** The block is gone; `costJoinCandidate`'s hash cost is
+      now exactly `hashJoinCost`. The width point above is the measured one:
+      against the 512 MB default budget a 4 M-row 1-column build FITS and the
+      row-count form charged it 40 000, while a 1 M-row 40-column build spills
+      to 4 batches and it charged nothing. `TestCostJoinCandidateLargeBuildPressure`
+      is replaced by `TestCostJoinCandidateHasNoRowCountPenalty` (equality with
+      the bare cost function — fails if a penalty is re-added) and
+      `TestCostJoinCandidateStillDetersHugeBuilds` (the defence survives via the
+      spill term). No deferral row: upstream has no such penalty, so nothing PG
+      does is left unimplemented. Bar met: UNITS + SPOT. DS05 not run — as the
+      note predicted, the arm is OFF by default, so the default planner is
+      byte-identical; 04 §4.2 records the same scope note for benchmark readers.
+- [x] **M0127-P5.6-e-i — the estimate-audit INSTRUMENT + pre-flip baseline**
+      (09 §5.1/§5.2): `cmd/estimate-audit` + `internal/estimateaudit`. One
+      `EXPLAIN ANALYZE` per query supplies both sides (cost `rows=` and
+      `actual rows=`); the unit of audit is the JOINREL, not the node; the
+      binary exits non-zero on a violation, so it is instrument and tripwire
+      in one. **The finding that shaped it: the audit was unrunnable on the
+      query 09 §5 names.** goopg does not propagate worker instrumentation
+      out of a `Gather` (upstream merges it in `execParallel.c`
+      `ExecParallelRetrieveInstrumentation`), and Q9 plans entirely below
+      one — the first run measured `(no ANALYZE)` for every joinrel of 10 of
+      12 queries. Hence `--serial`. Two further conditions are load-bearing:
+      per-connection ANALYZE stats (`--warm-stats`, ONE session for the whole
+      run — a pooled connection measures the blind planner) and goopg's
+      CUMULATIVE `actual rows=` where PG prints the per-loop average (a
+      PG-calibrated reader multiplying by `loops` inflates every nested-loop
+      inner node by exactly the loop count). Baseline (legacy planner, all 22
+      queries, 12 min): five joinrels over 10³, worst Q18's final SEMI at
+      2.5 × 10⁷ over; **Q9's final joinrel 124.7× over** — just outside §5's
+      ≤ 10² bar, its three outermost joinrels all carrying the same estimate
+      while the actual collapses 19× across them. Output committed under
+      `analysis/leftdeep-joins/` (+ a provenance README). 12 tests. 4 ledger
+      rows. IMPLEMENTATION-TODO P5.6-e-i; 09 §5.1/§5.2. Bar met: UNITS + the
+      audit run. DS05 not applicable — new tool + new package with no
+      importer in the engine; zero planner/executor lines changed.
+- [x] **M0127-P5.6-e-ii — close the two class-(a) causes the baseline
+      isolated** (09 §5.2): a SEMI/ANTI joinrel priced at its outer input
+      verbatim (`calc_joinrel_size_estimate`'s JOIN_SEMI arm, costsize.c —
+      Q18/Q20/Q22), and a joinrel's non-equi restriction contributing no
+      selectivity (Q19's three-branch OR, Q3's re-applied `Filter:`); then
+      re-run the audit. Q9's ≤ 10² bar is P5.9's to certify on the post-flip
+      planner. Landed in `internal/planner/cardinality.go` +
+      `selectivity.go`: the JOIN_SEMI/JOIN_ANTI arms with `eqjoinsel_semi`'s
+      no-MCV match fraction (incl. its asymmetric nd2-to-inner-rows clamp),
+      and `clauseSelectivity` over the conjuncts `HashKeys` does not answer —
+      BOTH-sided ones only, since a single-sided conjunct is a
+      baserestrictinfo already priced into the component rel even though
+      goopg leaves a copy on the join. Audit: Q19 328 705× → 13.1× under,
+      Q20-final 891× → 9.5× under, Q21 499× → 9.7× under, Q22 643× → 1.8×,
+      Q4 485× → 7.3×; Q18 halved; **Q9 unchanged at 124.7×**; no new
+      violations (09 §5.3, `analysis/leftdeep-joins/2026-08-04-p56eii*`).
+      **The finding that shaped the scope:** the join-key ndistinct lookup is
+      ALSO wrong (`RightKey.Index` is a MERGED index resolved against the
+      right child's own schema, so the right side of an equi-join never
+      entered `max(nd)`), and correcting it was measured as a large net
+      REGRESSION — Q9's final 124.7× → 176 424× over — because a saturated
+      ANALYZE ndistinct compounds and because supplying `nd` removes the
+      M0126-0010 cap. Spun out as P5.6-e-iii with the rejected run kept as
+      evidence. IMPLEMENTATION-TODO P5.6-e-ii. Bar met: UNITS + DS05
+      (PASS=94/MISMATCH=0, identical to the two prior sweeps) + SPOT
+      (Q12=2, Q13=35) + the audit run.
+- [x] **M0127-P5.6-e-iii — de-saturate ANALYZE's ndistinct, then fix the
+      join-key coordinate space.** Haas–Stokes in `compute_distinct_stats`
+      terms (`internal/executor/operators_analyze.go`, upstream analyze.c):
+      goopg stores the SAMPLE's distinct count, so a 1.5 M-row unique key
+      reads as ≈ 30 000 and every join above it divides by a number 50× too
+      small. Only then resolve `LeftKey`/`RightKey` in the merged left‖right
+      space and give `columnNDistinctForChild` its `*Join` arm (its
+      `columnStatsForChild` twin already has one — the divergence is
+      deliberate and commented at both ends). Re-examine the M0126-0010 cap
+      in the same loop: it bounds a join at max(|l|,|r|) only on the
+      nd-unavailable path, so it silently disappears the moment nd resolves.
+      Evidence: `analysis/leftdeep-joins/2026-08-04-p56eii-postfix.txt`,
+      09 §5.3. IMPLEMENTATION-TODO P5.6-e-iii. Bar: UNITS + DS05 + audit run.
+      **DONE 2026-08-04.** Landed: `executor.ndistinctEstimate` (mirrors
+      `compute_scalar_stats`'s three ndistinct branches, analyze.c:2588-2648);
+      `NDistinct`/`NDistinctFrac` are now two renderings of ONE estimate and
+      `StaDistinct()` picks between them with upstream's 10%-of-rows rule;
+      `estimateJoin`'s equi arm reads the right key through
+      `rightKeyNDistinct`; `columnNDistinctForChild` gained its `*Join` arm and
+      the divergence tripwire is retired. Cap re-examined and deliberately
+      left fallback-only (it stands in for upstream's FK `fkselec`; a real
+      many-to-many join legitimately exceeds max(|l|,|r|)). Audit violations
+      **5 → 2** — Q3 2967× → 10.4×, Q5 447× → 1.5×, Q7 1190× under → 1.4×,
+      Q8 20.7× → 1.3×, Q17 7.5× → 1.0×, Q18 1.26e7× → 42837×, Q20-inner
+      1311× → 129×. Two regressions FILED, not papered over (09 §5.4 + three
+      ledger rows): SEMI/ANTI collapse to `est=1` (Q21 final ANTI is a new
+      violation, 9.7× → 4003× under; needs `eqjoinsel_semi`'s MCV arm) and
+      **Q9 UNMEASURED** (93.9 s → >150 s). Bar met: UNITS + DS05 (PASS=94/
+      MISMATCH=0/CKMISMATCH=0, identical to the three prior sweeps) + SPOT
+      (Q12=2, Q13=35) + the audit run.
+- [x] **M0127-P5.6-f-pre — the FK/unique evidence P5.6-f needs does not
+      survive a restart (found + fixed 2026-08-04).** P5.6-f's second half
+      reads a UNIQUE index or a declared FK; goopg's TPC-H bench cluster
+      (db `tpch`) has **0 of each** against the PG 18.3 reference's **16
+      indexes and 8 constraints**. Root cause is a composed regression, not a
+      load failure: 4e follow-up 39 deferred index rows on the ground that
+      `RecordKindCreateIndex(20)`/`DropIndex(21)` still carried them, and B5
+      Slice A later retired 20/21 on the premise that
+      `loadUserIndexesFromHeap` had replaced them — but that reload scans ONE
+      database, and the write went to a different one, so `CREATE INDEX` /
+      `PRIMARY KEY` / `ADD CONSTRAINT` on any non-default database was durable
+      nowhere. Landed: per-DB routing on both sides + `Index.DBOid` on the
+      recovery path (without which the index came back as metadata that no
+      longer ENFORCED — a UNIQUE index accepting duplicates after restart).
+      `TestDistinctDatabaseIndexSurvivesRestartInOwnNamespace`; design
+      `0122-0018` new section; ledger row dated 2026-08-04. Bar met: UNITS +
+      SPOT (Q12=2, Q13=35) + DS05 + the four affected packages.
+      **Forward-only — see P5.6-f's step 0.**
+- [x] **M0127-P5.6-f — multi-key equi-join pricing + `fkselec`, the two
+      halves that must land together (DONE 2026-08-04).** Q9's
+      `l_suppkey = ps_suppkey AND l_partkey = ps_partkey` was priced on ONE
+      pair while `Join.Residual()` excluded BOTH. Landed together, as the item
+      required: `joinEquiPairs` folded over every pair AND the same list
+      excluded by `joinResidualSelectivity`; plus
+      `get_foreign_key_join_selectivity` (costsize.c:5651) for the legacy
+      estimator in `internal/planner/joinkeyproof.go`, reading uniqueness
+      evidence stamped on the leaf scans (`SeqScan/IndexScan.UniqueKeys`,
+      stamped where `SmallDim` already is, through the planner's own `cat`).
+      Step 0 was done FIRST and is recorded: the eight UNIQUE indexes the PG
+      reference declares were re-created on the bench cluster (they survive a
+      restart — first real-cluster validation of the P5.6-f-pre fix) and the
+      audit was RE-BASELINED on them
+      (`analysis/leftdeep-joins/2026-08-04-p56f-baseline-idx.txt`), which
+      reports the identical two violations as the index-free `p56eiii` run —
+      so the whole delta is the planner change. Result: violations 2 → 2,
+      **no joinrel worse**, Q9's target joinrel 479 779 280 (80× over) →
+      **5 997 241, exact**; Q20 d3 12.2× → 3.1× over, d2 SEMI 125× → 31.7×
+      over. 09 §5.5; three ledger rows dated 2026-08-04. Bar met: UNITS +
+      SPOT (Q12=2, Q13=35) + DS05 + the re-baselined audit run.
+      **Q9 is measurable again — at 291.8 s, not inside the audit's 150 s.**
+      Its cardinality defect is closed; the residue is class (b) and is
+      P5.6-f-ii below.
+- [x] **M0127-P5.6-f-ii — the legacy join-order SEARCH does not use
+      `estimateJoin`, so P5.6-f never reached plan shape.** Measured, not
+      inferred: with Q9's joinrel now EXACT its plan is byte-identical, still
+      applying the 5.3 %-selective `part` filter ABOVE three hash joins that
+      each carry the full 5 997 241 rows (PG filters `part` first and index-
+      scans lineitem via `lineitem_part_supp_fkidx`). The cause is a second
+      cardinality implementation: `estimateJoinCost` (bushy.go:1257). Its
+      PRODUCTION branch — the integer DP, `costDrivenJoinOrder` OFF — computes
+      `ndv` as the maximum NDistinct over EVERY column of the edge's two
+      tables, ignoring the join key entirely; the multi-edge enumeration and
+      superkey probe beside it (`crossEdgesBetween` +
+      `uniqueNoFanoutRawCount`) are gated on the flag M0126 closed as a no-go
+      and left OFF, and that probe's FK arm divides by the CHILD's raw count
+      where upstream divides by the PARENT's (costsize.c:5847). Resume point:
+      enumerate `crossEdgesBetween` unconditionally and run a
+      `joinkeyproof.go`-shaped prover over `g.tables` (the catalog is already
+      in scope there). Ledger row dated 2026-08-04. Bar: UNITS + DS05 +
+      PLAN + audit run with Q9 inside the 150 s timeout.
+      **DONE 2026-08-05.** The named cause was real and NOT sufficient; two
+      more were found by instrumenting the DP, and all three had to land
+      together. (1) `graphJoinKeyDivisor` (joinkeyproof.go) is
+      `superkeyJoinEstimate`'s algorithm arm-for-arm in the join-GRAPH
+      coordinate space, and now feeds BOTH search modes — `uniqueNoFanoutRawCount`
+      is deleted with its child-vs-parent FK inversion. (2) **A `joinEdge`'s key
+      `ColumnRef.Index` is in GLOBAL FROM-list coordinates** (Q5's `c_nationkey`
+      is `Index: 16` against an 8-column `customer`), so `accurateKeyDistinct`
+      returned 0 for every join key in the query and `sideKeyDistinct` served
+      the table-wide max instead — or, in range by accident, answered with
+      `n_comment` for `n_nationkey`. Third instance of the P5.6-e-ii `RightKey`
+      class; fixed by resolving through the NAME (`edgeColName` preference
+      inverted, `tableColumnIndex` added). (3) `accurateKeyDistinct` now renders
+      through `StaDistinct()` rather than multiplying `NDistinctFrac`
+      unconditionally. **The rejected half-fix is kept as evidence**
+      (`2026-08-05-p56fii-halfway.txt`): adding only the proof made Q5's
+      `lineitem ⋈ supplier` truthful while its rival `customer ⋈ supplier` kept
+      reading 10 000 against 60 000 000, the DP took the cartesian product, and
+      Q5 went 65.9 s → over the timeout. A search selects on comparisons, so a
+      partially truthful estimator is a new defect, not half a fix. Result:
+      violations 2 → 2, no joinrel worse, **Q9 UNMEASURED (>150 s) → 6.3× over**
+      (inside its ≤100× override) and **291.8 s → 16.6 s**; **zero runtime
+      regressions** over 22 queries, Q5 65.9→17.1 s, Q7 38.9→27.2 s,
+      Q21 125.1→90.5 s, stream total 546.8→445.1 s (0.81×). 09 §5.6; two ledger
+      rows dated 2026-08-05. Bar met: UNITS + SPOT (Q12=2, Q13=35) + DS05
+      (PASS=94/MISMATCH=0/CKMISMATCH=0/ERROR=0/TIMEOUT=1 Q47/SKIP=4, summary
+      identical to the four prior sweeps) + PLAN (19/22 diverged as intended,
+      re-pinned to `plan_snapshots/m0127-p56fii.txt`, then 22/22 MATCH) + the
+      audit run. **P5.9 can now certify Q9's ≤10² runtime bar as well as its
+      cardinality.**
+- [x] **M0127-P5.6-f-iii — the TPC-DS SF0.5 gate's single TIMEOUT hopped
+      from Q72 to Q47 (2026-08-04), unattributed.** The sweep's summary line
+      is identical to the three before it (PASS=94, MISMATCH=0, CKMISMATCH=0,
+      ERROR=0, TIMEOUT=1, SKIP=4) — correctness did not move — but Q47 went
+      31 s → 332 s timeout while Q72 went 328 s timeout → 166 s, Q57 15 s →
+      81 s and Q53 28 s → 6 s. Swings in both directions plus a hopping
+      victim match the documented sweep-tail confound (a server that just ran
+      a timeout query sits at GOMEMLIMIT with GOGC=off and thrashes). Checked,
+      not assumed: Q47's only multi-pair join is the 5-pair `v1 ⋈ v1` between
+      two CTE scans whose ndistinct resolves on NEITHER side, so it lands on
+      the same `defaultEqSelectivity` fallback as before (`EXPLAIN` shows
+      `rows=1`); every other joinrel is single-pair and unchanged by
+      construction. Resume: run the sweep twice at this commit and once at
+      `HEAD~1` and see whether the TIMEOUT hops without a code change.
+      Ledger row dated 2026-08-04.
+      **↳ ANSWERED 2026-08-05 — the confound hypothesis is REFUTED and the
+      filed "checked, not assumed" paragraph above is WRONG on its own terms.**
+      The TIMEOUT does not hop without a code change: it was moved by
+      **`ce027cee` (P5.6-f)**. Answered without the three ~1 h sweeps the
+      resume point asked for. (1) *Step function, not noise*: eight consecutive
+      sweeps hold the old regime, four hold the new, spread ±3 s. (2) *The
+      confound cannot reach Q47*: it runs at position 47, BEFORE Q72 — in the
+      old regime no timeout had yet occurred, in the new one Q47 is itself the
+      first — and a fresher post-restart server cannot explain Q57 getting 5×
+      SLOWER. (3) *Solo, quiet host, `TIMEOUT_SEC=900`*: **Q47 523 s**, Q57
+      81 s, both reproducing the new regime outside any sweep tail (the
+      hypothesis predicted ≈31 s). (4) *Bisect on a 2.3 G COPY of the cluster*
+      so the live dir was never at risk: `30293f78` 31 s, `29daeb72` 30 s with
+      a **byte-identical plan**, HEAD 523 s — and the old binary on TODAY's
+      data is fast, exonerating the cluster data too. `29daeb72..ce027cee` is
+      exactly one commit. The boundary sweep is labelled `29daeb72` only
+      because its header says `[tree DIRTY in Go sources]` / `diff=129e691bd41a`
+      — that binary was `29daeb72` + uncommitted P5.6-f WIP. **Read the `diff=`
+      field before the commit subject when attributing a sweep.**
+      **Mechanism**: Q47's outermost join has FIVE equi-pairs; P5.6-f folds
+      every pair under independence (`cardinality.go:457-483`,
+      `sel /= pairNDistinct` multiplied across pairs), two of them strongly
+      correlated (`i_category`↔`i_brand`, `s_store_name`↔`s_company_name`), so
+      the joinrel collapses and the plan degrades from a 5-pair **Hash Join**
+      to a **Nested Loop with no join condition**. The filed claim that this
+      join "lands on the same `defaultEqSelectivity` fallback as before" is
+      exactly what the plan diff disproves. **P5.6-f stays** — net win (+Q72
+      timeout→166 s, +Q53 28→6 s, +Q9's exact joinrel), correctness never moved
+      (`PASS=94 MISMATCH=0 CKMISMATCH=0`, Q47 returns its 100 oracle rows in
+      every regime); what it lacks is PG's correlation defence. Successor
+      **M0127-P5.6-f-iv**. `analysis/m0127-p56fiii/README.md`; 09 §5.15;
+      1 ledger row dated 2026-08-05.
+- [x] **M0127-P5.6-f-iv — REFUTED as filed: PG has no functional-dependency arm
+      for JOIN clauses.** The item asked for a correlation damper on
+      `internal/planner/cardinality.go:465-483`, citing
+      `dependencies_clauselist_selectivity` / `statext_clauselist_selectivity`.
+      Checked against the oracle, that citation does not reach join clauses:
+      `clauselist_selectivity_ext` (clausesel.c) gates the whole
+      extended-statistics branch on `find_single_rel_for_clauses`, which returns
+      `NULL` as soon as any clause carries two relids — so the dependency arm
+      **never runs on a join clause list** in any PG that has this gate.
+      Extended statistics are a *restriction*-clause mechanism upstream.
+      Measured confirmation: plain `EXPLAIN` of `query47.sql` against the PG
+      18.3 SF0.5 oracle (:65438) estimates **both** correlated 5-pair joins at
+      `rows=1` — PG collapses them exactly as goopg does. Implementing the item
+      would have added a non-PG heuristic under an upstream citation.
+      **What actually differs is the size of the join's INPUTS**: `CTE Scan on
+      v1` is 7 643 in PG and **18** in goopg, so PG refuses the nested loop
+      (rescanning 7 643 rows is expensive) where goopg accepts it. That 425×
+      under-estimate predates P5.6-f — `30293f78` carries the same 18 and still
+      picks the Hash Join — so P5.6-f only tipped an already-mispriced
+      comparison. Isolated to a **pushed-down restriction being charged a second
+      time at the join above it** (five-row probe table in the notes: no
+      restriction ⇒ factor 1.0; any restriction ⇒ the factor the scan already
+      applied). Doc 09 **§5.17** + a correction box on §5.15;
+      `analysis/m0127-p56fiv/README.md`; §6 of `analysis/m0127-p56fiii/README.md`
+      retracted in place; 2 ledger rows. Successors **P5.6-f-vi** / **-f-vii**
+      below. Bar: UNITS (no Go source changed).
+- [x] **M0127-P5.6-f-vi — a pushed-down restriction is priced twice.** The
+      real Q47 defect (§5.17). A join above a filtered scan is multiplied by the
+      selectivity the scan **already applied**: on SF0.5, the row-preserving
+      `store_sales ⋈ store` (unique `s_store_sk`, 12 rows) returns its left
+      input unchanged with no `date_dim` restriction present (1 439 608 →
+      1 439 608) and is scaled by ≈1/205 with `d_year = 2000`, ≈1/205 with
+      `d_dom = 15`, ≈0.505 with `d_year > 1999` — each time the scan's own
+      factor. PG does not (2 583 → 2 465). This is the double-count
+      `joinResidualSelectivity`'s header says it prevents, and it under-sizes
+      **every join above every filtered scan**, not just Q47's.
+      Already ruled out: `exprSide` is correct in isolation (`col = const` →
+      `sideLeft`, `col = col` → `sideMixed`), so the residual guard as written is
+      not the leak. Resume: `internal/planner/cardinality.go` `estimateJoin`'s
+      pair loop — check whether `joinEquiPairs` →
+      `splitAllEqualitiesForHash` admits a `col = const` conjunct as an
+      equi-pair (note the `d_year > 1999` row is neither `1/nd` nor
+      `defaultEqSelectivity`, so that arm alone cannot explain every row).
+      Instrument, and the acceptance test: a planner unit test building a join
+      whose left input is a `*Filter` over a scan with the same conjunct still
+      in `Predicate`, asserting the estimate equals the unfiltered estimate
+      scaled **once**. Bar: UNITS + the estimate audit + DS05 (named-victim
+      TIMEOUT-set diff, not a `TIMEOUT=` count) — this moves plan shape broadly,
+      so capture `plans` before and after.
+      **LANDED 2026-08-05.** The resume point above was wrong and is corrected
+      in doc 09 **§5.18**: `estimateJoin` returns the CORRECT 726 987 for the
+      probe's `store` join (server instrumentation), so its pair loop,
+      `splitAllEqualitiesForHash` and the residual guard are all exonerated.
+      The real node is one higher — `pushInnerJoinInputQuals`
+      (`inner_join_qual_pushdown.go`) DUPLICATES a single-relation restriction
+      onto its relation and leaves `f.Predicate` untouched ("property 2"), so
+      the estimator charged the same conjunct at the leaf Filter AND at the
+      residual Filter above the join. Fix: `Filter.PushedBelow` records the
+      duplication and `filterSelectivity` (`cardinality.go`) skips those
+      conjuncts — upstream needs no such list because
+      `distribute_restrictinfo_to_rels` MOVES the clause. Both duplicating
+      passes stamped (binary + MHJ arms); the two moving siblings checked and
+      left alone. Measured: the probe's `store` join is row-preserving in all
+      three regimes (was ×1/205 and ×0.505); Q47's `v1` 18 → 3 626 vs PG's
+      7 643. Gates: UNITS green; DS05 sweep `sweep-20260805-101345.txt` exit 0,
+      per-query verdicts BYTE-IDENTICAL to the `f05b5329` baseline, named
+      TIMEOUT set still exactly `{Q47}` — **50 of 99 plan shapes changed** (the
+      previous sweep changed 0), so the blast radius is real and cost 0
+      verdicts. Estimate audit
+      `analysis/leftdeep-joins/2026-08-05-p56fvi-postfix.txt`: no new
+      violation, per-joinrel moves ±1–4 %, and the corpus's one standing
+      violation (Q18's final SEMI) IMPROVED 25 182× → 23 433×. That check was
+      load-bearing, not a formality — the fix removes a downward correction, so
+      every affected estimate moves UP into a corpus already dominated by
+      over-estimates. It did NOT un-time-out Q47; that stays open under -f-vii
+      and the successor below. New tests
+      `internal/planner/cardinality_pusheddown_test.go` (3).
+- [x] **M0127-P5.6-f-viii — Q47 still takes the nested loop with `v1` at
+      3 626.** CLOSED 2026-08-05 by **M0127-P5.6-f-vii**, at the resume point
+      this item named. The `CTE Scan on v1 rows=6` outer was 6 because the
+      `v1` body's 6-key GROUP BY was estimated `child/2` = 3 626 rather than
+      7 252; with `estimate_num_groups` the body is 7 252 (PG 7 643), the outer
+      is 12, and the `Nested Loop (INNER) rows=1958` is now a `Hash Join
+      (INNER, build=left) rows=7252`. **Q47 completes in 12 s** (was TIMEOUT at
+      300 s), 100 rows against the PG oracle, and the DS05 named TIMEOUT set is
+      EMPTY for the first time since §5.15. No rescan-cost term was needed —
+      the alternative hypothesis in this item ("the rescan is unpriced") was
+      not reached and stays unmeasured; doc 09 §5.19. Original text below.
+      With -f-vi landed the 425× under-estimate is gone (18 → 3 626
+      against PG's 7 643) and Q47 *still* TIMEOUTs at 300 s: the top block
+      plans `Nested Loop (INNER) rows=1958` over a 5-pair `Hash Join rows=108`
+      and a `CTE Scan on v1 v1_lag rows=3626`, where PG picks a Merge Join.
+      So the plan flip is NOT wholly downstream of the `v1` size — doc 09
+      §5.17's chain was necessary, not sufficient (§5.18 closing paragraph).
+      Resume: the `CTE Scan on v1 rows=6` outer (post-`d_year = 2000 AND
+      avg_monthly_sales > 0` filter) is what makes rescanning 3 626 rows look
+      free; price the rescan, or check whether that outer's own 6 is a second
+      instance of the same double-charge class through a `*CTEScan`. Do
+      -f-vii first — one variable per measurement, per §6. Bar: UNITS + the
+      estimate audit + DS05 (named-victim TIMEOUT-set diff).
+- [x] **M0127-P5.6-f-vii — `estimateAggregate` is `child/2`, upstream is
+      `estimate_num_groups`.** LANDED 2026-08-05 (doc 09 §5.19).
+      `estimateNumGroups` (`internal/planner/cardinality.go`) is the port of
+      `estimate_num_groups` (selfuncs.c:3449): unique variables per grouping
+      expression, per-relation product of ndistinct clamped to that relation's
+      tuples (÷10 above one variable, floored at the largest single ndistinct),
+      the Yao/Dell'Era restriction correction (new `relFilteredRows` recovers
+      upstream's `rel->rows` from the plan tree), the product across relations,
+      and the closing clamp to `input_rows` — which is what the old `child/2`
+      was a crude stand-in for. Also ports `get_variable_numdistinct`'s
+      no-stats tail and `clamp_row_est`. The item was filed as explicitly NOT
+      load-bearing for Q47 and it is what **closed Q47** (see -f-viii). Gates:
+      UNITS green; estimate audit `2026-08-05-p56fvii.txt` — no new violation,
+      all TPC-H joinrels <1 % except Q20 which IMPROVED (30.2× → 24.9× over),
+      Q18's standing violation 23 433× → 23 015×; DS05 sweep
+      `sweep-20260805-112902.txt` exit 0, **TIMEOUT=0**, PASS 94 → 95,
+      MISMATCH=0 CKMISMATCH=0 ERROR=0. 10 new tests
+      (`internal/planner/cardinality_numgroups_test.go`). Four upstream
+      refinements ledgered, not faked: EC de-duplication (step 3), extended-stats
+      multivariate ndistinct, the boolean short-circuit, the volatile arm — plus
+      the standing sibling gap on `estimateSetOp` / `*Distinct` / `*DistinctOn`,
+      which still run no group estimate.
+- [x] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
+      cardinality.** §5.15's regression survived four sweeps because
+      `TIMEOUT=1` is invariant to WHICH query timed out; the summary line was
+      byte-identical across a 17× re-pricing. P5.6-g-i-b gave the gate a
+      plan-shape channel, which covers plan drift but is non-blocking and was
+      not read per-query either.
+      **LANDED 2026-08-05.** `scripts/tpcds-sweep-diff.py` + a `delta [OLD
+      [NEW]]` subcommand + a `sweep` tail stage directly under the SUMMARY
+      (before the slower plan pass): the per-query status/runtime vector is
+      diffed against the previous **full** report and printed by name —
+      `TIMEOUT +Q47 -Q72`, `SLOWER Q57 15s->81s (5.4x)`. **The input is the
+      sweep report itself**, in the format `cmd_sweep` already prints, so no
+      new artefact exists and all ~90 archived reports are valid baselines
+      retroactively. Four limits, printed in the channel's header every run
+      (never silent): both arms compare the INTERSECTION (a query absent from
+      one side is named once as ONLY-OLD/ONLY-NEW, not counted as leaving the
+      PASS set); TIMEOUT readings are the CAP and are excluded from the runtime
+      arm (the verdict arm already names them); a runtime move needs ≥2× AND
+      ≥5 s on the larger side (integer seconds make 1s→3s "3×"); and the
+      default baseline SKIPS subset probes, which are stamped "NOT a gate
+      result" and would compare 3 queries while staying silent about 96.
+      Non-blocking like the plan channel — performance still cannot fail this
+      gate. **Validated by replay over all 87 adjacent pairs of the archived
+      corpus** (zero crashes, 17 pairs report a verdict change); on the pair
+      whose SUMMARY lines are byte-identical it prints `TIMEOUT +Q47 -Q72`,
+      `PASS +Q72 -Q47` and `SLOWER Q57 15s->81s (5.4x)` — both §5.15 victims,
+      from artefacts that already existed the night it landed. Not filed as a
+      deferral (no PG behaviour involved), but two limits are stated in 09
+      §5.16: it compares ADJACENT runs, so sub-2×-per-run creep stays unnamed,
+      and it still cannot FAIL the gate on a traded timeout — that needs a
+      curated per-query budget file, deliberately not filed while the timeout
+      set is still moving under active planner work. 09 §5.16;
+      `bench/tpcds/README.md`. Gates: UNITS green (cached; no Go source
+      changed) + one full DS05 sweep with the channel live
+      (`sweep-20260805-090258`: PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=1 SKIP=4, delta `verdict-changes=none`, one runtime move Q83
+      7s→3s — the correct reading for a harness-only commit).
+- [x] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
+      factor.** Both landed verbatim from selfuncs.c in
+      `internal/planner/cardinality.go`: the matched-MCV frequency mass is
+      exact, the nd heuristic prices only the uncertain remainder with both
+      distinct counts discounted by the match count, the inner list is
+      truncated to the clamped `nd2`, each inner MCV is consumed once, and
+      `CLAMP_PROBABILITY` guards both terms. Statistics are read through
+      `resolveBaseColumn` (which now publishes the whole `*catalog.ColumnStats`)
+      rather than `columnStatsForChild`, so the match fraction cannot depend on
+      which scan the planner picked. 13 tests.
+      **Measured NO-OP on TPC-H** — violations 2 → 2, both bit-identical; every
+      other joinrel moved under 5 % in both directions on INNER joins this
+      change cannot reach, which is ANALYZE's sampling noise and is now the
+      documented noise floor for the instrument. A no-op is indistinguishable
+      from a broken wire, so both halves were proven on real data with the same
+      binary: **20 → 5 010 against an actual 5 010** once the inner has an MCV
+      list (uniform data gets none — upstream discards a list whose values are
+      not more common than average), and **1 000 → 750 against an actual 750**
+      at 25 % outer nulls. TPC-H's near-uniform surrogate keys and NOT NULL
+      join columns cannot exercise either.
+      **The finding that reframes the milestone: the premise was wrong, and the
+      oracle says so.** Both violations were re-measured on the PG 18.3
+      reference. Q21's ANTI — **PG estimates `rows=1` too** against the same
+      actual 4003: `neqjoinsel` returns `1 - nullfrac` for SEMI/ANTI by
+      documented design, and the eq clause is a self-join on
+      `lineitem.l_orderkey` so `nd1 = nd2` in every branch including the new
+      one. Closing it means diverging from PG; it is an audit override, not an
+      estimator task. Q18's SEMI is a real divergence of another mechanism —
+      PG dedups the `GROUP BY`-unique subquery to an INNER join (117 159 est)
+      while goopg keeps the SEMI and lands on the **0.5 punt** (2 998 620 =
+      exactly half the outer) because `resolveBaseColumn` has no
+      `*HashAggregate` arm. And at 1 674× on Q18 **PG itself trips the audit's
+      1 000× tripwire**, so the absolute factor is the wrong acceptance bar for
+      a PG-parity milestone. Q19's `d1` is an INNER join and was never this
+      item's; Q16 moved 1397 → 1401 (noise). Successors P5.6-g-ii / -g-iii.
+      2 ledger rows. IMPLEMENTATION-TODO P5.6-g; 09 §5.7.
+      Bar met: UNITS + SPOT (Q12=2, Q13=35) + audit run + the two real-data
+      probes. **DS05 NOT RUN** — the gate self-refuses while the nightly CI
+      batch holds the host (`FATAL: the nightly CI batch is running`), and the
+      batch was mid-run with a wedged testport stage for this loop's whole
+      duration. Carried in `.ralph/working_set.md` with the exact command.
+      **↳ DISCHARGED 2026-08-05 by M0127-P5.6-g-i**: no row/checksum change,
+      and this commit moves exactly ONE TPC-DS plan (Q83) — the nullable-key
+      premise for the carry is measured false (09 §5.10).
+- [x] **M0127-P5.6-g-i — run the DS05 gate for P5.6-g *and* P5.6-g-iv.**
+      DONE 2026-08-05, on a host the nightly batch had cleared (05:18). The
+      sweep owed **three** commits a gate, not two: the last DS05 baseline is
+      `ce027cee` (P5.6-f) and `4b820ab8` (P5.6-f-ii) landed after it, ungated.
+      **Gate: `PASS=94 (57 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=1 SKIP=4` — identical to the baseline line for line**, including
+      every value checksum and the single Q47 TIMEOUT. Total seconds 1828 →
+      1788, NOT claimed (the baseline's back half ran under the nightly).
+      Then a whole-corpus `EXPLAIN` A/B/C/D at `ce027cee` → `4b820ab8` →
+      `8ce056ff` → `f8338a09`, S-cold, noise floor measured at zero (same
+      binary twice = byte-identical plans for all 99): **P5.6-f-ii moved 74 of
+      99 plans, P5.6-g moved 1 (Q83), P5.6-g-iv moved 4 (Q13, Q41, Q48, Q85)**;
+      75 net, nothing changed and changed back. **The premise that raised this
+      item is measured false** — `(1 - nullfrac1)` + the MCV arm move estimates
+      but almost never the search's choice; the corpus-wide re-ordering belongs
+      to P5.6-f-ii, the commit that taught the search to read the join key at
+      all, and 74 plans moving with zero rows moving is the strongest evidence
+      available that it is a re-ordering and not a semantic change. Q41 is
+      `canonicalizeQual`'s pure case (`(A∧X)∨(A∧Y)` → `A∧(X∨Y)` in one filter);
+      Q13 is the load-bearing one (three join clauses + `ca_country` hoisted
+      out of all three OR arms → hash joins where a nested loop carried the
+      disjunction, PG's own Q13 shape). 27 of 99 texts contain an OR vs 2 in
+      all of TPC-H. Evidence `analysis/leftdeep-joins/2026-08-05-p56gi-*`
+      (README + both sweep reports + four corpus plan captures + the capture
+      script); doc 09 §5.10; IMPLEMENTATION-TODO P5.6-g-i. No ledger row: this
+      loop implemented nothing and left no PG behaviour unimplemented.
+      Successor **M0127-P5.6-g-i-b** below.
+- [x] **M0127-P5.6-g-i-b — give the DS05 gate a plan-shape channel.**
+      DONE 2026-08-05. `scripts/tpcds-plan-diff.py` (per-query diff of two plan
+      captures) + `scripts/tpcds-sf05-regression.sh`: a `plans` subcommand and a
+      tail stage on `sweep` that writes `plans-<stamp>.txt` beside
+      `sweep-<stamp>.txt` and appends `=== PLAN-SHAPE: queries=99 same=N
+      changed=N … ===` with the changed query list. **The primary bar is not
+      weakened and cannot be**: a sweep run with `PLAN_DIFF` pointed at a
+      nonexistent file still exits 0, and the report says the channel is
+      non-blocking. The capture is the FULL corpus even under `QUERIES=` (a plan
+      file exists to be diffed against every other one; 14 s for all 99), and it
+      stamps the planner-flags arm label — a plan diff across different flags is
+      meaningless. **Bar met, without re-running the ~1 h sweep**: three
+      consecutive captures at one commit → `changed=0` each time, and against
+      P5.6-g-i's four committed corpus captures (the format is deliberately
+      diff-compatible with `2026-08-05-p56gi-capture.sh`) the new gate path
+      reproduces 09 §5.10's attribution exactly — D `f8338a09` → 0 (same Go code,
+      different harness/dir), C `8ce056ff` → 4 (Q13 Q41 Q48 Q85), B `4b820ab8` →
+      5 (+Q83), A `ce027cee` → 75. One real defect found on the way: psql stamps
+      errors with the script PATH, so Q36/Q70/Q86 — the dsqgen artefacts whose
+      block is an error message, not a plan — were three permanent false
+      positives on any results-dir change; the diff tool canonicalises the prefix
+      to `psql:<script>:<line>:`. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56gib-README.md`; doc 09 §5.11;
+      IMPLEMENTATION-TODO P5.6-g-i-b. No ledger row: harness-only, no PG
+      behaviour left unimplemented. Successor stays **M0127-P5.6-g-ii**.
+      ~~Original filing:~~
+      P5.6-g-i's four corpus captures were built by hand for that loop, and a
+      74-query plan change passed the gate in silence: it compares row counts
+      and checksums only. That is the right PRIMARY bar and must not be
+      weakened — the ask is a second, non-blocking column. Concretely: an
+      `EXPLAIN`-only pass (every statement prefixed, so Q14/23/24/39's second
+      statement is never executed) writing one plan file per run beside the
+      sweep report, plus a diff against the previous run's file in the summary.
+      The noise floor is already known to be zero at S-cold (measured
+      2026-08-05), so a diff there is signal, not flake. Start from
+      `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh`, which is that pass
+      in throwaway form. Bar: two consecutive sweeps at the same commit report
+      zero plan diffs, and one at a different commit reports the expected set.
+- [x] **M0127-P5.6-g-ii — the `*HashAggregate` arm, and Q18's real shape.**
+      DONE 2026-08-05, and the item as filed was the wrong half of itself. The
+      arm alone measures worse because **upstream does not have it**:
+      `examine_simple_variable` (selfuncs.c) reaches
+      `if (subquery->groupClause)`, sets `vardata->isunique` when the referenced
+      output is the sole grouping column, and returns "cannot go further"
+      *without* a statistics tuple — what crosses a grouping node is
+      UNIQUENESS, never a distribution (grouping mashes the MCV list and
+      histogram; it cannot destroy one-row-per-group). The consumer is
+      `get_variable_numdistinct`'s negative `stadistinct`, i.e. the grouped
+      relation's own row count. Landed as `resolvesToGroupUniqueColumn` /
+      `groupUniqueNDistinct` (joinkeyproof.go) consumed **only** by
+      `columnNDistinctForChild`; `resolveBaseColumn` still refuses to walk a
+      grouping node and a test pins that MCVs do not leak up. DISTINCT /
+      DISTINCT ON are the same upstream test's other halves.
+      **Q18 42 837× → 24 242×** (2 998 620 → 1 696 939 — the `5 997 241 × 0.5`
+      punt is gone), parity excess vs PG 8.0× → 4.5×. It stays the corpus's one
+      absolute violation, but the residual is now attributable: goopg's
+      `l_orderkey` ndistinct is *more* accurate than PG's (1 210 559 vs
+      ~339 000, truth 1 500 000), which makes its post-HAVING inner 3.6× larger.
+      **The second half was measured INERT, not skipped**:
+      `reduce_unique_semijoins` fires in PG's Q18 plan, but for an inner unique
+      on the join key `inner_rows` = nd2, so the INNER and SEMI formulas agree
+      term for term — it buys join-order freedom, not a number. Ledger row.
+      **Found and fixed what the arm exposed:** `estimateJoin` had no
+      outer-join arm at all — LEFT/RIGHT/FULL took the INNER product and
+      stopped before `calc_joinrel_size_estimate`'s "the output must be at
+      least as large as the non-nullable input"; TPC-DS Q77 estimated 885 rows
+      for a join whose outer alone is 8 885. 12 tests.
+      Bar met: UNITS + **DS05 sweep identical to baseline**
+      (`PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`; 12 of 99
+      plans moved, zero rows; stream 2 116 s → 2 074 s with Q80 41→14 s,
+      Q40 16→2 s, Q78 29→17 s) + audit run (violations 2 → 1, no joinrel
+      worse). Evidence `analysis/leftdeep-joins/2026-08-05-p56gii-*`; doc 09
+      §5.12; IMPLEMENTATION-TODO P5.6-g-ii. 3 ledger rows. Successor:
+      **M0127-P5.6-g-v** below.
+- [x] **M0127-P5.6-g-v — Q18's residual, which is NOT a HAVING problem.**
+      DONE 2026-08-05, and the answer is "neither engine differs on HAVING".
+      The one `EXPLAIN` the item prescribed settled it: PG 339 423 → **113 141**
+      and goopg 1 150 720 → **383 573** are both exactly ÷3 — DEFAULT_INEQ_SEL
+      over an aggregate neither engine has statistics for, upstream via
+      `cost_agg`'s `clauselist_selectivity(quals)` scaling of `output_tuples`,
+      goopg via the `*Filter` wrapper over the `*Aggregate`. **The HAVING
+      mechanism is already identical; the whole 3.39× gap is the group
+      estimate**, and goopg's ndistinct is the *more* accurate one (1 150 720
+      vs PG's 339 423 against a truth of 1 500 000 — PG is 4.4× LOW). Q18's
+      inner is bigger than PG's *because goopg's statistics are better*, so
+      closing the gap would mean degrading them: **closed with no estimator
+      change.** Q18's standing violation is inherent to pricing an aggregate
+      blind, shared with upstream.
+      **The measurement found a real defect elsewhere — in the instrument.**
+      goopg splits a qual from the rows it filters: the predicate rides a
+      `*Filter` wrapper that `walkPlanFiltered` collapses onto the child below
+      it, and the collapsed line printed `EstimateRows(child)` — the PRE-qual
+      count — beside a `Filter:` the estimator had already applied. Upstream
+      cannot have this gap (`set_baserel_size_estimates` stores `rel->rows`
+      post-`clauselist_selectivity`; `cost_agg` sets `path->rows` post-HAVING).
+      The estimator was always right — a *parent* reads `EstimateRows(*Filter)`
+      and sees the filtered count, which is why a `Gather` over a filtered scan
+      was correct while the scan under it was not. Fixed by rendering the
+      collapsed wrapper's own estimate: `lineitem` filtered scan
+      **5 997 241 → 1 689 312** (PG 1 673 754), `nation` 25 → 4 (PG 5), TPC-DS
+      `date_dim WHERE d_year = 2000` **73 049 → 365** (PG 365, one year of
+      days). This is P5.6-g-iii-class, not cosmetic: `estimateaudit` parses
+      that field (`nodeLineRe`) and §5.11's DS05 plans channel captures it, so
+      **every capture taken before this commit reports unfiltered sizes for
+      filtered relations** — including the row-count half of M0125-0026's
+      "`date_dim` is costed at 73 049" evidence (C2's qual-*placement* finding
+      stands; its row-count reading was a renderer artifact).
+      Bar met: UNITS green; audit **1 violation (Q18), unchanged** from the
+      p56gii baseline with every joinrel diff sub-1 % ANALYZE noise and none
+      worse; DS05 `plans` **95 of 99 changed, but with `rows=` normalised the
+      diff is 6 lines — a psql header width, nothing else**, i.e. zero
+      structural movement (the proof it cannot reach plan selection). 3
+      regression tests, each verified failing without the fix. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56gv-postfix.*`; doc 09 §5.13;
+      IMPLEMENTATION-TODO P5.6-g-v. 2 ledger rows. Successor:
+      **M0127-P5.6-g-vi** below.
+- [x] **M0127-P5.6-g-vi — re-read the pre-fix plan-text conclusions.**
+      **DONE 2026-08-05, no code change, and every audited conclusion
+      SURVIVES.** The two DS05 corpus captures bracketing `20e17fa5` are
+      line-aligned (5 962 lines each), so a positional diff gives the blast
+      radius as a measurement rather than an argument: **836 of 3 283 node
+      lines carrying `rows=` changed — 25.5 %, across 96 of 99 queries** — and
+      the split is clean: **836 of the 966 lines that carry a `Filter:` detail
+      moved, against 0 of the 2 317 that do not.** That makes the rule for
+      reading any pre-fix capture exact and cheap: **a `rows=` is trustworthy
+      iff its node line has no `Filter:` beneath it.** Where it is wrong it is
+      badly wrong (overstatement median **9×**, p90 **18 000×**, max
+      **1 920 800×**), and it reaches **join nodes**, not just scans — Q1's
+      `Hash Join (INNER) … Filter: (date_dim.d_year = 2000)` went `rows=716` →
+      `rows=3`, so P5.6-g-v's "join nodes carry no collapsed `*Filter`" is a
+      TPC-H fact, not a general one.
+      **Verdicts** (each checked against the capture the finding itself
+      cites): **M0125-0026 C2** (pervasive form *and* the Q5 form),
+      **M0125-0038 (C5)**, **M0125-0040 (C6)**, **M0125-0031**, and the
+      `estimate-audit` joinrel conclusions of doc 09 §5.3–§5.12 — **all
+      survive; none needs re-deriving.** The audit ones by direct
+      re-measurement (P5.6-g-v's run: 1 violation, Q18, unchanged); the rest
+      because every line they quote is bare. Not luck: C2/C5/C6 are *about*
+      relations goopg failed to filter, so the numbers they cite are precisely
+      the ones the renderer had no filter to mis-scale.
+      **One correction, and it runs opposite to the filing.** This item was
+      filed saying C2's row-count claim "is already known to be an artifact" —
+      **it is not.** C2's own measurement is that **66 of 68** qualifying
+      `Filter:` lines sit on a join node, so the `date_dim` scans carry no
+      filter and 73 049 is what the estimator genuinely used: the row-count
+      claim is faithful for exactly the reason the placement claim is true.
+      P5.6-g-v's blanket wording is narrowed in place (09 §5.13 now carries a
+      `↳ NARROWED by §5.14` pointer). The only corrupted captures are C2's two
+      named exceptions — the Q14/Q54 scalar-SubPlan `date_dim` scans printing
+      `rows=73049` beside a scan-level `Filter:` — cited for placement, not
+      rows. Separately, **C5 corroborates the fix instead of falling to it**:
+      its `365.25` for `date_dim after d_year` appears nowhere in that plan
+      text (the line reads 73 049) — it is `73 049 × 0.005` (`DEFAULT_EQ_SEL`),
+      recovered by *dividing* the join estimate, i.e. C5 observed the estimator
+      holding the post-qual number the renderer hid, days before P5.6-g-v
+      proved it.
+      Pre-fix captures are deliberately **not** re-captured; they stay as the
+      historical record and the rule is recorded so it is not re-derived a
+      third time. Doc 09 **§5.14**; IMPLEMENTATION-TODO P5.6-g-vi; working
+      `analysis/leftdeep-joins/2026-08-05-p56gvi-README.md` (carries the
+      reproducible classifier script). No ledger row: bookkeeping over an
+      instrument, no PG behaviour left unimplemented. Bar met — docs-only, so
+      the commit-hook pgbench smoke plus `make ralph-state-guard` is the whole
+      gate set that applies.
+- [x] **M0127-P5.6-g-iii — fix the acceptance instrument, not the estimator.**
+      DONE 2026-08-05. `estimateaudit.Q21AntiJoinMax` (5 000×) beside Q9's bar,
+      both now rendering their justification into the artifact instead of being
+      bare numbers; and 09 §4's ratchet restated as **per-joinrel parity**
+      (`internal/estimateaudit/parity.go`): a joinrel is its base-relation SET
+      (`RelOptInfo.relids`) rebuilt from the printed plan, so two engines that
+      reached it by different join ORDERS still compare, and the ratchet fires
+      only on excess > 10× AND goopg's own factor > 100×. `--from-plans` /
+      `--reference` / `--ref-port` apply a new instrument to old committed
+      evidence — this run replayed the P5.6-g capture, so NO estimator code
+      changed. Absolute violations 2 → 1 (Q21 is measured parity: 4 003× vs
+      PG's own 4 178×, excess 1.0×). Baseline pinned:
+      `parity_violations=1 shape_mismatches=67`. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56giii-parity{.txt,.pg.plans.txt,-README.md}`,
+      docs 09 §4.1 + §5.8. Bar met: UNITS + audit run with the parity column.
+      Successors: **P5.6-g-iv** below and a ledger row (2026-08-05) for the
+      EXPLAIN rendering gap the gate exposed.
+- [x] **M0127-P5.6-g-iv — Q19, the only estimator defect TPC-H can prove.**
+      DONE 2026-08-05. The answer to "which step collapses" was none of the
+      three: the defect was one level earlier, in a preprocessing pass goopg
+      never had. **goopg did not run PG's `canonicalize_qual`**
+      (`process_duplicate_ors`, prepqual.c), so Q19's thrice-repeated join
+      clause `p_partkey = l_partkey` stayed inside every OR arm — charged once
+      as the equi-join key and again per arm at DEFAULT_EQ_SEL — and the three
+      single-relation conjuncts common to all arms (`l_shipmode IN`,
+      `l_shipinstruct =`, `p_size >= 1`) stayed trapped where NOTHING priced
+      them. M0058-0004's `commonEquijoinsAcrossOr` had already computed the
+      same intersection and used it for the join EDGE only.
+      Landed: `internal/planner/qual_canonical.go` (`canonicalizeQual`), applied
+      in `planSelect` at upstream's placement, parse tree not mutated;
+      `strictParserExprKey` (exprkey.go) as the equality test, because
+      `parserExprKey` drops table qualifiers and would hoist across `a.x = 1` /
+      `b.x = 1`. 9 tests. Q19 `{lineitem,part}` est 1 → 309 vs actual 131
+      (131.0× → 2.4×), parity excess 126.5× → 2.3×, `parity_violations=0
+      shape_mismatches=0`; the plan now carries PG's own shape (both scans
+      filtered, reduced OR at the join). Q12 — the only other OR-bearing TPC-H
+      query — bit-identical. Evidence
+      `analysis/leftdeep-joins/2026-08-05-p56giv{.txt,.plans.txt,-README.md}`
+      (+ the Q19-only `-q19` pair); doc 09 §5.9. Bar met and exceeded: UNITS +
+      audit with the parity column + **tpch-spotcheck PASS** (Q12 rows=2,
+      Q13 rows=35). **DS05 NOT RUN** — nightly batch held the host all loop;
+      carried on P5.6-g-i, and it matters MORE for this item than for P5.6-g
+      because TPC-DS has many OR-bearing queries. **↳ DISCHARGED 2026-08-05 by
+      M0127-P5.6-g-i**: no row/checksum change; 4 of the 27 OR-bearing TPC-DS
+      plans move (Q13, Q41, Q48, Q85), Q13 into PG's own hash-join shape. 1 ledger row (3 deferrals:
+      constant handling, UPDATE/DELETE quals, `extract_restriction_or_clauses`).
+      Watch list still open from g-iii (>10× the reference, under the 100×
+      floor): Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
+- [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
+      Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
+      06 §5. Bar: UNITS + PLAN (default arm ZERO diffs). **DECOMPOSED into -a
+      (the spill term, pricing) and -b (the LIMIT fraction, selection) below —
+      they touch different halves of the search and have different blast
+      radii.**
+- [x] **M0127-P5.7-a — the spill term: `hashJoinCost` prices the geometry the
+      executor will actually build.** DONE 2026-08-05. `hashJoinCost`
+      (`internal/planner/cost_funcs.go`) now takes a `hashJoinInputs` struct and
+      calls `hashsize.Choose` — the same function, with the same argument shape,
+      that `joinOp.buildGeometry` calls at run time — then applies upstream's
+      batch I/O charge verbatim when it answers `NBatch > 1`
+      (costsize.c:4239-4248): `seq_page_cost × innerPages` at STARTUP (the inner
+      is written during the build) and `seq_page_cost × (innerPages +
+      2 × outerPages)` at run. `spillPages` is `page_size` with
+      `relation_byte_size` replaced by `hashsize.EntryBytes`, so the pages
+      charged and the bytes the geometry solved for come from one model.
+      **It replaced M0126-0013's unconditional `seq_page_cost × innerRows/100`**,
+      which cited costsize.c:4166 for a page charge upstream does not make
+      there — PG charges pages only under `numbatches > 1`, and for the SPILL
+      rather than the resident table. Being monotone in `innerRows`, the
+      stand-in penalised a 6 M-row build that fits `work_mem` exactly as much as
+      one that does not, which is the distinction that decides the plan
+      (`TestHashJoinCost_SpillDependsOnFitNotOnSize`).
+      **The width that crosses the boundary is the finding:** PG hands
+      `ExecChooseHashTableSize` a byte width because its entry is a packed
+      MinimalTuple; goopg's entry is a `[]Datum` of 48-byte structs, so its size
+      follows the COLUMN count — and the executor passes `len(schema)`. The
+      planner had no column count, so `RelOptInfo.NCols` is new (leaf schema for
+      a base rel, sum over inputs for a join rel, since a join row is its inputs
+      concatenated). Feeding the existing byte-valued `Width` would have sized
+      the same build ~25× differently on the two sides of the sibling-path rule.
+      4 new tests. IMPLEMENTATION-TODO P5.7-a; 04 §4.1; 06 §5. **4 ledger rows**
+      (per-session `work_mem` never reaches the planner; `spillPages` prices the
+      in-memory footprint not the narrower batch-file encoding; `nbatch` not
+      exposed on `Path` for EXPLAIN; the LIMIT fraction → -b).
+      Bar met: UNITS. PLAN not applicable and the reason is structural, not a
+      skip: both `hashJoinCost` callers are behind OFF-by-default gates
+      (`costDrivenJoinOrder`, and the PG-shaped DP, which has no `planSelect`
+      caller at all), so the default arm has zero *reachable* plan movement.
+- [ ] **M0127-P5.7-b — the LIMIT fraction: nothing SELECTS on startup cost.**
+      P5.7-a made `hashJoinCost`'s Startup and Total move independently and for
+      the right reason, but the split buys nothing until a LIMIT can choose on
+      it. PG's `grouping_planner` (planner.c) turns a LIMIT into a
+      `tuple_fraction` and asks `get_cheapest_fractional_path` which path wins
+      at that fraction; goopg computes `RelOptInfo.CheapestStartup`
+      (`setCheapest`, path.go) and never reads it. Resume: thread a
+      `tuple_fraction` from the `*Limit` above the join into path selection.
+      IMPLEMENTATION-TODO P5.7-b; 04 §4.1. Bar: UNITS + PLAN (default arm ZERO
+      diffs) + at least one LIMIT-over-join query whose chosen path moves.
+- [ ] **M0127-P5.8 — collapse limits with PG's actual semantics** (03 §6: flat
+      comma lists are always ONE problem; limits govern sub-joinlists and
+      explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening
+      behind its own sub-flag `GOOPG_PGSHAPED_COLLAPSE` (soaked separately,
+      08 §2); outer joins stay pinned until `join_is_legal` inference lands
+      (03 §4.4); delete the 12-table bail-out. IMPLEMENTATION-TODO P5.8; 03 §6.
+      Bar: UNITS + DS05 (sub-flag OFF and ON).
+- [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
+      once with collapse OFF, then with collapse ON) + plan-shape ratchet
+      baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and
+      retire `GOOPG_COST_DRIVEN_JOINORDER`, or record the documented no-go.
+      File `analysis/leftdeep-joins/…-s5-acceptance.txt`. IMPLEMENTATION-TODO
+      P5.9; 09 §3-§5; 08 §2. Bar: the full acceptance bar.
+- [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
+      conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
+      `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1
+      (first half); 05 §6 (E5). Bar: UNITS + BENCH (no alloc regression).
+- [ ] **M0127-PS6.2 — compiled ↔ interpreted sibling audit + parity spot-diffs**
+      on expression corpora incl. the overflow corpus (0097-0037 precedent).
+      IMPLEMENTATION-TODO PS6.1 (second half); 09 §1 SIBLING. Bar: parity corpus
+      + BENCH. (The release gate for E5.)
+- [ ] **M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
+      `executor.go:160-163`, env vars, orphan-export check —
+      `IsCanonicalKeyEquality` has no other caller). IMPLEMENTATION-TODO P6.1;
+      08 §4 "Fusion". Bar: grep-clean + UNITS + SPOT.
+- [ ] **M0127-P6.2 — delete MultiHashJoin** (fresh grep inventory at S7 time;
+      2026-08-02 count ~34 arms / 18 files: node, packer
+      `rewriteMultiWayChain`/`collectMultiHashTables`, `mhj_input_rewrite.go`,
+      posmaps, cost/cardinality arms, executor op `multi_hash_join.go`,
+      EXPLAIN arms, `generateMultiHashJoinPath`, flags). IMPLEMENTATION-TODO
+      P6.2; 08 §4 "MultiHashJoin". Bar: after S5-ON survives a clean nightly
+      cycle; grep-clean + UNITS + SPOT + DS05.
+- [ ] **M0127-P6.3 — delete the old subset-bitmask DP + layout/remap family**
+      (`enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/
+      `dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,
+      `attachUnusedCrossEdges`, `bushySeedRowCounts`, the 12-table cap,
+      `IsSmallDimensionSide` pinning, `chooseInnerJoinAlgo` searched,
+      `dpEntry.layout`/`remapKeyToLayout`/`mergeSubsetLayouts`); demote
+      `joinorder.go` to the over-limit sequencer. **`buildBindingsPosMap`/
+      `applyJoinTreePosMap` held back** until the 03 §10 boundary map is proven
+      in production (08 §4 — the S7 change most likely to regress).
+      IMPLEMENTATION-TODO P6.3; 08 §4. Bar: grep-clean + UNITS + SPOT + DS05.
+- [ ] **M0127-P6.4 — supersession stamps + ledger rows.** 0034-0001, 0038-0001,
+      cost-model/09 §3 allowance, 0043/0063/0125/0126 MHJ chapters get
+      `superseded by: leftdeep-joins/` headers; README index status flips;
+      ledger rows for every deliberately-skipped PG behaviour (GEQO, skew
+      buckets, SpecialJoinInfo in-DP — `join_is_legal`-inference-dependent
+      marker —, shared spilling builds, full join_order_restriction inference).
+      IMPLEMENTATION-TODO P6.4; 08 §5. Bar: doc review.
+
+**Order:** P0.1→P0.3 (S0) → P1.1→P1.3 (S1; P1.3's bar gates P2) →
+P2.1→P2.3 (S2) → P3.1→P3.5 (S3) → P4.1→P4.4 (S4) → P5.1→P5.9 incl. P5.3a
+(S5, each 1–2 loops) → PS6.1→PS6.2 (S6) → P6.1→P6.4 (S7, only after S5-ON
+survives a clean nightly cycle). No M0127 task may be selected while any
+M0125 item marked as a prerequisite above is open (Current Priority banner).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

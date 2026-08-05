@@ -298,6 +298,31 @@ first time. An 8.4× runtime increase is the *expected* cost of that, not a
 performance regression. Q47 remains a wrong answer (0 vs 100) tracked as RC-1b
 residual (a); it is not a new finding of this sweep.
 
+> **⛔ REFUTED BY MEASUREMENT 2026-08-03 (M0125-0013, bookkeeping half).** The
+> paragraph above is wrong on its central claim. On a **verified quiet host**
+> (load 0.28–1.21, no nightly batch — every 2026-07-30 timing was taken at load
+> ~10), HEAD `374dc60e`, both engines back to back: **goopg 537.55 s** vs **PG
+> 18.3 3.38 s** for the identical query on identical SF=1 data — **159×**. An
+> 8.4× increase cannot be the "expected cost" of work that PG completes in 3.4 s,
+> so the runtime-deviation class this chunk closed should NOT have been closed.
+> The same refutation applies to the `tpcds-round2 RC-1b` ledger row's
+> "(14s->143s confirms real work)", which this chunk cites as corroboration.
+>
+> What is upheld is only the *reachability* argument: at set A the CTE body was
+> empty so the self-join did nothing (17 s); each later fix let more of the
+> pipeline execute (17 s empty → 142 s partial → 537 s fully correct, 100 rows =
+> PG byte-for-byte). The work is real but it is not *expected* — ~485 s of the
+> 537 s is one three-way self-join whose hash key degenerates to `i_category`
+> (10 distinct over 63,745 rows; the 4-key composite PG merge-joins on has
+> 5,667), a ~567× over-scan per probe, per
+> `internal/planner/planner.go:splitEqualityForHash` returning only the FIRST
+> disjoint equality. That is the pre-existing multi-column-hash-key deferral
+> (ledger `M0125-0011` / `M0125-0035`), not an RC-1b regression.
+>
+> Evidence `analysis/m0125-0013-q47-verdict/`; full record in
+> `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` § Q47
+> "Execution record (2026-08-03)".
+
 Two cells worth recording precisely:
 
 - **Q51 did not flip.** It was flagged as the chunk's main flip risk at set A's

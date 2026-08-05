@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -25,35 +28,75 @@ type joinRowCTID struct {
 }
 
 // joinOp is a join operator that dispatches on plan.Algo.
-// Hash joins use lazy materialization (M0036): joined rows are
-// yielded on demand via Next() instead of pre-computed in o.rows.
-// Merge and nested-loop still materialize in o.rows.
+//
+// Every algorithm now yields on demand. Hash was first (M0036's lazy
+// materialization), then M0127's P4 slice converted the rest: merge (P4.1),
+// the hash outer fill (P4.2), the nested loop (P4.3) and LATERAL (P4.4). With
+// the last of them the `rows []Row` / `idx int` output buffer that used to
+// back Next left the struct entirely — see the four `*Stream` fields below,
+// exactly one of which is non-nil between Open and Close.
 type joinOp struct {
 	plan   *planner.Join
 	left   Operator
 	right  Operator
 	schema planner.Schema
 
-	ctx  *Context
-	rows []Row
-	idx  int
+	ctx *Context
 
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
-	// int64 fast-path (cost-model ch.14): when every build-side key is
+	// int64 fast-path (cost-model ch.14): when the build-side keys are
 	// int64-representable, lazyIntHash replaces lazyHash so the probe hot
 	// path (e.g. Q9's ~6M lineitem rows) hashes an int64 instead of
 	// allocating a datumKey string per row — the GC-heavy cost that made
 	// the binary hash cascade slow where MultiHashJoin's int64 keys are
-	// fast (multi_hash_join.go M0043-0003). Only the plain INNER build
-	// paths opt in; CTID-preserving and semi/anti builds keep the string
-	// map (lazyHashIsInt stays false). lazyBuildAllInt64 tracks whether an
-	// int64 table is still viable during the build.
-	lazyIntHash       map[int64][]Row
-	lazyHashIsInt     bool
-	lazyBuildAllInt64 bool
+	// fast (multi_hash_join.go M0043-0003).
+	//
+	// M0127-P0.3 (05 §4, stage E3): exactly ONE of the two maps is built.
+	// lazyHashIsInt is decided BEFORE the build from the plan's key types
+	// (planner.Join.HashKeysAreInt64) instead of being discovered by
+	// populating both maps and dropping the loser at the end — which used
+	// to double peak build memory for every int-keyed join. Semi/Anti
+	// builds now opt in too; the CTID-preserving build is the one exception
+	// and stays on the string map, because lazyHashCTID is keyed alongside
+	// it. demoteIntHash covers the residual case where an integer-typed
+	// column yields a datum that is not int64-representable.
+	lazyIntHash   map[int64][]Row
+	lazyHashIsInt bool
+
+	// M0127-P2.2 (05 §5, stage E4): the executor's key plan, resolved once
+	// per Open from planner.Join.ExecHashKeyPlan. execKeys holds EVERY
+	// equi-pair the hash table is keyed on — goopg carried one since M0003 —
+	// and execResidual is what is left of Predicate once those pairs are
+	// enforced by the hash itself, which on an all-equijoin join is nothing
+	// at all. buildKeyExprs/probeKeyExprs are the same list already split by
+	// side, so the two loops cannot disagree about orientation.
+	//
+	// execKeyPackInt selects the fixed-width int64 lane of the composite
+	// encoding (join_composite_key.go); execKeyBuf is its per-row scratch,
+	// reused so the probe side allocates nothing.
+	execKeys       []planner.JoinKeyPair
+	execResidual   planner.Expr
+	buildKeyExprs  []planner.Expr
+	probeKeyExprs  []planner.Expr
+	execKeyPackInt bool
+	execKeyBuf     []byte
+
+	// M0127-P2.3 (07 §2): the same split for the MERGE algorithm, taken
+	// from planner.Join.ExecMergeKeyPlan by initMergeKeys. Deliberately
+	// NOT the execKeys/execResidual slots above: those are filled on the
+	// lazy-hash path only, and a joinOp runs one algorithm, so keeping the
+	// two apart makes a cross-read a compile error rather than a silent
+	// wrong-key join. See join_merge_key.go.
+	mergeKeys     []planner.JoinKeyPair
+	mergeResidual planner.Expr
+
+	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
+	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
+	// merge output is pulled from this state machine instead of being
+	// pre-computed into an array. See join_merge_stream.go.
+	mergeStream *mergeJoinStream
 	lazyProbe    Operator         // probe side (streaming)
-	lazyRow      Row              // current probe row
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
 	lazyActive   bool // true between probeRow and last match
@@ -74,7 +117,6 @@ type joinOp struct {
 	// pair, so a single allocation per side is enough.
 	lazyNullLeft  Row
 	lazyNullRight Row
-	lazyKeyRow    Row
 
 	// M0071-0014 Stage D-2: VirtualSlot composition replaces the
 	// nextLazy concatRows allocations. lazyBuildSlot's .row holds
@@ -86,10 +128,64 @@ type joinOp struct {
 	// Allocated lazily on first nextLazy invocation (Open path is
 	// shared with non-hash joinOp algorithms which don't need the
 	// virtual composition).
+	//
+	// M0127-P1.1 (leftdeep-joins/05 §2, stage E1) demoted both
+	// MaterializedSlots to the COPY FALLBACK: in steady state the probe
+	// child's own slot is bound directly as the probe source, and these
+	// two carry a row only when chaining is off or the child's slot
+	// cannot serve the composed shape.
 	lazyBuildSlot     *MaterializedSlot
 	lazyProbeSlot     *MaterializedSlot
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
+
+	// M0127-P1.1 (design leftdeep-joins/05 §2, stage E1; the un-deferred
+	// 0126-0004): probe-side slot chaining. nextLazy used to flatten the
+	// probe child's slot with `r := slotRow(probeSlot)` — for a
+	// VirtualSlot child that is a pooled acquireRow plus a width-wide
+	// 48-byte-Datum copy per probe row, and the pooled row was never
+	// released. Every aggregate-topped query runs its whole join subtree
+	// on this legacy path, so it, not the slab, governs the analytic
+	// workload. The child's slot is now bound straight into
+	// lazyVirtualOut.sources (and lazyOuterOnlyOut for Semi/Anti), so an
+	// emitted tuple reads through to the child's storage with no copy.
+	//
+	// The F7 contract (0126-0004 §2): a child does NOT return a stable
+	// slot object — the same child may hand back its own lazyVirtualOut,
+	// its lazyOuterOnlySlot, a fresh Materialize() (FOR UPDATE), or a
+	// fresh asSlot per call (rowsOp/spillOp, spill.go). bindProbe
+	// therefore rebinds on EVERY pull instead of caching, and falls back
+	// to one copy when the slot cannot serve the composed shape.
+	//
+	// Lifetime is safe by control flow, not by construction: nextLazy
+	// pulls a new probe row only after every match of the current one has
+	// been drained (lazyActive false). bindProbe asserts exactly that.
+	lazyProbeSrc     TupleSlot    // probe slot bound for the current row (nil = none)
+	lazyProbeSrcIdx  int          // its position inside lazyVirtualOut.sources
+	lazyProbeWidth   int          // columns lazyVirtualOut reads from it
+	lazyOuterOnlyOut *VirtualSlot // Semi/Anti emit slot, chained to the probe
+	lazyChainProbe   bool         // seam enabled (GOOPG_JOIN_SLOT_CHAIN=off disables)
+
+	// M0127-P0.1 (design leftdeep-joins/05 §3, stage E2): hoisted
+	// merged-key slots. mergedKeySlot allocated five objects per BUILD
+	// row and per PROBE row (the null Row, its MaterializedSlot, the
+	// []virtualCol, the sources slice, the VirtualSlot). That composed
+	// shape is invariant for a given (realWidth, nullWidth, realOnLeft)
+	// triple, and the child schemas fix those at Open — so each side
+	// builds its slot once and rebinds the real source per pull.
+	lazyBuildKeySlot mergedKeySlotCache
+	lazyProbeKeySlot mergedKeySlotCache
+
+	// M0127-P3.2 (06 §2.2-2.4): hybrid-hash batching state. nil means the
+	// build was projected to fit work_mem, or batching was declined for this
+	// join shape (joinBatchEligible) — either way every path below behaves as
+	// it did before batching existed. noBatch is the caller-side decline used
+	// by the shared (parallel) build, whose published table workers read
+	// without ever seeing this state. batchKeySlot re-presents a row reloaded
+	// from an inner batch file to the build key expression.
+	batches      *hashBatchState
+	noBatch      bool
+	batchKeySlot *MaterializedSlot
 
 	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
 	// computed once in openLazyHashJoin's build loop. Real NOT IN
@@ -100,11 +196,6 @@ type joinOp struct {
 	// nextLazy) is enough; see the Join.NullAware doc comment.
 	antiBuildRows     int  // total right-side rows seen during build
 	antiBuildHasNull  bool // any right-side row's join key was NULL
-
-	// M0100-0010: ctid captured per left-row during eager NL drain so
-	// lockRowsOp can stamp tuple locks after the scan is closed.
-	leftCTIDs     []joinRowCTID
-	rowSourceLeft []int
 
 	// M0118-0009 (eval-plan-qual): when a downstream LockRows (FOR UPDATE OF
 	// <rel>) needs to lock a relation that ends up on the BUILD side of a lazy
@@ -119,6 +210,43 @@ type joinOp struct {
 	preserveBuildSide bool
 	lazyHashCTID      map[string][]joinRowCTID
 	lazyMatchCTIDs    []joinRowCTID
+
+	// M0127-P4.2 (07 §3): outer-join fill — PG's HJ_FILL_INNER half. See
+	// join_outer_fill.go for the whole mechanism; these are its state.
+	//
+	// lazyMatched{S,I} are the per-batch matched bitmaps, parallel to
+	// lazyHash / lazyIntHash and created per bucket on its first probe;
+	// lazyMatchedCur is the bucket the current probe row is draining, so the
+	// emit loop marks a match with one indexed store and no map lookup.
+	// fillNullBuild holds the build rows whose key was NULL (they never enter
+	// a bucket). sweep* is the cursor fillSweepNext walks after each batch's
+	// probe replay ends; probeEOF latches that end so the sweep can return
+	// row by row without re-pulling an exhausted probe.
+	lazyMatchedS   map[string][]bool
+	lazyMatchedI   map[int64][]bool
+	lazyMatchedCur []bool
+	fillNullBuild  []Row
+	fillNullIdx    int
+	sweepInit      bool
+	sweepKeysS     []string
+	sweepKeysI     []int64
+	sweepKeyIdx    int
+	sweepRowIdx    int
+	sweepRows      []Row
+	sweepMatched   []bool
+	probeEOF       bool
+
+	// M0127-P4.3 (07 §4): the streaming nested loop. Non-nil for every
+	// non-lateral NL join; see join_nl_stream.go. Its presence is what routes
+	// Next away from the eager path, exactly as mergeStream does for merge.
+	nlStream *nlJoinStream
+
+	// M0127-P4.4 (07 §4): the streaming LATERAL join. Non-nil for every
+	// `Join.Lateral` join; see join_lateral_stream.go. It was the last operator
+	// holding the output in an array, and its removal is what let the
+	// `rows`/`idx` pair (and the never-repopulated `leftCTIDs`/`rowSourceLeft`
+	// side-channel that rode along with it) leave joinOp entirely.
+	latStream *lateralJoinStream
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -127,7 +255,14 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 		schema = append(schema, left.Schema()...)
 		schema = append(schema, right.Schema()...)
 	}
-	return &joinOp{plan: plan, left: left, right: right, schema: schema}
+	// M0127-P2.2: the residual defaults to the full Predicate, which is what
+	// every non-hash algorithm evaluates. openLazyHashJoin narrows it to the
+	// conjuncts the hash key does NOT already enforce.
+	var residual planner.Expr
+	if plan != nil {
+		residual = plan.Predicate
+	}
+	return &joinOp{plan: plan, left: left, right: right, schema: schema, execResidual: residual}
 }
 
 func (o *joinOp) Open(ctx *Context) error {
@@ -152,30 +287,11 @@ func (o *joinOp) Open(ctx *Context) error {
 				// it (unnestExistsExpr's belt); refuse loudly.
 				return fmt.Errorf("internal error: nested-loop semi/anti join without a predicate")
 			}
-			if err := o.left.Open(ctx); err != nil {
-				return err
-			}
-			if err := o.right.Open(ctx); err != nil {
-				_ = o.left.Close()
-				return err
-			}
-			leftRows, err := drainRowsCtx(o.left, ctx)
-			if err != nil {
-				return err
-			}
-			rightRows, err := drainRowsCtx(o.right, ctx)
-			if err != nil {
-				return err
-			}
-			leftWidth := len(o.left.Schema())
-			if leftWidth == 0 && len(leftRows) > 0 {
-				leftWidth = len(leftRows[0])
-			}
-			rightWidth := len(o.right.Schema())
-			if rightWidth == 0 && len(rightRows) > 0 {
-				rightWidth = len(rightRows[0])
-			}
-			return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+			// M0127-P4.3: streams, like every other nested loop. The old
+			// drain of BOTH sides is gone; the keyless early-out is what the
+			// Materialize's lazy fill exists for (07 §4). No ctid capture —
+			// the array path never captured one here either.
+			return o.openNestedLoop(ctx, false)
 		default:
 			return fmt.Errorf("internal error: semi/anti join requires hash or nested-loop algorithm, got %d", o.plan.Algo)
 		}
@@ -191,6 +307,34 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
+	// M0127-P4.1 (07 §2): merge join no longer shares the eager both-sides
+	// drain below. It opens its children and streams them through
+	// work_mem-bounded sorted sources instead; the CTID side-channel the
+	// drain captures is nested-loop-only anyway (rowSourceLeft, which
+	// runMergeJoin never populated, is what Next needs to use it).
+	if o.plan.Algo == planner.JoinAlgoMerge {
+		return o.openMergeJoin(ctx)
+	}
+	// M0127-P4.3 (07 §4): the universal fallback streams too. The outer side
+	// is pulled one tuple at a time and the inner side sits under a
+	// Materialize that replays it per outer tuple; nothing is drained into an
+	// array and nothing accumulates in the operator.
+	return o.openNestedLoop(ctx, true)
+}
+
+// openMergeJoin builds the streaming merge join (M0127-P4.1; design
+// leftdeep-joins/07 §2). Both children are opened, keyed and sorted into
+// work_mem-bounded streams; nothing is joined until Next asks.
+//
+// The one thing that has to happen here rather than inside the sources is
+// resolving the two widths: the key expressions index the MERGED left++right
+// column space, so keying either side needs the OTHER side's width, and a
+// child with an empty Schema() (a Values node, a subplan built without one)
+// only reveals its width when its first row arrives. Priming one row per side
+// is the streaming form of the array path's `width == 0 && len(rows) > 0`
+// fallback.
+func (o *joinOp) openMergeJoin(ctx *Context) error {
+	o.closeMergeStream()
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -198,31 +342,57 @@ func (o *joinOp) Open(ctx *Context) error {
 		_ = o.left.Close()
 		return err
 	}
-
-	leftScanLeaf := findScanLeaf(o.left)
-	leftRows, leftCTIDs, err := drainRowsCtxCTID(o.left, ctx, leftScanLeaf)
+	// The key list and residual are resolved before either side is keyed:
+	// the two sides must produce the same key arity in the same order.
+	o.initMergeKeys()
+	left, err := newMergeSortedSource(o, o.left, true)
 	if err != nil {
 		return err
 	}
-	o.leftCTIDs = leftCTIDs
-	rightRows, err := drainRowsCtx(o.right, ctx)
+	right, err := newMergeSortedSource(o, o.right, false)
 	if err != nil {
 		return err
 	}
-
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
-	if leftWidth == 0 && len(leftRows) > 0 {
-		leftWidth = len(leftRows[0])
+	firstLeft, err := left.prime()
+	if err != nil {
+		return err
 	}
-	if rightWidth == 0 && len(rightRows) > 0 {
-		rightWidth = len(rightRows[0])
+	firstRight, err := right.prime()
+	if err != nil {
+		return err
 	}
+	if leftWidth == 0 && firstLeft != nil {
+		leftWidth = len(firstLeft)
+	}
+	if rightWidth == 0 && firstRight != nil {
+		rightWidth = len(firstRight)
+	}
+	left.selfWidth, left.otherWidth = leftWidth, rightWidth
+	right.selfWidth, right.otherWidth = rightWidth, leftWidth
+	m := newMergeJoinStream(o, leftWidth, rightWidth, left, right)
+	o.mergeStream = m
+	if err := left.fill(ctx); err != nil {
+		return err
+	}
+	return right.fill(ctx)
+}
 
-	if o.plan.Algo == planner.JoinAlgoMerge {
-		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
+func (o *joinOp) closeMergeStream() {
+	if o.mergeStream != nil {
+		o.mergeStream.close()
+		o.mergeStream = nil
 	}
-	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+}
+
+// nextMerge yields the streaming merge join's next row.
+func (o *joinOp) nextMerge() (TupleSlot, error) {
+	row, err := o.mergeStream.next()
+	if err != nil {
+		return nil, err
+	}
+	return asSlot(o.Schema(), row), nil
 }
 
 // lateralBindable is implemented by FROM-clause SRFs that can have
@@ -230,242 +400,6 @@ func (o *joinOp) Open(ctx *Context) error {
 // by a parent Join.Lateral. M0103-0008.
 type lateralBindable interface {
 	BindLateralOuter(slot SlotView)
-}
-
-// openLateral handles `Join.Lateral == true`: drain the left, then
-// for each left row re-run the right side with the left row in scope.
-// Concatenated rows accumulate in o.rows and are emitted via the
-// existing Next() path.
-//
-// Two paths:
-//   - If the right child implements lateralBindable (e.g. pg_get_publication_tables):
-//     use BindLateralOuter to pass the outer row directly.
-//   - Otherwise: push the left row onto ctx.OuterRows so OuterColumnRef
-//     expressions inside the right subtree can resolve correlated refs.
-//     The CTERowCache is saved/cleared per iteration so LATERAL CTEs that
-//     depend on the outer row (e.g. WITH RECURSIVE inside LATERAL) are
-//     re-evaluated for each outer row, not served from a stale cache.
-//
-// LEFT lateral joins emit a null-padded row when the right side yields
-// zero rows; CROSS / INNER drop the outer row.
-func (o *joinOp) openLateral(ctx *Context) error {
-	if err := o.left.Open(ctx); err != nil {
-		return err
-	}
-	leftRows, err := drainRowsCtx(o.left, ctx)
-	if err != nil {
-		_ = o.left.Close()
-		return err
-	}
-	leftWidth := len(o.left.Schema())
-	if leftWidth == 0 && len(leftRows) > 0 {
-		leftWidth = len(leftRows[0])
-	}
-	rightWidth := len(o.right.Schema())
-	nullRight := nullRow(rightWidth)
-
-	bindable, isSRF := o.right.(lateralBindable)
-	if isSRF {
-		outerSlot := SlotFromRow(o.left.Schema(), nil)
-		bindable.BindLateralOuter(outerSlot)
-		defer bindable.BindLateralOuter(nil)
-		for i, l := range leftRows {
-			if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			outerSlot.row = l
-			if err := o.right.Open(ctx); err != nil {
-				return err
-			}
-			rightRows, err := drainRowsCtx(o.right, ctx)
-			_ = o.right.Close()
-			if err != nil {
-				return err
-			}
-			matched := false
-			for _, r := range rightRows {
-				joined := concatRows(l, r)
-				ok, perr := o.joinPredicateMatch(joined)
-				if perr != nil {
-					return perr
-				}
-				if !ok {
-					continue
-				}
-				matched = true
-				o.rows = append(o.rows, joined)
-			}
-			// LEFT JOIN: null-extend when the right side produced no rows or
-			// no right row satisfied the join predicate.
-			if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
-				o.rows = append(o.rows, concatRows(l, nullRight))
-			}
-		}
-		return nil
-	}
-
-	// General LATERAL: push each left row as an outer row context so
-	// OuterColumnRef (level=1) expressions in the right subtree resolve
-	// against it. Also clear CTERowCache per iteration so LATERAL CTEs
-	// whose content depends on the outer row are re-materialised.
-	savedCTECache := ctx.CTERowCache
-	for i, l := range leftRows {
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		ctx.OuterRows = append(ctx.OuterRows, l)
-		ctx.CTERowCache = nil // clear per-iteration so outer-dependent CTEs recompute
-		var rightRows []Row
-		if openErr := o.right.Open(ctx); openErr == nil {
-			rightRows, err = drainRowsCtx(o.right, ctx)
-			_ = o.right.Close()
-		} else {
-			err = openErr
-		}
-		ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1]
-		if err != nil {
-			ctx.CTERowCache = savedCTECache
-			return err
-		}
-		matched := false
-		for _, r := range rightRows {
-			joined := concatRows(l, r)
-			ok, perr := o.joinPredicateMatch(joined)
-			if perr != nil {
-				ctx.CTERowCache = savedCTECache
-				return perr
-			}
-			if !ok {
-				continue
-			}
-			matched = true
-			o.rows = append(o.rows, joined)
-		}
-		// LEFT JOIN: null-extend when the right side produced no rows or
-		// no right row satisfied the join predicate.
-		if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	return nil
-}
-
-// runNestedLoop is the universal fallback. O(N*M) over the two
-// drained sides; supports INNER / LEFT / RIGHT / FULL / CROSS.
-//
-// Cancellation: ctx.Err() is checked once per outer-row loop so a
-// CancelRequest interrupts a long join even when the inner side has
-// no per-row hooks. (M0058-0005.) Q5 and Q13 ran 60+ minutes without
-// responding to cancellation before this check existed.
-func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	rightMatched := make([]bool, len(rightRows))
-	for i, l := range leftRows {
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		matched := false
-		semiAnti := o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti
-		for j, r := range rightRows {
-			// M0062-followup: also check ctx.Err() inside the inner
-			// loop, every 4096 iterations. Q13 (customer LEFT JOIN
-			// orders, 150K × 1.5M with a NOT LIKE residual) ran 300 s
-			// past --cancel-after=600s in the M0061-0003 sweep
-			// because the *outer* check (every 256 outer rows) only
-			// fired between full passes of the 1.5M-row inner.
-			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			joined := concatRows(l, r)
-			ok, err := o.joinPredicateMatch(joined)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				// NULL predicate results count as no-match
-				// (joinPredicateMatch), which is exactly the
-				// semi/anti contract too.
-				continue
-			}
-			matched = true
-			if semiAnti {
-				// S4a (D3.2): keyless semi/anti — one qualifying
-				// inner row decides this outer row; never emit the
-				// joined row (the join's schema is outer-only) and
-				// never scan further inner rows.
-				break
-			}
-			rightMatched[j] = true
-			o.rows = append(o.rows, joined)
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, i)
-			}
-		}
-		if semiAnti {
-			// Semi emits the left row exactly once iff a qualifying
-			// inner row exists; Anti iff none does.
-			hit := matched
-			if o.plan.Type == planner.JoinTypeAnti {
-				hit = !matched
-			}
-			if hit {
-				o.rows = append(o.rows, append(Row(nil), l...))
-				if o.leftCTIDs != nil {
-					o.rowSourceLeft = append(o.rowSourceLeft, i)
-				}
-			}
-			continue
-		}
-		if !matched && (o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull) {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, i)
-			}
-		}
-	}
-
-	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-		for j, r := range rightRows {
-			// M0062-followup: ctx check inside the unmatched-right
-			// emission loop too. RIGHT/FULL join over a multi-million-
-			// row right side could otherwise stall cancel here even
-			// after the join body has finished.
-			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-				if err := o.ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			if rightMatched[j] {
-				continue
-			}
-			// M0097-0060: FULL JOIN USING coalescing. For unmatched
-			// right rows the left side is all NULL; copy each USING
-			// column value from the right position to the left position
-			// so `SELECT *` sees COALESCE(left.col, right.col) = right.col.
-			merged := concatRows(nullLeft, r)
-			for k, lIdx := range o.plan.UsingLeftCols {
-				rIdx := o.plan.UsingRightCols[k]
-				if rIdx < len(merged) {
-					merged[lIdx] = merged[rIdx]
-				}
-			}
-			o.rows = append(o.rows, merged)
-			if o.leftCTIDs != nil {
-				o.rowSourceLeft = append(o.rowSourceLeft, -1) // no left source
-			}
-		}
-	}
-	return nil
 }
 
 // coalesceUsingRow applies FULL JOIN USING coalescing: for each USING
@@ -482,8 +416,9 @@ func (o *joinOp) coalesceUsingRow(merged Row) {
 }
 
 // openLazyHashJoin builds a hash table from the build side and sets
-// up lazy output. When ctx.WorkMem > 0, the build side uses
-// drainRowsBounded to spill to disk if row data exceeds the budget.
+// up lazy output. The build side is consumed in a single pass — the
+// rows land in the hash table as they arrive (M0127-P0.2; see
+// buildLazyHashTable).
 // openLazyHashJoin builds the hash table (or adopts a shared one) and opens
 // the probe side.
 //
@@ -495,6 +430,11 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// A Gather pre-builds the shared table in the leader and publishes it
 	// before fan-out. It is frozen at that point and never written again,
 	// which is the whole reason workers can read it with no lock.
+	// M0127-P2.2: resolve the key plan before either branch. The shared-build
+	// branch skips buildLazyHashTable entirely, and the probe half needs the
+	// same key list the leader built with — deriving it from the plan (rather
+	// than shipping it in sharedHashBuild) makes that agreement structural.
+	o.initExecKeys()
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
@@ -516,22 +456,57 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 		return err
 	}
 	o.lazyProbe = probe
+	o.probeEOF = false
+	o.fillSweepReset()
+	// M0127-P3.2: the build is finished, so nbatch is now the count the outer
+	// scan starts from. nextBatch compares against it to tell a genuinely
+	// empty batch from one whose saved rows a later doubling has re-assigned
+	// (PG's nbatch_outstart, nodeHashjoin.c rule 3).
+	if o.batches != nil {
+		o.batches.nbatchOutstart = o.batches.nbatch
+	}
 	return nil
 }
 
 // buildLazyHashTable drains the build side into o.lazyHash and reports which
 // side is left for probing. It does NOT open the probe side.
+//
+// M0127-P0.2 (design leftdeep-joins/05 §4, stage E3): the build is a SINGLE
+// pass. It used to be drain-to-`[]Row` (drainRowsBounded) and then re-iterate
+// the drained operator, which cost a `MaterializedSlot` allocation per row on
+// the way back out (spill.go rowsOp.Next) plus a second traversal of the whole
+// build side. Rows are now keyed and inserted as they arrive from the child.
+//
+// The drain's `ctx.WorkMem` budget went with it, and deliberately so: that
+// budget bounded only the intermediate `[]Row`, never the hash table it was
+// feeding — every spilled row was read straight back in and inserted, so peak
+// memory was the finished table either way. Real work_mem enforcement for hash
+// join is the batched hybrid-hash spill (06 / P3.2), which partitions rows at
+// insert time and therefore *requires* this single-pass shape. Until it lands,
+// this path is unbounded (deferral ledger 2026-08-03 M0127-P0.2).
 func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
+	// M0127-P2.2: idempotent, and needed here as well as in openLazyHashJoin
+	// because prebuildSharedHashJoins (parallel_hash_build.go) runs the build
+	// phase alone, without ever opening the operator.
+	o.initExecKeys()
+	// A second build on the same operator (a re-Open that skipped Close)
+	// must not inherit the previous run's batch files or its curBatch.
+	o.releaseBatches()
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
 	o.lazyRW = rightWidth
 	o.antiBuildRows = 0
 	o.antiBuildHasNull = false
-	budget := ctx.WorkMem
-	if budget <= 0 {
-		budget = 512 * 1024 * 1024 // default 512 MiB
-	}
+	// M0127-P4.2: a re-Open that skipped Close must not inherit the previous
+	// run's matched bitmaps or its retained NULL-key build rows.
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
+	o.fillNullBuild = nil
+	o.fillNullIdx = 0
+	o.probeEOF = false
+	o.fillSweepReset()
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -548,55 +523,27 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
 		buildLeft = false
 	}
+	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
+	// from the plan's key types. Everything downstream of this line inserts
+	// into exactly one map.
+	//
+	// M0127-P2.2: the int64 MAP lane is the single-key representation. A
+	// multi-column key is packed into the string map instead (its own
+	// fixed-width int64 lane lives in join_composite_key.go), so a
+	// map[int64] table can never be built for a join that probes with a
+	// composite key.
+	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
 		}
-		buildOp, err := drainRowsBounded(o.left, budget)
+		o.presizeLazyHash(ctx, o.plan.Left, leftWidth, true)
+		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
+			o.releaseBatches()
 			return false, err
 		}
-		if err := buildOp.Open(ctx); err != nil {
-		return false, err
-	}
-		buildCount := 0
-		for {
-			// M0062-followup: ctx check inside the build loop. With
-			// 6M-row build inputs (Q21's anti-join lineitem) the
-			// build alone runs minutes; without this check the
-			// cancel-after deadline can be exceeded by 100+ s
-			// while build keeps draining.
-			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
-				if err := ctx.Ctx.Err(); err != nil {
-					return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-				}
-			}
-			buildCount++
-			lSlot, err := buildOp.Next()
-			if err == EOF {
-			break
-		}
-			if err != nil {
-			return false, err
-		}
-			l := slotRow(lSlot)
-			if leftWidth == 0 && len(l) > 0 {
-				leftWidth = len(l); o.lazyLW = leftWidth
-			}
-			// M0126-0003 0b: evaluate the key against a VirtualSlot
-			// over {lSlot, nullRight} instead of copying into a
-			// merged keyRow.
-			keySlot := mergedKeySlot(lSlot, leftWidth, rightWidth, true)
-			kd, ok, err := o.evalHashKeyDatumSlot(o.plan.LeftKey, keySlot)
-			if err != nil {
-			return false, err
-		}
-			if !ok { continue }
-			o.lazyHashInsertDatum(kd, l)
-		}
-		_ = buildOp.Close()
-		o.lazyHashFinalize()
 		return false, nil
 	}
 	if err := o.right.Open(ctx); err != nil {
@@ -606,47 +553,256 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
 		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
+			// The CTID exception: lazyHashCTID is a map[string] keyed in
+			// lockstep with lazyHash, so this build stays on the string map
+			// whatever the key types say (M0127-P0.3).
+			o.lazyHashIsInt = false
 			if err := o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth); err != nil {
 				return false, err
 			}
 			return true, nil
 		}
 	}
-	buildOp, err := drainRowsBounded(o.right, budget)
+	o.presizeLazyHash(ctx, o.plan.Right, rightWidth, false)
+	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
-			return false, err
-		}
-	if err := buildOp.Open(ctx); err != nil {
+		o.releaseBatches()
 		return false, err
 	}
-	buildCount := 0
-	for {
+	return true, nil
+}
+
+// releaseBatches drops the batch files a failed or finished join still owns.
+// M0127-P3.2: this is the join's half of the temp-file hygiene obligation;
+// the per-query registry that makes it unconditional (including the paths
+// where the operator is never Closed at all) is P3.3.
+func (o *joinOp) releaseBatches() {
+	if o.batches != nil {
+		o.batches.close()
+		o.batches = nil
+	}
+}
+
+// maxPresizeBuckets caps how many buckets presizeLazyHash will pre-allocate.
+//
+// The cap exists because the bucket count comes from planner.EstimateRows,
+// and an estimate is not a measurement: a 100× over-estimate on a join that
+// really holds a thousand rows would otherwise reserve a map big enough for
+// the imagined build and hold it for the query's life. Go maps grow by
+// doubling with incremental rehash, so past roughly a million buckets the
+// presize buys progressively less anyway — the allocation it saves is the one
+// the table would have grown into regardless. 1<<20 slots is about 48 MB of
+// map metadata worst case, which is a bounded loss if the estimate is wrong.
+//
+// The cap is presize policy, deliberately NOT part of hashsize.Choose: the
+// sizing function must keep returning PG's geometry so the planner and the
+// executor agree on it.
+//
+// M0127-P3.2 was expected to retire it — nbatch now bounds the ROWS that stay
+// resident — and it does not, because the bucket ARRAY is not what nbatch
+// bounds. Once the geometry goes multi-batch, hashsize.Choose re-derives
+// nbuckets from the full budget (PG's own rule), so a build over-estimated by
+// 100x would allocate a map sized for a memory-full table and hold it for a
+// hundred rows. Retiring the cap needs the presize to be revisable downward,
+// not just the row set to be bounded. Deferral ledger 2026-08-03 M0127-P3.2.
+const maxPresizeBuckets = 1 << 20
+
+// buildGeometry is the ONE derivation of a hash join's (nbuckets, nbatch)
+// geometry. Three callers read it and must not disagree about whether a build
+// fits: presizeLazyHash sizes the bucket array from it, newHashBatchState takes
+// its memory budget from it, and prebuildSharedHashJoins decides from it
+// whether a shared build would spill (M0127-P3.4). Three separate
+// hashsize.Choose calls would be three chances to drift.
+//
+// avgVarBytes is 0: goopg has no per-column average-width statistic to feed it,
+// so a text-heavy build is under-counted and its geometry is sized as if only
+// the 48-byte Datum array were resident. That biases NBatch low, which is the
+// risk 04 §4 names — and is why the batch state also grows on measured
+// overrun rather than trusting this number. Deferral ledger 2026-08-03
+// M0127-P3.1.
+func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int) hashsize.Sizing {
+	var workMem int64
+	if ctx != nil {
+		workMem = ctx.WorkMem
+	}
+	return hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
+		hashsize.EffectiveMemLimit(workMem))
+}
+
+// presizeLazyHash allocates the build-side table with its bucket count already
+// chosen, instead of letting an empty map grow by rehashing.
+//
+// M0127-P3.1 (design leftdeep-joins/06 §2.1): PG picks (nbuckets, nbatch) once
+// via ExecChooseHashTableSize and ExecHashTableCreate allocates the bucket
+// array up front (nodeHash.c:446). goopg built every hash table from a nil map
+// and let it double its way up — for a multi-million-row build that is a
+// couple of dozen rehashes of the whole table. hashsize.Choose is the shared
+// planner↔executor sizing rule; this is its first caller, and it uses only the
+// NBuckets half. NBatch is computed and currently ignored: honouring it means
+// partitioning rows at insert time, which is P3.2.
+//
+// buildNode is the plan node feeding the build side — the row estimate has to
+// come from the plan because the executor cannot know the count before it has
+// drained the side it is about to build.
+//
+// Not called for the FOR-UPDATE ctid build (buildHashRightWithCTID): that path
+// materialises its rows first and its result sets are small by construction.
+func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) {
+	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
+		return
+	}
+	sizing := o.buildGeometry(ctx, buildNode, buildWidth)
+	// M0127-P3.2: the geometry's NBatch half is honoured now instead of
+	// ignored — and the state is installed even when it comes out as ONE.
+	//
+	// That is not over-eagerness, it is the only way the bound is real here.
+	// goopg's row estimates are absent far more often than PG's (stats are
+	// per-connection, so an unANALYZEd relation estimates at the floor), and
+	// an under-estimate is precisely the case where the build overruns memory.
+	// PG has the same shape: ExecHashTableCreate may choose nbatch = 1 and
+	// ExecHashTableInsert still grows it when spaceUsed passes spaceAllowed.
+	// A single-batch state costs one add and one compare per build row.
+	if o.joinBatchEligible() {
+		o.batches = newHashBatchState(ctx, o.plan, sizing, buildIsLeft)
+	}
+	n := sizing.NBuckets
+	if n > maxPresizeBuckets {
+		n = maxPresizeBuckets
+	}
+	if n <= hashsize.MinBuckets {
+		// hashsize floors nbuckets at 1024 even for a three-row build, and
+		// that floor is also what an unestimated relation returns. Both mean
+		// "no useful information", so allocate nothing and let the map grow.
+		return
+	}
+	if o.lazyHashIsInt {
+		o.lazyIntHash = make(map[int64][]Row, n)
+		return
+	}
+	o.lazyHash = make(map[string][]Row, n)
+}
+
+// buildLoopLeft is the single-pass build loop for the BuildLeft orientation
+// (M0127-P0.2; 05 §4 stage E3). o.left is already Open and is closed by the
+// caller. rightWidth is the null-side width of the merged key column space.
+func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
+	o.ensureExecKeys()
+	leftWidth := o.lazyLW
+	for buildCount := 0; ; buildCount++ {
+		// M0062-followup: ctx check inside the build loop. With
+		// 6M-row build inputs (Q21's anti-join lineitem) the
+		// build alone runs minutes; without this check the
+		// cancel-after deadline can be exceeded by 100+ s
+		// while build keeps draining.
+		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		lSlot, err := o.left.Next()
+		if err == EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		l := slotRow(lSlot)
+		if leftWidth == 0 && len(l) > 0 {
+			leftWidth = len(l)
+			o.lazyLW = leftWidth
+		}
+		// M0126-0003 0b: evaluate the key against a VirtualSlot
+		// over {lSlot, nullRight} instead of copying into a
+		// merged keyRow.
+		keySlot := o.lazyBuildKeySlot.rebind(lSlot, leftWidth, rightWidth, true)
+		// M0127-P2.2: a multi-column key is encoded and filed as one
+		// composite; the single-key lanes are untouched.
+		if o.multiKey() {
+			ok, err := o.encodeBuildCompositeKey(keySlot)
+			if err != nil {
+				return err
+			}
+			if ok {
+				o.fileCompositeBuildRow(ownedBuildRow(l))
+			} else {
+				o.recordBuildNullKey(ownedBuildRow(l))
+			}
+			continue
+		}
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// M0127-P4.2: a NULL key matches nothing, which under RIGHT/FULL
+			// is precisely why the row has to be kept.
+			o.recordBuildNullKey(ownedBuildRow(l))
+			continue
+		}
+		if err := o.insertBuildRow(kd, ownedBuildRow(l)); err != nil {
+			return err
+		}
+	}
+}
+
+// insertBuildRow files one build row: straight into the hash table when the
+// join is not batching, through the batch router when it is (M0127-P3.2).
+func (o *joinOp) insertBuildRow(kd Datum, row Row) error {
+	if o.batches != nil {
+		return o.batches.insertBuildRow(o, kd, row)
+	}
+	o.lazyHashInsertDatum(kd, row)
+	return nil
+}
+
+// buildLoopRight is the single-pass build loop for the (default) BuildRight
+// orientation, including the Semi/Anti string-map lane and the NullAware
+// bookkeeping. o.right is already Open and is closed by the caller.
+func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
+	o.ensureExecKeys()
+	rightWidth := o.lazyRW
+	for buildCount := 0; ; buildCount++ {
 		// M0062-followup: same ctx check on the build-right path.
 		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 			if err := ctx.Ctx.Err(); err != nil {
-				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		buildCount++
-		rSlot, err := buildOp.Next()
+		rSlot, err := o.right.Next()
 		if err == EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return false, err
+			return err
 		}
 		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
-			rightWidth = len(r); o.lazyRW = rightWidth
+			rightWidth = len(r)
+			o.lazyRW = rightWidth
 		}
 		// M0126-0003 0b: evaluate the key against a VirtualSlot
 		// over {nullLeft, rSlot} instead of copying into a
 		// merged keyRow.
-		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
-		kd, ok, err := o.evalHashKeyDatumSlot(o.plan.RightKey, keySlot)
+		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
+		// M0127-P2.2: composite lane. NullAware joins are forced single-key
+		// by ExecHashKeyPlan (their antiBuildHasNull rule is defined over one
+		// key column), so this branch never has to maintain those counters.
+		if o.multiKey() {
+			ok, err := o.encodeBuildCompositeKey(keySlot)
+			if err != nil {
+				return err
+			}
+			if ok {
+				o.fileCompositeBuildRow(ownedBuildRow(r))
+			} else {
+				o.recordBuildNullKey(ownedBuildRow(r))
+			}
+			continue
+		}
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if o.plan.NullAware {
 			o.antiBuildRows++
@@ -655,25 +811,38 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			if o.plan.NullAware {
 				o.antiBuildHasNull = true
 			}
+			// M0127-P4.2: see buildLoopLeft — under RIGHT/FULL the NULL-key
+			// row is unmatched by construction, not absent.
+			o.recordBuildNullKey(ownedBuildRow(r))
 			continue
 		}
-		// int64 fast-path is INNER-only; semi/anti keep the string map so
-		// their NullAware / no-fan-out invariants are untouched.
-		if o.plan.Type == planner.JoinTypeInner {
-			o.lazyHashInsertDatum(kd, r)
-		} else {
-			sk := datumKey(kd)
-			if o.lazyHash == nil {
-				o.lazyHash = make(map[string][]Row)
-			}
-			o.lazyHash[sk] = append(o.lazyHash[sk], r)
+		// M0127-P0.3 (05 §4, stage E3): Semi/Anti go through the same
+		// insert as INNER now. The old INNER-only gate existed because the
+		// representation was DISCOVERED during the build and semi/anti
+		// never ran the finalize step that committed it; with the choice
+		// made up front there is nothing left for them to opt out of.
+		// Their NullAware / emit-once invariants live in the counters above
+		// and in nextLazy, neither of which reads the key representation.
+		if err := o.insertBuildRow(kd, ownedBuildRow(r)); err != nil {
+			return err
 		}
 	}
-	_ = buildOp.Close()
-	if o.plan.Type == planner.JoinTypeInner {
-		o.lazyHashFinalize()
+}
+
+// ownedBuildRow copies a build-side row into storage the hash table can hold
+// for the life of the join. This is the copy drainRowsBounded used to perform
+// (spill.go, M0073-0004 retention boundary) before M0127-P0.2 folded the drain
+// into the build loop: arena-backed Datums must be promoted to owned []byte
+// because the producer's next Next may Reset the arena, while the non-arena
+// case keeps the cheap O(width) struct copy. Dropping either half re-opens the
+// M0097-0058 aliasing class — build rows must never alias a scan buffer.
+func ownedBuildRow(row Row) Row {
+	if rowHasArena(row) {
+		return cloneRowOwned(row)
 	}
-	return true, nil
+	dup := make(Row, len(row))
+	copy(dup, row)
+	return dup
 }
 
 // buildHashRightWithCTID is the ctid-preserving variant of the !BuildLeft build
@@ -685,6 +854,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 // drainRowsCtxCTID consumes it to EOF without an extra Close. The materialising
 // drain (no spill) is acceptable because FOR UPDATE result sets are small.
 func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvider, leftWidth, rightWidth int) error {
+	o.ensureExecKeys()
 	rows, ctids, err := drainRowsCtxCTID(o.right, ctx, scanLeaf)
 	if err != nil {
 		return err
@@ -699,10 +869,25 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 		// M0126-0003 0b: slot-based key evaluation — skip the
 		// merged keyRow copy.
 		rSlot := SlotFromRow(nil, r)
-		keySlot := mergedKeySlot(rSlot, rightWidth, leftWidth, false)
-		key, ok, err := o.evalHashKeySlot(o.plan.RightKey, keySlot)
-		if err != nil {
-			return err
+		keySlot := o.lazyBuildKeySlot.rebind(rSlot, rightWidth, leftWidth, false)
+		// M0127-P2.2: this path keys lazyHashCTID in lockstep with lazyHash,
+		// so it must use the SAME encoding the probe will — composite when
+		// the join has more than one key pair.
+		var key string
+		var ok bool
+		if o.multiKey() {
+			var kerr error
+			ok, kerr = o.encodeBuildCompositeKey(keySlot)
+			if kerr != nil {
+				return kerr
+			}
+			key = string(o.execKeyBuf)
+		} else {
+			var kerr error
+			key, ok, kerr = o.evalHashKeySlot(o.buildKeyExprs[0], keySlot)
+			if kerr != nil {
+				return kerr
+			}
 		}
 		if !ok {
 			continue
@@ -716,210 +901,6 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 	// P8: the probe side is opened by the caller, not here — the build and
 	// probe halves of Open are separable now.
 	return nil
-}
-
-type mergeKeyedRow struct {
-	row    Row
-	key    Datum
-	hasKey bool
-}
-
-// runMergeJoin sorts both sides on their join keys and merges the
-// two ordered streams. NULL keys never match (same as hash join).
-// Supports INNER / LEFT / RIGHT / FULL outer semantics.
-func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	leftKeyed, leftNull, err := o.buildMergeSide(leftRows, true, leftWidth, rightWidth)
-	if err != nil {
-		return err
-	}
-	rightKeyed, rightNull, err := o.buildMergeSide(rightRows, false, leftWidth, rightWidth)
-	if err != nil {
-		return err
-	}
-
-	i, j := 0, 0
-	for i < len(leftKeyed) && j < len(rightKeyed) {
-		// M0058-0005: cheap ctx check every 256 left-side rows so a
-		// CancelRequest interrupts a long sort-merge join promptly.
-		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
-			if err := o.ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
-			}
-		}
-		cmp, err := compareDatum(leftKeyed[i].key, rightKeyed[j].key, o.plan.Pos())
-		if err != nil {
-			return err
-		}
-		switch {
-		case cmp < 0:
-			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-				o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
-			}
-			i++
-		case cmp > 0:
-			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				merged := concatRows(nullLeft, rightKeyed[j].row)
-				o.coalesceUsingRow(merged)
-				o.rows = append(o.rows, merged)
-			}
-			j++
-		default:
-			li := i
-			for i < len(leftKeyed) {
-				eq, err := compareDatum(leftKeyed[li].key, leftKeyed[i].key, o.plan.Pos())
-				if err != nil {
-					return err
-				}
-				if eq != 0 {
-					break
-				}
-				i++
-			}
-			rj := j
-			for j < len(rightKeyed) {
-				eq, err := compareDatum(rightKeyed[rj].key, rightKeyed[j].key, o.plan.Pos())
-				if err != nil {
-					return err
-				}
-				if eq != 0 {
-					break
-				}
-				j++
-			}
-			// M0125-0011: the merge key is only the FIRST equality
-			// conjunct of the ON clause — splitEqualityForHash
-			// (internal/planner/planner.go) returns a single
-			// left/right pair and discards the rest. Every remaining
-			// conjunct is residual and MUST still be evaluated per
-			// candidate pair, exactly as PostgreSQL evaluates a merge
-			// join's joinqual once its mergeclauses have located the
-			// group (postgres/src/backend/executor/nodeMergejoin.c,
-			// EXEC_MJ_JOINTUPLES -> ExecQual(joinqual)). Without this
-			// the residual was silently dropped, so a two-conjunct
-			// FULL OUTER JOIN degenerated into its single-key
-			// counterpart (TPC-DS Q97: 2131274 rows instead of
-			// 836302) and RIGHT OUTER JOIN was wrong the same way.
-			leftMatched := make([]bool, i-li)
-			rightMatched := make([]bool, j-rj)
-			for a := li; a < i; a++ {
-				for b := rj; b < j; b++ {
-					joined := concatRows(leftKeyed[a].row, rightKeyed[b].row)
-					ok, perr := o.joinPredicateMatch(joined)
-					if perr != nil {
-						return perr
-					}
-					if !ok {
-						continue
-					}
-					leftMatched[a-li] = true
-					rightMatched[b-rj] = true
-					o.rows = append(o.rows, joined)
-				}
-			}
-			// A row whose merge key matched but whose residual did not
-			// is still an UNMATCHED row for outer-join purposes, so it
-			// must be null-extended here; the cmp<0 / cmp>0 arms only
-			// see rows whose key itself found no partner.
-			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-				for a := li; a < i; a++ {
-					if !leftMatched[a-li] {
-						o.rows = append(o.rows, concatRows(leftKeyed[a].row, nullRight))
-					}
-				}
-			}
-			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				for b := rj; b < j; b++ {
-					if !rightMatched[b-rj] {
-						merged := concatRows(nullLeft, rightKeyed[b].row)
-						o.coalesceUsingRow(merged)
-						o.rows = append(o.rows, merged)
-					}
-				}
-			}
-		}
-	}
-
-	for ; i < len(leftKeyed); i++ {
-		if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-			o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
-		}
-	}
-	for ; j < len(rightKeyed); j++ {
-		if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-			merged := concatRows(nullLeft, rightKeyed[j].row)
-			o.coalesceUsingRow(merged)
-			o.rows = append(o.rows, merged)
-		}
-	}
-
-	if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
-		for _, l := range leftNull {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-		for _, r := range rightNull {
-			merged := concatRows(nullLeft, r)
-			o.coalesceUsingRow(merged)
-			o.rows = append(o.rows, merged)
-		}
-	}
-
-	return nil
-}
-
-func (o *joinOp) buildMergeSide(rows []Row, isLeft bool, leftWidth, rightWidth int) ([]mergeKeyedRow, []Row, error) {
-	var paddedLeft, paddedRight Row
-	if isLeft {
-		paddedRight = nullRow(rightWidth)
-	} else {
-		paddedLeft = nullRow(leftWidth)
-	}
-	keyExpr := o.plan.RightKey
-	if isLeft {
-		keyExpr = o.plan.LeftKey
-	}
-	if keyExpr == nil {
-		return nil, nil, fmt.Errorf("merge join key is nil")
-	}
-
-	keyed := make([]mergeKeyedRow, 0, len(rows))
-	nullKey := make([]Row, 0)
-	for _, row := range rows {
-		var evalRow Row
-		if isLeft {
-			evalRow = concatRows(row, paddedRight)
-		} else {
-			evalRow = concatRows(paddedLeft, row)
-		}
-		v, err := evalExpr(keyExpr, evalRow, o.ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		if v.IsNull() {
-			nullKey = append(nullKey, row)
-			continue
-		}
-		keyed = append(keyed, mergeKeyedRow{row: row, key: v, hasKey: true})
-	}
-
-	var sortErr error
-	sort.SliceStable(keyed, func(i, j int) bool {
-		cmp, err := compareDatum(keyed[i].key, keyed[j].key, o.plan.Pos())
-		if err != nil {
-			sortErr = err
-			return false
-		}
-		return cmp < 0
-	})
-	if sortErr != nil {
-		return nil, nil, sortErr
-	}
-
-	return keyed, nullKey, nil
 }
 
 // evalHashKey evaluates one side of the hash-join key against a
@@ -1009,38 +990,97 @@ func mergedKeySlot(realSlot TupleSlot, realWidth, nullWidth int, realOnLeft bool
 	return &VirtualSlot{sources: sources, cols: cols}
 }
 
-// lazyHashInsertDatum inserts a build row keyed by keyDatum. It always
-// populates lazyHash (string) and, while every key so far has been
-// int64-representable, also lazyIntHash. The first non-int64 key drops the
-// int table. lazyHashFinalize then keeps whichever survives.
+// mergedKeySlotCache holds one hoisted merged-key VirtualSlot together
+// with the shape it was built for (M0127-P0.1; design
+// leftdeep-joins/05 §3, stage E2). The build and probe loops call
+// rebind once per row; in steady state that swaps a single interface
+// word inside slot.sources and allocates nothing, where the previous
+// per-row mergedKeySlot call allocated five objects.
+type mergedKeySlotCache struct {
+	slot       *VirtualSlot
+	realWidth  int
+	nullWidth  int
+	realOnLeft bool
+	realIdx    int // position of the real source inside slot.sources
+}
+
+// rebind returns the cached slot presenting realSlot in the merged
+// (left+right) column space. It rebuilds only when the requested shape
+// differs from the cached one. Child schemas fix the widths at Open, so
+// the rebuild fires at most once per operator in practice — the build
+// loops' `width == 0 && len(row) > 0` first-row fallback (an empty child
+// schema) is the only case that can change the shape mid-loop, and it
+// can fire only once.
+//
+// The returned slot is valid until the next rebind on the same cache;
+// like the slot mergedKeySlot returned before, it must not be retained
+// past the key evaluation it was built for.
+func (c *mergedKeySlotCache) rebind(realSlot TupleSlot, realWidth, nullWidth int, realOnLeft bool) *VirtualSlot {
+	if c.slot == nil || c.realWidth != realWidth || c.nullWidth != nullWidth || c.realOnLeft != realOnLeft {
+		c.slot = mergedKeySlot(realSlot, realWidth, nullWidth, realOnLeft)
+		c.realWidth, c.nullWidth, c.realOnLeft = realWidth, nullWidth, realOnLeft
+		c.realIdx = 1
+		if realOnLeft {
+			c.realIdx = 0
+		}
+		return c.slot
+	}
+	c.slot.sources[c.realIdx] = realSlot
+	return c.slot
+}
+
+// lazyHashInsertDatum inserts a build row keyed by keyDatum into whichever of
+// the two tables buildLazyHashTable selected (M0127-P0.3, 05 §4 stage E3).
+//
+// keyDatum is never NULL here: both build loops skip a NULL key before calling
+// (that is what the `ok` return of evalHashKeyDatumSlot means), so a
+// datumToInt64Key miss really does mean "an integer-typed key produced a
+// non-integer datum" and not "this row has no key".
 func (o *joinOp) lazyHashInsertDatum(keyDatum Datum, row Row) {
+	if o.lazyHashIsInt {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			if o.lazyIntHash == nil {
+				o.lazyIntHash = make(map[int64][]Row)
+			}
+			o.lazyIntHash[ik] = append(o.lazyIntHash[ik], row)
+			return
+		}
+		o.demoteIntHash()
+	}
 	if o.lazyHash == nil {
 		o.lazyHash = make(map[string][]Row)
-		o.lazyIntHash = make(map[int64][]Row)
-		o.lazyBuildAllInt64 = true
 	}
 	sk := datumKey(keyDatum)
 	o.lazyHash[sk] = append(o.lazyHash[sk], row)
-	if o.lazyBuildAllInt64 {
-		if ik, ok := datumToInt64Key(keyDatum); ok {
-			o.lazyIntHash[ik] = append(o.lazyIntHash[ik], row)
-		} else {
-			o.lazyBuildAllInt64 = false
-			o.lazyIntHash = nil
-		}
-	}
 }
 
-// lazyHashFinalize commits the int64 table (and frees the string table)
-// when every build key was int64-representable. Called once after the
-// build loop of a plain INNER hash join.
-func (o *joinOp) lazyHashFinalize() {
-	if o.lazyBuildAllInt64 && len(o.lazyIntHash) > 0 {
-		o.lazyHashIsInt = true
-		o.lazyHash = nil // free the string map; KEEP lazyIntHash
-	} else {
-		o.lazyIntHash = nil
+// demoteIntHash abandons the int64 representation mid-build and re-keys
+// everything inserted so far into the general string table.
+//
+// This is the safety net under the planner's static type decision: the plan
+// says both key columns are machine integers, so every key datum should be
+// int64-representable, but a type is a promise about a column and the executor
+// deals in datums. Rather than have a broken promise silently drop rows (an
+// int64-only table cannot hold a key it cannot represent), the build degrades
+// to the always-correct representation and continues.
+//
+// The re-key is exact rather than approximate: datumKey(KindInt(v)) is
+// canonicalNumericKey(v, 0) by construction, which is the same canonical form
+// this rebuild produces, so a row inserted before the demotion lands under the
+// identical string key as one inserted after it.
+func (o *joinOp) demoteIntHash() {
+	o.lazyHashIsInt = false
+	if o.lazyIntHash == nil {
+		return
 	}
+	if o.lazyHash == nil {
+		o.lazyHash = make(map[string][]Row, len(o.lazyIntHash))
+	}
+	for ik, rows := range o.lazyIntHash {
+		sk := canonicalNumericKey(ik, 0)
+		o.lazyHash[sk] = append(o.lazyHash[sk], rows...)
+	}
+	o.lazyIntHash = nil
 }
 
 func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
@@ -1057,16 +1097,41 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 // joinPredicateMatchSlot evaluates plan.Predicate against a slot
 // (typically o.lazyVirtualOut). Caller must update the source-slot
 // .row fields before invocation.
+// M0127-P2.2 narrowed the expression from `plan.Predicate` to `execResidual`:
+// a conjunct the hash key already enforces must not be re-evaluated per match.
+// The narrowing is exactly the set of pairs the key encoding folded in
+// (planner.Join.ExecHashKeyPlan), so a pair the planner declined as not
+// hash-safe still gets its per-match check — which is why this is a pure
+// saving and not a semantic change.
 func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
-	if o.plan.Predicate == nil {
+	if o.execResidual == nil {
 		return true, nil
 	}
-	v, err := evalExprSlot(o.plan.Predicate, slot, o.ctx)
+	v, err := evalExprSlot(o.execResidual, slot, o.ctx)
 	if err != nil {
 		return false, err
 	}
 	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
+
+// joinSlotChainOn is M0127-P1.1's operational kill switch. Default ON;
+// GOOPG_JOIN_SLOT_CHAIN=off at server start (or
+// SetJoinSlotChainEnabled(false) from tests) restores the pre-P1.1 seam
+// that flattened the probe child's slot into a Row on every pull. Same
+// pattern as GOOPG_HASHED_SUBPLAN (subplan_hash.go).
+var joinSlotChainOn atomic.Bool
+
+func init() {
+	joinSlotChainOn.Store(os.Getenv("GOOPG_JOIN_SLOT_CHAIN") != "off")
+}
+
+// SetJoinSlotChainEnabled toggles probe-side slot chaining. Test-only
+// API; the operational switch is the environment variable read at init.
+// It is read once per joinOp in ensureLazyVirtual, so a toggle takes
+// effect from the next Open, not mid-scan.
+func SetJoinSlotChainEnabled(on bool) { joinSlotChainOn.Store(on) }
+
+func joinSlotChainEnabled() bool { return joinSlotChainOn.Load() }
 
 // ensureLazyVirtual lazily builds the persistent VirtualSlot used
 // by nextLazy to emit joined rows without per-match concat. Source
@@ -1081,6 +1146,17 @@ func (o *joinOp) ensureLazyVirtual() {
 	o.lazyBuildSlot = SlotFromRow(nil, nil)
 	o.lazyProbeSlot = SlotFromRow(nil, nil)
 	o.lazyOuterOnlySlot = SlotFromRow(o.schema, nil)
+	// M0127-P1.1: the Semi/Anti emit slot has the probe as its only
+	// source, so its column map is the identity over o.schema (which
+	// Join.Output() derives from Left for those two types — the probe
+	// side, by the buildLazyHashTable contract).
+	outerCols := make([]virtualCol, len(o.schema))
+	for i := range outerCols {
+		outerCols[i] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+	}
+	o.lazyOuterOnlyOut = NewVirtualSlot(o.schema,
+		[]TupleSlot{o.lazyProbeSlot}, outerCols)
+	o.lazyChainProbe = joinSlotChainEnabled()
 	cols := make([]virtualCol, 0, o.lazyLW+o.lazyRW)
 	if o.plan.BuildLeft {
 		// Output is left ++ right; build side is left → sources
@@ -1095,6 +1171,8 @@ func (o *joinOp) ensureLazyVirtual() {
 		}
 		o.lazyVirtualOut = NewVirtualSlot(o.schema,
 			[]TupleSlot{o.lazyBuildSlot, o.lazyProbeSlot}, cols)
+		// BuildLeft → the probe is the RIGHT side, at sources[1].
+		o.lazyProbeSrcIdx, o.lazyProbeWidth = 1, o.lazyRW
 		return
 	}
 	// !BuildLeft: probe is left, build is right → sources
@@ -1107,6 +1185,68 @@ func (o *joinOp) ensureLazyVirtual() {
 	}
 	o.lazyVirtualOut = NewVirtualSlot(o.schema,
 		[]TupleSlot{o.lazyProbeSlot, o.lazyBuildSlot}, cols)
+	o.lazyProbeSrcIdx, o.lazyProbeWidth = 0, o.lazyLW
+}
+
+// bindProbe points the join's output composition at the probe child's
+// current slot (M0127-P1.1; design leftdeep-joins/05 §2, stage E1).
+//
+// Steady state writes one interface word into lazyVirtualOut.sources and
+// copies nothing. Two conditions fall back to the pre-P1.1 copy through
+// lazyProbeSlot, so the seam can never be the reason a row is wrong:
+//
+//   - the kill switch is off (GOOPG_JOIN_SLOT_CHAIN=off), and
+//   - the child's slot is narrower than the columns lazyVirtualOut reads
+//     from it. That is the F7 type-change fallback in its observable
+//     form: what matters about "the child returned a different slot" is
+//     only whether the new slot can still serve the composed shape.
+//     (A WIDER slot needs no fallback — the extra columns are simply
+//     never addressed, exactly as the flattened Row's were not.)
+//
+// The returned bool reports whether chaining took effect; Semi/Anti uses
+// it to pick between the chained and the copied outer-only emit slot.
+//
+// Aliasing the child's storage is safe only because nextLazy pulls a new
+// probe row after draining every match of the previous one. Nothing in
+// the type system enforces that, so assert it here rather than trust it
+// (bundle 02 §2.4's honesty note).
+func (o *joinOp) bindProbe(probeSlot TupleSlot) (bool, error) {
+	if o.lazyActive {
+		return false, &ExecError{Code: "XX000", Message: "join probe rebound while matches were still draining"}
+	}
+	if o.lazyChainProbe && probeSlot != nil && probeSlot.Width() >= o.lazyProbeWidth {
+		o.lazyVirtualOut.sources[o.lazyProbeSrcIdx] = probeSlot
+		o.lazyProbeSrc = probeSlot
+		return true, nil
+	}
+	o.lazyProbeSlot.row = slotRow(probeSlot)
+	o.lazyVirtualOut.sources[o.lazyProbeSrcIdx] = o.lazyProbeSlot
+	o.lazyProbeSrc = o.lazyProbeSlot
+	return false, nil
+}
+
+// outerOnlyEmit returns the Semi/Anti emit slot for the probe row bound
+// by bindProbe. chained reports bindProbe's verdict for the INNER
+// composition; the outer-only slot needs the STRICTER width test because
+// here the probe slot is the whole emitted tuple, so its width is the
+// tuple's width. Pre-P1.1 an over-wide probe child emitted all of its
+// columns (slotRow handed the full Row to lazyOuterOnlySlot) — chaining
+// would silently narrow that to len(o.schema). P1.1 rewrites the seam, not
+// the semantics, so a width mismatch takes the copy and keeps the old
+// shape; a later stage may narrow it deliberately.
+func (o *joinOp) outerOnlyEmit(probeSlot TupleSlot, chained bool) TupleSlot { //nolint:ireturn
+	if chained {
+		if probeSlot.Width() == len(o.schema) {
+			o.lazyOuterOnlyOut.sources[0] = probeSlot
+			return o.lazyOuterOnlyOut
+		}
+		o.lazyOuterOnlySlot.row = slotRow(probeSlot)
+		return o.lazyOuterOnlySlot
+	}
+	// bindProbe already flattened the child's slot into lazyProbeSlot —
+	// reuse that Row rather than materialise the child a second time.
+	o.lazyOuterOnlySlot.row = o.lazyProbeSlot.row
+	return o.lazyOuterOnlySlot
 }
 
 func (o *joinOp) Next() (TupleSlot, error) {
@@ -1114,28 +1254,22 @@ func (o *joinOp) Next() (TupleSlot, error) {
 	if o.lazyProbe != nil {
 		return o.nextLazy()
 	}
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	// M0127-P4.1: so does the merge join, from its own state machine.
+	if o.mergeStream != nil {
+		return o.nextMerge()
 	}
-	row := o.rows[o.idx]
-	idx := o.idx
-	o.idx++
-	// M0100-0010: propagate left-side ctid through the join so lockRowsOp
-	// can stamp tuple locks even after the scan was eagerly drained/closed.
-	if o.leftCTIDs != nil && idx < len(o.rowSourceLeft) {
-		li := o.rowSourceLeft[idx]
-		if li >= 0 && li < len(o.leftCTIDs) {
-			lc := o.leftCTIDs[li]
-			if lc.hasCTID {
-				ms := SlotFromRow(o.Schema(), row)
-				ms.hasCTID = true
-				ms.ctidBlock = uint32(lc.ptr.Block)
-				ms.ctidOff = lc.ptr.Offset
-				return ms, nil
-			}
-		}
+	// M0127-P4.3: and so does the nested loop.
+	if o.nlStream != nil {
+		return o.nextNL()
 	}
-	return asSlot(o.Schema(), row), nil
+	// M0127-P4.4: and so does LATERAL, which was the last one left. Every arm
+	// of this switch now streams, so there is no array tail below it — a
+	// joinOp that reached Next with no stream at all never opened, and EOF is
+	// the only honest answer.
+	if o.latStream != nil {
+		return o.nextLateral()
+	}
+	return nil, EOF
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
@@ -1155,8 +1289,19 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	if o.lazyNullRight == nil || len(o.lazyNullRight) != o.lazyRW {
 		o.lazyNullRight = nullRow(o.lazyRW)
 	}
-	nullRight := o.lazyNullRight
+	// M0127-P4.2 (07 §3): the null padding an unmatched PROBE row is emitted
+	// against is the BUILD side's, which is the right side only in the default
+	// orientation. Naming it after its role rather than its side is what lets
+	// RIGHT (build on the left, probe the preserved right) reuse the LEFT fill
+	// path unchanged.
+	nullBuild := o.lazyNullRight
+	if o.hashBuildIsLeft() {
+		nullBuild = o.lazyNullLeft
+	}
 	o.ensureLazyVirtual()
+	// M0127-P2.2: same lazy guard the build loops use — a probe-only unit
+	// test reaches nextLazy without ever running Open's key resolution.
+	o.ensureExecKeys()
 	// Cancellation: cheap ctx check per Next() call so a long
 	// probe-only join responds promptly to CancelRequest.
 	// (M0058-0005.)
@@ -1186,8 +1331,15 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if err != nil {
 				return nil, err
 			}
-			o.lazyOuterOnlySlot.row = slotRow(probeSlot)
-			return o.lazyOuterOnlySlot, nil
+			// M0127-P1.1: same chained seam as the main loop — this
+			// branch emits the probe row untouched, which is exactly
+			// what outerOnlyEmit composes.
+			chained, err := o.bindProbe(probeSlot)
+			if err != nil {
+				return nil, err
+			}
+			o.lazyProbeSrc = nil
+			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
 	}
 	for {
@@ -1203,7 +1355,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			m := o.lazyMatches[mi]
 			o.lazyMatchIdx++
 			o.lazyBuildSlot.row = m
-			o.lazyProbeSlot.row = o.lazyRow
+			// M0127-P1.1: the probe source stays bound from bindProbe
+			// for the whole drain of this probe row — no per-match
+			// re-binding, and no flattened Row to re-bind from.
 			ok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
 			if err != nil {
 				return nil, err
@@ -1212,6 +1366,13 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				continue
 			}
 			o.lazyProbeMatched = true
+			// M0127-P4.2 (07 §3): PG's HeapTupleHeaderSetMatch — the build
+			// tuple is marked here, AFTER the residual predicate, because a
+			// hash-key hit that the residual rejects is not a match and must
+			// not suppress the row from the RIGHT/FULL sweep.
+			if mi < len(o.lazyMatchedCur) {
+				o.lazyMatchedCur[mi] = true
+			}
 			// M0118-0009 (eval-plan-qual): stamp the matched build row's heap
 			// ctid onto the emitted slot so a downstream LockRows can recover
 			// the TID of a locked relation on the build side (whose scan was
@@ -1236,43 +1397,120 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// predicate-level one, so without this check the outer row
 			// is silently dropped instead of null-padded.
 			o.lazyActive = false
-			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft && !o.lazyProbeMatched {
-				o.lazyProbeSlot.row = o.lazyRow
-				o.lazyBuildSlot.row = nullRight
-				o.lazyRow = nil
+			if o.fillProbeSide() && !o.lazyProbeMatched {
+				// The probe source is still bound to this row; only
+				// the build side changes to the NULL padding.
+				o.lazyBuildSlot.row = nullBuild
+				o.lazyProbeSrc = nil
 				return o.lazyVirtualOut, nil
 			}
 		}
-		// Pull next probe row.
-		probeSlot, err := o.lazyProbe.Next()
+		// Pull next probe row. M0127-P4.2: once the probe has reported EOF the
+		// sweep returns one row per Next() call, and each of those calls
+		// re-enters here — the latch is what keeps it from pulling an
+		// exhausted operator again (an Operator's post-EOF behaviour is not
+		// part of its contract).
+		var probeSlot TupleSlot
+		var err error
+		if o.probeEOF {
+			err = EOF
+		} else {
+			probeSlot, err = o.lazyProbe.Next()
+		}
 		if err == EOF {
+			o.probeEOF = true
+			// M0127-P4.2 (07 §3): PG's HJ_FILL_INNER_TUPLES. This batch's
+			// build side is still resident, so sweep its unmatched rows
+			// BEFORE the next batch overwrites the table (06 §2.5).
+			if o.fillBuildSide() {
+				if s := o.fillSweepNext(); s != nil {
+					return s, nil
+				}
+			}
+			// M0127-P3.2 (06 §2.3): PG's HJ_NEED_NEW_BATCH. The probe stream
+			// ending means this batch is done, not that the join is — load
+			// the next batch's build side and replay its saved probe rows.
+			if o.batches != nil {
+				more, berr := o.batches.nextBatch(o)
+				if berr != nil {
+					return nil, berr
+				}
+				if more {
+					o.probeEOF = false
+					o.fillSweepReset()
+					continue
+				}
+				// Release the files as soon as the last batch drains, but
+				// keep the state itself: Close() is what retires it, and the
+				// counters are what EXPLAIN reads (P3.5).
+				o.batches.close()
+			}
+			// The NULL-keyed build rows belong to no batch, so they are swept
+			// exactly once, after the last one.
+			if o.fillBuildSide() {
+				if s := o.fillNullKeyNext(); s != nil {
+					return s, nil
+				}
+			}
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
 		}
-		r := slotRow(probeSlot)
-		o.lazyRow = r
+		// A replayed outer row re-checks its batch (PG rule 3,
+		// nodeHashjoin.c:1172-1202): a doubling since it was saved may have
+		// pushed it past the current batch. The stored hash settles it
+		// without evaluating a key expression.
+		if bs := o.batches; bs != nil && bs.replaying {
+			routed, rerr := bs.routeProbeRow(bs.replayHash, slotRow(probeSlot))
+			if rerr != nil {
+				return nil, rerr
+			}
+			if routed {
+				continue
+			}
+		}
+		// M0127-P1.1 (05 §2, stage E1): bind the child's slot as the
+		// probe source instead of flattening it with slotRow.
+		chained, err := o.bindProbe(probeSlot)
+		if err != nil {
+			return nil, err
+		}
 		// M0126-0003 0b: evaluate the probe key against a
 		// VirtualSlot over {probeSlot, nullOtherSide} instead
-		// of copying into lazyKeyRow.
+		// of copying into a merged key Row.
 		//
 		// realWidth must match the probe side's width:
 		//   BuildLeft=true  → probe is right side → realWidth=lazyRW
 		//   BuildLeft=false → probe is left side  → realWidth=lazyLW
 		var keySlot *VirtualSlot
-		var probeKeyExpr planner.Expr
 		if o.plan.BuildLeft {
-			keySlot = mergedKeySlot(probeSlot, o.lazyRW, o.lazyLW, false)
-			probeKeyExpr = o.plan.RightKey
+			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyRW, o.lazyLW, false)
 		} else {
-			keySlot = mergedKeySlot(probeSlot, o.lazyLW, o.lazyRW, true)
-			probeKeyExpr = o.plan.LeftKey
+			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyLW, o.lazyRW, true)
 		}
+		probeKeyExpr := o.probeKeyExprs[0]
 		var key string // used only by the string path + the CTID lookup
 		var ok bool
 		var matches []Row
-		if o.lazyHashIsInt {
+		// M0127-P4.2: the int lane never materialises `key`, so the matched
+		// bitmap needs the int64 it looked up under.
+		var matchIntKey int64
+		var haveIntKey bool
+		if o.multiKey() {
+			// M0127-P2.2 (05 §5, stage E4): every equi-pair is in the key, so
+			// a column the qual placement pinned to a constant no longer
+			// collapses the bucket space — and the conjuncts folded into the
+			// key are gone from execResidual, which is what makes the
+			// all-equijoin join do zero interpreted work per match.
+			// M0127-P4.2: a fill-build join needs the key materialised for
+			// the same reason FOR UPDATE does — its parallel map is keyed
+			// alongside lazyHash.
+			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.fillBuildSide())
+			if err != nil {
+				return nil, err
+			}
+		} else if o.lazyHashIsInt {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
@@ -1282,8 +1520,23 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			}
 			ok = kok
 			if kok {
+				// M0127-P3.2: route before looking up. A probe row belonging
+				// to a later batch can never match the resident one (equal
+				// keys hash equal, so they batch together), and the lookup
+				// would be a wasted map probe on the majority of rows while
+				// batch 0 is being probed.
+				if bs := o.batches; bs != nil && bs.nbatch > 1 {
+					routed, rerr := bs.routeProbeRow(joinBatchHash(kd), slotRow(probeSlot))
+					if rerr != nil {
+						return nil, rerr
+					}
+					if routed {
+						continue
+					}
+				}
 				if ik, iok := datumToInt64Key(kd); iok {
 					matches = o.lazyIntHash[ik]
+					matchIntKey, haveIntKey = ik, true
 				}
 			}
 		} else {
@@ -1293,6 +1546,17 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			key, ok, err = o.evalHashKeySlot(probeKeyExpr, keySlot)
 			if err != nil {
 				return nil, err
+			}
+			// M0127-P3.2: `key` IS the canonical form joinBatchHash hashes,
+			// so the string lane routes without re-deriving anything.
+			if bs := o.batches; ok && bs != nil && bs.nbatch > 1 {
+				routed, rerr := bs.routeProbeRow(hashKeyString(key), slotRow(probeSlot))
+				if rerr != nil {
+					return nil, rerr
+				}
+				if routed {
+					continue
+				}
 			}
 			matches = o.lazyHash[key]
 		}
@@ -1334,7 +1598,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
-				o.lazyProbeSlot.row = r
+				// Probe source already bound by bindProbe.
 				for _, m := range matches {
 					o.lazyBuildSlot.row = m
 					pok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
@@ -1351,32 +1615,39 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				if !anyMatch {
 					continue
 				}
-				o.lazyRow = nil
-				o.lazyOuterOnlySlot.row = r
-				return o.lazyOuterOnlySlot, nil
+				o.lazyProbeSrc = nil
+				return o.outerOnlyEmit(probeSlot, chained), nil
 			}
 			// Anti: keep iff no match passed the predicate.
 			if anyMatch {
 				continue
 			}
-			o.lazyRow = nil
-			o.lazyOuterOnlySlot.row = r
-			return o.lazyOuterOnlySlot, nil
+			o.lazyProbeSrc = nil
+			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
 		if len(matches) == 0 {
-			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
-				// LEFT JOIN: preserve unmatched left rows. Bind
-				// build slot to nullRight padding; virtualOut
-				// already composes [probe, build] for !BuildLeft.
-				o.lazyRow = nil
-				o.lazyProbeSlot.row = r
-				o.lazyBuildSlot.row = nullRight
+			if o.fillProbeSide() {
+				// The preserved side is the PROBE side: emit the row with
+				// the build side null-padded. The probe source is already
+				// bound; virtualOut composes the two in plan order.
+				o.lazyProbeSrc = nil
+				o.lazyBuildSlot.row = nullBuild
 				return o.lazyVirtualOut, nil
 			}
-			// No matches, not LEFT — skip this probe row.
+			// No matches and nothing to preserve — skip this probe row.
 			continue
 		}
 		o.lazyMatches = matches
+		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
+		// successful match is one indexed store. A join that fills neither
+		// build side keeps lazyMatchedCur nil and pays nothing.
+		if o.fillBuildSide() {
+			if haveIntKey {
+				o.lazyMatchedCur = o.matchedIntBucket(matchIntKey, len(matches))
+			} else {
+				o.lazyMatchedCur = o.matchedStrBucket(key, len(matches))
+			}
+		}
 		if o.preserveBuildSide {
 			o.lazyMatchCTIDs = o.lazyHashCTID[key]
 		}
@@ -1388,18 +1659,26 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 }
 
 func (o *joinOp) Close() error {
-	o.rows = nil
-	o.leftCTIDs = nil
-	o.rowSourceLeft = nil
+	o.releaseBatches()
+	o.closeMergeStream()
+	o.closeNLStream()
+	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
 	o.lazyProbe = nil
-	o.lazyRow = nil
+	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
 	o.lazyMatchIdx = 0
 	o.lazyActive = false
+	// M0127-P4.2: the fill state is per-run, exactly like the hash table.
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
+	o.fillNullBuild = nil
+	o.fillNullIdx = 0
+	o.probeEOF = false
+	o.fillSweepReset()
 	o.ctx = nil
-	o.idx = 0
 	errL := o.left.Close()
 	errR := o.right.Close()
 	if errL != nil {
@@ -3565,9 +3844,22 @@ func datumKey(d Datum) string {
 // to the same canonical form. v0 never produces negative scales,
 // but the helper is kept robust.
 func canonicalNumericKey(mantissa int64, scale int) string {
+	var buf [32]byte
+	return string(appendCanonicalNumericKey(buf[:0], mantissa, scale))
+}
+
+// appendCanonicalNumericKey is canonicalNumericKey's allocation-free half.
+//
+// M0127-P3.2 split it out so the batch hash can hash the canonical key BYTES
+// of an int64 key without materialising the string (join_batch.go,
+// joinBatchHash). The split is what keeps the two consistent: routing a row to
+// a batch by one canonical form while filing it in the map under another would
+// send equal keys to different batches, which is a silently-lost match — and
+// the string map is reachable from the int lane at any time via demoteIntHash.
+func appendCanonicalNumericKey(b []byte, mantissa int64, scale int) []byte {
 	// Special case: 0 at any scale collapses to a single value.
 	if mantissa == 0 {
-		return "m:0:0"
+		return append(b, 'm', ':', '0', ':', '0')
 	}
 	for scale > 0 && mantissa%10 == 0 {
 		mantissa /= 10
@@ -3575,12 +3867,11 @@ func canonicalNumericKey(mantissa int64, scale int) string {
 	}
 	// Use strconv.AppendInt instead of fmt.Sprintf to avoid format-string
 	// parsing overhead on the string-key hot path.
-	var buf [32]byte
-	b := append(buf[:0], 'm', ':')
+	b = append(b, 'm', ':')
 	b = strconv.AppendInt(b, mantissa, 10)
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(scale), 10)
-	return string(b)
+	return b
 }
 
 // canonicalBigNumericKey is canonicalNumericKey's big.Int lane. It

@@ -230,6 +230,64 @@ but non-fatal, so the gate is a *correctness* gate and perf is tracked, not
 enforced. Run it after any planner/executor change, alongside (not instead of)
 `scripts/tpch-spotcheck.sh`.
 
+## Status-delta channel (named victims, non-blocking)
+
+```bash
+scripts/tpcds-sf05-regression.sh delta            # last two reports, runs nothing
+scripts/tpcds-sf05-regression.sh delta OLD NEW    # any two archived reports
+SF05_NO_DELTA=1 scripts/…-regression.sh sweep     # skip the tail stage
+```
+
+The SUMMARY line is a set of **counts**, and `TIMEOUT=1` is invariant to *which*
+query timed out. On 2026-08-04/05 one commit traded Q72's timeout for Q47's
+(31 s → 523 s) and the summary stayed byte-identical for four sweeps; it took a
+bisect against a copy of the cluster to find. So every sweep also diffs its
+per-query status/runtime vector against the previous **full** report (subset
+probes are skipped as baselines) and prints what moved, by name:
+
+```
+TIMEOUT    +Q47  -Q72
+SLOWER     Q57 15s->81s (5.4x)
+=== STATUS-DELTA: compared=99 verdict-changes=yes runtime-moves=20 (>=2.0x, floor 5s, TIMEOUT readings excluded) ===
+```
+
+The input is the report itself, so **every archived report is a valid baseline**
+— `delta` answers "what actually moved between those two sweeps?" for runs that
+predate the channel. A runtime move needs ≥2× *and* ≥5 s on the larger side
+(reports carry integer seconds, so 1 s → 3 s is noise); TIMEOUT readings are the
+cap rather than a runtime and are excluded from that arm, since the verdict arm
+already names them. Non-blocking, exactly like the plan channel below.
+
+## Plan-shape channel (second column, non-blocking)
+
+```bash
+scripts/tpcds-sf05-regression.sh plans        # capture + diff on its own, ~14 s
+SF05_NO_PLANS=1 scripts/…-regression.sh sweep # skip the tail stage
+```
+
+Every sweep now ends with one `EXPLAIN`-only pass over all 99 queries on a
+freshly started server, written to `tpcds-results-sf05/plans-<timestamp>.txt`
+(same timestamp as its `sweep-` report), plus a per-query diff against the
+previous capture appended to the report:
+
+```
+=== PLAN-SHAPE: queries=99 same=95 changed=4 added=0 removed=0 ===
+changed (4): Q13 Q41 Q48 Q85
+```
+
+Why it exists: on 2026-08-05 one commit re-ordered **74 of 99** TPC-DS plans
+while the gate reported a verdict identical to the previous baseline line for
+line. Row counts and checksums are still the *only* thing that can fail the gate
+— a plan that moves is information about a planner change, not an error, and the
+channel is engineered so a failure inside it cannot change the exit status.
+
+Nothing is executed (`EXPLAIN` without `ANALYZE`, every statement prefixed, so
+Q14/23/24/39's second statement never runs), which is what makes the file
+byte-stable; the measured noise floor is zero. The capture is always the full
+corpus even under `QUERIES=`, so any two captures are comparable. Diff two by
+hand — including the committed baselines under `analysis/leftdeep-joins/` — with
+`scripts/tpcds-plan-diff.py OLD NEW [--verbose]`.
+
 ## Oracle file format
 
 `tpcds-results-sf05/oracle.txt`, one line per query: `q|status|rows|secs`
@@ -285,3 +343,8 @@ same plan line carries the planner's *estimated* `rows=` first.
 | `TIMEOUT_SEC` | `300` | per-query timeout for the goopg sweep |
 | `RESTART_AFTER_TIMEOUT` | `1` | bounce goopg after each goopg TIMEOUT |
 | `FORCE` | unset | run even while the SF=1 sweep harness is active |
+| `SF05_NO_PLANS` | unset | skip the plan-shape channel appended to a sweep |
+| `SF05_NO_DELTA` | unset | skip the status-delta channel appended to a sweep |
+| `SF05_SWEEP_BASELINE` | newest non-probe `sweep-*.txt` | report to diff the status/runtime vector against; `none` skips it |
+| `PLAN_TIMEOUT` | `180` | per-query timeout for the EXPLAIN-only plan capture |
+| `SF05_PLANS_BASELINE` | newest `plans-*.txt` | capture to diff against; `none` skips the diff |

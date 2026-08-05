@@ -505,6 +505,21 @@ func smallestUnused(rowCounts []int64, used []bool) int {
 // count that's connected by an equality edge to any relation in
 // the already-joined set. ok=false when no such relation exists —
 // the caller falls back to the smallest unused relation.
+//
+// Ties break on the lowest relation index, matching smallestUnused and
+// orderByConnectivity. That last comparison is what makes this pass
+// DETERMINISTIC, and it is load-bearing rather than cosmetic:
+// `edges[j]` is a map, so `range` visits candidates in a different
+// order on every call, and a tie-break of only `rowCounts[k] <
+// rowCounts[best]` therefore kept whichever tied candidate the map
+// happened to yield first. A query that scans one table twice makes
+// the tie unavoidable — the two aliases are the same relation, so
+// their statistics are identical by construction — and TPC-DS Q85
+// (`customer_demographics cd1, cd2`) swapped the two aliases between
+// server starts of the same binary. Upstream's planner is stable given
+// identical inputs, so the flip was both a PG divergence and an
+// instrument hazard for every EXPLAIN-based A/B in this repo
+// (M0125-0047; joinorder_determinism_test.go).
 func pickNextByEdge(joined []int, used []bool, edges []map[int]struct{}, rowCounts []int64) (int, bool) {
 	best := -1
 	for _, j := range joined {
@@ -512,7 +527,8 @@ func pickNextByEdge(joined []int, used []bool, edges []map[int]struct{}, rowCoun
 			if used[k] {
 				continue
 			}
-			if best == -1 || rowCounts[k] < rowCounts[best] {
+			if best == -1 || rowCounts[k] < rowCounts[best] ||
+				(rowCounts[k] == rowCounts[best] && k < best) {
 				best = k
 			}
 		}

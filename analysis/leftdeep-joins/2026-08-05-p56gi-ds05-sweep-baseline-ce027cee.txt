@@ -1,0 +1,111 @@
+# TPC-DS SF0.5 goopg sweep — 2026-08-05T01:23:17+09:00
+# goopg: ce027cee planner(cost): M0127-P5.6-f — two clauses priced as one, and the composite key that stops the fix from overshooting
+# engine-id: 3d8c5d71f532a77288cbcefeaacb4ddc5aeca456 242aeac35990a4250be9be8db999edfc596d07b4  diff=783e8a32deff
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=383cae1b17ca2452 on-disk=383cae1b17ca2452 (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=unset(2) GOOPG_COST_DRIVEN_JOINORDER=unset(off) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on)
+Q1   PASS        1s      100 rows  ck=n/a
+Q2   PASS       15s     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        1s       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   PASS       16s      100 rows  ck=n/a
+Q6   PASS        3s       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       12s      100 rows  ck=n/a
+Q8   PASS        8s        0 rows  ck=1f18d650d205d71d
+Q9   PASS       67s        1 rows  ck=63ffce9ca5245d88
+Q10  PASS       15s        0 rows  ck=1f18d650d205d71d
+Q11  PASS       15s        8 rows  ck=3567170dea89bdc1
+Q12  PASS        2s      100 rows  ck=n/a
+Q13  PASS       20s        1 rows  ck=ce8ba876bbc6d2e9
+Q14  PASS      156s      200 rows  ck=n/a
+Q15  PASS        2s      100 rows  ck=n/a
+Q16  PASS        8s        1 rows  ck=40dbec0df91d2438
+Q17  PASS       12s        0 rows  ck=1f18d650d205d71d
+Q18  PASS       66s      100 rows  ck=n/a
+Q19  PASS        7s      100 rows  ck=n/a
+Q20  PASS        4s      100 rows  ck=n/a
+Q21  PASS        2s      100 rows  ck=n/a
+Q22  PASS       18s      100 rows  ck=n/a
+Q23  PASS       78s        1 rows  ck=00f53003bda23764
+Q24  PASS       18s        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS       12s        0 rows  ck=1f18d650d205d71d
+Q26  PASS        6s      100 rows  ck=n/a
+Q27  PASS       29s      100 rows  ck=n/a
+Q28  PASS       42s        1 rows  ck=3fbe61472403ae2f
+Q29  PASS       11s        0 rows  ck=1f18d650d205d71d
+Q30  PASS        1s       31 rows  ck=f47a48499fd7e070
+Q31  PASS       14s       19 rows  ck=2a74acfb556c21a7
+Q32  PASS        1s        1 rows  ck=a55f36d3bf196bce
+Q33  PASS       13s      100 rows  ck=n/a
+Q34  PASS        7s      187 rows  ck=c83808417d7a81d8
+Q35  PASS       19s      100 rows  ck=n/a
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS        7s        0 rows  ck=1f18d650d205d71d
+Q38  PASS       18s        1 rows  ck=6f66a76c23e12a63
+Q39  PASS       21s       77 rows  ck=4db806a9a11fddfd
+Q40  PASS       18s      100 rows  ck=n/a
+Q41  PASS        8s        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        1s       10 rows  ck=5004612d9b837c34
+Q43  PASS        1s        6 rows  ck=b70a4026e9b9bb04
+Q44  PASS       27s       10 rows  ck=d76f8301addaff98
+Q45  PASS        1s        7 rows  ck=e09cf591997524ad
+Q46  PASS        8s      100 rows  ck=n/a
+Q47  TIMEOUT   333s (oracle 100 rows)
+      (restarting goopg to drop accumulated heap)
+Q48  PASS       22s        1 rows  ck=9a9ece15cb525a79
+Q49  PASS       22s       25 rows  ck=ccb0983b810cf1d0
+Q50  PASS       12s        6 rows  ck=3928ecee672e3992
+Q51  PASS       12s      100 rows  ck=n/a
+Q52  PASS        2s      100 rows  ck=n/a
+Q53  PASS        7s      100 rows  ck=n/a
+Q54  PASS      102s        0 rows  ck=1f18d650d205d71d
+Q55  PASS        1s       73 rows  ck=46d35b957845db41
+Q56  PASS       18s      100 rows  ck=n/a
+Q57  PASS       86s      100 rows  ck=n/a
+Q58  PASS       18s        0 rows  ck=1f18d650d205d71d
+Q59  PASS       16s      100 rows  ck=n/a
+Q60  PASS       17s      100 rows  ck=n/a
+Q61  PASS       13s        1 rows  ck=4766027020fae308
+Q62  PASS        4s      100 rows  ck=n/a
+Q63  PASS        6s      100 rows  ck=n/a
+Q64  PASS       33s        2 rows  ck=31f0342ff9d55c4a
+Q65  PASS       18s      100 rows  ck=n/a
+Q66  PASS        7s        5 rows  ck=f6613897dd73709a
+Q67  PASS       79s      100 rows  ck=n/a
+Q68  PASS        7s      100 rows  ck=n/a
+Q69  PASS       20s      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       14s      580 rows  ck=521a7af7606d10c1
+Q72  PASS      174s      100 rows  ck=n/a
+Q73  PASS        6s        1 rows  ck=ec4c67dea8017171
+Q74  PASS       15s        7 rows  ck=2ffc13c77bf53028
+Q75  PASS       18s      100 rows  ck=n/a
+Q76  PASS       17s      100 rows  ck=n/a
+Q77  PASS       16s       44 rows  ck=2afe8ddcd18fad9c
+Q78  PASS       29s       45 rows  ck=8f67acff3895183f
+Q79  PASS        7s      100 rows  ck=n/a
+Q80  PASS       42s      100 rows  ck=n/a
+Q81  PASS        0s      100 rows  ck=n/a
+Q82  PASS       13s        0 rows  ck=1f18d650d205d71d
+Q83  PASS        3s        3 rows  ck=9504298446f22ddc
+Q84  PASS        3s        6 rows  ck=073898a18264bd8e
+Q85  PASS        3s        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       14s        1 rows  ck=b363a9287bdd0920
+Q88  PASS       59s        1 rows  ck=272de7cd629d9033
+Q89  PASS        7s      100 rows  ck=n/a
+Q90  PASS        4s        1 rows  ck=66ceccaa8ce9d2cf
+Q91  PASS        3s        1 rows  ck=88b9d5fffed589f8
+Q92  PASS        0s        1 rows  ck=26c02866b1827f1b
+Q93  PASS        6s        0 rows  ck=1f18d650d205d71d
+Q94  PASS        4s        1 rows  ck=04afc1b69831a5ea
+Q95  PASS        9s        1 rows  ck=e498634c02595c29
+Q96  PASS        1s        1 rows  ck=5923f3c62773e705
+Q97  PASS       12s        1 rows  ck=65725195ebe13a3b
+Q98  PASS        6s     2128 rows  ck=be1b9a6d08cb1a3d
+Q99  PASS       10s       90 rows  ck=b10fd5001836fcfb
+
+=== SUMMARY: PASS=94 (57 ck-verified, 37 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

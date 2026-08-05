@@ -139,6 +139,32 @@ descend:
 	// outer layout. On stats-less servers tryBushyDP is a no-op and
 	// pushdown never reorders, so this is the common fast path.
 	newSchema := newTarget.Output()
+
+	// M0127-P5.5-f-ii-b: the PG-shaped search's boundary, consumed.
+	//
+	// 03 §10 says this re-resolution "survives and consumes the boundary
+	// map". When the spliced subtree came out of the PG-shaped search,
+	// consuming that map means doing NOTHING — the boundary republishes
+	// the root in pre-search binding order (P5.5-f-i), so the map is the
+	// identity and every rebind below would be a no-op at best.
+	//
+	// Skipping it is not the interesting part; PROVING the skip is. The
+	// identity is asserted from the schemas rather than inferred from
+	// `layoutPosMap` returning nil, because nil is also how that helper
+	// says "widths differ, refuse to remap" — see
+	// assertSpineConsumesIdentityBoundaryMap. The tripwire then runs over
+	// the whole enclosing tree, which is the reference-side half of the
+	// same claim (03 §10's build-mode assertion, widened from the boundary
+	// node in P5.5-f-i to the tree it guards).
+	//
+	// Inert today: `GOOPG_PGSHAPED_DP` is OFF, nothing calls the search
+	// from tryBushyDP, so splicedSearchedRoot never finds a tagged root.
+	if splicedSearchedRoot(newTarget) != nil {
+		assertSpineConsumesIdentityBoundaryMap(oldSchema, newSchema)
+		assertEnclosingTreeColumnRefs("pinned-spine enclosing tree", newRoot)
+		return newRoot
+	}
+
 	pm := layoutPosMap(oldSchema, newSchema)
 	if pm == nil {
 		return newRoot

@@ -150,13 +150,61 @@ func prebuildSharedHashJoins(ctx *Context, plan planner.Node, buildChild func() 
 	out := make(map[*planner.Join]*sharedHashBuild, len(joins))
 	for _, j := range joins {
 		j.ctx = ctx
+		// M0127-P3.4: decline the SHARE, not the SPILL.
+		//
+		// A spilling build cannot be published: captureSharedBuild freezes the
+		// in-memory table alone, while the batch files and the per-batch probe
+		// replay live on THIS operator, which no worker ever runs — a worker
+		// handed that table would probe batch 0 and silently return the rows
+		// of one partition. P3.2 avoided the problem by forcing `noBatch`,
+		// which made the shared build the one hash build in the executor with
+		// no work_mem bound at all. The honest form is the opposite: keep the
+		// bound, give up the sharing, and let each worker build privately (and
+		// batch privately) — 06 §6, which defers real parallel hash outright.
+		//
+		// The check runs twice on purpose. Before the build, the ESTIMATE is
+		// consulted so the common case costs no wasted pass; after it, the
+		// MEASUREMENT is, because goopg's estimates are absent often enough
+		// that growth-on-overrun is the only bound worth relying on.
+		if sharedBuildWouldSpill(ctx, j) {
+			continue
+		}
 		probeIsLeft, err := j.buildLazyHashTable(ctx)
 		if err != nil {
 			return nil, err
 		}
+		if j.batches != nil && j.batches.nbatch > 1 {
+			// The estimate said it fit and it did not. Throw the leader's
+			// build away — files included — rather than publish a partition.
+			j.releaseBatches()
+			j.lazyHash, j.lazyIntHash, j.lazyHashCTID = nil, nil, nil
+			continue
+		}
 		out[j.plan] = j.captureSharedBuild(probeIsLeft)
 	}
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
+}
+
+// sharedBuildWouldSpill asks the shared geometry — the same one presizeLazyHash
+// and the batch state use — whether this build is projected to need more than
+// one batch.
+//
+// It answers false for a join that cannot batch anyway (a composite key, the
+// FOR-UPDATE ctid build): declining to share such a build would not bound
+// anything, it would just replace one unbounded build with one per worker.
+func sharedBuildWouldSpill(ctx *Context, j *joinOp) bool {
+	j.initExecKeys()
+	if !j.joinBatchEligible() {
+		return false
+	}
+	buildNode, buildWidth := j.plan.Right, len(j.right.Schema())
+	if !probeSideIsLeft(j.plan) {
+		buildNode, buildWidth = j.plan.Left, len(j.left.Schema())
+	}
+	return j.buildGeometry(ctx, buildNode, buildWidth).NBatch > 1
 }
 
 // collectShareableJoins finds the hash joins in a tree whose build side can be

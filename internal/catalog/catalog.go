@@ -1663,9 +1663,54 @@ type ColumnStats struct {
 	// works on a freshly started server, where TableStats.RowCount is still
 	// zero because it is never restored (ledger row pq-P6).
 	//
-	// NDistinct above remains the absolute SAMPLE count every existing
-	// consumer already reads; this field is additive and does not change it.
+	// Since M0127-P5.6-e-iii the two fields are two renderings of ONE
+	// estimate: ANALYZE computes the Haas-Stokes table-wide distinct count
+	// (executor.ndistinctEstimate, upstream compute_scalar_stats) and stores
+	// it absolutely in NDistinct and as NDistinct/RowCount here. Before that
+	// NDistinct held the raw SAMPLE count and this field the raw sample
+	// ratio, so the two disagreed by the sampling factor — a 1.5 M-row unique
+	// key read as NDistinct=30,000 with NDistinctFrac=1.0.
 	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
+}
+
+// StaDistinct returns these statistics in PostgreSQL's SIGNED `stadistinct`
+// convention (pg_statistic.stadistinct, read by `get_variable_numdistinct`,
+// selfuncs.c): POSITIVE is an absolute distinct-value count, NEGATIVE is a
+// fraction of the relation's row count, and zero means "unknown".
+//
+// goopg splits what upstream packs into one signed float across two fields —
+// `NDistinct` (the absolute sample count) and `NDistinctFrac` (the scale-free
+// fraction) — so every consumer that has to speak PG's convention needs the
+// same two-line reduction. It had been open-coded three times (the
+// pg_statistic heap row, the pg_stats view, and now the join-selectivity
+// estimator), which is the sibling-path shape that goes silently wrong the
+// first time one copy learns something the others don't: an estimator reading
+// `NDistinct` first and a catalog row writing `-NDistinctFrac` first would
+// report one number to the user and plan on another.
+//
+// Which form wins is upstream's rule, not a goopg preference (analyze.c:2650-
+// 2658): "if we estimated the number of distinct values at more than 10% of
+// the total row count then assume stadistinct should scale with the row count
+// rather than be a fixed value". NDistinctFrac IS that ratio, so the 10% test
+// is a comparison against 0.1 here. Below the threshold the absolute count is
+// the PG-faithful answer AND the more useful one — a boolean column has two
+// distinct values whatever the relation grows to.
+//
+// The fraction still wins when the absolute count is absent, which is how
+// statistics restored from a real PG heap arrive: initdb's pg_statistic reload
+// can recover a negative stadistinct only as a fraction, because converting it
+// to a count needs a row count the reload does not have (ledger row pq-P6).
+func (cs ColumnStats) StaDistinct() float64 {
+	switch {
+	case cs.NDistinctFrac > 0.1:
+		return -cs.NDistinctFrac
+	case cs.NDistinct > 0:
+		return float64(cs.NDistinct)
+	case cs.NDistinctFrac > 0:
+		return -cs.NDistinctFrac
+	default:
+		return 0
+	}
 }
 
 // MCVEntry is one entry in a per-column MCV list. Frequency is
@@ -5934,9 +5979,47 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	nullsNotDistinct bool,
 	tablespace uint32,
 ) {
+	c.RegisterIndexDuringRecoveryForDB(DefaultDBOid, schema, name, tableOID, cols, unique, method, primary, oid,
+		colDescending, colNullsFirst, hasPredicate, predicateString, includeColumns, colOpClasses, colCollations,
+		fillfactor, deduplicateItems, nullsNotDistinct, tablespace)
+}
+
+// RegisterIndexDuringRecoveryForDB is RegisterIndexDuringRecovery keyed to ONE
+// database's catalog namespace instead of the DefaultDBOid one.
+//
+// It exists because an index on a distinct-dbOid database has its owning table
+// registered in that database's namespace (loadUserTablesFromHeapForDB's
+// `nsDBOid`), so the DefaultDBOid-only `tableByOID` probe below could never
+// resolve it and the whole registration silently returned — the catalog half of
+// the durability gap M0127-P5.6-f-pre closes. Every namespace-keyed access in
+// the body (the owning-table probe, the duplicate check, and both index maps)
+// takes `dbOid`; passing DefaultDBOid reproduces the historical behaviour
+// exactly, which is what the wrapper above does.
+func (c *InMemory) RegisterIndexDuringRecoveryForDB(
+	dbOid uint32,
+	schema string,
+	name string,
+	tableOID uint32,
+	cols []string,
+	unique bool,
+	method string,
+	primary bool,
+	oid uint32,
+	colDescending []bool,
+	colNullsFirst []bool,
+	hasPredicate bool,
+	predicateString string,
+	includeColumns []string,
+	colOpClasses []string,
+	colCollations []string,
+	fillfactor int,
+	deduplicateItems *bool,
+	nullsNotDistinct bool,
+	tablespace uint32,
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
+	tbl, ok := c.tableByOID(tableOID, dbOid)
 	if !ok {
 		// Owning table not yet recovered — caller must run
 		// `loadUserTablesFromHeap` (or equivalent) before
@@ -5959,7 +6042,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	// follow-up). lookupIndexLocked already implements the same "" vs
 	// "public." collision fallback reads rely on, so reusing it here keeps
 	// recovery's notion of "same index" consistent with LookupIndex's.
-	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid); dup {
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, dbOid); dup {
 		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
@@ -5995,12 +6078,23 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		DeduplicateItems: deduplicateItems,
 		NullsNotDistinct: nullsNotDistinct,
 		Tablespace:       tablespace,
+		// The physical-file routing CreateIndex stamps on the live path
+		// (Index.DBOid, read by IndexRelFileNode). Recovery never set it, so a
+		// reloaded index on a distinct-dbOid database pointed
+		// IndexRelFileNode at the process-wide InMemory.dbOid — base/5 — where
+		// its btree file does not exist. The catalog row was therefore
+		// restored while the index silently stopped ENFORCING and stopped
+		// being scannable: a UNIQUE index that accepts duplicates after a
+		// restart is worse than one that vanished. Caught by
+		// TestDistinctDatabaseIndexSurvivesRestartInOwnNamespace's duplicate
+		// insert, which the metadata assertions alone all passed.
+		DBOid: dbOid,
 	}
-	c.ns(DefaultDBOid).indexes[k] = idx
-	if c.ns(DefaultDBOid).byTable[tbl.OID] == nil {
-		c.ns(DefaultDBOid).byTable[tbl.OID] = map[string]*Index{}
+	c.ns(dbOid).indexes[k] = idx
+	if c.ns(dbOid).byTable[tbl.OID] == nil {
+		c.ns(dbOid).byTable[tbl.OID] = map[string]*Index{}
 	}
-	c.ns(DefaultDBOid).byTable[tbl.OID][k] = idx
+	c.ns(dbOid).byTable[tbl.OID][k] = idx
 	c.advanceNextOIDLocked(oid)
 }
 

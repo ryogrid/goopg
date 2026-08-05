@@ -571,6 +571,8 @@ func (*FuncCall) exprNode()  {}
 
 // SeqScan — full heap scan of a single relation.
 type SeqScan struct {
+	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
+	searchedTree
 	pos    int
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
@@ -602,6 +604,27 @@ type SeqScan struct {
 	// `catalog.Table.SmallDimension`; see
 	// docs/design/0125-0043-smalldimension-name-tag-extinction.md.
 	SmallDim bool
+	// UniqueKeys is Table's uniqueness evidence: the column-name list of every
+	// UNIQUE index on the relation, stamped at plan-build time by
+	// `uniqueKeyColumnSets` (joinkeyproof.go).
+	//
+	// It exists for the same reason EstRelRows and SmallDim do, and the reason
+	// is sharper here. `estimateJoin` is the only place goopg can reproduce
+	// `get_foreign_key_join_selectivity` (costsize.c:5651) on the legacy
+	// planner, and it takes a bare `Node` — no catalog — because EXPLAIN in
+	// the executor calls it too. The index LIST is the one piece of the
+	// evidence that is not already reachable from the node: raw tuple counts
+	// come from `Table.Stats.RowCount` and declared FKs from
+	// `Table.ForeignKeys`, but a table's indexes live only in the catalog, and
+	// resolving them there per estimate call would additionally reintroduce
+	// the dbOid hazard (a bare `InMemory` answers for `DefaultDBOid` whatever
+	// database is active, so a uniqueness proof could fire off another
+	// database's index — cost-model/14 §2). Stamping through the planner's own
+	// `cat`, once, at the site that already stamps SmallDim, settles both.
+	//
+	// Same cached-plan exposure as EstRelRows: a plan carries the index set
+	// that was live when it was planned. M0127-P5.6-f.
+	UniqueKeys [][]string
 	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
 	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
 	// parent takes AccessShare on the parent relation too (PostgreSQL locks the
@@ -653,6 +676,8 @@ func (n *SeqScan) Output() Schema { return n.schema }
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
+	// searchedTree: see *SeqScan above (searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	Alias string // FROM-clause alias; empty when not specified. M0062-0002
@@ -679,6 +704,11 @@ type IndexScan struct {
 	// scan it replaces, so promoting a leaf to an index probe never changes
 	// the relation's small-dimension answer.
 	SmallDim bool
+	// UniqueKeys — see SeqScan's field of the same name (M0127-P5.6-f).
+	// Copied, like SmallDim, by every pass that substitutes an IndexScan for
+	// a SeqScan: the relation's uniqueness evidence is a property of the
+	// relation, not of how this plan chose to read it.
+	UniqueKeys [][]string
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -697,6 +727,8 @@ func (n *IndexScan) Output() Schema { return n.schema }
 // inner probe yields no rows, the operator emits `outer ++
 // nullRow(innerWidth)` to preserve outer rows.
 type NestedLoopIndexJoin struct {
+	// searchedTree: the parameterised arm of createNestLoopPlan (searchedtree.go).
+	searchedTree
 	pos       int
 	Type      JoinType
 	Outer     Node
@@ -818,12 +850,18 @@ const (
 // input (matches the executor's historical convention); the
 // planner sets BuildLeft=true when EstimateRows says the left
 // side is smaller — building on the smaller relation cuts both
-// memory and hash-table population time. BuildLeft is INNER-only
-// because LEFT JOIN's outer-row preservation depends on which
-// side drives the probe loop. Merge join sorts both sides on
-// their keys and merges the two ordered streams, preserving
-// RIGHT/FULL outer-row semantics.
+// memory and hash-table population time. Since M0127-P4.2 the
+// executor fills EITHER side (07 §3), so BuildLeft is no longer
+// INNER-only: RIGHT sets it deliberately (build the non-preserved
+// left, probe the preserved right), and an outer join's
+// preservation follows from Type plus BuildLeft rather than from
+// the build side alone. Semi/Anti remain build-right by contract.
+// Merge join sorts both sides on their keys and merges the two
+// ordered streams.
 type Join struct {
+	// searchedTree: the usual search root — every join arm but the
+	// parameterised nested loop emits one (searchedtree.go).
+	searchedTree
 	pos       int
 	Type      JoinType
 	Algo      JoinAlgo
@@ -832,6 +870,16 @@ type Join struct {
 	Predicate Expr
 	LeftKey   Expr // populated when Algo == JoinAlgoHash
 	RightKey  Expr
+	// HashKeys holds EVERY usable equi-pair of this join, not just the
+	// one (LeftKey, RightKey) the executor currently hashes on — PG's
+	// `hashclauses` / `mergeclauses` list. HashKeys[0] IS
+	// (LeftKey, RightKey), by pointer. Populated for JoinAlgoHash and
+	// JoinAlgoMerge by fillJoinHashKeys, a single late pass at the tail
+	// of Plan() (see join_hash_keys.go for why it is derived once at the
+	// end rather than maintained at the nine construction sites). Empty
+	// means "no list available" and every consumer must fall back to the
+	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
+	HashKeys  []JoinKeyPair
 	BuildLeft bool // hash join: build on left input instead of right
 	// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
 	// indices (relative to the merged schema) of the USING
@@ -1045,6 +1093,10 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// searchedTree: the scan arms' leaf rewrapper can restore the leaf's
+	// original *Filter around a rebuilt scan, so a one-relation search root
+	// can be a Filter (searchedtree.go).
+	searchedTree
 	pos       int
 	Child     Node
 	Predicate Expr
@@ -1056,6 +1108,27 @@ type Filter struct {
 	// (applyJoinTreePosMap, remapPosMapAfterRewrite), which
 	// assume cumulative coordinates.
 	LeafLocal bool
+	// PushedBelow lists the conjuncts of Predicate that a qual-placement
+	// pass DUPLICATED onto a descendant node — `pushInnerJoinInputQuals`
+	// and `pushResidualQualsIntoMHJTables` both copy a single-relation
+	// restriction down to the relation it references and deliberately
+	// leave `Predicate` untouched (their "property 2"), so the executor
+	// evaluates it twice and the ESTIMATOR charged it twice.
+	//
+	// Upstream has no such list because it has no such duplicate:
+	// `distribute_restrictinfo_to_rels` (initsplan.c) MOVES a
+	// single-relation clause into that baserel's `baserestrictinfo`, so
+	// `set_baserel_size_estimates` prices it once and the joinrel above
+	// never sees it again — which is the invariant
+	// `calc_joinrel_size_estimate`'s opening comment asserts ("we are not
+	// double-counting them because they were not considered in estimating
+	// the sizes of the component rels").
+	//
+	// goopg cannot move the clause — the copy left above the join is what
+	// keeps the join's own residual evaluation correct — so it records the
+	// duplication instead and `filterSelectivity` skips these conjuncts.
+	// M0127-P5.6-f-vi.
+	PushedBelow []Expr
 }
 
 func (n *Filter) Pos() int       { return n.pos }
@@ -1063,6 +1136,10 @@ func (n *Filter) Output() Schema { return n.Child.Output() }
 
 // Project — evaluates the target list against its child's rows.
 type Project struct {
+	// searchedTree: the boundary node P5.5-f-i emits is a *Project, and it is
+	// the node the legacy posmap family must most carefully not walk into
+	// (searchedtree.go).
+	searchedTree
 	pos     int
 	Child   Node
 	Targets []Expr
@@ -1147,6 +1224,8 @@ type SortKey struct {
 }
 
 type Sort struct {
+	// searchedTree: the PathSort arm's root (searchedtree.go).
+	searchedTree
 	pos   int
 	Child Node
 	Keys  []SortKey

@@ -1,0 +1,359 @@
+=== Q2
+Gather Merge  (cost=0.00..0.00 rows=1 width=0) (actual time=9171.432..9171.822 rows=455.00 loops=1)
+  Workers Planned: 2
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: supplier.s_acctbal DESC, nation.n_name, supplier.s_name, part.p_partkey
+    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Hash Cond: (part.p_partkey = ps_partkey)
+          Filter: (partsupp.ps_supplycost = min)
+          Buckets: 1024  Batches: 1  Memory Usage: 0kB
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=22 width=0)
+            Hash Cond: (nation.n_regionkey = region.r_regionkey)
+            Buckets: 1024  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=4443 width=0)
+              Hash Cond: (part.p_partkey = partsupp.ps_partkey)
+              Buckets: 131072 (originally 131072)  Batches: 2 (originally 1)  Memory Usage: 518145kB
+          ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0)
+                Filter: ((p_size = 15) AND (p_type LIKE '%BRASS'))
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=100000 width=0)
+                Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                Buckets: 1024  Batches: 1  Memory Usage: 8kB
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=800000 width=0)
+                  Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+                  Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+              ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+              ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+            ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+        ->  Seq Scan on public.region (stats)  (cost=0.00..0.00 rows=5 width=0)
+              Filter: (r_name = 'EUROPE')
+      ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=500 width=0)
+              Hash Cond: (nation.n_regionkey = region.r_regionkey)
+              Filter: (region.r_name = 'EUROPE')
+              Buckets: 1024  Batches: 1  Memory Usage: 1kB
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=100000 width=0)
+                Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                Buckets: 1024  Batches: 1  Memory Usage: 8kB
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=800000 width=0)
+                  Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+                  Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+              ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+              ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+            ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+          ->  Seq Scan on public.region (stats)  (cost=0.00..0.00 rows=5 width=0)
+                Filter: (r_name = 'EUROPE')
+Planning Time: 0.004 ms
+Execution Time: 9171.826 ms
+
+=== Q3
+Sort  (cost=0.00..0.00 rows=26228 width=0) (actual time=31310.873..31312.882 rows=11521.00 loops=1)
+  Sort Key: sum DESC, o_orderdate
+  ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=26228 width=0) (actual time=31286.307..31288.762 rows=11521.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=52457 width=0) (actual time=22277.622..31276.741 rows=30401.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=94423722 width=0)
+            Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+            Filter: (((customer.c_mktsegment = 'BUILDING') AND (orders.o_orderdate < '1995-03-15'::date)) AND (lineitem.l_shipdate > '1995-03-15'::date))
+            Buckets: 1048576  Batches: 8  Memory Usage: 332733kB
+        ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+              Filter: (l_shipdate > '1995-03-15'::date)
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=856611 width=0)
+              Hash Cond: (orders.o_custkey = customer.c_custkey)
+              Buckets: 32768  Batches: 1  Memory Usage: 0kB
+          ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+                Filter: (o_orderdate < '1995-03-15'::date)
+          ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+                Filter: (c_mktsegment = 'BUILDING')
+Planning Time: 0.005 ms
+Execution Time: 31312.889 ms
+
+=== Q5
+Sort  (cost=0.00..0.00 rows=1012096 width=0) (actual time=12825.234..12825.235 rows=5.00 loops=1)
+  Sort Key: sum DESC
+  ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1012096 width=0) (actual time=12825.220..12825.224 rows=5.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=2024192 width=0) (actual time=4385.587..12825.206 rows=178512.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2024192 width=0)
+            Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+            Buckets: 16384  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2024192 width=0)
+              Hash Cond: (nation.n_regionkey = region.r_regionkey)
+              Buckets: 1024  Batches: 1  Memory Usage: 0kB
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=404838407 width=0)
+                Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                Buckets: 524288  Batches: 8  Memory Usage: 37083kB
+            ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2004467 width=0)
+                  Hash Cond: (orders.o_custkey = customer.c_custkey)
+                  Buckets: 262144  Batches: 1  Memory Usage: 120452kB
+              ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+                    Filter: ((o_orderdate >= '1994-01-01'::date) AND (o_orderdate < ('1994-01-01'::date + '1 year'::interval)))
+              ->  Hash Join (INNER)  (cost=0.00..0.00 rows=150000 width=0)
+                    Hash Cond: (customer.c_nationkey = nation.n_nationkey)
+                    Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+                ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+          ->  Seq Scan on public.region (stats)  (cost=0.00..0.00 rows=5 width=0)
+                Filter: (r_name = 'ASIA')
+        ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+Planning Time: 0.004 ms
+Execution Time: 12825.239 ms
+
+=== Q7
+Sort  (cost=0.00..0.00 rows=472500 width=0) (actual time=61280.502..61280.503 rows=4.00 loops=1)
+  Sort Key: supp_nation, cust_nation, l_year
+  ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=472500 width=0) (actual time=61280.496..61280.498 rows=4.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=945000 width=0) (actual time=49071.291..61280.487 rows=5869.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=945000 width=0)
+            Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+            Buckets: 524288 (originally 524288)  Batches: 8 (originally 1)  Memory Usage: 499714kB
+        ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=945000 width=0)
+              Hash Cond: (customer.c_custkey = orders.o_custkey)
+              Buckets: 1024  Batches: 1  Memory Usage: 0kB
+          ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=126 width=0)
+                Hash Cond: (n2.n_nationkey = customer.c_nationkey)
+                Buckets: 1024  Batches: 1  Memory Usage: 8kB
+            ->  Seq Scan on public.nation n2 (stats)  (cost=0.00..0.00 rows=25 width=0)
+            ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+          ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=334287 width=0)
+              Hash Cond: (supplier.s_nationkey = n1.n_nationkey)
+              Buckets: 1024  Batches: 1  Memory Usage: 8kB
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2674297 width=0)
+                Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+                Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+            ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+                  Filter: ((l_shipdate >= '1995-01-01'::date) AND (l_shipdate <= '1996-12-31'::date))
+            ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+          ->  Seq Scan on public.nation n1 (stats)  (cost=0.00..0.00 rows=25 width=0)
+Planning Time: 0.004 ms
+Execution Time: 61280.507 ms
+
+=== Q8
+Sort  (cost=0.00..0.00 rows=666 width=0) (actual time=82513.095..82513.120 rows=2.00 loops=1)
+  Sort Key: o_year
+  ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=666 width=0) (actual time=82513.067..82513.068 rows=2.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=1332 width=0) (actual time=76128.047..82513.061 rows=2555.00 loops=1)
+          Workers Planned: 2
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1332 width=0)
+            Hash Cond: (n1.n_regionkey = region.r_regionkey)
+            Buckets: 1024  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=266477 width=0)
+              Hash Cond: (part.p_partkey = lineitem.l_partkey)
+              Buckets: 262144  Batches: 32  Memory Usage: 158326kB
+          ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0)
+                Filter: (p_type = 'ECONOMY ANODIZED STEEL')
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=5997241 width=0)
+                Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                Buckets: 524288  Batches: 8  Memory Usage: 74340kB
+            ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=5997241 width=0)
+                  Hash Cond: (n2.n_nationkey = supplier.s_nationkey)
+                  Buckets: 1024  Batches: 1  Memory Usage: 8kB
+              ->  Seq Scan on public.nation n2 (stats)  (cost=0.00..0.00 rows=25 width=0)
+              ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=5997241 width=0)
+                    Hash Cond: (supplier.s_suppkey = lineitem.l_suppkey)
+                    Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+                ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+                ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=3617585 width=0)
+                  Hash Cond: (orders.o_custkey = customer.c_custkey)
+                  Buckets: 262144  Batches: 1  Memory Usage: 120452kB
+              ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+                    Filter: ((o_orderdate >= '1995-01-01'::date) AND (o_orderdate <= '1996-12-31'::date))
+              ->  Hash Join (INNER)  (cost=0.00..0.00 rows=150000 width=0)
+                    Hash Cond: (customer.c_nationkey = n1.n_nationkey)
+                    Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+                ->  Seq Scan on public.nation n1 (stats)  (cost=0.00..0.00 rows=25 width=0)
+        ->  Seq Scan on public.region (stats)  (cost=0.00..0.00 rows=5 width=0)
+              Filter: (r_name = 'AMERICA')
+Planning Time: 0.004 ms
+Execution Time: 82513.128 ms
+
+=== Q9
+Sort  (cost=0.00..0.00 rows=19798600 width=0) (actual time=102506.378..102506.412 rows=175.00 loops=1)
+  Sort Key: nation, o_year DESC
+  ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=19798600 width=0) (actual time=102506.213..102506.258 rows=175.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=39597200 width=0) (actual time=52919.193..102506.040 rows=316264.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=39597200 width=0)
+            Hash Cond: ((lineitem.l_suppkey = partsupp.ps_suppkey) AND (lineitem.l_partkey = partsupp.ps_partkey))
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=39597200 width=0)
+              Hash Cond: (lineitem.l_partkey = part.p_partkey)
+              Buckets: 131072  Batches: 1  Memory Usage: 0kB
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=39597200 width=0)
+                Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+                Buckets: 524288 (originally 524288)  Batches: 32 (originally 4)  Memory Usage: 499714kB
+            ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=791944 width=0)
+                  Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                  Buckets: 1024  Batches: 1  Memory Usage: 8kB
+              ->  Hash Join (INNER)  (cost=0.00..0.00 rows=6335559 width=0)
+                    Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+                    Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+                ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+                ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+              ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+          ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0)
+                Filter: (p_name LIKE '%green%')
+        ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+Planning Time: 0.004 ms
+Execution Time: 102506.416 ms
+
+=== Q10
+Sort  (cost=0.00..0.00 rows=28965 width=0) (actual time=8677.499..8682.860 rows=20501.00 loops=1)
+  Sort Key: sum DESC
+  ->  HashAggregate (7 keys)  (cost=0.00..0.00 rows=28965 width=0) (actual time=8621.619..8628.967 rows=20501.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=57930 width=0) (actual time=3564.141..8586.835 rows=114106.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=104274420 width=0)
+            Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+            Filter: (((orders.o_orderdate >= '1993-10-01'::date) AND (orders.o_orderdate < ('1993-10-01'::date + '3 month'::interval))) AND (lineitem.l_returnflag = 'R'))
+            Buckets: 524288  Batches: 8  Memory Usage: 9375kB
+        ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+              Filter: (l_returnflag = 'R')
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2115950 width=0)
+              Hash Cond: (orders.o_custkey = customer.c_custkey)
+              Buckets: 262144  Batches: 1  Memory Usage: 120452kB
+          ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+                Filter: ((o_orderdate >= '1993-10-01'::date) AND (o_orderdate < ('1993-10-01'::date + '3 month'::interval)))
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=150000 width=0)
+                Hash Cond: (customer.c_nationkey = nation.n_nationkey)
+                Buckets: 1024  Batches: 1  Memory Usage: 8kB
+            ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+            ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+Planning Time: 0.004 ms
+Execution Time: 8682.869 ms
+
+=== Q11
+Sort  (cost=0.00..0.00 rows=3 width=0) (actual time=1780.734..1780.853 rows=819.00 loops=1)
+  Sort Key: sum DESC
+  ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=10 width=0) (actual time=356.634..1779.561 rows=30605.00 loops=1)
+        Filter: (sum > (SubPlan 1))
+        SubPlan 1 (calls=30605 rebuilds=1 rescans=0 hits=30604 misses=1)
+          ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+            ->  Hash Join (INNER)  (cost=0.00..0.00 rows=4000 width=0)
+                  Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                  Filter: (nation.n_name = 'GERMANY')
+                  Buckets: 1024  Batches: 1  Memory Usage: 1kB
+              ->  Hash Join (INNER)  (cost=0.00..0.00 rows=800000 width=0)
+                    Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+                    Buckets: 16384  Batches: 1  Memory Usage: 4677kB
+                ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+                ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+              ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+                    Filter: (n_name = 'GERMANY')
+    ->  Gather  (cost=0.00..0.00 rows=20 width=0) (actual time=15.696..342.644 rows=32560.00 loops=1)
+          Workers Planned: 3
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=4000 width=0)
+            Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+            Filter: (nation.n_name = 'GERMANY')
+            Buckets: 1024  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=800000 width=0)
+              Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+              Buckets: 16384  Batches: 1  Memory Usage: 0kB
+          ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+          ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+        ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0)
+              Filter: (n_name = 'GERMANY')
+Planning Time: 0.006 ms
+Execution Time: 1780.859 ms
+
+=== Q16
+Sort  (cost=0.00..0.00 rows=1916 width=0) (actual time=918.491..921.252 rows=18213.00 loops=1)
+  Sort Key: count DESC, p_brand, p_type, p_size
+  ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=1916 width=0) (actual time=889.075..893.190 rows=18213.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=3832 width=0) (actual time=497.478..851.832 rows=118892.00 loops=1)
+          Workers Planned: 3
+      ->  Hash Join (ANTI NULL-AWARE)  (cost=0.00..0.00 rows=3832 width=0)
+            Hash Cond: (partsupp.ps_suppkey = s_suppkey)
+            Filter: (true)
+            Buckets: 4096  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=288888 width=0)
+              Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+              Filter: (((part.p_brand <> 'Brand#45') AND (part.p_type NOT LIKE 'MEDIUM POLISHED%')) AND (part.p_size = ANY (49, 14, 23, 45, 19, 3, 36, 9)))
+              Buckets: 16384  Batches: 1  Memory Usage: 0kB
+          ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0)
+          ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0)
+                Filter: (((p_brand <> 'Brand#45') AND (p_type NOT LIKE 'MEDIUM POLISHED%')) AND (p_size = ANY (49, 14, 23, 45, 19, 3, 36, 9)))
+        ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0)
+              Filter: (s_comment LIKE '%Customer%Complaints%')
+Planning Time: 0.009 ms
+Execution Time: 921.260 ms
+
+=== Q18
+Sort  (cost=0.00..0.00 rows=875381787 width=0) (actual time=60716.783..60716.785 rows=10.00 loops=1)
+  Sort Key: o_totalprice DESC, o_orderdate
+  ->  HashAggregate (5 keys)  (cost=0.00..0.00 rows=875381787 width=0) (actual time=60716.769..60716.776 rows=10.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=1750763574 width=0) (actual time=49846.870..60716.756 rows=70.00 loops=1)
+          Workers Planned: 4
+      ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=1750763574 width=0)
+            Hash Cond: (orders.o_orderkey = l_orderkey)
+            Filter: (true)
+            Buckets: 16384  Batches: 1  Memory Usage: 0kB
+        ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=1750763574 width=0)
+              Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+              Buckets: 1048576  Batches: 16  Memory Usage: 308430kB
+          ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=8668515 width=0)
+                Hash Cond: (orders.o_custkey = customer.c_custkey)
+                Buckets: 262144  Batches: 1  Memory Usage: 0kB
+            ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+            ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+        ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=29694 width=0)
+              Filter: (sum > 313)
+          ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0)
+Planning Time: 0.004 ms
+Execution Time: 60716.789 ms
+
+=== Q20
+Sort  (cost=0.00..0.00 rows=68420 width=0) (actual time=17764.303..17764.314 rows=76.00 loops=1)
+  Sort Key: supplier.s_name
+  ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=68420 width=0) (actual time=17744.860..17764.200 rows=76.00 loops=1)
+        Hash Cond: (supplier.s_suppkey = ps_suppkey)
+        Filter: (true)
+        Buckets: 8388608  Batches: 4  Memory Usage: 47kB
+    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=400 width=0) (actual time=0.077..14.523 rows=374.00 loops=1)
+          Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+          Filter: (nation.n_name = 'CANADA')
+          Buckets: 1024  Batches: 1  Memory Usage: 1kB
+      ->  Seq Scan on public.supplier (stats)  (cost=0.00..0.00 rows=10000 width=0) (actual time=0.010..14.477 rows=10000.00 loops=1)
+      ->  Seq Scan on public.nation (stats)  (cost=0.00..0.00 rows=25 width=0) (actual time=0.025..0.049 rows=25.00 loops=1)
+            Filter: (n_name = 'CANADA')
+    ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=6842096 width=0) (actual time=16273.154..17743.241 rows=2568.00 loops=1)
+          Hash Cond: (ps_partkey = p_partkey)
+          Filter: (true)
+          Buckets: 131072  Batches: 1  Memory Usage: 152kB
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=20526289 width=0) (actual time=15986.335..17457.415 rows=236624.00 loops=1)
+            Hash Cond: ((ps_partkey = l_partkey) AND (ps_suppkey = l_suppkey))
+            Filter: (ps_availqty > (0.5 * sum))
+        ->  Seq Scan on public.partsupp (stats)  (cost=0.00..0.00 rows=800000 width=0) (actual time=8.253..1479.338 rows=800000.00 loops=1)
+        ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=727580 width=0) (actual time=15860.363..15978.050 rows=236624.00 loops=1)
+          ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.043..15287.205 rows=5997241.00 loops=1)
+                Filter: ((l_shipdate >= '1994-01-01'::date) AND (l_shipdate < ('1994-01-01'::date + '1 year'::interval)))
+      ->  Seq Scan on public.part (stats)  (cost=0.00..0.00 rows=200000 width=0) (actual time=1.214..286.342 rows=200000.00 loops=1)
+            Filter: (p_name LIKE 'forest%')
+Planning Time: 0.014 ms
+Execution Time: 17764.333 ms
+
+=== Q22
+Sort  (cost=0.00..0.00 rows=416666 width=0) (actual time=6393.363..6393.365 rows=7.00 loops=1)
+  Sort Key: cntrycode
+  ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=416666 width=0) (actual time=6393.354..6393.359 rows=7.00 loops=1)
+    ->  Gather  (cost=0.00..0.00 rows=833333 width=0) (actual time=4173.485..6393.150 rows=1812.00 loops=1)
+          Workers Planned: 2
+      ->  Hash Join (ANTI)  (cost=0.00..0.00 rows=2500000 width=0)
+            Hash Cond: (c_custkey = o_custkey)
+            Filter: (c_acctbal > (SubPlan 1))
+            Buckets: 2097152  Batches: 2  Memory Usage: 389870kB
+            SubPlan 1 (calls=1300 rebuilds=1 rescans=0 hits=1299 misses=1)
+              ->  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+                ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+                      Filter: ((c_acctbal > 0.00) AND (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')))
+        ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0)
+              Filter: (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17'))
+        ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0)
+Planning Time: 0.004 ms
+Execution Time: 6393.759 ms
+

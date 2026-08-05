@@ -26,14 +26,15 @@ measure per commit).
 | **S2** | E4 (multi-column keys, planner+executor) | plan-affecting → plan-snapshot re-baseline in same commit | spotcheck + SF0.5 + Q78-class degeneracy probe; `reselectDegenerateHashKeys` deleted same commit |
 | **S3** | [06](06-hash-spill-and-memory.md) hybrid hash spill | `work_mem`-honouring ON; `GOOPG_HASH_SPILL=off` escape | Q21 SF1 completes under cgroup cap; no-spill plans byte-identical results |
 | **S4** | [07](07-other-join-operators.md) §§2–4 (streaming merge, hash outer-fill, Materialize+NL) | per-operator, plan-affecting parts follow S5's flag | regress-port outer-join files; SF0.5 |
-| **S5** | the new DP ([03](03-join-search-pg-dp.md)) + cost binding ([04](04-cost-and-cardinality.md)) | `GOOPG_LEFTDEEP_DP` — OFF while soaking, flipped ON as the acceptance event; replaces `GOOPG_COST_DRIVEN_JOINORDER` (retired). The collapse-limit wiring ([03](03-join-search-pg-dp.md) §6) gets its **own sub-flag** (`GOOPG_LEFTDEEP_COLLAPSE`) and soaks separately: it changes *which statements enter the search at all* (explicit-JOIN flattening), and coupling that population change to the enumerator swap would make S5 regressions unattributable | the full [09](09-verification-and-acceptance.md) bar, including Q9 — run once with collapse OFF (comma-FROM population only), then with collapse ON |
+| **S5** | the new PG-shaped DP ([03](03-join-search-pg-dp.md) — all three `join_search_one_level` phases, including the bushy phase of §4.3) + cost binding ([04](04-cost-and-cardinality.md)) | `GOOPG_PGSHAPED_DP` — OFF while soaking, flipped ON as the acceptance event; replaces `GOOPG_COST_DRIVEN_JOINORDER` (retired). The collapse-limit wiring ([03](03-join-search-pg-dp.md) §6) gets its **own sub-flag** (`GOOPG_PGSHAPED_COLLAPSE`) and soaks separately: it changes *which statements enter the search at all* (explicit-JOIN flattening), and coupling that population change to the enumerator swap would make S5 regressions unattributable | the full [09](09-verification-and-acceptance.md) bar, including Q9 — run once with collapse OFF (comma-FROM population only), then with collapse ON |
 | **S6** | E5 (compiled key/residual eval) | none (behaviour-neutral) | units + parity spot-diffs on expression corpora |
 | **S7** | deletion (§4) | none — deletions only after S5 default-ON has survived ≥ 1 clean nightly cycle | nightly green; grep-clean inventory below |
 
 Rollback story: S0/S2/S6 revert by commit; S1/S3 flip their env switch; S5
-flips `GOOPG_LEFTDEEP_DP` OFF, restoring the bushy DP **which is not deleted
-until S7**. Both enumerators coexist behind the flag during the soak — the
-`tryBushyDP` entry point stays callable, exactly how
+flips `GOOPG_PGSHAPED_DP` OFF, restoring the current `tryBushyDP` enumerator
+(goopg's subset-bitmask DP, which is itself bushy-capable) **which is not
+deleted until S7**. Both enumerators coexist behind the flag during the soak —
+the `tryBushyDP` entry point stays callable, exactly how
 `mhjPackingEnabled`/`SetMHJPackingEnabled` kept MHJ revivable after
 M0126-0011.
 
@@ -45,28 +46,42 @@ M0126-0011.
   placement passes — those passes must not double-fire on searched subtrees
   (searched roots are tagged; the passes skip tagged subtrees).
 - `reconcileNLILayout` (`planner.go:99`) keeps running until S7 confirms no
-  searched plan needs it (left-deep prefix layouts should make it a no-op on
-  searched trees — assert, don't assume: debug-mode check that it changed
-  nothing on a searched tree, log+file a bug if it did).
+  searched plan needs it (the canonical relid-ordered layouts of
+  [02](02-plan-shape-contract.md) §3 should make it a no-op on searched
+  trees — assert, don't assume: debug-mode check that it changed nothing on
+  a searched tree, log+file a bug if it did).
 - Plan snapshots: S2 and S5 each re-baseline `plan_snapshots/` in the same
   commit with the diff summarised in the commit message (the
   `post-mhj-retire.txt` precedent).
 
 ## 4. Deletion inventory (S7)
 
-**Planner** — with the bushy DP:
+**Planner** — with the old subset-bitmask DP (not the new PG-shaped DP,
+which stays):
 `enumerateBushyPlans`, `enumerateSubsets`, `enumerateSplits`,
-`dp map[uint16]dpEntry` + `dpEntry.layout` and the per-subset remap pair
-(`remapKeyToLayout`, `mergeSubsetLayouts`), `estimateJoinCost` + integer
+`dp map[uint16]dpEntry`, `estimateJoinCost` + integer
 weights, `attachUnusedCrossEdges`, `bushySeedRowCounts`, the
 `len(tables) > 12` cap, `IsSmallDimensionSide` build pinning
 (`buildJoinFromDP`), `chooseInnerJoinAlgo` for searched joins,
 `joinorder.go`'s authority role (file shrinks to the over-ceiling
-sequencer). **Held back until the [03](03-join-search-pg-dp.md) §10
-boundary map is proven in production**: `buildBindingsPosMap` and
-`applyJoinTreePosMap` — they are today's search-boundary translation and
-the pinned-spine re-resolution consumes them; deleting them before the
-replacement is validated is the S7 change most likely to regress.
+sequencer).
+
+**The layout/remap family splits in two** under the canonical relid-ordered
+layout ([02](02-plan-shape-contract.md) §3):
+- *Subset-internal* machinery — `dpEntry.layout` and the per-subset remap
+  pair (`remapKeyToLayout`, `mergeSubsetLayouts`) — **is deleted**: with the
+  canonical layout, a joinrel's column order is a pure function of its
+  relset, so no enumeration-time layout state survives, and under bushy
+  shapes there is no prefix-sum composition it could be replaced by anyway.
+- *Search-boundary* translation — `buildBindingsPosMap` and
+  `applyJoinTreePosMap` — is **held back** until the [03](03-join-search-pg-dp.md)
+  §10 boundary map is proven in production. They are today's
+  search-boundary translation and the pinned-spine re-resolution consumes
+  them; deleting them before the replacement is validated is the S7 change
+  most likely to regress. Bushy makes the hold-back sharper, not looser:
+  the replacement is a single relset permutation (canonical relid order →
+  syntactic order) absorbed by a root `Project`, with no chain-order
+  simplification available.
 (`costJoinCandidate`'s quadratic penalty is NOT in this inventory — it is
 already deleted at S5 per [IMPLEMENTATION-TODO](IMPLEMENTATION-TODO.md)
 P5.6.)
@@ -105,14 +120,17 @@ survive unchanged.
   (never deleted);
   [cost-model/09](../cost-model/09-verification-and-acceptance.md) §3's
   "MultiHashJoin where PG uses a left-deep hash cascade" allowance is struck.
-- Every deliberately-skipped PG behaviour named in chapters 03–07 (bushy
-  phase, GEQO, skew buckets, SpecialJoinInfo semi/anti in-DP, shared spilling
-  builds, full join_order_restriction inference) gets its
+- Every deliberately-skipped PG behaviour named in chapters 03–07 (GEQO,
+  skew buckets, SpecialJoinInfo semi/anti in-DP, shared spilling builds,
+  full join_order_restriction inference) gets its
   `.ralph/deferral_ledger.md` row when its stage lands — the ledger, not
   this bundle, is the resume-point authority. The semi/anti-in-DP and
-  join_order_restriction rows must carry the **bushy-phase-dependent**
-  marker ([03](03-join-search-pg-dp.md) §4.3): neither may be resumed as a
-  standalone increment.
+  join_order_restriction rows carry the **`join_is_legal`-inference-dependent**
+  marker ([03](03-join-search-pg-dp.md) §4.4): the bushy shape capacity they
+  need is implemented ([03](03-join-search-pg-dp.md) §4.3), so neither is
+  blocked on search shape anymore — what blocks them is `join_is_legal`
+  constraint inference, and neither may be resumed as a standalone
+  increment before that lands.
 
 ## 6. Interaction with live M0126 state
 

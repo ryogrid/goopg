@@ -53,7 +53,9 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 	setCheapest(dim)
 
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 100)
-	generateHashJoinPaths(joinRel, fact, dim, cp, 1)
+	// One hash key, no residual. The clause's contents do not matter here —
+	// only its count reaches hashJoinCost.
+	generateHashJoinPaths(joinRel, fact, dim, cp, []*restrictInfo{{}}, nil)
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil {
@@ -81,34 +83,52 @@ func relWithScanCost(relids RelSet, rows float64, total float64) *RelOptInfo {
 	return rel
 }
 
-// TestGenerateNLIPath_RuinousForLargeOuter is the Q9 lesson (ch. 07 §4.5): an
-// NL-index join is cheap when the outer is small (few probes) but ruinous when the
-// outer is large — the distinction a binary-hash-only cost model could not make.
-func TestGenerateNLIPath_RuinousForLargeOuter(t *testing.T) {
+// TestNLIPathRuinousForLargeOuter is the Q9 lesson (ch. 07 §4.5): an NL-index
+// join is cheap when the outer is small (few probes) but ruinous when the outer
+// is large — the distinction a binary-hash-only cost model could not make.
+//
+// It used to exercise the C1-era `generateNLIPath`, which charged a flat
+// `indexProbeCost` per outer row no matter what the inner path was. That
+// primitive is retired (M0127-P5.4b-ii-b-1); the lesson is now measured on the
+// real arm, where the per-probe cost comes from the parameterised inner path
+// itself. Same conclusion, from the number that actually drives the plan.
+func TestNLIPathRuinousForLargeOuter(t *testing.T) {
 	cp := defaultCostParams()
-	bigInner := relWithScanCost(RelSet(0b10), 1000000, 10000)
+	innerRelids := RelSet(0b10)
 
-	smallOuter := relWithScanCost(RelSet(0b01), 100, 5)
-	jSmall := newRelOptInfo(RelSet(0b11), 100, 40)
-	generateNLIPath(jSmall, smallOuter, bigInner, cp)
-	setCheapest(jSmall)
-	nliSmall := jSmall.CheapestTotal.Cost.Total // ~ 100*8 + 5
-
-	bigOuter := relWithScanCost(RelSet(0b01), 6000000, 60000)
-	jLarge := newRelOptInfo(RelSet(0b11), 6000000, 40)
-	generateNLIPath(jLarge, bigOuter, bigInner, cp)
-	setCheapest(jLarge)
-	nliLarge := jLarge.CheapestTotal.Cost.Total // ~ 6M*8
-
-	if nliSmall > 10000 {
-		t.Fatalf("NLI over a 100-row outer must be cheap, got %v", nliSmall)
+	nliTotal := func(outerRelids RelSet, outerRows, outerCost, joinRows float64) *Path {
+		t.Helper()
+		outer := relWithScanCost(outerRelids, outerRows, outerCost)
+		inner := nliInnerRel(innerRelids, 1000000, outerRelids, indexProbeCost(cp))
+		joinRel := newRelOptInfo(outerRelids|innerRelids, joinRows, 40)
+		addNLIPaths(joinRel, outer, inner, cp, nil)
+		setCheapest(joinRel)
+		if joinRel.CheapestTotal == nil {
+			t.Fatal("the NLI arm produced no path for a fully-supplied inner")
+		}
+		return joinRel.CheapestTotal
 	}
-	if nliLarge < 1e6 {
-		t.Fatalf("NLI over a 6M-row outer must be very expensive, got %v", nliLarge)
+
+	small := nliTotal(RelSet(0b01), 100, 5, 100)
+	large := nliTotal(RelSet(0b01), 6000000, 60000, 6000000)
+
+	if small.Cost.Total > 10000 {
+		t.Fatalf("NLI over a 100-row outer must be cheap, got %v", small.Cost.Total)
 	}
-	// The parameterized path records its outer dependency.
-	if jLarge.CheapestTotal.RequiredOuter != bigInner.Relids {
-		t.Fatalf("NLI path must record RequiredOuter = the indexed inner's relids")
+	if large.Cost.Total < 1e6 {
+		t.Fatalf("NLI over a 6M-row outer must be very expensive, got %v", large.Cost.Total)
+	}
+	// M0127-P5.4b-i corrected this assertion. It used to demand
+	// `RequiredOuter == inner.Relids`, which read RequiredOuter as "what this
+	// path depends on below" — but it means "what this path still needs
+	// supplied from ABOVE", and a path over a joinrel can never require a
+	// relation that joinrel contains. A nested loop is precisely the operator
+	// that DISCHARGES an inner's parameterisation by the outer
+	// (`calc_nestloop_required_outer`, pathnode.c:2592), which is what lets an
+	// NLI subtree be a hash-join input higher up instead of being refused by
+	// the PATH_PARAM_BY_REL rule.
+	if large.RequiredOuter != 0 {
+		t.Fatalf("a nested loop must discharge its inner's parameterisation, got %#04b", large.RequiredOuter)
 	}
 }
 
@@ -134,7 +154,7 @@ func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 10, 10)
 	outer := newRelOptInfo(RelSet(0b01), 10, 10) // no paths -> CheapestTotal nil
 	inner := newRelOptInfo(RelSet(0b10), 10, 10)
-	generateHashJoinPaths(joinRel, outer, inner, cp, 1)
+	generateHashJoinPaths(joinRel, outer, inner, cp, []*restrictInfo{{}}, nil)
 	if len(joinRel.Pathlist) != 0 {
 		t.Fatalf("no join paths should be generated without child cheapest paths")
 	}

@@ -128,6 +128,19 @@ exists because of them.
   leading suspect is `5db0a067` (RC-1b), which post-dates set A and touches
   Q47's own family. Chunk 49–56 then showed Q49/Q50/Q51 **not** inflated, so
   the cause is specific to Q47 rather than to the RC-1b commit as a whole.
+  **↳ SETTLED 2026-08-03 (M0125-0013).** This bullet's *direction* was right and
+  chunk 49–56's rebuttal of it was wrong, but the reason given here ("the row
+  count did not move") no longer holds: Q47 now returns **100 rows = PG,
+  byte-identical at SF=1**, and it got *slower*. Re-measured on a quiet host at
+  HEAD `374dc60e`: **goopg 537.55 s vs PG 3.38 s = 159×**. It is now
+  **attributed** — ~485 s of it is the `v2` three-way self-join, whose hash key
+  degenerates to `i_category` (10 distinct over 63,745 rows vs the 4-key
+  composite's 5,667) because `splitEqualityForHash` takes only the first
+  disjoint equality; the CTE itself costs 52 s and is evaluated once. That is
+  the pre-existing multi-column-hash-key deferral (`M0125-0011` / `M0125-0035`),
+  not an RC-1b regression — RC-1b only made the defective join reachable.
+  Evidence `analysis/m0125-0013-q47-verdict/`; record in
+  `docs/design/0125-0013-q47-q49-q51-three-distinct-defects.md` § Q47.
 
 - **Q88 — the SF0.5 import trap, avoided.** D7 warned that Q88's `228 s / 1 row`
   is an SF0.5 figure. At SF=1 Q88 does not complete inside 600 s (`TIMEOUT
@@ -268,6 +281,12 @@ comparable to `TIMEOUT_SEC`.
    8.4× slowdown is bounded but unattributed; the four wrong-answer root causes
    were established by targeted probing in M0124-0006, not by this sweep's
    verdicts.
+   **↳ DISCHARGED 2026-08-03 (M0125-0013).** Both words are now superseded.
+   *Unattributed* → attributed: the single-key hash degeneracy in Q47's `v2`
+   self-join (see §3.2's 2026-08-03 note). *Bounded* → not bounded by the 142 s
+   this report quotes: a quiet-host re-measure at HEAD `374dc60e` reads
+   **537.55 s** against PG's **3.38 s**. This limit is retired, not merely
+   annotated.
 3. **No SF0.5 comparison** appears in this report, per D2 and the protocol's
    non-goals: SF0.5-derived numbers may be *tested* at SF=1 (§3) but never
    quoted as SF=1 results.

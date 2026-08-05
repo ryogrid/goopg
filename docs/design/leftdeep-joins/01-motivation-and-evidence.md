@@ -76,7 +76,8 @@ Two facts matter for the design:
 
 ## 3. The seam, precisely
 
-A left-deep hash cascade **already pipelines** in goopg: each `joinOp.Open`
+A binary hash cascade (left-deep or bushy) **already pipelines** in goopg:
+each `joinOp.Open`
 drains only its build side (`buildLazyHashTable`,
 `internal/executor/operators_join_agg.go:524`) and streams its probe side
 (`nextLazy` pulls one `TupleSlot` per row, `:1247`). No intermediate result
@@ -136,13 +137,14 @@ this: its MHJ packing swallowed the mis-ordered middle of the tree into one
 n-ary node whose estimate was equally wrong (1.8e14) but whose execution
 didn't care.
 
-Consequence for this bundle: the left-deep restriction alone does **not** fix
-Q9 — a left-deep enumerator with the same cardinality model would still pick
-dimension-first orders. [04](04-cost-and-cardinality.md) (FK-aware
-selectivity + honest build cost) is a co-requisite, not an optional
-refinement. Conversely the cost fixes alone don't suffice either — M0126-0013
-proved the bushy space as costed has no good order to find. Shape + cost move
-together.
+Consequence for this bundle: the search-space change alone does **not** fix
+Q9 — a PG-shaped enumerator (left-deep + bushy,
+[03](03-join-search-pg-dp.md) §4) with the same cardinality model would
+still pick dimension-first orders. [04](04-cost-and-cardinality.md)
+(FK-aware selectivity + honest build cost) is a co-requisite, not an
+optional refinement. Conversely the cost fixes alone don't suffice either —
+M0126-0013 proved goopg's subset-bitmask bushy space as costed has no good
+order to find. Shape + cost move together.
 
 ## 5. Why "PG-shaped DP" and not another repair pass
 

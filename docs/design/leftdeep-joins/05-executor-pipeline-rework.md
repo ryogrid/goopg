@@ -10,11 +10,13 @@
 
 ## 1. The claim to make true
 
-> A left-deep chain of binary hash joins with base-rel build sides must
-> execute with the same asymptotic work and within noise of the same
-> constant factors as `multiHashJoinOp` did: **N base-relation hash tables
-> built at Open, one streaming probe pass, zero per-tuple heap allocation
-> and zero row materialisation at the seams.**
+> Any PG-shaped binary join tree of hash joins — a left-deep chain (base-rel
+> build sides) or a bushy tree (composite build sides,
+> [02](02-plan-shape-contract.md) §1) — must execute with the same
+> asymptotic work and within noise of the same constant factors as
+> `multiHashJoinOp` did: **all hash tables built at Open, one streaming
+> probe pass, zero per-tuple heap allocation and zero row materialisation
+> at the seams.**
 
 Structural equivalence already holds: `joinOp.Open` → `openLazyHashJoin` →
 `buildLazyHashTable(inner)` → `openProbeSide(outer)` → child `joinOp.Open` →

@@ -93,9 +93,11 @@ NULL-aware short-circuit keeps its semantics with the batch-global
 Unnest-produced semi/anti joins remain pinned opaque for the search
 ([03](03-join-search-pg-dp.md) §2, §4.4) in v1; folding them into the DP as
 JOIN_SEMI/JOIN_ANTI jointypes (PG's SpecialJoinInfo machinery) is the
-recorded follow-up — **bushy-phase-dependent** per
-[03](03-join-search-pg-dp.md) §4.3 (ordering restrictions can make left-deep
-levels unplannable), ledger row at implementation time.
+recorded follow-up — implementable now that the bushy phase exists
+([03](03-join-search-pg-dp.md) §4.3): with composite⋈composite joins
+available, ordering-restricted levels stay plannable, so the search shape is
+no longer the blocker. What remains is `join_is_legal` constraint inference
+([03](03-join-search-pg-dp.md) §4.4), ledger row at implementation time.
 
 ## 6. NLI and Memoize become paths (behaviour unchanged)
 

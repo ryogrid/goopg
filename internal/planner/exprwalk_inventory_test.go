@@ -30,10 +30,16 @@ package planner
 // (dispatch switches survive inside their Rewrite closures), and commits 3
 // and 4 (2026-08-03) DELETED bushy.go:visitColumnRefs and
 // bushy.go:visitColumnRefsForTable outright — their switches vanished; the
-// *ColumnRef filter in each new body is a type assertion, not a switch. The
-// pinned walkerPending population stood at 47 after those deletions (new
-// pinned sites had joined since the 2026-07-30 census; the map below, not
-// this comment, is the authoritative count).
+// *ColumnRef filter in each new body is a type assertion, not a switch.
+// Commit 5 (2026-08-03) then DEMOTED planner.go:exprSide — its body is
+// walkExprRefs now, but a two-arm dispatch survives in the Visit closure —
+// leaving the pinned walkerPending population at 46. Commit 6 (2026-08-03)
+// handled the producer/consumer pair in local_filters.go both ways at once:
+// conjunctIsLocalEligible DEMOTED (its veto dispatch survives in the Visit
+// closure) and localizeExprToLeaf DELETED (cloneExprRefs left it with a
+// *ColumnRef type assertion, no switch), leaving 45. (New pinned sites had
+// joined since the 2026-07-30 census; the map below, not this comment, is
+// the authoritative count.)
 //
 // So the live figure for the RC-1a class is **50, not seven**. The seven named
 // in M0125-0002 are a hand-picked *conversion* scope chosen for their MHJ and
@@ -118,7 +124,23 @@ var exprSwitchInventory = map[string]walkerRole{
 	"bushy.go:remapByPosMap":           nonRecursiveClassifier,
 	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
 	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
-	"bushy.go:visitColumnRefsByName":   walkerPending, // 7 of 32 arms
+	// CONVERTED by M0125-0002 commit 7, the LAST of the series. The
+	// recursion is walkExprRefs (scopeSignal); the surviving switch is the
+	// three-arm "reads row data but names no column" veto inside the Visit
+	// closure (*OuterColumnRef / *CTIDExpr / *MergeWholeRowRef, plus the
+	// empty-Name *ColumnRef), attributed by the census to its enclosing
+	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
+	// RC-1a class 45 -> 44.
+	"bushy.go:visitColumnRefsByName": nonRecursiveClassifier,
+	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
+	// recursion and the exhaustiveness); what the census sees is the
+	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,
+	// refuse *OuterColumnRef / *CTIDExpr — attributed to the enclosing
+	// function. Same demoted shape as nl_index_join.go:cloneExprShiftIdx,
+	// whose two-arm veto set this one's is a superset of. Fail-open is not a
+	// hazard here: an unenumerated type aborts cloneExprRefs itself, and the
+	// arm panics on the `!ok`.
+	"createplanjoin.go:translateToLayout": nonRecursiveClassifier,
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and
 	// cloneExprRefs the rewrite — and what the census sees is the
@@ -148,8 +170,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	// bottom-up dispatch inside the Visit closure (veto *OuterColumnRef /
 	// *FuncCall, validate *ColumnRef against the owning Tables[i] range).
 	"inner_join_qual_pushdown.go:mhjResidualConjunctTable":      nonRecursiveClassifier,
-	"local_filters.go:conjunctIsLocalEligible":                  walkerPending, // 9 of 32 arms, recurses via its `walk` closure
-	"local_filters.go:localizeExprToLeaf":                       walkerPending, // 7 of 32 arms
+	// M0125-0002 commit 6 DEMOTED this one: the body is walkExprRefs
+	// (scopeVeto) now, but a two-arm veto dispatch survives in the Visit
+	// closure, so the census still keys a site to this function.
+	// localizeExprToLeaf, its consumer, was DELETED from this map in the
+	// same commit — cloneExprRefs left it with a *ColumnRef type
+	// assertion and no switch at all.
+	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
 	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
 	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
 	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
@@ -169,7 +196,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	// than no-ops (an identity function's unenumerated type is not skipped, it
 	// is asserted equal to every other node of its Go type), so the RC-1a
 	// class shrinks 50 → 48 and the census 64 → 63.
-	"planner.go:exprSide":                        walkerPending, // 15 of 32 arms
+	// CONVERTED by M0125-0002 commit 5, and DEMOTED for the same reason
+	// commits 1-2 demoted remapByPosMap and cloneExprShiftIdx: the
+	// recursion and the exhaustiveness moved to exprChildSlots (via
+	// walkExprRefs), but a two-arm bottom-up dispatch survives inside the
+	// Visit closure — classify a *ColumnRef by leftWidth, veto
+	// *OuterColumnRef / *CTIDExpr — and the census attributes a closure's
+	// switch to its enclosing function. RC-1a class 47 → 46.
+	"planner.go:exprSide":                        nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
 	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
 	"planner.go:inferExprType":                   nonRecursiveClassifier,

@@ -236,6 +236,16 @@ type opTreeSlab struct {
 	exprs   exprTreeSlab     // expression-tree slab (Phase C.3); immutable after BuildFast
 	plans   planTreeSlab     // plan-tree slab (Phase C.3); immutable after BuildFast
 	schemas []planner.Schema // output-schema pool for OpProject nodes; indexed by schemaIdx
+
+	// env is the fusion build env for buildRec's *planner.Join arm
+	// (M0126-0006). It is nil, and always has been: BuildFast is a
+	// top-level entry point (dispatch's simple-query path) and no
+	// buildWithEnv frame is ever on the stack above it, so the package
+	// global buildRec used to read here always read nil too. M0127-P1.2
+	// removed that global — the field keeps the site explicit rather
+	// than hiding a nil behind a name that suggested otherwise. It goes
+	// with fusion at P6.1/P6.2.
+	env *buildEnv
 }
 
 // add appends n to the slab and returns its index.

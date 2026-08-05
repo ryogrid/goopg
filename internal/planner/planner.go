@@ -107,13 +107,15 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	// could see refs==1 while a later sibling subquery adds a second
 	// reference to the same shared body.
 	pushQualsThroughSingleRefCTEs(node)
-	// M0125-0035 EC arm follow-through: qual placement (the two passes
-	// above plus the per-scope join pass) can pin a hash join's key
-	// column to a constant on BOTH inputs, collapsing the hash table
-	// into one bucket (Q78's top spine). Re-pick the key pair from the
-	// join's remaining equalities where that happened — result-neutral,
-	// the executor enforces the full Predicate per match either way.
-	reselectDegenerateHashKeys(node)
+	// M0127-P2.2 RETIRED `reselectDegenerateHashKeys` here. Qual placement
+	// (the two passes above plus the per-scope join pass) can pin a hash
+	// join's key column to a constant on BOTH inputs, which collapsed the
+	// hash table into one bucket (Q78's top spine); that pass worked around
+	// it by re-picking the single key pair away from the pinned column. The
+	// executor now keys on the FULL equi-pair list (`Join.HashKeys`, P2.1 →
+	// `ExecHashKeyPlan`, P2.2), so a pinned column merely contributes
+	// nothing to bucket spread — exactly as in PG, where the choice never
+	// existed. With nothing to choose there is nothing to re-pick.
 	// M0125-0036 (C3): turn a correlated EXISTS that no pass could make a
 	// semi-join into a hashable uncorrelated ANY sublink (upstream's
 	// convert_EXISTS_to_ANY). Must run AFTER every index-rewriting pass —
@@ -121,7 +123,16 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	// OuterColumnRef — and BEFORE lowering, which is what would otherwise
 	// bind that correlation to a PARAM_EXEC slot.
 	node = rewriteExistsToAny(node)
-	return lowerSubPlanParams(node), nil
+	node = lowerSubPlanParams(node)
+	// M0127-P2.1: publish every hash/merge join's FULL equi-pair list on
+	// Join.HashKeys. Deliberately the LAST thing Plan() does — the list
+	// aliases expressions the passes above rewrite in place, so deriving
+	// it after the final rewriter (lowerSubPlanParams, which rebinds
+	// correlated refs to PARAM_EXEC slots) is what makes staleness
+	// impossible rather than a maintenance obligation on every pass.
+	// See join_hash_keys.go.
+	fillJoinHashKeys(node)
+	return node, nil
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
@@ -1043,23 +1054,35 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
+		// M0127-P5.6-g-iv: PG's `canonicalize_qual` (prepqual.c), which
+		// upstream runs from `preprocess_expression` at exactly this point —
+		// after parse analysis, before the qual is distributed to
+		// baserestrictinfo / joinquals. It hoists the conjuncts common to
+		// every arm of an OR out of the OR, so TPC-H Q19's thrice-repeated
+		// `p_partkey = l_partkey` becomes one top-level join clause instead of
+		// three residual ones the estimator charges DEFAULT_EQ_SEL for on top
+		// of the equi-join key it already priced. See qual_canonical.go for
+		// the full statement of why. `s` itself is NOT mutated: the parse tree
+		// is shared with the view/rule deparsers, which must keep rendering
+		// the query as written.
+		whereQual := canonicalizeQual(s.Where)
 		if isSimpleSingle {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
-			whereForIndex := injectLikeRangePredicates(s.Where)
+			whereForIndex := injectLikeRangePredicates(whereQual)
 			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
 			} else {
-				pred, err := resolveExpr(s.Where, ctx)
+				pred, err := resolveExpr(whereQual, ctx)
 				if err != nil {
 					return nil, err
 				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
 		} else {
-			pred, err := resolveExpr(s.Where, ctx)
+			pred, err := resolveExpr(whereQual, ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -2227,8 +2250,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// predicate decomposes into disjoint-side keys:
 		//   - INNER / LEFT: hash join (M0003 rule); cost-driven
 		//     override for INNER when stats are present (M0006).
-		//   - RIGHT / FULL: merge join (semantics-driven; stays
-		//     rules-based regardless of stats).
+		//   - RIGHT / FULL: hash join too since M0127-P4.2 — the merge
+		//     pin they used to carry was an executor gap (no outer
+		//     fill), not a semantic one.
 		// CROSS and non-equality predicates stay on nested-loop.
 		leftWidth := len(leftCtx.schema)
 		if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
@@ -2272,7 +2296,31 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
 			case JoinTypeRight, JoinTypeFull:
+				// M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL
+				// are no longer PINNED to merge. The pin was never a
+				// semantic requirement — it was the absence of outer fill in
+				// the hash executor — and it charged every RIGHT/FULL join a
+				// sort of BOTH inputs whatever the inputs looked like.
+				//
+				// What replaces it is a choice, not a new pin: merge stays
+				// the answer when neither side has an estimate (which is
+				// what PG picks there too), and hash wins as soon as the
+				// sorts can be priced. chooseOuterFillJoinAlgo carries the
+				// reasoning.
 				jn.Algo = JoinAlgoMerge
+				if algo, ok := chooseOuterFillJoinAlgo(EstimateRows(jn.Left), EstimateRows(jn.Right)); ok {
+					jn.Algo = algo
+				}
+				if jn.Algo == JoinAlgoHash && jn.Type == JoinTypeRight {
+					// Build on the LEFT (non-preserved) side so the
+					// preserved right side streams as the probe: the mirror
+					// image of the LEFT default, and the orientation whose
+					// fill is per-probe-row (PG HJ_FILL_OUTER) rather than a
+					// post-probe sweep. FULL needs both halves whichever way
+					// it is oriented, so it keeps build-on-the-right and pays
+					// for the sweep (PG HJ_FILL_INNER_TUPLES).
+					jn.BuildLeft = true
+				}
 			}
 			// INNER joins: let the cost model pick when both sides
 			// have row estimates. Hash stays the M0003 fallback
@@ -2513,7 +2561,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
 					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
-						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf)}
+						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2550,7 +2598,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}
+				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
 			var root Node = parentWrapped
@@ -2564,7 +2612,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
 				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
-					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child)}
+					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2585,7 +2633,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
-		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl)}, b, nil
+		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}, b, nil
 }
 
 // stage1RelSizeRows is the single stamping point for the relation-size
@@ -5247,22 +5295,24 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 // l_partkey, l_suppkey)`) forced a Nested Loop that recomputed the
 // GROUP BY aggregate once per outer partsupp row (M-NIGHTLY
 // tpch/Q20-timeout).
+//
+// M0127-P2.1: the conjunct walk itself now lives in
+// `forEachEqualityForHash` (join_hash_keys.go), which
+// `splitAllEqualitiesForHash` uses to publish the FULL pair list on
+// `Join.HashKeys`. Stopping at the first pair here keeps this function's
+// behaviour byte-identical to its pre-P2.1 form, and sharing the core
+// means the single-pair and full-list views cannot drift apart about
+// what counts as a hash key.
 func splitEqualityForHash(pred Expr, leftWidth int) (Expr, Expr, bool) {
-	for _, conjunct := range splitAnd(pred) {
-		bin, ok := conjunct.(*BinaryOp)
-		if !ok || bin.Op != parser.OpEq {
-			continue
-		}
-		lSide := exprSide(bin.Left, leftWidth)
-		rSide := exprSide(bin.Right, leftWidth)
-		switch {
-		case lSide == sideLeft && rSide == sideRight:
-			return bin.Left, bin.Right, true
-		case lSide == sideRight && rSide == sideLeft:
-			return bin.Right, bin.Left, true
-		}
+	var l, r Expr
+	forEachEqualityForHash(pred, leftWidth, func(le, re Expr) bool {
+		l, r = le, re
+		return false
+	})
+	if l == nil {
+		return nil, nil, false
 	}
-	return nil, nil, false
+	return l, r, true
 }
 
 type joinSide int
@@ -5275,47 +5325,60 @@ const (
 )
 
 // exprSide classifies which join input(s) e references. Pure
-// constants resolve as sideUnknown and combine with anything;
-// references to the left input are sideLeft, to the right are
-// sideRight; if both appear the result is sideMixed.
+// constants and row-independent leaves resolve as sideUnknown and
+// combine with anything; references to the left input are sideLeft, to
+// the right are sideRight; if both appear — or e names a value the
+// composed row cannot cleanly supply — the result is sideMixed, which
+// splitEqualityForHash reads as "not a hash key".
+//
+// M0125-0002 commit 5: built on walkExprRefs / exprChildSlots instead
+// of its own 15-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a collation, a row
+// constructor, IS DISTINCT FROM or a literal-list IN — all fallen
+// through to sideMixed by the old arms — now classifies the conjunct,
+// and an `=` over such shapes can reach the hash path instead of
+// silently declining. Like cloneExprShiftIdx (commit 2) and unlike the
+// visitors of commits 3–4, this walker has always failed CLOSED — an
+// unenumerated kind cost an optimisation, never a wrong answer — so an
+// unknown type still resolves sideMixed rather than panicking.
+//
+// Scope policy: scopeVeto. A node carrying an inner Plan
+// (*SubqueryExpr / *ExistsExpr / a lowered *InExpr /
+// *ArraySubqueryExpr / *MultiAssignSubq*) is not a per-row hashable
+// key; the veto preserves the old fall-through decline regardless of
+// what the node's same-scope Args merged to. *OuterColumnRef and
+// *CTIDExpr are vetoed explicitly, because exprChildSlots correctly
+// reports both as childless leaves and a completeness-driven
+// conversion would otherwise ADMIT them: an outer ref is fixed only
+// per outer binding (a cached hash table would go stale across
+// re-executions), and ctid is injected into the scanned row's slot
+// (MaterializedSlot.hasCTID) so a side misattribution would hash the
+// wrong side's ctid. *ExecParamRef, *TableOidExpr (OID fixed at plan
+// time) and the Merge* leaves (executor-ctx-driven) join the ParamRef
+// class instead — commit 2's row-independence argument.
 func exprSide(e Expr, leftWidth int) joinSide {
-	switch x := e.(type) {
-	case *ColumnRef:
-		if x.Index < leftWidth {
-			return sideLeft
-		}
-		return sideRight
-	case *IntegerConst, *NumericConst, *StringConst, *NullConst, *BooleanConst, *ParamRef, *TypedStringLit, *IntervalLit:
-		return sideUnknown
-	case *BinaryOp:
-		return mergeSides(exprSide(x.Left, leftWidth), exprSide(x.Right, leftWidth))
-	case *UnaryOp:
-		return exprSide(x.Operand, leftWidth)
-	case *CastExpr:
-		return exprSide(x.Operand, leftWidth)
-	case *FuncCall:
-		side := sideUnknown
-		for _, a := range x.Args {
-			side = mergeSides(side, exprSide(a, leftWidth))
-		}
-		return side
-	case *CaseExpr:
-		side := sideUnknown
-		if x.Operand != nil {
-			side = mergeSides(side, exprSide(x.Operand, leftWidth))
-		}
-		for _, w := range x.Whens {
-			side = mergeSides(side, exprSide(w.When, leftWidth))
-			side = mergeSides(side, exprSide(w.Then, leftWidth))
-		}
-		if x.Else != nil {
-			side = mergeSides(side, exprSide(x.Else, leftWidth))
-		}
-		return side
-	case *ExtractExpr:
-		return exprSide(x.Source, leftWidth)
+	side := sideUnknown
+	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+		Visit: func(x Expr) bool {
+			switch ref := x.(type) {
+			case *ColumnRef:
+				if ref.Index < leftWidth {
+					side = mergeSides(side, sideLeft)
+				} else {
+					side = mergeSides(side, sideRight)
+				}
+			case *OuterColumnRef, *CTIDExpr:
+				side = sideMixed // absorbing under mergeSides
+			}
+			return true
+		},
+	})
+	if !ok {
+		// Aborted: an inner-plan child (scopeVeto) or an unenumerated
+		// type. Both were sideMixed under the old switch.
+		return sideMixed
 	}
-	return sideMixed
+	return side
 }
 
 func mergeSides(a, b joinSide) joinSide {
@@ -7936,12 +7999,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 				return nil, false, nil
 			}
 			return &IndexScan{
-				pos:      where.Pos(),
-				Table:    tbl,
-				Index:    idx,
-				Key:      resolvedKey,
-				schema:   ctx.schema,
-				SmallDim: smallDimensionTag(cat, tbl),
+				pos:        where.Pos(),
+				Table:      tbl,
+				Index:      idx,
+				Key:        resolvedKey,
+				schema:     ctx.schema,
+				SmallDim:   smallDimensionTag(cat, tbl),
+				UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 			}, true, nil
 		}
 		return nil, false, nil
@@ -8007,12 +8071,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	return &IndexScan{
-		pos:      where.Pos(),
-		Table:    tbl,
-		Index:    idx,
-		Key:      resolvedKey,
-		schema:   ctx.schema,
-		SmallDim: smallDimensionTag(cat, tbl),
+		pos:        where.Pos(),
+		Table:      tbl,
+		Index:      idx,
+		Key:        resolvedKey,
+		schema:     ctx.schema,
+		SmallDim:   smallDimensionTag(cat, tbl),
+		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 	}, true, nil
 }
 
@@ -8247,13 +8312,14 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	}
 
 	scan := &IndexScan{
-		pos:      where.Pos(),
-		Table:    tbl,
-		Index:    chosenIdx,
-		LowKey:   loKey,
-		HighKey:  hiKey,
-		schema:   ctx.schema,
-		SmallDim: smallDimensionTag(cat, tbl),
+		pos:        where.Pos(),
+		Table:      tbl,
+		Index:      chosenIdx,
+		LowKey:     loKey,
+		HighKey:    hiKey,
+		schema:     ctx.schema,
+		SmallDim:   smallDimensionTag(cat, tbl),
+		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 	}
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }

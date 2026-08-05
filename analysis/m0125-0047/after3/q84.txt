@@ -1,0 +1,18 @@
+Limit  (cost=0.00..0.00 rows=100 width=0)
+  ->  Gather Merge  (cost=0.00..0.00 rows=19208 width=0)
+        Workers Planned: 3
+    ->  Sort  (cost=0.00..0.00 rows=19208 width=0)
+          Sort Key: customer.c_customer_id
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=19208 width=0)
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1920800 width=0)
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1920800 width=0)
+            ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=1920800 width=0)
+              ->  Seq Scan on public.store_returns (stats)  (cost=0.00..0.00 rows=143486 width=0)
+              ->  Seq Scan on public.customer_demographics (stats)  (cost=0.00..0.00 rows=1920800 width=0)
+            ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=100000 width=0)
+              ->  Seq Scan on public.customer_address (stats)  (cost=0.00..0.00 rows=50000 width=0)
+                    Filter: (ca_city = 'Woodland')
+              ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=100000 width=0)
+          ->  Seq Scan on public.household_demographics (stats)  (cost=0.00..0.00 rows=7200 width=0)
+        ->  Seq Scan on public.income_band (stats)  (cost=0.00..0.00 rows=20 width=0)
+              Filter: ((ib_lower_bound >= 60306) AND (ib_upper_bound <= 110306))

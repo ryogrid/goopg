@@ -66,15 +66,10 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 			nullFrac := strconv.FormatFloat(cs.NullFrac, 'g', -1, 32)
 			// Same sign convention as the pg_statistic write path: PG's
 			// pg_stats.n_distinct is negative when the value scales with the
-			// relation's row count.
-			var distinctF float64
-			switch {
-			case cs.NDistinctFrac > 0:
-				distinctF = -cs.NDistinctFrac
-			case cs.NDistinct > 0:
-				distinctF = float64(cs.NDistinct)
-			}
-			nDistinct := strconv.FormatFloat(distinctF, 'g', -1, 32)
+			// relation's row count. Shared with that path and with the
+			// planner's join estimator via ColumnStats.StaDistinct
+			// (M0127-P5.6-a).
+			nDistinct := strconv.FormatFloat(cs.StaDistinct(), 'g', -1, 32)
 
 			mcVals := VirtualNull
 			mcFreqs := VirtualNull

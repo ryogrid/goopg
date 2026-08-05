@@ -1,0 +1,11 @@
+Limit  (cost=0.00..0.00 rows=1 width=0)
+  ->  Sort  (cost=0.00..0.00 rows=1 width=0)
+        Sort Key: s_store_name, s_store_id, sum, sum, sum, sum, sum, sum, sum
+    ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=86376 width=0)
+            Filter: ((store.s_gmt_offset = -5) AND (date_dim.d_year = 2000))
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=86376 width=0)
+          ->  Seq Scan on public.store_sales (stats)  (cost=0.00..0.00 rows=1439608 width=0)
+          ->  Seq Scan on public.store (stats)  (cost=0.00..0.00 rows=12 width=0)
+        ->  Index Scan using public.date_dim_pkey on public.date_dim  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (d_date_sk = ss_sold_date_sk)
