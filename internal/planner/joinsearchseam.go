@@ -46,15 +46,31 @@ package planner
 // equivalence is the whole licence for this, and it is why the walk descends
 // INNER and CROSS and stops at every other join type.
 //
+// M0127-P5.9-s: an outer link no longer declines the statement — it is PEELED.
+// `splitOuterSpine` takes the pinned outer links off the top of the chain, the
+// search plans the INNER PREFIX below them, and the links are spliced back above
+// the searched subtree unchanged. That is the shape the corpus actually has:
+// all 12 of TPC-DS's explicit-JOIN queries contain an outer join and none is
+// INNER-only (P5.9-r's `TestNoCorpusQueryHasAnInnerOnlyJoinChain`), so before the
+// peel the INNER walk had nothing to walk — Q72's nine-way inner prefix was
+// declined for the two `left outer join`s stacked on top of it. The peel is the
+// same division `runJoinSearchBelowPinned` (predp.go) makes for the semi/anti
+// spine, and it is bounded the same way: only LEFT links may be peeled, because
+// the prefix is the link's left side and the seam pushes conjuncts INTO it (see
+// `splitOuterSpine`).
+//
 // Four shapes are declined and each decline is a correctness statement, not a
 // tuning knob:
 //
-//   - a FROM item whose chain contains an OUTER (or semi/anti) join. The walk
-//     stops there and returns that node as a leaf, so the leaf count disagrees
-//     with the binding count and the statement falls back to the syntactic
-//     shape. `a LEFT JOIN b ON … JOIN c ON …` is therefore declined whole,
+//   - a chain whose outer join is NOT part of the top spine — one below an inner
+//     link, or on a non-first comma FROM item. `extractSearchLeaves` stops at it
+//     and returns that node as a leaf, so the leaf count disagrees with the
+//     prefix's relation count and the statement falls back to the syntactic
+//     shape. `a LEFT JOIN b ON … JOIN c ON …` is therefore still declined whole,
 //     rather than searched from a joinlist whose leaf indices would subscript
-//     bindings the leaves do not correspond to;
+//     bindings the leaves do not correspond to. `makeRelFromJoinlist` declines
+//     it a second time, from the joinlist side (P5.9-s), so a shape that slipped
+//     past the walk cannot be planned as an inner join by accident;
 //   - an `ON` qual on an item that is not the FIRST comma-separated FROM item.
 //     `planFromItem` resolves a chain's quals in that ITEM's coordinates
 //     (planner.go:2178-2190 — `mergedCtx` is built from the item's own
@@ -147,20 +163,44 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("size-or-no-joinlist", nrels, len(ctx.joinlist))
 		return node, pred, false
 	}
-	scans, widths, onQuals, ok := extractSearchLeaves(node)
+	// M0127-P5.9-s: peel the pinned outer spine off the top and search what is
+	// below it. With no outer link this is the identity — `chain == node`,
+	// `spine` empty, `jl == ctx.joinlist` — so the shapes P5.9-r already searched
+	// take exactly the path they took before.
+	chain, spine, jl, ok := splitOuterSpine(node, ctx.joinlist)
+	if !ok {
+		traceSeamDecline("outer-spine", nrels, len(spine))
+		return node, pred, false
+	}
+	// The prefix's own width, in FROM items. Everything below is written against
+	// it rather than against `nrels`, because the spine's relations are outside
+	// the problem: their columns lie beyond the prefix window, so every conjunct
+	// touching one is declined by the clause producer and survives in the
+	// residual `Filter` above the spine.
+	nprefix := jl.nrels()
+	if nprefix < 2 {
+		// `a LEFT JOIN b` has a one-relation prefix; there is no order to search.
+		traceSeamDecline("prefix-size", nrels, nprefix)
+		return node, pred, false
+	}
+	if lo, hi, okRange := jl.leafRange(); !okRange || lo != 0 || hi != nprefix {
+		traceSeamDecline("prefix-not-a-prefix", nrels, nprefix)
+		return node, pred, false
+	}
+	scans, widths, onQuals, ok := extractSearchLeaves(chain)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
 	}
-	if len(scans) != nrels {
+	if len(scans) != nprefix {
 		traceSeamDecline("leaf-count", nrels, len(scans))
 		return node, pred, false
 	}
-	if chainCarriesLateral(node) {
+	if chainCarriesLateral(chain) {
 		traceSeamDecline("lateral", nrels, len(scans))
 		return node, pred, false
 	}
-	cumOffsets := make([]int, nrels+1)
+	cumOffsets := make([]int, nprefix+1)
 	for i := range scans {
 		if scans[i] == nil {
 			traceSeamDecline("nil-leaf", nrels, len(scans))
@@ -171,6 +211,15 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			traceSeamDecline("offset-disagreement", nrels, len(scans))
 			return node, pred, false
 		}
+	}
+	// The spine's first relation must begin exactly where the prefix ends. That
+	// is what makes "beyond the prefix window" and "on the spine" the same
+	// statement, which every conjunct decision below relies on: a spine column
+	// that landed INSIDE the window would be attributed to a prefix leaf and
+	// pushed under the outer join.
+	if nprefix < nrels && ctx.bindings[nprefix].offset != cumOffsets[nprefix] {
+		traceSeamDecline("spine-offset-disagreement", nrels, nprefix)
+		return node, pred, false
 	}
 
 	// Same preparation the bushy DP does (bushy.go:162-196), for the same
@@ -195,9 +244,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, splitAnd(q)...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
-	leaves := make([]Node, nrels)
-	relInfos := make([]baseRelInfo, nrels)
-	for i, b := range ctx.bindings {
+	leaves := make([]Node, nprefix)
+	relInfos := make([]baseRelInfo, nprefix)
+	for i, b := range ctx.bindings[:nprefix] {
 		leaves[i] = scans[i]
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
@@ -228,8 +277,8 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 	}
 
-	searched, err := planJoinlistSearch(ctx.joinlist, &joinlistProblem{
-		bindings:   ctx.bindings,
+	searched, err := planJoinlistSearch(jl, &joinlistProblem{
+		bindings:   ctx.bindings[:nprefix],
 		scans:      leaves,
 		relInfos:   relInfos,
 		conjuncts:  searchConjuncts,
@@ -251,10 +300,100 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			left = append(left, c)
 		}
 	}
-	if len(left) == 0 {
-		return searched, nil, true
+	residual = nil
+	if len(left) > 0 {
+		residual = combineAnd(left)
 	}
-	return searched, combineAnd(left), true
+	if len(spine) == 0 {
+		return searched, residual, true
+	}
+	// Splice the searched prefix under the LOWEST spine link. Nothing above it
+	// is rebuilt and nothing below it is rebound, and both halves of that are
+	// claims about the boundary rather than conveniences:
+	//
+	//   - the searched root republishes the prefix's columns in pre-search
+	//     binding order (`createPlanAtSearchRootRange`, 03 §10), so every spine
+	//     `ON` qual — resolved in the statement's coordinates by `planFromItem` —
+	//     still reads the columns it named. That is the identity boundary map
+	//     `assertSpineConsumesIdentityBoundaryMap` (predp.go) proves for the
+	//     semi/anti spine; the width check below is the part of it that can be
+	//     checked from here, and the part whose failure would be silent;
+	//   - a spine link keeps its own type, sides and qual, because it was never
+	//     handed to the search. The joinlist's pin and this splice are the same
+	//     decision spelled in the two representations, which is why
+	//     `splitOuterSpine` refuses to proceed unless they agree.
+	low := spine[len(spine)-1]
+	if len(searched.Output()) != len(low.Left.Output()) {
+		traceSeamDecline("spine-width", nrels, nprefix)
+		return node, pred, false
+	}
+	low.Left = searched
+	traceSeamSpine(len(spine), nrels, nprefix)
+	return node, residual, true
+}
+
+// splitOuterSpine splits a statement into the INNER-PREFIX subproblem the search
+// may plan and the pinned outer links stacked above it, and returns the prefix's
+// own joinlist.
+//
+// It splits BOTH representations — the pre-search plan tree and the joinlist —
+// and declines unless they agree link for link, because they are two spellings of
+// the same chain: `deconstructFromItem` pins the same nodes `planFromItem` built,
+// in the same order, so a disagreement means one of them is not describing this
+// statement and the coordinate arithmetic below the seam has no ground truth.
+// `ok == true` with an empty spine is the no-outer-link case, where `chain` is
+// `node` and `prefix` is `jl` — the identity, so P5.9-r's shapes are unaffected.
+//
+// # Only LEFT, and the reason is what gets pushed below it
+//
+// `spineLinkSearchable` admits `JoinTypeLeft` alone. The prefix is that link's
+// LEFT side, which for a LEFT JOIN is the non-nullable one, and the search does
+// not merely reorder it: the seam attaches single-relation conjuncts to prefix
+// leaves and lets the search place spanning ones INSIDE the prefix, i.e. BELOW
+// the outer join. Upstream does the same for the same set —
+// `check_outerjoin_delay` (initsplan.c) delays a qual only when its relids reach
+// the NULLABLE side — and for RIGHT the nullable side IS the left one, so the
+// same push would turn `WHERE a.x IS NULL` from a test on null-extended rows into
+// a test on `a`'s own rows. FULL nullifies both sides. goopg has no
+// `reduce_outer_joins` pass to rewrite RIGHT into LEFT (collapse.go), so RIGHT
+// reaches here as itself and is declined rather than swapped.
+//
+// Semi/anti spines are declined too, and are not a gap: `runJoinSearchBelowPinned`
+// (predp.go) already descends those before the seam is called, so the `node` the
+// seam receives is the subtree below them.
+func splitOuterSpine(node Node, jl joinlist) (chain Node, spine []*Join, prefix joinlist, ok bool) {
+	prefix, types := jl.innerPrefixBelowOuterSpine()
+	chain = node
+	for _, t := range types {
+		j, isJoin := chain.(*Join)
+		if !isJoin || !spineLinkSearchable(j, t) {
+			return nil, nil, nil, false
+		}
+		spine = append(spine, j)
+		chain = j.Left
+	}
+	if chain == nil {
+		return nil, nil, nil, false
+	}
+	return chain, spine, prefix, true
+}
+
+// spineLinkSearchable reports whether one peeled link may stay pinned above a
+// searched prefix: the plan node and the joinlist must name the same join type,
+// that type must be LEFT (see `splitOuterSpine`), and the link must carry no
+// LATERAL dependency.
+//
+// LATERAL is checked on both spellings for the reason `chainCarriesLateral`
+// states — `planFromClause` marks the join it builds while a FROM-clause SRF's
+// outer references live on the leaf — and it is declined rather than reasoned
+// about: the right side of a LATERAL link is evaluated per left row, so it is the
+// one shape whose correctness depends on more than the left side's column
+// layout, which is all this splice preserves.
+func spineLinkSearchable(j *Join, t parser.JoinType) bool {
+	if j.Type != JoinTypeLeft || t != parser.JoinLeft {
+		return false
+	}
+	return !j.Lateral && !nodeReferencesOuter(j.Right)
 }
 
 // searchConsumes reports whether the join search placed `c` somewhere in the

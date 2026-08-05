@@ -261,3 +261,20 @@ func traceSeamDecline(reason string, nrels, nleaves int) {
 	fmt.Fprintf(os.Stderr, "%s seam-decline reason=%s nrels=%d nleaves=%d\n",
 		traceTag, reason, nrels, nleaves)
 }
+
+// traceSeamSpine is the record of a statement the seam ADMITTED only in part:
+// M0127-P5.9-s searched the inner prefix of a chain and left `nspine` pinned
+// outer links above it, so the search's own trace block below covers `nprefix` of
+// the statement's `nrels` relations and is complete about nothing else.
+//
+// Without this line the two numbers are indistinguishable in a log — a
+// `levels=1..9` block on an eleven-relation query reads as an enumerator that
+// gave up at nine, which is the same ambiguity `traceSeamDecline` exists to
+// remove one step earlier.
+func traceSeamSpine(nspine, nrels, nprefix int) {
+	if !dpTraceEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s seam-spine nspine=%d nrels=%d nprefix=%d\n",
+		traceTag, nspine, nrels, nprefix)
+}

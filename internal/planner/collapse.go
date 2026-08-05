@@ -163,6 +163,11 @@ type joinlistItem struct {
 	rel int
 	// sub is the subproblem when this item is a sub-joinlist; nil for a leaf.
 	sub joinlist
+	// jointype is the JOIN node that PINNED this item's two members, and it is
+	// meaningful only on the item `pinnedItem` builds — see `pinnedOuter` for
+	// why the zero value (`parser.JoinInner`) is the safe default everywhere
+	// else. M0127-P5.9-s.
+	jointype parser.JoinType
 }
 
 // joinlist is `make_rel_from_joinlist`'s input: items to be joined in an order
@@ -173,6 +178,66 @@ type joinlist []joinlistItem
 func leafItem(rel int) joinlistItem     { return joinlistItem{rel: rel} }
 func subItem(sub joinlist) joinlistItem { return joinlistItem{rel: -1, sub: sub} }
 func (it joinlistItem) isLeaf() bool    { return it.sub == nil }
+
+// pinnedItem is `combineJoinlists`' pinned arm as a value: the ONE item a pinned
+// JOIN node contributes, carrying the type of the node that pinned it.
+//
+// M0127-P5.9-s added the type, and it is a correctness device rather than
+// bookkeeping. Without it `makeRelFromJoinlist` sees only "a subproblem with two
+// members" and searches it — which for an INNER pin is right (the two orders
+// compute the same rows, so pinning restricts the PATHS and nothing else) and
+// for an OUTER pin is a WRONG ANSWER: the search builds inner joins, so a
+// `LEFT JOIN` would come back planned as an `INNER JOIN` with its unmatched left
+// rows silently dropped. No corpus query reached that shape, but only because
+// the seam declined every chain containing an outer link at all (09 §3.19) — an
+// accident standing in for an invariant. With the type on the item, the consumer
+// states the invariant itself.
+func pinnedItem(t parser.JoinType, left, right joinlist) joinlistItem {
+	return joinlistItem{rel: -1, jointype: t, sub: joinlist{subItem(left), subItem(right)}}
+}
+
+// pinnedOuter reports whether this item is a pinned join the search cannot
+// rebuild: every type but INNER and CROSS, which is exactly the set `joinPinned`
+// pins unconditionally.
+//
+// The polarity is deliberate. `parser.JoinInner` is `JoinType`'s zero value, so
+// every item NOT built by `pinnedItem` — a leaf, a `from_collapse_limit`
+// sub-list, a flattened INNER chain — answers false without its producer having
+// to remember the field. The field exists to mark the shape that must be
+// REFUSED, and the direction a forgotten tag fails in is therefore "search a
+// subproblem whose rows are an inner join's", which is what the untagged item
+// already is.
+func (it joinlistItem) pinnedOuter() bool {
+	if it.isLeaf() {
+		return false
+	}
+	switch it.jointype {
+	case parser.JoinInner, parser.JoinCross:
+		return false
+	default:
+		return true
+	}
+}
+
+// joinTypeName renders a `parser.JoinType` for the one message that has to name
+// one: `makeRelFromJoinlist`'s refusal to plan a pinned outer join. Spelled here,
+// beside `pinnedOuter`, so the two stay in step if a join type is added.
+func joinTypeName(t parser.JoinType) string {
+	switch t {
+	case parser.JoinInner:
+		return "INNER"
+	case parser.JoinLeft:
+		return "LEFT"
+	case parser.JoinRight:
+		return "RIGHT"
+	case parser.JoinFull:
+		return "FULL"
+	case parser.JoinCross:
+		return "CROSS"
+	default:
+		return "unknown"
+	}
+}
 
 // nrels is the number of base relations at or below this joinlist — the size of
 // the search problem it describes, which is what 03 §7's `maxSearchRels`
@@ -201,6 +266,42 @@ func (jl joinlist) leaves(dst []int) []int {
 		dst = it.sub.leaves(dst)
 	}
 	return dst
+}
+
+// innerPrefixBelowOuterSpine splits a statement's joinlist into the INNER
+// PREFIX a search may plan and the pinned OUTER links stacked above it,
+// outermost first. `spine` is empty — and `prefix` is `jl` itself — when the
+// joinlist is not topped by a pinned outer join.
+//
+// M0127-P5.9-s. The shape it recognises is the one `deconstructFromItem` builds
+// for the corpus's every explicit-JOIN query: a left-deep chain whose INNER
+// links flatten into one subproblem and whose outer links each wrap that
+// subproblem in a two-member pin, so the joinlist nests exactly as deep as the
+// chain has outer links. Peeling them is what makes the prefix searchable while
+// the outer links keep the order they were written in — the same division
+// `runJoinSearchBelowPinned` (predp.go) already makes for the semi/anti spine
+// pre-DP unnesting pins, and for the same reason: goopg cannot yet infer the
+// `SpecialJoinInfo` ordering constraints that would let an outer join enter the
+// search legally (03 §4.4), so the choice is "search what is below it" or
+// "search nothing", and before this the answer was nothing.
+//
+// A pin whose sub is not `pinnedItem`'s two-member `[left, right]` shape is
+// declined rather than interpreted: which member is the left side is the whole
+// question here, and guessing it wrong swaps the join's sides.
+func (jl joinlist) innerPrefixBelowOuterSpine() (prefix joinlist, spine []parser.JoinType) {
+	cur := jl
+	for len(cur) == 1 && cur[0].pinnedOuter() {
+		sub := cur[0].sub
+		if len(sub) != 2 || sub[0].isLeaf() {
+			return jl, nil
+		}
+		spine = append(spine, cur[0].jointype)
+		cur = sub[0].sub
+	}
+	if len(spine) == 0 {
+		return jl, nil
+	}
+	return cur, spine
 }
 
 // deconstructJointree computes the joinlist for a whole FROM clause: upstream's
@@ -283,7 +384,7 @@ func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits,
 	for _, j := range item.Joins {
 		right := joinlist{leafItem(next)}
 		next++
-		left = combineJoinlists(joinPinned(j.Type, collapseJoins), left, right, lim.joinCollapseLimit)
+		left = combineJoinlists(j.Type, joinPinned(j.Type, collapseJoins), left, right, lim.joinCollapseLimit)
 	}
 	return left
 }
@@ -313,7 +414,7 @@ func joinPinned(t parser.JoinType, collapseJoins bool) bool {
 // combineJoinlists is the tail of `deconstruct_recurse`'s `JoinExpr` arm
 // (initsplan.c:1410-1441): fold the two sides together unless the node forces
 // its order or `join_collapse_limit` forbids it.
-func combineJoinlists(pinned bool, left, right joinlist, joinCollapseLimit int) joinlist {
+func combineJoinlists(t parser.JoinType, pinned bool, left, right joinlist, joinCollapseLimit int) joinlist {
 	if pinned {
 		// `joinlist = list_make1(list_make2(leftjoinlist, rightjoinlist))`
 		// (initsplan.c:1417). One item — so the enclosing FromExpr sees
@@ -326,7 +427,12 @@ func combineJoinlists(pinned bool, left, right joinlist, joinCollapseLimit int) 
 		// (allpaths.c:3391), so the extra level is inert. Kept verbatim
 		// rather than normalised, because a joinlist that differs from
 		// upstream's only by nesting depth is one nobody can diff.
-		return joinlist{subItem(joinlist{subItem(left), subItem(right)})}
+		//
+		// M0127-P5.9-s: the item carries `t`. Upstream needs no such tag —
+		// its joinlist member is the `JoinExpr` itself, which HAS a
+		// `jointype` — and goopg's did not because its only consumer
+		// searched every subproblem alike. See `pinnedItem`.
+		return joinlist{pinnedItem(t, left, right)}
 	}
 	if len(left)+len(right) <= joinCollapseLimit {
 		out := make(joinlist, 0, len(left)+len(right))

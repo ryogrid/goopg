@@ -8178,23 +8178,60 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       an outer link would plan a LEFT JOIN as an INNER JOIN — the leaf-count
       decline is what stands between that and a wrong answer. Successor:
       **M0127-P5.9-s**. 2 ledger rows.
-- [ ] **M0127-P5.9-s — the joinlist carries no join TYPE, so an outer link
-      cannot enter the search and the whole statement is declined.** NEW
-      2026-08-06 (09 §3.19, ledger row P5.9-r). `joinPinned` (collapse.go)
-      correctly wraps an outer join into its own two-member subproblem, but
-      `makeRelFromJoinlist` (`relfromjoinlist.go`) has no type to rebuild it
-      with, so the seam's leaf-count decline is the only thing preventing a LEFT
-      JOIN from being planned as an INNER JOIN. Every explicit-JOIN query in
-      both corpora is topped by an outer link, so this — not the INNER walk —
-      is what keeps goopg from reordering any real `JOIN … ON` clause.
-      Smaller half first: add `joinlistItem.jointype` and search the INNER
-      PREFIX below the pinned outer spine, splicing the outer links back above
-      it, exactly as `runJoinSearchBelowPinned` (`internal/planner/predp.go:73`)
-      already does for the semi/anti spine. Larger half is 03 §4.4's
-      `SpecialJoinInfo` inference (real outer-join reordering). Files:
-      `internal/planner/collapse.go`, `relfromjoinlist.go`, `joinsearchseam.go`.
-      Bar: the full 09 §3 bar — this changes which quals are enforced where AND
-      which rows survive; then re-run 09 §3.19's protocol and re-decide COLLAPSE.
+- [x] **M0127-P5.9-s — the joinlist carries no join TYPE, so an outer link
+      cannot enter the search and the whole statement is declined.** **DONE
+      2026-08-06 — the peel landed and the corpus MOVED for the first time in
+      this milestone** (09 §3.20, 2 ledger rows). Two halves. Joinlist:
+      `joinlistItem.jointype` + `pinnedItem` + `pinnedOuter` +
+      `innerPrefixBelowOuterSpine` (collapse.go), and
+      `makeRelFromJoinlist` now REFUSES a pinned outer subproblem outright
+      (`TestSearchRefusesToPlanAPinnedOuterJoin`) — turning the leaf-count
+      decline from an accident into an invariant. Seam: `splitOuterSpine` /
+      `spineLinkSearchable` peel the pinned outer links off the TOP of the
+      chain, the search plans the INNER PREFIX below them, and the links are
+      spliced back unchanged — the division `runJoinSearchBelowPinned`
+      (predp.go) makes for the semi/anti spine. **Only LEFT may be peeled**: the
+      prefix is the link's left side and the seam pushes conjuncts INTO it, so
+      RIGHT/FULL (nullable left side) are declined, as is an outer link buried
+      below an inner one (Q78) — both ledgered. New `DPTRACE seam-spine`.
+      Measured: `TestCorpusQueriesWithASearchableInnerPrefix` pins the corpus
+      population at **{72,75}**, up from 0; DS05 SF0.5 `PASS=95 (57 ck)
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` (cells identical),
+      `STATUS-DELTA verdict-changes=none runtime-moves=1` with **Q72
+      163s→70s**, plan channel `same=97 changed=2` on exactly {Q72,Q75};
+      `tpch-spotcheck` Q12=2 Q13=35 PASS. **The moved plan paid for an executor
+      bug that predates it:** Q72 first ERRORed with `operator + requires
+      integer operands`, because `encodeDatum` (`internal/executor/spill.go`)
+      never wrote a `KindTime` datum's `Flags` byte — every DATE through a
+      hash-join spill came back a bare timestamp. Not the peel (the INNER-only
+      spelling failed identically, and `work_mem='2GB'` answered correctly).
+      Fixed in both halves of the pair, with `flagBigNumeric` deliberately not
+      carried; the flag-vs-type carrier gap is ledgered. Successors below.
+- [ ] **M0127-P5.9-t — a RIGHT JOIN reaches the planner as itself, so its
+      spine cannot be peeled.** NEW 2026-08-06 (09 §3.20, ledger row P5.9-s).
+      `spineLinkSearchable` (joinsearchseam.go) admits `JoinTypeLeft` alone,
+      because the peeled link's LEFT side is what the search plans and what the
+      seam pushes conjuncts into — for RIGHT that side is the NULLABLE one, so
+      the push would turn `WHERE a.x IS NULL` from a test on null-extended rows
+      into a test on `a`'s own rows. PG never sees the case: `reduce_outer_joins`
+      (postgres/src/backend/optimizer/prep/prepjointree.c) rewrites a RIGHT into
+      a LEFT with swapped sides before planning. Port that pass, then widen
+      `spineLinkSearchable`; FULL stays out (both sides nullable). Files:
+      `internal/planner/collapse.go`, `joinsearchseam.go`, a new prep pass.
+      Bar: the full 09 §3 bar — it changes which rows survive.
+- [ ] **M0127-P5.9-u — `Datum.Flags` is a serialization contract nobody
+      declared.** NEW 2026-08-06 (09 §3.20, ledger row P5.9-s). goopg carries the
+      DATE/TIMESTAMP distinction in a per-value FLAG rather than a type, so every
+      serializer must remember it — PG cannot have this bug, because a tuple
+      travels with its `TupleDesc`. The spill pair now carries `flagDate`, but the
+      NEXT flag bit will be lost the same silent way (a spilled date still
+      COMPARED correctly, which is why `TestSpillRoundTrip` was green for so
+      long). Give `KindTime` a structural DATE/TIMESTAMP/TIMESTAMPTZ
+      discriminator and audit `Datum.Flags` for any other bit whose loss is
+      silent. Files: `internal/executor/datum.go`, `codec.go` (the `KindDate`
+      carrier gap noted at codec.go:1100, M0003 / 0003-0013), `spill.go`.
+      Bar: full units + the regress-port suite (Hard-won Rule #5 — this is a
+      Datum-layout change).
 - [x] **M0127-P5.9-r — SUPERSEDED FILING (kept for attribution).** NEW 2026-08-06 (09 §3.18, ledger row P5.9-m).
       `extractScans` (`internal/planner/bushy.go:261`) descends `JoinTypeCross`
       and nothing else, so `tryPGShapedJoinSearch` declines every FROM clause

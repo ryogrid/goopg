@@ -318,6 +318,110 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 		total, len(unparsed), unparsed, got)
 }
 
+// levelHasSearchableInnerPrefix reports whether any query level of sql presents
+// the shape M0127-P5.9-s peels: a joinlist topped by pinned LEFT links with at
+// least two relations below them.
+//
+// It is the production predicate, not a paraphrase — `deconstructJointree` and
+// `innerPrefixBelowOuterSpine` are the same calls the seam makes, at the same
+// flag value — because P5.9-m's whole lesson was that a corpus measurement
+// re-derived from the SQL text answers a different question than the planner
+// does (the `72,75` note above: `grep -c ' join '` finds three eligible queries
+// where `deconstructJointree` finds two).
+//
+// The plan-tree half of the seam's check (`splitOuterSpine`) is not modelled: it
+// can only DECLINE what this admits, so the count below is an upper bound on the
+// corpus population, and it is labelled as one.
+func levelHasSearchableInnerPrefix(sql string, collapseJoins bool) (bool, error) {
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return false, err
+	}
+	for _, st := range stmts {
+		for _, sel := range selectLevels(st) {
+			if len(sel.FromExprs) == 0 {
+				continue
+			}
+			jl := deconstructJointree(sel.FromExprs, defaultCollapseLimits(), collapseJoins)
+			prefix, spine := jl.innerPrefixBelowOuterSpine()
+			if len(spine) == 0 || prefix.nrels() < 2 {
+				continue
+			}
+			allLeft := true
+			for _, t := range spine {
+				if t != parser.JoinLeft {
+					allLeft = false
+					break
+				}
+			}
+			if allLeft {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// TestCorpusQueriesWithASearchableInnerPrefix is P5.9-s's counterpart to
+// `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above, and it is the fact that
+// distinguishes this task from P5.9-r: the INNER walk reached zero corpus
+// queries, and the peel does not.
+//
+// The set is PINNED rather than merely logged, for the reason the collapse-
+// eligible set above is: it is the blast radius of the DS05 plan channel. If a
+// query enters or leaves it, the number of plans the arm can move changed, and
+// the acceptance bar's "same=99" needs re-reading rather than re-quoting.
+//
+// Measured at collapse ON, because that is the regime in which an inner prefix
+// flattens into one searchable problem. With collapse OFF each inner link is
+// itself pinned, so the prefix is a two-member subproblem whose order is forced
+// and only its PATHS are searched — reachable, but not reorderable.
+func TestCorpusQueriesWithASearchableInnerPrefix(t *testing.T) {
+	entries, err := os.ReadDir(tpcdsCorpusDir)
+	if err != nil {
+		t.Skipf("TPC-DS corpus not present (%v)", err)
+	}
+	nameRE := regexp.MustCompile(`^query([0-9]+)\.sql$`)
+	var peelable []int
+	total := 0
+	for _, e := range entries {
+		m := nameRE.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		qn, _ := strconv.Atoi(m[1])
+		sql, err := os.ReadFile(filepath.Join(tpcdsCorpusDir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		total++
+		ok, perr := levelHasSearchableInnerPrefix(string(sql), true)
+		if perr != nil {
+			continue
+		}
+		if ok {
+			peelable = append(peelable, qn)
+		}
+	}
+	sort.Ints(peelable)
+	// The same two queries the COLLAPSE arm is eligible on, and for the same
+	// reason: `deconstructJointree` is what decides both, so a chain it pins
+	// into one opaque item (Q78's `A LEFT JOIN B … JOIN date_dim …`, where the
+	// outer link sits BELOW an inner one) is out of reach of the peel as well —
+	// lifting it needs 03 §4.4's `SpecialJoinInfo` inference, not a spine walk.
+	// Zero before this task, so the corpus population went 0 -> 2.
+	const want = "72,75"
+	if got := sprintInts(peelable); got != want {
+		t.Errorf("TPC-DS queries with a searchable INNER prefix below a LEFT spine = {%s}, "+
+			"want {%s} (of %d).\nThis is the DS05 plan channel's blast radius for the peel; "+
+			"if it changed, re-run 09 §3.19's protocol rather than re-quoting its numbers.",
+			got, want, total)
+	}
+	t.Logf("TPC-DS corpus: %d queries, %d with a peelable LEFT spine over a >=2-relation "+
+		"inner prefix (upper bound: the plan-tree half of the check can still decline)",
+		total, len(peelable))
+}
+
 // chainIsInnerOnly reports whether EVERY explicit `JOIN` in this statement's
 // FROM clauses is INNER or CROSS — the property `extractSearchLeaves`
 // (joinsearchseam.go) needs to flatten a chain, since the walk stops at an outer
@@ -363,12 +467,19 @@ func chainIsInnerOnly(sql string) (innerOnly bool, err error) {
 //
 // So the corpus contains NO statement this walk can act on, and the collapse
 // flip stays a no-go for a NEW reason — one level deeper than P5.9-m's. The
-// remaining blocker is that `joinlistItem` (collapse.go) carries no join TYPE:
+// remaining blocker was that `joinlistItem` (collapse.go) carried no join TYPE:
 // `joinPinned` correctly wraps an outer join into its own two-member
 // subproblem, but nothing downstream could rebuild it AS an outer join, so
 // admitting one would silently plan a LEFT JOIN as an INNER JOIN. The leaf-count
-// decline is what stands between that latent shape and a wrong answer today,
-// which is why P5.9-r kept it rather than widening the walk further.
+// decline was what stood between that latent shape and a wrong answer, which is
+// why P5.9-r kept it rather than widening the walk further.
+//
+// M0127-P5.9-s closed that: the item carries its type, `makeRelFromJoinlist`
+// REFUSES a pinned outer subproblem outright, and the seam peels a LEFT spine off
+// the top and searches the inner prefix below it. This test's own claim is
+// unchanged and still true — no corpus query is INNER-only — but it is no longer
+// the reason the corpus cannot move: `TestCorpusQueriesWithASearchableInnerPrefix`
+// measures the population that CAN, and it is {72,75} rather than empty.
 //
 // This test fails the day a corpus query is written INNER-only — which is the
 // day a corpus measurement can move, and therefore the day 09 §3.18's protocol

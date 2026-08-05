@@ -225,9 +225,28 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 			r   joinlistRel
 			err error
 		)
-		if it.isLeaf() {
+		switch {
+		case it.isLeaf():
 			r, err = prob.leafRel(it.rel)
-		} else {
+		case it.pinnedOuter():
+			// M0127-P5.9-s: the search builds INNER joins, so planning a pinned
+			// outer subproblem would emit an inner join where the statement wrote
+			// an outer one and drop its unmatched rows. Upstream cannot reach
+			// this: its joinlist member IS the `JoinExpr`, and
+			// `make_rel_from_joinlist` hands a pinned one to
+			// `make_join_rel`/`join_is_legal`, which honour `jointype`.
+			//
+			// Refusing here is a decline of the whole statement, not of this
+			// item — `planJoinlistSearch`'s error makes the seam fall back to
+			// the syntactic tree (03 §4.2), which still carries the outer join
+			// on its own node. The seam peels an outer SPINE off before it gets
+			// here (`splitOuterSpine`, joinsearchseam.go), so what reaches this
+			// arm is an outer join the peel could not lift out: one below an
+			// inner link, or on a non-first comma FROM item.
+			return joinlistRel{}, fmt.Errorf(
+				"join search: joinlist item %d is a pinned %s join, which the search cannot rebuild",
+				i, joinTypeName(it.jointype))
+		default:
 			r, err = makeRelFromJoinlist(it.sub, prob, 0)
 		}
 		if err != nil {

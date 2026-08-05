@@ -3139,3 +3139,100 @@ still run-but-NOT-discharged.** §3.18's no-go stands; its stated cause does not
 The protocol to re-run is this section, and the signal to re-run it is
 `TestNoCorpusQueryHasAnInnerOnlyJoinChain` going red — the day a measurable
 query exists — or the outer-link successor landing, whichever comes first.
+
+### 3.20 The outer spine is peeled, the corpus moves for the first time, and the query that moved found a spill bug (P5.9-s, 2026-08-06)
+
+§3.19 ended with the seam able to walk an INNER chain and a corpus containing
+none: all twelve TPC-DS queries that spell an explicit JOIN are topped by an
+outer link, so the walk stopped at the first one and the statement fell back to
+the syntactic shape. This section is the successor it filed, and it is the first
+entry in this chapter where **a corpus plan actually changed with every result
+held identical**.
+
+**What landed, in two halves.** The joinlist half: `joinlistItem` carries a
+`jointype`, set by the new `pinnedItem` constructor, and `makeRelFromJoinlist`
+now REFUSES a pinned outer subproblem outright
+(`TestSearchRefusesToPlanAPinnedOuterJoin`). That converts §3.19's blocker from
+an accident into an invariant — the leaf-count decline was the only thing
+standing between a `LEFT JOIN` and a plan that dropped its unmatched left rows,
+and a decline is not a guard, it is a shape that happened not to arrive. The
+seam half: `splitOuterSpine` (`internal/planner/joinsearchseam.go`) peels the
+pinned outer links off the TOP of the chain, the search plans the INNER PREFIX
+below them, and the links are spliced back above the searched subtree
+unchanged — the same division `runJoinSearchBelowPinned` (`predp.go`) already
+makes for the semi/anti spine, for the same reason (goopg cannot yet infer 03
+§4.4's `SpecialJoinInfo` ordering constraints, so the choice is "search what is
+below it" or "search nothing", and until now it was nothing).
+
+**Only LEFT may be peeled, and that bound is the whole correctness argument.**
+The prefix is the peeled link's LEFT side, and the seam does not merely reorder
+it: single-relation conjuncts are attached to prefix leaves and spanning ones are
+placed by the search INSIDE the prefix — i.e. BELOW the outer join. For a LEFT
+JOIN the left side is the non-nullable one and that is exactly what upstream
+does (`check_outerjoin_delay`, `initsplan.c`, delays a qual only when its relids
+reach the NULLABLE side). For RIGHT the nullable side IS the left one, so the
+same push would turn `WHERE a.x IS NULL` from a test on null-extended rows into
+a test on `a`'s own rows; FULL nullifies both sides. Both are declined
+(`TestPGShapedSeamDeclinesANonLeftSpine`), as is an outer link buried BELOW an
+inner one (Q78's `A LEFT JOIN B … JOIN date_dim …` shape) and a one-relation
+prefix. The splice itself preserves nothing but the left side's column layout,
+which is why a LATERAL spine link is declined rather than reasoned about.
+
+**New instrument: `DPTRACE seam-spine nspine=… nrels=… nprefix=…`.** A search
+block covering nine of a statement's eleven relations otherwise reads, in a log,
+as an enumerator that gave up at nine — the same ambiguity `seam-decline` was
+added to remove one step earlier (§3.19).
+
+**The measurement.** `TestCorpusQueriesWithASearchableInnerPrefix` runs the
+production producer over the corpus and pins the population at **{72, 75}** — the
+same two queries the COLLAPSE arm is eligible on, because `deconstructJointree`
+decides both. Zero before this task, so the corpus population went **0 → 2**. The
+DS05 SF0.5 gate then measured it end to end:
+
+| channel | reading |
+|---|---|
+| results | `PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` — cells identical to the baseline |
+| status-delta | `verdict-changes=none runtime-moves=1` — **Q72 163s → 70s (2.3× faster)** |
+| plan-shape | `queries=99 same=97 changed=2` — exactly Q72 and Q75, the predicted set |
+| TPC-H | `tpch-spotcheck` Q12=2 Q13=35 PASS |
+
+Report: `sweep-20260806-062915.txt`. Q72's searched prefix is nine relations
+under two `left outer join`s, visible in its EXPLAIN as a hash-join cascade below
+two `Nested Loop (LEFT)` nodes.
+
+**The bug the moved plan found, and why nothing else could have found it.**
+Q72 first came back `ERROR: operator + requires integer operands` from
+`d3.d_date > d1.d_date + 5`. It was NOT the peel: the same query spelled without
+its outer links — a shape §3.19's walk already searched — failed identically,
+and `GOOPG_PGSHAPED_DP=0` answered correctly. `work_mem = '2GB'` also answered
+correctly, which named the cause: **`encodeDatum` (`internal/executor/spill.go`)
+wrote a `KindTime` datum's value and never its `Flags` byte**, so every DATE that
+went through a hash-join batch spill came back a bare timestamp. `flagDate` is
+what `date + integer` (upstream `date_pli`), `Format()`'s MDY rendering and the
+`date`-typed cast arms dispatch on, and a spilled row is read back as a bare
+`Row` with no column types in reach — nothing downstream could re-derive it.
+
+The reason it survived this long is the shape of its symptom: a COMPARISON of two
+spilled dates still works, because `Int` survives intact and only the TYPE is
+forgotten. `TestSpillRoundTrip` compared values and reported success on a datum
+that had lost half its meaning. `TestSpillPreservesTheDateDiscriminator` asserts
+the flag, not just the value, on an ordinary date and on both `±infinity`
+sentinels (whose carrier IS `KindTime + flagDate`); its sibling
+`TestSpillDoesNotForgeANumericRepresentation` pins the other direction, since
+`flagBigNumeric` describes a representation the decoder re-establishes for itself
+and must NOT be carried back. Both directions of the encode/decode pair changed
+together, and there is exactly one such pair — every spill consumer (hash-join
+batches, external sort, `drainRowsBounded`) goes through it.
+
+So the join-search work paid for an executor defect that predates it: reaching a
+new plan shape is also a probe of the operators that shape reaches.
+
+**Verdict: `pgShapedCollapse` stays default OFF.** The peel is orthogonal to it —
+it fires with collapse ON or OFF, because an outer pin is unconditional
+(`joinPinned`) — and the flip's own gate still has a corpus of two eligible
+queries. What has changed is that the collapse arm is no longer a control over an
+empty population: {72, 75} now reach the search whichever way the flag is set, so
+the next re-run of §3.18's protocol is measuring a real difference for the first
+time. The remaining reorderability gap is 03 §4.4's `SpecialJoinInfo` inference —
+an outer join that must be *reordered* rather than *pinned above a searched
+prefix* — which is where Q78's buried outer link lives.
