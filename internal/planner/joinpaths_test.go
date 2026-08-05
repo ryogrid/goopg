@@ -193,6 +193,13 @@ func TestAddPathsToJoinrel_NestLoopCarriesEveryClauseAsResidual(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
 	outer, inner := scanRel(a, 100, 2), scanRel(b, 50, 1)
 	joinrel := newRelOptInfo(a|b, 500, 64)
+	// This pair also produces a hash path, whose total cost beats the nested
+	// loop's by an order of magnitude while its startup cost is worse (it has
+	// to build the table first). Since M0127-P5.7-b that is a path add_path
+	// KEEPS only under a tuple fraction — `consider_startup` — so the fast-start
+	// regime is what this generation test has to observe in. The claim under
+	// test is qual PLACEMENT on the loop, not whether the tournament retains it.
+	joinrel.ConsiderStartup = true
 	clauses := []*restrictInfo{equiClause(a, b), plainClause(a | b)}
 	if err := addPathsToJoinrel(joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)

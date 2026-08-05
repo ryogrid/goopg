@@ -7897,16 +7897,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       skip: both `hashJoinCost` callers are behind OFF-by-default gates
       (`costDrivenJoinOrder`, and the PG-shaped DP, which has no `planSelect`
       caller at all), so the default arm has zero *reachable* plan movement.
-- [ ] **M0127-P5.7-b — the LIMIT fraction: nothing SELECTS on startup cost.**
-      P5.7-a made `hashJoinCost`'s Startup and Total move independently and for
-      the right reason, but the split buys nothing until a LIMIT can choose on
-      it. PG's `grouping_planner` (planner.c) turns a LIMIT into a
-      `tuple_fraction` and asks `get_cheapest_fractional_path` which path wins
-      at that fraction; goopg computes `RelOptInfo.CheapestStartup`
-      (`setCheapest`, path.go) and never reads it. Resume: thread a
-      `tuple_fraction` from the `*Limit` above the join into path selection.
-      IMPLEMENTATION-TODO P5.7-b; 04 §4.1. Bar: UNITS + PLAN (default arm ZERO
-      diffs) + at least one LIMIT-over-join query whose chosen path moves.
+- [x] **M0127-P5.7-b — the LIMIT fraction: nothing SELECTED on startup cost.**
+      DONE 2026-08-05. `internal/planner/tuplefraction.go` ports
+      `preprocess_limit` (planner.c:2577) → `get_cheapest_fractional_path`
+      (planner.c:6617) → `compare_fractional_path_costs` (pathnode.c:127).
+      `preprocessLimit` derives PG's `tuple_fraction` from the `*Limit` above
+      the join, `searchCtx.tupleFraction` carries it, and the new
+      `searchCtx.finalPath()` — upstream's
+      `best_path = get_cheapest_fractional_path(final_rel, root->tuple_fraction)`
+      (planner.c:437) — is now the only value a caller may hand
+      `createPlanAtSearchRoot`, because reading `finalRel().CheapestTotal`
+      directly discards the fraction silently.
+      **The finding: the fraction is TWO mechanisms and only the pair moves a
+      plan.** Beside selection there is RETENTION — the new
+      `RelOptInfo.ConsiderStartup` (`consider_startup`, relnode.c:211/707, set
+      from `tuple_fraction > 0` on every rel the search creates) enforced in
+      `comparePathCostsFuzzily`'s two "different" arms, which is where upstream
+      puts it (pathnode.c:178-183): a total-cost loser may not survive on good
+      startup cost alone unless a fraction will ever be asked for. Without it a
+      fractional selection has nothing to choose from. goopg had NEITHER half,
+      so it was wrong in both directions at once — it behaved as if
+      `consider_startup` were permanently true, keeping fast-start paths PG
+      prunes (a nested loop at total 183 beside a hash at 11.6, kept only for
+      its zero startup), and then always selected on total cost anyway. Three
+      existing tests were asserting on exactly such paths and now state the
+      fast-start regime they were really testing in.
+      Upstream's absolute/fractional overload is kept end to end:
+      `preprocessLimit` can only emit the absolute count (it knows the count,
+      not the result size), `getCheapestFractionalPath` converts it against
+      `CheapestTotal.rows` at the moment of use, and
+      `compareFractionalPathCosts` folds anything outside (0,1) back onto the
+      plain total-cost order so an unconverted count degrades to today's answer.
+      5 tests; acceptance is `TestLimitOverJoinMovesTheChosenPath` (a 10 000-row
+      joinrel offered hash startup 500/total 900 and loop startup 0/total 20 000
+      — crossing at ≈2.55% — chooses hash with no LIMIT and does not even retain
+      the loop, the loop under `LIMIT 100`, hash again under `LIMIT 5000`).
+      IMPLEMENTATION-TODO P5.7-b; 04 §4.3. **3 ledger rows** (no
+      `estimate_expression_value` const-fold on the LIMIT expression, so
+      `LIMIT 5+5` / `LIMIT $1` take the 10% punt; `consider_param_startup`
+      unreachable behind 03 §4.4's pin; no production PRODUCER of a fraction
+      yet). Bar met: UNITS. PLAN not applicable for the same structural reason
+      as P5.7-a — every consumer is behind an OFF-by-default gate
+      (`GOOPG_PGSHAPED_DP`, and the search has no `planSelect` caller at all),
+      so the default arm has zero reachable plan movement.
 - [ ] **M0127-P5.8 — collapse limits with PG's actual semantics** (03 §6: flat
       comma lists are always ONE problem; limits govern sub-joinlists and
       explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening

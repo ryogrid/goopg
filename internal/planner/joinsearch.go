@@ -76,6 +76,20 @@ type searchCtx struct {
 	// cp is the cost currency every path in this search is priced in (04 §1).
 	cp costParams
 
+	// tupleFraction is PG's `root->tuple_fraction` (pathnodes.h:341): how much
+	// of the result will actually be fetched, in upstream's overloaded
+	// encoding — 0 for all rows, (0,1) for a fraction, >= 1 for an absolute
+	// count. `preprocessLimit` (tuplefraction.go) derives it from the `*Limit`
+	// above the join and `buildInitialRels` records it here.
+	//
+	// It is on the CONTEXT rather than on each rel because it is a property of
+	// the query, not of a relation: every rel the search creates copies it into
+	// its own `ConsiderStartup`, exactly as `build_simple_rel` /
+	// `build_join_rel` do (relnode.c:211/707), and `finalPath` reads it once at
+	// the root. Zero is the "fetch everything" default, which is the regime
+	// every search ran in before M0127-P5.7-b.
+	tupleFraction float64
+
 	// relInfos is the per-initial-rel estimate `buildInitialRels` was handed,
 	// kept because the parameterised index paths of P5.4b-ii-a need each base
 	// rel's `catalog.Table` and cannot be built until the clause list exists
@@ -177,6 +191,35 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 	}
 }
 
+// finalPath is the path the search CHOSE: `standard_planner`'s
+// `best_path = get_cheapest_fractional_path(final_rel, root->tuple_fraction)`
+// (planner.c:437), and the one value a caller may hand
+// `createPlanAtSearchRoot`.
+//
+// It exists as a method rather than leaving the caller to read
+// `finalRel().CheapestTotal` because those two are not the same path under a
+// LIMIT, and the difference is the whole of M0127-P5.7-b: with a fraction in
+// play the cheapest way to produce ALL the rows is not the cheapest way to
+// produce the first ten. Reading CheapestTotal directly would silently discard
+// the fraction, so the search publishes the answer instead of the ingredients.
+//
+// With no LIMIT (`tupleFraction == 0`) this returns `CheapestTotal` exactly,
+// which is what every caller would have got before.
+func (s *searchCtx) finalPath() (*Path, error) {
+	rel, err := s.finalRel()
+	if err != nil {
+		return nil, err
+	}
+	p := getCheapestFractionalPath(rel, s.tupleFraction)
+	if p == nil {
+		// setCheapest leaves every slot nil only for an empty pathlist, which
+		// joinSearch already rejects per level; reaching here means the final
+		// rel was assembled outside that path.
+		return nil, fmt.Errorf("join search: final rel %#04x has no cheapest path", uint16(rel.Relids))
+	}
+	return p, nil
+}
+
 // buildInitialRels populates level 1: one RelOptInfo per FROM item, each with
 // its cardinality and one costed path. `bindings`, `scans` and `relInfos` are
 // the three parallel per-FROM-item slices the existing pipeline already
@@ -207,7 +250,13 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 // (allpaths.c:191) likewise runs only once `deconstruct_jointree` has produced
 // the `joininfo` lists `create_index_paths` reads. Real UNPARAMETERISED
 // per-index path generation is still P5.4's and still ledgered as deferred.
-func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams) (*searchCtx, error) {
+// `tupleFraction` is the query's `root->tuple_fraction` (see searchCtx), and it
+// is a PARAMETER rather than something set afterwards because PG fixes it in
+// `subquery_planner` before any rel exists: `build_simple_rel` reads it while
+// constructing the rel (relnode.c:211), and a flag that arrived after the first
+// `addPath` would have let one dominance decision be taken in the wrong regime.
+// Pass 0 for "fetch all rows", which is every caller that has no LIMIT.
+func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams, tupleFraction float64) (*searchCtx, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("join search: empty FROM list")
 	}
@@ -220,6 +269,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		return nil, err
 	}
 	s.relInfos = relInfos
+	s.tupleFraction = tupleFraction
 	for i := range bindings {
 		leaf := scans[i]
 		if leaf == nil {
@@ -231,6 +281,10 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// The column count the hash geometry is solved for, from the same
 		// schema the executor will call len() on (M0127-P5.7-a).
 		rel.NCols = len(leaf.Output())
+		// `rel->consider_startup = (root->tuple_fraction > 0)`
+		// (relnode.c:211): a fast start is worth keeping paths for exactly when
+		// something will ask for a fraction (M0127-P5.7-b).
+		rel.ConsiderStartup = s.tupleFraction > 0
 		// The leaf is recorded on the rel as well as inside the PathPrebuilt
 		// below, because two different consumers need it two different ways:
 		// createPlan's PathPrebuilt arm returns the node it wrapped, while the

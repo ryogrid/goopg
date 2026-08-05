@@ -331,6 +331,11 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).
 		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
+		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
+		// (relnode.c:707) — the same query-wide fact every base rel copied in
+		// `buildInitialRels`, not something inherited from the inputs
+		// (M0127-P5.7-b).
+		joinrel.ConsiderStartup = s.tupleFraction > 0
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

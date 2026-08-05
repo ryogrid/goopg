@@ -1194,11 +1194,31 @@
   and the PG-shaped DP, which has no `planSelect` caller at all), so the default
   arm has zero reachable plan movement.
   [04](04-cost-and-cardinality.md) §4.1, [06](06-hash-spill-and-memory.md) §5.
-- [ ] **P5.7-b** Startup/Total split for LIMIT-over-join. `hashJoinCost` has
-  always returned both numbers and P5.7-a made them move independently, but
-  nothing SELECTS on startup: PG's `tuple_fraction` (`grouping_planner`,
-  planner.c) is what chooses `cheapest_startup` over `cheapest_total` under a
-  LIMIT, and goopg's `RelOptInfo.CheapestStartup` is computed and unread.
+- [x] **P5.7-b** Startup/Total split for LIMIT-over-join. *(DONE 2026-08-05.
+  `internal/planner/tuplefraction.go`: `preprocessLimit` (`preprocess_limit`,
+  planner.c:2577) derives PG's `tuple_fraction` from the `*Limit` above the
+  join, `searchCtx.tupleFraction` carries it, and `searchCtx.finalPath()` is
+  `get_cheapest_fractional_path` (planner.c:6617) over the final rel — the only
+  value a caller may hand `createPlanAtSearchRoot`, because reading
+  `CheapestTotal` discards the fraction. The finding: the fraction is TWO
+  mechanisms and only the pair moves a plan — selection, plus RETENTION through
+  the new `RelOptInfo.ConsiderStartup` (`consider_startup`, relnode.c:211/707)
+  enforced in `comparePathCostsFuzzily`'s two "different" arms (pathnode.c:
+  178-183). goopg had behaved as if `consider_startup` were permanently true,
+  keeping fast-start paths PG prunes, and then always selecting on total cost;
+  three existing tests were asserting on such paths and now state the fast-start
+  regime they meant. Absolute-vs-fractional overload kept: `preprocessLimit`
+  emits the absolute count, `getCheapestFractionalPath` converts it against
+  `CheapestTotal.rows`, and `compareFractionalPathCosts` folds anything outside
+  (0,1) onto the total-cost order. Acceptance:
+  `TestLimitOverJoinMovesTheChosenPath` — hash with no LIMIT, loop under
+  `LIMIT 100`, hash again under `LIMIT 5000`. 5 tests. Deferred (3 ledger rows):
+  no `estimate_expression_value` const-fold on the LIMIT expression,
+  `consider_param_startup` unreachable behind 03 §4.4's pin, and no production
+  producer of a fraction yet. Still inert — no `planSelect` call site,
+  `GOOPG_PGSHAPED_DP` OFF. Bar met: UNITS. PLAN not applicable for the same
+  structural reason as P5.7-a: every consumer is behind an OFF-by-default gate.)*
+  [04](04-cost-and-cardinality.md) §4.3.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
   flat comma lists are always ONE problem; limits govern sub-joinlists and
   explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening

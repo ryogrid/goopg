@@ -150,7 +150,7 @@ func TestBuildInitialRelsPopulatesLevelOne(t *testing.T) {
 		infos[i] = mkRelInfo(t, leaf, filtered[i])
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams())
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
 	if err != nil {
 		t.Fatalf("buildInitialRels: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestBuildInitialRelsAdmitsNonTableLeaves(t *testing.T) {
 		}
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams())
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
 	if err != nil {
 		t.Fatalf("buildInitialRels rejected a FROM list with non-table leaves: %v", err)
 	}
@@ -289,16 +289,16 @@ func TestBuildInitialRelsRejectsMalformedInput(t *testing.T) {
 	info := []baseRelInfo{mkRelInfo(t, leaf, 100)}
 	cp := defaultCostParams()
 
-	if _, err := buildInitialRels(nil, nil, nil, cp); err == nil {
+	if _, err := buildInitialRels(nil, nil, nil, cp, 0); err == nil {
 		t.Error("an empty FROM list was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp, 0); err == nil {
 		t.Error("a scan/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp, 0); err == nil {
 		t.Error("a relInfo/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{nil}, info, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{nil}, info, cp, 0); err == nil {
 		t.Error("a nil leaf node was accepted")
 	}
 }

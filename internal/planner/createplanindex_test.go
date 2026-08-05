@@ -329,6 +329,7 @@ func TestBuildInitialRelsRecordsBaseLeaf(t *testing.T) {
 		leaves,
 		[]baseRelInfo{{filteredRows: 10}, {filteredRows: 10}},
 		defaultCostParams(),
+		0,
 	)
 	if err != nil {
 		t.Fatal(err)

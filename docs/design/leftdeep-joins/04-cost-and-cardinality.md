@@ -293,7 +293,68 @@ untouched here: `hashJoinCost` has always returned both numbers and now moves
 them independently (the inner write is startup, the read-back is run), but
 nothing yet SELECTS on startup under a LIMIT. That needs PG's `tuple_fraction`
 plumbed into `grouping_planner`'s choice between `CheapestTotal` and
-`CheapestStartup`, and is filed as **M0127-P5.7-b**.
+`CheapestStartup`, and is §4.3 below (**M0127-P5.7-b**).
+
+### 4.3 The LIMIT fraction (M0127-P5.7-b)
+
+§4.1 made the two cost numbers move independently and for the right reason, and
+changed no plan, because **nothing in goopg selected on startup cost**.
+`setCheapest` had computed `RelOptInfo.CheapestStartup` since P5.2 and no line of
+production code read it. `internal/planner/tuplefraction.go` supplies the number
+that makes it selectable: PG's `tuple_fraction`, ported as `preprocessLimit`
+(`preprocess_limit`, planner.c:2577) → `getCheapestFractionalPath`
+(planner.c:6617) → `compareFractionalPathCosts` (pathnode.c:127).
+
+The finding is that the fraction is **two mechanisms, not one**, and only the
+pair changes a plan:
+
+1. **Selection.** `searchCtx.finalPath()` is upstream's
+   `best_path = get_cheapest_fractional_path(final_rel, root->tuple_fraction)`
+   (planner.c:437) and is now the only value a caller may hand
+   `createPlanAtSearchRoot`. Reading `finalRel().CheapestTotal` directly — what
+   a caller would otherwise have done — silently discards the fraction, so the
+   search publishes the answer rather than the ingredients.
+2. **Retention.** `RelOptInfo.ConsiderStartup` (`consider_startup`,
+   relnode.c:211/707, set from `tuple_fraction > 0` on every rel the search
+   creates) is enforced in `comparePathCostsFuzzily`'s two "different" arms,
+   which is where upstream puts it (pathnode.c:178-183): a path that loses on
+   total cost may not survive on good startup cost alone unless a fraction will
+   ever be asked for.
+
+Without (2), (1) has nothing to choose from — and goopg had neither, which is
+why its pathlists were not PG's in both directions at once. Before this change
+goopg behaved as if `consider_startup` were permanently TRUE and kept every
+fast-start path, then always selected by total cost; three existing unit tests
+were asserting on paths PG would have pruned (a nested loop at total 183 beside
+a hash at 11.6, kept only for its zero startup), and they now state the
+fast-start regime they were really testing in.
+
+`tuple_fraction` is overloaded on purpose, and the port keeps the overload: 0
+means all rows, (0,1) is a fraction, and `>= 1` is an absolute COUNT.
+`preprocessLimit` can only produce the absolute form (it knows the count, not
+the result size) and `getCheapestFractionalPath` converts it against
+`CheapestTotal.rows` at the moment of use, which is the first point both numbers
+are in hand. `compareFractionalPathCosts` folds anything outside (0,1) back onto
+the plain total-cost order, so an unconverted count degrades to today's answer
+instead of extrapolating the cost line past its endpoint.
+
+Acceptance is `TestLimitOverJoinMovesTheChosenPath`: a 10 000-row joinrel
+offered a hash-shaped path (startup 500, total 900) and a loop-shaped one
+(startup 0, total 20 000) — they cross at ≈2.55% — chooses the hash with no
+LIMIT (and does not even retain the loop), the loop under `LIMIT 100`, and the
+hash again under `LIMIT 5000`. The fraction is honoured, not merely the
+presence of a LIMIT.
+
+Deferred (3 ledger rows, 2026-08-05): the LIMIT expression is read as resolved
+rather than through `estimate_expression_value`, so `LIMIT 5 + 5` and a bound
+`LIMIT $1` take the 10% punt where PG folds them to a constant;
+`consider_param_startup` stays false because `set_base_rel_consider_startup`
+(allpaths.c:247) derives it from the `SpecialJoinInfo` list that 03 §4.4's pin
+keeps out of the search; and no production caller produces a fraction yet —
+`planSelect` does not call the search at all, and `cursor_tuple_fraction` /
+subquery-inherited fractions have no path to `preprocessLimit`'s caller
+argument, which is nonetheless ported whole so the absolute-vs-fractional
+heuristics are not reconstructed later from a simplified version.
 
 ## 5. Inferred edges: from admissibility penalty to selectivity honesty
 

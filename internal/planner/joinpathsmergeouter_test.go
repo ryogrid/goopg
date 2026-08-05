@@ -65,6 +65,13 @@ func TestMatchUnsortedOuterMerge_ConsumesOrderedOuterWithoutSorting(t *testing.T
 	outer := orderedPathRel(a, 100, ascKeys(10), 40)
 	inner := scanRel(b, 100, 10)
 	joinrel := newRelOptInfo(a|b, 100, 32)
+	// The ordered outer costs more than the cheapest one, so the merge built on
+	// it costs more in TOTAL than the sorted-outer merge with the same result
+	// ordering, and wins only on startup (it skips the sort). Since
+	// M0127-P5.7-b add_path keeps such a path only under a tuple fraction, so
+	// this arm is observed in the fast-start regime; what is under test is that
+	// the arm REACHES the ordered path at all.
+	joinrel.ConsiderStartup = true
 	ri := equiClauseOn(a, b, 10, 11)
 
 	if outer.CheapestTotal.Pathkeys != nil {
@@ -159,6 +166,10 @@ func TestGenerateMergejoinPaths_TruncationDemotesDroppedClauseToResidual(t *test
 	setCheapest(inner)
 
 	joinrel := newRelOptInfo(a|b, 100, 32)
+	// Same reason as claim 1: the truncated merge keeps a cheaper-startup,
+	// dearer-total shape, which add_path retains only under a tuple fraction
+	// (M0127-P5.7-b).
+	joinrel.ConsiderStartup = true
 	c1 := equiClauseOn(a, b, 10, 11)
 	c2 := equiClauseOn(a, b, 20, 21)
 	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
@@ -318,6 +329,10 @@ func TestGenerateMergejoinPaths_StrictlyCheaperRuleSuppressesAPointlessTruncatio
 	setCheapest(inner)
 
 	joinrel := newRelOptInfo(a|b, 100, 32)
+	// Same reason as claim 1: the truncated merge keeps a cheaper-startup,
+	// dearer-total shape, which add_path retains only under a tuple fraction
+	// (M0127-P5.7-b).
+	joinrel.ConsiderStartup = true
 	c1 := equiClauseOn(a, b, 10, 11)
 	c2 := equiClauseOn(a, b, 20, 21)
 	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
