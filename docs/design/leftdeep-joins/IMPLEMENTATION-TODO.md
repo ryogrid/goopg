@@ -1289,9 +1289,25 @@
   reaches none). Bar met: UNITS + SPOT (Q12 2 rows / Q13 35 rows). 3 ledger
   rows. Flag still OFF; the flag-off arm is byte-identical by construction (the
   seam declines on its first line and nothing else reads the new state).
-- [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
+- [x] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.
+  **↳ FLIPPED 2026-08-06 (09 §3.14).** `GOOPG_PGSHAPED_DP` defaults ON and
+  survives as a kill-switch (`=0` only); `GOOPG_COST_DRIVEN_JOINORDER`'s env
+  hook is retired. The evidence is run 4 (§3.10, five clauses) plus §3.13's
+  clause-6 measurement. What the flip cost inside the tree: 24 standing unit
+  tests that had been green through all four acceptance runs, every one of them
+  a legacy REWRITE-RULE assertion on a fixture with no statistics — the rules
+  do not read row counts, the search does. Four were a genuine harness gap
+  (`newDDLFixture` installed no block-count sizer, so 4 000 rows on disk planned
+  as one) and are fixed; the rest are pinned to the kill-switch arm with
+  searched-arm counterparts added. The production worry — a populated,
+  never-ANALYZEd relation planned blind into nested loops — was MEASURED on a
+  live server and does not occur: both arms size it from block counts and plan
+  the same hash join. Gates: full units, `tpch-spotcheck` PASS (Q12=2, Q13=35),
+  pgbench smoke. The DS05 arm could not run (nightly CI batch holds the host)
+  and the run-4 measurement of the same configuration stands in the interim.
+  3 ledger rows; the collapse-ON pass is filed separately.
   **Run 1 executed 2026-08-05 — DOCUMENTED NO-GO** (09 §3.1;
   `analysis/leftdeep-joins/2026-08-05-p59-s5-acceptance.txt`). Flag stays OFF;
   the item stays open because P5.9 is the flip. Clause 5 passed (zero

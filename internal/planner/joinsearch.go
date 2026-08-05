@@ -45,16 +45,54 @@ import (
 // bushy DP"), and which the P5.8 TODO line stated more loosely. M0127-P5.8.
 const maxSearchRels = 16
 
-// pgShapedDP gates the whole PG-shaped search (08 §2, S5). It is OFF by default
-// and stays OFF through every P5 task: each lands dark, and P5.9's acceptance
-// run is what flips it. The gate is read once at process start so a plan cannot
-// change shape mid-statement.
-var pgShapedDP = os.Getenv("GOOPG_PGSHAPED_DP") == "1"
+// pgShapedDP gates the whole PG-shaped search (08 §2, S5). **FLIPPED ON
+// 2026-08-06 by M0127-P5.9** — the acceptance event. Every P5 task landed dark
+// behind this gate; run 4 of the 09 §3 bar (2026-08-06, HEAD `9e0cfe67`) is the
+// first run in which nothing in the evidence is attributed to the flag —
+// clauses 1-5 PASS, and clause 6 was discharged by measurement two days later
+// (09 §3.13: both PG-only bushy partitions were OFFERED to `makeJoinRel` at
+// phase 2, so the search can express them and lost them on cost, which the §4
+// ratchet admits).
+//
+// The knob survives the flip as a KILL-SWITCH, not a soak switch: 08 §2's
+// rollback story for S5 is "flips `GOOPG_PGSHAPED_DP` OFF, restoring the
+// current `tryBushyDP` enumerator, which is not deleted until S7". So the
+// polarity inverts rather than the variable disappearing — `=0` restores the
+// old subset-bitmask DP in one restart, with no rebuild, until S7 deletes it.
+// Anything else (unset, `1`, garbage) is ON, mirroring `GOOPG_JOIN_SLOT_CHAIN`
+// (08 §2 S1: "default ON, env kill-switch OFF only").
+//
+// The gate is read once at process start so a plan cannot change shape
+// mid-statement.
+var pgShapedDP = pgShapedDPFromEnv(os.Getenv("GOOPG_PGSHAPED_DP"))
+
+// pgShapedDPFromEnv is the kill-switch's polarity, factored out so it is
+// testable without a subprocess: only the exact string "0" turns the search
+// off. An unset variable reads as "" and is therefore ON.
+func pgShapedDPFromEnv(v string) bool { return v != "0" }
 
 // pgShapedDPEnabled reports whether the PG-shaped join search is active. P5.3's
 // entry point is its only production caller; exposed as a function so the flag
 // stays a single read site.
 func pgShapedDPEnabled() bool { return pgShapedDP }
+
+// SetPGShapedJoinSearch pins the enumerator for a caller that needs the other
+// arm, and returns the previous value so it can be restored. It is the
+// cross-package form of `useLegacyEnumerator` (planner-internal, test-only) and
+// exists for the same reason `SetMHJPackingEnabled` does: after M0127-P5.9
+// flipped the default on, tests of the OLD enumerator's rule-driven rewrites —
+// MultiHashJoin packing above all, which the PG-shaped search never emits by
+// design (09 §3 clause 5) — live in packages that cannot reach a private var.
+//
+// NOT for production use. The flag is read once at process start precisely so
+// a plan cannot change shape mid-statement; this setter breaks that guarantee
+// and is safe only in a single-goroutine test. It goes away with the old DP at
+// S7 (08 §4).
+func SetPGShapedJoinSearch(v bool) bool {
+	prev := pgShapedDP
+	pgShapedDP = v
+	return prev
+}
 
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.

@@ -168,7 +168,7 @@ when 09 §3 changes, update from there.
 | **S2** | E4 (multi-column keys, planner+executor) | plan-affecting → plan-snapshot re-baseline same commit | spotcheck + SF0.5 + Q78-class degeneracy probe; `reselectDegenerateHashKeys` deleted same commit |
 | **S3** | 06 hybrid hash spill | `work_mem`-honouring ON; `GOOPG_HASH_SPILL=off` escape | Q21 SF1 completes (cgroup cap); no-spill plans byte-identical results |
 | **S4** | 07 §§2–4 (streaming merge, hash outer-fill, Materialize+NL) | per-operator, plan-affecting parts follow S5's flag | regress-port outer-join files; SF0.5 |
-| **S5** | new PG-shaped DP (03, all 3 phases + bushy) + cost binding (04) | `GOOPG_PGSHAPED_DP` — OFF while soaking, flipped ON as the acceptance event; `GOOPG_COST_DRIVEN_JOINORDER` retired. Collapse-limit wiring gets its own sub-flag `GOOPG_PGSHAPED_COLLAPSE`, soaked separately | the full acceptance bar above (collapse OFF → ON, two passes) |
+| **S5** ✅ **FLIPPED 2026-08-06** | new PG-shaped DP (03, all 3 phases + bushy) + cost binding (04) | `GOOPG_PGSHAPED_DP` — **now ON by default**, surviving as a kill-switch (`=0` only); was OFF while soaking, flipped ON as the acceptance event (09 §3.14); `GOOPG_COST_DRIVEN_JOINORDER` retired. Collapse-limit wiring gets its own sub-flag `GOOPG_PGSHAPED_COLLAPSE`, soaked separately | the full acceptance bar above (collapse OFF → ON, two passes) |
 | **S6** | E5 (compiled key/residual eval) | none (behaviour-neutral) | units + parity spot-diffs on expression corpora |
 | **S7** | deletion (08 §4) | none — only after S5 default-ON has survived ≥ 1 clean nightly cycle | nightly green; grep-clean inventory |
 

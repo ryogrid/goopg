@@ -8049,7 +8049,95 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       flag-off arm is byte-identical by construction — the seam declines on its
       first line, no tree carries the searched tag, and all seven skips are
       unreachable.
-- [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
+- [x] **M0127-P5.9 — S5 acceptance run + flag flip.** **FLIPPED 2026-08-06
+      (09 §3.14).** See the run-by-run history below for how the bar got here;
+      what closed it is that run 4 left nothing attributed to the flag and
+      P5.9-l-ii measured clause 6 green. `GOOPG_PGSHAPED_DP` now defaults ON
+      and survives as a KILL-SWITCH (`=0` alone turns it off — unset is ON, so
+      the flip is not undone by an environment that never mentions it);
+      `GOOPG_COST_DRIVEN_JOINORDER`'s env hook is retired per 08 §2, while
+      `costDrivenJoinOrder`/`SetCostDrivenJoinOrder` stay with the old DP until
+      S7 deletes it. **The flip's cost inside the tree was 24 unit tests** (17
+      planner, 7 executor) that had been green through all four acceptance
+      runs, because both bars run on ANALYZEd data and the unit suites do not.
+      One mechanism: the old enumerator promotes operators by RULE
+      (`rewriteJoinsToNLI`, `rewriteMultiWayChain`, `IsSmallDimensionSide`) and
+      rules do not read row counts; the search picks by COST, and on a fixture
+      it believes holds zero rows the cheapest join really is a nested loop.
+      Four of the seven executor failures were a real harness gap —
+      `newDDLFixture` installed no block-count sizer, so 4 000 rows on disk
+      planned as one — and are FIXED by installing the reader the server
+      installs. The rest are pinned to the kill-switch arm
+      (`useLegacyEnumerator`, `planner.SetPGShapedJoinSearch`), never relaxed to
+      accept either operator, with two new searched-arm tests
+      (`TestPGShapedSearchPicksNLIOnCost`, `…PicksHashJoinOnCost`) proving the
+      search reaches the same operators by cost. **The production worry was
+      measured, not assumed:** a live throwaway server with 200 000 rows joined
+      against 2 000 and no `ANALYZE` anywhere plans the SAME hash join on both
+      arms with the same block-count estimates — `joinsearchseam.go` re-asks
+      `relSizeFallbackRows` exactly so the seam cannot hand the search a blind
+      problem. Gates: full units, `scripts/tpch-spotcheck.sh` PASS (Q12=2,
+      Q13=35), pgbench smoke via the hook. **The DS05 arm did not run** — the
+      gate refuses while the nightly CI batch holds the host, and forcing it
+      would have produced timing-contaminated TIMEOUTs; run 4's DS05
+      measurement was of this exact configuration (PASS=95, MISMATCH=0,
+      cell-for-cell the flag-OFF baseline) and stands in the interim. → the
+      re-run is M0127-P5.9-n below. 3 ledger rows.
+- [ ] **M0127-P5.9-m — the collapse-ON acceptance pass.** NEW 2026-08-06. 08 §2
+      gates S5 on the 09 bar run "once with collapse OFF, then with collapse
+      ON", and no arm to date has ever set `GOOPG_PGSHAPED_COLLAPSE=1` — every
+      script defaults it to 0. That did not block the DP flip and the reason is
+      in 08 §2 itself: the sub-flag soaks separately *because* coupling the
+      population change (explicit-JOIN flattening — which statements enter the
+      search at all) to the enumerator swap would make a regression
+      unattributable. So the collapse-ON pass gates the COLLAPSE flip, which is
+      what this item is. Run both arms of the 09 §3 bar with `COLLAPSE=1`
+      (`scripts/tpch-acceptance-arm.sh`, `scripts/tpch-estimate-audit-arm.sh`)
+      plus the DS05 clause, then flip `pgShapedCollapse` or record the no-go.
+      Files: `internal/planner/collapse.go`, the two arm scripts. 08 §2; 09 §3.
+      Bar: the full acceptance bar with collapse ON.
+- [ ] **M0127-P5.9-n — the post-flip DS05 arm.** NEW 2026-08-06. The one gate
+      the flip commit could not pay: `scripts/tpcds-sf05-regression.sh sweep`
+      refused with `FATAL: the nightly CI batch is running (ci/batch)`, and
+      `FORCE=1` would have bought a run whose TIMEOUT column is contaminated by
+      a CPU-saturated host — the exact confound the refusal exists to prevent.
+      Re-run it on a quiet host and compare against the git-tracked oracle;
+      expect run 4's cells (`PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0 SKIP=4`), since the planner code is unchanged between run 4 and
+      the flip apart from the default and the trace channel. A non-zero
+      MISMATCH/CKMISMATCH is a flip-owned correctness regression and reopens
+      P5.9. Bar: DS05 SF0.5 gate green on a quiet host.
+- [ ] **M0127-P5.9-o — EXPLAIN prints no `Join Filter:` line.** NEW 2026-08-06,
+      found while re-pointing `TestExplainQualifiesUpperFilter` (09 §3.14).
+      goopg prints a hash join's `Hash Cond:` but never its RESIDUAL qual: for
+      `… WHERE a.id = b.id AND a.st < b.st` the second conjunct appears nowhere
+      in the plan text, on EITHER arm. The rows are right — both arms compute
+      the same, correct answer — so this is a diagnostic gap, not a
+      correctness one, and it predates the flip; the flip only made it load
+      bearing, because a single-relation qual now pushes down to the scan (as
+      upstream does) and the join-node residual is the only upper-qual shape
+      left to assert `show_upper_qual`'s prefixing on. PG emits it from
+      `show_upper_qual` with `useprefix = es->rtable_size > 1`
+      (`postgres/src/backend/commands/explain.c:2554`). Files:
+      `internal/executor/operators_explain.go`; unpins
+      `TestExplainQualifiesUpperFilter`. Bar: UNITS + a plan-text diff against
+      PG 18.3 on the two-relation residual shape.
+- [ ] **M0127-P5.9-p — the hash-join batch-growth path has no searched-arm
+      fixture.** NEW 2026-08-06 (09 §3.14). nbatch GROWS only when the plan
+      under-estimates its build side, and
+      `TestExplainAnalyzeHashJoinReportsGrownBatches` used to get that
+      under-estimate by accident (a fixture with no block-count sizer sized
+      4 000 rows as 1). With the sizer installed the estimate is right, and a
+      right-sized plan never grows — correct planner behaviour, no executor
+      coverage. The test now blinds its own fixture AND pins the legacy arm,
+      because a blind searched arm costs a nested loop rather than a hash join,
+      so neither half alone reproduces growth. Build a searched-arm fixture that
+      mis-estimates on purpose while still costing a hash join (a
+      deliberately mis-estimated selectivity on the build side is the
+      production-realistic trigger). Files:
+      `internal/executor/join_batch_explain_test.go`. Bar: UNITS, growth
+      asserted on the default enumerator.
+- [x] **M0127-P5.9 — SUPERSEDED HISTORY (kept for attribution; the item itself is ticked above).** The full 09 §3 bar (run
       once with collapse OFF, then with collapse ON) + plan-shape ratchet
       baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and
       retire `GOOPG_COST_DRIVEN_JOINORDER`, or record the documented no-go.

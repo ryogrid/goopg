@@ -19,6 +19,8 @@ import (
 // resulting *Join must have `BuildLeft` set to the side where
 // nation lives.
 func TestHashJoinBuildOnSmallDim(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	for _, tc := range []struct {
 		name      string
 		fromOrder string

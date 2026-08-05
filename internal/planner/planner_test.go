@@ -278,6 +278,8 @@ func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
 // pushdown pass: comma-FROM with WHERE-side equalities should
 // produce real INNER hash joins instead of CROSS+Filter.
 func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := pgbenchCatalog(t)
 
 	// Two-table case: SELECT FROM a, h WHERE a.aid = h.aid.

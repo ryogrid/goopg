@@ -2634,3 +2634,95 @@ the "no unfalsifiable tuning" rule made procedural.
 Benchmarks are tripwires with recorded baselines in the evidence directory,
 not CI gates (WSL2 noise); regressions > 20 % require investigation before
 the stage advances.
+
+### 3.14 The flip, and the 24 tests that were measuring the fixture (P5.9, 2026-08-06)
+
+`GOOPG_PGSHAPED_DP` is **ON by default** as of this section. The knob survives
+as a kill-switch — only the exact string `0` turns the search off — because §2
+of [08](08-migration-and-removal.md) makes "flip it OFF, get `tryBushyDP` back
+in one restart, no rebuild" S5's entire rollback story until S7 deletes the old
+DP. `GOOPG_COST_DRIVEN_JOINORDER` is retired in the same commit, as §2 says it
+would be: the env hook is gone, while `costDrivenJoinOrder` and its setter stay
+with the enumerator they belong to.
+
+The evidence for the flip is run 4 (§3.10) plus §3.13's clause-6 measurement,
+and nothing in this section revises either. What this section records is what
+the flip cost inside the tree, because the acceptance bar could not have found
+it: **24 standing unit tests failed the moment the default changed** — 17 in
+`internal/planner`, 7 in `internal/executor` — and every one of them had been
+green through all four acceptance runs. Both bars run on ANALYZEd TPC-H and
+TPC-DS data; the unit suites do not, and that difference is the whole story.
+
+**The single mechanism.** The old enumerator promotes join OPERATORS by rule:
+`rewriteJoinsToNLI` turns any equi-join on an indexed inner into a
+`NestedLoopIndexJoin`, `rewriteMultiWayChain` packs a hash cascade into a
+`MultiHashJoin`, `IsSmallDimensionSide` pins a build side. None of those rules
+consults a row count, so they fire identically on a fixture that has no
+statistics at all. The PG-shaped search has no such rules — P5.9-b's eight
+skips keep every one of them off a searched tree — and picks the operator by
+cost, like `add_path`. On a relation the planner believes holds zero rows, the
+cheapest join is a bare nested loop, and the search plans one. Correctly.
+
+**Which of those beliefs are real.** Two are not, and separating them is the
+work this section did:
+
+- *`catalog.NewInMemory()` fixtures with no `TableStats`* (the 17 planner
+  tests). There is no relation, no file and no block count; nothing is wrong
+  with a planner that sizes them at zero. These tests assert the legacy
+  REWRITE RULES, which still ship and still run behind the kill-switch, so they
+  are pinned to that arm by `useLegacyEnumerator` — not relaxed to accept
+  either operator, which would leave them unable to fail. Their production-arm
+  counterpart is new: `TestPGShapedSearchPicksNLIOnCost` and
+  `TestPGShapedSearchPicksHashJoinOnCost` show the searched arm reaching the
+  same two operators by cost once the fixture carries numbers that justify it
+  (50 rows against a 200 000-row indexed inner; 500 000 against 400 000
+  unindexed).
+- *`newDDLFixture` relations with rows on disk and no sizer* (the 7 executor
+  tests). This one was a real gap in the harness. `initdb.Open` installs a
+  block-count reader on the catalog (`SetRelationSizer`), which is what lets
+  the relation-size fallback — goopg's `estimate_rel_size`, M0125-0003 — size a
+  never-ANALYZEd relation from its live file. The executor fixture builds a
+  `Context` directly and installed none, so `RelationBlocks` answered "no
+  estimate" and 4 000 rows on disk were planned as one. Installing the same
+  reader in the fixture fixed 4 of the 7 outright and is the change that makes
+  those tests plan like a server rather than like nothing.
+
+**The production case was measured, not assumed.** The failure mode that would
+actually matter — a populated relation nobody ever ANALYZEd, planned blind, and
+the flip turning that into nested loops — does not occur. On a live throwaway
+server (200 000 rows joined against 2 000, no `ANALYZE` anywhere) both arms
+produce the same plan and the same estimates from block counts alone:
+
+```
+flag ON   Hash Join (INNER)  rows=272760   Hash Cond: (b.k = s.k)
+            Seq Scan on big b   rows=272760
+            Seq Scan on small s rows=2260
+flag OFF  identical, modulo `public.`-qualified scan labels
+```
+
+The seam is what prevents it, deliberately and with the reasoning written down
+at the call site (`joinsearchseam.go`): when `estimateBaseRelInfo` comes back
+with no rows it re-asks `relSizeFallbackRows`, "so the seam would [not] hand
+the search a blind problem where the DP it replaces gets a live block-count
+estimate."
+
+**Three residues, all filed rather than fixed.** (i) goopg prints no
+`Join Filter:` line for a hash join's residual qual, on either arm — which is
+why `TestExplainQualifiesUpperFilter` has no searched-arm shape to assert
+against and stays pinned: single-relation quals push down to the scan, where
+`show_scan_qual` (explain.c:2540) correctly prints them UNQUALIFIED, and
+cross-relation quals are not printed at all. (ii) The hash-join batch-growth
+path needs a plan that under-estimates its build side; the searched arm no
+longer does on that fixture, so growth coverage now runs on a deliberately
+blinded legacy-arm fixture and the searched arm has none. (iii) The
+`MultiHashJoin` tests need the old enumerator to produce an MHJ at all, which
+is clause 5 working as specified. All three are deferral-ledger rows dated
+2026-08-06; (iii) resolves by deletion at S7.
+
+**What is still not measured.** The collapse sub-flag `GOOPG_PGSHAPED_COLLAPSE`
+stays OFF and its own acceptance pass — §2's "then with collapse ON" — has
+never been run; no arm to date has set it. That is not a gap in this flip: §2
+gives the sub-flag a separate soak precisely so the enumerator swap and the
+population change do not land as one unattributable diff, which makes the
+collapse-ON pass the gate on the COLLAPSE flip rather than on this one. It is
+filed as its own item.

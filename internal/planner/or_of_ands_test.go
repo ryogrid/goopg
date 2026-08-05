@@ -13,6 +13,8 @@ import (
 // produces a Hash Join on `t1.k = t2.k` instead of `Nested Loop
 // (CROSS)`. (M0058-0004.)
 func TestPlanOrOfAndsExtractsJoinKey(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
 		{Name: "p_partkey", Type: catalog.Type{Name: "int8"}, NotNull: true},

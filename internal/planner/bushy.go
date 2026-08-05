@@ -10,15 +10,20 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// GOOPG_COST_DRIVEN_JOINORDER=1 enables the C4 cost-driven join-order
-// planner (real PG-unit path cost) with MultiHashJoin packing dropped
-// (ch. 12). Off by default so production planning is unchanged; used to
-// measure the pivot on the bench server before promoting the default.
+// GOOPG_COST_DRIVEN_JOINORDER is RETIRED (M0127-P5.9, 2026-08-06). It was the
+// C4 pivot's measurement knob — real PG-unit path cost as the old DP's
+// argmin, with MultiHashJoin packing dropped — and M0126 closed it as a
+// documented no-go (the Q9 MHJ plan could not be cost-forced; every penalty
+// that moved Q9 broke Q5). 08 §2 files its retirement as part of the S5 event
+// that replaces it: `GOOPG_PGSHAPED_DP` is now the default enumerator, so a
+// knob whose only purpose was to re-rank the enumerator it replaced has no
+// remaining production meaning and no measurement left to serve.
+//
+// What is retired is the ENV HOOK, not the mechanism: `costDrivenJoinOrder`
+// and `SetCostDrivenJoinOrder` stay until S7 deletes the old subset-bitmask DP
+// they belong to (08 §4), because the kill-switch arm still runs that DP and
+// its tests still need to reach both of its argmins.
 func init() {
-	if os.Getenv("GOOPG_COST_DRIVEN_JOINORDER") == "1" {
-		costDrivenJoinOrder = true
-		mhjPackingEnabled = false
-	}
 	// M0126-0005 measurement-only: force packing off independently of
 	// join-order, so the A/B measures the cascade cost without
 	// conflating two variables (F12 trap).

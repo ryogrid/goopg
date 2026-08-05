@@ -126,6 +126,14 @@ func TestMHJSerialParallelIdentity(t *testing.T) {
 // join result ONCE. This is the shape that would reproduce the duplicate-rows
 // bug if attachParallelScan failed to reach the probe scan under the MHJ.
 func TestMHJParallelNoDuplicates(t *testing.T) {
+	// M0127-P5.9: MultiHashJoin is not reachable through the PG-shaped search
+	// — clause 5 of the acceptance bar (09 §3) requires ZERO MHJ nodes on the
+	// searched arm, and four consecutive runs measured zero. `SetMHJPackingEnabled`
+	// alone therefore no longer produces one; the packing rule runs on the old
+	// enumerator's output, so the enumerator has to be the old one. Both the
+	// operator and this test go away together at S7 (08 §4).
+	prevSearch := planner.SetPGShapedJoinSearch(false)
+	defer planner.SetPGShapedJoinSearch(prevSearch)
 	planner.SetMHJPackingEnabled(true)
 	defer planner.SetMHJPackingEnabled(false)
 	ctx, cleanup := mhjFixture(t)

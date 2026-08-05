@@ -89,10 +89,17 @@ func seamOrOfAnds(names []string, a, b int) Expr {
 // TestPGShapedSeamIsInertWithTheFlagOff is the rollback guarantee of 08 §2: with
 // `GOOPG_PGSHAPED_DP` off the seam must not merely produce the same plan, it
 // must not run at all — the node and the predicate come back by identity.
+//
+// M0127-P5.9 flipped the default ON, so this test now forces the flag off
+// itself instead of asserting the process default. That is not a weakening —
+// the guarantee under test was always about the OFF arm, and before the flip
+// the process default happened to be the arm it needed. After the flip it is
+// the kill-switch arm, and the kill-switch is exactly what must keep working:
+// it is S5's whole rollback story until S7 deletes the old DP.
 func TestPGShapedSeamIsInertWithTheFlagOff(t *testing.T) {
-	if pgShapedDP {
-		t.Fatal("GOOPG_PGSHAPED_DP is on in this process; the default arm is not being tested")
-	}
+	prev := pgShapedDP
+	pgShapedDP = false
+	t.Cleanup(func() { pgShapedDP = prev })
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{1_000_000, 10, 1000})
 	pred := combineAnd([]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})

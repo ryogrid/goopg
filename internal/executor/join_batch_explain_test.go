@@ -16,7 +16,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 )
 
 // hashJoinInfoRe matches the two forms of PG's show_hash_info line, capturing
@@ -161,6 +163,29 @@ func TestExplainAnalyzeHashJoinReportsBucketsBatchesMemory(t *testing.T) {
 func TestExplainAnalyzeHashJoinReportsGrownBatches(t *testing.T) {
 	ctx := spillFixture(t, 200, 4000, 400)
 	ctx.WorkMem = 64 << 10
+	// M0127-P5.9: nbatch GROWS only when the plan UNDER-ESTIMATES the build
+	// side — a right-sized plan picks its final nbatch up front and never
+	// moves it, which is what the operator should do. This fixture used to
+	// under-estimate by accident: `newDDLFixture` installed no block-count
+	// reader, so every never-ANALYZEd relation was sized at the 1-row floor.
+	// P5.9 installed the reader (the server has one, so a fixture that does
+	// not plans nothing like production) and the accident went away.
+	//
+	// So the mis-estimate is now made ON PURPOSE, and only for this test:
+	// clearing the sizer after the rows are on disk leaves the planner blind
+	// in exactly the way a stale-statistics relation leaves it blind in
+	// production, which is the real-world trigger for the growth path under
+	// test. Nothing else about the fixture changes.
+	ctx.Catalog.(*catalog.InMemory).SetRelationSizer(nil)
+	// A blind planner is necessary but not sufficient: the PG-shaped search
+	// costs its operator, and at the 1-row floor the cheapest join really is a
+	// nested loop, so a blind searched arm produces no hash join to grow. The
+	// old enumerator promotes the hash join by RULE and therefore still gives
+	// one. Both halves are needed, and both go away together — the searched
+	// arm needs a growth fixture that mis-estimates while still costing a hash
+	// join. Deferral ledger row 2026-08-06 (M0127-P5.9).
+	prevSearch := planner.SetPGShapedJoinSearch(false)
+	defer planner.SetPGShapedJoinSearch(prevSearch)
 
 	joined := strings.Join(runExplainRows(t, ctx, "EXPLAIN ANALYZE "+spillJoinSQL), "\n")
 	m := hashJoinInfoRe.FindStringSubmatch(joined)

@@ -123,6 +123,8 @@ func assertResidualIndicesResolve(t *testing.T, nli *NestedLoopIndexJoin) {
 // TestNLIPropagatesInnerAlias pins bug A: the rewritten inner IndexScan
 // must keep the FROM-clause alias its SeqScan carried.
 func TestNLIPropagatesInnerAlias(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := nliResidualFixture(t)
 	nli := planNLI(t, cat, `SELECT * FROM lineitem l, part p WHERE l.l_partkey = p.p_partkey`)
 	if nli.Inner.Alias != "p" {
@@ -134,6 +136,8 @@ func TestNLIPropagatesInnerAlias(t *testing.T) {
 // actually broke Q7: the same table joined to itself. Losing the inner
 // alias here makes the two sides indistinguishable to every later pass.
 func TestNLISelfJoinKeepsAliasesDistinct(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := nliSelfJoinFixture(t)
 	nli := planNLI(t, cat,
 		`SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_regionkey = n2.n_nationkey`)
@@ -157,6 +161,8 @@ func TestNLISelfJoinKeepsAliasesDistinct(t *testing.T) {
 // dropped. `l_quantity > p_size` spans both relations, so pushdown
 // leaves it on the join — exactly Q7's situation.
 func TestNLIKeepsResidualNotEnforcedByProbe(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := nliResidualFixture(t)
 	nli := planNLI(t, cat,
 		`SELECT * FROM lineitem, part WHERE l_partkey = p_partkey AND l_quantity > p_size`)
@@ -183,6 +189,8 @@ func TestNLIKeepsResidualNotEnforcedByProbe(t *testing.T) {
 // (Name, SourceTableIdx) rule. A wrong choice here does not error — it
 // silently compares a column against itself.
 func TestNLIResidualIndicesResolveOnSelfJoin(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := nliSelfJoinFixture(t)
 	nli := planNLI(t, cat, `SELECT n1.n_name, n2.n_name FROM nation n1, nation n2
 		WHERE n1.n_regionkey = n2.n_nationkey AND n1.n_name > n2.n_name`)
@@ -212,6 +220,8 @@ func TestNLIResidualIndicesResolveOnSelfJoin(t *testing.T) {
 // an NLI with a nil Predicate. A residual invented here would be
 // evaluated redundantly per joined row.
 func TestNLINoResidualWhenProbeEnforcesEverything(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := nliResidualFixture(t)
 	nli := planNLI(t, cat, `SELECT * FROM lineitem, part WHERE l_partkey = p_partkey`)
 	if nli.Predicate != nil {
