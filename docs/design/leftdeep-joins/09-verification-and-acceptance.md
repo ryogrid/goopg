@@ -1813,6 +1813,90 @@ Q13 rows=35, 28.9 s); **DS05 sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
 TIMEOUT=0, plan shapes 99/99 identical, no verdict changes and no runtime moves**;
 the two arms above. **P5.9's full bar re-run is now unblocked.**
 
+### 5.22 The decorrelated GROUP BY key was recorded in the scope it was found in, 2026-08-05 (P5.9-g)
+
+Run 2's last clause-1 failure that was actually the flag's: TPC-H **Q2 returned
+0 rows under `GOOPG_PGSHAPED_DP=1` against the control's 455**. Unchanged across
+runs 1 and 2, so it was never the P5.9-c rotation it had been provisionally
+attributed to.
+
+**What the splice needs.** `unnestSubquery` (unnest.go) rewrites Q2's correlated
+scalar aggregate into a hash join whose inner side is a `HashAggregate` over a
+clone of the subquery body, GROUPED BY the correlation column. That group key is
+evaluated against `agg.Child`'s **output**.
+
+**Where the key's coordinate came from.** Somewhere else. `SubCol` is recorded at
+whichever site the correlation was *collected* from, and there are two:
+
+- the Filter walk in `collectUnnestParamsAndResiduals` — the conjunct's own
+  space, which for a top-level Filter *is* the aggregate's input; and
+- `harvestIndexKeyParams` — the correlation the inner planner folded into an
+  `*IndexScan` probe key. That index is **leaf-relative**: the walk descends
+  through joins and projects recording `is.Output()` positions and never
+  accumulates an offset.
+
+The two spaces agree only when the column's relation happens to sit at the same
+offset in both. For Q2 they did, for years: left-deep and unprojected, partsupp
+is the first relation of the subquery body, so `ps_partkey` was 0 either way.
+Under the flag the search boundary publishes a rotated coordinate map (P5.9-c)
+and a reordering `Project` lands partsupp at offset 14, behind
+region/nation/supplier. `ps_partkey/0` then reads **`r_regionkey`**: every
+European row groups under the single key 3, `part.p_partkey = 3` matches
+nothing, and Q2 returns nothing.
+
+Note what the aggregate's *argument* did — `min(ps_supplycost/17)`, correctly
+resolved, because it is cloned from the original aggregate and was always
+expressed against `agg.Child`. **Key and argument were in different scopes
+inside the same node.** That is the fourth instance of this family after
+`*Project` (M0125-0012), `*SetOp`/`*WindowAgg` (RC-2) and `*Aggregate`
+(P5.9-f), and the first where the two disagreeing coordinates live in one plan
+node rather than across a build/apply pair.
+
+**Fix.** `resolveSubColInSchema` re-expresses `SubCol` in the schema the
+consumer will actually index — identity when the recorded index already names
+the right column (so no working path's ColumnRef changes), otherwise by name
+with `SourceTableIdx` disambiguating a self-join, and **nil** when it cannot be
+pinned to exactly one column. A nil is a bail, not an error: the caller leaves
+the correlated SubPlan in place, which is slower and right. This is the R3-4
+rule the EXISTS path already applies to `SubCol.Index` ("an in-range index
+pointing at the wrong column is the silent case"), generalised and moved to
+where the coordinate is consumed. `replace[p.OuterRef]` deliberately keeps the
+UNRESOLVED ref — it is substituted where the `OuterColumnRef` stood, which for
+an index probe is the leaf space it was harvested in.
+
+The sibling `unnestScalarWithResiduals` (the aggregate-above-join form) indexes
+`SubCol` into its inner schema twice, at `leftWidth + idx`, after
+`clonePlanReplacingOuter`, `unnestSubqueriesInPlan` and `unwrapTrivialWrappers`
+have each reshaped it — strictly further from the harvest space than the
+GROUP-BY case. It is routed through the same resolver rather than left as the
+next instance to be found by an acceptance run.
+
+**Why the indexes matter to the reproducer.** Without the TPC-H primary keys the
+correlation stays in a Filter, the two spaces coincide, and both arms agree —
+the fixture cannot fail. The defect is only reachable once `partsupp_pk` exists
+and the inner planner folds `ps_partkey = p_partkey` into an index probe. A
+first 5-table fixture without indexes returned 18 rows on both arms and nearly
+retired the hypothesis; adding the PKs reproduced 0-vs-18 immediately.
+
+**Result.** Both arms, one binary (`c8fe0d352d75b67e`), TPC-H SF1:
+
+| arm | result |
+|---|---|
+| `GOOPG_PGSHAPED_DP=0` | `OK elapsed=2.43s ordered=1c0f630719e8c7bf rows=455` |
+| `GOOPG_PGSHAPED_DP=1` | `OK elapsed=3.36s ordered=1c0f630719e8c7bf rows=455` |
+| `tpch-runner -diff` | `Q2 MATCH rows=455` — **VERDICT: PASS** |
+
+Adjudicated against PostgreSQL per §3.4: on the bench-free 5-table fixture PG
+18.3 returns the same 18 tuples in the same order as both goopg arms (differing
+only in `char(N)` blank padding and numeric scale, two pre-existing formatting
+gaps unrelated to this seam).
+
+Blast radius is wider than the flag — the resolver and both bails run on
+flag-OFF planning too. Gates run: UNITS; SPOT (Q12 rows=2, Q13 rows=35, 28.3 s);
+DS05; the two arms above. **Clause 1 of the acceptance bar now has no known
+flag-owned failure; run 3 is unblocked, with the clause 2/3 timing gap (P5.9-h)
+the remaining work.**
+
 ## 6. Attribution protocol for regressions (inherited, binding)
 
 Any per-query regression during S1–S5 gets classed before any fix lands:

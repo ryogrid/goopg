@@ -1312,19 +1312,32 @@
   Clauses 4/6 again not reached. The two surviving cells split: **Q2 is the
   flag's (→ P5.9-g); Q5 is the BASELINE's (→ M0119-0011)** — flag-ON agrees
   with PG 18.3, the default path is wrong by ~24×. Run 3 after P5.9-g.
-- [ ] **P5.9-g** Q2's decorrelated aggregate splice returns 0 rows — the last
-  clause-1 failure that is the flag's, and the only blocker on run 3.
-  Unchanged across runs 1 and 2, so it was never the P5.9-c rotation it was
-  provisionally attributed to. The ON plan is P5.9-f's Q17 shape (a
-  decorrelated `HashAggregate` as a foreign coordinate scope under
-  `Hash Cond: (part.p_partkey = partsupp.ps_partkey)` +
-  `Filter: (partsupp.ps_supplycost = min)`) but with a 4-relation inner under
-  a 5-relation outer, where Q17's was 2-under-2. Start at `unnestSubquery`'s
-  `outerWidth` splice (the P5.9-f fix) and establish whether the key or the
-  `= min` residual addresses the clone's scope or the outer's; the P5.9-f
-  fixture recipe (`analysis/leftdeep-joins/p59f/README.md`, ~1 s) generalises.
-  Bar: UNITS + SPOT + DS05 + Q2 arms on ONE binary → `tpch-runner -diff`
-  `VERDICT: PASS`.
+- [x] **P5.9-g** The decorrelated GROUP BY key was recorded in the scope it was
+  FOUND in, not the one it is READ in. DONE 2026-08-05 (09 §5.22) — and not
+  where this item predicted. At 4-under-5 the splice's
+  `LeftKey`/`RightKey`/`Predicate` and the `= min` residual are all correct;
+  P5.9-f's `outerWidth` fix generalised. The defect is one level down, inside
+  the decorrelated `HashAggregate`: its GROUP BY key and its aggregate
+  ARGUMENT were in different coordinate scopes. `SubCol` is recorded wherever
+  the correlation is collected — the Filter walk records the conjunct's space
+  (= the aggregate's input for a top-level Filter), but `harvestIndexKeyParams`
+  records a LEAF-relative `is.Output()` position and its walk never
+  accumulates an offset. Left-deep and unprojected, partsupp is Q2's first
+  inner relation so `ps_partkey/0` agreed by accident; P5.9-c's rotated map
+  puts partsupp at 14, `ps_partkey/0` reads `r_regionkey`, and every European
+  row groups under the single key 3. Fix: `resolveSubColInSchema` resolves
+  `SubCol` in the schema the consumer indexes (identity → name +
+  `SourceTableIdx` → nil BAIL to the SubPlan), applied at
+  `buildUnnestedSubquery`'s GROUP BY and the sibling
+  `unnestScalarWithResiduals`' two `leftWidth + SubCol.Index` sites. The
+  reproducer NEEDS the TPC-H PKs — without them the correlation stays in a
+  Filter and both arms agree on a fixture that cannot fail. Tests
+  `TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`,
+  `TestResolveSubColInSchema`. Bar MET: UNITS + SPOT + DS05 (PASS=95,
+  MISMATCH=0, plans 99/99 same) + Q2 arms on ONE binary
+  (`c8fe0d352d75b67e`) → `tpch-runner -diff` `Q2 MATCH rows=455`
+  **VERDICT: PASS**, with PG 18.3 agreeing tuple-for-tuple on the fixture.
+  3 ledger rows. **Run 3 of the bar is unblocked.**
 - [ ] **P5.9-h** The clause 2/3 timing gap (Q7 2.14×, Q9 3.23×, Q10 3.78×,
   Q12 2.00×, Q18 2.42×, total 1.36×). DEFERRED until P5.9-g closes: a build
   whose Q2 is wrong is not a timing baseline, and run 2's OFF total is itself

@@ -1216,11 +1216,44 @@ func buildUnnestedSubquery(sub *SubqueryExpr, params []unnestParam) (Node, Schem
 	if !ok {
 		return nil, nil, &PlanError{Pos: sub.Pos(), Code: "XX000", Message: "buildUnnestedSubquery: inner plan is not an Aggregate"}
 	}
+	// M0127-P5.9-g: `p.SubCol` and the GROUP BY key it becomes live in two
+	// different coordinate spaces, and only an accident of layout ever made
+	// them agree.
+	//
+	// `SubCol` is recorded where the correlation was FOUND. On the Filter
+	// path that is the conjunct's own space, which for a top-level Filter is
+	// also `agg.Child`'s output — so the two coincide. On the index-key path
+	// (`harvestIndexKeyParams`) the correlation is folded into an
+	// `*IndexScan` probe, and the index is LEAF-relative: the walk descends
+	// through joins and projects without ever accumulating an offset. The
+	// group key, by contrast, is evaluated against `agg.Child`'s OUTPUT.
+	//
+	// Left-deep and unprojected, partsupp is the first relation of TPC-H
+	// Q2's subquery body, so leaf-relative `ps_partkey/0` happened to equal
+	// its output coordinate and the defect stayed invisible. Under
+	// `GOOPG_PGSHAPED_DP` the search boundary publishes a rotated map
+	// (P5.9-c): partsupp lands at offset 14 behind region/nation/supplier,
+	// `ps_partkey/0` reads `r_regionkey`, and every European row groups
+	// under the single key 3. `part.p_partkey = 3` matches nothing and Q2
+	// returned 0 rows against 455 — a wrong answer, not an error.
+	//
+	// Resolve the group key against the schema that will actually be
+	// indexed, and bail to the SubPlan path when it cannot be pinned
+	// unambiguously (the R3-4 rule the EXISTS path already applies to
+	// `SubCol.Index`: an in-range index pointing at the wrong column is the
+	// silent case). `replace` keeps the UNRESOLVED ref on purpose — it is
+	// substituted where the OuterColumnRef stood, which for an index probe
+	// is the leaf space `SubCol` was harvested in.
+	childSchema := agg.Child.Output()
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	groupExprs := make([]Expr, len(params))
 	for i, p := range params {
 		replace[p.OuterRef] = p.SubCol
-		groupExprs[i] = cloneExprLeaf(p.SubCol)
+		gk := resolveSubColInSchema(childSchema, p.SubCol)
+		if gk == nil {
+			return nil, nil, nil
+		}
+		groupExprs[i] = gk
 	}
 	child, err := clonePlanReplacingOuter(agg.Child, replace)
 	if err != nil {
@@ -1242,6 +1275,64 @@ func buildUnnestedSubquery(sub *SubqueryExpr, params []unnestParam) (Node, Schem
 	})
 	newAgg.schema = schema
 	return newAgg, schema, nil
+}
+
+// resolveSubColInSchema re-expresses a correlation's subquery-scope column
+// `sc` as a ColumnRef into `schema` — the schema the CONSUMER will index —
+// and returns nil when it cannot be pinned to exactly one column.
+//
+// M0127-P5.9-g. `sc` carries the coordinate of whichever site the correlation
+// was collected from (a Filter conjunct, or an `*IndexScan` probe key, which
+// is leaf-relative). Consumers evaluate it somewhere else: the decorrelated
+// aggregate's GROUP BY reads `agg.Child`'s output, and the residual rewrite's
+// join key reads the unwrapped inner plan's. Those spaces agree only when the
+// column's relation happens to sit at the same offset in both, which is why
+// this held for years on left-deep unprojected inner bodies and broke the
+// moment the PG-shaped search rotated one.
+//
+// Identity first: when `sc.Index` already names the right column, it is
+// returned unchanged, so every path that was already correct keeps its exact
+// ColumnRef. Otherwise the column is looked up by name, disambiguated by
+// SourceTableIdx when both sides carry one (a self-join puts the same name in
+// the schema twice). A nil return is a BAIL, not an error — the caller leaves
+// the correlated SubPlan in place, which is slower and right.
+func resolveSubColInSchema(schema Schema, sc *ColumnRef) *ColumnRef {
+	if sc == nil {
+		return nil
+	}
+	stAgrees := func(col SchemaColumn) bool {
+		return sc.SourceTableIdx == 0 || col.SourceTableIdx == 0 ||
+			col.SourceTableIdx == sc.SourceTableIdx
+	}
+	clone := func(idx int) *ColumnRef {
+		out := *sc
+		out.Index = idx
+		if idx >= 0 && idx < len(schema) {
+			out.Type = schema[idx].Type
+			if schema[idx].SourceTableIdx != 0 {
+				out.SourceTableIdx = schema[idx].SourceTableIdx
+			}
+		}
+		return &out
+	}
+	if sc.Index >= 0 && sc.Index < len(schema) &&
+		strings.EqualFold(schema[sc.Index].Name, sc.Name) && stAgrees(schema[sc.Index]) {
+		return clone(sc.Index)
+	}
+	found := -1
+	for i, col := range schema {
+		if !strings.EqualFold(col.Name, sc.Name) || !stAgrees(col) {
+			continue
+		}
+		if found >= 0 {
+			return nil // ambiguous: two candidates, no way to choose
+		}
+		found = i
+	}
+	if found < 0 {
+		return nil
+	}
+	return clone(found)
 }
 
 func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) (Node, error) {
@@ -1990,6 +2081,11 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// M0127-P5.9-g: a nil plan with no error is the group-key resolution
+	// bailing (resolveSubColInSchema) — keep the correlated SubPlan.
+	if subPlan == nil {
+		return nil, nil
+	}
 	// D3.0 belt: if the clone did not fully neutralise the correlation
 	// (e.g. a partial multi-key harvest), leave the sublink as a SubPlan
 	// rather than install a join over an unbound OuterColumnRef.
@@ -2230,6 +2326,20 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 	outerWidth := len(outerSchema)
 	innerSchema := innerRaw.Output()
 
+	// M0127-P5.9-g (sibling of the GROUP-BY fix in buildUnnestedSubquery):
+	// this rewrite indexes `SubCol` into `innerSchema` at `leftWidth + idx`
+	// twice below — the per-pair join conjunct and the hash RightKey. That
+	// schema is the inner body AFTER clonePlanReplacingOuter,
+	// unnestSubqueriesInPlan and unwrapTrivialWrappers have all had a turn,
+	// so it is even further from the space an index-probe harvest recorded
+	// than the GROUP-BY case. Resolve once, up front, and bail together.
+	subCols := make([]*ColumnRef, len(params))
+	for i, p := range params {
+		if subCols[i] = resolveSubColInSchema(innerSchema, p.SubCol); subCols[i] == nil {
+			return nil, nil
+		}
+	}
+
 	// Ordinal-tagged outer side (reuses the WITH ORDINALITY plan node
 	// and its reopen-safe executor).
 	ordSchema := make(Schema, 0, outerWidth+1)
@@ -2246,7 +2356,7 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 	// Join predicate: every equijoin pair plus the lifted residuals,
 	// all in joined-row (left ++ inner) coordinates.
 	var conj []Expr
-	for _, p := range params {
+	for i, p := range params {
 		conj = append(conj, &BinaryOp{
 			pos: sub.Pos(), Op: parser.OpEq,
 			Left: &ColumnRef{
@@ -2258,10 +2368,10 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 			},
 			Right: &ColumnRef{
 				pos:            p.SubCol.Pos(),
-				Index:          leftWidth + p.SubCol.Index,
-				Name:           p.SubCol.Name,
-				Type:           p.SubCol.Type,
-				SourceTableIdx: p.SubCol.SourceTableIdx,
+				Index:          leftWidth + subCols[i].Index,
+				Name:           subCols[i].Name,
+				Type:           subCols[i].Type,
+				SourceTableIdx: subCols[i].SourceTableIdx,
 			},
 		})
 	}
@@ -2293,9 +2403,9 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 		// right key must index into the right region.
 		RightKey: &ColumnRef{
 			pos:   params[0].SubCol.Pos(),
-			Index: leftWidth + params[0].SubCol.Index,
-			Name:  params[0].SubCol.Name,
-			Type:  params[0].SubCol.Type,
+			Index: leftWidth + subCols[0].Index,
+			Name:  subCols[0].Name,
+			Type:  subCols[0].Type,
 		},
 		schema: joinSchema,
 	}

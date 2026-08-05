@@ -8103,27 +8103,54 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       before it is attributed, and a cell where ON agrees with PG does not
       count against the flip. Q5's 4.09× is struck from clause 3 (the arms
       compute different result sets). 3 ledger rows. **Run 3 after P5.9-g.**
-- [ ] **M0127-P5.9-g — Q2's decorrelated aggregate splice returns 0 rows.**
-      The LAST clause-1 failure that is actually the flag's, and the only
-      thing between here and run 3. Under `GOOPG_PGSHAPED_DP=1` Q2 returns 0
-      rows against 455 (flag-OFF keeps the correlated SubPlan and is right);
-      unchanged across runs 1 and 2, so it was never the P5.9-c rotation it
-      was provisionally attributed to. The ON plan
-      (`analysis/leftdeep-joins/2026-08-05-p59run2-explain-on.txt`) is
-      the shape P5.9-f fixed for Q17 — a decorrelated `HashAggregate` spliced
-      in as a foreign coordinate scope under
-      `Hash Cond: (part.p_partkey = partsupp.ps_partkey)` +
-      `Filter: (partsupp.ps_supplycost = min)` — but with a 4-relation inner
-      (partsupp/supplier/nation/region clone) under a 5-relation outer, where
-      Q17's was 2-under-2. Start at `unnestSubquery`'s `outerWidth` splice
-      (internal/planner/unnest.go, the P5.9-f fix) and ask whether the key or
-      the `= min` residual addresses the clone's scope or the outer's; the
-      P5.9-f fixture recipe in `analysis/leftdeep-joins/p59f/README.md`
-      generalises (a ~1 s throwaway 5533 cluster, NOT the 28 s SF1 arm).
-      09 §3.4; IMPLEMENTATION-TODO P5.9-g. Bar: UNITS + SPOT + DS05 (the
-      P5.9-f fixes changed flag-OFF planning, so DS05 is required not
-      optional) + Q2 arms ON/OFF on ONE binary → `tpch-runner -diff`
-      `VERDICT: PASS`.
+      **↳ P5.9-g CLOSED 2026-08-05 — clause 1 now has NO known flag-owned
+      failure.** Q2 MATCHes at `rows=455` on both arms of a one-binary SF1
+      pair (`tpch-runner -diff` **VERDICT: PASS**), leaving Q5 — which is the
+      *baseline's* defect (M0119-0011), and which clause 1's second amendment
+      already excludes from counting against the flip. **Run 3 is unblocked
+      and is this milestone's next action.** Order it exactly as 09 §3.4's
+      resume point states: one binary, both arms via
+      `NO_BUILD=1 PGSHAPED=0|1 scripts/tpch-acceptance-arm.sh`, `-diff`, and
+      only then the §4 plan-shape ratchet baseline, the §5 estimate audit and
+      the DS05 clause — each assumes the one before it. Expect clause 2/3 to
+      still FAIL: the timing gap is untouched and is P5.9-h's subject, so run
+      3's likely outcome is a THIRD documented no-go whose value is the
+      first-ever §4/§5 measurement on a build that computes right answers.
+- [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
+      scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
+      and it was NOT the splice arithmetic this item predicted. At 4-under-5
+      the splice's `LeftKey`/`RightKey`/`Predicate` and the `= min` residual
+      all carry correct merged coordinates; P5.9-f's `outerWidth` fix
+      generalised fine. The defect is one level down, INSIDE the decorrelated
+      `HashAggregate`: its GROUP BY key and its aggregate ARGUMENT were in
+      different coordinate scopes. `SubCol` is recorded wherever the
+      correlation is collected — the Filter walk records the conjunct's space
+      (which for a top-level Filter is the aggregate's input), but
+      `harvestIndexKeyParams` records a LEAF-relative `is.Output()` position
+      and never accumulates an offset while descending. Left-deep and
+      unprojected, partsupp is Q2's first inner relation, so `ps_partkey/0`
+      agreed by accident; P5.9-c's rotated boundary map puts partsupp at 14,
+      `ps_partkey/0` reads `r_regionkey`, every European row groups under the
+      single key 3, and `part.p_partkey = 3` matches nothing. Fix:
+      `resolveSubColInSchema` re-expresses `SubCol` in the schema the
+      consumer indexes (identity when already right, by name +
+      `SourceTableIdx` otherwise, **nil to bail to the SubPlan** when
+      ambiguous or absent — the R3-4 rule the EXISTS path already applies,
+      moved to the consumer); applied at `buildUnnestedSubquery`'s GROUP BY
+      and at the sibling `unnestScalarWithResiduals`' two
+      `leftWidth + SubCol.Index` sites. **The reproducer needs the TPC-H PKs**
+      — without them the correlation stays in a Filter and both arms return
+      18 rows on a fixture that cannot fail. Tests
+      `TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`,
+      `TestResolveSubColInSchema` (negative-control checked: reverts to
+      `group key ps_partkey/0 reads "r_regionkey"`).
+      09 §5.22; IMPLEMENTATION-TODO P5.9-g. Bar MET: one binary
+      `c8fe0d352d75b67e`, both SF1 arms `Q2 rows=455` identical digests,
+      `tpch-runner -diff` **VERDICT: PASS**, PG 18.3 agrees tuple-for-tuple
+      on the fixture. Also UNITS, SPOT (Q12=2/Q13=35), DS05 (PASS=95,
+      MISMATCH=0, CKMISMATCH=0, plans 99/99 same). 3 ledger rows — the
+      producer still has no scope contract, the fixture's PKs are
+      load-bearing, and `DROP INDEX` fails on a restart-surviving index.
 - [ ] **M0127-P5.9-h — the clause 2/3 timing gap.** DEFERRED until P5.9-g
       closes, deliberately: a build whose Q2 computes the wrong answer is not
       a timing baseline, and run 2's OFF total is itself inflated-fast by the
