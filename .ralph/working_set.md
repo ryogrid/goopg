@@ -1,5 +1,7 @@
-Task: **M0127-P5.9-u** — `Datum.Flags` was a serialization contract nobody
-declared. COMMITTED; DS05 SF0.5 confirmation run is the only thing outstanding.
+(idle — nothing in flight)
+
+Last loop: **M0127-P5.9-u CLOSED** — commit `53863272`, pushed. No orphaned
+servers. `Datum.Flags` was a serialization contract nobody declared.
 
 **What landed.** `flagDate` is retired for `Datum.TimeSub` (`TimeSubtype`:
 Timestamp/Date/TimestampTZ/Time/TimeTZ), carved out of the existing alignment
@@ -35,7 +37,12 @@ Gates run: `go build ./...`; units (0 FAIL); regress-port BASELINE-RELATIVE in a
 worktree off clean HEAD — 56 tests, **identical verdicts and diff line counts on
 both arms** (absolute parity is 1/52 and means nothing; the worktree needs the
 untracked `postgres` symlink or `pg_isready` is missing); `tpch-spotcheck` Q12=2
-Q13=35 PASS; pgbench smoke via the commit hook.
+Q13=35 PASS; pgbench smoke via the commit hook (612/637 write TPS, 12.6k
+read-only). DS05 SF0.5 `sweep`: `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0 SKIP=4`, `STATUS-DELTA verdict-changes=none runtime-moves=0`,
+`PLAN-SHAPE same=99 changed=0` — nothing moved, which is the correct reading for
+a serialization fix whose only behaviour changes are on types the corpus has
+none of (timetz/enum). Report `sweep-20260806-072019.txt`.
 
 NEXT LOOP (banner in `.ralph/fix_plan.md` wins — M0127 is #4 and current):
 **-t** (port `reduce_outer_joins` so a RIGHT arrives as a LEFT, then widen
@@ -49,4 +56,4 @@ off the `Scale != 0` timetz inference (it mis-reads a `+00` timetz as a plain
 Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323; all 18
 subjects already filed under M-NIGHTLY. Nothing new.
 
-In-flight: see the status block — DS05 SF0.5 result is recorded there.
+In-flight: none.
