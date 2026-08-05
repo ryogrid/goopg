@@ -614,6 +614,17 @@ func isProbableInnerScan(n Node) bool {
 	return false
 }
 
+// entryNCols is `relNCols` for the bushy DP's own entry type: the column count
+// of the subtree this entry already built, which is what the hash geometry must
+// be solved for (M0127-P5.7-a). Zero for an entry with no plan, which
+// hashJoinCost reads as "assume no spill".
+func entryNCols(e dpEntry) int {
+	if e.plan == nil {
+		return 0
+	}
+	return len(e.plan.Output())
+}
+
 // costJoinCandidate returns the PG-unit cost of a candidate join as the
 // method it will actually execute. Default: hashJoinCost. When NLI-cost
 // delegation is on and tryBuildNLI reports the join convertible (on a
@@ -621,8 +632,16 @@ func isProbableInnerScan(n Node) bool {
 // whose inner is one index probe per outer row — the cost that makes the
 // DP avoid orders that NL-probe a large relation.
 func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRows int64, cat catalog.Catalog) Cost {
-	hashCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
-		float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+	hashCost := hashJoinCost(cp, hashJoinInputs{
+		outer: entryA.pgCost, inner: entryB.pgCost,
+		outerRows: float64(entryA.rows), innerRows: float64(entryB.rows),
+		outputRows:     float64(outRows),
+		numHashClauses: 1,
+		// This DP has no RelOptInfo; its entries carry the executor subtree
+		// they built, whose schema is the same one the join will concatenate
+		// (M0127-P5.7-a).
+		outerCols: entryNCols(entryA), innerCols: entryNCols(entryB),
+	})
 
 	// M0126-0013: penalise hash joins that build on more than
 	// largeBuildThreshold rows. Building an N-row hash table

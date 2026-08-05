@@ -127,6 +127,8 @@ join's obligations and fixes the shared substrate:
 
 ## 5. Planner contract
 
+**Status: LANDED (M0127-P5.7-a, 2026-08-05)**, with one clause of it deferred.
+
 `hashJoinCost` calls the same `chooseHashTableSize`; `nbatch > 1` adds
 `(inner_bytes + outer_bytes_spilled_fraction) × 2 / BLCKSZ × seq_page_cost`
 I/O (write + read), per `final_cost_hashjoin` (costsize.c:4275). The planner
@@ -134,6 +136,30 @@ also exposes `nbatch` on the HashJoin path for EXPLAIN parity of estimates.
 This term is what replaces the deleted quadratic penalty as the honest
 deterrent against building on huge intermediates
 ([04](04-cost-and-cardinality.md) §1, §4).
+
+As built: the shared function is `hashsize.Choose` (this chapter's
+`chooseHashTableSize`), and the term applied is upstream's exact split rather
+than this section's prose sketch — `seq_page_cost · innerPages` at STARTUP
+plus `seq_page_cost · (innerPages + 2·outerPages)` at run
+(costsize.c:4239-4248), which totals the same `2·(inner+outer)` pages while
+putting the inner write where it actually happens. There is no
+"spilled fraction": PG charges the whole outer, because with `nbatch > 1`
+every outer row is routed through a batch file.
+
+**Not done — `nbatch` is not exposed on the HashJoin path.** The geometry is
+recomputed inside `hashJoinCost` and discarded; nothing carries it to
+`createPlan` or to EXPLAIN, so `EXPLAIN` cannot yet show the planner's batch
+prediction beside the executor's actual `Batches:` line. That comparison is the
+natural instrument for the width approximation named in
+[04](04-cost-and-cardinality.md) §4.1, and it is ledgered (2026-08-05
+M0127-P5.7-a) rather than built, because `Path` is deliberately kept small and
+the field earns its place only once something reads it.
+
+The other half of the contract — that a session's `work_mem` reaches the
+planner at all — is NOT satisfied: `costParams.workMem` is fixed at
+`hashsize.DefaultMemLimitBytes`, the executor's own fallback. Planner and
+executor therefore agree exactly at the default and diverge for any session
+that sets `work_mem`. Same ledger row.
 
 ## 6. Deferred (ledger rows at implementation time)
 

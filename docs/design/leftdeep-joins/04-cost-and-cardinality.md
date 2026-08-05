@@ -186,6 +186,11 @@ the [09](09-verification-and-acceptance.md) §5 estimate audit, not by eye.
 
 ## 4. Hash-join cost with the spill model
 
+**Status: LANDED (M0127-P5.7-a, 2026-08-05)** — `internal/planner/cost_funcs.go`
+`hashJoinCost`, now taking a `hashJoinInputs` struct and calling
+`hashsize.Choose`. What actually shipped, and the two things that did not, are
+at the end of this section; the plan below is what it was built from.
+
 Once [06](06-hash-spill-and-memory.md) gives the executor real
 `(nbuckets, nbatch)` sizing, `hashJoinCost` prices what will actually run,
 PG-style (`initial_cost_hashjoin`/`final_cost_hashjoin`):
@@ -205,6 +210,57 @@ semantics (`internal/executor/spill.go:324`) feeding `inner_pages`
 ([cost-model/06] owns the width model; note goopg hash entries cost ≈
 `48·r·c` bytes vs PG's packed MinimalTuple — the planner's page math must use
 goopg's widths, not PG's, or nbatch predictions will be systematically low).
+
+### 4.1 What landed (M0127-P5.7-a)
+
+`hashJoinCost` calls `hashsize.Choose(innerRows, innerCols, 0, cp.workMem)` —
+the same function, with the same argument shape, that `joinOp.buildGeometry`
+(`internal/executor/operators_join_agg.go:624`) calls at run time. When it
+answers `NBatch > 1`, PG's charge is applied verbatim
+(costsize.c:4239-4248): `seq_page_cost · innerPages` at startup (the inner is
+written during the build) and `seq_page_cost · (innerPages + 2·outerPages)` at
+run (the inner read back, the outer written and read). `spillPages` is
+`page_size` with `relation_byte_size` replaced by `hashsize.EntryBytes`, so
+the pages charged and the bytes the geometry solved for come from one model.
+
+The pivotal detail is **which width crosses the boundary**. PG hands
+`ExecChooseHashTableSize` a byte width because its entry is a packed
+MinimalTuple; goopg's entry is a `[]Datum` of 48-byte structs, so its size
+follows the COLUMN COUNT, and that is what the executor passes. The planner
+therefore had to learn a column count it did not carry: `RelOptInfo.NCols`,
+set from the leaf's schema for a base rel and as the sum over the two inputs
+for a join rel (a join row is its inputs concatenated). Feeding the existing
+byte-valued `Width` here would have sized the same build ~25× differently on
+the two sides of the sibling-path rule.
+
+This **replaced** an unconditional `seq_page_cost · innerRows/100` term added
+by M0126-0013, which cited costsize.c:4166 for a page charge upstream does not
+make there. Upstream charges pages only under `numbatches > 1`, and charges
+them for the SPILL, not for the resident table. The stand-in was monotone in
+`innerRows`, so it penalised a 6 M-row build that fits `work_mem` exactly as
+much as one that does not — which is precisely the distinction that decides
+the plan, and is pinned now by
+`TestHashJoinCost_SpillDependsOnFitNotOnSize`.
+
+Two parts of the section did **not** land and are ledgered (2026-08-05):
+
+- **`work_mem` is not per-session in the planner.** `costParams.workMem`
+  defaults to `hashsize.DefaultMemLimitBytes` (512 MB), which is the executor's
+  own no-work_mem fallback, so the two agree at the default and only at the
+  default. Cost time has no session in scope — the same gap `ParallelSettings`
+  exists to bridge for the parallel post-pass.
+- **The batch-file encoding is narrower than the in-memory footprint.**
+  `spillWriter.WriteRow` frames datums with uvarint lengths rather than storing
+  48-byte structs, so `spillPages` over-states the I/O of a wide build. That is
+  the safe direction (it deters spilling) but it is an approximation, not the
+  measurement.
+
+The **Startup/Total split for LIMIT-over-join** — the second half of P5.7 — is
+untouched here: `hashJoinCost` has always returned both numbers and now moves
+them independently (the inner write is startup, the read-back is run), but
+nothing yet SELECTS on startup under a LIMIT. That needs PG's `tuple_fraction`
+plumbed into `grouping_planner`'s choice between `CheapestTotal` and
+`CheapestStartup`, and is filed as **M0127-P5.7-b**.
 
 ## 5. Inferred edges: from admissibility penalty to selectivity honesty
 

@@ -7177,6 +7177,15 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
 - [ ] **M0127-P5.6-d — delete the quadratic build penalty** (bushy.go:632),
       once 04 §4's honest batch-I/O term prices what it stood in for.
       IMPLEMENTATION-TODO P5.6-d. Bar: UNITS + DS05.
+      **UNBLOCKED 2026-08-05 by M0127-P5.7-a**: the honest term now exists and
+      the penalty's sibling inside `hashJoinCost` (M0126-0013's
+      `seq_page_cost × innerRows/100`) is already gone. What remains at
+      `costJoinCandidate` is the separate `largeBuildThreshold` quadratic
+      overshoot, which the `NBatch > 1` charge now covers — and covers better,
+      since 2 M rows is a fixed row count while the real threshold depends on
+      the row's width. Note when doing it: the penalty lives on the
+      `costDrivenJoinOrder` arm, so DS05 will show no movement unless the sweep
+      runs with that flag ON.
 - [x] **M0127-P5.6-e-i — the estimate-audit INSTRUMENT + pre-flip baseline**
       (09 §5.1/§5.2): `cmd/estimate-audit` + `internal/estimateaudit`. One
       `EXPLAIN ANALYZE` per query supplies both sides (cost `rows=` and
@@ -7838,7 +7847,54 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       floor): Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
 - [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
-      06 §5. Bar: UNITS + PLAN (default arm ZERO diffs).
+      06 §5. Bar: UNITS + PLAN (default arm ZERO diffs). **DECOMPOSED into -a
+      (the spill term, pricing) and -b (the LIMIT fraction, selection) below —
+      they touch different halves of the search and have different blast
+      radii.**
+- [x] **M0127-P5.7-a — the spill term: `hashJoinCost` prices the geometry the
+      executor will actually build.** DONE 2026-08-05. `hashJoinCost`
+      (`internal/planner/cost_funcs.go`) now takes a `hashJoinInputs` struct and
+      calls `hashsize.Choose` — the same function, with the same argument shape,
+      that `joinOp.buildGeometry` calls at run time — then applies upstream's
+      batch I/O charge verbatim when it answers `NBatch > 1`
+      (costsize.c:4239-4248): `seq_page_cost × innerPages` at STARTUP (the inner
+      is written during the build) and `seq_page_cost × (innerPages +
+      2 × outerPages)` at run. `spillPages` is `page_size` with
+      `relation_byte_size` replaced by `hashsize.EntryBytes`, so the pages
+      charged and the bytes the geometry solved for come from one model.
+      **It replaced M0126-0013's unconditional `seq_page_cost × innerRows/100`**,
+      which cited costsize.c:4166 for a page charge upstream does not make
+      there — PG charges pages only under `numbatches > 1`, and for the SPILL
+      rather than the resident table. Being monotone in `innerRows`, the
+      stand-in penalised a 6 M-row build that fits `work_mem` exactly as much as
+      one that does not, which is the distinction that decides the plan
+      (`TestHashJoinCost_SpillDependsOnFitNotOnSize`).
+      **The width that crosses the boundary is the finding:** PG hands
+      `ExecChooseHashTableSize` a byte width because its entry is a packed
+      MinimalTuple; goopg's entry is a `[]Datum` of 48-byte structs, so its size
+      follows the COLUMN count — and the executor passes `len(schema)`. The
+      planner had no column count, so `RelOptInfo.NCols` is new (leaf schema for
+      a base rel, sum over inputs for a join rel, since a join row is its inputs
+      concatenated). Feeding the existing byte-valued `Width` would have sized
+      the same build ~25× differently on the two sides of the sibling-path rule.
+      4 new tests. IMPLEMENTATION-TODO P5.7-a; 04 §4.1; 06 §5. **4 ledger rows**
+      (per-session `work_mem` never reaches the planner; `spillPages` prices the
+      in-memory footprint not the narrower batch-file encoding; `nbatch` not
+      exposed on `Path` for EXPLAIN; the LIMIT fraction → -b).
+      Bar met: UNITS. PLAN not applicable and the reason is structural, not a
+      skip: both `hashJoinCost` callers are behind OFF-by-default gates
+      (`costDrivenJoinOrder`, and the PG-shaped DP, which has no `planSelect`
+      caller at all), so the default arm has zero *reachable* plan movement.
+- [ ] **M0127-P5.7-b — the LIMIT fraction: nothing SELECTS on startup cost.**
+      P5.7-a made `hashJoinCost`'s Startup and Total move independently and for
+      the right reason, but the split buys nothing until a LIMIT can choose on
+      it. PG's `grouping_planner` (planner.c) turns a LIMIT into a
+      `tuple_fraction` and asks `get_cheapest_fractional_path` which path wins
+      at that fraction; goopg computes `RelOptInfo.CheapestStartup`
+      (`setCheapest`, path.go) and never reads it. Resume: thread a
+      `tuple_fraction` from the `*Limit` above the join into path selection.
+      IMPLEMENTATION-TODO P5.7-b; 04 §4.1. Bar: UNITS + PLAN (default arm ZERO
+      diffs) + at least one LIMIT-over-join query whose chosen path moves.
 - [ ] **M0127-P5.8 — collapse limits with PG's actual semantics** (03 §6: flat
       comma lists are always ONE problem; limits govern sub-joinlists and
       explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening

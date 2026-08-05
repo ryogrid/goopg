@@ -1,48 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.6-f-vii** — LANDED, all three named gates green,
-committed + pushed. It also **closed M0127-P5.6-f-viii** (Q47).
+Last loop: **M0127-P5.7-a** — LANDED, gates green, committed + pushed.
+It also decomposed P5.7 and UNBLOCKED P5.6-d.
 Facts the next loop must NOT re-derive:
 
-1. `estimateAggregate` no longer answers `child/2`. `estimateNumGroups`
-   (`internal/planner/cardinality.go`) is the port of `estimate_num_groups`
-   (selfuncs.c:3449) — unique vars per grouping expr, per-relation ndistinct
-   product clamped to `rel->tuples` (÷10 above one var, floored at the largest
-   single nd), the Yao/Dell'Era restriction term (new `relFilteredRows` walk
-   recovers `rel->rows` from the plan tree), product across rels, closing
-   clamp to `input_rows`. Also ports `get_variable_numdistinct`'s no-stats
-   tail and `clamp_row_est` (`clampRowEstF`).
-2. **Q47 is FIXED.** The item was filed as explicitly NOT load-bearing for it;
-   it was. `v1` body 3 626 → 7 252 (PG 7 643), `CTE Scan on v1` outer 6 → 12,
-   `Nested Loop rows=1958` → `Hash Join rows=7252`, 12 s vs a 300 s timeout,
-   100 rows matching the oracle. No rescan-cost term was needed — -f-viii's
-   alternative hypothesis ("the rescan is unpriced") was never reached and
-   stays unmeasured.
-3. **The DS05 named TIMEOUT set is EMPTY** for the first time since §5.15.
-4. Guard to remember: a new hand-written Expr type switch fails
-   `TestExprSwitchInventoryIsPinned`. Build on `walkExprRefs`/`exprChildSlots`
-   (exprwalk.go) — which is also what let `groupVarsOfExpr` distinguish
-   "variable-free constant" (walk exhaustive, no refs → ignore) from "opaque
-   expression" (walk aborted → DEFAULT_NUM_DISTINCT).
-5. Ledgered, NOT implemented (4 upstream refinements + 1 sibling gap): EC
-   dedup (step 3), `estimate_multivariate_ndistinct`, the boolean
-   short-circuit (`exprType` unreachable in this package), the volatile arm,
-   and `estimateSetOp` / `*Distinct` / `*DistinctOn` still running no group
-   estimate. Each needs a planner facility that does not exist yet.
+1. `hashJoinCost` (`internal/planner/cost_funcs.go`) now takes a
+   `hashJoinInputs` struct and calls `hashsize.Choose` — the executor's own
+   geometry function (`joinOp.buildGeometry`, operators_join_agg.go:624) with
+   the executor's own argument shape. `NBatch > 1` applies PG's charge verbatim
+   (costsize.c:4239-4248): `seq*innerPages` at STARTUP, `seq*(innerPages +
+   2*outerPages)` at run. `spillPages` = `page_size` with
+   `relation_byte_size` → `hashsize.EntryBytes`.
+2. **M0126-0013's `seq_page_cost * innerRows/100` is GONE.** It cited
+   costsize.c:4166 for a charge upstream does not make there — PG charges
+   pages only under `numbatches > 1`, and for the SPILL, not the resident
+   table. Do not re-add it.
+3. **The finding is the width that crosses the sibling boundary.** PG passes a
+   BYTE width (packed MinimalTuple); goopg's entry is a `[]Datum` of 48-byte
+   structs, so size follows the COLUMN count and the executor passes
+   `len(schema)`. Hence new `RelOptInfo.NCols` (leaf schema for a base rel,
+   sum of inputs for a join rel) + `relNCols` / `entryNCols` accessors.
+   Feeding the byte-valued `Width` here would mis-size the same build ~25×.
+4. **PLAN was not run and that is not a skip.** Both `hashJoinCost` callers
+   are behind OFF-by-default gates: `costJoinCandidate` only runs under
+   `costDrivenJoinOrder` (bushy.go:785), and the PG-shaped DP's `pathgen.go`
+   has NO `planSelect` caller at all. The default arm has zero *reachable*
+   plan movement — verified structurally, then empirically by SPOT.
+5. Ledgered, NOT implemented (4 rows): per-session `work_mem` never reaches
+   the planner (`costParams.workMem` pinned at `hashsize.DefaultMemLimitBytes`
+   = the executor's own fallback, so the two agree at the default and ONLY
+   there); `spillPages` prices the in-memory footprint, not `spillWriter`'s
+   narrower uvarint encoding; `nbatch` unexposed on `Path` for EXPLAIN;
+   the LIMIT `tuple_fraction` → new item **M0127-P5.7-b**.
 
-Gates run: UNITS green (`/tmp/units-p56fvii.log`, 0 failures, executor
-re-ran at 6.2 s); estimate audit `2026-08-05-p56fvii.txt` — exit 1 is the
-UNCHANGED standing state (Q18's only violation, improved 23 433× → 23 015×),
-no new violation, all joinrels <1 % except Q20 which IMPROVED 30.2× → 24.9×;
-DS05 sweep `sweep-20260805-112902.txt` exit 0, PASS=95 MISMATCH=0
-CKMISMATCH=0 ERROR=0 **TIMEOUT=0**, delta named `PASS +Q47 / TIMEOUT −Q47`,
-59/99 plan shapes changed; commit-hook pgbench smoke.
+Gates run: UNITS green (`/tmp/units-p57a.log`, exit 0, zero FAIL lines,
+executor re-ran at 6.17 s); SPOT `scripts/tpch-spotcheck.sh` RESULT=PASS
+(`/tmp/spot-p57a.log`, Q12 rows=2, Q13 rows=35, both canonical, 27.7 s query
+phase, peak 10 638 MB); commit-hook pgbench smoke. No orphaned servers.
 
 Nightly triage 20260805-014309: unchanged, both items already filed under
 M-NIGHTLY and left unchecked per the banner. No new nightly run since.
 
-Next step: per the banner (M0124 → M0125 → M0127), pick the next open M0127
-P5.6 item from `.ralph/fix_plan.md` — the -f chain is now closed through
--f-viii, so the head of the remaining work is the P5.6-g / P5.7 items.
+Next step: per the banner (M0124 → M0125 → M0127), the head of open M0127
+work is **M0127-P5.6-d** (now unblocked — delete `costJoinCandidate`'s
+`largeBuildThreshold` quadratic overshoot, which the `NBatch > 1` charge
+supersedes and prices better, since 2 M rows is a fixed count while the real
+threshold depends on width). Note: it lives on the `costDrivenJoinOrder` arm,
+so DS05 shows no movement unless that flag is ON.
 
 In-flight: none.

@@ -414,6 +414,34 @@ func pow(base, exp int) int {
 // TestMakeJoinRelRejectsOverlap: PG asserts non-overlap (joinrels.c:706);
 // goopg returns it, because the search's failure mode is "fall back to the
 // syntactic shape", not "abort".
+// TestMakeJoinRelAddsColumnCounts pins the join arm of RelOptInfo.NCols
+// (M0127-P5.7-a). A join row is its two inputs concatenated, so the count adds
+// — and it must, because `hashJoinCost` solves the hash geometry for a build
+// over a JOIN rel just as often as over a base rel, and a zero there would
+// price a multi-gigabyte intermediate build as never spilling.
+func TestMakeJoinRelAddsColumnCounts(t *testing.T) {
+	s := jslCtx(t, 3)
+	s.clauses = jslClauses()
+	s.builder = &recordingBuilder{}
+	for i, rel := range []*RelOptInfo{s.findRel(rA), s.findRel(rB), s.findRel(rC)} {
+		rel.NCols = i + 2 // 2, 3, 4
+	}
+	ab, err := s.makeJoinRel(s.findRel(rA), s.findRel(rB))
+	if err != nil {
+		t.Fatalf("makeJoinRel(a,b): %v", err)
+	}
+	if ab.NCols != 5 {
+		t.Fatalf("NCols(a|b) = %d, want 5", ab.NCols)
+	}
+	abc, err := s.makeJoinRel(ab, s.findRel(rC))
+	if err != nil {
+		t.Fatalf("makeJoinRel(ab,c): %v", err)
+	}
+	if abc.NCols != 9 {
+		t.Fatalf("NCols(a|b|c) = %d, want 9 — the count must compose, not reset", abc.NCols)
+	}
+}
+
 func TestMakeJoinRelRejectsOverlap(t *testing.T) {
 	s := jslCtx(t, 2)
 	s.clauses = jslClauses()

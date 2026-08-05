@@ -1155,8 +1155,34 @@
   (`PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`,
   `verdict-changes=none`, one runtime move Q83 7→3 s).
   [09](09-verification-and-acceptance.md) §5.16.
-- [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
-  split for LIMIT-over-join.
+- [x] **P5.7-a** nbatch-aware `hashJoinCost` via the shared sizing fn. DONE
+  2026-08-05. `hashJoinCost` takes a `hashJoinInputs` struct and calls
+  `hashsize.Choose` — the executor's own function with the executor's own
+  argument shape — then applies upstream's batch I/O charge verbatim when it
+  answers `NBatch > 1` (costsize.c:4239-4248: `innerPages` at startup,
+  `innerPages + 2·outerPages` at run). It REPLACES M0126-0013's unconditional
+  `seq_page_cost · innerRows/100`, which cited a page charge upstream does not
+  make (PG charges pages only under `numbatches > 1`, and for the spill rather
+  than the resident table) and which, being monotone in `innerRows`, could not
+  draw the fits/does-not-fit distinction that decides the plan.
+  New `RelOptInfo.NCols`: goopg's hash entry is a `[]Datum` of 48-byte structs,
+  so its size follows the COLUMN count, not the byte width `Width` carries, and
+  the executor passes `len(schema)` — feeding `Width` here would have sized the
+  same build ~25× differently on the two sides of the sibling-path rule.
+  Deferred (2 ledger rows, 2026-08-05): per-session `work_mem` does not reach
+  the planner (fixed at the executor's 512 MB fallback, so the two agree at the
+  default and only there), and `spillPages` prices the in-memory footprint
+  rather than the narrower batch-file encoding. `nbatch` is still not exposed
+  on the `Path` for EXPLAIN. Bar met: UNITS; PLAN not applicable — both
+  `hashJoinCost` callers are behind OFF-by-default gates (`costDrivenJoinOrder`,
+  and the PG-shaped DP, which has no `planSelect` caller at all), so the default
+  arm has zero reachable plan movement.
+  [04](04-cost-and-cardinality.md) §4.1, [06](06-hash-spill-and-memory.md) §5.
+- [ ] **P5.7-b** Startup/Total split for LIMIT-over-join. `hashJoinCost` has
+  always returned both numbers and P5.7-a made them move independently, but
+  nothing SELECTS on startup: PG's `tuple_fraction` (`grouping_planner`,
+  planner.c) is what chooses `cheapest_startup` over `cheapest_total` under a
+  LIMIT, and goopg's `RelOptInfo.CheapestStartup` is computed and unread.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
   flat comma lists are always ONE problem; limits govern sub-joinlists and
   explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening

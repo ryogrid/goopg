@@ -327,6 +327,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			rows = 1
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
+		// A join row is the concatenation of its two inputs' rows — the
+		// executor's Join emits left++right — so the column count adds
+		// (M0127-P5.7-a).
+		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

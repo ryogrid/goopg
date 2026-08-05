@@ -66,7 +66,15 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	// per-parameterisation one (PG's ppi_rows; cost_hashjoin reads
 	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
 	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
-	cost := hashJoinCost(cp, p.Cost, b.Cost, p.Rows, b.Rows, joinRel.Rows, len(keys))
+	cost := hashJoinCost(cp, hashJoinInputs{
+		outer: p.Cost, inner: b.Cost,
+		outerRows: p.Rows, innerRows: b.Rows,
+		outputRows:     joinRel.Rows,
+		numHashClauses: len(keys),
+		// Column counts come from the RELS, not the paths: a parameterised
+		// path returns fewer ROWS than its rel but the same columns.
+		outerCols: relNCols(probe), innerCols: relNCols(build),
+	})
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
 	// `hashjointuples`, costsize.c:4432).

@@ -228,6 +228,9 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		rows := initialRelRows(leaf, relInfos[i])
 		width := nodeTupleWidth(leaf)
 		rel := newRelOptInfo(RelSet(1)<<uint(i), rows, width)
+		// The column count the hash geometry is solved for, from the same
+		// schema the executor will call len() on (M0127-P5.7-a).
+		rel.NCols = len(leaf.Output())
 		// The leaf is recorded on the rel as well as inside the PathPrebuilt
 		// below, because two different consumers need it two different ways:
 		// createPlan's PathPrebuilt arm returns the node it wrapped, while the

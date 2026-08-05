@@ -163,6 +163,20 @@ type RelOptInfo struct {
 	Rows   float64
 	Width  int
 
+	// NCols is how many COLUMNS a row of this relation carries. It sits beside
+	// Width (which is bytes) because goopg has two different width models and
+	// they answer two different questions: Width feeds the page math PG feeds
+	// with `pathtarget->width`, while NCols feeds `hashsize.Choose`, whose
+	// per-row footprint is `48·columns` because a goopg hash entry is a []Datum
+	// and not a packed MinimalTuple. Deriving one from the other is not
+	// possible and guessing is not safe — see hashJoinInputs.innerCols.
+	//
+	// Set by the two production constructors (`buildInitialRels` from the
+	// leaf's schema, `makeJoinRel` as the sum over the two inputs, which is
+	// what the executor's Join concatenates). Zero on a rel built by a test
+	// that does not care, which `relNCols` reads as "unknown".
+	NCols int
+
 	Pathlist        []*Path
 	PartialPathlist []*Path
 
@@ -212,6 +226,29 @@ type RelOptInfo struct {
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.
 func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 	return &RelOptInfo{Relids: relids, Rows: rows, Width: width}
+}
+
+// relNCols is the column count the hash-join cost model must feed
+// `hashsize.Choose` for this relation (M0127-P5.7-a).
+//
+// It prefers the field the search set, and falls back to the base leaf's own
+// schema — the rel and its leaf cannot disagree about how many columns a scan
+// of it produces, and the fallback keeps a rel constructed without the field
+// (every test that calls newRelOptInfo directly) priced correctly whenever it
+// is a base rel. Zero is returned only when neither is available, and
+// hashJoinCost reads that as "assume no spill", which is what it did before
+// this function existed.
+func relNCols(r *RelOptInfo) int {
+	if r == nil {
+		return 0
+	}
+	if r.NCols > 0 {
+		return r.NCols
+	}
+	if r.baseLeaf != nil {
+		return len(r.baseLeaf.Output())
+	}
+	return 0
 }
 
 // newPrebuiltPath wraps an already-built executor Node as a Path over rel. Cost
