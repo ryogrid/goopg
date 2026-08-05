@@ -66,6 +66,51 @@ A documented no-go with attribution (§6) is an acceptable S5 outcome — the
 flag then stays OFF and the bundle's planner half returns to design. The
 executor stages S0–S4 stand on their own gates regardless.
 
+### 3.1 The run, and why clause 1 could not have caught it (P5.9, 2026-08-05)
+
+**Run 1 of this bar is a documented NO-GO.** `GOOPG_PGSHAPED_DP` stays OFF.
+Evidence: `analysis/leftdeep-joins/2026-08-05-p59-s5-acceptance.txt`
+(HEAD `1bb24984`, TPC-H SF1, one binary, two arms differing only in the flag).
+Clause 1 fails on four counts — Q2 returns 0 rows against 455, Q7/Q8/Q9 raise
+`42883`, Q17 hangs past 3300 s where flag-OFF takes 20.93 s — and clause 3 on
+Q5 (4.15×) and Q10 (3.83×). Clause 5 is the one clause that passed: zero
+`MultiHashJoin`, zero fusion, in both arms across the EXPLAIN sweep. The
+flag-OFF arm completed 22/22 in 380.1 s, inside clause 2's allowance, so the
+bar is not failing for want of a contemporaneous baseline.
+
+All of clause 1's failures are **one defect**, attribution class (c): the search
+boundary publishes a coordinate map that is a **rotation** of the correct
+permutation. `projectToBindingOrder` (`createplanroot.go:240`) is
+self-consistent, so the wrong map arrives from the `outputLayout` that
+`createPlanNode` returns for the winning join arm. The discriminator across the
+sweep is `boundaryMapIsIdentity`: a winner that is already left-deep in binding
+order takes the early return and is correct; a winner that reorders the leaves
+gets the rotation.
+
+Two things this bar has to learn from it, both binding on the re-run:
+
+- **A rotation satisfies `boundaryMap`'s tripwire.** §10 of
+  [03](03-join-search-pg-dp.md) installed that check against the M0097-0058
+  class, and it tests exactly three things — HOLE, OUT OF RANGE, DUPLICATE —
+  each of which is a way of *not* being a permutation of `[0,width)`. A
+  rotation is a permutation, so the check passes on the one instance of the
+  class the search actually produced. A permutation test is not a correctness
+  test for a map whose contract is *which* permutation.
+- **Clause 1's row-count comparison cannot see this defect.** The reproducer
+  returns the right number of rows with every column value shifted one position
+  from its name. Five queries in the ON arm "matched" on count and were not
+  compared on value. Clause 1 is therefore amended: **22/22 complete plus
+  VALUE-level equality against the flag-OFF arm**, not row counts. The three
+  `42883` errors are not three bugs — `extract(year from …)` is the only TPC-H
+  construct that type-checks its argument at run time, so Q7/Q8/Q9 are simply
+  the only three places the silent corruption becomes loud. A bar that relies
+  on a query being loud is measuring the query, not the engine.
+
+Clauses 4 and 6, the §4 parity gate and the §5 estimate audit all score plan
+QUALITY, and were deliberately not run: they compare plans from a build whose
+plans compute the wrong answer. They are the first instruments to re-run once
+the rotation is fixed, and they remain part of the bar P5.9 must clear.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

@@ -8055,6 +8055,60 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       retire `GOOPG_COST_DRIVEN_JOINORDER`, or record the documented no-go.
       File `analysis/leftdeep-joins/…-s5-acceptance.txt`. IMPLEMENTATION-TODO
       P5.9; 09 §3-§5; 08 §2. Bar: the full acceptance bar.
+      **↳ RUN 1 EXECUTED 2026-08-05 — DOCUMENTED NO-GO (09 §3.1);
+      `analysis/leftdeep-joins/2026-08-05-p59-s5-acceptance.txt`.** The flag
+      stays OFF and the item stays OPEN: 09 §3 admits a no-go as an S5 outcome,
+      but P5.9 is the *flip*, and the flip did not happen. Clause 1 failed on
+      four counts (Q2 0 rows vs 455; Q7/Q8/Q9 `42883`; Q17 >3300 s vs 20.93 s)
+      and clause 3 on Q5 4.15× / Q10 3.83×; clause 5 PASSED (zero
+      `MultiHashJoin`, zero fusion, both arms). The flag-OFF arm did 22/22 in
+      380.1 s, inside clause 2's allowance, so the bar is not failing for want
+      of a baseline. **All clause-1 failures are ONE defect** — the search
+      boundary's coordinate map is a ROTATION of the correct permutation, so
+      every query whose winner is not already left-deep in binding order gets
+      each column's value one position from its name;
+      `extract(year from …)` is merely the only TPC-H construct that
+      type-checks at run time, which is why exactly three queries were loud.
+      Re-run the whole bar after P5.9-c/-d/-e. 3 ledger rows.
+- [ ] **M0127-P5.9-c — the search boundary publishes a rotated coordinate map.**
+      The P5.9 blocker. `projectToBindingOrder`
+      (`internal/planner/createplanroot.go:240`) is self-consistent, so the bad
+      map arrives from the `outputLayout` returned by `createPlanNode` for the
+      winning join arm (`createplanjoin.go`: `createHashJoinPlan` /
+      `createMergeJoinPlan` / `createNestLoopPlan` / `baseRelLayout`).
+      Discriminator across the sweep is `boundaryMapIsIdentity` — an
+      already-binding-order winner takes the early return and is correct.
+      **Reproducer (2 relations, 1 predicate):** `select * from orders, customer
+      where o_custkey = c_custkey and o_orderkey = 1` under
+      `GOOPG_PGSHAPED_DP=1` on SF1; flag-OFF is correct. Second half:
+      strengthen `boundaryMap` (`createplanroot.go:174`) from a PERMUTATION test
+      to an identity test against each leaf's recorded `baseOffset`/width — its
+      three documented failure modes (HOLE / OUT OF RANGE / DUPLICATE) are all
+      ways of not being a permutation, and a rotation is one, so the 03 §10
+      tripwire is blind to the one M0097-0058-class instance the search actually
+      produced. 09 §3.1; 03 §10. Bar: UNITS + a regression test on the
+      reproducer + SPOT.
+- [ ] **M0127-P5.9-d — the acceptance harness compares row counts, not values.**
+      `cmd/tpch-runner` reports `rows=N` only, so five ON-arm queries "matched"
+      without their tuples ever being compared, and the bar detected the defect
+      only through three queries that happened to raise. Add a result-digest
+      mode (stable per-row hash in scan order, plus an order-independent digest
+      for queries without a total `ORDER BY`) and diff the arms' digests. Must
+      land BEFORE P5.9 is re-run — the re-run's whole question is whether the
+      quiet queries are corrupt too. 09 §3.1 (clause 1 as amended). Bar: UNITS +
+      a two-arm digest diff on the flag-OFF arm against itself.
+- [ ] **M0127-P5.9-e — Q17 hangs at flag ON and the cause is unidentified.**
+      Re-measured in isolation (fresh server, age 0, only Q17): >1200 s at 3.8%
+      CPU / ~8.7 GB RSS vs 20.93 s flag-OFF, so the documented sweep-tail /
+      `GOGC=off` confound is REFUTED. Its flag-ON EXPLAIN differs from flag-OFF
+      by one line (a duplicated `part` qual no longer re-applied at the top
+      join), so nothing printed predicts 157×. Standing hypothesis, UNTESTED:
+      the boundary rotation feeds the hash join a rotated key column and
+      degenerates it to one bucket (the known single-key-degeneracy shape).
+      **Re-measure after P5.9-c lands before opening any separate work** — if it
+      still hangs, profile it (low CPU + large heap points at allocation, not a
+      spin) rather than re-reading EXPLAIN. 09 §5 (of the acceptance file).
+      Bar: Q17 ≤ 2× its flag-OFF 20.93 s, or an attributed finding.
 - [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
       conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
       `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1

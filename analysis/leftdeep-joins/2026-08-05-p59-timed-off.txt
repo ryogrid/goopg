@@ -1,0 +1,27 @@
+# arm=timed-off GOOPG_PGSHAPED_DP=0 GOOPG_PGSHAPED_COLLAPSE=0
+# started 2026-08-05T13:52:41+09:00
+Q1: OK elapsed=7.61s rows=4
+Q2: OK elapsed=2.66s rows=455
+Q3: OK elapsed=6.79s rows=11521
+Q4: OK elapsed=41.97s rows=5
+Q5: OK elapsed=6.20s rows=5
+Q6: OK elapsed=3.36s rows=1
+Q7: OK elapsed=12.39s rows=4
+Q8: OK elapsed=16.06s rows=2
+Q9: OK elapsed=16.48s rows=175
+Q10: OK elapsed=5.90s rows=20501
+Q11: OK elapsed=1.68s rows=819
+Q12: OK elapsed=10.55s rows=2
+Q13: OK elapsed=11.85s rows=35
+Q14: OK elapsed=3.48s rows=1
+Q15-CREATEVIEW: OK elapsed=0.00s rows=0
+Q15a-VIEWBODY: OK elapsed=3.89s rows=10000
+Q15b-MAIN: OK elapsed=35.28s rows=1
+Q16: OK elapsed=0.94s rows=18213
+Q17: OK elapsed=20.93s rows=1
+Q18: OK elapsed=30.47s rows=10
+Q19: OK elapsed=3.69s rows=1
+Q20: OK elapsed=17.63s rows=76
+Q21: OK elapsed=113.42s rows=405
+Q22: OK elapsed=6.93s rows=7
+# finished 2026-08-05T13:59:13+09:00

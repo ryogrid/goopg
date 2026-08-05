@@ -1292,6 +1292,40 @@
 - [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.
+  **Run 1 executed 2026-08-05 — DOCUMENTED NO-GO** (09 §3.1;
+  `analysis/leftdeep-joins/2026-08-05-p59-s5-acceptance.txt`). Flag stays OFF;
+  the item stays open because P5.9 is the flip. Clause 5 passed (zero
+  `MultiHashJoin`, zero fusion, both arms); clause 1 failed on four counts and
+  clause 3 on two, and every clause-1 failure is the ONE defect below. §4/§5
+  and the DS05 gate were deliberately not run — they score plan QUALITY on a
+  build whose plans compute the wrong answer. Re-run the whole bar after
+  P5.9-c/-d/-e.
+- [ ] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
+  P5.9 blocker. `projectToBindingOrder` (createplanroot.go:240) is
+  self-consistent, so the bad map comes from the `outputLayout` returned by
+  `createPlanNode` for the winning join arm (createplanjoin.go:
+  `createHashJoinPlan` / `createMergeJoinPlan` / `createNestLoopPlan` /
+  `baseRelLayout`). `boundaryMapIsIdentity` is the sweep's discriminator.
+  Reproducer: `select * from orders, customer where o_custkey = c_custkey and
+  o_orderkey = 1` at `GOOPG_PGSHAPED_DP=1` on SF1. Then strengthen `boundaryMap`
+  (createplanroot.go:174) from a permutation test to an identity test against
+  each leaf's `baseOffset`/width — §10's tripwire tests HOLE / OUT OF RANGE /
+  DUPLICATE, all of which are ways of not being a permutation, and a rotation
+  is one. Gate: units + a regression test on the reproducer + SPOT.
+- [ ] **P5.9-d** Result-digest mode for `cmd/tpch-runner` (per-row hash in scan
+  order + an order-independent digest for queries without a total `ORDER BY`),
+  and diff the two arms. 09 §3.1 amends clause 1 from row counts to VALUE
+  equality: this run produced a query with the right count and every value one
+  position off, and was saved only by `extract()`'s run-time type check. Must
+  land before P5.9 is re-run. Gate: units + a digest self-diff on the OFF arm.
+- [ ] **P5.9-e** Q17 hangs at flag ON, cause unidentified. Isolated re-run
+  (fresh server, age 0, Q17 alone) still exceeded 1200 s at 3.8% CPU / ~8.7 GB
+  RSS vs 20.93 s flag-OFF, refuting the sweep-tail / `GOGC=off` confound. Its
+  EXPLAIN differs by one line. Untested hypothesis: the P5.9-c rotation feeds
+  the hash join a rotated key column → one bucket (single-key degeneracy).
+  Re-measure after P5.9-c before opening separate work; profile rather than
+  re-read EXPLAIN if it survives. Gate: Q17 ≤ 2× 20.93 s, or an attributed
+  finding.
 
 ## P-S6 — Compiled key/residual evaluation [S6]
 

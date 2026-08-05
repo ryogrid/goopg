@@ -2,8 +2,8 @@
 
 | field | value |
 | --- | --- |
-| status | draft — **DESIGN ONLY**, implementation not started |
-| date | 2026-08-02 |
+| status | S0–S4 landed; S5 (the PG-shaped search) implemented and behind `GOOPG_PGSHAPED_DP`, **flag OFF** — acceptance run 1 is a documented NO-GO ([09](09-verification-and-acceptance.md) §3.1, `analysis/leftdeep-joins/2026-08-05-p59-s5-acceptance.txt`); S6/S7 blocked on the re-run |
+| date | 2026-08-02 (status 2026-08-05) |
 | scope | (a) restrict every emitted plan tree to **PG-shaped binary joins** — left-deep chains *and* bushy composite-composite joins, exactly the shapes PG 18.3's `join_search_one_level` can produce (`*planner.Join` only; `MultiHashJoin` deleted as a plan node), (b) replace the subset-bitmask DP with a **PostgreSQL-shaped level-wise DP** (`standard_join_search` / `join_search_one_level` analogue over `RelOptInfo` pathlists, all three phases — clause joins, bushy, last-ditch), and (c) rework the join operators so a binary hash-join cascade executes with **PG-grade efficiency** — streaming probe, zero per-level intermediate materialisation, multi-column keys, work_mem-bounded hybrid-hash spill — making both `MultiHashJoin` and the runtime fusion operator (`fusedHashJoinOp`) permanently unnecessary |
 | non-goals | GEQO (genetic search) port; parallel hash **build** (leader-serial shared build stays, [parallel-query/](../parallel-query/README.md) owns it); extended statistics; bitmap heap scans; a new executor IR (`create_plan` still translates Paths to the existing `Operator` nodes) |
 | baseline | PostgreSQL 18.3 under `postgres/` (read-only oracle) |
