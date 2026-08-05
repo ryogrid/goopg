@@ -2958,3 +2958,90 @@ properties whatsoever — not `Join Filter`, not `Hash Cond`, not `Filter`), and
 `NestedLoopIndexJoin`'s residual, which keeps its `Filter:` label because its
 `Predicate` mixes hoisted inner scan filters with join residuals and would be
 *less* faithful relabelled wholesale.
+
+### 3.18 The collapse-ON acceptance pass: green everywhere, and the flag cannot move a plan (P5.9-m, 2026-08-06)
+
+08 §2's S5 row gates on running this bar "once with collapse OFF, then with
+collapse ON", and no arm to date had ever set `GOOPG_PGSHAPED_COLLAPSE=1`. It has
+now been run end to end. **Every clause is green and the verdict is a NO-GO**,
+because the same run also measured why the green is uninformative: on the whole
+measured corpus the flag cannot change a plan, and the reason is not in the
+collapse pass.
+
+**The arms.** One binary (`5ed79a1b78bab6a8`, HEAD `d867ae03`), `GOOPG_PGSHAPED_DP=1`
+explicit on both, `COLLAPSE` the only variable.
+
+| channel | collapse OFF | collapse ON |
+|---|---|---|
+| TPC-H SF1, 24 labels | 370.29 s | 364.26 s (**0.984×**), **24/24 MATCH on values** |
+| TPC-DS SF0.5 sweep | `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` | **identical**, `STATUS-DELTA verdict-changes=none runtime-moves=0` |
+| DS05 plan capture, fixed binary | — | **`queries=99 same=99 changed=0`** |
+
+Artefacts: `analysis/leftdeep-joins/2026-08-06-p59m-coll-{off,on}.txt`,
+`bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260806-035500.txt`,
+`plans-20260806-{035500,042316}.txt`.
+
+Read the sweep's own plan channel with §3.17's header: it reports
+`changed (36)` against `plans-20260806-031851.txt`, a baseline captured before
+the `Join Filter:` commit. That count is §3.17's line, not collapse. The
+one-variable number is the third row — ON vs OFF at a FIXED binary, both
+post-`d867ae03` — and it is **zero**.
+
+**Why the TPC-H arm is a control, not a test.** `GOOPG_PGSHAPED_COLLAPSE` acts
+only on an explicit INNER/CROSS JOIN; `joinPinned` pins outer joins in both
+regimes. The TPC-H corpus contains exactly one explicit join — Q13's
+`LEFT OUTER JOIN` — so **0 of 22** queries pose a different search problem under
+the flag, and the 0.984× above is host noise measured to three digits.
+`TestCollapseIsAControlOnTheTPCHCorpus` pins that, running the production
+`deconstructJointree` over the production parse at both flag values; if the
+corpus ever gains an inner-JOIN spelling the test fails and says the arm has
+become a real test.
+
+**The TPC-DS corpus is eligible — twice.** Same instrument over the 99 dsqgen
+queries (3 unparseable: Q36, Q70, Q86): **Q72 and Q75** change search problem,
+nothing else. A `grep -c ' join '` says three, adding Q78 — and is wrong. Q78's
+chains are `A LEFT JOIN B … JOIN date_dim …`: the pinned outer join has already
+folded its two sides into ONE joinlist item, so the inner join that follows
+offers a two-member problem either way. The planner's count is the one the arm
+runs, which is why the measurement goes through `deconstructJointree` and not
+through a regex. (Same reason a two-way `a JOIN b` is not eligible: `[[[0] [1]]]`
+and `[0 1]` differ only by the inert nesting of initsplan.c:1417, and
+`canonJoinlist` strips it before comparing.)
+
+**So why did Q72 and Q75 plan identically?** Two facts predict that observable
+and they have opposite consequences — the search ran and chose the same plan, or
+the search never ran. The printed plan cannot separate them; the enumeration
+trace (§3.12) can, because "no trace" IS the evidence for the second. Measured
+with `GOOPG_PGSHAPED_DP_TRACE=1` on the SF0.5 cluster
+(`analysis/leftdeep-joins/p59m-collapse-probe.sh`):
+
+- Q72's eleven-way explicit-JOIN level: **no trace at all**, in either regime.
+- Q75: one traced problem, `nrels=2 rels=curr_yr,prev_yr` — its top-level
+  two-way CTE join. The six-way inner-JOIN level the flag collapses: no trace.
+- Synthetic control, same three relations written both ways:
+  `store_sales JOIN date_dim ON … JOIN item ON …` produces **no** trace with
+  `COLLAPSE=1`, while `FROM store_sales, date_dim, item WHERE …` produces the
+  full four-pair enumeration. The two plans differ (the explicit-JOIN one carries
+  a leftover `Filter: (date_dim.d_year = 2000)` above the join), which is the
+  legacy syntactic path's signature.
+
+**The cause is the seam, not the collapse pass.** `ctx.joinlist` is read only
+after `tryPGShapedJoinSearch`'s preconditions pass, and one of them is that the
+pre-search node's leaves enumerate to the binding count. `extractScans`
+(`internal/planner/bushy.go:261`) descends `JoinTypeCross` and nothing else, so
+an explicit JOIN arrives as ONE node for N bindings and the seam declines before
+the joinlist is consulted. `TestPGShapedSeamDeclines/leaf count disagrees with
+binding count` has pinned that gate from the other side since P5.9; what this
+pass adds is that it is also the collapse flag's blocker — the flag flattens a
+joinlist that the statement never gets far enough to use.
+`TestCollapseDoesNotReachTheSearch` pins the pair, and fails the day the seam
+learns to walk an INNER chain, which is exactly when this no-go should be
+re-measured.
+
+**Verdict: `pgShapedCollapse` stays default OFF.** 08 §2's S5 collapse gate is
+**not discharged** — it was run, and what it measured is that the flag is
+currently inert end to end. Flipping it would advance the row with a change that
+cannot move a plan, which is the §3.15/§3.16 defect one flag generation later:
+a gate reporting a number about a variable it did not vary. The unblock is a
+seam that admits an INNER-join chain (ledger row, 2026-08-06); collapse becomes
+measurable the moment it lands, and this section is the protocol to re-run.

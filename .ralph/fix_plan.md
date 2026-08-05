@@ -8118,7 +8118,55 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       measurement was of this exact configuration (PASS=95, MISMATCH=0,
       cell-for-cell the flag-OFF baseline) and stands in the interim. → the
       re-run is M0127-P5.9-n below. 3 ledger rows.
-- [ ] **M0127-P5.9-m — the collapse-ON acceptance pass.** NEW 2026-08-06. 08 §2
+- [x] **M0127-P5.9-m — the collapse-ON acceptance pass.** **DONE 2026-08-06 —
+      every clause GREEN, and the COLLAPSE flip is a NO-GO** (09 §3.18). Ran at
+      ONE binary with `COLLAPSE` as the only variable: TPC-H SF1 **24/24 MATCH
+      on values**, 364.26 s ON vs 370.29 s OFF (0.984×); DS05 SF0.5
+      `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` with
+      `STATUS-DELTA verdict-changes=none runtime-moves=0`; and a **one-variable**
+      DS05 plan A/B (both arms post-`d867ae03`, same binary) of
+      `queries=99 same=99 changed=0`. The sweep's own plan channel says
+      `changed (36)` — that is §3.17's `Join Filter:` line against a pre-`d867ae03`
+      baseline, not collapse; the fixed-binary number is the zero.
+      **Why the green is uninformative, measured not assumed.** New instrument
+      `internal/planner/collapse_corpus_test.go` runs the production
+      `deconstructJointree` over the production parse at both flag values:
+      **0 of 22** TPC-H queries are collapse-eligible (its one explicit join is
+      Q13's LEFT OUTER, pinned in both regimes) — so the TPC-H arm is a CONTROL —
+      and **2 of 99** TPC-DS queries are (Q72, Q75). A lexical `grep ' join '`
+      says three; Q78's inner join follows a pinned outer join, so both regimes
+      offer the same two-member problem. Those two eligible queries then planned
+      IDENTICALLY, and the enumeration trace says why: Q72's eleven-way
+      explicit-JOIN level emits **no trace at all** in either regime, and a
+      synthetic 3-relation control is searched written as a comma FROM and not
+      written as `JOIN … ON`. **Cause: the seam, not the collapse pass.**
+      `ctx.joinlist` is read only after `tryPGShapedJoinSearch`'s preconditions
+      pass, and `extractScans` (`bushy.go:261`) descends `JoinTypeCross` only, so
+      an explicit JOIN arrives as ONE node for N bindings and is declined before
+      its joinlist is consulted. `pgShapedCollapse` stays default OFF; 08 §2's S5
+      collapse gate is **run-but-not-discharged**. Guard:
+      `TestCollapseDoesNotReachTheSearch` fails the day the seam admits an INNER
+      chain — the signal to re-run §3.18's protocol. Successor: **M0127-P5.9-r**.
+      1 ledger row. Artefacts: `analysis/leftdeep-joins/2026-08-06-p59m-*`,
+      `p59m-collapse-probe.sh`, `sweep-20260806-035500.txt`,
+      `plans-20260806-042316.txt`.
+- [ ] **M0127-P5.9-r — the seam cannot walk an INNER-join chain, so no explicit
+      JOIN is ever reordered.** NEW 2026-08-06 (09 §3.18, ledger row P5.9-m).
+      `extractScans` (`internal/planner/bushy.go:261`) descends `JoinTypeCross`
+      and nothing else, so `tryPGShapedJoinSearch` declines every FROM clause
+      written with `JOIN … ON` — measured, not inferred: the DP trace is empty on
+      Q72's eleven-way level and on a synthetic three-relation control, while the
+      comma-FROM spelling of the same three relations enumerates all four pairs.
+      Upstream has no such restriction: `deconstruct_recurse`
+      (initsplan.c:1250-1441) plus `distribute_qual_to_rels` put the `ON` quals
+      into the enclosing problem's clause list and search it. Until this lands,
+      03 §6's collapse pass cannot affect a plan and M0127-P5.9-m's no-go stands.
+      Files: `internal/planner/joinsearchseam.go`, `internal/planner/bushy.go`.
+      Bar: `TestCollapseDoesNotReachTheSearch` inverted, then 09 §3.18's protocol
+      re-run and the COLLAPSE flip re-decided. **Correctness surface:** this
+      changes which quals are enforced where, so it needs the full 09 §3 bar, not
+      units alone.
+- [x] **M0127-P5.9-m — SUPERSEDED FILING (kept for attribution).** 08 §2
       gates S5 on the 09 bar run "once with collapse OFF, then with collapse
       ON", and no arm to date has ever set `GOOPG_PGSHAPED_COLLAPSE=1` — every
       script defaults it to 0. That did not block the DP flip and the reason is

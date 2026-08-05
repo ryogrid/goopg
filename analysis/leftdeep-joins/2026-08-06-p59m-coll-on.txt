@@ -1,0 +1,31 @@
+# arm=2026-08-06-p59m-coll-on GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=1
+# started 2026-08-06T03:46:55+09:00
+# engine-id: 2109a304a42310903d51192f7bbb18ec2cbfb093 7fd1be44ee52a840df01199ac884a3952d54920d  diff=e3b0c44298fc
+# engine-binary: on-disk=5ed79a1b78bab6a8 (tmp/goopg-acceptance-bin)
+# per-query cap 600s, serial, digest=1, queries=all
+# host: load7.00 4.54 2.59
+Q1: OK elapsed=6.26s colsig=767ce848ef814ee2 ordered=133c5680f047d5ff unordered=bf655c039b9630a8 rows=4
+Q2: OK elapsed=2.53s colsig=98559dc0378d935e ordered=1c0f630719e8c7bf unordered=ad503517a304eacf rows=455
+Q3: OK elapsed=6.62s colsig=83ee73dd50fba86d ordered=e9c4c543109177bc unordered=bba41dbedb8da83c rows=11521
+Q4: OK elapsed=41.06s colsig=ab046cf17754992f ordered=c81dd5ef71b011bd unordered=08edf1c67591965b rows=5
+Q5: OK elapsed=5.60s colsig=23ed6d41a314eb4e ordered=a73f016b577bbd65 unordered=724af4147aec4771 rows=5
+Q6: OK elapsed=3.23s colsig=2e0a9e7c16d79cc6 ordered=e5a8db4a6798f69b unordered=e5a8db4a6798f69b rows=1
+Q7: OK elapsed=11.46s colsig=effb45ed4c5e2661 ordered=bb9e4e06df20418b unordered=32224e1ce70c1e80 rows=4
+Q8: OK elapsed=13.23s colsig=8acb7c80bbac36a7 ordered=21f43e9716b42ce0 unordered=a779b123b06aa0b5 rows=2
+Q9: OK elapsed=16.13s colsig=d0a60022db317dc9 ordered=23c9981b4db0526f unordered=70790d38086c58c7 rows=175
+Q10: OK elapsed=5.76s colsig=82959e9b048aa541 ordered=8b50c0b2c9370d3b unordered=22a9d410b562ced5 rows=20501
+Q11: OK elapsed=1.33s colsig=a94b0078c4bc16ef ordered=eff730720ef9fbad unordered=9ed7402bd44d2781 rows=819
+Q12: OK elapsed=9.74s colsig=8c6c14235b8e3d44 ordered=fba7d11d65e06180 unordered=957e1055bbe6f1a7 rows=2
+Q13: OK elapsed=11.30s colsig=9694103490f49d86 ordered=eec08e9b8126f0db unordered=d5f2ca3fc4b2c277 rows=35
+Q14: OK elapsed=3.30s colsig=ab278eb7d8e03030 ordered=f0f51b95e71501c4 unordered=f0f51b95e71501c4 rows=1
+Q15-CREATEVIEW: OK elapsed=0.01s colsig=cbf29ce484222325 ordered=cbf29ce484222325 unordered=0000000000000000 rows=0
+Q15a-VIEWBODY: OK elapsed=3.66s colsig=7a934e0bc02f9878 ordered=4c6c419c6b30c9ba unordered=cb496b8e9ca907b7 rows=10000
+Q15b-MAIN: OK elapsed=33.62s colsig=25d4fdb3731a5fa2 ordered=3f4544a4899012d0 unordered=3f4544a4899012d0 rows=1
+Q16: OK elapsed=0.86s colsig=95a4c8de6e558c15 ordered=f1c8857156d37b12 unordered=3774c3c6cf116632 rows=18213
+Q17: OK elapsed=19.55s colsig=d54de0dda81daf86 ordered=acb1af46ffdeef81 unordered=acb1af46ffdeef81 rows=1
+Q18: OK elapsed=29.86s colsig=1c632e3bcd2ea332 ordered=fddc9e18a34446b0 unordered=042ea668685f0835 rows=10
+Q19: OK elapsed=3.80s colsig=2e0a9e7c16d79cc6 ordered=682580e22c803c1f unordered=682580e22c803c1f rows=1
+Q20: OK elapsed=19.16s colsig=5cd9dcbdb8104bbb ordered=8314fb5440bc02e6 unordered=53863a0208813acf rows=76
+Q21: OK elapsed=109.49s colsig=8877f45c5e0db592 ordered=883b3e7811ccd4b4 unordered=8467bd1497050724 rows=405
+Q22: OK elapsed=6.70s colsig=6d31a4f5ee00a4d0 ordered=7cb7d3403621a610 unordered=332f62efd848b934 rows=7
+# finished 2026-08-06T03:53:24+09:00
