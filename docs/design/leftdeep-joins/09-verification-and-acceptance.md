@@ -733,7 +733,7 @@ Evidence: `analysis/leftdeep-joins/2026-08-05-p59run4-s5-acceptance.txt`
 | 3 — no query > 2× | FAIL (5 cells) | **PASS**, worst 1.36× (Q2); Q9 15.83 s ≤ 170.9 s |
 | 4 — TPC-DS SF0.5 | FAIL (7 ERROR, 5 TIMEOUT) | **PASS** `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0` |
 | 5 — no `MultiHashJoin`/fusion | PASS | **PASS** (fourth consecutive) |
-| 6 — bushy-plan capability | PARTIAL | **UNDISCHARGED** |
+| 6 — bushy-plan capability | PARTIAL | **UNDISCHARGED** (§3.11: measured, 2 candidates left) |
 | §4 ratchet `parity_violations` | 0 OFF / **6** ON | **0 OFF / 0 ON** |
 | §5 absolute tripwire | 1 violation per arm (Q18) | 1 violation per arm (Q18), ON the smaller |
 
@@ -783,6 +783,83 @@ partition is among them. Clause 6 then either passes as a cost/stats divergence
 admitted under the ratchet, or names a concrete gap in the bushy phase. Both
 are results; the present state is neither.
 
+**↳ The manual measurement quoted above is superseded by §3.11's instrumented
+one.** "goopg produces no bushy spine on any of the 22, in either arm" is
+false: the flag-ON arm goes bushy on six queries, and on Q20 it chooses PG's
+bushy partition exactly. The three-query PG count and the Q7 partition survive.
+
+### 3.11 The spine channel, built — and goopg was already bushy (P5.9-l, 2026-08-06)
+
+Clause 6's instrument now exists: `internal/estimateaudit/spine.go`, rendered
+into every `cmd/estimate-audit` run that has a PG reference, so §4's ratchet,
+§5's tripwire and the spine diff come out of one arm with no change to
+`scripts/tpch-estimate-audit-arm.sh`.
+
+**Why the parity channel could not have answered this.** `Parity` keys a
+joinrel by the SET of base relations underneath it — upstream's
+`RelOptInfo.relids` — which is the right key for an *estimate* comparison and
+the wrong one for clause 6. On Q7 both engines build the six-relation top
+joinrel, so the parity channel reports it `matched`; what differs is how that
+relset was **partitioned**, and a relset name cannot carry a partition. The
+spine channel computes, for every join node, the relsets of its immediate
+children (`SpineJoin.Inputs`), and classes the node bushy iff both children —
+after descending through every single-child pipeline node between them, which is
+how PG's inner side reaches a join through a `Hash` — are themselves joins.
+
+Applied offline to run 4's committed plans (`--from-plans`, no re-run) against
+the pinned PG 18.3 reference:
+
+| | flag OFF | flag ON |
+|---|---|---|
+| pairings matched | 13 | **24** |
+| PG-only pairings | 44 | **33** |
+| goopg-only pairings | 45 | **32** |
+| bushy spine chosen by goopg | 2 (Q5, Q20) | **6** (Q2, Q7, Q8, Q9, Q10, Q20) |
+| bushy spine chosen by PG | 3 (Q7, Q8, Q20) | 3 (Q7, Q8, Q20) |
+| clause-6 candidates | 2 (Q7, Q8) | **2** (Q7, Q8) |
+
+Three results, in order of how much they move clause 6:
+
+1. **goopg's search expresses AND WINS a real bushy TPC-H partition.** Q20's
+   top pairing is `{nation+supplier} ⋈ {lineitem+part+partsupp}` on *both*
+   engines — the diff prints it `both`. That is the evidence the synthetic
+   4-relation chain tests could not supply: phase 2 built a bushy pair over a
+   five-relation TPC-H relset and `add_path` kept it. Q7's own ON-arm plan is
+   bushy one level under a left-deep top (`{lineitem+orders} ⋈
+   {n1+n2+supplier}`), so the mechanism is live on that query too.
+2. **The flag moves every spine number toward PG.** Matched pairings nearly
+   double, both one-sided counts fall by ~25 %, and the bushy count goes 2 → 6.
+   Run 3's shape-divergence proxy (67 → 46) pointed the same way; this is the
+   same movement measured on the unit clause 6 is stated on.
+3. **Two candidates remain**, and only two: PG's bushy top on Q7
+   (`{customer+lineitem+n2+orders} ⋈ {n1+supplier}`) and on Q8
+   (`{lineitem+orders+part} ⋈ {customer+n1+region}`). Q20's is no longer a
+   candidate because goopg chose it.
+
+Clause 6 is therefore no longer "unmeasured", but it is not yet discharged.
+§4's hard-failure condition is a bushy shape the search *cannot express*, and
+for Q7/Q8 "enumerated and lost on cost" and "never enumerated" still predict the
+same observable — a chosen plan without that pairing. Result 1 is strong
+circumstantial evidence for the first (the same phase-2 code produced a bushy
+winner on Q20 in the same arm), but circumstantial is what §3.10 refused to
+flip on. → **P5.9-l-ii**: the search's own provenance — record every pairing
+`makeJoinRel` was offered, with its phase, and ask directly whether Q7's and
+Q8's partitions are in that set.
+
+Two limits of the channel, both printed rather than silent:
+
+- **Ambiguous pairings are excluded from the candidate list.** A plan that
+  scans one relation name twice without an alias (Q2, Q8, Q17, Q18, Q22 on the
+  ON arm) collapses two range-table entries into one relset member — §4.1's
+  "`shape_mismatches` is an upper bound" note, same cause. The pairing is still
+  printed; it just cannot be adjudicated. Q8's candidate comes from the
+  *reference* side, which does dedupe (`select_rtable_names`, ruleutils.c).
+- **The diff is over CHOSEN spines**, on both sides. It says nothing about what
+  either search enumerated — which is precisely the gap P5.9-l-ii closes.
+
+Evidence: `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` and
+`-README.md`.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),
@@ -806,6 +883,15 @@ skeleton — node type, join type, build/probe side (PG: which child is under
   classed per §6 (usually (b) plan shape) and fixed. Spine mismatches driven
   by cost-constant or stats fidelity stay under the ratchet as usual, and
   are re-reviewed at each ratchet update.
+
+**Where the spine diff actually landed (P5.9-l, 2026-08-06):** inside
+`cmd/estimate-audit` (`internal/estimateaudit/spine.go`), not in a separate
+`scripts/pg-plan-shape-diff.sh`. One arm, one artifact, one PG reference — the
+§4 ratchet, the §5 tripwire and the spine diff are three questions about the
+same pair of captured plans, and splitting them across two drivers is how the
+ratchet and the spine budget would drift apart. Its ratchet line is
+`RATCHET spine_pg_only= spine_goopg_only= bushy_pg= bushy_goopg=
+clause6_candidates=`; the pinned values are in §3.11.
 
 ### 4.1 The ratchet is per-joinrel PARITY, not an absolute factor (P5.6-g-iii, landed 2026-08-05)
 

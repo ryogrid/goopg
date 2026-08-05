@@ -8188,6 +8188,54 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `cmd/estimate-audit/`, `internal/planner/joinsearchlevel.go` (the
       provenance channel), `scripts/tpch-estimate-audit-arm.sh`. 09 §3.10, §4;
       IMPLEMENTATION-TODO P5.9-l.
+      **↳ SPLIT 2026-08-06 — the PLAN-side half is DONE (P5.9-l-i); this item
+      stays open on the SEARCH-side half (P5.9-l-ii).**
+- [x] **M0127-P5.9-l-i — the spine/pairing channel, built, and run 4's manual
+      clause-6 reading refuted.** DONE 2026-08-06 (09 §3.11).
+      `internal/estimateaudit/spine.go`: for every join node of a captured plan
+      it computes the relsets of its two immediate children — the PAIRING,
+      which is the unit clause 6 is stated on and the one thing a relset name
+      cannot carry — and classes the node bushy iff both children are joins
+      after descending the single-child pipeline nodes between them (`Hash`,
+      `Materialize`, `Sort`, `Gather`, `Memoize`, aggregation; written as an
+      arity rule so the next such node either engine learns to print cannot
+      silently mis-class). `SpineDiff`/`CountSpine`/`RenderSpine` diff the two
+      engines' chosen spines per pairing and name the clause-6 candidates. It
+      renders from `cmd/estimate-audit` whenever `--reference` is present, so
+      `scripts/tpch-estimate-audit-arm.sh` needed **no change** — the §4
+      ratchet, the §5 tripwire and the spine diff come out of one arm.
+      **The measurement (offline over run 4's committed plans, no re-run)
+      refutes 09 §3.10's manual reading.** goopg does NOT produce a left-deep
+      spine on all 22: the ON arm goes bushy on **six** (Q2, Q7, Q8, Q9, Q10,
+      Q20) and the OFF arm on two, and **on Q20 the ON arm chooses PG's bushy
+      partition exactly** — `{nation+supplier} ⋈ {lineitem+part+partsupp}`,
+      printed `both`. That is the first evidence phase 2 builds and `add_path`
+      keeps a bushy pair over a real five-relation TPC-H relset instead of the
+      synthetic 4-rel chain its three unit tests use. Every spine number moves
+      toward PG under the flag: pairings matched 13 → 24, PG-only 44 → 33,
+      goopg-only 45 → 32. **Two clause-6 candidates remain and only two** — PG's
+      bushy top on Q7 (`{customer+lineitem+n2+orders} ⋈ {n1+supplier}`) and Q8
+      (`{lineitem+orders+part} ⋈ {customer+n1+region}`). Evidence:
+      `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` +
+      `-README.md`. 2 ledger rows (the enumeration gap; the EXPLAIN
+      alias-dedup gap that makes 5 queries' pairings unadjudicable).
+- [ ] **M0127-P5.9-l-ii — the SEARCH-side half: enumeration provenance.** NEW
+      2026-08-06 (09 §3.11). P5.9-l-i reads CHOSEN spines on both sides, so for
+      Q7 and Q8 "enumerated by the DP and lost on cost" and "never enumerated"
+      still predict the identical observable. Record what `makeJoinRel` was
+      actually offered: per join problem, every `(outer relset, inner relset,
+      phase)` triple the enumerator produced plus the relid → relation-name map
+      that makes it comparable to a plan's relset strings; export it on a
+      channel an arm run can harvest (an env-gated trace into the server log is
+      the cheap option). Then test membership of the two candidate partitions
+      directly, with **Q20's matched bushy pairing as the positive control** —
+      whatever the channel says about Q7/Q8 it must show Q20's partition
+      enumerated. Bar: clause 6 discharged — both partitions enumerated
+      (divergence is cost/stats, admitted under the §4 ratchet, clause 6 passes
+      and P5.9 flips) or a named gap in the bushy phase (a new slice). Files:
+      `internal/planner/joinsearchlevel.go`, `joinsearch.go`,
+      `cmd/estimate-audit/`, `scripts/tpch-estimate-audit-arm.sh`.
+      09 §3.11; IMPLEMENTATION-TODO P5.9-l-ii.
 - [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
       scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
       and it was NOT the splice arithmetic this item predicted. At 4-under-5

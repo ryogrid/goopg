@@ -118,6 +118,11 @@ func main() {
 		bar := estimateaudit.ParityBar{Slack: f.slack, Floor: f.floor}
 		rows := estimateaudit.Parity(reports, ref)
 		out += "\n" + estimateaudit.RenderParity(reports, ref, rows, bar)
+		// §4's spine diff — the pairing question clause 6 is stated on, which
+		// the parity column above cannot answer: it keys on the relset a node
+		// builds, and two engines that partition the same relset differently
+		// both report it MATCHED (09 §3.10, M0127-P5.9-l).
+		out += "\n" + estimateaudit.RenderSpine(reports, ref, estimateaudit.SpineDiff(reports, ref))
 	}
 
 	writeReport(f, out, plans, refPlans)

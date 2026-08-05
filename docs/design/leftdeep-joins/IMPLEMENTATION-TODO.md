@@ -1519,6 +1519,47 @@
   on Q7, Q8 and Q20 — pass (divergence attributed to cost or stats, admitted
   under the ratchet) or a named gap in the bushy phase. Then P5.9 re-runs
   clause 6 alone and flips or attributes.
+  **↳ SPLIT 2026-08-06. The plan-side half is DONE (P5.9-l-i below); the
+  search-provenance half is P5.9-l-ii.** This item stays open until -ii lands.
+- [x] **P5.9-l-i** The spine/pairing channel, built and measured (09 §3.11).
+  DONE 2026-08-06. `internal/estimateaudit/spine.go` computes, for every join
+  node of a captured plan, the relsets of its immediate children, and classes
+  the node bushy iff both children — after descending through the single-child
+  pipeline nodes between them (`Hash`, `Materialize`, `Sort`, `Gather`,
+  `Memoize`, aggregation; written as an arity rule, not a label whitelist) — are
+  themselves joins. `SpineDiff`/`CountSpine`/`RenderSpine` join the two engines'
+  chosen spines per pairing and name the clause-6 candidates. It renders from
+  `cmd/estimate-audit` whenever a `--reference` is present, so
+  `scripts/tpch-estimate-audit-arm.sh` needed **no change** — one arm, one
+  artifact, the §4 ratchet and the spine diff together.
+  **The measurement refuted run 4's manual reading.** Applied offline
+  (`--from-plans`) to run 4's committed plans: the ON arm chooses a bushy spine
+  on SIX of the 22 (Q2, Q7, Q8, Q9, Q10, Q20), not none — and on **Q20 it
+  chooses PG's bushy partition exactly**, `{nation+supplier} ⋈
+  {lineitem+part+partsupp}`, which is the first evidence that phase 2 builds and
+  `add_path` keeps a bushy pair over a real five-relation TPC-H relset rather
+  than a synthetic 4-rel chain. Every spine number moves toward PG under the
+  flag: pairings matched 13 → 24, PG-only 44 → 33, goopg-only 45 → 32, bushy
+  2 → 6. Two clause-6 candidates remain and only two — PG's bushy top on Q7
+  (`{customer+lineitem+n2+orders} ⋈ {n1+supplier}`) and Q8
+  (`{lineitem+orders+part} ⋈ {customer+n1+region}`). Evidence:
+  `analysis/leftdeep-joins/2026-08-06-p59l-spine-{on,off}.txt` + `-README.md`.
+- [ ] **P5.9-l-ii** The SEARCH-side half: enumeration provenance (NEW
+  2026-08-06, 09 §3.11). P5.9-l-i reads CHOSEN spines on both sides, so for Q7
+  and Q8 "enumerated by the DP and lost on cost" and "never enumerated" still
+  predict the identical observable. Record what `makeJoinRel` was actually
+  offered: per join problem, every `(outer relset, inner relset, phase)` triple
+  the enumerator produced, with the relid → relation-name map that makes it
+  comparable to a plan's relset strings; export it on a channel an arm run can
+  harvest (an env-gated trace into the server log is the cheap option — the
+  audit tool already has the label to key it on). Then test membership of the
+  two candidate partitions directly. Q20's matched bushy pairing is the
+  positive control: whatever the channel says about Q7/Q8, it must show Q20's
+  partition enumerated. Bar: clause 6 discharged — either both partitions were
+  enumerated (divergence is cost/stats, admitted under the §4 ratchet, clause 6
+  passes and P5.9 flips) or the bushy phase has a named gap on them (a new
+  slice). Files: `internal/planner/joinsearchlevel.go`, `joinsearch.go`,
+  `cmd/estimate-audit/`, `scripts/tpch-estimate-audit-arm.sh`.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is
