@@ -957,7 +957,8 @@
   **P5.6-f-iv** (the functional-dependency arm: PG's `clauselist_selectivity` /
   `dependencies.c`, which goopg lacks — it landed only the FK arm) and
   **P5.6-f-v** (the sweep must diff the TIMEOUT SET, not its cardinality:
-  `TIMEOUT=1` stayed byte-identical across a 17× re-pricing for four sweeps).
+  `TIMEOUT=1` stayed byte-identical across a 17× re-pricing for four sweeps —
+  **landed 2026-08-05**, §5.16).
   `analysis/m0127-p56fiii/README.md`; 1 ledger row.
 - [x] **P5.6-g** `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)` factor.
   **DONE 2026-08-05** — both arms landed verbatim from selfuncs.c (matched-MCV
@@ -1130,6 +1131,30 @@
   §5.9. Bar met: UNITS + audit (parity column) + tpch-spotcheck PASS. **DS05
   carried on P5.6-g-i** — it is where this pass's blast radius actually gets
   measured, since TPC-DS has many OR-bearing queries and TPC-H has two.
+- [x] **P5.6-f-v** the DS05 gate's status-delta channel, landed 2026-08-05 —
+  P5.6-f-iii's harness successor, and the answer to "a 17× re-pricing hid
+  behind four byte-identical SUMMARY lines". `scripts/tpcds-sweep-diff.py` + a
+  `delta [OLD [NEW]]` subcommand and a `sweep` tail stage placed directly under
+  the SUMMARY (before the slower plan pass): the per-query **status/runtime
+  vector** is diffed against the previous FULL report and printed by name —
+  `TIMEOUT +Q47 -Q72`, `SLOWER Q57 15s->81s (5.4x)`. **The input is the sweep
+  report itself**, in the format `cmd_sweep` already prints, so no new artefact
+  exists and all ~90 archived reports are valid baselines retroactively.
+  **Strictly a third column** — rows and checksums still decide the verdict,
+  and the channel swallows its own failures. Four limits, printed in its header
+  every run rather than assumed: intersection-only comparison (a query absent
+  from one side is named as ONLY-OLD/ONLY-NEW, not counted as leaving PASS);
+  TIMEOUT readings excluded from the runtime arm (they are the cap, not a
+  runtime); ≥2× AND ≥5 s on the larger side (integer seconds make 1s→3s "3×");
+  and the default baseline skips SUBSET PROBES, which are stamped "NOT a gate
+  result". Validated by replay over all 87 adjacent pairs of the archived
+  corpus — zero parse failures, 17 verdict changes, and on the pair whose
+  SUMMARY lines are byte-identical it prints `TIMEOUT +Q47 -Q72` plus Q57's
+  5.4×, i.e. both §5.15 victims out of artefacts that already existed that
+  night. Bar met: UNITS + one full DS05 sweep with the channel live
+  (`PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4`,
+  `verdict-changes=none`, one runtime move Q83 7→3 s).
+  [09](09-verification-and-acceptance.md) §5.16.
 - [ ] **P5.7** nbatch-aware `hashJoinCost` (shared sizing fn); Startup/Total
   split for LIMIT-over-join.
 - [ ] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:

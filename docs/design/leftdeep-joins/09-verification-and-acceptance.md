@@ -1096,7 +1096,67 @@ still multiplies out. Successor **M0127-P5.6-f-iv**; ledger row 2026-08-05.
 **Gate lesson (actionable):** the plan-shape channel (§5.11) catches plan
 drift, but a *named-victim* timeout comparison would have caught this on the
 night it landed. The sweep report should diff the TIMEOUT **set**, not its
-cardinality.
+cardinality. Landed as §5.16.
+
+### 5.16 The DS05 gate diffs the TIMEOUT set, 2026-08-05 (P5.6-f-v)
+
+Discharges §5.15's gate lesson. The counts in `=== SUMMARY: … TIMEOUT=1 … ===`
+cannot say *which* query owns them, which is exactly how a 17× re-pricing of
+Q47 hid behind four byte-identical summary lines. The sweep now also diffs its
+own **per-query status/runtime vector** against the previous report and prints
+what moved, by name:
+
+```
+TIMEOUT    +Q47  -Q72
+SLOWER     Q57 15s->81s (5.4x)  …
+```
+
+**The channel.** `scripts/tpcds-sweep-diff.py OLD NEW`, wired into `sweep` as a
+tail stage directly under the SUMMARY (before the slower plan pass), plus a
+`delta [OLD [NEW]]` subcommand that runs nothing and costs nothing. Like §5.11
+it is **non-blocking** — performance never fails this gate, only rows and
+checksums do — and like §5.11 its baseline is chosen *before* the new report
+exists so it cannot diff a run against itself.
+
+Four deliberate limits, printed in the channel's own header every run so a
+quiet delta is never read as a stronger claim than it is:
+
+1. **The input is the report itself**, in the format `cmd_sweep` already
+   printf()s. No new artefact, no new format — and therefore every one of the
+   ~90 reports already archived under `tpcds-results-sf05/` is a valid
+   baseline, retroactively.
+2. **Both arms compare the intersection.** A query absent from one side (subset
+   probe, or a corpus that grew) has no verdict there; counting it as "left the
+   PASS set" made every full-vs-probe pair scream. What is missing is named once
+   as `ONLY-OLD` / `ONLY-NEW`.
+3. **TIMEOUT readings are excluded from the runtime arm** — a clipped query
+   reports the cap, not its runtime (§5.15's `TIMEOUT_SEC=900` probe is the
+   whole reason that distinction matters). Verdict changes already name it.
+4. **A runtime move needs ≥2× *and* ≥5 s on the larger side.** Reports carry
+   integer seconds, so 1 s → 3 s is "3×" and is noise. Both thresholds are CLI
+   flags and both appear in the summary line.
+
+The default baseline additionally **skips SUBSET PROBES**: a probe is stamped
+"NOT a gate result" and covers a handful of queries, so diffing a full sweep
+against one would compare 3 queries and stay silent about the other 96. The
+newest *full* report is the last comparable gate run.
+
+**Validation — replay, not a new measurement.** The tool was run over all 87
+adjacent pairs of the archived corpus: zero crashes, zero parse failures, and
+**17 pairs report a verdict change**. On the pair that motivated it —
+`sweep-20260804-214607` → `-232914`, the two reports whose SUMMARY lines are
+byte-identical — it prints `TIMEOUT +Q47 -Q72`, `PASS +Q72 -Q47`, and
+`SLOWER Q57 15s->81s (5.4x)`: both §5.15 victims, named, from artefacts that
+already existed on the night it landed. A full gate sweep at HEAD then ran the
+channel live (`sweep-20260805-090258`, PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=1 SKIP=4): `verdict-changes=none`, one runtime move (Q83 7 s → 3 s) —
+the correct reading for a harness-only commit.
+
+**What this does not do.** It compares *adjacent* runs, so a regression that
+creeps in below 2× per run stays unnamed, and it still cannot *fail* the gate on
+a traded timeout — it only makes one impossible to miss in the report. Making a
+named-victim regression fatal needs a curated per-query budget file, which is
+not filed: the timeout set is still moving under active planner work.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 

@@ -7414,17 +7414,43 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `superkeyJoinEstimate`). Acceptance: Q47 back under the DS05 cap WITHOUT
       losing P5.6-f's Q9/Q72/Q53 wins, verified as a named-victim TIMEOUT-set
       diff, not a `TIMEOUT=` count. Bar: UNITS + DS05 + the estimate audit.
-- [ ] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
+- [x] **M0127-P5.6-f-v — the DS05 sweep must diff the TIMEOUT SET, not its
       cardinality.** §5.15's regression survived four sweeps because
       `TIMEOUT=1` is invariant to WHICH query timed out; the summary line was
       byte-identical across a 17× re-pricing. P5.6-g-i-b gave the gate a
       plan-shape channel, which covers plan drift but is non-blocking and was
-      not read per-query either. Resume:
-      `scripts/tpcds-sf05-regression.sh` — record the per-query status/runtime
-      vector against the previous report and print a NAMED delta line
-      (`TIMEOUT +Q47 -Q72`, plus any query whose runtime moved >2×), so a
-      traded timeout can never again present as an unchanged summary.
-      Harness-only; no PG behaviour involved. Bar: UNITS + one DS05 sweep.
+      not read per-query either.
+      **LANDED 2026-08-05.** `scripts/tpcds-sweep-diff.py` + a `delta [OLD
+      [NEW]]` subcommand + a `sweep` tail stage directly under the SUMMARY
+      (before the slower plan pass): the per-query status/runtime vector is
+      diffed against the previous **full** report and printed by name —
+      `TIMEOUT +Q47 -Q72`, `SLOWER Q57 15s->81s (5.4x)`. **The input is the
+      sweep report itself**, in the format `cmd_sweep` already prints, so no
+      new artefact exists and all ~90 archived reports are valid baselines
+      retroactively. Four limits, printed in the channel's header every run
+      (never silent): both arms compare the INTERSECTION (a query absent from
+      one side is named once as ONLY-OLD/ONLY-NEW, not counted as leaving the
+      PASS set); TIMEOUT readings are the CAP and are excluded from the runtime
+      arm (the verdict arm already names them); a runtime move needs ≥2× AND
+      ≥5 s on the larger side (integer seconds make 1s→3s "3×"); and the
+      default baseline SKIPS subset probes, which are stamped "NOT a gate
+      result" and would compare 3 queries while staying silent about 96.
+      Non-blocking like the plan channel — performance still cannot fail this
+      gate. **Validated by replay over all 87 adjacent pairs of the archived
+      corpus** (zero crashes, 17 pairs report a verdict change); on the pair
+      whose SUMMARY lines are byte-identical it prints `TIMEOUT +Q47 -Q72`,
+      `PASS +Q72 -Q47` and `SLOWER Q57 15s->81s (5.4x)` — both §5.15 victims,
+      from artefacts that already existed the night it landed. Not filed as a
+      deferral (no PG behaviour involved), but two limits are stated in 09
+      §5.16: it compares ADJACENT runs, so sub-2×-per-run creep stays unnamed,
+      and it still cannot FAIL the gate on a traded timeout — that needs a
+      curated per-query budget file, deliberately not filed while the timeout
+      set is still moving under active planner work. 09 §5.16;
+      `bench/tpcds/README.md`. Gates: UNITS green (cached; no Go source
+      changed) + one full DS05 sweep with the channel live
+      (`sweep-20260805-090258`: PASS=94 MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=1 SKIP=4, delta `verdict-changes=none`, one runtime move Q83
+      7s→3s — the correct reading for a harness-only commit).
 - [x] **M0127-P5.6-g — `eqjoinsel_semi`'s MCV arm + the `(1 - nullfrac1)`
       factor.** Both landed verbatim from selfuncs.c in
       `internal/planner/cardinality.go`: the matched-MCV frequency mass is
