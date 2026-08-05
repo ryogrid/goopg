@@ -1244,6 +1244,12 @@ leak is elsewhere in `estimateJoin`'s pair list — most likely
 equi-*pair*, though the `d_year > 1999` row (factor 0.505, which is neither
 `1/nd` nor `defaultEqSelectivity`) shows that arm cannot explain every row.
 
+> **⚠ That last paragraph is wrong; corrected by §5.18 (2026-08-05).** The leak
+> is not in `estimateJoin` at all — instrumenting the live server shows
+> `estimateJoin` returning the *correct* 726 987 for the `store` join while
+> EXPLAIN printed 367 128. The measurement in the table above stands; only its
+> attribution to the pair loop was wrong. §5.18 names the real node.
+
 **Successors.** **M0127-P5.6-f-vi** (the double-charge, with a unit test as its
 discriminating instrument — build a join whose left is a `*Filter` over a scan
 with the same conjunct still in `Predicate`, assert the estimate equals the
@@ -1252,6 +1258,84 @@ unfiltered one scaled once) and **M0127-P5.6-f-vii** (`estimateAggregate`'s
 same path, *not* load-bearing for Q47 and therefore not to be folded in).
 Correctness never moved in any regime: Q47 returns its 100 oracle rows
 throughout. 2 ledger rows.
+
+### 5.18 The double-charge is a duplicated qual, not a mispriced join, 2026-08-05 (P5.6-f-vi)
+
+§5.17 measured the defect correctly and located it wrongly. Instrumenting the
+running SF0.5 server settles it in one line: for the `store` join of §5.17's
+probe under `d_year > 1999`,
+
+```
+ESTJOIN l=726987 r=12 sel=0.0833 resid=1 pairs=1 rows=726987 bound=726987
+```
+
+`estimateJoin` returns **726 987 — the correct, row-preserving answer** — and
+EXPLAIN prints 367 128. Its pair loop, its residual guard and
+`splitAllEqualitiesForHash` are all exonerated; the two candidates §5.17 left
+open are both dead. (A synthetic unit-scale rebuild of the same three-node tree
+also returns the correct number, which is why the prescribed unit test had to be
+written against the *plan the planner actually builds*, not against a
+hand-assembled join.)
+
+The factor is applied one node higher. The same probe traced through the
+`*Filter` arm of `EstimateRows`:
+
+```
+ESTFILTER childType=*planner.SeqScan child=73049 sel=0.505 leafLocal=true  pred=&{pos:173 Op:> …}
+ESTFILTER childType=*planner.Join    child=726987 sel=0.505 leafLocal=false pred=&{pos:173 Op:> …}
+```
+
+**The same source conjunct — same `pos` — is priced by two different `*Filter`
+nodes.** `pushSingleSideQualsIntoInnerJoinInputs`
+(`internal/planner/inner_join_qual_pushdown.go`, M0125-0004) copies a
+single-relation restriction from the residual Filter down onto the relation it
+references and **deliberately leaves `f.Predicate` untouched** — its documented
+"property 2", which is what keeps the join's own residual evaluation correct.
+The estimator then charged both copies, so the restriction's selectivity was
+squared and the surplus landed on the join.
+
+Upstream has no such node pair to reconcile: `distribute_restrictinfo_to_rels`
+(`optimizer/plan/initsplan.c`) **moves** a single-relation clause into that
+baserel's `baserestrictinfo`. `set_baserel_size_estimates` prices it once, and
+the joinrel above never sees it — which is exactly the invariant
+`calc_joinrel_size_estimate`'s opening comment asserts ("we are not
+double-counting them because they were not considered in estimating the sizes of
+the component rels").
+
+**The fix.** goopg cannot move the clause, so it records the duplication:
+`Filter.PushedBelow` lists the conjuncts a placement pass copied downward, and
+`filterSelectivity` (`cardinality.go`) skips them. Splitting the predicate to do
+so is not a second formula — `clauseSelectivity`'s `OpAnd` arm is itself
+`left × right` under the independence assumption — so an empty `PushedBelow`
+reproduces the former number bit for bit. Both duplicating passes are stamped,
+per the sibling-paths rule: the binary-join arm (`pushInnerJoinInputQuals`) and
+the MHJ arm (`pushResidualQualsIntoMHJTables`), whose header states the identical
+"property 2". The two *moving* siblings — `pushOuterQualsIntoLaterals`
+(pushdown.go, rewrites `f.Predicate`) and `pushSingleSourceFiltersIntoMHJTables`
+(mhj_input_rewrite.go, consumes `mh.Filters`, which no estimator reads) — were
+checked and need no stamp.
+
+**Measured after (same probe, same cluster):**
+
+| restriction | `date_dim` scan | join below `store` | join **above** `store` | extra factor |
+|---|---|---|---|---|
+| *(none)* | 73 049 | 1 439 608 | 1 439 608 | 1.0 |
+| `d_year = 2000` | 365 | 7 193 | **7 193** | **1.0** |
+| `d_year > 1999` | 36 889 | 726 987 | **726 987** | **1.0** |
+
+Q47's `v1` subtree moves **18 → 3 626 rows** against PG's 7 643 — the same order
+at last, and the residual gap is §5.17's separately-filed `estimateAggregate`
+`child/2` (P5.6-f-vii), not this.
+
+**Scope of the change, and what it did *not* buy.** This under-sized *every*
+join above *every* pushed-down restriction, so it is broad, not Q47-local: the
+SF0.5 gate reports **50 of 99 plan shapes changed** where the previous sweep
+reported 0. It bought no verdict change — the named TIMEOUT set is still exactly
+`{Q47}`, PASS=94 / MISMATCH=0 / CKMISMATCH=0 / ERROR=0, byte-identical
+per-query verdicts to the `f05b5329` baseline. Q47's own plan still takes the
+nested loop. Stated plainly because §5.17's chain predicted the estimate fix
+would be *necessary*, not that it would be *sufficient*, and only the first half
+is now evidence.
 
 ## 6. Attribution protocol for regressions (inherited, binding)
 

@@ -7420,7 +7420,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `analysis/m0127-p56fiv/README.md`; §6 of `analysis/m0127-p56fiii/README.md`
       retracted in place; 2 ledger rows. Successors **P5.6-f-vi** / **-f-vii**
       below. Bar: UNITS (no Go source changed).
-- [ ] **M0127-P5.6-f-vi — a pushed-down restriction is priced twice.** The
+- [x] **M0127-P5.6-f-vi — a pushed-down restriction is priced twice.** The
       real Q47 defect (§5.17). A join above a filtered scan is multiplied by the
       selectivity the scan **already applied**: on SF0.5, the row-preserving
       `store_sales ⋈ store` (unique `s_store_sk`, 12 rows) returns its left
@@ -7443,6 +7443,41 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       scaled **once**. Bar: UNITS + the estimate audit + DS05 (named-victim
       TIMEOUT-set diff, not a `TIMEOUT=` count) — this moves plan shape broadly,
       so capture `plans` before and after.
+      **LANDED 2026-08-05.** The resume point above was wrong and is corrected
+      in doc 09 **§5.18**: `estimateJoin` returns the CORRECT 726 987 for the
+      probe's `store` join (server instrumentation), so its pair loop,
+      `splitAllEqualitiesForHash` and the residual guard are all exonerated.
+      The real node is one higher — `pushInnerJoinInputQuals`
+      (`inner_join_qual_pushdown.go`) DUPLICATES a single-relation restriction
+      onto its relation and leaves `f.Predicate` untouched ("property 2"), so
+      the estimator charged the same conjunct at the leaf Filter AND at the
+      residual Filter above the join. Fix: `Filter.PushedBelow` records the
+      duplication and `filterSelectivity` (`cardinality.go`) skips those
+      conjuncts — upstream needs no such list because
+      `distribute_restrictinfo_to_rels` MOVES the clause. Both duplicating
+      passes stamped (binary + MHJ arms); the two moving siblings checked and
+      left alone. Measured: the probe's `store` join is row-preserving in all
+      three regimes (was ×1/205 and ×0.505); Q47's `v1` 18 → 3 626 vs PG's
+      7 643. Gates: UNITS green; DS05 sweep `sweep-20260805-101345.txt` exit 0,
+      per-query verdicts BYTE-IDENTICAL to the `f05b5329` baseline, named
+      TIMEOUT set still exactly `{Q47}` — **50 of 99 plan shapes changed** (the
+      previous sweep changed 0), so the blast radius is real and cost 0
+      verdicts. It did NOT un-time-out Q47; that stays open under -f-vii and
+      the successor below. New tests
+      `internal/planner/cardinality_pusheddown_test.go` (3).
+- [ ] **M0127-P5.6-f-viii — Q47 still takes the nested loop with `v1` at
+      3 626.** With -f-vi landed the 425× under-estimate is gone (18 → 3 626
+      against PG's 7 643) and Q47 *still* TIMEOUTs at 300 s: the top block
+      plans `Nested Loop (INNER) rows=1958` over a 5-pair `Hash Join rows=108`
+      and a `CTE Scan on v1 v1_lag rows=3626`, where PG picks a Merge Join.
+      So the plan flip is NOT wholly downstream of the `v1` size — doc 09
+      §5.17's chain was necessary, not sufficient (§5.18 closing paragraph).
+      Resume: the `CTE Scan on v1 rows=6` outer (post-`d_year = 2000 AND
+      avg_monthly_sales > 0` filter) is what makes rescanning 3 626 rows look
+      free; price the rescan, or check whether that outer's own 6 is a second
+      instance of the same double-charge class through a `*CTEScan`. Do
+      -f-vii first — one variable per measurement, per §6. Bar: UNITS + the
+      estimate audit + DS05 (named-victim TIMEOUT-set diff).
 - [ ] **M0127-P5.6-f-vii — `estimateAggregate` is `child/2`, upstream is
       `estimate_num_groups`.** A multi-key GROUP BY returns `child/2`
       (`internal/planner/cardinality.go` `estimateAggregate`); PG runs

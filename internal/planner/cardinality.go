@@ -57,7 +57,7 @@ func EstimateRows(n Node) int64 {
 		if child <= 0 {
 			return 0
 		}
-		return scaleByFloat(child, clauseSelectivity(x.Predicate, x.Child))
+		return scaleByFloat(child, filterSelectivity(x))
 	case *Limit:
 		child := EstimateRows(x.Child)
 		if lim, ok := constInt(x.Limit); ok {
@@ -128,6 +128,50 @@ func EstimateRows(n Node) int64 {
 		return estimateMultiHashJoin(x)
 	}
 	return 0
+}
+
+// filterSelectivity prices a `*Filter`'s Predicate, skipping the conjuncts
+// a qual-placement pass duplicated onto a descendant (`Filter.PushedBelow`).
+//
+// Those conjuncts have ALREADY been charged: the copy hangs on the node it
+// was pushed to, and `EstimateRows` of that node scales by it. Charging the
+// original here too squares the restriction's selectivity, and it lands on
+// the JOIN above — so every join sitting over a filtered scan was
+// under-sized by exactly the factor its own scan had already applied. On
+// TPC-DS SF0.5 the row-preserving `store_sales ⋈ store` (unique
+// `s_store_sk`, 12 rows) came out at 367 128 instead of its left input's
+// 726 987 with `d_year > 1999` present, and at 1 439 608 — correct — with
+// no restriction at all; PG's same join is 2 583 → 2 465. That collapse is
+// what made a nested loop look free over Q47's `v1` CTE (design doc
+// leftdeep-joins/09 §5.17).
+//
+// Splitting the predicate and multiplying is not a different formula from
+// the whole-predicate call it replaces: `clauseSelectivity`'s OpAnd arm is
+// itself `left * right` under the independence assumption, so an empty
+// PushedBelow reproduces the former number exactly.
+//
+// M0127-P5.6-f-vi.
+func filterSelectivity(f *Filter) float64 {
+	if f == nil || f.Predicate == nil {
+		return 1.0
+	}
+	if len(f.PushedBelow) == 0 {
+		return clauseSelectivity(f.Predicate, f.Child)
+	}
+	sel := 1.0
+	for _, c := range splitAnd(f.Predicate) {
+		if f.pricedBelow(c) {
+			continue
+		}
+		sel *= clauseSelectivity(c, f.Child)
+	}
+	if sel > 1 {
+		return 1
+	}
+	if sel < 0 {
+		return 0
+	}
+	return sel
 }
 
 // estimateSetOp mirrors upstream's output-row rules

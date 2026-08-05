@@ -138,6 +138,11 @@ func pushInnerJoinInputQuals(f *Filter) {
 			// untouched — so only the error behaviour changes.
 			if repl, ok := pushConjunctIntoSubtree(child, c); ok {
 				f.Child = repl
+				// …only the error behaviour, and (until M0127-P5.6-f-vi)
+				// the estimate: the copy below is priced by the node it
+				// was attached to AND the original is priced here. Record
+				// the duplication so `filterSelectivity` charges it once.
+				f.notePushedBelow(c)
 			}
 		}
 	case *MultiHashJoin:
@@ -189,8 +194,40 @@ func pushResidualQualsIntoMHJTables(f *Filter, mh *MultiHashJoin) {
 		}
 		if repl, ok := pushConjunctIntoSubtree(mh.Tables[t], local); ok {
 			mh.Tables[t] = repl
+			// Same duplication, same double-charge — the binary arm's
+			// sibling (M0127-P5.6-f-vi). `estimateMultiHashJoin` walks
+			// mh.Tables, so the copy IS priced down there.
+			f.notePushedBelow(c)
 		}
 	}
+}
+
+// notePushedBelow records that conjunct `c` of f.Predicate has been
+// duplicated onto a descendant, so the descendant's own estimate already
+// charges it. Idempotent: both pushdown passes are re-walk safe
+// (pushConjunctIntoSubtree's exprEqual guard), so a second walk must not
+// grow the list.
+func (f *Filter) notePushedBelow(c Expr) {
+	for _, seen := range f.PushedBelow {
+		if seen == c || exprEqual(seen, c) {
+			return
+		}
+	}
+	f.PushedBelow = append(f.PushedBelow, c)
+}
+
+// pricedBelow reports whether conjunct c is one this Filter has already
+// charged at a descendant. Matched by `exprEqual` rather than pointer
+// identity because a later rewriter may clone the predicate wholesale
+// (cloneExprForShift and the posMap passes both do); identity alone would
+// silently go stale and restore the double-charge.
+func (f *Filter) pricedBelow(c Expr) bool {
+	for _, seen := range f.PushedBelow {
+		if seen == c || exprEqual(seen, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // mhjResidualConjunctTable attributes a residual conjunct to the unique

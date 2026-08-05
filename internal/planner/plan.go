@@ -1108,6 +1108,27 @@ type Filter struct {
 	// (applyJoinTreePosMap, remapPosMapAfterRewrite), which
 	// assume cumulative coordinates.
 	LeafLocal bool
+	// PushedBelow lists the conjuncts of Predicate that a qual-placement
+	// pass DUPLICATED onto a descendant node — `pushInnerJoinInputQuals`
+	// and `pushResidualQualsIntoMHJTables` both copy a single-relation
+	// restriction down to the relation it references and deliberately
+	// leave `Predicate` untouched (their "property 2"), so the executor
+	// evaluates it twice and the ESTIMATOR charged it twice.
+	//
+	// Upstream has no such list because it has no such duplicate:
+	// `distribute_restrictinfo_to_rels` (initsplan.c) MOVES a
+	// single-relation clause into that baserel's `baserestrictinfo`, so
+	// `set_baserel_size_estimates` prices it once and the joinrel above
+	// never sees it again — which is the invariant
+	// `calc_joinrel_size_estimate`'s opening comment asserts ("we are not
+	// double-counting them because they were not considered in estimating
+	// the sizes of the component rels").
+	//
+	// goopg cannot move the clause — the copy left above the join is what
+	// keeps the join's own residual evaluation correct — so it records the
+	// duplication instead and `filterSelectivity` skips these conjuncts.
+	// M0127-P5.6-f-vi.
+	PushedBelow []Expr
 }
 
 func (n *Filter) Pos() int       { return n.pos }
