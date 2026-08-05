@@ -721,6 +721,68 @@ caller, because the query's own ORDER BY never enters the path model at all
 boundary). A final `Sort` that spills is therefore still unpriced — it just has
 no rival to be unfair to yet.
 
+### 3.10 Run 4 — five clauses pass, and the sixth has no instrument (P5.9, 2026-08-06)
+
+Evidence: `analysis/leftdeep-joins/2026-08-05-p59run4-s5-acceptance.txt`
+(HEAD `9e0cfe67`, one binary, both arms, protocol per §3.4's resume point).
+
+| clause | run 3 | run 4 |
+|---|---|---|
+| 1 — 22/22 + value equality | PASS | **PASS** (23 MATCH; Q5 excluded per §3.4) |
+| 2 — total ≤ 1.2× | FAIL 1.362× | **PASS 0.982×** (ON 355.14 s, OFF 361.59 s) |
+| 3 — no query > 2× | FAIL (5 cells) | **PASS**, worst 1.36× (Q2); Q9 15.83 s ≤ 170.9 s |
+| 4 — TPC-DS SF0.5 | FAIL (7 ERROR, 5 TIMEOUT) | **PASS** `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0` |
+| 5 — no `MultiHashJoin`/fusion | PASS | **PASS** (fourth consecutive) |
+| 6 — bushy-plan capability | PARTIAL | **UNDISCHARGED** |
+| §4 ratchet `parity_violations` | 0 OFF / **6** ON | **0 OFF / 0 ON** |
+| §5 absolute tripwire | 1 violation per arm (Q18) | 1 violation per arm (Q18), ON the smaller |
+
+Every clause runs 1–3 failed on is green, and no defect anywhere in the run is
+attributed to `GOOPG_PGSHAPED_DP`. **The flip is still held, by clause 6 —
+and clause 6 is a gate on the harness before it is a gate on the planner.**
+
+§4 specifies the check as "verified through the §4 parity gate's spine diff".
+That spine diff does not exist: `cmd/estimate-audit` contains zero occurrences
+of "bushy" or "spine". Its parity channel compares per-joinrel *estimates* and
+labels one-sided relsets `SHAPE (PG-only joinrel)` / `SHAPE (goopg-only
+joinrel)`. A relset name says which base relations are underneath a node; it
+does not say how they were **paired**, and clause 6 is a question about
+pairing. Run 3's "PARTIAL" rested on the shape-divergence *count* (67 → 46),
+which is a proxy for the check, not the check.
+
+Measured directly for run 4 — a join node is bushy iff both children, after
+unwrapping `Hash`/`Materialize`/`Sort`/`Gather`/`Memoize`/aggregation nodes,
+are themselves joins:
+
+- PG 18.3 chooses a bushy spine on exactly **three** of the 22: Q7
+  (`Hash Join ← [Nested Loop, Hash Join]`), Q8 and Q20 (both
+  `← [Nested Loop, Nested Loop]`).
+- goopg produces **no** bushy spine on any of the 22, in **either** arm.
+
+PG's Q7 partition is `{customer+lineitem+n2+orders} ⋈ {n1+supplier}`; goopg's
+ON arm builds `{lineitem+n1+n2+orders+supplier} ⋈ customer`. That divergence is
+not itself a failure — §4 admits shapes chosen on cost-constant or
+stats-fidelity grounds and reserves hard failure for a bushy shape the search
+*cannot express*. The structural evidence says it can: `joinSearchOneLevel`
+phase 2 (`internal/planner/joinsearchlevel.go:171-222`) is `joinrels.c:141-198`
+term for term — k-loop halfway break, mirror-image offset, clause-only pair
+gate — and is unit-tested by `TestJoinSearchFourRelChainOffersBushyPair`,
+`TestJoinSearchBushyIsClauseOnly` and
+`TestJoinSearchPairCountMatchesClosedForm`.
+
+**But those tests prove the mechanism on a synthetic 4-relation chain.** For
+Q7's, Q8's and Q20's actual relset partitions, "enumerated and lost on cost"
+and "never enumerated" predict the identical observable — a left-deep winner —
+so the run cannot distinguish them. Hence undischarged rather than failed, and
+hence no flip: passing five clauses while the sixth is unmeasured is precisely
+what four runs of this bar exist to prevent.
+
+→ **P5.9-l**: build the channel §4 named. The search records, per query, the
+joinrel pairings the DP actually built; a comparator asks whether PG's chosen
+partition is among them. Clause 6 then either passes as a cost/stats divergence
+admitted under the ratchet, or names a concrete gap in the bushy phase. Both
+are results; the present state is neither.
+
 ## 4. The PG plan-shape parity gate (new instrument)
 
 Once the P-PG shape contract holds ([02](02-plan-shape-contract.md) §1),

@@ -1,0 +1,267 @@
+# M0127-P5.9 — S5 acceptance RUN 4 (TPC-H SF1), `GOOPG_PGSHAPED_DP` OFF vs ON
+#
+# Bar: docs/design/leftdeep-joins/09-verification-and-acceptance.md §3.
+# Predecessors: 2026-08-05-p59-s5-acceptance.txt      (run 1, HEAD 1bb24984)
+#               2026-08-05-p59run2-s5-acceptance.txt  (run 2, HEAD c00db762)
+#               2026-08-05-p59run3-s5-acceptance.txt  (run 3, HEAD 1964333a)
+#
+# VERDICT: **HOLD — five of six clauses PASS, and the flip is blocked by the
+#          ONE clause whose instrument was never built.**
+#
+#          Clause 1 PASS (23 MATCH; the single non-MATCH is the baseline's Q5,
+#          excluded by clause 1's own second amendment — §2).
+#          Clause 2 PASS **0.982x** (ON 355.14 s vs OFF 361.59 s, allowance
+#          433.91 s). Runs 1-3 failed this clause at 1.36x.
+#          Clause 3 PASS — worst measured query ratio **1.36x** (Q2), and
+#          Q9's named absolute bar passes at **15.83 s** vs ≤ 170.9 s.
+#          Clause 4 PASS — TPC-DS SF0.5 under the flag:
+#          `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`,
+#          cell-for-cell identical to the flag-OFF baseline.
+#          Clause 5 PASS (fourth consecutive).
+#          Clause 6 **UNDISCHARGED** — and this is the finding.
+#
+#          Every performance clause the previous three runs failed on is now
+#          green, on the same corpus, at the same HEAD, in one binary. What
+#          stops the flip is not a regression: it is that **clause 6 has no
+#          instrument.** §4 of the bar specifies the check as "verified through
+#          the §4 parity gate's spine diff", and the §4 gate has no spine diff
+#          — `cmd/estimate-audit` contains no bushy or spine channel at all
+#          (grep: zero hits for either word). Clause 6 has therefore never been
+#          evaluated by the thing the bar names, in any of the four runs.
+#
+#          Measured directly instead (§6 below): **PG 18.3 chooses a bushy
+#          spine on exactly three of the 22 queries — Q7, Q8, Q20 — and goopg
+#          produces a left-deep spine on all 22, in BOTH arms.** Clause 6 does
+#          not fail on that fact. Its hard failure is a bushy shape goopg
+#          *cannot express*, and divergence chosen on cost or stats grounds
+#          stays admitted. Nothing in this run distinguishes the two, so the
+#          clause is undischarged rather than failed — and a flip on 5 of 6
+#          clauses with the sixth unmeasured is the one thing four runs of this
+#          bar have been built to prevent. → **M0127-P5.9-l** (new).
+#
+# ---------------------------------------------------------------------------
+# 1. Protocol
+# ---------------------------------------------------------------------------
+#   - HEAD 9e0cfe67 (M0127-P5.9-k), ONE binary for both arms:
+#     tmp/goopg-acceptance-bin (on-disk 2c77a3817675688f),
+#     engine-id f160456a919ed09ad1183364984257e49899d1b4 (diff clean),
+#     runner tmp/tpch-acceptance-runner (cmd/tpch-runner).
+#   - value arms (driver: scripts/tpch-acceptance-arm.sh, the P5.9-d harness):
+#       NO_BUILD=1 PGSHAPED=0 scripts/tpch-acceptance-arm.sh run4-off \
+#           analysis/leftdeep-joins/2026-08-05-p59run4-off.txt
+#       NO_BUILD=1 PGSHAPED=1 scripts/tpch-acceptance-arm.sh run4-on  \
+#           analysis/leftdeep-joins/2026-08-05-p59run4-on.txt
+#     Fresh capped server per arm, GOMEMLIMIT=12GiB GOGC=off
+#     GOOPG_MEM_HIGH=20G GOOPG_MEM_MAX=24G GOOPG_MEM_SWAP_MAX=0, per-query cap
+#     600 s, serial, `-digest`, sweep at server age 0 s. The arms differ ONLY
+#     in GOOPG_PGSHAPED_DP. GOOPG_PGSHAPED_COLLAPSE=0 in both (as runs 1-3).
+#   - EXPLAIN arms (clause 5): same driver, DIGEST=0 PER_Q=120 `-explain`.
+#   - §4/§5 arms:
+#       NO_BUILD=1 PGSHAPED=0|1 PER_Q=600s \
+#           scripts/tpch-estimate-audit-arm.sh 2026-08-05-p59run4-audit-{off,on} \
+#           --fail-on-violation=false
+#     PG 18.3 reference: the committed capture
+#     2026-08-05-p56giii-parity.pg.plans.txt (same as run 3, so the ratchet
+#     stays comparable across runs rather than to a fresh reference measured
+#     under different host conditions).
+#   - clause 4:
+#       GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=0 SF05_NO_PLANS=1 \
+#           bash scripts/tpcds-sf05-regression.sh sweep
+#   - host 2026-08-05 23:55 - 2026-08-06 00:56 JST, quiet: no nightly CI batch
+#     (the arm script's bracketed guard pattern). Same caveat as runs 1-3 and
+#     recorded the same way: the OFF value arm started at load 0.43 and the ON
+#     arm, run immediately after it, at load 7.41 (1-min average still carrying
+#     the OFF arm's teardown). It biases AGAINST the ON arm, which passed
+#     clause 2 anyway — so for the first time the caveat cannot be read as
+#     flattering the result.
+#   - raw arms:  2026-08-05-p59run4-off.txt / -on.txt
+#     diff:      2026-08-05-p59run4-diff.txt
+#     EXPLAIN:   2026-08-05-p59run4-explain-off.txt / -on.txt
+#     §4/§5:     2026-08-05-p59run4-audit-off.txt / -on.txt (+ .plans.txt)
+#     clause 4:  2026-08-05-p59run4-ds05-on.txt
+#                (original: bench/tpcds/.../sweep-20260806-002849.txt)
+#
+# ---------------------------------------------------------------------------
+# 2. Clause 1 — 22/22 complete AND value-level equality — **PASS**
+# ---------------------------------------------------------------------------
+# `tmp/tpch-acceptance-runner -diff <off> <on>`:
+#
+#   SUMMARY: 23 MATCH, 1 VALUE-DIFF
+#   VERDICT: FAIL            <- the tool's verdict, on agreement alone
+#
+#   Q5  VALUE-DIFF  same 5 rows, different tuples
+#                   (unordered A=783749cf0cf09b4e B=724af4147aec4771)
+#
+# Both Q5 digests are BYTE-IDENTICAL to run 3's, which were byte-identical to
+# run 2's:
+#
+#   run 2/3/4 OFF  unordered=783749cf0cf09b4e
+#   run 2/3/4 ON   unordered=724af4147aec4771
+#
+# so run 2's adjudication against PostgreSQL 18.3 carries verbatim: the ON arm
+# is the one that agrees with PG, the OFF arm is wrong by ~24x, and the defect
+# is the BASELINE's (M0119-0011). Clause 1's second amendment (09 §3.4) is
+# explicit that a cell where ON agrees with PG does not count against the flip.
+#
+# Flag-owned wrong answers across the four runs: 4 -> 2 -> 0 -> **0**.
+# All 22 queries completed on both arms; zero hang, OOM or timeout.
+#
+# ---------------------------------------------------------------------------
+# 3. Clause 2 — total wall time — **PASS (0.982x)**
+# ---------------------------------------------------------------------------
+#   OFF total  361.59 s     (contemporaneous integer arm, same HEAD, same binary)
+#   ON  total  355.14 s
+#   allowance  1.2 x min(493.31 pinned R0, 361.59) = 433.91 s
+#   ON/OFF     0.982x
+#
+# The ON arm is FASTER than the integer arm it is measured against. Runs 1-3
+# read 1.36x, 1.36x, 1.362x on this clause; P5.9-j (loop rows vs pairs) and
+# P5.9-k (the unpriced sort spill) are what moved it, and §3.9's five-query
+# probe predicted 1.007x — the full 22-query sweep lands slightly better still.
+#
+# ---------------------------------------------------------------------------
+# 4. Clause 3 — no single query > 2x — **PASS**
+# ---------------------------------------------------------------------------
+# Worst ON/OFF ratios (contemporaneous arm; R0's pinned anchors checked below):
+#
+#   Q15-CREATEVIEW  0.01 -> 0.02 s   "2.00x"   <- a 10 ms DDL step at timer
+#                                                 granularity, not a query
+#   Q2              1.84 -> 2.51 s   1.36x     <- worst real query
+#   Q18            28.74 -> 29.98 s  1.04x
+#   Q14             3.30 -> 3.43 s   1.04x
+#   Q3              6.36 -> 6.53 s   1.03x
+#
+# Run 3's five clause-3 failures are all gone: Q10 3.91x -> 0.99x, Q9 3.13x ->
+# 0.96x, Q18 2.47x -> 1.04x, Q7 2.07x -> 0.96x, Q12 2.07x -> 1.02x.
+#
+# Against R0's pinned per-query anchors, ON arm vs 2x bar:
+#   Q3  6.53 s (bar 16.92)  Q10 5.75 s (bar 12.08)
+#   Q18 29.98 s (bar 55.16) Q7  11.20 s (bar 50.26)
+#   Q9  15.83 s (bar 170.9) — the clause's one named absolute, PASS with 10.8x
+#                             of headroom, and better than 01 §5's aspirational
+#                             58.83 s by 3.7x.
+#
+# Q5 is struck from this clause per 09 §3.4 (the arms compute different result
+# sets); for the record it reads 0.93x anyway.
+#
+# ---------------------------------------------------------------------------
+# 5. Clause 4 — TPC-DS SF0.5 under the flag — **PASS**
+# ---------------------------------------------------------------------------
+#   flag ON:  PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4
+#   flag OFF: PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4
+#             (the gate's git-tracked PG 18.3 oracle is the reference on both)
+#
+# Run 3 read PASS=83, ERROR=7, TIMEOUT=5 under the flag. Those were two
+# separate defects and both are closed: the 7 ERRORs were P5.9-i (the
+# reconcile assertion's own checker disagreeing) and the 5 TIMEOUTs were
+# P5.9-j/-k (Q47's mis-charged loop term, and the unpriced sort spill). The
+# gate's own status-delta channel reports the closure as
+# `PASS +Q7 +Q11 +Q26 +Q27 +Q31 +Q47 +Q53 +Q57 +Q58 +Q63 +Q74 +Q83`.
+#
+# 99 queries, zero wrong row counts, zero wrong checksums, under the flag.
+#
+# ---------------------------------------------------------------------------
+# 6. Clause 6 — bushy-plan capability — **UNDISCHARGED (no instrument)**
+# ---------------------------------------------------------------------------
+# What the bar asks for: on every searched query where PG 18.3's EXPLAIN shows
+# a bushy join spine (composite JOIN composite), goopg must be ABLE to produce
+# the same composite-composite pairing over the same relset partition,
+# "verified through the §4 parity gate's spine diff".
+#
+# **That spine diff does not exist.** `cmd/estimate-audit` — the §4 gate's
+# implementation — has zero occurrences of "bushy" or "spine". Its parity
+# channel compares per-joinrel ESTIMATES (`{a+b+c} goopg 3.1x | PG 2.1x`) and
+# reports relsets that appear on only one side as `SHAPE (PG-only joinrel)` /
+# `SHAPE (goopg-only joinrel)`. A relset name says which base relations are
+# underneath a node; it does not say how they were PAIRED. Clause 6 is a
+# question about pairing, so the gate cannot answer it, and has never answered
+# it in runs 1-4. Run 3 recorded clause 6 as "PARTIAL" on the strength of the
+# shape-divergence COUNT (67 -> 46) — that count is a proxy, not the check.
+#
+# Measured directly here instead, by classifying every join node in both plan
+# captures as bushy iff both of its children, after unwrapping
+# Hash/Materialize/Sort/Gather/Memoize/aggregation nodes, are themselves joins:
+#
+#   PG 18.3      Q7   BUSHY  Hash Join       <- [Nested Loop, Hash Join]
+#                Q8   BUSHY  Hash Join       <- [Nested Loop, Nested Loop]
+#                Q20  BUSHY  Hash Right Semi <- [Nested Loop, Nested Loop]
+#   goopg ON     (none in any of the 22)
+#   goopg OFF    (none in any of the 22)
+#
+# PG's Q7 partition, read off the §4 parity table's PG-only joinrels, is
+# {customer+lineitem+n2+orders} JOIN {n1+supplier}; goopg's ON arm instead
+# builds {lineitem+n1+n2+orders+supplier} JOIN customer — left-deep.
+#
+# This is NOT reported as a clause-6 failure. The clause admits alternative
+# shapes chosen on cost-constant or stats-fidelity grounds and reserves hard
+# failure for a bushy shape the search CANNOT EXPRESS. The structural evidence
+# says it can: `joinSearchOneLevel` phase 2 (internal/planner/joinsearchlevel.go
+# :171-222) is `joinrels.c:141-198` term for term, including the k-loop halfway
+# break, the mirror-image offset and the clause-only pair gate, and it is unit-
+# tested by TestJoinSearchFourRelChainOffersBushyPair,
+# TestJoinSearchBushyIsClauseOnly and TestJoinSearchPairCountMatchesClosedForm.
+# But those tests prove the MECHANISM on a synthetic 4-relation chain. Nothing
+# proves that for Q7's, Q8's or Q20's actual relset partition the pairing was
+# enumerated and then lost on cost, rather than never enumerated at all. Both
+# stories predict exactly the output observed above: a left-deep winner.
+#
+# So the clause stands undischarged, and with it the flip. Filed as
+# **M0127-P5.9-l**: give clause 6 the instrument §4 names — a search-level
+# channel that records, per query, the joinrel pairings the DP actually built,
+# and a comparator that asks whether PG's chosen partition is among them. Then
+# clause 6 is answered by measurement, and either it passes (cost/stats
+# divergence, admitted under the ratchet) or it names a concrete gap in the
+# bushy phase. Either outcome is a result; the current state is neither.
+#
+# ---------------------------------------------------------------------------
+# 7. Clause 5 — no MultiHashJoin, no fusion — **PASS (fourth consecutive)**
+# ---------------------------------------------------------------------------
+# EXPLAIN sweep over all 22 in both arms (PER_Q=120, DIGEST=0):
+#   2026-08-05-p59run4-explain-off.txt   MultiHashJoin=0  fusion=0  (443 lines)
+#   2026-08-05-p59run4-explain-on.txt    MultiHashJoin=0  fusion=0  (435 lines)
+# Zero ERROR/FAIL lines in either arm.
+#
+# ---------------------------------------------------------------------------
+# 8. §4 ratchet and §5 estimate audit
+# ---------------------------------------------------------------------------
+# §4 per-joinrel parity vs PG 18.3 (slack 10x, floor 100x):
+#
+#   arm   parity_violations   shape_mismatches   matched joinrels
+#   OFF   0                   67                 21
+#   ON    **0**               46                 32
+#
+# Run 3 read 0 (OFF) and **6** (ON) — every one of those six a joinrel the
+# PG-shaped search sized at rows=1 against actuals of 5 869 to 1 999 080.
+# P5.9-h's cardinality half and P5.9-k's cost half between them retired all
+# six. The ON arm now carries no joinrel worse than the PG reference beyond
+# the ratchet.
+#
+# §5 absolute tripwire (1000x; per-query overrides Q21<=5000x, Q9<=100x):
+#
+#   OFF   VIOLATION Q18 FINAL "Hash Join (SEMI)" est=1786825 actual=70 25526.1x
+#   ON    VIOLATION Q18 FINAL "Hash Join (SEMI)" est=1580956 actual=70 22585.1x
+#
+# One violation per arm, the same joinrel, and the ON arm's is the SMALLER of
+# the two. §3.6 already excluded this cell from the flag's account because it
+# is present in both arms; it remains the baseline's semi-join sizing, not the
+# search's.
+#
+# Clause 6's own secondary reading — matched joinrels 21 (OFF) -> 32 (ON),
+# shape divergences 67 -> 46 — is unchanged from run 3 and still says the
+# PG-shaped search agrees with PG about more of the join graph than the legacy
+# path does. It is evidence for 02's shape claim. It is not the pairing check.
+#
+# ---------------------------------------------------------------------------
+# 9. What run 4 changes
+# ---------------------------------------------------------------------------
+# Runs 1-3 each failed on something the search DID. Run 4 fails on something
+# the harness never MEASURED, and that is a different kind of no-go: there is
+# no open defect attributed to `GOOPG_PGSHAPED_DP` anywhere in this evidence
+# file. Correctness is discharged on two corpora (TPC-H 23/23 values, TPC-DS
+# 99 queries with zero MISMATCH and zero CKMISMATCH), performance is discharged
+# at 0.982x total with a 1.36x worst query, the estimate ratchet is at zero
+# violations on both arms, and MultiHashJoin is gone for the fourth run running.
+#
+# The single remaining gate is clause 6, and it is a gate on the harness before
+# it is a gate on the planner. P5.9-l builds it; P5.9 re-runs clause 6 alone
+# against it and then flips or attributes.

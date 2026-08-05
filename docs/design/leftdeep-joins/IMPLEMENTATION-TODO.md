@@ -1492,6 +1492,33 @@
   never saw it. Reproduce: `GOOPG_PGSHAPED_DP=1 bench/tpcds/server.sh start
   sf05`, then `psql -p 65437 -f
   bench/tpcds/runtime_goopg/tpcds-data/queries/query47.sql`.
+- [ ] **P5.9-l** Clause 6 has no instrument — build the spine/pairing channel
+  §4 names (NEW at P5.9 run 4, 09 §3.10). Run 4 passed clauses 1, 2, 3, 4 and 5
+  with zero defects attributed to `GOOPG_PGSHAPED_DP`, and the flip is held by
+  clause 6 alone. §4 specifies the check as "verified through the §4 parity
+  gate's spine diff"; `cmd/estimate-audit` has **zero** occurrences of "bushy"
+  or "spine". Its parity channel compares per-joinrel estimates and labels
+  one-sided relsets `SHAPE (…-only joinrel)` — a relset says which base
+  relations are underneath a node, never how they were PAIRED, and clause 6 is
+  a pairing question. Measured directly for run 4: PG 18.3 chooses a bushy
+  spine on exactly three of the 22 (Q7, Q8, Q20) and goopg on none, in either
+  arm; PG's Q7 partition is `{customer+lineitem+n2+orders} ⋈ {n1+supplier}`
+  against goopg's `{lineitem+n1+n2+orders+supplier} ⋈ customer`. Not a failure
+  by itself — the clause admits cost/stats-driven divergence and hard-fails
+  only on a shape the search cannot EXPRESS — but "enumerated and lost on cost"
+  and "never enumerated" predict the identical observable, so the run cannot
+  tell them apart. Phase 2 (`joinsearchlevel.go:171-222`) is `joinrels.c:141-198`
+  term for term and `TestJoinSearchFourRelChainOffersBushyPair` /
+  `TestJoinSearchBushyIsClauseOnly` / `TestJoinSearchPairCountMatchesClosedForm`
+  prove the mechanism — **on a synthetic 4-relation chain**, not on these
+  partitions. Build: a search-level channel that records, per query, the
+  joinrel pairings the DP actually built (phase 1 vs phase 2 provenance, both
+  sides' relsets), and a comparator that asks whether PG's chosen partition is
+  among them; wire it into `scripts/tpch-estimate-audit-arm.sh` so the ratchet
+  and the spine diff come from one arm. Bar: clause 6 answered by measurement
+  on Q7, Q8 and Q20 — pass (divergence attributed to cost or stats, admitted
+  under the ratchet) or a named gap in the bushy phase. Then P5.9 re-runs
+  clause 6 alone and flips or attributes.
 - [x] **P5.9-c** The search boundary publishes a ROTATED coordinate map — the
   P5.9 blocker. DONE 2026-08-05. The producer was innocent: the layout,
   `boundaryMap` and `projectToBindingOrder` are all correct, and the rotation is

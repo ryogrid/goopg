@@ -8145,6 +8145,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `scripts/tpch-estimate-audit-arm.sh` (new; the §4/§5 ratchet had no
       in-repo driver) and `sf05_planner_flags_line` (a flag-ON DS05 sweep was
       byte-indistinguishable from a flag-OFF one). 3 ledger rows.
+      **↳ RUN 4 EXECUTED 2026-08-06 (HEAD `9e0cfe67`) — HOLD, NOT a no-go
+      (09 §3.10);
+      `analysis/leftdeep-joins/2026-08-05-p59run4-s5-acceptance.txt`.** Flag
+      stays OFF, item stays OPEN — but for the first time **nothing in the
+      evidence is attributed to `GOOPG_PGSHAPED_DP`.** Clause 1 PASS (23 MATCH;
+      Q5's digests byte-identical to runs 2/3, so §3.4's PG adjudication and
+      exclusion carry). Clause 2 **PASS 0.982×** (ON 355.14 s, OFF 361.59 s,
+      allowance 433.91 s) — runs 1-3 read 1.36×. Clause 3 **PASS**, worst real
+      query 1.36× (Q2); run 3's five failures went Q10 3.91→0.99×, Q9
+      3.13→0.96×, Q18 2.47→1.04×, Q7 2.07→0.96×, Q12 2.07→1.02×; Q9's named
+      absolute passes at 15.83 s vs ≤ 170.9 s. Clause 4 **PASS** — DS05 under
+      the flag `PASS=95 (57 ck) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0
+      SKIP=4`, cell-for-cell the flag-OFF baseline (P5.9-i retired the 7
+      ERRORs, P5.9-j/-k the 5 TIMEOUTs). Clause 5 PASS (fourth consecutive).
+      §4 ratchet `parity_violations` **6 → 0** on the ON arm; §5 one violation
+      per arm, the same pre-existing Q18 semi-join, ON the smaller.
+      **What blocks the flip is clause 6, and it is a gate on the HARNESS.**
+      §4 specifies the check as "verified through the §4 parity gate's spine
+      diff" and `cmd/estimate-audit` has zero occurrences of "bushy" or
+      "spine" — its `SHAPE (…-only joinrel)` labels name relsets, never
+      PAIRINGS, and clause 6 is a pairing question. Measured directly: PG 18.3
+      goes bushy on exactly Q7, Q8, Q20 and goopg on none of the 22 in either
+      arm. That is not a failure by itself (the clause hard-fails only on a
+      shape the search cannot EXPRESS, and phase 2 is `joinrels.c:141-198`
+      term for term with three unit tests) — but "enumerated and lost on cost"
+      and "never enumerated" predict the same observable, so run 4 cannot tell
+      them apart. → **M0127-P5.9-l** (new). 3 ledger rows.
+- [ ] **M0127-P5.9-l — clause 6 has no instrument.** NEW 2026-08-06 at run 4;
+      the last thing between the bar and the flip. Build the spine/pairing
+      channel 09 §4 names but never got: the search records, per query, the
+      joinrel pairings the DP actually built (phase-1 vs phase-2 provenance,
+      both sides' relsets), and a comparator asks whether PG's chosen
+      partition is among them. Wire it into
+      `scripts/tpch-estimate-audit-arm.sh` so the §4 ratchet and the spine diff
+      come out of one arm. Adjudicate Q7
+      (`{customer+lineitem+n2+orders} ⋈ {n1+supplier}`), Q8 and Q20 — the three
+      TPC-H queries where PG 18.3 chooses a bushy spine. Bar: clause 6 answered
+      by MEASUREMENT — either the pairing was enumerated and lost on cost or
+      stats (admitted under the ratchet, clause 6 passes, P5.9 flips) or the
+      bushy phase has a named gap on these partitions (a new slice). Files:
+      `cmd/estimate-audit/`, `internal/planner/joinsearchlevel.go` (the
+      provenance channel), `scripts/tpch-estimate-audit-arm.sh`. 09 §3.10, §4;
+      IMPLEMENTATION-TODO P5.9-l.
 - [x] **M0127-P5.9-g — the decorrelated GROUP BY key was recorded in the
       scope it was FOUND in, not the one it is READ in.** DONE 2026-08-05 —
       and it was NOT the splice arithmetic this item predicted. At 4-under-5
