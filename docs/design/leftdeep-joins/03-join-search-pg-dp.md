@@ -616,13 +616,61 @@ Three things the port settled that the plan above had left as prose:
   bindings; `TestJoinlistLeavesMatchBindings` pins it through the production
   entry point rather than through the pure function.
 
-Two limits of the landed state, both ledgered: the per-session GUC values do
+One limit of the landed state is ledgered: the per-session GUC values do
 not reach the planner (`Plan` takes no session — the same gap
 `costParams.workMem` and `ParallelSettings` record), so `SET
 join_collapse_limit = 1` is still a no-op in a real session even though the
-semantics are implemented and tested; and nothing READS
-`resolveContext.joinlist` yet — `GOOPG_PGSHAPED_DP` is OFF and P5.9 is the
-wiring, so the pass runs on every planned SELECT and changes no plan.
+semantics are implemented and tested.
+
+### 6.2 As implemented (M0127-P5.9-a) — the CONSUMER, `internal/planner/relfromjoinlist.go`
+
+`makeRelFromJoinlist` is `make_rel_from_joinlist` (allpaths.c:3352): resolve
+every joinlist item to a rel — recursing on sub-lists — and, unless there is
+only one, search the orders in which they can be joined. `planJoinlistSearch`
+is the entry point; `searchOneProblem` is the only place the protocol
+(`buildInitialRels` → `addBaseRelIndexPaths` → `joinSearch`, then `finalPath`
+and the boundary) is written down rather than re-assembled per caller. Together
+they decide **how many searches a statement gets**, which is the question §6
+answers at the joinlist level and nothing had asked at the rel level.
+
+Three things the port settled:
+
+- **a sub-joinlist is planned, then handed over as ONE relation.** Upstream
+  returns a `RelOptInfo` whose whole PATHLIST stays available to the enclosing
+  problem; goopg returns a NODE — the sub-problem's cheapest tree, republished
+  in binding order — which the parent admits as one `PathPrebuilt` initial rel,
+  the same door a FROM-subquery leaf comes through (§2). So the parent cannot
+  pick a differently-sorted path for the sub-problem, and the sub-problem is
+  priced for all rows because it does not know which side of the enclosing join
+  it will land on. Ledgered, and the reason it is not a wiring fix: keeping the
+  pathlist alive across the boundary requires the level lists to be indexed by
+  joinlist ITEM rather than by base-relid popcount (`addRel`, joinsearch.go) —
+  a representation change.
+- **clause placement needs no placement pass.** Each problem builds its own
+  clause list from the statement's conjuncts with per-ITEM `cumOffsets`, and
+  `relidsOfExpr` (joinrestrict.go) does the rest: a clause between two leaves
+  inside one item collapses to a single bit, `relLevel < 2`, and is dropped
+  (the sub-problem that owns those leaves already placed it); a clause reaching
+  out of a sub-problem's window has a column outside it, is declined there, and
+  is placed by the enclosing problem, where both of its ends are items. No
+  clause is placed twice and none is lost.
+- **the boundary generalises to a window.** A sub-problem's rels carry GLOBAL
+  binding coordinates — they must, because the clause list is written in the
+  statement's one concatenated space — while the row it publishes is only its
+  own slice, so §10's map is now `createPlanAtSearchRootRange(p, base, width)`
+  and `createPlanAtSearchRoot` is the `base = 0` case. Running the same
+  permutation check ("no hole, no duplicate, nothing out of range") on the slice
+  is what makes a sub-problem that dropped a column fail at the boundary rather
+  than as a wrong row six nodes above. It works because a sub-joinlist covers a
+  CONTIGUOUS run of FROM items — deconstruction never reorders — which
+  `leafRange` CHECKS per item rather than assumes.
+
+Still inert: `GOOPG_PGSHAPED_DP` is OFF and no `planSelect` call site reaches
+`planJoinlistSearch`. The seam (`tryBushyDP` / `runJoinSearchBelowPinned`) is
+P5.9-b, which must also decide which conjuncts the search consumed before the
+residual `Filter` above it is rebuilt — the one piece of the wiring the
+recursion deliberately does not answer, because the residual belongs to the
+pre-search pipeline that owns that `Filter`, not to the search.
 
 ## 7. Search-size policy (the GEQO question)
 

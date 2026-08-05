@@ -1,55 +1,52 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.8** — LANDED, gates green, committed + pushed.
+Last loop: **M0127-P5.9-a** — LANDED, gates green, committed + pushed.
 Facts the next loop must NOT re-derive:
 
-1. `internal/planner/collapse.go` is new: `deconstructJointree` (the joinlist
-   half of `deconstruct_recurse`, initsplan.c:1148-1452), `deconstructFromItem`,
-   `combineJoinlists`, `soleItemOr`, types `joinlist`/`joinlistItem`,
-   `collapseLimits`/`defaultCollapseLimits`, flag `GOOPG_PGSHAPED_COLLAPSE`
-   (`pgShapedCollapseEnabled()`), and `deconstructRangeVars` for the JOIN-free
-   parse shape.
-2. **The finding.** Neither GUC is a search-size cap. `sub_members <= 1`
-   collapses every single-baserel FROM item unconditionally, so a flat comma
-   list is ONE problem at any width; `from_collapse_limit` governs merging
-   MULTI-relation sub-joinlists, `join_collapse_limit` governs explicit JOINs.
-   Reading them as a cap would re-introduce the greedy pre-reorder (03 §6's
-   Q2 failure mode). Also: `=1` does NOT bite until the THIRD relation (a
-   one-element side is unwrapped, initsplan.c:1428-1436).
-3. `resolveContext.joinlist` is new (planner.go), set ONLY in `planFromClause`
-   and `planFromRangeVars` — the two places where the FROM walk that numbers
-   leaves IS the walk that appends bindings. A leaf's `rel` is therefore a
-   direct `bindings`/`scans`/`relInfos` subscript
-   (`TestJoinlistLeavesMatchBindings`). Nil in every non-FROM context.
-4. Outer joins (LEFT/RIGHT/FULL) take upstream's FULL pin verbatim
-   (`list_make1(list_make2(l,r))`) per 03 §4.4 — RIGHT included, goopg has no
-   `reduce_outer_joins`. CROSS is upstream's JOIN_INNER.
-5. **The 12-table bail-out (`bushy.go:99`) was deliberately NOT deleted.** The
-   P5.8 TODO said to; 03 §7 says it dies WITH the bushy DP (P6.3) and §7 is
-   right — it guards the OLD 3ⁿ subset-bitmask DP (3¹⁶ ≈ 43 M), still the
-   production path. §7 and the `maxSearchRels` comment now say so explicitly.
-   Do not "finish" P5.8 by deleting it.
-6. DS05/PLAN not run and that is not a skip (same structural reason as
-   P5.7-a/-b): `GOOPG_PGSHAPED_COLLAPSE` is OFF so production joinlists pin
-   explicit JOINs exactly as today, and NOTHING reads `joinlist` under either
-   flag setting.
-7. 2 ledger rows: per-session collapse GUCs never reach `Plan` (no session
-   arg — `SET join_collapse_limit=1` is still a no-op in a real session); no
-   joinlist CONSUMER (`make_rel_from_joinlist` recursion) until P5.9.
+1. `internal/planner/relfromjoinlist.go` is new: `planJoinlistSearch` (entry),
+   `makeRelFromJoinlist` (allpaths.c:3352), `searchOneProblem` (the ONLY
+   written-down form of the protocol), `leafRel`, `validateJoinlistProblem`,
+   types `joinlistProblem` / `joinlistRel`, and `joinlist.leafRange`.
+2. **The protocol, in order, and it is not interchangeable:**
+   `buildInitialRels` → set `s.clauses` → `s.addBaseRelIndexPaths(cat)` →
+   `s.joinSearch(s.clauses, newJoinRelBuilder(s, cat))` → `s.finalPath()` →
+   `createPlanAtSearchRootRange`. `addParameterizedIndexPaths` READS
+   `s.clauses`, which `joinSearch` also sets — publish it before the producers.
+3. **Clause placement needs no pass.** Each problem builds its clause list with
+   per-ITEM `cumOffsets`; `relidsOfExpr` drops an intra-item clause
+   (`relLevel < 2` — already placed below) and declines a clause reaching out
+   of a sub-problem's window (`ok=false`), which the parent then places.
+4. A sub-joinlist enters its parent as ONE `PathPrebuilt` leaf with
+   `binding{offset: base}` and a **table-less** `baseRelInfo` (that nil table is
+   what makes every base-rel-only producer decline it). Its pathlist AND its
+   searched row estimate are discarded — parent re-derives rows via
+   `initialRelRows`'s non-scan arm (`EstimateRows`). Ledgered; the real fix is
+   indexing level lists by joinlist ITEM instead of base-relid popcount.
+5. `createPlanAtSearchRoot(p, w)` is now `createPlanAtSearchRootRange(p, 0, w)`;
+   `boundaryMap(lay, base, width)` and `missingBindingCoords(m, base)` took the
+   window. Sub-problems carry GLOBAL binding coordinates and publish only their
+   `[base, base+width)` slice — legal because a sub-joinlist covers a
+   CONTIGUOUS FROM-item run (`leafRange` checks it; it is not assumed).
+6. Still inert: `GOOPG_PGSHAPED_DP` OFF, no `planSelect` call site. DS05/PLAN
+   not run and that is not a skip (same structural reason as P5.7-a/-b, P5.8).
+7. 2 ledger rows added (pathlist+rows collapse at the boundary; no
+   residual-conjunct accounting). P5.8's "no joinlist CONSUMER" row FLIPPED to
+   `resolved`.
 
-Gates run: UNITS green (`/tmp/units-p58.log`, exit 0, zero FAIL lines);
-planner+executor re-run uncached with `GOOPG_PGSHAPED_COLLAPSE=1` (one-off
-`-count=1` env probe) both ok; commit-hook pgbench smoke. No orphaned servers.
+Gates run: UNITS green (`/tmp/units-p59a.log`, exit 0, zero FAIL lines);
+planner package green; gofmt clean on the three touched files; commit-hook
+pgbench smoke. No orphaned servers.
 
 Nightly triage 20260805-014309: unchanged, both items already filed under
-M-NIGHTLY (fix_plan lines 1097/1203/1215), left unchecked per the banner.
+M-NIGHTLY (fix_plan lines ~1097/1203/1215), left unchecked per the banner.
 
-Next step: per the banner (M0124 closed → M0125 → M0127), the head of open
-M0127 work is **M0127-P5.9** — the S5 acceptance run (09 §3, run once with
-collapse OFF then ON) + plan-shape ratchet baseline (§4) + estimate audit (§5),
-then flip `GOOPG_PGSHAPED_DP` / retire `GOOPG_COST_DRIVEN_JOINORDER`, or record
-the documented no-go. That slice must FIRST wire a consumer: `planSelect` →
-recurse over `resolveContext.joinlist` → `preprocessLimit` →
-`buildInitialRels` → `searchCtx.finalPath()`.
+Next step: **M0127-P5.9-b** — the `planSelect` seam. `tryBushyDP`
+(bushy.go:85) / `runJoinSearchBelowPinned` (predp.go:46/127) hand
+`resolveContext.joinlist` + `preprocessLimit`'s fraction to
+`planJoinlistSearch` under `GOOPG_PGSHAPED_DP`, and must decide which
+conjuncts the search consumed before rebuilding the residual `Filter`
+(`tryBushyDP` returns `(node, residualPredicate)`). Then P5.9 proper: the
+09 §3 acceptance run (collapse OFF then ON) + ratchet baseline + estimate
+audit, then the flag flip or a documented no-go.
 
 In-flight: none.

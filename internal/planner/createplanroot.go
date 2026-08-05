@@ -78,11 +78,35 @@ import (
 // still references. The caller holds the only copy of that number (the schema of
 // the join subtree the search replaced), so it is the caller that must state it.
 func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
+	return createPlanAtSearchRootRange(p, 0, bindingWidth)
+}
+
+// createPlanAtSearchRootRange is `createPlanAtSearchRoot` for a search problem
+// that does not start at binding coordinate 0 — a SUB-JOINLIST (M0127-P5.9-a).
+//
+// The joinlist recursion (`makeRelFromJoinlist`, relfromjoinlist.go) plans a
+// pinned sub-problem on its own and hands the result to the enclosing problem as
+// ONE initial rel. That sub-problem's rels carry GLOBAL binding coordinates —
+// they must, because the clause list it searches is written in the statement's
+// one concatenated space — while the row it publishes is only that sub-problem's
+// slice of it, `[base, base+width)`. Splitting the window out of `boundaryMap`
+// is what lets the same permutation check ("no hole, no duplicate, nothing out
+// of range") run on a slice as on the whole: a sub-problem that dropped or
+// duplicated a column fails here rather than as a wrong row six nodes above.
+//
+// The published order is still ascending binding coordinate, so the sub-result's
+// columns are exactly the pre-search concatenation restricted to its own range —
+// which is what makes it usable as a leaf of the enclosing problem with
+// `baseOffset = base` and nothing else to translate.
+func createPlanAtSearchRootRange(p *Path, base, width int) Node {
 	if p == nil {
 		panic("createPlan: search root has no path")
 	}
-	if bindingWidth <= 0 {
-		panic(fmt.Sprintf("createPlan: search root asked to reproduce a %d-column binding concatenation", bindingWidth))
+	if width <= 0 {
+		panic(fmt.Sprintf("createPlan: search root asked to reproduce a %d-column binding concatenation", width))
+	}
+	if base < 0 {
+		panic(fmt.Sprintf("createPlan: search root asked to publish binding coordinates from %d", base))
 	}
 	n, lay := createPlanNode(p)
 	if n == nil {
@@ -104,7 +128,7 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 	// — on the Project itself the claim is false by design (searchedtree.go
 	// explains why that is the sharpest argument for the tag).
 	assertSearchedTreeNeedsNoReconcile(n)
-	m := boundaryMap(lay, bindingWidth)
+	m := boundaryMap(lay, base, width)
 	if boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
 		// case. Emitting a Project here would be a pure copy of every row.
@@ -143,26 +167,30 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 //
 // All three are producer bugs, and all three are cheaper to fail on here than to
 // debug as a wrong row count six gates later.
-func boundaryMap(lay outputLayout, bindingWidth int) []int {
+// `base` is the first binding coordinate the problem covers — 0 for the
+// statement's own search, and the sub-problem's first FROM item's offset for a
+// sub-joinlist (M0127-P5.9-a). Entry `i` of the returned map is therefore the
+// root output column holding binding coordinate `base+i`.
+func boundaryMap(lay outputLayout, base, width int) []int {
 	if len(lay) == 0 {
 		panic("createPlan: search root publishes no columns")
 	}
-	m := make([]int, bindingWidth)
+	m := make([]int, width)
 	for i := range m {
 		m[i] = -1
 	}
 	for out, bind := range lay {
-		if bind < 0 || bind >= bindingWidth {
-			panic(fmt.Sprintf("createPlan: search root output column %d carries binding coordinate %d, outside the %d-column binding concatenation it must reproduce",
-				out, bind, bindingWidth))
+		if bind < base || bind >= base+width {
+			panic(fmt.Sprintf("createPlan: search root output column %d carries binding coordinate %d, outside the %d-column binding concatenation [%d,%d) it must reproduce",
+				out, bind, width, base, base+width))
 		}
-		if prev := m[bind]; prev != -1 {
+		if prev := m[bind-base]; prev != -1 {
 			panic(fmt.Sprintf("createPlan: search root output columns %d and %d both claim binding coordinate %d; a base relation reached the root through two children",
 				prev, out, bind))
 		}
-		m[bind] = out
+		m[bind-base] = out
 	}
-	if missing := missingBindingCoords(m); len(missing) > 0 {
+	if missing := missingBindingCoords(m, base); len(missing) > 0 {
 		panic(fmt.Sprintf("createPlan: search root does not publish binding coordinate(s) %v; the enclosing tree references columns the searched subtree cannot supply",
 			missing))
 	}
@@ -173,11 +201,11 @@ func boundaryMap(lay outputLayout, bindingWidth int) []int {
 // above. Separate so the message names every gap rather than the first — a
 // whole missing relation shows up as a run, which says "a FROM item never
 // entered the search" far more legibly than a single index.
-func missingBindingCoords(m []int) []int {
+func missingBindingCoords(m []int, base int) []int {
 	var missing []int
 	for bind, out := range m {
 		if out == -1 {
-			missing = append(missing, bind)
+			missing = append(missing, base+bind)
 		}
 	}
 	sort.Ints(missing)

@@ -1234,6 +1234,31 @@
   *with the bushy DP* (P6.3), and it must: it guards the old 3ⁿ subset-bitmask
   DP, which is still the production path. Ledger rows: per-session collapse
   GUCs unreachable; no joinlist consumer yet.
+- [x] **P5.9-a** `make_rel_from_joinlist` — the joinlist's CONSUMER (03 §6.2),
+  the piece P5.9 cannot run without: a joinlist had no reader and the search
+  protocol existed only as a sequence each test re-assembled.
+  DONE 2026-08-05 — `internal/planner/relfromjoinlist.go`:
+  `planJoinlistSearch` / `makeRelFromJoinlist` (allpaths.c:3352) walk the
+  joinlist, recurse on sub-lists, and run ONE problem per non-singleton list
+  through `buildInitialRels` → `addBaseRelIndexPaths` → `joinSearch` →
+  `finalPath` → the boundary. A sub-joinlist is planned separately and enters
+  its parent as one `PathPrebuilt` leaf; `createPlanAtSearchRootRange`
+  (createplanroot.go) is `createPlanAtSearchRoot` over a `[base, base+width)`
+  window so the permutation check runs on a sub-problem's slice too. Clause
+  placement needs no pass: each problem builds its list with per-ITEM
+  `cumOffsets`, so an intra-item clause collapses to one bit (`relLevel < 2`,
+  dropped — already placed below) and a clause reaching out of a sub-problem
+  is declined there and placed by the parent. 10 tests; acceptance is
+  `TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch` (with the unpinned
+  control arm that makes it non-vacuous). Still inert — no `planSelect` call
+  site, `GOOPG_PGSHAPED_DP` OFF. Bar met: UNITS. 2 ledger rows: the
+  pathlist-and-rows collapse at a sub-problem boundary; no residual-conjunct
+  accounting yet (P5.9-b's job).
+- [ ] **P5.9-b** the `planSelect` seam: `tryBushyDP` /
+  `runJoinSearchBelowPinned` hand `resolveContext.joinlist` +
+  `preprocessLimit`'s fraction to `planJoinlistSearch` under
+  `GOOPG_PGSHAPED_DP`, and decide which conjuncts the search consumed before
+  the residual `Filter` above it is rebuilt.
 - [ ] **P5.9** S5 acceptance run per [09](09-verification-and-acceptance.md)
   §3 + plan-shape ratchet baseline (§4) + estimate audit (§5); flag flip or
   documented no-go.

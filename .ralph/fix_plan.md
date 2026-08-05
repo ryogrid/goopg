@@ -7980,6 +7980,46 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       P5.7-a/-b: `GOOPG_PGSHAPED_COLLAPSE` is OFF, so production joinlists pin
       explicit JOINs exactly as today, and nothing reads the result under either
       flag setting — the default arm is byte-identical.
+- [x] **M0127-P5.9-a — `make_rel_from_joinlist`, the joinlist's CONSUMER.**
+      DONE 2026-08-05 — the prerequisite P5.9 could not run without: P5.8's
+      joinlist had no reader, and the search protocol existed only as a
+      sequence each unit test re-assembled by hand.
+      `internal/planner/relfromjoinlist.go` ports `make_rel_from_joinlist`
+      (allpaths.c:3352): `planJoinlistSearch` / `makeRelFromJoinlist` walk the
+      joinlist, recurse on sub-lists, and run ONE problem per non-singleton
+      list through `buildInitialRels` → `addBaseRelIndexPaths` → `joinSearch`
+      → `finalPath` → the boundary (`searchOneProblem`, the protocol's only
+      written-down form). **Three findings.** (i) A sub-joinlist is planned
+      separately and enters its parent as ONE `PathPrebuilt` leaf — goopg
+      returns a node where upstream returns a `RelOptInfo` with its pathlist
+      intact, so the parent cannot pick a differently-sorted path for it;
+      keeping the pathlist alive needs the level lists indexed by joinlist ITEM
+      rather than by base-relid popcount (`addRel`), a representation change,
+      not a wiring one. (ii) Clause placement needs NO placement pass: each
+      problem builds its clause list with per-ITEM `cumOffsets`, so an
+      intra-item clause collapses to one bit (`relLevel < 2`, dropped — the
+      sub-problem already placed it) and a clause reaching out of a
+      sub-problem is declined there and placed by the parent. (iii) The §10
+      boundary generalises to a window — `createPlanAtSearchRootRange(p, base,
+      width)`, with `createPlanAtSearchRoot` the `base = 0` case — so the
+      permutation check runs on a sub-problem's slice too; it works because a
+      sub-joinlist covers a CONTIGUOUS FROM-item run, which `leafRange` checks
+      rather than assumes. 10 tests; acceptance is
+      `TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch`, whose unpinned
+      control arm is what makes it non-vacuous. **2 ledger rows** (the
+      pathlist-and-rows collapse at a sub-problem boundary; no
+      residual-conjunct accounting — that is P5.9-b's). 03 §6.2;
+      IMPLEMENTATION-TODO P5.9-a. Bar met: UNITS. DS05/PLAN not applicable for
+      the same structural reason as P5.7-a/-b and P5.8: `GOOPG_PGSHAPED_DP` is
+      OFF and no `planSelect` call site reaches the new code.
+- [ ] **M0127-P5.9-b — the `planSelect` seam.** `tryBushyDP` /
+      `runJoinSearchBelowPinned` hand `resolveContext.joinlist` +
+      `preprocessLimit`'s fraction to `planJoinlistSearch` under
+      `GOOPG_PGSHAPED_DP`, and decide which conjuncts the search consumed
+      before the residual `Filter` above it is rebuilt (the recursion
+      deliberately does not answer that — the residual belongs to the
+      pre-search pipeline that owns the `Filter`). 03 §6.2; 08 §2.
+      Bar: UNITS + SPOT + DS05 flag-off inertness.
 - [ ] **M0127-P5.9 — S5 acceptance run + flag flip.** The full 09 §3 bar (run
       once with collapse OFF, then with collapse ON) + plan-shape ratchet
       baseline (§4) + estimate audit (§5); flip `GOOPG_PGSHAPED_DP` ON and
