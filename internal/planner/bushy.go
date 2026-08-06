@@ -1748,12 +1748,6 @@ func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 	return bin.Left == leftKey && bin.Right == rightKey
 }
 
-// IsCanonicalKeyEquality is the exported wrapper.
-// M0126-0006: the runtime fusion predicate in the executor needs it.
-func IsCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
-	return isCanonicalKeyEquality(c, leftKey, rightKey)
-}
-
 // extraInScans reports whether every ColumnRef in c references a
 // column name that appears in the output schema of at least one
 // scan in scans. Used to validate that an MHJ.Filters extra

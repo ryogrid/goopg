@@ -1847,8 +1847,17 @@
 
 ## P6 — Deletion [S7, after S5-ON survives a clean nightly cycle]
 
-- [ ] **P6.1** Delete fusion (`fused_hash_join.go`, hook, env vars, orphan
-  exports check).
+- [x] **P6.1** Delete fusion (`fused_hash_join.go`, hook, env vars, orphan
+  exports check). **DONE 2026-08-07.** Both files gone (`fused_hash_join.go`
+  + its test), both hook sites (`executor.go` `Build`'s `*planner.Join` arm
+  and `buildRec`'s), `GOOPG_RUNTIME_JOIN_FUSION{,_MIN_LEVELS}`,
+  `planner.IsCanonicalKeyEquality` (the unexported `isCanonicalKeyEquality`
+  stays — `join_hash_keys.go` still documents it). `buildEnv` went too: every
+  field on it (`root`/`inWorker`/`fusionCfg`/`q0`) was fusion-only, so
+  `buildWithEnv` is now `buildNode` and `BuildWorker` builds byte-for-byte
+  what `Build` builds; `opTreeSlab.env` (documented nil since M0127-P1.2)
+  is deleted as its own comment said it would be. Gate: grep-clean + UNITS +
+  SPOT (Q12=2/Q13=35).
 - [ ] **P6.2** Delete MultiHashJoin (fresh grep inventory; expect ~28 arms /
   15 files: node, packer, `mhj_input_rewrite.go`, posmaps, cost/cardinality
   arms, executor op, EXPLAIN arms, `generateMultiHashJoinPath`, flags).

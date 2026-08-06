@@ -10157,10 +10157,25 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       the wire, since goopg emits no `FieldPosition` for executor errors, which
       is what made divergence (3) log-text-only). **Stage E5 is COMPLETE; S7 (P6.1–P6.4) is next,
       gated on S5-ON surviving a clean nightly cycle.**
-- [ ] **M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
+- [x] **M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
       `executor.go:160-163`, env vars, orphan-export check —
       `IsCanonicalKeyEquality` has no other caller). IMPLEMENTATION-TODO P6.1;
-      08 §4 "Fusion". Bar: grep-clean + UNITS + SPOT.
+      08 §4 "Fusion". Bar: grep-clean + UNITS + SPOT. **DONE 2026-08-07** —
+      both files deleted whole, BOTH hook sites (`Build` and `buildRec`),
+      `GOOPG_RUNTIME_JOIN_FUSION{,_MIN_LEVELS}` (both defaulted OFF, so this
+      is behaviour-preserving by construction), `planner.IsCanonicalKeyEquality`
+      (unexported twin survives). The inventory's one wrong call was "keep
+      `inWorker`, it has other readers": it has none — every `buildEnv` field
+      was fusion-only, so the struct, `buildWithEnv`(→`buildNode`) and the
+      documented-nil `opTreeSlab.env` all went with it, and `BuildWorker` is
+      now a byte-identical alias kept as the named worker seam. Closes the
+      FUSED half of the `markJoinPreserveCTID` `FOR UPDATE` row-lock gap by
+      construction (ledger rows `2026-08-06 M-NIGHTLY (root-0038)` and
+      `(AI-20260806-011323-001)`); the `multiHashJoinOp` half stays open until
+      P6.2, so neither row is flipped to `resolved` yet — new ledger row
+      `2026-08-07 M0127-P6.1` records the partial closure. Gates: grep-clean,
+      `go build`/`go vet` clean, UNITS PASS, SPOT PASS (Q12=2/Q13=35, 28.8 s
+      query phase). Design doc §6 row + IMPLEMENTATION-TODO P6.1 stamped.
 - [ ] **M0127-P6.2 — delete MultiHashJoin** (fresh grep inventory at S7 time;
       2026-08-02 count ~34 arms / 18 files: node, packer
       `rewriteMultiWayChain`/`collectMultiHashTables`, `mhj_input_rewrite.go`,
