@@ -1216,6 +1216,18 @@ func (n *MaterializedCTEScan) Output() Schema { return n.schema }
 func (n *CTEScan) Pos() int       { return n.pos }
 func (n *CTEScan) Output() Schema { return n.schema }
 
+// DeclSeq exposes the WITH-list declaration order of the CTE this scan
+// consumes, so EXPLAIN can print its `CTE <name>` section in PG's order
+// (`SS_process_ctes` walks the WITH list left to right). 0 when the scan was
+// built outside preplanWithClause (tests), which sorts it first — harmless,
+// since such a plan has at most one CTE. M0125-0049.
+func (n *CTEScan) DeclSeq() int {
+	if n.cte == nil {
+		return 0
+	}
+	return n.cte.declSeq
+}
+
 // Sort — orders the child's rows by the given keys.
 type SortKey struct {
 	Expr       Expr

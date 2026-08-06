@@ -5219,8 +5219,31 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       pre-existing `grouping_sets_compat_test.go` answer pins unchanged. NOT
       urgent: -0040 already took the runtime win these queries were losing, so
       select this for FIDELITY, not for speed.
-- [ ] **M0125-0049 — EXPLAIN renders a shared CTE body once per reference**
-      (filed 2026-08-06 by `M0125-0040`; ledger row same date). `preplanWithClause`
+- [x] **M0125-0049 — EXPLAIN renders a shared CTE body once per reference**
+      **[CLOSED 2026-08-06 — `internal/executor/explain_cte.go`; design
+      `docs/design/0125-0049-explain-shared-cte-section.md`; 4 ledger rows]**
+      The filed premise was wrong in a way worth recording: `preplanWithClause`
+      does NOT clone the body. `planScanRangeVar` builds every reference with
+      `Child: ce.body` — one shared Node — so the plan is a DAG and the EXPLAIN
+      walker walked it as a tree. Fixed by hoisting one `CTE <name>` section
+      onto the top plan node (PG's `SS_process_ctes` + `ExplainSubPlans` shape,
+      captured from 18.3 including three edges: refs==1 is still sectioned,
+      order is declaration not encounter — new `CTEScan.DeclSeq` — and a nested
+      WITH sections inside its own body) and rendering each reference as a
+      leaf. **The key is the CTE NAME, not the body pointer:** M0125-0040 gives
+      each UNION branch its own `preplanWithClause` pass, so Q67's nine
+      references carry nine distinct-but-identical bodies for the one
+      `ctx.CTERowCache[name]` buffer they all read — a pointer key left the 36
+      `store_sales` mentions in place. Measured on the SF0.5 plan channel:
+      the full move is exactly the 30 TPC-DS `WITH` queries plus the 4
+      grouping-sets ones, **no query without a CTE moved**; corpus 5774 → 4307
+      lines; **Q67 127 → 40 lines, 36 → 4 `store_sales` mentions, ONE
+      `Seq Scan on public.store_sales`** — -0040's literal acceptance wording
+      is now met in rendering too. Baseline re-pinned by capture
+      `plans-20260806-142927.txt`. Deferred with rows: sections hoist to the
+      render root rather than the declaring query level; a sublink-only
+      reference is not collected; JSON/XML/YAML still duplicate. Discovery
+      filed as `M0125-0050`. ORIGINAL FILING: `preplanWithClause`
       clones a CTE body per consumer (M0016-0002's deliberate
       correctness-first contract), so a multiply-referenced CTE prints its whole
       subtree once per reference: TPC-DS Q67 now shows eight `CTE Scan on
@@ -5238,6 +5261,27 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       multiply-referenced user CTE too, not just the synthetic one. Bar: the
       SF0.5 gate's plan channel WILL move on every such query, so re-pin the
       plan snapshot in the same commit and say which queries moved and why.
+- [ ] **M0125-0050 — two same-named CTE declarations in disjoint scopes share
+      one materialization, so the second replays the first's rows** (filed
+      2026-08-06 by `M0125-0049`, which hit it while choosing the hoist key;
+      ledger row same date). WRONG ANSWERS, not a rendering issue:
+      `ctx.CTERowCache` is `map[string][]Row` keyed by the LOWERCASE CTE NAME
+      statement-wide (`internal/executor/context.go`), and `cteScanOp.Open`
+      (`internal/executor/operators_cte_dml.go`) buffers on the first scan of a
+      name and replays for every later one — with no notion of WHICH
+      declaration that name came from. Witness:
+      `SELECT v FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) a UNION ALL
+      SELECT v FROM (WITH x AS (SELECT 2 AS v) SELECT v FROM x) b` returns
+      **1, 1** on goopg and **1, 2** on PG 18.3. PG keys the buffer by the
+      CTE's plan node (`ctePlanId` / `CteScanState.cteplanstate`,
+      `postgres/src/backend/executor/nodeCtescan.c`), which is per-declaration
+      by construction. Fix: stamp a per-declaration id on `plannedCTE` (next to
+      `declSeq`, added by -0049), carry it on `CTEScan`, and key both
+      `CTERowCache` and `collectCTEHoist` (`internal/executor/explain_cte.go`)
+      by that id instead of the name. Bar: the witness above under
+      `internal/executor`, the existing CTE compat pins unchanged, and the
+      SF0.5 gate — TPC-DS has no same-name-different-scope CTE, so the plan
+      channel must report `same=99` unless the id changes a section heading.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor

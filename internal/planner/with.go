@@ -43,6 +43,24 @@ type plannedCTE struct {
 	// (side effects run once, rows replayed) and recursive bodies
 	// (WorkTableScan protocol) never qualify.
 	inlineEligible bool
+	// declSeq orders CTEs by WITH-list declaration (left to right, and an
+	// enclosing statement's list after any list declared inside a body it
+	// planned first). EXPLAIN reads it through CTEScan.DeclSeq to print the
+	// `CTE <name>` sections in PG's order: upstream walks the top plan
+	// node's subplan list, which is built in declaration order
+	// (`SS_process_ctes`, optimizer/plan/subselect.c). M0125-0049.
+	declSeq int
+}
+
+// cteDeclSeq stamps plannedCTE.declSeq. Package-global and unsynchronised,
+// exactly like planCTEs above (planning is single-goroutine per statement);
+// only the relative order within one plan tree is ever read, so the counter
+// never needs resetting.
+var cteDeclSeq int
+
+func nextCTEDeclSeq() int {
+	cteDeclSeq++
+	return cteDeclSeq
 }
 
 // planCTEs is the goroutine-thread-unsafe "current WITH-list"
@@ -115,10 +133,11 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 				cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
 			}
 			cur[strings.ToLower(cte.Name)] = &plannedCTE{
-				name:   cte.Name,
-				body:   body,
-				schema: schema,
-				table:  &catalog.Table{Name: cte.Name, Columns: cols},
+				name:    cte.Name,
+				body:    body,
+				schema:  schema,
+				table:   &catalog.Table{Name: cte.Name, Columns: cols},
+				declSeq: nextCTEDeclSeq(),
 			}
 		}
 		return restore, nil, nil
@@ -154,11 +173,12 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 				cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
 			}
 			entry := &plannedCTE{
-				name:   cte.Name,
-				body:   body,
-				schema: schema,
-				table:  &catalog.Table{Name: cte.Name, Columns: cols},
-				isDML:  true,
+				name:    cte.Name,
+				body:    body,
+				schema:  schema,
+				table:   &catalog.Table{Name: cte.Name, Columns: cols},
+				isDML:   true,
+				declSeq: nextCTEDeclSeq(),
 			}
 			cur[strings.ToLower(cte.Name)] = entry
 			dmlPlans = append(dmlPlans, dmlCTEPlan{name: cte.Name, plan: body, schema: schema})
@@ -208,10 +228,11 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 			cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
 		}
 		entry := &plannedCTE{
-			name:   cte.Name,
-			body:   body,
-			schema: schema,
-			table:  &catalog.Table{Name: cte.Name, Columns: cols},
+			name:    cte.Name,
+			body:    body,
+			schema:  schema,
+			table:   &catalog.Table{Name: cte.Name, Columns: cols},
+			declSeq: nextCTEDeclSeq(),
 			// Plain non-recursive SELECT body: the only shape whose Child
 			// a single-reference qual may descend into. The WITH RECURSIVE
 			// branch above and the DML branch never set this.
