@@ -1,47 +1,50 @@
 (idle — nothing in flight)
 
-Last loop: **M-NIGHTLY AI-20260806-011323-002..-015 — one mid-run compile
-error filed itself as 14 phantom testport regressions. FIXED, committed.**
-Selected under the carve-out: this DOES break a gate M0127 depends on —
-P6.1–P6.4's S7 bar is "S5-ON survives a clean nightly cycle", and a nightly
-that manufactures regressions whenever it overlaps an active Ralph loop can
-never come back clean. The gate was unmeasurable, not merely noisy.
+Last loop: **M-NIGHTLY / S7-gate loop #3. Selected `TestPort_IsolationEvalPlanQual`
+(AI-20260806-011323-001) under carve-out #2 — it is the last genuine blocker to
+the clean nightly cycle M0127-P6.1..P6.4 wait on. It did NOT reproduce; a
+DIFFERENT row-locking defect was found and FIXED. Committed.**
 
-1. **Option (a) from the filing was already implemented and did NOT help.**
-   `stage-preflight.sh` has always run `make build` and aborted; in run
-   `20260806-011323` preflight PASSED in 7 s and testport broke 1079 s later
-   (`s.traceFailed undefined`, from the previous loop's own `bf52391e`). The
-   tree mutates *between* stages, so no front-loaded build can catch it.
-2. **Boundary, not flag.** `build_error_line()` returns the *index* of the
-   first Go build signature; tests failing at/after it collapse into ONE
-   `[infra]` item, tests failing before it are reported normally. Load-bearing:
-   `TestPort_IsolationEvalPlanQual` (genuine, six nights) failed ~600 lines
-   above the boundary in that same log. The boundary also catches the 8
-   `pg_dump*` victims carrying **no compiler text at all** (`start failed;
-   process exited early`) — no message-matching rule could have.
-3. **Non-gating on purpose.** `build_kills` → `inconclusive`, like a resource
-   kill: the recorded sha builds clean. Gating it would keep the S7 bar
-   permanently unmeetable — the defect restated.
-4. `source_fingerprint()` (HEAD + `*.go`/`go.mod`/`go.sum` porcelain + tracked
-   diff) stamps `meta.json` + `stages/<name>.fp` before each stage, so drift is
-   stated rather than inferred.
+1. **The recorded diagnosis was wrong.** fix_plan said `partiallock_ext` failed
+   to block at L1027. The real 20260806 diff starts at **L1001 on
+   `lockwithvalues`** (perm `wx2 lockwithvalues c2 c1 read`, spec line 411):
+   no ` <waiting ...>` AND the stale row `checking|600|1200` where PG gives
+   `1050|2100`. `partiallock_ext` blocks correctly at L1024 of the same log.
+2. **Four reproduction conditions FALSIFIED at HEAD** — isolation (5 runs,
+   21–22 s), nightly cgroup env (6G/8G/GOMEMLIMIT=5GiB), synthetic 12-way CPU
+   load, and the whole `TestPort_Isolation*` family in nightly order (404 s,
+   PASS at 21.44 s). It still fails 6/6 nights in the FULL package run ⇒ the
+   trigger is order-dependent on a test OUTSIDE the isolation family.
+3. **Fixed instead (root-0038):** `ORDER BY … FOR UPDATE` over a JOIN took **no
+   tuple lock at all** — stale row in 4 ms, no block, no EPQ recheck. goopg has
+   no resjunk-ctid column and reconstructs the TID from plan shape; both walkers
+   correctly return nil at a `sortOp`, and the slot side-channel that covers
+   that case (`sortOp.ctids`) only fires if the slot entering the sort has
+   `hasCTID` — `seqScanOp` stamps it, a `joinOp` only does when
+   `preserveCTIDRel` is set, and `markJoinPreserveCTID` stopped dead at the
+   Sort. One arm (`case *sortOp:`) fixes it. A/B, same plan shape both sides:
+   4 ms/600/no-block → 4008 ms/1050/blocked.
 
-Files: `ci/batch/lib/summarize.py`, `ci/batch/lib/common.sh`,
-`ci/batch/run-nightly.sh`, `ci/batch/lib/test_summarize.py` (new
-`MidRunBuildBreakTest`), `ci/design/04-logging-and-reporting.md` §C.1 + README
-index, fix_plan (item ticked + S7 gate amendment), 1 ledger row.
+Files: `internal/executor/operators_lockrows.go` (the arm + why the walkers are
+left alone), `internal/testport/lockrows_sort_ctid_test.go` (new guard),
+`docs/design/root-0038-lockrows-sort-over-join-ctid.md` + README index,
+fix_plan (diagnosis corrected + `[x]` task), 3 ledger rows.
 
-Gates run: `test_summarize.py` 8/8 PASS, non-vacuous (forcing
-`tp_build_boundary = None` fails 2); real-run replay `20260806-011323`
-**18 items → 5** (4 genuine + 1 infra, EvalPlanQual still -001); `bash -n` on
-both shell files; fingerprint stability + edit-detection probe; pgbench smoke
-via hook. No Go changed, so UNITS/SPOT/DS05 not applicable.
+Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); `TestPort_(Isolation|LockRows)*`
+0 FAIL (416 s) post-change; new guard verified NON-VACUOUS (with the arm removed
+`sort_over_join` fails at `balance=600`/no block while the `join_no_sort`
+control still passes); pgbench smoke via hook. DS05 NOT run — deliberate:
+`markJoinPreserveCTID`'s only caller is `lockRowsOp.Open`, so the change is
+unreachable without a `LockRows` node and the TPC-DS corpus has no `FOR UPDATE`.
 
-NEXT LOOP (banner wins — M0124 → M0125 → M0127; M-NIGHTLY still parked).
-M0127's topmost unchecked item is **P6.1 — delete fusion**, still gated on a
-clean nightly cycle. Read the newest `ci/logs/action-items.md` FIRST: P6.1 is
-selectable only at `status: pass`. Note the next nightly is the first to run
-the new summarizer, so a `[infra] testport/build-broke-mid-stage` item now
-means "the harness saw the loop edit the tree", not a regression.
+NEXT LOOP (banner: M0124 closed → M0125 → **M0127** → M-NIGHTLY → M0123).
+M0127-P6.1 is STILL NOT selectable — it needs `ci/logs/action-items.md` at
+`status: pass`, and the newest run is still `fail`. Read the newest one FIRST:
+the next nightly is the first to run the new summarizer, so an
+`[infra] testport/build-broke-mid-stage` item means "the harness saw a loop edit
+the tree", not a regression. If still `fail` on EvalPlanQual, the next step is
+the **prefix bisect** of `internal/testport` (regress / pg_dump / pg_basebackup /
+pgoutput blocks + EvalPlanQual) to find the predecessor that poisons it — do not
+re-attempt an isolation-level repro, that is now falsified four ways.
 
 In-flight: none.

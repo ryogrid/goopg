@@ -1108,6 +1108,61 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       nightly at/after the M0126-0003 slot-path re-land (`d197365c`) — bisect
       candidates: `5c1c0e21` (0a VirtualSlot fast path), `d197365c` (0b re-land).
       FILED, NOT SELECTED per the 2026-07-28(b) amendment.
+      **⚠ 2026-08-06 (S7-gate loop #3) — THE DIAGNOSIS ABOVE IS WRONG, and four
+      reproduction conditions are FALSIFIED.** The recorded diff (`partiallock_ext`
+      missing its `<... completed>` marker around L1027) is not what run
+      `20260806-011323` shows. The actual diff starts at **L1001 on
+      `lockwithvalues`**: expected `" <waiting ...>"`, actual `""` — and the row
+      returned is the STALE `checking|600|1200` where PG gives `1050|2100`.
+      `partiallock_ext` blocks CORRECTLY at L1024 of that same log. So the
+      signature is "did not block AND read the pre-update row", on permutation
+      `wx2 lockwithvalues c2 c1 read` (spec line 411), not the adjacent
+      `partiallock_ext` one (line 412).
+      **NOT REPRODUCIBLE AT HEAD `5e767047`** under any of: isolation (5 runs,
+      21–22 s each); the nightly's own cgroup env (`GOOPG_MEM_HIGH=6G MAX=8G
+      GOMEMLIMIT=5GiB`); synthetic 12-way CPU load; or the WHOLE
+      `TestPort_Isolation*` family in nightly order (404 s — EvalPlanQual PASS
+      at 21.44 s). It still fails 6/6 nights in the full-package run, so the
+      trigger is **order-dependent on a test OUTSIDE the isolation family** —
+      in-process state left by an earlier testport test — and is unidentified.
+      NEXT STEP is a prefix bisect of the package (regress / pg_dump /
+      pg_basebackup / pgoutput blocks + EvalPlanQual), NOT another
+      isolation-level repro attempt: a full `internal/testport` run is the only
+      faithful reproduction and the nightly budgets 120 m for it. Ledger row
+      appended 2026-08-06.
+      A **different** row-locking defect was found and FIXED while investigating
+      — `ORDER BY … FOR UPDATE` over a join took no tuple lock at all
+      (docs/design/root-0038, guard
+      `TestPort_LockRowsSortOverJoinTakesRowLock`). It does NOT close this item:
+      the failing steps here carry no `ORDER BY`.
+- [x] **executor/row-locking — `ORDER BY … FOR UPDATE` over a JOIN took NO
+      tuple lock** (found 2026-08-06 during the EvalPlanQual triage above; a
+      DISTINCT defect from it, not a fix for it). `SELECT a.accountid, a.balance
+      FROM accounts a, small s WHERE a.accountid = s.k ORDER BY a.accountid FOR
+      UPDATE OF a` returned the stale pre-update row in **4 ms without
+      blocking**, where PG blocks and returns the updated row — no tuple lock,
+      no EvalPlanQual recheck. Drop the `ORDER BY` and the same query is correct
+      (blocks 6005 ms → 1050); a single-relation `ORDER BY … FOR UPDATE` is
+      correct too. Cause: goopg has no resjunk-`ctid` column (PG's
+      `preprocess_targetlist` adds one per rowmark, `nodeLockRows.c` reads it
+      back, so plan shape is irrelevant to locking there) and instead
+      RECONSTRUCTS the TID two ways — `lockRowsOp.scan` found by walking the
+      operator tree, else the `MaterializedSlot.hasCTID` side-channel. Route 1
+      cannot work under a Sort and both walkers correctly return nil at a
+      `sortOp`; route 2 is exactly the cover for that (`sortOp.ctids`,
+      M0118-0003) but only fires if the slot ENTERING the sort has `hasCTID`.
+      `seqScanOp` stamps it itself (hence the working single-relation case); a
+      `joinOp` forwards it only when `preserveCTIDRel` is set, and
+      `markJoinPreserveCTID` recursed through Project/Filter/Join only, stopping
+      dead at the Sort. Both routes empty ⇒ unlocked pass-through. Fix is one
+      arm (`case *sortOp:`); the walkers are deliberately left alone.
+      Design `docs/design/root-0038-lockrows-sort-over-join-ctid.md`. Guard
+      `TestPort_LockRowsSortOverJoinTakesRowLock` (`sort_over_join` +
+      `join_no_sort` control), non-vacuous — with the arm removed only the
+      former fails, with exactly `balance=600` and no block. Gates: UNITS 0 FAIL,
+      SPOT PASS (Q12=2, Q13=35), isolation family green. 2 ledger rows (sort
+      SPILL still drops the side-channel; the walkers know 8 of ~70 operator
+      types, so other shapes degrade to "no lock" the same silent way).
 - [ ] **regress/{btree_index,char,delete,int2,int4,int8,limit,numerology,
       portals_p2,prepare,select,select_into,text,union,varchar} — 15 baseline-pass
       cases diverged in ONE night, all "output mismatch; normalization rules
