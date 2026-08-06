@@ -5108,8 +5108,61 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       plan-shape ratchet is its consumer (ledger row). All four guards in
       `internal/planner/joinorder_determinism_test.go` were proven to FAIL
       against the pre-fix body before the fix landed.
-- [ ] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
+- [x] **M0125-0040 — C6: `ROLLUP` is expanded into a UNION ALL of one aggregate
       branch per grouping level, each re-running the whole join subtree**
+      **CLOSED 2026-08-06 by candidate (a) — the source is now executed ONCE.**
+      Design `docs/design/0125-0040-grouping-sets-source-sharing.md`; three
+      ledger rows dated 2026-08-06.
+      The fix reuses a mechanism goopg already had instead of adding an
+      executor node: a non-recursive CTE is buffered on its first reference and
+      REPLAYED from `ctx.CTERowCache` by every later one (`cteScanOp.Open`),
+      which is exactly "execute once, feed many". So
+      `shareGroupingSetsSource` (`internal/planner/groupingsets_share.go`,
+      called from `rewriteGroupingSets`) hoists `FROM`+`WHERE` into a synthetic
+      `__gs_src_<parse-pos>` materialized CTE projecting **exactly the
+      referenced columns, never `*`**, and points every generated branch at it.
+      **Three decisions carry the correctness, and the first was found only by
+      writing its guard:** (i) `WHERE` moves into the body UNREWRITTEN, so it
+      is walked with a verify-only resolver — a reference that resolves to no
+      `FROM` table is a correlation to an enclosing query, and a CTE body
+      cannot be correlated; the first draft checked only the target list and
+      would have shipped a 42703 regression on every correlated grouping-sets
+      subquery. (ii) The hoist renames every projected column to `__gs_cN`, so
+      a target with no `AS` clause has its original name pinned back as an
+      explicit alias (PG's `FigureColname` rule, descending CAST/COLLATE) —
+      without it the statement's own `ORDER BY` silently stops resolving.
+      (iii) `rewriteGSExpr` is an exhaustive type switch with **no
+      pass-through default**: sublinks, stars and any node type added later
+      fail closed and keep today's expansion.
+      **Measured (SF0.5 subset probe `QUERIES="18 22 27 67 77 80"`,
+      `sweep-20260806-140755.txt`, S-cold, private binary): `PASS=6
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`, Q67 82→14 s (5.9×),
+      Q18 37→8 s (4.6×), Q27 31→10 s (3.1×), Q22 21→7 s (3.0×)**, row counts
+      identical and Q77's checksum equal to the oracle. The gate's own
+      99-query plan channel reports **`same=95 changed=4 added=0 removed=0`**
+      — the four are exactly the grouping-sets queries, so nothing outside
+      this path moved. **Q77 and Q80 are the fail-closed path measured in
+      production**: they write `ROLLUP` but their grouping-sets SELECT reads
+      CTEs rather than base tables, so the guard declines them and they are
+      unchanged in plan and in time. Reopen path
+      `GOOPG_GS_SHARE_SOURCE=0`, stamped into every artefact via
+      `FlagProvenanceTable()` / `scripts/planner-flags.env`.
+      **Two things deliberately NOT done, each with a ledger row and neither a
+      forward reference in disguise:** candidate **(b)** — the faithful
+      multi-level `AGG_MIXED`/`AGG_SORTED` aggregate — is still unimplemented,
+      and it would REPLACE this rewrite (PG streams where this materializes,
+      and its `Group Key: ()` grand-total shape is still a UNION ALL branch
+      here); and **EXPLAIN still RENDERS the body N times**, because
+      `preplanWithClause` clones a CTE body per consumer, so Q67's plan prints
+      eight `CTE Scan on __gs_src_871` subtrees (36 `store_sales` mentions).
+      **The acceptance wording below — "Q67's plan shows ONE scan of
+      `store_sales`" — is therefore met in EXECUTION and not in RENDERING**,
+      and that distinction is the honest reading of this closure. The
+      execution claim is not inferred from the speedups alone: it is pinned by
+      `TestGroupingSetsShareSourceExecutesSourceOnce`, which counts `nextval()`
+      calls from inside the hoisted body (3 for a 3-row source under a
+      3-branch ROLLUP; 9 under the old expansion).
+      **Original filing follows.**
       (filed 2026-07-31 by `M0125-0037`(i); evidence
       `analysis/m0125-0026-timeout-plans/goopg-warm-m0125-0037/q18.txt` and
       `q67.txt`, which only became readable once the set-op node did). Neither
@@ -5145,6 +5198,46 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       linkage is re-measured under M0127-P1.3/P5.9 (see the -0033 skip
       note), but the ROLLUP fan-out fix itself is this item's alone.
 
+- [ ] **M0125-0048 — the faithful grouping-sets aggregate: one streaming pass,
+      one hash table per set** (filed 2026-08-06 by `M0125-0040`, which landed
+      that item's cheaper candidate (a); ledger row same date). goopg still
+      expands `ROLLUP`/`CUBE`/`GROUPING SETS` into a UNION ALL of one branch
+      per set and now MATERIALIZES the shared source; PostgreSQL computes
+      every level in ONE pass with one hash table per hashable set and needs no
+      buffer at all (`postgres/src/backend/executor/nodeAgg.c`, `AGG_MIXED` /
+      `AGG_SORTED`; planner side `preprocess_grouping_sets` and
+      `consider_groupingsets_paths` in `optimizer/plan/planner.c`). Two things
+      -0040 cannot reach follow from that: the grand-total level is a branch
+      rather than PG's `Group Key: ()` line, and the rewrite trades memory for
+      time on wide sources. **This REPLACES `shareGroupingSetsSource`, it does
+      not extend it** — do not build both. Shape: a `GroupingSetsAgg` plan node
+      carrying `Sets [][]Expr` and a grouping-set id column (which is also how
+      `GROUPING(...)` stops being a per-branch literal), plus an executor
+      operator keeping one hash table per set, fed from a single child stream.
+      Bar: as `M0125-0040` — the SF0.5 gate over at least
+      `QUERIES="18 22 27 67 77 80"` plus its 99-query plan channel, and the
+      pre-existing `grouping_sets_compat_test.go` answer pins unchanged. NOT
+      urgent: -0040 already took the runtime win these queries were losing, so
+      select this for FIDELITY, not for speed.
+- [ ] **M0125-0049 — EXPLAIN renders a shared CTE body once per reference**
+      (filed 2026-08-06 by `M0125-0040`; ledger row same date). `preplanWithClause`
+      clones a CTE body per consumer (M0016-0002's deliberate
+      correctness-first contract), so a multiply-referenced CTE prints its whole
+      subtree once per reference: TPC-DS Q67 now shows eight `CTE Scan on
+      __gs_src_871` nodes each carrying a full copy of the four-table join, 36
+      `store_sales` mentions, for a query that executes that join ONCE. The
+      plan therefore over-states the work by the reference count, which is the
+      exact misreading `M0125-0026`'s capture was built to avoid — and it is
+      why -0040's acceptance wording ("Q67's plan shows ONE scan of
+      `store_sales`") reads as unmet even though the runtime claim holds. PG
+      prints a CTE body once, above the plan that references it
+      (`postgres/src/backend/commands/explain.c`, `ExplainPrintPlan`'s CTE
+      section). Fix in `internal/executor/operators_explain.go`: render the
+      first reference's body under a `CTE <name>` heading and print later
+      references as bare `CTE Scan` lines. Predates -0040 — it affects every
+      multiply-referenced user CTE too, not just the synthetic one. Bar: the
+      SF0.5 gate's plan channel WILL move on every such query, so re-pin the
+      plan snapshot in the same commit and say which queries moved and why.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor

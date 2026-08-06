@@ -86,6 +86,7 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
 	"GOOPG_MHJ_PACKING_OFF":   func(v string) string { return onOff(mhjPackingOffFromEnv(v)) },
+	"GOOPG_GS_SHARE_SOURCE":   func(v string) string { return onOff(parseGSShareSource(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -113,6 +114,10 @@ var flagProvenanceOrder = []string{
 	"GOOPG_NLI_COSTGATE",
 	"GOOPG_HASH_OUTER_JOIN",
 	"GOOPG_MHJ_PACKING_OFF",
+	// Joined at M0125-0040: grouping-sets source sharing changes the plan of
+	// every ROLLUP/CUBE/GROUPING SETS query, so a TPC-DS artefact that does
+	// not name it cannot say which arm it measured.
+	"GOOPG_GS_SHARE_SOURCE",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

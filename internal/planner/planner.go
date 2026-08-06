@@ -3510,11 +3510,21 @@ func rewriteGroupingSets(s *parser.SelectStmt, cat catalog.Catalog) error {
 		return nil
 	}
 	s.GroupingSets = nil // consumed once; guards recursive planSelect re-entry
-	sets := spec.Sets
-	if len(sets) == 0 {
+	if len(spec.Sets) == 0 {
 		s.GroupBy = nil
 		return nil
 	}
+
+	// M0125-0040: hoist FROM+WHERE into a synthetic materialized CTE so the
+	// branches generated below share ONE execution of the source instead of
+	// re-scanning it once per grouping set. Fails closed — when it declines,
+	// s is untouched and the expansion below is byte-for-byte what it always
+	// was. It must run BEFORE `universe`/`sets` are read, because it rewrites
+	// both the target list and spec.Sets to the CTE's columns and the two key
+	// sets have to be derived from the same (rewritten) expressions.
+	// See groupingsets_share.go.
+	shareGroupingSetsSource(s, spec, cat)
+	sets := spec.Sets
 
 	universe := map[string]bool{}
 	for _, set := range sets {
