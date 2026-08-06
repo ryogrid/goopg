@@ -5302,6 +5302,55 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `internal/executor`, the existing CTE compat pins unchanged, and the
       SF0.5 gate — TPC-DS has no same-name-different-scope CTE, so the plan
       channel must report `same=99` unless the id changes a section heading.
+- [x] **M0125-0051 — goopg executed a data-modifying CTE at any nesting depth**
+      **DONE 2026-08-06** — `analyzeWith` now raises PG's `0A000`
+      "WITH clause containing a data-modifying statement must be at the top
+      level" unless the WITH belongs to the statement being run. Filed
+      2026-08-06 by `M0125-0050`'s `MaterializedCTEs` sibling audit (ledger row
+      same date), which recorded the SQLSTATE as 42P19 — **wrong**: PG uses
+      `ERRCODE_FEATURE_NOT_SUPPORTED` (`0A000`) at
+      `postgres/src/backend/parser/parse_cte.c:330-337`, verified against a live
+      18.3; 42P19 is the neighbouring recursive-CTE rule goopg already raises.
+      PG's test is `pstate->parentParseState != NULL` — a property of the parse
+      LEVEL — so the fix is a `stmtRoot` flag set only by the four statement
+      entry points when `outerScope == nil` and threaded into `analyzeWith`;
+      `analyzeSelectWithParent` becomes the constant-`false` wrapper, since all
+      15 of its call sites analyze a nested query. Two edges (both captured from
+      18.3 before being encoded) decide where the flag survives: a parenthesised
+      whole statement IS top level, a parenthesised set-op ARM is not, and goopg
+      reaches both through the same `SetOpOperand` hop — hence
+      `stmtRoot && s.SetOpOperand == nil` on the set-op recursion. This also
+      closes -0050's `MaterializedCTEs` name-key finding **by construction**
+      (two same-named DML CTEs now require a nested WITH), so that row stays
+      open only as a sibling-divergence debt, not a reachable bug. Design doc
+      `docs/design/0125-0051-data-modifying-cte-top-level-only.md`; test
+      `internal/analyzer/dml_cte_toplevel_test.go` (6 rejected shapes with code
+      + message, 8 accepted). Four further PG divergences filed to the ledger:
+      a sublink `WITH` does not parse (42601 where PG gives 0A000);
+      `WITH x AS (INSERT …) DELETE …` lets the outer DML see the CTE's rows
+      (PG returns 0 rows and keeps the row, goopg deletes it — a wrong-answer
+      bug, the biggest of the four); PL/pgSQL accepts no `WITH` statement at
+      all; `WITH … (SELECT …)` is a goopg syntax error.
+- [ ] **M0125-0052 — an outer DML sees the rows its own data-modifying CTE
+      wrote** (filed 2026-08-06 by `M0125-0051`, which A/B'd the top-level DML-CTE
+      forms against PG 18.3 while proving the accepted half still runs; ledger row
+      same date). `WITH x AS (INSERT INTO dm15 VALUES (15) RETURNING a)
+      DELETE FROM dm15 WHERE a = 15 RETURNING a` returns **1 row and empties the
+      table** on goopg; PG 18.3 returns **0 rows and the row survives**, because
+      every sub-statement of a data-modifying WITH runs on the same statement
+      snapshot and cannot see its siblings' writes (`postgres/src/backend/
+      executor/nodeModifyTable.c` + the `es_snapshot`/`es_crosscheck_snapshot`
+      pair; the user-visible rule is in the WITH documentation, "the
+      sub-statements … can't see one another's effects on the target tables").
+      goopg HAS the mechanism — `cteDMLPrefixOp.Open` saves the snapshot and
+      builds `ctx.CTEWriteFence` — but applies it only when the outer query is a
+      SELECT; an outer INSERT/UPDATE/DELETE runs after the restore without the
+      fence. Fix in `internal/executor/operators_cte_dml.go`: carry the fence
+      into the outer DML's scan/qual path the same way the SELECT path does, and
+      check the sibling case too (two DML CTEs writing the same table). Bar: the
+      A/B script above (goopg must return 0 rows and keep the row) plus the
+      existing DML-CTE compat pins; no plan-shape change, so the SF0.5 plan
+      channel must report `same=99`.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor
