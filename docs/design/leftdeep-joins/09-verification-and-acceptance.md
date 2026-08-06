@@ -3588,3 +3588,67 @@ measurement: implement PG's `TM_SelfModified` error for DML-CTE self-modified
 tuples, then re-run `make nightly-batch` — this loop's evidence that the batch
 can be run on demand is itself the mechanism that keeps the gate from stalling
 another five loops.
+
+### 3.26 The blocker was misnamed by its own bisect: the missing piece was the COMMAND COUNTER, not the error (S7-gate loop #7, 2026-08-06)
+
+§3.25 named the S7 blocker as "goopg does not implement PG's `TM_SelfModified`
+error". That was the visible half. Shrinking the isolation permutation until the
+**second session disappeared** found the other half, and it is a plain wrong
+answer with no concurrency, no isolation harness, and one connection:
+
+```sql
+WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking'
+              RETURNING *, update_checking(999))
+UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *;
+```
+
+leaves `checking` at **1701** on live PG 18.3 and **1700** on goopg. The
+`RETURNING` output agreed — which is why five loops of evidence agreed — but
+goopg's `update_checking()` **did nothing at all**: its `UPDATE` found no
+`checking` row it was allowed to see and reported 0 rows, silently, because a
+0-row `UPDATE` is not an error.
+
+**Why.** goopg's data-modifying-WITH write fence stands in for PG's per-tuple
+`cmin`, and it was command-blind: once registered, a tuple stayed hidden for the
+whole statement. PG hides it only while `cmin >= curcid`
+(`heapam_visibility.c` `HeapTupleSatisfiesMVCC`), and `curcid` is **not** frozen
+at `es_output_cid` — `functions.c postquel_getnext` runs
+`CommandCounterIncrement()` before every statement of a routine that is not
+`readonly_func` (= `provolatile != PROVOLATILE_VOLATILE`), "so that all work to
+date in this transaction is visible". A volatile function called from a
+statement therefore sees that statement's writes; goopg's fence hid them.
+
+**And that is what made the error unreachable.** The `TM_SelfModified` arm PG
+takes is the one at `ExecUpdate:2656` — *inside* the `TM_Updated`/EvalPlanQual
+path, after `table_tuple_lock`, not the pre-EPQ arm. The chain-follow applies no
+cmin test (`heapam_tuple_lock` with `TUPLE_LOCK_FLAG_FIND_LAST_VERSION` just
+walks `t_ctid`), so it leads the outer DML straight into a version this
+statement's own sub-command produced. With the function's write missing, that
+version did not exist and no error could be raised. Restoring the write makes
+the error site reachable, and the discriminator is upstream's:
+`tmfd.cmax != es_output_cid` — killed by a LATER command ⇒ error; killed by the
+SAME command ⇒ the silent skip that the passing `updwcte` permutation asserts.
+
+**Landed** (M0125-0055, design
+`docs/design/0125-0055-routine-command-counter-and-self-modified.md`):
+`Context.CmdID` as the `CommandCounterIncrement` analogue, the two fence maps
+re-valued by the writing/killing command id so `cteFenced`/`cteRevealed` *are*
+the `cmin`/`cmax` arms, and the error raised at the two EPQ chain-follow sites —
+with its SQLSTATE corrected from `09000` (`ERRCODE_TRIGGERED_ACTION_EXCEPTION`)
+to **`27000`** (`ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION`), which nothing had
+contradicted because the path had never been reached end-to-end.
+
+**Gate status.** `TestPort_IsolationEvalPlanQual` **PASSES** (22 s). All four
+forms of the query — `updwctefail`/`delwctefail` × with/without the concurrent
+session — are byte-identical to live PG 18.3 in returned rows AND final heap.
+**S7's engine side is clear.** The remaining 9 items of run `20260806-191958`
+are the single `regress/suite-wedge` phenomenon (§3.25), which produces no
+engine-side item. Next S7 attempt: re-run `make nightly-batch` and read the
+stage table.
+
+**Method note worth keeping.** Two loops' worth of bisect pointed at
+`276e7eda` and concluded "M0125-0052 unmasked a missing error arm". The bisect
+was right about the commit and wrong about the mechanism, because a bisect
+localises a *change*, not a *cause*. What separated them was shrinking the
+failing case until the concurrency was gone — at which point the remaining
+divergence was a single number in the heap that no permutation output showed.

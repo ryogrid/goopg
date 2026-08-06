@@ -59,18 +59,25 @@ var (
 	waitForGraph = make(map[storage.TransactionID]storage.TransactionID)
 )
 
-// Self-modification error sentinels (ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION = 09000).
-// Raised when a sub-command triggered by the current command already modified the tuple.
-var (
-	errTupleAlreadyModifiedByUpdate = &ExecError{
-		Code:    "09000",
-		Message: "tuple to be updated was already modified by an operation triggered by the current command",
+// errTupleAlreadyModified builds PostgreSQL's TM_SelfModified error for a DML
+// statement that reached — via an EvalPlanQual chain-follow — a row version a
+// LATER command of its own execution wrote. Upstream raises it from
+// nodeModifyTable.c `ExecUpdate` (line 2656 in PG 18.3) and `ExecDelete` with
+// ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION, whose SQLSTATE is 27000 (09000 is
+// ERRCODE_TRIGGERED_ACTION_EXCEPTION — a different class; goopg used it until
+// this was first exercised end-to-end). Message and hint are verbatim upstream.
+//
+// A constructor rather than a package-level sentinel because the Pos varies per
+// call site and *ExecError is mutable: stamping Pos on a shared value would be
+// a data race between concurrent backends.
+func errTupleAlreadyModified(verb string, pos int) *ExecError {
+	return &ExecError{
+		Code:    "27000",
+		Pos:     pos,
+		Message: "tuple to be " + verb + " was already modified by an operation triggered by the current command",
+		Hint:    "Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.",
 	}
-	errTupleAlreadyModifiedByDelete = &ExecError{
-		Code:    "09000",
-		Message: "tuple to be deleted was already modified by an operation triggered by the current command",
-	}
-)
+}
 
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
@@ -4480,13 +4487,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
 		return nil, err
 	}
-	// Self-modification error setup: if a sub-command during the CTE phase
-	// already modified a row we are about to update, scanMatching will raise
-	// errTupleAlreadyModifiedByUpdate when it encounters the original tuple.
-	if o.ctx.CTESelfModifiedErrors != nil {
-		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByUpdate
-		defer func() { o.ctx.CTESelfModErr = nil }()
-	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -5364,12 +5364,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		o.retIdx++
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
-	// If a CTE sub-command already modified a row we are about to delete,
-	// scanMatching must surface the 09000 error (TM_SelfModified equivalent).
-	if o.ctx.CTESelfModifiedErrors != nil {
-		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByDelete
-		defer func() { o.ctx.CTESelfModErr = nil }()
-	}
 	// DELETE … USING: nested-loop cross-product path. M0097-0076.
 	if len(o.plan.UsingScans) > 0 {
 		return o.deleteWithUsing()
@@ -5689,6 +5683,15 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				if !chainFound {
 					epqSkipDel = true
 					break
+				}
+				// Sibling of the updateWithFrom EPQ site: the chain can lead
+				// straight into a version a LATER command of this same statement
+				// wrote — a VOLATILE routine invoked from a data-modifying WITH.
+				// PG refuses to merge that with the original delete and errors
+				// (nodeModifyTable.c ExecDelete's TM_SelfModified arm with
+				// tmfd.cmax != es_output_cid).
+				if cteWrittenByLaterCommand(o.ctx, victimRel, newBlk, newSlot) {
+					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
 				}
 				v.blk = newBlk
 				v.slot = newSlot
@@ -6126,11 +6129,18 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					}
 					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
 				}
-				// CTE isolation: if the EPQ chain led to a CTE-written tuple, the CTE
-				// already owns this row. Skip to preserve savedSnap isolation semantics.
-				// M0100-0010; M0125-0052 made the fence key relation-qualified, so the
-				// xmin re-read that used to disambiguate another table's coincident
-				// {block,slot} is no longer needed.
+				// CTE isolation: if the EPQ chain led to a tuple this statement
+				// wrote, this statement already owns this row. Skip to preserve
+				// savedSnap isolation semantics — PG's "already updated by self;
+				// nothing to do". M0100-0010; M0125-0052 made the fence key
+				// relation-qualified, so the xmin re-read that used to disambiguate
+				// another table's coincident {block,slot} is no longer needed.
+				//
+				// Unless a LATER command wrote it, in which case PG refuses to
+				// merge and errors instead (nodeModifyTable.c ExecUpdate:2656).
+				if cteWrittenByLaterCommand(o.ctx, puSrcRel, epqBlk, newSlot) {
+					return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+				}
 				if cteFenced(o.ctx, puSrcRel, epqBlk, newSlot) {
 					continue
 				}
@@ -6436,7 +6446,23 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			continue // skip concurrent-update EPQ for USING case
+			// deleteWithUsing still has no EvalPlanQual (deferral ledger
+			// 2026-08-06, DELETE…USING EPQ) — it skips the row rather than
+			// re-fetching the live version. One case must not be skipped
+			// silently, though: when the update chain leads into a version a
+			// LATER command of THIS statement wrote, PG has already raised
+			// TM_SelfModified before any EPQ re-evaluation could matter
+			// (nodeModifyTable.c ExecDelete, `tmfd.cmax != es_output_cid`).
+			// Follow the chain far enough to see that, and only that — the
+			// guard keeps every statement without a data-modifying WITH in
+			// flight on exactly the old path.
+			if len(o.ctx.CTEWriteFence) > 0 {
+				if cBlk, cSlot, _, cFound := epqFollowChain(o.ctx, vRel, v.blk, v.slot, tbl.Columns, nil, nil); cFound &&
+					cteWrittenByLaterCommand(o.ctx, vRel, cBlk, cSlot) {
+					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+				}
+			}
+			continue
 		}
 		oldTupleBytes, _ := oldTup.MarshalBinary()
 		// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
@@ -6530,17 +6556,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				return err
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
-				// CTESelfModifiedErrors: if a sub-command during the CTE phase
-				// modified this invisible (own-xmax) tuple, the outer
-				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
-				if ctx.CTESelfModErr != nil && ctx.CTESelfModifiedErrors != nil {
-					ptr := CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}
-					if _, inErr := ctx.CTESelfModifiedErrors[ptr]; inErr {
-						s.RUnlock()
-						ctx.Pool.Unpin(s)
-						return ctx.CTESelfModErr
-					}
-				}
+				// A tuple this statement's own command already killed is simply
+				// not found by the DML scan. PG reaches it and takes ExecUpdate /
+				// ExecDelete's TM_SelfModified arm with cmax == es_output_cid,
+				// which returns NULL without touching the row — same row count,
+				// same heap state (M0125-0053). The LATER-command case that PG
+				// errors on cannot arrive here: such a version was written by
+				// this statement, so its own cmin hides it from this scan. It is
+				// reached only by an EvalPlanQual chain-follow, which is where
+				// cteWrittenByLaterCommand is consulted.
 				continue
 			}
 			// Skip rows written by DML CTEs — an outer INSERT/UPDATE/DELETE must

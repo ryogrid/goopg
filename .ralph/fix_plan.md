@@ -1277,9 +1277,32 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       identically on both sides. 2 ledger rows. **`portals_p2` still does not
       reproduce and the other 12 of the 15 are untouched, so this item stays
       open.**
-- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED 2026-08-06 with a
-      DIFFERENT signature: goopg has no `TM_SelfModified` error, and
-      M0125-0052 unmasked it** (AI-20260806-191958-001, run `20260806-191958`;
+- [x] **testport/TestPort_IsolationEvalPlanQual — RESOLVED 2026-08-06 (M0125-0055).
+      The missing piece was not the error but the COMMAND COUNTER: goopg's
+      data-modifying-WITH fence was command-blind, so the volatile function's
+      `UPDATE` never ran at all** — reproduced in ONE session with no isolation
+      harness (`checking` ends 1701 on live PG 18.3, 1700 on goopg: a silent
+      0-row no-op). Fix: `Context.CmdID` + `routineCommandCounterIncrement`
+      (PG's `functions.c postquel_getnext` `if (!readonly_func)
+      CommandCounterIncrement()`, gated on `provolatile != 'v'` exactly as
+      `init_sql_fcache` sets `readonly_func`); the fence/reveal maps now carry
+      the writing/killing command id, making `cteFenced`/`cteRevealed` PG's
+      `cmin >= curcid` / `cmax >= curcid` arms verbatim. With the write
+      restored, the EPQ chain-follow reaches a version this statement's own
+      sub-command produced and raises PG's error at `updateWithFrom` /
+      `deleteWithUsing` — SQLSTATE corrected `09000` → **`27000`**
+      (`ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION`; `09000` is
+      `ERRCODE_TRIGGERED_ACTION_EXCEPTION`, a different class — the path had
+      never been reached end-to-end). `CTENewToOld`/`CTESelfModifiedErrors`/
+      `CTESelfModErr` deleted: unreachable, and beside the counter fix they
+      would have fired on the non-concurrent query where PG succeeds. Bar:
+      byte-identical to live PG 18.3 on all four forms
+      (`updwctefail`/`delwctefail` × with/without the concurrent session), rows
+      AND final heap. Design
+      `docs/design/0125-0055-routine-command-counter-and-self-modified.md`;
+      2 ledger rows (`deleteWithUsing` still has no EPQ; the counter is
+      per-routine-body, not per-statement). **The M0127 S7 gate's sole
+      engine-side blocker is now clear.** Original filing: (AI-20260806-191958-001, run `20260806-191958`;
       repro `go test -v -run '^TestPort_IsolationEvalPlanQual$'
       ./internal/testport/` — deterministic, 22 s standalone; evidence
       `ci/logs/20260806-191958/testport/go-test.log` L11302). This is NOT the
@@ -10029,8 +10052,23 @@ was starved, not bypassed"), `6cd5872c` FAIL, `78bd04a4` FAIL. M0125-0052 made
 an outer DML see its own CTE's writes — correct for its target case, and exactly
 what removes the condition PG reports as `TM_SelfModified`. goopg has never
 implemented that error, so this is a **latent gap unmasked by a correct fix**.
-Next S7 attempt: implement the `TM_SelfModified` error (ledger row 2026-08-06),
-then re-run `make nightly-batch` — the gate no longer has to wait for 01:00.
+**RESOLVED 2026-08-06 by M0125-0055** — `TestPort_IsolationEvalPlanQual` now
+PASSES (22 s). The blocker was misnamed by its own bisect: the missing piece was
+not the error arm but the COMMAND COUNTER underneath it. goopg's
+data-modifying-WITH fence was command-blind, so the `updwctefail` step's volatile
+`update_checking()` never ran at all — a silent 0-row `UPDATE`, reproducible in
+ONE session with no isolation harness (`checking` ends **1701** on live PG 18.3,
+**1700** on goopg). PG advances the command counter before every statement of a
+non-`readonly_func` routine (`functions.c postquel_getnext`), which is exactly
+what makes the calling statement's writes visible to it. With
+`Context.CmdID` restored, the EPQ chain-follow reaches a version this statement's
+own sub-command produced and raises PG's error (SQLSTATE corrected `09000` →
+`27000`). All four forms — `updwctefail`/`delwctefail` × with/without the
+concurrent session — are byte-identical to live PG 18.3 in rows AND final heap.
+Design `docs/design/0125-0055-routine-command-counter-and-self-modified.md`;
+2 ledger rows. **S7's engine side is clear; the remaining 9 items are the one
+`regress/suite-wedge` phenomenon.** Next S7 attempt: re-run
+`make nightly-batch` — the gate no longer has to wait for 01:00.
 Design 09 §3.25.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)

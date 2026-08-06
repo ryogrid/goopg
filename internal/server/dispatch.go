@@ -914,10 +914,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// produce different rows). CTEWriteFence is cleared for the same reason.
 		ectx.CTEWriteFence = nil
 		ectx.CTEXmaxReveal = nil
-		ectx.CTENewToOld = nil
-		ectx.CTESelfModifiedErrors = nil
-		ectx.CTESelfModErr = nil
 		ectx.InDMLCTE = false
+		// Each statement starts at its own es_output_cid; the counter only
+		// advances into nested VOLATILE routine bodies, on their own child
+		// Context. Reset so a routine that raised mid-body cannot leave the
+		// next statement believing it runs at a later command id.
+		ectx.CmdID = 0
 		ectx.CTERowCache = nil
 		ectx.DeadlockVictim = false
 

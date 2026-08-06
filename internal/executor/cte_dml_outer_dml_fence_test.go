@@ -37,10 +37,8 @@ func runDMLRows(t *testing.T, ctx *Context, sql string) []Row {
 	t.Helper()
 	ctx.CTEWriteFence = nil
 	ctx.CTEXmaxReveal = nil
-	ctx.CTENewToOld = nil
-	ctx.CTESelfModifiedErrors = nil
-	ctx.CTESelfModErr = nil
 	ctx.InDMLCTE = false
+	ctx.CmdID = 0
 	ctx.CTERowCache = nil
 	ctx.MaterializedCTEs = nil
 
