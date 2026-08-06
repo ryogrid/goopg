@@ -159,33 +159,10 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, key
 // operator constructor: two of them drift, and the drift is invisible until a
 // plan is costed by one and built by the other.
 
-// generateMultiHashJoinPath adds a MultiHashJoin path to joinRel over one driving
-// (probe) rel and several dimension (build) rels, under the ch. 06 §4.1
-// comparability invariant. Competes in add_path against the equivalent hash
-// cascade; the DP keeps whichever is cheaper. setCheapest must have run on every
-// child rel.
-func generateMultiHashJoinPath(joinRel, probe *RelOptInfo, dims []*RelOptInfo, cp costParams) {
-	p := probe.CheapestTotal
-	if p == nil {
-		return
-	}
-	dimCosts := make([]Cost, 0, len(dims))
-	dimRows := make([]float64, 0, len(dims))
-	children := make([]*Path, 0, len(dims)+1)
-	children = append(children, p)
-	for _, d := range dims {
-		if d.CheapestTotal == nil {
-			return
-		}
-		dimCosts = append(dimCosts, d.CheapestTotal.Cost)
-		dimRows = append(dimRows, d.Rows)
-		children = append(children, d.CheapestTotal)
-	}
-	addPath(joinRel, &Path{
-		Kind:     PathMultiHash,
-		Rel:      joinRel,
-		Rows:     joinRel.Rows,
-		Cost:     multiHashJoinCost(cp, p.Cost, probe.Rows, dimCosts, dimRows, joinRel.Rows),
-		Children: children,
-	})
-}
+// `generateMultiHashJoinPath` was here until M0127-P6.2. It added a
+// PathMultiHash over one driving (probe) rel and several dimension (build)
+// rels, to compete in add_path against the equivalent hash cascade. It never
+// acquired a production caller — nothing in the PG-shaped search ever
+// enumerated the N-way shape — so the DP only ever saw the cascade, which is
+// the shape PG has. 0126-0011 §3 asked how this constructor should be
+// disposed of; the answer is: deleted.

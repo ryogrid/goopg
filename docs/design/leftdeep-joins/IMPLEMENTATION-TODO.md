@@ -1847,11 +1847,51 @@
 
 ## P6 — Deletion [S7, after S5-ON survives a clean nightly cycle]
 
-- [ ] **P6.1** Delete fusion (`fused_hash_join.go`, hook, env vars, orphan
-  exports check).
-- [ ] **P6.2** Delete MultiHashJoin (fresh grep inventory; expect ~28 arms /
-  15 files: node, packer, `mhj_input_rewrite.go`, posmaps, cost/cardinality
-  arms, executor op, EXPLAIN arms, `generateMultiHashJoinPath`, flags).
+- [x] **P6.1** Delete fusion (`fused_hash_join.go`, hook, env vars, orphan
+  exports check). **DONE 2026-08-07.** Both files gone (`fused_hash_join.go`
+  + its test), both hook sites (`executor.go` `Build`'s `*planner.Join` arm
+  and `buildRec`'s), `GOOPG_RUNTIME_JOIN_FUSION{,_MIN_LEVELS}`,
+  `planner.IsCanonicalKeyEquality` (the unexported `isCanonicalKeyEquality`
+  stays — `join_hash_keys.go` still documents it). `buildEnv` went too: every
+  field on it (`root`/`inWorker`/`fusionCfg`/`q0`) was fusion-only, so
+  `buildWithEnv` is now `buildNode` and `BuildWorker` builds byte-for-byte
+  what `Build` builds; `opTreeSlab.env` (documented nil since M0127-P1.2)
+  is deleted as its own comment said it would be. Gate: grep-clean + UNITS +
+  SPOT (Q12=2/Q13=35).
+- [x] **P6.2** Delete MultiHashJoin. **DONE 2026-08-07.** Fresh inventory came
+  in at 42 non-test files (the 2026-08-02 estimate of ~34 arms / 18 files was
+  low, as 08 §4 warned). Deleted whole: `internal/executor/multi_hash_join.go`
+  (696 lines) + its test, `mhj_virtual`/`mhj_filter_coordinate`/
+  `mhj_inlist_filter`/`parallel_mhj` tests in both packages,
+  `mhj_posmap_filtered_leaf_test.go`, `mhj_residual_qual_pushdown_test.go`.
+  Node `MultiHashJoin`/`MultiHashKey` (plan.go), `PathMultiHash` (path.go),
+  packer `rewriteMultiWayChain`/`collectMultiHashTables` + its
+  `isCanonicalKeyEquality`/`extraInScans`/`findScanByColName` helpers, the
+  whole posmap family (`buildMHJPosMap`, `mhjPosMapOf` — already a permanent
+  `return nil` — and the dead `binaryTreePosMapOf`), `estimateMultiHashJoin`,
+  `multiHashJoinCost`, `generateMultiHashJoinPath` (never had a production
+  caller — that settles 0126-0011 §3: deleted), `pushResidualQualsIntoMHJTables`
+  /`mhjResidualConjunctTable`, `multiHashJoinIsPartialCapable`, both EXPLAIN
+  arms, and flags `mhjPackingEnabled`/`SetMHJPackingEnabled`/
+  `GOOPG_MHJ_PACKING_OFF` (now a `flagProvenanceRetired` row, so older
+  artefacts carrying the label still read correctly).
+
+  **`mhj_input_rewrite.go` was NOT purely MHJ** and could not be deleted whole:
+  its first half is the generic single-table-predicate → IndexScan promotion
+  (`rewriteScanInputsWithSingleTablePredicates`), which planSelect still calls.
+  The file is renamed `scan_input_rewrite.go` with the MHJ half removed.
+  Similarly `shouldAttachBeforeMHJ` → `shouldAttachLocalFiltersBeforeSearch`:
+  live gate, MHJ-derived name.
+
+  Gate: grep-clean (only historical prose survives) + `go build`/`go vet` clean
+  + **UNITS PASS** + **SPOT PASS** (Q12=2 / Q13=35, 28.3 s query phase, peak
+  10,658 MB) + **DS05 PASS** (95 PASS / 0 MISMATCH / 0 CKMISMATCH / 0 ERROR /
+  0 TIMEOUT / 4 SKIP, and **plan shapes 99/99 identical, 0 changed** — the
+  deletion is behaviour-preserving by construction, as the default-off flag
+  predicted).
+
+  **The row-lock closure this task was named for did NOT happen** — see the
+  ledger row: the `eval-plan-qual` repro is byte-identical before and after.
 - [ ] **P6.3** Delete the old subset-bitmask DP + the per-subset
   layout/remap family (`dpEntry.layout`, `remapKeyToLayout`,
   `mergeSubsetLayouts`) + integer cost + `IsSmallDimensionSide` pinning +

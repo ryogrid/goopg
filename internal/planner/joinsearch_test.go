@@ -229,7 +229,7 @@ func TestBuildInitialRelsAdmitsNonTableLeaves(t *testing.T) {
 	// Precondition: this FROM list is exactly what today's whitelist rejects.
 	for i, n := range scans {
 		switch n.(type) {
-		case *SeqScan, *IndexScan, *MultiHashJoin:
+		case *SeqScan, *IndexScan:
 			if i != 0 {
 				t.Fatalf("leaf %d was expected to fall outside tryBushyDP's whitelist", i)
 			}

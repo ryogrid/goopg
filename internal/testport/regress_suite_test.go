@@ -49,6 +49,13 @@ func TestPort_RegressSuite(t *testing.T) {
 		t.Skip("psql not in PATH or postgres/local_install/bin")
 	}
 
+	// Give this cluster its own pprof endpoint so the wedge probe can pull a
+	// goroutine dump. The server's built-in default is a fixed 127.0.0.1:6060,
+	// which a bench cluster or a peer test may already hold — the bind then
+	// fails at Debug level and the endpoint silently does not exist.
+	pprofAddr := reserveLoopbackPort(t)
+	t.Setenv("GOOPG_PPROF_ADDR", pprofAddr)
+
 	c := newCluster(t, "regress_suite")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
@@ -67,10 +74,11 @@ func TestPort_RegressSuite(t *testing.T) {
 	}
 
 	exec := &ClusterRegressExecutor{
-		Cluster:  c,
-		PsqlBin:  psqlBin,
-		LibDir:   filepath.Join(root, "postgres", "local_install", "lib"),
-		RepoRoot: root,
+		Cluster:   c,
+		PsqlBin:   psqlBin,
+		LibDir:    filepath.Join(root, "postgres", "local_install", "lib"),
+		RepoRoot:  root,
+		PprofAddr: pprofAddr,
 	}
 
 	// clusterPoisoned is set when a case's psql was killed by the per-case
@@ -111,7 +119,7 @@ func TestPort_RegressSuite(t *testing.T) {
 					t.Skipf("deferred: cluster restart failed: %v", err)
 					return
 				}
-				runRegressSetup(t, root, psqlBin, c)
+				restoreRegressFixtures(t, root, psqlBin, c, exec)
 				t.Log("cluster recovered")
 			}
 
@@ -124,7 +132,12 @@ func TestPort_RegressSuite(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), regressCaseTimeout)
 			defer cancel()
 
+			// Capture live cluster state if this case wedges. Nothing else in
+			// the pipeline looks at the server while it is stuck, so without
+			// this a wedge reaches the nightly as one unactionable line.
+			stopProbe := exec.armWedgeProbe(t, rc.Name)
 			results, err := framework.RunRegressSubset(ctx, root, []framework.RegressCase{rc}, exec)
+			stopProbe()
 			if err != nil {
 				t.Logf("run error: %v", err)
 				t.Skip("deferred: execution error")
@@ -149,6 +162,48 @@ func TestPort_RegressSuite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// restoreRegressFixtures brings the shared test_setup.sql fixture tables back
+// after a wedge/crash restart — and, crucially, does NOT re-run test_setup.sql
+// when they are already there.
+//
+// A restart preserves the data directory, so the fixtures always survive it
+// (WAL recovery restores every committed row). Re-running test_setup.sql on top
+// of them is not idempotent and not a no-op: psql runs without ON_ERROR_STOP,
+// so each `CREATE TABLE` fails with "relation already exists" while the
+// `INSERT`/`COPY` that follows it succeeds — every fixture table DOUBLES
+// (measured: int4_tbl 5→10, text_tbl 2→4, varchar_tbl 4→8, onek 1000→2000,
+// tenk1 10000→20000).
+//
+// That is the mechanism behind the nightly "suite-wedge casualties": one case
+// hitting the 120 s per-case deadline poisons the cluster, recovery doubles the
+// shared fixtures, and every later case that reads them (numerology, select,
+// select_into, text, truncate, union, varchar, portals_p2 in run
+// 20260806-191958) reports a genuine — but harness-manufactured — output
+// mismatch. Those are joined against `regress-diff-baseline.csv` and filed as
+// regressions, so one wedged case turned a readable nightly into nine action
+// items and kept the M0127 S7 gate ("a clean nightly cycle") unmeetable.
+//
+// The setup is still run when the fixtures are genuinely absent, so a restart
+// onto an empty database still bootstraps.
+func restoreRegressFixtures(t *testing.T, root string, psqlBin string, c *cluster.Cluster, exec *ClusterRegressExecutor) {
+	t.Helper()
+	if exec.fixturesPresent() {
+		t.Log("shared fixtures survived the restart; NOT re-running test_setup.sql (it would double every fixture table)")
+		return
+	}
+	runRegressSetup(t, root, psqlBin, c)
+}
+
+// fixturesPresent reports whether the shared test_setup.sql fixture tables are
+// still resolvable. `onek` stands in for the whole set: it is created by
+// test_setup.sql alone and no regress case drops it.
+func (e *ClusterRegressExecutor) fixturesPresent() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := e.Cluster.Query(ctx, "SELECT 1 FROM onek LIMIT 1")
+	return err == nil
 }
 
 // regressPreSetup maps test names to SQL files that must be executed against
@@ -277,6 +332,13 @@ type ClusterRegressExecutor struct {
 	PsqlBin  string // full path to psql binary (e.g. postgres/local_install/bin/psql)
 	LibDir   string // postgres/local_install/lib — needed for libpq symbol resolution
 	RepoRoot string
+	// PprofAddr is the cluster server's pprof listen address; the wedge probe
+	// pulls its goroutine dump from it. Empty disables that section.
+	PprofAddr string
+	// wedgeDir is the current case's diagnostic bundle directory, set by
+	// armWedgeProbe. ExecuteSQL drops the killed client's partial output there
+	// — otherwise the only record of WHICH statement wedged dies with psql.
+	wedgeDir string
 }
 
 // psqlArgs builds the connection-arg slice for psql (host, port, user, database).
@@ -385,6 +447,15 @@ func (e *ClusterRegressExecutor) ExecuteSQL(ctx context.Context, sql string) (st
 		Timeout: timeout,
 	})
 	if result.TimedOut {
+		// framework.RegressResult carries only a rationale string, so this is
+		// the last point at which the partial output still exists. Its tail
+		// names the statement the server never answered — the single most
+		// useful datum about a wedge, and one every nightly so far discarded.
+		if e.wedgeDir != "" {
+			if err := os.MkdirAll(e.wedgeDir, 0o755); err == nil {
+				writeWedgeArtifact(e.wedgeDir, "psql-partial.out", result.Stdout+result.Stderr)
+			}
+		}
 		return result.Stdout + result.Stderr,
 			fmt.Errorf("%w: psql killed after %s (cluster wedged or overloaded; output is truncated, not a diff)",
 				framework.ErrExecTimeout, timeout)

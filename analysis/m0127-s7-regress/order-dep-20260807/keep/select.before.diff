@@ -1,0 +1,62 @@
+--- select_expected.txt	2026-08-07 00:41:19.047524735 +0900
++++ select_actual.txt	2026-08-07 00:41:19.047524735 +0900
+@@ -749,16 +749,14 @@
+ select * from onek2 where unique2 = 11 and stringu1 < 'B';
+  unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4
+ ---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+-     494 |      11 |   0 |    2 |   4 |     14 |       4 |       94 |          94 |       494 |      494 |   8 |    9 | ATAAAA   | LAAAAA   | VVVVxx
+-(1 row)
++(0 rows)
+ 
+ explain (costs off)
+ select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+ select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+  unique2
+ ---------
+-      11
+-(1 row)
++(0 rows)
+ 
+ -- but if it's an update target, must retest anyway
+ explain (costs off)
+@@ -766,8 +764,7 @@
+ select unique2 from onek2 where unique2 = 11 and stringu1 < 'B' for update;
+  unique2
+ ---------
+-      11
+-(1 row)
++(0 rows)
+ 
+ -- partial index is not applicable
+ explain (costs off)
+@@ -775,8 +772,7 @@
+ select unique2 from onek2 where unique2 = 11 and stringu1 < 'C';
+  unique2
+ ---------
+-      11
+-(1 row)
++(0 rows)
+ 
+ -- partial index implies clause, but bitmap scan must recheck predicate anyway
+ SET enable_indexscan TO off;
+@@ -785,8 +781,7 @@
+ select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+  unique2
+ ---------
+-      11
+-(1 row)
++(0 rows)
+ 
+ RESET enable_indexscan;
+ -- check multi-index cases too
+@@ -797,9 +792,7 @@
+   where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+  unique1 | unique2
+ ---------+---------
+-       0 |     998
+-     494 |      11
+-(2 rows)
++(0 rows)
+ 
+ explain (costs off)
+ select unique1, unique2 from onek2

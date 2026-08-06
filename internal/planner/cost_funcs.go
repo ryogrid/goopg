@@ -430,28 +430,13 @@ func indexProbeCost(cp costParams) float64 {
 // value is validated on SF1.
 var indexProbeCostMultiplier = envFloatDefault("GOOPG_INDEX_PROBE_MULT", 1.0)
 
-// multiHashJoinCost costs goopg's N-way MultiHashJoin under the comparability
-// invariant (design ch. 06 §4.1): build each dimension hash table (charged as
-// startup, since all builds complete before probing) and make ONE probe pass over
-// the driving table, hashing each driving row against every dimension. dims/dimRows
-// are the build-side rels; probe/probeRows the driving rel; outputRows the join
-// result. Costed in the same PG units as the equivalent hash cascade, so add_path
-// can rank the MHJ against it — the MHJ wins exactly when eliminating the cascade's
-// intermediate materialisations pays.
-func multiHashJoinCost(cp costParams, probe Cost, probeRows float64, dims []Cost, dimRows []float64, outputRows float64) Cost {
-	build := 0.0
-	for i := range dims {
-		r := 0.0
-		if i < len(dimRows) {
-			r = dimRows[i]
-		}
-		build += (cp.cpuOperatorCost+cp.cpuTupleCost)*r + dims[i].Total
-	}
-	startup := build + probe.Startup
-	probeCost := cp.cpuOperatorCost*float64(len(dims))*probeRows + cp.cpuTupleCost*outputRows
-	total := startup + (probe.Total - probe.Startup) + probeCost
-	return Cost{Startup: startup, Total: total}
-}
+// `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
+// comparability invariant (design ch. 06 §4.1) — build every dimension hash
+// table as startup, then one probe pass over the driving table — in the same
+// PG units as the equivalent hash cascade, so add_path could rank the two.
+// M0127-P6.2 deleted it with the node and its only caller
+// (`generateMultiHashJoinPath`). `hashJoinCost` prices the cascade that
+// remains.
 
 // aggCost reproduces the AGG_HASHED arm of cost_agg (costsize.c:2751): per input
 // tuple, a transition call plus a hash of each group column; per output group, a

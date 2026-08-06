@@ -141,12 +141,6 @@ func findFilterReferencingColumn(t *testing.T, n Node, name string) *Filter {
 			return f
 		}
 		return findFilterReferencingColumn(t, x.Inner, name)
-	case *MultiHashJoin:
-		for _, tb := range x.Tables {
-			if f := findFilterReferencingColumn(t, tb, name); f != nil {
-				return f
-			}
-		}
 	}
 	return nil
 }

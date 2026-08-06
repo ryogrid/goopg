@@ -28,6 +28,12 @@ package executor
 // while the leader builds its own child tree. That global is now a local
 // (executor.go); this file is what keeps the worker build path exercised
 // under the race detector.
+//
+// M0127-P6.1 stamp: runtime hash-join fusion is DELETED, so the precedent
+// cited above (tryFuseHashCascade declining on env.inWorker) is history —
+// `buildEnv` went with it and BuildWorker now builds exactly what Build
+// builds. Claim (1) below therefore reads as "the seam engages under the
+// worker entry point", with no remaining mechanism that declines there.
 
 import (
 	"sort"

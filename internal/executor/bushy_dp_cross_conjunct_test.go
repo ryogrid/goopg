@@ -42,6 +42,11 @@ import "testing"
 func TestBushyDPAttachesUnusedCrossEdge(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+//
+// M0127-P6.2 note: the MultiHashJoin node named below was deleted, so this
+// shape now plans as the left-deep binary hash cascade PG builds. The test is
+// kept unchanged — its assertions are about the RESULT, so it now guards the
+// cascade against the same defect the packed node once carried.
 
 	for _, ddl := range []string{
 		"CREATE TABLE zz_part (p_partkey int, p_name text)",

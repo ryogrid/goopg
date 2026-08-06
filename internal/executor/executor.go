@@ -19,35 +19,21 @@ import (
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
 func Build(plan planner.Node) (Operator, error) {
-	return buildWithEnv(plan, false)
+	return buildNode(plan)
 }
 
 // BuildWorker is the per-worker entry point for Gather/GatherMerge
-// closures. It sets inWorker=true so tryFuseHashCascade declines in
-// parallel workers (C10/F4).
+// closures. It used to set inWorker=true on a per-build `buildEnv` so
+// tryFuseHashCascade declined inside parallel workers (C10/F4);
+// M0127-P6.1 deleted runtime hash-join fusion, which was the sole
+// reader of that env, so a worker build is now byte-for-byte a leader
+// build. The entry point stays because gatherOp/gatherMergeOp and
+// join_worker_path_test.go name it as the worker seam.
 func BuildWorker(plan planner.Node) (Operator, error) {
-	return buildWithEnv(plan, true)
+	return buildNode(plan)
 }
 
-func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
-	// M0126-0006: thread buildEnv through this Build call so
-	// tryFuseHashCascade can access root + inWorker + fusion config.
-	//
-	// M0127-P1.2: this is a LOCAL, not a package global. It used to be
-	// `buildEnvInFlight`, saved and restored around the switch — which
-	// read identically here (the *planner.Join case below reads it
-	// before any recursive Build could overwrite it) but was written
-	// concurrently by every Gather worker, since gatherOp.runWorker
-	// calls BuildWorker from its own goroutine while the leader builds
-	// its own child tree. That made `go test -race` red for EVERY
-	// parallel-join test, with the whole race confined to this one
-	// variable. A local removes the sharing outright.
-	env := &buildEnv{
-		root:      plan,
-		inWorker:  inWorker,
-		fusionCfg: readFusionConfig(),
-	}
-
+func buildNode(plan planner.Node) (Operator, error) {
 	switch p := plan.(type) {
 	case *planner.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
@@ -104,7 +90,7 @@ func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 	case *planner.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls
-		// (same CTE name, same ctx.CTERowCache). This implements PostgreSQL's
+		// (same CTE declaration, same ctx.CTERowCache entry). This implements PostgreSQL's
 		// CTE optimization-fence: a volatile CTE (e.g. random()) produces the
 		// same rows regardless of how many times it is referenced. M0097-0099.
 		op, err := newCteScanOp(p)
@@ -166,11 +152,6 @@ func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *planner.Join:
-		// M0126-0006: try fusion first; fall through to
-		// ordinary cascade when the predicate declines.
-		if fused, ok := tryFuseHashCascade(env, p); ok {
-			return maybeInstrument(p, fused), nil
-		}
 		left, err := Build(p.Left)
 		if err != nil {
 			return nil, err
@@ -306,16 +287,6 @@ func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 		return maybeInstrument(p, op), nil
 	case *planner.Merge:
 		return maybeInstrument(p, newMergeOp(p)), nil
-	case *planner.MultiHashJoin:
-		children := make([]Operator, len(p.Tables))
-		for i, tbl := range p.Tables {
-			var err error
-			children[i], err = Build(tbl)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return maybeInstrument(p, newMultiHashJoinOp(p, children)), nil
 	case *planner.DDL:
 		return newDDLOp(p), nil
 	case *planner.Transaction:
@@ -566,11 +537,6 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
 	case *planner.Join:
-		// M0126-0006: try fusion first; fall through when declined.
-		if fused, ok := tryFuseHashCascade(tree.env, p); ok {
-			return tree.add(OpNode{Kind: OpAdapter, childA: noChild, childB: noChild,
-				state: &opAdapterState{op: fused}}), nil
-		}
 		leftIdx, err := tree.buildRec(p.Left)
 		if err != nil {
 			return noChild, err

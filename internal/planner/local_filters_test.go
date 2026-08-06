@@ -168,7 +168,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings4 := []rangeBinding{
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if shouldAttachBeforeMHJ(bindings4, nil) {
+	if shouldAttachLocalFiltersBeforeSearch(bindings4, nil) {
 		t.Error("fromCount=4 should NOT trigger pre-MHJ attachment")
 	}
 
@@ -176,7 +176,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings5SmallDim := []rangeBinding{
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if !shouldAttachBeforeMHJ(bindings5SmallDim, nil) {
+	if !shouldAttachLocalFiltersBeforeSearch(bindings5SmallDim, nil) {
 		t.Error("fromCount=5 with SmallDim binding should trigger pre-MHJ attachment (Q5 shape)")
 	}
 
@@ -184,7 +184,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	bindings5NoSmallDim := []rangeBinding{
 		{table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if shouldAttachBeforeMHJ(bindings5NoSmallDim, nil) {
+	if shouldAttachLocalFiltersBeforeSearch(bindings5NoSmallDim, nil) {
 		t.Error("fromCount=5 without SmallDim should NOT trigger pre-MHJ attachment (avoids Q7/Q8/Q21 regression)")
 	}
 
@@ -193,7 +193,7 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 		{table: smallDim}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 		{table: largeFact}, {table: largeFact}, {table: largeFact}, {table: largeFact},
 	}
-	if !shouldAttachBeforeMHJ(bindings8SmallDim, nil) {
+	if !shouldAttachLocalFiltersBeforeSearch(bindings8SmallDim, nil) {
 		t.Error("fromCount=8 with SmallDim should trigger pre-MHJ attachment")
 	}
 
@@ -208,14 +208,14 @@ func TestShouldAttachBeforeMHJGate(t *testing.T) {
 	scansDerived := []Node{
 		&SeqScan{Table: largeFact, SmallDim: true}, nil, nil, nil, nil,
 	}
-	if !shouldAttachBeforeMHJ(bindings5Derived, scansDerived) {
+	if !shouldAttachLocalFiltersBeforeSearch(bindings5Derived, scansDerived) {
 		t.Error("fromCount=5 with a size-derived SmallDim leaf scan should trigger pre-MHJ attachment")
 	}
 	// And the negative: same bindings, same scans, tag off.
 	scansPlain := []Node{
 		&SeqScan{Table: largeFact}, nil, nil, nil, nil,
 	}
-	if shouldAttachBeforeMHJ(bindings5Derived, scansPlain) {
+	if shouldAttachLocalFiltersBeforeSearch(bindings5Derived, scansPlain) {
 		t.Error("fromCount=5 with no small-dimension leaf should NOT trigger pre-MHJ attachment")
 	}
 }
@@ -308,12 +308,15 @@ func TestAttachRelationLocalFiltersSetsLeafLocalFlag(t *testing.T) {
 	}
 }
 
-// TestPlanQ5AttachesLeafLocalFiltersBeforeMHJRewrite is the
-// end-to-end Slice A probe: Q5 must attach leaf-local Filter
-// wrappers to the region and orders scans before the MHJ rewrite
-// runs, which in turn must prevent the historical 6-table
-// MultiHashJoin shape from appearing in the final plan.
-func TestPlanQ5AttachesLeafLocalFiltersBeforeMHJRewrite(t *testing.T) {
+// TestPlanQ5AttachesLeafLocalFilters is the end-to-end Slice A probe: Q5 must
+// attach leaf-local Filter wrappers to the region and orders scans.
+//
+// Until M0127-P6.2 the test also asserted the consequence that motivated Slice
+// A — that those wrappers kept the historical 6-table MultiHashJoin shape out
+// of the final plan, because the packer's chain detector declined on
+// Filter(SeqScan) leaves. The packed node is gone, so only the attachment
+// itself is still assertable; the shape half is now true by construction.
+func TestPlanQ5AttachesLeafLocalFilters(t *testing.T) {
 	cat, err := tpch.Catalog()
 	if err != nil {
 		t.Fatalf("tpch.Catalog: %v", err)
@@ -333,7 +336,6 @@ func TestPlanQ5AttachesLeafLocalFiltersBeforeMHJRewrite(t *testing.T) {
 
 	foundRegionLeafLocal := false
 	foundOrdersLeafLocal := false
-	hasSixTableMHJ := false
 
 	var walk func(Node)
 	walk = func(n Node) {
@@ -364,24 +366,14 @@ func TestPlanQ5AttachesLeafLocalFiltersBeforeMHJRewrite(t *testing.T) {
 			walk(x.Child)
 		case *Limit:
 			walk(x.Child)
-		case *MultiHashJoin:
-			if len(x.Tables) == 6 {
-				hasSixTableMHJ = true
-			}
-			for _, child := range x.Tables {
-				walk(child)
-			}
 		}
 	}
 	walk(node)
 
-	if hasSixTableMHJ {
-		t.Fatal("Q5 still planned as a 6-table MultiHashJoin; Slice A leaf-local Filters did not block MHJ rewrite")
-	}
 	if !foundRegionLeafLocal {
-		t.Error("Q5 should attach a LeafLocal Filter wrapper above region before MHJ rewrite")
+		t.Error("Q5 should attach a LeafLocal Filter wrapper above region")
 	}
 	if !foundOrdersLeafLocal {
-		t.Error("Q5 should attach a LeafLocal Filter wrapper above orders before MHJ rewrite")
+		t.Error("Q5 should attach a LeafLocal Filter wrapper above orders")
 	}
 }

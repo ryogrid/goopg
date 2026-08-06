@@ -1,56 +1,62 @@
 (idle — nothing in flight)
 
-Last loop: **M-NIGHTLY / S7-gate loop #4. Selected `regress/delete`
-(AI-20260806-011323-016) under the same carve-out the harness fix used — of the
-three 20260806 regress divergences it was the only one reproducing
-deterministically, so it alone could have kept the S7 cycle red forever.
-FIXED: `SKIP(deferred)` → `PASS`. Committed.**
+Last loop: **M0127-P6.2 COMPLETE — MultiHashJoin is deleted** (`4e08d4b7`,
+75 files, +849/-4616). Second S7 removal.
 
-1. **The ledger's DELETE scoping was too narrow.** goopg emitted the bald
-   `missing FROM-clause entry` for **all five** shapes upstream distinguishes
-   (`delete.out`, `update.out`, `returning.out`, `insert_conflict.out`, and
-   plain `SELECT t.a` / `t.*` over an aliased FROM entry). The missing piece is
-   a *diagnosis*, not wording: `errorMissingRTE()` (`parse_relation.c`) looks
-   the refname up a **second time ignoring aliases**
-   (`searchRangeTableForRel`) and reports "you wrote the table's own name where
-   only its alias is visible". goopg did the first lookup and stopped.
-2. **The trap avoided:** `blockOriginalName` (M0097-0003) already produced the
-   right text — but only at the two sites that SET the flag, and
-   `analyzeDelete` was not one, so the analyzer's bald error pre-empted the
-   planner's correct one. Patching that one call site would have turned
-   `delete` green and left the other four wrong.
-3. **Fixed (root-0039):** one helper per resolver —
-   `analyzer.errorMissingRTE` + `planner.errorMissingRTEPlan`. **Both twins
-   moved**: RETURNING scopes are built after analysis, so `RETURNING t.*` is
-   served only by the planner. Skips `qualifiedOnly` rels (ON CONFLICT's
-   `excluded` is a keyword, not a user rename) and self-aliased entries
-   (upstream's `strcmp(aliasname, relname) != 0`). Also 42712
-   (`duplicate_alias`) → **42P01** at the two `blockOriginalName` sites.
+Inventory was 42 non-test files, above 08 §4's ~34-arm/18-file estimate.
+Gone: `multi_hash_join.go` (696 lines) + 8 MHJ-only test files, the node,
+`PathMultiHash`, packer (`rewriteMultiWayChain`/`collectMultiHashTables`),
+the whole posmap family (`mhjPosMapOf` was ALREADY a permanent `return nil`
+— its 4 call sites were dead branches; `binaryTreePosMapOf` dead outright),
+`estimateMultiHashJoin`, `multiHashJoinCost`, `generateMultiHashJoinPath`
+(**never had a production caller** — settles 0126-0011 §3 as *deleted*),
+both EXPLAIN arms, flag trio (`GOOPG_MHJ_PACKING_OFF` → retired row).
 
-Files: `internal/analyzer/analyzer.go`, `internal/planner/planner.go`, two new
-guard tests (`*/missing_rte_test.go`),
-`docs/design/root-0039-error-missing-rte-alias-hint.md` + README index,
-fix_plan (item note + S7 status amendment), 2 ledger rows.
+**Two inventory calls were wrong, both toward over-deletion** — the trap for
+P6.3: `mhj_input_rewrite.go` is NOT an MHJ file (its first half is the
+generic single-table-predicate→IndexScan promotion `planSelect` calls on
+every query) — split + renamed `scan_input_rewrite.go`. And
+`shouldAttachBeforeMHJ` is a live Slice-A gate → renamed
+`shouldAttachLocalFiltersBeforeSearch`. **Grep the callers before deleting
+any MHJ-NAMED symbol; the name lies.**
 
-Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); both guards verified
-NON-VACUOUS (revert the two source files, keep the tests → both fail with
-`missing FROM-clause entry`); A/B on builds differing only in those two files —
-`delete` SKIP→PASS while `insert_conflict`/`returning`/`subselect`/`update`
-SKIP on BOTH sides and `join` + `rowtypes` (the only corpus files asserting the
-bald message) SKIP identically on both; pgbench smoke via hook. DS05 NOT run —
-deliberate: both helpers are reachable only on the `len(matches)==0` error
-return, which already returned an error, so the delta is error text/SQLSTATE
-only and cannot move a row count or a plan shape.
+**The row-lock closure P6.2 was named for did NOT happen — premise measured
+false.** With BOTH nodes deleted, `GOOPG_PGSHAPED_DP=0 go test -count=1 -run
+'^TestPort_IsolationEvalPlanQual$' ./internal/testport/` still fails
+byte-identically to a HEAD-baseline worktree run (`L1001 expected
+" <waiting ...>" / actual ""`). So the three ledger rows (P6.1's,
+`2026-08-06 M-NIGHTLY` root-0038 and AI-20260806-011323-001) are **NOT**
+flipped to `resolved`. Real cause located: `markJoinPreserveCTID`
+(`operators_lockrows.go:~404`) has only 4 arms (project/filter/sort/joinOp)
+and the legacy plan for `lockwithvalues` reaches a node outside that set.
+Default S5-ON PASSES the spec — production unaffected. Ledger row 2026-08-07
+carries the resume point.
 
-NEXT LOOP (banner: M0124 closed → M0125 → **M0127** → M-NIGHTLY → M0123).
-`ci/logs/action-items.md` is STILL run `20260806-011323` — no new nightly has
-run, so P6.1 stays unselectable; re-read it first, and if it is `status: pass`
-take P6.1. The 4 genuine items of that run now stand at: `select` FIXED,
-`delete` FIXED, `portals_p2` never reproduces, and
-**`TestPort_IsolationEvalPlanQual` (AI-…-001) is the last open engine-side
-blocker**. Four repro conditions are falsified — do NOT re-attempt an
-isolation-level repro; the designed next step is the **prefix bisect** of
-`internal/testport` (regress / pg_dump / pg_basebackup / pgoutput blocks +
-EvalPlanQual) to find the predecessor that poisons it.
+Gates: grep-clean, `go build`/`go vet ./...` clean, UNITS PASS, **SPOT PASS**
+(Q12=2/Q13=35, 28.3 s vs P6.1's 28.8 s, peak 10,658 MB), **DS05 PASS**
+(95 PASS / 0 MISMATCH / 0 CKMISMATCH / 0 ERROR / 0 TIMEOUT / 4 SKIP;
+**PLAN-SHAPE 99/99 same, 0 changed**), SMOKE via hook (13,106 TPS),
+`make ralph-state-guard` OK (auto-repaired the stale completed-marker).
+Two guards caught real staleness and were repaired, not suppressed:
+`TestExprSwitchInventoryIsPinned` + `TestFlagProvenanceEnvIsGenerated`
+(regen via `go run ./cmd/gen-planner-flag-labels > scripts/planner-flags.env`).
+
+**NEXT LOOP — M0127-P6.3 (delete the old subset-bitmask DP + layout/remap
+family).** `enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/
+`dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,
+`attachUnusedCrossEdges`, `bushySeedRowCounts`, the 12-table cap,
+`IsSmallDimensionSide` pinning, `chooseInnerJoinAlgo` (searched); demote
+`joinorder.go` to over-limit sequencer. **HELD BACK per 08 §4:
+`buildBindingsPosMap`/`applyJoinTreePosMap` stay** until the 03 §10 boundary
+map is proven — 08 §4 calls this the S7 change most likely to regress.
+Bar: grep-clean + UNITS + SPOT + DS05. Also freed by P6.3:
+`SetPGShapedJoinSearch`, `costDrivenJoinOrder`/`SetCostDrivenJoinOrder`
+(bushy.go:13 says they live until the old DP goes).
+
+Housekeeping: two orphaned `TestPort_RegressSuite` servers from earlier loops
+were live during this loop's gates (PIDs 3360059 / 3384704, ~4% CPU, ~380 MB
+each, /tmp/TestPort_RegressSuite*/001/data) — low spin, did not affect row
+counts. Not owned by this loop, so not killed. Never run SPOT while a
+nightly's tpch/tpcds stages are live.
 
 In-flight: none.

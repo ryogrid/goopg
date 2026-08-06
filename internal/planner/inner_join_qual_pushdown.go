@@ -95,10 +95,6 @@ func pushSingleSideQualsIntoInnerJoinInputs(n Node) {
 	case *NestedLoopIndexJoin:
 		pushSingleSideQualsIntoInnerJoinInputs(x.Outer)
 		pushSingleSideQualsIntoInnerJoinInputs(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			pushSingleSideQualsIntoInnerJoinInputs(t)
-		}
 	case *CTEScan:
 		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
 	case *Project:
@@ -145,60 +141,6 @@ func pushInnerJoinInputQuals(f *Filter) {
 				f.notePushedBelow(c)
 			}
 		}
-	case *MultiHashJoin:
-		pushResidualQualsIntoMHJTables(f, child)
-	}
-}
-
-// pushResidualQualsIntoMHJTables is the *MultiHashJoin* arm of
-// pushInnerJoinInputQuals (M0125-0046). A WHERE conjunct that
-// pushOneConjunct never AND'd onto a join predicate is still sitting in
-// the residual Filter when MHJ packing replaces the join chain, so
-// neither collectMultiHashTables (which only captures join-predicate
-// extras into mh.Filters) nor pushSingleSourceFiltersIntoMHJTables
-// (which only reads mh.Filters) ever sees it — `ca_state IN
-// ('IL','TX','ME')` stayed above the MHJ and customer_address was
-// hashed whole (50,000 rows for an 11,049-row answer, design doc
-// 0125-0035 §2).
-//
-// The MHJ is all-INNER by construction (collectMultiHashTables requires
-// JoinTypeInner), so every member is a preserved side and the
-// joinRestrictionSides outer-join analysis has no analog here. The four
-// load-bearing properties of the binary arm carry over: MHJ-output
-// coordinates with positional name validation (property 1, enforced in
-// mhjResidualConjunctTable), the conjunct is DUPLICATED not moved
-// (property 2 — f.Predicate stays untouched), CTE bodies are never
-// rewritten (property 3 — Tables[i] members are base-relation scans),
-// and re-walk idempotence comes from pushConjunctIntoSubtree's
-// exprEqual guard.
-func pushResidualQualsIntoMHJTables(f *Filter, mh *MultiHashJoin) {
-	if len(mh.Tables) == 0 {
-		return
-	}
-	// Cumulative offsets — the same arithmetic
-	// pushSingleSourceFiltersIntoMHJTables uses for mh.Filters, because
-	// the residual Filter's predicate and mh.Filters share the
-	// MHJ-output coordinate space once remapWithBindings has run.
-	offsets := make([]int, len(mh.Tables)+1)
-	for i, t := range mh.Tables {
-		offsets[i+1] = offsets[i] + len(t.Output())
-	}
-	for _, c := range splitAnd(f.Predicate) {
-		t, ok := mhjResidualConjunctTable(mh, offsets, c)
-		if !ok {
-			continue
-		}
-		local, ok := shiftConjunctForInput(c, -offsets[t])
-		if !ok {
-			continue
-		}
-		if repl, ok := pushConjunctIntoSubtree(mh.Tables[t], local); ok {
-			mh.Tables[t] = repl
-			// Same duplication, same double-charge — the binary arm's
-			// sibling (M0127-P5.6-f-vi). `estimateMultiHashJoin` walks
-			// mh.Tables, so the copy IS priced down there.
-			f.notePushedBelow(c)
-		}
 	}
 }
 
@@ -230,62 +172,17 @@ func (f *Filter) pricedBelow(c Expr) bool {
 	return false
 }
 
-// mhjResidualConjunctTable attributes a residual conjunct to the unique
-// mh.Tables[t] whose [offsets[t], offsets[t+1]) column range covers
-// every ColumnRef, validating each ref positionally by name (property
-// 1). The veto set matches innerJoinPushTarget: OuterColumnRef and
-// FuncCall (no volatility model — a volatile call must not change its
-// evaluation count) disqualify, and walkExprRefs under scopeVeto
-// already aborts on any subquery-bearing kind (an InExpr with Plan !=
-// nil carries a slotInnerPlan child; a literal IN-list walks its
-// Operand and List as same-scope slots and is admitted).
-func mhjResidualConjunctTable(mh *MultiHashJoin, offsets []int, c Expr) (int, bool) {
-	target := -1
-	bad := false
-	okWalk := walkExprRefs(c, scopeVeto, exprVisitor{
-		Visit: func(e Expr) bool {
-			if bad {
-				return false
-			}
-			switch x := e.(type) {
-			case *OuterColumnRef, *FuncCall:
-				_ = x
-				bad = true
-				return false
-			case *ColumnRef:
-				idx := x.Index
-				t := -1
-				for i := 0; i < len(mh.Tables); i++ {
-					if idx >= offsets[i] && idx < offsets[i+1] {
-						t = i
-						break
-					}
-				}
-				if t < 0 {
-					bad = true
-					return false
-				}
-				out := mh.Tables[t].Output()
-				local := idx - offsets[t]
-				if x.Name != "" && !strings.EqualFold(out[local].Name, x.Name) {
-					bad = true
-					return false
-				}
-				if target < 0 {
-					target = t
-				} else if target != t {
-					bad = true
-					return false
-				}
-			}
-			return true
-		},
-	})
-	if !okWalk || bad || target < 0 {
-		return -1, false
-	}
-	return target, true
-}
+// `pushResidualQualsIntoMHJTables` and `mhjResidualConjunctTable` were the
+// `*MultiHashJoin` arm of `pushInnerJoinInputQuals` (M0125-0046), deleted with
+// the node by M0127-P6.2. They handled the conjunct that fell between two
+// stools when packing replaced a join chain: `pushOneConjunct` had never AND'd
+// it onto a join predicate, so the packer's `extras` capture (join-predicate
+// conjuncts only) missed it and it stayed above the packed node, leaving TPC-DS
+// Q47's `ca_state IN ('IL','TX','ME')` un-pushed and customer_address scanned
+// whole. The binary `*Join` arm above is the surviving path and keeps both
+// load-bearing properties: the conjunct is DUPLICATED, not moved, and it is
+// attributed to a unique input by validating each ColumnRef positionally
+// against that input's schema by name.
 
 // joinRestrictionSides reports which of a join's inputs may receive a
 // copy of a restriction clause that sits ABOVE the join, and whether
@@ -474,11 +371,11 @@ func innerJoinPushEligibleInput(n Node) bool {
 //
 // D2 originally admitted CTE references ONLY, reasoning that "pushing
 // filters toward base-relation leaves is exactly what
-// shouldAttachBeforeMHJ withholds behind its SmallDimension guard".
+// shouldAttachLocalFiltersBeforeSearch withholds behind its SmallDimension guard".
 // M0125-0035 retired that half of the scoping, because the two passes do
 // not do the same thing:
 //
-//   - Slice A (shouldAttachBeforeMHJ → partitionConjunctsForJoinPlanning)
+//   - Slice A (shouldAttachLocalFiltersBeforeSearch → partitionConjunctsForJoinPlanning)
 //     MOVES a conjunct out of the DP's input BEFORE enumeration, so it
 //     changes the join ORDER as well as the qual placement. That is what
 //     "Slice A regresses Q8 / Q21 from PASS to CANCEL" recorded, and why

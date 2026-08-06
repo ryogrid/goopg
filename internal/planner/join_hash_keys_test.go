@@ -85,7 +85,7 @@ func TestJoinHashKeysCollectsEveryEquiPair(t *testing.T) {
 		t.Fatalf("HashKeys = %d pairs, want 2; plan:\n%s", len(j.HashKeys), planTreeString(node))
 	}
 	// HashKeys[0] must be the executor's current pair BY POINTER:
-	// IsCanonicalKeyEquality identifies the canonical conjunct by
+	// isCanonicalKeyEquality identifies the canonical conjunct by
 	// pointer identity, and reselectDegenerateHashKeys may have moved
 	// the pair off the first ON-clause conjunct on purpose.
 	if j.HashKeys[0].Left != j.LeftKey || j.HashKeys[0].Right != j.RightKey {

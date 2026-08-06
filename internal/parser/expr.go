@@ -137,10 +137,12 @@ func (*ExtractExpr) exprNode()  {}
 // BY used GROUPING SETS/ROLLUP/CUBE. Its value depends solely on which
 // generated grouping set produced the current row — bit i (counting from
 // the least-significant bit, rightmost arg) is 1 iff Args[i] is NOT part of
-// that set — so it never needs a runtime evaluation: the planner's
-// grouping-sets rewrite resolves each occurrence to a plain integer literal
-// once per generated branch. Stored separately from FuncCall (like
-// ExtractExpr) because it isn't a real catalog function. M0122-0004.
+// that set — so it never needs a per-row evaluation: the planner gives each
+// distinct call an aggregate OUTPUT COLUMN carrying its bitmask per set, and
+// the target list reads that column (M0125-0048; it used to resolve to a
+// per-branch integer literal, back when the clause was expanded into a UNION
+// ALL). Stored separately from FuncCall (like ExtractExpr) because it isn't a
+// real catalog function. M0122-0004.
 type GroupingCall struct {
 	pos  int
 	Args []Expr

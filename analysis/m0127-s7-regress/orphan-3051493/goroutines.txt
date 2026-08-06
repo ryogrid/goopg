@@ -1,0 +1,133 @@
+goroutine 34361 [running]:
+runtime/pprof.writeGoroutineStacks({0x1191f00, 0x380cef186000})
+	/usr/lib/go-1.26/src/runtime/pprof/pprof.go:819 +0x6b
+runtime/pprof.writeGoroutine({0x1191f00?, 0x380cef186000?}, 0x380cef6417b8?)
+	/usr/lib/go-1.26/src/runtime/pprof/pprof.go:782 +0x25
+runtime/pprof.(*Profile).WriteTo(0x1a48d70?, {0x1191f00?, 0x380cef186000?}, 0xc?)
+	/usr/lib/go-1.26/src/runtime/pprof/pprof.go:408 +0x149
+net/http/pprof.handler.ServeHTTP({0x380ce5aaa011, 0x9}, {0x1197aa0, 0x380cef186000}, 0x380cf4d3c000)
+	/usr/lib/go-1.26/src/net/http/pprof/pprof.go:273 +0x52a
+net/http/pprof.Index({0x1197aa0, 0x380cef186000}, 0x380cf4d3c000?)
+	/usr/lib/go-1.26/src/net/http/pprof/pprof.go:397 +0xda
+net/http.HandlerFunc.ServeHTTP(0x1a5e500?, {0x1197aa0?, 0x380cef186000?}, 0x684f56?)
+	/usr/lib/go-1.26/src/net/http/server.go:2286 +0x29
+net/http.(*ServeMux).ServeHTTP(0x487ef9?, {0x1197aa0, 0x380cef186000}, 0x380cf4d3c000)
+	/usr/lib/go-1.26/src/net/http/server.go:2828 +0x1c7
+net/http.serverHandler.ServeHTTP({0x380cf0cee000?}, {0x1197aa0?, 0x380cef186000?}, 0x1?)
+	/usr/lib/go-1.26/src/net/http/server.go:3311 +0x8e
+net/http.(*conn).serve(0x380e11310000, {0x1198928, 0x380cd2324420})
+	/usr/lib/go-1.26/src/net/http/server.go:2073 +0x650
+created by net/http.(*Server).Serve in goroutine 19
+	/usr/lib/go-1.26/src/net/http/server.go:3464 +0x485
+
+goroutine 1 [chan receive, 9 minutes]:
+main.runStart({0x380cd2226200, 0x4, 0x4}, {0x380cd21f41e0?, 0x380cd2278008?}, {0x1191580, 0x380cd21f2060})
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:810 +0x2a7b
+main.run({0x380cd22261f0, 0x5, 0x5}, {0x1191580, 0x380cd21f2058}, {0x1191580, 0x380cd21f2060})
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:93 +0x230
+main.main()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:78 +0x5e
+
+goroutine 19 [IO wait]:
+internal/poll.runtime_pollWait(0x757931c1fa00, 0x72)
+	/usr/lib/go-1.26/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x380cd24b4980?, 0x900422a37?, 0x0)
+	/usr/lib/go-1.26/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/usr/lib/go-1.26/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x380cd24b4980)
+	/usr/lib/go-1.26/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0x380cd24b4980)
+	/usr/lib/go-1.26/src/net/fd_unix.go:150 +0x29
+net.(*TCPListener).accept(0x380cd232c180)
+	/usr/lib/go-1.26/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0x380cd232c180)
+	/usr/lib/go-1.26/src/net/tcpsock.go:387 +0x30
+net/http.(*Server).Serve(0x380cd2658100, {0x1197920, 0x380cd232c180})
+	/usr/lib/go-1.26/src/net/http/server.go:3434 +0x30c
+net/http.Serve(...)
+	/usr/lib/go-1.26/src/net/http/server.go:2942
+main.runStart.func1()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:349 +0x214
+created by main.runStart in goroutine 1
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:338 +0x7bb
+
+goroutine 21 [syscall]:
+os/signal.signal_recv()
+	/usr/lib/go-1.26/src/runtime/sigqueue.go:152 +0x98
+os/signal.loop()
+	/usr/lib/go-1.26/src/os/signal/signal_unix.go:23 +0x13
+created by os/signal.Notify.func1.1 in goroutine 1
+	/usr/lib/go-1.26/src/os/signal/signal.go:152 +0x1f
+
+goroutine 35 [chan receive, 9 minutes]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0x380cd232c1c0)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb0
+
+goroutine 36 [chan receive, 9 minutes]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0x380cd232c1c0)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb0
+
+goroutine 37 [chan receive, 9 minutes]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0x380cd232c1c0)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb0
+
+goroutine 54 [select]:
+github.com/goopg/goopg/internal/initdb.Open.func61()
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:2388 +0xf4
+created by github.com/goopg/goopg/internal/initdb.Open in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:2377 +0x71b3
+
+goroutine 55 [select]:
+github.com/goopg/goopg/internal/storage.(*Bgwriter).run(0x380cd24b34c0)
+	/home/ryo/work/goopg/goopg/internal/storage/bgwriter.go:88 +0x169
+created by github.com/goopg/goopg/internal/storage.(*Bgwriter).Start in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/storage/bgwriter.go:65 +0x4f
+
+goroutine 56 [sync.RWMutex.RLock, 10 minutes]:
+sync.runtime_SemacquireRWMutexR(0x757918f81c60?, 0x18?, 0x0?)
+	/usr/lib/go-1.26/src/runtime/sema.go:100 +0x25
+sync.(*RWMutex).RLock(...)
+	/usr/lib/go-1.26/src/sync/rwmutex.go:74
+github.com/goopg/goopg/internal/storage.(*Pool).flushBatch(0x380cd236c000, {0x380cf1bc0000, 0x8, 0x8}, {0x380ce3d26000, 0x8, 0x808080802a7d?})
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:2318 +0xa5
+github.com/goopg/goopg/internal/storage.(*Pool).FlushAllPaced(0x380cd236c000, 0x0)
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:2302 +0x714
+github.com/goopg/goopg/internal/storage.(*Pool).FlushAll(0x380cd236c000?)
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:2222 +0x30
+github.com/goopg/goopg/internal/wal.(*Checkpointer).flushDirty(0x380cd3ae4000?, 0x0?)
+	/home/ryo/work/goopg/goopg/internal/wal/checkpointer.go:850 +0x5a
+github.com/goopg/goopg/internal/wal.(*Checkpointer).runCheckpoint(0x380cd3ae4000, {0x1198960, 0x380cd238dea0}, 0x0, 0x0)
+	/home/ryo/work/goopg/goopg/internal/wal/checkpointer.go:627 +0x445
+github.com/goopg/goopg/internal/wal.(*Checkpointer).Run(0x380cd3ae4000, {0x1198960, 0x380cd238dea0})
+	/home/ryo/work/goopg/goopg/internal/wal/checkpointer.go:470 +0x313
+main.runStart.func8()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:776 +0x53
+created by main.runStart in goroutine 1
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:774 +0x28d7
+
+goroutine 34362 [runnable]:
+syscall.Syscall(0x0, 0x2f, 0x380cf0cee021, 0x1)
+	/usr/lib/go-1.26/src/syscall/syscall_linux.go:74 +0x25
+syscall.read(0x380ce7e00000?, {0x380cf0cee021?, 0x41a900?, 0x380cd3a15770?})
+	/usr/lib/go-1.26/src/syscall/zsyscall_linux_amd64.go:736 +0x38
+syscall.Read(...)
+	/usr/lib/go-1.26/src/syscall/syscall_unix.go:183
+internal/poll.ignoringEINTRIO(...)
+	/usr/lib/go-1.26/src/internal/poll/fd_unix.go:738
+internal/poll.(*FD).Read(0x380ce7e00000, {0x380cf0cee021, 0x1, 0x1})
+	/usr/lib/go-1.26/src/internal/poll/fd_unix.go:161 +0x21d
+net.(*netFD).Read(0x380ce7e00000, {0x380cf0cee021?, 0x380ce720e6a0?, 0x380cd22bafd0?})
+	/usr/lib/go-1.26/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0x380ce28f2000, {0x380cf0cee021?, 0x0?, 0x0?})
+	/usr/lib/go-1.26/src/net/net.go:196 +0x45
+net/http.(*connReader).backgroundRead(0x380cf0cee000)
+	/usr/lib/go-1.26/src/net/http/server.go:702 +0x33
+created by net/http.(*connReader).startBackgroundRead in goroutine 34361
+	/usr/lib/go-1.26/src/net/http/server.go:698 +0xb6

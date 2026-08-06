@@ -79,6 +79,111 @@ that reports an output-mismatch skip is classified a **regression**, exactly
 as if it had failed. Isolation has no such hole — the 120 strict per-spec
 functions fail hard on divergence.
 
+**Wedge-recovery rule (added 2026-08-06): recovery must not re-bootstrap the
+shared fixtures.** The gating rule above has a companion hazard, and until this
+loop it was the single largest source of nightly action items. Regress cases
+share one cluster and one set of `test_setup.sql` fixture tables. When a case
+hits `regressCaseTimeout` (120 s) the suite marks the cluster poisoned and, at
+the next case, restarts it — correct, and the only way to drop the orphaned
+backend. What was *not* correct is what followed: recovery re-ran
+`test_setup.sql` "to restore shared fixture tables". A restart preserves the
+data directory, so the fixtures were never lost, and the re-run is neither
+idempotent nor a no-op — psql runs without `ON_ERROR_STOP`, so every
+`CREATE TABLE` fails with "relation already exists" while the `INSERT`/`COPY`
+after it succeeds. **Every fixture table doubles** (measured: `int4_tbl` 5→10,
+`text_tbl` 2→4, `varchar_tbl` 4→8, `onek` 1000→2000, `tenk1` 10000→20000).
+
+Every later case that reads a doubled table then produces a *genuine* output
+mismatch, which the gating rule above dutifully files as a regression. One
+wedged case therefore manufactured an unbounded tail of unattributable
+"regressions": run `20260806-191958` filed **9 items for 1 real event**
+(`multirangetypes` wedged; `numerology`, `portals_p2`, `select`, `select_into`,
+`text`, `truncate`, `union`, `varchar` were fixture casualties), and runs
+`20260802-014405`/`20260803-013955`/`20260804-005028` show the same shape at
+`aggregates`/`jsonb`/`misc`. That the wedge case *moves* between nights while
+the casualty set tracks it is the signature: the casualties are downstream of
+the recovery, not of any code change. Note this is a different failure mode
+from the summarizer's truncated-output class (04 §C.1) — the casualty output is
+complete and really does differ, so no report-side rule can filter it; the
+harness must not corrupt the fixtures in the first place.
+
+`restoreRegressFixtures` (`internal/testport/regress_suite_test.go`) is
+therefore the only entry point recovery uses: it re-runs `test_setup.sql` **only
+when the fixtures are genuinely absent** (`fixturesPresent()` probes `onek`), so
+a restart onto a live data directory keeps them pristine and a restart onto an
+empty database still bootstraps. Guard:
+`TestPort_RegressSuiteRecoveryKeepsFixturesPristine` asserts the post-recovery
+cardinalities and then performs the *unguarded* restore and asserts the
+doubling, so it cannot pass vacuously (verified: removing the guard fails it on
+all five tables).
+
+This bounds the blast radius of a wedge to the wedged case itself; **what wedges
+the cluster is a separate, still-open question**, addressed by the wedge-probe
+rule below.
+
+#### Wedge-probe rule (added 2026-08-06)
+
+A wedge is nondeterministic, rare, moves between cases, and happens on an
+unattended host — so the harness must collect its own evidence at the moment it
+happens, or the investigation never starts. Two facts from run
+`20260806-191958` set the requirements:
+
+- **It is not host overload and not a GC-thrashing server** (the two causes the
+  action item names). That run's 232 cases sum to **298.5 s including the
+  120 s wedge**, i.e. **178.5 s for the other 231** — faster than the 302 s the
+  same suite took on the dev workstation with no wedge at all. The server was
+  healthy immediately before and after; only one case stopped.
+- **A single statement hangs past its own 5 s `statement_timeout`** (ExecuteSQL
+  sets one on the session). The wait is therefore on a path that never observes
+  the statement deadline — which is the defect to find, not a symptom of load.
+
+Requirement: when a case crosses **`regressWedgeProbeAfter` (60 s, half the
+per-case deadline)** the suite captures live state *while the backend is still
+stuck*, and emits a bounded summary through `t.Log` — the nightly collects only
+`testport/go-test.log`, so anything written elsewhere is invisible to triage.
+`internal/testport/regress_wedge_probe_test.go` captures five things, chosen
+because together they separate the surviving hypotheses:
+
+| section | discriminates |
+|---|---|
+| `SELECT 1` liveness | one stuck backend vs. a dead/saturated postmaster |
+| `pg_stat_activity` | *which* statement is stuck, and its wait event |
+| `pg_locks` | a lock wait (and its holder) vs. a non-lock hang |
+| goroutine dump (`debug=2`), filtered to goroutines blocked **>1 minute** | *where* in the server it is parked: lock, channel, mutex, or a spin that never checks `ctx` |
+| server RSS from `/proc` | keeps or kills the GC-thrash hypothesis quantitatively |
+
+Plus `psql-partial.out`: `ExecuteSQL` writes the killed client's partial output
+to the bundle, because `framework.RegressResult` carries only a rationale string
+and the tail of that output names the statement the server never answered.
+Bundles land under `tmp/regress-wedge/<case>/` (override
+`GOOPG_REGRESS_WEDGE_DIR`).
+
+Two implementation constraints, both load-bearing:
+
+- **The cluster gets its own pprof address** (`reserveLoopbackPort` +
+  `GOOPG_PPROF_ADDR`). The server's built-in default is a fixed
+  `127.0.0.1:6060`; when a bench cluster or peer test already holds it the bind
+  fails at `Debug` level and the endpoint silently does not exist — precisely
+  when the dump is needed.
+- **Every probe query casts its columns to `text`.** goopg's
+  `pg_stat_activity` emits an *empty* value for `pid` on internal sessions (3 of
+  4 rows on an idle cluster), and an `int4` column carrying `""` fails a Go
+  driver's parse for the whole query (`pq: strconv.ParseInt: parsing "":
+  invalid syntax`). psql hides it by rendering a blank. The compat gap itself is
+  a deferral-ledger row (2026-08-06).
+
+Guard: `TestPort_RegressWedgeProbeNamesTheStuckStatement` runs the probe against
+a cluster deliberately holding a long statement and asserts it names that
+statement, reaches a dump containing real `internal/server` frames, and reads
+the RSS; `TestRegressWedgeProbeStuckFilter` covers the >1-minute selection on a
+synthetic dump, which a short live guard cannot reach. Non-vacuity is
+demonstrated, not assumed: before the `::text` casts the guard failed on exactly
+the `pg_stat_activity` assertion.
+
+The probe collects evidence; it does not fix the wedge. The wedge trigger stays
+an open M-NIGHTLY item with a deferral-ledger row, and its resume point is now
+"read the probe sections from the first nightly that wedges".
+
 **Dedup rule (from `05-duplicate-management.md`): the Go `testport` entry
 point is the ONLY execution path.** The batch never additionally drives
 `scripts/pg-regress-runner.sh` or per-spec CSV rows — those CSVs are tracking

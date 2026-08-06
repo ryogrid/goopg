@@ -49,8 +49,9 @@ type joinOp struct {
 	// int64-representable, lazyIntHash replaces lazyHash so the probe hot
 	// path (e.g. Q9's ~6M lineitem rows) hashes an int64 instead of
 	// allocating a datumKey string per row — the GC-heavy cost that made
-	// the binary hash cascade slow where MultiHashJoin's int64 keys are
-	// fast (multi_hash_join.go M0043-0003).
+	// the binary hash cascade slow where the packed MultiHashJoin's int64
+	// keys were fast (M0043-0003; the packed node went at M0127-P6.2, the
+	// fast path it motivated is this one).
 	//
 	// M0127-P0.3 (05 §4, stage E3): exactly ONE of the two maps is built.
 	// lazyHashIsInt is decided BEFORE the build from the plan's key types
@@ -1901,21 +1902,53 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	o.currentRowVersion = 0
 
 	type groupRuntime struct {
-		groupValues      Row
-		passthroughVals  Row // values of functionally-determined passthrough columns
-		aggs             []aggRuntime
+		setIdx          int // which grouping set produced this group
+		groupValues     Row
+		passthroughVals Row // values of functionally-determined passthrough columns
+		aggs            []aggRuntime
 	}
 
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
 
-	if len(o.plan.GroupExprs) == 0 {
+	nGroupCols := len(o.plan.GroupExprs)
+
+	// M0125-0048: `sets` is the list of grouping sets this node computes, each
+	// an ascending list of indices into plan.GroupExprs. An ordinary aggregate
+	// has exactly ONE implicit set holding every grouping column, so the loops
+	// below serve both cases unmodified — the same unification nodeAgg.c makes
+	// by giving a plain Agg numsets == 1.
+	sets := o.plan.GroupingSets
+	if sets == nil {
+		all := make([]int, nGroupCols)
+		for i := range all {
+			all[i] = i
+		}
+		sets = [][]int{all}
+	}
+	multiSet := len(sets) > 1
+
+	// A set with no active columns — an ungrouped aggregate, or the
+	// grand-total level of a ROLLUP — produces exactly one output row even
+	// over zero input rows, so its group is created before the drain.
+	for si, set := range sets {
+		if len(set) > 0 {
+			continue
+		}
 		var ptVals Row
 		if len(o.plan.Passthrough) > 0 {
 			ptVals = make(Row, len(o.plan.Passthrough))
 		}
-		groups["__all__"] = &groupRuntime{groupValues: nil, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-		order = append(order, "__all__")
+		var gv Row
+		if nGroupCols > 0 {
+			gv = make(Row, nGroupCols)
+			for i := range gv {
+				gv[i] = NullDatum
+			}
+		}
+		key := o.setGroupKey(si, nil, nil, multiSet)
+		groups[key] = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+		order = append(order, key)
 	}
 
 	for {
@@ -1931,50 +1964,70 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		key, groupValues, err := o.evalGroupKey(slot)
+		// Every grouping column is evaluated ONCE per input row; the per-set
+		// keys below are cut out of that one vector. This is the whole point
+		// of the single-pass shape — the source is read once and each row is
+		// routed into every set's hash table.
+		allVals, allKeys, err := o.evalGroupExprs(slot)
 		if err != nil {
 			return err
 		}
-		gr, ok := groups[key]
-		if !ok {
-			// Evaluate passthrough (functionally-determined) columns from the first row.
-			var ptVals Row
-			if len(o.plan.Passthrough) > 0 {
-				ptVals = make(Row, len(o.plan.Passthrough))
-				for i, expr := range o.plan.Passthrough {
-					v, err := evalExprSlot(expr, slot, ctx)
-					if err != nil {
-						ptVals[i] = NullDatum
-					} else {
-						ptVals[i] = v
+		for si, set := range sets {
+			key := o.setGroupKey(si, set, allKeys, multiSet)
+			gr, ok := groups[key]
+			if !ok {
+				// Evaluate passthrough (functionally-determined) columns from the first row.
+				var ptVals Row
+				if len(o.plan.Passthrough) > 0 {
+					ptVals = make(Row, len(o.plan.Passthrough))
+					for i, expr := range o.plan.Passthrough {
+						v, err := evalExprSlot(expr, slot, ctx)
+						if err != nil {
+							ptVals[i] = NullDatum
+						} else {
+							ptVals[i] = v
+						}
 					}
 				}
+				var gv Row
+				if nGroupCols > 0 {
+					gv = make(Row, nGroupCols)
+					for i := range gv {
+						// A column rolled up away at this level is NULL —
+						// the SQL standard's value for it, and what makes
+						// GROUPING(...) necessary to tell it from a real one.
+						gv[i] = NullDatum
+					}
+					for _, ci := range set {
+						gv[ci] = allVals[ci]
+					}
+				}
+				gr = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+				groups[key] = gr
+				order = append(order, key)
 			}
-			gr = &groupRuntime{groupValues: groupValues, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-			groups[key] = gr
-			order = append(order, key)
-		}
 
-		o.currentRowVersion++
-		for i, call := range o.plan.Aggs {
-			// For user-defined aggregates with shared transition state, only the
-			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
-			// skip applyAgg — they will be synced from the leader's final state just
-			// before finishAgg. M0097-0035.
-			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
-				isFollower := false
-				for j := 0; j < i; j++ {
-					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
-						isFollower = true
-						break
+			o.currentRowVersion++
+			for i, call := range o.plan.Aggs {
+				// For user-defined aggregates with shared transition state, only the
+				// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
+				// skip applyAgg — they will be synced from the leader's final state just
+				// before finishAgg. M0097-0035.
+				if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+					isFollower := false
+					for j := 0; j < i; j++ {
+						if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+							isFollower = true
+							break
+						}
+					}
+					if isFollower {
+						continue
 					}
 				}
-				if isFollower {
-					continue
+				if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
+					return err
 				}
-			}
-			if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
-				return err
 			}
 		}
 	}
@@ -2034,7 +2087,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	o.rows = make([]Row, 0, len(order))
-	nGroupCols := len(o.plan.GroupExprs)
+	// emitted[i] is the grouping set that produced o.rows[i]; consumed by the
+	// output sort below. M0125-0048.
+	emitted := make([]int, 0, len(order))
 	for idx, key := range order {
 		// M0062-followup: mirror the input-drain ctx check (line ~629)
 		// on the output-materialisation loop. A 1 M-group aggregate's
@@ -2158,16 +2213,46 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 			out = append(out, d)
 		}
+		// GROUPING(...) columns: the bitmask depends only on which grouping
+		// set produced this row, so it is materialised here rather than
+		// evaluated per row above the node. Emitted between the aggregates
+		// and the passthrough columns, matching the output schema
+		// buildAggregateStage laid out. M0125-0048.
+		for _, masks := range o.plan.GroupingMasks {
+			if gr.setIdx < len(masks) {
+				out = append(out, NewIntDatum(masks[gr.setIdx]))
+			} else {
+				out = append(out, NewIntDatum(0))
+			}
+		}
 		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
+		emitted = append(emitted, gr.setIdx)
 	}
 	// Sort output rows by GROUP BY key columns for deterministic ordering
 	// matching PostgreSQL's sort-based aggregate behavior. Without an explicit
 	// ORDER BY the planner wraps with a Sort node; here we pre-sort by key
 	// so hash-aggregate output is stable and GROUP BY queries without ORDER BY
 	// match PG's sort-aggregate output order. M0097-0117.
+	//
+	// M0125-0048: with grouping sets the sort is per SET first, then by key
+	// within the set. That reproduces exactly what the retired UNION ALL
+	// expansion emitted — one sorted block per branch, in declaration order —
+	// so the row ORDER of every grouping-sets query is unchanged by the
+	// rewrite. rowSets[i] is the set index of o.rows[i]; it is carried
+	// alongside rather than in the row because the set index is not an output
+	// column.
 	if nGroupCols > 0 {
-		sort.SliceStable(o.rows, func(i, j int) bool {
+		rowSets := emitted
+		idxOf := make([]int, len(o.rows))
+		for i := range idxOf {
+			idxOf[i] = i
+		}
+		sort.SliceStable(idxOf, func(a, b int) bool {
+			i, j := idxOf[a], idxOf[b]
+			if rowSets[i] != rowSets[j] {
+				return rowSets[i] < rowSets[j]
+			}
 			ra, rb := o.rows[i], o.rows[j]
 			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
 				c, _ := compareDatum(ra[k], rb[k], 0)
@@ -2180,20 +2265,31 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 			return false
 		})
+		sorted := make([]Row, len(o.rows))
+		for pos, i := range idxOf {
+			sorted[pos] = o.rows[i]
+		}
+		o.rows = sorted
 	}
 	return nil
 }
 
-func (o *aggregateOp) evalGroupKey(slot TupleSlot) (string, Row, error) {
-	if len(o.plan.GroupExprs) == 0 {
-		return "__all__", nil, nil
+// evalGroupExprs evaluates every grouping column of one input row once,
+// returning the values and their per-column key strings. Grouping sets cut
+// their keys out of this one vector (setGroupKey), so a ROLLUP over N levels
+// still evaluates each grouping expression exactly once per row — the whole
+// point of the single-pass shape. M0125-0048.
+func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
+	n := len(o.plan.GroupExprs)
+	if n == 0 {
+		return nil, nil, nil
 	}
-	vals := make(Row, 0, len(o.plan.GroupExprs))
-	parts := make([]string, 0, len(o.plan.GroupExprs))
+	vals := make(Row, 0, n)
+	parts := make([]string, 0, n)
 	for _, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
-			return "", nil, err
+			return nil, nil, err
 		}
 		// M0073-0004 retention boundary: arena-backed Datums
 		// (varchar / char / text / bytea group keys) must be
@@ -2205,7 +2301,28 @@ func (o *aggregateOp) evalGroupKey(slot TupleSlot) (string, Row, error) {
 		vals = append(vals, v)
 		parts = append(parts, datumKey(v))
 	}
-	return strings.Join(parts, "|"), vals, nil
+	return vals, parts, nil
+}
+
+// setGroupKey builds the hash key for grouping set si over one input row's
+// per-column keys. When there is only one set the set index is left out, so
+// an ordinary aggregate keys exactly as it always did.
+func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet bool) string {
+	if len(set) == 0 && !multiSet {
+		return "__all__"
+	}
+	var b strings.Builder
+	if multiSet {
+		b.WriteString(strconv.Itoa(si))
+		b.WriteByte('\x00')
+	}
+	for i, ci := range set {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(allKeys[ci])
+	}
+	return b.String()
 }
 
 func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot TupleSlot) error {

@@ -605,3 +605,75 @@ the fallback's *downside* on TPC-DS, so its two plans are worth capturing side b
 - Still owed: **stage 3**, the **W arms** (§I14), and an SF=1 reading for nothing in
   particular — Q35, the one query SF=1 would be run for, is unmeasurable there
   (M0124-0004: ≈9.1-day floor).
+
+## Closing record — the fourth consumer, and what is left owed (2026-08-06)
+
+This closes M0125-0003. §I19's three outstanding items are discharged, one by measurement,
+one by supersession, and one by the change recorded here.
+
+### I20. The fourth consumer (§I9) is landed — as a tier at stage 2, not as a stage of its own
+
+`reorderCommaFromByCardinality` (`internal/planner/joinorder.go`) no longer bails on
+`Stats.RowCount <= 0`. That guard is now a ladder — stored count, then
+`relSizeFallbackRows(2, cat, tbl)`, then decline — which is the same estimate, through the same
+single gated entry point, that `bushySeedRowCounts` reads at the DP seed.
+
+**Why it does not get a fourth stage, contradicting §I9's own reasoning.** §D4 stages *by
+consumer* so that a regression is attributable to one consumer; §I9 concluded that adding this
+one silently would break that. Both were right at the time and both are now moot, because
+M0127-P5.6 retired stage 3 (`applyRelSizeFallback`, `relsize.go` — the search seam reads a base
+relation's cardinality exactly once, so the second consumer stage 3 existed to sequence no
+longer exists) and the flag's `3` became a documented alias for stage-2 behaviour. What is left
+is a two-valued flag whose stage 2 is *defined* as "the consumers that move the JOIN ORDER".
+This consumer moves the join order and nothing else, so it belongs to that stage by the
+staging's own definition; giving it a `4` would mean shipping it default-off behind a value no
+script sets, which is not attribution, only concealment.
+
+The tier order matters and is pinned: an ANALYZEd relation is still ordered by its stored
+count in both flag states. That is §D3's invariant, and it has to hold at every consumer, not
+only at the one the W arms measured.
+
+### I21. The measured effect is ZERO plan movement — which is the safety evidence, not a null result
+
+TPC-DS SF0.5 plan-shape channel, 99 queries, against the previous capture: **`queries=99
+same=99 changed=0`** (`plans-20260806-191105.txt`). The gate's goopg cluster is restarted for
+the capture, so every relation is in exactly the S-cold state this change is about — the pass
+now *runs* on those lists where it previously declined, and the final plans are byte-identical
+anyway.
+
+The mechanism is M0127-P5.9-r's boundary, read in the other direction: `extractScans` descends
+`JoinTypeCross` only, so a **comma-FROM** list is precisely the shape that *does* reach
+`tryPGShapedJoinSearch`. On everything the new search accepts, the search re-derives the join
+order from the whole relset and the parser-level permutation cannot survive into the plan.
+So the live consumers of this pass are now the cases where the search declines: an
+explicit-`JOIN` FROM clause (which never reaches it), a relset over the search's limit, and any
+leaf shape the seam's whitelist rejects. After M0127-P6.3 demotes `joinorder.go` to the
+over-limit sequencer, that residue is the *only* join-order chooser those queries get, and it
+would have been the blind one.
+
+Two consequences worth stating plainly: the TPC-DS sweep was not re-run, because identical plan
+text for all 99 queries means identical execution and the plan channel exists exactly to license
+that; and no performance claim is made for this change on either benchmark family.
+
+### I22. §I19's other two items
+
+- **The W arms are MEASURED, not owed** — resolved 2026-07-30 by M0125-0031's first motion
+  (`analysis/m0125-0031-warm-tpch-20260730.md`): warm stream 413.3 s (w1, flag off) vs 420.1 s
+  (w2, stage 2), with `plan-diff` 22/22 MATCH in both `structural` and `strict-text` mode. §D3's
+  "flag-on == flag-off when ANALYZEd" invariant is confirmed byte-for-byte rather than resting on
+  `relSizeFallbackRows`' early return. Both blockers §I14 measured were removed as that row
+  predicted: M0125-0028 made `ANALYZE lineitem` resolve in database `tpch`, and M0125-0029 made
+  its output durable and cross-connection, so the harness's one-time warm-up pass replaced the
+  planned `cmd/tpch-runner -analyze` flag (retired unimplemented — nothing needs it).
+- **Stage 3 is superseded, not deferred** — M0127-P5.6's roll-up (`leftdeep-joins` 04 §2.1)
+  re-derived its placement as `applyRelSizeFallback` at the search seam, where the block-derived
+  count is `estimate_rel_size`'s pre-filter `tuples` and `set_baserel_size_estimates`'
+  `clauselist_selectivity` scales it. §I8's shadowing hazard died with the second consumer.
+
+### I23. What this still does NOT do
+
+`estimateRelSize` remains blind to plain (non-partition) inheritance parents — `hasSubclass` is
+`len(tbl.PartitionKey) > 0`, so an inheritance parent with children can take upstream's 10-page
+floor when it should not (I4's divergence, ledger). And nothing here touches
+`pg_class.reltuples`, which reads `Stats.RowCount` directly and still reports 0 after a restart:
+the fallback is a planner-internal estimate, exactly as `estimate_rel_size` is upstream.

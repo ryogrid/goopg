@@ -186,11 +186,6 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 	case *WindowAgg:
 		x.Child = walkRewriteNLI(x.Child, cat)
 		return x
-	case *MultiHashJoin:
-		for i := range x.Tables {
-			x.Tables[i] = walkRewriteNLI(x.Tables[i], cat)
-		}
-		return x
 	case *NestedLoopIndexJoin:
 		x.Outer = walkRewriteNLI(x.Outer, cat)
 		// Inner is *IndexScan — leaf; nothing to recurse.
@@ -490,37 +485,35 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 
 	// M0063-0001 / M0064: re-bind each outer-side Key's
 	// ColumnRef.Index against the chosen `outerNode.Output()`
-	// schema by Name — but only when `outerNode` is a
-	// *MultiHashJoin. That's the shape where (a) the upstream
-	// rewrite OID-sorted (or otherwise reordered) the joined
-	// output schema, and (b) the j.Predicate's ColumnRef indices
-	// were resolved at parse time against the FROM-cumulative
-	// layout and so disagree with the runtime row layout the MHJ
-	// actually produces (Q8's `l_partkey` rebind 40 → 42, where
-	// 40 maps to `l_quantity` in the OID-sorted layout).
+	// schema by Name — but only for the outer kinds where an
+	// upstream rewrite reordered the joined output schema while
+	// the j.Predicate's ColumnRef indices stayed at the
+	// parse-time FROM-cumulative layout, so the two disagree with
+	// the runtime row layout. (Until M0127-P6.2 the exemplar was a
+	// *MultiHashJoin outer: Q8's `l_partkey` rebind 40 → 42, where
+	// 40 maps to `l_quantity` in the OID-sorted packed layout.)
 	//
 	// For *NestedLoopIndexJoin outers (Q9's chained-NLI shape)
-	// the downstream remap walkers (`remapExprRefsToMHJ`,
+	// the downstream remap walkers (`remapColumnRefsAfterRewrite`,
 	// `remapWithBindings`) leave NLI keys in their pre-rewrite
 	// indices on purpose; rebinding here would move the probe
 	// onto a different table's column at runtime even though the
-	// schema annotation looks OID-sorted (Q9's `l_suppkey` 15 → 24
+	// schema annotation looks reordered (Q9's `l_suppkey` 15 → 24
 	// regression). For other outer kinds (SeqScan, Filter, …) the
 	// Index space matches the runtime layout directly and rebind
 	// is unnecessary.
-	_, outerIsMHJ := outerNode.(*MultiHashJoin)
 	_, outerIsNLI := outerNode.(*NestedLoopIndexJoin)
 	outerJoin, outerIsJoin := outerNode.(*Join)
 	outerSchema := outerNode.Output()
 	if outerIsJoin {
 		// A binary Join outer may already have a rewritten child
-		// (typically an MHJ) even though its cached schema still
-		// reflects the pre-rewrite layout. Refresh it before we
+		// even though its cached schema still reflects the
+		// pre-rewrite layout. Refresh it before we
 		// bind NLI probe keys against the outer row coordinates.
 		reresolveJoinByName(outerJoin)
 		outerSchema = outerJoin.Output()
 	}
-	if outerIsMHJ || outerIsNLI || outerIsJoin {
+	if outerIsNLI || outerIsJoin {
 		// M0075-0002: for *NestedLoopIndexJoin outers
 		// (Q9's chained-NLI shape) the rebind needs the per-
 		// outer selectivity guard. M0072-0002 attempted the
@@ -989,6 +982,12 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 		if !isBTreeIndex(idx) {
 			continue
 		}
+		// Partial index without a proven predicate — decline, same rule and
+		// reason as `findBTreeIndexForColumn` / `addOneOrderedIndexPath`.
+		// A parameterized inner-side scan drops rows just as silently.
+		if idx.HasPredicate {
+			continue
+		}
 		if len(idx.Columns) == 0 {
 			continue
 		}
@@ -1315,8 +1314,8 @@ func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *
 		// o_orderkey / n_nationkey probes). Reject iff NLI's probe work
 		// exceeds the hash alternative (one inner build + O(1) per outer).
 		// The production integer DP keeps the historical outer-row
-		// heuristic (its plans are snapshot-pinned and it reaches the star
-		// join via MultiHashJoin, not this fan-out NLI). When stats are
+		// heuristic (its plans are snapshot-pinned and it reached the star
+		// join via the packed node, not this fan-out NLI). When stats are
 		// absent (goopg's in-memory ANALYZE is lost on restart — the
 		// common case) the formula falls back to that same heuristic, so
 		// NLI is never permanently disabled.
@@ -1324,7 +1323,7 @@ func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *
 			// Composite-index exact probe MUST stay NLI. pickIndexCoveringAllLeadingColumns
 			// only returns a multi-column index when EVERY leading column is bound by an
 			// equi-conjunct, so this NLI probes the whole composite key exactly (matchSet=1,
-			// no fan-out). The hash alternative cannot: goopg's hash/MHJ join keys on a
+			// no fan-out). The hash alternative cannot: goopg's hash join keys on a
 			// SINGLE column, so a composite join hashes on one key column and fans out on the
 			// rest — Q9's partsupp on ps_partkey alone fans each row ~4× to 24M and OOMs.
 			// The integer planner keeps partsupp as an NLI for exactly this reason

@@ -141,10 +141,6 @@ func hasCrossJoin(node Node) bool {
 		return hasCrossJoin(n.Child)
 	case *Aggregate:
 		return hasCrossJoin(n.Child)
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			if hasCrossJoin(tbl) { return true }
-		}
 	}
 	return false
 }
@@ -288,14 +284,6 @@ func findSubqueryInPlanRecursive(node Node) bool {
 	if node == nil {
 		return false
 	}
-	if mh, ok := node.(*MultiHashJoin); ok {
-		for _, tbl := range mh.Tables {
-			if findSubqueryInPlanRecursive(tbl) {
-				return true
-			}
-		}
-		return false
-	}
 	return findSubqueryInPlan(node)
 }
 
@@ -322,17 +310,6 @@ func hasHashJoinWithAggregateChild(node Node) bool {
 		return hasHashJoinWithAggregateChild(n.Child)
 	case *Aggregate:
 		return hasHashJoinWithAggregateChild(n.Child)
-	case *MultiHashJoin:
-		return hasHashJoinWithAggregateChildInNode(n)
-	}
-	return false
-}
-
-func hasHashJoinWithAggregateChildInNode(n *MultiHashJoin) bool {
-	for _, tbl := range n.Tables {
-		if hasHashJoinWithAggregateChild(tbl) {
-			return true
-		}
 	}
 	return false
 }

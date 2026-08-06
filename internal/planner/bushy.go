@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -23,20 +22,12 @@ import (
 // and `SetCostDrivenJoinOrder` stay until S7 deletes the old subset-bitmask DP
 // they belong to (08 §4), because the kill-switch arm still runs that DP and
 // its tests still need to reach both of its argmins.
-func init() {
-	// M0126-0005 measurement-only: force packing off independently of
-	// join-order, so the A/B measures the cascade cost without
-	// conflating two variables (F12 trap).
-	if mhjPackingOffFromEnv(os.Getenv("GOOPG_MHJ_PACKING_OFF")) {
-		mhjPackingEnabled = false
-	}
-}
-
-// mhjPackingOffFromEnv is the measurement switch's polarity, factored out of
-// init for the provenance table (flaglabels.go); see memoizeFromEnv. Note the
-// inverted name: this variable turns packing OFF, so its unset label reads
-// `unset(off)` for "the off-switch is not engaged".
-func mhjPackingOffFromEnv(v string) bool { return v == "1" }
+//
+// GOOPG_MHJ_PACKING_OFF is likewise RETIRED (M0127-P6.2, 2026-08-07), and this
+// time the mechanism goes with the hook: it was M0126-0005's measurement-only
+// switch for forcing MultiHashJoin packing off independently of join-order,
+// and P6.2 deletes the packer it switched (08 §4). An off-switch for a feature
+// that no longer exists has nothing left to turn off.
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
 // FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)
@@ -134,8 +125,11 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// FROM list that contains non-table leaf nodes.
 	for _, scan := range scans {
 		switch scan.(type) {
-		case *SeqScan, *IndexScan, *MultiHashJoin:
+		case *SeqScan, *IndexScan:
 			// OK — buildBindingsPosMap can remap these.
+			// `*MultiHashJoin` was a third admitted leaf until
+			// M0127-P6.2 deleted the node (08 §4); no packed node
+			// can appear in `scans` any more.
 		default:
 			return node, pred
 		}
@@ -170,17 +164,18 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// before buildJoinGraph; they get attached to leaf
 	// scans below as Filter wrappers AFTER the bushy DP
 	// picks a binary tree. This preserves Q5's binary
-	// shape because the existing collectMultiHashTables
-	// path declines on Filter(SeqScan) leaves.
+	// shape because the MHJ packer's chain detector
+	// declined on Filter(SeqScan) leaves (both gone at
+	// M0127-P6.2; the partitioning itself is unchanged).
 	//
-	// shouldAttachBeforeMHJ gates the rollout: only
+	// shouldAttachLocalFiltersBeforeSearch gates the rollout: only
 	// FROM-clauses with ≥ 5 tables (the shape that
 	// triggers MultiHashJoin packing) get pre-MHJ
 	// attachment. Smaller queries keep their pre-M0077
 	// behaviour. See docs/design/fix-for-q5/01.
 	var locals relationLocalFilters
 	dpConjuncts := conjuncts
-	if shouldAttachBeforeMHJ(ctx.bindings, scans) {
+	if shouldAttachLocalFiltersBeforeSearch(ctx.bindings, scans) {
 		// Build cumOffsets matching the bindings'
 		// FROM-cumulative output coordinates.
 		cumOffsets := make([]int, len(ctx.bindings)+1)
@@ -586,22 +581,12 @@ func SetCostDrivenJoinOrder(v bool) bool {
 	return prev
 }
 
-// mhjPackingEnabled controls whether planSelect packs binary hash-join
-// chains into a MultiHashJoin (rewriteMultiWayChain). PG has no MHJ;
-// the cost-driven planner drops it (ch. 12 §3) so the DP's PG-shaped
-// binary tree is final and the order-then-rewrite mismatch that
-// regressed Q9 cannot recur. Default ON to preserve the current
-// (non-cost-driven) planner; SetCostDrivenJoinOrder(true) should be
-// paired with SetMHJPackingEnabled(false).
-var mhjPackingEnabled = false
-
-// SetMHJPackingEnabled toggles MultiHashJoin packing. Returns the
-// previous value.
-func SetMHJPackingEnabled(v bool) bool {
-	prev := mhjPackingEnabled
-	mhjPackingEnabled = v
-	return prev
-}
+// `mhjPackingEnabled`/`SetMHJPackingEnabled` gated whether planSelect packed
+// binary hash-join chains into a MultiHashJoin. Deleted by M0127-P6.2 with the
+// packer itself (08 §4): PG has no MHJ, so the PG-shaped search's binary tree
+// is final and the order-then-rewrite mismatch that regressed Q9 cannot recur.
+// The flag had been default-off since M0126-0005, so nothing production ever
+// reached the packed shape after that.
 
 // nliCostDelegation, when true (default under cost-driven order), makes
 // the DP cost each candidate join as the method rewriteJoinsToNLI will
@@ -1598,201 +1583,24 @@ func markEdgesInMask(mask uint16, g *joinGraph, used []bool) {
 	}
 }
 
-// collectMultiHashTables walks a left-deep chain of hash joins and
-// collects the SeqScan leaf nodes. Returns the scan nodes in join
-// order, the join keys for each edge, the probe table index, and
-// any extra residual conjuncts that were ANDed onto Inner-Hash
-// joins by `pushOneConjunct` (which the original chain detection
-// silently dropped because it only inspected `j.LeftKey` /
-// `j.RightKey`). Returns (nil, nil, 0, nil) when the tree is not a
-// valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
-func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
-	var scans []Node
-	var keys []MultiHashKey
-	var extras []Expr
+// `collectMultiHashTables` + `isCanonicalKeyEquality` lived here until
+// M0127-P6.2 (08 §4). They were the MultiHashJoin packer's chain detector:
+// walk a left-deep all-inner hash cascade, resolve each edge's keys by column
+// NAME (DFS collection order and FROM order disagree for a restructured tree),
+// fail closed unless the N scans are joined by exactly N-1 keys forming a
+// simple chain, then pick the widest scan as the probe. All of it died with
+// the node it packed. `join_hash_keys.go` carries the surviving statement of
+// the canonical-equality convention the detector relied on.
 
-	var walk func(n Node) bool
-	walk = func(n Node) bool {
-		if s, ok := n.(*SeqScan); ok {
-			scans = append(scans, s)
-			return true
-		}
-		// Stop at scope boundaries: aggregate, sort, project,
-		// filter — these represent query phases, not join trees.
-		if _, ok := n.(*Aggregate); ok {
-			return false
-		}
-		if _, ok := n.(*Sort); ok {
-			return false
-		}
-		if _, ok := n.(*Project); ok {
-			return false
-		}
-		if _, ok := n.(*Filter); ok {
-			return false
-		}
-		j, ok := n.(*Join)
-		if !ok || j.Algo != JoinAlgoHash || j.Type != JoinTypeInner {
-			return false
-		}
-		leftStart := len(scans)
-		if !walk(j.Left) {
-			return false
-		}
-		leftEnd := len(scans) // right subtree starts here
-		if !walk(j.Right) {
-			return false
-		}
-		rightEnd := len(scans)
-		// Capture extras AND'd onto j.Predicate beyond the canonical
-		// `LeftKey = RightKey` equality, but ONLY when every
-		// ColumnRef in the extra references a column NAME present
-		// in some scan inside the MHJ's subset. pushOneConjunct's
-		// width-based side classification can mis-push a conjunct
-		// onto a Join whose subtree doesn't actually contain the
-		// referenced tables (e.g. TPC-H Q9 pushes
-		// `ps_partkey = l_partkey` onto a 4-table Inner Join that
-		// doesn't include partsupp because the global FROM index of
-		// ps_partkey happens to fall inside that Join's
-		// subset-FROM-order width range). Capturing such conjuncts
-		// into MHJ.Filters would attempt to evaluate them on the
-		// MHJ output row where the ps_partkey column doesn't exist,
-		// producing wrong results. The conjunct is left in the
-		// outer Filter where the bindings posMap will remap it to
-		// actual scan offsets and the post-join evaluation will
-		// see all tables.
-		for _, c := range splitAnd(j.Predicate) {
-			if isCanonicalKeyEquality(c, j.LeftKey, j.RightKey) {
-				continue
-			}
-			if extraInScans(c, scans) {
-				extras = append(extras, c)
-			}
-		}
-
-		// Determine which scan and column the left/right join keys
-		// reference.  We resolve by column name rather than by
-		// ColumnRef.Index, because remapKeyToSubset (called from
-		// buildJoinFromDP) produces FROM-order indices while the
-		// tree walk collects scans in DFS order — the two orders
-		// may differ for bushy DP trees.  Column names are
-		// unique (prefixed by table), so the lookup is unambiguous.
-		li, lc := findScanByColName(scans, leftStart, leftEnd, j.LeftKey)
-		ri, rc := findScanByColName(scans, leftEnd, rightEnd, j.RightKey)
-		if li >= 0 && ri >= 0 {
-			keys = append(keys, MultiHashKey{
-				LeftTable:  li,
-				LeftCol:    lc,
-				RightTable: ri,
-				RightCol:   rc,
-			})
-		}
-		return true
-	}
-	if !walk(node) || len(scans) < 3 {
-		return nil, nil, 0, nil
-	}
-
-	// M0126-0001 Stage −1: a tree of N scans must have exactly N−1
-	// join keys connecting them. Fewer keys means at least one table
-	// is unreached and would be silently NULL-padded — a
-	// silent-wrong-answer path (bundle Stage −1, risk R1). Fail
-	// closed: decline to pack.
-	if len(keys) != len(scans)-1 {
-		return nil, nil, 0, nil
-	}
-
-	// Verify the keys form a simple chain: each table may appear
-	// at most twice (once as "source", once as "destination").
-	// Star graphs (e.g. lineitem at the centre of Q9) cannot be
-	// expressed as a single chain; the MultiHashJoin probe loop
-	// only follows one path through the keys.
-	chainOK := true
-	tableDeg := make([]int, len(scans))
-	for _, k := range keys {
-		tableDeg[k.LeftTable]++
-		tableDeg[k.RightTable]++
-	}
-	for _, d := range tableDeg {
-		if d > 2 {
-			chainOK = false
-			break
-		}
-	}
-	if !chainOK {
-		return nil, nil, 0, nil
-	}
-
-	// Determine probe table: the one with the largest row count.
-	probeIdx := 0
-	probeRows := int64(0)
-	for i, s := range scans {
-		if r := EstimateRows(s); r > probeRows {
-			probeRows = r
-			probeIdx = i
-		}
-	}
-	return scans, keys, probeIdx, extras
-}
-
-// isCanonicalKeyEquality reports whether c is the canonical
-// `LeftKey = RightKey` BinaryOp produced by buildJoinFromDP /
-// pushOneConjunct's CROSS→Inner promotion. Used to filter that
-// canonical equality out when capturing extras from a Join's
-// AND'd Predicate.
-func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
-	bin, ok := c.(*BinaryOp)
-	if !ok || bin.Op != parser.OpEq {
-		return false
-	}
-	return bin.Left == leftKey && bin.Right == rightKey
-}
-
-// IsCanonicalKeyEquality is the exported wrapper.
-// M0126-0006: the runtime fusion predicate in the executor needs it.
-func IsCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
-	return isCanonicalKeyEquality(c, leftKey, rightKey)
-}
-
-// extraInScans reports whether every ColumnRef in c references a
-// column name that appears in the output schema of at least one
-// scan in scans. Used to validate that an MHJ.Filters extra
-// belongs to the MHJ's subset before capturing it.
-//
-// M0125-0002 commit 7 — the fail-open this whole series was scoped
-// around. `allMatched` starts true and is only ever falsified from
-// INSIDE the callback, so before the conversion a conjunct built
-// entirely from kinds the 7-arm walker did not enumerate produced
-// ZERO callbacks and was admitted into MultiHashJoin.Filters on a
-// vacuous true (design doc §"Why this is not just fixing stale
-// indices"). The second result of visitColumnRefsByName closes it:
-// "the name test did not cover c" is NOT MATCHED, never matched.
-// D3 predetermined this inversion before a line was written.
-func extraInScans(c Expr, scans []Node) bool {
-	allMatched := true
-	total := visitColumnRefsByName(c, func(name string) {
-		found := false
-		for _, s := range scans {
-			ss, ok := s.(*SeqScan)
-			if !ok {
-				continue
-			}
-			for _, col := range ss.Output() {
-				if col.Name == name {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			allMatched = false
-		}
-	})
-	return total && allMatched
-}
+// `extraInScans` lived here until M0127-P6.2. It was the packer's admission
+// guard for residual conjuncts destined for `MultiHashJoin.Filters`, and the
+// fail-open that M0125-0002 commit 7 was scoped around: `allMatched` starts
+// true and is only falsified from inside the callback, so a conjunct built
+// entirely from kinds the pre-conversion 7-arm walker did not enumerate
+// produced ZERO callbacks and was admitted on a vacuous true. The second
+// result of `visitColumnRefsByName` closed it — and that inversion outlives
+// this caller: `pushdown.go`'s two consumers still seed `true` and still rely
+// on "the name test did not cover c" reading as NOT MATCHED.
 
 // visitColumnRefsByName invokes fn on each named ColumnRef in e and
 // reports whether the name test COVERED e — i.e. every node of e was
@@ -1860,134 +1668,17 @@ func visitColumnRefsByName(e Expr, fn func(string)) bool {
 	return total
 }
 
-// findScanByColName resolves a join-key ColumnRef to a
-// (scan-index, column-within-scan) pair by matching the column
-// name against scans[start..end).  Column names are unique per
-// table (TPC-H prefixes: p_partkey, s_suppkey, …) so the lookup
-// is unambiguous.  Returns (-1, 0) when the key type is not a
-// ColumnRef or the name is not found.
-func findScanByColName(scans []Node, start, end int, key Expr) (scanIdx int, colIdx int) {
-	cr, ok := key.(*ColumnRef)
-	if !ok {
-		return -1, 0
-	}
-	for i := start; i < end; i++ {
-		s, ok := scans[i].(*SeqScan)
-		if !ok {
-			continue
-		}
-		for j, col := range s.Output() {
-			if col.Name == cr.Name {
-				return i, j
-			}
-		}
-	}
-	return -1, 0
-}
-
-// rewriteMultiWayChain walks the plan tree and replaces chains of
-// ≥3 hash-joined tables with MultiHashJoin nodes. The catalog
-// argument is forwarded to `rewriteMHJInputsWithSingleTablePredicates`
-// so single-table constant-RHS filters can promote their input scan
-// from `SeqScan` to `IndexScan` (M0054-0006a-pre).
-func rewriteMultiWayChain(node Node, cat catalog.Catalog) Node {
-	if node == nil {
-		return nil
-	}
-	// M0127-P5.9-b (08 §3): never pack a searched tree. PG has no MHJ, the
-	// search's binary cascade IS the plan it costed, and the packer re-sorts
-	// the leaf layout — the order-then-rewrite mismatch that regressed Q9
-	// (ch. 12 §3). `mhjPackingEnabled` is off by default, so this guard is for
-	// the env that turns it back on.
-	if isSearchedTree(node) {
-		return node
-	}
-	scans, keys, probeIdx, extras := collectMultiHashTables(node)
-	if scans == nil {
-		// Not a valid chain — recurse into children.
-		// Only recurse into Join (binary ops) and thin wrappers
-		// (Filter, Project, Sort). Do NOT recurse into Aggregate:
-		// crossing a plan-phase boundary mixes table scopes.
-		switch n := node.(type) {
-		case *Join:
-			n.Left = rewriteMultiWayChain(n.Left, cat)
-			n.Right = rewriteMultiWayChain(n.Right, cat)
-		case *Filter:
-			n.Child = rewriteMultiWayChain(n.Child, cat)
-		case *Project:
-			n.Child = rewriteMultiWayChain(n.Child, cat)
-		case *Sort:
-			n.Child = rewriteMultiWayChain(n.Child, cat)
-		}
-		return node
-	}
-
-	// Build MultiHashJoin node.
-	mh := &MultiHashJoin{
-		pos:        node.Pos(),
-		Tables:     scans,
-		Keys:       keys,
-		ProbeTable: probeIdx,
-		Filters:    extras,
-	}
-	// Sort the tables (scans) by catalog OID so the output
-	// schema is in FROM-clause (table-creation) order, matching
-	// the binary join tree that was replaced.  Without this
-	// sort, the schema is in DFS tree-walk order which differs
-	// for bushy DP trees and would require downstream ColumnRef
-	// remapping.
-	//
-	// The sort also remaps the MultiHashKey table indices and
-	// the probe table index.
-	type idxEntry struct {
-		idx  int
-		oid  uint32
-		scan *SeqScan
-	}
-	items := make([]idxEntry, len(scans))
-	for i, s := range scans {
-		items[i] = idxEntry{idx: i, scan: s.(*SeqScan), oid: s.(*SeqScan).Table.OID}
-	}
-	byOID := func(i, j int) bool { return items[i].oid < items[j].oid }
-	for i := range items {
-		for j := i + 1; j < len(items); j++ {
-			if byOID(j, i) {
-				items[i], items[j] = items[j], items[i]
-			}
-		}
-	}
-	// Build old-to-new scan index mapping.
-	oldToNew := make([]int, len(scans))
-	sortedScans := make([]Node, len(scans))
-	for newIdx, item := range items {
-		oldToNew[item.idx] = newIdx
-		sortedScans[newIdx] = scans[item.idx]
-	}
-	// Update keys and probe table.
-	for i := range keys {
-		keys[i].LeftTable = oldToNew[keys[i].LeftTable]
-		keys[i].RightTable = oldToNew[keys[i].RightTable]
-	}
-	mh.Tables = sortedScans
-	mh.ProbeTable = oldToNew[probeIdx]
-
-	// Build output schema from all tables (now in FROM order).
-	fullSchema := make(Schema, 0)
-	for _, s := range sortedScans {
-		fullSchema = append(fullSchema, s.Output()...)
-	}
-	mh.schema = fullSchema
-
-	// M0054-0006a-pre: rewrite SeqScan inputs to IndexScan whenever a
-	// single-table constant-RHS filter from `mh.Filters` admits a
-	// usable B-tree index. Closes the M0054-0003d Q8 gap
-	// (`p_type = 'ECONOMY ANODIZED STEEL'` → `Index Scan using
-	// idx_part_type on part`). Mutates mh in place; absorbed
-	// conjuncts are removed from mh.Filters.
-	rewriteMHJInputsWithSingleTablePredicates(mh, cat)
-
-	return mh
-}
+// `findScanByColName` and `rewriteMultiWayChain` lived here until M0127-P6.2
+// (08 §4). `rewriteMultiWayChain` was the packing pass planSelect ran after
+// join-order search: detect a chain, build the `MultiHashJoin`, OID-sort its
+// tables so the packed schema matched the FROM order of the binary tree it
+// replaced, then hand the node to `rewriteMHJInputsWithSingleTablePredicates`
+// to promote SeqScan inputs to IndexScan. Its own guard already refused to
+// pack a searched tree (`isSearchedTree`, M0127-P5.9-b) because the packer
+// re-sorted the leaf layout the search had costed — the order-then-rewrite
+// mismatch that regressed Q9. With the PG-shaped search as the only search,
+// that guard covered every production call, so the pass was already a no-op
+// before it was deleted.
 
 // remapExprRefsToMHJ walks the plan tree and remaps ColumnRef
 // indices.  It first looks for a MultiHashJoin and uses its
@@ -2053,8 +1744,6 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 	}
 
 	switch n := node.(type) {
-	case *MultiHashJoin:
-		return
 	case *Join:
 		remapPosMapAfterRewrite(n.Left, nil)
 		// M0062-0005: Semi / Anti joins carry an isolated subquery
@@ -2078,14 +1767,11 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 			return
 		}
 		remapPosMapAfterRewrite(n.Child, nil)
-		// Only use MHJ posMap (OID‑based); binaryTreePosMapOf is
-		// disabled here because it assumes OID order == FROM order
-		// which is not always true — remapWithBindings handles that
-		// case using the actual FROM‑clause bindings.
-		pm := mhjPosMapOf(n.Child)
-		if pm != nil {
-			remapByPosMap(&n.Predicate, pm)
-		}
+		// The OID-keyed `mhjPosMapOf` that used to run here returned nil
+		// unconditionally (its own comment: OID order is not FROM order, and
+		// it collapsed self-join duplicates) and M0127-P6.2 deleted it with
+		// the rest of the MHJ family. `remapWithBindings`' bindings-keyed
+		// posMap is and was the pass that actually remaps this arm.
 		subRemap([]Expr{n.Predicate})
 		return
 	case *Project:
@@ -2094,42 +1780,16 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 			return
 		}
 		remapPosMapAfterRewrite(n.Child, nil)
-		pm := mhjPosMapOf(n.Child)
-		if pm != nil {
-			for i := range n.Targets {
-				remapByPosMap(&n.Targets[i], pm)
-			}
-		}
 		subRemap(n.Targets)
 		return
 	case *Sort:
 		remapPosMapAfterRewrite(n.Child, nil)
-		pm := mhjPosMapOf(n.Child)
-		if pm != nil {
-			for i := range n.Keys {
-				remapByPosMap(&n.Keys[i].Expr, pm)
-			}
-		}
 		for i := range n.Keys {
 			subRemap([]Expr{n.Keys[i].Expr})
 		}
 		return
 	case *Aggregate:
 		remapPosMapAfterRewrite(n.Child, nil)
-		pm := mhjPosMapOf(n.Child)
-		if pm != nil {
-			for i := range n.GroupExprs {
-				remapByPosMap(&n.GroupExprs[i], pm)
-			}
-			for i := range n.Aggs {
-				if n.Aggs[i].Arg != nil {
-					remapByPosMap(&n.Aggs[i].Arg, pm)
-				}
-				if n.Aggs[i].Arg2 != nil {
-					remapByPosMap(&n.Aggs[i].Arg2, pm)
-				}
-			}
-		}
 		subRemap(n.GroupExprs)
 		for i := range n.Aggs {
 			if n.Aggs[i].Arg != nil {
@@ -2143,50 +1803,10 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 	}
 }
 
-// binaryTreePosMapOf collects SeqScan leaves from a binary join
-// tree (traversing through thin wrappers), sorts them by OID
-// (FROM order), and returns a position map from old (FROM-order)
-// to new (DFS‑order) positions.
-func binaryTreePosMapOf(node Node) func(int) int {
-	var scans []Node
-	var collect func(Node)
-	collect = func(n Node) {
-		if n == nil {
-			return
-		}
-		switch x := n.(type) {
-		case *SeqScan:
-			scans = append(scans, x)
-		case *Join:
-			collect(x.Left)
-			collect(x.Right)
-		case *Filter:
-			collect(x.Child)
-		case *Project:
-			collect(x.Child)
-		case *Sort:
-			collect(x.Child)
-		case *Aggregate:
-			collect(x.Child)
-		}
-	}
-	collect(node)
-	if len(scans) < 3 {
-		return nil // 2‑table trees are left‑deep (FROM order)
-	}
-	// Build MHJ-like posMap from these scans.
-	mh := &MultiHashJoin{Tables: make([]Node, len(scans))}
-	for i, s := range scans {
-		mh.Tables[i] = s
-	}
-	return buildMHJPosMap(mh)
-}
-
-// remapExprRefsToMHJ is the old entry point; use
-// remapColumnRefsAfterRewrite instead.
-func remapExprRefsToMHJ(node Node) Node {
-	return remapColumnRefsAfterRewrite(node)
-}
+// `binaryTreePosMapOf` (dead — nothing had called it for several milestones)
+// and `remapExprRefsToMHJ` (a one-line alias for `remapColumnRefsAfterRewrite`,
+// kept only because callers predated the rename) were deleted by M0127-P6.2
+// along with the `buildMHJPosMap` they fed.
 
 // remapWithBindings applies a bindings‑based position remap to the
 // join‑tree portion of node (everything below any Aggregate).  It
@@ -2338,22 +1958,15 @@ func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
 	}
 }
 
-// mhjPosMapOf was a position map keyed by table OID, intended to
-// remap FROM‑order ColumnRef indices into the MHJ's OID‑sorted
-// output. The implementation was fundamentally broken: it assumed
-// FROM‑order == OID‑order (false whenever the FROM list isn't in
-// table‑creation order, which is most TPC‑H queries), and it
-// collapsed duplicate OIDs (self‑joins like TPC‑H Q7's
-// `nation n1, nation n2` where both scans share the nation OID).
-// The bindings‑based posMap (`buildBindingsPosMap`, used by
-// `remapWithBindings`) correctly handles both cases — it has access
-// to the actual FROM order via `rangeBinding.offset` and uses
-// `scanKey{table, alias}` to disambiguate self‑joins.
-//
-// Returning nil here makes the first remap pass a no‑op for all
-// node arms; the second (bindings) pass handles everything that
-// matters.
-func mhjPosMapOf(node Node) func(int) int { return nil }
+// `mhjPosMapOf` was a position map keyed by table OID, meant to remap
+// FROM-order ColumnRef indices into the MHJ's OID-sorted output order. It was
+// already a permanent `return nil` before M0127-P6.2 deleted it: OID order is
+// FROM order only when the FROM list happens to be in table-creation order
+// (false for most TPC-H queries), and it collapsed duplicate OIDs, so self
+// joins like Q7's `nation n1, nation n2` mapped both scans onto one entry.
+// `buildBindingsPosMap` (via `remapWithBindings`) is the posMap that handles
+// both cases, because it reads the real FROM order off `rangeBinding.offset`
+// and disambiguates self-joins with `scanKey{table, alias}`.
 
 // remapByPosMap rewrites every same-scope ColumnRef.Index in *e through
 // posMap — a position map built from the MultiHashJoin's bindings, so it
@@ -2511,60 +2124,9 @@ func remapOuterRefsInSubplan(node Node, depth int, posMap func(int) int) {
 	walkPlanExprs(node, visit)
 }
 
-// buildMHJPosMap returns a position map from old (FROM‑order
-// binary tree) column positions to new (MHJ DFS‑order) column
-// positions for the given MultiHashJoin.  The map uses table
-// OIDs to correctly disambiguate duplicate column names.
-func buildMHJPosMap(mh *MultiHashJoin) func(int) int {
-	type tblInfo struct {
-		oid uint32
-		off int
-		w   int
-	}
-	infos := make([]tblInfo, len(mh.Tables))
-	off := 0
-	for i, t := range mh.Tables {
-		if s, ok := t.(*SeqScan); ok {
-			infos[i] = tblInfo{oid: s.Table.OID, off: off, w: len(s.Output())}
-			off += len(s.Output())
-		}
-	}
-	// Sort by OID to get FROM‑order.
-	sorted := make([]tblInfo, len(infos))
-	copy(sorted, infos)
-	for i := range sorted {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[i].oid > sorted[j].oid {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-	fromWidth := 0
-	for i := range sorted {
-		fromWidth += sorted[i].w
-	}
-	return func(oldIdx int) int {
-		if oldIdx < 0 || oldIdx >= fromWidth {
-			return oldIdx
-		}
-		off2 := 0
-		for si := range sorted {
-			w := sorted[si].w
-			if oldIdx >= off2 && oldIdx < off2+w {
-				colIdx := oldIdx - off2
-				targetOID := sorted[si].oid
-				for ei := range infos {
-					if infos[ei].oid == targetOID {
-						return infos[ei].off + colIdx
-					}
-				}
-				break
-			}
-			off2 += w
-		}
-		return oldIdx
-	}
-}
+// `buildMHJPosMap` — old (FROM-order binary tree) → new (MHJ DFS-order)
+// column positions, keyed by table OID — was deleted with the node by
+// M0127-P6.2. `buildBindingsPosMap` below is the surviving position map.
 
 // buildBindingsPosMap collects all SeqScan leaves from node (in DFS
 // order) and builds a position map from FROM‑clause offsets (as
@@ -2619,43 +2181,26 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			// can disambiguate when one side flips to IndexScan.
 			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
-		case *MultiHashJoin:
-			// M0125-0013: recurse through `collect` instead of
-			// matching bare scans inline. An MHJ table is NOT
-			// always a bare scan: pushSingleSourceFiltersIntoMHJTables
-			// wraps Tables[i] in a *Filter when it pushes a
-			// single-source conjunct down (and, for >=5-table FROM
-			// clauses, so does attachRelationLocalFilters). The old
-			// two-case switch silently skipped such a table — it
-			// recorded no scanEntry AND never advanced `off`, so
-			// every table to its RIGHT got an offset short by the
-			// skipped table's width, while the skipped table's own
-			// columns kept their FROM-cumulative index. Both halves
-			// then landed in a different relation's columns: TPC-DS
-			// Q47 returned s_county for d_year and a d_date_sk for
-			// s_store_sk, with the row COUNT still correct because
-			// only the top projection was misremapped.
-			//
-			// This is the same silent-fallthrough defect the
-			// `default:` arm below was hardened against in RC-2; the
-			// MHJ loop simply never received that fix. `collect`
-			// treats *SeqScan / *IndexScan exactly as the old code
-			// did (M0062-0002 alias preservation included), sees
-			// through the *Filter wrapper via its pass-through arm,
-			// and declines the whole remap on anything it cannot
-			// classify — the documented safe direction.
-			for _, t := range x.Tables {
-				collect(t)
-			}
+		// A `*MultiHashJoin` arm sat here until M0127-P6.2. Its lesson
+		// outlives it and still governs the arms below: M0125-0013 found it
+		// matching bare scans inline, so a table wrapped in a *Filter by a
+		// pushed-down single-source conjunct recorded no scanEntry AND never
+		// advanced `off` — every table to its right got an offset short by
+		// the skipped width, while the skipped table's own columns kept their
+		// FROM-cumulative index. TPC-DS Q47 returned s_county for d_year with
+		// the row COUNT still correct, because only the top projection was
+		// misremapped. That is why this walker recurses through `collect`
+		// everywhere and declines the whole remap on anything it cannot
+		// classify (the `default:` arm's RC-2 hardening).
 		case *Join:
 			collect(x.Left)
 			collect(x.Right)
 		case *NestedLoopIndexJoin:
-			// M0062-0006: NLI sits between Filter and the underlying
-			// MHJ for Q9-shape plans. Without this case the collect
-			// walker stops at NLI and `buildBindingsPosMap` returns
-			// an empty scanMap, so `p_name`'s ColumnRef.Index is
-			// never re-resolved against the OID-sorted MHJ output.
+			// M0062-0006: NLI sits between Filter and the join subtree
+			// for Q9-shape plans. Without this case the collect walker
+			// stops at NLI and `buildBindingsPosMap` returns an empty
+			// scanMap, so `p_name`'s ColumnRef.Index is never
+			// re-resolved against the rewritten output layout.
 			collect(x.Outer)
 			collect(x.Inner)
 		case *Filter:
@@ -2843,20 +2388,6 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		return
 	}
 	switch n := node.(type) {
-	case *MultiHashJoin:
-		// MHJ keys are stored in per-table column-index pairs and
-		// are independent of the output schema. Filters, however,
-		// are evaluated on the joined output row — their
-		// ColumnRefs come from `pushOneConjunct` ANDing residual
-		// conjuncts onto Inner-Hash joins, then collectMultiHash-
-		// Tables capturing those extras when those joins were
-		// absorbed into the MHJ. Those refs are in pre-rewrite
-		// (global FROM-order) coords; remap them to MHJ-output
-		// coords here.
-		for i := range n.Filters {
-			remapByPosMap(&n.Filters[i], posMap)
-		}
-		return
 	case *Join:
 		applyJoinTreePosMap(n.Left, posMap)
 		// M0062-0005: Semi/Anti joins' Right side is the cloned
@@ -2868,10 +2399,13 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 			applyJoinTreePosMap(n.Right, posMap)
 		}
 		// Re‑resolve Join keys/predicate by NAME against the
-		// post‑rewrite child output schemas. The bushy DP produced
-		// subset‑FROM‑order indices, but rewriteMultiWayChain may
-		// have OID‑sorted the inner subtree (the MHJ), invalidating
-		// those indices. Looking up by ColumnRef.Name in the
+		// post‑rewrite child output schemas. The bushy DP produces
+		// subset‑FROM‑order indices, and a later pass may reorder the
+		// inner subtree in place, invalidating them. (Until M0127-P6.2
+		// the reordering pass was `rewriteMultiWayChain` OID-sorting the
+		// MHJ; the by-name re-resolution is what made this arm robust to
+		// it, and stays robust to the passes that remain.)
+		// Looking up by ColumnRef.Name in the
 		// freshly‑exposed schemas is robust to any in‑place
 		// reordering — column names are unique per table
 		// (TPC‑H prefixes p_, s_, l_, …). Self‑joins use SeqScan
@@ -3156,10 +2690,6 @@ func reconcileNLILayoutBody(node Node) {
 		}
 	case *Limit:
 		reconcileNLILayout(n.Child)
-	case *MultiHashJoin:
-		for i := range n.Tables {
-			reconcileNLILayout(n.Tables[i])
-		}
 	}
 }
 

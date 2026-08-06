@@ -24,7 +24,7 @@ import "strings"
 // tail: a CTE's body Node is SHARED between its references
 // (planScanRangeVar wraps the same ce.body per consumer), and the
 // executor additionally materializes the first reference's rows into
-// the name-keyed ctx.CTERowCache which later references REPLAY
+// the declaration-keyed ctx.CTERowCache which later references REPLAY
 // (operators_cte_dml.go). Pushing one reference's restriction into a
 // shared body would therefore filter every other reference twice over
 // — once through the mutated plan, once through the poisoned cache.
@@ -62,10 +62,6 @@ func pushQualsThroughSingleRefCTEs(n Node) {
 	case *NestedLoopIndexJoin:
 		pushQualsThroughSingleRefCTEs(x.Outer)
 		pushQualsThroughSingleRefCTEs(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			pushQualsThroughSingleRefCTEs(t)
-		}
 	case *CTEScan:
 		pushQualsThroughSingleRefCTEs(x.Child)
 	case *CTEDMLPrefix:

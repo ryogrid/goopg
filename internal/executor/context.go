@@ -552,34 +552,91 @@ type Context struct {
 
 	// CTERowCache holds rows materialized from regular (SELECT) CTEs when the same
 	// CTE is referenced more than once in a query. The first CTEScan for a given
-	// name buffers all rows here; subsequent scans replay from the buffer.
-	// Key is the lowercase CTE name; value is the materialized row set (nil = not yet filled).
+	// declaration buffers all rows here; subsequent scans replay from the buffer.
+	//
+	// Key is planner.CTEScan.DeclKey — the DECLARATION (declaring
+	// CommonTableExpr's source offset plus its name), not the name alone. It
+	// was the bare name until M0125-0050, which made two unrelated `WITH x`
+	// declarations in disjoint scopes share one buffer so the second replayed
+	// the first's rows (goopg answered 1,1 where PG answers 1,2). Value is the
+	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
 
-	// CTEWriteFence, when non-nil, is a set of row pointers written by DML
-	// CTEs during their execution phase. The outer query's seqScanOp skips
-	// these tuples to implement CTE snapshot isolation: DML-CTE writes must
-	// not be visible to the outer SELECT. Cleared between statements.
-	CTEWriteFence map[storage.ItemPointer]struct{}
+	// CTEWriteFence, when non-nil, maps each row written by a sub-statement of
+	// a data-modifying WITH to the command id (see CmdID) that wrote it. Every
+	// scan of the rest of the statement — the outer SELECT *and* an outer
+	// INSERT/UPDATE/DELETE — skips these tuples to implement CTE snapshot
+	// isolation: the sub-statements of a data-modifying WITH cannot see one
+	// another's effects on the target tables. Cleared between statements.
+	//
+	// The value is the goopg stand-in for PG's per-tuple cmin, and the test in
+	// cteFenced is PG's `cmin >= curcid ⇒ invisible`
+	// (postgres/src/backend/access/heap/heapam_visibility.c
+	// HeapTupleSatisfiesMVCC). It matters because a VOLATILE routine invoked
+	// from this statement runs its body at a LATER command id and therefore
+	// MUST see what the statement has written so far — see CmdID.
+	CTEWriteFence map[CTEFencePtr]int
 
-	// CTENewToOld maps each new tuple pointer added to CTEWriteFence to the
-	// original (pre-CTE) tuple it replaced. Used to detect when a sub-command
-	// within the CTE's expression evaluation modifies a CTE-written row, which
-	// must raise an error in the outer UPDATE/DELETE.
-	CTENewToOld map[storage.ItemPointer]storage.ItemPointer
+	// CTEXmaxReveal is the write fence's mirror image: it maps each tuple a
+	// sub-statement of this WITH stamped xmax on (a CTE DELETE's victim, or the
+	// old version behind a CTE UPDATE) to the command id that stamped it. The
+	// fence HIDES rows a CTE added; this set SHOWS the pre-image of rows a CTE
+	// removed, because "the sub-statements cannot see one another's effects"
+	// cuts both ways. The value is the stand-in for PG's per-tuple cmax and the
+	// test in cteRevealed is PG's `cmax >= curcid ⇒ the delete has not happened
+	// yet ⇒ show the pre-image`, in HeapTupleSatisfiesMVCC
+	// (postgres/src/backend/access/heap/heapam_visibility.c).
+	//
+	// Only READ scans consult it. A DML target scan must NOT: PG's ExecDelete
+	// and ExecUpdate take the TM_SelfModified arm for such a tuple and, when
+	// cmax equals es_output_cid, return NULL without touching the row
+	// ("already deleted by self; nothing to do", nodeModifyTable.c). Leaving
+	// the row unfound in the DML scan produces the same row count and the same
+	// heap state as finding it and declining to write. M0125-0053.
+	CTEXmaxReveal map[CTEFencePtr]int
 
-	// CTESelfModifiedErrors is the set of original (pre-CTE) tuple pointers
-	// for which the outer UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
-	// Populated when InDMLCTE=true and a write stamps xmax on a CTEWriteFence tuple.
-	CTESelfModifiedErrors map[storage.ItemPointer]struct{}
+	// CmdID is this context's command id RELATIVE to the enclosing statement's
+	// `estate->es_output_cid`: 0 while the statement's own plan (its CTEs and
+	// its body alike) runs, and one higher per nested VOLATILE routine body.
+	//
+	// It is goopg's stand-in for PostgreSQL's transaction command counter. PG
+	// runs each statement of a VOLATILE (non-`readonly_func`) SQL or PL routine
+	// after a `CommandCounterIncrement()`, with the active snapshot's command id
+	// bumped to match — postgres/src/backend/executor/functions.c
+	// `postquel_getnext`: "If not read-only, be sure to advance the command
+	// counter for each command, so that all work to date in this transaction is
+	// visible." A STABLE/IMMUTABLE routine gets no increment and so keeps the
+	// caller's command id.
+	//
+	// That difference is observable and was a wrong answer in goopg until
+	// M-NIGHTLY AI-20260806-191958-001: in
+	//
+	//	WITH doup AS (UPDATE accounts SET balance = balance + 1100
+	//	              WHERE accountid = 'checking' RETURNING *, update_checking(999))
+	//	UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *;
+	//
+	// the volatile `update_checking` must SEE and modify the row the CTE just
+	// wrote (live PG 18.3 leaves balance 1701); a command-blind fence hid it and
+	// goopg left 1700 — the function's UPDATE was a silent no-op.
+	CmdID int
 
-	// CTESelfModErr, when non-nil, is the error scanMatching returns upon
-	// encountering an invisible-due-to-own-xmax tuple in CTESelfModifiedErrors.
-	CTESelfModErr error
-
-	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
-	// Write operators register their output pointers in CTEWriteFence when this is set.
+	// InDMLCTE is true while cteDMLPrefixOp is executing one of its DML
+	// sub-plans (as opposed to the outer statement's own body). Both phases
+	// register their output pointers in CTEWriteFence — the sub-statements of
+	// a data-modifying WITH cannot see one another's effects in EITHER
+	// direction — so this does not gate the fence. M0125-0054.
 	InDMLCTE bool
+
+	// pendingDMLCTEs is the cteDMLPrefixOp currently driving this statement,
+	// or nil. It is how a MaterializedCTEScan demands the DML CTE it reads:
+	// PostgreSQL does not run data-modifying CTEs up front, it runs them when
+	// a CteScan pulls from them and, for those nothing pulled from, only after
+	// the main plan has finished (ExecPostprocessPlan,
+	// postgres/src/backend/executor/execMain.c). Demand-driving the CTEs off
+	// this pointer reproduces both halves and is fail-safe: an unreferenced
+	// CTE that turns out to be read anyway still runs before its first row is
+	// needed. M0125-0054.
+	pendingDMLCTEs *cteDMLPrefixOp
 
 	// DeadlockVictim is set by the pg_class in-place lock waits
 	// (waitPgClassInplaceXID) when this statement is chosen as a deadlock

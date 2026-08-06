@@ -101,6 +101,15 @@ func aggregateSplitIsSafe(a *Aggregate) bool {
 	if a == nil || a.Mode != AggModeSimple {
 		return false
 	}
+	if a.GroupingSets != nil {
+		// A grouping-sets node keeps one hash table per set and the set a
+		// group belongs to is carried outside the group key that the partial
+		// accumulator merges on, so a split would fold every level's groups
+		// together. PostgreSQL likewise refuses to make a grouping-sets Agg
+		// parallel-aware (optimizer/plan/planner.c, consider_groupingsets_paths
+		// is reached only for the non-partial grouping path). M0125-0048.
+		return false
+	}
 	if len(a.Aggs) == 0 {
 		// A group-only node (SELECT DISTINCT lowered to GROUP BY) has nothing
 		// to combine, and splitting it would emit each worker's group set as

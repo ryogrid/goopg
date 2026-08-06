@@ -67,10 +67,6 @@ func collectScanOutputNames(n Node, names map[string]bool) {
 		for _, col := range x.Output() {
 			names[col.Name] = true
 		}
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			collectScanOutputNames(t, names)
-		}
 	case *Join:
 		collectScanOutputNames(x.Left, names)
 		collectScanOutputNames(x.Right, names)

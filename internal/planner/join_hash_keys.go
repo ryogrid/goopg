@@ -141,10 +141,6 @@ func fillJoinHashKeysNodes(n Node) {
 	case *NestedLoopIndexJoin:
 		fillJoinHashKeysNodes(x.Outer)
 		fillJoinHashKeysNodes(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			fillJoinHashKeysNodes(t)
-		}
 	case *CTEScan:
 		fillJoinHashKeysNodes(x.Child)
 	case *CTEDMLPrefix:
@@ -184,7 +180,7 @@ func fillJoinHashKeysNodes(n Node) {
 // POINTER, not by re-deriving it: that pair is the one the executor
 // hashes on today (`reselectDegenerateHashKeys` could deliberately move
 // it off the first ON-clause conjunct until P2.2 retired that pass), and
-// `IsCanonicalKeyEquality` identifies the canonical conjunct by pointer
+// `isCanonicalKeyEquality` identifies the canonical conjunct by pointer
 // identity. Everything after
 // index 0 is the remaining usable equalities in conjunct order.
 //

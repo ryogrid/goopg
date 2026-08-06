@@ -126,9 +126,6 @@ func EstimateRows(n Node) int64 {
 		return estimateSetOp(x)
 	case *NestedLoopIndexJoin:
 		return estimateNLIndexJoin(x)
-
-	case *MultiHashJoin:
-		return estimateMultiHashJoin(x)
 	}
 	return 0
 }
@@ -225,57 +222,11 @@ func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
 	return EstimateRows(j.Outer)
 }
 
-// estimateMultiHashJoin mirrors the *Join arm's method: start from the
-// probe table's row count and walk the key chain, applying the same
-// binary-join selectivity formula (l·r / max(nd_l, nd_r)) at each step.
-//
-// Before this arm existed every packed MHJ estimated 0 rows, and every
-// ancestor's BuildLeft/algorithm decision above a packed chain was taken
-// on that zero (bushy.go:1375 requires BOTH sides > 0). M0126-0002.
-func estimateMultiHashJoin(mh *MultiHashJoin) int64 {
-	if len(mh.Tables) == 0 {
-		return 0
-	}
-	rows := EstimateRows(mh.Tables[mh.ProbeTable])
-	if rows <= 0 {
-		return 0
-	}
-	// Walk the key chain: each key joins a new table into the
-	// accumulated row count. Keys form a chain (verified by
-	// collectMultiHashTables's degree check); track which tables
-	// have been visited so the direction doesn't matter.
-	visited := make([]bool, len(mh.Tables))
-	visited[mh.ProbeTable] = true
-	for _, k := range mh.Keys {
-		var newTable int
-		if !visited[k.LeftTable] {
-			newTable = k.LeftTable
-		} else if !visited[k.RightTable] {
-			newTable = k.RightTable
-		} else {
-			continue
-		}
-		r := EstimateRows(mh.Tables[newTable])
-		if r <= 0 {
-			visited[newTable] = true
-			continue
-		}
-		nd := columnNDistinctForChild(k.LeftCol, mh.Tables[k.LeftTable])
-		if rnd := columnNDistinctForChild(k.RightCol, mh.Tables[k.RightTable]); rnd > nd {
-			nd = rnd
-		}
-		if nd > 0 {
-			rows = (rows * r) / nd
-		} else {
-			rows = scaleByFloat(rows*r, defaultEqSelectivity)
-		}
-		if rows < 1 {
-			rows = 1
-		}
-		visited[newTable] = true
-	}
-	return rows
-}
+// `estimateMultiHashJoin` was deleted with the node by M0127-P6.2. It
+// mirrored the `*Join` arm's method — start at the probe table's row count,
+// walk the key chain, apply `l·r / max(nd_l, nd_r)` per step — and existed
+// because before M0126-0002 every packed MHJ estimated 0 rows, which every
+// ancestor's BuildLeft/algorithm decision above the chain was then taken on.
 
 // seqScanRows is the base-relation row estimate for a scan leaf — the
 // stage-1 consumer of the relation-size fallback (M0125-0003 §D4).
@@ -290,8 +241,8 @@ func estimateMultiHashJoin(mh *MultiHashJoin) int64 {
 // this reduces to tableRows and no caller can observe a difference. The
 // consumers that make this move plan SHAPE — the bushy DP seed and
 // estimateBaseRelInfo.baseRows — are stages 2 and 3 and read the flag
-// separately; the only shape this one reaches is the MultiHashJoin probe-side
-// choice (bushy.go's EstimateRows comparison).
+// separately. (Its one remaining shape consumer, the MultiHashJoin probe-side
+// choice, went away with the node in M0127-P6.2.)
 func seqScanRows(x *SeqScan) int64 {
 	if x == nil {
 		return 0
@@ -1292,8 +1243,6 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 			return joinSide(x.Outer, x.Inner)
 		}
 		return joinSide(x.Outer)
-	case *MultiHashJoin:
-		return joinSide(x.Tables...)
 	}
 	return 0, false, false
 }

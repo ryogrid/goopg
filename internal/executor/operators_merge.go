@@ -550,6 +550,9 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
+			// M0125-0052: a MERGE running as a data-modifying CTE fences the
+			// rows it writes from the rest of the statement, like INSERT.
+			cteFenceInsert(o.ctx, insertRel, ptr)
 			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
 			o.collectReturningRow(planner.MergeActionInsert, nil, row)
@@ -931,6 +934,8 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if werr != nil {
 		return werr
 	}
+	// M0125-0052: fence the new version like the UPDATE paths do.
+	cteFenceUpdate(ctx, rel, storage.ItemPointer{Block: blk, Offset: slot}, destRel, newPtr)
 	// Link old→new via t_ctid for same-partition updates so EPQ chain
 	// followers (epqFollowChainFull) can locate the latest version. Cross-partition
 	// moves use the sentinel CTID (already set above) instead. M0100-0007.
@@ -1039,5 +1044,10 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	return derr
+	if derr != nil {
+		return derr
+	}
+	// M0125-0053: MERGE's WHEN MATCHED THEN DELETE twin of the deleteOp reveal.
+	cteFenceDelete(ctx, rel, storage.ItemPointer{Block: blk, Offset: slot})
+	return nil
 }

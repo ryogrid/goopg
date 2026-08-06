@@ -56,7 +56,6 @@ const (
 	PathHashJoin
 	PathMergeJoin
 	PathNestLoop
-	PathMultiHash
 	PathAgg
 	PathSort
 	PathGather

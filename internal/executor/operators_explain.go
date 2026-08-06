@@ -349,7 +349,7 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n)})
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
@@ -444,6 +444,13 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 		}
 	}
 
+	// The `CTE <name>` sections belong to the top plan node, before its
+	// InitPlans and children — upstream prints them from the top node's
+	// subplan list (M0125-0049; explain_cte.go carries the shape).
+	emitCTESections(rows, depth, reg, func(body planner.Node, bodyDepth int) {
+		walkPlanFiltered(body, bodyDepth, rows, opts, nil, nil, reg)
+	})
+
 	// Sublinks referenced by this node's detail lines print their
 	// inner plan as an indented `SubPlan N` subtree, as upstream's
 	// ExplainSubPlans does. n becomes the ancestor plan node for the
@@ -457,7 +464,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	})
 	reg.ancestor = prevAncestor
 
-	for _, c := range planChildren(n) {
+	for _, c := range renderChildren(n, reg.cte) {
 		walkPlanFiltered(c, depth+1, rows, opts, nil, nil, reg)
 	}
 }
@@ -809,6 +816,13 @@ type subPlanReg struct {
 	// (an aggregate zeroes SourceTableIdx). Set by the walkers around
 	// each node's render; nil outside one.
 	ancestor planner.Node
+	// cte holds the CTE bodies lifted out of their reference sites for this
+	// render, so a multiply-referenced CTE prints once as a `CTE <name>`
+	// section instead of once per reference (M0125-0049). Shared with the
+	// sublink walk, which is why it lives here: a reference inside a
+	// `SubPlan N` subtree must render as a leaf too. nil when the plan has
+	// no CTE, and nil-receiver tolerant either way.
+	cte *cteHoist
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
@@ -1143,7 +1157,7 @@ func schemaColumnNames(n planner.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, &subPlanReg{rel: newExplainNames(n)})
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
 func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, reg *subPlanReg) {
@@ -1239,6 +1253,13 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// The CTE sections print with their instrumentation intact: every
+	// reference shares one body Node, so the section IS the subtree that
+	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
+	emitCTESections(rows, depth, reg, func(body planner.Node, bodyDepth int) {
+		walkPlanAnalyzeFiltered(body, bodyDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
+	})
+
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
 	prevAncestor := reg.ancestor
@@ -1248,7 +1269,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	})
 	reg.ancestor = prevAncestor
 
-	for _, c := range planChildren(n) {
+	for _, c := range renderChildren(n, reg.cte) {
 		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
 	}
 }
@@ -1470,6 +1491,18 @@ func describePlan(n planner.Node) string {
 		case planner.AggModeFinal:
 			prefix = "Finalize "
 		}
+		if p.GroupingSets != nil {
+			// M0125-0048: one node, one hash table per grouping set. PG shows
+			// this as a HashAggregate (or MixedAggregate when it sorts some
+			// levels) carrying one "Hash Key:"/"Group Key:" line per set,
+			// including the bare "Group Key: ()" for the grand total. goopg
+			// has no per-key detail lines (see the note below), so the set
+			// count rides on the existing key-count suffix — which is what
+			// distinguishes this from the N-branch UNION ALL the clause used
+			// to expand into.
+			return fmt.Sprintf("%sHashAggregate (%d keys, %d grouping sets)",
+				prefix, len(p.GroupExprs), len(p.GroupingSets))
+		}
 		if len(p.GroupExprs) == 0 {
 			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
 			// regardless of strategy, so this one is already faithful.
@@ -1556,11 +1589,6 @@ func describePlan(n planner.Node) string {
 		// ordinal (preserving duplicate-row multiplicity through
 		// the aggregate-above-join shape).
 		return "Ordinality"
-	case *planner.MultiHashJoin:
-		// M0054-0003b: render the M0038 multi-way hash join
-		// explicitly so EXPLAIN shows the join shape instead of
-		// the Go type name "*planner.MultiHashJoin".
-		return fmt.Sprintf("Multi-Way Hash Join (%d tables)", len(p.Tables))
 	case *planner.NestedLoopIndexJoin:
 		// M0054-0006: render `Nested Loop` matching upstream's
 		// EXPLAIN output for a nested-loop join with an inner
@@ -1732,16 +1760,6 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Child}
 	case *planner.OrdinalityWrap:
 		return []planner.Node{p.Child}
-	case *planner.MultiHashJoin:
-		// M0054-0003b: walk every input table of the multi-way
-		// hash join. Without this, EXPLAIN truncates the plan
-		// tree at the MultiHashJoin label and the underlying
-		// SeqScan / IndexScan nodes are invisible — that was
-		// the root cause of Q2/Q3/Q5/Q7/Q10/Q11/Q18/Q21
-		// reporting "No scan nodes" in the M0054-0002 baseline.
-		out := make([]planner.Node, len(p.Tables))
-		copy(out, p.Tables)
-		return out
 	case *planner.NestedLoopIndexJoin:
 		// M0054-0006: render outer driver and inner index probe. With an
 		// S7 Memoize attached, the cache node renders between the join

@@ -29,6 +29,11 @@ package executor
 // returns `alpha|5` and `beta|7`. The probe FAILS on pre-fix HEAD with the
 // MaterializedSlot error above (verified against a throwaway goopg server
 // before the bushy.go change landed).
+//
+// M0127-P6.2 note: the MultiHashJoin node named below was deleted, so this
+// shape now plans as the left-deep binary hash cascade PG builds. The test is
+// kept unchanged — its assertions are about the RESULT, so it now guards the
+// cascade against the same defect the packed node once carried.
 
 import (
 	"strings"

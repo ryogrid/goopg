@@ -52,10 +52,6 @@ func findLimitNode(node Node) *Limit {
 		case *Join:
 			walk(x.Left)
 			walk(x.Right)
-		case *MultiHashJoin:
-			for _, t := range x.Tables {
-				walk(t)
-			}
 		}
 	}
 	walk(node)

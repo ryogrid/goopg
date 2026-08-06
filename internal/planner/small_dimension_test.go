@@ -16,7 +16,7 @@ import (
 //
 //   - the two TPC-H tables the name tag used to cover must still be tagged, in
 //     the state the benchmark actually runs in (S-cold, no ANALYZE) — if they
-//     stop being tagged, `shouldAttachBeforeMHJ` disarms and Q8 / Q21 go back
+//     stop being tagged, `shouldAttachLocalFiltersBeforeSearch` disarms and Q8 / Q21 go back
 //     to the M0077-0001 PASS→CANCEL regression;
 //   - a fact table must NOT be tagged, in either state;
 //   - a catalog with no storage behind it (every planner unit test) must see

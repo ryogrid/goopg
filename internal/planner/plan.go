@@ -4,6 +4,8 @@
 package planner
 
 import (
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -1008,6 +1010,42 @@ type Aggregate struct {
 	// two nodes are created together and the link is what pairs them at
 	// runtime.
 	PartialSource *Aggregate
+
+	// GroupingSets is non-nil for GROUP BY GROUPING SETS / ROLLUP / CUBE.
+	// Each entry is one grouping set, listed as ASCENDING indices into
+	// GroupExprs (which holds the deduplicated union of every set's
+	// expressions — PostgreSQL's `parse->groupClause`). The executor makes
+	// one pass over the child and keeps one hash table per set, the way
+	// nodeAgg.c does for AGG_HASHED/AGG_MIXED; a GroupExprs column that is
+	// not listed in the current set is emitted NULL, which is the SQL
+	// standard's value for a dimension rolled up away at that level.
+	//
+	// nil (the common case) means the ordinary single-set aggregate, and
+	// every construction site that does not set it keeps today's behaviour.
+	// M0125-0048.
+	GroupingSets [][]int
+	// GroupingMasks carries one entry per distinct GROUPING(...) call in the
+	// query, in the order the columns are appended to the output schema:
+	// output column len(GroupExprs)+len(Aggs)+i holds
+	// GroupingMasks[i][setIdx] for a row produced by grouping set setIdx.
+	//
+	// Materialising the bitmask as an output column (rather than as an
+	// expression over a hidden set-id) is what lets the target list resolve
+	// GROUPING(a,b) to a plain ColumnRef: the mask depends only on which set
+	// produced the row, never on data (PostgreSQL evaluates GroupingFunc
+	// from AggState->current_set for the same reason).
+	//
+	// Passthrough columns are appended AFTER these, so a functionally
+	// determined column discovered during target resolution never displaces
+	// a grouping column. M0125-0048.
+	GroupingMasks [][]int64
+}
+
+// GroupingMaskColOffset is the index of the first GROUPING(...) output
+// column: group expressions, then aggregates, then grouping masks, then
+// passthrough columns.
+func (n *Aggregate) GroupingMaskColOffset() int {
+	return len(n.GroupExprs) + len(n.Aggs)
 }
 
 // AggMode is an aggregate node's role in a parallel split.
@@ -1177,9 +1215,9 @@ type CTEScan struct {
 	// consumes. pushQualsThroughSingleRefCTEs reads its statement-wide
 	// reference count to decide whether Child is private to this one
 	// reference (PG 12+ `cte_inline` refcount==1 criterion) — both the
-	// plan Node and the executor's name-keyed CTERowCache are shared
-	// between references, so a per-reference qual may cross into the
-	// body only when no second reference exists. nil for scans built
+	// plan Node and the executor's CTERowCache entry (keyed by DeclKey)
+	// are shared between references, so a per-reference qual may cross
+	// into the body only when no second reference exists. nil for scans built
 	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
 	cte *plannedCTE
 }
@@ -1216,6 +1254,55 @@ func (n *MaterializedCTEScan) Output() Schema { return n.schema }
 func (n *CTEScan) Pos() int       { return n.pos }
 func (n *CTEScan) Output() Schema { return n.schema }
 
+// DeclSeq exposes the WITH-list declaration order of the CTE this scan
+// consumes, so EXPLAIN can print its `CTE <name>` section in PG's order
+// (`SS_process_ctes` walks the WITH list left to right). 0 when the scan was
+// built outside preplanWithClause (tests), which sorts it first — harmless,
+// since such a plan has at most one CTE. M0125-0049.
+func (n *CTEScan) DeclSeq() int {
+	if n.cte == nil {
+		return 0
+	}
+	return n.cte.declSeq
+}
+
+// DeclKey identifies the DECLARATION this scan consumes, and is the key the
+// executor materializes under (ctx.CTERowCache) and EXPLAIN hoists `CTE <name>`
+// sections by. It is goopg's analogue of PG's `CteScan.ctePlanId`
+// (postgres/src/backend/executor/nodeCtescan.c), which is per-declaration by
+// construction because `SS_process_ctes` makes one subplan per WITH entry.
+//
+// Name alone is NOT the identity, which is what M0125-0050 fixed: `WITH x` in
+// two disjoint scopes is two declarations, and keying by "x" made the second
+// replay the first's rows (goopg answered 1,1 where PG answers 1,2).
+//
+// The key is the declaring CommonTableExpr's source offset plus its name, not
+// the plannedCTE pointer, because ONE declaration can legitimately be planned
+// more than once: planSelect re-enters on the head operand of a set-op chain,
+// which yielded two distinct plannedCTEs for the one synthetic `__gs_src_N`
+// AST node M0125-0040's grouping-sets rewrite built. That rewrite is gone
+// (M0125-0048 replaced it with a single-pass aggregate that needs no synthetic
+// CTE), but the re-entry it exposed is not: any declaration reached through a
+// set-op head operand is planned twice and must keep sharing one
+// materialization, and a declaration site is stable across replanning where a
+// pointer is not.
+//
+// Both producers of a CommonTableExpr give distinct declarations distinct
+// (pos, name) pairs: the parser stamps pos from the declaring identifier token,
+// and the synthetic producer (CREATE RECURSIVE VIEW) leaves pos 0 but generates
+// a name unique within the statement.
+//
+// Falls back to the bare name for a CTEScan built outside preplanWithClause
+// (tests), which is the pre-M0125-0050 behaviour and unambiguous there: such a
+// plan has at most one declaration per name.
+func (n *CTEScan) DeclKey() string {
+	name := strings.ToLower(n.Name)
+	if n.cte == nil {
+		return name
+	}
+	return strconv.Itoa(n.cte.declPos) + ":" + name
+}
+
 // Sort — orders the child's rows by the given keys.
 type SortKey struct {
 	Expr       Expr
@@ -1234,29 +1321,13 @@ type Sort struct {
 func (n *Sort) Pos() int       { return n.pos }
 func (n *Sort) Output() Schema { return n.Child.Output() }
 
-// MultiHashKey is one equijoin edge in a MultiHashJoin node.
-type MultiHashKey struct {
-	LeftTable  int // index into Tables[]
-	LeftCol    int // column index in left table's schema
-	RightTable int
-	RightCol   int
-}
-
-// MultiHashJoin replaces a chain of N binary hash joins with a single
-// operator that builds N-1 hash tables from small tables and probes
-// one fact table via chain-lookups. Eliminates N-1 intermediate
-// result sets. See docs/design/0038-0001-multi-way-hash-join.md.
-type MultiHashJoin struct {
-	pos        int
-	Tables     []Node         // N child plan nodes (SeqScans or simple)
-	Keys       []MultiHashKey // N-1 equijoin edges forming a chain
-	ProbeTable int            // which child drives the probe loop
-	Filters    []Expr         // residual WHERE filters to apply
-	schema     Schema         // concatenated child schemas
-}
-
-func (n *MultiHashJoin) Pos() int       { return n.pos }
-func (n *MultiHashJoin) Output() Schema { return n.schema }
+// `MultiHashKey`/`MultiHashJoin` lived here until M0127-P6.2 deleted them
+// (leftdeep-joins 08 §4). The N-way packed node had no PG counterpart: PG
+// expresses the same shape as a left-deep cascade of binary `HashJoin`s, and
+// once the PG-shaped search became the only search (P5.9) nothing constructed
+// an MHJ any more — `mhjPackingEnabled` had been default-off since M0126-0005
+// and `generateMultiHashJoinPath` never had a production caller. Historical
+// design: docs/design/0038-0001-multi-way-hash-join.md (superseded).
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {

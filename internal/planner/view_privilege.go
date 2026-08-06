@@ -59,10 +59,6 @@ func tagViewOwnerScans(n Node, owner string) {
 	case *NestedLoopIndexJoin:
 		tagViewOwnerScans(p.Outer, owner)
 		tagViewOwnerScans(p.Inner, owner)
-	case *MultiHashJoin:
-		for _, t := range p.Tables {
-			tagViewOwnerScans(t, owner)
-		}
 	case *SetOp:
 		tagViewOwnerScans(p.Left, owner)
 		tagViewOwnerScans(p.Right, owner)

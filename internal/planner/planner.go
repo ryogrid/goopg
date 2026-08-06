@@ -725,15 +725,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		return nil, err
 	}
 
-	// GROUPING SETS/ROLLUP/CUBE: expand into an equivalent UNION ALL chain
-	// of plain-GROUP-BY branches before anything else runs. Recursive
-	// planSelect calls (nested subqueries, and this rewrite's own
-	// UNION-branch replanning below) reach this same check, so nested
-	// grouping sets are handled the same way as the top-level query.
-	// M0122-0004.
-	if err := rewriteGroupingSets(s, cat); err != nil {
-		return nil, err
-	}
+	// GROUPING SETS/ROLLUP/CUBE: normalise the GROUP BY list to the
+	// deduplicated union of the sets so buildAggregateStage can build ONE
+	// aggregate node covering every level, the way PostgreSQL does. This
+	// used to expand the clause into a UNION ALL chain of plain-GROUP-BY
+	// branches — the SQL:1999 definition, but not upstream's plan shape and
+	// not its cost. M0122-0004, replaced by M0125-0048; see
+	// groupingsets.go. Recursive planSelect calls (nested subqueries, the
+	// set-op chain's head operand) reach this same idempotent check.
+	prepareGroupingSets(s)
 
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
@@ -1180,23 +1180,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		node = unnestSubqueriesInPlan(node)
 	}
 
-	// Rewrite chains of ≥3 hash-joined tables into a single
-	// MultiHashJoin node.  Column indices are remapped inside
-	// collectMultiHashTables using scanForCol, so parent
-	// expressions (incl. unnest keys) stay aligned.
+	// The MultiHashJoin packing pass (`rewriteMultiWayChain`, guarded by
+	// `mhjPackingEnabled`) ran here until M0127-P6.2 deleted it (08 §4). PG has
+	// no MHJ, so the search's binary tree is now final and the
+	// order-then-rewrite mismatch that regressed Q9 cannot recur.
 	//
-	// Cost-model ch. 12 §3: the cost-driven planner drops MultiHashJoin
-	// (PG has none) so the DP's PG-shaped binary tree is final and the
-	// order-then-rewrite mismatch that regressed Q9 cannot recur. When
-	// mhjPackingEnabled is off, this packing pass is skipped. MHJ stays
-	// a valid executor operator; only the cost path forgoes it.
-	if mhjPackingEnabled {
-		node = rewriteMultiWayChain(node, cat)
-	}
-	// M0054-0006a-pre: after MultiHashJoin construction, walk the
-	// plan tree and route single-table constant-RHS equality
-	// predicates from `*Filter` wrappers and `mh.Filters` into the
-	// matching `*SeqScan` input by rewriting it to `*IndexScan`.
+	// M0054-0006a-pre: walk the plan tree and route single-table
+	// constant-RHS equality predicates from `*Filter` wrappers into
+	// the matching `*SeqScan` input by rewriting it to `*IndexScan`.
 	// Closes the M0054-0003d Q8 case
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
@@ -1208,32 +1199,26 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
 	node = rewriteJoinsToNLI(node, cat)
-	node = remapExprRefsToMHJ(node)
+	node = remapColumnRefsAfterRewrite(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).
 	if len(ctx.bindings) > 0 {
 		remapWithBindings(node, ctx.bindings)
 	}
-	// RC-1b (TPC-DS Q47/Q50): route single-source conjuncts from
-	// mh.Filters onto their Tables[i] only AFTER the remap above, when
-	// ColumnRef indices and Tables offsets finally share the MHJ-output
-	// coordinate space. Running this inside
-	// rewriteScanInputsWithSingleTablePredicates (pre-remap) attributed
-	// by FROM-cumulative indices against OID-sorted offsets and pushed
-	// predicates onto the WRONG scan — a date_dim OR-predicate landed on
-	// store, silently zeroing the result. The pass also validates every
-	// ref positionally by name and declines on any mismatch, so a path
-	// where the remap did not run degrades to post-join evaluation
-	// (slower, never wrong). Design: docs/design/tpcds-round2-fixes §3.4.
-	pushSingleSourceFiltersAfterRemap(node)
+	// RC-1b's `pushSingleSourceFiltersAfterRemap` ran here — after the remap,
+	// so that ColumnRef indices and table offsets finally shared one
+	// coordinate space — until M0127-P6.2 deleted it with the node it pushed
+	// into. Its position in this pipeline is the surviving lesson: the
+	// binary-Join sibling below is pinned to the same point for the same
+	// reason (see its own note).
 	// M0125-0004 (TPC-DS Q75): the binary-join sibling of the pass
 	// above. Copy a residual conjunct that references exactly one input
 	// of an INNER Join onto that input, so a single-relation restriction
 	// is applied before the side-mixed residual runs — PG's
 	// distribute_restrictinfo_to_rels placement. Pinned HERE, after the
-	// last applyJoinTreePosMap (inside remapWithBindings): that walker
-	// remaps n.Filters and returns without recursing into n.Tables[i],
-	// so a conjunct pushed before it would never be revisited.
+	// last applyJoinTreePosMap (inside remapWithBindings): a conjunct pushed
+	// before that walker runs would land in the wrong coordinate space, and
+	// (in the packed-node shape RC-1b hit) would never be revisited at all.
 	// Design: docs/design/0125-0004-q75-join-residual-evaluation-order.md.
 	pushSingleSideQualsIntoInnerJoinInputs(node)
 
@@ -3486,194 +3471,6 @@ func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
 	return parser.RewriteIndirectionStarTargets(s, nil)
 }
 
-// rewriteGroupingSets expands a GROUP BY clause that used GROUPING
-// SETS/ROLLUP/CUBE (parser.SelectStmt.GroupingSets) into an equivalent
-// UNION ALL chain of ordinary single-GROUP-BY branches — exactly the
-// SQL:1999 §7.9 definition of grouping sets. s becomes the head of the
-// chain (its own GroupBy/Targets/Having become the first generated set);
-// remaining sets thread through s.SetOp as synthetic sibling SelectStmts.
-// planSelect's caller falls straight through to the pre-existing
-// N-ary-UNION-chain planning code (segment flattening, per-branch column
-// casts, wrapSetOpSortLimit for the original ORDER BY/LIMIT/OFFSET) — that
-// machinery is unchanged and unaware this chain was synthesized rather
-// than parsed.
-//
-// Per-branch SELECT-list/HAVING substitution (substituteGroupingExpr)
-// replaces any reference to a grouping expression that isn't part of the
-// *current* branch's set with a typed-by-UNION-cast NULL — the standard
-// semantics for a rolled-up-away dimension — and resolves GROUPING(...)
-// calls to a literal bitmask, since which bits are set depends only on
-// the active branch, never on data.
-func rewriteGroupingSets(s *parser.SelectStmt, cat catalog.Catalog) error {
-	spec := s.GroupingSets
-	if spec == nil {
-		return nil
-	}
-	s.GroupingSets = nil // consumed once; guards recursive planSelect re-entry
-	sets := spec.Sets
-	if len(sets) == 0 {
-		s.GroupBy = nil
-		return nil
-	}
-
-	universe := map[string]bool{}
-	for _, set := range sets {
-		for _, e := range set {
-			universe[parserExprKey(e)] = true
-		}
-	}
-
-	buildBranch := func(set []parser.Expr) *parser.SelectStmt {
-		active := map[string]bool{}
-		for _, e := range set {
-			active[parserExprKey(e)] = true
-		}
-		targets := make([]parser.ResTarget, len(s.Targets))
-		for i, t := range s.Targets {
-			nt := t
-			nt.Expr = substituteGroupingExpr(t.Expr, universe, active, cat)
-			targets[i] = nt
-		}
-		branch := &parser.SelectStmt{
-			Distinct:   s.Distinct,
-			DistinctOn: s.DistinctOn,
-			Targets:    targets,
-			From:       s.From,
-			FromExprs:  s.FromExprs,
-			Where:      s.Where,
-			GroupBy:    set,
-		}
-		if s.Having != nil {
-			branch.Having = substituteGroupingExpr(s.Having, universe, active, cat)
-		}
-		return branch
-	}
-
-	branches := make([]*parser.SelectStmt, len(sets))
-	for i, set := range sets {
-		branches[i] = buildBranch(set)
-	}
-
-	s.Distinct = branches[0].Distinct
-	s.DistinctOn = branches[0].DistinctOn
-	s.Targets = branches[0].Targets
-	s.GroupBy = branches[0].GroupBy
-	s.Having = branches[0].Having
-	cur := s
-	for _, b := range branches[1:] {
-		cur.SetOp = &parser.SetOpClause{Type: parser.SetOpUnion, All: true, Right: b}
-		cur = b
-	}
-	return nil
-}
-
-// substituteGroupingExpr rewrites e for one generated grouping-set branch:
-// any subexpression that is one of the grouping construct's "universe"
-// expressions (appears in at least one generated set) but is NOT part of
-// the current branch's active set is replaced with NULL — the SQL-standard
-// value for a dimension rolled up away at this grouping level. GROUPING(...)
-// calls resolve to a literal bitmask (bit i, counting from the rightmost
-// arg, is 1 iff Args[i] is excluded from the active set). Arguments of
-// aggregate function calls (built-in or user-defined) are left untouched,
-// since aggregates evaluate over the raw pre-grouping rows, not the
-// rolled-up output value. Unrecognised expression shapes are returned
-// unchanged rather than guessed at.
-func substituteGroupingExpr(e parser.Expr, universe, active map[string]bool, cat catalog.Catalog) parser.Expr {
-	if e == nil {
-		return nil
-	}
-	if gc, ok := e.(*parser.GroupingCall); ok {
-		return &parser.IntegerConst{Value: groupingBitmask(gc.Args, active)}
-	}
-	if universe[parserExprKey(e)] && !active[parserExprKey(e)] {
-		return &parser.NullConst{}
-	}
-	switch x := e.(type) {
-	case *parser.BinaryOp:
-		clone := *x
-		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
-		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
-		return &clone
-	case *parser.UnaryOp:
-		clone := *x
-		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		return &clone
-	case *parser.IsNullExpr:
-		clone := *x
-		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		return &clone
-	case *parser.IsBoolExpr:
-		clone := *x
-		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		return &clone
-	case *parser.IsDistinctFromExpr:
-		clone := *x
-		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
-		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
-		return &clone
-	case *parser.CollateExpr:
-		clone := *x
-		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		return &clone
-	case *parser.CastExpr:
-		clone := *x
-		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		return &clone
-	case *parser.RowExpr:
-		clone := *x
-		elems := make([]parser.Expr, len(x.Elems))
-		for i, el := range x.Elems {
-			elems[i] = substituteGroupingExpr(el, universe, active, cat)
-		}
-		clone.Elems = elems
-		return &clone
-	case *parser.CaseExpr:
-		clone := *x
-		if x.Operand != nil {
-			clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
-		}
-		whens := make([]parser.CaseWhen, len(x.Whens))
-		for i, w := range x.Whens {
-			whens[i] = parser.CaseWhen{
-				When: substituteGroupingExpr(w.When, universe, active, cat),
-				Then: substituteGroupingExpr(w.Then, universe, active, cat),
-			}
-		}
-		clone.Whens = whens
-		if x.Else != nil {
-			clone.Else = substituteGroupingExpr(x.Else, universe, active, cat)
-		}
-		return &clone
-	case *parser.FuncCall:
-		if isAggregateFunc(x) || isUserAggregateFunc(x, cat) {
-			return x
-		}
-		clone := *x
-		args := make([]parser.Expr, len(x.Args))
-		for i, a := range x.Args {
-			args[i] = substituteGroupingExpr(a, universe, active, cat)
-		}
-		clone.Args = args
-		return &clone
-	default:
-		return e
-	}
-}
-
-// groupingBitmask computes the SQL-standard GROUPING(...) result for one
-// branch: bit i (rightmost arg = least-significant bit) is 1 iff args[i]
-// is excluded from the active grouping set.
-func groupingBitmask(args []parser.Expr, active map[string]bool) int64 {
-	var mask int64
-	n := len(args)
-	for i, a := range args {
-		if !active[parserExprKey(a)] {
-			mask |= int64(1) << uint(n-1-i)
-		}
-	}
-	return mask
-}
-
 // projectSetCompositeSchema returns the expanded composite-row schema for a
 // supported set-returning function. nil means the SRF cannot be lowered into
 // ProjectSet from a `(srf(<agg>)).*` shape — currently only
@@ -5494,6 +5291,15 @@ type aggregateSurface struct {
 	// aggregateByKeyQual is aggregateByKey keyed WITH the ColumnRef
 	// qualifiers. Consulted only for a contested key. M0125-0045.
 	aggregateByKeyQual map[string]aggregateBinding
+	// groupingCallCol maps groupingCallKey → the aggregate output column
+	// holding that GROUPING(...) call's per-set bitmask. Populated by
+	// buildAggregateStage before target resolution. M0125-0048.
+	groupingCallCol map[string]int
+	// groupCommonSlots is the set of group-expression slots present in EVERY
+	// grouping set — PostgreSQL's gset_common. nil means "no grouping sets",
+	// i.e. every slot is common. Only these slots may prove a functional
+	// dependency; see isColumnFunctionallyDetermined. M0125-0048.
+	groupCommonSlots map[int]bool
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -5622,6 +5428,12 @@ func tryPromoteAggSublink(s *parser.SelectStmt, fromNode Node, fromCtx *resolveC
 
 func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 	if len(s.GroupBy) > 0 {
+		return true
+	}
+	// GROUP BY GROUPING SETS (()) — every set is empty, so the union
+	// prepareGroupingSets built is empty too, but the clause still asks for a
+	// grouped aggregate (of one, grand-total, level). M0125-0048.
+	if s.GroupingSets != nil {
 		return true
 	}
 	hasAgg := func(e parser.Expr) bool {
@@ -6336,12 +6148,61 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		}
 	}
 
+	// M0125-0048: GROUP BY GROUPING SETS / ROLLUP / CUBE. ONE node covers
+	// every level — GroupExprs already holds the deduplicated union of the
+	// sets (prepareGroupingSets), gsSets says which of those columns each set
+	// keeps, and each distinct GROUPING(...) call takes an output column
+	// carrying its per-set bitmask.
+	//
+	// The grouping columns are allocated HERE, before the target list is
+	// resolved, because resolveTargetsAfterAggregate appends
+	// functionally-determined passthrough columns as it discovers them and the
+	// executor emits [group exprs, aggregates, grouping masks, passthrough]
+	// in that fixed order.
+	var gsSets [][]int
+	var groupingMasks [][]int64
+	var groupCommonSlots map[int]bool
+	groupingCallCol := map[string]int{}
+	if s.GroupingSets != nil {
+		gsSets, err = groupingSetIndices(s.GroupingSets, s.Targets, groupByExpr, groupByExprQual)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		groupCommonSlots = commonGroupingSlots(gsSets)
+	}
+	if calls := collectGroupingCalls(s); len(calls) > 0 {
+		maskSets := gsSets
+		if maskSets == nil {
+			// GROUPING(...) under a plain GROUP BY: one implicit set holding
+			// every grouping column, so every bit is 0. PostgreSQL accepts
+			// this and returns 0 (functions-aggregate.html, GROUPING).
+			all := make([]int, len(groupExprs))
+			for i := range all {
+				all[i] = i
+			}
+			maskSets = [][]int{all}
+		}
+		for _, gc := range calls {
+			masks, mErr := groupingCallMasks(gc, maskSets, s.Targets, groupByExpr, groupByExprQual)
+			if mErr != nil {
+				return nil, nil, nil, nil, mErr
+			}
+			groupingCallCol[groupingCallKey(gc)] = len(outputSchema)
+			groupingMasks = append(groupingMasks, masks)
+			// PostgreSQL names the column "grouping" (GroupingFunc's
+			// FigureColname case in parse_target.c).
+			outputSchema = append(outputSchema, SchemaColumn{Name: "grouping", Type: catalog.Type{Name: "int4"}})
+		}
+	}
+
 	aggNode := &Aggregate{
-		pos:        s.Pos(),
-		Child:      child,
-		GroupExprs: groupExprs,
-		Aggs:       plannedAggs,
-		schema:     outputSchema,
+		pos:           s.Pos(),
+		Child:         child,
+		GroupExprs:    groupExprs,
+		Aggs:          plannedAggs,
+		schema:        outputSchema,
+		GroupingSets:  gsSets,
+		GroupingMasks: groupingMasks,
 	}
 
 	outputCtx := newResolveContext(nil, outputSchema)
@@ -6356,6 +6217,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		aggregateByKey:      aggByKey,
 		aggregateAmbiguous:  aggAmbiguous,
 		aggregateByKeyQual:  aggByKeyQual,
+		groupingCallCol:     groupingCallCol,
+		groupCommonSlots:    groupCommonSlots,
 		node:                aggNode,
 		funcDepCols:         map[int]int{},
 		cat:                 cat,
@@ -6551,6 +6414,22 @@ func groupBySlotContested(e parser.Expr, agg *aggregateSurface) (int, bool) {
 }
 
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
+	// GROUPING(...) resolves to the aggregate output column buildAggregateStage
+	// allocated for it: the bitmask depends only on which grouping set produced
+	// the row, never on data, so the executor fills the column per set and the
+	// projection reads it like any other. Checked before the group-key lookup
+	// because a GroupingCall is not a grouping expression itself. M0125-0048.
+	if gc, ok := e.(*parser.GroupingCall); ok {
+		idx, found := agg.groupingCallCol[groupingCallKey(gc)]
+		if !found {
+			return nil, &PlanError{
+				Pos:     gc.Pos(),
+				Code:    "42803",
+				Message: "arguments to GROUPING must be grouping expressions of the associated query level",
+			}
+		}
+		return &ColumnRef{pos: gc.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
+	}
 	key := parserExprKey(e)
 	if idx, ok := agg.groupByExpr[key]; ok {
 		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
@@ -8146,6 +8025,22 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
+			continue
+		}
+		// A partial index. PG only reaches `build_index_paths` for an index
+		// whose predicate was PROVEN from the query's restriction clauses
+		// (`check_index_predicates` sets `index->predOK`; an unproven partial
+		// index is skipped in `create_index_paths`). goopg has no
+		// predicate-implication prover, so the honest answer is to decline
+		// rather than to emit a scan that silently drops every row the index
+		// predicate excludes. This mirrors the identical guard on the ordered
+		// path (`pathindexordered.go` `addOneOrderedIndexPath`), which was
+		// left un-mirrored here — the gap returned 0 rows for
+		// `onek2 WHERE unique1 = 50` against `onek2_u1_prtl (WHERE unique1 <
+		// 20 OR unique1 > 980)` in the regress cases `portals_p2`/`select`.
+		// Ledgered: teaching goopg the prover would let it USE the index when
+		// the qual does imply the predicate, as PG does.
+		if idx.HasPredicate {
 			continue
 		}
 		if len(idx.Columns) == 0 || idx.Columns[0] != col {
@@ -12309,7 +12204,21 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 				allCovered = false
 				break
 			}
-			if _, inGroupBy := agg.groupByInputCol[inputIdx]; !inGroupBy {
+			slot, inGroupBy := agg.groupByInputCol[inputIdx]
+			if !inGroupBy {
+				allCovered = false
+				break
+			}
+			// M0125-0048: under grouping sets only the columns present in
+			// EVERY set can prove a functional dependency. PostgreSQL builds
+			// groupClauseCommonVars from the intersection of the expanded sets
+			// (gset_common) and check_functional_grouping is handed that list,
+			// not the whole GROUP BY (src/backend/parser/parse_agg.c
+			// parseCheckAggregates). So `SELECT id, name FROM t GROUP BY
+			// ROLLUP(id)` is an error even with id a primary key: the
+			// grand-total level groups by nothing, and one grand-total row
+			// cannot carry one name.
+			if agg.groupCommonSlots != nil && !agg.groupCommonSlots[slot] {
 				allCovered = false
 				break
 			}

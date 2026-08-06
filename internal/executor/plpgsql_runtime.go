@@ -387,6 +387,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if ctx != nil {
 		*child = *ctx
 	}
+	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
@@ -529,6 +530,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	if ctx != nil {
 		*child = *ctx
 	}
+	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
@@ -610,6 +612,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	if ctx != nil {
 		*child = *ctx
 	}
+	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
@@ -727,6 +730,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	if ctx != nil {
 		*child = *ctx
 	}
+	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	frame := newPLpgSQLFrame()
@@ -987,6 +991,7 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	if ctx != nil {
 		*child = *ctx
 	}
+	routineCommandCounterIncrement(child, r)
 	// Reset notices so TakeNotices propagates only new ones from this call,
 	// not the parent's accumulated notices. M0100-0005.
 	child.Notices = nil
@@ -2626,6 +2631,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx
+		routineCommandCounterIncrement(child, r)
 		// Clear inherited notices so the child accumulates only its own;
 		// existing ctx.Notices are propagated by the parent, not re-propagated
 		// by the child's TakeNotices loop below. M0097-0140.

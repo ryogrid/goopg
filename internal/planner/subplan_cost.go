@@ -21,7 +21,7 @@ import "github.com/goopg/goopg/internal/catalog"
 //     rescan-friendly class — the executor re-Opens these per call
 //     without a rebuild.
 //   - SeqScan-rooted chains cost the full table row count per call.
-//   - Multi-child nodes (Join, MultiHashJoin, NLI) cost the sum of their
+//   - Multi-child nodes (Join, NLI) cost the sum of their
 //     children — the executor rebuilds their runtime state per rescan.
 //   - Anything unrecognised, or any scan without usable ANALYZE stats,
 //     makes the whole estimate UNKNOWN (returned as 0). Callers must
@@ -71,16 +71,6 @@ func estimateSubplanCostPerCall(n Node) int64 {
 			return 0
 		}
 		return l + l*r
-	case *MultiHashJoin:
-		var sum int64
-		for _, tbl := range x.Tables {
-			c := estimateSubplanCostPerCall(tbl)
-			if c <= 0 {
-				return 0
-			}
-			sum += c
-		}
-		return sum
 	}
 	return 0
 }

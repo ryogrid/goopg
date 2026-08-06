@@ -59,18 +59,25 @@ var (
 	waitForGraph = make(map[storage.TransactionID]storage.TransactionID)
 )
 
-// Self-modification error sentinels (ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION = 09000).
-// Raised when a sub-command triggered by the current command already modified the tuple.
-var (
-	errTupleAlreadyModifiedByUpdate = &ExecError{
-		Code:    "09000",
-		Message: "tuple to be updated was already modified by an operation triggered by the current command",
+// errTupleAlreadyModified builds PostgreSQL's TM_SelfModified error for a DML
+// statement that reached — via an EvalPlanQual chain-follow — a row version a
+// LATER command of its own execution wrote. Upstream raises it from
+// nodeModifyTable.c `ExecUpdate` (line 2656 in PG 18.3) and `ExecDelete` with
+// ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION, whose SQLSTATE is 27000 (09000 is
+// ERRCODE_TRIGGERED_ACTION_EXCEPTION — a different class; goopg used it until
+// this was first exercised end-to-end). Message and hint are verbatim upstream.
+//
+// A constructor rather than a package-level sentinel because the Pos varies per
+// call site and *ExecError is mutable: stamping Pos on a shared value would be
+// a data race between concurrent backends.
+func errTupleAlreadyModified(verb string, pos int) *ExecError {
+	return &ExecError{
+		Code:    "27000",
+		Pos:     pos,
+		Message: "tuple to be " + verb + " was already modified by an operation triggered by the current command",
+		Hint:    "Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.",
 	}
-	errTupleAlreadyModifiedByDelete = &ExecError{
-		Code:    "09000",
-		Message: "tuple to be deleted was already modified by an operation triggered by the current command",
-	}
-)
+}
 
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
@@ -293,7 +300,10 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
+	// nil reveal: EPQ re-resolves a row a WRITE is about to touch, and a row a
+	// DML CTE of this statement already removed is "already deleted by self"
+	// for that write (M0125-0053, Context.CTEXmaxReveal).
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact, nil)
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
@@ -1526,7 +1536,14 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+			// M0125-0053: a tuple a data-modifying CTE of this statement
+			// deleted (or whose new version it wrote) is invisible only
+			// because it carries our OWN xmax; PG's cmax-vs-es_output_cid
+			// test still shows its pre-image to the rest of the statement,
+			// so reveal it here. curSlot was already advanced past it.
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) &&
+				!(cteRevealed(o.ctx, rel, o.curBlock, o.curSlot-1) &&
+					mvcc.TupleVisibleSubxact(cteRevealHeader(tuple.Header), o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact)) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -1580,14 +1597,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				tuple.Header.Infomask&storage.HeapXminInvalid == 0 &&
 				!mvcc.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
 			// CTE snapshot isolation: skip rows written by DML CTEs so the
-			// outer SELECT sees the pre-CTE state (PostgreSQL semantics).
-			if o.ctx.CTEWriteFence != nil {
-				if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}]; inFence {
-					if o.pinned != nil {
-						o.pinned.RUnlock()
-					}
-					continue
+			// rest of the statement sees the pre-CTE state (PostgreSQL
+			// semantics). curSlot was already advanced past this tuple.
+			if cteFenced(o.ctx, rel, o.curBlock, o.curSlot-1) {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
 				}
+				continue
 			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
@@ -2244,6 +2260,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
+			// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
+			// invisible to every other sub-statement of the same WITH.
+			cteFenceInsert(o.ctx, targetRel, ptr)
 			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
 			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
 			// against any SERIALIZABLE reader that holds a covering predicate
@@ -2293,6 +2312,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if werr != nil {
 			return nil, werr
 		}
+		// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
+		// invisible to every other sub-statement of the same WITH.
+		cteFenceInsert(o.ctx, targetRel, ptr)
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
 		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
@@ -3570,23 +3592,9 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
-		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
-		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
-		if _, inFence := ctx.CTEWriteFence[oldItemPtr]; inFence {
-			if ctx.CTENewToOld != nil {
-				if orig, ok := ctx.CTENewToOld[oldItemPtr]; ok {
-					if ctx.CTESelfModifiedErrors == nil {
-						ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-					}
-					ctx.CTESelfModifiedErrors[orig] = struct{}{}
-				}
-			}
-		}
-		ctx.CTEWriteFence[newItemPtr] = struct{}{}
-		if ctx.CTENewToOld != nil {
-			ctx.CTENewToOld[newItemPtr] = oldItemPtr
-		}
+	if derr == nil {
+		cteFenceUpdate(ctx, rel, storage.ItemPointer{Block: blk, Offset: oldSlot},
+			rel, storage.ItemPointer{Block: blk, Offset: newSlot})
 	}
 	return true, derr
 }
@@ -3957,10 +3965,16 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
+		// nil reveal: this is an UPDATE's target scan (M0125-0053).
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
+			return true, nil
+		}
+		// M0125-0052: the index-driven UPDATE twin of the scanMatching fence —
+		// an outer UPDATE must not touch a row its own data-modifying CTE wrote.
+		if cteFenced(o.ctx, heapRel, ptr.Block, actualSlot) {
 			return true, nil
 		}
 		// No tuple-tag acquire on a foreign lock-only holder here: the
@@ -4378,23 +4392,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if werr != nil {
 					return nil, werr
 				}
-				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-						if o.ctx.CTENewToOld != nil {
-							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-								if o.ctx.CTESelfModifiedErrors == nil {
-									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-								}
-								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-							}
-						}
-					}
-					o.ctx.CTEWriteFence[newPtr] = struct{}{}
-					if o.ctx.CTENewToOld != nil {
-						o.ctx.CTENewToOld[newPtr] = oldPtr
-					}
-				}
+				cteFenceUpdate(o.ctx, rel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+					targetWriteRel, newPtr)
 				// Maintain unique/PK btree entries for the new row version.
 				if destPartIdx != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
@@ -4487,13 +4486,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// would mis-classify our own locks as foreign).
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
 		return nil, err
-	}
-	// Self-modification error setup: if a sub-command during the CTE phase
-	// already modified a row we are about to update, scanMatching will raise
-	// errTupleAlreadyModifiedByUpdate when it encounters the original tuple.
-	if o.ctx.CTESelfModifiedErrors != nil {
-		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByUpdate
-		defer func() { o.ctx.CTESelfModErr = nil }()
 	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
@@ -5119,23 +5111,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if werr != nil {
 					return nil, werr
 				}
-				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-						if o.ctx.CTENewToOld != nil {
-							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-								if o.ctx.CTESelfModifiedErrors == nil {
-									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-								}
-								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-							}
-						}
-					}
-					o.ctx.CTEWriteFence[newPtr] = struct{}{}
-					if o.ctx.CTENewToOld != nil {
-						o.ctx.CTENewToOld[newPtr] = oldPtr
-					}
-				}
+				cteFenceUpdate(o.ctx, puRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+					targetWriteRel, newPtr)
 				if destPart != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
 				} else if pu.scanTbl != nil {
@@ -5386,12 +5363,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		row := o.retRows[o.retIdx]
 		o.retIdx++
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
-	}
-	// If a CTE sub-command already modified a row we are about to delete,
-	// scanMatching must surface the 09000 error (TM_SelfModified equivalent).
-	if o.ctx.CTESelfModifiedErrors != nil {
-		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByDelete
-		defer func() { o.ctx.CTESelfModErr = nil }()
 	}
 	// DELETE … USING: nested-loop cross-product path. M0097-0076.
 	if len(o.plan.UsingScans) > 0 {
@@ -5713,6 +5684,15 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					epqSkipDel = true
 					break
 				}
+				// Sibling of the updateWithFrom EPQ site: the chain can lead
+				// straight into a version a LATER command of this same statement
+				// wrote — a VOLATILE routine invoked from a data-modifying WITH.
+				// PG refuses to merge that with the original delete and errors
+				// (nodeModifyTable.c ExecDelete's TM_SelfModified arm with
+				// tmfd.cmax != es_output_cid).
+				if cteWrittenByLaterCommand(o.ctx, victimRel, newBlk, newSlot) {
+					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+				}
 				v.blk = newBlk
 				v.slot = newSlot
 				if newRow != nil {
@@ -5750,6 +5730,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
+			// M0125-0053: a DELETE inside a data-modifying CTE stamps our own
+			// xmax, which would hide the row from the rest of the statement —
+			// where PG still shows its pre-image.
+			cteFenceDelete(o.ctx, victimRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
@@ -6145,25 +6129,20 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					}
 					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
 				}
-				// CTE isolation: if the EPQ chain led to a CTE-written tuple, the CTE
-				// already owns this row. Skip to preserve savedSnap isolation semantics.
-				// Verify xmin == currentTx to avoid false positives when another table's
-				// CTE-written rows coincidentally share the same {block,slot}. M0100-0010.
-				if o.ctx.CTEWriteFence != nil {
-					if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: epqBlk, Offset: newSlot}]; inFence {
-						skipRow := false
-						if s2, serr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: epqBlk}); serr == nil {
-							s2.RLock()
-							if tup2, terr := storage.PageGetHeapTuple(s2.Page(), newSlot); terr == nil {
-								skipRow = mvcc.IsSelfXID(tup2.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
-							}
-							s2.RUnlock()
-							o.ctx.Pool.Unpin(s2)
-						}
-						if skipRow {
-							continue
-						}
-					}
+				// CTE isolation: if the EPQ chain led to a tuple this statement
+				// wrote, this statement already owns this row. Skip to preserve
+				// savedSnap isolation semantics — PG's "already updated by self;
+				// nothing to do". M0100-0010; M0125-0052 made the fence key
+				// relation-qualified, so the xmin re-read that used to disambiguate
+				// another table's coincident {block,slot} is no longer needed.
+				//
+				// Unless a LATER command wrote it, in which case PG refuses to
+				// merge and errors instead (nodeModifyTable.c ExecUpdate:2656).
+				if cteWrittenByLaterCommand(o.ctx, puSrcRel, epqBlk, newSlot) {
+					return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+				}
+				if cteFenced(o.ctx, puSrcRel, epqBlk, newSlot) {
+					continue
 				}
 				// Re-evaluate predicate against the new row + FROM portion.
 				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
@@ -6265,23 +6244,8 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					return nil, cerr
 				}
 			}
-			if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-				oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-				if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-					if o.ctx.CTENewToOld != nil {
-						if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-							if o.ctx.CTESelfModifiedErrors == nil {
-								o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-							}
-							o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-						}
-					}
-				}
-				o.ctx.CTEWriteFence[newPtr] = struct{}{}
-				if o.ctx.CTENewToOld != nil {
-					o.ctx.CTENewToOld[newPtr] = oldPtr
-				}
-			}
+			cteFenceUpdate(o.ctx, puSrcRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+				puRel, newPtr)
 			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, puCols, pu.newRow, newPtr)
 			if !isCrossPartMove {
 				if cerr := stampOldCtid(o.ctx, puSrcRel, pu.blk, pu.slot, newPtr); cerr != nil {
@@ -6482,7 +6446,23 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			continue // skip concurrent-update EPQ for USING case
+			// deleteWithUsing still has no EvalPlanQual (deferral ledger
+			// 2026-08-06, DELETE…USING EPQ) — it skips the row rather than
+			// re-fetching the live version. One case must not be skipped
+			// silently, though: when the update chain leads into a version a
+			// LATER command of THIS statement wrote, PG has already raised
+			// TM_SelfModified before any EPQ re-evaluation could matter
+			// (nodeModifyTable.c ExecDelete, `tmfd.cmax != es_output_cid`).
+			// Follow the chain far enough to see that, and only that — the
+			// guard keeps every statement without a data-modifying WITH in
+			// flight on exactly the old path.
+			if len(o.ctx.CTEWriteFence) > 0 {
+				if cBlk, cSlot, _, cFound := epqFollowChain(o.ctx, vRel, v.blk, v.slot, tbl.Columns, nil, nil); cFound &&
+					cteWrittenByLaterCommand(o.ctx, vRel, cBlk, cSlot) {
+					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+				}
+			}
+			continue
 		}
 		oldTupleBytes, _ := oldTup.MarshalBinary()
 		// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
@@ -6502,6 +6482,8 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if derr != nil {
 			return nil, derr
 		}
+		// M0125-0053: the DELETE … USING twin of the deleteOp.Next reveal.
+		cteFenceDelete(o.ctx, vRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
 		}
@@ -6574,26 +6556,21 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				return err
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
-				// CTESelfModifiedErrors: if a sub-command during the CTE phase
-				// modified this invisible (own-xmax) tuple, the outer
-				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
-				if ctx.CTESelfModErr != nil && ctx.CTESelfModifiedErrors != nil {
-					ptr := storage.ItemPointer{Block: blk, Offset: slot}
-					if _, inErr := ctx.CTESelfModifiedErrors[ptr]; inErr {
-						s.RUnlock()
-						ctx.Pool.Unpin(s)
-						return ctx.CTESelfModErr
-					}
-				}
+				// A tuple this statement's own command already killed is simply
+				// not found by the DML scan. PG reaches it and takes ExecUpdate /
+				// ExecDelete's TM_SelfModified arm with cmax == es_output_cid,
+				// which returns NULL without touching the row — same row count,
+				// same heap state (M0125-0053). The LATER-command case that PG
+				// errors on cannot arrive here: such a version was written by
+				// this statement, so its own cmin hides it from this scan. It is
+				// reached only by an EvalPlanQual chain-follow, which is where
+				// cteWrittenByLaterCommand is consulted.
 				continue
 			}
-			// Skip rows written by DML CTEs — outer UPDATE/DELETE must see
-			// pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
-			if ctx.CTEWriteFence != nil {
-				ptr := storage.ItemPointer{Block: blk, Offset: slot}
-				if _, inFence := ctx.CTEWriteFence[ptr]; inFence {
-					continue
-				}
+			// Skip rows written by DML CTEs — an outer INSERT/UPDATE/DELETE must
+			// see pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
+			if cteFenced(ctx, rel, blk, slot) {
+				continue
 			}
 			// M0104-0008: SSI read-path hook for the UPDATE / DELETE
 			// scanMatching loop (mirrors the seqScanOp.Next site). A

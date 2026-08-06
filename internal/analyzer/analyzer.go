@@ -216,7 +216,12 @@ func Analyze(stmt parser.Stmt, cat catalog.Catalog) error {
 }
 
 func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
-	return analyzeSelectWithParent(s, cat, outerScope)
+	// stmtRoot is true only when this SELECT *is* the statement being
+	// analyzed — i.e. no planner-supplied outer scope. It is the sole
+	// gate on a data-modifying WITH (analyzeWith / M0125-0051), goopg's
+	// analogue of upstream's `pstate->parentParseState == NULL` test in
+	// analyzeCTE (postgres/src/backend/parser/parse_cte.c:333).
+	return analyzeSelectStmt(s, cat, outerScope, outerScope == nil)
 }
 
 // lockingClauseName returns the SQL name of a locking strength (FOR UPDATE, etc.)
@@ -241,6 +246,17 @@ func lockingClauseName(s parser.LockStrength) string {
 // InExpr / ExistsExpr handlers when recursing into inner
 // SELECTs so column refs can resolve against the outer scope.
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
+	// Every caller of this entry point is analyzing a NESTED query
+	// (a derived table, a sublink, a CTE body, a set-op arm), so it is
+	// never the statement root — a data-modifying WITH found from here
+	// is the 0A000 case. M0125-0051.
+	return analyzeSelectStmt(s, cat, parent, false)
+}
+
+// analyzeSelectStmt is analyzeSelectWithParent plus the statement-root
+// flag, which only analyzeSelect (the top-level entry) can set. See
+// M0125-0051 / docs/design/0125-0051-data-modifying-cte-top-level-only.md.
+func analyzeSelectStmt(s *parser.SelectStmt, cat catalog.Catalog, parent *scope, stmtRoot bool) error {
 	// A grouping node has no target list, FROM or WHERE of its own — it stands
 	// for the parenthesised operand `( SetOpOperand )` and holds only what was
 	// written after the ')'. Analyze the operand; the trailing sort/limit is
@@ -251,7 +267,11 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 	// that branch clears SetOp and recurses, which lands here exactly once.
 	// M0125-0020.
 	if s.SetOpOperand != nil && s.SetOp == nil {
-		return analyzeSelectWithParent(s.SetOpOperand, cat, parent)
+		// A parenthesised statement is still the statement root:
+		// `(WITH x AS (INSERT … RETURNING) SELECT * FROM x)` is accepted
+		// by PG 18.3 (verified), because the grammar's select_with_parens
+		// adds no parse-state level. Carry stmtRoot through. M0125-0051.
+		return analyzeSelectStmt(s.SetOpOperand, cat, parent, stmtRoot)
 	}
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
@@ -280,7 +300,12 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		setOpParent := parent
 		if s.With != nil {
 			ctxForSetOp := &scope{parent: parent, cat: cat}
-			if err := analyzeWith(s.With, ctxForSetOp); err != nil {
+			// The WITH written before the whole chain belongs to THIS
+			// statement, so a data-modifying CTE in it is legal exactly
+			// when this statement is the root. A WITH written inside a
+			// parenthesised ARM is a different query level and reaches
+			// analyzeWith with stmtRoot=false below. M0125-0051.
+			if err := analyzeWith(s.With, ctxForSetOp, stmtRoot); err != nil {
 				return err
 			}
 			setOpParent = ctxForSetOp
@@ -292,7 +317,12 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		s.SetOp = nil
 		savedWith := s.With
 		s.With = nil // already processed above; don't re-register in the left-branch recursion
-		err := analyzeSelectWithParent(s, cat, setOpParent)
+		// The left arm loses root status when it is PARENTHESISED
+		// (`(WITH … ) UNION B`): the recursion below descends into
+		// s.SetOpOperand, which is its own query level — PG 18.3 rejects
+		// a data-modifying WITH written there (verified). An unparenthesised
+		// left arm is this same statement, so it keeps stmtRoot. M0125-0051.
+		err := analyzeSelectStmt(s, cat, setOpParent, stmtRoot && s.SetOpOperand == nil)
 		s.SetOp = saved
 		s.With = savedWith
 		if err != nil {
@@ -308,7 +338,7 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 	// buildSelectScope walks the From list. See
 	// docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
 	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
+		if err := analyzeWith(s.With, ctx, stmtRoot); err != nil {
 			return err
 		}
 	}
@@ -537,7 +567,9 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	var cteCtx *scope
 	if s.With != nil {
 		cteCtx = &scope{cat: cat}
-		if err := analyzeWith(s.With, cteCtx); err != nil {
+		// A WITH on the INSERT being analyzed is a root WITH exactly when
+		// no planner-supplied outer scope is in force. M0125-0051.
+		if err := analyzeWith(s.With, cteCtx, outerScope == nil); err != nil {
 			return err
 		}
 	}
@@ -733,7 +765,7 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	// Register CTEs first so FROM-clause tables can reference them. M0100-0010.
 	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
+		if err := analyzeWith(s.With, ctx, outerScope == nil); err != nil {
 			return err
 		}
 	}
@@ -791,7 +823,7 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	// Register CTEs first so USING-clause tables can reference them. M0100-0010.
 	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
+		if err := analyzeWith(s.With, ctx, outerScope == nil); err != nil {
 			return err
 		}
 	}
@@ -1144,10 +1176,11 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "int8"}, nil
 	case *parser.GroupingCall:
 		// GROUPING(a, b, ...) — its value depends only on which grouping
-		// set produced the current row (resolved to a literal by the
-		// planner's grouping-sets rewrite, M0122-0004), but the args still
-		// need scope resolution here so an unknown-column reference is
-		// caught the same way it would be for a plain SELECT-list column.
+		// set produced the current row, so the planner materialises it as an
+		// aggregate output column rather than evaluating it per row
+		// (M0125-0048). The args still need scope resolution here so an
+		// unknown-column reference is caught the same way it would be for a
+		// plain SELECT-list column.
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
 				return catalog.Type{}, err
@@ -2407,7 +2440,11 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	return nil
 }
 
-func analyzeWith(with *parser.WithClause, ctx *scope) error {
+// analyzeWith registers a WITH list in ctx. stmtRoot says whether the
+// clause belongs to the statement being analyzed rather than to a nested
+// query level; only a root WITH may contain a data-modifying CTE (see the
+// dataModifyingCTENotTopLevel check below). M0125-0051.
+func analyzeWith(with *parser.WithClause, ctx *scope, stmtRoot bool) error {
 	if with == nil {
 		return nil
 	}
@@ -2431,6 +2468,18 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 		}
 
 		if cte.DMLBody != nil {
+			if !stmtRoot {
+				// PG disallows a data-modifying WITH anywhere but the top
+				// level of a query "because it's not clear when such a
+				// modification should be executed"
+				// (postgres/src/backend/parser/parse_cte.c:330-337,
+				// ERRCODE_FEATURE_NOT_SUPPORTED). goopg used to EXECUTE
+				// these: `SELECT v FROM (WITH x AS (INSERT … RETURNING a)
+				// SELECT a AS v FROM x) s` inserted a row and returned it.
+				// M0125-0051.
+				return analyzeError(cte.Pos(), "0A000",
+					"WITH clause containing a data-modifying statement must be at the top level")
+			}
 			// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE).
 			// Analysis is handled by the DML-specific planner when
 			// the CTE is planned; register with an empty table so
@@ -2470,7 +2519,9 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	// come from the leftmost branch below it. M0125-0020.
 	src := setOpLeftmostBranch(cte.Query)
 	if src.With != nil {
-		if err := analyzeWith(src.With, innerCtx); err != nil {
+		// A WITH inside a CTE body is a nested query level: PG rejects a
+		// data-modifying CTE declared there. M0125-0051.
+		if err := analyzeWith(src.With, innerCtx, false); err != nil {
 			return err
 		}
 	}
@@ -2717,7 +2768,11 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 	// (which walks the scope chain). buildSelectScope uses lookupTable which
 	// is catalog-only and silently drops CTE names. M0097-0098.
 	if src.With != nil {
-		_ = analyzeWith(src.With, innerCtx)
+		// Best-effort registration (the inner SELECT was already analyzed
+		// above, which is where a real error surfaces), so the error is
+		// still discarded here — but the WITH is a nested level, so pass
+		// stmtRoot=false. M0125-0051.
+		_ = analyzeWith(src.With, innerCtx, false)
 	}
 	if len(src.From) > 0 || len(src.FromExprs) > 0 {
 		rels, err := buildSelectScopeIn(src, innerCtx)

@@ -23,7 +23,14 @@ import (
 // ItemIDRedirect line pointers (created by opportunistic pruning when a chain
 // root is freed) are followed transparently — the redirect leads to the live
 // chain tip, skipping the freed slots.
-func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store) (storage.HeapTuple, uint16, bool) {
+// reveal (M0125-0053) may be nil; when non-nil it names slots whose own-xmax
+// the walk must ignore, so a read scan finds the pre-image of a row a
+// data-modifying CTE of this statement removed. It is checked INSIDE the walk
+// rather than on the result: the pre-image sits ahead of the CTE's new version
+// in the chain, so testing it only at the end would return the new version
+// (which the write fence then drops) and lose the row entirely. Every DML
+// target scan passes nil — see Context.CTEXmaxReveal.
+func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, reveal cteRevealFn) (storage.HeapTuple, uint16, bool) {
 	const maxChain = 64
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
@@ -48,7 +55,8 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid, mxs) {
+		if mvcc.TupleVisible(t.Header, snap, xid, mxs) ||
+			(reveal != nil && reveal(cur) && mvcc.TupleVisible(cteRevealHeader(t.Header), snap, xid, mxs)) {
 			return t, cur, true
 		}
 		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
@@ -68,7 +76,8 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 // PageGetHeapTupleNoCopy variant. Caller MUST hold the page's
 // content RLock for the lifetime of the returned tuple — the
 // returned tuple.Data aliases the page bytes (M0092-0006).
-func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store) (storage.HeapTuple, uint16, bool) {
+// reveal has the same meaning as in followHOTChain.
+func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, reveal cteRevealFn) (storage.HeapTuple, uint16, bool) {
 	const maxChain = 64
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
@@ -91,7 +100,8 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid, mxs) {
+		if mvcc.TupleVisible(t.Header, snap, xid, mxs) ||
+			(reveal != nil && reveal(cur) && mvcc.TupleVisible(cteRevealHeader(t.Header), snap, xid, mxs)) {
 			return t, cur, true
 		}
 		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
@@ -511,7 +521,17 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// rows, ~µs for wide rows) — bounded write-starvation,
 		// acceptable per the M0091-0002 audit.
 		slot.RLock()
-		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
+		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact,
+			cteRevealFor(o.ctx, o.heapRel, ptr.Block))
+		// M0125-0052: a row written by a data-modifying CTE of this statement
+		// is invisible to the rest of it. The seq-scan twin fences the same
+		// tuple (operators_storage.go), so which scan the planner picks must
+		// not decide the answer.
+		if found && cteFenced(o.ctx, o.heapRel, ptr.Block, actualSlot) {
+			slot.RUnlock()
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
 		if !found {
 			// C3-S2 kill-list oracle: invisible-to-me is upgraded to
 			// dead-to-ALL only when every HOT-chain member proves dead

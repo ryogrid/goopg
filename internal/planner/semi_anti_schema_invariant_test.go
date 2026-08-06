@@ -25,6 +25,11 @@ import (
 // in place is caught here regardless of where it lives.
 func TestSemiAntiJoinPublishesLeftOutput(t *testing.T) {
 	cat := semiAntiInvariantCatalog(t)
+//
+// M0127-P6.2 note: the MultiHashJoin node named below was deleted, so this
+// shape now plans as the left-deep binary hash cascade PG builds. The test is
+// kept unchanged — its assertions are about the RESULT, so it now guards the
+// cascade against the same defect the packed node once carried.
 
 	// Both conjunct orders, and base widths on either side of the
 	// >= 3-table threshold where MHJ packing re-sorts the layout.

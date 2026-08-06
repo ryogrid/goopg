@@ -18,8 +18,8 @@ package planner
 // `joinsearch_test.go`.
 //
 // What it DOES settle is the leaf-whitelist gap. `tryBushyDP` abandons the
-// entire search when any FROM item is not a `*SeqScan` / `*IndexScan` /
-// `*MultiHashJoin` (bushy.go:116-123) — a single subquery, CTE or VALUES item
+// entire search when any FROM item is not a `*SeqScan` / `*IndexScan`
+// (bushy.go's leaf whitelist) — a single subquery, CTE or VALUES item
 // disables join reordering for the whole statement (ledger rows M0125-0034 /
 // -0036, and M0125-0037 stage (ii)). `buildInitialRels` admits every FROM item
 // instead: each becomes one initial rel whose single path carries the leaf the
@@ -78,11 +78,12 @@ func pgShapedDPEnabled() bool { return pgShapedDP }
 
 // SetPGShapedJoinSearch pins the enumerator for a caller that needs the other
 // arm, and returns the previous value so it can be restored. It is the
-// cross-package form of `useLegacyEnumerator` (planner-internal, test-only) and
-// exists for the same reason `SetMHJPackingEnabled` does: after M0127-P5.9
-// flipped the default on, tests of the OLD enumerator's rule-driven rewrites —
-// MultiHashJoin packing above all, which the PG-shaped search never emits by
-// design (09 §3 clause 5) — live in packages that cannot reach a private var.
+// cross-package form of `useLegacyEnumerator` (planner-internal, test-only).
+// It exists because after M0127-P5.9 flipped the default on, tests of the OLD
+// enumerator's rule-driven rewrites live in packages that cannot reach a
+// private var. (Its sibling `SetMHJPackingEnabled` served the largest of those
+// rewrites, MultiHashJoin packing, which the PG-shaped search never emitted by
+// design — 09 §3 clause 5 — and went with the node at P6.2.)
 //
 // NOT for production use. The flag is read once at process start precisely so
 // a plan cannot change shape mid-statement; this setter breaks that guarantee
