@@ -570,6 +570,25 @@ type Context struct {
 	// between statements.
 	CTEWriteFence map[CTEFencePtr]struct{}
 
+	// CTEXmaxReveal is the write fence's mirror image: the set of tuples a DML
+	// CTE of this statement stamped xmax on (a CTE DELETE's victim, or the old
+	// version behind a CTE UPDATE). The fence HIDES rows a CTE added; this set
+	// SHOWS the pre-image of rows a CTE removed, because "the sub-statements
+	// cannot see one another's effects" cuts both ways and goopg's heap has no
+	// per-tuple command id to distinguish "deleted by an earlier command of
+	// this transaction" (invisible) from "deleted by this same command"
+	// (visible pre-image) — PG makes exactly that distinction by comparing
+	// cmax against es_output_cid in HeapTupleSatisfiesMVCC
+	// (postgres/src/backend/access/heap/heapam_visibility.c).
+	//
+	// Only READ scans consult it. A DML target scan must NOT: PG's ExecDelete
+	// and ExecUpdate take the TM_SelfModified arm for such a tuple and, when
+	// cmax equals es_output_cid, return NULL without touching the row
+	// ("already deleted by self; nothing to do", nodeModifyTable.c). Leaving
+	// the row unfound in the DML scan produces the same row count and the same
+	// heap state as finding it and declining to write. M0125-0053.
+	CTEXmaxReveal map[CTEFencePtr]struct{}
+
 	// CTENewToOld maps each new tuple added to CTEWriteFence to the
 	// original (pre-CTE) tuple it replaced. Used to detect when a sub-command
 	// within the CTE's expression evaluation modifies a CTE-written row, which

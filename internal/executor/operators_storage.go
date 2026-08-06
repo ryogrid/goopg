@@ -293,7 +293,10 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
+	// nil reveal: EPQ re-resolves a row a WRITE is about to touch, and a row a
+	// DML CTE of this statement already removed is "already deleted by self"
+	// for that write (M0125-0053, Context.CTEXmaxReveal).
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact, nil)
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
@@ -1526,7 +1529,14 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+			// M0125-0053: a tuple a data-modifying CTE of this statement
+			// deleted (or whose new version it wrote) is invisible only
+			// because it carries our OWN xmax; PG's cmax-vs-es_output_cid
+			// test still shows its pre-image to the rest of the statement,
+			// so reveal it here. curSlot was already advanced past it.
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) &&
+				!(cteRevealed(o.ctx, rel, o.curBlock, o.curSlot-1) &&
+					mvcc.TupleVisibleSubxact(cteRevealHeader(tuple.Header), o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact)) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -3948,7 +3958,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
+		// nil reveal: this is an UPDATE's target scan (M0125-0053).
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
@@ -5716,6 +5727,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
+			// M0125-0053: a DELETE inside a data-modifying CTE stamps our own
+			// xmax, which would hide the row from the rest of the statement —
+			// where PG still shows its pre-image.
+			cteFenceDelete(o.ctx, victimRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
@@ -6441,6 +6456,8 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if derr != nil {
 			return nil, derr
 		}
+		// M0125-0053: the DELETE … USING twin of the deleteOp.Next reveal.
+		cteFenceDelete(o.ctx, vRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
 		}

@@ -706,7 +706,10 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 				if perr == nil {
 					hotBuf.RLock()
-					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
+					// nil reveal: the arbiter probe asks whether a row is LIVE
+					// for a uniqueness conflict, and a pre-image a DML CTE of
+					// this statement deleted is not (M0125-0053).
+					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
 					hotBuf.RUnlock()
 					o.ctx.Pool.Unpin(hotBuf)
 					if liveFound && isLiveForUniqueCheck(o.ctx, liveTuple.Header.Xmin, liveTuple.Header.Xmax) {

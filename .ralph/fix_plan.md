@@ -5371,8 +5371,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `internal/executor/cte_dml_outer_dml_fence_test.go`, each pinned to a
       value captured from live PG 18.3. Gates: units PASS, TPC-H Q12=2/Q13=35,
       SF0.5 plan channel `same=99`. Successor filed as `M0125-0053`.
-- [ ] **M0125-0053 — the write fence hides rows a DML CTE ADDED but cannot show
-      rows it REMOVED** (filed 2026-08-06 by `M0125-0052`; ledger row same
+- [x] **M0125-0053 — the write fence hides rows a DML CTE ADDED but cannot show
+      rows it REMOVED** *(done 2026-08-06)* (filed 2026-08-06 by `M0125-0052`; ledger row same
       date). A CTE DELETE stamps xmax with our own XID, and a CTE UPDATE does
       the same to the old version whose new version is then fenced, so the row
       vanishes from the rest of the statement — where PG still shows its
@@ -5392,6 +5392,57 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       changes the visibility PREDICATE every scan and isolation test depends
       on. Bar: both witnesses above, plus the seven -0052 tests unchanged, the
       isolation suite, and TPC-H Q12=2/Q13=35.
+      **↳ LANDED 2026-08-06.** Design doc
+      `docs/design/0125-0053-dml-cte-preimage-reveal.md`; three ledger rows.
+      `ctx.CTEXmaxReveal` is the fence's mirror image on the same
+      `CTEFencePtr{Rel, Ptr}` key, populated by `cteFenceDelete` at both
+      `deleteOp` paths, MERGE's matched-DELETE, and `cteFenceUpdate`'s old key.
+      Both witnesses now match PG. Two findings the filing did not anticipate:
+      (1) **only READ scans may consult it** — that is PG's own structure, not a
+      shortcut, since `ExecDelete`/`ExecUpdate` return NULL for a tuple whose
+      cmax equals `es_output_cid` ("already deleted by self",
+      `nodeModifyTable.c`), so a DML target scan that never finds the row gives
+      the same row count and heap state; and the reveal must live INSIDE the
+      HOT-chain walk, because the pre-image sits ahead of the CTE's new version
+      and testing only the walk's result returns the new version, which the
+      fence then drops — losing the row entirely. (2) **membership is not a
+      licence to show the tuple.** The first cut forced visibility and broke
+      `TestPort_IsolationInsertConflictDoUpdate3` with a duplicate row: `INSERT
+      … ON CONFLICT DO UPDATE`'s documented MVCC violation lets it stamp a
+      version not visible to the command's snapshot, so `cteRevealHeader` clears
+      only `Xmax` and re-runs the ordinary test, leaving the xmin snapshot check
+      in force. Bar met: 6 new tests + the 7 unchanged -0052 tests, the full
+      `TestPort_Isolation*` suite (only the pre-existing `EvalPlanQual` failure,
+      nightly `AI-20260806-011323-001`, confirmed failing at HEAD without this
+      change), units gate, `tpch-spotcheck` Q12=2/Q13=35, TPC-DS SF0.5 plan
+      channel `queries=99 same=99 changed=0`. Successor filed as `M0125-0054`.
+- [ ] **M0125-0054 — goopg runs data-modifying CTEs BEFORE the outer statement;
+      PG runs them after it** (filed 2026-08-06 by `M0125-0053`, which found the
+      witnesses; ledger rows 2026-08-06 under -0053 and -0052). PG runs the main
+      plan first and only then any not-yet-completed data-modifying CTE, in
+      `ExecPostprocessPlan`
+      (`postgres/src/backend/executor/execMain.c`); goopg's `cteDMLPrefixOp`
+      runs every DML CTE before it even builds the outer body. Proved on live
+      PG 18.3 (2026-08-06): `WITH x AS (INSERT INTO ord_log VALUES ('cte')
+      RETURNING tag) INSERT INTO ord_log SELECT 'outer' RETURNING tag` places
+      'outer' at ctid **(0,1)** and 'cte' at **(0,2)**. -0052's ledger row
+      recorded this divergence as untestable; it is not. Four witnesses
+      distinguish the orders, because whichever sub-statement runs SECOND finds
+      the row already stamped and declines it: outer `DELETE` of a CTE-UPDATEd
+      row (PG `DELETE 1` / table `[2]`, goopg 0 rows / `[2 6]`); outer `UPDATE`
+      of a CTE-DELETEd row (PG `UPDATE 1` / `[2 101]`, goopg 0 rows / `[2]`);
+      outer `DELETE` of a CTE-DELETEd row (PG `DELETE 1`, goopg 0 rows); outer
+      `UPDATE` of a CTE-UPDATEd row (PG `UPDATE 1` / `[2 7]`, goopg 0 rows /
+      `[2 6]`). Reads are order-independent under the shared snapshot, so
+      -0053's visibility work is untouched by this and vice versa. Fix:
+      `cteDMLPrefixOp.Open` runs only the CTEs the outer body REFERENCES and
+      defers the rest to a post-`Next()` phase — `planner.CTEDMLPrefix` carries
+      the names but not the demand, so referenced-ness has to be computed at
+      plan time. Note the outer statement's own writes then have to enter
+      `CTEWriteFence`/`CTEXmaxReveal` too, so the deferred CTE cannot see them.
+      Bar: `TestCTEPreImageWriteWriteDivergesFromPG` inverted to PG's answers
+      (it exists precisely to flip), the seven -0052 and six -0053 tests
+      unchanged, the isolation suite, and TPC-H Q12=2/Q13=35.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor

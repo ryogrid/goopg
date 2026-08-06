@@ -1044,5 +1044,10 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	return derr
+	if derr != nil {
+		return derr
+	}
+	// M0125-0053: MERGE's WHEN MATCHED THEN DELETE twin of the deleteOp reveal.
+	cteFenceDelete(ctx, rel, storage.ItemPointer{Block: blk, Offset: slot})
+	return nil
 }

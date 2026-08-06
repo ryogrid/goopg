@@ -63,6 +63,72 @@ func cteFenceUpdate(ctx *Context, oldRel storage.RelFileNode, oldPtr storage.Ite
 	if ctx.CTENewToOld != nil {
 		ctx.CTENewToOld[newKey] = oldKey
 	}
+	// The old version now carries our own xmax, which would hide it from the
+	// rest of the statement — but PG still shows its PRE-IMAGE there. Reveal
+	// it. M0125-0053.
+	cteFenceDelete(ctx, oldRel, oldPtr)
+}
+
+// cteFenceDelete registers a tuple whose xmax this DML CTE just stamped, so
+// read scans in the rest of the statement still see its pre-image. No-op
+// outside a DML CTE. See Context.CTEXmaxReveal for why writes must not
+// consult the set this fills.
+func cteFenceDelete(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
+	if !ctx.InDMLCTE || ctx.CTEXmaxReveal == nil {
+		return
+	}
+	ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: ptr}] = struct{}{}
+}
+
+// cteRevealFn answers "is this slot of the page being scanned a pre-image a
+// DML CTE of this statement removed?". nil means no reveal is in effect —
+// which is the case for every statement that has no data-modifying WITH, and
+// for every DML target scan regardless.
+type cteRevealFn func(slot uint16) bool
+
+// cteRevealed is the direct (non-closure) form of cteRevealFn, for read scans
+// that test one slot at a time rather than walking a HOT chain.
+func cteRevealed(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
+	if len(ctx.CTEXmaxReveal) == 0 {
+		return false
+	}
+	_, ok := ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
+	return ok
+}
+
+// cteRevealHeader returns h with its xmax cleared, so the ordinary visibility
+// test judges the tuple as if this statement's DML CTE had never stamped it.
+//
+// Being in CTEXmaxReveal is NOT on its own a licence to show the tuple: PG
+// relaxes only the cmax arm of HeapTupleSatisfiesMVCC, and the xmin snapshot
+// test still has to pass. The difference is not academic — INSERT … ON
+// CONFLICT DO UPDATE carries a documented MVCC violation that lets it update a
+// tuple *not visible to the command's snapshot* (see the header comment of
+// postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec), so a
+// CTE upsert can stamp a version this statement was never allowed to see.
+// Revealing that version unconditionally produced a duplicate key in
+// TestPort_IsolationInsertConflictDoUpdate3: the snapshot-visible version of
+// the row was returned alongside it.
+//
+// Clearing Xmax alone is sufficient — TupleVisible/TupleVisibleSubxact reach
+// no xmax infomask bit once Xmax is invalid — and the header is passed by
+// value, so the caller's tuple is untouched.
+func cteRevealHeader(h storage.HeapTupleHeader) storage.HeapTupleHeader {
+	h.Xmax = storage.InvalidTransactionID
+	return h
+}
+
+// cteRevealFor builds the reveal predicate for a read scan of one heap block,
+// or returns nil when there is nothing to reveal. Returning nil rather than an
+// always-false closure keeps the ordinary scan path allocation-free.
+func cteRevealFor(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber) cteRevealFn {
+	if ctx == nil || len(ctx.CTEXmaxReveal) == 0 {
+		return nil
+	}
+	return func(slot uint16) bool {
+		_, ok := ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
+		return ok
+	}
 }
 
 // cteFenced reports whether a tuple was written by a DML CTE of this
@@ -127,6 +193,7 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	// PostgreSQL CTE semantics hold (outer SELECT sees pre-CTE state).
 	savedSnap := ctx.Snap
 	ctx.CTEWriteFence = make(map[CTEFencePtr]struct{})
+	ctx.CTEXmaxReveal = make(map[CTEFencePtr]struct{})
 	ctx.CTENewToOld = make(map[CTEFencePtr]CTEFencePtr)
 	ctx.CTESelfModifiedErrors = make(map[CTEFencePtr]struct{})
 	ctx.InDMLCTE = true

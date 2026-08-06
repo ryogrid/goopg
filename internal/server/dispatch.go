@@ -913,6 +913,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// a CTE named "q" in query 1 must not bleed into query 2 (they may
 		// produce different rows). CTEWriteFence is cleared for the same reason.
 		ectx.CTEWriteFence = nil
+		ectx.CTEXmaxReveal = nil
 		ectx.CTENewToOld = nil
 		ectx.CTESelfModifiedErrors = nil
 		ectx.CTESelfModErr = nil
