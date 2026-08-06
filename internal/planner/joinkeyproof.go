@@ -11,8 +11,10 @@ package planner
 //
 // WHY THIS FILE EXISTS SEPARATELY FROM joinrelsize.go. The same mechanism is
 // already implemented, reviewed and unit-tested on the PG-shaped DP path
-// (`superkeyJoinSelectivity`, joinrelsize.go), but that path is inert
-// (`GOOPG_PGSHAPED_DP` is OFF until P5.9) and its inputs are `RelOptInfo`s and
+// (`superkeyJoinSelectivity`, joinrelsize.go). That path is no longer inert —
+// P5.9 flipped `GOOPG_PGSHAPED_DP` ON by default on 2026-08-06, so BOTH arms
+// now run in production and the sibling-paths rule below binds harder than when
+// this file was written, not more weakly. Its inputs are `RelOptInfo`s and
 // `restrictInfo`s — a coordinate space the production planner's finished plan
 // tree does not have. The production estimator is `estimateJoin`
 // (cardinality.go), which sees `*Join` nodes, merged left‖right ColumnRef

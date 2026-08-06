@@ -41,9 +41,9 @@ package planner
 //     is 03 §10's coordinate-map assertion (P5.5-f), which attaches at the
 //     search boundary, not per arm.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan and no row can move. Validated in isolation by
-// `createplansimple_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so plans and rows DO move here. Validated by
+// `createplansimple_test.go`, no longer in isolation.
 
 import "fmt"
 

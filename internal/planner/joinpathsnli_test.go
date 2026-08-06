@@ -3,9 +3,11 @@ package planner
 // M0127-P5.4b-ii-b-1 — the NLI arm (joinpathsnli.go) and the pairwise-union
 // parameterisations that feed it (pathparamindex.go).
 //
-// The arm is inert in the same sense P5.4b-ii-a's paths were — `GOOPG_PGSHAPED_DP`
-// is OFF and nothing calls the search from `planSelect` — so these tests are
-// the only thing that can falsify it. What they pin, in order: that the arm
+// The arm is LIVE in the same sense P5.4b-ii-a's paths are, since M0127-P5.9
+// (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the
+// search, so these tests are no longer the only thing that can falsify it —
+// they are the only thing that can falsify it CHEAPLY. What they pin, in
+// order: that the arm
 // closes the hole P5.4b-i opened, that it costs the rescan from the inner PATH
 // rather than from the inner REL (the mis-costing PG moves the pair here to
 // avoid), that a clause already enforced as an index qual is not charged twice

@@ -2,9 +2,10 @@ package planner
 
 // M0127-P5.4c-ii-a — `build_index_pathkeys` (pathkeysindex.go).
 //
-// These tests are the falsifiable half of the slice. The paths are still inert
-// (`GOOPG_PGSHAPED_DP` OFF, no `planSelect` call site), so nothing else in the
-// repository can observe whether the recorded ordering is right; what is pinned
+// These tests are the falsifiable half of the slice. The paths are LIVE since
+// M0127-P5.9 (2026-08-06) — `GOOPG_PGSHAPED_DP` defaults ON and `planSelect`
+// calls the search — so the repository CAN now observe a wrong recorded
+// ordering, just far more expensively than here; what is pinned
 // here is each of PG's loop rules separately — INCLUDE columns excluded,
 // per-column ASC/DESC and NULLS placement, backward inversion of BOTH, the STOP
 // (not skip) on an unusable column, non-orderable access methods, and the

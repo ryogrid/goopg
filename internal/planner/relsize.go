@@ -183,10 +183,10 @@ func applyRelSizeFallback(info *baseRelInfo, binding rangeBinding, scan Node, lo
 }
 
 // Relation size and width estimation — the inputs the cost model's per-node cost
-// functions consume. See docs/design/cost-model/ chapter 05. These are pure
-// helpers in phase C2; nothing in the live planner calls them yet (selection is
-// still the integer DP), so they cannot change a plan. They are wired into path
-// generation in C3/C4.
+// functions consume. See docs/design/cost-model/ chapter 05. These began as
+// pure phase-C2 helpers; the C3/C4 wiring they were waiting for landed, and
+// since M0127-P5.9 (2026-08-06) `GOOPG_PGSHAPED_DP` defaults ON, so the live
+// search consumes them and they DO move plans.
 //
 // The load-bearing piece is the estimate_rel_size ROW FALLBACK (§4): column
 // statistics survive a restart but TableStats.RowCount does not (ledger pq-P6),

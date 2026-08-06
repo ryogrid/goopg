@@ -40,10 +40,25 @@ package planner
 // would require the row count at derivation time, which is exactly what the
 // planner does not have there.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06), and it acquired a PRODUCER
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
-// no plan and no row can move. Validated by `tuplefraction_test.go`.
+// Two separate things changed, and P5.7-b's own ledger row named only the
+// second as missing. `GOOPG_PGSHAPED_DP` defaults ON, so `finalPath` →
+// `getCheapestFractionalPath` runs on real statements; and P5.9-b added the
+// production producer this file was written without — `searchTupleFraction`
+// (joinsearchseam.go:579), called from `planSelect` (planner.go:1128) at
+// upstream's point in the order, before the search builds its first rel.
+//
+// The RETENTION half is live even for a query with no LIMIT, and that is the
+// non-obvious part: `ConsiderStartup` is set from `tupleFraction > 0`, so a
+// fraction of 0 does not mean "this file is doing nothing" — it means
+// `comparePathCostsFuzzily` is actively PRUNING fast-start paths that goopg
+// used to keep. Absent LIMIT is a decision here, not an abstention.
+//
+// One producer, one assignment site (planner.go:1128), and it is not a
+// coverage gap: the only other `planSelect` arm that skips it is the
+// `isSimpleSingle` index path, which is single-relation and never reaches the
+// join search at all.
 
 // unestimatableLimitFraction is PG's punt when LIMIT or OFFSET is not a
 // constant: "for lack of a better idea, assume 10% of the plan's result is

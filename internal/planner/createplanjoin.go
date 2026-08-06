@@ -67,9 +67,10 @@ package planner
 // separate pieces of code drift, and the drift is a wrong-column join that still
 // runs.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan and no row can move. Validated in isolation by
-// `createplanjoin_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so this arm builds production join trees and
+// a wrong-column join here returns wrong rows. `createplanjoin_test.go` is no
+// longer its only observer.
 
 import (
 	"fmt"

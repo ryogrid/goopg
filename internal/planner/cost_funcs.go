@@ -21,9 +21,19 @@ func envFloatDefault(key string, def float64) float64 {
 
 // Per-node cost functions, reproduced from PostgreSQL's costsize.c in PG's units
 // (seq_page_cost = 1.0). See docs/design/cost-model/ chapter 02. Phase C3.1:
-// pure functions plus the cost constants; nothing selects on them yet (path
-// generation is C3.2, selection is C4), so they cannot change a plan. Each is
-// unit-tested against a hand-computed oracle value (cost_funcs_test.go).
+// pure functions plus the cost constants. Each is unit-tested against a
+// hand-computed oracle value (cost_funcs_test.go).
+//
+// # Live since M0127-P5.9 (2026-08-06)
+//
+// The former banner here read "nothing selects on them yet (path generation is
+// C3.2, selection is C4), so they cannot change a plan". That is FALSE at HEAD
+// and was the most dangerous of the package's surviving inertness claims,
+// because this is the file `hashJoinCost` lives in: `GOOPG_PGSHAPED_DP` now
+// defaults ON (`pgShapedDPFromEnv` is `v != "0"`), `planSelect` calls the
+// search, and `addHashJoinPath` (pathgen.go) prices every hash path the live
+// search considers. A change to any function below MOVES PRODUCTION PLANS and
+// carries the full planner bar (UNITS + SPOT + DS05), not a unit test alone.
 //
 // All costs are absolute and in one unit, so a scan, a sort, a join, and a
 // Gather are directly comparable — invariant #1 of the design README. "Relative

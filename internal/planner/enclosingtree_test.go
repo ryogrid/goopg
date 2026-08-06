@@ -3,8 +3,10 @@ package planner
 // M0127-P5.5-f-ii-b — the enclosing-tree tripwire and the pinned spine's
 // consumption of the boundary map (enclosingtree.go, predp.go).
 //
-// Both are inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are their only observer. The unusual one is
+// Both are LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer their only observer — enclosingtree.go's own header
+// already records the correction. The unusual one is
 // `TestEnclosingTripwireRefusesToPassVacuously`: it asserts that the tripwire
 // FAILS on a tree it cannot check, which is the lesson P5.5-f-ii-a paid for —
 // an assertion that abstains silently is a false green, and a partial tree walk

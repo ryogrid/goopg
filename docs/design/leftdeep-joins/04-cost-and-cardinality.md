@@ -407,6 +407,69 @@ subquery-inherited fractions have no path to `preprocessLimit`'s caller
 argument, which is nonetheless ported whole so the absolute-vs-fractional
 heuristics are not reconstructed later from a simplified version.
 
+### 4.4 The bar that expired: what closing P5.7 actually cost (2026-08-06)
+
+The P5.7 roll-up's stated bar was **UNITS + PLAN (default arm ZERO diffs)**, and
+by the time it was read that bar could no longer be stated. Both sub-items had
+recorded a careful-sounding justification for skipping PLAN — *"not applicable
+and the reason is structural, not a skip: every consumer is behind an
+OFF-by-default gate"* — which was **true when written and false hours later**:
+
+| what | when |
+|---|---|
+| P5.7-a lands (`hashJoinCost` spill term) | 2026-08-05 12:20 (`9d500fce`) |
+| P5.7-b lands (LIMIT fraction + `ConsiderStartup`) | 2026-08-05 12:47 (`0391d36c`) |
+| P5.9 acceptance run 4 | 2026-08-06 01:04 (`23dcc60e`) |
+| **P5.9 flips `GOOPG_PGSHAPED_DP` ON by default** | 2026-08-06 02:22 (`b92582fb`) |
+
+Two consequences, and they point in opposite directions.
+
+**The bar is void, not failed.** "Zero diffs in the default arm" was a
+*containment* check: it asked whether a pricing change leaked out of an inert
+search. Post-flip the default arm is *supposed* to move plans — that is what the
+flip is for — so re-running PLAN and finding diffs would prove nothing about
+P5.7. What discharges P5.7 is the ordering above: both halves were already in
+the tree the flip's own acceptance measured (Q9 final joinrel 6.3× against the
+≤10² bar, `parity_violations=0`). P5.7's plan movement *was* measured, under
+P5.9's label rather than its own.
+
+**But the claim it rested on became a hazard.** `hashJoinCost` is now reached on
+every hash path the live search considers (`addHashJoinPath`, pathgen.go ←
+`addPathsToJoinrel`, joinpaths.go:197), and `finalPath` →
+`getCheapestFractionalPath` runs on every searched statement. A later loop
+reading P5.7-a's paragraph would conclude that a `cost_funcs.go` change needs no
+planner gate. That conclusion is now wrong.
+
+It was not confined to P5.7. **28 files in `internal/planner/` still carried
+`Still inert: GOOPG_PGSHAPED_DP is OFF … so they cannot change a plan`
+headers**, `cost_funcs.go` — the file `hashJoinCost` lives in — among them.
+Those banners function as gate-skip authority, so each was corrected to state
+post-flip reachability, **verified per file** rather than blanket-rewritten.
+Three did not come out like the rest:
+
+- **`collapse.go`** — its joinlist IS consumed now (`tryPGShapedJoinSearch`
+  reads `ctx.joinlist`, joinsearchseam.go:162/170). Only the narrower
+  `GOOPG_PGSHAPED_COLLAPSE` arm (explicit INNER JOIN flattening) is still off,
+  so production consumes a *today-shaped* joinlist through a *live* reader. "The
+  collapse flag is off" must not be read as "this file cannot move a plan".
+- **`tuplefraction.go`** — P5.7-b's third ledger row ("no production PRODUCER of
+  a fraction yet") is **discharged**: P5.9-b added `searchTupleFraction`
+  (joinsearchseam.go:579) called from `planSelect` (planner.go:1128), at
+  upstream's point in the order. Checked for the sibling-path gap this invites:
+  there is none — the only arm that skips the assignment is `isSimpleSingle`,
+  which is single-relation and never reaches the join search. Note the half that
+  is live *even with no LIMIT*: `ConsiderStartup` is `tupleFraction > 0`, so a
+  fraction of 0 actively PRUNES fast-start paths rather than abstaining.
+- **`exprwalk.go`** — "inert until a caller opts in" is stale too, but for a
+  different reason (M0125-0002's walker conversion, not the flip). Left alone
+  and ledgered rather than corrected on a guess.
+
+The general lesson for this milestone: **an inertness claim has an expiry date
+that the flag flip does not automatically write.** A flag flip is not one commit
+that changes one default — it silently invalidates every comment, task
+justification and skipped gate that cited the old default, and none of them are
+in the flip's own diff.
+
 ## 5. Inferred edges: from admissibility penalty to selectivity honesty
 
 Today `isInferred` edges carry a ×2.0 cost penalty (`inferredEdgePenalty`,

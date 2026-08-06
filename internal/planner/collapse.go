@@ -67,15 +67,24 @@ package planner
 // ports the joinlist RESULT and only that — which is exactly the part
 // `make_rel_from_joinlist` (allpaths.c:3391) consumes.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06) — but read the split carefully
 //
 // `deconstructJointree` runs on every planned SELECT (it is computed beside the
 // bindings in `planFromClause`, which is the one place the leaf numbering and
-// the binding order are guaranteed to agree), but nothing READS the result yet:
-// `GOOPG_PGSHAPED_DP` is OFF and no `planSelect` call site hands a joinlist to
-// the search. P5.9 is the wiring. The pass is therefore pure, allocation-light
-// and cannot fail — it has no error return because there is no malformed FROM
-// clause it could reject that the parser would have accepted.
+// the binding order are guaranteed to agree). The result is now READ:
+// `tryPGShapedJoinSearch` consults `ctx.joinlist` (joinsearchseam.go:162,170)
+// and `GOOPG_PGSHAPED_DP` defaults ON, so the header's former claim that
+// "nothing READS the result yet" is false.
+//
+// What IS still off is the narrower thing — `pgShapedCollapse`
+// (`GOOPG_PGSHAPED_COLLAPSE`, `v == "1"`, default off) gates only explicit
+// INNER JOIN FLATTENING. So production consumes a joinlist whose SHAPE is
+// today's (a JOIN chain still enters as one opaque item) via a live reader.
+// Do not read "the collapse flag is off" as "this file cannot move a plan".
+//
+// The pass is pure, allocation-light and cannot fail — it has no error return
+// because there is no malformed FROM clause it could reject that the parser
+// would have accepted.
 
 import (
 	"os"

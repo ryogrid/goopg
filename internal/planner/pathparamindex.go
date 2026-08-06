@@ -20,9 +20,11 @@ package planner
 // arm that consumes it is the last of the three. Each step is separately
 // falsifiable, which a single combined change would not be.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so these paths cannot change a plan. Validated in isolation by
-// `pathparamindex_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `addParameterizedIndexPaths` is reached
+// from `searchOneProblem` via `addBaseRelIndexPaths` (pathindexordered.go:49)
+// and `GOOPG_PGSHAPED_DP` defaults ON, so these paths DO compete for
+// production plans. Validated by `pathparamindex_test.go`, no longer in
+// isolation.
 
 import (
 	"math"

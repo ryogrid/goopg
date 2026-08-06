@@ -1247,8 +1247,24 @@
   `consider_param_startup` unreachable behind 03 §4.4's pin, and no production
   producer of a fraction yet. Still inert — no `planSelect` call site,
   `GOOPG_PGSHAPED_DP` OFF. Bar met: UNITS. PLAN not applicable for the same
-  structural reason as P5.7-a: every consumer is behind an OFF-by-default gate.)*
+  structural reason as P5.7-a: every consumer is behind an OFF-by-default gate.
+  **↳ Both "still inert" claims EXPIRED 2026-08-06** when P5.9 flipped
+  `GOOPG_PGSHAPED_DP` on by default, and the third ledger row is DISCHARGED:
+  P5.9-b's `searchTupleFraction` is the production producer. See the P5.7
+  roll-up below.)*
   [04](04-cost-and-cardinality.md) §4.3.
+- [x] **P5.7** (roll-up) nbatch-aware `hashJoinCost` + the LIMIT Startup/Total
+  split. *(CLOSED 2026-08-06. Both sub-items were already `[x]`; what the
+  roll-up owed was its BAR — "PLAN, default arm ZERO diffs" — whose premise
+  expired between the sub-items landing (2026-08-05 12:20/12:47) and this read.
+  P5.9 flipped `GOOPG_PGSHAPED_DP` ON at 2026-08-06 02:22, so the zero-diff
+  containment check can no longer be stated: the default arm is now supposed to
+  move plans. What discharges P5.7 instead is that both halves were in the tree
+  the flip's own acceptance measured — run 4 (`23dcc60e`, 01:04) and the
+  default-arm audit (Q9 final joinrel 6.3×, parity_violations=0) both post-date
+  them. Same commit swept the 28 planner files whose "Still inert" headers had
+  outlived the flip, `cost_funcs.go` — where `hashJoinCost` lives — among them.
+  Bar met: UNITS + SPOT.)* [04](04-cost-and-cardinality.md) §4.4.
 - [x] **P5.8** Collapse limits wired with PG's actual semantics (03 §6:
   flat comma lists are always ONE problem; limits govern sub-joinlists and
   explicit JOINs only; =1 pin semantics); explicit INNER JOIN flattening

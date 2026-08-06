@@ -30,9 +30,10 @@ package planner
 // is a path PG would emit for the same pair, and the sort it charges for is a
 // sort PG would charge for.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan can move. Validated in isolation by
-// `joinpathsmerge_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `sortInnerAndOuter` is called from
+// `addPathsToJoinrel` (joinpaths.go:188) and `GOOPG_PGSHAPED_DP` defaults ON,
+// so the merge paths this file emits DO compete for production plans.
+// Validated by `joinpathsmerge_test.go`, no longer in isolation.
 
 // mergeKeyGroup is one distinct sort key of a merge join, together with every
 // clause that key serves.

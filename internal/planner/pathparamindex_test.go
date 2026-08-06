@@ -2,10 +2,11 @@ package planner
 
 // M0127-P5.4b-ii-a — parameterised base index paths (pathparamindex.go).
 //
-// These tests are the falsifiable half of the slice: the paths are inert
-// (`GOOPG_PGSHAPED_DP` OFF, no `planSelect` call site), so nothing else in the
-// repository can observe whether the parameterisation, the row count or the
-// cost is right. What they pin, in order: which clauses qualify, which index is
+// These tests are the falsifiable half of the slice. The paths are LIVE since
+// M0127-P5.9 (2026-08-06) — `GOOPG_PGSHAPED_DP` defaults ON and `planSelect`
+// calls the search — so a wrong parameterisation, row count or cost IS now
+// observable elsewhere in the repository, at planner-bar expense rather than
+// here. What they pin, in order: which clauses qualify, which index is
 // accepted, what `ppi_rows` comes out as, and — the property the whole 03 §9
 // discipline exists for — that a parameterised path never displaces the rel's
 // unparameterised representative.

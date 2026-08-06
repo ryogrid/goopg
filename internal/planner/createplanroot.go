@@ -51,11 +51,11 @@ package planner
 // is already binding order (the leading case — a left-deep tree whose outer
 // spine starts at FROM item 0), which is the projection elision §10 anticipated.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06)
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
-// no plan and no row can move. `createplanroot_test.go` is this file's only
-// observer.
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so this
+// file builds the executor tree production actually runs: plans and rows DO
+// move here. `createplanroot_test.go` is no longer its only observer.
 
 import (
 	"fmt"

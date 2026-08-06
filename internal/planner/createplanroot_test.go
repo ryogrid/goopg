@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.5-f-i — the search boundary (createplanroot.go).
 //
-// The boundary is inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are its only observer. What they pin is the property
+// The boundary is LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer its only observer. What they pin is the property
 // the whole task exists for: a reference written in PRE-SEARCH BINDING
 // coordinates — which is every reference the enclosing tree holds — must resolve
 // to the same column after the search as before it, no matter how the search

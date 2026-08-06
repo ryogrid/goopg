@@ -7986,12 +7986,49 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       constant handling, UPDATE/DELETE quals, `extract_restriction_or_clauses`).
       Watch list still open from g-iii (>10× the reference, under the 100×
       floor): Q16 84.9× vs 2.0×, Q20 32.1× vs 1.1×, Q14 12.4× vs 1.0×.
-- [ ] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
+- [x] **M0127-P5.7 — nbatch-aware `hashJoinCost`** (shared sizing fn);
       Startup/Total split for LIMIT-over-join. IMPLEMENTATION-TODO P5.7; 04 §4;
       06 §5. Bar: UNITS + PLAN (default arm ZERO diffs). **DECOMPOSED into -a
       (the spill term, pricing) and -b (the LIMIT fraction, selection) below —
       they touch different halves of the search and have different blast
       radii.**
+      **CLOSED 2026-08-06. The roll-up's residue was its own BAR, whose premise
+      expired between the sub-items landing and this read.** Both -a and -b
+      recorded "PLAN not applicable, and the reason is structural, not a skip:
+      every consumer is behind an OFF-by-default gate". That was true when
+      written (2026-08-05 12:20 and 12:47) and is FALSE at HEAD: P5.9 flipped
+      `GOOPG_PGSHAPED_DP` ON by default at 2026-08-06 02:22 (`pgShapedDPFromEnv`
+      is `v != "0"`), so `hashJoinCost` is now reached on every hash path the
+      live search considers (`addHashJoinPath`, pathgen.go ← joinpaths.go:197)
+      and `finalPath` → `getCheapestFractionalPath` runs on every searched
+      statement.
+      **So "PLAN, default arm ZERO diffs" is not a gate that was skipped — it is
+      a gate that can no longer be stated.** Post-flip the default arm is
+      *supposed* to move plans; zero-diff was a containment check on an inert
+      search. What actually discharges P5.7 is that both halves were IN THE TREE
+      the flip's own acceptance measured: run 4 (`23dcc60e`, 2026-08-06 01:04)
+      and the default-arm audit
+      (`analysis/leftdeep-joins/2026-08-05-p59run4-audit-off.txt`, Q9 final
+      joinrel 6.3×, parity_violations=0) both post-date the sub-items. P5.7's
+      plan movement was measured — under P5.9's label, never under its own.
+      **Discharged while closing this:** P5.7-b's ledger row "no production
+      PRODUCER of a fraction yet" is resolved — P5.9-b added
+      `searchTupleFraction` (joinsearchseam.go:579) called from planner.go:1128.
+      Checked for the sibling-path trap this invites (rule #2) and there is no
+      gap: the one `planSelect` arm that skips the assignment is the
+      `isSimpleSingle` index path, which is single-relation and never reaches
+      the join search.
+      **The defect this exposed is bigger than P5.7 and is fixed in the same
+      commit:** the inertness claim was not confined to these two items. 28
+      files in `internal/planner/` still carried "Still inert: `GOOPG_PGSHAPED_DP`
+      is OFF … so they cannot change a plan" headers, including `cost_funcs.go`
+      — the file `hashJoinCost` lives in. Those banners are read as gate-skip
+      authority by later loops, so each was corrected to state post-flip
+      reachability, verified per file rather than blanket-rewritten. Two came
+      out differently from the rest: `collapse.go` (its joinlist IS consumed at
+      joinsearchseam.go:162/170; only the narrower `GOOPG_PGSHAPED_COLLAPSE`
+      flattening arm is still off) and `exprwalk.go` (a different stale claim,
+      owned by M0125-0002 — left alone, ledgered). Bar met: UNITS + SPOT.
 - [x] **M0127-P5.7-a — the spill term: `hashJoinCost` prices the geometry the
       executor will actually build.** DONE 2026-08-05. `hashJoinCost`
       (`internal/planner/cost_funcs.go`) now takes a `hashJoinInputs` struct and
@@ -8026,6 +8063,13 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       skip: both `hashJoinCost` callers are behind OFF-by-default gates
       (`costDrivenJoinOrder`, and the PG-shaped DP, which has no `planSelect`
       caller at all), so the default arm has zero *reachable* plan movement.
+      **↳ EXPIRED 2026-08-06 (M0127-P5.7 roll-up).** The sentence above was true
+      when written and is false at HEAD: P5.9 flipped `GOOPG_PGSHAPED_DP` ON by
+      default hours later, so `hashJoinCost` now prices every hash path the live
+      search considers via `addHashJoinPath`. This item is NOT reopened — the
+      flip's own acceptance measured a tree that already contained this spill
+      term — but do not cite this paragraph as evidence that a `cost_funcs.go`
+      change is unreachable. It no longer is.
 - [x] **M0127-P5.7-b — the LIMIT fraction: nothing SELECTED on startup cost.**
       DONE 2026-08-05. `internal/planner/tuplefraction.go` ports
       `preprocess_limit` (planner.c:2577) → `get_cheapest_fractional_path`
@@ -8069,6 +8113,14 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       as P5.7-a — every consumer is behind an OFF-by-default gate
       (`GOOPG_PGSHAPED_DP`, and the search has no `planSelect` caller at all),
       so the default arm has zero reachable plan movement.
+      **↳ EXPIRED 2026-08-06 (M0127-P5.7 roll-up), on BOTH clauses.** P5.9
+      flipped `GOOPG_PGSHAPED_DP` ON by default, so `finalPath` →
+      `getCheapestFractionalPath` runs on every searched statement; and P5.9-b
+      supplied the production PRODUCER this item's third ledger row said did not
+      exist (`searchTupleFraction`, joinsearchseam.go:579 ← planner.go:1128).
+      Note the half that is live even with NO LIMIT: `ConsiderStartup` is
+      `tupleFraction > 0`, so fraction 0 is an active decision to PRUNE
+      fast-start paths, not an abstention.
 - [x] **M0127-P5.8 — collapse limits with PG's actual semantics.**
       DONE 2026-08-05. `internal/planner/collapse.go` ports the JOINLIST half of
       `deconstruct_recurse` (initsplan.c:1148-1452) — and only that half: the

@@ -60,13 +60,13 @@ package planner
 //
 // So no clause is placed twice and none is lost, without a placement pass.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06)
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing in `planSelect` calls this yet — the
-// production seam (`tryBushyDP` / `runJoinSearchBelowPinned`) is P5.9-b, which
-// must also decide which conjuncts the search consumed before the residual
-// `Filter` above it is rebuilt. Validated in isolation by
-// `relfromjoinlist_test.go`.
+// The production seam this header was waiting on landed: P5.9-b wired
+// `tryBushyDP` / `runJoinSearchBelowPinned` → `tryPGShapedJoinSearch` →
+// `planJoinlistSearch`, and `GOOPG_PGSHAPED_DP` defaults ON. This recursion
+// runs on real statements; `relfromjoinlist_test.go` is no longer its only
+// observer.
 
 import (
 	"fmt"

@@ -2,9 +2,12 @@ package planner
 
 // M0127-P5.8 — the collapse pass (collapse.go, 03 §6).
 //
-// The pass is inert in production (`GOOPG_PGSHAPED_COLLAPSE` off, and nothing
-// reads `resolveContext.joinlist` until P5.9), so these tests are the whole
-// specification. They are written against the PG behaviours the file claims to
+// `resolveContext.joinlist` IS read in production since M0127-P5.9
+// (2026-08-06) — `tryPGShapedJoinSearch` consults it — so only the narrower
+// `GOOPG_PGSHAPED_COLLAPSE` arm (explicit INNER JOIN flattening) is still off
+// by default. These tests are therefore no longer the whole specification,
+// though they remain the whole specification of the flattening arm. They are
+// written against the PG behaviours the file claims to
 // port, not against the implementation's shape: each names the upstream line it
 // pins.
 //

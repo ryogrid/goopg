@@ -1,59 +1,59 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.6 roll-up CLOSED** — every sub-item was already `[x]`; what
-the roll-up still owed was the residue in its own body and the acceptance re-read.
+Last loop: **M0127-P5.7 roll-up CLOSED.** Both sub-items were already `[x]`; the
+residue was the roll-up's own BAR, and the finding is that **the bar's premise
+expired between the sub-items landing and this read.**
 
-**The residue was "re-evaluate M0125-0003 stage 3 against 04 §2's rows-once
-discipline", and the answer is that stage 3 is not a staged flag consumer and
-never will be.** Stage 3 was filed as "make `estimateBaseRelInfo.baseRows`
-positive cold"; under the OLD DP that would have SHADOWED the stage-2 seed tier,
-and sequencing that shadowing is the entire reason the flag was staged. Rows-once
-deletes the second consumer — the search reads a base rel's cardinality exactly
-once, `initialRelRows` → `baseRelInfo.filteredRows` — so the placement is simply
-correct at the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` stays a
-documented alias for stage-2 behaviour.
+-a and -b each recorded "PLAN not applicable, and the reason is structural, not
+a skip: every consumer is behind an OFF-by-default gate". True when written
+(2026-08-05 12:20 / 12:47), FALSE at HEAD: P5.9 flipped `GOOPG_PGSHAPED_DP` ON
+by default at 2026-08-06 02:22 (`pgShapedDPFromEnv` = `v != "0"`; the spotcheck
+banner prints `GOOPG_PGSHAPED_DP=unset(on)`). `hashJoinCost` is now reached on
+every hash path the live search considers (`addHashJoinPath` ← joinpaths.go:197)
+and `finalPath` → `getCheapestFractionalPath` runs on every searched statement.
 
-Landed as `applyRelSizeFallback` (relsize.go) replacing joinsearchseam.go's inline
-tier, in upstream's order: `estimate_rel_size` (plancat.c:1075) supplies pre-filter
-`tuples`, `set_baserel_size_estimates` (costsize.c:5378) multiplies by
-`clauselist_selectivity` — here `applyLocalFilterSelectivity`, factored out of
-`estimateBaseRelInfo` so the twins cannot drift (rule #2).
+**"Zero diffs in the default arm" is void, not failed** — it was a containment
+check on an inert search; post-flip the default arm is *supposed* to move plans.
+What discharges P5.7 is that both halves were in the tree the flip's own
+acceptance measured (run 4 `23dcc60e` 01:04, and the default-arm audit: Q9 final
+joinrel 6.3×, `parity_violations=0`) — measured under P5.9's label, never P5.7's.
 
-**Why it is a re-derivation, and the one place it is NOT:** the fallback fires
-only when `tableRows` answered 0, and for `Stats == nil` that is also the state
-where `columnStatsForChild` answers nil for every column → every clause
-`reliable=false` → unscaled → identical to the pre-filter stamping. **But
-`Analyzed=true, Columns populated, RowCount=0` is a REAL state**, not an edge
-case: it is what `loadStatisticsFromHeap` leaves behind (column stats survive a
-restart, `RowCount` does not — ledger pq-P6). There the old stamping threw the
-restored MCV list away; the new placement spends it, as PG does.
+**The defect was bigger than P5.7 and is fixed in the same commit: 28 files in
+`internal/planner/` still carried "Still inert: `GOOPG_PGSHAPED_DP` is OFF … so
+they cannot change a plan" headers** — including `cost_funcs.go`, the file
+`hashJoinCost` lives in. Those banners are read as gate-skip authority. Each
+corrected to verified post-flip reachability, per file, not blanket-rewritten.
+Three came out differently: `collapse.go` (joinlist IS consumed at
+joinsearchseam.go:162/170; only the narrower `GOOPG_PGSHAPED_COLLAPSE`
+flattening arm is off), `tuplefraction.go` (below), `exprwalk.go` (stale from a
+DIFFERENT cause — M0125-0002's walker conversion — left alone + ledgered rather
+than corrected on a guess).
 
-Acceptance re-read (not re-run) from the default-arm audit
-`analysis/leftdeep-joins/2026-08-05-p59run4-audit-off.txt`: **Q9 final joinrel
-6.3×** (est=1999060 actual=316264) vs the ≤10² bar, **parity_violations=0**. The
-lone absolute tripwire, Q18 25 526×, is what 09 §4.1's parity ratchet exists for
-(PG 18.3 is at 5 386×/9 428× on its own shapes there).
+**Discharged:** P5.7-b's ledger row "no production PRODUCER of a fraction yet" —
+P5.9-b added `searchTupleFraction` (joinsearchseam.go:579) ← planner.go:1128.
+Checked rule #2: no gap, the only arm skipping it is `isSimpleSingle`, which is
+single-relation and never reaches the search. Note the half live even with NO
+LIMIT: `ConsiderStartup` is `tupleFraction > 0`, so fraction 0 actively PRUNES
+fast-start paths rather than abstaining. Caller-fraction half re-filed (no
+`cursor_tuple_fraction` source).
 
-Files: `internal/planner/{cardinality.go,relsize.go,joinsearchseam.go}`,
-`relsize_baserel_placement_test.go` (new, 4 tests). Docs: 04 §2 + new §2.1,
-IMPLEMENTATION-TODO P5.6 tick, design README index, M0125-0003's re-scope note
-amended with the verdict, 1 ledger row.
+Files: 28 planner files (comment-only) + fix_plan (P5.7 tick, -a/-b EXPIRED
+notes), IMPLEMENTATION-TODO (P5.7 roll-up entry), 04 §4.4 (new), design README,
+3 ledger rows (1 flipped `resolved`, 2 new).
 
-Gates run: UNITS 0 FAIL; **SPOT PASS (Q12=2, Q13=35)** — and SPOT is S-cold, i.e.
-it runs the exact state the change is proven inert in. DS05 not re-run,
-structurally: the changed arm needs `RowCount == 0` with populated column stats,
-and the DS05 cluster persists both (M0125-0028/-0029), so no gate query reaches it.
+Gates run: UNITS 0 FAIL; **SPOT PASS (Q12=2, Q13=35)**. DS05 not re-run — the
+diff is comment-only, zero executable change (`go build` + `go vet` clean).
 
-NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 item is
-now the roll-up **P5.7**, whose sub-items -a and -b are both `[x]`: same question
-as P5.6 — is it a tick or does its body carry residue? Its stated bar is "UNITS +
-PLAN (default arm ZERO diffs)", and both sub-items argued PLAN was structurally
-inapplicable because `hashJoinCost`'s callers sat behind OFF-by-default gates —
-**re-check that claim, because the searched planner is demonstrably live in the
-default arm now** (last loop's DS05 moved Q6's shape via a searched Memoize path).
-Then **PS6.1/PS6.2** and the P6.x deletion series.
+NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 items
+are now **PS6.1/PS6.2**, then the P6.x deletion series (P6.3 deletes the legacy
+enumerator + `rewriteJoinsToNLI`/`tryBuildNLI`, which is what collapses the two
+NLI constructors back to one — see the 2026-08-06 P5.4b-ii-b-2 ledger row).
+**Carry this loop's lesson in: a flag flip invalidates comments, task
+justifications and skipped gates that cited the old default, and none of them
+appear in the flip's diff — when P6.x deletes the legacy arm, sweep its claims
+in the same commit rather than leaving them for a later audit.**
 
-Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items, all
-subjects already filed under M-NIGHTLY. Nothing new.
+Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items,
+all subjects already filed under M-NIGHTLY. Nothing new.
 
 In-flight: none.

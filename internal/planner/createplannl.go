@@ -89,9 +89,9 @@ package planner
 // such a leaf, the same way P5.5-c made it decline a leaf that is not a scan at
 // all. Ledgered, with the capability loss stated.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan and no row can move. Falsifiable in
-// `createplannl_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so plans and rows DO move here. Falsifiable
+// in `createplannl_test.go`, but no longer only there.
 
 import "fmt"
 

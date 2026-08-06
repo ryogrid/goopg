@@ -2,9 +2,11 @@ package planner
 
 // M0127-P5.4c-ii-b — `cost_index` (costindex.go).
 //
-// These tests are the falsifiable half of the cost model. Nothing in the
-// repository selects on it yet (`GOOPG_PGSHAPED_DP` is OFF), so the only way to
-// be wrong about it and find out is to pin the arithmetic against
+// These tests are the falsifiable half of the cost model. Production DOES
+// select on it since M0127-P5.9 (2026-08-06) — `GOOPG_PGSHAPED_DP` defaults ON
+// — so the header's former "nothing selects on it yet" no longer holds; the
+// cheapest way to be wrong about it and find out is still to pin the
+// arithmetic against
 // hand-computed PG values and to pin the STRUCTURAL properties that make the
 // model usable: that the correlation interpolation runs in the direction PG's
 // does, that the descent charge lands at startup, and that the one calibration

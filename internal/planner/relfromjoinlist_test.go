@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.9-a — the joinlist consumer (relfromjoinlist.go).
 //
-// The recursion is inert in production (`GOOPG_PGSHAPED_DP` OFF, no
-// `planSelect` caller), so these tests are its only observer. Two properties
+// The recursion is LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer its only observer. Two properties
 // carry the file:
 //
 //  1. whatever the joinlist's shape, the tree handed back publishes the

@@ -60,9 +60,10 @@ package planner
 // M0127-P5.5-d also the seq-scan arm's resolver (createplansimple.go) — and
 // no drift.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan and no row can move. `createplanindex_test.go` is
-// where the invariants are falsifiable.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so plans and rows DO move here.
+// `createplanindex_test.go` is where the invariants are falsifiable, but it is
+// no longer the only place they are exercised.
 
 import (
 	"fmt"

@@ -25,9 +25,10 @@ package planner
 // the inner's own per-probe cost. Between P5.4b-i and this slice that pair was
 // legitimately pathless; from here it is not.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan can move. Validated in isolation by
-// `joinpathsnli_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so the paths this arm emits DO compete for
+// production plans. Validated by `joinpathsnli_test.go`, no longer in
+// isolation.
 
 // paramSourceRels is PG's `extra->param_source_rels` (joinpath.c:227-263): the
 // relations a join path is allowed to stay parameterised BY, which PG derives
