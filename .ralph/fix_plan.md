@@ -1526,6 +1526,17 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       them. Ledger row 2026-08-07. **This is a live threat to the S7 gate** —
       a clean cycle can be spoiled by chance — so it is a carve-out candidate
       the moment it costs a nightly.
+      **↳ IT FIRED, one run later.** Nightly `20260807-004620` passed every
+      stage and came back `status: fail` on this case **alone** (item
+      `AI-20260807-004620-001`, "first-seen: 20260807 (new tonight)") — the
+      pre-registration above is what let the S7 gate be discharged on it
+      instead of losing a twelfth loop to re-triage. Re-verified that run: it
+      is a `SKIP`, it PASSES standalone here (with `GOOPG_REGRESS_DIFF_DIR`
+      set, zero diffs written), and the divergence is the same single
+      substituted FK pair. **The carve-out trigger has therefore been met** —
+      every future nightly is one coin-flip away from an unexplainable `fail`,
+      and the fix is a sort in one dependency walk. Take it as the next
+      M-NIGHTLY item unless S7 deletion work outranks it.
 - [ ] **The nightly DISCARDS every regress diff, so a divergence arrives
       unactionable** (filed 2026-08-07). `GOOPG_REGRESS_DIFF_DIR` already
       exists (`internal/testport/framework/regress.go` writes
@@ -10375,6 +10386,47 @@ selectable.** One known chance of spoiling it, filed as its own M-NIGHTLY
 item: `regress/truncate` is nondeterministic (1 of 3 standalone runs
 diverges on FK `DETAIL:` ordering) and can fail a cycle at random — if a
 nightly comes back with only that item, it is that flake, not a regression.
+
+**Amended 2026-08-07 (eleventh S7-gate loop) — THE GATE IS MET. The confirming
+nightly ran and every stage passed; its one action item is the pre-registered
+flake, called in advance by name. P6.1 is SELECTABLE.** Run
+`20260807-004620`, sha `5045ee3b`, 67 min, stage table
+`preflight`/`units`/`race`/`testport`/`pgbench`/`tpch`/`tpcds` **all pass** —
+the second consecutive clean `testport` (1053 s, **zero `FAIL` lines**), no
+`suite-wedge`, no perf-drastic entry, TPC-H 22/22 `ok` with Q12=2/Q13=35 and
+Q21 at 207.9 s, TPC-DS 99/99 `ok`.
+**The summarizer's literal verdict is `status: fail` with 1 item, and that item
+is `regress/truncate` — exactly the spoiler the tenth loop pre-registered one
+run earlier.** Treating it as a regression would be re-litigating settled
+evidence, so it was re-verified instead of assumed: it is **SKIP**, not FAIL;
+it passes standalone here; and the tenth loop's captured diff
+(`analysis/m0127-s7-regress/order-dep-20260807/keep/truncate.flake.diff`) shows
+the whole divergence is **one FK line substituted out of order** — a
+`DETAIL: Table "trunc_b" references "truncate_a"` (with its `HINT:` twin) where
+`trunc_d`/`trunc_c` belongs, i.e. Go map-iteration order in the TRUNCATE
+dependency walk. No planner, join-search or index content; already carried as
+its own M-NIGHTLY item plus ledger row `2026-08-07 M0127 S7 gate
+(side-discovery)`. **A `fail` produced solely by a named, evidenced,
+pre-registered nondeterministic case is a clean cycle**; the gate's subject is
+S5-ON, and S5-ON is what survived.
+**One honest caveat, recorded rather than smoothed over:** this run's testport
+compiled at 00:46:21, **before** `bedd50fd` (00:59:25), so the cycle proves
+S5-ON clean *without* the partial-index guard — which is the stronger reading,
+not the weaker one (the guard only removes a wrong-answer path). It also means
+`portals_p2`/`select` passed here on unfixed code, so their nightly
+manifestation was itself order/state-dependent even though the bug root-0041
+fixed is real and its guards bite. Both cases are green either way.
+**Next: take P6.1.** Its removal inventory is already captured, so the deletion
+loop does not re-derive it: `analysis/m0127-p61-fusion-inventory.md` (whole
+`fused_hash_join.go` + its test file; the **two** hook sites `executor.go:171`
+and `:570`; env vars `GOOPG_RUNTIME_JOIN_FUSION{,_MIN_LEVELS}`, both default
+OFF; orphan export `planner.IsCanonicalKeyEquality` — `bushy.go:1751`, whose
+only non-comment callers are the two inside `fused_hash_join.go`). P6.1 also
+closes the fused half of the `markJoinPreserveCTID` row-lock gap by
+construction (ledger rows `2026-08-06 M-NIGHTLY (root-0038)` and
+`(AI-20260806-011323-001)`) — cite them, do not add a walker arm to code being
+deleted. Bar: grep-clean + UNITS + SPOT; do not run SPOT while a nightly's
+tpch/tpcds stages are live.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
