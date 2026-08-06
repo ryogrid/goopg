@@ -205,7 +205,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, relB)
 		inner := newRelWithPath(relB, 0)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		if len(joinrel.Pathlist) != 0 {
@@ -217,7 +217,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, 0)
 		inner := newRelWithPath(relB, relA)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		// Hash refuses it outright and the plain nested loop declines because
@@ -244,7 +244,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, 0)
 		inner := newRelWithPath(relB, 0)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		if len(joinrel.Pathlist) == 0 {

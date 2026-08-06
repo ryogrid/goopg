@@ -1,51 +1,52 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.9-p CLOSED** — test-only change, units gate green.
+Last loop: **M0127-P5.4b-ii-b-2 CLOSED** — Memoize is now a searched PATH.
 
-**The filed proposal was measured and does not work; that is the finding.**
-`buildGeometry` sizes a hash table from `planner.EstimateRows(buildNode)`, and
-for a SEARCHED scan the base restrictions ride on the scan node rather than in a
-`*Filter` wrapper — `seqScanRows` (cardinality.go) returns the relation's row
-count and ignores them. So "a deliberately mis-estimated selectivity on the
-build side" never reaches the geometry. Measured with `b.k = b.kdup`
-(column-column eq, `defaultEqSelectivity` 0.005, true for every row): the JOIN
-line moved `rows=1840`→`rows=171` (the search prices it in `makeJoinRel`) while
-`Batches: 4` never budged and no `(originally …)` form appeared. Two estimates
-for one scan; the executor reads the one that does not change.
+The item was DEPENDENCY-DEFERRED on 2026-08-04 pending P5.5's `createPlan`
+arms; P5.5 has landed, so it was re-selected as the topmost unchecked M0127
+item, exactly as its own note instructed.
 
-**The lever that works is WIDTH.** `buildGeometry` passes `avgVarBytes = 0` (no
-per-column average-width statistic — ledger 2026-08-03 M0127-P3.1), so a
-text-heavy build is priced as if only its Datum array were resident. That is the
-one mis-estimate leaving ROW counts — and therefore the join algorithm —
-untouched, which is exactly what the pinned legacy arm existed to work around.
-New `spillFixtureWidth(t, probe, build, distinct, padBytes)`; the growth test
-uses 400 rows × 2 kB text: prices ~19 kB, occupies ~800 kB →
-`Buckets: 1024 (originally 1024)  Batches: 32 (originally 4)` on the DEFAULT
-enumerator with the sizer INSTALLED. Both crutches removed
-(`SetRelationSizer(nil)`, `SetPGShapedJoinSearch(false)`); the test now also
-asserts the plan really is a `Hash Join`. Negative control (width back to 48 B):
-`Batches: 4` up front, never moved — the assertion has teeth.
+**Memoize is a PATH, not an attachment, and that was forced.** goopg already had
+`maybeAttachMemoize` (`memoize.go`) running on a BUILT `*NestedLoopIndexJoin` —
+but `walkRewriteNLI` skips a searched subtree (nl_index_join.go:110), so no
+searched NLI ever reached it. Attaching at `createPlan` time would have made the
+executed plan cheaper than the plan the search costed, when the point of
+memoizing is that an NLI beats a hash join it would otherwise LOSE to; that
+comparison happens in `addPath` or nowhere. So: new `PathMemoize` kind +
+`MemoizeInfo` carrier, `getMemoizePath` (= `get_memoize_path`, joinpath.c:674),
+`costMemoizeRescan` (= costsize.c:2541), and `addNLIPaths` offering the bare AND
+the wrapped inner to `addPath` — `match_unsorted_outer`'s own shape (:1965-1986).
+`PathMemoize` has NO `createPlan` arm (it panics there): goopg's cache is
+`NestedLoopIndexJoin.InnerMemo`, a field on the join, so the NLI arm unwraps it
+and keys the cache on the ALREADY-TRANSLATED probe keys — one list read twice,
+since `memoizeOp` and `indexScanOp.Rescan` read the same bound outer slot.
 
-Files: `internal/executor/join_batch_explain_test.go` (only code file);
-09 §3.23 + `docs/design/README.md`; ledger row P5.9-p + fix_plan tick.
+**The §5.2 binding contract was discharged in a different form than filed:**
+`tryBuildNLI` is not the searched constructor at all; `createNestLoopIndexJoinPlan`
+is, its declines are panics, and eligibility is shared at the PRODUCER
+(`pickIndexCoveringAllLeadingColumns`, `addParameterizedIndexPaths`). Two
+constructors now exist on disjoint trees — ledgered against the S7 deletion of
+the legacy one.
 
-Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — 0
-FAIL (executor 5.9s, rest cached); pgbench smoke via the commit hook. No
-tpch-spotcheck / DS05: the change touches no production code, so no plan shape
-or row count can move.
+Files: `internal/planner/joinpathsmemoize.go` + `_test.go` (new),
+`path.go`, `joinpaths.go` (`searchCtx` threaded), `joinpathsnli.go`,
+`joinrelsize.go`, `createplan.go`, `createplannl.go`; 6 test files took a `nil`
+searchCtx arg. Docs: 03 §5.2 status + IMPLEMENTATION-TODO tick; 3 ledger rows.
 
-NEXT LOOP (banner in `.ralph/fix_plan.md` wins — M0127 is #3 and current): no
-P5.9-* item is open. Larger successors, in order of the banner's intent:
-03 §4.4 `SpecialJoinInfo` inference for an outer link buried below an inner one
-(Q78). Ledger P5.9-p follow-up: make a scan's base restrictions reduce
-`EstimateRows` (stamp the post-qual count on the leaf, the `EstRelRows`/
-`SmallDim` precedent) — corpus-wide, needs its own bar. Ledger P5.9-t
-follow-up: port `reduce_outer_joins`' REDUCTIONS as a TYPE downgrade before
-`planFromClause`. Ledger P5.9-u follow-up: populate `TimeSubTime`/
-`TimeSubTimestampTZ` at their producers, then switch `compareDatum` off the
-`Scale != 0` timetz inference.
+Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); **DS05 PASS=95 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0, runtime-moves=0**, plan channel: ONE shape
+change — **Q6's `date_dim_pkey` probe now wrapped in `Memoize (Cache Key:
+s.ss_sold_date_sk)`**, same rows, same checksum. That is the end-to-end proof.
+Note for future loops: the "no stats → no plan can move" argument covers SPOT
+only. DS05 persists per-column stats since M0125-0028/-0029 and IS load-bearing.
 
-Nightly triage: `ci/logs/action-items.md` is still run 20260806-011323, 18
-items; all subjects already filed under M-NIGHTLY. Nothing new.
+NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 items
+are the roll-ups **P5.6** and **P5.7**, whose every sub-item is `[x]`: check
+whether they are ticks or carry residue (P5.6's body still names "re-evaluate
+M0125-0003 stage 3, rows-once per RelOptInfo, 04 §2"). Then **PS6.1/PS6.2**
+(compiled HashKeys accessors + sibling audit) and the P6.x deletion series.
+
+Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items,
+all subjects already filed under M-NIGHTLY. Nothing new.
 
 In-flight: none.

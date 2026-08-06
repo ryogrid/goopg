@@ -126,7 +126,7 @@ func TestAddPathsToJoinrel_EveryUsableEqualityBecomesAKey(t *testing.T) {
 	clauses := []*restrictInfo{
 		equiClause(a, b), equiClause(a, b), equiClause(a, b), plainClause(a | b),
 	}
-	if err := addPathsToJoinrel(joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	var hash *Path
@@ -155,7 +155,7 @@ func TestAddPathsToJoinrel_CartesianPairStillGetsAPath(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
 	outer, inner := scanRel(a, 100, 2), scanRel(b, 50, 1)
 	joinrel := newRelOptInfo(a|b, 5000, 64)
-	if err := addPathsToJoinrel(joinrel, outer, inner, nil, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	if len(joinrel.Pathlist) != 1 {
@@ -173,7 +173,7 @@ func TestAddPathsToJoinrel_InequalityOnlyPairGetsNoHash(t *testing.T) {
 	outer, inner := scanRel(a, 100, 2), scanRel(b, 50, 1)
 	joinrel := newRelOptInfo(a|b, 500, 64)
 	clauses := []*restrictInfo{plainClause(a | b)}
-	if err := addPathsToJoinrel(joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	for _, p := range joinrel.Pathlist {
@@ -201,7 +201,7 @@ func TestAddPathsToJoinrel_NestLoopCarriesEveryClauseAsResidual(t *testing.T) {
 	// test is qual PLACEMENT on the loop, not whether the tournament retains it.
 	joinrel.ConsiderStartup = true
 	clauses := []*restrictInfo{equiClause(a, b), plainClause(a | b)}
-	if err := addPathsToJoinrel(joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	var nl *Path
@@ -240,10 +240,10 @@ func TestAddPathsToJoinrel_SymmetricPairResolvesToTheFirstOfferedOrder(t *testin
 		joinrel := newRelOptInfo(a|b, 200000, 64)
 		clauses := []*restrictInfo{equiClause(a, b)}
 		// The two calls makeJoinRel makes, in its order.
-		if err := addPathsToJoinrel(joinrel, rel1, rel2, clauses, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, rel1, rel2, clauses, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel(rel1, rel2): %v", err)
 		}
-		if err := addPathsToJoinrel(joinrel, rel2, rel1, clauses, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, rel2, rel1, clauses, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel(rel2, rel1): %v", err)
 		}
 		setCheapest(joinrel)
@@ -272,10 +272,10 @@ func TestAddPathsToJoinrel_MissingCheapestPathIsLoud(t *testing.T) {
 	good := scanRel(a, 100, 2)
 	bare := newRelOptInfo(b, 100, 32) // no paths -> CheapestTotal nil
 	joinrel := newRelOptInfo(a|b, 100, 64)
-	if err := addPathsToJoinrel(joinrel, good, bare, nil, defaultCostParams()); err == nil {
+	if err := addPathsToJoinrel(nil, joinrel, good, bare, nil, defaultCostParams()); err == nil {
 		t.Fatalf("a nil inner cheapest path must be reported, not skipped")
 	}
-	if err := addPathsToJoinrel(joinrel, bare, good, nil, defaultCostParams()); err == nil {
+	if err := addPathsToJoinrel(nil, joinrel, bare, good, nil, defaultCostParams()); err == nil {
 		t.Fatalf("a nil outer cheapest path must be reported, not skipped")
 	}
 	if len(joinrel.Pathlist) != 0 {

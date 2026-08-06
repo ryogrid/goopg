@@ -348,11 +348,25 @@
   charged a flat `indexProbeCost` per outer row regardless of the inner path,
   and one NLI constructor is the §5.2 rule. Still inert — no `planSelect` call
   site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger rows. UNITS PASS.)*
-- [ ] **P5.4b-ii-b-2** Memoize paths (`get_memoize_path`, joinpath.c:562) and
-  the §5.2 constructor binding contract: shared eligibility fn with
-  `tryBuildNLI`; constructor failure on a DP-chosen path = loud planner error.
-  Both need a Node rather than a Path — `tryBuildNLI` analyses a built `*Join`
-  — so they bind to P5.5's `createPlan` arms, not to path generation.
+- [x] **P5.4b-ii-b-2** Memoize paths (`get_memoize_path`, joinpath.c:674) and
+  the §5.2 constructor binding contract.
+  *(DONE 2026-08-06 — `internal/planner/joinpathsmemoize.go` (new)
+  + `joinpaths.go`, `joinpathsnli.go`, `joinrelsize.go`, `path.go`,
+  `createplan.go`, `createplannl.go`. Memoize is a PATH, not an attachment:
+  `getMemoizePath` wraps a parameterised inner, `cost_memoize_rescan`
+  (costsize.c:2541) prices the rescan, and `addNLIPaths` offers the bare and the
+  wrapped candidate to `addPath` exactly as `match_unsorted_outer` does
+  (:1965-1986). The new `PathMemoize` kind has no `createPlan` arm — goopg's
+  cache is `NestedLoopIndexJoin.InnerMemo`, a field on the join — so the NLI arm
+  unwraps it and keys the cache on the ALREADY-TRANSLATED probe keys. The
+  binding contract turned out to be discharged in a different form than filed:
+  `walkRewriteNLI` skips a searched subtree, so `tryBuildNLI` is not the
+  searched constructor at all; `createNestLoopIndexJoinPlan` is, its declines
+  are panics, and eligibility is shared at the PRODUCER
+  (`pickIndexCoveringAllLeadingColumns`, `addParameterizedIndexPaths`). Safety
+  property: a defaulted ndistinct becomes `calls` (:2592), so on a stats-free
+  server the wrapper is strictly more expensive and can never win `addPath`.
+  4 ledger rows. UNITS + SPOT PASS.)*
 - [x] **P5.4c-i** `sort_inner_and_outer` (joinpath.c:1357) — the merge arm that
   sorts BOTH inputs, plus the pathkey machinery it needs.
   *(DONE 2026-08-04, `internal/planner/joinpathsmerge.go` + `joinpaths.go`,

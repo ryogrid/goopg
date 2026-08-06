@@ -276,6 +276,62 @@ restriction buys an invariant the rest of the search leans on: **every join path
 in the search is unparameterised**, so `Path.Rows == Rel.Rows` holds for every
 join path and the only parameterised paths in play are base index scans.
 
+**Status (P5.4b-ii-b-2, 2026-08-06) — Memoize landed as a PATH, and the
+"one constructor" sentence above is now historically false.**
+
+`getMemoizePath` (`internal/planner/joinpathsmemoize.go`) is
+`get_memoize_path` (joinpath.c:674) with `cost_memoize_rescan`
+(costsize.c:2541) transcribed beside it, and `addNLIPaths` offers the bare inner
+AND the cache-wrapped one to `addPath`, exactly as `match_unsorted_outer` does
+(:1965-1986). The new `PathMemoize` kind has no `createPlan` arm of its own:
+goopg's cache is `NestedLoopIndexJoin.InnerMemo`, a field on the join rather than
+a node between the join and its inner, so `createNestLoopIndexJoinPlan` unwraps
+it and builds the `Memoize` from the ALREADY-TRANSLATED probe keys — the cache
+key and the probe key are one list read twice, because `memoizeOp` evaluates
+`KeyExprs` against the same bound outer slot `indexScanOp.Rescan` evaluates
+`IndexScan.Key` against.
+
+Why it had to be a path and not an attachment: goopg already had
+`maybeAttachMemoize` (`memoize.go`), which runs on a BUILT
+`*NestedLoopIndexJoin` — and `walkRewriteNLI` skips a searched subtree
+(nl_index_join.go:110), so no searched NLI ever reached it. Bolting it on at
+`createPlan` time would have made the executed plan cheaper than the plan the
+search costed, and the point of memoizing is precisely that an NLI beats a hash
+join it would otherwise lose to; that comparison happens in `addPath` or not at
+all.
+
+The blast radius is bounded by upstream's own caution. `cost_memoize_rescan`
+replaces a DEFAULTED ndistinct with `calls` (:2592, "a bit too risky"), which
+drives the hit ratio to zero and makes the wrapper strictly more expensive than
+what it wraps. goopg reaches the same place through `getVariableNumDistinct`'s
+`isdefault` return. The two gates are NOT alike here, and the difference is
+worth stating because it is easy to get backwards: the TPC-H spot-check runs a
+fresh capped server and never ANALYZEs, and goopg's in-session statistics do not
+survive a restart, so no candidate there can be anything but defaulted; the
+TPC-DS SF0.5 cluster, since M0125-0028/-0029, persists per-column statistics and
+`reltuples` through the goopg-private sidecar, so the sweep plans WITH statistics
+and a Memoize path can win there. DS05 is the load-bearing gate for this slice,
+and it exercised it: the 2026-08-06 sweep is `PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0` with runtime-moves=0, and its plan channel reports exactly one
+shape change — **Q6, whose parameterised `date_dim_pkey` probe is now wrapped in
+`Memoize (Cache Key: s.ss_sold_date_sk)`**, with the same row count and the same
+checksum. That is the only end-to-end evidence available that the path is chosen
+AND that the cache returns the right rows.
+
+**The binding-contract half of this section is discharged, but not in the form
+filed above.** `tryBuildNLI` is NOT the constructor for a searched join —
+`walkRewriteNLI` returns early on a searched tree — so there are now TWO
+operator constructors, `tryBuildNLI` for non-searched trees and
+`createNestLoopIndexJoinPlan` for searched ones, operating on disjoint trees.
+"Constructor failure on a DP-chosen path is a loud planner error" holds: every
+decline in the searched constructor is a panic naming the producer that violated
+it. The eligibility half is shared at the PRODUCER instead of at construction —
+`pickIndexCoveringAllLeadingColumns` (P5.4b-ii-a) and
+`addParameterizedIndexPaths`' refusal of a wrapped leaf (P5.5-e-ii-b) are what
+make the searched constructor's declines unreachable. The residual — two
+constructors where §5.2 asked for one — is ledgered against the S7 retirement of
+the legacy enumerator, which deletes the other one.
+
 ### 5.3 Merge join / plain nested loop
 - Merge path when both sides can be sorted on the key (explicit Sort paths;
   pathkey propagation via the existing `pathkeys.go`); required for

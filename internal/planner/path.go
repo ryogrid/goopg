@@ -61,6 +61,14 @@ const (
 	PathSort
 	PathGather
 	PathGatherMerge
+	// PathMemoize is PG's `MemoizePath` (pathnodes.h:2079): a caching wrapper
+	// over a PARAMETERISED inner path, so a rescan with a parameter set already
+	// seen is served from the cache instead of re-probed. It is produced only by
+	// `getMemoizePath` (joinpathsmemoize.go) and consumed only by the NLI arm of
+	// `createNestLoopPlan`, because goopg's executor expresses the cache as
+	// `NestedLoopIndexJoin.InnerMemo` rather than as a free-standing node —
+	// which is why `createPlanNode` has no arm for it (M0127-P5.4b-ii-b-2).
+	PathMemoize
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -147,6 +155,15 @@ type Path struct {
 	IndexInfo    *catalog.Index
 	IndexScanDir ScanDirection
 	IndexClauses []indexPathClause
+
+	// MemoizeInfo is the `MemoizePath`-only payload (M0127-P5.4b-ii-b-2): the
+	// entry-count estimate `cost_memoize_rescan` computed on the way to the
+	// rescan cost, and that rescan cost itself. It is nil for every other kind,
+	// and a non-nil one is what makes `PathMemoize` self-describing — the two
+	// numbers are produced together from one set of statistics, so carrying them
+	// as one pointer is what stops an entry estimate from being paired with a
+	// cost that was computed from a different ndistinct.
+	MemoizeInfo *memoizePathInfo
 
 	Children []*Path
 

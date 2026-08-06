@@ -77,7 +77,7 @@ func TestMatchUnsortedOuterMerge_ConsumesOrderedOuterWithoutSorting(t *testing.T
 	if outer.CheapestTotal.Pathkeys != nil {
 		t.Fatalf("fixture broken: the ordered path must NOT be cheapest-total")
 	}
-	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestMatchUnsortedOuterMerge_ClauseListIsAPrefixOfTheOrdering(t *testing.T) 
 	joinrel := newRelOptInfo(a|b, 100, 32)
 	ri := equiClauseOn(a, b, 20, 11)
 
-	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	if got := unsortedMergePaths(joinrel); len(got) != 0 {
@@ -130,7 +130,7 @@ func TestMatchUnsortedOuterMerge_ResultKeepsTheOuterFullOrdering(t *testing.T) {
 	joinrel := newRelOptInfo(a|b, 100, 32)
 	ri := equiClauseOn(a, b, 10, 11)
 
-	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, []*restrictInfo{ri}, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	got := unsortedMergePaths(joinrel)
@@ -172,7 +172,7 @@ func TestGenerateMergejoinPaths_TruncationDemotesDroppedClauseToResidual(t *test
 	joinrel.ConsiderStartup = true
 	c1 := equiClauseOn(a, b, 10, 11)
 	c2 := equiClauseOn(a, b, 20, 21)
-	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 
@@ -335,7 +335,7 @@ func TestGenerateMergejoinPaths_StrictlyCheaperRuleSuppressesAPointlessTruncatio
 	joinrel.ConsiderStartup = true
 	c1 := equiClauseOn(a, b, 10, 11)
 	c2 := equiClauseOn(a, b, 20, 21)
-	if err := addPathsToJoinrel(joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, []*restrictInfo{c1, c2}, defaultCostParams()); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 

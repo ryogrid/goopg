@@ -86,6 +86,16 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		// keys onto the outer alone, the residual onto the merged row.
 		// createplannl.go.
 		return createNestLoopPlan(p)
+	case PathMemoize:
+		// A Memoize path has NO arm here, deliberately (M0127-P5.4b-ii-b-2).
+		// goopg's executor expresses the cache as `NestedLoopIndexJoin.InnerMemo`
+		// — a field on the join, not a node between the join and its inner —
+		// so the only legal consumer is `createNestLoopIndexJoinPlan`, which
+		// unwraps it and rebuilds the probe below it. Reaching this arm means a
+		// Memoize path escaped into a position where nothing will bind its
+		// parameter, and emitting the bare child there would silently drop the
+		// cache the search costed.
+		panic("createPlan: PathMemoize outside a nested-loop inner; goopg's cache is NestedLoopIndexJoin.InnerMemo and has no free-standing node")
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.

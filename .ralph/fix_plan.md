@@ -6602,7 +6602,47 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       site, `GOOPG_PGSHAPED_DP` OFF. 2 ledger rows. Bar met: UNITS
       (SPOT/DS05 not applicable — no call site, flag OFF, so no plan and no
       row can move).
-- [ ] **M0127-P5.4b-ii-b-2 — Memoize paths + the §5.2 binding contract:**
+- [x] **M0127-P5.4b-ii-b-2 — Memoize paths + the §5.2 binding contract.**
+      **DONE 2026-08-06** — `internal/planner/joinpathsmemoize.go` (new) plus
+      `joinpaths.go`, `joinpathsnli.go`, `joinrelsize.go`, `path.go`,
+      `createplan.go`, `createplannl.go`. The dependency the 2026-08-04 note
+      named (P5.5's `createPlan` arms) has landed, so the item was re-selected
+      as filed. Memoize is a **PATH**, not an attachment: `getMemoizePath` is
+      `get_memoize_path` (joinpath.c:674) with `cost_memoize_rescan`
+      (costsize.c:2541) transcribed beside it, and `addNLIPaths` offers the bare
+      inner AND the wrapped one to `addPath`, which is `match_unsorted_outer`'s
+      own shape (:1965-1986). The reason it could not be an attachment is the
+      finding the filing half-anticipated: goopg already had
+      `maybeAttachMemoize`, but `walkRewriteNLI` skips a searched subtree
+      (nl_index_join.go:110) so no searched NLI ever reached it — and attaching
+      at `createPlan` time would make the executed plan cheaper than the plan
+      the search costed, when the whole point of memoizing is that the NLI beats
+      a hash join it would otherwise lose to. The new `PathMemoize` has **no
+      `createPlan` arm**: goopg's cache is `NestedLoopIndexJoin.InnerMemo`, a
+      field on the join, so the NLI arm unwraps it and keys the cache on the
+      ALREADY-TRANSLATED probe keys — one list read twice, because `memoizeOp`
+      and `indexScanOp.Rescan` evaluate against the same bound outer slot.
+      **The §5.2 binding contract is discharged in a different form than
+      filed:** `tryBuildNLI` is not the searched constructor,
+      `createNestLoopIndexJoinPlan` is, its declines are panics, and eligibility
+      is shared at the PRODUCER (`pickIndexCoveringAllLeadingColumns`,
+      `addParameterizedIndexPaths`). **Safety property that bounds the blast
+      radius:** a defaulted ndistinct becomes `calls` (costsize.c:2592), so a
+      stats-free server prices the wrapper strictly above the probe it wraps and
+      it can never win `addPath`. That covers SPOT (fresh capped server, no
+      ANALYZE, in-session stats lost on restart) but NOT DS05 — since
+      M0125-0028/-0029 the SF0.5 cluster persists per-column stats through the
+      goopg-private sidecar, so the sweep plans WITH statistics and a Memoize
+      path can genuinely win there. DS05 is the load-bearing gate for this
+      slice — and it EXERCISED the slice rather than merely tolerating it:
+      `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`, runtime-moves=0, and
+      the plan channel shows exactly one shape change, **Q6, where the
+      parameterised `date_dim_pkey` probe is now wrapped in
+      `Memoize (Cache Key: s.ss_sold_date_sk)`** — same rows, same checksum.
+      That is the only end-to-end proof available that the path is chosen and
+      the cache returns the right rows. 3 ledger rows. Bar met: UNITS + SPOT +
+      DS05.
+- [x] **M0127-P5.4b-ii-b-2 — SUPERSEDED FILING (kept for attribution):**
       `get_memoize_path` (joinpath.c:562) — wrap an NLI inner in a cache when
       the outer key's distinct count makes it pay — plus the NLI binding
       contract (shared eligibility fn with `tryBuildNLI`; constructor failure

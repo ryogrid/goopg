@@ -157,6 +157,26 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 // `innerPath` is passed rather than re-read from `p.Children[1]` so the caller's
 // dispatch decision and this function's assumption are the same value.
 func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) {
+	// M0127-P5.4b-ii-b-2: the inner may be a `PathMemoize` wrapping the probe.
+	// It is unwrapped HERE rather than given its own `createPlanNode` arm
+	// because goopg's cache is a field on the join (`InnerMemo`) and not a node
+	// between the join and its inner — so the wrapper's translation is part of
+	// building the join, and the probe below it is built exactly as an unwrapped
+	// one is. Everything from here down therefore reads the INDEX path, and the
+	// wrapper is consulted again only at the very end.
+	memoPath := (*Path)(nil)
+	if innerPath.Kind == PathMemoize {
+		if len(innerPath.Children) != 1 || innerPath.Children[0] == nil {
+			panic(fmt.Sprintf("createPlan: PathMemoize with %d children, want exactly 1", len(innerPath.Children)))
+		}
+		if innerPath.MemoizeInfo == nil {
+			// `getMemoizePath` is the only producer and always sets it; a nil
+			// here would mean the cache was sized by nothing, and the executor
+			// would build a hash table the search never priced.
+			panic("createPlan: PathMemoize with no MemoizeInfo; the cache was never costed")
+		}
+		memoPath, innerPath = innerPath, innerPath.Children[0]
+	}
 	if innerPath.Kind != PathIndexScan {
 		// The only parameterised path kind goopg builds is the base index scan
 		// (`addParameterizedIndexPaths`). Any other kind reaching here is a
@@ -229,7 +249,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		is.Keys = keys
 	}
 
-	return &NestedLoopIndexJoin{
+	nli := &NestedLoopIndexJoin{
 		pos:   in.outer.Pos(),
 		Type:  JoinTypeInner,
 		Outer: in.outer,
@@ -242,12 +262,45 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// re-checked, an index probe enforces its keys exactly.
 		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
 		schema:    in.merged,
-		// InnerMemo stays nil. Memoize is a cost decision
-		// (`get_memoize_path`, joinpath.c) that goopg's searched path model has
-		// not made — there is no `PathMemoize` — and inventing one here would be
-		// an uncosted opinion of exactly the kind 06 §2.1 retires. Deferred with
-		// the rest of P5.7's rescan machinery (`cost_rescan`/Material).
-	}, in.lay
+		// InnerMemo is filled below, and only when the SEARCH chose a
+		// `PathMemoize` inner. It is never decided here: attaching a cache to a
+		// join whose cost was computed without one makes the executed plan
+		// cheaper than the plan that won the comparison, which is the uncosted
+		// opinion 06 §2.1 retires. `getMemoizePath` (joinpathsmemoize.go) is
+		// where the decision lives, beside every alternative it competes with.
+	}
+	if memoPath != nil {
+		nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
+	}
+	return nli, in.lay
+}
+
+// memoizeNodeFor builds the `Memoize` the search's `PathMemoize` stands for.
+//
+// It takes the ALREADY-TRANSLATED probe keys rather than re-deriving them from
+// the path, and that is the point of the function existing at all: the cache
+// key and the probe key must be the same expressions in the same coordinate
+// space, because `memoizeOp` evaluates `KeyExprs` against the very slot
+// `indexScanOp.Rescan` evaluates `IndexScan.Keys` against (the OUTER row alone,
+// see the file header). Two derivations would be two chances to key the cache on
+// one column and probe on another — a cache that returns the wrong rows, not a
+// slow one.
+//
+// `SingleRow` is decided here and not on the path because it is a property of
+// the INDEX the probe ended up using (`Index.Unique` with every index column
+// bound), which is a fact about the built node; the path-level decision was only
+// ever whether a cache pays. It is the same test `maybeAttachMemoize` applies
+// (memoize.go:134-136), shared in intent so the legacy and searched arms cannot
+// mark the same probe differently.
+func memoizeNodeFor(memoPath *Path, is *IndexScan, keys []Expr) *Memoize {
+	singleRow := is.Index != nil && is.Index.Unique && len(keys) == len(is.Index.Columns)
+	return &Memoize{
+		pos:        is.Pos(),
+		Child:      is,
+		KeyExprs:   keys,
+		SingleRow:  singleRow,
+		EstEntries: memoPath.MemoizeInfo.estEntries,
+	}
 }
 
 // relsOf is the relset a path stands for, or 0 when it has no RelOptInfo. It

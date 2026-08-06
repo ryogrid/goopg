@@ -257,7 +257,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 	cp := defaultCostParams()
 
 	joinrel := newRelOptInfo(a|b, 2000, 64)
-	if err := addPathsToJoinrel(joinrel, scanRel(a, 10000, 100), scanRel(b, 5000, 50),
+	if err := addPathsToJoinrel(nil, joinrel, scanRel(a, 10000, 100), scanRel(b, 5000, 50),
 		[]*restrictInfo{equiClause(a, b)}, cp); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 	}
 
 	bare := newRelOptInfo(a|b, 2000, 64)
-	if err := addPathsToJoinrel(bare, scanRel(a, 100, 2), scanRel(b, 50, 1),
+	if err := addPathsToJoinrel(nil, bare, scanRel(a, 100, 2), scanRel(b, 50, 1),
 		[]*restrictInfo{plainClause(a | b)}, cp); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
