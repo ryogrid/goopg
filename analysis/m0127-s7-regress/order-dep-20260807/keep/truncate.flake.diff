@@ -1,0 +1,20 @@
+--- after/truncate_expected.txt	2026-08-07 00:50:53.209737852 +0900
++++ after/truncate_actual.txt	2026-08-07 00:50:53.209737852 +0900
+@@ -527,7 +527,7 @@
+ DETAIL:   Table "trunc_b" references "truncate_a".
+ DETAIL:   Table "trunc_b" references "truncate_a".
+ DETAIL:   Table "trunc_b" references "truncate_a".
+-DETAIL:   Table "trunc_d" references "trunc_c".
++DETAIL:   Table "trunc_b" references "truncate_a".
+ DETAIL:   Table "trunc_d" references "trunc_c".
+ DETAIL:   Table "trunc_e" references "trunc_c".
+ DETAIL:   Table "trunc_e" references "trunc_c".
+@@ -556,7 +556,7 @@
+ HINT:   Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+ HINT:   Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+ HINT:   Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+-HINT:   Truncate table "trunc_d" at the same time, or use TRUNCATE ... CASCADE.
++HINT:   Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+ HINT:   Truncate table "trunc_d" at the same time, or use TRUNCATE ... CASCADE.
+ HINT:   Truncate table "trunc_e" at the same time, or use TRUNCATE ... CASCADE.
+ HINT:   Truncate table "trunc_e" at the same time, or use TRUNCATE ... CASCADE.

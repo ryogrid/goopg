@@ -8042,6 +8042,22 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		if strings.ToLower(idx.Method) != "btree" {
 			continue
 		}
+		// A partial index. PG only reaches `build_index_paths` for an index
+		// whose predicate was PROVEN from the query's restriction clauses
+		// (`check_index_predicates` sets `index->predOK`; an unproven partial
+		// index is skipped in `create_index_paths`). goopg has no
+		// predicate-implication prover, so the honest answer is to decline
+		// rather than to emit a scan that silently drops every row the index
+		// predicate excludes. This mirrors the identical guard on the ordered
+		// path (`pathindexordered.go` `addOneOrderedIndexPath`), which was
+		// left un-mirrored here — the gap returned 0 rows for
+		// `onek2 WHERE unique1 = 50` against `onek2_u1_prtl (WHERE unique1 <
+		// 20 OR unique1 > 980)` in the regress cases `portals_p2`/`select`.
+		// Ledgered: teaching goopg the prover would let it USE the index when
+		// the qual does imply the predicate, as PG does.
+		if idx.HasPredicate {
+			continue
+		}
 		if len(idx.Columns) == 0 || idx.Columns[0] != col {
 			continue
 		}

@@ -989,6 +989,12 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 		if !isBTreeIndex(idx) {
 			continue
 		}
+		// Partial index without a proven predicate — decline, same rule and
+		// reason as `findBTreeIndexForColumn` / `addOneOrderedIndexPath`.
+		// A parameterized inner-side scan drops rows just as silently.
+		if idx.HasPredicate {
+			continue
+		}
 		if len(idx.Columns) == 0 {
 			continue
 		}

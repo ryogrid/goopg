@@ -1328,7 +1328,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       row 2026-08-06. **This is the SOLE engine-side blocker of the M0127 S7
       gate** (see the S7 gate status in M0127), so unlike the rest of
       M-NIGHTLY it is on the critical path of the banner's live milestone.
-- [ ] **regress/suite-wedge — RECURRED 2026-08-06 at a DIFFERENT case:
+- [x] **regress/suite-wedge — RECURRED 2026-08-06 at a DIFFERENT case:
       `multirangetypes`** (AI-20260806-191958-010, run `20260806-191958`; 1 case
       at the 120 s per-case timeout, 0 baseline-pass; repro
       `go test -v -run 'TestPort_RegressSuite/multirangetypes'
@@ -1455,6 +1455,90 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       **Item stays OPEN only for confirmation**: the next `make nightly-batch`
       must come back without a `suite-wedge` item. The TRIGGER is filed
       separately directly below.
+      **↳ CONFIRMED AND CLOSED 2026-08-07 (tenth S7-gate loop).** The
+      confirming cycle was RUN — `make nightly-batch`, run `20260806-232940`
+      at sha `dffb05be` (the latch fix), 68 min — and it came back **with NO
+      `suite-wedge` item and with `testport` PASS as a stage** for the first
+      time in ten runs. Every stage passed: `preflight`/`units`/`race`/
+      `testport`/`pgbench`/`tpch`/`tpcds` (durations in
+      `ci/logs/history.jsonl`). Action items went **10 → 2**, and the 8
+      truncated-output casualties are gone exactly as the recovery-path fix
+      (`4146e5c8`) predicted, because with no wedge there is no restart and no
+      fixture doubling. Both halves of this item — the casualties and the
+      wedge itself — are therefore discharged. The 2 survivors are unrelated
+      to the wedge and are root-caused in the item directly below.
+- [x] **regress/portals_p2 + regress/select — the LAST two nightly items, and
+      they were ONE wrong-answer bug: a partial index chosen for quals its
+      predicate never implied** (AI-20260806-232940-001/-002, run
+      `20260806-232940` at `dffb05be`). **SELECTED under the carve-out** (they
+      were the only two items standing between the tree and M0127's S7 bar,
+      "S5-ON survives a clean nightly cycle") **and FIXED 2026-08-07.**
+      Both were labelled "output mismatch; normalization rules need extension"
+      and both PASS STANDALONE, which is why three earlier loops recorded
+      `portals_p2` as "never reproduced in isolation at HEAD" and moved on.
+      The order dependence was the SYMPTOM: `onek2`'s partial indexes are
+      created by `create_index`, so only a full-suite pass has them —
+      standalone the cases seq-scan and are correct.
+      **Root cause:** goopg's scan-path index selection never checked that the
+      query quals imply the index predicate. `onek2 WHERE unique1 = 50` took
+      `Index Only Scan using onek2_u1_prtl` (predicate `unique1 < 20 OR
+      unique1 > 980`) and returned **0 rows where 1 exists** — reproduced
+      directly on a throwaway server, with two controls proving the scan
+      machinery and partial-index maintenance are both sound, so the fault is
+      purely candidate selection. `select` is the same mechanism via
+      `onek2_stu1_prtl` (predicate `stringu1 >= 'J' AND stringu1 < 'K'`) for
+      the qual `stringu1 < 'B'`. PG proves the predicate in
+      `check_index_predicates()` (`predicate_implied_by()` → `index->predOK`)
+      and `create_index_paths()` skips it when unproven. goopg had ALREADY
+      reached that conclusion in one place — `addOneOrderedIndexPath`
+      (`pathindexordered.go`) declines `HasPredicate` with a comment saying
+      why — but never mirrored it onto the main scan path, where
+      `HasPredicate` had **zero readers**: the recurring sibling-path failure
+      (`pattern_sibling_paths_must_agree`).
+      **Fix:** mirror the guard at `findBTreeIndexForColumn`
+      (`internal/planner/planner.go` — covers the plain path and all three
+      `mhj_input_rewrite.go` sites, which route through it) and
+      `pickIndexCoveringAllLeadingColumns` (`internal/planner/nl_index_join.go`
+      — the parameterized path, a separate loop needing the guard
+      independently). `continue`, not `return nil`, so a plain index on the
+      same column still wins. Guards in
+      `internal/planner/partial_index_predicate_test.go`:
+      `TestPartialIndexNotChosenForUnprovenQual` (non-vacuous — neutering both
+      guards fails it), plus still-chosen and preferred-over-partial controls
+      so the fix cannot pass by disabling index scans wholesale.
+      Verified in real suite order: both cases PASS, diverging set 89 → 87
+      (`hash_index` recovered too); units PASS; `tpch-spotcheck` PASS
+      (Q12=2, Q13=35). Design
+      **docs/design/root-0041-partial-index-predicate-guard.md**; 3 ledger
+      rows. Evidence `analysis/m0127-s7-regress/order-dep-20260807/`.
+- [ ] **regress/truncate is NONDETERMINISTIC — it will make a nightly `fail`
+      at random** (filed 2026-08-07; found while diffing the before/after
+      regress divergence sets for the partial-index fix, and independent of
+      it). Measured: **1 of 3 identical standalone runs diverged**, emitting
+      `DETAIL: Table "trunc_b" references "truncate_a"` where `trunc_d`/
+      `trunc_c` was expected — the FK-dependency `DETAIL:`/`HINT:` lines come
+      out in a varying order, the signature of Go map iteration over the
+      dependency set. PG emits them deterministically. Repro (may need several
+      attempts): `GOOPG_REGRESS_DIFF_DIR=/tmp/x go test -count=1 -run
+      'TestPort_RegressSuite/truncate$' ./internal/testport/`. Resume point:
+      the TRUNCATE FK-dependency walk that builds the `references` message
+      lists (`internal/executor`), sorted the way PG's dependency scan orders
+      them. Ledger row 2026-08-07. **This is a live threat to the S7 gate** —
+      a clean cycle can be spoiled by chance — so it is a carve-out candidate
+      the moment it costs a nightly.
+- [ ] **The nightly DISCARDS every regress diff, so a divergence arrives
+      unactionable** (filed 2026-08-07). `GOOPG_REGRESS_DIFF_DIR` already
+      exists (`internal/testport/framework/regress.go` writes
+      `<case>_{expected,actual,raw}.txt`), but no nightly stage sets it, so
+      `ci/logs/action-items.md` carries only "output mismatch; normalization
+      rules need extension". That is precisely why the partial-index bug
+      above survived three loops: setting the variable by hand reduced it to
+      `(0 rows)` against `onek2` in one pass. Resume point:
+      `ci/batch/stages/stage-testport.sh`, export
+      `GOOPG_REGRESS_DIFF_DIR="${RUN_DIR}/testport/regress-diffs"` before the
+      `go test` call and cite it in the item's `evidence:` field. Same
+      "capture your own evidence" gap the wedge probe (`b0b4dc61`) closed for
+      hangs, still open for divergences. Ledger row 2026-08-07.
 - [ ] **`pageHasSpaceFor` and `insertItemSorted` disagree about what fits on a
       btree page.** NEW 2026-08-06 (found as the trigger of the wedge above,
       from a real regress-suite server log, not filed by a nightly).
@@ -10262,6 +10346,35 @@ attempt: run `make nightly-batch`; if it wedges, the probe block in the
 testport log names the statement and the server frame directly, and that is
 the fix's starting point; if it does not wedge, the S7 cycle may already be
 clean.
+
+**Amended 2026-08-07 (tenth S7-gate loop) — the cycle was RUN at the latch
+fix, the wedge is GONE, and the last two items are FIXED. The gate now needs
+one confirming nightly and nothing else is known to block it.**
+`make nightly-batch` ran a full cycle at 23:29 JST: **run `20260806-232940`,
+sha `dffb05be`, 68 min.** Every stage PASSED — `preflight`/`units`/`race`/
+**`testport`**/`pgbench`/`tpch`/`tpcds` — which is the first `testport` pass
+in ten runs, and there was **no `suite-wedge` item**. That confirms root-0040
+(the stranded page latch) and, with it, the 8 truncated-output casualties:
+**10 action items → 2**.
+The 2 survivors, `regress/portals_p2` and `regress/select`, turned out to be
+neither wedge shrapnel nor the "output normalization" their label claimed, but
+**one wrong-answer bug — and it is fixed this loop** (M-NIGHTLY item, design
+**root-0041**): goopg chose partial indexes without proving the index
+predicate from the quals, so `onek2 WHERE unique1 = 50` took `Index Only Scan
+using onek2_u1_prtl` and returned 0 rows where 1 exists. Both cases now PASS
+in real suite order (diverging set 89 → 87), with units and `tpch-spotcheck`
+(Q12=2, Q13=35) green.
+**Why three loops missed it, recorded as method:** both cases pass STANDALONE,
+so "does not reproduce in isolation at HEAD" was taken as a dead end when it
+was the actual clue — `onek2`'s partial indexes exist only after
+`create_index` runs, i.e. only in a full-suite pass. The diff was available
+the whole time behind `GOOPG_REGRESS_DIFF_DIR`, which the nightly does not
+set (now filed).
+**Next S7 attempt: run `make nightly-batch`. If `status: pass`, P6.1 is
+selectable.** One known chance of spoiling it, filed as its own M-NIGHTLY
+item: `regress/truncate` is nondeterministic (1 of 3 standalone runs
+diverges on FK `DETAIL:` ordering) and can fail a cycle at random — if a
+nightly comes back with only that item, it is that flake, not a regression.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
