@@ -84,6 +84,46 @@ Replace drain-both-and-buffer-output with PG's shape:
 `Materialize` is a general operator (plan node + path), also usable under
 merge join's inner in a later pass; v1 constructs it only for NL inners.
 
+### 4a. The composed-slot seam must not use `asSlot` (2026-08-06)
+
+Both streams — `nlJoinStream` and `lateralJoinStream` — signal absence with
+`EOF`, an **error**. So every `(row, nil)` return from `next()` is a real
+tuple, including one that is zero columns wide. `asSlot` maps a nil `Row` to
+a nil `TupleSlot`, which collapses "a row with no columns" onto "no row":
+`Row(nil)` is the representation of both.
+
+That collapse is reachable. When BOTH join inputs are zero-column relations
+(`CREATE TABLE t()`, legal PG) the concatenated pair has width 0,
+`cloneRow` of it is nil, and the seam handed back a nil slot with a nil
+error. Every consumer then reads "row present" and dereferences it —
+in the server that is `internal/server/dispatch.go`'s simple-query result
+loop (`slot.Row()`), so the backend **panicked and the session died**
+mid-result. PG emits one 0-column row
+(`postgres/src/test/regress/expected/select.out:520-522`, regress case
+`select` line 149); the crash truncated that case's remaining 352 lines,
+which is how the nightly first saw it.
+
+This is the **row-level analogue of `0122-0004-extended-zero-column-rows.md`**,
+which fixed the same ambiguity one level up: there a zero-column *schema* had
+to be a non-nil zero-length `planner.Schema` so `nil ⇒ no result set` stayed
+distinguishable from `zero-length ⇒ zero-column result set`. The same
+discriminator is needed for `Row`, and for the same reason — PG models a
+zero-column read as a real result set, not as nothing.
+
+Both arms therefore build the slot unconditionally with `SlotFromRow`. The
+nested loop's own **ctid arm had always done so** — the plain arm beside it
+was its diverging sibling, which is the recurring failure mode Hard-won
+Rule #2 names, in the narrowest possible form: two arms of one function.
+
+The guard lives in `internal/testport` (`TestPort_ZeroColumnJoinDoesNotCrash-
+Backend`), not `internal/executor`, and that placement is a finding in its
+own right: the natural executor unit test over `newDDLFixture` **passed
+against the unfixed code**. That fixture's scan yields a non-nil,
+zero-length `Row` where a real heap scan yields nil, so the pair never
+becomes nil and the seam is never reached — identical plans on both sides
+(`Nested Loop (CROSS)` over two width=0 `Seq Scan`s), differing only in the
+`Row`'s nil-ness. A unit fixture cannot see this class of defect at all.
+
 ## 5. Semi / Anti / NULL-aware
 
 Hash Semi/Anti stay probe-streaming (`:1335-1366`) and gain E-series

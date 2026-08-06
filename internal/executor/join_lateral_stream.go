@@ -131,7 +131,12 @@ func (o *joinOp) nextLateral() (TupleSlot, error) { //nolint:ireturn
 	if err != nil {
 		return nil, err
 	}
-	return asSlot(o.Schema(), row), nil
+	// NOT asSlot — same reason as nextNL's tail: absence is EOF, so a nil Row
+	// here is a zero-COLUMN tuple, not a missing one. `SELECT * FROM nocols n,
+	// LATERAL (VALUES(n.*)) v` expands n.* to zero expressions and PG returns one
+	// 0-column row; asSlot turned that row into a nil slot and crashed the
+	// backend in the simple-query result loop.
+	return SlotFromRow(o.Schema(), row), nil
 }
 
 // next returns the join's next output row, or EOF.

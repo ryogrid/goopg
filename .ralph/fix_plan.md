@@ -1128,6 +1128,26 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       suite-ordering task above — do not double-work them. Triage the wedge
       first; only if a case still diverges in a wedge-free full-suite run does
       it become real. FILED, NOT SELECTED per the 2026-07-28(b) amendment.
+      **⚠ 2026-08-06 — the "phantom" reading is FALSIFIED for the 20260806
+      three.** They were selected under the S7 gate (P6.1–P6.4 wait on "S5-ON
+      surviving a clean nightly cycle", and the nightly ran at `23dcc60e`, the
+      P5.9 flag-flip sha, so attributing them WAS the gate). All three
+      reproduce in isolation at HEAD, wedge-free. **None is S5-attributable:**
+      output is byte-identical at `GOOPG_PGSHAPED_DP` ON and OFF, modulo the
+      psql tmp path (`analysis/m0127-s7-regress/{on,off}/`). Individually:
+      **`select` was a real backend CRASH**, not a normalization gap — a
+      zero-column join (`SELECT * FROM nocols n, LATERAL (VALUES(n.*)) v`,
+      line 149) returned a nil `TupleSlot` with a nil error and the
+      simple-query result loop dereferenced it, truncating the case's
+      remaining 352 lines. FIXED this loop (see the M0127 note below);
+      `select` now PASSES. **`portals_p2` does not reproduce** in isolation at
+      HEAD, pre- OR post-fix — it passed on every local run, so it is the only
+      one of the three the phantom reading still fits. **`delete` is a real
+      PG-compat gap**, unrelated to the crash and still open: PG raises
+      `invalid reference to FROM-clause entry` + a HINT naming the alias where
+      goopg raises `missing FROM-clause entry`; ledger row 2026-08-06 with the
+      `errorMissingRTE()` resume point. Do NOT re-triage these three as
+      wedge-downstream; the remaining 12 of the 15 are untouched by this.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -9284,6 +9304,23 @@ P2.1→P2.3 (S2) → P3.1→P3.5 (S3) → P4.1→P4.4 (S4) → P5.1→P5.9 incl.
 (S5, each 1–2 loops) → PS6.1→PS6.2 (S6) → P6.1→P6.4 (S7, only after S5-ON
 survives a clean nightly cycle). No M0127 task may be selected while any
 M0125 item marked as a prerequisite above is open (Current Priority banner).
+
+**S7 gate status (2026-08-06).** The first nightly at a default-ON binary
+(run `20260806-011323`, sha `23dcc60e` = the P5.9 flip) came back `fail` with
+18 items, so the gate was NOT met and P6.1 was not selectable. That loop
+attributed the only planner-shaped failures instead — the three baseline-pass
+regress divergences `select`/`portals_p2`/`delete` — and **none is
+S5-attributable**: each is byte-identical at `GOOPG_PGSHAPED_DP` ON and OFF
+(`analysis/m0127-s7-regress/{on,off}/`). `select` was a **backend crash on a
+zero-column join**, fixed at both join-stream seams (`nextNL`/`nextLateral`
+now build the slot with `SlotFromRow`, not `asSlot`; design 07 §4a; guard
+`TestPort_ZeroColumnJoinDoesNotCrashBackend`) and now PASSES; `portals_p2`
+never reproduced in isolation; `delete` is an unrelated PG error-wording gap
+(ledger). The other 15 items are testport pg_dump / pg_basebackup /
+pgoutput / EvalPlanQual regressions with no planner content. **The gate still
+needs a clean nightly cycle to run** — this only removes the join search as a
+candidate cause for the regress arm. Re-read the newest
+`ci/logs/action-items.md` before selecting P6.1.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
