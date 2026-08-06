@@ -111,7 +111,7 @@ func TestPort_RegressSuite(t *testing.T) {
 					t.Skipf("deferred: cluster restart failed: %v", err)
 					return
 				}
-				runRegressSetup(t, root, psqlBin, c)
+				restoreRegressFixtures(t, root, psqlBin, c, exec)
 				t.Log("cluster recovered")
 			}
 
@@ -149,6 +149,48 @@ func TestPort_RegressSuite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// restoreRegressFixtures brings the shared test_setup.sql fixture tables back
+// after a wedge/crash restart — and, crucially, does NOT re-run test_setup.sql
+// when they are already there.
+//
+// A restart preserves the data directory, so the fixtures always survive it
+// (WAL recovery restores every committed row). Re-running test_setup.sql on top
+// of them is not idempotent and not a no-op: psql runs without ON_ERROR_STOP,
+// so each `CREATE TABLE` fails with "relation already exists" while the
+// `INSERT`/`COPY` that follows it succeeds — every fixture table DOUBLES
+// (measured: int4_tbl 5→10, text_tbl 2→4, varchar_tbl 4→8, onek 1000→2000,
+// tenk1 10000→20000).
+//
+// That is the mechanism behind the nightly "suite-wedge casualties": one case
+// hitting the 120 s per-case deadline poisons the cluster, recovery doubles the
+// shared fixtures, and every later case that reads them (numerology, select,
+// select_into, text, truncate, union, varchar, portals_p2 in run
+// 20260806-191958) reports a genuine — but harness-manufactured — output
+// mismatch. Those are joined against `regress-diff-baseline.csv` and filed as
+// regressions, so one wedged case turned a readable nightly into nine action
+// items and kept the M0127 S7 gate ("a clean nightly cycle") unmeetable.
+//
+// The setup is still run when the fixtures are genuinely absent, so a restart
+// onto an empty database still bootstraps.
+func restoreRegressFixtures(t *testing.T, root string, psqlBin string, c *cluster.Cluster, exec *ClusterRegressExecutor) {
+	t.Helper()
+	if exec.fixturesPresent() {
+		t.Log("shared fixtures survived the restart; NOT re-running test_setup.sql (it would double every fixture table)")
+		return
+	}
+	runRegressSetup(t, root, psqlBin, c)
+}
+
+// fixturesPresent reports whether the shared test_setup.sql fixture tables are
+// still resolvable. `onek` stands in for the whole set: it is created by
+// test_setup.sql alone and no regress case drops it.
+func (e *ClusterRegressExecutor) fixturesPresent() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := e.Cluster.Query(ctx, "SELECT 1 FROM onek LIMIT 1")
+	return err == nil
 }
 
 // regressPreSetup maps test names to SQL files that must be executed against

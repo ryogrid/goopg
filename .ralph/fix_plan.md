@@ -1346,6 +1346,36 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       Note `regress/select` here is wedge shrapnel, NOT the zero-column-join
       crash fixed by `569ecea2`. FILED, NOT SELECTED per the 2026-07-28(b)
       amendment.
+      **↳ SELECTED 2026-08-06 under the carve-out (it breaks a gate M0127
+      depends on — P6.1–P6.4's S7 bar is literally "S5-ON survives a clean
+      nightly cycle"), and the CASUALTY HALF IS FIXED. The 8 casualties were
+      never truncated output: they were REAL mismatches the harness itself
+      manufactured.** When a case wedges, the suite restarts the cluster
+      (correct) and then re-ran `test_setup.sql` "to restore shared fixture
+      tables" — but a restart preserves the data directory, so the fixtures were
+      never lost, and the re-run is not idempotent: psql runs without
+      `ON_ERROR_STOP`, so each `CREATE TABLE` fails while the `INSERT`/`COPY`
+      after it succeeds. **Every fixture table DOUBLES** — measured on a live
+      cluster: `int4_tbl` 5→10, `text_tbl` 2→4, `varchar_tbl` 4→8, `onek`
+      1000→2000, `tenk1` 10000→20000. Every later case reading a doubled table
+      diverges for real, and §A's gating rule files it as a regression. That is
+      the exact casualty set (`numerology`/`portals_p2`/`select`/`select_into`/
+      `text`/`truncate`/`union`/`varchar` all read `INT4_TBL`/`TEXT_TBL`/
+      `VARCHAR_TBL`/`onek`), and it explains why the casualties track the wedge
+      case as it moves. Fix: `restoreRegressFixtures` +
+      `ClusterRegressExecutor.fixturesPresent()` — recovery re-runs
+      `test_setup.sql` ONLY when the fixtures are genuinely absent. Guard
+      `TestPort_RegressSuiteRecoveryKeepsFixturesPristine` (asserts the
+      post-recovery cardinalities, then performs the unguarded restore and
+      asserts the doubling; proven non-vacuous — removing the guard fails it on
+      all 5 tables). Design **ci/design/02 §A "Wedge-recovery rule"**.
+      **STILL OPEN: what wedges the cluster.** `multirangetypes` completes in
+      **0.18 s standalone at HEAD**, so the trigger is a whole-suite
+      resource/state condition, not a per-case defect. A wedge now costs 1
+      action item instead of 9, but a nightly containing one is still `fail`.
+      Ledger row 2026-08-06. Resume point: instrument the suite to dump
+      `pg_stat_activity` + goroutine state when a case crosses ~60 s, and check
+      whether the preceding case leaks a backend/lock.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -1361,6 +1391,10 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
+      **↳ CASUALTY HALF EXPLAINED 2026-08-06 by the entry above** — the
+      "15 phantom divergences (same night)" were fixture doubling in the wedge
+      recovery path, now fixed; only the wedge itself (3 cases at the 120 s
+      deadline) remains, and it is the same open question as above.
 - [x] **nightly builds the DIRTY WORKING TREE, so an in-flight Ralph edit files
       itself as 14 phantom testport regressions.** NEW 2026-08-06
       (AI-20260806-011323-002..-015: PgBasebackup010{FetchWAL,Manifest,
@@ -10070,6 +10104,27 @@ Design `docs/design/0125-0055-routine-command-counter-and-self-modified.md`;
 `regress/suite-wedge` phenomenon.** Next S7 attempt: re-run
 `make nightly-batch` — the gate no longer has to wait for 01:00.
 Design 09 §3.25.
+
+**Amended 2026-08-06 (seventh S7-gate loop) — the `regress/suite-wedge`
+phenomenon is now two defects, and the one that inflates it is FIXED.** The
+loop did NOT re-run the nightly blind: run `20260806-191958`'s 9 remaining
+items were 1 wedge + 8 casualties, and re-running with the casualty mechanism
+live would have reproduced the same 9. Measured on a live cluster: the suite's
+wedge recovery restarts the cluster (correct) and then re-ran `test_setup.sql`,
+which is not idempotent — psql has no `ON_ERROR_STOP`, so `CREATE TABLE` fails
+while the following `INSERT`/`COPY` succeeds and **every shared fixture table
+doubles** (`onek` 1000→2000, `tenk1` 10000→20000, `int4_tbl` 5→10, `text_tbl`
+2→4, `varchar_tbl` 4→8). The 8 casualties are exactly the cases that read those
+tables, so they were REAL mismatches manufactured by the harness — not the
+truncated-output class 04 §C.1 collapses, which is why no report-side rule
+caught them. `restoreRegressFixtures`/`fixturesPresent` now re-bootstrap only
+when the fixtures are genuinely gone; guard
+`TestPort_RegressSuiteRecoveryKeepsFixturesPristine`. Design **ci/design/02 §A
+"Wedge-recovery rule"**. **A wedge now costs 1 action item instead of 9**, but
+the gate is still not met: the wedge itself is unexplained (`multirangetypes`
+runs in 0.18 s standalone at HEAD ⇒ whole-suite resource/state condition) and
+a nightly containing one is `fail`. Next S7 attempt: work the wedge trigger
+(M-NIGHTLY, resume point in that item), then re-run `make nightly-batch`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

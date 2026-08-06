@@ -1,47 +1,47 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-S7's sole engine-side blocker is CLOSED (M0125-0055).
-`TestPort_IsolationEvalPlanQual` PASSES.**
+Last loop: **M-NIGHTLY `regress/suite-wedge` — the CASUALTY half is FIXED.**
+The wedge is two independent defects; this loop closed the one that made every
+wedge unreadable.
 
-1. Two loops of bisect had named the blocker "goopg does not implement PG's
-   `TM_SelfModified` error". That was the visible half. **Shrinking the
-   isolation permutation until the second session disappeared** exposed the
-   real defect: a plain wrong answer, one session, no harness —
-   `WITH doup AS (UPDATE accounts … RETURNING *, update_checking(999))
-   UPDATE accounts a … FROM doup` leaves `checking` at **1701** on live PG 18.3
-   and **1700** on goopg. The volatile function's UPDATE was a silent 0-row
-   no-op; the RETURNING output agreed, which is why five loops of evidence did.
-2. Cause: goopg's data-modifying-WITH fence stands in for PG's per-tuple `cmin`
-   and was **command-blind**. PG hides the tuple only while `cmin >= curcid`,
-   and `curcid` is not frozen at `es_output_cid` — `functions.c
-   postquel_getnext` does `CommandCounterIncrement()` before every statement of
-   a routine that is not `readonly_func` (= `provolatile != 'v'`).
-3. Fix: `Context.CmdID` + `routineCommandCounterIncrement` (6 child-Context
-   sites in plpgsql_runtime.go); both fence maps re-valued by the writing /
-   killing command id, so `cteFenced`/`cteRevealed` *are* the cmin/cmax arms.
-4. That unmasked the error site — `ExecUpdate:2656`, INSIDE the EPQ path (the
-   chain-follow applies no cmin test), raised at `updateWithFrom` /
-   `deleteWithUsing`. SQLSTATE corrected `09000` → **`27000`**.
-   `CTENewToOld`/`CTESelfModifiedErrors`/`CTESelfModErr` deleted — unreachable,
-   and beside the counter fix they would have fired where PG succeeds.
+1. Did NOT re-run the nightly blind (the baton's stale suggestion): run
+   `20260806-191958`'s 9 remaining items are 1 wedge + 8 "casualties", and
+   re-running with the casualty mechanism live reproduces the same 9.
+2. The 8 casualties were **never truncated output** — they were REAL mismatches
+   the harness manufactured. When a case wedges, the suite restarts the cluster
+   (correct) and then re-ran `test_setup.sql`. A restart preserves the data dir,
+   so the fixtures were never lost, and the re-run is not idempotent: psql has
+   no `ON_ERROR_STOP`, so `CREATE TABLE` fails while the following
+   `INSERT`/`COPY` succeeds. **Every fixture table doubles** — measured live:
+   `onek` 1000→2000, `tenk1` 10000→20000, `int4_tbl` 5→10, `text_tbl` 2→4,
+   `varchar_tbl` 4→8. The casualty set is exactly the cases reading those
+   tables, which is why it tracks the wedge case as it moves.
+3. Fix: `restoreRegressFixtures` + `ClusterRegressExecutor.fixturesPresent()` —
+   recovery re-bootstraps ONLY when the fixtures are genuinely absent.
+   A wedge now costs 1 action item instead of 9.
 
-Files: `internal/executor/{context,operators_cte_dml,operators_storage,
-plpgsql_runtime}.go`, `internal/server/dispatch.go`, new
-`cte_dml_command_counter_test.go`; design `0125-0055-…` + README index +
-`leftdeep-joins/09-…` §3.26; fix_plan (item ticked + S7 status); 2 ledger rows.
+Files: `internal/testport/regress_suite_test.go`, new
+`internal/testport/regress_suite_recovery_test.go`; design `ci/design/02 §A
+"Wedge-recovery rule"` + `ci/design/README.md`; fix_plan (2 wedge items
+annotated + M0127 S7 seventh-loop amendment); 1 ledger row.
 
-Gates run: PG-vs-goopg byte-comparison on all 4 forms (`updwctefail`/
-`delwctefail` × with/without the concurrent session), rows AND final heap —
-identical; `TestPort_IsolationEvalPlanQual` PASS (22 s); full `TestPort_Isolation*`
-(407 s) PASS; full `TestPort_RegressSuite` (322 s) PASS; executor/server/planner/
-mvcc PASS; units gate PASS; `tpch-spotcheck` Q12=2/Q13=35; TPC-DS SF0.5 sweep
-PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan-shape 99 same/0 changed;
-`make ralph-state-guard`; pgbench smoke via the commit hook.
+Key symbols: `restoreRegressFixtures`, `ClusterRegressExecutor.fixturesPresent`,
+`clusterPoisoned`, `runRegressSetup`,
+`TestPort_RegressSuiteRecoveryKeepsFixturesPristine`.
 
-NEXT LOOP (banner: M0124 closed → M0125 closed → M0127 → M-NIGHTLY → M0123).
-**Re-run `make nightly-batch`** — S7's engine side is now clear and the
-remaining 9 items of run `20260806-191958` are the single `regress/suite-wedge`
-phenomenon, which produces no engine-side item. If the stage table comes back
-`status: pass`, take **M0127-P6.1 (delete fusion)**.
+Gates run: new guard PASS (2.0 s) and proven **non-vacuous** — removing the
+guard fails it on all 5 tables; full `TestPort_RegressSuite` PASS (302 s, no
+wedge locally); `go vet ./internal/testport` clean; units gate PASS;
+`make ralph-state-guard`; pgbench smoke via the commit hook. No engine code
+changed (test harness only), so SPOT/DS05 not applicable.
+
+NEXT LOOP (banner: M0124 closed → M0125 closed → **M0127** → M-NIGHTLY → M0123).
+S7 is still not met: **the wedge TRIGGER is unexplained** — `multirangetypes`
+runs in 0.18 s standalone at HEAD, so it is a whole-suite resource/state
+condition, and a nightly containing a wedge is still `fail`. Take that
+(M-NIGHTLY, same carve-out): instrument `regress_suite_test.go` to dump session/
+lock state + RSS when a case crosses ~60 s and keep the wedged cluster's log,
+and check whether the case *preceding* the wedge leaks a backend. Then re-run
+`make nightly-batch`.
 
 In-flight: none.

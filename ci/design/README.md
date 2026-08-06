@@ -47,7 +47,7 @@ local time.
 | Doc | Contents |
 |-----|----------|
 | [01-architecture.md](01-architecture.md) | Components, stage DAG, entrypoints, `ci/batch/` layout, reuse-vs-consolidate table |
-| [02-test-selection.md](02-test-selection.md) | Exactly what runs / skips; data-driven must-pass; expected-fail handling; promotion workflow |
+| [02-test-selection.md](02-test-selection.md) | Exactly what runs / skips; data-driven must-pass; expected-fail handling; promotion workflow; **regress wedge-recovery rule** (recovery must not re-bootstrap the shared fixtures — one wedged case used to file 9 items) |
 | [03-resources-and-parallelism.md](03-resources-and-parallelism.md) | Memory budget, cgroup units, parallelism policy, `mem_guard.py` interaction, port isolation |
 | [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, §C.1 mid-run build breaks (`build_kills`, source fingerprints), retention |
 | [05-tpch-stage.md](05-tpch-stage.md) | The 2-hour-bounded TPC-H sweep: budget algorithm, EXPLAIN capture, comparisons |

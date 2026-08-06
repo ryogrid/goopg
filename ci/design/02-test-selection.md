@@ -79,6 +79,49 @@ that reports an output-mismatch skip is classified a **regression**, exactly
 as if it had failed. Isolation has no such hole — the 120 strict per-spec
 functions fail hard on divergence.
 
+**Wedge-recovery rule (added 2026-08-06): recovery must not re-bootstrap the
+shared fixtures.** The gating rule above has a companion hazard, and until this
+loop it was the single largest source of nightly action items. Regress cases
+share one cluster and one set of `test_setup.sql` fixture tables. When a case
+hits `regressCaseTimeout` (120 s) the suite marks the cluster poisoned and, at
+the next case, restarts it — correct, and the only way to drop the orphaned
+backend. What was *not* correct is what followed: recovery re-ran
+`test_setup.sql` "to restore shared fixture tables". A restart preserves the
+data directory, so the fixtures were never lost, and the re-run is neither
+idempotent nor a no-op — psql runs without `ON_ERROR_STOP`, so every
+`CREATE TABLE` fails with "relation already exists" while the `INSERT`/`COPY`
+after it succeeds. **Every fixture table doubles** (measured: `int4_tbl` 5→10,
+`text_tbl` 2→4, `varchar_tbl` 4→8, `onek` 1000→2000, `tenk1` 10000→20000).
+
+Every later case that reads a doubled table then produces a *genuine* output
+mismatch, which the gating rule above dutifully files as a regression. One
+wedged case therefore manufactured an unbounded tail of unattributable
+"regressions": run `20260806-191958` filed **9 items for 1 real event**
+(`multirangetypes` wedged; `numerology`, `portals_p2`, `select`, `select_into`,
+`text`, `truncate`, `union`, `varchar` were fixture casualties), and runs
+`20260802-014405`/`20260803-013955`/`20260804-005028` show the same shape at
+`aggregates`/`jsonb`/`misc`. That the wedge case *moves* between nights while
+the casualty set tracks it is the signature: the casualties are downstream of
+the recovery, not of any code change. Note this is a different failure mode
+from the summarizer's truncated-output class (04 §C.1) — the casualty output is
+complete and really does differ, so no report-side rule can filter it; the
+harness must not corrupt the fixtures in the first place.
+
+`restoreRegressFixtures` (`internal/testport/regress_suite_test.go`) is
+therefore the only entry point recovery uses: it re-runs `test_setup.sql` **only
+when the fixtures are genuinely absent** (`fixturesPresent()` probes `onek`), so
+a restart onto a live data directory keeps them pristine and a restart onto an
+empty database still bootstraps. Guard:
+`TestPort_RegressSuiteRecoveryKeepsFixturesPristine` asserts the post-recovery
+cardinalities and then performs the *unguarded* restore and asserts the
+doubling, so it cannot pass vacuously (verified: removing the guard fails it on
+all five tables).
+
+This bounds the blast radius of a wedge to the wedged case itself; **what wedges
+the cluster is a separate, still-open question** — `multirangetypes` completes
+in 0.18 s standalone at HEAD, so the trigger is a whole-suite resource/state
+condition, tracked as its own M-NIGHTLY item and deferral-ledger row.
+
 **Dedup rule (from `05-duplicate-management.md`): the Go `testport` entry
 point is the ONLY execution path.** The batch never additionally drives
 `scripts/pg-regress-runner.sh` or per-spec CSV rows — those CSVs are tracking
