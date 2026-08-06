@@ -1090,7 +1090,9 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       (AI-20260725-011243-003/-005/-006/-007). **Stale — all 4 PASS at HEAD**
       (`e7d9b88e`: 0.66 s / 20.27 s / 1.92 s / 1.15 s, one run each). Same
       pre-merge-tip explanation as the executor items. No new work.
-- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED** — the root-0030
+- [x] **testport/TestPort_IsolationEvalPlanQual — REOPENED → RESOLVED 2026-08-06
+      (fixed by `b92582fb`, the M0127-P5.9 default flip; see the ✅ block at the
+      end of this item)** — the root-0030
       fix (checked item above) did not hold: FAILed in nightly runs 20260801,
       `20260802-014405`, and `20260803-013955`
       (AI-20260802-014405-001, AI-20260803-013955-003,
@@ -1135,6 +1137,49 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       (docs/design/root-0038, guard
       `TestPort_LockRowsSortOverJoinTakesRowLock`). It does NOT close this item:
       the failing steps here carry no `ORDER BY`.
+      **✅ RESOLVED 2026-08-06 (S7-gate loop #5) — the prefix bisect RAN and
+      falsified the order-dependence conclusion above.** `EvalPlanQual` is the
+      69th of 351 top-level tests; all 68 predecessors in nightly order PASS at
+      HEAD (172 s) and PASS again under `stage-testport.sh`'s exact cgroup env
+      (`GOOPG_MEM_HIGH=6G MAX=8G GOMEMLIMIT=5GiB`) — there is no poisoning
+      predecessor. At the nightly's own sha `23dcc60e` the test fails
+      **STANDALONE** in 22 s with this same L1001 diff, so it was never
+      order-dependent: the three loops that could not reproduce it were testing a
+      HEAD that already contained the fix. `git bisect` over
+      `23dcc60e..2d300d14` (22 revisions) names **`b92582fb` — the M0127-P5.9
+      default flip — as the first fixed commit**, and the flag A/B at HEAD
+      confirms the mechanism, not just the coordinate: `GOOPG_PGSHAPED_DP=0`
+      reproduces the identical L1001 failure, the default PASSes.
+      The record's claim that sha `23dcc60e` "= the P5.9 flip" is wrong —
+      `23dcc60e` is `bench(acceptance): P5.9 run 4` and `b92582fb` landed after
+      the nightly started. The nightly builds the LIVE tree, so its stamped sha
+      is preflight's, not the tree it measured: the non-compile manifestation of
+      the same race that filed 14 phantom regressions in this run (ci/design/04
+      §C.1). **The flip MASKS rather than repairs** — under the legacy
+      enumerator this is root-0038's mechanism reached by a different shape
+      (`markJoinPreserveCTID` has arms for `projectOp`/`filterOp`/`sortOp`/
+      `joinOp` but none for `multiHashJoinOp`/`fusedHashJoinOp`, which only the
+      legacy enumerator emits), so `GOOPG_PGSHAPED_DP=0` is a silent FOR UPDATE
+      violation until P6.1/P6.2 delete both nodes. Ledger row + follow-up task
+      below; evidence `analysis/m0127-epq-bisect/`; design 09 §3.24.
+- [ ] **executor/row-locking — `FOR UPDATE` over a MultiHashJoin / fused hash
+      join takes NO tuple lock (legacy enumerator only)** (found 2026-08-06,
+      S7-gate loop #5; the defect the P5.9 flip MASKED rather than repaired).
+      `markJoinPreserveCTID` (`internal/executor/operators_lockrows.go:430`)
+      recurses through `projectOp` / `filterOp` / `sortOp` / `joinOp` and has no
+      arm for `multiHashJoinOp` (`multi_hash_join.go:24`) or `fusedHashJoinOp`
+      (`fused_hash_join.go:96`), so `preserveCTIDRel` is never set, the heap
+      ctid does not survive the build-side drain, `drainAndStamp` finds no TID
+      and `lockRowsOp` takes its unlocked pass-through path — a silent FOR
+      UPDATE violation (no block, no EvalPlanQual recheck, stale pre-update row).
+      Repro: `GOOPG_PGSHAPED_DP=0 go test -v -run
+      '^TestPort_IsolationEvalPlanQual$' ./internal/testport/` → L1001
+      `lockwithvalues`. **Both nodes are legacy-enumerator-only and are deleted
+      by M0127-P6.1 (fused) and P6.2 (MultiHashJoin), which retires this by
+      construction** — so the intended close is "P6.1+P6.2 landed, repro
+      unreachable", not a new walker arm. Only fix it directly if the escape
+      hatch `GOOPG_PGSHAPED_DP=0` must stay honest before then. Ledger row
+      2026-08-06; design 09 §3.24.
 - [x] **executor/row-locking — `ORDER BY … FOR UPDATE` over a JOIN took NO
       tuple lock** (found 2026-08-06 during the EvalPlanQual triage above; a
       DISTINCT defect from it, not a fix for it). `SELECT a.accountid, a.balance
@@ -9472,6 +9517,28 @@ family. **Do not re-attempt an isolation-level repro.** The remaining designed
 step is a prefix bisect of `internal/testport` (regress / pg_dump /
 pg_basebackup / pgoutput blocks + EvalPlanQual) to find the predecessor that
 poisons it.
+
+**Amended 2026-08-06 (fifth S7-gate loop) — the prefix bisect RAN, and
+`TestPort_IsolationEvalPlanQual` (AI-…-001) is RESOLVED, so no known
+engine-side blocker remains.** There is no poisoning predecessor: all 68
+predecessors in nightly order pass at HEAD (172 s), and pass again under
+`stage-testport.sh`'s exact cgroup env. The order-dependence was an artefact —
+at the nightly's own sha `23dcc60e` the test fails STANDALONE in 22 s, and a
+`git bisect` over `23dcc60e..2d300d14` names **`b92582fb`, the P5.9 default
+flip itself**, as the first fixed commit (flag A/B at HEAD confirms the
+mechanism: `GOOPG_PGSHAPED_DP=0` reproduces the identical L1001 diff, the
+default passes). The three earlier loops tested a HEAD that already contained
+the fix. The record's `23dcc60e = the P5.9 flip` was wrong: the flip landed
+after the nightly started, and the nightly builds the LIVE tree, so its stamped
+sha is preflight's — the non-compile twin of the phantom-regression race.
+Scoreboard for run `20260806-011323`: `select` FIXED, `delete` FIXED,
+`EvalPlanQual` FIXED (by the flip), `portals_p2` never reproduces. **The gate is
+still "a clean nightly cycle" and no nightly has run since**, so P6.1 remains
+unselectable on missing evidence, not on a known defect: re-read
+`ci/logs/action-items.md`; if `status: pass`, take P6.1. One masked defect is
+carried forward as an M-NIGHTLY task (FOR UPDATE over `multiHashJoinOp` /
+`fusedHashJoinOp` takes no row lock — retired by construction when P6.1/P6.2
+delete both nodes). Design 09 §3.24; evidence `analysis/m0127-epq-bisect/`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

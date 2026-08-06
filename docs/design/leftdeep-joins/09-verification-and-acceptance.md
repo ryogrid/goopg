@@ -3471,3 +3471,54 @@ test is that safety net under test. When `avgVarBytes` is populated the geometry
 will pick the final nbatch up front and this test will fail with "nbatch never
 grew". That is the correct outcome to see, not a flake — the fixture is
 re-derived then, against whatever estimate remains wrong.
+
+### 3.24 The S7 gate's last blocker was fixed by the flip itself, and it was never order-dependent (S7-gate loop #5, 2026-08-06)
+
+`TestPort_IsolationEvalPlanQual` (nightly AI-20260806-011323-001) failed six
+consecutive nights and was the last engine-side item standing between S5-ON and
+a clean nightly cycle — the precondition for selecting P6.1. Three prior loops
+could not reproduce it outside the nightly and concluded it was
+**order-dependent on a test outside the isolation family**; the recorded next
+step was a prefix bisect of `internal/testport`.
+
+**The prefix bisect ran and falsified that conclusion.** `EvalPlanQual` is the
+69th of 351 top-level tests; running all 68 predecessors in nightly order (172 s
+of test time) passes at HEAD, and passes again under the nightly stage's exact
+cgroup env (`GOOPG_MEM_HIGH=6G MAX=8G GOMEMLIMIT=5GiB`, `stage-testport.sh`).
+There is no poisoning predecessor.
+
+**What the failure actually was.** At the nightly's own recorded sha
+`23dcc60e` the test fails **standalone**, in 22 s, with the same L1001
+`lockwithvalues` divergence (1467 vs 1468 lines). It was never order-dependent
+and never a co-load flake: the earlier loops tested a HEAD that already
+contained the fix. A `git bisect` over `23dcc60e..2d300d14` (22 revisions,
+`analysis/m0127-epq-bisect/bisect-step.sh`) names **`b92582fb` — the P5.9
+default flip — as the first fixed commit**, and the flag A/B at HEAD confirms
+the mechanism rather than the coordinate: `GOOPG_PGSHAPED_DP=0` reproduces the
+identical L1001 diff, the default reproduces PASS.
+
+**Why the record said `23dcc60e` "= the P5.9 flip".** It is not. `23dcc60e` is
+`bench(acceptance): P5.9 run 4`; the flip `b92582fb` landed after the nightly
+started. The nightly builds the LIVE working tree while a loop is mid-flight, so
+the sha it stamps is the sha at preflight, not the tree it measured — the same
+race that manufactured 14 phantom testport regressions in this very run
+(ci/design/04 §C.1). The compile-error boundary was fixed there; this is the
+non-compile manifestation of the same hazard.
+
+**The masked defect (recorded, not fixed).** The flip did not repair the
+row-locking gap, it stopped producing the plan that hits it. Under the legacy
+enumerator, `SELECT a1.*, v.id FROM accounts a1, (VALUES …) v WHERE
+a1.accountid = v.id … FOR UPDATE OF a1` neither blocks on a concurrently
+updated row nor runs the EvalPlanQual recheck — it returns the stale
+pre-update row. That is root-0038's mechanism (`markJoinPreserveCTID` fails to
+reach the join → no `preserveCTIDRel` → `drainAndStamp` finds no TID →
+`lockRowsOp` takes its unlocked pass-through path), reached through a different
+shape: the walker's arms are `projectOp` / `filterOp` / `sortOp` / `joinOp`,
+and it has none for `multiHashJoinOp` or `fusedHashJoinOp`, which only the
+legacy enumerator emits. P6.1 and P6.2 delete both nodes, which retires the
+hazard by construction; until then `GOOPG_PGSHAPED_DP=0` is a silent FOR UPDATE
+violation. Ledger row 2026-08-06.
+
+**Gate status.** This removes the last known engine-side blocker but does not
+retro-clear S7: the gate is "a clean nightly cycle", and no nightly has run
+since. Re-read `ci/logs/action-items.md`; if `status: pass`, P6.1 is selectable.
