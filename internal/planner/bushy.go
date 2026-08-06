@@ -10,22 +10,33 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// GOOPG_COST_DRIVEN_JOINORDER=1 enables the C4 cost-driven join-order
-// planner (real PG-unit path cost) with MultiHashJoin packing dropped
-// (ch. 12). Off by default so production planning is unchanged; used to
-// measure the pivot on the bench server before promoting the default.
+// GOOPG_COST_DRIVEN_JOINORDER is RETIRED (M0127-P5.9, 2026-08-06). It was the
+// C4 pivot's measurement knob — real PG-unit path cost as the old DP's
+// argmin, with MultiHashJoin packing dropped — and M0126 closed it as a
+// documented no-go (the Q9 MHJ plan could not be cost-forced; every penalty
+// that moved Q9 broke Q5). 08 §2 files its retirement as part of the S5 event
+// that replaces it: `GOOPG_PGSHAPED_DP` is now the default enumerator, so a
+// knob whose only purpose was to re-rank the enumerator it replaced has no
+// remaining production meaning and no measurement left to serve.
+//
+// What is retired is the ENV HOOK, not the mechanism: `costDrivenJoinOrder`
+// and `SetCostDrivenJoinOrder` stay until S7 deletes the old subset-bitmask DP
+// they belong to (08 §4), because the kill-switch arm still runs that DP and
+// its tests still need to reach both of its argmins.
 func init() {
-	if os.Getenv("GOOPG_COST_DRIVEN_JOINORDER") == "1" {
-		costDrivenJoinOrder = true
-		mhjPackingEnabled = false
-	}
 	// M0126-0005 measurement-only: force packing off independently of
 	// join-order, so the A/B measures the cascade cost without
 	// conflating two variables (F12 trap).
-	if os.Getenv("GOOPG_MHJ_PACKING_OFF") == "1" {
+	if mhjPackingOffFromEnv(os.Getenv("GOOPG_MHJ_PACKING_OFF")) {
 		mhjPackingEnabled = false
 	}
 }
+
+// mhjPackingOffFromEnv is the measurement switch's polarity, factored out of
+// init for the provenance table (flaglabels.go); see memoizeFromEnv. Note the
+// inverted name: this variable turns packing OFF, so its unset label reads
+// `unset(off)` for "the off-switch is not engaged".
+func mhjPackingOffFromEnv(v string) bool { return v == "1" }
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
 // FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)
@@ -83,6 +94,14 @@ type joinGraph struct {
 // is the Filter predicate with consumed equalities removed (may be nil).
 // On failure, returns (originalNode, originalPred) unchanged.
 func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) (Node, Expr) {
+	// M0127-P5.9-b: under `GOOPG_PGSHAPED_DP` the PG-shaped search gets the
+	// statement first, and this DP is what it falls back to — the coexistence
+	// rule of 08 §2, which keeps `tryBushyDP` callable so the flag is a real
+	// rollback and not a one-way door. The seam declines on its own first line
+	// with the flag off, so nothing below changes.
+	if searched, residual, used := tryPGShapedJoinSearch(node, pred, ctx, cat); used {
+		return searched, residual
+	}
 	if ctx == nil || len(ctx.bindings) < 3 {
 		return node, pred
 	}
@@ -670,7 +689,15 @@ func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRow
 	if !isProbableInnerScan(entryB.plan) {
 		outerCost, outerRows, innerCost = entryB.pgCost, entryB.rows, entryA.pgCost
 	}
-	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), float64(outRows), indexProbeCost(cp))
+	// innerRows is `inner_path->rows` — for the index probe this arm costs
+	// (one `indexProbeCost` per outer row) that is the PER-PROBE count, which
+	// this DP models as a single matched row, not the probed relation's total.
+	// M0127-P5.9-j moved the `cpu_tuple_cost` charge onto `outer × inner`
+	// tuples processed; passing 1 here keeps this arm's per-outer-row charge
+	// exactly what `outRows` used to buy it whenever the join emits about one
+	// row per outer row, and unlike `outRows` it does not vary with a
+	// downstream cardinality this arm cannot see.
+	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), 1, indexProbeCost(cp))
 }
 
 // bushySeedRowCounts computes the per-relation row count the bushy DP seeds its
@@ -1867,6 +1894,14 @@ func rewriteMultiWayChain(node Node, cat catalog.Catalog) Node {
 	if node == nil {
 		return nil
 	}
+	// M0127-P5.9-b (08 §3): never pack a searched tree. PG has no MHJ, the
+	// search's binary cascade IS the plan it costed, and the packer re-sorts
+	// the leaf layout — the order-then-rewrite mismatch that regressed Q9
+	// (ch. 12 §3). `mhjPackingEnabled` is off by default, so this guard is for
+	// the env that turns it back on.
+	if isSearchedTree(node) {
+		return node
+	}
 	scans, keys, probeIdx, extras := collectMultiHashTables(node)
 	if scans == nil {
 		// Not a valid chain — recurse into children.
@@ -2190,6 +2225,33 @@ func remapTopProjection(out Node, bindings []rangeBinding) {
 	// Limit / LockRows wrappers until we hit it.
 	root := out
 	for {
+		// M0127-P5.9-c (08 §3): this descent is the one place the
+		// searched-subtree opacity could be walked THROUGH rather than
+		// stopped at, and it was. The boundary is a `*Project`
+		// (createplanroot.go) and an elided boundary over a sorted root
+		// is a `*Sort`, so both arms below step over the search root and
+		// hand `buildBindingsPosMap` a node INSIDE it. `collect`'s own
+		// guard (bushy.go:2563) then never fires — it is asked about the
+		// searched join, not about the searched root — and the map that
+		// comes back is the search's binding→plan-position permutation.
+		//
+		// Applied to the wrappers, that map is a second permutation on
+		// top of the one the boundary already performed: the enclosing
+		// Project's targets are written in binding coordinates and the
+		// boundary republishes binding order, so the correct action here
+		// is NOTHING. Measured on `select * from customer, orders where
+		// o_custkey = c_custkey and o_orderkey = 1` (P5.9 run 1's
+		// reproducer): every column's value came back one relation-block
+		// away from its name, and the boundary Project's OWN target list
+		// — which is the coordinate map, not a reference into it — was
+		// rewritten along with the targets above it.
+		//
+		// Stopping here rather than teaching `collect` is the correct
+		// half: `collect` is already right, and what was wrong is asking
+		// it a question about the inside of an opaque subtree.
+		if isSearchedTree(root) {
+			return
+		}
 		switch n := root.(type) {
 		case *Project:
 			root = n.Child
@@ -2613,7 +2675,43 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Sort:
 			collect(x.Child)
 		case *Aggregate:
-			collect(x.Child)
+			// M0127-P5.9-f (TPC-H Q17): opaque leaf, NOT a descent.
+			// `applyJoinTreePosMap` has always stopped at *Aggregate
+			// ("aggregate expressions are a different scope"), so the
+			// entries this arm used to record were never applied inside
+			// the aggregate's own subtree — they only leaked into
+			// `scanMap` and mis-addressed the SAME table elsewhere in the
+			// tree. Build and apply must stop at the same nodes; this is
+			// the third instance of that rule (*Project M0125-0012,
+			// *SetOp/*WindowAgg RC-2).
+			//
+			// The descent was also numerically wrong on its own terms: an
+			// Aggregate's output is group keys + agg results, so
+			// descending advanced `off` by the CHILD's width instead of
+			// the aggregate's, leaving every node to its RIGHT short by
+			// the difference — the identical defect *WindowAgg was moved
+			// out of the descend set for.
+			//
+			// Q17 is where it became visible. `unnestSubquery` (unnest.go)
+			// decorrelates `l_quantity < (select 0.2*avg(l_quantity) from
+			// lineitem where l_partkey = p_partkey)` into a hash join whose
+			// INNER side is a HashAggregate over a CLONE of lineitem — a
+			// separate planning scope. With `GOOPG_PGSHAPED_DP` on, the
+			// outer side is a searched subtree and so records no entries
+			// (the arm above), which left that clone as the FIRST and only
+			// `lineitem` entry, at offset 25. Every outer `lineitem`
+			// binding was then remapped to `25 + col`, and the residual
+			// `l_quantity/4` became `l_quantity/29` against a 27-wide
+			// composed slot: "column ref l_quantity/29 out of VirtualSlot
+			// range 27". Flag OFF hid it only by accident — the untagged
+			// outer join recorded `lineitem` at offset 0 first, and
+			// "first occurrence wins" (below) discarded the clone.
+			//
+			// With this arm opaque, Q17 collects no entries at all and the
+			// remap declines — which is the truth: the search boundary
+			// already publishes binding order, so there is nothing to
+			// correct. See 09 §5.21.
+			off += len(x.Output())
 		case *Values:
 			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
 			// Advance off by the output width so sibling scans stay aligned.
@@ -2847,16 +2945,31 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 // closure (M0063-0001) so the NLI rewrite path can re-bind a
 // derived-table outer's Key index by Name.
 func findUniqueColumnIndex(schema Schema, name string, offset int) int {
+	idx, _ := lookupColumnIndexByName(schema, name, offset)
+	return idx
+}
+
+// lookupColumnIndexByName is `findUniqueColumnIndex` with the two ways of
+// failing told apart: it returns (-1, true) when the name appears more than
+// once and (-1, false) when it does not appear at all.
+//
+// M0127-P5.9-i: the distinction is not decoration. A caller that may consult a
+// SECOND schema after a miss — `reresolveJoinByName`'s `predRebind` is the only
+// one — must treat ambiguity as "stop", because the reference demonstrably
+// belongs to THIS side and the resolver simply cannot say where. Conflating the
+// two makes it walk to the other side and rebind a correctly-bound reference
+// onto a different relation's column of the same name.
+func lookupColumnIndexByName(schema Schema, name string, offset int) (int, bool) {
 	hit := -1
 	for i, c := range schema {
 		if c.Name == name {
 			if hit >= 0 {
-				return -1 // duplicate
+				return -1, true // ambiguous
 			}
 			hit = i + offset
 		}
 	}
-	return hit
+	return hit, false
 }
 
 // findColumnIndexByNameAndSource (M0071-0009) returns the index
@@ -2870,16 +2983,35 @@ func findUniqueColumnIndex(schema Schema, name string, offset int) int {
 // callers must not invoke this helper with a zero source idx;
 // they should fall back to findUniqueColumnIndex instead.
 func findColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx int16, offset int) int {
+	idx, _ := lookupColumnIndexByNameAndSource(schema, name, sourceTableIdx, offset)
+	return idx
+}
+
+// lookupColumnIndexByNameAndSource is `findColumnIndexByNameAndSource` with the
+// duplicate case reported instead of folded into the miss — see
+// `lookupColumnIndexByName` for why the difference matters.
+//
+// M0127-P5.9-i also settled what the duplicate case IS. The old comment called
+// it "shouldn't happen in well-formed schemas": that is true only within one
+// query scope, which is the case M0071-0009 was written for (Q21's `l1/l2/l3`
+// are three range-table entries of ONE scope, so three distinct source
+// indices). It is false across scopes. TPC-DS Q83 joins three CTE scans whose
+// `item_id` each descends from `item.i_item_id` inside a separate WITH arm;
+// every arm numbers its own range table, so all three columns carry the same
+// source identity and the pair (Name, SourceTableIdx) is genuinely ambiguous.
+// Seven TPC-DS queries are in this family (Q11, Q31, Q47, Q57, Q58, Q74, Q83) —
+// a shape none of TPC-H's 22 queries produce.
+func lookupColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx int16, offset int) (int, bool) {
 	hit := -1
 	for i, c := range schema {
 		if c.Name == name && c.SourceTableIdx == sourceTableIdx {
 			if hit >= 0 {
-				return -1 // duplicate (same name + same source twice — shouldn't happen in well-formed schemas, but guard)
+				return -1, true // ambiguous — the same name from the same source twice
 			}
 			hit = i + offset
 		}
 	}
-	return hit
+	return hit, false
 }
 
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
@@ -3083,21 +3215,29 @@ func reresolveJoinByName(j *Join) {
 		j.schema = merged
 	}
 
-	findUnique := findUniqueColumnIndex
-
 	// resolveSide tries SourceTableIdx-aware lookup first when
 	// the ColumnRef carries a known source identity (M0071-0009);
 	// falls back to Name-only when source identity is unknown.
-	// Returns -1 on miss.
-	resolveSide := func(schema Schema, cr *ColumnRef, offset int) int {
+	// Returns (-1, false) on miss and (-1, true) when the name is
+	// present but ambiguous — a distinction only `predRebind` acts
+	// on (M0127-P5.9-i).
+	//
+	// An ambiguous (Name, SourceTableIdx) does NOT fall back to the
+	// Name-only lookup: dropping the disambiguator can only match
+	// the same columns or more of them, so the answer would be
+	// ambiguous again.
+	resolveSide := func(schema Schema, cr *ColumnRef, offset int) (int, bool) {
 		if cr.SourceTableIdx != 0 {
-			if newIdx := findColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); newIdx >= 0 {
-				return newIdx
+			if newIdx, ambiguous := lookupColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); newIdx >= 0 || ambiguous {
+				return newIdx, ambiguous
 			}
 		}
-		return findUnique(schema, cr.Name, offset)
+		return lookupColumnIndexByName(schema, cr.Name, offset)
 	}
 
+	// rebind resolves a join key against the side it is already known
+	// to belong to, so an ambiguous name is simply left alone — there
+	// is no other side to be wrongly tempted by.
 	rebind := func(e Expr, leftSide bool) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
@@ -3105,9 +3245,9 @@ func reresolveJoinByName(j *Join) {
 		}
 		var newIdx int
 		if leftSide {
-			newIdx = resolveSide(leftSchema, cr, 0)
+			newIdx, _ = resolveSide(leftSchema, cr, 0)
 		} else {
-			newIdx = resolveSide(rightSchema, cr, leftWidth)
+			newIdx, _ = resolveSide(rightSchema, cr, leftWidth)
 		}
 		if newIdx >= 0 {
 			cr.Index = newIdx
@@ -3129,27 +3269,38 @@ func reresolveJoinByName(j *Join) {
 	// resolveSide prefers the (Name, SourceTableIdx) match — Q21's
 	// 3 lineitem aliases all named `l_suppkey` are no longer
 	// "ambiguous"; each disambiguates by its source.
+	//
+	// M0127-P5.9-i: the fallback is for a MISS, never for an
+	// AMBIGUITY. A miss says "this name is not on this side", which
+	// is real evidence the side classification was wrong; an
+	// ambiguity says "this name is on this side more than once",
+	// which is evidence of nothing except that the resolver cannot
+	// finish. Crossing over on the second is how a correctly-bound
+	// reference to one of three repeated CTE scans (TPC-DS Q83's
+	// `item_id`) got rebound onto a different scan's column of the
+	// same name — a predicate comparing a column to itself, hence a
+	// cross product, and under GOOPG_PGSHAPED_DP a plan-time abort in
+	// `assertSearchedTreeNeedsNoReconcile`. Abstaining leaves the
+	// index the coordinate arithmetic bound, which is the answer.
 	predRebind := func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
 			return
 		}
-		tryLeftFirst := cr.Index < leftWidth
-		if tryLeftFirst {
-			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
-				cr.Index = newIdx
+		type side struct {
+			schema Schema
+			offset int
+		}
+		order := [2]side{{leftSchema, 0}, {rightSchema, leftWidth}}
+		if cr.Index >= leftWidth {
+			order[0], order[1] = order[1], order[0]
+		}
+		for _, s := range order {
+			newIdx, ambiguous := resolveSide(s.schema, cr, s.offset)
+			if ambiguous {
 				return
 			}
-			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
-				cr.Index = newIdx
-				return
-			}
-		} else {
-			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
-				cr.Index = newIdx
-				return
-			}
-			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
+			if newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}

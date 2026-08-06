@@ -1,0 +1,233 @@
+=== Q1
+  (no join nodes; 3 plan nodes)
+
+=== Q2
+  F d1  Hash Join (INNER)                        est=34         actual=632        ratio=18.6x under
+    d2  Hash Join (INNER)                        est=213        actual=632        ratio=3.0x under
+    d3  Hash Join (INNER)                        est=32000      actual=163440     ratio=5.1x under
+    d4  Hash Join (INNER)                        est=400        actual=2043       ratio=5.1x under
+    d5  Nested Loop (INNER)                      est=1          actual=5          ratio=5.0x under
+    d3  Hash Join (INNER)                        est=32000      actual=163440     ratio=5.1x under
+    d4  Hash Join (INNER)                        est=400        actual=2043       ratio=5.1x under
+    d5  Nested Loop (INNER)                      est=1          actual=5          ratio=5.0x under
+
+=== Q3
+  F d2  Hash Join (INNER)                        est=307309     actual=30401      ratio=10.1x over
+    d3  Hash Join (INNER)                        est=145295     actual=145757     ratio=1.0x under
+
+=== Q4
+  F d2  Hash Join (SEMI)                         est=319722     actual=52806      ratio=6.1x over
+
+=== Q5
+  F d2  Hash Join (INNER)                        est=1          actual=7411       ratio=7411.0x under
+    d3  Merge Join (INNER)                       est=1          actual=189451     ratio=189451.0x under
+    d4  Hash Join (INNER)                        est=239889     actual=1251590    ratio=5.2x under
+    d5  Hash Join (INNER)                        est=400        actual=2086       ratio=5.2x under
+    d6  Nested Loop (INNER)                      est=1          actual=5          ratio=5.0x under
+
+=== Q6
+  (no join nodes; 2 plan nodes)
+
+=== Q7
+  F d2  Hash Join (INNER)                        est=1          actual=5869       ratio=5869.0x under
+    d3  Hash Join (INNER)                        est=1          actual=147791     ratio=147791.0x under
+    d4  Merge Join (INNER)                       est=1          actual=1820702    ratio=1820702.0x under
+    d4  Hash Join (INNER)                        est=1200       actual=813        ratio=1.5x over
+    d5  Nested Loop (INNER)                      est=3          actual=2          ratio=1.5x over
+
+=== Q8
+  F d2  Hash Join (INNER)                        est=657        actual=2555       ratio=3.9x under
+    d3  Hash Join (INNER)                        est=657        actual=2555       ratio=3.9x under
+    d4  Hash Join (INNER)                        est=657        actual=2555       ratio=3.9x under
+    d5  Hash Join (INNER)                        est=39971      actual=42336      ratio=1.1x under
+    d5  Hash Join (INNER)                        est=24687      actual=90389      ratio=3.7x under
+    d6  Hash Join (INNER)                        est=6000       actual=29821      ratio=5.0x under
+    d7  Nested Loop (INNER)                      est=1          actual=5          ratio=5.0x under
+
+=== Q9
+  F d2  Hash Join (INNER)                        est=1          actual=316264     ratio=316264.0x under
+    d3  Hash Join (INNER)                        est=1          actual=316264     ratio=316264.0x under
+    d4  Hash Join (INNER)                        est=3          actual=5997241    ratio=1999080.3x under
+    d5  Merge Join (INNER)                       est=3          actual=5997241    ratio=1999080.3x under
+    d5  Hash Join (INNER)                        est=10000      actual=10000      ratio=1.0x under
+
+=== Q10
+  F d2  Hash Join (INNER)                        est=1          actual=114106     ratio=114106.0x under
+    d3  Merge Join (INNER)                       est=1          actual=114106     ratio=114106.0x under
+    d3  Hash Join (INNER)                        est=150000     actual=150000     ratio=1.0x under
+
+=== Q11
+    d6  Hash Join (INNER)                        est=4000       actual=?        (no ANALYZE)
+    d7  Nested Loop (INNER)                      est=50         actual=?        (no ANALYZE)
+  F d2  Hash Join (INNER)                        est=4000       actual=32560      ratio=8.1x under
+    d3  Nested Loop (INNER)                      est=50         actual=407        ratio=8.1x under
+
+=== Q12
+  F d2  Merge Join (INNER)                       est=1          actual=31354      ratio=31354.0x under
+
+=== Q13
+  F d3  Hash Join (LEFT)                         est=500000     actual=1528411    ratio=3.1x under
+
+=== Q14
+  F d1  Hash Join (INNER)                        est=916089     actual=74763      ratio=12.3x over
+
+=== Q15a-VIEWBODY
+  (no join nodes; 2 plan nodes)
+
+=== Q16
+  F d2  Hash Join (ANTI NULL-AWARE)              est=27370      actual=118892     ratio=4.3x under
+    d3  Hash Join (INNER)                        est=40960      actual=118892     ratio=2.9x under
+
+=== Q17
+  F d1  Hash Join (INNER)                        est=5828       actual=5763       ratio=1.0x over
+    d2  Hash Join (INNER)                        est=5997       actual=5763       ratio=1.0x over
+
+=== Q18
+  F d2  Hash Join (SEMI)                         est=1642632    actual=70         ratio=23466.2x over
+    d3  Merge Join (INNER)                       est=5997241    actual=5997241    ratio=1.0x under
+    d4  Hash Join (INNER)                        est=1500000    actual=1500000    ratio=1.0x under
+
+=== Q19
+  F d1  Hash Join (INNER)                        est=329        actual=131        ratio=2.5x over
+
+=== Q20
+  F d1  Hash Join (SEMI)                         est=50         actual=76         ratio=1.5x under
+    d2  Nested Loop (INNER)                      est=50         actual=374        ratio=7.5x under
+    d2  Hash Join (SEMI)                         est=62677      actual=2568       ratio=24.4x over
+    d3  Hash Join (INNER)                        est=559670     actual=236624     ratio=2.4x over
+
+=== Q21
+  F d2  Hash Join (ANTI)                         est=24         actual=4003       ratio=166.8x under
+    d3  Hash Join (SEMI)                         est=4819       actual=71824      ratio=14.9x under
+    d4  Hash Join (INNER)                        est=4844       actual=74546      ratio=15.4x under
+    d5  Hash Join (INNER)                        est=9995       actual=153894     ratio=15.4x under
+    d6  Nested Loop (INNER)                      est=50         actual=405        ratio=8.1x under
+
+=== Q22
+  F d2  Hash Join (ANTI)                         est=18783      actual=3884       ratio=4.8x over
+
+=== SUMMARY (tripwire 1000x; final joinrel 1000x, per-query overrides [Q21<=5000x Q9<=100x])
+  VIOLATION Q9: joinrel "Hash Join (INNER)" est=3 actual=5997241 ratio=1999080.3x (underestimated, threshold 1000x)
+  VIOLATION Q9: joinrel "Merge Join (INNER)" est=3 actual=5997241 ratio=1999080.3x (underestimated, threshold 1000x)
+  VIOLATION Q7: joinrel "Merge Join (INNER)" est=1 actual=1820702 ratio=1820702.0x (underestimated, threshold 1000x)
+  VIOLATION Q9: FINAL joinrel "Hash Join (INNER)" est=1 actual=316264 ratio=316264.0x (underestimated, threshold 100x)
+  VIOLATION Q9: joinrel "Hash Join (INNER)" est=1 actual=316264 ratio=316264.0x (underestimated, threshold 1000x)
+  VIOLATION Q5: joinrel "Merge Join (INNER)" est=1 actual=189451 ratio=189451.0x (underestimated, threshold 1000x)
+  VIOLATION Q7: joinrel "Hash Join (INNER)" est=1 actual=147791 ratio=147791.0x (underestimated, threshold 1000x)
+  VIOLATION Q10: FINAL joinrel "Hash Join (INNER)" est=1 actual=114106 ratio=114106.0x (underestimated, threshold 1000x)
+  VIOLATION Q10: joinrel "Merge Join (INNER)" est=1 actual=114106 ratio=114106.0x (underestimated, threshold 1000x)
+  VIOLATION Q12: FINAL joinrel "Merge Join (INNER)" est=1 actual=31354 ratio=31354.0x (underestimated, threshold 1000x)
+  VIOLATION Q18: FINAL joinrel "Hash Join (SEMI)" est=1642632 actual=70 ratio=23466.2x (overestimated, threshold 1000x)
+  VIOLATION Q5: FINAL joinrel "Hash Join (INNER)" est=1 actual=7411 ratio=7411.0x (underestimated, threshold 1000x)
+  VIOLATION Q7: FINAL joinrel "Hash Join (INNER)" est=1 actual=5869 ratio=5869.0x (underestimated, threshold 1000x)
+  OVERRIDE Q21 final joinrel <=5000x — PG 18.3 estimates rows=1 for the same ANTI against the same actual (neqjoinsel returns 1-nullfrac for JOIN_ANTI by design); closing it would diverge from PG
+  OVERRIDE Q9 final joinrel <=100x — 09 §5's stated demonstration that 04 §3's sizing mechanisms worked
+
+=== PER-JOINREL PARITY vs PG 18.3 (09 §4 ratchet)
+--- Q10
+  F {customer+lineitem+nation+orders}              goopg 114106.0x | PG      2.1x | excess 54658.3x  <== PARITY-VIOLATION
+    {customer+nation}                              goopg      1.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+orders}                              goopg 114106.0x | PG      2.1x | excess 54658.3x  <== PARITY-VIOLATION
+    {customer+lineitem+orders}                     goopg        - | PG      2.1x | SHAPE (PG-only joinrel)
+--- Q11
+  F {nation+partsupp+supplier}                     goopg      8.1x | PG      1.1x | excess     7.5x
+    {nation+supplier}                              goopg      8.1x | PG      1.1x | excess     7.5x
+    {nation_1+partsupp_1+supplier_1}               goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+    {nation_1+supplier_1}                          goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+--- Q12
+  F {lineitem+orders}                              goopg  31354.0x | PG      1.1x | excess 28421.0x  <== PARITY-VIOLATION
+--- Q13
+  F {customer+orders}                              goopg      3.1x | PG      1.0x | excess     2.9x
+--- Q14
+  F {lineitem+part}                                goopg     12.3x | PG      1.0x | excess    11.7x
+--- Q16
+    {part+partsupp}                                goopg      2.9x | PG        - | SHAPE (goopg-only joinrel)
+  F {part+partsupp+supplier}                       goopg      4.3x | PG      2.0x | excess     2.2x
+--- Q17
+  F~{lineitem+part}                                goopg      1.0x | PG        - | SHAPE (goopg-only joinrel)
+  F {lineitem+lineitem_1+part}                     goopg        - | PG      4.1x | SHAPE (PG-only joinrel)
+--- Q18
+  F~{customer+lineitem+orders}                     goopg  23466.2x | PG        - | SHAPE (goopg-only joinrel)
+    {customer+orders}                              goopg      1.0x | PG        - | SHAPE (goopg-only joinrel)
+  F {customer+lineitem+lineitem_1+orders}          goopg        - | PG   5386.6x | SHAPE (PG-only joinrel)
+    {customer+lineitem_1+orders}                   goopg        - | PG   9428.4x | SHAPE (PG-only joinrel)
+    {lineitem_1+orders}                            goopg        - | PG   9428.4x | SHAPE (PG-only joinrel)
+--- Q19
+  F {lineitem+part}                                goopg      2.5x | PG      1.0x | excess     2.4x
+--- Q2
+  F~{nation+part+partsupp+region+supplier}         goopg     18.6x | PG        - | SHAPE (goopg-only joinrel)
+   ~{nation+partsupp+region+supplier}              goopg      5.1x | PG      1.0x | excess     5.1x
+   ~{nation+region}                                goopg      5.0x | PG      1.0x | excess     5.0x
+   ~{nation+region+supplier}                       goopg      5.1x | PG      1.0x | excess     5.1x
+  F {nation+nation_1+part+partsupp+partsupp_1+reg… goopg        - | PG    469.0x | SHAPE (PG-only joinrel)
+    {nation_1+partsupp_1+region_1+supplier_1}      goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {nation_1+partsupp_1+supplier_1}               goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {partsupp_1+supplier_1}                        goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+--- Q20
+  F {lineitem+nation+part+partsupp+supplier}       goopg      1.5x | PG      1.2x | excess     1.3x
+    {lineitem+part+partsupp}                       goopg     24.4x | PG      1.1x | excess    23.2x
+    {lineitem+partsupp}                            goopg      2.4x | PG        - | SHAPE (goopg-only joinrel)
+    {nation+supplier}                              goopg      7.5x | PG      1.0x | excess     7.3x
+--- Q21
+  F {l1+l2+l3+nation+orders+supplier}              goopg    166.8x | PG   4178.0x | excess     0.0x
+    {l1+l2+nation+orders+supplier}                 goopg     14.9x | PG        - | SHAPE (goopg-only joinrel)
+    {l1+nation+orders+supplier}                    goopg     15.4x | PG        - | SHAPE (goopg-only joinrel)
+    {l1+nation+supplier}                           goopg     15.4x | PG      2.0x | excess     7.7x
+    {nation+supplier}                              goopg      8.1x | PG      1.1x | excess     7.7x
+    {l1+l2+l3+nation+supplier}                     goopg        - | PG   8563.0x | SHAPE (PG-only joinrel)
+    {l1+l3+nation+supplier}                        goopg        - | PG  14214.0x | SHAPE (PG-only joinrel)
+--- Q22
+  F {customer+orders}                              goopg      4.8x | PG      2.7x | excess     1.8x
+--- Q3
+  F {customer+lineitem+orders}                     goopg     10.1x | PG     10.3x | excess     1.0x
+    {customer+orders}                              goopg      1.0x | PG      1.0x | excess     1.0x
+--- Q4
+  F {lineitem+orders}                              goopg      6.1x | PG      4.1x | excess     1.5x
+--- Q5
+  F {customer+lineitem+nation+orders+region+suppl… goopg   7411.0x | PG      1.0x | excess  7339.2x  <== PARITY-VIOLATION
+    {lineitem+nation+orders+region+supplier}       goopg 189451.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+nation+region+supplier}              goopg      5.2x | PG        - | SHAPE (goopg-only joinrel)
+    {nation+region}                                goopg      5.0x | PG      1.0x | excess     5.0x
+    {nation+region+supplier}                       goopg      5.2x | PG        - | SHAPE (goopg-only joinrel)
+    {customer+lineitem+nation+orders+region}       goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {customer+nation+orders+region}                goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {customer+nation+region}                       goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+--- Q7
+  F {customer+lineitem+n1+n2+orders+supplier}      goopg   5869.0x | PG      1.0x | excess  5868.0x  <== PARITY-VIOLATION
+    {lineitem+n1+n2+orders+supplier}               goopg 147791.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+orders}                              goopg 1820702.0x | PG        - | SHAPE (goopg-only joinrel)
+    {n1+n2}                                        goopg      1.5x | PG        - | SHAPE (goopg-only joinrel)
+    {n1+n2+supplier}                               goopg      1.5x | PG        - | SHAPE (goopg-only joinrel)
+    {customer+lineitem+n2+orders}                  goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {customer+n2}                                  goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {customer+n2+orders}                           goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+    {n1+supplier}                                  goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+--- Q8
+  F {customer+lineitem+n1+n2+orders+part+region+s… goopg      3.9x | PG      1.1x | excess     3.6x
+    {customer+lineitem+n1+orders+part+region}      goopg      3.9x | PG      1.1x | excess     3.6x
+    {customer+lineitem+n1+orders+part+region+supp… goopg      3.9x | PG      1.1x | excess     3.6x
+    {customer+n1+orders+region}                    goopg      3.7x | PG        - | SHAPE (goopg-only joinrel)
+    {customer+n1+region}                           goopg      5.0x | PG      1.0x | excess     5.0x
+    {lineitem+part}                                goopg      1.1x | PG      1.0x | excess     1.0x
+    {n1+region}                                    goopg      5.0x | PG      1.0x | excess     5.0x
+    {lineitem+orders+part}                         goopg        - | PG      1.0x | SHAPE (PG-only joinrel)
+--- Q9
+  F {lineitem+nation+orders+part+partsupp+supplie… goopg 316264.0x | PG      1.7x | excess 184922.9x  <== PARITY-VIOLATION
+    {lineitem+nation+orders+part+supplier}         goopg 316264.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+nation+orders+supplier}              goopg 1999080.3x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+orders}                              goopg 1999080.3x | PG        - | SHAPE (goopg-only joinrel)
+    {nation+supplier}                              goopg      1.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+nation+part+partsupp+supplier}       goopg        - | PG      1.7x | SHAPE (PG-only joinrel)
+    {nation+part+partsupp+supplier}                goopg        - | PG      1.7x | SHAPE (PG-only joinrel)
+    {part+partsupp}                                goopg        - | PG      1.7x | SHAPE (PG-only joinrel)
+    {part+partsupp+supplier}                       goopg        - | PG      1.7x | SHAPE (PG-only joinrel)
+
+=== PARITY SUMMARY (slack 10x, floor 100x)
+  joinrels compared: 32 matched, 46 shape-divergent, 6 ambiguous (a relation scanned twice without an alias — outermost occurrence compared)
+  PARITY-VIOLATION Q9: {lineitem+nation+orders+part+partsupp+supplier} goopg est=1 actual=316264 ratio=316264.0x vs PG est=545138 actual=318748 ratio=1.7x — 184922.9x worse than the reference
+  PARITY-VIOLATION Q10: {customer+lineitem+nation+orders} goopg est=1 actual=114106 ratio=114106.0x vs PG est=55189 actual=115214 ratio=2.1x — 54658.3x worse than the reference
+  PARITY-VIOLATION Q10: {lineitem+orders} goopg est=1 actual=114106 ratio=114106.0x vs PG est=55189 actual=115214 ratio=2.1x — 54658.3x worse than the reference
+  PARITY-VIOLATION Q12: {lineitem+orders} goopg est=1 actual=31354 ratio=31354.0x vs PG est=28421 actual=31354 ratio=1.1x — 28421.0x worse than the reference
+  PARITY-VIOLATION Q5: {customer+lineitem+nation+orders+region+supplier} goopg est=1 actual=7411 ratio=7411.0x vs PG est=7428 actual=7356 ratio=1.0x — 7339.2x worse than the reference
+  PARITY-VIOLATION Q7: {customer+lineitem+n1+n2+orders+supplier} goopg est=1 actual=5869 ratio=5869.0x vs PG est=5985 actual=5986 ratio=1.0x — 5868.0x worse than the reference
+  RATCHET parity_violations=6 shape_mismatches=46

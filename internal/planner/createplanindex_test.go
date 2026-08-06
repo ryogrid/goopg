@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.5-c — the `createPlan` index-scan arm (createplanindex.go).
 //
-// The arm is inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are the only observer of its invariants. What they
+// The arm is LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer the only observer of its invariants. What they
 // pin, in order: which leaf shapes are rebuildable and what the rewrapper
 // reproduces; that the emitted `*IndexScan` carries the LEAF's identity and the
 // PATH's index; the executor's `Key`/`Keys` convention; every panic the arm
@@ -329,6 +330,7 @@ func TestBuildInitialRelsRecordsBaseLeaf(t *testing.T) {
 		leaves,
 		[]baseRelInfo{{filteredRows: 10}, {filteredRows: 10}},
 		defaultCostParams(),
+		0,
 	)
 	if err != nil {
 		t.Fatal(err)

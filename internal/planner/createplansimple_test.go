@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.5-d — the seq-scan and sort `createPlan` arms (createplansimple.go).
 //
-// The arms are inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are the only observer of their invariants. What they
+// The arms are LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer the only observer of their invariants. What they
 // pin: the seq-scan rebuild is a FRESH node that loses no `*SeqScan` field
 // (including the four fields only this arm copies — a field added to the node
 // but not to `scanIdentity` fails here, which is the struct's stated purpose);

@@ -28,9 +28,10 @@ package planner
 // when the join above it can skip a sort, which is precisely the comparison
 // `addPath`'s pathkey dimension exists to hold open.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so these paths cannot change a plan. Validated in isolation by
-// `pathindexordered_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `addBaseRelIndexPaths` is called from
+// `searchOneProblem` (relfromjoinlist.go:325) and `GOOPG_PGSHAPED_DP` defaults
+// ON, so these paths DO compete for production plans. Validated by
+// `pathindexordered_test.go`, no longer in isolation.
 
 import (
 	"github.com/goopg/goopg/internal/catalog"

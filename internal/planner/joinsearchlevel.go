@@ -98,8 +98,15 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 	s.clauses = clauses
 	s.builder = b
 
+	// The provenance block is emitted for a FAILED search too (P5.9-l-ii): a
+	// search that could not enumerate is precisely the case where "what was
+	// offered" is the evidence, and a deferred emit that only fired on success
+	// would go dark exactly then. `trace` is nil unless the gate is on.
+	defer s.trace.emit()
+
 	for lev := 2; lev <= s.nrels; lev++ {
 		if err := s.joinSearchOneLevel(lev); err != nil {
+			s.traceFailed(err)
 			return nil, err
 		}
 		// PG runs set_cheapest per rel only after the whole level is done
@@ -108,12 +115,31 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 		// last such pair has been offered.
 		for _, rel := range s.levelRels(lev) {
 			if len(rel.Pathlist) == 0 {
-				return nil, fmt.Errorf("join search: joinrel %#04x has no paths", uint16(rel.Relids))
+				err := fmt.Errorf("join search: joinrel %#04x has no paths", uint16(rel.Relids))
+				s.traceFailed(err)
+				return nil, err
 			}
 			setCheapest(rel)
 		}
 	}
-	return s.finalRel()
+	top, err := s.finalRel()
+	if err != nil {
+		s.traceFailed(err)
+		return nil, err
+	}
+	if s.trace != nil {
+		s.trace.top = top.Relids
+	}
+	return top, nil
+}
+
+// traceFailed records why the search gave up, so the emitted block says whether
+// the enumeration it lists is the whole enumeration or a truncated one.
+func (s *searchCtx) traceFailed(err error) {
+	if s.trace == nil || err == nil {
+		return
+	}
+	s.trace.failed = err.Error()
 }
 
 // joinSearchOneLevel is `join_search_one_level` (joinrels.c:73) at phases 1 and
@@ -142,6 +168,7 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 	// rel can have no relevant clause with any base rel, so it always falls
 	// through to the else) EXCEPT for the level-2 `first` offset below, which
 	// PG applies to the clause branch only.
+	s.tracePhase = tracePhaseLeftRight
 	for i, old := range prev {
 		if !s.clauses.hasNoJoinClauseAtAll(old) || hasJoinRestriction(old) {
 			// At level 2 the pair condition is symmetric and the previous
@@ -179,6 +206,7 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 	// composites. PG's stated reason is planning time (:144-146) — the
 	// unfiltered space is (3ⁿ − 2ⁿ⁺¹ + 1)/2 pairs, ~7M at n=15 — and the
 	// filter is what keeps goopg's ceiling-16 no-GEQO policy (03 §7) tenable.
+	s.tracePhase = tracePhaseBushy
 	for k := 2; ; k++ {
 		otherLevel := lev - k
 		// make_join_rel(x, y) already handles y,x, so the k-loop only has to
@@ -202,6 +230,11 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 			// enter the search: then a clauseless rel CAN be forced into a
 			// bushy plan, and the skip is what decides which ones are.
 			if s.clauses.hasNoJoinClauseAtAll(old) && !hasJoinRestriction(old) {
+				// Recorded against the empty relset because the skip is per OLD
+				// REL, not per pair: what the trace has to show is that this
+				// composite was withheld from the whole bushy pass, not that
+				// some particular partner was refused (P5.9-l-ii).
+				s.trace.decline(tracePhaseBushy, old.Relids, 0, "clauseless-composite")
 				continue
 			}
 			// At the halfway level the two lists are the SAME list, so every
@@ -226,6 +259,7 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 	// the clause requirement dropped; left/right-sided only, no bushy
 	// (joinrels.c:215-216).
 	if len(s.levelRels(lev)) == 0 {
+		s.tracePhase = tracePhaseLastDitch
 		for _, old := range prev {
 			if err := s.makeRelsByClauselessJoins(old, initial); err != nil {
 				return err
@@ -256,6 +290,12 @@ func (s *searchCtx) makeRelsByClauseJoins(old *RelOptInfo, others []*RelOptInfo,
 			continue
 		}
 		if !s.clauses.hasRelevantJoinClause(old, other) && !joinOrderRestricted(old, other) {
+			// The one gate that can silently withhold a partition PG chose.
+			// Recorded (P5.9-l-ii) because "never offered" and "offered and
+			// out-costed" are the two readings clause 6 has to choose between,
+			// and only the first has a cause worth naming: this line is that
+			// cause when it fires.
+			s.trace.decline(s.tracePhase, old.Relids, other.Relids, "no-join-clause")
 			continue
 		}
 		if _, err := s.makeJoinRel(old, other); err != nil {
@@ -318,6 +358,11 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	clauses := s.clauses.clausesFor(rel1.Relids, rel2.Relids)
 
 	joinrel := s.findRel(joinrelids)
+	// Recorded BEFORE the find-or-create branch, so the `created` bit says
+	// which pair of the several spanning this relset was the first to reach it
+	// — the pair whose `sizeJoinRel` fixed the relset's cardinality for every
+	// later comparison (joinsearchlevel.go:43) (P5.9-l-ii).
+	s.trace.offer(s.tracePhase, rel1.Relids, rel2.Relids, joinrel == nil)
 	if joinrel == nil {
 		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses)
 		// The same floor buildInitialRels applies (joinsearch.go:220-240):
@@ -331,6 +376,11 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).
 		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
+		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
+		// (relnode.c:707) — the same query-wide fact every base rel copied in
+		// `buildInitialRels`, not something inherited from the inputs
+		// (M0127-P5.7-b).
+		joinrel.ConsiderStartup = s.tupleFraction > 0
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

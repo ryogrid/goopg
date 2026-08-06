@@ -55,9 +55,10 @@ package planner
 //     joins, whose blow-up is a fact about the data rather than an artefact of
 //     compounding.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF (joinsearch.go:44) and nothing calls
-// `joinSearch` from `planSelect`, so this builder is reachable only from tests
-// until P5.9. Validated by `joinrelsize_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON
+// (`pgShapedDPFromEnv` is `v != "0"`) and `planSelect` calls the search, so
+// this builder sizes production joinrels rather than being reachable only from
+// tests. Validated by `joinrelsize_test.go`, and now also by the planner bar.
 
 import (
 	"math"
@@ -94,7 +95,7 @@ func (b *searchJoinRelBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*
 }
 
 func (b *searchJoinRelBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
-	return addPathsToJoinrel(joinrel, outer, inner, clauses, b.s.cp)
+	return addPathsToJoinrel(b.s, joinrel, outer, inner, clauses, b.s.cp)
 }
 
 // calcJoinrelSize is `calc_joinrel_size_estimate` (costsize.c:5499) for the

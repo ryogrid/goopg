@@ -25,9 +25,10 @@ package planner
 // the inner's own per-probe cost. Between P5.4b-i and this slice that pair was
 // legitimately pathless; from here it is not.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan can move. Validated in isolation by
-// `joinpathsnli_test.go`.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and
+// `planSelect` calls the search, so the paths this arm emits DO compete for
+// production plans. Validated by `joinpathsnli_test.go`, no longer in
+// isolation.
 
 // paramSourceRels is PG's `extra->param_source_rels` (joinpath.c:227-263): the
 // relations a join path is allowed to stay parameterised BY, which PG derives
@@ -201,7 +202,7 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // paths in play are base index scans. That is what lets `addNestLoopPath` and
 // `addHashJoinPath` set `Rows: joinRel.Rows` unconditionally without a
 // `ppi_rows` of their own.
-func addNLIPaths(joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*restrictInfo) {
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*restrictInfo) {
 	o := outer.CheapestTotal
 	if o == nil || o.RequiredOuter != 0 {
 		return
@@ -226,26 +227,40 @@ func addNLIPaths(joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*re
 			continue
 		}
 		residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
-		// `i.Cost` prices ONE execution with the parameter bound and `i.Rows`
-		// is its `ppi_rows` (03 §9 rule 3), so the inner's own total IS the
-		// per-outer-row rescan cost — PG's `cost_rescan` default for an index
-		// scan, which caches nothing between rescans (costsize.c:4577). This
-		// is the whole reason PG re-costs the pair here instead of in the
-		// plain-NL arm, where the inner's unparameterised total would be
-		// charged per outer row.
-		cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinrel.Rows, i.Cost.Total)
-		cost.Total += qualEvalCost(cp, len(residual), o.Rows*i.Rows)
-		addPath(joinrel, &Path{
-			Kind:     PathNestLoop,
-			Rel:      joinrel,
-			Rows:     joinrel.Rows,
-			Cost:     cost,
-			Children: []*Path{o, i},
-			Residual: residual,
-			// Empty by the test above. Carried through the constructor rather
-			// than hard-coded so the star-schema case is a one-line relaxation
-			// once P5.6's sizer exists.
-			RequiredOuter: req,
-		})
+		// PG offers the bare inner AND, when `get_memoize_path` returns one,
+		// the cache-wrapped inner — both to the same `try_nestloop_path`
+		// (joinpath.c:1965-1986), so `add_path` decides whether the cache pays.
+		// The residual is computed ONCE, from the bare inner: a Memoize wrapper
+		// changes nothing about which clauses the probe below it enforces, and
+		// re-deriving it per candidate would invite the two to disagree.
+		// M0127-P5.4b-ii-b-2.
+		for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+			if in == nil {
+				continue
+			}
+			// `in.Cost` prices ONE execution with the parameter bound and
+			// `in.Rows` is its `ppi_rows` (03 §9 rule 3), so the inner's own
+			// total IS the per-outer-row rescan cost for an uncached inner —
+			// PG's `cost_rescan` default for an index scan, which caches
+			// nothing between rescans (costsize.c:4577). This is the whole
+			// reason PG re-costs the pair here instead of in the plain-NL arm,
+			// where the inner's unparameterised total would be charged per
+			// outer row. `pathRescanTotal` is the one place that knows a
+			// Memoize wrapper answers differently.
+			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, pathRescanTotal(in))
+			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+			addPath(joinrel, &Path{
+				Kind:     PathNestLoop,
+				Rel:      joinrel,
+				Rows:     joinrel.Rows,
+				Cost:     cost,
+				Children: []*Path{o, in},
+				Residual: residual,
+				// Empty by the test above. Carried through the constructor
+				// rather than hard-coded so the star-schema case is a one-line
+				// relaxation once P5.6's sizer exists.
+				RequiredOuter: req,
+			})
+		}
 	}
 }

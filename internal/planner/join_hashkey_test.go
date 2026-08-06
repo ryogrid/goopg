@@ -94,6 +94,8 @@ func hashKeyTestCatalog(t *testing.T) catalog.Catalog {
 // executor's int64 key is width-agnostic while a type check written as "both
 // sides are the same type" would reject them.
 func TestHashKeysAreInt64OnPlannedIntegerJoin(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := hashKeyTestCatalog(t)
 	joins := planHashJoins(t, cat, `select s_name, n_name
 from supplier, nation, lineitem

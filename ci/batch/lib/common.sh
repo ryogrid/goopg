@@ -18,6 +18,30 @@ stage_status() {
     printf '%s\n' "$2" > "${RUN_DIR}/stages/$1.status"
 }
 
+# source_fingerprint — a hash of the Go build inputs as they are RIGHT NOW.
+#
+# The batch builds from the live working tree, and a Ralph loop edits/commits
+# that tree while the batch runs. Preflight's `make build` therefore proves
+# nothing about the tree a later stage compiles: on 2026-08-06 preflight passed
+# at 01:13 and the testport stage failed to build at ~01:2x because the loop had
+# committed `bf52391e` in between, manufacturing 14 unattributable "regressions"
+# (AI-20260806-011323-002..-015). meta.json recorded `dirty=50` and nothing acted
+# on it. Stamping every stage lets the summarizer say WHICH stages ran on WHICH
+# tree instead of inferring it from a compile error in a log body.
+#
+# Covers: HEAD (a mid-run commit), the porcelain status (a file appearing or
+# disappearing), and the tracked-file diff content (an in-place edit that leaves
+# the porcelain line unchanged). Untracked .go files are covered by name only —
+# enough to see one appear, not to see one edited; a stronger content hash would
+# have to walk the tree on every stage boundary.
+source_fingerprint() {
+    {
+        git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null
+        git -C "${REPO_ROOT}" status --porcelain -- '*.go' go.mod go.sum 2>/dev/null
+        git -C "${REPO_ROOT}" diff HEAD -- '*.go' go.mod go.sum 2>/dev/null
+    } | sha1sum | cut -c1-16
+}
+
 # port_busy <host> <port> — 0 when something accepts on host:port.
 port_busy() {
     ( exec 3<>"/dev/tcp/$1/$2" ) 2>/dev/null

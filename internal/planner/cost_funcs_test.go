@@ -43,10 +43,12 @@ func TestCostSeqscan_HandComputed(t *testing.T) {
 
 func TestCostSortRun_StartupHeavy(t *testing.T) {
 	cp := defaultCostParams()
-	if (costSortRun(cp, 1) != Cost{}) {
-		t.Fatalf("a 1-row sort should cost nothing")
+	// `cost_tuplesort` clamps `tuples` to 2 rather than returning zero
+	// ("mustn't do log(0)"), so a degenerate input still costs something.
+	if tiny := costSortRun(cp, 1, 0); !(tiny.Total > 0) {
+		t.Fatalf("a 1-row sort must be clamped to PG's 2-tuple floor, got %+v", tiny)
 	}
-	c := costSortRun(cp, 1000)
+	c := costSortRun(cp, 1000, 0)
 	// startup = 2*0.0025 * 1000 * log2(1000)
 	wantStartup := 2 * 0.0025 * 1000 * math.Log2(1000)
 	if !approx(c.Startup, wantStartup) {

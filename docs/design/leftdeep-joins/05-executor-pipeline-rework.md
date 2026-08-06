@@ -134,6 +134,132 @@ sibling-path rule applies (any semantic divergence between the twins is a
 release blocker; the overflow-parity precedent is
 `docs/design/0097-0037-fast-path-int-overflow.md`).
 
+### 6.1 PS6.1 as landed (2026-08-06)
+
+`initExecKeys` (`join_composite_key.go`) now also calls `compileExecExprs`,
+which compiles `buildKeyExprs[i]`, `probeKeyExprs[i]` and `execResidual` into
+a per-`joinOp` `exprTreeSlab`; `evalHashKeyDatumSlot` / `evalHashKeySlot` /
+`encodeCompositeKey` / `joinPredicateMatchSlot` take slab indices and run
+`evalFastExpr`. Compilation hangs off `initExecKeys` on purpose: the
+build/probe split is derived exactly once, so the compiled lists cannot end
+up in a different orientation from the interpreted ones they came from.
+
+Three findings the stage did not predict, all worth carrying forward.
+
+**1. The guard was the substantive change, not the dispatch.** The
+interpreted twin bounds-checks every `ColumnRef` and raises XX000
+(`expr.go:353-393`); that check exists because a raw index panic once escaped
+the hash-join build-side drain — run by `gatherOp.Open` in the LEADER
+goroutine, *outside* `ParallelGroup.Go`'s recover — reached `serveConn` and
+closed the client socket (TPC-DS Q8). `evalFastExpr`'s `ColumnRef` arm was a
+bare `slot.Get(colIdx)`. Putting it on that exact seam without the check would
+have re-armed the original crash, so the guard is now in `evalFastExpr` and
+covers filter/project/limit too, which had carried the same latent hole since
+M0107-0003.
+
+**2. A capability-interface bounds check costs more than it saves.** The first
+implementation asserted to a `widthSlot interface{ Width() int }`, which is an
+itab lookup: measured at ~1.4 ns/eval, it alone made the compiled key arm
+SLOWER than the interpreter it replaces (11.5 vs 10.1 ns/op). A concrete type
+switch over the four `SlotView` implementations is a type-descriptor compare,
+and each arm can then call its own `Get` DIRECTLY — so the guard is added
+while the interface dispatch on `Get` is removed. Final
+(`BenchmarkJoinKeyEval` / `BenchmarkJoinResidualEval`, 0 allocs throughout):
+
+| seam | interpreted | compiled |
+|---|---|---|
+| `ColumnRef` key over the merged key slot | 9.91 ns/op | **7.32 ns/op** (−26 %) |
+| AND-of-two-comparisons residual | 150.3 ns/op | **139.0 ns/op** (−7.5 %) |
+
+The residual number is the honest one to plan against: at ~150 ns the cost is
+`evalBinary`, not dispatch, so E5 buys little there. §8's "residual only when
+a non-equijoin conjunct exists" remains the load-bearing claim — P2.2's
+narrowing, not PS6.1's compilation, is what makes the residual cheap.
+
+**3. An uncompiled node list fails silently in the WORST direction.** The
+composite encoder walks node indices; over an empty (uncompiled) list it does
+not error — it succeeds and returns the EMPTY key, filing every build row in
+one bucket and matching every probe row against all of them. That is the Q78
+degeneracy shape with wrong rows instead of slow ones. `initExecKeys` now
+compiles even on the `plan == nil` early return, and both composite encoders
+call `ensureExecKeys` first (two predicted branches per row).
+`TestCompositeEncodeNeverRunsOnAnUncompiledNodeList` pins it. A nil key
+expression is likewise raised as `errNilHashKey` rather than degraded to a
+NULL key — before PS6.1 it reached `evalExprSlot(nil, …)`, whose fall-through
+calls `e.Pos()` on a nil interface and panics.
+
+Still interpreted after PS6.1: the MERGE key/residual seam
+(`join_merge_stream.go:260`, `join_merge_key.go`) — E5 named the hash seam
+only; ledgered 2026-08-06. `fused_hash_join.go` and `multi_hash_join.go` stay
+interpreted by design, being deleted in P6.1/P6.2.
+
+### 6.2 PS6.2 — the sibling audit (2026-08-06); E5's release gate
+
+09 §1 makes "compiled ↔ interpreted evaluators" a named sibling audit and this
+is it: `expr_sibling_parity_test.go`, nine corpora × every `SlotView`
+implementation × both twins, comparing OUTCOMES rather than values. A panic, an
+error (code + message + position) and a Datum are three points in one space,
+and the harness renders all three to one string — because PS6.1's own finding
+was that the twins diverged in a FAILURE mode (`ColumnRef` bounds), not in a
+value, and a value-only comparison is blind to exactly that.
+
+The audit found **three** divergences, none of which any existing test could
+see. In descending order of how wrong they were:
+
+**1. AND/OR short-circuited under different conditions (silent wrong answers).**
+`evalFastExpr` short-circuited on `!left.IsNull()`; `evalAnd`/`evalOr`
+(`expr.go`) require `left.Kind == KindBool`. `Datum.BoolValue()` is `Int != 0`
+on ANY Kind, so a non-boolean left operand short-circuited on the compiled twin
+— and the compiled twin then **returned that operand** as the value of the
+AND/OR, where the interpreted twin always yields `KindBool` or NULL. The worst
+shape: for an ARENA-backed string, `Datum.Int` is the mctx coordinate
+(`offset<<32|length`), so *which branch was taken* depended on the arena
+offset. 619 corpus diffs, one root cause. This is a residual-conjunction seam
+as of PS6.1, i.e. a join-predicate seam.
+
+**2. Two spellings-of-a-type lists, each duplicated (unreachable today, by
+luck).** The float-vs-integer decision existed as `isFloatResultType`
+(`exprnode.go`, case-folding, knows `"double"`) *and* as an inline string list
+in `evalExprSlot` (exact-match, did not know `"double"`); the int2/int4
+overflow decision existed as `overflowCodeForType` (case-folding) *and* as an
+inline `switch` on exact strings. The float pair is the sharper lesson: the
+compiled twin routes a ResultType that predicate accepts **to ExprAdapter —
+i.e. back into `evalExprSlot`** — so when the two lists disagree the fallback
+lands in the branch it was diverted to avoid. The overflow pair diverged
+outright (`"INT4"` → 22003 on one twin, `2147483648` on the other). Both are
+unreachable from SQL today because the planner lowercases every type name it
+emits — but "unreachable" is a property of the planner, not of these
+evaluators. Each decision is now ONE function, called by both.
+
+**3. Every compiled error lost its source position.** The interpreted twin
+passes `x.Pos()` into `evalBinary` / `evalUnary` / `evalPgLSNBinary` and stamps
+it on its 22003; the compiled twin passed a literal `0`. `ExecError.Pos` does
+not reach the wire today (goopg emits no `FieldPosition` — see
+`testport/framework/regress.go`), so this is log text for now and a live
+divergence the moment that gap closes. The position is compiled into
+`payload[4:8]` at build time; the measured cost of the extra load is nil (see
+the table below). Note what this says about corpus design: **every hand-built
+corpus was blind to it**, because `planner.BinaryOp.pos` is unexported and a
+hand-built node has position 0, so both twins agreed — for the wrong reason.
+The fix was a ninth corpus resolved from real SQL through
+`planner.ResolveIndexPredicate`, which is also the only corpus whose
+ResultType spellings and operator resolution are the production ones.
+
+Bar (bench re-run on the same box after all three fixes; 0 allocs throughout):
+
+| seam | interpreted | compiled |
+|---|---|---|
+| `ColumnRef` key over the merged key slot | 11.39 ns/op | **6.52 ns/op** |
+| AND-of-two-comparisons residual | 149.8 ns/op | **130.3 ns/op** |
+
+One PG divergence surfaced in passing and is ledgered rather than fixed here:
+`c0 + 2147483647` with `c0 int4` resolves to **int8** in goopg (`exprType`
+widens), so PG's int4 `22003` never fires for the commonest overflow shape in
+SQL. PostgreSQL types the literal `int4` and raises from `int4pl`
+(`postgres/src/backend/utils/adt/int.c`). Both twins agree, so it is not a
+sibling defect — it is why the parity corpus needs an explicit `::int4` to
+reach the int4 arm at all.
+
 ## 7. What emphatically does NOT change
 
 - The `Operator`/`TupleSlot` interfaces (`operator.go:34`, `slot.go:18`) —

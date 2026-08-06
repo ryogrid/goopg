@@ -39,14 +39,31 @@ func main() {
 	cancelAfter := flag.Duration("cancel-after", 0, "send a CancelRequest after this duration (0 = disabled). Uses lib/pq context cancel; server-side query returns SQLSTATE 57014.")
 	signalFile := flag.String("signal-file", "", "path to a sentinel file; when the file appears the current query is cancelled (context cancel + CancelRequest) and the runner moves to the next query. The file is removed after detection. Useful for manual mid-run interruption without stopping the whole process.")
 	doExplain := flag.Bool("explain", false, "issue EXPLAIN <query> instead of the query body")
+	doDigest := flag.Bool("digest", false, "compute per-result digests (ordered + order-independent + column signature) and append them to each OK line, so two arms can be compared on VALUES rather than on row counts. Costs one Scan per row; TPC-H result sets are small, but the default stays off so R0-comparable timings remain available.")
+	doDiff := flag.Bool("diff", false, "compare two -digest run logs instead of running queries: tpch-runner -diff A.log B.log. Exits 1 on any non-MATCH.")
 	doCheckpoint := flag.Bool("checkpoint", false, "issue a CHECKPOINT and exit (ignore -queries)")
 	parallelWorkers := flag.Int("parallel-workers", -1, "if >=0, SET max_parallel_workers_per_gather = N on each per-query session (-1 = leave the server default). Each query gets a fresh connection, so the SET is re-issued per query.")
 	flag.Parse()
+
+	// -diff is an offline mode: it reads two run logs and never opens a
+	// connection, so it is handled before any of the cluster plumbing.
+	if *doDiff {
+		if flag.NArg() != 2 {
+			fail("-diff takes exactly two log paths: tpch-runner -diff A.log B.log")
+		}
+		runDigestDiff(flag.Arg(0), flag.Arg(1))
+		return
+	}
 
 	// Thread the parallel-worker override to the per-query session setup via a
 	// package var: timeOneWithCancel is called from several sites and this
 	// avoids widening every signature for a measurement flag.
 	sessionParallelWorkers = *parallelWorkers
+
+	// Same package-var reasoning as sessionParallelWorkers: -digest is a
+	// measurement switch consumed deep in the drain loop, not a per-call
+	// parameter worth threading through five signatures.
+	sessionDigest = *doDigest && !*doExplain
 
 	connStr := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
 		*host, *port, *dbName, *user, *pass)
@@ -222,12 +239,76 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 		fmt.Printf("%s: ERROR after %.2fs — %v\n", label, time.Since(t0).Seconds(), err)
 		return
 	}
-	rowCount := 0
-	var explainLines []string
+	rowCount, explainLines, dig := drainRows(rows, doExplain)
+	closeErr := rows.Err()
+	rows.Close()
+	elapsed := time.Since(t0)
+	if closeErr != nil {
+		fmt.Printf("%s: ERROR after %.2fs (%d rows scanned) — %v\n", label, elapsed.Seconds(), rowCount, closeErr)
+		return
+	}
+	if doExplain {
+		fmt.Printf("%s: EXPLAIN plan:\n", label)
+		for _, l := range explainLines {
+			fmt.Printf("  %s\n", l)
+		}
+		fmt.Printf("%s: OK elapsed=%.2fs\n", label, elapsed.Seconds())
+	} else {
+		fmt.Println(okLine(label, "OK", elapsed, rowCount, dig))
+	}
+}
+
+// okLine formats the per-query result line.
+//
+// The digest tokens go BEFORE `rows=N`, which stays terminal, and that ordering
+// is a contract, not a preference: three gate scripts extract the row count with
+// an end-of-line-anchored regex —
+//
+//	scripts/tpch-spotcheck.sh:249      s/^${label}: OK .*rows=\([0-9]\+\)$/\1/p
+//	ci/batch/stages/stage-tpch.sh:193  s/^Q12: OK .*rows=\([0-9]\+\)$/\1/p
+//	scripts/tpch-relsize-arm.sh:323    s/.*rows=\([0-9]\+\)$/\1/p
+//
+// — so appending anything after `rows=N` would make every one of them extract
+// an empty string the moment someone ran a gate with -digest. Keeping the count
+// last means -digest composes with the existing gates instead of quietly
+// disarming them. TestOKLineKeepsRowsTerminal pins it.
+func okLine(label, status string, elapsed time.Duration, rowCount int, dig *resultDigest) string {
+	digest := ""
+	if dig != nil {
+		digest = " " + dig.fields()
+	}
+	return fmt.Sprintf("%s: %s elapsed=%.2fs%s rows=%d", label, status, elapsed.Seconds(), digest, rowCount)
+}
+
+// sessionDigest is the -digest switch, consumed by drainRows. Set once from
+// main; see the flag's own help text for the cost argument.
+var sessionDigest = false
+
+// drainRows consumes a result set and returns the row count, the EXPLAIN body
+// (when doExplain), and the result digest (when -digest is on; nil otherwise).
+//
+// BOTH timing paths call this, deliberately. timeOne and timeOneWithCancel are
+// sibling drains, and a digest wired into one but not the other would leave
+// whichever path an acceptance arm happened to use silently reporting row
+// counts again — the exact failure M0127-P5.9-d exists to remove.
+func drainRows(rows *sql.Rows, doExplain bool) (int, []string, *resultDigest) {
 	cols, _ := rows.Columns()
+	var (
+		explainLines []string
+		dig          *resultDigest
+		raw          []sql.RawBytes
+		targets      []any
+	)
+	if sessionDigest && !doExplain {
+		dig = newResultDigest(cols)
+		raw = make([]sql.RawBytes, len(cols))
+		targets = scanTargets(raw)
+	}
+	rowCount := 0
 	for rows.Next() {
 		rowCount++
-		if doExplain {
+		switch {
+		case doExplain:
 			// EXPLAIN output: collect all columns of each row (goopg
 			// returns a single text column; collect defensively).
 			vals := make([]interface{}, len(cols))
@@ -247,25 +328,21 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 				}
 				explainLines = append(explainLines, line)
 			}
+		case dig != nil:
+			if err := rows.Scan(targets...); err != nil {
+				// Drop the digest rather than emit a partial one: a digest
+				// over some of the rows would compare equal by accident. The
+				// diff then reports NO-DIGEST for this label, which fails.
+				fmt.Printf("  (digest abandoned at row %d: scan: %v)\n", rowCount, err)
+				dig = nil
+				continue
+			}
+			dig.addRow(raw)
 		}
 	}
-	closeErr := rows.Err()
-	rows.Close()
-	elapsed := time.Since(t0)
-	if closeErr != nil {
-		fmt.Printf("%s: ERROR after %.2fs (%d rows scanned) — %v\n", label, elapsed.Seconds(), rowCount, closeErr)
-		return
-	}
-	if doExplain {
-		fmt.Printf("%s: EXPLAIN plan:\n", label)
-		for _, l := range explainLines {
-			fmt.Printf("  %s\n", l)
-		}
-		fmt.Printf("%s: OK elapsed=%.2fs\n", label, elapsed.Seconds())
-	} else {
-		fmt.Printf("%s: OK elapsed=%.2fs rows=%d\n", label, elapsed.Seconds(), rowCount)
-	}
+	return rowCount, explainLines, dig
 }
+
 
 // runOne dispatches a single Q. Q15 is special-cased into
 // CREATE VIEW + main SELECT + DROP VIEW (matches HammerDB's
@@ -317,10 +394,7 @@ func timeOne(db *sql.DB, label, body string, budget time.Duration, doExplain boo
 		fmt.Printf("%s: ERROR after %.2fs — %v\n", label, time.Since(t0).Seconds(), err)
 		return
 	}
-	rowCount := 0
-	for rows.Next() {
-		rowCount++
-	}
+	rowCount, explainLines, dig := drainRows(rows, doExplain)
 	closeErr := rows.Err()
 	rows.Close()
 	elapsed := time.Since(t0)
@@ -330,7 +404,13 @@ func timeOne(db *sql.DB, label, body string, budget time.Duration, doExplain boo
 		fmt.Printf("%s: %s after %.2fs (%d rows scanned) — %v\n", label, status, elapsed.Seconds(), rowCount, closeErr)
 		return
 	}
-	fmt.Printf("%s: %s elapsed=%.2fs rows=%d\n", label, status, elapsed.Seconds(), rowCount)
+	if doExplain {
+		fmt.Printf("%s: EXPLAIN plan:\n", label)
+		for _, l := range explainLines {
+			fmt.Printf("  %s\n", l)
+		}
+	}
+	fmt.Println(okLine(label, status, elapsed, rowCount, dig))
 }
 
 // selectQueries parses the -queries flag into a sorted list of

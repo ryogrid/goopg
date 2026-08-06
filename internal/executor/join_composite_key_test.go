@@ -94,10 +94,13 @@ func TestCompositeKeyEncodingIsInjective(t *testing.T) {
 			&planner.ColumnRef{Index: 1},
 		},
 	}
+	// M0127-PS6.1: the encoder reads compiled slab indices, so a hand-built
+	// joinOp (no plan, hence no Open-time initExecKeys) must compile its own.
+	o.compileExecExprs()
 	encode := func(a, b string) string {
 		t.Helper()
 		slot := SlotFromRow(nil, Row{NewStringDatum(a), NewStringDatum(b)})
-		ok, packMiss, err := o.encodeCompositeKey(o.buildKeyExprs, slot)
+		ok, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
 		if err != nil || !ok || packMiss {
 			t.Fatalf("encode(%q,%q): ok=%v packMiss=%v err=%v", a, b, ok, packMiss, err)
 		}
@@ -122,8 +125,9 @@ func TestCompositeKeyNullColumnMatchesNothing(t *testing.T) {
 			&planner.ColumnRef{Index: 1},
 		},
 	}
+	o.compileExecExprs()
 	slot := SlotFromRow(nil, Row{NewIntDatum(1), NullDatum})
-	ok, _, err := o.encodeCompositeKey(o.buildKeyExprs, slot)
+	ok, _, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}

@@ -51,11 +51,11 @@ package planner
 // is already binding order (the leading case — a left-deep tree whose outer
 // spine starts at FROM item 0), which is the projection elision §10 anticipated.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06)
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
-// no plan and no row can move. `createplanroot_test.go` is this file's only
-// observer.
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so this
+// file builds the executor tree production actually runs: plans and rows DO
+// move here. `createplanroot_test.go` is no longer its only observer.
 
 import (
 	"fmt"
@@ -78,11 +78,35 @@ import (
 // still references. The caller holds the only copy of that number (the schema of
 // the join subtree the search replaced), so it is the caller that must state it.
 func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
+	return createPlanAtSearchRootRange(p, 0, bindingWidth)
+}
+
+// createPlanAtSearchRootRange is `createPlanAtSearchRoot` for a search problem
+// that does not start at binding coordinate 0 — a SUB-JOINLIST (M0127-P5.9-a).
+//
+// The joinlist recursion (`makeRelFromJoinlist`, relfromjoinlist.go) plans a
+// pinned sub-problem on its own and hands the result to the enclosing problem as
+// ONE initial rel. That sub-problem's rels carry GLOBAL binding coordinates —
+// they must, because the clause list it searches is written in the statement's
+// one concatenated space — while the row it publishes is only that sub-problem's
+// slice of it, `[base, base+width)`. Splitting the window out of `boundaryMap`
+// is what lets the same permutation check ("no hole, no duplicate, nothing out
+// of range") run on a slice as on the whole: a sub-problem that dropped or
+// duplicated a column fails here rather than as a wrong row six nodes above.
+//
+// The published order is still ascending binding coordinate, so the sub-result's
+// columns are exactly the pre-search concatenation restricted to its own range —
+// which is what makes it usable as a leaf of the enclosing problem with
+// `baseOffset = base` and nothing else to translate.
+func createPlanAtSearchRootRange(p *Path, base, width int) Node {
 	if p == nil {
 		panic("createPlan: search root has no path")
 	}
-	if bindingWidth <= 0 {
-		panic(fmt.Sprintf("createPlan: search root asked to reproduce a %d-column binding concatenation", bindingWidth))
+	if width <= 0 {
+		panic(fmt.Sprintf("createPlan: search root asked to reproduce a %d-column binding concatenation", width))
+	}
+	if base < 0 {
+		panic(fmt.Sprintf("createPlan: search root asked to publish binding coordinates from %d", base))
 	}
 	n, lay := createPlanNode(p)
 	if n == nil {
@@ -104,7 +128,7 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 	// — on the Project itself the claim is false by design (searchedtree.go
 	// explains why that is the sharpest argument for the tag).
 	assertSearchedTreeNeedsNoReconcile(n)
-	m := boundaryMap(lay, bindingWidth)
+	m := boundaryMap(lay, base, width)
 	if boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
 		// case. Emitting a Project here would be a pure copy of every row.
@@ -143,26 +167,30 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 //
 // All three are producer bugs, and all three are cheaper to fail on here than to
 // debug as a wrong row count six gates later.
-func boundaryMap(lay outputLayout, bindingWidth int) []int {
+// `base` is the first binding coordinate the problem covers — 0 for the
+// statement's own search, and the sub-problem's first FROM item's offset for a
+// sub-joinlist (M0127-P5.9-a). Entry `i` of the returned map is therefore the
+// root output column holding binding coordinate `base+i`.
+func boundaryMap(lay outputLayout, base, width int) []int {
 	if len(lay) == 0 {
 		panic("createPlan: search root publishes no columns")
 	}
-	m := make([]int, bindingWidth)
+	m := make([]int, width)
 	for i := range m {
 		m[i] = -1
 	}
 	for out, bind := range lay {
-		if bind < 0 || bind >= bindingWidth {
-			panic(fmt.Sprintf("createPlan: search root output column %d carries binding coordinate %d, outside the %d-column binding concatenation it must reproduce",
-				out, bind, bindingWidth))
+		if bind < base || bind >= base+width {
+			panic(fmt.Sprintf("createPlan: search root output column %d carries binding coordinate %d, outside the %d-column binding concatenation [%d,%d) it must reproduce",
+				out, bind, width, base, base+width))
 		}
-		if prev := m[bind]; prev != -1 {
+		if prev := m[bind-base]; prev != -1 {
 			panic(fmt.Sprintf("createPlan: search root output columns %d and %d both claim binding coordinate %d; a base relation reached the root through two children",
 				prev, out, bind))
 		}
-		m[bind] = out
+		m[bind-base] = out
 	}
-	if missing := missingBindingCoords(m); len(missing) > 0 {
+	if missing := missingBindingCoords(m, base); len(missing) > 0 {
 		panic(fmt.Sprintf("createPlan: search root does not publish binding coordinate(s) %v; the enclosing tree references columns the searched subtree cannot supply",
 			missing))
 	}
@@ -173,11 +201,11 @@ func boundaryMap(lay outputLayout, bindingWidth int) []int {
 // above. Separate so the message names every gap rather than the first — a
 // whole missing relation shows up as a run, which says "a FROM item never
 // entered the search" far more legibly than a single index.
-func missingBindingCoords(m []int) []int {
+func missingBindingCoords(m []int, base int) []int {
 	var missing []int
 	for bind, out := range m {
 		if out == -1 {
-			missing = append(missing, bind)
+			missing = append(missing, base+bind)
 		}
 	}
 	sort.Ints(missing)
@@ -230,6 +258,158 @@ func projectToBindingOrder(child Node, m []int) Node {
 	// THIS schema.
 	assertColumnRefsWithinSchema("search-boundary projection", targets, len(in))
 	return p
+}
+
+// assertSearchedBoundariesIntact re-checks every searched subtree's boundary
+// projection against the FINISHED plan — after `planSelect`'s rewriters, after
+// the legacy remap family, after `Plan()`'s own tail passes.
+//
+// # Why the check had to move here (M0127-P5.9-c)
+//
+// `boundaryMap`'s three refusals (hole / out of range / duplicate) guard the
+// map's PRODUCER, and P5.9 run 1 proved that is only half the exposure. The
+// layout the arms published was correct and `boundaryMap` was right to accept
+// it; the corruption happened AFTERWARDS, when `remapTopProjection` (bushy.go)
+// walked past the boundary `*Project` — the one legacy descent that steps over
+// a `*Project` unconditionally — derived a binding→plan-position map from the
+// searched join INSIDE the subtree, and applied it to the boundary's own target
+// list as if it were a reference into the map rather than the map itself. The
+// result composed two permutations and returned every column's value one
+// relation-block from its name (`select * from customer, orders where
+// o_custkey = c_custkey and o_orderkey = 1`).
+//
+// No producer-side check can see that, and strengthening `boundaryMap` from a
+// permutation test to a per-leaf identity test — the shape P5.9 run 1's
+// write-up proposed — would not have either: it runs before the pass that did
+// the damage. The invariant that DOES catch it is a consumer-side one, and it
+// is available because `projectToBindingOrder` builds the node so that it holds
+// by construction:
+//
+//	target[i] is a bare ColumnRef naming the very column it addresses —
+//	`child.Output()[target[i].Index]` — and the node's own `schema[i]`
+//	is that same column.
+//
+// A permutation applied to the indices breaks the correspondence with the names
+// immediately, because the names do not move with them. That is the M0097-0058
+// class stated as a property of the node instead of as a property of the map.
+//
+// # Scope and cost
+//
+// Gated on the flag: with `GOOPG_PGSHAPED_DP` off no tree carries the tag and
+// this walk returns on its first line, so the default arm pays one boolean. It
+// descends THROUGH a searched root rather than stopping at it, because a pinned
+// sub-joinlist publishes its own boundary inside the enclosing one
+// (`createPlanAtSearchRootRange`, relfromjoinlist.go) and each is a separate
+// map with the same obligation.
+//
+// It abstains on an unnamed target, for `assertSearchedTreeNeedsNoReconcile`'s
+// reason: name-based evidence says nothing where there is no name. Production
+// targets come from resolved leaf schemas and carry one.
+func assertSearchedBoundariesIntact(root Node) {
+	if !pgShapedDPEnabled() || root == nil {
+		return
+	}
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		if p, isProj := n.(*Project); isProj && isSearchedTree(p) {
+			assertBoundaryProjectionIntact(p)
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walk(c)
+		}
+	}
+	walk(root)
+}
+
+// boundaryWalkChildren enumerates the children the walk above descends into.
+//
+// It is a `Node` switch rather than a reuse of `enclosingNodeScopeOf`
+// (enclosingtree.go) because the two walks answer different questions: that one
+// asks "is every reference above the search root in range", which is meaningless
+// once the coordinate space is unknown, so it STOPS at a node kind it does not
+// recognise. This one only needs to reach the boundary node, so an unrecognised
+// kind costs nothing to pass over — but it cannot pass over what it cannot
+// enumerate, so an unknown kind is still where the walk ends.
+//
+// The listed set is every kind that can sit between a statement's root and a
+// spliced searched subtree: `planSelect`'s upper stack, the pinned semi/anti
+// spine, the MHJ packer's node (searched trees are never packed, but a
+// non-searched sibling can be), the set-operation arms, and the DML wrappers
+// whose source is a SELECT plan.
+func boundaryWalkChildren(n Node) []Node {
+	switch x := n.(type) {
+	case *Project:
+		return []Node{x.Child}
+	case *Filter:
+		return []Node{x.Child}
+	case *Sort:
+		return []Node{x.Child}
+	case *Limit:
+		return []Node{x.Child}
+	case *Distinct:
+		return []Node{x.Child}
+	case *DistinctOn:
+		return []Node{x.Child}
+	case *OrdinalityWrap:
+		return []Node{x.Child}
+	case *LockRows:
+		return []Node{x.Child}
+	case *Aggregate:
+		return []Node{x.Child}
+	case *WindowAgg:
+		return []Node{x.Child}
+	case *Memoize:
+		return []Node{x.Child}
+	case *Join:
+		return []Node{x.Left, x.Right}
+	case *SetOp:
+		return []Node{x.Left, x.Right}
+	case *NestedLoopIndexJoin:
+		return []Node{x.Outer, x.Inner}
+	case *MultiHashJoin:
+		return x.Tables
+	case *Update:
+		return []Node{x.Child}
+	case *Delete:
+		return []Node{x.Child}
+	case *Insert:
+		return []Node{x.Source}
+	}
+	return nil
+}
+
+// assertBoundaryProjectionIntact is the per-node half of the check above.
+func assertBoundaryProjectionIntact(p *Project) {
+	if p.Child == nil {
+		panic("createPlan: search-boundary projection lost its child")
+	}
+	in := p.Child.Output()
+	out := p.Output()
+	for i, tg := range p.Targets {
+		cr, isCol := tg.(*ColumnRef)
+		if !isCol {
+			panic(fmt.Sprintf("createPlan: search-boundary projection target %d is a %T; every target of the boundary map is a pass-through ColumnRef, so a pass rebuilt the map as an expression",
+				i, tg))
+		}
+		if cr.Index < 0 || cr.Index >= len(in) {
+			panic(fmt.Sprintf("createPlan: search-boundary projection target %d (%s) addresses column %d of a %d-column child",
+				i, cr.Name, cr.Index, len(in)))
+		}
+		if cr.Name == "" {
+			continue
+		}
+		if got := in[cr.Index]; got.Name != cr.Name || got.SourceTableIdx != cr.SourceTableIdx {
+			panic(fmt.Sprintf("createPlan: search-boundary projection target %d says %q (source %d) but addresses child column %d, which is %q (source %d); a pass after the boundary permuted the coordinate map itself — see remapTopProjection's searched-subtree guard (bushy.go)",
+				i, cr.Name, cr.SourceTableIdx, cr.Index, got.Name, got.SourceTableIdx))
+		}
+		if i < len(out) && out[i].Name != cr.Name {
+			panic(fmt.Sprintf("createPlan: search-boundary projection publishes %q at output column %d but its target there is %q; the schema and the target list were permuted apart",
+				out[i].Name, i, cr.Name))
+		}
+	}
 }
 
 // assertColumnRefsWithinSchema is 03 §10's plan-time tripwire: every

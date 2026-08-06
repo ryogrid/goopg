@@ -61,6 +61,14 @@ const (
 	PathSort
 	PathGather
 	PathGatherMerge
+	// PathMemoize is PG's `MemoizePath` (pathnodes.h:2079): a caching wrapper
+	// over a PARAMETERISED inner path, so a rescan with a parameter set already
+	// seen is served from the cache instead of re-probed. It is produced only by
+	// `getMemoizePath` (joinpathsmemoize.go) and consumed only by the NLI arm of
+	// `createNestLoopPlan`, because goopg's executor expresses the cache as
+	// `NestedLoopIndexJoin.InnerMemo` rather than as a free-standing node —
+	// which is why `createPlanNode` has no arm for it (M0127-P5.4b-ii-b-2).
+	PathMemoize
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -148,6 +156,15 @@ type Path struct {
 	IndexScanDir ScanDirection
 	IndexClauses []indexPathClause
 
+	// MemoizeInfo is the `MemoizePath`-only payload (M0127-P5.4b-ii-b-2): the
+	// entry-count estimate `cost_memoize_rescan` computed on the way to the
+	// rescan cost, and that rescan cost itself. It is nil for every other kind,
+	// and a non-nil one is what makes `PathMemoize` self-describing — the two
+	// numbers are produced together from one set of statistics, so carrying them
+	// as one pointer is what stops an entry estimate from being paired with a
+	// cost that was computed from a different ndistinct.
+	MemoizeInfo *memoizePathInfo
+
 	Children []*Path
 
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.
@@ -182,6 +199,30 @@ type RelOptInfo struct {
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
+
+	// ConsiderStartup / ConsiderParamStartup are PG's per-rel
+	// `consider_startup` / `consider_param_startup` (pathnodes.h:889-890), and
+	// they are the SAME fact `tuple_fraction` is: `build_simple_rel`
+	// (relnode.c:211) and `build_join_rel` (:707) set both from
+	// `root->tuple_fraction > 0`, so "is a fast-start plan interesting here"
+	// is decided once, for the whole query, by whether a LIMIT was asked for.
+	//
+	// They exist because a startup-cheap path is only worth KEEPING when
+	// something will later select on startup. `compare_path_costs_fuzzily`
+	// enforces exactly that (pathnode.c:178-183): a path that loses on total
+	// cost may not survive on good startup cost alone unless the relevant flag
+	// is set. Without the flag goopg kept every such path — harmless for the
+	// chosen plan, since selection was by total cost, but it is not PG's
+	// pathlist, and P5.7-b's fractional selection is precisely the consumer
+	// that makes the difference visible.
+	//
+	// ConsiderParamStartup stays false: PG sets it per base rel in
+	// `set_base_rel_consider_startup` (allpaths.c:247) from the outer-join
+	// `SpecialJoinInfo` list, and 03 §4.4's pin keeps special joins out of the
+	// search entirely, so nothing can set it truthfully yet (ledger row
+	// 2026-08-05).
+	ConsiderStartup      bool
+	ConsiderParamStartup bool
 
 	// CheapestParameterized is PG's `cheapest_parameterized_paths`
 	// (pathnode.c:255): every parameterised path that survived the addPath
@@ -269,9 +310,37 @@ const (
 	costsDifferent                           // each is better on one axis
 )
 
+// considerPathStartupCost is PG's CONSIDER_PATH_STARTUP_COST macro
+// (pathnode.c:187): whether THIS path's startup cost is interesting, read off
+// its own parent rel and keyed on whether the path is parameterised. See
+// RelOptInfo.ConsiderStartup for what sets it.
+//
+// A path with no parent rel is not a production shape — every constructor in
+// this package sets `Rel` — but the comparator is also driven directly by unit
+// tests that build bare paths to exercise one axis. Those get the
+// fast-start-interesting answer, so the comparator's trade-off arm stays
+// reachable without a rel in hand.
+func considerPathStartupCost(p *Path) bool {
+	if p.Rel == nil {
+		return true
+	}
+	if p.RequiredOuter != 0 {
+		return p.Rel.ConsiderParamStartup
+	}
+	return p.Rel.ConsiderStartup
+}
+
 // comparePathCostsFuzzily reproduces compare_path_costs_fuzzily
 // (pathnode.c:185). disabled_nodes trumps all else (:191); then total cost is
 // checked before startup (many paths have zero startup); each within `fuzz`.
+//
+// The two "different" arms carry PG's policy rule (:178-183, M0127-P5.7-b): the
+// total-cost LOSER is allowed to be called merely different — rather than
+// dominated — only when its own rel says a fast start is interesting. The
+// asymmetry is upstream's and it is deliberate: the rule is about which paths
+// are worth keeping, so it is the loser's parent that decides, and it does not
+// apply when the totals are fuzzily equal (there PG compares startup anyway, in
+// the hope of eliminating one path or the other).
 func comparePathCostsFuzzily(p1, p2 *Path, fuzz float64) pathCostComparison {
 	// Number of disabled nodes, if different, trumps all else (pathnode.c:191).
 	if p1.DisabledNodes != p2.DisabledNodes {
@@ -285,13 +354,13 @@ func comparePathCostsFuzzily(p1, p2 *Path, fuzz float64) pathCostComparison {
 	if p1.Cost.Total > p2.Cost.Total*fuzz {
 		// p1 fuzzily worse on total; if p2 is fuzzily worse on startup they are
 		// genuinely different, else p2 dominates.
-		if p2.Cost.Startup > p1.Cost.Startup*fuzz {
+		if considerPathStartupCost(p1) && p2.Cost.Startup > p1.Cost.Startup*fuzz {
 			return costsDifferent
 		}
 		return costsBetter2
 	}
 	if p2.Cost.Total > p1.Cost.Total*fuzz {
-		if p1.Cost.Startup > p2.Cost.Startup*fuzz {
+		if considerPathStartupCost(p2) && p1.Cost.Startup > p2.Cost.Startup*fuzz {
 			return costsDifferent
 		}
 		return costsBetter1

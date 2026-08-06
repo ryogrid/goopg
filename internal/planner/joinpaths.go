@@ -128,7 +128,15 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 // `buildInitialRels`, every higher level at the end of its own level pass — so
 // a nil here means the search's own invariant broke, and swallowing it would
 // surface much later as an unexplained empty pathlist at the top level.
-func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams) error {
+// `s` is the search context, and it is threaded here for exactly one reason:
+// the Memoize arm (`getMemoizePath`, M0127-P5.4b-ii-b-2) has to read a base
+// relation's `stadistinct` to know whether a cache would hit, and `relInfos` is
+// the only map from a relset bit to the `catalog.Table` behind it (P5.6-a's
+// `examineJoinVar` goes through the same door). A nil `s` is legal and means
+// "no statistics reachable" — every cache key then fails to resolve and no
+// Memoize path is offered, which is the correct degradation and what the
+// path-generation unit tests run with.
+func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams) error {
 	if joinrel == nil || outer == nil || inner == nil {
 		return fmt.Errorf("join paths: nil input rel")
 	}
@@ -197,6 +205,6 @@ func addPathsToJoinrel(joinrel, outer, inner *RelOptInfo, clauses []*restrictInf
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
-	addNLIPaths(joinrel, outer, inner, cp, clauses)
+	addNLIPaths(s, joinrel, outer, inner, cp, clauses)
 	return nil
 }

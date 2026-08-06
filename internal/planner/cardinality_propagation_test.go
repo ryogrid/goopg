@@ -35,7 +35,11 @@ func statsTable(name string, rows int64, ndistinct ...int64) *catalog.Table {
 
 func TestEstimateRowsPassThroughWrappers(t *testing.T) {
 	scan := &SeqScan{Table: statsTable("t", 1234, 1234)}
-	idxScan := &IndexScan{Table: statsTable("t", 1234, 1234)}
+	// A PROBE index scan — Key non-nil. Memoize only ever wraps the
+	// parameterised inner of an NLI, which is always this shape; the
+	// bound-less full-scan shape estimates the relation instead
+	// (M0127-P5.9-h, TestEstimateRowsFullIndexScan).
+	idxScan := &IndexScan{Table: statsTable("t", 1234, 1234), Key: &ColumnRef{Name: "c"}}
 	cases := []struct {
 		name string
 		node Node

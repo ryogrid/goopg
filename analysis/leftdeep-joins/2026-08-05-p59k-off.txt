@@ -1,0 +1,12 @@
+# arm=p59k-off GOOPG_PGSHAPED_DP=0 GOOPG_PGSHAPED_COLLAPSE=0
+# started 2026-08-05T23:38:36+09:00
+# engine-id: bf8ea7e49cdd3820ec3bef83f962d92f65eae479 9b06b5433a2c1807361b57dcf6f4cecceb222f7d  diff=b8260d85c5df
+# engine-binary: on-disk=2accf21d9c6f96df (tmp/goopg-acceptance-bin)
+# per-query cap 600s, serial, digest=1, queries=7,9,10,12,18
+# host: load2.92 1.54 1.02
+Q7: OK elapsed=16.50s colsig=effb45ed4c5e2661 ordered=bb9e4e06df20418b unordered=32224e1ce70c1e80 rows=4
+Q9: OK elapsed=16.11s colsig=d0a60022db317dc9 ordered=23c9981b4db0526f unordered=70790d38086c58c7 rows=175
+Q10: OK elapsed=5.70s colsig=82959e9b048aa541 ordered=8b50c0b2c9370d3b unordered=22a9d410b562ced5 rows=20501
+Q12: OK elapsed=9.56s colsig=8c6c14235b8e3d44 ordered=fba7d11d65e06180 unordered=957e1055bbe6f1a7 rows=2
+Q18: OK elapsed=29.03s colsig=1c632e3bcd2ea332 ordered=fddc9e18a34446b0 unordered=042ea668685f0835 rows=10
+# finished 2026-08-05T23:39:58+09:00

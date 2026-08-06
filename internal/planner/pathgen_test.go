@@ -101,7 +101,7 @@ func TestNLIPathRuinousForLargeOuter(t *testing.T) {
 		outer := relWithScanCost(outerRelids, outerRows, outerCost)
 		inner := nliInnerRel(innerRelids, 1000000, outerRelids, indexProbeCost(cp))
 		joinRel := newRelOptInfo(outerRelids|innerRelids, joinRows, 40)
-		addNLIPaths(joinRel, outer, inner, cp, nil)
+		addNLIPaths(nil, joinRel, outer, inner, cp, nil)
 		setCheapest(joinRel)
 		if joinRel.CheapestTotal == nil {
 			t.Fatal("the NLI arm produced no path for a fully-supplied inner")

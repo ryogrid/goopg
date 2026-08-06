@@ -38,9 +38,10 @@ package planner
 // because they belong to two different cost models, which 04 §1 forbids mixing
 // inside one comparison — not because either is a copy of the other.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF, `sizeJoinRel` has no production
-// implementation yet (P5.6-b), and nothing calls the search from `planSelect`.
-// Validated in isolation by `joinselectivity_test.go`.
+// No longer inert (M0127-P5.9, 2026-08-06): `GOOPG_PGSHAPED_DP` is ON by
+// default, `sizeJoinRel` landed at P5.6-b, and `planSelect` calls the search —
+// these estimates price production joins. Validated in isolation by
+// `joinselectivity_test.go`.
 
 import (
 	"math"

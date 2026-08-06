@@ -65,18 +65,36 @@ func TestExplainQualifiesUpperQualOnSelfJoin(t *testing.T) {
 	}
 }
 
-// TestExplainQualifiesUpperFilter: a Filter that survives above a join is an
+// TestExplainQualifiesUpperFilter: a qual that survives ON a join node is an
 // upper qual (show_upper_qual), so its column references carry the alias.
+//
+// M0127-P5.9 pinned this to the legacy enumerator and P5.9-o unpins it, which
+// is worth spelling out because the pin was never "the new plan is wrong".
+//
+// The original fixture's `a.st = 'x'` names ONE relation, so the PG-shaped
+// search pushes it down to the scan — what upstream does. Once it is a SCAN
+// qual, upstream's `show_scan_qual` (explain.c:2540) deparses it with
+// `useprefix = (IsA(SubqueryScan) || es->verbose)`, i.e. UNQUALIFIED, so
+// asserting a prefix on the searched arm's `Filter: (st = 'x')` would have
+// asserted the opposite of PostgreSQL. The repair — a conjunct spanning both
+// relations, which no scan can absorb — was unavailable only because goopg
+// printed no `Join Filter:` line for a join's residual.
+//
+// P5.9-o prints it, so the fixture is now that cross-relation shape and the
+// test runs on the DEFAULT enumerator. `Join Filter` is emitted through the
+// same `es->rtable_size > 1` rule as `Hash Cond`, which is exactly the
+// prefixing decision under test here. PG 18.3 prints
+// `Join Filter: (a.st < b.st)` for this query.
 func TestExplainQualifiesUpperFilter(t *testing.T) {
 	lines := qualifyExplainLines(t,
-		"EXPLAIN SELECT a.id FROM eq_r a, eq_r b WHERE a.id = b.id AND a.st = 'x'")
+		"EXPLAIN SELECT a.id FROM eq_r a, eq_r b WHERE a.id = b.id AND a.st < b.st")
 
-	got := findLine(lines, "Filter:")
+	got := findLine(lines, "Join Filter:")
 	if got == "" {
-		t.Fatalf("no Filter line in plan:\n%s", strings.Join(lines, "\n"))
+		t.Fatalf("no Join Filter line in plan:\n%s", strings.Join(lines, "\n"))
 	}
-	if !strings.Contains(got, "a.st") {
-		t.Errorf("upper Filter left its column unqualified: %q\nplan:\n%s",
+	if !strings.Contains(got, "a.st") || !strings.Contains(got, "b.st") {
+		t.Errorf("upper qual left a column unqualified: %q\nplan:\n%s",
 			got, strings.Join(lines, "\n"))
 	}
 }

@@ -166,7 +166,14 @@ func (o *joinOp) nextNL() (TupleSlot, error) { //nolint:ireturn
 		ms.ctidOff = ctid.ptr.Offset
 		return ms, nil
 	}
-	return asSlot(o.Schema(), row), nil
+	// NOT asSlot: the stream signals absence with EOF, never with a nil Row, so
+	// every (row, nil) return here is a real tuple. A join of two zero-column
+	// relations (`SELECT * FROM nocols a, nocols b` — PG emits one 0-column row)
+	// builds its pair as cloneRow(m.pair) with n == 0, which is nil; asSlot maps
+	// that back to a nil TupleSlot, and the caller reads a nil error as "row
+	// present" and dereferences it. The ctid arm above has always built the slot
+	// unconditionally — this arm is its sibling and must agree.
+	return SlotFromRow(o.Schema(), row), nil
 }
 
 // next returns the join's next output row, its outer-side ctid, or EOF.

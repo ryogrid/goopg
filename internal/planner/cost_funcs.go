@@ -21,9 +21,19 @@ func envFloatDefault(key string, def float64) float64 {
 
 // Per-node cost functions, reproduced from PostgreSQL's costsize.c in PG's units
 // (seq_page_cost = 1.0). See docs/design/cost-model/ chapter 02. Phase C3.1:
-// pure functions plus the cost constants; nothing selects on them yet (path
-// generation is C3.2, selection is C4), so they cannot change a plan. Each is
-// unit-tested against a hand-computed oracle value (cost_funcs_test.go).
+// pure functions plus the cost constants. Each is unit-tested against a
+// hand-computed oracle value (cost_funcs_test.go).
+//
+// # Live since M0127-P5.9 (2026-08-06)
+//
+// The former banner here read "nothing selects on them yet (path generation is
+// C3.2, selection is C4), so they cannot change a plan". That is FALSE at HEAD
+// and was the most dangerous of the package's surviving inertness claims,
+// because this is the file `hashJoinCost` lives in: `GOOPG_PGSHAPED_DP` now
+// defaults ON (`pgShapedDPFromEnv` is `v != "0"`), `planSelect` calls the
+// search, and `addHashJoinPath` (pathgen.go) prices every hash path the live
+// search considers. A change to any function below MOVES PRODUCTION PLANS and
+// carries the full planner bar (UNITS + SPOT + DS05), not a unit test alone.
 //
 // All costs are absolute and in one unit, so a scan, a sort, a join, and a
 // Gather are directly comparable — invariant #1 of the design README. "Relative
@@ -139,18 +149,98 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 	return cp.cpuOperatorCost * float64(numQuals) * tuples
 }
 
-// costSortRun reproduces the comparison term of cost_sort (costsize.c:2144) for
-// an in-memory sort of n rows: an n*log2(n) comparison cost, charged as startup
-// (the sort must complete before the first row), plus a per-row emit at run. The
-// caller adds the input path's cost. width participates in the external-merge
-// arm (not modelled at the milestone; TPC-H sorts are small dimension outputs).
-func costSortRun(cp costParams, inputRows float64) Cost {
-	if inputRows < 2 {
-		return Cost{}
+// costSortRun reproduces `cost_tuplesort` (costsize.c:2144, called by
+// `cost_sort`): what it costs to sort `inputRows` rows of `ncols` columns.
+// Comparison work is charged as STARTUP — the sort must complete before the
+// first row emerges — and a per-row emit at run. The caller adds the input
+// path's cost.
+//
+// M0127-P5.9-k added the EXTERNAL-MERGE arm, which the milestone had skipped
+// with the note "TPC-H sorts are small dimension outputs". That note was
+// falsified by the thing this whole phase builds: a merge join sorts a JOIN
+// INPUT, and TPC-H Q12's is 5 997 241 lineitem rows. Skipping the arm was not a
+// neutral simplification, because the omission is ASYMMETRIC — the hash rival
+// in the very same `addPath` comparison IS charged its spill in full
+// (`hashJoinCost`'s `NBatch > 1` term, P5.7-a). A sort that will certainly
+// write ~4.7 GB of runs was priced as if it fit in memory while the hash join
+// that writes the same data was charged 1.3 M cost units for it, which is
+// exactly the "two independently calibrated models competing inside one
+// addPath comparison" that design ch. 04 §1 forbids. Measured consequence: the
+// PG-shaped search chose Merge Join over a full ordered index scan of `orders`
+// for five TPC-H queries where the flag-OFF planner hash-joins, at 2-4x the
+// runtime (09 §3.7).
+//
+// Only two of upstream's three branches can be reached from here. PG's middle
+// branch is the bounded heap-sort for a useful LIMIT (`limit_tuples`); goopg
+// has no LIMIT-aware sort path, so `output_tuples == tuples` and
+// `output_bytes == input_bytes` identically, which makes that branch's guard
+// (`tuples > 2 * output_tuples || input_bytes > sort_mem_bytes`) false whenever
+// the disk branch did not already fire. Ledgered with the LIMIT push-down.
+//
+// `ncols` sizes one row through `hashsize.EntryBytes` — the SAME byte model
+// `spillPages` uses for the hash rival's batch files, so the two spill charges
+// this function was added to reconcile are denominated in one currency. Zero
+// means "column count unknown" and suppresses the disk arm, matching
+// `hashJoinCost`'s reading of a zero `innerCols` as "assume no spill": an
+// unknown width must not invent an I/O charge.
+func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
+	// "We want to be sure the cost of a sort is never estimated as zero, even
+	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
+	// (costsize.c) — PG clamps rather than returning zero, and a zero here
+	// would make a sort of a collapsed estimate free, which is the failure mode
+	// P5.9-j closed on the nested-loop side.
+	tuples := inputRows
+	if tuples < 2.0 {
+		tuples = 2.0
 	}
 	comparisonCost := 2.0 * cp.cpuOperatorCost
-	startup := comparisonCost * inputRows * math.Log2(inputRows)
-	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*inputRows}
+	startup := comparisonCost * tuples * math.Log2(tuples)
+
+	if ncols > 0 && cp.workMem > 0 {
+		inputBytes := tuples * hashsize.EntryBytes(ncols, 0)
+		sortMemBytes := float64(cp.workMem)
+		if inputBytes > sortMemBytes {
+			npages := math.Ceil(inputBytes / blockSizeBytes)
+			nruns := inputBytes / sortMemBytes
+			mergeorder := tuplesortMergeOrder(cp.workMem)
+			logRuns := 1.0
+			if nruns > mergeorder {
+				logRuns = math.Ceil(math.Log(nruns) / math.Log(mergeorder))
+			}
+			npageaccesses := 2.0 * npages * logRuns
+			// "Assume 3/4ths of accesses are sequential, 1/4th are not."
+			startup += npageaccesses * (cp.seqPageCost*0.75 + cp.randomPageCost*0.25)
+		}
+	}
+
+	// "a small amount (arbitrarily set equal to operator cost) per extracted
+	// tuple" — NOT cpu_tuple_cost, because a Sort does no qual-checking or
+	// projection.
+	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*tuples}
+}
+
+// tuplesortMergeOrder is `tuplesort_merge_order` (tuplesort.c): how many input
+// tapes one merge pass can afford out of `allowedMem`, which is what turns a
+// run count into a PASS count.
+//
+// The constants are upstream's, and they are the reason a 512 MB budget almost
+// never multi-passes: MAXORDER caps the fan-in at 500 runs per pass, and
+// goopg's default budget already buys that cap outright.
+func tuplesortMergeOrder(allowedMem int64) float64 {
+	const (
+		tapeBufferOverhead = blockSizeBytes      // TAPE_BUFFER_OVERHEAD
+		mergeBufferSize    = blockSizeBytes * 32 // MERGE_BUFFER_SIZE
+		minOrder           = 6.0                 // MINORDER
+		maxOrder           = 500.0               // MAXORDER
+	)
+	mOrder := float64(allowedMem) / float64(2*tapeBufferOverhead+mergeBufferSize)
+	if mOrder < minOrder {
+		mOrder = minOrder
+	}
+	if mOrder > maxOrder {
+		mOrder = maxOrder
+	}
+	return mOrder
 }
 
 // hashJoinInputs is everything hashJoinCost needs that is not a GUC — the
@@ -257,9 +347,41 @@ func spillPages(rows float64, ncols int) float64 {
 // row, pay the inner path's per-rescan cost. innerRescanTotal is the cost of one
 // inner scan (one parameterised index probe for an NLI). Cheap for a selective
 // outer side.
-func nestloopCost(cp costParams, outer, inner Cost, outerRows, outputRows, innerRescanTotal float64) Cost {
+//
+// M0127-P5.9-j — the per-tuple CPU charge rides `ntuples`, the number of pairs
+// the loop PROCESSES, not the number it emits. PG is explicit about the
+// distinction at the assignment ("Compute number of tuples processed (not
+// number emitted!)", costsize.c) and then charges the combined
+// `cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple` on it:
+//
+//	ntuples = outer_path_rows * inner_path_rows;
+//	cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
+//	run_cost += cpu_per_tuple * ntuples;
+//
+// goopg splits that sum across two sites — the qual half is the caller's
+// `qualEvalCost(cp, len(quals), outerRows*innerRows)` — and the
+// `cpu_tuple_cost` half was landing on the join's OUTPUT rows instead. That is
+// the one direction the error cannot be tolerated in: a nested loop is chosen
+// precisely when its output is small, so charging the tuple cost on the output
+// makes a cartesian loop over a collapsed estimate look free. Q47's
+// `{v1,v1_lag} ⋈ v1_lead` (three CTE self-scans, four stats-less equalities ⇒
+// the outer sizes to 1 row) priced NL at 968.53 against a hash at 968.55 and
+// won by 0.02, then rescanned 7 193 rows per outer row at runtime: 8 m 40 s
+// against 11–13 s. Charged on `ntuples` the same NL is 1040.45 and the hash
+// wins. The hash and merge siblings are NOT affected — PG charges those on
+// `hashjointuples` / `mergejointuples`, which really are output counts.
+//
+// innerRows is the INNER PATH's own row count (`inner_path->rows`), so for a
+// parameterised NLI inner it is the per-probe count (`ppi_rows`), not the
+// relation's total — the same number the caller's `qualEvalCost` uses.
+func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanTotal float64) Cost {
 	startup := outer.Startup + inner.Startup
-	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*outputRows
+	// PG's clamp sits at the top of final_cost_nestloop and so reaches only
+	// the tuple count, not the rescan term `initial_cost_nestloop` already
+	// accumulated: a zero path row count would otherwise zero the whole
+	// per-tuple charge.
+	ntuples := math.Max(outerRows, 1) * math.Max(innerRows, 1)
+	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*ntuples
 	return Cost{Startup: startup, Total: startup + run}
 }
 

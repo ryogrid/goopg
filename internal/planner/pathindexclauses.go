@@ -73,9 +73,9 @@ package planner
 // (pathnodes.h:1817) is precisely what that path is — a scan of the whole
 // relation through the index for its ordering alone, with no qual pushed in.
 //
-// Still inert. `GOOPG_PGSHAPED_DP` is OFF and `createPlan` handles only
-// `PathPrebuilt`, so nothing reads the list yet; `pathindexclauses_test.go` is
-// where its invariants are falsifiable.
+// Live since M0127-P5.9 (2026-08-06): `GOOPG_PGSHAPED_DP` defaults ON and the
+// list is populated on real paths (`indexPathClauses`, pathparamindex.go:338).
+// `pathindexclauses_test.go` is still where its invariants are falsifiable.
 
 import "github.com/goopg/goopg/internal/catalog"
 

@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"os"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -150,7 +151,7 @@ func TestBuildInitialRelsPopulatesLevelOne(t *testing.T) {
 		infos[i] = mkRelInfo(t, leaf, filtered[i])
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams())
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
 	if err != nil {
 		t.Fatalf("buildInitialRels: %v", err)
 	}
@@ -239,7 +240,7 @@ func TestBuildInitialRelsAdmitsNonTableLeaves(t *testing.T) {
 		}
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams())
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
 	if err != nil {
 		t.Fatalf("buildInitialRels rejected a FROM list with non-table leaves: %v", err)
 	}
@@ -289,25 +290,57 @@ func TestBuildInitialRelsRejectsMalformedInput(t *testing.T) {
 	info := []baseRelInfo{mkRelInfo(t, leaf, 100)}
 	cp := defaultCostParams()
 
-	if _, err := buildInitialRels(nil, nil, nil, cp); err == nil {
+	if _, err := buildInitialRels(nil, nil, nil, cp, 0); err == nil {
 		t.Error("an empty FROM list was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp, 0); err == nil {
 		t.Error("a scan/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp, 0); err == nil {
 		t.Error("a relInfo/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{nil}, info, cp); err == nil {
+	if _, err := buildInitialRels(b, []Node{nil}, info, cp, 0); err == nil {
 		t.Error("a nil leaf node was accepted")
 	}
 }
 
-// TestPgShapedDPDefaultsOff: every P5 task lands dark (08 §2). If this ever
-// fails without P5.9 having flipped it deliberately, an unmeasured enumerator
-// is planning production queries.
-func TestPgShapedDPDefaultsOff(t *testing.T) {
-	if pgShapedDPEnabled() {
-		t.Error("GOOPG_PGSHAPED_DP is on; the PG-shaped join search must soak dark until P5.9")
+// TestPgShapedDPDefaultsOn is the inversion of `TestPgShapedDPDefaultsOff`,
+// which guarded the soak: every P5 task landed dark (08 §2), and this test used
+// to fail if anything turned the search on before it had been measured. M0127-
+// P5.9 flipped it on 2026-08-06 against the full 09 §3 bar, so the tripwire
+// inverts rather than being deleted — from here on, the thing that must not
+// happen silently is the search going BACK off. A default-off binary would run
+// the old subset-bitmask DP while every doc, ratchet baseline and plan snapshot
+// in the tree describes the new one.
+//
+// The kill-switch itself is exercised by `TestPgShapedDPKillSwitchPolarity`;
+// this test is about what a plain `go test` process (no env) plans with.
+func TestPgShapedDPDefaultsOn(t *testing.T) {
+	if os.Getenv("GOOPG_PGSHAPED_DP") == "0" {
+		t.Skip("the kill-switch is set in this process; the default arm is not under test")
+	}
+	if !pgShapedDPEnabled() {
+		t.Error("GOOPG_PGSHAPED_DP is off by default; M0127-P5.9 flipped the PG-shaped join search ON")
+	}
+}
+
+// TestPgShapedDPKillSwitchPolarity pins the one asymmetry of the post-flip
+// knob: it is a kill-switch, so ONLY the exact string "0" turns the search off
+// (08 §2's S5 rollback story — `=0` restores `tryBushyDP` in one restart, no
+// rebuild). Unset must not read as off, or the flip would be undone by every
+// environment that simply does not mention the variable.
+func TestPgShapedDPKillSwitchPolarity(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"", true},    // unset — the default, ON
+		{"0", false},  // the kill-switch, the only off value
+		{"1", true},   // the soak-era spelling still means on
+		{"off", true}, // not a recognised off value: fail safe, stay on
+	} {
+		if got := pgShapedDPFromEnv(tc.env); got != tc.want {
+			t.Errorf("pgShapedDPFromEnv(%q) = %v, want %v", tc.env, got, tc.want)
+		}
 	}
 }

@@ -45,11 +45,14 @@ func EstimateRows(n Node) int64 {
 	case *SeqScan:
 		return seqScanRows(x)
 	case *IndexScan:
-		// Equality probe → 1 row per call site.
-		return 1
+		// Equality probe → 1 row per call site; a bound-less scan reads the
+		// whole relation (M0127-P5.9-h, see indexScanRows).
+		return indexScanRows(x.Table, x.Key, x.Keys, x.LowKey, x.HighKey)
 	case *IndexOnlyScan:
-		// Same equality-probe convention as *IndexScan.
-		return 1
+		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
+		// without the join search: planner.go's sort-avoidance rewrite builds
+		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
+		return indexScanRows(x.Table, x.Key, x.Keys, x.LowKey, x.HighKey)
 	case *Values:
 		return int64(len(x.Rows))
 	case *Filter:
@@ -299,6 +302,54 @@ func seqScanRows(x *SeqScan) int64 {
 	return x.EstRelRows
 }
 
+// indexScanRows is the cardinality of an `*IndexScan` / `*IndexOnlyScan` leaf.
+//
+// The historical convention — "an index scan is an equality probe, so 1 row
+// per call site" — is right for every such node goopg emitted before
+// M0127-P5.4c-ii-b: each one carries an Index Cond binding the index columns
+// and the executor probes it once per outer row. It became wrong the moment
+// the PG-shaped join search started emitting the OTHER shape PG has always
+// had, the index path with an EMPTY indexclauses list, which "implies a full
+// index scan" (pathnodes.h:1817) — the ordering-only path
+// `addOneOrderedIndexPath` builds so a merge join above it can skip a sort.
+// That node reads the WHOLE relation, and the same full-range shape is
+// reachable with the flag off through planner.go's sort-avoidance rewrite to
+// an ordered `*IndexOnlyScan`.
+//
+// Reporting 1 for it is not a display defect. `EstimateRows` is what EXPLAIN
+// prints (operators_explain.go:1312), but it is also what sizes a hash table
+// (operators_join_agg.go:629), picks a join algorithm (planner.go:2360) and
+// decides a Memoize (memoize.go:114) — so a full scan claiming one row
+// collapses every estimate ABOVE it too, the same propagation shape M0125-0038
+// fixed for the pass-through wrappers. Measured at M0127-P5.9 run 3: all six
+// of `GOOPG_PGSHAPED_DP`'s §4 parity violations were joins sitting over such a
+// leaf, estimated at 1 against actuals of 5 869–1 999 080, and the reproducer
+// was Q12's `Index Scan using orders_pk on orders` with no Index Cond and
+// `rows=1` over 1 500 000 actual rows (fix_plan M0127-P5.9-h).
+//
+// The search's OWN sizing was never wrong — `addOneOrderedIndexPath` sets
+// `Path.Rows = rel.Rows` and `makeJoinRel` sizes off that — which is why the
+// bisect P5.9-h asked for ("built at 1, or a correct size mis-consumed?")
+// answers neither: the 1 is minted here, after the search, when the finished
+// plan tree is re-estimated.
+//
+// A node with ANY key or bound keeps the old answer verbatim, which is what
+// keeps this narrow: every index scan the flag-off TPC-H planner emits binds
+// an Index Cond, so none of them reach the full-scan arm.
+//
+// The no-statistics case returns 1 rather than 0 deliberately: 0 means "no
+// estimate available" to every caller and would zero every node above, which
+// is a worse answer than the one this function is replacing.
+func indexScanRows(tbl *catalog.Table, key Expr, keys []Expr, lowKey, highKey Expr) int64 {
+	if key != nil || len(keys) > 0 || lowKey != nil || highKey != nil {
+		return 1
+	}
+	if rows := tableRows(tbl); rows > 0 {
+		return rows
+	}
+	return 1
+}
+
 // tableRows returns the catalog's reltuples-equivalent for a
 // table, or 0 when ANALYZE hasn't run yet.
 func tableRows(tbl *catalog.Table) int64 {
@@ -356,24 +407,41 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 	if binding.table != nil {
 		info.baseRows = tableRows(binding.table)
 	}
-	info.filteredRows = info.baseRows
-	if local == nil || scan == nil || info.baseRows <= 0 {
-		return info
+	info.filteredRows = applyLocalFilterSelectivity(info.baseRows, binding, scan, local)
+	return info
+}
+
+// applyLocalFilterSelectivity is the second half of upstream's
+// `set_baserel_size_estimates` (costsize.c:5378) — `rel->rows = clamp_row_est(
+// rel->tuples * clauselist_selectivity(root, rel->baserestrictinfo, …))` — over
+// a pre-filter row count somebody else supplied. It is factored out of
+// `estimateBaseRelInfo` because the relation-size fallback needs the SAME rule
+// applied to a block-derived `tuples` (`applyRelSizeFallback`, relsize.go), and
+// a second open-coded copy of the reliability gate is exactly the sibling shape
+// hard-won rule #2 forbids (M0127-P5.6, the M0125-0003 stage-3 re-evaluation).
+//
+// The one deliberate deviation from upstream is the `reliable` gate: PG always
+// multiplies, falling back to DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL when it has no
+// statistic, whereas goopg keeps the pre-filter count (design 02 §2 rule (4)).
+// Ledgered — see the 2026-08-06 row.
+func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node, local Expr) int64 {
+	if local == nil || scan == nil || baseRows <= 0 {
+		return baseRows
 	}
 	localized := localizeExprToLeaf(local, binding)
 	sel := clauseSelectivityWithSource(localized, scan)
 	if !sel.reliable {
-		return info
+		return baseRows
 	}
-	info.filteredRows = scaleByFloat(info.baseRows, sel.value)
-	if info.filteredRows < 1 {
+	rows := scaleByFloat(baseRows, sel.value)
+	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would
 		// collapse a heavily-filtered relation's contribution
 		// to 0 even when at least one row is plausible.
-		info.filteredRows = 1
+		return 1
 	}
-	return info
+	return rows
 }
 
 // IsSmallDimensionSide (M0054-0010) returns true when the plan

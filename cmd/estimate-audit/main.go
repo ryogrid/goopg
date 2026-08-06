@@ -18,7 +18,10 @@
 //     plans only, and finishes in seconds), an audit run costs a full TPC-H
 //     power run. --timeout bounds each query; a query that exceeds it is
 //     recorded as UNMEASURED rather than dropped, because a silently missing
-//     query reads as an audited-and-clean one.
+//     query reads as an audited-and-clean one. --plan-only drops back to plain
+//     EXPLAIN for the questions that are decided at PLANNING time — the §4
+//     clause-6 spine diff and the enumeration provenance — and omits the two
+//     sections that cannot be scored without actuals.
 //   - The estimate side is read from the `rows=` of the cost parenthetical,
 //     so the server must not be running with `SET costs = off`.
 //   - goopg does not propagate ANALYZE instrumentation out of parallel
@@ -63,6 +66,29 @@ import (
 
 const defaultOutDir = "analysis/leftdeep-joins"
 
+// planOnlyBanner replaces the §5 estimate block in a --plan-only run, and says
+// what such a run is NOT.
+//
+// The temptation is to print the §5 table anyway — every row would simply read
+// `actual=? (no ANALYZE)`, which the renderer already supports for nodes under
+// a Gather. That is the one way this artifact could lie: `Violations` counts
+// only joinrels that HAVE an actual, so a plan-only §5 block is a table of
+// unmeasured rows followed by a clean verdict, indistinguishable at a glance
+// from an audit that ran and found nothing. The section is therefore omitted,
+// not emptied, and --fail-on-violation is forced off with it.
+const planOnlyBanner = "" +
+	"=== PLAN-ONLY RUN — §4 clause 6 channel only (09 §5 and the §4 parity ratchet are NOT measured)\n" +
+	"  Queries were EXPLAINed, not EXPLAIN ANALYZEd. Both the §5 estimate audit\n" +
+	"  and the §4 parity ratchet score an estimate against an ACTUAL row count,\n" +
+	"  which this run does not have, so both sections are omitted rather than\n" +
+	"  printed empty, and --fail-on-violation is off. Do not cite this artifact\n" +
+	"  as a §5 or §4 result.\n" +
+	"  What IS measured: the join-spine pairing diff and, with --enum-trace, the\n" +
+	"  clause-6 enumeration provenance. Both are properties of PLANNING, decided\n" +
+	"  before a single tuple moves, so a plan-only run answers clause 6 exactly\n" +
+	"  as a full audit would — in seconds instead of a power run, and without\n" +
+	"  timing content that a co-resident workload could contaminate.\n"
+
 type flags struct {
 	host      string
 	port      int
@@ -87,6 +113,8 @@ type flags struct {
 	refPass   string
 	slack     float64
 	floor     float64
+	enumTrace string
+	planOnly  bool
 }
 
 func main() {
@@ -110,14 +138,36 @@ func main() {
 		FinalJoinPerQuery: estimateaudit.DefaultThresholds().FinalJoinPerQuery,
 	}
 	th.FinalJoinPerQuery["Q9"] = estimateaudit.FinalBar{Max: f.finalMax, Why: th.FinalJoinPerQuery["Q9"].Why}
-	out := estimateaudit.Render(reports, th)
+	var out string
+	if f.planOnly {
+		out = planOnlyBanner
+	} else {
+		out = estimateaudit.Render(reports, th)
+	}
 
 	// §4's parity column, when a PG 18.3 reference is available.
 	ref, refPlans, haveRef := referenceReports(f)
 	if haveRef {
-		bar := estimateaudit.ParityBar{Slack: f.slack, Floor: f.floor}
-		rows := estimateaudit.Parity(reports, ref)
-		out += "\n" + estimateaudit.RenderParity(reports, ref, rows, bar)
+		if !f.planOnly {
+			bar := estimateaudit.ParityBar{Slack: f.slack, Floor: f.floor}
+			rows := estimateaudit.Parity(reports, ref)
+			out += "\n" + estimateaudit.RenderParity(reports, ref, rows, bar)
+		}
+		// §4's spine diff — the pairing question clause 6 is stated on, which
+		// the parity column above cannot answer: it keys on the relset a node
+		// builds, and two engines that partition the same relset differently
+		// both report it MATCHED (09 §3.10, M0127-P5.9-l).
+		spine := estimateaudit.SpineDiff(reports, ref)
+		out += "\n" + estimateaudit.RenderSpine(reports, ref, spine)
+		// …and the SEARCH side of the same clause, when the arm was run with
+		// `GOOPG_PGSHAPED_DP_TRACE=1` and its server log is handed over. The
+		// spine diff can only NAME the bushy partitions PG chose and goopg did
+		// not; whether the goopg search ever OFFERED them — cost divergence,
+		// which §4 admits, versus a shape it cannot enumerate, which §4 fails —
+		// is only in the search's own record (M0127-P5.9-l-ii).
+		if f.enumTrace != "" {
+			out += "\n" + renderEnum(f.enumTrace, spine)
+		}
 	}
 
 	writeReport(f, out, plans, refPlans)
@@ -142,7 +192,7 @@ func capture(f *flags, port int, dbName, user, pass, engine string) ([]estimatea
 	// The per-connection-stats warmup is a goopg property (see the package
 	// comment); on upstream ANALYZE is global and persistent, so re-running
 	// it per session is merely redundant, not wrong.
-	s := &session{db: db, warmup: f.analyze, serial: f.serial, timeout: f.timeout}
+	s := &session{db: db, warmup: f.analyze, serial: f.serial, timeout: f.timeout, planOnly: f.planOnly}
 	defer s.close()
 
 	reports := make([]estimateaudit.QueryReport, 0, 22)
@@ -187,6 +237,23 @@ func referenceReports(f *flags) ([]estimateaudit.QueryReport, string, bool) {
 	return reports, plans, true
 }
 
+// renderEnum harvests the join search's own enumeration record from an arm's
+// server log and adjudicates clause 6's bushy partitions against it.
+//
+// An unreadable log is reported into the artifact rather than fatal: the audit
+// this section hangs off is a 13-minute measurement, and losing it because a
+// secondary channel's path was mistyped would be the expensive failure.
+func renderEnum(path string, spine []estimateaudit.SpineRow) string {
+	fh, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("=== JOIN-SEARCH ENUMERATION PROVENANCE (09 §4 clause 6, P5.9-l-ii)\n"+
+			"  NOT HARVESTED: open %s: %v\n", path, err)
+	}
+	defer fh.Close()
+	t := estimateaudit.ParseEnumTrace(fh)
+	return estimateaudit.RenderEnum(t, t.Adjudicate(estimateaudit.EnumChecks(spine)))
+}
+
 func replayPlans(path string) []estimateaudit.QueryReport {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -225,7 +292,15 @@ func parseFlags(args []string) *flags {
 	fs.StringVar(&f.refPass, "ref-password", "tpch", "reference password")
 	fs.Float64Var(&f.slack, "parity-slack", estimateaudit.DefaultParitySlack, "09 §4 ratchet: how many times worse than PG a joinrel may be")
 	fs.Float64Var(&f.floor, "parity-floor", estimateaudit.DefaultParityFloor, "09 §4 ratchet: goopg's own ratio must also exceed this")
+	fs.StringVar(&f.enumTrace, "enum-trace", "", "goopg server log from a GOOPG_PGSHAPED_DP_TRACE=1 arm; adjudicates clause 6's bushy partitions against what the join search actually enumerated")
+	fs.BoolVar(&f.planOnly, "plan-only", false, "EXPLAIN without ANALYZE: emit the clause-6 spine/enumeration channel only, and omit the §5 audit and §4 parity ratchet (they need actual rows)")
 	fs.Parse(args)
+	if f.planOnly {
+		// A plan-only run has no actuals, so `Violations` is empty by
+		// construction; leaving the tripwire armed would turn "nothing was
+		// measured" into a green exit code.
+		f.failOn = false
+	}
 	if f.label == "" {
 		fmt.Fprintln(os.Stderr, "--label is required")
 		fs.Usage()
@@ -251,11 +326,22 @@ func queryFor(qn int) (string, string) {
 // statistics per connection: a pooled `db.QueryContext` may land on a cold
 // session and silently measure the no-stats planner.
 type session struct {
-	db      *sql.DB
-	conn    *sql.Conn
-	warmup  bool
-	serial  bool
-	timeout time.Duration
+	db       *sql.DB
+	conn     *sql.Conn
+	warmup   bool
+	serial   bool
+	timeout  time.Duration
+	planOnly bool
+}
+
+// prefix is the EXPLAIN form this run uses. `warmup` stays on in either mode:
+// the stats decide which plan is CHOSEN, so a plan-only run without them would
+// measure the spine of the no-stats planner (see the package comment).
+func (s *session) prefix() string {
+	if s.planOnly {
+		return "EXPLAIN "
+	}
+	return "EXPLAIN ANALYZE "
 }
 
 func (s *session) ensure(ctx context.Context) error {
@@ -303,7 +389,7 @@ func (s *session) explainAnalyze(query string) (string, error) {
 	if err := s.ensure(ctx); err != nil {
 		return "", err
 	}
-	rows, err := s.conn.QueryContext(ctx, "EXPLAIN ANALYZE "+query)
+	rows, err := s.conn.QueryContext(ctx, s.prefix()+query)
 	if err != nil {
 		s.close()
 		return "", err

@@ -29,9 +29,10 @@ package planner
 // `add_path` does, since `create_index_path` passes the same `useful_pathkeys`
 // to the parameterised path.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan can move. Validated in isolation by
-// `pathkeysindex_test.go`.
+// No longer inert (M0127-P5.9, 2026-08-06): `GOOPG_PGSHAPED_DP` is ON by
+// default and `planSelect` calls the search, so this IS on the production path.
+// The isolation coverage in `pathkeysindex_test.go` is now a floor, not the
+// whole story — the DS05 fixed-binary A/B moved 86 of 99 plans (09 §3.15).
 
 import "github.com/goopg/goopg/internal/catalog"
 

@@ -223,7 +223,7 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 		t.Fatalf("skipping the sort must be cheaper: %v vs %v", pre.Cost.Total, plain.Cost.Total)
 	}
 	// The saving must be the sort's own cost, not a rounding difference.
-	if want := costSortRun(cp, 10000).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
+	if want := costSortRun(cp, 10000, relNCols(unordered)).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
 		t.Fatalf("saving %v is far below the sort cost %v — the sort was charged twice or not at all",
 			plain.Cost.Total-pre.Cost.Total, want)
 	}
@@ -257,7 +257,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 	cp := defaultCostParams()
 
 	joinrel := newRelOptInfo(a|b, 2000, 64)
-	if err := addPathsToJoinrel(joinrel, scanRel(a, 10000, 100), scanRel(b, 5000, 50),
+	if err := addPathsToJoinrel(nil, joinrel, scanRel(a, 10000, 100), scanRel(b, 5000, 50),
 		[]*restrictInfo{equiClause(a, b)}, cp); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 	}
 
 	bare := newRelOptInfo(a|b, 2000, 64)
-	if err := addPathsToJoinrel(bare, scanRel(a, 100, 2), scanRel(b, 50, 1),
+	if err := addPathsToJoinrel(nil, bare, scanRel(a, 100, 2), scanRel(b, 50, 1),
 		[]*restrictInfo{plainClause(a | b)}, cp); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestSortPathFor_ChargesTheSortOnTopOfItsInput(t *testing.T) {
 	keys := []PathKey{{Expr: col(1), SortAsc: true}}
 
 	s := sortPathFor(sub, keys, cp)
-	run := costSortRun(cp, 1000)
+	run := costSortRun(cp, 1000, relNCols(rel))
 	if s.Cost.Startup != sub.Cost.Total+run.Startup {
 		t.Fatalf("sort startup = %v, want input total + comparison cost %v", s.Cost.Startup, sub.Cost.Total+run.Startup)
 	}

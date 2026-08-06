@@ -2,10 +2,12 @@ package planner
 
 // M0127-P5.6-a — the join-selectivity substrate (joinselectivity.go).
 //
-// These tests are the whole falsifiable surface of the slice: nothing calls it
-// yet (`sizeJoinRel` has no production implementation until P5.6-b, and
-// `GOOPG_PGSHAPED_DP` is OFF), so no plan, cost or row count in the repository
-// moves if any of it is wrong. What they pin, in order: each branch of PG's
+// These tests were written as the whole falsifiable surface of the slice, when
+// nothing called it (`sizeJoinRel` had no production implementation until
+// P5.6-b, and `GOOPG_PGSHAPED_DP` was OFF). Both conditions are gone: P5.6-b
+// landed the builder and P5.9 flipped the flag ON by default (2026-08-06), so
+// plans, costs and row counts in the repository DO move if any of it is wrong.
+// What they pin, in order: each branch of PG's
 // `get_variable_numdistinct` ladder; that `eqjoinsel` divides by the LARGER of
 // the two ndistincts and applies both null fractions; that an operand resolves
 // to its statistics by column NAME rather than by the clause-space `Index`;

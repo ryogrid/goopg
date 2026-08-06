@@ -119,10 +119,19 @@ echo "tpch-spotcheck: starting fresh goopg on ${PG_HOST}:${PG_PORT} (scope ${CG_
 # Record the planner-flag state IN the artefact. A timing/RSS number whose arm
 # is only known from the shell that produced it is not reproducible evidence —
 # the same omission was repaired in scripts/tpcds-sf05-regression.sh (M0125-0011).
-# "unset(build default)" rather than "unset(off)": M0125-0005 flipped
-# GOOPG_RELSIZE_FALLBACK's default to stage 2, so spelling the unset case "off"
-# in the artefact would make every future run of this gate misreport its own arm.
-echo "tpch-spotcheck: planner-flags: GOOPG_RELSIZE_FALLBACK=${GOOPG_RELSIZE_FALLBACK:-unset(build default)} GOOPG_COST_DRIVEN_JOINORDER=${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)} GOMEMLIMIT=${GOMEMLIMIT:-unset} GOGC=${GOGC:-unset}"
+#
+# M0127-P5.9-q (2026-08-06): the flag list and its unset-labels now come from
+# scripts/planner-flags.sh, whose table is GENERATED from the Go defaults. This
+# line used to hedge with "unset(build default)" for GOOPG_RELSIZE_FALLBACK —
+# honest, but not actually the default, so it could not be diffed — while
+# naming GOOPG_COST_DRIVEN_JOINORDER, which no code reads any more, and not
+# naming GOOPG_PGSHAPED_DP, which since M0127-P5.9 selects the ENUMERATOR. A
+# spot-check timing whose artefact cannot say which enumerator produced it is
+# the failure this line exists to prevent, and this gate is the one every
+# planner commit pays.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/planner-flags.sh"
+echo "tpch-spotcheck: planner-flags: $(planner_flags_body) GOMEMLIMIT=${GOMEMLIMIT:-unset} GOGC=${GOGC:-unset}"
 GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${PGDATA}" \
     --listen "${PG_HOST}:${PG_PORT}" \

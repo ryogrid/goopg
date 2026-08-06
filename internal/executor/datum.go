@@ -62,6 +62,15 @@ const (
 	// Datum.Buf = []byte(label) for display.
 	// compareDatum compares by sort order; Format/StringValue return the label.
 	KindEnum
+
+	// datumKindCount is one past the last kind. It exists so
+	// TestSpillDatumRoundTripCoversEveryKind can assert that the spill codec
+	// has an arm for EVERY declared kind rather than for the ones someone
+	// happened to think of. M0127-P5.9-u added it after finding that KindEnum
+	// and KindToastPointer had no arm at all — encodeDatum wrote a bare kind
+	// byte and decodeDatum then rejected the frame with "unknown datum kind",
+	// so a query that had to spill an enum column simply failed.
+	datumKindCount
 )
 
 // Datum flag bits (Datum.Flags).
@@ -71,11 +80,64 @@ const (
 	// representation. When clear, Int holds the int64 fast-path mantissa.
 	flagBigNumeric uint8 = 1 << 0
 
-	// flagDate marks a KindTime datum as a DATE (not a timestamp).
-	// When set, Format() renders the value using PostgreSQL's Postgres,MDY
-	// date output style ("MM-DD-YYYY"), matching the pg_regress default
-	// DateStyle. M0097-0063.
-	flagDate uint8 = 1 << 1
+	// (bit 1 was flagDate until M0127-P5.9-u; it is now Datum.TimeSub, a
+	// structural field rather than a decoration on Flags. Do not reuse the bit
+	// without reading the TimeSubtype comment below.)
+)
+
+// TimeSubtype names which SQL type a KindTime Datum actually is.
+//
+// M0127-P5.9-u. goopg carries five SQL types — timestamp, date, timestamptz,
+// time and timetz — on the single KindTime carrier, so the carrier alone does
+// not say what a value IS. Upstream has no equivalent problem: a PG Datum
+// travels with the TupleDesc that names its type OID, and `date`, `timestamp`
+// and `timetz` are separate types with separate typoutput functions
+// (postgres/src/backend/utils/adt/date.c, timestamp.c).
+//
+// This used to be one bit on Datum.Flags (`flagDate`), which made the
+// distinction look optional — an adornment a serializer could forget. It could,
+// and did: `encodeDatum` (spill.go) wrote a KindTime datum's value and never
+// its flags, so every DATE that passed through a hash-join batch spill came
+// back a bare timestamp. TPC-DS Q72's `d3.d_date > d1.d_date + 5` then failed
+// with "operator + requires integer operands", while the same query at
+// work_mem='2GB' answered correctly. It survived unmeasured for as long as it
+// did because a spilled date still COMPARES correctly — only the type is
+// forgotten — so a round-trip test that checked values stayed green.
+//
+// Making it a field is what lets the round-trip contract be stated
+// exhaustively: TestSpillDatumRoundTripCoversEveryKind walks every DatumKind
+// and every TimeSubtype, so a subtype added here without a matching arm in the
+// spill codec fails a test instead of silently degrading a value.
+//
+// NOTE (deferred, see the ledger row for M0127-P5.9-u): TimeSubTime and
+// TimeSubTimestampTZ are declared but not yet populated by their producers —
+// nothing today branches on them, and the two distinctions that DO have
+// behaviour (date rendering, timetz's UTC-normalised comparison) are carried by
+// TimeSubDate and TimeSubTimeTZ respectively. They are declared now so the
+// round-trip guard covers them the day a producer starts setting them.
+type TimeSubtype uint8
+
+const (
+	// TimeSubTimestamp is the zero value: a bare `timestamp without time
+	// zone`. Datum.Format() renders it "2006-01-02 15:04:05.000000".
+	TimeSubTimestamp TimeSubtype = iota
+	// TimeSubDate marks the datum as a DATE. Format() renders it in
+	// PostgreSQL's Postgres,MDY output style ("MM-DD-YYYY"), matching the
+	// pg_regress default DateStyle (M0097-0063), and `date + integer`
+	// (expr.go, upstream date_pli) dispatches on it.
+	TimeSubDate
+	// TimeSubTimestampTZ marks `timestamp with time zone`. Not yet populated.
+	TimeSubTimestampTZ
+	// TimeSubTime marks `time without time zone`. Not yet populated.
+	TimeSubTime
+	// TimeSubTimeTZ marks `time with time zone`; the offset east of UTC rides
+	// in Datum.Scale as minutes (see NewTimeTZDatum).
+	TimeSubTimeTZ
+
+	// timeSubtypeCount is one past the last subtype. It exists so the spill
+	// round-trip guard can assert it has an arm for every declared subtype;
+	// adding a subtype without extending that test's table is a test failure.
+	timeSubtypeCount
 )
 
 // Datum is one column value flowing through the operator tree.
@@ -108,8 +170,11 @@ type Datum struct {
 	Flags   uint8          // 1B @ 1 (flagBigNumeric; reserved others)
 	ArenaID mctx.ContextID // 2B @ 2 (replaces *mctx.Context; 0 = no mctx payload)
 	Scale   int16          // 2B @ 4
-	_pad0   [2]byte        // 2B @ 6 (alignment pad before Int)
-	Int     int64          // 8B @ 8
+	TimeSub TimeSubtype    // 1B @ 6 (KindTime only; else zero. M0127-P5.9-u —
+	//                        carved out of the alignment pad, so the 48 B
+	//                        layout below is unchanged.)
+	_pad0 [1]byte // 1B @ 7 (alignment pad before Int)
+	Int   int64   // 8B @ 8
 	Buf     []byte         // 24B @ 16 (nil when arena-backed)
 	Hi      uint64         // 8B @ 40 (KindInterval sub-day micros; else reserved/UUID-hi)
 	// Total: 48 B. GC-traced fields: Buf (nil for arena-backed rows → 0 scans).
@@ -259,18 +324,18 @@ func NewTimestampInfinity(positive bool) Datum {
 
 // NewDateInfinity constructs the +infinity / -infinity DATE sentinel. The date
 // type shares the KindTime INT64-extremes carrier with timestamp — Format /
-// AppendValueText (both intercept Int==MaxInt64/MinInt64 before the flagDate
+// AppendValueText (both intercept Int==MaxInt64/MinInt64 before the TimeSubDate
 // shape), IsTimestampNotFinite (Kind/Int only), and compareDatum (KindTime by
 // Int) are all already sentinel-aware, so no per-domain internal value is
-// needed. flagDate is set to keep the datum tagged as a date (matching ordinary
-// date datums). On the wire the sentinel serialises to PG's DATEVAL_NOEND /
+// needed. TimeSub is set to TimeSubDate to keep the datum tagged as a date
+// (matching ordinary date datums). On the wire the sentinel serialises to PG's DATEVAL_NOEND /
 // DATEVAL_NOBEGIN = PG_INT32_MAX / PG_INT32_MIN days (date_send,
 // postgres/src/include/utils/date.h); see codec.go. (unimplemented_feat #5(d-iv))
 func NewDateInfinity(positive bool) Datum {
 	if positive {
-		return Datum{Kind: KindTime, Int: math.MaxInt64, Flags: flagDate}
+		return Datum{Kind: KindTime, Int: math.MaxInt64, TimeSub: TimeSubDate}
 	}
-	return Datum{Kind: KindTime, Int: math.MinInt64, Flags: flagDate}
+	return Datum{Kind: KindTime, Int: math.MinInt64, TimeSub: TimeSubDate}
 }
 
 // NumericMantissaValue is the int64 fast-path mantissa of KindNumeric
@@ -440,15 +505,21 @@ func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
 }
 
-// NewDateDatum constructs a KindTime Datum tagged as a DATE (flagDate set).
-// Date and timestamp values share the KindTime carrier, so the flag is what
+// NewDateDatum constructs a KindTime Datum tagged as a DATE
+// (TimeSub == TimeSubDate).
+// Date and timestamp values share the KindTime carrier, so the subtype is what
 // distinguishes them for type-agnostic rendering: Datum.Format() emits the
-// date-only shape ("MM-DD-YYYY", M0097-0063) for a flagged datum and the full
+// date-only shape ("MM-DD-YYYY", M0097-0063) for a tagged datum and the full
 // timestamp shape otherwise. Use this at every date-producing site (literals,
 // casts, on-disk decode) so a date is indistinguishable regardless of origin.
 func NewDateDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Flags: flagDate}
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubDate}
 }
+
+// IsDate reports whether d is a KindTime Datum carrying a DATE. Prefer this to
+// testing TimeSub directly: it also pins the Kind, so a stray non-time Datum
+// whose TimeSub byte happens to be set cannot be mistaken for a date.
+func (d Datum) IsDate() bool { return d.Kind == KindTime && d.TimeSub == TimeSubDate }
 
 // NewTimeTZDatum constructs a KindTime Datum for a timetz column.
 // The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.
@@ -456,7 +527,12 @@ func NewDateDatum(t time.Time) Datum {
 // The offset is stored in Datum.Scale as minutes (int16 range ≥ ±840 covers ±14h).
 // Callers with sub-minute offsets (historical oddities) lose the remainder.
 func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Scale: int16(offsetSecs / 60)}
+	return Datum{
+		Kind:    KindTime,
+		Int:     t.UTC().UnixNano(),
+		Scale:   int16(offsetSecs / 60),
+		TimeSub: TimeSubTimeTZ,
+	}
 }
 
 // TimeTZOffsetSecs returns the timezone offset in seconds east of UTC for a
@@ -650,14 +726,14 @@ func (d Datum) Format() string {
 		return string(d.Buf)
 	case KindTime:
 		// ±infinity timestamp/date sentinel renders identically to upstream
-		// EncodeSpecialTimestamp / EncodeSpecialDate regardless of flagDate.
+		// EncodeSpecialTimestamp / EncodeSpecialDate regardless of TimeSub.
 		if d.Int == math.MaxInt64 {
 			return "infinity"
 		}
 		if d.Int == math.MinInt64 {
 			return "-infinity"
 		}
-		if d.Flags&flagDate != 0 {
+		if d.TimeSub == TimeSubDate {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
 			return d.TimeValue().Format("01-02-2006")
 		}

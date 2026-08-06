@@ -1100,7 +1100,7 @@ func analyzeStar(star *parser.StarExpr, ctx *scope) error {
 		}
 	}
 	if matches == 0 {
-		return analyzeError(star.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", star.Table))
+		return errorMissingRTE(star.Pos(), star.Schema, star.Table, ctx)
 	}
 	if matches > 1 {
 		return analyzeError(star.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", star.Table))
@@ -1772,7 +1772,7 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 		}
 	}
 	if x.Table != "" {
-		return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+		return catalog.Type{}, errorMissingRTE(x.Pos(), x.Schema, x.Table, ctx)
 	}
 	return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 }
@@ -1809,7 +1809,9 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 				strings.EqualFold(x.Table, rel.table.Name) {
 				// Defer the error: allow a qualifiedOnly binding
 				// (e.g. excluded pseudo-table) to match first.
-				deferredBlockErr = analyzeErrorWithHint(x.Pos(), "42712",
+				// 42P01, not 42712: upstream raises this from
+				// errorMissingRTE() with ERRCODE_UNDEFINED_TABLE.
+				deferredBlockErr = analyzeErrorWithHint(x.Pos(), "42P01",
 					fmt.Sprintf("invalid reference to FROM-clause entry for table %q", x.Table),
 					fmt.Sprintf("Perhaps you meant to reference the table alias %q.", rel.alias))
 				continue
@@ -1946,6 +1948,51 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil
+}
+
+// errorMissingRTE mirrors postgres/src/backend/parser/parse_relation.c's
+// errorMissingRTE(). When a table-qualified reference fails to resolve,
+// PostgreSQL does NOT immediately conclude the relation is absent: it searches
+// the range table a SECOND time ignoring aliases (searchRangeTableForRel), and
+// if the refname names a FROM entry the user renamed with an alias, the real
+// mistake is "you wrote the table's own name where only its alias is visible"
+// (`SELECT foo.* FROM foo f`). Upstream calls that mistake common enough to
+// justify its own message plus a HINT naming the alias. Both branches carry
+// ERRCODE_UNDEFINED_TABLE (42P01) — the bald "missing FROM-clause entry" is
+// only for a refname that matches nothing at all.
+//
+// NOT ported: upstream's middle branch — a range-table entry that exists but is
+// not visible from this part of the query — which adds an errdetail and, for a
+// sub-select, a "you must mark this subquery with LATERAL" hint. goopg's scope
+// chain carries no present-but-invisible entries to key that off (see the
+// deferral ledger row for AI-20260806-011323-016).
+func errorMissingRTE(pos int, schema, table string, ctx *scope) *AnalyzeError {
+	for cur := ctx; cur != nil; cur = cur.parent {
+		for _, rel := range cur.rels {
+			// qualifiedOnly rels (the ON CONFLICT `excluded`
+			// pseudo-table) share the target's *catalog.Table; their
+			// alias is a keyword, never a rename the user chose, so
+			// hinting it would be actively misleading.
+			if rel.qualifiedOnly || rel.alias == "" || rel.table == nil {
+				continue
+			}
+			if schema != "" && !strings.EqualFold(schema, rel.table.Schema) {
+				continue
+			}
+			// Upstream's guard `strcmp(eref->aliasname, relname) != 0`:
+			// an entry aliased to its own name was not renamed, so there
+			// is no alias to point at.
+			if strings.EqualFold(rel.alias, rel.table.Name) {
+				continue
+			}
+			if strings.EqualFold(table, rel.table.Name) {
+				return analyzeErrorWithHint(pos, "42P01",
+					fmt.Sprintf("invalid reference to FROM-clause entry for table %q", table),
+					fmt.Sprintf("Perhaps you meant to reference the table alias %q.", rel.alias))
+			}
+		}
+	}
+	return analyzeError(pos, "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", table))
 }
 
 func scopeRelMatches(rel scopeRel, table, schema string) bool {

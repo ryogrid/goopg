@@ -405,13 +405,35 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDPr
 // joinOp with the relation whose heap ctid must survive the build-side drain
 // (M0118-0009, eval-plan-qual). Each tagged join decides at its own Open whether
 // targetRel actually lands on its build side; the tag is a harmless hint
-// otherwise. Recurses through Project / Filter wrappers and into both join
-// children so a join nested under another join is reached too.
+// otherwise. Recurses through Project / Filter / Sort wrappers and into both
+// join children so a join nested under another join is reached too.
+//
+// Sort must be recursed through, not stopped at (M-NIGHTLY, 2026-08-06). Both
+// findScanLeaf and findScanLeafForRel deliberately return nil at a sortOp — a
+// scan cursor is meaningless once the sort has drained and reordered its input,
+// so `o.scan` is nil for every `ORDER BY ... FOR UPDATE` plan and the TID can
+// only arrive through the slot side-channel (sortOp.ctids, re-attached in
+// sortOp.Next; drainAndStamp's ms.hasCTID fallback consumes it). For a
+// single-relation sort that already works, because seqScanOp stamps
+// slot.hasCTID itself. Under a JOIN it did not: a joinOp only carries the heap
+// ctid through when preserveCTIDRel is set, this walker stopped at the sortOp
+// before ever reaching the join, so the sort recorded has=false for every row,
+// drainAndStamp found neither a scan nor a slot TID, and lockRowsOp fell
+// through to its unlocked pass-through path. The visible effect was a silent
+// violation of FOR UPDATE: `SELECT ... FROM a, b WHERE ... ORDER BY ...
+// FOR UPDATE OF a` neither blocked on a concurrently-updated row nor ran the
+// EvalPlanQual recheck — it returned the stale pre-update row immediately,
+// where PG blocks and returns the updated one. PG has no equivalent hazard: it
+// carries the row mark as a resjunk `ctid` column that Sort preserves like any
+// other column (nodeLockRows.c / preprocess_targetlist's rowmark junk attrs),
+// rather than reconstructing it from the shape of the plan tree.
 func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) {
 	switch v := op.(type) {
 	case *projectOp:
 		markJoinPreserveCTID(v.child, targetRel)
 	case *filterOp:
+		markJoinPreserveCTID(v.child, targetRel)
+	case *sortOp:
 		markJoinPreserveCTID(v.child, targetRel)
 	case *joinOp:
 		rel := targetRel

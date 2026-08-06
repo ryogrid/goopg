@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.5-f-ii-a — the searched-subtree tag (searchedtree.go).
 //
-// The tag is inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are its only observer. Two of them are unusual and
+// The tag is LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON, so real trees carry it and these tests are
+// no longer its only observer. Two of them are unusual and
 // deserve the note: `TestLegacyPosMapAlreadyStoppedAtTheBoundaryProject` and
 // `TestElidedSearchRootIsTheHoleTheTagCloses` assert on what the code did
 // BEFORE this task, because the value of the tag is exactly the difference

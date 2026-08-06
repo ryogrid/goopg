@@ -83,9 +83,10 @@ package planner
 // `addPathsToJoinrel` carries no jointype to switch on. Both are ledgered rather
 // than written as dead branches over a value that does not exist.
 //
-// Still inert: `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from
-// `planSelect`, so no plan can move. Validated in isolation by
-// `joinpathsmergeouter_test.go`.
+// No longer inert (M0127-P5.9, 2026-08-06): `GOOPG_PGSHAPED_DP` is ON by
+// default and `planSelect` calls the search, so this IS on the production path.
+// Validated in isolation by `joinpathsmergeouter_test.go`; corpus-level
+// evidence is the DS05 arm in 09 §3.15.
 
 // mergeOuterMatch is one outer sort key that the merge can actually use: the key
 // group whose outer operand it sorts on, paired with the outer PATH's own pathkey

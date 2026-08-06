@@ -20,9 +20,9 @@ package planner
 // placement (03 §5.4) has to put them somewhere, and "somewhere" has to be a
 // clause the search knows about.
 //
-// NOTHING here is called from `planSelect`: P5.3's enumerator is the first
-// consumer and the whole search is gated behind `GOOPG_PGSHAPED_DP` (OFF by
-// default, joinsearch.go:44). Validated in isolation by `joinrestrict_test.go`.
+// P5.3's enumerator is the first consumer, and since M0127-P5.9 (2026-08-06)
+// `GOOPG_PGSHAPED_DP` is ON by default — so `planSelect` DOES reach this via the
+// search; only `=0` opts out. Validated in isolation by `joinrestrict_test.go`.
 
 import (
 	"sort"

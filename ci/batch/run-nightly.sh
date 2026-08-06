@@ -44,9 +44,11 @@ want() { [[ ",${NIGHTLY_STAGES}," == *",$1,"* ]]; }
 # --- meta.json ----------------------------------------------------------------
 sha="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 dirty="$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
-python3 - "$RUN_DIR" "$RUN_ID" "$sha" "$dirty" <<'PY'
+src_fp="$(source_fingerprint)"
+export SOURCE_FP_START="${src_fp}"
+python3 - "$RUN_DIR" "$RUN_ID" "$sha" "$dirty" "$src_fp" <<'PY'
 import json, subprocess, sys, platform
-run_dir, run_id, sha, dirty = sys.argv[1:5]
+run_dir, run_id, sha, dirty, src_fp = sys.argv[1:6]
 try:
     gover = subprocess.run(["go", "version"], capture_output=True, text=True).stdout.strip()
 except Exception:
@@ -64,14 +66,14 @@ try:
 except Exception:
     dirty_list = []
 meta = {"run_id": run_id, "sha": sha, "dirty_files": int(dirty),
-        "dirty_list": dirty_list,
+        "dirty_list": dirty_list, "source_fp": src_fp,
         "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "host": platform.node(), "go": gover, "config": cfg}
 with open(f"{run_dir}/meta.json", "w") as f:
     json.dump(meta, f, indent=1)
 PY
 
-progress "RUN" "start run_id=${RUN_ID} sha=${sha:0:8} dirty=${dirty} stages=${NIGHTLY_STAGES}"
+progress "RUN" "start run_id=${RUN_ID} sha=${sha:0:8} dirty=${dirty} src_fp=${src_fp} stages=${NIGHTLY_STAGES}"
 
 # --- abort handling -------------------------------------------------------------
 COMPLETED=0
@@ -165,6 +167,12 @@ commit_and_push_logs() {
 run_stage() {  # run_stage <name>  (records "<status> <elapsed>" in stages/<name>.status)
     local name="$1" t0=${SECONDS} rc=0 sp
     mkdir -p "${RUN_DIR}/${name}"
+    # Stamp the tree this stage is about to compile against. A stage whose fp
+    # differs from meta.json's `source_fp` ran on a DIFFERENT tree than
+    # preflight validated, so its failures are unattributable (see
+    # source_fingerprint in lib/common.sh). Written before the stage starts,
+    # so it survives a stage that dies.
+    source_fingerprint > "${RUN_DIR}/stages/${name}.fp" 2>/dev/null || true
     # Run the stage as a background child + wait: `wait` is interruptible, so
     # an INT/TERM to the orchestrator aborts promptly (mid-stage) instead of
     # being deferred to the stage boundary; abort_cleanup kills CUR_STAGE_PID.

@@ -33,20 +33,66 @@ import (
 
 // maxSearchRels is the relset width. `RelSet` is a uint16 (path.go:29), so the
 // search can address 16 base relations — above the level the collapse limits
-// admit (03 §7), and above the old DP's own 12-table bail-out (bushy.go:99),
-// which P5.8 deletes.
+// admit (03 §7), and above the old DP's own 12-table bail-out (bushy.go:99).
+//
+// This constant is that bail-out's REPLACEMENT, not its executioner: it is a
+// representation limit on the new search, while `bushy.go:99` is a runtime
+// guard on the old subset-bitmask DP, whose enumeration is 3ⁿ over splits of
+// subsets (3¹⁶ ≈ 43 M) rather than this search's clause-connected pair
+// enumeration. Deleting the old guard while the old DP is still the production
+// path would hand it 13-16-relation queries it cannot finish, so the deletion
+// happens WITH that DP in P6.3 — which is what 03 §7 says ("deleted with the
+// bushy DP"), and which the P5.8 TODO line stated more loosely. M0127-P5.8.
 const maxSearchRels = 16
 
-// pgShapedDP gates the whole PG-shaped search (08 §2, S5). It is OFF by default
-// and stays OFF through every P5 task: each lands dark, and P5.9's acceptance
-// run is what flips it. The gate is read once at process start so a plan cannot
-// change shape mid-statement.
-var pgShapedDP = os.Getenv("GOOPG_PGSHAPED_DP") == "1"
+// pgShapedDP gates the whole PG-shaped search (08 §2, S5). **FLIPPED ON
+// 2026-08-06 by M0127-P5.9** — the acceptance event. Every P5 task landed dark
+// behind this gate; run 4 of the 09 §3 bar (2026-08-06, HEAD `9e0cfe67`) is the
+// first run in which nothing in the evidence is attributed to the flag —
+// clauses 1-5 PASS, and clause 6 was discharged by measurement two days later
+// (09 §3.13: both PG-only bushy partitions were OFFERED to `makeJoinRel` at
+// phase 2, so the search can express them and lost them on cost, which the §4
+// ratchet admits).
+//
+// The knob survives the flip as a KILL-SWITCH, not a soak switch: 08 §2's
+// rollback story for S5 is "flips `GOOPG_PGSHAPED_DP` OFF, restoring the
+// current `tryBushyDP` enumerator, which is not deleted until S7". So the
+// polarity inverts rather than the variable disappearing — `=0` restores the
+// old subset-bitmask DP in one restart, with no rebuild, until S7 deletes it.
+// Anything else (unset, `1`, garbage) is ON, mirroring `GOOPG_JOIN_SLOT_CHAIN`
+// (08 §2 S1: "default ON, env kill-switch OFF only").
+//
+// The gate is read once at process start so a plan cannot change shape
+// mid-statement.
+var pgShapedDP = pgShapedDPFromEnv(os.Getenv("GOOPG_PGSHAPED_DP"))
+
+// pgShapedDPFromEnv is the kill-switch's polarity, factored out so it is
+// testable without a subprocess: only the exact string "0" turns the search
+// off. An unset variable reads as "" and is therefore ON.
+func pgShapedDPFromEnv(v string) bool { return v != "0" }
 
 // pgShapedDPEnabled reports whether the PG-shaped join search is active. P5.3's
 // entry point is its only production caller; exposed as a function so the flag
 // stays a single read site.
 func pgShapedDPEnabled() bool { return pgShapedDP }
+
+// SetPGShapedJoinSearch pins the enumerator for a caller that needs the other
+// arm, and returns the previous value so it can be restored. It is the
+// cross-package form of `useLegacyEnumerator` (planner-internal, test-only) and
+// exists for the same reason `SetMHJPackingEnabled` does: after M0127-P5.9
+// flipped the default on, tests of the OLD enumerator's rule-driven rewrites —
+// MultiHashJoin packing above all, which the PG-shaped search never emits by
+// design (09 §3 clause 5) — live in packages that cannot reach a private var.
+//
+// NOT for production use. The flag is read once at process start precisely so
+// a plan cannot change shape mid-statement; this setter breaks that guarantee
+// and is safe only in a single-goroutine test. It goes away with the old DP at
+// S7 (08 §4).
+func SetPGShapedJoinSearch(v bool) bool {
+	prev := pgShapedDP
+	pgShapedDP = v
+	return prev
+}
 
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.
@@ -76,6 +122,20 @@ type searchCtx struct {
 	// cp is the cost currency every path in this search is priced in (04 §1).
 	cp costParams
 
+	// tupleFraction is PG's `root->tuple_fraction` (pathnodes.h:341): how much
+	// of the result will actually be fetched, in upstream's overloaded
+	// encoding — 0 for all rows, (0,1) for a fraction, >= 1 for an absolute
+	// count. `preprocessLimit` (tuplefraction.go) derives it from the `*Limit`
+	// above the join and `buildInitialRels` records it here.
+	//
+	// It is on the CONTEXT rather than on each rel because it is a property of
+	// the query, not of a relation: every rel the search creates copies it into
+	// its own `ConsiderStartup`, exactly as `build_simple_rel` /
+	// `build_join_rel` do (relnode.c:211/707), and `finalPath` reads it once at
+	// the root. Zero is the "fetch everything" default, which is the regime
+	// every search ran in before M0127-P5.7-b.
+	tupleFraction float64
+
 	// relInfos is the per-initial-rel estimate `buildInitialRels` was handed,
 	// kept because the parameterised index paths of P5.4b-ii-a need each base
 	// rel's `catalog.Table` and cannot be built until the clause list exists
@@ -94,6 +154,18 @@ type searchCtx struct {
 	// P5.6's calcJoinrelSize and P5.4's add_paths_to_joinrel
 	// (joinsearchlevel.go:36). Set by `joinSearch`, which refuses a nil one.
 	builder joinRelBuilder
+
+	// trace is the enumeration-provenance record (M0127-P5.9-l-ii,
+	// joinsearchtrace.go) — nil unless `GOOPG_PGSHAPED_DP_TRACE=1`, and read
+	// only through its own nil-safe methods. It answers the one question the
+	// chosen plan cannot: whether a pairing PG chose was ever OFFERED here.
+	trace *searchTrace
+
+	// tracePhase is which `join_search_one_level` pass is currently
+	// enumerating, so `makeJoinRel` can record a pair's provenance without
+	// being handed a phase argument it would otherwise ignore. Meaningless
+	// while `trace` is nil.
+	tracePhase int
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.
@@ -177,6 +249,35 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 	}
 }
 
+// finalPath is the path the search CHOSE: `standard_planner`'s
+// `best_path = get_cheapest_fractional_path(final_rel, root->tuple_fraction)`
+// (planner.c:437), and the one value a caller may hand
+// `createPlanAtSearchRoot`.
+//
+// It exists as a method rather than leaving the caller to read
+// `finalRel().CheapestTotal` because those two are not the same path under a
+// LIMIT, and the difference is the whole of M0127-P5.7-b: with a fraction in
+// play the cheapest way to produce ALL the rows is not the cheapest way to
+// produce the first ten. Reading CheapestTotal directly would silently discard
+// the fraction, so the search publishes the answer instead of the ingredients.
+//
+// With no LIMIT (`tupleFraction == 0`) this returns `CheapestTotal` exactly,
+// which is what every caller would have got before.
+func (s *searchCtx) finalPath() (*Path, error) {
+	rel, err := s.finalRel()
+	if err != nil {
+		return nil, err
+	}
+	p := getCheapestFractionalPath(rel, s.tupleFraction)
+	if p == nil {
+		// setCheapest leaves every slot nil only for an empty pathlist, which
+		// joinSearch already rejects per level; reaching here means the final
+		// rel was assembled outside that path.
+		return nil, fmt.Errorf("join search: final rel %#04x has no cheapest path", uint16(rel.Relids))
+	}
+	return p, nil
+}
+
 // buildInitialRels populates level 1: one RelOptInfo per FROM item, each with
 // its cardinality and one costed path. `bindings`, `scans` and `relInfos` are
 // the three parallel per-FROM-item slices the existing pipeline already
@@ -207,7 +308,13 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 // (allpaths.c:191) likewise runs only once `deconstruct_jointree` has produced
 // the `joininfo` lists `create_index_paths` reads. Real UNPARAMETERISED
 // per-index path generation is still P5.4's and still ledgered as deferred.
-func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams) (*searchCtx, error) {
+// `tupleFraction` is the query's `root->tuple_fraction` (see searchCtx), and it
+// is a PARAMETER rather than something set afterwards because PG fixes it in
+// `subquery_planner` before any rel exists: `build_simple_rel` reads it while
+// constructing the rel (relnode.c:211), and a flag that arrived after the first
+// `addPath` would have let one dominance decision be taken in the wrong regime.
+// Pass 0 for "fetch all rows", which is every caller that has no LIMIT.
+func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams, tupleFraction float64) (*searchCtx, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("join search: empty FROM list")
 	}
@@ -220,6 +327,12 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		return nil, err
 	}
 	s.relInfos = relInfos
+	s.tupleFraction = tupleFraction
+	// The relid → relation-name map has to be taken HERE, from the same
+	// `bindings` slice whose position i defines relid `1<<i` below: taking it
+	// anywhere else would be a second derivation of the correspondence the
+	// whole trace is read through (M0127-P5.9-l-ii). nil unless the gate is on.
+	s.trace = newSearchTrace(bindings)
 	for i := range bindings {
 		leaf := scans[i]
 		if leaf == nil {
@@ -231,6 +344,10 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// The column count the hash geometry is solved for, from the same
 		// schema the executor will call len() on (M0127-P5.7-a).
 		rel.NCols = len(leaf.Output())
+		// `rel->consider_startup = (root->tuple_fraction > 0)`
+		// (relnode.c:211): a fast start is worth keeping paths for exactly when
+		// something will ask for a fraction (M0127-P5.7-b).
+		rel.ConsiderStartup = s.tupleFraction > 0
 		// The leaf is recorded on the rel as well as inside the PathPrebuilt
 		// below, because two different consumers need it two different ways:
 		// createPlan's PathPrebuilt arm returns the node it wrapped, while the
@@ -268,7 +385,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 // here because a 0-row initial rel would make every join above it free.
 func initialRelRows(leaf Node, info baseRelInfo) float64 {
 	rows := info.filteredRows
-	switch leaf.(type) {
+	switch leafBaseScan(leaf).(type) {
 	case *SeqScan, *IndexScan, *IndexOnlyScan:
 		// Base-table leaf: `filteredRows` is the authority.
 	default:
@@ -281,4 +398,26 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		return 1
 	}
 	return float64(rows)
+}
+
+// leafBaseScan peels the `*Filter` wrappers off a search leaf and returns what
+// is underneath — the same peel `scanLeafFor` (createplanindex.go) does, and
+// for the same reason: a base-relation leaf whose local quals have been pushed
+// into it is a `*Filter` over a scan, not a scan (M0127-P5.9-b attaches them
+// before the search rather than after it, joinsearchseam.go).
+//
+// It matters HERE because the wrapper decides which cardinality is believed. A
+// filter-wrapped base table reaching `initialRelRows`' default arm would be
+// re-estimated by `EstimateRows` — a second selectivity computation over the
+// same predicate `estimateBaseRelInfo` already applied to produce
+// `filteredRows`, and a different one, which is the sibling-divergence shape
+// this planner keeps paying for.
+func leafBaseScan(n Node) Node {
+	for {
+		f, ok := n.(*Filter)
+		if !ok || f.Child == nil {
+			return n
+		}
+		n = f.Child
+	}
 }

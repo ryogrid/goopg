@@ -3,9 +3,15 @@ package planner
 // Path generation — building the candidate Paths for a relation and letting
 // add_path prune them. See docs/design/cost-model/ chapter 06. Phase C3.2: the
 // generation primitives as pure functions over RelOptInfo, unit-tested in
-// isolation. They are NOT yet called from the live DP (that wiring, and the
-// switch of selection from the integer cost to these pathlists, is C4), so they
-// cannot change a plan.
+// isolation.
+//
+// # Live since M0127-P5.9 (2026-08-06)
+//
+// The C4 wiring this header used to say was still pending ("NOT yet called from
+// the live DP … so they cannot change a plan") HAPPENED: `addPathsToJoinrel`
+// (joinpaths.go:197) calls `addHashJoinPath` for every pair the live search
+// offers, and `GOOPG_PGSHAPED_DP` defaults ON. These primitives generate the
+// paths production selects from.
 //
 // The build side and the parallel/serial choice are not decided by a private
 // rule here: both hash-build orientations (and, from C4, merge / nestloop / MHJ)
@@ -111,7 +117,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, joinRel.Rows, i.Cost.Total)
+	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, i.Cost.Total)
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:     PathNestLoop,

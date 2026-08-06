@@ -2,8 +2,9 @@ package planner
 
 // M0127-P5.5-e-ii-b — the nested-loop `createPlan` arms (createplannl.go).
 //
-// The arm is inert in production (`GOOPG_PGSHAPED_DP` OFF), so these tests are
-// its only observer. What they pin is the fact the other two join arms do not
+// The arm is LIVE in production since M0127-P5.9 (2026-08-06)
+// (`GOOPG_PGSHAPED_DP` defaults ON), so these tests are no longer its only
+// observer. What they pin is the fact the other two join arms do not
 // have to know: an NLI writes expressions into TWO coordinate spaces, and every
 // fixture below puts the outer side SECOND in binding order so that a
 // translation which silently did nothing would still build a runnable node —

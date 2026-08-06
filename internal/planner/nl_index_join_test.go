@@ -11,6 +11,8 @@ import (
 // rewrite fires for the canonical shape: a binary equi-join whose
 // inner table has a single-column B-tree index on the join key.
 func TestNLIRulePromotesEquiJoinOnIndexedInner(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := catalog.NewInMemory()
 	parts, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
 		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -108,6 +110,8 @@ func TestNLIRuleRespectsKillSwitch(t *testing.T) {
 // equi-conjunct, the rule emits an NLI with `Keys` populated
 // and a multi-column probe.
 func TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := catalog.NewInMemory()
 	parts, err := cat.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
 		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -303,6 +307,8 @@ func TestNLIRuleSkipsIsolatedScopeOuter(t *testing.T) {
 // into the join key while keeping the full OR as the residual
 // Predicate on NLI for per-branch filtering.
 func TestNLIRulePromotesAcrossOROfANDsCommonEqui(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	cat := catalog.NewInMemory()
 	part, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
 		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},

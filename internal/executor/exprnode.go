@@ -69,8 +69,8 @@ const (
 	ExprIntConst           // payload[0:8] = int64 value
 	ExprBoolConst          // payload[0] = 0 (false) or 1 (true)
 	ExprNullConst          // no payload
-	ExprBinaryOp           // payload[0] = uint8(parser.OpCode); childA/childB = operand indices
-	ExprUnaryOp            // payload[0] = uint8(parser.OpCode); childA = operand index
+	ExprBinaryOp           // payload[0] = op, [1] = overflow code, [4:8] = int32 pos; childA/childB = operands
+	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
 )
 
@@ -82,8 +82,13 @@ const noExpr = int32(-1)
 // For ExprAdapter, orig holds the original planner.Expr to keep it
 // GC-live and to delegate evaluation to evalExprSlot.
 //
-// For all concrete kinds, data is encoded in payload bytes or child
-// indices; orig is nil (no GC pointer cost per row for hot kinds).
+// For all concrete kinds except ExprColumnRef, data is encoded in payload
+// bytes or child indices and orig is nil. ExprColumnRef also keeps orig:
+// evalFastExpr's out-of-range arm delegates to evalExprSlot so the raised
+// error is byte-identical to the interpreted twin's (M0127-PS6.1; see the
+// bounds-check comment in evalFastExpr). The pointer is read on the error
+// path only, and the planner.Expr tree is retained by the plan regardless,
+// so it adds no retention.
 type ExprNode struct {
 	Kind    ExprKind
 	_pad    [3]byte
@@ -108,7 +113,9 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 	switch t := e.(type) {
 	case *planner.ColumnRef:
 		idx := int32(len(*s))
-		*s = append(*s, ExprNode{Kind: ExprColumnRef})
+		// orig is kept so the bounds-check arm of evalFastExpr can raise the
+		// interpreted twin's exact error rather than a second, diverging one.
+		*s = append(*s, ExprNode{Kind: ExprColumnRef, orig: e})
 		binary.LittleEndian.PutUint32((*s)[idx].payload[:], uint32(t.Index))
 		return idx
 
@@ -186,6 +193,13 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		// payload[1] carries the int2/int4 overflow code so evalFastExpr can
 		// apply the same range check evalExprSlot does. M0097 regression fix.
 		(*s)[idx].payload[1] = overflowCodeForType(t.ResultType)
+		// payload[4:8] carries the source position. The interpreted twin passes
+		// x.Pos() to evalBinary/evalPgLSNBinary and stamps it on every ExecError
+		// it raises; the compiled twin passed a literal 0, so the SAME failing
+		// expression carried a position on one evaluator and none on the other.
+		// It is compiled in at build time rather than read from orig because
+		// only ExprColumnRef keeps orig. M0127-PS6.2 sibling audit.
+		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
 		return idx
 
 	case *planner.UnaryOp:
@@ -194,6 +208,7 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		childA := s.buildExpr(t.Operand)
 		(*s)[idx].childA = childA
 		(*s)[idx].payload[0] = uint8(t.Op)
+		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
 		return idx
 
 	default:
@@ -204,6 +219,27 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 		return idx
 	}
+}
+
+// evalFastColumnRefErr raises the out-of-range (or nil-slot) ColumnRef error
+// for the compiled evaluator. It delegates to evalExprSlot on the original
+// planner.Expr so the message is exactly the interpreted twin's — including
+// the column name and the per-concrete-type wording — and only synthesises
+// its own text when a node was built without orig. M0127-PS6.1.
+func evalFastColumnRefErr(n *ExprNode, slot SlotView, ctx *Context, colIdx, width int) (Datum, error) {
+	if n.orig != nil {
+		d, err := evalExprSlot(n.orig, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		// evalExprSlot accepted an index this arm rejected: the two
+		// evaluators disagree about what is in range, which is a defect in
+		// this guard, not in the plan. Fail loudly rather than papering over
+		// a divergence the sibling rule exists to catch.
+		return d, &ExecError{Code: "XX000", Message: fmt.Sprintf(
+			"executor: compiled/interpreted ColumnRef bounds disagree at index %d (width %d)", colIdx, width)}
+	}
+	return Datum{}, &ExecError{Code: "XX000", Message: fmt.Sprintf("column ref %d out of slot range %d", colIdx, width)}
 }
 
 // evalFastExpr evaluates the expression tree rooted at exprs[idx] against slot.
@@ -219,6 +255,52 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	switch n.Kind {
 	case ExprColumnRef:
 		colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		// Sibling-path guard (M0127-PS6.1, 09 §1). The interpreted twin
+		// bounds-checks every ColumnRef before Get and raises XX000
+		// (expr.go:353-393); that check exists because a raw index panic
+		// escaped the hash-join build-side drain — which gatherOp.Open runs
+		// in the LEADER goroutine, outside ParallelGroup.Go's recover — and
+		// closed the client socket (TPC-DS Q8). PS6.1 puts this evaluator on
+		// that exact seam, so the compiled twin must make the same promise:
+		// an ERROR kills the statement, never the backend.
+		//
+		// The check is a CONCRETE type switch, not an assertion to a
+		// `Width() int` capability interface. Measured (BenchmarkJoinKeyEval):
+		// the capability assertion is an itab lookup and costs ~1.4 ns/eval,
+		// which alone made the compiled key arm SLOWER than the interpreter it
+		// replaces. A concrete switch is a type-descriptor compare, and it
+		// also lets each arm call its own Get directly — so the guard is added
+		// while the interface dispatch on Get is removed.
+		//
+		// An out-of-range index delegates to evalExprSlot so the raised error
+		// is byte-identical to the interpreted twin's per-type text rather
+		// than a second, diverging one. It is the error path; cost is moot.
+		switch s := slot.(type) {
+		case *MaterializedSlot:
+			if colIdx < 0 || colIdx >= len(s.row) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.row))
+			}
+			return s.Get(colIdx), nil
+		case *VirtualSlot:
+			if colIdx < 0 || colIdx >= len(s.cols) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.cols))
+			}
+			return s.Get(colIdx), nil
+		case *Slot:
+			if colIdx < 0 || colIdx >= len(s.Cells) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.Cells))
+			}
+			return s.Get(colIdx), nil
+		case rowSlotView:
+			if colIdx < 0 || colIdx >= len(s) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s))
+			}
+			return s.Get(colIdx), nil
+		case nil:
+			return evalFastColumnRefErr(n, slot, ctx, colIdx, 0)
+		}
+		// A SlotView implementation this switch does not know: no width is
+		// reachable, so behave as the pre-PS6.1 arm did.
 		return slot.Get(colIdx), nil
 
 	case ExprIntConst:
@@ -242,13 +324,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		}
 		// Short-circuit boolean operators before evaluating the right side,
 		// matching evalExprSlot behaviour.
+		//
+		// The gate is `Kind == KindBool`, NOT `!IsNull()` (M0127-PS6.2). Datum
+		// .BoolValue() is `Int != 0` on ANY Kind, so `!IsNull()` short-circuits
+		// on non-boolean left operands too — and then RETURNS THAT OPERAND as
+		// the result of the AND/OR. The interpreted twin cannot do that: it
+		// declines to short-circuit and evalAnd/evalOr (expr.go) always yield
+		// KindBool or NULL. Two ways that mattered: a KindString left operand
+		// made `s AND x` evaluate to the string, and for an ARENA-backed string
+		// Datum.Int is the mctx coordinate (offset<<32|length), so BoolValue()
+		// — and hence which branch was taken — depended on the arena offset.
+		// Found by the PS6.2 parity corpus (619 diffs, 2 root causes).
 		switch op {
 		case parser.OpAnd:
-			if !left.IsNull() && !left.BoolValue() {
+			if left.Kind == KindBool && !left.BoolValue() {
 				return left, nil
 			}
 		case parser.OpOr:
-			if !left.IsNull() && left.BoolValue() {
+			if left.Kind == KindBool && left.BoolValue() {
 				return left, nil
 			}
 		}
@@ -256,10 +349,14 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		// The compiled position (payload[4:8]), not a literal 0: every error
+		// these three helpers raise is stamped with it on the interpreted twin.
+		// M0127-PS6.2.
+		pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
 		// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
-			res, handled, lsnErr := evalPgLSNBinary(op, left, right, 0)
+			res, handled, lsnErr := evalPgLSNBinary(op, left, right, pos)
 			if lsnErr != nil {
 				return Datum{}, lsnErr
 			}
@@ -267,7 +364,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				return res, nil
 			}
 		}
-		result, err := evalBinary(op, left, right, 0, ctx)
+		result, err := evalBinary(op, left, right, pos, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -278,11 +375,11 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 			switch n.payload[1] {
 			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
 				}
 			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
 				}
 			}
 		}
@@ -297,7 +394,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalUnary(op, operand, 0)
+		return evalUnary(op, operand, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))))
 
 	case ExprAdapter:
 		return evalExprSlot(n.orig, slot, ctx)

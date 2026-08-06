@@ -31,8 +31,13 @@ import (
 var memoizeOn atomic.Bool
 
 func init() {
-	memoizeOn.Store(os.Getenv("GOOPG_MEMOIZE") != "off")
+	memoizeOn.Store(memoizeFromEnv(os.Getenv("GOOPG_MEMOIZE")))
 }
+
+// memoizeFromEnv is the kill-switch's polarity, factored out of init so the
+// provenance table (flaglabels.go) can ask what an UNSET variable resolves to
+// without a subprocess — the same shape as pgShapedDPFromEnv.
+func memoizeFromEnv(v string) bool { return v != "off" }
 
 // SetMemoizeEnabled flips Memoize insertion on or off (test hook and
 // the enable_memoize GUC bridge target).

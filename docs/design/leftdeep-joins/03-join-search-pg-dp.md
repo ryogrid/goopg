@@ -276,6 +276,62 @@ restriction buys an invariant the rest of the search leans on: **every join path
 in the search is unparameterised**, so `Path.Rows == Rel.Rows` holds for every
 join path and the only parameterised paths in play are base index scans.
 
+**Status (P5.4b-ii-b-2, 2026-08-06) — Memoize landed as a PATH, and the
+"one constructor" sentence above is now historically false.**
+
+`getMemoizePath` (`internal/planner/joinpathsmemoize.go`) is
+`get_memoize_path` (joinpath.c:674) with `cost_memoize_rescan`
+(costsize.c:2541) transcribed beside it, and `addNLIPaths` offers the bare inner
+AND the cache-wrapped one to `addPath`, exactly as `match_unsorted_outer` does
+(:1965-1986). The new `PathMemoize` kind has no `createPlan` arm of its own:
+goopg's cache is `NestedLoopIndexJoin.InnerMemo`, a field on the join rather than
+a node between the join and its inner, so `createNestLoopIndexJoinPlan` unwraps
+it and builds the `Memoize` from the ALREADY-TRANSLATED probe keys — the cache
+key and the probe key are one list read twice, because `memoizeOp` evaluates
+`KeyExprs` against the same bound outer slot `indexScanOp.Rescan` evaluates
+`IndexScan.Key` against.
+
+Why it had to be a path and not an attachment: goopg already had
+`maybeAttachMemoize` (`memoize.go`), which runs on a BUILT
+`*NestedLoopIndexJoin` — and `walkRewriteNLI` skips a searched subtree
+(nl_index_join.go:110), so no searched NLI ever reached it. Bolting it on at
+`createPlan` time would have made the executed plan cheaper than the plan the
+search costed, and the point of memoizing is precisely that an NLI beats a hash
+join it would otherwise lose to; that comparison happens in `addPath` or not at
+all.
+
+The blast radius is bounded by upstream's own caution. `cost_memoize_rescan`
+replaces a DEFAULTED ndistinct with `calls` (:2592, "a bit too risky"), which
+drives the hit ratio to zero and makes the wrapper strictly more expensive than
+what it wraps. goopg reaches the same place through `getVariableNumDistinct`'s
+`isdefault` return. The two gates are NOT alike here, and the difference is
+worth stating because it is easy to get backwards: the TPC-H spot-check runs a
+fresh capped server and never ANALYZEs, and goopg's in-session statistics do not
+survive a restart, so no candidate there can be anything but defaulted; the
+TPC-DS SF0.5 cluster, since M0125-0028/-0029, persists per-column statistics and
+`reltuples` through the goopg-private sidecar, so the sweep plans WITH statistics
+and a Memoize path can win there. DS05 is the load-bearing gate for this slice,
+and it exercised it: the 2026-08-06 sweep is `PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0` with runtime-moves=0, and its plan channel reports exactly one
+shape change — **Q6, whose parameterised `date_dim_pkey` probe is now wrapped in
+`Memoize (Cache Key: s.ss_sold_date_sk)`**, with the same row count and the same
+checksum. That is the only end-to-end evidence available that the path is chosen
+AND that the cache returns the right rows.
+
+**The binding-contract half of this section is discharged, but not in the form
+filed above.** `tryBuildNLI` is NOT the constructor for a searched join —
+`walkRewriteNLI` returns early on a searched tree — so there are now TWO
+operator constructors, `tryBuildNLI` for non-searched trees and
+`createNestLoopIndexJoinPlan` for searched ones, operating on disjoint trees.
+"Constructor failure on a DP-chosen path is a loud planner error" holds: every
+decline in the searched constructor is a panic naming the producer that violated
+it. The eligibility half is shared at the PRODUCER instead of at construction —
+`pickIndexCoveringAllLeadingColumns` (P5.4b-ii-a) and
+`addParameterizedIndexPaths`' refusal of a wrapped leaf (P5.5-e-ii-b) are what
+make the searched constructor's declines unreachable. The residual — two
+constructors where §5.2 asked for one — is ledgered against the S7 retirement of
+the legacy enumerator, which deletes the other one.
+
 ### 5.3 Merge join / plain nested loop
 - Merge path when both sides can be sorted on the key (explicit Sort paths;
   pathkey propagation via the existing `pathkeys.go`); required for
@@ -553,7 +609,7 @@ once, in path generation. The post-hoc placement passes
 stop running on searched subtrees ([08](08-migration-and-removal.md) §3 keeps
 them for non-searched shapes).
 
-## 6. What enters the search: collapse limits, explicit JOINs
+## 6. What enters the search: collapse limits, explicit JOINs — IMPLEMENTED
 
 Today only comma-FROM lists of whitelisted leaves reach the DP; explicit
 `JOIN … ON` trees are never reordered, and the registered
@@ -583,6 +639,160 @@ wires them with PG semantics (`initsplan.c:1081-1238`, `deconstruct_jointree`)
   restrictions; the remaining prerequisite is the constraint inference
   itself, not the search shape.
 
+### 6.1 As implemented (M0127-P5.8) — `internal/planner/collapse.go`
+
+`deconstructJointree` ports the joinlist half of `deconstruct_recurse`
+(`initsplan.c:1148-1452`) and nothing else: the `JoinDomain`s, `qualscope` /
+`inner_join_rels` / `nonnullable_rels` sets and the `JoinTreeItem` list that
+phase 2 walks have no reader in goopg, which places quals in the pre-search
+pipeline (`planJoinPredicate`, `inner_join_qual_pushdown.go`) and does not let
+outer joins into the search at all. What is ported is the part
+`make_rel_from_joinlist` (`allpaths.c:3391`) consumes.
+
+Three things the port settled that the plan above had left as prose:
+
+- **the =1 pin is weaker than the folklore, and the recursion says where.** At
+  a two-way `a JOIN b` the "cannot combine" branch emits `[a, b]` — identical
+  to the collapsed answer, because a one-element side is unwrapped rather than
+  wrapped (`initsplan.c:1428-1436`). The pin first bites at the third relation:
+  `(a JOIN b) JOIN c` → `[[a,b], c]`. So `join_collapse_limit = 1` restricts
+  the order of the syntactic tree's own nodes; it never forbids commuting a
+  single join.
+- **outer joins take upstream's FULL treatment, not a new mechanism.** §4.4's
+  pin is exactly `list_make1(list_make2(l, r))` (`initsplan.c:1414-1418`) — one
+  joinlist member, so the enclosing `FromExpr` always absorbs it
+  (`sub_members <= 1`), whose subproblem is the forced order. RIGHT is included
+  because goopg has no `reduce_outer_joins` to rewrite it to a LEFT.
+- **the leaf numbering is the binding order, by construction.** A joinlist leaf
+  is an index into `resolveContext.bindings`, so a consumer subscripts
+  `bindings` / `scans` / `relInfos` for `buildInitialRels` with no name
+  matching. That only holds because the pass is computed inside
+  `planFromClause` / `planFromRangeVars` (`planner.go:1920`/`:1968`), the two
+  places where the FROM walk that numbers leaves *is* the walk that appends
+  bindings; `TestJoinlistLeavesMatchBindings` pins it through the production
+  entry point rather than through the pure function.
+
+One limit of the landed state is ledgered: the per-session GUC values do
+not reach the planner (`Plan` takes no session — the same gap
+`costParams.workMem` and `ParallelSettings` record), so `SET
+join_collapse_limit = 1` is still a no-op in a real session even though the
+semantics are implemented and tested.
+
+### 6.2 As implemented (M0127-P5.9-a) — the CONSUMER, `internal/planner/relfromjoinlist.go`
+
+`makeRelFromJoinlist` is `make_rel_from_joinlist` (allpaths.c:3352): resolve
+every joinlist item to a rel — recursing on sub-lists — and, unless there is
+only one, search the orders in which they can be joined. `planJoinlistSearch`
+is the entry point; `searchOneProblem` is the only place the protocol
+(`buildInitialRels` → `addBaseRelIndexPaths` → `joinSearch`, then `finalPath`
+and the boundary) is written down rather than re-assembled per caller. Together
+they decide **how many searches a statement gets**, which is the question §6
+answers at the joinlist level and nothing had asked at the rel level.
+
+Three things the port settled:
+
+- **a sub-joinlist is planned, then handed over as ONE relation.** Upstream
+  returns a `RelOptInfo` whose whole PATHLIST stays available to the enclosing
+  problem; goopg returns a NODE — the sub-problem's cheapest tree, republished
+  in binding order — which the parent admits as one `PathPrebuilt` initial rel,
+  the same door a FROM-subquery leaf comes through (§2). So the parent cannot
+  pick a differently-sorted path for the sub-problem, and the sub-problem is
+  priced for all rows because it does not know which side of the enclosing join
+  it will land on. Ledgered, and the reason it is not a wiring fix: keeping the
+  pathlist alive across the boundary requires the level lists to be indexed by
+  joinlist ITEM rather than by base-relid popcount (`addRel`, joinsearch.go) —
+  a representation change.
+- **clause placement needs no placement pass.** Each problem builds its own
+  clause list from the statement's conjuncts with per-ITEM `cumOffsets`, and
+  `relidsOfExpr` (joinrestrict.go) does the rest: a clause between two leaves
+  inside one item collapses to a single bit, `relLevel < 2`, and is dropped
+  (the sub-problem that owns those leaves already placed it); a clause reaching
+  out of a sub-problem's window has a column outside it, is declined there, and
+  is placed by the enclosing problem, where both of its ends are items. No
+  clause is placed twice and none is lost.
+- **the boundary generalises to a window.** A sub-problem's rels carry GLOBAL
+  binding coordinates — they must, because the clause list is written in the
+  statement's one concatenated space — while the row it publishes is only its
+  own slice, so §10's map is now `createPlanAtSearchRootRange(p, base, width)`
+  and `createPlanAtSearchRoot` is the `base = 0` case. Running the same
+  permutation check ("no hole, no duplicate, nothing out of range") on the slice
+  is what makes a sub-problem that dropped a column fail at the boundary rather
+  than as a wrong row six nodes above. It works because a sub-joinlist covers a
+  CONTIGUOUS run of FROM items — deconstruction never reorders — which
+  `leafRange` CHECKS per item rather than assumes.
+
+Superseded by §6.3: `planJoinlistSearch` has a production caller since P5.9-b.
+The seam (`tryBushyDP` / `runJoinSearchBelowPinned`) also had to decide which
+conjuncts the search consumed before the residual `Filter` above it is rebuilt —
+the one piece of the wiring the recursion deliberately does not answer, because
+the residual belongs to the pre-search pipeline that owns that `Filter`, not to
+the search.
+
+### 6.3 As implemented (M0127-P5.9-b) — the SEAM, `internal/planner/joinsearchseam.go`
+
+`tryPGShapedJoinSearch` is the production caller, entered from the first line of
+`tryBushyDP` so that both call sites (`planSelect`'s legacy position and
+`runJoinSearchBelowPinned`'s pinned-spine position) reach it through one door and
+the old DP remains the fallback the S5 rollback story ([08](08-migration-and-removal.md) §2)
+requires. It answers the three questions the recursion does not.
+
+**Which statements enter the search.** The search wants one leaf per binding, in
+binding order, with no execution-time dependency between them; `extractScans`
+over the pre-search CROSS chain supplies exactly that for a comma-FROM list —
+including the subquery / VALUES / function-scan leaves the old DP's whitelist
+refused, so the leaf-whitelist gap closes in production and not only in
+principle. Three shapes are declined, each for a correctness reason: a FROM item
+that is itself an explicit `JOIN` (one node, several bindings — see the ledger
+row below), a LATERAL item (the search chooses an order; the dependency is not a
+clause), and bindings whose offsets disagree with the concatenation of the leaf
+widths (the clause list is written in that one space).
+
+**Which conjuncts survive.** `searchConsumes` puts the question to
+`buildRestrictInfos` — the search's own producer — and treats a conjunct as
+consumed only when the producer emits THAT conjunct as a clause. Re-deriving the
+rule ("does it reach two relations?") would be wrong for exactly one shape and
+silently: an OR-of-ANDs contributes the equalities COMMON to its branches and not
+itself (`joinrestrict.go`), so the OR reaches two relations and must still stay
+in the `Filter`. The question is asked in the FULL per-FROM-item coordinate
+space rather than the per-joinlist-item space one problem uses, because two
+distinct leaves must separate at some level of the recursion, and the problem
+where they separate is the one that places the clause.
+
+**What the legacy passes may still do.** [08](08-migration-and-removal.md) §3's
+coexistence rule is now enforced for the four passes that REWRITE a join tree —
+`pushPredicatesIntoCrossJoins`, `rewriteJoinsToNLI`, `rewriteMultiWayChain`,
+`rewriteScanInputsWithSingleTablePredicates` — joining the three that renumber
+one (P5.5-f-ii-a). The reason is coordinates: those passes address a tree in the
+statement's FROM-cumulative space, while a searched tree's INTERNAL joins carry
+the search's own per-joinrel layouts and only its ROOT is republished in binding
+order (§10).
+
+Two things the port settled that the plan above had not:
+
+- **the two cardinality entry points had different tier ladders, and the search
+  was on the shorter one.** `bushySeedRowCounts` (bushy.go) falls back to the
+  `estimate_rel_size` row estimate (M0125-0003 stage 3) when a relation has no
+  `TableStats`; `estimateBaseRelInfo` — the only cardinality the search sees —
+  does not, because `tableRows` answers 0 and stops. `TableStats.RowCount` does
+  not survive a restart (ledger pq-P6), so on a cold server every initial rel
+  floors at one row, and at one row per side the cost model correctly prefers a
+  NESTED LOOP where the legacy pipeline built a hash join unconditionally. The
+  seam applies the same tier locally; the shared entry point is ledgered.
+- **local quals go into the leaf BEFORE the search, not onto the tree after
+  it.** `attachRelationLocalFilters` matches leaves by POINTER identity, and the
+  search's index arm REBUILDS a leaf (P5.5-c), so a qual attached afterwards
+  could be attached to nothing and lost. Attaching first also gives the search
+  the leaf shape it already expects (`scanLeafFor`, createplanindex.go) and puts
+  the relation's post-filter cardinality where `initialRelRows` reads it —
+  which needed one arm there, since a filter-wrapped base table was previously
+  re-estimated by `EstimateRows`, a second and different selectivity computation
+  over the predicate `estimateBaseRelInfo` had already applied.
+
+The flag stays OFF: this is its only production reader, and with it off the seam
+declines on its first line, no tree carries the searched tag, and all seven skips
+are unreachable — the default arm is byte-identical. The acceptance run and the
+flip are P5.9.
+
 ## 7. Search-size policy (the GEQO question)
 
 PG switches to GEQO at `geqo_threshold` (12) rels (`allpaths.c:3420`). goopg
@@ -606,7 +816,13 @@ ports no GEQO. Policy:
   workloads hit this.
 
 The hardcoded `len(tables) > 12` bail-out (`bushy.go:99`) is deleted with the
-bushy DP.
+bushy DP — i.e. in P6.3, not in P5.8. The two are not the same guard: the
+bail-out bounds the OLD subset-bitmask DP, whose enumeration is 3ⁿ over splits
+of subsets (3¹⁶ ≈ 43 M), while `maxSearchRels` (16, `joinsearch.go`) is the
+`RelSet` representation limit on the new search's clause-connected pair
+enumeration. Removing the bail-out while the old DP is still the production
+path would hand it 13-16-relation queries it cannot finish. P5.8's TODO line
+stated this more loosely; this section is the authority.
 
 ## 8. Determinism and tie-breaking
 
@@ -705,6 +921,31 @@ bug generator. The replacement must be named, not implied:
 Debug tripwire: a build-mode assertion that every `ColumnRef` above the
 search root resolves within its input schema — the M0097-0058
 out-of-bounds class must fail loudly at plan time, never at execution.
+
+**Amendment 2026-08-05 (P5.9-c) — the tripwire above is necessary and not
+sufficient, and the missing half is about WHEN it runs.** Every check this
+section specifies is a PRODUCER-side check: `boundaryMap`'s hole /
+out-of-range / duplicate refusals, `assertColumnRefsWithinSchema`,
+`assertSearchedTreeNeedsNoReconcile`. All of them run while the boundary node
+is being built, and P5.9's acceptance run failed on a defect that happened
+*after* that — a legacy pass renumbered the boundary `Project`'s own target
+list, which is the map rather than a reference into it
+([09](09-verification-and-acceptance.md) §3.2). The composed result stayed a
+permutation of `[0,width)`, stayed in range, and joined on the right columns;
+only the top projection read the wrong ones. So:
+
+> The boundary map has a consumer-side invariant, and it must be checked on the
+> FINISHED tree: **target `i` of the boundary `Project` is a bare `ColumnRef`
+> naming exactly the column it addresses, and the node's `schema[i]` is that
+> same column.** `projectToBindingOrder` establishes it by construction; any
+> permutation applied later breaks it, because the indices move and the names
+> do not.
+
+`assertSearchedBoundariesIntact` (createplanroot.go) runs it at the tail of
+`Plan()`, gated on `GOOPG_PGSHAPED_DP`. The generalised rule it backstops is
+in [08](08-migration-and-removal.md) §3: a legacy pass must skip a searched
+subtree not only when it REWRITES a join tree, but whenever it DESCENDS
+THROUGH a node kind the boundary can be.
 
 **Amendment 2026-08-04 (P5.5-e-i) — the map's INPUT now exists, and it is
 produced by the recursion rather than re-derived.** The scan and sort arms

@@ -89,7 +89,9 @@ better formula.
 Each `RelOptInfo` carries `rows` set exactly once:
 
 - initial rels: today's `estimateBaseRelInfo` post-filter estimate
-  (`internal/planner/cardinality.go:285`);
+  (`internal/planner/cardinality.go:285`), reached through `initialRelRows`
+  (joinsearch.go), with the relation-size fallback below filling in the
+  pre-filter count when the restart lost it;
 - join rels: `calcJoinrelSize(outer, inner, clauses)` at find-or-create time
   in `makeJoinRel` — **before** any path is generated, so every method's
   paths for one relset share one output-row figure, PG's
@@ -112,6 +114,55 @@ estimate** (`ppiRows` — per-outer-row output of an NLI inner; PG's
 `get_parameterized_baserel_size`). The RelOptInfo `rows` stays canonical for
 the rel; each parameterisation's rows live beside the path
 ([03](03-join-search-pg-dp.md) §9 rule 3).
+
+### 2.1 The base rel's pre-filter count, and where M0125-0003 "stage 3" went
+
+*(P5.6's re-evaluation of M0125-0003 stage 3 against this chapter, 2026-08-06.)*
+
+`tableRows` answers 0 for a relation with no `TableStats`, and
+`TableStats.RowCount` does not survive a restart (ledger `pq-P6`) — so without
+a fallback a cold server seeds every initial rel at the 1-row floor, and at one
+row per side the cost model correctly prefers a nested loop. The seam
+(`joinsearchseam.go`) therefore installs M0125-0003's block-derived estimate,
+now through `applyRelSizeFallback` (`relsize.go`) in **upstream's order**:
+`estimate_rel_size` (plancat.c:1075) supplies the pre-filter `tuples`, and
+`set_baserel_size_estimates` (costsize.c:5378) multiplies by
+`clauselist_selectivity(baserestrictinfo)` — here
+`applyLocalFilterSelectivity`, factored out of `estimateBaseRelInfo` so the two
+callers cannot drift.
+
+**Stage 3 is therefore not a fourth staged flag consumer, and never will be.**
+It was filed as "make `estimateBaseRelInfo.baseRows` positive cold", which under
+the old DP would have *shadowed* the stage-2 seed tier — two consumers reading
+the same fallback at different points of the same plan, which is what the flag
+staging existed to sequence. Rows-once removes the second consumer: the search
+reads a base relation's cardinality exactly once, so the placement is simply
+correct at the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` keeps
+answering with stage-2 behaviour.
+
+Two facts make this a re-derivation rather than a behaviour change, both pinned
+by `relsize_baserel_placement_test.go`:
+
+- **S-cold it is a no-op.** The fallback fires only when `tableRows` answered 0;
+  for `Stats == nil` that is also the state in which `columnStatsForChild`
+  answers nil for every column, so every clause reports `reliable=false` and the
+  selectivity is never applied. The pre-filter stamping this replaces produced
+  the same number. The old seam comment justified stamping pre-filter with "a
+  server with no row count has no column statistics either, so scaling invents
+  precision" — a true premise, now enforced by the reliability gate rather than
+  by refusing to scale.
+- **Post-restart it is load-bearing.** `loadStatisticsFromHeap` restores
+  per-column statistics while `RowCount` does not survive, so
+  `Analyzed=true, Columns populated, RowCount=0` is the state a restarted goopg
+  is actually in — not an edge case. The pre-filter stamping threw the restored
+  MCV list away and handed the search the whole relation; the post-filter
+  placement spends it, which is what upstream does.
+
+The remaining deviation from `set_baserel_size_estimates` is goopg's `reliable`
+gate: PG always multiplies, falling back to `DEFAULT_EQ_SEL` / `DEFAULT_INEQ_SEL`
+when it has no statistic, whereas goopg keeps the pre-filter count (design
+`tpch-round2/02` §2 rule (4)). Ledgered, not changed here — it is a
+planner-wide policy, not this placement's business.
 
 ## 3. Join selectivity: fixing class (a)
 
@@ -293,7 +344,131 @@ untouched here: `hashJoinCost` has always returned both numbers and now moves
 them independently (the inner write is startup, the read-back is run), but
 nothing yet SELECTS on startup under a LIMIT. That needs PG's `tuple_fraction`
 plumbed into `grouping_planner`'s choice between `CheapestTotal` and
-`CheapestStartup`, and is filed as **M0127-P5.7-b**.
+`CheapestStartup`, and is §4.3 below (**M0127-P5.7-b**).
+
+### 4.3 The LIMIT fraction (M0127-P5.7-b)
+
+§4.1 made the two cost numbers move independently and for the right reason, and
+changed no plan, because **nothing in goopg selected on startup cost**.
+`setCheapest` had computed `RelOptInfo.CheapestStartup` since P5.2 and no line of
+production code read it. `internal/planner/tuplefraction.go` supplies the number
+that makes it selectable: PG's `tuple_fraction`, ported as `preprocessLimit`
+(`preprocess_limit`, planner.c:2577) → `getCheapestFractionalPath`
+(planner.c:6617) → `compareFractionalPathCosts` (pathnode.c:127).
+
+The finding is that the fraction is **two mechanisms, not one**, and only the
+pair changes a plan:
+
+1. **Selection.** `searchCtx.finalPath()` is upstream's
+   `best_path = get_cheapest_fractional_path(final_rel, root->tuple_fraction)`
+   (planner.c:437) and is now the only value a caller may hand
+   `createPlanAtSearchRoot`. Reading `finalRel().CheapestTotal` directly — what
+   a caller would otherwise have done — silently discards the fraction, so the
+   search publishes the answer rather than the ingredients.
+2. **Retention.** `RelOptInfo.ConsiderStartup` (`consider_startup`,
+   relnode.c:211/707, set from `tuple_fraction > 0` on every rel the search
+   creates) is enforced in `comparePathCostsFuzzily`'s two "different" arms,
+   which is where upstream puts it (pathnode.c:178-183): a path that loses on
+   total cost may not survive on good startup cost alone unless a fraction will
+   ever be asked for.
+
+Without (2), (1) has nothing to choose from — and goopg had neither, which is
+why its pathlists were not PG's in both directions at once. Before this change
+goopg behaved as if `consider_startup` were permanently TRUE and kept every
+fast-start path, then always selected by total cost; three existing unit tests
+were asserting on paths PG would have pruned (a nested loop at total 183 beside
+a hash at 11.6, kept only for its zero startup), and they now state the
+fast-start regime they were really testing in.
+
+`tuple_fraction` is overloaded on purpose, and the port keeps the overload: 0
+means all rows, (0,1) is a fraction, and `>= 1` is an absolute COUNT.
+`preprocessLimit` can only produce the absolute form (it knows the count, not
+the result size) and `getCheapestFractionalPath` converts it against
+`CheapestTotal.rows` at the moment of use, which is the first point both numbers
+are in hand. `compareFractionalPathCosts` folds anything outside (0,1) back onto
+the plain total-cost order, so an unconverted count degrades to today's answer
+instead of extrapolating the cost line past its endpoint.
+
+Acceptance is `TestLimitOverJoinMovesTheChosenPath`: a 10 000-row joinrel
+offered a hash-shaped path (startup 500, total 900) and a loop-shaped one
+(startup 0, total 20 000) — they cross at ≈2.55% — chooses the hash with no
+LIMIT (and does not even retain the loop), the loop under `LIMIT 100`, and the
+hash again under `LIMIT 5000`. The fraction is honoured, not merely the
+presence of a LIMIT.
+
+Deferred (3 ledger rows, 2026-08-05): the LIMIT expression is read as resolved
+rather than through `estimate_expression_value`, so `LIMIT 5 + 5` and a bound
+`LIMIT $1` take the 10% punt where PG folds them to a constant;
+`consider_param_startup` stays false because `set_base_rel_consider_startup`
+(allpaths.c:247) derives it from the `SpecialJoinInfo` list that 03 §4.4's pin
+keeps out of the search; and no production caller produces a fraction yet —
+`planSelect` does not call the search at all, and `cursor_tuple_fraction` /
+subquery-inherited fractions have no path to `preprocessLimit`'s caller
+argument, which is nonetheless ported whole so the absolute-vs-fractional
+heuristics are not reconstructed later from a simplified version.
+
+### 4.4 The bar that expired: what closing P5.7 actually cost (2026-08-06)
+
+The P5.7 roll-up's stated bar was **UNITS + PLAN (default arm ZERO diffs)**, and
+by the time it was read that bar could no longer be stated. Both sub-items had
+recorded a careful-sounding justification for skipping PLAN — *"not applicable
+and the reason is structural, not a skip: every consumer is behind an
+OFF-by-default gate"* — which was **true when written and false hours later**:
+
+| what | when |
+|---|---|
+| P5.7-a lands (`hashJoinCost` spill term) | 2026-08-05 12:20 (`9d500fce`) |
+| P5.7-b lands (LIMIT fraction + `ConsiderStartup`) | 2026-08-05 12:47 (`0391d36c`) |
+| P5.9 acceptance run 4 | 2026-08-06 01:04 (`23dcc60e`) |
+| **P5.9 flips `GOOPG_PGSHAPED_DP` ON by default** | 2026-08-06 02:22 (`b92582fb`) |
+
+Two consequences, and they point in opposite directions.
+
+**The bar is void, not failed.** "Zero diffs in the default arm" was a
+*containment* check: it asked whether a pricing change leaked out of an inert
+search. Post-flip the default arm is *supposed* to move plans — that is what the
+flip is for — so re-running PLAN and finding diffs would prove nothing about
+P5.7. What discharges P5.7 is the ordering above: both halves were already in
+the tree the flip's own acceptance measured (Q9 final joinrel 6.3× against the
+≤10² bar, `parity_violations=0`). P5.7's plan movement *was* measured, under
+P5.9's label rather than its own.
+
+**But the claim it rested on became a hazard.** `hashJoinCost` is now reached on
+every hash path the live search considers (`addHashJoinPath`, pathgen.go ←
+`addPathsToJoinrel`, joinpaths.go:197), and `finalPath` →
+`getCheapestFractionalPath` runs on every searched statement. A later loop
+reading P5.7-a's paragraph would conclude that a `cost_funcs.go` change needs no
+planner gate. That conclusion is now wrong.
+
+It was not confined to P5.7. **28 files in `internal/planner/` still carried
+`Still inert: GOOPG_PGSHAPED_DP is OFF … so they cannot change a plan`
+headers**, `cost_funcs.go` — the file `hashJoinCost` lives in — among them.
+Those banners function as gate-skip authority, so each was corrected to state
+post-flip reachability, **verified per file** rather than blanket-rewritten.
+Three did not come out like the rest:
+
+- **`collapse.go`** — its joinlist IS consumed now (`tryPGShapedJoinSearch`
+  reads `ctx.joinlist`, joinsearchseam.go:162/170). Only the narrower
+  `GOOPG_PGSHAPED_COLLAPSE` arm (explicit INNER JOIN flattening) is still off,
+  so production consumes a *today-shaped* joinlist through a *live* reader. "The
+  collapse flag is off" must not be read as "this file cannot move a plan".
+- **`tuplefraction.go`** — P5.7-b's third ledger row ("no production PRODUCER of
+  a fraction yet") is **discharged**: P5.9-b added `searchTupleFraction`
+  (joinsearchseam.go:579) called from `planSelect` (planner.go:1128), at
+  upstream's point in the order. Checked for the sibling-path gap this invites:
+  there is none — the only arm that skips the assignment is `isSimpleSingle`,
+  which is single-relation and never reaches the join search. Note the half that
+  is live *even with no LIMIT*: `ConsiderStartup` is `tupleFraction > 0`, so a
+  fraction of 0 actively PRUNES fast-start paths rather than abstaining.
+- **`exprwalk.go`** — "inert until a caller opts in" is stale too, but for a
+  different reason (M0125-0002's walker conversion, not the flip). Left alone
+  and ledgered rather than corrected on a guess.
+
+The general lesson for this milestone: **an inertness claim has an expiry date
+that the flag flip does not automatically write.** A flag flip is not one commit
+that changes one default — it silently invalidates every comment, task
+justification and skipped gate that cited the old default, and none of them are
+in the flip's own diff.
 
 ## 5. Inferred edges: from admissibility penalty to selectivity honesty
 

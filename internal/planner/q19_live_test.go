@@ -10,6 +10,8 @@ import (
 
 // Mirror the live HammerDB column ordering.
 func TestPlanQ19LiveSQL(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
 		{Name: "l_shipdate", Type: catalog.Type{Name: "date"}},
@@ -71,6 +73,8 @@ func TestPlanQ19LiveSQL(t *testing.T) {
 // whole conjunct as `sideOutOfScope`, blocking pushdown into the
 // CROSS join and leaving Q19 / Q22 stuck on Cartesian.
 func TestInExprLiteralListPushdown(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "tl"}, []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int8"}},

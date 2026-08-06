@@ -17,6 +17,8 @@ Classification (ci/design/02 §B):
   - tpch timeout / not-run(budget) / total > 2x base   -> perf-drastic (fail)
   - build failure                                      -> regression (fail(build))
   - signal-9 kill with no test FAIL                    -> resource-kill (inconclusive)
+  - build broke DURING a stage (tree edited mid-run)   -> build-kill: ONE item,
+    every test failing at/after the break is unattributable (inconclusive)
   - expected-fail (ci/batch/expected-failures.csv) hit -> informational
   - expected-fail PASS                                 -> promotable notice
 """
@@ -112,6 +114,67 @@ def looks_resource_killed(log_text):
     return bool(re.search(r"signal: killed|Killed\b|exit status 137", log_text))
 
 
+# The Go toolchain prefixes a package's build errors with `# <import path>` and
+# renders each error as `file.go:LINE:COL: msg`. A test-log line is
+# `file_test.go:LINE: msg` (no column), so the two-number form does not collide
+# with test output. Either signature is accepted because a fixture may capture
+# only the error line, or only the header, into its t.Errorf text.
+GO_BUILD_PKG_RE = re.compile(r"#\s+github\.com/goopg/goopg/\S+\s*$")
+GO_COMPILE_ERR_RE = re.compile(r"\S+\.go:\d+:\d+: \S")
+TOP_FAIL_RE = re.compile(r"^--- FAIL: (\S+) \(")
+
+
+def build_error_line(log_text):
+    """Index of the first line showing a Go BUILD failure, or None.
+
+    Used as a boundary, not just a flag: the nightly compiles the live working
+    tree, so a Ralph loop committing mid-run can break the build AFTER
+    preflight's `make build` already passed. Every test that fails at or after
+    this line ran against a tree that does not compile and says nothing about
+    the code; every test that failed BEFORE it is a real result and must still
+    be reported (on 2026-08-06 `TestPort_IsolationEvalPlanQual` — a genuine
+    six-night regression — failed 600 lines above the boundary).
+    """
+    for i, line in enumerate(log_text.splitlines()):
+        if GO_BUILD_PKG_RE.search(line) or GO_COMPILE_ERR_RE.search(line):
+            return i
+    return None
+
+
+def top_fail_lines(log_text):
+    """name -> line index of its top-level `--- FAIL:` line.
+
+    Subtest failures are indented, so the `^` anchor keeps this to top-level
+    tests — the same granularity the testport action items use.
+    """
+    out = {}
+    for i, line in enumerate(log_text.splitlines()):
+        m = TOP_FAIL_RE.match(line)
+        if m:
+            out.setdefault(m.group(1), i)
+    return out
+
+
+def stage_fingerprints(run_dir):
+    """stage -> the source fingerprint recorded when that stage started.
+
+    Written by run_stage (ci/batch/run-nightly.sh); absent for runs predating
+    the stamp, in which case drift detection silently degrades to "unknown".
+    """
+    out = {}
+    d = os.path.join(run_dir, "stages")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for fn in names:
+        if fn.endswith(".fp"):
+            fp = read_file(os.path.join(d, fn)).strip()
+            if fp:
+                out[fn[: -len(".fp")]] = fp
+    return out
+
+
 PKG_LINE_RE = re.compile(r"^(ok|FAIL|\?)\s+(\S+)")
 
 
@@ -163,6 +226,7 @@ class Items:
         self.regressions = []      # gating -> fail
         self.perf_drastic = []     # gating -> fail
         self.resource_kills = []   # -> inconclusive (when no regressions)
+        self.build_kills = []      # mid-run build break -> inconclusive, ONE item
         self.known_fails = []      # informational
         self.promotable = []       # notices
         self.notes = []            # informational
@@ -265,11 +329,26 @@ def analyze(run_dir, repo_root, run_id):
         except OSError:
             pass
 
+    # Mid-run build break (see build_error_line): collapse every test that
+    # failed at or after the boundary into ONE item. Pre-2026-08-06 these
+    # arrived as N separate "regression" action items — 14 of them in run
+    # 20260806-011323, from one `traceFailed undefined` — and a later loop's
+    # triage had to re-derive the single cause by reading the evidence log.
+    # The 8 pg_dump* victims never even carried the compiler text: their
+    # fixtures start a cluster from the freshly built binary, so the same break
+    # surfaced as "start failed; process exited early".
+    tp_build_boundary = build_error_line(tp_log)
+    tp_fail_lines = top_fail_lines(tp_log)
+    tp_unattributable = []
+
     top_fails = sorted(
         n for n, s in tp_results.items() if s[0] == "FAIL" and "/" not in n
     )
     for name in top_fails:
         subj = f"testport/{name}"
+        if tp_build_boundary is not None and tp_fail_lines.get(name, -1) >= tp_build_boundary:
+            tp_unattributable.append(name)
+            continue
         exp = is_expected(name)
         subfails = sorted(n for n, s in tp_results.items() if s[0] == "FAIL" and n.startswith(name + "/"))
         what = f"testport {name} FAILed"
@@ -279,6 +358,34 @@ def analyze(run_dir, repo_root, run_id):
             it.known_fails.append({"subject": subj, "case_id": exp, "what": what})
         else:
             it.add_regression(subj, what, f"go test -v -run '^{name}$' ./internal/testport/", ev("testport/go-test.log"))
+
+    if tp_unattributable:
+        # Attribute the break to a tree change when the stage stamps prove one,
+        # rather than inferring it — meta.json has recorded `dirty=<n>` since
+        # the batch existed and nothing ever acted on it.
+        fps = stage_fingerprints(run_dir)
+        try:
+            start_fp = (json.loads(read_file(os.path.join(run_dir, "meta.json")) or "{}")
+                        .get("source_fp") or "").strip()
+        except ValueError:
+            start_fp = ""
+        tp_fp = fps.get("testport", "")
+        if start_fp and tp_fp and tp_fp != start_fp:
+            cause = (f"the working tree MUTATED mid-run (preflight fp {start_fp}, "
+                     f"testport fp {tp_fp}) — a concurrent edit/commit, not a code regression")
+        else:
+            cause = ("the working tree is built live, so a concurrent edit/commit is the "
+                     "likely cause; no stage fingerprints available to confirm")
+        it.build_kills.append({
+            "kind": "infra",
+            "subject": "testport/build-broke-mid-stage",
+            "what": (f"the goopg build broke DURING the testport stage — {len(tp_unattributable)} "
+                     f"test(s) after the break are UNATTRIBUTABLE, not regressions "
+                     f"({', '.join(tp_unattributable[:6])}"
+                     f"{', …' if len(tp_unattributable) > 6 else ''}); {cause}"),
+            "repro": "go build ./... at the run's recorded sha (clean sha ⇒ nothing to fix in the code)",
+            "evidence": ev("testport/go-test.log"),
+        })
 
     # regress mismatch-skip join (design 02 §A): a diverging regress case is a
     # t.Skip("deferred: output mismatch...") — join against the baseline CSV.
@@ -637,7 +744,11 @@ def main():
     gating = it.regressions + it.perf_drastic
     if gating:
         status = "fail"
-    elif it.resource_kills:
+    elif it.resource_kills or it.build_kills:
+        # A build that broke mid-run says nothing about the code (the recorded
+        # sha builds clean); like a resource kill it makes the run unreadable,
+        # not red. It must NOT be gating, or every night that overlaps an
+        # active Ralph loop reports a regression the tree does not have.
         status = "inconclusive"
     else:
         status = "pass"
@@ -671,6 +782,7 @@ def main():
         "regressions": it.regressions,
         "perf_drastic": it.perf_drastic,
         "resource_kills": it.resource_kills,
+        "build_kills": it.build_kills,
         "known_fails": it.known_fails,
         "promotable": it.promotable,
         "notes": it.notes,
@@ -742,6 +854,7 @@ def main():
         ("Promotable", it.promotable, lambda r: f"- {r['case_id']} PASSED ({r['test']}) — consider promotion (ci/design/02 §D)"),
         ("Known-fails hit", it.known_fails, lambda r: f"- {r['subject']} ({r.get('case_id','')})"),
         ("Resource kills", it.resource_kills, lambda r: f"- stage {r['stage']}{(' pkg=' + r['pkg']) if r.get('pkg') else ''} — check cgroup OOM via dmesg/journalctl (design 03 §C); {r['evidence']}"),
+        ("Build broke mid-run", it.build_kills, lambda r: f"- **{r['subject']}** — {r['what']}  \n  evidence: {r['evidence']}"),
         ("Notes", it.notes, lambda r: f"- {r}"),
     ):
         if rows:
@@ -752,7 +865,9 @@ def main():
         f.write("\n".join(md) + "\n")
 
     # ---- action-items.md (stable path; design 07 §A)
-    items = gating[:]
+    # build_kills ride in action-items.md (the harness defect is real and worth
+    # fixing) but are NOT in `gating`, so they cannot turn the run red.
+    items = gating + it.build_kills
     ai = [
         "# NIGHTLY ACTION ITEMS — generated by ci/batch, DO NOT EDIT",
         f"run: {run_id}   sha: {summary['sha'][:12]}   status: {status}",
@@ -800,6 +915,7 @@ def main():
         "status": status,
         "regressions": len(it.regressions),
         "perf_drastic": len(it.perf_drastic),
+        "build_kills": len(it.build_kills),
         "stages": {k: v["status"] for k, v in stages.items()},
         "durations": {k: v["elapsed_s"] for k, v in stages.items()},
     }
@@ -807,7 +923,8 @@ def main():
         f.write(json.dumps(hist) + "\n")
 
     print(f"STATUS={status} regressions={len(it.regressions)} perf_drastic={len(it.perf_drastic)} "
-          f"resource_kills={len(it.resource_kills)} promotable={len(it.promotable)}")
+          f"resource_kills={len(it.resource_kills)} build_kills={len(it.build_kills)} "
+          f"promotable={len(it.promotable)}")
     sys.exit(0 if status == "pass" else (3 if status == "inconclusive" else 2))
 
 

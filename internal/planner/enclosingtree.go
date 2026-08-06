@@ -80,11 +80,12 @@ package planner
 //     `translateToLayout` and `assertColumnRefsWithinSchema`'s `scopeIgnore`
 //     policy draw.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06)
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
-// no production tree carries the tag, `splicedSearchedRoot` never finds one, and
-// both assertions below are unreachable outside `enclosingtree_test.go`.
+// `GOOPG_PGSHAPED_DP` is ON by default and `planSelect` calls the search, so
+// production trees DO carry the tag, `splicedSearchedRoot` finds them, and both
+// assertions below run on real plans rather than only in
+// `enclosingtree_test.go`.
 
 import "fmt"
 

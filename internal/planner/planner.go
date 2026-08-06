@@ -132,6 +132,11 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	// impossible rather than a maintenance obligation on every pass.
 	// See join_hash_keys.go.
 	fillJoinHashKeys(node)
+	// M0127-P5.9-c: the search boundary's coordinate map, re-checked on the
+	// FINISHED tree. Every producer-side guard in createplanroot.go runs before
+	// the passes that turned out to be able to rewrite the map; this one runs
+	// after all of them. A no-op boolean test with `GOOPG_PGSHAPED_DP` off.
+	assertSearchedBoundariesIntact(node)
 	return node, nil
 }
 
@@ -346,6 +351,32 @@ type resolveContext struct {
 	// row (fewer columns than the input) and resolving the outer column
 	// ref at its input-schema index fails with "out of range". M0097-0035.
 	havingAgg *aggregateSurface
+
+	// joinlist is what `deconstruct_jointree` decided about this FROM
+	// clause: which of its relations belong to ONE join search problem and
+	// which are subproblems planned separately (collapse.go, 03 §6). Its
+	// leaf indices subscript `bindings` directly, which is why it is
+	// computed in `planFromClause`/`planFromRangeVars` beside the bindings
+	// rather than re-derived later from a parse tree that is no longer in
+	// scope — those are the only two places where the FROM order and the
+	// binding order are the same walk.
+	//
+	// M0127-P5.8: nil in every context that is not a FROM clause (subquery
+	// scopes, ON CONFLICT's `excluded`, DML targets), and read by
+	// `tryPGShapedJoinSearch` (joinsearchseam.go) since P5.9-b.
+	joinlist joinlist
+
+	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
+	// will actually be fetched, which decides whether a fast-start path may
+	// win at the search root (`finalPath`) and whether one is worth keeping
+	// at all (`RelOptInfo.ConsiderStartup`).
+	//
+	// It lives on the context for the same reason `joinlist` does — the join
+	// search runs from `tryBushyDP` / `runJoinSearchBelowPinned`, neither of
+	// which is handed the statement — and it is set where PG sets it, before
+	// the first rel exists. 0 (fetch everything) in every context that is not
+	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
+	tupleFraction float64
 }
 
 type rangeBinding struct {
@@ -1087,6 +1118,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			// M0127-P5.9-b: `root->tuple_fraction`, fixed before the join
+			// search below builds its first rel — upstream's order
+			// (`preprocess_limit` in `subquery_planner`, before
+			// `query_planner`). The `*Limit` node is built ~350 lines below,
+			// far too late to influence which path the search selects, so the
+			// fraction is derived from the unresolved clauses; see
+			// `searchTupleFraction` for why they are not resolved early.
+			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-
@@ -1962,7 +2001,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	if root == nil {
 		return nil, nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	return root, newResolveContext(bindings, root.Output()), nil
+	rctx := newResolveContext(bindings, root.Output())
+	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
+	// walk that numbered these bindings is still the current walk (collapse.go).
+	// Inert until P5.9 — nothing reads `joinlist` yet.
+	rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	return root, rctx, nil
 }
 
 func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *resolveContext, error) {
@@ -2004,7 +2048,12 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	if root == nil {
 		return nil, nil, &PlanError{Pos: 0, Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	return root, newResolveContext(bindings, root.Output()), nil
+	rctx := newResolveContext(bindings, root.Output())
+	// M0127-P5.8: a JOIN-free FROM list is one search problem of `len(from)`
+	// relations whatever the collapse GUCs say — upstream's unconditional
+	// `sub_members <= 1` merge (collapse.go, 03 §6).
+	rctx.joinlist = deconstructRangeVars(len(bindings))
+	return root, rctx, nil
 }
 
 // nodeReferencesOuter reports whether the planned right-side FROM item
@@ -9665,7 +9714,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			}
 		}
 		if len(matches) == 0 {
-			return nil, nil, &PlanError{Pos: star.Pos(), Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", star.Table)}
+			return nil, nil, errorMissingRTEPlan(star.Pos(), star.Schema, star.Table, ctx)
 		}
 		if len(matches) > 1 {
 			return nil, nil, &PlanError{Pos: star.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", star.Table)}
@@ -11467,8 +11516,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if b.blockOriginalName && b.alias != "" &&
 				strings.EqualFold(x.Table, b.table.Name) {
 				deferredBlockErr = &PlanError{
-					Pos:  x.Pos(),
-					Code: "42712",
+					Pos: x.Pos(),
+					// 42P01, not 42712: upstream raises this from
+					// errorMissingRTE() with ERRCODE_UNDEFINED_TABLE.
+					Code: "42P01",
 					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q",
 						b.table.Name),
 					Hint: fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
@@ -11671,6 +11722,45 @@ func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
 		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
 	}
 	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
+}
+
+// errorMissingRTEPlan is the planner-side twin of the analyzer's
+// errorMissingRTE (internal/analyzer/analyzer.go), which ports
+// postgres/src/backend/parser/parse_relation.c:errorMissingRTE(). Both must
+// change together: the analyzer runs first for statements it covers, but the
+// planner is the only error source for the paths it does not (rewritten
+// sub-plans, RETURNING scopes built after analysis).
+//
+// A refname that names a FROM entry the user renamed with an alias gets the
+// "invalid reference" message plus a HINT naming the alias; anything else gets
+// the bald "missing FROM-clause entry". Both are 42P01, per upstream's
+// ERRCODE_UNDEFINED_TABLE.
+func errorMissingRTEPlan(pos int, schema, table string, ctx *resolveContext) *PlanError {
+	for cur := ctx; cur != nil; cur = cur.parent {
+		for _, b := range cur.bindings {
+			// qualifiedOnly = the ON CONFLICT `excluded` pseudo-table
+			// (a keyword, not a user-chosen rename); notReferenceable =
+			// present for diagnostics only, never a real FROM entry.
+			if b.qualifiedOnly || b.notReferenceable || b.alias == "" || b.table == nil {
+				continue
+			}
+			if schema != "" && !strings.EqualFold(schema, b.table.Schema) {
+				continue
+			}
+			if strings.EqualFold(b.alias, b.table.Name) {
+				continue
+			}
+			if strings.EqualFold(table, b.table.Name) {
+				return &PlanError{
+					Pos:     pos,
+					Code:    "42P01",
+					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q", table),
+					Hint:    fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
+				}
+			}
+		}
+	}
+	return &PlanError{Pos: pos, Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", table)}
 }
 
 func bindingMatchesRelation(b rangeBinding, table, schema string) bool {

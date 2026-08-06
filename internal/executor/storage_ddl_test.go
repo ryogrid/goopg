@@ -541,6 +541,22 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		t.Fatalf("NewPool: %v", err)
 	}
 	cat := catalog.NewInMemory()
+	// M0127-P5.9: install the live block-count reader the server installs
+	// (`initdb.Open`, open.go), so a fixture table with rows on disk plans
+	// like one. Without it `RelationBlocks` answers "no estimate" and the
+	// relation-size fallback (M0125-0003) — goopg's `estimate_rel_size` —
+	// cannot run, so every never-ANALYZEd fixture relation is sized at the
+	// 1-row floor. That was invisible while the default enumerator promoted
+	// operators by RULE; the PG-shaped search picks them by COST, so a blind
+	// fixture silently plans nested loops over thousands of rows and the test
+	// measures the fixture rather than the engine.
+	cat.SetRelationSizer(func(rfn storage.RelFileNode) (int64, bool) {
+		n, err := pool.NBlocks(rfn)
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	})
 	mgrMVCC := mvcc.NewManager()
 	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
 	if err != nil {

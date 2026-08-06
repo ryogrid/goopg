@@ -12,6 +12,7 @@ Run: python3 ci/batch/lib/test_summarize.py
 """
 
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -106,6 +107,101 @@ class AnalyzeUnitsClassificationTest(unittest.TestCase):
         self.assertEqual(len(it.regressions), 0)
         rk_pkgs = {r["pkg"] for r in it.resource_kills}
         self.assertEqual(rk_pkgs, {"internal/amcheck", "cmd/goopg"})
+
+
+SYNTHETIC_TESTPORT_LOG = """\
+=== RUN   TestPort_IsolationEvalPlanQual
+    isolation_port_test.go:88: output mismatch at line 1027
+--- FAIL: TestPort_IsolationEvalPlanQual (21.56s)
+=== RUN   TestPort_PgBasebackup010StreamWAL
+--- PASS: TestPort_PgBasebackup010StreamWAL (15.36s)
+=== RUN   TestPort_PgBasebackup010FetchWAL
+    pgbasebackup_port_test.go:316: init: init failed: # github.com/goopg/goopg/internal/planner
+        internal/planner/joinsearchlevel.go:109:6: s.traceFailed undefined (type *searchCtx has no field or method traceFailed)
+--- FAIL: TestPort_PgBasebackup010FetchWAL (0.18s)
+=== RUN   TestPort_PgDumpConnectionSetup
+    pgdump_connsetup_test.go:397: start failed; process exited early (see /tmp/x/data/cluster.log)
+--- FAIL: TestPort_PgDumpConnectionSetup (0.45s)
+FAIL
+FAIL\tgithub.com/goopg/goopg/internal/testport\t1079.0s
+"""
+
+
+class MidRunBuildBreakTest(unittest.TestCase):
+    """Guards AI-20260806-011323-002..-015: ONE mid-run compile error became 14
+    separate "regression" action items, because the nightly builds the LIVE
+    working tree and a Ralph loop committed between preflight's `make build`
+    (which passed) and the testport stage.
+    """
+
+    def _run_analyze(self, log_text, meta=None, stage_fps=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = os.path.join(tmp, "20260101-000000")
+            os.makedirs(os.path.join(run_dir, "testport"))
+            os.makedirs(os.path.join(run_dir, "stages"))
+            with open(os.path.join(run_dir, "testport", "go-test.log"), "w") as f:
+                f.write(log_text)
+            with open(os.path.join(run_dir, "stages", "testport.status"), "w") as f:
+                f.write("fail 1079\n")
+            if meta is not None:
+                with open(os.path.join(run_dir, "meta.json"), "w") as f:
+                    json.dump(meta, f)
+            for stage, fp in (stage_fps or {}).items():
+                with open(os.path.join(run_dir, "stages", f"{stage}.fp"), "w") as f:
+                    f.write(fp + "\n")
+            it, *_ = summarize.analyze(run_dir, tmp, "20260101-000000")
+            return it
+
+    def test_boundary_is_the_first_compile_error(self):
+        idx = summarize.build_error_line(SYNTHETIC_TESTPORT_LOG)
+        lines = SYNTHETIC_TESTPORT_LOG.splitlines()
+        self.assertIsNotNone(idx)
+        self.assertIn("init: init failed:", lines[idx])
+        # A plain test-log line (`file.go:LINE:`, one number) must not look
+        # like a compile error (`file.go:LINE:COL:`) — otherwise every stage
+        # with normal t.Errorf output would collapse to "build broke".
+        self.assertIsNone(summarize.build_error_line(
+            "    isolation_port_test.go:88: output mismatch at line 1027\n"))
+
+    def test_post_boundary_fails_collapse_and_pre_boundary_survives(self):
+        it = self._run_analyze(SYNTHETIC_TESTPORT_LOG)
+        subjects = {r["subject"] for r in it.regressions}
+        # The genuine six-night regression failed BEFORE the break — it is a
+        # real result and must still be reported.
+        self.assertIn("testport/TestPort_IsolationEvalPlanQual", subjects)
+        # Both post-break victims collapse, including the pg_dump-shaped one
+        # whose body carries no compiler text at all ("process exited early").
+        self.assertNotIn("testport/TestPort_PgBasebackup010FetchWAL", subjects)
+        self.assertNotIn("testport/TestPort_PgDumpConnectionSetup", subjects)
+        self.assertEqual(len(it.build_kills), 1)
+        what = it.build_kills[0]["what"]
+        self.assertIn("2 test(s)", what)
+        self.assertIn("TestPort_PgDumpConnectionSetup", what)
+
+    def test_fingerprint_drift_names_the_cause(self):
+        it = self._run_analyze(
+            SYNTHETIC_TESTPORT_LOG,
+            meta={"source_fp": "aaaaaaaaaaaaaaaa"},
+            stage_fps={"testport": "bbbbbbbbbbbbbbbb"},
+        )
+        self.assertIn("MUTATED mid-run", it.build_kills[0]["what"])
+
+    def test_no_build_error_leaves_every_fail_reported(self):
+        clean = SYNTHETIC_TESTPORT_LOG.replace(
+            "    pgbasebackup_port_test.go:316: init: init failed: # github.com/goopg/goopg/internal/planner\n"
+            "        internal/planner/joinsearchlevel.go:109:6: s.traceFailed undefined (type *searchCtx has no field or method traceFailed)\n",
+            "    pgbasebackup_port_test.go:316: WAL segment never arrived\n",
+        )
+        it = self._run_analyze(clean)
+        self.assertEqual(it.build_kills, [])
+        self.assertEqual(
+            {r["subject"] for r in it.regressions},
+            {
+                "testport/TestPort_IsolationEvalPlanQual",
+                "testport/TestPort_PgBasebackup010FetchWAL",
+                "testport/TestPort_PgDumpConnectionSetup",
+            },
+        )
 
 
 if __name__ == "__main__":

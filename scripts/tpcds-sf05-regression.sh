@@ -91,6 +91,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
+# planner_flags_body — the generated provenance stamp (M0127-P5.9-q); see
+# sf05_planner_flags_line below.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/planner-flags.sh"
 
 # Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF05_DATA_DIR,
 # SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
@@ -614,12 +618,35 @@ sf05_status_delta_channel() {
 #
 # A plan diff between two captures taken under different flags is meaningless,
 # which is why the capture stamps this too and not just the sweep.
+#
+# GOOPG_PGSHAPED_DP/_COLLAPSE joined the line at M0127-P5.9 run 3, when this
+# gate was first used as an ARM of a planner A/B (09 §3 clause 4). Without them
+# a flag-ON sweep is byte-indistinguishable from a flag-OFF one — precisely the
+# failure this function exists to prevent, one flag generation later.
+#
+# M0127-P5.9-n (2026-08-06) then walked straight into the RELSIZE defect the
+# paragraph above describes, one flag generation later still. The DP flip
+# (`b92582fb`) made `GOOPG_PGSHAPED_DP` default-ON with `=0` as the opt-out, and
+# the `unset(off)` label survived it — so every artefact captured between the
+# flip and this fix (`sweep-20260806-022814.txt`, `plans-20260806-022814.txt`)
+# states the OPPOSITE of the regime it measured. The label is now `unset(on)`.
+# Same commit retired `GOOPG_COST_DRIVEN_JOINORDER` entirely: no code reads it
+# any more (`internal/planner/bushy.go:13`), so printing it as a live flag
+# invited a later loop to A/B a variable the binary cannot see. It is stamped
+# `retired` rather than dropped, because dropping it would make old artefacts
+# that DO carry it look like they were captured by this version of the gate.
+#
+# M0127-P5.9-q (2026-08-06) took the labels away from this printf. Fixing the
+# same defect by hand for the second time is evidence that hand-written labels
+# do not survive a flip, so the list and its unset-labels now come from
+# `scripts/planner-flags.env`, GENERATED from the Go defaults
+# (internal/planner/flaglabels.go) and guarded by a unit test. Adding a
+# plan-shaping flag in Go now stamps it here with no edit to this file — which
+# is how the six flags this function never named (EXISTS_TO_ANY, UNNEST_PREDP,
+# INDEXKEY_HARVEST, NLI_COSTGATE, HASH_OUTER_JOIN, MHJ_PACKING_OFF) joined the
+# line in the same commit.
 sf05_planner_flags_line() {
-    printf '# planner-flags: GOOPG_RELSIZE_FALLBACK=%s GOOPG_COST_DRIVEN_JOINORDER=%s GOOPG_MEMOIZE=%s GOOPG_PARALLEL=%s\n' \
-        "${GOOPG_RELSIZE_FALLBACK:-unset(2)}" \
-        "${GOOPG_COST_DRIVEN_JOINORDER:-unset(off)}" \
-        "${GOOPG_MEMOIZE:-unset(on)}" \
-        "${GOOPG_PARALLEL:-unset(on)}"
+    printf '# planner-flags: %s\n' "$(planner_flags_body)"
 }
 
 # sf05_plan_baseline — the capture this run is diffed against: the newest

@@ -52,8 +52,14 @@ func init() {
 	// D6.3a escape hatch: GOOPG_NLI_COSTGATE=legacy restores the
 	// stats-blind semi/anti gate for one stage (deleted in R2-8 if
 	// unused).
-	nliCostGateLegacy.Store(os.Getenv("GOOPG_NLI_COSTGATE") == "legacy")
+	nliCostGateLegacy.Store(nliCostGateLegacyFromEnv(os.Getenv("GOOPG_NLI_COSTGATE")))
 }
+
+// nliCostGateLegacyFromEnv is the escape hatch's polarity, factored out of init
+// for the provenance table (flaglabels.go); see memoizeFromEnv. Unlike the
+// boolean kill switches this one is a MODE — the label spells `legacy` or
+// `current`, not on/off.
+func nliCostGateLegacyFromEnv(v string) bool { return v == "legacy" }
 
 // SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
 // only API; the production toggle path is the GUC mentioned above.
@@ -95,6 +101,14 @@ func rewriteJoinsToNLI(n Node, cat catalog.Catalog) Node {
 func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 	if n == nil {
 		return nil
+	}
+	// M0127-P5.9-b (08 §3): the PG-shaped search already chose the join
+	// METHOD, NLI included (`joinpathsnli.go`), and costed the choice against
+	// every alternative. Re-deciding it here with the legacy pass would both
+	// override that choice and rebuild the join's keys in FROM-cumulative
+	// coordinates a searched join does not use (03 §10).
+	if isSearchedTree(n) {
+		return n
 	}
 	switch x := n.(type) {
 	case *Join:

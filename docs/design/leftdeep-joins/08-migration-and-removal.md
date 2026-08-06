@@ -26,7 +26,7 @@ measure per commit).
 | **S2** | E4 (multi-column keys, planner+executor) | plan-affecting → plan-snapshot re-baseline in same commit | spotcheck + SF0.5 + Q78-class degeneracy probe; `reselectDegenerateHashKeys` deleted same commit |
 | **S3** | [06](06-hash-spill-and-memory.md) hybrid hash spill | `work_mem`-honouring ON; `GOOPG_HASH_SPILL=off` escape | Q21 SF1 completes under cgroup cap; no-spill plans byte-identical results |
 | **S4** | [07](07-other-join-operators.md) §§2–4 (streaming merge, hash outer-fill, Materialize+NL) | per-operator, plan-affecting parts follow S5's flag | regress-port outer-join files; SF0.5 |
-| **S5** | the new PG-shaped DP ([03](03-join-search-pg-dp.md) — all three `join_search_one_level` phases, including the bushy phase of §4.3) + cost binding ([04](04-cost-and-cardinality.md)) | `GOOPG_PGSHAPED_DP` — OFF while soaking, flipped ON as the acceptance event; replaces `GOOPG_COST_DRIVEN_JOINORDER` (retired). The collapse-limit wiring ([03](03-join-search-pg-dp.md) §6) gets its **own sub-flag** (`GOOPG_PGSHAPED_COLLAPSE`) and soaks separately: it changes *which statements enter the search at all* (explicit-JOIN flattening), and coupling that population change to the enumerator swap would make S5 regressions unattributable | the full [09](09-verification-and-acceptance.md) bar, including Q9 — run once with collapse OFF (comma-FROM population only), then with collapse ON |
+| **S5** | the new PG-shaped DP ([03](03-join-search-pg-dp.md) — all three `join_search_one_level` phases, including the bushy phase of §4.3) + cost binding ([04](04-cost-and-cardinality.md)) | **FLIPPED ON 2026-08-06 (M0127-P5.9)** — `GOOPG_PGSHAPED_DP` was OFF while soaking and is now the default; it survives as a KILL-SWITCH, where only the exact string `0` restores `tryBushyDP` (unset means ON), which is this row's rollback story until S7. `GOOPG_COST_DRIVEN_JOINORDER` is retired: the env hook is deleted, while `costDrivenJoinOrder` and `SetCostDrivenJoinOrder` stay with the old DP until S7 deletes it. Evidence: [09](09-verification-and-acceptance.md) §3.10 (run 4, five clauses), §3.13 (clause 6 measured) and §3.14 (the flip, and the 24 unit tests it moved). The collapse-ON pass of this row's gate RAN on 2026-08-06 (M0127-P5.9-m, [09](09-verification-and-acceptance.md) §3.18): every clause is green — TPC-H 24/24 MATCH at 0.984×, DS05 `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`, and a one-variable plan A/B of `queries=99 same=99 changed=0` — and the COLLAPSE flip is a **NO-GO** on that evidence, because the same run measured the flag to be inert end to end: `ctx.joinlist` is read only after `tryPGShapedJoinSearch`'s preconditions pass, and `extractScans` (`bushy.go:261`) descends `JoinTypeCross` only, so every statement the flag acts on is declined by the seam before its joinlist is consulted (enumeration trace: Q72's eleven-way explicit-JOIN level emits no trace in either regime). The gate is therefore run-but-NOT-discharged; it becomes discharge-able when the seam admits an INNER chain. The collapse-limit wiring ([03](03-join-search-pg-dp.md) §6) gets its **own sub-flag** (`GOOPG_PGSHAPED_COLLAPSE`) and soaks separately: it changes *which statements enter the search at all* (explicit-JOIN flattening), and coupling that population change to the enumerator swap would make S5 regressions unattributable | the full [09](09-verification-and-acceptance.md) bar, including Q9 — run once with collapse OFF (comma-FROM population only), then with collapse ON |
 | **S6** | E5 (compiled key/residual eval) | none (behaviour-neutral) | units + parity spot-diffs on expression corpora |
 | **S7** | deletion (§4) | none — deletions only after S5 default-ON has survived ≥ 1 clean nightly cycle | nightly green; grep-clean inventory below |
 
@@ -45,6 +45,28 @@ M0126-0011.
   the current pipeline **including** `rewriteJoinsToNLI` and the qual-
   placement passes — those passes must not double-fire on searched subtrees
   (searched roots are tagged; the passes skip tagged subtrees).
+  **Landed (M0127-P5.9-b):** seven skips, all keyed on `isSearchedTree`. Three
+  RENUMBER a tree and were done at P5.5-f-ii-a (`buildBindingsPosMap`'s
+  collector, `applyJoinTreePosMap`, `reconcileNLILayout`); four REWRITE one and
+  are done here (`pushOneConjunct` — hence `pushPredicatesIntoCrossJoins`,
+  `walkRewriteNLI` — hence `rewriteJoinsToNLI`, `rewriteMultiWayChain`,
+  `rewriteScanInputsWithSingleTablePredicates`). The rule they enforce is about
+  COORDINATES, not duplication: each addresses a join tree in the statement's
+  FROM-cumulative space, and only a searched tree's ROOT is in that space
+  ([03](03-join-search-pg-dp.md) §10).
+  **Amended (M0127-P5.9-c): EIGHT skips.** The eighth is `remapTopProjection`
+  (bushy.go), and its omission is what made the P5.9 acceptance run a no-go —
+  see [09](09-verification-and-acceptance.md) §3.2. It belongs to neither of the
+  two families above, which is why the P5.9-b audit missed it: it does not
+  rewrite a join tree and it does not renumber one, it renumbers the WRAPPERS
+  above one. It nonetheless reaches into a searched subtree, because it locates
+  the tree to derive its posMap from by walking down past `*Project` / `*Sort`
+  wrappers — and the search boundary is a `*Project` (or, for an elided
+  boundary over a sorted root, a `*Sort`). The `collect`-side guard cannot
+  help: it is never asked about the root. The generalised rule is therefore
+  **any pass that DESCENDS THROUGH a node kind the boundary can be, not only a
+  pass that rewrites one**; the standing tripwire for the class is
+  `assertSearchedBoundariesIntact` at the tail of `Plan()`.
 - `reconcileNLILayout` (`planner.go:99`) keeps running until S7 confirms no
   searched plan needs it (the canonical relid-ordered layouts of
   [02](02-plan-shape-contract.md) §3 should make it a no-op on searched

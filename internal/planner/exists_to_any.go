@@ -76,8 +76,12 @@ import (
 var existsToAnyOn atomic.Bool
 
 func init() {
-	existsToAnyOn.Store(os.Getenv("GOOPG_EXISTS_TO_ANY") != "off")
+	existsToAnyOn.Store(existsToAnyFromEnv(os.Getenv("GOOPG_EXISTS_TO_ANY")))
 }
+
+// existsToAnyFromEnv is the kill-switch's polarity, factored out of init for
+// the provenance table (flaglabels.go); see memoizeFromEnv.
+func existsToAnyFromEnv(v string) bool { return v != "off" }
 
 // SetExistsToAnyEnabled flips the EXISTS→ANY conversion. Test-only API;
 // the operational switch is the environment variable read at init.

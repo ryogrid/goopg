@@ -124,12 +124,26 @@ Close:
    close the leader's own tree
 ```
 
-Three details that are easy to get wrong:
+Four details that are easy to get wrong:
 
 - **`Close` must drain before joining.** A worker blocked on a channel send
   will never observe cancellation, so cancelling and then joining without
   draining deadlocks. This is the classic Go shutdown bug and it is worth an
   explicit test.
+- **A drain needs a closer, so `Open` must start one on every exit path.**
+  The drain above ends only when someone closes the channel, and that someone
+  is a goroutine `Open` starts. Starting it at the *end* of `Open` — after the
+  leader's own child is built and opened — means every error return in between
+  hands `Close` a live channel with no closer, and the backend parks in the
+  drain forever at 0 % CPU with the statement's real error never delivered.
+  That was a live wedge for two loops
+  ([leftdeep-joins/09](../leftdeep-joins/09-verification-and-acceptance.md)
+  §5.20, TPC-H Q17). The invariant: **once the channel exists, a closer for it
+  exists on every path out of `Open`** — started after the last worker launch
+  (earlier and a worker could send on a closed channel, which panics a
+  goroutine `serveConn`'s recover does not cover), and idempotent.
+  `gatherMergeOp` gets this for free: each worker closes its own channel with a
+  `defer`, so the closer cannot outlive-or-precede the goroutine that owns it.
 - **`Close` must join on *every* path** — early `LIMIT`, error, cancellation.
   Worker lifetime is strictly nested inside the statement
   ([03](03-concurrency-substrate.md) §6.1) because the statement `mctx` is

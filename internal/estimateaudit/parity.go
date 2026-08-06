@@ -319,16 +319,21 @@ func uncomparedQueries(goopg, reference []QueryReport) []string {
 	return out
 }
 
-// attachRels computes every node's joinrel identity from the printed plan.
+// planParents reconstructs the plan tree from indentation alone and returns
+// each node's parent index (-1 for the root).
 //
-// The tree is reconstructed from indentation alone, which is why the depth
-// STEP must never be assumed: goopg indents two spaces per level and upstream
-// six, so the rule is "strictly deeper than mine, before the next node at my
-// depth or shallower, is my descendant" rather than any arithmetic on depth.
-func attachRels(nodes []Node) {
-	if len(nodes) == 0 {
-		return
-	}
+// The depth STEP must never be assumed: goopg indents two spaces per level and
+// upstream six, so the rule is "strictly deeper than mine, before the next node
+// at my depth or shallower, is my descendant" rather than any arithmetic on
+// depth.
+//
+// It is a named function rather than a loop inside attachRels because the spine
+// channel (spine.go) needs the same tree for a different question — attachRels
+// asks which LEAVES are underneath a node, and clause 6 asks how the node's two
+// CHILDREN partition them. Two reconstructions of the same tree from the same
+// text that disagreed would be the sibling-divergence shape this package's
+// parity gate exists to catch.
+func planParents(nodes []Node) []int {
 	parent := make([]int, len(nodes))
 	var stack []int
 	for i := range nodes {
@@ -341,6 +346,15 @@ func attachRels(nodes []Node) {
 		}
 		stack = append(stack, i)
 	}
+	return parent
+}
+
+// attachRels computes every node's joinrel identity from the printed plan.
+func attachRels(nodes []Node) {
+	if len(nodes) == 0 {
+		return
+	}
+	parent := planParents(nodes)
 	// Children always follow their parent in the printed order, so one
 	// backwards pass propagates every leaf to every ancestor.
 	for i := len(nodes) - 1; i >= 0; i-- {

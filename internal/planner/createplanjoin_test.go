@@ -3,8 +3,10 @@ package planner
 // M0127-P5.5-e-i — the coordinate carrier and the hash-join `createPlan` arm
 // (createplanjoin.go).
 //
-// The arm is inert in production (`GOOPG_PGSHAPED_DP` OFF, no `planSelect`
-// caller), so these tests are its only observer. What they pin is the one thing
+// The arm is LIVE in production since M0127-P5.9 (2026-08-06):
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so these
+// tests are no longer its only observer — the planner bar (SPOT/DS05) sees it
+// too. They remain the sharpest one. What they pin is the one thing
 // a join arm can get wrong while still producing a runnable plan: the
 // COORDINATES. Every fixture below deliberately puts the outer side SECOND in
 // binding order, so a translation that silently did nothing would still build a

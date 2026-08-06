@@ -94,6 +94,8 @@ where c.c_current_addr_sk = ca.ca_address_sk
   and ca.ca_state in ('IL','TX','ME')`
 
 func TestMHJResidualInListPushedToMemberScan(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	SetMHJPackingEnabled(true)
 	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)
@@ -163,6 +165,8 @@ func TestMHJResidualInListPushedToMemberScan(t *testing.T) {
 // with the subtree embedded) must not AND the same conjunct in twice —
 // pushConjunctIntoSubtree's exprEqual guard owns this.
 func TestMHJResidualPushIdempotent(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	SetMHJPackingEnabled(true)
 	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)
@@ -187,6 +191,8 @@ func TestMHJResidualPushIdempotent(t *testing.T) {
 // A conjunct spanning two member tables is not a restriction clause and
 // must stay in the residual — attribution requires a UNIQUE table.
 func TestMHJResidualCrossTableConjunctStaysPut(t *testing.T) {
+	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
+	useLegacyEnumerator(t)
 	SetMHJPackingEnabled(true)
 	defer SetMHJPackingEnabled(false)
 	cat := mhjResidualTestCatalog(t)

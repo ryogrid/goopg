@@ -77,11 +77,11 @@ package planner
 // returns wrong rows. That is the class this whole milestone exists to remove
 // from the planner, so it fails loudly here.
 //
-// # Still inert
+// # Live since M0127-P5.9 (2026-08-06)
 //
-// `GOOPG_PGSHAPED_DP` is OFF and nothing calls the search from `planSelect`, so
-// no production tree carries the tag and all three skips are unreachable
-// outside `searchedtree_test.go`.
+// `GOOPG_PGSHAPED_DP` defaults ON and `planSelect` calls the search, so
+// production trees DO carry the tag and all three skips are reachable on real
+// plans — the same correction enclosingtree.go's header already carries.
 
 import "fmt"
 
