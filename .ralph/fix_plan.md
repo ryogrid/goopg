@@ -1373,9 +1373,61 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       **0.18 s standalone at HEAD**, so the trigger is a whole-suite
       resource/state condition, not a per-case defect. A wedge now costs 1
       action item instead of 9, but a nightly containing one is still `fail`.
-      Ledger row 2026-08-06. Resume point: instrument the suite to dump
-      `pg_stat_activity` + goroutine state when a case crosses ~60 s, and check
-      whether the preceding case leaks a backend/lock.
+      Ledger row 2026-08-06.
+      **↳ 2026-08-06 (eighth S7-gate loop) — TWO OF THE ITEM'S OWN HYPOTHESES
+      ARE REFUTED, and the suite now collects its own evidence.**
+      (a) **Not host overload, not a GC-thrashing server.** Run
+      `20260806-191958`'s 232 cases sum to **298.5 s INCLUDING the 120 s
+      wedge** — 178.5 s for the other 231, *faster* than the 302 s the same
+      suite takes on this workstation with no wedge at all. Every case before
+      and after ran at normal speed, so nothing degrades gradually; one case
+      stops dead while the server stays healthy.
+      (b) **A single statement hangs past its own 5 s `statement_timeout`**
+      (`ExecuteSQL` sets one per session), so the wait is on a path that never
+      observes the statement deadline — that is the defect to find.
+      (c) The reason it was never diagnosable: the harness kept NOTHING.
+      `framework.RegressResult` carries only a rationale string, psql's partial
+      output died with the killed client, and nobody looked at the server while
+      it was stuck — a wedge reached the nightly as one line.
+      **Landed: the wedge probe**
+      (`internal/testport/regress_wedge_probe_test.go`). At 60 s (half the case
+      deadline) a case captures, while the backend is still parked:
+      `SELECT 1` liveness (one stuck backend vs. dead postmaster),
+      `pg_stat_activity` (WHICH statement + wait event), `pg_locks`, a
+      `debug=2` goroutine dump filtered to goroutines blocked >1 minute (WHERE
+      in the server it is parked), and RSS from `/proc`; `ExecuteSQL` also
+      persists the killed client's partial output. Bounded summary goes through
+      `t.Log` because the nightly collects only `testport/go-test.log`.
+      Design **ci/design/02 §A "Wedge-probe rule"**. Guards:
+      `TestPort_RegressWedgeProbeNamesTheStuckStatement` (live, non-vacuous —
+      it failed on the `pg_stat_activity` assertion before the `::text` fix) and
+      `TestRegressWedgeProbeStuckFilter`. Full `TestPort_RegressSuite` PASS at
+      194.9 s with the probe wired in (no wedge locally, no overhead).
+      **Discovery en route:** goopg's `pg_stat_activity` emits an EMPTY `pid`
+      for internal sessions (3 of 4 rows on an idle cluster); an `int4` column
+      carrying `""` fails any Go driver's parse for the whole query
+      (`pq: strconv.ParseInt`), while psql hides it as a blank. Real PG always
+      reports a pid per row. Separate ledger row 2026-08-06.
+      **Resume point (unchanged goal, now instrumented): run
+      `make nightly-batch`; if it wedges, read the probe's `pg_stat_activity` +
+      long-blocked-goroutine sections out of `testport/go-test.log` — they name
+      the statement and the server frame directly. If it does NOT wedge, the
+      remaining question is only whether the S7 cycle is clean.**
+- [ ] **`pg_stat_activity` emits an EMPTY `pid` for internal sessions, so no Go
+      driver can read the view at all.** NEW 2026-08-06 (found while
+      instrumenting the wedge probe, not filed by a nightly). On an idle
+      cluster 3 of 4 rows carry `pid=''` and an empty `query`; an `int4` column
+      carrying `""` fails the driver's parse for the WHOLE result set
+      (`pq: strconv.ParseInt: parsing "": invalid syntax`), so a client gets
+      zero rows rather than partial data. psql hides it by rendering a blank
+      cell, which is why it survived. Real PG never emits a row without a pid
+      (`postgres/src/backend/utils/activity/backend_status.c`
+      `pgstat_read_current_status` / `pg_stat_get_activity`; background
+      processes appear with their own pids and are told apart by
+      `backend_type`). Fix in `internal/initdb/pg_stat_activity_view.go`
+      `registerPgStatActivityView`: give internal sessions a real pid, or stop
+      emitting placeholder rows that have no upstream counterpart. Ledger row
+      2026-08-06. FILED, NOT SELECTED per the 2026-07-28(b) amendment.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -10125,6 +10177,31 @@ the gate is still not met: the wedge itself is unexplained (`multirangetypes`
 runs in 0.18 s standalone at HEAD ⇒ whole-suite resource/state condition) and
 a nightly containing one is `fail`. Next S7 attempt: work the wedge trigger
 (M-NIGHTLY, resume point in that item), then re-run `make nightly-batch`.
+
+**Amended 2026-08-06 (eighth S7-gate loop) — the wedge's two named causes are
+REFUTED and the suite now self-instruments.** Arithmetic on run
+`20260806-191958` kills both: its 232 cases sum to 298.5 s *including* the
+120 s wedge, so the other 231 took 178.5 s — faster than the 302 s the same
+suite takes on this workstation with no wedge at all. There is no host
+overload and no GC-thrashing server; one statement stops dead while everything
+around it stays fast, and it does so past its own 5 s `statement_timeout`, so
+the wait is on a path that never observes the statement deadline. The reason
+seven loops could not name it is that the harness kept no evidence: psql's
+partial output died with the killed client and nothing looked at the server
+while it was stuck. Landed the **wedge probe** — at 60 s a case captures
+liveness, `pg_stat_activity`, `pg_locks`, a goroutine dump filtered to
+goroutines blocked >1 minute, and RSS, summarised into `t.Log` (the nightly
+collects only `testport/go-test.log`). Guards
+`TestPort_RegressWedgeProbeNamesTheStuckStatement` (live, non-vacuous) and
+`TestRegressWedgeProbeStuckFilter`; full `TestPort_RegressSuite` PASS at
+194.9 s with the probe wired in. Design **ci/design/02 §A "Wedge-probe
+rule"**; 2 ledger rows (the second: `pg_stat_activity` emits an empty `pid`
+for internal sessions, which breaks every Go-driver read of the view). **The
+trigger is still unidentified — this is instrumentation, not a fix.** Next S7
+attempt: run `make nightly-batch`; if it wedges, the probe block in the
+testport log names the statement and the server frame directly, and that is
+the fix's starting point; if it does not wedge, the S7 cycle may already be
+clean.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

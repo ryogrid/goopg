@@ -118,9 +118,71 @@ doubling, so it cannot pass vacuously (verified: removing the guard fails it on
 all five tables).
 
 This bounds the blast radius of a wedge to the wedged case itself; **what wedges
-the cluster is a separate, still-open question** — `multirangetypes` completes
-in 0.18 s standalone at HEAD, so the trigger is a whole-suite resource/state
-condition, tracked as its own M-NIGHTLY item and deferral-ledger row.
+the cluster is a separate, still-open question**, addressed by the wedge-probe
+rule below.
+
+#### Wedge-probe rule (added 2026-08-06)
+
+A wedge is nondeterministic, rare, moves between cases, and happens on an
+unattended host — so the harness must collect its own evidence at the moment it
+happens, or the investigation never starts. Two facts from run
+`20260806-191958` set the requirements:
+
+- **It is not host overload and not a GC-thrashing server** (the two causes the
+  action item names). That run's 232 cases sum to **298.5 s including the
+  120 s wedge**, i.e. **178.5 s for the other 231** — faster than the 302 s the
+  same suite took on the dev workstation with no wedge at all. The server was
+  healthy immediately before and after; only one case stopped.
+- **A single statement hangs past its own 5 s `statement_timeout`** (ExecuteSQL
+  sets one on the session). The wait is therefore on a path that never observes
+  the statement deadline — which is the defect to find, not a symptom of load.
+
+Requirement: when a case crosses **`regressWedgeProbeAfter` (60 s, half the
+per-case deadline)** the suite captures live state *while the backend is still
+stuck*, and emits a bounded summary through `t.Log` — the nightly collects only
+`testport/go-test.log`, so anything written elsewhere is invisible to triage.
+`internal/testport/regress_wedge_probe_test.go` captures five things, chosen
+because together they separate the surviving hypotheses:
+
+| section | discriminates |
+|---|---|
+| `SELECT 1` liveness | one stuck backend vs. a dead/saturated postmaster |
+| `pg_stat_activity` | *which* statement is stuck, and its wait event |
+| `pg_locks` | a lock wait (and its holder) vs. a non-lock hang |
+| goroutine dump (`debug=2`), filtered to goroutines blocked **>1 minute** | *where* in the server it is parked: lock, channel, mutex, or a spin that never checks `ctx` |
+| server RSS from `/proc` | keeps or kills the GC-thrash hypothesis quantitatively |
+
+Plus `psql-partial.out`: `ExecuteSQL` writes the killed client's partial output
+to the bundle, because `framework.RegressResult` carries only a rationale string
+and the tail of that output names the statement the server never answered.
+Bundles land under `tmp/regress-wedge/<case>/` (override
+`GOOPG_REGRESS_WEDGE_DIR`).
+
+Two implementation constraints, both load-bearing:
+
+- **The cluster gets its own pprof address** (`reserveLoopbackPort` +
+  `GOOPG_PPROF_ADDR`). The server's built-in default is a fixed
+  `127.0.0.1:6060`; when a bench cluster or peer test already holds it the bind
+  fails at `Debug` level and the endpoint silently does not exist — precisely
+  when the dump is needed.
+- **Every probe query casts its columns to `text`.** goopg's
+  `pg_stat_activity` emits an *empty* value for `pid` on internal sessions (3 of
+  4 rows on an idle cluster), and an `int4` column carrying `""` fails a Go
+  driver's parse for the whole query (`pq: strconv.ParseInt: parsing "":
+  invalid syntax`). psql hides it by rendering a blank. The compat gap itself is
+  a deferral-ledger row (2026-08-06).
+
+Guard: `TestPort_RegressWedgeProbeNamesTheStuckStatement` runs the probe against
+a cluster deliberately holding a long statement and asserts it names that
+statement, reaches a dump containing real `internal/server` frames, and reads
+the RSS; `TestRegressWedgeProbeStuckFilter` covers the >1-minute selection on a
+synthetic dump, which a short live guard cannot reach. Non-vacuity is
+demonstrated, not assumed: before the `::text` casts the guard failed on exactly
+the `pg_stat_activity` assertion.
+
+The probe collects evidence; it does not fix the wedge. The wedge trigger stays
+an open M-NIGHTLY item with a deferral-ledger row, and its resume point is now
+"read the probe sections from the first nightly that wedges".
 
 **Dedup rule (from `05-duplicate-management.md`): the Go `testport` entry
 point is the ONLY execution path.** The batch never additionally drives
