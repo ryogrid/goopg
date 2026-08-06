@@ -259,11 +259,6 @@ func planShapeString(n Node) string {
 				" p=" + exprShape(x.Predicate) + "\n")
 			walk(x.Left, d+1)
 			walk(x.Right, d+1)
-		case *MultiHashJoin:
-			b.WriteString("MHJ\n")
-			for _, tbl := range x.Tables {
-				walk(tbl, d+1)
-			}
 		case *SeqScan:
 			b.WriteString("SeqScan " + x.Table.Name + "\n")
 		case *IndexScan:

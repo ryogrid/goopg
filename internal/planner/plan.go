@@ -1321,29 +1321,13 @@ type Sort struct {
 func (n *Sort) Pos() int       { return n.pos }
 func (n *Sort) Output() Schema { return n.Child.Output() }
 
-// MultiHashKey is one equijoin edge in a MultiHashJoin node.
-type MultiHashKey struct {
-	LeftTable  int // index into Tables[]
-	LeftCol    int // column index in left table's schema
-	RightTable int
-	RightCol   int
-}
-
-// MultiHashJoin replaces a chain of N binary hash joins with a single
-// operator that builds N-1 hash tables from small tables and probes
-// one fact table via chain-lookups. Eliminates N-1 intermediate
-// result sets. See docs/design/0038-0001-multi-way-hash-join.md.
-type MultiHashJoin struct {
-	pos        int
-	Tables     []Node         // N child plan nodes (SeqScans or simple)
-	Keys       []MultiHashKey // N-1 equijoin edges forming a chain
-	ProbeTable int            // which child drives the probe loop
-	Filters    []Expr         // residual WHERE filters to apply
-	schema     Schema         // concatenated child schemas
-}
-
-func (n *MultiHashJoin) Pos() int       { return n.pos }
-func (n *MultiHashJoin) Output() Schema { return n.schema }
+// `MultiHashKey`/`MultiHashJoin` lived here until M0127-P6.2 deleted them
+// (leftdeep-joins 08 §4). The N-way packed node had no PG counterpart: PG
+// expresses the same shape as a left-deep cascade of binary `HashJoin`s, and
+// once the PG-shaped search became the only search (P5.9) nothing constructed
+// an MHJ any more — `mhjPackingEnabled` had been default-off since M0126-0005
+// and `generateMultiHashJoinPath` never had a production caller. Historical
+// design: docs/design/0038-0001-multi-way-hash-join.md (superseded).
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {

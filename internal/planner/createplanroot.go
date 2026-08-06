@@ -369,8 +369,6 @@ func boundaryWalkChildren(n Node) []Node {
 		return []Node{x.Left, x.Right}
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
-	case *MultiHashJoin:
-		return x.Tables
 	case *Update:
 		return []Node{x.Child}
 	case *Delete:

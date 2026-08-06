@@ -216,10 +216,6 @@ func visit(n Node, fn func(Node) bool) {
 		visit(x.Child, fn)
 	case *Limit:
 		visit(x.Child, fn)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			visit(t, fn)
-		}
 	}
 }
 
@@ -258,12 +254,6 @@ func containsJoinType(node Node, want JoinType) bool {
 		return containsJoinType(n.Child, want)
 	case *Limit:
 		return containsJoinType(n.Child, want)
-	case *MultiHashJoin:
-		for _, t := range n.Tables {
-			if containsJoinType(t, want) {
-				return true
-			}
-		}
 	}
 	return false
 }

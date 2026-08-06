@@ -49,8 +49,9 @@ type joinOp struct {
 	// int64-representable, lazyIntHash replaces lazyHash so the probe hot
 	// path (e.g. Q9's ~6M lineitem rows) hashes an int64 instead of
 	// allocating a datumKey string per row — the GC-heavy cost that made
-	// the binary hash cascade slow where MultiHashJoin's int64 keys are
-	// fast (multi_hash_join.go M0043-0003).
+	// the binary hash cascade slow where the packed MultiHashJoin's int64
+	// keys were fast (M0043-0003; the packed node went at M0127-P6.2, the
+	// fast path it motivated is this one).
 	//
 	// M0127-P0.3 (05 §4, stage E3): exactly ONE of the two maps is built.
 	// lazyHashIsInt is decided BEFORE the build from the plan's key types

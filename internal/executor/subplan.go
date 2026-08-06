@@ -226,13 +226,6 @@ func classifySubPlan(n planner.Node, ctx *Context) (kind int, cacheable bool) {
 			}
 			walk(x.Left)
 			walk(x.Right)
-		case *planner.MultiHashJoin:
-			if kind == rescanReOpen {
-				kind = rescanCloseOpen
-			}
-			for _, t := range x.Tables {
-				walk(t)
-			}
 		case *planner.NestedLoopIndexJoin:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen

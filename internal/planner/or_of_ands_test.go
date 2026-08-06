@@ -71,9 +71,6 @@ func containsCrossJoin(n Node) bool {
 		return containsCrossJoin(x.Child)
 	case *Limit:
 		return containsCrossJoin(x.Child)
-	case *MultiHashJoin:
-		// MHJ is by construction equijoin-only; never a CROSS.
-		return false
 	}
 	return false
 }
@@ -83,9 +80,6 @@ func containsHashJoin(n Node) bool {
 		return false
 	}
 	if j, ok := n.(*Join); ok && j.Algo == JoinAlgoHash {
-		return true
-	}
-	if _, ok := n.(*MultiHashJoin); ok {
 		return true
 	}
 	switch x := n.(type) {
@@ -122,12 +116,6 @@ func walkPlanString(n Node, depth int) string {
 		s := indent + fmt.Sprintf("Join(t=%d/a=%d)\n", x.Type, x.Algo)
 		s += walkPlanString(x.Left, depth+1)
 		s += walkPlanString(x.Right, depth+1)
-		return s
-	case *MultiHashJoin:
-		s := indent + "MultiHashJoin\n"
-		for _, t := range x.Tables {
-			s += walkPlanString(t, depth+1)
-		}
 		return s
 	case *Filter:
 		return indent + "Filter\n" + walkPlanString(x.Child, depth+1)

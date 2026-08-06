@@ -136,8 +136,6 @@ func planChildren(n Node) []Node {
 		return []Node{x.Left, x.Right}
 	case *SetOp:
 		return []Node{x.Left, x.Right}
-	case *MultiHashJoin:
-		return x.Tables
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
 	}

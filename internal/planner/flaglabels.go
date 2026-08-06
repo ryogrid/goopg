@@ -56,10 +56,10 @@ type FlagProvenance struct {
 }
 
 // onOff spells a boolean flag's resolved state. It describes the VARIABLE, never
-// the feature — so an inverted switch such as GOOPG_MHJ_PACKING_OFF resolves to
-// `off` ("the off-switch is not engaged"), the same way GOOPG_PGSHAPED_COLLAPSE
-// does. Reading it the other way would make one row of the stamp mean the
-// opposite of its neighbours.
+// the feature — so an inverted switch such as GOOPG_PGSHAPED_COLLAPSE resolves
+// to `off` ("the off-switch is not engaged"). Reading it the other way would
+// make one row of the stamp mean the opposite of its neighbours. (The pattern's
+// original exemplar, GOOPG_MHJ_PACKING_OFF, was retired by M0127-P6.2.)
 func onOff(on bool) string {
 	if on {
 		return "on"
@@ -85,7 +85,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
-	"GOOPG_MHJ_PACKING_OFF":   func(v string) string { return onOff(mhjPackingOffFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -128,6 +127,10 @@ var flagProvenanceOrder = []string{
 // from this version of the gate.
 var flagProvenanceRetired = map[string]string{
 	"GOOPG_COST_DRIVEN_JOINORDER": "M0127-P5.9",
+	// M0126-0005's measurement-only switch for forcing MultiHashJoin packing
+	// off independently of join-order. M0127-P6.2 deleted the packer, so the
+	// off-switch has nothing left to turn off.
+	"GOOPG_MHJ_PACKING_OFF": "M0127-P6.2",
 	// M0125-0040's grouping-sets source-sharing knob. M0125-0048 replaced the
 	// UNION-ALL expansion the knob existed to make cheaper with a single-pass
 	// grouping-sets aggregate, so there is no source to share and nothing

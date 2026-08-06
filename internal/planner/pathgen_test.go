@@ -132,22 +132,9 @@ func TestNLIPathRuinousForLargeOuter(t *testing.T) {
 	}
 }
 
-func TestGenerateMultiHashJoinPath(t *testing.T) {
-	cp := defaultCostParams()
-	probe := relWithScanCost(RelSet(0b1000), 6000000, 60000) // driving lineitem
-	d1 := relWithScanCost(RelSet(0b0001), 1500000, 15000)    // orders
-	d2 := relWithScanCost(RelSet(0b0010), 10000, 100)        // supplier
-	d3 := relWithScanCost(RelSet(0b0100), 25, 1)             // nation
-	joinRel := newRelOptInfo(RelSet(0b1111), 6000000, 100)
-	generateMultiHashJoinPath(joinRel, probe, []*RelOptInfo{d1, d2, d3}, cp)
-	setCheapest(joinRel)
-	if joinRel.CheapestTotal == nil || joinRel.CheapestTotal.Kind != PathMultiHash {
-		t.Fatalf("expected a MultiHashJoin path")
-	}
-	if len(joinRel.CheapestTotal.Children) != 4 {
-		t.Fatalf("MHJ path should carry the probe + 3 dims, got %d children", len(joinRel.CheapestTotal.Children))
-	}
-}
+// TestGenerateMultiHashJoinPath was removed with `generateMultiHashJoinPath`
+// at M0127-P6.2. The constructor never had a production caller, so the test
+// was the only thing that ever built a PathMultiHash.
 
 func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	cp := defaultCostParams()

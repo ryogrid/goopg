@@ -1180,23 +1180,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		node = unnestSubqueriesInPlan(node)
 	}
 
-	// Rewrite chains of ≥3 hash-joined tables into a single
-	// MultiHashJoin node.  Column indices are remapped inside
-	// collectMultiHashTables using scanForCol, so parent
-	// expressions (incl. unnest keys) stay aligned.
+	// The MultiHashJoin packing pass (`rewriteMultiWayChain`, guarded by
+	// `mhjPackingEnabled`) ran here until M0127-P6.2 deleted it (08 §4). PG has
+	// no MHJ, so the search's binary tree is now final and the
+	// order-then-rewrite mismatch that regressed Q9 cannot recur.
 	//
-	// Cost-model ch. 12 §3: the cost-driven planner drops MultiHashJoin
-	// (PG has none) so the DP's PG-shaped binary tree is final and the
-	// order-then-rewrite mismatch that regressed Q9 cannot recur. When
-	// mhjPackingEnabled is off, this packing pass is skipped. MHJ stays
-	// a valid executor operator; only the cost path forgoes it.
-	if mhjPackingEnabled {
-		node = rewriteMultiWayChain(node, cat)
-	}
-	// M0054-0006a-pre: after MultiHashJoin construction, walk the
-	// plan tree and route single-table constant-RHS equality
-	// predicates from `*Filter` wrappers and `mh.Filters` into the
-	// matching `*SeqScan` input by rewriting it to `*IndexScan`.
+	// M0054-0006a-pre: walk the plan tree and route single-table
+	// constant-RHS equality predicates from `*Filter` wrappers into
+	// the matching `*SeqScan` input by rewriting it to `*IndexScan`.
 	// Closes the M0054-0003d Q8 case
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
@@ -1208,32 +1199,26 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
 	node = rewriteJoinsToNLI(node, cat)
-	node = remapExprRefsToMHJ(node)
+	node = remapColumnRefsAfterRewrite(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).
 	if len(ctx.bindings) > 0 {
 		remapWithBindings(node, ctx.bindings)
 	}
-	// RC-1b (TPC-DS Q47/Q50): route single-source conjuncts from
-	// mh.Filters onto their Tables[i] only AFTER the remap above, when
-	// ColumnRef indices and Tables offsets finally share the MHJ-output
-	// coordinate space. Running this inside
-	// rewriteScanInputsWithSingleTablePredicates (pre-remap) attributed
-	// by FROM-cumulative indices against OID-sorted offsets and pushed
-	// predicates onto the WRONG scan — a date_dim OR-predicate landed on
-	// store, silently zeroing the result. The pass also validates every
-	// ref positionally by name and declines on any mismatch, so a path
-	// where the remap did not run degrades to post-join evaluation
-	// (slower, never wrong). Design: docs/design/tpcds-round2-fixes §3.4.
-	pushSingleSourceFiltersAfterRemap(node)
+	// RC-1b's `pushSingleSourceFiltersAfterRemap` ran here — after the remap,
+	// so that ColumnRef indices and table offsets finally shared one
+	// coordinate space — until M0127-P6.2 deleted it with the node it pushed
+	// into. Its position in this pipeline is the surviving lesson: the
+	// binary-Join sibling below is pinned to the same point for the same
+	// reason (see its own note).
 	// M0125-0004 (TPC-DS Q75): the binary-join sibling of the pass
 	// above. Copy a residual conjunct that references exactly one input
 	// of an INNER Join onto that input, so a single-relation restriction
 	// is applied before the side-mixed residual runs — PG's
 	// distribute_restrictinfo_to_rels placement. Pinned HERE, after the
-	// last applyJoinTreePosMap (inside remapWithBindings): that walker
-	// remaps n.Filters and returns without recursing into n.Tables[i],
-	// so a conjunct pushed before it would never be revisited.
+	// last applyJoinTreePosMap (inside remapWithBindings): a conjunct pushed
+	// before that walker runs would land in the wrong coordinate space, and
+	// (in the packed-node shape RC-1b hit) would never be revisited at all.
 	// Design: docs/design/0125-0004-q75-join-residual-evaluation-order.md.
 	pushSingleSideQualsIntoInnerJoinInputs(node)
 

@@ -124,10 +124,6 @@ func hasSemiOrAntiOfType(node Node, want JoinType) bool {
 			walk(x.Child)
 		case *Distinct:
 			walk(x.Child)
-		case *MultiHashJoin:
-			for _, tbl := range x.Tables {
-				walk(tbl)
-			}
 		}
 	}
 	walk(node)
@@ -177,10 +173,6 @@ func firstSemiOrAntiPredicate(node Node) Expr {
 			walk(x.Child)
 		case *Distinct:
 			walk(x.Child)
-		case *MultiHashJoin:
-			for _, tbl := range x.Tables {
-				walk(tbl)
-			}
 		}
 	}
 	walk(node)
@@ -237,10 +229,6 @@ func selfProbeIndexScan(node Node) *IndexScan {
 			walk(x.Child)
 		case *Distinct:
 			walk(x.Child)
-		case *MultiHashJoin:
-			for _, tbl := range x.Tables {
-				walk(tbl)
-			}
 		}
 	}
 	walk(node)
@@ -317,10 +305,6 @@ func findFirstAggregate(node Node) *Aggregate {
 			walk(x.Child)
 		case *Distinct:
 			walk(x.Child)
-		case *MultiHashJoin:
-			for _, tbl := range x.Tables {
-				walk(tbl)
-			}
 		}
 	}
 	walk(node)

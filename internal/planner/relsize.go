@@ -18,8 +18,8 @@ import (
 // The staging exists because a single flag switching all three consumers at
 // once produces one number and no attribution (design §D4):
 //
-//	1 — EstimateRows / the MultiHashJoin probe-side choice. Shape-neutral for
-//	    TPC-H; the cheap first cut. IMPLEMENTED.
+//	1 — EstimateRows (and, until M0127-P6.2, the MultiHashJoin probe-side
+//	    choice). Shape-neutral for TPC-H; the cheap first cut. IMPLEMENTED.
 //	2 — + the bushy DP seed (rowCounts[i]). Where round 4's statistics
 //	    regressions live, because this is the first consumer that moves the
 //	    JOIN ORDER rather than a single node's choice. IMPLEMENTED.

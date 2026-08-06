@@ -141,10 +141,6 @@ func fillJoinHashKeysNodes(n Node) {
 	case *NestedLoopIndexJoin:
 		fillJoinHashKeysNodes(x.Outer)
 		fillJoinHashKeysNodes(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			fillJoinHashKeysNodes(t)
-		}
 	case *CTEScan:
 		fillJoinHashKeysNodes(x.Child)
 	case *CTEDMLPrefix:

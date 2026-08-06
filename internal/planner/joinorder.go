@@ -55,8 +55,8 @@
 // has no row count for that item and never will, so the pass declined
 // and the source order survived — CROSS and all. `tryBushyDP` declines
 // on the same lists for an unrelated reason (its leaf whitelist admits
-// only SeqScan / IndexScan / MultiHashJoin, because buildBindingsPosMap
-// keys on scan identity), so nothing reordered them at all. That is the
+// only SeqScan / IndexScan, because buildBindingsPosMap keys on scan
+// identity), so nothing reordered them at all. That is the
 // mechanism behind M0125-0026's class C1: TPC-DS Q30, Q64 and Q81 each
 // join a WITH reference to base relations and each got a Cartesian
 // product with the equi-predicate demoted to a Filter above it.

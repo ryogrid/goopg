@@ -857,10 +857,6 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 			walk(x.Child)
 		case *DistinctOn:
 			walk(x.Child)
-		case *MultiHashJoin:
-			for _, tbl := range x.Tables {
-				walk(tbl)
-			}
 		case *LockRows:
 			walk(x.Child)
 		case *OrdinalityWrap:
@@ -1136,13 +1132,6 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		if n.EndBlock != nil {
 			walkExprTree(n.EndBlock, visit)
-		}
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			walkPlanExprs(tbl, visit)
-		}
-		for _, f := range n.Filters {
-			walkExprTree(f, visit)
 		}
 	case *RecursiveUnion:
 		walkPlanExprs(n.Anchor, visit)
@@ -1591,28 +1580,6 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			return &Filter{pos: n.pos, Child: seq, Predicate: combineAnd(conds)}, nil
 		}
 		return seq, nil
-	case *MultiHashJoin:
-		c := *n
-		c.Tables = make([]Node, len(n.Tables))
-		for i, tbl := range n.Tables {
-			cloned, err := clonePlanReplacingOuter(tbl, replace)
-			if err != nil {
-				return nil, err
-			}
-			c.Tables[i] = cloned
-		}
-		c.Filters = nil
-		if n.Filters != nil {
-			c.Filters = make([]Expr, len(n.Filters))
-			for i, f := range n.Filters {
-				c.Filters[i] = cloneExprReplacingOuter(f, replace)
-			}
-		}
-		c.Keys = make([]MultiHashKey, len(n.Keys))
-		for i, k := range n.Keys {
-			c.Keys[i] = k
-		}
-		return &c, nil
 	case *Values:
 		c := *n
 		c.Rows = make([][]Expr, len(n.Rows))
@@ -1967,12 +1934,6 @@ func findFilterContainingSubquery(node Node, target *SubqueryExpr) (*Filter, Exp
 		return findFilterContainingSubquery(n.Child, target)
 	case *Limit:
 		return findFilterContainingSubquery(n.Child, target)
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			if f, c := findFilterContainingSubquery(tbl, target); f != nil {
-				return f, c
-			}
-		}
 	}
 	return nil, nil
 }
@@ -3060,12 +3021,6 @@ func findFilterContainingInExpr(node Node, target *InExpr) (*Filter, Expr) {
 		return findFilterContainingInExpr(n.Child, target)
 	case *Limit:
 		return findFilterContainingInExpr(n.Child, target)
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			if f, c := findFilterContainingInExpr(tbl, target); f != nil {
-				return f, c
-			}
-		}
 	}
 	return nil, nil
 }
@@ -3630,10 +3585,6 @@ func planCloneSupported(node Node) bool {
 			walk(x.Child)
 		case *SeqScan:
 		case *IndexScan:
-		case *MultiHashJoin:
-			for _, t := range x.Tables {
-				walk(t)
-			}
 		case *Values:
 		case *CTEScan:
 			// M0125-0041 sibling of clonePlanReplacingOuter's CTEScan
@@ -4123,12 +4074,6 @@ func findFilterContainingExistsExpr(node Node, target *ExistsExpr) (*Filter, Exp
 		return findFilterContainingExistsExpr(n.Child, target)
 	case *Limit:
 		return findFilterContainingExistsExpr(n.Child, target)
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			if f, c := findFilterContainingExistsExpr(tbl, target); f != nil {
-				return f, c
-			}
-		}
 	}
 	return nil, nil
 }

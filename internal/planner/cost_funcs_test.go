@@ -212,21 +212,6 @@ func TestIndexProbeCost(t *testing.T) {
 	}
 }
 
-func TestMultiHashJoinCost_BuildIsStartup(t *testing.T) {
-	cp := defaultCostParams()
-	probe := Cost{Startup: 0, Total: 1000}
-	dims := []Cost{{Total: 10}, {Total: 5}}
-	dimRows := []float64{100, 50}
-	c := multiHashJoinCost(cp, probe, 100000, dims, dimRows, 100000)
-	// build = (0.0025+0.01)*100 + 10 + (0.0025+0.01)*50 + 5 = 1.25+10 + 0.625+5 = 16.875
-	if !approx(c.Startup, 16.875) {
-		t.Fatalf("MHJ startup = %v, want 16.875 (all dim builds)", c.Startup)
-	}
-	if c.Total <= c.Startup {
-		t.Fatalf("MHJ total must exceed the build-only startup by the probe pass")
-	}
-}
-
 // TestCostParamsMatchConfigDefaults is the drift guard: the PG constants baked
 // into defaultCostParams must equal the boot values config/defaults.go registers,
 // so the cost model and SHOW cannot silently diverge (memory: GUC defaults must

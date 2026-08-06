@@ -111,16 +111,6 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 			return false
 		}
 		return lowerTraverseNode(x.Outer, fx) && lowerTraverseNode(x.Inner, fx)
-	case *MultiHashJoin:
-		if !rewriteAll(x.Filters) {
-			return false
-		}
-		for _, t := range x.Tables {
-			if !lowerTraverseNode(t, fx) {
-				return false
-			}
-		}
-		return true
 	case *Values:
 		for _, row := range x.Rows {
 			if !rewriteAll(row) {

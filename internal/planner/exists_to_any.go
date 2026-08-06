@@ -135,15 +135,6 @@ func rewriteExistsToAnyNode(node Node) {
 		if n.Predicate != nil && n.Outer != nil && n.Inner != nil {
 			n.Predicate = rewriteExistsToAnyQual(n.Predicate, joinedRowSchema(n.Outer, n.Inner), false)
 		}
-	case *MultiHashJoin:
-		for _, tbl := range n.Tables {
-			rewriteExistsToAnyNode(tbl)
-		}
-		for i, f := range n.Filters {
-			if f != nil {
-				n.Filters[i] = rewriteExistsToAnyQual(f, n.Output(), false)
-			}
-		}
 	case *Project:
 		rewriteExistsToAnyNode(n.Child)
 	case *Aggregate:
@@ -339,8 +330,9 @@ func existsToAny(ex *ExistsExpr, hostRow Schema) *InExpr {
 
 	// Re-resolve the OUTER side against the row this qual is actually
 	// evaluated against. OuterColumnRef.Index was set by the binder
-	// against FROM-cumulative offsets, and MultiHashJoin packing re-sorts
-	// its output schema by OID while treating a sublink body as opaque —
+	// against FROM-cumulative offsets, and a later layout rewrite can re-sort
+	// the output schema while treating a sublink body as opaque (until
+	// M0127-P6.2 the concrete case was MultiHashJoin packing's OID sort) —
 	// so the index inside the body can be stale by the time this pass
 	// runs, and reading the stale slot yields a value set that matches
 	// nothing (TPC-DS Q35: 0 rows instead of 100, found by probe before
@@ -477,7 +469,7 @@ func resolveHostColumnIdx(hostRow Schema, name string, idx int, srcIdx int16) (i
 // unnest (an OR-ed pair, e.g.) keeps whatever Index the binder assigned
 // against a partial join layout during planning. Unlike an unnested single
 // IN, nothing routes it through a Name-based rebind afterwards, so a later
-// MultiHashJoin OID re-sort or bindings remap can leave it stale: right
+// layout rewrite or bindings remap can leave it stale: right
 // Name, wrong column, silently — EXPLAIN still prints the Name, and
 // compareEq's cross-type coercion answers instead of raising when the stale
 // slot lands on a column of a different type. Skip the sublink's own Plan

@@ -300,7 +300,7 @@ func TestInnerJoinQualPushReachesCrossJoinInput(t *testing.T) {
 // REVERSAL of D2's leaf scoping. This test formerly asserted the
 // opposite ("DeclinesOnBaseRelationLeaf"), on the reasoning that
 // "pushing filters toward base-relation leaves is exactly what
-// shouldAttachBeforeMHJ withholds behind its SmallDimension guard,
+// shouldAttachLocalFiltersBeforeSearch withholds behind its SmallDimension guard,
 // whose comment records that without it Slice A regresses Q8 / Q21 from
 // PASS to CANCEL".
 //

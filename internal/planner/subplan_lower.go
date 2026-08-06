@@ -358,8 +358,6 @@ func lowerNodeChildren(n Node) []Node {
 		return []Node{x.Left, x.Right}
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
-	case *MultiHashJoin:
-		return x.Tables
 	}
 	return nil
 }

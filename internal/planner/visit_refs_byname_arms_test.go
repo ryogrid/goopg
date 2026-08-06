@@ -13,12 +13,12 @@ package planner
 //	return allMatched
 //
 // A conjunct built entirely from kinds the old 7-arm switch did not
-// enumerate produced ZERO callbacks and returned a vacuous `true`. For
-// extraInScans that vacuous true ADMITS the conjunct into
-// MultiHashJoin.Filters, where it is evaluated against the MHJ output
-// row; for the two pushdown guards it authorises a push. So this
-// walker's fail-open is not a missed optimisation, it is the admission
-// side of a wrong-answer path.
+// enumerate produced ZERO callbacks and returned a vacuous `true`. For the
+// pushdown guards that vacuous true authorises a push. (The original exemplar
+// was `extraInScans`, where it ADMITTED the conjunct into
+// MultiHashJoin.Filters to be evaluated against a row the value was not on;
+// both went at M0127-P6.2.) So this walker's fail-open is not a missed
+// optimisation, it is the admission side of a wrong-answer path.
 //
 // The conversion therefore changes the SIGNATURE, not just the arm set:
 // the second result says whether the name test COVERED the expression.
@@ -31,7 +31,7 @@ package planner
 //  1. newly-collected names — the 25-of-32 kinds the old switch skipped;
 //  2. the totality result — every kind that cannot be certified by a
 //     name test, stated per kind rather than derived;
-//  3. the consumer inversion — extraInScans / allColumnRefNamesInScope /
+//  3. the consumer inversion — allColumnRefNamesInScope /
 //     pushOuterQualsIntoLaterals must now REJECT what they used to
 //     admit vacuously.
 
@@ -61,7 +61,7 @@ func byNameSaw(e Expr, want string) bool {
 }
 
 // byNameScan builds a SeqScan whose Output() carries the given column
-// names — the only thing extraInScans and collectScanOutputNames read.
+// names — the only thing collectScanOutputNames reads.
 func byNameScan(table string, cols ...string) *SeqScan {
 	s := &SeqScan{Table: &catalog.Table{Name: table}}
 	for _, c := range cols {
@@ -272,85 +272,12 @@ func TestVisitColumnRefsByName_InnerPlanNamesAreNotCollected(t *testing.T) {
 // and whose opaque part is invisible to the old walker.
 // ---------------------------------------------------------------------
 
-func TestExtraInScans_RejectsOpaqueConjunct(t *testing.T) {
-	scans := []Node{byNameScan("t", "a", "b")}
-
-	cases := []struct {
-		name string
-		expr Expr
-	}{
-		// Every named ref matches; the subquery does not.
-		{"SubqueryExpr", &BinaryOp{Op: parser.OpEq,
-			Left:  &ColumnRef{Index: 0, Name: "a"},
-			Right: &SubqueryExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "z"}}}}},
-		{"ExistsExpr", &ExistsExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "z"}}}},
-		{"ArraySubqueryExpr", &BinaryOp{Op: parser.OpEq,
-			Left:  &ColumnRef{Index: 0, Name: "a"},
-			Right: &ArraySubqueryExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "z"}}}}},
-		// A correlation to a scope ABOVE the MHJ: the column does not
-		// exist on the MHJ output row at all.
-		{"OuterColumnRef", &BinaryOp{Op: parser.OpEq,
-			Left:  &ColumnRef{Index: 0, Name: "a"},
-			Right: &OuterColumnRef{Level: 1, Index: 2, Name: "a"}}},
-		// ctid is injected by seqScanOp into the SCANNED row's slot,
-		// which is not the MHJ output row.
-		{"CTIDExpr", &BinaryOp{Op: parser.OpEq,
-			Left: &ColumnRef{Index: 0, Name: "a"}, Right: &CTIDExpr{}}},
-		// An unnamed ref cannot be checked by a name test.
-		{"unnamed ColumnRef", &BinaryOp{Op: parser.OpEq,
-			Left: &ColumnRef{Index: 0, Name: "a"}, Right: &ColumnRef{Index: 9}}},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if extraInScans(c.expr, scans) {
-				t.Errorf("extraInScans admitted a conjunct containing %s into "+
-					"MultiHashJoin.Filters; it is evaluated on the MHJ output row "+
-					"where that value does not exist", c.name)
-			}
-		})
-	}
-}
-
-// The admission path must still admit: a conjunct built only from named
-// refs present in the subset and from row-independent leaves is captured
-// exactly as before. Without this the inversion above could be satisfied
-// by rejecting everything.
-func TestExtraInScans_StillAdmitsCoveredConjunct(t *testing.T) {
-	scans := []Node{byNameScan("t", "a", "b"), byNameScan("u", "c")}
-
-	ok := []struct {
-		name string
-		expr Expr
-	}{
-		{"simple equality", &BinaryOp{Op: parser.OpEq,
-			Left: &ColumnRef{Index: 0, Name: "a"}, Right: &ColumnRef{Index: 2, Name: "c"}}},
-		// Newly VISIBLE and still admitted — the conversion is not a
-		// blanket decline of the 25 kinds it opened up.
-		{"IS NULL", &IsNullExpr{Operand: &ColumnRef{Index: 0, Name: "a"}}},
-		{"CASE", &CaseExpr{Whens: []CaseWhen{{
-			When: &ColumnRef{Index: 1, Name: "b"}, Then: &IntegerConst{Value: 1}}}}},
-		{"IN list", &InExpr{Operand: &ColumnRef{Index: 0, Name: "a"},
-			List: []Expr{&IntegerConst{Value: 1}, &IntegerConst{Value: 2}}}},
-		{"param", &BinaryOp{Op: parser.OpEq,
-			Left: &ColumnRef{Index: 0, Name: "a"}, Right: &ParamRef{Number: 1}}},
-	}
-	for _, c := range ok {
-		t.Run(c.name, func(t *testing.T) {
-			if !extraInScans(c.expr, scans) {
-				t.Errorf("extraInScans rejected %s, whose every named ref is in the subset", c.name)
-			}
-		})
-	}
-
-	// And a name genuinely outside the subset is still rejected — the
-	// behaviour the function was written for (TPC-H Q9's ps_partkey).
-	out := &BinaryOp{Op: parser.OpEq,
-		Left: &ColumnRef{Index: 0, Name: "a"}, Right: &ColumnRef{Index: 7, Name: "ps_partkey"}}
-	if extraInScans(out, scans) {
-		t.Error("extraInScans admitted a name absent from every scan in the subset")
-	}
-}
+// TestExtraInScans_{RejectsOpaqueConjunct,StillAdmitsCoveredConjunct} were
+// deleted at M0127-P6.2 with `extraInScans` and the MultiHashJoin.Filters
+// admission it guarded. The inversion they pinned is unchanged and is still
+// pinned by the two consumers below: a conjunct whose NAMED refs all match —
+// so the callback stream alone says "yes" — must be REJECTED when its opaque
+// part was invisible to the old walker.
 
 // allColumnRefNamesInScope guards pushOneConjunct's CROSS→INNER
 // promotion. Its fail-open is the same shape and inverts the same way.

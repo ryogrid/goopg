@@ -15,11 +15,13 @@ import "fmt"
 //  2. After the bushy DP picks a binary tree, attach
 //     each binding's local predicates to its leaf scan
 //     as a `Filter(SeqScan)` wrapper.
-//  3. Keep the existing `MultiHashJoin` skip-on-
-//     filtered-leaf behaviour — promote it to an
-//     explicit contract (Slice A).
+//  3. Keep the existing skip-on-filtered-leaf
+//     behaviour (then expressed by the
+//     `MultiHashJoin` packer, deleted at
+//     M0127-P6.2) — promote it to an explicit
+//     contract (Slice A).
 //
-// Slice B refines `shouldAttachBeforeMHJ` with reliable-
+// Slice B refines `shouldAttachLocalFiltersBeforeSearch` with reliable-
 // selectivity from the M0077-0002 `baseRelInfo` work;
 // Slice C+D continue with cost-model + anchored
 // equality synthesis. See
@@ -149,10 +151,13 @@ func conjunctIsLocalEligible(e Expr) bool {
 	return eligible && ok
 }
 
-// shouldAttachBeforeMHJ is the rollout gate per
-// design 01 §4.1. Slice A's gate has TWO clauses:
+// shouldAttachLocalFiltersBeforeSearch is the rollout gate per
+// design 01 §4.1. (It was `shouldAttachBeforeMHJ` until M0127-P6.2
+// deleted the node both clauses below were calibrated against; the
+// thresholds are unchanged, so the historical reasoning is kept
+// verbatim.) Slice A's gate has TWO clauses:
 //
-//  1. fromCount ≥ 5 — only the shape that triggers
+//  1. fromCount ≥ 5 — only the shape that triggered
 //     MultiHashJoin packing benefits from the binary-
 //     preservation barrier; smaller queries are left
 //     alone.
@@ -160,11 +165,11 @@ func conjunctIsLocalEligible(e Expr) bool {
 //     `SmallDimension`-flagged table (region / nation
 //     in TPC-H). Slice A's intended target — Q5 —
 //     leans on filtered region as its anchor; Q7 / Q8 /
-//     Q21 are 5+-table queries whose MHJ shape is
-//     beneficial and where filtered leaves push the
+//     Q21 are 5+-table queries whose MHJ shape was
+//     beneficial and where filtered leaves pushed the
 //     planner away from MHJ packing into a slower
 //     binary chain. Without the SmallDim guard, Slice A
-//     regresses Q8 / Q21 from PASS to CANCEL.
+//     regressed Q8 / Q21 from PASS to CANCEL.
 //
 // Slice B (M0077-0002) refines this with reliable-
 // selectivity from `baseRelInfo`; Slice A keeps the
@@ -178,7 +183,7 @@ func conjunctIsLocalEligible(e Expr) bool {
 // relation's size. `scans[i]` is the leaf built for `bindings[i]`; a binding
 // with no scan falls back to the catalog hint, which is what the TPC-H unit
 // fixtures set.
-func shouldAttachBeforeMHJ(bindings []rangeBinding, scans []Node) bool {
+func shouldAttachLocalFiltersBeforeSearch(bindings []rangeBinding, scans []Node) bool {
 	// Cost-driven order builds a binary Join tree (no MultiHashJoin), so a
 	// single-table restriction that isn't routed to its leaf scan here
 	// filters the full-table join output at the top instead — e.g. TPC-H

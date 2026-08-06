@@ -229,12 +229,6 @@ func firstNLI(n Node) *NestedLoopIndexJoin {
 			return r
 		}
 		return firstNLI(x.Right)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			if r := firstNLI(t); r != nil {
-				return r
-			}
-		}
 	}
 	return nil
 }
@@ -366,12 +360,6 @@ func findNLI(n Node) bool {
 		return findNLI(x.Child)
 	case *Join:
 		return findNLI(x.Left) || findNLI(x.Right)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			if findNLI(t) {
-				return true
-			}
-		}
 	}
 	return false
 }
@@ -391,8 +379,6 @@ func describePlanTree(n Node) string {
 		return "Filter(" + describePlanTree(x.Child) + ")"
 	case *Join:
 		return "Join{algo:" + joinAlgoName(x.Algo) + "}"
-	case *MultiHashJoin:
-		return "MHJ"
 	case *SeqScan:
 		return "Seq(" + x.Table.Name + ")"
 	case *IndexScan:

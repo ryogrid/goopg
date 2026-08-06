@@ -436,12 +436,10 @@ func TestSearchedTreeIsOpaqueToTheLegacyRewrites(t *testing.T) {
 		}
 	})
 
-	t.Run("rewriteMultiWayChain", func(t *testing.T) {
-		searched := build()
-		if out := rewriteMultiWayChain(searched, nil); out != searched {
-			t.Fatalf("the packer rebuilt a searched tree as %T", out)
-		}
-	})
+	// The `rewriteMultiWayChain` subtest was removed with the packer at
+	// M0127-P6.2. It asserted the seam's original motivating case: the packer
+	// must return a searched tree untouched rather than re-sorting the leaf
+	// layout the search had already costed.
 
 	t.Run("rewriteScanInputsWithSingleTablePredicates", func(t *testing.T) {
 		searched := build()

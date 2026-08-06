@@ -38,9 +38,11 @@ import (
 //
 // NO CALL SITE IS CONVERTED IN THIS COMMIT. Converting the seven
 // remaining walkers is M0125-0002, and it is a plan-SHAPE change (see
-// that task: extraInScans admits unenumerated conjuncts into
+// that task: `extraInScans` admitted unenumerated conjuncts into
 // MultiHashJoin.Filters *by accident*, so completing a walker REMOVES
-// predicates). This file is inert until a caller opts in.
+// predicates — both that consumer and the node went at M0127-P6.2, but the
+// hazard is general and still governs every consumer of these walkers).
+// This file is inert until a caller opts in.
 
 // exprSlotKind classifies a child slot by its COORDINATE SPACE, which is
 // the property callers actually branch on. Classify by kind — never by

@@ -47,6 +47,8 @@ package planner
 // counts and the severity split (which fail-opens can corrupt rows, which only
 // degrade an estimate) are recorded in
 // docs/design/0125-0002-walker-conversion-and-mhj-composition-risk.md.
+// (That doc's MHJ composition risk was retired by construction at M0127-P6.2,
+// when the node was deleted; the walker-conversion scope it set is unchanged.)
 //
 // WHAT THIS GATE ENFORCES, and why it is set equality rather than a count:
 //
@@ -165,11 +167,9 @@ var exprSwitchInventory = map[string]walkerRole{
 	"foldconst.go:FoldConstants":                                walkerPending, // 15 of 32 arms
 	"foldconst.go:toLiteralValue":                               nonRecursiveClassifier,
 	"inner_join_qual_pushdown.go:innerJoinPushTarget":           nonRecursiveClassifier,
-	// Added by M0125-0046: the MHJ analog of innerJoinPushTarget — the
-	// recursion is walkExprRefs (fail-closed), and the census sees the
-	// bottom-up dispatch inside the Visit closure (veto *OuterColumnRef /
-	// *FuncCall, validate *ColumnRef against the owning Tables[i] range).
-	"inner_join_qual_pushdown.go:mhjResidualConjunctTable":      nonRecursiveClassifier,
+	// M0125-0046 pinned `inner_join_qual_pushdown.go:mhjResidualConjunctTable`
+	// here — the MHJ analog of innerJoinPushTarget. M0127-P6.2 deleted it with
+	// the node, so the row is deleted rather than demoted.
 	// M0125-0002 commit 6 DEMOTED this one: the body is walkExprRefs
 	// (scopeVeto) now, but a two-arm veto dispatch survives in the Visit
 	// closure, so the census still keys a site to this function.
@@ -177,9 +177,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
 	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
-	"mhj_input_rewrite.go:cloneExprForShift":                    walkerPending, // 13 of 32 arms
-	"mhj_input_rewrite.go:matchSingleTableConstantPredicate":    nonRecursiveClassifier,
-	"mhj_input_rewrite.go:pushSingleSourceFiltersIntoMHJTables": walkerPending, // 13 of 32 arms
+	// `mhj_input_rewrite.go` was renamed `scan_input_rewrite.go` by M0127-P6.2,
+	// which deleted its MultiHashJoin half: `cloneExprForShift` and
+	// `pushSingleSourceFiltersIntoMHJTables` went with the node (rows deleted,
+	// not demoted); `matchSingleTableConstantPredicate` survives under the new
+	// path and keeps its classification.
+	"scan_input_rewrite.go:matchSingleTableConstantPredicate": nonRecursiveClassifier,
 	// CONVERTED by M0125-0002 commit 2, and DEMOTED for the same reason
 	// commit 1's remapByPosMap was: the recursion and the exhaustiveness
 	// moved to exprChildSlots (via cloneExprRefs), but a two-arm bottom-up

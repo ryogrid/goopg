@@ -252,11 +252,6 @@ func TestSublinkConjunctPlacementProperty(t *testing.T) {
 			walk(x.Child, belowJoin)
 		case *Aggregate:
 			walk(x.Child, belowJoin)
-		case *MultiHashJoin:
-			joinSeen = true
-			for _, tb := range x.Tables {
-				walk(tb, true)
-			}
 		case *NestedLoopIndexJoin:
 			joinSeen = true
 			walk(x.Outer, true)

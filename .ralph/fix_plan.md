@@ -10176,13 +10176,40 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `2026-08-07 M0127-P6.1` records the partial closure. Gates: grep-clean,
       `go build`/`go vet` clean, UNITS PASS, SPOT PASS (Q12=2/Q13=35, 28.8 s
       query phase). Design doc §6 row + IMPLEMENTATION-TODO P6.1 stamped.
-- [ ] **M0127-P6.2 — delete MultiHashJoin** (fresh grep inventory at S7 time;
-      2026-08-02 count ~34 arms / 18 files: node, packer
-      `rewriteMultiWayChain`/`collectMultiHashTables`, `mhj_input_rewrite.go`,
-      posmaps, cost/cardinality arms, executor op `multi_hash_join.go`,
-      EXPLAIN arms, `generateMultiHashJoinPath`, flags). IMPLEMENTATION-TODO
-      P6.2; 08 §4 "MultiHashJoin". Bar: after S5-ON survives a clean nightly
-      cycle; grep-clean + UNITS + SPOT + DS05.
+- [x] **M0127-P6.2 — delete MultiHashJoin.** IMPLEMENTATION-TODO P6.2;
+      08 §4 "MultiHashJoin". **DONE 2026-08-07.** Fresh inventory came in at
+      **42 non-test files**, above the 2026-08-02 estimate of ~34 arms / 18
+      files. Gone: executor op `multi_hash_join.go` (696 lines) + 8 MHJ-only
+      test files, node `MultiHashJoin`/`MultiHashKey`, `PathMultiHash`, the
+      packer `rewriteMultiWayChain`/`collectMultiHashTables` + its
+      now-callerless helpers, the whole posmap family (`buildMHJPosMap`;
+      `mhjPosMapOf`, already a permanent `return nil`; `binaryTreePosMapOf`,
+      dead outright), `estimateMultiHashJoin`, `multiHashJoinCost`,
+      `generateMultiHashJoinPath` (**no production caller ever** — settles
+      0126-0011 §3 as *deleted*), `pushResidualQualsIntoMHJTables`, both
+      EXPLAIN arms, and the flag trio (`GOOPG_MHJ_PACKING_OFF` becomes a
+      `flagProvenanceRetired` row). Two inventory errors, both toward
+      over-deletion: `mhj_input_rewrite.go` is NOT an MHJ file — its first
+      half is the generic single-table-predicate→IndexScan promotion
+      `planSelect` still calls, so it is split and renamed
+      `scan_input_rewrite.go`; and `shouldAttachBeforeMHJ` is a live Slice-A
+      gate, renamed `shouldAttachLocalFiltersBeforeSearch`. Gates: grep-clean,
+      `go build`/`go vet` clean, UNITS PASS, SPOT PASS (Q12=2/Q13=35, 28.3 s),
+      **DS05 PASS with PLAN-SHAPE 99/99 identical, 0 changed** — the deletion
+      moved nothing, as the default-off flag predicted.
+      **↳ The row-lock closure this task was named for did NOT happen, and the
+      premise is now measured false.** P6.1's row and both `2026-08-06
+      M-NIGHTLY` rows (root-0038, AI-20260806-011323-001) predicted that
+      deleting both nodes retires the `markJoinPreserveCTID` `FOR UPDATE` gap
+      by construction. With both deleted, `GOOPG_PGSHAPED_DP=0 go test
+      -count=1 -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`
+      still fails with a **byte-identical** diff to a HEAD-baseline worktree
+      run (`L1001 expected " <waiting ...>" / actual ""`). **No ledger row is
+      flipped to `resolved`.** Real cause, now located: `markJoinPreserveCTID`
+      has only four arms (`*projectOp`/`*filterOp`/`*sortOp`/`*joinOp`) and the
+      legacy plan for `lockwithvalues` reaches a node outside that set. Ledger
+      row 2026-08-07 carries the resume point. Default S5-ON PASSES the spec,
+      so production is unaffected.
 - [ ] **M0127-P6.3 — delete the old subset-bitmask DP + layout/remap family**
       (`enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/
       `dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,

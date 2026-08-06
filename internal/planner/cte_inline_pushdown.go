@@ -62,10 +62,6 @@ func pushQualsThroughSingleRefCTEs(n Node) {
 	case *NestedLoopIndexJoin:
 		pushQualsThroughSingleRefCTEs(x.Outer)
 		pushQualsThroughSingleRefCTEs(x.Inner)
-	case *MultiHashJoin:
-		for _, t := range x.Tables {
-			pushQualsThroughSingleRefCTEs(t)
-		}
 	case *CTEScan:
 		pushQualsThroughSingleRefCTEs(x.Child)
 	case *CTEDMLPrefix:
