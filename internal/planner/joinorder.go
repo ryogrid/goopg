@@ -36,7 +36,10 @@
 // where their explosion is bounded by earlier filtering).
 //
 // Preconditions for applying the rewrite:
-//   - All tables in FROM have catalog statistics (ANALYZE has run).
+//   - Every base table in FROM has a row count — either from ANALYZE
+//     (`Stats.RowCount`) or, since M0125-0003's fourth consumer, from
+//     the estimate_rel_size block-count fallback at stage 2. See the
+//     M0125-0003 note below.
 //   - Pure comma-FROM (no `JOIN ... ON` clauses, no table functions,
 //     no LATERAL derived tables; a non-lateral derived table is
 //     admitted and forces connectivity mode, like a WITH reference).
@@ -66,6 +69,22 @@
 // relations first" to "never emit an avoidable cross", and breaks ties
 // on source order. See orderByConnectivity and
 // docs/design/0125-0034a-comma-from-connectivity-order.md.
+//
+// M0125-0003 (the fourth consumer). Connectivity mode fixed the shape
+// that can NEVER have a row count; this pass was still blind to the
+// state every restarted server is in. `TableStats.RowCount` does not
+// survive a restart (`loadStatisticsFromHeap` leaves it 0; ledger
+// pq-P6), so on an S-cold server EVERY base table failed the "has
+// statistics" precondition, the pass declined, and the source order
+// survived — even though the block-count relation-size fallback that
+// M0125-0003 landed for the DP seed could have answered for all of
+// them. The `Stats.RowCount <= 0 ⇒ decline` guard is now a TIER:
+// stored count, then `relSizeFallbackRows(2, …)`, then decline. Stage
+// 2 is the join-ORDER stage by definition and this is a join-order
+// consumer, so it does not get a stage of its own — M0127-P5.6 retired
+// stage 3 and the flag's `3` is a documented alias for stage-2
+// behaviour. Filed by the deferral-ledger row dated 2026-07-30; see
+// docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md.
 package planner
 
 import (
@@ -135,9 +154,11 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 	//               no ANALYZE will ever supply one. Cardinality
 	//               ordering is impossible *by construction*, so the
 	//               list runs in connectivity mode below.
-	//   unstatted — a base table that simply has not been ANALYZEd.
-	//               Here the cardinality signal is merely missing,
-	//               and the pass declines exactly as it always has.
+	//   unstatted — a base table that simply has not been ANALYZEd (or
+	//               was, before a restart dropped the count). Here the
+	//               cardinality signal is merely missing, so the
+	//               block-count fallback is asked for it first and the
+	//               pass declines only if that has no answer either.
 	rowCounts := make([]int64, len(rels))
 	tables := make([]*catalog.Table, len(rels))
 	unknown := false
@@ -163,17 +184,33 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 		if tbl == nil {
 			continue // WITH reference — no row count exists to read
 		}
-		if tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
-			// Un-ANALYZEd base table. In cardinality mode that is the
-			// whole signal missing and the pass declines, exactly as
-			// it always has. In connectivity mode row counts are
-			// never consulted, so it is not a reason to decline.
-			if !unknown {
-				return s.FromExprs, s.From, false
-			}
+		if tbl.Stats != nil && tbl.Stats.RowCount > 0 {
+			rowCounts[i] = tbl.Stats.RowCount
 			continue
 		}
-		rowCounts[i] = tbl.Stats.RowCount
+		// No stored row count: either the relation was never ANALYZEd,
+		// or it was and the count did not survive the restart
+		// (`loadStatisticsFromHeap` leaves RowCount 0; ledger pq-P6).
+		// Tier 2 — the estimate_rel_size block-count fallback, the same
+		// estimate and the same flag stage the bushy DP seed reads
+		// (`bushySeedRowCounts`). This site is a join-ORDER consumer,
+		// which is exactly what stage 2 is defined to enable, so it
+		// joins that stage rather than adding a fourth one: the
+		// re-evaluation at M0127-P5.6 retired stage 3, and the flag's
+		// `3` is now a documented alias for stage-2 behaviour.
+		if rows := relSizeFallbackRows(2, cat, tbl); rows > 0 {
+			rowCounts[i] = rows
+			continue
+		}
+		// Not even a live block count (flag off, an embedded catalog
+		// with no storage behind it, or a zero-page relation). In
+		// cardinality mode that is the whole signal missing and the
+		// pass declines, exactly as it always has. In connectivity mode
+		// row counts are never consulted, so it is not a reason to
+		// decline.
+		if !unknown {
+			return s.FromExprs, s.From, false
+		}
 	}
 	// Build qualifier → relation-index map. Aliases / unqualified
 	// table names point to the FROM position; bare column names

@@ -1,56 +1,46 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0048 CLOSED and committed** — grouping sets are no longer a
-UNION ALL. ONE `Aggregate` node, one hash table per set, one pass over the
-child.
+Last loop: **M0125-0003 CLOSED and committed** — the fourth and last consumer of
+the `GOOPG_RELSIZE_FALLBACK` block-count estimate is wired, so **M0125 has no
+open item left that is not `[→ M0127: absorbed]`.**
 
-1. `GroupExprs` = deduplicated union of the sets (PG's `parse->groupClause`),
-   `GroupingSets [][]int` = the slots each set keeps, `GroupingMasks [][]int64`
-   = each `GROUPING(...)` call's bitmask per set.
-2. **The mask is an output COLUMN, not an expression over a hidden set-id.**
-   It depends only on which set produced the row, so `GROUPING(a,b)` resolves
-   to a plain `ColumnRef` — no new Expr node, no evaluator case, no EXPLAIN
-   formatter. Bonus: the column is named `grouping`, as PG names it.
-3. **The ordinary aggregate is the one-set case, not a second operator**
-   (`sets = [[0..n-1]]`; set prefix omitted when there is one set). A separate
-   operator would have cloned 250 lines of shared-state/`finishAgg` logic.
-4. **What the oracle taught it:** PG proves a functional dependency only
-   against the INTERSECTION of the sets (`gset_common` →
-   `groupClauseCommonVars`, `parse_agg.c parseCheckAggregates`), so
-   `SELECT id, name … GROUP BY ROLLUP(id)` is 42803 even with `id` a PK.
-5. Retired outright: `rewriteGroupingSets`/`substituteGroupingExpr`/
-   `groupingBitmask`, `groupingsets_share.go` + both its tests, and
-   `GOOPG_GS_SHARE_SOURCE` (kept as `retired(M0125-0048)` in
-   `flagProvenanceRetired` so older artefacts stay attributable).
+1. `reorderCommaFromByCardinality` (`internal/planner/joinorder.go`) bailed the
+   moment any table had `Stats.RowCount <= 0` — which, since RowCount does not
+   survive a restart (ledger pq-P6), is EVERY table on an S-cold server. The
+   guard is now a tier: stored count → `relSizeFallbackRows(2, cat, tbl)` →
+   decline.
+2. **Stage 2, not a fourth stage.** M0127-P5.6 retired stage 3, leaving stage 2
+   defined as "the consumers that move the join ORDER". A `4` would ship it
+   default-off behind a value no script sets.
+3. **Measured effect is ZERO plan movement, and that IS the evidence**: DS05
+   plan channel `queries=99 same=99 changed=0` on a restarted (S-cold) cluster,
+   so the pass runs where it used to decline and nothing moves. Mechanism =
+   M0127-P5.9-r inverted: `extractScans` descends `JoinTypeCross` only, so a
+   comma-FROM list is exactly what reaches `tryPGShapedJoinSearch`, and the
+   search re-derives the order. Live residue = what the search declines
+   (explicit `JOIN`, over-limit relsets) = `joinorder.go`'s P6.3 role.
+4. Sweep deliberately NOT re-run: identical plan text for 99/99 means identical
+   execution; that is what the plan channel exists to license.
 
-Files: `internal/planner/{groupingsets,planner,plan,parallel_agg,flaglabels}.go`,
-`internal/executor/{operators_join_agg,operators_explain,explain_cte}.go`,
-`internal/parser/{ast,expr}.go`, `internal/analyzer/analyzer.go`,
-`internal/executor/grouping_sets_single_pass_test.go` (8 new tests, every value
-from live PG 18.3 on 65432), `scripts/planner-flags.env` (regenerated),
-`docs/design/0125-0048-single-pass-grouping-sets.md` + README index (and the
--0040 row marked RETIRED), fix_plan (-0048 ticked), 4 ledger rows.
+Files: `internal/planner/joinorder.go`,
+`internal/planner/joinorder_relsize_test.go` (4 tests; the landing test proven
+to fail pre-fix by checking out HEAD's joinorder.go), design doc
+`0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md` §I20–I23 + README index
+row, fix_plan (-0003 ticked), 3 ledger motions (1 flip + 2 new).
 
-Gates run: units gate PASS; planner/executor/parser/analyzer PASS; full
-`go test ./...` PASS except the pre-existing `TestPort_IsolationEvalPlanQual`
-(nightly `AI-20260806-011323-001`, unrelated and unchanged);
-`scripts/tpch-spotcheck.sh` Q12=2/Q13=35 canonical PASS; SF0.5 plan channel
-`queries=99 same=91 changed=8` — the eight ARE exactly the eight ROLLUP queries
-(Q5 Q14 Q18 Q22 Q27 Q67 Q77 Q80), no other query moved; SF0.5 sweep of those
-eight `PASS=8 MISMATCH=0` (Q67 82s→17s, Q18 37s→9s, Q22 21s→4s, Q27 31s→10s);
-pgbench smoke via the commit hook. Plan baseline is the newest capture
-`plans-20260806-185158.txt`; only `oracle.txt` is git-tracked and it is
-unchanged.
+Gates run: planner PASS; executor/analyzer PASS; units gate 0 FAIL;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2 Q13=35, 28.1 s); DS05 plan channel
+99/99 same (`plans-20260806-191105.txt`); pgbench smoke via the commit hook.
 
 NEXT LOOP (banner: M0124 closed → M0125 → M0127 → M-NIGHTLY → M0123).
-`ci/logs/action-items.md` was still run `20260806-011323` this loop (all 18
-filed, nothing new) — re-check first; a NEW nightly at `status: pass` makes
-M0127-P6.1 selectable. Open M0125 items are now only `M0125-0003` (staged
-`GOOPG_RELSIZE_FALLBACK`, stages 1+2 landed default-off) and
-`-0031/-0032/-0033/-0041`, all four marked `[→ M0127: absorbed]` — so M0125 is
-effectively down to -0003, and M0127 is the next live milestone.
+**M0125 is now effectively closed**, so M0127 is the live milestone and
+**M0127-P6.1 (delete fusion) is the next selection — IF the gate is met.** Its
+bar is "S5-ON survives a clean nightly cycle": read `ci/logs/action-items.md`
+FIRST; it was still run `20260806-011323` (`status: fail`, all 18 filed, nothing
+new) this loop, and every one of its 4 genuine items is now fixed, so a fresh
+nightly at `status: pass` unlocks P6.1. If the file is still that same run, no
+new nightly has run and P6.1 stays unselectable on missing evidence.
 
-In-flight: none. The PG reference cluster on 65432 was started for oracle
-captures and stopped again (`bench/tpch/setup_pg.sh` to bring it back;
-`set -a; source bench/tpch/env.sh; set +a` for PGPASSWORD — a bare psql blocks
-on a password PROMPT and will eat a 15-minute Bash timeout).
+In-flight: none. Private bench binary at `tmp/goopg-m0125-0003-fourth` (used for
+the DS05 plan capture so the nightly's shared `tmp/goopg-bench-bin` was not
+touched); the SF0.5 server on 65437 was started and stopped by the gate script.

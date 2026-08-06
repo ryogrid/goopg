@@ -2323,8 +2323,42 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       source — do that FIRST or M0125-0002 closes against a list that was never
       right. Two ledger rows appended (`exprwalk-node-side`; the walker-inventory
       correction).
-- [ ] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
-      phase 6.1). **STAGE 1 LANDED 2026-07-29, flag-off and inert** — the
+- [x] **M0125-0003 — `GOOPG_RELSIZE_FALLBACK` relation-size fallback** (§13.5 #2,
+      phase 6.1). **CLOSED 2026-08-06 — the fourth consumer landed, and the
+      other two open items were already discharged.**
+      (a) `reorderCommaFromByCardinality` (`internal/planner/joinorder.go`) no
+      longer bails on `Stats.RowCount <= 0`; the guard is a TIER — stored
+      count, then `relSizeFallbackRows(2, cat, tbl)`, then decline — so an
+      S-cold comma-FROM list is ordered by block-derived counts instead of
+      keeping source order. It joins **stage 2** rather than becoming a fourth
+      stage: M0127-P5.6 retired stage 3, leaving stage 2 defined as "the
+      consumers that move the join ORDER", and a `4` would ship it default-off
+      behind a value no script sets. (b) **The measured effect is ZERO plan
+      movement, which is the safety evidence, not a null result**: TPC-DS
+      SF0.5 plan channel `queries=99 same=99 changed=0`
+      (`plans-20260806-191105.txt`), captured on a restarted — therefore
+      S-cold — cluster, so the pass RUNS on the lists where it used to decline
+      and the plans are byte-identical anyway. Mechanism: M0127-P5.9-r read in
+      the other direction — `extractScans` descends `JoinTypeCross` only, so a
+      comma-FROM list is exactly what reaches `tryPGShapedJoinSearch`, and the
+      search re-derives the order from the whole relset. The pass's live
+      consumers are what the search declines (explicit `JOIN`, over-limit
+      relsets) — which is precisely the over-limit sequencer role P6.3 demotes
+      `joinorder.go` to, where it becomes the ONLY join-order chooser those
+      queries get. The SF0.5 sweep was NOT re-run: identical plan text for all
+      99 queries means identical execution, which is what the plan channel
+      exists to license. (c) The **W arms are measured, not owed** — resolved
+      2026-07-30 by M0125-0031 (warm 413.3 s w1 vs 420.1 s w2, `plan-diff`
+      22/22 MATCH in both `structural` and `strict-text`), after M0125-0028
+      and -0029 removed both named blockers. (d) **Stage 3 is superseded, not
+      deferred** (M0127-P5.6 / `applyRelSizeFallback`). Gates: units 0 FAIL,
+      planner package PASS (4 new tests in
+      `internal/planner/joinorder_relsize_test.go`, the landing test proven to
+      fail pre-fix), SPOT PASS (Q12=2, Q13=35, 28.1 s), DS05 plan channel
+      99/99 same. Closing record: design doc §I20–I23; 2 new ledger rows (the
+      pass is now correct and almost entirely unreachable; no gate exercises
+      the over-limit path) and the 2026-07-30 fourth-consumer row flipped to
+      `resolved`. **STAGE 1 LANDED 2026-07-29, flag-off and inert** — the
       arithmetic (`estimateRelSize`), the `reltuples < 0` sentinel
       (`catalog.TableStats.Analyzed`), the live block count
       (`InMemory.RelationBlocks`, installed from the pool in `initdb.Open`), the
