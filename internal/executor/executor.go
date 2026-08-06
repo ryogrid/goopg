@@ -104,7 +104,7 @@ func buildWithEnv(plan planner.Node, inWorker bool) (Operator, error) {
 	case *planner.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls
-		// (same CTE name, same ctx.CTERowCache). This implements PostgreSQL's
+		// (same CTE declaration, same ctx.CTERowCache entry). This implements PostgreSQL's
 		// CTE optimization-fence: a volatile CTE (e.g. random()) produces the
 		// same rows regardless of how many times it is referenced. M0097-0099.
 		op, err := newCteScanOp(p)

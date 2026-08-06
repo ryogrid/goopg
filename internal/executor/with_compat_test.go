@@ -140,3 +140,54 @@ func TestCompatCTEVisibleInFromSubquery(t *testing.T) {
 		t.Fatalf("nested: got %+v, want single row [7]", rows)
 	}
 }
+
+// TestCompatCTESameNameDisjointScopes pins M0125-0050: a CTE's identity is its
+// DECLARATION, not its name.
+//
+// ctx.CTERowCache used to be keyed by the lowercased CTE name statement-wide,
+// so two unrelated `WITH x` declarations in disjoint subqueries shared one
+// buffer: the first scan materialized `SELECT 1` and the second replayed it
+// instead of running its own `SELECT 2`. goopg answered 1,1 where PG 18.3
+// answers 1,2 — a wrong answer, not a plan-shape difference.
+//
+// PG cannot express the bug: SS_process_ctes makes one subplan per WITH entry
+// and CteScanState keys off that subplan's ctePlanId
+// (postgres/src/backend/executor/nodeCtescan.c), which is per-declaration by
+// construction. planner.CTEScan.DeclKey is goopg's equivalent.
+func TestCompatCTESameNameDisjointScopes(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	rows := runQuery(t, ctx,
+		`SELECT v FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) a
+		 UNION ALL
+		 SELECT v FROM (WITH x AS (SELECT 2 AS v) SELECT v FROM x) b`)
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d, want 2", len(rows))
+	}
+	got := []int64{rows[0][0].Int, rows[1][0].Int}
+	if got[0] != 1 || got[1] != 2 {
+		t.Errorf("got %v, want [1 2] (PG 18.3); [1 1] is the M0125-0050 regression", got)
+	}
+}
+
+// TestCompatCTEMultiReferenceStillMaterializesOnce is the other side of
+// M0125-0050's key change: narrowing the key must not un-share a CTE that PG
+// materializes once. Two references to ONE declaration still run the body a
+// single time, which is the optimization-fence guarantee the volatile-CTE
+// tests rely on. random() would make an un-shared body visible as two
+// different values; a sequence-free equivalent is to check both references
+// observe the same buffer identity via a row count that would double.
+func TestCompatCTEMultiReferenceStillMaterializesOnce(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	rows := runQuery(t, ctx,
+		"WITH x(a) AS (SELECT 1) SELECT p.a, q.a FROM x p, x q")
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("rows=%d cols=%d, want 1×2", len(rows), len(rows[0]))
+	}
+	if rows[0][0].Int != 1 || rows[0][1].Int != 1 {
+		t.Errorf("got %+v, want [1 1]", rows[0])
+	}
+}

@@ -4,6 +4,8 @@
 package planner
 
 import (
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -1177,9 +1179,9 @@ type CTEScan struct {
 	// consumes. pushQualsThroughSingleRefCTEs reads its statement-wide
 	// reference count to decide whether Child is private to this one
 	// reference (PG 12+ `cte_inline` refcount==1 criterion) — both the
-	// plan Node and the executor's name-keyed CTERowCache are shared
-	// between references, so a per-reference qual may cross into the
-	// body only when no second reference exists. nil for scans built
+	// plan Node and the executor's CTERowCache entry (keyed by DeclKey)
+	// are shared between references, so a per-reference qual may cross
+	// into the body only when no second reference exists. nil for scans built
 	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
 	cte *plannedCTE
 }
@@ -1226,6 +1228,40 @@ func (n *CTEScan) DeclSeq() int {
 		return 0
 	}
 	return n.cte.declSeq
+}
+
+// DeclKey identifies the DECLARATION this scan consumes, and is the key the
+// executor materializes under (ctx.CTERowCache) and EXPLAIN hoists `CTE <name>`
+// sections by. It is goopg's analogue of PG's `CteScan.ctePlanId`
+// (postgres/src/backend/executor/nodeCtescan.c), which is per-declaration by
+// construction because `SS_process_ctes` makes one subplan per WITH entry.
+//
+// Name alone is NOT the identity, which is what M0125-0050 fixed: `WITH x` in
+// two disjoint scopes is two declarations, and keying by "x" made the second
+// replay the first's rows (goopg answered 1,1 where PG answers 1,2).
+//
+// The key is the declaring CommonTableExpr's source offset plus its name, not
+// the plannedCTE pointer, because ONE declaration can legitimately be planned
+// more than once: planSelect re-enters on the head operand of a set-op chain,
+// so M0125-0040's grouping-sets rewrite yields two distinct plannedCTEs for the
+// one synthetic `__gs_src_N` AST node. Those must keep sharing a single
+// materialization — that sharing is the whole point of the rewrite — and a
+// declaration site is stable across replanning where a pointer is not.
+//
+// Both producers of a CommonTableExpr give distinct declarations distinct
+// (pos, name) pairs: the parser stamps pos from the declaring identifier token,
+// and the two synthetic producers (groupingsets_share.go, CREATE RECURSIVE
+// VIEW) leave pos 0 but generate a name unique within the statement.
+//
+// Falls back to the bare name for a CTEScan built outside preplanWithClause
+// (tests), which is the pre-M0125-0050 behaviour and unambiguous there: such a
+// plan has at most one declaration per name.
+func (n *CTEScan) DeclKey() string {
+	name := strings.ToLower(n.Name)
+	if n.cte == nil {
+		return name
+	}
+	return strconv.Itoa(n.cte.declPos) + ":" + name
 }
 
 // Sort — orders the child's rows by the given keys.

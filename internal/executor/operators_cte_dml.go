@@ -220,7 +220,12 @@ func (o *cteScanOp) Open(ctx *Context) error {
 		return o.child.Open(ctx)
 	}
 
-	key := strings.ToLower(o.plan.Name)
+	// Key by DECLARATION, not by name: `WITH x` in two disjoint scopes is two
+	// declarations that must materialize separately, and keying by "x" made
+	// the second replay the first's rows (M0125-0050 — goopg answered 1,1
+	// where PG answers 1,2). See planner.CTEScan.DeclKey for why the key is
+	// the declaration site rather than the plannedCTE pointer.
+	key := o.plan.DeclKey()
 	if ctx.CTERowCache != nil {
 		if cached, ok := ctx.CTERowCache[key]; ok {
 			// Replay from cache (second or later reference to this CTE).

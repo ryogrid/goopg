@@ -125,14 +125,19 @@ func TestExplainCTESectionDeclarationOrder(t *testing.T) {
 	}
 }
 
-// TestExplainGroupingSetsSharedSourceSectioned is the case that forced the
-// hoist key to be the CTE NAME rather than the body Node pointer. M0125-0040
-// rewrites a grouping-sets query into a UNION ALL of branches over a synthetic
-// `__gs_src_<pos>` CTE, and each branch runs its own preplanWithClause pass —
-// so the references carry DISTINCT (structurally identical) body Nodes for the
-// one ctx.CTERowCache buffer they all read. Keyed by pointer, only the first
-// branch's body hoisted and TPC-DS Q67 still printed 36 `store_sales` mentions
-// for a join that scans it once.
+// TestExplainGroupingSetsSharedSourceSectioned is the case that rules out a
+// body-Node-pointer hoist key. M0125-0040 rewrites a grouping-sets query into a
+// UNION ALL of branches over a synthetic `__gs_src_<pos>` CTE, and planSelect
+// re-enters on the head operand of that chain — so the one declaration is
+// preplanned twice and the references carry DISTINCT (structurally identical)
+// body Nodes for the one ctx.CTERowCache buffer they all read. Keyed by
+// pointer, only the first body hoisted and TPC-DS Q67 still printed 36
+// `store_sales` mentions for a join that scans it once.
+//
+// The key is the declaration site (CTEScan.DeclKey, M0125-0050), which both
+// preplan passes derive identically from the same CommonTableExpr — so this
+// still collapses to one section while genuinely distinct declarations that
+// happen to share a name no longer do.
 func TestExplainGroupingSetsSharedSourceSectioned(t *testing.T) {
 	lines := cteExplainLines(t, "SELECT a, b, count(*) FROM t GROUP BY ROLLUP(a, b)")
 	joined := strings.Join(lines, "\n")
@@ -168,5 +173,42 @@ func TestExplainSingleReferenceCTEStillSectioned(t *testing.T) {
 	}
 	if countLinesContaining(lines, "Scan on t") != 1 {
 		t.Errorf("want the body exactly once:\n%s", joined)
+	}
+}
+
+// TestExplainSameNameDisjointScopesSectionedTwice is the render half of
+// M0125-0050. Before it, `collectCTEHoist` claimed one section per CTE NAME,
+// so two unrelated `WITH x` declarations in disjoint subqueries collapsed into
+// a single `CTE x` heading — which faithfully reflected the runtime, because
+// the runtime was wrongly collapsing them too.
+//
+// Both are keyed by declaration now, so each declaration gets its own section
+// and its own body. That is also what PG prints: SS_process_ctes emits one
+// subplan per WITH entry and ExplainSubPlans prints a heading per subplan, so
+// two same-named declarations give two `CTE x` headings.
+func TestExplainSameNameDisjointScopesSectionedTwice(t *testing.T) {
+	lines := cteExplainLines(t,
+		`SELECT v FROM (WITH x AS (SELECT a AS v FROM t) SELECT v FROM x) p
+		 UNION ALL
+		 SELECT v FROM (WITH x AS (SELECT b AS v FROM t) SELECT v FROM x) q`)
+	joined := strings.Join(lines, "\n")
+
+	sections := 0
+	for _, l := range lines {
+		if strings.HasSuffix(l, "CTE x") {
+			sections++
+		}
+	}
+	if sections != 2 {
+		t.Errorf("want 2 `CTE x` sections (one per declaration), got %d:\n%s", sections, joined)
+	}
+	// One body each — two declarations, two scans of t. A name-keyed hoist
+	// printed one section and one scan, hiding the second declaration
+	// entirely.
+	if got := countLinesContaining(lines, "Scan on t"); got != 2 {
+		t.Errorf("want 2 scans of t (one body per declaration), got %d:\n%s", got, joined)
+	}
+	if got := countLinesContaining(lines, "CTE Scan on x"); got != 2 {
+		t.Errorf("want 2 `CTE Scan on x` reference leaves, got %d:\n%s", got, joined)
 	}
 }

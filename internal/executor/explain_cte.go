@@ -57,35 +57,36 @@ type cteSection struct {
 }
 
 // cteHoist is the per-EXPLAIN-render set of CTE bodies that have been lifted
-// out of their reference sites. A name present in byName renders as a leaf
-// wherever it is referenced, INCLUDING inside sublink subtrees (the same
+// out of their reference sites. A declaration present in byDecl renders as a
+// leaf wherever it is referenced, INCLUDING inside sublink subtrees (the same
 // subPlanReg — and therefore the same cteHoist — is threaded through them).
 type cteHoist struct {
 	order  []*cteSection
-	byName map[string]*cteSection
+	byDecl map[string]*cteSection
 }
 
 // collectCTEHoist walks the plan spine of root and claims one body per CTE
-// NAME (lowercased, as the runtime keys it).
+// DECLARATION, keyed exactly as the runtime keys its buffer — CTEScan.DeclKey,
+// the declaring CommonTableExpr's source offset plus its name.
 //
-// Name, not body pointer, is the identity that matters here, and it is the
-// executor's own: `ctx.CTERowCache` is `map[string][]Row` keyed by the
-// lowercase CTE name — the first CTEScan for a name buffers the rows and every
-// later scan of that name replays them (operators_cte_dml.go, cteScanOp.Open).
-// So one name means exactly one materialisation at runtime, and one section is
-// what EXPLAIN should print. A pointer-identity key would under-hoist: a plain
-// `WITH` hands every consumer the same body Node (planScanRangeVar's
-// `Child: ce.body`), but M0125-0040's grouping-sets rewrite gives each UNION
-// branch its own preplanWithClause pass, so Q67's eight references to
-// `__gs_src_871` carry eight distinct — structurally identical — body Nodes for
-// the one buffer they all read.
+// Matching the runtime key is the whole requirement: `ctx.CTERowCache` is
+// keyed by DeclKey, the first CTEScan for a declaration buffers the rows and
+// every later scan of it replays them (operators_cte_dml.go, cteScanOp.Open),
+// so one declaration means exactly one materialisation and one section is what
+// EXPLAIN should print. Both cheaper identities are wrong in one direction:
 //
-// The same aliasing is why two DIFFERENT declarations sharing a name in
-// disjoint scopes render as one section: goopg executes them as one too, which
-// is a wrong-answer bug in its own right (goopg returns 1,1 where PG returns
-// 1,2 — see the deferral ledger row for 2026-08-06 / M0125-0049 and the
-// fix_plan item it cites). Printing one section is the render that matches what
-// runs; when that bug is fixed the key here has to be fixed with it.
+//   - A body-POINTER key would under-hoist. A plain `WITH` hands every consumer
+//     the same body Node (planScanRangeVar's `Child: ce.body`), but planSelect
+//     re-enters on the head operand of a set-op chain, so M0125-0040's
+//     grouping-sets rewrite plans the one synthetic `__gs_src_N` declaration
+//     twice — distinct, structurally identical bodies for the one buffer they
+//     share. Q67 would print two sections for one materialisation.
+//   - A NAME key would over-hoist, and used to: two DIFFERENT declarations
+//     sharing a name in disjoint scopes collapsed into one section. That was
+//     the render matching the runtime while the runtime was also wrong
+//     (M0125-0050: goopg answered 1,1 where PG answers 1,2). Both are keyed by
+//     declaration now, so such a query prints two `CTE x` sections — which is
+//     also what PG prints, one per subplan.
 //
 // Returns nil when the plan references no CTE, so the render path costs
 // nothing for the overwhelming majority of statements.
@@ -93,22 +94,22 @@ func collectCTEHoist(root planner.Node) *cteHoist {
 	if root == nil {
 		return nil
 	}
-	h := &cteHoist{byName: map[string]*cteSection{}}
+	h := &cteHoist{byDecl: map[string]*cteSection{}}
 	var walk func(planner.Node)
 	walk = func(n planner.Node) {
 		if n == nil {
 			return
 		}
 		if scan, ok := n.(*planner.CTEScan); ok && scan.Child != nil {
-			key := strings.ToLower(scan.Name)
-			if _, claimed := h.byName[key]; claimed {
+			key := scan.DeclKey()
+			if _, claimed := h.byDecl[key]; claimed {
 				// A second reference to an already-claimed name. Do NOT
 				// descend: the body is the same buffer, so descending would
 				// only re-walk a subtree whose CTEs are already claimed.
 				return
 			}
 			sec := &cteSection{name: scan.Name, body: scan.Child, declSeq: scan.DeclSeq()}
-			h.byName[key] = sec
+			h.byDecl[key] = sec
 			h.order = append(h.order, sec)
 			// A claimed body may itself reference another CTE (`WITH x AS
 			// (...), y AS (SELECT ... FROM x)`), so keep descending — that
@@ -141,7 +142,7 @@ func (h *cteHoist) hoisted(n planner.Node) bool {
 	if !ok {
 		return false
 	}
-	_, claimed := h.byName[strings.ToLower(scan.Name)]
+	_, claimed := h.byDecl[scan.DeclKey()]
 	return claimed
 }
 

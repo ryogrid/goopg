@@ -87,8 +87,17 @@ func gsCountSeqScansOf(n Node, table string) int {
 // TestGSShareSourceAppliesToJoinedRollup is the shape M0125-0040 was filed
 // for: a multi-table comma-FROM with a WHERE, rolled up over columns from
 // both tables. All four generated branches must read the same synthetic
-// source, which is what makes the executor's name-keyed CTERowCache replay
-// the join instead of re-running it (operators_cte_dml.go, cteScanOp.Open).
+// source, which is what makes the executor's CTERowCache replay the join
+// instead of re-running it (operators_cte_dml.go, cteScanOp.Open).
+//
+// The assertion is on CTEScan.DeclKey, the cache key itself, and not merely on
+// the name — M0125-0050 narrowed that key from the CTE name to the declaration
+// site, and the branches do NOT share a *plannedCTE: planSelect re-enters on
+// the head operand of the set-op chain it just built, so the one synthetic
+// `__gs_src_N` declaration is planned twice. Sharing therefore rests on both
+// passes deriving the same key from the same declaration, which is precisely
+// what this pins. Keying by declSeq or by body pointer compiles, passes a
+// name-only assertion, and silently doubles the join.
 func TestGSShareSourceAppliesToJoinedRollup(t *testing.T) {
 	cat := gsShareCatalog(t)
 	plan := gsPlan(t, cat, `
@@ -102,10 +111,11 @@ func TestGSShareSourceAppliesToJoinedRollup(t *testing.T) {
 	if len(scans) != 3 {
 		t.Fatalf("synthetic-source references = %d, want 3 (one per generated branch)", len(scans))
 	}
-	name := scans[0].Name
+	key := scans[0].DeclKey()
 	for _, s := range scans[1:] {
-		if s.Name != name {
-			t.Fatalf("branches read different sources: %q vs %q — they would not share the cache", name, s.Name)
+		if s.DeclKey() != key {
+			t.Fatalf("branches read different sources: DeclKey %q vs %q — they would not share the cache, so the join would run once per branch",
+				key, s.DeclKey())
 		}
 	}
 }

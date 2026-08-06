@@ -552,8 +552,14 @@ type Context struct {
 
 	// CTERowCache holds rows materialized from regular (SELECT) CTEs when the same
 	// CTE is referenced more than once in a query. The first CTEScan for a given
-	// name buffers all rows here; subsequent scans replay from the buffer.
-	// Key is the lowercase CTE name; value is the materialized row set (nil = not yet filled).
+	// declaration buffers all rows here; subsequent scans replay from the buffer.
+	//
+	// Key is planner.CTEScan.DeclKey — the DECLARATION (declaring
+	// CommonTableExpr's source offset plus its name), not the name alone. It
+	// was the bare name until M0125-0050, which made two unrelated `WITH x`
+	// declarations in disjoint scopes share one buffer so the second replayed
+	// the first's rows (goopg answered 1,1 where PG answers 1,2). Value is the
+	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
 
 	// CTEWriteFence, when non-nil, is a set of row pointers written by DML

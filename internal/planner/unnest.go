@@ -1641,13 +1641,16 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		// does for two consumers of the same WITH item (planner.go's
 		// Stage A inlining hands each consumer the same `ce.body`), and
 		// what makes the decorrelated form cheap: the executor's
-		// name-keyed ctx.CTERowCache materializes the body once and both
-		// the outer CTEScan and this one replay it.
+		// declaration-keyed ctx.CTERowCache materializes the body once and
+		// both the outer CTEScan and this one replay it.
 		//
-		// That name-keyed cache is exactly why a body carrying an outer
+		// That shared cache entry is exactly why a body carrying an outer
 		// reference must bail instead: a rewritten body and an
-		// un-rewritten consumer of the same CTE name would share one
+		// un-rewritten consumer of the same DECLARATION would share one
 		// cache entry, so the second scan would replay the first's rows.
+		// (Keyed by declaration since M0125-0050 — same-named declarations
+		// in disjoint scopes no longer collide, but two consumers of ONE
+		// declaration still share, which is what this guards.)
 		// A sublink nested inside the body can hold such a ref, so the
 		// check descends through sublink plans.
 		if planSubtreeHasOuterRefDeep(n.Child) {

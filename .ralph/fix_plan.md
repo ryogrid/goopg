@@ -5261,8 +5261,28 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       multiply-referenced user CTE too, not just the synthetic one. Bar: the
       SF0.5 gate's plan channel WILL move on every such query, so re-pin the
       plan snapshot in the same commit and say which queries moved and why.
-- [ ] **M0125-0050 — two same-named CTE declarations in disjoint scopes share
-      one materialization, so the second replays the first's rows** (filed
+- [x] **M0125-0050 — two same-named CTE declarations in disjoint scopes share
+      one materialization, so the second replays the first's rows**
+      **DONE 2026-08-06** — `ctx.CTERowCache` and EXPLAIN's `collectCTEHoist`
+      are keyed by `planner.CTEScan.DeclKey()` = the declaring
+      `CommonTableExpr`'s source offset + lowercased name, goopg's analogue of
+      PG's `ctePlanId`. The witness returns 1,2 like PG. The task was entirely
+      the KEY choice: the filed suggestion (a per-declaration id next to
+      `declSeq`) and `declSeq` itself both UNDER-share, because `planSelect`
+      re-enters on the head operand of a set-op chain and M0125-0040's
+      grouping-sets rewrite therefore plans its ONE synthetic `__gs_src_N`
+      declaration TWICE (measured: 3 scans, 2 `*plannedCTE`, 2 declSeqs, 1
+      declaration) — either key splits the buffer and re-runs the hoisted join,
+      undoing -0040 on Q18/Q67 while still passing a name-only assertion. The
+      declaration SITE is stable across replanning and race-free (no counter, no
+      lazily-mutated AST field). Gates: Q12=2/Q13=35 canonical; SF0.5 plan
+      channel `same=99 changed=0` as the bar required. Design doc
+      `docs/design/0125-0050-cte-declaration-identity.md`. Two discoveries filed
+      to the ledger, not fixed: `MaterializedCTEs` (DML sibling) is still
+      name-keyed, and goopg does not enforce PG's top-level rule for
+      data-modifying CTEs (accepts a nested `WITH x AS (INSERT … RETURNING)`
+      that PG rejects 42P19) — the latter is what makes the former reachable.
+      ORIGINAL FILING: (filed
       2026-08-06 by `M0125-0049`, which hit it while choosing the hoist key;
       ledger row same date). WRONG ANSWERS, not a rendering issue:
       `ctx.CTERowCache` is `map[string][]Row` keyed by the LOWERCASE CTE NAME
