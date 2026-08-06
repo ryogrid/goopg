@@ -82,6 +82,32 @@ type joinOp struct {
 	execKeyPackInt bool
 	execKeyBuf     []byte
 
+	// M0127-PS6.1 (05 §6, stage E5): the COMPILED twin of the three
+	// expression slots above. Join keys and residuals were the last
+	// 100%-interpreted hot expressions in the executor — the compiled
+	// ExprNode evaluator (exprnode.go, M0107-0003 Phase C) served only
+	// filter/project/limit. buildKeyNodes[i]/probeKeyNodes[i] are the
+	// exprTreeSlab indices of buildKeyExprs[i]/probeKeyExprs[i], and
+	// execResidualNode is execResidual's; all are compiled once per Open by
+	// initExecKeys and evaluated with evalFastExpr, which dispatches on an
+	// integer kind instead of a type switch — and reads a bare ColumnRef
+	// key, the overwhelmingly common shape, as a direct slot.Get.
+	//
+	// This is a DISPATCH change, never a semantic one: any expression kind
+	// the compiler does not recognise becomes an ExprAdapter node that still
+	// calls evalExprSlot. The sibling rule (09 §1) is what makes that safe,
+	// and PS6.2 is its release gate.
+	//
+	// execCompiled distinguishes "compiled, and the residual genuinely has
+	// no node" from "never compiled": execResidualNode's zero value is a
+	// VALID slab index, so it must not be trusted on a joinOp that only ran
+	// the constructor (newJoinOp fills execResidual directly).
+	execExprs        exprTreeSlab
+	buildKeyNodes    []int32
+	probeKeyNodes    []int32
+	execResidualNode int32
+	execCompiled     bool
+
 	// M0127-P2.3 (07 §2): the same split for the MERGE algorithm, taken
 	// from planner.Join.ExecMergeKeyPlan by initMergeKeys. Deliberately
 	// NOT the execKeys/execResidual slots above: those are filled on the
@@ -730,7 +756,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -800,7 +826,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -884,7 +910,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 			key = string(o.execKeyBuf)
 		} else {
 			var kerr error
-			key, ok, kerr = o.evalHashKeySlot(o.buildKeyExprs[0], keySlot)
+			key, ok, kerr = o.evalHashKeySlot(o.buildKeyNodes[0], keySlot)
 			if kerr != nil {
 				return kerr
 			}
@@ -935,8 +961,17 @@ func (o *joinOp) evalHashKeyDatum(keyExpr planner.Expr, row Row) (Datum, bool, e
 // M0126-0003 Stage 0b: evaluates the key expression against a slot
 // instead of a merged Row, so callers can pass a VirtualSlot over
 // {realSide, nullOtherSide} and skip the per-row merged-Row copy.
-func (o *joinOp) evalHashKeyDatumSlot(keyExpr planner.Expr, slot SlotView) (Datum, bool, error) {
-	v, err := evalExprSlot(keyExpr, slot, o.ctx)
+//
+// M0127-PS6.1 (05 §6, stage E5): `node` is an index into o.execExprs, the
+// compiled twin of buildKeyExprs/probeKeyExprs, not a planner.Expr. The
+// build/probe split still happens once in initExecKeys, so the two loops
+// still cannot disagree about orientation — they now index the same two
+// node lists instead of the same two expression lists.
+func (o *joinOp) evalHashKeyDatumSlot(node int32, slot SlotView) (Datum, bool, error) {
+	if node == noExpr {
+		return Datum{}, false, errNilHashKey
+	}
+	v, err := evalFastExpr(o.execExprs, node, slot, o.ctx)
 	if err != nil {
 		return Datum{}, false, err
 	}
@@ -946,9 +981,13 @@ func (o *joinOp) evalHashKeyDatumSlot(keyExpr planner.Expr, slot SlotView) (Datu
 	return v, true, nil
 }
 
-// evalHashKeySlot is the SlotView variant of evalHashKey.
-func (o *joinOp) evalHashKeySlot(keyExpr planner.Expr, slot SlotView) (string, bool, error) {
-	v, err := evalExprSlot(keyExpr, slot, o.ctx)
+// evalHashKeySlot is the SlotView variant of evalHashKey, on the same
+// compiled node index as evalHashKeyDatumSlot.
+func (o *joinOp) evalHashKeySlot(node int32, slot SlotView) (string, bool, error) {
+	if node == noExpr {
+		return "", false, errNilHashKey
+	}
+	v, err := evalFastExpr(o.execExprs, node, slot, o.ctx)
 	if err != nil {
 		return "", false, err
 	}
@@ -957,6 +996,14 @@ func (o *joinOp) evalHashKeySlot(keyExpr planner.Expr, slot SlotView) (string, b
 	}
 	return datumKey(v), true, nil
 }
+
+// errNilHashKey is raised when a key slot compiled to noExpr, i.e. the plan
+// handed the hash path a nil key expression. Before PS6.1 this reached
+// evalExprSlot(nil, …), whose fall-through calls e.Pos() on a nil interface
+// and panics in the build-side drain. A loud statement-scoped error is both
+// the PG contract and strictly safer than turning it into a silent NULL key,
+// which would make the join emit no matches instead of failing.
+var errNilHashKey = &ExecError{Code: "XX000", Message: "executor: hash join key expression is nil"}
 
 // mergedKeySlot builds a VirtualSlot that presents the merged
 // (left+right) column space for hash-key evaluation. realSlot
@@ -1103,11 +1150,19 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 // (planner.Join.ExecHashKeyPlan), so a pair the planner declined as not
 // hash-safe still gets its per-match check — which is why this is a pure
 // saving and not a semantic change.
+// M0127-PS6.1 (05 §6, stage E5) evaluates it through the compiled slab. The
+// !execCompiled arm is not defensive noise: newJoinOp fills execResidual
+// directly, so a joinOp that reached a residual check without an Open-time
+// initExecKeys would otherwise read execResidualNode's zero value — a valid
+// slab index into an empty slab.
 func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	if o.execResidual == nil {
 		return true, nil
 	}
-	v, err := evalExprSlot(o.execResidual, slot, o.ctx)
+	if !o.execCompiled {
+		o.compileExecExprs()
+	}
+	v, err := evalFastExpr(o.execExprs, o.execResidualNode, slot, o.ctx)
 	if err != nil {
 		return false, err
 	}
@@ -1489,7 +1544,8 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		} else {
 			keySlot = o.lazyProbeKeySlot.rebind(probeSlot, o.lazyLW, o.lazyRW, true)
 		}
-		probeKeyExpr := o.probeKeyExprs[0]
+		// M0127-PS6.1: the compiled node index, not the planner.Expr.
+		probeKeyNode := o.probeKeyNodes[0]
 		var key string // used only by the string path + the CTID lookup
 		var ok bool
 		var matches []Row
@@ -1514,7 +1570,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyExpr, keySlot)
+			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -1543,7 +1599,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// Assign the OUTER key: the preserveBuildSide CTID lookup
 			// below reads o.lazyHashCTID[key], so a shadowing inner
 			// declaration would leave it empty for FOR UPDATE joins.
-			key, ok, err = o.evalHashKeySlot(probeKeyExpr, keySlot)
+			key, ok, err = o.evalHashKeySlot(probeKeyNode, keySlot)
 			if err != nil {
 				return nil, err
 			}

@@ -9154,10 +9154,52 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       (PASS=95 MISMATCH=0 ERROR=0, plan shapes 99/99 identical) — both fixes
       change flag-OFF planning for every correlated-aggregate decorrelation.
       **P5.9's full bar re-run is now unblocked.** 2 ledger rows.
-- [ ] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
+- [x] **M0127-PS6.1 — compile `HashKeys[i]` accessors and the residual
       conjunction to `ExprNode` at `Open`** (`internal/executor/exprnode.go`);
       `ExprAdapter` fallback for unsupported kinds. IMPLEMENTATION-TODO PS6.1
       (first half); 05 §6 (E5). Bar: UNITS + BENCH (no alloc regression).
+      **DONE 2026-08-06** (05 §6.1, new). `compileExecExprs` hangs off
+      `initExecKeys` so the compiled node lists are derived from the SAME
+      build/probe split as the interpreted ones — a separate entry point could
+      compile one orientation while the loops evaluate the other.
+      `evalHashKeyDatumSlot`/`evalHashKeySlot`/`encodeCompositeKey`/
+      `joinPredicateMatchSlot` take slab indices. Bar MET: UNITS 0 FAIL, and
+      BENCH (`BenchmarkJoinKeyEval`/`BenchmarkJoinResidualEval`, 0 allocs both
+      arms) key 9.91→7.32 ns/op (−26 %), residual 150.3→139.0 ns/op (−7.5 %).
+      Also SPOT PASS (Q12=2, Q13=35) and DS05 — an executor hot path on every
+      hash join is a CLAUDE.md two-gate change, not a units-only one.
+      Three findings, none of them predicted by the stage:
+      (1) **The guard, not the dispatch, was the substantive change.**
+      `evalFastExpr`'s `ColumnRef` arm was a bare `slot.Get(colIdx)` with NO
+      bounds check, while its interpreted twin raises XX000 — a check that
+      exists because a raw index panic escaped the hash-join build-side drain
+      (`gatherOp.Open` runs it in the LEADER goroutine, outside
+      `ParallelGroup.Go`'s recover), reached `serveConn` and closed the client
+      socket (TPC-DS Q8, `expr.go:369-392`). Moving the key/residual onto the
+      compiled evaluator without it would have re-armed exactly that crash.
+      The guard is now in `evalFastExpr`, so filter/project/limit — latently
+      exposed since M0107-0003 — are covered too.
+      (2) **A capability-interface check costs more than the dispatch it
+      saves.** The first cut asserted to `widthSlot interface{ Width() int }`:
+      an itab lookup at ~1.4 ns/eval, alone enough to make the compiled arm
+      SLOWER than the interpreter (11.5 vs 10.1 ns/op). A concrete type switch
+      over the four `SlotView` impls is a type-descriptor compare AND lets each
+      arm call its own `Get` directly, so the guard is added while the
+      interface dispatch is removed. Second measurement to plan against: at
+      ~150 ns the residual is dominated by `evalBinary`, so P2.2's NARROWING,
+      not PS6.1's compilation, is what makes an all-equijoin residual cheap —
+      05 §8's per-tuple claim rests on P2.2.
+      (3) **An uncompiled node list fails in the worst direction.** A composite
+      encode over an empty list does not error — it returns the EMPTY key and
+      files every row under it: the Q78 degeneracy shape with wrong rows
+      instead of slow ones. `initExecKeys` now compiles on the `plan == nil`
+      path too and both encoders `ensureExecKeys` first;
+      `TestCompositeEncodeNeverRunsOnAnUncompiledNodeList` pins it. A nil key
+      expression raises `errNilHashKey` rather than degrading to a NULL key
+      (it previously reached `evalExprSlot(nil, …)`, which panics on
+      `e.Pos()`). 4 tests + 2 benchmarks, `join_compiled_key_test.go`.
+      1 ledger row (the MERGE key/residual seam is still fully interpreted —
+      `join_merge_stream.go:260` — and E5 named only the hash seam).
 - [ ] **M0127-PS6.2 — compiled ↔ interpreted sibling audit + parity spot-diffs**
       on expression corpora incl. the overflow corpus (0097-0037 precedent).
       IMPLEMENTATION-TODO PS6.1 (second half); 09 §1 SIBLING. Bar: parity corpus

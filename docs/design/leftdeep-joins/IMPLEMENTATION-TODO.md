@@ -1814,6 +1814,16 @@
   spot-diffs on expression corpora incl. the overflow corpus
   (0097-0037 precedent). Gate: units + parity corpus + seam microbench (no
   alloc regression).
+  - **FIRST HALF LANDED 2026-08-06** (fix_plan M0127-PS6.1; [05](05-executor-pipeline-rework.md)
+    §6.1). `compileExecExprs` off `initExecKeys`; key/residual seams read slab
+    indices. Measured: key eval 9.91→7.32 ns/op (−26 %), residual
+    150.3→139.0 ns/op (−7.5 %), 0 allocs both arms. Two things the stage did
+    not predict — `evalFastExpr`'s `ColumnRef` arm had NO bounds check, so
+    the seam would have re-armed the TPC-DS Q8 backend-killing panic
+    (`expr.go:353-393`); and a `widthSlot` capability assertion for that check
+    costs more than the dispatch it saves, so it is a concrete type switch
+    that also removes the interface `Get`. The item stays UNCHECKED: its
+    second half is the release gate, filed as fix_plan **M0127-PS6.2**.
 
 ## P6 — Deletion [S7, after S5-ON survives a clean nightly cycle]
 

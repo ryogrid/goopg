@@ -55,6 +55,12 @@ const compositeKeyWidth = 8
 // a join that runs and returns wrong rows.
 func (o *joinOp) initExecKeys() {
 	if o.plan == nil {
+		// A joinOp assembled outside Plan() (the build loops are driven
+		// directly by unit tests) has no key plan to resolve, but whatever
+		// key expressions it was handed still have to be COMPILED — an
+		// uncompiled composite encode walks an empty node list, returns a
+		// valid empty key, and files every row under it. M0127-PS6.1.
+		o.compileExecExprs()
 		return
 	}
 	plan := o.execKeyPlan()
@@ -85,6 +91,37 @@ func (o *joinOp) initExecKeys() {
 	if n := len(plan.Keys) * compositeKeyWidth; cap(o.execKeyBuf) < n {
 		o.execKeyBuf = make([]byte, 0, n)
 	}
+	o.compileExecExprs()
+}
+
+// compileExecExprs compiles the key accessors and the residual conjunction
+// into this join's ExprNode slab (M0127-PS6.1, design leftdeep-joins/05 §6,
+// stage E5). Called from initExecKeys so the compiled form is derived from the
+// SAME build/probe split as the interpreted expressions — a separate entry
+// point could compile one orientation while the loops evaluated the other.
+//
+// Rebuilds unconditionally: initExecKeys is an Open-time (or pre-Open) step
+// that may run more than once per operator (openLazyHashJoin,
+// buildLazyHashTable, sharedBuildWouldSpill all call it), and re-deriving is
+// cheaper to reason about than deciding when a cached slab went stale.
+func (o *joinOp) compileExecExprs() {
+	o.execExprs = o.execExprs[:0]
+	if cap(o.buildKeyNodes) < len(o.buildKeyExprs) {
+		o.buildKeyNodes = make([]int32, len(o.buildKeyExprs))
+	}
+	o.buildKeyNodes = o.buildKeyNodes[:len(o.buildKeyExprs)]
+	for i, e := range o.buildKeyExprs {
+		o.buildKeyNodes[i] = o.execExprs.buildExpr(e)
+	}
+	if cap(o.probeKeyNodes) < len(o.probeKeyExprs) {
+		o.probeKeyNodes = make([]int32, len(o.probeKeyExprs))
+	}
+	o.probeKeyNodes = o.probeKeyNodes[:len(o.probeKeyExprs)]
+	for i, e := range o.probeKeyExprs {
+		o.probeKeyNodes[i] = o.execExprs.buildExpr(e)
+	}
+	o.execResidualNode = o.execExprs.buildExpr(o.execResidual)
+	o.execCompiled = true
 }
 
 // ensureExecKeys initialises the key plan if Open did not. The build loops are
@@ -92,7 +129,7 @@ func (o *joinOp) initExecKeys() {
 // and a loop that indexed an empty expression list would panic there rather
 // than degrade.
 func (o *joinOp) ensureExecKeys() {
-	if o.buildKeyExprs == nil {
+	if o.buildKeyExprs == nil || !o.execCompiled {
 		o.initExecKeys()
 	}
 }
@@ -123,10 +160,17 @@ func (o *joinOp) multiKey() bool { return len(o.execKeys) > 1 }
 // datum did not fit it. On the build side that demands a demotion (the table
 // must be re-keyed); on the probe side it simply means no build key can equal
 // this one, because every build key IS int64-representable.
-func (o *joinOp) encodeCompositeKey(exprs []planner.Expr, slot SlotView) (ok bool, packMiss bool, err error) {
+// M0127-PS6.1: `nodes` are compiled slab indices (o.buildKeyNodes /
+// o.probeKeyNodes), evaluated with evalFastExpr. A multi-column key is the
+// shape that evaluates the MOST expressions per row, so it is the one that
+// gains most from losing the per-column type switch.
+func (o *joinOp) encodeCompositeKey(nodes []int32, slot SlotView) (ok bool, packMiss bool, err error) {
 	o.execKeyBuf = o.execKeyBuf[:0]
-	for _, e := range exprs {
-		v, err := evalExprSlot(e, slot, o.ctx)
+	for _, node := range nodes {
+		if node == noExpr {
+			return false, false, errNilHashKey
+		}
+		v, err := evalFastExpr(o.execExprs, node, slot, o.ctx)
 		if err != nil {
 			return false, false, err
 		}
@@ -155,7 +199,14 @@ func (o *joinOp) encodeCompositeKey(exprs []planner.Expr, slot SlotView) (ok boo
 // Split from the insert so callers copy the build row only after the key has
 // survived — ownedBuildRow is the expensive half.
 func (o *joinOp) encodeBuildCompositeKey(slot SlotView) (ok bool, err error) {
-	keyOK, packMiss, err := o.encodeCompositeKey(o.buildKeyExprs, slot)
+	// M0127-PS6.1: two predicted branches, paid per build row, against a
+	// silent wrong-answer join. An encode over an uncompiled (empty) node
+	// list succeeds and returns the EMPTY key, so every row would be filed
+	// in one bucket under it — the failure would look like the Q78
+	// degeneracy this file exists to prevent, with wrong rows instead of
+	// slow ones.
+	o.ensureExecKeys()
+	keyOK, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
 	if err != nil {
 		return false, err
 	}
@@ -168,7 +219,7 @@ func (o *joinOp) encodeBuildCompositeKey(slot SlotView) (ok bool, err error) {
 		// row filed before the demotion lands under the identical key as one
 		// filed after it.
 		o.demoteCompositeIntKeys()
-		keyOK, packMiss, err = o.encodeCompositeKey(o.buildKeyExprs, slot)
+		keyOK, packMiss, err = o.encodeCompositeKey(o.buildKeyNodes, slot)
 		if err != nil {
 			return false, err
 		}
@@ -226,7 +277,10 @@ func (o *joinOp) demoteCompositeIntKeys() {
 // `wantKey` forces the key to be materialised anyway, for the FOR UPDATE path
 // whose parallel CTID map is keyed alongside lazyHash.
 func (o *joinOp) compositeProbeMatches(slot SlotView, wantKey bool) (matches []Row, key string, ok bool, err error) {
-	keyOK, packMiss, err := o.encodeCompositeKey(o.probeKeyExprs, slot)
+	// See encodeBuildCompositeKey: the probe half must not be able to run on
+	// an uncompiled node list either, or it looks up the empty key.
+	o.ensureExecKeys()
+	keyOK, packMiss, err := o.encodeCompositeKey(o.probeKeyNodes, slot)
 	if err != nil {
 		return nil, "", false, err
 	}

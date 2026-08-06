@@ -82,8 +82,13 @@ const noExpr = int32(-1)
 // For ExprAdapter, orig holds the original planner.Expr to keep it
 // GC-live and to delegate evaluation to evalExprSlot.
 //
-// For all concrete kinds, data is encoded in payload bytes or child
-// indices; orig is nil (no GC pointer cost per row for hot kinds).
+// For all concrete kinds except ExprColumnRef, data is encoded in payload
+// bytes or child indices and orig is nil. ExprColumnRef also keeps orig:
+// evalFastExpr's out-of-range arm delegates to evalExprSlot so the raised
+// error is byte-identical to the interpreted twin's (M0127-PS6.1; see the
+// bounds-check comment in evalFastExpr). The pointer is read on the error
+// path only, and the planner.Expr tree is retained by the plan regardless,
+// so it adds no retention.
 type ExprNode struct {
 	Kind    ExprKind
 	_pad    [3]byte
@@ -108,7 +113,9 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 	switch t := e.(type) {
 	case *planner.ColumnRef:
 		idx := int32(len(*s))
-		*s = append(*s, ExprNode{Kind: ExprColumnRef})
+		// orig is kept so the bounds-check arm of evalFastExpr can raise the
+		// interpreted twin's exact error rather than a second, diverging one.
+		*s = append(*s, ExprNode{Kind: ExprColumnRef, orig: e})
 		binary.LittleEndian.PutUint32((*s)[idx].payload[:], uint32(t.Index))
 		return idx
 
@@ -206,6 +213,27 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 	}
 }
 
+// evalFastColumnRefErr raises the out-of-range (or nil-slot) ColumnRef error
+// for the compiled evaluator. It delegates to evalExprSlot on the original
+// planner.Expr so the message is exactly the interpreted twin's — including
+// the column name and the per-concrete-type wording — and only synthesises
+// its own text when a node was built without orig. M0127-PS6.1.
+func evalFastColumnRefErr(n *ExprNode, slot SlotView, ctx *Context, colIdx, width int) (Datum, error) {
+	if n.orig != nil {
+		d, err := evalExprSlot(n.orig, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		// evalExprSlot accepted an index this arm rejected: the two
+		// evaluators disagree about what is in range, which is a defect in
+		// this guard, not in the plan. Fail loudly rather than papering over
+		// a divergence the sibling rule exists to catch.
+		return d, &ExecError{Code: "XX000", Message: fmt.Sprintf(
+			"executor: compiled/interpreted ColumnRef bounds disagree at index %d (width %d)", colIdx, width)}
+	}
+	return Datum{}, &ExecError{Code: "XX000", Message: fmt.Sprintf("column ref %d out of slot range %d", colIdx, width)}
+}
+
 // evalFastExpr evaluates the expression tree rooted at exprs[idx] against slot.
 //
 // Dispatches common kinds via integer switch (no interface type assertions)
@@ -219,6 +247,52 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	switch n.Kind {
 	case ExprColumnRef:
 		colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		// Sibling-path guard (M0127-PS6.1, 09 §1). The interpreted twin
+		// bounds-checks every ColumnRef before Get and raises XX000
+		// (expr.go:353-393); that check exists because a raw index panic
+		// escaped the hash-join build-side drain — which gatherOp.Open runs
+		// in the LEADER goroutine, outside ParallelGroup.Go's recover — and
+		// closed the client socket (TPC-DS Q8). PS6.1 puts this evaluator on
+		// that exact seam, so the compiled twin must make the same promise:
+		// an ERROR kills the statement, never the backend.
+		//
+		// The check is a CONCRETE type switch, not an assertion to a
+		// `Width() int` capability interface. Measured (BenchmarkJoinKeyEval):
+		// the capability assertion is an itab lookup and costs ~1.4 ns/eval,
+		// which alone made the compiled key arm SLOWER than the interpreter it
+		// replaces. A concrete switch is a type-descriptor compare, and it
+		// also lets each arm call its own Get directly — so the guard is added
+		// while the interface dispatch on Get is removed.
+		//
+		// An out-of-range index delegates to evalExprSlot so the raised error
+		// is byte-identical to the interpreted twin's per-type text rather
+		// than a second, diverging one. It is the error path; cost is moot.
+		switch s := slot.(type) {
+		case *MaterializedSlot:
+			if colIdx < 0 || colIdx >= len(s.row) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.row))
+			}
+			return s.Get(colIdx), nil
+		case *VirtualSlot:
+			if colIdx < 0 || colIdx >= len(s.cols) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.cols))
+			}
+			return s.Get(colIdx), nil
+		case *Slot:
+			if colIdx < 0 || colIdx >= len(s.Cells) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.Cells))
+			}
+			return s.Get(colIdx), nil
+		case rowSlotView:
+			if colIdx < 0 || colIdx >= len(s) {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s))
+			}
+			return s.Get(colIdx), nil
+		case nil:
+			return evalFastColumnRefErr(n, slot, ctx, colIdx, 0)
+		}
+		// A SlotView implementation this switch does not know: no width is
+		// reachable, so behave as the pre-PS6.1 arm did.
 		return slot.Get(colIdx), nil
 
 	case ExprIntConst:

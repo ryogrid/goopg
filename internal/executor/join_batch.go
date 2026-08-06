@@ -726,7 +726,7 @@ func (o *joinOp) buildKeyOfRow(row Row) (Datum, bool, error) {
 		realWidth, nullWidth = o.lazyLW, o.lazyRW
 	}
 	keySlot := o.lazyBuildKeySlot.rebind(o.batchKeySlot, realWidth, nullWidth, o.batches.buildIsLeft)
-	return o.evalHashKeyDatumSlot(o.buildKeyExprs[0], keySlot)
+	return o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
 }
 
 // routeProbeRow decides whether a probe row belongs to the current batch. When
