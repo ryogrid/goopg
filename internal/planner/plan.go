@@ -1010,6 +1010,42 @@ type Aggregate struct {
 	// two nodes are created together and the link is what pairs them at
 	// runtime.
 	PartialSource *Aggregate
+
+	// GroupingSets is non-nil for GROUP BY GROUPING SETS / ROLLUP / CUBE.
+	// Each entry is one grouping set, listed as ASCENDING indices into
+	// GroupExprs (which holds the deduplicated union of every set's
+	// expressions — PostgreSQL's `parse->groupClause`). The executor makes
+	// one pass over the child and keeps one hash table per set, the way
+	// nodeAgg.c does for AGG_HASHED/AGG_MIXED; a GroupExprs column that is
+	// not listed in the current set is emitted NULL, which is the SQL
+	// standard's value for a dimension rolled up away at that level.
+	//
+	// nil (the common case) means the ordinary single-set aggregate, and
+	// every construction site that does not set it keeps today's behaviour.
+	// M0125-0048.
+	GroupingSets [][]int
+	// GroupingMasks carries one entry per distinct GROUPING(...) call in the
+	// query, in the order the columns are appended to the output schema:
+	// output column len(GroupExprs)+len(Aggs)+i holds
+	// GroupingMasks[i][setIdx] for a row produced by grouping set setIdx.
+	//
+	// Materialising the bitmask as an output column (rather than as an
+	// expression over a hidden set-id) is what lets the target list resolve
+	// GROUPING(a,b) to a plain ColumnRef: the mask depends only on which set
+	// produced the row, never on data (PostgreSQL evaluates GroupingFunc
+	// from AggState->current_set for the same reason).
+	//
+	// Passthrough columns are appended AFTER these, so a functionally
+	// determined column discovered during target resolution never displaces
+	// a grouping column. M0125-0048.
+	GroupingMasks [][]int64
+}
+
+// GroupingMaskColOffset is the index of the first GROUPING(...) output
+// column: group expressions, then aggregates, then grouping masks, then
+// passthrough columns.
+func (n *Aggregate) GroupingMaskColOffset() int {
+	return len(n.GroupExprs) + len(n.Aggs)
 }
 
 // AggMode is an aggregate node's role in a parallel split.
@@ -1243,15 +1279,18 @@ func (n *CTEScan) DeclSeq() int {
 // The key is the declaring CommonTableExpr's source offset plus its name, not
 // the plannedCTE pointer, because ONE declaration can legitimately be planned
 // more than once: planSelect re-enters on the head operand of a set-op chain,
-// so M0125-0040's grouping-sets rewrite yields two distinct plannedCTEs for the
-// one synthetic `__gs_src_N` AST node. Those must keep sharing a single
-// materialization — that sharing is the whole point of the rewrite — and a
-// declaration site is stable across replanning where a pointer is not.
+// which yielded two distinct plannedCTEs for the one synthetic `__gs_src_N`
+// AST node M0125-0040's grouping-sets rewrite built. That rewrite is gone
+// (M0125-0048 replaced it with a single-pass aggregate that needs no synthetic
+// CTE), but the re-entry it exposed is not: any declaration reached through a
+// set-op head operand is planned twice and must keep sharing one
+// materialization, and a declaration site is stable across replanning where a
+// pointer is not.
 //
 // Both producers of a CommonTableExpr give distinct declarations distinct
 // (pos, name) pairs: the parser stamps pos from the declaring identifier token,
-// and the two synthetic producers (groupingsets_share.go, CREATE RECURSIVE
-// VIEW) leave pos 0 but generate a name unique within the statement.
+// and the synthetic producer (CREATE RECURSIVE VIEW) leaves pos 0 but generates
+// a name unique within the statement.
 //
 // Falls back to the bare name for a CTEScan built outside preplanWithClause
 // (tests), which is the pre-M0125-0050 behaviour and unambiguous there: such a

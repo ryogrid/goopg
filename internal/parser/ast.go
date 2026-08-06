@@ -915,18 +915,26 @@ type SelectStmt struct {
 	// every expression referenced by any generated set (so pre-existing
 	// consumers — analyzer resolution, FOR UPDATE's "not allowed with
 	// GROUP BY" check, positional GROUP BY — keep working unmodified);
-	// GroupingSets carries the actual expanded set list the planner
-	// rewrites into a UNION ALL of plain-GROUP-BY branches. M0122-0004.
+	// GroupingSets carries the actual expanded set list, which the planner
+	// lowers into a single grouping-sets Aggregate node (M0125-0048; it
+	// used to rewrite it into a UNION ALL of plain-GROUP-BY branches).
+	// M0122-0004.
 	GroupingSets *GroupingSetsSpec
 }
 
 // GroupingSetsSpec is the fully expanded form of a GROUP BY clause that
 // used GROUPING SETS / ROLLUP / CUBE. SQL:1999 §7.9 defines the result of
 // such a clause as equivalent to grouping by each listed set independently
-// and taking the UNION ALL of the results — which is exactly how the
-// planner executes it (see rewriteGroupingSets in internal/planner).
+// and taking the UNION ALL of the results. goopg computes that result the
+// way PostgreSQL does — one pass over the source, one hash table per set
+// (see prepareGroupingSets in internal/planner).
 type GroupingSetsSpec struct {
 	pos int
+	// Flattened records that the planner has already rewritten the owning
+	// statement's GroupBy list into the deduplicated union of Sets.
+	// planSelect re-enters on the head operand of a set-op chain, so the
+	// rewrite has to be idempotent. M0125-0048.
+	Flattened bool
 	// Sets holds one entry per generated grouping set: the list of
 	// original GROUP BY expressions active in that set. ROLLUP(a,b,c)
 	// expands to the n+1 prefixes {a,b,c},{a,b},{a},{}; CUBE(a,b,c)

@@ -7,11 +7,14 @@ package executor
 // every consumer the SAME body Node: `planScanRangeVar` builds each CTEScan
 // with `Child: ce.body`, so the plan is a DAG, not a tree. The EXPLAIN walker
 // walks it as a tree, so an N-times-referenced CTE printed its whole subtree N
-// times. TPC-DS Q67 after M0125-0040 showed eight `CTE Scan on __gs_src_871`
-// nodes each carrying a full copy of a four-table join — 36 `store_sales`
-// mentions for a join that EXECUTES once (the rows are materialised on the
-// first reference and replayed from ctx.CTERowCache). The plan therefore
-// over-stated the work by the reference count.
+// times. TPC-DS Q67 under M0125-0040's grouping-sets source-sharing hoist
+// (since retired by M0125-0048) showed eight `CTE Scan on __gs_src_871` nodes
+// each carrying a full copy of a four-table join — 36 `store_sales` mentions
+// for a join that EXECUTES once (the rows are materialised on the first
+// reference and replayed from ctx.CTERowCache). The plan therefore over-stated
+// the work by the reference count. The same over-statement reaches any
+// multiply-referenced user CTE, which is why the fix outlived the hoist that
+// exposed it.
 //
 // PostgreSQL renders the same shape as ONE section. `SS_process_ctes`
 // (optimizer/plan/subselect.c) turns each WITH entry into a subplan of the top
@@ -77,10 +80,11 @@ type cteHoist struct {
 //
 //   - A body-POINTER key would under-hoist. A plain `WITH` hands every consumer
 //     the same body Node (planScanRangeVar's `Child: ce.body`), but planSelect
-//     re-enters on the head operand of a set-op chain, so M0125-0040's
-//     grouping-sets rewrite plans the one synthetic `__gs_src_N` declaration
-//     twice — distinct, structurally identical bodies for the one buffer they
-//     share. Q67 would print two sections for one materialisation.
+//     re-enters on the head operand of a set-op chain, so any declaration
+//     reached that way is planned twice — distinct, structurally identical
+//     bodies for the one buffer they share, and two sections printed for one
+//     materialisation. (The witness was M0125-0040's synthetic `__gs_src_N`,
+//     retired by M0125-0048; the re-entry it exposed is not.)
 //   - A NAME key would over-hoist, and used to: two DIFFERENT declarations
 //     sharing a name in disjoint scopes collapsed into one section. That was
 //     the render matching the runtime while the runtime was also wrong

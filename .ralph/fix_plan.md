@@ -5198,8 +5198,48 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       linkage is re-measured under M0127-P1.3/P5.9 (see the -0033 skip
       note), but the ROLLUP fan-out fix itself is this item's alone.
 
-- [ ] **M0125-0048 — the faithful grouping-sets aggregate: one streaming pass,
-      one hash table per set** (filed 2026-08-06 by `M0125-0040`, which landed
+- [x] **M0125-0048 — the faithful grouping-sets aggregate: one streaming pass,
+      one hash table per set**
+      **[CLOSED 2026-08-06 — `internal/planner/groupingsets.go` +
+      `internal/executor/operators_join_agg.go`; design
+      `docs/design/0125-0048-single-pass-grouping-sets.md`; 4 ledger rows]**
+      ONE `Aggregate` node now carries `GroupExprs` = the deduplicated union of
+      the sets (PG's `parse->groupClause`), `GroupingSets [][]int` = the slots
+      each set keeps, and `GroupingMasks [][]int64` = each `GROUPING(...)`
+      call's bitmask per set; `aggregateOp.Open` evaluates the grouping columns
+      once per input row and routes the row into every set's hash table. The
+      UNION-ALL expansion, `substituteGroupingExpr`, `groupingBitmask` and the
+      whole `shareGroupingSetsSource`/`__gs_src_N` hoist are DELETED, as this
+      item required (`GOOPG_GS_SHARE_SOURCE` survives only as
+      `retired(M0125-0048)` so older artefacts stay attributable).
+      Three decisions worth carrying forward: (1) **the mask is an output
+      COLUMN, not an expression over a hidden set-id** — it depends only on
+      which set produced the row, so the target list resolves `GROUPING(a,b)`
+      to a plain `ColumnRef` and no new Expr node, evaluator case or EXPLAIN
+      formatter was needed; the column is named `grouping`, which is what PG
+      names it and what the retired `IntegerConst` rewrite could not produce.
+      (2) **The ordinary aggregate is the one-set case, not a second
+      operator** (`sets = [[0..n-1]]`, set prefix omitted when there is one
+      set) — a separate operator would have cloned 250 lines of
+      shared-state/`finishAgg` logic, the sibling-path hazard. (3) The output
+      sort is per SET then per key, which reproduces the retired expansion's
+      row order exactly, so no query's rows moved.
+      **What the oracle taught this change:** PG proves a functional dependency
+      only against `groupClauseCommonVars` — the INTERSECTION of the sets
+      (`gset_common`) — so `SELECT id, name … GROUP BY ROLLUP(id)` is 42803
+      even with `id` a primary key, because the grand-total level groups by
+      nothing (`parse_agg.c parseCheckAggregates`);
+      `isColumnFunctionallyDetermined` now consults `groupCommonSlots`. 22
+      shapes captured live from PG 18.3 on 65432 are byte-identical.
+      Gates: SF0.5 plan channel `queries=99 same=91 changed=8` and the eight
+      ARE exactly the eight ROLLUP queries (Q5 Q14 Q18 Q22 Q27 Q67 Q77 Q80) —
+      no query without a grouping-set construct moved; sweep of those eight
+      `PASS=8 MISMATCH=0`; TPC-H Q12=2/Q13=35 canonical; units gate PASS.
+      Q27 collapses from `CTE __gs_src_606` + a 3-branch Append to one
+      `HashAggregate (2 keys, 3 grouping sets)` over one scan — PG's node
+      count. Runtime was not the goal but moved anyway: Q67 82s→17s, Q18
+      37s→9s, Q22 21s→4s, Q27 31s→10s.
+      ORIGINAL FILING: (filed 2026-08-06 by `M0125-0040`, which landed
       that item's cheaper candidate (a); ledger row same date). goopg still
       expands `ROLLUP`/`CUBE`/`GROUPING SETS` into a UNION ALL of one branch
       per set and now MATERIALIZES the shared source; PostgreSQL computes

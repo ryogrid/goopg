@@ -1491,6 +1491,18 @@ func describePlan(n planner.Node) string {
 		case planner.AggModeFinal:
 			prefix = "Finalize "
 		}
+		if p.GroupingSets != nil {
+			// M0125-0048: one node, one hash table per grouping set. PG shows
+			// this as a HashAggregate (or MixedAggregate when it sorts some
+			// levels) carrying one "Hash Key:"/"Group Key:" line per set,
+			// including the bare "Group Key: ()" for the grand total. goopg
+			// has no per-key detail lines (see the note below), so the set
+			// count rides on the existing key-count suffix — which is what
+			// distinguishes this from the N-branch UNION ALL the clause used
+			// to expand into.
+			return fmt.Sprintf("%sHashAggregate (%d keys, %d grouping sets)",
+				prefix, len(p.GroupExprs), len(p.GroupingSets))
+		}
 		if len(p.GroupExprs) == 0 {
 			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
 			// regardless of strategy, so this one is already faithful.

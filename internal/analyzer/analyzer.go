@@ -1176,10 +1176,11 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "int8"}, nil
 	case *parser.GroupingCall:
 		// GROUPING(a, b, ...) — its value depends only on which grouping
-		// set produced the current row (resolved to a literal by the
-		// planner's grouping-sets rewrite, M0122-0004), but the args still
-		// need scope resolution here so an unknown-column reference is
-		// caught the same way it would be for a plain SELECT-list column.
+		// set produced the current row, so the planner materialises it as an
+		// aggregate output column rather than evaluating it per row
+		// (M0125-0048). The args still need scope resolution here so an
+		// unknown-column reference is caught the same way it would be for a
+		// plain SELECT-list column.
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
 				return catalog.Type{}, err
