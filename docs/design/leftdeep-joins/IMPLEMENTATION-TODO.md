@@ -1807,7 +1807,7 @@
 
 ## P-S6 — Compiled key/residual evaluation [S6]
 
-- [ ] **PS6.1** Compile `HashKeys[i]` accessors and the residual conjunction
+- [x] **PS6.1** Compile `HashKeys[i]` accessors and the residual conjunction
   to `ExprNode` at `Open` (`internal/executor/exprnode.go`); `ExprAdapter`
   fallback for unsupported kinds. Sibling-path audit compiled ↔ interpreted
   is the release gate ([09](09-verification-and-acceptance.md) §1): parity
@@ -1822,8 +1822,28 @@
     the seam would have re-armed the TPC-DS Q8 backend-killing panic
     (`expr.go:353-393`); and a `widthSlot` capability assertion for that check
     costs more than the dispatch it saves, so it is a concrete type switch
-    that also removes the interface `Get`. The item stays UNCHECKED: its
-    second half is the release gate, filed as fix_plan **M0127-PS6.2**.
+    that also removes the interface `Get`.
+  - **SECOND HALF (the release gate) LANDED 2026-08-06** (fix_plan
+    M0127-PS6.2; [05](05-executor-pipeline-rework.md) §6.2).
+    `expr_sibling_parity_test.go`: nine corpora × every `SlotView` × both
+    twins, comparing OUTCOMES (panic / error incl. code+message+position /
+    Datum) rather than values — PS6.1's own divergence was a failure mode, and
+    a value comparison cannot see one. THREE divergences found, all invisible
+    to existing tests: (1) AND/OR short-circuited on `!IsNull()` compiled vs
+    `Kind == KindBool` interpreted, so a non-boolean left operand
+    short-circuited AND WAS RETURNED as the AND/OR's value — and since an
+    arena-backed string's `Datum.Int` is the mctx coordinate, which branch was
+    taken depended on the arena offset (619 diffs); (2) the float-type and
+    int2/int4-overflow decisions each existed twice, case-folding on one twin
+    and exact-match on the other — and the float pair matters most because the
+    compiled twin *diverts to `evalExprSlot`* on that predicate, so a
+    disagreement lands the fallback in the branch it was avoiding; (3) every
+    compiled `evalBinary`/`evalUnary`/`evalPgLSNBinary` error carried position
+    0. (3) was invisible to every hand-built corpus (`planner.BinaryOp.pos` is
+    unexported ⇒ both twins render 0), which is why a ninth corpus is resolved
+    from real SQL via `planner.ResolveIndexPredicate`. Bench after the fixes,
+    0 allocs: key 11.39 → 6.52 ns/op, residual 149.8 → 130.3 ns/op. **Stage E5
+    is complete.**
 
 ## P6 — Deletion [S7, after S5-ON survives a clean nightly cycle]
 

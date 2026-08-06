@@ -25,7 +25,18 @@
 - Sibling-path audits, explicitly listed per stage in code review: E4
   (planner keys ↔ executor key encode), §2.1 of
   [06](06-hash-spill-and-memory.md) (planner nbatch ↔ executor nbatch),
-  E5 (compiled ↔ interpreted evaluators).
+  E5 (compiled ↔ interpreted evaluators). **E5's audit was run 2026-08-06 and
+  is the model for the other two** ([05](05-executor-pipeline-rework.md) §6.2,
+  `internal/executor/expr_sibling_parity_test.go`): it compares OUTCOMES — a
+  panic, an error (code + message + position) and a value are three points in
+  one space — over every corpus entry × every `SlotView` implementation, and
+  all three divergences it found were failure-mode or unreachable-today
+  divergences that a value-only diff cannot see. Two transferable lessons: a
+  fallback predicate must be the SAME FUNCTION as the branch it falls back to
+  (a diverted case that disagrees lands in the branch it was diverted to
+  avoid), and a hand-built corpus is blind to anything the planner alone can
+  set — E5's lost-position divergence was only visible once a corpus was
+  resolved from real SQL.
 
 ## 2. Stage gates (advancement criteria)
 

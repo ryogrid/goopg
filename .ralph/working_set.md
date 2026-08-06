@@ -1,57 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.7 roll-up CLOSED.** Both sub-items were already `[x]`; the
-residue was the roll-up's own BAR, and the finding is that **the bar's premise
-expired between the sub-items landing and this read.**
+Last loop: **M0127-PS6.2 DONE — E5's release gate, so STAGE E5 IS COMPLETE.**
+The compiled ↔ interpreted sibling audit ran and found THREE divergences, none
+of which any existing test could see. Carry the method, not just the result.
 
--a and -b each recorded "PLAN not applicable, and the reason is structural, not
-a skip: every consumer is behind an OFF-by-default gate". True when written
-(2026-08-05 12:20 / 12:47), FALSE at HEAD: P5.9 flipped `GOOPG_PGSHAPED_DP` ON
-by default at 2026-08-06 02:22 (`pgShapedDPFromEnv` = `v != "0"`; the spotcheck
-banner prints `GOOPG_PGSHAPED_DP=unset(on)`). `hashJoinCost` is now reached on
-every hash path the live search considers (`addHashJoinPath` ← joinpaths.go:197)
-and `finalPath` → `getCheapestFractionalPath` runs on every searched statement.
+**The harness compares OUTCOMES, not values.** A panic, an error (code +
+message + position) and a Datum are three points in one space; every corpus
+entry is rendered to one string on both twins × every `SlotView` impl. That
+shape is what PS6.1's own finding demanded — the twins had diverged in a
+FAILURE mode (`ColumnRef` bounds), which a value diff is blind to.
 
-**"Zero diffs in the default arm" is void, not failed** — it was a containment
-check on an inert search; post-flip the default arm is *supposed* to move plans.
-What discharges P5.7 is that both halves were in the tree the flip's own
-acceptance measured (run 4 `23dcc60e` 01:04, and the default-arm audit: Q9 final
-joinrel 6.3×, `parity_violations=0`) — measured under P5.9's label, never P5.7's.
+1. **AND/OR short-circuited under different conditions — wrong ANSWERS on a
+   join-residual seam.** `evalFastExpr` gated on `!left.IsNull()`;
+   `evalAnd`/`evalOr` gate on `left.Kind == KindBool`. `BoolValue()` is
+   `Int != 0` on ANY Kind, so a non-boolean left operand short-circuited AND
+   WAS RETURNED as the AND/OR's value. For an ARENA-backed string `Datum.Int`
+   is the mctx coordinate (`offset<<32|length`) — so which branch was taken
+   depended on the arena offset. 619 diffs, one root cause.
+2. **Two type-spelling decisions each existed twice** (`isFloatResultType` +
+   an inline exact-match list; `overflowCodeForType` + an inline `switch`).
+   The float pair is the transferable lesson: the compiled twin DIVERTS to
+   `evalExprSlot` on that predicate, so when the two lists disagree the
+   fallback lands in the branch it was diverted to avoid. One function each now.
+3. **Every compiled error carried position 0** (`evalBinary`/`evalUnary`/
+   `evalPgLSNBinary` got a literal 0), now compiled into `payload[4:8]`.
+   **Invisible to every hand-built corpus** — `planner.BinaryOp.pos` is
+   unexported, so both twins render 0 and agree for the wrong reason. Found
+   only after adding a ninth corpus resolved from real SQL via
+   `planner.ResolveIndexPredicate`. Generalise: a hand-built corpus cannot see
+   anything only the planner can set.
 
-**The defect was bigger than P5.7 and is fixed in the same commit: 28 files in
-`internal/planner/` still carried "Still inert: `GOOPG_PGSHAPED_DP` is OFF … so
-they cannot change a plan" headers** — including `cost_funcs.go`, the file
-`hashJoinCost` lives in. Those banners are read as gate-skip authority. Each
-corrected to verified post-flip reachability, per file, not blanket-rewritten.
-Three came out differently: `collapse.go` (joinlist IS consumed at
-joinsearchseam.go:162/170; only the narrower `GOOPG_PGSHAPED_COLLAPSE`
-flattening arm is off), `tuplefraction.go` (below), `exprwalk.go` (stale from a
-DIFFERENT cause — M0125-0002's walker conversion — left alone + ledgered rather
-than corrected on a guess).
+Files: `exprnode.go` (short-circuit gate, pos in payload, `Pos` on the 22003),
+`expr.go` (both inline lists replaced by the shared predicates),
+`expr_sibling_parity_test.go` (new, 9 corpora), 05 §6.2 + 09 §1 +
+IMPLEMENTATION-TODO (PS6.1 now `[x]`), fix_plan, 2 ledger rows.
 
-**Discharged:** P5.7-b's ledger row "no production PRODUCER of a fraction yet" —
-P5.9-b added `searchTupleFraction` (joinsearchseam.go:579) ← planner.go:1128.
-Checked rule #2: no gap, the only arm skipping it is `isSimpleSingle`, which is
-single-relation and never reaches the search. Note the half live even with NO
-LIMIT: `ConsiderStartup` is `tupleFraction > 0`, so fraction 0 actively PRUNES
-fast-start paths rather than abstaining. Caller-fraction half re-filed (no
-`cursor_tuple_fraction` source).
+Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); DS05 PASS=95 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan shapes 99/99 identical
+(`analysis/ps62/ds05.log`); BENCH 0 allocs, key 11.39→6.52, residual
+149.8→130.3 ns/op; pgbench smoke via hook.
 
-Files: 28 planner files (comment-only) + fix_plan (P5.7 tick, -a/-b EXPIRED
-notes), IMPLEMENTATION-TODO (P5.7 roll-up entry), 04 §4.4 (new), design README,
-3 ledger rows (1 flipped `resolved`, 2 new).
-
-Gates run: UNITS 0 FAIL; **SPOT PASS (Q12=2, Q13=35)**. DS05 not re-run — the
-diff is comment-only, zero executable change (`go build` + `go vet` clean).
-
-NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 items
-are now **PS6.1/PS6.2**, then the P6.x deletion series (P6.3 deletes the legacy
-enumerator + `rewriteJoinsToNLI`/`tryBuildNLI`, which is what collapses the two
-NLI constructors back to one — see the 2026-08-06 P5.4b-ii-b-2 ledger row).
-**Carry this loop's lesson in: a flag flip invalidates comments, task
-justifications and skipped gates that cited the old default, and none of them
-appear in the flip's diff — when P6.x deletes the legacy arm, sweep its claims
-in the same commit rather than leaving them for a later audit.**
+NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked is
+**M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
+`executor.go:160-163`, env vars, `IsCanonicalKeyEquality` orphan check). Note
+the S7 precondition in the fix_plan order line: P6.1–P6.4 are gated on S5-ON
+surviving a clean nightly cycle — check `ci/logs/action-items.md`'s newest run
+before selecting, and if that has not happened, say so and pick per the banner.
 
 Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items,
 all subjects already filed under M-NIGHTLY. Nothing new.

@@ -69,8 +69,8 @@ const (
 	ExprIntConst           // payload[0:8] = int64 value
 	ExprBoolConst          // payload[0] = 0 (false) or 1 (true)
 	ExprNullConst          // no payload
-	ExprBinaryOp           // payload[0] = uint8(parser.OpCode); childA/childB = operand indices
-	ExprUnaryOp            // payload[0] = uint8(parser.OpCode); childA = operand index
+	ExprBinaryOp           // payload[0] = op, [1] = overflow code, [4:8] = int32 pos; childA/childB = operands
+	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
 )
 
@@ -193,6 +193,13 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		// payload[1] carries the int2/int4 overflow code so evalFastExpr can
 		// apply the same range check evalExprSlot does. M0097 regression fix.
 		(*s)[idx].payload[1] = overflowCodeForType(t.ResultType)
+		// payload[4:8] carries the source position. The interpreted twin passes
+		// x.Pos() to evalBinary/evalPgLSNBinary and stamps it on every ExecError
+		// it raises; the compiled twin passed a literal 0, so the SAME failing
+		// expression carried a position on one evaluator and none on the other.
+		// It is compiled in at build time rather than read from orig because
+		// only ExprColumnRef keeps orig. M0127-PS6.2 sibling audit.
+		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
 		return idx
 
 	case *planner.UnaryOp:
@@ -201,6 +208,7 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		childA := s.buildExpr(t.Operand)
 		(*s)[idx].childA = childA
 		(*s)[idx].payload[0] = uint8(t.Op)
+		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
 		return idx
 
 	default:
@@ -316,13 +324,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		}
 		// Short-circuit boolean operators before evaluating the right side,
 		// matching evalExprSlot behaviour.
+		//
+		// The gate is `Kind == KindBool`, NOT `!IsNull()` (M0127-PS6.2). Datum
+		// .BoolValue() is `Int != 0` on ANY Kind, so `!IsNull()` short-circuits
+		// on non-boolean left operands too — and then RETURNS THAT OPERAND as
+		// the result of the AND/OR. The interpreted twin cannot do that: it
+		// declines to short-circuit and evalAnd/evalOr (expr.go) always yield
+		// KindBool or NULL. Two ways that mattered: a KindString left operand
+		// made `s AND x` evaluate to the string, and for an ARENA-backed string
+		// Datum.Int is the mctx coordinate (offset<<32|length), so BoolValue()
+		// — and hence which branch was taken — depended on the arena offset.
+		// Found by the PS6.2 parity corpus (619 diffs, 2 root causes).
 		switch op {
 		case parser.OpAnd:
-			if !left.IsNull() && !left.BoolValue() {
+			if left.Kind == KindBool && !left.BoolValue() {
 				return left, nil
 			}
 		case parser.OpOr:
-			if !left.IsNull() && left.BoolValue() {
+			if left.Kind == KindBool && left.BoolValue() {
 				return left, nil
 			}
 		}
@@ -330,10 +349,14 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		// The compiled position (payload[4:8]), not a literal 0: every error
+		// these three helpers raise is stamped with it on the interpreted twin.
+		// M0127-PS6.2.
+		pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
 		// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
-			res, handled, lsnErr := evalPgLSNBinary(op, left, right, 0)
+			res, handled, lsnErr := evalPgLSNBinary(op, left, right, pos)
 			if lsnErr != nil {
 				return Datum{}, lsnErr
 			}
@@ -341,7 +364,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				return res, nil
 			}
 		}
-		result, err := evalBinary(op, left, right, 0, ctx)
+		result, err := evalBinary(op, left, right, pos, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -352,11 +375,11 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 			switch n.payload[1] {
 			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
 				}
 			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
 				}
 			}
 		}
@@ -371,7 +394,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalUnary(op, operand, 0)
+		return evalUnary(op, operand, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))))
 
 	case ExprAdapter:
 		return evalExprSlot(n.orig, slot, ctx)

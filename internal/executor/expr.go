@@ -1022,8 +1022,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// float64 to match PostgreSQL's float8 semantics (approximate, not exact).
 		// This prevents exact big.Int arithmetic from producing 200-digit numbers
 		// when float64 would stay in scientific notation. M0097-0003.
-		if rt := strings.ToLower(x.ResultType); rt == "float8" || rt == "double precision" ||
-			rt == "float4" || rt == "real" || rt == "float" {
+		// The float-vs-integer decision is isFloatResultType (exprnode.go), not
+		// an inline list. It used to be both, and the two lists had already
+		// drifted by one spelling ("double"): the compiled twin routes a
+		// ResultType this predicate accepts to ExprAdapter — i.e. back to HERE
+		// — so if the two disagreed, the fallback would land in the branch it
+		// was diverted to avoid. M0127-PS6.2 sibling audit.
+		if isFloatResultType(x.ResultType) {
 			var lf, rf float64
 			if left.Kind == KindNumeric {
 				lf, _ = strconv.ParseFloat(left.Format(), 64)
@@ -1089,19 +1094,31 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, err
 		}
 		// Overflow checks for integer arithmetic (M0097-0003).
+		//
+		// The int2/int4 decision is overflowCodeForType (exprnode.go), shared
+		// with the compiled twin, which precomputes it into ExprNode.payload[1]
+		// at build time. It used to be this switch AND that function, and they
+		// disagreed: this one compared exact strings, that one folds case, so
+		// a ResultType of "INT4" raised 22003 on one evaluator and returned
+		// 2147483648 on the other. The planner lowercases every type name it
+		// emits (planner.go: `strings.ToLower(x.Type.Name)`), so the spelling
+		// is not reachable from SQL today — but "unreachable" is a property of
+		// the planner, not of these two evaluators, and it is not what keeps
+		// them in agreement. One function is. M0127-PS6.2 sibling audit.
+		//
+		// int8/bigint stays unchecked on both twins (overflowCodeForType
+		// returns ovfNone): Go wraps int64 silently and no wrap detection is
+		// implemented. Ledgered.
 		if result.Kind == KindInt {
-			switch x.ResultType {
-			case "int2", "smallint":
+			switch overflowCodeForType(x.ResultType) {
+			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
 					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
 				}
-			case "int4", "integer", "int":
+			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
 					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
 				}
-			case "int8", "bigint":
-				// int8 can wrap in Go; detect via sign change for mul/add/sub only.
-				// For now, no overflow detection for int8 (matches most common cases).
 			}
 		}
 		return result, nil

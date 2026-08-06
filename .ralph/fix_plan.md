@@ -9200,10 +9200,56 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `e.Pos()`). 4 tests + 2 benchmarks, `join_compiled_key_test.go`.
       1 ledger row (the MERGE key/residual seam is still fully interpreted —
       `join_merge_stream.go:260` — and E5 named only the hash seam).
-- [ ] **M0127-PS6.2 — compiled ↔ interpreted sibling audit + parity spot-diffs**
+- [x] **M0127-PS6.2 — compiled ↔ interpreted sibling audit + parity spot-diffs**
       on expression corpora incl. the overflow corpus (0097-0037 precedent).
       IMPLEMENTATION-TODO PS6.1 (second half); 09 §1 SIBLING. Bar: parity corpus
-      + BENCH. (The release gate for E5.)
+      + BENCH. (The release gate for E5.) **DONE 2026-08-06** (05 §6.2, new;
+      09 §1 amended). `internal/executor/expr_sibling_parity_test.go`: nine
+      corpora × every `SlotView` impl × both twins, comparing **outcomes**
+      (panic / error incl. code+message+position / Datum) rather than values —
+      PS6.1's own divergence was a FAILURE MODE, which a value diff cannot see.
+      **Three divergences, none visible to any existing test:**
+      (1) **AND/OR short-circuited under different conditions — silent wrong
+      answers on a join-residual seam.** `evalFastExpr` gated on
+      `!left.IsNull()`, `evalAnd`/`evalOr` gate on `left.Kind == KindBool`.
+      `BoolValue()` is `Int != 0` on ANY Kind, so a non-boolean left operand
+      short-circuited on the compiled twin *and was returned as the AND/OR's
+      value*; for an ARENA-backed string `Datum.Int` is the mctx coordinate
+      (`offset<<32|length`), so which branch was taken depended on the arena
+      offset. 619 corpus diffs, one root cause.
+      (2) **Two type-spelling decisions each existed twice.** `isFloatResultType`
+      (case-folding, knows `"double"`) vs an inline exact-match list in
+      `evalExprSlot`; `overflowCodeForType` (case-folding) vs an inline exact
+      `switch`. The float pair is the transferable lesson: the compiled twin
+      *diverts to `evalExprSlot`* on that predicate, so when the two disagree
+      the fallback lands in the branch it was diverted to avoid. `"INT4"` was
+      an outright divergence (22003 vs 2147483648). Unreachable from SQL today
+      only because the planner lowercases — a property of the planner, not of
+      these evaluators. One function each now.
+      (3) **Every compiled error lost its source position** (`evalBinary` /
+      `evalUnary` / `evalPgLSNBinary` got a literal 0; the interpreted twin
+      passes `x.Pos()`), now compiled into `payload[4:8]`. **Invisible to every
+      hand-built corpus** — `planner.BinaryOp.pos` is unexported, so both twins
+      render 0 and agree for the wrong reason; found only after adding a ninth
+      corpus resolved from real SQL via `planner.ResolveIndexPredicate`, which
+      is also the only corpus with production ResultType spellings.
+      Bar MET: parity corpus green; BENCH 0 allocs, key 11.39→6.52 ns/op,
+      residual 149.8→130.3 ns/op (the position load costs nothing measurable).
+      Also UNITS 0 FAIL, SPOT PASS (Q12=2, Q13=35), and DS05 PASS=95
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 (57 ck-verified, plan shapes
+      99/99 identical, no runtime move ≥2×; log `analysis/ps62/ds05.log`) —
+      AND/OR short-circuiting is every compiled filter, not just the join seam.
+      The DS05 binary predates fix (3) by ten minutes; that fix only reaches
+      `ExecError.Pos`, and `pos` is threaded into `evalBinary`'s helpers for
+      error construction ONLY (`timestampOutOfRange(pos)`, `numericDiv(a,b,pos)`
+      …), so it cannot move a row count — UNITS and SPOT ran after it.
+      2 ledger rows (goopg resolves
+      `int4col + int4literal` to **int8**, so PG's int4 22003 never fires for
+      the commonest overflow shape — both twins agree, so it is a PG
+      divergence, not a sibling defect; and nothing carries `ExecError.Pos` to
+      the wire, since goopg emits no `FieldPosition` for executor errors, which
+      is what made divergence (3) log-text-only). **Stage E5 is COMPLETE; S7 (P6.1–P6.4) is next,
+      gated on S5-ON surviving a clean nightly cycle.**
 - [ ] **M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
       `executor.go:160-163`, env vars, orphan-export check —
       `IsCanonicalKeyEquality` has no other caller). IMPLEMENTATION-TODO P6.1;

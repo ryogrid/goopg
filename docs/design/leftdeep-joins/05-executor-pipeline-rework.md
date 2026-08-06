@@ -193,6 +193,73 @@ Still interpreted after PS6.1: the MERGE key/residual seam
 only; ledgered 2026-08-06. `fused_hash_join.go` and `multi_hash_join.go` stay
 interpreted by design, being deleted in P6.1/P6.2.
 
+### 6.2 PS6.2 — the sibling audit (2026-08-06); E5's release gate
+
+09 §1 makes "compiled ↔ interpreted evaluators" a named sibling audit and this
+is it: `expr_sibling_parity_test.go`, nine corpora × every `SlotView`
+implementation × both twins, comparing OUTCOMES rather than values. A panic, an
+error (code + message + position) and a Datum are three points in one space,
+and the harness renders all three to one string — because PS6.1's own finding
+was that the twins diverged in a FAILURE mode (`ColumnRef` bounds), not in a
+value, and a value-only comparison is blind to exactly that.
+
+The audit found **three** divergences, none of which any existing test could
+see. In descending order of how wrong they were:
+
+**1. AND/OR short-circuited under different conditions (silent wrong answers).**
+`evalFastExpr` short-circuited on `!left.IsNull()`; `evalAnd`/`evalOr`
+(`expr.go`) require `left.Kind == KindBool`. `Datum.BoolValue()` is `Int != 0`
+on ANY Kind, so a non-boolean left operand short-circuited on the compiled twin
+— and the compiled twin then **returned that operand** as the value of the
+AND/OR, where the interpreted twin always yields `KindBool` or NULL. The worst
+shape: for an ARENA-backed string, `Datum.Int` is the mctx coordinate
+(`offset<<32|length`), so *which branch was taken* depended on the arena
+offset. 619 corpus diffs, one root cause. This is a residual-conjunction seam
+as of PS6.1, i.e. a join-predicate seam.
+
+**2. Two spellings-of-a-type lists, each duplicated (unreachable today, by
+luck).** The float-vs-integer decision existed as `isFloatResultType`
+(`exprnode.go`, case-folding, knows `"double"`) *and* as an inline string list
+in `evalExprSlot` (exact-match, did not know `"double"`); the int2/int4
+overflow decision existed as `overflowCodeForType` (case-folding) *and* as an
+inline `switch` on exact strings. The float pair is the sharper lesson: the
+compiled twin routes a ResultType that predicate accepts **to ExprAdapter —
+i.e. back into `evalExprSlot`** — so when the two lists disagree the fallback
+lands in the branch it was diverted to avoid. The overflow pair diverged
+outright (`"INT4"` → 22003 on one twin, `2147483648` on the other). Both are
+unreachable from SQL today because the planner lowercases every type name it
+emits — but "unreachable" is a property of the planner, not of these
+evaluators. Each decision is now ONE function, called by both.
+
+**3. Every compiled error lost its source position.** The interpreted twin
+passes `x.Pos()` into `evalBinary` / `evalUnary` / `evalPgLSNBinary` and stamps
+it on its 22003; the compiled twin passed a literal `0`. `ExecError.Pos` does
+not reach the wire today (goopg emits no `FieldPosition` — see
+`testport/framework/regress.go`), so this is log text for now and a live
+divergence the moment that gap closes. The position is compiled into
+`payload[4:8]` at build time; the measured cost of the extra load is nil (see
+the table below). Note what this says about corpus design: **every hand-built
+corpus was blind to it**, because `planner.BinaryOp.pos` is unexported and a
+hand-built node has position 0, so both twins agreed — for the wrong reason.
+The fix was a ninth corpus resolved from real SQL through
+`planner.ResolveIndexPredicate`, which is also the only corpus whose
+ResultType spellings and operator resolution are the production ones.
+
+Bar (bench re-run on the same box after all three fixes; 0 allocs throughout):
+
+| seam | interpreted | compiled |
+|---|---|---|
+| `ColumnRef` key over the merged key slot | 11.39 ns/op | **6.52 ns/op** |
+| AND-of-two-comparisons residual | 149.8 ns/op | **130.3 ns/op** |
+
+One PG divergence surfaced in passing and is ledgered rather than fixed here:
+`c0 + 2147483647` with `c0 int4` resolves to **int8** in goopg (`exprType`
+widens), so PG's int4 `22003` never fires for the commonest overflow shape in
+SQL. PostgreSQL types the literal `int4` and raises from `int4pl`
+(`postgres/src/backend/utils/adt/int.c`). Both twins agree, so it is not a
+sibling defect — it is why the parity corpus needs an explicit `::int4` to
+reach the int4 arm at all.
+
 ## 7. What emphatically does NOT change
 
 - The `Operator`/`TupleSlot` interfaces (`operator.go:34`, `slot.go:18`) —
