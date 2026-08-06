@@ -1203,6 +1203,35 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       goopg raises `missing FROM-clause entry`; ledger row 2026-08-06 with the
       `errorMissingRTE()` resume point. Do NOT re-triage these three as
       wedge-downstream; the remaining 12 of the 15 are untouched by this.
+      **↳ `delete` IS FIXED 2026-08-06 (third S7-gate loop) — `SKIP(deferred)
+      → PASS`.** Selected under the same carve-out as the harness fix: of the
+      three 20260806 divergences it is the only one that reproduces
+      deterministically, so it is the one that could keep the S7 cycle from
+      ever coming back clean. **The ledger's DELETE scoping was too narrow** —
+      goopg emitted the bald `missing FROM-clause entry` for *all five* shapes
+      upstream distinguishes (`delete.out`, `update.out`, `returning.out`,
+      `insert_conflict.out`, plain `SELECT t.a`/`t.*` over an aliased FROM
+      entry), because neither name resolver performed upstream's SECOND,
+      alias-ignoring lookup (`searchRangeTableForRel`) — *renamed* and *absent*
+      collapsed into one outcome. The existing `blockOriginalName` machinery
+      (M0097-0003) produced the right text but only at the two sites that SET
+      the flag, and `analyzeDelete` was not one, so the analyzer's bald error
+      pre-empted the planner's correct one; patching that single call site
+      would have turned `delete` green and left the other four wrong. Ported
+      `errorMissingRTE()` into BOTH twins instead
+      (`analyzer.errorMissingRTE` + `planner.errorMissingRTEPlan` — RETURNING
+      scopes are built after analysis, so `RETURNING t.*` is planner-only),
+      and corrected 42712 (`duplicate_alias`) → **42P01** at the two
+      `blockOriginalName` sites. Design `docs/design/root-0039-error-missing-rte-alias-hint.md`.
+      Guards `TestAnalyzeErrorMissingRTEAliasHint` +
+      `TestPlanErrorMissingRTEAliasHint`, both non-vacuous. Gates: UNITS 0
+      FAIL, SPOT PASS (Q12=2, Q13=35); A/B on builds differing only in the two
+      source files — `insert_conflict`/`returning`/`subselect`/`update` SKIP on
+      BOTH sides (deferred for unrelated reasons, not regressed), and `join` +
+      `rowtypes` (the only two corpus files that assert the bald message) SKIP
+      identically on both sides. 2 ledger rows. **`portals_p2` still does not
+      reproduce and the other 12 of the 15 are untouched, so this item stays
+      open.**
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -9426,6 +9455,23 @@ the gate could never *become* measurable: before this, any night overlapping
 an active loop manufactured regressions the tree does not have. Next S7
 attempt: read the newest `ci/logs/action-items.md`; if `status: pass`, P6.1
 is selectable.
+
+**Amended 2026-08-06 (third S7-gate loop).** `ci/logs/action-items.md` is
+still run `20260806-011323` — **no new nightly has run**, so the gate is
+unchanged and P6.1 remains unselectable. Of that run's 4 genuine items, the
+scoreboard is now: `select` FIXED (zero-column join crash), `delete` FIXED
+(`errorMissingRTE` port, this loop — the only one of the three that
+reproduced deterministically, and therefore the only one that could have kept
+the cycle red by itself), `portals_p2` still does not reproduce in isolation
+at HEAD, and `TestPort_IsolationEvalPlanQual` (AI-…-001) remains the ONE open
+engine-side blocker. Its four candidate reproduction conditions are falsified
+(isolation, nightly cgroup env, synthetic CPU load, the whole
+`TestPort_Isolation*` family in nightly order) — it fails only in the FULL
+package run, so the trigger is order-dependent on a test OUTSIDE the isolation
+family. **Do not re-attempt an isolation-level repro.** The remaining designed
+step is a prefix bisect of `internal/testport` (regress / pg_dump /
+pg_basebackup / pgoutput blocks + EvalPlanQual) to find the predecessor that
+poisons it.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

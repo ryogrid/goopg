@@ -1,50 +1,56 @@
 (idle — nothing in flight)
 
-Last loop: **M-NIGHTLY / S7-gate loop #3. Selected `TestPort_IsolationEvalPlanQual`
-(AI-20260806-011323-001) under carve-out #2 — it is the last genuine blocker to
-the clean nightly cycle M0127-P6.1..P6.4 wait on. It did NOT reproduce; a
-DIFFERENT row-locking defect was found and FIXED. Committed.**
+Last loop: **M-NIGHTLY / S7-gate loop #4. Selected `regress/delete`
+(AI-20260806-011323-016) under the same carve-out the harness fix used — of the
+three 20260806 regress divergences it was the only one reproducing
+deterministically, so it alone could have kept the S7 cycle red forever.
+FIXED: `SKIP(deferred)` → `PASS`. Committed.**
 
-1. **The recorded diagnosis was wrong.** fix_plan said `partiallock_ext` failed
-   to block at L1027. The real 20260806 diff starts at **L1001 on
-   `lockwithvalues`** (perm `wx2 lockwithvalues c2 c1 read`, spec line 411):
-   no ` <waiting ...>` AND the stale row `checking|600|1200` where PG gives
-   `1050|2100`. `partiallock_ext` blocks correctly at L1024 of the same log.
-2. **Four reproduction conditions FALSIFIED at HEAD** — isolation (5 runs,
-   21–22 s), nightly cgroup env (6G/8G/GOMEMLIMIT=5GiB), synthetic 12-way CPU
-   load, and the whole `TestPort_Isolation*` family in nightly order (404 s,
-   PASS at 21.44 s). It still fails 6/6 nights in the FULL package run ⇒ the
-   trigger is order-dependent on a test OUTSIDE the isolation family.
-3. **Fixed instead (root-0038):** `ORDER BY … FOR UPDATE` over a JOIN took **no
-   tuple lock at all** — stale row in 4 ms, no block, no EPQ recheck. goopg has
-   no resjunk-ctid column and reconstructs the TID from plan shape; both walkers
-   correctly return nil at a `sortOp`, and the slot side-channel that covers
-   that case (`sortOp.ctids`) only fires if the slot entering the sort has
-   `hasCTID` — `seqScanOp` stamps it, a `joinOp` only does when
-   `preserveCTIDRel` is set, and `markJoinPreserveCTID` stopped dead at the
-   Sort. One arm (`case *sortOp:`) fixes it. A/B, same plan shape both sides:
-   4 ms/600/no-block → 4008 ms/1050/blocked.
+1. **The ledger's DELETE scoping was too narrow.** goopg emitted the bald
+   `missing FROM-clause entry` for **all five** shapes upstream distinguishes
+   (`delete.out`, `update.out`, `returning.out`, `insert_conflict.out`, and
+   plain `SELECT t.a` / `t.*` over an aliased FROM entry). The missing piece is
+   a *diagnosis*, not wording: `errorMissingRTE()` (`parse_relation.c`) looks
+   the refname up a **second time ignoring aliases**
+   (`searchRangeTableForRel`) and reports "you wrote the table's own name where
+   only its alias is visible". goopg did the first lookup and stopped.
+2. **The trap avoided:** `blockOriginalName` (M0097-0003) already produced the
+   right text — but only at the two sites that SET the flag, and
+   `analyzeDelete` was not one, so the analyzer's bald error pre-empted the
+   planner's correct one. Patching that one call site would have turned
+   `delete` green and left the other four wrong.
+3. **Fixed (root-0039):** one helper per resolver —
+   `analyzer.errorMissingRTE` + `planner.errorMissingRTEPlan`. **Both twins
+   moved**: RETURNING scopes are built after analysis, so `RETURNING t.*` is
+   served only by the planner. Skips `qualifiedOnly` rels (ON CONFLICT's
+   `excluded` is a keyword, not a user rename) and self-aliased entries
+   (upstream's `strcmp(aliasname, relname) != 0`). Also 42712
+   (`duplicate_alias`) → **42P01** at the two `blockOriginalName` sites.
 
-Files: `internal/executor/operators_lockrows.go` (the arm + why the walkers are
-left alone), `internal/testport/lockrows_sort_ctid_test.go` (new guard),
-`docs/design/root-0038-lockrows-sort-over-join-ctid.md` + README index,
-fix_plan (diagnosis corrected + `[x]` task), 3 ledger rows.
+Files: `internal/analyzer/analyzer.go`, `internal/planner/planner.go`, two new
+guard tests (`*/missing_rte_test.go`),
+`docs/design/root-0039-error-missing-rte-alias-hint.md` + README index,
+fix_plan (item note + S7 status amendment), 2 ledger rows.
 
-Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); `TestPort_(Isolation|LockRows)*`
-0 FAIL (416 s) post-change; new guard verified NON-VACUOUS (with the arm removed
-`sort_over_join` fails at `balance=600`/no block while the `join_no_sort`
-control still passes); pgbench smoke via hook. DS05 NOT run — deliberate:
-`markJoinPreserveCTID`'s only caller is `lockRowsOp.Open`, so the change is
-unreachable without a `LockRows` node and the TPC-DS corpus has no `FOR UPDATE`.
+Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); both guards verified
+NON-VACUOUS (revert the two source files, keep the tests → both fail with
+`missing FROM-clause entry`); A/B on builds differing only in those two files —
+`delete` SKIP→PASS while `insert_conflict`/`returning`/`subselect`/`update`
+SKIP on BOTH sides and `join` + `rowtypes` (the only corpus files asserting the
+bald message) SKIP identically on both; pgbench smoke via hook. DS05 NOT run —
+deliberate: both helpers are reachable only on the `len(matches)==0` error
+return, which already returned an error, so the delta is error text/SQLSTATE
+only and cannot move a row count or a plan shape.
 
 NEXT LOOP (banner: M0124 closed → M0125 → **M0127** → M-NIGHTLY → M0123).
-M0127-P6.1 is STILL NOT selectable — it needs `ci/logs/action-items.md` at
-`status: pass`, and the newest run is still `fail`. Read the newest one FIRST:
-the next nightly is the first to run the new summarizer, so an
-`[infra] testport/build-broke-mid-stage` item means "the harness saw a loop edit
-the tree", not a regression. If still `fail` on EvalPlanQual, the next step is
-the **prefix bisect** of `internal/testport` (regress / pg_dump / pg_basebackup /
-pgoutput blocks + EvalPlanQual) to find the predecessor that poisons it — do not
-re-attempt an isolation-level repro, that is now falsified four ways.
+`ci/logs/action-items.md` is STILL run `20260806-011323` — no new nightly has
+run, so P6.1 stays unselectable; re-read it first, and if it is `status: pass`
+take P6.1. The 4 genuine items of that run now stand at: `select` FIXED,
+`delete` FIXED, `portals_p2` never reproduces, and
+**`TestPort_IsolationEvalPlanQual` (AI-…-001) is the last open engine-side
+blocker**. Four repro conditions are falsified — do NOT re-attempt an
+isolation-level repro; the designed next step is the **prefix bisect** of
+`internal/testport` (regress / pg_dump / pg_basebackup / pgoutput blocks +
+EvalPlanQual) to find the predecessor that poisons it.
 
 In-flight: none.

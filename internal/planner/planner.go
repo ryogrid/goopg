@@ -9714,7 +9714,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			}
 		}
 		if len(matches) == 0 {
-			return nil, nil, &PlanError{Pos: star.Pos(), Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", star.Table)}
+			return nil, nil, errorMissingRTEPlan(star.Pos(), star.Schema, star.Table, ctx)
 		}
 		if len(matches) > 1 {
 			return nil, nil, &PlanError{Pos: star.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", star.Table)}
@@ -11516,8 +11516,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if b.blockOriginalName && b.alias != "" &&
 				strings.EqualFold(x.Table, b.table.Name) {
 				deferredBlockErr = &PlanError{
-					Pos:  x.Pos(),
-					Code: "42712",
+					Pos: x.Pos(),
+					// 42P01, not 42712: upstream raises this from
+					// errorMissingRTE() with ERRCODE_UNDEFINED_TABLE.
+					Code: "42P01",
 					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q",
 						b.table.Name),
 					Hint: fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
@@ -11720,6 +11722,45 @@ func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
 		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
 	}
 	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
+}
+
+// errorMissingRTEPlan is the planner-side twin of the analyzer's
+// errorMissingRTE (internal/analyzer/analyzer.go), which ports
+// postgres/src/backend/parser/parse_relation.c:errorMissingRTE(). Both must
+// change together: the analyzer runs first for statements it covers, but the
+// planner is the only error source for the paths it does not (rewritten
+// sub-plans, RETURNING scopes built after analysis).
+//
+// A refname that names a FROM entry the user renamed with an alias gets the
+// "invalid reference" message plus a HINT naming the alias; anything else gets
+// the bald "missing FROM-clause entry". Both are 42P01, per upstream's
+// ERRCODE_UNDEFINED_TABLE.
+func errorMissingRTEPlan(pos int, schema, table string, ctx *resolveContext) *PlanError {
+	for cur := ctx; cur != nil; cur = cur.parent {
+		for _, b := range cur.bindings {
+			// qualifiedOnly = the ON CONFLICT `excluded` pseudo-table
+			// (a keyword, not a user-chosen rename); notReferenceable =
+			// present for diagnostics only, never a real FROM entry.
+			if b.qualifiedOnly || b.notReferenceable || b.alias == "" || b.table == nil {
+				continue
+			}
+			if schema != "" && !strings.EqualFold(schema, b.table.Schema) {
+				continue
+			}
+			if strings.EqualFold(b.alias, b.table.Name) {
+				continue
+			}
+			if strings.EqualFold(table, b.table.Name) {
+				return &PlanError{
+					Pos:     pos,
+					Code:    "42P01",
+					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q", table),
+					Hint:    fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
+				}
+			}
+		}
+	}
+	return &PlanError{Pos: pos, Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", table)}
 }
 
 func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
