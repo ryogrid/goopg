@@ -1,46 +1,49 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0003 CLOSED and committed** — the fourth and last consumer of
-the `GOOPG_RELSIZE_FALLBACK` block-count estimate is wired, so **M0125 has no
-open item left that is not `[→ M0127: absorbed]`.**
+Last loop: **M0127-S7 gate MEASURED — the nightly was run on demand instead of
+waited for, and the gate now has exactly ONE named, bisected blocker.**
 
-1. `reorderCommaFromByCardinality` (`internal/planner/joinorder.go`) bailed the
-   moment any table had `Stats.RowCount <= 0` — which, since RowCount does not
-   survive a restart (ledger pq-P6), is EVERY table on an S-cold server. The
-   guard is now a tier: stored count → `relSizeFallbackRows(2, cat, tbl)` →
-   decline.
-2. **Stage 2, not a fourth stage.** M0127-P5.6 retired stage 3, leaving stage 2
-   defined as "the consumers that move the join ORDER". A `4` would ship it
-   default-off behind a value no script sets.
-3. **Measured effect is ZERO plan movement, and that IS the evidence**: DS05
-   plan channel `queries=99 same=99 changed=0` on a restarted (S-cold) cluster,
-   so the pass runs where it used to decline and nothing moves. Mechanism =
-   M0127-P5.9-r inverted: `extractScans` descends `JoinTypeCross` only, so a
-   comma-FROM list is exactly what reaches `tryPGShapedJoinSearch`, and the
-   search re-derives the order. Live residue = what the search declines
-   (explicit `JOIN`, over-limit relsets) = `joinorder.go`'s P6.3 role.
-4. Sweep deliberately NOT re-run: identical plan text for 99/99 means identical
-   execution; that is what the plan channel exists to license.
+1. Five loops recorded "no nightly has run since". That was a wait on the 01:00
+   scheduler, not on evidence: `make nightly-batch` is the documented manual
+   entrypoint and shares the scheduled firing's run lock. Ran a full cycle at
+   19:20 JST: **run `20260806-191958`, sha `758ac76e`, 70 min, `status: fail`,
+   10 items** (was 18).
+2. Stage table: preflight/units/race/pgbench/tpch/tpcds **pass**, only
+   `testport` fails ⇒ `status: pass` is attainable. The 14-phantom class did not
+   recur (no commit overlapped the run).
+3. **8 of the 10 items are one `regress/suite-wedge`** at `multirangetypes` +
+   truncated-output casualties (numerology, portals_p2, select, select_into,
+   text, truncate, union, varchar). The wedge case MOVED from
+   aggregates/jsonb/misc ⇒ cluster/resource condition, not a per-case defect.
+4. **Sole engine-side blocker: `TestPort_IsolationEvalPlanQual`** — and it is a
+   NEW failure, not the one loop #5 fixed. Loop #5 stands (`47b4aed5` PASSES
+   standalone, verified in a worktree). New diff is **L696 on
+   `wx1 updwctefail c1 c2 read`** + `delwctefail`: PG raises `ERROR: tuple to be
+   updated was already modified by an operation triggered by the current
+   command` (`TM_SelfModified`, nodeModifyTable.c); goopg returns rows (1475 vs
+   1468). Deterministic 22 s, **flag-independent** (`GOOPG_PGSHAPED_DP` ON/OFF
+   both fail) ⇒ not join-search related.
+5. **Bisected in 5 tests over `47b4aed5..758ac76e`:** 1547b38a/2af216ba/d8a25def
+   PASS, **276e7eda FAIL** (M0125-0052), 6cd5872c/78bd04a4 FAIL. M0125-0052 is
+   CORRECT — it made an outer DML see its own CTE's writes — and that removed
+   the accidental agreement masking a gap goopg never implemented.
 
-Files: `internal/planner/joinorder.go`,
-`internal/planner/joinorder_relsize_test.go` (4 tests; the landing test proven
-to fail pre-fix by checking out HEAD's joinorder.go), design doc
-`0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md` §I20–I23 + README index
-row, fix_plan (-0003 ticked), 3 ledger motions (1 flip + 2 new).
+Files: `.ralph/fix_plan.md` (S7 gate sixth-loop amendment + 2 new M-NIGHTLY
+items), `.ralph/deferral_ledger.md` (2 rows), design
+`leftdeep-joins/09-verification-and-acceptance.md` §3.25 + README index.
 
-Gates run: planner PASS; executor/analyzer PASS; units gate 0 FAIL;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2 Q13=35, 28.1 s); DS05 plan channel
-99/99 same (`plans-20260806-191105.txt`); pgbench smoke via the commit hook.
+Gates run: full nightly cycle `20260806-191958` (the loop's deliverable);
+EvalPlanQual standalone at HEAD (FAIL, both flag states) and across 5 bisect
+revisions; `make ralph-state-guard` OK after auto-repair; pgbench smoke via the
+commit hook. No Go code changed this loop.
 
-NEXT LOOP (banner: M0124 closed → M0125 → M0127 → M-NIGHTLY → M0123).
-**M0125 is now effectively closed**, so M0127 is the live milestone and
-**M0127-P6.1 (delete fusion) is the next selection — IF the gate is met.** Its
-bar is "S5-ON survives a clean nightly cycle": read `ci/logs/action-items.md`
-FIRST; it was still run `20260806-011323` (`status: fail`, all 18 filed, nothing
-new) this loop, and every one of its 4 genuine items is now fixed, so a fresh
-nightly at `status: pass` unlocks P6.1. If the file is still that same run, no
-new nightly has run and P6.1 stays unselectable on missing evidence.
+NEXT LOOP (banner: M0124 closed → M0125 closed → M0127 → M-NIGHTLY → M0123).
+**Implement PG's `TM_SelfModified` error** — filed under M-NIGHTLY but named as
+S7's sole engine-side blocker, so it is on the banner's critical path: add the
+self-modified check to the DML/EPQ seam M0125-0052 touched (compare the tuple's
+writer command id to the current command id; raise
+`ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION` before applying). Do NOT revert
+M0125-0052. Then re-run `make nightly-batch`; if `status: pass`, take
+M0127-P6.1 (delete fusion).
 
-In-flight: none. Private bench binary at `tmp/goopg-m0125-0003-fourth` (used for
-the DS05 plan capture so the nightly's shared `tmp/goopg-bench-bin` was not
-touched); the SF0.5 server on 65437 was started and stopped by the gate script.
+In-flight: none.

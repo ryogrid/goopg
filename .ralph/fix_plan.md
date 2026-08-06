@@ -1277,6 +1277,52 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       identically on both sides. 2 ledger rows. **`portals_p2` still does not
       reproduce and the other 12 of the 15 are untouched, so this item stays
       open.**
+- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED 2026-08-06 with a
+      DIFFERENT signature: goopg has no `TM_SelfModified` error, and
+      M0125-0052 unmasked it** (AI-20260806-191958-001, run `20260806-191958`;
+      repro `go test -v -run '^TestPort_IsolationEvalPlanQual$'
+      ./internal/testport/` — deterministic, 22 s standalone; evidence
+      `ci/logs/20260806-191958/testport/go-test.log` L11302). This is NOT the
+      item resolved above: that one was `L1001`/`lockwithvalues` and really was
+      fixed by the P5.9 flip (`47b4aed5` PASSES standalone, verified in a
+      worktree this loop). The new diff is **L696 on permutation
+      `wx1 updwctefail c1 c2 read`** (spec line 394) and its `delwctefail` twin
+      (line 400): both run a data-modifying CTE whose `RETURNING` list calls
+      `update_checking(999)`, a volatile function that writes the same row the
+      outer `UPDATE`/`DELETE` then touches. PG raises `ERROR: tuple to be
+      updated was already modified by an operation triggered by the current
+      command`; goopg completes the statement and returns rows (1475 lines vs
+      1468). **Bisected to `276e7eda` (M0125-0052)** in 5 tests over
+      `47b4aed5..758ac76e` (`1547b38a`/`2af216ba`/`d8a25def` PASS;
+      `276e7eda`/`6cd5872c`/`78bd04a4` FAIL). Flag-independent
+      (`GOOPG_PGSHAPED_DP` ON and OFF both fail) ⇒ not join-search related.
+      M0125-0052 is CORRECT — it made an outer DML see its own CTE's writes —
+      and that is exactly what removes the condition PG reports as
+      `TM_SelfModified`, so the gap is latent, not caused. Resume point:
+      PG `nodeModifyTable.c` `ExecUpdate`/`ExecDelete` → `TM_SelfModified` →
+      `ereport(ERROR, errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION))`;
+      goopg side is the DML-CTE write-fence path touched by M0125-0052. Ledger
+      row 2026-08-06. **This is the SOLE engine-side blocker of the M0127 S7
+      gate** (see the S7 gate status in M0127), so unlike the rest of
+      M-NIGHTLY it is on the critical path of the banner's live milestone.
+- [ ] **regress/suite-wedge — RECURRED 2026-08-06 at a DIFFERENT case:
+      `multirangetypes`** (AI-20260806-191958-010, run `20260806-191958`; 1 case
+      at the 120 s per-case timeout, 0 baseline-pass; repro
+      `go test -v -run 'TestPort_RegressSuite/multirangetypes'
+      ./internal/testport/`; evidence
+      `ci/logs/20260806-191958/testport/go-test.log`). Its truncated-output
+      casualties are the other 8 items of that run — **regress/numerology
+      (-002), regress/portals_p2 (-003), regress/select (-004),
+      regress/select_into (-005), regress/text (-006), regress/truncate (-007),
+      regress/union (-008), regress/varchar (-009)** — filed here as one entry
+      because they are one phenomenon: output truncated ⇒ NOT divergences.
+      **The moving wedge case is the new evidence** (aggregates/jsonb/misc on
+      20260802-04 → `multirangetypes` tonight): it rules out a per-case defect
+      and points at a cluster/resource condition (orphaned backend holding
+      locks, or a GC-thrashing server) — investigate that, not the cases.
+      Note `regress/select` here is wedge shrapnel, NOT the zero-column-join
+      crash fixed by `569ecea2`. FILED, NOT SELECTED per the 2026-07-28(b)
+      amendment.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -9951,6 +9997,41 @@ unselectable on missing evidence, not on a known defect: re-read
 carried forward as an M-NIGHTLY task (FOR UPDATE over `multiHashJoinOp` /
 `fusedHashJoinOp` takes no row lock — retired by construction when P6.1/P6.2
 delete both nodes). Design 09 §3.24; evidence `analysis/m0127-epq-bisect/`.
+
+**Amended 2026-08-06 (sixth S7-gate loop) — the nightly was RUN, not waited
+for, and the gate is now blocked by ONE named, bisected defect.** Five loops
+recorded "no nightly has run since"; that is a wait on the 01:00 scheduler, not
+on evidence. `make nightly-batch` is the documented manual entrypoint and shares
+the scheduled firing's run lock, so this loop ran a full cycle at 19:20 JST:
+**run `20260806-191958`, sha `758ac76e`, 70 min, `status: fail`, 10 items.**
+Stage table: `preflight/units/race/pgbench/tpch/tpcds` **pass**, only `testport`
+fails — so `status: pass` is attainable and the 14-phantom class did NOT recur
+(no commit overlapped the run; §3.24's `source_fingerprint()` + build-boundary
+collapse were in place regardless). **8 of the 10 items are one phenomenon**:
+`regress/suite-wedge` at `multirangetypes` plus its truncated-output casualties
+(`numerology`, `portals_p2`, `select`, `select_into`, `text`, `truncate`,
+`union`, `varchar`) — and the wedge case MOVED from
+`aggregates`/`jsonb`/`misc`, which is itself evidence it is a cluster/resource
+condition, not a per-case divergence. **The single engine-side blocker is
+`TestPort_IsolationEvalPlanQual` (AI-20260806-191958-001), and it is a NEW
+failure, not the one loop #5 resolved.** Loop #5's finding stands — at
+`47b4aed5` the test PASSES standalone (verified this loop in a worktree), so the
+flip really did fix the `L1001`/`lockwithvalues` signature. What fails now is
+**`L696` on `wx1 updwctefail c1 c2 read`** (and its `delwctefail` twin): PG
+raises `ERROR: tuple to be updated was already modified by an operation
+triggered by the current command` (`TM_SelfModified`, `nodeModifyTable.c`) where
+goopg completes the statement and returns rows (1475 lines vs PG's 1468). It is
+deterministic (22 s standalone) and **flag-independent** — `GOOPG_PGSHAPED_DP=0`
+and the default both fail — so the join search is not involved.
+**Bisected in 5 tests over `47b4aed5..758ac76e`:** `1547b38a` PASS, `2af216ba`
+PASS, `d8a25def` PASS, **`276e7eda` FAIL** (M0125-0052, "the DML-CTE write fence
+was starved, not bypassed"), `6cd5872c` FAIL, `78bd04a4` FAIL. M0125-0052 made
+an outer DML see its own CTE's writes — correct for its target case, and exactly
+what removes the condition PG reports as `TM_SelfModified`. goopg has never
+implemented that error, so this is a **latent gap unmasked by a correct fix**.
+Next S7 attempt: implement the `TM_SelfModified` error (ledger row 2026-08-06),
+then re-run `make nightly-batch` — the gate no longer has to wait for 01:00.
+Design 09 §3.25.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

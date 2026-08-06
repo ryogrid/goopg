@@ -3522,3 +3522,69 @@ violation. Ledger row 2026-08-06.
 **Gate status.** This removes the last known engine-side blocker but does not
 retro-clear S7: the gate is "a clean nightly cycle", and no nightly has run
 since. Re-read `ci/logs/action-items.md`; if `status: pass`, P6.1 is selectable.
+
+### 3.25 The nightly the gate was waiting for is one we can run ourselves — and it says the blocker is a NEW one, from M0125-0052 (S7-gate loop #6, 2026-08-06)
+
+Five consecutive loops read `ci/logs/action-items.md`, found it still at run
+`20260806-011323`, and recorded "the gate needs a clean nightly cycle and none
+has run". That is a wait on a scheduler, not on evidence: `make nightly-batch`
+is the documented single manual entrypoint (`ci/batch/run-nightly.sh`) and it
+shares the scheduled firing's run lock, so a manual cycle at 19:20 JST — five
+hours before the 01:00 firing — is the same measurement, taken sooner. This
+loop ran it: **run `20260806-191958`, sha `758ac76e`, 70 minutes.**
+
+**The reading.** Stage table: `preflight/units/race/pgbench/tpch/tpcds` all
+**pass**; only `testport` fails. Action items **18 → 10**. Two things are worth
+separating in that drop:
+
+1. The 14-phantom class is **gone** — the run overlapped no commit, and §3.24's
+   `source_fingerprint()` + build-boundary collapse were in place to catch it if
+   it had. The `pg_dump*` / `pg_basebackup*` / `pgoutput` block that dominated
+   the previous list was never a regression, and it did not come back.
+2. Of the 10 that remain, **8 are one phenomenon**: `regress/suite-wedge`
+   reports the suite wedged at `multirangetypes` (1 case at the 120 s per-case
+   timeout, 0 baseline-pass), and `numerology`, `portals_p2`, `select`,
+   `select_into`, `text`, `truncate`, `union`, `varchar` are its downstream
+   casualties — truncated output, not divergence. Note the wedge case MOVED
+   (`aggregates`/`jsonb`/`misc` on 20260802-04 → `multirangetypes` tonight),
+   which is itself evidence that the wedge is a cluster/resource condition and
+   not a property of any one case.
+
+So the gate is not met, and **exactly one engine-side item stands**:
+`TestPort_IsolationEvalPlanQual` (AI-20260806-191958-001).
+
+**§3.24 was right, and the test is broken again anyway.** The failure this run
+is NOT the one §3.24 resolved. That one was `L1001` on permutation
+`wx2 lockwithvalues c2 c1 read` — "did not block, and read the pre-update row" —
+and it really was fixed by the P5.9 flip: at `47b4aed5` (the loop-#5 triage
+commit) the test **PASSES standalone**, verified this loop in a worktree. What
+fails now is `L696`, on **`wx1 updwctefail c1 c2 read`** (and its `delwctefail`
+twin): PG raises
+
+> `ERROR:  tuple to be updated was already modified by an operation triggered by the current command`
+
+and goopg instead **completes the statement and returns rows** (1475 lines where
+PG gives 1468). Both steps are data-modifying CTEs whose `RETURNING` list calls
+`update_checking(999)`, a volatile function that writes the very row the outer
+`UPDATE`/`DELETE` is about to touch — PG's `TM_SelfModified` arm in
+`nodeModifyTable.c`. It is deterministic, reproduces standalone in 22 s, and
+is **flag-independent** (`GOOPG_PGSHAPED_DP=0` and the default both fail), so
+the join search is not involved.
+
+**Bisected, 5 tests, over the 9 commits `47b4aed5..758ac76e`:** `1547b38a` PASS,
+`2af216ba` PASS, `d8a25def` PASS, **`276e7eda` FAIL**, `6cd5872c` FAIL,
+`78bd04a4` FAIL. The first bad commit is **`276e7eda` — M0125-0052, "the DML-CTE
+write fence was starved, not bypassed"**. That fix made an outer DML see the
+writes its own CTE performed, which is correct for the case it targeted and is
+precisely what removes the condition PG reports as `TM_SelfModified`: goopg now
+treats the self-modified tuple as an ordinary visible update instead of an
+error. The agreement that existed before was accidental — goopg has never
+implemented the error — so this is a **latent gap unmasked by a correct fix**,
+not a wrong fix. Ledger row 2026-08-06.
+
+**Gate status.** S7 (P6.1–P6.4) remains unselectable, but for the first time the
+bar is one named, deterministic, bisected defect rather than an unrun
+measurement: implement PG's `TM_SelfModified` error for DML-CTE self-modified
+tuples, then re-run `make nightly-batch` — this loop's evidence that the batch
+can be run on demand is itself the mechanism that keeps the gate from stalling
+another five loops.
