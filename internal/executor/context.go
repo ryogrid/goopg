@@ -604,9 +604,25 @@ type Context struct {
 	// encountering an invisible-due-to-own-xmax tuple in CTESelfModifiedErrors.
 	CTESelfModErr error
 
-	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
-	// Write operators register their output pointers in CTEWriteFence when this is set.
+	// InDMLCTE is true while cteDMLPrefixOp is executing one of its DML
+	// sub-plans (as opposed to the outer statement's own body). Both phases
+	// register their output pointers in CTEWriteFence — the sub-statements of
+	// a data-modifying WITH cannot see one another's effects in EITHER
+	// direction — so this no longer gates the fence; it distinguishes the two
+	// phases for the CTENewToOld / CTESelfModifiedErrors bookkeeping, which
+	// only a CTE-phase write can trigger. M0125-0054.
 	InDMLCTE bool
+
+	// pendingDMLCTEs is the cteDMLPrefixOp currently driving this statement,
+	// or nil. It is how a MaterializedCTEScan demands the DML CTE it reads:
+	// PostgreSQL does not run data-modifying CTEs up front, it runs them when
+	// a CteScan pulls from them and, for those nothing pulled from, only after
+	// the main plan has finished (ExecPostprocessPlan,
+	// postgres/src/backend/executor/execMain.c). Demand-driving the CTEs off
+	// this pointer reproduces both halves and is fail-safe: an unreferenced
+	// CTE that turns out to be read anyway still runs before its first row is
+	// needed. M0125-0054.
+	pendingDMLCTEs *cteDMLPrefixOp
 
 	// DeadlockVictim is set by the pg_class in-place lock waits
 	// (waitPgClassInplaceXID) when this statement is chosen as a deadlock

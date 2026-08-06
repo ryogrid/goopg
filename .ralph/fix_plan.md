@@ -5416,7 +5416,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       nightly `AI-20260806-011323-001`, confirmed failing at HEAD without this
       change), units gate, `tpch-spotcheck` Q12=2/Q13=35, TPC-DS SF0.5 plan
       channel `queries=99 same=99 changed=0`. Successor filed as `M0125-0054`.
-- [ ] **M0125-0054 — goopg runs data-modifying CTEs BEFORE the outer statement;
+- [x] **M0125-0054 — goopg runs data-modifying CTEs BEFORE the outer statement;
       PG runs them after it** (filed 2026-08-06 by `M0125-0053`, which found the
       witnesses; ledger rows 2026-08-06 under -0053 and -0052). PG runs the main
       plan first and only then any not-yet-completed data-modifying CTE, in
@@ -5443,6 +5443,46 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       Bar: `TestCTEPreImageWriteWriteDivergesFromPG` inverted to PG's answers
       (it exists precisely to flip), the seven -0052 and six -0053 tests
       unchanged, the isolation suite, and TPC-H Q12=2/Q13=35.
+      **↳ LANDED 2026-08-06.** Design doc
+      `docs/design/0125-0054-dml-cte-execution-order.md`; three ledger rows.
+      The filing named the right mechanism but only half its shape. PG has **no
+      prefix phase at all**: a data-modifying CTE is a non-`canSetTag`
+      `ModifyTable` reached by TWO routes — (1) **on demand**, driven by the
+      `CteScan` that reads it, and (2) **after the main plan**, swept from
+      `estate->es_auxmodifytables` by `ExecPostprocessPlan`. The filing had
+      route 2 only; route 1 is not optional, since a CTE the body READS cannot
+      be deferred until after the body has produced its rows. Two further
+      findings: **(a) the sweep runs in REVERSE declaration order** —
+      `ExecInitModifyTable` files with `lcons`, not `lappend`, so
+      `es_auxmodifytables` is reverse init order (confirmed live: three
+      unreferenced INSERT CTEs a,b,c land at ctid (0,1)=c, (0,2)=b, (0,3)=a;
+      with `SELECT count(*) FROM b` as the body, b preempts and the sweep takes
+      c then a). Upstream's own comment gives the reason — a later CTE reading
+      an earlier one must run first so its `CteScan` drives the earlier one.
+      **(b) The filed plan-time referenced-ness flag was the wrong shape.** A
+      body-plan walk that misses a subtree UNDERCOUNTS references, defers a
+      read CTE, and its `MaterializedCTEScan` silently returns nothing — a
+      wrong answer with no error, and the planner has no complete generic node
+      walker to make the walk safe. Demand-driving has no such direction: the
+      scan that would read nothing is the thing that triggers the run, so
+      `materializedCTEScanOp.Open` → `ctx.pendingDMLCTEs.ensureCTE` cannot
+      misjudge, and it is also literally what route 1 is upstream. Nothing was
+      added to the planner. The reorder's own obligation landed with it: the
+      fence and its reveal now gate on the fence's EXISTENCE rather than on
+      `ctx.InDMLCTE`, so the outer statement's writes are registered too and a
+      deferred CTE cannot see them (`WITH x AS (INSERT INTO fs_dst SELECT a
+      FROM fs_src RETURNING a) INSERT INTO fs_src VALUES (2)` leaves fs_dst
+      `[1]`); `InDMLCTE` survives only for the
+      `CTENewToOld`/`CTESelfModifiedErrors` bookkeeping, which really is
+      phase-specific. Bar met: `TestCTEPreImageWriteWriteDivergesFromPG`
+      inverted (now `TestCTEWriteWriteRunsOuterStatementFirst`, extended from 2
+      witnesses to all 4) plus 4 new tests, every value captured from live PG
+      18.3 on port 65432; the six -0053 and seven -0052 tests unchanged;
+      executor/server/planner/analyzer green; units gate; `TestPort_Isolation*`
+      green except the pre-existing `EvalPlanQual` (nightly
+      `AI-20260806-011323-001`, proved byte-identical at HEAD without this
+      change); `TestPort_RegressSuite` green; `tpch-spotcheck` Q12=2/Q13=35;
+      TPC-DS SF0.5 plan channel `queries=99 same=99 changed=0`.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor

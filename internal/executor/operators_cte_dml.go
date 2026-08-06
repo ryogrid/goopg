@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -21,16 +22,22 @@ type CTEFencePtr struct {
 	Ptr storage.ItemPointer
 }
 
-// cteFenceInsert registers a tuple this DML CTE just inserted, so every later
-// scan in the same statement skips it. No-op outside a DML CTE.
+// cteFenceInsert registers a tuple a sub-statement of a data-modifying WITH
+// just inserted, so every later scan in the same statement skips it. No-op
+// outside such a statement.
 //
 // PostgreSQL needs no such set: all sub-statements of a data-modifying WITH
 // share `estate->es_snapshot` AND `estate->es_output_cid`, so a sibling's
 // tuple is filtered by the cmin test in HeapTupleSatisfiesMVCC
 // (postgres/src/backend/access/heap/heapam_visibility.c). goopg's heap has no
 // per-tuple command id, so the fence stands in for the cmin test.
+//
+// The OUTER statement's own writes belong in the fence too (M0125-0054): once
+// the outer body runs first, a CTE deferred to the post-body phase would
+// otherwise see rows the outer statement inserted, where PG's cmin test hides
+// them. That is why the gate is the fence's existence, not InDMLCTE.
 func cteFenceInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
-	if !ctx.InDMLCTE || ctx.CTEWriteFence == nil {
+	if ctx.CTEWriteFence == nil {
 		return
 	}
 	ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: ptr}] = struct{}{}
@@ -40,16 +47,22 @@ func cteFenceInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPoint
 // and remembers which tuple it replaced. When the replaced tuple was itself
 // written by an earlier DML CTE, the original (pre-CTE) tuple is recorded in
 // CTESelfModifiedErrors so the outer UPDATE/DELETE raises
-// ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION. No-op outside a DML CTE.
-// oldRel and newRel differ when the update moved the row across partitions.
+// ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION. No-op outside a data-modifying
+// WITH. oldRel and newRel differ when the update moved the row across
+// partitions.
+//
+// The fence and the reveal cover the outer statement's writes as well
+// (M0125-0054), but the self-modified bookkeeping stays gated on InDMLCTE:
+// it exists to catch a sub-command *inside* a CTE re-modifying a CTE-written
+// row, and the outer body's own writes are the normal case, not that one.
 func cteFenceUpdate(ctx *Context, oldRel storage.RelFileNode, oldPtr storage.ItemPointer,
 	newRel storage.RelFileNode, newPtr storage.ItemPointer) {
-	if !ctx.InDMLCTE || ctx.CTEWriteFence == nil {
+	if ctx.CTEWriteFence == nil {
 		return
 	}
 	oldKey := CTEFencePtr{Rel: oldRel, Ptr: oldPtr}
 	newKey := CTEFencePtr{Rel: newRel, Ptr: newPtr}
-	if _, inFence := ctx.CTEWriteFence[oldKey]; inFence {
+	if _, inFence := ctx.CTEWriteFence[oldKey]; inFence && ctx.InDMLCTE {
 		if ctx.CTENewToOld != nil {
 			if orig, ok := ctx.CTENewToOld[oldKey]; ok {
 				if ctx.CTESelfModifiedErrors == nil {
@@ -69,12 +82,17 @@ func cteFenceUpdate(ctx *Context, oldRel storage.RelFileNode, oldPtr storage.Ite
 	cteFenceDelete(ctx, oldRel, oldPtr)
 }
 
-// cteFenceDelete registers a tuple whose xmax this DML CTE just stamped, so
-// read scans in the rest of the statement still see its pre-image. No-op
-// outside a DML CTE. See Context.CTEXmaxReveal for why writes must not
-// consult the set this fills.
+// cteFenceDelete registers a tuple whose xmax a sub-statement of this
+// data-modifying WITH just stamped, so read scans in the rest of the statement
+// still see its pre-image. No-op outside such a statement. See
+// Context.CTEXmaxReveal for why writes must not consult the set this fills.
+//
+// As with the fence, the outer statement's own victims belong here too
+// (M0125-0054): PG's cmax-vs-es_output_cid test is symmetric between the CTEs
+// and the main plan, so a CTE deferred to the post-body phase must still see
+// the pre-image of a row the outer statement removed.
 func cteFenceDelete(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
-	if !ctx.InDMLCTE || ctx.CTEXmaxReveal == nil {
+	if ctx.CTEXmaxReveal == nil {
 		return
 	}
 	ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: ptr}] = struct{}{}
@@ -141,14 +159,50 @@ func cteFenced(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, s
 	return ok
 }
 
-// cteDMLPrefixOp executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
-// before handing control to the outer query plan. Each DML plan's RETURNING
-// rows are materialized into ctx.MaterializedCTEs so that MaterializedCTEScan
-// operators in the outer query can read them.
+// cteDMLPrefixOp drives the data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
+// of one statement. Each DML plan's RETURNING rows are materialized into
+// ctx.MaterializedCTEs so that MaterializedCTEScan operators in the outer
+// query can read them.
+//
+// The name is now a misnomer: the CTEs are NOT a prefix. PostgreSQL runs the
+// main plan first and only afterwards the data-modifying CTEs nothing pulled
+// from, in ExecPostprocessPlan over estate->es_auxmodifytables
+// (postgres/src/backend/executor/execMain.c); a CTE the main plan DOES read is
+// run by the CteScan that pulls from it, i.e. at the moment of demand. Both
+// halves are reproduced here (M0125-0054): runDMLCTE is called from
+// materializedCTEScanOp.Open for the referenced CTEs, and from runPending —
+// the ExecPostprocessPlan analogue — once the body reaches EOF.
+//
+// Running them up front, as this operator did until M0125-0054, is observable
+// whenever the outer statement writes a row a CTE also writes: whichever
+// sub-statement runs SECOND finds the row already stamped by this same command
+// and declines it. `WITH x AS (INSERT INTO t VALUES ('cte') RETURNING tag)
+// INSERT INTO t SELECT 'outer' RETURNING tag` puts 'outer' at ctid (0,1) and
+// 'cte' at (0,2) on live PG 18.3 — the reverse of the old prefix order.
 type cteDMLPrefixOp struct {
 	plan  *planner.CTEDMLPrefix
 	ctx   *Context
 	inner Operator // outer query operator
+
+	// ran[i] is set once DMls[i] has been executed to completion, running[i]
+	// while it is executing. running guards against a CTE reachable from its
+	// own body; references may only point backwards, so it should be
+	// unreachable, but a demand-driven runner must not recurse forever if it
+	// ever is.
+	ran     []bool
+	running []bool
+
+	// prevPending restores ctx.pendingDMLCTEs at Close, so a nested driver
+	// (currently rejected by the analyzer — a data-modifying WITH below the
+	// top level is an error, M0125-0051) could not strand the outer one.
+	prevPending *cteDMLPrefixOp
+
+	// drained records that the post-body phase has already been attempted, so
+	// Close does not repeat what Next already did. failed suppresses that
+	// phase after the body raised: PG never reaches ExecutorFinish on the
+	// error path either.
+	drained bool
+	failed  bool
 
 	// scope is the instrumenter active on this op's own Build() call,
 	// handed over by maybeInstrument (instrumentScopeCarrier). The DML
@@ -187,80 +241,167 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 		ctx.MaterializedCTEs = make(map[string][][]Datum)
 	}
 
-	// CTE snapshot isolation: save the statement-start snapshot and
-	// initialise the write fence. The outer query will restore the
-	// snapshot and skip any rows written by the DML CTEs so that
-	// PostgreSQL CTE semantics hold (outer SELECT sees pre-CTE state).
-	savedSnap := ctx.Snap
+	// CTE snapshot isolation: initialise the write fence and its mirror.
+	// Every sub-statement of this WITH — the CTEs and the outer body alike —
+	// registers what it writes, and every scan of the others skips it, so
+	// PostgreSQL's "the sub-statements cannot see one another's effects on the
+	// target tables" holds regardless of the order they run in.
 	ctx.CTEWriteFence = make(map[CTEFencePtr]struct{})
 	ctx.CTEXmaxReveal = make(map[CTEFencePtr]struct{})
 	ctx.CTENewToOld = make(map[CTEFencePtr]CTEFencePtr)
 	ctx.CTESelfModifiedErrors = make(map[CTEFencePtr]struct{})
-	ctx.InDMLCTE = true
-
-	// Execute each DML CTE in order, collecting RETURNING rows.
-	for i, dml := range o.plan.DMls {
-		op, err := o.buildUnderScope(dml)
-		if err != nil {
-			ctx.InDMLCTE = false
-			ctx.Snap = savedSnap
-			return err
-		}
-		if err := op.Open(ctx); err != nil {
-			ctx.InDMLCTE = false
-			ctx.Snap = savedSnap
-			return err
-		}
-		var rows [][]Datum
-		for {
-			slot, err := op.Next()
-			if err == EOF {
-				break
-			}
-			if err != nil {
-				op.Close()
-				ctx.InDMLCTE = false
-				ctx.Snap = savedSnap
-				return err
-			}
-			// Materialize the row so it survives after op.Close().
-			r := slotRow(slot)
-			owned := make([]Datum, len(r))
-			copy(owned, r)
-			rows = append(rows, owned)
-		}
-		op.Close()
-		key := strings.ToLower(o.plan.Names[i])
-		ctx.MaterializedCTEs[key] = rows
-	}
-
-	// Restore snapshot and clear InDMLCTE before running the outer query.
-	// The outer SELECT uses the statement-start snapshot (pre-CTE state)
-	// and the CTEWriteFence skips any rows written by the DML CTEs above.
 	ctx.InDMLCTE = false
-	ctx.Snap = savedSnap
 
-	// Now build and open the outer query plan.
+	o.ran = make([]bool, len(o.plan.DMls))
+	o.running = make([]bool, len(o.plan.DMls))
+	o.prevPending = ctx.pendingDMLCTEs
+	ctx.pendingDMLCTEs = o
+
+	// The main plan goes first. A MaterializedCTEScan inside it reaches back
+	// through ctx.pendingDMLCTEs and runs the CTE it reads before returning a
+	// row, so a referenced CTE still completes before its consumer sees
+	// anything — which is what PG's CteScan-driven ModifyTable does.
 	inner, err := o.buildUnderScope(o.plan.Body)
 	if err != nil {
+		ctx.pendingDMLCTEs = o.prevPending
 		return err
 	}
 	if err := inner.Open(ctx); err != nil {
+		ctx.pendingDMLCTEs = o.prevPending
 		return err
 	}
 	o.inner = inner
 	return nil
 }
 
-func (o *cteDMLPrefixOp) Close() error {
-	if o.inner != nil {
-		return o.inner.Close()
+// runDMLCTE executes DMls[i] to completion and files its RETURNING rows under
+// Names[i]. Idempotent: the second call for an already-run CTE is a no-op,
+// which is what makes demand-driving and the post-body sweep composable.
+func (o *cteDMLPrefixOp) runDMLCTE(i int) error {
+	if o.ran[i] {
+		return nil
+	}
+	if o.running[i] {
+		return &ExecError{
+			Code:    "42P19",
+			Pos:     o.plan.Pos(),
+			Message: fmt.Sprintf("data-modifying WITH query %q refers to itself", o.plan.Names[i]),
+		}
+	}
+	o.running[i] = true
+	ctx := o.ctx
+	savedSnap := ctx.Snap
+	savedInCTE := ctx.InDMLCTE
+	ctx.InDMLCTE = true
+	defer func() {
+		o.running[i] = false
+		ctx.InDMLCTE = savedInCTE
+		// The sub-statements all read the statement-start snapshot; a DML
+		// plan that took its own must not leak it back to the caller.
+		ctx.Snap = savedSnap
+	}()
+
+	op, err := o.buildUnderScope(o.plan.DMls[i])
+	if err != nil {
+		return err
+	}
+	if err := op.Open(ctx); err != nil {
+		return err
+	}
+	var rows [][]Datum
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			op.Close()
+			return err
+		}
+		// Materialize the row so it survives after op.Close().
+		r := slotRow(slot)
+		owned := make([]Datum, len(r))
+		copy(owned, r)
+		rows = append(rows, owned)
+	}
+	op.Close()
+	o.ran[i] = true
+	ctx.MaterializedCTEs[strings.ToLower(o.plan.Names[i])] = rows
+	return nil
+}
+
+// ensureCTE runs the named DML CTE if it has not run yet. Called by
+// materializedCTEScanOp.Open — the demand half of PG's model.
+func (o *cteDMLPrefixOp) ensureCTE(name string) error {
+	for i, n := range o.plan.Names {
+		if strings.EqualFold(n, name) {
+			return o.runDMLCTE(i)
+		}
 	}
 	return nil
 }
 
+// runPending is the ExecPostprocessPlan analogue: after the main plan is done,
+// every data-modifying CTE nothing pulled from is run to completion.
+//
+// The order is REVERSE declaration order, which is not an arbitrary choice.
+// ExecInitModifyTable files each non-canSetTag ModifyTable with `lcons`, not
+// lappend (postgres/src/backend/executor/nodeModifyTable.c), so
+// es_auxmodifytables is in reverse initialization order and
+// ExecPostprocessPlan walks it head-first. Upstream's own comment gives the
+// reason: a later CTE may read an earlier one, and running the later one first
+// lets its CteScan drive the earlier one rather than finding its RETURNING
+// rows already thrown away. Confirmed on live PG 18.3 (2026-08-06): three
+// unreferenced INSERT CTEs a, b, c land at ctid (0,1)=c, (0,2)=b, (0,3)=a.
+//
+// goopg reaches the same place from the other side — a deferred CTE that reads
+// an earlier one demands it through ensureCTE — so the traversal order only
+// has to match PG's observable heap order, and this is it.
+func (o *cteDMLPrefixOp) runPending() error {
+	for i := len(o.plan.DMls) - 1; i >= 0; i-- {
+		if err := o.runDMLCTE(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *cteDMLPrefixOp) Close() error {
+	// A cursor closed before its body was exhausted never reached the EOF in
+	// Next; PG still runs the leftover CTEs (ExecutorFinish precedes
+	// ExecutorEnd), so do it here, with the body still open as it is there.
+	var err error
+	if !o.drained && !o.failed && o.ctx != nil {
+		o.drained = true
+		err = o.runPending()
+	}
+	if o.ctx != nil {
+		o.ctx.pendingDMLCTEs = o.prevPending
+	}
+	if o.inner != nil {
+		if cerr := o.inner.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
 func (o *cteDMLPrefixOp) Next() (TupleSlot, error) {
-	return o.inner.Next()
+	slot, err := o.inner.Next()
+	switch {
+	case err == EOF:
+		if !o.drained {
+			o.drained = true
+			if perr := o.runPending(); perr != nil {
+				o.failed = true
+				return nil, perr
+			}
+		}
+		return nil, EOF
+	case err != nil:
+		o.failed = true
+	}
+	return slot, err
 }
 
 // materializedCTEScanOp reads rows from ctx.MaterializedCTEs[name].
@@ -423,6 +564,16 @@ func (o *materializedCTEScanOp) Schema() planner.Schema { return o.plan.Output()
 
 func (o *materializedCTEScanOp) Open(ctx *Context) error {
 	key := strings.ToLower(o.plan.Name)
+	// Demand half of PG's model: a data-modifying CTE runs when something
+	// pulls from it. Reaching the driver here rather than deciding
+	// referenced-ness at plan time keeps the split fail-safe — a CTE the
+	// planner would have judged unreferenced still runs before its first row
+	// is read. M0125-0054.
+	if ctx.pendingDMLCTEs != nil {
+		if err := ctx.pendingDMLCTEs.ensureCTE(key); err != nil {
+			return err
+		}
+	}
 	if ctx.MaterializedCTEs != nil {
 		o.rows = ctx.MaterializedCTEs[key]
 	}
