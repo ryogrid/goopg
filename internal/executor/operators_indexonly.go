@@ -229,6 +229,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			}
 			return true, nil
 		}
+		// M0125-0052: same fence as the seq-scan and index-scan twins — a row a
+		// data-modifying CTE of this statement wrote is invisible to the rest of
+		// it. A CTE-written row is never on an ALL_VISIBLE page (the write clears
+		// the VM bit), so this heap-checking fallback is the only IOS path that
+		// can reach one.
+		if cteFenced(ctx, heapRel, ptr.Block, actualSlot) {
+			return true, nil
+		}
 		// M0118-0001: SSI read-path per-tuple conflict-out on the HOT-resolved
 		// live version. The ALL_VISIBLE fast path needs no heap tuple, but this
 		// non-ALL_VISIBLE fallback already fetched it, so record the rw-edge

@@ -512,6 +512,15 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// acceptable per the M0091-0002 audit.
 		slot.RLock()
 		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
+		// M0125-0052: a row written by a data-modifying CTE of this statement
+		// is invisible to the rest of it. The seq-scan twin fences the same
+		// tuple (operators_storage.go), so which scan the planner picks must
+		// not decide the answer.
+		if found && cteFenced(o.ctx, o.heapRel, ptr.Block, actualSlot) {
+			slot.RUnlock()
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
 		if !found {
 			// C3-S2 kill-list oracle: invisible-to-me is upgraded to
 			// dead-to-ALL only when every HOT-chain member proves dead

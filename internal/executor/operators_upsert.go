@@ -973,9 +973,7 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	if err != nil {
 		return storage.ItemPointer{}, err
 	}
-	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-		o.ctx.CTEWriteFence[ptr] = struct{}{}
-	}
+	cteFenceInsert(o.ctx, rel, ptr)
 	o.trackWrittenPtr(ptr)
 	// Insert the arbiter btree entry using the pre-computed Phase B key so the
 	// expression is not re-evaluated (avoiding extra NOTICEs for plain INSERT).
@@ -1087,9 +1085,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	if err != nil {
 		return err
 	}
-	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-		o.ctx.CTEWriteFence[newPtr] = struct{}{}
-	}
+	cteFenceUpdate(o.ctx, rel, oldPtr, rel, newPtr)
 	// Link the old tuple to the new version via t_ctid so a concurrent locker
 	// (e.g. FOR KEY SHARE on a key-UPDATE conflict) that waits on the old
 	// tuple's xmax can follow the ctid chain to the live successor instead of

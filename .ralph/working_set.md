@@ -1,51 +1,49 @@
 (idle — nothing in flight)
 
-Last loop: **M0125-0050 CLOSED — a CTE's runtime identity is its DECLARATION,
-not its name.** The witness now returns 1,2 like PG (was 1,1).
+Last loop: **M0125-0052 CLOSED and committed** — a data-modifying CTE's writes
+are now invisible to the WHOLE statement, not just to an outer SELECT.
 
-1. **The task was entirely the choice of KEY**; the code change is ~6 lines.
-   Both cheap candidates fail in OPPOSITE directions, and the filed suggestion
-   was one of the wrong ones.
-2. **Name over-shares** — the bug: `ctx.CTERowCache` keyed by lowercase name
-   statement-wide, so two disjoint `WITH x` shared one buffer.
-3. **Pointer / `declSeq` under-share** (the trap I nearly shipped): `planSelect`
-   re-enters on the head operand of a set-op chain, so M0125-0040's
-   grouping-sets rewrite plans its ONE synthetic `__gs_src_N` declaration
-   TWICE. Measured on a 3-branch ROLLUP: 3 scans, 2 `*plannedCTE`, 2 declSeqs,
-   1 declaration. Either key splits the buffer → the hoisted join runs twice →
-   undoes -0040 on Q18/Q67, while still passing a name-only assertion.
-4. **Landed key:** `CTEScan.DeclKey()` = declaring `CommonTableExpr` source
-   offset + lowercased name (PG's `ctePlanId` analogue). Stable across
-   replanning, distinct per declaration (all 3 `CommonTableExpr` producers
-   checked), race-free — no counter, no lazily-mutated AST field.
-5. EXPLAIN's `collectCTEHoist` moved to the same key, as -0049 said it must:
-   grouping-sets source still ONE section; two same-named declarations now two
-   `CTE x` sections — also what PG prints.
+1. The filing's diagnosis ("only the outer SELECT consults the fence") was
+   half right. `scanMatching` — the scan behind an outer UPDATE/DELETE —
+   ALREADY consulted `ctx.CTEWriteFence`. The fence was **starved**: only
+   `upsertOp` and the three UPDATE paths ever registered a write, so for the
+   archetypal `WITH x AS (INSERT …)` it was EMPTY. That also broke the
+   outer-SELECT half everyone believed worked (`SELECT count(*)` → 2, PG 1).
+2. Registering INSERTs alone would have traded one wrong answer for another:
+   the key was a bare `ItemPointer` and `{block 0, offset 1}` is the first row
+   of EVERY table. Key is now `CTEFencePtr{Rel, Ptr}`; the EvalPlanQual xmin
+   re-read that existed only to work around that collision is deleted.
+3. Fourth site class found while verifying: the fence must not be PLAN-SHAPE
+   dependent. With a PK on the target the outer SELECT went through an Index
+   Only Scan and returned the CTE's row — so `indexScanOp`, `indexOnlyScanOp`
+   and the index-driven UPDATE fast path consult it now too.
+4. Five inline registration copies collapsed into `cteFenceInsert` /
+   `cteFenceUpdate` (separate src/dest rel for cross-partition moves) /
+   `cteFenced`, in `operators_cte_dml.go`.
 
-Files: `internal/planner/with.go` (`declPos` ×3 sites), `internal/planner/plan.go`
-(`DeclKey`), `internal/executor/operators_cte_dml.go` (key), `explain_cte.go`
-(`byName`→`byDecl`), comment sync in `context.go`/`executor.go`/
-`cte_inline_pushdown.go`/`unnest.go`; tests in `with_compat_test.go` (+2),
-`explain_cte_test.go` (+1), `groupingsets_share_test.go` (strengthened to
-DeclKey — this is the §2.1 guard); `docs/design/0125-0050-cte-declaration-identity.md`
-+ README index; fix_plan tick; 2 ledger rows.
+Files: `internal/executor/{context,operators_cte_dml,operators_storage,
+operators_index,operators_indexonly,operators_merge,operators_upsert}.go`, new
+`internal/executor/cte_dml_outer_dml_fence_test.go` (7 shapes, each pinned to a
+value captured from live PG 18.3 on port 65432),
+`docs/design/0125-0052-dml-cte-write-fence-covers-whole-statement.md` + README
+index, fix_plan (-0052 ticked, -0053 filed), 3 ledger rows.
 
-Gates run: `internal/planner` + `internal/executor` PASS;
+Gates run: executor/planner/analyzer/parser/server packages PASS;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` Q12=2/Q13=35 canonical PASS;
 `scripts/tpcds-sf05-regression.sh plans` → `queries=99 same=99 changed=0`
-(new baseline `plans-20260806-152448.txt`) — the bar the item stated, and the
-real check that nothing un-shared; pgbench smoke via the commit hook.
+(capture `plans-20260806-160727.txt`, baseline NOT re-pinned — nothing moved);
+pgbench smoke via the commit hook.
 
 NEXT LOOP (banner: M0124 closed → M0125 → M0127 → M-NIGHTLY → M0123).
-Read `ci/logs/action-items.md` FIRST — it was still run `20260806-011323` this
-loop (all 18 filed; nothing new). If a NEW nightly ran with `status: pass`, the
-M0127 S7 gate is met and **M0127-P6.1 (delete fusion)** becomes selectable.
-Otherwise the live M0125 choice is **`M0125-0048`** (the faithful `AGG_MIXED`
-grouping-sets aggregate — fidelity, and it would RETIRE the `__gs_src_N` CTE
-hoist this loop just hardened). -0031/-0032/-0033/-0041 stay
-`[→ M0127: absorbed]` — never select them standalone. The two new ledger rows
-(DML `MaterializedCTEs` name key; missing 42P19 top-level DML-CTE check) are
-small and paired — the 42P19 check is the one to do first.
+`ci/logs/action-items.md` is still run `20260806-011323` (all 18 filed, nothing
+new) — re-check first; a NEW nightly at `status: pass` makes M0127-P6.1
+selectable. Otherwise the live M0125 choices are **`M0125-0053`** (this loop's
+successor: the fence hides rows a CTE ADDED but cannot show rows it REMOVED —
+two witnesses recorded, but note the blast radius is the tuple VISIBILITY
+predicate, not a skip list) or **`M0125-0048`** (the faithful `AGG_MIXED`
+grouping-sets aggregate — fidelity, large, retires the `__gs_src_N` hoist).
+-0031/-0032/-0033/-0041 stay `[→ M0127: absorbed]`.
 
-In-flight: none.
+In-flight: none. PG reference cluster on 65432 was started this loop for the
+oracle capture and left RUNNING (`bench/tpch/stop_pg.sh` to stop it).

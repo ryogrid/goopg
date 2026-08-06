@@ -5331,8 +5331,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       (PG returns 0 rows and keeps the row, goopg deletes it — a wrong-answer
       bug, the biggest of the four); PL/pgSQL accepts no `WITH` statement at
       all; `WITH … (SELECT …)` is a goopg syntax error.
-- [ ] **M0125-0052 — an outer DML sees the rows its own data-modifying CTE
-      wrote** (filed 2026-08-06 by `M0125-0051`, which A/B'd the top-level DML-CTE
+- [x] **M0125-0052 — an outer DML sees the rows its own data-modifying CTE
+      wrote** *(done 2026-08-06)* (filed 2026-08-06 by `M0125-0051`, which A/B'd the top-level DML-CTE
       forms against PG 18.3 while proving the accepted half still runs; ledger row
       same date). `WITH x AS (INSERT INTO dm15 VALUES (15) RETURNING a)
       DELETE FROM dm15 WHERE a = 15 RETURNING a` returns **1 row and empties the
@@ -5351,6 +5351,47 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       A/B script above (goopg must return 0 rows and keep the row) plus the
       existing DML-CTE compat pins; no plan-shape change, so the SF0.5 plan
       channel must report `same=99`.
+      **DONE 2026-08-06** (`docs/design/0125-0052-dml-cte-write-fence-covers-whole-statement.md`).
+      The fence was *starved*, not bypassed: `scanMatching` — the scan behind an
+      outer UPDATE/DELETE — already consulted it, but only `upsertOp` and the
+      three UPDATE paths ever registered a write, so for the archetypal
+      `WITH x AS (INSERT …)` the fence was EMPTY. That also broke the
+      outer-SELECT half believed to work (`SELECT count(*)` answered 2 where PG
+      answers 1). Registering INSERTs alone would have traded one wrong answer
+      for another — the key was a bare `ItemPointer`, and `{block 0, offset 1}`
+      is the first row of every table — so the key is now `CTEFencePtr{Rel,
+      Ptr}` (the EvalPlanQual xmin re-read that worked around the collision is
+      deleted), the five inline registration copies collapse into
+      `cteFenceInsert`/`cteFenceUpdate`/`cteFenced`, and INSERT + MERGE-insert
+      register. Fourth site class found while verifying: the fence must not be
+      PLAN-SHAPE dependent — with a PK on the target the outer SELECT went
+      through an Index Only Scan and returned the CTE's row — so
+      `indexScanOp`, `indexOnlyScanOp` and the index-driven UPDATE fast path
+      consult it too. Seven tests in
+      `internal/executor/cte_dml_outer_dml_fence_test.go`, each pinned to a
+      value captured from live PG 18.3. Gates: units PASS, TPC-H Q12=2/Q13=35,
+      SF0.5 plan channel `same=99`. Successor filed as `M0125-0053`.
+- [ ] **M0125-0053 — the write fence hides rows a DML CTE ADDED but cannot show
+      rows it REMOVED** (filed 2026-08-06 by `M0125-0052`; ledger row same
+      date). A CTE DELETE stamps xmax with our own XID, and a CTE UPDATE does
+      the same to the old version whose new version is then fenced, so the row
+      vanishes from the rest of the statement — where PG still shows its
+      PRE-IMAGE. Witnesses (live PG 18.3, 2026-08-06):
+      `WITH x AS (DELETE FROM dz WHERE a = 1 RETURNING a) SELECT count(*) FROM
+      dz` → PG **2**, goopg **1**; `WITH x AS (UPDATE dz SET a = 6 WHERE a = 5
+      RETURNING a) SELECT a FROM dz ORDER BY a` → PG **[2, 5]**, goopg **[2]**.
+      PG needs no second mechanism: the same `es_output_cid` that hides a
+      sibling's insert through `cmin` reveals the pre-image through `cmax`
+      (`postgres/src/backend/access/heap/heapam_visibility.c`,
+      HeapTupleSatisfiesMVCC). Fix: the inverse of the fence — a per-statement
+      set of `CTEFencePtr`s whose own-xmax the visibility test must IGNORE for
+      the rest of the statement — populated wherever a DML CTE stamps xmax
+      (`markHeapDeleteDirtyAndClearVM` callers, `cteFenceUpdate`'s old key).
+      The faithful alternative is a real per-tuple command id. Note the blast
+      radius is larger than -0052's: the fence only ever SKIPS rows, this
+      changes the visibility PREDICATE every scan and isolation test depends
+      on. Bar: both witnesses above, plus the seven -0052 tests unchanged, the
+      isolation suite, and TPC-H Q12=2/Q13=35.
 - [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor

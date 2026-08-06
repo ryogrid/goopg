@@ -562,22 +562,24 @@ type Context struct {
 	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
 
-	// CTEWriteFence, when non-nil, is a set of row pointers written by DML
-	// CTEs during their execution phase. The outer query's seqScanOp skips
-	// these tuples to implement CTE snapshot isolation: DML-CTE writes must
-	// not be visible to the outer SELECT. Cleared between statements.
-	CTEWriteFence map[storage.ItemPointer]struct{}
+	// CTEWriteFence, when non-nil, is a set of rows written by DML CTEs during
+	// their execution phase. Every scan of the rest of the statement — the
+	// outer SELECT *and* an outer INSERT/UPDATE/DELETE — skips these tuples to
+	// implement CTE snapshot isolation: the sub-statements of a data-modifying
+	// WITH cannot see one another's effects on the target tables. Cleared
+	// between statements.
+	CTEWriteFence map[CTEFencePtr]struct{}
 
-	// CTENewToOld maps each new tuple pointer added to CTEWriteFence to the
+	// CTENewToOld maps each new tuple added to CTEWriteFence to the
 	// original (pre-CTE) tuple it replaced. Used to detect when a sub-command
 	// within the CTE's expression evaluation modifies a CTE-written row, which
 	// must raise an error in the outer UPDATE/DELETE.
-	CTENewToOld map[storage.ItemPointer]storage.ItemPointer
+	CTENewToOld map[CTEFencePtr]CTEFencePtr
 
-	// CTESelfModifiedErrors is the set of original (pre-CTE) tuple pointers
+	// CTESelfModifiedErrors is the set of original (pre-CTE) tuples
 	// for which the outer UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
 	// Populated when InDMLCTE=true and a write stamps xmax on a CTEWriteFence tuple.
-	CTESelfModifiedErrors map[storage.ItemPointer]struct{}
+	CTESelfModifiedErrors map[CTEFencePtr]struct{}
 
 	// CTESelfModErr, when non-nil, is the error scanMatching returns upon
 	// encountering an invisible-due-to-own-xmax tuple in CTESelfModifiedErrors.

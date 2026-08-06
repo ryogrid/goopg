@@ -7,6 +7,74 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// CTEFencePtr identifies one heap tuple for the DML-CTE write fence.
+//
+// The relation is part of the key because an ItemPointer alone is not unique
+// across relations: {block 0, offset 1} exists in every table, so a
+// relation-blind fence hides an unrelated table's row from the rest of the
+// statement. That collision was already known — the EvalPlanQual site in
+// operators_storage.go worked around it by re-reading the tuple and checking
+// xmin — and M0125-0052 made it reachable in the common case by registering
+// plain INSERTs, which land at low block/offset numbers in every table.
+type CTEFencePtr struct {
+	Rel storage.RelFileNode
+	Ptr storage.ItemPointer
+}
+
+// cteFenceInsert registers a tuple this DML CTE just inserted, so every later
+// scan in the same statement skips it. No-op outside a DML CTE.
+//
+// PostgreSQL needs no such set: all sub-statements of a data-modifying WITH
+// share `estate->es_snapshot` AND `estate->es_output_cid`, so a sibling's
+// tuple is filtered by the cmin test in HeapTupleSatisfiesMVCC
+// (postgres/src/backend/access/heap/heapam_visibility.c). goopg's heap has no
+// per-tuple command id, so the fence stands in for the cmin test.
+func cteFenceInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
+	if !ctx.InDMLCTE || ctx.CTEWriteFence == nil {
+		return
+	}
+	ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: ptr}] = struct{}{}
+}
+
+// cteFenceUpdate registers the new version of a tuple a DML CTE just updated
+// and remembers which tuple it replaced. When the replaced tuple was itself
+// written by an earlier DML CTE, the original (pre-CTE) tuple is recorded in
+// CTESelfModifiedErrors so the outer UPDATE/DELETE raises
+// ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION. No-op outside a DML CTE.
+// oldRel and newRel differ when the update moved the row across partitions.
+func cteFenceUpdate(ctx *Context, oldRel storage.RelFileNode, oldPtr storage.ItemPointer,
+	newRel storage.RelFileNode, newPtr storage.ItemPointer) {
+	if !ctx.InDMLCTE || ctx.CTEWriteFence == nil {
+		return
+	}
+	oldKey := CTEFencePtr{Rel: oldRel, Ptr: oldPtr}
+	newKey := CTEFencePtr{Rel: newRel, Ptr: newPtr}
+	if _, inFence := ctx.CTEWriteFence[oldKey]; inFence {
+		if ctx.CTENewToOld != nil {
+			if orig, ok := ctx.CTENewToOld[oldKey]; ok {
+				if ctx.CTESelfModifiedErrors == nil {
+					ctx.CTESelfModifiedErrors = make(map[CTEFencePtr]struct{})
+				}
+				ctx.CTESelfModifiedErrors[orig] = struct{}{}
+			}
+		}
+	}
+	ctx.CTEWriteFence[newKey] = struct{}{}
+	if ctx.CTENewToOld != nil {
+		ctx.CTENewToOld[newKey] = oldKey
+	}
+}
+
+// cteFenced reports whether a tuple was written by a DML CTE of this
+// statement and must therefore be skipped by the rest of it.
+func cteFenced(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
+	if ctx.CTEWriteFence == nil {
+		return false
+	}
+	_, ok := ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
+	return ok
+}
+
 // cteDMLPrefixOp executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
 // before handing control to the outer query plan. Each DML plan's RETURNING
 // rows are materialized into ctx.MaterializedCTEs so that MaterializedCTEScan
@@ -58,9 +126,9 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	// snapshot and skip any rows written by the DML CTEs so that
 	// PostgreSQL CTE semantics hold (outer SELECT sees pre-CTE state).
 	savedSnap := ctx.Snap
-	ctx.CTEWriteFence = make(map[storage.ItemPointer]struct{})
-	ctx.CTENewToOld = make(map[storage.ItemPointer]storage.ItemPointer)
-	ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
+	ctx.CTEWriteFence = make(map[CTEFencePtr]struct{})
+	ctx.CTENewToOld = make(map[CTEFencePtr]CTEFencePtr)
+	ctx.CTESelfModifiedErrors = make(map[CTEFencePtr]struct{})
 	ctx.InDMLCTE = true
 
 	// Execute each DML CTE in order, collecting RETURNING rows.

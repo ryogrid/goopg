@@ -1580,14 +1580,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				tuple.Header.Infomask&storage.HeapXminInvalid == 0 &&
 				!mvcc.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
 			// CTE snapshot isolation: skip rows written by DML CTEs so the
-			// outer SELECT sees the pre-CTE state (PostgreSQL semantics).
-			if o.ctx.CTEWriteFence != nil {
-				if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}]; inFence {
-					if o.pinned != nil {
-						o.pinned.RUnlock()
-					}
-					continue
+			// rest of the statement sees the pre-CTE state (PostgreSQL
+			// semantics). curSlot was already advanced past this tuple.
+			if cteFenced(o.ctx, rel, o.curBlock, o.curSlot-1) {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
 				}
+				continue
 			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
@@ -2244,6 +2243,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
+			// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
+			// invisible to every other sub-statement of the same WITH.
+			cteFenceInsert(o.ctx, targetRel, ptr)
 			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
 			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
 			// against any SERIALIZABLE reader that holds a covering predicate
@@ -2293,6 +2295,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if werr != nil {
 			return nil, werr
 		}
+		// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
+		// invisible to every other sub-statement of the same WITH.
+		cteFenceInsert(o.ctx, targetRel, ptr)
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
 		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
@@ -3570,23 +3575,9 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
-		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
-		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
-		if _, inFence := ctx.CTEWriteFence[oldItemPtr]; inFence {
-			if ctx.CTENewToOld != nil {
-				if orig, ok := ctx.CTENewToOld[oldItemPtr]; ok {
-					if ctx.CTESelfModifiedErrors == nil {
-						ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-					}
-					ctx.CTESelfModifiedErrors[orig] = struct{}{}
-				}
-			}
-		}
-		ctx.CTEWriteFence[newItemPtr] = struct{}{}
-		if ctx.CTENewToOld != nil {
-			ctx.CTENewToOld[newItemPtr] = oldItemPtr
-		}
+	if derr == nil {
+		cteFenceUpdate(ctx, rel, storage.ItemPointer{Block: blk, Offset: oldSlot},
+			rel, storage.ItemPointer{Block: blk, Offset: newSlot})
 	}
 	return true, derr
 }
@@ -3961,6 +3952,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
+			return true, nil
+		}
+		// M0125-0052: the index-driven UPDATE twin of the scanMatching fence —
+		// an outer UPDATE must not touch a row its own data-modifying CTE wrote.
+		if cteFenced(o.ctx, heapRel, ptr.Block, actualSlot) {
 			return true, nil
 		}
 		// No tuple-tag acquire on a foreign lock-only holder here: the
@@ -4378,23 +4374,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if werr != nil {
 					return nil, werr
 				}
-				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-						if o.ctx.CTENewToOld != nil {
-							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-								if o.ctx.CTESelfModifiedErrors == nil {
-									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-								}
-								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-							}
-						}
-					}
-					o.ctx.CTEWriteFence[newPtr] = struct{}{}
-					if o.ctx.CTENewToOld != nil {
-						o.ctx.CTENewToOld[newPtr] = oldPtr
-					}
-				}
+				cteFenceUpdate(o.ctx, rel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+					targetWriteRel, newPtr)
 				// Maintain unique/PK btree entries for the new row version.
 				if destPartIdx != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
@@ -5119,23 +5100,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if werr != nil {
 					return nil, werr
 				}
-				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-						if o.ctx.CTENewToOld != nil {
-							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-								if o.ctx.CTESelfModifiedErrors == nil {
-									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-								}
-								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-							}
-						}
-					}
-					o.ctx.CTEWriteFence[newPtr] = struct{}{}
-					if o.ctx.CTENewToOld != nil {
-						o.ctx.CTENewToOld[newPtr] = oldPtr
-					}
-				}
+				cteFenceUpdate(o.ctx, puRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+					targetWriteRel, newPtr)
 				if destPart != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
 				} else if pu.scanTbl != nil {
@@ -6147,23 +6113,11 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 				// CTE isolation: if the EPQ chain led to a CTE-written tuple, the CTE
 				// already owns this row. Skip to preserve savedSnap isolation semantics.
-				// Verify xmin == currentTx to avoid false positives when another table's
-				// CTE-written rows coincidentally share the same {block,slot}. M0100-0010.
-				if o.ctx.CTEWriteFence != nil {
-					if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: epqBlk, Offset: newSlot}]; inFence {
-						skipRow := false
-						if s2, serr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: epqBlk}); serr == nil {
-							s2.RLock()
-							if tup2, terr := storage.PageGetHeapTuple(s2.Page(), newSlot); terr == nil {
-								skipRow = mvcc.IsSelfXID(tup2.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
-							}
-							s2.RUnlock()
-							o.ctx.Pool.Unpin(s2)
-						}
-						if skipRow {
-							continue
-						}
-					}
+				// M0100-0010; M0125-0052 made the fence key relation-qualified, so the
+				// xmin re-read that used to disambiguate another table's coincident
+				// {block,slot} is no longer needed.
+				if cteFenced(o.ctx, puSrcRel, epqBlk, newSlot) {
+					continue
 				}
 				// Re-evaluate predicate against the new row + FROM portion.
 				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
@@ -6265,23 +6219,8 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					return nil, cerr
 				}
 			}
-			if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
-				oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
-				if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
-					if o.ctx.CTENewToOld != nil {
-						if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
-							if o.ctx.CTESelfModifiedErrors == nil {
-								o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
-							}
-							o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
-						}
-					}
-				}
-				o.ctx.CTEWriteFence[newPtr] = struct{}{}
-				if o.ctx.CTENewToOld != nil {
-					o.ctx.CTENewToOld[newPtr] = oldPtr
-				}
-			}
+			cteFenceUpdate(o.ctx, puSrcRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
+				puRel, newPtr)
 			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, puCols, pu.newRow, newPtr)
 			if !isCrossPartMove {
 				if cerr := stampOldCtid(o.ctx, puSrcRel, pu.blk, pu.slot, newPtr); cerr != nil {
@@ -6578,7 +6517,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				// modified this invisible (own-xmax) tuple, the outer
 				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
 				if ctx.CTESelfModErr != nil && ctx.CTESelfModifiedErrors != nil {
-					ptr := storage.ItemPointer{Block: blk, Offset: slot}
+					ptr := CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}
 					if _, inErr := ctx.CTESelfModifiedErrors[ptr]; inErr {
 						s.RUnlock()
 						ctx.Pool.Unpin(s)
@@ -6587,13 +6526,10 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				}
 				continue
 			}
-			// Skip rows written by DML CTEs — outer UPDATE/DELETE must see
-			// pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
-			if ctx.CTEWriteFence != nil {
-				ptr := storage.ItemPointer{Block: blk, Offset: slot}
-				if _, inFence := ctx.CTEWriteFence[ptr]; inFence {
-					continue
-				}
+			// Skip rows written by DML CTEs — an outer INSERT/UPDATE/DELETE must
+			// see pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
+			if cteFenced(ctx, rel, blk, slot) {
+				continue
 			}
 			// M0104-0008: SSI read-path hook for the UPDATE / DELETE
 			// scanMatching loop (mirrors the seqScanOp.Next site). A
