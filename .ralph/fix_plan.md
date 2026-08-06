@@ -1413,6 +1413,66 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       long-blocked-goroutine sections out of `testport/go-test.log` — they name
       the statement and the server frame directly. If it does NOT wedge, the
       remaining question is only whether the S7 cycle is clean.**
+      **↳ ROOT CAUSE FOUND AND FIXED 2026-08-06 (ninth S7-gate loop). The
+      wedge is a page content latch STRANDED BY A RECOVERED PANIC.** It was
+      not diagnosed from a re-run but from a LIVE SPECIMEN found on this
+      workstation: an orphaned regress-suite `goopg` server (PPID 1, data dir
+      already deleted, ignoring SIGTERM) whose goroutine dump
+      (`analysis/m0127-s7-regress/orphan-3051493/goroutines.txt`) showed the
+      **checkpointer blocked 10 minutes** on one slot's shared content latch
+      (`flushBatch` ← `FlushAllPaced` ← `runCheckpoint`) that **no live
+      goroutine held** — a latch with no owner alive. Its own server log
+      (`/tmp/goopg_cluster_debug/regress_suite.log`, which survives the test
+      TempDir cleanup) named the owner at the same minute: `backend goroutine
+      panic … "storage: not enough free space in page"` in
+      `btree.insertItemSorted` ← `insertIntoBlock` ← `Insert` ←
+      `maintainUniqueIndexesForInsert` ← `updateOp.Next`. `insertIntoBlock`
+      takes the leaf's exclusive latch via `pinW` and releases it with an
+      explicit `unpinW` (NOT a defer — the split path hands latches between
+      frames), so a panic unwinding that window strands the latch forever,
+      because `internal/server`'s per-connection handler recovers every backend
+      panic (`server.go:~799`) and the owning goroutine simply vanishes.
+      **Every element of this item's own signature follows from that**:
+      hypothesis (b) is now EXPLAINED (the wait is on `contentMu`, and a mutex
+      wait observes no statement deadline — nothing checks the statement
+      clock); the server stays fast because only that one page is poisoned;
+      the wedge case MOVES because it is whoever next touches the page; and
+      the shutdown checkpoint's `FlushAll` wants the same latch, which is why
+      wedged servers ignore SIGTERM — **the "testport orphan crawl" is the
+      same defect, not a separate one**. PG cannot reach this state:
+      `elog(ERROR)` longjmps and `AbortTransaction()` calls
+      `LWLockReleaseAll()`. Fix: local idempotent `wlatch` holder
+      (`internal/access/btree/latch_release.go`), `defer held.release()` in
+      `insertIntoBlock` covering the panic path while its 11 normal exits keep
+      releasing explicitly. A first cut keeping the registry on the `*BTree`
+      was FALSIFIED by the package's own tests (`*BTree` is NOT
+      goroutine-private — `TestConcurrentSearchAfterInserts` deadlocked; and
+      callers latch outside any entry point — `lpdead_kill_test.go:225`
+      double-released). Guards `TestStrandedLatchReleasedOnPanic` (non-vacuous:
+      removing only the defer makes it HANG — the wedge in miniature) and
+      `TestWlatchReleaseIsIdempotent`. Design
+      **docs/design/root-0040-btree-stranded-latch-release.md**; 2 ledger rows.
+      **Item stays OPEN only for confirmation**: the next `make nightly-batch`
+      must come back without a `suite-wedge` item. The TRIGGER is filed
+      separately directly below.
+- [ ] **`pageHasSpaceFor` and `insertItemSorted` disagree about what fits on a
+      btree page.** NEW 2026-08-06 (found as the trigger of the wedge above,
+      from a real regress-suite server log, not filed by a nightly).
+      `insertIntoBlock` tests `pageHasSpaceFor(slot.Page(), it)`, takes the
+      no-split branch, and `insertItemSorted` then PANICS `storage: not enough
+      free space in page` (`internal/access/btree/btree.go:2854`). Two
+      independent space computations that must agree and do not — Hard-won Rule
+      #2 in its sibling-paths form. PostgreSQL has no such split brain:
+      `_bt_findinsertloc`/`PageAddItem` share `PageGetFreeSpace` accounting, and
+      an overflow is a split decision, never an elog. Repro shape: an `UPDATE`
+      maintaining a unique index (`maintainUniqueIndexesForInsert`) against a
+      nearly-full leaf. Suspects: line-pointer slot cost, `MAXALIGN`, and the
+      posting-list/dedup case. Fix direction: make the writer's own budget check
+      the single source of truth and route an overflow to the split path instead
+      of panicking. Ledger row 2026-08-06. **Severity note:** since the fix
+      above, this is one failed statement (loud, with its original stack)
+      rather than a wedged cluster — so it is a correctness task, not a gate
+      blocker.
 - [ ] **`pg_stat_activity` emits an EMPTY `pid` for internal sessions, so no Go
       driver can read the view at all.** NEW 2026-08-06 (found while
       instrumenting the wedge probe, not filed by a nightly). On an idle

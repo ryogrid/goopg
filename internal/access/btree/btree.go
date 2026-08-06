@@ -668,6 +668,11 @@ type BTree struct {
 	freeListMu sync.Mutex
 	freeList   []storage.BlockNumber
 
+	// Test-only fault injection for the stranded-latch guard: fires inside
+	// insertIntoBlock's leaf-write window, where insertItemSorted really
+	// panicked. See latch_release.go.
+	panicBeforeLeafWrite func(storage.BlockNumber) // test-only fault injection
+
 	// DebugTraceInserts (M-NIGHTLY AI-20260708-064334-001 investigation
 	// aid, 5th loop): when true, every insertItemSorted call anywhere in
 	// this BTree (fast-path, cached-rightmost, split-left-refill,
@@ -2221,20 +2226,36 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// instead of inserting out of bounds.
 	var slot *storage.Slot
 	var op BTPageOpaque
+	// held owns `slot`'s exclusive latch for this frame. Every normal exit
+	// below still releases through its own held.release() call; this holder
+	// exists for the path those calls cannot cover — a PANIC unwinding out of
+	// the page-mutation window, which would otherwise strand the latch and
+	// wedge the whole cluster (see latch_release.go). release() is idempotent,
+	// so the deferred call is a no-op on every normal return.
+	held := wlatch{bt: bt}
+	defer held.release()
 	for {
 		var err error
 		slot, err = bt.pinW(blk)
 		if err != nil {
 			return err
 		}
+		held.hold(slot)
 		op = readOpaque(slot.Page())
 		if itemOvershootsHighKey(op, it.key) {
 			next := op.Next
-			bt.unpinW(slot)
+			held.release()
 			blk = next
 			continue
 		}
 		break
+	}
+
+	// Test-only fault injection: fires exactly where insertItemSorted
+	// panicked in the wedge (regress suite, 2026-08-06), i.e. with the leaf
+	// latch held and the frame mid-mutation.
+	if bt.panicBeforeLeafWrite != nil {
+		bt.panicBeforeLeafWrite(blk)
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
@@ -2256,7 +2277,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		} else {
 			bt.pool.MarkDirty(slot)
 		}
-		bt.unpinW(slot)
+		held.release()
 		return derr
 	}
 
@@ -2274,7 +2295,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// extending the file.
 	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
 	if err != nil {
-		bt.unpinW(slot)
+		held.release()
 		return err
 	}
 	// rightSlot is already content-locked by pinNewOrRecycled (its
@@ -2310,7 +2331,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	if err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
-		bt.unpinW(slot)
+		held.release()
 		return err
 	}
 	allItems = appendSorted(allItems, it)
@@ -2364,14 +2385,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 				return logVac(bt.rel, blk, slot.Page())
 			}); err != nil {
-				bt.unpinW(slot)
+				held.release()
 				return err
 			}
 		} else if err := bt.markDirtyWithPageRecord(slot, blk); err != nil {
-			bt.unpinW(slot)
+			held.release()
 			return err
 		}
-		bt.unpinW(slot)
+		held.release()
 		return nil
 	}
 	bt.traceRewrite(blk, "split", preLineCount, postPageItemsSnap, postDedupSnap)
@@ -2406,7 +2427,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	if len(sepKey) > MaxHighKeyLen {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
-		bt.unpinW(slot)
+		held.release()
 		return fmt.Errorf("btree: separator key length %d exceeds MaxHighKeyLen %d",
 			len(sepKey), MaxHighKeyLen)
 	}
@@ -2438,7 +2459,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if err != nil {
 			rightSlot.Unlock()
 			bt.pool.Unpin(rightSlot)
-			bt.unpinW(slot)
+			held.release()
 			return fmt.Errorf("btree: pin old right sibling %d: %w", sibBlk, err)
 		}
 		sibOp := readOpaque(sibSlot.Page())
@@ -2465,12 +2486,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage)
 		if lerr != nil {
 			if sibSlot != nil {
-				sibSlot.Unlock()
-				bt.pool.Unpin(sibSlot)
+				bt.unpinW(sibSlot)
 			}
 			rightSlot.Unlock()
 			bt.pool.Unpin(rightSlot)
-			bt.unpinW(slot)
+			held.release()
 			return fmt.Errorf("btree: log split: %w", lerr)
 		}
 		bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
@@ -2486,8 +2506,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 	}
 	if sibSlot != nil {
-		sibSlot.Unlock()
-		bt.pool.Unpin(sibSlot)
+		bt.unpinW(sibSlot)
 	}
 
 	// The separator key going up is the smallest key in the right page.
@@ -2499,7 +2518,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)
-	bt.unpinW(slot)
+	held.release()
 
 	// If we just split the root, lift a new root.
 	if op.IsRoot() {
