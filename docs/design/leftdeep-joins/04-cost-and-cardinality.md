@@ -89,7 +89,9 @@ better formula.
 Each `RelOptInfo` carries `rows` set exactly once:
 
 - initial rels: today's `estimateBaseRelInfo` post-filter estimate
-  (`internal/planner/cardinality.go:285`);
+  (`internal/planner/cardinality.go:285`), reached through `initialRelRows`
+  (joinsearch.go), with the relation-size fallback below filling in the
+  pre-filter count when the restart lost it;
 - join rels: `calcJoinrelSize(outer, inner, clauses)` at find-or-create time
   in `makeJoinRel` — **before** any path is generated, so every method's
   paths for one relset share one output-row figure, PG's
@@ -112,6 +114,55 @@ estimate** (`ppiRows` — per-outer-row output of an NLI inner; PG's
 `get_parameterized_baserel_size`). The RelOptInfo `rows` stays canonical for
 the rel; each parameterisation's rows live beside the path
 ([03](03-join-search-pg-dp.md) §9 rule 3).
+
+### 2.1 The base rel's pre-filter count, and where M0125-0003 "stage 3" went
+
+*(P5.6's re-evaluation of M0125-0003 stage 3 against this chapter, 2026-08-06.)*
+
+`tableRows` answers 0 for a relation with no `TableStats`, and
+`TableStats.RowCount` does not survive a restart (ledger `pq-P6`) — so without
+a fallback a cold server seeds every initial rel at the 1-row floor, and at one
+row per side the cost model correctly prefers a nested loop. The seam
+(`joinsearchseam.go`) therefore installs M0125-0003's block-derived estimate,
+now through `applyRelSizeFallback` (`relsize.go`) in **upstream's order**:
+`estimate_rel_size` (plancat.c:1075) supplies the pre-filter `tuples`, and
+`set_baserel_size_estimates` (costsize.c:5378) multiplies by
+`clauselist_selectivity(baserestrictinfo)` — here
+`applyLocalFilterSelectivity`, factored out of `estimateBaseRelInfo` so the two
+callers cannot drift.
+
+**Stage 3 is therefore not a fourth staged flag consumer, and never will be.**
+It was filed as "make `estimateBaseRelInfo.baseRows` positive cold", which under
+the old DP would have *shadowed* the stage-2 seed tier — two consumers reading
+the same fallback at different points of the same plan, which is what the flag
+staging existed to sequence. Rows-once removes the second consumer: the search
+reads a base relation's cardinality exactly once, so the placement is simply
+correct at the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` keeps
+answering with stage-2 behaviour.
+
+Two facts make this a re-derivation rather than a behaviour change, both pinned
+by `relsize_baserel_placement_test.go`:
+
+- **S-cold it is a no-op.** The fallback fires only when `tableRows` answered 0;
+  for `Stats == nil` that is also the state in which `columnStatsForChild`
+  answers nil for every column, so every clause reports `reliable=false` and the
+  selectivity is never applied. The pre-filter stamping this replaces produced
+  the same number. The old seam comment justified stamping pre-filter with "a
+  server with no row count has no column statistics either, so scaling invents
+  precision" — a true premise, now enforced by the reliability gate rather than
+  by refusing to scale.
+- **Post-restart it is load-bearing.** `loadStatisticsFromHeap` restores
+  per-column statistics while `RowCount` does not survive, so
+  `Analyzed=true, Columns populated, RowCount=0` is the state a restarted goopg
+  is actually in — not an edge case. The pre-filter stamping threw the restored
+  MCV list away and handed the search the whole relation; the post-filter
+  placement spends it, which is what upstream does.
+
+The remaining deviation from `set_baserel_size_estimates` is goopg's `reliable`
+gate: PG always multiplies, falling back to `DEFAULT_EQ_SEL` / `DEFAULT_INEQ_SEL`
+when it has no statistic, whereas goopg keeps the pre-filter count (design
+`tpch-round2/02` §2 rule (4)). Ledgered, not changed here — it is a
+planner-wide policy, not this placement's business.
 
 ## 3. Join selectivity: fixing class (a)
 

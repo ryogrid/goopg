@@ -276,21 +276,15 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		relInfos[i] = estimateBaseRelInfo(b, scans[i], local)
 		relInfos[i].bindingIdx = i
 		// Tier 3 of `bushySeedRowCounts`' ladder (bushy.go), which
-		// `estimateBaseRelInfo` does not apply for itself: `tableRows` answers 0
-		// for a relation with no `TableStats`, and `TableStats.RowCount` does not
-		// survive a restart (ledger pq-P6). Without this a cold server seeds
-		// every relation at the 1-row floor, and at one row per side the cost
-		// model correctly prefers a NESTED LOOP — so the seam would have handed
-		// the search a blind problem where the DP it replaces gets a live
-		// block-count estimate. Deliberately PRE-filter, for the reason
-		// `bushySeedRowCounts` states: a server with no row count has no column
-		// statistics either, so scaling it by a selectivity invents precision.
-		if relInfos[i].filteredRows <= 0 {
-			if rows := relSizeFallbackRows(2, cat, b.table); rows > 0 {
-				relInfos[i].baseRows = rows
-				relInfos[i].filteredRows = rows
-			}
-		}
+		// `estimateBaseRelInfo` does not apply for itself — and, since
+		// M0127-P5.6's re-evaluation of M0125-0003 stage 3, in upstream's own
+		// order: the block-derived count is the PRE-filter `tuples` and the
+		// local-filter selectivity is re-applied on top of it, exactly as
+		// `estimate_rel_size` feeds `set_baserel_size_estimates`. It reads the
+		// same reliability gate `estimateBaseRelInfo` does, so the earlier
+		// "scaling a fallback invents precision" concern is enforced by the
+		// gate rather than by refusing to scale. See `applyRelSizeFallback`.
+		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
 	}
 
 	searched, err := planJoinlistSearch(jl, &joinlistProblem{

@@ -1,52 +1,59 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-P5.4b-ii-b-2 CLOSED** — Memoize is now a searched PATH.
+Last loop: **M0127-P5.6 roll-up CLOSED** — every sub-item was already `[x]`; what
+the roll-up still owed was the residue in its own body and the acceptance re-read.
 
-The item was DEPENDENCY-DEFERRED on 2026-08-04 pending P5.5's `createPlan`
-arms; P5.5 has landed, so it was re-selected as the topmost unchecked M0127
-item, exactly as its own note instructed.
+**The residue was "re-evaluate M0125-0003 stage 3 against 04 §2's rows-once
+discipline", and the answer is that stage 3 is not a staged flag consumer and
+never will be.** Stage 3 was filed as "make `estimateBaseRelInfo.baseRows`
+positive cold"; under the OLD DP that would have SHADOWED the stage-2 seed tier,
+and sequencing that shadowing is the entire reason the flag was staged. Rows-once
+deletes the second consumer — the search reads a base rel's cardinality exactly
+once, `initialRelRows` → `baseRelInfo.filteredRows` — so the placement is simply
+correct at the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` stays a
+documented alias for stage-2 behaviour.
 
-**Memoize is a PATH, not an attachment, and that was forced.** goopg already had
-`maybeAttachMemoize` (`memoize.go`) running on a BUILT `*NestedLoopIndexJoin` —
-but `walkRewriteNLI` skips a searched subtree (nl_index_join.go:110), so no
-searched NLI ever reached it. Attaching at `createPlan` time would have made the
-executed plan cheaper than the plan the search costed, when the point of
-memoizing is that an NLI beats a hash join it would otherwise LOSE to; that
-comparison happens in `addPath` or nowhere. So: new `PathMemoize` kind +
-`MemoizeInfo` carrier, `getMemoizePath` (= `get_memoize_path`, joinpath.c:674),
-`costMemoizeRescan` (= costsize.c:2541), and `addNLIPaths` offering the bare AND
-the wrapped inner to `addPath` — `match_unsorted_outer`'s own shape (:1965-1986).
-`PathMemoize` has NO `createPlan` arm (it panics there): goopg's cache is
-`NestedLoopIndexJoin.InnerMemo`, a field on the join, so the NLI arm unwraps it
-and keys the cache on the ALREADY-TRANSLATED probe keys — one list read twice,
-since `memoizeOp` and `indexScanOp.Rescan` read the same bound outer slot.
+Landed as `applyRelSizeFallback` (relsize.go) replacing joinsearchseam.go's inline
+tier, in upstream's order: `estimate_rel_size` (plancat.c:1075) supplies pre-filter
+`tuples`, `set_baserel_size_estimates` (costsize.c:5378) multiplies by
+`clauselist_selectivity` — here `applyLocalFilterSelectivity`, factored out of
+`estimateBaseRelInfo` so the twins cannot drift (rule #2).
 
-**The §5.2 binding contract was discharged in a different form than filed:**
-`tryBuildNLI` is not the searched constructor at all; `createNestLoopIndexJoinPlan`
-is, its declines are panics, and eligibility is shared at the PRODUCER
-(`pickIndexCoveringAllLeadingColumns`, `addParameterizedIndexPaths`). Two
-constructors now exist on disjoint trees — ledgered against the S7 deletion of
-the legacy one.
+**Why it is a re-derivation, and the one place it is NOT:** the fallback fires
+only when `tableRows` answered 0, and for `Stats == nil` that is also the state
+where `columnStatsForChild` answers nil for every column → every clause
+`reliable=false` → unscaled → identical to the pre-filter stamping. **But
+`Analyzed=true, Columns populated, RowCount=0` is a REAL state**, not an edge
+case: it is what `loadStatisticsFromHeap` leaves behind (column stats survive a
+restart, `RowCount` does not — ledger pq-P6). There the old stamping threw the
+restored MCV list away; the new placement spends it, as PG does.
 
-Files: `internal/planner/joinpathsmemoize.go` + `_test.go` (new),
-`path.go`, `joinpaths.go` (`searchCtx` threaded), `joinpathsnli.go`,
-`joinrelsize.go`, `createplan.go`, `createplannl.go`; 6 test files took a `nil`
-searchCtx arg. Docs: 03 §5.2 status + IMPLEMENTATION-TODO tick; 3 ledger rows.
+Acceptance re-read (not re-run) from the default-arm audit
+`analysis/leftdeep-joins/2026-08-05-p59run4-audit-off.txt`: **Q9 final joinrel
+6.3×** (est=1999060 actual=316264) vs the ≤10² bar, **parity_violations=0**. The
+lone absolute tripwire, Q18 25 526×, is what 09 §4.1's parity ratchet exists for
+(PG 18.3 is at 5 386×/9 428× on its own shapes there).
 
-Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); **DS05 PASS=95 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0, runtime-moves=0**, plan channel: ONE shape
-change — **Q6's `date_dim_pkey` probe now wrapped in `Memoize (Cache Key:
-s.ss_sold_date_sk)`**, same rows, same checksum. That is the end-to-end proof.
-Note for future loops: the "no stats → no plan can move" argument covers SPOT
-only. DS05 persists per-column stats since M0125-0028/-0029 and IS load-bearing.
+Files: `internal/planner/{cardinality.go,relsize.go,joinsearchseam.go}`,
+`relsize_baserel_placement_test.go` (new, 4 tests). Docs: 04 §2 + new §2.1,
+IMPLEMENTATION-TODO P5.6 tick, design README index, M0125-0003's re-scope note
+amended with the verdict, 1 ledger row.
 
-NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 items
-are the roll-ups **P5.6** and **P5.7**, whose every sub-item is `[x]`: check
-whether they are ticks or carry residue (P5.6's body still names "re-evaluate
-M0125-0003 stage 3, rows-once per RelOptInfo, 04 §2"). Then **PS6.1/PS6.2**
-(compiled HashKeys accessors + sibling audit) and the P6.x deletion series.
+Gates run: UNITS 0 FAIL; **SPOT PASS (Q12=2, Q13=35)** — and SPOT is S-cold, i.e.
+it runs the exact state the change is proven inert in. DS05 not re-run,
+structurally: the changed arm needs `RowCount == 0` with populated column stats,
+and the DS05 cluster persists both (M0125-0028/-0029), so no gate query reaches it.
 
-Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items,
-all subjects already filed under M-NIGHTLY. Nothing new.
+NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked M0127 item is
+now the roll-up **P5.7**, whose sub-items -a and -b are both `[x]`: same question
+as P5.6 — is it a tick or does its body carry residue? Its stated bar is "UNITS +
+PLAN (default arm ZERO diffs)", and both sub-items argued PLAN was structurally
+inapplicable because `hashJoinCost`'s callers sat behind OFF-by-default gates —
+**re-check that claim, because the searched planner is demonstrably live in the
+default arm now** (last loop's DS05 moved Q6's shape via a searched Memoize path).
+Then **PS6.1/PS6.2** and the P6.x deletion series.
+
+Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items, all
+subjects already filed under M-NIGHTLY. Nothing new.
 
 In-flight: none.

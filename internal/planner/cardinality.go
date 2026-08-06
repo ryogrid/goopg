@@ -407,24 +407,41 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 	if binding.table != nil {
 		info.baseRows = tableRows(binding.table)
 	}
-	info.filteredRows = info.baseRows
-	if local == nil || scan == nil || info.baseRows <= 0 {
-		return info
+	info.filteredRows = applyLocalFilterSelectivity(info.baseRows, binding, scan, local)
+	return info
+}
+
+// applyLocalFilterSelectivity is the second half of upstream's
+// `set_baserel_size_estimates` (costsize.c:5378) — `rel->rows = clamp_row_est(
+// rel->tuples * clauselist_selectivity(root, rel->baserestrictinfo, …))` — over
+// a pre-filter row count somebody else supplied. It is factored out of
+// `estimateBaseRelInfo` because the relation-size fallback needs the SAME rule
+// applied to a block-derived `tuples` (`applyRelSizeFallback`, relsize.go), and
+// a second open-coded copy of the reliability gate is exactly the sibling shape
+// hard-won rule #2 forbids (M0127-P5.6, the M0125-0003 stage-3 re-evaluation).
+//
+// The one deliberate deviation from upstream is the `reliable` gate: PG always
+// multiplies, falling back to DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL when it has no
+// statistic, whereas goopg keeps the pre-filter count (design 02 §2 rule (4)).
+// Ledgered — see the 2026-08-06 row.
+func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node, local Expr) int64 {
+	if local == nil || scan == nil || baseRows <= 0 {
+		return baseRows
 	}
 	localized := localizeExprToLeaf(local, binding)
 	sel := clauseSelectivityWithSource(localized, scan)
 	if !sel.reliable {
-		return info
+		return baseRows
 	}
-	info.filteredRows = scaleByFloat(info.baseRows, sel.value)
-	if info.filteredRows < 1 {
+	rows := scaleByFloat(baseRows, sel.value)
+	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would
 		// collapse a heavily-filtered relation's contribution
 		// to 0 even when at least one row is plausible.
-		info.filteredRows = 1
+		return 1
 	}
-	return info
+	return rows
 }
 
 // IsSmallDimensionSide (M0054-0010) returns true when the plan

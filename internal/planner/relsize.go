@@ -140,6 +140,48 @@ func relSizeFallbackRows(stage int, cat catalog.Catalog, tbl *catalog.Table) int
 	return estimateTableRowsFallback(cat, tbl)
 }
 
+// applyRelSizeFallback installs the block-derived relation-size estimate on a
+// `baseRelInfo` whose row count did not survive the restart, in upstream's
+// order: `estimate_rel_size` (plancat.c:1075) supplies the PRE-filter `tuples`,
+// then `set_baserel_size_estimates` scales it by the local-filter selectivity.
+// It is the search seam's tier-3 ladder rung — `tableRows` answers 0 for a
+// relation with no `TableStats`, and `TableStats.RowCount` does not survive a
+// restart (ledger pq-P6). Without it a cold server seeds every relation at the
+// 1-row floor, and at one row per side the cost model correctly prefers a
+// NESTED LOOP, so the seam would hand the search a blind problem where the DP
+// it replaces gets a live block-count estimate.
+//
+// **This is where M0125-0003's "stage 3" landed, and why it is not a fourth
+// staged flag consumer** (M0127-P5.6's re-evaluation of it against 04 §2's
+// rows-once discipline). Stage 3 was filed as "make `estimateBaseRelInfo.
+// baseRows` positive cold", which under the old DP would have SHADOWED the
+// stage-2 seed tier and so needed its own flag stage to sequence. The new
+// search reads a base relation's cardinality exactly once, through
+// `initialRelRows` → `baseRelInfo.filteredRows`, so there is no second consumer
+// left to shadow and nothing to stage: the placement is simply correct here, at
+// the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` keeps
+// answering with stage-2 behaviour, as documented.
+//
+// Against the pre-filter stamping this replaces (both fields set to the raw
+// fallback), it differs in exactly one reachable state — an ANALYZEd relation
+// whose `RowCount` is 0 but whose per-column statistics are populated. In the
+// S-cold state the seam was built for, `Stats == nil` means
+// `columnStatsForChild` answers nil for every column, every clause reports
+// `reliable=false`, and `applyLocalFilterSelectivity` returns the fallback
+// unscaled — the two placements coincide, which is why this is a
+// re-derivation rather than a behaviour change (TestRelSizeFallback*Placement*).
+func applyRelSizeFallback(info *baseRelInfo, binding rangeBinding, scan Node, local Expr, cat catalog.Catalog) {
+	if info == nil || info.filteredRows > 0 {
+		return
+	}
+	rows := relSizeFallbackRows(2, cat, binding.table)
+	if rows <= 0 {
+		return
+	}
+	info.baseRows = rows
+	info.filteredRows = applyLocalFilterSelectivity(rows, binding, scan, local)
+}
+
 // Relation size and width estimation — the inputs the cost model's per-node cost
 // functions consume. See docs/design/cost-model/ chapter 05. These are pure
 // helpers in phase C2; nothing in the live planner calls them yet (selection is

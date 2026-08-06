@@ -2216,8 +2216,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       M0125-0026's classification pass (ledger row). Two ledger rows carry
       Q72's unexplained 13 % and Q35's non-fix; a third records that the TPC-H
       harnesses still stamp no planner flags.
-      **Still owed, which is why this box is unchecked:** stage 3
-      (`estimateBaseRelInfo.baseRows`, `cardinality.go:139`) and the W arms.
+      **Still owed, which is why this box is unchecked: the W arms.**
       **Re-scope note 2026-08-03 (M0127):** do NOT land stage 3 into the old
       DP before checking it against M0127's P5.1/P5.6 — the new search
       computes base rows once per `RelOptInfo` (`leftdeep-joins` 04 §2) and
@@ -2225,7 +2224,18 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       fallback's documented role is an S-cold safety net (inert warm by its
       `RowCount > 0` early return), and stage 3's consumer may be superseded
       by the rows-once design rather than extended. Re-evaluate at M0127-P5.1.
-      The
+      **↳ RE-EVALUATED AND RESOLVED 2026-08-06 by M0127-P5.6** (its roll-up
+      closure; `leftdeep-joins` 04 §2.1 is the write-up). The suspicion above is
+      confirmed: **stage 3 IS superseded as a staged flag consumer.** Its only
+      reason to be a separate stage was that, under the old DP, making
+      `estimateBaseRelInfo.baseRows` positive cold would have SHADOWED the
+      stage-2 seed tier; rows-once deletes that second consumer, so the placement
+      stage 3 described just *is* the search seam's, at stage 2, as
+      `applyRelSizeFallback` (`internal/planner/relsize.go`) — the block-derived
+      count as `estimate_rel_size`'s pre-filter `tuples`, with
+      `set_baserel_size_estimates`' `clauselist_selectivity` re-applied on top.
+      **Nothing further is owed here for stage 3, and the flag's `3` value stays
+      a documented alias for stage-2 behaviour.** The
       flag accepts `3` today and yields stage-2 behavior. **`M0125-0005`'s
       evidence is now COMPLETE in both benchmark families and both recommend the
       flip** — it is the next selection, and its commit must name Q72's 1.13× as
@@ -7126,13 +7136,57 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       change is reachable only from a tagged node, and only
       `createPlanAtSearchRoot` tags, which nothing calls from `planSelect`; no
       plan can move.
-- [ ] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
+- [x] **M0127-P5.6 — `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
       FK clamp** (04 §3.1-3.3; the Q9 class-(a) fix); delete the quadratic build
       penalty; estimate-audit tooling (09 §5 — Q9's chain ≤ 10²× at the final
       joinrel). Re-evaluate M0125-0003 stage 3 here (rows-once per RelOptInfo,
       04 §2). IMPLEMENTATION-TODO P5.6; 04 §3; 09 §5. Bar: UNITS + DS05 +
       estimate audit run. **DECOMPOSED into -a … -e below** (04 §3's remedy set
       is four mechanisms and a measurement, in a mandatory order).
+      **CLOSED 2026-08-06.** Every sub-item is `[x]`; what this roll-up still
+      owed was the residue in its own body, and the acceptance re-read.
+      **The residue — "re-evaluate M0125-0003 stage 3" — is discharged, and the
+      answer is that stage 3 is not a fourth staged flag consumer and never will
+      be** (04 §2.1, new). Stage 3 was filed as "make
+      `estimateBaseRelInfo.baseRows` positive cold"; under the OLD DP that would
+      have SHADOWED the stage-2 seed tier — two consumers reading one fallback at
+      two points of the same plan — and sequencing that shadowing is the entire
+      reason the flag was staged. **Rows-once deletes the second consumer**: the
+      search reads a base relation's cardinality exactly once, `initialRelRows` →
+      `baseRelInfo.filteredRows`, so the placement is simply correct at the stage
+      the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` keeps yielding stage-2
+      behaviour, as already documented.
+      Landed as `applyRelSizeFallback` (`internal/planner/relsize.go`), replacing
+      the seam's inline tier with **upstream's order**: `estimate_rel_size`
+      (plancat.c:1075) supplies the pre-filter `tuples`, then
+      `set_baserel_size_estimates` (costsize.c:5378) multiplies by
+      `clauselist_selectivity` — here `applyLocalFilterSelectivity`, factored out
+      of `estimateBaseRelInfo` so the two callers cannot drift (rule #2).
+      **Why this is a re-derivation and not a behaviour change, and where it is
+      NOT:** the fallback fires only when `tableRows` answered 0, and for
+      `Stats == nil` that is also the state where `columnStatsForChild` answers
+      nil for every column — every clause is `reliable=false`, the selectivity is
+      never applied, and the number equals the pre-filter stamping it replaces.
+      So S-cold (TPC-H, SPOT) no plan can move. **But `Analyzed=true, Columns
+      populated, RowCount=0` is a REAL state, not an edge case** — it is what
+      `loadStatisticsFromHeap` leaves behind, since column statistics survive a
+      restart and `RowCount` does not (ledger pq-P6). There the old stamping threw
+      the restored MCV list away and handed the search the whole relation; the new
+      placement spends it, which is what PG does.
+      **Acceptance, re-read from the default-arm audit run**
+      `analysis/leftdeep-joins/2026-08-05-p59run4-audit-off.txt`: **Q9's final
+      joinrel 6.3×** (`est=1999060 actual=316264`) against the ≤10² per-query bar,
+      `parity_violations=0` over 21 matched joinrels. The single remaining absolute
+      tripwire is Q18 at 25 526×, and it is precisely what 09 §4.1's parity ratchet
+      was added for: PG 18.3 sits at 5 386×/9 428× on its own shapes for that query
+      (P5.6-g-iii, -g-v). 4 tests (`relsize_baserel_placement_test.go`, incl. the
+      twin-drift check on the extracted helper). 1 ledger row (the `reliable` gate
+      itself deviates from `set_baserel_size_estimates`, which always multiplies).
+      Bar met: UNITS + SPOT + audit re-read. **DS05 not re-run and the reason is
+      structural, not a skip:** the only behaviour that changed needs
+      `RowCount == 0` with populated column stats, and the DS05 cluster persists
+      per-column stats *and* row counts (M0125-0028/-0029), so no gate query can
+      reach the changed arm.
 - [x] **M0127-P5.6-a — the per-clause selectivity substrate: `examine_variable`,
       `get_variable_numdistinct`, `eqjoinsel`'s no-MCV arm.** DONE 2026-08-04
       (`internal/planner/joinselectivity.go` new,

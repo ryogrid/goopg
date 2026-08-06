@@ -776,11 +776,27 @@
   `Aggregate.Passthrough` / `AggregateCall.Filter` / `WindowFunc.Args|Filter` /
   frame offsets; `pushOneConjunct` is the fourth legacy family member and is not
   taught about the tag). 12 new tests (`enclosingtree_test.go`). Still inert.)*
-- [ ] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
+- [x] **P5.6** `calcJoinrelSize` + FK-superkey generalisation + eqjoinsel +
   FK clamp ([04](04-cost-and-cardinality.md) §3.1-3.3); delete quadratic
   build penalty; estimate audit tooling
   ([09](09-verification-and-acceptance.md) §5). Decomposed, because 04 §3's
-  remedy set is four mechanisms and a measurement, not one edit:
+  remedy set is four mechanisms and a measurement, not one edit.
+  **CLOSED 2026-08-06.** Every sub-item below is done, the stated acceptance is
+  MEASURED, and the one residue the roll-up carried in its own body — "re-evaluate
+  M0125-0003 stage 3 (rows-once per RelOptInfo, [04](04-cost-and-cardinality.md)
+  §2)" — is discharged in [04](04-cost-and-cardinality.md) §2.1: stage 3 is not
+  a fourth staged flag consumer, because rows-once removes the second consumer it
+  would have shadowed, and its placement is now `applyRelSizeFallback` at the
+  search seam, in `estimate_rel_size` → `set_baserel_size_estimates` order. That
+  is a no-op S-cold (the reliability gate) and load-bearing post-restart (restored
+  column statistics with no `RowCount`). Acceptance, from the default-arm audit run
+  `analysis/leftdeep-joins/2026-08-05-p59run4-audit-off.txt`: **Q9's final joinrel
+  6.3× against the ≤10² bar** (`est=1999060 actual=316264`), `parity_violations=0`
+  over 21 matched joinrels. One absolute tripwire remains, Q18 at 25 526×, and it
+  is exactly what §4.1's parity ratchet was introduced for — PG 18.3 is at
+  5 386×/9 428× on its own shapes for the same query (P5.6-g-iii/-g-v).
+  4 tests (`relsize_baserel_placement_test.go`); 1 ledger row. Bar met: UNITS +
+  audit (re-read, not re-run — no plan-reachable behaviour changed S-cold) + SPOT.
   - [x] **P5.6-a** the per-clause substrate: `examine_variable`,
     `get_variable_numdistinct` and `eqjoinsel`'s no-MCV arm over
     `restrictInfo` operands. *(DONE 2026-08-04 —
