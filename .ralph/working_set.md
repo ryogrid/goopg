@@ -1,53 +1,47 @@
 (idle — nothing in flight)
 
-Last loop: **M0127-PS6.2 DONE — E5's release gate, so STAGE E5 IS COMPLETE.**
-The compiled ↔ interpreted sibling audit ran and found THREE divergences, none
-of which any existing test could see. Carry the method, not just the result.
+Last loop: **M-NIGHTLY AI-20260806-011323-002..-015 — one mid-run compile
+error filed itself as 14 phantom testport regressions. FIXED, committed.**
+Selected under the carve-out: this DOES break a gate M0127 depends on —
+P6.1–P6.4's S7 bar is "S5-ON survives a clean nightly cycle", and a nightly
+that manufactures regressions whenever it overlaps an active Ralph loop can
+never come back clean. The gate was unmeasurable, not merely noisy.
 
-**The harness compares OUTCOMES, not values.** A panic, an error (code +
-message + position) and a Datum are three points in one space; every corpus
-entry is rendered to one string on both twins × every `SlotView` impl. That
-shape is what PS6.1's own finding demanded — the twins had diverged in a
-FAILURE mode (`ColumnRef` bounds), which a value diff is blind to.
+1. **Option (a) from the filing was already implemented and did NOT help.**
+   `stage-preflight.sh` has always run `make build` and aborted; in run
+   `20260806-011323` preflight PASSED in 7 s and testport broke 1079 s later
+   (`s.traceFailed undefined`, from the previous loop's own `bf52391e`). The
+   tree mutates *between* stages, so no front-loaded build can catch it.
+2. **Boundary, not flag.** `build_error_line()` returns the *index* of the
+   first Go build signature; tests failing at/after it collapse into ONE
+   `[infra]` item, tests failing before it are reported normally. Load-bearing:
+   `TestPort_IsolationEvalPlanQual` (genuine, six nights) failed ~600 lines
+   above the boundary in that same log. The boundary also catches the 8
+   `pg_dump*` victims carrying **no compiler text at all** (`start failed;
+   process exited early`) — no message-matching rule could have.
+3. **Non-gating on purpose.** `build_kills` → `inconclusive`, like a resource
+   kill: the recorded sha builds clean. Gating it would keep the S7 bar
+   permanently unmeetable — the defect restated.
+4. `source_fingerprint()` (HEAD + `*.go`/`go.mod`/`go.sum` porcelain + tracked
+   diff) stamps `meta.json` + `stages/<name>.fp` before each stage, so drift is
+   stated rather than inferred.
 
-1. **AND/OR short-circuited under different conditions — wrong ANSWERS on a
-   join-residual seam.** `evalFastExpr` gated on `!left.IsNull()`;
-   `evalAnd`/`evalOr` gate on `left.Kind == KindBool`. `BoolValue()` is
-   `Int != 0` on ANY Kind, so a non-boolean left operand short-circuited AND
-   WAS RETURNED as the AND/OR's value. For an ARENA-backed string `Datum.Int`
-   is the mctx coordinate (`offset<<32|length`) — so which branch was taken
-   depended on the arena offset. 619 diffs, one root cause.
-2. **Two type-spelling decisions each existed twice** (`isFloatResultType` +
-   an inline exact-match list; `overflowCodeForType` + an inline `switch`).
-   The float pair is the transferable lesson: the compiled twin DIVERTS to
-   `evalExprSlot` on that predicate, so when the two lists disagree the
-   fallback lands in the branch it was diverted to avoid. One function each now.
-3. **Every compiled error carried position 0** (`evalBinary`/`evalUnary`/
-   `evalPgLSNBinary` got a literal 0), now compiled into `payload[4:8]`.
-   **Invisible to every hand-built corpus** — `planner.BinaryOp.pos` is
-   unexported, so both twins render 0 and agree for the wrong reason. Found
-   only after adding a ninth corpus resolved from real SQL via
-   `planner.ResolveIndexPredicate`. Generalise: a hand-built corpus cannot see
-   anything only the planner can set.
+Files: `ci/batch/lib/summarize.py`, `ci/batch/lib/common.sh`,
+`ci/batch/run-nightly.sh`, `ci/batch/lib/test_summarize.py` (new
+`MidRunBuildBreakTest`), `ci/design/04-logging-and-reporting.md` §C.1 + README
+index, fix_plan (item ticked + S7 gate amendment), 1 ledger row.
 
-Files: `exprnode.go` (short-circuit gate, pos in payload, `Pos` on the 22003),
-`expr.go` (both inline lists replaced by the shared predicates),
-`expr_sibling_parity_test.go` (new, 9 corpora), 05 §6.2 + 09 §1 +
-IMPLEMENTATION-TODO (PS6.1 now `[x]`), fix_plan, 2 ledger rows.
+Gates run: `test_summarize.py` 8/8 PASS, non-vacuous (forcing
+`tp_build_boundary = None` fails 2); real-run replay `20260806-011323`
+**18 items → 5** (4 genuine + 1 infra, EvalPlanQual still -001); `bash -n` on
+both shell files; fingerprint stability + edit-detection probe; pgbench smoke
+via hook. No Go changed, so UNITS/SPOT/DS05 not applicable.
 
-Gates run: UNITS 0 FAIL; SPOT PASS (Q12=2, Q13=35); DS05 PASS=95 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan shapes 99/99 identical
-(`analysis/ps62/ds05.log`); BENCH 0 allocs, key 11.39→6.52, residual
-149.8→130.3 ns/op; pgbench smoke via hook.
-
-NEXT LOOP (banner wins — M0127 is #3 and current). Topmost unchecked is
-**M0127-P6.1 — delete fusion** (`fused_hash_join.go` 707 lines, hook
-`executor.go:160-163`, env vars, `IsCanonicalKeyEquality` orphan check). Note
-the S7 precondition in the fix_plan order line: P6.1–P6.4 are gated on S5-ON
-surviving a clean nightly cycle — check `ci/logs/action-items.md`'s newest run
-before selecting, and if that has not happened, say so and pick per the banner.
-
-Nightly triage: `ci/logs/action-items.md` still run 20260806-011323, 18 items,
-all subjects already filed under M-NIGHTLY. Nothing new.
+NEXT LOOP (banner wins — M0124 → M0125 → M0127; M-NIGHTLY still parked).
+M0127's topmost unchecked item is **P6.1 — delete fusion**, still gated on a
+clean nightly cycle. Read the newest `ci/logs/action-items.md` FIRST: P6.1 is
+selectable only at `status: pass`. Note the next nightly is the first to run
+the new summarizer, so a `[infra] testport/build-broke-mid-stage` item now
+means "the harness saw the loop edit the tree", not a regression.
 
 In-flight: none.

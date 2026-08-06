@@ -1163,7 +1163,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
       check the run's launch window against host state first). FILED, NOT
       SELECTED per the 2026-07-28(b) amendment.
-- [ ] **nightly builds the DIRTY WORKING TREE, so an in-flight Ralph edit files
+- [x] **nightly builds the DIRTY WORKING TREE, so an in-flight Ralph edit files
       itself as 14 phantom testport regressions.** NEW 2026-08-06
       (AI-20260806-011323-002..-015: PgBasebackup010{FetchWAL,Manifest,
       ManifestChecksums}, PgBasebackup011InPlaceTablespace, PgReceivewal020,
@@ -1194,6 +1194,42 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       Repro: none needed — the evidence log is self-describing. FILED, NOT
       SELECTED per the 2026-07-28(b) amendment (it breaks no build and no gate
       M0124/M0125/M0127 depends on).
+      **↳ SELECTED AND DONE 2026-08-06** under the carve-out, on a re-reading
+      of the filing note above: this DOES break a gate M0127 depends on —
+      M0127-P6.1–P6.4's S7 bar is literally "S5-ON survives a clean nightly
+      cycle", and a nightly that manufactures N regressions whenever it
+      overlaps an active loop can never come back clean. The gate is
+      unmeasurable, not merely noisy. Design: **ci/design/04 §C.1**.
+      **Option (a) from the filing is FALSIFIED — it was already implemented
+      and it did not help.** `stage-preflight.sh` has always run `make build`
+      and aborted on failure; in run `20260806-011323` preflight PASSED in 7 s
+      and testport broke 1079 s later. The tree mutated *between* stages, so no
+      amount of front-loaded building can catch it. Two mechanisms landed
+      instead:
+      (1) **boundary collapse** — `summarize.build_error_line()` finds the
+      first Go *build* signature in a stage log and treats it as a boundary:
+      every top-level test failing at/after it collapses into ONE `[infra]`
+      item, every test failing *before* it is reported normally. That
+      distinction is the whole design — `TestPort_IsolationEvalPlanQual`, the
+      genuine six-night regression, failed ~600 lines above the boundary in the
+      same log and must survive. It also catches the 8 `pg_dump*` victims that
+      carry **no compiler text at all** (`start failed; process exited early`),
+      which no message-matching rule could have found;
+      (2) **stage source fingerprints** — `source_fingerprint()` (HEAD +
+      `*.go`/`go.mod`/`go.sum` porcelain + tracked diff content) into
+      `meta.json` and `stages/<name>.fp` before each stage, so the summarizer
+      *states* that the tree mutated instead of inferring it.
+      **Classified NOT gating** (`build_kills` → `inconclusive`, like a
+      resource kill): the recorded sha builds clean, so the run is unreadable,
+      not red — and a gating classification would keep the S7 bar permanently
+      unmeetable, which is the defect restated.
+      Verified by replaying the real run through the new summarizer:
+      **18 action items → 5** (4 genuine + 1 `[infra]`), EvalPlanQual still
+      item -001. Guards: `test_summarize.py::MidRunBuildBreakTest` (4 cases),
+      proven non-vacuous by forcing `tp_build_boundary = None` (2 fail).
+      1 ledger row (prevention — running the batch from a `git worktree`
+      pinned to the recorded sha — is still deferred; this makes a mutated run
+      *legible*, it does not stop the mutation).
 - [x] **units/internal/executor + race/internal/executor — REOPENED, new causes**
       — both lanes failed in nightly `20260803-013955` at sha `1a589c23`
       (AI-20260803-013955-001/-002, both first-seen tonight; evidence
@@ -9321,6 +9357,20 @@ pgoutput / EvalPlanQual regressions with no planner content. **The gate still
 needs a clean nightly cycle to run** — this only removes the join search as a
 candidate cause for the regress arm. Re-read the newest
 `ci/logs/action-items.md` before selecting P6.1.
+
+**Amended 2026-08-06 (second S7-gate loop).** 14 of that run's 18 items were
+never regressions at all: ONE mid-run compile error (the nightly builds the
+LIVE working tree and this loop's predecessor committed `bf52391e` 1079 s
+after preflight's `make build` passed) filed itself as 14 phantom testport
+failures. The nightly summarizer now collapses that class into a single
+non-gating `[infra]` item (ci/design/04 §C.1) — replaying the same run gives
+**5 items, not 18**, and had the fix been in place the run would have been
+`fail` on its 4 genuine items only. This does NOT retro-clear the gate (the 4
+genuine items stand, so the cycle was not clean), but it removes the reason
+the gate could never *become* measurable: before this, any night overlapping
+an active loop manufactured regressions the tree does not have. Next S7
+attempt: read the newest `ci/logs/action-items.md`; if `status: pass`, P6.1
+is selectable.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

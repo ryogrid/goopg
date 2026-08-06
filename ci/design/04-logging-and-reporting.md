@@ -99,6 +99,57 @@ design. The policy:
 - `promotable` notices (expected-fail passed);
 - `env-drift` (newly skipped tests).
 
+### C.1 Build broke DURING a stage — `build_kills` (added 2026-08-06)
+
+The batch compiles the **live working tree**, and the Ralph loop edits and
+commits that tree while the batch runs. Preflight's `make build` therefore
+proves nothing about the tree a *later* stage compiles. Run
+`20260806-011323`: preflight passed at 01:13:30 (7 s), then the loop committed
+`bf52391e` and the testport stage's fixtures — which `go build` the goopg
+binary at fixture init — failed at ~01:2x with
+`internal/planner/joinsearchlevel.go:109:6: s.traceFailed undefined`. That ONE
+break produced **14 separate `[regression]` action items** (`AI-…-002..-015`):
+six carried the compiler text, and eight `pg_dump*`/`pg_dumpall*` victims
+carried none at all — their fixtures start a cluster from the freshly built
+binary, so the same break surfaced as `start failed; process exited early`. A
+later loop had to read the evidence log to re-derive the single cause.
+`meta.json` had recorded `dirty_files: 50` since the batch existed and nothing
+ever acted on it.
+
+Two mechanisms, both in this design's scope:
+
+1. **Boundary collapse.** `summarize.build_error_line()` finds the first Go
+   *build* signature in a stage log (`# <import path>`, or the
+   `file.go:LINE:COL:` two-number form, which a test-log line —
+   `file.go:LINE:` — cannot produce). It is used as a **boundary**, not a
+   flag: every top-level test failing at or after that line is collapsed into
+   ONE item, and every test that failed *before* it is reported normally. This
+   distinction is load-bearing — in the same run
+   `TestPort_IsolationEvalPlanQual`, a genuine six-night regression, failed
+   ~600 lines above the boundary and must survive.
+2. **Stage source fingerprints.** `source_fingerprint()`
+   (`ci/batch/lib/common.sh`) hashes HEAD + the `*.go`/`go.mod`/`go.sum`
+   porcelain status + the tracked-file diff content. It is recorded in
+   `meta.json` as `source_fp` and stamped per stage into
+   `stages/<name>.fp` *before* the stage runs, so the summarizer can state
+   that the tree mutated instead of inferring it. (Untracked `.go` files are
+   covered by name only; a content hash there would mean walking the tree at
+   every stage boundary.)
+
+**Classification: NOT gating.** A build that broke mid-run says nothing about
+the code — `go build ./...` at the recorded sha is clean — so like a
+resource kill it makes the run *unreadable*, not red: `build_kills` alone
+yields `inconclusive`. Making it gating would mean every night that overlaps an
+active Ralph loop reports a regression the tree does not have, and any gate
+phrased as "survives a clean nightly cycle" (e.g. M0127's S7 bar) could never
+be met. The single item still reaches `action-items.md` with kind `infra`,
+because the harness defect is real: the fix that would *prevent* it — running
+the batch from a `git worktree` snapshot pinned to the recorded sha — is
+deferred (see the deferral ledger).
+
+Guards: `ci/batch/lib/test_summarize.py::MidRunBuildBreakTest` (4 cases),
+verified non-vacuous by forcing `tp_build_boundary = None`.
+
 ## D. Summary artifacts
 
 `summary.json` (schema, one object per run):
@@ -107,6 +158,7 @@ design. The policy:
 {
   "run_id": "20260707-000012",
   "sha": "04f2f6cf", "dirty_files": 7,
+  "source_fp": "db5153c783fd0180",
   "status": "pass|fail|inconclusive|aborted",
   "stages": {
     "preflight": {"status": "ok", "elapsed_s": 208},
@@ -122,7 +174,7 @@ design. The policy:
                   "spotcheck": {"q12": 2, "q13": 33},
                   "total_vs_baseline": 1.04}
   },
-  "regressions": [], "promotable": [], "resource_kills": [],
+  "regressions": [], "promotable": [], "resource_kills": [], "build_kills": [],
   "notes": ["plan-drift: Q2 join order changed (informational)"]
 }
 ```
@@ -140,7 +192,7 @@ bottom section. Full format and the fix_plan consumption contract: doc 07.
 **Exit code contract (normative):** `run-nightly.sh` exits
 - **0** — `status == "pass"`;
 - **2** — `fail` (any regression, perf-drastic, or build failure);
-- **3** — `inconclusive` (resource-kill);
+- **3** — `inconclusive` (resource-kill, or a build that broke mid-stage — §C.1);
 - **4** — `aborted` (signal/operator);
 - **5** — run lock already held (doc 06 §C; no run dir is created).
 
