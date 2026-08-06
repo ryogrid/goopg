@@ -45,5 +45,6 @@ predicate, not a skip list) or **`M0125-0048`** (the faithful `AGG_MIXED`
 grouping-sets aggregate — fidelity, large, retires the `__gs_src_N` hoist).
 -0031/-0032/-0033/-0041 stay `[→ M0127: absorbed]`.
 
-In-flight: none. PG reference cluster on 65432 was started this loop for the
-oracle capture and left RUNNING (`bench/tpch/stop_pg.sh` to stop it).
+In-flight: none. The PG reference cluster on 65432 was started this loop for
+the oracle capture and stopped again (`bench/tpch/setup_pg.sh` to bring it back
+— it starts in seconds from the existing pgdata).
