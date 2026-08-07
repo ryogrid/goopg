@@ -2,21 +2,11 @@
 
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
 Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
-Priority banner below or a dependency forces another order**. As of 2026-07-28
-the banner puts **M0124 → M0125** (closing the TPC-DS round-2 plan, per
-`docs/design/tpcds-round2-fixes/README.md` §13.5) at the top of the roadmap,
-ahead of M0123 and every other milestone. **Amended 2026-07-31 (USER): M0126 —
-cost-driven planning made production-viable — is inserted directly after M0125,
-so the head of the roadmap is M0124 → M0125 → M0126.** **Amended 2026-08-03:
-M0126 is CLOSED as a documented no-go (milestone-terminal); M0127 — PG-shaped
-join search — is filed as its successor and inserted directly after M0125, so
-the head of the roadmap is M0124 → M0125 → M0127.** **Amended 2026-08-07
-(USER): M0128 — special-join inference (`join_is_legal`/`SpecialJoinInfo`) +
-M0127 residuals — is filed and inserted directly after M0127, so the head of
-the roadmap is M0124 → M0125 → M0127 → M0128.** M0128 tasks are not selected
-while any M0127 task is open (M0127-P6.4 is M0127's last). **M-NIGHTLY no longer
-preempts it (amended 2026-07-28): nightly items are still FILED every loop, but
-they are not SELECTED until M0124, M0125 and (since 2026-08-03) M0127 close.** This banner is the sole ordering
+Priority banner below or a dependency forces another order**. **As of 2026-08-08:
+M0124 (TPC-DS round-2 closeout), M0125 (TPC-DS timeout class & walker extinction),
+M0127 (PG-shaped join search), M0128 (special-join inference + M0127 residuals),
+and M0123 (canonical pg_node_tree serialization) are all CLOSED — every item is
+`[x]`. M-NIGHTLY is now the top priority.** The banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
 
@@ -37,29 +27,35 @@ priority, and does not outrank it.
   `completed_fix_plan_008.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-07-28 directive)
+## Current Priority (per 2026-08-08 — M-NIGHTLY unblocked)
 
-**Standing FILING obligation (amended 2026-07-28 — replaces the former
-"M-NIGHTLY triage items preempt everything below" exception):** every loop still
-reads `ci/logs/action-items.md` and files each new `## AI-` subject as a task
-under the M-NIGHTLY milestone directly below this banner. **Filing is
-unconditional; selection is not.** M-NIGHTLY work is PARKED beneath M0124/M0125
-and its tasks stay unchecked until both milestones close. Exactly two carve-outs
-may be worked immediately, because the parked milestones cannot be *measured*
-without them:
+**Standing FILING obligation:** every loop still reads `ci/logs/action-items.md`
+and files each new `## AI-` subject as a task under the M-NIGHTLY milestone
+directly below this banner. **Filing is unconditional, and as of 2026-08-08
+selection is also unblocked** — M0124, M0125, M0127, M0128, and M0123 are all
+CLOSED (every item `[x]`), so M-NIGHTLY is the current priority.
 
-- an item that breaks the build, and
-- an item that breaks a gate M0124/M0125 depend on — `scripts/tpch-spotcheck.sh`,
-  the TPC-DS SF0.5 gate, `make plan-diff`, or a bench cluster
-  (65432/65433/65436/65437/65438).
+**M-NIGHTLY selection rule (inherits prior M-NIGHTLY procedure §2, per
+ci/design/07-ralph-feedback.md §B):**
+1. Before investigating, re-run the item's repro at HEAD — the log reflects the
+   last nightly run and may be stale.
+2. Fix with the normal gates (practice cards apply), cite the AI-id in the
+   commit message, check the task off.
+3. The next nightly run confirms and drops the item from the log.
 
 Everything else is filed and left unchecked. Rationale: every loop from
 `ddfb035e` (root-0029) through root-0036 went to nightly triage while the TPC-DS
 round-2 closeout — the measurement every M0125 task diffs against — never
 started.
 
+**⚡ 2026-08-08 — ALL PRIORITY MILESTONES CLOSED.** M0124, M0125, M0127, M0128,
+and M0123 are fully checked off. The M-NIGHTLY backlog is now the top priority
+and is no longer parked. The historical directive block below (2026-07-28
+through 2026-08-07 amendments) is retained for provenance; it has no further
+ordering effect.
+
 **⚡ 2026-07-28 directive — branch `tpcds-fix2`, priority order for this loop
-(SUPERSEDES the 2026-07-18 directive below):**
+(SUPERSEDES the 2026-07-18 directive below — NOW HISTORICAL, ALL MILESTONES CLOSED):**
 > `docs/design/tpcds-round2-fixes/README.md` §13 audited the TPC-DS round-2 plan
 > against itself: four of twelve phases landed as planned, four with a named gap,
 > four never started; seven of nine planned deferral-ledger rows were never
@@ -719,11 +715,13 @@ row); commit + push at every clean, green (build + pre-commit) checkpoint.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
-## M-NIGHTLY — Nightly regression triage (STANDING — FILING CONTINUES, WORK PARKED BELOW M0124/M0125 since 2026-07-28)
+## M-NIGHTLY — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
 
 <!-- Standing milestone: never complete it, never archive it, keep it directly
      under the Current Priority banner. Source of work: ci/logs/action-items.md
      (regenerated by every nightly batch run; design ci/design/07-ralph-feedback.md).
+     As of 2026-08-08 ALL priority milestones (M0124/M0125/M0127/M0128/M0123) are
+     CLOSED; M-NIGHTLY is now the top priority and selections are unblocked.
      Loop rule:
        1. Read ci/logs/action-items.md (absent file = nothing to do). For each
           `## AI-` item whose `subject:` has no OPEN (unchecked) task below,
@@ -733,18 +731,10 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
           another — append the new AI-id to that task's line instead. If only a
           CHECKED task exists for the subject, the failure REOPENED: add a new
           task and note the earlier fix didn't hold.
-       2. AMENDED 2026-07-28: tasks in this milestone are FILED every loop but
-          are NOT selected while the Current Priority banner parks them (today:
-          below M0124/M0125). Filing is unconditional; selection follows the
-          banner. Two carve-outs may be worked at once — an item that breaks the
-          build, and an item that breaks a gate the banner's milestones depend on
-          (tpch-spotcheck, the TPC-DS SF0.5 gate, plan-diff, a bench cluster).
-          The pre-amendment rule ("these PREEMPT all other milestones") returns
-          automatically once the banner stops naming M0124/M0125.
-       3. Before investigating, re-run the item's repro at HEAD — the log
+       2. Before investigating, re-run the item's repro at HEAD — the log
           reflects the last nightly run and may be stale; if it passes, check
           the task off with a "stale — already fixed" note.
-       4. Fix with the normal gates (practice cards apply), cite the AI-id in
+       3. Fix with the normal gates (practice cards apply), cite the AI-id in
           the commit message, check the task off. The next nightly run confirms
           and drops the item from the log.
      (Tasks are added here by the in-loop agent, one per subject. This
@@ -4691,9 +4681,9 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       reset — every S-cold `analysis/` number stops being comparable, and
       analysis docs state their stats regime explicitly from here on.
 
-- [ ] **M0125-0031 — the warm-stats planning line: eliminate the TPC-DS
+- [x] **M0125-0031 — the warm-stats planning line: eliminate the TPC-DS
       timeout class, then optimize and stabilize TPC-H/TPC-DS runtimes**
-      **[→ M0127: absorbed 2026-08-03]** — both remaining motions (goal (a)'s
+      **[→ M0127: CLOSED 2026-08-08 by M0127 completion]** — both remaining motions (goal (a)'s
       outcome, goal (b)'s fixes) are M0127's own acceptance bar: timeout-class
       elimination and the Q3/Q10/Q18/Q7/Q9/Q21 recoveries are the S1/S3/S5
       exit gates of `docs/design/leftdeep-joins/` (09 §2-§3; 01 §6), so this
@@ -4770,8 +4760,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       not via cardinality — and goal (b)'s actual fixes.** Both measurement
       motions are now discharged; what remains under this umbrella is repair.
 
-- [ ] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
-      cardinality regimes** **[→ M0127: absorbed 2026-08-03]** — Q21's
+- [x] **M0125-0032 — TPC-H Q21 is the shape-class timeout: it survives BOTH
+      cardinality regimes** **[→ M0127: CLOSED 2026-08-08 by M0127 completion]** — Q21's
       completion is M0127's S3 exit gate by name (`leftdeep-joins` 06:
       hybrid-hash spill; 09 §2: "Q21 completes at SF1 under the standard
       cgroup cap") and clause 1 of the S5 acceptance bar (22/22 complete,
@@ -4798,8 +4788,8 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       instance of the same question its capture asks of the 16 TPC-DS members,
       and one shared root-cause taxonomy is the point.
 
-- [ ] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics**
-      **[→ M0127: absorbed 2026-08-03]** — Q18 is in the S1 exit bar's named
+- [x] **M0125-0033 — TPC-DS Q18 is 2.1× SLOWER under warm statistics**
+      **[→ M0127: CLOSED 2026-08-08 by M0127 completion]** — Q18 is in the S1 exit bar's named
       set ("Q18 ≤ 1.2× its R0 27.58 s", `leftdeep-joins` 09 §2) and in
       01 §6(1)'s recovery list; the seam de-materialisation (M0127-P1.1) and
       the executor stages S0–S2 are the mechanism this item's fix would have
@@ -11661,7 +11651,7 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       text varlena header, int8-max, bool short-len, OpExpr, FuncExpr, null Const).
       NO resolver/writer wired yet (S2). Design doc `0123-0001-pgnodes-scalar-
       serializer.md` + README index + ledger row (2026-07-19). LANDED.
-- [ ] M0123-S2 — SUB-SLICE 1 LANDED (2026-07-19): `resolver_expr.go`
+- [x] M0123-S2 — SUB-SLICE 1 LANDED (2026-07-19): `resolver_expr.go`
       (`ResolveExpr`: goopg `parser.Expr` → scalar IR via S0 `LookupOperatorForNode`)
       + `rebuild.go` (`Rebuild`: IR → goopg AST for reload) + `unsupported.go`
       (`SupportsExpr` all-or-nothing shape check), all pure `internal/pgnodes`
@@ -11702,7 +11692,7 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       + 2656/2657 index materialization first. (2) canonical **`stxexprs`** is
       blocked on a `List` IR node (`stxexprs` is a `List` of trees, `(...)` not
       `{...}`) — arrives with S3/S4.
-- [ ] M0123-S3 — SUB-SLICE 1 LANDED (2026-07-19): the pure `internal/pgnodes`
+- [x] M0123-S3 — SUB-SLICE 1 LANDED (2026-07-19): the pure `internal/pgnodes`
       query-tree **codec** (no wiring), mirroring how S1 landed the scalar codec
       before S2's resolver. New IR `Query`/`RangeTblEntry`/`RTEPermissionInfo`/
       `FromExpr`/`RangeTblRef`/`TargetEntry`/`Var`/`Alias` (`ir_query.go`) + two
@@ -11768,7 +11758,7 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       (rewriter uses relcache rd_rules, not the pg_rewrite scan pg_get_viewdef
       uses; copied pg_internal.init caches a ruleless entry). Next: S4 coverage OR
       the rd_rules standby-eval unblock.
-- [ ] M0123-S4 — coverage + hardening: more datum types (numeric, timestamptz,
+- [x] M0123-S4 — coverage + hardening: more datum types (numeric, timestamptz,
       more), `CASE`/`BoolExpr`/`NullTest` in target lists, more operators; and the
       byte-diff oracle gate (goopg's emitted `ev_action`/`adbin` `==` real-PG18's
       for the identical DDL, `:location` normalized). Decompose into sub-slices;
