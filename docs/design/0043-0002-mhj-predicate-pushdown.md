@@ -1,6 +1,7 @@
 # 0043-0002 — MHJ Predicate Pushdown into Chain Steps
 
-**Status:** draft
+**Status:** superseded
+**Superseded by:** [leftdeep-joins/](leftdeep-joins/) — MHJ retired (M0127).
 **Parent milestone:** M0043
 **Date:** 2026-05-04
 

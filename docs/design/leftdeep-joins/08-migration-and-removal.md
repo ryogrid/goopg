@@ -134,6 +134,13 @@ survive unchanged.
 
 ## 5. Documentation obligations (same-commit, per repo rule)
 
+**COMPLETED 2026-08-07 (M0127-P6.4).** All items below landed in one commit:
+23 doc files stamped, README index 19 rows flipped, cost-model/09 §3 MHJ
+allowance struck, 5 `.ralph/deferral_ledger.md` rows added (GEQO, skew
+buckets, SpecialJoinInfo semi/anti in-DP, shared spilling builds, full
+join_order_restriction inference — the last two carry the
+`join_is_legal`-inference-dependent marker per 03 §4.4/§6).
+
 - `docs/design/README.md`: bundle bullet under `## Design Bundles` (added
   with this bundle); status flips (`draft` → `accepted`) as stages land.
 - Supersession stamps at S7: [0034-0001](../0034-0001-bushy-join-planning.md),
@@ -147,7 +154,7 @@ survive unchanged.
   full join_order_restriction inference) gets its
   `.ralph/deferral_ledger.md` row when its stage lands — the ledger, not
   this bundle, is the resume-point authority. The semi/anti-in-DP and
-  join_order_restriction rows carry the **`join_is_legal`-inference-dependent**
+  join_order_restriction rows carry the **`join_is_legal`-inference-dependent`
   marker ([03](03-join-search-pg-dp.md) §4.4): the bushy shape capacity they
   need is implemented ([03](03-join-search-pg-dp.md) §4.3), so neither is
   blocked on search shape anymore — what blocks them is `join_is_legal`

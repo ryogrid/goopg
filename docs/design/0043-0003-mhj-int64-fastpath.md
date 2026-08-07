@@ -1,6 +1,7 @@
 # 0043-0003 — MHJ Int64 Fast-Path Hash Tables
 
-**Status:** accepted
+**Status:** superseded
+**Superseded by:** [leftdeep-joins/](leftdeep-joins/) — MHJ retired (M0127).
 **Parent milestone:** M0043
 **Date:** 2026-05-04
 

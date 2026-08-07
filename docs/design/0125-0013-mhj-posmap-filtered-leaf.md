@@ -1,6 +1,6 @@
 # M0125-0013 — the MHJ leaf that was skipped twice over
 
-*Status: accepted. Branch `tpcds-fix2`. Closes TPC-DS Q47
+*Status: superseded — MHJ retired (M0127); see [leftdeep-joins/](leftdeep-joins/). Originally accepted. Branch `tpcds-fix2`. Closes TPC-DS Q47
 (`MISMATCH goopg=0 oracle=100` → 100 rows).*
 
 ## 1. The symptom, and why it hid for so long

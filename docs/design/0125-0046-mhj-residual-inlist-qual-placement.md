@@ -1,6 +1,6 @@
 # M0125-0046 — MHJ residual-qual placement: the IN-list was never in `mh.Filters` to begin with
 
-Status: **landed** (2026-08-01). Filed 2026-08-01 by the M0125-0035 closure as
+Status: **superseded** — MHJ retired (M0127); see [leftdeep-joins/](leftdeep-joins/). Originally landed 2026-08-01. Filed 2026-08-01 by the M0125-0035 closure as
 arm (b); evidence `docs/design/0125-0035-c2-single-table-qual-placement.md` §2
 and §6(b), ledger row 2026-07-31 (M0125-0035, "InExpr disqualifier").
 

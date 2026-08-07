@@ -1,6 +1,7 @@
 # 0038-0001 — Multi-Way Hash Join Operator
 
-**Status:** accepted
+**Status:** superseded
+**Superseded by:** [leftdeep-joins/](leftdeep-joins/) — the MultiHashJoin operator, its planner path, and its fusion pipeline are retired in favour of left-deep binary hash cascades on the PG-shaped search (M0127).
 **Parent milestone:** M0038
 **Date:** 2026-05-02
 

@@ -2,7 +2,8 @@
 
 | field | value |
 | --- | --- |
-| status | draft |
+| status | superseded |
+| superseded by | [leftdeep-joins/](../leftdeep-joins/) — MHJ retired (M0127) |
 | date | 2026-07-31 |
 | task | M0126-0009 — **CONDITIONAL: M0126-0008 leaves ≥1 query failing a bar clause** |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` |

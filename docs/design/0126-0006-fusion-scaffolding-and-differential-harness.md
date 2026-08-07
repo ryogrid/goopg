@@ -2,7 +2,8 @@
 
 | field | value |
 | --- | --- |
-| status | **LANDED** |
+| status | superseded |
+| superseded by | [leftdeep-joins/](../leftdeep-joins/) — MHJ retired (M0127) |
 | date | 2026-08-02 |
 | task | M0126-0006 — **CONDITIONAL on M0126-0005** ("a large gap remains") |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` |

@@ -1516,7 +1516,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       **docs/design/root-0041-partial-index-predicate-guard.md**; 3 ledger
       rows. Evidence `analysis/m0127-s7-regress/order-dep-20260807/`.
 - [ ] **regress/truncate is NONDETERMINISTIC — it will make a nightly `fail`
-      at random** (filed 2026-08-07; found while diffing the before/after
+      at random** (AI-20260807-004620-001; filed 2026-08-07; found while diffing the before/after
       regress divergence sets for the partial-index fix, and independent of
       it). Measured: **1 of 3 identical standalone runs diverged**, emitting
       `DETAIL: Table "trunc_b" references "truncate_a"` where `trunc_d`/
@@ -10270,7 +10270,7 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       `TestExprSwitchInventoryIsPinned` caught the file split and was
       re-keyed in-commit (four walker pins `bushy.go`→`joinlayout.go`), not
       suppressed.
-- [ ] **M0127-P6.4 — supersession stamps + ledger rows.** 0034-0001, 0038-0001,
+- [x] **M0127-P6.4 — supersession stamps + ledger rows.** 0034-0001, 0038-0001,
       cost-model/09 §3 allowance, 0043/0063/0125/0126 MHJ chapters get
       `superseded by: leftdeep-joins/` headers; README index status flips;
       ledger rows for every deliberately-skipped PG behaviour (GEQO, skew

@@ -1,6 +1,6 @@
 # 0125-0002 — Converting the seven remaining walkers: a plan-**shape** change and the TPC-H trade-off it re-opens
 
-Status: in progress — STEP 0 and commit 1 of 8 executed (see "Execution record")
+Status: superseded — MHJ retired (M0127); see [leftdeep-joins/](leftdeep-joins/)
 Date: 2026-07-28 (STEP 0 2026-07-30; commit 1 2026-07-30)
 Milestone: M0125-0002 (§13.5 action 4, phase 2.2)
 Depends on: `0125-0001-…` (the driver), M0124-0002 (the plan baseline), M0124-0005 (value checksums)
