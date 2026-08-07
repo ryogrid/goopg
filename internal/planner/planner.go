@@ -365,6 +365,11 @@ type resolveContext struct {
 	// `tryPGShapedJoinSearch` (joinsearchseam.go) since P5.9-b.
 	joinlist joinlist
 
+	// joinInfoList is root->join_info_list: every SpecialJoinInfo built
+	// during jointree deconstruction, in bottom-up order. Populated by
+	// deconstructJointree and consumed by join_is_legal (P1.2+). M0128-P1.1.
+	joinInfoList []*SpecialJoinInfo
+
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
 	// win at the search root (`finalPath`) and whether one is worth keeping
@@ -1990,6 +1995,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil
 }
 
