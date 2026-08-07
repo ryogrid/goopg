@@ -12230,6 +12230,23 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       no-wrap guard + ColumnTypmod table) + oracle_pgnodes_adbin_test.go now **91
       cases** all byte-identical vs LIVE PG18.3 (1.97s). Design 0123-0005
       §"Deferred" updated.
-      REMAINING: other length types (`timestamp(N)`, `bit(N)`/`varbit(N)`,
-      `time(N)`); broader date input forms (`infinity`, BC years,
-      DateStyle-dependent).
+      SUB-SLICE 35 LANDED (2026-08-08): canonical **`timestamp(N)` length
+      coercion**. A string literal in a `timestamp(N)` column context now folds
+      to a timestamp Const (new OID 1114, NewTimestampConst datum constructor,
+      parseTimestampMicros — wall-clock μs since PG epoch, no timezone offset),
+      then coerce_type_typmod wraps it in an IMPLICIT FuncExpr —
+      `timestamp(timestamp,int4)` (funcid 1961, funcformat 2) — with the column
+      precision (0-6) as the int4 typmod arg. Same COERCION_PATH_FUNC pattern
+      as varchar/bpchar; the pg_cast.dat self-cast entry confirms it. The
+      rebuild path unwraps the implicit FuncExpr transparently and
+      formatTimestamp rebuilds the Const to a canonical timestamp literal
+      (without timezone). ColumnTypmod("timestamp", args) now returns the
+      precision directly. Gate `internal/pgnodes/timestamp_lencoerce_test.go`
+      (5 live PG18.3 goldens byte-for-byte + structure + codec/rebuild
+      round-trip + bare-column no-wrap guard + ColumnTypmod + explicit cast
+      symmetry + Const rebuild) + oracle_pgnodes_adbin_test.go now **96
+      cases** all byte-identical vs LIVE PG18.3 (2.01s). Design 0123-0005
+      §"Sub-slice 35".
+      REMAINING: other length types (`bit(N)`/`varbit(N)`, `time(N)`,
+      `timestamptz(N)`); broader date input forms (`infinity`, BC years,
+      DateStyle-dependent); `time(N)` / `timetz(N)`.

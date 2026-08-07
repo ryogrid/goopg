@@ -310,6 +310,14 @@ var adbinOracleCases = []adbinOracleCase{
 	{"bpchar5_abc", "char(5)", pgnodes.OidBpchar, "'abc'"},
 	{"bpchar10_xyz", "character(10)", pgnodes.OidBpchar, "'xyz'"},
 	{"bpchar3_empty", "bpchar(3)", pgnodes.OidBpchar, "''"},
+	// Sub-slice 34: a string literal in a timestamp(N) column context
+	// folds to a timestamp Const (consttypmod -1), then coerce_type_typmod
+	// wraps it in an IMPLICIT timestamp(timestamp,int4) FuncExpr (funcid 1961).
+	{"ts0_2024_01_15", "timestamp(0)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00'"},
+	{"ts3_2024_01_15_123456", "timestamp(3)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts6_2024_01_15_123456", "timestamp(6)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts0_truncate", "timestamp(0)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts0_epoch", "timestamp(0)", pgnodes.OidTimestamp, "'epoch'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

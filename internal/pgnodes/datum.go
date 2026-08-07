@@ -22,6 +22,7 @@ const (
 	OidVarchar     = 1043
 	OidBpchar      = 1042
 	OidDate        = 1082
+	OidTimestamp   = 1114
 	OidTimestamptz = 1184
 )
 
@@ -164,7 +165,7 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 		return 8, true, true
 	case OidNumeric:
 		return -1, false, true
-	case OidTimestamptz:
+	case OidTimestamp, OidTimestamptz:
 		return 8, true, true
 	default:
 		return 0, false, false
@@ -900,6 +901,19 @@ func NewTimestamptzConst(usec int64) *Const {
 	}
 }
 
+// NewTimestampConst builds a Const for a timestamp value (μs since the
+// PostgreSQL epoch, without timezone). Same wire form as timestamptz
+// (constlen 8, constbyval true) but consttype 1114 and no timezone
+// semantics — the stored microseconds are the wall-clock value, not a
+// UTC instant.
+func NewTimestampConst(usec int64) *Const {
+	return &Const{
+		ConstType: OidTimestamp, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(usec),
+	}
+}
+
 // NewDateConst builds a Const for a date value (DateADT: signed int32 days since
 // the PostgreSQL epoch, 2000-01-01). It is by-value (constlen 4, constbyval true,
 // constcollid 0) and sign-extends into the 8-byte datum word so a pre-2000 date
@@ -988,6 +1002,42 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 	days := int64(date2j(y, mo, d) - postgresEpochJDate)
 	// UTC instant = wall-clock at the given offset minus that offset.
 	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss) - offSec
+	return totalSec*1000000 + fracUsec, true
+}
+
+// parseTimestampMicros parses a timestamp literal (without timezone) into
+// microseconds since the PostgreSQL epoch, returning ok=false for anything
+// outside the deterministic subset (which the resolver then degrades to SQL
+// text). PG folds such a literal at parse time using timestamp_in; since
+// timestamp has no timezone semantics, the wall-clock date+time converts
+// directly to microseconds without any offset adjustment. Supported forms:
+// "YYYY-MM-DD HH:MI:SS[.ffffff]", the 'epoch' keyword.
+func parseTimestampMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "epoch") {
+		return unixEpochMicros, true
+	}
+
+	// Split the date from the time part on the first space or 'T'.
+	sep := strings.IndexAny(s, " Tt")
+	if sep < 0 {
+		return 0, false
+	}
+	dateStr, timeStr := s[:sep], s[sep+1:]
+
+	y, mo, d, ok := parseDateFields(dateStr)
+	if !ok {
+		return 0, false
+	}
+
+	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
+	if !ok {
+		return 0, false
+	}
+
+	days := int64(date2j(y, mo, d) - postgresEpochJDate)
+	// Wall-clock value with no timezone offset.
+	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss)
 	return totalSec*1000000 + fracUsec, true
 }
 
@@ -1163,5 +1213,35 @@ func formatTimestamptzUTC(usec int64) string {
 		sb.WriteString(frac)
 	}
 	sb.WriteString("+00")
+	return sb.String()
+}
+
+// formatTimestamp formats a timestamp μs value into a canonical "YYYY-MM-DD
+// HH:MI:SS[.ffffff]" literal (no timezone). It is the timestamp analogue of
+// formatTimestamptzUTC: same date/time decomposition but without the +00
+// offset, so a re-resolve through parseTimestampMicros reproduces the
+// identical Const.
+func formatTimestamp(usec int64) string {
+	day := usec / usecsPerDay
+	rem := usec % usecsPerDay
+	if rem < 0 {
+		rem += usecsPerDay
+		day--
+	}
+	y, mo, d := j2date(int(day) + postgresEpochJDate)
+	sec := rem / 1000000
+	fracUsec := rem % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
 	return sb.String()
 }

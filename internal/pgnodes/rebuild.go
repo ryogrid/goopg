@@ -247,7 +247,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitIntToInt2Cast(f) ||
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) || isImplicitToFloat4Cast(f) ||
 		isImplicitNumericLengthCoercion(f) ||
-			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) {
+			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) ||
+			isImplicitTimestampLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
 	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
@@ -395,6 +396,21 @@ func isImplicitVarcharLengthCoercion(f *FuncExpr) bool {
 // funcformat 2.
 func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 668 || f.Funcformat != 2 || f.Funcresulttype != OidBpchar || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimestampLengthCoercion reports whether f is the IMPLICIT timestamp
+// length coercion coerce_type_typmod adds when a timestamp(N) column has a precision
+// qualifier (see wrapTimestampLengthCoercion): timestamp(timestamp,int4) = funcid
+// 1961, funcformat 2 (IMPLICIT), a timestamp result, and two args whose second is a
+// non-null int4 typmod Const. pg_get_expr renders the implicit form invisibly, so
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimestampLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1961 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamp || len(f.Args) != 2 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)
@@ -647,6 +663,12 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// value is inside the literal string, not a unary minus.
 		usec := int64FromByvalWord(c.Datum)
 		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
+	case OidTimestamp:
+		// Same as timestamptz but WITHOUT the +00 offset — timestamp has no
+		// timezone. A re-resolve in a timestamp column context folds through
+		// parseTimestampMicros to the identical Const.
+		usec := int64FromByvalWord(c.Datum)
+		return &parser.StringConst{Value: formatTimestamp(usec)}, nil
 	case OidDate:
 		// Render the DateADT day count back into a canonical "YYYY-MM-DD" literal
 		// which re-resolves to the identical Const in a date column context — the

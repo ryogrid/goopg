@@ -1,30 +1,29 @@
-Task: M0123-S4 REMAINING #3 — other length types (`timestamp(N)`, `bit(N)`/`varbit(N)`, `time(N)`)
+Task: M0123-S4 SUB-SLICE 35 LANDED — timestamp(N) length coercion
 
 Files:
-  - internal/pgnodes/datum.go: added OidVarchar(1043), OidBpchar(1042), NewVarcharConst, NewBpcharConst
-  - internal/pgnodes/resolver_expr.go: foldStringLiteralConst varchar/bpchar, wrapVarchar/BpcharLengthCoercion, ColumnTypmod, ResolveForColumnTypmod generalized
-  - internal/pgnodes/rebuild.go: isImplicitVarchar/BpcharLengthCoercion, rebuildConst OidText+OidVarchar+OidBpchar
-  - internal/executor/sys_pg_attrdef.go: ColumnTypmod replaces NumericColumnTypmod
-  - internal/pgnodes/varchar_lencoerce_test.go: NEW — 6 live PG18.3 goldens + rebuild round-trip + bare-column + ColumnTypmod
-  - internal/testport/oracle_pgnodes_adbin_test.go: colSQLTypmod replaces numericColSQLTypmod + 6 new varchar/bpchar cases
-  - docs/design/0123-0005-pgnodes-bool-null-scalar.md: Deferred section updated
-  - .ralph/fix_plan.md: SUB-SLICE 34 landed entry
+  - internal/pgnodes/datum.go: added OidTimestamp(1114), NewTimestampConst, parseTimestampMicros, formatTimestamp
+  - internal/pgnodes/resolver_expr.go: foldStringLiteralConst OidTimestamp case, wrapTimestampLengthCoercion(1961), ResolveForColumnTypmod OidTimestamp case, ColumnTypmod timestamp type
+  - internal/pgnodes/rebuild.go: isImplicitTimestampLengthCoercion, unwrap list, OidTimestamp Const rebuild case
+  - internal/pgnodes/timestamp_lencoerce_test.go: NEW — 5 live PG18.3 goldens + structure + round-trip + ColumnTypmod
+  - internal/testport/oracle_pgnodes_adbin_test.go: 5 new timestamp(N) cases (96 total)
+  - .ralph/fix_plan.md: SUB-SLICE 35 landed entry
 
-Key symbols: wrapVarcharLengthCoercion(669), wrapBpcharLengthCoercion(668), ColumnTypmod, ResolveForColumnTypmod, NewVarcharConst, NewBpcharConst
+Key symbols: OidTimestamp(1114), NewTimestampConst, parseTimestampMicros, formatTimestamp,
+  wrapTimestampLengthCoercion(1961), isImplicitTimestampLengthCoercion
 
 Hypothesis/Findings:
-  - SUB-SLICE 34 LANDED: varchar(N) / bpchar(N) length coercion.
-  - The CoerceViaIO hypothesis was REFUTED — PG uses COERCION_PATH_FUNC (same FuncExpr
-    pattern as numeric). Every typmod-capable type has a pg_cast self-cast entry
-    (varchar→varchar funcid 669, bpchar→bpchar funcid 668, both 3-arg with isExplicit).
-  - varchar(N) typmod = N + VARHDRSZ(4); stored in the FuncExpr's int4 arg.
-  - REMAINING: timestamp(N), bit(N)/varbit(N), time(N) — each needs its own datum
-    support (timestamp without tz, bit literal parsing) before typmod coercion can land.
+  - SUB-SLICE 35 LANDED: timestamp(N) length coercion.
+  - Uses same COERCION_PATH_FUNC pattern as varchar/bpchar — pg_cast.dat has a
+    timestamp→timestamp self-cast via `timestamp(timestamp,int4)` (funcid 1961).
+  - Typmod for timestamp is just the precision (0-6), no VARHDRSZ offset.
+  - Unlike varchar/bpchar, the coercion FuncExpr has 2 args (no bool isExplicit third arg).
+  - The formatTimestamp rebuild produces a canonical literal WITHOUT timezone (+00),
+    matching PG's timestamp_in output.
 
-Next step: Add timestamp(N) datum support (timestamp without timezone, OID 1114),
-  then add its self-cast `timestamp(timestamp,int4)` FuncExpr (funcid from pg_cast.dat).
+Next step: Add bit(N)/varbit(N) datum support, then its self-cast FuncExpr.
+  Or continue with time(N) if bit types are more complex.
 
-Gates run: UNITS PASS (cached), ORACLE PASS (91/91 including 6 new varchar/bpchar vs live PG18.3, 1.97s),
-  initdb PASS
+Gates run: UNITS PASS (cached, 0.029s), ORACLE PASS (96/96 including 5 new timestamp vs live PG18.3, 2.01s),
+  initdb build PASS
 
 In-flight: none
