@@ -491,22 +491,34 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			uint16(rel1.Relids), uint16(rel2.Relids))
 	}
 
-	// join_is_legal (joinrels.c:350, M0128-P1.2): check SpecialJoinInfo
+	// join_is_legal (joinrels.c:350, M0128-P1.2 / P1.3): check SpecialJoinInfo
 	// constraints. While the pin holds (03 §4.4) every searched rel is
-	// inner-joinable, so this returns (nil, false, nil) — the LJO arm.
-	// When the pin relaxes, an error here means the pair is illegal;
-	// the search continues with other pairs (03 §4.2).
-	if _, _, err := s.joinIsLegal(rel1, rel2); err != nil {
+	// inner-joinable, so this returns (nil, false, nil). When the pin relaxes,
+	// sjinfo carries the join type and reversed tells the caller to swap
+	// outer/inner to match the SpecialJoinInfo's orientation (PG: "also,
+	// *reversed_p is set true if the given relations need to be swapped to
+	// match the SpecialJoinInfo node" — joinrels.c:345-347).
+	// An error here means the pair is illegal; the search continues with
+	// other pairs (03 §4.2).
+	sjinfo, reversed, err := s.joinIsLegal(rel1, rel2)
+	if err != nil {
 		s.trace.decline(s.tracePhase, rel1.Relids, rel2.Relids, "illegal")
 		return nil, nil
+	}
+	// PG swaps the arguments inside make_join_rel (joinrels.c:715-717) so the
+	// caller's notion of outer/inner matches the SpecialJoinInfo's LHS/RHS.
+	if reversed {
+		rel1, rel2 = rel2, rel1
 	}
 
 	joinrelids := rel1.Relids | rel2.Relids
 
-	// build_joinrel_restrictlist (relnode.c): the quals this join applies —
-	// computable here and not already applied below. 03 §3's coverage rule,
-	// which is a different predicate from the connectivity gate above.
-	clauses := s.clauses.clausesFor(rel1.Relids, rel2.Relids)
+	// build_joinrel_restrictlist (relnode.c, M0128-P1.3): the quals this join
+	// applies — computable here and not already applied below. For a non-nil
+	// sjinfo (outer join) this additionally admits filter clauses on the
+	// nullable side. 03 §3's coverage rule, which is a different predicate
+	// from the connectivity gate above.
+	clauses := s.clauses.buildJoinRelRestrictList(rel1.Relids, rel2.Relids, sjinfo)
 
 	joinrel := s.findRel(joinrelids)
 	// Recorded BEFORE the find-or-create branch, so the `created` bit says

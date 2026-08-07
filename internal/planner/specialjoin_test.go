@@ -589,3 +589,209 @@ func TestJoinIsLegalMultipleSJInfosRejected(t *testing.T) {
 		t.Error("joinIsLegal should reject a pair matching multiple SpecialJoinInfos")
 	}
 }
+
+// ── M0128-P1.3 FULL-nesting legality tests ──
+
+func TestJoinIsLegalFullJoinReversedOrientation(t *testing.T) {
+	// A FULL JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (B, A): matches as reversed — FULL is symmetric so both
+	// orientations are valid.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b001))
+	if err != nil {
+		t.Fatalf("joinIsLegal(B,A) for FULL: %v", err)
+	}
+	if sj == nil || sj.Jointype != parser.JoinFull {
+		t.Fatalf("joinIsLegal(B,A) sj.Jointype = %v, want FULL", sj)
+	}
+	if !rev {
+		t.Error("joinIsLegal(B,A) reversed = false, want true — (B,A) matches (RHS,LHS)")
+	}
+}
+
+func TestJoinIsLegalFullJoinRHSBuilding(t *testing.T) {
+	// A FULL JOIN (B ⋈ C) — SJ: LHS={A}, RHS={B,C}.
+	// Pair (B, C): both overlap RHS — PG allows this via the "both overlap
+	// RHS → assume valid commutation" branch (joinrels.c:509-511).
+	// This builds up the RHS and is not the FULL join itself.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b110)}
+	s := mkTestSearchCtx(t, 3, jil)
+	sj, _, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b100))
+	if err != nil {
+		t.Fatalf("joinIsLegal(B,C) within FULL RHS: %v — both overlap RHS is legal for RHS building", err)
+	}
+	if sj != nil {
+		t.Errorf("joinIsLegal(B,C) sj != nil, want nil — building RHS is not the FULL join itself")
+	}
+}
+
+func TestJoinIsLegalRejectsFullJoinRHSPlusUnrelated(t *testing.T) {
+	// A FULL JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (B, C) where C is unrelated: FULL joins cannot have association
+	// into their RHS (unlike LEFT). PG rejects this at joinrels.c:519.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 3, jil)
+	_, _, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b100))
+	if err == nil {
+		t.Error("joinIsLegal(B,C) should reject — joining FULL RHS with an unrelated rel is illegal")
+	}
+}
+
+func TestJoinIsLegalNestedFullJoins(t *testing.T) {
+	// (A FULL JOIN B) FULL JOIN C — SJ1: LHS={A}, RHS={B}; SJ2: LHS={A,B}, RHS={C}.
+	// Test that the inner FULL pair (A,B) matches SJ1 and the outer (AB,C) matches SJ2.
+	jil := []*SpecialJoinInfo{
+		mkSJ(parser.JoinFull, 0b001, 0b010),
+		mkSJ(parser.JoinFull, 0b011, 0b100),
+	}
+	s := mkTestSearchCtx(t, 3, jil)
+
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,B) nested FULL: %v", err)
+	}
+	if sj == nil || sj.Jointype != parser.JoinFull || sj.MinLefthand != 0b001 {
+		t.Fatalf("joinIsLegal(A,B) nested: got sj=%v rev=%v, want SJ1 FULL LHS={A}", sj, rev)
+	}
+
+	sj, rev, err = s.joinIsLegal(mkTestRel(0b011), mkTestRel(0b100))
+	if err != nil {
+		t.Fatalf("joinIsLegal(AB,C) nested FULL: %v", err)
+	}
+	if sj == nil || sj.Jointype != parser.JoinFull || sj.MinRighthand != 0b100 {
+		t.Fatalf("joinIsLegal(AB,C) nested: got sj=%v rev=%v, want SJ2 FULL RHS={C}", sj, rev)
+	}
+	if rev {
+		t.Error("joinIsLegal(AB,C) reversed = true, want false")
+	}
+}
+
+// ── M0128-P1.3 buildJoinRelRestrictList / clause distribution tests ──
+
+func TestBuildJoinRelRestrictListInnerJoin(t *testing.T) {
+	l := &restrictInfoList{all: []*restrictInfo{
+		{relids: 0b011}, // A, B — touches both
+		{relids: 0b001}, // A only
+		{relids: 0b110}, // B, C — B in join, C outside
+	}}
+	got := l.buildJoinRelRestrictList(0b001, 0b010, nil)
+	want := l.clausesFor(0b001, 0b010)
+	if len(got) != len(want) {
+		t.Errorf("buildJoinRelRestrictList(nil sjinfo) = %d clauses, want %d", len(got), len(want))
+	}
+}
+
+func TestBuildJoinRelRestrictListLeftJoinNullableFilters(t *testing.T) {
+	sj := mkSJ(parser.JoinLeft, 0b001, 0b010)
+	nullableClause := &restrictInfo{relids: 0b010} // B only — nullable RHS filter
+	joinClause := &restrictInfo{relids: 0b011}     // A and B — join clause
+	l := &restrictInfoList{all: []*restrictInfo{joinClause, nullableClause}}
+	got := l.buildJoinRelRestrictList(0b001, 0b010, sj)
+	if len(got) != 2 {
+		t.Fatalf("buildJoinRelRestrictList(LEFT) = %d clauses, want 2", len(got))
+	}
+	foundJoin, foundFilter := false, false
+	for _, ri := range got {
+		if ri == joinClause {
+			foundJoin = true
+		}
+		if ri == nullableClause {
+			foundFilter = true
+		}
+	}
+	if !foundJoin {
+		t.Error("join clause missing from result")
+	}
+	if !foundFilter {
+		t.Error("nullable-side filter clause missing from result")
+	}
+}
+
+func TestBuildJoinRelRestrictListFullJoinBothSides(t *testing.T) {
+	sj := mkSJ(parser.JoinFull, 0b001, 0b010)
+	filterA := &restrictInfo{relids: 0b001} // A only — nullable LHS
+	filterB := &restrictInfo{relids: 0b010} // B only — nullable RHS
+	joinAB := &restrictInfo{relids: 0b011}  // A and B — join clause
+	l := &restrictInfoList{all: []*restrictInfo{joinAB, filterA, filterB}}
+	got := l.buildJoinRelRestrictList(0b001, 0b010, sj)
+	if len(got) != 3 {
+		t.Errorf("buildJoinRelRestrictList(FULL) = %d clauses, want 3", len(got))
+	}
+}
+
+func TestBuildJoinRelRestrictListDedup(t *testing.T) {
+	sj := mkSJ(parser.JoinFull, 0b001, 0b010)
+	clause := &restrictInfo{relids: 0b011}
+	l := &restrictInfoList{all: []*restrictInfo{clause, clause}}
+	got := l.buildJoinRelRestrictList(0b001, 0b010, sj)
+	if len(got) != 1 {
+		t.Errorf("buildJoinRelRestrictList dedup = %d clauses, want 1", len(got))
+	}
+}
+
+func TestBuildJoinRelRestrictListPreservedSideNotFilter(t *testing.T) {
+	sj := mkSJ(parser.JoinLeft, 0b001, 0b010)
+	preservedClause := &restrictInfo{relids: 0b001} // A only — preserved side
+	l := &restrictInfoList{all: []*restrictInfo{preservedClause}}
+	got := l.buildJoinRelRestrictList(0b001, 0b010, sj)
+	if len(got) != 0 {
+		t.Errorf("buildJoinRelRestrictList preserved-side = %d clauses, want 0", len(got))
+	}
+}
+
+// ── isOuterJoinFilterClause ──
+
+func TestIsOuterJoinFilterClauseLeftJoin(t *testing.T) {
+	sj := mkSJ(parser.JoinLeft, 0b001, 0b010)
+	if !isOuterJoinFilterClause(0b010, sj) {
+		t.Error("clause on nullable RHS should be a filter clause for LEFT join")
+	}
+	if isOuterJoinFilterClause(0b001, sj) {
+		t.Error("clause on preserved LHS should NOT be a filter clause for LEFT join")
+	}
+	if isOuterJoinFilterClause(0b011, sj) {
+		t.Error("clause on both sides should NOT be a filter clause")
+	}
+}
+
+func TestIsOuterJoinFilterClauseFullJoin(t *testing.T) {
+	sj := mkSJ(parser.JoinFull, 0b001, 0b010)
+	if !isOuterJoinFilterClause(0b001, sj) {
+		t.Error("clause on nullable LHS should be a filter clause for FULL join")
+	}
+	if !isOuterJoinFilterClause(0b010, sj) {
+		t.Error("clause on nullable RHS should be a filter clause for FULL join")
+	}
+	if isOuterJoinFilterClause(0b011, sj) {
+		t.Error("clause on both sides should NOT be a filter clause for FULL join")
+	}
+}
+
+// ── dedupRestrictInfoPtrs ──
+
+func TestDedupRestrictInfoPtrs(t *testing.T) {
+	a := &restrictInfo{relids: 0b001}
+	b := &restrictInfo{relids: 0b010}
+	c := &restrictInfo{relids: 0b100}
+	tests := []struct {
+		name string
+		in   []*restrictInfo
+		want int
+	}{
+		{"empty", nil, 0},
+		{"single", []*restrictInfo{a}, 1},
+		{"no dups", []*restrictInfo{a, b, c}, 3},
+		{"dup adjacent", []*restrictInfo{a, a, b}, 2},
+		{"dup separated", []*restrictInfo{a, b, a}, 2},
+		{"all same", []*restrictInfo{a, a, a}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dedupRestrictInfoPtrs(tt.in)
+			if len(got) != tt.want {
+				t.Errorf("dedupRestrictInfoPtrs = %d, want %d", len(got), tt.want)
+			}
+		})
+	}
+}

@@ -10578,7 +10578,7 @@ it at selection time and record the split in both the plan doc and here.
       shapes **error loudly**. Resume point
       `internal/executor/operators_lockrows.go`. Bar: UNITS + SPOT + DS05 + a
       regression test that an interposed shape errors.
-- [ ] **M0128-P1.1 — `SpecialJoinInfo` representation + construction.** 03
+- [x] **M0128-P1.1 — `SpecialJoinInfo` representation + construction.** 03
       §4.4; PG `joinrels.c:350` (consumer), `initsplan.c`
       `deconstruct_jointree` (construction). Port the semantic fields **as PG
       18.3 defines them** (`postgres/src/include/nodes/pathnodes.h:3031-3053`:
@@ -10599,7 +10599,7 @@ it at selection time and record the split in both the plan doc and here.
       condition-only form. Bar: UNITS + SPOT + DS05 (zero row/checksum
       deltas; only outer-join queries may change plans, only to PG-legal
       orders) + a legality-matrix unit test.
-- [ ] **M0128-P1.3 — FULL joins + outer-join clause distribution.** 03 §6:
+- [x] **M0128-P1.3 — FULL joins + outer-join clause distribution.** 03 §6:
       `build_joinrel_restrictlist` for special joins (join vs filter clauses
       on the nullable side), the FULL arm of `join_is_legal`, identity/dedup
       rules for restricted levels. Bar: as P1.2 + FULL-nesting unit tests.

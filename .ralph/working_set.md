@@ -1,42 +1,37 @@
-M0128-P1.2 COMPLETE — join_is_legal + joinOrderRestriction + hasJoinRestriction for LEFT/FULL
+M0128-P1.3 COMPLETE — FULL joins + buildJoinRelRestrictList + dedup
 
-Task: M0128-P1.2 — join_is_legal + joinOrderRestriction/hasJoinRestriction for LEFT joins
+Task: M0128-P1.3 — FULL joins + outer-join clause distribution (03 §6)
 Files:
-  - internal/planner/joinsearchlevel.go: joinIsLegal, joinOrderRestricted,
-    hasJoinRestriction methods on searchCtx; joinIsLegal wired into makeJoinRel
-  - internal/planner/joinsearch.go: joinInfoList field on searchCtx; updated
-    newSearchCtx + buildInitialRels signatures
-  - internal/planner/relfromjoinlist.go: joinInfoList on joinlistProblem,
-    threaded through searchOneProblem → buildInitialRels
-  - internal/planner/joinsearchseam.go: ctx.joinInfoList passed to
-    joinlistProblem construction
-  - internal/planner/specialjoin_test.go: 18 legality-matrix tests for all
-    three functions
-  - 10 test files: nil joinInfoList in newSearchCtx/buildInitialRels callers
+  - internal/planner/joinrestrict.go: buildJoinRelRestrictList,
+    isOuterJoinFilterClause, dedupRestrictInfoPtrs (91 new lines)
+  - internal/planner/joinsearchlevel.go: makeJoinRel captures sjinfo/reversed
+    from joinIsLegal, uses buildJoinRelRestrictList instead of clausesFor
+  - internal/planner/specialjoin_test.go: 13 new tests (FULL-nesting legality
+    matrix, clause distribution, isOuterJoinFilterClause, dedup)
 
-Key symbols: searchCtx.joinIsLegal, searchCtx.joinOrderRestricted,
-  searchCtx.hasJoinRestriction, joinlistProblem.joinInfoList
+Key symbols: buildJoinRelRestrictList, isOuterJoinFilterClause,
+  dedupRestrictInfoPtrs
 
 Hypothesis/Findings:
-  - joinIsLegal: PG joinrels.c:350 port, LJO arm only. Checks every
-    SpecialJoinInfo entry: RHS overlap fast-path, subset-in-RHS skip,
-    already-contained skip, LHS⊆rel1+RHS⊆rel2→match, both-overlap-RHS
-    commutation, LEFT association into RHS with must_be_leftjoin post-scan.
-    Returns (sjinfo, reversed, nil) for special joins, (nil, false, nil)
-    for plain inner joins, error for illegal pairs.
-  - joinOrderRestricted: PG joinrels.c:1066 port, LJO/FULL arms. Checks
-    if pair forms SJ, or both overlap RHS, or both overlap LHS. Skip FULL.
-    Post-filters on hasRelevantJoinClause per PG.
-  - hasJoinRestriction: PG joinrels.c:1178 port. Detects rel-SJ overlap
-    beyond containment.
-  - With pin in place (03 §4.4), all searched rels are inner-joinable, so
-    joinInfoList entries reference pinned outer-join items not in the search
-    → all three functions return zero-effect results. Verified: SPOT
-    Q12=2/Q13=35, DS05 95/95 zero row/checksum/plan-shape deltas.
+  - buildJoinRelRestrictList: wraps clausesFor + admits nullable-side filter
+    clauses for outer joins (LEFT/FULL/RIGHT). Dedup by pointer equality.
+  - makeJoinRel now captures sjinfo from joinIsLegal and uses it for
+    restrictlist construction. If reversed, swaps rel1/rel2 per PG.
+  - FULL arm of join_is_legal already correct: FULL matches via LHS/RHS
+    branches, is rejected for RHS association (else→error), cannot commute.
+    Added explicit tests for reversed orientation, RHS building, nested FULL.
+  - LhsStrict remains unpopulated (pre-existing P1.2 gap) — the mustBeLeftJoin
+    arm of joinIsLegal can never succeed. This is a known gap.
+  - addPathsToJoinrel still produces only INNER paths — path-level join type
+    plumbing is deferred to when the pin relaxes. Not a regression.
+  - Pin still holds: SPOT Q12=2/Q13=35, DS05 95/95 zero row/checksum/plan-shape
+    deltas. No behavioral change — the infrastructure is ready for pin removal.
 
-Next step: M0128-P1.3 (FULL joins + outer-join clause distribution, 03 §6)
+Next step: M0128-P1.4 (semi/anti in-DP, 07 §5) OR M0128-P1.5 (COLLAPSE verdict,
+09 §3.19) — consult the Current Priority banner.
 
-Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/95, zero
-  deltas), pgbench smoke PASS, make ralph-state-guard REPAIRED+OK.
+Gates run: UNITS PASS, SMOKE PASS (13038 tps), SPOT PASS (Q12=2/Q13=35),
+  DS05 PASS (95/95, zero deltas, 99/99 plan-shape identical),
+  make ralph-state-guard REPAIRED+OK.
 
 In-flight: none
