@@ -820,21 +820,17 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       background child answers `kill -0` while a zombie). Escalations are reported
       via `progress`, so this can never present as silence again. Guarded by
       `ci/batch/lib/test_stop_ladder.sh` (5 rungs + dump capture, ~50s, no build).
-- [ ] **goopg graceful shutdown hangs forever on a backend that outlives its client**
-      — the engine defect underneath the wedge above; the ladder bounds the COST,
-      not the CAUSE. `startClientEOFWatch` (`internal/server/eof_watch.go:113`)
-      logged `client connection lost mid-query; cancelling statement` for backend
-      `pid=40` and called `cancel()`; the backend never finished. `cl.OnStop`
-      (`internal/server/server.go:602`) checkpointed, called `runCancel()` and
-      drained the accept loop, but has **no deadline and no force-terminate step**,
-      so one unresponsive backend hangs the process indefinitely. PG diverges:
-      `pg_ctl stop -m fast` SIGTERMs every backend and `ProcessInterrupts` acts at
-      the next `CHECK_FOR_INTERRUPTS()`. The blocking site is NOT established — the
-      server was idle (0.4% CPU, 23 threads sleeping), so blocked, not spinning.
-      **Get the stack before theorising**: the next occurrence now auto-saves
-      `<stage>/server-goroutines.txt`; to force one, run TPC-H Q13 at SF=1 under a
-      1200s cap and kill the psql client. Ledger row 2026-07-29 (root-0037); same
-      family as root-0029's still-open orphaned-backend row, narrowed to one pid.
+- [x] **goopg graceful shutdown hangs forever on a backend that outlives its client**
+      — **FIXED 2026-08-08.** `Config.ShutdownDeadline` (default 120 s graceful,
+      0 s for STOPIMMEDIATE) bounds `Run()`'s `connWG.Wait()` after the accept loop
+      exits. On timeout, all goroutine stacks are dumped to
+      `<DataDir>/shutdown_goroutines.txt` before returning. The harness-side ladder
+      (`stop_goopg_server`) is belt-and-suspenders: if the server's own deadline
+      expires first, the process exits; if it somehow doesn't, the ladder's
+      `sigterm`/`sigkill` rungs catch the rest. See
+      `docs/design/root-0037-nightly-server-shutdown-ladder.md` (updated).
+      Ledger row 2026-07-29 (root-0037) discharged.
+      Original filing preserved below for historical record.
 
 - [x] **TestPort_IsolationPreparedTransactions** — testport spec FAILed in
       nightly run 20260719-094219 (AI-20260719-094219-001; repro:
@@ -1730,6 +1726,25 @@ one clean night is not a fix — but do not re-file them per night.
       (2026-08-08 isolated repro, 22.11s). Sixth consecutive nightly failure
       was a flake; the test passes deterministically in isolation. If it
       re-occurs in a future nightly, re-open with the new AI-id.
+      **↳ REOPENED: the next nightly (`20260808-005620` at sha `d33ba423`) DID
+      re-occur — AI-20260808-005620-001, confirming the earlier "stale" verdict
+      was wrong.** See the new task directly below.
+- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (AI-20260808-005620-001,
+      seventh nightly failure)** — FAILed at nightly sha `d33ba423` despite passing
+      in isolation at the same HEAD (21.8s; verified 2026-08-08).
+      Diff starts at L970: `lockwithvalues` did NOT block (expected
+      `" <waiting ...>"`, got `""`) and returned 0 rows instead of waiting.
+      The P5.9 flip (GOOPG_PGSHAPED_DP=1) should be active in the nightly
+      (it defaults ON since `b92582fb`), and the legacy-enumerator-only
+      multiHashJoinOp/fusedHashJoinOp nodes that root-0038 blamed are now
+      deleted (M0127-P6.1/P6.2). So this is a NEW mechanism — the FOR UPDATE
+      lock is silently dropped through a path that still exists under the
+      DP enumerator, and the drop manifests as "0 rows returned, no block"
+      (not stale-data as in earlier signatures). The test passes in isolation
+      but fails in the full-suite context → order-dependent trigger still
+      unidentified. Evidence: `ci/logs/20260808-005620/testport/go-test.log`
+      L13451-13514. Repro: full `go test ./internal/testport/` (NOT isolated
+      -run — the isolated run passes). PARKED per banner.
 
 - [ ] **tpcds/Q95-timeout (AI-20260808-005620-002)** — Q95 hit its per-query
       budget (57014/cancel) in the nightly TPC-DS lane; first-seen 20260808.

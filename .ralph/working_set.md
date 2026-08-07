@@ -1,24 +1,26 @@
-Task: M-NIGHTLY — nightly DISCARDS every regress diff (infrastructure fix)
+Task: M-NIGHTLY — graceful shutdown hang: server-side deadline (engine fix)
 
 Files:
-  - ci/batch/stages/stage-testport.sh: export GOOPG_REGRESS_DIFF_DIR + mkdir
+  - internal/server/server.go: Config.ShutdownDeadline field, Server.shutdownDeadline,
+    timed connWG.Wait() in Run(), OnStop/OnStopImmediate set deadline
+  - docs/design/root-0037-nightly-server-shutdown-ladder.md: updated "not fixed" → "NOW FIXED"
+  - .ralph/fix_plan.md: marked graceful-shutdown task [x], filed EvalPlanQual REOPENED
 
-Key symbols: GOOPG_REGRESS_DIFF_DIR, internal/testport/framework/regress.go
+Key symbols: Config.ShutdownDeadline, Server.shutdownDeadline, Run(), OnStop, OnStopImmediate
 
 Hypothesis/Findings:
-  - The regress framework already writes per-case diff files when
-    GOOPG_REGRESS_DIFF_DIR is set. The gap was purely that the nightly stage
-    never exported it. One-line fix: create the dir and export the env var.
-  - The full set of milestone priorities M0124→M0125→M0127→M0128 are all
-    CLOSED. M-NIGHTLY is now un-parked and selectable.
-  - Two new nightly items (AI-20260808-005620-001 EvalPlanQual, -002 Q95-timeout)
-    were already filed in fix_plan.md by the nightly system.
+  - OnStop had no deadline — one stuck backend hung the process indefinitely.
+  - Fix: Config.ShutdownDeadline (default 120s) bounds connWG.Wait() in Run().
+  - On timeout, dumps goroutine stacks to <DataDir>/shutdown_goroutines.txt.
+  - Immediate shutdown uses 0 deadline (no wait). Zero = backward compat.
+  - Backward compat: embedded test servers (DataDir="") never start control plane,
+    so shutdownDeadline stays 0 → unbounded wait (old behaviour).
 
-Next step: Continue with M-NIGHTLY or M0123-S4. Highest-impact remaining
-  unchecked M-NIGHTLY items: graceful-shutdown hang, regress/suite-wedge,
-  regress output-normalization groups. M0123-S4 sub-slice 39 (timetz(N))
-  is a well-understood follow-on from sub-slice 38.
+Next step: Continue M-NIGHTLY — next highest-impact unchecked items:
+  suite-wedge (line 1569 — likely stale after root-0040), EvalPlanQual REOPENED
+  (order-dependent, passes in isolation), or regress output-normalization.
 
-Gates run: ralph-state-guard OK (auto-repaired progress inconsistency)
+Gates run: server pkg tests PASS, build ./... PASS, pre-commit units PASS,
+  ralph-state-guard OK (auto-repaired)
 
 In-flight: none
