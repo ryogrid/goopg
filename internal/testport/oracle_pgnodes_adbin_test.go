@@ -47,6 +47,35 @@ import (
 // type into PG's atttypmod for ResolveForColumnTypmod, mirroring what the executor
 // writer derives from catalog.Type.Args. Any non-numeric or unqualified column type
 // returns -1 (no length qualifier), matching the writer's bare-column path.
+// colSQLTypmod packs the length qualifier of a typed column SQL into PG's
+// atttypmod for ResolveForColumnTypmod, mirroring what the executor writer derives
+// from catalog.Type.Name + Type.Args. Any non-length-qualified or unmodeled type
+// returns -1 (no length qualifier).
+func colSQLTypmod(colSQL string) int32 {
+	s := strings.TrimSpace(colSQL)
+	if len(s) == 0 {
+		return -1
+	}
+	// Split type name from parenthesized args.
+	paren := strings.IndexByte(s, '(')
+	if paren < 0 || !strings.HasSuffix(s, ")") {
+		return -1
+	}
+	typeName := s[:paren]
+	inner := s[paren+1 : len(s)-1]
+	parts := strings.Split(inner, ",")
+	args := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil {
+			return -1
+		}
+		args = append(args, n)
+	}
+	return pgnodes.ColumnTypmod(typeName, args)
+}
+
+// numericColSQLTypmod is retained for backward-compat readability in the test body.
 func numericColSQLTypmod(colSQL string) int32 {
 	s := strings.TrimSpace(colSQL)
 	if !strings.HasPrefix(s, "numeric(") || !strings.HasSuffix(s, ")") {
@@ -271,6 +300,16 @@ var adbinOracleCases = []adbinOracleCase{
 	{"str_cast_float4", "float4", pgnodes.OidFloat4, "'5'::float4"},
 	{"str_cast_float4_decimal", "float4", pgnodes.OidFloat4, "'5.5'::float4"},
 	{"str_cast_float4_neg", "float4", pgnodes.OidFloat4, "'-2.5'::float4"},
+	// Sub-slice 34: a string literal in a varchar(N)/bpchar(N) column context
+	// folds to a varchar/bpchar Const (consttypmod -1), then coerce_type_typmod
+	// wraps it in an IMPLICIT varchar/bpchar(varchar/bpchar,int4,bool) FuncExpr
+	// (funcformat 2) carrying the packed column typmod (maxlen + VARHDRSZ).
+	{"varchar10_hello", "varchar(10)", pgnodes.OidVarchar, "'hello'"},
+	{"varchar20_world", "varchar(20)", pgnodes.OidVarchar, "'world'"},
+	{"varchar5_empty", "varchar(5)", pgnodes.OidVarchar, "''"},
+	{"bpchar5_abc", "char(5)", pgnodes.OidBpchar, "'abc'"},
+	{"bpchar10_xyz", "character(10)", pgnodes.OidBpchar, "'xyz'"},
+	{"bpchar3_empty", "bpchar(3)", pgnodes.OidBpchar, "''"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
@@ -318,7 +357,7 @@ func TestOraclePgnodesAdbinBytesMatchPG(t *testing.T) {
 			if err != nil {
 				t.Fatalf("goopg parser.ParseExpr(%q): %v", tc.def, err)
 			}
-			node, ok := pgnodes.ResolveForColumnTypmod(expr, tc.colOid, numericColSQLTypmod(tc.colSQL))
+			node, ok := pgnodes.ResolveForColumnTypmod(expr, tc.colOid, colSQLTypmod(tc.colSQL))
 			if !ok {
 				t.Fatalf("goopg ResolveForColumn(%q, oid=%d) degraded to SQL text, but PG18 stored a canonical adbin:\n  PG18: %s",
 					tc.def, tc.colOid, want)

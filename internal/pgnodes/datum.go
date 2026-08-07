@@ -19,6 +19,8 @@ const (
 	OidFloat4      = 700
 	OidFloat8      = 701
 	OidNumeric     = 1700
+	OidVarchar     = 1043
+	OidBpchar      = 1042
 	OidDate        = 1082
 	OidTimestamptz = 1184
 )
@@ -380,6 +382,26 @@ func newNullConst(oid uint32, constlen int32, constbyval bool) *Const {
 func NewTextConst(s string) *Const {
 	return &Const{
 		ConstType: OidText, ConstTypmod: -1, ConstCollid: DefaultCollationOid,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: textVarlena(s),
+	}
+}
+
+// NewVarcharConst builds a Const for a varchar literal (unknown→varchar fold at
+// parse time). The on-disk varlena is byte-identical to text — only the consttype
+// (1043) and constcollid differ.
+func NewVarcharConst(s string) *Const {
+	return &Const{
+		ConstType: OidVarchar, ConstTypmod: -1, ConstCollid: DefaultCollationOid,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: textVarlena(s),
+	}
+}
+
+// NewBpcharConst builds a Const for a bpchar (char(N)) literal.
+func NewBpcharConst(s string) *Const {
+	return &Const{
+		ConstType: OidBpchar, ConstTypmod: -1, ConstCollid: DefaultCollationOid,
 		ConstLen: -1, ConstByval: false, Location: -1,
 		Datum: textVarlena(s),
 	}

@@ -1731,5 +1731,13 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   (implicit length coercion), sub-slice 24 the bare `numeric` column DEFAULT (implicit
   `relabelformat` 2), and sub-slice 25 the explicit `(inner)::numeric` re-cast
   (`relabelformat` 1). Still deferred: typmod-qualified casts to the **other** length
-  types (`varchar(N)` = `CoerceViaIO`, `timestamp(N)`, `bit(N)`), and non-int/numeric
+  types (`timestamp(N)`, `bit(N)`/`varbit(N)`, `time(N)`); `varchar(N)` and
+  `bpchar(N)` length coercion are NOW CANONICAL (sub-slice 34). The CoerceViaIO
+  hypothesis was refuted: PG uses the same COERCION_PATH_FUNC approach as numeric —
+  `varchar(varchar,int4,bool)` (funcid 669) / `bpchar(bpchar,int4,bool)` (funcid
+  668), both implicit (funcformat 2), wrapping an inner varchar/bpchar Const folded
+  at parse time from the unknown-type string literal. The rebuild path unwraps the
+  implicit FuncExpr invisibly (like pg_get_expr) and the inner Const rebuilds to
+  a StringConst → fixed point. All 6 live PG18.3 oracle cases byte-identical.
+  Still deferred: non-int/numeric
   sources into `numeric(p,s)` (`int2`, the binary floats).

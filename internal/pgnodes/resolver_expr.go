@@ -96,22 +96,25 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 	if err != nil || typ != targetType {
 		return nil, false
 	}
-	if targetType == OidNumeric {
+	switch {
+	case targetType == OidNumeric:
 		exprTypmod := numericNodeTypmod(n)
 		if targetTypmod >= 0 {
-			// The column has a length qualifier: coerce_type_typmod adds an implicit
-			// numeric() length coercion whenever the stored typmod differs from it.
 			if exprTypmod != targetTypmod {
 				n = wrapNumericLengthCoercion(n, targetTypmod)
 			}
 			return n, true
 		}
-		// Bare numeric column: an explicit `::numeric(p,s)` cast (exprTypmod >= 0) is
-		// re-labelled back to typmod -1 via an IMPLICIT RelabelType (coerce_type_typmod:
-		// target typmod -1 ⇒ the length coercion is a no-op, so PG emits a RelabelType,
-		// not a numeric() call). A default already at typmod -1 needs no relabel.
 		if exprTypmod >= 0 {
-			n = wrapNumericRelabelToBare(n, 2) // COERCE_IMPLICIT_CAST
+			n = wrapNumericRelabelToBare(n, 2)
+		}
+	case targetType == OidVarchar:
+		if targetTypmod >= 0 {
+			n = wrapVarcharLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidBpchar:
+		if targetTypmod >= 0 {
+			n = wrapBpcharLengthCoercion(n, targetTypmod)
 		}
 	}
 	return n, true
@@ -192,6 +195,62 @@ func NumericColumnTypmod(args []int64) int32 {
 		return tm
 	}
 	return -1
+}
+
+// ColumnTypmod packs column type arguments into PG's atttypmod for the modeled
+// length-coercion types, or returns -1 when the column carries no length qualifier.
+// The writer passes this to ResolveForColumnTypmod so a DEFAULT is emitted
+// canonically only when the column typmod matches.
+func ColumnTypmod(typeName string, args []int64) int32 {
+	switch typeName {
+	case "numeric", "decimal":
+		return NumericColumnTypmod(args)
+	case "varchar", "character varying", "char", "character", "bpchar":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = maxlen + VARHDRSZ (4). Goes directly into the
+			// varchar/bpchar(..., int4 typmod, ...) coercion FuncExpr.
+			return int32(args[0]) + 4
+		}
+		return -1
+	default:
+		return -1
+	}
+}
+
+// wrapVarcharLengthCoercion wraps n in an IMPLICIT varchar(varchar,int4,bool) FuncExpr
+// (funcid 669, funcformat 2), the coerce_type_typmod length coercion PG applies when a
+// varchar column's typmod differs from the stored default's. The inner varchar Const
+// carries typmod -1; the outer FuncExpr carries the column's packed typmod (maxlen+4) as
+// arg 2 and isExplicit=false as arg 3. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapVarcharLengthCoercion(n Node, packedTypmod int32) Node {
+	return &FuncExpr{
+		Funcid:         669, // varchar(varchar,int4,bool)
+		Funcresulttype: OidVarchar,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     DefaultCollationOid,
+		Inputcollid:    DefaultCollationOid,
+		Args:           []Node{n, NewInt4Const(packedTypmod), NewBoolConst(false)},
+		Location:       -1,
+	}
+}
+
+// wrapBpcharLengthCoercion wraps n in an IMPLICIT bpchar(bpchar,int4,bool) FuncExpr
+// (funcid 668, funcformat 2). Same pattern as varchar but with OID 1042.
+func wrapBpcharLengthCoercion(n Node, packedTypmod int32) Node {
+	return &FuncExpr{
+		Funcid:         668, // bpchar(bpchar,int4,bool)
+		Funcresulttype: OidBpchar,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     DefaultCollationOid,
+		Inputcollid:    DefaultCollationOid,
+		Args:           []Node{n, NewInt4Const(packedTypmod), NewBoolConst(false)},
+		Location:       -1,
+	}
 }
 
 // resolve returns the IR node AND its result type OID (needed to forward-resolve
@@ -387,6 +446,12 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 		if usec, ok := parseTimestamptzMicros(s); ok {
 			return NewTimestamptzConst(usec), OidTimestamptz, true
 		}
+	case OidVarchar:
+		// unknown→varchar fold: same varlena as text, different consttype (1043).
+		return NewVarcharConst(s), OidVarchar, true
+	case OidBpchar:
+		// unknown→bpchar fold.
+		return NewBpcharConst(s), OidBpchar, true
 	}
 	return nil, 0, false
 }

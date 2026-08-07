@@ -246,7 +246,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) ||
 		isImplicitIntToInt2Cast(f) ||
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) || isImplicitToFloat4Cast(f) ||
-		isImplicitNumericLengthCoercion(f) {
+		isImplicitNumericLengthCoercion(f) ||
+			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
 	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
@@ -368,6 +369,32 @@ func numericTypmodCastPS(f *FuncExpr) (p, s int64, ok bool) {
 // funcid 1703) that numericCastPackedTypmod/numericTypmodCastPS rebuild to a CastExpr.
 func isImplicitNumericLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 1703 || f.Funcformat != 2 || f.Funcresulttype != OidNumeric || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitVarcharLengthCoercion reports whether f is the IMPLICIT varchar length
+// coercion coerce_type_typmod adds when a varchar(N) column has a length qualifier
+// (see wrapVarcharLengthCoercion): varchar(varchar,int4,bool) = funcid 669,
+// funcformat 2 (IMPLICIT), a varchar result, and three args whose second is a non-null
+// int4 typmod Const and third a bool isExplicit Const. pg_get_expr renders the implicit
+// form invisibly, so rebuild unwraps to Args[0]; a re-resolve through
+// ResolveForColumnTypmod re-wraps the identical node (fixed point).
+func isImplicitVarcharLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 669 || f.Funcformat != 2 || f.Funcresulttype != OidVarchar || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitBpcharLengthCoercion reports whether f is the IMPLICIT bpchar length
+// coercion (see wrapBpcharLengthCoercion): bpchar(bpchar,int4,bool) = funcid 668,
+// funcformat 2.
+func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 668 || f.Funcformat != 2 || f.Funcresulttype != OidBpchar || len(f.Args) != 3 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)
@@ -567,7 +594,11 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 	case OidBool:
 		// The by-value word is 0 (false) or 1 (true); see datum.go:NewBoolConst.
 		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil
-	case OidText:
+	case OidText, OidVarchar, OidBpchar:
+		// text, varchar, and bpchar Consts share the same varlena wire format;
+		// rebuild to the verbatim string literal. A re-resolve in the column
+		// context re-folds through foldStringLiteralConst to the correct consttype
+		// (the fixed point).
 		return &parser.StringConst{Value: textFromVarlena(c.Datum)}, nil
 	case OidOid:
 		// An oid Const only arises from folding an unknown-type string literal

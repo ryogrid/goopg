@@ -12213,6 +12213,23 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       column's type. Every type foldStringLiteralConst supports (timestamptz, int2,
       numeric, date, bool, float4, float8, oid) now coerces in view WHERE clauses.
       5 new oracle ev_action goldens (v14–v18) byte-identical to PG18.3.
-      REMAINING: other length types (`varchar(N)`=CoerceViaIO, `timestamp(N)`,
-      `bit(N)`); broader date input forms (`infinity`, BC years,
+      SUB-SLICE 34 LANDED (2026-08-08): canonical **`varchar(N)` / `bpchar(N)`
+      length coercion**. A string literal in a `varchar(N)` / `bpchar(N)` column
+      context now folds to a varchar/bpchar Const (new OID constants 1043/1042,
+      NewVarcharConst/NewBpcharConst datum constructors), then coerce_type_typmod
+      wraps it in an IMPLICIT FuncExpr — `varchar(varchar,int4,bool)` (funcid 669,
+      funcformat 2) / `bpchar(bpchar,int4,bool)` (funcid 668, funcformat 2) —
+      with the packed column typmod (maxlen+VARHDRSZ) as arg 2 and isExplicit=false
+      as arg 3. PG uses COERCION_PATH_FUNC (NOT CoerceViaIO — the hypothesis in the
+      working set was refuted) — every typmod-capable type has a pg_cast self-cast
+      entry and applies the same FuncExpr pattern. The rebuild path unwraps the
+      implicit FuncExpr invisibly and rebuilds the inner varchar/bpchar Const to a
+      StringConst (fixed point). New general ColumnTypmod(typeName,args) replaces
+      NumericColumnTypmod in the writer. Gate `internal/pgnodes/varchar_lencoerce_test.go`
+      (6 live PG18.3 goldens byte-for-byte + codec/rebuild round-trip + bare-column
+      no-wrap guard + ColumnTypmod table) + oracle_pgnodes_adbin_test.go now **91
+      cases** all byte-identical vs LIVE PG18.3 (1.97s). Design 0123-0005
+      §"Deferred" updated.
+      REMAINING: other length types (`timestamp(N)`, `bit(N)`/`varbit(N)`,
+      `time(N)`); broader date input forms (`infinity`, BC years,
       DateStyle-dependent).
