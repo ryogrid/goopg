@@ -11003,6 +11003,41 @@ func isSupportedBTreeKeyType(name string) bool {
 		strings.ToLower(name) == "uuid"
 }
 
+// truncateTableEntry is the per-table state in execTruncate's BFS loop.
+type truncateTableEntry struct {
+	tbl  *catalog.Table
+	only bool
+}
+
+// sortedTruncateTableSet returns the entries of tableSet in deterministic order:
+// tables named in the original TRUNCATE statement first (in statement order),
+// then CASCADE-added tables sorted by lowercased name. This matches PG's
+// deterministic FK-violation error: PG processes relations in range-table order.
+func sortedTruncateTableSet(tableSet map[uint32]*truncateTableEntry, nameOrder map[string]int) []*truncateTableEntry {
+	entries := make([]*truncateTableEntry, 0, len(tableSet))
+	for _, e := range tableSet {
+		entries = append(entries, e)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		ni := strings.ToLower(entries[i].tbl.Name)
+		nj := strings.ToLower(entries[j].tbl.Name)
+		oi, oki := nameOrder[ni]
+		oj, okj := nameOrder[nj]
+		if oki && okj {
+			return oi < oj
+		}
+		if oki {
+			return true // named in statement → comes first
+		}
+		if okj {
+			return false
+		}
+		// Neither was in the original statement (CASCADE-added) — sort by name.
+		return ni < nj
+	})
+	return entries
+}
+
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "TRUNCATE requires Pool in Context"}
@@ -11010,11 +11045,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	im, hasIM := o.ctx.Catalog.(*catalog.InMemory)
 
 	// Build the initial set of tables (OID → table pointer).
-	type tableEntry struct {
-		tbl  *catalog.Table
-		only bool
-	}
-	tableSet := make(map[uint32]*tableEntry) // deduplicated by OID
+	tableSet := make(map[uint32]*truncateTableEntry) // deduplicated by OID
 	for i, name := range s.Names {
 		tbl, ok := o.ctx.Catalog.LookupTable(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
@@ -11022,7 +11053,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 		only := len(s.Only) > i && s.Only[i]
 		if _, exists := tableSet[tbl.OID]; !exists {
-			tableSet[tbl.OID] = &tableEntry{tbl: tbl, only: only}
+			tableSet[tbl.OID] = &truncateTableEntry{tbl: tbl, only: only}
 		}
 	}
 
@@ -11048,6 +11079,13 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 	}
 
+	// Build a lookup from lowercased name → position in s.Names so the
+	// deterministic sort preserves statement order (PG behaviour).
+	nameOrder := make(map[string]int, len(s.Names))
+	for i, n := range s.Names {
+		nameOrder[strings.ToLower(n.Name)] = i
+	}
+
 	// FK constraint check / CASCADE expansion.
 	// For each table in the set, find all tables (not in the set) that have an FK
 	// pointing to it. If behavior is CASCADE, expand the set and emit NOTICEs.
@@ -11057,7 +11095,10 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		// Process in a BFS loop because CASCADE expansion may introduce new referencing tables.
 		for {
 			expanded := false
-			for _, entry := range tableSet {
+			// sortedTruncateTableSet returns entries in deterministic order:
+			// statement order for originally-named tables, then by name.
+			entries := sortedTruncateTableSet(tableSet, nameOrder)
+			for _, entry := range entries {
 				tbl := entry.tbl
 				for _, other := range allTables {
 					if _, inSet := tableSet[other.OID]; inSet {
@@ -11088,7 +11129,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 						}
 						// other references tbl (or its partition parent) and is not in the truncation set.
 						if s.Behavior == parser.DropCascade {
-							tableSet[other.OID] = &tableEntry{tbl: other, only: false}
+							tableSet[other.OID] = &truncateTableEntry{tbl: other, only: false}
 							o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", other.Name))
 							expanded = true
 						} else {
@@ -11114,7 +11155,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if s.Behavior == parser.DropCascade {
 			for {
 				expanded := false
-				for _, entry := range tableSet {
+				for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 					// Exclude other-session temp inheritance children from CASCADE
 					// expansion (RELATION_IS_OTHER_TEMP). Design 0118-0036.
 					children := append(im.PartitionChildren(entry.tbl.OID),
@@ -11123,7 +11164,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 						if _, inSet := tableSet[child.OID]; inSet {
 							continue
 						}
-						tableSet[child.OID] = &tableEntry{tbl: child, only: false}
+						tableSet[child.OID] = &truncateTableEntry{tbl: child, only: false}
 						o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", child.Name))
 						expanded = true
 					}
@@ -11135,7 +11176,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 
 		// Also validate: TRUNCATE ONLY on a partitioned table is not allowed.
-		for _, entry := range tableSet {
+		for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 			if entry.only && len(entry.tbl.PartitionKey) > 0 {
 				return &ExecError{
 					Code:    "0A000",
@@ -11157,21 +11198,21 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// TRUNCATE issued while another session holds the table open blocks until
 	// that session commits (truncate-conflict's granted permutations — design
 	// 0118-0039). Both via acquireRelLockMaybeTransient. M0118-0008.
-	for _, entry := range tableSet {
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
 			return err
 		}
 	}
 
 	// Fire BEFORE TRUNCATE FOR EACH STATEMENT triggers on all tables.
-	for _, entry := range tableSet {
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		if err := fireStatementTriggers(o.ctx, entry.tbl, "before", "truncate"); err != nil {
 			return err
 		}
 	}
 
 	// Truncate all tables (and their partition children unless ONLY).
-	for _, entry := range tableSet {
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		if err := o.truncateTableAndPartitions(entry.tbl, s.Pos(), entry.only); err != nil {
 			return err
 		}
@@ -11181,7 +11222,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// counts and resets the in-transaction insert/update/delete counters
 	// (pgstat_count_truncate). Recorded after the physical truncate succeeds.
 	// M0118-0009 (`stats`, rung 7; design 0118-0131).
-	for _, entry := range tableSet {
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		recordRelTruncate(o.ctx, entry.tbl.OID)
 	}
 
@@ -11190,7 +11231,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		sess, isBas := o.ctx.Session.(*BasicSession)
 		inExplicitTx := isBas && sess.InExplicitTransaction()
 		seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-		for _, entry := range tableSet {
+		for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 			tbl := entry.tbl
 			for _, col := range tbl.Columns {
 				if col.Dropped {
@@ -11223,7 +11264,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	}
 
 	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.
-	for _, entry := range tableSet {
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		if err := fireStatementTriggers(o.ctx, entry.tbl, "after", "truncate"); err != nil {
 			return err
 		}

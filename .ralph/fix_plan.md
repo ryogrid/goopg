@@ -1513,32 +1513,16 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       (Q12=2, Q13=35). Design
       **docs/design/root-0041-partial-index-predicate-guard.md**; 3 ledger
       rows. Evidence `analysis/m0127-s7-regress/order-dep-20260807/`.
-- [ ] **regress/truncate is NONDETERMINISTIC — it will make a nightly `fail`
-      at random** (AI-20260807-004620-001; filed 2026-08-07; found while diffing the before/after
-      regress divergence sets for the partial-index fix, and independent of
-      it). Measured: **1 of 3 identical standalone runs diverged**, emitting
-      `DETAIL: Table "trunc_b" references "truncate_a"` where `trunc_d`/
-      `trunc_c` was expected — the FK-dependency `DETAIL:`/`HINT:` lines come
-      out in a varying order, the signature of Go map iteration over the
-      dependency set. PG emits them deterministically. Repro (may need several
-      attempts): `GOOPG_REGRESS_DIFF_DIR=/tmp/x go test -count=1 -run
-      'TestPort_RegressSuite/truncate$' ./internal/testport/`. Resume point:
-      the TRUNCATE FK-dependency walk that builds the `references` message
-      lists (`internal/executor`), sorted the way PG's dependency scan orders
-      them. Ledger row 2026-08-07. **This is a live threat to the S7 gate** —
-      a clean cycle can be spoiled by chance — so it is a carve-out candidate
-      the moment it costs a nightly.
-      **↳ IT FIRED, one run later.** Nightly `20260807-004620` passed every
-      stage and came back `status: fail` on this case **alone** (item
-      `AI-20260807-004620-001`, "first-seen: 20260807 (new tonight)") — the
-      pre-registration above is what let the S7 gate be discharged on it
-      instead of losing a twelfth loop to re-triage. Re-verified that run: it
-      is a `SKIP`, it PASSES standalone here (with `GOOPG_REGRESS_DIFF_DIR`
-      set, zero diffs written), and the divergence is the same single
-      substituted FK pair. **The carve-out trigger has therefore been met** —
-      every future nightly is one coin-flip away from an unexplainable `fail`,
-      and the fix is a sort in one dependency walk. Take it as the next
-      M-NIGHTLY item unless S7 deletion work outranks it.
+- [x] **regress/truncate is NONDETERMINISTIC — FIXED 2026-08-08
+      (AI-20260807-004620-001).** Root cause: `for _, entry := range tableSet`
+      iterated over a Go map — when multiple tables in the set each had FK
+      references from outside, which error fired first depended on map
+      iteration order. Fix: `sortedTruncateTableSet` sorts entries in
+      statement order (PG's range-table order), then CASCADE-added tables
+      by name; replaces ALL nine `range tableSet` sites so the FK check,
+      CASCADE expansion, validation, locks, triggers, truncation, stats,
+      and sequence-restart loops are all deterministic. 20/20 regress
+      truncate passes (identical runs). Ledger row was 2026-08-07.
 - [ ] **The nightly DISCARDS every regress diff, so a divergence arrives
       unactionable** (filed 2026-08-07). `GOOPG_REGRESS_DIFF_DIR` already
       exists (`internal/testport/framework/regress.go` writes
