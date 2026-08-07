@@ -1523,8 +1523,14 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       CASCADE expansion, validation, locks, triggers, truncation, stats,
       and sequence-restart loops are all deterministic. 20/20 regress
       truncate passes (identical runs). Ledger row was 2026-08-07.
-- [ ] **The nightly DISCARDS every regress diff, so a divergence arrives
-      unactionable** (filed 2026-08-07). `GOOPG_REGRESS_DIFF_DIR` already
+- [x] **The nightly DISCARDS every regress diff, so a divergence arrives
+      unactionable** — **DONE 2026-08-08.** `ci/batch/stages/stage-testport.sh`
+      now creates `${RUN_DIR}/testport/regress-diffs/` and exports
+      `GOOPG_REGRESS_DIFF_DIR` before the `go test` invocation. The regress
+      framework already writes `<case>_{expected,actual,raw}.txt` per
+      divergence when the env var is set; the gap was purely that the nightly
+      stage never set it. Next nightly run will populate the directory for
+      every `output mismatch` case. (filed 2026-08-07). `GOOPG_REGRESS_DIFF_DIR` already
       exists (`internal/testport/framework/regress.go` writes
       `<case>_{expected,actual,raw}.txt`), but no nightly stage sets it, so
       `ci/logs/action-items.md` carries only "output mismatch; normalization

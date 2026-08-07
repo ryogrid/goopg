@@ -7,10 +7,13 @@ set -uo pipefail
 source "${REPO_ROOT}/ci/batch/lib/common.sh"
 
 mkdir -p "${RUN_DIR}/testport"
+REGRESS_DIFF_DIR="${RUN_DIR}/testport/regress-diffs"
+mkdir -p "${REGRESS_DIFF_DIR}"
 progress "S1.H" "testport start (unit=goopg-nightly-testport high=6G max=8G timeout=120m)"
 
 rc=0
 ( cd "${REPO_ROOT}" && \
+  GOOPG_REGRESS_DIFF_DIR="${REGRESS_DIFF_DIR}" \
   GOOPG_CG_UNIT=goopg-nightly-testport GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
   GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \
       "${REPO_ROOT}/scripts/goopg-test-run.sh" \

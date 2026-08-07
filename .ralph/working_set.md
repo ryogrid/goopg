@@ -1,31 +1,24 @@
-Task: M0123-S4 SUB-SLICE 36 LANDED — bit(N)/varbit(N) length coercion
+Task: M-NIGHTLY — nightly DISCARDS every regress diff (infrastructure fix)
 
 Files:
-  - internal/pgnodes/datum.go: added OidBit(1560), OidVarBit(1562), bitVarlena, parseBitFromString, formatBit, bitLenFromVarlena, bitDataFromVarlena, NewBitConst, NewVarBitConst
-  - internal/pgnodes/resolver_expr.go: foldStringLiteralConst OidBit/OidVarBit cases, wrapBitLengthCoercion(1685), wrapVarBitLengthCoercion(1687), ResolveForColumnTypmod OidBit/OidVarBit cases, ColumnTypmod bit/varbit types
-  - internal/pgnodes/rebuild.go: isImplicitBitLengthCoercion, isImplicitVarBitLengthCoercion, OidBit/OidVarBit Const rebuild cases, implicit cast check in rebuildFuncExprWith
-  - internal/pgnodes/bit_lencoerce_test.go: NEW — 5 live PG18.3 goldens + structure + rebuild round-trip + varbit no-typmod + parse/format round-trip + ColumnTypmod
-  - internal/testport/oracle_pgnodes_adbin_test.go: 6 new bit/varbit cases (102 total)
+  - ci/batch/stages/stage-testport.sh: export GOOPG_REGRESS_DIFF_DIR + mkdir
 
-Key symbols: OidBit(1560), OidVarBit(1562), NewBitConst, NewVarBitConst,
-  parseBitFromString, formatBit, bitVarlena, wrapBitLengthCoercion(1685),
-  wrapVarBitLengthCoercion(1687), isImplicitBitLengthCoercion
+Key symbols: GOOPG_REGRESS_DIFF_DIR, internal/testport/framework/regress.go
 
 Hypothesis/Findings:
-  - SUB-SLICE 36 LANDED: bit(N)/varbit(N) length coercion.
-  - Uses same COERCION_PATH_FUNC pattern as varchar/bpchar/timestamp — pg_cast.dat
-    has bit→bit (funcid 1685) and varbit→varbit (funcid 1687) self-casts.
-  - PG uses funcformat 2 (COERCE_IMPLICIT_CAST) for bare literals (no ::bit cast).
-  - Unlike timestamp which has 2 args, bit/varbit coercion has 3 args (including
-    bool isExplicit as third arg — false for implicit).
-  - Varbit WITHOUT length qualifier stores bare Const (no coercion needed).
-  - Broken $1Serana replace_content from previous loop's WIP was discarded and
-    rebuild.go changes were re-applied cleanly with built-in Edit tool.
+  - The regress framework already writes per-case diff files when
+    GOOPG_REGRESS_DIFF_DIR is set. The gap was purely that the nightly stage
+    never exported it. One-line fix: create the dir and export the env var.
+  - The full set of milestone priorities M0124→M0125→M0127→M0128 are all
+    CLOSED. M-NIGHTLY is now un-parked and selectable.
+  - Two new nightly items (AI-20260808-005620-001 EvalPlanQual, -002 Q95-timeout)
+    were already filed in fix_plan.md by the nightly system.
 
-Next step: Add time(N) or timestamptz(N) length coercion. Or continue with any
-  remaining datum types from the REMAINING list.
+Next step: Continue with M-NIGHTLY or M0123-S4. Highest-impact remaining
+  unchecked M-NIGHTLY items: graceful-shutdown hang, regress/suite-wedge,
+  regress output-normalization groups. M0123-S4 sub-slice 39 (timetz(N))
+  is a well-understood follow-on from sub-slice 38.
 
-Gates run: UNITS PASS (0.031s), ORACLE PASS (102/102 including 6 new bit/varbit
-  vs live PG18.3, 2.09s), initdb build PASS
+Gates run: ralph-state-guard OK (auto-repaired progress inconsistency)
 
 In-flight: none
