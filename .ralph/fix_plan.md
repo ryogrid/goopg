@@ -1552,24 +1552,20 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       `go test` call and cite it in the item's `evidence:` field. Same
       "capture your own evidence" gap the wedge probe (`b0b4dc61`) closed for
       hangs, still open for divergences. Ledger row 2026-08-07.
-- [ ] **`pageHasSpaceFor` and `insertItemSorted` disagree about what fits on a
-      btree page.** NEW 2026-08-06 (found as the trigger of the wedge above,
-      from a real regress-suite server log, not filed by a nightly).
-      `insertIntoBlock` tests `pageHasSpaceFor(slot.Page(), it)`, takes the
-      no-split branch, and `insertItemSorted` then PANICS `storage: not enough
-      free space in page` (`internal/access/btree/btree.go:2854`). Two
-      independent space computations that must agree and do not — Hard-won Rule
-      #2 in its sibling-paths form. PostgreSQL has no such split brain:
-      `_bt_findinsertloc`/`PageAddItem` share `PageGetFreeSpace` accounting, and
-      an overflow is a split decision, never an elog. Repro shape: an `UPDATE`
-      maintaining a unique index (`maintainUniqueIndexesForInsert`) against a
-      nearly-full leaf. Suspects: line-pointer slot cost, `MAXALIGN`, and the
-      posting-list/dedup case. Fix direction: make the writer's own budget check
-      the single source of truth and route an overflow to the split path instead
-      of panicking. Ledger row 2026-08-06. **Severity note:** since the fix
-      above, this is one failed statement (loud, with its original stack)
-      rather than a wedged cluster — so it is a correctness task, not a gate
-      blocker.
+- [x] **`pageHasSpaceFor` and `insertItemSorted` disagree about what fits on a
+      btree page.** FIXED 2026-08-08. **Root cause:** the page-space budget was
+      computed from TWO independent expressions — `pageHasSpaceFor` used
+      `itemIDSize + itemPrefixSize + len(it.key)` and `compactRawSize` had its
+      own copy `itemIDSize + 8 + len(it.key)`, while `PageInsertItemRawAt`
+      implicitly agreed with `len(it.marshal())`. A single `itemEncodedSize(it)`
+      function now serves all three sites (single source of truth). **Defense:**
+      `insertItemSorted` returns `(int, error)` instead of panicking on
+      `ErrNoSpaceInPage`; `mustInsertItemSorted` panics for safe callers;
+      `tryInsertNoSplit`, `tryInsertOnCachedRightmost`, and `insertIntoBlock`'s
+      no-split branch route the error to the split path instead of panicking.
+      The original panic site (`btree.go:2854`) no longer panics on space errors.
+      Gates: btree tests PASS, pre-commit units PASS (42/42).
+      Ledger row 2026-08-06 root-0040 flipped to resolved.
 - [x] **`pg_stat_activity` emits an EMPTY `pid` for internal sessions, so no Go
       driver can read the view at all.** RESOLVED 2026-08-08. `numericPIDOrNull`
       was returning `""` for empty/non-numeric PIDs; `TypedVirtualCell` can't
