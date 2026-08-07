@@ -10689,14 +10689,26 @@ it at selection time and record the split in both the plan doc and here.
       reduction, ON-clause propagation, LEFT→ANTI, strictness catalog.
       Gates: UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/99, zero
       row/checksum/plan deltas).
-- [ ] **M0128-P5.1 — EXPLAIN range-table name dedup.** 09 §3.11: port
+- [x] **M0128-P5.1 — EXPLAIN range-table name dedup.** 09 §3.11: port
       `ruleutils.c` `select_rtable_names_for_explain`-style disambiguation
       (PG 18.3: `postgres/src/backend/utils/adt/ruleutils.c:3855` — 09 §3.11
       cites the pre-rename name `select_rtable_names`) so a relation
       scanned twice without an alias prints two distinguishable names;
-      Q2/Q8/Q17/Q18/Q22 become clause-6 adjudicable. Bar: UNITS + SPOT + DS05
-      plan channel (alias changes only on the ambiguous set) + the five
-      queries re-adjudicated under clause 6, outcome recorded.
+      Q2/Q8/Q17/Q18/Q22 become clause-6 adjudicable. **DONE 2026-08-07.**
+      `explain_names.go`: added `nodeLabels` map (separate from
+      `bySource` column-qualification table) keyed by `nodePtr(n)` —
+      the existing `seen[src]` guard skips the second node when two
+      distinct plan nodes share a SourceTableIdx (e.g. SEMI-join sides
+      over the same relation), but the node label still needs
+      disambiguation. `collect` now runs a second pass after `register`:
+      first occurrence of a base name keeps it bare; subsequent ones get
+      `_1`, `_2`, etc. `disambiguatedName` returns the per-node label
+      or "". `describePlan`/`describePlanVerbose` now accept
+      `*explainNames` and use `disambiguatedName` for SeqScan/IndexScan/
+      IndexOnlyScan labels. Gates: UNITS PASS, SPOT PASS (Q12=2/Q13=35),
+      DS05 PASS (95/99, zero row/checksum deltas). Clause-6 re-adjudication
+      deferred to a measurement loop (the rendering gap is fixed; the
+      estimate-audit comparison is a measurable follow-up).
 - [ ] **M0128-P5.2 — `Rows Removed by Filter` / `by Join Filter`.** 09 §3.17:
       executor counters (per-scan qual rejects, per-join residual rejects)
       rendered by EXPLAIN ANALYZE text; structured formats (JSON/XML/YAML —

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,15 +60,29 @@ type explainNames struct {
 	// M0125-0039 deferral row: the complete fix is a globally unique
 	// range-table id (PostgreSQL's varno), which is planner work.
 	cols map[int16]map[string]bool
+	// nodeLabels maps each plan node to its EXPLAIN-node-label name,
+	// disambiguated independently of SourceTableIdx so two distinct
+	// nodes that share a SourceTableIdx (e.g. a SEMI-join outer and
+	// inner side over the same relation) still get distinguishable
+	// labels. Keyed by nodePtr(n). Populated by collect; nil means no
+	// disambiguation was needed.
+	// M0128-P5.1: this is the select_rtable_names_for_explain equivalent
+	// for node labels — the existing bySource/taken/seen serve column
+	// qualification, which has different collision rules.
+	nodeLabels map[string]string
 }
+
+// nodePtr returns a unique string id for a plan node.
+func nodePtr(n planner.Node) string { return fmt.Sprintf("%p", n) }
 
 // newExplainNames builds the name table for the plan rooted at n.
 func newExplainNames(n planner.Node) *explainNames {
 	nm := &explainNames{
-		bySource: map[int16]string{},
-		taken:    map[string]int{},
-		seen:     map[int16]bool{},
-		cols:     map[int16]map[string]bool{},
+		bySource:   map[int16]string{},
+		taken:      map[string]int{},
+		seen:       map[int16]bool{},
+		cols:       map[int16]map[string]bool{},
+		nodeLabels: map[string]string{},
 	}
 	nm.collect(n)
 	return nm
@@ -139,6 +154,27 @@ func (nm *explainNames) collect(n planner.Node) {
 	sort.SliceStable(found, func(i, j int) bool { return found[i].src < found[j].src })
 	for _, e := range found {
 		nm.register(e.src, e.base, e.node)
+	}
+
+	// M0128-P5.1: assign per-node disambiguated labels for the EXPLAIN
+	// node label ("Seq Scan on <name>"). This is a separate pass from
+	// column qualification (bySource) because two distinct nodes can
+	// share a SourceTableIdx (e.g. SEMI-join sides over the same
+	// relation) — the column-qualification register() skips the second
+	// one via its `seen` guard, but the node label still needs
+	// disambiguation.
+	//
+	// Labels follow PG select_rtable_names_for_explain: first occurrence
+	// of a base name keeps it bare; subsequent ones get _1, _2, etc.
+	labelTaken := map[string]int{}
+	for _, e := range found {
+		base := e.base
+		n := labelTaken[base]
+		labelTaken[base] = n + 1
+		if n > 0 {
+			base += "_" + strconv.Itoa(n)
+			nm.nodeLabels[nodePtr(e.node)] = base
+		}
 	}
 }
 
@@ -279,6 +315,25 @@ func (nm *explainNames) resolveInAncestor(anc planner.Node, colName string) stri
 		return ""
 	}
 	return hit
+}
+
+// disambiguatedName returns the per-node label for EXPLAIN node headers
+// (e.g. "Seq Scan on <name>"), disambiguated when the same base relation
+// name appears on multiple plan nodes. An empty string means "no
+// disambiguation needed" — this node already has a distinct alias or is the
+// first occurrence.
+//
+// This is PG's select_rtable_names_for_explain (ruleutils.c) applied to
+// plan node labels. It reads from nodeLabels, which collect builds in a
+// separate pass from the column-qualification bySource table, because two
+// distinct nodes can share a SourceTableIdx (the column-qualification
+// register() skips the second one via its `seen` guard) but still need
+// distinguishable node labels.
+func (nm *explainNames) disambiguatedName(n planner.Node) string {
+	if nm == nil || n == nil {
+		return ""
+	}
+	return nm.nodeLabels[nodePtr(n)]
 }
 
 // explainIsScanNode reports whether n is a scan-like node, i.e. one whose

@@ -391,7 +391,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
-	label := prefix + describePlanVerbose(n, opts.Verbose)
+	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	// COSTS defaults to ON in PostgreSQL (and goopg); only suppress when
 	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
 	showCosts := !opts.Set.Costs || opts.Costs
@@ -1179,7 +1179,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
-	label := prefix + describePlanVerbose(n, opts.Verbose)
+	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	showCostsA := !opts.Set.Costs || opts.Costs
 	if showCostsA {
 		est := planner.EstimateRows(n)
@@ -1364,7 +1364,7 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 // JSON shape).
 func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
 	obj := map[string]any{
-		"Node Type": describePlan(n),
+		"Node Type": describePlan(n, nil),
 	}
 	// M0125-0037(i): upstream's non-text formats do NOT fold the set-op
 	// command into the node name the way the text format does. Verified
@@ -1412,14 +1412,25 @@ func schemaQualify(name string) string {
 }
 
 // describePlanVerbose returns the plan-node description; verbose=true adds schema qualification.
-func describePlanVerbose(n planner.Node, verbose bool) string {
+func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string {
 	if !verbose {
-		return describePlan(n)
+		return describePlan(n, nm)
 	}
 	switch p := n.(type) {
 	case *planner.SeqScan:
 		if p.Table == nil {
-			return describePlan(n)
+			return describePlan(n, nm)
+		}
+		// When the range-table name table disambiguates a repeated
+		// relation name (PG select_rtable_names_for_explain), use
+		// the disambiguated name instead of the catalog name so a
+		// relation scanned twice without an alias prints two
+		// distinguishable labels (e.g. "nation" / "nation_1").
+		if dname := nm.disambiguatedName(n); dname != "" {
+			if p.Table.Stats != nil {
+				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
+			}
+			return "Seq Scan on " + dname
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
@@ -1427,8 +1438,14 @@ func describePlanVerbose(n planner.Node, verbose bool) string {
 		}
 		return "Seq Scan on " + tname
 	case *planner.IndexScan:
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+		}
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *planner.IndexOnlyScan:
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+		}
 		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *planner.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
@@ -1437,10 +1454,10 @@ func describePlanVerbose(n planner.Node, verbose bool) string {
 	case *planner.Delete:
 		return "Delete on " + schemaQualify(p.Table.QualifiedName())
 	}
-	return describePlan(n)
+	return describePlan(n, nm)
 }
 
-func describePlan(n planner.Node) string {
+func describePlan(n planner.Node, nm *explainNames) string {
 	switch p := n.(type) {
 	case *planner.Project:
 		return "Projection"
@@ -1534,6 +1551,12 @@ func describePlan(n planner.Node) string {
 		// these. M0006 / 0006-0004 surfaces this so an operator
 		// inspecting EXPLAIN can verify which scans feed the
 		// cost model.
+		if dname := nm.disambiguatedName(n); dname != "" {
+			if p.Table != nil && p.Table.Stats != nil {
+				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
+			}
+			return "Seq Scan on " + dname
+		}
 		if p.Table != nil && p.Table.Stats != nil {
 			if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
 				return fmt.Sprintf("Seq Scan on %s %s (stats)", p.Table.QualifiedName(), p.Alias)
@@ -1545,11 +1568,17 @@ func describePlan(n planner.Node) string {
 		}
 		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
 	case *planner.IndexScan:
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+		}
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
 	case *planner.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
 		// upstream's "Index Only Scan using <idx> on <table>".
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+		}
 		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
 	case *planner.Insert:
 		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
