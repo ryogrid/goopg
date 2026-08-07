@@ -10,7 +10,11 @@ cost-driven planning made production-viable — is inserted directly after M0125
 so the head of the roadmap is M0124 → M0125 → M0126.** **Amended 2026-08-03:
 M0126 is CLOSED as a documented no-go (milestone-terminal); M0127 — PG-shaped
 join search — is filed as its successor and inserted directly after M0125, so
-the head of the roadmap is M0124 → M0125 → M0127.** **M-NIGHTLY no longer
+the head of the roadmap is M0124 → M0125 → M0127.** **Amended 2026-08-07
+(USER): M0128 — special-join inference (`join_is_legal`/`SpecialJoinInfo`) +
+M0127 residuals — is filed and inserted directly after M0127, so the head of
+the roadmap is M0124 → M0125 → M0127 → M0128.** M0128 tasks are not selected
+while any M0127 task is open (M0127-P6.4 is M0127's last). **M-NIGHTLY no longer
 preempts it (amended 2026-07-28): nightly items are still FILED every loop, but
 they are not SELECTED until M0124, M0125 and (since 2026-08-03) M0127 close.** This banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
@@ -10515,6 +10519,184 @@ construction (ledger rows `2026-08-06 M-NIGHTLY (root-0038)` and
 `(AI-20260806-011323-001)`) — cite them, do not add a walker arm to code being
 deleted. Bar: grep-clean + UNITS + SPOT; do not run SPOT while a nightly's
 tpch/tpcds stages are live.
+
+## M0128 — Special-join inference (`join_is_legal`/`SpecialJoinInfo`) + M0127 residuals (filed 2026-08-07)
+
+Milestone: `docs/milestones/0128-special-join-inference-and-m0127-residuals.md`.
+Implementation plan (the authoritative task decomposition):
+`docs/design/0128-special-join-inference-and-m0127-residuals.md`. Design of
+record: `docs/design/leftdeep-joins/` for the planner items (**03** §4.4 — the
+v1 pin this milestone removes — and §6; **07** §5; **09**
+§3.11/§3.17/§3.19/§3.22/§3.23 — the measured residuals) and
+`docs/design/parallel-query/` for the executor items (**07** §3.1,
+**10-roadmap** P8 + the "Deliberately deferred" table). The bundle chapters are
+referenced only, never modified. **The task bodies below cite design sections
+instead of restating them.**
+**Priority: immediately after M0127** (user directive 2026-08-07 — see the
+amended Current Priority banner). Not selected while M0127-P6.4 is open.
+
+**Acceptance bar (the milestone doc's bar is normative):** TPC-DS SF0.5 **zero
+row/checksum deltas** across the milestone (plan changes only where a task's
+own bar adjudicates them); TPC-H SF1 **22/22**, total ≤ 1.2× R0 (493.31 s),
+**Q9 ≤ 170.9 s** (the M0127 S5 bounds retained as floor); a **recorded
+COLLAPSE verdict** per 09 §3.19 with outer joins searchable; a **recorded
+parallel-hash-build verdict** against parallel-query/10-roadmap's reopen
+condition; **Q74 attributed**; `Rows Removed by Filter` visible and
+Q2/Q8/Q17/Q18/Q22 clause-6 adjudicable; `FOR UPDATE` never silently degrades;
+`avgVarBytes` fed from a collected width stat. A documented, attributed no-go
+on the verdict items is success; an unmeasured outcome is the only failure.
+
+**Read before picking any task here.** (1) Gates use the M0127 vocabulary
+(UNITS/SMOKE/SPOT/DS05/PLAN/RACE; `make ralph-state-guard` before every
+finish). (2) Timed measurements on a quiet host, server age held constant
+(sweep-tail discipline). (3) Worktrees off pinned clean HEAD, explicit
+pathspec staging, guard re-runs after rebase/handoff. (4) Ordering: **P0
+first** (a live 7× regression and a silent-unlock safety net), then P1.1 →
+P1.2 → P1.3 strictly; P1.4 needs P1.2; **P1.5 needs P1.3** and is the
+flagship verdict; P2.2 → P2.3 → P2.4 strictly (design-doc-first); P3.1 before
+P3.2; P4/P5 independent. (5) Where a task proves larger than one loop, split
+it at selection time and record the split in both the plan doc and here.
+
+- [ ] **M0128-P0.1 — Q74 attribution.** TPC-DS SF0.5 Q74: PASS 11–14 s
+      (the nine 2026-08-04 sweeps with a Q74 row) → PASS ~81–93 s stable since
+      M0127-P5.9-i (first slow sweep 2026-08-05 22:26;
+      `sweep-20260807-122645`: 88 s, 7 rows, ck `2ffc13c77bf53028` identical
+      to every pre-regression sweep) — ~7× slower with
+      correct output, never attributed. 09 §6 protocol: bisect the P5.9
+      sub-commits (i is the first suspect by timing, not evidence), EXPLAIN
+      (ANALYZE) both arms, fix or ledger with a measured bound. Bar:
+      attribution to a specific commit + fix or ledger row; DS05.
+- [ ] **M0128-P0.2 — lockRows hard-error safety net.** Ledger root-0038:
+      `lockRowsOp`'s `findScanLeafForRel`/`markJoinPreserveCTID` walkers know
+      ~8 of ~70 operator types; a `spillOp` (or materialize/memoize/gather/
+      indexOnlyScan/lateral…) between LockRows and the scan leaf degrades
+      `FOR UPDATE` to an unlocked pass-through with NO error. Audit every
+      reachable operator, classify pass-through vs barrier, and make unknown
+      shapes **error loudly**. Resume point
+      `internal/executor/operators_lockrows.go`. Bar: UNITS + SPOT + DS05 + a
+      regression test that an interposed shape errors.
+- [ ] **M0128-P1.1 — `SpecialJoinInfo` representation + construction.** 03
+      §4.4; PG `joinrels.c:350` (consumer), `initsplan.c`
+      `deconstruct_jointree` (construction). Port the semantic fields **as PG
+      18.3 defines them** (`postgres/src/include/nodes/pathnodes.h:3031-3053`:
+      min/syn lefthand+righthand, jointype, ojrelid, the `commute_above_l/r` +
+      `commute_below_l/r` Relids — 18.3's replacement for the PG≤15
+      `delay_upper_joins`, which no longer exists upstream —, lhs_strict,
+      semi_can_btree/hash, semi_operators/semi_rhs_exprs where meaningful) and
+      build them during jointree
+      deconstruction for LEFT/FULL/SEMI/ANTI. **Data only — no search
+      change**; the pin stays until P1.2. Bar: UNITS + SPOT + DS05 (zero
+      deltas by construction) + unit tests over nested special joins.
+- [ ] **M0128-P1.2 — `join_is_legal` + `have_join_order_restriction` for LEFT
+      joins.** Replace the constant-false `joinOrderRestricted`/
+      `hasJoinRestriction` stubs (`internal/planner/joinsearchlevel.go`; 03
+      lines 112/163) with real inference over P1.1's entries — the LJO arm
+      only (`joinrels.c:350`, `:1066`). Legal orders enter the DP, illegal
+      ones stay excluded; 03 §4.2's error contract takes its PG
+      condition-only form. Bar: UNITS + SPOT + DS05 (zero row/checksum
+      deltas; only outer-join queries may change plans, only to PG-legal
+      orders) + a legality-matrix unit test.
+- [ ] **M0128-P1.3 — FULL joins + outer-join clause distribution.** 03 §6:
+      `build_joinrel_restrictlist` for special joins (join vs filter clauses
+      on the nullable side), the FULL arm of `join_is_legal`, identity/dedup
+      rules for restricted levels. Bar: as P1.2 + FULL-nesting unit tests.
+- [ ] **M0128-P1.4 — semi/anti in-DP.** 07 §5: unpin the semi/anti spine; the
+      SJE arms of `join_is_legal`; `semi_can_hash`/`semi_can_btree` consumed
+      by path generation. Retires the semi/anti-in-DP ledger row that
+      M0127-P6.4 files with the "`join_is_legal`-inference-dependent" marker
+      (the row does not exist until P6.4 lands; M0128 selection is gated on
+      P6.4 anyway). Bar: as P1.2; DS05
+      semi/anti-heavy queries adjudicated.
+- [ ] **M0128-P1.5 — `GOOPG_PGSHAPED_COLLAPSE` verdict with the pin
+      removed.** 09 §3.19's protocol re-run: the two prior NO-GOs were
+      measured with every outer join pinned
+      (`TestNoCorpusQueryHasAnInnerOnlyJoinChain` — all 12 TPC-DS
+      explicit-JOIN queries contain an outer join), so the premise no longer
+      holds once P1.3 lands. Re-measure ON vs OFF on the TPC-DS corpus; the
+      target shape is an outer link buried under inner joins (Q78). Bar: the
+      measurement recorded + flag flipped or a third documented no-go with
+      attribution; DS05 + SPOT.
+- [ ] **M0128-P2.1 — parallel hash build: the reopen-condition
+      measurement.** parallel-query/10-roadmap defers cooperative parallel
+      hash build with "Reopen when: a measured plan where build time
+      dominates" — this task IS the measurement (EXPLAIN (ANALYZE) sweep,
+      TPC-H SF1 + TPC-DS SF0.5, quiet host, constant server age). GO → record
+      and decompose the implementation (parallel-query/07 §3.1; 10-roadmap P8
+      gates: join-corpus identity, RACE, TPC-H Q9/Q17/Q19). NO-GO → document
+      and re-defer (ledger); both are success. The leader-serial shared build
+      (`internal/executor/parallel_hash_build.go`, M0127-P3.4) already exists
+      — this is only the cooperative half. Bar: the measurement write-up +
+      verdict.
+- [ ] **M0128-P2.2 — bitmap heap scan: design doc.** goopg has zero bitmap
+      machinery. Write `docs/design/0128-0001-bitmap-heap-scan.md` (PG
+      `tidbitmap.c` exact/lossy pages, `nodeBitmapIndexScan.c`/
+      `nodeBitmapHeapscan.c` analogues, `costsize.c` bitmap costing, index-AM
+      glue, EXPLAIN ANALYZE exact/lossy block counters), status `draft`, with
+      the docs/design/README.md index entry in the same commit (hard
+      requirement). Bar: doc review.
+- [ ] **M0128-P2.3 — bitmap executor: TID bitmap + the four nodes.** Per the
+      P2.2 design; lossy-page `Recheck` semantics included; planner-invisible
+      until P2.4. Bar: UNITS + RACE + exact/lossy transition unit tests.
+- [ ] **M0128-P2.4 — bitmap planner: path + cost + index glue.** Per the P2.2
+      design, costed in the search's currency. Bar: UNITS + SPOT + DS05
+      (zero row/checksum deltas; plans adjudicated) + PLAN + a TPC-H A/B on
+      queries PG itself plans bitmap paths for.
+- [ ] **M0128-P3.1 — per-column average-width stats → `avgVarBytes`.** 09
+      §3.23: ANALYZE collects a `pg_statistic.stawidth` equivalent (PG feeds
+      `Plan.plan_width` from it); the planner threads it to hash-join plan
+      width; `buildGeometry`
+      (`internal/executor/operators_join_agg.go:645`) stops passing 0 into
+      `internal/hashsize.EntryBytes` (`48·ncols + 24 + avgVarBytes`). Retire
+      the `avgVarBytes=0` comment; adjudicate the
+      `TestExplainAnalyzeHashJoinReportsGrownBatches` tripwire (written
+      against the under-count — expected to change verdict; fix / re-pin /
+      retire-with-reason is part of the task). Bar: UNITS + SPOT + DS05 + a
+      unit test that a text-heavy build sizes `nbatch` from real widths.
+- [ ] **M0128-P3.2 — one scan, one estimate.** 09 §3.23: `seqScanRows`
+      ignores on-scan quals, so the executor's hash sizing reads the pre-qual
+      estimate while the planner priced the post-qual one. Thread the
+      filtered count (or apply `baserestrictinfo` selectivity in
+      `seqScanRows` — pick per 09 §3.23). Bar: UNITS + SPOT + DS05 + a
+      regression test pinning `nbatch` to the filtered estimate.
+- [ ] **M0128-P4.1 — `reduce_outer_joins`: the reduction half.** 09 §3.22:
+      demote an outer join to inner when a strict qual above it constrains
+      the nullable side (PG `prepjointree.c` `reduce_outer_joins`). The
+      RIGHT→LEFT flip half is unrepresentable (`parser.FromExpr` = Base
+      RangeVar + flat `[]JoinExpr`) and stays out — ledger row records the
+      split. Pessimization fix, never a wrong answer. Bar: UNITS + SPOT +
+      DS05 (plan changes only where a demotion fires, adjudicated) + the
+      strict-qual demotion matrix unit tests.
+- [ ] **M0128-P5.1 — EXPLAIN range-table name dedup.** 09 §3.11: port
+      `ruleutils.c` `select_rtable_names_for_explain`-style disambiguation
+      (PG 18.3: `postgres/src/backend/utils/adt/ruleutils.c:3855` — 09 §3.11
+      cites the pre-rename name `select_rtable_names`) so a relation
+      scanned twice without an alias prints two distinguishable names;
+      Q2/Q8/Q17/Q18/Q22 become clause-6 adjudicable. Bar: UNITS + SPOT + DS05
+      plan channel (alias changes only on the ambiguous set) + the five
+      queries re-adjudicated under clause 6, outcome recorded.
+- [ ] **M0128-P5.2 — `Rows Removed by Filter` / `by Join Filter`.** 09 §3.17:
+      executor counters (per-scan qual rejects, per-join residual rejects)
+      rendered by EXPLAIN ANALYZE text; structured formats (JSON/XML/YAML —
+      no qual properties at all today) in scope if the plumbing is
+      mechanical, else ledgered. Bar: UNITS + SPOT + DS05 + an EXPLAIN golden
+      test showing both line kinds.
+- [ ] **M0128-P6.1 — resjunk-ctid rowmark (durable lockRows fix).** PG's
+      mechanism: `preprocess_targetlist` adds junk `ctid` attributes for
+      rowmarked relations, so TID identity rides the tuple, not the
+      operator-tree shape — immune to spill/materialize/memoize/gather
+      interposition by construction (ledger root-0038, resume point
+      `internal/executor/operators_lockrows.go`). Expected to decompose at
+      selection (planner junk-attr plumbing; executor slot carriage; the
+      walker arms' retirement; P0.2's net becomes unreachable and is
+      removed). Bar at completion: UNITS + SPOT + DS05 + an isolation
+      `FOR UPDATE` test over an interposed shape + the root-0038 ledger row
+      closed.
+
+**Order:** P0.1, P0.2 → P1.1→P1.3 → P1.4 → P1.5 → P3.1→P3.2 → P4.1 →
+P5.1→P5.2 → P2.1→P2.4 → P6.1 (P2.1's measurement may run any time the host
+is quiet; P4/P5 may interleave with P1 when a loop needs a smaller task). No
+M0128 task may be selected while M0127-P6.4 is open (Current Priority
+banner).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
