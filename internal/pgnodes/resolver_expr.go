@@ -519,6 +519,33 @@ func resolveNumericTypmodCast(v *parser.CastExpr) (Node, uint32, error) {
 	if !ok {
 		return nil, 0, ErrUnsupported
 	}
+	// An unknown-type string literal cast to numeric(p,s) — e.g.
+	// '5.5'::numeric(10,2) — folds at parse time in PG: coerce_type first
+	// converts the unknown literal to a bare numeric Const via
+	// stringTypeToConst → numeric_in, then coerce_type_typmod applies the
+	// length coercion numeric(numeric,int4). The bare-numeric fold step
+	// already exists (foldStringLiteralConst), and the length-coercion
+	// wrapper is shared with the integer-operand path below. (M0123-S4
+	// sub-slice 30: typmod'd string numeric cast.)
+	if lit, isStr := v.Operand.(*parser.StringConst); isStr {
+		if n, _, ok2 := foldStringLiteralConst(pgTrimSpace(lit.Value), OidNumeric); ok2 {
+			return &FuncExpr{
+				Funcid:         1703, // numeric(numeric, int4) length coercion
+				Funcresulttype: OidNumeric,
+				Funcretset:     false,
+				Funcvariadic:   false,
+				Funcformat:     1, // COERCE_EXPLICIT_CAST
+				Funccollid:     0,
+				Inputcollid:    0,
+				Args:           []Node{n, NewInt4Const(typmod)},
+				Location:       -1,
+			}, OidNumeric, nil
+		}
+		// A string literal that can't fold to numeric (e.g. non-numeric
+		// text) degrades to SQL text — PG would reject it at parse time
+		// via numeric_in, so there is no canonical byte sequence to match.
+		return nil, 0, ErrUnsupported
+	}
 	arg, srcType, err := resolve(v.Operand, 0)
 	if err != nil {
 		return nil, 0, err
