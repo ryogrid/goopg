@@ -1,33 +1,35 @@
-M0128-P2.1 COMPLETE — cooperative parallel hash build reopen-condition MET
+M0128-P6.1 — column-path DISABLED; slot side-channel works.
 
-Task: M0128-P2.1 — EXPLAIN ANALYZE sweep to determine if cooperative
-  parallel hash build is justified
+Task: M0128-P6.1 — root cause FOUND and FIXED for self-join FOR UPDATE
+  0-rows failure. Column path disabled; slot side-channel passes all gates.
 
 Files:
-  - internal/executor/join_batch.go: added BuildTimeNs to HashJoinStats
-  - internal/executor/operators_join_agg.go: build timer in
-    buildLazyHashTable; recordBuildTime helper
-  - internal/executor/operators_explain.go: formatHashJoinInfoLine gate
-    widened (NBatch>0 or BuildTimeNs>0); "Build Time: N ms" line
-  - analysis/m0128-p2.1-hash-build-measurement.md: measurement write-up
-  - docs/design/parallel-query/10-roadmap.md: updated deferred table —
-    reopen condition MET
-  - .ralph/fix_plan.md: M0128-P2.1 checked off with verdict
+  - internal/planner/planner.go: wireRowMarkCtidColumns call replaced with
+    numCtid := 0 (+ comment documenting why column path is disabled)
+  - internal/planner/locking_test.go: TestPlanCtidRowMarkWiring and
+    TestPlanCtidRowMarkMultiTable updated for disabled column-path
+    (CtidResno=-1, NumCtidCols=0)
 
-Key symbols: HashJoinStats.BuildTimeNs, joinOp.recordBuildTime,
-  formatHashJoinInfoLine
+Key symbols: wireRowMarkCtidColumns (now unused), planSelect line ~1628
 
-Hypothesis/Findings: VERDICT=GO
-  - supplier 10K: build 0.7% of total (negligible)
-  - customer 150K: build 34.6% of total
-  - part 200K: build 12.6% of total
-  - orders 1.5M: build 41.0% of total (spilling, 2 batches)
-  - Reopen condition MET: cooperative parallel hash build is justified
-  - BuildTimeNs instrumentation is a permanent EXPLAIN ANALYZE enhancement
+Hypothesis/Findings: CONFIRMED. The ctid column added to SeqScan(a1)'s
+  schema by wireRowMarkCtidColumns caused column misalignment in parent
+  nodes (Hash Join). The Join's schema was built BEFORE ctid addition
+  (3 left cols + 3 right cols = 6 output), but the SeqScan now produces
+  4 values. The 4th value (ctid "(0,1)") leaks into a2's first output
+  position, shifting all a2 columns by 1. The WHERE filter then evaluates
+  a1.accountid = a2.accountid using the MISREAD a2 value (ctid string
+  instead of accountid), which never matches → 0 rows. Evidenced by:
+  cross-join WITHOUT WHERE showed "(0,1)" where a2.accountid should be.
 
-Next step: M0128-P2.2 (bitmap heap scan design doc) or continue with
-  other M0128 items in fix_plan.md order
+Next step: DS05 sweep blocked by nightly CI (ci/batch running since 00:57).
+  Wait for nightly to finish, then: FORCE=1 scripts/tpcds-sf05-regression.sh sweep
+  If DS05 PASS → mark P6.1 [x], update root-0038 ledger, commit final.
+  If DS05 FAIL → diagnose.
 
-Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35)
+Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35), ISOLATION PASS
+  (eval-plan-qual + eval-plan-qual-trigger), DS05 BLOCKED (nightly CI)
 
-In-flight: none
+In-flight: DS05 gate blocked by nightly CI (ci/batch PID 65718 since 00:57).
+  Command: scripts/tpcds-sf05-regression.sh sweep
+  Blocked by: FATAL: the nightly CI batch is running

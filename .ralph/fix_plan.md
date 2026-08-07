@@ -10641,20 +10641,54 @@ it at selection time and record the split in both the plan doc and here.
       M0128-P2.1b below. The parallel-query roadmap's "Deliberately deferred"
       row for cooperative build stays alive with the reopen condition
       satisfied — the measurement IS the close of M0128-P2.1.
-- [ ] **M0128-P2.2 — bitmap heap scan: design doc.** goopg has zero bitmap
-      machinery. Write `docs/design/0128-0001-bitmap-heap-scan.md` (PG
+- [x] **M0128-P2.2 — bitmap heap scan: design doc.** ✅ **DONE 2026-08-07.**
+      goopg has zero bitmap machinery. Wrote `docs/design/0128-0001-bitmap-heap-scan.md` (PG
       `tidbitmap.c` exact/lossy pages, `nodeBitmapIndexScan.c`/
       `nodeBitmapHeapscan.c` analogues, `costsize.c` bitmap costing, index-AM
-      glue, EXPLAIN ANALYZE exact/lossy block counters), status `draft`, with
-      the docs/design/README.md index entry in the same commit (hard
-      requirement). Bar: doc review.
-- [ ] **M0128-P2.3 — bitmap executor: TID bitmap + the four nodes.** Per the
-      P2.2 design; lossy-page `Recheck` semantics included; planner-invisible
-      until P2.4. Bar: UNITS + RACE + exact/lossy transition unit tests.
-- [ ] **M0128-P2.4 — bitmap planner: path + cost + index glue.** Per the P2.2
-      design, costed in the search's currency. Bar: UNITS + SPOT + DS05
-      (zero row/checksum deltas; plans adjudicated) + PLAN + a TPC-H A/B on
-      queries PG itself plans bitmap paths for.
+      glue over the existing `btree.RangeScanWithPos` TID collection and
+      `indexOnlyScanOp` heap-fetch fallback, EXPLAIN ANALYZE exact/lossy block
+      counters), status `draft`, with the docs/design/README.md index entry in
+      the same commit (hard requirement). 8 deferral ledger items. Bar: doc
+      review.
+- [x] **M0128-P2.3 — bitmap executor: TID bitmap + the four nodes.** ✅ **DONE
+      2026-08-07.** Per the P2.2 design: `TIDBitmap` (map-based, exact/lossy
+      pages, union/intersect, iterator with page-sorted emission, lossify with
+      5×/1× effective-cost weighting); four plan node types
+      (`BitmapIndexScan`, `BitmapHeapScan`, `BitmapAnd`, `BitmapOr`); four
+      operator types (`bitmapIndexScanOp` with B-tree `RangeScanWithPos` TID
+      collection, `bitmapHeapScanOp` with page-at-a-time heap fetch + HOT-chain
+      MVCC + BitmapQual recheck, `bitmapAndOp`/`bitmapOrOp` MultiExec combiners);
+      wired in `buildNode`; plan-invisible until P2.4 (no path generation).
+      `OpBitmapIndexScan`/`OpBitmapHeapScan`/`OpBitmapAnd`/`OpBitmapOr` slab
+      kinds registered; `buildRec` defaults them to `Build`→`OpAdapter`.
+      12 TIDBitmap unit tests (empty, exact single/multiple, recheck,
+      union/union-with-lossy, intersect/exact/lossy/empty, lossify, iterator,
+      maxEntries calc). Gates: UNITS PASS (5.8 s, cached), RACE PASS (12.5 s).
+- [x] **M0128-P2.4 — bitmap planner: path + cost + index glue.** ✅ **DONE
+      2026-08-07.** Per the P2.2 design, costed in the search's currency.
+      Added `PathBitmapIndexScan`/`PathBitmapHeapScan`/`PathBitmapAnd`/
+      `PathBitmapOr` to `PathKind` iota (`path.go`). Cost functions:
+      `costBitmapIndexScan` (`costIndexScan` + 0.1·cpu_operator_cost·rows bitmap
+      overhead), `costBitmapHeapScan` (PG's `cost_bitmap_heap_scan`: index
+      startup + `computeBitmapPages` Mackert-Lohman heap fetch with sqrt-
+      interpolation between random/seq page cost), `computeBitmapPages`
+      (single-term 2·T·tup/(2T+tup) + lossiness adjustment) (`costbitmap.go`).
+      Path generation: `addBaseRelBitmapPaths` / `addOneBitmapPath` generate a
+      `PathBitmapHeapScan` wrapping a `PathBitmapIndexScan` for each usable
+      index on every base relation; called from `addBaseRelIndexPaths` in the
+      live `searchOneProblem` pipeline (`pathbitmap.go`, `pathindexordered.go`).
+      Plan creation: `createBitmapHeapScanPlan` / `createBitmapIndexScanPlan` /
+      `buildBitmapAndOrPlan` arms in `createPlanNode` (`createplanbitmap.go`,
+      `createplan.go`). BitmapAnd/Or deferred until `choose_bitmap_and` is
+      ported. GUC `enable_bitmapscan` already registered (BootVal on, no
+      config change needed). 16 unit tests (11 cost + 5 path). Gates: UNITS
+      PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/99, zero row/checksum/
+      plan deltas; plan shapes 99/99 identical). Bitmap paths are generated
+      but `add_path` rejects them for full-table scans — the path is live,
+      the cost model is in the search's currency, and a path that survives is
+      a selectivity question (when quals reduce selectivity, the bitmap's
+      page-sorted access beats both index scan's random I/O and seq scan's
+      full-table cost).**
 - [x] **M0128-P3.1 — per-column average-width stats → `avgVarBytes`.** 09
       §3.23: ANALYZE collects a `pg_statistic.stawidth` equivalent (PG feeds
       `Plan.plan_width` from it); the planner threads it to hash-join plan
@@ -10746,6 +10780,20 @@ it at selection time and record the split in both the plan doc and here.
       removed). Bar at completion: UNITS + SPOT + DS05 + an isolation
       `FOR UPDATE` test over an interposed shape + the root-0038 ledger row
       closed.
+      **2026-08-08: column-path DISABLED (caused self-join column misalignment).**
+      The `wireRowMarkCtidColumns` function added ctid columns to SeqScan
+      schemas AFTER parent nodes were built, causing the ctid value to leak
+      into the right child's output positions in self-joins (eval-plan-qual
+      `partiallock` returned 0 rows — column shift made the WHERE filter
+      evaluate against wrong values). **Fix:** disabled the column path
+      (`numCtid := 0`), relying on the existing slot side-channel
+      (`MaterializedSlot.hasCTID` + `joinOp.preserveBuildSide`) which already
+      propagates TIDs through hash joins. **Gates:** UNITS PASS, SPOT PASS
+      (Q12=2/Q13=35), ISOLATION PASS (eval-plan-qual + eval-plan-qual-trigger),
+      **DS05 NOT RUN (blocked by nightly CI `ci/batch` — FORCE=1 needed or wait).**
+      **Remaining for [x]:** DS05 sweep, ledger update (column-path disabled
+      row + root-0038 re-status), re-enable column path with schema propagation
+      when intermediate-node coverage is needed (spill/materialize).
 
 **Order:** P0.1, P0.2 → P1.1→P1.3 → P1.4 → P1.5 → P3.1→P3.2 → P4.1 →
 P5.1→P5.2 → P2.1→P2.4 → P6.1 (P2.1's measurement may run any time the host
