@@ -10590,7 +10590,7 @@ it at selection time and record the split in both the plan doc and here.
       deconstruction for LEFT/FULL/SEMI/ANTI. **Data only — no search
       change**; the pin stays until P1.2. Bar: UNITS + SPOT + DS05 (zero
       deltas by construction) + unit tests over nested special joins.
-- [ ] **M0128-P1.2 — `join_is_legal` + `have_join_order_restriction` for LEFT
+- [x] **M0128-P1.2 — `join_is_legal` + `have_join_order_restriction` for LEFT
       joins.** Replace the constant-false `joinOrderRestricted`/
       `hasJoinRestriction` stubs (`internal/planner/joinsearchlevel.go`; 03
       lines 112/163) with real inference over P1.1's entries — the LJO arm
