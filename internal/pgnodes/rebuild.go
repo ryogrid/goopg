@@ -249,6 +249,7 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitNumericLengthCoercion(f) ||
 			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) ||
 			isImplicitTimestampLengthCoercion(f) ||
+			isImplicitTimestamptzLengthCoercion(f) ||
 			isImplicitBitLengthCoercion(f) || isImplicitVarBitLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
@@ -412,6 +413,21 @@ func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
 // the identical node (fixed point).
 func isImplicitTimestampLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 1961 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamp || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimestamptzLengthCoercion reports whether f is the IMPLICIT timestamptz
+// length coercion coerce_type_typmod adds when a timestamptz(N) column has a precision
+// qualifier (see wrapTimestamptzLengthCoercion): timestamptz(timestamptz,int4) = funcid
+// 1967, funcformat 2 (IMPLICIT), a timestamptz result, and two args whose second is a
+// non-null int4 typmod Const. pg_get_expr renders the implicit form invisibly, so
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimestamptzLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1967 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamptz || len(f.Args) != 2 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)

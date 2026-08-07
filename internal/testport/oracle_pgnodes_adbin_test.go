@@ -329,6 +329,15 @@ var adbinOracleCases = []adbinOracleCase{
 	{"varbit8_10101010", "varbit(8)", pgnodes.OidVarBit, "'10101010'"},
 	// varbit WITHOUT a length qualifier stores a bare Const.
 	{"varbit_bare_10101", "bit varying", pgnodes.OidVarBit, "'10101'"},
+	// Sub-slice 37: timestamptz(N) length coercion (funcid 1967, funcformat 2).
+	// PG wraps the timestamptz Const in an IMPLICIT timestamptz(timestamptz,int4)
+	// FuncExpr when the column has a precision qualifier (0-6).
+	{"tstz3_2024_frac", "timestamptz(3)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz6_full", "timestamptz(6)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz0_truncate", "timestamptz(0)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz0_epoch", "timestamptz(0)", pgnodes.OidTimestamptz, "'epoch'"},
+	// timestamptz WITHOUT a precision qualifier stores a bare Const.
+	{"tstz_bare", "timestamptz", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00+00'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

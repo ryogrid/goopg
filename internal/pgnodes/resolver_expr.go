@@ -120,6 +120,10 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 		if targetTypmod >= 0 {
 			n = wrapTimestampLengthCoercion(n, targetTypmod)
 		}
+	case targetType == OidTimestamptz:
+		if targetTypmod >= 0 {
+			n = wrapTimestamptzLengthCoercion(n, targetTypmod)
+		}
 	case targetType == OidBit:
 		if targetTypmod >= 0 {
 			n = wrapBitLengthCoercion(n, targetTypmod)
@@ -230,6 +234,12 @@ func ColumnTypmod(typeName string, args []int64) int32 {
 			return int32(args[0])
 		}
 		return -1
+	case "timestamptz":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
 	case "bit":
 		if len(args) == 1 && args[0] > 0 {
 			// typmod = N (the bit length directly, no VARHDRSZ offset).
@@ -296,6 +306,29 @@ func wrapTimestampLengthCoercion(n Node, typmod int32) Node {
 	return &FuncExpr{
 		Funcid:         1961, // timestamp(timestamp,int4)
 		Funcresulttype: OidTimestamp,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimestamptzLengthCoercion wraps n in an IMPLICIT timestamptz(timestamptz,int4)
+// FuncExpr (funcid 1967, funcformat 2), the coerce_type_typmod length coercion
+// PG applies when a timestamptz(N) column's precision differs from the stored
+// default's. The FuncExpr carries the column's precision as an int4 Const
+// (typmod = N, 0-6). Like timestamp, there is no bool isExplicit third arg —
+// the pg_cast entry for timestamptz→timestamptz is a two-argument function.
+// The inner timestamptz Const carries typmod -1; the outer FuncExpr carries the
+// column's typmod. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapTimestamptzLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1967, // timestamptz(timestamptz,int4)
+		Funcresulttype: OidTimestamptz,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
