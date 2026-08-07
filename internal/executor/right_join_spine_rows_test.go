@@ -10,16 +10,16 @@ package executor
 // that is provably legal on paper is still the project's most expensive failure
 // mode when it is not (Hard-won Rule #1).
 //
-// Both enumerators run the same statement and must agree, and the expected row
-// set is spelled out independently of either — an A/B that only compares the two
-// arms would pass if both were wrong the same way.
+// Until M0127-P6.3 both enumerators ran the same statement here and had to
+// agree; the A/B closed with the old subset-bitmask DP (08 §4), whose deletion
+// also took the cross-package `SetPGShapedJoinSearch` pin. The expected row set
+// is still spelled out independently of the enumerator — an assertion that only
+// compared two arms would pass if both were wrong the same way.
 
 import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/planner"
 )
 
 // rightSpineFixture builds `a ⋈ b RIGHT JOIN c`: a two-relation INNER prefix on
@@ -73,34 +73,27 @@ func TestRightJoinSpineKeepsNullExtendedRows(t *testing.T) {
 	}
 }
 
-// TestRightJoinSpineAgreesAcrossEnumerators: the searched arm may pick a
-// different order for `rj_a ⋈ rj_b` than the syntactic one, and a reordering
-// that changes the answer is the failure this project pays most for. The old
-// enumerator never entered this shape, so it is the reference.
-func TestRightJoinSpineAgreesAcrossEnumerators(t *testing.T) {
-	for _, arm := range []struct {
-		name     string
-		pgShaped bool
-	}{{"searched", true}, {"legacy", false}} {
-		t.Run(arm.name, func(t *testing.T) {
-			prev := planner.SetPGShapedJoinSearch(arm.pgShaped)
-			defer planner.SetPGShapedJoinSearch(prev)
-			ctx, cleanup := rightSpineFixture(t)
-			defer cleanup()
+// TestRightJoinSpineSearchedRows: the searched arm may pick a different order
+// for `rj_a ⋈ rj_b` than the syntactic one, and a reordering that changes the
+// answer is the failure this project pays most for. Until M0127-P6.3 this was
+// an A/B against the legacy arm (`SetPGShapedJoinSearch`); the old DP's
+// deletion took the pin, so the expected rows are now asserted directly —
+// which is the stronger half of the comparison anyway.
+func TestRightJoinSpineSearchedRows(t *testing.T) {
+	ctx, cleanup := rightSpineFixture(t)
+	defer cleanup()
 
-			// The unrestricted join, so the comparison covers the MATCHED rows
-			// too — a lost prefix `ON` qual is a cross product, and `WHERE
-			// a.id IS NULL` alone would not see it.
-			all := formatRows(runQueryRows(t, ctx, strings.TrimSuffix(
-				rightSpineSQL, "\n\tWHERE rj_a.id IS NULL")+" ORDER BY rj_c.id"))
-			want := []string{"100,1,11", "101,2,12", "102,,"}
-			if !reflect.DeepEqual(all, want) {
-				t.Fatalf("%s arm rows = %v, want %v", arm.name, all, want)
-			}
-			if got := formatRows(runQueryRows(t, ctx, rightSpineSQL)); !reflect.DeepEqual(
-				got, []string{"102,,"}) {
-				t.Fatalf("%s arm restricted rows = %v, want [102,,]", arm.name, got)
-			}
-		})
+	// The unrestricted join, so the assertion covers the MATCHED rows
+	// too — a lost prefix `ON` qual is a cross product, and `WHERE
+	// a.id IS NULL` alone would not see it.
+	all := formatRows(runQueryRows(t, ctx, strings.TrimSuffix(
+		rightSpineSQL, "\n\tWHERE rj_a.id IS NULL")+" ORDER BY rj_c.id"))
+	want := []string{"100,1,11", "101,2,12", "102,,"}
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("rows = %v, want %v", all, want)
+	}
+	if got := formatRows(runQueryRows(t, ctx, rightSpineSQL)); !reflect.DeepEqual(
+		got, []string{"102,,"}) {
+		t.Fatalf("restricted rows = %v, want [102,,]", got)
 	}
 }

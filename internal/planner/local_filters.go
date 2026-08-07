@@ -3,25 +3,31 @@ package planner
 import "fmt"
 
 // M0077-0001 (Slice A): relation-local predicate
-// partition + attachment.
+// partition + leaf-local rebasing.
 //
 // This file is the planner-side first slice of the
 // 4-slice Q5 fix from `docs/design/fix-for-q5/`.
-// The slice is intentionally narrow:
+// What survives of it after M0127-P6.3:
 //
 //  1. Partition WHERE conjuncts into "join-side"
 //     (multi-binding) vs "relation-local" (one-binding)
-//     buckets BEFORE the bushy DP runs.
-//  2. After the bushy DP picks a binary tree, attach
-//     each binding's local predicates to its leaf scan
-//     as a `Filter(SeqScan)` wrapper.
-//  3. Keep the existing skip-on-filtered-leaf
-//     behaviour (then expressed by the
-//     `MultiHashJoin` packer, deleted at
-//     M0127-P6.2) — promote it to an explicit
-//     contract (Slice A).
+//     buckets BEFORE the join-order search runs
+//     (`partitionConjunctsForJoinPlanning` — the PG-shaped
+//     seam consumes it at joinsearchseam.go).
+//  2. Rebase a local conjunct from FROM-cumulative to
+//     leaf-local coordinates (`localizeExprToLeaf` — the
+//     seam and `estimateBaseRelInfo` both consume it).
 //
-// Slice B refines `shouldAttachLocalFiltersBeforeSearch` with reliable-
+// The two functions that attached the partitioned locals to the tree the
+// old subset-bitmask DP had picked — `shouldAttachLocalFiltersBeforeSearch`
+// (the Slice-A rollout gate) and `attachRelationLocalFilters` (the
+// pointer-identity leaf wrapper) — were deleted at M0127-P6.3 with that DP,
+// their only production caller (08 §4). The PG-shaped search attaches locals
+// to the leaf BEFORE the search instead (joinsearchseam.go), which is the
+// shape its index producers expect and removes the pointer-identity
+// dependency the post-hoc attach needed.
+//
+// Slice B refines leaf cardinality with reliable-
 // selectivity from the M0077-0002 `baseRelInfo` work;
 // Slice C+D continue with cost-model + anchored
 // equality synthesis. See
@@ -41,18 +47,18 @@ type relationLocalFilters struct {
 //  1. joinConjuncts — multi-binding predicates plus
 //     any conjunct containing OuterColumnRef /
 //     SubqueryExpr / ExistsExpr / InExpr-with-Plan
-//     (per design 01 §3.1). These flow into the bushy
-//     DP / Filter residual path unchanged.
+//     (per design 01 §3.1). These flow into the join
+//     search / Filter residual path unchanged.
 //  2. locals — one-binding predicates keyed by binding
-//     index. These get attached to the corresponding
-//     leaf scan via attachRelationLocalFilters AFTER
-//     the DP picks a join tree.
+//     index. The PG-shaped seam attaches these to the
+//     corresponding leaf scan BEFORE the search runs
+//     (joinsearchseam.go).
 //
 // `cumOffsets` maps the FROM-cumulative output column
 // offsets — index `i` maps to bindings[i]'s first
 // output-column index; index `len(bindings)` is the
-// total schema width. This matches the DP's existing
-// `tableForCol` contract at bushy.go:285.
+// total schema width. This matches `tableForCol`'s
+// contract (joinrestrict.go).
 //
 // (M0077-0001.)
 func partitionConjunctsForJoinPlanning(
@@ -149,149 +155,6 @@ func conjunctIsLocalEligible(e Expr) bool {
 	// unenumerated kinds returned a vacuous true and was pushed to a
 	// leaf that localizeExprToLeaf could not rebase.
 	return eligible && ok
-}
-
-// shouldAttachLocalFiltersBeforeSearch is the rollout gate per
-// design 01 §4.1. (It was `shouldAttachBeforeMHJ` until M0127-P6.2
-// deleted the node both clauses below were calibrated against; the
-// thresholds are unchanged, so the historical reasoning is kept
-// verbatim.) Slice A's gate has TWO clauses:
-//
-//  1. fromCount ≥ 5 — only the shape that triggered
-//     MultiHashJoin packing benefits from the binary-
-//     preservation barrier; smaller queries are left
-//     alone.
-//  2. The FROM list contains at least one
-//     `SmallDimension`-flagged table (region / nation
-//     in TPC-H). Slice A's intended target — Q5 —
-//     leans on filtered region as its anchor; Q7 / Q8 /
-//     Q21 are 5+-table queries whose MHJ shape was
-//     beneficial and where filtered leaves pushed the
-//     planner away from MHJ packing into a slower
-//     binary chain. Without the SmallDim guard, Slice A
-//     regressed Q8 / Q21 from PASS to CANCEL.
-//
-// Slice B (M0077-0002) refines this with reliable-
-// selectivity from `baseRelInfo`; Slice A keeps the
-// guard cheap (table-flag check, no row-count math).
-//
-// (M0077-0001.)
-// M0125-0043 added the `scans` parameter. The gate's second clause asks
-// whether the FROM list contains a small-dimension relation, and that answer
-// moved off `catalog.Table.SmallDimension` (a lookup of the literal names
-// "region"/"nation") onto the leaf scan, where it is derived from the
-// relation's size. `scans[i]` is the leaf built for `bindings[i]`; a binding
-// with no scan falls back to the catalog hint, which is what the TPC-H unit
-// fixtures set.
-func shouldAttachLocalFiltersBeforeSearch(bindings []rangeBinding, scans []Node) bool {
-	// Cost-driven order builds a binary Join tree (no MultiHashJoin), so a
-	// single-table restriction that isn't routed to its leaf scan here
-	// filters the full-table join output at the top instead — e.g. TPC-H
-	// Q3 hash-joins all 6M lineitem rows then applies l_shipdate (121s vs
-	// 17s once the filter sits on the scan). Partitioning the locals out
-	// pre-DP also feeds the DP filtered base-rel cardinality, so it can
-	// pick the order for the RESTRICTED sizes rather than the full tables.
-	// Fire for every multi-table cost-driven plan. The NLI path is
-	// unaffected: the ≥5-table shapes already reach here (Q8's part scan
-	// is wrapped AND still becomes a NestedLoopIndexJoin), so a leaf
-	// Filter does not block the probe. The production integer DP keeps the
-	// original ≥5-table + small-dimension gate — its MultiHashJoin path
-	// routes leaf filters separately and its plans are snapshot-pinned.
-	if costDrivenJoinOrder {
-		return len(bindings) >= 2
-	}
-	if len(bindings) < 5 {
-		return false
-	}
-	for i, b := range bindings {
-		var scan Node
-		if i < len(scans) {
-			scan = scans[i]
-		}
-		if smallDimensionSide(scan, b.table) {
-			return true
-		}
-	}
-	return false
-}
-
-// attachRelationLocalFilters walks the bushy plan tree
-// and wraps each leaf scan that owns local predicates
-// with a Filter node. The leaf identity is determined
-// by pointer equality against the original `scans[i]`
-// list passed into the bushy DP — `i` is the binding
-// index that the partition step keyed `locals.byBinding`
-// against.
-//
-// Each predicate is rebased from FROM-cumulative
-// indices into leaf-local indices via localizeExprToLeaf
-// so the executor's evalExprSlot reads from the leaf's
-// own slot, not the (no-longer-cumulative) global
-// schema.
-//
-// Per design 01 §3.4: this stage attaches as
-// `Filter(SeqScan)` ONLY — no IndexScan promotion,
-// no further rewriting. The post-MHJ
-// `rewriteScanInputsWithSingleTablePredicates` path
-// can still tighten leaves into IndexScans later.
-//
-// (M0077-0001.)
-func attachRelationLocalFilters(
-	node Node,
-	locals relationLocalFilters,
-	scans []Node,
-	bindings []rangeBinding,
-) Node {
-	if len(locals.byBinding) == 0 {
-		return node
-	}
-	// Build identity map: scans[i] → binding index i.
-	scanToBinding := make(map[Node]int, len(scans))
-	for i, s := range scans {
-		scanToBinding[s] = i
-	}
-	var rewrite func(n Node) Node
-	rewrite = func(n Node) Node {
-		if n == nil {
-			return nil
-		}
-		// Match leaves by identity against the original
-		// scans list. The bushy DP's buildJoinFromDP
-		// preserves the same Node pointers as leaves, so
-		// pointer-equality is reliable here.
-		if bidx, ok := scanToBinding[n]; ok {
-			preds := locals.byBinding[bidx]
-			if len(preds) == 0 {
-				return n
-			}
-			// Rebase every predicate from FROM-cumulative
-			// indices to leaf-local indices.
-			binding := bindings[bidx]
-			localized := make([]Expr, 0, len(preds))
-			for _, p := range preds {
-				localized = append(localized, localizeExprToLeaf(p, binding))
-			}
-			return &Filter{
-				Child:     n,
-				Predicate: combineAnd(localized),
-				LeafLocal: true,
-			}
-		}
-		switch x := n.(type) {
-		case *Join:
-			x.Left = rewrite(x.Left)
-			x.Right = rewrite(x.Right)
-			return x
-		case *Filter:
-			x.Child = rewrite(x.Child)
-			return x
-		case *Project:
-			x.Child = rewrite(x.Child)
-			return x
-		}
-		return n
-	}
-	return rewrite(node)
 }
 
 // localizeExprToLeaf rewrites every ColumnRef.Index in

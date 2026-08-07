@@ -86,3 +86,17 @@ func describePlanTreeForUnnest(n Node) string {
 	}
 	return "?"
 }
+
+// hasSubqueryExpr reports whether any SubqueryExpr remains in the plan.
+// (It lived in bushy_test.go until M0127-P6.3 deleted that file with the old
+// subset-bitmask DP; this test was the helper's only remaining user.)
+func hasSubqueryExpr(node Node) bool {
+	return findSubqueryInPlanRecursive(node)
+}
+
+func findSubqueryInPlanRecursive(node Node) bool {
+	if node == nil {
+		return false
+	}
+	return findSubqueryInPlan(node)
+}

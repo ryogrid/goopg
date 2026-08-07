@@ -326,9 +326,10 @@ func TestPgShapedDPDefaultsOn(t *testing.T) {
 
 // TestPgShapedDPKillSwitchPolarity pins the one asymmetry of the post-flip
 // knob: it is a kill-switch, so ONLY the exact string "0" turns the search off
-// (08 §2's S5 rollback story — `=0` restores `tryBushyDP` in one restart, no
-// rebuild). Unset must not read as off, or the flip would be undone by every
-// environment that simply does not mention the variable.
+// (08 §2's S5 rollback story — until M0127-P6.3 `=0` restored the old
+// subset-bitmask DP; since its deletion `=0` means no join-order search, the
+// syntactic FROM order). Unset must not read as off, or the flip would be
+// undone by every environment that simply does not mention the variable.
 func TestPgShapedDPKillSwitchPolarity(t *testing.T) {
 	for _, tc := range []struct {
 		env  string

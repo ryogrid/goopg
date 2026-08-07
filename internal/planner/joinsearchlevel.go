@@ -27,10 +27,9 @@ package planner
 //     (joinpath.c:124).
 //
 // The enumerator owns which pairs are offered and in which outer/inner order,
-// which is exactly what this task is verified on. Nothing here is called from
-// `planSelect`; the whole search is gated behind `GOOPG_PGSHAPED_DP` (OFF by
-// default, joinsearch.go:44) and P5.9 is what flips it. Validated in isolation
-// by `joinsearchlevel_test.go`.
+// which is exactly what this task is verified on. (Written before the wiring:
+// nothing here was called from `planSelect` until P5.9-b, and P5.9 flipped
+// `GOOPG_PGSHAPED_DP` ON — joinsearch.go — so this file now moves plans.)
 
 import "fmt"
 

@@ -133,16 +133,44 @@ package planner
 //
 // # The flag
 //
-// `GOOPG_PGSHAPED_DP` (joinsearch.go) is OFF by default and this is the only
-// production reader of it. With it off `tryPGShapedJoinSearch` returns
-// `used == false` on its first line, `tryBushyDP` runs unchanged, no tree
-// carries the searched tag, and all four skips above are unreachable — the
-// default arm is byte-identical.
+// `GOOPG_PGSHAPED_DP` (joinsearch.go) is ON by default (flipped at
+// M0127-P5.9) and this is the only production reader of it. With it off
+// `tryPGShapedJoinSearch` returns `used == false` on its first line, no tree
+// carries the searched tag, and the skips above are unreachable — the
+// statement keeps its syntactic FROM order. (Until M0127-P6.3 the off arm
+// ran the old subset-bitmask DP instead; that enumerator is deleted, 08 §4.)
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// tryJoinSearch is the pipeline's join-order entry point: `planSelect`
+// (planner.go) and `runJoinSearchBelowPinned` (predp.go) call it with the
+// pre-search CROSS/INNER chain and the `WHERE` predicate above it, and get back
+// the tree to plan plus whatever predicate is left.
+//
+// It was `tryBushyDP` (bushy.go) until M0127-P6.3 deleted the old
+// subset-bitmask DP (08 §4). Between M0127-P5.9 and P6.3 the function had two
+// arms — the PG-shaped search first, that DP as the `GOOPG_PGSHAPED_DP=0`
+// fallback — and the kill-switch's rollback story was "restores the current
+// `tryBushyDP` enumerator, which is not deleted until S7". S7 is here, so the
+// second arm is gone and the flag now only decides whether a join order is
+// SEARCHED at all: with it off, or on a shape the seam declines, the statement
+// keeps the syntactic order the FROM clause was written in (permuted at parse
+// level by `reorderCommaFromByCardinality`, joinorder.go) and the downstream
+// rewrites — `pushPredicatesIntoCrossJoins`, `rewriteJoinsToNLI` — do what they
+// have always done to such a tree.
+//
+// Returning `(node, pred)` unchanged is therefore the whole fallback, and it is
+// 03 §4.2's rule: a search that did not run falls back to the syntactic shape
+// rather than failing the statement.
+func tryJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) (Node, Expr) {
+	if searched, residual, used := tryPGShapedJoinSearch(node, pred, ctx, cat); used {
+		return searched, residual
+	}
+	return node, pred
+}
 
 // tryPGShapedJoinSearch plans `node`'s FROM items with the PG-shaped join
 // search and returns the searched tree plus the conjuncts of `pred` the search

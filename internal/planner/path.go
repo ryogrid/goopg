@@ -23,11 +23,10 @@ import "github.com/goopg/goopg/internal/catalog"
 // determinism mechanism the integer->float migration needs (design ch. 07 §4).
 const stdFuzzFactor = 1.01
 
-// RelSet is a set of base-relation ids, one bit per relation. It reuses the
-// uint16 bitmask the bushy DP already keys joinrels on (bushy.go), so joinrel
-// identity is shared with the existing enumerator rather than reinvented. This
-// bounds a single query's join at 16 base relations — already the DP's regime
-// (it caps at 12, bushy.go:80).
+// RelSet is a set of base-relation ids, one bit per relation. (It reused the
+// uint16 bitmask the bushy DP keyed joinrels on; that DP is deleted as of
+// M0127-P6.3 and the width is now the search's own — `maxSearchRels`,
+// joinsearch.go.) This bounds a single query's join at 16 base relations.
 type RelSet uint16
 
 // Cost is PG's two-number cost, in PG's units (seq_page_cost = 1.0, design ch. 02
