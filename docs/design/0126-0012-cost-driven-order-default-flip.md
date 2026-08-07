@@ -10,7 +10,8 @@
 
 | field | value |
 | --- | --- |
-| status | executed — documented no-go (2026-08-03) |
+| status | superseded — originally executed no-go (2026-08-03) |
+| superseded by | [leftdeep-joins/](../leftdeep-joins/) — MHJ retired (M0127) |
 | date | 2026-07-31 |
 | task | M0126-0012 — terminal task; **flip-or-documented-no-go, by construction** |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` — §"The acceptance bar" is normative and is NOT restated here |

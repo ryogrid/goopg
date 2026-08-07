@@ -135,7 +135,14 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 		fillInner: o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull,
 	}
 	if captureCTID {
-		m.scanLeaf = findScanLeaf(o.left)
+		// The ctid side-channel is an optimisation for LockRows;
+		// if an unrecognised operator sits between the join and its
+		// scan leaf, skip the capture rather than failing the join.
+		// LockRows will diagnose the unsupported shape through its
+		// own findScanLeaf walker at Open time.
+		if sl, err := findScanLeaf(o.left); err == nil {
+			m.scanLeaf = sl
+		}
 	}
 	o.nlStream = m
 	return nil

@@ -1443,3 +1443,62 @@ func TestLockRowsStampsXmaxOnPartitionedTableLeaf(t *testing.T) {
 		t.Errorf("HeapXmaxLockOnly not set on leaf tuple (Infomask=%#x)", tuple.Header.Infomask)
 	}
 }
+
+// unknownOp is a minimal Operator that is not recognised by any of the
+// lockRows walkers. Its sole purpose is to verify that unrecognised
+// shapes between LockRows and the scan leaf produce a hard error
+// instead of the historical silent pass-through (M0128-P0.2).
+type unknownOp struct{ child Operator }
+
+func (o *unknownOp) Open(*Context) error     { return nil }
+func (o *unknownOp) Next() (TupleSlot, error) { return nil, EOF }
+func (o *unknownOp) Close() error             { return nil }
+func (o *unknownOp) Schema() planner.Schema   { return nil }
+
+// TestLockRowsUnknownShapeErrors verifies that an unrecognised operator
+// type between LockRows and its scan leaf causes findScanLeaf,
+// findScanLeafForRel, and markJoinPreserveCTID to return errors rather
+// than silently returning nil (which would degrade FOR UPDATE to an
+// unlocked pass-through).
+func TestLockRowsUnknownShapeErrors(t *testing.T) {
+	child := &unknownOp{child: &seqScanOp{}}
+	rel := storage.RelFileNode{TblOid: 1, DBOid: 2, RelOid: 3}
+
+	// findScanLeaf must error on the unknown wrapper.
+	_, err := findScanLeaf(child)
+	if err == nil {
+		t.Error("findScanLeaf returned nil error for unknown operator — expected a hard error")
+	}
+	t.Logf("findScanLeaf error (expected): %v", err)
+
+	// findScanLeafForRel must error on the unknown wrapper.
+	_, err = findScanLeafForRel(child, rel)
+	if err == nil {
+		t.Error("findScanLeafForRel returned nil error for unknown operator — expected a hard error")
+	}
+	t.Logf("findScanLeafForRel error (expected): %v", err)
+
+	// markJoinPreserveCTID must error on an unknown op wrapping a join.
+	j := &joinOp{left: &seqScanOp{}, right: &seqScanOp{}}
+	wrappingJoin := &unknownOp{child: j}
+	err = markJoinPreserveCTID(wrappingJoin, rel)
+	if err == nil {
+		t.Error("markJoinPreserveCTID returned nil error for unknown operator — expected a hard error")
+	}
+	t.Logf("markJoinPreserveCTID error (expected): %v", err)
+
+	// All three walkers must return nil for recognised shapes.
+	known := &sortOp{child: &projectOp{child: &seqScanOp{}}}
+	_, err = findScanLeaf(known)
+	if err != nil {
+		t.Errorf("findScanLeaf errored on recognised shape sort→project→seqScan: %v", err)
+	}
+	_, err = findScanLeafForRel(known, rel)
+	if err != nil {
+		t.Errorf("findScanLeafForRel errored on recognised shape: %v", err)
+	}
+	err = markJoinPreserveCTID(known, rel)
+	if err != nil {
+		t.Errorf("markJoinPreserveCTID errored on recognised shape: %v", err)
+	}
+}

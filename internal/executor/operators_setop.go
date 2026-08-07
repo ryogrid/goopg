@@ -257,7 +257,7 @@ func (o *setOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
 	} else {
 		active = o.right
 	}
-	if src := findScanLeaf(active); src != nil {
+	if src, err := findScanLeaf(active); err == nil && src != nil {
 		return src.currentTID()
 	}
 	return storage.RelFileNode{}, storage.ItemPointer{}, false

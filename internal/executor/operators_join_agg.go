@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/hashsize"
@@ -274,6 +275,11 @@ type joinOp struct {
 	// `rows`/`idx` pair (and the never-repopulated `leftCTIDs`/`rowSourceLeft`
 	// side-channel that rode along with it) leave joinOp entirely.
 	latStream *lateralJoinStream
+
+	// joinFilterRemoved is the stats.joinFilterRejected pointer handed by
+	// maybeInstrument; nil when EXPLAIN ANALYZE is not active. Incremented
+	// each time joinPredicateMatchSlot returns false (residual reject).
+	joinFilterRemoved *int64
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -291,6 +297,8 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 	}
 	return &joinOp{plan: plan, left: left, right: right, schema: schema, execResidual: residual}
 }
+
+func (o *joinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -560,6 +568,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
 	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+	buildStart := time.Now()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
@@ -571,6 +580,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			o.releaseBatches()
 			return false, err
 		}
+		o.recordBuildTime(ctx, buildStart)
 		return false, nil
 	}
 	if err := o.right.Open(ctx); err != nil {
@@ -579,7 +589,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// M0118-0009 (eval-plan-qual): preserve build-side heap ctids when a
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
-		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
+			sl, ferr := findScanLeafForRel(o.right, *o.preserveCTIDRel)
+			if ferr != nil {
+				return false, ferr
+			}
+			if sl != nil {
 			// The CTID exception: lazyHashCTID is a map[string] keyed in
 			// lockstep with lazyHash, so this build stays on the string map
 			// whatever the key types say (M0127-P0.3).
@@ -587,6 +601,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			if err := o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth); err != nil {
 				return false, err
 			}
+			o.recordBuildTime(ctx, buildStart)
 			return true, nil
 		}
 	}
@@ -597,7 +612,18 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		o.releaseBatches()
 		return false, err
 	}
+		o.recordBuildTime(ctx, buildStart)
 	return true, nil
+}
+
+// recordBuildTime records the wall-clock build time in the per-plan-node
+// hash-join instrumentation. Merged by MAXIMUM across re-Opens (PG rule).
+// M0128-P2.1.
+func (o *joinOp) recordBuildTime(ctx *Context, start time.Time) {
+	st := ctx.hashJoinStat(o.plan)
+	if ns := time.Since(start).Nanoseconds(); ns > st.BuildTimeNs {
+		st.BuildTimeNs = ns
+	}
 }
 
 // releaseBatches drops the batch files a failed or finished join still owns.
@@ -642,18 +668,30 @@ const maxPresizeBuckets = 1 << 20
 // whether a shared build would spill (M0127-P3.4). Three separate
 // hashsize.Choose calls would be three chances to drift.
 //
-// avgVarBytes is 0: goopg has no per-column average-width statistic to feed it,
-// so a text-heavy build is under-counted and its geometry is sized as if only
-// the 48-byte Datum array were resident. That biases NBatch low, which is the
-// risk 04 §4 names — and is why the batch state also grows on measured
-// overrun rather than trusting this number. Deferral ledger 2026-08-03
-// M0127-P3.1.
-func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int) hashsize.Sizing {
+// M0128-P3.1: avgVarBytes is read from the plan's AvgVarBytes, fed from ANALYZE
+// column-width stats via RelOptInfo. Zero means "unknown" (no ANALYZE stats, or
+// a fixed-width relation), which prices the geometry by column count alone —
+// exactly the old behaviour, so no query changes unless it has text-heavy columns
+// that have been ANALYZEd.
+func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) hashsize.Sizing {
 	var workMem int64
 	if ctx != nil {
 		workMem = ctx.WorkMem
 	}
-	return hashsize.Choose(float64(planner.EstimateRows(buildNode)), buildWidth, 0,
+	// M0128-P3.2: read the post-qual row estimate from the plan — the join
+	// search's RelOptInfo.Rows already has baserestrictinfo selectivity applied,
+	// while EstimateRows(buildNode) dispatches to seqScanRows which ignores
+	// on-scan quals (09 §3.23). When the stored value is zero the plan came
+	// through the legacy path and EstimateRows is the fallback.
+	buildRows := o.plan.InnerRows
+	if buildIsLeft {
+		buildRows = o.plan.OuterRows
+	}
+	if buildRows <= 0 {
+		buildRows = float64(planner.EstimateRows(buildNode))
+	}
+	avgVarBytes := o.plan.AvgVarBytes
+	return hashsize.Choose(buildRows, buildWidth, avgVarBytes,
 		hashsize.EffectiveMemLimit(workMem))
 }
 
@@ -679,7 +717,7 @@ func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidt
 	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
 		return
 	}
-	sizing := o.buildGeometry(ctx, buildNode, buildWidth)
+	sizing := o.buildGeometry(ctx, buildNode, buildWidth, buildIsLeft)
 	// M0127-P3.2: the geometry's NBatch half is honoured now instead of
 	// ignored — and the state is installed even when it comes out as ONE.
 	//
@@ -1139,7 +1177,11 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
+	if !ok && o.joinFilterRemoved != nil {
+		*o.joinFilterRemoved++
+	}
+	return ok, nil
 }
 
 // joinPredicateMatchSlot evaluates plan.Predicate against a slot
@@ -1167,7 +1209,11 @@ func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
+	if !ok && o.joinFilterRemoved != nil {
+		*o.joinFilterRemoved++
+	}
+	return ok, nil
 }
 
 // joinSlotChainOn is M0127-P1.1's operational kill switch. Default ON;

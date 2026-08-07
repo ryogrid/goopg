@@ -177,6 +177,10 @@ type joinlistItem struct {
 	// why the zero value (`parser.JoinInner`) is the safe default everywhere
 	// else. M0127-P5.9-s.
 	jointype parser.JoinType
+	// sjinfo is the SpecialJoinInfo built during deconstruction for outer/
+	// semi/anti joins. nil for leaves and flattened inner-join subproblems.
+	// M0128-P1.1.
+	sjinfo *SpecialJoinInfo
 }
 
 // joinlist is `make_rel_from_joinlist`'s input: items to be joined in an order
@@ -393,7 +397,21 @@ func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits,
 	for _, j := range item.Joins {
 		right := joinlist{leafItem(next)}
 		next++
-		left = combineJoinlists(j.Type, joinPinned(j.Type, collapseJoins), left, right, lim.joinCollapseLimit)
+		pinned := joinPinned(j.Type, collapseJoins)
+		left = combineJoinlists(j.Type, pinned, left, right, lim.joinCollapseLimit)
+		// M0128-P1.1: build SpecialJoinInfo for every outer/semi/anti join.
+		// For P1.1 the pin stays in force regardless, so the entry is data
+		// only — recorded, not consulted. P1.2 consumes it.
+		if j.Type != parser.JoinInner && j.Type != parser.JoinCross {
+			// When pinned, combineJoinlists returns exactly one pinnedItem;
+			// the SpecialJoinInfo lives on it. When not pinned (future:
+			// collapseJoins=true for INNER-like), the join flattens and there
+			// is no single item to attach to — but the pin is mandatory for
+			// outer/semi/anti until P1.2, so that case does not arise.
+			if pinned && len(left) == 1 && !left[0].isLeaf() {
+				left[0].sjinfo = makeSpecialJoinInfo(j.Type, left[0].sub[0].sub, right, j.On)
+			}
+		}
 	}
 	return left
 }

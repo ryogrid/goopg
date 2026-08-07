@@ -853,7 +853,7 @@ type fastPathItemIdent struct {
 // pageItems()-snapshot check described by FastPathViolation. A no-op
 // wrapper (falls straight through to insertItemSorted) when
 // DebugVerifyFastPathInserts is false.
-func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) int {
+func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) (int, error) {
 	if !bt.DebugVerifyFastPathInserts {
 		return insertItemSorted(p, it)
 	}
@@ -862,13 +862,16 @@ func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, 
 		panic(err)
 	}
 	preSnap := append([]item(nil), pre...)
-	lineIdx := insertItemSorted(p, it)
+	lineIdx, err := insertItemSorted(p, it)
+	if err != nil {
+		return 0, err
+	}
 	post, err := pageItems(p)
 	if err != nil {
 		panic(err)
 	}
 	bt.checkFastPathSurvivors(site, blk, it, preSnap, post)
-	return lineIdx
+	return lineIdx, nil
 }
 
 // checkFastPathSurvivors is the pre/post survivor-set comparison behind
@@ -2188,7 +2191,10 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 		return errNeedsSplit
 	}
 
-	lineIdx := bt.insertItemSortedVerified("tryInsertNoSplit", leafBlk, slot.Page(), it)
+	lineIdx, err := bt.insertItemSortedVerified("tryInsertNoSplit", leafBlk, slot.Page(), it)
+	if err != nil {
+		return errNeedsSplit
+	}
 	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
@@ -2259,26 +2265,34 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
-		lineIdx := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
-		bt.traceInsert(blk, lineIdx, it)
-		// Logical-record path (M0002 redo-records): if the pool
-		// has a btree-insert hook configured, emit a small
-		// change record on subsequent dirties of this page in
-		// the same checkpoint epoch instead of a full FPI. The
-		// first dirty in an epoch still emits the FPI baseline.
-		// Falls back to plain MarkDirty when the hook isn't
-		// wired (test helpers, pre-runtime callers).
-		var derr error
-		if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-			itemBytes := it.marshal()
-			derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logIns(bt.rel, blk, itemBytes)
-			})
+		lineIdx, err := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
+		if err != nil {
+			// pageHasSpaceFor and PageInsertItemRawAt disagreed
+			// (root-0040). Fall through to the split path instead
+			// of panicking — the space budget is restated from a
+			// single source (itemEncodedSize), but a residual
+			// disagreement must not strand the latch.
 		} else {
-			bt.pool.MarkDirty(slot)
+			bt.traceInsert(blk, lineIdx, it)
+			// Logical-record path (M0002 redo-records): if the pool
+			// has a btree-insert hook configured, emit a small
+			// change record on subsequent dirties of this page in
+			// the same checkpoint epoch instead of a full FPI. The
+			// first dirty in an epoch still emits the FPI baseline.
+			// Falls back to plain MarkDirty when the hook isn't
+			// wired (test helpers, pre-runtime callers).
+			var derr error
+			if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
+				itemBytes := it.marshal()
+				derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+					return logIns(bt.rel, blk, itemBytes)
+				})
+			} else {
+				bt.pool.MarkDirty(slot)
+			}
+			held.release()
+			return derr
 		}
-		held.release()
-		return derr
 	}
 
 	// Split. Pin a freshly-extended right page exclusively,
@@ -2358,7 +2372,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
 		for _, x := range allItems {
-			lineIdx := insertItemSorted(slot.Page(), x)
+			lineIdx := mustInsertItemSorted(slot.Page(), x)
 			bt.traceInsert(blk, lineIdx, x)
 		}
 		// Drop the freshly-allocated right slot — split avoided.
@@ -2410,11 +2424,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// Reset left page to empty, refill.
 	resetPageItems(slot.Page())
 	for _, x := range leftItems {
-		lineIdx := insertItemSorted(slot.Page(), x)
+		lineIdx := mustInsertItemSorted(slot.Page(), x)
 		bt.traceInsert(blk, lineIdx, x)
 	}
 	for _, x := range rightItems {
-		lineIdx := insertItemSorted(rightSlot.Page(), x)
+		lineIdx := mustInsertItemSorted(rightSlot.Page(), x)
 		bt.traceInsert(rightBlk, lineIdx, x)
 	}
 
@@ -2695,7 +2709,7 @@ func ApplyInsertRecord(page storage.Page, raw []byte) error {
 	if !pageHasSpaceFor(page, it) {
 		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", it.keyLen)
 	}
-	insertItemSorted(page, it)
+	mustInsertItemSorted(page, it)
 	return nil
 }
 
@@ -2760,8 +2774,8 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
 		key:    append([]byte(nil), rightKey...),
 	}
-	insertItemSorted(rootSlot.Page(), leftItem)
-	insertItemSorted(rootSlot.Page(), rightItem)
+	mustInsertItemSorted(rootSlot.Page(), leftItem)
+	mustInsertItemSorted(rootSlot.Page(), rightItem)
 
 	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
 	// both the new root page (backup block 0) and the updated metapage
@@ -2810,22 +2824,24 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	return bt.updateRootMeta(rootBlk, level)
 }
 
+// itemEncodedSize returns the number of bytes the raw item occupies on a page,
+// including the line-pointer ItemID (4 bytes) and the prefix+key body.
+// This is the single source of truth for the budget both pageHasSpaceFor and
+// PageInsertItemRawAt depend on — they were once computed from different
+// expressions and a mismatch at a nearly-full leaf triggered the
+// "not enough free space in page" panic (root-0040).
+func itemEncodedSize(it item) int {
+	const itemIDSize = 4 // matches storage.itemIDSize
+	return itemIDSize + itemPrefixSize + len(it.key)
+}
+
 // pageHasSpaceFor reports whether `it` would fit on `p` if appended.
 func pageHasSpaceFor(p storage.Page, it item) bool {
 	h := storage.MustHeader(p)
 	free := int(h.Upper()) - int(h.Lower())
-	const itemIDSize = 4
-	return free >= itemIDSize+itemPrefixSize+len(it.key)
+	return free >= itemEncodedSize(it)
 }
 
-// insertItemSorted inserts it into p in sorted-key order. Caller must
-// have verified there is room (pageHasSpaceFor) — otherwise this panics.
-//
-// The implementation pulls all items off the page, inserts the new one
-// at the right offset, and rewrites the page. That's quadratic in the
-// item count but v0 leaves are small (<256 entries) and split before
-// growing further; the simplicity is worth it until profiling says
-// otherwise.
 // insertItemSorted (M0055-0002 Phase A) writes `it` into its
 // sorted position on the page WITHOUT decoding and re-encoding
 // every existing item. Binary-searches the existing line-pointer
@@ -2838,9 +2854,13 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // encoded every item. The pre-Phase-A path was the chief CPU
 // hotspot per the M0055 baseline pprof (analysis/btree-baseline-
 // 2026-05-06.md) — this rewrite eliminates the O(n) re-encode.
-// insertItemSorted writes it into p at its sorted position and returns the
-// 0-based line-pointer index it landed at (used by BTree.traceInsert).
-func insertItemSorted(p storage.Page, it item) int {
+//
+// Returns the 0-based line-pointer index (used by BTree.traceInsert) and
+// any error from PageInsertItemRawAt. Callers that have pre-verified space
+// via pageHasSpaceFor should use mustInsertItemSorted; callers on the
+// no-split fast path should route storage.ErrNoSpaceInPage to the split
+// path instead of panicking (root-0040).
+func insertItemSorted(p storage.Page, it item) (int, error) {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		panic(err)
@@ -2870,9 +2890,22 @@ func insertItemSorted(p storage.Page, it item) int {
 	// PageInsertItemRawAt is 1-based, line-pointer index lo is
 	// 0-based; convert.
 	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
+		return 0, err
+	}
+	return lo, nil
+}
+
+// mustInsertItemSorted is the panicking variant for callers that have
+// pre-verified space (dedup-recovery refill, split left/right refill,
+// createNewRoot, WAL replay). A panic here means the space estimate and
+// the real insert logic have diverged — a logic bug, not a runtime
+// condition.
+func mustInsertItemSorted(p storage.Page, it item) int {
+	idx, err := insertItemSorted(p, it)
+	if err != nil {
 		panic(err)
 	}
-	return lo
+	return idx
 }
 
 // tryInsertOnCachedRightmost (M0055-0002-followup-rightmost-cache)
@@ -2927,7 +2960,11 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		bt.unpinW(slot)
 		return false, nil
 	}
-	lineIdx := bt.insertItemSortedVerified("tryInsertOnCachedRightmost", blk, slot.Page(), it)
+	lineIdx, err := bt.insertItemSortedVerified("tryInsertOnCachedRightmost", blk, slot.Page(), it)
+	if err != nil {
+		bt.unpinW(slot)
+		return false, nil
+	}
 	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
@@ -2993,10 +3030,9 @@ func dedupConsolidate(items []item) []item {
 // overhead. Used to decide whether dedup recovered enough space
 // to skip the split.
 func compactRawSize(items []item) int {
-	const itemIDSize = 4 // matches storage.itemIDSize
 	total := 0
 	for _, it := range items {
-		total += itemIDSize + 8 + len(it.key) // marshal: 8-byte prefix + key
+		total += itemEncodedSize(it)
 	}
 	return total
 }

@@ -33,6 +33,16 @@ type nodeStats struct {
 	// increments it directly via a pointer handed to it in maybeInstrument.
 	heapFetches int64
 
+	// filterRejected counts tuples a Filter operator rejected (scan-level
+	// qual). Mirrors upstream's Instrumentation.nfiltered1 for scan nodes,
+	// surfaced by EXPLAIN ANALYZE as "Rows Removed by Filter".
+	filterRejected int64
+
+	// joinFilterRejected counts tuples a join operator rejected on its join
+	// residual qual. Mirrors upstream's Instrumentation.nfiltered1 for join
+	// nodes, surfaced by EXPLAIN ANALYZE as "Rows Removed by Join Filter".
+	joinFilterRejected int64
+
 	// bufHit / bufRead / bufDirtied / bufWritten are the cumulative
 	// shared-buffer hit/read/dirtied/written counts EXPLAIN (ANALYZE,
 	// BUFFERS) attributes to this node, inclusive of its children (same
@@ -195,6 +205,23 @@ type heapFetchCounter interface {
 	setHeapFetchCounter(*int64)
 }
 
+// filterRemoveCounter is implemented by operators that evaluate scan
+// filter qual(s) and reject rows that don't qualify. maybeInstrument
+// hands the operator a pointer to its node's stats.filterRejected so
+// it can ++ on each rejection. Surfaces as "Rows Removed by Filter".
+type filterRemoveCounter interface {
+	setFilterRemoveCounter(*int64)
+}
+
+// joinFilterRemoveCounter is implemented by join operators that
+// evaluate join residual qual(s) and reject candidate matches.
+// maybeInstrument hands the operator a pointer to its node's
+// stats.joinFilterRejected so it can ++ on each rejection. Surfaces
+// as "Rows Removed by Join Filter".
+type joinFilterRemoveCounter interface {
+	setJoinFilterRemoveCounter(*int64)
+}
+
 // nodeStatsTable maps a planner.Node back to its instrumentation
 // counters. The EXPLAIN ANALYZE renderer walks the plan tree the
 // same way the static path does and looks up stats in this map
@@ -249,6 +276,12 @@ func maybeInstrument(plan planner.Node, op Operator) Operator {
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
 	if hf, ok := op.(heapFetchCounter); ok {
 		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
+	if fr, ok := op.(filterRemoveCounter); ok {
+		fr.setFilterRemoveCounter(&stats.filterRejected)
+	}
+	if jf, ok := op.(joinFilterRemoveCounter); ok {
+		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
 	}
 	if sc, ok := op.(instrumentScopeCarrier); ok {
 		sc.setInstrumentScope(instrumentScope)

@@ -327,6 +327,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// joinInfoList is root->join_info_list from jointree deconstruction,
+		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
+		// inside the search (M0128-P1.2).
+		joinInfoList: ctx.joinInfoList,
 	})
 	if err != nil || searched == nil {
 		return node, pred, false

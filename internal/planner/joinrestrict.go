@@ -292,6 +292,90 @@ func (l *restrictInfoList) clausesFor(outer, inner RelSet) []*restrictInfo {
 	return out
 }
 
+// buildJoinRelRestrictList is PG's build_joinrel_restrictlist (relnode.c:1285):
+// the clauses that become the joinrel's restriction list for a specific outer/
+// inner pair. It generalises clausesFor with outer-join clause distribution:
+// when sjinfo is non-nil (this is a special join), clauses on the nullable side
+// of the outer join are admitted as filter clauses for the join result — they
+// are computable at this level but must NOT be applied before the outer join
+// (they would incorrectly filter rows that should be null-extended).
+//
+// Dedup is by pointer equality (PG's list_append_unique_ptr: the same
+// RestrictInfo is linked into multiple input rels' joininfo lists, so two
+// per-input scans see duplicates). M0128-P1.3.
+func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo *SpecialJoinInfo) []*restrictInfo {
+	// Core set: clauses computable here that touch both sides.
+	base := l.clausesFor(outer, inner)
+	if sjinfo == nil {
+		return base // inner join — clausesFor is exactly right
+	}
+
+	// For outer joins, also admit clauses on the nullable side as filter
+	// clauses. PG does this through per-rel joininfo distribution and
+	// required_relids inflation; goopg scans the flat list for clauses
+	// computable here that reference only the nullable side.
+	join := outer | inner
+	var extra []*restrictInfo
+	for _, ri := range l.all {
+		if !relsSubset(ri.relids, join) {
+			continue
+		}
+		// Already in base (touches both sides)? clausesFor already picked it.
+		if relsOverlap(ri.relids, outer) && relsOverlap(ri.relids, inner) {
+			continue
+		}
+		// Is this clause on the nullable side of this outer join?
+		if isOuterJoinFilterClause(ri.relids, sjinfo) {
+			extra = append(extra, ri)
+		}
+	}
+
+	return dedupRestrictInfoPtrs(append(base, extra...))
+}
+
+// isOuterJoinFilterClause reports whether a clause whose relids are a subset of
+// the joinrel's relids is a filter clause for an outer join — it references only
+// the nullable side and must be applied after the join, not before. PG encodes
+// this with incompatible_relids; goopg checks the nullable side directly.
+// M0128-P1.3.
+func isOuterJoinFilterClause(clauseRelids RelSet, sjinfo *SpecialJoinInfo) bool {
+	switch sjinfo.Jointype {
+	case parser.JoinLeft:
+		// RHS is nullable — clauses entirely in RHS are filter clauses.
+		return relsSubset(clauseRelids, sjinfo.SynRighthand) && !relsOverlap(clauseRelids, sjinfo.SynLefthand)
+	case parser.JoinFull:
+		// Both sides nullable — clauses entirely in either side are filter clauses.
+		return (relsSubset(clauseRelids, sjinfo.SynRighthand) && !relsOverlap(clauseRelids, sjinfo.SynLefthand)) ||
+			(relsSubset(clauseRelids, sjinfo.SynLefthand) && !relsOverlap(clauseRelids, sjinfo.SynRighthand))
+	case parser.JoinRight:
+		// LHS is nullable (RIGHT join = reversed LEFT).
+		return relsSubset(clauseRelids, sjinfo.SynLefthand) && !relsOverlap(clauseRelids, sjinfo.SynRighthand)
+	}
+	return false
+}
+
+// dedupRestrictInfoPtrs removes duplicate *restrictInfo entries by pointer
+// equality, preserving order (PG's list_append_unique_ptr). The same
+// RestrictInfo is linked into multiple input rels' joininfo lists in PG;
+// goopg's flat-list scan can produce the same clause from both sides when
+// two different input pairs can form the same joinrel — which only happens
+// when join-order restrictions are present. M0128-P1.3.
+func dedupRestrictInfoPtrs(clauses []*restrictInfo) []*restrictInfo {
+	if len(clauses) <= 1 {
+		return clauses
+	}
+	seen := make(map[*restrictInfo]bool, len(clauses))
+	out := clauses[:0]
+	for _, ri := range clauses {
+		if seen[ri] {
+			continue
+		}
+		seen[ri] = true
+		out = append(out, ri)
+	}
+	return out
+}
+
 // selectivityClauses is `clausesFor` reduced to the clauses that may
 // CONTRIBUTE SELECTIVITY at this join — 04 §5's equivalence-class rule, and
 // P5.6's input to `calcJoinrelSize`.

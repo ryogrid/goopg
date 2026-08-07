@@ -1,6 +1,7 @@
 # 0034-0001 — DP-Based Bushy Join Enumeration (DPccp-Style)
 
-**Status:** accepted
+**Status:** superseded
+**Superseded by:** [leftdeep-joins/](leftdeep-joins/) — the PG-shaped DP search replaces this DPccp-style enumerator; both the old subset-bitmask DP code and its design are retired (M0127-P6.3).
 **Parent milestone:** M0034
 **Date:** 2026-05-02
 

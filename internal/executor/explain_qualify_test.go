@@ -247,3 +247,37 @@ func TestExplainNamesDisambiguateRepeatedRelation(t *testing.T) {
 			got, "Sort Key: eq_r.st, x.st", strings.Join(lines, "\n"))
 	}
 }
+
+// M0128-P5.1 — when a relation is scanned twice without an alias (e.g. a
+// subquery scanning the same table the outer query also scans), the second
+// scan's node label must carry a `_1` suffix so the two lines are
+// distinguishable. PG does this via select_rtable_names_for_explain
+// (ruleutils.c).
+func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
+	lines := qualifyExplainLines(t,
+		"EXPLAIN (COSTS OFF) SELECT * FROM eq_r WHERE id IN (SELECT id FROM eq_r)")
+
+	// Count Seq Scan lines that mention eq_r — there should be at
+	// least two, and one should carry the disambiguated suffix.
+	hasBare := false
+	hasDisambiguated := false
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "->  ") {
+			trimmed = trimmed[4:]
+		}
+		if strings.HasPrefix(trimmed, "Seq Scan on eq_r_1") {
+			hasDisambiguated = true
+		} else if strings.HasPrefix(trimmed, "Seq Scan on eq_r") {
+			hasBare = true
+		}
+	}
+	if !hasBare {
+		t.Errorf("expected one Seq Scan on eq_r (bare) line\nplan:\n%s",
+			strings.Join(lines, "\n"))
+	}
+	if !hasDisambiguated {
+		t.Errorf("expected one Seq Scan on eq_r_1 (disambiguated) line\nplan:\n%s",
+			strings.Join(lines, "\n"))
+	}
+}

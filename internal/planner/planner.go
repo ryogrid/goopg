@@ -365,6 +365,11 @@ type resolveContext struct {
 	// `tryPGShapedJoinSearch` (joinsearchseam.go) since P5.9-b.
 	joinlist joinlist
 
+	// joinInfoList is root->join_info_list: every SpecialJoinInfo built
+	// during jointree deconstruction, in bottom-up order. Populated by
+	// deconstructJointree and consumed by join_is_legal (P1.2+). M0128-P1.1.
+	joinInfoList []*SpecialJoinInfo
+
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
 	// win at the search root (`finalPath`) and whether one is worth keeping
@@ -1616,6 +1621,19 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if lerr != nil {
 			return nil, lerr
 		}
+		// M0128-P6.1 resjunk-ctid rowmark: PG adds junk ctid attributes
+		// to the targetlist so TID identity rides the tuple. goopg instead
+		// propagates TIDs through the MaterializedSlot's hasCTID/ctidBlock/
+		// ctidOff side channel, which joinOp.preserveBuildSide already
+		// forwards through the build side for hash joins. The column-path
+		// (wireRowMarkCtidColumns) is DISABLED until intermediate-node
+		// schema propagation is implemented — adding ctid to a SeqScan
+		// schema after parent nodes are built causes column misalignment
+		// (the ctid leaks into the right child's output positions in
+		// self-joins, attested by the eval-plan-qual partiallock failure).
+		// When re-enabled it must also update every node on the path from
+		// the scan to the root, not just the scan + top Project.
+		numCtid := 0 // wireRowMarkCtidColumns disabled — use slot side-channel
 		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
 		// after the LIMIT count of *successfully-locked* rows (PG plans
 		// `Limit → LockRows → Sort`). goopg's default plan above produced
@@ -1626,10 +1644,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// Limit, lift that Limit ABOVE the LockRows and hand its LIMIT/OFFSET
 		// expressions to the LockRows so the executor caps the drain at
 		// LIMIT+OFFSET locked rows. M0118-0003.
-		if lifted := liftLimitAboveLockRows(out, locks, s.Locking[0].Pos()); lifted != nil {
+		if lifted := liftLimitAboveLockRows(out, locks, s.Locking[0].Pos(), numCtid); lifted != nil {
 			out = lifted
+			if lr, ok := out.(*LockRows); ok {
+				lr.NumCtidCols = numCtid
+			}
 		} else {
-			out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
+			out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks, NumCtidCols: numCtid}
 		}
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
@@ -1837,7 +1858,7 @@ func locksHaveSkipLocked(locks []LockedRel) bool {
 //   - the top node is not a Project directly wrapping a Limit, or
 //   - the Limit uses WITH TIES (its emission count is data-dependent and can
 //     exceed LIMIT, which the fixed drain cap cannot model).
-func liftLimitAboveLockRows(out Node, locks []LockedRel, pos int) Node {
+func liftLimitAboveLockRows(out Node, locks []LockedRel, pos int, numCtid int) Node {
 	if !locksHaveSkipLocked(locks) {
 		return nil
 	}
@@ -1859,6 +1880,7 @@ func liftLimitAboveLockRows(out Node, locks []LockedRel, pos int) Node {
 		Locks:       locks,
 		LimitCount:  lim.Limit,
 		OffsetCount: lim.Offset,
+		NumCtidCols: numCtid,
 	}
 	lim.Child = lock
 	return lim
@@ -1869,12 +1891,34 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 		return nil, &PlanError{Pos: s.Pos(), Code: "0A000", Message: "FOR UPDATE/SHARE requires a FROM clause"}
 	}
 	var out []LockedRel
+	// Assign sequential 1-based rowmarkIds, one per binding (range-table
+	// entry). Self-joins produce distinct bindings for the same physical OID
+	// and each gets its own id. PG's rowmarkId is per-range-table-entry too.
+	// M0128-P6.1 resjunk-ctid rowmark.
+	markID := 1
+	seen := map[string]int{} // "OID@offset" → rowmarkId (dedup: same binding across multiple clauses)
+	emit := func(b rangeBinding, strength LockStrength, policy LockWaitPolicy) {
+		key := fmt.Sprintf("%d@%d", b.table.OID, b.offset)
+		id, ok := seen[key]
+		if !ok {
+			id = markID
+			seen[key] = id
+			markID++
+		}
+		out = append(out, LockedRel{
+			Table: b.table, Alias: b.alias,
+			Strength: strength, WaitPolicy: policy,
+			ColOffset: b.offset,
+			RowMarkId: id,
+			CtidResno: -1, // wired later by the plan builder
+		})
+	}
 	for _, lc := range s.Locking {
 		strength := lockStrengthFromParser(lc.Strength)
 		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
 		if len(lc.Targets) == 0 {
 			for _, b := range ctx.bindings {
-				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
+				emit(b, strength, policy)
 			}
 			continue
 		}
@@ -1884,7 +1928,7 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
 					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
 			}
-			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
+			emit(b, strength, policy)
 		}
 	}
 	return out, nil
@@ -1940,6 +1984,155 @@ func findBindingByName(bindings []rangeBinding, name string) (rangeBinding, bool
 	return rangeBinding{}, false
 }
 
+// wireRowMarkCtidColumns adds resjunk ctid columns to the schema of every
+// SeqScan or IndexScan whose relation is rowmarked, and extends the top-level
+// Project to carry those columns through to the LockRows. Returns the number of
+// ctid columns wired (also reflected in locks[i].CtidResno, set by this call).
+// When no scan can be wired (e.g. a CTE scan), CtidResno stays -1 and the
+// executor falls back to the walker/side-channel path. M0128-P6.1 resjunk-ctid rowmark.
+func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
+	if len(locks) == 0 {
+		return 0
+	}
+	// Build a set of locked relation OIDs.
+	lockedOID := map[uint32]int{} // OID → index into locks
+	for i := range locks {
+		if locks[i].Table != nil {
+			lockedOID[locks[i].Table.OID] = i
+		}
+	}
+	if len(lockedOID) == 0 {
+		return 0
+	}
+	// Walk the plan tree and append a ctid column to every matching scan's
+	// schema. Use the same node-enumeration pattern as boundaryWalkChildren.
+	// For self-joins each scan gets its own ctid column; scans are matched to
+	// LockedRel entries by OID, assigning to the first LockedRel for that OID
+	// that hasn't been wired yet.
+	ctidType := catalog.Type{Name: "tid"}
+	type taggedScan struct {
+		lockIdx   int // index into locks
+		schemaIdx int // ctid column index in this scan's output
+	}
+	tagged := []taggedScan{} // in scan-tree walk order
+	// nextLockIdx[oid] is the index into locks of the next LockedRel for this
+	// OID that should be wired when a matching scan is found. Starts at the
+	// first LockedRel for each OID, increments on each match.
+	nextLockIdx := map[uint32]int{}
+	for i := range locks {
+		if locks[i].Table != nil {
+			if _, exists := nextLockIdx[locks[i].Table.OID]; !exists {
+				nextLockIdx[locks[i].Table.OID] = i
+			}
+		}
+	}
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch s := n.(type) {
+		case *SeqScan:
+			if li, ok := nextLockIdx[s.Table.OID]; ok {
+				idx := len(s.schema)
+				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
+				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
+				// Advance to the next LockedRel for this OID, if any.
+				li++
+				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
+					li++
+				}
+				if li < len(locks) {
+					nextLockIdx[s.Table.OID] = li
+				} else {
+					delete(nextLockIdx, s.Table.OID)
+				}
+			}
+		case *IndexScan:
+			if li, ok := nextLockIdx[s.Table.OID]; ok {
+				idx := len(s.schema)
+				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
+				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
+				li++
+				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
+					li++
+				}
+				if li < len(locks) {
+					nextLockIdx[s.Table.OID] = li
+				} else {
+					delete(nextLockIdx, s.Table.OID)
+				}
+			}
+		case *Project:
+			walk(s.Child)
+		case *Filter:
+			walk(s.Child)
+		case *Sort:
+			walk(s.Child)
+		case *Limit:
+			walk(s.Child)
+		case *Distinct:
+			walk(s.Child)
+		case *DistinctOn:
+			walk(s.Child)
+		case *OrdinalityWrap:
+			walk(s.Child)
+		case *Aggregate:
+			walk(s.Child)
+		case *WindowAgg:
+			walk(s.Child)
+		case *Memoize:
+			walk(s.Child)
+		case *LockRows:
+			walk(s.Child)
+		case *Join:
+			walk(s.Left)
+			walk(s.Right)
+		case *SetOp:
+			walk(s.Left)
+			walk(s.Right)
+		case *NestedLoopIndexJoin:
+			walk(s.Outer)
+			walk(s.Inner)
+		// DML wrappers / utility nodes that wrap a plan: walk their child.
+		case *Update:
+			walk(s.Child)
+		case *Delete:
+			walk(s.Child)
+		case *Insert:
+			if s.Source != nil {
+				walk(s.Source)
+			}
+		}
+	}
+	walk(root)
+	if len(tagged) == 0 {
+		return 0
+	}
+	// Extend the top-level Project with ColumnRef entries for the ctid columns
+	// so they survive the projection. The ctid resno that the executor reads is
+	// the column's index in the Project's output (i.e. the final user-visible
+	// schema + trailing ctid). Set it on the LockedRel.
+	if proj, ok := root.(*Project); ok {
+		for _, ts := range tagged {
+			li := ts.lockIdx
+			proj.Targets = append(proj.Targets, &ColumnRef{
+				pos:   proj.pos,
+				Index: ts.schemaIdx,
+				Name:  fmt.Sprintf("ctid%d", locks[li].RowMarkId),
+				Type:  ctidType,
+			})
+			proj.schema = append(proj.schema, SchemaColumn{
+				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
+				Type:           ctidType,
+				SourceTableIdx: -1,
+			})
+			locks[li].CtidResno = len(proj.schema) - 1
+		}
+	}
+	return len(tagged)
+}
+
 func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveContext, error) {
 	if len(s.FromExprs) == 0 {
 		return planFromRangeVars(s.From, cat)
@@ -1989,7 +2182,11 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
-	rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	// M0128-P4.1: reduce outer joins before deconstruction so that
+		// demoted joins enter the joinlist as plain INNER joins.
+		reduceOuterJoins(s.FromExprs, s.Where)
+		rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil
 }
 

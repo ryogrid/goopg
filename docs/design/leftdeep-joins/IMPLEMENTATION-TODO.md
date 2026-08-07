@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | draft — no task started; this file is the decomposition source for fix_plan milestone filing |
+| status | in progress — P6 complete (M0127 closed); P0–P5 are the remaining decomposition for fix_plan filing |
 | date | 2026-08-02 |
 | convention | tasks are sized one-Ralph-loop each where possible; **[stage]** refers to [08-migration-and-removal.md](08-migration-and-removal.md) §2; every task lists its gate; deferral = ledger row + unchecked box, never a silent close |
 
@@ -1930,12 +1930,12 @@
   0 changed**) + `make ralph-state-guard` OK.
   `TestExprSwitchInventoryIsPinned` caught the file split and was re-keyed
   in-commit (four walker pins `bushy.go`→`joinlayout.go`).
-- [ ] **P6.4** Supersession stamps (0034-0001, 0038-0001, cost-model/09 §3
+- [x] **P6.4** Supersession stamps (0034-0001, 0038-0001, cost-model/09 §3
   allowance, 0125/0126 MHJ chapters); README index status flips; ledger
   rows for every deliberately-skipped PG behaviour (GEQO, skew buckets,
   SpecialJoinInfo in-DP — now unblocked by the bushy phase, still gated on
   `join_is_legal` inference —, shared spilling builds, full
-  join_order_restriction inference).
+  join_order_restriction inference). **DONE 2026-08-07.**
 
 ## Standing deferral pointers (file rows when their stage lands)
 

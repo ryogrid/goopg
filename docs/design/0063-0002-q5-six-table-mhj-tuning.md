@@ -2,7 +2,8 @@
 
 | field      | value |
 | ---------- | ----- |
-| status     | draft |
+| status     | superseded |
+| superseded by | [leftdeep-joins/](leftdeep-joins/) — MHJ retired (M0127) |
 | date       | 2026-05-07 |
 | milestone  | 0063 — TPC-H residual long-tail v2 |
 | supersedes | — |

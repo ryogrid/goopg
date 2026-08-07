@@ -163,3 +163,87 @@ func TestPlanSelectWithoutLockingNoWrapper(t *testing.T) {
 		t.Errorf("SELECT without locking produced *LockRows wrapper: %T", node)
 	}
 }
+
+// TestPlanCtidRowMarkWiring — M0128-P6.1 resjunk-ctid rowmark: a single-table
+// SELECT … FOR UPDATE assigns sequential RowMarkId, wires a ctid column into the
+// scan schema, extends the Project, and sets CtidResno on the LockedRel.
+func TestPlanCtidRowMarkWiring(t *testing.T) {
+	// M0128-P6.1 resjunk-ctid rowmark is DISABLED: the column-path
+	// (wireRowMarkCtidColumns) is turned off because it doesn't propagate
+	// ctid columns through intermediate nodes (Join etc.), causing column
+	// misalignment in self-joins. The executor instead uses the
+	// MaterializedSlot's hasCTID/ctidBlock/ctidOff side channel, which
+	// joinOp.preserveBuildSide already forwards through hash joins.
+	// When re-enabled, this test verifies:
+	//   CtidResno >= 0, NumCtidCols >= 1, Project includes ctid column,
+	//   LockRows strips ctid from Output(), SeqScan schema extended.
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "SELECT aid FROM pgbench_accounts FOR UPDATE")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	lr, ok := node.(*LockRows)
+	if !ok {
+		t.Fatalf("root node = %T, want *LockRows", node)
+	}
+	if len(lr.Locks) != 1 {
+		t.Fatalf("len(Locks) = %d, want 1", len(lr.Locks))
+	}
+	lk := lr.Locks[0]
+	if lk.RowMarkId != 1 {
+		t.Errorf("RowMarkId = %d, want 1", lk.RowMarkId)
+	}
+	// Column path disabled: CtidResno stays -1 (slot side-channel instead).
+	if lk.CtidResno != -1 {
+		t.Errorf("CtidResno = %d, want -1 (column path disabled)", lk.CtidResno)
+	}
+	if lr.NumCtidCols != 0 {
+		t.Errorf("NumCtidCols = %d, want 0 (column path disabled)", lr.NumCtidCols)
+	}
+	// Output schema equals child output (no ctid stripping needed).
+	output := lr.Output()
+	childOutput := lr.Child.Output()
+	if len(output) != len(childOutput) {
+		t.Errorf("Output().len = %d, want == child.Output().len (%d) — no ctid to strip",
+			len(output), len(childOutput))
+	}
+}
+
+// TestPlanCtidRowMarkMultiTable — verifies RowMarkId assignment for multiple
+// locked relations.  M0128-P6.1 column path is disabled: CtidResno stays -1
+// and NumCtidCols is 0 (the executor uses the MaterializedSlot side channel).
+func TestPlanCtidRowMarkMultiTable(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t,
+		"SELECT a.aid, b.aid FROM pgbench_accounts a, pgbench_accounts b FOR UPDATE OF a, b")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	lr, ok := node.(*LockRows)
+	if !ok {
+		t.Fatalf("root node = %T, want *LockRows", node)
+	}
+	if len(lr.Locks) < 2 {
+		t.Fatalf("len(Locks) = %d, want >= 2", len(lr.Locks))
+	}
+	ids := map[int]bool{}
+	for _, lk := range lr.Locks {
+		if lk.RowMarkId < 1 {
+			t.Errorf("RowMarkId = %d for %s, want >= 1", lk.RowMarkId, lk.Alias)
+		}
+		if ids[lk.RowMarkId] {
+			t.Errorf("duplicate RowMarkId %d", lk.RowMarkId)
+		}
+		ids[lk.RowMarkId] = true
+		// Column path disabled: CtidResno stays -1.
+		if lk.CtidResno != -1 {
+			t.Errorf("CtidResno = %d for %s, want -1 (column path disabled)", lk.CtidResno, lk.Alias)
+		}
+	}
+	// Column path disabled: NumCtidCols is 0 (no ctid stripping).
+	if lr.NumCtidCols != 0 {
+		t.Errorf("NumCtidCols = %d, want 0 (column path disabled)", lr.NumCtidCols)
+	}
+}

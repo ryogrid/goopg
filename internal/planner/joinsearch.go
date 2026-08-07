@@ -155,10 +155,19 @@ type searchCtx struct {
 	// being handed a phase argument it would otherwise ignore. Meaningless
 	// while `trace` is nil.
 	tracePhase int
+
+	// joinInfoList is root->join_info_list: every SpecialJoinInfo built during
+	// jointree deconstruction, in bottom-up order. Consumed by join_is_legal
+	// (joinIsLegal), joinOrderRestricted, and hasJoinRestriction. nil means
+	// "no special joins" — a simple inner-join-only FROM clause — which is
+	// the fast path equivalent of an empty list. M0128-P1.2.
+	joinInfoList []*SpecialJoinInfo
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.
-func newSearchCtx(nrels int, cp costParams) (*searchCtx, error) {
+// joinInfoList is the statement's SpecialJoinInfo list (nil if none — a simple
+// inner-join FROM clause).
+func newSearchCtx(nrels int, cp costParams, joinInfoList []*SpecialJoinInfo) (*searchCtx, error) {
 	if nrels < 1 {
 		return nil, fmt.Errorf("join search: need at least one base relation, got %d", nrels)
 	}
@@ -166,10 +175,11 @@ func newSearchCtx(nrels int, cp costParams) (*searchCtx, error) {
 		return nil, fmt.Errorf("join search: %d base relations exceeds the %d-relation relset width", nrels, maxSearchRels)
 	}
 	return &searchCtx{
-		joinrels: make([][]*RelOptInfo, nrels+1),
-		relMap:   make(map[RelSet]*RelOptInfo),
-		nrels:    nrels,
-		cp:       cp,
+		joinrels:     make([][]*RelOptInfo, nrels+1),
+		relMap:       make(map[RelSet]*RelOptInfo),
+		nrels:        nrels,
+		cp:           cp,
+		joinInfoList: joinInfoList,
 	}, nil
 }
 
@@ -303,7 +313,7 @@ func (s *searchCtx) finalPath() (*Path, error) {
 // constructing the rel (relnode.c:211), and a flag that arrived after the first
 // `addPath` would have let one dominance decision be taken in the wrong regime.
 // Pass 0 for "fetch all rows", which is every caller that has no LIMIT.
-func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams, tupleFraction float64) (*searchCtx, error) {
+func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelInfo, cp costParams, tupleFraction float64, joinInfoList []*SpecialJoinInfo) (*searchCtx, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("join search: empty FROM list")
 	}
@@ -311,7 +321,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		return nil, fmt.Errorf("join search: %d bindings but %d scans and %d rel infos",
 			len(bindings), len(scans), len(relInfos))
 	}
-	s, err := newSearchCtx(len(bindings), cp)
+	s, err := newSearchCtx(len(bindings), cp, joinInfoList)
 	if err != nil {
 		return nil, err
 	}

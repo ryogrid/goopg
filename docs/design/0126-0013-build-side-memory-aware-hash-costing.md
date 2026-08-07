@@ -15,7 +15,8 @@
 
 | field | value |
 | --- | --- |
-| status | executed — final no-go (2026-08-03) |
+| status | superseded — originally final no-go (2026-08-03) |
+| superseded by | [leftdeep-joins/](../leftdeep-joins/) — MHJ retired (M0127); successor leftdeep-joins/ already named in original text |
 | date | 2026-07-31 |
 | task | M0126-0013 — **CONDITIONAL: triggered only by an M0126-0012 no-go** |
 | milestone | `docs/milestones/0126-cost-driven-planning-production-viability.md` — the bar is defined there, not here |

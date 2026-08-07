@@ -379,9 +379,10 @@ func (o *projectOp) Next() (TupleSlot, error) {
 // to the parent unchanged, so filter never owns Row buffers and
 // no borrow contract is needed.
 type filterOp struct {
-	child Operator
-	pred  planner.Expr
-	ctx   *Context
+	child         Operator
+	pred          planner.Expr
+	ctx           *Context
+	filterRemoved *int64 // set by maybeInstrument; nil when not instrumented
 }
 
 func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
@@ -391,6 +392,8 @@ func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
 func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
 func (o *filterOp) Schema() planner.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
+
+func (o *filterOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 func (o *filterOp) Next() (TupleSlot, error) {
 	rejected := 0
@@ -418,6 +421,9 @@ func (o *filterOp) Next() (TupleSlot, error) {
 		}
 		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
 			return slot, nil
+		}
+		if o.filterRemoved != nil {
+			*o.filterRemoved++
 		}
 		rejected++
 	}

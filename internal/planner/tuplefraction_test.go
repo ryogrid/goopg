@@ -204,6 +204,7 @@ func tfSearch(t *testing.T, lim *Limit) *searchCtx {
 		[]baseRelInfo{{filteredRows: 1000}, {filteredRows: 1000}},
 		defaultCostParams(),
 		fraction,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("buildInitialRels: %v", err)

@@ -90,9 +90,7 @@ them. Both are used, at different phase boundaries:
 - Every place goopg's chosen plan differs from PG's is recorded and classified
   against a **Divergence-from-PostgreSQL allow-list**, assembled from the per-
   chapter divergence sections:
-  - `MultiHashJoin` where PG uses a left-deep hash cascade
-    ([06](06-scan-and-join-path-costs.md) §4) — **allowed**;
-  - hash semi/anti where PG uses an index-nested-loop semi/anti
+    - hash semi/anti where PG uses an index-nested-loop semi/anti
     ([06](06-scan-and-join-path-costs.md) §2.4) — **allowed**;
   - a redundant sort a syntactic pathkey comparison did not elide
     ([04](04-pathkeys-and-ordering.md) §2.1) — **allowed**;
@@ -116,7 +114,7 @@ The distinction the whole bundle rests on: PG is the authority for the cost
 those are validated by reading PG source and by unit tests that check goopg's
 `cost_seqscan` etc. produce PG's numbers for known inputs. PG is **not** the
 authority for the final *plan* — goopg's executor makes some PG plans impossible
-and some goopg plans (MHJ) unavailable to PG. Conflating the two would make the
+and some goopg plans unavailable to PG. Conflating the two would make the
 gate demand goopg abandon its own operators, which is not the goal.
 
 ## 4. Honest measurement discipline
