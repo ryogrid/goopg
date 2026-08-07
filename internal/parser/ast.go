@@ -680,6 +680,8 @@ const (
 	JoinRight
 	JoinFull
 	JoinCross
+	JoinSemi  // planner-internal: SEMI join (EXISTS → JOIN_SEMI)
+	JoinAnti // planner-internal: ANTI join (NOT EXISTS → JOIN_ANTI)
 )
 
 // JoinExpr is one JOIN clause attached to a FROM base item.

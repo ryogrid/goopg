@@ -795,3 +795,250 @@ func TestDedupRestrictInfoPtrs(t *testing.T) {
 		})
 	}
 }
+
+// ── M0128-P1.4 SEMI/ANTI legality tests ──
+
+// mkSEMISJ builds a SEMI SpecialJoinInfo with the given syntactic RHS
+// distinct from the minimum RHS, to test the unique-ified skip.
+func mkSEMISJ(minLHS, minRHS, synRHS RelSet) *SpecialJoinInfo {
+	return &SpecialJoinInfo{
+		MinLefthand:  minLHS,
+		MinRighthand: minRHS,
+		SynLefthand:  minLHS,
+		SynRighthand: synRHS,
+		Jointype:     parser.JoinSemi,
+	}
+}
+
+// mkANTISJ builds an ANTI SpecialJoinInfo.
+func mkANTISJ(minLHS, minRHS RelSet) *SpecialJoinInfo {
+	return &SpecialJoinInfo{
+		MinLefthand:  minLHS,
+		MinRighthand: minRHS,
+		SynLefthand:  minLHS,
+		SynRighthand: minRHS,
+		Jointype:     parser.JoinAnti,
+	}
+}
+
+// ── joinIsLegal SEMI/ANTI tests ──
+
+func TestJoinIsLegalSemiMatch(t *testing.T) {
+	// A LEFT SEMI JOIN B on A.x = B.x → SpecialJoinInfo(A, B)
+	sj := mkSJ(parser.JoinSemi, 0b001, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	got, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,B) for SEMI returned error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("joinIsLegal(A,B) for SEMI = nil; want the SpecialJoinInfo")
+	}
+	if got.Jointype != parser.JoinSemi {
+		t.Errorf("joinIsLegal sj.Jointype = %v; want SEMI", got.Jointype)
+	}
+	if rev {
+		t.Error("joinIsLegal(A,B) reversed = true; want false")
+	}
+}
+
+func TestJoinIsLegalSemiReversed(t *testing.T) {
+	sj := mkSJ(parser.JoinSemi, 0b001, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	got, rev, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b001))
+	if err != nil {
+		t.Fatalf("joinIsLegal(B,A) for SEMI returned error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("joinIsLegal(B,A) for SEMI = nil; want the SpecialJoinInfo")
+	}
+	if !rev {
+		t.Error("joinIsLegal(B,A) reversed = false; want true")
+	}
+}
+
+func TestJoinIsLegalSemiUniqueifiedSkip(t *testing.T) {
+	// SEMI(A min={A}, syn={B}) — when the proposed join's rel1
+	// already has the full syn_righthand embedded (proper superset),
+	// the SEMI was already unique-ified and is no longer relevant.
+	sj := mkSEMISJ(0b001, 0b010, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {B,C} ⋈ {A}: rel1 contains B (syn_righthand) as proper subset
+	got, _, err := s.joinIsLegal(mkTestRel(0b110), mkTestRel(0b001))
+	if err != nil {
+		t.Fatalf("joinIsLegal({B,C},A) returned error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("joinIsLegal({B,C},A) = %v; want nil — SEMI already unique-ified", got)
+	}
+}
+
+func TestJoinIsLegalSemiNotUniqueifiedWhenExactRHS(t *testing.T) {
+	// When syn_righthand EQUALS rel (not a proper subset), the SEMI is
+	// still relevant — it hasn't been unique-ified yet.
+	sj := mkSEMISJ(0b001, 0b010, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {B} ⋈ {A}: {B} equals syn_righthand, not proper subset → still relevant
+	got, _, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b001))
+	if err != nil {
+		t.Fatalf("joinIsLegal({B},A) returned error: %v", err)
+	}
+	if got == nil {
+		t.Error("joinIsLegal({B},A) = nil; want SEMI match — RHS equals syn_righthand, not proper subset")
+	}
+}
+
+func TestJoinIsLegalAntiMatch(t *testing.T) {
+	// ANTI join: matches the same way as LEFT (min_lefthand/min_righthand).
+	sj := mkANTISJ(0b001, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	got, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,B) for ANTI returned error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("joinIsLegal(A,B) for ANTI = nil; want the SpecialJoinInfo")
+	}
+	if got.Jointype != parser.JoinAnti {
+		t.Errorf("joinIsLegal sj.Jointype = %v; want ANTI", got.Jointype)
+	}
+	if rev {
+		t.Error("joinIsLegal(A,B) reversed = true; want false")
+	}
+}
+
+func TestJoinIsLegalAntiRejectsRHSAssociation(t *testing.T) {
+	// ANTI cannot associate into another join's RHS — only LEFT can.
+	// The "both overlap RHS" case still handles this (valid commute).
+	sj := mkANTISJ(0b001, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {A,B} ⋈ {B}: overlap RHS on both sides → both-overlap-RHS safe path
+	got, _, err := s.joinIsLegal(mkTestRel(0b011), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal({A,B},B) returned error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("joinIsLegal({A,B},B) = %v; want nil — both overlap RHS, valid commute", got)
+	}
+}
+
+func TestJoinIsLegalAntiCannotAssociateIntoRHS(t *testing.T) {
+	// ANTI(A,{B,C}) with min_lefthand={A}, min_righthand={B,C}.
+	// Join {A} ⋈ {C}: RHS {B,C} overlaps joinrelids={A,C} via C.
+	// But {A} contains min_lefthand and {C} does NOT contain
+	// min_righthand={B,C}. For LEFT, this could be mustBeLeftJoin;
+	// for ANTI (and SEMI), it's an error (joinrels.c:519-521).
+	sj := mkANTISJ(0b001, 0b110) // LHS={A}, RHS={B,C}
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	_, _, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b100))
+	if err == nil {
+		t.Error("joinIsLegal({A},{C}) should reject — ANTI RHS={B,C}, {C} doesn't cover full RHS and ANTI cannot associate")
+	}
+}
+
+func TestJoinIsLegalSemiCannotAssociateIntoRHS(t *testing.T) {
+	// Same shape as the ANTI test: SEMI also cannot associate.
+	sj := mkSEMISJ(0b001, 0b110, 0b110) // LHS={A}, RHS={B,C}
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	_, _, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b100))
+	if err == nil {
+		t.Error("joinIsLegal({A},{C}) should reject — SEMI RHS={B,C}, {C} doesn't cover full RHS and SEMI cannot associate")
+	}
+}
+
+// ── joinOrderRestricted SEMI tests ──
+
+func TestJoinOrderRestrictedSemiUniqueifiedSkip(t *testing.T) {
+	sj := mkSEMISJ(0b001, 0b010, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {B,C} has synRHS={B} as proper subset → skip → no restriction
+	if s.joinOrderRestricted(mkTestRel(0b110), mkTestRel(0b001)) {
+		t.Error("joinOrderRestricted({B,C},A) = true; want false — SEMI already unique-ified")
+	}
+}
+
+func TestJoinOrderRestrictedSemiExactRHSNotSkipped(t *testing.T) {
+	sj := mkSEMISJ(0b001, 0b010, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {B} equals synRHS → NOT a proper subset → restriction applies
+	if !s.joinOrderRestricted(mkTestRel(0b010), mkTestRel(0b001)) {
+		t.Error("joinOrderRestricted({B},A) = false; want true — exact RHS match, not unique-ified")
+	}
+}
+
+// ── hasJoinRestriction SEMI tests ──
+
+func TestHasJoinRestrictionSemiUniqueifiedSkip(t *testing.T) {
+	sj := mkSEMISJ(0b001, 0b010, 0b010)
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	// {B,C} has synRHS={B} as proper subset → skip → no restriction
+	if s.hasJoinRestriction(mkTestRel(0b110)) {
+		t.Error("hasJoinRestriction({B,C}) = true; want false — SEMI already unique-ified")
+	}
+}
+
+func TestHasJoinRestrictionSemiPartialLHSOverlap(t *testing.T) {
+	// SEMI(minLHS={A,B}, minRHS={C}). rel={A}: overlaps min_lefthand but
+	// doesn't fully contain → restriction (needs {B} to complete LHS).
+	sj := mkSEMISJ(0b011, 0b100, 0b100) // LHS={A,B}, RHS={C}
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sj})
+
+	if !s.hasJoinRestriction(mkTestRel(0b001)) {
+		t.Error("hasJoinRestriction({A}) with minLHS={A,B} = false; want true — partial LHS overlap")
+	}
+}
+
+func TestHasJoinRestrictionSemiRHSNeedsCompletion(t *testing.T) {
+	// SEMI(minLHS={A,B}, minRHS={C}). rel={C,D}: overlaps min_righthand but
+	// doesn't fully contain it ({C} ∩ {C} ≠ ∅, but {C,D} does contain {C}).
+	// Actually {C,D} DOES fully contain {C}, so no restriction.
+	// Better: SEMI({A,B},{C,D}). rel={C}: overlaps RHS but doesn't contain it.
+	sj := mkSEMISJ(0b011, 0b1100, 0b1100) // LHS={A,B}, RHS={C,D}
+	s := mkTestSearchCtx(t, 4, []*SpecialJoinInfo{sj})
+
+	if !s.hasJoinRestriction(mkTestRel(0b0100)) {
+		t.Error("hasJoinRestriction({C}) with minRHS={C,D} = false; want true")
+	}
+}
+
+// ── semiQualCapabilities tests ──
+
+func TestSemiQualCapabilitiesNil(t *testing.T) {
+	cb, ch := semiQualCapabilities(nil)
+	if cb || ch {
+		t.Error("semiQualCapabilities(nil) should be false, false")
+	}
+}
+
+func TestSemiQualCapabilitiesEquality(t *testing.T) {
+	eq := &parser.BinaryOp{Op: parser.OpEq,
+		Left:  &parser.ColumnRef{Column: "x"},
+		Right: &parser.ColumnRef{Column: "y"},
+	}
+	cb, ch := semiQualCapabilities(eq)
+	if !cb || !ch {
+		t.Error("semiQualCapabilities with = should be true, true")
+	}
+}
+
+func TestSemiQualCapabilitiesNoEquality(t *testing.T) {
+	lt := &parser.BinaryOp{Op: parser.OpLt,
+		Left:  &parser.ColumnRef{Column: "x"},
+		Right: &parser.ColumnRef{Column: "y"},
+	}
+	cb, ch := semiQualCapabilities(lt)
+	if cb || ch {
+		t.Error("semiQualCapabilities with < should be false, false")
+	}
+}

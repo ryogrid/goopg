@@ -3706,6 +3706,7 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 				NDistinct:     distinctVal,
 				NDistinctFrac: distinctFrac,
 				NullFrac:      float64(sr.StaNullFrac),
+				AvgWidth:      float64(sr.StaWidth),
 			}
 			// MCV
 			if len(sr.MCVFreqs) > 0 && len(sr.MCVValues) > 0 {

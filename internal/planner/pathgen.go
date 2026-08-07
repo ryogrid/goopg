@@ -80,6 +80,8 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		// Column counts come from the RELS, not the paths: a parameterised
 		// path returns fewer ROWS than its rel but the same columns.
 		outerCols: relNCols(probe), innerCols: relNCols(build),
+		// AvgVarBytes come from the rels for the same reason (M0128-P3.1).
+		outerAvgVarBytes: probe.AvgVarBytes, innerAvgVarBytes: build.AvgVarBytes,
 	})
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on

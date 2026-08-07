@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"math"
 	"math/rand"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -434,5 +437,79 @@ func TestAnalyzeRespectsNDistinctOption(t *testing.T) {
 	// Column 1 (no override, single value) still reflects the sample.
 	if got := stats.Columns[1].NDistinct; got != 1 {
 		t.Errorf("label NDistinct=%d want 1", got)
+	}
+}
+
+// TestDatumVariablePayloadWidth pins the per-Datum variable-width byte count
+// used by computeColumnStats to derive AvgWidth (M0128-P3.1).
+func TestDatumVariablePayloadWidth(t *testing.T) {
+	tests := []struct {
+		name string
+		d    Datum
+		want int
+	}{
+		{"int", NewIntDatum(42), 0},
+		{"float", NewIntDatum(int64(math.Float64bits(3.14))), 0},
+		{"bool", NewBoolDatum(true), 0},
+		{"null", NullDatum, 0},
+		{"string empty", NewStringDatum(""), 0},
+		{"string short", NewStringDatum("hello"), 5},
+		{"string long", NewStringDatum(strings.Repeat("x", 2000)), 2000},
+		{"bytes empty", NewBytesDatum(nil), 0},
+		{"bytes small", NewBytesDatum([]byte{1, 2, 3}), 3},
+		{"numeric fast", NewNumericInt64Datum(12345, 0), 0}, // int64 fast-path, no Buf
+		{"time", NewTimeDatum(time.Unix(1, 0)), 0},
+		{"date", NewDateDatum(time.Date(2026, time.August, 7, 0, 0, 0, 0, time.UTC)), 0},
+		{"interval", NewIntervalDatum(0, 0), 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := datumVariablePayloadWidth(tc.d)
+			if got != tc.want {
+				t.Errorf("datumVariablePayloadWidth(%v) = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnalyzePopulatesAvgWidth pins that computeColumnStats calculates
+// per-column AvgWidth from sampled non-null Datum values (M0128-P3.1).
+// It tests the computation directly rather than through the full
+// insert→heap→decode pipeline, so it controls the Datum shapes precisely.
+func TestAnalyzePopulatesAvgWidth(t *testing.T) {
+	// Build a sample of 20 rows: column 0 is fixed-width (int), column 1 is
+	// variable-width text with known byte lengths.
+	sample := make([]Row, 20)
+	for i := 0; i < 20; i++ {
+		sample[i] = Row{
+			NewIntDatum(int64(i + 1)),                        // fixed-width: contributes 0
+			NewStringDatum(strings.Repeat("x", (i+1)*10)),    // 10, 20, …, 200 bytes
+		}
+	}
+	// Add one null row to verify nulls don't affect the average.
+	sample = append(sample, Row{NullDatum, NullDatum})
+
+	stats := computeColumnStats(sample, 0, 100, 21, nil)
+	if stats.AvgWidth != 0 {
+		t.Errorf("col 0 (fixed-width int): AvgWidth=%v, want 0", stats.AvgWidth)
+	}
+
+	stats1 := computeColumnStats(sample, 1, 100, 21, nil)
+	// 20 values: 10, 20, …, 200 bytes; avg = (10+200)*20/2/20 = 105.
+	if stats1.AvgWidth < 90 || stats1.AvgWidth > 120 {
+		t.Errorf("col 1 (text 10–200B): AvgWidth=%v, want ~105", stats1.AvgWidth)
+	}
+
+	// A sample with only nulls: AvgWidth = 0.
+	nullSample := []Row{{NullDatum}, {NullDatum}, {NullDatum}}
+	nullStats := computeColumnStats(nullSample, 0, 100, 3, nil)
+	if nullStats.AvgWidth != 0 {
+		t.Errorf("all-null column: AvgWidth=%v, want 0", nullStats.AvgWidth)
+	}
+
+	// An empty sample: AvgWidth = 0.
+	emptyStats := computeColumnStats(nil, 0, 100, 0, nil)
+	if emptyStats.AvgWidth != 0 {
+		t.Errorf("empty sample: AvgWidth=%v, want 0", emptyStats.AvgWidth)
 	}
 }

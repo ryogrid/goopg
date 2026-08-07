@@ -1455,39 +1455,44 @@ func (o *unknownOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *unknownOp) Close() error             { return nil }
 func (o *unknownOp) Schema() planner.Schema   { return nil }
 
-// TestLockRowsUnknownShapeErrors verifies that an unrecognised operator
-// type between LockRows and its scan leaf causes findScanLeaf,
-// findScanLeafForRel, and markJoinPreserveCTID to return errors rather
-// than silently returning nil (which would degrade FOR UPDATE to an
-// unlocked pass-through).
-func TestLockRowsUnknownShapeErrors(t *testing.T) {
+// TestLockRowsWalkersGracefulOnUnknown verifies that findScanLeaf,
+// findScanLeafForRel, and markJoinPreserveCTID gracefully return nil
+// (no error) for unknown operator types. M0128-P6.1 resjunk-ctid rowmark:
+// the ctid rides the row as a column — unknown operators between LockRows
+// and the scan leaf are harmless because the TID is in the row, not
+// reconstructed from plan shape. The P0.2 hard-error safety net is retired
+// since it is unreachable with the durable ctid-column path.
+func TestLockRowsWalkersGracefulOnUnknown(t *testing.T) {
 	child := &unknownOp{child: &seqScanOp{}}
 	rel := storage.RelFileNode{TblOid: 1, DBOid: 2, RelOid: 3}
 
-	// findScanLeaf must error on the unknown wrapper.
+	// findScanLeaf must NOT error on unknown wrapper — the ctid is in
+	// the row, so the scan cursor is optional.
 	_, err := findScanLeaf(child)
-	if err == nil {
-		t.Error("findScanLeaf returned nil error for unknown operator — expected a hard error")
+	if err != nil {
+		t.Errorf("findScanLeaf errored on unknown operator: %v", err)
 	}
-	t.Logf("findScanLeaf error (expected): %v", err)
 
-	// findScanLeafForRel must error on the unknown wrapper.
+	// findScanLeafForRel must NOT error on unknown wrapper.
 	_, err = findScanLeafForRel(child, rel)
-	if err == nil {
-		t.Error("findScanLeafForRel returned nil error for unknown operator — expected a hard error")
+	if err != nil {
+		t.Errorf("findScanLeafForRel errored on unknown operator: %v", err)
 	}
-	t.Logf("findScanLeafForRel error (expected): %v", err)
 
-	// markJoinPreserveCTID must error on an unknown op wrapping a join.
+	// markJoinPreserveCTID must NOT error on an unknown op wrapping a join
+	// — the ctid column survives it.
 	j := &joinOp{left: &seqScanOp{}, right: &seqScanOp{}}
 	wrappingJoin := &unknownOp{child: j}
 	err = markJoinPreserveCTID(wrappingJoin, rel)
-	if err == nil {
-		t.Error("markJoinPreserveCTID returned nil error for unknown operator — expected a hard error")
+	if err != nil {
+		t.Errorf("markJoinPreserveCTID errored on unknown operator: %v", err)
 	}
-	t.Logf("markJoinPreserveCTID error (expected): %v", err)
+	// The joinOp inside must still have been tagged (the walk recurses
+	// through unknown ops now, so it won't reach the join — but that's
+	// fine because the ctid is in the row).
+	_ = j
 
-	// All three walkers must return nil for recognised shapes.
+	// All three walkers must still work for recognised shapes.
 	known := &sortOp{child: &projectOp{child: &seqScanOp{}}}
 	_, err = findScanLeaf(known)
 	if err != nil {
@@ -1502,3 +1507,101 @@ func TestLockRowsUnknownShapeErrors(t *testing.T) {
 		t.Errorf("markJoinPreserveCTID errored on recognised shape: %v", err)
 	}
 }
+
+// M0128-P6.1 resjunk-ctid rowmark: unit tests for the parseRowCTID helper
+// and the ctid-column trimming behaviour in lockRowsOp.Next.
+
+func TestParseRowCTID(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantOk   bool
+		wantBlk  int64
+		wantOff  int
+	}{
+		{"(0,1)", true, 0, 1},
+		{"(100,50)", true, 100, 50},
+		{"(0,0)", true, 0, 0},
+		// Invalid forms
+		{"", false, 0, 0},        // empty
+		{"abc", false, 0, 0},     // not a tuple
+		{"(0)", false, 0, 0},     // missing offset
+		{"(0,1,2)", false, 0, 0}, // too many components
+		{"(ab,cd)", false, 0, 0}, // non-numeric
+		{"(-1,1)", false, 0, 0},  // negative block
+		{"(1,-1)", false, 0, 0},  // negative offset
+	}
+	for _, tc := range tests {
+		d := NewStringDatum(tc.input)
+		ptr, ok := parseRowCTID(d)
+		if ok != tc.wantOk {
+			t.Errorf("parseRowCTID(%q) ok=%v, want %v", tc.input, ok, tc.wantOk)
+		}
+		if ok && (int64(ptr.Block) != tc.wantBlk || int(ptr.Offset) != tc.wantOff) {
+			t.Errorf("parseRowCTID(%q) = (%d,%d), want (%d,%d)",
+				tc.input, ptr.Block, ptr.Offset, tc.wantBlk, tc.wantOff)
+		}
+	}
+	// Null datum
+	nullD := NullDatum
+	if _, ok := parseRowCTID(nullD); ok {
+		t.Error("parseRowCTID on NullDatum returned ok=true, want false")
+	}
+}
+
+// TestLockRowsOutputStripsCtidColumns verifies that LockRows.Output() removes
+// the trailing ctid junk columns from the child schema.
+func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
+	colA := planner.SchemaColumn{Name: "a", Type: catalog.Type{Name: "int4"}}
+	colB := planner.SchemaColumn{Name: "b", Type: catalog.Type{Name: "int4"}}
+	ctidCol := planner.SchemaColumn{Name: "ctid1", Type: catalog.Type{Name: "tid"}}
+
+	t.Run("no_ctid_columns", func(t *testing.T) {
+		lr := &planner.LockRows{
+			Child:       &planner.SeqScan{},
+			NumCtidCols: 0,
+		}
+		// Output should equal child output (identity when no ctid columns)
+		out := lr.Output()
+		if len(out) != 0 {
+			t.Errorf("no-ctid Output().len = %d, want 0 (identity with empty child)", len(out))
+		}
+	})
+
+	t.Run("strips_trailing_ctid", func(t *testing.T) {
+		// Simulate: child has [a, b, ctid1, ctid2], NumCtidCols=2
+		childSchema := planner.Schema{colA, colB, ctidCol, ctidCol}
+		mock := &mockSchemaNode{schema: childSchema}
+		lr := &planner.LockRows{
+			Child:       mock,
+			NumCtidCols: 2,
+		}
+		out := lr.Output()
+		if len(out) != 2 {
+			t.Errorf("Output().len = %d, want 2 (user-visible columns only)", len(out))
+		}
+		if out[0].Name != "a" || out[1].Name != "b" {
+			t.Errorf("Output() = %v, want [a b]", out)
+		}
+	})
+
+	t.Run("NumCtidCols_exceeds_schema", func(t *testing.T) {
+		childSchema := planner.Schema{colA}
+		mock := &mockSchemaNode{schema: childSchema}
+		lr := &planner.LockRows{
+			Child:       mock,
+			NumCtidCols: 5,
+		}
+		out := lr.Output()
+		if len(out) != 0 {
+			t.Errorf("Output().len = %d, want 0 (NumCtidCols exceeds child schema)", len(out))
+		}
+	})
+}
+
+// mockSchemaNode implements planner.Node with just a schema for testing.
+type mockSchemaNode struct {
+	schema planner.Schema
+}
+
+func (m *mockSchemaNode) Pos() int             { return 0 }
+func (m *mockSchemaNode) Output() planner.Schema { return m.schema }

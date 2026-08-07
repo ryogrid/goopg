@@ -605,6 +605,26 @@ func ndistinctEstimate(sampleDistinct, nmultiple, nonNull int, nullFrac float64,
 // upstream's `compute_scalar_stats` while staying within the v0
 // type set.
 //
+// datumVariablePayloadWidth returns the variable-width payload bytes of a
+// Datum — the bytes BEYOND the fixed 48-byte Datum struct that live in Buf
+// or an arena. M0128-P3.1: this is the per-column contribution to avgVarBytes.
+func datumVariablePayloadWidth(d Datum) int {
+	switch d.Kind {
+	case KindString, KindBytes, KindEnum:
+		if d.ArenaID != 0 {
+			return int(uint32(d.Int & 0xFFFFFFFF))
+		}
+		return len(d.Buf)
+	case KindNumeric:
+		if d.Flags&flagBigNumeric != 0 {
+			return int(uint32(d.Int & 0xFFFFFFFF))
+		}
+		return 0 // fast-path int64 mantissa fits in Datum.Int
+	default:
+		return 0
+	}
+}
+
 // totalRows is the relation's FULL live-row count (goopg's ANALYZE walks every
 // block and reservoir-samples, so the caller has measured it exactly). It is
 // what turns the sample's distinct count into a table-wide estimate — see
@@ -624,6 +644,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	}
 	freq := make(map[string]*bucket, len(sample))
 	var nullCount, nonNull int
+	var totalPayloadWidth int64
 	for _, row := range sample {
 		if colIdx >= len(row) {
 			// Defensive: mismatched schema shouldn't happen given
@@ -636,6 +657,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 			continue
 		}
 		nonNull++
+		totalPayloadWidth += int64(datumVariablePayloadWidth(d))
 		key := datumKey(d)
 		if b, ok := freq[key]; ok {
 			b.count++
@@ -645,6 +667,10 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	}
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
+
+	if nonNull > 0 {
+		stats.AvgWidth = float64(totalPayloadWidth) / float64(nonNull)
+	}
 
 	// Number of sampled values seen more than once — upstream's `nmultiple`
 	// (compute_scalar_stats, analyze.c). Everything else appeared exactly once

@@ -63,7 +63,8 @@ type joinRelBuilder interface {
 // joinOrderRestricted is PG's `have_join_order_restriction` (joinrels.c:1066),
 // the second disjunct of the clause gate that admits a pair even without a join
 // clause because a SpecialJoinInfo constraint requires the two rels to be joined.
-// M0128-P1.2: LEFT and FULL arms (PG lines 1104-1145).
+// M0128-P1.2: LEFT and FULL arms. M0128-P1.4: SEMI unique-ified skip added
+// (PG lines 1095-1102).
 func (s *searchCtx) joinOrderRestricted(rel1, rel2 *RelOptInfo) bool {
 	if len(s.joinInfoList) == 0 {
 		return false
@@ -73,6 +74,18 @@ func (s *searchCtx) joinOrderRestricted(rel1, rel2 *RelOptInfo) bool {
 		// FULL joins are handled by other mechanisms — skip (joinrels.c:1109-1110).
 		if sjinfo.Jointype == parser.JoinFull {
 			continue
+		}
+
+		// M0128-P1.4: SEMI join — if syn_righthand is already a proper subset
+		// of one input (but not equal to it), the RHS was unique-ified and the
+		// SEMI is no longer relevant (joinrels.c:1095-1102).
+		if sjinfo.Jointype == parser.JoinSemi {
+			if relsSubset(sjinfo.SynRighthand, rel1.Relids) && sjinfo.SynRighthand != rel1.Relids {
+				continue
+			}
+			if relsSubset(sjinfo.SynRighthand, rel2.Relids) && sjinfo.SynRighthand != rel2.Relids {
+				continue
+			}
 		}
 
 		// One input covers min_lefthand and the other covers min_righthand
@@ -113,7 +126,8 @@ func (s *searchCtx) joinOrderRestricted(rel1, rel2 *RelOptInfo) bool {
 // hasJoinRestriction is PG's `has_join_restriction` (joinrels.c:1178): detect
 // whether the rel has join-order restrictions from being inside a special join.
 // "It's OK if we sometimes say 'true' incorrectly" (PG's comment). M0128-P1.2:
-// LEFT and FULL arms (PG lines 1195-1215).
+// LEFT and FULL arms. M0128-P1.4: SEMI unique-ified skip added
+// (PG lines 1195-1202).
 func (s *searchCtx) hasJoinRestriction(rel *RelOptInfo) bool {
 	if len(s.joinInfoList) == 0 {
 		return false
@@ -122,6 +136,15 @@ func (s *searchCtx) hasJoinRestriction(rel *RelOptInfo) bool {
 		// FULL joins preserve ordering through other mechanisms — skip.
 		if sjinfo.Jointype == parser.JoinFull {
 			continue
+		}
+
+		// M0128-P1.4: SEMI join — if syn_righthand is already a proper subset
+		// of rel (but not equal), the RHS was unique-ified; no restriction
+		// (joinrels.c:1195-1202).
+		if sjinfo.Jointype == parser.JoinSemi {
+			if relsSubset(sjinfo.SynRighthand, rel.Relids) && sjinfo.SynRighthand != rel.Relids {
+				continue
+			}
 		}
 
 		// "ignore if SJ is already contained in rel" (joinrels.c:1204)
@@ -142,15 +165,18 @@ func (s *searchCtx) hasJoinRestriction(rel *RelOptInfo) bool {
 	return false
 }
 
-// joinIsLegal is PG's `join_is_legal` (joinrels.c:350) — the LJO arm only
-// (SEMI/ANTI are P1.4). Checks whether joining rel1 and rel2 violates any
-// SpecialJoinInfo constraint, and if it IS a special join, returns the matching
-// SpecialJoinInfo and whether the pair is reversed.
+// joinIsLegal is PG's `join_is_legal` (joinrels.c:350). Checks whether joining
+// rel1 and rel2 violates any SpecialJoinInfo constraint, and if it IS a special
+// join, returns the matching SpecialJoinInfo and whether the pair is reversed.
 //
 // Returns (nil, false, nil) for a plain inner join — the pair is legal and is
 // not a special join. Returns (sjinfo, reversed, nil) when the pair forms a
 // special join. Returns (nil, false, error) when the pair is illegal — the
 // caller must skip the pair but continue the search (03 §4.2).
+//
+// M0128-P1.4: SEMI/ANTI arms added — unique-ified skip (joinrels.c:412-420),
+// and SEMI/ANTI correctly rejected for RHS association where LEFT alone can
+// succeed (joinrels.c:519-521: only JOIN_LEFT permits association into RHS).
 //
 // PG signature: join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed) → bool
 func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo, reversed bool, err error) {
@@ -180,6 +206,18 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 			continue
 		}
 
+		// M0128-P1.4: SEMI join — if we already joined the RHS to any other
+		// rels within either input, we must have unique-ified the RHS at that
+		// point, so this SEMI is no longer relevant (joinrels.c:412-420).
+		if sj.Jointype == parser.JoinSemi {
+			if relsSubset(sj.SynRighthand, rel1.Relids) && sj.SynRighthand != rel1.Relids {
+				continue
+			}
+			if relsSubset(sj.SynRighthand, rel2.Relids) && sj.SynRighthand != rel2.Relids {
+				continue
+			}
+		}
+
 		// One input contains min_lefthand and the other contains min_righthand
 		// — we can perform the SJ at this join (joinrels.c:424-436).
 		if relsSubset(sj.MinLefthand, rel1.Relids) && relsSubset(sj.MinRighthand, rel2.Relids) {
@@ -200,6 +238,8 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 		} else if sj.Jointype == parser.JoinLeft && !relsOverlap(sj.MinLefthand, joinrelids) {
 			// LEFT join: can associate the proposed join into this SJ's RHS
 			// only if the join is itself a LEFT join (joinrels.c:519-529).
+			// SEMI/ANTI/FULL are excluded here: only JOIN_LEFT permits
+			// RHS association (joinrels.c:519-521).
 			mustBeLeftJoin = true
 		} else {
 			return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x violates outer-join constraint (SJ type=%s)", uint16(rel1.Relids), uint16(rel2.Relids), joinTypeName(sj.Jointype))
@@ -539,6 +579,9 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).
 		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
+		// AvgVarBytes adds the same way: a concatenation of two
+		// schemas sums their variable-width payloads (M0128-P3.1).
+		joinrel.AvgVarBytes = rel1.AvgVarBytes + rel2.AvgVarBytes
 		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:707) — the same query-wide fact every base rel copied in
 		// `buildInitialRels`, not something inherited from the inputs

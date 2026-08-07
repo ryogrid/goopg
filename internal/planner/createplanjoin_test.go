@@ -609,3 +609,52 @@ func TestCreateMergeJoinPlanPanics(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateHashJoinPlanThreadsPathRows verifies M0128-P3.2: the join plan
+// carries the search's post-qual row estimates (OuterRows / InnerRows) from
+// the child paths, so the executor's buildGeometry can read them instead of
+// recomputing via EstimateRows(buildNode) — which dispatches to seqScanRows
+// and ignores on-scan quals (09 §3.23).
+func TestCreateHashJoinPlanThreadsPathRows(t *testing.T) {
+	a, b := cpjTwoRel()
+	// Give the paths deliberately distinct row counts, different from the
+	// hardcoded 100 in cpjLeafRel.
+	outerPath := cpjLeafPath(a)
+	outerPath.Rows = 150
+	innerPath := cpjLeafPath(b)
+	innerPath.Rows = 30
+
+	key := equiClauseOn(a.Relids, b.Relids, 0, 3)
+	p := cpjHashPath(outerPath, innerPath, []*restrictInfo{key}, nil)
+	j, ok := createPlan(p).(*Join)
+	if !ok {
+		t.Fatalf("createPlan = %T, want *Join", createPlan(p))
+	}
+	if j.OuterRows != 150 {
+		t.Errorf("OuterRows = %v, want 150 — the search's post-qual estimate for the outer side", j.OuterRows)
+	}
+	if j.InnerRows != 30 {
+		t.Errorf("InnerRows = %v, want 30 — the search's post-qual estimate for the build/inner side", j.InnerRows)
+	}
+
+	// Zero path Rows → zero plan Rows, which tells buildGeometry to fall back
+	// to EstimateRows (the legacy path). This exercises the fallback guard.
+	outerPath.Rows = 0
+	innerPath.Rows = 0
+	p2 := cpjHashPath(outerPath, innerPath, []*restrictInfo{key}, nil)
+	j2, ok := createPlan(p2).(*Join)
+	if !ok {
+		t.Fatalf("createPlan = %T, want *Join", createPlan(p2))
+	}
+	if j2.OuterRows != 0 || j2.InnerRows != 0 {
+		t.Errorf("OuterRows/InnerRows = %v/%v, want 0/0 — zero path Rows means \"come back to EstimateRows\"",
+			j2.OuterRows, j2.InnerRows)
+	}
+
+	// The default-nil case: a Join built by the legacy planner has zero values
+	// and must not crash the executor.
+	legacy := &Join{}
+	if legacy.OuterRows != 0 || legacy.InnerRows != 0 {
+		t.Error("a zero-value Join must have zero OuterRows/InnerRows")
+	}
+}

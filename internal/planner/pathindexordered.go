@@ -49,6 +49,11 @@ import (
 func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	s.addParameterizedIndexPaths(cat)
 	s.addOrderedIndexPaths(cat)
+	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
+	// add_path for every usable index. They are always generated — PG's
+	// create_index_paths generates both indexscan and bitmap paths for every
+	// index, and add_path keeps the cheaper one in each cost regime.
+	s.addBaseRelBitmapPaths(cat)
 }
 
 // addOrderedIndexPaths generates, for every base relation, the unparameterised

@@ -640,6 +640,16 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
 		// before the next Next() invocation.
+		// M0128-P6.1 resjunk-ctid rowmark: when the scan's schema
+		// has been extended with a trailing ctid column, append
+		// the TID as a string datum so it rides the row through
+		// the plan tree.
+		tableCols := len(o.plan.Table.Columns)
+		if len(o.Schema()) > tableCols {
+			for i := tableCols; i < len(o.Schema()); i++ {
+				row = append(row, NewStringDatum(fmt.Sprintf("(%d,%d)", ptr.Block, actualSlot)))
+			}
+		}
 		o.slot.schema = o.Schema()
 		o.slot.row = row
 		return &o.slot, nil

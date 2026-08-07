@@ -167,7 +167,7 @@ func TestSpillingSortAndSpillingHashAreChargedInOneCurrency(t *testing.T) {
 	sortIO := costSortRun(cp, rows, ncols).Startup - 2*cp.cpuOperatorCost*rows*math.Log2(rows)
 	// The hash rival's charge for spilling the SAME rows: `hashJoinCost`'s
 	// batch term, inner side (written once at build, read back at probe).
-	hashIO := cp.seqPageCost * 2 * spillPages(rows, ncols)
+	hashIO := cp.seqPageCost * 2 * spillPages(rows, ncols, 0)
 
 	if !(sortIO > 0) {
 		t.Fatalf("the sort of %v rows over a %v-byte budget must be charged for spilling", rows, cp.workMem)

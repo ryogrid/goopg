@@ -204,7 +204,7 @@ func sharedBuildWouldSpill(ctx *Context, j *joinOp) bool {
 	if !probeSideIsLeft(j.plan) {
 		buildNode, buildWidth = j.plan.Left, len(j.left.Schema())
 	}
-	return j.buildGeometry(ctx, buildNode, buildWidth).NBatch > 1
+	return j.buildGeometry(ctx, buildNode, buildWidth, !probeSideIsLeft(j.plan)).NBatch > 1
 }
 
 // collectShareableJoins finds the hash joins in a tree whose build side can be
