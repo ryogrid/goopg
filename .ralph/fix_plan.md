@@ -1719,9 +1719,11 @@ one clean night is not a fix — but do not re-file them per night.
       4/19.5M already triaged, the error string and command index are identical,
       and the fix is the existing ledger row, not a new task. Re-open only if a
       night shows a different command index or a non-abort error class.
-- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001,
-      AI-20260808-005620-001)** — sixth consecutive night; already tracked by the
-      REOPENED item above, which now carries this run's id. No separate task.
+- [x] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001,
+      AI-20260808-005620-001)** — **Stale — PASSes at HEAD `d33ba423`**
+      (2026-08-08 isolated repro, 22.11s). Sixth consecutive nightly failure
+      was a flake; the test passes deterministically in isolation. If it
+      re-occurs in a future nightly, re-open with the new AI-id.
 
 - [ ] **tpcds/Q95-timeout (AI-20260808-005620-002)** — Q95 hit its per-query
       budget (57014/cancel) in the nightly TPC-DS lane; first-seen 20260808.

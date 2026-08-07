@@ -249,6 +249,7 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitNumericLengthCoercion(f) ||
 			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) ||
 			isImplicitTimestampLengthCoercion(f) ||
+			isImplicitTimeLengthCoercion(f) ||
 			isImplicitTimestamptzLengthCoercion(f) ||
 			isImplicitBitLengthCoercion(f) || isImplicitVarBitLengthCoercion(f) {
 		return rec(f.Args[0])
@@ -413,6 +414,20 @@ func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
 // the identical node (fixed point).
 func isImplicitTimestampLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 1961 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamp || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimeLengthCoercion reports whether f is the IMPLICIT time length
+// coercion coerce_type_typmod adds when a time(N) column has a precision
+// qualifier (see wrapTimeLengthCoercion): time(time,int4) = funcid 1968,
+// funcformat 2 (COERCE_IMPLICIT_CAST). Like the other length-coercion wrappers,
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimeLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1968 || f.Funcformat != 2 || f.Funcresulttype != OidTime || len(f.Args) != 2 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)
@@ -706,6 +721,12 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// value is inside the literal string, not a unary minus.
 		usec := int64FromByvalWord(c.Datum)
 		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
+	case OidTime:
+		// Render the μs-since-midnight datum back into a canonical "HH:MM:SS[.ffffff]"
+		// literal so a re-resolve in the time column context reproduces the identical
+		// Const — the fixed point.
+		micros := int64FromByvalWord(c.Datum)
+		return &parser.StringConst{Value: formatTime(micros)}, nil
 	case OidTimestamp:
 		// Same as timestamptz but WITHOUT the +00 offset — timestamp has no
 		// timezone. A re-resolve in a timestamp column context folds through

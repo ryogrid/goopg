@@ -120,6 +120,10 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 		if targetTypmod >= 0 {
 			n = wrapTimestampLengthCoercion(n, targetTypmod)
 		}
+	case targetType == OidTime:
+		if targetTypmod >= 0 {
+			n = wrapTimeLengthCoercion(n, targetTypmod)
+		}
 	case targetType == OidTimestamptz:
 		if targetTypmod >= 0 {
 			n = wrapTimestamptzLengthCoercion(n, targetTypmod)
@@ -234,6 +238,12 @@ func ColumnTypmod(typeName string, args []int64) int32 {
 			return int32(args[0])
 		}
 		return -1
+	case "time", "time without time zone":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
 	case "timestamptz":
 		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
 			// typmod = precision (0-6 only; PG rejects negative and >6).
@@ -306,6 +316,25 @@ func wrapTimestampLengthCoercion(n Node, typmod int32) Node {
 	return &FuncExpr{
 		Funcid:         1961, // timestamp(timestamp,int4)
 		Funcresulttype: OidTimestamp,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimeLengthCoercion wraps a time Const in the IMPLICIT time(time,int4)
+// FuncExpr (funcid 1968, funcformat 2 = COERCE_IMPLICIT_CAST) that coerce_type_typmod
+// adds when a time(N) column has a precision qualifier. PG's pg_cast.dat registers
+// the self-cast time→time (funcid 1968, castcontext 'i'). Without a qualifier
+// (typmod < 0) callers skip the wrap — the bare time Const has typmod -1.
+func wrapTimeLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1968, // time(time,int4)
+		Funcresulttype: OidTime,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -570,6 +599,10 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 	case OidTimestamptz:
 		if usec, ok := parseTimestamptzMicros(s); ok {
 			return NewTimestamptzConst(usec), OidTimestamptz, true
+		}
+	case OidTime:
+		if micros, ok := parseTimeMicros(s); ok {
+			return NewTimeConst(micros), OidTime, true
 		}
 	case OidTimestamp:
 		if usec, ok := parseTimestampMicros(s); ok {

@@ -22,6 +22,7 @@ const (
 	OidVarchar     = 1043
 	OidBpchar      = 1042
 	OidDate        = 1082
+	OidTime        = 1083
 	OidTimestamp   = 1114
 	OidTimestamptz = 1184
 	OidBit         = 1560
@@ -167,7 +168,7 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 		return 8, true, true
 	case OidNumeric:
 		return -1, false, true
-	case OidTimestamp, OidTimestamptz:
+	case OidTimestamp, OidTimestamptz, OidTime:
 		return 8, true, true
 	default:
 		return 0, false, false
@@ -1011,6 +1012,17 @@ func NewTimestampConst(usec int64) *Const {
 	}
 }
 
+// NewTimeConst builds a Const for a time value (TimeADT: μs since midnight).
+// Same wire form as timestamp/timestamptz (constlen 8, constbyval true) but
+// consttype 1083 — the stored microseconds are the time-of-day value.
+func NewTimeConst(micros int64) *Const {
+	return &Const{
+		ConstType: OidTime, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(micros),
+	}
+}
+
 // NewDateConst builds a Const for a date value (DateADT: signed int32 days since
 // the PostgreSQL epoch, 2000-01-01). It is by-value (constlen 4, constbyval true,
 // constcollid 0) and sign-extends into the 8-byte datum word so a pre-2000 date
@@ -1135,6 +1147,20 @@ func parseTimestampMicros(s string) (int64, bool) {
 	days := int64(date2j(y, mo, d) - postgresEpochJDate)
 	// Wall-clock value with no timezone offset.
 	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss)
+	return totalSec*1000000 + fracUsec, true
+}
+
+// parseTimeMicros parses a time literal (without timezone) into microseconds since
+// midnight, returning ok=false for anything outside the deterministic subset (which
+// the resolver then degrades to SQL text). PG folds such a literal at parse time
+// using time_in. Supported forms: "HH:MI:SS[.ffffff]", "HH:MI".
+func parseTimeMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	hh, mi, ss, fracUsec, ok := parseTimeFields(s)
+	if !ok {
+		return 0, false
+	}
+	totalSec := int64(hh)*3600 + int64(mi)*60 + int64(ss)
 	return totalSec*1000000 + fracUsec, true
 }
 
@@ -1334,6 +1360,31 @@ func formatTimestamp(usec int64) string {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+	return sb.String()
+}
+
+// formatTime formats a time μs-since-midnight value into a canonical
+// "HH:MM:SS[.ffffff]" literal (without trailing zeros) — the inverse of
+// parseTimeMicros, so a re-resolve through parseTimeMicros reproduces the
+// identical Const.
+func formatTime(micros int64) string {
+	if micros < 0 {
+		micros = 0
+	}
+	sec := micros / 1000000
+	fracUsec := micros % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%02d:%02d:%02d", hh, mi, ss)
 	if fracUsec > 0 {
 		frac := fmt.Sprintf("%06d", fracUsec)
 		frac = strings.TrimRight(frac, "0")
