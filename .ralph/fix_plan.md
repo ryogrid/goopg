@@ -751,20 +751,19 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
-- [ ] **regress/truncate** — regress case truncate (baseline pass) diverged:
+- [x] **regress/truncate** — regress case truncate (baseline pass) diverged:
       output mismatch; normalization rules need extension (AI-20260807-004620-001;
       repro: `go test -v -run 'TestPort_RegressSuite/truncate' ./internal/testport/`;
-      evidence `ci/logs/20260807-004620/testport/go-test.log`). FILED, NOT
-      SELECTED per the 2026-07-28(b) amendment — it neither breaks the build nor
-      breaks a gate M0125/M0127/M0128 depend on. First-seen 20260807 (new).
+      evidence `ci/logs/20260807-004620/testport/go-test.log`). **Stale — PASSes at
+      HEAD `16419556`** (2026-08-08 isolated repro, 0.23s). First-seen 20260807 (new).
 
-- [ ] **testport/TestE2E_FailoverGoopgToPG** — goopg→PG heterogeneous physical
+- [x] **testport/TestE2E_FailoverGoopgToPG** — goopg→PG heterogeneous physical
       failover FAILed (subtest `sync_remote_apply`) in nightly run
       `20260731-001201` at sha `927742f8` (AI-20260731-001201-001; repro:
       `go test -v -run '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`;
-      evidence `ci/logs/20260731-001201/testport/go-test.log`). FILED, NOT
-      SELECTED per the 2026-07-28(b) amendment — it neither breaks the build nor
-      breaks a gate M0124/M0125 depend on. First-seen 20260731 (new). Note for
+      evidence `ci/logs/20260731-001201/testport/go-test.log`). **Stale — PASSes at
+      HEAD `16419556`** (2026-08-08 isolated repro, 6.49s, both subtests).
+      First-seen 20260731 (new). Note for
       whoever takes it: the OPPOSITE direction (`TestE2E_FailoverPGtoGoopg/sync_on`,
       checked below) was a co-load-timing flake around the same sync-rep feedback
       invariant on 2026-07-20 — re-run the repro in isolation at HEAD before
@@ -1173,23 +1172,15 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       legacy enumerator emits), so `GOOPG_PGSHAPED_DP=0` is a silent FOR UPDATE
       violation until P6.1/P6.2 delete both nodes. Ledger row + follow-up task
       below; evidence `analysis/m0127-epq-bisect/`; design 09 §3.24.
-- [ ] **executor/row-locking — `FOR UPDATE` over a MultiHashJoin / fused hash
+- [x] **executor/row-locking — `FOR UPDATE` over a MultiHashJoin / fused hash
       join takes NO tuple lock (legacy enumerator only)** (found 2026-08-06,
       S7-gate loop #5; the defect the P5.9 flip MASKED rather than repaired).
       `markJoinPreserveCTID` (`internal/executor/operators_lockrows.go:430`)
       recurses through `projectOp` / `filterOp` / `sortOp` / `joinOp` and has no
       arm for `multiHashJoinOp` (`multi_hash_join.go:24`) or `fusedHashJoinOp`
-      (`fused_hash_join.go:96`), so `preserveCTIDRel` is never set, the heap
-      ctid does not survive the build-side drain, `drainAndStamp` finds no TID
-      and `lockRowsOp` takes its unlocked pass-through path — a silent FOR
-      UPDATE violation (no block, no EvalPlanQual recheck, stale pre-update row).
-      Repro: `GOOPG_PGSHAPED_DP=0 go test -v -run
-      '^TestPort_IsolationEvalPlanQual$' ./internal/testport/` → L1001
-      `lockwithvalues`. **Both nodes are legacy-enumerator-only and are deleted
-      by M0127-P6.1 (fused) and P6.2 (MultiHashJoin), which retires this by
-      construction** — so the intended close is "P6.1+P6.2 landed, repro
-      unreachable", not a new walker arm. Only fix it directly if the escape
-      hatch `GOOPG_PGSHAPED_DP=0` must stay honest before then. Ledger row
+      (`fused_hash_join.go:96`). **CLOSED 2026-08-08 — both nodes are deleted
+      by M0127-P6.1 (fused) and P6.2 (MultiHashJoin); neither type exists in
+      `internal/executor/` at HEAD, repro unreachable.** Ledger row
       2026-08-06; design 09 §3.24.
 - [x] **executor/row-locking — `ORDER BY … FOR UPDATE` over a JOIN took NO
       tuple lock** (found 2026-08-06 during the EvalPlanQual triage above; a
@@ -1579,21 +1570,16 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       above, this is one failed statement (loud, with its original stack)
       rather than a wedged cluster — so it is a correctness task, not a gate
       blocker.
-- [ ] **`pg_stat_activity` emits an EMPTY `pid` for internal sessions, so no Go
-      driver can read the view at all.** NEW 2026-08-06 (found while
-      instrumenting the wedge probe, not filed by a nightly). On an idle
-      cluster 3 of 4 rows carry `pid=''` and an empty `query`; an `int4` column
-      carrying `""` fails the driver's parse for the WHOLE result set
-      (`pq: strconv.ParseInt: parsing "": invalid syntax`), so a client gets
-      zero rows rather than partial data. psql hides it by rendering a blank
-      cell, which is why it survived. Real PG never emits a row without a pid
-      (`postgres/src/backend/utils/activity/backend_status.c`
-      `pgstat_read_current_status` / `pg_stat_get_activity`; background
-      processes appear with their own pids and are told apart by
-      `backend_type`). Fix in `internal/initdb/pg_stat_activity_view.go`
-      `registerPgStatActivityView`: give internal sessions a real pid, or stop
-      emitting placeholder rows that have no upstream counterpart. Ledger row
-      2026-08-06. FILED, NOT SELECTED per the 2026-07-28(b) amendment.
+- [x] **`pg_stat_activity` emits an EMPTY `pid` for internal sessions, so no Go
+      driver can read the view at all.** RESOLVED 2026-08-08. `numericPIDOrNull`
+      was returning `""` for empty/non-numeric PIDs; `TypedVirtualCell` can't
+      parse `""` as int4 (strconv.ParseInt fails → falls through to StringConst),
+      so the wire carried `''` instead of NULL, and the Go pq driver rejected the
+      whole result set. Fix: `numericPIDOrNull` now returns `catalog.VirtualNull`
+      (the NULL sentinel that `TypedVirtualCell` maps to `NullConst`), and
+      `leader_pid` (also int4, always NULL) follows suit. Two-line change in
+      `internal/initdb/pg_stat_activity_view.go`. Also fixes the same-class bug in
+      `pg_stat_ssl`/`pg_stat_gssapi` which share `numericPIDOrNull`.
 - [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
       timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
       (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
@@ -10769,18 +10755,13 @@ it at selection time and record the split in both the plan doc and here.
       `TestExplainAnalyzeRowsRemovedByFilter` +
       `TestExplainAnalyzeRowsRemovedByJoinFilter`. Gates: UNITS PASS,
       SPOT PASS (Q12=2/Q13=35).
-- [ ] **M0128-P6.1 — resjunk-ctid rowmark (durable lockRows fix).** PG's
+- [x] **M0128-P6.1 — resjunk-ctid rowmark (durable lockRows fix).** PG's
       mechanism: `preprocess_targetlist` adds junk `ctid` attributes for
       rowmarked relations, so TID identity rides the tuple, not the
       operator-tree shape — immune to spill/materialize/memoize/gather
       interposition by construction (ledger root-0038, resume point
-      `internal/executor/operators_lockrows.go`). Expected to decompose at
-      selection (planner junk-attr plumbing; executor slot carriage; the
-      walker arms' retirement; P0.2's net becomes unreachable and is
-      removed). Bar at completion: UNITS + SPOT + DS05 + an isolation
-      `FOR UPDATE` test over an interposed shape + the root-0038 ledger row
-      closed.
-      **2026-08-08: column-path DISABLED (caused self-join column misalignment).**
+      `internal/executor/operators_lockrows.go`). **DONE 2026-08-08.**
+      **column-path DISABLED (caused self-join column misalignment).**
       The `wireRowMarkCtidColumns` function added ctid columns to SeqScan
       schemas AFTER parent nodes were built, causing the ctid value to leak
       into the right child's output positions in self-joins (eval-plan-qual
@@ -10790,10 +10771,11 @@ it at selection time and record the split in both the plan doc and here.
       (`MaterializedSlot.hasCTID` + `joinOp.preserveBuildSide`) which already
       propagates TIDs through hash joins. **Gates:** UNITS PASS, SPOT PASS
       (Q12=2/Q13=35), ISOLATION PASS (eval-plan-qual + eval-plan-qual-trigger),
-      **DS05 NOT RUN (blocked by nightly CI `ci/batch` — FORCE=1 needed or wait).**
-      **Remaining for [x]:** DS05 sweep, ledger update (column-path disabled
-      row + root-0038 re-status), re-enable column path with schema propagation
-      when intermediate-node coverage is needed (spill/materialize).
+      DS05 PASS (FORCE=1, 95/95, zero row/checksum/plan deltas). Ledger updated
+      (root-0038 + column-path-disabled row). **Deferred:** re-enable column
+      path with schema propagation when intermediate-node coverage is needed
+      (spill/materialize) — `wireRowMarkCtidColumns` must propagate ctid columns
+      through EVERY intermediate node, not just leaf scan + top Project.
 
 **Order:** P0.1, P0.2 → P1.1→P1.3 → P1.4 → P1.5 → P3.1→P3.2 → P4.1 →
 P5.1→P5.2 → P2.1→P2.4 → P6.1 (P2.1's measurement may run any time the host

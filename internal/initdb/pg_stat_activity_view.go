@@ -6,16 +6,20 @@ import (
 )
 
 // numericPIDOrNull returns pid unchanged when it is a non-empty decimal
-// integer (regular client backends use monotonic numeric pids), or "" (NULL)
-// otherwise. Background-worker pids such as "cp-0" are non-numeric and would
-// fail an int4 decode, so they surface as NULL in the int4 pid column.
+// integer (regular client backends use monotonic numeric pids), or
+// catalog.VirtualNull (SQL NULL) otherwise. Background-worker pids such as
+// "cp-0" are non-numeric and would fail an int4 decode, so they surface as
+// NULL in the int4 pid column. VirtualNull is the only correct sentinel
+// for an int4 column — an empty string falls through TypedVirtualCell's
+// int4 branch (strconv.ParseInt fails) and lands as a StringConst, which
+// the Go pq driver rejects with "parsing "": invalid syntax".
 func numericPIDOrNull(pid string) string {
 	if pid == "" {
-		return ""
+		return catalog.VirtualNull
 	}
 	for _, r := range pid {
 		if r < '0' || r > '9' {
-			return ""
+			return catalog.VirtualNull
 		}
 	}
 	return pid
@@ -69,7 +73,7 @@ func registerPgStatActivityView(cat *catalog.InMemory, reg *activity.Registry) e
 				b.DatID,
 				b.DatName,
 				numericPIDOrNull(b.PID),
-				"", // leader_pid: always NULL
+				catalog.VirtualNull, // leader_pid: always NULL
 				b.UserSysID,
 				b.UserName,
 				b.ApplicationName,
