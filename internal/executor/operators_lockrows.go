@@ -284,46 +284,117 @@ type currentTIDProvider interface {
 
 // findScanLeaf walks the child operator chain past Project /
 // Filter wrappers to surface a TID-providing leaf operator
-// (seqScanOp / indexScanOp). Returns nil when the leaf is
+// (seqScanOp / indexScanOp). Returns (nil, nil) when the leaf is
 // neither (e.g. Values, CTEScan); lockRowsOp falls through to
 // pass-through Next in that case with only relation-level
 // lock applied.
-func findScanLeaf(op Operator) currentTIDProvider {
+//
+// Returns (nil, error) when it encounters an operator type it does not
+// recognise — unknown shapes must error loudly rather than silently
+// degrading FOR UPDATE to an unlocked pass-through (M0128-P0.2).
+func findScanLeaf(op Operator) (currentTIDProvider, error) {
 	for {
 		switch v := op.(type) {
+		// TID-providing scan leaves.
 		case *seqScanOp:
-			return v
+			return v, nil
 		case *indexScanOp:
-			return v
+			return v, nil
+		// Pass-through operators — recurse through the single child.
 		case *projectOp:
 			op = v.child
 		case *filterOp:
 			op = v.child
+		case *sortOp:
+			op = v.child
+		case *limitOp:
+			op = v.child
+		case *distinctOp:
+			op = v.child
+		case *distinctOnOp:
+			op = v.child
+		case *ordinalityOp:
+			op = v.child
+		case *windowOp:
+			op = v.child
+		case *projectSetOp:
+			op = v.child
+		case *materializeOp:
+			op = v.child
+		case *instrumentedOp:
+			op = v.inner
+		// setOp: partition UNION ALL — implements currentTIDProvider,
+		// delegates to whichever child is currently active.
 		case *setOp:
-			// Partition UNION ALL: setOp implements currentTIDProvider and
-			// delegates to whichever child is currently active (left while
-			// !leftDone, right once leftDone). M0100-0005 follow-up.
-			return v
+			return v, nil
+		// Join operators — prefer the left (outer) child, fall back to right.
 		case *joinOp:
-			// For joins, prefer the left (outer) child because its scan
-			// cursor stays at the current row while the inner scan loops.
-			// When the left child is not a real-table scan (e.g. a VALUES
-			// or correlated subquery), fall back to the right child so that
-			// FOR UPDATE OF a real table still gets a TID even when the
-			// planner reordered the join to put VALUES outermost.
-			if left := findScanLeaf(v.left); left != nil {
-				return left
+			left, lerr := findScanLeaf(v.left)
+			if lerr != nil {
+				return nil, lerr
+			}
+			if left != nil {
+				return left, nil
 			}
 			op = v.right
 		case *nestedLoopIndexJoinOp:
-			// Prefer outer; fall back to inner (indexScanOp) when outer is
-			// not a real-table scan (e.g. VALUES, subquery).
-			if left := findScanLeaf(v.outer); left != nil {
-				return left
+			outer, oerr := findScanLeaf(v.outer)
+			if oerr != nil {
+				return nil, oerr
 			}
-			return nliInnerIndexScan(v.inner)
+			if outer != nil {
+				return outer, nil
+			}
+			return nliInnerIndexScan(v.inner), nil
+		// Known non-TID terminals — legitimate, no error.
+		// A LockRows above one of these gets only the relation-level lock
+		// and the slot side-channel (drainAndStamp fallback).
+		case *valuesOp,
+			*cteScanOp,
+			*workTableScanOp,
+			*materializedCTEScanOp,
+			*indexOnlyScanOp,
+			*scalarFuncScanOp,
+			*fromUnnestOp,
+			*generateSeriesOp,
+			*generateSubscriptsOp,
+			*userSrfScanOp,
+			*rowsFromOp,
+			*fromRegexpMatchesOp,
+			*pgOptionsToTableOp,
+			*pgPartitionTreeOp,
+			*pgGetPublicationTablesOp,
+			*pgGetSequenceDataOp,
+			*pgAvailableWalSummariesOp,
+			*pgInputErrorInfoOp,
+			*tsTokenTypeOp,
+			*callOp,
+			*recursiveUnionOp:
+			return nil, nil
+		// Barrier operators — a LockRows above these has no unambiguous
+		// TID source; error rather than silently degrading.
+		case *gatherOp:
+			return nil, fmt.Errorf("lockRows: gatherOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *gatherMergeOp:
+			return nil, fmt.Errorf("lockRows: gatherMergeOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *spillOp:
+			return nil, fmt.Errorf("lockRows: spillOp replays spilled rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *rowsOp:
+			return nil, fmt.Errorf("lockRows: rowsOp replays pre-drained rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *batchReplayOp:
+			return nil, fmt.Errorf("lockRows: batchReplayOp replays spilled hash batches and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *cteDMLPrefixOp:
+			return nil, fmt.Errorf("lockRows: cteDMLPrefixOp wraps DML CTEs and has no single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		// DML / utility operators — must never appear under a LockRows.
+		case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
+			*ddlOp, *lockRowsOp, *aggregateOp,
+			*vacuumOp, *analyzeOp, *clusterOp,
+			*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
+			*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
+			*verifyHeapamOp, *reindexOp:
+			return nil, fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
 		default:
-			return nil
+			return nil, fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to findScanLeaf or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
 		}
 	}
 }
@@ -333,43 +404,121 @@ func findScanLeaf(op Operator) currentTIDProvider {
 // Called after o.child.Open so seqScanOp.rel and indexScanOp.ctx are set.
 // Used to ensure the lockRowsOp captures TIDs from the correct scan in complex
 // joins where the locked table is not the leftmost leaf (M0100-0010).
-func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDProvider {
+//
+// Returns (nil, error) when it encounters an operator type it does not
+// recognise — unknown shapes must error loudly rather than silently
+// degrading FOR UPDATE to an unlocked pass-through (M0128-P0.2).
+func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) (currentTIDProvider, error) {
 	for {
 		switch v := op.(type) {
+		// TID-providing scan leaves — match on relation.
 		case *seqScanOp:
 			if v.rel == targetRel {
-				return v
+				return v, nil
 			}
-			return nil
+			return nil, nil
 		case *indexScanOp:
 			if v.ctx != nil && v.ctx.Catalog.RelFileNode(v.plan.Table) == targetRel {
-				return v
+				return v, nil
 			}
-			return nil
+			return nil, nil
+		// Pass-through operators — recurse through the single child.
 		case *projectOp:
 			op = v.child
 		case *filterOp:
 			op = v.child
+		case *sortOp:
+			op = v.child
+		case *limitOp:
+			op = v.child
+		case *distinctOp:
+			op = v.child
+		case *distinctOnOp:
+			op = v.child
+		case *ordinalityOp:
+			op = v.child
+		case *windowOp:
+			op = v.child
+		case *projectSetOp:
+			op = v.child
+		case *materializeOp:
+			op = v.child
+		case *instrumentedOp:
+			op = v.inner
+		// setOp: implements currentTIDProvider but we can't check its
+		// target rel — fall back to generic findScanLeaf.
 		case *setOp:
-			// setOp implements currentTIDProvider for partition unions;
-			// we can't check its target rel, fall back to generic findScanLeaf.
-			return nil
+			return nil, nil
+		// Join operators — recurse into both children.
 		case *joinOp:
-			if left := findScanLeafForRel(v.left, targetRel); left != nil {
-				return left
+			left, lerr := findScanLeafForRel(v.left, targetRel)
+			if lerr != nil {
+				return nil, lerr
+			}
+			if left != nil {
+				return left, nil
 			}
 			op = v.right
 		case *nestedLoopIndexJoinOp:
-			if left := findScanLeafForRel(v.outer, targetRel); left != nil {
-				return left
+			outer, oerr := findScanLeafForRel(v.outer, targetRel)
+			if oerr != nil {
+				return nil, oerr
+			}
+			if outer != nil {
+				return outer, nil
 			}
 			if is := nliInnerIndexScan(v.inner); is != nil && is.ctx != nil &&
 				is.ctx.Catalog.RelFileNode(is.plan.Table) == targetRel {
-				return is
+				return is, nil
 			}
-			return nil
+			return nil, nil
+		// Known non-TID terminals — legitimate, no error.
+		case *valuesOp,
+			*cteScanOp,
+			*workTableScanOp,
+			*materializedCTEScanOp,
+			*indexOnlyScanOp,
+			*scalarFuncScanOp,
+			*fromUnnestOp,
+			*generateSeriesOp,
+			*generateSubscriptsOp,
+			*userSrfScanOp,
+			*rowsFromOp,
+			*fromRegexpMatchesOp,
+			*pgOptionsToTableOp,
+			*pgPartitionTreeOp,
+			*pgGetPublicationTablesOp,
+			*pgGetSequenceDataOp,
+			*pgAvailableWalSummariesOp,
+			*pgInputErrorInfoOp,
+			*tsTokenTypeOp,
+			*callOp,
+			*recursiveUnionOp:
+			return nil, nil
+		// Barrier operators — a LockRows above these has no unambiguous
+		// TID source; error rather than silently degrading.
+		case *gatherOp:
+			return nil, fmt.Errorf("lockRows: gatherOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *gatherMergeOp:
+			return nil, fmt.Errorf("lockRows: gatherMergeOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *spillOp:
+			return nil, fmt.Errorf("lockRows: spillOp replays spilled rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *rowsOp:
+			return nil, fmt.Errorf("lockRows: rowsOp replays pre-drained rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *batchReplayOp:
+			return nil, fmt.Errorf("lockRows: batchReplayOp replays spilled hash batches and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		case *cteDMLPrefixOp:
+			return nil, fmt.Errorf("lockRows: cteDMLPrefixOp wraps DML CTEs and has no single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
+		// DML / utility operators — must never appear under a LockRows.
+		case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
+			*ddlOp, *lockRowsOp, *aggregateOp,
+			*vacuumOp, *analyzeOp, *clusterOp,
+			*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
+			*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
+			*verifyHeapamOp, *reindexOp:
+			return nil, fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
 		default:
-			return nil
+			return nil, fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to findScanLeafForRel or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
 		}
 	}
 }
@@ -400,19 +549,67 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDPr
 // carries the row mark as a resjunk `ctid` column that Sort preserves like any
 // other column (nodeLockRows.c / preprocess_targetlist's rowmark junk attrs),
 // rather than reconstructing it from the shape of the plan tree.
-func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) {
+func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) error {
 	switch v := op.(type) {
+	// Pass-through operators — recurse through the single child.
 	case *projectOp:
-		markJoinPreserveCTID(v.child, targetRel)
+		return markJoinPreserveCTID(v.child, targetRel)
 	case *filterOp:
-		markJoinPreserveCTID(v.child, targetRel)
+		return markJoinPreserveCTID(v.child, targetRel)
 	case *sortOp:
-		markJoinPreserveCTID(v.child, targetRel)
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *limitOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *distinctOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *distinctOnOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *ordinalityOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *windowOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *projectSetOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *materializeOp:
+		return markJoinPreserveCTID(v.child, targetRel)
+	case *instrumentedOp:
+		return markJoinPreserveCTID(v.inner, targetRel)
+	// Join operators — tag joinOp with preserveCTIDRel, recurse into children.
 	case *joinOp:
 		rel := targetRel
 		v.preserveCTIDRel = &rel
-		markJoinPreserveCTID(v.left, targetRel)
-		markJoinPreserveCTID(v.right, targetRel)
+		if err := markJoinPreserveCTID(v.left, targetRel); err != nil {
+			return err
+		}
+		return markJoinPreserveCTID(v.right, targetRel)
+	case *nestedLoopIndexJoinOp:
+		// Inner is always *indexScanOp or *memoizeOp (nliInner), neither
+		// of which can contain a joinOp — recurse outer only.
+		return markJoinPreserveCTID(v.outer, targetRel)
+	// Known terminals — no children, harmless no-op.
+	case *seqScanOp, *indexScanOp, *setOp,
+		*valuesOp, *cteScanOp, *workTableScanOp, *materializedCTEScanOp,
+		*indexOnlyScanOp, *scalarFuncScanOp, *fromUnnestOp, *generateSeriesOp,
+		*generateSubscriptsOp, *userSrfScanOp, *rowsFromOp, *fromRegexpMatchesOp,
+		*pgOptionsToTableOp, *pgPartitionTreeOp, *pgGetPublicationTablesOp,
+		*pgGetSequenceDataOp, *pgAvailableWalSummariesOp, *pgInputErrorInfoOp,
+		*tsTokenTypeOp, *callOp, *recursiveUnionOp:
+		return nil
+	// Barrier operators — a LockRows above these cannot tag joins below;
+	// error rather than silently degrading.
+	case *gatherOp, *gatherMergeOp, *spillOp, *rowsOp,
+		*batchReplayOp, *cteDMLPrefixOp:
+		return fmt.Errorf("lockRows: %T is a barrier for preserveCTID tagging and cannot appear below LockRows — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix", v)
+	// DML / utility operators — must never appear under a LockRows.
+	case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
+		*ddlOp, *lockRowsOp, *aggregateOp,
+		*vacuumOp, *analyzeOp, *clusterOp,
+		*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
+		*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
+		*verifyHeapamOp, *reindexOp:
+		return fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
+	default:
+		return fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to markJoinPreserveCTID or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
 	}
 }
 
@@ -515,7 +712,9 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// drainAndStamp). Must run BEFORE o.child.Open builds the hash table.
 	if len(o.plan.Locks) > 0 && o.plan.Locks[0].Table != nil {
 		targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[0].Table)
-		markJoinPreserveCTID(o.child, targetRel)
+		if err := markJoinPreserveCTID(o.child, targetRel); err != nil {
+			return err
+		}
 	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
@@ -524,12 +723,18 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// the TID tracked by drainAndStamp comes from the right table.
 	// This matters when the locked table is not the leftmost scan leaf
 	// in a complex join (e.g. FOR UPDATE OF jt where jt is not outer).
-	o.scan = findScanLeaf(o.child) // default fallback
+	scan, err := findScanLeaf(o.child) // default fallback
+	if err != nil {
+		return err
+	}
+	o.scan = scan
 	for i := range o.plan.Locks {
 		if o.plan.Locks[i].Table != nil {
 			targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[i].Table)
-			if scan := findScanLeafForRel(o.child, targetRel); scan != nil {
-				o.scan = scan
+			if scanRel, scanErr := findScanLeafForRel(o.child, targetRel); scanErr != nil {
+				return scanErr
+			} else if scanRel != nil {
+				o.scan = scanRel
 			}
 			break
 		}

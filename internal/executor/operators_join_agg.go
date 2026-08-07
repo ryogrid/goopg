@@ -579,7 +579,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// M0118-0009 (eval-plan-qual): preserve build-side heap ctids when a
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
-		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
+			sl, ferr := findScanLeafForRel(o.right, *o.preserveCTIDRel)
+			if ferr != nil {
+				return false, ferr
+			}
+			if sl != nil {
 			// The CTID exception: lazyHashCTID is a map[string] keyed in
 			// lockstep with lazyHash, so this build stays on the string map
 			// whatever the key types say (M0127-P0.3).
