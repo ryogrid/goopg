@@ -100,6 +100,12 @@ type joinlistProblem struct {
 	cp  costParams
 	cat catalog.Catalog
 
+	// joinInfoList is root->join_info_list: every SpecialJoinInfo for the
+	// statement, in bottom-up order. Carried by the top-level problem so
+	// `buildInitialRels` can store it on the search context. nil for
+	// inner-join-only FROM clauses. M0128-P1.2.
+	joinInfoList []*SpecialJoinInfo
+
 	// tupleFraction is the query's `root->tuple_fraction`, applied to the
 	// TOP-level problem only (see makeRelFromJoinlist).
 	tupleFraction float64
@@ -314,7 +320,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	}
 	cum[len(items)] = prob.cumOffsets[hi]
 
-	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction)
+	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, prob.joinInfoList)
 	if err != nil {
 		return joinlistRel{}, err
 	}

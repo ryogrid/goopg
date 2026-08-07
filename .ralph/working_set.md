@@ -1,36 +1,36 @@
-M0127-P6.4 COMPLETE — supersession stamps + ledger rows (LAST M0127 task)
+M0128-P1.1 COMPLETE — SpecialJoinInfo representation + construction
 
-M0127 is now fully closed. All P6.1–P6.4 tasks are [x].
-
-Task: M0127-P6.4 — supersession stamps, README index flips, ledger rows
+Task: M0128-P1.1 — SpecialJoinInfo representation + construction
 Files:
-  - 23 design docs stamped with `superseded by: leftdeep-joins/` headers
-    (0034-0001, 0038-0001, 0043-0002/0003, 0063-0002, 0125-0002/0013/0046,
-    all 13 0126-*)
-  - docs/design/README.md: 19 row status flips (0034, 0038, 0043-0003,
-    0125-0002/0013/0046, all 13 0126-* from draft→superseded)
-  - docs/design/cost-model/09-verification-and-acceptance.md: §3 MHJ
-    allow-list item struck, (MHJ) reference removed
-  - docs/design/leftdeep-joins/08-migration-and-removal.md: §5 COMPLETED
-    note added
-  - docs/design/leftdeep-joins/IMPLEMENTATION-TODO.md: P6.4 checked off
-  - .ralph/deferral_ledger.md: 5 new rows (GEQO, skew buckets,
-    SpecialJoinInfo semi/anti in-DP, shared spilling builds, full
-    join_order_restriction inference — last two carry
-    join_is_legal-inference-dependent marker per 08 §5)
-  - .ralph/fix_plan.md: M0127-P6.4 checked [x]; M-NIGHTLY
-    AI-20260807-004620-001 appended to existing regress/truncate task
+  - internal/planner/specialjoin.go (NEW): SpecialJoinInfo struct, makeSpecialJoinInfo,
+    joinlistRelSet, collectSpecialJoinInfos
+  - internal/planner/collapse.go: sjinfo field on joinlistItem, SpecialJoinInfo
+    construction in deconstructFromItem for LEFT/RIGHT/FULL on pinned items
+  - internal/planner/planner.go: joinInfoList on resolveContext, populated after
+    deconstructJointree
+  - internal/planner/specialjoin_test.go (NEW): 15 tests covering basic/nested/
+    mixed special joins, empty cases, resolveContext population, field correctness
 
-Key symbols: N/A (doc-only change)
-Hypothesis/Findings: M0127 closed — all 4 P6 tasks done. The PG-shaped
-  DP is the ONLY join-order search; MHJ is fully deleted; the
-  supersession trail is complete.
+Key symbols: SpecialJoinInfo, makeSpecialJoinInfo, joinlistRelSet,
+  collectSpecialJoinInfos, joinlistItem.sjinfo, resolveContext.joinInfoList
 
-Next step: M0128-P1.1 (special-join inference / join_is_legal, per the
-  Current Priority banner — M0128 is unblocked now that M0127-P6.4
-  filed the join_is_legal-inference-dependent ledger rows P1.2/P1.5 need).
+Hypothesis/Findings:
+  - SpecialJoinInfo is built bottom-up during deconstructFromItem for every
+    LEFT/RIGHT/FULL join (SEMI/ANTI parser support varies — structural path
+    exists). Each pinned item carries its sjinfo.
+  - min_lefthand/min_righthand are conservative for LEFT (syn = min); the true
+    clause-based computation is P1.2's job.
+  - commute fields, lhs_strict, ojrelid, and semi fields are zero/nil — all
+    populated when consumed (P1.2/P1.4).
+  - resolveContext.joinInfoList is populated from the joinlist's
+    collectSpecialJoinInfos immediately after deconstruction.
+  - Zero behavioral change verified (SPOT Q12=2/Q13=35, DS05 95 PASS/0 MISMATCH,
+    99/99 plan shapes identical).
 
-Gates run: `make ralph-state-guard` OK. Build `go build ./...` OK.
-  No code changed — doc-only, no test/sweep gates needed.
+Next step: M0128-P1.2 (join_is_legal + have_join_order_restriction for LEFT joins
+  — consume P1.1's entries, replace constant-false stubs in joinsearchlevel.go)
+
+Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/95, zero
+  row/checksum/plan-shape deltas), make ralph-state-guard REPAIRED+OK.
 
 In-flight: none

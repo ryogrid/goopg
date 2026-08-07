@@ -350,7 +350,7 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 	}
 
 	part, supplier, fact := relsetOf(0), relsetOf(1), relsetOf(2)
-	s, err := newSearchCtx(3, defaultCostParams())
+	s, err := newSearchCtx(3, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

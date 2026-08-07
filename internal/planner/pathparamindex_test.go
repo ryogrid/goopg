@@ -72,7 +72,7 @@ func ppiEquiClause(outerRels RelSet, outerName string, innerRels RelSet, innerNa
 // given clause list already installed. Rel 0 stands for the outer.
 func ppiCtx(t *testing.T, inner *catalog.Table, innerRows float64, clauses ...*restrictInfo) *searchCtx {
 	t.Helper()
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestAddParameterizedIndexPathsOneParameterizationPerOuterRelset(t *testing.
 		catalog.ColumnStats{NDistinct: 1_500_000},
 		catalog.ColumnStats{NDistinct: 150_000},
 		catalog.ColumnStats{NDistinct: 5})
-	s, err := newSearchCtx(3, defaultCostParams())
+	s, err := newSearchCtx(3, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

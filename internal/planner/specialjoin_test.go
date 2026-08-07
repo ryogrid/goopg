@@ -312,3 +312,280 @@ func TestSpecialJoinInfoFieldsAreSet(t *testing.T) {
 		t.Errorf("Ojrelid = %d, want 0 (no RT entry yet)", sj.Ojrelid)
 	}
 }
+
+// ── M0128-P1.2 legality-matrix tests ──
+//
+// These test joinIsLegal, joinOrderRestricted, and hasJoinRestriction over
+// hand-built SpecialJoinInfo entries. Each test:
+//  1. Constructs a searchCtx with the joinInfoList the production code
+//     deconstructJointree would produce.
+//  2. Calls the function under known (rel1, rel2) pairs.
+//  3. Verifies the result against PG's documented behaviour in joinrels.c.
+
+// mkTestSearchCtx builds a minimal searchCtx with n base rels and the given
+// joinInfoList, enough for joinIsLegal/joinOrderRestricted/hasJoinRestriction
+// to run on.
+func mkTestSearchCtx(t *testing.T, nrels int, jil []*SpecialJoinInfo) *searchCtx {
+	t.Helper()
+	s, err := newSearchCtx(nrels, defaultCostParams(), jil)
+	if err != nil {
+		t.Fatalf("newSearchCtx: %v", err)
+	}
+	return s
+}
+
+// mkTestRel builds a minimal RelOptInfo with the given relids, for legality tests.
+func mkTestRel(relids RelSet) *RelOptInfo {
+	return &RelOptInfo{Relids: relids, Rows: 100, Width: 8}
+}
+
+// mkSJ builds a SpecialJoinInfo with the given fields — the minimum needed
+// for legality tests.
+func mkSJ(jointype parser.JoinType, minLHS, minRHS RelSet) *SpecialJoinInfo {
+	return &SpecialJoinInfo{
+		MinLefthand:  minLHS,
+		MinRighthand: minRHS,
+		SynLefthand:  minLHS,
+		SynRighthand: minRHS,
+		Jointype:     jointype,
+	}
+}
+
+// ── joinIsLegal ──
+
+func TestJoinIsLegalEmptyJoinInfoList(t *testing.T) {
+	s := mkTestSearchCtx(t, 3, nil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal returned error: %v", err)
+	}
+	if sj != nil || rev {
+		t.Errorf("joinIsLegal = (%v, %v); want (nil, false) for plain inner join", sj, rev)
+	}
+}
+
+func TestJoinIsLegalInnerJoinUnaffectedBySJ(t *testing.T) {
+	// A LEFT JOIN B — SJ covers {A}=LHS, {B}=RHS.
+	// Pair (A, C) where C is unrelated: A is the preserved side, so
+	// joining A with C before the LEFT JOIN is legal — the SJ's RHS={B}
+	// doesn't overlap {A,C} at all.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 3, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b100))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,C) returned error: %v", err)
+	}
+	if sj != nil || rev {
+		t.Errorf("joinIsLegal(A,C) = (%v, %v); want (nil, false) — A and C are not the SJ pair", sj, rev)
+	}
+}
+
+func TestJoinIsLegalRejectsRHSPlusUnrelated(t *testing.T) {
+	// A LEFT JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (B, C) where C is unrelated: B is the nullable RHS, and joining
+	// it with C before the LEFT JOIN would produce rows that should be
+	// null-extended. PG rejects this (joinrels.c:490-530).
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 3, jil)
+	_, _, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b100))
+	if err == nil {
+		t.Error("joinIsLegal(B,C) should reject — joining nullable RHS with an unrelated rel before the LEFT JOIN is illegal")
+	}
+}
+
+func TestJoinIsLegalMatchesLeftJoin(t *testing.T) {
+	// A LEFT JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (A, B): must match the SJ, not reversed.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,B) returned error: %v", err)
+	}
+	if sj == nil {
+		t.Fatal("joinIsLegal(A,B) = nil; want the LEFT JOIN SpecialJoinInfo")
+	}
+	if rev {
+		t.Error("joinIsLegal(A,B) reversed = true; want false")
+	}
+	if sj.Jointype != parser.JoinLeft {
+		t.Errorf("joinIsLegal(A,B) sj.Jointype = %v; want LEFT", sj.Jointype)
+	}
+}
+
+func TestJoinIsLegalMatchesLeftJoinReversed(t *testing.T) {
+	// A LEFT JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (B, A): must match the SJ, reversed.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b001))
+	if err != nil {
+		t.Fatalf("joinIsLegal(B,A) returned error: %v", err)
+	}
+	if sj == nil {
+		t.Fatal("joinIsLegal(B,A) = nil; want the LEFT JOIN SpecialJoinInfo")
+	}
+	if !rev {
+		t.Error("joinIsLegal(B,A) reversed = false; want true")
+	}
+}
+
+func TestJoinIsLegalRHSOverlapBothSides(t *testing.T) {
+	// A LEFT JOIN (B ⋈ C) — SJ: LHS={A}, RHS={B,C}.
+	// Pair (B, C): both overlap RHS but neither fully contains it.
+	// PG's join_is_legal says: if both inputs overlap RHS, assume valid
+	// previous commutation → continue → returns plain inner join.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b110)}
+	s := mkTestSearchCtx(t, 3, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b010), mkTestRel(0b100))
+	if err != nil {
+		t.Fatalf("joinIsLegal(B,C) returned error: %v", err)
+	}
+	if sj != nil || rev {
+		t.Errorf("joinIsLegal(B,C) = (%v, %v); want (nil, false) — both sides overlap RHS", sj, rev)
+	}
+}
+
+func TestJoinIsLegalMatchesFullJoin(t *testing.T) {
+	// A FULL JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (A, B): must match the SJ, not reversed.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	sj, rev, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,B) for FULL returned error: %v", err)
+	}
+	if sj == nil {
+		t.Fatal("joinIsLegal(A,B) for FULL = nil; want the SpecialJoinInfo")
+	}
+	if sj.Jointype != parser.JoinFull {
+		t.Errorf("joinIsLegal sj.Jointype = %v; want FULL", sj.Jointype)
+	}
+	if rev {
+		t.Error("joinIsLegal reversed = true; want false")
+	}
+}
+
+// ── joinOrderRestricted ──
+
+func TestJoinOrderRestrictedEmptyJoinInfoList(t *testing.T) {
+	s := mkTestSearchCtx(t, 3, nil)
+	if s.joinOrderRestricted(mkTestRel(0b001), mkTestRel(0b010)) {
+		t.Error("joinOrderRestricted returned true with no SpecialJoinInfos")
+	}
+}
+
+func TestJoinOrderRestrictedLeftJoinPair(t *testing.T) {
+	// A LEFT JOIN B — SJ: LHS={A}, RHS={B}.
+	// Pair (A, B): must be restricted — they complete the SJ.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	if !s.joinOrderRestricted(mkTestRel(0b001), mkTestRel(0b010)) {
+		t.Error("joinOrderRestricted(A,B) = false; want true — they form the SJ")
+	}
+}
+
+func TestJoinOrderRestrictedLeftJoinReversed(t *testing.T) {
+	// Same as above but rels reversed — must still be restricted.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	if !s.joinOrderRestricted(mkTestRel(0b010), mkTestRel(0b001)) {
+		t.Error("joinOrderRestricted(B,A) = false; want true — reversed still forms the SJ")
+	}
+}
+
+func TestJoinOrderRestrictedBothOverlapRHS(t *testing.T) {
+	// A LEFT JOIN (B ⋈ C) — SJ: LHS={A}, RHS={B,C}.
+	// Pair (B, C): both overlap RHS → restricted (completes RHS).
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b110)}
+	s := mkTestSearchCtx(t, 3, jil)
+	if !s.joinOrderRestricted(mkTestRel(0b010), mkTestRel(0b100)) {
+		t.Error("joinOrderRestricted(B,C) = false; want true — both overlap RHS")
+	}
+}
+
+func TestJoinOrderRestrictedBothOverlapLHS(t *testing.T) {
+	// (A ⋈ B) LEFT JOIN C — SJ: LHS={A,B}, RHS={C}.
+	// Pair (A, B): both overlap LHS → restricted (completes LHS).
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b011, 0b100)}
+	s := mkTestSearchCtx(t, 3, jil)
+	if !s.joinOrderRestricted(mkTestRel(0b001), mkTestRel(0b010)) {
+		t.Error("joinOrderRestricted(A,B) = false; want true — both overlap LHS")
+	}
+}
+
+func TestJoinOrderRestrictedSkipsFullJoin(t *testing.T) {
+	// FULL JOIN — should be skipped by the restriction check per PG's logic.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	if s.joinOrderRestricted(mkTestRel(0b001), mkTestRel(0b010)) {
+		t.Error("joinOrderRestricted(A,B) for FULL = true; want false — FULL joins are handled elsewhere")
+	}
+}
+
+// ── hasJoinRestriction ──
+
+func TestHasJoinRestrictionEmptyJoinInfoList(t *testing.T) {
+	s := mkTestSearchCtx(t, 3, nil)
+	if s.hasJoinRestriction(mkTestRel(0b001)) {
+		t.Error("hasJoinRestriction returned true with no SpecialJoinInfos")
+	}
+}
+
+func TestHasJoinRestrictionOverlapsRHS(t *testing.T) {
+	// A LEFT JOIN (B ⋈ C) — SJ: LHS={A}, RHS={B,C}.
+	// Rel B alone: overlaps RHS but doesn't fully contain it → restricted.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b001, 0b110)}
+	s := mkTestSearchCtx(t, 3, jil)
+	if !s.hasJoinRestriction(mkTestRel(0b010)) { // B
+		t.Error("hasJoinRestriction(B) = false; want true — B overlaps RHS but doesn't contain it")
+	}
+}
+
+func TestHasJoinRestrictionFullyContainsSJ(t *testing.T) {
+	// (A ⋈ B) LEFT JOIN C — SJ: LHS={A,B}, RHS={C}.
+	// Rel {A,B}: fully contains LHS AND RHS (C inside larger rel or SJ done).
+	// Actually: {A,B} fully contains min_lefthand and doesn't overlap RHS → not restricted.
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinLeft, 0b011, 0b100)}
+	s := mkTestSearchCtx(t, 3, jil)
+	if s.hasJoinRestriction(mkTestRel(0b011)) {
+		t.Error("hasJoinRestriction({A,B}) = true; want false — LHS is fully contained, RHS doesn't overlap")
+	}
+}
+
+func TestHasJoinRestrictionSkipsFullJoin(t *testing.T) {
+	jil := []*SpecialJoinInfo{mkSJ(parser.JoinFull, 0b001, 0b010)}
+	s := mkTestSearchCtx(t, 2, jil)
+	if s.hasJoinRestriction(mkTestRel(0b001)) {
+		t.Error("hasJoinRestriction(A) for FULL = true; want false — FULL joins are handled elsewhere")
+	}
+}
+
+func TestHasJoinRestrictionBothOverlap(t *testing.T) {
+	// (A LEFT JOIN B) LEFT JOIN C — two SJs: SJ1 LHS={A}, RHS={B}; SJ2 LHS={A,B}, RHS={C}.
+	// Rel {A,B}: SJ1's LHS+RHS are subset → contained (skip). SJ2's LHS is subset but RHS doesn't overlap → not restricted.
+	// Actually: {A,B} = SJ1 fully done. SJ2's LHS={A,B} IS subset, RHS={C} doesn't overlap → skip.
+	// Result: false.
+	jil := []*SpecialJoinInfo{
+		mkSJ(parser.JoinLeft, 0b001, 0b010),
+		mkSJ(parser.JoinLeft, 0b011, 0b100),
+	}
+	s := mkTestSearchCtx(t, 4, jil)
+	if s.hasJoinRestriction(mkTestRel(0b011)) {
+		t.Error("hasJoinRestriction({A,B}) = true; want false — both SJs are either contained or don't overlap")
+	}
+}
+
+// TestJoinIsLegalMultipleSJInfosRejected: matching multiple SJs is illegal.
+func TestJoinIsLegalMultipleSJInfosRejected(t *testing.T) {
+	// Two LEFT JOINs with identical LHS/RHS — pathological but must be caught.
+	jil := []*SpecialJoinInfo{
+		mkSJ(parser.JoinLeft, 0b001, 0b010),
+		mkSJ(parser.JoinLeft, 0b001, 0b010),
+	}
+	s := mkTestSearchCtx(t, 2, jil)
+	_, _, err := s.joinIsLegal(mkTestRel(0b001), mkTestRel(0b010))
+	if err == nil {
+		t.Error("joinIsLegal should reject a pair matching multiple SpecialJoinInfos")
+	}
+}

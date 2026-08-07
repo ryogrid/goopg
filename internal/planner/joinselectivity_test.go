@@ -54,7 +54,7 @@ func jsCtx(t *testing.T) *searchCtx {
 		catalog.ColumnStats{NDistinctFrac: 0.25},
 		catalog.ColumnStats{NDistinct: 20000},
 	)
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

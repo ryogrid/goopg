@@ -55,7 +55,7 @@ func jrsCatalog(t *testing.T) (catalog.Catalog, *catalog.Table, *catalog.Table) 
 // `lineitem` (the probing side) and rel 1 is `partsupp`.
 func jrsCtx(t *testing.T, lineitem, partsupp *catalog.Table) *searchCtx {
 	t.Helper()
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestCalcJoinrelSizeFKDividesByParentCount(t *testing.T) {
 		RefTable: "orders", RefColumns: []string{"o_orderkey"},
 	}}
 
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestCalcJoinrelSizeInvalidFKIgnored(t *testing.T) {
 		RefTable: "orders", RefColumns: []string{"o_orderkey"}, NotValid: true,
 	}}
 
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestCalcJoinrelSizeClauseConsumedOnce(t *testing.T) {
 		}
 	}
 
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide(t *testing.T) {
 		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}},
 	}, 10000, catalog.ColumnStats{NDistinct: 10000})
 
-	s, err := newSearchCtx(3, defaultCostParams())
+	s, err := newSearchCtx(3, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +502,7 @@ func jrsUnanalysed(t *testing.T) (catalog.Catalog, *searchCtx) {
 	lineitem := jsTable(t, c, "lineitem", []catalog.Column{
 		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}},
 	}, 6000000)
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestCalcJoinrelSizeMeasuredBlowUpIsNotCapped(t *testing.T) {
 	lineitem := jsTable(t, c, "lineitem", []catalog.Column{
 		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}},
 	}, 6000000, catalog.ColumnStats{NDistinct: 100})
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

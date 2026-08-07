@@ -77,7 +77,7 @@ func (b *recordingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses [
 // three parallel slices). Rel i owns bit i and has 10*(i+1) rows.
 func jslCtx(t *testing.T, n int) *searchCtx {
 	t.Helper()
-	s, err := newSearchCtx(n, defaultCostParams())
+	s, err := newSearchCtx(n, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatalf("newSearchCtx: %v", err)
 	}

@@ -35,7 +35,7 @@ func mkRelInfo(t *testing.T, leaf *SeqScan, filtered int64) baseRelInfo {
 // holds exactly the rels with `lev` members (allpaths.c:3475-3496), and the
 // enumerator's phase-2 pairing (k, lev-k) is only sound if that holds.
 func TestSearchCtxFilesRelsByRelsetPopcount(t *testing.T) {
-	s, err := newSearchCtx(4, defaultCostParams())
+	s, err := newSearchCtx(4, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatalf("newSearchCtx: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestSearchCtxFilesRelsByRelsetPopcount(t *testing.T) {
 // already-registered relset is a caller bug (it splits the pathlist add_path
 // prunes within), and a relset wider than the problem cannot be filed at all.
 func TestSearchCtxRejectsDuplicateAndOutOfRangeRels(t *testing.T) {
-	s, err := newSearchCtx(3, defaultCostParams())
+	s, err := newSearchCtx(3, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatalf("newSearchCtx: %v", err)
 	}
@@ -99,10 +99,10 @@ func TestSearchCtxRejectsDuplicateAndOutOfRangeRels(t *testing.T) {
 	if err := s.addRel(nil); err == nil {
 		t.Error("a nil rel was accepted")
 	}
-	if _, err := newSearchCtx(maxSearchRels+1, defaultCostParams()); err == nil {
+	if _, err := newSearchCtx(maxSearchRels+1, defaultCostParams(), nil); err == nil {
 		t.Errorf("newSearchCtx accepted %d rels; RelSet is %d bits wide", maxSearchRels+1, maxSearchRels)
 	}
-	if _, err := newSearchCtx(0, defaultCostParams()); err == nil {
+	if _, err := newSearchCtx(0, defaultCostParams(), nil); err == nil {
 		t.Error("newSearchCtx accepted an empty join problem")
 	}
 }
@@ -111,7 +111,7 @@ func TestSearchCtxRejectsDuplicateAndOutOfRangeRels(t *testing.T) {
 // (allpaths.c:3508-3512). goopg reports instead of asserting, because P5.3's
 // answer to a failed search is the syntactic shape, not an error.
 func TestSearchCtxFinalRelContract(t *testing.T) {
-	s, _ := newSearchCtx(2, defaultCostParams())
+	s, _ := newSearchCtx(2, defaultCostParams(), nil)
 	if _, err := s.finalRel(); err == nil {
 		t.Error("finalRel on an unpopulated top level returned no error")
 	}
@@ -151,7 +151,7 @@ func TestBuildInitialRelsPopulatesLevelOne(t *testing.T) {
 		infos[i] = mkRelInfo(t, leaf, filtered[i])
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0, nil)
 	if err != nil {
 		t.Fatalf("buildInitialRels: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestBuildInitialRelsAdmitsNonTableLeaves(t *testing.T) {
 		}
 	}
 
-	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0)
+	s, err := buildInitialRels(bindings, scans, infos, defaultCostParams(), 0, nil)
 	if err != nil {
 		t.Fatalf("buildInitialRels rejected a FROM list with non-table leaves: %v", err)
 	}
@@ -290,16 +290,16 @@ func TestBuildInitialRelsRejectsMalformedInput(t *testing.T) {
 	info := []baseRelInfo{mkRelInfo(t, leaf, 100)}
 	cp := defaultCostParams()
 
-	if _, err := buildInitialRels(nil, nil, nil, cp, 0); err == nil {
+	if _, err := buildInitialRels(nil, nil, nil, cp, 0, nil); err == nil {
 		t.Error("an empty FROM list was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp, 0); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf, leaf}, info, cp, 0, nil); err == nil {
 		t.Error("a scan/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp, 0); err == nil {
+	if _, err := buildInitialRels(b, []Node{leaf}, nil, cp, 0, nil); err == nil {
 		t.Error("a relInfo/binding length mismatch was accepted")
 	}
-	if _, err := buildInitialRels(b, []Node{nil}, info, cp, 0); err == nil {
+	if _, err := buildInitialRels(b, []Node{nil}, info, cp, 0, nil); err == nil {
 		t.Error("a nil leaf node was accepted")
 	}
 }

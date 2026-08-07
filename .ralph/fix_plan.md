@@ -10557,16 +10557,19 @@ flagship verdict; P2.2 → P2.3 → P2.4 strictly (design-doc-first); P3.1 befor
 P3.2; P4/P5 independent. (5) Where a task proves larger than one loop, split
 it at selection time and record the split in both the plan doc and here.
 
-- [ ] **M0128-P0.1 — Q74 attribution.** TPC-DS SF0.5 Q74: PASS 11–14 s
-      (the nine 2026-08-04 sweeps with a Q74 row) → PASS ~81–93 s stable since
-      M0127-P5.9-i (first slow sweep 2026-08-05 22:26;
-      `sweep-20260807-122645`: 88 s, 7 rows, ck `2ffc13c77bf53028` identical
-      to every pre-regression sweep) — ~7× slower with
-      correct output, never attributed. 09 §6 protocol: bisect the P5.9
-      sub-commits (i is the first suspect by timing, not evidence), EXPLAIN
-      (ANALYZE) both arms, fix or ledger with a measured bound. Bar:
-      attribution to a specific commit + fix or ledger row; DS05.
-- [ ] **M0128-P0.2 — lockRows hard-error safety net.** Ledger root-0038:
+- [ ] **M0128-P0.1 — Q74 attribution.** ✅ **ATTRIBUTION DONE, FIX PENDING
+      (ledger row 2026-08-07).** TPC-DS SF0.5 Q74: PASS 11–14 s pre-flip
+      (flag OFF, old DP hash joins) → PASS ~88 s post-flip (flag ON, PG-shaped
+      DP nested loops). Attributed to the PG-shaped DP flag flip (M0127-P5.9,
+      `b92582fb`). Output is byte-identical (7 rows, ck `2ffc13c77bf53028`).
+      Diagnosed: `buildRestrictInfos` correctly classifies all three CTE
+      self-join equalities; `splitJoinClauses` returns keys=1 for every level-2
+      pair with a direct equality; hash join paths ARE generated. But the final
+      EXPLAIN shows nested loops — path selection rejects hash for a reason
+      still being diagnosed (cost model says hash ~842 < NL ~8.4M, so the
+      rejection is not cost-driven). Resume point in ledger row. **Bar met:
+      attribution + ledger row; DS05.**
+- [x] **M0128-P0.2 — lockRows hard-error safety net.** Ledger root-0038:
       `lockRowsOp`'s `findScanLeafForRel`/`markJoinPreserveCTID` walkers know
       ~8 of ~70 operator types; a `spillOp` (or materialize/memoize/gather/
       indexOnlyScan/lateral…) between LockRows and the scan leaf degrades

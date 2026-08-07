@@ -55,7 +55,7 @@ func memoTestCtx(t *testing.T, outerRows int64, outerNDistinctFrac float64, anal
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := newSearchCtx(2, defaultCostParams())
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,11 @@ package planner
 // nothing here was called from `planSelect` until P5.9-b, and P5.9 flipped
 // `GOOPG_PGSHAPED_DP` ON — joinsearch.go — so this file now moves plans.)
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // joinRelBuilder is the search's sizing-and-costing collaborator: everything
 // `makeJoinRel` needs that is not enumeration. Splitting it out is what lets
@@ -57,23 +61,160 @@ type joinRelBuilder interface {
 }
 
 // joinOrderRestricted is PG's `have_join_order_restriction` (joinrels.c:1066),
-// reserved and CONSTANT FALSE in v1 (03 §4.4). It is the second disjunct of
-// both phase-1 and phase-2 pair gates upstream; goopg keeps the disjunct in the
-// code so that admitting special joins later is a change to this function, not
-// a change to the enumerator's shape.
-//
-// Why false is correct today and not a shortcut: v1 pins every outer/semi/anti
-// construct as an opaque `PathPrebuilt` initial rel (03 §4.4), so the search
-// only ever sees INNER-joinable rels, and PG generates join-order restrictions
-// solely from `SpecialJoinInfo` entries and LATERAL references — neither of
-// which can reach the search while the pin holds. The pin relaxes when
-// `join_is_legal`-equivalent inference lands.
-func joinOrderRestricted(a, b *RelOptInfo) bool { return false }
+// the second disjunct of the clause gate that admits a pair even without a join
+// clause because a SpecialJoinInfo constraint requires the two rels to be joined.
+// M0128-P1.2: LEFT and FULL arms (PG lines 1104-1145).
+func (s *searchCtx) joinOrderRestricted(rel1, rel2 *RelOptInfo) bool {
+	if len(s.joinInfoList) == 0 {
+		return false
+	}
+	result := false
+	for _, sjinfo := range s.joinInfoList {
+		// FULL joins are handled by other mechanisms — skip (joinrels.c:1109-1110).
+		if sjinfo.Jointype == parser.JoinFull {
+			continue
+		}
 
-// hasJoinRestriction is PG's `has_join_restriction` (joinrels.c:1160), the
-// per-rel form used by phase 1's outer branch. Constant false in v1 for the
-// same reason as joinOrderRestricted.
-func hasJoinRestriction(rel *RelOptInfo) bool { return false }
+		// One input covers min_lefthand and the other covers min_righthand
+		// — the SJ can be performed here (joinrels.c:1113-1124).
+		if relsSubset(sjinfo.MinLefthand, rel1.Relids) && relsSubset(sjinfo.MinRighthand, rel2.Relids) {
+			result = true
+			break
+		}
+		if relsSubset(sjinfo.MinLefthand, rel2.Relids) && relsSubset(sjinfo.MinRighthand, rel1.Relids) {
+			result = true
+			break
+		}
+
+		// Both rels overlap the RHS — may need to complete it (joinrels.c:1131-1135).
+		if relsOverlap(sjinfo.MinRighthand, rel1.Relids) && relsOverlap(sjinfo.MinRighthand, rel2.Relids) {
+			result = true
+			break
+		}
+
+		// Likewise for the LHS (joinrels.c:1138-1144).
+		if relsOverlap(sjinfo.MinLefthand, rel1.Relids) && relsOverlap(sjinfo.MinLefthand, rel2.Relids) {
+			result = true
+			break
+		}
+	}
+
+	// PG post-filter (joinrels.c:1156-1161): if either rel already has
+	// relevant join clauses, defer the clauseless join. Goopg uses the
+	// pair-level gate already present on the caller.
+	if result {
+		if s.clauses != nil && s.clauses.hasRelevantJoinClause(rel1, rel2) {
+			result = false
+		}
+	}
+	return result
+}
+
+// hasJoinRestriction is PG's `has_join_restriction` (joinrels.c:1178): detect
+// whether the rel has join-order restrictions from being inside a special join.
+// "It's OK if we sometimes say 'true' incorrectly" (PG's comment). M0128-P1.2:
+// LEFT and FULL arms (PG lines 1195-1215).
+func (s *searchCtx) hasJoinRestriction(rel *RelOptInfo) bool {
+	if len(s.joinInfoList) == 0 {
+		return false
+	}
+	for _, sjinfo := range s.joinInfoList {
+		// FULL joins preserve ordering through other mechanisms — skip.
+		if sjinfo.Jointype == parser.JoinFull {
+			continue
+		}
+
+		// "ignore if SJ is already contained in rel" (joinrels.c:1204)
+		if relsSubset(sjinfo.MinLefthand, rel.Relids) && relsSubset(sjinfo.MinRighthand, rel.Relids) {
+			continue
+		}
+
+		// Does rel overlap min_lefthand but NOT fully contain it?
+		// If so, joining more rels may complete the LHS — restriction.
+		if relsOverlap(sjinfo.MinLefthand, rel.Relids) && !relsSubset(sjinfo.MinLefthand, rel.Relids) {
+			return true
+		}
+		// Same for min_righthand.
+		if relsOverlap(sjinfo.MinRighthand, rel.Relids) && !relsSubset(sjinfo.MinRighthand, rel.Relids) {
+			return true
+		}
+	}
+	return false
+}
+
+// joinIsLegal is PG's `join_is_legal` (joinrels.c:350) — the LJO arm only
+// (SEMI/ANTI are P1.4). Checks whether joining rel1 and rel2 violates any
+// SpecialJoinInfo constraint, and if it IS a special join, returns the matching
+// SpecialJoinInfo and whether the pair is reversed.
+//
+// Returns (nil, false, nil) for a plain inner join — the pair is legal and is
+// not a special join. Returns (sjinfo, reversed, nil) when the pair forms a
+// special join. Returns (nil, false, error) when the pair is illegal — the
+// caller must skip the pair but continue the search (03 §4.2).
+//
+// PG signature: join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed) → bool
+func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo, reversed bool, err error) {
+	if len(s.joinInfoList) == 0 {
+		return nil, false, nil // simple inner-join clause, fast path
+	}
+	joinrelids := rel1.Relids | rel2.Relids
+
+	var matchSJInfo *SpecialJoinInfo
+	matchReversed := false
+	mustBeLeftJoin := false
+
+	for _, sj := range s.joinInfoList {
+		// Fast path: not relevant unless RHS overlaps joinrelids (joinrels.c:386-387).
+		if !relsOverlap(sj.MinRighthand, joinrelids) {
+			continue
+		}
+		// Not relevant if joinrelids is fully within RHS — still building it (joinrels.c:392-394).
+		if relsSubset(joinrelids, sj.MinRighthand) {
+			continue
+		}
+		// Not relevant if SJ already contained within either input (joinrels.c:398-404).
+		if relsSubset(sj.MinLefthand, rel1.Relids) && relsSubset(sj.MinRighthand, rel1.Relids) {
+			continue
+		}
+		if relsSubset(sj.MinLefthand, rel2.Relids) && relsSubset(sj.MinRighthand, rel2.Relids) {
+			continue
+		}
+
+		// One input contains min_lefthand and the other contains min_righthand
+		// — we can perform the SJ at this join (joinrels.c:424-436).
+		if relsSubset(sj.MinLefthand, rel1.Relids) && relsSubset(sj.MinRighthand, rel2.Relids) {
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x matches multiple SpecialJoinInfos — invalid", uint16(rel1.Relids), uint16(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = false
+		} else if relsSubset(sj.MinLefthand, rel2.Relids) && relsSubset(sj.MinRighthand, rel1.Relids) {
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x matches multiple SpecialJoinInfos — invalid", uint16(rel1.Relids), uint16(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = true
+		} else if relsOverlap(sj.MinRighthand, rel1.Relids) && relsOverlap(sj.MinRighthand, rel2.Relids) {
+			// Both inputs overlap RHS — assume valid previous commutation (joinrels.c:509-511).
+			continue
+		} else if sj.Jointype == parser.JoinLeft && !relsOverlap(sj.MinLefthand, joinrelids) {
+			// LEFT join: can associate the proposed join into this SJ's RHS
+			// only if the join is itself a LEFT join (joinrels.c:519-529).
+			mustBeLeftJoin = true
+		} else {
+			return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x violates outer-join constraint (SJ type=%s)", uint16(rel1.Relids), uint16(rel2.Relids), joinTypeName(sj.Jointype))
+		}
+	}
+
+	// Post-scan: must_be_leftjoin requires matching LEFT SJ with lhs_strict (joinrels.c:542-546).
+	if mustBeLeftJoin {
+		if matchSJInfo == nil || matchSJInfo.Jointype != parser.JoinLeft || !matchSJInfo.LhsStrict {
+			return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x must be a LEFT join with strict LHS clause", uint16(rel1.Relids), uint16(rel2.Relids))
+		}
+	}
+
+	return matchSJInfo, matchReversed, nil
+}
 
 // joinSearch is the `standard_join_search` analogue (allpaths.c:3457): run
 // every level from 2 to nrels, `set_cheapest` each rel the level produced, and
@@ -169,7 +310,7 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 	// PG applies to the clause branch only.
 	s.tracePhase = tracePhaseLeftRight
 	for i, old := range prev {
-		if !s.clauses.hasNoJoinClauseAtAll(old) || hasJoinRestriction(old) {
+		if !s.clauses.hasNoJoinClauseAtAll(old) || s.hasJoinRestriction(old) {
 			// At level 2 the pair condition is symmetric and the previous
 			// level IS the initial-rel list, so initial rels before this one
 			// were already paired with it from the other side; starting after
@@ -228,7 +369,7 @@ func (s *searchCtx) joinSearchOneLevel(lev int) error {
 			// disjunct makes it semantically live the moment restrictions
 			// enter the search: then a clauseless rel CAN be forced into a
 			// bushy plan, and the skip is what decides which ones are.
-			if s.clauses.hasNoJoinClauseAtAll(old) && !hasJoinRestriction(old) {
+			if s.clauses.hasNoJoinClauseAtAll(old) && !s.hasJoinRestriction(old) {
 				// Recorded against the empty relset because the skip is per OLD
 				// REL, not per pair: what the trace has to show is that this
 				// composite was withheld from the whole bushy pass, not that
@@ -288,7 +429,7 @@ func (s *searchCtx) makeRelsByClauseJoins(old *RelOptInfo, others []*RelOptInfo,
 		if relsOverlap(old.Relids, other.Relids) {
 			continue
 		}
-		if !s.clauses.hasRelevantJoinClause(old, other) && !joinOrderRestricted(old, other) {
+		if !s.clauses.hasRelevantJoinClause(old, other) && !s.joinOrderRestricted(old, other) {
 			// The one gate that can silently withhold a partition PG chose.
 			// Recorded (P5.9-l-ii) because "never offered" and "offered and
 			// out-costed" are the two readings clause 6 has to choose between,
@@ -349,6 +490,17 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		return nil, fmt.Errorf("join search: overlapping input relsets %#04x and %#04x",
 			uint16(rel1.Relids), uint16(rel2.Relids))
 	}
+
+	// join_is_legal (joinrels.c:350, M0128-P1.2): check SpecialJoinInfo
+	// constraints. While the pin holds (03 §4.4) every searched rel is
+	// inner-joinable, so this returns (nil, false, nil) — the LJO arm.
+	// When the pin relaxes, an error here means the pair is illegal;
+	// the search continues with other pairs (03 §4.2).
+	if _, _, err := s.joinIsLegal(rel1, rel2); err != nil {
+		s.trace.decline(s.tracePhase, rel1.Relids, rel2.Relids, "illegal")
+		return nil, nil
+	}
+
 	joinrelids := rel1.Relids | rel2.Relids
 
 	// build_joinrel_restrictlist (relnode.c): the quals this join applies —
