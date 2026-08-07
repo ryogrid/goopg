@@ -41,6 +41,11 @@ type nestedLoopIndexJoinOp struct {
 	inner nliInner
 	ctx   *Context
 
+	// joinFilterRemoved is the stats.joinFilterRejected pointer handed by
+	// maybeInstrument; nil when EXPLAIN ANALYZE is not active. Incremented
+	// each time evalPredicateSlot returns false (residual reject).
+	joinFilterRemoved *int64
+
 	// outerWidth / innerWidth are captured in Open() from the child
 	// schemas. They are constant for the operator's lifetime.
 	outerWidth int
@@ -122,6 +127,8 @@ func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, in
 func (o *nestedLoopIndexJoinOp) Schema() planner.Schema {
 	return o.plan.Output()
 }
+
+func (o *nestedLoopIndexJoinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
 
 func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -211,6 +218,9 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				// rejected it, so it is not a match at all —
 				// leave outerMatched alone and try the next
 				// candidate.
+				if o.joinFilterRemoved != nil {
+					*o.joinFilterRemoved++
+				}
 				continue
 			}
 			// R3-1: a QUALIFYING match. Recording it here rather

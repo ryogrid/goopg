@@ -1,45 +1,53 @@
-M0128-P5.1 COMPLETE — EXPLAIN range-table name dedup landed
+M0128-P5.2 COMPLETE — Rows Removed by Filter / by Join Filter
 
-Task: M0128-P5.1 — EXPLAIN node-label disambiguation for repeated relation
-  names (PG select_rtable_names_for_explain, ruleutils.c)
+Task: M0128-P5.2 — EXPLAIN ANALYZE counters for scan qual rejects
+  ("Rows Removed by Filter") and join residual rejects ("Rows Removed
+  by Join Filter")
 
 Files:
-  - internal/executor/explain_names.go: added nodeLabels map + nodePtr helper;
-    collect now runs a second pass after register to assign per-node
-    disambiguated labels (_1, _2, …) for node labels independently of
-    SourceTableIdx-based column qualification; added disambiguatedName method
-  - internal/executor/operators_explain.go: describePlan/describePlanVerbose
-    now accept *explainNames parameter; SeqScan/IndexScan/IndexOnlyScan labels
-    use disambiguatedName when available; all call sites updated
-  - internal/executor/explain_qualify_test.go: added
-    TestExplainNodeLabelDisambiguatesRepeatedTable (SEMI-join self-scan)
-  - .ralph/fix_plan.md: M0128-P5.1 checked off
-  - .ralph/deferral_ledger.md: clause-6 re-adjudication row for the five
-    queries (now adjudicable but not yet measured)
+  - internal/executor/instrument.go: added filterRejected/joinFilterRejected
+    to nodeStats; filterRemoveCounter/joinFilterRemoveCounter interfaces;
+    maybeInstrument wiring
+  - internal/executor/operators.go: filterOp gains filterRemoved pointer;
+    setFilterRemoveCounter; increment on rejection
+  - internal/executor/operators_nljoin.go: nestedLoopIndexJoinOp gains
+    joinFilterRemoved; setJoinFilterRemoveCounter; increment on
+    evalPredicateSlot reject
+  - internal/executor/operators_join_agg.go: joinOp gains
+    joinFilterRemoved; setJoinFilterRemoveCounter;
+    joinPredicateMatch/joinPredicateMatchSlot increment on reject
+  - internal/executor/join_merge_key.go: mergeResidualMatch increments
+    joinFilterRemoved on reject
+  - internal/executor/operators_explain.go: walkPlanAnalyzeFiltered
+    signature +filterRowsRemoved int64; Filter collapse accumulates
+    count; scan/join nodes emit "Rows Removed by Filter: N" and
+    "Rows Removed by Join Filter: N" (per-loop average, zero suppressed
+    in text); planToJSONWithStats emits both properties unconditionally
+  - internal/executor/explain_analyze_test.go: golden tests
+    TestExplainAnalyzeRowsRemovedByFilter +
+    TestExplainAnalyzeRowsRemovedByJoinFilter
+  - .ralph/fix_plan.md: M0128-P5.2 checked off with completion note
 
-Key symbols: explainNames.nodeLabels, nodePtr, disambiguatedName,
-  describePlanVerbose, describePlan
+Key symbols: nodeStats.filterRejected, nodeStats.joinFilterRejected,
+  filterRemoveCounter, joinFilterRemoveCounter, filterOp.filterRemoved,
+  joinOp.joinFilterRemoved, walkPlanAnalyzeFiltered.filterRowsRemoved
 
 Hypothesis/Findings:
-  - The existing explainNames.register() uses seen[src] to guard against
-    double-registration (same subtree, cross-level SourceTableIdx collision).
-    But two DISTINCT plan nodes can share a SourceTableIdx (e.g. SEMI-join
-    outer and inner sides over the same relation). The bySource column-
-    qualification table correctly keeps the first, but node LABELS need
-    per-node disambiguation — hence the separate nodeLabels map.
-  - The fix is a parallel pass in collect: iterate found entries in order,
-    count base names across ALL nodes, append _N suffix to non-first
-    occurrences. nodeLabels is keyed by fmt.Sprintf("%p", n) — stable within
-    a process lifetime.
-  - Zero row/checksum deltas in DS05: the change affects only EXPLAIN text,
-    never execution.
-  - The existing column-qualification system (bySource/taken/seen/cols) is
-    untouched — this is purely an addition.
+  - Counter pattern mirrors heapFetches: interface+pointer handed by
+    maybeInstrument, nil-safe increment at the rejection site
+  - PG uses two counters (nfiltered1/nfiltered2) per node; goopg uses
+    filterRejected (for collapsed Filter) and joinFilterRejected (for
+    join residual). The PG-style nfiltered2 (non-join qual on join)
+    is not needed in goopg because the planner places a separate Filter
+    node above the join for non-join quals — that Filter node is then
+    collapsed by the text walker and its count is passed down
+  - Chained Filter nodes accumulate counts (outer + inner)
+  - Zero row/checksum deltas expected: all increments are nil-guarded,
+    only active under EXPLAIN ANALYZE
 
-Next step: M0128-P5.2 (Rows Removed by Filter / by Join Filter) or next
-  M0128 task per fix_plan.md ordering (P4.1→P5.1→P5.2)
+Next step: M0128-P2.1 (parallel hash build reopen-condition) or next
+  M0128 task per fix_plan.md ordering (P5.2→P2.1)
 
-Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/99, zero
-  row/checksum deltas, 45 plan text changes from P4.1 not from this change)
+Gates run: UNITS PASS, SPOT PASS (Q12=2/Q13=35), golden tests PASS
 
 In-flight: none

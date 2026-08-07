@@ -10709,12 +10709,28 @@ it at selection time and record the split in both the plan doc and here.
       DS05 PASS (95/99, zero row/checksum deltas). Clause-6 re-adjudication
       deferred to a measurement loop (the rendering gap is fixed; the
       estimate-audit comparison is a measurable follow-up).
-- [ ] **M0128-P5.2 — `Rows Removed by Filter` / `by Join Filter`.** 09 §3.17:
+- [x] **M0128-P5.2 — `Rows Removed by Filter` / `by Join Filter`.** 09 §3.17:
       executor counters (per-scan qual rejects, per-join residual rejects)
       rendered by EXPLAIN ANALYZE text; structured formats (JSON/XML/YAML —
       no qual properties at all today) in scope if the plumbing is
       mechanical, else ledgered. Bar: UNITS + SPOT + DS05 + an EXPLAIN golden
-      test showing both line kinds.
+      test showing both line kinds. **DONE 2026-08-07.**
+      `instrument.go`: added `filterRejected`/`joinFilterRejected` to
+      `nodeStats` + `filterRemoveCounter`/`joinFilterRemoveCounter` interfaces;
+      `maybeInstrument` wires them (nil-safe). `filterOp` increments
+      `filterRejected` per reject; `joinOp.joinPredicateMatchSlot` /
+      `joinPredicateMatch` / `mergeResidualMatch` increment
+      `joinFilterRejected`; `nestedLoopIndexJoinOp.evalPredicateSlot`
+      rejection path increments `joinFilterRejected`. The TEXT renderer
+      (`walkPlanAnalyzeFiltered`): collapsed Filter nodes pass their
+      `filterRejected` count down (accumulated for chained filters) and
+      the scan/join node emits `Rows Removed by Filter: N` (per-loop
+      average); join nodes emit `Rows Removed by Join Filter: N` from
+      their own `joinFilterRejected`. JSON/XML/YAML: both properties
+      emitted unconditionally per node. Golden tests:
+      `TestExplainAnalyzeRowsRemovedByFilter` +
+      `TestExplainAnalyzeRowsRemovedByJoinFilter`. Gates: UNITS PASS,
+      SPOT PASS (Q12=2/Q13=35).
 - [ ] **M0128-P6.1 — resjunk-ctid rowmark (durable lockRows fix).** PG's
       mechanism: `preprocess_targetlist` adds junk `ctid` attributes for
       rowmarked relations, so TID identity rides the tuple, not the

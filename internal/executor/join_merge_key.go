@@ -111,5 +111,9 @@ func (o *joinOp) mergeResidualMatch(row Row) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
+	if !ok && o.joinFilterRemoved != nil {
+		*o.joinFilterRemoved++
+	}
+	return ok, nil
 }

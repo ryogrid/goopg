@@ -1157,12 +1157,12 @@ func schemaColumnNames(n planner.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, reg)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -1170,7 +1170,16 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, reg)
+		// A Filter node wraps a scan/join to apply qual(s). Its own
+		// instrumentation entry (when ANALYZE) carries the number of
+		// rows it rejected. Accumulate that count (chained Filters
+		// each reject a subset) and carry it down to the scan/join
+		// node so it can render "Rows Removed by Filter".
+		fr := filterRowsRemoved
+		if fs, ok := stats[f]; ok && fs != nil {
+			fr += fs.filterRejected
+		}
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
 		return
 	}
 
@@ -1203,14 +1212,37 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
-	// matching upstream's text format (design 0118-0102).
-	if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
-		if s, ok := stats[n]; ok && s != nil {
-			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Heap Fetches: %d", s.heapFetches))})
+		// matching upstream's text format (design 0118-0102).
+		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+			if s, ok := stats[n]; ok && s != nil {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Heap Fetches: %d", s.heapFetches))})
+			}
 		}
-	}
 
-	// Memoize emits its cache counters under ANALYZE, matching upstream's
+		// M0128-P5.2: "Rows Removed by Filter" — a scan/join node whose
+		// Filter wrapper (collapsed above) rejected tuples. The count is
+		// carried down from the collapsed Filter plan node's
+		// stats.filterRejected. Mirrors PG's show_instrumentation_count
+		// (nfiltered1 for scan qual rejects, per-loop average). Zero
+		// suppressed in text mode (PG convention).
+		if filterRowsRemoved > 0 {
+			if s, ok := stats[n]; ok && s != nil && s.loops > 0 {
+				avg := float64(filterRowsRemoved) / float64(s.loops)
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Filter: %.0f", avg))})
+			}
+		}
+
+		// M0128-P5.2: "Rows Removed by Join Filter" — a join node
+		// rejected candidate matches on its residual qual. The count is
+		// from the join node's own stats.joinFilterRejected. Mirrors
+		// PG's show_instrumentation_count (nfiltered1 for joinqual
+		// rejects, per-loop average). Zero suppressed in text mode.
+		if s, ok := stats[n]; ok && s != nil && s.joinFilterRejected > 0 && s.loops > 0 {
+			avg := float64(s.joinFilterRejected) / float64(s.loops)
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Join Filter: %.0f", avg))})
+		}
+
+		// Memoize emits its cache counters under ANALYZE, matching upstream's
 	// show_memoize_info line shape (S7; Memory Usage is deferred — our
 	// byte accounting is a budget approximation, not a report-grade
 	// number).
@@ -1257,7 +1289,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
 	emitCTESections(rows, depth, reg, func(body planner.Node, bodyDepth int) {
-		walkPlanAnalyzeFiltered(body, bodyDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
+		walkPlanAnalyzeFiltered(body, bodyDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
@@ -1265,12 +1297,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, reg)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	}
 }
 
@@ -1292,12 +1324,20 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 			obj["Actual Total Time"] = nsToMs(s.totalNs)
 		}
 		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
-		// ANALYZE (design 0118-0102). horizons.spec reads it via
-		// ...->'Plan'->'Heap Fetches'.
-		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
-			obj["Heap Fetches"] = s.heapFetches
-		}
-		// EXPLAIN (ANALYZE, BUFFERS, FORMAT {JSON,XML,YAML}): unlike TEXT's
+			// ANALYZE (design 0118-0102). horizons.spec reads it via
+			// ...->'Plan'->'Heap Fetches'.
+			if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+				obj["Heap Fetches"] = s.heapFetches
+			}
+			// M0128-P5.2: "Rows Removed by Filter" and "Rows Removed by Join
+			// Filter" per-loop averages, mirroring PG's non-text
+			// show_instrumentation_count (emitted unconditionally in structured
+			// formats regardless of zero, matching PG's EXPLAIN_FORMAT_TEXT gate).
+			if s.loops > 0 {
+				obj["Rows Removed by Filter"] = float64(s.filterRejected) / float64(s.loops)
+				obj["Rows Removed by Join Filter"] = float64(s.joinFilterRejected) / float64(s.loops)
+			}
+			// EXPLAIN (ANALYZE, BUFFERS, FORMAT {JSON,XML,YAML}): unlike TEXT's
 		// "Buffers:" line (formatBuffersLine, only printed when non-zero),
 		// upstream's non-text show_buffer_usage() prints these properties
 		// unconditionally once BUFFERS is requested, even when zero
