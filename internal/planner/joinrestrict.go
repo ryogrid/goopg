@@ -25,6 +25,7 @@ package planner
 // search; only `=0` opts out. Validated in isolation by `joinrestrict_test.go`.
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -354,4 +355,145 @@ func relidsOfExpr(e Expr, cumOffsets []int) (RelSet, bool) {
 		return 0, false
 	}
 	return set, true
+}
+
+// ---------------------------------------------------------------------------
+// M0127-P6.3 — the three coordinate/edge helpers that outlived `bushy.go`.
+//
+// They were written for the old subset-bitmask DP's edge extraction and were
+// deleted from under it with the rest of that file (08 §4), but each has a
+// live consumer in the clause-producing path: `plannerCommonEquijoinsAcrossOr`
+// feeds `buildRestrictInfos` below and `pushdown.go`'s cross-join promotion,
+// and `tableForCol` / `visitColumnRefsForTable` are how BOTH this file's
+// `relSetOf` and `local_filters.go`'s conjunct partition attribute an
+// expression to a FROM position. They move here rather than dying because the
+// question they answer — "which relation does this conjunct read?" — is this
+// file's question, not the enumerator's.
+
+// plannerCommonEquijoinsAcrossOr is the planner-Expr counterpart of
+// commonEquijoinsAcrossOr in joinorder.go. Returns equality
+// expressions of the form `t1.col = t2.col` that appear in every
+// branch of an OR predicate.
+func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != parser.OpOr {
+		return nil
+	}
+	branches := flattenPlannerOr(bin)
+	if len(branches) < 2 {
+		return nil
+	}
+	branchEqs := make([]map[string]*BinaryOp, len(branches))
+	for i, br := range branches {
+		branchEqs[i] = map[string]*BinaryOp{}
+		for _, c := range splitAnd(br) {
+			b, ok := c.(*BinaryOp)
+			if !ok || b.Op != parser.OpEq {
+				continue
+			}
+			lc, lok := b.Left.(*ColumnRef)
+			rc, rok := b.Right.(*ColumnRef)
+			if !lok || !rok {
+				continue
+			}
+			branchEqs[i][colRefIndexPairKey(lc, rc)] = b
+		}
+	}
+	var common []*BinaryOp
+	for k, v := range branchEqs[0] {
+		ok := true
+		for j := 1; j < len(branchEqs); j++ {
+			if _, present := branchEqs[j][k]; !present {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			common = append(common, v)
+		}
+	}
+	return common
+}
+
+func flattenPlannerOr(e Expr) []Expr {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != parser.OpOr {
+		return []Expr{e}
+	}
+	out := flattenPlannerOr(bin.Left)
+	out = append(out, flattenPlannerOr(bin.Right)...)
+	return out
+}
+
+// colRefIndexPairKey produces an order-independent key for two
+// planner ColumnRef nodes via their resolved column indices.
+func colRefIndexPairKey(a, b *ColumnRef) string {
+	li, ri := a.Index, b.Index
+	if li > ri {
+		li, ri = ri, li
+	}
+	return fmt.Sprintf("%d==%d", li, ri)
+}
+
+// tableForCol returns the FROM-table index that all ColumnRef nodes
+// in e belong to, or -1 if columns span multiple tables.
+func tableForCol(e Expr, cumOffsets []int) int {
+	result := -1
+	visitColumnRefsForTable(e, func(colIdx int) {
+		for t := 0; t < len(cumOffsets)-1; t++ {
+			if colIdx >= cumOffsets[t] && colIdx < cumOffsets[t+1] {
+				if result == -1 {
+					result = t
+				} else if result != t {
+					result = -2 // spans multiple tables
+				}
+				return
+			}
+		}
+		result = -2 // column not in any table
+	})
+	if result < 0 {
+		return -1
+	}
+	return result
+}
+
+// visitColumnRefsForTable invokes onIdx with the Index of every
+// same-scope *ColumnRef in e. Its one live consumer is tableForCol.
+//
+// M0125-0002 commit 4: built on walkExprRefs / exprChildSlots instead
+// of its own 12-of-32 type switch. Child structure comes from the
+// primitive, so a ColumnRef under IS NULL, a cast, a row constructor
+// or IS DISTINCT FROM — all silently skipped by the old arms — now
+// contributes its index, and tableForCol attributes the conjunct
+// correctly instead of answering -1 from a partial reference set.
+//
+// Scope policy: scopeIgnore. tableForCol's cumOffsets attribution is
+// only meaningful for indices in THIS scope's coordinate space: an
+// inner plan's ColumnRefs index the subplan's own schema and an
+// *OuterColumnRef names a scope above, so neither reaches onIdx (the
+// old walker's documented declines, preserved — see
+// visit_refs_for_table_arms_test.go). A subquery node's PARAM_EXEC
+// Args are same-scope slots and ARE visited now, as is the Operand of
+// a Plan-carrying InExpr — the old arm returned before visiting
+// anything when Plan != nil, so `col IN (subquery)` read as "no
+// table" even though col is an ordinary same-scope reference.
+//
+// An unenumerated type panics, matching PG's
+// expression_tree_walker_impl (nodeFuncs.c:2667); a silent skip means
+// tableForCol partitions on an incomplete reference set (RC-1a).
+func visitColumnRefsForTable(e Expr, onIdx func(int)) {
+	walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool {
+			if cr, ok := x.(*ColumnRef); ok {
+				onIdx(cr.Index)
+			}
+			return true
+		},
+		OnUnknown: func(x Expr) {
+			panic(fmt.Sprintf("visitColumnRefsForTable: unrecognized expression type %T — "+
+				"teach exprChildSlots (exprwalk.go) about it; a silent skip makes "+
+				"tableForCol partition on an incomplete reference set", x))
+		},
+	})
 }

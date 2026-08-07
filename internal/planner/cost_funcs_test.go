@@ -248,65 +248,8 @@ func TestCostParamsMatchConfigDefaults(t *testing.T) {
 	}
 }
 
-// dpEntryOfWidth builds a DP entry whose plan carries `ncols` output columns,
-// which is what `entryNCols` reads and therefore the only part of the plan
-// costJoinCandidate's hash geometry depends on.
-func dpEntryOfWidth(rows int64, ncols int, c Cost) dpEntry {
-	return dpEntry{plan: &SeqScan{schema: make(Schema, ncols)}, rows: rows, pgCost: c}
-}
-
-// TestCostJoinCandidateHasNoRowCountPenalty pins M0127-P5.6-d: costJoinCandidate
-// adds NOTHING to hashJoinCost. M0126-0013's quadratic penalty above a fixed
-// 2 M-row build was deleted here once M0127-P5.7-a made hashJoinCost charge the
-// batch I/O the penalty stood in for, so the DP's hash cost is now exactly the
-// cost function — no second, differently-shaped deterrent layered on top.
-func TestCostJoinCandidateHasNoRowCountPenalty(t *testing.T) {
-	cp := defaultCostParams()
-	// One column at 4 M rows is 72 bytes/row plus a 4 Mi-slot bucket array, which
-	// still fits the 512 MB default budget — while sitting ABOVE the deleted
-	// penalty's fixed 2 M-row threshold, which would have charged it
-	// `1² × cpu_tuple_cost × 4 M` = 40 000 for a build that never spills. That
-	// is the case the row-count stand-in got wrong.
-	const ncols = 1
-	const rows = 4_000_000
-	outer := dpEntryOfWidth(rows, ncols, Cost{Startup: 10, Total: 100})
-	inner := dpEntryOfWidth(rows, ncols, Cost{Startup: 5, Total: 50})
-	if hashsize.Choose(rows, ncols, 0, cp.workMem).NBatch != 1 {
-		t.Fatal("premise broken: the 4 M-row single-column build was expected to fit work_mem")
-	}
-
-	got := costJoinCandidate(cp, nil, outer, inner, rows, nil)
-	want := hashJoinCost(cp, hashJoinInputs{
-		outer: outer.pgCost, inner: inner.pgCost,
-		outerRows: rows, innerRows: rows, outputRows: rows,
-		numHashClauses: 1,
-		outerCols:      ncols, innerCols: ncols,
-	})
-	if !approx(got.Startup, want.Startup) || !approx(got.Total, want.Total) {
-		t.Fatalf("costJoinCandidate = %+v, want the bare hashJoinCost %+v — a penalty has been re-added", got, want)
-	}
-}
-
-// TestCostJoinCandidateStillDetersHugeBuilds is the other half of M0127-P5.6-d:
-// deleting the penalty must not delete the DEFENCE it was there for. The DP must
-// still rank a join whose build blows the memory budget above one that does not
-// — now because hashJoinCost prices the spill the executor will really perform.
-func TestCostJoinCandidateStillDetersHugeBuilds(t *testing.T) {
-	cp := defaultCostParams()
-	outer := dpEntryOfWidth(6_000_000, 8, Cost{Startup: 10, Total: 100})
-	fits := dpEntryOfWidth(500_000, 8, Cost{Startup: 5, Total: 50})
-	spills := dpEntryOfWidth(6_000_000, 8, Cost{Startup: 5, Total: 50})
-	if hashsize.Choose(5e5, 8, 0, cp.workMem).NBatch != 1 {
-		t.Fatal("premise broken: the 500 K-row build was expected to fit work_mem")
-	}
-	if hashsize.Choose(6e6, 8, 0, cp.workMem).NBatch <= 1 {
-		t.Fatal("premise broken: the 6 M-row 8-column build was expected to spill")
-	}
-
-	cheap := costJoinCandidate(cp, nil, outer, fits, 500_000, nil)
-	dear := costJoinCandidate(cp, nil, outer, spills, 6_000_000, nil)
-	if dear.Total <= cheap.Total {
-		t.Errorf("spilling 6 M build Total=%v must exceed the fitting 500 K build Total=%v",
-			dear.Total, cheap.Total)
-	}
-}
+// dpEntryOfWidth and the two TestCostJoinCandidate* pins lived here until
+// M0127-P6.3 deleted costJoinCandidate with the old subset-bitmask DP it priced
+// (08 §4). The property they guarded — the DP's hash cost is exactly
+// hashJoinCost, with spill priced by the real batch geometry — is now pinned
+// at the cost-function level by the hashsize.Choose tests above.

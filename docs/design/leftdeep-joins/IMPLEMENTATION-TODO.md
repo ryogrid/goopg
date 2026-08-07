@@ -1892,12 +1892,44 @@
 
   **The row-lock closure this task was named for did NOT happen** — see the
   ledger row: the `eval-plan-qual` repro is byte-identical before and after.
-- [ ] **P6.3** Delete the old subset-bitmask DP + the per-subset
+- [x] **P6.3** Delete the old subset-bitmask DP + the per-subset
   layout/remap family (`dpEntry.layout`, `remapKeyToLayout`,
   `mergeSubsetLayouts`) + integer cost + `IsSmallDimensionSide` pinning +
   `chooseInnerJoinAlgo` (searched); demote `joinorder.go` to over-limit
-  sequencer. Held back until the 03 §10 relid-order boundary map is
-  proven: `buildBindingsPosMap`/`applyJoinTreePosMap` (08 §4).
+  sequencer. **DONE 2026-08-07.** `bushy.go` (2880 lines) is gone whole —
+  `enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`, the
+  `dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,
+  `attachUnusedCrossEdges`, `bushySeedRowCounts`, the 12-table cap,
+  `buildJoinFromDP`, the `joinGraph`/`joinEdge` types, and the graph-space
+  key-proof sibling in `joinkeyproof.go` (its only consumer was
+  `estimateJoinCost`; the `*Join`-space prover is now sole). Both flags the
+  old DP owned are freed: `costDrivenJoinOrder`/`SetCostDrivenJoinOrder`
+  (default-OFF since P5.9 — production already ran the surviving arms, so
+  the deletion is behaviour-preserving by construction) and
+  `SetPGShapedJoinSearch` (`GOOPG_PGSHAPED_DP=0` now means NO search — the
+  syntactic order — not "the old DP"). `tryBushyDP` is renamed
+  `tryJoinSearch`; `joinorder.go`'s mechanism and caller are unchanged
+  under its new over-limit-sequencer header. Survivors split out, not
+  deleted: **`joinlayout.go`** (new, 1348 lines) takes
+  `buildBindingsPosMap`/`applyJoinTreePosMap` (held back until the 03 §10
+  boundary map is proven — this hold-back STANDS), `reconcileNLILayout`
+  (production call site removed with the flag; function STAYS per 08 §3 as
+  `assertSearchedTreeNeedsNoReconcile`'s oracle), and the remap walkers;
+  `joinrestrict.go` takes the three coordinate/edge helpers with live
+  consumers (`plannerCommonEquijoinsAcrossOr`, `tableForCol`,
+  `visitColumnRefsForTable`). `shouldAttachLocalFiltersBeforeSearch`/
+  `attachRelationLocalFilters` had no caller but bushy.go and were deleted.
+  Six old-DP-only test files deleted; three more truncated at tombstones
+  naming the surviving coverage.
+
+  Gate: grep-clean + `go build`/`go vet` clean + **UNITS PASS** +
+  **SPOT PASS** (Q12=2 / Q13=35, 29.4 s query phase, peak 12,115 MB) +
+  **DS05 PASS** (`sweep-20260807-122645`: 95 PASS / 0 MISMATCH /
+  0 CKMISMATCH / 0 ERROR / 0 TIMEOUT / 4 SKIP, status-delta
+  `verdict-changes=none runtime-moves=0`, **plan shapes 99/99 identical,
+  0 changed**) + `make ralph-state-guard` OK.
+  `TestExprSwitchInventoryIsPinned` caught the file split and was re-keyed
+  in-commit (four walker pins `bushy.go`→`joinlayout.go`).
 - [ ] **P6.4** Supersession stamps (0034-0001, 0038-0001, cost-model/09 §3
   allowance, 0125/0126 MHJ chapters); README index status flips; ledger
   rows for every deliberately-skipped PG behaviour (GEQO, skew buckets,

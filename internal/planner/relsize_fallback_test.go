@@ -407,99 +407,15 @@ func TestSeqScanRowsFallbackOnlyWhenRowCountAbsent(t *testing.T) {
 	}
 }
 
-// ── stage 2: the bushy DP seed ───────────────────────────────────────────────
-
-// newSeedFixture builds the two-relation graph the stage-2 tests seed: `cold`
-// has never been ANALYZEd (the state every restarted server is in), `warm` has
-// a row count. The sizer reports the same live block count for both, so any
-// difference between them comes from the tier logic and not from the estimate.
-func newSeedFixture() (*joinGraph, *catalog.InMemory, *catalog.Table) {
-	cat := catalog.NewInMemory()
-	cat.SetRelationSizer(func(storage.RelFileNode) (int64, bool) { return 100, true })
-	cold := &catalog.Table{Name: "cold", Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}}}
-	warm := &catalog.Table{
-		Name:    "warm",
-		Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}},
-		Stats:   &catalog.TableStats{RowCount: 4242, Pages: 7, Analyzed: true},
-	}
-	g := &joinGraph{nodes: 2, tables: []*catalog.Table{cold, warm}}
-	return g, cat, cold
-}
-
-// TestBushySeedRowCountsStageGating is stage 2's landing invariant: below stage
-// 2 the DP seed is byte-identical to the pre-M0125-0003 planner — an
-// un-ANALYZEd relation seeds the 1-row floor — and at stage 2 it seeds the
-// block-count estimate instead. Stage 1 is included explicitly because the
-// probe-side consumer that stage 1 wired must NOT leak into the join order;
-// that separation is the entire reason the flag is staged (design §D4).
-func TestBushySeedRowCountsStageGating(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	g, cat, cold := newSeedFixture()
-
-	for _, stage := range []int{0, 1} {
-		SetRelSizeFallbackStage(stage)
-		got := bushySeedRowCounts(g, nil, cat)
-		if got[0] != 1 {
-			t.Fatalf("stage %d: cold relation must seed the 1-row floor, got %d", stage, got[0])
-		}
-		if got[1] != 4242 {
-			t.Fatalf("stage %d: warm relation must seed its RowCount, got %d", stage, got[1])
-		}
-	}
-
-	SetRelSizeFallbackStage(2)
-	want := estimateTableRowsFallback(cat, cold)
-	if want <= 1 {
-		t.Fatalf("fixture is not exercising the fallback: estimate = %d", want)
-	}
-	got := bushySeedRowCounts(g, nil, cat)
-	if got[0] != want {
-		t.Errorf("stage 2: cold relation must seed the fallback estimate %d, got %d", want, got[0])
-	}
-	// Design §D3 at this site: an ANALYZEd relation is untouched in BOTH flag
-	// states, so the four-arm measurement's W-arms stay a genuine control.
-	if got[1] != 4242 {
-		t.Errorf("stage 2: warm relation must still seed its RowCount, got %d (want 4242)", got[1])
-	}
-}
-
-// TestBushySeedRowCountsPostFilterTierWins pins the tier ORDER. relInfos
-// carries a post-filter count — the only tier that has seen a local predicate —
-// so it must outrank the fallback even at stage 2. If this inverts, a
-// selective filter on a large table would be costed as if it selected
-// everything, which is the round-4 regression shape this staging exists to
-// attribute.
-func TestBushySeedRowCountsPostFilterTierWins(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-	g, cat, _ := newSeedFixture()
-
-	relInfos := []baseRelInfo{{filteredRows: 17}, {filteredRows: 9}}
-	got := bushySeedRowCounts(g, relInfos, cat)
-	if got[0] != 17 || got[1] != 9 {
-		t.Fatalf("post-filter tier must win at stage 2, got %v want [17 9]", got)
-	}
-}
-
-// TestBushySeedRowCountsNoSizer covers the failure direction at the DP seed:
-// with no live block count available (every planner unit test, and any embedded
-// caller) the fallback yields "no estimate" and the seed must land on the floor
-// rather than on 0. A 0 here would divide into the join-cost model.
-func TestBushySeedRowCountsNoSizer(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-
-	cold := &catalog.Table{Name: "cold", Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}}}
-	g := &joinGraph{nodes: 2, tables: []*catalog.Table{cold, nil}}
-	got := bushySeedRowCounts(g, nil, catalog.NewInMemory())
-	if got[0] != 1 || got[1] != 1 {
-		t.Fatalf("no sizer must leave the 1-row floor, got %v", got)
-	}
-	// A nil catalog must not panic the planner either.
-	if got := bushySeedRowCounts(g, nil, nil); got[0] != 1 || got[1] != 1 {
-		t.Fatalf("nil catalog must leave the 1-row floor, got %v", got)
-	}
-}
+// ── stage 2: the join-search seed ──────────────────────────────────────────
+//
+// newSeedFixture and the three TestBushySeedRowCounts* pins lived here until
+// M0127-P6.3 deleted `bushySeedRowCounts` with the old subset-bitmask DP
+// (08 §4). The behaviour they pinned — the block-count fallback tier feeding
+// a relation's search cardinality, the post-filter tier outranking it, the
+// no-sizer 1-row floor — is now owned by `applyRelSizeFallback` (relsize.go),
+// which the PG-shaped seam calls per leaf (joinsearchseam.go), and is pinned
+// in relsize_baserel_placement_test.go.
 
 // TestEstimateTableRowsFallbackNoCatalogSizer covers the plumbing's failure
 // direction: with no live block count available the answer is "no estimate"

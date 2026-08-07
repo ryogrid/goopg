@@ -12,10 +12,10 @@ package planner
 // beside them — plus PG's level-1 population (`set_base_rel_pathlists`,
 // allpaths.c:191) at goopg's fidelity level. Design: leftdeep-joins 03 §1-§2.
 //
-// NOTHING here is called from `planSelect`. The enumerator that consumes it is
-// P5.3, and the whole search is gated behind `GOOPG_PGSHAPED_DP` (08 §2, OFF by
-// default), so this file cannot change a plan; it is validated in isolation by
-// `joinsearch_test.go`.
+// NOTHING here was called from `planSelect` when this file landed — the
+// wiring arrived at P5.9-b (joinsearchseam.go) and the search has been ON by
+// default since P5.9 (`GOOPG_PGSHAPED_DP`, 08 §2), so everything here moves
+// plans. The file's original validation vehicle was `joinsearch_test.go`.
 //
 // What it DOES settle is the leaf-whitelist gap. `tryBushyDP` abandons the
 // entire search when any FROM item is not a `*SeqScan` / `*IndexScan`
@@ -54,13 +54,14 @@ const maxSearchRels = 16
 // phase 2, so the search can express them and lost them on cost, which the §4
 // ratchet admits).
 //
-// The knob survives the flip as a KILL-SWITCH, not a soak switch: 08 §2's
-// rollback story for S5 is "flips `GOOPG_PGSHAPED_DP` OFF, restoring the
-// current `tryBushyDP` enumerator, which is not deleted until S7". So the
-// polarity inverts rather than the variable disappearing — `=0` restores the
-// old subset-bitmask DP in one restart, with no rebuild, until S7 deletes it.
-// Anything else (unset, `1`, garbage) is ON, mirroring `GOOPG_JOIN_SLOT_CHAIN`
-// (08 §2 S1: "default ON, env kill-switch OFF only").
+// The knob survives the flip as a KILL-SWITCH, not a soak switch. Until
+// M0127-P6.3 the rollback story for S5 was "flips `GOOPG_PGSHAPED_DP` OFF,
+// restoring the `tryBushyDP` enumerator"; P6.3 deleted that enumerator
+// (08 §4), so `=0` now means "no join-order search at all" — the statement
+// keeps its syntactic FROM order and the rule-driven rewrites
+// (`rewriteJoinsToNLI`, the qual-placement passes) do what they have always
+// done to such a tree. Anything else (unset, `1`, garbage) is ON, mirroring
+// `GOOPG_JOIN_SLOT_CHAIN` (08 §2 S1: "default ON, env kill-switch OFF only").
 //
 // The gate is read once at process start so a plan cannot change shape
 // mid-statement.
@@ -76,24 +77,11 @@ func pgShapedDPFromEnv(v string) bool { return v != "0" }
 // stays a single read site.
 func pgShapedDPEnabled() bool { return pgShapedDP }
 
-// SetPGShapedJoinSearch pins the enumerator for a caller that needs the other
-// arm, and returns the previous value so it can be restored. It is the
-// cross-package form of `useLegacyEnumerator` (planner-internal, test-only).
-// It exists because after M0127-P5.9 flipped the default on, tests of the OLD
-// enumerator's rule-driven rewrites live in packages that cannot reach a
-// private var. (Its sibling `SetMHJPackingEnabled` served the largest of those
-// rewrites, MultiHashJoin packing, which the PG-shaped search never emitted by
-// design — 09 §3 clause 5 — and went with the node at P6.2.)
-//
-// NOT for production use. The flag is read once at process start precisely so
-// a plan cannot change shape mid-statement; this setter breaks that guarantee
-// and is safe only in a single-goroutine test. It goes away with the old DP at
-// S7 (08 §4).
-func SetPGShapedJoinSearch(v bool) bool {
-	prev := pgShapedDP
-	pgShapedDP = v
-	return prev
-}
+// SetPGShapedJoinSearch — the cross-package test pin for the other enumerator
+// arm — went away with the old DP at M0127-P6.3 (08 §4), as its doc always
+// said it would. The planner-internal `useLegacyEnumerator` (legacyarm_test.go)
+// remains and now pins the kill-switch arm: no search, syntactic order, rule
+// rewrites.
 
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.

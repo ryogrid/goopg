@@ -3,7 +3,7 @@ package planner
 // S5a (design bundle correlated-subquery-planning, D3.1): run sublink
 // pull-up BEFORE join-order search.
 //
-// Historically the pipeline ran tryBushyDP + predicate pushdown first
+// Historically the pipeline ran the join-order search + predicate pushdown first
 // and unnested sublinks afterwards, so decorrelated semi/anti joins
 // wrapped an already-searched join tree and their sunk residual
 // conjuncts never participated in join search. Upstream runs
@@ -43,7 +43,7 @@ func whereEligibleForPreDPUnnest(pred Expr) bool {
 	return eligible
 }
 
-// runJoinSearchBelowPinned runs the join-order search (tryBushyDP +
+// runJoinSearchBelowPinned runs the join-order search (tryJoinSearch +
 // pushPredicatesIntoCrossJoins — verbatim the historical DP block) on
 // the subtree BELOW the pinned spine that pre-DP unnesting produced.
 //
@@ -124,7 +124,7 @@ descend:
 
 	// The historical DP block, verbatim (planner.go legacy position).
 	var newTarget Node = f
-	if newChild, newPred := tryBushyDP(f.Child, f.Predicate, ctx, cat); newPred == nil {
+	if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
 		newTarget = newChild // all conjuncts consumed → remove Filter
 	} else if newChild != f.Child {
 		f.Child = newChild
@@ -136,7 +136,7 @@ descend:
 	put(newTarget)
 
 	// Re-resolve the pinned spine only when join search changed the
-	// outer layout. On stats-less servers tryBushyDP is a no-op and
+	// outer layout. On a shape the search declines tryJoinSearch is a no-op and
 	// pushdown never reorders, so this is the common fast path.
 	newSchema := newTarget.Output()
 
@@ -234,7 +234,7 @@ func layoutPosMap(oldSchema, newSchema Schema) func(int) int {
 // OuterColumnRefs inside every sublink plan found in e — the retained
 // SubPlans' correlation refs point at the pinned spine's outer layout,
 // which join search just changed. Mirrors the MHJ path's use of
-// remapOuterRefsInSubplan (bushy.go).
+// remapOuterRefsInSubplan (joinlayout.go).
 func remapSublinkOuterRefs(e Expr, pm func(int) int) {
 	walkExprTree(e, func(x Expr) {
 		switch s := x.(type) {

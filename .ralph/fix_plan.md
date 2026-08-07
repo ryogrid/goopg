@@ -10210,16 +10210,62 @@ cost-model/09 §3, 0043/0063/0125/0126 MHJ chapters).
       legacy plan for `lockwithvalues` reaches a node outside that set. Ledger
       row 2026-08-07 carries the resume point. Default S5-ON PASSES the spec,
       so production is unaffected.
-- [ ] **M0127-P6.3 — delete the old subset-bitmask DP + layout/remap family**
-      (`enumerateBushyPlans`/`enumerateSubsets`/`enumerateSplits`/
-      `dp map[uint16]dpEntry`, `estimateJoinCost` + integer weights,
-      `attachUnusedCrossEdges`, `bushySeedRowCounts`, the 12-table cap,
-      `IsSmallDimensionSide` pinning, `chooseInnerJoinAlgo` searched,
-      `dpEntry.layout`/`remapKeyToLayout`/`mergeSubsetLayouts`); demote
-      `joinorder.go` to the over-limit sequencer. **`buildBindingsPosMap`/
-      `applyJoinTreePosMap` held back** until the 03 §10 boundary map is proven
-      in production (08 §4 — the S7 change most likely to regress).
-      IMPLEMENTATION-TODO P6.3; 08 §4. Bar: grep-clean + UNITS + SPOT + DS05.
+- [x] **M0127-P6.3 — delete the old subset-bitmask DP + layout/remap family.**
+      IMPLEMENTATION-TODO P6.3; 08 §4 "Planner" / "layout/remap family".
+      **DONE 2026-08-07.** `bushy.go` (2880 lines) is gone whole, and with it
+      the entire 08 §4 inventory: `enumerateBushyPlans`/`enumerateSubsets`/
+      `enumerateSplits`, the `dp map[uint16]dpEntry`, `estimateJoinCost` +
+      integer weights, `attachUnusedCrossEdges`, `bushySeedRowCounts`, the
+      12-table cap, `buildJoinFromDP`'s `IsSmallDimensionSide` pinning (the
+      helpers stay — live callers in cardinality.go/pushdown.go), the
+      searched arm of `chooseInnerJoinAlgo` (syntactic/pushdown callers keep
+      it), the per-subset layout/remap family (`dpEntry.layout`,
+      `remapKeyToLayout`, `mergeSubsetLayouts`), the `joinGraph`/`joinEdge`
+      types, and the graph-space key-proof sibling in `joinkeyproof.go`
+      (`graphEndOf`/`graphJoinKeyDivisor`/`bestProvableGraphKey`/
+      `coveringGraphEdges`/`graphFKParentRaw` — only consumer was
+      `estimateJoinCost`; the `*Join`-space prover is now the sole
+      implementation, retiring the sibling-paths obligation). Both flags the
+      old DP owned are freed: `costDrivenJoinOrder`/`SetCostDrivenJoinOrder`
+      (default-OFF, env hook retired at P5.9 — production had already run the
+      surviving arms for a day, so the deletion is behaviour-preserving by
+      construction) and `SetPGShapedJoinSearch` (the kill-switch inverts:
+      `GOOPG_PGSHAPED_DP=0` now means NO search — the syntactic order — since
+      no old DP remains to fall back to). `tryBushyDP` → **`tryJoinSearch`**;
+      `joinorder.go` demoted to the over-limit sequencer (mechanism and
+      caller unchanged). **Survivors split out, not deleted:** the new
+      `joinlayout.go` (1348 lines) takes `buildBindingsPosMap`/
+      `applyJoinTreePosMap` (**held back per 08 §4** until the 03 §10
+      boundary map is proven — the hold-back STANDS), `reconcileNLILayout`
+      (its Plan() call site died with the flag; the function STAYS per 08 §3
+      as `assertSearchedTreeNeedsNoReconcile`'s oracle — ledgered), and the
+      remap walker family; `joinrestrict.go` takes the three coordinate/edge
+      helpers with live consumers (`plannerCommonEquijoinsAcrossOr`,
+      `tableForCol`, `visitColumnRefsForTable`).
+      `shouldAttachLocalFiltersBeforeSearch`/`attachRelationLocalFilters`
+      turned out to have no caller but bushy.go and were deleted. Tests: six
+      old-DP-only files deleted (`bushy_test`, `bushy_remap_test`,
+      `joingraphkeyproof_test`, `cost_overflow_test`,
+      `cost_model_inferred_edge_test`, `cost_model_3part_test`);
+      `cost_funcs_test`/`local_filters_test`/`relsize_fallback_test`
+      truncated at tombstones naming the surviving coverage
+      (`TestPlanQ5AttachesLeafLocalFilters` still pins the pre-search attach
+      end-to-end; `applyRelSizeFallback` owns the seed behaviour);
+      `right_join_spine_rows_test` rewritten single-arm;
+      `hasSubqueryExpr` rescued to its sole user. The stats-aware NLI INNER
+      fan-out test that sat under `costDrivenJoinOrder` in
+      `nliCostGateAccepts` died with the flag — its hazard (non-unique inner
+      probe column ⇒ matchSet = innerRows/NDistinct rows per outer; Q5's
+      730k→~290M) is real, so resurrecting it is a cost-model decision,
+      ledgered. Gates: grep-clean, `go build`/`go vet` clean, UNITS PASS,
+      SPOT PASS (Q12=2/Q13=35, 29.4 s query phase, peak 12,115 MB), **DS05
+      PASS** (`sweep-20260807-122645`: 95 PASS / 0 MISMATCH / 0 CKMISMATCH /
+      0 ERROR / 0 TIMEOUT / 4 SKIP, status-delta `verdict-changes=none
+      runtime-moves=0`, **PLAN-SHAPE 99/99 same, 0 changed** — the deletion
+      moved nothing), `make ralph-state-guard` OK.
+      `TestExprSwitchInventoryIsPinned` caught the file split and was
+      re-keyed in-commit (four walker pins `bushy.go`→`joinlayout.go`), not
+      suppressed.
 - [ ] **M0127-P6.4 — supersession stamps + ledger rows.** 0034-0001, 0038-0001,
       cost-model/09 §3 allowance, 0043/0063/0125/0126 MHJ chapters get
       `superseded by: leftdeep-joins/` headers; README index status flips;

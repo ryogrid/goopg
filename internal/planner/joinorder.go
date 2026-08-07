@@ -1,5 +1,19 @@
 // Cost-based join-order reordering for the v0 planner.
 //
+// # Role after M0127-P6.3 (08 §4: "demoted to over-limit sequencer")
+//
+// The PG-shaped join search (`GOOPG_PGSHAPED_DP`, ON by default since
+// M0127-P5.9) picks the join order for every shape its seam admits, and the
+// old subset-bitmask DP that used to outrank this pass is deleted. What is
+// left here is the PARSE-LEVEL sequencer: it permutes the FROM list before
+// column resolution, so its result is the order a statement gets when the
+// search does NOT run — over the `maxSearchRels` ceiling, a shape the seam
+// declines (LATERAL, non-flattenable chains, outer-join spines), or the
+// kill-switch arm. For searched shapes the permutation is harmless: the
+// search considers every order regardless of the one it is handed.
+//
+// # What it does
+//
 // The default `planFromClause` builds a left-deep CROSS-join chain
 // in source order, then `pushPredicatesIntoCrossJoins` pushes WHERE
 // equalities down to their qualifying Join. That lifts the

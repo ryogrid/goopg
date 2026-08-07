@@ -91,14 +91,13 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Cost-model doc 13 Phase 2: final NLI-layout reconciliation. Runs
-	// after all planning (incl. sub-query integration), which is where a
-	// derived-table outer's schema is reordered relative to the build-time
-	// schema the NLI probe keys were bound to. Gated on cost-driven (where
-	// NLI is being re-enabled); a no-op for production.
-	if costDrivenJoinOrder {
-		reconcileNLILayout(node)
-	}
+	// Cost-model doc 13 Phase 2's final NLI-layout reconciliation
+	// (`reconcileNLILayout`) lost its only production call site here at
+	// M0127-P6.3: it was gated on `costDrivenJoinOrder`, which defaulted off
+	// and lost its env hook at P5.9, so production has run without it since
+	// 2026-08-06 and the two in-place reorders it repaired (the integer DP,
+	// the MHJ packer) are both deleted. The function STAYS (joinlayout.go) —
+	// 08 §3 retires it only once a searched plan is proven never to need it.
 	// M0125-0035 CTE-body arm: carry a restriction sitting on a
 	// single-reference CTE's output through the reference into the body
 	// (PG 12+ cte_inline + subquery qual pushdown). Runs from Plan()'s
@@ -372,7 +371,7 @@ type resolveContext struct {
 	// at all (`RelOptInfo.ConsiderStartup`).
 	//
 	// It lives on the context for the same reason `joinlist` does — the join
-	// search runs from `tryBushyDP` / `runJoinSearchBelowPinned`, neither of
+	// search runs from `tryJoinSearch` / `runJoinSearchBelowPinned`, neither of
 	// which is handed the statement — and it is set where PG sets it, before
 	// the first rel exists. 0 (fetch everything) in every context that is not
 	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
@@ -1141,12 +1140,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				preDPUnnested = true
 			} else if f, ok := node.(*Filter); ok {
 				// Legacy order (GOOPG_UNNEST_PREDP=off, or a scalar-
-				// family sublink in the WHERE): bushy-join DP when all
-				// tables have ANALYZE stats. This replaces the
-				// left-deep CROSS chain with a DPccp-style optimal
-				// bushy tree that eliminates Cartesian products. See
-				// internal/planner/bushy.go.
-				if newChild, newPred := tryBushyDP(f.Child, f.Predicate, ctx, cat); newPred == nil {
+				// family sublink in the WHERE): run the join-order
+				// search over the left-deep CROSS chain. Until
+				// M0127-P6.3 this door led to the subset-bitmask bushy
+				// DP (bushy.go, deleted); it now leads to the PG-shaped
+				// search alone. See internal/planner/joinsearchseam.go.
+				if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
 					node = newChild // all conjuncts consumed → remove Filter
 				} else if newChild != f.Child {
 					f.Child = newChild
@@ -10869,7 +10868,7 @@ func planHasOuterRef(node Node) bool {
 // depth is the Level value that would refer to node's own immediate
 // parent scope at the current nesting point (1 at the top call,
 // incrementing by one for each subquery level recursed into — the
-// same convention bushy.go's remapOuterRefsInSubplan already uses).
+// same convention joinlayout.go's remapOuterRefsInSubplan already uses).
 func planHasEscapingOuterRef(node Node, depth int) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {

@@ -123,9 +123,9 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function, so the pin DEMOTES instead of disappearing. A conversion is
 	// audited by this role change; only a walker whose switch vanishes
 	// entirely loses its line.
-	"bushy.go:remapByPosMap":           nonRecursiveClassifier,
-	"bushy.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms
-	"bushy.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms
+	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
+	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
+	"joinlayout.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms; moved from bushy.go at M0127-P6.3
 	// CONVERTED by M0125-0002 commit 7, the LAST of the series. The
 	// recursion is walkExprRefs (scopeSignal); the surviving switch is the
 	// three-arm "reads row data but names no column" veto inside the Visit
@@ -133,7 +133,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// empty-Name *ColumnRef), attributed by the census to its enclosing
 	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
 	// RC-1a class 45 -> 44.
-	"bushy.go:visitColumnRefsByName": nonRecursiveClassifier,
+	"joinlayout.go:visitColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
 	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
 	// recursion and the exhaustiveness); what the census sees is the
 	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,
