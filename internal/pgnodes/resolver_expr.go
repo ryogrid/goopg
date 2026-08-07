@@ -787,6 +787,12 @@ func resolveIntLiteral(v int64, expected uint32) (Node, uint32, error) {
 	if expected == OidNumeric {
 		return wrapIntToNumericCast(c, ityp), OidNumeric, nil
 	}
+	// Same pattern for int2 (smallint): a bare integer literal is int4, then
+	// coerce_to_target wraps it in an IMPLICIT-CAST FuncExpr — int2(int4) (314)
+	// or int2(int8) (714). PG never stores a bare int2 Const for a literal.
+	if expected == OidInt2 {
+		return wrapIntToInt2Cast(c, ityp), OidInt2, nil
+	}
 	return c, ityp, nil
 }
 
@@ -802,6 +808,28 @@ func wrapIntToNumericCast(arg Node, argType uint32) Node {
 	return &FuncExpr{
 		Funcid:         funcid,
 		Funcresulttype: OidNumeric,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
+}
+
+// wrapIntToInt2Cast builds the implicit int->int2 coercion FuncExpr that PG's
+// coerce_type emits for a bare integer literal in an int2 context. funcid:
+// int2(int4) (314) for int4, int2(int8) (714) for int8. funcformat =
+// COERCE_IMPLICIT_CAST (2); funcresulttype = int2.
+func wrapIntToInt2Cast(arg Node, argType uint32) Node {
+	funcid := uint32(314) // int2(int4)
+	if argType == OidInt8 {
+		funcid = 714 // int2(int8)
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: OidInt2,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -875,6 +903,40 @@ func wrapToFloat8Cast(arg Node, fromType uint32) Node {
 	return &FuncExpr{
 		Funcid:         funcid,
 		Funcresulttype: OidFloat8,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
+}
+
+// wrapToFloat4Cast builds the implicit <numeric-family>->float4 coercion FuncExpr
+// PG's coerce_type emits for an int4/int8/numeric CASE result promoted to a
+// common float4 type (float4 is the widest type present when no float8 member
+// exists; it is NOT a preferred type, so it wins only via the pairwise walk).
+// The cast function is chosen by the source type per pg_cast.dat (all castcontext
+// 'i' implicit, castmethod 'f'): float4(int4) 318, float4(int8) 652,
+// float4(numeric) 1745. funcresulttype float4; funcformat = COERCE_IMPLICIT_CAST
+// (2); no collation. The float4 side never needs a cast (identity). The caller
+// (coerceCaseResult) guarantees a supported source type.
+func wrapToFloat4Cast(arg Node, fromType uint32) Node {
+	var funcid uint32
+	switch fromType {
+	case OidInt4:
+		funcid = 318 // float4(int4)
+	case OidInt8:
+		funcid = 652 // float4(int8)
+	case OidNumeric:
+		funcid = 1745 // float4(numeric)
+	default:
+		return nil
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: OidFloat4,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -1273,13 +1335,10 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 // set (or a collatable/other-category type) returns false and the CASE degrades
 // to SQL text (all-or-nothing).
 //
-// The reachable common types are int4 < int8 < numeric < float8; a float4 result
-// WITHOUT any float8 result would make float4 the common type (float4 beats
-// numeric/int8/int4 in the walk) and PG then wraps the whole CASE in an outer
-// float8(float4) column cast — this canonicalizer has no int/numeric->float4
-// implicit-cast arm and emits no outer column cast, so that mix returns false and
-// degrades. Every accepted common type therefore has a coerceCaseResult arm for
-// each member present.
+// The reachable common types are int4 < int8 < numeric < float4 < float8;
+// float8 is the category's PREFERRED type and wins whenever present; float4 wins
+// over the exact-integer/numeric family when NO float8 member is present. Every
+// accepted common type has a coerceCaseResult arm for each narrower member.
 func selectCaseCommonType(types []uint32) (uint32, bool) {
 	if len(types) == 0 {
 		return 0, false
@@ -1317,9 +1376,7 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 		// it whenever any result is float8 — every other member coerces up to it.
 		return OidFloat8, true
 	case hasFloat4:
-		// float4 common type (float4 present, no float8): PG would wrap the whole
-		// CASE in an outer float8(float4) column cast; unmodeled -> degrade.
-		return 0, false
+			return OidFloat4, true
 	case hasNumeric:
 		return OidNumeric, true
 	case hasInt8:
@@ -1336,11 +1393,12 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 // the narrower result in the exact implicit-cast FuncExpr PG stores un-const-
 // folded: int4/int8 → numeric via int4_numeric (1740) / int8_numeric (1781),
 // int4 → int8 via int8(int4) (481), float4 → float8 via float8(float4) (311),
-// and int4/int8/numeric → float8 via float8(int4)/float8(int8)/float8(numeric)
-// (316/482/1746). No other coercion is modeled — the only mismatches
-// selectCaseCommonType can yield are these narrowing→widening cases within PG's
-// numeric type category, so this stays total for the accepted subset; anything
-// else returns ErrUnsupported.
+// int4/int8/numeric → float8 via float8(int4)/float8(int8)/float8(numeric)
+// (316/482/1746), and int4/int8/numeric → float4 via
+// float4(int4)/float4(int8)/float4(numeric) (318/652/1745). No other coercion is
+// modeled — the only mismatches selectCaseCommonType can yield are these
+// narrowing→widening cases within PG's numeric type category, so this stays total
+// for the accepted subset; anything else returns ErrUnsupported.
 func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	if fromType == toType {
 		return node, nil
@@ -1356,6 +1414,9 @@ func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	}
 	if toType == OidFloat8 && (fromType == OidInt4 || fromType == OidInt8 || fromType == OidNumeric) {
 		return wrapToFloat8Cast(node, fromType), nil
+	}
+	if toType == OidFloat4 && (fromType == OidInt4 || fromType == OidInt8 || fromType == OidNumeric) {
+		return wrapToFloat4Cast(node, fromType), nil
 	}
 	return nil, ErrUnsupported
 }

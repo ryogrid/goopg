@@ -244,7 +244,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	// a re-resolve re-wraps the identical FuncExpr (fixed point), rather than a
 	// spurious numeric(<int>) function call.
 	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) ||
-		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) ||
+		isImplicitIntToInt2Cast(f) ||
+		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) || isImplicitToFloat4Cast(f) ||
 		isImplicitNumericLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
@@ -394,6 +395,38 @@ func isImplicitInt4ToInt8Cast(f *FuncExpr) bool {
 	return f.Funcid == 481 &&
 		f.Funcformat == 2 &&
 		f.Funcresulttype == OidInt8 &&
+		len(f.Args) == 1
+}
+
+// isImplicitIntToInt2Cast reports whether f is the exact FuncExpr the forward
+// resolver emits for an int4 (or int8) literal wrapped in an implicit int2 cast:
+// int2(int4) (314) or int2(int8) (714), funcformat 2, single argument. Like the
+// int→numeric cast it has no SQL call syntax — PG re-derives it from the bare
+// integer in an int2 context — so rebuild unwraps to the inner argument for a
+// re-resolve fixed point.
+func isImplicitIntToInt2Cast(f *FuncExpr) bool {
+	return (f.Funcid == 314 || f.Funcid == 714) &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidInt2 &&
+		len(f.Args) == 1
+}
+
+// isImplicitToFloat4Cast reports whether f is the exact FuncExpr the forward
+// resolver emits for an int4/int8/numeric CASE result widened to a common
+// float4 type (see wrapToFloat4Cast): float4(int4) (318), float4(int8) (652), or
+// float4(numeric) (1745), all in the implicit-cast form (funcformat 2) with a
+// single argument. Like the sibling numeric-family casts these have no SQL call
+// syntax that would round-trip as an implicit cast — the CASE common-type walk
+// re-derives them from the bare int/numeric result in a float4 context — so
+// rebuild unwraps to the inner argument for a re-resolve fixed point. The
+// funcformat==2 guard is load-bearing: the SAME OIDs (e.g. float4(int4) 318)
+// appear with funcformat 0 for an explicit float4(<int>) conversion call and
+// funcformat 1 for an explicit `::float4` cast, both of which must rebuild back
+// to their own syntax, NOT unwrap.
+func isImplicitToFloat4Cast(f *FuncExpr) bool {
+	return (f.Funcid == 318 || f.Funcid == 652 || f.Funcid == 1745) &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidFloat4 &&
 		len(f.Args) == 1
 }
 

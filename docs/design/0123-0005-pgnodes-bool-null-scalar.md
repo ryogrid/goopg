@@ -1693,12 +1693,15 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
 
 ## Deferred
 
-- **Cross-family** float-common-*without*-float8 `CASE` mixes still degrade: a mix
-  whose PG common type is `float4` (float4 present, no float8) resolves to a
-  `float4` CASE wrapped in an outer `float8(float4)` column cast, which needs the
-  `int/numeric`→`float4` cast arms plus outer-column-cast modeling; and the
-  date-time families are not yet modeled. Sub-slice 16 covers every mix whose
-  common type is `int8`/`numeric`/`float8`.
+- **Cross-family** `CASE` mixes whose common type is `float4` (float4 present, no
+  float8) are NOW CANONICAL (sub-slice 32): `selectCaseCommonType` returns
+  `OidFloat4`, `coerceCaseResult` gains the `int4`/`int8`/`numeric`→`float4` arms
+  (`float4(int4)`=318 / `float4(int8)`=652 / `float4(numeric)`=1745, all
+  funcformat 2), and `isImplicitToFloat4Cast` in the rebuild path unwraps them.
+  No outer `float8(float4)` column cast is needed — PG stores `casetype 700`
+  directly. The per-result `float4()` conversion calls carry funcformat 0 and
+  round-trip through `catalog.RegprocName`; the implicit coercion arms carry
+  funcformat 2 and unwrap. The date-time families are not yet modeled.
 - Simple-form `WHEN`-value resolution now models both `make_op` phases — the
   native cross-type operator (sub-slice 18) and the coerce-value-up path
   (sub-slice 17, limited to the `int4/int8`→`numeric` widenings `coerceCaseResult`

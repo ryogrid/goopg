@@ -87,7 +87,7 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"str-numeric-nan", col("numeric", "'NaN'::numeric"), true, []string{"CONST", "1700"}},
 		// SQL-text fallback: a bare integer literal `5` in an int2 column is int4-typed
 		// then wrapped in an int4→int2 cast FuncExpr (not modeled), so type != int2 → text.
-		{"smallint-lit", col("int2", "5"), false, []string{"5"}},
+		{"smallint-lit", col("int2", "5"), true, []string{"FUNCEXPR", "funcid 314", "funcresulttype 21", "CONST", "consttype 23"}},
 		// A mixed-result-type CASE (int vs numeric) now folds via select_common_
 		// type: casetype numeric (1700), the int result wrapped in the implicit
 		// int4_numeric cast FuncExpr (funcid 1740). M0123-S4 sub-slice 13.

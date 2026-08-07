@@ -1719,9 +1719,14 @@ one clean night is not a fix — but do not re-file them per night.
       4/19.5M already triaged, the error string and command index are identical,
       and the fix is the existing ledger row, not a new task. Re-open only if a
       night shows a different command index or a non-abort error class.
-- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001)** —
-      fifth consecutive night; already tracked by the REOPENED item above, which
-      now carries this run's id. No separate task.
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260805-014309-001,
+      AI-20260808-005620-001)** — sixth consecutive night; already tracked by the
+      REOPENED item above, which now carries this run's id. No separate task.
+
+- [ ] **tpcds/Q95-timeout (AI-20260808-005620-002)** — Q95 hit its per-query
+      budget (57014/cancel) in the nightly TPC-DS lane; first-seen 20260808.
+      Repro: `psql -h 127.0.0.1 -p 65435 -U postgres -d postgres -f bench/tpcds/runtime_goopg/tpcds-data/queries/q95.sql`.
+      Evidence: `ci/logs/20260808-005620/tpcds/run.log`. PARKED per banner.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -12171,10 +12176,31 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       Inf/NaN) + oracle_pgnodes_adbin_test.go now **85 cases** all byte-identical vs LIVE
       PG18.3; resolver_expr_test/cast_test siblings reconciled. Design 0123-0005 §"Sub-slice
       29c".
-      REMAINING: typmod'd string numeric cast (`'5.5'::numeric(10,2)`);
-      the bare-integer→int2 implicit cast
-      FuncExpr (`int2 DEFAULT 5`); float4-common (no float8) CASE mix (needs
-      int/numeric→float4 arms + outer column cast); operator-driven view-qual coercion
-      (unblocks int2/timestamptz literals inside a view WHERE); other length types
-      (`varchar(N)`=CoerceViaIO, `timestamp(N)`, `bit(N)`); broader date input forms
-      (`infinity`, BC years, DateStyle-dependent).
+      SUB-SLICE 30 LANDED (2026-08-08): typmod'd string numeric cast (`'5.5'::numeric(10,2)`). resolveNumericTypmodCast gains a string-literal
+      fast path: foldStringLiteralConst(s, OidNumeric) → numeric Const, then wrap
+      in numeric(numeric,int4) length coercion (funcid 1703, funcformat 1).
+      4 tests: resolve structure, rebuild fixed point, degradation. Design
+      0123-0005 §"Sub-slice 30".
+      SUB-SLICE 31 LANDED (2026-08-08): bare-integer→int2 implicit cast
+      FuncExpr (`int2 DEFAULT 5`). resolveIntLiteral now wraps int4/int8 Const
+      in int2(int4) (314) / int2(int8) (714) implicit-cast (funcformat 2)
+      when expected==OidInt2; rebuild unwraps via isImplicitIntToInt2Cast.
+      4 live PG18.3 adbin goldens (5/0/-3/32767) byte-for-byte + codec round-trip
+      + resolve→Rebuild→re-resolve fixed point + DeepEqual + shape assertion.
+      Updated TestCanonicalAttrdefText smallint-lit to canonical-true.
+      Design 0123-0005 §"Sub-slice 31".
+      SUB-SLICE 32 LANDED (2026-08-08): float4-common (no float8) CASE mix.
+      selectCaseCommonType now returns OidFloat4 when a float4 result is present
+      without float8. coerceCaseResult gains int4/int8/numeric→float4 implicit-cast
+      arms (float4(int4)=318 / float4(int8)=652 / float4(numeric)=1745, all
+      funcformat 2, byte-identical to PG18.3 pg_attrdef.adbin). rebuild.go
+      isImplicitToFloat4Cast unwraps them (funcformat==2 guard — same OIDs appear
+      funcformat 0 for float4() conv calls and funcformat 1 for ::float4 casts).
+      No outer float8(float4) column cast needed — PG stores casetype 700 directly.
+      case_test.go: 3 live PG18.3 goldens (int4+float4, numeric+float4, multi-arm
+      3-family) + codec + rebuild round-trip; degrade case float4_common_no_float8
+      removed. Design 0123-0005 §"Deferred".
+      REMAINING: operator-driven view-qual coercion (unblocks int2/timestamptz
+      literals inside a view WHERE); other length types (`varchar(N)`=CoerceViaIO,
+      `timestamp(N)`, `bit(N)`); broader date input forms (`infinity`, BC years,
+      DateStyle-dependent).

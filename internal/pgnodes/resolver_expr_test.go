@@ -258,9 +258,11 @@ func TestResolveForColumn(t *testing.T) {
 		// int4_numeric/int8_numeric cast FuncExpr (M0123-S4 sub-slice 4a).
 		{"0", oidNumeric, true},          // int4 -> numeric implicit cast
 		{"5000000000", oidNumeric, true}, // int8 -> numeric implicit cast
+		// Integer literal in an int2 column: canonical via the implicit
+		// int4→int2 cast FuncExpr (M0123-S4 sub-slice 31).
+		{"5", oidInt2, true}, // int4 -> int2 implicit cast
 		// Type mismatch: must fall back to SQL text (wantOK false) so a standby
 		// never inserts a mistyped Datum.
-		{"5", oidInt2, false},   // int4 Const for a smallint column (int2 cast unsupported)
 		{"'x'", OidInt4, false}, // string literal on a non-text column
 		// Outside the canonical subset at all: SQL text.
 		{"now()", OidText, false}, // now() has no seeded overload here
