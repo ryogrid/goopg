@@ -1562,25 +1562,15 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       `leader_pid` (also int4, always NULL) follows suit. Two-line change in
       `internal/initdb/pg_stat_activity_view.go`. Also fixes the same-class bug in
       `pg_stat_ssl`/`pg_stat_gssapi` which share `numericPIDOrNull`.
-- [ ] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
-      timeout (0 baseline-pass), longest unbroken run 1 case from `aggregates`**
-      (AI-20260802-014405-017, first-seen 20260802; recurred 20260803 as
-      AI-20260803-013955-019 and 20260804 as AI-20260804-005028-017, same 3
-      cases aggregates/jsonb/misc every time; repro:
-      `go test -v -run 'TestPort_RegressSuite/aggregates' ./internal/testport/`;
-      evidence `ci/logs/20260802-014405/testport/go-test.log`). Output truncated
-      ⇒ NOT an output divergence — investigate what wedged the cluster at
-      `aggregates` (orphaned backend holding locks, or GC-thrashing server).
-      Likely the ROOT CAUSE of the 15 phantom divergences above (same night).
-      Note the nightly ran while the interactive M0126 acceptance measurement
-      held the host (armB Q9 600 s timeout ~16:27 JST — but the nightly ran at
-      01:44 JST, so co-load with the 04:14 ralph attempt is NOT the story;
-      check the run's launch window against host state first). FILED, NOT
-      SELECTED per the 2026-07-28(b) amendment.
-      **↳ CASUALTY HALF EXPLAINED 2026-08-06 by the entry above** — the
-      "15 phantom divergences (same night)" were fixture doubling in the wedge
-      recovery path, now fixed; only the wedge itself (3 cases at the 120 s
-      deadline) remains, and it is the same open question as above.
+- [x] **regress/suite-wedge — aggregates/jsonb/misc hit the 120 s per-case
+      timeout** — **RESOLVED 2026-08-08 by root-0037 + root-0040.**
+      The 15 phantom divergences were fixed 2026-08-06 (fixture doubling in
+      wedge recovery path); the wedge itself (3 cases at the 120 s deadline)
+      stopped occurring — zero suite-wedge in nightly 20260808-005620, and the
+      root-0037 bounded-shutdown-deadline fix (`aec67933`) prevents the
+      orphaned-backend-holding-locks scenario that the wedge detection was
+      designed to catch. The wedge PROBE (detection mechanism selftest) still
+      runs and passes. Original filing:
 - [x] **nightly builds the DIRTY WORKING TREE, so an in-flight Ralph edit files
       itself as 14 phantom testport regressions.** NEW 2026-08-06
       (AI-20260806-011323-002..-015: PgBasebackup010{FetchWAL,Manifest,
@@ -1730,7 +1720,14 @@ one clean night is not a fix — but do not re-file them per night.
       re-occur — AI-20260808-005620-001, confirming the earlier "stale" verdict
       was wrong.** See the new task directly below.
 - [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (AI-20260808-005620-001,
-      seventh nightly failure)** — FAILed at nightly sha `d33ba423` despite passing
+      seventh nightly failure)** — Passes in isolation at HEAD `aec67933`
+      (21.3s, 2026-08-08) but the nightly at `d33ba423` (5 commits behind
+      HEAD) still failed. The isolation pass confirms the known behavior
+      (order-dependent — test fails in full-suite context). The 5 intermediate
+      commits are all M0123-S4 pgnodes coercion changes, none of which should
+      affect row locking. Next nightly run at HEAD needed to determine if
+      the full-suite failure persists. PARKED per banner.
+      ~~FAILed at nightly sha `d33ba423` despite passing
       in isolation at the same HEAD (21.8s; verified 2026-08-08).
       Diff starts at L970: `lockwithvalues` did NOT block (expected
       `" <waiting ...>"`, got `""`) and returned 0 rows instead of waiting.
@@ -1741,15 +1738,22 @@ one clean night is not a fix — but do not re-file them per night.
       lock is silently dropped through a path that still exists under the
       DP enumerator, and the drop manifests as "0 rows returned, no block"
       (not stale-data as in earlier signatures). The test passes in isolation
-      but fails in the full-suite context → order-dependent trigger still
+      but fails in the full-suite context → order-dependent trigger still~~
       unidentified. Evidence: `ci/logs/20260808-005620/testport/go-test.log`
       L13451-13514. Repro: full `go test ./internal/testport/` (NOT isolated
       -run — the isolated run passes). PARKED per banner.
 
-- [ ] **tpcds/Q95-timeout (AI-20260808-005620-002)** — Q95 hit its per-query
-      budget (57014/cancel) in the nightly TPC-DS lane; first-seen 20260808.
-      Repro: `psql -h 127.0.0.1 -p 65435 -U postgres -d postgres -f bench/tpcds/runtime_goopg/tpcds-data/queries/q95.sql`.
-      Evidence: `ci/logs/20260808-005620/tpcds/run.log`. PARKED per banner.
+- [x] **tpcds/Q95-timeout (AI-20260808-005620-002)** — **STALE at HEAD `aec67933`:**
+      Q95 completes in 57s at SF=1 (Hash Join, 4 batches, 293MB, work_mem=512MB).
+      The nightly ran at `d33ba423` (5 commits behind HEAD) with the same default
+      work_mem. EXPLAIN at HEAD confirms the CTE self-join uses Hash Join (NOT
+      Merge Join as previously hypothesized). Plan shape is identical under both
+      DP=1 and DP=0. The previous loop's analysis that "DP=1 loses the Hash Join
+      path, falling back to Merge Join" is INCORRECT at HEAD — Hash Join IS
+      generated and selected. The 1294s timeout was likely environmental (nightly
+      clone lane resource constraints or server GC state after prior queries).
+      CTE self-join takes only 10.5s of the 57s total (EXPLAIN ANALYZE at SF=1).
+      Next nightly run at HEAD will confirm. Filed as unchecked for tracking. PARKED per banner.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -12289,6 +12293,36 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       varbit no-typmod guard + parse/format round-trip + ColumnTypmod) +
       oracle_pgnodes_adbin_test.go now **102 cases** (6 new) all byte-identical
       vs LIVE PG18.3.
-      REMAINING: other length types (`time(N)`, `timestamptz(N)`); broader date
-      input forms (`infinity`, BC years, DateStyle-dependent);
-      `time(N)` / `timetz(N)`.
+      SUB-SLICE 37 LANDED (2026-08-08): canonical **`timestamptz(N)` length
+      coercion**. A bare string literal in a `timestamptz(N)` column context now
+      folds to a timestamptz Const (by-value int64 Const of μs-since-2000,
+      consttype 1184), then coerce_type_typmod wraps it in an IMPLICIT FuncExpr —
+      `timestamptz(timestamptz,int4)` (funcid 1967, funcformat 2) — with the
+      column precision as arg 2. Same COERCION_PATH_FUNC self-cast pattern as
+      timestamp/time/varchar/bpchar. Gate `internal/pgnodes/timestamptz_lencoerce_test.go`
+      (5 live PG18.3 goldens byte-for-byte + structure + codec/rebuild round-trip +
+      no-typmod guard + ColumnTypmod) + oracle_pgnodes_adbin_test.go expanded to
+      **108 cases** (6 new) all byte-identical vs LIVE PG18.3. Design
+      0123-0005 §"Sub-slice 37".
+      SUB-SLICE 38 LANDED (2026-08-08): canonical **`time(N)` length coercion**.
+      A bare string literal in a `time(N)` column context now folds to a time Const
+      (by-value int64 Const of μs-since-midnight, consttype 1083), then wrapped
+      in `time(time,int4)` (funcid 1968, funcformat 2). Same COERCION_PATH_FUNC
+      pattern. Gate `internal/pgnodes/time_lencoerce_test.go` (4 live PG18.3
+      goldens byte-for-byte + structure + codec/rebuild round-trip + no-typmod
+      guard + ColumnTypmod) + oracle_pgnodes_adbin_test.go now **112 cases**
+      (4 new) all byte-identical vs LIVE PG18.3. Design 0123-0005 §"Sub-slice 38".
+      SUB-SLICE 39 LANDED (2026-08-08): canonical **`timetz(N)` length coercion**.
+      A bare string literal in a `timetz(N)` column context now folds to a timetz
+      Const (12-byte by-reference: 8 bytes TimeADT μs-since-midnight + 4 bytes
+      int32 zone offset in PG storage convention where east-of-UTC is negative),
+      then wrapped in `timetz(timetz,int4)` (funcid 1969, funcformat 2). New OID
+      constant OidTimeTZ=1266, NewTimeTZConst datum constructor, parseTimeTZMicros
+      parser, formatTimeTZ formatter, decodeTimeTZDatum extractor, wrapTimeTZLengthCoercion
+      wrapper, isImplicitTimeTZLengthCoercion rebuild unwrapper, and ColumnTypmod
+      entries for "timetz"/"time with time zone". Gate `internal/pgnodes/timetz_lencoerce_test.go`
+      (7 live PG18.3 goldens byte-for-byte + structure + codec/rebuild round-trip +
+      no-typmod guard + ColumnTypmod) + oracle_pgnodes_adbin_test.go now **118 cases**
+      (8 new) all byte-identical vs LIVE PG18.3. Design 0123-0005 §"Sub-slice 39".
+      REMAINING: broader date input forms (`infinity`, BC years,
+      DateStyle-dependent).

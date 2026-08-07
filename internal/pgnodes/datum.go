@@ -25,6 +25,7 @@ const (
 	OidTime        = 1083
 	OidTimestamp   = 1114
 	OidTimestamptz = 1184
+	OidTimeTZ      = 1266
 	OidBit         = 1560
 	OidVarBit      = 1562
 )
@@ -170,6 +171,10 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 		return -1, false, true
 	case OidTimestamp, OidTimestamptz, OidTime:
 		return 8, true, true
+	case OidTimeTZ:
+		// timetz is a 12-byte by-reference type: 8 bytes TimeADT (μs since
+		// midnight) + 4 bytes int32 timezone offset in seconds.
+		return 12, false, true
 	default:
 		return 0, false, false
 	}
@@ -1023,6 +1028,37 @@ func NewTimeConst(micros int64) *Const {
 	}
 }
 
+// NewTimeTZConst builds a Const for a time-with-time-zone value (TimeTzADT:
+// 8 bytes TimeADT μs since midnight + 4 bytes int32 timezone offset in seconds).
+// PG stores the zone offset with the opposite sign convention: a POSITIVE
+// zoneOffset (east of UTC) is stored as a NEGATIVE int32. This function accepts
+// the human convention (positive = east) and negates it for on-disk storage.
+// timetz is a by-reference type (constlen 12, constbyval false) — the 12-byte
+// datum is stored directly as []byte so outDatum emits the raw bytes in signed
+// decimal, matching PG's constvalue output byte-for-byte.
+func NewTimeTZConst(micros int64, zoneOffset int32) *Const {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint64(b[:8], uint64(micros))
+	// PG convention: east of UTC is negative.
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(-zoneOffset)))
+	return &Const{
+		ConstType: OidTimeTZ, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 12, ConstByval: false, Location: -1,
+		Datum: b,
+	}
+}
+
+// decodeTimeTZDatum extracts the (micros, zoneOffset) from a 12-byte timetz datum.
+// The returned zoneOffset is in PG storage convention (east of UTC is negative).
+func decodeTimeTZDatum(datum []byte) (micros int64, zoneOffset int32) {
+	if len(datum) < 12 {
+		return 0, 0
+	}
+	micros = int64(binary.LittleEndian.Uint64(datum[:8]))
+	zoneOffset = int32(binary.LittleEndian.Uint32(datum[8:12]))
+	return
+}
+
 // NewDateConst builds a Const for a date value (DateADT: signed int32 days since
 // the PostgreSQL epoch, 2000-01-01). It is by-value (constlen 4, constbyval true,
 // constcollid 0) and sign-extends into the 8-byte datum word so a pre-2000 date
@@ -1163,6 +1199,38 @@ func parseTimeMicros(s string) (int64, bool) {
 	totalSec := int64(hh)*3600 + int64(mi)*60 + int64(ss)
 	return totalSec*1000000 + fracUsec, true
 }
+
+// parseTimeTZMicros parses a timetz literal into (microseconds since midnight,
+// zoneOffset in seconds), returning ok=false for anything outside the deterministic
+// subset (which the resolver then degrades to SQL text). PG folds such a literal at
+// parse time using timetz_in. Supported forms: "HH:MI:SS[.ffffff]+HH:MI",
+// "HH:MI:SS[.ffffff]-HH:MI", "HH:MI:SS[.ffffff]Z".
+func parseTimeTZMicros(s string) (micros int64, zoneOffset int32, ok bool) {
+	s = strings.TrimSpace(s)
+
+	// Locate the timezone offset: the first '+', '-', or 'Z'/'z' in the string
+	// (the time part itself contains only digits, ':' and '.').
+	off := strings.IndexAny(s, "+-Zz")
+	if off < 0 {
+		return 0, 0, false
+	}
+	timeStr, offStr := s[:off], s[off:]
+
+	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
+	if !ok {
+		return 0, 0, false
+	}
+	offSec, ok := parseTZOffsetSeconds(offStr)
+	if !ok {
+		return 0, 0, false
+	}
+
+	totalSec := int64(hh)*3600 + int64(mi)*60 + int64(ss)
+	// Return in human convention (positive = east of UTC). NewTimeTZConst
+	// negates for PG storage convention (east is negative).
+	return totalSec*1000000 + fracUsec, int32(offSec), true
+}
+
 
 // parseDateFields parses "YYYY-MM-DD" (each field a plain non-negative integer;
 // BC / variable-form years are out of the supported subset).
@@ -1391,5 +1459,45 @@ func formatTime(micros int64) string {
 		sb.WriteByte('.')
 		sb.WriteString(frac)
 	}
+	return sb.String()
+}
+
+// formatTimeTZ formats a timetz value (microseconds since midnight + zone offset
+// in PG storage convention where east of UTC is negative) into a canonical
+// "HH:MM:SS[.ffffff]+HH:MI" / "-HH:MI" literal. It is the inverse of
+// parseTimeTZMicros, so a re-resolve reproduces the identical Const (rebuild fixed
+// point). The zone offset is negated for display (human convention: + = east).
+func formatTimeTZ(micros int64, zoneOffset int32) string {
+	if micros < 0 {
+		micros = 0
+	}
+	sec := micros / 1000000
+	fracUsec := micros % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%02d:%02d:%02d", hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+
+	// Negate from PG storage convention back to display convention.
+	off := -zoneOffset
+	if off == 0 {
+		sb.WriteString("+00")
+	} else if off < 0 {
+		sb.WriteByte('-')
+		off = -off
+	} else {
+		sb.WriteByte('+')
+	}
+	oh := off / 3600
+	om := (off % 3600) / 60
+	fmt.Fprintf(&sb, "%02d:%02d", oh, om)
 	return sb.String()
 }

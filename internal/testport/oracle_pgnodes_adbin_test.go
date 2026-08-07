@@ -348,6 +348,19 @@ var adbinOracleCases = []adbinOracleCase{
 	{"t0_trunc", "time(0)", pgnodes.OidTime, "'10:30:00.123456'"},
 	// time WITHOUT a precision qualifier stores a bare Const.
 	{"t_bare", "time", pgnodes.OidTime, "'10:30:00'"},
+
+	// Sub-slice 39: timetz(N) length coercion (funcid 1969, funcformat 2).
+	// PG wraps the timetz Const in an IMPLICIT timetz(timetz,int4) FuncExpr when
+	// the column has a precision qualifier (0-6).
+	{"tz0_midnight_utc", "timetz(0)", pgnodes.OidTimeTZ, "'00:00:00+00:00'"},
+	{"tz0_pos_offset", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00+05:30'"},
+	{"tz3_frac", "timetz(3)", pgnodes.OidTimeTZ, "'10:30:00.123+05:30'"},
+	{"tz6_full", "timetz(6)", pgnodes.OidTimeTZ, "'10:30:00.123456+05:30'"},
+	{"tz0_trunc", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00.123456+05:30'"},
+	{"tz0_zulu", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00Z'"},
+	{"tz3_neg_offset", "timetz(3)", pgnodes.OidTimeTZ, "'10:30:00.100-03:00'"},
+	// timetz WITHOUT a precision qualifier stores a bare Const.
+	{"tz_bare", "timetz", pgnodes.OidTimeTZ, "'10:30:00+05:30'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

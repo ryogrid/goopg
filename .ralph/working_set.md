@@ -1,26 +1,37 @@
-Task: M-NIGHTLY — graceful shutdown hang: server-side deadline (engine fix)
+Task: M0123-S4 sub-slice 39 — timetz(N) length coercion
 
 Files:
-  - internal/server/server.go: Config.ShutdownDeadline field, Server.shutdownDeadline,
-    timed connWG.Wait() in Run(), OnStop/OnStopImmediate set deadline
-  - docs/design/root-0037-nightly-server-shutdown-ladder.md: updated "not fixed" → "NOW FIXED"
-  - .ralph/fix_plan.md: marked graceful-shutdown task [x], filed EvalPlanQual REOPENED
+  - internal/pgnodes/datum.go: OidTimeTZ=1266, NewTimeTZConst, decodeTimeTZDatum,
+    parseTimeTZMicros, formatTimeTZ, caseTypeMeta entry
+  - internal/pgnodes/resolver_expr.go: resolveStringLiteral OidTimeTZ case,
+    wrapTimeTZLengthCoercion (funcid 1969), ResolveForColumnTypmod case,
+    ColumnTypmod "timetz"/"time with time zone" entries
+  - internal/pgnodes/rebuild.go: isImplicitTimeTZLengthCoercion, rebuildConst
+    OidTimeTZ case, implicit-coercion unwrap chain
+  - internal/pgnodes/timetz_lencoerce_test.go: new — structure + round-trip +
+    no-wrap + ColumnTypmod tests (all PASS)
+  - internal/testport/oracle_pgnodes_adbin_test.go: 8 new timetz oracle cases
 
-Key symbols: Config.ShutdownDeadline, Server.shutdownDeadline, Run(), OnStop, OnStopImmediate
+Key symbols:
+  - OidTimeTZ=1266, NewTimeTZConst, parseTimeTZMicros, formatTimeTZ,
+    decodeTimeTZDatum
+  - wrapTimeTZLengthCoercion (funcid 1969), isImplicitTimeTZLengthCoercion
 
 Hypothesis/Findings:
-  - OnStop had no deadline — one stuck backend hung the process indefinitely.
-  - Fix: Config.ShutdownDeadline (default 120s) bounds connWG.Wait() in Run().
-  - On timeout, dumps goroutine stacks to <DataDir>/shutdown_goroutines.txt.
-  - Immediate shutdown uses 0 deadline (no wait). Zero = backward compat.
-  - Backward compat: embedded test servers (DataDir="") never start control plane,
-    so shutdownDeadline stays 0 → unbounded wait (old behaviour).
+  - PG stores timetz zone offset with opposite sign: east of UTC is NEGATIVE
+    (verified via oracle test byte comparison)
+  - timetz is by-reference (constlen 12, constbyval false)
+  - All 118 oracle adbin cases PASS byte-for-byte against live PG18.3
 
-Next step: Continue M-NIGHTLY — next highest-impact unchecked items:
-  suite-wedge (line 1569 — likely stale after root-0040), EvalPlanQual REOPENED
-  (order-dependent, passes in isolation), or regress output-normalization.
+Next step:
+  M0123-S4 sub-slice 40: broader date input forms (infinity, BC years,
+  DateStyle-dependent) — the last REMAINING item
 
-Gates run: server pkg tests PASS, build ./... PASS, pre-commit units PASS,
-  ralph-state-guard OK (auto-repaired)
+Gates run:
+  - go test ./internal/pgnodes/ PASS
+  - go vet ./internal/pgnodes/ PASS
+  - go build ./... PASS
+  - go test -run TestOraclePgnodesAdbinBytesMatchPG ./internal/testport/ PASS (118 cases)
+  - make ralph-state-guard PASS (with auto-repair)
 
 In-flight: none

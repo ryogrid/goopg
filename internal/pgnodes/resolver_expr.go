@@ -133,10 +133,14 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 			n = wrapBitLengthCoercion(n, targetTypmod)
 		}
 	case targetType == OidVarBit:
-		if targetTypmod >= 0 {
-			n = wrapVarBitLengthCoercion(n, targetTypmod)
+			if targetTypmod >= 0 {
+				n = wrapVarBitLengthCoercion(n, targetTypmod)
+			}
+		case targetType == OidTimeTZ:
+			if targetTypmod >= 0 {
+				n = wrapTimeTZLengthCoercion(n, targetTypmod)
+			}
 		}
-	}
 	return n, true
 }
 
@@ -250,6 +254,12 @@ func ColumnTypmod(typeName string, args []int64) int32 {
 			return int32(args[0])
 		}
 		return -1
+	case "timetz", "time with time zone":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
 	case "bit":
 		if len(args) == 1 && args[0] > 0 {
 			// typmod = N (the bit length directly, no VARHDRSZ offset).
@@ -358,6 +368,28 @@ func wrapTimestamptzLengthCoercion(n Node, typmod int32) Node {
 	return &FuncExpr{
 		Funcid:         1967, // timestamptz(timestamptz,int4)
 		Funcresulttype: OidTimestamptz,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimeTZLengthCoercion wraps n in an IMPLICIT timetz(timetz,int4) FuncExpr
+// (funcid 1969, funcformat 2), the coerce_type_typmod length coercion PG applies
+// when a timetz(N) column's precision differs from the stored default's. The
+// inner timetz Const carries typmod -1; the outer FuncExpr carries the column's
+// precision as an int4 Const (typmod = N, 0-6). Like time/timestamp/timestamptz,
+// there is no bool isExplicit third arg — the pg_cast entry for timetz→timetz
+// is a two-argument function. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapTimeTZLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1969, // timetz(timetz,int4)
+		Funcresulttype: OidTimeTZ,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -603,6 +635,10 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 	case OidTime:
 		if micros, ok := parseTimeMicros(s); ok {
 			return NewTimeConst(micros), OidTime, true
+		}
+	case OidTimeTZ:
+		if micros, off, ok := parseTimeTZMicros(s); ok {
+			return NewTimeTZConst(micros, off), OidTimeTZ, true
 		}
 	case OidTimestamp:
 		if usec, ok := parseTimestampMicros(s); ok {

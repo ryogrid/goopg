@@ -251,6 +251,7 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 			isImplicitTimestampLengthCoercion(f) ||
 			isImplicitTimeLengthCoercion(f) ||
 			isImplicitTimestamptzLengthCoercion(f) ||
+			isImplicitTimeTZLengthCoercion(f) ||
 			isImplicitBitLengthCoercion(f) || isImplicitVarBitLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
@@ -443,6 +444,20 @@ func isImplicitTimeLengthCoercion(f *FuncExpr) bool {
 // the identical node (fixed point).
 func isImplicitTimestamptzLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 1967 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamptz || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimeTZLengthCoercion reports whether f is the IMPLICIT timetz length
+// coercion coerce_type_typmod adds when a timetz(N) column has a precision
+// qualifier (see wrapTimeTZLengthCoercion): timetz(timetz,int4) = funcid 1969,
+// funcformat 2 (COERCE_IMPLICIT_CAST). Like the other time-family length-coercion
+// wrappers, rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod
+// re-wraps the identical node (fixed point).
+func isImplicitTimeTZLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1969 || f.Funcformat != 2 || f.Funcresulttype != OidTimeTZ || len(f.Args) != 2 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)
@@ -722,12 +737,18 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		usec := int64FromByvalWord(c.Datum)
 		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
 	case OidTime:
-		// Render the μs-since-midnight datum back into a canonical "HH:MM:SS[.ffffff]"
-		// literal so a re-resolve in the time column context reproduces the identical
-		// Const — the fixed point.
-		micros := int64FromByvalWord(c.Datum)
-		return &parser.StringConst{Value: formatTime(micros)}, nil
-	case OidTimestamp:
+			// Render the μs-since-midnight datum back into a canonical "HH:MM:SS[.ffffff]"
+			// literal so a re-resolve in the time column context reproduces the identical
+			// Const — the fixed point.
+			micros := int64FromByvalWord(c.Datum)
+			return &parser.StringConst{Value: formatTime(micros)}, nil
+		case OidTimeTZ:
+			// Render the 12-byte timetz datum back into a canonical
+			// "HH:MM:SS[.ffffff]±HH:MI" literal so a re-resolve reproduces the
+			// identical Const — the fixed point.
+			micros, off := decodeTimeTZDatum(c.Datum)
+			return &parser.StringConst{Value: formatTimeTZ(micros, off)}, nil
+		case OidTimestamp:
 		// Same as timestamptz but WITHOUT the +00 offset — timestamp has no
 		// timezone. A re-resolve in a timestamp column context folds through
 		// parseTimestampMicros to the identical Const.
