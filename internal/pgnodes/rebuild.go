@@ -248,7 +248,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) || isImplicitToFloat4Cast(f) ||
 		isImplicitNumericLengthCoercion(f) ||
 			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) ||
-			isImplicitTimestampLengthCoercion(f) {
+			isImplicitTimestampLengthCoercion(f) ||
+			isImplicitBitLengthCoercion(f) || isImplicitVarBitLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
 	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
@@ -411,6 +412,32 @@ func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
 // the identical node (fixed point).
 func isImplicitTimestampLengthCoercion(f *FuncExpr) bool {
 	if f.Funcid != 1961 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamp || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitBitLengthCoercion reports whether f is the IMPLICIT bit length
+// coercion coerce_type_typmod adds when a bit(N) column has a length qualifier
+// (see wrapBitLengthCoercion): bit(bit,int4,bool) = funcid 1685, funcformat 2
+// (IMPLICIT), a bit result, and three args whose second is a non-null int4
+// typmod Const and third a bool isExplicit Const. pg_get_expr renders the
+// implicit form invisibly, so rebuild unwraps to Args[0]; a re-resolve through
+// ResolveForColumnTypmod re-wraps the identical node (fixed point).
+func isImplicitBitLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1685 || f.Funcformat != 2 || f.Funcresulttype != OidBit || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitVarBitLengthCoercion reports whether f is the IMPLICIT varbit length
+// coercion (see wrapVarBitLengthCoercion): varbit(varbit,int4,bool) = funcid 1687,
+// funcformat 2.
+func isImplicitVarBitLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1687 || f.Funcformat != 2 || f.Funcresulttype != OidVarBit || len(f.Args) != 3 {
 		return false
 	}
 	tc, isConst := f.Args[1].(*Const)
@@ -676,6 +703,18 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// string, not a unary minus.
 		days := int32(int64FromByvalWord(c.Datum))
 		return &parser.StringConst{Value: formatDate(days)}, nil
+	case OidBit:
+		// Rebuild the VarBit varlena to its canonical bit-string literal
+		// (e.g. '10101010'). A re-resolve in a bit column context re-folds
+		// through parseBitFromString → NewBitConst to the identical Const.
+		bitLen := bitLenFromVarlena(c.Datum)
+		data := bitDataFromVarlena(c.Datum)
+		return &parser.StringConst{Value: formatBit(bitLen, data)}, nil
+	case OidVarBit:
+		// Same as bit but with consttype 1562.
+		bitLen := bitLenFromVarlena(c.Datum)
+		data := bitDataFromVarlena(c.Datum)
+		return &parser.StringConst{Value: formatBit(bitLen, data)}, nil
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported Const type OID %d", c.ConstType)
 	}

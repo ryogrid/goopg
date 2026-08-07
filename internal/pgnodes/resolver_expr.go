@@ -120,6 +120,14 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 		if targetTypmod >= 0 {
 			n = wrapTimestampLengthCoercion(n, targetTypmod)
 		}
+	case targetType == OidBit:
+		if targetTypmod >= 0 {
+			n = wrapBitLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidVarBit:
+		if targetTypmod >= 0 {
+			n = wrapVarBitLengthCoercion(n, targetTypmod)
+		}
 	}
 	return n, true
 }
@@ -222,6 +230,18 @@ func ColumnTypmod(typeName string, args []int64) int32 {
 			return int32(args[0])
 		}
 		return -1
+	case "bit":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = N (the bit length directly, no VARHDRSZ offset).
+			return int32(args[0])
+		}
+		return -1
+	case "bit varying", "varbit":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = N (the maximum bit length).
+			return int32(args[0])
+		}
+		return -1
 	default:
 		return -1
 	}
@@ -282,6 +302,45 @@ func wrapTimestampLengthCoercion(n Node, typmod int32) Node {
 		Funccollid:     0,
 		Inputcollid:    0,
 		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapBitLengthCoercion wraps n in an IMPLICIT bit(bit,int4,bool) FuncExpr
+// (funcid 1685, funcformat 2), the coerce_type_typmod length coercion PG applies
+// when a bit(N) column's length qualifier differs from the stored default's.
+// The inner bit Const carries typmod -1; the outer FuncExpr carries the column's
+// typmod (= N, the bit length, directly without offset) as arg 2 and
+// isExplicit=false as arg 3. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapBitLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1685, // bit(bit,int4,bool)
+		Funcresulttype: OidBit,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod), NewBoolConst(false)},
+		Location:       -1,
+	}
+}
+
+// wrapVarBitLengthCoercion wraps n in an IMPLICIT varbit(varbit,int4,bool)
+// FuncExpr (funcid 1687, funcformat 2), the coerce_type_typmod length coercion
+// PG applies when a bit varying(N) column's length qualifier differs from the
+// stored default's. Same pattern as bit but with OID 1562.
+func wrapVarBitLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1687, // varbit(varbit,int4,bool)
+		Funcresulttype: OidVarBit,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod), NewBoolConst(false)},
 		Location:       -1,
 	}
 }
@@ -489,6 +548,16 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 	case OidBpchar:
 		// unknown→bpchar fold.
 		return NewBpcharConst(s), OidBpchar, true
+	case OidBit:
+		// unknown→bit fold: parse bit-string → VarBit varlena Const (1560).
+		if c, err := NewBitConst(s); err == nil {
+			return c, OidBit, true
+		}
+	case OidVarBit:
+		// unknown→varbit fold: parse bit-string → VarBit varlena Const (1562).
+		if c, err := NewVarBitConst(s); err == nil {
+			return c, OidVarBit, true
+		}
 	}
 	return nil, 0, false
 }

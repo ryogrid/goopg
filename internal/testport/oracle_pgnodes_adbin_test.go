@@ -318,6 +318,17 @@ var adbinOracleCases = []adbinOracleCase{
 	{"ts6_2024_01_15_123456", "timestamp(6)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
 	{"ts0_truncate", "timestamp(0)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
 	{"ts0_epoch", "timestamp(0)", pgnodes.OidTimestamp, "'epoch'"},
+	// Sub-slice 36: a string literal in a bit(N) column context folds to
+	// a bit Const (consttypmod -1), then coerce_type_typmod wraps it in an
+	// IMPLICIT bit(bit,int4,bool) FuncExpr (funcid 1685, funcformat 2).
+	{"bit4_1010", "bit(4)", pgnodes.OidBit, "'1010'"},
+	{"bit8_11110000", "bit(8)", pgnodes.OidBit, "'11110000'"},
+	{"bit1_single", "bit(1)", pgnodes.OidBit, "'1'"},
+	// Sub-slice 36: varbit(N) length coercion (funcid 1687, funcformat 2).
+	{"varbit6_111000", "bit varying(6)", pgnodes.OidVarBit, "'111000'"},
+	{"varbit8_10101010", "varbit(8)", pgnodes.OidVarBit, "'10101010'"},
+	// varbit WITHOUT a length qualifier stores a bare Const.
+	{"varbit_bare_10101", "bit varying", pgnodes.OidVarBit, "'10101'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

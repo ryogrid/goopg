@@ -24,6 +24,8 @@ const (
 	OidDate        = 1082
 	OidTimestamp   = 1114
 	OidTimestamptz = 1184
+	OidBit         = 1560
+	OidVarBit      = 1562
 )
 
 // DefaultCollationOid is DEFAULT_COLLATION_OID (pg_collation.dat "default"),
@@ -406,6 +408,101 @@ func NewBpcharConst(s string) *Const {
 		ConstLen: -1, ConstByval: false, Location: -1,
 		Datum: textVarlena(s),
 	}
+}
+
+// bitVarlena builds the in-memory varlena for a bit or varbit Const's constvalue.
+// Format: VARHDRSZ_4B (4 bytes, VARSIZE_SHORT) + int32 bit_len (little-endian) +
+// ceil(bit_len/8) data bytes (left-aligned, MSB first, last byte zero-padded).
+// This is byte-identical to PG's VarBit (varbit.c) / bits8 on-disk representation.
+func bitVarlena(bitLen int32, data []byte) []byte {
+	total := 4 + 4 + len(data)
+	b := make([]byte, total)
+	binary.LittleEndian.PutUint32(b[:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(b[4:8], uint32(bitLen))
+	copy(b[8:], data)
+	return b
+}
+
+// parseBitFromString parses a bit-string literal like '10101010' into (bitLen,
+// packed bytes, ok). Only '0' and '1' are accepted; empty string → bitLen=0,
+// zero data bytes (just the header+bit_len). Returns (0, nil, false) on non-bit
+// characters. The packed bytes are left-aligned, MSB first, with the last byte
+// zero-padded on the right — byte-identical to PG's bit_in (varbit.c).
+func parseBitFromString(s string) (int32, []byte, bool) {
+	bitLen := int32(len(s))
+	if bitLen == 0 {
+		return 0, nil, true
+	}
+	nBytes := (int(bitLen) + 7) / 8
+	data := make([]byte, nBytes)
+	for i := 0; i < int(bitLen); i++ {
+		switch s[i] {
+		case '1':
+			data[i/8] |= 1 << (7 - (i % 8))
+		case '0':
+			// zero bit — no-op (byte is already zero)
+		default:
+			return 0, nil, false
+		}
+	}
+	return bitLen, data, true
+}
+
+// formatBit reverses parseBitFromString, producing the canonical bit string
+// representation (e.g. '10101010') from the packed VarBit datum. The bitLen
+// and data bytes are decoded from the varlena that bitVarlena produced.
+func formatBit(bitLen int32, data []byte) string {
+	if bitLen == 0 {
+		return ""
+	}
+	b := make([]byte, bitLen)
+	for i := int32(0); i < bitLen; i++ {
+		if data[i/8]&(1<<(7-(i%8))) != 0 {
+			b[i] = '1'
+		} else {
+			b[i] = '0'
+		}
+	}
+	return string(b)
+}
+
+// bitLenFromVarlena extracts the bit_len int32 from a bit/varbit varlena
+// (the 4-byte little-endian word at offset 4, after the VARSIZE header).
+func bitLenFromVarlena(b []byte) int32 {
+	return int32(binary.LittleEndian.Uint32(b[4:8]))
+}
+
+// bitDataFromVarlena extracts the raw data bytes from a bit/varbit varlena
+// (everything after the 8-byte header: VARSIZE + bit_len).
+func bitDataFromVarlena(b []byte) []byte {
+	total := binary.LittleEndian.Uint32(b[:4]) >> 2
+	return b[8:total]
+}
+
+// NewBitConst builds a Const for a bit(N) literal (consttype=1560, constcollid=0).
+func NewBitConst(s string) (*Const, error) {
+	bitLen, data, ok := parseBitFromString(s)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: invalid bit literal %q", s)
+	}
+	return &Const{
+		ConstType: OidBit, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: bitVarlena(bitLen, data),
+	}, nil
+}
+
+// NewVarBitConst builds a Const for a varbit (bit varying) literal (consttype=1562).
+func NewVarBitConst(s string) (*Const, error) {
+	bitLen, data, ok := parseBitFromString(s)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: invalid varbit literal %q", s)
+	}
+	return &Const{
+		ConstType: OidVarBit, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: bitVarlena(bitLen, data),
+	}, nil
 }
 
 // NumericData on-disk format constants (utils/adt/numeric.c). A numeric Const's

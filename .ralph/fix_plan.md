@@ -12247,6 +12247,25 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       symmetry + Const rebuild) + oracle_pgnodes_adbin_test.go now **96
       cases** all byte-identical vs LIVE PG18.3 (2.01s). Design 0123-0005
       §"Sub-slice 35".
-      REMAINING: other length types (`bit(N)`/`varbit(N)`, `time(N)`,
-      `timestamptz(N)`); broader date input forms (`infinity`, BC years,
-      DateStyle-dependent); `time(N)` / `timetz(N)`.
+      SUB-SLICE 36 LANDED (2026-08-08): canonical **`bit(N)` / `varbit(N)`
+      length coercion**. A bare string literal in a `bit(N)` or `varbit(N)`
+      column context now folds to a bit/varbit Const (OidBit=1560, OidVarBit=1562;
+      NewBitConst/NewVarBitConst datum constructors; parseBitFromString/formatBit
+      — packed varlena byte-identical to PG's VarBit/bits8 on-disk format),
+      then coerce_type_typmod wraps it in an IMPLICIT FuncExpr —
+      `bit(bit,int4,bool)` (funcid 1685, funcformat 2) or
+      `varbit(varbit,int4,bool)` (funcid 1687, funcformat 2) — with the column
+      bit-length as arg 2 and isExplicit=false as arg 3. Same COERCION_PATH_FUNC
+      pattern as varchar/bpchar and timestamp. Unlike those, the FuncExpr has 3
+      args (including the bool isExplicit). Varbit WITHOUT a length qualifier
+      stores a bare Const (no coercion). The rebuild path unwraps the implicit
+      FuncExpr transparently and formatBit rebuilds the Const to a canonical
+      bit-string literal. ColumnTypmod extended with "bit", "bit varying", and
+      "varbit" cases. Gate `internal/pgnodes/bit_lencoerce_test.go` (5 live
+      PG18.3 goldens byte-for-byte + structure + codec/rebuild round-trip +
+      varbit no-typmod guard + parse/format round-trip + ColumnTypmod) +
+      oracle_pgnodes_adbin_test.go now **102 cases** (6 new) all byte-identical
+      vs LIVE PG18.3.
+      REMAINING: other length types (`time(N)`, `timestamptz(N)`); broader date
+      input forms (`infinity`, BC years, DateStyle-dependent);
+      `time(N)` / `timetz(N)`.
