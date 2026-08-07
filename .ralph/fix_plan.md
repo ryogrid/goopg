@@ -12324,5 +12324,18 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       (7 live PG18.3 goldens byte-for-byte + structure + codec/rebuild round-trip +
       no-typmod guard + ColumnTypmod) + oracle_pgnodes_adbin_test.go now **118 cases**
       (8 new) all byte-identical vs LIVE PG18.3. Design 0123-0005 §"Sub-slice 39".
-      REMAINING: broader date input forms (`infinity`, BC years,
-      DateStyle-dependent).
+      SUB-SLICE 40 LANDED (2026-08-08): broader date input forms —
+      **`infinity`/`-infinity`** for date, timestamp, and timestamptz (folds to
+      INT32_MAX/INT32_MIN for date, INT64_MAX/INT64_MIN for timestamp/timestamptz,
+      byte-identical to PG18.3 hardware sentinel values); and **BC years** via an
+      era-suffix parser (`stripEraSuffix`) + astronomical-year conversion
+      (1 BC → year 0, 2 BC → −1). Format functions (`formatDate`, `formatTimestamp`,
+      `formatTimestamptzUTC`) handle infinity (return `"infinity"`/`"-infinity"`)
+      and BC (append `" BC"` suffix). Timestamptz BC requires an explicit offset
+      for determinism (no-offset forms still degrade to SQL text). `now`/`today`/
+      `tomorrow`/`yesterday` remain degraded (require runtime context). Gate
+      `internal/pgnodes/bc_infinity_test.go` (12 live PG18.3 adbin goldens
+      byte-for-byte across date/timestamp/timestamptz + codec/rebuild round-trip +
+      format sentinel + no-regression checks) + oracle_pgnodes_adbin_test.go now
+      **130 cases** (12 new) all byte-identical vs LIVE PG18.3. Design 0123-0005
+      §"Sub-slice 40".

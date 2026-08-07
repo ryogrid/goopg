@@ -361,6 +361,20 @@ var adbinOracleCases = []adbinOracleCase{
 	{"tz3_neg_offset", "timetz(3)", pgnodes.OidTimeTZ, "'10:30:00.100-03:00'"},
 	// timetz WITHOUT a precision qualifier stores a bare Const.
 	{"tz_bare", "timetz", pgnodes.OidTimeTZ, "'10:30:00+05:30'"},
+
+	// Sub-slice 40: broader date input forms — infinity, BC years.
+	{"date_infinity", "date", pgnodes.OidDate, "'infinity'"},
+	{"date_neg_infinity", "date", pgnodes.OidDate, "'-infinity'"},
+	{"date_0001_01_01_bc", "date", pgnodes.OidDate, "'0001-01-01 BC'"},
+	{"date_0044_03_15_bc", "date", pgnodes.OidDate, "'0044-03-15 BC'"},
+	{"ts_infinity", "timestamp", pgnodes.OidTimestamp, "'infinity'"},
+	{"ts_neg_infinity", "timestamp", pgnodes.OidTimestamp, "'-infinity'"},
+	{"ts_0001_01_01_bc", "timestamp", pgnodes.OidTimestamp, "'0001-01-01 00:00:00 BC'"},
+	{"ts_0044_03_15_bc", "timestamp", pgnodes.OidTimestamp, "'0044-03-15 00:00:00 BC'"},
+	{"tstz_infinity", "timestamptz", pgnodes.OidTimestamptz, "'infinity'"},
+	{"tstz_neg_infinity", "timestamptz", pgnodes.OidTimestamptz, "'-infinity'"},
+	{"tstz_0001_01_01_bc", "timestamptz", pgnodes.OidTimestamptz, "'0001-01-01 00:00:00+00 BC'"},
+	{"tstz_0044_03_15_bc", "timestamptz", pgnodes.OidTimestamptz, "'0044-03-15 00:00:00+00 BC'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

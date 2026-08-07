@@ -948,6 +948,44 @@ const (
 // microseconds since the PostgreSQL epoch — negative because it predates 2000.
 const unixEpochMicros = int64(unixEpochJDate-postgresEpochJDate) * 86400 * 1000000
 
+// PG18 sends date/timestamp infinities as constvalue = PG_INT32_MAX / PG_INT64_MAX
+// (datetime.h: DATE_END_VAL / TIMESTAMP_END_VAL), i.e. the hardware integer limits.
+// These are the adbin Const datums; the parse functions recognise the string forms.
+const (
+	dateInfinity      int32 = math.MaxInt32
+	dateNegInfinity   int32 = math.MinInt32
+	tsInfinity        int64 = math.MaxInt64
+	tsNegInfinity     int64 = math.MinInt64
+)
+
+// stripEraSuffix trims optional whitespace-suffixed "BC" or "AD" from s, returning
+// the trimmed string and whether the era is BC (as opposed to AD). The caller then
+// converts the calendar year to the astronomical year PG's date2j expects:
+//  1 BC → year 0, 2 BC → year −1, … (astronomical = 1 − original).
+// No suffix defaults to AD (eraNeg = false).
+func stripEraSuffix(s string) (rest string, eraNeg bool) {
+	if idx := strings.LastIndexByte(strings.ToUpper(s), 'B'); idx >= 0 {
+		// Check for "BC" suffix: the character before B must be a space and C must follow.
+		if idx > 0 && s[idx-1] == ' ' && idx+1 < len(s) && (s[idx+1] == 'C' || s[idx+1] == 'c') {
+			// Also check that C is at end of string or followed by space/end
+			rest := idx + 2
+			if rest == len(s) || s[rest] == ' ' {
+				return strings.TrimSpace(s[:idx-1]), true
+			}
+		}
+	}
+	// Check for "AD" suffix.
+	if idx := strings.LastIndexByte(strings.ToUpper(s), 'A'); idx >= 0 {
+		if idx > 0 && s[idx-1] == ' ' && idx+1 < len(s) && (s[idx+1] == 'D' || s[idx+1] == 'd') {
+			rest := idx + 2
+			if rest == len(s) || s[rest] == ' ' {
+				return strings.TrimSpace(s[:idx-1]), false
+			}
+		}
+	}
+	return s, false
+}
+
 // date2j is PostgreSQL's Gregorian date → Julian day number (datetime.c:date2j),
 // exact integer arithmetic (no floating point, correct across the proleptic
 // calendar). Used to convert a parsed timestamp's calendar fields to a day count.
@@ -1082,9 +1120,20 @@ func NewDateConst(days int32) *Const {
 // 32 so only a genuine date literal folds.
 func parseDateDays(s string) (int32, bool) {
 	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return dateInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return dateNegInfinity, true
+	}
+	// Strip an era suffix (BC/AD) before parsing the date fields.
+	s, eraNeg := stripEraSuffix(s)
 	y, m, d, ok := parseDateFields(s)
 	if !ok || y < 1 {
 		return 0, false
+	}
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
 	}
 	jd := date2j(y, m, d)
 	if ry, rm, rd := j2date(jd); ry != y || rm != m || rd != d {
@@ -1097,7 +1146,17 @@ func parseDateDays(s string) (int32, bool) {
 // "YYYY-MM-DD" literal, the inverse of parseDateDays (used by the rebuild path so
 // a re-resolve is a fixed point).
 func formatDate(days int32) string {
+	if days == dateInfinity {
+		return "infinity"
+	}
+	if days == dateNegInfinity {
+		return "-infinity"
+	}
 	y, m, d := j2date(int(days) + postgresEpochJDate)
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		return fmt.Sprintf("%04d-%02d-%02d BC", 1-y, m, d)
+	}
 	return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 }
 
@@ -1110,6 +1169,12 @@ func formatDate(days int32) string {
 // offset, depends on the server's TimeZone and is left to SQL-text fallback.
 func parseTimestamptzMicros(s string) (int64, bool) {
 	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return tsInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return tsNegInfinity, true
+	}
 	if strings.EqualFold(s, "epoch") {
 		return unixEpochMicros, true
 	}
@@ -1135,6 +1200,9 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 	}
 	timeStr, offStr := rest[:off], rest[off:]
 
+	// Strip an era suffix (BC/AD) from the offset tail (e.g. "00+00 BC").
+	offStr, eraNeg := stripEraSuffix(offStr)
+
 	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
 	if !ok {
 		return 0, false
@@ -1142,6 +1210,10 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 	offSec, ok := parseTZOffsetSeconds(offStr)
 	if !ok {
 		return 0, false
+	}
+
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
 	}
 
 	days := int64(date2j(y, mo, d) - postgresEpochJDate)
@@ -1159,9 +1231,18 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 // "YYYY-MM-DD HH:MI:SS[.ffffff]", the 'epoch' keyword.
 func parseTimestampMicros(s string) (int64, bool) {
 	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return tsInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return tsNegInfinity, true
+	}
 	if strings.EqualFold(s, "epoch") {
 		return unixEpochMicros, true
 	}
+
+	// Strip an era suffix (BC/AD) before splitting date from time.
+	s, eraNeg := stripEraSuffix(s)
 
 	// Split the date from the time part on the first space or 'T'.
 	sep := strings.IndexAny(s, " Tt")
@@ -1173,6 +1254,9 @@ func parseTimestampMicros(s string) (int64, bool) {
 	y, mo, d, ok := parseDateFields(dateStr)
 	if !ok {
 		return 0, false
+	}
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
 	}
 
 	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
@@ -1382,6 +1466,12 @@ func parseTZOffsetSeconds(s string) (int64, bool) {
 // resolve→Rebuild→re-resolve is a fixed point. The rendering need not match
 // timestamptz_out's session-TimeZone form — only round-trip to the same instant.
 func formatTimestamptzUTC(usec int64) string {
+	if usec == tsInfinity {
+		return "infinity"
+	}
+	if usec == tsNegInfinity {
+		return "-infinity"
+	}
 	day := usec / usecsPerDay
 	rem := usec % usecsPerDay
 	if rem < 0 {
@@ -1396,7 +1486,12 @@ func formatTimestamptzUTC(usec int64) string {
 	ss := sec % 60
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", 1-y, mo, d, hh, mi, ss)
+	} else {
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	}
 	if fracUsec > 0 {
 		frac := fmt.Sprintf("%06d", fracUsec)
 		frac = strings.TrimRight(frac, "0")
@@ -1404,6 +1499,9 @@ func formatTimestamptzUTC(usec int64) string {
 		sb.WriteString(frac)
 	}
 	sb.WriteString("+00")
+	if y <= 0 {
+		sb.WriteString(" BC")
+	}
 	return sb.String()
 }
 
@@ -1413,6 +1511,12 @@ func formatTimestamptzUTC(usec int64) string {
 // offset, so a re-resolve through parseTimestampMicros reproduces the
 // identical Const.
 func formatTimestamp(usec int64) string {
+	if usec == tsInfinity {
+		return "infinity"
+	}
+	if usec == tsNegInfinity {
+		return "-infinity"
+	}
 	day := usec / usecsPerDay
 	rem := usec % usecsPerDay
 	if rem < 0 {
@@ -1427,12 +1531,20 @@ func formatTimestamp(usec int64) string {
 	ss := sec % 60
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", 1-y, mo, d, hh, mi, ss)
+	} else {
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	}
 	if fracUsec > 0 {
 		frac := fmt.Sprintf("%06d", fracUsec)
 		frac = strings.TrimRight(frac, "0")
 		sb.WriteByte('.')
 		sb.WriteString(frac)
+	}
+	if y <= 0 {
+		sb.WriteString(" BC")
 	}
 	return sb.String()
 }
