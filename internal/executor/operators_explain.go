@@ -37,6 +37,14 @@ func (o *explainOp) Open(ctx *Context) error {
 	var stats nodeStatsTable
 	var planNs, execNs int64
 
+	// GENERIC_PLAN: PG 16+ option that forces EXPLAIN to show the
+	// generic plan. Since goopg has no plan cache, emit a notice and
+	// fall through to the custom plan (matching PG's behavior when
+	// no generic plan is cached).
+	if opts.GenericPlan && opts.Set.GenericPlan {
+		ctx.AddNotice("generic plan is not available for this statement; using custom plan")
+	}
+
 	if opts.Analyze {
 		// M0018-0003: build the inner plan with instrumentation,
 		// drain it to completion so timers fire, then render.

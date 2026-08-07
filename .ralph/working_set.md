@@ -1,30 +1,37 @@
-Task: Bookkeeping — mark all milestones CLOSED, unblock M-NIGHTLY
+Task: M0122-0003 — Add GENERIC_PLAN, WAL, MEMORY EXPLAIN options to parser
 
 Files:
-  - .ralph/fix_plan.md: M0123-S2/S3/S4 → [x], M0125-0031/0032/0033 → [x]
-    (absorbed into now-closed M0127), M-NIGHTLY section unblocked
-  - .ralph/working_set.md: this file
+  - internal/parser/ast.go: added GenericPlan, Wal, Memory fields to
+    ExplainOptions + ExplainOptionsSet
+  - internal/parser/parser.go: added cases for "generic_plan", "wal",
+    "memory" in parseExplainOneOption
+  - internal/parser/explain_options_test.go: updated AllOptions test,
+    added TestParseExplainGenericPlan/Wal/Memory
+  - internal/executor/operators_explain.go: GENERIC_PLAN notice when
+    no generic plan is available (matches PG behavior)
 
-Key symbols: N/A (bookkeeping loop)
+Key symbols: ExplainOptions, ExplainOptionsSet, parseExplainOneOption,
+explainOp.Open
 
 Hypothesis/Findings:
-  - All five priority milestones CLOSED: M0124, M0125 (absorbed items → M0127),
-    M0127, M0128, M0123
-  - M-NIGHTLY now unblocked — banner + section header + procedure comment updated
-  - Two M-NIGHTLY items filed from action-items 20260808-005620:
-    1. testport/TestPort_IsolationEvalPlanQual — REOPENED but PASSES in isolation
-       at HEAD aec67933 (21.84s); full-suite ordering issue, not a regression
-    2. tpcds/Q95-timeout — STALE at HEAD (completes 57s)
-  - No immediately actionable M-NIGHTLY items remain
-  - Remaining unchecked items in fix_plan are deferred/blocked milestones
-    (M0095, M0110, M0119, M0122)
+  - PG 18 supports GENERIC_PLAN, WAL, and MEMORY EXPLAIN options that
+    goopg rejected as "unknown EXPLAIN option"
+  - Parser change is the minimum viable improvement — tools that use
+    these options (e.g. EXPLAIN (GENERIC_PLAN)) no longer error
+  - GENERIC_PLAN gets a NOTICE "generic plan is not available" matching
+    PG's behavior when no plan cache entry exists
+  - WAL and MEMORY are parsed but produce no extra output yet —
+    executor tracking for WAL record counts and per-node memory is
+    deferred to follow-up loops
 
-Next step: Read ci/logs/action-items.md; if new items, file + investigate the
-most actionable one. If the log is stale/same, consider M0122 PG-compat buckets
-or user direction.
+Next step: Consider next M0122-0003 subtask (EXPLAIN WAL record
+tracking or per-node MEMORY reporting), or triage next M-NIGHTLY run
 
 Gates run:
-  - go test -run TestPort_IsolationEvalPlanQual ./internal/testport/ PASS (21.84s)
+  - go test -run TestParseExplain ./internal/parser/ PASS (18 tests)
+  - go test -run TestExplain ./internal/executor/ PASS
+  - go build ./... clean
+  - RALPH_PRECOMMIT_SCOPE=smoke PASS (0 failed, 3 workloads)
   - make ralph-state-guard PASS (auto-repaired, consistent)
 
 In-flight: none

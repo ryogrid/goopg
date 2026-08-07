@@ -486,22 +486,26 @@ const (
 // from "user said nothing" (Set.Timing=false) — the latter
 // defaults to ON matching upstream's default-true semantics.
 type ExplainOptions struct {
-	Analyze  bool
-	Verbose  bool
-	Costs    bool
-	Buffers  bool
-	Settings bool
-	Timing   bool
-	Summary  bool
-	Format   ExplainFormat
-	Set      ExplainOptionsSet
+	Analyze     bool
+	Verbose     bool
+	Costs       bool
+	Buffers     bool
+	Settings    bool
+	Timing      bool
+	Summary     bool
+	GenericPlan bool
+	Wal         bool
+	Memory      bool
+	Format      ExplainFormat
+	Set         ExplainOptionsSet
 }
 
 // ExplainOptionsSet records which ExplainOptions fields the user
 // wrote explicitly. Allows the executor to distinguish a user-set
 // false from an unset zero-value bool.
 type ExplainOptionsSet struct {
-	Analyze, Verbose, Costs, Buffers, Settings, Timing, Summary, Format bool
+	Analyze, Verbose, Costs, Buffers, Settings, Timing, Summary, Format,
+	GenericPlan, Wal, Memory bool
 }
 
 // ExplainStmt — `EXPLAIN [ANALYZE] [VERBOSE] <stmt>` or
