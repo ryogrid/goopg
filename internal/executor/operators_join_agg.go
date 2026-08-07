@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/hashsize"
@@ -567,6 +568,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
 	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+	buildStart := time.Now()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
 			return false, err
@@ -578,6 +580,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			o.releaseBatches()
 			return false, err
 		}
+		o.recordBuildTime(ctx, buildStart)
 		return false, nil
 	}
 	if err := o.right.Open(ctx); err != nil {
@@ -598,6 +601,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			if err := o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth); err != nil {
 				return false, err
 			}
+			o.recordBuildTime(ctx, buildStart)
 			return true, nil
 		}
 	}
@@ -608,7 +612,18 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		o.releaseBatches()
 		return false, err
 	}
+		o.recordBuildTime(ctx, buildStart)
 	return true, nil
+}
+
+// recordBuildTime records the wall-clock build time in the per-plan-node
+// hash-join instrumentation. Merged by MAXIMUM across re-Opens (PG rule).
+// M0128-P2.1.
+func (o *joinOp) recordBuildTime(ctx *Context, start time.Time) {
+	st := ctx.hashJoinStat(o.plan)
+	if ns := time.Since(start).Nanoseconds(); ns > st.BuildTimeNs {
+		st.BuildTimeNs = ns
+	}
 }
 
 // releaseBatches drops the batch files a failed or finished join still owns.

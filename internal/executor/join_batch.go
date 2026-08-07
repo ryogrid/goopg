@@ -162,6 +162,12 @@ type HashJoinStats struct {
 	NBatch       int
 	OrigNBatch   int
 	SpacePeak    int64
+	// BuildTimeNs is the wall-clock time the hash table build took.
+	// Merged by MAXIMUM across re-Opens, same as the geometry fields.
+	// PG's Hash node (a separate plan node under the Hash Join) carries
+	// this implicitly as its (actual time=…) line; goopg has no Hash
+	// node, so the measurement hangs here. M0128-P2.1.
+	BuildTimeNs int64
 }
 
 // hashJoinStat returns the instrumentation sink for one hash-join plan node,

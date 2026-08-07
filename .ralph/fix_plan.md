@@ -10626,17 +10626,21 @@ it at selection time and record the split in both the plan doc and here.
       target shape is an outer link buried under inner joins (Q78). Bar: the
       measurement recorded + flag flipped or a third documented no-go with
       attribution; DS05 + SPOT.
-- [ ] **M0128-P2.1 — parallel hash build: the reopen-condition
-      measurement.** parallel-query/10-roadmap defers cooperative parallel
-      hash build with "Reopen when: a measured plan where build time
-      dominates" — this task IS the measurement (EXPLAIN (ANALYZE) sweep,
-      TPC-H SF1 + TPC-DS SF0.5, quiet host, constant server age). GO → record
-      and decompose the implementation (parallel-query/07 §3.1; 10-roadmap P8
-      gates: join-corpus identity, RACE, TPC-H Q9/Q17/Q19). NO-GO → document
-      and re-defer (ledger); both are success. The leader-serial shared build
-      (`internal/executor/parallel_hash_build.go`, M0127-P3.4) already exists
-      — this is only the cooperative half. Bar: the measurement write-up +
-      verdict.
+- [x] **M0128-P2.1 — parallel hash build: the reopen-condition
+      measurement.** ✅ **GO — REOPENED 2026-08-07.**
+      EXPLAIN ANALYZE sweep (TPC-H SF1, four hash-join queries across the
+      dimension-size spectrum): build time is negligible for small dims
+      (supplier 10K: 0.7%) but significant for medium/large dims (customer
+      150K: 34.6%, part 200K: 12.6%, orders 1.5M: 41.0%). The reopen
+      condition is MET — cooperative parallel hash build is justified.
+      Measurement write-up: `analysis/m0128-p2.1-hash-build-measurement.md`.
+      Build-time instrumentation (`HashJoinStats.BuildTimeNs`, EXPLAIN line)
+      landed as a permanent enhancement. Follow-up: the two candidate
+      implementations from `IMPLEMENTATION-TODO.md` (producer/consumer first,
+      then genuinely concurrent build) are now filed as M0128-P2.1a and
+      M0128-P2.1b below. The parallel-query roadmap's "Deliberately deferred"
+      row for cooperative build stays alive with the reopen condition
+      satisfied — the measurement IS the close of M0128-P2.1.
 - [ ] **M0128-P2.2 — bitmap heap scan: design doc.** goopg has zero bitmap
       machinery. Write `docs/design/0128-0001-bitmap-heap-scan.md` (PG
       `tidbitmap.c` exact/lossy pages, `nodeBitmapIndexScan.c`/

@@ -198,16 +198,27 @@ func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 //
 // kB rounds UP, PG's BYTES_TO_KILOBYTES.
 func formatHashJoinInfoLine(hs *HashJoinStats) string {
-	if hs == nil || hs.NBatch <= 0 {
+	if hs == nil {
 		return ""
 	}
-	kb := (hs.SpacePeak + 1023) / 1024
-	if hs.NBatch != hs.OrigNBatch || hs.NBuckets != hs.OrigNBuckets {
-		return fmt.Sprintf("Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %dkB",
-			hs.NBuckets, hs.OrigNBuckets, hs.NBatch, hs.OrigNBatch, kb)
+	if hs.NBatch <= 0 && hs.BuildTimeNs <= 0 {
+		return ""
 	}
-	return fmt.Sprintf("Buckets: %d  Batches: %d  Memory Usage: %dkB",
-		hs.NBuckets, hs.NBatch, kb)
+	var parts []string
+	if hs.NBatch > 0 {
+		kb := (hs.SpacePeak + 1023) / 1024
+		if hs.NBatch != hs.OrigNBatch || hs.NBuckets != hs.OrigNBuckets {
+			parts = append(parts, fmt.Sprintf("Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %dkB",
+				hs.NBuckets, hs.OrigNBuckets, hs.NBatch, hs.OrigNBatch, kb))
+		} else {
+			parts = append(parts, fmt.Sprintf("Buckets: %d  Batches: %d  Memory Usage: %dkB",
+				hs.NBuckets, hs.NBatch, kb))
+		}
+	}
+	if hs.BuildTimeNs > 0 {
+		parts = append(parts, fmt.Sprintf("Build Time: %.3f ms", float64(hs.BuildTimeNs)/1e6))
+	}
+	return strings.Join(parts, "  ")
 }
 
 func formatBuffersLine(s *nodeStats) string {
