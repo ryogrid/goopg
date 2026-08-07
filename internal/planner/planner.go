@@ -1994,7 +1994,10 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
-	rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	// M0128-P4.1: reduce outer joins before deconstruction so that
+		// demoted joins enter the joinlist as plain INNER joins.
+		reduceOuterJoins(s.FromExprs, s.Where)
+		rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
 	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil
 }

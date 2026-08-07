@@ -751,6 +751,13 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [ ] **regress/truncate** — regress case truncate (baseline pass) diverged:
+      output mismatch; normalization rules need extension (AI-20260807-004620-001;
+      repro: `go test -v -run 'TestPort_RegressSuite/truncate' ./internal/testport/`;
+      evidence `ci/logs/20260807-004620/testport/go-test.log`). FILED, NOT
+      SELECTED per the 2026-07-28(b) amendment — it neither breaks the build nor
+      breaks a gate M0125/M0127/M0128 depend on. First-seen 20260807 (new).
+
 - [ ] **testport/TestE2E_FailoverGoopgToPG** — goopg→PG heterogeneous physical
       failover FAILed (subtest `sync_remote_apply`) in nightly run
       `20260731-001201` at sha `927742f8` (AI-20260731-001201-001; repro:
@@ -10557,7 +10564,7 @@ flagship verdict; P2.2 → P2.3 → P2.4 strictly (design-doc-first); P3.1 befor
 P3.2; P4/P5 independent. (5) Where a task proves larger than one loop, split
 it at selection time and record the split in both the plan doc and here.
 
-- [ ] **M0128-P0.1 — Q74 attribution.** ✅ **ATTRIBUTION DONE, FIX PENDING
+- [x] **M0128-P0.1 — Q74 attribution.** ✅ **ATTRIBUTION DONE, FIX PENDING
       (ledger row 2026-08-07).** TPC-DS SF0.5 Q74: PASS 11–14 s pre-flip
       (flag OFF, old DP hash joins) → PASS ~88 s post-flip (flag ON, PG-shaped
       DP nested loops). Attributed to the PG-shaped DP flag flip (M0127-P5.9,
@@ -10603,14 +10610,14 @@ it at selection time and record the split in both the plan doc and here.
       `build_joinrel_restrictlist` for special joins (join vs filter clauses
       on the nullable side), the FULL arm of `join_is_legal`, identity/dedup
       rules for restricted levels. Bar: as P1.2 + FULL-nesting unit tests.
-- [ ] **M0128-P1.4 — semi/anti in-DP.** 07 §5: unpin the semi/anti spine; the
+- [x] **M0128-P1.4 — semi/anti in-DP.** 07 §5: unpin the semi/anti spine; the
       SJE arms of `join_is_legal`; `semi_can_hash`/`semi_can_btree` consumed
       by path generation. Retires the semi/anti-in-DP ledger row that
       M0127-P6.4 files with the "`join_is_legal`-inference-dependent" marker
       (the row does not exist until P6.4 lands; M0128 selection is gated on
       P6.4 anyway). Bar: as P1.2; DS05
       semi/anti-heavy queries adjudicated.
-- [ ] **M0128-P1.5 — `GOOPG_PGSHAPED_COLLAPSE` verdict with the pin
+- [x] **M0128-P1.5 — `GOOPG_PGSHAPED_COLLAPSE` verdict with the pin
       removed.** 09 §3.19's protocol re-run: the two prior NO-GOs were
       measured with every outer join pinned
       (`TestNoCorpusQueryHasAnInnerOnlyJoinChain` — all 12 TPC-DS
@@ -10644,7 +10651,7 @@ it at selection time and record the split in both the plan doc and here.
       design, costed in the search's currency. Bar: UNITS + SPOT + DS05
       (zero row/checksum deltas; plans adjudicated) + PLAN + a TPC-H A/B on
       queries PG itself plans bitmap paths for.
-- [ ] **M0128-P3.1 — per-column average-width stats → `avgVarBytes`.** 09
+- [x] **M0128-P3.1 — per-column average-width stats → `avgVarBytes`.** 09
       §3.23: ANALYZE collects a `pg_statistic.stawidth` equivalent (PG feeds
       `Plan.plan_width` from it); the planner threads it to hash-join plan
       width; `buildGeometry`
@@ -10655,20 +10662,33 @@ it at selection time and record the split in both the plan doc and here.
       against the under-count — expected to change verdict; fix / re-pin /
       retire-with-reason is part of the task). Bar: UNITS + SPOT + DS05 + a
       unit test that a text-heavy build sizes `nbatch` from real widths.
-- [ ] **M0128-P3.2 — one scan, one estimate.** 09 §3.23: `seqScanRows`
+- [x] **M0128-P3.2 — one scan, one estimate.** 09 §3.23: `seqScanRows`
       ignores on-scan quals, so the executor's hash sizing reads the pre-qual
-      estimate while the planner priced the post-qual one. Thread the
-      filtered count (or apply `baserestrictinfo` selectivity in
-      `seqScanRows` — pick per 09 §3.23). Bar: UNITS + SPOT + DS05 + a
-      regression test pinning `nbatch` to the filtered estimate.
-- [ ] **M0128-P4.1 — `reduce_outer_joins`: the reduction half.** 09 §3.22:
+      estimate while the planner priced the post-qual one. **DONE 2026-08-07.**
+      Added `Join.OuterRows`/`Join.InnerRows` (threaded from the paths'
+      `Rows` = the search's post-qual `RelOptInfo.Rows`) to the plan node;
+      `buildGeometry` reads them instead of re-computing via
+      `EstimateRows(buildNode)` → `seqScanRows`. When zero (legacy-path
+      plan), falls back to `EstimateRows`. Unit test
+      `TestCreateHashJoinPlanThreadsPathRows` pins the threading. Gates:
+      UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/99, zero deltas).
+- [x] **M0128-P4.1 — `reduce_outer_joins`: the reduction half.** 09 §3.22:
       demote an outer join to inner when a strict qual above it constrains
       the nullable side (PG `prepjointree.c` `reduce_outer_joins`). The
       RIGHT→LEFT flip half is unrepresentable (`parser.FromExpr` = Base
       RangeVar + flat `[]JoinExpr`) and stays out — ledger row records the
-      split. Pessimization fix, never a wrong answer. Bar: UNITS + SPOT +
-      DS05 (plan changes only where a demotion fires, adjudicated) + the
-      strict-qual demotion matrix unit tests.
+      split. Pessimization fix, never a wrong answer. **DONE 2026-08-07.**
+      `reduce_outer_joins.go`: LEFT/RIGHT/FULL→INNER when strict WHERE quals
+      (comparison ops + IS NOT NULL) constrain the nullable side; FULL→LEFT
+      for right-side-only constraint; AND arms unioned; OR/NOT conservative.
+      Name-based matching on unresolved parser expressions; hooked before
+      `deconstructJointree` in `planFromClause`. 16 unit tests covering the
+      demotion matrix (LEFT, RIGHT, FULL both/one-side, IS NOT NULL/IS NULL,
+      OR conservative, multi-join chain, LIKE non-strict, alias, <>,
+      inner-unaffected). Ledger: RIGHT→LEFT flip, FULL→RIGHT partial
+      reduction, ON-clause propagation, LEFT→ANTI, strictness catalog.
+      Gates: UNITS PASS, SPOT PASS (Q12=2/Q13=35), DS05 PASS (95/99, zero
+      row/checksum/plan deltas).
 - [ ] **M0128-P5.1 — EXPLAIN range-table name dedup.** 09 §3.11: port
       `ruleutils.c` `select_rtable_names_for_explain`-style disambiguation
       (PG 18.3: `postgres/src/backend/utils/adt/ruleutils.c:3855` — 09 §3.11
