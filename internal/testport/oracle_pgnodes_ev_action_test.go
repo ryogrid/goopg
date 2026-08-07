@@ -138,6 +138,14 @@ var evActionOracleCases = []evActionOracleCase{
 	{"v11_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS DISTINCT FROM NULL"},
 	{"v12_not_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM NULL"},
 	{"v13_simple_case_var_operand", "SELECT client, src FROM bench_log WHERE CASE client WHEN 5 THEN true ELSE false END"},
+	// v14–v18: operator-driven implicit coercion (M0123-S4 REMAINING #1).
+	// A string literal on one side of a comparison coerces to the typed column's
+	// type via foldStringLiteralConst (PG's unknown-type resolution at parse time).
+	{"v14_timestamptz_coerce", "SELECT client, src FROM bench_log WHERE taken > '2024-01-01 00:00:00+00'"},
+	{"v15_int2_coerce", "SELECT client, src FROM bench_log WHERE priority = '5'"},
+	{"v16_numeric_coerce", "SELECT client, src FROM bench_log WHERE score > '3.14'"},
+	{"v17_date_coerce", "SELECT client, src FROM bench_log WHERE registered = '2024-03-15'"},
+	{"v18_timestamptz_coerce_left", "SELECT client, src FROM bench_log WHERE '2024-01-01 00:00:00+00' < taken"},
 }
 
 // TestOraclePgnodesEvActionBytesMatchPG is the M0123-S4 byte-diff oracle for the
@@ -166,7 +174,7 @@ func TestOraclePgnodesEvActionBytesMatchPG(t *testing.T) {
 
 	// Shared base relation for every view case.
 	c.Exec(t, "DROP TABLE IF EXISTS bench_log CASCADE")
-	c.Exec(t, "CREATE TABLE bench_log(client int, src text)")
+	c.Exec(t, "CREATE TABLE bench_log(client int, src text, taken timestamptz, priority int2, score numeric, registered date)")
 
 	resolver := liveRelationResolver{t: t, c: c}
 

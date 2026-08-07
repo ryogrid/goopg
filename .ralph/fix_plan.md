@@ -5849,7 +5849,7 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       `AI-20260806-011323-001`, proved byte-identical at HEAD without this
       change); `TestPort_RegressSuite` green; `tpch-spotcheck` Q12=2/Q13=35;
       TPC-DS SF0.5 plan channel `queries=99 same=99 changed=0`.
-- [ ] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
+- [x] **M0125-0041 — C3's second half: a correlated SCALAR-aggregate subquery is
       re-evaluated per outer row** **[→ M0127: residual absorbed 2026-08-03]**
       — the decorrelation root cause is fixed (loop #14); the remaining factor
       is C1 = the `Nested Loop (CROSS)` shape, which M0127's P5 DP is the
@@ -5928,6 +5928,12 @@ arm B is. M0125-0002's gate budget alone is ~12–20 h.
       ERROR=0 TIMEOUT=6 SKIP=4 with **all 99 cells identical in status, rows and
       checksum** to the pre-change baseline; TPC-H plan A/B 0/22;
       `tpch-spotcheck` PASS (Q12=2 Q13=35); units gate PASS.
+      **↳ CLOSED 2026-08-08 — acceptance MET by M0125-0034's join-order arm.**
+      M0125-0034 loop #15 measured Q30 TIMEOUT → PASS 1 s, 31 rows,
+      ck=f47a48499fd7e070 (the exact acceptance criteria). Confirmed still PASS in
+      sweep-20260808-011700.txt: `Q30 PASS 3s 31 rows ck=f47a48499fd7e070`. The
+      root cause (CTEScan clone, loop #14) + C1 Cartesian fix (M0125-0034, loop
+      #15) together satisfy this item; the C1 residual was absorbed into M0127-P5.
 
 - [x] **M0125-0042 — two OR-ed uncorrelated `IN (subquery)` sublinks over-match
       under a SEMI join over an MHJ** (filed 2026-07-31 by `M0125-0036`, found
@@ -12200,7 +12206,13 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       case_test.go: 3 live PG18.3 goldens (int4+float4, numeric+float4, multi-arm
       3-family) + codec + rebuild round-trip; degrade case float4_common_no_float8
       removed. Design 0123-0005 §"Deferred".
-      REMAINING: operator-driven view-qual coercion (unblocks int2/timestamptz
-      literals inside a view WHERE); other length types (`varchar(N)`=CoerceViaIO,
-      `timestamp(N)`, `bit(N)`); broader date input forms (`infinity`, BC years,
+      SUB-SLICE 33 LANDED (2026-08-08): operator-driven view-qual coercion.
+      queryScope.resolveExpr's BinaryOp handler now calls coerceUnknownForOp after
+      resolving both operands: if one is a typed column and the other an OidText
+      Const (from a string literal), foldStringConstToType re-folds it to the typed
+      column's type. Every type foldStringLiteralConst supports (timestamptz, int2,
+      numeric, date, bool, float4, float8, oid) now coerces in view WHERE clauses.
+      5 new oracle ev_action goldens (v14–v18) byte-identical to PG18.3.
+      REMAINING: other length types (`varchar(N)`=CoerceViaIO, `timestamp(N)`,
+      `bit(N)`); broader date input forms (`infinity`, BC years,
       DateStyle-dependent).

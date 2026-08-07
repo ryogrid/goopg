@@ -1715,10 +1715,16 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   and the **view `ev_action` (`pg_rewrite`) path** (see the two oracle sections
   above); the view oracle's `liveRelationResolver` answers base-table column
   metadata from the live PG18 catalog.
-- Operator-driven implicit coercion in view quals (which would let a
-  `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
-  is also still SQL-text — only the exact scalar-column DEFAULT context folds a
-  `timestamptz`/numeric literal.
+- ~~Operator-driven implicit coercion in view quals~~ **LANDED 2026-08-08
+  (sub-slice 33).** `queryScope.resolveExpr`'s `BinaryOp` handler now calls
+  `coerceUnknownForOp` after resolving both operands: if one operand is a typed
+  column reference (not OidText) and the other is an OidText `Const` (from a
+  string literal), `foldStringConstToType` re-folds the text to the typed
+  operand's type via `foldStringLiteralConst`. This lets a
+  `timestamptz`/`int2`/`numeric`/`date` string literal resolve inside a view
+  `WHERE` — every type `foldStringLiteralConst` already supported for column
+  DEFAULTs now works for view-qual comparisons too. Oracle gate: 5 new ev_action
+  goldens (v14–v18) byte-identical to PG18.3.
 - **`::numeric(p,s)` on a typmod-mismatched column** (sub-slices 22–25): the
   `RelabelType` re-label that `coerce_type_typmod` emits when a column's typmod differs
   from the cast's is now in the IR — sub-slice 23 handles a `numeric(p',s')` mismatch
