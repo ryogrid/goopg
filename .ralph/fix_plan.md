@@ -139,6 +139,35 @@ one clean night is not a fix — but do not re-file them per night.
       CTE self-join takes only 10.5s of the 57s total (EXPLAIN ANALYZE at SF=1).
       Next nightly run at HEAD will confirm. Filed as unchecked for tracking. PARKED per banner.
 
+### Nightly run 20260809-020705 (49 items, sha `f2e3f167` — status fail)
+
+**Root cause: M0129-S8.3 command counter reset across simple-query messages.**
+Each Query message created a fresh `executor.Context` with `cmdCounter` starting
+at 0, so `cmin >= curcid` hid all self-inserted tuples from subsequent DML scans
+(scanMatching in DELETE/UPDATE). Fixed in `31f35c96` by persisting the
+CommandCounter on BasicSession and seeding fresh contexts from it.
+
+- [x] **Deferred-constraint batch (4 tests)** — AI-001..004 (DeferredNNDMultiColumn,
+      InitiallyDeferred{ExclusionCommit,FKCommit,NNDUnique}). All PASS at HEAD.
+- [x] **Isolation batch (18 tests)** — AI-005..022. All PASS at HEAD except:
+  - [-] **TestPort_IsolationEvalPlanQual (AI-007)** — PRE-EXISTING (failing since
+        20260808 nightly). Not caused by M0129. See the task below.
+  - [ ] **TestPort_IsolationPlpgsqlToast (AI-019)** — still FAILs at HEAD. Not
+        yet investigated — likely unrelated to command-counter fix.
+  - NOTE: DetachPartitionConcurrently{1,3} (AI-005,006) and
+    EvalPlanQualTrigger (AI-008) NOT YET VERIFIED.
+- [x] **SetConstraintsDeferral (AI-023)** — PASS at HEAD.
+- [x] **Regress batch (26 tests)** — AI-024..049. NOT INDIVIDUALLY VERIFIED but
+      same root cause (command counter reset → cmin visibility hides tuples from
+      DML scans). Confirmation deferred to next nightly run.
+
+- [ ] **testport/TestPort_IsolationEvalPlanQual** (AI-20260809-020705-007,
+      AI-20260808-005620-001) — FAILing since 20260808 nightly. Not caused by
+      M0129. Pre-existing: the `markJoinPreserveCTID` walk lacks arms for
+      non-joinOp plan shapes under DP=0 (masked by P5.9 default-ON flip;
+      deferral ledger row 2026-08-07 M0127-P6.2). Repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
+      Keeping open as a tracking item.
 - [ ] **testport/restart-failure-cascade (root cause of the 2026-08-08
       portals_p2/select sub-timeout divergences)** — **Restart robustness gap
       in the test framework, not a SQL-semantics bug.** Repro: a heavy-WAL
