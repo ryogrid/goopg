@@ -73,6 +73,8 @@ func planWorkerQuery(t *testing.T, ctx *Context, sql string) planner.Node {
 // every row but the last.
 func drainWorkerTree(t *testing.T, ctx *Context, node planner.Node) ([]Row, []*joinOp) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	op, err := BuildWorker(node)
 	if err != nil {
 		t.Fatalf("BuildWorker: %v", err)
@@ -224,6 +226,8 @@ func TestJoinSeamWorkerTransferIndependence(t *testing.T) {
 // it off is what forces EVERY row through the worker transfer path.
 func runSeamGathered(t *testing.T, ctx *Context, sql string, workers int, leaderParticipation bool) ([]string, bool) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	node := planWorkerQuery(t, ctx, sql)
 	gathered := planner.MaybeAddGather(node, planner.ParallelSettings{
 		MaxWorkersPerGather: workers,

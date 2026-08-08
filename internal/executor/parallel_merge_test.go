@@ -49,6 +49,8 @@ func gmFixture(t *testing.T) (*Context, func()) {
 // worker count, and returns the rendered rows IN ORDER.
 func runGatherMerge(t *testing.T, ctx *Context, sql string, workers int) []string {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse: %v", err)

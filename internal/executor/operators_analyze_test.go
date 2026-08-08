@@ -88,6 +88,8 @@ func TestAnalyzeRelationPopulatesStats(t *testing.T) {
 func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr, statsTarget int) (*Context, *catalog.TableStats) {
 	t.Helper()
 	ctx, cat, cleanup := newStorageFixture(t)
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	t.Cleanup(cleanup)
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 

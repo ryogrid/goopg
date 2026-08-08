@@ -210,6 +210,8 @@ func TestIsLiveForUniqueCheck_SelfXactDeleteIsDead(t *testing.T) {
 func uniqueCheckFixture(t *testing.T) (*Context, *catalog.Table, []catalog.Column, func()) {
 	t.Helper()
 	ctx, cat, cleanup := newStorageFixture(t)
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	idx, err := cat.CreateIndex(parser.ObjectName{Name: "items_id_pkey"}, tbl, []string{"id"}, true, "btree", true)
 	if err != nil {

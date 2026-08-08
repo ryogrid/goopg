@@ -49,6 +49,8 @@ func resetFixture(t *testing.T) (*Context, func()) {
 
 func buildFor(t *testing.T, ctx *Context, sql string) Operator {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
@@ -65,8 +67,10 @@ func buildFor(t *testing.T, ctx *Context, sql string) Operator {
 }
 
 // drainAll materializes every remaining row as its String()-ed Row.
-func drainAll(t *testing.T, op Operator) []string {
+func drainAll(t *testing.T, ctx *Context, op Operator) []string {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	var out []string
 	for {
 		slot, err := op.Next()
@@ -88,8 +92,10 @@ func drainAll(t *testing.T, op Operator) []string {
 	}
 }
 
-func drainN(t *testing.T, op Operator, n int) {
+func drainN(t *testing.T, ctx *Context, op Operator, n int) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	for i := 0; i < n; i++ {
 		if _, err := op.Next(); err != nil {
 			t.Fatalf("Next %d: %v", i, err)
@@ -145,14 +151,14 @@ func TestLimitOpDoubleOpenResets(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	first := drainAll(t, op)
+	first := drainAll(t, ctx, op)
 	if len(first) != 2 {
 		t.Fatalf("first pass: got %v, want 2 rows", first)
 	}
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
-	second := drainAll(t, op)
+	second := drainAll(t, ctx, op)
 	if !eqStrings(first, second) {
 		t.Fatalf("re-Open changed the limit window: first %v, second %v", first, second)
 	}
@@ -204,7 +210,7 @@ func TestLimitOpWithTiesDoubleOpenResets(t *testing.T) {
 		if err := lim.Open(ctx); err != nil {
 			t.Fatalf("pass %d Open: %v", pass, err)
 		}
-		got := drainAll(t, lim)
+		got := drainAll(t, ctx, lim)
 		if len(got) != 2 {
 			t.Fatalf("pass %d: got %v, want the 2 tied k=1 rows", pass, got)
 		}
@@ -236,7 +242,7 @@ func TestSeqScanDoubleOpenRewinds(t *testing.T) {
 	if sctx1 == nil {
 		t.Fatalf("first Open did not acquire an mctx arena")
 	}
-	first := drainAll(t, op)
+	first := drainAll(t, ctx, op)
 	if len(first) != 5 {
 		t.Fatalf("first pass: got %d rows, want 5", len(first))
 	}
@@ -249,7 +255,7 @@ func TestSeqScanDoubleOpenRewinds(t *testing.T) {
 	if scan.curBlock != 0 {
 		t.Fatalf("re-Open did not rewind: curBlock=%d", scan.curBlock)
 	}
-	second := drainAll(t, op)
+	second := drainAll(t, ctx, op)
 	if !eqStrings(first, second) {
 		t.Fatalf("rewound scan diverged: first %v, second %v", first, second)
 	}
@@ -276,14 +282,14 @@ func TestSeqScanPartialDrainReopen(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	drainN(t, op, 2) // leaves the scan mid-page, pin held
+	drainN(t, ctx, op, 2) // leaves the scan mid-page, pin held
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("re-Open after partial drain: %v", err)
 	}
 	if scan.pinned != nil || scan.activePage != nil {
 		t.Fatalf("re-Open left a stale page pin from the partial drain")
 	}
-	got := drainAll(t, op)
+	got := drainAll(t, ctx, op)
 	if len(got) != 5 {
 		t.Fatalf("post-rewind drain: got %d rows, want 5", len(got))
 	}
@@ -306,7 +312,7 @@ func TestSortCloseOpenRoundTripAfterPartialDrain(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	drainN(t, op, 1) // the EXISTS maxDrain=1 shape
+	drainN(t, ctx, op, 1) // the EXISTS maxDrain=1 shape
 	if err := op.Close(); err != nil {
 		t.Fatalf("Close after partial drain: %v", err)
 	}
@@ -316,7 +322,7 @@ func TestSortCloseOpenRoundTripAfterPartialDrain(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}
-	got := drainAll(t, op)
+	got := drainAll(t, ctx, op)
 	want := make([]string, 0, 5)
 	for _, n := range []int64{5, 4, 3, 2, 1} {
 		want = append(want, datumKey(NewIntDatum(n)))
@@ -345,14 +351,14 @@ func TestFilterIndexScanDoubleOpen(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	first := drainAll(t, op)
+	first := drainAll(t, ctx, op)
 	if len(first) != 1 {
 		t.Fatalf("first pass: got %v, want exactly the (2,20) row", first)
 	}
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
-	second := drainAll(t, op)
+	second := drainAll(t, ctx, op)
 	if !eqStrings(first, second) {
 		t.Fatalf("double Open diverged: first %v, second %v", first, second)
 	}

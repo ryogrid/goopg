@@ -34,6 +34,8 @@ func upsertSeed(t *testing.T, ctx *Context) (*catalog.Table, *catalog.Index) {
 // through.
 func runUpsertSQL(t *testing.T, ctx *Context, sql string) (rowsAffected int64) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
@@ -97,6 +99,8 @@ func TestUpsertNoConflictInsertsRow(t *testing.T) {
 	if rc != 1 {
 		t.Errorf("RowsAffected = %d, want 1", rc)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the upserted row.
+	advanceStmtCounter(ctx)
 	got := scanItems(t, ctx, tbl)
 	want := map[int64]string{1: "alpha", 2: "beta", 3: "gamma", 4: "delta"}
 	if len(got) != len(want) {
@@ -126,6 +130,8 @@ func TestUpsertConflictDoUpdate(t *testing.T) {
 	if rc != 1 {
 		t.Errorf("RowsAffected = %d, want 1", rc)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the DO UPDATE's new row.
+	advanceStmtCounter(ctx)
 	got := scanItems(t, ctx, tbl)
 	want := map[int64]string{1: "alpha", 2: "beta-replaced", 3: "gamma"}
 	if len(got) != len(want) {
@@ -254,6 +260,8 @@ func TestUpsertDoUpdateMixingExistingAndExcluded(t *testing.T) {
 	if rc != 1 {
 		t.Errorf("RowsAffected = %d, want 1", rc)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the DO UPDATE's new row.
+	advanceStmtCounter(ctx)
 	got := scanItems(t, ctx, tbl)
 	if got[2] != "beta/NEW" {
 		t.Errorf("got[2]=%q, want beta/NEW", got[2])
@@ -304,6 +312,8 @@ func TestUpsertConflictByConstraintName(t *testing.T) {
 	if rc != 1 {
 		t.Errorf("RowsAffected = %d, want 1", rc)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the DO UPDATE's new row.
+	advanceStmtCounter(ctx)
 	got := scanItems(t, ctx, tbl)
 	if got[2] != "beta-replaced" {
 		t.Errorf("constraint-name conflict not applied: got[2]=%q want beta-replaced", got[2])

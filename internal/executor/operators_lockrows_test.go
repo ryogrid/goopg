@@ -19,6 +19,8 @@ import (
 // FOR UPDATE doesn't change row shape) and any error.
 func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)

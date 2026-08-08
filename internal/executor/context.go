@@ -1638,12 +1638,20 @@ type Checkpointer interface {
 
 // NewContext builds a Context with sensible defaults: a fresh
 // timestamp and no bind parameters. Tests use this directly.
+//
+// M0129-S8.3: CmdID defaults to InvalidCommandId so callers that bypass
+// the dispatch-layer per-statement CommandCounterIncrement (raw
+// Build+Open+Next in tests, internal utility contexts) get pass-through
+// cmin/cmax visibility — cmin >= InvalidCommandId is never true for any
+// real command id. Callers that DO manage the command counter (dispatch,
+// advanceStmtCounter in test helpers) override CmdID on the first
+// GetCurrentCommandId(true) call.
 func NewContext() *Context {
 	// M0127-P3.3: every context that can run a query owns a spill-file
 	// registry from birth. Allocating here rather than lazily is what makes
 	// it safe to share with parallel workers — a lazily-installed registry
 	// would be a write to a field those workers read concurrently.
-	return &Context{Now: time.Now(), tempFiles: newTempFileRegistry()}
+	return &Context{Now: time.Now(), tempFiles: newTempFileRegistry(), CmdID: storage.InvalidCommandId}
 }
 
 // MaterializeWriterXID ensures the context's transaction has a real

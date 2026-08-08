@@ -80,6 +80,8 @@ $$`)
 // runQueryExpectErr runs a query and returns any error from plan/build/open/drain
 // without failing the test (used to assert an expected runtime error).
 func runQueryExpectErr(ctx *Context, sql string) error {
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return err

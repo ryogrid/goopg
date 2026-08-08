@@ -30,6 +30,8 @@ import (
 // plus the type the planner advertises for it.
 func byteaExprResult(t *testing.T, ctx *Context, sql string) (Datum, string) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
@@ -64,6 +66,8 @@ func byteaExprResult(t *testing.T, ctx *Context, sql string) (Datum, string) {
 // byteaExprErr runs a query expected to fail and returns the ExecError.
 func byteaExprErr(t *testing.T, ctx *Context, sql string) *ExecError {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)

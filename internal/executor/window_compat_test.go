@@ -635,6 +635,10 @@ func TestCompatWindowNtileInvalidArgument(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// M0129-S8.3: advance the command counter so the window scan sees the seeded row
+	// and ntile(0) is evaluated (total > 0), raising 22014.
+	advanceStmtCounter(ctx)
+
 	sql := "SELECT val, ntile(0) OVER (ORDER BY val) FROM t"
 	stmts, err := parser.Parse(sql)
 	if err != nil {

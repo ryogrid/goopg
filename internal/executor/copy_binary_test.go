@@ -133,6 +133,9 @@ func TestCopyBinaryRoundTripViaExecutor(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
 
+	// M0129-S8.3: advance the command counter so RunCopyTo sees the seed rows.
+	advanceStmtCounter(ctx)
+
 	plan := &planner.Copy{
 		Direction:   planner.CopyTo,
 		Table:       tbl,
