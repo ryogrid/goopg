@@ -146,8 +146,16 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 		effXmax = upd
 	}
 
-	// Deleted by our own transaction: invisible.
+	// Deleted by our own transaction: visibility depends on
+	// whether the delete happened before or after the scan's
+	// command counter (mirrors PG's HeapTupleSatisfiesMVCC).
+	// cmax >= curcid → pre-image visible.
+	// cmax <  curcid → invisible (deleted by earlier command).
 	if effXmax == currentXID {
+		cmax := GetCmax(h, combo)
+		if cmax >= curcid {
+			return true
+		}
 		return false
 	}
 	// M0115-0002: hint-bit read for xmax.

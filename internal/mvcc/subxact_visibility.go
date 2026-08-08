@@ -364,7 +364,11 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	}
 
 	if isCurrentTxXID(effXmax, currentXID, r) {
-		return false
+		cmax := GetCmax(h, combo)
+		if cmax >= curcid {
+			return true // deleted by later command — pre-image visible
+		}
+		return false // deleted by earlier command — gone
 	}
 	// M0115-0002: hint-bit read for xmax.
 	if h.Infomask&storage.HeapXmaxInvalid != 0 {

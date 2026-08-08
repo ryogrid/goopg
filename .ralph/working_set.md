@@ -1,38 +1,52 @@
-Task: M-NIGHTLY AI-019 PlpgsqlToast — FIXED (command counter per-statement advance).
+Task: M-NIGHTLY AI-007 EvalPlanQual — partial fix (delwctefail ERROR now fires; updwctefail still missing)
 
 Files:
-- internal/executor/plpgsql_runtime.go: `executePLpgSQLStmtList` — added
-  `routineCommandCounterIncrement(ctx, r)` after each statement so subsequent
-  statements see prior writes (mirrors PG's SPI per-statement increment).
-- internal/executor/operators_ddl.go: `execDoBlock` — added initial
-  `routineCommandCounterIncrement(o.ctx, r)` before executing the statement
-  list (mirrors the same call in `executePLpgSQLRoutine`).
+- internal/mvcc/visibility.go: `TupleVisible` — fixed xmax==currentXID check:
+  cmax >= curcid → pre-image visible (was: unconditionally invisible).
+  Matches PG's HeapTupleSatisfiesMVCC.
+- internal/mvcc/subxact_visibility.go: `TupleVisibleSubxact` — same fix for
+  the subxact-aware variant.
+- internal/executor/operators_storage.go: `deleteWithUsing` — added
+  TM_SelfModified check inside the EPQ chain-following path (truncated
+  comment site at ~L6509). After epqFollowHOT/epqFollowChain resolves the
+  new slot, re-pins and checks cmax against curcid. Different CID →
+  errTupleAlreadyModified("deleted"); same CID → epqSkipDel.
 
-Key symbols: executePLpgSQLStmtList, execDoBlock, routineCommandCounterIncrement,
-  CommandCounter, executePLpgSQLRoutine
+Key symbols: TupleVisible, TupleVisibleSubxact, deleteWithUsing,
+  errTupleAlreadyModified, GetCmax
 
 Hypothesis/Findings:
-- Root cause: `routineCommandCounterIncrement` was called only once at routine
-  entry, not after each embedded SQL statement. INSERTs within the same DO block
-  stamped tuples with cmin == curcid, making them invisible to subsequent FOR
-  loop SELECT (cmin >= curcid → hidden). Only pre-existing rows from prior
-  transactions were visible. The FOR loop iterated 1 time instead of 3.
-- PG advances the command counter through SPI after EVERY statement of a volatile
-  routine (postquel_getnext in functions.c).
-- Fix verified: PlpgsqlToast PASS, executor suite PASS, TPC-H spotcheck PASS
-  (Q12=2, Q13=35), pre-commit pgbench smoke PASS (0 failed, all 3 workloads).
+- Root cause (visibility): TupleVisible unconditionally returned false for
+  xmax==currentXID, hiding the pre-image that PG shows (cmax >= curcid →
+  visible). The DELETE's scanMatching never collected the checking row
+  because every version was invisible.
+- Root cause (missing TM_SelfModified): the EPQ chain-following code had a
+  truncated comment "// TM_SelfModified guard: the chain can lead into a
+  version a" — the check was never implemented. After following the EPQ
+  chain to our own transaction's version, the code went straight to
+  predicate re-evaluation without checking whether a different sub-command
+  (function call from CTE RETURNING) had stamped a different cmax.
+- updateWithFrom (updwctefail) needs the same fix but the insertion point
+  is different (no epqRetry loop; the check goes after the re-pin before
+  stamping). Attempted twice but caused regression in line count — needs
+  more careful placement.
+- The parser defaults CREATE FUNCTION to Volatile="v", so
+  inferSQLFunctionVolatility is never called for typical user functions.
+  The command counter DOES advance for function calls — confirmed via
+  server log showing cmax values differing from curcid.
 
-Next step: Investigate EvalPlanQual (AI-007) — the only remaining M-NIGHTLY
-  engine failure. Pre-existing `markJoinPreserveCTID` walk lacks arms for
-  non-joinOp plan shapes under DP=0 (deferral ledger row 2026-08-07 M0127-P6.2).
+Next step: Add TM_SelfModified check to updateWithFrom EPQ path (after
+  isConcurrentlyUpdated else branch + re-pin, before oldTupleBytes).
+  Then verify both delwctefail and updwctefail permutations raise errors.
 
 Gates run:
-- `go build ./...`: PASS
-- `go test ./internal/executor/...`: PASS (6.080s, all cached)
-- PlpgsqlToast repro: PASS (4.25s)
+- `go build ./internal/executor/... ./internal/mvcc/...`: PASS
+- `go test ./internal/executor/...`: PASS (6.018s)
+- EvalPlanQual repro: improved 1458→1462 lines (delwctefail now errors)
+  but still FAIL (1462 vs 1468 expected; updwctefail still missing)
 - `scripts/tpch-spotcheck.sh`: PASS (Q12=2, Q13=35)
 - `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`: PASS
-  (0 failed, all 3 workloads: TPC-B 395 tps, simple-update 418 tps, select-only 12303 tps)
-- `make ralph-state-guard`: PENDING (run below)
+  (0 failed, all 3 workloads)
+- `make ralph-state-guard`: REPAIRED (consistent after repair)
 
 In-flight: none

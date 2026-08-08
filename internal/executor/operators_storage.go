@@ -6506,7 +6506,29 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 					epqSkipDel = true
 					break
 				}
-				// TM_SelfModified guard: the chain can lead into a version a
+				// TM_SelfModified guard: the EPQ chain can lead into a
+				// version our own transaction wrote through a different
+				// sub-command (e.g. a function called from a CTE's
+				// RETURNING clause). Re-pin at the new slot and check cmax.
+				// Different CID → error; same CID → skip silently.
+				if tms, tmsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: vRel, Block: newBlk}); tmsErr == nil {
+					tms.RLock()
+					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
+						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
+							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							tms.RUnlock()
+							o.ctx.Pool.Unpin(tms)
+							if cmax != o.ctx.CmdID {
+								return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+							}
+							// Same CID: TM_SelfModified — skip silently.
+							epqSkipDel = true
+							break
+						}
+					}
+					tms.RUnlock()
+					o.ctx.Pool.Unpin(tms)
+				}
 				// Re-evaluate USING join predicate against new row + USING portion.
 				if o.plan.UsingPred != nil {
 					epqCombined := append(append(Row(nil), newRow...), v.usingPortion...)
