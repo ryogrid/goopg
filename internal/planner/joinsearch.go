@@ -343,6 +343,18 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// The column count the hash geometry is solved for, from the same
 		// schema the executor will call len() on (M0127-P5.7-a).
 		rel.NCols = len(leaf.Output())
+		// AvgVarBytes: sum the per-column AvgWidth from ANALYZE stats
+		// across every column of this relation. Zero when the relation
+		// has never been ANALYZEd or is all-fixed-width — both are
+		// correct for hash sizing (M0128-P3.1).
+		ri := relInfos[i]
+		if ri.table != nil && ri.table.Stats != nil && len(ri.table.Stats.Columns) > 0 {
+			var sum float64
+			for _, cs := range ri.table.Stats.Columns {
+				sum += cs.AvgWidth
+			}
+			rel.AvgVarBytes = sum
+		}
 		// `rel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:211): a fast start is worth keeping paths for exactly when
 		// something will ask for a fraction (M0127-P5.7-b).

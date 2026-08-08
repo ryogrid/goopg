@@ -247,6 +247,10 @@ func joinTypeName(t parser.JoinType) string {
 		return "FULL"
 	case parser.JoinCross:
 		return "CROSS"
+	case parser.JoinSemi:
+		return "SEMI"
+	case parser.JoinAnti:
+		return "ANTI"
 	default:
 		return "unknown"
 	}

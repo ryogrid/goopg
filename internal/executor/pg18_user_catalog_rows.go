@@ -1339,7 +1339,7 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 		NewIntDatum(int64(attNum)),   // staattnum
 		NewBoolDatum(false),          // stainherit
 		NewStringDatum(nullFracStr),  // stanullfrac (float4 as varlena text)
-		NewIntDatum(8),               // stawidth (avg col width, placeholder)
+		NewIntDatum(int64(stats.AvgWidth + 0.5)), // stawidth (avg col width in bytes, M0128-P3.1)
 		NewStringDatum(distinctStr),  // stadistinct (float4 as varlena text)
 		NewIntDatum(int64(stakind1)), // stakind1
 		NewIntDatum(int64(stakind2)), // stakind2

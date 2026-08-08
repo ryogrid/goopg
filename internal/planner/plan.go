@@ -911,7 +911,25 @@ type Join struct {
 	// nextLazy/openLazyHashJoin special-case this flag instead of
 	// reusing the NOT-EXISTS-shaped default.
 	NullAware bool
-	schema    Schema
+	// AvgVarBytes is the average total variable-width payload of a build-side
+	// row, fed from the build relation's RelOptInfo.AvgVarBytes. Zero means
+	// "unknown" (no ANALYZE stats, or a fixed-width relation) and the geometry
+	// falls back to sizing by column count alone — which is what the hardcoded
+	// zero did before M0128-P3.1.
+	AvgVarBytes float64
+	// OuterRows / InnerRows are the join search's row-count estimates for the
+	// two sides, threaded from the paths' Rows (which are the post-qual
+	// RelOptInfo.Rows values the planner costed). Zero means the plan was not
+	// built through the PG-shaped search (legacy path), and geometry falls back
+	// to EstimateRows on the child node.
+	//
+	// M0128-P3.2: buildGeometry reads these instead of calling EstimateRows
+	// on the build-side child node, because EstimateRows dispatches to
+	// seqScanRows — which ignores on-scan quals — while the search's
+	// RelOptInfo.Rows has baserestrictinfo selectivity already applied (§3.23).
+	OuterRows float64
+	InnerRows float64
+	schema     Schema
 }
 
 func (n *Join) Pos() int { return n.pos }
@@ -1779,6 +1797,18 @@ type LockedRel struct {
 	// so the executor can merge EPQ-refetched values at the correct position
 	// even when the locked table is not the leftmost in the join (M0100-0010).
 	ColOffset int
+	// RowMarkId is a 1-based statement-local rowmark identifier (PG's
+	// rowmarkId). Assigned sequentially by resolveLockedRels. Used by the
+	// executor to locate the junk ctid column in the child row.
+	// M0128-P6.1 resjunk-ctid rowmark.
+	RowMarkId int
+	// CtidResno is the column index of the resjunk ctid attribute in the
+	// child plan's output row. Set at plan-build time when the ctid column
+	// is appended to the scan's schema; lockRowsOp reads the TID from the
+	// row at this position rather than from the walker/side-channel. -1
+	// when not yet wired (the executor falls back to the walker path).
+	// M0128-P6.1 resjunk-ctid rowmark.
+	CtidResno int
 }
 
 // LockRows is the upstream-shape wrapper that adds row-lock
@@ -1787,8 +1817,8 @@ type LockedRel struct {
 // LockRows at the top of the plan tree when the SELECT carries
 // any locking clause; pre-M0021 SELECTs never see this node.
 //
-// Output schema is the child's schema unchanged — locking is a
-// side effect on storage, not a row-shape transformation.
+// Output schema is the child's schema with resjunk ctid columns
+// stripped — callers see only the user-visible columns.
 type LockRows struct {
 	pos   int
 	Child Node
@@ -1805,10 +1835,30 @@ type LockRows struct {
 	// Limit was lifted (unbounded drain). M0118-0003.
 	LimitCount  Expr
 	OffsetCount Expr
+
+	// NumCtidCols is the number of resjunk ctid columns appended to the
+	// child's output (one per locked relation with a wired CtidResno).
+	// Output() strips these trailing columns so callers see only the
+	// user-visible projection. The executor trims the ctid columns from
+	// returned rows. M0128-P6.1 resjunk-ctid rowmark.
+	NumCtidCols int
 }
 
-func (n *LockRows) Pos() int       { return n.pos }
-func (n *LockRows) Output() Schema { return n.Child.Output() }
+func (n *LockRows) Pos() int { return n.pos }
+
+// Output returns the user-visible schema (child schema with trailing ctid
+// junk columns stripped). When no ctid columns are wired, this is identical
+// to Child.Output(). M0128-P6.1 resjunk-ctid rowmark.
+func (n *LockRows) Output() Schema {
+	if n.NumCtidCols == 0 {
+		return n.Child.Output()
+	}
+	child := n.Child.Output()
+	if n.NumCtidCols >= len(child) {
+		return Schema{}
+	}
+	return child[:len(child)-n.NumCtidCols]
+}
 
 // OnConflictAction enumerates the resolved conflict action — mirrors
 // the parser's parser.OnConflictAction enum, but the analyzer-only
@@ -2250,3 +2300,63 @@ type WorkTableScan struct {
 
 func (n *WorkTableScan) Pos() int       { return n.pos }
 func (n *WorkTableScan) Output() Schema { return n.schema }
+
+// BitmapIndexScan is a leaf node: scan one index and produce a TIDBitmap.
+// It is NEVER executed via the standard pull-model Next() — it is a
+// MultiExec-style whole-result producer called once by BitmapHeapScan.
+// (M0128-P2.3: P2.2 design doc §3.2)
+type BitmapIndexScan struct {
+	pos   int
+	Table *catalog.Table
+	Alias string
+	Index *catalog.Index
+	Key   Expr   // single-column equality (non-nil for equality scan)
+	Keys  []Expr // multi-column equality (Keys[i] binds Index.Columns[i])
+	// Pred is the full index condition (for recheck). When Key/Keys
+	// cover only a prefix, Pred holds the remaining index quals.
+	Pred   []Expr
+	schema Schema
+}
+
+func (n *BitmapIndexScan) Pos() int       { return n.pos }
+func (n *BitmapIndexScan) Output() Schema { return n.schema }
+
+// BitmapHeapScan reads a relation via a TID bitmap produced by its outer
+// (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
+// (M0128-P2.3: P2.2 design doc §3.2)
+type BitmapHeapScan struct {
+	pos   int
+	Table *catalog.Table
+	Alias string
+	// BitmapQual is the original index qual, re-evaluated per tuple when
+	// the bitmap entry is lossy or the index AM requires recheck.
+	BitmapQual []Expr
+	// Outer is the bitmap-producing subtree (BitmapIndexScan / BitmapAnd / BitmapOr).
+	Outer  Node
+	schema Schema
+}
+
+func (n *BitmapHeapScan) Pos() int       { return n.pos }
+func (n *BitmapHeapScan) Output() Schema { return n.schema }
+
+// BitmapAnd combines multiple bitmap sub-trees via intersection.
+// (M0128-P2.3: P2.2 design doc §3.2)
+type BitmapAnd struct {
+	pos    int
+	Inputs []Node // []*BitmapIndexScan or nested []*BitmapAnd/[]*BitmapOr
+	schema Schema
+}
+
+func (n *BitmapAnd) Pos() int       { return n.pos }
+func (n *BitmapAnd) Output() Schema { return n.schema }
+
+// BitmapOr combines multiple bitmap sub-trees via union.
+// (M0128-P2.3: P2.2 design doc §3.2)
+type BitmapOr struct {
+	pos    int
+	Inputs []Node
+	schema Schema
+}
+
+func (n *BitmapOr) Pos() int       { return n.pos }
+func (n *BitmapOr) Output() Schema { return n.schema }

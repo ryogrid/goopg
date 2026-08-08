@@ -278,6 +278,12 @@ type hashJoinInputs struct {
 	// pre-P5.7 behaviour. `relNCols` is the production source and never
 	// returns zero for a rel the search built.
 	outerCols, innerCols int
+
+	// outerAvgVarBytes / innerAvgVarBytes are the average total variable-width
+	// payload per row of each side — the `avgVarBytes` parameter of
+	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
+	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
+	outerAvgVarBytes, innerAvgVarBytes float64
 }
 
 // hashJoinCost reproduces initial_cost_hashjoin + final_cost_hashjoin
@@ -312,10 +318,11 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
-	sizing := hashsize.Choose(in.innerRows, in.innerCols, 0, cp.workMem)
+	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
+	sizing := hashsize.Choose(in.innerRows, in.innerCols, in.innerAvgVarBytes, cp.workMem)
 	if sizing.NBatch > 1 {
-		innerPages := spillPages(in.innerRows, in.innerCols)
-		outerPages := spillPages(in.outerRows, in.outerCols)
+		innerPages := spillPages(in.innerRows, in.innerCols, in.innerAvgVarBytes)
+		outerPages := spillPages(in.outerRows, in.outerCols, in.outerAvgVarBytes)
 		startup += cp.seqPageCost * innerPages
 		run += cp.seqPageCost * (innerPages + 2*outerPages)
 	}
@@ -336,11 +343,11 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 // is deliberate for now and it is the safe direction — it deters spilling — but
 // it is a real approximation and is recorded as such (deferral ledger
 // 2026-08-05 M0127-P5.7-a).
-func spillPages(rows float64, ncols int) float64 {
+func spillPages(rows float64, ncols int, avgVarBytes float64) float64 {
 	if !(rows > 0) {
 		return 0
 	}
-	return math.Ceil(rows * hashsize.EntryBytes(ncols, 0) / blockSizeBytes)
+	return math.Ceil(rows * hashsize.EntryBytes(ncols, avgVarBytes) / blockSizeBytes)
 }
 
 // nestloopCost reproduces final_cost_nestloop (costsize.c:3349): for each outer

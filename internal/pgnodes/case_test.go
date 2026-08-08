@@ -280,6 +280,31 @@ var caseGolden = []struct {
 		colType: OidInt4,
 		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 15 :opfuncid 852 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 10 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]} :location -1}`,
 	},
+	// float4-common CASE (sub-slice 32): the common type is float4 when at least
+	// one result is float4 and no float8 result is present. PG stores casetype 700
+	// with each narrower result wrapped in an implicit float4(...) FuncExpr
+	// (funcformat 2). Captured live from PG18.3 (table cf4):
+	//   d4 real DEFAULT (CASE WHEN (1=1) THEN 1 ELSE float4(2) END)
+	//   d5 real DEFAULT (CASE WHEN (1=1) THEN 1.5 ELSE float4(2.5) END)
+	//   d1 real DEFAULT (CASE WHEN (1=1) THEN 1.5 WHEN (2=2) THEN float4(20) ELSE 30 END)
+	{
+		name:    "crossfam_int4_float4_common",
+		sql:     "CASE WHEN (1=1) THEN 1 ELSE float4(2) END",
+		colType: OidFloat4,
+		want:    `{CASEEXPR :casetype 700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :location -1}`,
+	},
+	{
+		name:    "crossfam_numeric_float4_common",
+		sql:     "CASE WHEN (1=1) THEN 1.5 ELSE float4(2.5) END",
+		colType: OidFloat4,
+		want:    `{CASEEXPR :casetype 700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 1745 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 1 0 -120 19 ]}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 1745 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]}) :location -1} :location -1}`,
+	},
+	{
+		name:    "crossfam_multi_float4_common",
+		sql:     "CASE WHEN (1=1) THEN 1.5 WHEN (2=2) THEN float4(20) ELSE 30 END",
+		colType: OidFloat4,
+		want:    `{CASEEXPR :casetype 700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 1745 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 1 0 -120 19 ]}) :location -1} :location -1} {CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 30 0 0 0 0 0 0 0 ]}) :location -1} :location -1}`,
+	},
 }
 
 // TestCaseResolveMatchesGolden parses each SQL default and asserts
@@ -347,13 +372,9 @@ func TestCaseResolveRebuildRoundTrip(t *testing.T) {
 }
 
 // TestCaseDegradesGracefully covers the bounded-subset boundaries that remain
-// SQL text after sub-slice 16's unified cross-family coercion landed: a
-// collatable result type (text — would need a non-zero casecollid), and a
-// numeric-category mix whose PG common type is float4 (float4 present but NO
-// float8) — PG resolves that to a float4 CASE wrapped in an OUTER float8(float4)
-// column cast, which this subset does not model (no int/numeric->float4 arm, no
-// outer column cast). Each must NOT resolve to a canonical node, so the writer
-// keeps SQL text.
+// SQL text after sub-slice 32's float4-common coercion landed: a
+// collatable result type (text — would need a non-zero casecollid).
+// Each must NOT resolve to a canonical node, so the writer keeps SQL text.
 func TestCaseDegradesGracefully(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -361,7 +382,6 @@ func TestCaseDegradesGracefully(t *testing.T) {
 		colType uint32
 	}{
 		{"text_result", "CASE WHEN true THEN 'a' ELSE 'b' END", OidText},
-		{"float4_common_no_float8", "CASE WHEN (1=1) THEN 1.5 WHEN (2=2) THEN float4(20) ELSE 30 END", OidFloat8},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -45,6 +45,10 @@ type SpecialJoinInfo struct {
 // commutativity analysis and clause-strictness walk arrive in P1.2 when the
 // search actually consults these entries.
 //
+// M0128-P1.4: populates semi_can_hash/semi_can_btree optimistically from the
+// join qual's equality conjuncts. Per-operator checking (PG's
+// compute_semijoin_info, initsplan.c) is deferred — ledger row.
+//
 // left/right are the joinlists for the two sides, and joinQual is the ON/USING
 // clause (nil for NATURAL and comma joins — never called for those).
 func makeSpecialJoinInfo(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr) *SpecialJoinInfo {
@@ -76,7 +80,48 @@ func makeSpecialJoinInfo(jointype parser.JoinType, left, right joinlist, joinQua
 		sj.MinRighthand = sj.SynRighthand
 	}
 
+	// M0128-P1.4: populate semi fields for SEMI/ANTI joins. PG computes these
+	// in compute_semijoin_info (initsplan.c) by checking each equality
+	// operator against pg_am. Goopg sets both flags optimistically when the
+	// qual has equality conjuncts — the actual path generation gate
+	// (splitJoinClauses → op_hashjoinable) filters per-operator regardless, so
+	// an over-estimate here is harmless. Per-operator specificity is deferred
+	// (ledger: semi_can_hash/btree per-operator check).
+	if jointype == parser.JoinSemi || jointype == parser.JoinAnti {
+		sj.SemiCanBtree, sj.SemiCanHash = semiQualCapabilities(joinQual)
+	}
+
 	return sj
+}
+
+// semiQualCapabilities scans a join qual for equality operators and returns
+// whether the qual supports btree (merge) and hash join methods. P1.4:
+// optimistically returns true when any equality conjunct is found; per-operator
+// specificity (PG's compute_semijoin_info) is deferred.
+func semiQualCapabilities(qual parser.Expr) (canBtree bool, canHash bool) {
+	if qual == nil {
+		return false, false
+	}
+	if hasEqualityOperator(qual) {
+		return true, true
+	}
+	return false, false
+}
+
+// hasEqualityOperator walks a parser expression tree looking for an equality
+// operator (=), descending into both arms of AND/OR and BinaryOp.
+func hasEqualityOperator(e parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if x.Op == parser.OpEq {
+			return true
+		}
+		return hasEqualityOperator(x.Left) || hasEqualityOperator(x.Right)
+	}
+	return false
 }
 
 // joinlistRelSet returns the set of base-relation FROM-item indices covered by

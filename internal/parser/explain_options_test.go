@@ -83,9 +83,10 @@ func TestParseExplainParenAnalyzeBare(t *testing.T) {
 // via the parenthesised form. Pins the option-name dispatch
 // table.
 func TestParseExplainParenAllOptions(t *testing.T) {
-	es := parseExplainStmt(t, "EXPLAIN (ANALYZE, VERBOSE, COSTS, BUFFERS, SETTINGS, TIMING, SUMMARY) SELECT 1")
+	es := parseExplainStmt(t, "EXPLAIN (ANALYZE, VERBOSE, COSTS, BUFFERS, SETTINGS, TIMING, SUMMARY, GENERIC_PLAN, WAL, MEMORY) SELECT 1")
 	o := es.Options
-	if !o.Analyze || !o.Verbose || !o.Costs || !o.Buffers || !o.Settings || !o.Timing || !o.Summary {
+	if !o.Analyze || !o.Verbose || !o.Costs || !o.Buffers || !o.Settings || !o.Timing || !o.Summary ||
+		!o.GenericPlan || !o.Wal || !o.Memory {
 		t.Errorf("not all flags true: %+v", o)
 	}
 }
@@ -191,5 +192,43 @@ func TestParseExplainMultipleOptionsMixed(t *testing.T) {
 	}
 	if es.Options.Format != ExplainFormatJSON {
 		t.Error("Format should be JSON")
+	}
+}
+
+// TestParseExplainGenericPlan: GENERIC_PLAN is a PG 16+ option that
+// forces EXPLAIN to show the generic plan. Goopg parses it; the
+// executor shows a notice when no generic plan is available.
+func TestParseExplainGenericPlan(t *testing.T) {
+	for _, sql := range []string{
+		"EXPLAIN (GENERIC_PLAN) SELECT 1",
+		"EXPLAIN (GENERIC_PLAN on) SELECT 1",
+		"EXPLAIN (GENERIC_PLAN off) SELECT 1",
+	} {
+		es := parseExplainStmt(t, sql)
+		if !es.Options.Set.GenericPlan {
+			t.Errorf("%q: Set.GenericPlan=false, want true", sql)
+		}
+	}
+	es := parseExplainStmt(t, "EXPLAIN (GENERIC_PLAN off) SELECT 1")
+	if es.Options.GenericPlan {
+		t.Error("GENERIC_PLAN should be false with explicit off")
+	}
+}
+
+// TestParseExplainWal: WAL is a PG 14+ option that includes
+// WAL-record counts in EXPLAIN ANALYZE for DML statements.
+func TestParseExplainWal(t *testing.T) {
+	es := parseExplainStmt(t, "EXPLAIN (WAL) SELECT 1")
+	if !es.Options.Wal || !es.Options.Set.Wal {
+		t.Errorf("WAL=%v Set.Wal=%v, want both true", es.Options.Wal, es.Options.Set.Wal)
+	}
+}
+
+// TestParseExplainMemory: MEMORY is a PG 18 option that includes
+// per-node peak memory usage in EXPLAIN ANALYZE output.
+func TestParseExplainMemory(t *testing.T) {
+	es := parseExplainStmt(t, "EXPLAIN (MEMORY) SELECT 1")
+	if !es.Options.Memory || !es.Options.Set.Memory {
+		t.Errorf("Memory=%v Set.Memory=%v, want both true", es.Options.Memory, es.Options.Set.Memory)
 	}
 }

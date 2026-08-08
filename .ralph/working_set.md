@@ -1,30 +1,37 @@
-Task: M-NIGHTLY — regress/truncate nondeterministic FK-dependency ordering
-  (AI-20260807-004620-001). FIXED.
+Task: M0122-0003 — Add GENERIC_PLAN, WAL, MEMORY EXPLAIN options to parser
 
 Files:
-  - internal/executor/operators_ddl.go: `truncateTableEntry` (package-level type),
-    `sortedTruncateTableSet` (deterministic sort helper), moved `nameOrder`
-    declaration to function scope, replaced ALL `range tableSet` iterations
-    (FK check, CASCADE expansion, validation, locks, triggers, truncation,
-    stats, sequences) with `sortedTruncateTableSet(tableSet, nameOrder)`.
+  - internal/parser/ast.go: added GenericPlan, Wal, Memory fields to
+    ExplainOptions + ExplainOptionsSet
+  - internal/parser/parser.go: added cases for "generic_plan", "wal",
+    "memory" in parseExplainOneOption
+  - internal/parser/explain_options_test.go: updated AllOptions test,
+    added TestParseExplainGenericPlan/Wal/Memory
+  - internal/executor/operators_explain.go: GENERIC_PLAN notice when
+    no generic plan is available (matches PG behavior)
 
-Key symbols: truncateTableEntry, sortedTruncateTableSet, execTruncate
+Key symbols: ExplainOptions, ExplainOptionsSet, parseExplainOneOption,
+explainOp.Open
 
 Hypothesis/Findings:
-  - Root cause: `for _, entry := range tableSet` iterated over a Go map;
-    when multiple tables in the set each had FK references from outside
-    tables, which error fired first depended on map iteration order.
-  - Fix: sort entries in statement order (s.Names position), then
-    CASCADE-added tables by name — matches PG's range-table-order behavior.
-  - Also fixed the same nondeterminism in CASCADE partition expansion,
-    validation, lock acquisition, triggers, truncation, stats, and sequence
-    restart loops — all now deterministic.
+  - PG 18 supports GENERIC_PLAN, WAL, and MEMORY EXPLAIN options that
+    goopg rejected as "unknown EXPLAIN option"
+  - Parser change is the minimum viable improvement — tools that use
+    these options (e.g. EXPLAIN (GENERIC_PLAN)) no longer error
+  - GENERIC_PLAN gets a NOTICE "generic plan is not available" matching
+    PG's behavior when no plan cache entry exists
+  - WAL and MEMORY are parsed but produce no extra output yet —
+    executor tracking for WAL record counts and per-node memory is
+    deferred to follow-up loops
 
-Next step: Decide between (a) merge m018 to master, (b) next M-NIGHTLY item
-  (regress diff capture or suite-wedge), or (c) close remaining M0125 absorbed
-  items and move to M0123.
+Next step: Consider next M0122-0003 subtask (EXPLAIN WAL record
+tracking or per-node MEMORY reporting), or triage next M-NIGHTLY run
 
-Gates run: truncate regress 20/20 PASS (10+10), executor unit tests PASS,
-  ralph-state-guard PASS (auto-repaired), build OK.
+Gates run:
+  - go test -run TestParseExplain ./internal/parser/ PASS (18 tests)
+  - go test -run TestExplain ./internal/executor/ PASS
+  - go build ./... clean
+  - RALPH_PRECOMMIT_SCOPE=smoke PASS (0 failed, 3 workloads)
+  - make ralph-state-guard PASS (auto-repaired, consistent)
 
 In-flight: none

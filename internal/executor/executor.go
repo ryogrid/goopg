@@ -343,6 +343,14 @@ func buildNode(plan planner.Node) (Operator, error) {
 		return nil, &ExecError{Code: "0A000", Pos: p.Pos(), Message: "COPY is driven from the wire layer; planner.Copy has no executor path yet"}
 	case *planner.Call:
 		return newCallOp(p), nil
+	case *planner.BitmapIndexScan:
+		return maybeInstrument(p, newBitmapIndexScanOp(p)), nil
+	case *planner.BitmapHeapScan:
+		return maybeInstrument(p, newBitmapHeapScanOp(p)), nil
+	case *planner.BitmapAnd:
+		return maybeInstrument(p, newBitmapAndOp(p)), nil
+	case *planner.BitmapOr:
+		return maybeInstrument(p, newBitmapOrOp(p)), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }

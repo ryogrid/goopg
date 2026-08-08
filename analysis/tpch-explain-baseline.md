@@ -21,11 +21,15 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | region | — |
-| 2 | Index Scan | nation | idx_nation_regionkey |
-| 3 | Seq Scan | supplier | — |
-| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
-| 5 | Index Scan | part | idx_part_size |
+| 1 | Seq Scan | partsupp | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | region | — |
+| 4 | Seq Scan | supplier | — |
+| 5 | Seq Scan | part | — |
+| 6 | Seq Scan | partsupp | — |
+| 7 | Seq Scan | nation | — |
+| 8 | Seq Scan | region | — |
+| 9 | Seq Scan | supplier | — |
 
 ### Q3
 
@@ -33,9 +37,9 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Index Scan | customer | idx_customer_mktsegment |
-| 2 | Index Scan | orders | idx_orders_orderdate |
-| 3 | Index Scan | lineitem | idx_lineitem_shipdate |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | orders | — |
+| 3 | Seq Scan | customer | — |
 
 ### Q4
 
@@ -44,6 +48,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Index Scan | orders | idx_orders_orderdate |
+| 2 | Index Scan | lineitem | idx_lineitem_orderkey |
 
 ### Q5
 
@@ -51,12 +56,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Index Scan | orders | idx_orders_orderdate |
-| 2 | Index Scan | lineitem | idx_lineitem_orderkey |
-| 3 | Index Scan | supplier | supplier_pk |
-| 4 | Index Scan | customer | customer_pk |
-| 5 | Index Scan | nation | nation_pk |
-| 6 | Seq Scan | region | — |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | region | — |
+| 4 | Seq Scan | supplier | — |
+| 5 | Seq Scan | customer | — |
+| 6 | Seq Scan | orders | — |
 
 ### Q6
 
@@ -72,12 +77,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation n2 | — |
-| 2 | Seq Scan | customer | — |
-| 3 | Seq Scan | orders | — |
-| 4 | Index Scan | lineitem | idx_lineitem_shipdate |
-| 5 | Index Scan | supplier | supplier_pk |
-| 6 | Index Scan | nation | nation_pk |
+| 1 | Seq Scan | orders | — |
+| 2 | Seq Scan | lineitem | — |
+| 3 | Seq Scan | supplier | — |
+| 4 | Seq Scan | nation n1 | — |
+| 5 | Seq Scan | customer | — |
+| 6 | Seq Scan | nation n2 | — |
 
 ### Q8
 
@@ -85,14 +90,14 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | region | — |
-| 2 | Index Scan | nation | idx_nation_regionkey |
-| 3 | Index Scan | customer | idx_customer_nationkey |
-| 4 | Index Scan | orders | idx_orders_orderdate |
-| 5 | Index Scan | lineitem | idx_lineitem_orderkey |
-| 6 | Index Scan | supplier | supplier_pk |
-| 7 | Index Scan | nation | nation_pk |
-| 8 | Index Scan | part | idx_part_type |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | part | — |
+| 3 | Seq Scan | orders | — |
+| 4 | Seq Scan | supplier | — |
+| 5 | Seq Scan | nation n2 | — |
+| 6 | Seq Scan | customer | — |
+| 7 | Seq Scan | nation n1 | — |
+| 8 | Seq Scan | region | — |
 
 ### Q9
 
@@ -100,12 +105,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | supplier | — |
-| 2 | Seq Scan | orders | — |
-| 3 | Seq Scan | lineitem | — |
-| 4 | Index Scan | partsupp | partsupp_pk |
-| 5 | Index Scan | nation | nation_pk |
-| 6 | Seq Scan | part | — |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | supplier | — |
+| 3 | Seq Scan | nation | — |
+| 4 | Seq Scan | part | — |
+| 5 | Seq Scan | orders | — |
+| 6 | Seq Scan | partsupp | — |
 
 ### Q10
 
@@ -113,10 +118,10 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation | — |
-| 2 | Seq Scan | customer | — |
-| 3 | Index Scan | orders | idx_orders_orderdate |
-| 4 | Seq Scan | lineitem | — |
+| 1 | Seq Scan | orders | — |
+| 2 | Seq Scan | lineitem | — |
+| 3 | Seq Scan | customer | — |
+| 4 | Seq Scan | nation | — |
 
 ### Q11
 
@@ -124,9 +129,9 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation | — |
+| 1 | Seq Scan | partsupp | — |
 | 2 | Seq Scan | supplier | — |
-| 3 | Seq Scan | partsupp | — |
+| 3 | Seq Scan | nation | — |
 
 ### Q12
 
@@ -134,8 +139,8 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Index Scan | lineitem | idx_lineitem_receiptdate |
-| 2 | Index Scan | orders | orders_pk |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | orders | — |
 
 ### Q13
 
@@ -152,8 +157,8 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Index Scan | lineitem | idx_lineitem_shipdate |
-| 2 | Index Scan | part | part_pk |
+| 1 | Seq Scan | lineitem | — |
+| 2 | Seq Scan | part | — |
 
 ### Q15a
 
@@ -179,7 +184,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | partsupp | — |
-| 2 | Index Scan | part | part_pk |
+| 2 | Seq Scan | part | — |
 | 3 | Seq Scan | supplier | — |
 
 ### Q17
@@ -189,7 +194,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
-| 2 | Index Scan | part | part_pk |
+| 2 | Seq Scan | part | — |
 
 ### Q18
 
@@ -197,9 +202,9 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | customer | — |
+| 1 | Seq Scan | lineitem | — |
 | 2 | Seq Scan | orders | — |
-| 3 | Seq Scan | lineitem | — |
+| 3 | Seq Scan | customer | — |
 | 4 | Seq Scan | lineitem | — |
 
 ### Q19
@@ -209,7 +214,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
-| 2 | Index Scan | part | part_pk |
+| 2 | Seq Scan | part | — |
 
 ### Q20
 
@@ -218,10 +223,9 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | supplier | — |
-| 2 | Index Scan | nation | nation_pk |
+| 2 | Seq Scan | nation | — |
 | 3 | Seq Scan | partsupp | — |
-| 4 | Index Scan | lineitem | idx_lineitem_shipdate |
-| 5 | Seq Scan | part | — |
+| 4 | Seq Scan | part | — |
 
 ### Q21
 
@@ -229,10 +233,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation | — |
+| 1 | Seq Scan | lineitem l1 | — |
 | 2 | Seq Scan | supplier | — |
-| 3 | Seq Scan | orders | — |
-| 4 | Seq Scan | lineitem l1 | — |
+| 3 | Seq Scan | nation | — |
+| 4 | Seq Scan | orders | — |
+| 5 | Index Scan | lineitem | idx_lineitem_orderkey |
+| 6 | Index Scan | lineitem | idx_lineitem_orderkey |
 
 ### Q22
 
@@ -241,6 +247,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | customer | — |
+| 2 | Index Scan | orders | idx_orders_custkey |
 
 ## Aggregate gaps
 
@@ -250,14 +257,15 @@ for an M0054-0003 sub-task investigation.
 
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
-| customer | Q10, Q13, Q18, Q22, Q7 | Q3, Q5, Q8 |
-| lineitem | Q10, Q17, Q18, Q19, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q3, Q5, Q6, Q7, Q8 |
+| customer | Q10, Q13, Q18, Q22, Q3, Q5, Q7, Q8 | — |
+| lineitem | Q10, Q12, Q14, Q17, Q18, Q19, Q3, Q5, Q7, Q8, Q9 | Q1, Q15a, Q15b, Q21, Q4, Q6 |
 | lineitem l1 | Q21 | — |
-| nation | Q10, Q11, Q21 | Q2, Q20, Q5, Q7, Q8, Q9 |
-| nation n2 | Q7 | — |
-| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
-| part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
-| partsupp | Q11, Q16, Q20 | Q2, Q9 |
+| nation | Q10, Q11, Q2, Q20, Q21, Q5, Q9 | — |
+| nation n1 | Q7, Q8 | — |
+| nation n2 | Q7, Q8 | — |
+| orders | Q10, Q12, Q13, Q18, Q21, Q3, Q5, Q7, Q8, Q9 | Q22, Q4 |
+| part | Q14, Q16, Q17, Q19, Q2, Q20, Q8, Q9 | — |
+| partsupp | Q11, Q16, Q2, Q20, Q9 | — |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q16, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
+| supplier | Q11, Q15b, Q16, Q2, Q20, Q21, Q5, Q7, Q8, Q9 | — |
 

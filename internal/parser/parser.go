@@ -1524,6 +1524,15 @@ func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
 	case "summary":
 		opts.Summary = val
 		opts.Set.Summary = true
+	case "generic_plan":
+		opts.GenericPlan = val
+		opts.Set.GenericPlan = true
+	case "wal":
+		opts.Wal = val
+		opts.Set.Wal = true
+	case "memory":
+		opts.Memory = val
+		opts.Set.Memory = true
 	default:
 		return &SyntaxError{Pos: pos, Message: fmt.Sprintf("unknown EXPLAIN option %q", tok.Value)}
 	}

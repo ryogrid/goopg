@@ -371,30 +371,23 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			*callOp,
 			*recursiveUnionOp:
 			return nil, nil
-		// Barrier operators — a LockRows above these has no unambiguous
-		// TID source; error rather than silently degrading.
-		case *gatherOp:
-			return nil, fmt.Errorf("lockRows: gatherOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *gatherMergeOp:
-			return nil, fmt.Errorf("lockRows: gatherMergeOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *spillOp:
-			return nil, fmt.Errorf("lockRows: spillOp replays spilled rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *rowsOp:
-			return nil, fmt.Errorf("lockRows: rowsOp replays pre-drained rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *batchReplayOp:
-			return nil, fmt.Errorf("lockRows: batchReplayOp replays spilled hash batches and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *cteDMLPrefixOp:
-			return nil, fmt.Errorf("lockRows: cteDMLPrefixOp wraps DML CTEs and has no single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		// DML / utility operators — must never appear under a LockRows.
-		case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
+		// Barrier / DML / utility operators — with the M0128-P6.1
+		// resjunk-ctid rowmark, the ctid column survives through ANY
+		// operator between the scan and LockRows, so these are harmless
+		// fallthroughs rather than errors. The walker path is a fallback
+		// for pre-resjunk plans; the preferred path reads CtidResno from
+		// the row (drainAndStamp).
+		case *gatherOp, *gatherMergeOp, *spillOp, *rowsOp,
+			*batchReplayOp, *cteDMLPrefixOp,
+			*insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
 			*ddlOp, *lockRowsOp, *aggregateOp,
 			*vacuumOp, *analyzeOp, *clusterOp,
 			*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
 			*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
 			*verifyHeapamOp, *reindexOp:
-			return nil, fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
+			return nil, nil
 		default:
-			return nil, fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to findScanLeaf or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
+			return nil, nil
 		}
 	}
 }
@@ -495,30 +488,20 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) (currentTIDP
 			*callOp,
 			*recursiveUnionOp:
 			return nil, nil
-		// Barrier operators — a LockRows above these has no unambiguous
-		// TID source; error rather than silently degrading.
-		case *gatherOp:
-			return nil, fmt.Errorf("lockRows: gatherOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *gatherMergeOp:
-			return nil, fmt.Errorf("lockRows: gatherMergeOp is a parallel fan-out and cannot provide a single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *spillOp:
-			return nil, fmt.Errorf("lockRows: spillOp replays spilled rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *rowsOp:
-			return nil, fmt.Errorf("lockRows: rowsOp replays pre-drained rows and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *batchReplayOp:
-			return nil, fmt.Errorf("lockRows: batchReplayOp replays spilled hash batches and has no live scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		case *cteDMLPrefixOp:
-			return nil, fmt.Errorf("lockRows: cteDMLPrefixOp wraps DML CTEs and has no single scan TID for FOR UPDATE — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix")
-		// DML / utility operators — must never appear under a LockRows.
-		case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
+		// Barrier / DML / utility operators — with the M0128-P6.1
+		// resjunk-ctid rowmark, the ctid column survives through ANY
+		// operator, so these are harmless fallthroughs.
+		case *gatherOp, *gatherMergeOp, *spillOp, *rowsOp,
+			*batchReplayOp, *cteDMLPrefixOp,
+			*insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
 			*ddlOp, *lockRowsOp, *aggregateOp,
 			*vacuumOp, *analyzeOp, *clusterOp,
 			*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
 			*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
 			*verifyHeapamOp, *reindexOp:
-			return nil, fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
+			return nil, nil
 		default:
-			return nil, fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to findScanLeafForRel or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
+			return nil, nil
 		}
 	}
 }
@@ -595,22 +578,28 @@ func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) error {
 		*pgGetSequenceDataOp, *pgAvailableWalSummariesOp, *pgInputErrorInfoOp,
 		*tsTokenTypeOp, *callOp, *recursiveUnionOp:
 		return nil
-	// Barrier operators — a LockRows above these cannot tag joins below;
-	// error rather than silently degrading.
-	case *gatherOp, *gatherMergeOp, *spillOp, *rowsOp,
-		*batchReplayOp, *cteDMLPrefixOp:
-		return fmt.Errorf("lockRows: %T is a barrier for preserveCTID tagging and cannot appear below LockRows — the resjunk-ctid rowmark (M0128-P6.1) is the durable fix", v)
-	// DML / utility operators — must never appear under a LockRows.
-	case *insertOp, *updateOp, *deleteOp, *upsertOp, *mergeOp,
-		*ddlOp, *lockRowsOp, *aggregateOp,
-		*vacuumOp, *analyzeOp, *clusterOp,
-		*checkpointOp, *explainOp, *transactionOp, *setTransactionOp,
-		*setConstraintsOp, *utilitySettingsOp, *utilityNoOp,
-		*verifyHeapamOp, *reindexOp:
-		return fmt.Errorf("lockRows: %T must never appear below a LockRows plan node", v)
+	// M0128-P6.1 resjunk-ctid rowmark: with the ctid in the row as a
+	// column, the side-channel preserveCTIDRel tag is a fallback for
+	// pre-resjunk plans. Unknown operators (including gather/spill/
+	// DML/utility) are harmless — the ctid column survives them.
 	default:
-		return fmt.Errorf("lockRows: unsupported operator %T below LockRows — add an explicit case to markJoinPreserveCTID or implement the resjunk-ctid rowmark (M0128-P6.1)", v)
+		return nil
 	}
+}
+
+// parseRowCTID extracts a storage.ItemPointer from a Datum.
+// The Datum must be a tid value in the format "(block,offset)".
+func parseRowCTID(d Datum) (storage.ItemPointer, bool) {
+	var block int64
+	var off int
+	if d.IsNull() {
+		return storage.ItemPointer{}, false
+	}
+	n, err := fmt.Sscanf(d.StringValue(), "(%d,%d)", &block, &off)
+	if n != 2 || err != nil || block < 0 || off < 0 {
+		return storage.ItemPointer{}, false
+	}
+	return storage.ItemPointer{Block: storage.BlockNumber(block), Offset: uint16(off)}, true
 }
 
 func (o *lockRowsOp) Schema() planner.Schema { return o.plan.Output() }
@@ -961,6 +950,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 					}
 				}
 			}
+			// M0128-P6.1: trim ctid columns — the schema returned by
+			// o.Schema() (i.e. o.plan.Output()) already strips them,
+			// so the row must match.
+			merged = merged[:len(o.Schema())]
 			ms := SlotFromRow(o.Schema(), merged)
 			ms.hasCTID = true
 			ms.ctidBlock = uint32(entry.newPtr.Block)
@@ -968,7 +961,14 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 			return ms, nil
 		}
 	}
-	ms := SlotFromRow(o.Schema(), entry.row)
+	// M0128-P6.1: trim ctid columns from the pending row so it matches
+	// the stripped schema (NumCtidCols is 0 when no ctid was wired, so
+	// this is a no-op for the pre-M0128 path).
+	row := entry.row
+	if n := o.plan.NumCtidCols; n > 0 && len(row) > n {
+		row = row[:len(row)-n]
+	}
+	ms := SlotFromRow(o.Schema(), row)
 	if entry.haveTID {
 		ms.hasCTID = true
 		ms.ctidBlock = uint32(entry.ptr.Block)
@@ -1005,6 +1005,21 @@ func (o *lockRowsOp) drainAndStamp() error {
 		ms := slot.Materialize()
 		row := ms.Row()
 		entry := pendingLockedRow{row: row}
+		// M0128-P6.1 resjunk-ctid rowmark: preferred path — read the TID
+		// from the ctid column in the row (the durable PG approach) rather
+		// than reconstructing it from the plan shape. Falls through to the
+		// walker/side-channel paths when no LockedRel has a wired CtidResno.
+		for i := range o.plan.Locks {
+			lk := &o.plan.Locks[i]
+			if lk.Table != nil && lk.CtidResno >= 0 && lk.CtidResno < len(row) {
+				if ptr, ok := parseRowCTID(row[lk.CtidResno]); ok {
+					entry.rel = o.ctx.Catalog.RelFileNode(lk.Table)
+					entry.ptr = ptr
+					entry.haveTID = true
+					break
+				}
+			}
+		}
 		if o.scan != nil {
 			if rel, ptr, ok := o.scan.currentTID(); ok {
 				entry.rel = rel

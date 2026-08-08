@@ -1765,6 +1765,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// loop; rows that need retention go through
 			// slot.Materialize().
 			o.slot.schema = o.schema
+			// M0128-P6.1 resjunk-ctid rowmark: when the scan's schema has
+			// been extended with a trailing ctid column, append the TID as
+			// a string datum "(block,offset)" so it rides the row through
+			// the plan tree and lockRowsOp reads it from there instead of
+			// from the side-channel / walker.
+			if len(o.schema) > len(o.cols) {
+				for i := len(o.cols); i < len(o.schema); i++ {
+					row = append(row, NewStringDatum(fmt.Sprintf("(%d,%d)", o.curBlock, o.curSlot-1)))
+				}
+			}
 			o.slot.row = row
 			// M0097-0038: inject current TID for CTIDExpr evaluation.
 			o.slot.hasCTID = true

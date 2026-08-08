@@ -244,8 +244,15 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	// a re-resolve re-wraps the identical FuncExpr (fixed point), rather than a
 	// spurious numeric(<int>) function call.
 	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) ||
-		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) ||
-		isImplicitNumericLengthCoercion(f) {
+		isImplicitIntToInt2Cast(f) ||
+		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) || isImplicitToFloat4Cast(f) ||
+		isImplicitNumericLengthCoercion(f) ||
+			isImplicitVarcharLengthCoercion(f) || isImplicitBpcharLengthCoercion(f) ||
+			isImplicitTimestampLengthCoercion(f) ||
+			isImplicitTimeLengthCoercion(f) ||
+			isImplicitTimestamptzLengthCoercion(f) ||
+			isImplicitTimeTZLengthCoercion(f) ||
+			isImplicitBitLengthCoercion(f) || isImplicitVarBitLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
 	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
@@ -373,6 +380,116 @@ func isImplicitNumericLengthCoercion(f *FuncExpr) bool {
 	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
 }
 
+// isImplicitVarcharLengthCoercion reports whether f is the IMPLICIT varchar length
+// coercion coerce_type_typmod adds when a varchar(N) column has a length qualifier
+// (see wrapVarcharLengthCoercion): varchar(varchar,int4,bool) = funcid 669,
+// funcformat 2 (IMPLICIT), a varchar result, and three args whose second is a non-null
+// int4 typmod Const and third a bool isExplicit Const. pg_get_expr renders the implicit
+// form invisibly, so rebuild unwraps to Args[0]; a re-resolve through
+// ResolveForColumnTypmod re-wraps the identical node (fixed point).
+func isImplicitVarcharLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 669 || f.Funcformat != 2 || f.Funcresulttype != OidVarchar || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitBpcharLengthCoercion reports whether f is the IMPLICIT bpchar length
+// coercion (see wrapBpcharLengthCoercion): bpchar(bpchar,int4,bool) = funcid 668,
+// funcformat 2.
+func isImplicitBpcharLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 668 || f.Funcformat != 2 || f.Funcresulttype != OidBpchar || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimestampLengthCoercion reports whether f is the IMPLICIT timestamp
+// length coercion coerce_type_typmod adds when a timestamp(N) column has a precision
+// qualifier (see wrapTimestampLengthCoercion): timestamp(timestamp,int4) = funcid
+// 1961, funcformat 2 (IMPLICIT), a timestamp result, and two args whose second is a
+// non-null int4 typmod Const. pg_get_expr renders the implicit form invisibly, so
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimestampLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1961 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamp || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimeLengthCoercion reports whether f is the IMPLICIT time length
+// coercion coerce_type_typmod adds when a time(N) column has a precision
+// qualifier (see wrapTimeLengthCoercion): time(time,int4) = funcid 1968,
+// funcformat 2 (COERCE_IMPLICIT_CAST). Like the other length-coercion wrappers,
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimeLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1968 || f.Funcformat != 2 || f.Funcresulttype != OidTime || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimestamptzLengthCoercion reports whether f is the IMPLICIT timestamptz
+// length coercion coerce_type_typmod adds when a timestamptz(N) column has a precision
+// qualifier (see wrapTimestamptzLengthCoercion): timestamptz(timestamptz,int4) = funcid
+// 1967, funcformat 2 (IMPLICIT), a timestamptz result, and two args whose second is a
+// non-null int4 typmod Const. pg_get_expr renders the implicit form invisibly, so
+// rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod re-wraps
+// the identical node (fixed point).
+func isImplicitTimestamptzLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1967 || f.Funcformat != 2 || f.Funcresulttype != OidTimestamptz || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitTimeTZLengthCoercion reports whether f is the IMPLICIT timetz length
+// coercion coerce_type_typmod adds when a timetz(N) column has a precision
+// qualifier (see wrapTimeTZLengthCoercion): timetz(timetz,int4) = funcid 1969,
+// funcformat 2 (COERCE_IMPLICIT_CAST). Like the other time-family length-coercion
+// wrappers, rebuild unwraps to Args[0]; a re-resolve through ResolveForColumnTypmod
+// re-wraps the identical node (fixed point).
+func isImplicitTimeTZLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1969 || f.Funcformat != 2 || f.Funcresulttype != OidTimeTZ || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitBitLengthCoercion reports whether f is the IMPLICIT bit length
+// coercion coerce_type_typmod adds when a bit(N) column has a length qualifier
+// (see wrapBitLengthCoercion): bit(bit,int4,bool) = funcid 1685, funcformat 2
+// (IMPLICIT), a bit result, and three args whose second is a non-null int4
+// typmod Const and third a bool isExplicit Const. pg_get_expr renders the
+// implicit form invisibly, so rebuild unwraps to Args[0]; a re-resolve through
+// ResolveForColumnTypmod re-wraps the identical node (fixed point).
+func isImplicitBitLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1685 || f.Funcformat != 2 || f.Funcresulttype != OidBit || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
+// isImplicitVarBitLengthCoercion reports whether f is the IMPLICIT varbit length
+// coercion (see wrapVarBitLengthCoercion): varbit(varbit,int4,bool) = funcid 1687,
+// funcformat 2.
+func isImplicitVarBitLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1687 || f.Funcformat != 2 || f.Funcresulttype != OidVarBit || len(f.Args) != 3 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
+}
+
 // isImplicitIntToNumericCast reports whether f is the exact FuncExpr the forward
 // resolver emits for a bare integer literal in a numeric context (see
 // wrapIntToNumericCast): int4_numeric (1740) or int8_numeric (1781), an
@@ -394,6 +511,38 @@ func isImplicitInt4ToInt8Cast(f *FuncExpr) bool {
 	return f.Funcid == 481 &&
 		f.Funcformat == 2 &&
 		f.Funcresulttype == OidInt8 &&
+		len(f.Args) == 1
+}
+
+// isImplicitIntToInt2Cast reports whether f is the exact FuncExpr the forward
+// resolver emits for an int4 (or int8) literal wrapped in an implicit int2 cast:
+// int2(int4) (314) or int2(int8) (714), funcformat 2, single argument. Like the
+// int→numeric cast it has no SQL call syntax — PG re-derives it from the bare
+// integer in an int2 context — so rebuild unwraps to the inner argument for a
+// re-resolve fixed point.
+func isImplicitIntToInt2Cast(f *FuncExpr) bool {
+	return (f.Funcid == 314 || f.Funcid == 714) &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidInt2 &&
+		len(f.Args) == 1
+}
+
+// isImplicitToFloat4Cast reports whether f is the exact FuncExpr the forward
+// resolver emits for an int4/int8/numeric CASE result widened to a common
+// float4 type (see wrapToFloat4Cast): float4(int4) (318), float4(int8) (652), or
+// float4(numeric) (1745), all in the implicit-cast form (funcformat 2) with a
+// single argument. Like the sibling numeric-family casts these have no SQL call
+// syntax that would round-trip as an implicit cast — the CASE common-type walk
+// re-derives them from the bare int/numeric result in a float4 context — so
+// rebuild unwraps to the inner argument for a re-resolve fixed point. The
+// funcformat==2 guard is load-bearing: the SAME OIDs (e.g. float4(int4) 318)
+// appear with funcformat 0 for an explicit float4(<int>) conversion call and
+// funcformat 1 for an explicit `::float4` cast, both of which must rebuild back
+// to their own syntax, NOT unwrap.
+func isImplicitToFloat4Cast(f *FuncExpr) bool {
+	return (f.Funcid == 318 || f.Funcid == 652 || f.Funcid == 1745) &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidFloat4 &&
 		len(f.Args) == 1
 }
 
@@ -534,7 +683,11 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 	case OidBool:
 		// The by-value word is 0 (false) or 1 (true); see datum.go:NewBoolConst.
 		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil
-	case OidText:
+	case OidText, OidVarchar, OidBpchar:
+		// text, varchar, and bpchar Consts share the same varlena wire format;
+		// rebuild to the verbatim string literal. A re-resolve in the column
+		// context re-folds through foldStringLiteralConst to the correct consttype
+		// (the fixed point).
 		return &parser.StringConst{Value: textFromVarlena(c.Datum)}, nil
 	case OidOid:
 		// An oid Const only arises from folding an unknown-type string literal
@@ -583,6 +736,24 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// value is inside the literal string, not a unary minus.
 		usec := int64FromByvalWord(c.Datum)
 		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
+	case OidTime:
+			// Render the μs-since-midnight datum back into a canonical "HH:MM:SS[.ffffff]"
+			// literal so a re-resolve in the time column context reproduces the identical
+			// Const — the fixed point.
+			micros := int64FromByvalWord(c.Datum)
+			return &parser.StringConst{Value: formatTime(micros)}, nil
+		case OidTimeTZ:
+			// Render the 12-byte timetz datum back into a canonical
+			// "HH:MM:SS[.ffffff]±HH:MI" literal so a re-resolve reproduces the
+			// identical Const — the fixed point.
+			micros, off := decodeTimeTZDatum(c.Datum)
+			return &parser.StringConst{Value: formatTimeTZ(micros, off)}, nil
+		case OidTimestamp:
+		// Same as timestamptz but WITHOUT the +00 offset — timestamp has no
+		// timezone. A re-resolve in a timestamp column context folds through
+		// parseTimestampMicros to the identical Const.
+		usec := int64FromByvalWord(c.Datum)
+		return &parser.StringConst{Value: formatTimestamp(usec)}, nil
 	case OidDate:
 		// Render the DateADT day count back into a canonical "YYYY-MM-DD" literal
 		// which re-resolves to the identical Const in a date column context — the
@@ -590,6 +761,18 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// string, not a unary minus.
 		days := int32(int64FromByvalWord(c.Datum))
 		return &parser.StringConst{Value: formatDate(days)}, nil
+	case OidBit:
+		// Rebuild the VarBit varlena to its canonical bit-string literal
+		// (e.g. '10101010'). A re-resolve in a bit column context re-folds
+		// through parseBitFromString → NewBitConst to the identical Const.
+		bitLen := bitLenFromVarlena(c.Datum)
+		data := bitDataFromVarlena(c.Datum)
+		return &parser.StringConst{Value: formatBit(bitLen, data)}, nil
+	case OidVarBit:
+		// Same as bit but with consttype 1562.
+		bitLen := bitLenFromVarlena(c.Datum)
+		data := bitDataFromVarlena(c.Datum)
+		return &parser.StringConst{Value: formatBit(bitLen, data)}, nil
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported Const type OID %d", c.ConstType)
 	}

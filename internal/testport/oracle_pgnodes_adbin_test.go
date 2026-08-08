@@ -47,6 +47,35 @@ import (
 // type into PG's atttypmod for ResolveForColumnTypmod, mirroring what the executor
 // writer derives from catalog.Type.Args. Any non-numeric or unqualified column type
 // returns -1 (no length qualifier), matching the writer's bare-column path.
+// colSQLTypmod packs the length qualifier of a typed column SQL into PG's
+// atttypmod for ResolveForColumnTypmod, mirroring what the executor writer derives
+// from catalog.Type.Name + Type.Args. Any non-length-qualified or unmodeled type
+// returns -1 (no length qualifier).
+func colSQLTypmod(colSQL string) int32 {
+	s := strings.TrimSpace(colSQL)
+	if len(s) == 0 {
+		return -1
+	}
+	// Split type name from parenthesized args.
+	paren := strings.IndexByte(s, '(')
+	if paren < 0 || !strings.HasSuffix(s, ")") {
+		return -1
+	}
+	typeName := s[:paren]
+	inner := s[paren+1 : len(s)-1]
+	parts := strings.Split(inner, ",")
+	args := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil {
+			return -1
+		}
+		args = append(args, n)
+	}
+	return pgnodes.ColumnTypmod(typeName, args)
+}
+
+// numericColSQLTypmod is retained for backward-compat readability in the test body.
 func numericColSQLTypmod(colSQL string) int32 {
 	s := strings.TrimSpace(colSQL)
 	if !strings.HasPrefix(s, "numeric(") || !strings.HasSuffix(s, ")") {
@@ -271,6 +300,81 @@ var adbinOracleCases = []adbinOracleCase{
 	{"str_cast_float4", "float4", pgnodes.OidFloat4, "'5'::float4"},
 	{"str_cast_float4_decimal", "float4", pgnodes.OidFloat4, "'5.5'::float4"},
 	{"str_cast_float4_neg", "float4", pgnodes.OidFloat4, "'-2.5'::float4"},
+	// Sub-slice 34: a string literal in a varchar(N)/bpchar(N) column context
+	// folds to a varchar/bpchar Const (consttypmod -1), then coerce_type_typmod
+	// wraps it in an IMPLICIT varchar/bpchar(varchar/bpchar,int4,bool) FuncExpr
+	// (funcformat 2) carrying the packed column typmod (maxlen + VARHDRSZ).
+	{"varchar10_hello", "varchar(10)", pgnodes.OidVarchar, "'hello'"},
+	{"varchar20_world", "varchar(20)", pgnodes.OidVarchar, "'world'"},
+	{"varchar5_empty", "varchar(5)", pgnodes.OidVarchar, "''"},
+	{"bpchar5_abc", "char(5)", pgnodes.OidBpchar, "'abc'"},
+	{"bpchar10_xyz", "character(10)", pgnodes.OidBpchar, "'xyz'"},
+	{"bpchar3_empty", "bpchar(3)", pgnodes.OidBpchar, "''"},
+	// Sub-slice 34: a string literal in a timestamp(N) column context
+	// folds to a timestamp Const (consttypmod -1), then coerce_type_typmod
+	// wraps it in an IMPLICIT timestamp(timestamp,int4) FuncExpr (funcid 1961).
+	{"ts0_2024_01_15", "timestamp(0)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00'"},
+	{"ts3_2024_01_15_123456", "timestamp(3)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts6_2024_01_15_123456", "timestamp(6)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts0_truncate", "timestamp(0)", pgnodes.OidTimestamp, "'2024-01-15 10:30:00.123456'"},
+	{"ts0_epoch", "timestamp(0)", pgnodes.OidTimestamp, "'epoch'"},
+	// Sub-slice 36: a string literal in a bit(N) column context folds to
+	// a bit Const (consttypmod -1), then coerce_type_typmod wraps it in an
+	// IMPLICIT bit(bit,int4,bool) FuncExpr (funcid 1685, funcformat 2).
+	{"bit4_1010", "bit(4)", pgnodes.OidBit, "'1010'"},
+	{"bit8_11110000", "bit(8)", pgnodes.OidBit, "'11110000'"},
+	{"bit1_single", "bit(1)", pgnodes.OidBit, "'1'"},
+	// Sub-slice 36: varbit(N) length coercion (funcid 1687, funcformat 2).
+	{"varbit6_111000", "bit varying(6)", pgnodes.OidVarBit, "'111000'"},
+	{"varbit8_10101010", "varbit(8)", pgnodes.OidVarBit, "'10101010'"},
+	// varbit WITHOUT a length qualifier stores a bare Const.
+	{"varbit_bare_10101", "bit varying", pgnodes.OidVarBit, "'10101'"},
+	// Sub-slice 37: timestamptz(N) length coercion (funcid 1967, funcformat 2).
+	// PG wraps the timestamptz Const in an IMPLICIT timestamptz(timestamptz,int4)
+	// FuncExpr when the column has a precision qualifier (0-6).
+	{"tstz3_2024_frac", "timestamptz(3)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz6_full", "timestamptz(6)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz0_truncate", "timestamptz(0)", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00.123456+00'"},
+	{"tstz0_epoch", "timestamptz(0)", pgnodes.OidTimestamptz, "'epoch'"},
+	// timestamptz WITHOUT a precision qualifier stores a bare Const.
+	{"tstz_bare", "timestamptz", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00+00'"},
+
+	// Sub-slice 38: time(N) length coercion (funcid 1968, funcformat 2).
+	// PG wraps the time Const in an IMPLICIT time(time,int4) FuncExpr when
+	// the column has a precision qualifier (0-6).
+	{"t0_midnight", "time(0)", pgnodes.OidTime, "'00:00:00'"},
+	{"t3_frac", "time(3)", pgnodes.OidTime, "'10:30:00.123456'"},
+	{"t6_full", "time(6)", pgnodes.OidTime, "'10:30:00.123456'"},
+	{"t0_trunc", "time(0)", pgnodes.OidTime, "'10:30:00.123456'"},
+	// time WITHOUT a precision qualifier stores a bare Const.
+	{"t_bare", "time", pgnodes.OidTime, "'10:30:00'"},
+
+	// Sub-slice 39: timetz(N) length coercion (funcid 1969, funcformat 2).
+	// PG wraps the timetz Const in an IMPLICIT timetz(timetz,int4) FuncExpr when
+	// the column has a precision qualifier (0-6).
+	{"tz0_midnight_utc", "timetz(0)", pgnodes.OidTimeTZ, "'00:00:00+00:00'"},
+	{"tz0_pos_offset", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00+05:30'"},
+	{"tz3_frac", "timetz(3)", pgnodes.OidTimeTZ, "'10:30:00.123+05:30'"},
+	{"tz6_full", "timetz(6)", pgnodes.OidTimeTZ, "'10:30:00.123456+05:30'"},
+	{"tz0_trunc", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00.123456+05:30'"},
+	{"tz0_zulu", "timetz(0)", pgnodes.OidTimeTZ, "'10:30:00Z'"},
+	{"tz3_neg_offset", "timetz(3)", pgnodes.OidTimeTZ, "'10:30:00.100-03:00'"},
+	// timetz WITHOUT a precision qualifier stores a bare Const.
+	{"tz_bare", "timetz", pgnodes.OidTimeTZ, "'10:30:00+05:30'"},
+
+	// Sub-slice 40: broader date input forms — infinity, BC years.
+	{"date_infinity", "date", pgnodes.OidDate, "'infinity'"},
+	{"date_neg_infinity", "date", pgnodes.OidDate, "'-infinity'"},
+	{"date_0001_01_01_bc", "date", pgnodes.OidDate, "'0001-01-01 BC'"},
+	{"date_0044_03_15_bc", "date", pgnodes.OidDate, "'0044-03-15 BC'"},
+	{"ts_infinity", "timestamp", pgnodes.OidTimestamp, "'infinity'"},
+	{"ts_neg_infinity", "timestamp", pgnodes.OidTimestamp, "'-infinity'"},
+	{"ts_0001_01_01_bc", "timestamp", pgnodes.OidTimestamp, "'0001-01-01 00:00:00 BC'"},
+	{"ts_0044_03_15_bc", "timestamp", pgnodes.OidTimestamp, "'0044-03-15 00:00:00 BC'"},
+	{"tstz_infinity", "timestamptz", pgnodes.OidTimestamptz, "'infinity'"},
+	{"tstz_neg_infinity", "timestamptz", pgnodes.OidTimestamptz, "'-infinity'"},
+	{"tstz_0001_01_01_bc", "timestamptz", pgnodes.OidTimestamptz, "'0001-01-01 00:00:00+00 BC'"},
+	{"tstz_0044_03_15_bc", "timestamptz", pgnodes.OidTimestamptz, "'0044-03-15 00:00:00+00 BC'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
@@ -318,7 +422,7 @@ func TestOraclePgnodesAdbinBytesMatchPG(t *testing.T) {
 			if err != nil {
 				t.Fatalf("goopg parser.ParseExpr(%q): %v", tc.def, err)
 			}
-			node, ok := pgnodes.ResolveForColumnTypmod(expr, tc.colOid, numericColSQLTypmod(tc.colSQL))
+			node, ok := pgnodes.ResolveForColumnTypmod(expr, tc.colOid, colSQLTypmod(tc.colSQL))
 			if !ok {
 				t.Fatalf("goopg ResolveForColumn(%q, oid=%d) degraded to SQL text, but PG18 stored a canonical adbin:\n  PG18: %s",
 					tc.def, tc.colOid, want)

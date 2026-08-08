@@ -101,6 +101,15 @@ type Config struct {
 	// startup handshake. Defaults to 30s.
 	HandshakeTimeout time.Duration
 
+	// ShutdownDeadline caps how long Run() waits for in-flight connections
+	// to drain after the accept loop exits. Defaults to 120s (graceful
+	// shutdown). A zero value means "wait forever" (backward-compatible
+	// with tests that embed a server in-process). The STOPIMMEDIATE
+	// control-plane command bypasses this deadline entirely (0s wait),
+	// mirroring upstream's immediate (SIGQUIT) shutdown.
+	// See docs/design/root-0037-nightly-server-shutdown-ladder.md.
+	ShutdownDeadline time.Duration
+
 	// Policy decides whether to admit a connection based on the
 	// (conn-type, remote, database, user) tuple from the StartupMessage.
 	// nil means auth.DefaultPolicy() — loopback-only trust. See
@@ -290,6 +299,9 @@ func (c *Config) defaults() {
 	if c.HandshakeTimeout == 0 {
 		c.HandshakeTimeout = 30 * time.Second
 	}
+	if c.ShutdownDeadline == 0 {
+		c.ShutdownDeadline = 120 * time.Second
+	}
 	if c.Policy == nil {
 		c.Policy = auth.DefaultPolicy()
 	}
@@ -319,6 +331,11 @@ type Server struct {
 	nextPID       atomic.Uint32
 	nextBackendID atomic.Uint32
 	closeOnce     sync.Once
+
+	// shutdownDeadline is set by the control-plane STOP / STOPIMMEDIATE
+	// handler before runCancel() fires, then read by Run() to bound the
+	// connWG.Wait() after the accept loop exits. See ShutdownDeadline.
+	shutdownDeadline time.Duration
 
 	cancelReg *backendCancelRegistry
 
@@ -583,8 +600,49 @@ func (s *Server) Run(ctx context.Context) error {
 
 	acceptErr := s.acceptLoop(runCtx, ln)
 
-	// Wait for in-flight connections to drain.
-	s.connWG.Wait()
+	// Wait for in-flight connections to drain, bounded by the
+	// deadline the control-plane STOP handler set. A zero deadline
+	// (backward-compat for embedded/test servers, or STOPIMMEDIATE)
+	// means "wait forever" — the prior behaviour.
+	if s.shutdownDeadline > 0 {
+		done := make(chan struct{})
+		go func() {
+			s.connWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// All backends drained within the deadline.
+		case <-time.After(s.shutdownDeadline):
+			s.cfg.Logger.Warn(
+				"shutdown deadline exceeded; forcing exit",
+				"deadline", s.shutdownDeadline,
+			)
+			// Dump all goroutine stacks for post-mortem analysis
+			// so the next loop can identify the blocking site.
+			buf := make([]byte, 1<<20) // 1 MiB
+			n := runtime.Stack(buf, true)
+			// Truncation note: if n == len(buf), the dump was
+			// clipped; the kernel's /proc/<pid>/stack per-thread
+			// remains available as a fallback if the goopg process
+			// is still alive.
+			if n == len(buf) {
+				s.cfg.Logger.Warn("goroutine dump truncated (1 MiB buffer full)")
+			}
+			s.cfg.Logger.Warn("forced shutdown goroutine dump (see log for stacks)",
+				"goroutines", runtime.NumGoroutine(),
+				"dump_len", n)
+			// Write the full dump to a file on disk so it
+			// survives process exit even if the log is buffered.
+			dumpPath := filepath.Join(s.cfg.DataDir, "shutdown_goroutines.txt")
+			if err := os.WriteFile(dumpPath, buf[:n], 0644); err != nil {
+				s.cfg.Logger.Warn("failed to write shutdown goroutine dump",
+					"path", dumpPath, "err", err)
+			}
+		}
+	} else {
+		s.connWG.Wait()
+	}
 
 	s.cfg.Logger.Info("goopg listener stopped")
 	if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
@@ -636,6 +694,11 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 				s.cfg.Logger.Info("shutdown checkpoint complete")
 			}
 		}
+		// Set the graceful deadline before cancelling so Run()
+		// bounds its connWG.Wait(). A zero ShutdownDeadline
+		// (backward-compat for embedded/test servers) means
+		// "wait forever" — the prior behaviour.
+		s.shutdownDeadline = s.cfg.ShutdownDeadline
 		runCancel()
 		return nil
 	}
@@ -653,6 +716,9 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 				s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
 			}
 		}
+		// Zero deadline: Run() logs and returns immediately without
+		// waiting for backends — mirrors upstream's SIGQUIT.
+		s.shutdownDeadline = 0
 		runCancel()
 		return nil
 	}

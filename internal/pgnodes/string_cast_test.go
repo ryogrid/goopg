@@ -178,11 +178,10 @@ func TestStringCastNonStringOperandNotFolded(t *testing.T) {
 	if fe.Funcid != 314 || fe.Funcformat != 1 {
 		t.Fatalf("5::int2 = FuncExpr{funcid %d, funcformat %d}, want funcid 314 / funcformat 1", fe.Funcid, fe.Funcformat)
 	}
-	// And the bare integer literal in an int2 COLUMN context degrades to SQL text
-	// (the int4→int2 implicit cast FuncExpr is a separate, un-folded shape not modeled
-	// in this slice — resolveIntLiteral yields an int4 Const, whose type != int2).
-	if _, ok := ResolveForColumn(mustParse(t, "5"), OidInt2); ok {
-		t.Fatalf("int2 DEFAULT 5 (bare integer literal) unexpectedly resolved canonical; want SQL-text degrade")
+	// A bare integer literal in an int2 COLUMN context now resolves canonically
+	// via the implicit int4→int2 cast FuncExpr (M0123-S4 sub-slice 31).
+	if _, ok := ResolveForColumn(mustParse(t, "5"), OidInt2); !ok {
+		t.Fatalf("int2 DEFAULT 5 (bare integer literal) degraded to SQL text; want canonical int4→int2 implicit cast FuncExpr")
 	}
 }
 

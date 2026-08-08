@@ -19,8 +19,15 @@ const (
 	OidFloat4      = 700
 	OidFloat8      = 701
 	OidNumeric     = 1700
+	OidVarchar     = 1043
+	OidBpchar      = 1042
 	OidDate        = 1082
+	OidTime        = 1083
+	OidTimestamp   = 1114
 	OidTimestamptz = 1184
+	OidTimeTZ      = 1266
+	OidBit         = 1560
+	OidVarBit      = 1562
 )
 
 // DefaultCollationOid is DEFAULT_COLLATION_OID (pg_collation.dat "default"),
@@ -162,8 +169,12 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 		return 8, true, true
 	case OidNumeric:
 		return -1, false, true
-	case OidTimestamptz:
+	case OidTimestamp, OidTimestamptz, OidTime:
 		return 8, true, true
+	case OidTimeTZ:
+		// timetz is a 12-byte by-reference type: 8 bytes TimeADT (μs since
+		// midnight) + 4 bytes int32 timezone offset in seconds.
+		return 12, false, true
 	default:
 		return 0, false, false
 	}
@@ -383,6 +394,121 @@ func NewTextConst(s string) *Const {
 		ConstLen: -1, ConstByval: false, Location: -1,
 		Datum: textVarlena(s),
 	}
+}
+
+// NewVarcharConst builds a Const for a varchar literal (unknown→varchar fold at
+// parse time). The on-disk varlena is byte-identical to text — only the consttype
+// (1043) and constcollid differ.
+func NewVarcharConst(s string) *Const {
+	return &Const{
+		ConstType: OidVarchar, ConstTypmod: -1, ConstCollid: DefaultCollationOid,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: textVarlena(s),
+	}
+}
+
+// NewBpcharConst builds a Const for a bpchar (char(N)) literal.
+func NewBpcharConst(s string) *Const {
+	return &Const{
+		ConstType: OidBpchar, ConstTypmod: -1, ConstCollid: DefaultCollationOid,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: textVarlena(s),
+	}
+}
+
+// bitVarlena builds the in-memory varlena for a bit or varbit Const's constvalue.
+// Format: VARHDRSZ_4B (4 bytes, VARSIZE_SHORT) + int32 bit_len (little-endian) +
+// ceil(bit_len/8) data bytes (left-aligned, MSB first, last byte zero-padded).
+// This is byte-identical to PG's VarBit (varbit.c) / bits8 on-disk representation.
+func bitVarlena(bitLen int32, data []byte) []byte {
+	total := 4 + 4 + len(data)
+	b := make([]byte, total)
+	binary.LittleEndian.PutUint32(b[:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(b[4:8], uint32(bitLen))
+	copy(b[8:], data)
+	return b
+}
+
+// parseBitFromString parses a bit-string literal like '10101010' into (bitLen,
+// packed bytes, ok). Only '0' and '1' are accepted; empty string → bitLen=0,
+// zero data bytes (just the header+bit_len). Returns (0, nil, false) on non-bit
+// characters. The packed bytes are left-aligned, MSB first, with the last byte
+// zero-padded on the right — byte-identical to PG's bit_in (varbit.c).
+func parseBitFromString(s string) (int32, []byte, bool) {
+	bitLen := int32(len(s))
+	if bitLen == 0 {
+		return 0, nil, true
+	}
+	nBytes := (int(bitLen) + 7) / 8
+	data := make([]byte, nBytes)
+	for i := 0; i < int(bitLen); i++ {
+		switch s[i] {
+		case '1':
+			data[i/8] |= 1 << (7 - (i % 8))
+		case '0':
+			// zero bit — no-op (byte is already zero)
+		default:
+			return 0, nil, false
+		}
+	}
+	return bitLen, data, true
+}
+
+// formatBit reverses parseBitFromString, producing the canonical bit string
+// representation (e.g. '10101010') from the packed VarBit datum. The bitLen
+// and data bytes are decoded from the varlena that bitVarlena produced.
+func formatBit(bitLen int32, data []byte) string {
+	if bitLen == 0 {
+		return ""
+	}
+	b := make([]byte, bitLen)
+	for i := int32(0); i < bitLen; i++ {
+		if data[i/8]&(1<<(7-(i%8))) != 0 {
+			b[i] = '1'
+		} else {
+			b[i] = '0'
+		}
+	}
+	return string(b)
+}
+
+// bitLenFromVarlena extracts the bit_len int32 from a bit/varbit varlena
+// (the 4-byte little-endian word at offset 4, after the VARSIZE header).
+func bitLenFromVarlena(b []byte) int32 {
+	return int32(binary.LittleEndian.Uint32(b[4:8]))
+}
+
+// bitDataFromVarlena extracts the raw data bytes from a bit/varbit varlena
+// (everything after the 8-byte header: VARSIZE + bit_len).
+func bitDataFromVarlena(b []byte) []byte {
+	total := binary.LittleEndian.Uint32(b[:4]) >> 2
+	return b[8:total]
+}
+
+// NewBitConst builds a Const for a bit(N) literal (consttype=1560, constcollid=0).
+func NewBitConst(s string) (*Const, error) {
+	bitLen, data, ok := parseBitFromString(s)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: invalid bit literal %q", s)
+	}
+	return &Const{
+		ConstType: OidBit, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: bitVarlena(bitLen, data),
+	}, nil
+}
+
+// NewVarBitConst builds a Const for a varbit (bit varying) literal (consttype=1562).
+func NewVarBitConst(s string) (*Const, error) {
+	bitLen, data, ok := parseBitFromString(s)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: invalid varbit literal %q", s)
+	}
+	return &Const{
+		ConstType: OidVarBit, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: -1, ConstByval: false, Location: -1,
+		Datum: bitVarlena(bitLen, data),
+	}, nil
 }
 
 // NumericData on-disk format constants (utils/adt/numeric.c). A numeric Const's
@@ -822,6 +948,44 @@ const (
 // microseconds since the PostgreSQL epoch — negative because it predates 2000.
 const unixEpochMicros = int64(unixEpochJDate-postgresEpochJDate) * 86400 * 1000000
 
+// PG18 sends date/timestamp infinities as constvalue = PG_INT32_MAX / PG_INT64_MAX
+// (datetime.h: DATE_END_VAL / TIMESTAMP_END_VAL), i.e. the hardware integer limits.
+// These are the adbin Const datums; the parse functions recognise the string forms.
+const (
+	dateInfinity      int32 = math.MaxInt32
+	dateNegInfinity   int32 = math.MinInt32
+	tsInfinity        int64 = math.MaxInt64
+	tsNegInfinity     int64 = math.MinInt64
+)
+
+// stripEraSuffix trims optional whitespace-suffixed "BC" or "AD" from s, returning
+// the trimmed string and whether the era is BC (as opposed to AD). The caller then
+// converts the calendar year to the astronomical year PG's date2j expects:
+//  1 BC → year 0, 2 BC → year −1, … (astronomical = 1 − original).
+// No suffix defaults to AD (eraNeg = false).
+func stripEraSuffix(s string) (rest string, eraNeg bool) {
+	if idx := strings.LastIndexByte(strings.ToUpper(s), 'B'); idx >= 0 {
+		// Check for "BC" suffix: the character before B must be a space and C must follow.
+		if idx > 0 && s[idx-1] == ' ' && idx+1 < len(s) && (s[idx+1] == 'C' || s[idx+1] == 'c') {
+			// Also check that C is at end of string or followed by space/end
+			rest := idx + 2
+			if rest == len(s) || s[rest] == ' ' {
+				return strings.TrimSpace(s[:idx-1]), true
+			}
+		}
+	}
+	// Check for "AD" suffix.
+	if idx := strings.LastIndexByte(strings.ToUpper(s), 'A'); idx >= 0 {
+		if idx > 0 && s[idx-1] == ' ' && idx+1 < len(s) && (s[idx+1] == 'D' || s[idx+1] == 'd') {
+			rest := idx + 2
+			if rest == len(s) || s[rest] == ' ' {
+				return strings.TrimSpace(s[:idx-1]), false
+			}
+		}
+	}
+	return s, false
+}
+
 // date2j is PostgreSQL's Gregorian date → Julian day number (datetime.c:date2j),
 // exact integer arithmetic (no floating point, correct across the proleptic
 // calendar). Used to convert a parsed timestamp's calendar fields to a day count.
@@ -878,6 +1042,61 @@ func NewTimestamptzConst(usec int64) *Const {
 	}
 }
 
+// NewTimestampConst builds a Const for a timestamp value (μs since the
+// PostgreSQL epoch, without timezone). Same wire form as timestamptz
+// (constlen 8, constbyval true) but consttype 1114 and no timezone
+// semantics — the stored microseconds are the wall-clock value, not a
+// UTC instant.
+func NewTimestampConst(usec int64) *Const {
+	return &Const{
+		ConstType: OidTimestamp, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(usec),
+	}
+}
+
+// NewTimeConst builds a Const for a time value (TimeADT: μs since midnight).
+// Same wire form as timestamp/timestamptz (constlen 8, constbyval true) but
+// consttype 1083 — the stored microseconds are the time-of-day value.
+func NewTimeConst(micros int64) *Const {
+	return &Const{
+		ConstType: OidTime, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(micros),
+	}
+}
+
+// NewTimeTZConst builds a Const for a time-with-time-zone value (TimeTzADT:
+// 8 bytes TimeADT μs since midnight + 4 bytes int32 timezone offset in seconds).
+// PG stores the zone offset with the opposite sign convention: a POSITIVE
+// zoneOffset (east of UTC) is stored as a NEGATIVE int32. This function accepts
+// the human convention (positive = east) and negates it for on-disk storage.
+// timetz is a by-reference type (constlen 12, constbyval false) — the 12-byte
+// datum is stored directly as []byte so outDatum emits the raw bytes in signed
+// decimal, matching PG's constvalue output byte-for-byte.
+func NewTimeTZConst(micros int64, zoneOffset int32) *Const {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint64(b[:8], uint64(micros))
+	// PG convention: east of UTC is negative.
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(-zoneOffset)))
+	return &Const{
+		ConstType: OidTimeTZ, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 12, ConstByval: false, Location: -1,
+		Datum: b,
+	}
+}
+
+// decodeTimeTZDatum extracts the (micros, zoneOffset) from a 12-byte timetz datum.
+// The returned zoneOffset is in PG storage convention (east of UTC is negative).
+func decodeTimeTZDatum(datum []byte) (micros int64, zoneOffset int32) {
+	if len(datum) < 12 {
+		return 0, 0
+	}
+	micros = int64(binary.LittleEndian.Uint64(datum[:8]))
+	zoneOffset = int32(binary.LittleEndian.Uint32(datum[8:12]))
+	return
+}
+
 // NewDateConst builds a Const for a date value (DateADT: signed int32 days since
 // the PostgreSQL epoch, 2000-01-01). It is by-value (constlen 4, constbyval true,
 // constcollid 0) and sign-extends into the 8-byte datum word so a pre-2000 date
@@ -901,9 +1120,20 @@ func NewDateConst(days int32) *Const {
 // 32 so only a genuine date literal folds.
 func parseDateDays(s string) (int32, bool) {
 	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return dateInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return dateNegInfinity, true
+	}
+	// Strip an era suffix (BC/AD) before parsing the date fields.
+	s, eraNeg := stripEraSuffix(s)
 	y, m, d, ok := parseDateFields(s)
 	if !ok || y < 1 {
 		return 0, false
+	}
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
 	}
 	jd := date2j(y, m, d)
 	if ry, rm, rd := j2date(jd); ry != y || rm != m || rd != d {
@@ -916,7 +1146,17 @@ func parseDateDays(s string) (int32, bool) {
 // "YYYY-MM-DD" literal, the inverse of parseDateDays (used by the rebuild path so
 // a re-resolve is a fixed point).
 func formatDate(days int32) string {
+	if days == dateInfinity {
+		return "infinity"
+	}
+	if days == dateNegInfinity {
+		return "-infinity"
+	}
 	y, m, d := j2date(int(days) + postgresEpochJDate)
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		return fmt.Sprintf("%04d-%02d-%02d BC", 1-y, m, d)
+	}
 	return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 }
 
@@ -929,6 +1169,12 @@ func formatDate(days int32) string {
 // offset, depends on the server's TimeZone and is left to SQL-text fallback.
 func parseTimestamptzMicros(s string) (int64, bool) {
 	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return tsInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return tsNegInfinity, true
+	}
 	if strings.EqualFold(s, "epoch") {
 		return unixEpochMicros, true
 	}
@@ -954,6 +1200,9 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 	}
 	timeStr, offStr := rest[:off], rest[off:]
 
+	// Strip an era suffix (BC/AD) from the offset tail (e.g. "00+00 BC").
+	offStr, eraNeg := stripEraSuffix(offStr)
+
 	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
 	if !ok {
 		return 0, false
@@ -963,11 +1212,109 @@ func parseTimestamptzMicros(s string) (int64, bool) {
 		return 0, false
 	}
 
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
+	}
+
 	days := int64(date2j(y, mo, d) - postgresEpochJDate)
 	// UTC instant = wall-clock at the given offset minus that offset.
 	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss) - offSec
 	return totalSec*1000000 + fracUsec, true
 }
+
+// parseTimestampMicros parses a timestamp literal (without timezone) into
+// microseconds since the PostgreSQL epoch, returning ok=false for anything
+// outside the deterministic subset (which the resolver then degrades to SQL
+// text). PG folds such a literal at parse time using timestamp_in; since
+// timestamp has no timezone semantics, the wall-clock date+time converts
+// directly to microseconds without any offset adjustment. Supported forms:
+// "YYYY-MM-DD HH:MI:SS[.ffffff]", the 'epoch' keyword.
+func parseTimestampMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "infinity") {
+		return tsInfinity, true
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "infinity negative") {
+		return tsNegInfinity, true
+	}
+	if strings.EqualFold(s, "epoch") {
+		return unixEpochMicros, true
+	}
+
+	// Strip an era suffix (BC/AD) before splitting date from time.
+	s, eraNeg := stripEraSuffix(s)
+
+	// Split the date from the time part on the first space or 'T'.
+	sep := strings.IndexAny(s, " Tt")
+	if sep < 0 {
+		return 0, false
+	}
+	dateStr, timeStr := s[:sep], s[sep+1:]
+
+	y, mo, d, ok := parseDateFields(dateStr)
+	if !ok {
+		return 0, false
+	}
+	if eraNeg {
+		y = 1 - y // 1 BC → astronomical year 0, 2 BC → −1, …
+	}
+
+	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
+	if !ok {
+		return 0, false
+	}
+
+	days := int64(date2j(y, mo, d) - postgresEpochJDate)
+	// Wall-clock value with no timezone offset.
+	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss)
+	return totalSec*1000000 + fracUsec, true
+}
+
+// parseTimeMicros parses a time literal (without timezone) into microseconds since
+// midnight, returning ok=false for anything outside the deterministic subset (which
+// the resolver then degrades to SQL text). PG folds such a literal at parse time
+// using time_in. Supported forms: "HH:MI:SS[.ffffff]", "HH:MI".
+func parseTimeMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	hh, mi, ss, fracUsec, ok := parseTimeFields(s)
+	if !ok {
+		return 0, false
+	}
+	totalSec := int64(hh)*3600 + int64(mi)*60 + int64(ss)
+	return totalSec*1000000 + fracUsec, true
+}
+
+// parseTimeTZMicros parses a timetz literal into (microseconds since midnight,
+// zoneOffset in seconds), returning ok=false for anything outside the deterministic
+// subset (which the resolver then degrades to SQL text). PG folds such a literal at
+// parse time using timetz_in. Supported forms: "HH:MI:SS[.ffffff]+HH:MI",
+// "HH:MI:SS[.ffffff]-HH:MI", "HH:MI:SS[.ffffff]Z".
+func parseTimeTZMicros(s string) (micros int64, zoneOffset int32, ok bool) {
+	s = strings.TrimSpace(s)
+
+	// Locate the timezone offset: the first '+', '-', or 'Z'/'z' in the string
+	// (the time part itself contains only digits, ':' and '.').
+	off := strings.IndexAny(s, "+-Zz")
+	if off < 0 {
+		return 0, 0, false
+	}
+	timeStr, offStr := s[:off], s[off:]
+
+	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
+	if !ok {
+		return 0, 0, false
+	}
+	offSec, ok := parseTZOffsetSeconds(offStr)
+	if !ok {
+		return 0, 0, false
+	}
+
+	totalSec := int64(hh)*3600 + int64(mi)*60 + int64(ss)
+	// Return in human convention (positive = east of UTC). NewTimeTZConst
+	// negates for PG storage convention (east is negative).
+	return totalSec*1000000 + fracUsec, int32(offSec), true
+}
+
 
 // parseDateFields parses "YYYY-MM-DD" (each field a plain non-negative integer;
 // BC / variable-form years are out of the supported subset).
@@ -1119,6 +1466,12 @@ func parseTZOffsetSeconds(s string) (int64, bool) {
 // resolve→Rebuild→re-resolve is a fixed point. The rendering need not match
 // timestamptz_out's session-TimeZone form — only round-trip to the same instant.
 func formatTimestamptzUTC(usec int64) string {
+	if usec == tsInfinity {
+		return "infinity"
+	}
+	if usec == tsNegInfinity {
+		return "-infinity"
+	}
 	day := usec / usecsPerDay
 	rem := usec % usecsPerDay
 	if rem < 0 {
@@ -1133,7 +1486,12 @@ func formatTimestamptzUTC(usec int64) string {
 	ss := sec % 60
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", 1-y, mo, d, hh, mi, ss)
+	} else {
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	}
 	if fracUsec > 0 {
 		frac := fmt.Sprintf("%06d", fracUsec)
 		frac = strings.TrimRight(frac, "0")
@@ -1141,5 +1499,117 @@ func formatTimestamptzUTC(usec int64) string {
 		sb.WriteString(frac)
 	}
 	sb.WriteString("+00")
+	if y <= 0 {
+		sb.WriteString(" BC")
+	}
+	return sb.String()
+}
+
+// formatTimestamp formats a timestamp μs value into a canonical "YYYY-MM-DD
+// HH:MI:SS[.ffffff]" literal (no timezone). It is the timestamp analogue of
+// formatTimestamptzUTC: same date/time decomposition but without the +00
+// offset, so a re-resolve through parseTimestampMicros reproduces the
+// identical Const.
+func formatTimestamp(usec int64) string {
+	if usec == tsInfinity {
+		return "infinity"
+	}
+	if usec == tsNegInfinity {
+		return "-infinity"
+	}
+	day := usec / usecsPerDay
+	rem := usec % usecsPerDay
+	if rem < 0 {
+		rem += usecsPerDay
+		day--
+	}
+	y, mo, d := j2date(int(day) + postgresEpochJDate)
+	sec := rem / 1000000
+	fracUsec := rem % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	if y <= 0 {
+		// BC dates: astronomical year 0 = 1 BC, −1 = 2 BC, …
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", 1-y, mo, d, hh, mi, ss)
+	} else {
+		fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	}
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+	if y <= 0 {
+		sb.WriteString(" BC")
+	}
+	return sb.String()
+}
+
+// formatTime formats a time μs-since-midnight value into a canonical
+// "HH:MM:SS[.ffffff]" literal (without trailing zeros) — the inverse of
+// parseTimeMicros, so a re-resolve through parseTimeMicros reproduces the
+// identical Const.
+func formatTime(micros int64) string {
+	if micros < 0 {
+		micros = 0
+	}
+	sec := micros / 1000000
+	fracUsec := micros % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%02d:%02d:%02d", hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+	return sb.String()
+}
+
+// formatTimeTZ formats a timetz value (microseconds since midnight + zone offset
+// in PG storage convention where east of UTC is negative) into a canonical
+// "HH:MM:SS[.ffffff]+HH:MI" / "-HH:MI" literal. It is the inverse of
+// parseTimeTZMicros, so a re-resolve reproduces the identical Const (rebuild fixed
+// point). The zone offset is negated for display (human convention: + = east).
+func formatTimeTZ(micros int64, zoneOffset int32) string {
+	if micros < 0 {
+		micros = 0
+	}
+	sec := micros / 1000000
+	fracUsec := micros % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%02d:%02d:%02d", hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+
+	// Negate from PG storage convention back to display convention.
+	off := -zoneOffset
+	if off == 0 {
+		sb.WriteString("+00")
+	} else if off < 0 {
+		sb.WriteByte('-')
+		off = -off
+	} else {
+		sb.WriteByte('+')
+	}
+	oh := off / 3600
+	om := (off % 3600) / 60
+	fmt.Fprintf(&sb, "%02d:%02d", oh, om)
 	return sb.String()
 }

@@ -192,20 +192,21 @@ func TestExplainAnalyzeHashJoinReportsGrownBatches(t *testing.T) {
 	//     enumerator: at a low row count the cheapest join really is a nested
 	//     loop, so the searched arm produced no hash join to grow.
 	//
-	// The width gap is left. `buildGeometry` passes avgVarBytes = 0 because
-	// goopg has no per-column average-width statistic, so a build is sized as
-	// if only its fixed-width Datum array were resident and a text-heavy one
-	// is under-counted by however wide its values are (operators_join_agg.go,
-	// deferral ledger 2026-08-03 M0127-P3.1). 400 rows of 2 kB text price as
-	// ~19 kB and occupy ~800 kB, so the geometry picks its nbatch from the
-	// former and the batch state grows on the measured overrun — which is the
-	// safety net P3.1 documented as the reason the low bias is tolerable, now
-	// under test.
+	// The width gap is left. `buildGeometry` reads avgVarBytes from the plan's
+	// AvgVarBytes field (M0128-P3.1), fed from ANALYZE column-width stats. This
+	// fixture has no ANALYZE stats, so AvgVarBytes is 0 and the geometry still
+	// under-counts a text-heavy build — the build sizes as if only the 48-byte
+	// Datum array were resident. 400 rows of 2 kB text price as ~19 kB and
+	// occupy ~800 kB, so the geometry picks its nbatch from the former and the
+	// batch state grows on the measured overrun.
 	//
-	// TRIPWIRE: when avgVarBytes is populated the geometry will pick the final
-	// nbatch up front and this test will fail with "nbatch never grew". That
-	// is the correct outcome to see, not a flake — re-derive the fixture then,
-	// against whatever estimate remains wrong.
+	// ADJUDICATED (M0128-P3.1): this test remains as the no-stats safety net.
+	// When ANALYZE stats ARE present on a text-heavy column, avgVarBytes is
+	// non-zero and the geometry picks the final nbatch up front — the growth
+	// path is never exercised and EXPLAIN shows no (originally …) form. That
+	// is correct behaviour and the positive-control test for it is a new test
+	// (not this one) that ANALYZEs a text-heavy column and asserts Batches: N
+	// with no (originally N).
 	ctx := spillFixtureWidth(t, 100, 400, 400, 2000)
 	ctx.WorkMem = 64 << 10
 

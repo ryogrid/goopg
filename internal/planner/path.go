@@ -67,6 +67,16 @@ const (
 	// `NestedLoopIndexJoin.InnerMemo` rather than as a free-standing node —
 	// which is why `createPlanNode` has no arm for it (M0127-P5.4b-ii-b-2).
 	PathMemoize
+
+	// M0128-P2.4: bitmap scan path kinds. PathBitmapIndexScan is the index-
+	// access leaf (MultiExec-style, feeds a TIDBitmap); PathBitmapHeapScan
+	// consumes the bitmap with page-at-a-time heap access; PathBitmapAnd /
+	// PathBitmapOr combine multiple bitmap sub-trees. Design:
+	// docs/design/0128-0001-bitmap-heap-scan.md §3.4.
+	PathBitmapIndexScan
+	PathBitmapHeapScan
+	PathBitmapAnd
+	PathBitmapOr
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -191,6 +201,16 @@ type RelOptInfo struct {
 	// what the executor's Join concatenates). Zero on a rel built by a test
 	// that does not care, which `relNCols` reads as "unknown".
 	NCols int
+
+	// AvgVarBytes is the average total variable-width payload per row, in
+	// bytes — the sum of the per-column average widths (ColumnStats.AvgWidth)
+	// across every column of this relation. It feeds `hashsize.EntryBytes` as
+	// the `avgVarBytes` parameter, replacing the hardcoded zero that under-
+	// counted text-heavy builds. Set alongside NCols by the same two
+	// constructors; absent (zero) on a rel whose columns have never been
+	// ANALYZEd, and zero for every fixed-width relation — both are correct.
+	// M0128-P3.1.
+	AvgVarBytes float64
 
 	Pathlist        []*Path
 	PartialPathlist []*Path

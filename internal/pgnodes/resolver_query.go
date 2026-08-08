@@ -350,14 +350,21 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 			return resolveBoolBinaryWith(v, BoolExprOr, s.resolveExpr)
 		}
 		lNode, lType, err := s.resolveExpr(v.Left, 0)
-		if err != nil {
-			return nil, 0, err
-		}
-		rNode, rType, err := s.resolveExpr(v.Right, 0)
-		if err != nil {
-			return nil, 0, err
-		}
-		return buildOpExpr(lNode, lType, rNode, rType, v.Op.String())
+			if err != nil {
+				return nil, 0, err
+			}
+			rNode, rType, err := s.resolveExpr(v.Right, 0)
+			if err != nil {
+				return nil, 0, err
+			}
+			// Operator-driven implicit coercion: if one operand is a concrete
+			// typed column reference and the other is an unknown-type text literal
+			// (from a string constant), PG coerces the unknown literal to match
+			// the typed operand before operator lookup.  Without this a
+			// timestamptz/int2/numeric string literal compared to a typed column
+			// stays text and buildOpExpr cannot find a cross-type operator.
+			lNode, lType, rNode, rType = coerceUnknownForOp(lNode, lType, rNode, rType)
+			return buildOpExpr(lNode, lType, rNode, rType, v.Op.String())
 
 	case *parser.FuncCall:
 		if err := funcCallGuard(v); err != nil {
@@ -433,4 +440,46 @@ func (s *queryScope) selectedCols() Bitmapset {
 		bms[i] = a + selectedColsBias
 	}
 	return bms
+}
+
+// coerceUnknownForOp implements PG's operator-driven implicit coercion for
+// unknown-type literals.  When one operand of a binary operator is a typed
+// column reference and the other is an unknown-type text constant (from a
+// string literal resolved without type context), PG coerces the unknown
+// literal to match the typed operand's type before operator lookup.
+//
+// This is how PG resolves e.g. ts_col > '2024-01-01' (timestamptz vs
+// unknown→timestamptz) or int2_col = '5' (int2 vs unknown→int2).  Without
+// this pass, the unknown literal stays text and buildOpExpr cannot find a
+// cross-type operator in the catalog.
+func coerceUnknownForOp(lNode Node, lType uint32, rNode Node, rType uint32) (Node, uint32, Node, uint32) {
+	// Left typed, right unknown text — coerce right to left's type.
+	if lType != 0 && lType != OidText && rType == OidText {
+		if n, t := foldStringConstToType(rNode, lType); n != nil {
+			return lNode, lType, n, t
+		}
+	}
+	// Right typed, left unknown text — coerce left to right's type.
+	if rType != 0 && rType != OidText && lType == OidText {
+		if n, t := foldStringConstToType(lNode, rType); n != nil {
+			return n, t, rNode, rType
+		}
+	}
+	return lNode, lType, rNode, rType
+}
+
+// foldStringConstToType attempts to fold a text constant node to the target
+// type via foldStringLiteralConst.  Returns nil on failure (not a OidText Const
+// or the string cannot be represented in the target type).
+func foldStringConstToType(n Node, targetType uint32) (Node, uint32) {
+	c, ok := n.(*Const)
+	if !ok || c.ConstType != OidText {
+		return nil, 0
+	}
+	s := textFromVarlena(c.Datum)
+	nn, nt, ok := foldStringLiteralConst(s, targetType)
+	if !ok {
+		return nil, 0
+	}
+	return nn, nt
 }

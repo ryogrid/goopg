@@ -96,24 +96,51 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 	if err != nil || typ != targetType {
 		return nil, false
 	}
-	if targetType == OidNumeric {
+	switch {
+	case targetType == OidNumeric:
 		exprTypmod := numericNodeTypmod(n)
 		if targetTypmod >= 0 {
-			// The column has a length qualifier: coerce_type_typmod adds an implicit
-			// numeric() length coercion whenever the stored typmod differs from it.
 			if exprTypmod != targetTypmod {
 				n = wrapNumericLengthCoercion(n, targetTypmod)
 			}
 			return n, true
 		}
-		// Bare numeric column: an explicit `::numeric(p,s)` cast (exprTypmod >= 0) is
-		// re-labelled back to typmod -1 via an IMPLICIT RelabelType (coerce_type_typmod:
-		// target typmod -1 ⇒ the length coercion is a no-op, so PG emits a RelabelType,
-		// not a numeric() call). A default already at typmod -1 needs no relabel.
 		if exprTypmod >= 0 {
-			n = wrapNumericRelabelToBare(n, 2) // COERCE_IMPLICIT_CAST
+			n = wrapNumericRelabelToBare(n, 2)
 		}
-	}
+	case targetType == OidVarchar:
+		if targetTypmod >= 0 {
+			n = wrapVarcharLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidBpchar:
+		if targetTypmod >= 0 {
+			n = wrapBpcharLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidTimestamp:
+		if targetTypmod >= 0 {
+			n = wrapTimestampLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidTime:
+		if targetTypmod >= 0 {
+			n = wrapTimeLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidTimestamptz:
+		if targetTypmod >= 0 {
+			n = wrapTimestamptzLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidBit:
+		if targetTypmod >= 0 {
+			n = wrapBitLengthCoercion(n, targetTypmod)
+		}
+	case targetType == OidVarBit:
+			if targetTypmod >= 0 {
+				n = wrapVarBitLengthCoercion(n, targetTypmod)
+			}
+		case targetType == OidTimeTZ:
+			if targetTypmod >= 0 {
+				n = wrapTimeTZLengthCoercion(n, targetTypmod)
+			}
+		}
 	return n, true
 }
 
@@ -192,6 +219,224 @@ func NumericColumnTypmod(args []int64) int32 {
 		return tm
 	}
 	return -1
+}
+
+// ColumnTypmod packs column type arguments into PG's atttypmod for the modeled
+// length-coercion types, or returns -1 when the column carries no length qualifier.
+// The writer passes this to ResolveForColumnTypmod so a DEFAULT is emitted
+// canonically only when the column typmod matches.
+func ColumnTypmod(typeName string, args []int64) int32 {
+	switch typeName {
+	case "numeric", "decimal":
+		return NumericColumnTypmod(args)
+	case "varchar", "character varying", "char", "character", "bpchar":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = maxlen + VARHDRSZ (4). Goes directly into the
+			// varchar/bpchar(..., int4 typmod, ...) coercion FuncExpr.
+			return int32(args[0]) + 4
+		}
+		return -1
+	case "timestamp":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
+	case "time", "time without time zone":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
+	case "timestamptz":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
+	case "timetz", "time with time zone":
+		if len(args) == 1 && args[0] >= 0 && args[0] <= 6 {
+			// typmod = precision (0-6 only; PG rejects negative and >6).
+			return int32(args[0])
+		}
+		return -1
+	case "bit":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = N (the bit length directly, no VARHDRSZ offset).
+			return int32(args[0])
+		}
+		return -1
+	case "bit varying", "varbit":
+		if len(args) == 1 && args[0] > 0 {
+			// typmod = N (the maximum bit length).
+			return int32(args[0])
+		}
+		return -1
+	default:
+		return -1
+	}
+}
+
+// wrapVarcharLengthCoercion wraps n in an IMPLICIT varchar(varchar,int4,bool) FuncExpr
+// (funcid 669, funcformat 2), the coerce_type_typmod length coercion PG applies when a
+// varchar column's typmod differs from the stored default's. The inner varchar Const
+// carries typmod -1; the outer FuncExpr carries the column's packed typmod (maxlen+4) as
+// arg 2 and isExplicit=false as arg 3. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapVarcharLengthCoercion(n Node, packedTypmod int32) Node {
+	return &FuncExpr{
+		Funcid:         669, // varchar(varchar,int4,bool)
+		Funcresulttype: OidVarchar,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     DefaultCollationOid,
+		Inputcollid:    DefaultCollationOid,
+		Args:           []Node{n, NewInt4Const(packedTypmod), NewBoolConst(false)},
+		Location:       -1,
+	}
+}
+
+// wrapBpcharLengthCoercion wraps n in an IMPLICIT bpchar(bpchar,int4,bool) FuncExpr
+// (funcid 668, funcformat 2). Same pattern as varchar but with OID 1042.
+func wrapBpcharLengthCoercion(n Node, packedTypmod int32) Node {
+	return &FuncExpr{
+		Funcid:         668, // bpchar(bpchar,int4,bool)
+		Funcresulttype: OidBpchar,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     DefaultCollationOid,
+		Inputcollid:    DefaultCollationOid,
+		Args:           []Node{n, NewInt4Const(packedTypmod), NewBoolConst(false)},
+		Location:       -1,
+	}
+}
+
+// wrapTimestampLengthCoercion wraps n in an IMPLICIT timestamp(timestamp,int4)
+// FuncExpr (funcid 1961, funcformat 2), the coerce_type_typmod length coercion
+// PG applies when a timestamp(N) column's precision differs from the stored
+// default's. The FuncExpr carries the column's precision as an int4 Const
+// (typmod = N, 0-6). Unlike varchar/bpchar, there is no bool isExplicit third
+// arg — the pg_cast entry for timestamp→timestamp is a two-argument function.
+// The inner timestamp Const carries typmod -1; the outer FuncExpr carries the
+// column's typmod. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapTimestampLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1961, // timestamp(timestamp,int4)
+		Funcresulttype: OidTimestamp,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimeLengthCoercion wraps a time Const in the IMPLICIT time(time,int4)
+// FuncExpr (funcid 1968, funcformat 2 = COERCE_IMPLICIT_CAST) that coerce_type_typmod
+// adds when a time(N) column has a precision qualifier. PG's pg_cast.dat registers
+// the self-cast time→time (funcid 1968, castcontext 'i'). Without a qualifier
+// (typmod < 0) callers skip the wrap — the bare time Const has typmod -1.
+func wrapTimeLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1968, // time(time,int4)
+		Funcresulttype: OidTime,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimestamptzLengthCoercion wraps n in an IMPLICIT timestamptz(timestamptz,int4)
+// FuncExpr (funcid 1967, funcformat 2), the coerce_type_typmod length coercion
+// PG applies when a timestamptz(N) column's precision differs from the stored
+// default's. The FuncExpr carries the column's precision as an int4 Const
+// (typmod = N, 0-6). Like timestamp, there is no bool isExplicit third arg —
+// the pg_cast entry for timestamptz→timestamptz is a two-argument function.
+// The inner timestamptz Const carries typmod -1; the outer FuncExpr carries the
+// column's typmod. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapTimestamptzLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1967, // timestamptz(timestamptz,int4)
+		Funcresulttype: OidTimestamptz,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapTimeTZLengthCoercion wraps n in an IMPLICIT timetz(timetz,int4) FuncExpr
+// (funcid 1969, funcformat 2), the coerce_type_typmod length coercion PG applies
+// when a timetz(N) column's precision differs from the stored default's. The
+// inner timetz Const carries typmod -1; the outer FuncExpr carries the column's
+// precision as an int4 Const (typmod = N, 0-6). Like time/timestamp/timestamptz,
+// there is no bool isExplicit third arg — the pg_cast entry for timetz→timetz
+// is a two-argument function. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapTimeTZLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1969, // timetz(timetz,int4)
+		Funcresulttype: OidTimeTZ,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod)},
+		Location:       -1,
+	}
+}
+
+// wrapBitLengthCoercion wraps n in an IMPLICIT bit(bit,int4,bool) FuncExpr
+// (funcid 1685, funcformat 2), the coerce_type_typmod length coercion PG applies
+// when a bit(N) column's length qualifier differs from the stored default's.
+// The inner bit Const carries typmod -1; the outer FuncExpr carries the column's
+// typmod (= N, the bit length, directly without offset) as arg 2 and
+// isExplicit=false as arg 3. Byte-identical to the same coercion in PG18.3's
+// pg_attrdef.adbin.
+func wrapBitLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1685, // bit(bit,int4,bool)
+		Funcresulttype: OidBit,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod), NewBoolConst(false)},
+		Location:       -1,
+	}
+}
+
+// wrapVarBitLengthCoercion wraps n in an IMPLICIT varbit(varbit,int4,bool)
+// FuncExpr (funcid 1687, funcformat 2), the coerce_type_typmod length coercion
+// PG applies when a bit varying(N) column's length qualifier differs from the
+// stored default's. Same pattern as bit but with OID 1562.
+func wrapVarBitLengthCoercion(n Node, typmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1687, // varbit(varbit,int4,bool)
+		Funcresulttype: OidVarBit,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(typmod), NewBoolConst(false)},
+		Location:       -1,
+	}
 }
 
 // resolve returns the IR node AND its result type OID (needed to forward-resolve
@@ -387,6 +632,34 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 		if usec, ok := parseTimestamptzMicros(s); ok {
 			return NewTimestamptzConst(usec), OidTimestamptz, true
 		}
+	case OidTime:
+		if micros, ok := parseTimeMicros(s); ok {
+			return NewTimeConst(micros), OidTime, true
+		}
+	case OidTimeTZ:
+		if micros, off, ok := parseTimeTZMicros(s); ok {
+			return NewTimeTZConst(micros, off), OidTimeTZ, true
+		}
+	case OidTimestamp:
+		if usec, ok := parseTimestampMicros(s); ok {
+			return NewTimestampConst(usec), OidTimestamp, true
+		}
+	case OidVarchar:
+		// unknown→varchar fold: same varlena as text, different consttype (1043).
+		return NewVarcharConst(s), OidVarchar, true
+	case OidBpchar:
+		// unknown→bpchar fold.
+		return NewBpcharConst(s), OidBpchar, true
+	case OidBit:
+		// unknown→bit fold: parse bit-string → VarBit varlena Const (1560).
+		if c, err := NewBitConst(s); err == nil {
+			return c, OidBit, true
+		}
+	case OidVarBit:
+		// unknown→varbit fold: parse bit-string → VarBit varlena Const (1562).
+		if c, err := NewVarBitConst(s); err == nil {
+			return c, OidVarBit, true
+		}
 	}
 	return nil, 0, false
 }
@@ -517,6 +790,33 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 func resolveNumericTypmodCast(v *parser.CastExpr) (Node, uint32, error) {
 	typmod, ok := numericTypmodValue(v.Typmods)
 	if !ok {
+		return nil, 0, ErrUnsupported
+	}
+	// An unknown-type string literal cast to numeric(p,s) — e.g.
+	// '5.5'::numeric(10,2) — folds at parse time in PG: coerce_type first
+	// converts the unknown literal to a bare numeric Const via
+	// stringTypeToConst → numeric_in, then coerce_type_typmod applies the
+	// length coercion numeric(numeric,int4). The bare-numeric fold step
+	// already exists (foldStringLiteralConst), and the length-coercion
+	// wrapper is shared with the integer-operand path below. (M0123-S4
+	// sub-slice 30: typmod'd string numeric cast.)
+	if lit, isStr := v.Operand.(*parser.StringConst); isStr {
+		if n, _, ok2 := foldStringLiteralConst(pgTrimSpace(lit.Value), OidNumeric); ok2 {
+			return &FuncExpr{
+				Funcid:         1703, // numeric(numeric, int4) length coercion
+				Funcresulttype: OidNumeric,
+				Funcretset:     false,
+				Funcvariadic:   false,
+				Funcformat:     1, // COERCE_EXPLICIT_CAST
+				Funccollid:     0,
+				Inputcollid:    0,
+				Args:           []Node{n, NewInt4Const(typmod)},
+				Location:       -1,
+			}, OidNumeric, nil
+		}
+		// A string literal that can't fold to numeric (e.g. non-numeric
+		// text) degrades to SQL text — PG would reject it at parse time
+		// via numeric_in, so there is no canonical byte sequence to match.
 		return nil, 0, ErrUnsupported
 	}
 	arg, srcType, err := resolve(v.Operand, 0)
@@ -760,6 +1060,12 @@ func resolveIntLiteral(v int64, expected uint32) (Node, uint32, error) {
 	if expected == OidNumeric {
 		return wrapIntToNumericCast(c, ityp), OidNumeric, nil
 	}
+	// Same pattern for int2 (smallint): a bare integer literal is int4, then
+	// coerce_to_target wraps it in an IMPLICIT-CAST FuncExpr — int2(int4) (314)
+	// or int2(int8) (714). PG never stores a bare int2 Const for a literal.
+	if expected == OidInt2 {
+		return wrapIntToInt2Cast(c, ityp), OidInt2, nil
+	}
 	return c, ityp, nil
 }
 
@@ -775,6 +1081,28 @@ func wrapIntToNumericCast(arg Node, argType uint32) Node {
 	return &FuncExpr{
 		Funcid:         funcid,
 		Funcresulttype: OidNumeric,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
+}
+
+// wrapIntToInt2Cast builds the implicit int->int2 coercion FuncExpr that PG's
+// coerce_type emits for a bare integer literal in an int2 context. funcid:
+// int2(int4) (314) for int4, int2(int8) (714) for int8. funcformat =
+// COERCE_IMPLICIT_CAST (2); funcresulttype = int2.
+func wrapIntToInt2Cast(arg Node, argType uint32) Node {
+	funcid := uint32(314) // int2(int4)
+	if argType == OidInt8 {
+		funcid = 714 // int2(int8)
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: OidInt2,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -848,6 +1176,40 @@ func wrapToFloat8Cast(arg Node, fromType uint32) Node {
 	return &FuncExpr{
 		Funcid:         funcid,
 		Funcresulttype: OidFloat8,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
+}
+
+// wrapToFloat4Cast builds the implicit <numeric-family>->float4 coercion FuncExpr
+// PG's coerce_type emits for an int4/int8/numeric CASE result promoted to a
+// common float4 type (float4 is the widest type present when no float8 member
+// exists; it is NOT a preferred type, so it wins only via the pairwise walk).
+// The cast function is chosen by the source type per pg_cast.dat (all castcontext
+// 'i' implicit, castmethod 'f'): float4(int4) 318, float4(int8) 652,
+// float4(numeric) 1745. funcresulttype float4; funcformat = COERCE_IMPLICIT_CAST
+// (2); no collation. The float4 side never needs a cast (identity). The caller
+// (coerceCaseResult) guarantees a supported source type.
+func wrapToFloat4Cast(arg Node, fromType uint32) Node {
+	var funcid uint32
+	switch fromType {
+	case OidInt4:
+		funcid = 318 // float4(int4)
+	case OidInt8:
+		funcid = 652 // float4(int8)
+	case OidNumeric:
+		funcid = 1745 // float4(numeric)
+	default:
+		return nil
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: OidFloat4,
 		Funcretset:     false,
 		Funcvariadic:   false,
 		Funcformat:     2, // COERCE_IMPLICIT_CAST
@@ -1246,13 +1608,10 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 // set (or a collatable/other-category type) returns false and the CASE degrades
 // to SQL text (all-or-nothing).
 //
-// The reachable common types are int4 < int8 < numeric < float8; a float4 result
-// WITHOUT any float8 result would make float4 the common type (float4 beats
-// numeric/int8/int4 in the walk) and PG then wraps the whole CASE in an outer
-// float8(float4) column cast — this canonicalizer has no int/numeric->float4
-// implicit-cast arm and emits no outer column cast, so that mix returns false and
-// degrades. Every accepted common type therefore has a coerceCaseResult arm for
-// each member present.
+// The reachable common types are int4 < int8 < numeric < float4 < float8;
+// float8 is the category's PREFERRED type and wins whenever present; float4 wins
+// over the exact-integer/numeric family when NO float8 member is present. Every
+// accepted common type has a coerceCaseResult arm for each narrower member.
 func selectCaseCommonType(types []uint32) (uint32, bool) {
 	if len(types) == 0 {
 		return 0, false
@@ -1290,9 +1649,7 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 		// it whenever any result is float8 — every other member coerces up to it.
 		return OidFloat8, true
 	case hasFloat4:
-		// float4 common type (float4 present, no float8): PG would wrap the whole
-		// CASE in an outer float8(float4) column cast; unmodeled -> degrade.
-		return 0, false
+			return OidFloat4, true
 	case hasNumeric:
 		return OidNumeric, true
 	case hasInt8:
@@ -1309,11 +1666,12 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 // the narrower result in the exact implicit-cast FuncExpr PG stores un-const-
 // folded: int4/int8 → numeric via int4_numeric (1740) / int8_numeric (1781),
 // int4 → int8 via int8(int4) (481), float4 → float8 via float8(float4) (311),
-// and int4/int8/numeric → float8 via float8(int4)/float8(int8)/float8(numeric)
-// (316/482/1746). No other coercion is modeled — the only mismatches
-// selectCaseCommonType can yield are these narrowing→widening cases within PG's
-// numeric type category, so this stays total for the accepted subset; anything
-// else returns ErrUnsupported.
+// int4/int8/numeric → float8 via float8(int4)/float8(int8)/float8(numeric)
+// (316/482/1746), and int4/int8/numeric → float4 via
+// float4(int4)/float4(int8)/float4(numeric) (318/652/1745). No other coercion is
+// modeled — the only mismatches selectCaseCommonType can yield are these
+// narrowing→widening cases within PG's numeric type category, so this stays total
+// for the accepted subset; anything else returns ErrUnsupported.
 func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	if fromType == toType {
 		return node, nil
@@ -1329,6 +1687,9 @@ func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	}
 	if toType == OidFloat8 && (fromType == OidInt4 || fromType == OidInt8 || fromType == OidNumeric) {
 		return wrapToFloat8Cast(node, fromType), nil
+	}
+	if toType == OidFloat4 && (fromType == OidInt4 || fromType == OidInt8 || fromType == OidNumeric) {
+		return wrapToFloat4Cast(node, fromType), nil
 	}
 	return nil, ErrUnsupported
 }

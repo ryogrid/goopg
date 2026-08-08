@@ -96,6 +96,22 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		// parameter, and emitting the bare child there would silently drop the
 		// cache the search costed.
 		panic("createPlan: PathMemoize outside a nested-loop inner; goopg's cache is NestedLoopIndexJoin.InnerMemo and has no free-standing node")
+	case PathBitmapHeapScan:
+		// M0128-P2.4: bitmap heap scan — the page-at-a-time heap visitor.
+		n := createBitmapHeapScanPlan(p)
+		return n, baseRelLayout(p.Rel, n)
+	case PathBitmapIndexScan:
+		// M0128-P2.4: bitmap index scan — the TIDBitmap producer leaf.
+		n := createBitmapIndexScanPlan(p)
+		return n, baseRelLayout(p.Rel, n)
+	case PathBitmapAnd:
+		// M0128-P2.4: bitmap intersection combinator.
+		n := buildBitmapAndOrPlan(p, true)
+		return n, baseRelLayout(p.Rel, n)
+	case PathBitmapOr:
+		// M0128-P2.4: bitmap union combinator.
+		n := buildBitmapAndOrPlan(p, false)
+		return n, baseRelLayout(p.Rel, n)
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.

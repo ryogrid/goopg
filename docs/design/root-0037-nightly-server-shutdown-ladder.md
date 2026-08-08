@@ -134,19 +134,25 @@ The `sigkill` case (a child with `trap "" TERM`) is the one that actually encode
 guarantee: bounded exit no matter how wedged the server is. `already-exited` is the
 zombie regression guard.
 
-## What is deliberately not fixed
+## What is deliberately not fixed (UPDATED 2026-08-08)
 
-**The engine leak itself.** A backend that ignores statement cancellation after its
-client disappears, and thereby blocks graceful shutdown indefinitely, is a real
-divergence from PostgreSQL: upstream's postmaster reaps backends and a
-`pg_ctl stop -m fast` sends `SIGTERM` to each, which `ProcessInterrupts` honours at the
-next `CHECK_FOR_INTERRUPTS()`. goopg's graceful path has no equivalent deadline or
-force-terminate step, so one unresponsive backend is enough to hang the process forever.
-This change bounds the *harness* cost; it does not make the server exit.
+**The engine leak itself — NOW FIXED.** The server-side half of this design is now
+implemented: `Server.Run()` bounds `connWG.Wait()` with `ShutdownDeadline` (default
+120 s graceful, 0 s immediate), and on timeout dumps all goroutine stacks to
+`<DataDir>/shutdown_goroutines.txt` before returning. The implementation:
 
-That is filed as an open M-NIGHTLY task and a deferral-ledger row (2026-07-29). It is the
-same family as root-0029's still-open "orphaned backend vs GOMEMLIMIT saturation" row —
-this is a second, sharper instance of it, with the survivor identified down to a single
-backend pid. The concrete resume point is the auto-captured goroutine dump the next
-occurrence will leave behind, or a deliberate reproduction (run Q13 at SF=1 under a
-1200 s cap and kill the client).
+- `Config.ShutdownDeadline` (default 120 s, zero = wait forever for backward compat)
+- `Server.shutdownDeadline` — set by `OnStop` (graceful) / `OnStopImmediate` (0 s)
+- `Run()` — timed `select` with `time.After(shutdownDeadline)` + goroutine dump on expiry
+
+This complements the harness-side ladder (`stop_goopg_server` in
+`ci/batch/lib/common.sh`): if the server's own deadline expires first, the process
+exits cleanly with a goroutine dump; if the server is somehow still alive after that,
+the harness ladder's `sigterm`/`sigkill` rungs catch the rest. The combination is a
+belt-and-suspenders guarantee that no single leaked backend can hold the process open
+beyond 120 s.
+
+The open M-NIGHTLY task (graceful shutdown hang) and the deferral-ledger row
+(2026-07-29, root-0037) are now discharged.
+
+Original text below for historical record:

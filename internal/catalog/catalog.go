@@ -1650,6 +1650,7 @@ type TableStats struct {
 type ColumnStats struct {
 	NDistinct int64      `json:"ndistinct,omitempty"`
 	NullFrac  float64    `json:"null_frac,omitempty"`
+	AvgWidth  float64    `json:"avg_width,omitempty"`   // stawidth (average width in bytes of variable payload per non-null value)
 	MCV       []MCVEntry `json:"mcv,omitempty"`
 	Histogram []string   `json:"histogram,omitempty"`
 

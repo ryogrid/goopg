@@ -1693,12 +1693,15 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
 
 ## Deferred
 
-- **Cross-family** float-common-*without*-float8 `CASE` mixes still degrade: a mix
-  whose PG common type is `float4` (float4 present, no float8) resolves to a
-  `float4` CASE wrapped in an outer `float8(float4)` column cast, which needs the
-  `int/numeric`→`float4` cast arms plus outer-column-cast modeling; and the
-  date-time families are not yet modeled. Sub-slice 16 covers every mix whose
-  common type is `int8`/`numeric`/`float8`.
+- **Cross-family** `CASE` mixes whose common type is `float4` (float4 present, no
+  float8) are NOW CANONICAL (sub-slice 32): `selectCaseCommonType` returns
+  `OidFloat4`, `coerceCaseResult` gains the `int4`/`int8`/`numeric`→`float4` arms
+  (`float4(int4)`=318 / `float4(int8)`=652 / `float4(numeric)`=1745, all
+  funcformat 2), and `isImplicitToFloat4Cast` in the rebuild path unwraps them.
+  No outer `float8(float4)` column cast is needed — PG stores `casetype 700`
+  directly. The per-result `float4()` conversion calls carry funcformat 0 and
+  round-trip through `catalog.RegprocName`; the implicit coercion arms carry
+  funcformat 2 and unwrap. The date-time families are not yet modeled.
 - Simple-form `WHEN`-value resolution now models both `make_op` phases — the
   native cross-type operator (sub-slice 18) and the coerce-value-up path
   (sub-slice 17, limited to the `int4/int8`→`numeric` widenings `coerceCaseResult`
@@ -1712,15 +1715,29 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   and the **view `ev_action` (`pg_rewrite`) path** (see the two oracle sections
   above); the view oracle's `liveRelationResolver` answers base-table column
   metadata from the live PG18 catalog.
-- Operator-driven implicit coercion in view quals (which would let a
-  `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
-  is also still SQL-text — only the exact scalar-column DEFAULT context folds a
-  `timestamptz`/numeric literal.
+- ~~Operator-driven implicit coercion in view quals~~ **LANDED 2026-08-08
+  (sub-slice 33).** `queryScope.resolveExpr`'s `BinaryOp` handler now calls
+  `coerceUnknownForOp` after resolving both operands: if one operand is a typed
+  column reference (not OidText) and the other is an OidText `Const` (from a
+  string literal), `foldStringConstToType` re-folds the text to the typed
+  operand's type via `foldStringLiteralConst`. This lets a
+  `timestamptz`/`int2`/`numeric`/`date` string literal resolve inside a view
+  `WHERE` — every type `foldStringLiteralConst` already supported for column
+  DEFAULTs now works for view-qual comparisons too. Oracle gate: 5 new ev_action
+  goldens (v14–v18) byte-identical to PG18.3.
 - **`::numeric(p,s)` on a typmod-mismatched column** (sub-slices 22–25): the
   `RelabelType` re-label that `coerce_type_typmod` emits when a column's typmod differs
   from the cast's is now in the IR — sub-slice 23 handles a `numeric(p',s')` mismatch
   (implicit length coercion), sub-slice 24 the bare `numeric` column DEFAULT (implicit
   `relabelformat` 2), and sub-slice 25 the explicit `(inner)::numeric` re-cast
   (`relabelformat` 1). Still deferred: typmod-qualified casts to the **other** length
-  types (`varchar(N)` = `CoerceViaIO`, `timestamp(N)`, `bit(N)`), and non-int/numeric
+  types (`timestamp(N)`, `bit(N)`/`varbit(N)`, `time(N)`); `varchar(N)` and
+  `bpchar(N)` length coercion are NOW CANONICAL (sub-slice 34). The CoerceViaIO
+  hypothesis was refuted: PG uses the same COERCION_PATH_FUNC approach as numeric —
+  `varchar(varchar,int4,bool)` (funcid 669) / `bpchar(bpchar,int4,bool)` (funcid
+  668), both implicit (funcformat 2), wrapping an inner varchar/bpchar Const folded
+  at parse time from the unknown-type string literal. The rebuild path unwraps the
+  implicit FuncExpr invisibly (like pg_get_expr) and the inner Const rebuilds to
+  a StringConst → fixed point. All 6 live PG18.3 oracle cases byte-identical.
+  Still deferred: non-int/numeric
   sources into `numeric(p,s)` (`int2`, the binary floats).

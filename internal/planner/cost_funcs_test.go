@@ -82,6 +82,7 @@ func TestHashJoinCost_BuildIsStartup(t *testing.T) {
 		outputRows:     8000,
 		numHashClauses: 1,
 		outerCols:      4, innerCols: 4,
+		outerAvgVarBytes: 0, innerAvgVarBytes: 0,
 	})
 	// A 1000-row, 4-column build is 216 kB against the 512 MB default budget,
 	// so NBatch is 1 and no spill I/O is charged (M0127-P5.7-a; before it, an
@@ -114,6 +115,7 @@ func TestHashJoinCost_SpillTermFiresExactlyWhenTheExecutorSpills(t *testing.T) {
 			outputRows:     rows,
 			numHashClauses: 1,
 			outerCols:      ncols, innerCols: ncols,
+			outerAvgVarBytes: 0, innerAvgVarBytes: 0,
 		}
 		got := hashJoinCost(cp, in)
 
@@ -128,8 +130,8 @@ func TestHashJoinCost_SpillTermFiresExactlyWhenTheExecutorSpills(t *testing.T) {
 			// PG's charge verbatim (costsize.c:4239-4248): the inner is
 			// written during the build (startup), then read back while the
 			// outer is written and read (run).
-			innerPages := spillPages(in.innerRows, ncols)
-			outerPages := spillPages(in.outerRows, ncols)
+			innerPages := spillPages(in.innerRows, ncols, 0)
+			outerPages := spillPages(in.outerRows, ncols, 0)
 			wantStartup += cp.seqPageCost * innerPages
 			wantRun += cp.seqPageCost * (innerPages + 2*outerPages)
 			spilled++
@@ -162,6 +164,7 @@ func TestHashJoinCost_SpillDependsOnFitNotOnSize(t *testing.T) {
 			outerRows: rows, innerRows: rows, outputRows: rows,
 			numHashClauses: 1,
 			outerCols:      ncols, innerCols: ncols,
+			outerAvgVarBytes: 0, innerAvgVarBytes: 0,
 		})
 	}
 	// Same row count, different widths: narrow fits, wide does not.

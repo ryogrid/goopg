@@ -91,13 +91,14 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 			}
 
 			N := VirtualNull
+			avgWidth := strconv.FormatFloat(cs.AvgWidth, 'g', -1, 32)
 			out = append(out, []string{
 				schema,    // 0:  schemaname
 				t.Name,    // 1:  tablename
 				col.Name,  // 2:  attname
 				"f",       // 3:  inherited (stainherit=false; goopg has no inheritance stats)
 				nullFrac,  // 4:  null_frac
-				"8",       // 5:  avg_width (placeholder, mirrors pg_statistic.stawidth)
+				avgWidth,  // 5:  avg_width (M0128-P3.1)
 				nDistinct, // 6:  n_distinct
 				mcVals,    // 7:  most_common_vals
 				mcFreqs,   // 8:  most_common_freqs

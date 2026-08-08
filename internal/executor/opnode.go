@@ -214,6 +214,14 @@ const (
 	// children; the joinOp itself is unchanged).
 	OpJoin
 
+	// M0128-P2.3: Bitmap scan operators.
+	// BitmapIndexScan produces a TIDBitmap; BitmapHeapScan consumes it.
+	// BitmapAnd/BitmapOr combine multiple bitmap subtrees.
+	OpBitmapIndexScan
+	OpBitmapHeapScan
+	OpBitmapAnd
+	OpBitmapOr
+
 	// Adapter — wraps a legacy Operator interface.
 	// All unmigrated operators use this until they are individually
 	// promoted to a concrete kind.

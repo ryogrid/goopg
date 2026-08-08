@@ -30,6 +30,33 @@ func (benchLogResolver) LookupRelation(schema, name string) (*RelationInfo, bool
 	}, true
 }
 
+// benchLog2Resolver is an extended bench_log table with extra column types
+// (timestamptz, int2, numeric, date) for testing operator-driven string-literal
+// coercion in view quals (M0123-S4 REMAINING #1).
+//
+//	CREATE TABLE bench_log2(client int, src text, taken timestamptz,
+//	                       priority int2, score numeric, registered date);
+type benchLog2Resolver struct{}
+
+func (benchLog2Resolver) LookupRelation(schema, name string) (*RelationInfo, bool) {
+	if (schema != "" && schema != "public") || name != "bench_log2" {
+		return nil, false
+	}
+	return &RelationInfo{
+		Relid:   16385,
+		Relname: "bench_log2",
+		Relkind: 'r',
+		Columns: []ColumnInfo{
+			{Name: "client", Attno: 1, TypeOID: OidInt4, Typmod: -1, Collation: 0},
+			{Name: "src", Attno: 2, TypeOID: OidText, Typmod: -1, Collation: DefaultCollationOid},
+			{Name: "taken", Attno: 3, TypeOID: OidTimestamptz, Typmod: -1, Collation: 0},
+			{Name: "priority", Attno: 4, TypeOID: OidInt2, Typmod: -1, Collation: 0},
+			{Name: "score", Attno: 5, TypeOID: OidNumeric, Typmod: -1, Collation: 0},
+			{Name: "registered", Attno: 6, TypeOID: OidDate, Typmod: -1, Collation: 0},
+		},
+	}, true
+}
+
 func parseSelect(t *testing.T, sql string) *parser.SelectStmt {
 	t.Helper()
 	stmts, err := parser.Parse(sql)
@@ -152,7 +179,37 @@ func TestResolveViewQueryUnsupported(t *testing.T) {
 		"SELECT client FROM bench_log UNION SELECT client FROM bench_log",
 	} {
 		if _, err := ResolveViewQuery(parseSelect(t, sql), benchLogResolver{}); err == nil {
-			t.Errorf("ResolveViewQuery(%q) = nil error, want ErrUnsupported", sql)
+				t.Errorf("ResolveViewQuery(%q) = nil error, want ErrUnsupported", sql)
+			}
 		}
 	}
-}
+
+	// TestResolveViewQueryStringLiteralCoercion verifies that a string literal
+	// compared to a typed column in a view WHERE clause is coerced to the column's
+	// type (operator-driven implicit coercion, M0123-S4 REMAINING #1). Before the
+	// fix, the string stayed OidText and buildOpExpr could not find a cross-type
+	// operator, degrading to SQL text.
+	func TestResolveViewQueryStringLiteralCoercion(t *testing.T) {
+		r := benchLog2Resolver{}
+		cases := []struct {
+			name, sql string
+		}{
+			{"timestamptz_coerce", "SELECT client, src FROM bench_log2 WHERE taken > '2024-01-01 00:00:00+00'"},
+			{"int2_coerce", "SELECT client, src FROM bench_log2 WHERE priority = '5'"},
+			{"numeric_coerce", "SELECT client, src FROM bench_log2 WHERE score > '3.14'"},
+			{"date_coerce", "SELECT client, src FROM bench_log2 WHERE registered = '2024-03-15'"},
+			{"timestamptz_left", "SELECT client, src FROM bench_log2 WHERE '2024-01-01 00:00:00+00' < taken"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				q, err := ResolveViewQuery(parseSelect(t, tc.sql), r)
+				if err != nil {
+					t.Fatalf("ResolveViewQuery: %v", err)
+				}
+				// Verify the query was resolved (not degraded to SQL text).
+				if q == nil {
+					t.Fatal("ResolveViewQuery returned nil Query")
+				}
+			})
+		}
+	}
