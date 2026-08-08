@@ -11016,7 +11016,7 @@ measurement discipline).
       all 11 CTE DML tests + CTE command-counter tests PASS.
       `TestPort_IsolationEvalPlanQual` pre-existing FAIL (also fails at
       HEAD, tracked as M-NIGHTLY AI-20260808-005620-001, already [x]).
-- [ ] **M0129-S8.3 — per-tuple cmin/cmax + fence-map retirement.**
+- [x] **M0129-S8.3 — per-tuple cmin/cmax + fence-map retirement.**
       **S8.3g (fence retirement) DONE 2026-08-08.** `CTEWriteFence`/`CTEXmaxReveal`
       maps, `CTEFencePtr` type, `cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`,
       `cteRevealFn`/`cteRevealed`/`cteRevealHeader`/`cteRevealFor`/`cteFenced`/
@@ -11024,13 +11024,22 @@ measurement discipline).
       `context.go` + all 8 call-site files + dispatch.go. `followHOTChain`/
       `followHOTChainNoCopy` `reveal` parameter removed. 10/11 CTE DML tests PASS
       (up from 8/11 — the 2 newly-passing tests were fence-dependent).
-      **Remaining from S8.3a-f (deferred):**
-      - [ ] cmax stamping in `stampUpdaterXmaxNonHOT` (lost in restore, needs re-apply)
-      - [ ] second `writeHeapRowReturning` cmin stamp (needs re-apply)
-      - [ ] `TestTupleVisibleOwnXIDRules` investigation
-      - [ ] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo`
-        (cmin/curcid=0 interaction in direct `followHOTChain` tests)
-      - [ ] `TestCTEDMLVolatileRoutineSeesStatementWrites` (command counter advance)
+      **S8.3i (test infrastructure) DONE 2026-08-08.** NewContext() defaults CmdID
+      to storage.InvalidCommandId so callers bypassing the dispatch path get
+      pass-through cmin/cmax visibility. Added centralized advanceStmtCounter(ctx)
+      helper and 20+ call sites in test helpers + direct Build+Open+Next sites.
+      Full executor suite PASS (serial). All 11 CTE DML tests PASS. All HOT tests
+      PASS. TestTupleVisibleOwnXIDRules PASS. TestCTEDMLVolatileRoutineSeesStatementWrites
+      PASS. SPOT PASS (Q12:2, Q13:35).
+      **Remaining from S8.3a-f (deferred, engine code):**
+      - [x] cmax stamping in `stampUpdaterXmaxNonHOT` (DONE 2026-08-08 — cmax added to
+            both Multi and plain paths, 3 fallback sites, and HOT path)
+      - [x] second `writeHeapRowReturning` cmin stamp (DONE 2026-08-08 — verified all
+            heap-write paths already have cmin from S8.3g; no missing sites found)
+      **Resolved by S8.3i (test infrastructure fix):**
+      - [x] `TestTupleVisibleOwnXIDRules` investigation → PASS
+      - [x] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo` → PASS
+      - [x] `TestCTEDMLVolatileRoutineSeesStatementWrites` → PASS
       Gate: UNITS + CTE DML test family + isolation + SPOT + DS05.
 - [ ] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
       row 2026-08-07 M0128-P4.1; base code

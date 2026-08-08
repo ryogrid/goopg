@@ -3354,10 +3354,23 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 		return err
 	}
 	if ok {
-		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
+		if cerr := storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2); cerr != nil {
+			return cerr
+		}
+		// M0129-S8.3: stamp the deleting command id (cmax) on the old
+		// tuple. Mirrors PG's heap_delete / heap_update calling
+		// HeapTupleHeaderSetCmax after the xmax write, so the visibility
+		// check can reveal the pre-image (cmax >= curcid) while hiding
+		// tuples inserted by later commands (cmin >= curcid).
+		return storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false)
 	}
 	if serr := storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx)); serr != nil {
 		return serr
+	}
+	// M0129-S8.3: stamp the deleting command id (cmax) on the old tuple.
+	// See the multi-path comment above for the visibility rationale.
+	if cerr := storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false); cerr != nil {
+		return cerr
 	}
 	// A key-changing UPDATE / DELETE must mark the old tuple HEAP_KEYS_UPDATED so
 	// a concurrent FOR KEY SHARE locker recognises the conflict and WAITS on the
@@ -3547,10 +3560,18 @@ func tryApplyHOTUpdate(
 				return perr
 			}
 			if ok {
-				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot)
+				if serr := storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot); serr != nil {
+					return serr
+				}
+				// M0129-S8.3: stamp cmax on the HOT old tuple.
+				return storage.PageSetHeapTupleCmax(s.Page(), oldSlot, ctx.GetCurrentCommandId(true), false)
 			}
 		}
-		return storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot)
+		if serr := storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot); serr != nil {
+			return serr
+		}
+		// M0129-S8.3: stamp cmax on the HOT old tuple.
+		return storage.PageSetHeapTupleCmax(s.Page(), oldSlot, ctx.GetCurrentCommandId(true), false)
 	}()
 	if stampErr != nil {
 		// Clean up the orphan new tuple: PageAddHeapTuple already
@@ -4330,6 +4351,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					if stampIdxErr == nil {
+						// M0129-S8.3: stamp cmax on the fallback path
+						// (PageGetHeapTuple failed — plain xmax stamp
+						// without locker preservation).
+						stampIdxErr = storage.PageSetHeapTupleCmax(s.Page(), pu.slot, o.ctx.GetCurrentCommandId(true), false)
+					}
 				}
 				if stampIdxErr != nil {
 					s.Unlock()
@@ -5043,6 +5070,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					if stampErr == nil {
+						// M0129-S8.3: stamp cmax on the fallback path.
+						stampErr = storage.PageSetHeapTupleCmax(s.Page(), pu.slot, o.ctx.GetCurrentCommandId(true), false)
+					}
 				}
 				if stampErr != nil {
 					s.Unlock()
@@ -5678,6 +5709,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				delStampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true)
 			} else {
 				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, effectiveWriterXID(o.ctx))
+				if delStampErr == nil {
+					// M0129-S8.3: stamp cmax on the fallback path.
+					delStampErr = storage.PageSetHeapTupleCmax(s.Page(), v.slot, o.ctx.GetCurrentCommandId(true), false)
+				}
 			}
 			if err := delStampErr; err != nil {
 				s.Unlock()
