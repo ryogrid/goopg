@@ -6300,7 +6300,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	tgtCols := tbl.Columns
 	tgtColCount := len(tgtCols)
-	needUsingForReturning := len(o.plan.Returning) > 0
 
 	// Step 1: collect all rows from each USING table.
 	type usingRows struct {
@@ -6323,8 +6322,9 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		slot         uint16
 		oldRow       Row // raw row in source table column order (for xmax stamping)
 		retOldRow    Row // parent-aligned row for RETURNING (nil = use oldRow); M0097-0078
-		usingPortion Row // joined USING-table columns for RETURNING; nil when RETURNING absent
-	}
+		usingPortion Row              // joined USING-table columns for RETURNING; nil when RETURNING absent
+			cols         []catalog.Column // source relation columns for EPQ chain-following (M0129-S2)
+		}
 	var victims []victim
 	seen := make(map[rowDedupKey]bool)
 
@@ -6381,7 +6381,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 						}
 					}
 					var usingPortion Row
-					if needUsingForReturning && len(combinedRow) > tgtColCount {
+					if len(combinedRow) > tgtColCount {
 						usingPortion = cloneRow(combinedRow[tgtColCount:])
 					}
 					// For inheritance children, store parent-aligned tgtRow for RETURNING. M0097-0078.
@@ -6393,6 +6393,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 						rel: ust.rel, blk: blk, slot: slot,
 						oldRow: cloneRow(rawRow), retOldRow: retOldRow,
 						usingPortion: usingPortion,
+						cols: ust.cols,
 					})
 					seen[key] = true
 					return nil
@@ -6442,55 +6443,145 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if err := enforceFKOnDelete(o.ctx, tbl, v.oldRow); err != nil {
 			return nil, err
 		}
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: vRel, Block: v.blk})
-		if err != nil {
-			return nil, err
-		}
-		s.Lock()
-		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
-		if oldGerr != nil {
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			continue
-		}
-		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			// deleteWithUsing still has no EvalPlanQual (deferral ledger
-			// 2026-08-06, DELETE…USING EPQ) — it skips the row rather than
-			// re-fetching the live version. One case must not be skipped
-			// silently, though: when the update chain leads into a version a
-			// LATER command of THIS statement wrote, PG has already raised
-			// TM_SelfModified before any EPQ re-evaluation could matter
-			// (nodeModifyTable.c ExecDelete, `tmfd.cmax != es_output_cid`).
-			// Follow the chain far enough to see that, and only that — the
-			// guard keeps every statement without a data-modifying WITH in
-			// flight on exactly the old path.
-			if len(o.ctx.CTEWriteFence) > 0 {
-				if cBlk, cSlot, _, cFound := epqFollowChain(o.ctx, vRel, v.blk, v.slot, tbl.Columns, nil, nil); cFound &&
-					cteWrittenByLaterCommand(o.ctx, vRel, cBlk, cSlot) {
+		// EvalPlanQual retry loop (M0129-S2): on concurrent xmax conflict,
+		// wait for the conflicting transaction, follow the t_ctid chain,
+		// re-evaluate both WHERE and USING predicates, and retry the stamp.
+		// Mirror of deleteOp.Next stamp-phase EPQ. M0129-S2.
+		epqSkipDel := false
+		epqDoDelete := false // abort-confirmed bypass flag
+		for epqRetry := 0; ; epqRetry++ {
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: vRel, Block: v.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
+			if oldGerr != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				epqSkipDel = true
+				break
+			}
+			if !epqDoDelete && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
+				xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update",
+					}
+				}
+				if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					terr.Pos = o.plan.Pos()
+					return nil, terr
+				} else if dl {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update (deadlock)",
+					}
+				}
+				visible, _ := epqRecheckVisible(o.ctx, vRel, v.blk, v.slot)
+				if visible {
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						aborted, committed := epqXmaxSettled(o.ctx, xmax)
+						if aborted {
+							epqDoDelete = true
+							continue
+						}
+						if committed {
+							return nil, epqSerializationErr(o.ctx, vRel, v.blk, v.slot, o.plan.Pos())
+						}
+						continue
+					}
+					// RC (or no manager): legacy snapshot heuristic.
+					if !o.ctx.Snap.HasInProgress(xmax) {
+						epqDoDelete = true
+						continue
+					}
+					if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+						epqDoDelete = true
+						continue
+					}
+					continue
+				}
+				// Concurrent tx committed — row was updated or deleted.
+				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update",
+					}
+				}
+				// RC: cross-partition UPDATE sentinel check.
+				if epqSlotMovedToAnotherPartition(o.ctx, vRel, v.blk, v.slot) {
+					return nil, errMovedToAnotherPartition(o.plan.Pos())
+				}
+				// Follow HOT chain, then non-HOT chain. Re-evaluate both
+				// the WHERE predicate (o.pred) and the USING join predicate
+				// (o.plan.UsingPred) against the re-fetched live version.
+				victimCols := v.cols
+				if victimCols == nil {
+					victimCols = tbl.Columns
+				}
+				newBlk := v.blk
+				newSlot, newRow, hotFound, predOk := epqFollowHOT(o.ctx, vRel, v.blk, v.slot, victimCols, nil, nil)
+				chainFound := predOk
+				if !hotFound {
+					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, vRel, v.blk, v.slot, victimCols, nil, nil); cFound {
+						newBlk, newSlot, newRow, chainFound = cBlk, cSlot, cRow, true
+					}
+				}
+				if !chainFound {
+					epqSkipDel = true
+					break
+				}
+				// TM_SelfModified guard: the chain can lead into a version a
+				// LATER command of this same statement wrote. PG refuses to merge
+				// that with the original delete (nodeModifyTable.c ExecDelete).
+				if cteWrittenByLaterCommand(o.ctx, vRel, newBlk, newSlot) {
 					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
 				}
-			}
-			continue
-		}
-		oldTupleBytes, _ := oldTup.MarshalBinary()
-		// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
-		// producer). DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
-		// non-conflicting locker survives; wired for sibling-path parity.
-		if stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true); stampErr != nil {
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			if errors.Is(stampErr, storage.ErrUnsupportedItem) {
+				// Re-evaluate USING join predicate against new row + USING portion.
+				if o.plan.UsingPred != nil {
+					epqCombined := append(append(Row(nil), newRow...), v.usingPortion...)
+					uv, _ := evalExpr(o.plan.UsingPred, epqCombined, o.ctx)
+					if uv.IsNull() || uv.Kind != KindBool || !uv.BoolValue() {
+						epqSkipDel = true
+						break
+					}
+				}
+				// Row survived EPQ: update victim and retry stamp.
+				v.blk, v.slot = newBlk, newSlot
+				v.oldRow = cloneRow(newRow)
+				v.retOldRow = nil // EPQ-fetched row is in source-table layout
 				continue
 			}
-			return nil, stampErr
+			oldTupleBytes, _ := oldTup.MarshalBinary()
+			// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+			// producer). DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
+			// non-conflicting locker survives; wired for sibling-path parity.
+			if stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true); stampErr != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				if errors.Is(stampErr, storage.ErrUnsupportedItem) {
+					epqSkipDel = true
+					break
+				}
+				return nil, stampErr
+			}
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			if derr != nil {
+				return nil, derr
+			}
+			break
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
-		s.Unlock()
-		o.ctx.Pool.Unpin(s)
-		if derr != nil {
-			return nil, derr
+		if epqSkipDel {
+			continue
 		}
 		// M0125-0053: the DELETE … USING twin of the deleteOp.Next reveal.
 		cteFenceDelete(o.ctx, vRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})

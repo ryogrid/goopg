@@ -10852,25 +10852,24 @@ DS05/PLAN/RACE; `make ralph-state-guard` before every finish). **Read the
 plan doc §2 before picking any task here** (gate vocabulary, worktree and
 measurement discipline).
 
-- [ ] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** Live,
-      default-ON, stable ~7× regression (SF0.5 Q74 11–14 s → ~86–99 s; SF1
-      ~290–329 s). Attribution DONE (ledger row 2026-08-07): hash paths ARE
-      generated, cost ranks hash ~842 < merge ~2100 < NL ~8.4M at level 2,
-      yet the plan is NL at all 4 join levels — the rejection is NOT
-      cost-driven. Subtasks: **S1.1** diagnose — add `M0129-DEBUG` stderr
-      output in `addPathsToJoinrel` (`internal/planner/joinpaths.go:139`)
-      printing each level-2 candidate path's kind+cost and the
-      `setCheapest` survivor; run Q74 on the SF0.5 cluster
-      (`bench/tpcds/server.sh start sf05`, :65437); the three hypotheses
-      are recorded in the ledger row (merge cost for CTE inputs / dropped
-      hash precondition in `addHashJoinPath` / merge `Pathkeys` dominance
-      in `comparePaths`). **S1.2** fix the named cause; remove or
-      env-gate the debug output. **S1.3** pin — plan-shape guard test
-      (4-way CTE self-join with equalities → Hash Join); verify Q74 SF0.5
-      ≤ 20 s with byte-identical output (7 rows, ck `2ffc13c77bf53028`);
-      record the root cause in the ledger row. Bar: UNITS + SPOT + DS05
-      (Q74 time is the headline number) + PLAN.
-- [ ] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
+- [x] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** DONE
+      `ea1b2fbe` 2026-08-08. Root cause: TWO mechanisms, both diagnosed and
+      fixed. **(a) Hash path rejection by merge on pathkeys within 1% fuzz
+      band:** `comparePathCostsFuzzily` returned `costsEqual` for hash-vs-merge
+      at CTE self-join costs (~2.04 vs ~2.06) → merge pathkeys dominated hash
+      (no pathkeys) → hash silently rejected from pathlist. Fixed by falling
+      through to actual (non-fuzzy) cost comparison when fuzzily equal, so
+      hash (cheaper) trades off against merge (has pathkeys) and both survive.
+      **(b) CTE scan row estimates collapsed to 1:** `filterSelectivity`
+      defaults to `defaultEqSelectivity=0.005` per conjunct on columns with no
+      statistics — for Q74's year_total CTE (17977 rows, 2 sale_type/2 year
+      values), 0.005⁴×17977≈0.000011→1, making NL look free. Fixed by
+      falling back to CTE body's unfiltered row count in `initialRelRows`.
+      Q74: 99s→14s SF0.5 (≤20s ✓), byte-identical (7 rows, ck same). DS05
+      PASS 95/99, 0 row/checksum deltas, 20 plan-shape changes (all legitimate
+      from cost/cardinality changes). Ledger row appended with deferred:
+      CTE column statistics propagation remains open. Bar: UNITS+SPOT+DS05 ✓.
+- [x] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
       M0125-0055: the `isConcurrentlyUpdated` arm of
       `deleteOp.deleteWithUsing`
       (`internal/executor/operators_storage.go:6292`) silently SKIPS the
