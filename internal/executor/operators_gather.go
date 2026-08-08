@@ -93,6 +93,11 @@ type gatherOp struct {
 	// ownsSharedBuilds records that this Gather published hash tables on the
 	// session context (P8) and must retract them at Close.
 	ownsSharedBuilds bool
+
+	// pbm is the shared page allocator for a parallel bitmap heap scan (S5.6).
+	// The leader builds the bitmap once before fan-out and publishes it here;
+	// workers claim pages via attachParallelBitmapScan.
+	pbm *parallelBitmapState
 }
 
 func newGatherOp(p *planner.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -105,6 +110,78 @@ func (o *gatherOp) Schema() planner.Schema { return o.schema }
 // ANALYZE renders as PG's `Workers Launched:`. It can be lower than
 // WorkersPlanned once the cluster-wide cap is honoured (P6).
 func (o *gatherOp) WorkersLaunched() int { return o.launched }
+
+// prebuildBitmapScan builds the TIDBitmap once before fan-out so workers
+// share the result rather than each running their own index scan. (S5.6)
+//
+// This mirrors the pattern of prebuildHashJoins: the leader builds the bitmap
+// eagerly, publishes the sorted block list in a shared atomic allocator, and
+// workers claim disjoint pages from it.
+func (o *gatherOp) prebuildBitmapScan(ctx *Context) error {
+	// Decide from the PLAN, before building anything.
+	if !planner.HasBitmapScan(o.plan.Child) {
+		return nil
+	}
+	tree, err := o.buildChild()
+	if err != nil {
+		return err
+	}
+	var bmOps []*bitmapHeapScanOp
+	collectBitmapScans(tree, &bmOps)
+	if len(bmOps) == 0 {
+		return nil
+	}
+	// A partial subtree should have exactly one driving scan. If multiple
+	// bitmap scans appear (unexpected), fall back rather than guessing which
+	// one to share.
+	if len(bmOps) > 1 {
+		return nil
+	}
+	bm := bmOps[0]
+	if err := bm.Open(ctx); err != nil {
+		return err
+	}
+	// Build the bitmap.
+	tbm, err := bm.outerBitmap.buildBitmap(ctx)
+	if err != nil {
+		bm.Close()
+		return err
+	}
+	bm.tbm = tbm
+	bm.iter = tbmBeginIterate(tbm)
+	bm.ownBitmap = true
+
+	// Publish the sorted block list for workers.
+	o.pbm = newParallelBitmapState()
+	o.pbm.init(tbm)
+	return nil
+}
+
+// collectBitmapScans walks an operator tree and collects all bitmapHeapScanOp
+// nodes into dst.
+// Follows the same explicit-type-switch pattern as collectShareableJoins.
+func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
+	switch x := op.(type) {
+	case *bitmapHeapScanOp:
+		*dst = append(*dst, x)
+	case *filterOp:
+		collectBitmapScans(x.child, dst)
+	case *projectOp:
+		collectBitmapScans(x.child, dst)
+	case *sortOp:
+		collectBitmapScans(x.child, dst)
+	case *aggregateOp:
+		collectBitmapScans(x.child, dst)
+	case *instrumentedOp:
+		collectBitmapScans(x.inner, dst)
+	case *joinOp:
+		if probeSideIsLeft(x.plan) {
+			collectBitmapScans(x.left, dst)
+		} else {
+			collectBitmapScans(x.right, dst)
+		}
+	}
+}
 
 // prebuildHashJoins publishes shared hash tables on ctx for the duration of
 // this Gather. The leader's own child tree reads them from ctx directly, which
@@ -160,6 +237,13 @@ func (o *gatherOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// S5.6: pre-build the bitmap scan (if any) so workers share the result
+	// rather than each running their own index scan.
+	if err := o.prebuildBitmapScan(ctx); err != nil {
+		o.startChannelCloser()
+		return err
+	}
+
 	// Worker arenas are allocated HERE, by the leader, before any goroutine
 	// starts: mctx.Acquire appends to parent.children without synchronisation,
 	// so concurrent acquisition is itself a slice-append race.
@@ -208,6 +292,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 		// The leader takes blocks from the same allocator as the workers —
 		// it is a peer, not an extra full scan.
 		attachParallelScan(child, o.pscan)
+		attachParallelBitmapScan(child, o.pbm) // S5.6
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -246,6 +331,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		return err
 	}
 	attachParallelScan(child, o.pscan)
+	attachParallelBitmapScan(child, o.pbm) // S5.6
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err

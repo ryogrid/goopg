@@ -235,6 +235,39 @@ Per 10-roadmap P8, per subtask (S4.1 = P2.1a):
 - **DS05** — `scripts/tpcds-sf05-regression.sh sweep` (zero row/checksum deltas
   from parallel build).
 
+**Gate results (2026-08-08, HEAD f2e3f167):** UNITS PASS, SPOT PASS (Q12=2,
+Q13=35), DS05 PASS (95/95, zero mismatches, zero plan-shape changes), RACE PASS
+(all packages, zero races). DS05 channel showed Q15 8s→4s (0.5×, likely parallel
+scan on build side) and zero plan deltas.
+
+## 5.1 S4.1 A/B measurement (TPC-H SF1, 2026-08-08)
+
+Build times measured via EXPLAIN ANALYZE's `Build Time:` instrumentation,
+comparing HEAD (parallel build enabled, default) vs HEAD with
+`GOOPG_PARALLEL_HASH_BUILD=false` (serial build, temporary env-var guard).
+
+| query | hash join | serial build | parallel build | speedup |
+|---|---|---|---|---|
+| Q9 | INNER, Batches: 1, medium (part↔supplier) | 351 ms | 99 ms | **3.55×** |
+| Q9 | INNER, shared (Gather leader build) | 1,671 ms | 1,572 ms | 1.06× |
+| Q9 | INNER, Batches: 2, large (lineitem, spill) | 3,745 ms | 3,838 ms | ~1× (ineligible, spills) |
+| Q17 | INNER, Batches: 1, small (lineitem↔part) | 269 ms | 49 ms | **5.5×** |
+| Q17 | INNER, Batches: 1, large (correlated subq) | 17,286 ms | 17,144 ms | ~1× (ineligible, extractSeqScanFromPlan returns nil on HashAggregate→SeqScan) |
+| Q19 | INNER, Batches: 1, medium (lineitem↔part) | 367 ms | 97 ms | **3.78×** |
+
+**Verdict:** parallel build delivers 3–5× build-time speedup on eligible joins
+(non-spilling SeqScan build child, same-probe-shareable join type). The wins are
+real but modest in absolute execution-time terms (1–2 % overall for Q9/Q19)
+because the dominant cost in these queries is elsewhere (probe, aggregation, or
+a large ineligible build).
+
+**S4.2 gating:** the remaining large builds (>1 s) are blocked by eligibility
+gaps — `extractSeqScanFromPlan` does not see through HashAggregate (Q17
+correlated subquery, 17 s), and spilling builds decline the parallel path. S4.2
+(genuinely concurrent build) is therefore DEFERRED until those gaps are closed
+or a benchmark with eligible large builds is found. Recorded here per the design
+doc's §6 decision rule.
+
 ## 6. Relationship to S4.2
 
 S4.2 (= P2.1b) is a genuinely concurrent build (sharded or

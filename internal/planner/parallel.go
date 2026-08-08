@@ -207,6 +207,11 @@ func subtreeHasUnsafeNode(n Node) bool {
 				unsafe = true
 				return
 			}
+		case *BitmapHeapScan:
+			if tableIsUnsafeForParallel(x.Table) {
+				unsafe = true
+				return
+			}
 		}
 		for _, c := range parallelChildren(cur) {
 			walk(c)
@@ -258,7 +263,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// aggregate to produce four groups, and measurement shows that serial
 		// tail pinning the query at ~7.1 s no matter how many workers run.
 		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
-			drivingSeqScan(agg.Child) != nil {
+			drivingScan(agg.Child) != nil {
 			// The gate has to run HERE, not after the walk. Refusing must let
 			// the loop fall through terminatesPartial(*Aggregate) and place
 			// the Gather BELOW the aggregate — and that fallback is precisely
@@ -288,7 +293,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// goopg's Sort carries no top-N limit, so there is no per-worker
 		// truncation to reason about: every worker emits its whole partition.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
-			drivingSeqScan(srt.Child) != nil {
+			drivingScan(srt.Child) != nil {
 			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}
 		if terminatesPartial(cur) {
@@ -300,7 +305,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 			continue
 		}
 		// cur is partial-capable if it bottoms out in an eligible seq scan.
-		if drivingSeqScan(cur) != nil {
+		if drivingScan(cur) != nil {
 			return partialTarget{node: cur}, true
 		}
 		kids := parallelChildren(cur)
@@ -332,16 +337,21 @@ func terminatesPartial(n Node) bool {
 	return false
 }
 
-// drivingSeqScan finds the SeqScan a subtree ultimately reads from, or nil
-// when the subtree is not driven by a single sequential scan.
-func drivingSeqScan(n Node) *SeqScan {
+// drivingScan finds the scan node a subtree ultimately reads from, or nil
+// when the subtree is not driven by a single scannable relation.
+//
+// S5.6: extended from SeqScan-only to also recognize BitmapHeapScan, so that
+// a parallel bitmap path satisfies the same partial-subtree walk.
+func drivingScan(n Node) Node {
 	switch x := n.(type) {
 	case *SeqScan:
 		return x
+	case *BitmapHeapScan:
+		return x
 	case *Filter:
-		return drivingSeqScan(x.Child)
+		return drivingScan(x.Child)
 	case *Project:
-		return drivingSeqScan(x.Child)
+		return drivingScan(x.Child)
 	case *Join:
 		// P8. A hash join is partial through its PROBE side only: the build
 		// side is drained once by the leader before fan-out, and the probe is
@@ -352,9 +362,9 @@ func drivingSeqScan(n Node) *SeqScan {
 			return nil
 		}
 		if joinProbeSideIsLeft(x) {
-			return drivingSeqScan(x.Left)
+			return drivingScan(x.Left)
 		}
-		return drivingSeqScan(x.Right)
+		return drivingScan(x.Right)
 	}
 	return nil
 }
@@ -364,12 +374,28 @@ func drivingSeqScan(n Node) *SeqScan {
 // its PROBE side only, and needed no shared build: each worker rebuilt the
 // (small, by the probe-selection rule) dimension tables itself. What survives
 // is the discipline the approval point existed to enforce — every arm of
-// `drivingSeqScan` names its partial side explicitly and refuses toward serial
+// `drivingScan` names its partial side explicitly and refuses toward serial
 // rather than deriving a side that could disagree across call sites.
 
 // ParallelChildrenForTest exposes the post-pass's child walk to tests in other
 // packages, which need to traverse a rebuilt plan to find the Gather.
 func ParallelChildrenForTest(n Node) []Node { return parallelChildren(n) }
+
+// HasBitmapScan reports whether a partial subtree contains a BitmapHeapScan.
+// The executor asks this BEFORE constructing anything, matching the pattern of
+// HasShareableHashJoin. (S5.6)
+func HasBitmapScan(n Node) bool {
+	switch n.(type) {
+	case *BitmapHeapScan:
+		return true
+	}
+	for _, c := range parallelChildren(n) {
+		if HasBitmapScan(c) {
+			return true
+		}
+	}
+	return false
+}
 
 // HasShareableHashJoin reports whether a partial subtree contains a hash join
 // whose build side the leader must pre-build before fanning out (P8).
@@ -437,24 +463,37 @@ func hashJoinIsPartialCapable(p *Join) bool {
 	return false
 }
 
+// scanTable extracts the *catalog.Table from a scan node (SeqScan or
+// BitmapHeapScan). Returns nil for any other node kind.
+func scanTable(n Node) *catalog.Table {
+	switch x := n.(type) {
+	case *SeqScan:
+		return x.Table
+	case *BitmapHeapScan:
+		return x.Table
+	}
+	return nil
+}
+
 // computeParallelWorkers reproduces upstream's compute_parallel_worker()
 // (postgres/src/backend/optimizer/path/allpaths.c): a SIZE RULE, not a cost
 // comparison — which is exactly why it is reproducible here despite goopg
 // having no absolute node costs to add parallel_setup_cost to.
 func computeParallelWorkers(subtree Node, s ParallelSettings) int {
-	scan := drivingSeqScan(subtree)
-	if scan == nil || scan.Table == nil {
+	scan := drivingScan(subtree)
+	tbl := scanTable(scan)
+	if tbl == nil {
 		return 0
 	}
 
 	forced := s.DebugParallelQuery == "on" || s.DebugParallelQuery == "regress"
 
 	// The table's parallel_workers reloption wins outright, as in PG.
-	if n := tableParallelWorkersReloption(scan.Table); n > 0 {
+	if n := tableParallelWorkersReloption(tbl); n > 0 {
 		return min(n, s.MaxWorkersPerGather)
 	}
 
-	blocks, known := parallelRelationBlocks(scan.Table, s)
+	blocks, known := parallelRelationBlocks(tbl, s)
 	if !known {
 		// Size unknown — refuse. Note this is NOT "no ANALYZE statistics":
 		// the size input is a live block count, which needs no ANALYZE (see
@@ -642,7 +681,7 @@ func parallelChildren(n Node) []Node {
 		// (subtreeHasUnsafeNode) see temp tables, virtual catalog relations
 		// and LockRows sitting under a join once P8 made joins
 		// partial-capable. Two children also make findPartialSubtree and
-		// rebuildWithGather refuse any join drivingSeqScan has not explicitly
+		// rebuildWithGather refuse any join drivingScan has not explicitly
 		// approved, since both bail on len(kids) != 1.
 		return []Node{x.Left, x.Right}
 	// The `*MultiHashJoin` arm here (chapter 12 §7) went with the node in
@@ -650,9 +689,12 @@ func parallelChildren(n Node) []Node {
 	// this switch makes `subtreeHasUnsafeNode` stop dead and read "no children"
 	// as "nothing unsafe below" — the opposite of conservative for the SAFETY
 	// walk — so a temp / virtual / LockRows relation underneath would go unseen
-	// the moment `drivingSeqScan` learned to descend through it.
+	// the moment `drivingScan` learned to descend through it.
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
+	case *BitmapHeapScan:
+		// S5.6: the Outer bitmap-producing subtree is the child.
+		return []Node{x.Outer}
 	}
 	return nil
 }

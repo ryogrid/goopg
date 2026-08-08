@@ -1,42 +1,53 @@
-Task: M0129-S5.2 complete — bitmap scan selectivity-region survival proof
+Task: M0129-S5.6 COMPLETE — parallel bitmap heap scan. M0129 milestone COMPLETE (all subtasks [x]; S5.7/S5.8 closed blocked-with-reason).
 
 Files:
-- internal/planner/pathbitmap_test.go: added TestBitmapPathSurvivesAddPathOnLargeTable
-  (+ pathsOfKind helper) — constructs a 1M-row/10k-page table with uncorrelated
-  index, proves bitmap path (cost 9525) dominates seq scan (cost 10980) in
-  add_path and becomes CheapestTotal
-- analysis/m0129-s5.2-bitmap-survival-proof.txt: recorded cost breakdown and
-  selectivity-region analysis
-- .ralph/fix_plan.md: S5.2 marked DONE 2026-08-09
+- internal/planner/parallel.go: drivingSeqScan→drivingScan (supports BitmapHeapScan);
+  scanTable helper; BitmapHeapScan added to subtreeHasUnsafeNode, parallelChildren;
+  HasBitmapScan for executor pre-build gating.
+- internal/executor/parallel_bitmap_scan.go: new — parallelBitmapState
+  (shared atomic page allocator + sorted block list from TIDBitmap).
+- internal/executor/operators_bitmap.go: pbm field on bitmapHeapScanOp;
+  nextSerial/nextParallel split; fetchOneTuple inline (avoids recursive Next()
+  across the shared-allocator boundary); ownBitmap flag.
+- internal/executor/parallel_scan.go: attachParallelBitmapScan (walks
+  filterOp/projectOp/instrumentedOp/joinOp/aggregateOp/sortOp→bitmapHeapScanOp).
+- internal/executor/operators_gather.go: pbm field on gatherOp;
+  prebuildBitmapScan (leader builds bitmap once before fan-out);
+  collectBitmapScans; wired in Open(), runWorker, leader child.
+- internal/executor/parallel_bitmap_scan_test.go: 6 unit tests for
+  parallelBitmapState (empty, single, multiple, lossy, nil-safety, idempotent).
+- .ralph/deferral_ledger.md: S5.7/S5.8 blocked-with-reason rows appended.
+- .ralph/fix_plan.md: S5.6 DONE, S5.7/S5.8 CLOSED blocked, S5 parent [x].
 
-Key symbols: TestBitmapPathSurvivesAddPathOnLargeTable, pathsOfKind
+Key symbols: parallelBitmapState, drivingScan, HasBitmapScan, scanTable,
+nextParallel, fetchOneTuple, attachParallelBitmapScan, prebuildBitmapScan,
+collectBitmapScans
 
 Hypothesis/Findings:
-- Bitmap scan wins over seq scan when selectivity ~0.001 on a large table
-  (>10k pages) with low correlation. The sqrt interpolation of per-page cost
-  (between random and seq) gives bitmap a ~2× per-page discount vs index scan.
-- The prebuilt (seq scan) path's cost in buildInitialRels uses filteredRows
-  instead of baseRows for page estimation, artificially lowering seq scan cost
-  for selective queries. This is a pre-existing issue — the test works around
-  it by setting filteredRows = baseRows for proper cost comparison.
-- For single-table queries, the post-hoc rewriteScanInputsWithSingleTablePredicates
-  pass replaces SeqScan→IndexScan AFTER path selection; bitmap paths are only
-  generated during join search. A multi-table query with a local filter would
-  exercise the full bitmap path selection.
-- The S5.3 cache-aware Mackert-Lohman (indexPagesFetched) is correctly plumbed
-  through computeBitmapPages; the bitmap cost uses the same formula as index
-  scan for pages_fetched but with interpolated per-page cost.
-- S5.1 + S5.2 + S5.3 are now all DONE. Remaining bitmap subtasks: S5.4
-  (partial-index predicate recheck), S5.5 (tbm_extract_page_tuple), S5.6
-  (parallel bitmap heap scan), S5.7 (read-stream prefetch — NAMED BLOCKER),
-  S5.8 (GiST/GIN getBitmap — NAMED BLOCKER).
+- PG's ParallelBitmapHeapState uses DSA (dynamic shared memory) for the
+  shared page allocator. goopg shares a Go pointer — the state reduces to
+  a sorted block list + an atomic.Int64 counter.
+- The leader builds the TIDBitmap once before fan-out (prebuildBitmapScan),
+  publishes the sorted blocks in parallelBitmapState, and workers claim
+  disjoint pages via nextPage().
+- Unlike the serial path (fetchExact calls o.Next() recursively), the
+  parallel path inlines the per-tuple fetch (fetchOneTuple) so that an
+  invisible tuple advances to the next offset on the SAME page rather than
+  accidentally claiming a new page from the shared allocator.
+- planner changes: drivingScan generalizes drivingSeqScan to also recognize
+  BitmapHeapScan; computeParallelWorkers uses scanTable() to extract the
+  *catalog.Table from either scan type. HasBitmapScan gates the executor
+  pre-build so we don't build a throwaway tree unnecessarily.
 
-Next step: Check the Current Priority banner in fix_plan.md for the next task.
-M0129-S5.4 (partial-index predicate recheck) is the next bitmap task, but the
-banner may prioritize S1 (Q74 fix) or another slice.
+Next step: M-NIGHTLY items (49 new regressions from 20260809-020705). All
+M0129 items are [x]; the Current Priority banner should be updated or M-NIGHTLY
+selection resumes.
 
 Gates run:
-- UNITS: PASS (pre-commit scope=units, all packages including planner)
-- SPOT: PASS (Q12=2, Q13=35)
+- UNITS: PASS (SCOPE=units precommit)
+- SPOT: PASS (Q12=2, Q13=35, 28.1s)
+- pgbench smoke: PASS (13,974 TPS, 0 failures)
+- RACE: PASS (all packages green)
+- ralph-state-guard: REPAIRED+OK
 
 In-flight: none

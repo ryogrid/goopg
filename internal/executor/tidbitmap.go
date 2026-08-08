@@ -275,6 +275,20 @@ func tbmCalculateMaxEntries(workMemBytes int64) int {
 // Iterator
 // ---------------------------------------------------------------------------
 
+// BitmapPageResult holds the result of a page-level iteration step.
+// This mirrors PG's TBMIterateResult (tidbitmap.c).
+// For lossy pages, the caller visits every tuple on the page.
+// For exact pages, the caller extracts offsets via tbmExtractPageTuple.
+type BitmapPageResult struct {
+	Block   storage.BlockNumber
+	Lossy   bool
+	Recheck bool
+
+	// internalPage points to the pageEntry for exact pages (nil for lossy).
+	// Callers extract offsets via tbmExtractPageTuple.
+	internalPage *pageEntry
+}
+
 // tbmIterator walks a TIDBitmap in block-number order.
 // For lossy pages, it yields one entry with offset=0 (caller visits
 // the whole page). For exact pages, it yields each set offset.
@@ -284,7 +298,7 @@ type tbmIterator struct {
 
 	idx int // current index into blocks
 
-	// For the current exact page:
+	// For the current exact page (per-offset iteration):
 	offsets []uint16 // sorted offsets extracted from bitmap
 	offIdx  int
 
@@ -306,6 +320,69 @@ func tbmBeginIterate(tbm *TIDBitmap) *tbmIterator {
 		})
 	}
 	return it
+}
+
+// tbmExtractPageTuple extracts all tuple offsets from an exact page result
+// into the caller-provided buffer. It returns the number of offsets that
+// would be extracted (even if the buffer is too small to hold them all).
+//
+// This mirrors PG's tbm_extract_page_tuple (tidbitmap.c:900).
+// The caller pre-allocates the buffer once and reuses it across pages
+// to avoid per-page allocations.
+func tbmExtractPageTuple(e *pageEntry, offsets []uint16) int {
+	total := 0
+	for i := 0; i < len(e.bitmap); i++ {
+		w := e.bitmap[i]
+		for w != 0 {
+			bit := bits.TrailingZeros8(w)
+			w &= w - 1 // clear lowest set bit
+			off := uint16(i*8 + bit + 1) // OffsetNumber is 1-based
+			if total < len(offsets) {
+				offsets[total] = off
+			}
+			total++
+		}
+	}
+	return total
+}
+
+// nextPage advances the iterator to the next page and fills the
+// BitmapPageResult. It returns false when the iterator is exhausted.
+//
+// This mirrors PG's tbm_private_iterate (tidbitmap.c:976): pages are
+// delivered in block-number order, and lossy/exact semantics are
+// preserved at the page level. The caller then extracts offsets for
+// exact pages via tbmExtractPageTuple.
+func (it *tbmIterator) nextPage(result *BitmapPageResult) bool {
+	for {
+		if it.idx >= len(it.blocks) {
+			return false
+		}
+
+		block := it.blocks[it.idx]
+		e := it.tbm.entries[block]
+		it.idx++
+
+		if e.isLossy {
+			if it.lossyVisited {
+				it.lossyVisited = false
+				continue
+			}
+			it.lossyVisited = true
+			result.Block = block
+			result.Lossy = true
+			result.Recheck = e.recheck
+			result.internalPage = nil
+			return true
+		}
+
+		// Exact page.
+		result.Block = block
+		result.Lossy = false
+		result.Recheck = e.recheck
+		result.internalPage = e
+		return true
+	}
 }
 
 // next advances the iterator and returns the next TID.
@@ -342,14 +419,13 @@ func (it *tbmIterator) next() (block storage.BlockNumber, offset uint16, lossy, 
 
 		// Exact page: extract sorted offsets from bitmap.
 		it.offsets = it.offsets[:0]
-		for i := 0; i < len(e.bitmap); i++ {
-			w := e.bitmap[i]
-			for w != 0 {
-				bit := bits.TrailingZeros8(w)
-				w &= w - 1 // clear lowest set bit
-				off := uint16(i*8 + bit + 1) // OffsetNumber is 1-based
-				it.offsets = append(it.offsets, off)
-			}
+		n := tbmExtractPageTuple(e, it.offsets[:cap(it.offsets)])
+		// Grow if needed (first use or undersized buffer).
+		if n > cap(it.offsets) {
+			it.offsets = make([]uint16, n)
+			tbmExtractPageTuple(e, it.offsets)
+		} else {
+			it.offsets = it.offsets[:n]
 		}
 		it.offIdx = 0
 

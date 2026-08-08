@@ -10956,7 +10956,8 @@ measurement discipline).
       builds — the remaining >1s builds are ineligible. Recorded per design
       doc `13-cooperative-parallel-hash-build.md` §5.1/§6. Design doc
       updated with measurement.
-- [ ] **M0129-S5 — bitmap heap scan burn-down (8 subtasks).** Source:
+- [x] **M0129-S5 — bitmap heap scan burn-down (8 subtasks).** ALL DONE 2026-08-09
+      (S5.1–S5.6 complete; S5.7/S5.8 closed blocked-with-reason). Source:
       `docs/design/0128-0001-bitmap-heap-scan.md` §6 (8 deferral rows) +
       the P2.4 caveat (paths generated but ALWAYS rejected by `add_path`).
       Base code: `internal/planner/{pathbitmap,costbitmap,createplanbitmap}.go`,
@@ -10973,14 +10974,11 @@ measurement discipline).
       **S5.4** partial-index predicate recheck (`bitmapqualorig` analogue;
       actionable now — goopg has partial indexes, cf. root-0041) (DONE 2026-08-09).
       **S5.5** `tbm_extract_page_tuple` bulk-offset extraction
-      (`tidbitmap.go` iterator; microbenchmark). **S5.6** parallel bitmap
-      heap scan (`ParallelGroup` + `ParallelScanState`; design §3.7's
-      no-DSA shape). **S5.7** read-stream prefetch — NAMED BLOCKER (needs a
-      general I/O prefetch layer that does not exist): if still absent at
-      selection time, ledger the strong reason and close
-      blocked-with-reason; never silently skip. **S5.8** GiST/GIN
-      `getBitmap` — NAMED BLOCKER (no GiST/GIN index AM per the 0128-0001
-      design; re-verify against HEAD at selection time): same protocol.
+      (`tidbitmap.go` iterator; microbenchmark) (DONE 2026-08-09). **S5.6** parallel bitmap
+      heap scan (`ParallelGroup` + shared atomic allocator; design §3.7's
+      no-DSA shape) (DONE 2026-08-09). **S5.7** (CLOSED blocked 2026-08-09) read-stream prefetch (general I/O prefetch layer
+      does not exist; deferred to storage subsystem). **S5.8** (CLOSED blocked 2026-08-09) GiST/GIN
+      `getBitmap` (no GiST/GIN index AM exists; deferred to AM milestone).
       Bar per subtask: UNITS + unit tests + SPOT; DS05 for plan-visible
       subtasks (S5.1–S5.4); RACE for S5.6.
 - [x] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable

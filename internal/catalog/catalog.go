@@ -1672,6 +1672,15 @@ type ColumnStats struct {
 	// ratio, so the two disagreed by the sampling factor — a 1.5 M-row unique
 	// key read as NDistinct=30,000 with NDistinctFrac=1.0.
 	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
+
+	// Correlation is pg_stats.correlation: the Pearson correlation between
+	// physical row order and logical (sorted) column order. Range [-1, 1];
+	// 1.0 = perfectly correlated, -1.0 = perfectly anti-correlated, 0 = no
+	// correlation or unknown. PG collects this as STATISTIC_KIND_CORRELATION
+	// (analyze.c compute_scalar_stats). It feeds cost_index's correlation
+	// adjustment (btcost_correlation, selfuncs.c:7305) and is the statistic
+	// that makes the two-term Mackert-Lohman formula usable.
+	Correlation float64 `json:"correlation,omitempty"`
 }
 
 // StaDistinct returns these statistics in PostgreSQL's SIGNED `stadistinct`

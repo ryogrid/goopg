@@ -651,7 +651,19 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	freq := make(map[string]*bucket, len(sample))
 	var nullCount, nonNull int
 	var totalPayloadWidth int64
-	for _, row := range sample {
+
+	// Correlation data: PG's compute_scalar_stats (analyze.c:2853-2890)
+	// computes the Pearson correlation between physical row order and
+	// logical (sorted) column order. We collect (value, original_position)
+	// pairs here during the first pass so the correlation can be computed
+	// after sorting by value. Non-orderable kinds skip this.
+	type valuePosition struct {
+		d  Datum
+		pos int
+	}
+	var corrPairs []valuePosition
+
+	for pos, row := range sample {
 		if colIdx >= len(row) {
 			// Defensive: mismatched schema shouldn't happen given
 			// DecodeRow honours tbl.Columns, but stay sane.
@@ -670,6 +682,9 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		} else {
 			freq[key] = &bucket{val: d, count: 1}
 		}
+
+		// Collect for correlation: track original position alongside value.
+		corrPairs = append(corrPairs, valuePosition{d: d, pos: pos})
 	}
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
@@ -698,6 +713,39 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 
 	if nonNull == 0 {
 		return stats
+	}
+
+	// --- correlation (STATISTIC_KIND_CORRELATION) ---
+	// Pearson correlation between physical row order (original sample
+	// position) and logical column order (position after sorting by value).
+	// PG's compute_scalar_stats (analyze.c:2853-2890): since both x and y
+	// sets are {0,1,...,n-1}, sum(x)=sum(y)=n*(n-1)/2 and
+	// sum(x^2)=sum(y^2)=n*(n-1)*(2n-1)/6, so the coefficient reduces to
+	//   corr = (n * Σxy - Σx²) / (n * Σx² - Σx²)
+	// where Σxy is the sum of original_position[i] * sorted_position[i].
+	if len(corrPairs) > 1 && isOrderableKind(corrPairs[0].d.Kind) {
+		sort.Slice(corrPairs, func(i, j int) bool {
+			cmp, err := compareDatum(corrPairs[i].d, corrPairs[j].d, 0)
+			if err != nil {
+				return false
+			}
+			return cmp < 0
+		})
+		// Verify sort succeeded: if the first pair comparison failed, skip
+		// the correlation (it stays 0).
+		if _, err := compareDatum(corrPairs[0].d, corrPairs[1].d, 0); err == nil {
+			var corrXYSum float64
+			for sortedPos, vp := range corrPairs {
+				corrXYSum += float64(vp.pos) * float64(sortedPos)
+			}
+			n := float64(len(corrPairs))
+			corrXSum := (n - 1.0) * n / 2.0
+			corrX2Sum := (n - 1.0) * n * (2.0*n - 1.0) / 6.0
+			denom := n*corrX2Sum - corrXSum*corrXSum
+			if denom != 0 {
+				stats.Correlation = (n*corrXYSum - corrXSum*corrXSum) / denom
+			}
+		}
 	}
 
 	// Sort buckets by count desc — primary input to the MCV /
