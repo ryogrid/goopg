@@ -390,6 +390,30 @@ func comparePathCostsFuzzily(p1, p2 *Path, fuzz float64) pathCostComparison {
 	if p2.Cost.Startup > p1.Cost.Startup*fuzz {
 		return costsBetter1
 	}
+	// Both total and startup are fuzzily equal. Use the actual (non-fuzzy)
+	// cost to pick a direction rather than returning costsEqual. Returning
+	// costsEqual would let a non-cost dimension (typically pathkeys) decide
+	// dominance alone — a hash path with no pathkeys then loses to a
+	// near-identically-costed merge path with pathkeys. For CTE self-joins
+	// with low row-count estimates, both paths land inside the 1% fuzz band
+	// and the hash path is silently rejected, leaving only nested-loop
+	// plans. A weak actual-cost directional signal preserves the tie-breaking
+	// cost comparison that makes the paths incomparable (hash cheaper, merge
+	// has pathkeys), so both survive and setCheapest can pick the cheaper
+	// one. M0129-S1.
+	if p1.Cost.Total < p2.Cost.Total {
+		return costsBetter1
+	}
+	if p2.Cost.Total < p1.Cost.Total {
+		return costsBetter2
+	}
+	// Truly equal on total; use startup as the final tie-break.
+	if p1.Cost.Startup < p2.Cost.Startup {
+		return costsBetter1
+	}
+	if p2.Cost.Startup < p1.Cost.Startup {
+		return costsBetter2
+	}
 	return costsEqual
 }
 
