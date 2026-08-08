@@ -10944,16 +10944,18 @@ measurement discipline).
       `numCtid := 0`) because `wireRowMarkCtidColumns` (`planner.go:1993`)
       injected ctid columns AFTER parent nodes were built, misaligning
       self-join schemas (eval-plan-qual `partiallock` returned 0 rows).
-      **Design doc first** (`0129-0003-*`, draft → accepted within M0129):
-      (a) bottom-up schema recomputation after injection vs (b) injecting
-      the junk attribute at scan creation (PG `preprocess_targetlist`
-      timing). Subtasks: re-enable behind the chosen design; propagate
-      through EVERY intermediate node (Join, Filter, Sort, …), not just
-      leaf scan + top Project; regression tests (eval-plan-qual
-      `partiallock`/`lockwithvalues` green; a self-join FOR UPDATE shape);
-      record whether the slot side-channel retires or stays
-      belt-and-braces. Bar: UNITS + SPOT + ISOLATION (eval-plan-qual
-      family) + DS05.
+      **Design doc LANDED 2026-08-08** (`0129-0003-resjunk-ctid-column-path.md`,
+      draft): chose (a) bottom-up schema recomputation — only `Join` and
+      `NestedLoopIndexJoin` store their own schema and need explicit
+      recomputation (post-order `appendSchema` from children's updated
+      `Output()`); all other intermediate types delegate `Output()` to
+      child and auto-correct. Executor-side column path already fully
+      wired. Subtasks: write `recomputeIntermediateSchemas`, replace
+      `numCtid := 0` with the `wireRowMarkCtidColumns` call, re-enable
+      `TestPlanCtidRowMarkWiring` + add self-join FOR UPDATE case, verify
+      `TestPort_IsolationEvalPlanQual` PASSes. Record whether the slot
+      side-channel retires or stays belt-and-braces. Bar: UNITS + SPOT +
+      ISOLATION (eval-plan-qual family) + DS05.
 - [ ] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
       row 2026-08-07 M0128-P5.1: the rendering gap is fixed
       (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit
