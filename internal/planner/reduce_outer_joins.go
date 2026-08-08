@@ -1,6 +1,8 @@
 package planner
 
 import (
+	"slices"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -15,40 +17,52 @@ import (
 // Algorithm (simplified from PG's recursive two-pass by the flat join chain):
 //  1. Walk the unresolved WHERE clause to collect table names/aliases in
 //     strict-operator positions — these rels are forced non-null if the
-//     WHERE passes.
-//  2. For each FromExpr, walk its flat join chain. At each LEFT/RIGHT/FULL
-//     join, check whether the nullable side's table name is in the
-//     nonnullable set. If so, demote the join type.
+//     WHERE passes. This is the "upper" nonnullable set.
+//  2. For each FromExpr, walk its flat join chain. At each join:
+//     a. Compute local nonnullable rels from the ON clause.
+//     b. Check whether the nullable side overlaps the accumulated nonnullable
+//        set (upper + any merged from prior INNER JOIN ON clauses). If so,
+//        demote.
+//     c. Propagate: INNER merges local ON findings into the accumulated set
+//        for subsequent joins; LEFT passes only the upper set forward (the
+//        right side can be null-extended); RIGHT/FULL reset or narrow the set.
 //
 // It modifies from in-place: JoinExpr.Type is changed when demotion fires.
 // This is a pessimisation fix — it never produces a wrong answer, only
 // opportunities it misses for lack of strictness information.
 func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Catalog) {
-	if where == nil {
-		return
-	}
 	// Build a table-name → *catalog.Table lookup from the FROM clause so
 	// collectNonNullableTableNames can resolve column types for operator
 	// strictness checks.
 	tableMap := buildTableMap(from, cat)
-	nonnullable := collectNonNullableTableNames(where, tableMap, cat)
-	if len(nonnullable) == 0 {
-		return
-	}
+	upperNN := collectNonNullableTableNames(where, tableMap, cat)
 	for i := range from {
-		applyDemotion(&from[i], nonnullable)
+		applyDemotion(&from[i], upperNN, tableMap, cat)
 	}
 }
 
 // applyDemotion walks one FromExpr's flat join chain and demotes outer joins
-// whose nullable side is constrained by a strict qual in nonnullable.
+// whose nullable side is constrained by strict quals. The nonnullable set
+// evolves as we walk the chain: local ON-clause findings are merged for INNER
+// joins (PG's reduce_outer_joins_pass2 propagation).
 //
 // The join chain is strictly left-deep: (((Base ⋈ J0.Right) ⋈ J1.Right) ⋈ …).
 // For a LEFT JOIN at position i, the right (nullable) side is Joins[i].Right
 // (a single RangeVar). For a RIGHT JOIN, the left (accumulated) side is
 // nullable and we check whether ANY of its tables are in nonnullable. For a
 // FULL JOIN, each side is checked independently.
-func applyDemotion(item *parser.FromExpr, nonnullable map[string]bool) {
+//
+// Parameters:
+//   - upperNN: nonnullable rels from the WHERE clause (the "upper" set).
+//     This is the starting accumulated set; it is never mutated.
+func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+	// accumulatedNN is the working set that evolves as we walk the chain.
+	// It starts as a copy of upperNN (WHERE-clause findings).
+	accumulatedNN := make(map[string]bool, len(upperNN))
+	for name := range upperNN {
+		accumulatedNN[name] = true
+	}
+
 	// Accumulated set of table names on the left.
 	leftNames := rangeVarNames(item.Base)
 
@@ -56,23 +70,30 @@ func applyDemotion(item *parser.FromExpr, nonnullable map[string]bool) {
 		j := &item.Joins[i]
 		rightName := rangeVarPrimaryName(j.Right)
 
+		// Compute local nonnullable rels from the ON clause.
+		// For INNER joins these become real constraints on the result and
+		// propagate to subsequent joins; for outer joins they only apply
+		// within the nullable side (which may still be null-extended).
+		localNN := collectNonNullableTableNames(j.On, tableMap, cat)
+
+		// ---- demotion check ----
 		switch j.Type {
 		case parser.JoinLeft:
 			// Left side is preserved, right side is nullable.
-			if nonnullable[rightName] {
+			if accumulatedNN[rightName] {
 				j.Type = parser.JoinInner
 			}
 
 		case parser.JoinRight:
 			// Right side is preserved, left (accumulated) side is nullable.
-			if anyNameIn(leftNames, nonnullable) {
+			if anyNameIn(leftNames, accumulatedNN) {
 				j.Type = parser.JoinInner
 			}
 
 		case parser.JoinFull:
 			// Both sides are nullable. Check each independently.
-			leftConstrained := anyNameIn(leftNames, nonnullable)
-			rightConstrained := nonnullable[rightName]
+			leftConstrained := anyNameIn(leftNames, accumulatedNN)
+			rightConstrained := accumulatedNN[rightName]
 			if leftConstrained && rightConstrained {
 				j.Type = parser.JoinInner
 			} else if rightConstrained {
@@ -83,9 +104,51 @@ func applyDemotion(item *parser.FromExpr, nonnullable map[string]bool) {
 			// is unrepresentable — leave as FULL. (Ledger.)
 		}
 
+		// ---- propagation: update accumulatedNN for next iteration ----
+		// PG reduce_outer_joins_pass2: inner merges upper+local; outer
+		// passes local only to the nullable side, upper only to the
+		// preserved side. In a left-deep chain the "preserved left"
+		// continues to the next join, so the rules are:
+		switch j.Type {
+		case parser.JoinInner:
+			// Both sides are truly combined — ON clause strict quals are
+			// real constraints on the result. Merge local findings.
+			for name := range localNN {
+				accumulatedNN[name] = true
+			}
+
+		case parser.JoinLeft:
+			// Preserved left side keeps the upper set unchanged.
+			// The right (nullable) side can be null-extended, so its
+			// tables do NOT join the accumulated nonnullable set.
+			// accumulatedNN stays as-is (no merge).
+
+		case parser.JoinRight:
+			// Preserved right, nullable left. The left (accumulated)
+			// side may be null-extended for subsequent joins, so reset
+			// accumulatedNN: only right-side tables constrained by localNN
+			// survive. (S9.4 will make this dead code after the flip.)
+			next := make(map[string]bool)
+			for name := range localNN {
+				if name == rightName || containsName(rangeVarNames(j.Right), name) {
+					next[name] = true
+				}
+			}
+			accumulatedNN = next
+
+		case parser.JoinFull:
+			// Both sides nullable — nothing propagates through.
+			accumulatedNN = make(map[string]bool)
+		}
+
 		// Accumulate right side's names for the next iteration.
 		leftNames = append(leftNames, rangeVarNames(j.Right)...)
 	}
+}
+
+// containsName reports whether name is present in names.
+func containsName(names []string, name string) bool {
+	return slices.Contains(names, name)
 }
 
 // buildTableMap builds a map from table name/alias to *catalog.Table by

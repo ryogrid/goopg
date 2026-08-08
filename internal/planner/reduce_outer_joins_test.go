@@ -352,3 +352,242 @@ func TestReduceOuterJoinsInnerUnaffected(t *testing.T) {
 		t.Errorf("INNER JOIN should stay INNER: got %v", got)
 	}
 }
+
+// ---- M0129-S9.2: ON-clause propagation tests ----
+
+func TestReduceOuterJoinsInnerOnPropagatesToRightDemotion(t *testing.T) {
+	// a INNER JOIN b ON a.x = b.y RIGHT JOIN c
+	// WHERE is empty — the INNER JOIN's strict ON clause is the ONLY source
+	// of nonnullable rels.
+	// → INNER ON: localNN = {a, b} → merged into accumulatedNN = {a, b}
+	// → RIGHT JOIN: nullable (left) side = {a, b}, accumulatedNN = {a, b}
+	//   → overlap → demote RIGHT to INNER.
+	// Without S9.2, accumulatedNN stays empty and no demotion happens.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinRight, Right: parser.RangeVar{Name: "c"},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil) // no WHERE
+
+	if got := from[0].Joins[1].Type; got != parser.JoinInner {
+		t.Errorf("RIGHT JOIN after INNER JOIN with strict ON (no WHERE): got %v, want JoinInner", got)
+	}
+}
+
+func TestReduceOuterJoinsInnerOnPropagatesToLeftCheck(t *testing.T) {
+	// a INNER JOIN b ON a.x = b.y LEFT JOIN c ON b.z = c.w
+	// WHERE empty.
+	// → INNER ON: localNN = {a, b} → accumulatedNN = {a, b}
+	// → LEFT JOIN: check "c" (nullable side) against {a, b} → NO match
+	// → stays LEFT (propagation should not cause false demotion).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "z"},
+					Right: &parser.ColumnRef{Table: "c", Column: "w"},
+				},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	// c is the nullable side; it is NOT in accumulatedNN ({a, b}).
+	if got := from[0].Joins[1].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN with nullable side not in accumulatedNN: got %v, want JoinLeft", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftOnDoesNotSelfDemote(t *testing.T) {
+	// a LEFT JOIN b ON b.x = 5
+	// The ON clause b.x = 5 is strict, but b can still be null-extended
+	// for non-matching rows → no self-demotion by local ON clause.
+	// PG reduce_outer_joins_pass2 uses only upper nonnullable_rels for
+	// demotion, never the local ON clause's own findings.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "x"},
+					Right: &parser.IntegerConst{Value: 5},
+				},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN with strict ON referencing only nullable side: got %v, want JoinLeft (no self-demotion)", got)
+	}
+}
+
+func TestReduceOuterJoinsMultiInnerOnChain(t *testing.T) {
+	// a INNER JOIN b ON a.x = b.y INNER JOIN c ON b.z = c.w RIGHT JOIN d
+	// → accumulatedNN after first INNER: {a, b}
+	// → accumulatedNN after second INNER: {a, b, c} (merged from second ON)
+	// → RIGHT JOIN: nullable left side = {a, b, c}, accumulatedNN overlap → demote!
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "z"},
+					Right: &parser.ColumnRef{Table: "c", Column: "w"},
+				},
+			},
+			{
+				Type: parser.JoinRight, Right: parser.RangeVar{Name: "d"},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	if got := from[0].Joins[2].Type; got != parser.JoinInner {
+		t.Errorf("RIGHT JOIN after two INNER joins with strict ONs (no WHERE): got %v, want JoinInner", got)
+	}
+}
+
+func TestReduceOuterJoinsWhereCombinedWithInnerOnPropagation(t *testing.T) {
+	// a INNER JOIN b ON a.x = b.y LEFT JOIN c ON b.z = c.w WHERE c.v = 5
+	// → upperNN from WHERE = {c}
+	// → INNER ON: localNN = {a, b} → accumulatedNN = {a, b, c}
+	// → LEFT JOIN: check "c" against accumulatedNN → "c" IS in accumulatedNN
+	// → demote LEFT to INNER.
+	// This is a regression guard that WHERE + ON interplay correctly.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "z"},
+					Right: &parser.ColumnRef{Table: "c", Column: "w"},
+				},
+			},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "c", Column: "v"},
+		Right: &parser.IntegerConst{Value: 5},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[1].Type; got != parser.JoinInner {
+		t.Errorf("LEFT JOIN with WHERE on nullable side + INNER ON propagation: got %v, want JoinInner", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftOnDoesNotPropagate(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y RIGHT JOIN c
+	// → LEFT ON: localNN = {a, b} but LEFT propagation → does NOT merge
+	// → accumulatedNN stays empty
+	// → RIGHT JOIN: nullable side = {a, b}, accumulatedNN = {} → no demotion.
+	// This is the key guard: LEFT JOIN's ON findings don't leak to subsequent
+	// joins because b can be null-extended.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinRight, Right: parser.RangeVar{Name: "c"},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	if got := from[0].Joins[1].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after LEFT JOIN with strict ON (no WHERE): got %v, want JoinRight (LEFT ON does not propagate)", got)
+	}
+}
+
+func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
+	// a INNER JOIN b ON a.x = b.y FULL JOIN c RIGHT JOIN d
+	// → INNER ON: accumulatedNN = {a, b}
+	// → FULL JOIN: both sides nullable → accumulatedNN RESET to empty
+	// → RIGHT JOIN: nullable side = {a, b, c}, accumulatedNN = {} → no demotion
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinFull, Right: parser.RangeVar{Name: "c"},
+			},
+			{
+				Type: parser.JoinRight, Right: parser.RangeVar{Name: "d"},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	// FULL JOIN resets accumulatedNN; subsequent RIGHT JOIN can't demote.
+	if got := from[0].Joins[2].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after FULL JOIN: got %v, want JoinRight (FULL resets propagation)", got)
+	}
+}

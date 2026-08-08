@@ -1,38 +1,44 @@
-Task: M0129-S8.3 DONE — cmax stamping applied, S8.3 milestone closed
+Task: M0129-S9.2 DONE — ON-clause propagation in reduce_outer_joins
 
 Files:
-- internal/executor/operators_storage.go: cmax stamping added to:
-  stampUpdaterXmaxNonHOT (both Multi and plain xmax paths),
-  3 fallback PageSetHeapTupleXmax sites (UPDATE index-driven,
-  UPDATE updateWithFrom, DELETE deleteOp), and tryApplyHOTUpdate
-  (both PageStampHotOldTupleMulti and PageStampHotOldTuple paths)
+- internal/planner/reduce_outer_joins.go: refactored reduceOuterJoins + applyDemotion
+  to compute local nonnullable rels from each JoinExpr.On clause and propagate
+  per join type (INNER merges local→accumulated; LEFT preserves upper only;
+  RIGHT resets to right-side local; FULL resets to empty). Removed early-return
+  when WHERE is nil so ON-clause-only propagation works.
+- internal/planner/reduce_outer_joins_test.go: added 7 new tests covering:
+  INNER ON → RIGHT demotion (core S9.2 enablement), LEFT check (no false
+  demotion), self-demotion guard (LEFT ON does not demote itself), multi-INNER
+  chain propagation, WHERE+ON interplay, LEFT ON non-propagation guard, and
+  FULL JOIN reset guard.
 
 Key symbols:
-- stampUpdaterXmaxNonHOT, PageSetHeapTupleCmax, GetCurrentCommandId
-- PageSetHeapTupleXmax, PageStampHotOldTuple, PageStampHotOldTupleMulti
-- tryApplyHOTUpdate
+- applyDemotion(item, upperNN, tableMap, cat): now accepts tableMap+cat for
+  ON-clause collection; uses evolving accumulatedNN
+- containsName(names, name): new helper wrapping slices.Contains
+- localNN per join: collectNonNullableTableNames(j.On, tableMap, cat)
 
 Hypothesis/Findings:
-- All cmax stamping sites now covered: the central wrapper
-  (stampUpdaterXmaxNonHOT), the 3 direct-PageSetHeapTupleXmax fallbacks,
-  and the HOT old-tuple path.
-- The "second writeHeapRowReturning cmin stamp" referenced in the ledger
-  appears to have been resolved by S8.3g — all heap-write paths
-  (writeHeapRowReturning, buildCatalogPGHeapTuple, tryApplyHOTUpdate,
-  toast.go) already have SetCmin.
-- S8.3 is now fully complete.
+- PG reduce_outer_joins_pass2 only uses UPPER nonnullable_rels for demotion,
+  never the local ON clause's own findings. Our implementation matches: localNN
+  is computed but only used for propagation after the join type is resolved,
+  never for self-demotion.
+- The key new capability: an INNER JOIN's strict ON clause (e.g. a.x = b.y)
+  makes a and b non-nullable in the result, which can then demote a subsequent
+  RIGHT JOIN whose nullable side includes those tables.
+- LEFT JOIN ON findings do NOT propagate (b can be null-extended), matching PG.
 
-Next step: Pick next M0129 task from fix_plan.md. M0129-S9
-(reduce_outer_joins residuals) is the next unchecked item.
+Next step: M0129-S9.3 — LEFT→ANTI. find_forced_null_vars analogue (IS NULL on
+  nullable-side columns). PG reduce_outer_joins_pass2 lines 3388-3403:
+  find_nonnullable_vars(j->quals), intersect with forced_null_vars from above,
+  check overlap with right_state->relids → demote LEFT to ANTI.
 
 Gates run:
 - go build ./...: PASS
-- Full executor suite (serial): PASS (5.7-5.8s)
-- CTE DML + HOT tests: PASS
-- mvcc tests: PASS
-- storage tests: PASS
-- SPOT (Q12/Q13): PASS (2/35 rows, 29.7s)
-- pgbench smoke: PASS (500/692/13820 tps, 0 failures)
+- All 23 reduce_outer_joins tests: PASS
+- Full planner suite: PASS (1.146s)
+- Pre-commit (units): PASS
+- tpch-spotcheck: PASS (Q12=2 Q13=35, 29.6s)
 - make ralph-state-guard: PASS (auto-repaired)
 
 In-flight: none

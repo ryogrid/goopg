@@ -11055,7 +11055,7 @@ measurement discipline).
       `LookupOperatorForNode` + column-type lookup from FROM-clause tables,
       falling back to the token-based comparison-operator fast path when
       types can't be resolved.
-  - [ ] **M0129-S9.2 — ON-clause propagation.** Collect non-nullable rels from
+  - [x] **M0129-S9.2 — ON-clause propagation.** Collect non-nullable rels from
       `JoinExpr.On` clauses and propagate per join type (PG
       `reduce_outer_joins_pass2`: inner merges with upper; outer passes
       local to the nullable side, upper to the preserved side).
