@@ -568,6 +568,16 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
 	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+
+	// M0129-S4.1: cooperative parallel hash build — N goroutines scan+filter
+	// the build table while one goroutine owns the hash map
+	// (producer/consumer split). When eligible this replaces the serial
+	// build loops entirely; when not it falls through to them.
+	// Design: docs/design/parallel-query/13-cooperative-parallel-hash-build.md.
+	if o.parallelBuildEligible(ctx, buildLeft) {
+		return o.parallelBuildLazyHashTable(ctx, buildLeft)
+	}
+
 	buildStart := time.Now()
 	if buildLeft {
 		if err := o.left.Open(ctx); err != nil {
