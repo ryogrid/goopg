@@ -8,11 +8,14 @@ import (
 )
 
 // reduceOuterJoins demotes outer joins to inner joins when a strict qual above
-// them constrains the nullable side. It is the reduction half of PG's
-// reduce_outer_joins (postgres/src/backend/optimizer/prep/prepjointree.c).
+// them constrains the nullable side. It implements both the reduction (pass 2)
+// and the RIGHT→LEFT flip of PG's reduce_outer_joins
+// (postgres/src/backend/optimizer/prep/prepjointree.c).
 //
-// The RIGHT→LEFT flip half is unrepresentable in parser.FromExpr (Base RangeVar
-// + flat []JoinExpr) and stays out — a ledger row records the split.
+// RIGHT→LEFT flip (S9.4): first-position RIGHT and FULL→RIGHT joins are
+// flipped to LEFT by swapping Base↔Right. Deeper RIGHT/FULL→RIGHT joins
+// need a nested JoinExpr AST (parser.FromExpr is a flat left-deep chain)
+// and are ledgred — their RIGHT→ANTI path is unavailable.
 //
 // Algorithm (simplified from PG's recursive two-pass by the flat join chain):
 //  1. Walk the unresolved WHERE clause to collect table names/aliases in
@@ -55,6 +58,17 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 // nullable and we check whether ANY of its tables are in nonnullable. For a
 // FULL JOIN, each side is checked independently.
 //
+// S9.4 RIGHT→LEFT flip (PG reduce_outer_joins_pass2 lines 3366-3376):
+// RIGHT joins are flipped to LEFT before demotion checks so that LEFT→ANTI
+// and other LEFT-specific reductions apply. The flip swaps the join's children
+// (larg↔rarg in PG). In goopg's flat chain, this means swapping Base↔Right
+// for the first join. Deeper RIGHT joins need a nested AST and are ledgred.
+//
+// FULL→RIGHT→LEFT: when only the right side of a FULL join is constrained,
+// PG demotes FULL→RIGHT first (prepjointree.c:3334-3340), then the
+// RIGHT→LEFT flip at line 3366 converts it. We do both in one step for the
+// simple (first-join) case: swap Base↔Right and change to LEFT.
+//
 // Parameters:
 //   - upperNN: nonnullable rels from the WHERE clause (the "upper" set).
 //     This is the starting accumulated set; it is never mutated.
@@ -71,6 +85,28 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 	accumulatedFN := make(map[string]bool, len(upperFN))
 	for name := range upperFN {
 		accumulatedFN[name] = true
+	}
+
+	// S9.4: RIGHT→LEFT flip for the first join (PG pass2 lines 3366-3376).
+	// This normalises RIGHT to LEFT so that LEFT-specific reductions
+	// (LEFT→ANTI, etc.) apply. For the first join, the swap is trivial:
+	// RIGHT(A,B) → LEFT(B,A) by swapping Base↔Right.
+	if len(item.Joins) > 0 {
+		first := &item.Joins[0]
+		if first.Type == parser.JoinRight {
+			item.Base, first.Right = first.Right, item.Base
+			first.Type = parser.JoinLeft
+		} else if first.Type == parser.JoinFull {
+			// FULL→RIGHT→LEFT: when only the right side is constrained,
+			// PG demotes FULL→RIGHT, then RIGHT→LEFT flip. Do both at once.
+			// PG prepjointree.c:3334-3340 (FULL→RIGHT) + 3366-3376 (flip).
+			baseName := rangeVarPrimaryName(item.Base)
+			rightName := rangeVarPrimaryName(first.Right)
+			if !accumulatedNN[baseName] && accumulatedNN[rightName] {
+				item.Base, first.Right = first.Right, item.Base
+				first.Type = parser.JoinLeft
+			}
+		}
 	}
 
 	// Accumulated set of table names on the left.
@@ -104,23 +140,31 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 			}
 
 		case parser.JoinRight:
-			// Right side is preserved, left (accumulated) side is nullable.
+			// RIGHT join not at first position (first-position RIGHT was
+			// flipped to LEFT above). Only RIGHT→INNER demotion is possible
+			// without the flip; RIGHT→ANTI needs a nested AST.
+			// S9.4 ledger: deeper RIGHT joins can't be flipped.
 			if anyNameIn(leftNames, accumulatedNN) {
 				j.Type = parser.JoinInner
 			}
 
 		case parser.JoinFull:
 			// Both sides are nullable. Check each independently.
+			// PG prepjointree.c:3319-3341.
 			leftConstrained := anyNameIn(leftNames, accumulatedNN)
 			rightConstrained := accumulatedNN[rightName]
 			if leftConstrained && rightConstrained {
 				j.Type = parser.JoinInner
-			} else if rightConstrained {
-				// Right constrained → left preserved → becomes LEFT.
+			} else if leftConstrained {
+				// Only left constrained → LEFT (PG: JOIN_LEFT).
+				// Left side is nonnullable, right side is still nullable.
 				j.Type = parser.JoinLeft
+			} else if rightConstrained {
+				// Only right constrained.
+				// First join: already flipped by pre-loop above → won't reach here.
+				// Deeper joins: FULL→RIGHT needed, but RIGHT is unrepresentable
+				// in the flat chain. Ledgered at S9.4.
 			}
-			// Left-only constrained: would become RIGHT, but the flip
-			// is unrepresentable — leave as FULL. (Ledger.)
 		}
 
 		// ---- propagation: update accumulatedNN + accumulatedFN for next iteration ----
@@ -149,7 +193,10 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 			// Preserved right, nullable left. The left (accumulated)
 			// side may be null-extended for subsequent joins, so reset
 			// accumulatedNN: only right-side tables constrained by localNN
-			// survive. (S9.4 will make this dead code after the flip.)
+			// survive.
+			// NOTE: first-position RIGHT is flipped to LEFT above, so this
+			// branch is now dead for i==0. It remains for deeper chains where
+			// the flip is unrepresentable (S9.4 ledger).
 			next := make(map[string]bool)
 			for name := range localNN {
 				if name == rightName || containsName(rangeVarNames(j.Right), name) {

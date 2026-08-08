@@ -11061,7 +11061,7 @@ measurement discipline).
       local to the nullable side, upper to the preserved side).
   - [x] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
       nullable-side columns).
-  - [ ] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
+  - [x] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
       PREREQUISITE: `parser.FromExpr` is a Base RangeVar +
       flat `[]JoinExpr`, so the flip has no syntax tree to hang on; the
       parser/AST nested-join representation IS PART OF THIS SUBTASK. If

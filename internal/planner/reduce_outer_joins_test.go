@@ -69,8 +69,10 @@ func TestReduceOuterJoinsLeftNoWhere(t *testing.T) {
 }
 
 func TestReduceOuterJoinsRightDemotion(t *testing.T) {
-	// a RIGHT JOIN b WHERE a.x = 5 → RIGHT JOIN becomes INNER
-	// (strict qual constrains the left/nulled side).
+	// a RIGHT JOIN b WHERE a.x = 5 → RIGHT flipped to LEFT, then LEFT→INNER
+	// (strict qual constrains the nullable side after flip).
+	// S9.4: RIGHT(A,B) → LEFT(B,A); then LEFT→INNER because A is in
+	// accumulatedNN (WHERE a.x = 5 constrains the nullable side).
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -88,11 +90,17 @@ func TestReduceOuterJoinsRightDemotion(t *testing.T) {
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("RIGHT JOIN with strict WHERE on nullable (left) side: got %v, want JoinInner", got)
 	}
+	// After the flip, Base should be the original right side (b → preserved).
+	if got := from[0].Base.Name; got != "b" {
+		t.Errorf("RIGHT→LEFT flip: expected Base 'b', got %q", got)
+	}
 }
 
 func TestReduceOuterJoinsRightNoDemotion(t *testing.T) {
-	// a RIGHT JOIN b WHERE b.x = 5 → no demotion (strict qual on preserved
-	// right side).
+	// a RIGHT JOIN b WHERE b.x = 5 → RIGHT flipped to LEFT, no further demotion
+	// (strict qual is on the preserved side after flip).
+	// S9.4: RIGHT(A,B) → LEFT(B,A); LEFT→INNER doesn't fire because A (the
+	// nullable side after flip) is NOT in accumulatedNN — only B is.
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -107,8 +115,14 @@ func TestReduceOuterJoinsRightNoDemotion(t *testing.T) {
 
 	reduceOuterJoins(from, where, nil)
 
-	if got := from[0].Joins[0].Type; got != parser.JoinRight {
-		t.Errorf("RIGHT JOIN with strict WHERE on preserved side: got %v, want JoinRight", got)
+	// After S9.4 flip: RIGHT(A,B) → LEFT(B,A). B is preserved, A is nullable.
+	// B is constrained (b.x = 5) but that doesn't demote LEFT further.
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("RIGHT JOIN with strict WHERE on preserved side: got %v, want JoinLeft (after flip)", got)
+	}
+	// After the flip, Base should be B (the original right side → now preserved).
+	if got := from[0].Base.Name; got != "b" {
+		t.Errorf("RIGHT→LEFT flip: expected Base 'b', got %q", got)
 	}
 }
 
@@ -142,8 +156,11 @@ func TestReduceOuterJoinsFullDemotionBothSides(t *testing.T) {
 }
 
 func TestReduceOuterJoinsFullDemotionOneSide(t *testing.T) {
-	// a FULL JOIN b WHERE b.y = 10 → FULL becomes LEFT
-	// (right side constrained → left is now the only nullable side → LEFT).
+	// a FULL JOIN b WHERE b.y = 10 → FULL→RIGHT→LEFT flip.
+	// PG prepjointree.c:3334-3340 (FULL→RIGHT when only right constrained)
+	// + 3366-3376 (RIGHT→LEFT flip).
+	// Result: FULL(A,B) → RIGHT(A,B) → LEFT(B,A).
+	// B is preserved (and constrained by WHERE), A is nullable.
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -160,6 +177,13 @@ func TestReduceOuterJoinsFullDemotionOneSide(t *testing.T) {
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("FULL JOIN with strict WHERE on right side only: got %v, want JoinLeft", got)
+	}
+	// After FULL→RIGHT→LEFT flip: Base should be B, right should be A.
+	if got := from[0].Base.Name; got != "b" {
+		t.Errorf("FULL→RIGHT→LEFT flip: expected Base 'b', got %q", got)
+	}
+	if got := from[0].Joins[0].Right.Name; got != "a" {
+		t.Errorf("FULL→RIGHT→LEFT flip: expected Right 'a', got %q", got)
 	}
 }
 
@@ -561,9 +585,19 @@ func TestReduceOuterJoinsLeftOnDoesNotPropagate(t *testing.T) {
 
 func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
 	// a INNER JOIN b ON a.x = b.y FULL JOIN c RIGHT JOIN d
-	// → INNER ON: accumulatedNN = {a, b}
-	// → FULL JOIN: both sides nullable → accumulatedNN RESET to empty
-	// → RIGHT JOIN: nullable side = {a, b, c}, accumulatedNN = {} → no demotion
+	// S9.4 + S9.2: goopg's flat-chain model propagates INNER→ON nonnullable
+	// findings through the chain. PG's top-down tree would keep both outer
+	// joins, but goopg's left-to-right chain demotes both.
+	//
+	// → INNER ON a.x = b.y: localNN = {a,b} → merge into accumulatedNN = {a,b}
+	// → FULL JOIN: leftNames={a,b}, rightName=c
+	//     leftConstrained (anyNameIn({a,b}, {a,b})) = true → FULL→LEFT
+	//     LEFT propagation: accumulatedNN stays {a,b}
+	// → RIGHT JOIN: leftNames={a,b,c}, accumulatedNN={a,b}
+	//     RIGHT→INNER: anyNameIn({a,b,c}, {a,b}) = true → INNER
+	// Quality note: PG would NOT demote here because nonnullable_rels flows
+	// top-down and INNER→ON findings don't reach the FULL parent.
+	// goopg is more aggressive but still correct (demotion never loses rows).
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -586,9 +620,15 @@ func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
 
 	reduceOuterJoins(from, nil, nil)
 
-	// FULL JOIN resets accumulatedNN; subsequent RIGHT JOIN can't demote.
-	if got := from[0].Joins[2].Type; got != parser.JoinRight {
-		t.Errorf("RIGHT JOIN after FULL JOIN: got %v, want JoinRight (FULL resets propagation)", got)
+	// FULL→LEFT demotion (left side constrained by propagated INNER→ON NN).
+	if got := from[0].Joins[1].Type; got != parser.JoinLeft {
+		t.Errorf("FULL JOIN after INNER ON chain: got %v, want JoinLeft", got)
+	}
+	// RIGHT→INNER demotion (right was flipped to LEFT, but this is pos 2,
+	// not first, so not flipped — RIGHT→INNER fires because left side
+	// {a,b,c} overlaps accumulatedNN {a,b}).
+	if got := from[0].Joins[2].Type; got != parser.JoinInner {
+		t.Errorf("RIGHT JOIN after FULL→LEFT: got %v, want JoinInner", got)
 	}
 }
 
@@ -892,5 +932,230 @@ func TestReduceOuterJoinsForcedNullWithOrNoDemotion(t *testing.T) {
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with IS NULL in OR: got %v, want JoinLeft (OR not examined for forced-null)", got)
+	}
+}
+
+// ---- S9.4: RIGHT→LEFT flip tests ----
+
+func TestReduceOuterJoinsRightToLeftFlipFirstPosition(t *testing.T) {
+	// RIGHT JOIN at first position is flipped to LEFT.
+	// RIGHT(A,B) → LEFT(B,A): Base and Right are swapped.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinRight, Right: parser.RangeVar{Name: "b"}},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("RIGHT JOIN first position: got %v, want JoinLeft (flipped)", got)
+	}
+	if got := from[0].Base.Name; got != "b" {
+		t.Errorf("RIGHT→LEFT flip: expected Base 'b', got %q", got)
+	}
+	if got := from[0].Joins[0].Right.Name; got != "a" {
+		t.Errorf("RIGHT→LEFT flip: expected Right 'a', got %q", got)
+	}
+}
+
+func TestReduceOuterJoinsRightFlipThenAnti(t *testing.T) {
+	// RIGHT(A,B) flipped to LEFT(B,A), then LEFT→ANTI because A is
+	// forced-null (IS NULL) AND nonnullable (strict ON clause).
+	// WHERE a.x IS NULL → accumulatedFN = {a}
+	// ON a.x = b.x → localNN = {a, b}
+	// LEFT→ANTI: accumulatedFN["a"]=true, localNN["a"]=true → ANTI
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinRight, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "x"},
+				}},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "a", Column: "x"},
+		Negated: false,
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("RIGHT flip then ANTI: got %v, want JoinAnti", got)
+	}
+}
+
+func TestReduceOuterJoinsRightFlipInnerWinsOverAnti(t *testing.T) {
+	// RIGHT(A,B) flipped to LEFT(B,A). Both INNER and ANTI conditions are met;
+	// INNER wins over ANTI (INNER is the stronger demotion).
+	// WHERE a.x = 5 AND a.x IS NULL → accumulatedNN={a}, accumulatedFN={a}
+	// ON a.x = b.x → localNN = {a, b}
+	// LEFT→INNER fires first: accumulatedNN["a"]=true → INNER
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinRight, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "x"},
+				}},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op: parser.OpAnd,
+		Left: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+			Right: &parser.IntegerConst{Value: 5},
+		},
+		Right: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "a", Column: "x"},
+			Negated: false,
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("RIGHT flip, INNER wins over ANTI: got %v, want JoinInner", got)
+	}
+}
+
+func TestReduceOuterJoinsRightFlipMultiJoinChain(t *testing.T) {
+	// RIGHT JOIN in a multi-join chain. First RIGHT is flipped;
+	// deeper RIGHT (pos 1) is not flipped (S9.4 ledger).
+	// a INNER JOIN b RIGHT JOIN c WHERE a.x = 5
+	// First join: INNER+ON a.x=b.x → localNN merges; accumulatedNN={a,b}
+	// Second join: RIGHT at pos 1 → NOT flipped (needs nested AST).
+	//   RIGHT→INNER: leftNames={a,b} overlaps accumulatedNN={a,b}? YES → INNER.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "x"},
+				}},
+			{Type: parser.JoinRight, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "y"},
+					Right: &parser.ColumnRef{Table: "c", Column: "y"},
+				}},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+		Right: &parser.IntegerConst{Value: 5},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	// First join: INNER stays INNER.
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("first INNER in chain: got %v, want JoinInner", got)
+	}
+	// Second join: RIGHT at pos 1 → NOT flipped (S9.4 ledger).
+	// RIGHT→INNER check: leftNames={a,b} overlap accumulatedNN={a,b}? YES → INNER.
+	if got := from[0].Joins[1].Type; got != parser.JoinInner {
+		t.Errorf("RIGHT at pos 1, right→inner: got %v, want JoinInner", got)
+	}
+}
+
+// ---- S9.4: FULL→RIGHT→LEFT flip tests ----
+
+func TestReduceOuterJoinsFullRightFlipFirstPosition(t *testing.T) {
+	// FULL(A,B) with only right constrained → FULL→RIGHT→LEFT flip.
+	// WHERE b.y = 10: accumulatedNN = {b} (right constrained only).
+	// PG: FULL→RIGHT, then RIGHT→LEFT flip.
+	// Result: LEFT(B,A). LEFT→INNER: accumulatedNN["a"]? No (only b). Stays LEFT.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinFull, Right: parser.RangeVar{Name: "b"}},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+		Right: &parser.IntegerConst{Value: 10},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("FULL→RIGHT→LEFT flip: got %v, want JoinLeft", got)
+	}
+	if got := from[0].Base.Name; got != "b" {
+		t.Errorf("FULL→RIGHT→LEFT flip: expected Base 'b', got %q", got)
+	}
+}
+
+func TestReduceOuterJoinsFullToLeftOnlyLeftConstrained(t *testing.T) {
+	// FULL(A,B) with only left constrained → FULL→LEFT (no flip needed).
+	// WHERE a.x = 5: accumulatedNN = {a} (left constrained only).
+	// PG prepjointree.c:3325-3330: FULL→LEFT when left is nonnullable.
+	// Result: LEFT(A,B). A is preserved, B is nullable.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinFull, Right: parser.RangeVar{Name: "b"}},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+		Right: &parser.IntegerConst{Value: 5},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("FULL→LEFT (only left constrained): got %v, want JoinLeft", got)
+	}
+	// No flip — Base stays as original left (A).
+	if got := from[0].Base.Name; got != "a" {
+		t.Errorf("FULL→LEFT: expected Base 'a', got %q", got)
+	}
+}
+
+func TestReduceOuterJoinsFullDemotionBothSidesStructural(t *testing.T) {
+	// FULL(A,B) with both sides constrained → INNER.
+	// No structural change needed. Verify Base stays A.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinFull, Right: parser.RangeVar{Name: "b"}},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op: parser.OpAnd,
+		Left: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+			Right: &parser.IntegerConst{Value: 5},
+		},
+		Right: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+			Right: &parser.IntegerConst{Value: 10},
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("FULL JOIN both sides constrained: got %v, want JoinInner", got)
+	}
+	// No flip needed — both sides constrained → straight to INNER.
+	if got := from[0].Base.Name; got != "a" {
+		t.Errorf("FULL→INNER: expected Base 'a', got %q", got)
 	}
 }
