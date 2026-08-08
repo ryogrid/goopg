@@ -1,53 +1,42 @@
-Task: M0129-S5.6 COMPLETE — parallel bitmap heap scan. M0129 milestone COMPLETE (all subtasks [x]; S5.7/S5.8 closed blocked-with-reason).
+Task: M-NIGHTLY — fix 49 nightly regressions (20260809-020705). M0129-S8.3 command counter fix landed.
 
 Files:
-- internal/planner/parallel.go: drivingSeqScan→drivingScan (supports BitmapHeapScan);
-  scanTable helper; BitmapHeapScan added to subtreeHasUnsafeNode, parallelChildren;
-  HasBitmapScan for executor pre-build gating.
-- internal/executor/parallel_bitmap_scan.go: new — parallelBitmapState
-  (shared atomic page allocator + sorted block list from TIDBitmap).
-- internal/executor/operators_bitmap.go: pbm field on bitmapHeapScanOp;
-  nextSerial/nextParallel split; fetchOneTuple inline (avoids recursive Next()
-  across the shared-allocator boundary); ownBitmap flag.
-- internal/executor/parallel_scan.go: attachParallelBitmapScan (walks
-  filterOp/projectOp/instrumentedOp/joinOp/aggregateOp/sortOp→bitmapHeapScanOp).
-- internal/executor/operators_gather.go: pbm field on gatherOp;
-  prebuildBitmapScan (leader builds bitmap once before fan-out);
-  collectBitmapScans; wired in Open(), runWorker, leader child.
-- internal/executor/parallel_bitmap_scan_test.go: 6 unit tests for
-  parallelBitmapState (empty, single, multiple, lossy, nil-safety, idempotent).
-- .ralph/deferral_ledger.md: S5.7/S5.8 blocked-with-reason rows appended.
-- .ralph/fix_plan.md: S5.6 DONE, S5.7/S5.8 CLOSED blocked, S5 parent [x].
+- internal/executor/context.go: added cmdCounterExt + SetCmdCounter() + pointer delegation
+- internal/executor/session.go: added cmdCounter field to BasicSession; reset on begin/end
+- internal/server/dispatch.go: seed ectx cmdCounter from session
 
-Key symbols: parallelBitmapState, drivingScan, HasBitmapScan, scanTable,
-nextParallel, fetchOneTuple, attachParallelBitmapScan, prebuildBitmapScan,
-collectBitmapScans
+Key symbols: SetCmdCounter, BasicSession.CmdCounter, CommandCounterIncrement, GetCurrentCommandId
 
 Hypothesis/Findings:
-- PG's ParallelBitmapHeapState uses DSA (dynamic shared memory) for the
-  shared page allocator. goopg shares a Go pointer — the state reduces to
-  a sorted block list + an atomic.Int64 counter.
-- The leader builds the TIDBitmap once before fan-out (prebuildBitmapScan),
-  publishes the sorted blocks in parallelBitmapState, and workers claim
-  disjoint pages via nextPage().
-- Unlike the serial path (fetchExact calls o.Next() recursively), the
-  parallel path inlines the per-tuple fetch (fetchOneTuple) so that an
-  invisible tuple advances to the next offset on the SAME page rather than
-  accidentally claiming a new page from the shared allocator.
-- planner changes: drivingScan generalizes drivingSeqScan to also recognize
-  BitmapHeapScan; computeParallelWorkers uses scanTable() to extract the
-  *catalog.Table from either scan type. HasBitmapScan gates the executor
-  pre-build so we don't build a throwaway tree unnecessarily.
+- ROOT CAUSE: Each simple-query message creates a fresh executor.Context with cmdCounter
+  starting at 0. The cmin/cmax visibility check in TupleVisibleSubxact (S8.3g) makes
+  cmin >= curcid → invisible. With curcid=0, all self-inserted tuples (cmin >= 0) are
+  hidden from subsequent DML scans (scanMatching). DELETE/UPDATE find no victims → no
+  xmax stamp → deferred uniqueness checks at COMMIT find duplicate live tuples → 23505.
+- FIX: Store CommandCounter on BasicSession (per-transaction), seed fresh Context from
+  session via SetCmdCounter pointer delegation. Reset on tx begin/end.
+- Also fixes INSERT-time immediate NND checks that scan via scanMatching.
 
-Next step: M-NIGHTLY items (49 new regressions from 20260809-020705). All
-M0129 items are [x]; the Current Priority banner should be updated or M-NIGHTLY
-selection resumes.
+Verified fixed (13 tests):
+  All 5 deferred constraint tests: DeferredNNDMultiColumn, InitiallyDeferred{Exclusion,FK,NND,Unique}Commit
+  Isolation: FkSnapshot, InsertConflictDoUpdate{2,3,4}, LockUpdateDelete, Merge{Delete,InsertUpdate,Join,MatchRecheck,Update}, PropagateLockDelete, Stats, TotalCash
+  SetConstraintsDeferral
+
+Still failing (pre-existing, NOT caused by M0129):
+  - TestPort_IsolationEvalPlanQual (AI-007): failing since 20260808 nightly
+  - TestPort_IsolationPlpgsqlToast (AI-019): possible separate issue
+
+Not yet verified:
+  - DetachPartitionConcurrently1/3 (AI-005,006), EvalPlanQualTrigger (AI-008)
+  - 26 regress tests (AI-024–049): likely same root cause, should be fixed
+
+Next step: Run full testport suite to confirm remaining fixes; update fix_plan.md M-NIGHTLY
+  items with findings; investigate any remaining failures.
 
 Gates run:
-- UNITS: PASS (SCOPE=units precommit)
-- SPOT: PASS (Q12=2, Q13=35, 28.1s)
-- pgbench smoke: PASS (13,974 TPS, 0 failures)
-- RACE: PASS (all packages green)
+- UNITS: PASS
+- SPOT: PASS (Q12=2, Q13=35, 29.5s)
+- pgbench smoke: PASS (14,477/17,392/366,793 tps, 0 failures)
 - ralph-state-guard: REPAIRED+OK
 
 In-flight: none
