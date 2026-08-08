@@ -387,7 +387,6 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if ctx != nil {
 		*child = *ctx
 	}
-	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
@@ -401,9 +400,27 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
+	// M0129-S8.3h: sync parent command counter after function body runs so
+	// the caller sees the higher command id and subsequent statements don't
+	// hide writes that happened inside the function (PG's CommandCounterIncrement
+	// is global — the function body's increments are visible to the caller).
+	// Only cmdCounter is synced, NOT CmdID — the outer plan's visibility checks
+	// must keep the pinned es_output_cid that was current when the outer plan
+	// started (changing CmdID mid-plan would make the outer UPDATE see CTE
+	// writes it must not see).
+	defer func() {
+		if ctx != nil {
+			ctx.cmdCounter = child.cmdCounter
+		}
+	}()
 	// VOID functions: run all statements for side-effects, return NULL.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
 		for si, stmt := range stmts {
+			// Advance command counter before each statement so later
+			// statements see writes from earlier ones (PG's
+			// postquel_getnext calls CommandCounterIncrement for each
+			// command of a volatile function).
+			routineCommandCounterIncrement(child, r)
 			node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
@@ -438,6 +455,11 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	// Execute all statements except the last as side effects; return from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
+		// Advance command counter before each statement so later
+		// statements see writes from earlier ones (PG's
+		// postquel_getnext calls CommandCounterIncrement for each
+		// command of a volatile function).
+		routineCommandCounterIncrement(child, r)
 		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
@@ -530,7 +552,6 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	if ctx != nil {
 		*child = *ctx
 	}
-	routineCommandCounterIncrement(child, r)
 	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
@@ -544,9 +565,21 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 		}
 		child.Params[i] = coerced
 	}
+	// M0129-S8.3h: sync parent command counter after procedure body runs.
+	// Only cmdCounter is synced, NOT CmdID — see executeSQLRoutine.
+	defer func() {
+		if ctx != nil {
+			ctx.cmdCounter = child.cmdCounter
+		}
+	}()
 	var lastRow Row
 	for i, stmt := range stmts {
 		stmtNum := i + 1
+		// Advance command counter before each statement so later
+		// statements see writes from earlier ones (PG's
+		// postquel_getnext calls CommandCounterIncrement for each
+		// command of a volatile procedure).
+		routineCommandCounterIncrement(child, r)
 		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)

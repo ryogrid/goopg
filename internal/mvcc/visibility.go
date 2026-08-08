@@ -18,7 +18,9 @@ import (
 // curcid is the current command id within this transaction, used for the
 // cmin/cmax comparison on self-inserted tuples (PG's
 // HeapTupleSatisfiesMVCC HEAPTUPLE_INSERT_IN_PROGRESS arm). Callers
-// without a command counter (VACUUM, tests) pass InvalidCommandId (0).
+// without a command counter (VACUUM, tests) pass InvalidCommandId
+// (~uint32(0)) so that all self-inserted tuples are visible regardless
+// of cmin.
 //
 // combo is the per-connection ComboCIDStore, used to resolve combo CIDs
 // back to real cmin/cmax values. It may be nil when no per-connection
@@ -62,9 +64,11 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 			return true
 		}
 		// cmin check: a tuple inserted by a later command (cmin >= curcid)
-		// is not yet visible. goopg sets curcid=0 until the first write,
-		// and existing tuples have cmin=0; this correctly hides self-inserted
-		// tuples within the same statement while showing them to later ones.
+		// is not yet visible, mirroring PG's HeapTupleSatisfiesMVCC
+		// HEAPTUPLE_INSERT_IN_PROGRESS arm. A caller that bypasses the
+		// dispatch-layer per-statement CommandCounterIncrement (raw
+		// Build+Open+Next in tests) must advance ctx.CmdID itself, otherwise
+		// self-inserted tuples remain hidden even from a later statement.
 		cmin := GetCmin(h, combo)
 		if cmin >= curcid {
 			return false

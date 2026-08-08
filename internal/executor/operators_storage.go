@@ -300,9 +300,6 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	// nil reveal: EPQ re-resolves a row a WRITE is about to touch, and a row a
-	// DML CTE of this statement already removed is "already deleted by self"
-	// for that write (M0125-0053, Context.CTEXmaxReveal).
 	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact, ctx.CmdID, ctx.comboStore())
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
@@ -1536,7 +1533,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-		if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -3582,8 +3579,6 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil {
-	}
 	return true, derr
 }
 
@@ -3953,7 +3948,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		// nil reveal: this is an UPDATE's target scan (M0125-0053).
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
@@ -5663,10 +5657,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					epqSkipDel = true
 					break
 				}
-				// Sibling of the updateWithFrom EPQ site: the chain can lead
-				// straight into a version a LATER command of this same statement
-				// wrote — a VOLATILE routine invoked from a data-modifying WITH.
-				// PG refuses to merge that with the original delete and errors
 				v.blk = newBlk
 				v.slot = newSlot
 				if newRow != nil {
@@ -6099,13 +6089,6 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					}
 					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
 				}
-				// CTE isolation: if the EPQ chain led to a tuple this statement
-				// wrote, this statement already owns this row. Skip to preserve
-				// savedSnap isolation semantics — PG's "already updated by self;
-				// nothing to do". M0100-0010; M0125-0052 made the fence key
-				// relation-qualified, so the xmin re-read that used to disambiguate
-				// another table's coincident {block,slot} is no longer needed.
-				//
 				// Re-evaluate predicate against the new row + FROM portion.
 				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
 				if o.plan.FromPred != nil {
@@ -6607,7 +6590,6 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				// same heap state (M0125-0053). The LATER-command case that PG
 				// errors on cannot arrive here: such a version was written by
 				// this statement, so its own cmin hides it from this scan. It is
-				// reached only by an EvalPlanQual chain-follow, which is where
 				continue
 			}
 			// M0104-0008: SSI read-path hook for the UPDATE / DELETE

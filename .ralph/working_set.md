@@ -1,41 +1,42 @@
-Task: M0129-S6 COMPLETE — resjunk-ctid column path re-enable
+Task: M0129-S8.3 — cmin/cmax stamps + test fixes (partial: engine core DONE, test infra DEFERRED)
+
 Files:
-- internal/planner/planner.go: numCtid := wireRowMarkCtidColumns(out, locks);
-  recomputeIntermediateSchemas(out) when numCtid>0;
-  fixColumnRefIndices fixes ALL ColumnRefs via (name,SourceTableIdx) lookup;
-  ctid ColumnRefs now carry SourceTableIdx:-1
-- internal/planner/locking_test.go: re-enabled TestPlanCtidRowMarkWiring +
-  TestPlanCtidRowMarkMultiTable; NEW TestPlanCtidRowMarkSelfJoin
-- docs/design/0129-0003-resjunk-ctid-column-path.md: status → accepted
-- .ralph/fix_plan.md: M0129-S6 → [x]
+- internal/storage/command_id.go: InvalidCommandId changed 0→^uint32(0) (PG match)
+- internal/mvcc/visibility.go: TupleVisible cmin/cmax check, comment updates
+- internal/executor/executor.go: Run() advances command counter for test compat
+- internal/executor/plpgsql_runtime.go: executeSQLRoutine + executeSQLProcedureCore:
+  per-statement routineCommandCounterIncrement + parent cmdCounter sync (CmdID NOT synced)
+- internal/executor/with_compat_test.go: runQuery advances counter
+- internal/executor/time_text_cast_test.go: runSQL advances counter
 
 Key symbols:
-- recomputeIntermediateSchemas (planner.go): post-order recomputation of
-  Join/NLIJ schemas from children's Output()
-- fixColumnRefIndices + fixColumnRefsInExpr (planner.go): (name,srcIdx) lookup
-  in child output; walks sub-expressions via exprChildSlots
-- columnKey struct: {name string, srcIdx int16} for disambiguation
+- CommandCounter, GetCurrentCommandId, CommandCounterIncrement
+- TupleVisible, GetCmin, GetCmax
+- executeSQLRoutine, executeSQLProcedureCore, routineCommandCounterIncrement
+- InvalidCommandId, FirstCommandId
 
 Hypothesis/Findings:
-- Column path re-enabled with correct schema propagation.
-- All planner unit tests pass including self-join ctid disambiguation.
-- Isolation test (TestPort_IsolationEvalPlanQual) has a PRE-EXISTING failure
-  (same diff at f96b669d — verified by stash test). The column-path disable
-  was masking a slot-side-channel self-join TID-loss bug, not preventing
-  a regression.
-- Slot side-channel retained as belt-and-braces (CTE scans, VALUES).
-- S6 subsumes S3 (sort-spill TID loss): a ctid datum in the row survives
-  spill like any other column. S3 reduces to verifying the shape and closing
-  root-0038.
+- Fence retirement is COMPLETE (10/10 CTE DML tests pass → 11/11 now)
+- InvalidCommandId was 0, should be ~uint32(0) like PG → FIXED
+- SQL volatile functions didn't advance counter per-statement → FIXED
+- 102 executor unit tests FAIL because raw Build+Open+Next test helpers
+  don't advance the command counter (pre-existing gap exposed by cmin check)
+- Production dispatch path (dispatch.go:920-921) advances correctly → SPOT+DS05 PASS
+- cmax stamp in stampUpdaterXmaxNonHOT not yet done (no test coverage needs it;
+  old-tuple cmax=0 works correctly when curcid > 0)
 
-Next step: M0129-S7 (clause-6 re-adjudication) — run the estimate-audit
-comparison; no engine change expected.
+Next step: Fix test infrastructure gap — add CommandCounterIncrement+GetCurrentCommandId
+to test helpers that bypass dispatch (runQueryErr, drainScan wrappers, and ~100 raw
+Build+Open+Next sites). Then run full executor unit suite + pre-commit gate.
 
 Gates run:
-- UNITS: PASS (all packages)
-- SPOT: PASS (Q12=2 Q13=35)
-- DS05: PASS (95/99, 0 deltas, plan shapes identical)
-- ISOLATION: pre-existing failure (not a regression)
-- pgbench smoke: PASS (401 TPS, 0 failures)
+- go build ./...: PASS
+- 11/11 CTE DML tests: PASS
+- 5/5 HOT tests: PASS
+- mvcc tests: PASS
+- storage tests: PASS
+- SPOT (Q12/Q13): PASS (2/35 rows)
+- DS05 SF0.5 sweep: PASS (95/95, 0 mismatches, plans identical)
+- make ralph-state-guard: PASS (auto-repaired)
 
 In-flight: none

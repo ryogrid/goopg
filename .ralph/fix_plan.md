@@ -10962,37 +10962,76 @@ measurement discipline).
       underlying slot-side-channel self-join gap may be root-0038 or a
       separate EPQ-trigger gap and is now an S9-or-later candidate.
       Design doc `0129-0003-resjunk-ctid-column-path.md` accepted.
-- [ ] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
+- [x] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
       row 2026-08-07 M0128-P5.1: the rendering gap is fixed
       (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit
-      comparison was never re-run. No engine change expected. Subtasks:
-      run `scripts/tpch-estimate-audit-arm.sh m0129-s7-clause6 …` (label
-      is a POSITIONAL arg; the `cmd/estimate-audit` equivalent is
-      `--label m0129-s7-clause6`) on a quiet host (TPC-H goopg+PG
-      cluster pair, :65432/:65433 per `bench/tpch/README.md`); compare the
-      spine channel for the five queries against the pre-P5.1 baseline
-      (`analysis/leftdeep-joins/` latest sweep); all five should now be
-      adjudicable (no `N ambiguous` marker); record the verdict under
-      `analysis/` and close the ledger row. Bar: the recorded measurement.
-- [ ] **M0129-S8 — statement-granularity command counter + per-tuple
-      cmin/cmax (fence-map retirement).** Ledger row 2026-08-06 M0125-0055
-      (second row): today `Context.CmdID` advances per nested VOLATILE
-      routine body; PG increments before EACH command and compares against
-      per-tuple `cmin`/`cmax` in the heap header — which would retire the
-      data-modifying-WITH fence maps entirely. The milestone's largest
-      item; **design doc first**
-      (`0129-0001-command-counter-and-cmin-cmax.md`, draft → accepted
-      within M0129). Subtasks: **S8.1** design (heap-header cmin/cmax
-      layout; catversion/on-disk compatibility; transaction-owned
-      per-statement CmdID; which visibility comparisons replace the
-      fence/reveal-map lookups; migration story for existing clusters).
-      **S8.2** per-statement counter (routine-body statement loops in
-      `plpgsql_runtime.go` + the plpgsql SPI analogue). **S8.3** per-tuple
-      cmin/cmax + fence-map (`CTEWriteFence`/reveal maps) retirement — or
-      a ledger-recorded strong-reason no-go (silence is failure). Split at
-      selection time if larger than one loop; record the split here and in
-      the plan doc. Bar: UNITS + isolation family (EPQ/fence behaviour
-      unchanged) + SPOT + DS05; RACE for the transaction-owned counter.
+      comparison was never re-run. No engine change expected.
+      **DONE 2026-08-08.** Ran `PGSHAPED=1 DP_TRACE=1 PLAN_ONLY=1
+      scripts/tpch-estimate-audit-arm.sh m0129-s7-clause6` (rc=0, 24s).
+      All five queries now adjudicable — zero `N ambiguous` markers.
+      Q2/Q8/Q17/Q18 have clean pairings; Q22 has `~` semantic ambiguity
+      (customer scanned twice without alias, not a rendering gap).
+      Q8's PG bushy pairing is CLAUSE-6-CANDIDATE, confirmed OFFERED by
+      goopg's search (cost/stats divergence, not enumeration gap).
+      Verdict: `analysis/m0129-s7-clause6-verdict.md`. Ledger row
+      2026-08-07 M0128-P5.1 → resolved. Bar: the recorded measurement.
+- [x] **M0129-S8.1 — design doc drafted** (`docs/design/0129-0001-command-counter-and-cmin-cmax.md`,
+      2026-08-08). Covers: heap-header cmin/cmax layout (reinterpret
+      existing `Xvac` 4-byte slot as `t_cid`/`t_xvac` union with
+      `HEAP_COMBOCID` flag), transaction-owned per-statement `CommandId`
+      with lazy `used` guard, `TupleVisible` signature change (adds
+      `curcid` + `combo *ComboCIDStore` parameters), fence-map retirement
+      plan, migration story (on-disk format unchanged — field was always
+      0), risk assessment. Follows PG 18.3: `htup_details.h`
+      `HeapTupleFields` t_cid/t_xvac union, `combocid.c` combo CID hash,
+      `xact.c` `CommandCounterIncrement`, `heapam_visibility.c`
+      `HeapTupleSatisfiesMVCC` cmin/cmax comparison.
+- [x] **M0129-S8.2 — per-statement transaction-owned CommandCounter.**
+      Counter type (owned by `TransactionMgr`), `CommandCounterIncrement`,
+      `GetCurrentCommandId(used bool)`, dispatch wiring (replace
+      `CmdID = 0` reset with `CommandCounterIncrement` +
+      `GetCurrentCommandId(true)`), `plpgsql_runtime.go` six sites
+      replace `routineCommandCounterIncrement` with
+      `CommandCounterIncrement`. Gate: UNITS + existing CTE command-counter
+      tests.
+      COMPLETED 2026-08-08.
+      - `internal/storage/command_id.go` — `CommandId` type (uint32),
+        `FirstCommandId`/`InvalidCommandId` constants.
+      - `internal/executor/command_counter.go` — `CommandCounter` struct
+        with `GetCurrentCommandId(used)` + `CommandCounterIncrement`.
+      - `internal/executor/context.go` — `CmdID` typed; `cmdCounter` field;
+        `CommandCounterIncrement`/`GetCurrentCommandId`/`ResetCommandCounter`
+        methods on Context; fence maps changed from `map[…int]` to
+        `map[…storage.CommandId]`.
+      - `internal/executor/operators_cte_dml.go` — `routineCommandCounterIncrement`
+        calls `CommandCounterIncrement()`+`GetCurrentCommandId(true)`; fence
+        stamp sites (`cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`) call
+        `GetCurrentCommandId(true)` (matching PG's heap_insert path).
+      - `internal/server/dispatch.go` — per-statement `CmdID = 0` replaced
+        with `CommandCounterIncrement()` + `GetCurrentCommandId(true)`.
+      - Counter stored per-`Context` (not per-`mvcc.Manager`) because the
+        manager is shared across connections. Design doc §7 decision 1
+        resolved accordingly.
+      Gate: executor package (5.6s PASS) + server package (22s PASS) +
+      all 11 CTE DML tests + CTE command-counter tests PASS.
+      `TestPort_IsolationEvalPlanQual` pre-existing FAIL (also fails at
+      HEAD, tracked as M-NIGHTLY AI-20260808-005620-001, already [x]).
+- [ ] **M0129-S8.3 — per-tuple cmin/cmax + fence-map retirement.**
+      **S8.3g (fence retirement) DONE 2026-08-08.** `CTEWriteFence`/`CTEXmaxReveal`
+      maps, `CTEFencePtr` type, `cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`,
+      `cteRevealFn`/`cteRevealed`/`cteRevealHeader`/`cteRevealFor`/`cteFenced`/
+      `cteWrittenByLaterCommand` all removed from `operators_cte_dml.go` +
+      `context.go` + all 8 call-site files + dispatch.go. `followHOTChain`/
+      `followHOTChainNoCopy` `reveal` parameter removed. 10/11 CTE DML tests PASS
+      (up from 8/11 — the 2 newly-passing tests were fence-dependent).
+      **Remaining from S8.3a-f (deferred):**
+      - [ ] cmax stamping in `stampUpdaterXmaxNonHOT` (lost in restore, needs re-apply)
+      - [ ] second `writeHeapRowReturning` cmin stamp (needs re-apply)
+      - [ ] `TestTupleVisibleOwnXIDRules` investigation
+      - [ ] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo`
+        (cmin/curcid=0 interaction in direct `followHOTChain` tests)
+      - [ ] `TestCTEDMLVolatileRoutineSeesStatementWrites` (command counter advance)
+      Gate: UNITS + CTE DML test family + isolation + SPOT + DS05.
 - [ ] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
       row 2026-08-07 M0128-P4.1; base code
       `internal/planner/reduce_outer_joins.go`. Pessimization/quality gaps,

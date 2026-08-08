@@ -13,6 +13,11 @@ import (
 // CTE shape under test rather than the boilerplate.
 func runQuery(t *testing.T, ctx *Context, sql string) []Row {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements, matching
+	// PG's per-statement CommandCounterIncrement. GetCurrentCommandId(true)
+	// pins es_output_cid so cmin/cmax stamps carry the current command id.
+	ctx.CommandCounterIncrement()
+	ctx.CmdID = ctx.GetCurrentCommandId(true)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
