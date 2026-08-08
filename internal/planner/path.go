@@ -173,6 +173,23 @@ type Path struct {
 	// cost that was computed from a different ndistinct.
 	MemoizeInfo *memoizePathInfo
 
+	// BitmapSelectivity is the estimated fraction of the relation's rows that
+	// the bitmap tree (index/and/or) admits from the index side, before heap
+	// access and recheck. It is PG's `indexselectivity` on an IndexPath and
+	// `bitmapselectivity` on BitmapAnd/BitmapOr. Zero for non-bitmap paths.
+	// Set by costBitmapIndexScan for leaves and costBitmapAnd/costBitmapOr
+	// for combinators.
+	BitmapSelectivity float64
+
+	// PartialPredicate is the resolved planner expression for a partial
+	// index's WHERE predicate (PG's indpred). It is nil when the index is not
+	// partial and nil when the prover has proven the predicate is implied by
+	// the query quals (future — the prover does not yet exist). When non-nil,
+	// createBitmapHeapScanPlan appends it to BitmapQual so the executor
+	// rechecks it against every heap tuple. Only meaningful on
+	// PathBitmapIndexScan leaves (M0129-S5.4).
+	PartialPredicate Expr
+
 	Children []*Path
 
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.

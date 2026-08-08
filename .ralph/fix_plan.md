@@ -10971,7 +10971,7 @@ measurement discipline).
       (`internal/executor/operators_analyze.go`) + two-term Mackert-Lohman
       in `computeBitmapPages` + the `costIndexScan` correlation arm (DONE 2026-08-09).
       **S5.4** partial-index predicate recheck (`bitmapqualorig` analogue;
-      actionable now — goopg has partial indexes, cf. root-0041).
+      actionable now — goopg has partial indexes, cf. root-0041) (DONE 2026-08-09).
       **S5.5** `tbm_extract_page_tuple` bulk-offset extraction
       (`tidbitmap.go` iterator; microbenchmark). **S5.6** parallel bitmap
       heap scan (`ParallelGroup` + `ParallelScanState`; design §3.7's

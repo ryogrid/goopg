@@ -95,9 +95,14 @@ func TestAddOneBitmapPath_SkipsUniqueSingleRow(t *testing.T) {
 	}
 }
 
-func TestAddOneBitmapPath_SkipsPartialIndex(t *testing.T) {
+func TestBuildOneBitmapPath_ResolvesPartialIndexPredicate(t *testing.T) {
 	_, tbl, idx := testCatWithIdx(t)
 	idx.HasPredicate = true
+	idx.Predicate = &parser.BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &parser.ColumnRef{Column: "a"},
+		Right: &parser.IntegerConst{Value: 0},
+	}
 	s := testSearchForBitmap(t, tbl)
 	rel := s.levelRels(1)[0]
 	relTuples := float64(s.relInfos[0].baseRows)
@@ -107,9 +112,29 @@ func TestAddOneBitmapPath_SkipsPartialIndex(t *testing.T) {
 		T = 1
 	}
 
+	// S5.4: partial indexes are no longer declined for bitmap scans.
+	// The predicate is resolved and stored on the path for recheck.
 	p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), 0, rel.baseLeaf)
-	if p != nil {
-		t.Error("buildOneBitmapPath should return nil for partial index")
+	if p == nil {
+		t.Fatal("buildOneBitmapPath should build a path for partial index (predicate recheck covers correctness)")
+	}
+	if p.Kind != PathBitmapHeapScan {
+		t.Fatalf("expected PathBitmapHeapScan, got kind=%d", p.Kind)
+	}
+	if len(p.Children) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(p.Children))
+	}
+	idxPath := p.Children[0]
+	if idxPath.Kind != PathBitmapIndexScan {
+		t.Fatalf("expected child PathBitmapIndexScan, got kind=%d", idxPath.Kind)
+	}
+	if idxPath.PartialPredicate == nil {
+		t.Error("partial index predicate should be resolved and stored on the bitmap index path")
+	}
+	// Also verify the bitmap heap scan itself doesn't carry the predicate
+	// (it's on the child index scan path).
+	if p.PartialPredicate != nil {
+		t.Error("PartialPredicate should be nil on the heap scan path (only on index scan leaves)")
 	}
 }
 
@@ -478,4 +503,76 @@ func pathsOfKind(list []*Path, kind PathKind) []*Path {
 		}
 	}
 	return out
+}
+
+// TestCollectBitmapPartialPredicates verifies that collectBitmapPartialPredicates
+// collects PartialPredicate from bitmap index leaves (M0129-S5.4).
+func TestCollectBitmapPartialPredicates(t *testing.T) {
+	dummyPred := &ColumnRef{Name: "a", Index: 0}
+
+	tests := []struct {
+		name string
+		path *Path
+		want int
+	}{
+		{"nil path", nil, 0},
+		{"non-bitmap path", &Path{Kind: PathSeqScan, PartialPredicate: dummyPred}, 0},
+		{
+			"single index scan with predicate",
+			&Path{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+			1,
+		},
+		{
+			"single index scan without predicate",
+			&Path{Kind: PathBitmapIndexScan, PartialPredicate: nil},
+			0,
+		},
+		{
+			"bitmap AND with two partial index leaves",
+			&Path{
+				Kind: PathBitmapAnd,
+				Children: []*Path{
+					{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+					{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+				},
+			},
+			2,
+		},
+		{
+			"bitmap OR with mixed leaves",
+			&Path{
+				Kind: PathBitmapOr,
+				Children: []*Path{
+					{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+					{Kind: PathBitmapIndexScan, PartialPredicate: nil},
+				},
+			},
+			1,
+		},
+		{
+			"nested AND/OR",
+			&Path{
+				Kind: PathBitmapAnd,
+				Children: []*Path{
+					{
+						Kind: PathBitmapOr,
+						Children: []*Path{
+							{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+							{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+						},
+					},
+					{Kind: PathBitmapIndexScan, PartialPredicate: dummyPred},
+				},
+			},
+			3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectBitmapPartialPredicates(tt.path)
+			if len(got) != tt.want {
+				t.Errorf("collectBitmapPartialPredicates returned %d predicates, want %d", len(got), tt.want)
+			}
+		})
+	}
 }
