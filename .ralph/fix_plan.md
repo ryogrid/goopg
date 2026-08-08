@@ -11044,22 +11044,29 @@ measurement discipline).
 - [ ] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
       row 2026-08-07 M0128-P4.1; base code
       `internal/planner/reduce_outer_joins.go`. Pessimization/quality gaps,
-      never wrong answers. Subtasks: **S9.1** strictness catalog —
-      `isStrictOp(oid)` consulting `pg_proc.proisstrict` replacing the
-      hardcoded `isStrictCompareOp` set (`reduce_outer_joins.go:141`).
-      **S9.2** ON-clause propagation — collect non-nullable rels from
+      never wrong answers. Bar per subtask: UNITS +
+      demotion-matrix unit tests + SPOT + DS05 (plan movement adjudicated
+      via the plan channel).
+  - [x] **M0129-S9.1 — strictness catalog.** `isStrictOp(oid)` consulting
+      `pg_proc.proisstrict` replacing the hardcoded `isStrictCompareOp` set.
+      Generated `pgProcIsStrictByOID` map (3396 entries) via
+      `cmd/gen-pg-proc-data -names`; `IsStrictProc(oid)` in catalog;
+      `isStrictOp` in `reduce_outer_joins.go` resolves operator OID via
+      `LookupOperatorForNode` + column-type lookup from FROM-clause tables,
+      falling back to the token-based comparison-operator fast path when
+      types can't be resolved.
+  - [ ] **M0129-S9.2 — ON-clause propagation.** Collect non-nullable rels from
       `JoinExpr.On` clauses and propagate per join type (PG
       `reduce_outer_joins_pass2`: inner merges with upper; outer passes
-      local to the nullable side, upper to the preserved side). **S9.3**
-      LEFT→ANTI — `find_forced_null_vars` analogue (IS NULL on
-      nullable-side columns). **S9.4** RIGHT→LEFT flip half (+ FULL→RIGHT
-      partial) — NAMED PREREQUISITE: `parser.FromExpr` is a Base RangeVar +
+      local to the nullable side, upper to the preserved side).
+  - [ ] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
+      nullable-side columns).
+  - [ ] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
+      PREREQUISITE: `parser.FromExpr` is a Base RangeVar +
       flat `[]JoinExpr`, so the flip has no syntax tree to hang on; the
       parser/AST nested-join representation IS PART OF THIS SUBTASK. If
       scoping shows it breaks unrelated planner invariants, ledger the
-      strong reason instead of silently skipping. Bar per subtask: UNITS +
-      demotion-matrix unit tests + SPOT + DS05 (plan movement adjudicated
-      via the plan channel).
+      strong reason instead of silently skipping.
 - [ ] **M0129-S10 — `ExecError.Pos` → wire `FieldPosition`.** Ledger row
       2026-08-06 M0127-PS6.2: goopg never emits the `FieldPosition` ('P')
       error field for executor errors, so psql shows no `LINE n: … ^`

@@ -24,7 +24,7 @@ func TestReduceOuterJoinsLeftDemotion(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("LEFT JOIN with strict WHERE on nullable side: got %v, want JoinInner", got)
@@ -45,7 +45,7 @@ func TestReduceOuterJoinsLeftNoDemotionPreservedSide(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with strict WHERE on preserved side: got %v, want JoinLeft (no demotion)", got)
@@ -61,7 +61,7 @@ func TestReduceOuterJoinsLeftNoWhere(t *testing.T) {
 		},
 	}}
 
-	reduceOuterJoins(from, nil)
+	reduceOuterJoins(from, nil, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with no WHERE: got %v, want JoinLeft", got)
@@ -83,7 +83,7 @@ func TestReduceOuterJoinsRightDemotion(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("RIGHT JOIN with strict WHERE on nullable (left) side: got %v, want JoinInner", got)
@@ -105,7 +105,7 @@ func TestReduceOuterJoinsRightNoDemotion(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinRight {
 		t.Errorf("RIGHT JOIN with strict WHERE on preserved side: got %v, want JoinRight", got)
@@ -134,7 +134,7 @@ func TestReduceOuterJoinsFullDemotionBothSides(t *testing.T) {
 		},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("FULL JOIN with strict WHERE on both sides: got %v, want JoinInner", got)
@@ -156,7 +156,7 @@ func TestReduceOuterJoinsFullDemotionOneSide(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 10},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("FULL JOIN with strict WHERE on right side only: got %v, want JoinLeft", got)
@@ -176,7 +176,7 @@ func TestReduceOuterJoinsIsNotNull(t *testing.T) {
 		Negated: true, // IS NOT NULL
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("LEFT JOIN with IS NOT NULL on nullable side: got %v, want JoinInner", got)
@@ -197,7 +197,7 @@ func TestReduceOuterJoinsIsNullNoDemotion(t *testing.T) {
 		Negated: false, // IS NULL
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with IS NULL on nullable side: got %v, want JoinLeft (no demotion)", got)
@@ -227,7 +227,7 @@ func TestReduceOuterJoinsOrNoDemotion(t *testing.T) {
 		},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with OR in WHERE: got %v, want JoinLeft (no demotion)", got)
@@ -250,7 +250,7 @@ func TestReduceOuterJoinsMultiJoinChain(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("multi-join: first LEFT JOIN with no constraint: got %v, want JoinLeft", got)
@@ -274,7 +274,7 @@ func TestReduceOuterJoinsLikeNoDemotion(t *testing.T) {
 		Right: &parser.StringConst{Value: "foo"},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
 		t.Errorf("LEFT JOIN with LIKE in WHERE: got %v, want JoinLeft (no demotion)", got)
@@ -295,7 +295,7 @@ func TestReduceOuterJoinsAliasDemotion(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("LEFT JOIN with alias qual on nullable side: got %v, want JoinInner", got)
@@ -316,7 +316,7 @@ func TestReduceOuterJoinsNeOperator(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("LEFT JOIN with <> on nullable side: got %v, want JoinInner", got)
@@ -329,7 +329,7 @@ func TestReduceOuterJoinsEmptyFromExprs(t *testing.T) {
 		Op:    parser.OpEq,
 		Left:  &parser.ColumnRef{Table: "x", Column: "y"},
 		Right: &parser.IntegerConst{Value: 1},
-	})
+	}, nil)
 }
 
 func TestReduceOuterJoinsInnerUnaffected(t *testing.T) {
@@ -346,7 +346,7 @@ func TestReduceOuterJoinsInnerUnaffected(t *testing.T) {
 		Right: &parser.IntegerConst{Value: 5},
 	}
 
-	reduceOuterJoins(from, where)
+	reduceOuterJoins(from, where, nil)
 
 	if got := from[0].Joins[0].Type; got != parser.JoinInner {
 		t.Errorf("INNER JOIN should stay INNER: got %v", got)

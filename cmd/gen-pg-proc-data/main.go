@@ -426,6 +426,16 @@ func emitNamesOnly(entries []procEntry) {
 	for _, e := range entries {
 		fmt.Printf("\t%d: %d,\n", e.OID, e.RetType)
 	}
+	fmt.Printf("}\n\n")
+
+	fmt.Printf("// pgProcIsStrictByOID is a generated OID -> proisstrict index of every\n")
+	fmt.Printf("// PG18 pg_proc.dat entry (%d entries), backing IsStrictProc.\n", len(entries))
+	fmt.Printf("// true means the function is strict (returns NULL on NULL input).\n")
+	fmt.Printf("// Same leaf-package-copy rationale as pgProcNamesByOID above.\n")
+	fmt.Printf("var pgProcIsStrictByOID = map[uint32]bool{\n")
+	for _, e := range entries {
+		fmt.Printf("\t%d: %v,\n", e.OID, !e.NotStrict)
+	}
 	fmt.Printf("}\n")
 }
 

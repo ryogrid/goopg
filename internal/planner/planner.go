@@ -2298,7 +2298,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
 		// demoted joins enter the joinlist as plain INNER joins.
-		reduceOuterJoins(s.FromExprs, s.Where)
+		reduceOuterJoins(s.FromExprs, s.Where, cat)
 		rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
 	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil

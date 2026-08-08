@@ -19524,6 +19524,16 @@ func RegprocName(oid uint32) (string, bool) {
 	return name, ok
 }
 
+// IsStrictProc reports whether a built-in function is strict (returns NULL on
+// any NULL input). It consults the generated pgProcIsStrictByOID map, which
+// mirrors pg_proc.proisstrict for every PG18 built-in function. Returns false
+// for unknown OIDs (including user-defined functions, whose strictness isn't
+// tracked here — callers needing that should extend Routines or consult the
+// on-disk pg_proc heap).
+func IsStrictProc(oid uint32) bool {
+	return pgProcIsStrictByOID[oid]
+}
+
 // pgArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
 // typname, or a user Routine's stored Type.Name) to PG's format_type_be
 // display alias — the handful of base types whose internal name differs from
