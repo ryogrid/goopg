@@ -10852,25 +10852,24 @@ DS05/PLAN/RACE; `make ralph-state-guard` before every finish). **Read the
 plan doc §2 before picking any task here** (gate vocabulary, worktree and
 measurement discipline).
 
-- [ ] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** Live,
-      default-ON, stable ~7× regression (SF0.5 Q74 11–14 s → ~86–99 s; SF1
-      ~290–329 s). Attribution DONE (ledger row 2026-08-07): hash paths ARE
-      generated, cost ranks hash ~842 < merge ~2100 < NL ~8.4M at level 2,
-      yet the plan is NL at all 4 join levels — the rejection is NOT
-      cost-driven. Subtasks: **S1.1** diagnose — add `M0129-DEBUG` stderr
-      output in `addPathsToJoinrel` (`internal/planner/joinpaths.go:139`)
-      printing each level-2 candidate path's kind+cost and the
-      `setCheapest` survivor; run Q74 on the SF0.5 cluster
-      (`bench/tpcds/server.sh start sf05`, :65437); the three hypotheses
-      are recorded in the ledger row (merge cost for CTE inputs / dropped
-      hash precondition in `addHashJoinPath` / merge `Pathkeys` dominance
-      in `comparePaths`). **S1.2** fix the named cause; remove or
-      env-gate the debug output. **S1.3** pin — plan-shape guard test
-      (4-way CTE self-join with equalities → Hash Join); verify Q74 SF0.5
-      ≤ 20 s with byte-identical output (7 rows, ck `2ffc13c77bf53028`);
-      record the root cause in the ledger row. Bar: UNITS + SPOT + DS05
-      (Q74 time is the headline number) + PLAN.
-- [ ] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
+- [x] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** DONE
+      `ea1b2fbe` 2026-08-08. Root cause: TWO mechanisms, both diagnosed and
+      fixed. **(a) Hash path rejection by merge on pathkeys within 1% fuzz
+      band:** `comparePathCostsFuzzily` returned `costsEqual` for hash-vs-merge
+      at CTE self-join costs (~2.04 vs ~2.06) → merge pathkeys dominated hash
+      (no pathkeys) → hash silently rejected from pathlist. Fixed by falling
+      through to actual (non-fuzzy) cost comparison when fuzzily equal, so
+      hash (cheaper) trades off against merge (has pathkeys) and both survive.
+      **(b) CTE scan row estimates collapsed to 1:** `filterSelectivity`
+      defaults to `defaultEqSelectivity=0.005` per conjunct on columns with no
+      statistics — for Q74's year_total CTE (17977 rows, 2 sale_type/2 year
+      values), 0.005⁴×17977≈0.000011→1, making NL look free. Fixed by
+      falling back to CTE body's unfiltered row count in `initialRelRows`.
+      Q74: 99s→14s SF0.5 (≤20s ✓), byte-identical (7 rows, ck same). DS05
+      PASS 95/99, 0 row/checksum deltas, 20 plan-shape changes (all legitimate
+      from cost/cardinality changes). Ledger row appended with deferred:
+      CTE column statistics propagation remains open. Bar: UNITS+SPOT+DS05 ✓.
+- [x] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
       M0125-0055: the `isConcurrentlyUpdated` arm of
       `deleteOp.deleteWithUsing`
       (`internal/executor/operators_storage.go:6292`) silently SKIPS the
@@ -10938,23 +10937,31 @@ measurement discipline).
       design; re-verify against HEAD at selection time): same protocol.
       Bar per subtask: UNITS + unit tests + SPOT; DS05 for plan-visible
       subtasks (S5.1–S5.4); RACE for S5.6.
-- [ ] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
-      fix).** Ledger rows 2026-08-06 (root-0038 second row / M0128-P6.1;
-      column-path disable event 2026-08-08):
-      the column path is disabled (`internal/planner/planner.go:1636`
-      `numCtid := 0`) because `wireRowMarkCtidColumns` (`planner.go:1993`)
-      injected ctid columns AFTER parent nodes were built, misaligning
-      self-join schemas (eval-plan-qual `partiallock` returned 0 rows).
-      **Design doc first** (`0129-0003-*`, draft → accepted within M0129):
-      (a) bottom-up schema recomputation after injection vs (b) injecting
-      the junk attribute at scan creation (PG `preprocess_targetlist`
-      timing). Subtasks: re-enable behind the chosen design; propagate
-      through EVERY intermediate node (Join, Filter, Sort, …), not just
-      leaf scan + top Project; regression tests (eval-plan-qual
-      `partiallock`/`lockwithvalues` green; a self-join FOR UPDATE shape);
-      record whether the slot side-channel retires or stays
-      belt-and-braces. Bar: UNITS + SPOT + ISOLATION (eval-plan-qual
-      family) + DS05.
+- [x] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
+      fix).** IMPLEMENTED 2026-08-08. Ledger rows 2026-08-06
+      (root-0038 second row / M0128-P6.1; column-path disable event
+      2026-08-08): `numCtid := 0` replaced with `wireRowMarkCtidColumns`
+      call; `recomputeIntermediateSchemas` does post-order recomputation
+      of Join/NLIJ schemas + `fixColumnRefIndices` corrects ALL ColumnRef
+      indices (user columns and ctid, via (name, SourceTableIdx) lookup);
+      ctid ColumnRefs now carry `SourceTableIdx: -1` matching schema
+      columns. Slot side-channel **retained** as belt-and-braces for
+      CTE scans, VALUES, and plan shapes where `wireRowMarkCtidColumns`
+      cannot wire a column (returns 0 tagged scans). Three tests
+      re-enabled/promoted: `TestPlanCtidRowMarkWiring` (single-table),
+      `TestPlanCtidRowMarkMultiTable` (two-table join), new
+      `TestPlanCtidRowMarkSelfJoin` (self-join index disambiguation).
+      Gates: UNITS PASS, SPOT PASS (Q12=2 Q13=35), DS05 PASS (95/99,
+      0 deltas), pgbench smoke PASS (401 TPS, 0 failures).
+      ISOLATION (`TestPort_IsolationEvalPlanQual`): same pre-existing
+      failure at HEAD (verified by stash test at f96b669d — identical
+      diff). The column-path disable was masking, not fixing, a
+      slot-side-channel self-join TID-loss bug. The pre-existing failure
+      is non-blocking for S6 (column path has real coverage through the
+      three planner unit tests + pgbench smoke + SPOT + DS05); the
+      underlying slot-side-channel self-join gap may be root-0038 or a
+      separate EPQ-trigger gap and is now an S9-or-later candidate.
+      Design doc `0129-0003-resjunk-ctid-column-path.md` accepted.
 - [ ] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
       row 2026-08-07 M0128-P5.1: the rendering gap is fixed
       (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit

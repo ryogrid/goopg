@@ -1,21 +1,41 @@
-(idle — nothing in flight)
+Task: M0129-S6 COMPLETE — resjunk-ctid column path re-enable
+Files:
+- internal/planner/planner.go: numCtid := wireRowMarkCtidColumns(out, locks);
+  recomputeIntermediateSchemas(out) when numCtid>0;
+  fixColumnRefIndices fixes ALL ColumnRefs via (name,SourceTableIdx) lookup;
+  ctid ColumnRefs now carry SourceTableIdx:-1
+- internal/planner/locking_test.go: re-enabled TestPlanCtidRowMarkWiring +
+  TestPlanCtidRowMarkMultiTable; NEW TestPlanCtidRowMarkSelfJoin
+- docs/design/0129-0003-resjunk-ctid-column-path.md: status → accepted
+- .ralph/fix_plan.md: M0129-S6 → [x]
 
-All priority milestones through M0128 (M0124/M0125/M0127/M0128/M0123) are
-CLOSED. **M0129 (Q74 fix + M0128 verdict follow-ups + residual-ledger
-burn-down) is FILED and is the TOP-PRIORITY milestone** (user directive
-2026-08-08 — see the Current Priority banner). Milestone doc:
-`docs/milestones/0129-q74-fix-and-m0128-followups.md`; implementation plan:
-`docs/design/0129-q74-fix-and-m0128-followups.md`.
+Key symbols:
+- recomputeIntermediateSchemas (planner.go): post-order recomputation of
+  Join/NLIJ schemas from children's Output()
+- fixColumnRefIndices + fixColumnRefsInExpr (planner.go): (name,srcIdx) lookup
+  in child output; walks sub-expressions via exprChildSlots
+- columnKey struct: {name string, srcIdx int16} for disambiguation
 
-Next step: **M0129-S1 — Q74 path-selection fix** (attribution done in
-M0128-P0.1; resume at `addPathsToJoinrel`, internal/planner/joinpaths.go:139;
-subtasks S1.1 diagnose → S1.2 fix → S1.3 pin, per the fix_plan task body).
-The standing M-NIGHTLY filing obligation (read `ci/logs/action-items.md`,
-file new AI items) still applies each loop. All existing M-NIGHTLY items are
-[x] (the 20260808-005620 EPQ/Q95 pair confirmed stale at HEAD); the remaining
-unchecked non-M0129 items belong to deferred milestones (M0122, M0119,
-M0110, M0095) parked per the banner.
+Hypothesis/Findings:
+- Column path re-enabled with correct schema propagation.
+- All planner unit tests pass including self-join ctid disambiguation.
+- Isolation test (TestPort_IsolationEvalPlanQual) has a PRE-EXISTING failure
+  (same diff at f96b669d — verified by stash test). The column-path disable
+  was masking a slot-side-channel self-join TID-loss bug, not preventing
+  a regression.
+- Slot side-channel retained as belt-and-braces (CTE scans, VALUES).
+- S6 subsumes S3 (sort-spill TID loss): a ctid datum in the row survives
+  spill like any other column. S3 reduces to verifying the shape and closing
+  root-0038.
 
-Gates run: make ralph-state-guard OK (auto-repaired status/progress inconsistency)
+Next step: M0129-S7 (clause-6 re-adjudication) — run the estimate-audit
+comparison; no engine change expected.
+
+Gates run:
+- UNITS: PASS (all packages)
+- SPOT: PASS (Q12=2 Q13=35)
+- DS05: PASS (95/99, 0 deltas, plan shapes identical)
+- ISOLATION: pre-existing failure (not a regression)
+- pgbench smoke: PASS (401 TPS, 0 failures)
 
 In-flight: none

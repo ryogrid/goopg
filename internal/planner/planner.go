@@ -1621,19 +1621,18 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if lerr != nil {
 			return nil, lerr
 		}
-		// M0128-P6.1 resjunk-ctid rowmark: PG adds junk ctid attributes
-		// to the targetlist so TID identity rides the tuple. goopg instead
-		// propagates TIDs through the MaterializedSlot's hasCTID/ctidBlock/
-		// ctidOff side channel, which joinOp.preserveBuildSide already
-		// forwards through the build side for hash joins. The column-path
-		// (wireRowMarkCtidColumns) is DISABLED until intermediate-node
-		// schema propagation is implemented — adding ctid to a SeqScan
-		// schema after parent nodes are built causes column misalignment
-		// (the ctid leaks into the right child's output positions in
-		// self-joins, attested by the eval-plan-qual partiallock failure).
-		// When re-enabled it must also update every node on the path from
-		// the scan to the root, not just the scan + top Project.
-		numCtid := 0 // wireRowMarkCtidColumns disabled — use slot side-channel
+		// M0129-S6 resjunk-ctid column-path re-enable: wire ctid columns
+		// into leaf scan schemas, then recompute intermediate-node schemas
+		// (Join, NestedLoopIndexJoin) so the ctid columns propagate through
+		// the join tree. recomputeIntermediateSchemas also fixes the
+		// ColumnRef indices in the top Project from scan-local to absolute
+		// positions. The slot side-channel (MaterializedSlot.hasCTID) remains
+		// as belt-and-braces for plan shapes the column path cannot cover
+		// (CTE scans, VALUES). M0129-0003 §2.
+		numCtid := wireRowMarkCtidColumns(out, locks)
+		if numCtid > 0 {
+			recomputeIntermediateSchemas(out)
+		}
 		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
 		// after the LIMIT count of *successfully-locked* rows (PG plans
 		// `Limit → LockRows → Sort`). goopg's default plan above produced
@@ -2117,10 +2116,11 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 		for _, ts := range tagged {
 			li := ts.lockIdx
 			proj.Targets = append(proj.Targets, &ColumnRef{
-				pos:   proj.pos,
-				Index: ts.schemaIdx,
-				Name:  fmt.Sprintf("ctid%d", locks[li].RowMarkId),
-				Type:  ctidType,
+				pos:            proj.pos,
+				Index:          ts.schemaIdx,
+				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
+				Type:           ctidType,
+				SourceTableIdx: -1,
 			})
 			proj.schema = append(proj.schema, SchemaColumn{
 				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
@@ -2131,6 +2131,120 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 		}
 	}
 	return len(tagged)
+}
+
+// recomputeIntermediateSchemas rebuilds intermediate-node schemas after
+// ctid columns are injected into leaf scans by wireRowMarkCtidColumns.
+// Only Join and NestedLoopIndexJoin store their own schema and need
+// explicit recomputation; all other intermediate types delegate Output()
+// to their child and auto-correct when the child's schema changes.
+//
+// It also fixes ALL ColumnRef indices in the top Project: when a ctid
+// column is injected into a left-side scan, intermediate schema
+// recomputation shifts right-side column positions. Every ColumnRef
+// (user columns and ctid columns alike) is updated to its absolute
+// position in the Project's child output by (name, SourceTableIdx) lookup.
+func recomputeIntermediateSchemas(root Node) {
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch v := n.(type) {
+		case *Join:
+			walk(v.Left)
+			walk(v.Right)
+			if v.Type != JoinTypeSemi && v.Type != JoinTypeAnti {
+				v.schema = appendSchema(v.Left.Output(), v.Right.Output())
+			}
+		case *NestedLoopIndexJoin:
+			walk(v.Outer)
+			walk(v.Inner)
+			v.schema = appendSchema(v.Outer.Output(), v.Inner.Output())
+		case *SetOp:
+			walk(v.Left)
+			walk(v.Right)
+		case *Project:
+			walk(v.Child)
+			fixColumnRefIndices(v)
+		case *Filter:
+			walk(v.Child)
+		case *Sort:
+			walk(v.Child)
+		case *Limit:
+			walk(v.Child)
+		case *Distinct:
+			walk(v.Child)
+		case *DistinctOn:
+			walk(v.Child)
+		case *OrdinalityWrap:
+			walk(v.Child)
+		case *Aggregate:
+			walk(v.Child)
+		case *WindowAgg:
+			walk(v.Child)
+		case *Memoize:
+			walk(v.Child)
+		case *LockRows:
+			walk(v.Child)
+		case *Insert:
+			if v.Source != nil {
+				walk(v.Source)
+			}
+		case *Update:
+			walk(v.Child)
+		case *Delete:
+			walk(v.Child)
+		}
+	}
+	walk(root)
+}
+
+// columnKey disambiguates columns by name and source-table index so the
+// (name, SourceTableIdx) pair uniquely identifies a column in the child
+// output even in self-joins where both sides have identically named columns.
+type columnKey struct {
+	name   string
+	srcIdx int16
+}
+
+// fixColumnRefIndices updates every ColumnRef.Index in the Project (both user
+// columns and ctid columns) to absolute positions in the Project's child output.
+// This is necessary because recomputeIntermediateSchemas rebuilds intermediate
+// join schemas after ctid injection, which shifts right-side column positions.
+// The (name, SourceTableIdx) pair disambiguates columns in self-joins.
+func fixColumnRefIndices(proj *Project) {
+	childSchema := proj.Child.Output()
+	// Build position map from child output.
+	posMap := make(map[columnKey]int, len(childSchema))
+	for i, col := range childSchema {
+		posMap[columnKey{name: col.Name, srcIdx: col.SourceTableIdx}] = i
+	}
+	// Fix all ColumnRefs in Project targets (including inside sub-expressions).
+	for _, t := range proj.Targets {
+		fixColumnRefsInExpr(t, posMap)
+	}
+}
+
+// fixColumnRefsInExpr recursively walks an expression tree via the standard
+// exprChildSlots walker and updates ColumnRef.Index using posMap (child-schema
+// position lookup). Non-ColumnRef leaves and scope-opening nodes are skipped.
+func fixColumnRefsInExpr(e Expr, posMap map[columnKey]int) {
+	if e == nil {
+		return
+	}
+	if cr, ok := e.(*ColumnRef); ok {
+		if newIdx, found := posMap[columnKey{name: cr.Name, srcIdx: cr.SourceTableIdx}]; found {
+			cr.Index = newIdx
+		}
+		return
+	}
+	slots, _ := exprChildSlots(e)
+	for _, s := range slots {
+		if s.kind == slotSameScope && s.expr != nil {
+			fixColumnRefsInExpr(*s.expr, posMap)
+		}
+	}
 }
 
 func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveContext, error) {
