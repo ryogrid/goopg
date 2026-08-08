@@ -591,3 +591,306 @@ func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
 		t.Errorf("RIGHT JOIN after FULL JOIN: got %v, want JoinRight (FULL resets propagation)", got)
 	}
 }
+
+// ---- M0129-S9.3: LEFT→ANTI demotion tests ----
+
+func TestReduceOuterJoinsLeftToAntiBasic(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y WHERE b.y IS NULL
+	// → WHERE b.y IS NULL: accumulatedFN = {b}
+	// → ON a.x = b.y: localNN = {a, b}  (strict comparison)
+	// → LEFT JOIN: rightName = b, accumulatedFN[b]=true, localNN[b]=true
+	// → ANTI (the ON can never be TRUE when WHERE passes → no matches).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: false, // IS NULL
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("LEFT JOIN with IS NULL on nullable-side column in strict ON: got %v, want JoinAnti", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftToAntiFixedConstant(t *testing.T) {
+	// a LEFT JOIN b ON b.y = 5 WHERE b.y IS NULL
+	// → ON b.y = 5: localNN = {b}  (b in strict comparison with constant)
+	// → WHERE b.y IS NULL: accumulatedFN = {b}
+	// → ANTI.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+					Right: &parser.IntegerConst{Value: 5},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: false,
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("LEFT JOIN with constant-eq ON + IS NULL WHERE on nullable side: got %v, want JoinAnti", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftToAntiIsNullOnPreservedSideNoDemotion(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y WHERE a.x IS NULL
+	// → WHERE a.x IS NULL: accumulatedFN = {a}
+	// → ON a.x = b.y: localNN = {a, b}
+	// → LEFT JOIN: rightName = b, accumulatedFN[b]=false
+	// → stays LEFT: the IS NULL is on the preserved (left) side.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "a", Column: "x"},
+		Negated: false,
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN with IS NULL on preserved side: got %v, want JoinLeft (IS NULL on left, not right)", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftToAntiIsNullWithoutOnClause(t *testing.T) {
+	// a LEFT JOIN b WHERE b.y IS NULL  (no ON clause)
+	// → WHERE b.y IS NULL: accumulatedFN = {b}
+	// → localNN from nil ON = {}
+	// → accumulatedFN[b]=true but localNN[b]=false
+	// → stays LEFT: no nonnullable vars in ON to intersect with.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"}},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: false,
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN with IS NULL but no ON clause: got %v, want JoinLeft (no ON to intersect)", got)
+	}
+}
+
+func TestReduceOuterJoinsInnerWinsOverAnti(t *testing.T) {
+	// a LEFT JOIN b ON b.y = 5 WHERE b.y = 5 AND b.y IS NULL
+	// → WHERE b.y = 5: upperNN = {b} (strict comparison)
+	// → WHERE b.y IS NULL: upperFN = {b}
+	// → LEFT→INNER check fires first (accumulatedNN[b]=true)
+	// → becomes INNER, not ANTI.
+	// INNER is the stronger demotion; inner trumps anti.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+					Right: &parser.IntegerConst{Value: 5},
+				},
+			},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op: parser.OpAnd,
+		Left: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+			Right: &parser.IntegerConst{Value: 5},
+		},
+		Right: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+			Negated: false,
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	// INNER trumps ANTI because it's checked first.
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("LEFT JOIN with both INNER+ANTI conditions: got %v, want JoinInner (inner wins)", got)
+	}
+}
+
+func TestReduceOuterJoinsIsNotNullDoesNotBecomeAnti(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y WHERE b.y IS NOT NULL
+	// → WHERE b.y IS NOT NULL: upperNN = {b}, upperFN = {}
+	// → accumulatedNN[b]=true → INNER demotion
+	// → NOT ANTI (IS NOT NULL is not a forced-null condition).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: true, // IS NOT NULL
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("LEFT JOIN with IS NOT NULL WHERE on nullable side: got %v, want JoinInner (IS NOT NULL = nonnullable, not forced-null)", got)
+	}
+}
+
+func TestReduceOuterJoinsForcedNullPropagationThroughInner(t *testing.T) {
+	// a INNER JOIN b ON b.y IS NULL LEFT JOIN c ON c.z = b.w WHERE empty
+	// → INNER ON b.y IS NULL: localFN = {b} → merged into accumulatedFN = {b}
+	//   (IS NULL is not a strict op → localNN = {})
+	// → LEFT JOIN (c): ON c.z = b.w: localNN = {b, c}
+	// → rightName = c, accumulatedFN[c]=false → no ANTI.
+	// → b is forced-null AND non-nullable... but b is on the preserved (left) side.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinInner, Right: parser.RangeVar{Name: "b"},
+				On: &parser.IsNullExpr{
+					Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+					Negated: false,
+				},
+			},
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "c", Column: "z"},
+					Right: &parser.ColumnRef{Table: "b", Column: "w"},
+				},
+			},
+		},
+	}}
+
+	reduceOuterJoins(from, nil, nil)
+
+	// c is nullable side. accumulatedFN = {b}. c is not in accumulatedFN → no ANTI.
+	if got := from[0].Joins[1].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN without forced-null on nullable side: got %v, want JoinLeft", got)
+	}
+}
+
+func TestReduceOuterJoinsAntiInMultiJoinChain(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y LEFT JOIN c ON b.y = c.z WHERE c.z IS NULL
+	// → WHERE c.z IS NULL: upperFN = {c}
+	// → LEFT #1 (b): check accumulatedFN["b"] → false → not ANTI
+	//   LEFT propagation: accumulatedFN = {c} (unchanged)
+	// → LEFT #2 (c): check accumulatedFN["c"]=true, localNN[c]=true → ANTI!
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "c"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+					Right: &parser.ColumnRef{Table: "c", Column: "z"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "c", Column: "z"},
+		Negated: false,
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("multi-join LEFT→ANTI: first LEFT (b): got %v, want JoinLeft (IS NULL not on b)", got)
+	}
+	if got := from[0].Joins[1].Type; got != parser.JoinAnti {
+		t.Errorf("multi-join LEFT→ANTI: second LEFT (c): got %v, want JoinAnti (IS NULL on c and c in strict ON)", got)
+	}
+}
+
+func TestReduceOuterJoinsForcedNullWithOrNoDemotion(t *testing.T) {
+	// a LEFT JOIN b ON a.x = b.y WHERE b.y IS NULL OR b.z IS NULL
+	// → OR is not examined for forced-null vars → upperFN = {}
+	// → no ANTI demotion.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "x"},
+					Right: &parser.ColumnRef{Table: "b", Column: "y"},
+				},
+			},
+		},
+	}}
+	where := &parser.BinaryOp{
+		Op: parser.OpOr,
+		Left: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+			Negated: false,
+		},
+		Right: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "z"},
+			Negated: false,
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN with IS NULL in OR: got %v, want JoinLeft (OR not examined for forced-null)", got)
+	}
+}

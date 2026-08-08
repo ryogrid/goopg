@@ -11059,7 +11059,7 @@ measurement discipline).
       `JoinExpr.On` clauses and propagate per join type (PG
       `reduce_outer_joins_pass2`: inner merges with upper; outer passes
       local to the nullable side, upper to the preserved side).
-  - [ ] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
+  - [x] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
       nullable-side columns).
   - [ ] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
       PREREQUISITE: `parser.FromExpr` is a Base RangeVar +

@@ -36,8 +36,11 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 	// strictness checks.
 	tableMap := buildTableMap(from, cat)
 	upperNN := collectNonNullableTableNames(where, tableMap, cat)
+	// Collect forced-null table names from WHERE (IS NULL predicates).
+	// These drive LEFT→ANTI demotion at S9.3.
+	upperFN := collectForcedNullTableNames(where)
 	for i := range from {
-		applyDemotion(&from[i], upperNN, tableMap, cat)
+		applyDemotion(&from[i], upperNN, upperFN, tableMap, cat)
 	}
 }
 
@@ -55,12 +58,19 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 // Parameters:
 //   - upperNN: nonnullable rels from the WHERE clause (the "upper" set).
 //     This is the starting accumulated set; it is never mutated.
-func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
 	// accumulatedNN is the working set that evolves as we walk the chain.
 	// It starts as a copy of upperNN (WHERE-clause findings).
 	accumulatedNN := make(map[string]bool, len(upperNN))
 	for name := range upperNN {
 		accumulatedNN[name] = true
+	}
+	// accumulatedFN is the parallel forced-null set (IS NULL predicates).
+	// It drives LEFT→ANTI demotion (S9.3) and propagates by the same rules
+	// as accumulatedNN.
+	accumulatedFN := make(map[string]bool, len(upperFN))
+	for name := range upperFN {
+		accumulatedFN[name] = true
 	}
 
 	// Accumulated set of table names on the left.
@@ -70,11 +80,12 @@ func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[
 		j := &item.Joins[i]
 		rightName := rangeVarPrimaryName(j.Right)
 
-		// Compute local nonnullable rels from the ON clause.
+		// Compute local nonnullable and forced-null rels from the ON clause.
 		// For INNER joins these become real constraints on the result and
 		// propagate to subsequent joins; for outer joins they only apply
 		// within the nullable side (which may still be null-extended).
 		localNN := collectNonNullableTableNames(j.On, tableMap, cat)
+		localFN := collectForcedNullTableNames(j.On)
 
 		// ---- demotion check ----
 		switch j.Type {
@@ -82,6 +93,14 @@ func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[
 			// Left side is preserved, right side is nullable.
 			if accumulatedNN[rightName] {
 				j.Type = parser.JoinInner
+			}
+			// S9.3 LEFT→ANTI: right-side table is forced-null from upper
+			// quals (IS NULL) AND appears in a strict position in the ON
+			// clause → the ON can never be TRUE for any row where the
+			// upper quals pass → ANTI join suffices.
+			// PG reduce_outer_joins_pass2 lines 3388-3403.
+			if j.Type == parser.JoinLeft && accumulatedFN[rightName] && localNN[rightName] {
+				j.Type = parser.JoinAnti
 			}
 
 		case parser.JoinRight:
@@ -104,7 +123,7 @@ func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[
 			// is unrepresentable — leave as FULL. (Ledger.)
 		}
 
-		// ---- propagation: update accumulatedNN for next iteration ----
+		// ---- propagation: update accumulatedNN + accumulatedFN for next iteration ----
 		// PG reduce_outer_joins_pass2: inner merges upper+local; outer
 		// passes local only to the nullable side, upper only to the
 		// preserved side. In a left-deep chain the "preserved left"
@@ -116,12 +135,15 @@ func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[
 			for name := range localNN {
 				accumulatedNN[name] = true
 			}
+			for name := range localFN {
+				accumulatedFN[name] = true
+			}
 
-		case parser.JoinLeft:
+		case parser.JoinLeft, parser.JoinAnti:
 			// Preserved left side keeps the upper set unchanged.
-			// The right (nullable) side can be null-extended, so its
-			// tables do NOT join the accumulated nonnullable set.
-			// accumulatedNN stays as-is (no merge).
+			// The right (nullable) side can be null-extended (LEFT) or
+			// excluded (ANTI), so its tables do NOT join the accumulated
+			// nonnullable set. accumulatedNN/accumulatedFN stay as-is.
 
 		case parser.JoinRight:
 			// Preserved right, nullable left. The left (accumulated)
@@ -135,10 +157,19 @@ func applyDemotion(item *parser.FromExpr, upperNN map[string]bool, tableMap map[
 				}
 			}
 			accumulatedNN = next
+			// Same reset for forced-null.
+			nextFN := make(map[string]bool)
+			for name := range localFN {
+				if name == rightName || containsName(rangeVarNames(j.Right), name) {
+					nextFN[name] = true
+				}
+			}
+			accumulatedFN = nextFN
 
 		case parser.JoinFull:
 			// Both sides nullable — nothing propagates through.
 			accumulatedNN = make(map[string]bool)
+			accumulatedFN = make(map[string]bool)
 		}
 
 		// Accumulate right side's names for the next iteration.
@@ -405,6 +436,52 @@ func collectColumnRefTableNamesWalk(e parser.Expr, dst map[string]bool) {
 			collectColumnRefTableNamesWalk(arg, dst)
 		}
 	}
+}
+
+// collectForcedNullTableNames walks a WHERE expression and returns the set of
+// table names/aliases whose columns are tested with IS NULL at the top level.
+// This is the goopg analogue of PG's find_forced_null_vars (clauses.c), simplified
+// to table-level granularity.
+//
+// Only top-level IS NULL and AND are examined: PG's find_forced_null_vars only
+// checks NullTest IS_NULL at the top level and AND combinations, but does not
+// descend into OR, NOT, or function calls.
+func collectForcedNullTableNames(e parser.Expr) map[string]bool {
+	return collectForcedNullWalk(e, true)
+}
+
+func collectForcedNullWalk(e parser.Expr, topLevel bool) map[string]bool {
+	if e == nil {
+		return nil
+	}
+	result := make(map[string]bool)
+
+	switch x := e.(type) {
+	case *parser.IsNullExpr:
+		// IS NULL (not IS NOT NULL): the column IS forced to be null if the
+		// clause passes.
+		if !x.Negated {
+			for _, name := range collectColumnRefTableNames(x.Operand) {
+				result[name] = true
+			}
+		}
+
+	case *parser.BinaryOp:
+		// AND: union of children (at top level only — PG's
+		// find_forced_null_vars does not descend into OR).
+		if x.Op == parser.OpAnd && topLevel {
+			left := collectForcedNullWalk(x.Left, true)
+			right := collectForcedNullWalk(x.Right, true)
+			for name := range left {
+				result[name] = true
+			}
+			for name := range right {
+				result[name] = true
+			}
+		}
+	}
+
+	return result
 }
 
 // rangeVarNames returns the names by which a RangeVar can be referenced:

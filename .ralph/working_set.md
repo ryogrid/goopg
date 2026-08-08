@@ -1,44 +1,40 @@
-Task: M0129-S9.2 DONE — ON-clause propagation in reduce_outer_joins
+Task: M0129-S9.3 DONE — LEFT→ANTI demotion in reduce_outer_joins
 
 Files:
-- internal/planner/reduce_outer_joins.go: refactored reduceOuterJoins + applyDemotion
-  to compute local nonnullable rels from each JoinExpr.On clause and propagate
-  per join type (INNER merges local→accumulated; LEFT preserves upper only;
-  RIGHT resets to right-side local; FULL resets to empty). Removed early-return
-  when WHERE is nil so ON-clause-only propagation works.
-- internal/planner/reduce_outer_joins_test.go: added 7 new tests covering:
-  INNER ON → RIGHT demotion (core S9.2 enablement), LEFT check (no false
-  demotion), self-demotion guard (LEFT ON does not demote itself), multi-INNER
-  chain propagation, WHERE+ON interplay, LEFT ON non-propagation guard, and
-  FULL JOIN reset guard.
+- internal/planner/reduce_outer_joins.go: added collectForcedNullTableNames +
+  forced-null propagation through applyDemotion (accumulatedFN), LEFT→ANTI check
+  (right-side table in both accumulatedFN AND localNN → ANTI).
+- internal/planner/reduce_outer_joins_test.go: added 9 tests covering basic ANTI,
+  fixed-constant ON, preserved-side guard (no false demotion), no-ON-clause guard,
+  INNER-wins-over-ANTI precedence, IS-NOT-NULL doesn't trigger ANTI, forced-null
+  propagation through INNER, multi-join chain ANTI, OR non-examination guard.
 
 Key symbols:
-- applyDemotion(item, upperNN, tableMap, cat): now accepts tableMap+cat for
-  ON-clause collection; uses evolving accumulatedNN
-- containsName(names, name): new helper wrapping slices.Contains
-- localNN per join: collectNonNullableTableNames(j.On, tableMap, cat)
+- collectForcedNullTableNames(e): IS NULL → table names (PG find_forced_null_vars analogue)
+- applyDemotion: now accepts upperFN + maintains accumulatedFN in parallel with accumulatedNN
+- LEFT→ANTI condition: accumulatedFN[rightName] && localNN[rightName]
+  (PG reduce_outer_joins_pass2: overlap(nonnullable_vars, forced_null_vars) ∩ right_state->relids)
 
 Hypothesis/Findings:
-- PG reduce_outer_joins_pass2 only uses UPPER nonnullable_rels for demotion,
-  never the local ON clause's own findings. Our implementation matches: localNN
-  is computed but only used for propagation after the join type is resolved,
-  never for self-demotion.
-- The key new capability: an INNER JOIN's strict ON clause (e.g. a.x = b.y)
-  makes a and b non-nullable in the result, which can then demote a subsequent
-  RIGHT JOIN whose nullable side includes those tables.
-- LEFT JOIN ON findings do NOT propagate (b can be null-extended), matching PG.
+- PG's find_forced_null_vars only checks NullTest IS_NULL + AND at top level;
+  goopg's collectForcedNullTableNames mirrors this at table-level granularity.
+- LEFT→ANTI is checked AFTER LEFT→INNER; INNER trumps ANTI when both fire.
+- The forced-null set propagates by the same rules as nonnullable (INNER merges,
+  LEFT/ANTI pass through, RIGHT/FULL reset).
+- DS05 showed zero plan movement (99/99 same plan shapes) — the triggering
+  pattern (LEFT JOIN ... ON ... WHERE right_side_col IS NULL) wasn't in any query.
 
-Next step: M0129-S9.3 — LEFT→ANTI. find_forced_null_vars analogue (IS NULL on
-  nullable-side columns). PG reduce_outer_joins_pass2 lines 3388-3403:
-  find_nonnullable_vars(j->quals), intersect with forced_null_vars from above,
-  check overlap with right_state->relids → demote LEFT to ANTI.
+Next step: M0129-S9.4 — RIGHT→LEFT flip + FULL→RIGHT partial reduction.
+  Named prerequisite: parser.FromExpr is a Base RangeVar + flat []JoinExpr;
+  the parser/AST nested-join representation IS PART OF THIS SUBTASK.
+  Last task in the S9 group.
 
 Gates run:
 - go build ./...: PASS
-- All 23 reduce_outer_joins tests: PASS
-- Full planner suite: PASS (1.146s)
+- All 32 reduce_outer_joins tests: PASS (23 existing + 9 new)
+- Full planner suite: PASS (1.148s)
 - Pre-commit (units): PASS
-- tpch-spotcheck: PASS (Q12=2 Q13=35, 29.6s)
-- make ralph-state-guard: PASS (auto-repaired)
+- tpch-spotcheck: PASS (Q12=2 Q13=35, 31.5s)
+- DS05: PASS (95/99, zero row/checksum/plan deltas)
 
 In-flight: none
