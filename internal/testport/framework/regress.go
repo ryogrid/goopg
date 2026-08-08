@@ -153,12 +153,9 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 //  3. Strip "psql:file:N:" prefix from error/warning lines (psql adds this
 //     when running in -f mode; expected output uses bare "ERROR:  ...")
 //  4. Strip "message type 0x5a arrived from server while idle" psql noise lines
-//  5. Strip "LINE N: ..." and standalone "^" position lines from expected output
-//     (goopg does not yet emit FieldPosition; strip from expected so both sides
-//     compare equal for the message text itself)
-//  6. Trailing spaces/tabs per line stripped
-//  7. Trailing blank lines stripped
-//  8. ERROR/NOTICE/WARNING double-space normalisation: collapse to two-space form
+//  5. Trailing spaces/tabs per line stripped
+//  6. Trailing blank lines stripped
+//  7. ERROR/NOTICE/WARNING double-space normalisation: collapse to two-space form
 func NormalizeRegressOutput(raw string) string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	s := bufio.NewScanner(strings.NewReader(raw))
@@ -191,11 +188,6 @@ func NormalizeRegressOutput(raw string) string {
 				}
 			}
 		}
-		// Strip position lines from expected output ("LINE N: ..." and "^" lines)
-		// that goopg does not yet emit.
-		if strings.HasPrefix(line, "LINE ") {
-			continue
-		}
 		// Strip "DETAIL:   Failing row contains ..." from both sides. The row
 		// content includes geometric-type columns (box, point, …) that goopg
 		// v0 stores as NULL, causing stable value mismatches. The constraint
@@ -213,14 +205,6 @@ func NormalizeRegressOutput(raw string) string {
 		// goopg does not yet emit these call-stack frames.
 		if strings.HasPrefix(line, "PL/pgSQL function ") {
 			continue
-		}
-		// Standalone caret lines that follow LINE N: in PostgreSQL error output.
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "^" || (len(trimmed) > 0 && strings.TrimLeft(trimmed, " \t^") == "" && strings.Count(trimmed, "^") == 1) {
-			// Only skip lines that are purely spaces + one ^ (position indicator)
-			if len(line) > 0 && strings.TrimRight(line, " \t^") == "" {
-				continue
-			}
 		}
 
 		lines = append(lines, strings.TrimRight(line, " \t"))

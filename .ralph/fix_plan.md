@@ -11067,7 +11067,7 @@ measurement discipline).
       parser/AST nested-join representation IS PART OF THIS SUBTASK. If
       scoping shows it breaks unrelated planner invariants, ledger the
       strong reason instead of silently skipping.
-- [ ] **M0129-S10 — `ExecError.Pos` → wire `FieldPosition`.** Ledger row
+- [x] **M0129-S10 — `ExecError.Pos` → wire `FieldPosition`.** Ledger row
       2026-08-06 M0127-PS6.2: goopg never emits the `FieldPosition` ('P')
       error field for executor errors, so psql shows no `LINE n: … ^`
       caret where PG shows one. Subtasks: at each `*executor.ExecError`

@@ -734,8 +734,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 					}
 					params, err := evalExecuteParams(es.Params)
 					if err != nil {
-						if ee, ok := err.(*executor.ExecError); ok {
-							return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+						if _, ok := err.(*executor.ExecError); ok {
+							return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 						}
 						return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 					}
@@ -790,8 +790,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				params, err := evalExecuteParams(es.Params)
 				if err != nil {
-					if ee, ok := err.(*executor.ExecError); ok {
-						return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+					if _, ok := err.(*executor.ExecError); ok {
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 					return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 				}
@@ -826,7 +826,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// (as in PG, where planning/opening happens at DECLARE).
 				if cur, found := connTx.cursorLookup(dc.Name); found {
 					if err := s.materializeCursor(ectx, cur, dc.Name); err != nil {
-						return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 				}
 			}
@@ -2713,6 +2713,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							if ee.Detail != "" {
 								fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
 							}
+							if ee.Pos > 0 {
+								fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(ee.Pos + 1)})
+							}
 							return s.writeQueryError(w, code, ee.Message, fields...)
 						}
 						return s.writeQueryError(w, code, deferErr.Error())
@@ -3548,7 +3551,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	// Materialise on first access.
 	if !cur.Materialized {
 		if err := s.materializeCursor(ectx, cur, cursorName); err != nil {
-			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
 	}
 
