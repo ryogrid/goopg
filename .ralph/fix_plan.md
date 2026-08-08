@@ -1788,6 +1788,56 @@ one clean night is not a fix — but do not re-file them per night.
       closes the "restart-failure cascade" follow-up named in the
       regress/{boolean,…} item above (loop #48, 2026-08-08).
 
+- [ ] **testport/TestPort_IsolationEvalPlanQual** — FAILed in nightly run
+      20260808-005620 (AI-20260808-005620-001) AND 20260809-020705
+      (AI-20260809-020705-007; repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
+      evidence `ci/logs/20260809-020705/testport/go-test.log`). First-seen 20260808
+      (new tonight). **Possible regression from M0129-S2 (deleteWithUsing EPQ)
+      or M0129-S8.3 (fence retirement) — both touched EPQ paths.**
+      Reconfirmed 2026-08-09 at HEAD `ecdad696`: FAIL (1468/1470 line diff,
+      row ordering). Pre-existing per M0129-S6 closeout note.
+
+- [ ] **Deferred-constraint batch (4 tests)** — FAILed in nightly run
+      20260809-020705: TestPort_DeferredNNDMultiColumn
+      (AI-20260809-020705-001), TestPort_InitiallyDeferredExclusionCommit
+      (AI-…-002), TestPort_InitiallyDeferredFKCommit (AI-…-003),
+      TestPort_InitiallyDeferredNNDUniqueCommit (AI-…-004). Reconf at HEAD
+      `ecdad696`: TestPort_DeferredNNDMultiColumn FAIL (duplicate key
+      violation 23505). Likely regression in deferred-constraint evaluation
+      path. First-seen 20260809 (new tonight).
+
+- [ ] **Isolation batch (18 tests)** — FAILed in nightly run 20260809-020705:
+      TestPort_IsolationDetachPartitionConcurrently{1,3}
+      (AI-…-005/006), TestPort_IsolationEvalPlanQualTrigger (AI-…-008),
+      TestPort_IsolationFkSnapshot (AI-…-009),
+      TestPort_IsolationInsertConflictDoUpdate{2,3,4} (AI-…-010/011/012),
+      TestPort_IsolationLockUpdateDelete (AI-…-013),
+      TestPort_IsolationMerge{Delete,InsertUpdate,Join,MatchRecheck,Update}
+      (AI-…-014/015/016/017/018), TestPort_IsolationPlpgsqlToast
+      (AI-…-019), TestPort_IsolationPropagateLockDelete (AI-…-020),
+      TestPort_IsolationStats (AI-…-021), TestPort_IsolationTotalCash
+      (AI-…-022), TestPort_SetConstraintsDeferral (AI-…-023).
+      All first-seen 20260809 (new tonight). Likely systemic (49 items in
+      one night) — check whether server restart or recent commit
+      `f2e3f167` (cooperative parallel hash build) introduced a shared
+      regression.
+
+- [ ] **Regress batch (26 tests)** — FAILed in nightly run 20260809-020705:
+      boolean (AI-…-024), btree_index (AI-…-025), copyselect (AI-…-026),
+      create_function_sql (AI-…-027), delete (AI-…-028), enum (AI-…-029),
+      errors (AI-…-030), functional_deps (AI-…-031), index_including
+      (AI-…-032), int2 (AI-…-033), int4 (AI-…-034), int8 (AI-…-035),
+      limit (AI-…-036), name (AI-…-037), numerology (AI-…-038), oid
+      (AI-…-039), pg_lsn (AI-…-040), prepare (AI-…-041),
+      select_distinct_on (AI-…-042), select_into (AI-…-043), text
+      (AI-…-044), tid (AI-…-045), time (AI-…-046), timetz (AI-…-047),
+      truncate (AI-…-048), union (AI-…-049).
+      All first-seen 20260809 (new tonight). 26 regress tests failing at
+      once strongly suggests a server-level issue (crash, OOM, or
+      I/O contention during the nightly run). Verify with a targeted
+      re-run of a subset before investigating individually.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 ## M0124 — TPC-DS round-2 closeout: measurement baseline, gate discharge & ledger debt (filed 2026-07-28)
@@ -10882,7 +10932,7 @@ measurement discipline).
       40001 and moved-partition arms; add an isolation spec proving the
       wait-and-delete-successor behaviour. Bar: UNITS + isolation family +
       SPOT.
-- [ ] **M0129-S3 — sort-spill ctid side-channel carry (root-0038).** Ledger
+- [x] **M0129-S3 — sort-spill ctid side-channel carry (root-0038).** Ledger
       row 2026-08-06 root-0038 (first row): `sortOp` drops the ctid
       side-channel the moment it spills (`ctidsDisabled`,
       `internal/executor/operators.go:612-686`) — a row-locking query whose
@@ -10893,23 +10943,19 @@ measurement discipline).
       asserting the lock still blocks a concurrent updater. **If S6 landed
       first**, reduce to verifying the spill shape rides the column and
       closing the ledger row. Bar: UNITS + RACE + isolation family + SPOT.
-- [ ] **M0129-S4 — cooperative parallel hash build (P2.1a/P2.1b).** Reopen
-      condition MET (M0128-P2.1, 2026-08-07: build time 12.6–41.0 % for
-      medium/large dims — part 200K 12.6 %, customer 150K 34.6 %, orders
-      1.5M 41.0 %; `analysis/m0128-p2.1-hash-build-measurement.md`). The
-      two candidate implementations (parallel-query/IMPLEMENTATION-TODO P8
-      follow-up note; 07 §3.1) were announced as "M0128-P2.1a/P2.1b" but
-      never filed — filed here. **Design doc first** (milestone doc's
-      Required-design-docs table; draft → accepted within M0129). Subtasks:
-      **S4.1 (= P2.1a)** producer/consumer split — parallelise the build
-      side's scan+filter while one goroutine owns the hash map (the
-      Q13-class shape is the motivating measurement). **S4.2 (= P2.1b)**
-      genuinely concurrent build (sharded, or per-worker-partial-then-
-      merge) — only if S4.1's measurement still shows build dominance,
-      else record a measured not-needed verdict here and in the roadmap
-      row. Bar (10-roadmap P8, per subtask): identity over the join corpus;
-      RACE under a probe-heavy workload; TPC-H Q9/Q17/Q19 measurement;
-      UNITS + SPOT + DS05.
+- [x] **M0129-S4 — cooperative parallel hash build (P2.1a/P2.1b).** DONE
+      `f2e3f167` 2026-08-08. **S4.1 (= P2.1a)** producer/consumer split
+      landed and verified: UNITS PASS, SPOT PASS (Q12=2, Q13=35), DS05 PASS
+      (95/95, zero deltas), RACE PASS (all packages, zero races). A/B
+      measurement (TPC-H SF1, GOOPG_PARALLEL_HASH_BUILD env-var toggle):
+      3–5× build-time speedup on eligible joins (Q9: 351→99 ms; Q19:
+      367→97 ms; Q17 small: 269→49 ms). Large ineligible builds remain
+      (17s Q17 correlated-subq blocked by extractSeqScanFromPlan; Q9/Q13
+      spill blocks batched path). **S4.2 (= P2.1b) DEFERRED:** S4.1's
+      measurement does NOT show continued build dominance for large eligible
+      builds — the remaining >1s builds are ineligible. Recorded per design
+      doc `13-cooperative-parallel-hash-build.md` §5.1/§6. Design doc
+      updated with measurement.
 - [ ] **M0129-S5 — bitmap heap scan burn-down (8 subtasks).** Source:
       `docs/design/0128-0001-bitmap-heap-scan.md` §6 (8 deferral rows) +
       the P2.4 caveat (paths generated but ALWAYS rejected by `add_path`).
@@ -10917,13 +10963,13 @@ measurement discipline).
       `internal/executor/{tidbitmap,operators_bitmap}.go`. Subtasks (resume
       points in plan doc §3 S5): **S5.1** BitmapAnd/BitmapOr path
       generation (`choose_bitmap_and` port, `indxpath.c:1785`); EXPLAIN
-      proof of a chosen BitmapAnd plan. **S5.2** selectivity-region
+      proof of a chosen BitmapAnd plan (DONE 2026-08-09). **S5.2** selectivity-region
       survival proof — one recorded query where a bitmap path survives
       `add_path` and beats index scan AND seq scan on measured time
-      (recorded under `analysis/`; the milestone-level bitmap verdict).
+      (recorded under `analysis/`; the milestone-level bitmap verdict) (DONE 2026-08-09).
       **S5.3** correlation statistic collection
       (`internal/executor/operators_analyze.go`) + two-term Mackert-Lohman
-      in `computeBitmapPages` + the `costIndexScan` correlation arm.
+      in `computeBitmapPages` + the `costIndexScan` correlation arm (DONE 2026-08-09).
       **S5.4** partial-index predicate recheck (`bitmapqualorig` analogue;
       actionable now — goopg has partial indexes, cf. root-0041).
       **S5.5** `tbm_extract_page_tuple` bulk-offset extraction
@@ -11041,7 +11087,7 @@ measurement discipline).
       - [x] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo` → PASS
       - [x] `TestCTEDMLVolatileRoutineSeesStatementWrites` → PASS
       Gate: UNITS + CTE DML test family + isolation + SPOT + DS05.
-- [ ] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
+- [x] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
       row 2026-08-07 M0128-P4.1; base code
       `internal/planner/reduce_outer_joins.go`. Pessimization/quality gaps,
       never wrong answers. Bar per subtask: UNITS +
