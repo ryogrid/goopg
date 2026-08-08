@@ -72,7 +72,7 @@ func TestTupleVisibleBasicCases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := TupleVisible(tc.h, snap, current, nil); got != tc.want {
+			if got := TupleVisible(tc.h, snap, current, storage.InvalidCommandId, nil, nil); got != tc.want {
 				t.Fatalf("TupleVisible=%v want=%v header=%+v", got, tc.want, tc.h)
 			}
 		})
@@ -91,7 +91,7 @@ func TestTupleVisibleOwnXIDRules(t *testing.T) {
 		Xmin: current,
 		Xmax: storage.InvalidTransactionID,
 	}
-	if !TupleVisible(visibleOwnInsert, snap, current, nil) {
+	if !TupleVisible(visibleOwnInsert, snap, current, storage.InvalidCommandId, nil, nil) {
 		t.Fatal("own insert should be visible")
 	}
 
@@ -99,7 +99,7 @@ func TestTupleVisibleOwnXIDRules(t *testing.T) {
 		Xmin: current,
 		Xmax: current,
 	}
-	if TupleVisible(deletedOwnInsert, snap, current, nil) {
+	if TupleVisible(deletedOwnInsert, snap, current, storage.InvalidCommandId, nil, nil) {
 		t.Fatal("tuple deleted by current transaction should be invisible")
 	}
 }
@@ -158,7 +158,7 @@ func TestTupleVisibleLockOnlyXmax(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if !TupleVisible(tc.h, snap, current, nil) {
+			if !TupleVisible(tc.h, snap, current, storage.InvalidCommandId, nil, nil) {
 				t.Errorf("TupleVisible=false, want true; header=%+v", tc.h)
 			}
 		})
@@ -181,7 +181,7 @@ func TestTupleVisibleNonLockXmaxRegression(t *testing.T) {
 		Xmin: 8,
 		Xmax: 9, // committed deleter, no LOCK_ONLY infomask
 	}
-	if TupleVisible(deletedNoLockBit, snap, current, nil) {
+	if TupleVisible(deletedNoLockBit, snap, current, storage.InvalidCommandId, nil, nil) {
 		t.Errorf("plain committed delete should be invisible; header=%+v", deletedNoLockBit)
 	}
 }
@@ -271,7 +271,7 @@ func TestTupleVisibleMultiXact(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := TupleVisible(c.h, snap, current, c.mxs); got != c.want {
+			if got := TupleVisible(c.h, snap, current, storage.InvalidCommandId, nil, c.mxs); got != c.want {
 				t.Errorf("TupleVisible = %v, want %v; header=%+v", got, c.want, c.h)
 			}
 		})

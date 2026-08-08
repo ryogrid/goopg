@@ -275,7 +275,7 @@ func SeesCommittedXIDWithSubxacts(snap Snapshot, xid storage.TransactionID, r Su
 // visibility resolution. When resolver is nil it degrades to the
 // standard TupleVisible behaviour, so all existing callers continue
 // to work.
-func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, r SubxactResolver, mxs *multixact.Store) bool {
+func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, r SubxactResolver, curcid storage.CommandId, combo *ComboCIDStore, mxs *multixact.Store) bool {
 	if h.Xmin == storage.InvalidTransactionID {
 		return false
 	}
@@ -285,11 +285,26 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	// transaction. Inside a subtransaction the top-level XID (and any
 	// intermediate ancestor XID) also qualifies as "self": tuples
 	// inserted before the savepoint remain visible inside it.
+	//
+	// M0129-S8.3e: cmin/cmax comparison mirroring PG's
+	// HeapTupleSatisfiesMVCC HEAPTUPLE_INSERT_IN_PROGRESS arm.
+	// Must agree with TupleVisible (pattern_sibling_paths_must_agree).
 	if isCurrentTxXID(h.Xmin, currentXID, r) {
 		if xmaxIsLockOnly {
 			return true
 		}
-		return !isCurrentTxXID(h.Xmax, currentXID, r)
+		cmin := GetCmin(h, combo)
+		if cmin >= curcid {
+			return false
+		}
+		if isCurrentTxXID(h.Xmax, currentXID, r) {
+			cmax := GetCmax(h, combo)
+			if cmax >= curcid {
+				return true // deleted by later command — pre-image visible
+			}
+			return false // deleted by earlier command — gone
+		}
+		return true
 	}
 
 	// M0115-0001: FrozenTransactionID fast path (same as TupleVisible).

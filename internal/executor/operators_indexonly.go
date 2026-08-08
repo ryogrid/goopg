@@ -208,7 +208,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			o.touchedBlocks[ptr.Block] = struct{}{}
 		}
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID, ctx.MultiXact,
-			cteRevealFor(ctx, heapRel, ptr.Block))
+		ctx.CmdID, ctx.comboStore())
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
 		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The
@@ -228,14 +228,6 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 					return false, serr
 				}
 			}
-			return true, nil
-		}
-		// M0125-0052: same fence as the seq-scan and index-scan twins — a row a
-		// data-modifying CTE of this statement wrote is invisible to the rest of
-		// it. A CTE-written row is never on an ALL_VISIBLE page (the write clears
-		// the VM bit), so this heap-checking fallback is the only IOS path that
-		// can reach one.
-		if cteFenced(ctx, heapRel, ptr.Block, actualSlot) {
 			return true, nil
 		}
 		// M0118-0001: SSI read-path per-tuple conflict-out on the HOT-resolved

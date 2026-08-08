@@ -272,7 +272,7 @@ func Analyze(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, mxs
 			// Resolves an updater-bearing multi xmax to its updater before
 			// judging visibility so the live-row count does not undercount a
 			// live, only-row-locked tuple as invisible. M0118-0003.
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID, mxs) {
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, storage.InvalidCommandId, nil, mxs) {
 				continue
 			}
 			out.Rows++

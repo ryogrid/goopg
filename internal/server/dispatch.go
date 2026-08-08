@@ -908,18 +908,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				ectx.Snap = snap2
 			}
 		}
-		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
-		// row cache from any previous statement. The row cache is query-scoped:
-		// a CTE named "q" in query 1 must not bleed into query 2 (they may
-		// produce different rows). CTEWriteFence is cleared for the same reason.
-		ectx.CTEWriteFence = nil
-		ectx.CTEXmaxReveal = nil
-		ectx.InDMLCTE = false
-		// Each statement starts at its own es_output_cid; the counter only
-		// advances into nested VOLATILE routine bodies, on their own child
-		// Context. Reset so a routine that raised mid-body cannot leave the
-		// next statement believing it runs at a later command id.
-		ectx.CmdID = 0
+		// Per-statement reset: clear the regular-CTE row cache from any
+		// previous statement. The row cache is query-scoped: a CTE named
+		// "q" in query 1 must not bleed into query 2 (they may produce
+		// different rows).
+		// M0129-S8.2: advance the transaction command counter for the new
+			// statement. CommandCounterIncrement only advances when the used flag
+			// is set (a prior statement in this transaction wrote a tuple),
+			// matching PostgreSQL's lazy-advance scheme. Pin the result as the
+			// statement's es_output_cid.
+			ectx.CommandCounterIncrement()
+			ectx.CmdID = ectx.GetCurrentCommandId(true)
 		ectx.CTERowCache = nil
 		ectx.DeadlockVictim = false
 

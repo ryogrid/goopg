@@ -13,6 +13,9 @@ import (
 
 func runDDL(t *testing.T, ctx *Context, sql string) error {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	ctx.CommandCounterIncrement()
+	ctx.CmdID = ctx.GetCurrentCommandId(true)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)

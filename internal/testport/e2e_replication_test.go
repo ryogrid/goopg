@@ -250,7 +250,7 @@ func TestE2E_LogicalReplication(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, subSnap, tx.XID, nil) {
+			if !mvcc.TupleVisible(tup.Header, subSnap, tx.XID, storage.InvalidCommandId, nil, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(pubCols, tup.Data)

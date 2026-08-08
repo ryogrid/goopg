@@ -407,7 +407,7 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 	}
 
 	// Follow HOT chain + MVCC visibility.
-	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
+	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
 	if !found {
 		return o.Next() // tuple invisible, skip
 	}

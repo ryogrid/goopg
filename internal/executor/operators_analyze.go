@@ -411,7 +411,13 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 			// wrapper). Resolves an updater-bearing multi xmax to its updater
 			// before judging visibility — a stats-sampling scan must not
 			// undercount a live, only-row-locked tuple as invisible. M0118-0003.
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID, mxs) {
+			var curcid storage.CommandId = storage.InvalidCommandId
+		var combo *mvcc.ComboCIDStore
+		if dsCtx != nil {
+			curcid = dsCtx.CmdID
+			combo = dsCtx.comboStore()
+		}
+		if !mvcc.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +

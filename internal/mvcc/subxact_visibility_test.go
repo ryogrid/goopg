@@ -134,8 +134,8 @@ func TestTupleVisibleSubxactDegrades(t *testing.T) {
 		Xmax:     storage.InvalidTransactionID,
 		Infomask: 0,
 	}
-	want := TupleVisible(h, snap, 999, nil)
-	got := TupleVisibleSubxact(h, snap, 999, nil, nil)
+	want := TupleVisible(h, snap, 999, storage.InvalidCommandId, nil, nil)
+	got := TupleVisibleSubxact(h, snap, 999, nil, storage.InvalidCommandId, nil, nil)
 	if got != want {
 		t.Errorf("TupleVisibleSubxact degraded: got %v want %v", got, want)
 	}
@@ -173,7 +173,7 @@ func TestSubxactAbortHidesRowAfterParentCommit(t *testing.T) {
 		Infomask: 0,
 	}
 	// Row was created by an aborted subxact — must be invisible.
-	if TupleVisibleSubxact(h, snapAfter, txP.XID+500, mgr, nil) {
+	if TupleVisibleSubxact(h, snapAfter, txP.XID+500, mgr, storage.InvalidCommandId, nil, nil) {
 		t.Error("row created by aborted subxact should be invisible after parent commit")
 	}
 
@@ -186,7 +186,7 @@ func TestSubxactAbortHidesRowAfterParentCommit(t *testing.T) {
 		Xmax:     storage.InvalidTransactionID,
 		Infomask: 0,
 	}
-	if !TupleVisibleSubxact(h2, snapAfter, txP.XID+500, mgr, nil) {
+	if !TupleVisibleSubxact(h2, snapAfter, txP.XID+500, mgr, storage.InvalidCommandId, nil, nil) {
 		t.Error("row created by committed subxact should be visible after parent commit")
 	}
 }
@@ -273,7 +273,7 @@ func TestTupleVisibleSubxactMultiXact(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			// nil SubxactResolver: the multixact branch must match TupleVisible
 			// exactly (the updater xids are plain top-level xids).
-			if got := TupleVisibleSubxact(c.h, snap, current, nil, c.mxs); got != c.want {
+			if got := TupleVisibleSubxact(c.h, snap, current, nil, storage.InvalidCommandId, nil, c.mxs); got != c.want {
 				t.Errorf("TupleVisibleSubxact = %v, want %v; header=%+v", got, c.want, c.h)
 			}
 		})

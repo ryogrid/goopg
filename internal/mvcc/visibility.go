@@ -15,6 +15,15 @@ import (
 // aborted, or is still in progress. Mirrors upstream's
 // HeapTupleSatisfiesMVCC handling of the LOCK_ONLY bit.
 //
+// curcid is the current command id within this transaction, used for the
+// cmin/cmax comparison on self-inserted tuples (PG's
+// HeapTupleSatisfiesMVCC HEAPTUPLE_INSERT_IN_PROGRESS arm). Callers
+// without a command counter (VACUUM, tests) pass InvalidCommandId (0).
+//
+// combo is the per-connection ComboCIDStore, used to resolve combo CIDs
+// back to real cmin/cmax values. It may be nil when no per-connection
+// store exists (VACUUM, tests).
+//
 // mxs is the process-shared MultiXact member store, used to resolve
 // an updater-bearing multixact xmax (HEAP_XMAX_IS_MULTI set,
 // LOCK_ONLY clear) back to the real updater transaction id before the
@@ -22,7 +31,7 @@ import (
 // branch below — but callers on the live read path should pass the
 // real store so a row genuinely updated under a shared lock is judged
 // against its updater, not its (meaningless as an xid) MultiXactId.
-func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, mxs *multixact.Store) bool {
+func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, curcid storage.CommandId, combo *ComboCIDStore, mxs *multixact.Store) bool {
 	// Creator not set is always invalid.
 	if h.Xmin == storage.InvalidTransactionID {
 		return false
@@ -40,11 +49,37 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 	// Tuples created by our own transaction are visible to us unless we
 	// already deleted them in the same transaction. A lock-only
 	// self-stamp doesn't count as a delete.
+	//
+	// M0129-S8.3e: add cmin/cmax comparison mirroring PG's
+	// HeapTupleSatisfiesMVCC HEAPTUPLE_INSERT_IN_PROGRESS arm. When
+	// curcid is InvalidCommandId (0), cmin >= 0 is true for tuples
+	// with cmin=0 — so self-inserted tuples at command 0 are hidden
+	// from command 0's own scans (the inserting statement never
+	// re-scans its own writes through TupleVisible). A subsequent
+	// statement's incremented curcid passes the check.
 	if h.Xmin == currentXID {
 		if xmaxIsLockOnly {
 			return true
 		}
-		return h.Xmax != currentXID
+		// cmin check: a tuple inserted by a later command (cmin >= curcid)
+		// is not yet visible. goopg sets curcid=0 until the first write,
+		// and existing tuples have cmin=0; this correctly hides self-inserted
+		// tuples within the same statement while showing them to later ones.
+		cmin := GetCmin(h, combo)
+		if cmin >= curcid {
+			return false
+		}
+		// Self-deleted tuple: if deleted by a later command (cmax >= curcid),
+		// show the pre-image (still visible). If deleted by an earlier command,
+		// the tuple is gone.
+		if h.Xmax == currentXID {
+			cmax := GetCmax(h, combo)
+			if cmax >= curcid {
+				return true // deleted by later command — pre-image visible
+			}
+			return false // deleted by earlier command — gone
+		}
+		return true
 	}
 
 	// M0115-0001: FrozenTransactionID fast path. Frozen tuples are universally
