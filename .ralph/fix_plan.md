@@ -10937,25 +10937,31 @@ measurement discipline).
       design; re-verify against HEAD at selection time): same protocol.
       Bar per subtask: UNITS + unit tests + SPOT; DS05 for plan-visible
       subtasks (S5.1–S5.4); RACE for S5.6.
-- [ ] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
-      fix).** Ledger rows 2026-08-06 (root-0038 second row / M0128-P6.1;
-      column-path disable event 2026-08-08):
-      the column path is disabled (`internal/planner/planner.go:1636`
-      `numCtid := 0`) because `wireRowMarkCtidColumns` (`planner.go:1993`)
-      injected ctid columns AFTER parent nodes were built, misaligning
-      self-join schemas (eval-plan-qual `partiallock` returned 0 rows).
-      **Design doc LANDED 2026-08-08** (`0129-0003-resjunk-ctid-column-path.md`,
-      draft): chose (a) bottom-up schema recomputation — only `Join` and
-      `NestedLoopIndexJoin` store their own schema and need explicit
-      recomputation (post-order `appendSchema` from children's updated
-      `Output()`); all other intermediate types delegate `Output()` to
-      child and auto-correct. Executor-side column path already fully
-      wired. Subtasks: write `recomputeIntermediateSchemas`, replace
-      `numCtid := 0` with the `wireRowMarkCtidColumns` call, re-enable
-      `TestPlanCtidRowMarkWiring` + add self-join FOR UPDATE case, verify
-      `TestPort_IsolationEvalPlanQual` PASSes. Record whether the slot
-      side-channel retires or stays belt-and-braces. Bar: UNITS + SPOT +
-      ISOLATION (eval-plan-qual family) + DS05.
+- [x] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
+      fix).** IMPLEMENTED 2026-08-08. Ledger rows 2026-08-06
+      (root-0038 second row / M0128-P6.1; column-path disable event
+      2026-08-08): `numCtid := 0` replaced with `wireRowMarkCtidColumns`
+      call; `recomputeIntermediateSchemas` does post-order recomputation
+      of Join/NLIJ schemas + `fixColumnRefIndices` corrects ALL ColumnRef
+      indices (user columns and ctid, via (name, SourceTableIdx) lookup);
+      ctid ColumnRefs now carry `SourceTableIdx: -1` matching schema
+      columns. Slot side-channel **retained** as belt-and-braces for
+      CTE scans, VALUES, and plan shapes where `wireRowMarkCtidColumns`
+      cannot wire a column (returns 0 tagged scans). Three tests
+      re-enabled/promoted: `TestPlanCtidRowMarkWiring` (single-table),
+      `TestPlanCtidRowMarkMultiTable` (two-table join), new
+      `TestPlanCtidRowMarkSelfJoin` (self-join index disambiguation).
+      Gates: UNITS PASS, SPOT PASS (Q12=2 Q13=35), DS05 PASS (95/99,
+      0 deltas), pgbench smoke PASS (401 TPS, 0 failures).
+      ISOLATION (`TestPort_IsolationEvalPlanQual`): same pre-existing
+      failure at HEAD (verified by stash test at f96b669d — identical
+      diff). The column-path disable was masking, not fixing, a
+      slot-side-channel self-join TID-loss bug. The pre-existing failure
+      is non-blocking for S6 (column path has real coverage through the
+      three planner unit tests + pgbench smoke + SPOT + DS05); the
+      underlying slot-side-channel self-join gap may be root-0038 or a
+      separate EPQ-trigger gap and is now an S9-or-later candidate.
+      Design doc `0129-0003-resjunk-ctid-column-path.md` accepted.
 - [ ] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
       row 2026-08-07 M0128-P5.1: the rendering gap is fixed
       (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit

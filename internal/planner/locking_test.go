@@ -1,6 +1,9 @@
 package planner
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestPlanSelectForUpdateWrapsLockRows — the headline case: a
 // SELECT … FOR UPDATE produces a LockRows wrapper at the top of
@@ -164,19 +167,11 @@ func TestPlanSelectWithoutLockingNoWrapper(t *testing.T) {
 	}
 }
 
-// TestPlanCtidRowMarkWiring — M0128-P6.1 resjunk-ctid rowmark: a single-table
-// SELECT … FOR UPDATE assigns sequential RowMarkId, wires a ctid column into the
-// scan schema, extends the Project, and sets CtidResno on the LockedRel.
+// TestPlanCtidRowMarkWiring — M0129-S6 resjunk-ctid column-path re-enable:
+// a single-table SELECT … FOR UPDATE assigns sequential RowMarkId, wires a ctid
+// column into the scan schema, extends the Project, sets CtidResno on the
+// LockedRel, and LockRows strips ctid from Output().
 func TestPlanCtidRowMarkWiring(t *testing.T) {
-	// M0128-P6.1 resjunk-ctid rowmark is DISABLED: the column-path
-	// (wireRowMarkCtidColumns) is turned off because it doesn't propagate
-	// ctid columns through intermediate nodes (Join etc.), causing column
-	// misalignment in self-joins. The executor instead uses the
-	// MaterializedSlot's hasCTID/ctidBlock/ctidOff side channel, which
-	// joinOp.preserveBuildSide already forwards through hash joins.
-	// When re-enabled, this test verifies:
-	//   CtidResno >= 0, NumCtidCols >= 1, Project includes ctid column,
-	//   LockRows strips ctid from Output(), SeqScan schema extended.
 	cat := pgbenchCatalog(t)
 	stmt := parseOne(t, "SELECT aid FROM pgbench_accounts FOR UPDATE")
 	node, err := Plan(stmt, cat)
@@ -194,25 +189,41 @@ func TestPlanCtidRowMarkWiring(t *testing.T) {
 	if lk.RowMarkId != 1 {
 		t.Errorf("RowMarkId = %d, want 1", lk.RowMarkId)
 	}
-	// Column path disabled: CtidResno stays -1 (slot side-channel instead).
-	if lk.CtidResno != -1 {
-		t.Errorf("CtidResno = %d, want -1 (column path disabled)", lk.CtidResno)
+	// Column path enabled: CtidResno must be a valid column index.
+	if lk.CtidResno < 0 {
+		t.Errorf("CtidResno = %d, want >= 0 (column path enabled)", lk.CtidResno)
 	}
-	if lr.NumCtidCols != 0 {
-		t.Errorf("NumCtidCols = %d, want 0 (column path disabled)", lr.NumCtidCols)
+	if lr.NumCtidCols != 1 {
+		t.Errorf("NumCtidCols = %d, want 1 (column path enabled)", lr.NumCtidCols)
 	}
-	// Output schema equals child output (no ctid stripping needed).
+	// Output schema has ctid stripped: len(Output) == len(Child.Output) - NumCtidCols.
 	output := lr.Output()
 	childOutput := lr.Child.Output()
-	if len(output) != len(childOutput) {
-		t.Errorf("Output().len = %d, want == child.Output().len (%d) — no ctid to strip",
-			len(output), len(childOutput))
+	if len(output) != len(childOutput)-lr.NumCtidCols {
+		t.Errorf("Output().len = %d, want child.Output().len(%d) - NumCtidCols(%d) = %d",
+			len(output), len(childOutput), lr.NumCtidCols, len(childOutput)-lr.NumCtidCols)
+	}
+	// The Project must contain a ctid column in its schema.
+	proj, ok := lr.Child.(*Project)
+	if !ok {
+		t.Fatalf("LockRows.Child = %T, want *Project", lr.Child)
+	}
+	found := false
+	for _, col := range proj.schema {
+		if strings.HasPrefix(col.Name, "ctid") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Project schema missing ctid column")
 	}
 }
 
 // TestPlanCtidRowMarkMultiTable — verifies RowMarkId assignment for multiple
-// locked relations.  M0128-P6.1 column path is disabled: CtidResno stays -1
-// and NumCtidCols is 0 (the executor uses the MaterializedSlot side channel).
+// locked relations with column path enabled (M0129-S6). Two tables in a join,
+// each FOR UPDATE: both get distinct RowMarkId, valid CtidResno, and LockRows
+// strips both ctid columns.
 func TestPlanCtidRowMarkMultiTable(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	stmt := parseOne(t,
@@ -237,13 +248,83 @@ func TestPlanCtidRowMarkMultiTable(t *testing.T) {
 			t.Errorf("duplicate RowMarkId %d", lk.RowMarkId)
 		}
 		ids[lk.RowMarkId] = true
-		// Column path disabled: CtidResno stays -1.
-		if lk.CtidResno != -1 {
-			t.Errorf("CtidResno = %d for %s, want -1 (column path disabled)", lk.CtidResno, lk.Alias)
+		// Column path enabled: CtidResno must be a valid column index.
+		if lk.CtidResno < 0 {
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path enabled)", lk.CtidResno, lk.Alias)
 		}
 	}
-	// Column path disabled: NumCtidCols is 0 (no ctid stripping).
-	if lr.NumCtidCols != 0 {
-		t.Errorf("NumCtidCols = %d, want 0 (column path disabled)", lr.NumCtidCols)
+	// Both tables locked: NumCtidCols == 2.
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2 (column path enabled)", lr.NumCtidCols)
+	}
+	// Output schema has both ctid columns stripped.
+	childOutput := lr.Child.Output()
+	if len(lr.Output()) != len(childOutput)-lr.NumCtidCols {
+		t.Errorf("Output().len = %d, want child.Output().len(%d) - NumCtidCols(%d) = %d",
+			len(lr.Output()), len(childOutput), lr.NumCtidCols, len(childOutput)-lr.NumCtidCols)
+	}
+}
+
+// TestPlanCtidRowMarkSelfJoin — M0129-S6: a self-join with FOR UPDATE must
+// wire distinct ctid columns for each scan of the same table (RowMarkId
+// disambiguation) and the Project's ColumnRef indices must reference the
+// correct positions in the join output, not the scan-local positions. This is
+// the exact shape that was broken before intermediate schema recomputation.
+func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t,
+		"SELECT a.aid, b.aid FROM pgbench_accounts a JOIN pgbench_accounts b ON a.aid = b.aid FOR UPDATE OF a, b")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	lr, ok := node.(*LockRows)
+	if !ok {
+		t.Fatalf("root node = %T, want *LockRows", node)
+	}
+	if len(lr.Locks) < 2 {
+		t.Fatalf("len(Locks) = %d, want >= 2", len(lr.Locks))
+	}
+	// Verify each LockedRel has a valid CtidResno.
+	for _, lk := range lr.Locks {
+		if lk.CtidResno < 0 {
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path enabled)", lk.CtidResno, lk.Alias)
+		}
+		if lk.RowMarkId < 1 {
+			t.Errorf("RowMarkId = %d for %s, want >= 1", lk.RowMarkId, lk.Alias)
+		}
+	}
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2", lr.NumCtidCols)
+	}
+	// The Project must contain two distinct ctid columns.
+	proj, ok := lr.Child.(*Project)
+	if !ok {
+		t.Fatalf("LockRows.Child = %T, want *Project", lr.Child)
+	}
+	ctidCols := map[string]int{} // name → index in Project schema
+	for i, col := range proj.schema {
+		if strings.HasPrefix(col.Name, "ctid") {
+			ctidCols[col.Name] = i
+		}
+	}
+	if len(ctidCols) != 2 {
+		t.Fatalf("Project schema has %d ctid columns, want 2", len(ctidCols))
+	}
+	// The two ctid ColumnRefs must have different indices (pointing to different
+	// positions in the join output).
+	ctidIndices := map[int]bool{}
+	for _, target := range proj.Targets {
+		cr, ok := target.(*ColumnRef)
+		if !ok || !strings.HasPrefix(cr.Name, "ctid") {
+			continue
+		}
+		if ctidIndices[cr.Index] {
+			t.Errorf("duplicate ColumnRef.Index %d for ctid column %s", cr.Index, cr.Name)
+		}
+		ctidIndices[cr.Index] = true
+	}
+	if len(ctidIndices) != 2 {
+		t.Errorf("found %d distinct ctid ColumnRef indices, want 2", len(ctidIndices))
 	}
 }

@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | **draft** — design complete; implementation next loop |
+| status | **accepted** — implemented 2026-08-08 (m0129 branch, commit pending) |
 | date | 2026-08-08 |
 | milestone | `docs/milestones/0129-q74-fix-and-m0128-followups.md` |
 | task | M0129-S6 |
