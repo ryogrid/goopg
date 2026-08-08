@@ -1,42 +1,38 @@
-Task: M-NIGHTLY — fix 49 nightly regressions (20260809-020705). M0129-S8.3 command counter fix landed.
+Task: M-NIGHTLY AI-019 PlpgsqlToast — FIXED (command counter per-statement advance).
 
 Files:
-- internal/executor/context.go: added cmdCounterExt + SetCmdCounter() + pointer delegation
-- internal/executor/session.go: added cmdCounter field to BasicSession; reset on begin/end
-- internal/server/dispatch.go: seed ectx cmdCounter from session
+- internal/executor/plpgsql_runtime.go: `executePLpgSQLStmtList` — added
+  `routineCommandCounterIncrement(ctx, r)` after each statement so subsequent
+  statements see prior writes (mirrors PG's SPI per-statement increment).
+- internal/executor/operators_ddl.go: `execDoBlock` — added initial
+  `routineCommandCounterIncrement(o.ctx, r)` before executing the statement
+  list (mirrors the same call in `executePLpgSQLRoutine`).
 
-Key symbols: SetCmdCounter, BasicSession.CmdCounter, CommandCounterIncrement, GetCurrentCommandId
+Key symbols: executePLpgSQLStmtList, execDoBlock, routineCommandCounterIncrement,
+  CommandCounter, executePLpgSQLRoutine
 
 Hypothesis/Findings:
-- ROOT CAUSE: Each simple-query message creates a fresh executor.Context with cmdCounter
-  starting at 0. The cmin/cmax visibility check in TupleVisibleSubxact (S8.3g) makes
-  cmin >= curcid → invisible. With curcid=0, all self-inserted tuples (cmin >= 0) are
-  hidden from subsequent DML scans (scanMatching). DELETE/UPDATE find no victims → no
-  xmax stamp → deferred uniqueness checks at COMMIT find duplicate live tuples → 23505.
-- FIX: Store CommandCounter on BasicSession (per-transaction), seed fresh Context from
-  session via SetCmdCounter pointer delegation. Reset on tx begin/end.
-- Also fixes INSERT-time immediate NND checks that scan via scanMatching.
+- Root cause: `routineCommandCounterIncrement` was called only once at routine
+  entry, not after each embedded SQL statement. INSERTs within the same DO block
+  stamped tuples with cmin == curcid, making them invisible to subsequent FOR
+  loop SELECT (cmin >= curcid → hidden). Only pre-existing rows from prior
+  transactions were visible. The FOR loop iterated 1 time instead of 3.
+- PG advances the command counter through SPI after EVERY statement of a volatile
+  routine (postquel_getnext in functions.c).
+- Fix verified: PlpgsqlToast PASS, executor suite PASS, TPC-H spotcheck PASS
+  (Q12=2, Q13=35), pre-commit pgbench smoke PASS (0 failed, all 3 workloads).
 
-Verified fixed (13 tests):
-  All 5 deferred constraint tests: DeferredNNDMultiColumn, InitiallyDeferred{Exclusion,FK,NND,Unique}Commit
-  Isolation: FkSnapshot, InsertConflictDoUpdate{2,3,4}, LockUpdateDelete, Merge{Delete,InsertUpdate,Join,MatchRecheck,Update}, PropagateLockDelete, Stats, TotalCash
-  SetConstraintsDeferral
-
-Still failing (pre-existing, NOT caused by M0129):
-  - TestPort_IsolationEvalPlanQual (AI-007): failing since 20260808 nightly
-  - TestPort_IsolationPlpgsqlToast (AI-019): possible separate issue
-
-Not yet verified:
-  - DetachPartitionConcurrently1/3 (AI-005,006), EvalPlanQualTrigger (AI-008)
-  - 26 regress tests (AI-024–049): likely same root cause, should be fixed
-
-Next step: Run full testport suite to confirm remaining fixes; update fix_plan.md M-NIGHTLY
-  items with findings; investigate any remaining failures.
+Next step: Investigate EvalPlanQual (AI-007) — the only remaining M-NIGHTLY
+  engine failure. Pre-existing `markJoinPreserveCTID` walk lacks arms for
+  non-joinOp plan shapes under DP=0 (deferral ledger row 2026-08-07 M0127-P6.2).
 
 Gates run:
-- UNITS: PASS
-- SPOT: PASS (Q12=2, Q13=35, 29.5s)
-- pgbench smoke: PASS (14,477/17,392/366,793 tps, 0 failures)
-- ralph-state-guard: REPAIRED+OK
+- `go build ./...`: PASS
+- `go test ./internal/executor/...`: PASS (6.080s, all cached)
+- PlpgsqlToast repro: PASS (4.25s)
+- `scripts/tpch-spotcheck.sh`: PASS (Q12=2, Q13=35)
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`: PASS
+  (0 failed, all 3 workloads: TPC-B 395 tps, simple-update 418 tps, select-only 12303 tps)
+- `make ralph-state-guard`: PENDING (run below)
 
 In-flight: none

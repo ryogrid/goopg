@@ -1118,6 +1118,13 @@ func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plp
 		if err != nil || flow != flowNone {
 			return res, flow, err
 		}
+		// Advance the command counter after each statement so subsequent
+		// statements see this statement's writes. PostgreSQL does this
+		// through SPI_execute_plan, which advances the command counter
+		// for every statement of a routine that is not readonly_func
+		// (i.e. every VOLATILE one — postquel_getnext in functions.c).
+		// M-NIGHTLY AI-20260809-020705-019 (plpgsql-toast assign6).
+		routineCommandCounterIncrement(ctx, r)
 	}
 	return Datum{}, flowNone, nil
 }

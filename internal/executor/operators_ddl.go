@@ -1530,7 +1530,9 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: addErr.Error()}
 		}
 	}
-	// Execute statements directly using the parent context so NOTICEs propagate. M0097-0003.
+	// Advance the command counter so the DO body sees the caller's writes,
+	// mirroring executePLpgSQLRoutine. M-NIGHTLY AI-20260809-020705-019.
+	routineCommandCounterIncrement(o.ctx, r)
 	_, flow, execErr := executePLpgSQLStmtList(block.Statements, r, frame, o.ctx)
 	if execErr != nil {
 		return execErr

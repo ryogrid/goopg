@@ -161,8 +161,14 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       Pre-existing: the `markJoinPreserveCTID` walk lacks arms for non-joinOp plan
       shapes under DP=0 (deferral ledger row 2026-08-07 M0127-P6.2). Repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
-- [ ] **TestPort_IsolationPlpgsqlToast (AI-019)** — FAILs at HEAD (separate issue,
-      not command-counter related). Not yet investigated. Repro:
+- [x] **TestPort_IsolationPlpgsqlToast (AI-019)** — **FIXED (2026-08-09).**
+      Root cause: `routineCommandCounterIncrement` was called only once at routine
+      entry, not after each embedded SQL statement — so INSERTs within the same
+      DO block stamped their tuples with cmin equal to the FOR loop SELECT's
+      curcid, making them invisible (`cmin >= curcid` → hidden). PG advances the
+      command counter through SPI after EVERY statement of a volatile routine.
+      Fix: added `routineCommandCounterIncrement(ctx, r)` after each statement in
+      `executePLpgSQLStmtList`, and at entry in `execDoBlock`. Repro:
       `go test -v -run '^TestPort_IsolationPlpgsqlToast$' ./internal/testport/`.
 
 **Infrastructure, not engine:**
