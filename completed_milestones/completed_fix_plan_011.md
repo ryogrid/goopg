@@ -2349,7 +2349,7 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       format sentinel + no-regression checks) + oracle_pgnodes_adbin_test.go now
       **130 cases** (12 new) all byte-identical vs LIVE PG18.3. Design 0123-0005
       §"Sub-slice 40".
-      
+
 ## M0124 — TPC-DS round-2 closeout: measurement baseline, gate discharge & ledger debt (filed 2026-07-28)
 
 Milestone: `docs/milestones/0124-tpcds-round2-closeout-measurement-and-gate-debt.md`.
@@ -11393,3 +11393,256 @@ P5.1→P5.2 → P2.1→P2.4 → P6.1 (P2.1's measurement may run any time the ho
 is quiet; P4/P5 may interleave with P1 when a loop needs a smaller task). No
 M0128 task may be selected while M0127-P6.4 is open (Current Priority
 banner).
+
+## M0129 — Q74 fix + M0128 verdict follow-ups + residual-ledger burn-down (filed 2026-08-08)
+
+Milestone: `docs/milestones/0129-q74-fix-and-m0128-followups.md`.
+Implementation plan (the authoritative task decomposition):
+`docs/design/0129-q74-fix-and-m0128-followups.md`. **Priority: TOP — user
+directive 2026-08-08; ahead of the M-NIGHTLY backlog** (the standing
+M-NIGHTLY *filing* obligation still applies to every loop).
+
+**Filing rules for this milestone (user directive 2026-08-08):** (1) no item
+is deferred without a strong reason recorded in `.ralph/deferral_ledger.md`;
+(2) every item's subtasks are listed inline in the task body below; (3)
+every non-trivial subsystem's design doc is created AND completed (status
+`accepted`) within M0129 — a design doc punted past the milestone is a
+milestone failure. Gates use the M0127/M0128 vocabulary (UNITS/SMOKE/SPOT/
+DS05/PLAN/RACE; `make ralph-state-guard` before every finish). **Read the
+plan doc §2 before picking any task here** (gate vocabulary, worktree and
+measurement discipline).
+
+- [x] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** DONE
+      `ea1b2fbe` 2026-08-08. Root cause: TWO mechanisms, both diagnosed and
+      fixed. **(a) Hash path rejection by merge on pathkeys within 1% fuzz
+      band:** `comparePathCostsFuzzily` returned `costsEqual` for hash-vs-merge
+      at CTE self-join costs (~2.04 vs ~2.06) → merge pathkeys dominated hash
+      (no pathkeys) → hash silently rejected from pathlist. Fixed by falling
+      through to actual (non-fuzzy) cost comparison when fuzzily equal, so
+      hash (cheaper) trades off against merge (has pathkeys) and both survive.
+      **(b) CTE scan row estimates collapsed to 1:** `filterSelectivity`
+      defaults to `defaultEqSelectivity=0.005` per conjunct on columns with no
+      statistics — for Q74's year_total CTE (17977 rows, 2 sale_type/2 year
+      values), 0.005⁴×17977≈0.000011→1, making NL look free. Fixed by
+      falling back to CTE body's unfiltered row count in `initialRelRows`.
+      Q74: 99s→14s SF0.5 (≤20s ✓), byte-identical (7 rows, ck same). DS05
+      PASS 95/99, 0 row/checksum deltas, 20 plan-shape changes (all legitimate
+      from cost/cardinality changes). Ledger row appended with deferred:
+      CTE column statistics propagation remains open. Bar: UNITS+SPOT+DS05 ✓.
+- [x] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
+      M0125-0055: the `isConcurrentlyUpdated` arm of
+      `deleteOp.deleteWithUsing`
+      (`internal/executor/operators_storage.go:6292`) silently SKIPS the
+      victim where PG waits for the updater, re-fetches the live version
+      via the `t_ctid` chain, re-evaluates the USING predicate, and deletes
+      that version (`nodeModifyTable.c` `ExecDelete` → `EvalPlanQual`).
+      Subtasks: mirror the loop `deleteOp.Next` already has (`epqWait` →
+      `epqFollowHOT` → `epqFollowChain` → re-evaluate `o.pred` and the
+      USING portion → retry the stamp), including the `epqRetryLimit`/
+      40001 and moved-partition arms; add an isolation spec proving the
+      wait-and-delete-successor behaviour. Bar: UNITS + isolation family +
+      SPOT.
+- [x] **M0129-S3 — sort-spill ctid side-channel carry (root-0038).** Ledger
+      row 2026-08-06 root-0038 (first row): `sortOp` drops the ctid
+      side-channel the moment it spills (`ctidsDisabled`,
+      `internal/executor/operators.go:612-686`) — a row-locking query whose
+      sort exceeds `work_mem` silently loses its tuple lock. Subtasks:
+      carry `sortCTID` into the spill records and back out of the N-way
+      merge (`sortOp.flushChunk` / `initMerge`, operators.go:798/882;
+      on-disk sort record layout change); guard test forcing a sort past `work_mem` under FOR UPDATE
+      asserting the lock still blocks a concurrent updater. **If S6 landed
+      first**, reduce to verifying the spill shape rides the column and
+      closing the ledger row. Bar: UNITS + RACE + isolation family + SPOT.
+- [x] **M0129-S4 — cooperative parallel hash build (P2.1a/P2.1b).** DONE
+      `f2e3f167` 2026-08-08. **S4.1 (= P2.1a)** producer/consumer split
+      landed and verified: UNITS PASS, SPOT PASS (Q12=2, Q13=35), DS05 PASS
+      (95/95, zero deltas), RACE PASS (all packages, zero races). A/B
+      measurement (TPC-H SF1, GOOPG_PARALLEL_HASH_BUILD env-var toggle):
+      3–5× build-time speedup on eligible joins (Q9: 351→99 ms; Q19:
+      367→97 ms; Q17 small: 269→49 ms). Large ineligible builds remain
+      (17s Q17 correlated-subq blocked by extractSeqScanFromPlan; Q9/Q13
+      spill blocks batched path). **S4.2 (= P2.1b) DEFERRED:** S4.1's
+      measurement does NOT show continued build dominance for large eligible
+      builds — the remaining >1s builds are ineligible. Recorded per design
+      doc `13-cooperative-parallel-hash-build.md` §5.1/§6. Design doc
+      updated with measurement.
+- [x] **M0129-S5 — bitmap heap scan burn-down (8 subtasks).** ALL DONE 2026-08-09
+      (S5.1–S5.6 complete; S5.7/S5.8 closed blocked-with-reason). Source:
+      `docs/design/0128-0001-bitmap-heap-scan.md` §6 (8 deferral rows) +
+      the P2.4 caveat (paths generated but ALWAYS rejected by `add_path`).
+      Base code: `internal/planner/{pathbitmap,costbitmap,createplanbitmap}.go`,
+      `internal/executor/{tidbitmap,operators_bitmap}.go`. Subtasks (resume
+      points in plan doc §3 S5): **S5.1** BitmapAnd/BitmapOr path
+      generation (`choose_bitmap_and` port, `indxpath.c:1785`); EXPLAIN
+      proof of a chosen BitmapAnd plan (DONE 2026-08-09). **S5.2** selectivity-region
+      survival proof — one recorded query where a bitmap path survives
+      `add_path` and beats index scan AND seq scan on measured time
+      (recorded under `analysis/`; the milestone-level bitmap verdict) (DONE 2026-08-09).
+      **S5.3** correlation statistic collection
+      (`internal/executor/operators_analyze.go`) + two-term Mackert-Lohman
+      in `computeBitmapPages` + the `costIndexScan` correlation arm (DONE 2026-08-09).
+      **S5.4** partial-index predicate recheck (`bitmapqualorig` analogue;
+      actionable now — goopg has partial indexes, cf. root-0041) (DONE 2026-08-09).
+      **S5.5** `tbm_extract_page_tuple` bulk-offset extraction
+      (`tidbitmap.go` iterator; microbenchmark) (DONE 2026-08-09). **S5.6** parallel bitmap
+      heap scan (`ParallelGroup` + shared atomic allocator; design §3.7's
+      no-DSA shape) (DONE 2026-08-09). **S5.7** (CLOSED blocked 2026-08-09) read-stream prefetch (general I/O prefetch layer
+      does not exist; deferred to storage subsystem). **S5.8** (CLOSED blocked 2026-08-09) GiST/GIN
+      `getBitmap` (no GiST/GIN index AM exists; deferred to AM milestone).
+      Bar per subtask: UNITS + unit tests + SPOT; DS05 for plan-visible
+      subtasks (S5.1–S5.4); RACE for S5.6.
+- [x] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
+      fix).** IMPLEMENTED 2026-08-08. Ledger rows 2026-08-06
+      (root-0038 second row / M0128-P6.1; column-path disable event
+      2026-08-08): `numCtid := 0` replaced with `wireRowMarkCtidColumns`
+      call; `recomputeIntermediateSchemas` does post-order recomputation
+      of Join/NLIJ schemas + `fixColumnRefIndices` corrects ALL ColumnRef
+      indices (user columns and ctid, via (name, SourceTableIdx) lookup);
+      ctid ColumnRefs now carry `SourceTableIdx: -1` matching schema
+      columns. Slot side-channel **retained** as belt-and-braces for
+      CTE scans, VALUES, and plan shapes where `wireRowMarkCtidColumns`
+      cannot wire a column (returns 0 tagged scans). Three tests
+      re-enabled/promoted: `TestPlanCtidRowMarkWiring` (single-table),
+      `TestPlanCtidRowMarkMultiTable` (two-table join), new
+      `TestPlanCtidRowMarkSelfJoin` (self-join index disambiguation).
+      Gates: UNITS PASS, SPOT PASS (Q12=2 Q13=35), DS05 PASS (95/99,
+      0 deltas), pgbench smoke PASS (401 TPS, 0 failures).
+      ISOLATION (`TestPort_IsolationEvalPlanQual`): same pre-existing
+      failure at HEAD (verified by stash test at f96b669d — identical
+      diff). The column-path disable was masking, not fixing, a
+      slot-side-channel self-join TID-loss bug. The pre-existing failure
+      is non-blocking for S6 (column path has real coverage through the
+      three planner unit tests + pgbench smoke + SPOT + DS05); the
+      underlying slot-side-channel self-join gap may be root-0038 or a
+      separate EPQ-trigger gap and is now an S9-or-later candidate.
+      Design doc `0129-0003-resjunk-ctid-column-path.md` accepted.
+- [x] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
+      row 2026-08-07 M0128-P5.1: the rendering gap is fixed
+      (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit
+      comparison was never re-run. No engine change expected.
+      **DONE 2026-08-08.** Ran `PGSHAPED=1 DP_TRACE=1 PLAN_ONLY=1
+      scripts/tpch-estimate-audit-arm.sh m0129-s7-clause6` (rc=0, 24s).
+      All five queries now adjudicable — zero `N ambiguous` markers.
+      Q2/Q8/Q17/Q18 have clean pairings; Q22 has `~` semantic ambiguity
+      (customer scanned twice without alias, not a rendering gap).
+      Q8's PG bushy pairing is CLAUSE-6-CANDIDATE, confirmed OFFERED by
+      goopg's search (cost/stats divergence, not enumeration gap).
+      Verdict: `analysis/m0129-s7-clause6-verdict.md`. Ledger row
+      2026-08-07 M0128-P5.1 → resolved. Bar: the recorded measurement.
+- [x] **M0129-S8.1 — design doc drafted** (`docs/design/0129-0001-command-counter-and-cmin-cmax.md`,
+      2026-08-08). Covers: heap-header cmin/cmax layout (reinterpret
+      existing `Xvac` 4-byte slot as `t_cid`/`t_xvac` union with
+      `HEAP_COMBOCID` flag), transaction-owned per-statement `CommandId`
+      with lazy `used` guard, `TupleVisible` signature change (adds
+      `curcid` + `combo *ComboCIDStore` parameters), fence-map retirement
+      plan, migration story (on-disk format unchanged — field was always
+      0), risk assessment. Follows PG 18.3: `htup_details.h`
+      `HeapTupleFields` t_cid/t_xvac union, `combocid.c` combo CID hash,
+      `xact.c` `CommandCounterIncrement`, `heapam_visibility.c`
+      `HeapTupleSatisfiesMVCC` cmin/cmax comparison.
+- [x] **M0129-S8.2 — per-statement transaction-owned CommandCounter.**
+      Counter type (owned by `TransactionMgr`), `CommandCounterIncrement`,
+      `GetCurrentCommandId(used bool)`, dispatch wiring (replace
+      `CmdID = 0` reset with `CommandCounterIncrement` +
+      `GetCurrentCommandId(true)`), `plpgsql_runtime.go` six sites
+      replace `routineCommandCounterIncrement` with
+      `CommandCounterIncrement`. Gate: UNITS + existing CTE command-counter
+      tests.
+      COMPLETED 2026-08-08.
+      - `internal/storage/command_id.go` — `CommandId` type (uint32),
+        `FirstCommandId`/`InvalidCommandId` constants.
+      - `internal/executor/command_counter.go` — `CommandCounter` struct
+        with `GetCurrentCommandId(used)` + `CommandCounterIncrement`.
+      - `internal/executor/context.go` — `CmdID` typed; `cmdCounter` field;
+        `CommandCounterIncrement`/`GetCurrentCommandId`/`ResetCommandCounter`
+        methods on Context; fence maps changed from `map[…int]` to
+        `map[…storage.CommandId]`.
+      - `internal/executor/operators_cte_dml.go` — `routineCommandCounterIncrement`
+        calls `CommandCounterIncrement()`+`GetCurrentCommandId(true)`; fence
+        stamp sites (`cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`) call
+        `GetCurrentCommandId(true)` (matching PG's heap_insert path).
+      - `internal/server/dispatch.go` — per-statement `CmdID = 0` replaced
+        with `CommandCounterIncrement()` + `GetCurrentCommandId(true)`.
+      - Counter stored per-`Context` (not per-`mvcc.Manager`) because the
+        manager is shared across connections. Design doc §7 decision 1
+        resolved accordingly.
+      Gate: executor package (5.6s PASS) + server package (22s PASS) +
+      all 11 CTE DML tests + CTE command-counter tests PASS.
+      `TestPort_IsolationEvalPlanQual` pre-existing FAIL (also fails at
+      HEAD, tracked as M-NIGHTLY AI-20260808-005620-001, already [x]).
+- [x] **M0129-S8.3 — per-tuple cmin/cmax + fence-map retirement.**
+      **S8.3g (fence retirement) DONE 2026-08-08.** `CTEWriteFence`/`CTEXmaxReveal`
+      maps, `CTEFencePtr` type, `cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`,
+      `cteRevealFn`/`cteRevealed`/`cteRevealHeader`/`cteRevealFor`/`cteFenced`/
+      `cteWrittenByLaterCommand` all removed from `operators_cte_dml.go` +
+      `context.go` + all 8 call-site files + dispatch.go. `followHOTChain`/
+      `followHOTChainNoCopy` `reveal` parameter removed. 10/11 CTE DML tests PASS
+      (up from 8/11 — the 2 newly-passing tests were fence-dependent).
+      **S8.3i (test infrastructure) DONE 2026-08-08.** NewContext() defaults CmdID
+      to storage.InvalidCommandId so callers bypassing the dispatch path get
+      pass-through cmin/cmax visibility. Added centralized advanceStmtCounter(ctx)
+      helper and 20+ call sites in test helpers + direct Build+Open+Next sites.
+      Full executor suite PASS (serial). All 11 CTE DML tests PASS. All HOT tests
+      PASS. TestTupleVisibleOwnXIDRules PASS. TestCTEDMLVolatileRoutineSeesStatementWrites
+      PASS. SPOT PASS (Q12:2, Q13:35).
+      **Remaining from S8.3a-f (deferred, engine code):**
+      - [x] cmax stamping in `stampUpdaterXmaxNonHOT` (DONE 2026-08-08 — cmax added to
+            both Multi and plain paths, 3 fallback sites, and HOT path)
+      - [x] second `writeHeapRowReturning` cmin stamp (DONE 2026-08-08 — verified all
+            heap-write paths already have cmin from S8.3g; no missing sites found)
+      **Resolved by S8.3i (test infrastructure fix):**
+      - [x] `TestTupleVisibleOwnXIDRules` investigation → PASS
+      - [x] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo` → PASS
+      - [x] `TestCTEDMLVolatileRoutineSeesStatementWrites` → PASS
+      Gate: UNITS + CTE DML test family + isolation + SPOT + DS05.
+- [x] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
+      row 2026-08-07 M0128-P4.1; base code
+      `internal/planner/reduce_outer_joins.go`. Pessimization/quality gaps,
+      never wrong answers. Bar per subtask: UNITS +
+      demotion-matrix unit tests + SPOT + DS05 (plan movement adjudicated
+      via the plan channel).
+  - [x] **M0129-S9.1 — strictness catalog.** `isStrictOp(oid)` consulting
+      `pg_proc.proisstrict` replacing the hardcoded `isStrictCompareOp` set.
+      Generated `pgProcIsStrictByOID` map (3396 entries) via
+      `cmd/gen-pg-proc-data -names`; `IsStrictProc(oid)` in catalog;
+      `isStrictOp` in `reduce_outer_joins.go` resolves operator OID via
+      `LookupOperatorForNode` + column-type lookup from FROM-clause tables,
+      falling back to the token-based comparison-operator fast path when
+      types can't be resolved.
+  - [x] **M0129-S9.2 — ON-clause propagation.** Collect non-nullable rels from
+      `JoinExpr.On` clauses and propagate per join type (PG
+      `reduce_outer_joins_pass2`: inner merges with upper; outer passes
+      local to the nullable side, upper to the preserved side).
+  - [x] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
+      nullable-side columns).
+  - [x] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
+      PREREQUISITE: `parser.FromExpr` is a Base RangeVar +
+      flat `[]JoinExpr`, so the flip has no syntax tree to hang on; the
+      parser/AST nested-join representation IS PART OF THIS SUBTASK. If
+      scoping shows it breaks unrelated planner invariants, ledger the
+      strong reason instead of silently skipping.
+- [x] **M0129-S10 — `ExecError.Pos` → wire `FieldPosition`.** Ledger row
+      2026-08-06 M0127-PS6.2: goopg never emits the `FieldPosition` ('P')
+      error field for executor errors, so psql shows no `LINE n: … ^`
+      caret where PG shows one. Subtasks: at each `*executor.ExecError`
+      site in `internal/server/dispatch.go` pass
+      `protocol.ErrorField{Code: protocol.FieldPosition, Value:
+      strconv.Itoa(ee.Pos + 1)}` when `ee.Pos > 0` (`ExecError.Pos` is 0
+      when unset — the COPY path's `se.Pos >= 0` guard at
+      `internal/server/copy.go:729` relies on that type's -1 sentinel
+      instead; `writeQueryError` in
+      `internal/server/query.go` already takes variadic extra fields;
+      1-based precedent `internal/server/copy.go:729`); drop the
+      regress-runner normalisation
+      (`internal/testport/framework/regress.go:157`) and RE-BASELINE the
+      corpus (the M0106 six-silent-regressions precedent — the re-capture
+      is part of this task, not a follow-up); verify the caret in psql
+      with a failing expression. Bar: UNITS + regress suite re-baselined
+      and green + SPOT.
+
+**Order:** S1 → S2 → S3 → S6 → S10 → S4.1 → S4.2 → S5.1–S5.8 → S9.1–S9.4 →
+S8.1–S8.3, with two relaxations: **S7 may interleave any time the host is
+quiet** (a measurement, not an engine change) and **S6 may be taken before
+S3** (it subsumes S3's defect class). S4.2 is conditional on S4.1's
+measurement; S5.7 and S5.8 carry named blockers and follow the
+blocked-with-reason protocol (ledger row, never a silent skip).

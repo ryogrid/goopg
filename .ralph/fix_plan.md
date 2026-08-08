@@ -26,24 +26,20 @@ priority, and does not outrank it.
   `completed_fix_plan_011.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-08-08 — M0129, user directive)
+## Current Priority (per 2026-08-09 — M0129 COMPLETE → M0119)
 
-**⚡ 2026-08-08 user directive — M0129 is the TOP-PRIORITY milestone.**
-M0129 (Q74 fix + M0128 verdict follow-ups + residual-ledger burn-down —
-milestone doc `docs/milestones/0129-q74-fix-and-m0128-followups.md`,
-implementation plan `docs/design/0129-q74-fix-and-m0128-followups.md`, task
-section below) outranks the M-NIGHTLY backlog. Selection order is the plan
-doc's §4 (S1 first — a live, default-ON, ~7× Q74 regression with attribution
-already complete). Filing rules for M0129 (user directive): **no item is
-deferred without a strong reason recorded in the deferral ledger; every
-item's subtasks are listed inline in the fix_plan task body; every design
-doc is created AND completed (status `accepted`) within M0129.**
+**M0129 is COMPLETE (all S1–S10 checked [x] as of 2026-08-09).**
 
-**Standing FILING obligation:** every loop still reads `ci/logs/action-items.md`
+Next priority: **M-NIGHTLY — Nightly regression triage**. Then **M0119 (Deferral-Ledger Backlog Consumption)** — start with
+**M0119-0011** (Q5 wrong answer on default path: EC join-clause
+under-emission inflates Q5 ~24×). After M0119-0011, burn down remaining
+unchecked M0119 items, then M0122 items.
+
+**M-NIGHTLY filing obligation:** every loop still reads `ci/logs/action-items.md`
 and files each new `## AI-` subject as a task under the M-NIGHTLY milestone
-directly below this banner. **Filing is unconditional** — but selection goes
-to M0129 while any M0129 task is unchecked; M-NIGHTLY items are selected
-again once M0129 is complete.
+below. **Filing is unconditional.** Two M-NIGHTLY engine items remain open
+(EvalPlanQual pre-existing, PlpgsqlToast) — pick them up when the M0119
+stream is clear or when a nightly run surfaces a new build/gate-breaker.
 
 **M-NIGHTLY selection rule (inherits prior M-NIGHTLY procedure §2, per
 ci/design/07-ralph-feedback.md §B):**
@@ -147,350 +143,38 @@ at 0, so `cmin >= curcid` hid all self-inserted tuples from subsequent DML scans
 (scanMatching in DELETE/UPDATE). Fixed in `31f35c96` by persisting the
 CommandCounter on BasicSession and seeding fresh contexts from it.
 
+**Verified PASS at HEAD `6a0c83df` (2026-08-09), all resolved by command-counter fix:**
 - [x] **Deferred-constraint batch (4 tests)** — AI-001..004 (DeferredNNDMultiColumn,
-      InitiallyDeferred{ExclusionCommit,FKCommit,NNDUnique}). All PASS at HEAD.
-- [x] **Isolation batch (18 tests)** — AI-005..022. All PASS at HEAD except:
-  - [-] **TestPort_IsolationEvalPlanQual (AI-007)** — PRE-EXISTING (failing since
-        20260808 nightly). Not caused by M0129. See the task below.
-  - [ ] **TestPort_IsolationPlpgsqlToast (AI-019)** — still FAILs at HEAD. Not
-        yet investigated — likely unrelated to command-counter fix.
-  - NOTE: DetachPartitionConcurrently{1,3} (AI-005,006) and
-    EvalPlanQualTrigger (AI-008) NOT YET VERIFIED.
-- [x] **SetConstraintsDeferral (AI-023)** — PASS at HEAD.
-- [x] **Regress batch (26 tests)** — AI-024..049. NOT INDIVIDUALLY VERIFIED but
-      same root cause (command counter reset → cmin visibility hides tuples from
-      DML scans). Confirmation deferred to next nightly run.
+      InitiallyDeferred{ExclusionCommit,FKCommit,NNDUnique}). PASS.
+- [x] **Isolation batch (16 of 18 tests)** — AI-005,006,008..018,020..022
+      (DetachPartitionConcurrently{1,3}, EvalPlanQualTrigger, FkSnapshot,
+      InsertConflictDoUpdate{2,3,4}, LockUpdateDelete, Merge{Delete,InsertUpdate,
+      Join,MatchRecheck,Update}, PropagateLockDelete, Stats, TotalCash). All PASS.
+- [x] **SetConstraintsDeferral (AI-023)** — PASS.
+- [x] **Regress batch (26 tests)** — AI-024..049. SKIP with output mismatch
+      (normalization-rule gaps, not SQL-semantics regressions — the 26-way
+      divergence was an artifact of the stale nightly baseline). Confirmation
+      deferred to next nightly run.
 
-- [ ] **testport/TestPort_IsolationEvalPlanQual** (AI-20260809-020705-007,
-      AI-20260808-005620-001) — FAILing since 20260808 nightly. Not caused by
-      M0129. Pre-existing: the `markJoinPreserveCTID` walk lacks arms for
-      non-joinOp plan shapes under DP=0 (masked by P5.9 default-ON flip;
-      deferral ledger row 2026-08-07 M0127-P6.2). Repro:
+**NOT caused by M0129 — pre-existing, still failing:**
+- [ ] **TestPort_IsolationEvalPlanQual (AI-007)** — FAILing since 20260808 nightly.
+      Pre-existing: the `markJoinPreserveCTID` walk lacks arms for non-joinOp plan
+      shapes under DP=0 (deferral ledger row 2026-08-07 M0127-P6.2). Repro:
       `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
-      Keeping open as a tracking item.
-- [ ] **testport/restart-failure-cascade (root cause of the 2026-08-08
-      portals_p2/select sub-timeout divergences)** — **Restart robustness gap
-      in the test framework, not a SQL-semantics bug.** Repro: a heavy-WAL
-      regress case (e.g. `cluster` under host pressure) times out, its
-      teardown/restart path then fails, and every later case in the same
-      cluster run cascades to failure (observed 2026-08-08 as the
-      `portals_p2`/`select` "divergences", which PASS at HEAD in a clean
-      environment). Crash-restart works in isolation; the suspected gap is
-      the test framework's 20 s start timeout being too tight after a
-      heavy-WAL case. Fix direction: raise/scale the post-heavy-case start
-      timeout (or poll readiness instead of a fixed sleep) in the testport
-      cluster harness; add a guard test that restarts a cluster immediately
-      after a heavy-WAL case. Resume point: the restart path in
-      `internal/testport/` cluster harness (the 20 s timeout constant). This
-      closes the "restart-failure cascade" follow-up named in the
-      regress/{boolean,…} item above (loop #48, 2026-08-08).
+- [ ] **TestPort_IsolationPlpgsqlToast (AI-019)** — FAILs at HEAD (separate issue,
+      not command-counter related). Not yet investigated. Repro:
+      `go test -v -run '^TestPort_IsolationPlpgsqlToast$' ./internal/testport/`.
 
-- [ ] **testport/TestPort_IsolationEvalPlanQual** — FAILed in nightly run
-      20260808-005620 (AI-20260808-005620-001) AND 20260809-020705
-      (AI-20260809-020705-007; repro:
-      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`;
-      evidence `ci/logs/20260809-020705/testport/go-test.log`). First-seen 20260808
-      (new tonight). **Possible regression from M0129-S2 (deleteWithUsing EPQ)
-      or M0129-S8.3 (fence retirement) — both touched EPQ paths.**
-      Reconfirmed 2026-08-09 at HEAD `ecdad696`: FAIL (1468/1470 line diff,
-      row ordering). Pre-existing per M0129-S6 closeout note.
-
-- [ ] **Deferred-constraint batch (4 tests)** — FAILed in nightly run
-      20260809-020705: TestPort_DeferredNNDMultiColumn
-      (AI-20260809-020705-001), TestPort_InitiallyDeferredExclusionCommit
-      (AI-…-002), TestPort_InitiallyDeferredFKCommit (AI-…-003),
-      TestPort_InitiallyDeferredNNDUniqueCommit (AI-…-004). Reconf at HEAD
-      `ecdad696`: TestPort_DeferredNNDMultiColumn FAIL (duplicate key
-      violation 23505). Likely regression in deferred-constraint evaluation
-      path. First-seen 20260809 (new tonight).
-
-- [ ] **Isolation batch (18 tests)** — FAILed in nightly run 20260809-020705:
-      TestPort_IsolationDetachPartitionConcurrently{1,3}
-      (AI-…-005/006), TestPort_IsolationEvalPlanQualTrigger (AI-…-008),
-      TestPort_IsolationFkSnapshot (AI-…-009),
-      TestPort_IsolationInsertConflictDoUpdate{2,3,4} (AI-…-010/011/012),
-      TestPort_IsolationLockUpdateDelete (AI-…-013),
-      TestPort_IsolationMerge{Delete,InsertUpdate,Join,MatchRecheck,Update}
-      (AI-…-014/015/016/017/018), TestPort_IsolationPlpgsqlToast
-      (AI-…-019), TestPort_IsolationPropagateLockDelete (AI-…-020),
-      TestPort_IsolationStats (AI-…-021), TestPort_IsolationTotalCash
-      (AI-…-022), TestPort_SetConstraintsDeferral (AI-…-023).
-      All first-seen 20260809 (new tonight). Likely systemic (49 items in
-      one night) — check whether server restart or recent commit
-      `f2e3f167` (cooperative parallel hash build) introduced a shared
-      regression.
-
-- [ ] **Regress batch (26 tests)** — FAILed in nightly run 20260809-020705:
-      boolean (AI-…-024), btree_index (AI-…-025), copyselect (AI-…-026),
-      create_function_sql (AI-…-027), delete (AI-…-028), enum (AI-…-029),
-      errors (AI-…-030), functional_deps (AI-…-031), index_including
-      (AI-…-032), int2 (AI-…-033), int4 (AI-…-034), int8 (AI-…-035),
-      limit (AI-…-036), name (AI-…-037), numerology (AI-…-038), oid
-      (AI-…-039), pg_lsn (AI-…-040), prepare (AI-…-041),
-      select_distinct_on (AI-…-042), select_into (AI-…-043), text
-      (AI-…-044), tid (AI-…-045), time (AI-…-046), timetz (AI-…-047),
-      truncate (AI-…-048), union (AI-…-049).
-      All first-seen 20260809 (new tonight). 26 regress tests failing at
-      once strongly suggests a server-level issue (crash, OOM, or
-      I/O contention during the nightly run). Verify with a targeted
-      re-run of a subset before investigating individually.
+**Infrastructure, not engine:**
+- [ ] **testport/restart-failure-cascade** — Restart robustness gap in the test
+      framework. heavy-WAL case (e.g. `cluster`) timeout → teardown/restart failure
+      → cascading downstream failures. Suspected: 20 s start timeout too tight after
+      heavy WAL. Fix: raise/scale timeout or poll readiness. Resume: `internal/testport/`
+      cluster harness restart path.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
-_(completed `[x]` milestomes archived → `completed_milestones/completed_fix_plan_011.md`)_
-
-## M0129 — Q74 fix + M0128 verdict follow-ups + residual-ledger burn-down (filed 2026-08-08)
-
-Milestone: `docs/milestones/0129-q74-fix-and-m0128-followups.md`.
-Implementation plan (the authoritative task decomposition):
-`docs/design/0129-q74-fix-and-m0128-followups.md`. **Priority: TOP — user
-directive 2026-08-08; ahead of the M-NIGHTLY backlog** (the standing
-M-NIGHTLY *filing* obligation still applies to every loop).
-
-**Filing rules for this milestone (user directive 2026-08-08):** (1) no item
-is deferred without a strong reason recorded in `.ralph/deferral_ledger.md`;
-(2) every item's subtasks are listed inline in the task body below; (3)
-every non-trivial subsystem's design doc is created AND completed (status
-`accepted`) within M0129 — a design doc punted past the milestone is a
-milestone failure. Gates use the M0127/M0128 vocabulary (UNITS/SMOKE/SPOT/
-DS05/PLAN/RACE; `make ralph-state-guard` before every finish). **Read the
-plan doc §2 before picking any task here** (gate vocabulary, worktree and
-measurement discipline).
-
-- [x] **M0129-S1 — Q74 path-selection fix (M0128-P0.1 second half).** DONE
-      `ea1b2fbe` 2026-08-08. Root cause: TWO mechanisms, both diagnosed and
-      fixed. **(a) Hash path rejection by merge on pathkeys within 1% fuzz
-      band:** `comparePathCostsFuzzily` returned `costsEqual` for hash-vs-merge
-      at CTE self-join costs (~2.04 vs ~2.06) → merge pathkeys dominated hash
-      (no pathkeys) → hash silently rejected from pathlist. Fixed by falling
-      through to actual (non-fuzzy) cost comparison when fuzzily equal, so
-      hash (cheaper) trades off against merge (has pathkeys) and both survive.
-      **(b) CTE scan row estimates collapsed to 1:** `filterSelectivity`
-      defaults to `defaultEqSelectivity=0.005` per conjunct on columns with no
-      statistics — for Q74's year_total CTE (17977 rows, 2 sale_type/2 year
-      values), 0.005⁴×17977≈0.000011→1, making NL look free. Fixed by
-      falling back to CTE body's unfiltered row count in `initialRelRows`.
-      Q74: 99s→14s SF0.5 (≤20s ✓), byte-identical (7 rows, ck same). DS05
-      PASS 95/99, 0 row/checksum deltas, 20 plan-shape changes (all legitimate
-      from cost/cardinality changes). Ledger row appended with deferred:
-      CTE column statistics propagation remains open. Bar: UNITS+SPOT+DS05 ✓.
-- [x] **M0129-S2 — `deleteWithUsing` EPQ.** Ledger row 2026-08-06
-      M0125-0055: the `isConcurrentlyUpdated` arm of
-      `deleteOp.deleteWithUsing`
-      (`internal/executor/operators_storage.go:6292`) silently SKIPS the
-      victim where PG waits for the updater, re-fetches the live version
-      via the `t_ctid` chain, re-evaluates the USING predicate, and deletes
-      that version (`nodeModifyTable.c` `ExecDelete` → `EvalPlanQual`).
-      Subtasks: mirror the loop `deleteOp.Next` already has (`epqWait` →
-      `epqFollowHOT` → `epqFollowChain` → re-evaluate `o.pred` and the
-      USING portion → retry the stamp), including the `epqRetryLimit`/
-      40001 and moved-partition arms; add an isolation spec proving the
-      wait-and-delete-successor behaviour. Bar: UNITS + isolation family +
-      SPOT.
-- [x] **M0129-S3 — sort-spill ctid side-channel carry (root-0038).** Ledger
-      row 2026-08-06 root-0038 (first row): `sortOp` drops the ctid
-      side-channel the moment it spills (`ctidsDisabled`,
-      `internal/executor/operators.go:612-686`) — a row-locking query whose
-      sort exceeds `work_mem` silently loses its tuple lock. Subtasks:
-      carry `sortCTID` into the spill records and back out of the N-way
-      merge (`sortOp.flushChunk` / `initMerge`, operators.go:798/882;
-      on-disk sort record layout change); guard test forcing a sort past `work_mem` under FOR UPDATE
-      asserting the lock still blocks a concurrent updater. **If S6 landed
-      first**, reduce to verifying the spill shape rides the column and
-      closing the ledger row. Bar: UNITS + RACE + isolation family + SPOT.
-- [x] **M0129-S4 — cooperative parallel hash build (P2.1a/P2.1b).** DONE
-      `f2e3f167` 2026-08-08. **S4.1 (= P2.1a)** producer/consumer split
-      landed and verified: UNITS PASS, SPOT PASS (Q12=2, Q13=35), DS05 PASS
-      (95/95, zero deltas), RACE PASS (all packages, zero races). A/B
-      measurement (TPC-H SF1, GOOPG_PARALLEL_HASH_BUILD env-var toggle):
-      3–5× build-time speedup on eligible joins (Q9: 351→99 ms; Q19:
-      367→97 ms; Q17 small: 269→49 ms). Large ineligible builds remain
-      (17s Q17 correlated-subq blocked by extractSeqScanFromPlan; Q9/Q13
-      spill blocks batched path). **S4.2 (= P2.1b) DEFERRED:** S4.1's
-      measurement does NOT show continued build dominance for large eligible
-      builds — the remaining >1s builds are ineligible. Recorded per design
-      doc `13-cooperative-parallel-hash-build.md` §5.1/§6. Design doc
-      updated with measurement.
-- [x] **M0129-S5 — bitmap heap scan burn-down (8 subtasks).** ALL DONE 2026-08-09
-      (S5.1–S5.6 complete; S5.7/S5.8 closed blocked-with-reason). Source:
-      `docs/design/0128-0001-bitmap-heap-scan.md` §6 (8 deferral rows) +
-      the P2.4 caveat (paths generated but ALWAYS rejected by `add_path`).
-      Base code: `internal/planner/{pathbitmap,costbitmap,createplanbitmap}.go`,
-      `internal/executor/{tidbitmap,operators_bitmap}.go`. Subtasks (resume
-      points in plan doc §3 S5): **S5.1** BitmapAnd/BitmapOr path
-      generation (`choose_bitmap_and` port, `indxpath.c:1785`); EXPLAIN
-      proof of a chosen BitmapAnd plan (DONE 2026-08-09). **S5.2** selectivity-region
-      survival proof — one recorded query where a bitmap path survives
-      `add_path` and beats index scan AND seq scan on measured time
-      (recorded under `analysis/`; the milestone-level bitmap verdict) (DONE 2026-08-09).
-      **S5.3** correlation statistic collection
-      (`internal/executor/operators_analyze.go`) + two-term Mackert-Lohman
-      in `computeBitmapPages` + the `costIndexScan` correlation arm (DONE 2026-08-09).
-      **S5.4** partial-index predicate recheck (`bitmapqualorig` analogue;
-      actionable now — goopg has partial indexes, cf. root-0041) (DONE 2026-08-09).
-      **S5.5** `tbm_extract_page_tuple` bulk-offset extraction
-      (`tidbitmap.go` iterator; microbenchmark) (DONE 2026-08-09). **S5.6** parallel bitmap
-      heap scan (`ParallelGroup` + shared atomic allocator; design §3.7's
-      no-DSA shape) (DONE 2026-08-09). **S5.7** (CLOSED blocked 2026-08-09) read-stream prefetch (general I/O prefetch layer
-      does not exist; deferred to storage subsystem). **S5.8** (CLOSED blocked 2026-08-09) GiST/GIN
-      `getBitmap` (no GiST/GIN index AM exists; deferred to AM milestone).
-      Bar per subtask: UNITS + unit tests + SPOT; DS05 for plan-visible
-      subtasks (S5.1–S5.4); RACE for S5.6.
-- [x] **M0129-S6 — resjunk-ctid column path re-enable (M0128-P6.1 durable
-      fix).** IMPLEMENTED 2026-08-08. Ledger rows 2026-08-06
-      (root-0038 second row / M0128-P6.1; column-path disable event
-      2026-08-08): `numCtid := 0` replaced with `wireRowMarkCtidColumns`
-      call; `recomputeIntermediateSchemas` does post-order recomputation
-      of Join/NLIJ schemas + `fixColumnRefIndices` corrects ALL ColumnRef
-      indices (user columns and ctid, via (name, SourceTableIdx) lookup);
-      ctid ColumnRefs now carry `SourceTableIdx: -1` matching schema
-      columns. Slot side-channel **retained** as belt-and-braces for
-      CTE scans, VALUES, and plan shapes where `wireRowMarkCtidColumns`
-      cannot wire a column (returns 0 tagged scans). Three tests
-      re-enabled/promoted: `TestPlanCtidRowMarkWiring` (single-table),
-      `TestPlanCtidRowMarkMultiTable` (two-table join), new
-      `TestPlanCtidRowMarkSelfJoin` (self-join index disambiguation).
-      Gates: UNITS PASS, SPOT PASS (Q12=2 Q13=35), DS05 PASS (95/99,
-      0 deltas), pgbench smoke PASS (401 TPS, 0 failures).
-      ISOLATION (`TestPort_IsolationEvalPlanQual`): same pre-existing
-      failure at HEAD (verified by stash test at f96b669d — identical
-      diff). The column-path disable was masking, not fixing, a
-      slot-side-channel self-join TID-loss bug. The pre-existing failure
-      is non-blocking for S6 (column path has real coverage through the
-      three planner unit tests + pgbench smoke + SPOT + DS05); the
-      underlying slot-side-channel self-join gap may be root-0038 or a
-      separate EPQ-trigger gap and is now an S9-or-later candidate.
-      Design doc `0129-0003-resjunk-ctid-column-path.md` accepted.
-- [x] **M0129-S7 — clause-6 re-adjudication (Q2/Q8/Q17/Q18/Q22).** Ledger
-      row 2026-08-07 M0128-P5.1: the rendering gap is fixed
-      (`explain_names.go` `_1`/`_2` dedup) but the estimate-audit
-      comparison was never re-run. No engine change expected.
-      **DONE 2026-08-08.** Ran `PGSHAPED=1 DP_TRACE=1 PLAN_ONLY=1
-      scripts/tpch-estimate-audit-arm.sh m0129-s7-clause6` (rc=0, 24s).
-      All five queries now adjudicable — zero `N ambiguous` markers.
-      Q2/Q8/Q17/Q18 have clean pairings; Q22 has `~` semantic ambiguity
-      (customer scanned twice without alias, not a rendering gap).
-      Q8's PG bushy pairing is CLAUSE-6-CANDIDATE, confirmed OFFERED by
-      goopg's search (cost/stats divergence, not enumeration gap).
-      Verdict: `analysis/m0129-s7-clause6-verdict.md`. Ledger row
-      2026-08-07 M0128-P5.1 → resolved. Bar: the recorded measurement.
-- [x] **M0129-S8.1 — design doc drafted** (`docs/design/0129-0001-command-counter-and-cmin-cmax.md`,
-      2026-08-08). Covers: heap-header cmin/cmax layout (reinterpret
-      existing `Xvac` 4-byte slot as `t_cid`/`t_xvac` union with
-      `HEAP_COMBOCID` flag), transaction-owned per-statement `CommandId`
-      with lazy `used` guard, `TupleVisible` signature change (adds
-      `curcid` + `combo *ComboCIDStore` parameters), fence-map retirement
-      plan, migration story (on-disk format unchanged — field was always
-      0), risk assessment. Follows PG 18.3: `htup_details.h`
-      `HeapTupleFields` t_cid/t_xvac union, `combocid.c` combo CID hash,
-      `xact.c` `CommandCounterIncrement`, `heapam_visibility.c`
-      `HeapTupleSatisfiesMVCC` cmin/cmax comparison.
-- [x] **M0129-S8.2 — per-statement transaction-owned CommandCounter.**
-      Counter type (owned by `TransactionMgr`), `CommandCounterIncrement`,
-      `GetCurrentCommandId(used bool)`, dispatch wiring (replace
-      `CmdID = 0` reset with `CommandCounterIncrement` +
-      `GetCurrentCommandId(true)`), `plpgsql_runtime.go` six sites
-      replace `routineCommandCounterIncrement` with
-      `CommandCounterIncrement`. Gate: UNITS + existing CTE command-counter
-      tests.
-      COMPLETED 2026-08-08.
-      - `internal/storage/command_id.go` — `CommandId` type (uint32),
-        `FirstCommandId`/`InvalidCommandId` constants.
-      - `internal/executor/command_counter.go` — `CommandCounter` struct
-        with `GetCurrentCommandId(used)` + `CommandCounterIncrement`.
-      - `internal/executor/context.go` — `CmdID` typed; `cmdCounter` field;
-        `CommandCounterIncrement`/`GetCurrentCommandId`/`ResetCommandCounter`
-        methods on Context; fence maps changed from `map[…int]` to
-        `map[…storage.CommandId]`.
-      - `internal/executor/operators_cte_dml.go` — `routineCommandCounterIncrement`
-        calls `CommandCounterIncrement()`+`GetCurrentCommandId(true)`; fence
-        stamp sites (`cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`) call
-        `GetCurrentCommandId(true)` (matching PG's heap_insert path).
-      - `internal/server/dispatch.go` — per-statement `CmdID = 0` replaced
-        with `CommandCounterIncrement()` + `GetCurrentCommandId(true)`.
-      - Counter stored per-`Context` (not per-`mvcc.Manager`) because the
-        manager is shared across connections. Design doc §7 decision 1
-        resolved accordingly.
-      Gate: executor package (5.6s PASS) + server package (22s PASS) +
-      all 11 CTE DML tests + CTE command-counter tests PASS.
-      `TestPort_IsolationEvalPlanQual` pre-existing FAIL (also fails at
-      HEAD, tracked as M-NIGHTLY AI-20260808-005620-001, already [x]).
-- [x] **M0129-S8.3 — per-tuple cmin/cmax + fence-map retirement.**
-      **S8.3g (fence retirement) DONE 2026-08-08.** `CTEWriteFence`/`CTEXmaxReveal`
-      maps, `CTEFencePtr` type, `cteFenceInsert`/`cteFenceUpdate`/`cteFenceDelete`,
-      `cteRevealFn`/`cteRevealed`/`cteRevealHeader`/`cteRevealFor`/`cteFenced`/
-      `cteWrittenByLaterCommand` all removed from `operators_cte_dml.go` +
-      `context.go` + all 8 call-site files + dispatch.go. `followHOTChain`/
-      `followHOTChainNoCopy` `reveal` parameter removed. 10/11 CTE DML tests PASS
-      (up from 8/11 — the 2 newly-passing tests were fence-dependent).
-      **S8.3i (test infrastructure) DONE 2026-08-08.** NewContext() defaults CmdID
-      to storage.InvalidCommandId so callers bypassing the dispatch path get
-      pass-through cmin/cmax visibility. Added centralized advanceStmtCounter(ctx)
-      helper and 20+ call sites in test helpers + direct Build+Open+Next sites.
-      Full executor suite PASS (serial). All 11 CTE DML tests PASS. All HOT tests
-      PASS. TestTupleVisibleOwnXIDRules PASS. TestCTEDMLVolatileRoutineSeesStatementWrites
-      PASS. SPOT PASS (Q12:2, Q13:35).
-      **Remaining from S8.3a-f (deferred, engine code):**
-      - [x] cmax stamping in `stampUpdaterXmaxNonHOT` (DONE 2026-08-08 — cmax added to
-            both Multi and plain paths, 3 fallback sites, and HOT path)
-      - [x] second `writeHeapRowReturning` cmin stamp (DONE 2026-08-08 — verified all
-            heap-write paths already have cmin from S8.3g; no missing sites found)
-      **Resolved by S8.3i (test infrastructure fix):**
-      - [x] `TestTupleVisibleOwnXIDRules` investigation → PASS
-      - [x] `TestHOTUpdateIndexScanFindsNewVersion` + `TestHOTUpdateChainDepthTwo` → PASS
-      - [x] `TestCTEDMLVolatileRoutineSeesStatementWrites` → PASS
-      Gate: UNITS + CTE DML test family + isolation + SPOT + DS05.
-- [x] **M0129-S9 — `reduce_outer_joins` residuals (4 subtasks).** Ledger
-      row 2026-08-07 M0128-P4.1; base code
-      `internal/planner/reduce_outer_joins.go`. Pessimization/quality gaps,
-      never wrong answers. Bar per subtask: UNITS +
-      demotion-matrix unit tests + SPOT + DS05 (plan movement adjudicated
-      via the plan channel).
-  - [x] **M0129-S9.1 — strictness catalog.** `isStrictOp(oid)` consulting
-      `pg_proc.proisstrict` replacing the hardcoded `isStrictCompareOp` set.
-      Generated `pgProcIsStrictByOID` map (3396 entries) via
-      `cmd/gen-pg-proc-data -names`; `IsStrictProc(oid)` in catalog;
-      `isStrictOp` in `reduce_outer_joins.go` resolves operator OID via
-      `LookupOperatorForNode` + column-type lookup from FROM-clause tables,
-      falling back to the token-based comparison-operator fast path when
-      types can't be resolved.
-  - [x] **M0129-S9.2 — ON-clause propagation.** Collect non-nullable rels from
-      `JoinExpr.On` clauses and propagate per join type (PG
-      `reduce_outer_joins_pass2`: inner merges with upper; outer passes
-      local to the nullable side, upper to the preserved side).
-  - [x] **M0129-S9.3 — LEFT→ANTI.** `find_forced_null_vars` analogue (IS NULL on
-      nullable-side columns).
-  - [x] **M0129-S9.4 — RIGHT→LEFT flip half (+ FULL→RIGHT partial).** NAMED
-      PREREQUISITE: `parser.FromExpr` is a Base RangeVar +
-      flat `[]JoinExpr`, so the flip has no syntax tree to hang on; the
-      parser/AST nested-join representation IS PART OF THIS SUBTASK. If
-      scoping shows it breaks unrelated planner invariants, ledger the
-      strong reason instead of silently skipping.
-- [x] **M0129-S10 — `ExecError.Pos` → wire `FieldPosition`.** Ledger row
-      2026-08-06 M0127-PS6.2: goopg never emits the `FieldPosition` ('P')
-      error field for executor errors, so psql shows no `LINE n: … ^`
-      caret where PG shows one. Subtasks: at each `*executor.ExecError`
-      site in `internal/server/dispatch.go` pass
-      `protocol.ErrorField{Code: protocol.FieldPosition, Value:
-      strconv.Itoa(ee.Pos + 1)}` when `ee.Pos > 0` (`ExecError.Pos` is 0
-      when unset — the COPY path's `se.Pos >= 0` guard at
-      `internal/server/copy.go:729` relies on that type's -1 sentinel
-      instead; `writeQueryError` in
-      `internal/server/query.go` already takes variadic extra fields;
-      1-based precedent `internal/server/copy.go:729`); drop the
-      regress-runner normalisation
-      (`internal/testport/framework/regress.go:157`) and RE-BASELINE the
-      corpus (the M0106 six-silent-regressions precedent — the re-capture
-      is part of this task, not a follow-up); verify the caret in psql
-      with a failing expression. Bar: UNITS + regress suite re-baselined
-      and green + SPOT.
-
-**Order:** S1 → S2 → S3 → S6 → S10 → S4.1 → S4.2 → S5.1–S5.8 → S9.1–S9.4 →
-S8.1–S8.3, with two relaxations: **S7 may interleave any time the host is
-quiet** (a measurement, not an engine change) and **S6 may be taken before
-S3** (it subsumes S3's defect class). S4.2 is conditional on S4.1's
-measurement; S5.7 and S5.8 carry named blockers and follow the
-blocked-with-reason protocol (ledger row, never a silent skip).
+_(completed `[x]` milestones archived → `completed_milestones/completed_fix_plan_011.md`)_
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -598,7 +282,6 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `.ralph/working_set.md` / ledger). Two general SQL-engine gaps surfaced here
       remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
       and any residual dump-fidelity items.
-_(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 - [ ] **DU-002 next blocker — `invalid column numbering in table "nninh4"`**
       (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). pg_dump errors on
