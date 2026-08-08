@@ -3510,8 +3510,7 @@ func tryApplyHOTUpdate(
 		}
 		return false, nil // fall back to delete+insert; caller re-checks
 	}
-
-	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
 		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
@@ -6070,6 +6069,27 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			}
 		}
 		used := false
+		// TM_SelfModified guard: before attempting HOT (which skips
+		// the non-HOT path where the concurrent-modification check
+		// lives), verify that the old tuple wasn't already stamped
+		// by our own transaction through a different sub-command
+		// (e.g. a function called from a CTE's RETURNING clause).
+		// Do a quick RLock probe — the HOT path does its own
+		// Pin+Lock later. M0129-S2.
+		{
+			if ts, tsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk}); tsErr == nil {
+				ts.RLock()
+				if tsTup, tsGerr := storage.PageGetHeapTuple(ts.Page(), pu.slot); tsGerr == nil {
+					if tsTup.Header.Xmax != storage.InvalidTransactionID && tsTup.Header.Xmax == o.ctx.Tx.XID {
+						ts.RUnlock()
+						o.ctx.Pool.Unpin(ts)
+						return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+					}
+				}
+				ts.RUnlock()
+				o.ctx.Pool.Unpin(ts)
+			}
+		}
 		if hotEligible && puSrcRel == rel && puRel == rel {
 			var err error
 			used, err = tryApplyHOTUpdate(o.ctx, rel, tgtCols, pu.blk, pu.slot, pu.newRow)
@@ -6181,6 +6201,16 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				// above and never reach here).
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
+				// TM_SelfModified guard: isConcurrentlyUpdated already ruled
+				// out a foreign xmax, but the tuple may carry our own xmax
+				// from a different sub-command (e.g. a function called from a
+				// CTE's RETURNING clause). A live tuple has xmax=Invalid; a
+				// stale HOT-updated tuple has a foreign xmax (aborted). Only
+				// our own xmax here means a different sub-command already
+				// modified this tuple. M0129-S2.
+				if oldTup.Header.Xmax != storage.InvalidTransactionID && oldTup.Header.Xmax == o.ctx.Tx.XID {
+					return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+				}
 			}
 			var oldTupleBytes []byte
 			s, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})

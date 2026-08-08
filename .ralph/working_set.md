@@ -1,52 +1,36 @@
-Task: M-NIGHTLY AI-007 EvalPlanQual — partial fix (delwctefail ERROR now fires; updwctefail still missing)
+Task: M-NIGHTLY AI-007 EvalPlanQual — partial fix, updwctefail still not erroring
 
 Files:
-- internal/mvcc/visibility.go: `TupleVisible` — fixed xmax==currentXID check:
-  cmax >= curcid → pre-image visible (was: unconditionally invisible).
-  Matches PG's HeapTupleSatisfiesMVCC.
-- internal/mvcc/subxact_visibility.go: `TupleVisibleSubxact` — same fix for
-  the subxact-aware variant.
-- internal/executor/operators_storage.go: `deleteWithUsing` — added
-  TM_SelfModified check inside the EPQ chain-following path (truncated
-  comment site at ~L6509). After epqFollowHOT/epqFollowChain resolves the
-  new slot, re-pins and checks cmax against curcid. Different CID →
-  errTupleAlreadyModified("deleted"); same CID → epqSkipDel.
+- internal/executor/operators_storage.go: `updateWithFrom` — two TM_SelfModified checks added:
+  1. pre-HOT RLock probe (before HOT attempt, catches HOT-path bypass)
+  2. non-EPQ else branch (after isConcurrentlyUpdated returns false)
 
-Key symbols: TupleVisible, TupleVisibleSubxact, deleteWithUsing,
-  errTupleAlreadyModified, GetCmax
+Key symbols: updateWithFrom, tryApplyHOTUpdate, errTupleAlreadyModified, isConcurrentlyUpdated
 
 Hypothesis/Findings:
-- Root cause (visibility): TupleVisible unconditionally returned false for
-  xmax==currentXID, hiding the pre-image that PG shows (cmax >= curcid →
-  visible). The DELETE's scanMatching never collected the checking row
-  because every version was invisible.
-- Root cause (missing TM_SelfModified): the EPQ chain-following code had a
-  truncated comment "// TM_SelfModified guard: the chain can lead into a
-  version a" — the check was never implemented. After following the EPQ
-  chain to our own transaction's version, the code went straight to
-  predicate re-evaluation without checking whether a different sub-command
-  (function call from CTE RETURNING) had stamped a different cmax.
-- updateWithFrom (updwctefail) needs the same fix but the insertion point
-  is different (no epqRetry loop; the check goes after the re-pin before
-  stamping). Attempted twice but caused regression in line count — needs
-  more careful placement.
-- The parser defaults CREATE FUNCTION to Volatile="v", so
-  inferSQLFunctionVolatility is never called for typical user functions.
-  The command counter DOES advance for function calls — confirmed via
-  server log showing cmax values differing from curcid.
+- delwctefail NOW errors (confirmed by previous loop's 1458→1462 improvement).
+  My changes did not regress this (verified: line count stable at 1462).
+- updwctefail STILL does NOT error (1462 vs 1468 expected, 6 lines short).
+  The TM_SelfModified checks added to updateWithFrom (pre-HOT probe + non-EPQ
+  else branch) are NOT reached during the test. Root cause unknown — the
+  checking row's xmax at the probed slot is not our XID, or the code path
+  through scanMatching→pending→HOT/non-HOT does not encounter the pre-image
+  tuple. The test permutation is multi-session (wx1 updwctefail c1 c2 read),
+  so the EPQ wait+retry may alter the tuple state before my checks run.
+- A third check was attempted inside tryApplyHOTUpdate (serena) but was
+  reverted — it used position 0 for the error, and adding a `pos` parameter
+  to the shared helper would be needed for a clean fix there.
 
-Next step: Add TM_SelfModified check to updateWithFrom EPQ path (after
-  isConcurrentlyUpdated else branch + re-pin, before oldTupleBytes).
-  Then verify both delwctefail and updwctefail permutations raise errors.
+Next step: Debug why the updateWithFrom TM_SelfModified checks aren't reached.
+Add server-side logging to trace the tuple's xmax at the pre-HOT RLock probe
+and at the non-EPQ else branch. The EPQ chain resolution (after wx1 commits)
+may route the update to a different slot where xmax is Invalid.
 
 Gates run:
-- `go build ./internal/executor/... ./internal/mvcc/...`: PASS
-- `go test ./internal/executor/...`: PASS (6.018s)
-- EvalPlanQual repro: improved 1458→1462 lines (delwctefail now errors)
-  but still FAIL (1462 vs 1468 expected; updwctefail still missing)
+- `go build ./internal/executor/...`: PASS
+- `go test ./internal/executor/...`: PASS (6.077s)
 - `scripts/tpch-spotcheck.sh`: PASS (Q12=2, Q13=35)
 - `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`: PASS
   (0 failed, all 3 workloads)
-- `make ralph-state-guard`: REPAIRED (consistent after repair)
 
 In-flight: none
