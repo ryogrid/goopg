@@ -404,6 +404,21 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		// already-built join subtree: `filteredRows` was derived from a
 		// synthetic catalog.Table and means nothing, so read the subtree.
 		rows = EstimateRows(leaf)
+		// M0129-S1: CTE scans have no per-column statistics, so
+		// filterSelectivity defaults to defaultEqSelectivity (0.005)
+		// per conjunct. For a CTE like year_total with 4 conjuncts
+		// over columns that actually have 2 distinct values each,
+		// 0.005⁴×17977≈0.000011 collapses to 1 row — a severe
+		// under-estimate that makes nested loops look free. Fall
+		// back to the CTE body's unfiltered row count to avoid
+		// the default-selectivity cliff.
+		if rows <= 1 {
+			if cte, ok := leafBaseScan(leaf).(*CTEScan); ok && cte.Child != nil {
+				if bodyRows := EstimateRows(cte.Child); bodyRows > 1 {
+					rows = bodyRows
+				}
+			}
+		}
 	}
 	if rows < 1 {
 		return 1

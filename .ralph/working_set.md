@@ -1,37 +1,21 @@
-Task: M0122-0003 — Add GENERIC_PLAN, WAL, MEMORY EXPLAIN options to parser
+(idle — nothing in flight)
 
-Files:
-  - internal/parser/ast.go: added GenericPlan, Wal, Memory fields to
-    ExplainOptions + ExplainOptionsSet
-  - internal/parser/parser.go: added cases for "generic_plan", "wal",
-    "memory" in parseExplainOneOption
-  - internal/parser/explain_options_test.go: updated AllOptions test,
-    added TestParseExplainGenericPlan/Wal/Memory
-  - internal/executor/operators_explain.go: GENERIC_PLAN notice when
-    no generic plan is available (matches PG behavior)
+All priority milestones through M0128 (M0124/M0125/M0127/M0128/M0123) are
+CLOSED. **M0129 (Q74 fix + M0128 verdict follow-ups + residual-ledger
+burn-down) is FILED and is the TOP-PRIORITY milestone** (user directive
+2026-08-08 — see the Current Priority banner). Milestone doc:
+`docs/milestones/0129-q74-fix-and-m0128-followups.md`; implementation plan:
+`docs/design/0129-q74-fix-and-m0128-followups.md`.
 
-Key symbols: ExplainOptions, ExplainOptionsSet, parseExplainOneOption,
-explainOp.Open
+Next step: **M0129-S1 — Q74 path-selection fix** (attribution done in
+M0128-P0.1; resume at `addPathsToJoinrel`, internal/planner/joinpaths.go:139;
+subtasks S1.1 diagnose → S1.2 fix → S1.3 pin, per the fix_plan task body).
+The standing M-NIGHTLY filing obligation (read `ci/logs/action-items.md`,
+file new AI items) still applies each loop. All existing M-NIGHTLY items are
+[x] (the 20260808-005620 EPQ/Q95 pair confirmed stale at HEAD); the remaining
+unchecked non-M0129 items belong to deferred milestones (M0122, M0119,
+M0110, M0095) parked per the banner.
 
-Hypothesis/Findings:
-  - PG 18 supports GENERIC_PLAN, WAL, and MEMORY EXPLAIN options that
-    goopg rejected as "unknown EXPLAIN option"
-  - Parser change is the minimum viable improvement — tools that use
-    these options (e.g. EXPLAIN (GENERIC_PLAN)) no longer error
-  - GENERIC_PLAN gets a NOTICE "generic plan is not available" matching
-    PG's behavior when no plan cache entry exists
-  - WAL and MEMORY are parsed but produce no extra output yet —
-    executor tracking for WAL record counts and per-node memory is
-    deferred to follow-up loops
-
-Next step: Consider next M0122-0003 subtask (EXPLAIN WAL record
-tracking or per-node MEMORY reporting), or triage next M-NIGHTLY run
-
-Gates run:
-  - go test -run TestParseExplain ./internal/parser/ PASS (18 tests)
-  - go test -run TestExplain ./internal/executor/ PASS
-  - go build ./... clean
-  - RALPH_PRECOMMIT_SCOPE=smoke PASS (0 failed, 3 workloads)
-  - make ralph-state-guard PASS (auto-repaired, consistent)
+Gates run: make ralph-state-guard OK (auto-repaired status/progress inconsistency)
 
 In-flight: none

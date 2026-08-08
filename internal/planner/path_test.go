@@ -37,9 +37,17 @@ func TestComparePathCostsFuzzily_Incomparable(t *testing.T) {
 }
 
 func TestComparePathCostsFuzzily_WithinFuzzIsEqual(t *testing.T) {
-	// 100 vs 100.5 is within the 1% band on total; startups equal.
-	if got := comparePathCostsFuzzily(costPath(0, 100), costPath(0, 100.5), stdFuzzFactor); got != costsEqual {
-		t.Fatalf("within-fuzz costs should be equal, got %v", got)
+	// 100 vs 100.5 is within the 1% band on total, but 100 < 100.5 so
+	// the actual-cost fallback returns costsBetter1. The fallback was
+	// added for M0129-S1 to prevent hash paths being silently rejected
+	// when costs land inside the fuzz band (the hash-vs-merge tiebreak).
+	// Truly identical costs still return costsEqual.
+	if got := comparePathCostsFuzzily(costPath(0, 100), costPath(0, 100.5), stdFuzzFactor); got != costsBetter1 {
+		t.Fatalf("within-fuzz costs with actual diff should return costsBetter1, got %v", got)
+	}
+	// 100 vs 100 is truly equal (not just fuzzily) — still costsEqual.
+	if got := comparePathCostsFuzzily(costPath(0, 100), costPath(0, 100), stdFuzzFactor); got != costsEqual {
+		t.Fatalf("identical costs should be equal, got %v", got)
 	}
 }
 
