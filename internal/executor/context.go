@@ -589,8 +589,9 @@ type Context struct {
 	// M0129-S8.2: CmdID is now the pinned es_output_cid for this statement,
 	// backed by cmdCounter which owns the authoritative transaction-wide state.
 	// See command_counter.go.
-	CmdID      storage.CommandId
-	cmdCounter CommandCounter
+	CmdID         storage.CommandId
+	cmdCounter    CommandCounter
+	cmdCounterExt *CommandCounter // external (session-owned) pointer; used when set
 	// comboCIDStore is the per-connection combo CID store, mirroring
 	// PostgreSQL's comboCids hash+array. It maps (cmin, cmax) pairs to
 	// synthetic combo CID numbers for tuples both inserted and deleted
@@ -920,11 +921,24 @@ func (c *Context) backendPID() string {
 	return c.ActivityPID
 }
 
+// SetCmdCounter replaces the context's command counter with an external
+// (session-owned) pointer so that a fresh per-message Context shares the
+// transaction's counter state. When set, GetCurrentCommandId,
+// CommandCounterIncrement, and ResetCommandCounter operate on the external
+// counter directly, keeping the session in sync. M0129-S8.3.
+func (c *Context) SetCmdCounter(ext *CommandCounter) {
+	c.cmdCounterExt = ext
+}
+
 // CommandCounterIncrement advances this context's command counter, matching
 // PostgreSQL's CommandCounterIncrement() in xact.c. The counter only advances
 // when GetCurrentCommandId(true) has been called, so read-only statements do
 // not consume command ids. M0129-S8.2.
 func (c *Context) CommandCounterIncrement() {
+	if c.cmdCounterExt != nil {
+		c.cmdCounterExt.CommandCounterIncrement()
+		return
+	}
 	c.cmdCounter.CommandCounterIncrement()
 }
 
@@ -932,13 +946,20 @@ func (c *Context) CommandCounterIncrement() {
 // When used is true, it marks the counter so the NEXT
 // CommandCounterIncrement actually advances. M0129-S8.2.
 func (c *Context) GetCurrentCommandId(used bool) storage.CommandId {
+	if c.cmdCounterExt != nil {
+		return c.cmdCounterExt.GetCurrentCommandId(used)
+	}
 	return c.cmdCounter.GetCurrentCommandId(used)
 }
 
 // ResetCommandCounter resets the command counter to FirstCommandId (0).
 // Used in tests and when a new transaction begins on a recycled Context.
 func (c *Context) ResetCommandCounter() {
-	c.cmdCounter.Reset()
+	if c.cmdCounterExt != nil {
+		c.cmdCounterExt.Reset()
+	} else {
+		c.cmdCounter.Reset()
+	}
 	c.CmdID = storage.FirstCommandId
 }
 

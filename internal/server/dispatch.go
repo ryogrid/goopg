@@ -317,6 +317,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if connTx != nil {
 		if sess := connTx.Session(); sess != nil {
 			ectx.Session = sess
+			// M0129-S8.3: seed the fresh context's command counter from
+			// the session so it persists across simple-query messages
+			// within the same explicit transaction. Without this, every
+			// message starts at curcid=0 and self-inserted tuples are
+			// hidden from the next message's DML scans (cmin >= curcid).
+			ectx.SetCmdCounter(sess.CmdCounter())
 		} else {
 			// Autocommit implicit batch (no explicit BEGIN): still give
 			// execCreateTable/execCreateIndex a *BasicSession to record
