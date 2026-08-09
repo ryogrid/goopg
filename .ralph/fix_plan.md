@@ -204,8 +204,8 @@ Theme A — Cluster directory format compatibility:
 
 Theme B — WAL fidelity verification (B5 landed 2026-07-18/19; these tasks audit + add gates):
 - [x] **M0130-S4 — B5 verification: index/attrdef native WAL kinds** (est ~1 loop). Kinds 20/21/94/69 already retired at HEAD (commit `eb88b8a2`); grep-verify zero emit sites remain; add regression gate. Design: `docs/design/0130-0004-b5-index-and-attrdef-retirement.md`. **DONE (2026-08-09).**
-- [ ] **M0130-S5 — B5 verification: view/matview native WAL kinds** (est ~1 loop). Kinds 102/103 already retired at HEAD (commit `2697504f`); grep-verify zero emit sites; confirm standby DDL replay. Design: `docs/design/0130-0005-b5-view-matview-retirement.md`.
-- [ ] **M0130-S6 — Verify zero rmid-128 emitted; document keep-classify-arms** (est ~1 loop). Zero goopg-catalog WAL records emitted at HEAD; `RmgrGoopgCatalog` constant deliberately kept for non-catalog kinds (ledger #415). Add regression gate + document decision. Design: `docs/design/0130-0006-rmgr-goopg-catalog-retirement.md`.
+- [x] **M0130-S5 — B5 verification: view/matview native WAL kinds** (est ~1 loop). Kinds 102/103 already retired at HEAD (commit `2697504f`); grep-verify zero emit sites; confirm standby DDL replay. Design: `docs/design/0130-0005-b5-view-matview-retirement.md`. **DONE (2026-08-09).**
+- [x] **M0130-S6 — Verify zero rmid-128 emitted; document keep-classify-arms** (est ~1 loop). Zero goopg-catalog WAL records emitted at HEAD; `RmgrGoopgCatalog` constant deliberately kept for non-catalog kinds (ledger #415). Add regression gate + document decision. Design: `docs/design/0130-0006-rmgr-goopg-catalog-retirement.md`. **DONE (2026-08-09).**
 - [ ] **M0130-S7 — WAL fidelity audit: xl_prev 0-based + atomic heap-update** (est ~1 loop). xl_prev already fixed at HEAD (`writer.go` −1 conversion, ledger #29); audit atomic heap-update completeness (ledger #27). Design: `docs/design/0130-0007-wal-record-fidelity-xlprev-atomic-update.md`.
 
 Theme C — Physical replication PG compatibility:
