@@ -2947,6 +2947,10 @@ const (
 	// AlterTableDetachPartition — `DETACH PARTITION child`.
 	// Removes a table from its partition parent. M0097-0028.
 	AlterTableDetachPartition
+	// AlterTableAddExclude — `ADD [CONSTRAINT name] EXCLUDE USING method
+	// (col WITH op) [INCLUDE (cols)]`. Creates an exclusion constraint backed
+	// by an index. DU-002.
+	AlterTableAddExclude
 	// AlterTableDropConstraint — `DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 	// For PK constraints, checks view→constraint dependencies before dropping.
 	// M0097-0036 (functional_deps).
@@ -3196,6 +3200,7 @@ type AlterTableAction struct {
 	RefColumns []string
 	Deferrable        bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 	InitiallyDeferred bool     // true if `INITIALLY DEFERRED` (implies Deferrable); DU-002
+	NullsNotDistinct  bool     // true if `NULLS NOT DISTINCT` for UNIQUE constraint; DU-002
 	OnDelete          FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
 	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
@@ -3308,6 +3313,16 @@ type AlterTableAction struct {
 	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
 	// table-level, ColumnName unused). DU-002 slice 419/420.
 	FDWOptionChanges []FDWOptionChange
+
+	// ExclusionOp is the per-column operator for AlterTableAddExclude
+	// (e.g. "=", "&&", "~=~"). DU-002.
+	ExclusionOp string
+	// ExclusionMethod is the index access method for AlterTableAddExclude
+	// (e.g. "btree", "gist", "spgist"). DU-002.
+	ExclusionMethod string
+	// ExclusionWhere is the optional WHERE predicate for a partial EXCLUDE
+	// constraint. nil when absent. DU-002.
+	ExclusionWhere Expr
 
 	// AlterConstraint* fields are populated for AlterTableAlterConstraint
 	// (`ALTER CONSTRAINT name ...`); ConstraintName holds the target

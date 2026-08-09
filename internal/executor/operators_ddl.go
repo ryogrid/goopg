@@ -7513,6 +7513,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterTableAddUnique(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAddExclude:
+			if err := o.execAlterTableAddExclude(tbl, act); err != nil {
+				return err
+			}
 		case parser.AlterTableAddForeignKey:
 			// v0 accepts the syntax for HammerDB TPC-H
 			// compatibility but does not enforce referential
@@ -9461,6 +9465,8 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+		idx.Deferrable = act.Deferrable
+		idx.InitiallyDeferred = act.InitiallyDeferred
 	}
 	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard). PG18 also
 	// materialises that implication as a contype='n' `<table>_<col>_not_null`
@@ -9687,16 +9693,68 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false, nil, nil); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, act.NullsNotDistinct, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+		idx.NullsNotDistinct = act.NullsNotDistinct
 		// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
 		// pg_constraint re-emit the clause on dump. DU-002.
 		idx.Deferrable = act.Deferrable
 		idx.InitiallyDeferred = act.InitiallyDeferred
+	}
+	return nil
+}
+
+// execAlterTableAddExclude handles `ALTER TABLE t ADD [CONSTRAINT name]
+// EXCLUDE USING method (col WITH op) [INCLUDE (cols)] [WHERE (pred)]`.
+// Mirrors the CREATE TABLE path for EXCLUDE constraints. DU-002.
+func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if len(act.Columns) == 0 {
+		return nil // nothing to do
+	}
+	name := act.ConstraintName
+	if name == "" {
+		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "excl")
+	}
+	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
+	method := act.ExclusionMethod
+	if method == "" {
+		method = "btree"
+	}
+	if act.ExclusionOp == "=" && strings.ToLower(method) == "btree" {
+		// btree equality exclusion ≈ unique constraint: build a real
+		// btree so checkExclusionConstraintsForInsert can probe it.
+		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil); err != nil {
+			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			idx.IsExclusion = true
+			idx.ExclusionOp = "="
+			idx.IncludeColumns = act.IncludeColumns
+			idx.IsConstraint = true
+			idx.Deferrable = act.Deferrable
+			idx.InitiallyDeferred = act.InitiallyDeferred
+			applyExclusionPredicate(idx, act.ExclusionWhere)
+		}
+	} else {
+		// Other exclusion operators: stub catalog entry; no enforcement in v0.
+		ec := parser.TableConstraintDef{
+			Name:             name,
+			Columns:          act.Columns,
+			IsExclusion:      true,
+			ExclusionOp:      act.ExclusionOp,
+			Method:           method,
+			IncludeColumns:   act.IncludeColumns,
+			Deferrable:       act.Deferrable,
+			InitiallyDeferred: act.InitiallyDeferred,
+			ExclusionWhere:   act.ExclusionWhere,
+		}
+		if err := o.createExclusionIndexStub(act.Pos(), idxName, tbl, ec); err != nil {
+			return err
+		}
 	}
 	return nil
 }

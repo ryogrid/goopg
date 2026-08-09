@@ -816,6 +816,79 @@ func TestParseAlterTableAddUniqueDeferrable(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddExclude pins ALTER TABLE ADD [CONSTRAINT name]
+// EXCLUDE USING method (col WITH op) [INCLUDE (cols)] [DEFERRABLE ...].
+// pg_dump emits this for EXCLUDE constraints. DU-002.
+func TestParseAlterTableAddExclude(t *testing.T) {
+	cases := []struct {
+		in             string
+		wantName       string
+		wantOp         string
+		wantMethod     string
+		wantCols       []string
+		wantDefer      bool
+		wantDeferred   bool
+	}{
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =)", "", "=", "btree", []string{"a"}, false, false},
+		{"ALTER TABLE t ADD CONSTRAINT ex EXCLUDE USING btree (a WITH =)", "ex", "=", "btree", []string{"a"}, false, false},
+		{"ALTER TABLE t ADD EXCLUDE USING gist (c WITH &&)", "", "&&", "gist", []string{"c"}, false, false},
+		{"ALTER TABLE t ADD CONSTRAINT exdef EXCLUDE USING gist (c WITH &&)", "exdef", "&&", "gist", []string{"c"}, false, false},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) DEFERRABLE", "", "=", "btree", []string{"a"}, true, false},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED", "", "=", "btree", []string{"a"}, true, true},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) INITIALLY DEFERRED", "", "=", "btree", []string{"a"}, true, true},
+		{"ALTER TABLE t ADD CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED", "ex", "=", "btree", []string{"a"}, true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("Parse(%q): got %d statements", c.in, len(stmts))
+			continue
+		}
+		alt, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Errorf("Parse(%q): expected AlterTableStmt, got %T", c.in, stmts[0])
+			continue
+		}
+		if len(alt.Actions) != 1 {
+			t.Errorf("Parse(%q): got %d actions", c.in, len(alt.Actions))
+			continue
+		}
+		act := alt.Actions[0]
+		if act.Kind != AlterTableAddExclude {
+			t.Errorf("Parse(%q): expected AlterTableAddExclude, got %v", c.in, act.Kind)
+			continue
+		}
+		if act.ConstraintName != c.wantName {
+			t.Errorf("Parse(%q): ConstraintName=%q want %q", c.in, act.ConstraintName, c.wantName)
+		}
+		if act.ExclusionOp != c.wantOp {
+			t.Errorf("Parse(%q): ExclusionOp=%q want %q", c.in, act.ExclusionOp, c.wantOp)
+		}
+		if act.ExclusionMethod != c.wantMethod {
+			t.Errorf("Parse(%q): ExclusionMethod=%q want %q", c.in, act.ExclusionMethod, c.wantMethod)
+		}
+		if len(act.Columns) != len(c.wantCols) {
+			t.Errorf("Parse(%q): Columns=%v want %v", c.in, act.Columns, c.wantCols)
+		} else {
+			for i := range act.Columns {
+				if act.Columns[i] != c.wantCols[i] {
+					t.Errorf("Parse(%q): Columns[%d]=%q want %q", c.in, i, act.Columns[i], c.wantCols[i])
+				}
+			}
+		}
+		if act.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, act.Deferrable, c.wantDefer)
+		}
+		if act.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, act.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

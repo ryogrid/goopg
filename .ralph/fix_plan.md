@@ -309,8 +309,16 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       decoder was never consulted. Fix: swap decoder order — physical first,
       logical as fallback. Same fix applied to pg_class match closure
       (same class of bug). The nninh4 column-numbering error is now gone;
-      remaining DU-002 gap is the multi-database catalog-isolation item
-      (text search template not found).
+      remaining DU-002 gap is constraint-trigger parsing
+      (`CREATE CONSTRAINT TRIGGER ... NOT DEFERRABLE INITIALLY IMMEDIATE`).
+    - [x] **DU-002: EXCLUDE in ALTER TABLE ADD CONSTRAINT** — **FIXED (2026-08-09, this loop).**
+      Root cause: `parseAlterTableAction` had no case for EXCLUDE keyword; fell
+      through to default → `AlterTableNoOp`. Added `AlterTableAddExclude` kind,
+      `ExclusionOp`/`ExclusionMethod`/`ExclusionWhere` fields, EXCLUDE case in
+      parser, and `execAlterTableAddExclude` in executor. Also fixed two sibling
+      gaps found by the same test run: `NULLS NOT DISTINCT` after UNIQUE and
+      `DEFERRABLE` after PRIMARY KEY in ALTER TABLE ADD CONSTRAINT path.
+      Parser test: `TestParseAlterTableAddExclude` (8 cases).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

@@ -9339,6 +9339,10 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				}
 			}
 		}
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		// pg_dump emits `PRIMARY KEY (col) DEFERRABLE INITIALLY DEFERRED`
+		// for constraints whose condeferrable/condeferred are set. DU-002.
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 		// ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
@@ -9481,6 +9485,15 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.
 		// M0097-0023.
 		p.advance()
+		// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+		// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
+		// (col)` when the flag is set). DU-002.
+		if p.acceptIdentKeyword("nulls") {
+			act.NullsNotDistinct = p.acceptKeyword(KwNot)
+			if !p.acceptKeyword(KwDistinct) {
+				_ = p.acceptIdentKeyword("distinct")
+			}
+		}
 		if !(p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using")) || !(p.acceptKeyword(KwIndex) || p.acceptIdentKeyword("index")) {
 			// Normal UNIQUE (cols) form.
 			if p.acceptSymbol("(") {
@@ -9515,6 +9528,20 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// for constraints whose condeferrable/condeferred are set. DU-002.
 		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
 		act.Kind = AlterTableAddUnique
+		return act, nil
+	case p.acceptIdentKeyword("exclude"):
+		// ADD [CONSTRAINT name] EXCLUDE USING method (col WITH op)
+		// [INCLUDE (cols)] [WHERE (pred)] — create an exclusion
+		// constraint. DU-002.
+		cdef := p.parseExcludeConstraint()
+		act.Columns = cdef.Columns
+		act.IncludeColumns = cdef.IncludeColumns
+		act.ExclusionOp = cdef.ExclusionOp
+		act.ExclusionMethod = cdef.Method
+		act.ExclusionWhere = cdef.ExclusionWhere
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+		act.Kind = AlterTableAddExclude
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
 		// ADD [CONSTRAINT name] NOT NULL col [NO INHERIT] — PG18 named NOT NULL
