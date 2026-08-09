@@ -12970,6 +12970,35 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 	return nil
 }
 
+
+	// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
+	// The caller (execDropCompat) has already validated the extension exists and
+	// captured its OID for heap cleanup.
+	func (c *InMemory) DropExtension(name string) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.extensions, strings.ToLower(name))
+	}
+
+	// CreateExtensionDuringRecovery re-registers an extension at startup from the
+	// pg_extension heap (M0130-S3). Unlike CreateExtension (which mints a new OID
+	// via nextOID++), this records the pg_extension-derived OID verbatim so the
+	// reloaded extensions match their on-disk OIDs.
+	func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database string, oid uint32) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		lc := strings.ToLower(name)
+		if _, ok := c.extensions[lc]; ok {
+			return // already registered
+		}
+		c.extensions[lc] = &extensionRow{
+			oid:      oid,
+			name:     name,
+			schema:   schema,
+			version:  version,
+			database: database,
+		}
+	}
 // ExtensionOID returns the runtime pg_extension OID for the named extension, or
 // 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
 // key the pg_description row on the extension's catalog OID (classoid 3079) so

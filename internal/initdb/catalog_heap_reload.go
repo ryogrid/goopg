@@ -2645,3 +2645,46 @@ func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 	}
 	return nil
 }
+
+// reloadUserExtensionsFromHeap (M0130-S3) is the pg_extension reload —
+// reads base/*/3079 to reconstruct the in-memory runtime extension registry
+// after a restart. Each row maps onto the catalog extensionRow.
+func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	extCols := executor.PGExtensionColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3079, Fork: storage.MainFork}
+	type extRec struct {
+		oid     uint32
+		name    string
+		schema  string
+		version string
+		dbName  string
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_extension",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(extCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, extCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			nsOID := uint32(decoded[3].Int)
+			schema := cat.SchemaNameForOID(nsOID)
+			if schema == "" {
+				schema = "public"
+			}
+			return extRec{
+				oid:     uint32(decoded[0].Int),
+				name:    decoded[1].StringValue(),
+				schema:  schema,
+				version: decoded[5].StringValue(),
+				dbName:  "", // database is per-catalog reload scope
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(extRec)
+		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, "", r.oid)
+	}
+	return nil
+}

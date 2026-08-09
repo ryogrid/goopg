@@ -2149,6 +2149,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
+
+	// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
+	// heap so installed extensions are visible after a restart.
+	if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
+	}
 		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
 	}
 	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {

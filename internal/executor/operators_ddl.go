@@ -255,8 +255,19 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// M0130-S3: journal the extension as a real pg_extension heap row
+	// so it survives restart and is visible on a PG standby.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		extOID := im.ExtensionOID(s.Name)
+		nsOID := im.SchemaOID(schema)
+		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
+			return fmt.Errorf("pg_extension journal: %w", err)
+		}
+	}
 	return nil
-}
+	}
+
+	// execDropExtension handles DROP EXTENSION [IF EXISTS] name.
 
 // inPlaceTablespacesEnabled reports the session-effective
 // allow_in_place_tablespaces GUC. Defaults to false when no GetSetting hook is
@@ -9231,6 +9242,20 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
 	}
+	// M0130-S3: sync the new column set to the pg_attribute heap so a
+	// PG standby (and a goopg restart) see the added column. Same
+	// delete-old-rows + re-sync pattern as every other ALTER TABLE path.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
 	// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
 	// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
 	// so the commit-time xact-marker hook unlinks + regenerates
@@ -15789,6 +15814,26 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return nil
 				}
 			}
+		case "extension":
+			// M0130-S3: DROP EXTENSION stamps xmax on the pg_extension
+			// heap row so the drop survives restart.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				name := s.Names[0].String()
+				extOID := im.ExtensionOID(name)
+				if extOID == 0 {
+					if s.IfExists {
+						o.ctx.AddNotice(fmt.Sprintf("extension %q does not exist, skipping", name))
+						return nil
+					}
+					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("extension %q does not exist", name)}
+				}
+				im.DropExtension(name)
+				if catalogHeapSyncAvailable(o.ctx) {
+					deleteExtensionCatalogRow(o.ctx, extOID)
+				}
+				return nil
+			}
+
 		case "event trigger":
 			// Drop the dump-visible pg_event_trigger registry entry (DU-002,
 			// M0119-0004) so a dropped event trigger stops round-tripping
