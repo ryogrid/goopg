@@ -43,7 +43,8 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_encoding", Type: TypeString, BootVal: "UTF8",
 		Context: ContextUserset, Flags: FlagReport,
-		Scope: ScopeSession | ScopeTransaction,
+		Scope:   ScopeSession | ScopeTransaction,
+		CheckFn: checkClientEncoding,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "DateStyle", Type: TypeString, BootVal: "ISO, MDY",

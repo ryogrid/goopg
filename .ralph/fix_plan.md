@@ -602,10 +602,18 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       validation landed this loop (M0122-0008: ValidServerEncodingName +
       extractEncodingRawFromSQL + catalog.databaseEncoding storage + heap-row override).
       **Genuinely remaining:** (1) channel binding — blocked on TLS infrastructure
-      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) runtime encoding constraints
-      beyond CREATE DATABASE (client_encoding GUC validation, bootstrap encoding
-      enforcement, locale↔encoding mismatch checks — the catalog/storage layer doesn't
-      do actual encoding conversion).
+      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) bootstrap encoding
+      enforcement + locale↔encoding mismatch checks (the initdb/catalog layer
+      doesn't do actual encoding conversion).
+      **client_encoding GUC validation landed (2026-08-09, this loop):**
+      SET client_encoding TO 'INVALID' now raises 22023 (invalid_parameter_value).
+      Added CheckFn callback to config.Variable; checkClientEncoding resolves the
+      value against the PG 18.3 pg_enc2name_tbl (42 canonical names + alias table),
+      accepting all valid encodings including client-only ones (SJIS, BIG5, GBK,
+      etc.) since client_encoding is per-connection. Encoding table duplicated in
+      config/encoding_guc.go (config is a leaf package; import cycle prevents
+      sharing). Tests: TestClientEncodingValidation (guc_test.go) +
+      TestEncodingTableIntegrity (encoding_guc_test.go).
       **RBAC for INSERT/UPDATE/DELETE landed (2026-07-05, this loop,
       M0097-0040):** `dmlPrivilegePermitted` (`internal/executor/
       operators_storage.go`) checks the existing `tableACLs`/

@@ -1,51 +1,41 @@
-Task: M0122-0007 verification + M0122-0008 encoding validation (COMPLETE this loop)
+Task: M0122-0008 client_encoding GUC validation (LANDED)
 
 Files:
-- internal/catalog/encoding.go: Added ValidServerEncodingName(name string) int32 +
-  pgEncodingBELast constant (34 = PG_KOI8U)
-- internal/catalog/catalog.go: Added databaseEncoding map[string]int32 +
-  DatabaseEncoding/SetDatabaseEncoding methods + DropDatabase cleanup
-- internal/catalog/conversion_test.go: Added TestValidServerEncodingName
-- internal/server/database_ddl.go: Added createDatabaseEncodingRe regex,
-  extractEncodingRawFromSQL, databaseEncodingRegistry interface; encoding
-  validation in tryHandleDatabaseDDL (ValidateServerEncodingName rejection);
-  dbEncodingID threaded through SetDatabaseEncoding + syncPgDatabaseHeapRow
-- internal/executor/sys_pg_database.go: encodingOverride int32 param added
-  to SyncPgDatabaseCatalogRow + clonePgDatabaseRowForCreate (overrides
-  template encoding in pg_database heap row ordinal 3)
-- .ralph/fix_plan.md: M0122-0007 marked [x] COMPLETE; M0122-0008 status
-  updated with actual remaining items
+- internal/config/guc.go: Added CheckFn func(string) error to Variable struct;
+  called in canonicalizeFrom TypeString case
+- internal/config/encoding_guc.go: New — pgEncNames (42-entry encoding name table),
+  pgEncAliases, cleanEncName, encodingNameToCanonical, checkClientEncoding
+- internal/config/encoding_guc_test.go: New — TestEncodingTableIntegrity
+- internal/config/guc_test.go: Added TestClientEncodingValidation
+- internal/config/defaults.go: Registered CheckFn: checkClientEncoding for
+  client_encoding GUC
+- .ralph/fix_plan.md: M0122-0008 status updated
 
 Key symbols:
-- ValidServerEncodingName(name) int32 — validates encoding is known + server-safe
-- extractEncodingRawFromSQL(sql) (string, bool) — parses ENCODING option from raw SQL
-- databaseEncodingRegistry (SetDatabaseEncoding) — new interface on catalog
-- SyncPgDatabaseCatalogRow(..., encodingOverride int32) — new param
-- clonePgDatabaseRowForCreate(..., encodingOverride int32) — new param
+- Variable.CheckFn func(string) error — optional post-canonicalisation hook
+- checkClientEncoding(value) error — validates against PG 18.3 pg_enc2name_tbl
+- encodingNameToCanonical(name) string — cleaned-name resolution + aliases
 
 Hypothesis/Findings:
-- M0122-0007 is actually COMPLETE: all three "remaining" items (physical storage
-  isolation, WITH FORCE, REINDEX CONCURRENTLY) were already implemented in prior
-  loops but the fix_plan checkbox was stale.
-- M0122-0008: most items landed in prior loops. This loop added CREATE DATABASE
-  encoding validation (name-to-ID resolution + server-encoding validity check +
-  catalog storage + heap-row override). Genuinely remaining: channel binding
-  (blocked on TLS) and deeper encoding constraints (client_encoding GUC
-  validation, locale↔encoding mismatch checks — goopg doesn't do actual
-  encoding conversion).
+- client_encoding GUC already existed (ContextUserset, FlagReport) but had
+  zero validation — any arbitrary string was accepted
+- CheckFn is the minimal mechanism; full assign/check hooks (PG's check_assign/
+  check_client_encoding) would be overengineered for one GUC
+- Encoding table is duplicated in config (leaf package) to avoid importing
+  catalog; the table is an immutable PG constant, guarded by
+  TestEncodingTableIntegrity
 
 Next step:
-- Per priority banner: M0119 then M0122. M0119-0005/0006/0007 are blocked/huge.
-  M0122-0009 (MultiXact WAL) is multi-loop. M0122-0010 (Lehman/Yao) is multi-loop.
-  Most actionable: M0122-0008 channel binding (if TLS infrastructure is built)
-  or broader encoding enforcement (client_encoding GUC validation).
+- Per priority banner: M0130 is COMPLETE, M0119 is next but M0119-0005/0006/0007
+  are blocked/huge. Most tractable remaining M0122-0008 item: bootstrap encoding
+  enforcement (validate --encoding flag in initdb). Channel binding still blocked
+  on TLS.
 
 Gates run:
 - go build ./internal/...: OK
-- go test ./internal/catalog/...: PASS (TestValidServerEncodingName PASS)
-- go test ./internal/server/...: PASS (all database DDL tests PASS)
+- go test ./internal/config/...: PASS (all tests incl. new)
+- go test ./internal/server/...: PASS
+- go test ./internal/catalog/...: PASS
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, 408263 txns, 13609 tps)
-- ralph-state-guard: REPAIRED (in_progress)
 
 In-flight: none
