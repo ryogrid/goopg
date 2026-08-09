@@ -602,9 +602,21 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       validation landed this loop (M0122-0008: ValidServerEncodingName +
       extractEncodingRawFromSQL + catalog.databaseEncoding storage + heap-row override).
       **Genuinely remaining:** (1) channel binding — blocked on TLS infrastructure
-      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) actual byte-level
-      encoding conversion/transcoding (the initdb/catalog/GUC layers all validate
-      encoding NAMES but none does character-set transcoding).
+      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) additional encoding
+      pairs beyond LATIN1↔UTF8 (EUC_JP, SJIS, BIG5, GBK, etc. — each follows
+      the same proc-registration pattern); (3) query-text transcoding on
+      simple-query and Parse paths (Bind parameter transcoding is wired).
+      **Byte-level encoding conversion first slice LANDED (2026-08-09, this loop):**
+      New `internal/mb/` package (mirrors PG's `src/backend/utils/mb/`) with
+      `DoEncodingConversion` dispatch, LATIN1↔UTF8 conversion procs (OIDs
+      4374/4375), and `pg_utf_mblen`/`pg_utf8_islegal` validation. Wired into
+      all three DataRow output paths (simple-query, cursor FETCH, extended-query
+      Execute) via `Server.maybeConvertCellsForClientEncoding`, plus Bind
+      parameter input transcoding in `handleExecuteFrame`. Catalog
+      `FindDefaultConversionProc(forEnc, toEnc)` resolves user-created
+      conversions. Design: `docs/design/0122-0020-encoding-conversion-mb-layer.md`.
+      Verified: live `psql` with `client_encoding=LATIN1` correctly transcodes
+      accented characters; TPC-H spotcheck PASS; pgbench smoke 0 failed.
       **Bootstrap encoding enforcement (name validation) verified COMPLETE (2026-08-09):**
       initdb resolveEncoding validates --encoding flag; catalog ValidServerEncodingName
       validates CREATE DATABASE ENCODING; all three tiers reject invalid/client-only

@@ -377,7 +377,13 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 		toSend = int(maxRows)
 	}
 	for i := 0; i < toSend; i++ {
-		if err := w.WriteDataRow(res.Rows[portal.RowPos+i]); err != nil {
+		row := res.Rows[portal.RowPos+i]
+		getSetting := func(name string) (string, bool) {
+			_, val, ok := sess.Get(name)
+			return val, ok
+		}
+		row = s.maybeConvertCellsForClientEncoding(row, getSetting)
+		if err := w.WriteDataRow(row); err != nil {
 			return nil, err
 		}
 	}

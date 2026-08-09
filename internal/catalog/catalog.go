@@ -13531,6 +13531,31 @@ func (c *InMemory) ListUserConversionsForDBOid(dbOid uint32) []*UserConversion {
 	return out
 }
 
+// FindDefaultConversionProc returns the proc OID for the default conversion
+// between forEnc and toEnc, searching user-created conversions (CREATE
+// CONVERSION). Built-in conversion pairs (the 128 bootstrap rows seeded by
+// initdb) are resolved at the executor level via mb.BuiltinLookup, which
+// matches the known proc OIDs. Mirrors PG's FindDefaultConversion
+// (namespace.c:4083 → pg_conversion.c:152, CONDEFAULT syscache scan).
+// The caller resolves the returned OID to an mb.ConvProc.
+func (c *InMemory) FindDefaultConversionProc(forEnc, toEnc int32, dbOid ...uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	resolveDBOid := DefaultDBOid
+	if len(dbOid) > 0 {
+		resolveDBOid = dbOid[0]
+	}
+	// Walk in reverse so later-created conversions shadow earlier ones.
+	for i := len(c.userConversions) - 1; i >= 0; i-- {
+		uc := c.userConversions[i]
+		if uc.ForEncoding == forEnc && uc.ToEncoding == toEnc &&
+			uc.Default && uc.DBOid == resolveDBOid {
+			return uc.FuncOID, true
+		}
+	}
+	return 0, false
+}
+
 // PGConversionRowsForDBOid builds the pg_conversion catalog row-set for
 // dbOid's own registered user conversions (built-in conversions all live in
 // pg_catalog and are filtered out at pg_dump dump-out time, so there is no

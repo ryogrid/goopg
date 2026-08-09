@@ -216,9 +216,8 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "code_audit": "narrowed 2026-07-12: two of the three bundled sub-features are already fully implemented and wired. SASLprep: internal/auth/saslprep.go + saslprep_tables.go is a straight port of postgres/src/common/saslprep.c (RFC 4013), applied at both scramBuildSecret call sites (scram.go:88 password->secret, scram.go:180 verify) via saslPrepOrOriginal. scram_iterations GUC: registered (config/defaults.go:184, BootVal 4096) and honored on the live password-set path -- role_ddl.go:320 NewSCRAMSecretWithIterations(resolveScramIterations(...)) reads the calling session's live GUC, so SET scram_iterations=N changes PBKDF2 cost of newly-set passwords. Also hardened the SCRAM exchange this loop: handleClientFinal now verifies the c= gs2-cbind-flag echoes the SAME flag sent in client-first ('n'->\"n,,\", 'y'->\"y,,\"), matching auth-scram.c read_client_final_message:211 (was accepting either spelling -- a downgrade-tamper gap). Still-open residual: channel binding PROPER (SCRAM-SHA-256-PLUS / tls-server-end-point) is architecturally blocked -- goopg has no TLS; server.go:1211 transparently REJECTS SSLRequest, so no channel-binding data exists to bind. Unblocks only when TLS termination lands. See deferral_ledger.md.",
-   "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-08: scram_iterations GUC is now consulted — auth.NewSCRAMSecretWithIterations (internal/auth/scram.go) + role_ddl.go's resolveScramIterations read the live session GUC for CREATE/ALTER ROLE PASSWORD (fix_plan.md M0122-0008, docs/design/root-0021-role-auth-persistence.md). SASLprep (RFC 4013) also landed 2026-07-08: internal/auth/saslprep.go ports pg_saslprep byte-for-byte (mechanically-extracted tables in saslprep_tables.go, NFKC via golang.org/x/text/unicode/norm), wired into NewSCRAMSecretWithIterations/VerifySCRAMSecretFromPassword, differential-tested against a real libpq client (TestE2E_SASLPrepMatchesRealLibpqClient); see docs/design/0049-0003-scram-sha-256.md §3.1. Still confirmed-open: scram.go:279-289 channel binding explicitly rejected"
+   "code_audit": "partially-resolved 2026-07-08: scram_iterations GUC is now consulted — auth.NewSCRAMSecretWithIterations (internal/auth/scram.go) + role_ddl.go's resolveScramIterations read the live session GUC for CREATE/ALTER ROLE PASSWORD (fix_plan.md M0122-0008, docs/design/root-0021-role-auth-persistence.md). SASLprep (RFC 4013) also landed 2026-07-08: internal/auth/saslprep.go ports pg_saslprep byte-for-byte (mechanically-extracted tables in saslprep_tables.go, NFKC via golang.org/x/text/unicode/norm), wired into NewSCRAMSecretWithIterations/VerifySCRAMSecretFromPassword, differential-tested against a real libpq client (TestE2E_SASLPrepMatchesRealLibpqClient); see docs/design/0049-0003-scram-sha-256.md §3.1. Still confirmed-open: scram.go:279-289 channel binding explicitly rejected",
+   "confidence": "high"
   },
   {
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
@@ -3709,7 +3708,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "PARTIAL (2026-08-09): encoding NAME validation fully implemented at all three tiers (initdb resolveEncoding, catalog ValidServerEncodingName for CREATE DATABASE, config checkClientEncoding for GUC); pg_client_encoding() and getdatabaseencoding() builtins now return correct values through executor dispatch; actual byte-level transcoding between character sets remains unimplemented — goopg stores and forwards raw bytes without conversion"
+   "code_audit": "PARTIAL (2026-08-09): First slice landed — LATIN1↔UTF8 conversion wired into all DataRow output paths. Remaining: additional encoding pairs, query-text transcoding."
   },
   {
    "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",

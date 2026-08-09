@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/mb"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -3056,6 +3057,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
+			cells = s.maybeConvertCellsForClientEncoding(cells, ctx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				_ = op.Close()
 				return err
@@ -3468,6 +3470,46 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 	}
 }
 
+// maybeConvertCellsForClientEncoding transcodes each non-nil DataRow cell from
+// server encoding (UTF8) to client_encoding when the two differ. The conversion
+// uses mb.BuiltinLookup (the 128 bootstrap pg_conversion rows); user-created
+// CREATE CONVERSION entries are not yet consulted. A conversion failure falls
+// back to the raw server-encoding bytes (noError semantics — a malformed
+// character in one cell should not break the whole result set).
+// M0122-0008: encoding conversion first slice (LATIN1 ↔ UTF8).
+func (s *Server) maybeConvertCellsForClientEncoding(cells [][]byte, getSetting func(string) (string, bool)) [][]byte {
+	encName, ok := getSetting("client_encoding")
+	if !ok || encName == "" {
+		return cells
+	}
+	encName = strings.ToUpper(encName)
+	if encName == "UTF8" || encName == "UNICODE" {
+		return cells
+	}
+	// Resolve encoding name to PG encoding ID via the catalog table.
+	// catalog.EncodingNameToID returns -1 for unknown names.
+	clientEnc := catalog.EncodingNameToID(encName)
+	if clientEnc < 0 {
+		return cells
+	}
+	// SQL_ASCII means no conversion.
+	if clientEnc == 0 {
+		return cells
+	}
+	for i, cell := range cells {
+		if cell == nil {
+			continue
+		}
+		converted, err := mb.DoEncodingConversion(cell, mb.PG_UTF8, clientEnc, mb.BuiltinLookup)
+		if err != nil {
+			// Fall back to raw bytes on conversion failure (noError).
+			continue
+		}
+		cells[i] = converted
+	}
+	return cells
+}
+
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.
 // Uses strconv.FormatFloat so large/small values display in scientific notation
 // appendFloatText formats a datum for wire output using the specified bitSize (32 or 64).
@@ -3791,6 +3833,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 				valueBuf = d.AppendValueText(valueBuf)
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
+			cells = s.maybeConvertCellsForClientEncoding(cells, ectx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				return err
 			}
