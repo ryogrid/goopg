@@ -19337,6 +19337,39 @@ func (c *InMemory) SetAmProcMemberProc(oid, newProcOID uint32) bool {
 	return false
 }
 
+// LookupOpClassSupportProcOID resolves the pg_amproc.amproc OID of support
+// function number procNum for the *user-created* operator class named
+// opClassName under access method methodOID — PG's
+// `get_opfamily_proc(opclass's opcfamily, opcintype, opcintype, procNum)`
+// (utils/cache/lsyscache.c), the lookup `_bt_first`/amcheck perform to find an
+// index's BTORDER_PROC (procNum 1) comparator.
+//
+// It reads the live amProcMembers store, so a runtime
+// `UPDATE pg_catalog.pg_amproc SET amproc = ...` (nextVirtualPgAmproc →
+// SetAmProcMemberProc) is observed immediately — that is the corruption-injection
+// mechanism pg_amcheck's 005_opclass_damage.pl relies on. Built-in (BKI-pinned)
+// operator classes are deliberately NOT covered: their comparators are the
+// engine's own key encoding, not a catalog-resolved function.
+// M0119-0006 (005_opclass_damage).
+func (c *InMemory) LookupOpClassSupportProcOID(opClassName string, methodOID, procNum uint32) (uint32, bool) {
+	var classOID uint32
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.Name == opClassName {
+			classOID = uoc.OID
+			break
+		}
+	}
+	if classOID == 0 {
+		return 0, false
+	}
+	for _, m := range c.ListAmProcMembers() {
+		if m.ClassOID == classOID && m.ProcNum == procNum && m.ProcOID != 0 {
+			return m.ProcOID, true
+		}
+	}
+	return 0, false
+}
+
 // amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"
 // (see AccessMethodOIDByName below) — the only two in-tree access methods
 // whose amadjustmembers override (gistvalidate.c gistadjustmembers,

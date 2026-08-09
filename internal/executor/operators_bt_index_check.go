@@ -131,7 +131,8 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 		return page, nil
 	}
 
-	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck)
+	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck,
+		btIndexOpClassComparator(idx, im, ctx, x.Pos()))
 	if err != nil {
 		// A genuine read error (not a corruption finding) maps to internal error.
 		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: err.Error()}
@@ -149,7 +150,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 // returns every finding (so the SQL surface can report the count, mirroring how
 // the standalone realtree test exercises the same tiers). It returns a Go error
 // only for a genuine page-read failure, never for a corruption finding.
-func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool) ([]amcheck.BtreeReport, error) {
+func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator) ([]amcheck.BtreeReport, error) {
 	var reports []amcheck.BtreeReport
 
 	// Per-page tiers over every block, including the metapage (block 0).
@@ -159,7 +160,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			return nil, err
 		}
 		reports = append(reports, amcheck.VerifyBtreePage(p, blk, name)...)
-		reports = append(reports, amcheck.VerifyBtreeItemOrder(p, blk, name)...)
+		reports = append(reports, amcheck.VerifyBtreeItemOrderCmp(p, blk, name, cmpKeys)...)
 	}
 
 	// A tree with only the metapage (an empty index, or none) has no key levels
@@ -197,6 +198,96 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 		}
 	}
 	return reports, nil
+}
+
+// btIndexOpClassComparator returns the operator-class key comparator to verify
+// idx under, or nil to use the engine's built-in key-byte order.
+//
+// Upstream amcheck always compares through the index's support function 1
+// (BTORDER_PROC, resolved from pg_amproc for the index's opclass) — see
+// _bt_compare / _bt_mkscankey in nbtutils.c, which verify_nbtree.c builds its
+// BTScanInsert from. goopg's B-tree is key-encoding based, so a *built-in*
+// opclass has no catalog function to call and nil (btree.CompareKeys) is the
+// faithful answer: the encoding IS that opclass's order.
+//
+// A *user-created* class (CREATE OPERATOR CLASS … USING btree … FUNCTION 1 f)
+// does name a real comparator, and pg_amcheck's 005_opclass_damage.pl injects
+// corruption by repointing exactly that pg_amproc row at a function that sorts
+// the other way. Verifying under the catalog-resolved function is what makes the
+// physically-unchanged index then report `item order invariant violated`.
+//
+// Scope (this slice): a single-key-column index on an int4 column whose declared
+// opclass resolves to a user routine. That is 005_opclass_damage's shape, and it
+// is the only one whose stored key bytes can be inverted back to the SQL datum
+// the function expects (btree.DecodeInt4). Wider coverage needs a general
+// encoded-key → Datum decoder per type; see the deferral ledger.
+// M0119-0006.
+func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Context, pos int) amcheck.KeyComparator {
+	if len(idx.Columns) != 1 || len(idx.IncludeColumns) > 0 || len(idx.ColOpClasses) < 1 {
+		return nil
+	}
+	className := idx.ColOpClasses[0]
+	if className == "" {
+		return nil
+	}
+	method := idx.Method
+	if method == "" {
+		method = "btree"
+	}
+	procOID, ok := im.LookupOpClassSupportProcOID(className, catalog.AccessMethodOIDByName(method), 1)
+	if !ok {
+		return nil
+	}
+	routine := ctx.Catalog.Routines().LookupByOID(procOID)
+	if routine == nil || len(routine.ArgTypes) != 2 {
+		return nil
+	}
+	// Only an int4 key column can be decoded back from its stored key bytes.
+	if idx.Table == nil {
+		return nil
+	}
+	isInt4 := false
+	for _, c := range idx.Table.Columns {
+		if strings.EqualFold(c.Name, idx.Columns[0]) {
+			switch strings.ToLower(c.Type.Name) {
+			case "int4", "integer", "int":
+				isInt4 = !c.Type.IsArray
+			}
+			break
+		}
+	}
+	if !isInt4 {
+		return nil
+	}
+	return func(a, b []byte) int {
+		av, aerr := btree.DecodeInt4(a)
+		bv, berr := btree.DecodeInt4(b)
+		if aerr != nil || berr != nil {
+			// Not a plain int4 key: the negative-infinity pivot tuple on an
+			// internal page carries an empty key (findChildBlock), and a
+			// truncated separator may be shorter than the full encoding. Byte
+			// order is correct for those, exactly as it is for the leftmost
+			// downlink upstream treats as minus infinity.
+			return btree.CompareKeys(a, b)
+		}
+		res, err := executeStoredRoutine(routine,
+			[]Datum{NewIntDatum(int64(av)), NewIntDatum(int64(bv))}, ctx, pos)
+		if err != nil || res.IsNull() {
+			// A comparator that errors or returns NULL cannot decide the
+			// ordering; fall back rather than manufacture a bogus finding
+			// (upstream would ereport, but amcheck's contract here is
+			// report-and-continue over the whole index).
+			return btree.CompareKeys(a, b)
+		}
+		switch {
+		case res.Int < 0:
+			return -1
+		case res.Int > 0:
+			return 1
+		default:
+			return 0
+		}
+	}
 }
 
 // btIndexLeftmostByLevel descends root → leftmost child at each level via the

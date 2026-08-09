@@ -1,42 +1,45 @@
-Task: M0122-0008 follow-up — LATIN2↔UTF8 encoding pair (second built-in pair)
+Task: M0119-0006 slice — operator-class comparator dispatch in amcheck's B-tree
+verifier (the read-side unlock for pg_amcheck 005_opclass_damage.pl)
 
 Files:
-- internal/mb/latin2.go: iso8859_2_to_utf8 + utf8_to_iso8859_2 conversion procs
-  with [128]uint16 forward table (from PG's iso8859_2_to_utf8.map) +
-  map[uint16]byte reverse lookup (init()-built)
-- internal/mb/latin2_test.go: 8 tests (round-trip, expansion, untranslatable,
-  NUL noError, dispatch integration, table integrity, reverse-map consistency)
-- internal/mb/wchar.go: added PG_LATIN2 = 14
-- internal/mb/conv.go: registered OIDs 4493/4492 in BuiltinConversions;
-  refactored BuiltinLookup from if-else to generic builtinPair table
-- docs/design/0122-0020-encoding-conversion-mb-layer.md: Follow-up section
-- docs/design/README.md: updated entry
+- internal/amcheck/verify_nbtree.go: KeyComparator type + VerifyBtreeItemOrderCmp;
+  VerifyBtreeItemOrder now delegates with nil (= btree.CompareKeys)
+- internal/catalog/catalog.go: LookupOpClassSupportProcOID (PG get_opfamily_proc),
+  reads the LIVE amProcMembers store so runtime UPDATE pg_amproc is observed
+- internal/executor/operators_bt_index_check.go: btIndexOpClassComparator +
+  comparator threaded through btIndexVerify
+- internal/executor/operators_bt_index_check_test.go: TestBtIndexCheck_OpClassDamageDetected
+- docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md (accepted) + README row
+- .ralph/deferral_ledger.md, .ralph/fix_plan.md
 
 Key symbols:
-- iso8859_2_to_utf8_table [128]uint16 — forward mapping (byte 0x80–0xFF → UTF8)
-- iso8859_2_from_utf8_map map[uint16]byte — reverse mapping (init()-built)
-- builtinPair map[[2]int32]uint32 — generic encoding-pair→proc-OID table
+- amcheck.KeyComparator / VerifyBtreeItemOrderCmp
+- catalog.InMemory.LookupOpClassSupportProcOID
+- executor.btIndexOpClassComparator (btree.DecodeInt4 + executeStoredRoutine)
 
 Hypothesis/Findings:
-- The LATIN2 pattern proves the ISO 8859 family can be added mechanically:
-  extract .map → create latin<N>.go → two-line BuiltinConversions registration
-  → one-line builtinPair entry. Remaining 12 ISO 8859 variants are now trivial.
-- Multi-byte encodings (EUC_JP, SJIS) remain separate slices — they need
-  variable-width parsers and 4000+-entry mapping tables (radix trees in PG).
-- The BuiltinLookup refactor (if-else → table) was clean and will scale.
+- Upstream amcheck never compares keys itself — every comparison goes through
+  the opclass's FUNCTION 1 (BTORDER_PROC). That indirection IS what 005 tests.
+- A nil comparator is the FAITHFUL answer for a built-in opclass: goopg's key
+  encoding IS that class's order; only user classes name a real function.
+- Non-vacuity confirmed: with the comparator forced nil the damaged index
+  reports clean and the new test fails.
 
 Next step:
-(1) M0122-0008 follow-up: remaining 12 ISO 8859 variants (LATIN3–10, ISO_8859_5–8)
-    — mechanical addition following the same pattern
-(2) M0122-0008 follow-up: query-text transcoding, pg_encoding_max_length
-(3) M0122-0010 btree locking (Lehman-Yao crab-walk first slice)
+(1) M0119-0006 continued: general encoded-key→Datum decoder (inverse of
+    encodeBTreeKeyForColumn) to lift the single-int4-column restriction, then
+    the --checkunique tier, then port 005_opclass_damage.pl to internal/testport.
+(2) Otherwise re-read the Current Priority banner: M0130 is all [x]; remaining
+    unchecked M0119 items are 0005 (pg_waldump server tier, needs index AMs)
+    and 0007 (blocked on logical decoding), then M0122.
 
 Gates run:
 - go build ./...: CLEAN
-- go test ./internal/mb/...: ALL PASS (22 tests — 14 existing + 8 new)
+- go test ./internal/amcheck/... ./internal/catalog/...: PASS
+- go test -run TestBtIndexCheck_ ./internal/executor/: PASS (new test non-vacuous)
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
-- RALPH_PRECOMMIT_SCOPE=smoke: 1 failed txn (pre-existing non-FIFO tuple-lock)
 - scripts/tpch-spotcheck.sh: PASS (Q12=2, Q13=35)
-- make ralph-state-guard: REPAIRED → CONSISTENT
+- make ralph-state-guard: CONSISTENT
+- commit hook pgbench smoke: see commit
 
 In-flight: none

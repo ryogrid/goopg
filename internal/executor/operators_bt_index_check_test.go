@@ -179,3 +179,64 @@ func TestBtIndexCheck_DetectsMissingRelationFork(t *testing.T) {
 		}
 	}
 }
+
+// TestBtIndexCheck_OpClassDamageDetected is the M0119-0006 gate for
+// operator-class comparator dispatch: the mechanism pg_amcheck's upstream
+// 005_opclass_damage.pl is built on.
+//
+// A B-tree index declared with a *user* operator class must be verified through
+// that class's FUNCTION 1 support proc, resolved live from pg_amproc — not
+// through the engine's own key-byte order. The test reproduces the upstream
+// scenario end to end: build the index under an ascending comparator (clean),
+// then repoint the pg_amproc row at a comparator that sorts descending. The
+// index bytes never change; the check must nonetheless now report
+// `item order invariant violated for index "fickleidx"`, because the ordering
+// it is judged against did.
+//
+// The no-false-positive half (the clean pre-damage check) is the load-bearing
+// assertion of the pair: dispatching to a user comparator must not manufacture
+// findings on a healthy index.
+func TestBtIndexCheck_OpClassDamageDetected(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION int4_asc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION int4_desc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS int4_fickle_ops FOR TYPE int4 USING btree AS
+			OPERATOR 1 < (int4, int4), OPERATOR 2 <= (int4, int4),
+			OPERATOR 3 = (int4, int4), OPERATOR 4 >= (int4, int4),
+			OPERATOR 5 > (int4, int4), FUNCTION 1 int4_asc_cmp(int4, int4)`,
+		"CREATE TABLE int4tbl (i int4)",
+		"INSERT INTO int4tbl VALUES (1), (2), (3), (4), (5), (6), (7), (8)",
+		"CREATE INDEX fickleidx ON int4tbl USING btree (i int4_fickle_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleidx')"); err != nil {
+		t.Fatalf("healthy index under a user operator class raised: %v", err)
+	}
+
+	// Upstream's corruption injection, verbatim in shape.
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'int4_desc_cmp'::regproc
+		WHERE amproc = 'int4_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleidx')")
+	if err == nil {
+		t.Fatal("broken operator class not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "fickleidx"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}

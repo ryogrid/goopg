@@ -375,6 +375,20 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       top of `internal/amcheck` + opclass catalog parity. Largest open cluster
       (~29 ledger rows): index AMs, `box`/`int4range`/`int4[]` types, STORAGE
       EXTERNAL TOAST corruption, and the heapallindexed heap-scan producer.
+      **Slice landed 2026-08-10 — operator-class comparator dispatch** (the
+      `005_opclass_damage.pl` read-side unlock, successor to the
+      `nextVirtualPgAmproc` write-side prerequisite): `bt_index_check` on an
+      index declaring a user operator class is now judged under that class's
+      `pg_amproc` FUNCTION 1, resolved live, so repointing the amproc row makes
+      the physically-unchanged index report `item order invariant violated`.
+      Three seams — `amcheck.KeyComparator`/`VerifyBtreeItemOrderCmp`,
+      `catalog.InMemory.LookupOpClassSupportProcOID`,
+      `executor.btIndexOpClassComparator`. Gate:
+      `TestBtIndexCheck_OpClassDamageDetected` (verified non-vacuous). Design:
+      `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`. Still
+      open for 005: single-int4-key-column-only dispatch (needs a general
+      encoded-key→Datum decoder) and the `--checkunique` tier — ledger row
+      2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

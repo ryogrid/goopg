@@ -197,6 +197,36 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 // items cannot be decoded surfaces as a finding, never a Go error, matching the
 // report-and-continue model of the heap engine.
 func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName string) []BtreeReport {
+	return VerifyBtreeItemOrderCmp(p, blkno, indexName, nil)
+}
+
+// KeyComparator compares two encoded index keys, returning <0, 0 or >0 exactly
+// like btree.CompareKeys. It is the seam through which a caller supplies an
+// *operator-class* comparator instead of the engine's built-in byte order.
+//
+// Upstream amcheck never compares index keys itself: every comparison goes
+// through the index's own support function 1 (`_bt_compare` → the BTORDER_PROC
+// resolved from pg_amproc for the index's opclass, verify_nbtree.c's
+// `bt_index_check` operating on a fully-built `BTScanInsert` key). That is what
+// makes pg_amcheck's 005_opclass_damage.pl work: it swaps the pg_amproc row of a
+// custom operator class to a comparator that sorts the other way, and the *same*
+// physically-unchanged index then reports `item order invariant violated`,
+// because the check is performed under the new sort order.
+//
+// goopg's engine is key-encoding based (order-preserving bytes, btree.CompareKeys),
+// so the opclass comparator is injected here rather than being intrinsic. A nil
+// KeyComparator selects btree.CompareKeys — the default for every index whose key
+// column uses a built-in operator class. M0119-0006 (005_opclass_damage).
+type KeyComparator func(a, b []byte) int
+
+// VerifyBtreeItemOrderCmp is VerifyBtreeItemOrder with an explicit key
+// comparator (see KeyComparator). Both invariants — high key and item order —
+// are evaluated under it, matching upstream where a single opclass comparator
+// governs every key comparison amcheck performs on the index.
+func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, cmpKeys KeyComparator) []BtreeReport {
+	if cmpKeys == nil {
+		cmpKeys = btree.CompareKeys
+	}
 	// The metapage has no data items; deleted pages hold none either (their
 	// level field is type-punned and the page carries no live tuples).
 	if blkno == btree.MetaBlock {
@@ -222,7 +252,7 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 	for i, key := range keys {
 		if checkHighKey {
 			// Leaf: key <= high key. Internal: key < high key.
-			cmp := btree.CompareKeys(key, opaque.HighKey)
+			cmp := cmpKeys(key, opaque.HighKey)
 			if (leaf && cmp > 0) || (!leaf && cmp >= 0) {
 				return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 					"high key invariant violated for index \"%s\"", indexName)}}
@@ -231,7 +261,7 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 		// Item order: current key must not be greater than the next item's key
 		// (a strict decrease is the only violation — see the doc comment above
 		// on why goopg tolerates equal adjacent keys).
-		if i+1 < len(keys) && btree.CompareKeys(key, keys[i+1]) > 0 {
+		if i+1 < len(keys) && cmpKeys(key, keys[i+1]) > 0 {
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"item order invariant violated for index \"%s\"", indexName)}}
 		}
