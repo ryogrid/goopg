@@ -66,6 +66,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -129,4 +130,121 @@ func encodeArrayBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecEr
 		out = append(out, eb...)
 	}
 	return append(out, arrayKeyEnd), nil
+}
+
+// decodeArrayBTreeKey inverts encodeArrayBTreeKey: it rebuilds the array's
+// canonical text form ("{1,2}") as the KindString datum every other goopg path
+// carries an array value in, and reports how many bytes the array segment
+// occupied — which is what makes an array usable as one column of a COMPOSITE
+// key walk.
+//
+// This is the DECODE sibling the encoding slice left open, and its absence was
+// not merely a missing feature (Hard-won Rule #2). Both decode siblings
+// dispatch on col.Type.Name, which for an array column is the ELEMENT type
+// name, so an `int4[]` key column reached decodeIndexKeyColumn's int4 arm and
+// an `int2[]` one reached decodeScalarBTreeKey's int2 arm: each consumed 4 bytes
+// of a longer segment (the 0x01 presence tag plus the first 3 bytes of the
+// element key) and returned that as the column's value. Consequences, both
+// silent: a composite key walk desynchronized at the array column, so every
+// LATER key column decoded from the wrong offset (the btIndexOpClassComparator
+// walk then compared unrelated bytes and could call a corrupt index clean), and
+// a single-column index-only scan over an array column produced a garbage
+// integer instead of the array. This routing is therefore placed BEFORE
+// decodeScalarBTreeKey in both siblings, exactly as encodeBTreeKeyForColumn
+// routes arrays before its own scalar switch.
+//
+// The decode is value-preserving, not byte-preserving, in the same way the
+// scalar decodes are: EncodeNumericKey drops trailing mantissa zeros, so an
+// element 1.50 comes back as 1.5.
+func decodeArrayBTreeKey(key []byte, col catalog.Column) (Datum, int, error) {
+	// The element column: the array's Name minus its array-ness, so the
+	// per-element decode resolves the ELEMENT type — the mirror of the elemCol
+	// the encoder builds.
+	elemCol := catalog.Column{Name: col.Name, Type: catalog.Type{Name: col.Type.Name}}
+	var sb strings.Builder
+	sb.WriteByte('{')
+	off, n := 0, 0
+	for {
+		if off >= len(key) {
+			return NullDatum, 0, fmt.Errorf("btree: array key for column %q is not terminated", col.Name)
+		}
+		tag := key[off]
+		off++
+		if tag == arrayKeyEnd {
+			break
+		}
+		if n > 0 {
+			sb.WriteByte(',')
+		}
+		n++
+		switch tag {
+		case arrayKeyElemNull:
+			// The unquoted NULL token, as array_out writes a NULL element.
+			sb.WriteString("NULL")
+		case arrayKeyElemPresent:
+			text, w, err := decodeArrayKeyElemText(key[off:], elemCol)
+			if err != nil {
+				return NullDatum, 0, err
+			}
+			sb.WriteString(text)
+			off += w
+		default:
+			return NullDatum, 0, fmt.Errorf("btree: invalid array key element tag 0x%02x for column %q", tag, col.Name)
+		}
+	}
+	sb.WriteByte('}')
+	return NewStringDatum(sb.String()), off, nil
+}
+
+// decodeArrayKeyElemText decodes one element's key bytes and renders the element
+// exactly as the heap-side array decode renders it (decodeArrayElem in
+// codec_array.go), so an array read out of an index and the same array read out
+// of the heap are the same text.
+//
+// The element VALUE comes from decodeIndexKeyColumn — the one decoder the
+// encoder's own recursion into encodeBTreeKeyForColumn pairs with, which is also
+// what reports the element's byte width. Only the rendering is per-type, because
+// a Datum alone does not say how PG spells it: a float has to go through
+// PGFloatOut (the decoder hands back Go's 'g' form, which is round-trip exact
+// but not PG's spelling) and a text-like element has to be re-quoted by
+// array_out's rules.
+//
+// An element type with no faithful rendering is refused rather than guessed. The
+// set refused here is not reachable from a stored array anyway: goopg's heap
+// array codec (arrayElemTypeInfo) stores only the fixed-width types below plus
+// varlena text-likes, so bytea/date/time/enum arrays cannot be written in the
+// first place.
+func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, error) {
+	name := elemCol.Type.Name
+	d, w, err := decodeIndexKeyColumn(key, elemCol)
+	if err != nil {
+		return "", 0, err
+	}
+	if w <= 0 {
+		return "", 0, fmt.Errorf("btree: array element of type %q consumed no bytes", name)
+	}
+	switch {
+	case isInt2Type(name), isInt4Type(name), isInt8Type(name), isOidType(name):
+		return strconv.FormatInt(d.Int, 10), w, nil
+	case isBoolType(name):
+		if d.BoolValue() {
+			return "t", w, nil
+		}
+		return "f", w, nil
+	case isFloat8Type(name):
+		f, perr := strconv.ParseFloat(d.StringValue(), 64)
+		if perr != nil {
+			return "", 0, fmt.Errorf("btree: array element float key: %w", perr)
+		}
+		if isFloat4TypeName(name) {
+			return PGFloatOut(f, 32), w, nil
+		}
+		return PGFloatOut(f, 64), w, nil
+	case isNumericType(name):
+		return d.Format(), w, nil
+	case isVarcharType(name), isCharType(name), isTextType(name), isNameType(name),
+		strings.ToLower(name) == "uuid":
+		return quoteArrayTextElem(d.StringValue()), w, nil
+	}
+	return "", 0, fmt.Errorf("btree: array element type %q has no key decoding", name)
 }

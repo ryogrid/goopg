@@ -399,6 +399,13 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
 	// `len(b) == width`, which fails when the multi-column loop passes
 	// the still-trailing remainder of a composite key.
+	// ARRAY column: Type.Name is the ELEMENT type, so every predicate below (and
+	// in decodeScalarBTreeKey) answers for the element and would consume the
+	// element's width out of a longer array segment. Route arrays first, the
+	// mirror of encodeBTreeKeyForColumn's own array-first routing. M0119-0006.
+	if col.Type.IsArray {
+		return decodeArrayBTreeKey(key, col)
+	}
 	// int2 / oid / bool / bytea / time (btree_scalar_keys.go). Routed BEFORE the
 	// switch below so neither of these types can reach the `default:` arm, which
 	// reads any 8 leading bytes as an enum float8 without ever erroring.
@@ -508,6 +515,21 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	typeName := col.Type.Name
+	// Sibling of decodeIndexKeyColumn's array routing (same ordering rationale:
+	// an array's Type.Name is its ELEMENT type name, so it must not reach any
+	// scalar predicate). Strict on the width: a single-column key is the whole
+	// key, so bytes trailing the array's end marker mean this is not the
+	// encoding we think it is. M0119-0006.
+	if col.Type.IsArray {
+		d, n, err := decodeArrayBTreeKey(key, col)
+		if err != nil {
+			return NullDatum, err
+		}
+		if n != len(key) {
+			return NullDatum, fmt.Errorf("btree: array key for column %q has %d trailing bytes", col.Name, len(key)-n)
+		}
+		return d, nil
+	}
 	// Sibling of decodeIndexKeyColumn's routing — both must invert
 	// encodeScalarBTreeKey, or an int2/oid/bool/bytea/time key column decodes
 	// one way in a single-column IOS and another way in a composite one.

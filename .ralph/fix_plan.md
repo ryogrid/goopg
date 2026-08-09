@@ -645,10 +645,41 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestTimeTzIndexKeyDeclined` — all non-vacuous. 2 ledger rows (timetz;
       and the INSERT-path gap this surfaced: `VALUES ('true')` into a bool
       column raises XX000 because the codec bool arm demands `KindBool`).
+      **Slice landed 2026-08-10 (14th) — ARRAY key DECODING** (design
+      `docs/design/0119-0006-array-index-key-decoding.md`). The decode sibling
+      the array ENCODE slice left open, and its absence was a live MISREAD, not
+      a gap (Hard-won Rule #2): both decode siblings dispatch on
+      `col.Type.Name`, which for an array column is the ELEMENT type name, so an
+      `int4[]` key column reached `decodeIndexKeyColumn`'s int4 arm and an
+      `int2[]`/`oid[]`/`bool[]` one reached `decodeScalarBTreeKey`, each
+      consuming the ELEMENT's width out of a longer array segment (for `int4[]`:
+      the `0x01` presence tag plus three bytes of the first element key). A
+      single-column index-only scan over an array column therefore returned a
+      garbage integer, and — worse — a COMPOSITE key walk desynchronized at the
+      array column so every LATER key column decoded from the wrong offset. That
+      walk is `btIndexOpClassComparator`'s: confirmed at HEAD, `bt_index_check`
+      reported a composite `(a int4[], i int4 <user opclass>)` index CLEAN with
+      its `FUNCTION 1` support proc repointed at a descending comparator. New
+      `decodeArrayBTreeKey` inverts the encoding (tag dispatch, recursion into
+      `decodeIndexKeyColumn` for each element, byte width reported so the walk
+      can advance) and returns the array's canonical text form — the same
+      representation the heap-side `decodeArrayValuePG` produces. Arrays route
+      FIRST in both siblings, mirroring the encoder; `decodeBTreeKeyToDatum`
+      additionally requires the segment to consume the WHOLE key. Element
+      rendering is per-type (`PGFloatOut` for floats, `quoteArrayTextElem` for
+      text-likes, shared with the heap path); types with no faithful rendering
+      are refused rather than guessed, which also re-arms the comparator's
+      decode-failure fallback. Gates:
+      `TestDecodeArrayBTreeKey{RoundTrip,CompositeWalk,RejectsMalformed}`,
+      `TestArrayBTreeKeyDecodeSiblingParity`,
+      `TestBtIndexCheck_OpClassDamageDetectedAfterArrayColumn` — all five
+      non-vacuous. 2 ledger rows (no decoding for bytea/date/time/enum elements;
+      and the encode-side defect this surfaced — a QUOTED `"NULL"` text element
+      is encoded as an array NULL because `parseTextArray` strips quoting before
+      the NULL test).
       Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range`/`interval`/`timetz` key encodings, the
-      array DECODE arm for the opclass comparator, and the whole-database
-      (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      checkunique tier, `box`/`int4range`/`interval`/`timetz` key encodings, and
+      the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
