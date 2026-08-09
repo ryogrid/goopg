@@ -288,9 +288,23 @@ func waitForPhysicalStreamingPGtoGoopg(t *testing.T, pgPrimary *pgcluster.Cluste
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		// Check PG side: the standby appears in pg_stat_replication.
-		pgReady := pgPrimary.QueryScalar(t,
-			fmt.Sprintf("SELECT count(*) FROM pg_stat_replication WHERE application_name = '%s' AND state = 'streaming'", appName)) == "1"
+		// Check PG side: the standby appears among the walsenders.
+		//
+		// This probes the two SRFs that `pg_stat_replication` is built from
+		// rather than the view itself. The PG in this phase runs on a data
+		// directory that goopg's initdb created, and a goopg-built catalog
+		// carries no rewrite rules that PG's relcache can load
+		// (`pg_internal.init` is written ruleless — ledgered gap), so PG
+		// answers any `SELECT ... FROM <view>` with
+		// `cannot open relation "pg_stat_replication" / This operation is not
+		// supported for views`. The join below is exactly the view body from
+		// upstream `system_views.sql:906` minus the `pg_authid` outer join,
+		// which only supplies `usename`.
+		pgReady := pgPrimary.QueryScalar(t, fmt.Sprintf(
+			`SELECT count(*) FROM pg_stat_get_activity(NULL) AS s
+			   JOIN pg_stat_get_wal_senders() AS w ON (s.pid = w.pid)
+			  WHERE s.application_name = '%s' AND w.state = 'streaming'`,
+			appName)) == "1"
 
 		// Check goopg side: pg_stat_wal_receiver reports streaming.
 		goopgReady := false

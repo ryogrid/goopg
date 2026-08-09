@@ -411,24 +411,60 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          `TestDetectWritePos_PrefersHighestTimeline`, both
          mutation-verified; the first reproduces the production error
          string verbatim.
-      7. OPEN — Phase D's verification query `SELECT count(*) FROM
+      7. FIXED (2026-08-10) — **Phase D now reaches its DATA checks**: the
+         reverse standby is confirmed `streaming` on both sides. The
+         harness's verification query `SELECT count(*) FROM
          pg_stat_replication WHERE application_name = 's10_reverse' AND
-         state = 'streaming'` runs against the PROMOTED PG and fails with
+         state = 'streaming'` runs against the PROMOTED PG and failed with
          `ERROR: cannot open relation "pg_stat_replication" / DETAIL: This
          operation is not supported for views`. A real PG on a goopg-built
          catalog cannot evaluate ANY view: the rewriter reads relcache
          `rd_rules`, which goopg's `pg_internal.init` leaves empty, so
          `pg_rewrite` is never scanned (pre-existing, separately ledgered
-         ruleless-init gap; `pg_get_viewdef` works). Resume: probe the
-         underlying SRF `pg_stat_get_wal_senders()` instead of the view
-         (`internal/testport/e2e_pg183_standby_full_cycle_test.go`);
-         populating `rd_rules` is the real engine fix and stays on the
-         ruleless-init ledger row. NOTE the `walreceiver WALData start
-         mismatch` INFO line before the failure is NOT a blocker — the
-         `m.StartLSN < expectedStart` arm already trims. Repro:
-         `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`.
-         Design: addenda in
-         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 6 rows.
+         ruleless-init gap; `pg_get_viewdef` works — populating `rd_rules`
+         stays the real engine fix on that ledger row). Harness fix:
+         `waitForPhysicalStreamingPGtoGoopg`
+         (`internal/testport/e2e_pg183_standby_full_cycle_test.go`) now
+         probes the two SRFs the view is built from —
+         `pg_stat_get_activity(NULL) JOIN pg_stat_get_wal_senders()` —
+         i.e. upstream `system_views.sql:906`'s body minus the `pg_authid`
+         outer join (it only supplies `usename`). NOTE the `walreceiver
+         WALData start mismatch` INFO line is NOT a blocker — the
+         `m.StartLSN < expectedStart` arm already trims.
+      8. OPEN — **the promoted PG performs NO index maintenance on
+         goopg-created indexes**, so the reverse standby's index scans
+         miss every post-promote row. Phase D's
+         `SELECT count(*) FROM public.s10_t WHERE id = 5 AND val =
+         'reverse-attach'` returns 0 while the row IS present
+         (`SELECT … WHERE id = 5` → 1, unfiltered `string_agg` shows all
+         5 rows); the `val` predicate is served by an Index Scan on
+         `s10_t_val_idx` (confirmed via EXPLAIN on the standby) and rows
+         4/5 (both PG-authored) are absent from that index, while row 3
+         (goopg-authored, post-CREATE INDEX) is found. GROUND TRUTH from
+         `pg_waldump` on the promoted PG's `000000020000000000000003`:
+         the INSERT emitted `Heap INSERT` + `Transaction COMMIT` and **no
+         RM_BTREE record at all** — goopg's replay is innocent (an
+         `ApplyRecord` trace over the whole reverse-replay stream shows
+         zero rmid=11 records arriving). Root cause is the SAME shape as
+         blocker 3's `pg_attrdef`: `pg_index_indrelid_index` (OID 2678) is
+         only an EMPTY placeholder file in goopg's initdb
+         (`internal/initdb/initdb.go:~4765` says so explicitly — only 2679
+         gets a populated btree via `bootstrapPgIndexIndexrelidIndex`), so
+         PG's `RelationGetIndexList` (`relcache.c`, systable_beginscan on
+         `IndexIndrelidIndexId`) finds zero pg_index rows for the table
+         and `ExecInsertIndexTuples` has nothing to maintain.
+         `pg_index.indisvalid/indisready/indislive` are all `t` on the
+         promoted PG, so this is invisible to catalog assertions. Resume:
+         mirror the blocker-3 pg_attrdef work for 2678 — populated btree
+         at `base/{1,5}/2678` (+ `global/2678`) keyed on `indrelid`
+         (NON-unique, `oid_ops`) in `internal/initdb/btree_index_bootstrap.go`
+         alongside `bootstrapPgIndexIndexrelidIndex`, mirror 2610/2678 into
+         `base/5` in `mirrorTouchedCatalogsToPostgresDB`, and insert a
+         runtime entry whenever a pg_index row is written (CREATE INDEX)
+         the way `writeAttrdefRow` does. Repro:
+         `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`
+         (~40 s). Design: addenda in
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 8 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

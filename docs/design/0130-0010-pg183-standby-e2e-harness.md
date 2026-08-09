@@ -419,3 +419,66 @@ goopg's requested start LSN, and `handleReplicationMessage`'s
 teardown, fired by the failed view query above.
 
 Blocker #7 is recorded in the deferral ledger; the fix_plan item stays open.
+
+## 2026-08-10 addendum — blocker #7 fixed; blocker #8 diagnosed (PG skips index maintenance)
+
+### Blocker #7 — probe the SRFs, not the view
+
+`waitForPhysicalStreamingPGtoGoopg` now asks the promoted PG
+
+```sql
+SELECT count(*) FROM pg_stat_get_activity(NULL) AS s
+  JOIN pg_stat_get_wal_senders() AS w ON (s.pid = w.pid)
+ WHERE s.application_name = '<slot>' AND w.state = 'streaming'
+```
+
+which is exactly upstream `system_views.sql:906`'s `pg_stat_replication` body
+minus the `LEFT JOIN pg_authid` (it only supplies `usename`). Both SRFs resolve
+on a goopg-built catalog because `pg_proc` is nailed (`formrdesc`), so no
+rewrite rule — and therefore no `rd_rules` — is needed. Populating `rd_rules`
+remains the real engine fix and stays on the ruleless-`pg_internal.init` ledger
+row; every *other* `pg_stat_*` probe against a PG hosted on goopg's cluster
+directory has to take the same SRF detour until that lands.
+
+With this, **both sides report `streaming`** and Phase D reaches its data
+checks for the first time.
+
+### Blocker #8 — the promoted PG does no index maintenance
+
+Phase D's `SELECT count(*) FROM public.s10_t WHERE id = 5 AND val =
+'reverse-attach'` returns 0 on the reverse standby even though the row is
+there: `WHERE id = 5` returns 1 and an unfiltered `string_agg` lists all five
+rows. `EXPLAIN` shows the `val` predicate served by an **Index Scan using
+`s10_t_val_idx`**, and that index is missing exactly the two PG-authored rows
+(id 4, 5) while the goopg-authored post-`CREATE INDEX` row (id 3) is present.
+
+Two traces settle the cause, and both exonerate goopg's replay:
+
+- `pg_waldump` over the promoted PG's `000000020000000000000003` shows the
+  INSERT as `Heap INSERT` + `Transaction COMMIT` and **no RM_BTREE record at
+  all**;
+- an `ApplyRecord` trace over the reverse standby's whole replay stream logs
+  zero `rmid=11` records arriving (only rmid 0/1/8/10/128).
+
+PG itself never inserted into the index. `pg_index` on the promoted PG has the
+row with `indisvalid`/`indisready`/`indislive` all `t`, so no catalog assertion
+can see the problem — but `RelationGetIndexList` (`relcache.c`) reaches
+`pg_index` through a `systable_beginscan` on **`IndexIndrelidIndexId` (OID
+2678)**, and in goopg's initdb that index is only an *empty placeholder file*:
+`internal/initdb/initdb.go` (~line 4765) states outright that only 2679
+(`pg_index_indexrelid_index`) gets a populated btree, built by
+`bootstrapPgIndexIndexrelidIndex`, "because `pg_index_indrelid_index` is not
+used for a syscache lookup during early backend startup". True for startup —
+false for `RelationGetIndexList`, which every `ExecInsertIndexTuples` depends
+on. The scan returns nothing, PG concludes the table has no indexes, and index
+maintenance is silently skipped.
+
+This is blocker #3's `pg_attrdef` shape a second time (an unmaterialized system
+index turning a catalog scan into a silent empty result), and the fix mirrors
+it: a populated NON-unique `oid_ops` btree keyed on `indrelid` at
+`base/{1,5}/2678` + `global/2678`, mirroring of 2610/2678 into `base/5` in
+`mirrorTouchedCatalogsToPostgresDB`, and a runtime index insert whenever
+`CREATE INDEX` writes a `pg_index` row — the `writeAttrdefRow` /
+`insertPgAttrdefAdrelidAdnumIndexEntry` pattern.
+
+Blocker #8 is recorded in the deferral ledger; the fix_plan item stays open.
