@@ -125,10 +125,22 @@ item order.
   index passes with `checkunique` on.
   `TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex` pins the `ii_Unique` gate.
 
+- `internal/testport` (2026-08-10): `TestPort_PgAmcheck005OpclassDamage` drives
+  this tier through the **real upstream `pg_amcheck --checkunique` binary**. Its
+  phase 4 repoints a UNIQUE index's operator class at a comparator that declares
+  the adjacent live values 768 and 769 equal and asserts pg_amcheck exits 2 with
+  `index uniqueness is violated for index "bttest_unique_idx"`; its phase 3
+  asserts the same command is clean on the repaired class, so the tier is proven
+  to be both reached and discriminating. Reaching it at all depends on goopg
+  reporting amcheck extension version ≥ 1.4 — below that `pg_amcheck.c:607-631`
+  silently drops `--checkunique` and the phase would be vacuous. See
+  `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md` §Verification.
+
 ## Still open for `005_opclass_damage` / `--checkunique`
 
 - Posting-list duplicates are expanded and reported with their posting index, but
   no test exercises a posting-list page (goopg deduplicates only under specific
   churn; constructing one deterministically is a separate fixture).
-- `INCLUDE`/expression key columns remain outside the opclass comparator's
-  contract, so a `checkunique` run on such an index falls back to byte order.
+- Expression key columns remain outside the opclass comparator's contract, so a
+  `checkunique` run on such an index falls back to byte order. (`INCLUDE`
+  columns were lifted by the fourth slice.)

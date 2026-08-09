@@ -438,6 +438,27 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       005: expression key columns, posting-list duplicate coverage, and the
       remaining non-invertible key types (box/int4range/int4[]) — ledger rows
       2026-08-10.
+      **Sixth slice landed 2026-08-10 — `005_opclass_damage.pl` PORTED:**
+      `TestPort_PgAmcheck005OpclassDamage`
+      (`internal/testport/pgamcheck005_opclass_test.go`) runs the real upstream
+      `pg_amcheck` binary through all four upstream phases against ONE
+      unchanging set of index pages — clean → repoint `int4_fickle_ops`
+      FUNCTION 1 at a descending comparator via `UPDATE pg_catalog.pg_amproc`
+      → exit 2 with `item order invariant violated for index "fickleidx"` →
+      repair the amproc row → clean again under `--checkunique` → repoint
+      `int4_unique_ops` FUNCTION 1 at a comparator declaring 768 and 769 equal
+      → exit 2 with `index uniqueness is violated for index
+      "bttest_unique_idx"`. Nothing on disk is ever corrupted; every verdict is
+      decided by the live `pg_amproc` row, which is the property 005 exists to
+      prove. Also repaired a pre-existing defect this required: two unquoted
+      commas in the `W-001` row of
+      `docs/test-port/postgres-oracle-port-status.csv` made the whole file fail
+      to parse, so `cmd/gen-oracle-port-status` could not regenerate the `.md`
+      at all. CSV row `AC-003` rationale updated + `.md` regenerated; `AC-003`
+      stays `defer` because its 003/004 tiers still need index AMs goopg lacks.
+      Remaining for M0119-0006: expression key columns, posting-list duplicate
+      coverage, `box`/`int4range`/`int4[]` key encodings, and the whole-database
+      (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

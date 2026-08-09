@@ -174,7 +174,9 @@ Still out of scope:
   Unlike `NUMERIC` these do hit the per-column decode-failure fallback and keep
   byte order for that column, so they are never a false positive — only a missed
   detection. Recorded in `.ralph/deferral_ledger.md`.
-- **The `--checkunique` tier**, tracked separately under M0119-0006.
+- **The `--checkunique` tier** — landed separately under M0119-0006
+  (`docs/design/0119-0006-checkunique-tier-amcheck.md`); the sixth slice below
+  exercises both tiers together through the real binary.
 
 Cost: one SQL-function call per key comparison on the pages of an index that
 declares a user opclass. Acceptable for a corruption check, and zero for every
@@ -216,5 +218,26 @@ index that does not (the comparator is nil and never allocated).
   `internal/executor`: `TestNumericIndexKeyDecodeSiblingParity` and
   `TestNumericIndexKeyDecodeCompositeWalk` pin the two decoders against each
   other, the Rule-#2 sibling obligation.
+- Sixth slice (2026-08-10 — the upstream script itself):
+  `TestPort_PgAmcheck005OpclassDamage`
+  (`internal/testport/pgamcheck005_opclass_test.go`) is the full port of
+  `postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl`. It is the property no
+  unit gate can show — that the **real upstream `pg_amcheck` binary**, driving
+  goopg over the wire with its own generated SQL
+  (`SELECT public.bt_index_check(index := c.oid, heapallindexed := false,
+  checkunique := true)`), observes the same four-phase verdict sequence upstream
+  asserts over one unchanging set of index pages: clean → repoint
+  `int4_fickle_ops`'s FUNCTION 1 at a descending comparator → exit 2 with
+  `item order invariant violated for index "fickleidx"` → repair the `pg_amproc`
+  row → clean again under `--checkunique` → repoint `int4_unique_ops`'s FUNCTION 1
+  at a comparator declaring 768 and 769 equal → exit 2 with
+  `index uniqueness is violated for index "bttest_unique_idx"`. Nothing on disk
+  is ever corrupted; every verdict is decided by what `pg_amproc` currently says
+  the class's comparator is, which is what this script exists to prove.
+  The phase-4 assertion also transitively proves pg_amcheck's amcheck-version
+  gate is satisfied — `pg_amcheck.c:607-631` silently drops `--checkunique`
+  (with a warning the helper now fails on) unless the extension reports ≥ 1.4,
+  which goopg does. Runs are scoped `--table public.int4tbl`, the same whole-db
+  scoping adaptation the 003/004 ports use.
 - `go test ./internal/amcheck/... ./internal/catalog/...` and the existing
   `TestBtIndexCheck_*` suite PASS unchanged.
