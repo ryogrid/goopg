@@ -449,9 +449,13 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`.
       GENERIC_PLAN/WAL/MEMORY parser support **done** (2026-08-08, commit
-      `a121193f`) — the three PG 18 options no longer error. GENERIC_PLAN emits
-      a NOTICE; WAL/MEMORY are parsed but produce no executor output yet
-      (deferral-ledger rows 2026-08-08).
+      `a121193f`). GENERIC_PLAN emits a NOTICE.
+      **EXPLAIN (WAL) executor output done (2026-08-09, commit `41c9d632`)** —
+      per-node "WAL: records=N bytes=K" in TEXT, JSON properties in structured
+      formats. Deferred: payload-only byte counting (no xlog header overhead),
+      FPI/Buffers Full always zero.
+      **Remaining: EXPLAIN (MEMORY) executor output** — needs per-node peak
+      memory tracking (no MemoryContext framework yet).
 
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
