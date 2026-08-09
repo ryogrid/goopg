@@ -1901,11 +1901,44 @@ type LeafEntry struct {
 // this expands posting items because heapallindexed fingerprints every heap TID
 // the index references.
 func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
+	items, err := PageLeafItems(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LeafEntry, 0, len(items))
+	for _, it := range items {
+		out = append(out, LeafEntry{Key: it.Key, TID: it.TID})
+	}
+	return out, nil
+}
+
+// LeafItem is PageLeafEntries' (key, heap TID) pair plus the on-page location
+// it was read from: the line-pointer Slot and, for a posting-list item, the
+// position of this TID within the posting list (PostingIndex; -1 for a plain
+// item). Upstream amcheck's uniqueness tier reports exactly these coordinates
+// in its errdetail — `Index tid=(blk,off) posting N and tid=(...) …`,
+// verify_nbtree.c's bt_report_duplicate — which the collapsed LeafEntry shape
+// cannot express. M0119-0006.
+type LeafItem struct {
+	Key          []byte
+	TID          storage.ItemPointer
+	Slot         uint16
+	PostingIndex int
+}
+
+// PageLeafItems returns every (key, heap TID) entry on a B-tree leaf page in
+// physical slot order, expanding posting-list items to one entry per TID and
+// retaining each entry's slot / posting position (see LeafItem).
+//
+// PageLeafEntries is a thin projection of this reader, so the two never drift
+// apart on the ItemIDDead skip or the posting-list expansion rule — the
+// sibling-paths-must-agree discipline that guards the on-disk item layout.
+func PageLeafItems(p storage.Page) ([]LeafItem, error) {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]LeafEntry, 0, count)
+	out := make([]LeafItem, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
 		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
 			// C3-S1: ItemIDDead entries are invisible to every reader —
@@ -1920,19 +1953,19 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 		if isPostingRaw(raw) {
 			key, tids, perr := parsePostingRaw(raw)
 			if perr != nil {
-				maybeDumpPageOnParseErr(p, "PageLeafEntries: parsePostingRaw")
+				maybeDumpPageOnParseErr(p, "PageLeafItems: parsePostingRaw")
 				return nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, LeafEntry{Key: key, TID: tid})
+			for i, tid := range tids {
+				out = append(out, LeafItem{Key: key, TID: tid, Slot: slot, PostingIndex: i})
 			}
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
-				maybeDumpPageOnParseErr(p, "PageLeafEntries: parseItem")
+				maybeDumpPageOnParseErr(p, "PageLeafItems: parseItem")
 				return nil, perr
 			}
-			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
+			out = append(out, LeafItem{Key: it.key, TID: it.ptr, Slot: slot, PostingIndex: -1})
 		}
 	}
 	return out, nil

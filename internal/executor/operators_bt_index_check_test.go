@@ -342,3 +342,163 @@ func TestBtIndexCheck_OpClassDamageDetectedComposite(t *testing.T) {
 		t.Errorf("got %q, want substring %q", err.Error(), want)
 	}
 }
+
+// TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate is the M0119-0006 gate for
+// the `checkunique` tier (upstream bt_entry_unique_check, verify_nbtree.c).
+//
+// It reproduces the corruption the tier exists to find: a UNIQUE index holding
+// two entries with the same key, both pointing at heap tuples that are live
+// under the checker's snapshot. The heap is untouched and internally consistent
+// — the index alone is wrong — so no other tier can see it: the key run
+// 1,1,3,4,5 is still non-decreasing, so item order is satisfied.
+//
+// Three assertions, in the order that makes the gate non-vacuous:
+//  1. the damaged index passes with checkunique OFF (proving the finding comes
+//     from the new tier and not from a pre-existing structural check),
+//  2. it fails with checkunique ON, naming the upstream message, and
+//  3. an undamaged unique index passes with checkunique ON (no false positive).
+func TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		"CREATE TABLE bicu (a int)",
+		"INSERT INTO bicu VALUES (1), (2), (3), (4), (5)",
+		"CREATE UNIQUE INDEX bicu_a_idx ON bicu (a)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	// (3) first, while the index is still healthy: checkunique on a clean unique
+	// index must not manufacture a finding.
+	for _, sql := range []string{
+		"SELECT bt_index_check('bicu_a_idx', false, true)",
+		"SELECT bt_index_parent_check('bicu_a_idx', false, false, true)",
+		"SELECT bt_index_check(index := 'bicu_a_idx', heapallindexed := false, checkunique := true)",
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Fatalf("%s: clean unique index raised: %v", sql, err)
+		}
+	}
+
+	// Rewrite the leaf entry for a=2 so its key encodes 1: the index now claims
+	// two live rows share key 1, while both heap tuples stay live and distinct.
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("expected in-memory catalog")
+	}
+	idx, ok := im.LookupIndex(parser.ObjectName{Name: "bicu_a_idx"})
+	if !ok {
+		t.Fatal("index bicu_a_idx not found")
+	}
+	rel := ctx.Catalog.IndexRelFileNode(idx)
+	key1, key2 := btree.EncodeInt4(1), btree.EncodeInt4(2)
+	patched := false
+	nblocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		t.Fatalf("NBlocks: %v", err)
+	}
+	for blk := btree.MetaBlock + 1; blk < nblocks && !patched; blk++ {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			t.Fatalf("pin block %d: %v", blk, perr)
+		}
+		if btree.ParseOpaque(s.Page()).IsLeaf() {
+			count, cerr := storage.PageLinePointerCount(s.Page())
+			if cerr != nil {
+				t.Fatalf("line pointer count: %v", cerr)
+			}
+			for slot := uint16(1); slot <= uint16(count); slot++ {
+				raw, rerr := storage.PageGetItemRawNoCopy(s.Page(), slot)
+				if rerr != nil || len(raw) != 8+len(key2) {
+					continue
+				}
+				if string(raw[8:]) == string(key2) {
+					copy(raw[8:], key1) // in-place: raw aliases the page
+					patched = true
+					break
+				}
+			}
+		}
+		if patched {
+			ctx.Pool.MarkDirty(s)
+		}
+		ctx.Pool.Unpin(s)
+	}
+	if !patched {
+		t.Fatal("could not locate the leaf entry for a=2 to damage")
+	}
+
+	// (1) The damage is invisible to every other tier.
+	for _, sql := range []string{
+		"SELECT bt_index_check('bicu_a_idx')",
+		"SELECT bt_index_check('bicu_a_idx', false, false)",
+		"SELECT bt_index_parent_check('bicu_a_idx', false, false, false)",
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Fatalf("%s: duplicate-key damage leaked into a non-checkunique tier: %v", sql, err)
+		}
+	}
+
+	// (2) checkunique finds it, with the upstream message and a detail naming
+	// both heap TIDs.
+	for _, sql := range []string{
+		"SELECT bt_index_check('bicu_a_idx', false, true)",
+		"SELECT bt_index_parent_check('bicu_a_idx', false, false, true)",
+	} {
+		qerr := func() error { _, e := runQueryWithErr(ctx, sql); return e }()
+		if qerr == nil {
+			t.Errorf("%s: live duplicate not detected", sql)
+			continue
+		}
+		const want = `index uniqueness is violated for index "bicu_a_idx"`
+		if !strings.Contains(qerr.Error(), want) {
+			t.Errorf("%s: got %q, want substring %q", sql, qerr.Error(), want)
+		}
+		// The heap-TID errdetail rides the ExecError's Detail (the wire DETAIL
+		// field), not the primary message, exactly as upstream's
+		// errdetail_internal does.
+		ee, ok := qerr.(*ExecError)
+		if !ok {
+			t.Errorf("%s: error is %T, want *ExecError", sql, qerr)
+			continue
+		}
+		if !strings.Contains(ee.Detail, "point to heap tid=") {
+			t.Errorf("%s: DETAIL %q lacks the duplicate errdetail", sql, ee.Detail)
+		}
+	}
+}
+
+// TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex pins upstream's
+// `state->indexinfo->ii_Unique` gate: the same duplicate-key layout on a
+// NON-unique index is not corruption at all, so checkunique must stay silent.
+func TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		"CREATE TABLE bicn (a int)",
+		// Genuine duplicates, permitted because the index is not unique.
+		"INSERT INTO bicn VALUES (1), (1), (2), (3)",
+		"CREATE INDEX bicn_a_idx ON bicn (a)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('bicn_a_idx', false, true)",
+		"SELECT bt_index_parent_check('bicn_a_idx', false, false, true)",
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: duplicates on a non-unique index reported: %v", sql, err)
+		}
+	}
+}

@@ -394,8 +394,24 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       in any key position dispatches; columns without a user class keep byte
       order for their own slice. Gates:
       `TestBtIndexCheck_OpClassDamageDetectedText` +
-      `TestBtIndexCheck_OpClassDamageDetectedComposite`. Still open for 005:
-      the `--checkunique` tier, `INCLUDE`/expression key columns, and
+      `TestBtIndexCheck_OpClassDamageDetectedComposite`.
+      **Third slice landed 2026-08-10 — the `checkunique` tier:**
+      `bt_index_check(..., checkunique := true)` previously accepted the
+      argument and ran nothing, so `pg_amcheck --checkunique` could not fail.
+      It now runs upstream's `bt_entry_unique_check`: engine
+      `amcheck.VerifyBtreeUnique` walks the whole leaf level carrying
+      `BtreeLastVisibleEntry` across page boundaries under the injected
+      `KeyComparator` (so a user opclass governs uniqueness as it governs item
+      order), `btree.PageLeafItems` retains slot/posting position for the
+      errdetail, and executor `btIndexCheckUnique` gates on `idx.Unique` and
+      supplies heap visibility from `ctx.Snap`. A duplicate is reported only
+      when BOTH heap tuples are visible — the dead-row-version duplicates every
+      healthy unique index accumulates stay clean. Gates:
+      `TestVerifyBtreeUnique_*` (7),
+      `TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate`,
+      `TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex`. Design:
+      `docs/design/0119-0006-checkunique-tier-amcheck.md`. Still open for 005:
+      `INCLUDE`/expression key columns, posting-list duplicate coverage, and
       non-invertible key types (NUMERIC, box/int4range/int4[]) — ledger rows
       2026-08-10.
 

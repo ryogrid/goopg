@@ -64,9 +64,15 @@ import (
 // corruption message (verbatim from verify_nbtree.c, including the
 // in index "<name>" clause, so the later SQL surface and the
 // 003_check/005_opclass_damage ports can reuse it).
+// Detail carries the upstream errdetail_internal text for the findings whose
+// upstream ereport has one and whose content is not derivable from Block alone
+// (today: the uniqueness tier's index/heap TID pair, verify_nbtree.c's
+// bt_report_duplicate). It is empty for tiers whose upstream detail is just the
+// block number, which the SQL surface already renders. M0119-0006.
 type BtreeReport struct {
-	Block storage.BlockNumber
-	Msg   string
+	Block  storage.BlockNumber
+	Msg    string
+	Detail string
 }
 
 // VerifyBtreePage runs the page-structural bt_index_check tier on a single

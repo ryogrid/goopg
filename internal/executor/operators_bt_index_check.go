@@ -25,13 +25,17 @@ package executor
 //   - VerifyBtreeLevelSiblingLinks per level (leftmost-descent right-link walk),
 //   - VerifyBtreeParentDownlinks on every internal page (parent-check only).
 //
-// The heapallindexed (heap↔index completeness), rootdescend, and checkunique
-// arguments are accepted for call-shape compatibility with pg_amcheck but their
-// deeper tiers are deferred to S5: heapallindexed needs MVCC-aware heap-tuple →
-// index-key extraction (the engine seam VerifyBtreeHeapAllIndexedRelation
-// exists, but forming the heap entry set is the missing piece), and the default
-// pg_amcheck B-tree probe passes `heapallindexed := false`. This deferral
-// mirrors S3's nil-XidStatusFunc clog-tier deferral. M0110-0003.
+// plus, when the call passes `checkunique := true` on a UNIQUE index,
+//   - VerifyBtreeUnique over the leaf level (btIndexCheckUnique below), the
+//     heap-visibility-aware duplicate-key tier. M0119-0006.
+//
+// The heapallindexed and rootdescend arguments are still accepted for call-shape
+// compatibility with pg_amcheck without running their tiers: heapallindexed needs
+// MVCC-aware heap-tuple → index-key extraction (the engine seam
+// VerifyBtreeHeapAllIndexedRelation exists, but forming the heap entry set is the
+// missing piece), and the default pg_amcheck B-tree probe passes
+// `heapallindexed := false`. This deferral mirrors S3's nil-XidStatusFunc
+// clog-tier deferral. M0110-0003.
 
 import (
 	"fmt"
@@ -40,6 +44,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -131,8 +136,16 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 		return page, nil
 	}
 
-	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck,
-		btIndexOpClassComparator(idx, im, ctx, x.Pos()))
+	cmpKeys := btIndexOpClassComparator(idx, im, ctx, x.Pos())
+	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys)
+	if err == nil && len(reports) == 0 {
+		// checkunique runs only on a structurally sound index: upstream reaches
+		// bt_entry_unique_check from inside bt_target_page_check, which never
+		// runs once an earlier per-page invariant has ereport(ERROR)ed.
+		var ureports []amcheck.BtreeReport
+		ureports, err = btIndexCheckUnique(x, row, ctx, idx, src, parentCheck, cmpKeys)
+		reports = append(reports, ureports...)
+	}
 	if err != nil {
 		// A genuine read error (not a corruption finding) maps to internal error.
 		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: err.Error()}
@@ -198,6 +211,68 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 		}
 	}
 	return reports, nil
+}
+
+// btIndexCheckUnique runs amcheck's `checkunique` tier when the call requested
+// it and the target index actually declares UNIQUE — upstream's two gates,
+// `state->checkunique` and `state->indexinfo->ii_Unique` (verify_nbtree.c:1650).
+// A non-unique index, or a call that left the argument at its false default
+// (which is what pg_amcheck emits unless `--checkunique` is passed), yields no
+// findings without touching the heap.
+//
+// The argument is positional: bt_index_check(index, heapallindexed, checkunique)
+// puts it third, bt_index_parent_check(index, heapallindexed, rootdescend,
+// checkunique) fourth — the parser strips named-argument labels and keeps the
+// written order (M0097-0003), which for both pg_amcheck call shapes is the
+// declared order.
+//
+// Heap visibility is the tier's one real dependency and is supplied here from
+// the executor's own MVCC state, mirroring upstream's use of a registered
+// transaction snapshot taken once per index check (verify_nbtree.c:471). Without
+// a snapshot in Context there is nothing to judge liveness against, so the tier
+// is skipped rather than answered wrongly. M0119-0006.
+func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog.Index,
+	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator,
+) ([]amcheck.BtreeReport, error) {
+	argIdx := 2
+	if parentCheck {
+		argIdx = 3
+	}
+	if len(x.Args) <= argIdx {
+		return nil, nil
+	}
+	d, err := evalExpr(x.Args[argIdx], row, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d.IsNull() || !d.BoolValue() {
+		return nil, nil
+	}
+	if !idx.Unique || idx.Table == nil || ctx.Snap.Xmax == 0 {
+		// Xmax == 0 is an unseeded snapshot (no transaction snapshot was taken
+		// for this statement); there is nothing to judge tuple liveness against.
+		return nil, nil
+	}
+
+	heapRel := ctx.Catalog.RelFileNode(idx.Table)
+	visible := func(tid storage.ItemPointer) bool {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: tid.Block})
+		if perr != nil {
+			return false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), tid.Offset)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			// An index entry pointing at an unreadable heap slot is heap damage,
+			// which verify_heapam reports; it is not a live duplicate.
+			return false
+		}
+		return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+			ctx.comboStore(), ctx.MultiXact)
+	}
+	return amcheck.VerifyBtreeUnique(src, idx.Name, cmpKeys, visible)
 }
 
 // btIndexOpClassComparator returns the operator-class key comparator to verify
@@ -386,6 +461,11 @@ func btIndexReportDetail(reports []amcheck.BtreeReport) string {
 			b.WriteByte('\n')
 		}
 		fmt.Fprintf(&b, "block %d: %s", r.Block, r.Msg)
+		if r.Detail != "" {
+			// The uniqueness tier carries upstream's own errdetail text
+			// (bt_report_duplicate); pass it through verbatim.
+			fmt.Fprintf(&b, " %s", r.Detail)
+		}
 	}
 	return b.String()
 }
