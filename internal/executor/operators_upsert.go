@@ -1511,7 +1511,7 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 				return nil, nil
 			}
 			// Encode the expression result as a text/varchar key.
-			k := encodeArbiterExprKey(v, pos)
+			k := encodeArbiterExprKey(v, oc.ArbiterExprs[i], pos)
 			if k == nil {
 				return nil, &ExecError{Code: "42804", Pos: pos, Message: "expression-based arbiter column produced unsupported datum type"}
 			}
@@ -1544,10 +1544,22 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 //
 // Dispatch is on the runtime Datum kind rather than a declared column type,
 // because an expression key column has no catalog column to consult
-// (idx.Columns[i] == ""); planner.inferExprType is unexported and too weak to
-// give a reliable static result type. Kind dispatch is sound as long as an
-// expression yields a stable kind across rows, which holds for every builtin
-// goopg evaluates today (see the deferral ledger row for the mixed-kind case).
+// (idx.Columns[i] == ""). Kind dispatch is sound as long as an expression
+// yields a stable kind across rows, which holds for every builtin goopg
+// evaluates today EXCEPT float4/float8 (see the deferral ledger row for the
+// remaining mixed-kind cases).
+//
+// float is the exception, and the reason keyExpr exists. goopg has no
+// KindFloat: the codec re-parses a stored float's PGFloatOut text
+// (floatTextDatum), so one float column yields KindNumeric for 1.5 and
+// KindString for 1e+30 / Infinity / NaN. Under pure kind dispatch those two
+// rows would land in the SAME index under DIFFERENT encodings (EncodeNumericKey
+// vs EncodeVarchar), which is not an ordering at all. So when the key
+// expression's static result type (planner.ExprResultType) is a float type,
+// every row goes through EncodeFloat8 — the same encoder a float8 *column* key
+// uses, whose bit-flip order puts NaN last exactly as PG's float8 opclass does.
+// keyExpr may be nil (callers that have no resolved expression); then the kind
+// dispatch below applies unchanged.
 //
 // Each arm reuses the same order-preserving encoder that the equivalent
 // declared column type would use, so bytewise comparison of the encoded key
@@ -1566,7 +1578,14 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 //
 // Returns nil for a kind with no btree encoding; callers treat that as
 // "row not indexable" rather than an error.
-func encodeArbiterExprKey(v Datum, pos int) []byte {
+func encodeArbiterExprKey(v Datum, keyExpr planner.Expr, pos int) []byte {
+	if exprKeyIsFloat(keyExpr) {
+		f, _, ok := datumToFloat64ForKey(v)
+		if !ok {
+			return nil
+		}
+		return btree.EncodeFloat8(f)
+	}
 	switch v.Kind {
 	case KindString:
 		return btree.EncodeVarchar([]byte(v.StringValue()))
@@ -1587,6 +1606,20 @@ func encodeArbiterExprKey(v Datum, pos int) []byte {
 		return btree.EncodeVarchar(v.BytesValue())
 	}
 	return nil
+}
+
+// exprKeyIsFloat reports whether an index key expression's static result type is
+// a float type, which is the one case where encodeArbiterExprKey cannot dispatch
+// on the runtime Datum kind (see its comment). Resolution failure means "not
+// known to be float" and leaves the kind dispatch in charge — the pre-M0119-0006
+// behaviour — so an expression whose type goopg cannot resolve is never made
+// worse by this check.
+func exprKeyIsFloat(keyExpr planner.Expr) bool {
+	if keyExpr == nil {
+		return false
+	}
+	t, ok := planner.ExprResultType(keyExpr)
+	return ok && !t.IsArray && isFloat8Type(t.Name)
 }
 
 // exprKeyDecodeType is the DECODE-side twin of encodeArbiterExprKey: given the
@@ -1642,6 +1675,13 @@ func exprKeyDecodeType(t catalog.Type) (surrogate catalog.Type, allowRoutine boo
 		// KindBytes → EncodeVarchar: same self-delimiting form as text, but the
 		// decoded Datum is a string of raw bytes.
 		return catalog.Type{Name: "text"}, false, true
+	case "float4", "float8", "real", "double precision", "double", "float":
+		// Type-directed arm (exprKeyIsFloat), not kind dispatch: every float key
+		// is EncodeFloat8, exactly as a float8 COLUMN key is. allowRoutine is
+		// true because the decode is the column path's decode too — a float8
+		// column key also comes back as the 'g'-formatted string a comparator
+		// declared over float8 already sees.
+		return catalog.Type{Name: "float8"}, true, true
 	}
 	return catalog.Type{}, false, false
 }

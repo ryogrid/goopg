@@ -7098,7 +7098,7 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 			if err != nil || v.IsNull() {
 				return nil
 			}
-			k := encodeArbiterExprKey(v, 0)
+			k := encodeArbiterExprKey(v, planExpr, 0)
 			if k == nil {
 				return nil
 			}

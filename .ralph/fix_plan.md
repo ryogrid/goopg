@@ -483,8 +483,24 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestBtIndexCheck_OpClassDamageDetectedExpression` and
       `TestBtIndexCheck_ExpressionKeyCleanUnderPlainOpClass` (the decode-width
       gate), both confirmed non-vacuous.
-      Remaining for M0119-0006: float4/float8 and enum expression key encodings
-      (the two kinds `exprKeyDecodeType` still declines), posting-list duplicate
+      **Slice landed 2026-08-10 (10th) — FLOAT expression key encoding, made
+      type-directed** (design
+      `docs/design/0119-0006-expression-index-float-key.md`). The kind-dispatch
+      assumption behind `encodeArbiterExprKey` broke on float INSIDE one column:
+      goopg has no `KindFloat`, so `codec.go` re-parses a stored float's
+      `PGFloatOut` text and yields `KindNumeric` for `1.5` but `KindString` for
+      `1e+30`/`Infinity`/`NaN` — the same expression index was written by
+      `EncodeNumericKey` AND `EncodeVarchar`, whose byte spaces do not
+      interleave, so it was not ordered at all (a range scan could miss
+      arbitrarily many live rows). The encoder now takes the resolved key
+      expression and routes every row of a float-typed expression through
+      `btree.EncodeFloat8` (PG's `float8_cmp_internal` order, NaN last), with
+      `datumToFloat64ForKey` shared with the float COLUMN path. Gates
+      `TestEncodeArbiterExprKeyFloatIsTypeDirected` +
+      `TestExpressionIndexBuildFloatKey` (physical tree scan, bulk build and
+      post-build INSERT), confirmed non-vacuous.
+      Remaining for M0119-0006: enum expression key encoding (needs
+      `ExprResultType` to resolve user enum types), posting-list duplicate
       coverage in the checkunique tier, `box`/`int4range`/`int4[]`/interval key
       encodings, and the whole-database (unscoped) pg_amcheck run — ledger rows
       2026-08-10.

@@ -10798,7 +10798,8 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 //   - expression yields NULL          → hasNullKey (row not indexable, no null bitmap)
 //   - expression result kind has no   → key == nil, so the caller skips the row
 //     btree encoding (encodeArbiterExprKey covers string/int/numeric/
-//     timestamp/bool/enum/bytea; see its comment for the encoder per kind)
+//     timestamp/bool/enum/bytea by kind, plus float4/float8 by resolved type;
+//     see its comment for the encoder per kind)
 //   - otherwise                       → bytes appended in key-column order
 func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
@@ -10819,7 +10820,7 @@ func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Col
 			if v.IsNull() {
 				return nil, true, nil
 			}
-			k := encodeArbiterExprKey(v, pos)
+			k := encodeArbiterExprKey(v, keyExprs[i], pos)
 			if k == nil {
 				return nil, false, nil
 			}
@@ -11018,27 +11019,11 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isFloat8Type(col.Type.Name):
 		// float4/float8 stored as text; decode then re-encode sortably.
-		var f float64
-		switch v.Kind {
-		case KindString:
-			var err error
-			f, err = strconv.ParseFloat(v.StringValue(), 64)
-			if err != nil {
+		f, badSyntax, ok := datumToFloat64ForKey(v)
+		if !ok {
+			if badSyntax {
 				return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("invalid float value %q for index key", v.StringValue())}
 			}
-		case KindInt:
-			f = float64(v.Int)
-		case KindNumeric:
-			// Convert NUMERIC datum (mantissa * 10^-scale) to float64.
-			m := numericMant(v)
-			fv, _ := new(big.Float).SetInt(m).Float64()
-			if v.Scale > 0 {
-				fv /= math.Pow10(int(v.Scale))
-			} else if v.Scale < 0 {
-				fv *= math.Pow10(-int(v.Scale))
-			}
-			f = fv
-		default:
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
 		return btree.EncodeFloat8(f), nil
@@ -11179,6 +11164,40 @@ func isTimestamptzType(name string) bool {
 }
 
 // isFloat8Type returns true for float8 / float4 / real / double precision.
+// datumToFloat64ForKey coerces a runtime Datum holding a float4/float8 value to
+// the float64 that btree.EncodeFloat8 orders on. goopg has no KindFloat: the
+// codec renders a stored float through PGFloatOut and then re-parses it
+// (floatTextDatum), so the SAME float column yields KindNumeric for a value that
+// prints as a plain decimal ("1.5") and KindString for one that does not
+// ("1e+30", "Infinity", "NaN"). Every float key encoder must therefore accept
+// both kinds, or one index would mix two encodings and lose its ordering.
+//
+// badSyntax distinguishes an unparseable string (PG's 22003 for an index key)
+// from a kind that is not a float at all (42804); both return ok=false.
+func datumToFloat64ForKey(v Datum) (f float64, badSyntax, ok bool) {
+	switch v.Kind {
+	case KindString:
+		parsed, err := strconv.ParseFloat(v.StringValue(), 64)
+		if err != nil {
+			return 0, true, false
+		}
+		return parsed, false, true
+	case KindInt:
+		return float64(v.Int), false, true
+	case KindNumeric:
+		// Convert NUMERIC datum (mantissa * 10^-scale) to float64.
+		m := numericMant(v)
+		fv, _ := new(big.Float).SetInt(m).Float64()
+		if v.Scale > 0 {
+			fv /= math.Pow10(int(v.Scale))
+		} else if v.Scale < 0 {
+			fv *= math.Pow10(-int(v.Scale))
+		}
+		return fv, false, true
+	}
+	return 0, false, false
+}
+
 func isFloat8Type(name string) bool {
 	switch strings.ToLower(name) {
 	case "float8", "float4", "real", "double precision", "double", "float":
