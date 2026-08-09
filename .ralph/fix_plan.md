@@ -352,6 +352,23 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       rather than counted, and TPS then *rises* (7.6k→14.5k) as ~50 of 100
       clients die — the failure is silent in the headline numbers. The `-S`
       select-only stage is clean, so it is write-path specific.
+      **New evidence 2026-08-10 (incidental, from the commit hook — NOT worked
+      this loop):** this reproduces at the smoke's tiny scale too, so the c=100
+      / s=50 nightly config is NOT required. The pre-commit pgbench smoke
+      (`RALPH_PRECOMMIT_SCOPE=smoke`, s=1 **c=2** T=30, fresh initdb) hit the
+      identical `client 0 script 0 aborted in command 4 query 0: ERROR:
+      current transaction is aborted` once; an immediate re-run of the same
+      command passed clean (417732 txns, 0 failed). Two things worth chasing:
+      (a) the failing run also ran **36× slower** — 389 tps / 2.890 ms avg vs
+      13924 tps / 0.143 ms on the clean re-run — so whatever aborts the
+      transaction is correlated with (or caused by) a massive stall, not with
+      client count; (b) `grep -E 'ERROR|FATAL|panic'` over the whole server log
+      of the failing run returns **nothing**, confirming the nightly note that
+      the originating error never reaches the log. That combination says the
+      server aborted the transaction internally without emitting an
+      ErrorResponse for the *originating* command, which is the thing to find:
+      instrument the abort-marking site rather than hunting for a missing log
+      line. A 2-client repro makes this cheap to bisect.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
