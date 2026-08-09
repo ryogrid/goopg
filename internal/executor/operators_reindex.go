@@ -202,7 +202,7 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 // rebuildIndex physically rebuilds idx's on-disk btree pages from a fresh
 // scan of its table's heap, keeping the index's OID and catalog metadata
 // unchanged — reusing the exact bulk-build path CREATE INDEX uses
-// (ddlOp.bulkBuildBTree/bulkBuildBTreeWithPredicate, which truncates the
+// (ddlOp.bulkBuildBTreeFull, which truncates the
 // relation before repacking it). M0122-0007 (REINDEX physical rebuild).
 //
 // Non-btree access methods (gist/spgist/gin/brin) are catalog-only in
@@ -225,9 +225,10 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 	cols := make([]*catalog.Column, len(idx.Columns))
 	for i, name := range idx.Columns {
 		if name == "" {
-			// Expression column (e.g. lower(col)); collectBTreeEntries skips
-			// rows with an all-expression key, matching CREATE INDEX's own
-			// documented limitation for expression indexes.
+			// Expression column (e.g. lower(col)): cols[i] stays nil and the
+			// key bytes come from resolveIndexKeyExprs(tbl, idx) below, which
+			// the bulk build evaluates per row (M0119-0006) — the same
+			// expression the runtime maintain path encodes on INSERT.
 			continue
 		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
@@ -248,10 +249,7 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 	}
 	defer release()
 	dop := &ddlOp{ctx: o.ctx}
-	if predExpr != nil {
-		return dop.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
-	}
-	return dop.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos)
+	return dop.bulkBuildBTreeFull(idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 }
 
 // rebuildTableIndexes rebuilds every btree index on tbl. Used by plain
@@ -388,9 +386,10 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 	cols := make([]*catalog.Column, len(idx.Columns))
 	for i, name := range idx.Columns {
 		if name == "" {
-			// Expression column (e.g. lower(col)); collectBTreeEntries skips
-			// rows with an all-expression key, matching CREATE INDEX's own
-			// documented limitation for expression indexes.
+			// Expression column (e.g. lower(col)): cols[i] stays nil and the
+			// key bytes come from resolveIndexKeyExprs(tbl, idx) below, which
+			// the bulk build evaluates per row (M0119-0006) — the same
+			// expression the runtime maintain path encodes on INSERT.
 			continue
 		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
@@ -406,12 +405,7 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 	shadowRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	shadowRel.RelOid = o.ctx.Catalog.AllocOID()
 	dop := &ddlOp{ctx: o.ctx}
-	var buildErr error
-	if predExpr != nil {
-		buildErr = dop.bulkBuildBTreeWithPredicate(shadowRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
-	} else {
-		buildErr = dop.bulkBuildBTree(shadowRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos)
-	}
+	buildErr := dop.bulkBuildBTreeFull(shadowRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 	if buildErr != nil {
 		o.removeShadowFile(shadowRel)
 		return storage.RelFileNode{}, false, buildErr

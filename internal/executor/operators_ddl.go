@@ -10383,11 +10383,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	if xp != nil {
 		predExpr = xp.Predicate
 	}
-	if predExpr != nil {
-		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
-	} else {
-		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
-	}
+	// M0119-0006: resolve expression key columns so the build indexes them too.
+	// Before this, `CREATE INDEX ON t(lower(c))` over pre-existing rows built an
+	// EMPTY index while INSERT-time maintenance did populate it.
+	keyExprs := resolveIndexKeyExprs(tbl, idx)
+	buildErr = o.bulkBuildBTreeFull(idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
@@ -10413,16 +10413,16 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	return nil
 }
 
-// bulkBuildBTree collects all heap entries into memory, then calls
+// bulkBuildBTreeFull collects all heap entries into memory, then calls
 // btree.BulkCreate for a sort-then-build pass (M0047-0001). This replaces
 // the old Create+backfillBTree flow and is significantly faster for large
 // tables because it avoids per-key tree traversals and page splits.
-func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
-	return o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, indexName, pos, nil)
-}
-
-func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
-	entries, err := o.collectBTreeEntries(tbl, cols, unique, nullsNotDistinct, indexName, pos, predExpr)
+// keyExprs (M0119-0006) carries the resolved expression key columns of an
+// expression index, parallel to cols (see encodeCompositeBTreeKeyWithExprs);
+// callers building a plain index pass nil and get the pre-existing behaviour.
+// predExpr is the partial-index predicate, or nil.
+func (o *ddlOp) bulkBuildBTreeFull(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+	entries, err := o.collectBTreeEntries(tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -10435,7 +10435,7 @@ func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *cat
 
 // collectBTreeEntries scans the heap, decodes visible tuples, encodes
 // B-tree keys, enforces uniqueness, and returns the entries for bulk build.
-func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -10524,7 +10524,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 					continue
 				}
 			}
-			key, hasNullKey, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			key, hasNullKey, encErr := encodeCompositeBTreeKeyWithExprs(o.ctx, row, cols, keyExprs, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
@@ -10779,11 +10779,50 @@ func parseReloptionBool(s string) (bool, bool) {
 // divergence that made CREATE INDEX over any NULL-containing column fail
 // (PostgreSQL admits NULLs in unique indexes, distinct by default).
 func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+	return encodeCompositeBTreeKeyWithExprs(nil, row, cols, nil, pos)
+}
+
+// encodeCompositeBTreeKeyWithExprs is encodeCompositeBTreeKey extended with the
+// resolved expression key columns of an expression index (M0119-0006): keyExprs
+// is parallel to cols, and keyExprs[i] is non-nil exactly where cols[i] is nil
+// because idx.Columns[i] == "" (an expression key such as `lower(col)`).
+//
+// Before this existed the bulk-build path skipped expression key columns
+// outright, so `CREATE INDEX ON t(lower(c))` over pre-existing rows produced an
+// EMPTY index — and REINDEX threw away the entries that the runtime maintain
+// path (encodeExprIndexKey in operators_storage.go) had written on INSERT.
+// The two paths are siblings and must encode identically, so this evaluates the
+// same resolved expression and reuses the same encodeArbiterExprKey encoder.
+//
+// Three outcomes, matching the runtime path's own semantics:
+//   - expression yields NULL          → hasNullKey (row not indexable, no null bitmap)
+//   - expression result kind has no   → key == nil, so the caller skips the row
+//     btree encoding (encodeArbiterExprKey covers string + int only)
+//   - otherwise                       → bytes appended in key-column order
+func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
-	for _, col := range cols {
+	for i, col := range cols {
 		if col == nil {
-			// Expression column — cannot encode from raw row during bulk build.
-			// Callers building expression indexes must handle this separately.
+			if ctx == nil || i >= len(keyExprs) || keyExprs[i] == nil {
+				// Expression column with no resolved expression — cannot encode
+				// from raw row during bulk build; caller skips the row.
+				continue
+			}
+			v, evalErr := evalExpr(keyExprs[i], row, ctx)
+			if evalErr != nil {
+				// A key expression that cannot be evaluated over stored data is
+				// not a build failure here; the row is simply not indexed (the
+				// runtime maintain path makes the same call).
+				return nil, false, nil
+			}
+			if v.IsNull() {
+				return nil, true, nil
+			}
+			k := encodeArbiterExprKey(v, pos)
+			if k == nil {
+				return nil, false, nil
+			}
+			out = append(out, k...)
 			continue
 		}
 		v := row[col.Ordinal]
@@ -10799,6 +10838,31 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 		out = append(out, k...)
 	}
 	return out, false, nil
+}
+
+// resolveIndexKeyExprs resolves idx's stored expression key columns
+// (idx.ColExprs, set where idx.Columns[i] == "") against tbl so the bulk-build
+// path can evaluate them per row. Returns nil when idx has no expression key
+// column, which keeps every plain index on the byte-for-byte-unchanged path.
+func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []planner.Expr {
+	if idx == nil || len(idx.ColExprs) == 0 {
+		return nil
+	}
+	var out []planner.Expr
+	for i, name := range idx.Columns {
+		if name != "" || i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
+			continue
+		}
+		planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+		if err != nil || planExpr == nil {
+			continue
+		}
+		if out == nil {
+			out = make([]planner.Expr, len(idx.Columns))
+		}
+		out[i] = planExpr
+	}
+	return out
 }
 
 // nndNullKeyDedupKey builds an in-memory-only dedup key for a row that has at
@@ -14746,7 +14810,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idxName, 0); err != nil {
+			if err := o.bulkBuildBTreeFull(idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
 				return err
 			}
 		}

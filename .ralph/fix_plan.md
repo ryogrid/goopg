@@ -456,9 +456,25 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       to parse, so `cmd/gen-oracle-port-status` could not regenerate the `.md`
       at all. CSV row `AC-003` rationale updated + `.md` regenerated; `AC-003`
       stays `defer` because its 003/004 tiers still need index AMs goopg lacks.
-      Remaining for M0119-0006: expression key columns, posting-list duplicate
-      coverage, `box`/`int4range`/`int4[]` key encodings, and the whole-database
-      (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      **Slice landed 2026-08-10 (7th) — expression key columns in the B-tree
+      BULK BUILD** (design `docs/design/0119-0006-expression-index-bulk-build.md`).
+      Chasing the expression-key arm of the comparator dispatch surfaced a real
+      data defect one layer down: the bulk-build encoder skipped expression key
+      columns outright while the runtime maintain path evaluated them, so
+      `CREATE INDEX ON t(lower(b))` over pre-existing rows built a physically
+      EMPTY index, REINDEX (plain and CONCURRENTLY) discarded the entries INSERT
+      had written, and a mixed `(a, lower(b))` index stored keys missing the
+      expression component. Both encoders now share `encodeArbiterExprKey` via
+      `encodeCompositeBTreeKeyWithExprs`/`resolveIndexKeyExprs`; gates
+      `TestExpressionIndexBuildIndexesExistingRows` +
+      `TestReindexExpressionIndexKeepsEntries` (physical entry counts, confirmed
+      non-vacuous).
+      Remaining for M0119-0006: widen `encodeArbiterExprKey` beyond string/int
+      (needs the expression's result type — `planner.inferExprType` is
+      unexported and weak) so amcheck's comparator dispatch can cover
+      expression keys, posting-list duplicate coverage, `box`/`int4range`/
+      `int4[]` key encodings, and the whole-database (unscoped) pg_amcheck run
+      — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
