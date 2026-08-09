@@ -751,9 +751,10 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		return nil
 	}
 	type dbRow struct {
-		oid   uint32
-		name  string
-		owner uint32
+		oid       uint32
+		name      string
+		owner     uint32
+		connLimit int32
 	}
 	rel := storage.RelFileNode{DBOid: 0, RelOid: catalog.PgDatabaseRelationOID, Fork: storage.MainFork}
 	cols := catalog.PgDatabaseColumnsPG18()
@@ -764,7 +765,12 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return dbRow{oid: uint32(d[0].Int), name: d[1].StringValue(), owner: uint32(d[2].Int)}, false, nil
+			return dbRow{
+				oid:       uint32(d[0].Int),
+				name:      d[1].StringValue(),
+				owner:     uint32(d[2].Int),
+				connLimit: int32(d[catalog.PgDatabaseDatConnLimitOrdinal].Int),
+			}, false, nil
 		})
 	if err != nil {
 		return err
@@ -775,9 +781,13 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			continue // bootstrap databases are registered at construction
 		}
 		cat.RegisterDatabaseDuringRecovery(db.name, db.owner, db.oid)
+		// M0122-0006: restore datconnlimit from the heap row so a
+		// restart preserves the value set by UPDATE pg_database SET
+		// datconnlimit.
+		cat.SetDatabaseConnLimit(db.name, db.connLimit)
 	}
-	return nil
-}
+		return nil
+	}
 
 // reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
 // replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +

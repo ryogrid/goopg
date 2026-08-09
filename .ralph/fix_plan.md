@@ -464,17 +464,33 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       non-ANALYZE path (planner memory — goopg's planner doesn't use mctx);
       per-node counters are inclusive like WAL/BUFFERS.
 
-- [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
+- [x] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
-      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write
+      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
+      **COMPLETE (2026-08-09).** All sub-items verified at HEAD:
+      (1) Persistent pg_index heap — done (M0113 + B5 Slice A, kinds 20/21/94 retired);
+      (2) index column order (ASC/DESC/NULLS) across restart — done (buildUserPGIndexRow
+      writes indoption, DecodePGIndexPhysicalRow decodes it, loadUserIndexesFromHeap
+      restores ColDescending/ColNullsFirst);
+      (3) pg_tablespace visibility — done (B4.1: heap-backed shared catalog with
+      RM_TBLSPC, kinds 124/125 retired; pg_dump + pg_basebackup tests PASS);
+      (4) pg_database.datconnlimit write — done (this loop: PersistDatConnLimit
+      in-place heap update wired into UPDATE pg_database SET datconnlimit;
+      reloadDatabasesFromHeap restores connLimit for user databases;
+      TestPort_DatConnLimitSurvivesRestart PASS).
 
-- [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
+- [x] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN,
       planner/jit GUC stubs. (`goopg reload`/SIGHUP and `goopg restart` done.)
-      **Remaining M0122-0007 items:** CREATE/DROP DATABASE physical storage
-      isolation (template copy on CREATE, real directory removal on DROP —
-      the architectural item), `WITH (FORCE)` connection-termination (no
-      cancel-backend mechanism), REINDEX CONCURRENTLY physical rebuild.
+      **COMPLETE (2026-08-09).** All three previously-remaining items verified
+      implemented at HEAD: (1) CREATE/DROP DATABASE physical storage isolation —
+      done (database_ddl.go: createDatabasePhysicalDirectory,
+      removeDatabasePhysicalDirectory, copyTemplateTables, template-copy for
+      sequences/views/matviews); (2) WITH (FORCE) connection-termination — done
+      (cancel.go: terminateByPID + database_ddl.go: terminateOtherDBBackends +
+      waitForDatabaseBackendsToDrain); (3) REINDEX CONCURRENTLY physical rebuild —
+      done (reindex_physical_rebuild_test.go: build-then-swap verified).
+      Gates: all database-DDL tests, REINDEX tests, pgbench smoke PASS.
 
   - [x] `pg_ts_config per-DB routing` (2026-08-09, this loop) —
       **UserTSConfig registry now dbOid-scoped** — DBOid field added to
@@ -580,6 +596,16 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
+      **Status (2026-08-09):** SASLprep, scram_iterations, RBAC for DML/SELECT/
+      view-owner, and SET SESSION AUTHORIZATION (full end-to-end SetSessionAuthorization
+      callback in both simple/extended query paths) all LANDED. CREATE DATABASE ENCODING
+      validation landed this loop (M0122-0008: ValidServerEncodingName +
+      extractEncodingRawFromSQL + catalog.databaseEncoding storage + heap-row override).
+      **Genuinely remaining:** (1) channel binding — blocked on TLS infrastructure
+      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) runtime encoding constraints
+      beyond CREATE DATABASE (client_encoding GUC validation, bootstrap encoding
+      enforcement, locale↔encoding mismatch checks — the catalog/storage layer doesn't
+      do actual encoding conversion).
       **RBAC for INSERT/UPDATE/DELETE landed (2026-07-05, this loop,
       M0097-0040):** `dmlPrivilegePermitted` (`internal/executor/
       operators_storage.go`) checks the existing `tableACLs`/

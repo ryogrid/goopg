@@ -2281,6 +2281,12 @@ type InMemory struct {
 	// Absent entries report -1 (PG's "no limit" default, pg_database.h) via
 	// DatabaseConnLimit's comma-ok lookup.
 	databaseConnLimit map[string]int32
+	// databaseEncoding holds the per-database encoding (pg_database.encoding,
+	// pg_enc integer ID). Set at CREATE DATABASE time from the ENCODING option
+	// (or inherited from the template). Absent entries (bootstrap databases
+	// or databases created before this field was added) report PG_UTF8 (6)
+	// via DatabaseEncoding. M0122-0008.
+	databaseEncoding map[string]int32
 	// databaseOwner holds `pg_database.datdba` for databases registered via
 	// CreateDatabase/RegisterDatabaseDuringRecovery (M0122-0007 DROP DATABASE
 	// ownership check). Absent entries (the bootstrap postgres/template0/
@@ -3743,6 +3749,7 @@ func NewInMemory() *InMemory {
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		databaseConnLimit:      make(map[string]int32),
+		databaseEncoding:       make(map[string]int32),
 		databaseOwner:          make(map[string]uint32),
 		databaseOid:            make(map[string]uint32),
 		dbRoleSettings:         make(map[uint32][]string),
@@ -5030,6 +5037,7 @@ func (c *InMemory) DropDatabase(name string) error {
 	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
+	delete(c.databaseEncoding, name)
 	delete(c.databaseOwner, name)
 	delete(c.databaseOid, name)
 	return nil
@@ -5229,6 +5237,30 @@ func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
 		return false
 	}
 	c.databaseConnLimit[name] = limit
+	return true
+}
+
+// DatabaseEncoding returns the per-database encoding (pg_enc integer ID) for
+// name, or PG_UTF8 (6) if none was explicitly set — all bootstrap databases
+// and databases created before M0122-0008 default to UTF8. M0122-0008.
+func (c *InMemory) DatabaseEncoding(name string) int32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if enc, ok := c.databaseEncoding[name]; ok {
+		return enc
+	}
+	return 6 // PG_UTF8
+}
+
+// SetDatabaseEncoding records a per-database encoding for name. Returns false
+// if name is not a registered database. M0122-0008.
+func (c *InMemory) SetDatabaseEncoding(name string, encoding int32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return false
+	}
+	c.databaseEncoding[name] = encoding
 	return true
 }
 

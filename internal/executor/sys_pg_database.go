@@ -41,10 +41,12 @@ func pgDatabaseRel() storage.RelFileNode {
 
 // SyncPgDatabaseCatalogRow INSERTs the pg_database heap row for a freshly
 // created database newOid, cloning encoding/locale from the template database's
-// existing heap row and overwriting the identity columns. It maintains the
-// 2671/2672 indexes. Exported for the server-layer CREATE DATABASE handler,
-// which drives it from its own short-lived transaction.
-func SyncPgDatabaseCatalogRow(ctx *Context, newOid uint32, name string, owner, templateOid uint32) error {
+// existing heap row and overwriting the identity columns. encodingOverride, when
+// >= 0, replaces the template's encoding with the user-specified pg_enc ID
+// (e.g. from CREATE DATABASE ... ENCODING 'LATIN1'); when -1 the template's
+// encoding is inherited verbatim. It maintains the 2671/2672 indexes. Exported
+// for the server-layer CREATE DATABASE handler. M0122-0008.
+func SyncPgDatabaseCatalogRow(ctx *Context, newOid uint32, name string, owner, templateOid uint32, encodingOverride int32) error {
 	if !catalogHeapSyncAvailable(ctx) {
 		return nil
 	}
@@ -63,7 +65,7 @@ func SyncPgDatabaseCatalogRow(ctx *Context, newOid uint32, name string, owner, t
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	row := clonePgDatabaseRowForCreate(tmpl, newOid, name, owner)
+	row := clonePgDatabaseRowForCreate(tmpl, newOid, name, owner, encodingOverride)
 	tid, err := writeHeapRowCanonical(ctx, pgDatabaseRel(), cols, row)
 	if err != nil {
 		return err
@@ -103,14 +105,18 @@ func DeletePgDatabaseCatalogRow(ctx *Context, oid uint32) error {
 // varlen datcollate/datctype/datlocale/daticurules/datcollversion/datacl) is
 // inherited verbatim from the template, matching what CREATE DATABASE ...
 // TEMPLATE would produce. Ordinals per catalog.PgDatabaseColumnsPG18.
-func clonePgDatabaseRowForCreate(tmpl Row, newOid uint32, name string, owner uint32) Row {
+func clonePgDatabaseRowForCreate(tmpl Row, newOid uint32, name string, owner uint32, encodingOverride int32) Row {
 	row := make(Row, len(tmpl))
 	copy(row, tmpl)
 	row[0] = NewIntDatum(int64(newOid)) // oid
 	row[1] = NewStringDatum(name)       // datname
 	row[2] = NewIntDatum(int64(owner))  // datdba
-	row[5] = NewBoolDatum(false)        // datistemplate
-	row[6] = NewBoolDatum(true)         // datallowconn
+	// Ordinal 3 = encoding (int4). Default -1 -> inherit template encoding. M0122-0008.
+	if encodingOverride >= 0 {
+		row[3] = NewIntDatum(int64(encodingOverride))
+	}
+	row[5] = NewBoolDatum(false) // datistemplate
+	row[6] = NewBoolDatum(true)  // datallowconn
 	return row
 }
 
@@ -170,4 +176,100 @@ func decodePgDatabaseRowOnPage(slot *storage.Slot, cols []catalog.Column, oid ui
 		return row, true, nil
 	}
 	return nil, false, nil
+}
+
+// PersistDatConnLimit does an in-place update of the on-disk pg_database
+// heap tuple (global/1262) for the database identified by dbOid, setting
+// datconnlimit to newLimit. It mirrors persistDatFrozenXID's heap_inplace_update
+// pattern: scan every page, locate the live tuple whose oid matches dbOid,
+// decode it, overwrite the datconnlimit column, re-encode, and
+// PageReplaceItemRaw. The caller (nextVirtualPgDatabase) treats any error as
+// non-fatal — the in-memory registry (SetDatabaseConnLimit) is goopg's truth;
+// this heap write exists purely for restart durability and standby parity
+// (M0122-0006).
+//
+// Unlike persistDatFrozenXID, which hard-codes the session database's OID, this
+// takes dbOid explicitly because the UPDATE's WHERE clause can name any
+// database.
+func PersistDatConnLimit(ctx *Context, dbOid uint32, newLimit int32) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	rel := pgDatabaseRel()
+	cols := catalog.PgDatabaseColumnsPG18()
+
+	nblocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	for blk := storage.BlockNumber(0); blk < nblocks; blk++ {
+		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return err
+		}
+		updated, done, err := updatePgDatabaseConnLimitOnPage(ctx, slot, rel, cols, dbOid, newLimit)
+		ctx.Pool.Unpin(slot)
+		if err != nil {
+			return err
+		}
+		if done {
+			_ = updated
+			return nil
+		}
+	}
+	return nil
+}
+
+// updatePgDatabaseConnLimitOnPage scans one pg_database page for the live tuple
+// whose oid matches dbOid, performs an in-place overwrite of datconnlimit, and
+// marks the page dirty. done is true once the row has been located on this
+// page. Mirrors updatePgDatabaseTupleOnPage (operators_vacuum_datfrozenxid.go).
+func updatePgDatabaseConnLimitOnPage(ctx *Context, slot *storage.Slot, rel storage.RelFileNode, cols []catalog.Column, dbOid uint32, newLimit int32) (updated, done bool, err error) {
+	slot.Lock()
+	defer slot.Unlock()
+	page := slot.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return false, false, err
+	}
+	for s := uint16(1); s <= uint16(count); s++ {
+		tup, terr := storage.PageGetHeapTuple(page, s)
+		if terr != nil {
+			continue
+		}
+		if tup.Header.Xmin == storage.InvalidTransactionID || tup.Header.Xmax != storage.InvalidTransactionID {
+			continue
+		}
+		if len(tup.Data) < 4 || binary.LittleEndian.Uint32(tup.Data[0:4]) != dbOid {
+			continue
+		}
+
+		natts := int(tup.Header.Infomask2 & 0x07FF)
+		row := make(Row, len(cols))
+		if derr := DecodeRowIntoMctxPGTuple(row, cols, tup.Data, tup.Bitmap, natts, nil); derr != nil {
+			return false, true, derr
+		}
+
+		current := int32(row[catalog.PgDatabaseDatConnLimitOrdinal].Int)
+		if current == newLimit {
+			return false, true, nil // already at target — no write
+		}
+		row[catalog.PgDatabaseDatConnLimitOrdinal] = NewIntDatum(int64(newLimit))
+
+		newData, eerr := EncodeRowPG(cols, row)
+		if eerr != nil {
+			return false, true, eerr
+		}
+		newTup := storage.HeapTuple{Header: tup.Header, Bitmap: tup.Bitmap, Data: newData}
+		raw, merr := newTup.MarshalBinary()
+		if merr != nil {
+			return false, true, merr
+		}
+		if rerr := storage.PageReplaceItemRaw(page, s, raw); rerr != nil {
+			return false, true, rerr
+		}
+		ctx.Pool.MarkDirty(slot)
+		return true, true, nil
+	}
+	return false, false, nil
 }

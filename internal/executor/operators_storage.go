@@ -3823,6 +3823,12 @@ func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
 				datname = rawRow[datnameOrd]
 			}
 			im.SetDatabaseConnLimit(datname, int32(newVal.Int))
+			// M0122-0006: persist the new datconnlimit to the on-disk
+			// pg_database heap row (global/1262) so it survives restart.
+			// Best-effort — the in-memory registry is goopg's truth.
+			if dbOid, ok := im.ResolveDatabaseOid(datname); ok && dbOid != 0 {
+				_ = PersistDatConnLimit(o.ctx, dbOid, int32(newVal.Int))
+			}
 			row[connLimitOrd] = newVal
 		}
 		o.appendUpdateRetRow(row)

@@ -126,6 +126,30 @@ func TestPgConversionVirtualRows(t *testing.T) {
 	}
 }
 
+// TestValidServerEncodingName verifies the server-encoding validity check that
+// gatekeeps CREATE DATABASE ... ENCODING — client-only encodings (SJIS,
+// BIG5, …) and unknown names are rejected. M0122-0008.
+func TestValidServerEncodingName(t *testing.T) {
+	// Valid server encodings (PG_VALID_BE_ENCODING: 0-34).
+	valid := []string{"UTF8", "utf-8", "LATIN1", "SQL_ASCII", "WIN1252", "KOI8U"}
+	for _, name := range valid {
+		if got := ValidServerEncodingName(name); got < 0 {
+			t.Errorf("ValidServerEncodingName(%q) = %d, want >= 0", name, got)
+		}
+	}
+	// Client-only encodings (ID > 34).
+	clientOnly := []string{"SJIS", "BIG5", "GBK", "UHC", "GB18030", "JOHAB", "SHIFT_JIS_2004"}
+	for _, name := range clientOnly {
+		if got := ValidServerEncodingName(name); got >= 0 {
+			t.Errorf("ValidServerEncodingName(%q) = %d, want -1 (client-only)", name, got)
+		}
+	}
+	// Unknown encoding → -1.
+	if got := ValidServerEncodingName("NO_SUCH_ENC"); got != -1 {
+		t.Errorf("ValidServerEncodingName(NO_SUCH_ENC) = %d, want -1", got)
+	}
+}
+
 // TestPgConversionVirtualRowsFuncOID verifies that conproc resolves through a
 // live FuncOID->pg_proc lookup (mirroring regproc's real OID-reference
 // semantics) rather than the as-written ProcSchema/ProcName text — so a
