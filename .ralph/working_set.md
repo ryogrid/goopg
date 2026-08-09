@@ -1,41 +1,51 @@
-Task: M0122-0003 EXPLAIN (WAL) — text + JSON output (COMPLETE)
+Task: M0122-0003 EXPLAIN (MEMORY) — text + JSON output (COMPLETE)
 
 Files:
-- internal/wal/writer.go: Added walRecords/walBytes atomic counters + WalRecords()/WalBytes() getters; incremented in Append (both fast/slow paths)
-- internal/storage/bufpool.go: Extended WALFlusher interface with WalRecords()/WalBytes(); added Pool.WalCounters()
-- internal/storage/lpdead_hook_test.go: Stub methods for walFlushRecorder
-- internal/storage/storage_test.go: Stub methods for recordingWAL
-- internal/executor/instrument.go: Added walRecords/walBytes + base fields to nodeStats; seeding in Open + diffing in accountBuffers
-- internal/executor/operators_explain.go: formatWalLine (TEXT: "WAL: records=N bytes=K"); WAL rendering in walkPlanAnalyzeFiltered (TEXT) + planToJSONWithStats (JSON: "WAL Records"/"WAL FPI"/"WAL Bytes"/"WAL Buffers Full")
-- .ralph/fix_plan.md: M0119-0004 marked [x] complete
+- internal/mctx/mctx.go: Added lifetimeCounters struct (totalAllocated/currentBytes/peakBytes);
+  ensureLC() init guard; Usage() (allocated, peak int64) getter; tracking in
+  Alloc/AllocAligned/allocBytes/growChunk; Reset zeroes currentBytes;
+  pointer-based (lc *lifetimeCounters) to keep Context ≤96 B
+- internal/executor/instrument.go: Added memAllocated/memPeak/memBase*/memSeeded
+  to nodeStats; sctx *mctx.Context on instrumentedOp; seed in Open(); diff in
+  accountBuffers() (outside pool-nil guard)
+- internal/executor/operators_explain.go: formatMemoryLine (TEXT: "Memory:
+  used=NkB  allocated=NkB"); opts.Memory gate in walkPlanAnalyzeFiltered;
+  "Memory Used"/"Memory Allocated" JSON properties in planToJSONWithStats
+  (outside opts.Buffers block)
+- internal/executor/explain_memory_test.go: NEW — 9 tests (formatMemoryLine,
+  SQL-level smoke, JSON presence/absence, instrumentedOp diffing, nil-Mctx)
+- .ralph/fix_plan.md: M0122-0003 marked [x] complete
 
 Key symbols:
-- Writer.walRecords / Writer.walBytes (atomic.Int64)
-- Writer.WalRecords() / Writer.WalBytes() (getters)
-- WALFlusher.WalRecords() / WALFlusher.WalBytes() (interface)
-- Pool.WalCounters() (records, bytes int64)
-- nodeStats.walRecords / walBytes / walBaseRecords / walBaseBytes / walSeeded
-- formatWalLine(s *nodeStats) string
+- mctx.lifetimeCounters: totalAllocated, currentBytes, peakBytes
+- mctx.Context.ensureLC(), Usage() (allocated, peak int64)
+- nodeStats.memAllocated, memPeak, memBase*, memSeeded
+- instrumentedOp.sctx *mctx.Context
+- formatMemoryLine(s *nodeStats) string
 
 Hypothesis/Findings:
-- EXPLAIN (WAL) now produces per-node "WAL: records=N bytes=K" lines in TEXT and
-  JSON properties in structured formats. Counters are lifetime (never reset) and
-  diffed per-node (nested-stopwatch semantics, same as BUFFERS).
-- walBytes counts payload bytes only (not xlog record header overhead — deferred).
-- WAL FPI and WAL Buffers Full are always 0 (FPI counting needs per-record kind
-  knowledge; buffers-full tracking needs cross-reference with WAL buffer state).
-  JSON format emits them as int64(0) matching PG's unconditional-non-text pattern.
+- EXPLAIN (MEMORY) is done: TEXT per-node "Memory: used=NkB  allocated=NkB",
+  JSON "Memory Used"/"Memory Allocated" in kB, matching PG's show_memory_counters
+  format. Counters are lifetime (never reset) and diffed per-node (nested-
+  stopwatch semantics, same as WAL and BUFFERS).
+- Simple SeqScan doesn't use mctx for tuple decode (DecodeHeapTupleRow passes
+  nil), so the Memory line may be suppressed (formatMemoryLine returns "" when
+  counters are zero). Hash joins, index scans, and expression evaluation DO
+  allocate through mctx — those nodes will show non-zero memory.
+- Deferred: EXPLAIN (MEMORY) without ANALYZE (would need planner memory
+  tracking — goopg's planner uses Go heap, not mctx).
 
 Next step:
-- EXPLAIN (MEMORY) output (same pattern — needs MemoryContext framework first) OR
-  next M0122 unchecked item (M0122-0006: On-disk catalog persistence;
-  M0122-0007: DDL/admin commands).
+- Next priority per banner: M0119 unchecked items (M0119-0005 pg_waldump server
+  tier — needs index AMs; M0119-0006 pg_amcheck server tier — needs index AMs
+  + opclass parity; both blocked on foundation work)
+  OR M0122-0006 (On-disk catalog persistence) / M0122-0007 (DDL/admin commands)
 
 Gates run:
 - go build ./...: OK
-- go test (executor, wal, storage): ALL PASS
+- go test (mctx, executor): ALL PASS (incl. 9 new explain_memory tests)
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, 404706 txns)
-- ralph-state-guard: REPAIRED + PASS
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, 409153 txns)
+- ralph-state-guard: PENDING (run before status block)
 
 In-flight: none

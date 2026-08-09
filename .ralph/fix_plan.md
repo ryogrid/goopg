@@ -445,7 +445,7 @@ mirroring M0119's ledger `status` column.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
-- [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
+- [x] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`.
       GENERIC_PLAN/WAL/MEMORY parser support **done** (2026-08-08, commit
@@ -454,8 +454,15 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       per-node "WAL: records=N bytes=K" in TEXT, JSON properties in structured
       formats. Deferred: payload-only byte counting (no xlog header overhead),
       FPI/Buffers Full always zero.
-      **Remaining: EXPLAIN (MEMORY) executor output** — needs per-node peak
-      memory tracking (no MemoryContext framework yet).
+      **EXPLAIN (MEMORY) executor output done (2026-08-09, this loop)** —
+      per-node "Memory: used=NkB  allocated=NkB" in TEXT, "Memory Used"/
+      "Memory Allocated" in JSON (kB). Added lifetime memory counters
+      (totalAllocated/currentBytes/peakBytes) to internal/mctx via
+      lifetimeCounters pointer; wired into nodeStats (memAllocated/memPeak)
+      with nested-stopwatch diffing in instrumentedOp; formatMemoryLine +
+      planToJSONWithStats properties gated on opts.Memory. Deferred:
+      non-ANALYZE path (planner memory — goopg's planner doesn't use mctx);
+      per-node counters are inclusive like WAL/BUFFERS.
 
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across

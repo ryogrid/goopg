@@ -9,6 +9,7 @@ package executor
 import (
 	"time"
 
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -79,6 +80,17 @@ type nodeStats struct {
 	walRecords, walBytes           int64
 	walBaseRecords, walBaseBytes   int64
 	walSeeded                      bool
+
+	// memAllocated / memPeak are the cumulative mctx memory counters
+	// EXPLAIN (ANALYZE, MEMORY) attributes to this node, inclusive of
+	// its children (nested-stopwatch semantics). memAllocated is the
+	// total cap of all chunks ever created; memPeak is the high-water
+	// mark of in-use bytes. The memBase* fields hold the last-seen
+	// Context.Usage() snapshot for delta computation; memSeeded guards
+	// the first checkpoint on Open. M0122-0003.
+	memAllocated, memPeak           int64
+	memBaseAllocated, memBasePeak   int64
+	memSeeded                       bool
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -87,7 +99,8 @@ type instrumentedOp struct {
 	inner Operator
 	plan  planner.Node
 	stats *nodeStats
-	pool  *storage.Pool // captured from ctx.Pool in Open; nil-safe (BUFFERS off / no ctx.Pool)
+	pool  *storage.Pool  // captured from ctx.Pool in Open; nil-safe (BUFFERS off / no ctx.Pool)
+	sctx  *mctx.Context  // captured from ctx.Mctx in Open; nil-safe (MEMORY off / no ctx.Mctx)
 }
 
 // underlying lets `setChildBorrow` (M0054-0005a-followup) reach
@@ -118,6 +131,13 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 			o.stats.walSeeded = true
 		}
 	}
+	if ctx != nil && ctx.Mctx != nil {
+		o.sctx = ctx.Mctx
+		if !o.stats.memSeeded {
+			o.stats.memBaseAllocated, o.stats.memBasePeak = o.sctx.Usage()
+			o.stats.memSeeded = true
+		}
+	}
 	if o.stats.timing {
 		now := time.Now()
 		o.stats.openTime = now
@@ -133,27 +153,35 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 // from within it) to this node — see the bufHit/bufRead doc comment on
 // nodeStats.
 func (o *instrumentedOp) accountBuffers() {
-	if o.pool == nil {
-		return
+	if o.pool != nil {
+		hit, read, dirtied, written := o.pool.BufferCounters()
+		o.stats.bufHit += hit - o.stats.bufBaseHit
+		o.stats.bufRead += read - o.stats.bufBaseRead
+		o.stats.bufDirtied += dirtied - o.stats.bufBaseDirtied
+		o.stats.bufWritten += written - o.stats.bufBaseWritten
+		o.stats.bufBaseHit, o.stats.bufBaseRead = hit, read
+		o.stats.bufBaseDirtied, o.stats.bufBaseWritten = dirtied, written
+
+		readTimeNs := o.pool.ReadTimeNanos()
+		writeTimeNs := o.pool.WriteTimeNanos() + o.pool.ExtendTimeNanos()
+		o.stats.bufReadTimeNs += readTimeNs - o.stats.bufBaseReadTimeNs
+		o.stats.bufWriteTimeNs += writeTimeNs - o.stats.bufBaseWriteTimeNs
+		o.stats.bufBaseReadTimeNs, o.stats.bufBaseWriteTimeNs = readTimeNs, writeTimeNs
+
+		recs, bytes := o.pool.WalCounters()
+		o.stats.walRecords += recs - o.stats.walBaseRecords
+		o.stats.walBytes += bytes - o.stats.walBaseBytes
+		o.stats.walBaseRecords, o.stats.walBaseBytes = recs, bytes
 	}
-	hit, read, dirtied, written := o.pool.BufferCounters()
-	o.stats.bufHit += hit - o.stats.bufBaseHit
-	o.stats.bufRead += read - o.stats.bufBaseRead
-	o.stats.bufDirtied += dirtied - o.stats.bufBaseDirtied
-	o.stats.bufWritten += written - o.stats.bufBaseWritten
-	o.stats.bufBaseHit, o.stats.bufBaseRead = hit, read
-	o.stats.bufBaseDirtied, o.stats.bufBaseWritten = dirtied, written
 
-	readTimeNs := o.pool.ReadTimeNanos()
-	writeTimeNs := o.pool.WriteTimeNanos() + o.pool.ExtendTimeNanos()
-	o.stats.bufReadTimeNs += readTimeNs - o.stats.bufBaseReadTimeNs
-	o.stats.bufWriteTimeNs += writeTimeNs - o.stats.bufBaseWriteTimeNs
-	o.stats.bufBaseReadTimeNs, o.stats.bufBaseWriteTimeNs = readTimeNs, writeTimeNs
-
-	recs, bytes := o.pool.WalCounters()
-	o.stats.walRecords += recs - o.stats.walBaseRecords
-	o.stats.walBytes += bytes - o.stats.walBaseBytes
-	o.stats.walBaseRecords, o.stats.walBaseBytes = recs, bytes
+	// EXPLAIN (ANALYZE, MEMORY): diff the mctx context usage.
+	// Independent of pool (mctx is per-statement, not per-pool).
+	if o.sctx != nil {
+		allocated, peak := o.sctx.Usage()
+		o.stats.memAllocated += allocated - o.stats.memBaseAllocated
+		o.stats.memPeak += peak - o.stats.memBasePeak
+		o.stats.memBaseAllocated, o.stats.memBasePeak = allocated, peak
+	}
 }
 
 // Next records the per-row delta into the running total and
