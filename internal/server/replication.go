@@ -123,7 +123,7 @@ func (s *Server) replyTimelineHistory(w *protocol.FrameWriter, args string) erro
 	if err := w.WriteCommandComplete("TIMELINE_HISTORY"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // replyIdentifySystem emits the four-column / one-row reply upstream's
@@ -168,7 +168,7 @@ func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	if err := w.WriteCommandComplete("IDENTIFY_SYSTEM"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // replyCreateReplicationSlot parses the upstream CREATE_REPLICATION_SLOT
@@ -309,7 +309,7 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 	if err := w.WriteCommandComplete("CREATE_REPLICATION_SLOT"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // replyDropReplicationSlot removes a slot. Argument shape:
@@ -334,7 +334,7 @@ func (s *Server) replyDropReplicationSlot(w *protocol.FrameWriter, args string) 
 	if err := w.WriteCommandComplete("DROP_REPLICATION_SLOT"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // replyReadReplicationSlot serves the upstream READ_REPLICATION_SLOT
@@ -393,7 +393,7 @@ func (s *Server) replyReadReplicationSlot(w *protocol.FrameWriter, args string) 
 	if err := w.WriteCommandComplete("READ_REPLICATION_SLOT"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // replyStartReplication validates the START_REPLICATION command,
@@ -598,14 +598,14 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
 				_ = w.WriteCommandComplete("START_REPLICATION")
-				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+				_ = w.ReadyForQuery()
 			}
 			return nil
 		case <-receiveDone:
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
 				_ = w.WriteCommandComplete("START_REPLICATION")
-				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+				_ = w.ReadyForQuery()
 			}
 			return nil
 		case chunk := <-chunkCh:
@@ -647,7 +647,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 				if clientSentCopyDone {
 					_ = w.WriteCopyDone()
 					_ = w.WriteCommandComplete("START_REPLICATION")
-					_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+					_ = w.ReadyForQuery()
 				}
 				return nil
 			}

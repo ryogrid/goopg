@@ -1806,7 +1806,7 @@ func (s *Server) handleDatabaseDDLBypass(sql, liveDBName, actingRole string, res
 	if err := w.WriteCommandComplete(tag); err != nil {
 		return true, err
 	}
-	return true, w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return true, w.ReadyForQuery()
 }
 
 // databaseRegistry is the subset of catalog.Catalog the database-DDL

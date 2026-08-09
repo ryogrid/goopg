@@ -261,3 +261,89 @@ neither imports `os/signal` nor knows about CLI flags.
   *receives* in v0 is just the startup packet plus "anything else, which
   becomes an error". A few hand-rolled encoders are clearer than a
   reflective marshalling layer at this stage.
+
+---
+
+## Follow-up (2026-08-10): the ReadyForQuery transaction-status byte
+
+**Nightly item AI-20260810-011258-006.**
+
+v0 emitted `ReadyForQuery('I')` from every site (~47 of them, each with the
+status byte hard-coded). The `'T'` / `'E'` codes were declared in
+`internal/protocol` but no code path could produce them, so the server was
+telling every client "you are not in a transaction block" even while an
+explicit `BEGIN` block was open — and even while that block was aborted.
+
+### Why it mattered
+
+libpq surfaces the byte as `PQtransactionStatus`, and clients act on it.
+pgbench's post-error cleanup (`CSTATE_ERROR` in
+`postgres/src/bin/pgbench/pgbench.c`) is the case the nightly hit:
+
+```c
+tstatus = getTransactionStatus(st->con);
+if (tstatus == TSTATUS_IN_BLOCK)      /* PQTRANS_INTRANS | PQTRANS_INERROR */
+    PQsendQuery(st->con, "ROLLBACK");
+else if (tstatus == TSTATUS_IDLE)     /* nothing left to roll back */
+    ...;
+```
+
+A retriable failure (serialization/deadlock, which pgbench only *prints* under
+`--verbose-errors`) left goopg's block aborted; the permanent `'I'` sent
+pgbench down the `TSTATUS_IDLE` branch, so the `ROLLBACK` was never sent; the
+next script iteration's `BEGIN` — command index 4 of both the tpcb-like and
+simple-update scripts — came back `25P02`, which is *not* retriable, so the
+client aborted. That is the nightly's "79 aborted clients whose originating
+error is absent from the log": the originating error was invisible by design,
+and the visible abort was a protocol-state mismatch one transaction later.
+The headline numbers hid it further — `number of failed transactions: 0`,
+with TPS *rising* as half the clients died.
+
+### Design
+
+`connTxState.wireStatus(afterError bool)` is the single source of truth,
+mirroring upstream `TransactionBlockStatusCode()`
+(`postgres/src/backend/access/transam/xact.c`):
+
+| state | byte |
+|---|---|
+| no explicit block open, or block is `PREPARE TRANSACTION`-detached | `'I'` |
+| explicit block open and valid | `'T'` |
+| explicit block open and aborted (25P02) | `'E'` |
+
+`serveConn` installs it on the connection's `FrameWriter` as `TxStatusFn`, and
+the emission sites call `w.ReadyForQuery()` instead of
+`w.WriteReadyForQuery(protocol.TxStatusIdle)`. A writer with no `TxStatusFn`
+(tests, walsender-only paths) still degrades to `'I'`.
+
+`ReadyForQueryAfterError()` is the second entry point, used by every `'Z'` that
+terminates an `ErrorResponse`. It exists because of an ordering difference:
+upstream aborts the transaction (`AbortCurrentTransaction`) *before* computing
+the status byte, whereas goopg's dispatch loop calls `connTxState.Fail()` only
+after `writeQueryError` has returned `errQueryErrorSent`. Passing
+`afterError=true` reports `'E'` for a block that is erroring right now, without
+moving the `Fail()` call and disturbing its lock-release / pinned-snapshot
+side effects.
+
+Guard: `TestPort_ReadyForQueryTransactionStatus` (`internal/testport`) drives
+the sequence at the wire level — psql does not print the byte in
+non-interactive mode.
+
+### Measured effect
+
+Nightly pgbench stage (`ci/batch/stages/stage-pgbench.sh`, s=50 c=100 j=20
+T=180×3), before → after:
+
+| | before | after |
+|---|---|---|
+| clients aborted (`aborted in command 4`) | 80 | 0 |
+| workloads that produced a summary | 2/3 | 3/3 |
+| reported failed transactions | 0 | 1488 (0.154%, TPC-B only) |
+
+The stage still fails, but honestly: the 1488 are the *originating* retriable
+errors that were previously masked. `--verbose-errors` now names them —
+`ERROR: could not serialize access due to concurrent update (deadlock)`,
+raised by the EvalPlanQual wait in
+`internal/executor/operators_storage.go` (`epqWait` reporting a deadlock at
+`:3534` / `:4186`). Upstream READ COMMITTED never raises a serialization error
+for TPC-B; that gap is tracked separately.

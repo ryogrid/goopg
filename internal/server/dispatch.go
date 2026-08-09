@@ -177,7 +177,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			return w.ReadyForQuery()
 		}
 		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
 			if tag == "CREATE SCHEMA" {
@@ -206,7 +206,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				if err := w.WriteCommandComplete(tag); err != nil {
 					return err
 				}
-				return w.WriteReadyForQuery(protocol.TxStatusIdle)
+				return w.ReadyForQuery()
 			}
 		}
 		msg, extra := syntaxErrorMsg(err)
@@ -216,7 +216,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if err := w.WriteEmptyQueryResponse(); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 	// Session-level explicit transaction support (M0096-0005):
 	// When the client has issued BEGIN, reuse the open TxnMgr transaction
@@ -1101,7 +1101,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if err := s.deliverNotifications(w, connTx); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // sessionStatsTarget reads the effective `default_statistics_target`

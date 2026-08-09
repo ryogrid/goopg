@@ -142,6 +142,34 @@ func (fw *FrameWriter) WriteReadyForQuery(status TransactionStatus) error {
 	return fw.Flush()
 }
 
+// ReadyForQuery emits 'Z' carrying the CONNECTION's current transaction
+// status, as reported by TxStatusFn (see the field comment on FrameWriter).
+// Every ordinary end-of-message ReadyForQuery goes through here so the byte is
+// derived from live transaction state in one place instead of being hard-coded
+// 'I' at ~40 call sites. With no TxStatusFn installed it degrades to 'I',
+// which is what a connection with no transaction machinery (walsender-only
+// paths, tests) should report anyway.
+func (fw *FrameWriter) ReadyForQuery() error {
+	return fw.WriteReadyForQuery(fw.txStatus(false))
+}
+
+// ReadyForQueryAfterError emits the 'Z' that terminates an ErrorResponse.
+// It is a separate entry point because PostgreSQL marks the transaction
+// aborted (AbortCurrentTransaction) BEFORE computing the status byte, whereas
+// goopg's dispatch loop marks connTxState failed only after the error has been
+// written; passing afterError=true lets the status function report 'E' for an
+// explicit block that is about to be marked failed.
+func (fw *FrameWriter) ReadyForQueryAfterError() error {
+	return fw.WriteReadyForQuery(fw.txStatus(true))
+}
+
+func (fw *FrameWriter) txStatus(afterError bool) TransactionStatus {
+	if fw.TxStatusFn == nil {
+		return TxStatusIdle
+	}
+	return fw.TxStatusFn(afterError)
+}
+
 
 // WriteParseComplete emits '1' with no payload.
 func (fw *FrameWriter) WriteParseComplete() error {

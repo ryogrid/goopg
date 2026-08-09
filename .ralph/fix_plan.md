@@ -400,8 +400,40 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       the originating error never reaches the log. That combination says the
       server aborted the transaction internally without emitting an
       ErrorResponse for the *originating* command, which is the thing to find:
-      instrument the abort-marking site rather than hunting for a missing log
       line. A 2-client repro makes this cheap to bisect.
+      **ROOT CAUSE FOUND + HALF FIXED (2026-08-10) — item stays open.** The
+      abort cascade was a wire-protocol bug: goopg answered EVERY
+      `ReadyForQuery` with `'I'` (idle). The `'T'`/`'E'` codes existed in
+      `internal/protocol` but no path could emit them. libpq exposes the byte
+      as `PQtransactionStatus`, and pgbench's `CSTATE_ERROR` cleanup
+      (`postgres/src/bin/pgbench/pgbench.c`) uses it to decide whether a failed
+      block still owes a `ROLLBACK`; a permanent `'I'` sent it down the
+      `TSTATUS_IDLE` branch, so the ROLLBACK was never sent and the NEXT
+      iteration's `BEGIN` (command index 4 of both scripts — the "command 4" in
+      the log is BEGIN, not the UPDATE) returned 25P02, which is not retriable,
+      so the client aborted. The originating error was never missing from the
+      log: pgbench only *prints* retriable (40001/40P01) errors under
+      `--verbose-errors`. Fixed by `connTxState.wireStatus` →
+      `FrameWriter.TxStatusFn` (design: follow-up section in
+      `docs/design/root-0002-wire-protocol.md`; guard
+      `TestPort_ReadyForQueryTransactionStatus`). Stage re-run after the fix:
+      client aborts 80 → **0**, workload summaries 2/3 → **3/3**.
+      **Why it stays unchecked:** the gate still fails, now honestly —
+      **1488 failed transactions (0.154%) on TPC-B** (`-N` and `-S` clean),
+      which are the originating errors the aborts had been masking.
+      `--verbose-errors` names them: `ERROR: could not serialize access due to
+      concurrent update (deadlock)` (40001) from `epqWait` in
+      `internal/executor/operators_storage.go:3534/:4186`. Upstream READ
+      COMMITTED never raises a serialization error for TPC-B (it waits and
+      re-reads via EvalPlanQual), and 100 clients on 50 `pgbench_branches` rows
+      is a waiter chain, not a cycle — so the deadlock verdict is a false
+      positive, likely tied to the documented non-FIFO tuple-lock gap
+      (`goopg_dml_conflict_no_fifo_tuple_lock`, ledger 0021-0012). Next step:
+      instrument `epqWait`'s deadlock verdict against
+      `postgres/src/backend/storage/lmgr/deadlock.c`'s wait-graph rule.
+      Cheap repro: s=20 c=100 T=60 with `--verbose-errors`.
+      Two ledger rows filed (the status-byte fix's remaining plan-time-error
+      gap, and this serialization-error discovery).
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
