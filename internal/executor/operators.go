@@ -281,6 +281,12 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// the pg_ts_config branch above. M0119-0004 (DU-002 per-DB
 			// publication scoping).
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgPublicationRows())
+		} else if tbl.Name == "pg_subscription" && ctx != nil && ctx.PgSubscriptionRows != nil {
+			// pg_subscription must list the connecting database's own CREATE
+			// SUBSCRIPTION'd subscriptions, not always DefaultDBOid's —
+			// mirrors the pg_publication branch above. M0119-0004 (DU-002
+			// per-DB subscription scoping).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgSubscriptionRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

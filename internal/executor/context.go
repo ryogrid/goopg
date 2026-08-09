@@ -787,6 +787,13 @@ type Context struct {
 	// CurrentDatabaseOid. M0119-0004 (DU-002 per-DB publication scoping).
 	PgPublicationRows func() [][]string
 
+	// PgSubscriptionRows mirrors PgPublicationRows above for the
+	// pg_subscription catalog table: it lists CurrentDatabaseOid's own CREATE
+	// SUBSCRIPTION'd subscriptions rather than always DefaultDBOid's
+	// (catalog.PubSub's SubscriptionsForDBOid). Wired by the server to close
+	// over CurrentDatabaseOid. M0119-0004 (DU-002 per-DB subscription scoping).
+	PgSubscriptionRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

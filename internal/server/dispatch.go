@@ -2364,6 +2364,15 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return publicationRowsForDBOid(s.cfg.PubSub, catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_subscription must likewise reflect the connecting database's own
+	// CREATE SUBSCRIPTION'd subscriptions, not always DefaultDBOid's.
+	// Mirrors the pg_publication wiring above. M0119-0004 (DU-002 per-DB
+	// subscription scoping).
+	if s.cfg.PubSub != nil {
+		ectx.PgSubscriptionRows = func() [][]string {
+			return subscriptionRowsForDBOid(s.cfg.PubSub, catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2520,6 +2529,39 @@ func publicationRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 	return out
 }
 
+// subscriptionRowsForDBOid builds the pg_subscription VirtualRows for dbOid
+// from the PubSub registry, matching the publicationRowsForDBOid convention.
+// M0119-0004 (DU-002 per-DB subscription scoping).
+func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
+	subs := ps.SubscriptionsForDBOid(dbOid)
+	if len(subs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(subs))
+	for _, sub := range subs {
+		out = append(out, []string{
+			fmt.Sprintf("%d", sub.OID),
+			fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid — matches pg_database.oid
+			sub.Name,
+			fmt.Sprintf("%d", sub.Owner), // subowner
+			boolToText(sub.Enabled),
+			"f",   // subbinary
+			"f",   // substream
+			"d",   // subtwophasestate disabled
+			"f",   // subdisableonerr
+			"t",   // subpasswordrequired (upstream default)
+			"f",   // subrunasowner (upstream default)
+			"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
+			"f",   // subfailover (upstream default)
+			sub.Conninfo,
+			sub.SlotName,
+			"local", // subsynccommit
+			formatStringList(sub.Publications),
+		})
+	}
+	return out
+}
+
 // boolToText converts a bool to "t"/"f" for pg_catalog VirtualRows
 // (mirrors replicate_views.go:boolText). M0119-0004.
 func boolToText(b bool) string {
@@ -2527,6 +2569,22 @@ func boolToText(b bool) string {
 		return "t"
 	}
 	return "f"
+}
+
+// formatStringList formats a []string as a PG text-array literal
+// (mirrors initdb/replication_views.go:formatStringList). M0119-0004.
+func formatStringList(xs []string) string {
+	if len(xs) == 0 {
+		return "{}"
+	}
+	out := "{"
+	for i, x := range xs {
+		if i > 0 {
+			out += ","
+		}
+		out += x
+	}
+	return out + "}"
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {

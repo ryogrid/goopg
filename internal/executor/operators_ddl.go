@@ -1099,12 +1099,13 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
 	var dropOID uint32
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
 		dropOID = sub.OID
 	}
-	if err := o.ctx.PubSub.DropSubscription(s.Name); err != nil {
+	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
 		if s.IfExists {
 			return nil
 		}
@@ -1173,15 +1174,16 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
 	if err != nil {
 		return err
 	}
-	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
+	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID, subDBOid); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
 	// B4.4: re-sync the pg_subscription heap row's subowner (replaces kind 55).
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
 		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 			return fmt.Errorf("pg_subscription heap write: %w", err)
 		}
