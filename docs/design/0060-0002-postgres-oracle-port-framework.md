@@ -93,6 +93,28 @@ Coverage snapshot output:
 
 - `docs/test-port/upstream-regress-coverage.md`
 
+#### 4.3.1 Error-position lines are stripped from BOTH sides
+
+`NormalizeRegressOutput` drops `LINE N: ...` and the standalone caret line that
+follows it, on the goopg side and the expected side alike. The suite compares
+error message TEXT; goopg's `P` (position) field coverage is partial — it is
+attached only where an `ExecError` carries a non-zero `Pos`, so coercion-time
+datatype errors and row-constraint errors have no position, and at least one
+DDL path emits a position where PG emits none.
+
+This rule was removed once (M0129-S10, commit `d6bcc190`, on the premise that
+position coverage was complete) and restored 2026-08-10 after the nightly of
+2026-08-09 reported 26 previously-passing cases diverging on position lines
+alone. Two constraints follow for anyone who wants to remove it again:
+
+1. Do not remove it until `ExecError.Pos` is set on every error path (see the
+   deferral-ledger row dated 2026-08-10 for the known gaps and the
+   `parser_errposition()` design PG uses).
+2. Removing it needs a gate that **fails** on a position mismatch. A diverging
+   regress case reports `t.Skip`, so `TestPort_RegressSuite` stays green — the
+   suite structurally cannot catch this class. The unit gate
+   `TestNormalizeRegressOutputStripsErrorPositionLines` guards the rule today.
+
 ### 4.4 Isolation Harness Foundation
 
 `framework` exposes:

@@ -185,6 +185,52 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       (`shutdownWait + 30s`) via new `runGoopgTimeout` helper. No test relied on the
       old 10s default; `TestKillKillRecovery` (crash-restart) still PASSes.
 
+**Nightly run 20260809-020705 (sha `f2e3f167`, 49 items) — filed 2026-08-10:**
+
+- [x] **regress/{boolean,btree_index,copyselect,create_function_sql,delete,enum,
+      errors,functional_deps,index_including,int2,int4,int8,limit,name,numerology,
+      oid,pg_lsn,prepare,select_distinct_on,select_into,text,tid,time,timetz,
+      truncate,union}** — 26 baseline-pass regress cases diverged
+      (AI-20260809-020705-024..049; repro:
+      `go test -v -run 'TestPort_RegressSuite/<case>' ./internal/testport/`).
+      **FIXED (2026-08-10, this loop).** Single root cause for all 26: M0129-S10
+      (commit `d6bcc190`) deleted the LINE/caret stripping from
+      `NormalizeRegressOutput` on the premise that goopg now emits
+      `FieldPosition` on every error path. It does not — the P field only rides
+      an `ExecError` with non-zero `Pos`, so datatype-input coercion errors
+      (`invalid input syntax for type smallint`), row-constraint errors and
+      several DDL paths carry no position; and one path (CREATE VIEW in
+      `limit`) emits a position where PG emits none. Every one of the 26 diffs
+      was position lines only, zero message-text divergence. Fix: strip
+      `LINE N:` + standalone-caret lines from BOTH sides again, with the gap
+      recorded in the ledger. New gate
+      `TestNormalizeRegressOutputStripsErrorPositionLines` — needed because the
+      suite reports a diverging case as `t.Skip`, so `TestPort_RegressSuite`
+      stays green (that is exactly how `d6bcc190` shipped claiming
+      "RegressSuite PASS"). All 26 cases PASS at HEAD after the fix.
+- [x] **testport/{DeferredNNDMultiColumn,InitiallyDeferredExclusionCommit,
+      InitiallyDeferredFKCommit,InitiallyDeferredNNDUniqueCommit,
+      SetConstraintsDeferral,IsolationDetachPartitionConcurrently1,
+      IsolationDetachPartitionConcurrently3,IsolationEvalPlanQual,
+      IsolationEvalPlanQualTrigger,IsolationFkSnapshot,
+      IsolationInsertConflictDoUpdate2,IsolationInsertConflictDoUpdate3,
+      IsolationInsertConflictDoUpdate4,IsolationLockUpdateDelete,
+      IsolationMergeDelete,IsolationMergeInsertUpdate,IsolationMergeJoin,
+      IsolationMergeMatchRecheck,IsolationPlpgsqlToast,
+      IsolationPropagateLockDelete,IsolationStats,IsolationTotalCash}** — 22
+      testport failures (AI-20260809-020705-001..017,019..023).
+      **STALE — all 22 PASS at HEAD `d4bee0df`** (re-run 2026-08-10 per the
+      M-NIGHTLY selection rule step 1). Pattern is consistent with the
+      suite-wedge casualty mode already documented under `root-0029`: one wedged
+      case poisons the shared cluster and the rest of the batch reports as
+      independent failures. No engine change made.
+- [ ] **testport/TestPort_IsolationMergeUpdate** — testport
+      TestPort_IsolationMergeUpdate FAILed (AI-20260809-020705-018; repro:
+      `go test -v -run '^TestPort_IsolationMergeUpdate$' ./internal/testport/`).
+      **REAL — still FAILs at HEAD `d4bee0df`** (4.09s), the only one of the 23
+      testport items that reproduces. Not investigated this loop (one task per
+      loop); it is the next M-NIGHTLY task.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 _(completed `[x]` milestones archived → `completed_milestones/completed_fix_plan_011.md`)_
