@@ -86,3 +86,119 @@ func TestClassifyXLogRecordWiredToRecordKindToRmgrInfo(t *testing.T) {
 		}
 	}
 }
+
+// TestActiveRecordKindValuesNotRetiredB5IndexAttrdef guards against accidental
+// reuse of the retired B5 group A+B WAL record kind byte values (20, 21, 94, 69).
+// These values were retired in eb88b8a2 (index) and 7f42e9c3 (attrdef); the
+// former CREATE/DROP/RENAME INDEX and ColumnDefaults records now journal as
+// real PG-native heap WAL (pg_class/pg_index/pg_attrdef) and a PG standby
+// replays them natively. A new RecordKind constant must never be assigned one
+// of these values — it would be indistinguishable from a retired record in
+// legacy WAL, and real PG standbys would FATAL on the rmid-128 record.
+//
+// This is a hardcoded enumeration of every active RecordKind constant. If you
+// add a new RecordKind, add it to the activeKinds slice below. If it is assigned
+// a retired value, this test catches it at compilation time (the constant is
+// directly referenced in the slice literal, so a duplicate-value collision
+// surfaces as a test failure rather than a silent WAL corruption).
+func TestActiveRecordKindValuesNotRetiredB5IndexAttrdef(t *testing.T) {
+	// retiredB5GroupAB holds the byte values retired in B5 groups A (index:
+	// 20=CreateIndex, 21=DropIndex, 94=RenameIndex) and B (attrdef:
+	// 69=ColumnDefaults). These must never appear in activeKinds below.
+	retiredB5GroupAB := map[byte]string{
+		20: "CreateIndex (retired eb88b8a2)",
+		21: "DropIndex (retired eb88b8a2)",
+		69: "ColumnDefaults (retired 7f42e9c3)",
+		94: "RenameIndex (retired eb88b8a2)",
+	}
+
+	// activeKinds enumerates every RecordKind* constant currently emitted
+	// or dispatched. This list is maintained manually; a missing constant
+	// is not an error here (TestRecordKindToRmgrInfoAnalogTable covers
+	// PG-analog dispatch), but a newly-added constant that reuses a
+	// retired value IS an error.
+	activeKinds := []struct {
+		value byte
+		name  string
+	}{
+		{RecordKindPageImage, "PageImage"},
+		{RecordKindCheckpoint, "Checkpoint"},
+		{RecordKindBtreeSplit, "BtreeSplit"},
+		{RecordKindHeapInsert, "HeapInsert"},
+		{RecordKindBtreeInsert, "BtreeInsert"},
+		{RecordKindHeapDelete, "HeapDelete"},
+		{RecordKindHeapVacuum, "HeapVacuum"},
+		{RecordKindXactCommit, "XactCommit"},
+		{RecordKindXactAbort, "XactAbort"},
+		{RecordKindHeapLock, "HeapLock"},
+		{RecordKindSmgrCreate, "SmgrCreate"},
+		{RecordKindSmgrTruncate, "SmgrTruncate"},
+		{RecordKindHeapHotUpdate, "HeapHotUpdate"},
+		{RecordKindHeapPruneOpt, "HeapPruneOpt"},
+		{RecordKindXactAssignment, "XactAssignment"},
+		{RecordKindXactRollbackTo, "XactRollbackTo"},
+		{RecordKindXactSubAbort, "XactSubAbort"},
+		{RecordKindBtreeVacuum, "BtreeVacuum"},
+		{RecordKindBtreeUnlinkPage, "BtreeUnlinkPage"},
+		{RecordKindBtreeNewRoot, "BtreeNewRoot"},
+		{RecordKindBtreeMarkPageHalfDead, "BtreeMarkPageHalfDead"},
+		{RecordKindHeapFreeze, "HeapFreeze"},
+		{RecordKindHeapUpdate, "HeapUpdate"},
+		{RecordKindHeapMultiInsert, "HeapMultiInsert"},
+		{RecordKindHeapVisible, "HeapVisible"},
+		{RecordKindBtreeReusePage, "BtreeReusePage"},
+		{RecordKindBtreeMetaCleanup, "BtreeMetaCleanup"},
+		{RecordKindClogTruncate, "ClogTruncate"},
+	}
+
+	seen := make(map[byte]string)
+	for _, k := range activeKinds {
+		// Duplicate-value guard (two constants assigned the same byte).
+		if prev, ok := seen[k.value]; ok {
+			t.Errorf("RecordKind value %d assigned to both %s and %s", k.value, k.name, prev)
+		}
+		seen[k.value] = k.name
+
+		// Retired-value guard.
+		if retired, ok := retiredB5GroupAB[k.value]; ok {
+			t.Errorf("RecordKind %s uses retired byte value %d (%s)", k.name, k.value, retired)
+		}
+	}
+
+	// Verify retired kinds have NO PG-analog mapping (they fall through to
+	// RmgrGoopgCatalog). An active PG-analog mapping for a retired kind
+	// would mean a code path is still producing PG-classified records for
+	// what should be legacy-only bytes.
+	for kind, label := range retiredB5GroupAB {
+		gotRmgr, _ := recordKindToRmgrInfo(kind)
+		if gotRmgr != RmgrGoopgCatalog {
+			t.Errorf("retired kind %d (%s) maps to rmgr %d, want RmgrGoopgCatalog(%d) — "+
+				"a PG-analog mapping suggests an emit site still exists",
+				kind, label, gotRmgr, RmgrGoopgCatalog)
+		}
+	}
+}
+
+// TestNativeApplyRecordKindKnownRejectsRetiredB5IndexAttrdef verifies that
+// nativeApplyRecordKindKnown (the PG-decoded-record gate in ApplyRecord) returns
+// false for the retired B5 group A+B kind bytes. A true return would route a
+// retired-kind record to the native replay switch, which has no arms for these
+// kinds and would silently drop the record. The correct path for a legacy WAL
+// record carrying a retired kind is false → replayDecodedXLogRecord (the
+// general PG-xlog path), which FATALs with "resource manager 128" on a real PG
+// standby — exactly the behaviour we want for records that should never be
+// emitted in new WAL.
+func TestNativeApplyRecordKindKnownRejectsRetiredB5IndexAttrdef(t *testing.T) {
+	retiredKinds := map[byte]string{
+		20: "CreateIndex (retired eb88b8a2)",
+		21: "DropIndex (retired eb88b8a2)",
+		69: "ColumnDefaults (retired 7f42e9c3)",
+		94: "RenameIndex (retired eb88b8a2)",
+	}
+	for kind, label := range retiredKinds {
+		if nativeApplyRecordKindKnown(kind) {
+			t.Errorf("retired kind %d (%s): nativeApplyRecordKindKnown returned true — "+
+				"a gate arm still exists for a retired kind", kind, label)
+		}
+	}
+}

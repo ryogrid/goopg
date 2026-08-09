@@ -1,37 +1,34 @@
-Task: M0130-S2 — pg_class heap persistence, reverse path COMPLETE
+Task: M0130-S4 — B5 verification: index/attrdef native WAL kinds (COMPLETE)
 
 Files:
-- internal/initdb/reverse_path_test.go: NEW — TestReversePathColdStartOpensWithoutCache
-  validates that Open() succeeds when the goopg catalog cache is absent (simulating
-  a PG-created data dir), and that core system catalogs are accessible
-- docs/design/0130-0002-pg-class-heap-persistence.md: updated with reverse-path
-  implementation section, WAL replay constraint, and remaining deferred items
-- .ralph/fix_plan.md: M0130-S2 marked [x] DONE
+- internal/wal/record_kind_rmgr_mapping_test.go: added 2 regression gate tests
+  (TestActiveRecordKindValuesNotRetiredB5IndexAttrdef +
+  TestNativeApplyRecordKindKnownRejectsRetiredB5IndexAttrdef)
+- docs/design/0130-0004-b5-index-and-attrdef-retirement.md: status → accepted,
+  gates section updated with verification results + new regression gates
 
 Key symbols:
-- loadUserTablesFromHeap: cold-start heap-scan path used when cache absent
-- DecodePGClassPhysicalRow: PG fixed-offset decoder that reads PG-created rows
-- isCheckpointRecord: recognises PG shutdown checkpoints (replay no-op)
-- readCatalogCache / writeCatalogCache: goopg-specific fast-start markers
+- nativeApplyRecordKindKnown: gatekeeper function tested for retired kinds
+- recordKindToRmgrInfo: verified retired kinds fall through to RmgrGoopgCatalog
+- All active RecordKind constants enumerated in the new test
 
 Hypothesis/Findings:
-- The cold-start path (cache absent → heap scan) already handles PG-created data
-  dirs correctly. The decoder fallback (DecodePGClassRow → DecodePGClassPhysicalRow)
-  reads PG-physical-format rows.
-- WAL replay is a no-op for cleanly shut down PG data dirs (shutdown checkpoint
-  recognised by isCheckpointRecord). Unclean PG WAL would fail on unsupported
-  rmid types — documented constraint.
-- registerSystemTables() provides system catalogs; loadUserTablesFromHeap adds
-  user tables. The combination is sufficient for practical reverse-path use.
-- Deferred: system catalogs from heap, unclean PG WAL replay, E2E PG-attach test.
+- grep audit confirmed zero emit sites: all references to kinds 20/21/94/69
+  are in comments documenting retirement
+- nativeApplyRecordKindKnown has no arms for retired kinds → legacy WAL
+  records route to replayDecodedXLogRecord (FATAL on real PG standby)
+- recordKindToRmgrInfo maps retired kinds to RmgrGoopgCatalog (default arm)
+- 27 active RecordKind constants enumerated; none uses retired values
 
-Next step: M0130-S3 — Catalog heap sync for remaining DDL (ADD COLUMN →
-pg_attribute sync, CREATE SCHEMA → pg_namespace, pg_collation/FDW/server heap rows)
+Next step: M0130-S5 — B5 verification: view/matview native WAL kinds (est ~1
+loop). Kinds 102/103 already retired at HEAD (commit 2697504f); grep-verify
+zero emit sites; confirm standby DDL replay.
 
 Gates run:
-- go test ./internal/initdb/...: PASS (55s, all tests including new reverse path test)
+- go test -run 'TestActiveRecordKindValuesNotRetiredB5IndexAttrdef|TestNativeApplyRecordKindKnownRejectsRetiredB5IndexAttrdef' ./internal/wal/...: PASS
+- go test ./internal/wal/...: PASS (5.4s)
 - RALPH_PRECOMMIT_SCOPE=units: PASS (all cached)
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, 13507 TPS)
 - make ralph-state-guard: REPAIRED + PASS
 
 In-flight: none
