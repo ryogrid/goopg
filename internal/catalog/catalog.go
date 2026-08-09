@@ -14906,6 +14906,33 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 		})
 	}
 
+		// Table inheritance (CREATE TABLE child INHERITS (parent)): each
+		// parent→child edge records a NORMAL ('n') pg_depend row so pg_dump's
+		// dependency-based topological sort outputs parent tables before
+		// children. PostgreSQL's StoreCatalogInheritance
+		// (src/backend/commands/tablecmds.c) records this as:
+		//   classid = pg_class, objid = child_oid, objsubid = 0
+		//   refclassid = pg_class, refobjid = parent_oid, refobjsubid = 0
+		//   deptype = 'n' (DEPENDENCY_NORMAL)
+		// DU-002 (M0119-0004): fixes pg_dump output ordering for inherited
+		// tables when a per-database-namespace catalog is in use.
+		for _, t := range c.ns(dbOid).tables {
+			if len(t.InheritsParentOIDs) == 0 {
+				continue
+			}
+			for _, parentOID := range t.InheritsParentOIDs {
+				rows = append(rows, []string{
+					"1259",                          // 0: classid    = pg_class
+					strconv.Itoa(int(t.OID)),        // 1: objid      = child table OID
+					"0",                             // 2: objsubid
+					"1259",                          // 3: refclassid = pg_class
+					strconv.Itoa(int(parentOID)),    // 4: refobjid   = parent table OID
+					"0",                             // 5: refobjsubid
+					"n",                             // 6: deptype    = NORMAL
+				})
+			}
+		}
+
 	return rows
 }
 

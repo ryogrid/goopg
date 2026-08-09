@@ -1716,8 +1716,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, parentName := range s.Inherits {
 			parent, ok := o.ctx.Catalog.LookupTable(parentName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
-				// Parent might not exist yet or may be a virtual table; skip silently.
-				continue
+				return &ExecError{Code: "42P01", Pos: s.Pos(),
+					Message: fmt.Sprintf("relation %q does not exist", parentName.String())}
 			}
 			if parent.PartitionMethod != "" {
 				return &ExecError{Code: "42809", Pos: s.Pos(),
@@ -3226,7 +3226,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			parentOIDs = append(parentOIDs, parent.OID)
 		}
 		tbl.InheritsParentOIDs = parentOIDs
-	}
+			// Write pg_depend rows so pg_dump's dependency-based topological
+			// sort outputs parent tables before children. DU-002 (M0119-0004).
+			for _, parentOID := range parentOIDs {
+				if err := writeInheritsDependRow(o.ctx, tbl.OID, parentOID); err != nil {
+					return fmt.Errorf("write inherits pg_depend row: %w", err)
+				}
+			}
+		}
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
@@ -8649,6 +8656,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if oldRel != newRel {
 				o.relocateRelationPhysicalFileCleanupOld(oldRel)
 			}
+		case parser.AlterTableSetAccessMethod:
+			// SET ACCESS METHOD name — change the table's access method
+			// (pg_class.relam). goopg only supports `heap`; any other access
+			// method is rejected with ERRCODE_FEATURE_NOT_SUPPORTED.
+			// DU-002: pg_dump emits `ALTER TABLE ... SET ACCESS METHOD heap`
+			// for partitioned tables whose relam differs from the default.
+			if !strings.EqualFold(act.AccessMethodName, "heap") {
+				return &ExecError{Code: "0A000", Pos: s.Pos(),
+					Message: fmt.Sprintf("access method %q is not supported", act.AccessMethodName)}
+			}
+			// Setting access method to heap is a no-op — goopg's default
+			// and only supported AM. No catalog update needed.
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump

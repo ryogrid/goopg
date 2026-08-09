@@ -80,3 +80,29 @@ func deleteSequenceOwnedByDependRow(ctx *Context, seqrelid uint32, xmax storage.
 func mirrorDependCatalogFiles(ctx *Context) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, pgDependRelOID)
 }
+
+// writeInheritsDependRow journals a `CREATE TABLE child INHERITS (parent)`
+// relationship as a pg_depend row: (pg_class, childOID, 0) depends-normal-on
+// (pg_class, parentOID, 0) with deptype='n'. This ensures pg_dump's
+// dependency-based topological sort outputs parent tables before children,
+// so a dump/restore round-trip in a per-database-namespace catalog
+// correctly recreates inheritance hierarchies. DU-002 (M0119-0004).
+func writeInheritsDependRow(ctx *Context, childOID, parentOID uint32) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	row := Row{
+		NewIntDatum(int64(catalog.RelationRelationId)), // classid = pg_class
+		NewIntDatum(int64(childOID)),                    // objid
+		NewIntDatum(0),                                  // objsubid
+		NewIntDatum(int64(catalog.RelationRelationId)), // refclassid
+		NewIntDatum(int64(parentOID)),                   // refobjid
+		NewIntDatum(0),                                  // refobjsubid
+		NewStringDatum("n"),                             // deptype = DEPENDENCY_NORMAL
+	}
+	_, err := writeHeapRowCanonical(ctx, pgDependRel(), PGDependColumnsPG18(), row)
+	return err
+}

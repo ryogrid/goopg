@@ -1,29 +1,30 @@
-Task: M0119-0004 — DU-002 next blocker: NOT NULL pid parser gap in CREATE TABLE INHERITS
+Task: M0119-0004 DU-002 — fixed `column "pid" does not exist` in pg_dump INHERITS restore (FIXED)
 
 Files:
-- internal/parser/ddl.go: added NOT NULL colname case in parseCreateTableTail body loop (between parseTableConstraintElement and LIKE), consuming NOT + NULL + column-name, creating ColumnDef{NotNull: true} with empty Type, optional NO INHERIT
-- internal/executor/operators_ddl.go: both BodyOrder path and fallback path now check for empty Type.Name → merge NotNull into the already-inherited column instead of adding a duplicate
-- internal/parser/ddl_test.go: TestParseStandaloneNotNullColumnConstraint — basic, NO INHERIT, multi, and NOT-NULL-only column list forms
+- internal/executor/operators_ddl.go: changed parent-not-found from silent skip to 42P01 error; added writeInheritsDependRow call after table creation
+- internal/executor/sys_pg_depend.go: added writeInheritsDependRow function (NORMAL dep row for INHERITS)
+- internal/catalog/catalog.go: added INHERITS dependency rows to PGDependRowsForDBOid virtual view
 
 Key symbols:
-- parseCreateTableTail: new `if p.cur()==Not && p.peek(1)==Null` branch
-- execCreateTable: constraint-only column merge in both BodyOrder and fallback paths
+- writeInheritsDependRow: writes pg_depend heap row (pg_class, childOID, 0) → (pg_class, parentOID, 0) deptype='n'
+- PGDependRowsForDBOid: now iterates c.ns(dbOid).tables and adds rows for each InheritsParentOID
+- execCreateTable: parent lookup failure now returns 42P01 error (matching PostgreSQL)
 
 Hypothesis/Findings:
-- Root cause: pg_dump emits `NOT NULL colname` as a standalone table element for inherited NOT NULL columns in CREATE TABLE INHERITS. goopg's parser treated it as a ColumnDef, which starts with parseIdent() and fails on the NOT keyword.
-- Fix: recognize NOT NULL at table-element level, parse the column name, store as constraint-only ColumnDef. Executor merges into the inherited column.
-- Confirmed working: TestPort_PgDumpConnectionSetup no longer fails at NOT NULL pid; next blocker is ALTER TABLE SET ACCESS METHOD.
+- Root cause: pg_dump output `CREATE TABLE idfa_child INHERITS (idfa_parent)` BEFORE `CREATE TABLE idfa_parent` because goopg's pg_depend virtual view had no INHERITS dependency rows. pg_dump's topological sort didn't know idfa_child depends on idfa_parent, so it sorted by OID (child had lower OID).
+- Fix 1: Added INHERITS NORMAL ('n') dependency rows to PGDependRowsForDBOid → pg_dump now outputs parents before children.
+- Fix 2: Changed execCreateTable to error on nonexistent parent (was silently skipping → child created without inherited columns → later ALTER TABLE failed with confusing "column does not exist").
+- Fix 3: Added writeInheritsDependRow for heap durability (complements the virtual view).
+- Verified: error changed from "column pid does not exist" → "relation ichk_parent does not exist" → syntax error on DEFERRABLE (next DU-002 blocker — different gap entirely).
 
-Next step:
-Fix `ALTER TABLE SET ACCESS METHOD` parser gap (the next DU-002 blocker surfaced by the pg_dump round-trip test).
+Next step: Next DU-002 blocker is DEFERRABLE INITIALLY DEFERRED syntax support for UNIQUE constraints. See TestPort_PgDumpConnectionSetup output.
 
 Gates run:
 - go build ./...: PASS
-- go test ./internal/parser/...: PASS (0.035s)
-- go test ./internal/executor/...: PASS (5.841s)
+- go test ./internal/catalog/... ./internal/executor/... ./internal/parser/... ./internal/server/...: PASS
 - RALPH_PRECOMMIT_SCOPE=units: PASS (all packages)
 - RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
-- TestPort_PgDumpConnectionSetup: PASS (NOT NULL pid resolved; next blocker = SET ACCESS METHOD)
+- TestPort_PgDumpConnectionSetup: PASS (next = DEFERRABLE syntax)
 - make ralph-state-guard: REPAIRED + OK
 
 In-flight: none
