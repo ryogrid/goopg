@@ -1,31 +1,29 @@
-Task: M0119-0004 — pg_dump DU-002 round-trip probe: ALTER TEXT SEARCH DICTIONARY/CONFIGURATION OWNER TO + AddTSConfigMapping per-DB scoping
+Task: M0119-0004 — DU-002 next blocker: ALTER SERVER OWNER TO
 
 Files:
-- internal/executor/operators_ddl.go: ALTER guard for "text search dictionary" and "text search configuration" cases in execCompatNoop; AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict callers pass NamespaceDBOid
-- internal/catalog/catalog.go: AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict now take dbOid ...uint32 variadic param + filter by DBOid in the lookup loop
+- internal/parser/ddl.go: added ALTER SERVER dispatch in parseAlter() (after ALTER FOREIGN DATA WRAPPER, before ALTER FOREIGN TABLE). Detects `server` ident keyword, consumes server name + trailing clauses (including OPTIONS with balanced parens), returns CompatNoopStmt with Tag="ALTER SERVER", ObjType="server".
+- internal/parser/op_compat_test.go: added TestParseAlterServerOwner (OWNER TO, OWNER TO CURRENT_USER, OPTIONS, VERSION forms)
 
 Key symbols:
-- ddlOp.execCompatNoop: case "text search dictionary" and "text search configuration" now check strings.HasPrefix(s.Tag, "ALTER ") before requiring TSDictTemplate/TSConfigParser
-- catalog.AddTSConfigMapping: new dbOid ...uint32 param, DBOid match added
-- catalog.DropTSConfigMapping: new dbOid ...uint32 param, DBOid match added
-- catalog.ReplaceTSConfigMappingDict: new dbOid ...uint32 param, DBOid match added
+- parseAlter: new `if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "server")` block
+- execCompatNoop: NO CHANGE needed — existing `case "server":` idempotently handles ALTER SERVER (RegisterForeignServer merges only non-empty fields, all empty for ALTER)
 
 Hypothesis/Findings:
-- Bug 1: execCompatNoop's "text search dictionary" case handled both CREATE and ALTER but always required TSDictTemplate.Name (set only for CREATE). ALTER TEXT SEARCH DICTIONARY OWNER TO produced "text search template is required".
-- Bug 2: Same pattern in "text search configuration" — ALTER OWNER TO would hit "text search parser is required".
-- Bug 3: AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict matched configs by NamespaceOID+Name only (no DBOid), so a restore into a different DB would find the source DB's config, report duplicate, and fail with "duplicate key value violates unique constraint pg_ts_config_map_index".
-- All three FIXED. DU-002 round-trip probe advances past text search objects.
-- Next blocker: ALTER SERVER OWNER TO — parser has no ALTER SERVER dispatch (falls through to ALTER TABLE path → syntax error). After that, likely more ALTER ... OWNER TO gaps for other compat-registry objects.
+- ALTER SERVER OWNER TO was the parseAlter DU-002 blocker from the previous loop. FIXED.
+- ALTER FOREIGN DATA WRAPPER OWNER TO: already handled by the existing token-skipping default case in the parseAlter FDW branch.
+- ALTER EVENT TRIGGER OWNER TO: already handled explicitly (ddl.go:8064-8080).
+- Next blocker: `NOT NULL pid` syntax error in CREATE TABLE with INHERITS — pg_dump emits bare `NOT NULL pid` column constraint for inherited NOT NULL columns. Parser fails with "expected identifier (got not)" at the NOT keyword. This is a different class of gap (column-constraint parsing in CREATE TABLE INHERITS body), not another ALTER OWNER TO.
 
 Next step:
-Continue DU-002 blockers: add ALTER SERVER/FDW/EVENT TRIGGER OWNER TO compat no-op handlers in parser + executor, or add a generic ALTER <compat_object> OWNER TO catch-all to avoid per-type repetition.
+Fix the "NOT NULL pid" column-constraint parsing gap in CREATE TABLE INHERITS. The NOT NULL constraint is emitted as a standalone column constraint item in the table body (not part of the column definition), and the parser doesn't recognize it in that position.
 
 Gates run:
 - go build ./...: PASS
-- go test ./internal/catalog/...: PASS (0.064s)
-- go test ./internal/executor/...: PASS (5.848s)
-- go test ./internal/parser/...: PASS (0.035s)
-- make ralph-state-guard: OK
-- TestPort_PgDumpConnectionSetup: PASS (DU-002 round-trip FAILS at next blocker: ALTER SERVER OWNER TO syntax error)
+- go test ./internal/parser/...: PASS (0.045s)
+- go test ./internal/executor/...: PASS (5.809s)
+- TestPort_PgDumpConnectionSetup: PASS (3.68s) — ALTER SERVER assertion passed; round-trip fails at next blocker (NOT NULL pid)
+- RALPH_PRECOMMIT_SCOPE=units: PASS (all packages)
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all workloads)
+- make ralph-state-guard: REPAIRED + OK
 
 In-flight: none
