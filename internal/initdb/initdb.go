@@ -1816,7 +1816,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -1958,7 +1961,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -2052,7 +2058,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -4781,6 +4790,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 10=contypid (oid). PG declares UNIQUE not PKEY.
 		entry(2665, 2606, []int16{9, 10, 2}, []uint32{oidOps, oidOps, nameOps}, []uint32{0, 0, cCollation}, true, false), // pg_constraint_conrelid_contypid_conname_index
 		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                         // pg_operator_oid_index
+		// M-NIGHTLY AI-20260810-011258-003: pg_attrdef's declared indexes
+		// (postgres/src/include/catalog/pg_attrdef.h:53-54). pg_attrdef
+		// attnums: 1=oid, 2=adrelid, 3=adnum, 4=adbin. PG's AttrDefaultFetch
+		// scans 2656 for (adrelid, adnum) — without a pg_index row the
+		// standby FATALs `could not open relation with OID 2656` on any
+		// table that has a column DEFAULT.
+		entry(2656, 2604, []int16{2, 3}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, false), // pg_attrdef_adrelid_adnum_index (UNIQUE, not PKEY)
+		entry(2657, 2604, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                 // pg_attrdef_oid_index (UNIQUE PRIMARY)
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                          // pg_inherits_relid_seqno_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:

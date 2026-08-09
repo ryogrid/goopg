@@ -334,19 +334,42 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       2. FIXED — the test then created the slot twice (SQL *and*
          `pg_basebackup -C`), which upstream rejects. Helper split into
          `runGoopgBasebackupToPGSlot(..., createSlot bool)`.
-      3. OPEN — Phase A is now green end to end and Phase B replays
-         CREATE TABLE / CREATE INDEX / INSERT, but the
-         `ALTER TABLE ... ADD COLUMN extra int DEFAULT 0` check fails: any
-         query on that relation ON THE PG STANDBY raises `could not open
-         relation with OID 2656`. That is PG's `AttrDefaultFetch`
-         (`relcache.c`) opening `pg_attrdef` by `AttrDefaultIndexId` = 2656,
-         which goopg does not materialize — the pre-existing `pg_attrdef`
-         gap ledgered 2026-07-19, orthogonal to slot management.
-         **Phases C (failover/promote) and D (reverse attach) have never
-         executed and remain UNVERIFIED.** Resume: materialize pg_attrdef
-         index 2656 (+ the relid-2604 tupledesc gap), then re-run.
-         Design: addendum in
-         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 2 rows.
+      3. FIXED (2026-08-10) — the `pg_attrdef` catalog-completeness gap
+         (ledgered 2026-07-19) is closed. THREE causes, fixed together:
+         (a) indexes 2656 (`adrelid`,`adnum`) / 2657 (`oid`) were not
+         materialized at all — added to `nailedLocalRels`
+         (`internal/initdb/relcache_init.go`), `pgIndexInitialEntries`
+         (`internal/initdb/initdb.go`) and the three critical-index
+         placeholder lists (base/1, base/5, global); (b) `pgAttrdefAttrs()`
+         declared only 3 attributes while the heap writer always wrote 4 —
+         `adbin` (`pg_node_tree`/194) added, relnatts 3→4, and that
+         pg_attribute shape is exactly what a non-formrdesc'd pg_attrdef's
+         TupleDesc is rebuilt from on the standby; (c)
+         `mirrorTouchedCatalogsToPostgresDB` did not mirror 2604/2656/2657
+         into `base/5`, so a `dbname=postgres` standby saw zero rows and
+         downgraded to `WARNING: 1 pg_attrdef record(s) missing`. Runtime
+         entries now inserted by `writeAttrdefRow` via
+         `insertPgAttrdefAdrelidAdnumIndexEntry` /
+         `insertPgAttrdefOidIndexEntry`. Guards:
+         `TestPgAttrdefCatalogSurfaceIsPGComplete` +
+         `TestPgAttrdefIndexFilesBootstrapped`
+         (`internal/initdb/pg_attrdef_indexes_test.go`).
+      4. OPEN — **Phase C (failover/promote) now PASSES for the first time**
+         (kill goopg primary → `pg_ctl promote` → write + read on the
+         promoted PG). Phase D (reverse attach) fails on a NEW, unrelated
+         blocker: the promoted PG rejects
+         `SELECT pg_create_physical_replication_slot('s10_reverse')` with
+         `function pg_create_physical_replication_slot(unknown) does not
+         exist`. PG 18's signature is `(slot_name name, immediately_reserve
+         bool DEFAULT false, temporary bool DEFAULT false)`; goopg's seeded
+         pg_proc row for OID 3779 (and 3780) lacks the `pronargdefaults` /
+         `proargdefaults` that let PG resolve the 1-argument call form.
+         Resume: seed `pronargdefaults=2` + a PG-parseable `proargdefaults`
+         pg_node_tree (a LIST of two bool Consts — note internal/pgnodes has
+         no List node yet, ledgered) for 3779 in goopg's pg_proc seed, then
+         re-run `go test -v -run '^TestE2E_PGStandbyFullCycle$'
+         ./internal/testport/`. Design: addenda in
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 3 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

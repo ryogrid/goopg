@@ -41,6 +41,8 @@ const (
 	pgClassOidIndexOID             uint32 = 2662
 	pgClassRelnameNspIndexOID      uint32 = 2663
 	pgAttributeRelidAttnumIndexOID uint32 = 2659
+	pgAttrdefAdrelidAdnumIndexOID  uint32 = 2656
+	pgAttrdefOidIndexOID           uint32 = 2657
 )
 
 // All bootstrap btrees write their root-leaf at block 1 (block 0 is the
@@ -566,4 +568,24 @@ func insertPgClassRelnameNspIndexEntry(ctx *Context, relname string, relnamespac
 func insertPgAttributeRelidAttnumIndexEntry(ctx *Context, attrelid uint32, attnum int16, tid storage.ItemPointer) error {
 	tup := buildIndexTupleOidInt2Key(uint32(tid.Block), tid.Offset, attrelid, attnum)
 	return insertCanonicalSysBtreeLeaf(ctx, pgAttributeRelidAttnumIndexOID, tup, cmpKeyOidInt2)
+}
+
+// insertPgAttrdefAdrelidAdnumIndexEntry inserts an entry into
+// pg_attrdef_adrelid_adnum_index (OID 2656, AttrDefaultIndexId) for
+// ((adrelid, adnum) → heap TID). PG's AttrDefaultFetch (relcache.c) reads
+// every column default through THIS index, never by seq-scan, so a
+// pg_attrdef heap row that is not indexed is invisible to a PG standby even
+// though the heap insert replayed byte-correctly. Key shape is identical to
+// pg_attribute_relid_attnum_index (oid, int2). AI-20260810-011258-003.
+func insertPgAttrdefAdrelidAdnumIndexEntry(ctx *Context, adrelid uint32, adnum int16, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidInt2Key(uint32(tid.Block), tid.Offset, adrelid, adnum)
+	return insertCanonicalSysBtreeLeaf(ctx, pgAttrdefAdrelidAdnumIndexOID, tup, cmpKeyOidInt2)
+}
+
+// insertPgAttrdefOidIndexEntry inserts an entry into pg_attrdef_oid_index
+// (OID 2657, AttrDefaultOidIndexId) for (oid → heap TID). Used by PG's
+// GetAttrDefaultColumnAddress / RemoveAttrDefaultById dependency paths.
+func insertPgAttrdefOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgAttrdefOidIndexOID, tup, cmpKeyUint32)
 }

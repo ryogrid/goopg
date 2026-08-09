@@ -170,6 +170,17 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		// written to base/1 by syncTableToCatalogHeap (writeViewRewriteRow); the
 		// standby (dbname=postgres) reads base/5, so the heap must mirror.
 		pgRewriteRelOID, // 2618 pg_rewrite
+		// M-NIGHTLY AI-20260810-011258-003: pg_attrdef + both of its declared
+		// indexes. syncTableToCatalogHeap writes column DEFAULTs to base/1
+		// (writeAttrdefRow); a PG 18.3 standby attached with dbname=postgres
+		// reads base/5, and its AttrDefaultFetch (relcache.c) resolves them
+		// through AttrDefaultIndexId = 2656 with no seq-scan fallback. Without
+		// all three here the standby's relcache build emits
+		//   WARNING: 1 pg_attrdef record(s) missing for relation "<rel>"
+		// and the promoted PG evaluates the column as if it had no default.
+		pgAttrdefRelOID,               // 2604 pg_attrdef
+		pgAttrdefAdrelidAdnumIndexOID, // 2656
+		pgAttrdefOidIndexOID,          // 2657
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

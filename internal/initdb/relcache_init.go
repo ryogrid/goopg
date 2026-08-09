@@ -290,7 +290,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2618, "pg_rewrite", 83, 'r', 8, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 8, false, pgTriggerAttrs()},
 	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
-	{2604, "pg_attrdef", 83, 'r', 3, false, pgAttrdefAttrs()},
+	{2604, "pg_attrdef", 83, 'r', 4, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 11, false, pgConstraintAttrs()},
 	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
 	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
@@ -732,6 +732,21 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// btree(contypid oid_ops), indnatts=1, non-unique.
 	{OID: 2666, Name: "pg_constraint_contypid_index"},
 	{OID: 2688, Name: "pg_operator_oid_index"},
+	// M-NIGHTLY AI-20260810-011258-003: pg_attrdef's two declared indexes
+	// (postgres/src/include/catalog/pg_attrdef.h:53-54)
+	//   AttrDefaultIndexId    = 2656 = pg_attrdef_adrelid_adnum_index
+	//     btree(adrelid oid_ops, adnum int2_ops)  UNIQUE
+	//   AttrDefaultOidIndexId = 2657 = pg_attrdef_oid_index
+	//     btree(oid oid_ops)                      UNIQUE PRIMARY KEY
+	// PG's AttrDefaultFetch (utils/cache/relcache.c) opens pg_attrdef BY
+	// AttrDefaultIndexId whenever it builds the relcache entry of a table
+	// with atthasdef, so a PG 18.3 standby streaming from goopg raised
+	// `could not open relation with OID 2656` on EVERY query against a
+	// table with a column DEFAULT. Same shape as pg_attribute_relid_attnum
+	// _index (2659) / pg_class_oid_index (2662); runtime entries are
+	// inserted by writeAttrdefRow (internal/executor/sys_pg_attrdef.go).
+	{OID: 2656, Name: "pg_attrdef_adrelid_adnum_index"},
+	{OID: 2657, Name: "pg_attrdef_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
 	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
@@ -2807,11 +2822,28 @@ func pgNamespaceAttrs() []nailedAttr {
 	}
 }
 
+// pgAttrdefAttrs mirrors FormData_pg_attrdef
+// (postgres/src/include/catalog/pg_attrdef.h):
+//
+//	1 oid      oid           (NOT NULL)
+//	2 adrelid  oid           (NOT NULL)
+//	3 adnum    int2          (NOT NULL)
+//	4 adbin    pg_node_tree  (BKI_FORCE_NOT_NULL, CATALOG_VARLEN)
+//
+// M-NIGHTLY AI-20260810-011258-003: `adbin` was missing here even though
+// goopg's heap writer (PGAttrdefColumnsPG18 / writeAttrdefRow) has always
+// written a 4-column row. pg_attrdef is NOT formrdesc'd, so a real PG 18.3
+// standby rebuilds its TupleDesc from the streamed pg_attribute rows for
+// relid 2604 — with only three attributes the standby's relcache saw no
+// `adbin` column at all (a direct `pg_get_expr(adbin, adrelid)` failed with
+// `column "adbin" does not exist`) and AttrDefaultFetch could not read the
+// expression it had just replayed.
 func pgAttrdefAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "adrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "adnum", TypeOID: 21, Num: 3, Len: 2, NotNull: true},
+		{Name: "adbin", TypeOID: 194, Num: 4, Len: -1, NotNull: true},
 	}
 }
 

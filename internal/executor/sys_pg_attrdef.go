@@ -6,8 +6,11 @@ package executor
 // record. pg_attrdef was a VIRTUAL table (rows synthesized on demand); it is
 // now heap-backed. A real PG18 standby replays the heap inserts (no rmid-128).
 //
-// Heap-only, no index (2656/2657 are not materialized in goopg — the reload
-// seq-scans base/<dbOid>/2604). adbin is stored as SQL text (goopg's
+// Since AI-20260810-011258-003 the two declared indexes ARE materialized:
+// initdb bootstraps 2656 (adrelid, adnum) / 2657 (oid) and writeAttrdefRow
+// inserts a leaf entry into both after each heap row. goopg's own reload
+// still seq-scans base/<dbOid>/2604; the indexes exist for PG's
+// AttrDefaultFetch, which has no seq-scan fallback. adbin is stored as SQL text (goopg's
 // established pg_node_tree-as-text convention, same as pg_index.indpred),
 // re-parsed via parser.ParseExpr on reload — canonical node-tree bytes are a
 // separate concern (only matter when PG evaluates the default, not at WAL
@@ -70,12 +73,24 @@ func PGAttrdefColumnsPG18() []catalog.Column {
 // fresh allocation (identity only; the reload keys on adrelid/adnum).
 func writeAttrdefRow(ctx *Context, adrelid uint32, adnum int16, adbin string) error {
 	rel := storage.RelFileNode{DBOid: tableCatalogHeapDBOid(ctx), RelOid: pgAttrdefRelOID, Fork: storage.MainFork}
+	oid := ctx.Catalog.AllocOID()
 	row := Row{
-		NewIntDatum(int64(ctx.Catalog.AllocOID())),
+		NewIntDatum(int64(oid)),
 		NewIntDatum(int64(adrelid)),
 		NewIntDatum(int64(adnum)),
 		NewStringDatum(adbin),
 	}
-	_, err := writeHeapRowCanonical(ctx, rel, PGAttrdefColumnsPG18(), row)
-	return err
+	tid, err := writeHeapRowCanonical(ctx, rel, PGAttrdefColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	// AI-20260810-011258-003: index the row in pg_attrdef's two declared
+	// btrees. goopg's own reload seq-scans base/<dbOid>/2604 and needs
+	// neither, but PG's AttrDefaultFetch reads defaults ONLY through
+	// AttrDefaultIndexId (2656), so an unindexed row leaves a PG standby
+	// unable to build the relcache entry of any table with a DEFAULT.
+	if err := insertPgAttrdefAdrelidAdnumIndexEntry(ctx, adrelid, adnum, tid); err != nil {
+		return err
+	}
+	return insertPgAttrdefOidIndexEntry(ctx, oid, tid)
 }

@@ -152,3 +152,57 @@ less WAL, never more). All three are ledger rows.
 **Guard.** `TestPort_SQLPhysicalReplicationSlotFuncs`
 (`internal/testport/sql_replication_slot_funcs_test.go`): create → duplicate →
 `immediately_reserve` LSN rendering → drop → drop-missing → survives restart.
+
+## Addendum 2026-08-10 (2) — pg_attrdef catalog completeness (M-NIGHTLY AI-20260810-011258-003)
+
+The `could not open relation with OID 2656` blocker described in the previous
+addendum is closed. It had **three** independent causes, all in the pg_attrdef
+catalog surface goopg hands to a PG 18.3 standby:
+
+1. **Missing indexes.** `pg_attrdef.h:53-54` declares
+   `AttrDefaultIndexId` = 2656 `btree(adrelid oid_ops, adnum int2_ops)` and
+   `AttrDefaultOidIndexId` = 2657 `btree(oid oid_ops)`. goopg materialized
+   neither — no `pg_class`/`pg_index`/`pg_attribute` rows and no files — so
+   PG's `AttrDefaultFetch` (`utils/cache/relcache.c`), which opens 2656 with
+   **no seq-scan fallback**, FATAL'd on every relcache build of a table with
+   `atthasdef`. Fixed by adding both to `nailedLocalRels` (`relcache_init.go`),
+   to `pgIndexInitialEntries` (`initdb.go`, indkey `{2,3}` / `{1}`), and to the
+   three critical-index placeholder lists that lay down `base/1`, `base/5` and
+   `global` btree pages. Key-attribute descriptors auto-derive from the
+   pg_attrdef heap attrs via `flattenRels`.
+2. **Truncated tupledesc.** `pgAttrdefAttrs()` declared only
+   `(oid, adrelid, adnum)` while `PGAttrdefColumnsPG18` had always written four
+   columns. pg_attrdef is not `formrdesc`'d, so PG rebuilds its TupleDesc from
+   the streamed `pg_attribute` rows for relid 2604 and therefore had no `adbin`
+   column to read. Added `adbin` (`pg_node_tree`, OID 194, varlena,
+   `BKI_FORCE_NOT_NULL`) and bumped relnatts 3 → 4.
+3. **Not mirrored to the `postgres` database.** `writeAttrdefRow` writes to
+   `tableCatalogHeapDBOid` (= `base/1` for a connection on postgres/template1),
+   but the standby attaches with `dbname=postgres` and reads `base/5`.
+   `mirrorTouchedCatalogsToPostgresDB` listed pg_class/pg_attribute/pg_index/…
+   but not pg_attrdef, so the standby's scan found zero rows and PG downgraded
+   to `WARNING: 1 pg_attrdef record(s) missing for relation "s10_t"` — a
+   silently default-less column. 2604/2656/2657 are now in the mirror set.
+
+Runtime index maintenance rides the existing canonical-sys-btree machinery:
+`writeAttrdefRow` now calls `insertPgAttrdefAdrelidAdnumIndexEntry` /
+`insertPgAttrdefOidIndexEntry` (`sys_catalog_index_insert.go`) with the heap
+TID, reusing `buildIndexTupleOidInt2Key` / `buildIndexTupleOidKey` — the
+pg_attrdef key shapes are byte-identical to
+`pg_attribute_relid_attnum_index` and `pg_class_oid_index`.
+
+**Result.** `TestE2E_PGStandbyFullCycle` Phases A, B and **C** (failover: kill
+the goopg primary, `pg_ctl promote`, write and read on the promoted PG) now
+pass — Phase C had never executed before. Phase D (reverse attach) fails on a
+new, unrelated blocker: the promoted PG rejects
+`SELECT pg_create_physical_replication_slot('s10_reverse')` with
+`function pg_create_physical_replication_slot(unknown) does not exist`. PG 18's
+signature is `(slot_name name, immediately_reserve bool DEFAULT false,
+temporary bool DEFAULT false)`; goopg's seeded pg_proc row for OID 3779 does
+not carry the `pronargdefaults` / `proargdefaults` that let PG resolve the
+1-argument call form. Ledgered; the fix_plan item stays unchecked.
+
+**Guards.** `TestPgAttrdefCatalogSurfaceIsPGComplete` and
+`TestPgAttrdefIndexFilesBootstrapped` (`internal/initdb/pg_attrdef_indexes_test.go`)
+pin the tupledesc, both index specs, the pg_index seed rows and the on-disk
+placeholder files — cheap static checks that fire long before the PG-binary E2E.
