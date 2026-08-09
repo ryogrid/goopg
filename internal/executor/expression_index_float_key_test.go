@@ -60,7 +60,7 @@ func TestEncodeArbiterExprKeyFloatIsTypeDirected(t *testing.T) {
 	prevIdx := -1
 	var prev []byte
 	for i, tc := range ascending {
-		got := encodeArbiterExprKey(tc.v, keyExpr, 0)
+		got := encodeArbiterExprKey(nil, tc.v, keyExpr, 0)
 		if got == nil {
 			t.Fatalf("%s: nil encoding — the row would be dropped from the index", tc.name)
 		}
@@ -78,8 +78,8 @@ func TestEncodeArbiterExprKeyFloatIsTypeDirected(t *testing.T) {
 	// Without the resolved expression the encoder cannot know the type and keeps
 	// kind dispatch — this asserts the two really did disagree, so the test above
 	// is not vacuous.
-	numericKind := encodeArbiterExprKey(Datum{Kind: KindNumeric, Int: 15, Scale: 1}, nil, 0)
-	stringKind := encodeArbiterExprKey(NewStringDatum("1e+30"), nil, 0)
+	numericKind := encodeArbiterExprKey(nil, Datum{Kind: KindNumeric, Int: 15, Scale: 1}, nil, 0)
+	stringKind := encodeArbiterExprKey(nil, NewStringDatum("1e+30"), nil, 0)
 	if len(numericKind) == 8 && len(stringKind) == 8 {
 		t.Fatal("kind dispatch now produces 8-byte keys for both float " +
 			"representations; this test no longer proves the float arm does anything")

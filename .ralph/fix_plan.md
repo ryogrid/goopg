@@ -567,11 +567,32 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestEncodeArbiterExprKeyFloatIsTypeDirected` +
       `TestExpressionIndexBuildFloatKey` (physical tree scan, bulk build and
       post-build INSERT), confirmed non-vacuous.
-      Remaining for M0119-0006: enum expression key encoding (needs
-      `ExprResultType` to resolve user enum types), posting-list duplicate
-      coverage in the checkunique tier, `box`/`int4range`/`int4[]`/interval key
-      encodings, and the whole-database (unscoped) pg_amcheck run — ledger rows
-      2026-08-10.
+      **Slice landed 2026-08-10 (11th) — ENUM expression key encoding, made
+      type-directed** (design
+      `docs/design/0119-0006-expression-index-enum-key.md`). The second and
+      worse kind-dispatch failure in `encodeArbiterExprKey`, and unlike float it
+      was wrong for EVERY enum expression index, not just exotic values. An enum
+      COLUMN key is `EncodeFloat8(enumsortorder)` — the type's ordering, since
+      upstream `enum_ops` compares by `enumsortorder` (`enum_cmp`,
+      `src/backend/utils/adt/enum.c`) — and every column path converts a
+      `KindString` label to `KindEnum` before encoding so that holds
+      (M0097-0022). An expression key column has no catalog column, so that
+      conversion never ran: over `ENUM ('sad','ok','happy')` a real build stored
+      `686170707900`/`6f6b00`/`73616400`, i.e. ALPHABETICAL label order, the
+      exact reverse of declaration order. Latent second defect: a datum that did
+      arrive as `KindEnum` (the seq-scan path injects those) wrote 8 float bytes
+      into the same index as the variable-width label bytes. Fixed as for float:
+      `encodeArbiterExprKey` takes a `*Context` (all three call sites had one),
+      `exprKeyEnumType` resolves `planner.ExprResultType`'s type NAME through
+      `catalog.InMemory.LookupEnum`, and `enumSortOrderForKey` maps either datum
+      kind onto the sort order, so column and expression keys over one enum are
+      byte-identical. Gates
+      `TestEncodeArbiterExprKeyEnumIsTypeDirected` +
+      `TestExpressionIndexBuildEnumKey` (physical tree scan over bulk build and
+      post-build INSERT), both confirmed non-vacuous.
+      Remaining for M0119-0006: posting-list duplicate coverage in the
+      checkunique tier, `box`/`int4range`/`int4[]`/interval key encodings, and
+      the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

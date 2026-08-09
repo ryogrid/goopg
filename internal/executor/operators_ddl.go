@@ -10820,7 +10820,7 @@ func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Col
 			if v.IsNull() {
 				return nil, true, nil
 			}
-			k := encodeArbiterExprKey(v, keyExprs[i], pos)
+			k := encodeArbiterExprKey(ctx, v, keyExprs[i], pos)
 			if k == nil {
 				return nil, false, nil
 			}

@@ -1511,7 +1511,7 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 				return nil, nil
 			}
 			// Encode the expression result as a text/varchar key.
-			k := encodeArbiterExprKey(v, oc.ArbiterExprs[i], pos)
+			k := encodeArbiterExprKey(ctx, v, oc.ArbiterExprs[i], pos)
 			if k == nil {
 				return nil, &ExecError{Code: "42804", Pos: pos, Message: "expression-based arbiter column produced unsupported datum type"}
 			}
@@ -1561,6 +1561,21 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 // keyExpr may be nil (callers that have no resolved expression); then the kind
 // dispatch below applies unchanged.
 //
+// enum is the second type-directed arm, and the reason ctx exists. An enum
+// *column* key is EncodeFloat8(enumsortorder) — the label's DECLARATION order,
+// which is what PG's enum_ops orders by (enum_cmp → enumsortorder,
+// src/backend/utils/adt/enum.c) — and every column path converts a KindString
+// label to KindEnum first (M0097-0022) precisely so that holds. An expression
+// key column has no catalog column, so that conversion never ran and a label
+// reached the KindString arm below: the index came out in ALPHABETICAL label
+// order ('happy' < 'ok' < 'sad') instead of enum order (sad < ok < happy). Two
+// consequences, both real: an ordered read of the index disagrees with the
+// type's ordering, and a row whose datum did arrive as KindEnum (the seq-scan
+// path injects those) encoded 8 float bytes into the same index as the label
+// bytes — the float bug's mixed-encoding shape again. So when the key
+// expression's static result type names a user enum, the label is resolved
+// through the catalog and every row goes through EncodeFloat8(sort order).
+//
 // Each arm reuses the same order-preserving encoder that the equivalent
 // declared column type would use, so bytewise comparison of the encoded key
 // reproduces the SQL ordering of the expression's result type:
@@ -1578,13 +1593,23 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 //
 // Returns nil for a kind with no btree encoding; callers treat that as
 // "row not indexable" rather than an error.
-func encodeArbiterExprKey(v Datum, keyExpr planner.Expr, pos int) []byte {
+func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr planner.Expr, pos int) []byte {
 	if exprKeyIsFloat(keyExpr) {
 		f, _, ok := datumToFloat64ForKey(v)
 		if !ok {
 			return nil
 		}
 		return btree.EncodeFloat8(f)
+	}
+	if et, ok := exprKeyEnumType(ctx, keyExpr); ok {
+		order, ok := enumSortOrderForKey(et, v)
+		if !ok {
+			// A value that is not a label of this enum cannot be placed in the
+			// type's order; the row is simply not indexed, as for any other
+			// kind the encoder has no arm for.
+			return nil
+		}
+		return btree.EncodeFloat8(order)
 	}
 	switch v.Kind {
 	case KindString:
@@ -1620,6 +1645,56 @@ func exprKeyIsFloat(keyExpr planner.Expr) bool {
 	}
 	t, ok := planner.ExprResultType(keyExpr)
 	return ok && !t.IsArray && isFloat8Type(t.Name)
+}
+
+// exprKeyEnumType reports the enum type an index key expression yields, when it
+// yields one. Like exprKeyIsFloat, a resolution failure means "not known to be
+// an enum" and leaves the runtime kind dispatch in charge, so nothing an earlier
+// goopg indexed stops being indexed.
+//
+// planner.ExprResultType already returns a user enum's type NAME for the shapes
+// an enum key expression actually takes (a ColumnRef of enum type, a CAST to the
+// enum, a CASE over them); it is the catalog, not the planner, that decides
+// whether that name is an enum. exactTypeOID deliberately refuses to resolve
+// non-builtin type names, so a FuncCall *over* an enum argument still declines —
+// conservative in the same direction.
+func exprKeyEnumType(ctx *Context, keyExpr planner.Expr) (*catalog.EnumType, bool) {
+	if ctx == nil || keyExpr == nil {
+		return nil, false
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || im == nil {
+		return nil, false
+	}
+	t, ok := planner.ExprResultType(keyExpr)
+	if !ok || t.IsArray || t.Name == "" {
+		return nil, false
+	}
+	et, isEnum := im.LookupEnum(t.Name)
+	if !isEnum || et == nil {
+		return nil, false
+	}
+	return et, true
+}
+
+// enumSortOrderForKey resolves the enumsortorder an enum-typed key datum encodes
+// under. A datum that already went through a KindEnum injection carries the
+// order; one that did not is still the raw label, and the catalog entry is what
+// turns it into an order — the same label→order step every enum COLUMN path
+// performs before calling encodeBTreeKeyForColumn (M0097-0022).
+func enumSortOrderForKey(et *catalog.EnumType, v Datum) (float64, bool) {
+	switch v.Kind {
+	case KindEnum:
+		return v.EnumSortOrder(), true
+	case KindString:
+		label := v.StringValue()
+		for _, ev := range et.Values {
+			if ev.Label == label {
+				return ev.SortOrder, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // exprKeyDecodeType is the DECODE-side twin of encodeArbiterExprKey: given the

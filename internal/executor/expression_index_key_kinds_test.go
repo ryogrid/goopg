@@ -29,7 +29,7 @@ func TestEncodeArbiterExprKeyCoversNonTextKinds(t *testing.T) {
 		{"enum", NewEnumDatum(3, "green")},
 		{"bytes", NewBytesDatum([]byte{0x00, 0x01, 0x7f})},
 	} {
-		if got := encodeArbiterExprKey(tc.v, nil, 0); got == nil {
+		if got := encodeArbiterExprKey(nil, tc.v, nil, 0); got == nil {
 			t.Errorf("%s: encodeArbiterExprKey returned nil — rows with this "+
 				"expression result kind would be dropped from the index", tc.name)
 		}
@@ -55,8 +55,8 @@ func TestEncodeArbiterExprKeyOrderPreserving(t *testing.T) {
 		{"bytes", NewBytesDatum([]byte{0x01, 0x02}), NewBytesDatum([]byte{0x02})},
 		{"int", NewIntDatum(-5), NewIntDatum(5)},
 	} {
-		lo := encodeArbiterExprKey(tc.lo, nil, 0)
-		hi := encodeArbiterExprKey(tc.hi, nil, 0)
+		lo := encodeArbiterExprKey(nil, tc.lo, nil, 0)
+		hi := encodeArbiterExprKey(nil, tc.hi, nil, 0)
 		if lo == nil || hi == nil {
 			t.Fatalf("%s: unexpected nil encoding", tc.name)
 		}

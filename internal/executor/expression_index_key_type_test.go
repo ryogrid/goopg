@@ -58,7 +58,7 @@ func TestExprKeyDecodeTypeRoundTrip(t *testing.T) {
 				t.Fatalf("exprKeyDecodeType(%s) declined — the comparator would "+
 					"fall back to whole-key byte order for this type", tc.sqlType)
 			}
-			enc := encodeArbiterExprKey(tc.v, tc.keyExpr, 0)
+			enc := encodeArbiterExprKey(nil, tc.v, tc.keyExpr, 0)
 			if enc == nil {
 				t.Fatalf("encodeArbiterExprKey returned nil for %s", tc.name)
 			}
