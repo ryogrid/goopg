@@ -293,7 +293,7 @@ func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog
 //
 // Scope: any index whose key columns are all plain (non-expression) columns of a
 // type the B-tree key decoder can invert (decodeIndexKeyColumn — int4/int8/
-// float8/date/timestamp(tz)/text-like/enum), with at least one key column
+// float8/numeric/date/timestamp(tz)/text-like/enum), with at least one key column
 // declaring a user opclass. Composite keys are compared column by column, each
 // under its own opclass — the column-wise contract of upstream's _bt_compare,
 // which walks scan-key attributes in order and stops at the first non-equal one.

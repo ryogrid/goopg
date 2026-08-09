@@ -134,15 +134,46 @@ also the upstream rule: `_bt_compare` stops at
 (`len(idx.IncludeColumns) > 0`) and is gone; the `checkunique` tier inherits the
 widening for free, since `btIndexCheckUnique` runs under the same comparator.
 
+**2026-08-10 (fifth slice — `NUMERIC` keys).** `NUMERIC` was the one common
+built-in type the walk could not invert, and the miss was worse than "keeps byte
+order": `decodeIndexKeyColumn` has no numeric branch, so a numeric key column
+fell through to the `default:` arm, which reads the first 8 bytes as a float8
+and returns an enum `Datum`. That never errors, so the decode-failure fallback
+never fired — the comparator handed the user's FUNCTION 1 routine a fabricated
+value. The same `default:` arm served goopg's index-only scan, so an IOS over a
+`NUMERIC` key column projected the same fabricated value.
+
+`btree.EncodeNumericKey`'s doc comment declared decoding "intentionally not
+provided", but the format is in fact invertible and self-delimiting — a fixed
+6-byte frame (sign byte + biased 4-byte exponent) followed by an ASCII digit run
+ended by a terminator that can never be a digit byte (`0x00` below `'0'` for
+positive keys, `0xFF` above `'9'` for negative ones), plus the `0x01` single-byte
+zero sentinel. New `btree.DecodeNumericKey` inverts it and reports the byte count,
+which is what the composite walk needs to find the next column. Two properties
+are worth stating because callers depend on them:
+
+- The round trip is **value-preserving, not byte-preserving**: the encoder strips
+  trailing mantissa zeros, so `1.50` comes back as mantissa 15 / scale 1. Both
+  denote the same value, which is what key comparison and IOS projection compare
+  on, and re-encoding the decoded pair reproduces the identical key bytes.
+- The returned scale is **never negative**. A value like `100` normalises to
+  E=2 over a single digit, i.e. scale −2; rather than hand back a negative scale
+  the mantissa is expanded to 100 at scale 0, so every caller can treat `Scale`
+  as the unsigned digit count the codec already assumes.
+
+Both key-decode siblings are wired (Hard-won Rule #2): `decodeIndexKeyColumn`
+(composite / amcheck) and `decodeBTreeKeyToDatum` (single-column IOS), through a
+shared `numericDatumFromBig` that picks the int64 fast lane or the `big.Int`
+overflow lane exactly as `datum.go` does.
+
 Still out of scope:
 
 - **Expression key columns** (`Columns[i] == ""`): there is no catalog column
   whose type drives the decode.
-- **Types the key decoder cannot invert** (e.g. `NUMERIC`, whose encoding is
-  documented as deliberately one-way, and `box`/`int4range`/`int4[]`). These hit
-  the per-column decode-failure fallback and keep byte order for that column, so
-  they are never a false positive — only a missed detection. Recorded in
-  `.ralph/deferral_ledger.md`.
+- **Types the key decoder still cannot invert** (`box`/`int4range`/`int4[]`).
+  Unlike `NUMERIC` these do hit the per-column decode-failure fallback and keep
+  byte order for that column, so they are never a false positive — only a missed
+  detection. Recorded in `.ralph/deferral_ledger.md`.
 - **The `--checkunique` tier**, tracked separately under M0119-0006.
 
 Cost: one SQL-function call per key comparison on the pages of an index that
@@ -171,5 +202,19 @@ index that does not (the comparator is nil and never allocated).
   column of an `(i int4_fickle3_ops) INCLUDE (payload)` index. Clean-then-damaged
   pair as above; confirmed **non-vacuous** (restoring the `IncludeColumns` guard
   makes the damaged covering index report clean and the test fail).
+- Fifth slice (2026-08-10 — `NUMERIC`):
+  `TestBtIndexCheck_OpClassDamageDetectedNumeric` — a user `numeric` opclass over
+  a column of mixed scales and signs (`-2.50, -1, 0, 0.125, 1.5, 10, 100.25,
+  1000`). Clean-then-damaged pair as above; self-proving for non-vacuity, since a
+  comparator that declines (or is never consulted) reports the damaged index
+  clean and fails the second assertion.
+  `internal/access/btree`: `TestDecodeNumericKeyRoundTrip` (incl. the
+  normalisation and min/max-int64 cases and a re-encode identity check),
+  `TestDecodeNumericKeyBigMantissa`, `TestDecodeNumericKeyComposite` (the
+  self-delimiting contract) and `TestDecodeNumericKeyRejectsGarbage` (errors must
+  actually be reported, or the comparator's byte-order fallback is unsound).
+  `internal/executor`: `TestNumericIndexKeyDecodeSiblingParity` and
+  `TestNumericIndexKeyDecodeCompositeWalk` pin the two decoders against each
+  other, the Rule-#2 sibling obligation.
 - `go test ./internal/amcheck/... ./internal/catalog/...` and the existing
   `TestBtIndexCheck_*` suite PASS unchanged.

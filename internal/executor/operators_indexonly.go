@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -380,6 +381,16 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 	return row, nil
 }
 
+// numericDatumFromBig wraps a decoded NUMERIC mantissa/scale pair in a Datum,
+// taking the int64 fast lane when the mantissa fits and the big.Int overflow
+// lane otherwise — the same split the codec makes (see datum.go). M0119-0006.
+func numericDatumFromBig(m *big.Int, scale int16) Datum {
+	if m.IsInt64() {
+		return NewNumericInt64Datum(m.Int64(), scale)
+	}
+	return NewNumericBigDatum(m, scale)
+}
+
 // decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
@@ -423,6 +434,16 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		v, err := btree.DecodeInt4(key[:4])
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
 		return NewTimeDatum(ts), 4, err
+	case isNumericType(typeName):
+		// NUMERIC keys are variable-length but self-delimiting, so the
+		// composite walk can consume exactly this column. Value-preserving,
+		// not byte-preserving: EncodeNumericKey strips trailing mantissa
+		// zeros, so 1.50 decodes as (15, scale 1). M0119-0006.
+		m, scale, n, err := btree.DecodeNumericKey(key)
+		if err != nil {
+			return NullDatum, 0, err
+		}
+		return numericDatumFromBig(m, scale), n, nil
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
 		strings.ToLower(typeName) == "uuid":
 		raw, n, err := btree.DecodeVarcharLen(key)
@@ -502,6 +523,17 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), nil
+
+	case isNumericType(typeName):
+		// Sibling of the multi-column branch in decodeIndexKeyColumn — both
+		// must invert EncodeNumericKey, or a NUMERIC key column decodes one
+		// way in a single-column IOS and another way in a composite one.
+		// M0119-0006.
+		m, scale, _, err := btree.DecodeNumericKey(key)
+		if err != nil {
+			return NullDatum, err
+		}
+		return numericDatumFromBig(m, scale), nil
 
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
 		b, err := btree.DecodeVarchar(key)

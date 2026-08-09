@@ -376,8 +376,10 @@ func DecodeInt8(b []byte) (int64, error) {
 // Where d_1.d_2…d_n × 10^E is the value's scientific normalisation
 // after stripping trailing zeros from the mantissa.
 //
-// Decoding is intentionally not provided: the B-tree never inverts the
-// encoding; index probes always re-encode from the live datum.
+// The B-tree itself never inverts this encoding — index probes always
+// re-encode from the live datum. DecodeNumericKey exists for the callers
+// that must read a stored key back (amcheck's operator-class comparator
+// dispatch, index-only-scan key projection); see M0119-0006.
 //
 // M0041-0004 widens the mantissa parameter from int64 to *big.Int so
 // arbitrary-precision NUMERIC values (e.g. results of TPC-H Q8's
@@ -436,6 +438,90 @@ func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
 		out = append(out, 0x00) // less than any digit byte; shorter sorts first
 	}
 	return out
+}
+
+// DecodeNumericKey inverts EncodeNumericKey over the head of b, returning the
+// value as mantissa * 10^(-scale) plus the number of bytes the key occupied.
+// The encoding is self-delimiting (a fixed 6-byte frame plus a digit run ended
+// by a terminator that can never be a digit byte), so a composite key can be
+// walked column by column through it — that is what the amcheck operator-class
+// comparator does (M0119-0006).
+//
+// Because EncodeNumericKey strips trailing mantissa zeros, the returned pair is
+// the *normalised* representation: (1.50 :: numeric) round-trips as (15, 1),
+// not (150, 2). The two denote the same value, which is the property callers
+// (key comparison, IOS projection) rely on. The returned scale is never
+// negative — a value like 100 normalises to E=2 with one digit, and rather than
+// hand back scale -2 the mantissa is expanded to 100 with scale 0, so every
+// caller can treat Scale as an unsigned digit count exactly as the codec does.
+func DecodeNumericKey(b []byte) (mantissa *big.Int, scale int16, n int, err error) {
+	if len(b) == 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key truncated (empty)")
+	}
+	switch b[0] {
+	case 0x01:
+		return big.NewInt(0), 0, 1, nil
+	case 0x00, 0x02:
+	default:
+		return nil, 0, 0, fmt.Errorf("btree: bad numeric key sign byte 0x%02x", b[0])
+	}
+	negative := b[0] == 0x00
+	if len(b) < 6 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key truncated, got %d bytes", len(b))
+	}
+	biased := binary.BigEndian.Uint32(b[1:5])
+	var E int32
+	term := byte(0x00)
+	if negative {
+		E = int32(0x7FFFFFFF) - int32(biased)
+		term = 0xFF
+	} else {
+		E = int32(biased - 0x80000000)
+	}
+	// Digits run until the terminator; it is 0x00 (below '0') for positive keys
+	// and 0xFF (above '9') for negative ones, so it can never be mistaken for a
+	// digit byte of this column.
+	end := -1
+	for i := 5; i < len(b); i++ {
+		if b[i] == term {
+			end = i
+			break
+		}
+		if b[i] < '0' || b[i] > '9' {
+			return nil, 0, 0, fmt.Errorf("btree: bad numeric key digit 0x%02x", b[i])
+		}
+	}
+	if end < 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key missing terminator")
+	}
+	digits := make([]byte, end-5)
+	for i := range digits {
+		d := b[5+i] - '0'
+		if negative {
+			d = 9 - d // undo the digit inversion that makes bigger magnitudes sort smaller
+		}
+		digits[i] = '0' + d
+	}
+	if len(digits) == 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key has no digits")
+	}
+	m, ok := new(big.Int).SetString(string(digits), 10)
+	if !ok {
+		return nil, 0, 0, fmt.Errorf("btree: bad numeric key digits %q", digits)
+	}
+	// E = ndigits - 1 - scale  (see EncodeNumericKey).
+	s := int32(len(digits)) - 1 - E
+	if s < 0 {
+		m.Mul(m, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-s)), nil))
+		s = 0
+	}
+	if s > math.MaxInt16 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key scale %d out of range", s)
+	}
+	if negative {
+		m.Neg(m)
+	}
+	return m, int16(s), end + 1, nil
 }
 
 // EncodeVarchar encodes a variable-length string as a self-terminating

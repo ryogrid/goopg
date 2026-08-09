@@ -419,9 +419,24 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       column-by-column walk — upstream's rule too (`_bt_compare` stops at
       `IndexRelationGetNumberOfKeyAttributes`). A user opclass on a covering
       index now dispatches, and `checkunique` inherits it. Gate:
-      `TestBtIndexCheck_OpClassDamageDetectedInclude` (non-vacuous). Still open
-      for 005: expression key columns, posting-list duplicate coverage, and
-      non-invertible key types (NUMERIC, box/int4range/int4[]) — ledger rows
+      `TestBtIndexCheck_OpClassDamageDetectedInclude` (non-vacuous).
+      **Fifth slice landed 2026-08-10 — `NUMERIC` key columns:** new
+      `btree.DecodeNumericKey` inverts `EncodeNumericKey`, whose doc comment had
+      declared decoding "intentionally not provided" — the format is in fact
+      invertible and self-delimiting (`0x01` zero sentinel, else sign byte +
+      biased 4-byte exponent + ASCII digit run + a terminator that can never be a
+      digit byte), so it also reports the byte width the composite walk needs.
+      Wired into BOTH key-decode siblings via `numericDatumFromBig`:
+      `decodeIndexKeyColumn` (composite/amcheck) and `decodeBTreeKeyToDatum`
+      (single-column IOS). That second wiring repairs a latent index-only-scan
+      defect — `NUMERIC` used to fall through the shared `default:` arm, which
+      reads 8 bytes as a float8 and returns an enum `Datum`, and since it never
+      errors the comparator's decode-failure fallback never fired. Gates:
+      `TestBtIndexCheck_OpClassDamageDetectedNumeric`,
+      `TestDecodeNumericKey{RoundTrip,BigMantissa,Composite,RejectsGarbage}`,
+      `TestNumericIndexKeyDecode{SiblingParity,CompositeWalk}`. Still open for
+      005: expression key columns, posting-list duplicate coverage, and the
+      remaining non-invertible key types (box/int4range/int4[]) — ledger rows
       2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`

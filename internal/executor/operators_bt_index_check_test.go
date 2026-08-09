@@ -558,3 +558,60 @@ func TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex(t *testing.T) {
 		}
 	}
 }
+
+// TestBtIndexCheck_OpClassDamageDetectedNumeric covers the NUMERIC key type —
+// the fifth M0119-0006 slice. NUMERIC was the one common built-in type the
+// column-by-column walk could not invert: its key encoding is variable-length
+// (sign || biased exponent || digit run || terminator), so before
+// btree.DecodeNumericKey existed the walk fell through to the default branch,
+// mis-read 8 bytes as a float8 and returned a bogus enum Datum. The comparator
+// would then hand the user's FUNCTION 1 routine garbage.
+//
+// Non-vacuity: the healthy assertion below fails if the comparator silently
+// declines, because a declining comparator can never report damage either —
+// the damaged assertion is what proves the routine is actually consulted.
+func TestBtIndexCheck_OpClassDamageDetectedNumeric(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION n_asc_cmp (a numeric, b numeric) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION n_desc_cmp (a numeric, b numeric) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS numeric_fickle_ops FOR TYPE numeric USING btree AS
+			OPERATOR 1 < (numeric, numeric), OPERATOR 2 <= (numeric, numeric),
+			OPERATOR 3 = (numeric, numeric), OPERATOR 4 >= (numeric, numeric),
+			OPERATOR 5 > (numeric, numeric), FUNCTION 1 n_asc_cmp(numeric, numeric)`,
+		"CREATE TABLE numtbl (n numeric)",
+		// Mixed scales and signs so the decode has to normalise, not just read
+		// a fixed-width field: -2.50, -1, 0, 0.125, 1.5, 10, 100.25, 1000.
+		`INSERT INTO numtbl VALUES (-2.50), (-1), (0), (0.125), (1.5), (10), (100.25), (1000)`,
+		"CREATE INDEX ficklen ON numtbl USING btree (n numeric_fickle_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklen')"); err != nil {
+		t.Fatalf("healthy numeric index under a user operator class raised: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'n_desc_cmp'::regproc
+		WHERE amproc = 'n_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklen')")
+	if err == nil {
+		t.Fatal("broken numeric operator class not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "ficklen"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}
