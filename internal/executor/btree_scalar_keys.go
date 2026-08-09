@@ -36,11 +36,19 @@ import (
 //	      NUL/0x01 bytes cannot forge a terminator.
 //	time  (bttimecmp,  time_ops)         — int64 microseconds since midnight,
 //	      encoded through the timestamp/int8 key (8 bytes).
+//	timetz (bttimetzcmp, timetz_ops)     — TWO ordered parts, concatenated
+//	      (12 bytes); see encodeTimeTzBTreeKey.
 //
-// `timetz` is deliberately NOT here: its comparison is two-part
-// (`timetz_cmp_internal` compares time-minus-zone first and only then the zone
-// itself), so a single ordered key column cannot represent it. See the
-// deferral-ledger row for the resume point.
+// The earlier slice of this file declined `timetz` on the grounds that its
+// comparison is two-part and therefore "not single-key representable". That
+// reasoning was wrong, and this slice corrects it: `timetz_cmp_internal`
+// (`postgres/src/backend/utils/adt/date.c`) sorts first by the GMT-equivalent
+// time and then, to break ties, by the zone — and BOTH parts are fixed-width
+// integers, so their order-preserving keys CONCATENATE into one ordered key
+// exactly the way a two-column composite index key does. What genuinely cannot
+// be represented is a comparison whose parts are not each individually
+// order-preserving (`interval`'s 128-bit span is one key but a lossy one, so it
+// is a separate, still-open row) — not merely one with more than one part.
 
 // isInt2Type returns true for the 2-byte signed integer type. `smallserial` /
 // `serial2` are the sequence-backed spellings of int2, matching how isInt4Type
@@ -81,8 +89,8 @@ func isByteaType(name string) bool {
 }
 
 // isTimeOfDayType returns true for `time without time zone` ONLY. It must not
-// answer for `timetz`, whose ordering is not single-key representable (see the
-// file comment), nor for `timestamp`, which has its own predicate.
+// answer for `timetz`, which is a DIFFERENT key encoding (12 bytes, not 8 —
+// see isTimeTzType), nor for `timestamp`, which has its own predicate.
 func isTimeOfDayType(name string) bool {
 	switch strings.ToLower(name) {
 	case "time", "time without time zone":
@@ -90,6 +98,49 @@ func isTimeOfDayType(name string) bool {
 	default:
 		return false
 	}
+}
+
+// isTimeTzType returns true for `time with time zone`.
+func isTimeTzType(name string) bool {
+	switch strings.ToLower(name) {
+	case "timetz", "time with time zone":
+		return true
+	default:
+		return false
+	}
+}
+
+// timeTzKeyParts splits a timetz Datum into the two quantities
+// timetz_cmp_internal sorts by, in PG's own units and sign convention:
+//
+//	gmtMicros — the GMT-equivalent time, upstream's
+//	            `time1->time + (time1->zone * USECS_PER_SEC)`.
+//	pgZone    — the zone in seconds WEST of UTC, which is upstream's sign
+//	            convention for TimeTzADT.zone and the NEGATION of goopg's
+//	            Datum.Scale convention (Scale holds minutes EAST of UTC).
+//
+// The zone direction is the load-bearing detail. Ordering by seconds east
+// would reverse every tie: PG puts `13:00:00+01` (zone -3600 west) BELOW
+// `12:00:00+00` and that below `11:00:00-01` (zone +3600 west), even though all
+// three are the same instant — captured from the PG 18.3 reference cluster.
+func timeTzKeyParts(v Datum) (gmtMicros int64, pgZone int32) {
+	local := pgTimeMicros(v.TimeValue())
+	pgZone = int32(-v.TimeTZOffsetSecs())
+	return local + int64(pgZone)*1_000_000, pgZone
+}
+
+// encodeTimeTzBTreeKey builds the 12-byte timetz key: the int8 key of the
+// GMT-equivalent microseconds followed by the int4 key of the zone. Both parts
+// are fixed-width and individually order-preserving, so their concatenation
+// compares lexicographically exactly as timetz_cmp_internal does — the primary
+// part decides unless it is equal, in which case the bytes of the secondary
+// part decide. Fixed width also makes the key self-delimiting, so timetz is
+// safe in any position of a COMPOSITE key.
+func encodeTimeTzBTreeKey(v Datum) []byte {
+	gmt, pgZone := timeTzKeyParts(v)
+	key := make([]byte, 0, 12)
+	key = append(key, btree.EncodeInt8(gmt)...)
+	return append(key, btree.EncodeInt4(pgZone)...)
 }
 
 // coerceScalarKeyStringDatum resolves an unknown-literal probe (`WHERE b =
@@ -130,6 +181,16 @@ func coerceScalarKeyStringDatum(v Datum, col *catalog.Column, pos int) (Datum, *
 				Message: fmt.Sprintf("invalid input syntax for type bytea: %q", s)}
 		}
 		return NewBytesDatum(b), nil
+	case isTimeTzType(col.Type.Name):
+		t, offsetSecs, err := parseTimeTZString(s)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				return v, ee
+			}
+			return v, &ExecError{Code: "22007", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", s)}
+		}
+		return NewTimeTZDatum(t, offsetSecs), nil
 	case isTimeOfDayType(col.Type.Name):
 		t, err := parseTimeString(s)
 		if err != nil {
@@ -186,6 +247,12 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 				Message: fmt.Sprintf("column %q is not bytea at runtime", col.Name)}
 		}
 		return btree.EncodeVarchar(v.BytesValue()), true, nil
+	case isTimeTzType(col.Type.Name):
+		if v.Kind != KindTime {
+			return nil, true, &ExecError{Code: "42804", Pos: pos,
+				Message: fmt.Sprintf("column %q is not time with time zone at runtime", col.Name)}
+		}
+		return encodeTimeTzBTreeKey(v), true, nil
 	case isTimeOfDayType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -236,6 +303,23 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 			return NullDatum, 0, true, derr
 		}
 		return NewBytesDatum(append([]byte(nil), raw...)), n, true, nil
+	case isTimeTzType(typeName):
+		if len(key) < 12 {
+			return NullDatum, 0, true, fmt.Errorf("btree: timetz key truncated, got %d bytes", len(key))
+		}
+		gmt, derr := btree.DecodeInt8(key[:8])
+		if derr != nil {
+			return NullDatum, 0, true, derr
+		}
+		pgZone, derr := btree.DecodeInt4(key[8:12])
+		if derr != nil {
+			return NullDatum, 0, true, derr
+		}
+		// Invert timeTzKeyParts: the stored primary part is GMT-equivalent, so
+		// the local time-of-day is it minus the zone, and goopg's Datum wants
+		// the offset EAST of UTC.
+		local := gmt - int64(pgZone)*1_000_000
+		return NewTimeTZDatum(pgTimeFromMicros(local), int(-pgZone)), 12, true, nil
 	case isTimeOfDayType(typeName):
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: time key truncated, got %d bytes", len(key))

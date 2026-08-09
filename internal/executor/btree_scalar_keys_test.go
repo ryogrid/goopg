@@ -17,10 +17,21 @@ import (
 //	bool : false true
 //	bytea: (empty) 00 0001 01 ff
 //	time : 00:00:00 00:00:00.000001 12:30:00 23:59:59.999999
+//	timetz: 00:00:00+14 00:00:00+00 12:00:00+05:30 13:00:00+01 12:00:00+00
+//	        11:00:00-01 00:00:00-12 23:59:59.999999-12
 //
 // The oid row is the load-bearing one: PG compares OIDs UNSIGNED, so 2147483648
 // sorts ABOVE 2147483647. An int4-shaped key (the obvious choice for a 4-byte
 // type) would put it below OID 0 instead.
+//
+// The timetz row carries two properties at once. Its middle three values are
+// the SAME instant (13:00+01, 12:00+00 and 11:00-01 are all 12:00 GMT), so they
+// pin the tie-break: PG breaks it by the zone in seconds WEST of UTC, which is
+// the negation of the seconds-east offset goopg's Datum carries — order by the
+// datum's own offset and those three come out exactly reversed. The outer
+// values pin the primary part: 00:00:00+14 is the smallest even though its
+// local clock reads midnight, because GMT-equivalent it is 10:00 the previous
+// day.
 
 // scalarKeyCase is one column type plus its values in PG's order.
 type scalarKeyCase struct {
@@ -31,6 +42,13 @@ type scalarKeyCase struct {
 }
 
 func timeDatumOfDay(micros int64) Datum { return NewTimeDatum(pgTimeFromMicros(micros)) }
+
+// timeTzDatumOfDay builds a timetz Datum from the LOCAL microseconds-of-day and
+// the offset in seconds EAST of UTC (goopg's Datum.Scale convention, the
+// negation of upstream TimeTzADT.zone).
+func timeTzDatumOfDay(micros int64, offsetEastSecs int) Datum {
+	return NewTimeTZDatum(pgTimeFromMicros(micros), offsetEastSecs)
+}
 
 // sqlLiteralForKeyType writes the value as an INSERT literal. Everything is
 // quoted except boolean: goopg's codec bool arm requires KindBool strictly, so
@@ -78,6 +96,22 @@ func scalarKeyCases() []scalarKeyCase {
 			values: []Datum{timeDatumOfDay(0), timeDatumOfDay(1),
 				timeDatumOfDay(12*3600*1000000 + 30*60*1000000), timeDatumOfDay(86400*1000000 - 1)},
 			lits: []string{"00:00:00", "00:00:00.000001", "12:30:00", "23:59:59.999999"},
+		},
+		{
+			name: "timetz",
+			typ:  "timetz",
+			values: []Datum{
+				timeTzDatumOfDay(0, 14*3600),
+				timeTzDatumOfDay(0, 0),
+				timeTzDatumOfDay(12*3600*1000000, 5*3600+30*60),
+				timeTzDatumOfDay(13*3600*1000000, 3600),
+				timeTzDatumOfDay(12*3600*1000000, 0),
+				timeTzDatumOfDay(11*3600*1000000, -3600),
+				timeTzDatumOfDay(0, -12*3600),
+				timeTzDatumOfDay(86400*1000000-1, -12*3600),
+			},
+			lits: []string{"00:00:00+14", "00:00:00+00", "12:00:00+05:30", "13:00:00+01",
+				"12:00:00+00", "11:00:00-01", "00:00:00-12", "23:59:59.999999-12"},
 		},
 	}
 }
@@ -285,22 +319,112 @@ func TestByteaIndexKeyIsSelfDelimiting(t *testing.T) {
 	}
 }
 
-// TestTimeTzIndexKeyDeclined pins the deliberate refusal: timetz's comparison is
-// two-part (timetz_cmp_internal compares time-minus-zone, then the zone), which
-// a single ordered key column cannot represent. Accepting it would build an
-// index claiming an order it does not have — worse than refusing. See the
-// deferral-ledger row.
-func TestTimeTzIndexKeyDeclined(t *testing.T) {
+// TestTimeTzIndexKeyIsTwoPart pins the shape that makes timetz representable
+// after all (this slice supersedes the earlier deliberate refusal). Three
+// things must hold together:
+//
+//  1. timetz keeps its OWN encoding — isTimeOfDayType must not claim it, or a
+//     timetz key would be the 8-byte plain-time key and the zone would vanish
+//     from the order entirely.
+//  2. The key is a fixed 12 bytes: the int8 GMT part then the int4 zone part.
+//     Fixed width is what makes it safe in a composite key.
+//  3. The tie-break runs the way timetz_cmp_internal runs it — by seconds WEST
+//     of UTC. This is the direction that is easy to get backwards, so it is
+//     asserted directly on same-instant values rather than only through the
+//     whole-ordering table.
+func TestTimeTzIndexKeyIsTwoPart(t *testing.T) {
 	if isTimeOfDayType("timetz") || isTimeOfDayType("time with time zone") {
-		t.Fatal("timetz must not be routed through the time-of-day key encoding")
+		t.Fatal("timetz must not be routed through the plain time-of-day key encoding")
 	}
-	if isSupportedBTreeKeyType("timetz") {
-		t.Fatal("timetz must not be accepted as a B-tree key type")
+	if !isSupportedBTreeKeyType("timetz") || !isSupportedBTreeKeyType("time with time zone") {
+		t.Fatal("timetz must be accepted as a B-tree key type")
 	}
 	col := &catalog.Column{Name: "k", Type: catalog.Type{Name: "timetz"}}
-	if _, err := encodeBTreeKeyForColumn(timeDatumOfDay(0), col, 0); err == nil {
-		t.Fatal("timetz was accepted as a B-tree key")
-	} else if err.Code != "0A000" {
-		t.Errorf("timetz key error code = %s, want 0A000", err.Code)
+
+	// Same instant (12:00 GMT), three different zones. PG: 13:00+01 < 12:00+00
+	// < 11:00-01. Ordering by the datum's seconds-EAST offset reverses this.
+	sameInstant := []struct {
+		lit string
+		d   Datum
+	}{
+		{"13:00:00+01", timeTzDatumOfDay(13*3600*1000000, 3600)},
+		{"12:00:00+00", timeTzDatumOfDay(12*3600*1000000, 0)},
+		{"11:00:00-01", timeTzDatumOfDay(11*3600*1000000, -3600)},
+	}
+	var prev []byte
+	for i, c := range sameInstant {
+		k, err := encodeBTreeKeyForColumn(c.d, col, 0)
+		if err != nil {
+			t.Fatalf("encode %s: %v", c.lit, err)
+		}
+		if len(k) != 12 {
+			t.Fatalf("timetz key for %s is %d bytes, want 12", c.lit, len(k))
+		}
+		if i > 0 {
+			if !bytes.Equal(prev[:8], k[:8]) {
+				t.Errorf("%s and %s are the same instant but their GMT key parts differ: %x vs %x",
+					sameInstant[i-1].lit, c.lit, prev[:8], k[:8])
+			}
+			if bytes.Compare(prev, k) >= 0 {
+				t.Errorf("key(%s)=%x is not below key(%s)=%x, but PG orders them that way",
+					sameInstant[i-1].lit, prev, c.lit, k)
+			}
+		}
+		prev = k
+	}
+}
+
+// TestTimeTzCompositeKeyIsSelfDelimiting is the composite-position gate: a
+// timetz key column is fixed-width, so a FOLLOWING key column's bytes can never
+// be mistaken for part of it. The pair below shares the timetz value's primary
+// (GMT) part and differs only in the trailing int4 column, so the composite key
+// must still order by that trailing column.
+func TestTimeTzCompositeKeyIsSelfDelimiting(t *testing.T) {
+	tcol := &catalog.Column{Name: "k", Type: catalog.Type{Name: "timetz"}}
+	icol := &catalog.Column{Name: "i", Type: catalog.Type{Name: "int4"}}
+	compose := func(d Datum, i int64) []byte {
+		tk, err := encodeBTreeKeyForColumn(d, tcol, 0)
+		if err != nil {
+			t.Fatalf("encode timetz: %v", err)
+		}
+		ik, err := encodeBTreeKeyForColumn(NewIntDatum(i), icol, 0)
+		if err != nil {
+			t.Fatalf("encode int4: %v", err)
+		}
+		return append(append([]byte{}, tk...), ik...)
+	}
+	noon := timeTzDatumOfDay(12*3600*1000000, 0)
+	if lo, hi := compose(noon, 1), compose(noon, 2); bytes.Compare(lo, hi) >= 0 {
+		t.Errorf("('12:00:00+00',1)=%x is not below ('12:00:00+00',2)=%x", lo, hi)
+	}
+	// And the timetz column still dominates a later column, whatever it holds.
+	early := timeTzDatumOfDay(11*3600*1000000, 0)
+	if lo, hi := compose(early, 9999), compose(noon, -9999); bytes.Compare(lo, hi) >= 0 {
+		t.Errorf("('11:00:00+00',9999)=%x is not below ('12:00:00+00',-9999)=%x", lo, hi)
+	}
+	// The composite WALK must resynchronize on the same boundary — the failure
+	// the array-decode slice found is a decoder that consumes the wrong width
+	// and reads every LATER column from a shifted offset. Both key columns are
+	// checked, not just the widths.
+	key := compose(noon, -9999)
+	d, n, err := decodeIndexKeyColumn(key, catalog.Column{Name: "k", Type: catalog.Type{Name: "timetz"}})
+	if err != nil {
+		t.Fatalf("composite walk over timetz: %v", err)
+	}
+	if n != 12 {
+		t.Fatalf("composite walk consumed %d bytes of the timetz column, want 12", n)
+	}
+	if re, rErr := encodeBTreeKeyForColumn(d, tcol, 0); rErr != nil {
+		t.Fatalf("re-encode decoded timetz: %v", rErr)
+	} else if !bytes.Equal(re, key[:12]) {
+		t.Errorf("re-encoded timetz %x != %x", re, key[:12])
+	}
+	tail, tn, err := decodeIndexKeyColumn(key[n:], catalog.Column{Name: "i", Type: catalog.Type{Name: "int4"}})
+	if err != nil {
+		t.Fatalf("composite walk over the trailing int4: %v", err)
+	}
+	if tn != 4 || tail.Kind != KindInt || tail.Int != -9999 {
+		t.Errorf("trailing int4 decoded as (kind %d, %d) over %d bytes, want (KindInt, -9999) over 4",
+			tail.Kind, tail.Int, tn)
 	}
 }

@@ -11248,6 +11248,8 @@ func isSupportedBTreeKeyType(name string) bool {
 		// int2 / oid / bool / bytea / time — M0119-0006 (btree_scalar_keys.go).
 		isInt2Type(name) || isOidType(name) || isBoolType(name) ||
 		isByteaType(name) || isTimeOfDayType(name) ||
+		// timetz — M0119-0006, the two-part key (btree_scalar_keys.go).
+		isTimeTzType(name) ||
 		strings.ToLower(name) == "uuid"
 }
 

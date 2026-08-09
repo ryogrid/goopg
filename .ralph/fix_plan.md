@@ -677,8 +677,50 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       and the encode-side defect this surfaced — a QUOTED `"NULL"` text element
       is encoded as an array NULL because `parseTextArray` strips quoting before
       the NULL test).
+      **Slice landed 2026-08-10 (15th) — `timetz` key encoding, retracting a
+      wrong refusal** (design
+      `docs/design/0119-0006-timetz-index-key-encoding.md`). The 13th slice
+      declined `timetz` on the grounds that `timetz_cmp_internal`
+      (`postgres/src/backend/utils/adt/date.c`) is two-part — GMT-equivalent
+      time first, zone only to break ties — and that "a single ordered key
+      column cannot represent it". The premise is right and the conclusion is
+      wrong: both parts are FIXED-WIDTH integers whose order-preserving key
+      encodings goopg already ships, so `EncodeInt8(gmt) ++ EncodeInt4(zone)`
+      compares lexicographically exactly as upstream compares — the same
+      structure that makes a two-column composite key work. Arity was never the
+      obstacle; a part that is not INDIVIDUALLY order-preserving is, which is
+      why `interval` (a lossy 128-bit span, `'1 mon'` = `'30 days'`) stays open
+      as its own slice with an IOS-behaviour decision attached. Landed as
+      `isTimeTzType` (kept disjoint from `isTimeOfDayType` — had the plain-time
+      predicate claimed timetz, the key would be 8 bytes of LOCAL time-of-day
+      and the zone would drop out of the ordering entirely, a silently wrong
+      index rather than a refused one), `timeTzKeyParts`,
+      `encodeTimeTzBTreeKey`, arms in all three of `encodeScalarBTreeKey` /
+      `decodeScalarBTreeKey` / `coerceScalarKeyStringDatum`, and `timetz` in
+      `isSupportedBTreeKeyType`. The load-bearing detail is the SIGN
+      CONVENTION: upstream `TimeTzADT.zone` is seconds WEST of UTC where
+      goopg's `Datum.Scale` is minutes EAST, so the encoder negates — and the
+      ledger row's own proposed resume encoding had that secondary part
+      backwards. Getting it wrong leaves the primary part correct (the local
+      time compensates) and reverses every tie: PG orders `13:00:00+01` <
+      `12:00:00+00` < `11:00:00-01` although all three are the same instant
+      (captured from the PG 18.3 reference cluster). The decode arm is not
+      optional, for the reason the 14th slice found at HEAD — the two decode
+      siblings' shared `default:` arm reads any 8 leading bytes as an enum
+      float8 and never errors, so an unrouted 12-byte timetz key would decode
+      as a bogus enum AND consume 8 bytes in the composite walk,
+      desynchronizing every later key column. Gates: the four
+      `scalarKeyCases()` table-driven gates gain a `timetz` row, plus
+      `TestTimeTzIndexKeyIsTwoPart` (tie-break direction asserted on
+      same-instant values — a whole-ordering table can pass with an inverted
+      tie-break if no two of its values are the same instant) and
+      `TestTimeTzCompositeKeyIsSelfDelimiting` (non-final composite position,
+      and the walk resynchronizing so the trailing column decodes); all
+      confirmed non-vacuous by four separate source mutations. 2 ledger rows
+      (interval; and `timetz[]` elements, which now encode but have no
+      renderer in `decodeArrayKeyElemText`).
       Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range`/`interval`/`timetz` key encodings, and
+      checkunique tier, `box`/`int4range`/`interval` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
