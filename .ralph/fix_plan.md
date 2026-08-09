@@ -198,7 +198,7 @@ _(completed `[x]` milestones archived → `completed_milestones/completed_fix_pl
 **Filing rule (inherited from M0129):** no task deferred without a ledger-recorded strong reason; subtasks inline in fix_plan; every non-trivial subsystem lands its design doc (draft → accepted) within M0130.
 
 Theme A — Cluster directory format compatibility:
-- [ ] **M0130-S1 — Per-relation FSM/VM fork files** (est ~2 loops). Replace aggregate `pg_fsm_state.bin`/`pg_vm_state.bin` with per-relation `_fsm`/`_vm` fork files in PG FSM/VM binary layout. Design: `docs/design/0130-0001-fsm-vm-per-relation-fork-files.md`.
+- [x] **M0130-S1 — Per-relation FSM/VM fork files** (est ~2 loops). Replace aggregate `pg_fsm_state.bin`/`pg_vm_state.bin` with per-relation `_fsm`/`_vm` fork files in PG FSM/VM binary layout. Design: `docs/design/0130-0001-fsm-vm-per-relation-fork-files.md`. **DONE (2026-08-09).** Core implementation: `fsm_fork.go`/`vm_fork.go` with PG-compatible binary format; old aggregate `Save`/`Load`/`FSMStatePath`/`VMStatePath` and `fsmFileMagic`/`vmFileMagic` constants removed. Design doc accepted. BASE_BACKUP includes `_fsm`/`_vm` implicitly via `filepath.Walk`.
 - [ ] **M0130-S2 — pg_class heap persistence** (est ~2 loops). Heap-backed pg_class with bootstrap rows, runtime sync audit, reload pass, and reverse-start (goopg from PG-created 1259 heap). Design: `docs/design/0130-0002-pg-class-heap-persistence.md`.
 - [ ] **M0130-S3 — Catalog heap sync for remaining DDL** (est ~2 loops). ADD COLUMN → pg_attribute sync; CREATE SCHEMA → pg_namespace; pg_collation/FDW/server heap rows. Design: `docs/design/0130-0003-catalog-heap-sync-coverage.md`.
 
@@ -1019,20 +1019,3 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       **Overlaps M0119-0004/0006 — the triage assigns each item to ONE milestone;
       do not double-work.**
 
-## WAL native → PG-format rework (design bundle `docs/design/wal-native-pg-format/`)
-
-_(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
-
-- [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
-      DONE and committed: `analysis/tests-overview-260706/` (test-landscape
-      snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two
-      parallel lanes [units+race / testport+pgbench-smoke] → S2 solo TPC-H →
-      S3 summary, plus a `flock`-guarded resident scheduler hooked from
-      `~/.ralph/ralph_loop.sh`). Indexed in `docs/design/README.md` (Design
-      Bundles). **Nothing under `ci/batch/` exists yet** — next step is to
-      implement `ci/batch/run-nightly.sh` + `lib/common.sh` + the `stage-*.sh`
-      scripts per `ci/design/01-architecture.md`'s layout, starting with S0
-      preflight (cheapest to verify standalone) before wiring the two S1
-      lanes. Low priority relative to the M0122 PG-compat buckets above — pick
-      up only when no M0122/M0119 item is in flight, since this is
-      Ralph-tooling, not user-facing PG compatibility.
