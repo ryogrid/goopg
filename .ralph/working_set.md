@@ -1,48 +1,41 @@
-Task: M0119-0004 — per-DB publication scoping COMPLETE; subscription scoping next
+Task: M0122-0003 EXPLAIN (WAL) — text + JSON output (COMPLETE)
 
 Files:
-- internal/catalog/pubsub.go: Added DBOid to Publication, compound map key,
-  variadic dbOid on CreatePublicationAsOwner/LookupPublication/DropPublication/
-  SetPublicationOwner, PublicationsForDBOid, recovery methods updated
-- internal/catalog/pubsub_dbscope_test.go: NEW — cross-DB isolation test (PASS)
-- internal/executor/context.go: Added PgPublicationRows field
-- internal/executor/operators.go: pg_publication branch for per-connection override
-- internal/executor/operators_ddl.go: Pass dbOid through execCreate/Drop/Alter
-- internal/executor/operators_pg_get_publication_tables.go: PublicationsForDBOid
-- internal/server/dispatch.go: Wire PgPublicationRows + publicationRowsForDBOid helper
-- internal/server/logicalwalsender.go: Pass DefaultDBOid (walsender needs DB-aware follow-up)
-- internal/initdb/catalog_heap_reload.go: Set DBOid = cat.DBOID() on reload
+- internal/wal/writer.go: Added walRecords/walBytes atomic counters + WalRecords()/WalBytes() getters; incremented in Append (both fast/slow paths)
+- internal/storage/bufpool.go: Extended WALFlusher interface with WalRecords()/WalBytes(); added Pool.WalCounters()
+- internal/storage/lpdead_hook_test.go: Stub methods for walFlushRecorder
+- internal/storage/storage_test.go: Stub methods for recordingWAL
+- internal/executor/instrument.go: Added walRecords/walBytes + base fields to nodeStats; seeding in Open + diffing in accountBuffers
+- internal/executor/operators_explain.go: formatWalLine (TEXT: "WAL: records=N bytes=K"); WAL rendering in walkPlanAnalyzeFiltered (TEXT) + planToJSONWithStats (JSON: "WAL Records"/"WAL FPI"/"WAL Bytes"/"WAL Buffers Full")
+- .ralph/fix_plan.md: M0119-0004 marked [x] complete
 
 Key symbols:
-- pubMapKey(dbOid, name) — compound map key (pubsub.go)
-- PublicationsForDBOid(dbOid) — filtered iteration
-- publicationRowsForDBOid(ps, dbOid) — VirtualRows builder (dispatch.go)
-- PgPublicationRows func() [][]string — per-connection override (context.go)
+- Writer.walRecords / Writer.walBytes (atomic.Int64)
+- Writer.WalRecords() / Writer.WalBytes() (getters)
+- WALFlusher.WalRecords() / WALFlusher.WalBytes() (interface)
+- Pool.WalCounters() (records, bytes int64)
+- nodeStats.walRecords / walBytes / walBaseRecords / walBaseBytes / walSeeded
+- formatWalLine(s *nodeStats) string
 
 Hypothesis/Findings:
-- Publication per-DB scoping FIXED — round-trip error moved from "publication
-  already exists" to "subscription already exists" (the next DU-002 blocker)
-- Compound map key `pubMapKey(dbOid, name)` solves the same-name collision
-- Subscription struct already has DBOid field (set at CREATE time), but
-  CreateSubscriptionAsOwner/DropSubscription/LookupSubscription/Subscriptions
-  don't filter by dbOid or use a compound key
-- Pattern established by publications applies directly to subscriptions
+- EXPLAIN (WAL) now produces per-node "WAL: records=N bytes=K" lines in TEXT and
+  JSON properties in structured formats. Counters are lifetime (never reset) and
+  diffed per-node (nested-stopwatch semantics, same as BUFFERS).
+- walBytes counts payload bytes only (not xlog record header overhead — deferred).
+- WAL FPI and WAL Buffers Full are always 0 (FPI counting needs per-record kind
+  knowledge; buffers-full tracking needs cross-reference with WAL buffer state).
+  JSON format emits them as int64(0) matching PG's unconditional-non-text pattern.
 
 Next step:
-1. Add compound map key for subscriptions (subMapKey)
-2. Update CreateSubscriptionAsOwner/DropSubscription/LookupSubscription/
-   Subscriptions/SubscriptionsForDBOid to use compound key + filter
-3. Add PgSubscriptionRows to Context + operators.go branch + dispatch.go wiring
-4. Update replication_views.go VirtualRows + walsender
-5. Add cross-database subscription isolation test
-6. Verify: go build && go test ./internal/catalog/... ./internal/executor/...
-   && TestPort_PgDumpConnectionSetup
+- EXPLAIN (MEMORY) output (same pattern — needs MemoryContext framework first) OR
+  next M0122 unchecked item (M0122-0006: On-disk catalog persistence;
+  M0122-0007: DDL/admin commands).
 
 Gates run:
 - go build ./...: OK
-- go test (catalog/executor/server/initdb): PASS
-- TestCreatePublicationCrossDatabaseIsolation: PASS
+- go test (executor, wal, storage): ALL PASS
+- RALPH_PRECOMMIT_SCOPE=units: ALL PASS
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, 404706 txns)
 - ralph-state-guard: REPAIRED + PASS
-- pre-commit pgbench smoke: PASS (0 failed)
 
 In-flight: none

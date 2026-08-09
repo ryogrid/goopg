@@ -329,6 +329,24 @@ func formatIOTimingsLine(s *nodeStats) string {
 	return "I/O Timings: shared " + strings.Join(parts, " ")
 }
 
+// formatWalLine renders the upstream "WAL: records=N bytes=K" text
+// (show_wal_usage in postgres/src/backend/commands/explain.c),
+// omitting the whole line when both counters are zero and each individual
+// records=/bytes= term when that counter is zero. M0122-0003.
+func formatWalLine(s *nodeStats) string {
+	if s.walRecords == 0 && s.walBytes == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if s.walRecords > 0 {
+		parts = append(parts, fmt.Sprintf("records=%d", s.walRecords))
+	}
+	if s.walBytes > 0 {
+		parts = append(parts, fmt.Sprintf("bytes=%d", s.walBytes))
+	}
+	return "WAL: " + strings.Join(parts, " ")
+}
+
 func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -1292,6 +1310,16 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 			}
 			if line := formatIOTimingsLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
+	// EXPLAIN (ANALYZE, WAL) emits a "WAL: records=N bytes=K"
+	// detail line per node (M0122-0003).
+	if opts.Wal {
+		if s, ok := stats[n]; ok && s != nil {
+			if line := formatWalLine(s); line != "" {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 			}
 		}

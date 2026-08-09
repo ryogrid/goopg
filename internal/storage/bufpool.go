@@ -654,6 +654,10 @@ type PoolConfig struct {
 // enforce write-ahead ordering.
 type WALFlusher interface {
 	FlushUpTo(lsn uint64) error
+	// WalRecords returns the lifetime total WAL records appended (M0122-0003).
+	WalRecords() int64
+	// WalBytes returns the lifetime total WAL record payload bytes (M0122-0003).
+	WalBytes() int64
 }
 
 // LogBtreeSplitFunc emits one atomic WAL record covering a B-tree page split.
@@ -1018,6 +1022,16 @@ func (p *Pool) Manager() *Manager { return p.mgr }
 // shared_blks_read (postgres/src/include/executor/instrument.h).
 func (p *Pool) BufferCounters() (hit, read, dirtied, written int64) {
 	return p.sharedHitCount.Load(), p.sharedReadCount.Load(), p.sharedDirtiedCount.Load(), p.sharedWrittenCount.Load()
+}
+
+// WalCounters returns the WAL writer's cumulative record and byte counters.
+// EXPLAIN (WAL) diffs a before/after snapshot (M0122-0003).
+// Returns 0,0 when WAL is nil (e.g. in tests that don't wire it).
+func (p *Pool) WalCounters() (records, bytes int64) {
+	if p.wal == nil {
+		return 0, 0
+	}
+	return p.wal.WalRecords(), p.wal.WalBytes()
 }
 
 // AddReadTimeNanos accumulates n nanoseconds of real disk-read wait time

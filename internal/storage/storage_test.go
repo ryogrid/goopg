@@ -22,6 +22,9 @@ func (w *recordingWAL) FlushUpTo(lsn uint64) error {
 	return nil
 }
 
+func (w *recordingWAL) WalRecords() int64 { return 0 }
+func (w *recordingWAL) WalBytes() int64   { return 0 }
+
 // TestInitPagePinsHeaderLayout verifies a freshly-initialised page has
 // the byte-for-byte layout from docs/design/0006-storage-format.md.
 func TestInitPagePinsHeaderLayout(t *testing.T) {

@@ -69,6 +69,16 @@ type nodeStats struct {
 	// needed beyond the nonzero check formatIOTimingsLine already does.
 	bufReadTimeNs, bufWriteTimeNs         int64
 	bufBaseReadTimeNs, bufBaseWriteTimeNs int64
+
+	// walRecords / walBytes are the cumulative WAL record count and
+	// payload bytes EXPLAIN (ANALYZE, WAL) attributes to this node,
+	// inclusive of its children (nested-stopwatch semantics like buffers
+	// above). The walBase* fields hold the last-seen Pool.WalCounters()
+	// snapshot for delta computation; walSeeded guards the first
+	// checkpoint on Open. M0122-0003.
+	walRecords, walBytes           int64
+	walBaseRecords, walBaseBytes   int64
+	walSeeded                      bool
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -103,6 +113,10 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 			o.stats.bufBaseWriteTimeNs = o.pool.WriteTimeNanos() + o.pool.ExtendTimeNanos()
 			o.stats.bufSeeded = true
 		}
+		if !o.stats.walSeeded {
+			o.stats.walBaseRecords, o.stats.walBaseBytes = o.pool.WalCounters()
+			o.stats.walSeeded = true
+		}
 	}
 	if o.stats.timing {
 		now := time.Now()
@@ -135,6 +149,11 @@ func (o *instrumentedOp) accountBuffers() {
 	o.stats.bufReadTimeNs += readTimeNs - o.stats.bufBaseReadTimeNs
 	o.stats.bufWriteTimeNs += writeTimeNs - o.stats.bufBaseWriteTimeNs
 	o.stats.bufBaseReadTimeNs, o.stats.bufBaseWriteTimeNs = readTimeNs, writeTimeNs
+
+	recs, bytes := o.pool.WalCounters()
+	o.stats.walRecords += recs - o.stats.walBaseRecords
+	o.stats.walBytes += bytes - o.stats.walBaseBytes
+	o.stats.walBaseRecords, o.stats.walBaseBytes = recs, bytes
 }
 
 // Next records the per-row delta into the running total and

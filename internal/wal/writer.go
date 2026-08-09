@@ -393,6 +393,15 @@ type Writer struct {
 	// sharded stats.Counter) because fsyncs are already serialised through
 	// group commit, unlike per-buffer read/write/extend ops.
 	sharedFsyncTimeNanos atomic.Int64
+
+	// walRecords counts the lifetime number of WAL records appended
+	// (incremented once per successful Append call). walBytes counts
+	// the lifetime total bytes written to WAL (record payload size,
+	// not including the xlog record header). Both back EXPLAIN (WAL)
+	// output (M0122-0003). Plain atomic.Int64 because the per-stripe
+	// locks serialise the counter bumps within Append already.
+	walRecords atomic.Int64
+	walBytes   atomic.Int64
 }
 
 type state struct {
@@ -760,6 +769,18 @@ func (w *Writer) PreallocatedBytes() int64 {
 	return w.walBufferCounters.preallocatedBytes.Sum()
 }
 
+// WalRecords returns the lifetime total WAL records appended.
+// Atomic load; backs EXPLAIN (WAL) output (M0122-0003).
+func (w *Writer) WalRecords() int64 {
+	return w.walRecords.Load()
+}
+
+// WalBytes returns the lifetime total WAL record payload bytes appended.
+// Atomic load; backs EXPLAIN (WAL) output (M0122-0003).
+func (w *Writer) WalBytes() int64 {
+	return w.walBytes.Load()
+}
+
 // WrittenLSN returns the LSN of the last byte the writer has
 // appended (durable or not). Cheap and lock-free; suitable for
 // the checkpointer's max_wal_size trigger.
@@ -853,6 +874,10 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	// the buffer overflows.
 	if st := w.stateRef; st != nil && st.walBuf != nil {
 		if start, end, ok, err := st.tryAppend(payload); ok {
+			if err == nil {
+				w.walRecords.Add(1)
+				w.walBytes.Add(int64(len(payload)))
+			}
 			return start, end, err
 		}
 	}
@@ -876,8 +901,12 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	default:
 	}
 	start, end, err := st.append(payload)
-	if err == nil && st.onAppend != nil {
-		st.onAppend()
+	if err == nil {
+		w.walRecords.Add(1)
+		w.walBytes.Add(int64(len(payload)))
+		if st.onAppend != nil {
+			st.onAppend()
+		}
 	}
 	return start, end, err
 }

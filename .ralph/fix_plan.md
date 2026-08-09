@@ -312,13 +312,12 @@ conflict-wait), plus the landed sub-slices of -0004 (NULLS NOT DISTINCT
 enforcement + upsert arbiter) and -0005 (pg_waldump WD-003/WD-004 canonical
 prune-WAL round-trip). The four open items below carry the remaining unbuilt scope.
 
-- [ ] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001). Schema dump,
-      dump/restore round-trip, parallel, filter-file, connstr — advance the
-      catalog-view parity battery slice-by-slice (guard
-      `TestPort_PgDumpConnectionSetup`; resume = next catalog getter gap tracked in
-      `.ralph/working_set.md` / ledger). Two general SQL-engine gaps surfaced here
-      remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
-      and any residual dump-fidelity items.
+- [x] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001). Schema dump,
+      dump/restore round-trip, parallel, filter-file, connstr. DU-002 guard
+      `TestPort_PgDumpConnectionSetup` PASSES cleanly. All catalog-view gaps
+      closed: publication/subscription per-DB scoping, invalid-column-numbering
+      fix, EXCLUDE in ALTER TABLE ADD CONSTRAINT, constraint-trigger parsing,
+      deferred-constraint checking at COMMIT. **COMPLETE (2026-08-09).**
       - [x] **DU-002 publication per-DB scoping** (2026-08-09, this loop) ---
           DBOid added to Publication struct; compound map key via `pubMapKey`;
           CreatePublicationAsOwner/LookupPublication/DropPublication/SetPublicationOwner
@@ -328,12 +327,21 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
           (PASS). Follows the UserTSConfig pattern from DU-002 slices 437/446.
           Round-trip error moved from "publication already exists" to "subscription
           already exists" --- Subscription per-DB scoping is the next DU-002 blocker.
-      - [ ] **DU-002 subscription per-DB scoping** --- same compound-key +
-          per-connection-override pattern applied to Subscription (struct already has
-          DBOid but methods don't filter). pubsub.go touch points: CreateSubscriptionAsOwner
-          subMapKey lookup, DropSubscription/LookupSubscription/Subscriptions/
-          SubscriptionsForDBOid, pg_subscription VirtualRows override, operators.go
-          branch, dispatch.go wiring. See `.ralph/working_set.md` for exact file list.
+      - [x] **DU-002 subscription per-DB scoping** (2026-08-09, this loop) ---
+          same compound-key + per-connection-override pattern applied to Subscription
+          (struct already had DBOid but methods didn't filter). pubsub.go: subMapKey,
+          CreateSubscriptionAsOwner/DropSubscription/LookupSubscription/SetSubscriptionOwner
+          all accept variadic dbOid; SubscriptionsForDBOid added; findSubByName helper
+          for backward-compat subRels method access. operators_ddl.go: execDropSubscription
+          + execAlterSubscriptionOwner pass subDBOid. context.go: PgSubscriptionRows
+          field. operators.go: pg_subscription per-connection override branch.
+          dispatch.go: PgSubscriptionRows wiring + subscriptionRowsForDBOid helper
+          (with formatStringList). replication_views.go: pg_subscription +
+          pg_stat_subscription_stats VirtualRows unchanged (override handles per-DB
+          filtering). Cross-database isolation test
+          TestCreateSubscriptionCrossDatabaseIsolation (PASS). DU-002 round-trip
+          guard TestPort_PgDumpConnectionSetup now PASSES cleanly (no remaining
+          catalog-view errors).
 
 - [x] **DU-002 next blocker — `invalid column numbering in table "nninh4"`** (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). **FIXED (2026-08-09).**
       Root cause: `deleteCatalogRowsForOID`/`deleteAttributeFromCatalogHeap` tried
