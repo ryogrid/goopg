@@ -599,7 +599,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// M0118-0009 (eval-plan-qual): preserve build-side heap ctids when a
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
-			sl, ferr := findScanLeafForRel(o.right, *o.preserveCTIDRel)
+			sl, ferr := findScanLeafForRel(o.right, *o.preserveCTIDRel, ctx)
 			if ferr != nil {
 				return false, ferr
 			}
