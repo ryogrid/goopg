@@ -11552,6 +11552,18 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(catalog.EncodingIDToName(int32(encArg.Int))), nil
 		}
+case "pg_char_to_encoding":
+	// pg_char_to_encoding(name) → int4: resolves an encoding name
+	// (any case, with arbitrary punctuation that clean_encoding_name
+	// strips) to its pg_enc integer ID, or -1 if unknown. Mirrors
+	// pg_char_to_encoding in encnames.c. NULL input → NULL. M0122-0008.
+	if len(x.Args) >= 1 {
+		encArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(catalog.EncodingNameToID(encArg.StringValue()))}, nil
+	}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)

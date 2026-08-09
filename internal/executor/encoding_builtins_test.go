@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/planner"
 )
 
 // TestEvalPgClientEncoding verifies that pg_client_encoding() returns the
@@ -99,4 +100,88 @@ func TestEvalGetDatabaseEncoding(t *testing.T) {
 	if got := d.StringValue(); got != "UTF8" {
 		t.Errorf("empty db encoding = %q, want UTF8", got)
 	}
+}
+
+// TestEvalPgCharToEncoding verifies that pg_char_to_encoding(name) resolves
+// encoding names to their pg_enc integer IDs through the evalFuncCall dispatch.
+// M0122-0008.
+func TestEvalPgCharToEncoding(t *testing.T) {
+	ctx := &Context{}
+
+	t.Run("canonical name UTF8", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "UTF8"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != 6 {
+			t.Errorf("pg_char_to_encoding('UTF8') = %d, want 6", got.Int)
+		}
+	})
+
+	t.Run("alias unicode to UTF8", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "unicode"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != 6 {
+			t.Errorf("pg_char_to_encoding('unicode') = %d, want 6 (UTF8)", got.Int)
+		}
+	})
+
+	t.Run("canonical LATIN1", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "LATIN1"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != 8 {
+			t.Errorf("pg_char_to_encoding('LATIN1') = %d, want 8", got.Int)
+		}
+	})
+
+	t.Run("NULL returns NULL", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.NullConst{}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if !got.IsNull() {
+			t.Errorf("pg_char_to_encoding(NULL) should return NULL, got %#v", got)
+		}
+	})
+
+	t.Run("unknown encoding returns -1", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "nonexistent_encoding_xyz"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != -1 {
+			t.Errorf("pg_char_to_encoding('nonexistent') = %d, want -1", got.Int)
+		}
+	})
+
+	t.Run("case insensitive", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "utf8"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != 6 {
+			t.Errorf("pg_char_to_encoding('utf8') = %d, want 6", got.Int)
+		}
+	})
+
+	t.Run("punctuation variant UTF-8", func(t *testing.T) {
+		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "UTF-8"}}}
+		got, err := evalFuncCall(call, nil, ctx)
+		if err != nil {
+			t.Fatalf("evalFuncCall: %v", err)
+		}
+		if got.Int != 6 {
+			t.Errorf("pg_char_to_encoding('UTF-8') = %d, want 6 (UTF8)", got.Int)
+		}
+	})
 }
