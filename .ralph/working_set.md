@@ -1,50 +1,43 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY `race/internal/mctx TestMultipleChunks`. COMPLETE,
-committed, pushed. Nightly batch 20260810-011258 was already fully FILED (all
-6 items present in fix_plan); nothing new to file this loop.
+Last loop: M-NIGHTLY `testport/TestPort_PublicationSurvivesRestart`
+(AI-20260810-011258-005). COMPLETE, committed, pushed. Also closed
+AI-20260810-011258-004 (`TestPort_IsolationMergeUpdate`) as CONFIRMED STALE —
+it passes at HEAD in 4.77 s, no code change.
 
-The discovery: this was filed as a load-sensitive TEST flake and was a REAL
-ENGINE BUG in the mctx bump allocator. `AllocBytes` encodes
-`offset = chunkIdx*c.cs + offsetWithinChunk`, and `Bytes` inverts with `/c.cs`
-and `%c.cs` — invertible only while EVERY chunk has cap exactly `c.cs`.
-`growChunk` deliberately makes oversized chunks (`make([]byte,0,n)`, n > cs),
-which is harmless in-context because such a chunk is created full — but
-`Release` handed every chunk to `putChunk(c.cs, …)`, filing the oversized one
-into the `cs` size pool. An unrelated later `Acquire` drew a `cap > cs` chunk,
-and the first allocation reaching in-chunk offset `c.cs` reported `chunkIdx+1`,
-so `Bytes` resolved into a nonexistent chunk and returned nil. Silent: no
-panic, no error, just `""`.
+The discovery: publications silently vanished across EVERY restart, and neither
+the heap nor the reload was at fault. `reloadUserPublicationsFromHeap` found and
+decoded the rows correctly (instrumented: `baseRows=1`, name + `puballtables`
+right) but stamped `Publication.DBOid` with the raw `cat.DBOID()` — the STORAGE
+db oid `detectCatalogDBOID` reads out of the pg_database heap, `PostgresDBOid`
+= 5. Every live path keys on the NAMESPACE oid instead: `resolveDBOid` defaults
+to `DefaultDBOid` = 1, and dispatch.go's pg_publication lister queries
+`PublicationsForDBOid(NamespaceDBOid(ectx.CurrentDatabaseOid))`, which folds
+5 → 1. Since `d14af1e6` made DBOid half the registry key, reloaded rows landed
+in a namespace no `postgres` connection ever reads. Third catalog to hit this
+storage-vs-namespace mismatch (`f1e73ce0` fixed pg_ts_config the same way).
 
-The filed hypothesis (recycled context with a grown `c.cs`) is REFUTED —
-`Acquire` allocates a fresh `Context` and derives `cs` from `Kind` alone; only
-chunks are pooled, never contexts. That cross-test hand-off through a shared
-`sync.Pool` is precisely why it needed full-package load and passed 100/100 in
-isolation.
+Fix: stamp `catalog.NamespaceDBOid(cat.DBOID())` —
+`internal/initdb/catalog_heap_reload.go`. Design: addendum on the B3.3 entry in
+`docs/design/wal-pg-identical-stream/IMPLEMENTATION-TODO.md`. Ledger: 1 row —
+domain (~1382) / range (~1492) / enum (~1583) reloads stamp `cat.DBOID()` the
+same way, unobservable today only because `LookupDomain`/`LookupEnum` fall back
+to a name scan when no dbOid is threaded.
 
-Fix: `putChunk` pools only buffers whose cap is exactly the pool's size class.
-Files: `internal/mctx/mctx.go` (guard) + `internal/mctx/mctx_test.go` (2 tests).
-Design: addendum in `docs/design/0107-0001-mctx-memory-context-substrate.md`
-(+ README row amended). Ledger: 1 new row (adjacent unguarded entrance —
-`growChunk` inserts after `head` and memmoves the tail, renumbering chunks past
-`head`; unreachable today only as an emergent property of `head` bookkeeping).
-
-Gates run: mutation-verified BOTH directions (guard reverted → white-box test
-reports `cap 65636`, black-box fails at block 64 `Bytes returned 0 bytes`);
-`go test -race ./internal/mctx/` PASS; **`make race-gate` GREEN** (it had been
-red on this test for several loops); units precommit PASS; `tpch-spotcheck`
-PASS (Q12=2, Q13=35) since this is the row-data allocation path; pgbench commit
-hook PASS.
+Gates run: repro confirmed at HEAD and out-of-test on a manual capped cluster
+(port 5533) BEFORE the fix; `TestPort_PublicationSurvivesRestart` PASS after;
+`go test -run SurvivesRestart ./internal/testport/` PASS (whole restart-
+durability family, 45 s); units precommit PASS (`internal/initdb` re-ran cold,
+59 s); pgbench commit hook PASS; `make ralph-state-guard` OK (auto-repaired the
+previous loop's clean-exit marker).
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M0130 all `[x]`, so M-NIGHTLY stays the top selectable milestone. 4 items
-remain unchecked, all from batch 20260810-011258:
-AI-...-002 `TestE2E_FailoverGoopgToPG` (subtest `sync_remote_apply`),
-AI-...-003 `TestE2E_PGStandbyFullCycle`, AI-...-004
-`TestPort_IsolationMergeUpdate` (LIKELY STALE — re-run at HEAD first; the
-cross-partition cmax fix landed after the nightly sha), AI-...-005
-`TestPort_PublicationSurvivesRestart`. Cheapest first move: re-run -004 at HEAD
-to close it. Highest-value engine item remains AI-...-006 pgbench/nightly —
+M0130 all `[x]`, so M-NIGHTLY stays the top selectable milestone. 3 items remain
+unchecked, all from batch 20260810-011258: AI-...-002
+`TestE2E_FailoverGoopgToPG` (subtest `sync_remote_apply`), AI-...-003
+`TestE2E_PGStandbyFullCycle`, AI-...-006 pgbench/nightly. -002 and -003 are the
+M0130-S10 standby harness and likely share one root cause — re-run both at HEAD
+first and diagnose together. AI-...-006 stays the highest-value engine item:
 79 aborted clients whose ORIGINATING error is not in the log, and the run still
 prints `0 failed`.
 

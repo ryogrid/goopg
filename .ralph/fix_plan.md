@@ -314,16 +314,33 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       (AI-20260810-011258-003; repro: `go test -v -run
       '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`). New tonight; this
       is the M0130-S10 four-phase harness test itself.
-- [ ] **testport/TestPort_IsolationMergeUpdate** — FAILed
+- [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
-      '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **Likely STALE**
-      — the nightly ran at sha `367d0df1`; the cross-partition-UPDATE cmax fix
-      for the identical subject (AI-20260809-020705-018, above) landed
-      2026-08-10. Re-run at HEAD before investigating.
-- [ ] **testport/TestPort_PublicationSurvivesRestart** — FAILed
+      '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —
+      CONFIRMED, no code change needed (2026-08-10).** The nightly ran at sha
+      `367d0df1`; the cross-partition-UPDATE cmax fix for the identical subject
+      (AI-20260809-020705-018, above) landed after it. Re-run at HEAD: PASS in
+      4.77 s (`PASS: postgres/src/test/isolation/specs/merge-update.spec`).
+- [x] **testport/TestPort_PublicationSurvivesRestart** — FAILed
       (AI-20260810-011258-005; repro: `go test -v -run
-      '^TestPort_PublicationSurvivesRestart$' ./internal/testport/`). New
-      tonight.
+      '^TestPort_PublicationSurvivesRestart$' ./internal/testport/`).
+      **FIXED (2026-08-10).** REAL bug, reproduced at HEAD and out-of-test on a
+      manual cluster: publications silently vanished across every restart.
+      `reloadUserPublicationsFromHeap` decoded the heap rows correctly but
+      stamped `Publication.DBOid` with the raw `cat.DBOID()` — the STORAGE db
+      oid detected from the pg_database heap (`PostgresDBOid` = 5) — while
+      every live write path keys on the NAMESPACE oid (`resolveDBOid` →
+      `DefaultDBOid` = 1) and `dispatch.go`'s pg_publication lister reads
+      `PublicationsForDBOid(NamespaceDBOid(ectx.CurrentDatabaseOid))`, which
+      folds 5 → 1. Since `d14af1e6` made DBOid half the registry key, the
+      reloaded rows landed in a namespace no `postgres` connection ever reads.
+      Fix: stamp `catalog.NamespaceDBOid(cat.DBOID())`
+      (`internal/initdb/catalog_heap_reload.go`). Same storage-vs-namespace
+      mismatch `f1e73ce0` fixed for pg_ts_config — third catalog to hit it.
+      Design: addendum on the B3.3 entry in
+      `docs/design/wal-pg-identical-stream/IMPLEMENTATION-TODO.md`. Ledger: one
+      row for the sibling audit (domain/range/enum reloads stamp `cat.DBOID()`
+      too, masked today by name-scan lookup fallbacks).
 - [ ] **pgbench/nightly** — 79 failed transactions in the *standard* (simple
       update) stage (AI-20260810-011258-006; repro: `REPO_ROOT=$PWD
       RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`, s=50 c=100

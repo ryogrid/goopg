@@ -543,6 +543,22 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     chain is proven by pub.Tables being repopulated post-restart. TestPort_PublicationSurvivesRestart
     green (FOR ALL TABLES + FOR TABLE w/ 2 members + publish flags + ALTER OWNER + DROP); waldump
     += CREATE/DROP PUBLICATION (both forms).
+    **Addendum 2026-08-10 (AI-20260810-011258-005 — reload stamped the STORAGE db oid, not the
+    NAMESPACE one).** After the per-DB publication scoping of `d14af1e6`, `Publication.DBOid`
+    became half of the registry key, and `reloadUserPublicationsFromHeap` stamped it with the raw
+    `cat.DBOID()` — the *storage* oid detected from the pg_database heap, i.e. `PostgresDBOid` (5)
+    for the default cluster. Every live write path keys on the *namespace* oid instead:
+    `resolveDBOid` defaults to `DefaultDBOid` (1) and `dispatch.go`'s pg_publication lister queries
+    `PublicationsForDBOid(NamespaceDBOid(ectx.CurrentDatabaseOid))`, which folds 5 → 1. So the
+    reload *did* find and register the rows (verified: `baseRows=1`, name/`puballtables` decoded
+    correctly) but filed them under db 5, where no `postgres` connection ever looks — every
+    publication silently vanished at restart, with the heap and the reload both innocent. Fix:
+    stamp `catalog.NamespaceDBOid(cat.DBOID())`. This is the same storage-vs-namespace mismatch
+    `f1e73ce0` fixed for pg_ts_config, and the third catalog to hit it. Note the reload's *scan*
+    RelFileNode still uses `cat.DBOID()` (base/5) while the writer uses `DefaultDBOid` (base/1) —
+    that works only because `mirrorPublicationCatalogFiles` copies the heap into both; see the
+    deferral-ledger row for the sibling audit (domain/range/enum reloads stamp `cat.DBOID()` too,
+    masked today by name-scan lookup fallbacks).
   - [x] **B3.2 pg_event_trigger (kinds 56-60 retired)** — LANDED. `sys_pg_event_trigger.go`:
     7-col FormData_pg_event_trigger builder (six scalars + evttags text[] — the WHEN TAG filter,
     declared `Type{Name:"text",IsArray:true}` so encode/decode are the symmetric generic array

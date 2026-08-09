@@ -2301,9 +2301,18 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 	if err != nil {
 		return err
 	}
+	// pg_publication is per-database, but the registry key is the NAMESPACE
+	// db oid, not the storage db oid: NamespaceDBOid folds a "postgres"
+	// connection (PostgresDBOid = 5) back onto DefaultDBOid = 1, which is
+	// where every live CREATE PUBLICATION registers (resolveDBOid's default,
+	// and what dispatch.go's pg_publication lister queries via
+	// NamespaceDBOid(ectx.CurrentDatabaseOid)). Stamping the raw cat.DBOID()
+	// here filed reloaded rows under 5 and made every publication vanish
+	// after a restart — the same mismatch f1e73ce0 fixed for pg_ts_config.
+	nsDBOid := catalog.NamespaceDBOid(cat.DBOID())
 	for _, raw := range rows {
 		pr := raw.(pubRow)
-		pr.pub.DBOid = cat.DBOID() // pg_publication is per-database; tag with the DB it was reloaded from
+		pr.pub.DBOid = nsDBOid
 		pr.pub.Tables = membersByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
