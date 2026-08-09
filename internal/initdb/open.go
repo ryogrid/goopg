@@ -2339,8 +2339,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		VM:             storage.NewVisibilityMap(),
 	}
 
-	// M0080-0003: load persistent Visibility Map state from
-	// `<DataDir>/global/pg_vm_state.bin` if present. A missing
+	// M0130-S1: load persistent Visibility Map state from per-relation
+	// _vm fork files if present. A missing
 	// file is fine — that's the fresh-from-init case OR a cluster
 	// from before VM persistence existed. Failure to load is a
 	// hard startup error so the operator sees the issue rather
@@ -2348,19 +2348,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// CORRECT semantically — a cleared VM bit is a conservative
 	// "must check heap" — but would degrade index-only-scan
 	// performance until the next VACUUM rebuilt the bits).
-	if err := rt.VM.Load(storage.VMStatePath(rt.DataDir)); err != nil {
+	if err := rt.VM.VMLoadForks(rt.DataDir); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: vm load: %w", err)
 	}
 
-	// M0080-0004: load persistent FSM state. Same shape /
+	// M0130-S1: load persistent FSM state from per-relation. Same shape /
 	// nil-safety as the VM load above. A missing file is the
 	// fresh-cluster case; a corrupt one is a hard startup
 	// failure (running with stale FSM bits would direct INSERTs
 	// to wrong pages and waste time on retries).
-	if err := rt.FSM.Load(storage.FSMStatePath(rt.DataDir)); err != nil {
+	if err := rt.FSM.FSMLoadForks(rt.DataDir); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -3092,17 +3092,17 @@ func (r *Runtime) SaveVM() error {
 	if r == nil || r.VM == nil {
 		return nil
 	}
-	return r.VM.Save(storage.VMStatePath(r.DataDir))
+	return r.VM.VMSaveForks(r.DataDir, nil)
 }
 
-// SaveFSM writes the runtime's FSM state to
-// `<DataDir>/global/pg_fsm_state.bin` atomically. Same shape
-// as SaveVM. (M0080-0004.)
+// SaveFSM writes the runtime's FSM state to per-relation _fsm fork
+// files under base/<dbOid>/ (PG-compatible format). Same shape
+// as SaveVM. (M0130-S1.)
 func (r *Runtime) SaveFSM() error {
 	if r == nil || r.FSM == nil {
 		return nil
 	}
-	return r.FSM.Save(storage.FSMStatePath(r.DataDir))
+	return r.FSM.FSMSaveForks(r.DataDir, nil)
 }
 
 // Close releases the runtime's storage handles. Safe to call

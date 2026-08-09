@@ -6,13 +6,12 @@ import (
 	"testing"
 )
 
-// TestFSMSaveLoadRoundTrip pins the M0080-0004 persistence
-// contract: an FSM state written by Save() and read back by
-// Load() must produce byte-identical free-space values per
+// TestFSMSaveLoadRoundTrip pins the M0130-S1 persistence
+// contract: FSM state written via FSMSaveForks and read back by
+// FSMLoadForks must produce equivalent free-space values per
 // relation block.
 func TestFSMSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "global", "pg_fsm_state.bin")
 
 	src := NewFSM()
 	relA := RelFileNode{DBOid: 1, RelOid: 16402, Fork: MainFork}
@@ -22,13 +21,13 @@ func TestFSMSaveLoadRoundTrip(t *testing.T) {
 	src.RecordFreeSpace(relA, 2, 4096)
 	src.RecordFreeSpace(relB, 0, 8000)
 
-	if err := src.Save(path); err != nil {
-		t.Fatalf("Save: %v", err)
+	if err := src.FSMSaveForks(dir, nil); err != nil {
+		t.Fatalf("FSMSaveForks: %v", err)
 	}
 
 	dst := NewFSM()
-	if err := dst.Load(path); err != nil {
-		t.Fatalf("Load: %v", err)
+	if err := dst.FSMLoadForks(dir); err != nil {
+		t.Fatalf("FSMLoadForks: %v", err)
 	}
 
 	// Verify the GetPageWithFreeSpace lookup still works on the
@@ -42,33 +41,38 @@ func TestFSMSaveLoadRoundTrip(t *testing.T) {
 }
 
 // TestFSMLoadMissingFileIsNoOp pins fresh-cluster behaviour.
-// (M0080-0004.)
+// (M0130-S1.)
 func TestFSMLoadMissingFileIsNoOp(t *testing.T) {
 	f := NewFSM()
-	if err := f.Load(filepath.Join(t.TempDir(), "does-not-exist.bin")); err != nil {
-		t.Fatalf("Load of missing file should return nil, got %v", err)
+	if err := f.FSMLoadForks(t.TempDir()); err != nil {
+		t.Fatalf("FSMLoadForks of empty dir should return nil, got %v", err)
 	}
 }
 
-// TestFSMLoadRejectsBadMagic pins format guards. (M0080-0004.)
-func TestFSMLoadRejectsBadMagic(t *testing.T) {
+// TestFSMLoadRejectsCorruptFork pins format guards. A fork file
+// that is not a multiple of BlockSize must be rejected. (M0130-S1.)
+func TestFSMLoadRejectsCorruptFork(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "bad.bin")
-	if err := os.WriteFile(path, []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0}, 0o600); err != nil {
+	// Write a corrupt _fsm file that is not a multiple of BlockSize.
+	dbDir := filepath.Join(dir, "base", "1")
+	if err := os.MkdirAll(dbDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	forkPath := filepath.Join(dbDir, "99999_fsm")
+	if err := os.WriteFile(forkPath, []byte{0xDE, 0xAD, 0xBE, 0xEF}, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f := NewFSM()
-	if err := f.Load(path); err == nil {
-		t.Error("Load must reject bad magic bytes")
+	if err := f.FSMLoadForks(dir); err == nil {
+		t.Error("FSMLoadForks must reject corrupt fork file")
 	}
 }
 
 // TestFSMSaveDeterministicOrdering pins "same state → byte-
-// identical file". (M0080-0004.)
+// identical fork files". (M0130-S1.)
 func TestFSMSaveDeterministicOrdering(t *testing.T) {
-	dir := t.TempDir()
-	pathA := filepath.Join(dir, "a.bin")
-	pathB := filepath.Join(dir, "b.bin")
+	dirA := t.TempDir()
+	dirB := t.TempDir()
 
 	src := NewFSM()
 	for _, rel := range []RelFileNode{
@@ -78,15 +82,28 @@ func TestFSMSaveDeterministicOrdering(t *testing.T) {
 	} {
 		src.RecordFreeSpace(rel, 1, 1234)
 	}
-	if err := src.Save(pathA); err != nil {
+	if err := src.FSMSaveForks(dirA, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := src.Save(pathB); err != nil {
+	if err := src.FSMSaveForks(dirB, nil); err != nil {
 		t.Fatal(err)
 	}
-	a, _ := os.ReadFile(pathA)
-	b, _ := os.ReadFile(pathB)
-	if string(a) != string(b) {
-		t.Error("two saves of the same FSM state must be byte-identical")
+
+	// Compare the fork files — same state should produce identical files.
+	for _, rel := range []RelFileNode{
+		{DBOid: 1, RelOid: 16405, Fork: FSMFork},
+		{DBOid: 1, RelOid: 16402, Fork: FSMFork},
+		{DBOid: 5, RelOid: 99, Fork: FSMFork},
+	} {
+		pathA := RelForkPath(dirA, rel)
+		pathB := RelForkPath(dirB, rel)
+		a, errA := os.ReadFile(pathA)
+		b, errB := os.ReadFile(pathB)
+		if errA != nil || errB != nil {
+			t.Fatalf("read fork %d/%d: errA=%v errB=%v", rel.DBOid, rel.RelOid, errA, errB)
+		}
+		if string(a) != string(b) {
+			t.Errorf("FSM fork %d/%d: two saves must be byte-identical", rel.DBOid, rel.RelOid)
+		}
 	}
 }
