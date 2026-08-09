@@ -2557,7 +2557,7 @@ func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, cl
 			Owner:        uint32(d[3].Int),
 			Parser:       uint32(d[4].Int),
 			Mappings:     buildTSConfigMappings(mapRowsByCfg[uint32(d[0].Int)]),
-			DBOid:        cat.DBOID(),
+			DBOid:        catalog.DefaultDBOid,
 		},
 				tid: tid,
 			}, false, nil

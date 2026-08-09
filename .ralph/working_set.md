@@ -1,29 +1,29 @@
-Task: M0119-0004 — DU-002 next blocker: ALTER SERVER OWNER TO
+Task: M0119-0004 — Fix TestPort_TSConfigSurvivesRestart (TSConfig lost on restart)
 
 Files:
-- internal/parser/ddl.go: added ALTER SERVER dispatch in parseAlter() (after ALTER FOREIGN DATA WRAPPER, before ALTER FOREIGN TABLE). Detects `server` ident keyword, consumes server name + trailing clauses (including OPTIONS with balanced parens), returns CompatNoopStmt with Tag="ALTER SERVER", ObjType="server".
-- internal/parser/op_compat_test.go: added TestParseAlterServerOwner (OWNER TO, OWNER TO CURRENT_USER, OPTIONS, VERSION forms)
+- internal/initdb/catalog_heap_reload.go: reloadUserTSConfigsFromHeap — DBOid: cat.DBOID() → catalog.DefaultDBOid
 
 Key symbols:
-- parseAlter: new `if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "server")` block
-- execCompatNoop: NO CHANGE needed — existing `case "server":` idempotently handles ALTER SERVER (RegisterForeignServer merges only non-empty fields, all empty for ALTER)
+- reloadUserTSConfigsFromHeap: reload path that reads TS configs from catalog heap
+- pgTSConfigRel / upsertTSConfigCatalogRow: write path (hardcodes DefaultDBOid)
+- ListUserTSConfigs: filters by uc.DBOid == dbOid (the query-time filter)
+- NamespaceDBOid / DefaultDBOid / PostgresDBOid: the dual-mirror catalog DBOid scheme
 
 Hypothesis/Findings:
-- ALTER SERVER OWNER TO was the parseAlter DU-002 blocker from the previous loop. FIXED.
-- ALTER FOREIGN DATA WRAPPER OWNER TO: already handled by the existing token-skipping default case in the parseAlter FDW branch.
-- ALTER EVENT TRIGGER OWNER TO: already handled explicitly (ddl.go:8064-8080).
-- Next blocker: `NOT NULL pid` syntax error in CREATE TABLE with INHERITS — pg_dump emits bare `NOT NULL pid` column constraint for inherited NOT NULL columns. Parser fails with "expected identifier (got not)" at the NOT keyword. This is a different class of gap (column-constraint parsing in CREATE TABLE INHERITS body), not another ALTER OWNER TO.
+- Root cause: `reloadUserTSConfigsFromHeap` stamped `DBOid: cat.DBOID()` (= PostgresDBOid=5), but `ListUserTSConfigs` filters by `NamespaceDBOid(CurrentDatabaseOid)` (= DefaultDBOid=1). The write side (`pgTSConfigRel()`) uses DefaultDBOid and mirrors to PostgresDBOid, so the reload correctly reads from the mirrored location but stamps the wrong DBOid.
+- TS dicts don't have this bug because `ListUserTSDicts` has no DBOid filter.
+- Fix: changed `DBOid: cat.DBOID()` → `DBOid: catalog.DefaultDBOid` in reloadUserTSConfigsFromHeap.
+- Deferred: per-DB catalog heap routing for pg_ts_config (the write path always uses DefaultDBOid regardless of creating database). Tracked in deferral ledger.
+- Pre-existing failures: TestPort_IsolationMergeUpdate (line count mismatch, normalization issue, unrelated).
 
-Next step:
-Fix the "NOT NULL pid" column-constraint parsing gap in CREATE TABLE INHERITS. The NOT NULL constraint is emitted as a standalone column constraint item in the table body (not part of the column definition), and the parser doesn't recognize it in that position.
+Next step: Advance M0119-0004 — run TestPort_PgDumpConnectionSetup to identify the next catalog-view parity gap, or pick up the next M0119 sub-item.
 
 Gates run:
 - go build ./...: PASS
-- go test ./internal/parser/...: PASS (0.045s)
-- go test ./internal/executor/...: PASS (5.809s)
-- TestPort_PgDumpConnectionSetup: PASS (3.68s) — ALTER SERVER assertion passed; round-trip fails at next blocker (NOT NULL pid)
-- RALPH_PRECOMMIT_SCOPE=units: PASS (all packages)
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all workloads)
-- make ralph-state-guard: REPAIRED + OK
+- go test ./internal/initdb/... ./internal/catalog/... ./internal/executor/... ./internal/server/...: PASS
+- TestPort_TSConfigSurvivesRestart: PASS (was FAILING before fix)
+- TestPort_TSDictSurvivesRestart: PASS (no regression)
+- RALPH_PRECOMMIT_SCOPE=units + smoke: PASS (0 failed, all 3 workloads)
+- make ralph-state-guard: PASS
 
 In-flight: none

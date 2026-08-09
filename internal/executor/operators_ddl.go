@@ -1716,8 +1716,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, parentName := range s.Inherits {
 			parent, ok := o.ctx.Catalog.LookupTable(parentName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
-				// Parent might not exist yet or may be a virtual table; skip silently.
-				continue
+				return &ExecError{Code: "42P01", Pos: s.Pos(),
+					Message: fmt.Sprintf("relation %q does not exist", parentName.String())}
 			}
 			if parent.PartitionMethod != "" {
 				return &ExecError{Code: "42809", Pos: s.Pos(),
@@ -2031,13 +2031,43 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			} else {
 				c, ok := colByName[strings.ToLower(item)]
 				if ok {
-					addCol(c)
+					if c.Type.Name == "" {
+						// Constraint-only column (e.g. NOT NULL colname from
+						// pg_dump for inherited columns). Merge the NOT NULL
+						// constraint into the already-inherited column instead
+						// of adding a duplicate. DU-002 (M0119-0004).
+						for i := range cols {
+							if strings.EqualFold(cols[i].Name, c.Name) {
+								if c.NotNull {
+									cols[i].NotNull = true
+								}
+								break
+							}
+						}
+					} else {
+						addCol(c)
+					}
 				}
 			}
 		}
 	} else {
 		// Fallback: no BodyOrder (e.g. empty column list or old path).
 		for _, c := range s.Columns {
+			if c.Type.Name == "" {
+				// Constraint-only column (e.g. NOT NULL colname from
+				// pg_dump for inherited columns). Merge into the
+				// already-inherited column instead of adding a duplicate.
+				// DU-002 (M0119-0004).
+				for i := range cols {
+					if strings.EqualFold(cols[i].Name, c.Name) {
+						if c.NotNull {
+							cols[i].NotNull = true
+						}
+						break
+					}
+				}
+				continue
+			}
 			typeName := strings.ToLower(c.Type.Name)
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
@@ -3196,7 +3226,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			parentOIDs = append(parentOIDs, parent.OID)
 		}
 		tbl.InheritsParentOIDs = parentOIDs
-	}
+			// Write pg_depend rows so pg_dump's dependency-based topological
+			// sort outputs parent tables before children. DU-002 (M0119-0004).
+			for _, parentOID := range parentOIDs {
+				if err := writeInheritsDependRow(o.ctx, tbl.OID, parentOID); err != nil {
+					return fmt.Errorf("write inherits pg_depend row: %w", err)
+				}
+			}
+		}
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
@@ -7476,6 +7513,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterTableAddUnique(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAddExclude:
+			if err := o.execAlterTableAddExclude(tbl, act); err != nil {
+				return err
+			}
 		case parser.AlterTableAddForeignKey:
 			// v0 accepts the syntax for HammerDB TPC-H
 			// compatibility but does not enforce referential
@@ -8619,6 +8660,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if oldRel != newRel {
 				o.relocateRelationPhysicalFileCleanupOld(oldRel)
 			}
+		case parser.AlterTableSetAccessMethod:
+			// SET ACCESS METHOD name — change the table's access method
+			// (pg_class.relam). goopg only supports `heap`; any other access
+			// method is rejected with ERRCODE_FEATURE_NOT_SUPPORTED.
+			// DU-002: pg_dump emits `ALTER TABLE ... SET ACCESS METHOD heap`
+			// for partitioned tables whose relam differs from the default.
+			if !strings.EqualFold(act.AccessMethodName, "heap") {
+				return &ExecError{Code: "0A000", Pos: s.Pos(),
+					Message: fmt.Sprintf("access method %q is not supported", act.AccessMethodName)}
+			}
+			// Setting access method to heap is a no-op — goopg's default
+			// and only supported AM. No catalog update needed.
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump
@@ -9412,6 +9465,8 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+		idx.Deferrable = act.Deferrable
+		idx.InitiallyDeferred = act.InitiallyDeferred
 	}
 	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard). PG18 also
 	// materialises that implication as a contype='n' `<table>_<col>_not_null`
@@ -9638,12 +9693,68 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false, nil, nil); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, act.NullsNotDistinct, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+		idx.NullsNotDistinct = act.NullsNotDistinct
+		// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+		// pg_constraint re-emit the clause on dump. DU-002.
+		idx.Deferrable = act.Deferrable
+		idx.InitiallyDeferred = act.InitiallyDeferred
+	}
+	return nil
+}
+
+// execAlterTableAddExclude handles `ALTER TABLE t ADD [CONSTRAINT name]
+// EXCLUDE USING method (col WITH op) [INCLUDE (cols)] [WHERE (pred)]`.
+// Mirrors the CREATE TABLE path for EXCLUDE constraints. DU-002.
+func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if len(act.Columns) == 0 {
+		return nil // nothing to do
+	}
+	name := act.ConstraintName
+	if name == "" {
+		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "excl")
+	}
+	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
+	method := act.ExclusionMethod
+	if method == "" {
+		method = "btree"
+	}
+	if act.ExclusionOp == "=" && strings.ToLower(method) == "btree" {
+		// btree equality exclusion ≈ unique constraint: build a real
+		// btree so checkExclusionConstraintsForInsert can probe it.
+		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil); err != nil {
+			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			idx.IsExclusion = true
+			idx.ExclusionOp = "="
+			idx.IncludeColumns = act.IncludeColumns
+			idx.IsConstraint = true
+			idx.Deferrable = act.Deferrable
+			idx.InitiallyDeferred = act.InitiallyDeferred
+			applyExclusionPredicate(idx, act.ExclusionWhere)
+		}
+	} else {
+		// Other exclusion operators: stub catalog entry; no enforcement in v0.
+		ec := parser.TableConstraintDef{
+			Name:             name,
+			Columns:          act.Columns,
+			IsExclusion:      true,
+			ExclusionOp:      act.ExclusionOp,
+			Method:           method,
+			IncludeColumns:   act.IncludeColumns,
+			Deferrable:       act.Deferrable,
+			InitiallyDeferred: act.InitiallyDeferred,
+			ExclusionWhere:   act.ExclusionWhere,
+		}
+		if err := o.createExclusionIndexStub(act.Pos(), idxName, tbl, ec); err != nil {
+			return err
+		}
 	}
 	return nil
 }

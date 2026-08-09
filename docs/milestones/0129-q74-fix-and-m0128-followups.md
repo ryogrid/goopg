@@ -1,6 +1,6 @@
 # Milestone 0129 — Q74 fix (M0128-P0.1 second half) + M0128 verdict follow-ups + residual-ledger burn-down
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-08-08 (user directive — see the fix_plan Current Priority
 banner)
 **Reference plan:** `.ralph/fix_plan.md` (M0129 section)

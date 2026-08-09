@@ -2947,6 +2947,10 @@ const (
 	// AlterTableDetachPartition — `DETACH PARTITION child`.
 	// Removes a table from its partition parent. M0097-0028.
 	AlterTableDetachPartition
+	// AlterTableAddExclude — `ADD [CONSTRAINT name] EXCLUDE USING method
+	// (col WITH op) [INCLUDE (cols)]`. Creates an exclusion constraint backed
+	// by an index. DU-002.
+	AlterTableAddExclude
 	// AlterTableDropConstraint — `DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 	// For PK constraints, checks view→constraint dependencies before dropping.
 	// M0097-0036 (functional_deps).
@@ -3150,6 +3154,12 @@ const (
 	// physical relocation of the relation's files, matching the CREATE TABLE/
 	// INDEX ... TABLESPACE precedent (M0122-0007).
 	AlterTableSetTablespace
+	// AlterTableSetAccessMethod — `ALTER TABLE name SET ACCESS METHOD name`.
+	// Changes the table's access method (pg_class.relam). goopg only supports
+	// `heap`; any other access method is rejected (ERRCODE_FEATURE_NOT_SUPPORTED).
+	// AccessMethodName holds the target AM name. DU-002: pg_dump emits this for
+	// partitioned tables whose relam differs from the default.
+	AlterTableSetAccessMethod
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3188,8 +3198,10 @@ type AlterTableAction struct {
 	// Foreign-key extras (only populated for AddForeignKey).
 	RefTable   ObjectName
 	RefColumns []string
-	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
-	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
+	Deferrable        bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+	InitiallyDeferred bool     // true if `INITIALLY DEFERRED` (implies Deferrable); DU-002
+	NullsNotDistinct  bool     // true if `NULLS NOT DISTINCT` for UNIQUE constraint; DU-002
+	OnDelete          FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
 	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
 	// subset of Columns (PG15 confdelsetcols); empty = all columns. DU-002 slice 311.
@@ -3252,6 +3264,10 @@ type AlterTableAction struct {
 	// TablespaceName is the target tablespace for AlterTableSetTablespace
 	// (`SET TABLESPACE name`, table or index). M0122-0007.
 	TablespaceName string
+	// AccessMethodName is the target access method for AlterTableSetAccessMethod
+	// (`SET ACCESS METHOD name`). DU-002: pg_dump emits this for partitioned
+	// tables whose relam differs from the default.
+	AccessMethodName string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
@@ -3297,6 +3313,16 @@ type AlterTableAction struct {
 	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
 	// table-level, ColumnName unused). DU-002 slice 419/420.
 	FDWOptionChanges []FDWOptionChange
+
+	// ExclusionOp is the per-column operator for AlterTableAddExclude
+	// (e.g. "=", "&&", "~=~"). DU-002.
+	ExclusionOp string
+	// ExclusionMethod is the index access method for AlterTableAddExclude
+	// (e.g. "btree", "gist", "spgist"). DU-002.
+	ExclusionMethod string
+	// ExclusionWhere is the optional WHERE predicate for a partial EXCLUDE
+	// constraint. nil when absent. DU-002.
+	ExclusionWhere Expr
 
 	// AlterConstraint* fields are populated for AlterTableAlterConstraint
 	// (`ALTER CONSTRAINT name ...`); ConstraintName holds the target

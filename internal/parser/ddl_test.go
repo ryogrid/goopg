@@ -760,6 +760,135 @@ func TestParseExcludeDeferrable(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddUniqueDeferrable pins DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] on ALTER TABLE ADD CONSTRAINT ... UNIQUE (cols). pg_dump
+// emits this for a unique constraint whose condeferrable/condeferred are set
+// (e.g. `ALTER TABLE t ADD CONSTRAINT u UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`).
+// Before this slice the trailing DEFERRABLE was a hard parse error. DU-002.
+func TestParseAlterTableAddUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"ALTER TABLE t ADD UNIQUE (a)", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT u UNIQUE (a)", false, false},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE", true, false},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE INITIALLY DEFERRED", true, true},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE", true, false},
+		{"ALTER TABLE t ADD UNIQUE (a) NOT DEFERRABLE", false, false},
+		{"ALTER TABLE t ADD UNIQUE (a) INITIALLY DEFERRED", true, true},
+		{"ALTER TABLE t ADD UNIQUE (a) INITIALLY IMMEDIATE", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT u UNIQUE (a) DEFERRABLE INITIALLY DEFERRED", true, true},
+		// INCLUDE clause with DEFERRABLE
+		{"ALTER TABLE t ADD UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("Parse(%q): got %d statements", c.in, len(stmts))
+			continue
+		}
+		alt, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Errorf("Parse(%q): expected AlterTableStmt, got %T", c.in, stmts[0])
+			continue
+		}
+		if len(alt.Actions) != 1 {
+			t.Errorf("Parse(%q): got %d actions", c.in, len(alt.Actions))
+			continue
+		}
+		act := alt.Actions[0]
+		if act.Kind != AlterTableAddUnique {
+			t.Errorf("Parse(%q): expected AlterTableAddUnique, got %v", c.in, act.Kind)
+			continue
+		}
+		if act.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, act.Deferrable, c.wantDefer)
+		}
+		if act.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, act.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
+// TestParseAlterTableAddExclude pins ALTER TABLE ADD [CONSTRAINT name]
+// EXCLUDE USING method (col WITH op) [INCLUDE (cols)] [DEFERRABLE ...].
+// pg_dump emits this for EXCLUDE constraints. DU-002.
+func TestParseAlterTableAddExclude(t *testing.T) {
+	cases := []struct {
+		in             string
+		wantName       string
+		wantOp         string
+		wantMethod     string
+		wantCols       []string
+		wantDefer      bool
+		wantDeferred   bool
+	}{
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =)", "", "=", "btree", []string{"a"}, false, false},
+		{"ALTER TABLE t ADD CONSTRAINT ex EXCLUDE USING btree (a WITH =)", "ex", "=", "btree", []string{"a"}, false, false},
+		{"ALTER TABLE t ADD EXCLUDE USING gist (c WITH &&)", "", "&&", "gist", []string{"c"}, false, false},
+		{"ALTER TABLE t ADD CONSTRAINT exdef EXCLUDE USING gist (c WITH &&)", "exdef", "&&", "gist", []string{"c"}, false, false},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) DEFERRABLE", "", "=", "btree", []string{"a"}, true, false},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED", "", "=", "btree", []string{"a"}, true, true},
+		{"ALTER TABLE t ADD EXCLUDE USING btree (a WITH =) INITIALLY DEFERRED", "", "=", "btree", []string{"a"}, true, true},
+		{"ALTER TABLE t ADD CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED", "ex", "=", "btree", []string{"a"}, true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("Parse(%q): got %d statements", c.in, len(stmts))
+			continue
+		}
+		alt, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Errorf("Parse(%q): expected AlterTableStmt, got %T", c.in, stmts[0])
+			continue
+		}
+		if len(alt.Actions) != 1 {
+			t.Errorf("Parse(%q): got %d actions", c.in, len(alt.Actions))
+			continue
+		}
+		act := alt.Actions[0]
+		if act.Kind != AlterTableAddExclude {
+			t.Errorf("Parse(%q): expected AlterTableAddExclude, got %v", c.in, act.Kind)
+			continue
+		}
+		if act.ConstraintName != c.wantName {
+			t.Errorf("Parse(%q): ConstraintName=%q want %q", c.in, act.ConstraintName, c.wantName)
+		}
+		if act.ExclusionOp != c.wantOp {
+			t.Errorf("Parse(%q): ExclusionOp=%q want %q", c.in, act.ExclusionOp, c.wantOp)
+		}
+		if act.ExclusionMethod != c.wantMethod {
+			t.Errorf("Parse(%q): ExclusionMethod=%q want %q", c.in, act.ExclusionMethod, c.wantMethod)
+		}
+		if len(act.Columns) != len(c.wantCols) {
+			t.Errorf("Parse(%q): Columns=%v want %v", c.in, act.Columns, c.wantCols)
+		} else {
+			for i := range act.Columns {
+				if act.Columns[i] != c.wantCols[i] {
+					t.Errorf("Parse(%q): Columns[%d]=%q want %q", c.in, i, act.Columns[i], c.wantCols[i])
+				}
+			}
+		}
+		if act.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, act.Deferrable, c.wantDefer)
+		}
+		if act.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, act.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {
@@ -1221,5 +1350,96 @@ func TestParseColumnDefCollation(t *testing.T) {
 	// The COLLATE before NOT NULL must not swallow the constraint.
 	if !ct.Columns[1].NotNull {
 		t.Errorf("col[1].NotNull=false, want true (COLLATE consumed the NOT NULL)")
+	}
+}
+
+// TestParseStandaloneNotNullColumnConstraint verifies that a bare
+// `NOT NULL colname` column-constraint element (as emitted by pg_dump for
+// inherited NOT NULL columns in CREATE TABLE ... INHERITS) is parsed as a
+// ColumnDef with Name=colname, NotNull=true, and empty Type. Also covers
+// `NOT NULL colname NO INHERIT`. DU-002 (M0119-0004).
+func TestParseStandaloneNotNullColumnConstraint(t *testing.T) {
+	// Basic form — single NOT NULL constraint element
+	sql := "CREATE TABLE child (NOT NULL pid, name text) INHERITS (parent)"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if len(ct.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ct.Columns))
+	}
+	// First column should be the NOT NULL constraint-only entry
+	if ct.Columns[0].Name != "pid" {
+		t.Errorf("col[0].Name=%q, want %q", ct.Columns[0].Name, "pid")
+	}
+	if !ct.Columns[0].NotNull {
+		t.Errorf("col[0].NotNull=false, want true")
+	}
+	if ct.Columns[0].Type.Name != "" {
+		t.Errorf("col[0].Type.Name=%q, want empty (constraint-only)", ct.Columns[0].Type.Name)
+	}
+	if ct.Columns[0].NotNullNoInherit {
+		t.Errorf("col[0].NotNullNoInherit=true, want false")
+	}
+	// Second column should be a normal typed column
+	if ct.Columns[1].Name != "name" {
+		t.Errorf("col[1].Name=%q, want %q", ct.Columns[1].Name, "name")
+	}
+	if ct.Columns[1].Type.Name != "text" {
+		t.Errorf("col[1].Type.Name=%q, want %q", ct.Columns[1].Type.Name, "text")
+	}
+	// INHERITS should be parsed
+	if len(ct.Inherits) != 1 || ct.Inherits[0].Name != "parent" {
+		t.Errorf("Inherits=%v, want [parent]", ct.Inherits)
+	}
+
+	// Form with NO INHERIT
+	sql2 := "CREATE TABLE child2 (NOT NULL pid NO INHERIT) INHERITS (parent)"
+	stmts2, err2 := Parse(sql2)
+	if err2 != nil {
+		t.Fatalf("Parse NO INHERIT form: %v", err2)
+	}
+	ct2 := stmts2[0].(*CreateTableStmt)
+	if !ct2.Columns[0].NotNull {
+		t.Errorf("NO INHERIT form: NotNull=false, want true")
+	}
+	if !ct2.Columns[0].NotNullNoInherit {
+		t.Errorf("NO INHERIT form: NotNullNoInherit=false, want true")
+	}
+
+	// Multiple NOT NULL constraint elements
+	sql3 := "CREATE TABLE child3 (NOT NULL a, NOT NULL b, c integer) INHERITS (parent)"
+	stmts3, err3 := Parse(sql3)
+	if err3 != nil {
+		t.Fatalf("Parse multi NOT NULL: %v", err3)
+	}
+	ct3 := stmts3[0].(*CreateTableStmt)
+	if len(ct3.Columns) != 3 {
+		t.Fatalf("multi NOT NULL: expected 3 columns, got %d", len(ct3.Columns))
+	}
+	if ct3.Columns[0].Name != "a" || !ct3.Columns[0].NotNull || ct3.Columns[0].Type.Name != "" {
+		t.Errorf("multi NOT NULL col[0]: Name=%q NotNull=%v Type=%q", ct3.Columns[0].Name, ct3.Columns[0].NotNull, ct3.Columns[0].Type.Name)
+	}
+	if ct3.Columns[1].Name != "b" || !ct3.Columns[1].NotNull || ct3.Columns[1].Type.Name != "" {
+		t.Errorf("multi NOT NULL col[1]: Name=%q NotNull=%v Type=%q", ct3.Columns[1].Name, ct3.Columns[1].NotNull, ct3.Columns[1].Type.Name)
+	}
+	if ct3.Columns[2].Name != "c" || ct3.Columns[2].Type.Name != "integer" {
+		t.Errorf("multi NOT NULL col[2]: Name=%q Type=%q", ct3.Columns[2].Name, ct3.Columns[2].Type.Name)
+	}
+
+	// Empty column list with only NOT NULL constraints — valid PG syntax
+	// for a child that only redeclares NOT NULL on inherited columns.
+	sql4 := "CREATE TABLE child4 (NOT NULL pid) INHERITS (parent)"
+	stmts4, err4 := Parse(sql4)
+	if err4 != nil {
+		t.Fatalf("Parse NOT-NULL-only column list: %v", err4)
+	}
+	ct4 := stmts4[0].(*CreateTableStmt)
+	if len(ct4.Columns) != 1 || ct4.Columns[0].Name != "pid" || !ct4.Columns[0].NotNull {
+		t.Errorf("NOT-NULL-only: col=%+v", ct4.Columns[0])
 	}
 }

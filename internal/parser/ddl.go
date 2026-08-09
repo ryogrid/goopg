@@ -2786,6 +2786,12 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) {
 	if p.acceptKeyword(KwNot) {
 		_ = p.acceptKeyword(KwDeferrable)
+		// Optionally consume INITIALLY {IMMEDIATE|DEFERRED} — pg_dump
+		// emits NOT DEFERRABLE INITIALLY IMMEDIATE as two independent
+		// constraint attributes. DU-002.
+		if p.acceptIdentKeyword("initially") {
+			_ = p.acceptIdentKeyword("immediate") || p.acceptIdentKeyword("deferred")
+		}
 		return
 	}
 	if p.acceptKeyword(KwDeferrable) {
@@ -3445,6 +3451,26 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		} else if matched {
 			// handled by parseTableConstraintElement
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot &&
+			p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwNull {
+			// Standalone NOT NULL colname column constraint — pg_dump emits
+			// these for inherited NOT NULL columns in CREATE TABLE ...
+			// INHERITS (...). The column is inherited from the parent and
+			// only the NOT NULL constraint is redeclared. DU-002 (M0119-0004).
+			p.advance() // NOT
+			p.advance() // NULL
+			colNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			col := ColumnDef{Name: identText(colNameTok), NotNull: true}
+			// Optional NO INHERIT
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				col.NotNullNoInherit = true
+			}
+			stmt.Columns = append(stmt.Columns, col)
+			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
 			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
 			p.advance() // consume LIKE
@@ -9232,6 +9258,23 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: pos, Kind: AlterTableSetTablespace, TablespaceName: identText(tsTok)}, nil
 	}
+	// SET ACCESS METHOD name — change the table's access method (pg_class.relam).
+	// goopg only supports `heap`; the executor rejects any other AM.
+	// DU-002: pg_dump emits `ALTER TABLE ... SET ACCESS METHOD heap` for
+	// partitioned tables whose relam differs from the default.
+	if cur := p.cur(); cur.Kind == TokenKeyword && cur.Keyword == KwSet &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "access") &&
+		p.peek(2).Kind == TokenIdent && strings.EqualFold(p.peek(2).Value, "method") {
+		pos := cur.Pos
+		p.advance() // SET
+		p.advance() // ACCESS
+		p.advance() // METHOD
+		amTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: pos, Kind: AlterTableSetAccessMethod, AccessMethodName: identText(amTok)}, nil
+	}
 	// SET (reloptions) / RESET (reloptions) — table-level storage parameters,
 	// e.g. `ALTER TABLE foo SET (parallel_workers = 2)` or
 	// `RESET (fillfactor)`. Only the parenthesized form is a reloptions update;
@@ -9302,6 +9345,10 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				}
 			}
 		}
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		// pg_dump emits `PRIMARY KEY (col) DEFERRABLE INITIALLY DEFERRED`
+		// for constraints whose condeferrable/condeferred are set. DU-002.
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 		// ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
@@ -9444,6 +9491,15 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.
 		// M0097-0023.
 		p.advance()
+		// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+		// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
+		// (col)` when the flag is set). DU-002.
+		if p.acceptIdentKeyword("nulls") {
+			act.NullsNotDistinct = p.acceptKeyword(KwNot)
+			if !p.acceptKeyword(KwDistinct) {
+				_ = p.acceptIdentKeyword("distinct")
+			}
+		}
 		if !(p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using")) || !(p.acceptKeyword(KwIndex) || p.acceptIdentKeyword("index")) {
 			// Normal UNIQUE (cols) form.
 			if p.acceptSymbol("(") {
@@ -9473,7 +9529,25 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			_, _ = p.parseIdent() // consume indexname
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		// pg_dump emits `UNIQUE (col) DEFERRABLE INITIALLY DEFERRED`
+		// for constraints whose condeferrable/condeferred are set. DU-002.
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
 		act.Kind = AlterTableAddUnique
+		return act, nil
+	case p.acceptIdentKeyword("exclude"):
+		// ADD [CONSTRAINT name] EXCLUDE USING method (col WITH op)
+		// [INCLUDE (cols)] [WHERE (pred)] — create an exclusion
+		// constraint. DU-002.
+		cdef := p.parseExcludeConstraint()
+		act.Columns = cdef.Columns
+		act.IncludeColumns = cdef.IncludeColumns
+		act.ExclusionOp = cdef.ExclusionOp
+		act.ExclusionMethod = cdef.Method
+		act.ExclusionWhere = cdef.ExclusionWhere
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+		act.Kind = AlterTableAddExclude
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
 		// ADD [CONSTRAINT name] NOT NULL col [NO INHERIT] — PG18 named NOT NULL
