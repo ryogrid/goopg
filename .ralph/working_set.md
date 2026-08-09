@@ -1,40 +1,31 @@
-Task: M0122-0007 — pg_ts_config per-DB routing (landed)
+Task: M0119-0004 — pg_dump DU-002 round-trip probe: ALTER TEXT SEARCH DICTIONARY/CONFIGURATION OWNER TO + AddTSConfigMapping per-DB scoping
 
 Files:
-- internal/catalog/catalog.go: UserTSConfig.DBOid field, CreateTSConfig/FindTSConfig/DropTSConfig dbOid variadic params, ListUserTSConfigs dbOid filtering, PGTSConfigRowsForDBOid method, CreateTSConfigDuringRecovery DBOid fallback, pgTSConfig/pgTSConfigMap VirtualRows update
-- internal/executor/operators_ddl.go: 10 call sites updated to pass catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-- internal/initdb/catalog_heap_reload.go: UserTSConfig literal includes DBOid: cat.DBOID()
-- internal/server/dispatch.go: pgTSConfigRowLister interface + wireExtensionRows PgTSConfigRows
-- internal/executor/context.go: PgTSConfigRows field
-- internal/executor/operators.go: pg_ts_config per-connection override
-- internal/catalog/create_tsconfig_dbscope_test.go: cross-DB isolation test (PASS)
-- test files updated: tsconfig_replacedict, tsconfig_rename_setschema_dropmapping, tsconfig_copy
+- internal/executor/operators_ddl.go: ALTER guard for "text search dictionary" and "text search configuration" cases in execCompatNoop; AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict callers pass NamespaceDBOid
+- internal/catalog/catalog.go: AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict now take dbOid ...uint32 variadic param + filter by DBOid in the lookup loop
 
 Key symbols:
-- catalog.UserTSConfig (new DBOid field)
-- catalog.PGTSConfigRowsForDBOid (new method, mirrors PGTSDictRowsForDBOid)
-- server.pgTSConfigRowLister (new interface)
-- executor.Context.PgTSConfigRows (new field)
+- ddlOp.execCompatNoop: case "text search dictionary" and "text search configuration" now check strings.HasPrefix(s.Tag, "ALTER ") before requiring TSDictTemplate/TSConfigParser
+- catalog.AddTSConfigMapping: new dbOid ...uint32 param, DBOid match added
+- catalog.DropTSConfigMapping: new dbOid ...uint32 param, DBOid match added
+- catalog.ReplaceTSConfigMappingDict: new dbOid ...uint32 param, DBOid match added
 
 Hypothesis/Findings:
-- UserTSConfig lacked DBOid, leaking configs across databases
-- Fixed by following the exact UserTSDict pattern (dbOid variadic param, resolveDBOid convention)
-- pg_ts_config_map also uses ListUserTSConfigs; updated its VirtualRows to pass DefaultDBOid explicitly
-- The mapcfg-filtered WHERE clause in pg_ts_config_map queries means cross-DB leakage there is cosmetic (config OIDs won't match across databases), so per-connection override deferred
+- Bug 1: execCompatNoop's "text search dictionary" case handled both CREATE and ALTER but always required TSDictTemplate.Name (set only for CREATE). ALTER TEXT SEARCH DICTIONARY OWNER TO produced "text search template is required".
+- Bug 2: Same pattern in "text search configuration" — ALTER OWNER TO would hit "text search parser is required".
+- Bug 3: AddTSConfigMapping/DropTSConfigMapping/ReplaceTSConfigMappingDict matched configs by NamespaceOID+Name only (no DBOid), so a restore into a different DB would find the source DB's config, report duplicate, and fail with "duplicate key value violates unique constraint pg_ts_config_map_index".
+- All three FIXED. DU-002 round-trip probe advances past text search objects.
+- Next blocker: ALTER SERVER OWNER TO — parser has no ALTER SERVER dispatch (falls through to ALTER TABLE path → syntax error). After that, likely more ALTER ... OWNER TO gaps for other compat-registry objects.
 
 Next step:
-Per the Current Priority banner: M-NIGHTLY (clear) → M0119 (blocked on large items) → M0122.
-Next M0122 slice: either M0122-0003 EXPLAIN WAL/MEMORY output (deferral ledger rows 2026-08-08)
-or a follow-up on the design doc 0122-0018's "Still deferred" items (only "type catalog rows" remain — sequences and constraints are already done).
+Continue DU-002 blockers: add ALTER SERVER/FDW/EVENT TRIGGER OWNER TO compat no-op handlers in parser + executor, or add a generic ALTER <compat_object> OWNER TO catch-all to avoid per-type repetition.
 
 Gates run:
 - go build ./...: PASS
-- go vet: PASS
-- catalog tests: PASS (0.068s)
-- executor tests: PASS (5.894s)
-- server tests: PASS (23.412s)
-- initdb tests: PASS (54.573s)
-- TestCreateTSConfigCrossDatabaseIsolation: PASS
+- go test ./internal/catalog/...: PASS (0.064s)
+- go test ./internal/executor/...: PASS (5.848s)
+- go test ./internal/parser/...: PASS (0.035s)
 - make ralph-state-guard: OK
+- TestPort_PgDumpConnectionSetup: PASS (DU-002 round-trip FAILS at next blocker: ALTER SERVER OWNER TO syntax error)
 
 In-flight: none

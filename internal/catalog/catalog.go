@@ -14116,15 +14116,16 @@ func (c *InMemory) ListUserTSConfigs(dbOid ...uint32) []*UserTSConfig {
 // whether tokenType already had a mapping entry (the caller must not append
 // in that case).
 // DU-002 slice 446 (M0119-0004).
-func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig, duplicate bool) {
+func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32, dbOid ...uint32) (cfg *UserTSConfig, duplicate bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			for _, m := range uc.Mappings {
 				if strings.EqualFold(m.TokenType, tokenType) {
 					return uc, true
@@ -14152,15 +14153,16 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 // configuration (nil if no configuration with the given schema-resolved name
 // exists) and whether a mapping for tokenType was found and removed.
 // DU-002 slice 446 follow-up (M0119-0004).
-func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string) (cfg *UserTSConfig, found bool) {
+func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string, dbOid ...uint32) (cfg *UserTSConfig, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			for i, m := range uc.Mappings {
 				if strings.EqualFold(m.TokenType, tokenType) {
 					uc.Mappings = append(uc.Mappings[:i], uc.Mappings[i+1:]...)
@@ -14276,15 +14278,16 @@ func (c *InMemory) AlterTSConfigMappingDuringRecovery(name, schema, tokenType st
 // succeeds. Returns the matched configuration (nil if no configuration with
 // the given schema-resolved name exists) and whether any entry was actually
 // replaced. DU-002 replacedict follow-up (M0119-0004).
-func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32) (cfg *UserTSConfig, replaced bool) {
+func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32, dbOid ...uint32) (cfg *UserTSConfig, replaced bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
 			continue
 		}
 		for mi := range uc.Mappings {

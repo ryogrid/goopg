@@ -16770,6 +16770,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return fmt.Errorf("pg_conversion journal: %w", err)
 		}
 	case "text search dictionary":
+		// ALTER TEXT SEARCH DICTIONARY … OWNER TO (and any other unrecognised
+		// trailer) falls through the parser's ALTER branch into a CompatNoopStmt
+		// carrying ObjType "text search dictionary" but no TSDictTemplate (only
+		// CREATE sets that field). Gate the CREATE-only logic on the Tag prefix
+		// so a round-trip restore doesn't fail on the OWNER TO trailer the dump
+		// emitted. DU-002 slice 437 follow-up (M0119-0004).
+		if strings.HasPrefix(s.Tag, "ALTER ") {
+			if s.ObjName.Name != "" {
+				im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+			}
+			return nil
+		}
 		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
 		// tmpl [, opt = val, ...])) so it round-trips through pg_dump (pg_ts_dict
 		// view → getTSDictionaries / dumpTSDictionary). DU-002 slice 437.
@@ -16810,6 +16822,19 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return fmt.Errorf("pg_ts_dict journal: %w", err)
 		}
 	case "text search configuration":
+		// ALTER TEXT SEARCH CONFIGURATION … OWNER TO (and any other unrecognised
+		// trailer) falls through the parser's ALTER branch into a CompatNoopStmt
+		// carrying ObjType "text search configuration" but no TSConfigParser /
+		// TSConfigCopySource (only CREATE sets those fields). Gate the
+		// CREATE-only logic on the Tag prefix so a round-trip restore doesn't
+		// fail on the OWNER TO trailer the dump emitted. DU-002 slice 446
+		// follow-up (M0119-0004).
+		if strings.HasPrefix(s.Tag, "ALTER ") {
+			if s.ObjName.Name != "" {
+				im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+			}
+			return nil
+		}
 		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
 		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
 		// view → getTSConfigurations / dumpTSConfig). DU-002 slice 446.
@@ -16873,7 +16898,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// ALTER ... ADD MAPPING uses, so restart replay needs no new WAL
 			// record kind.
 			for _, m := range copySource.Mappings {
-				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
+				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc2 == nil || dup {
 					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
 				}
 			}
@@ -16996,7 +17021,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 		dictOIDs = append(dictOIDs, oid)
 	}
 	for _, tt := range s.TokenTypes {
-		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
@@ -17066,7 +17091,7 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if err != nil {
 		return err
 	}
-	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
@@ -17117,7 +17142,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 // in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
 	for _, tt := range s.TokenTypes {
-		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt)
+		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
