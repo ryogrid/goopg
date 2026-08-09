@@ -107,6 +107,20 @@ const (
 	// therefore not the fix for these; the closed set IS the invariant, and
 	// pinning it here is how a later edit that widens the set gets audited.
 	boundedQualSpine walkerRole = "bounded-qual-spine"
+
+	// failClosedTypeResolver recurses only into TYPE-DETERMINING positions —
+	// a cast's operand, a CASE branch, an operator's operands, a function's
+	// arguments — and returns ok=false for every node type it does not
+	// enumerate. Added by M0119-0006 for ExprResultType, goopg's mirror of
+	// PG's exprType() (nodes/nodeFuncs.c), which upstream is likewise a
+	// per-node-type switch and not a traversal: there is no "descend into all
+	// children" answer to "what type does this node produce". It is a distinct
+	// role because the RC-1a hazard does not apply — an unenumerated type is
+	// not silently skipped, it makes the whole resolution DECLINE, and every
+	// caller's decline path is its pre-existing conservative behaviour. An
+	// edit that gave it a default answer instead of a decline would be the
+	// real defect, which is what pinning it here audits.
+	failClosedTypeResolver walkerRole = "fail-closed-type-resolver"
 )
 
 // exprSwitchInventory pins every Expr type switch in package planner, keyed
@@ -206,6 +220,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// Visit closure — classify a *ColumnRef by leftWidth, veto
 	// *OuterColumnRef / *CTIDExpr — and the census attributes a closure's
 	// switch to its enclosing function. RC-1a class 47 → 46.
+	// Added by M0119-0006. See failClosedTypeResolver's comment: an
+	// unenumerated Expr type makes ExprResultType decline, never guess.
+	"expr_result_type.go:ExprResultType": failClosedTypeResolver,
+
 	"planner.go:exprSide":                        nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
 	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
@@ -378,7 +396,8 @@ func TestExprSwitchInventoryIsPinned(t *testing.T) {
 
 	for key, role := range exprSwitchInventory {
 		switch role {
-		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier, boundedQualSpine:
+		case exprwalkPrimitive, walkerPending, nonRecursiveClassifier, boundedQualSpine,
+			failClosedTypeResolver:
 		default:
 			t.Errorf("%s: unknown walkerRole %q", key, role)
 		}

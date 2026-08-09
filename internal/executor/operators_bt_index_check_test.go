@@ -343,6 +343,116 @@ func TestBtIndexCheck_OpClassDamageDetectedComposite(t *testing.T) {
 	}
 }
 
+// TestBtIndexCheck_OpClassDamageDetectedExpression covers an *expression* key
+// column: `CREATE INDEX … ((lower(t)) text_fickle_ops)`. Every earlier slice
+// declined an index with any expression key column outright — there was no
+// catalog column to read the key's type off, so the whole index fell back to
+// the engine's byte order and a damaged support proc went unreported.
+//
+// The type now comes from planner.ExprResultType over the same resolved
+// expression the build path indexed with, mapped through exprKeyDecodeType onto
+// the encoding the expression-key encoder actually produced. Both halves are
+// asserted: no false positive on the healthy index, and the item-order
+// violation once the amproc row is repointed at a descending comparator.
+func TestBtIndexCheck_OpClassDamageDetectedExpression(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION x_asc_cmp (a text, b text) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION x_desc_cmp (a text, b text) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS text_fickle_expr_ops FOR TYPE text USING btree AS
+			OPERATOR 1 < (text, text), OPERATOR 2 <= (text, text),
+			OPERATOR 3 = (text, text), OPERATOR 4 >= (text, text),
+			OPERATOR 5 > (text, text), FUNCTION 1 x_asc_cmp(text, text)`,
+		"CREATE TABLE exprtbl (t text)",
+		"INSERT INTO exprtbl VALUES ('A'), ('B'), ('C'), ('D'), ('E'), ('F'), ('G'), ('H')",
+		"CREATE INDEX fickleexpr ON exprtbl USING btree ((lower(t)) text_fickle_expr_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleexpr')"); err != nil {
+		t.Fatalf("healthy expression index under a user operator class raised: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'x_desc_cmp'::regproc
+		WHERE amproc = 'x_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleexpr')")
+	if err == nil {
+		t.Fatal("broken operator class on an expression index not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "fickleexpr"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}
+
+// TestBtIndexCheck_ExpressionKeyCleanUnderPlainOpClass is the no-false-positive
+// half in isolation, and the one that would catch a wrong DECODE WIDTH: a
+// composite key whose leading column is an integer-valued expression (encoded
+// through EncodeInt8 by kind dispatch, NOT as the 4-byte int4 its SQL type
+// suggests) followed by a plain int4 column carrying the user opclass. If the
+// expression column's surrogate consumed the wrong number of bytes, the walk
+// would land mid-key on the second column and the healthy index would be
+// reported corrupt.
+func TestBtIndexCheck_ExpressionKeyCleanUnderPlainOpClass(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION xw_asc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION xw_desc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS int4_fickle_expr_ops FOR TYPE int4 USING btree AS
+			OPERATOR 1 < (int4, int4), OPERATOR 2 <= (int4, int4),
+			OPERATOR 3 = (int4, int4), OPERATOR 4 >= (int4, int4),
+			OPERATOR 5 > (int4, int4), FUNCTION 1 xw_asc_cmp(int4, int4)`,
+		"CREATE TABLE exprwtbl (a int4, i int4)",
+		// Constant leading expression value: the damaged second-column
+		// comparator alone decides the order, as in the composite test.
+		"INSERT INTO exprwtbl VALUES (5,1), (5,2), (5,3), (5,4), (5,5), (5,6), (5,7), (5,8)",
+		"CREATE INDEX ficklexw ON exprwtbl USING btree ((a * 2), i int4_fickle_expr_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklexw')"); err != nil {
+		t.Fatalf("healthy expression+column index raised (wrong expression key "+
+			"decode width would look exactly like this): %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'xw_desc_cmp'::regproc
+		WHERE amproc = 'xw_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklexw')")
+	if err == nil {
+		t.Fatal("broken opclass after an expression key column not detected: reported clean")
+	}
+	const want = `item order invariant violated for index "ficklexw"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}
+
 // TestBtIndexCheck_OpClassDamageDetectedInclude covers a *covering* index: a
 // user opclass on the key column of an index that also carries INCLUDE
 // (non-key) columns. The earlier slices declined such an index outright,

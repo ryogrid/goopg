@@ -322,9 +322,27 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 	anyRoutine := false
 	for i, name := range idx.Columns {
 		if name == "" {
-			// Expression key column: there is no catalog column whose type
-			// drives the key decode, so no column-wise inversion is possible.
-			return nil
+			// Expression key column. There is no catalog column to read the
+			// type off, so resolve the expression's static result type
+			// (planner.ExprResultType) and map it onto the surrogate type whose
+			// decoder consumes exactly the bytes the expression-key ENCODER
+			// wrote (exprKeyDecodeType). M0119-0006.
+			surrogate, allowRoutine, ok := exprKeyColumnType(idx, i)
+			if !ok {
+				return nil
+			}
+			kc := keyCol{col: catalog.Column{Name: "", Type: surrogate}}
+			if allowRoutine && i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+				if procOID, found := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
+					catalog.AccessMethodOIDByName(method), 1); found {
+					if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+						kc.routine = r
+						anyRoutine = true
+					}
+				}
+			}
+			cols = append(cols, kc)
+			continue
 		}
 		var col *catalog.Column
 		for j := range idx.Table.Columns {
@@ -378,6 +396,33 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 		// the engine's own comparator.
 		return btree.CompareKeys(a[ao:], b[bo:])
 	}
+}
+
+// exprKeyColumnType resolves the decode surrogate for expression key column i
+// of idx: the column type under which decodeIndexKeyColumn consumes exactly the
+// bytes the expression-key encoder wrote for that column, and whether a user
+// opclass comparator may be given the decoded Datum.
+//
+// Two resolutions have to succeed. First the expression's static SQL result
+// type (planner.ExprResultType over the same resolved Expr the build path uses,
+// so the comparator can never disagree with what was indexed). Then the mapping
+// from that SQL type onto the encoding actually produced (exprKeyDecodeType) —
+// see its comment for why the two differ. Either failing returns ok=false and
+// the caller falls back to whole-key byte order, which is what this arm did
+// unconditionally before M0119-0006.
+func exprKeyColumnType(idx *catalog.Index, i int) (surrogate catalog.Type, allowRoutine bool, ok bool) {
+	if i >= len(idx.ColExprs) || idx.ColExprs[i] == nil || idx.Table == nil {
+		return catalog.Type{}, false, false
+	}
+	planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], idx.Table)
+	if err != nil || planExpr == nil {
+		return catalog.Type{}, false, false
+	}
+	sqlType, resolved := planner.ExprResultType(planExpr)
+	if !resolved {
+		return catalog.Type{}, false, false
+	}
+	return exprKeyDecodeType(sqlType)
 }
 
 // btIndexCompareKeyColumn orders one key column: through the operator class's

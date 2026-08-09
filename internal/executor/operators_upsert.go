@@ -1588,4 +1588,61 @@ func encodeArbiterExprKey(v Datum, pos int) []byte {
 	}
 	return nil
 }
+
+// exprKeyDecodeType is the DECODE-side twin of encodeArbiterExprKey: given the
+// statically resolved SQL result type of an expression key column
+// (planner.ExprResultType), it returns the *surrogate* column type whose
+// decoder in decodeIndexKeyColumn consumes exactly the bytes the encoder above
+// wrote, plus whether a user opclass comparator may be handed the decoded
+// Datum.
+//
+// The surrogate is NOT always the SQL type, because encodeArbiterExprKey
+// dispatches on the runtime Datum *kind*, not on a declared type — every
+// integer width goes through EncodeInt8 (8 bytes) where an int4 *column* key
+// would be 4, and every date/time value goes through EncodeTimestamp (micros)
+// where a date *column* key would be int4 days. Decoding an expression key
+// under its SQL type would therefore consume the wrong width and desynchronize
+// the whole composite walk. Any change to an encodeArbiterExprKey arm must
+// change the matching row here (Hard-won Rule #2: sibling paths move together;
+// TestExprKeyDecodeTypeRoundTrip pins the pairing).
+//
+// allowRoutine is false where the surrogate's decoded Datum kind does not match
+// what a comparator declared over the SQL type expects: a bool expression
+// decodes as an integer 0/1 and a bytea expression as a string, so feeding
+// either to a user FUNCTION 1 routine could invent an ordering. Those columns
+// still decode (so the walk stays aligned) but keep the engine's byte order,
+// which for both encodings is the type's own order anyway.
+//
+// ok=false means the expression's key bytes are not invertible at all — the
+// caller must decline the whole index. That covers the kinds encodeArbiterExprKey
+// has no arm for (float4/float8 — such a row is simply not indexed today) and
+// enums, whose EncodeFloat8(sort order) key cannot be turned back into a label
+// without the enum catalog entry.
+func exprKeyDecodeType(t catalog.Type) (surrogate catalog.Type, allowRoutine bool, ok bool) {
+	if t.IsArray {
+		return catalog.Type{}, false, false
+	}
+	switch strings.ToLower(t.Name) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint", "oid":
+		// KindInt → EncodeInt8, regardless of the declared width.
+		return catalog.Type{Name: "int8"}, true, true
+	case "bool", "boolean":
+		// KindBool → EncodeInt8(0/1): decodes as an integer, not a boolean.
+		return catalog.Type{Name: "int8"}, false, true
+	case "numeric", "decimal":
+		return catalog.Type{Name: "numeric"}, true, true
+	case "date", "time", "time without time zone", "timestamp",
+		"timestamp without time zone", "timestamptz", "timestamp with time zone":
+		// KindTime → EncodeTimestamp (int64 micros) for every subtype.
+		return catalog.Type{Name: "timestamp"}, true, true
+	case "text", "varchar", "character varying", "char", "character", "bpchar",
+		"name", "uuid":
+		return catalog.Type{Name: "text"}, true, true
+	case "bytea":
+		// KindBytes → EncodeVarchar: same self-delimiting form as text, but the
+		// decoded Datum is a string of raw bytes.
+		return catalog.Type{Name: "text"}, false, true
+	}
+	return catalog.Type{}, false, false
+}
  

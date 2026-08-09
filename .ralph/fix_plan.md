@@ -469,12 +469,25 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestExpressionIndexBuildIndexesExistingRows` +
       `TestReindexExpressionIndexKeepsEntries` (physical entry counts, confirmed
       non-vacuous).
-      Remaining for M0119-0006: widen `encodeArbiterExprKey` beyond string/int
-      (needs the expression's result type — `planner.inferExprType` is
-      unexported and weak) so amcheck's comparator dispatch can cover
-      expression keys, posting-list duplicate coverage, `box`/`int4range`/
-      `int4[]` key encodings, and the whole-database (unscoped) pg_amcheck run
-      — ledger rows 2026-08-10.
+      **Slice landed 2026-08-10 (9th) — index-expression RESULT-TYPE resolution
+      + expression key columns in the opclass comparator** (design
+      `docs/design/0119-0006-expression-index-result-type.md`). New exported
+      `planner.ExprResultType` reads the type out of the PG 18 pg_proc /
+      pg_operator seed goopg already ships (not a hand-written name table) and
+      DECLINES rather than falling back to text the way `inferExprType` does;
+      its decode-side twin `exprKeyDecodeType` maps that SQL type onto the
+      surrogate the kind-dispatching expression-key ENCODER actually produced
+      (int4 expression key = 8 bytes, date = int64 micros), so
+      `btIndexOpClassComparator` no longer declines a whole index because one
+      key column is an expression. Gates
+      `TestBtIndexCheck_OpClassDamageDetectedExpression` and
+      `TestBtIndexCheck_ExpressionKeyCleanUnderPlainOpClass` (the decode-width
+      gate), both confirmed non-vacuous.
+      Remaining for M0119-0006: float4/float8 and enum expression key encodings
+      (the two kinds `exprKeyDecodeType` still declines), posting-list duplicate
+      coverage in the checkunique tier, `box`/`int4range`/`int4[]`/interval key
+      encodings, and the whole-database (unscoped) pg_amcheck run — ledger rows
+      2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
