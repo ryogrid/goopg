@@ -292,7 +292,7 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string) *publicationFilt
 		byTable: map[string]allowFlags{},
 	}
 	for _, name := range names {
-		pub, ok := ps.LookupPublication(name)
+		pub, ok := ps.LookupPublication(name, catalog.DefaultDBOid)
 		if !ok {
 			continue
 		}

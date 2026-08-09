@@ -2293,6 +2293,7 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 	}
 	for _, raw := range rows {
 		pr := raw.(pubRow)
+		pr.pub.DBOid = cat.DBOID() // pg_publication is per-database; tag with the DB it was reloaded from
 		pr.pub.Tables = membersByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})

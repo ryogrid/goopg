@@ -1025,7 +1025,7 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		}
 		tables = append(tables, tbl.QualifiedName())
 	}
-	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID())
+	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -1055,10 +1055,11 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	// the pg_publication row and its pg_publication_rel members (kind 51
 	// retired).
 	var pubOID uint32
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
 		pubOID = pub.OID
 	}
-	if err := o.ctx.PubSub.DropPublication(s.Name); err != nil {
+	if err := o.ctx.PubSub.DropPublication(s.Name, pubDBOid); err != nil {
 		if s.IfExists {
 			return nil
 		}
@@ -1151,12 +1152,13 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 	if err != nil {
 		return err
 	}
-	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
+	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID, pubDBOid); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
 	// B3.3: the owner change is a canonical pg_publication heap UPDATE
 	// (kind 52 retired).
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
 		if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
 			return fmt.Errorf("pg_publication journal: %w", uerr)
 		}

@@ -275,6 +275,12 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// — mirrors the pg_ts_dict branch above. M0122-0007 4e
 			// follow-up (DU-002 round-trip probe unblock).
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTSConfigRows())
+		} else if tbl.Name == "pg_publication" && ctx != nil && ctx.PgPublicationRows != nil {
+			// pg_publication must list the connecting database's own CREATE
+			// PUBLICATION'd publications, not always DefaultDBOid's — mirrors
+			// the pg_ts_config branch above. M0119-0004 (DU-002 per-DB
+			// publication scoping).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgPublicationRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

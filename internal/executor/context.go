@@ -780,6 +780,13 @@ type Context struct {
 	// round-trip probe unblock).
 	PgTSConfigRows func() [][]string
 
+	// PgPublicationRows mirrors PgTSDictRows above for the pg_publication
+	// catalog table: it lists CurrentDatabaseOid's own CREATE PUBLICATION'd
+	// publications rather than always DefaultDBOid's (catalog.PubSub's
+	// PublicationsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0119-0004 (DU-002 per-DB publication scoping).
+	PgPublicationRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

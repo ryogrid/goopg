@@ -319,6 +319,21 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `.ralph/working_set.md` / ledger). Two general SQL-engine gaps surfaced here
       remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
       and any residual dump-fidelity items.
+      - [x] **DU-002 publication per-DB scoping** (2026-08-09, this loop) ---
+          DBOid added to Publication struct; compound map key via `pubMapKey`;
+          CreatePublicationAsOwner/LookupPublication/DropPublication/SetPublicationOwner
+          all accept variadic dbOid; PublicationsForDBOid filters; PgPublicationRows
+          per-connection override on Context wired in dispatch.go + operators.go;
+          cross-database isolation test TestCreatePublicationCrossDatabaseIsolation
+          (PASS). Follows the UserTSConfig pattern from DU-002 slices 437/446.
+          Round-trip error moved from "publication already exists" to "subscription
+          already exists" --- Subscription per-DB scoping is the next DU-002 blocker.
+      - [ ] **DU-002 subscription per-DB scoping** --- same compound-key +
+          per-connection-override pattern applied to Subscription (struct already has
+          DBOid but methods don't filter). pubsub.go touch points: CreateSubscriptionAsOwner
+          subMapKey lookup, DropSubscription/LookupSubscription/Subscriptions/
+          SubscriptionsForDBOid, pg_subscription VirtualRows override, operators.go
+          branch, dispatch.go wiring. See `.ralph/working_set.md` for exact file list.
 
 - [x] **DU-002 next blocker — `invalid column numbering in table "nninh4"`** (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). **FIXED (2026-08-09).**
       Root cause: `deleteCatalogRowsForOID`/`deleteAttributeFromCatalogHeap` tried
@@ -331,7 +346,9 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       decoder was never consulted. Fix: swap decoder order — physical first,
       logical as fallback. Same fix applied to pg_class match closure
       (same class of bug). The nninh4 column-numbering error is now gone;
-      remaining DU-002 gap is constraint-trigger parsing
+      remaining DU-002 gaps: subscription per-DB scoping (round-trip error
+      "subscription already exists" — see new unchecked item above);
+      constraint-trigger parsing
       (`CREATE CONSTRAINT TRIGGER ... NOT DEFERRABLE INITIALLY IMMEDIATE`).
     - [x] **DU-002: EXCLUDE in ALTER TABLE ADD CONSTRAINT** — **FIXED (2026-08-09, this loop).**
       Root cause: `parseAlterTableAction` had no case for EXCLUDE keyword; fell

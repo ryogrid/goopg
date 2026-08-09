@@ -2354,6 +2354,16 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return ptc.PGTSConfigRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_publication must likewise reflect the connecting database's own
+	// CREATE PUBLICATION'd publications, not always DefaultDBOid's.
+	// Mirrors the pg_ts_config wiring above. PubSub is separate from
+	// catalog.InMemory, so we wire it directly through s.cfg.PubSub.
+	// M0119-0004 (DU-002 per-DB publication scoping).
+	if s.cfg.PubSub != nil {
+		ectx.PgPublicationRows = func() [][]string {
+			return publicationRowsForDBOid(s.cfg.PubSub, catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2481,6 +2491,42 @@ type pgTSDictRowLister interface {
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 type pgTSConfigRowLister interface {
 	PGTSConfigRowsForDBOid(dbOid uint32) [][]string
+}
+
+// publicationRowsForDBOid builds the pg_publication VirtualRows for dbOid
+// from the PubSub registry, matching the wireExtensionRows convention of
+// filtering catalog views to the connecting database. M0119-0004 (DU-002
+// per-DB publication scoping).
+func publicationRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
+	pubs := ps.PublicationsForDBOid(dbOid)
+	if len(pubs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(pubs))
+	for _, pub := range pubs {
+		out = append(out, []string{
+			fmt.Sprintf("%d", pub.OID),
+			pub.Name,
+			fmt.Sprintf("%d", pub.Owner),
+			boolToText(pub.AllTables),
+			boolToText(pub.PublishInsert),
+			boolToText(pub.PublishUpdate),
+			boolToText(pub.PublishDelete),
+			"f", // pubtruncate
+			"f", // pubviaroot
+			"n", // pubgencols
+		})
+	}
+	return out
+}
+
+// boolToText converts a bool to "t"/"f" for pg_catalog VirtualRows
+// (mirrors replicate_views.go:boolText). M0119-0004.
+func boolToText(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {

@@ -94,7 +94,7 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 	if ctx.PubSub == nil {
 		return nil, nil
 	}
-	pubs := ctx.PubSub.Publications()
+	pubs := ctx.PubSub.PublicationsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	rows := make([]Row, 0)
 	for _, pub := range pubs {
 		if !all {
