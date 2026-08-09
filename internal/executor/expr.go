@@ -7818,6 +7818,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
+	case "pg_client_encoding":
+		return evalPgClientEncoding(row, ctx)
+	case "getdatabaseencoding":
+		return evalGetDatabaseEncoding(row, ctx)
 	case "current_setting":
 		if len(x.Args) >= 1 {
 			nameArg, err := evalExpr(x.Args[0], row, ctx)
@@ -14866,4 +14870,45 @@ func canonicalTypeName(name string) string {
 		return "character"
 	}
 	return name
+}
+
+// evalPgClientEncoding returns the current session's client_encoding as a name,
+// mirroring PG's pg_client_encoding() (postgres/src/backend/utils/adt/mb/pg_wchar.c).
+// It reads the live client_encoding GUC value; falls back to "UTF8" when the
+// setting is unavailable (nil context / nil GetSetting). M0122-0008.
+func evalPgClientEncoding(row Row, ctx *Context) (Datum, error) {
+	enc := "UTF8"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("client_encoding"); ok {
+			enc = v
+		}
+	}
+	return NewStringDatum(enc), nil
+}
+
+// evalGetDatabaseEncoding returns the current database's encoding as a name,
+// mirroring PG's getdatabaseencoding() (postgres/src/backend/utils/adt/dbsize.c).
+// It reads the encoding ID from the in-memory catalog and maps it to a canonical
+// name; falls back to "UTF8" when the context or catalog is unavailable.
+// M0122-0008.
+func evalGetDatabaseEncoding(row Row, ctx *Context) (Datum, error) {
+	if ctx == nil || ctx.Catalog == nil {
+		return NewStringDatum("UTF8"), nil
+	}
+	dbName := ctx.CurrentDatabase
+	if dbName == "" {
+		dbName = "postgres"
+	}
+	// DatabaseEncoding lives on *InMemory, not the Catalog interface. Type-assert
+	// so this works against the production implementation; the fallback covers
+	// tests that supply a different Catalog implementation.
+	var encID int32 = -1
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		encID = im.DatabaseEncoding(dbName)
+	}
+	encName := catalog.EncodingIDToName(encID)
+	if encName == "" {
+		encName = "UTF8"
+	}
+	return NewStringDatum(encName), nil
 }

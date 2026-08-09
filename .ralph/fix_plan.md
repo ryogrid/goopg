@@ -602,10 +602,21 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       validation landed this loop (M0122-0008: ValidServerEncodingName +
       extractEncodingRawFromSQL + catalog.databaseEncoding storage + heap-row override).
       **Genuinely remaining:** (1) channel binding — blocked on TLS infrastructure
-      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) bootstrap encoding
-      enforcement + locale↔encoding mismatch checks (the initdb/catalog layer
-      doesn't do actual encoding conversion).
-      **client_encoding GUC validation landed (2026-08-09, this loop):**
+      (SCRAM-SHA-256-PLUS needs tls-server-end-point); (2) actual byte-level
+      encoding conversion/transcoding (the initdb/catalog/GUC layers all validate
+      encoding NAMES but none does character-set transcoding).
+      **Bootstrap encoding enforcement (name validation) verified COMPLETE (2026-08-09):**
+      initdb resolveEncoding validates --encoding flag; catalog ValidServerEncodingName
+      validates CREATE DATABASE ENCODING; all three tiers reject invalid/client-only
+      encoding names. Only actual byte-level transcoding remains unimplemented.
+      **pg_client_encoding() / getdatabaseencoding() builtins landed (2026-08-09, this loop):**
+      Both functions now return correct results through the executor funcCall dispatch.
+      pg_client_encoding() reads the live client_encoding GUC via GetSetting.
+      getdatabaseencoding() reads the encoding ID from catalog.InMemory.DatabaseEncoding
+      and maps it to a canonical name via catalog.EncodingIDToName. Tests:
+      TestEvalPgClientEncoding + TestEvalGetDatabaseEncoding
+      (internal/executor/encoding_builtins_test.go) and live-psql verification.
+      **client_encoding GUC validation landed (2026-08-09, previous loop):**
       SET client_encoding TO 'INVALID' now raises 22023 (invalid_parameter_value).
       Added CheckFn callback to config.Variable; checkClientEncoding resolves the
       value against the PG 18.3 pg_enc2name_tbl (42 canonical names + alias table),

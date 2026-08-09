@@ -3691,12 +3691,12 @@
    "code_audit": "RESOLVED (verified 2026-07-11, M0122-0004): duplicate-source detection is fully implemented and works across partition routing. internal/executor/operators_merge.go marks mods[].hasDuplicate when a second source row matches an already-matched target during the (per-partition-child) scan, and raises SQLSTATE 21000 'MERGE command cannot affect row a second time' AFTER applying the first modification (matching PG src/backend/executor/nodeModifyTable.c ExecMergeMatched). Confirmed via end-to-end probes for: non-partitioned UPDATE, non-partitioned DELETE, single-partition UPDATE, and the specific cross-partition-MOVE case (first source row's UPDATE relocates the row from ptgt1 to ptgt2, second matching source row still trips the guard). This loop also added PG's errhint 'Ensure that not more than one source row matches any one target row.' (previously omitted) and regression tests internal/executor/merge_dup_source_test.go (TestMergeDupSource{UpdateNonPartitioned,DeleteNonPartitioned,UpdateWithinOnePartition,CrossPartitionMove}) — the behavior had zero prior test coverage."
   },
   {
-   "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
-   "task_id": null,
-   "resume_point": null,
+   "feature": "Actual character-set encoding conversion (transcoding) between server and client",
+   "task_id": "M0122-0008",
+   "resume_point": "internal/initdb/encoding.go resolveEncoding + internal/catalog/encoding.go ValidServerEncodingName + internal/config/encoding_guc.go checkClientEncoding — all three validate encoding NAMES; none does actual byte-level conversion. Resume: port PG's mb/conversion_procs to Go.",
    "status": "open",
    "evidence": [
-    "No server-side encoding enforcement (on-disk PG-compat)"
+    "Encoding name validation (initdb --encoding, CREATE DATABASE ENCODING, SET client_encoding) all landed 2026-08-09; actual byte-level transcoding between character sets is still not implemented"
    ],
    "first_deferred_commit": "8f9ddf252dac8c87c8c20c3f4c9cac27cc62d988",
    "deferred_date": "2026-06-13",
@@ -3709,7 +3709,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: No character encoding constraint logic found in server bootstrap or runtime code"
+   "code_audit": "PARTIAL (2026-08-09): encoding NAME validation fully implemented at all three tiers (initdb resolveEncoding, catalog ValidServerEncodingName for CREATE DATABASE, config checkClientEncoding for GUC); pg_client_encoding() and getdatabaseencoding() builtins now return correct values through executor dispatch; actual byte-level transcoding between character sets remains unimplemented — goopg stores and forwards raw bytes without conversion"
   },
   {
    "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",
