@@ -385,9 +385,18 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `catalog.InMemory.LookupOpClassSupportProcOID`,
       `executor.btIndexOpClassComparator`. Gate:
       `TestBtIndexCheck_OpClassDamageDetected` (verified non-vacuous). Design:
-      `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`. Still
-      open for 005: single-int4-key-column-only dispatch (needs a general
-      encoded-key→Datum decoder) and the `--checkunique` tier — ledger row
+      `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`.
+      **Second slice landed 2026-08-10 — general key decode:** the
+      single-int4-key-column restriction is lifted. `btIndexOpClassComparator`
+      now walks a composite key column by column (upstream `_bt_compare`'s
+      contract) via the shared `decodeIndexKeyColumn`, so a user opclass on any
+      invertible type (int4/int8/float8/date/timestamp(tz)/text-like/enum) and
+      in any key position dispatches; columns without a user class keep byte
+      order for their own slice. Gates:
+      `TestBtIndexCheck_OpClassDamageDetectedText` +
+      `TestBtIndexCheck_OpClassDamageDetectedComposite`. Still open for 005:
+      the `--checkunique` tier, `INCLUDE`/expression key columns, and
+      non-invertible key types (NUMERIC, box/int4range/int4[]) — ledger rows
       2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`

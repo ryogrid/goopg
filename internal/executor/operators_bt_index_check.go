@@ -216,77 +216,113 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 // the other way. Verifying under the catalog-resolved function is what makes the
 // physically-unchanged index then report `item order invariant violated`.
 //
-// Scope (this slice): a single-key-column index on an int4 column whose declared
-// opclass resolves to a user routine. That is 005_opclass_damage's shape, and it
-// is the only one whose stored key bytes can be inverted back to the SQL datum
-// the function expects (btree.DecodeInt4). Wider coverage needs a general
-// encoded-key → Datum decoder per type; see the deferral ledger.
-// M0119-0006.
+// Scope: any index whose key columns are all plain (non-expression) columns of a
+// type the B-tree key decoder can invert (decodeIndexKeyColumn — int4/int8/
+// float8/date/timestamp(tz)/text-like/enum), with at least one key column
+// declaring a user opclass. Composite keys are compared column by column, each
+// under its own opclass — the column-wise contract of upstream's _bt_compare,
+// which walks scan-key attributes in order and stops at the first non-equal one.
+// Key columns that resolve to no user routine keep the engine's own byte order
+// for that column (their encoding IS the built-in opclass's order). Indexes with
+// INCLUDE columns are still declined — non-key attributes never participate in
+// ordering upstream, and goopg's covering-key layout for them is not yet part of
+// this decoder's contract. M0119-0006.
 func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Context, pos int) amcheck.KeyComparator {
-	if len(idx.Columns) != 1 || len(idx.IncludeColumns) > 0 || len(idx.ColOpClasses) < 1 {
-		return nil
-	}
-	className := idx.ColOpClasses[0]
-	if className == "" {
+	if len(idx.Columns) == 0 || len(idx.IncludeColumns) > 0 || idx.Table == nil {
 		return nil
 	}
 	method := idx.Method
 	if method == "" {
 		method = "btree"
 	}
-	procOID, ok := im.LookupOpClassSupportProcOID(className, catalog.AccessMethodOIDByName(method), 1)
-	if !ok {
-		return nil
+	type keyCol struct {
+		col     catalog.Column
+		routine *catalog.Routine // nil → this column keeps the engine's byte order
 	}
-	routine := ctx.Catalog.Routines().LookupByOID(procOID)
-	if routine == nil || len(routine.ArgTypes) != 2 {
-		return nil
-	}
-	// Only an int4 key column can be decoded back from its stored key bytes.
-	if idx.Table == nil {
-		return nil
-	}
-	isInt4 := false
-	for _, c := range idx.Table.Columns {
-		if strings.EqualFold(c.Name, idx.Columns[0]) {
-			switch strings.ToLower(c.Type.Name) {
-			case "int4", "integer", "int":
-				isInt4 = !c.Type.IsArray
-			}
-			break
+	cols := make([]keyCol, 0, len(idx.Columns))
+	anyRoutine := false
+	for i, name := range idx.Columns {
+		if name == "" {
+			// Expression key column: there is no catalog column whose type
+			// drives the key decode, so no column-wise inversion is possible.
+			return nil
 		}
+		var col *catalog.Column
+		for j := range idx.Table.Columns {
+			if strings.EqualFold(idx.Table.Columns[j].Name, name) {
+				col = &idx.Table.Columns[j]
+				break
+			}
+		}
+		if col == nil {
+			return nil
+		}
+		kc := keyCol{col: *col}
+		if i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+			if procOID, ok := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
+				catalog.AccessMethodOIDByName(method), 1); ok {
+				if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+					kc.routine = r
+					anyRoutine = true
+				}
+			}
+		}
+		cols = append(cols, kc)
 	}
-	if !isInt4 {
+	if !anyRoutine {
+		// Every key column resolves to a built-in class: the encoding already
+		// is that order, so nil (btree.CompareKeys) is the faithful answer and
+		// avoids a per-comparison decode.
 		return nil
 	}
 	return func(a, b []byte) int {
-		av, aerr := btree.DecodeInt4(a)
-		bv, berr := btree.DecodeInt4(b)
-		if aerr != nil || berr != nil {
-			// Not a plain int4 key: the negative-infinity pivot tuple on an
-			// internal page carries an empty key (findChildBlock), and a
-			// truncated separator may be shorter than the full encoding. Byte
-			// order is correct for those, exactly as it is for the leftmost
-			// downlink upstream treats as minus infinity.
-			return btree.CompareKeys(a, b)
+		ao, bo := 0, 0
+		for _, kc := range cols {
+			ad, an, aerr := decodeIndexKeyColumn(a[ao:], kc.col)
+			bd, bn, berr := decodeIndexKeyColumn(b[bo:], kc.col)
+			if aerr != nil || berr != nil || an <= 0 || bn <= 0 {
+				// Not a decodable key at this position: the negative-infinity
+				// pivot tuple on an internal page carries an empty key
+				// (findChildBlock), and a truncated separator may stop short of
+				// this column. Byte order over what remains is correct for
+				// those, exactly as it is for the leftmost downlink upstream
+				// treats as minus infinity.
+				return btree.CompareKeys(a[ao:], b[bo:])
+			}
+			if cmp := btIndexCompareKeyColumn(kc.routine, a[ao:ao+an], b[bo:bo+bn], ad, bd, ctx, pos); cmp != 0 {
+				return cmp
+			}
+			ao += an
+			bo += bn
 		}
-		res, err := executeStoredRoutine(routine,
-			[]Datum{NewIntDatum(int64(av)), NewIntDatum(int64(bv))}, ctx, pos)
-		if err != nil || res.IsNull() {
-			// A comparator that errors or returns NULL cannot decide the
-			// ordering; fall back rather than manufacture a bogus finding
-			// (upstream would ereport, but amcheck's contract here is
-			// report-and-continue over the whole index).
-			return btree.CompareKeys(a, b)
-		}
-		switch {
-		case res.Int < 0:
-			return -1
-		case res.Int > 0:
-			return 1
-		default:
-			return 0
-		}
+		// Equal on every key column: any trailing bytes decide, as they do for
+		// the engine's own comparator.
+		return btree.CompareKeys(a[ao:], b[bo:])
+	}
+}
+
+// btIndexCompareKeyColumn orders one key column: through the operator class's
+// FUNCTION 1 routine when the column declares a user class, otherwise by the
+// column's encoded bytes (which are the built-in class's order by construction).
+func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd Datum, ctx *Context, pos int) int {
+	if routine == nil {
+		return btree.CompareKeys(aRaw, bRaw)
+	}
+	res, err := executeStoredRoutine(routine, []Datum{ad, bd}, ctx, pos)
+	if err != nil || res.IsNull() {
+		// A comparator that errors or returns NULL cannot decide the ordering;
+		// fall back rather than manufacture a bogus finding (upstream would
+		// ereport, but amcheck's contract here is report-and-continue over the
+		// whole index).
+		return btree.CompareKeys(aRaw, bRaw)
+	}
+	switch {
+	case res.Int < 0:
+		return -1
+	case res.Int > 0:
+		return 1
+	default:
+		return 0
 	}
 }
 

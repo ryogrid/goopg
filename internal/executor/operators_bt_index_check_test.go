@@ -240,3 +240,105 @@ func TestBtIndexCheck_OpClassDamageDetected(t *testing.T) {
 		t.Errorf("got %q, want substring %q", err.Error(), want)
 	}
 }
+
+// TestBtIndexCheck_OpClassDamageDetectedText is the type-generalization half of
+// the M0119-0006 comparator dispatch: the same 005_opclass_damage shape on a
+// *text* key column. The first slice could only invert int4 key bytes, so a
+// user opclass on any other type silently fell back to the engine's byte order
+// and the damage went unreported. The key decode now runs through the shared
+// decodeIndexKeyColumn, so every type the B-tree can invert dispatches.
+func TestBtIndexCheck_OpClassDamageDetectedText(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION text_asc_cmp (a text, b text) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION text_desc_cmp (a text, b text) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS text_fickle_ops FOR TYPE text USING btree AS
+			OPERATOR 1 < (text, text), OPERATOR 2 <= (text, text),
+			OPERATOR 3 = (text, text), OPERATOR 4 >= (text, text),
+			OPERATOR 5 > (text, text), FUNCTION 1 text_asc_cmp(text, text)`,
+		"CREATE TABLE texttbl (t text)",
+		"INSERT INTO texttbl VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h')",
+		"CREATE INDEX ficklet ON texttbl USING btree (t text_fickle_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklet')"); err != nil {
+		t.Fatalf("healthy text index under a user operator class raised: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'text_desc_cmp'::regproc
+		WHERE amproc = 'text_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklet')")
+	if err == nil {
+		t.Fatal("broken text operator class not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "ficklet"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}
+
+// TestBtIndexCheck_OpClassDamageDetectedComposite covers the composite-key half:
+// a two-column index whose *second* key column carries the user opclass. The
+// comparator must walk the key column by column — decoding and skipping the
+// leading variable-length text column to reach the int4 column the damaged
+// support proc governs. The first slice declined any index with more than one
+// key column outright.
+func TestBtIndexCheck_OpClassDamageDetectedComposite(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION c_asc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION c_desc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS int4_fickle2_ops FOR TYPE int4 USING btree AS
+			OPERATOR 1 < (int4, int4), OPERATOR 2 <= (int4, int4),
+			OPERATOR 3 = (int4, int4), OPERATOR 4 >= (int4, int4),
+			OPERATOR 5 > (int4, int4), FUNCTION 1 c_asc_cmp(int4, int4)`,
+		"CREATE TABLE comptbl (t text, i int4)",
+		// One text value throughout, so the leading column is always equal and
+		// the damaged second-column comparator alone decides the order.
+		"INSERT INTO comptbl VALUES ('k',1), ('k',2), ('k',3), ('k',4), ('k',5), ('k',6), ('k',7), ('k',8)",
+		"CREATE INDEX ficklec ON comptbl USING btree (t, i int4_fickle2_ops)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklec')"); err != nil {
+		t.Fatalf("healthy composite index under a user operator class raised: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'c_desc_cmp'::regproc
+		WHERE amproc = 'c_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('ficklec')")
+	if err == nil {
+		t.Fatal("broken composite operator class not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "ficklec"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}

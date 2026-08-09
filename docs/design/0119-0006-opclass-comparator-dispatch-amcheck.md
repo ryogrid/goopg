@@ -79,15 +79,29 @@ rationale above.
 Called from `evalBtIndexCheck` and threaded through `btIndexVerify`. It returns
 non-nil only when all of the following hold:
 
-1. the index has exactly one key column and no `INCLUDE` columns;
-2. that column declares an explicit operator class (`idx.ColOpClasses[0]`);
-3. the class resolves through seam 2 to a routine (`Routines().LookupByOID`)
-   taking two arguments;
-4. the key column's type is `int4`.
+1. the index has no `INCLUDE` columns and every key column is a plain
+   (non-expression) column resolvable in `idx.Table.Columns`;
+2. **at least one** key column declares an explicit operator class
+   (`idx.ColOpClasses[i]`) that resolves through seam 2 to a routine
+   (`Routines().LookupByOID`) taking two arguments.
 
-The comparator decodes both stored keys with `btree.DecodeInt4` and calls the
-routine through `executeStoredRoutine` — the same path the hash-partitioning
-custom-opclass hash function already uses (`expr.go`, M0097-0027).
+The comparator walks the composite key **column by column**, which is the
+contract of upstream `_bt_compare`: it iterates the scan key's attributes in
+order and stops at the first non-equal one. Each column is decoded from the
+stored key bytes with the executor's shared
+`decodeIndexKeyColumn` — the same inverse-of-`encodeBTreeKeyForColumn` decoder
+the index-only scan uses, covering `int4`/`int8`/`float8`/`date`/
+`timestamp(tz)`/text-like/enum — and the column's own comparator decides:
+
+- a column that resolved to a user routine is compared by calling it through
+  `executeStoredRoutine` (the same path the hash-partitioning custom-opclass
+  hash function already uses, `expr.go`, M0097-0027);
+- a column that did not keeps `btree.CompareKeys` over **that column's** encoded
+  bytes — the built-in class's order by construction.
+
+Decoding returns the byte width consumed, which is what lets the walk advance
+past a leading variable-length column (e.g. `text`) to reach a later key column
+whose opclass was damaged.
 
 Two deliberate fallbacks to byte order inside the comparator:
 
@@ -102,11 +116,26 @@ Two deliberate fallbacks to byte order inside the comparator:
 
 ## Scope and deferral
 
-`int4`, single key column. That is 005_opclass_damage's shape and the only
-shape whose stored key bytes can be inverted back to the SQL datum the support
-function expects. Wider coverage needs a general encoded-key → `Datum` decoder
-per type (the inverse of `encodeBTreeKeyForColumn`), which does not exist;
-recorded in `.ralph/deferral_ledger.md`.
+**2026-08-10 (second slice).** The first slice restricted dispatch to a single
+`int4` key column, because it inverted key bytes with a hand-rolled
+`btree.DecodeInt4` call. That restriction is lifted: the walk now delegates to
+`decodeIndexKeyColumn`, so every type that decoder inverts, in any position of a
+composite key, dispatches to its declared opclass.
+
+Still out of scope:
+
+- **`INCLUDE` columns.** Non-key attributes never participate in ordering
+  upstream, and goopg's covering-key byte layout for them is not part of this
+  decoder's contract; such an index declines dispatch entirely rather than risk
+  mis-slicing the key.
+- **Expression key columns** (`Columns[i] == ""`): there is no catalog column
+  whose type drives the decode.
+- **Types the key decoder cannot invert** (e.g. `NUMERIC`, whose encoding is
+  documented as deliberately one-way, and `box`/`int4range`/`int4[]`). These hit
+  the per-column decode-failure fallback and keep byte order for that column, so
+  they are never a false positive — only a missed detection. Recorded in
+  `.ralph/deferral_ledger.md`.
+- **The `--checkunique` tier**, tracked separately under M0119-0006.
 
 Cost: one SQL-function call per key comparison on the pages of an index that
 declares a user opclass. Acceptable for a corruption check, and zero for every
@@ -122,5 +151,12 @@ index that does not (the comparator is nil and never allocated).
   and the test fails.
 - The no-false-positive half (a healthy index under a user opclass must not
   raise) is the load-bearing assertion of the pair.
+- Second slice (2026-08-10):
+  `TestBtIndexCheck_OpClassDamageDetectedText` (user opclass on a `text` key
+  column) and `TestBtIndexCheck_OpClassDamageDetectedComposite` (two-column
+  `(text, int4 int4_fickle2_ops)` index, damage on the *trailing* column) —
+  both shapes the first slice declined outright and therefore reported clean.
+  Each keeps the clean-then-damaged pair, so the no-false-positive half is
+  asserted for the widened surface too.
 - `go test ./internal/amcheck/... ./internal/catalog/...` and the existing
   `TestBtIndexCheck_*` suite PASS unchanged.
