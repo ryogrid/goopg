@@ -2909,7 +2909,7 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			}
 			cols[i] = catalog.Column{
 				Name:    ar.AttName,
-				Type:    catalog.Type{Name: catalog.OIDToTypeName(typOID), IsArray: isArray},
+				Type:    catalog.Type{Name: catalog.OIDToTypeName(typOID), Args: pgTypeArgsFromTypmod(typOID, int64(ar.AttTypMod)), IsArray: isArray},
 				NotNull: ar.AttNotNull,
 				Ordinal: i,
 				// B1.3b: attidentity round-trips through the heap (the
