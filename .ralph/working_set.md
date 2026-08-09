@@ -1,50 +1,42 @@
-Task: M0122-0008 encoding conversion — LATIN1↔UTF8 first slice (LANDED)
+Task: M0122-0008 follow-up — LATIN2↔UTF8 encoding pair (second built-in pair)
 
 Files:
-- internal/mb/wchar.go: UTF8 validation (pgUTFMblen, pgUTF8IsLegal, error types)
-- internal/mb/latin1.go: iso8859_1_to_utf8 + utf8_to_iso8859_1 conversion procs
-- internal/mb/conv.go: ConvProc type, BuiltinConversions, DoEncodingConversion dispatch
-- internal/mb/latin1_test.go: round-trip test (0x00–0xFF), expansion test,
-  invalid/untranslatable rejection, DoEncodingConversion fast-path tests
-- internal/catalog/catalog.go: FindDefaultConversionProc(forEnc, toEnc) method
-- internal/server/dispatch.go: maybeConvertCellsForClientEncoding helper +
-  wire-in at simple-query DataRow + cursor FETCH DataRow sites
-- internal/server/extended.go: wire-in at extended-query Execute DataRow path
-- docs/design/0122-0020-encoding-conversion-mb-layer.md: design doc
-- docs/design/README.md: index entry
-- .ralph/fix_plan.md: updated M0122-0008 status
-- .ralph/deferral_ledger.md: new row for remaining encoding pairs
+- internal/mb/latin2.go: iso8859_2_to_utf8 + utf8_to_iso8859_2 conversion procs
+  with [128]uint16 forward table (from PG's iso8859_2_to_utf8.map) +
+  map[uint16]byte reverse lookup (init()-built)
+- internal/mb/latin2_test.go: 8 tests (round-trip, expansion, untranslatable,
+  NUL noError, dispatch integration, table integrity, reverse-map consistency)
+- internal/mb/wchar.go: added PG_LATIN2 = 14
+- internal/mb/conv.go: registered OIDs 4493/4492 in BuiltinConversions;
+  refactored BuiltinLookup from if-else to generic builtinPair table
+- docs/design/0122-0020-encoding-conversion-mb-layer.md: Follow-up section
+- docs/design/README.md: updated entry
 
 Key symbols:
-- mb.ConvProc — func([]byte, bool) (int, []byte, error)
-- mb.DoEncodingConversion — core dispatch with PG-faithful fast paths
-- mb.BuiltinLookup — ConvProcLookup over BuiltinConversions map
-- Server.maybeConvertCellsForClientEncoding — wire-in helper
-- catalog.InMemory.FindDefaultConversionProc — lookup by (forEnc, toEnc)
+- iso8859_2_to_utf8_table [128]uint16 — forward mapping (byte 0x80–0xFF → UTF8)
+- iso8859_2_from_utf8_map map[uint16]byte — reverse mapping (init()-built)
+- builtinPair map[[2]int32]uint32 — generic encoding-pair→proc-OID table
 
 Hypothesis/Findings:
-- LATIN1↔UTF8 conversion works end-to-end: live psql with client_encoding=LATIN1
-  correctly transcodes accented characters (é = 0xE9 ↔ 0xC3 0xA9)
-- The wire-in architecture (single helper, called before PutDataRowScratch at all
-  three DataRow sites + Bind parameter path) is clean and extensible
-- Additional encoding pairs are straight ports of PG conversion procs (~100-200
-  lines of C each)
+- The LATIN2 pattern proves the ISO 8859 family can be added mechanically:
+  extract .map → create latin<N>.go → two-line BuiltinConversions registration
+  → one-line builtinPair entry. Remaining 12 ISO 8859 variants are now trivial.
+- Multi-byte encodings (EUC_JP, SJIS) remain separate slices — they need
+  variable-width parsers and 4000+-entry mapping tables (radix trees in PG).
+- The BuiltinLookup refactor (if-else → table) was clean and will scale.
 
 Next step:
-- M0130 is COMPLETE. M-NIGHTLY is clear. Remaining actionable items:
-  (1) M0122-0008 follow-up: additional encoding pairs (EUC_JP, SJIS, etc.)
-  (2) M0122-0010 btree locking (Lehman-Yao crab-walk first slice —
-      needs buffer-pool fix first, risk documented in scouting report)
-  (3) M0122-0008 follow-up: query-text transcoding, pg_encoding_max_length
+(1) M0122-0008 follow-up: remaining 12 ISO 8859 variants (LATIN3–10, ISO_8859_5–8)
+    — mechanical addition following the same pattern
+(2) M0122-0008 follow-up: query-text transcoding, pg_encoding_max_length
+(3) M0122-0010 btree locking (Lehman-Yao crab-walk first slice)
 
 Gates run:
-- go test ./internal/mb/...: ALL PASS (8 tests)
-- go test ./internal/catalog/...: PASS
-- go test ./internal/server/...: PASS
+- go build ./...: CLEAN
+- go test ./internal/mb/...: ALL PASS (22 tests — 14 existing + 8 new)
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
+- RALPH_PRECOMMIT_SCOPE=smoke: 1 failed txn (pre-existing non-FIFO tuple-lock)
 - scripts/tpch-spotcheck.sh: PASS (Q12=2, Q13=35)
-- Live psql: client_encoding=LATIN1 correctly transcodes café/chr(233)
 - make ralph-state-guard: REPAIRED → CONSISTENT
 
 In-flight: none

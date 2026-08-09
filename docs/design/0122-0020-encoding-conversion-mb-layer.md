@@ -174,7 +174,45 @@ conversions (CREATE CONVERSION) are also visible.
   ASCII-safe for practical SQL; the Bind parameter path is the critical one
   because parameter values can contain arbitrary byte sequences).
 
-## Test plan
+## Follow-up: LATIN2↔UTF8 (2026-08-09)
+
+Added the second built-in encoding pair: ISO 8859-2 (LATIN2, PG encoding ID 14).
+
+### What changed
+
+- `internal/mb/latin2.go` — `iso8859_2_to_utf8` and `utf8_to_iso8859_2`
+  conversion procs (proc OIDs 4493/4492). Uses a `[128]uint16` forward mapping
+  table (generated from PG's `iso8859_2_to_utf8.map`) and a `map[uint16]byte`
+  reverse lookup (built at init() from the forward table).
+- `internal/mb/latin2_test.go` — 8 tests: full 0x00–0xFF round-trip, byte
+  expansion, untranslatable rejection (3-byte UTF8 + unmapped 2-byte), NUL
+  handling, DoEncodingConversion integration, forward-table integrity
+  (bijection), and reverse-map consistency.
+- `internal/mb/wchar.go` — added `PG_LATIN2 = 14` constant.
+- `internal/mb/conv.go` — registered OIDs 4493/4492 in `BuiltinConversions`;
+  refactored `BuiltinLookup` from inline if-else to a generic `builtinPair`
+  table so adding more pairs is a single-line table entry.
+
+### Pattern for further pairs
+
+Adding another ISO 8859 variant (LATIN3–LATIN10, ISO_8859_5–8) now requires:
+1. Extract the `[128]uint16` forward table from PG's corresponding `.map` file.
+2. Create `latin<N>.go` with the table + two conversion functions following
+   the same template as `latin2.go`.
+3. Add two lines to `BuiltinConversions` (proc OIDs) and one line to
+   `builtinPair` (encoding pair → OID).
+4. Add `PG_LATIN<N>` constant to `wchar.go`.
+5. Add tests following the `latin2_test.go` template.
+
+Multi-byte encodings (EUC_JP, SJIS, GBK, BIG5) are structurally different —
+they need variable-width encoding parsers and much larger mapping tables
+(radix trees in PG, ~4000+ entries each). Those are separate slices.
+
+### Remaining encoding pairs
+
+All 14 ISO 8859 variants beyond LATIN1/2 and the 4 ISO_8859_5–8 variants can
+now be added mechanically. The mapping tables exist in
+`postgres/src/backend/utils/mb/Unicode/iso8859_<N>_to_utf8.map`.
 
 1. `internal/mb/latin1_test.go`: byte-for-byte round-trip: every 0x00–0xFF
    byte → iso8859_1_to_utf8 → utf8_to_iso8859_1 → original byte. Validate

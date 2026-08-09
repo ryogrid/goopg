@@ -26,6 +26,8 @@ type ConvProc func(src []byte, noError bool) (consumed int, dest []byte, err err
 var BuiltinConversions = map[uint32]ConvProc{
 	4374: iso8859_1_to_utf8,
 	4375: utf8_to_iso8859_1,
+	4493: iso8859_2_to_utf8,
+	4492: utf8_to_iso8859_2,
 }
 
 // DoEncodingConversion converts src from srcEnc to destEnc.
@@ -101,18 +103,24 @@ func (e *ErrConversionNotFound) Error() string {
 
 // BuiltinLookup is a ConvProcLookup that only checks BuiltinConversions.
 // Useful for testing and as a fallback.
+// builtinPair maps (srcEnc, destEnc) pairs to proc OIDs in BuiltinConversions.
+var builtinPair = map[[2]int32]uint32{
+	{PG_LATIN1, PG_UTF8}: 4374,
+	{PG_UTF8, PG_LATIN1}: 4375,
+	{PG_LATIN2, PG_UTF8}: 4493,
+	{PG_UTF8, PG_LATIN2}: 4492,
+}
+
+// BuiltinLookup is a ConvProcLookup that only checks BuiltinConversions.
+// Useful for testing and as a fallback.
 func BuiltinLookup(srcEnc, destEnc int32) (ConvProc, error) {
-	// The built-in pg_conversion bootstrap rows map specific proc OIDs
-	// to encoding pairs. For the first slice, we only have LATIN1↔UTF8.
-	// The full catalog lookup (FindDefaultConversionProc) will be added
-	// to internal/catalog/.
-	if (srcEnc == PG_LATIN1 && destEnc == PG_UTF8) || (srcEnc == PG_UTF8 && destEnc == PG_LATIN1) {
-		// LATIN1→UTF8 = proc OID 4374, UTF8→LATIN1 = proc OID 4375
-		// Both are registered in BuiltinConversions above.
-		if srcEnc == PG_LATIN1 {
-			return BuiltinConversions[4374], nil
-		}
-		return BuiltinConversions[4375], nil
+	oid, ok := builtinPair[[2]int32{srcEnc, destEnc}]
+	if !ok {
+		return nil, &ErrConversionNotFound{SrcEnc: srcEnc, DestEnc: destEnc}
 	}
-	return nil, &ErrConversionNotFound{SrcEnc: srcEnc, DestEnc: destEnc}
+	proc, ok := BuiltinConversions[oid]
+	if !ok {
+		return nil, &ErrConversionNotFound{SrcEnc: srcEnc, DestEnc: destEnc}
+	}
+	return proc, nil
 }

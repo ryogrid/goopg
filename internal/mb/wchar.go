@@ -12,6 +12,7 @@ const (
 	PG_SQL_ASCII = 0
 	PG_UTF8      = 6
 	PG_LATIN1    = 8
+	PG_LATIN2    = 14
 )
 
 // MAX_CONVERSION_GROWTH is the worst-case byte expansion for any
