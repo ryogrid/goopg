@@ -3445,6 +3445,26 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		} else if matched {
 			// handled by parseTableConstraintElement
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot &&
+			p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwNull {
+			// Standalone NOT NULL colname column constraint — pg_dump emits
+			// these for inherited NOT NULL columns in CREATE TABLE ...
+			// INHERITS (...). The column is inherited from the parent and
+			// only the NOT NULL constraint is redeclared. DU-002 (M0119-0004).
+			p.advance() // NOT
+			p.advance() // NULL
+			colNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			col := ColumnDef{Name: identText(colNameTok), NotNull: true}
+			// Optional NO INHERIT
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				col.NotNullNoInherit = true
+			}
+			stmt.Columns = append(stmt.Columns, col)
+			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
 			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
 			p.advance() // consume LIKE

@@ -1223,3 +1223,94 @@ func TestParseColumnDefCollation(t *testing.T) {
 		t.Errorf("col[1].NotNull=false, want true (COLLATE consumed the NOT NULL)")
 	}
 }
+
+// TestParseStandaloneNotNullColumnConstraint verifies that a bare
+// `NOT NULL colname` column-constraint element (as emitted by pg_dump for
+// inherited NOT NULL columns in CREATE TABLE ... INHERITS) is parsed as a
+// ColumnDef with Name=colname, NotNull=true, and empty Type. Also covers
+// `NOT NULL colname NO INHERIT`. DU-002 (M0119-0004).
+func TestParseStandaloneNotNullColumnConstraint(t *testing.T) {
+	// Basic form — single NOT NULL constraint element
+	sql := "CREATE TABLE child (NOT NULL pid, name text) INHERITS (parent)"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if len(ct.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ct.Columns))
+	}
+	// First column should be the NOT NULL constraint-only entry
+	if ct.Columns[0].Name != "pid" {
+		t.Errorf("col[0].Name=%q, want %q", ct.Columns[0].Name, "pid")
+	}
+	if !ct.Columns[0].NotNull {
+		t.Errorf("col[0].NotNull=false, want true")
+	}
+	if ct.Columns[0].Type.Name != "" {
+		t.Errorf("col[0].Type.Name=%q, want empty (constraint-only)", ct.Columns[0].Type.Name)
+	}
+	if ct.Columns[0].NotNullNoInherit {
+		t.Errorf("col[0].NotNullNoInherit=true, want false")
+	}
+	// Second column should be a normal typed column
+	if ct.Columns[1].Name != "name" {
+		t.Errorf("col[1].Name=%q, want %q", ct.Columns[1].Name, "name")
+	}
+	if ct.Columns[1].Type.Name != "text" {
+		t.Errorf("col[1].Type.Name=%q, want %q", ct.Columns[1].Type.Name, "text")
+	}
+	// INHERITS should be parsed
+	if len(ct.Inherits) != 1 || ct.Inherits[0].Name != "parent" {
+		t.Errorf("Inherits=%v, want [parent]", ct.Inherits)
+	}
+
+	// Form with NO INHERIT
+	sql2 := "CREATE TABLE child2 (NOT NULL pid NO INHERIT) INHERITS (parent)"
+	stmts2, err2 := Parse(sql2)
+	if err2 != nil {
+		t.Fatalf("Parse NO INHERIT form: %v", err2)
+	}
+	ct2 := stmts2[0].(*CreateTableStmt)
+	if !ct2.Columns[0].NotNull {
+		t.Errorf("NO INHERIT form: NotNull=false, want true")
+	}
+	if !ct2.Columns[0].NotNullNoInherit {
+		t.Errorf("NO INHERIT form: NotNullNoInherit=false, want true")
+	}
+
+	// Multiple NOT NULL constraint elements
+	sql3 := "CREATE TABLE child3 (NOT NULL a, NOT NULL b, c integer) INHERITS (parent)"
+	stmts3, err3 := Parse(sql3)
+	if err3 != nil {
+		t.Fatalf("Parse multi NOT NULL: %v", err3)
+	}
+	ct3 := stmts3[0].(*CreateTableStmt)
+	if len(ct3.Columns) != 3 {
+		t.Fatalf("multi NOT NULL: expected 3 columns, got %d", len(ct3.Columns))
+	}
+	if ct3.Columns[0].Name != "a" || !ct3.Columns[0].NotNull || ct3.Columns[0].Type.Name != "" {
+		t.Errorf("multi NOT NULL col[0]: Name=%q NotNull=%v Type=%q", ct3.Columns[0].Name, ct3.Columns[0].NotNull, ct3.Columns[0].Type.Name)
+	}
+	if ct3.Columns[1].Name != "b" || !ct3.Columns[1].NotNull || ct3.Columns[1].Type.Name != "" {
+		t.Errorf("multi NOT NULL col[1]: Name=%q NotNull=%v Type=%q", ct3.Columns[1].Name, ct3.Columns[1].NotNull, ct3.Columns[1].Type.Name)
+	}
+	if ct3.Columns[2].Name != "c" || ct3.Columns[2].Type.Name != "integer" {
+		t.Errorf("multi NOT NULL col[2]: Name=%q Type=%q", ct3.Columns[2].Name, ct3.Columns[2].Type.Name)
+	}
+
+	// Empty column list with only NOT NULL constraints — valid PG syntax
+	// for a child that only redeclares NOT NULL on inherited columns.
+	sql4 := "CREATE TABLE child4 (NOT NULL pid) INHERITS (parent)"
+	stmts4, err4 := Parse(sql4)
+	if err4 != nil {
+		t.Fatalf("Parse NOT-NULL-only column list: %v", err4)
+	}
+	ct4 := stmts4[0].(*CreateTableStmt)
+	if len(ct4.Columns) != 1 || ct4.Columns[0].Name != "pid" || !ct4.Columns[0].NotNull {
+		t.Errorf("NOT-NULL-only: col=%+v", ct4.Columns[0])
+	}
+}

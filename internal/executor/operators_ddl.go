@@ -2031,13 +2031,43 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			} else {
 				c, ok := colByName[strings.ToLower(item)]
 				if ok {
-					addCol(c)
+					if c.Type.Name == "" {
+						// Constraint-only column (e.g. NOT NULL colname from
+						// pg_dump for inherited columns). Merge the NOT NULL
+						// constraint into the already-inherited column instead
+						// of adding a duplicate. DU-002 (M0119-0004).
+						for i := range cols {
+							if strings.EqualFold(cols[i].Name, c.Name) {
+								if c.NotNull {
+									cols[i].NotNull = true
+								}
+								break
+							}
+						}
+					} else {
+						addCol(c)
+					}
 				}
 			}
 		}
 	} else {
 		// Fallback: no BodyOrder (e.g. empty column list or old path).
 		for _, c := range s.Columns {
+			if c.Type.Name == "" {
+				// Constraint-only column (e.g. NOT NULL colname from
+				// pg_dump for inherited columns). Merge into the
+				// already-inherited column instead of adding a duplicate.
+				// DU-002 (M0119-0004).
+				for i := range cols {
+					if strings.EqualFold(cols[i].Name, c.Name) {
+						if c.NotNull {
+							cols[i].NotNull = true
+						}
+						break
+					}
+				}
+				continue
+			}
 			typeName := strings.ToLower(c.Type.Name)
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
