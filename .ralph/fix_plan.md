@@ -619,10 +619,34 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       + `TestArrayIndex{BuildAndMaintainKeys,CompositeKeyIsSelfDelimiting}`,
       the orderings captured from the PG 18.3 reference cluster, all five
       confirmed non-vacuous.
+      **Slice landed 2026-08-10 (13th) — `int2`/`oid`/`bool`/`bytea`/`time` key
+      encodings** (design `docs/design/0119-0006-scalar-index-key-encodings.md`).
+      Five ordinary PG types could not be indexed AT ALL — `isSupportedBTreeKeyType`
+      rejected them, so even `PRIMARY KEY (smallint_col)` raised `0A000 btree v0
+      only supports int4 / numeric keys`. New `internal/executor/btree_scalar_keys.go`
+      encodes each to its DEFAULT-OPCLASS order (captured from the PG 18.3
+      reference cluster, not read off the comparators): int2 widens to the
+      signed int4 key; **`oid` widens to the INT8 key because `oidcmp` compares
+      UNSIGNED** — the obvious int4 key sorts every OID ≥ 2³¹ below OID 0;
+      bool = int4 key of 0/1; bytea rides `EncodeVarchar`, whose escaped
+      `0x00`-terminated form is exactly `byteacmp` (memcmp, then shorter-first)
+      for arbitrary bytes, so an embedded NUL cannot forge the terminator and
+      bytea is safe as a composite key column; `time` = int64 micros-of-day via
+      the codec's own `pgTimeMicros`. `timetz` is deliberately DECLINED (its
+      `timetz_cmp_internal` is two-part: time-minus-zone, then zone). Both
+      key-decode siblings route to one shared decoder BEFORE their own switches —
+      their common `default:` arm reads any 8 leading bytes as an enum float8
+      and never errors, so an 8-byte oid/time key would otherwise decode as a
+      bogus enum. Gates: `TestEncodeScalarBTreeKeyMatchesPGOrder`,
+      `TestScalarBTreeKeyProbeMatchesStoredKey`,
+      `TestScalarBTreeKeyDecodeSiblingParity`,
+      `TestScalarIndexBuildAndMaintainKeys` (both stored-key writers, physical
+      `btree.RangeScan` counts), `TestByteaIndexKeyIsSelfDelimiting`,
+      `TestTimeTzIndexKeyDeclined` — all non-vacuous. 2 ledger rows (timetz;
+      and the INSERT-path gap this surfaced: `VALUES ('true')` into a bool
+      column raises XX000 because the codec bool arm demands `KindBool`).
       Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range`/`interval` key encodings (and
-      `smallint`/`bool`/`oid`/`time`/`bytea`, which `isSupportedBTreeKeyType`
-      also rejects outright — discovered while probing the array gap), the
+      checkunique tier, `box`/`int4range`/`interval`/`timetz` key encodings, the
       array DECODE arm for the opclass comparator, and the whole-database
       (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 

@@ -1,45 +1,44 @@
 (idle — nothing in flight)
 
-Last loop: M0119-0006 11th slice — ENUM expression index key encoding, made
-type-directed. COMPLETE and committed.
+Last loop: M0119-0006 13th slice — B-tree key encodings for `int2`/`oid`/`bool`/
+`bytea`/`time`. COMPLETE and committed, pushed.
 
-The defect: `encodeArbiterExprKey` dispatches on the runtime Datum KIND, and an
-expression key column has no catalog column, so the `KindString`→`KindEnum`
-conversion every enum COLUMN path performs (M0097-0022) never ran. The raw label
-was written with `EncodeVarchar`, so every enum expression index came out in
-ALPHABETICAL label order instead of `enumsortorder` (declaration) order —
-`enum_ops` compares by enumsortorder (`enum_cmp`, PG `utils/adt/enum.c`). Over
-`ENUM ('sad','ok','happy')` a real build stored `686170707900`/`6f6b00`/
-`73616400`, the exact reverse of the type's order. Latent second half: a datum
-that DID arrive as `KindEnum` (seq-scan injects those) wrote 8 float bytes into
-the same index as variable-width label bytes — the float slice's
-non-interleaving-byte-space shape.
+The defect: `isSupportedBTreeKeyType` rejected all five, so `CREATE INDEX` (even
+a `PRIMARY KEY (smallint_col)`) raised `0A000 btree v0 only supports int4 /
+numeric keys`. Not a corner — pg_amcheck's own upstream fixtures index `oid`.
 
-Fix mirrors the float arm: `encodeArbiterExprKey` gained a `*Context` first
-param (all 3 call sites had one), `exprKeyEnumType` resolves
-`planner.ExprResultType`'s name via `catalog.InMemory.LookupEnum`, and
-`enumSortOrderForKey` maps either kind onto the sort order → `EncodeFloat8`.
+Fix: new `internal/executor/btree_scalar_keys.go` — predicates + one encoder
+(`encodeScalarBTreeKey`, routed from `encodeBTreeKeyForColumn` before its type
+switch), one unknown-literal coercer (`coerceScalarKeyStringDatum`, reusing
+`byteaIn`/`parseTimeString`/`evalCast`), one decoder (`decodeScalarBTreeKey`)
+that BOTH key-decode siblings (`decodeIndexKeyColumn`, `decodeBTreeKeyToDatum`)
+route to before their own switches — their shared `default:` arm reads any 8
+leading bytes as an enum float8 and never errors, so an 8-byte oid/time key would
+otherwise decode as a bogus enum. Orders reproduce the default opclass, NOT the
+text: **oid widens to the INT8 key because `oidcmp` is UNSIGNED** (int4 would
+sort OIDs ≥ 2³¹ below OID 0); bytea rides `EncodeVarchar` (escaped,
+0x00-terminated = `byteacmp` memcmp-then-shorter-first, NUL-safe, composite-safe);
+time = int64 micros-of-day. `timetz` DECLINED (two-part comparison).
 
-Method note worth carrying: a ~40-line throwaway `zz_probe_*_test.go` that
-builds the index and `RangeScan`s the physical tree, logging `len(key)`/hex, is
-the fastest way to see an encoding defect — the wrong order was obvious in the
-key bytes before any theory. Same trick works for the remaining key types.
+Method note: the PG reference cluster was already running — connect by ABSOLUTE
+socket path: `postgres/local_install/bin/psql -h
+/home/ryo/work/goopg/goopg/bench/tpch/runtime/sockets -p 65432 -U postgres -d
+tpch` (a relative `-h` is treated as a hostname and fails to resolve).
 
-Design: `docs/design/0119-0006-expression-index-enum-key.md` (+ README row
-`0119-0006f`). 1 ledger row: the DECODE side still declines enums, so amcheck's
-opclass comparator declines any index carrying an enum expression key.
+Design: `docs/design/0119-0006-scalar-index-key-encodings.md` (+ README row
+`0119-0006h`). 2 ledger rows (timetz; and the INSERT-path gap this surfaced —
+`VALUES ('true')` into a bool column raises XX000, codec bool arm demands
+KindBool).
 
-Gates run: `TestEncodeArbiterExprKeyEnumIsTypeDirected` +
-`TestExpressionIndexBuildEnumKey` PASS (both proven non-vacuous by disabling the
-new arm); `go test ./internal/executor/ ./internal/access/btree/
-./internal/planner/` PASS; units precommit PASS; `scripts/tpch-spotcheck.sh`
-PASS (Q12 rows=2, Q13 rows=35); pgbench hook PASS at commit;
-`make ralph-state-guard` OK (auto-repaired the stale completed marker).
+Gates run: 6 new tests PASS, non-vacuous (routing disabled ⇒ all fail);
+`go test ./internal/executor/ ./internal/access/btree/ ./internal/planner/` PASS;
+units precommit PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35);
+pgbench hook PASS at commit; `make ralph-state-guard` OK (auto-repaired the stale
+completed marker).
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M0130 is all `[x]` and M-NIGHTLY has no open item. Remaining M0119-0006 work:
-checkunique posting-list duplicates, `box`/`int4range`/`int4[]`/`interval` key
-encodings (no encoder arm at all), unscoped whole-DB pg_amcheck, and the enum
-DECODE seam from this loop's ledger row.
+M0130 all `[x]`; M-NIGHTLY run 20260809-020705 fully triaged (all 49 filed/closed).
+Remaining M0119-0006: checkunique posting-list duplicates, `box`/`int4range`/
+`interval`/`timetz` encodings, the array DECODE arm, unscoped whole-DB pg_amcheck.
 
 In-flight: none.

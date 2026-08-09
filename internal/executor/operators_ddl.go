@@ -10946,7 +10946,19 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			// Leave unparseable strings as-is; the kind checks below produce
 			// the existing 42804 for a genuinely non-coercible probe.
 			v = tryParseStringAs(KindTime, v.StringValue())
+		default:
+			// int2 / oid / bool / bytea / time probes (btree_scalar_keys.go).
+			coerced, cErr := coerceScalarKeyStringDatum(v, col, pos)
+			if cErr != nil {
+				return nil, cErr
+			}
+			v = coerced
 		}
+	}
+	// int2 / oid / bool / bytea / time — see btree_scalar_keys.go for why each
+	// encoding is what it is (the type's default opclass order, not its text).
+	if k, handled, encErr := encodeScalarBTreeKey(v, col, pos); handled {
+		return k, encErr
 	}
 	switch {
 	case isInt4Type(col.Type.Name):
@@ -11233,6 +11245,9 @@ func isSupportedBTreeKeyType(name string) bool {
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
 		isTimestamptzType(name) || isDateType(name) || isFloat8Type(name) ||
+		// int2 / oid / bool / bytea / time — M0119-0006 (btree_scalar_keys.go).
+		isInt2Type(name) || isOidType(name) || isBoolType(name) ||
+		isByteaType(name) || isTimeOfDayType(name) ||
 		strings.ToLower(name) == "uuid"
 }
 

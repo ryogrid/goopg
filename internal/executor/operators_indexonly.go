@@ -399,6 +399,12 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
 	// `len(b) == width`, which fails when the multi-column loop passes
 	// the still-trailing remainder of a composite key.
+	// int2 / oid / bool / bytea / time (btree_scalar_keys.go). Routed BEFORE the
+	// switch below so neither of these types can reach the `default:` arm, which
+	// reads any 8 leading bytes as an enum float8 without ever erroring.
+	if d, n, handled, err := decodeScalarBTreeKey(key, typeName); handled {
+		return d, n, err
+	}
 	switch {
 	case isInt4Type(typeName):
 		if len(key) < 4 {
@@ -502,6 +508,12 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	typeName := col.Type.Name
+	// Sibling of decodeIndexKeyColumn's routing — both must invert
+	// encodeScalarBTreeKey, or an int2/oid/bool/bytea/time key column decodes
+	// one way in a single-column IOS and another way in a composite one.
+	if d, _, handled, err := decodeScalarBTreeKey(key, typeName); handled {
+		return d, err
+	}
 	switch {
 	case isInt4Type(typeName):
 		v, err := btree.DecodeInt4(key)
