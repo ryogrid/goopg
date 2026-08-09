@@ -772,6 +772,14 @@ type Context struct {
 	// unblock).
 	PgTSDictRows func() [][]string
 
+	// PgTSConfigRows mirrors PgTSDictRows above for the pg_ts_config catalog
+	// table: it lists CurrentDatabaseOid's own CREATE TEXT SEARCH
+	// CONFIGURATION'd configurations rather than always DefaultDBOid's
+	// (catalog.InMemory's PGTSConfigRowsForDBOid). Wired by the server to
+	// close over CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	PgTSConfigRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

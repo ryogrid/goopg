@@ -269,6 +269,12 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// mirrors the pg_conversion branch above. M0122-0007 4e
 			// follow-up (DU-002 round-trip probe unblock).
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTSDictRows())
+		} else if tbl.Name == "pg_ts_config" && ctx != nil && ctx.PgTSConfigRows != nil {
+			// pg_ts_config must list the connecting database's own CREATE TEXT
+			// SEARCH CONFIGURATION'd configurations, not always DefaultDBOid's
+			// — mirrors the pg_ts_dict branch above. M0122-0007 4e
+			// follow-up (DU-002 round-trip probe unblock).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTSConfigRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

@@ -1,37 +1,40 @@
-Task: M0119-0010 — char(N) typmods not restored per column on catalog reload — FIXED
+Task: M0122-0007 — pg_ts_config per-DB routing (landed)
 
 Files:
-- internal/catalog/codec.go: added pgAttributeOffTypMod=76 constant,
-  AttTypMod int32 field on PGAttributeRow, decoding in
-  DecodePGAttributePhysicalRow at offset 76.
-- internal/initdb/open.go: loadUserTablesFromHeapForDB now calls
-  pgTypeArgsFromTypmod(typOID, ar.AttTypMod) to reconstruct Type.Args.
-- internal/initdb/heap_catalog_load_test.go: added
-  TestBpCharVarcharTypModRestoredAfterRestart regression test.
+- internal/catalog/catalog.go: UserTSConfig.DBOid field, CreateTSConfig/FindTSConfig/DropTSConfig dbOid variadic params, ListUserTSConfigs dbOid filtering, PGTSConfigRowsForDBOid method, CreateTSConfigDuringRecovery DBOid fallback, pgTSConfig/pgTSConfigMap VirtualRows update
+- internal/executor/operators_ddl.go: 10 call sites updated to pass catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+- internal/initdb/catalog_heap_reload.go: UserTSConfig literal includes DBOid: cat.DBOID()
+- internal/server/dispatch.go: pgTSConfigRowLister interface + wireExtensionRows PgTSConfigRows
+- internal/executor/context.go: PgTSConfigRows field
+- internal/executor/operators.go: pg_ts_config per-connection override
+- internal/catalog/create_tsconfig_dbscope_test.go: cross-DB isolation test (PASS)
+- test files updated: tsconfig_replacedict, tsconfig_rename_setschema_dropmapping, tsconfig_copy
 
-Key symbols: PGAttributeRow.AttTypMod, DecodePGAttributePhysicalRow,
-loadUserTablesFromHeapForDB, pgTypeArgsFromTypmod, coerceTextLikeDatum
+Key symbols:
+- catalog.UserTSConfig (new DBOid field)
+- catalog.PGTSConfigRowsForDBOid (new method, mirrors PGTSDictRowsForDBOid)
+- server.pgTSConfigRowLister (new interface)
+- executor.Context.PgTSConfigRows (new field)
 
 Hypothesis/Findings:
-- ROOT CAUSE: DecodePGAttributePhysicalRow never decoded atttypmod
-  (offset 76), so loadUserTablesFromHeapForDB set Args: nil on every
-  column. coerceTextLikeDatum defaulted to n=1, so every reloaded
-  char(N) was length-checked as char(1).
-- FIX: 3 lines of code + 1 test. pgTypeArgsFromTypmod already existed
-  for the domain-reload path (catalog_heap_reload.go:1216); reused it.
-- Verified non-vacuous: stash revert → test fails with Args=[] for all
-  3 columns.
+- UserTSConfig lacked DBOid, leaking configs across databases
+- Fixed by following the exact UserTSDict pattern (dbOid variadic param, resolveDBOid convention)
+- pg_ts_config_map also uses ListUserTSConfigs; updated its VirtualRows to pass DefaultDBOid explicitly
+- The mapcfg-filtered WHERE clause in pg_ts_config_map queries means cross-DB leakage there is cosmetic (config OIDs won't match across databases), so per-connection override deferred
 
-Next step: Per Current Priority banner, M-NIGHTLY is next (all items are
-checked [x] — verify the restart-failure-cascade infrastructure item
-or move on). Then M0119-0004 (pg_dump TAP), M0119-0005 (pg_waldump),
-M0119-0006 (pg_amcheck), M0119-0007 (recvlogical — blocked).
+Next step:
+Per the Current Priority banner: M-NIGHTLY (clear) → M0119 (blocked on large items) → M0122.
+Next M0122 slice: either M0122-0003 EXPLAIN WAL/MEMORY output (deferral ledger rows 2026-08-08)
+or a follow-up on the design doc 0122-0018's "Still deferred" items (only "type catalog rows" remain — sequences and constraints are already done).
 
 Gates run:
-- go test ./internal/initdb/...: PASS (including new test, ~57s)
-- go test ./internal/catalog/...: PASS (cached)
-- go test ./internal/executor/...: PASS
-- RALPH_PRECOMMIT_SCOPE=units: PASS
-- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
+- go build ./...: PASS
+- go vet: PASS
+- catalog tests: PASS (0.068s)
+- executor tests: PASS (5.894s)
+- server tests: PASS (23.412s)
+- initdb tests: PASS (54.573s)
+- TestCreateTSConfigCrossDatabaseIsolation: PASS
+- make ralph-state-guard: OK
 
 In-flight: none

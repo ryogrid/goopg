@@ -178,11 +178,14 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       `go test -v -run '^TestPort_IsolationPlpgsqlToast$' ./internal/testport/`.
 
 **Infrastructure, not engine:**
-- [ ] **testport/restart-failure-cascade** — Restart robustness gap in the test
-      framework. heavy-WAL case (e.g. `cluster`) timeout → teardown/restart failure
-      → cascading downstream failures. Suspected: 20 s start timeout too tight after
-      heavy WAL. Fix: raise/scale timeout or poll readiness. Resume: `internal/testport/`
-      cluster harness restart path.
+- [x] **testport/restart-failure-cascade** — **FIXED (2026-08-09).**
+      Root cause: default `StartupWait` and `ShutdownWait` in `internal/testutil/cluster`
+      were 10s — too tight after heavy WAL replay at restart. `runGoopg` (used by
+      `Stop`) had a fixed 30s timeout that could race with `shutdownWait` + `go run`
+      compile overhead. Fix: raised both defaults to 20s (matching what most testport
+      tests already use explicitly), and made `Stop` use an adaptive timeout
+      (`shutdownWait + 30s`) via new `runGoopgTimeout` helper. No test relied on the
+      old 10s default; `TestKillKillRecovery` (crash-restart) still PASSes.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
@@ -295,13 +298,19 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
       and any residual dump-fidelity items.
 
-- [ ] **DU-002 next blocker — `invalid column numbering in table "nninh4"`**
-      (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). pg_dump errors on
-      a pg_attribute attnum-ordering / column-numbering gap for the inheritance
-      test table `nninh4` (dropped/inherited columns). Not a registry-scoping
-      collision — a different subsystem (pg_attribute physical attnum order).
-      Repro: `go test -v -run '^TestPort_PgDumpConnectionSetup$'
-      ./internal/testport/`; inspect the emitted pg_attribute rows for nninh4.
+- [x] **DU-002 next blocker — `invalid column numbering in table "nninh4"`** (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). **FIXED (2026-08-09).**
+      Root cause: `deleteCatalogRowsForOID`/`deleteAttributeFromCatalogHeap` tried
+      the goopg logical decoder (`DecodePGAttributeRow`) before the PG-physical
+      decoder. The logical decoder uses a null-flag-prefix format; when the first
+      byte of attrelid happened to equal 0x00 (e.g. relOID=16640 which is
+      `0x4100` → LE bytes `00 00 41 00`), `nextInt4` read it as a valid null
+      flag, consumed the next 4 bytes as big-endian (spanning into attname), and
+      returned a wrong AttRelID (16739). No error was returned, so the physical
+      decoder was never consulted. Fix: swap decoder order — physical first,
+      logical as fallback. Same fix applied to pg_class match closure
+      (same class of bug). The nninh4 column-numbering error is now gone;
+      remaining DU-002 gap is the multi-database catalog-isolation item
+      (text search template not found).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
@@ -400,6 +409,21 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       isolation (template copy on CREATE, real directory removal on DROP —
       the architectural item), `WITH (FORCE)` connection-termination (no
       cancel-backend mechanism), REINDEX CONCURRENTLY physical rebuild.
+
+  - [x] `pg_ts_config per-DB routing` (2026-08-09, this loop) —
+      **UserTSConfig registry now dbOid-scoped** — DBOid field added to
+      UserTSConfig struct; CreateTSConfig/FindTSConfig/DropTSConfig/
+      ListUserTSConfigs all accept and filter by dbOid via variadic
+      `dbOid ...uint32` parameter (resolveDBOid default convention).
+      PGTSConfigRowsForDBOid added; pgTSConfig/pgTSConfigMap VirtualRows
+      use it; pgTSConfigRowLister interface + wireExtensionRows wiring +
+      operators.go per-connection override + Context.PgTSConfigRows field
+      all landed. New cross-database isolation test
+      TestCreateTSConfigCrossDatabaseIsolation (PASS). Follows the exact
+      UserTSDict pattern established in DU-002 slice 437/446. Remaining
+      unscoped TS catalogs: pg_ts_config_map per-connection override (the
+      mapcfg-filtered WHERE clause means cross-DB leakage is cosmetic, not
+      a correctness gap — the config OIDs won't match across databases).
 
   - [x] `unimplemented_feat #135 (pg_get_expr)` (2026-07-10, this loop) —
       **fixed the live `pg_index.indpred`/`indexprs` NULL-sentinel bug and

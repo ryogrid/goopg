@@ -12811,6 +12811,17 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
 					continue
 				}
+				// Also set the committed hint bit so runtime visibility
+				// (TupleVisibleSubxact) takes the fast HeapXmaxCommitted
+				// path instead of falling through to the snapshot-based
+				// SeesCommittedXIDWithSubxacts branch. Without this hint,
+				// a conservative snapshot may hold the old row visible
+				// even though the deleting transaction committed.
+				// DU-002: belt-and-suspenders — the xmax stamp alone
+				// suffices for the startup heap reload (scanCatalogHeapRows
+				// checks Xmax!=0), but runtime seq scans need this hint to
+				// reliably hide catalog rows that were re-synced.
+				storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
 				// Use MarkDirtyForceFPI to emit a fresh full-page image of
 				// the post-stamp page. This overrides any stale FPI that
 				// was captured before the row existed (e.g. the mirror
@@ -12841,9 +12852,11 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
-		row, err := catalog.DecodePGClassRow(data)
+		// Try the PG-physical decoder first — same class of bug as
+		// the pg_attribute sibling above (null-flag-sentinel collision).
+		row, err := catalog.DecodePGClassPhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGClassPhysicalRow(data)
+			row, err = catalog.DecodePGClassRow(data)
 		}
 		if err == nil {
 			return row.OID == relOID
@@ -12859,9 +12872,13 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
-		row, err := catalog.DecodePGAttributeRow(data)
+		// Try the PG-physical decoder first — the goopg logical
+		// decoder (DecodePGAttributeRow) uses a null-flag-prefix
+		// format that misinterprets PG-physical heap data whenever
+		// the first byte of attrelid equals 0x00 (null-flag sentinel).
+		row, err := catalog.DecodePGAttributePhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGAttributePhysicalRow(data)
+			row, err = catalog.DecodePGAttributeRow(data)
 		}
 		if err == nil {
 			return row.AttRelID == relOID
@@ -15619,10 +15636,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					// current-name-keyed DropCompatObject gate (the B3.5
 					// rename-then-drop fix, applied here too).
 					var cfgOID uint32
-					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema); cfg != nil {
+					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 						cfgOID = cfg.OID
 					}
-					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) {
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						if cfgOID != 0 {
 							deleteTSConfigCatalogRows(o.ctx, cfgOID)
 						}
@@ -16814,7 +16831,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		var parserOID uint32
 		var copySource *catalog.UserTSConfig
 		if copySourceName != "" {
-			for _, existing := range im.ListUserTSConfigs() {
+			for _, existing := range im.ListUserTSConfigs(catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				if strings.EqualFold(existing.Name, copySourceName) {
 					copySource = existing
 					break
@@ -16841,7 +16858,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			Owner:  uint32(10), // bootstrap superuser (postgres)
 			Parser: parserOID,
 		}
-		if _, err := im.CreateTSConfig(uc, schema); err != nil {
+		if _, err := im.CreateTSConfig(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
 		// B3.6 (doc 02d §2): the configuration journals as a real
@@ -16863,7 +16880,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		// B3.6: write the base row + all config_map rows from the config's
 		// final mapping set.
-		if cfg := im.FindTSConfig(uc.Name, schema); cfg != nil {
+		if cfg := im.FindTSConfig(uc.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 				return fmt.Errorf("pg_ts_config journal: %w", err)
 			}
@@ -16939,7 +16956,7 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		}
 		// B3.6: the rename is a canonical pg_ts_config base-row heap UPDATE
 		// (kind 110 retired).
-		if cfg := im.FindTSConfig(s.NewName, schema); cfg != nil {
+		if cfg := im.FindTSConfig(s.NewName, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
@@ -16953,7 +16970,7 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		}
 		// B3.6: SET SCHEMA is a canonical pg_ts_config base-row heap UPDATE
 		// (kind 111 retired).
-		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema); cfg != nil {
+		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
@@ -17000,7 +17017,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 	}
 	// B3.6: re-sync the config's pg_ts_config_map rows from its final
 	// mapping set (kind 107 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17084,7 +17101,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		}
 	}
 	// B3.6: re-sync the config's config_map rows (kind 113 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17113,7 +17130,7 @@ func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.Alt
 		}
 	}
 	// B3.6: re-sync the config's config_map rows (kind 109 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17626,9 +17643,10 @@ func deleteAttributeFromCatalogHeap(ctx *Context, dbOid, relOID uint32, attNum i
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
-		row, err := catalog.DecodePGAttributeRow(data)
+		// Try the PG-physical decoder first (sibling of deleteCatalogRowsForOID).
+		row, err := catalog.DecodePGAttributePhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGAttributePhysicalRow(data)
+			row, err = catalog.DecodePGAttributeRow(data)
 		}
 		return err == nil && row.AttRelID == relOID && row.AttNum == int32(attNum)
 	})

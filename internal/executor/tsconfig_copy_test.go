@@ -47,7 +47,7 @@ func TestCreateTSConfigCopy(t *testing.T) {
 	}
 
 	var srcCfg, dstCfg *catalog.UserTSConfig
-	for _, uc := range im.ListUserTSConfigs() {
+	for _, uc := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
 		switch uc.Name {
 		case "ts_copy_src":
 			srcCfg = uc
