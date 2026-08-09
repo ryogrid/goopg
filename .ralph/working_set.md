@@ -1,41 +1,44 @@
-Task: M0122-0008 client_encoding GUC validation (LANDED)
+Task: M0122-0008 pg_client_encoding() + getdatabaseencoding() builtins (LANDED)
 
 Files:
-- internal/config/guc.go: Added CheckFn func(string) error to Variable struct;
-  called in canonicalizeFrom TypeString case
-- internal/config/encoding_guc.go: New — pgEncNames (42-entry encoding name table),
-  pgEncAliases, cleanEncName, encodingNameToCanonical, checkClientEncoding
-- internal/config/encoding_guc_test.go: New — TestEncodingTableIntegrity
-- internal/config/guc_test.go: Added TestClientEncodingValidation
-- internal/config/defaults.go: Registered CheckFn: checkClientEncoding for
-  client_encoding GUC
-- .ralph/fix_plan.md: M0122-0008 status updated
+- internal/executor/expr.go: Added dispatch cases for pg_client_encoding and
+  getdatabaseencoding in evalFuncCall switch; implemented evalPgClientEncoding
+  (reads client_encoding GUC via GetSetting) and evalGetDatabaseEncoding
+  (reads encoding ID from catalog.InMemory.DatabaseEncoding + maps via
+  EncodingIDToName)
+- internal/executor/encoding_builtins_test.go: TestEvalPgClientEncoding +
+  TestEvalGetDatabaseEncoding (nil-ctx fallback, custom GUC, non-default encoding)
+- .ralph/fix_plan.md: Updated M0122-0008 status
+- unimplemented_feat.json: Updated encoding entry code_audit
 
 Key symbols:
-- Variable.CheckFn func(string) error — optional post-canonicalisation hook
-- checkClientEncoding(value) error — validates against PG 18.3 pg_enc2name_tbl
-- encodingNameToCanonical(name) string — cleaned-name resolution + aliases
+- evalPgClientEncoding(row, ctx) — returns current client_encoding as name Datum
+- evalGetDatabaseEncoding(row, ctx) — returns database encoding as name Datum
 
 Hypothesis/Findings:
-- client_encoding GUC already existed (ContextUserset, FlagReport) but had
-  zero validation — any arbitrary string was accepted
-- CheckFn is the minimal mechanism; full assign/check hooks (PG's check_assign/
-  check_client_encoding) would be overengineered for one GUC
-- Encoding table is duplicated in config (leaf package) to avoid importing
-  catalog; the table is an immutable PG constant, guarded by
-  TestEncodingTableIntegrity
+- Both functions were registered in pg_proc_seed_data.go with HandlerName entries
+  but had no dispatch arms in evalFuncCall → returned "function does not exist"
+- Bootstrap encoding enforcement (initdb --encoding validation via resolveEncoding)
+  was already fully implemented — the working_set's "Next step" from the previous
+  loop was stale
+- getdatabaseencoding() uses a type assertion to *catalog.InMemory because
+  DatabaseEncoding is not on the Catalog interface (only on the concrete type)
+- Verified against live psql: default UTF8, SET to LATIN1 reflects correctly
 
 Next step:
-- Per priority banner: M0130 is COMPLETE, M0119 is next but M0119-0005/0006/0007
-  are blocked/huge. Most tractable remaining M0122-0008 item: bootstrap encoding
-  enforcement (validate --encoding flag in initdb). Channel binding still blocked
-  on TLS.
+- M0130 is COMPLETE. M0119-0005/0006/0007 are blocked/huge (need index AMs + types).
+  M0122-0008 remaining: (1) channel binding blocked on TLS; (2) actual byte-level
+  encoding conversion (port PG mb/conversion_procs). Most tractable next item:
+  start on M0122-0010 btree locking (Lehman-Yao crab-walk first slice), or
+  continue M0122-0008 with a small encoding follow-up like pg_encoding_to_char()
+  and pg_char_to_encoding() SQL builtins (also registered but may lack dispatch).
 
 Gates run:
-- go build ./internal/...: OK
-- go test ./internal/config/...: PASS (all tests incl. new)
-- go test ./internal/server/...: PASS
-- go test ./internal/catalog/...: PASS
+- go build ./internal/executor/...: OK
+- go test -run TestEvalPgClientEncoding/TestEvalGetDatabaseEncoding: PASS
+- go test ./internal/executor/...: PASS (5.8s)
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
+- make ralph-state-guard: REPAIRED (progress.json reconciled)
 
 In-flight: none
