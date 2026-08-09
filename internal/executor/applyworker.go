@@ -496,7 +496,7 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
@@ -635,7 +635,7 @@ func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.C
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {

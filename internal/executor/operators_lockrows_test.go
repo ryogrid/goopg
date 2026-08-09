@@ -19,6 +19,8 @@ import (
 // FOR UPDATE doesn't change row shape) and any error.
 func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -1474,7 +1476,7 @@ func TestLockRowsWalkersGracefulOnUnknown(t *testing.T) {
 	}
 
 	// findScanLeafForRel must NOT error on unknown wrapper.
-	_, err = findScanLeafForRel(child, rel)
+	_, err = findScanLeafForRel(child, rel, nil)
 	if err != nil {
 		t.Errorf("findScanLeafForRel errored on unknown operator: %v", err)
 	}
@@ -1498,7 +1500,7 @@ func TestLockRowsWalkersGracefulOnUnknown(t *testing.T) {
 	if err != nil {
 		t.Errorf("findScanLeaf errored on recognised shape sort→project→seqScan: %v", err)
 	}
-	_, err = findScanLeafForRel(known, rel)
+	_, err = findScanLeafForRel(known, rel, nil)
 	if err != nil {
 		t.Errorf("findScanLeafForRel errored on recognised shape: %v", err)
 	}

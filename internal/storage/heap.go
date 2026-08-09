@@ -140,6 +140,13 @@ const (
 	// HEAP_NATTS_MASK is the bit mask for number of attributes in
 	// t_infomask2 (bits 0-10). Mirrors PG's HEAP_NATTS_MASK (0x07FF).
 	HeapNattsMask uint16 = 0x07FF
+
+	// HeapComboCID indicates that t_field3 (the Xvac/t_cid union at bytes
+	// 8-11) holds a combo CID rather than a plain cmin/cmax. When set,
+	// the raw t_cid value must be resolved through the backend's
+	// ComboCIDStore to recover the real cmin and cmax. Mirrors
+	// PostgreSQL's HEAP_COMBOCID (0x0020, htup_details.h:197).
+	HeapComboCID uint16 = 0x0020
 )
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
@@ -164,6 +171,53 @@ func IsHeapTupleLockOnly(infomask uint16) bool {
 // upstream's pre-9.3 EXCL_LOCK fallback clause.
 func IsHeapTupleXmaxMulti(infomask uint16) bool {
 	return infomask&HeapXmaxIsMulti != 0
+}
+
+// IsHeapComboCID reports whether the tuple's t_field3 holds a combo CID
+// (HEAP_COMBOCID set in infomask). When true, the raw t_cid must be resolved
+// through the backend's ComboCIDStore to recover the real cmin and cmax.
+// Mirrors the HEAP_COMBOCID bit test in PostgreSQL.
+func IsHeapComboCID(infomask uint16) bool {
+	return infomask&HeapComboCID != 0
+}
+
+// HeapTupleHeader cmin / cmax getters and setters.
+//
+// The goopg HeapTupleHeader carries a 4-byte field at offset 8-11 (Xvac)
+// that mirrors PostgreSQL's t_cid/t_xvac union (t_field3 in htup_details.h).
+// When HEAP_COMBOCID is clear, Xvac directly holds the inserting CommandId
+// (cmin) when interpreting as cmin, or both cmin and cmax are equal and the
+// field holds that shared value. When HEAP_COMBOCID is set, the raw value is a
+// combo CID — a synthetic identifier that the ComboCIDStore resolves to the
+// real (cmin, cmax) pair.
+//
+// SetCmin stamps the inserting command id and clears HEAP_COMBOCID. Mirrors
+// PostgreSQL's HeapTupleHeaderSetCmin (htup_details.h).
+func (h *HeapTupleHeader) SetCmin(cid CommandId) {
+	h.Xvac = TransactionID(cid)
+	h.Infomask &^= HeapComboCID
+}
+
+// SetCmax stamps the deleting command id. When isCombo is true, HEAP_COMBOCID
+// is set (the caller resolved (cmin, cmax) to a combo CID and passed it).
+// When isCombo is false, the raw cid is the plain cmax and HEAP_COMBOCID is
+// clear. Mirrors PostgreSQL's HeapTupleHeaderSetCmax (htup_details.h).
+func (h *HeapTupleHeader) SetCmax(cid CommandId, isCombo bool) {
+	h.Xvac = TransactionID(cid)
+	if isCombo {
+		h.Infomask |= HeapComboCID
+	} else {
+		h.Infomask &^= HeapComboCID
+	}
+}
+
+// GetRawCommandId returns the raw 4-byte t_field3 value, irrespective of
+// whether it represents a plain CommandId or a combo CID. Callers that need
+// the real cmin/cmax must pass this through ComboCIDStore resolution when
+// IsHeapComboCID(h.Infomask) is true. Mirrors PostgreSQL's
+// HeapTupleHeaderGetRawCommandId (htup_details.h).
+func (h *HeapTupleHeader) GetRawCommandId() CommandId {
+	return CommandId(h.Xvac)
 }
 
 // ResolveMultiUpdater, when non-nil, resolves an updater-bearing multixact xmax
@@ -996,6 +1050,50 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
 	}
+	return nil
+}
+
+// PageSetHeapTupleCmax writes the deleting CommandId (cmax) into the on-page
+// tuple header at offset 8-11 (the t_cid/t_xvac union field) and manages the
+// HEAP_COMBOCID infomask bit. When isCombo is true, HEAP_COMBOCID is set
+// (the raw cid is a combo CID, resolved via ComboCIDStore). When false, the
+// raw cid is the plain cmax and HEAP_COMBOCID is clear.
+//
+// This mirrors PostgreSQL's HeapTupleHeaderSetCmax + the in-place update at
+// heap_delete/heap_update after the buffer is locked.
+func PageSetHeapTupleCmax(p Page, slot uint16, cid CommandId, isCombo bool) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+23 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	// Write the raw CommandId at offset 8-11 (t_cid/t_xvac union).
+	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(cid))
+	// Manage HEAP_COMBOCID in infomask (offset 20-21).
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	if isCombo {
+		infomask |= HeapComboCID
+	} else {
+		infomask &^= HeapComboCID
+	}
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }
 

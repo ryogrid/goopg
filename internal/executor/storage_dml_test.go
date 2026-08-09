@@ -12,6 +12,8 @@ import (
 // known starting state.
 func seedItems(t *testing.T, ctx *Context, tbl *catalog.Table) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	in := &planner.Insert{
 		Table: tbl,
 		Source: &planner.Values{
@@ -46,6 +48,9 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
 
+	// M0129-S8.3: advance the command counter so the UPDATE sees the seed rows.
+	advanceStmtCounter(ctx)
+
 	// UPDATE items SET label = 'updated' WHERE id = 2
 	upd := &planner.Update{
 		Table: tbl,
@@ -74,6 +79,8 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	}
 	_ = op.Close()
 
+	// M0129-S8.3: advance the command counter so the scan sees the UPDATE's new tuples.
+	advanceStmtCounter(ctx)
 	// Scan back: same xact should see id=1 alpha, id=3 gamma, and the
 	// new id=2 updated. The old id=2 beta is invisible because its
 	// xmax = ctx.Tx.XID (TupleVisible's "deleted by current xact"
@@ -107,6 +114,9 @@ func TestDeleteStampsXmax(t *testing.T) {
 	defer cleanup()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
+
+	// M0129-S8.3: advance the command counter so the DELETE sees the seed rows.
+	advanceStmtCounter(ctx)
 
 	// DELETE FROM items WHERE id = 2
 	del := &planner.Delete{
@@ -158,6 +168,9 @@ func TestDeleteAllRowsWithoutPredicate(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
 
+	// M0129-S8.3: advance the command counter so the DELETE sees the seed rows.
+	advanceStmtCounter(ctx)
+
 	del := &planner.Delete{
 		Table: tbl,
 		Child: &planner.SeqScan{Table: tbl},
@@ -202,6 +215,8 @@ func TestUpdateViaIndexScanPath(t *testing.T) {
 	if err := runDDL(t, ctx, "UPDATE items SET label = 'updated' WHERE id = 2"); err != nil {
 		t.Fatalf("UPDATE WHERE indexed: %v", err)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the UPDATE's new tuples.
+	advanceStmtCounter(ctx)
 	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()

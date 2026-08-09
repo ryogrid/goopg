@@ -283,7 +283,9 @@ func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte, compres
 		tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
 		tuple.Header.SetNatts(len(toastCols))
 		tuple.Header.Infomask |= storage.HeapXmaxInvalid
-		if err := writeHeapTupleToRel(ctx, toastRel, tuple); err != nil {
+			// M0129-S8.3c: stamp the inserting command id (cmin).
+			tuple.Header.SetCmin(ctx.GetCurrentCommandId(true))
+			if err := writeHeapTupleToRel(ctx, toastRel, tuple); err != nil {
 			return nil, err
 		}
 		seq++
@@ -431,7 +433,7 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(t.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact) {
+			if !mvcc.TupleVisible(t.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(toastCols, t, nil)

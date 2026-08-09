@@ -2551,13 +2551,14 @@ func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, cl
 			}
 			return cfgRow{
 				uc: catalog.UserTSConfig{
-					OID:          uint32(d[0].Int),
-					Name:         d[1].StringValue(),
-					NamespaceOID: uint32(d[2].Int),
-					Owner:        uint32(d[3].Int),
-					Parser:       uint32(d[4].Int),
-					Mappings:     buildTSConfigMappings(mapRowsByCfg[uint32(d[0].Int)]),
-				},
+			OID:          uint32(d[0].Int),
+			Name:         d[1].StringValue(),
+			NamespaceOID: uint32(d[2].Int),
+			Owner:        uint32(d[3].Int),
+			Parser:       uint32(d[4].Int),
+			Mappings:     buildTSConfigMappings(mapRowsByCfg[uint32(d[0].Int)]),
+			DBOid:        cat.DBOID(),
+		},
 				tid: tid,
 			}, false, nil
 		})

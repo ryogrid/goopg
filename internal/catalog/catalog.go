@@ -1672,6 +1672,15 @@ type ColumnStats struct {
 	// ratio, so the two disagreed by the sampling factor — a 1.5 M-row unique
 	// key read as NDistinct=30,000 with NDistinctFrac=1.0.
 	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
+
+	// Correlation is pg_stats.correlation: the Pearson correlation between
+	// physical row order and logical (sorted) column order. Range [-1, 1];
+	// 1.0 = perfectly correlated, -1.0 = perfectly anti-correlated, 0 = no
+	// correlation or unknown. PG collects this as STATISTIC_KIND_CORRELATION
+	// (analyze.c compute_scalar_stats). It feeds cost_index's correlation
+	// adjustment (btcost_correlation, selfuncs.c:7305) and is the statistic
+	// that makes the two-term Mackert-Lohman formula usable.
+	Correlation float64 `json:"correlation,omitempty"`
 }
 
 // StaDistinct returns these statistics in PostgreSQL's SIGNED `stadistinct`
@@ -3539,6 +3548,18 @@ type UserTSConfig struct {
 	Owner        uint32 // cfgowner (role OID; 10 = postgres superuser)
 	Parser       uint32 // cfgparser (FK into the built-in pg_ts_parser row)
 	Mappings     []TSConfigMapping
+	// DBOid is the real physical database oid this configuration was CREATE
+	// TEXT SEARCH CONFIGURATION'd under (mirrors UserTSDict.DBOid).
+	// Registry entries are matched by (DBOid, NamespaceOID, Name), so two
+	// distinct databases may each CREATE TEXT SEARCH CONFIGURATION a
+	// same-named configuration without colliding (the DU-002 pg_dump
+	// round-trip restores a dump's configurations into a fresh database
+	// whose registry must not clash with the source database's). Defaults
+	// to DefaultDBOid for every call site that does not pass an explicit
+	// dbOid (resolveDBOid's convention), keeping the pre-4e single-DB
+	// semantics for callers that predate per-database isolation. M0122-0007
+	// 4e follow-up (DU-002 round-trip probe unblock).
+	DBOid uint32
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -10567,22 +10588,13 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3602,
 	}
+	// The base virtual view always reflects DefaultDBOid's configurations.
+	// A per-connection dbOid-scoped row-set is wired in via
+	// executor.Context.PgTSConfigRows so a pg_dump restoring into a
+	// non-default database sees only its own configurations (DU-002 slice 446;
+	// dbOid scoping: M0122-0007 4e follow-up).
 	pgTSConfig.VirtualRows = func() [][]string {
-		cfgs := c.ListUserTSConfigs()
-		if len(cfgs) == 0 {
-			return nil
-		}
-		rows := make([][]string, 0, len(cfgs))
-		for _, uc := range cfgs {
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(uc.OID), 10), // oid
-				uc.Name,                                // cfgname
-				strconv.FormatUint(uint64(uc.NamespaceOID), 10), // cfgnamespace
-				strconv.FormatUint(uint64(uc.Owner), 10),        // cfgowner
-				strconv.FormatUint(uint64(uc.Parser), 10),       // cfgparser
-			})
-		}
-		return rows
+		return c.PGTSConfigRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_config"] = pgTSConfig
 
@@ -10608,8 +10620,12 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3603,
 	}
+	// The base virtual view always reflects DefaultDBOid's configuration
+	// mappings. A per-connection dbOid-scoped row-set is wired in via
+	// executor.Context.PgTSConfigMapRows (see wireExtensionRows).
+	// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 	pgTSConfigMap.VirtualRows = func() [][]string {
-		cfgs := c.ListUserTSConfigs()
+		cfgs := c.ListUserTSConfigs(DefaultDBOid)
 		var rows [][]string
 		for _, uc := range cfgs {
 			tokIDByName := make(map[string]int, len(DefaultParserTokenTypes))
@@ -14008,20 +14024,22 @@ func (c *InMemory) SetTSDictSchemaDuringRecovery(name, schema, newSchema string)
 // namespace OID. Returns the new OID, or 0 with an error if a same-named
 // configuration already exists in the same namespace (PG enforces a unique
 // (cfgname, cfgnamespace)). DU-002 slice 446 (M0119-0004).
-func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, error) {
+func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userTSConfigs {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
 			return 0, fmt.Errorf("text search configuration %q already exists", uc.Name)
 		}
 	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
+	uc.DBOid = oid
 	c.userTSConfigs = append(c.userTSConfigs, uc)
 	return uc.OID, nil
 }
@@ -14033,30 +14051,32 @@ func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, erro
 // FindTSConfig returns the user TS configuration matching (schema, name), or
 // nil. B3.6: the emit sites journal the config's CURRENT state after a
 // registry mutation (base row + config_map rows re-derived from Mappings).
-func (c *InMemory) FindTSConfig(name, schema string) *UserTSConfig {
+func (c *InMemory) FindTSConfig(name, schema string, dbOid ...uint32) *UserTSConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			return uc
 		}
 	}
 	return nil
 }
 
-func (c *InMemory) DropTSConfig(name, schema string) bool {
+func (c *InMemory) DropTSConfig(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			c.userTSConfigs = append(c.userTSConfigs[:i], c.userTSConfigs[i+1:]...)
 			return true
 		}
@@ -14065,15 +14085,22 @@ func (c *InMemory) DropTSConfig(name, schema string) bool {
 }
 
 // ListUserTSConfigs returns the user-created text search configurations in
-// creation order. DU-002 slice 446.
-func (c *InMemory) ListUserTSConfigs() []*UserTSConfig {
+// creation order for the given dbOid. A zero-valued or absent dbOid resolves
+// to DefaultDBOid per resolveDBOid's convention. DU-002 slice 446.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) ListUserTSConfigs(dbOid ...uint32) []*UserTSConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
 	if len(c.userTSConfigs) == 0 {
 		return nil
 	}
-	out := make([]*UserTSConfig, len(c.userTSConfigs))
-	copy(out, c.userTSConfigs)
+	out := make([]*UserTSConfig, 0, len(c.userTSConfigs))
+	for _, uc := range c.userTSConfigs {
+		if uc.DBOid == oid {
+			out = append(out, uc)
+		}
+	}
 	return out
 }
 
@@ -14089,15 +14116,16 @@ func (c *InMemory) ListUserTSConfigs() []*UserTSConfig {
 // whether tokenType already had a mapping entry (the caller must not append
 // in that case).
 // DU-002 slice 446 (M0119-0004).
-func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig, duplicate bool) {
+func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32, dbOid ...uint32) (cfg *UserTSConfig, duplicate bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			for _, m := range uc.Mappings {
 				if strings.EqualFold(m.TokenType, tokenType) {
 					return uc, true
@@ -14125,15 +14153,16 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 // configuration (nil if no configuration with the given schema-resolved name
 // exists) and whether a mapping for tokenType was found and removed.
 // DU-002 slice 446 follow-up (M0119-0004).
-func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string) (cfg *UserTSConfig, found bool) {
+func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string, dbOid ...uint32) (cfg *UserTSConfig, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			for i, m := range uc.Mappings {
 				if strings.EqualFold(m.TokenType, tokenType) {
 					uc.Mappings = append(uc.Mappings[:i], uc.Mappings[i+1:]...)
@@ -14249,15 +14278,16 @@ func (c *InMemory) AlterTSConfigMappingDuringRecovery(name, schema, tokenType st
 // succeeds. Returns the matched configuration (nil if no configuration with
 // the given schema-resolved name exists) and whether any entry was actually
 // replaced. DU-002 replacedict follow-up (M0119-0004).
-func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32) (cfg *UserTSConfig, replaced bool) {
+func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32, dbOid ...uint32) (cfg *UserTSConfig, replaced bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userTSConfigs {
-		if uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
 			continue
 		}
 		for mi := range uc.Mappings {
@@ -14308,6 +14338,11 @@ func (c *InMemory) CreateTSConfigDuringRecovery(uc *UserTSConfig, schema string)
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
+	// Respect a caller-set DBOid; zero falls back to DefaultDBOid — what live
+	// postgres-DB sessions key on (mirrors CreateTSDictDuringRecovery).
+	if uc.DBOid == 0 {
+		uc.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userTSConfigs {
 		if existing.OID == uc.OID {
 			c.userTSConfigs[i] = uc
@@ -14321,6 +14356,32 @@ func (c *InMemory) CreateTSConfigDuringRecovery(uc *UserTSConfig, schema string)
 	if uc.OID >= c.nextOID {
 		c.nextOID = uc.OID + 1
 	}
+}
+
+// PGTSConfigRowsForDBOid builds the pg_ts_config catalog row-set for dbOid:
+// only the configurations registered in dbOid's own registry are included.
+// The virtual pg_ts_config view calls this with DefaultDBOid so every existing
+// caller (server dispatch without a per-connection PgTSConfigRows wire-up,
+// every test) sees byte-identical behavior; a per-connection dbOid is wired
+// in via executor.Context.PgTSConfigRows (internal/server/dispatch.go's
+// wireExtensionRows). Mirrors PGTSDictRowsForDBOid. M0122-0007 4e follow-up
+// (DU-002 round-trip probe unblock).
+func (c *InMemory) PGTSConfigRowsForDBOid(dbOid uint32) [][]string {
+	cfgs := c.ListUserTSConfigs(dbOid)
+	if len(cfgs) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(cfgs))
+	for _, uc := range cfgs {
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(uc.OID), 10),          // oid
+			uc.Name,                                         // cfgname
+			strconv.FormatUint(uint64(uc.NamespaceOID), 10), // cfgnamespace
+			strconv.FormatUint(uint64(uc.Owner), 10),        // cfgowner
+			strconv.FormatUint(uint64(uc.Parser), 10),       // cfgparser
+		})
+	}
+	return rows
 }
 
 // AddTSConfigMappingDuringRecovery is the discard-result recovery
@@ -19522,6 +19583,16 @@ func BuiltinProcs() []BuiltinProc {
 func RegprocName(oid uint32) (string, bool) {
 	name, ok := pgProcNamesByOID[oid]
 	return name, ok
+}
+
+// IsStrictProc reports whether a built-in function is strict (returns NULL on
+// any NULL input). It consults the generated pgProcIsStrictByOID map, which
+// mirrors pg_proc.proisstrict for every PG18 built-in function. Returns false
+// for unknown OIDs (including user-defined functions, whose strictness isn't
+// tracked here — callers needing that should extend Routines or consult the
+// on-disk pg_proc heap).
+func IsStrictProc(oid uint32) bool {
+	return pgProcIsStrictByOID[oid]
 }
 
 // pgArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat

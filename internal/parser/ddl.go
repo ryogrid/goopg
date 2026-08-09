@@ -8368,6 +8368,40 @@ func (p *parser) parseAlter() (Stmt, error) {
 			FDWValidatorFunc: validatorFunc, FDWValidatorGiven: validatorGiven,
 		}, nil
 	}
+	// ALTER SERVER name [OWNER TO role | RENAME TO name | OPTIONS (...)
+	// | VERSION 'ver'] — compat no-op for pg_dump round-trip. The server
+	// was already registered by CREATE SERVER; ALTER only needs to be
+	// accepted without error. DU-002 slice 376 follow-up (M0119-0004).
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "server") {
+		p.advance() // consume SERVER
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// Consume trailing clauses up to the terminator.
+		for p.cur().Kind != TokenEOF && !(p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				depth := 1
+				p.advance()
+				for depth > 0 && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						depth++
+					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						depth--
+					}
+					if depth > 0 {
+						p.advance()
+					}
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+					p.advance()
+				}
+				continue
+			}
+			p.advance()
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER SERVER", ObjType: "server", ObjName: name}, nil
+	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply
 	// consumed here so the rest of this function (including the ALTER

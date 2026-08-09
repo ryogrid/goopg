@@ -340,7 +340,7 @@ func TestDecodedXLogHeapInsertVisibleThroughPreloadedBufferPoolAfterCommit(t *te
 	if err != nil {
 		t.Fatalf("PageGetHeapTuple: %v", err)
 	}
-	if !mvcc.TupleVisible(tup.Header, snap, tx.XID, nil) {
+	if !mvcc.TupleVisible(tup.Header, snap, tx.XID, storage.InvalidCommandId, nil, nil) {
 		t.Fatalf("tuple header=%+v not visible through preloaded buffer-pool page", tup.Header)
 	}
 	if string(tup.Data) != "hello" {

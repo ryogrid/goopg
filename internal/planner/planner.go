@@ -1629,7 +1629,17 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// positions. The slot side-channel (MaterializedSlot.hasCTID) remains
 		// as belt-and-braces for plan shapes the column path cannot cover
 		// (CTE scans, VALUES). M0129-0003 §2.
-		numCtid := wireRowMarkCtidColumns(out, locks)
+		// M-NIGHTLY AI-007: ctid column injection breaks the hash join for
+		// self-joins because recomputeIntermediateSchemas rebuilds the join
+		// schema but the hash key expressions still use pre-injection indices.
+		// Skip injection when a locked table appears in multiple FROM items
+		// (same OID referenced more than once). The scan fallback path
+		// (findScanLeafForRel → o.scan.currentTID()) handles TID correctly
+		// in these cases.
+		numCtid := 0
+		if !hasSelfJoinLockedTable(locks, s) {
+			numCtid = wireRowMarkCtidColumns(out, locks)
+		}
 		if numCtid > 0 {
 			recomputeIntermediateSchemas(out)
 		}
@@ -1983,6 +1993,31 @@ func findBindingByName(bindings []rangeBinding, name string) (rangeBinding, bool
 	return rangeBinding{}, false
 }
 
+
+// hasSelfJoinLockedTable reports whether ctid injection should be skipped
+// because a locked table appears in a self-join (same table name in multiple
+// FROM items). Ctid column injection breaks the hash join schema when a table
+// appears on both sides, because recomputeIntermediateSchemas does not update
+// hash key expressions. The scan fallback path (findScanLeafForRel →
+// o.scan.currentTID()) handles TID correctly. M-NIGHTLY AI-007.
+func hasSelfJoinLockedTable(locks []LockedRel, sel *parser.SelectStmt) bool {
+	for _, lk := range locks {
+		if lk.Table == nil {
+			continue
+		}
+		seen := 0
+		for _, f := range sel.From {
+			if f.Name != "" && f.Name == lk.Table.Name && f.Schema == lk.Table.Schema {
+				seen++
+			}
+		}
+		if seen > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // wireRowMarkCtidColumns adds resjunk ctid columns to the schema of every
 // SeqScan or IndexScan whose relation is rowmarked, and extends the top-level
 // Project to carry those columns through to the LockRows. Returns the number of
@@ -2298,7 +2333,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
 		// demoted joins enter the joinlist as plain INNER joins.
-		reduceOuterJoins(s.FromExprs, s.Where)
+		reduceOuterJoins(s.FromExprs, s.Where, cat)
 		rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
 	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil

@@ -44,6 +44,7 @@ const (
 	pgAttributeOffName       = 4
 	pgAttributeOffTypID      = 68
 	pgAttributeOffNum        = 74
+	pgAttributeOffTypMod     = 76
 	pgAttributeOffNotNull    = 86
 	pgAttributeOffIdentity   = 89
 	pgAttributeOffIsDropped  = 91
@@ -622,6 +623,11 @@ type PGAttributeRow struct {
 	// reload restores IdentityColumn/IdentityAlways from it, replacing the
 	// retired kind-65 IdentityKind marker).
 	AttIdentity byte
+	// AttTypMod is atttypmod — the type modifier (e.g. 29 for varchar(25),
+	// encoding the declared length + VARHDRSZ). Decoded only by the
+	// PG-physical decoder; the legacy encoder/decoder does not carry it.
+	// M0119-0010.
+	AttTypMod int32
 }
 
 // PGTypeRow is the v0 on-disk shape of one pg_type tuple.
@@ -968,6 +974,7 @@ func DecodePGAttributePhysicalRow(data []byte) (PGAttributeRow, error) {
 		AttNotNull:   attNotNull,
 		AttIsDropped: attIsDropped,
 		AttIdentity:  data[pgAttributeOffIdentity],
+		AttTypMod:    int32(binary.LittleEndian.Uint32(data[pgAttributeOffTypMod : pgAttributeOffTypMod+4])),
 	}
 	if !r.AttIsDropped && r.AttTypID == 0 {
 		return r, fmt.Errorf("pg_attribute.atttypid: invalid 0")

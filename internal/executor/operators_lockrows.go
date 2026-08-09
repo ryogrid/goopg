@@ -401,17 +401,17 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 // Returns (nil, error) when it encounters an operator type it does not
 // recognise — unknown shapes must error loudly rather than silently
 // degrading FOR UPDATE to an unlocked pass-through (M0128-P0.2).
-func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) (currentTIDProvider, error) {
+func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context) (currentTIDProvider, error) {
 	for {
 		switch v := op.(type) {
 		// TID-providing scan leaves — match on relation.
 		case *seqScanOp:
-			if v.rel == targetRel {
+			if v.rel == targetRel || (v.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(v.tbl) == targetRel) {
 				return v, nil
 			}
 			return nil, nil
 		case *indexScanOp:
-			if v.ctx != nil && v.ctx.Catalog.RelFileNode(v.plan.Table) == targetRel {
+			if (v.ctx != nil && v.ctx.Catalog.RelFileNode(v.plan.Table) == targetRel) || (ctx != nil && ctx.Catalog.RelFileNode(v.plan.Table) == targetRel) {
 				return v, nil
 			}
 			return nil, nil
@@ -444,7 +444,7 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) (currentTIDP
 			return nil, nil
 		// Join operators — recurse into both children.
 		case *joinOp:
-			left, lerr := findScanLeafForRel(v.left, targetRel)
+			left, lerr := findScanLeafForRel(v.left, targetRel, ctx)
 			if lerr != nil {
 				return nil, lerr
 			}
@@ -453,7 +453,7 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) (currentTIDP
 			}
 			op = v.right
 		case *nestedLoopIndexJoinOp:
-			outer, oerr := findScanLeafForRel(v.outer, targetRel)
+			outer, oerr := findScanLeafForRel(v.outer, targetRel, ctx)
 			if oerr != nil {
 				return nil, oerr
 			}
@@ -720,7 +720,7 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	for i := range o.plan.Locks {
 		if o.plan.Locks[i].Table != nil {
 			targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[i].Table)
-			if scanRel, scanErr := findScanLeafForRel(o.child, targetRel); scanErr != nil {
+			if scanRel, scanErr := findScanLeafForRel(o.child, targetRel, ctx); scanErr != nil {
 				return scanErr
 			} else if scanRel != nil {
 				o.scan = scanRel

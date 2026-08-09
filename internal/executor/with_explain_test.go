@@ -13,6 +13,8 @@ import (
 // label tests.
 func runExplain(t *testing.T, ctx *Context, sql string) []string {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse("EXPLAIN " + sql)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)

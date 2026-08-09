@@ -1,6 +1,6 @@
 package executor
 
-// parallel_hash_build.go — P8 of docs/design/parallel-query/, chapter 07.
+// parallel_hash_build.go — P8 + M0129-S4.1 (cooperative parallel hash build).
 //
 // PostgreSQL offers two parallel hash joins: a non-shared one where every
 // worker builds its own complete copy of the table, and `Parallel Hash`, where
@@ -15,13 +15,19 @@ package executor
 // happens-before that publishes it. That replaces PG's whole DSA + barrier
 // apparatus with a struct and a map lookup.
 //
-// What goopg gives up in exchange is PG's parallel BUILD. Here the build stays
-// serial in the leader. That is acceptable because the planner puts the small
-// side on the build side by construction (IsSmallDimensionSide), so the build
-// is not usually the bottleneck — but it is a genuine capability PG has and
-// this does not, recorded rather than glossed (chapter 07 §3.1).
+// P8 keeps the build serial in the leader. M0129-S4.1 (= P2.1a) adds a
+// cooperative parallel build: N goroutines scan+filter the build table
+// (producers), one goroutine owns the hash map and inserts (consumer). The
+// design is a producer/consumer split over a buffered channel — single writer
+// on the map, no lock, no concurrent map. See
+// docs/design/parallel-query/13-cooperative-parallel-hash-build.md.
 
 import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -236,4 +242,281 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 	case *instrumentedOp:
 		collectShareableJoins(x.inner, out)
 	}
+}
+
+// ── M0129-S4.1: cooperative parallel hash build ──────────────────────────
+//
+// Design: docs/design/parallel-query/13-cooperative-parallel-hash-build.md.
+
+// channelSource is a synthetic Operator that feeds rows received from a
+// channel into the build loop. It exists so the parallel build can reuse the
+// EXACT same buildLoopRight/buildLoopLeft code the serial build uses — the
+// only difference is the row source (channel vs. child operator tree).
+type channelSource struct {
+	ch     <-chan []Row
+	schema planner.Schema
+	batch  []Row
+	idx    int
+}
+
+func (s *channelSource) Open(_ *Context) error { return nil }
+func (s *channelSource) Close() error {
+	// Drain remaining batches so producers don't block on send.
+	for range s.ch {
+	}
+	return nil
+}
+func (s *channelSource) Schema() planner.Schema { return s.schema }
+
+func (s *channelSource) Next() (TupleSlot, error) {
+	for s.idx >= len(s.batch) {
+		b, ok := <-s.ch
+		if !ok {
+			return nil, EOF
+		}
+		s.batch = b
+		s.idx = 0
+	}
+	row := s.batch[s.idx]
+	s.idx++
+	return &MaterializedSlot{schema: s.schema, row: row}, nil
+}
+
+// extractSeqScanFromPlan returns the *planner.SeqScan at the root of a plan
+// subtree, unwrapping a single Filter if present. Returns nil when the subtree
+// is not a parallel-scannable shape (e.g. IndexScan, join, subquery).
+func extractSeqScanFromPlan(node planner.Node) *planner.SeqScan {
+	switch n := node.(type) {
+	case *planner.SeqScan:
+		return n
+	case *planner.Filter:
+		if s, ok := n.Child.(*planner.SeqScan); ok {
+			return s
+		}
+	}
+	return nil
+}
+
+// parallelBuildEligible reports whether this hash join's build side can be
+// parallelised. Four conditions must all hold (design §1.3):
+//
+//  1. The join type permits shared probe (INNER/SEMI/ANTI, or LEFT with
+//     probe on the outer side).
+//  2. The build fits in one batch (spilling builds can't be shared).
+//  3. The build child is a parallel-scannable SeqScan (possibly under
+//     Filter).
+//  4. The relation has enough blocks (≥ MinParallelTableScanBlocks).
+//
+// The function never mutates join state.
+func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
+	// Rule 1: must be shareable (P8 eligibility).
+	if o.plan.Type == planner.JoinTypeFull || o.plan.Type == planner.JoinTypeRight {
+		return false
+	}
+	if o.plan.Type == planner.JoinTypeLeft && buildLeft {
+		// LEFT join with build on the left side: the probe (right) would
+		// carry the outer — wrong shape, declined.
+		return false
+	}
+	// FOR UPDATE on the build side uses a CTID-preserving build that
+	// cannot be parallelised (it captures per-tuple heap TIDs via a
+	// dedicated scan leaf).
+	if o.preserveCTIDRel != nil {
+		return false
+	}
+	// Multi-key joins force the string map but are otherwise fine.
+	// Composite keys, however, have a different insertion path
+	// (fileCompositeBuildRow) that the channel-source pattern doesn't
+	// reach — declined for now.
+	if o.multiKey() {
+		return false
+	}
+
+	// Rule 2: must not be projected to spill.
+	buildPlan := o.plan.Right
+	buildWidth := o.lazyRW
+	if buildLeft {
+		buildPlan = o.plan.Left
+		buildWidth = o.lazyLW
+	}
+	if o.joinBatchEligible() {
+		if o.buildGeometry(ctx, buildPlan, buildWidth, buildLeft).NBatch > 1 {
+			return false
+		}
+	}
+
+	// Rule 3: build child must be a SeqScan (possibly under Filter).
+	scan := extractSeqScanFromPlan(buildPlan)
+	if scan == nil {
+		return false
+	}
+
+	// Rule 4: enough blocks.
+	nBlocks, err := ctx.Pool.NBlocks(ctx.Catalog.RelFileNode(scan.Table))
+	if err != nil || int64(nBlocks) < ctx.MinParallelTableScanBlocks {
+		return false
+	}
+
+	return true
+}
+
+// parallelBuildLazyHashTable runs a cooperative parallel hash build.
+//
+// N goroutines scan+filter the build table (producers), each claiming blocks
+// atomically from a shared ParallelScanState. Rows are sent in batches through
+// a buffered channel to the calling goroutine (consumer), which evaluates hash
+// keys and inserts into the hash map — exactly as the serial build loops do,
+// but from a channelSource instead of from the child operator tree.
+//
+// The consumer runs the SAME buildLoopRight or buildLoopLeft as the serial
+// path. A synthetic channelSource operator replaces o.right or o.left, so the
+// existing build loop needs zero changes.
+func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool, error) {
+	buildPlan := o.plan.Right
+	buildSchema := o.right.Schema()
+	otherWidth := o.lazyLW
+	if buildLeft {
+		buildPlan = o.plan.Left
+		buildSchema = o.left.Schema()
+		otherWidth = o.lazyRW
+	}
+
+	scan := extractSeqScanFromPlan(buildPlan)
+	if scan == nil {
+		return false, fmt.Errorf("parallel build: no SeqScan in build child")
+	}
+
+	// Determine worker count. At least 2 producers, capped by
+	// MaxParallelWorkers. One goroutine is the consumer (the leader); the
+	// rest are producers.
+	maxProducers := ctx.MaxParallelWorkers
+	if maxProducers < 2 {
+		maxProducers = 2
+	}
+
+	group := NewParallelGroup(ctx.Ctx)
+	pscan := newParallelScanState(0)
+	ch := make(chan []Row, gatherChanDepth*(maxProducers+1))
+
+	// Pre-allocate arenas and worker contexts. mctx.Acquire is NOT
+	// goroutine-safe (appends to parent.children without synchronisation).
+	var workerCtxs []*Context
+	var arenas []*mctx.Context
+	for i := 0; i < maxProducers; i++ {
+		arena := mctx.Acquire(ctx.Mctx, mctx.KindStmt)
+		arenas = append(arenas, arena)
+		workerCtxs = append(workerCtxs, NewWorkerContext(ctx, arena, group.Context()))
+	}
+
+	// Launch producers.
+	for i := 0; i < maxProducers; i++ {
+		wctx := workerCtxs[i]
+		group.Go(func(workerCtx context.Context) error {
+			tree, err := BuildWorker(buildPlan)
+			if err != nil {
+				return err
+			}
+			// attachParallelScan wires the shared block allocator into
+			// the driving seqScanOp so each producer claims a disjoint
+			// subset of blocks.
+			if !attachParallelScan(tree, pscan) {
+				return fmt.Errorf("parallel build: no scan in built tree")
+			}
+			if err := tree.Open(wctx); err != nil {
+				return err
+			}
+			defer tree.Close()
+
+			var batch []Row
+			for {
+				slot, err := tree.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					return err
+				}
+				batch = append(batch, MaterializeForTransfer(slot.Row()))
+				if len(batch) >= gatherBatchRows {
+					select {
+					case ch <- batch:
+					case <-workerCtx.Done():
+						return workerCtx.Err()
+					}
+					batch = nil
+				}
+			}
+			if len(batch) > 0 {
+				select {
+				case ch <- batch:
+				case <-workerCtx.Done():
+					return workerCtx.Err()
+				}
+			}
+			return nil
+		})
+	}
+
+	// Close channel after all producers exit so the consumer's build loop
+	// receives EOF through the channelSource.
+	go func() {
+		group.Wait()
+		close(ch)
+	}()
+
+	// Replace the build child with a synthetic operator that reads from the
+	// channel. The old operator was never opened — it is harmless to drop.
+	source := &channelSource{ch: ch, schema: buildSchema}
+
+	// Run the SAME build loop as the serial path, but from the channel.
+	buildStart := time.Now()
+	var loopErr error
+	var probeIsLeft bool
+	if buildLeft {
+		o.left = source
+		if err := o.left.Open(ctx); err != nil {
+			loopErr = err
+		} else {
+			o.presizeLazyHash(ctx, o.plan.Left, o.lazyLW, true)
+			loopErr = o.buildLoopLeft(ctx, otherWidth)
+			_ = o.left.Close()
+		}
+		probeIsLeft = false
+	} else {
+		o.right = source
+		if err := o.right.Open(ctx); err != nil {
+			loopErr = err
+		} else {
+			o.presizeLazyHash(ctx, o.plan.Right, o.lazyRW, false)
+			loopErr = o.buildLoopRight(ctx, otherWidth)
+			_ = o.right.Close()
+		}
+		probeIsLeft = true
+	}
+
+	// Cleanup: same discipline as gatherOp.Close — cancel before draining
+	// so no producer is stuck on send, then drain, then join.
+	//
+	// In the normal path (loopErr == nil) the channel is already closed by
+	// the closer goroutine, so the drain is instant. In the error path the
+	// channel may still be open; Cancel unblocks producers, they exit, the
+	// closer closes the channel, and the drain completes.
+	group.Cancel()
+	for range ch {
+	}
+	group.Wait()
+
+	// Merge per-worker notices/warnings and release arenas.
+	for i := range maxProducers {
+		MergeWorkerContext(ctx, workerCtxs[i])
+		arenas[i].Release()
+	}
+
+	if loopErr != nil {
+		o.releaseBatches()
+		return false, loopErr
+	}
+
+	o.recordBuildTime(ctx, buildStart)
+	return probeIsLeft, nil
 }

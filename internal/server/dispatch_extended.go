@@ -292,11 +292,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 
 	op, err := executor.Build(node)
 	if err != nil {
-		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
+		return nil, newExtendedQueryError(err)
 	}
 	if err := op.Open(ectx); err != nil {
 		_ = op.Close()
-		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
+		return nil, newExtendedQueryError(err)
 	}
 
 	schema := node.Output()
@@ -329,7 +329,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 		if err != nil {
 			_ = op.Close()
-			return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
+			return nil, newExtendedQueryError(err)
 		}
 		if schema != nil {
 			row := slot.Row()
@@ -356,7 +356,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 	}
 	if err := op.Close(); err != nil {
-		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
+		return nil, newExtendedQueryError(err)
 	}
 	if err := ectx.CommitTransaction(tx); err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}

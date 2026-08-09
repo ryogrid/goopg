@@ -10,7 +10,7 @@ import "fmt"
 // *BitmapHeapScan executor plan node. It follows the same scanLeafFor
 // pattern as createIndexScanPlan (createplanindex.go): peel the leaf's
 // *Filter wrappers, build the replacement scan, and rewrap.
-func createBitmapHeapScanPlan(p *Path) Node {
+func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	if p.Rel == nil {
 		panic("createPlan: PathBitmapHeapScan with no RelOptInfo")
 	}
@@ -29,17 +29,27 @@ func createBitmapHeapScanPlan(p *Path) Node {
 	// Each index clause becomes part of the recheck condition.
 	bitmapQual := bitmapQualExprs(p.Children[0])
 
+	// Collect partial-index predicates from the bitmap tree leaves.
+	// PG's create_bitmap_subplan appends indpred to bitmapqualorig for
+	// every partial-index leaf, so the predicate is re-evaluated against
+	// every heap tuple — the safety net for lossy bitmap pages, and the
+	// correct filter when the predicate-implication prover is absent.
+	partialPreds := collectBitmapPartialPredicates(p.Children[0])
+	if len(partialPreds) > 0 {
+		bitmapQual = append(bitmapQual, partialPreds...)
+	}
+
 	bhs := &BitmapHeapScan{
 		pos:   id.pos,
 		Table: id.table,
 		Alias: id.alias,
-		// BitmapQual: the original index qual, re-evaluated on lossy pages
-		// or when the index AM requires recheck.
+		// BitmapQual: the original index qual + partial-index predicates,
+		// re-evaluated on lossy pages or when the index AM requires recheck.
 		BitmapQual: bitmapQual,
 		Outer:      outer,
 		schema:     id.schema,
 	}
-	return rewrap(bhs)
+	return rewrap(bhs), nil
 }
 
 // createBitmapIndexScanPlan translates a PathBitmapIndexScan into a
@@ -106,6 +116,29 @@ func bitmapQualExprs(p *Path) []Expr {
 		}
 	}
 	return exprs
+}
+
+// collectBitmapPartialPredicates walks a bitmap path tree (IndexScan / And / Or)
+// and collects all resolved partial-index predicates from the leaves. These are
+// appended to the BitmapHeapScan's BitmapQual so the executor re-evaluates them
+// against every heap tuple — the safety net for lossy pages (M0129-S5.4).
+func collectBitmapPartialPredicates(p *Path) []Expr {
+	if p == nil {
+		return nil
+	}
+	switch p.Kind {
+	case PathBitmapIndexScan:
+		if p.PartialPredicate != nil {
+			return []Expr{p.PartialPredicate}
+		}
+	case PathBitmapAnd, PathBitmapOr:
+		var preds []Expr
+		for _, child := range p.Children {
+			preds = append(preds, collectBitmapPartialPredicates(child)...)
+		}
+		return preds
+	}
+	return nil
 }
 
 // buildBitmapAndOrPlan translates a PathBitmapAnd or PathBitmapOr into the

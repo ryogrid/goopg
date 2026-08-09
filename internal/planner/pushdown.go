@@ -37,6 +37,16 @@ func pushPredicatesIntoCrossJoins(node Node) Node {
 	if len(conjuncts) == 0 {
 		return node
 	}
+	// M0119-0011: generate transitive closure of ColumnRef = ColumnRef
+	// equalities (e.g. c_nationkey = s_nationkey AND s_nationkey = n_nationkey
+	// → c_nationkey = n_nationkey) so the pushdown pass has every clause it
+	// needs to constrain all relations in a 3+-member equivalence class.
+	// inferTransitiveEqualities was wired into the old bushy DP (deleted);
+	// without this call the legacy comma-FROM path under-emits join clauses for
+	// equivalence classes spanning three or more relations.
+	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
+		conjuncts = append(conjuncts, synth...)
+	}
 	var remaining []Expr
 	for _, c := range conjuncts {
 		if !pushOneConjunct(f.Child, c) {

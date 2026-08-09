@@ -133,11 +133,11 @@ func New(name string, opts Options) (*Cluster, error) {
 	}
 	startup := opts.StartupWait
 	if startup <= 0 {
-		startup = 10 * time.Second
+		startup = 20 * time.Second
 	}
 	shutdown := opts.ShutdownWait
 	if shutdown <= 0 {
-		shutdown = 10 * time.Second
+		shutdown = 20 * time.Second
 	}
 	return &Cluster{
 		name:         name,
@@ -280,7 +280,10 @@ func (c *Cluster) Stop(mode ShutdownMode) error {
 	if mode == "" {
 		mode = ShutdownFast
 	}
-	res, err := c.runGoopg("stop", "-D", c.dataDir, "-mode", string(mode), "-t", strconv.Itoa(int(c.shutdownWait.Seconds())))
+	// Use an adaptive timeout: the goopg stop command itself waits up to
+	// shutdownWait seconds, plus "go run" may need to recompile the binary
+	// (cold-cache ~10s). A fixed 30s races shutdownWait=20s + compile.
+	res, err := c.runGoopgTimeout(c.shutdownWait+30*time.Second, "stop", "-D", c.dataDir, "-mode", string(mode), "-t", strconv.Itoa(int(c.shutdownWait.Seconds())))
 	if err != nil {
 		return err
 	}
@@ -603,12 +606,16 @@ func (c *Cluster) TruncateLog() error {
 }
 
 func (c *Cluster) runGoopg(args ...string) (util.CommandResult, error) {
+	return c.runGoopgTimeout(30*time.Second, args...)
+}
+
+func (c *Cluster) runGoopgTimeout(timeout time.Duration, args ...string) (util.CommandResult, error) {
 	cmdArgs := append(append([]string{}, c.goopgCommand[1:]...), args...)
 	return util.RunCommand(util.CommandSpec{
 		Name:    c.goopgCommand[0],
 		Args:    cmdArgs,
 		Dir:     c.repoRoot,
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 	})
 }
 

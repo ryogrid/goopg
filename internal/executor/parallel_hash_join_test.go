@@ -105,6 +105,8 @@ func pqJoinCorpus() []string {
 // findPartialSubtree picked the build side, this is where it shows.
 func runJoinGathered(t *testing.T, ctx *Context, sql string, workers int) ([]string, bool) {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse: %v", err)

@@ -125,3 +125,84 @@ func TestHeapLoadIdempotent(t *testing.T) {
 		t.Errorf("shared has %d cols, want 1", len(tbl.Columns))
 	}
 }
+
+// TestBpCharVarcharTypModRestoredAfterRestart verifies M0119-0010: after a
+// server restart, bpchar/varchar columns restore their length (Type.Args) from
+// the pg_attribute heap's atttypmod field. Before the fix, Args was always nil
+// after reload, so every character column was checked against the default
+// char(1) length.
+func TestBpCharVarcharTypModRestoredAfterRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ct(a char(1), b char(25), c varchar(50))
+	runDDL(t, rt1, `CREATE TABLE ct (
+		a character(1),
+		b character(25),
+		c character varying(50)
+	)`)
+	if err := rt1.SaveCatalog(); err != nil {
+		rt1.Close()
+		t.Fatal(err)
+	}
+	rt1.Close()
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	tbl, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "ct"})
+	if !ok {
+		t.Fatal("ct not found in catalog after restart")
+	}
+	if len(tbl.Columns) != 3 {
+		t.Fatalf("ct has %d columns, want 3", len(tbl.Columns))
+	}
+
+	// Column "a" — char(1): Args should be [1] (default, no typmod). PG
+	// stores 1 + VARHDRSZ = 5; goopg's pgTypeArgsFromTypmod subtracts 4 → 1.
+	// If AttTypMod was zero (unset), Args is nil and the codec falls back to n=1,
+	// which happens to match — so we also check that Args is genuinely present.
+	colA := tbl.Columns[0]
+	if colA.Name != "a" {
+		t.Errorf("col[0].Name=%q want a", colA.Name)
+	}
+	if colA.Type.Name != "bpchar" {
+		t.Errorf("col[0].Type.Name=%q want bpchar", colA.Type.Name)
+	}
+	if len(colA.Type.Args) != 1 || colA.Type.Args[0] != 1 {
+		t.Errorf("col[0].Type.Args=%v want [1]", colA.Type.Args)
+	}
+
+	// Column "b" — char(25): Args should be [25].
+	colB := tbl.Columns[1]
+	if colB.Name != "b" {
+		t.Errorf("col[1].Name=%q want b", colB.Name)
+	}
+	if colB.Type.Name != "bpchar" {
+		t.Errorf("col[1].Type.Name=%q want bpchar", colB.Type.Name)
+	}
+	if len(colB.Type.Args) != 1 || colB.Type.Args[0] != 25 {
+		t.Errorf("col[1].Type.Args=%v want [25]", colB.Type.Args)
+	}
+
+	// Column "c" — varchar(50): Args should be [50].
+	colC := tbl.Columns[2]
+	if colC.Name != "c" {
+		t.Errorf("col[2].Name=%q want c", colC.Name)
+	}
+	if colC.Type.Name != "varchar" {
+		t.Errorf("col[2].Type.Name=%q want varchar", colC.Type.Name)
+	}
+	if len(colC.Type.Args) != 1 || colC.Type.Args[0] != 50 {
+		t.Errorf("col[2].Type.Args=%v want [50]", colC.Type.Args)
+	}
+}

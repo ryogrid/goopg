@@ -373,6 +373,12 @@ func (o *utilityNoOp) Close() error             { return nil }
 // of rows, then closes. Production paths use Open/Next/Close
 // directly so they can stream into the wire-protocol encoder.
 func Run(op Operator, ctx *Context) ([]Row, error) {
+	// M0129-S8.3: advance the command counter before executing the operator,
+	// matching PG's per-statement CommandCounterIncrement in the dispatch layer
+	// (production paths advance before calling Build — Run is exclusively a
+	// test helper and must do the same).
+	ctx.CommandCounterIncrement()
+	ctx.CmdID = ctx.GetCurrentCommandId(true)
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
 		return nil, err

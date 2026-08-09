@@ -237,6 +237,8 @@ func TestExecDropProcedureRemovesEntry(t *testing.T) {
 // no-Session Context (autocommit).
 func runRoutineDDLInSession(t *testing.T, ctx *Context, sql string, cat catalog.Catalog) error {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	plan := planOne(t, sql, cat)
 	op, err := Build(plan)
 	if err != nil {

@@ -9,7 +9,7 @@ import (
 // mappingDictOIDs returns the DictOIDs slice for tokenType on the named
 // configuration, or nil if the configuration/mapping is not found.
 func mappingDictOIDs(im *catalog.InMemory, cfgName, tokenType string) []uint32 {
-	for _, uc := range im.ListUserTSConfigs() {
+	for _, uc := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
 		if uc.Name != cfgName {
 			continue
 		}

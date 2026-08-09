@@ -98,7 +98,10 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathMemoize outside a nested-loop inner; goopg's cache is NestedLoopIndexJoin.InnerMemo and has no free-standing node")
 	case PathBitmapHeapScan:
 		// M0128-P2.4: bitmap heap scan — the page-at-a-time heap visitor.
-		n := createBitmapHeapScanPlan(p)
+		n, err := createBitmapHeapScanPlan(p)
+		if err != nil {
+			return nil, nil
+		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathBitmapIndexScan:
 		// M0128-P2.4: bitmap index scan — the TIDBitmap producer leaf.

@@ -151,6 +151,8 @@ func TestEnumSeqScanAfterInsenum(t *testing.T) {
 
 // runQueryWithErr executes a SQL query and returns the rows and any execution error.
 func runQueryWithErr(ctx *Context, sql string) ([]Row, error) {
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err

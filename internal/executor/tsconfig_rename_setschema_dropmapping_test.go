@@ -28,7 +28,7 @@ func TestAlterTSConfigRenameTo(t *testing.T) {
 	}
 
 	found := false
-	for _, uc := range im.ListUserTSConfigs() {
+	for _, uc := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
 		if uc.Name == "ts_ren_cfg2" {
 			found = true
 		}
@@ -79,7 +79,7 @@ func TestAlterTSConfigSetSchema(t *testing.T) {
 		t.Fatal("SchemaOID(\"ts_other_schema\") = 0, want a real namespace OID")
 	}
 	var uc *catalog.UserTSConfig
-	for _, c := range im.ListUserTSConfigs() {
+	for _, c := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
 		if c.Name == "ts_schema_cfg" {
 			uc = c
 		}
@@ -126,7 +126,7 @@ func TestAlterTSConfigDropMapping(t *testing.T) {
 	if err := runDDL(t, ctx, `ALTER TEXT SEARCH CONFIGURATION ts_drop_cfg DROP MAPPING FOR word`); err != nil {
 		t.Fatalf("DROP MAPPING: %v", err)
 	}
-	for _, c := range im.ListUserTSConfigs() {
+	for _, c := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
 		if c.Name != "ts_drop_cfg" {
 			continue
 		}

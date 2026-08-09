@@ -770,7 +770,8 @@ func execErrCode(err error) sqlstate.Code {
 	return sqlstate.SystemError
 }
 
-// execErrDetailFields returns extra ErrorField(s) for any Detail and Hint carried by the error. M0097-0003.
+// execErrDetailFields returns extra ErrorField(s) for any Detail, Hint, Context,
+// and FieldPosition carried by the error. M0097-0003, M0129-S10.
 func execErrDetailFields(err error) []protocol.ErrorField {
 	var ee *executor.ExecError
 	if !errors.As(err, &ee) {
@@ -786,6 +787,10 @@ func execErrDetailFields(err error) []protocol.ErrorField {
 	if ee.Context != "" {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldWhere, Value: ee.Context})
 	}
+	// ExecError.Pos is 0-based (0 = unset); wire protocol FieldPosition is 1-based.
+	if ee.Pos > 0 {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(ee.Pos + 1)})
+	}
 	return fields
 }
 
@@ -797,4 +802,23 @@ func execErrMsg(err error) string {
 		return ee.Message
 	}
 	return err.Error()
+}
+
+// newExtendedQueryError builds an extendedQueryError from an executor error,
+// extracting Code, Message, Detail, and Position (0-based → 1-based). M0129-S10.
+func newExtendedQueryError(err error) *extendedQueryError {
+	var ee *executor.ExecError
+	if errors.As(err, &ee) {
+		pos := 0
+		if ee.Pos > 0 {
+			pos = ee.Pos + 1 // 0-based → 1-based
+		}
+		return &extendedQueryError{
+			Code:     execErrCode(err),
+			Message:  execErrMsg(err),
+			Detail:   ee.Detail,
+			Position: pos,
+		}
+	}
+	return &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 }

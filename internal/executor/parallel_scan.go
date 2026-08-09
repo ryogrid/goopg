@@ -150,3 +150,40 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 	}
 	return false
 }
+
+// attachParallelBitmapScan wires op's driving bitmap heap scan to the shared
+// bitmap state, so each worker claims disjoint pages from the pre-built
+// TIDBitmap. (S5.6)
+//
+// The walk mirrors attachParallelScan: it descends through row-wise wrappers
+// and stops at the first bitmapHeapScanOp. An unmodelled node is left alone,
+// which declines to parallelise rather than risk a wrong result.
+func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
+	if st == nil {
+		return false
+	}
+	switch x := op.(type) {
+	case *bitmapHeapScanOp:
+		x.pbm = st
+		return true
+	case *filterOp:
+		return attachParallelBitmapScan(x.child, st)
+	case *projectOp:
+		return attachParallelBitmapScan(x.child, st)
+	case *instrumentedOp:
+		return attachParallelBitmapScan(x.inner, st)
+	case *joinOp:
+		// P8: only the PROBE side is partial.
+		if probeSideIsLeft(x.plan) {
+			return attachParallelBitmapScan(x.left, st)
+		}
+		return attachParallelBitmapScan(x.right, st)
+	case *aggregateOp:
+		// P9: Partial aggregate must read only its worker's partition.
+		return attachParallelBitmapScan(x.child, st)
+	case *sortOp:
+		// P7: per-worker Sort under Gather Merge.
+		return attachParallelBitmapScan(x.child, st)
+	}
+	return false
+}

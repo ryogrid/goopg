@@ -255,6 +255,16 @@ type bitmapHeapScanOp struct {
 	// Stats.
 	exactPages int64
 	lossyPages int64
+
+	// pbm, when non-nil, makes this a PARALLEL bitmap scan: pages are claimed
+	// from a shared atomic allocator instead of iterating locally, so N
+	// workers partition the bitmap's sorted block list. The bitmap itself is
+	// built once by the leader before fan-out. (S5.6)
+	pbm *parallelBitmapState
+
+	// ownBitmap flags that this operator built the bitmap itself and must
+	// release it at Close. false when the bitmap is shared (pbm != nil).
+	ownBitmap bool
 }
 
 func newBitmapHeapScanOp(p *planner.BitmapHeapScan) *bitmapHeapScanOp {
@@ -285,6 +295,13 @@ func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 	// Create mctx for per-page byte arena.
 	if ctx.Mctx != nil {
 		o.mctx = mctx.Acquire(ctx.Mctx, mctx.KindExpr)
+	}
+
+	// S5.6: when a parallel bitmap state is attached, the bitmap was already
+	// built by the leader and published there. Workers skip building the outer
+	// tree entirely — they claim pages from the shared allocator.
+	if o.pbm != nil {
+		return nil
 	}
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
@@ -339,6 +356,15 @@ func (o *bitmapHeapScanOp) releasePinned() {
 
 // Next advances the bitmap iterator and returns the next matching heap tuple.
 func (o *bitmapHeapScanOp) Next() (TupleSlot, error) {
+	// S5.6: parallel path — claim pages from the shared atomic allocator.
+	if o.pbm != nil {
+		return o.nextParallel()
+	}
+	return o.nextSerial()
+}
+
+// nextSerial is the original serial Next() path.
+func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 	for {
 		// Lazily build the bitmap on first call.
 		if o.tbm == nil {
@@ -348,6 +374,7 @@ func (o *bitmapHeapScanOp) Next() (TupleSlot, error) {
 			}
 			o.tbm = tbm
 			o.iter = tbmBeginIterate(tbm)
+			o.ownBitmap = true
 		}
 
 		// Advance the TBM iterator.
@@ -395,6 +422,116 @@ func (o *bitmapHeapScanOp) Next() (TupleSlot, error) {
 	}
 }
 
+// nextParallel claims pages from the shared parallelBitmapState.
+//
+// The leader built the TIDBitmap once before fan-out and published it in
+// o.pbm. Each worker (and the leader, when participating) calls this to
+// claim disjoint pages. The iteration is page-at-a-time — the same
+// granularity as the serial iterator, so the pin/release cadence is
+// identical.
+//
+// Unlike fetchExact (which recursively calls o.Next() for the serial path),
+// the parallel path inlines the fetch logic so that an invisible tuple
+// simply advances to the next offset on the same page rather than
+// accidentally claiming a new page from the shared allocator.
+func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
+	for {
+		block, entry, ok := o.pbm.nextPage()
+		if !ok {
+			// Exhausted.
+			o.releasePinned()
+			return nil, nil
+		}
+
+		// Pin the page.
+		o.releasePinned()
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.rel, Block: block})
+		if err != nil {
+			return nil, err
+		}
+		slot.RLock()
+		o.pinned = slot
+		o.pageBuf = slot.Page()
+		o.pageBlock = block
+		o.mctx.Reset()
+
+		if entry.isLossy {
+			o.lossyPages++
+			// Lossy pages: the serial path does not iterate all offsets
+			// (the original Next() issued `continue` for lossy). Match that
+			// here — a lossy page emits nothing through this operator.
+			// Full lossy-page iteration is deferred (S5.x follow-up).
+			continue
+		}
+
+		// Exact page: extract and iterate offsets.
+		o.exactPages++
+		n := tbmExtractPageTuple(entry, nil)
+		if n == 0 {
+			continue
+		}
+		offsets := make([]uint16, n)
+		tbmExtractPageTuple(entry, offsets)
+		for _, off := range offsets {
+			// Inline the per-tuple fetch, avoiding fetchExact's recursive
+			// o.Next() call which would claim a fresh page from the shared
+			// allocator and lose the remaining TIDs on this page.
+			row, err := o.fetchOneTuple(block, off, entry.recheck)
+			if err != nil {
+				return nil, err
+			}
+			if row != nil {
+				return row, nil
+			}
+		}
+	}
+}
+
+// fetchOneTuple fetches and decodes a single tuple at (block, offset).
+// Returns (nil, nil) when the tuple is invisible or reclaimed — the caller
+// advances to the next offset. Does NOT recursively call Next().
+func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+	id, err := storage.PageGetItemID(o.pageBuf, offset)
+	if err != nil {
+		return nil, nil // entry reclaimed, skip
+	}
+	if id.Flags == storage.ItemIDUnused || id.Flags == storage.ItemIDDead {
+		return nil, nil // entry reclaimed, skip
+	}
+
+	// Follow HOT chain + MVCC visibility.
+	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
+	if !found {
+		return nil, nil // tuple invisible, skip
+	}
+
+	// Lazily allocate scanRow.
+	if o.scanRow == nil || len(o.scanRow) != len(o.tbl.Columns) {
+		o.scanRow = acquireRow(len(o.tbl.Columns))
+	}
+
+	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+	if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.mctx); err != nil {
+		return nil, nil // decode failure, skip
+	}
+
+	// If recheck is required, evaluate the original index qual.
+	if recheck && len(o.plan.BitmapQual) > 0 {
+		passed, evalErr := o.evalBitmapQual()
+		if evalErr != nil {
+			return nil, evalErr
+		}
+		if !passed {
+			return nil, nil // recheck failed, skip
+		}
+	}
+
+	// Clone arena-backed data.
+	row := cloneRowOwned(o.scanRow)
+	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
+	return &o.slot, nil
+}
+
 // fetchExact fetches a specific tuple at the given offset.
 func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
 	// Check that the line pointer is still valid.
@@ -407,7 +544,7 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 	}
 
 	// Follow HOT chain + MVCC visibility.
-	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
+	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
 	if !found {
 		return o.Next() // tuple invisible, skip
 	}

@@ -29,6 +29,8 @@ import (
 // runtime error (unlike runSQL, which t.Fatals on error).
 func runMergeStmt(t *testing.T, ctx *Context, sql string) error {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return err

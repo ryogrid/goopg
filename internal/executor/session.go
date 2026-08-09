@@ -203,6 +203,7 @@ type BasicSession struct {
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
 	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 	autocommitUndoScope bool                       // see NewAutocommitUndoSession / TracksDDLUndo (root-0024 residual, M0110-0001)
+	cmdCounter          CommandCounter             // per-transaction command counter (M0129-S8.3)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -258,7 +259,13 @@ func (s *BasicSession) BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.S
 	s.tx = tx
 	s.snap = snap.Clone()
 	s.inTx = true
+	s.cmdCounter.Reset() // M0129-S8.3: fresh command counter per transaction
 }
+
+// CmdCounter returns a pointer to the session's per-transaction command counter
+// so dispatch can seed a fresh Context with the correct prior-command state.
+// M0129-S8.3.
+func (s *BasicSession) CmdCounter() *CommandCounter { return &s.cmdCounter }
 
 // RelocateTransaction updates the session's cached transaction handle after the
 // transaction has been moved to a dedicated proc slot (PREPARE TRANSACTION
@@ -318,6 +325,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	// drops the stats snapshot at every transaction boundary so the next
 	// transaction reads live values again. M0118-0009 (stats_fetch_consistency).
 	s.statsSnapshot = nil
+	s.cmdCounter.Reset() // M0129-S8.3: reset command counter at transaction boundary
 }
 
 // ensureStatsSnapshot returns the session's per-transaction cumulative-stats

@@ -6,77 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
-	"github.com/goopg/goopg/internal/storage"
 )
-
-// CTEFencePtr identifies one heap tuple for the DML-CTE write fence.
-//
-// The relation is part of the key because an ItemPointer alone is not unique
-// across relations: {block 0, offset 1} exists in every table, so a
-// relation-blind fence hides an unrelated table's row from the rest of the
-// statement. That collision was already known — the EvalPlanQual site in
-// operators_storage.go worked around it by re-reading the tuple and checking
-// xmin — and M0125-0052 made it reachable in the common case by registering
-// plain INSERTs, which land at low block/offset numbers in every table.
-type CTEFencePtr struct {
-	Rel storage.RelFileNode
-	Ptr storage.ItemPointer
-}
-
-// cteFenceInsert registers a tuple a sub-statement of a data-modifying WITH
-// just inserted, so every later scan in the same statement skips it. No-op
-// outside such a statement.
-//
-// PostgreSQL needs no such set: all sub-statements of a data-modifying WITH
-// share `estate->es_snapshot` AND `estate->es_output_cid`, so a sibling's
-// tuple is filtered by the cmin test in HeapTupleSatisfiesMVCC
-// (postgres/src/backend/access/heap/heapam_visibility.c). goopg's heap has no
-// per-tuple command id, so the fence stands in for the cmin test — and it
-// records ctx.CmdID as that missing cmin, so cteFenced can reproduce PG's
-// `cmin >= curcid` comparison rather than an unconditional hide.
-//
-// The OUTER statement's own writes belong in the fence too (M0125-0054): once
-// the outer body runs first, a CTE deferred to the post-body phase would
-// otherwise see rows the outer statement inserted, where PG's cmin test hides
-// them. That is why the gate is the fence's existence, not InDMLCTE.
-func cteFenceInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
-	if ctx.CTEWriteFence == nil {
-		return
-	}
-	ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: ptr}] = ctx.CmdID
-}
-
-// cteFenceUpdate registers the new version of a tuple a sub-statement of a
-// data-modifying WITH just updated, and records the old version as killed by
-// this context's command id. No-op outside such a statement. oldRel and newRel
-// differ when the update moved the row across partitions.
-func cteFenceUpdate(ctx *Context, oldRel storage.RelFileNode, oldPtr storage.ItemPointer,
-	newRel storage.RelFileNode, newPtr storage.ItemPointer) {
-	if ctx.CTEWriteFence == nil {
-		return
-	}
-	ctx.CTEWriteFence[CTEFencePtr{Rel: newRel, Ptr: newPtr}] = ctx.CmdID
-	// The old version now carries our own xmax, which would hide it from the
-	// rest of the statement — but PG still shows its PRE-IMAGE to every command
-	// whose curcid is at most the killing cmax. Reveal it. M0125-0053.
-	cteFenceDelete(ctx, oldRel, oldPtr)
-}
-
-// cteFenceDelete registers a tuple whose xmax a sub-statement of this
-// data-modifying WITH just stamped, so read scans in the rest of the statement
-// still see its pre-image. No-op outside such a statement. See
-// Context.CTEXmaxReveal for why writes must not consult the set this fills.
-//
-// As with the fence, the outer statement's own victims belong here too
-// (M0125-0054): PG's cmax-vs-es_output_cid test is symmetric between the CTEs
-// and the main plan, so a CTE deferred to the post-body phase must still see
-// the pre-image of a row the outer statement removed.
-func cteFenceDelete(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) {
-	if ctx.CTEXmaxReveal == nil {
-		return
-	}
-	ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: ptr}] = ctx.CmdID
-}
 
 // routineCommandCounterIncrement is goopg's CommandCounterIncrement: it moves
 // a stored routine's body one command id past its caller, so the body sees
@@ -104,96 +34,12 @@ func routineCommandCounterIncrement(child *Context, r *catalog.Routine) {
 	case "s", "i":
 		return // readonly_func: no CommandCounterIncrement upstream either
 	}
-	child.CmdID++
-}
-
-// cteRevealFn answers "is this slot of the page being scanned a pre-image a
-// DML CTE of this statement removed?". nil means no reveal is in effect —
-// which is the case for every statement that has no data-modifying WITH, and
-// for every DML target scan regardless.
-type cteRevealFn func(slot uint16) bool
-
-// cteRevealed is the direct (non-closure) form of cteRevealFn, for read scans
-// that test one slot at a time rather than walking a HOT chain.
-func cteRevealed(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
-	if len(ctx.CTEXmaxReveal) == 0 {
-		return false
-	}
-	killCmd, ok := ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
-	return ok && killCmd >= ctx.CmdID
-}
-
-// cteRevealHeader returns h with its xmax cleared, so the ordinary visibility
-// test judges the tuple as if this statement's DML CTE had never stamped it.
-//
-// Being in CTEXmaxReveal is NOT on its own a licence to show the tuple: PG
-// relaxes only the cmax arm of HeapTupleSatisfiesMVCC, and the xmin snapshot
-// test still has to pass. The difference is not academic — INSERT … ON
-// CONFLICT DO UPDATE carries a documented MVCC violation that lets it update a
-// tuple *not visible to the command's snapshot* (see the header comment of
-// postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec), so a
-// CTE upsert can stamp a version this statement was never allowed to see.
-// Revealing that version unconditionally produced a duplicate key in
-// TestPort_IsolationInsertConflictDoUpdate3: the snapshot-visible version of
-// the row was returned alongside it.
-//
-// Clearing Xmax alone is sufficient — TupleVisible/TupleVisibleSubxact reach
-// no xmax infomask bit once Xmax is invalid — and the header is passed by
-// value, so the caller's tuple is untouched.
-func cteRevealHeader(h storage.HeapTupleHeader) storage.HeapTupleHeader {
-	h.Xmax = storage.InvalidTransactionID
-	return h
-}
-
-// cteRevealFor builds the reveal predicate for a read scan of one heap block,
-// or returns nil when there is nothing to reveal. Returning nil rather than an
-// always-false closure keeps the ordinary scan path allocation-free.
-func cteRevealFor(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber) cteRevealFn {
-	if ctx == nil || len(ctx.CTEXmaxReveal) == 0 {
-		return nil
-	}
-	cmdID := ctx.CmdID
-	return func(slot uint16) bool {
-		killCmd, ok := ctx.CTEXmaxReveal[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
-		return ok && killCmd >= cmdID
-	}
-}
-
-// cteFenced reports whether a tuple written by a sub-statement of this
-// data-modifying WITH must be skipped by the scan running now — PG's
-// `cmin >= curcid ⇒ invisible` arm of HeapTupleSatisfiesMVCC, with the fence
-// value standing in for cmin and ctx.CmdID for curcid. A tuple written at a
-// LOWER command id (i.e. by the statement itself, seen from inside a VOLATILE
-// routine this statement called) is NOT fenced: PG's CommandCounterIncrement
-// makes exactly that work visible. See Context.CmdID.
-func cteFenced(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
-	if ctx.CTEWriteFence == nil {
-		return false
-	}
-	writeCmd, ok := ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
-	return ok && writeCmd >= ctx.CmdID
-}
-
-// cteWrittenByLaterCommand reports whether the tuple at (rel, blk, slot) was
-// written by a command that ran AFTER the one executing now — i.e. by a
-// VOLATILE routine this statement itself invoked.
-//
-// This is the condition PostgreSQL reports as TM_SelfModified with
-// `tmfd.cmax != estate->es_output_cid`. An EvalPlanQual chain-follow applies no
-// cmin test (heapam_handler.c heapam_tuple_lock with
-// TUPLE_LOCK_FLAG_FIND_LAST_VERSION just walks t_ctid), so a concurrently
-// updated row can lead the outer UPDATE/DELETE straight into a version its own
-// statement's sub-command produced. PG refuses to merge that with the original
-// update and errors instead — nodeModifyTable.c ExecUpdate:2656 /
-// ExecDelete, ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION (27000). When the
-// version was written by the SAME command, PG silently ignores the redundant
-// update, which is the caller's `continue`.
-func cteWrittenByLaterCommand(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
-	if ctx.CTEWriteFence == nil {
-		return false
-	}
-	writeCmd, ok := ctx.CTEWriteFence[CTEFencePtr{Rel: rel, Ptr: storage.ItemPointer{Block: blk, Offset: slot}}]
-	return ok && writeCmd > ctx.CmdID
+	// M0129-S8.2: advance the child's command counter. CommandCounterIncrement
+	// only actually advances when the used flag is set (a write happened in
+	// the parent), matching PostgreSQL's lazy-advance scheme. Then pin the
+	// new command id as the child's es_output_cid.
+	child.CommandCounterIncrement()
+	child.CmdID = child.GetCurrentCommandId(true)
 }
 
 // cteDMLPrefixOp drives the data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -278,15 +124,6 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 		ctx.MaterializedCTEs = make(map[string][][]Datum)
 	}
 
-	// CTE snapshot isolation: initialise the write fence and its mirror.
-	// Every sub-statement of this WITH — the CTEs and the outer body alike —
-	// registers what it writes, and every scan of the others skips it, so
-	// PostgreSQL's "the sub-statements cannot see one another's effects on the
-	// target tables" holds regardless of the order they run in.
-	ctx.CTEWriteFence = make(map[CTEFencePtr]int)
-	ctx.CTEXmaxReveal = make(map[CTEFencePtr]int)
-	ctx.InDMLCTE = false
-
 	o.ran = make([]bool, len(o.plan.DMls))
 	o.running = make([]bool, len(o.plan.DMls))
 	o.prevPending = ctx.pendingDMLCTEs
@@ -326,11 +163,8 @@ func (o *cteDMLPrefixOp) runDMLCTE(i int) error {
 	o.running[i] = true
 	ctx := o.ctx
 	savedSnap := ctx.Snap
-	savedInCTE := ctx.InDMLCTE
-	ctx.InDMLCTE = true
 	defer func() {
 		o.running[i] = false
-		ctx.InDMLCTE = savedInCTE
 		// The sub-statements all read the statement-start snapshot; a DML
 		// plan that took its own must not leak it back to the caller.
 		ctx.Snap = savedSnap

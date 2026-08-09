@@ -37,6 +37,8 @@ func nndNewTable(t *testing.T, ctx *Context, cat catalog.Catalog, name string, i
 // uniqueness check) and returns its error (nil on success).
 func nndInsert(t *testing.T, ctx *Context, tbl *catalog.Table, vals ...planner.Expr) error {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	op, err := Build(&planner.Insert{
 		Table:       tbl,
 		Source:      &planner.Values{Rows: [][]planner.Expr{vals}},
@@ -179,6 +181,8 @@ func TestNullsNotDistinctUpdateNoSelfConflict(t *testing.T) {
 		},
 		Set: []planner.Expr{nil, &planner.IntegerConst{Value: 2}},
 	}
+	// M0129-S8.3: advance the command counter so the UPDATE sees the seed row.
+	advanceStmtCounter(ctx)
 	op, err := Build(upd)
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +207,8 @@ func TestNullsNotDistinctUpdateNoSelfConflict(t *testing.T) {
 // number of rows affected by the upsert op.
 func nndUpsert(t *testing.T, ctx *Context, tbl *catalog.Table, idx *catalog.Index, action planner.OnConflictAction, setB planner.Expr, vals ...planner.Expr) int64 {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	oc := &planner.OnConflictPlan{
 		Action:         action,
 		ArbiterIndex:   idx,
@@ -298,6 +304,8 @@ func TestNullsNotDistinctOnConflictDoUpdate(t *testing.T) {
 	if ra := nndUpsert(t, ctx, tbl, idx, planner.OnConflictActionUpdate, i(7), null(), i(2)); ra != 1 {
 		t.Fatalf("DO UPDATE on NULL conflict: RowsAffected=%d want 1", ra)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees the upserted row.
+	advanceStmtCounter(ctx)
 	if got := nndScanColB(t, ctx, tbl); len(got) != 1 || got[0].Int != 7 {
 		t.Fatalf("heap after DO UPDATE = %+v, want exactly one row with b=7 (existing NULL row updated)", got)
 	}
@@ -501,6 +509,8 @@ func TestNullsDistinctOnConflictControlInserts(t *testing.T) {
 	if ra := nndUpsert(t, ctx, tbl, idx, planner.OnConflictActionNothing, nil, null(), i(2)); ra != 1 {
 		t.Fatalf("DO NOTHING under NULLS DISTINCT: RowsAffected=%d want 1 (NULL never conflicts)", ra)
 	}
+	// M0129-S8.3: advance the command counter so the scan sees both inserted rows.
+	advanceStmtCounter(ctx)
 	if got := nndScanColB(t, ctx, tbl); len(got) != 2 {
 		t.Fatalf("heap after DO NOTHING = %+v, want 2 rows (both NULL keys admitted)", got)
 	}

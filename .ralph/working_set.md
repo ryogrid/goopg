@@ -1,41 +1,29 @@
-Task: M0129-S6 COMPLETE — resjunk-ctid column path re-enable
+Task: M0119-0004 — DU-002 next blocker: ALTER SERVER OWNER TO
+
 Files:
-- internal/planner/planner.go: numCtid := wireRowMarkCtidColumns(out, locks);
-  recomputeIntermediateSchemas(out) when numCtid>0;
-  fixColumnRefIndices fixes ALL ColumnRefs via (name,SourceTableIdx) lookup;
-  ctid ColumnRefs now carry SourceTableIdx:-1
-- internal/planner/locking_test.go: re-enabled TestPlanCtidRowMarkWiring +
-  TestPlanCtidRowMarkMultiTable; NEW TestPlanCtidRowMarkSelfJoin
-- docs/design/0129-0003-resjunk-ctid-column-path.md: status → accepted
-- .ralph/fix_plan.md: M0129-S6 → [x]
+- internal/parser/ddl.go: added ALTER SERVER dispatch in parseAlter() (after ALTER FOREIGN DATA WRAPPER, before ALTER FOREIGN TABLE). Detects `server` ident keyword, consumes server name + trailing clauses (including OPTIONS with balanced parens), returns CompatNoopStmt with Tag="ALTER SERVER", ObjType="server".
+- internal/parser/op_compat_test.go: added TestParseAlterServerOwner (OWNER TO, OWNER TO CURRENT_USER, OPTIONS, VERSION forms)
 
 Key symbols:
-- recomputeIntermediateSchemas (planner.go): post-order recomputation of
-  Join/NLIJ schemas from children's Output()
-- fixColumnRefIndices + fixColumnRefsInExpr (planner.go): (name,srcIdx) lookup
-  in child output; walks sub-expressions via exprChildSlots
-- columnKey struct: {name string, srcIdx int16} for disambiguation
+- parseAlter: new `if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "server")` block
+- execCompatNoop: NO CHANGE needed — existing `case "server":` idempotently handles ALTER SERVER (RegisterForeignServer merges only non-empty fields, all empty for ALTER)
 
 Hypothesis/Findings:
-- Column path re-enabled with correct schema propagation.
-- All planner unit tests pass including self-join ctid disambiguation.
-- Isolation test (TestPort_IsolationEvalPlanQual) has a PRE-EXISTING failure
-  (same diff at f96b669d — verified by stash test). The column-path disable
-  was masking a slot-side-channel self-join TID-loss bug, not preventing
-  a regression.
-- Slot side-channel retained as belt-and-braces (CTE scans, VALUES).
-- S6 subsumes S3 (sort-spill TID loss): a ctid datum in the row survives
-  spill like any other column. S3 reduces to verifying the shape and closing
-  root-0038.
+- ALTER SERVER OWNER TO was the parseAlter DU-002 blocker from the previous loop. FIXED.
+- ALTER FOREIGN DATA WRAPPER OWNER TO: already handled by the existing token-skipping default case in the parseAlter FDW branch.
+- ALTER EVENT TRIGGER OWNER TO: already handled explicitly (ddl.go:8064-8080).
+- Next blocker: `NOT NULL pid` syntax error in CREATE TABLE with INHERITS — pg_dump emits bare `NOT NULL pid` column constraint for inherited NOT NULL columns. Parser fails with "expected identifier (got not)" at the NOT keyword. This is a different class of gap (column-constraint parsing in CREATE TABLE INHERITS body), not another ALTER OWNER TO.
 
-Next step: M0129-S7 (clause-6 re-adjudication) — run the estimate-audit
-comparison; no engine change expected.
+Next step:
+Fix the "NOT NULL pid" column-constraint parsing gap in CREATE TABLE INHERITS. The NOT NULL constraint is emitted as a standalone column constraint item in the table body (not part of the column definition), and the parser doesn't recognize it in that position.
 
 Gates run:
-- UNITS: PASS (all packages)
-- SPOT: PASS (Q12=2 Q13=35)
-- DS05: PASS (95/99, 0 deltas, plan shapes identical)
-- ISOLATION: pre-existing failure (not a regression)
-- pgbench smoke: PASS (401 TPS, 0 failures)
+- go build ./...: PASS
+- go test ./internal/parser/...: PASS (0.045s)
+- go test ./internal/executor/...: PASS (5.809s)
+- TestPort_PgDumpConnectionSetup: PASS (3.68s) — ALTER SERVER assertion passed; round-trip fails at next blocker (NOT NULL pid)
+- RALPH_PRECOMMIT_SCOPE=units: PASS (all packages)
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all workloads)
+- make ralph-state-guard: REPAIRED + OK
 
 In-flight: none

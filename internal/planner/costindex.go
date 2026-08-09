@@ -86,12 +86,11 @@ type indexScanInputs struct {
 //     table): exactly `selectivity * pages` pages, of which only the first is
 //     random and the rest are sequential.
 //
-// A goopg index therefore always prices at `max_IO_cost`, because
-// `indexCorrelationFor` is 0 — see its comment. That is not a stub: it is what
-// PG itself charges for an index whose leading column has no correlation
-// statistic, and it is why a full ordered index scan is normally beaten by a
-// sort over a sequential scan. The slice that makes an ordered scan win is the
-// one that collects the statistic, not this one.
+// A goopg index whose leading column has no correlation statistic prices at
+// `max_IO_cost` (indexCorrelationFor returns 0 when stats are missing), which
+// matches PG's default for the uncorrelated case. When ANALYZE has collected a
+// correlation statistic, the blend takes effect and the cost interpolates
+// between the random and sequential extremes.
 func costIndexScan(cp costParams, in indexScanInputs) Cost {
 	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	startupCost := idxStartup
@@ -232,30 +231,31 @@ func indexPagesFetched(tuplesFetched float64, pages int64, indexPages, totalTabl
 	return math.Ceil(pagesFetched)
 }
 
-// indexCorrelationFor is `btcost_correlation` (selfuncs.c:7305) at goopg's
-// statistics level, which is: zero, always.
-//
-// PG reads STATISTIC_KIND_CORRELATION for the index's LEADING column, negates
-// it when that column is a DESC key, and dilutes it by 0.75 for a
-// multi-column index (the later columns dilute the first one's ordering
-// without negating it). goopg's ANALYZE collects `NDistinct`, `NullFrac`, an
-// MCV list and a histogram, but no correlation slot, so the statistic PG reads
-// does not exist.
-//
-// The faithful behaviour for a missing slot is NOT to guess: `btcost_correlation`
-// returns its `indexCorrelation = 0` initialiser when `get_attstatsslot` finds
-// nothing, and `genericcostestimate` documents the same default as "generic
-// assumption about index correlation: there isn't any" (selfuncs.c:7237). So
-// this function is PG-correct for the statistics goopg has, and becomes a real
-// computation the moment the statistic is collected — which is why it exists
-// as a named function taking the column's stats rather than as a literal 0 at
-// the call site. Ledgered.
+// indexCorrelationFor is `btcost_correlation` (selfuncs.c:7305): the Pearson
+// correlation between the index's physical row order and the leading column's
+// logical (sorted) order. It reads the STATISTIC_KIND_CORRELATION slot
+// (stored as ColumnStats.Correlation), collected by ANALYZE
+// (operators_analyze.go:746), negates for a DESC key, and dilutes by 0.75 for
+// multi-column indexes (extra columns weaken the ordering, selfuncs.c:7330).
+// When the leading column has no correlation statistic, it returns 0 (PG's
+// default for the uncorrelated case — selfuncs.c:7237).
 func indexCorrelationFor(idx *catalog.Index, stats *catalog.ColumnStats) float64 {
 	if idx == nil || stats == nil {
 		return 0
 	}
-	// No STATISTIC_KIND_CORRELATION equivalent on catalog.ColumnStats yet.
-	return 0
+	varCorrelation := stats.Correlation
+
+	// DESC key: negate the correlation (PG's reverse_sort check).
+	if len(idx.ColDescending) > 0 && idx.ColDescending[0] {
+		varCorrelation = -varCorrelation
+	}
+
+	// Multi-column index: later keys dilute the leading column's ordering
+	// (PG uses a flat 0.75 factor — btcost_correlation, selfuncs.c:7330).
+	if len(idx.Columns) > 1 {
+		return varCorrelation * 0.75
+	}
+	return varCorrelation
 }
 
 // estimateIndexGeometry derives the `index->pages`, `index->tuples` and

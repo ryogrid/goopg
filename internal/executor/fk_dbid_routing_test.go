@@ -20,6 +20,8 @@ import (
 // tests elsewhere in this package exercise via plain runDDL).
 func runDMLUnderDBOid(t *testing.T, ctx *Context, sql string) error {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
@@ -48,6 +50,8 @@ func runDMLUnderDBOid(t *testing.T, ctx *Context, sql string) error {
 // distinct-dbOid table resolves.
 func runQueryUnderDBOid(t *testing.T, ctx *Context, sql string) []Row {
 	t.Helper()
+	// M0129-S8.3: advance the command counter between statements.
+	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)

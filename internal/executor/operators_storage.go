@@ -218,7 +218,7 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	if gerr != nil {
 		return false, nil // page read error → treat as not visible
 	}
-	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact), nil
+	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact), nil
 }
 
 // epqXmaxSettled classifies a concurrent modifier xid for an EvalPlanQual
@@ -300,10 +300,7 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	// nil reveal: EPQ re-resolves a row a WRITE is about to touch, and a row a
-	// DML CTE of this statement already removed is "already deleted by self"
-	// for that write (M0125-0053, Context.CTEXmaxReveal).
-	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact, nil)
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact, ctx.CmdID, ctx.comboStore())
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
@@ -562,7 +559,7 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		// visibility + predicate against this tuple.
 		atTail := isChainTailCTID(ctid, curBlk, curSlot)
 		if atTail {
-			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact) {
+			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeHeapTupleRow(cols, tup, nil)
@@ -1536,14 +1533,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			// M0125-0053: a tuple a data-modifying CTE of this statement
-			// deleted (or whose new version it wrote) is invisible only
-			// because it carries our OWN xmax; PG's cmax-vs-es_output_cid
-			// test still shows its pre-image to the rest of the statement,
-			// so reveal it here. curSlot was already advanced past it.
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) &&
-				!(cteRevealed(o.ctx, rel, o.curBlock, o.curSlot-1) &&
-					mvcc.TupleVisibleSubxact(cteRevealHeader(tuple.Header), o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact)) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -1596,15 +1586,6 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				tuple.Header.Infomask&storage.HeapXminCommitted == 0 &&
 				tuple.Header.Infomask&storage.HeapXminInvalid == 0 &&
 				!mvcc.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
-			// CTE snapshot isolation: skip rows written by DML CTEs so the
-			// rest of the statement sees the pre-CTE state (PostgreSQL
-			// semantics). curSlot was already advanced past this tuple.
-			if cteFenced(o.ctx, rel, o.curBlock, o.curSlot-1) {
-				if o.pinned != nil {
-					o.pinned.RUnlock()
-				}
-				continue
-			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
 			// rw-conflict edge to the producing writer (xmin). Helper
@@ -2270,9 +2251,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
-			// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
-			// invisible to every other sub-statement of the same WITH.
-			cteFenceInsert(o.ctx, targetRel, ptr)
 			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
 			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
 			// against any SERIALIZABLE reader that holds a covering predicate
@@ -2322,9 +2300,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if werr != nil {
 			return nil, werr
 		}
-		// M0125-0052: a row this INSERT wrote as a data-modifying CTE is
-		// invisible to every other sub-statement of the same WITH.
-		cteFenceInsert(o.ctx, targetRel, ptr)
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
 		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
@@ -3379,10 +3354,23 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 		return err
 	}
 	if ok {
-		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
+		if cerr := storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2); cerr != nil {
+			return cerr
+		}
+		// M0129-S8.3: stamp the deleting command id (cmax) on the old
+		// tuple. Mirrors PG's heap_delete / heap_update calling
+		// HeapTupleHeaderSetCmax after the xmax write, so the visibility
+		// check can reveal the pre-image (cmax >= curcid) while hiding
+		// tuples inserted by later commands (cmin >= curcid).
+		return storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false)
 	}
 	if serr := storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx)); serr != nil {
 		return serr
+	}
+	// M0129-S8.3: stamp the deleting command id (cmax) on the old tuple.
+	// See the multi-path comment above for the visibility rationale.
+	if cerr := storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false); cerr != nil {
+		return cerr
 	}
 	// A key-changing UPDATE / DELETE must mark the old tuple HEAP_KEYS_UPDATED so
 	// a concurrent FOR KEY SHARE locker recognises the conflict and WAITS on the
@@ -3464,6 +3452,8 @@ func tryApplyHOTUpdate(
 	if pgRowHasExternal(cols, newRow) {
 		tup.Header.Infomask |= storage.HeapHasExternal
 	}
+	// M0129-S8.3c: stamp the inserting command id (cmin).
+	tup.Header.SetCmin(ctx.GetCurrentCommandId(true))
 	tupleBytes, err := tup.MarshalBinary()
 	if err != nil {
 		return false, err
@@ -3520,8 +3510,7 @@ func tryApplyHOTUpdate(
 		}
 		return false, nil // fall back to delete+insert; caller re-checks
 	}
-
-	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
 		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
@@ -3570,10 +3559,18 @@ func tryApplyHOTUpdate(
 				return perr
 			}
 			if ok {
-				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot)
+				if serr := storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot); serr != nil {
+					return serr
+				}
+				// M0129-S8.3: stamp cmax on the HOT old tuple.
+				return storage.PageSetHeapTupleCmax(s.Page(), oldSlot, ctx.GetCurrentCommandId(true), false)
 			}
 		}
-		return storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot)
+		if serr := storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot); serr != nil {
+			return serr
+		}
+		// M0129-S8.3: stamp cmax on the HOT old tuple.
+		return storage.PageSetHeapTupleCmax(s.Page(), oldSlot, ctx.GetCurrentCommandId(true), false)
 	}()
 	if stampErr != nil {
 		// Clean up the orphan new tuple: PageAddHeapTuple already
@@ -3602,10 +3599,6 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil {
-		cteFenceUpdate(ctx, rel, storage.ItemPointer{Block: blk, Offset: oldSlot},
-			rel, storage.ItemPointer{Block: blk, Offset: newSlot})
-	}
 	return true, derr
 }
 
@@ -3975,16 +3968,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		// nil reveal: this is an UPDATE's target scan (M0125-0053).
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, nil)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
-			return true, nil
-		}
-		// M0125-0052: the index-driven UPDATE twin of the scanMatching fence —
-		// an outer UPDATE must not touch a row its own data-modifying CTE wrote.
-		if cteFenced(o.ctx, heapRel, ptr.Block, actualSlot) {
 			return true, nil
 		}
 		// No tuple-tag acquire on a foreign lock-only holder here: the
@@ -4363,6 +4350,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					if stampIdxErr == nil {
+						// M0129-S8.3: stamp cmax on the fallback path
+						// (PageGetHeapTuple failed — plain xmax stamp
+						// without locker preservation).
+						stampIdxErr = storage.PageSetHeapTupleCmax(s.Page(), pu.slot, o.ctx.GetCurrentCommandId(true), false)
+					}
 				}
 				if stampIdxErr != nil {
 					s.Unlock()
@@ -4402,8 +4395,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if werr != nil {
 					return nil, werr
 				}
-				cteFenceUpdate(o.ctx, rel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
-					targetWriteRel, newPtr)
 				// Maintain unique/PK btree entries for the new row version.
 				if destPartIdx != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
@@ -5078,6 +5069,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					if stampErr == nil {
+						// M0129-S8.3: stamp cmax on the fallback path.
+						stampErr = storage.PageSetHeapTupleCmax(s.Page(), pu.slot, o.ctx.GetCurrentCommandId(true), false)
+					}
 				}
 				if stampErr != nil {
 					s.Unlock()
@@ -5121,8 +5116,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if werr != nil {
 					return nil, werr
 				}
-				cteFenceUpdate(o.ctx, puRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
-					targetWriteRel, newPtr)
 				if destPart != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
 				} else if pu.scanTbl != nil {
@@ -5694,15 +5687,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					epqSkipDel = true
 					break
 				}
-				// Sibling of the updateWithFrom EPQ site: the chain can lead
-				// straight into a version a LATER command of this same statement
-				// wrote — a VOLATILE routine invoked from a data-modifying WITH.
-				// PG refuses to merge that with the original delete and errors
-				// (nodeModifyTable.c ExecDelete's TM_SelfModified arm with
-				// tmfd.cmax != es_output_cid).
-				if cteWrittenByLaterCommand(o.ctx, victimRel, newBlk, newSlot) {
-					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
-				}
 				v.blk = newBlk
 				v.slot = newSlot
 				if newRow != nil {
@@ -5724,6 +5708,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				delStampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true)
 			} else {
 				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, effectiveWriterXID(o.ctx))
+				if delStampErr == nil {
+					// M0129-S8.3: stamp cmax on the fallback path.
+					delStampErr = storage.PageSetHeapTupleCmax(s.Page(), v.slot, o.ctx.GetCurrentCommandId(true), false)
+				}
 			}
 			if err := delStampErr; err != nil {
 				s.Unlock()
@@ -5740,10 +5728,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
-			// M0125-0053: a DELETE inside a data-modifying CTE stamps our own
-			// xmax, which would hide the row from the rest of the statement —
-			// where PG still shows its pre-image.
-			cteFenceDelete(o.ctx, victimRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
@@ -6085,6 +6069,38 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			}
 		}
 		used := false
+		// TM_SelfModified guard: before attempting HOT (which skips
+		// the non-HOT path where the concurrent-modification check
+		// lives), verify that the old tuple wasn't already stamped
+		// by our own transaction through a different sub-command
+		// (e.g. a function called from a CTE's RETURNING clause).
+		// Do a quick RLock probe — the HOT path does its own
+		// Pin+Lock later. M0129-S2.
+		{
+			if ts, tsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk}); tsErr == nil {
+				ts.RLock()
+				if tsTup, tsGerr := storage.PageGetHeapTuple(ts.Page(), pu.slot); tsGerr == nil {
+					if tsTup.Header.Xmax != storage.InvalidTransactionID && tsTup.Header.Xmax == o.ctx.Tx.XID {
+						cmax := mvcc.GetCmax(tsTup.Header, o.ctx.comboStore())
+						ts.RUnlock()
+						o.ctx.Pool.Unpin(ts)
+						// cmax == live CID (post-function-sync) → same sub-command → skip silently.
+						// cmax != live CID → different sub-command (e.g. a volatile function
+						// in RETURNING) → raise TM_SelfModified.
+						// Uses GetCurrentCommandId(true), not CmdID: cmdCounter is synced
+						// back from the child after a volatile function returns, so it
+						// reflects function-driven command-counter advances. AI-007.
+						liveCID := o.ctx.GetCurrentCommandId(true)
+						if cmax != liveCID {
+							return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+						}
+						continue // same CID — silently skip this row (mirrors PG TM_Ok)
+					}
+				}
+				ts.RUnlock()
+				o.ctx.Pool.Unpin(ts)
+			}
+		}
 		if hotEligible && puSrcRel == rel && puRel == rel {
 			var err error
 			used, err = tryApplyHOTUpdate(o.ctx, rel, tgtCols, pu.blk, pu.slot, pu.newRow)
@@ -6139,20 +6155,28 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					}
 					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
 				}
-				// CTE isolation: if the EPQ chain led to a tuple this statement
-				// wrote, this statement already owns this row. Skip to preserve
-				// savedSnap isolation semantics — PG's "already updated by self;
-				// nothing to do". M0100-0010; M0125-0052 made the fence key
-				// relation-qualified, so the xmin re-read that used to disambiguate
-				// another table's coincident {block,slot} is no longer needed.
-				//
-				// Unless a LATER command wrote it, in which case PG refuses to
-				// merge and errors instead (nodeModifyTable.c ExecUpdate:2656).
-				if cteWrittenByLaterCommand(o.ctx, puSrcRel, epqBlk, newSlot) {
-					return nil, errTupleAlreadyModified("updated", o.plan.Pos())
-				}
-				if cteFenced(o.ctx, puSrcRel, epqBlk, newSlot) {
-					continue
+				// TM_SelfModified guard: the EPQ chain can lead into a
+				// version our own transaction wrote through a different
+				// sub-command (e.g. a function called from a CTE's
+				// RETURNING clause). Re-pin at the new slot and check cmax.
+				// Different CID → error; same CID → skip silently. AI-007.
+				if tms, tmsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: epqBlk}); tmsErr == nil {
+					tms.RLock()
+					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
+						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
+							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							liveCID := o.ctx.GetCurrentCommandId(true)
+							tms.RUnlock()
+							o.ctx.Pool.Unpin(tms)
+							if cmax != liveCID {
+								return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+							}
+							// Same CID: TM_SelfModified — skip silently.
+							continue
+						}
+					}
+					tms.RUnlock()
+					o.ctx.Pool.Unpin(tms)
 				}
 				// Re-evaluate predicate against the new row + FROM portion.
 				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
@@ -6211,6 +6235,22 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				// above and never reach here).
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
+				// TM_SelfModified guard: isConcurrentlyUpdated already ruled
+				// out a foreign xmax, but the tuple may carry our own xmax
+				// from a different sub-command (e.g. a function called from a
+				// CTE's RETURNING clause). A live tuple has xmax=Invalid; a
+				// stale HOT-updated tuple has a foreign xmax (aborted). Only
+				// our own xmax here means the tuple was already modified by
+				// a sub-command of our transaction. Compare cmax against live CID.
+				// M0129-S2 / AI-007.
+				if oldTup.Header.Xmax != storage.InvalidTransactionID && oldTup.Header.Xmax == o.ctx.Tx.XID {
+					cmax := mvcc.GetCmax(oldTup.Header, o.ctx.comboStore())
+					liveCID := o.ctx.GetCurrentCommandId(true)
+					if cmax != liveCID {
+						return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+					}
+					continue // same CID — silently skip this row
+				}
 			}
 			var oldTupleBytes []byte
 			s, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})
@@ -6254,8 +6294,6 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					return nil, cerr
 				}
 			}
-			cteFenceUpdate(o.ctx, puSrcRel, storage.ItemPointer{Block: pu.blk, Offset: pu.slot},
-				puRel, newPtr)
 			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, puCols, pu.newRow, newPtr)
 			if !isCrossPartMove {
 				if cerr := stampOldCtid(o.ctx, puSrcRel, pu.blk, pu.slot, newPtr); cerr != nil {
@@ -6538,11 +6576,29 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 					epqSkipDel = true
 					break
 				}
-				// TM_SelfModified guard: the chain can lead into a version a
-				// LATER command of this same statement wrote. PG refuses to merge
-				// that with the original delete (nodeModifyTable.c ExecDelete).
-				if cteWrittenByLaterCommand(o.ctx, vRel, newBlk, newSlot) {
-					return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+				// TM_SelfModified guard: the EPQ chain can lead into a
+				// version our own transaction wrote through a different
+				// sub-command (e.g. a function called from a CTE's
+				// RETURNING clause). Re-pin at the new slot and check cmax.
+				// Different CID → error; same CID → skip silently.
+				if tms, tmsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: vRel, Block: newBlk}); tmsErr == nil {
+					tms.RLock()
+					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
+						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
+							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							liveCID := o.ctx.GetCurrentCommandId(true)
+							tms.RUnlock()
+							o.ctx.Pool.Unpin(tms)
+							if cmax != liveCID {
+								return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
+							}
+							// Same CID: TM_SelfModified — skip silently.
+							epqSkipDel = true
+							break
+						}
+					}
+					tms.RUnlock()
+					o.ctx.Pool.Unpin(tms)
 				}
 				// Re-evaluate USING join predicate against new row + USING portion.
 				if o.plan.UsingPred != nil {
@@ -6583,8 +6639,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if epqSkipDel {
 			continue
 		}
-		// M0125-0053: the DELETE … USING twin of the deleteOp.Next reveal.
-		cteFenceDelete(o.ctx, vRel, storage.ItemPointer{Block: v.blk, Offset: v.slot})
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
 		}
@@ -6656,7 +6710,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				ctx.Pool.Unpin(s)
 				return err
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				// A tuple this statement's own command already killed is simply
 				// not found by the DML scan. PG reaches it and takes ExecUpdate /
 				// ExecDelete's TM_SelfModified arm with cmax == es_output_cid,
@@ -6664,13 +6718,6 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				// same heap state (M0125-0053). The LATER-command case that PG
 				// errors on cannot arrive here: such a version was written by
 				// this statement, so its own cmin hides it from this scan. It is
-				// reached only by an EvalPlanQual chain-follow, which is where
-				// cteWrittenByLaterCommand is consulted.
-				continue
-			}
-			// Skip rows written by DML CTEs — an outer INSERT/UPDATE/DELETE must
-			// see pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
-			if cteFenced(ctx, rel, blk, slot) {
 				continue
 			}
 			// M0104-0008: SSI read-path hook for the UPDATE / DELETE
@@ -8056,6 +8103,11 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}
+	// M0129-S8.3c: stamp the inserting command id (cmin).
+	// GetCurrentCommandId(true) marks the counter as used so the next
+	// CommandCounterIncrement actually advances, matching PG.s heap_insert
+	// calling GetCurrentCommandId(true) before stamping cmin.
+	tuple.Header.SetCmin(ctx.GetCurrentCommandId(true))
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return ptr, err
@@ -8447,6 +8499,11 @@ func buildCatalogPGHeapTuple(ctx *Context, cols []catalog.Column, row Row) (stor
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}
+	// M0129-S8.3c: stamp the inserting command id (cmin).
+	// GetCurrentCommandId(true) marks the counter as used so the next
+	// CommandCounterIncrement actually advances, matching PG.s heap_insert
+	// calling GetCurrentCommandId(true) before stamping cmin.
+	tuple.Header.SetCmin(ctx.GetCurrentCommandId(true))
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return tuple, nil, err

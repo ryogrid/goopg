@@ -317,6 +317,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if connTx != nil {
 		if sess := connTx.Session(); sess != nil {
 			ectx.Session = sess
+			// M0129-S8.3: seed the fresh context's command counter from
+			// the session so it persists across simple-query messages
+			// within the same explicit transaction. Without this, every
+			// message starts at curcid=0 and self-inserted tuples are
+			// hidden from the next message's DML scans (cmin >= curcid).
+			ectx.SetCmdCounter(sess.CmdCounter())
 		} else {
 			// Autocommit implicit batch (no explicit BEGIN): still give
 			// execCreateTable/execCreateIndex a *BasicSession to record
@@ -734,8 +740,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 					}
 					params, err := evalExecuteParams(es.Params)
 					if err != nil {
-						if ee, ok := err.(*executor.ExecError); ok {
-							return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+						if _, ok := err.(*executor.ExecError); ok {
+							return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 						}
 						return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 					}
@@ -790,8 +796,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				params, err := evalExecuteParams(es.Params)
 				if err != nil {
-					if ee, ok := err.(*executor.ExecError); ok {
-						return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+					if _, ok := err.(*executor.ExecError); ok {
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 					return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 				}
@@ -826,7 +832,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// (as in PG, where planning/opening happens at DECLARE).
 				if cur, found := connTx.cursorLookup(dc.Name); found {
 					if err := s.materializeCursor(ectx, cur, dc.Name); err != nil {
-						return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 				}
 			}
@@ -908,18 +914,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				ectx.Snap = snap2
 			}
 		}
-		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
-		// row cache from any previous statement. The row cache is query-scoped:
-		// a CTE named "q" in query 1 must not bleed into query 2 (they may
-		// produce different rows). CTEWriteFence is cleared for the same reason.
-		ectx.CTEWriteFence = nil
-		ectx.CTEXmaxReveal = nil
-		ectx.InDMLCTE = false
-		// Each statement starts at its own es_output_cid; the counter only
-		// advances into nested VOLATILE routine bodies, on their own child
-		// Context. Reset so a routine that raised mid-body cannot leave the
-		// next statement believing it runs at a later command id.
-		ectx.CmdID = 0
+		// Per-statement reset: clear the regular-CTE row cache from any
+		// previous statement. The row cache is query-scoped: a CTE named
+		// "q" in query 1 must not bleed into query 2 (they may produce
+		// different rows).
+		// M0129-S8.2: advance the transaction command counter for the new
+			// statement. CommandCounterIncrement only advances when the used flag
+			// is set (a prior statement in this transaction wrote a tuple),
+			// matching PostgreSQL's lazy-advance scheme. Pin the result as the
+			// statement's es_output_cid.
+			ectx.CommandCounterIncrement()
+			ectx.CmdID = ectx.GetCurrentCommandId(true)
 		ectx.CTERowCache = nil
 		ectx.DeadlockVictim = false
 
@@ -2340,6 +2345,15 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return ptd.PGTSDictRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_ts_config must likewise reflect the connecting database's own
+	// CREATE TEXT SEARCH CONFIGURATION'd configurations, not always
+	// DefaultDBOid's. Mirrors the pg_ts_dict wiring above. M0122-0007
+	// 4e follow-up (DU-002 round-trip probe unblock).
+	if ptc, ok := s.cfg.Catalog.(pgTSConfigRowLister); ok {
+		ectx.PgTSConfigRows = func() [][]string {
+			return ptc.PGTSConfigRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2460,6 +2474,13 @@ type pgConversionRowLister interface {
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 type pgTSDictRowLister interface {
 	PGTSDictRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgTSConfigRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_ts_config row-set, mirroring pgTSDictRowLister above.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgTSConfigRowLister interface {
+	PGTSConfigRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {
@@ -2713,6 +2734,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							}
 							if ee.Detail != "" {
 								fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
+							}
+							if ee.Pos > 0 {
+								fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(ee.Pos + 1)})
 							}
 							return s.writeQueryError(w, code, ee.Message, fields...)
 						}
@@ -3549,7 +3573,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	// Materialise on first access.
 	if !cur.Materialized {
 		if err := s.materializeCursor(ectx, cur, cursorName); err != nil {
-			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
 	}
 

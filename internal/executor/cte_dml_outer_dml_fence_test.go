@@ -35,10 +35,11 @@ import (
 // a real session gets the fence cleared between them.
 func runDMLRows(t *testing.T, ctx *Context, sql string) []Row {
 	t.Helper()
-	ctx.CTEWriteFence = nil
-	ctx.CTEXmaxReveal = nil
-	ctx.InDMLCTE = false
-	ctx.CmdID = 0
+	// M0129-S8.3: advance the command counter between statements, matching
+	// PG's per-statement CommandCounterIncrement. GetCurrentCommandId(true)
+	// pins es_output_cid so cmin/cmax stamps carry the current command id.
+	ctx.CommandCounterIncrement()
+	ctx.CmdID = ctx.GetCurrentCommandId(true)
 	ctx.CTERowCache = nil
 	ctx.MaterializedCTEs = nil
 

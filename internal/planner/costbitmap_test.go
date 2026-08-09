@@ -32,44 +32,47 @@ func TestCostBitmapIndexScan_AddsBitmapOverhead(t *testing.T) {
 
 func TestComputeBitmapPages_SmallSelectivity(t *testing.T) {
 	// T=1000 pages, 10 tuples fetched — should be ~10 pages (few distinct pages).
-	pages := computeBitmapPages(10, 1000, 0)
+	// No cache info → falls back to single-term ML.
+	pages := computeBitmapPages(10, 1000, 0, 1000, 0, 0)
 	// 2*1000*10/(2000+10) = 20000/2010 ≈ 9.95 → ceil → 10
 	if pages != 10 {
-		t.Errorf("computeBitmapPages(10, 1000, 0) = %v, want 10", pages)
+		t.Errorf("computeBitmapPages(10, 1000, 0, ...) = %v, want 10", pages)
 	}
 }
 
 func TestComputeBitmapPages_LargeSelectivity(t *testing.T) {
 	// T=1000 pages, 5000 tuples fetched — many distinct pages, approaching T.
-	pages := computeBitmapPages(5000, 1000, 0)
+	// No cache info → falls back to single-term ML.
+	pages := computeBitmapPages(5000, 1000, 0, 1000, 0, 0)
 	// 2*1000*5000/(2000+5000) = 10000000/7000 ≈ 1428.6 → ceil → 1429
 	// But capped at T=1000.
 	if pages != 1000 {
-		t.Errorf("computeBitmapPages(5000, 1000, 0) = %v, want 1000 (capped)", pages)
+		t.Errorf("computeBitmapPages(5000, 1000, 0, ...) = %v, want 1000 (capped)", pages)
 	}
 }
 
 func TestComputeBitmapPages_AllTuples(t *testing.T) {
 	// T=100 pages, all tuples fetched (10000 tuples on 100 pages).
-	pages := computeBitmapPages(10000, 100, 0)
+	// No cache info → falls back to single-term ML.
+	pages := computeBitmapPages(10000, 100, 0, 100, 0, 0)
 	// Should be capped at T.
 	if pages != 100 {
-		t.Errorf("computeBitmapPages(10000, 100, 0) = %v, want 100", pages)
+		t.Errorf("computeBitmapPages(10000, 100, 0, ...) = %v, want 100", pages)
 	}
 }
 
 func TestComputeBitmapPages_ZeroInputs(t *testing.T) {
-	if p := computeBitmapPages(0, 100, 0); p != 0 {
-		t.Errorf("computeBitmapPages(0, _, _) = %v, want 0", p)
+	if p := computeBitmapPages(0, 100, 0, 100, 0, 0); p != 0 {
+		t.Errorf("computeBitmapPages(0, _, _, ...) = %v, want 0", p)
 	}
-	if p := computeBitmapPages(10, 0, 0); p != 0 {
-		t.Errorf("computeBitmapPages(_, 0, _) = %v, want 0", p)
+	if p := computeBitmapPages(10, 0, 0, 100, 0, 0); p != 0 {
+		t.Errorf("computeBitmapPages(_, 0, _, ...) = %v, want 0", p)
 	}
 }
 
 func TestComputeBitmapPages_LossyAdjustment(t *testing.T) {
 	// T=1000 pages, 500 tuples fetched, maxEntries=200 → pages exceeds budget.
-	pages := computeBitmapPages(500, 1000, 200)
+	pages := computeBitmapPages(500, 1000, 0, 1000, 0, 200)
 	// Without lossiness: 2*1000*500/(2000+500) = 400 → ceil → 400
 	// With lossiness: pages ≈ 400 > 200, so exact=200, lossy=200
 	// Pages fetched stays at 400 (still visiting same pages).

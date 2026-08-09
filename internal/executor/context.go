@@ -562,39 +562,6 @@ type Context struct {
 	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
 
-	// CTEWriteFence, when non-nil, maps each row written by a sub-statement of
-	// a data-modifying WITH to the command id (see CmdID) that wrote it. Every
-	// scan of the rest of the statement — the outer SELECT *and* an outer
-	// INSERT/UPDATE/DELETE — skips these tuples to implement CTE snapshot
-	// isolation: the sub-statements of a data-modifying WITH cannot see one
-	// another's effects on the target tables. Cleared between statements.
-	//
-	// The value is the goopg stand-in for PG's per-tuple cmin, and the test in
-	// cteFenced is PG's `cmin >= curcid ⇒ invisible`
-	// (postgres/src/backend/access/heap/heapam_visibility.c
-	// HeapTupleSatisfiesMVCC). It matters because a VOLATILE routine invoked
-	// from this statement runs its body at a LATER command id and therefore
-	// MUST see what the statement has written so far — see CmdID.
-	CTEWriteFence map[CTEFencePtr]int
-
-	// CTEXmaxReveal is the write fence's mirror image: it maps each tuple a
-	// sub-statement of this WITH stamped xmax on (a CTE DELETE's victim, or the
-	// old version behind a CTE UPDATE) to the command id that stamped it. The
-	// fence HIDES rows a CTE added; this set SHOWS the pre-image of rows a CTE
-	// removed, because "the sub-statements cannot see one another's effects"
-	// cuts both ways. The value is the stand-in for PG's per-tuple cmax and the
-	// test in cteRevealed is PG's `cmax >= curcid ⇒ the delete has not happened
-	// yet ⇒ show the pre-image`, in HeapTupleSatisfiesMVCC
-	// (postgres/src/backend/access/heap/heapam_visibility.c).
-	//
-	// Only READ scans consult it. A DML target scan must NOT: PG's ExecDelete
-	// and ExecUpdate take the TM_SelfModified arm for such a tuple and, when
-	// cmax equals es_output_cid, return NULL without touching the row
-	// ("already deleted by self; nothing to do", nodeModifyTable.c). Leaving
-	// the row unfound in the DML scan produces the same row count and the same
-	// heap state as finding it and declining to write. M0125-0053.
-	CTEXmaxReveal map[CTEFencePtr]int
-
 	// CmdID is this context's command id RELATIVE to the enclosing statement's
 	// `estate->es_output_cid`: 0 while the statement's own plan (its CTEs and
 	// its body alike) runs, and one higher per nested VOLATILE routine body.
@@ -618,14 +585,19 @@ type Context struct {
 	// the volatile `update_checking` must SEE and modify the row the CTE just
 	// wrote (live PG 18.3 leaves balance 1701); a command-blind fence hid it and
 	// goopg left 1700 — the function's UPDATE was a silent no-op.
-	CmdID int
-
-	// InDMLCTE is true while cteDMLPrefixOp is executing one of its DML
-	// sub-plans (as opposed to the outer statement's own body). Both phases
-	// register their output pointers in CTEWriteFence — the sub-statements of
-	// a data-modifying WITH cannot see one another's effects in EITHER
-	// direction — so this does not gate the fence. M0125-0054.
-	InDMLCTE bool
+	//
+	// M0129-S8.2: CmdID is now the pinned es_output_cid for this statement,
+	// backed by cmdCounter which owns the authoritative transaction-wide state.
+	// See command_counter.go.
+	CmdID         storage.CommandId
+	cmdCounter    CommandCounter
+	cmdCounterExt *CommandCounter // external (session-owned) pointer; used when set
+	// comboCIDStore is the per-connection combo CID store, mirroring
+	// PostgreSQL's comboCids hash+array. It maps (cmin, cmax) pairs to
+	// synthetic combo CID numbers for tuples both inserted and deleted
+	// within this transaction at different command ids. Initialized
+	// lazily on first access; cleared per transaction. M0129-S8.3.
+	comboCIDStore mvcc.ComboCIDStore
 
 	// pendingDMLCTEs is the cteDMLPrefixOp currently driving this statement,
 	// or nil. It is how a MaterializedCTEScan demands the DML CTE it reads:
@@ -800,6 +772,14 @@ type Context struct {
 	// unblock).
 	PgTSDictRows func() [][]string
 
+	// PgTSConfigRows mirrors PgTSDictRows above for the pg_ts_config catalog
+	// table: it lists CurrentDatabaseOid's own CREATE TEXT SEARCH
+	// CONFIGURATION'd configurations rather than always DefaultDBOid's
+	// (catalog.InMemory's PGTSConfigRowsForDBOid). Wired by the server to
+	// close over CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	PgTSConfigRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
@@ -947,6 +927,62 @@ func (c *Context) backendPID() string {
 		}
 	}
 	return c.ActivityPID
+}
+
+// SetCmdCounter replaces the context's command counter with an external
+// (session-owned) pointer so that a fresh per-message Context shares the
+// transaction's counter state. When set, GetCurrentCommandId,
+// CommandCounterIncrement, and ResetCommandCounter operate on the external
+// counter directly, keeping the session in sync. M0129-S8.3.
+func (c *Context) SetCmdCounter(ext *CommandCounter) {
+	c.cmdCounterExt = ext
+}
+
+// CommandCounterIncrement advances this context's command counter, matching
+// PostgreSQL's CommandCounterIncrement() in xact.c. The counter only advances
+// when GetCurrentCommandId(true) has been called, so read-only statements do
+// not consume command ids. M0129-S8.2.
+func (c *Context) CommandCounterIncrement() {
+	if c.cmdCounterExt != nil {
+		c.cmdCounterExt.CommandCounterIncrement()
+		return
+	}
+	c.cmdCounter.CommandCounterIncrement()
+}
+
+// GetCurrentCommandId returns the current command id for this context.
+// When used is true, it marks the counter so the NEXT
+// CommandCounterIncrement actually advances. M0129-S8.2.
+func (c *Context) GetCurrentCommandId(used bool) storage.CommandId {
+	if c.cmdCounterExt != nil {
+		return c.cmdCounterExt.GetCurrentCommandId(used)
+	}
+	return c.cmdCounter.GetCurrentCommandId(used)
+}
+
+// ResetCommandCounter resets the command counter to FirstCommandId (0).
+// Used in tests and when a new transaction begins on a recycled Context.
+func (c *Context) ResetCommandCounter() {
+	if c.cmdCounterExt != nil {
+		c.cmdCounterExt.Reset()
+	} else {
+		c.cmdCounter.Reset()
+	}
+	c.CmdID = storage.FirstCommandId
+}
+
+// comboStore returns a pointer to this context's per-connection combo CID
+// store, initializing it lazily on first access. The store maps (cmin, cmax)
+// pairs to synthetic combo CID numbers for tuples both inserted and deleted
+// within this transaction at different command ids. Mirrors PostgreSQL's
+// comboCids (combocid.c). M0129-S8.3.
+func (c *Context) comboStore() *mvcc.ComboCIDStore {
+	return &c.comboCIDStore
+}
+
+// ResetComboCIDStore clears the combo CID store for a new transaction.
+func (c *Context) ResetComboCIDStore() {
+	c.comboCIDStore.Reset()
 }
 
 // CommitTransaction commits tx through TxnMgr, choosing the synchronous or
@@ -1631,12 +1667,20 @@ type Checkpointer interface {
 
 // NewContext builds a Context with sensible defaults: a fresh
 // timestamp and no bind parameters. Tests use this directly.
+//
+// M0129-S8.3: CmdID defaults to InvalidCommandId so callers that bypass
+// the dispatch-layer per-statement CommandCounterIncrement (raw
+// Build+Open+Next in tests, internal utility contexts) get pass-through
+// cmin/cmax visibility — cmin >= InvalidCommandId is never true for any
+// real command id. Callers that DO manage the command counter (dispatch,
+// advanceStmtCounter in test helpers) override CmdID on the first
+// GetCurrentCommandId(true) call.
 func NewContext() *Context {
 	// M0127-P3.3: every context that can run a query owns a spill-file
 	// registry from birth. Allocating here rather than lazily is what makes
 	// it safe to share with parallel workers — a lazily-installed registry
 	// would be a write to a field those workers read concurrently.
-	return &Context{Now: time.Now(), tempFiles: newTempFileRegistry()}
+	return &Context{Now: time.Now(), tempFiles: newTempFileRegistry(), CmdID: storage.InvalidCommandId}
 }
 
 // MaterializeWriterXID ensures the context's transaction has a real

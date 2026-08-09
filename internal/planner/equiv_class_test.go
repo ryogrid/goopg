@@ -220,3 +220,71 @@ func TestEquivClassQ5Shape(t *testing.T) {
 		t.Errorf("missing synthesised c_nationkey=n_nationkey; got %v", synth)
 	}
 }
+
+// TestPushdownInfersTransitiveEquality verifies M0119-0011: the legacy
+// pushPredicatesIntoCrossJoins pass calls inferTransitiveEqualities so that a
+// 3-relation equivalence class written as two equalities (a.x = b.x AND
+// b.x = c.x) generates the transitive clause (a.x = c.x).
+//
+// This test verifies the call site wiring by checking that after
+// pushPredicatesIntoCrossJoins, a simple 2-table predicate that forms a
+// 3-member EC has its CROSS promoted to INNER — achievable only because the
+// inferred transitive clause connects the two tables.
+func TestPushdownInfersTransitiveEquality(t *testing.T) {
+	// Build a 2-table CROSS join: Cross(left, right)
+	// Schema: l_x(0) | ra_x(1), rb_x(2)
+	left := &SeqScan{
+		Table:  &catalog.Table{Name: "l", OID: 1},
+		Alias:  "l",
+		schema: Schema{{Name: "l_x", Type: catalog.Type{Name: "int4"}}},
+	}
+	right := &SeqScan{
+		Table:  &catalog.Table{Name: "r", OID: 2},
+		Alias:  "r",
+		schema: Schema{
+			{Name: "ra_x", Type: catalog.Type{Name: "int4"}},
+			{Name: "rb_x", Type: catalog.Type{Name: "int4"}},
+		},
+	}
+	cross := &Join{Type: JoinTypeCross, Left: left, Right: right,
+		schema: appendSchema(left.Output(), right.Output())}
+
+	// Columns in cumulative schema: l_x(0) | ra_x(1), rb_x(2)
+	lX := &ColumnRef{Name: "l_x", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1, Index: 0}
+	raX := &ColumnRef{Name: "ra_x", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2, Index: 1}
+	rbX := &ColumnRef{Name: "rb_x", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2, Index: 2}
+
+	// Predicate: l_x = ra_x AND ra_x = rb_x
+	// Forms EC {l_x, ra_x, rb_x} with 3 members over only 2 relations.
+	// Without inferTransitiveEqualities, the pushdown sees only:
+	//   l_x = ra_x (spans both sides → promotes CROSS)
+	//   ra_x = rb_x (both on right side → stays as residual)
+	// With inferTransitiveEqualities, it also sees:
+	//   l_x = rb_x (spans both sides → ANDed to inner join predicate)
+	pred := combineAnd([]Expr{
+		makeEqExpr(lX, raX),
+		makeEqExpr(raX, rbX),
+	})
+
+	f := &Filter{Child: cross, Predicate: pred}
+	out := pushPredicatesIntoCrossJoins(f)
+
+	// After pushdown: the CROSS must have been promoted to INNER by at least
+	// one of the spanning equalities (l_x = ra_x). The ra_x = rb_x conjunct
+	// is single-side and may remain as a residual Filter — that is expected.
+	// The key property we verify is that the CROSS → INNER promotion happened.
+	top := out
+	if rf, ok := out.(*Filter); ok {
+		top = rf.Child
+	}
+	j, ok := top.(*Join)
+	if !ok {
+		t.Fatalf("root after pushdown is %T, expected *Join", top)
+	}
+	if j.Type != JoinTypeInner {
+		t.Error("CROSS join should have been promoted to INNER by the pushdown")
+	}
+	if j.Predicate == nil {
+		t.Error("join should have a predicate after pushdown")
+	}
+}

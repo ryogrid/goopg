@@ -1530,7 +1530,9 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: addErr.Error()}
 		}
 	}
-	// Execute statements directly using the parent context so NOTICEs propagate. M0097-0003.
+	// Advance the command counter so the DO body sees the caller's writes,
+	// mirroring executePLpgSQLRoutine. M-NIGHTLY AI-20260809-020705-019.
+	routineCommandCounterIncrement(o.ctx, r)
 	_, flow, execErr := executePLpgSQLStmtList(block.Statements, r, frame, o.ctx)
 	if execErr != nil {
 		return execErr
@@ -12809,6 +12811,17 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
 					continue
 				}
+				// Also set the committed hint bit so runtime visibility
+				// (TupleVisibleSubxact) takes the fast HeapXmaxCommitted
+				// path instead of falling through to the snapshot-based
+				// SeesCommittedXIDWithSubxacts branch. Without this hint,
+				// a conservative snapshot may hold the old row visible
+				// even though the deleting transaction committed.
+				// DU-002: belt-and-suspenders — the xmax stamp alone
+				// suffices for the startup heap reload (scanCatalogHeapRows
+				// checks Xmax!=0), but runtime seq scans need this hint to
+				// reliably hide catalog rows that were re-synced.
+				storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
 				// Use MarkDirtyForceFPI to emit a fresh full-page image of
 				// the post-stamp page. This overrides any stale FPI that
 				// was captured before the row existed (e.g. the mirror
@@ -12839,14 +12852,19 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
-		// Try native format first, then PG18-canonical physical format.
-		// syncTableToCatalogHeap writes physical rows; loadUserTablesFromHeap
-		// also handles both, so we must mirror that here.
-		row, err := catalog.DecodePGClassRow(data)
+		// Try the PG-physical decoder first — same class of bug as
+		// the pg_attribute sibling above (null-flag-sentinel collision).
+		row, err := catalog.DecodePGClassPhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGClassPhysicalRow(data)
+			row, err = catalog.DecodePGClassRow(data)
 		}
-		return err == nil && row.OID == relOID
+		if err == nil {
+			return row.OID == relOID
+		}
+		if len(data) >= 4 {
+			return binary.LittleEndian.Uint32(data[:4]) == relOID
+		}
+		return false
 	})
 	attrRel := storage.RelFileNode{
 		DBOid:  dbOid,
@@ -12854,11 +12872,21 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
-		row, err := catalog.DecodePGAttributeRow(data)
+		// Try the PG-physical decoder first — the goopg logical
+		// decoder (DecodePGAttributeRow) uses a null-flag-prefix
+		// format that misinterprets PG-physical heap data whenever
+		// the first byte of attrelid equals 0x00 (null-flag sentinel).
+		row, err := catalog.DecodePGAttributePhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGAttributePhysicalRow(data)
+			row, err = catalog.DecodePGAttributeRow(data)
 		}
-		return err == nil && row.AttRelID == relOID
+		if err == nil {
+			return row.AttRelID == relOID
+		}
+		if len(data) >= 4 {
+			return binary.LittleEndian.Uint32(data[:4]) == relOID
+		}
+		return false
 	})
 	// B5 Slice B: stamp xmax on this relation's pg_attrdef rows too, so an ALTER
 	// re-sync (delete-old-rows + syncTableToCatalogHeap) or a rolled-back CREATE
@@ -14423,7 +14451,7 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
@@ -15608,10 +15636,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					// current-name-keyed DropCompatObject gate (the B3.5
 					// rename-then-drop fix, applied here too).
 					var cfgOID uint32
-					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema); cfg != nil {
+					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 						cfgOID = cfg.OID
 					}
-					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) {
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						if cfgOID != 0 {
 							deleteTSConfigCatalogRows(o.ctx, cfgOID)
 						}
@@ -16742,6 +16770,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return fmt.Errorf("pg_conversion journal: %w", err)
 		}
 	case "text search dictionary":
+		// ALTER TEXT SEARCH DICTIONARY … OWNER TO (and any other unrecognised
+		// trailer) falls through the parser's ALTER branch into a CompatNoopStmt
+		// carrying ObjType "text search dictionary" but no TSDictTemplate (only
+		// CREATE sets that field). Gate the CREATE-only logic on the Tag prefix
+		// so a round-trip restore doesn't fail on the OWNER TO trailer the dump
+		// emitted. DU-002 slice 437 follow-up (M0119-0004).
+		if strings.HasPrefix(s.Tag, "ALTER ") {
+			if s.ObjName.Name != "" {
+				im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+			}
+			return nil
+		}
 		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
 		// tmpl [, opt = val, ...])) so it round-trips through pg_dump (pg_ts_dict
 		// view → getTSDictionaries / dumpTSDictionary). DU-002 slice 437.
@@ -16782,6 +16822,19 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return fmt.Errorf("pg_ts_dict journal: %w", err)
 		}
 	case "text search configuration":
+		// ALTER TEXT SEARCH CONFIGURATION … OWNER TO (and any other unrecognised
+		// trailer) falls through the parser's ALTER branch into a CompatNoopStmt
+		// carrying ObjType "text search configuration" but no TSConfigParser /
+		// TSConfigCopySource (only CREATE sets those fields). Gate the
+		// CREATE-only logic on the Tag prefix so a round-trip restore doesn't
+		// fail on the OWNER TO trailer the dump emitted. DU-002 slice 446
+		// follow-up (M0119-0004).
+		if strings.HasPrefix(s.Tag, "ALTER ") {
+			if s.ObjName.Name != "" {
+				im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+			}
+			return nil
+		}
 		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
 		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
 		// view → getTSConfigurations / dumpTSConfig). DU-002 slice 446.
@@ -16803,7 +16856,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		var parserOID uint32
 		var copySource *catalog.UserTSConfig
 		if copySourceName != "" {
-			for _, existing := range im.ListUserTSConfigs() {
+			for _, existing := range im.ListUserTSConfigs(catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				if strings.EqualFold(existing.Name, copySourceName) {
 					copySource = existing
 					break
@@ -16830,7 +16883,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			Owner:  uint32(10), // bootstrap superuser (postgres)
 			Parser: parserOID,
 		}
-		if _, err := im.CreateTSConfig(uc, schema); err != nil {
+		if _, err := im.CreateTSConfig(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
 		// B3.6 (doc 02d §2): the configuration journals as a real
@@ -16845,14 +16898,14 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// ALTER ... ADD MAPPING uses, so restart replay needs no new WAL
 			// record kind.
 			for _, m := range copySource.Mappings {
-				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
+				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc2 == nil || dup {
 					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
 				}
 			}
 		}
 		// B3.6: write the base row + all config_map rows from the config's
 		// final mapping set.
-		if cfg := im.FindTSConfig(uc.Name, schema); cfg != nil {
+		if cfg := im.FindTSConfig(uc.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 				return fmt.Errorf("pg_ts_config journal: %w", err)
 			}
@@ -16928,7 +16981,7 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		}
 		// B3.6: the rename is a canonical pg_ts_config base-row heap UPDATE
 		// (kind 110 retired).
-		if cfg := im.FindTSConfig(s.NewName, schema); cfg != nil {
+		if cfg := im.FindTSConfig(s.NewName, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
@@ -16942,7 +16995,7 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		}
 		// B3.6: SET SCHEMA is a canonical pg_ts_config base-row heap UPDATE
 		// (kind 111 retired).
-		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema); cfg != nil {
+		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
@@ -16968,7 +17021,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 		dictOIDs = append(dictOIDs, oid)
 	}
 	for _, tt := range s.TokenTypes {
-		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
@@ -16989,7 +17042,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 	}
 	// B3.6: re-sync the config's pg_ts_config_map rows from its final
 	// mapping set (kind 107 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17038,7 +17091,7 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if err != nil {
 		return err
 	}
-	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
@@ -17073,7 +17126,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		}
 	}
 	// B3.6: re-sync the config's config_map rows (kind 113 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17089,7 +17142,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 // in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
 	for _, tt := range s.TokenTypes {
-		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt)
+		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
@@ -17102,7 +17155,7 @@ func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.Alt
 		}
 	}
 	// B3.6: re-sync the config's config_map rows (kind 109 retired).
-	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); cfg != nil {
 		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
 			return err
 		}
@@ -17615,9 +17668,10 @@ func deleteAttributeFromCatalogHeap(ctx *Context, dbOid, relOID uint32, attNum i
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
-		row, err := catalog.DecodePGAttributeRow(data)
+		// Try the PG-physical decoder first (sibling of deleteCatalogRowsForOID).
+		row, err := catalog.DecodePGAttributePhysicalRow(data)
 		if err != nil {
-			row, err = catalog.DecodePGAttributePhysicalRow(data)
+			row, err = catalog.DecodePGAttributeRow(data)
 		}
 		return err == nil && row.AttRelID == relOID && row.AttNum == int32(attNum)
 	})
@@ -20249,7 +20303,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -20412,7 +20466,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))

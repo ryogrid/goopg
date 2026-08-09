@@ -228,6 +228,54 @@ func TestParseCreateServerTypeVersion(t *testing.T) {
 	}
 }
 
+// TestParseAlterServerOwner verifies that ALTER SERVER ... OWNER TO ...
+// parses as a CompatNoopStmt for the pg_dump round-trip. DU-002 slice 376
+// follow-up (M0119-0004).
+func TestParseAlterServerOwner(t *testing.T) {
+	stmts, err := Parse("ALTER SERVER goopg_srv OWNER TO postgres")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.Tag != "ALTER SERVER" || ns.ObjType != "server" || ns.ObjName.Name != "goopg_srv" {
+		t.Errorf("ALTER SERVER mis-parsed: Tag=%q ObjType=%q ObjName=%q", ns.Tag, ns.ObjType, ns.ObjName.Name)
+	}
+
+	// OWNER TO with CURRENT_USER — pg_dump emits the literal current role
+	// name, but the form with CURRENT_USER is used in other contexts.
+	stmts, err = Parse("ALTER SERVER srv2 OWNER TO CURRENT_USER")
+	if err != nil {
+		t.Fatalf("Parse error (CURRENT_USER): %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ObjName.Name != "srv2" {
+		t.Errorf("ALTER SERVER CURRENT_USER mis-parsed: %+v", ns)
+	}
+
+	// OPTIONS clause — must be accepted as a no-op.
+	stmts, err = Parse("ALTER SERVER srv3 OPTIONS (SET host 'newhost')")
+	if err != nil {
+		t.Fatalf("Parse error (OPTIONS): %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ObjName.Name != "srv3" {
+		t.Errorf("ALTER SERVER OPTIONS mis-parsed: %+v", ns)
+	}
+
+	// VERSION clause — must be accepted as a no-op.
+	stmts, err = Parse("ALTER SERVER srv4 VERSION '2.0'")
+	if err != nil {
+		t.Fatalf("Parse error (VERSION): %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ObjName.Name != "srv4" {
+		t.Errorf("ALTER SERVER VERSION mis-parsed: %+v", ns)
+	}
+}
+
 // TestParseCreateFDWOptions verifies that CREATE FOREIGN DATA WRAPPER captures an
 // OPTIONS (name 'value', …) clause as "name=value" elements (independently of
 // any HANDLER/VALIDATOR clause preceding it — see
