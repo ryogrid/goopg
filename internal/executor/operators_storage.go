@@ -6081,9 +6081,20 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				ts.RLock()
 				if tsTup, tsGerr := storage.PageGetHeapTuple(ts.Page(), pu.slot); tsGerr == nil {
 					if tsTup.Header.Xmax != storage.InvalidTransactionID && tsTup.Header.Xmax == o.ctx.Tx.XID {
+						cmax := mvcc.GetCmax(tsTup.Header, o.ctx.comboStore())
 						ts.RUnlock()
 						o.ctx.Pool.Unpin(ts)
-						return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+						// cmax == live CID (post-function-sync) → same sub-command → skip silently.
+						// cmax != live CID → different sub-command (e.g. a volatile function
+						// in RETURNING) → raise TM_SelfModified.
+						// Uses GetCurrentCommandId(true), not CmdID: cmdCounter is synced
+						// back from the child after a volatile function returns, so it
+						// reflects function-driven command-counter advances. AI-007.
+						liveCID := o.ctx.GetCurrentCommandId(true)
+						if cmax != liveCID {
+							return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+						}
+						continue // same CID — silently skip this row (mirrors PG TM_Ok)
 					}
 				}
 				ts.RUnlock()
@@ -6143,6 +6154,29 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						continue // row deleted or chain exhausted
 					}
 					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
+				}
+				// TM_SelfModified guard: the EPQ chain can lead into a
+				// version our own transaction wrote through a different
+				// sub-command (e.g. a function called from a CTE's
+				// RETURNING clause). Re-pin at the new slot and check cmax.
+				// Different CID → error; same CID → skip silently. AI-007.
+				if tms, tmsErr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: epqBlk}); tmsErr == nil {
+					tms.RLock()
+					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
+						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
+							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							liveCID := o.ctx.GetCurrentCommandId(true)
+							tms.RUnlock()
+							o.ctx.Pool.Unpin(tms)
+							if cmax != liveCID {
+								return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+							}
+							// Same CID: TM_SelfModified — skip silently.
+							continue
+						}
+					}
+					tms.RUnlock()
+					o.ctx.Pool.Unpin(tms)
 				}
 				// Re-evaluate predicate against the new row + FROM portion.
 				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
@@ -6206,10 +6240,16 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				// from a different sub-command (e.g. a function called from a
 				// CTE's RETURNING clause). A live tuple has xmax=Invalid; a
 				// stale HOT-updated tuple has a foreign xmax (aborted). Only
-				// our own xmax here means a different sub-command already
-				// modified this tuple. M0129-S2.
+				// our own xmax here means the tuple was already modified by
+				// a sub-command of our transaction. Compare cmax against live CID.
+				// M0129-S2 / AI-007.
 				if oldTup.Header.Xmax != storage.InvalidTransactionID && oldTup.Header.Xmax == o.ctx.Tx.XID {
-					return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+					cmax := mvcc.GetCmax(oldTup.Header, o.ctx.comboStore())
+					liveCID := o.ctx.GetCurrentCommandId(true)
+					if cmax != liveCID {
+						return nil, errTupleAlreadyModified("updated", o.plan.Pos())
+					}
+					continue // same CID — silently skip this row
 				}
 			}
 			var oldTupleBytes []byte
@@ -6546,9 +6586,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
 						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
 							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							liveCID := o.ctx.GetCurrentCommandId(true)
 							tms.RUnlock()
 							o.ctx.Pool.Unpin(tms)
-							if cmax != o.ctx.CmdID {
+							if cmax != liveCID {
 								return nil, errTupleAlreadyModified("deleted", o.plan.Pos())
 							}
 							// Same CID: TM_SelfModified — skip silently.
