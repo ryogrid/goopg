@@ -5,11 +5,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
@@ -79,6 +85,57 @@ func errTupleAlreadyModified(verb string, pos int) *ExecError {
 	}
 }
 
+// wfgDebug dumps the exact wait-for cycle to stderr whenever
+// registerWFGAndCheckCycle reports a deadlock (`GOOPG_DEBUG_WFG=1`).
+//
+// It exists because the WFG's deadlock verdict is only as good as its edges,
+// and a wrong edge is indistinguishable from a real cycle at the call site:
+// the caller just sees `dl == true` and raises 40001. pgbench TPC-B is
+// deadlock-free by construction (every transaction takes its row locks in the
+// fixed order accounts → tellers → branches, so wait-for edges only ever point
+// "forward" and cannot close), yet the nightly stage reports thousands of
+// `could not serialize access due to concurrent update (deadlock)` errors —
+// so the reported cycles must contain at least one edge that does not
+// correspond to a live wait. Printing the participants (and the age of each
+// edge) is the only way to identify which one. Off by default; this is a
+// diagnostic for AI-20260810-011258-006, not a supported log channel.
+var wfgDebug = os.Getenv("GOOPG_DEBUG_WFG") == "1"
+
+// wfgEdgeInfo is the per-edge provenance kept only while wfgDebug is on: when
+// the edge was registered and which epqWait call site created it. Held in a
+// side map so the hot path keeps its plain XID→XID edge.
+type wfgEdgeInfo struct {
+	since  time.Time
+	site   string
+	target string
+}
+
+// wfgDebugTarget records, per waiting XID, the exact tuple its next epqWait is
+// about to block on. Written by wfgNoteTarget at the call site (which has the
+// RelFileNode/block/slot epqWait itself never sees) and folded into the cycle
+// dump. Debug-only (GOOPG_DEBUG_WFG=1).
+var wfgDebugTarget = make(map[storage.TransactionID]string)
+
+func wfgNoteTarget(xid storage.TransactionID, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, h storage.HeapTupleHeader) {
+	// superseded=true means the version we are about to block on already has a
+	// successor (t_ctid points elsewhere): PG would have walked the chain to the
+	// head before deciding whom to wait for, so an edge derived here is an edge
+	// to a transaction that may not hold the row's current version at all.
+	superseded := h.CTID.Block != blk || h.CTID.Offset != slot
+	t := fmt.Sprintf("rel=%d blk=%d slot=%d xmin=%d xmax=%d ctid=(%d,%d) superseded=%v im=%#x",
+		rel.RelOid, blk, slot, h.Xmin, h.Xmax, h.CTID.Block, h.CTID.Offset, superseded, h.Infomask)
+	wfgMu.Lock()
+	wfgDebugTarget[xid] = t
+	wfgMu.Unlock()
+}
+
+var wfgDebugInfo = make(map[storage.TransactionID]wfgEdgeInfo)
+
+// wfgDebugActivity is the pg_stat_activity registry, captured from the first
+// waiting Context so the cycle dump can name the SQL each participant is
+// running. Debug-only; nil until the first wait under GOOPG_DEBUG_WFG=1.
+var wfgDebugActivity atomic.Pointer[activity.ActivityRegistry]
+
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
 // a cycle is detected; the edge is removed before returning (caller must NOT
@@ -88,9 +145,16 @@ func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	wfgMu.Lock()
 	defer wfgMu.Unlock()
 	waitForGraph[myXID] = blockingXID
+	if wfgDebug {
+		wfgDebugInfo[myXID] = wfgEdgeInfo{since: time.Now(), site: wfgCallSite(), target: wfgDebugTarget[myXID]}
+	}
 	cur := blockingXID
 	for i := 0; i < maxWFGHops; i++ {
 		if cur == myXID {
+			if wfgDebug {
+				dumpWFGCycle(myXID, blockingXID)
+				delete(wfgDebugInfo, myXID)
+			}
 			delete(waitForGraph, myXID)
 			return true
 		}
@@ -103,12 +167,73 @@ func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	return false
 }
 
+// dumpWFGCycle prints the cycle myXID→blockingXID→…→myXID that
+// registerWFGAndCheckCycle just closed. Called with wfgMu held.
+func dumpWFGCycle(myXID, blockingXID storage.TransactionID) {
+	var b strings.Builder
+	now := time.Now()
+	edge := func(from storage.TransactionID) string {
+		i, ok := wfgDebugInfo[from]
+		if !ok {
+			return "(no info)"
+		}
+		return i.site + " " + i.target + " age=" + now.Sub(i.since).Round(time.Microsecond).String()
+	}
+	fmt.Fprintf(&b, "WFG deadlock: %d [%s]", myXID, edge(myXID))
+	cur := blockingXID
+	for i := 0; i < maxWFGHops; i++ {
+		fmt.Fprintf(&b, " -> %d", cur)
+		if cur == myXID {
+			break
+		}
+		fmt.Fprintf(&b, " [%s]", edge(cur))
+		next, ok := waitForGraph[cur]
+		if !ok {
+			b.WriteString(" -> (no edge)")
+			break
+		}
+		cur = next
+	}
+	fmt.Fprintf(&b, "  [graph size %d]\n", len(waitForGraph))
+	if reg := wfgDebugActivity.Load(); reg != nil {
+		for _, be := range reg.Snapshot() {
+			if be.BackendXID == "" || be.BackendXID == "0" {
+				continue
+			}
+			x, err := strconv.ParseUint(be.BackendXID, 10, 64)
+			if err != nil {
+				continue
+			}
+			xid := storage.TransactionID(x)
+			if xid != myXID {
+				if _, onPath := wfgDebugInfo[xid]; !onPath {
+					continue
+				}
+			}
+			fmt.Fprintf(&b, "    xid %d: %s\n", xid, strings.Join(strings.Fields(be.Query), " "))
+		}
+	}
+	os.Stderr.WriteString(b.String())
+}
+
 // deregisterWFG removes myXID from the wait-for graph after a snapshot
 // refresh completes.
 func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Lock()
 	delete(waitForGraph, myXID)
+	if wfgDebug {
+		delete(wfgDebugInfo, myXID)
+	}
 	wfgMu.Unlock()
+}
+
+// wfgCallSite names the epqWait/waitPgClassInplaceXID caller that created the
+// current edge (skip: wfgCallSite, registerWFGAndCheckCycle, epqWait).
+func wfgCallSite() string {
+	if _, file, line, ok := runtime.Caller(3); ok {
+		return filepath.Base(file) + ":" + strconv.Itoa(line)
+	}
+	return "?"
 }
 
 // waitPgClassInplaceXID is the deadlock-aware wait that the intra-grant-inplace
@@ -176,6 +301,9 @@ func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool, timeout *
 		return false, nil
 	}
 	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if wfgDebug && ctx.Activity != nil {
+			wfgDebugActivity.CompareAndSwap(nil, ctx.Activity)
+		}
 		if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
 			return true, nil
 		}
@@ -3524,6 +3652,9 @@ func tryApplyHOTUpdate(
 		xmax := concurrentModifierXID(oldTuple.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
+		if wfgDebug {
+			wfgNoteTarget(ctx.Tx.XID, rel, blk, oldSlot, oldTuple.Header)
+		}
 		if dl, terr := epqWait(ctx, xmax); terr != nil {
 			return false, terr
 		} else if dl {
@@ -4176,6 +4307,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// the original snapshot, matching PG's EvalPlanQual semantics
 					// (chain-follow uses refreshed snapshot; qual eval uses origSnap).
 					origSnap := o.ctx.Snap
+					if wfgDebug {
+						wfgNoteTarget(o.ctx.Tx.XID, rel, pu.blk, pu.slot, oldTup.Header)
+					}
 					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
 						terr.Pos = o.plan.Pos()
 						return nil, terr

@@ -434,6 +434,30 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       Cheap repro: s=20 c=100 T=60 with `--verbose-errors`.
       Two ledger rows filed (the status-byte fix's remaining plan-time-error
       gap, and this serialization-error discovery).
+      **LOCALISED 2026-08-10 (second loop) — the WFG verdict is a symptom, not
+      the disease; item still open.** `GOOPG_DEBUG_WFG=1` (new, off by default)
+      records per waiting XID the edge age, the `epqWait` call site and the
+      exact tuple blocked on — `rel/blk/slot`, `xmin`, `xmax`, `t_ctid`, whether
+      that ctid makes it a non-head *superseded* version — and dumps the cycle
+      on detection. Driver: `analysis/wfg-tpcb-repro.sh`; 2–12 false cycles per
+      60–120 s at s=10–20 c=100. Findings: every cycle is a 2-cycle whose edges
+      are µs–ms old (so nothing is stale or leaked — the detector is correct);
+      both participants wait on the **same relation, almost always the same
+      block, at different slots**; and the waited-on version is usually
+      `superseded=true`. goopg takes the blocker from the xmax of whatever
+      version the scan landed on, where upstream re-enters EvalPlanQual on the
+      **head** of the update chain (`EvalPlanQualFetch`, execMain.c; the
+      `t_ctid` walk in `heap_lock_tuple`) and so always blocks on the holder of
+      the row's current version. Next step: walk `t_ctid` to the chain head
+      before computing xmax / registering the edge at both hot `epqWait` sites
+      (`epqFollowHOT` already walks, but only *after* the wait); gate =
+      `SCALE=10 T=120 bash analysis/wfg-tpcb-repro.sh` with 0 `WFG deadlock`
+      lines, plus the isolation suite. Two further ledger rows filed, including
+      a **wrong-answer-class** discovery: waiters have usually already stamped a
+      version of their own in the same page (one UPDATE may apply
+      `bbalance + :delta` twice), and some waited-on versions carry `xmax` older
+      than their own `xmin` — an impossible stamp. Design: follow-up section in
+      `docs/design/0099-0003-deadlock-safe-conflict-waiting.md`.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 

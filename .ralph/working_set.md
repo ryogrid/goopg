@@ -1,48 +1,44 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY AI-20260810-011258-006 (pgbench/nightly silent client
-aborts). Root cause found and the protocol half FIXED; the fix_plan item
-STAYS UNCHECKED because the stage still fails — now honestly.
+Last loop: M-NIGHTLY AI-20260810-011258-006 (pgbench TPC-B 40001 storm).
+LOCALISED, not fixed — the fix_plan item stays unchecked.
 
-The bug: goopg answered EVERY `ReadyForQuery` with `'I'`. `'T'`/`'E'` were
-declared in `internal/protocol` but no path could emit them. libpq exposes the
-byte as `PQtransactionStatus`; pgbench's `CSTATE_ERROR` cleanup uses it to
-decide whether a failed block still owes a ROLLBACK. A permanent `'I'` took the
-`TSTATUS_IDLE` branch → no ROLLBACK → the NEXT iteration's BEGIN (command index
-4 of both scripts IS the BEGIN, not the UPDATE) got 25P02 → non-retriable →
-client aborted. The "missing originating error" was never missing: pgbench only
-prints retriable (40001/40P01) errors under `--verbose-errors`.
+Landed: WFG edge provenance behind `GOOPG_DEBUG_WFG=1` (off by default, one
+bool read on the register path when off) in
+`internal/executor/operators_storage.go`: `wfgDebug`, `wfgEdgeInfo`,
+`wfgDebugTarget` + `wfgNoteTarget` (called at the two hot `epqWait` sites),
+`wfgCallSite`, `dumpWFGCycle`. Records per waiting XID the edge age, the
+`epqWait` call site, and the tuple blocked on (rel/blk/slot, xmin, xmax,
+t_ctid, superseded flag, infomask); dumps the whole cycle on detection.
+Driver: `analysis/wfg-tpcb-repro.sh` (untracked analysis area).
 
-Fix: `connTxState.wireStatus(afterError)` (internal/server/conn_tx.go, mirrors
-upstream TransactionBlockStatusCode) installed as `FrameWriter.TxStatusFn` in
-serveConn; the ~47 sites now call `w.ReadyForQuery()` /
-`w.ReadyForQueryAfterError()`. The afterError variant exists because goopg calls
-`connTxState.Fail()` AFTER writing the error, unlike upstream.
-Design: follow-up section in `docs/design/root-0002-wire-protocol.md` + README row.
+Evidence (2–12 false cycles per 60–120 s at s=10–20, c=100):
+- every cycle is a 2-cycle, edges µs–ms old ⇒ nothing stale/leaked; the
+  detector is correct, its INPUTS are wrong;
+- both participants wait on the same relation, almost always the same block,
+  at DIFFERENT slots — two versions in one hot page, not one contended tuple;
+- the waited-on version is usually `superseded=true` (t_ctid → successor).
+  goopg blocks on the xmax of whatever version the scan landed on; upstream
+  re-enters EvalPlanQual on the chain HEAD (EvalPlanQualFetch / heap_lock_tuple
+  t_ctid walk), so it always blocks on the current holder.
+Two extra discoveries, both wrong-answer class, ledgered separately: waiters
+have usually already stamped a version of their own in the same page (one
+UPDATE may apply `bbalance + :delta` twice — no gate asserts the TPC-B
+balance invariant), and some waited-on versions carry xmax OLDER than their
+own xmin (impossible stamp; M0090-0002's race is not fully closed).
 
-Measured: client aborts 80 → 0; workload summaries 2/3 → 3/3; reported failed
-transactions 0 → 1488 (0.154%, TPC-B only; -N and -S clean). Those 1488 are the
-originating errors the aborts had masked: `ERROR: could not serialize access due
-to concurrent update (deadlock)` (40001) from `epqWait`
-(internal/executor/operators_storage.go:3534/:4186). Upstream READ COMMITTED
-never raises this for TPC-B — 100 clients on 50 branch rows is a waiter chain,
-not a cycle. Likely tied to `goopg_dml_conflict_no_fifo_tuple_lock` / ledger
-0021-0012.
+Next step: at both hot `epqWait` sites, walk t_ctid to the chain head before
+computing xmax / registering the WFG edge (`epqFollowHOT` walks, but only
+after the wait). Gate: `SCALE=10 T=120 REPO_ROOT=$PWD bash
+analysis/wfg-tpcb-repro.sh` → 0 `WFG deadlock` lines, plus the isolation
+suite (the wait target changes for every UPDATE/DELETE/MERGE conflict path).
 
-Ledger: 2 rows (plan-time errors still don't abort the block — the choke-point
-fix in handleQuery is deferred because `Fail()` releases table locks and the
-pinned snapshot, which the isolation specs time against; and the
-serialization-error discovery).
-
-Gates run: `TestPort_ReadyForQueryTransactionStatus` PASS (new guard, 0.69 s);
-`go test ./internal/server/` PASS (22.7 s); units precommit PASS (cached);
-testport subset PASS 293 s (RegressSuite, Psql001/020, TwoPhaseCommit,
-SetConstraints, SSI, 4 isolation specs incl. MergeUpdate, Scripts020/100);
-nightly pgbench stage re-run (12 min, results above); `make ralph-state-guard` OK.
+Gates run: `go test ./internal/executor/` PASS (5.8 s); units precommit PASS
+(cached); 4× pgbench repro runs (s=10/20, c=100, T=60–120); commit-hook
+pgbench smoke; `make ralph-state-guard` OK (auto-repaired progress marker).
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M-NIGHTLY is top selectable (all M0130 S1–S10 are `[x]`). Highest-value
-remaining: the 40001-from-epqWait false deadlock above (finishes AI-…-006), or
-AI-…-003's pg_attrdef index 2656 blocker.
+Ledger: 2 rows. Design: follow-up in
+`docs/design/0099-0003-deadlock-safe-conflict-waiting.md` (+ README row).
 
 In-flight: none.
