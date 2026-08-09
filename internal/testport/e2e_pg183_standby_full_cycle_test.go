@@ -212,6 +212,15 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 
 	// pg_basebackup from the promoted PG for the reverse goopg standby.
 	reverseDir := filepath.Join(baseDir, "goopg-reverse-standby")
+	// Phase D runs inside t.TempDir(), which Go removes when the test ends —
+	// so a reverse-standby start failure would otherwise point at a path that
+	// no longer exists by the time anyone looks. Dump the log inline, the same
+	// way the PG standby's log is dumped above.
+	t.Cleanup(func() {
+		if log, rerr := os.ReadFile(filepath.Join(reverseDir, "cluster.log")); rerr == nil {
+			t.Logf("[s10-goopg-reverse-standby-log] %s/cluster.log:\n%s", reverseDir, string(log))
+		}
+	})
 	runPGBasebackup(t, repo, pgBasebackupBin, standby, reverseDir, reverseSlot)
 	normalizePGWALSegmentNames(t, reverseDir)
 	configureGoopgStandbyFromPGBackup(t, reverseDir, standby.Conninfo(reverseSlot), reverseSlot)

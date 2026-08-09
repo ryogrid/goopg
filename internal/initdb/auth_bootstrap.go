@@ -97,9 +97,19 @@ func resolveAuthMethods(host, local string, hasPassword bool) (rHost, rLocal str
 // buildPgHBAConf renders pg_hba.conf with the chosen host/local methods
 // substituted into the local and loopback-host rules. The external
 // catch-all rules stay reject (goopg's default-deny policy for non-loopback
-// connections, unchanged from the original fixed template). Passing
-// ("trust", "trust") reproduces the historical default file byte-for-byte,
-// so defaultPgHBAConf() and its existing tests are unaffected.
+// connections, unchanged from the original fixed template).
+//
+// The three `replication` rules mirror upstream's pg_hba.conf.sample
+// (postgres/src/backend/libpq/pg_hba.conf.sample, emitted verbatim by
+// initdb's setup_config) — `local replication all <local>`, plus the
+// 127.0.0.1/32 and ::1/128 host twins. In upstream a DATABASE field of
+// `all` does NOT match a physical replication connection (hba.c:
+// check_hba → check_db), so without these rules a replication walreceiver
+// gets "no pg_hba.conf entry for replication connection". goopg never
+// noticed because its own matcher treats `all` as matching everything
+// (internal/auth.nameListMatches); it only became visible once a real
+// PG 18.3 was started on a goopg-initdb'd data directory and read this
+// file (M0130-S10 Phase D pg_basebackup).
 func buildPgHBAConf(hostMethod, localMethod string) []byte {
 	return fmt.Appendf(nil, `# goopg pg_hba.conf — host-based authentication rules.
 #
@@ -111,6 +121,15 @@ func buildPgHBAConf(hostMethod, localMethod string) []byte {
 local    all       all                    %[2]s
 host     all       all    127.0.0.1/32    %[1]s
 host     all       all    ::1/128         %[1]s
+
+# Allow replication connections from localhost, by a user with the
+# replication privilege. The "all" DATABASE keyword does not cover
+# replication connections, so these rules are required for a walreceiver
+# or pg_basebackup to connect.
+local    replication  all                 %[2]s
+host     replication  all  127.0.0.1/32   %[1]s
+host     replication  all  ::1/128        %[1]s
+
 host     all       all    0.0.0.0/0       reject
 host     all       all    ::/0            reject
 `, hostMethod, localMethod)

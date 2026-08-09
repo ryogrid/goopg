@@ -66,6 +66,12 @@ func TestBuildPgHBAConf(t *testing.T) {
 		"local    all       all                    trust",
 		"host     all       all    127.0.0.1/32    trust",
 		"host     all       all    ::1/128         trust",
+		// Upstream's three replication rules (pg_hba.conf.sample): a real
+		// PG reading a goopg data dir needs them, because `all` in the
+		// DATABASE field does not match a replication connection.
+		"local    replication  all                 trust",
+		"host     replication  all  127.0.0.1/32   trust",
+		"host     replication  all  ::1/128        trust",
 		"host     all       all    0.0.0.0/0       reject",
 		"host     all       all    ::/0            reject",
 	} {

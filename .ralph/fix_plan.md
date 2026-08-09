@@ -373,19 +373,35 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          `TestPgProcSeedArgDefaultsMatchesRealPG`,
          `TestPgProcSeedArgDefaultsUnlistedOIDsUnchanged`,
          `TestPgProcRowCarriesSeedDefaults`, `TestOutListBareList`.
-      5. OPEN — Phase D now fails one step later, in `pg_basebackup` against
-         the promoted PG: `FATAL: no pg_hba.conf entry for replication
-         connection from host "127.0.0.1", user "ryo"`. Same class as #4 —
-         the promoted PG enforces *goopg's* `pg_hba.conf` because the data
-         dir came from goopg's initdb, and `buildPgHBAConf`
-         (`internal/initdb/auth_bootstrap.go`) emits only `all`-database
-         rules, omitting the three `replication` rules upstream initdb writes
-         (`local replication all <local>`, `host replication all
-         127.0.0.1/32 <host>`, and the `::1/128` twin). goopg ignores
-         pg_hba.conf for its own auth (`internal/auth`), so this was
-         invisible until a real PG read the file. Resume: add the three rules
-         to `buildPgHBAConf` with the same `%[1]s`/`%[2]s` host/local method
-         substitution, update the byte-for-byte pg_hba tests, re-run
+      5. FIXED (2026-08-10) — **Phase D's `pg_basebackup` against the promoted
+         PG now succeeds.** goopg's `buildPgHBAConf`
+         (`internal/initdb/auth_bootstrap.go`) emitted only `all`-database
+         rules; upstream's `pg_hba.conf.sample` also carries three
+         `replication` rules (`local replication all <local>`,
+         `host replication all 127.0.0.1/32 <host>`, `::1/128` twin), and in
+         PG a DATABASE field of `all` does **not** match a physical
+         replication connection (hba.c `check_db`), so the promoted PG —
+         which enforces goopg's pg_hba.conf because the data dir came from
+         goopg's initdb — answered `FATAL: no pg_hba.conf entry for
+         replication connection from host "127.0.0.1"`. Invisible to goopg
+         because its own matcher treats `all` as matching everything
+         (`internal/auth.nameListMatches`). The three rules are now emitted
+         between the loopback `all` rules and the external `reject`
+         catch-alls. Guard: `TestBuildPgHBAConf` (needles extended).
+      6. OPEN — Phase D now fails one step later, at
+         `reverseStandby.Start`: goopg refuses to start on the
+         PG-produced base backup with `wal: read
+         <dir>/pg_wal/000000010000000000000002: no such file or
+         directory`. The promoted PG is on **timeline 2**, so its backup's
+         pg_wal holds `00000002…` segments (plus the `.history` file);
+         goopg's startup WAL reader still resolves the segment name on
+         timeline 1. Resume: the recovery-start segment lookup must read
+         `pg_control`'s / the backup label's timeline (and consult
+         `00000002.history`) instead of assuming TLI 1 — see
+         `normalizePGWALSegmentNames` in the harness and goopg's WAL
+         segment-name resolution. Harness now dumps the reverse standby's
+         `cluster.log` on failure (it lives under `t.TempDir()`, which Go
+         deletes before anyone can look). Repro:
          `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`.
          Design: addenda in
          `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 4 rows.

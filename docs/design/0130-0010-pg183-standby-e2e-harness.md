@@ -271,3 +271,65 @@ fix_plan item stays unchecked.
 `TestPgProcRowCarriesSeedDefaults`
 (`internal/initdb/pg_proc_seed_defaults_test.go`) plus `TestOutListBareList`
 (`internal/pgnodes/pgnodes_test.go`).
+
+## Addendum (2026-08-10) — blocker #5: pg_hba.conf had no `replication` rules
+
+Blocker #4 (pg_proc argument DEFAULTs) unblocked
+`pg_create_physical_replication_slot('s10_reverse')` on the promoted PG, and
+Phase D then failed one step later, inside `pg_basebackup`:
+
+```
+FATAL:  no pg_hba.conf entry for replication connection from host "127.0.0.1", user "ryo"
+```
+
+Same class as #4: the promoted PG is running on a data directory that goopg's
+`initdb` created, so it enforces **goopg's** `pg_hba.conf`.
+
+`buildPgHBAConf` (`internal/initdb/auth_bootstrap.go`) emitted five rules —
+`local all`, `host all` on 127.0.0.1/32 and ::1/128, and the two external
+`reject` catch-alls. Upstream's `pg_hba.conf.sample`
+(`postgres/src/backend/libpq/pg_hba.conf.sample`, emitted verbatim by initdb's
+`setup_config`) carries three more:
+
+```
+local   replication     all                                     <local method>
+host    replication     all             127.0.0.1/32            <host method>
+host    replication     all             ::1/128                 <host method>
+```
+
+They are not redundant with the `all` rules. In upstream, a DATABASE field of
+`all` does **not** match a physical replication connection — `hba.c`'s
+`check_db` handles the `replication` keyword separately and returns false for
+`all` when `am_walsender && !am_db_walsender`. So a real walreceiver or
+`pg_basebackup` against a goopg-initdb'd directory had no matching entry at
+all and drew the implicit reject.
+
+goopg never noticed because its own matcher
+(`internal/auth.nameListMatches`) short-circuits on `all` for every requested
+database, replication included — a fidelity gap in the opposite direction,
+recorded in the ledger.
+
+**Fix.** The three rules are emitted between the loopback `all` rules and the
+external `reject` catch-alls, using the same `%[1]s`/`%[2]s` host/local method
+substitution as the existing rules, so `--auth-host`/`--auth-local` keep
+flowing through. The `reject` catch-alls stay last; they never matched
+replication traffic in PG anyway. Guard: `TestBuildPgHBAConf` needles
+extended (`internal/initdb/auth_bootstrap_test.go`); the byte-for-byte
+`defaultPgHBAConf()` equality assertion still holds because both sides are
+built from the same template.
+
+**Result.** Phase D's `pg_basebackup` from the promoted PG succeeds. The
+harness now fails at the *next* step — **blocker #6** — where goopg is started
+on the PG-produced backup:
+
+```
+goopg start: goopg: wal: wal: read <dir>/pg_wal/000000010000000000000002: no such file or directory
+```
+
+The promoted PG is on **timeline 2**; its backup's `pg_wal` holds
+`00000002…` segments plus `00000002.history`, while goopg's startup WAL
+reader still composes the recovery-start segment name on timeline 1. That is
+a goopg gap (multi-timeline reverse attach, S8), not a harness one. The
+harness now dumps the reverse standby's `cluster.log` on failure — it lives
+under `t.TempDir()`, which Go deletes before anyone can read the path the
+error prints.
