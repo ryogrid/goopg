@@ -1533,15 +1533,58 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 	return out, nil
 }
 
-// encodeArbiterExprKey encodes a Datum produced by an expression-based
-// arbiter column into BTree key bytes. Supports text/string and integer
-// datums (the most common expression result types).
+// encodeArbiterExprKey encodes a Datum produced by an expression key column
+// into BTree key bytes. It is the expression-side sibling of
+// encodeBTreeKeyForColumn and is shared by all three expression-key paths:
+// ON CONFLICT arbiter probing (encodeArbiterKey), the runtime index-maintain
+// path (encodeExprIndexKey in operators_storage.go) and the bulk build /
+// REINDEX path (encodeCompositeBTreeKeyWithExprs in operators_ddl.go). Every
+// arm must therefore stay byte-identical across those callers — a key written
+// by one and re-derived by another has to land on the same bytes.
+//
+// Dispatch is on the runtime Datum kind rather than a declared column type,
+// because an expression key column has no catalog column to consult
+// (idx.Columns[i] == ""); planner.inferExprType is unexported and too weak to
+// give a reliable static result type. Kind dispatch is sound as long as an
+// expression yields a stable kind across rows, which holds for every builtin
+// goopg evaluates today (see the deferral ledger row for the mixed-kind case).
+//
+// Each arm reuses the same order-preserving encoder that the equivalent
+// declared column type would use, so bytewise comparison of the encoded key
+// reproduces the SQL ordering of the expression's result type:
+//
+//	KindString  → EncodeVarchar   (text/varchar/uuid/name)
+//	KindInt     → EncodeInt8      (int2/int4/int8 widened to int64)
+//	KindNumeric → EncodeNumericKey(mantissa, scale)
+//	KindTime    → EncodeTimestamp (micros since the PG epoch; date/time
+//	                               subtypes order correctly under the same
+//	                               scale, so no subtype tag is needed)
+//	KindBool    → EncodeInt8(0/1) (false < true, PG's boolean btree order)
+//	KindEnum    → EncodeFloat8(sort order)  — same as the enum column path
+//	KindBytes   → EncodeVarchar   (bytea; escaped encoding is bytewise-order
+//	                               preserving and self-terminating)
+//
+// Returns nil for a kind with no btree encoding; callers treat that as
+// "row not indexable" rather than an error.
 func encodeArbiterExprKey(v Datum, pos int) []byte {
 	switch v.Kind {
 	case KindString:
 		return btree.EncodeVarchar([]byte(v.StringValue()))
 	case KindInt:
 		return btree.EncodeInt8(v.Int)
+	case KindNumeric:
+		return btree.EncodeNumericKey(numericMant(v), v.Scale)
+	case KindTime:
+		return btree.EncodeTimestamp(v.TimeValue().Sub(pgEpoch).Microseconds())
+	case KindBool:
+		if v.BoolValue() {
+			return btree.EncodeInt8(1)
+		}
+		return btree.EncodeInt8(0)
+	case KindEnum:
+		return btree.EncodeFloat8(v.EnumSortOrder())
+	case KindBytes:
+		return btree.EncodeVarchar(v.BytesValue())
 	}
 	return nil
 }

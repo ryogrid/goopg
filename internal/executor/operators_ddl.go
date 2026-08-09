@@ -10797,7 +10797,8 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 // Three outcomes, matching the runtime path's own semantics:
 //   - expression yields NULL          → hasNullKey (row not indexable, no null bitmap)
 //   - expression result kind has no   → key == nil, so the caller skips the row
-//     btree encoding (encodeArbiterExprKey covers string + int only)
+//     btree encoding (encodeArbiterExprKey covers string/int/numeric/
+//     timestamp/bool/enum/bytea; see its comment for the encoder per kind)
 //   - otherwise                       → bytes appended in key-column order
 func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
