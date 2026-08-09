@@ -3388,6 +3388,32 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 	return nil
 }
 
+// stampMovedPartitionOldTuple stamps the old tuple of a cross-partition UPDATE
+// (a row whose new key routes it to a different partition child): xmax plus the
+// {InvalidBlockNumber, MovedPartitionsOffsetNumber} sentinel CTID, and then the
+// deleting command id (cmax).
+//
+// The cmax half is not optional. Upstream heap_delete calls
+// HeapTupleHeaderSetCmax (heapam.c:3065) unconditionally and only *afterwards*
+// adds HeapTupleHeaderSetMovedPartitions (heapam.c:3071) — the sentinel is an
+// addition to the normal delete stamp, not a replacement for it. goopg's three
+// cross-partition stamp sites previously wrote only the sentinel, leaving the
+// tuple's stale t_cid (its cmin, from whichever command inserted it) to stand in
+// for cmax. mvcc.TupleVisible then reaches the `effXmax == currentXID` arm and
+// reads `cmax >= curcid` as "deleted by a later command — pre-image visible", so
+// the deleting transaction kept seeing its own moved-away row. Other sessions
+// were unaffected (they judge xmax by the snapshot, never by cmax), which is why
+// the bug only ever surfaced in the writer's own re-scan.
+//
+// M-NIGHTLY AI-20260809-020705-018 (isolation spec merge-update, permutation
+// `pa_merge1 pa_merge2a c1 pa_select2 c2`).
+func stampMovedPartitionOldTuple(ctx *Context, page storage.Page, slot uint16) error {
+	if err := storage.PageSetHeapTupleMovedPartition(page, slot, effectiveWriterXID(ctx)); err != nil {
+		return err
+	}
+	return storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false)
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
@@ -4347,7 +4373,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				var stampIdxErr error
 				if isCrossPartitionMoveIdx {
-					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					stampIdxErr = stampMovedPartitionOldTuple(o.ctx, s.Page(), pu.slot)
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
@@ -5067,7 +5093,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				var stampErr error
 				if isCrossPartitionMove {
-					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					stampErr = stampMovedPartitionOldTuple(o.ctx, s.Page(), pu.slot)
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT

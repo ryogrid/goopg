@@ -224,12 +224,34 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       suite-wedge casualty mode already documented under `root-0029`: one wedged
       case poisons the shared cluster and the rest of the batch reports as
       independent failures. No engine change made.
-- [ ] **testport/TestPort_IsolationMergeUpdate** — testport
+- [x] **testport/TestPort_IsolationMergeUpdate** — testport
       TestPort_IsolationMergeUpdate FAILed (AI-20260809-020705-018; repro:
       `go test -v -run '^TestPort_IsolationMergeUpdate$' ./internal/testport/`).
-      **REAL — still FAILs at HEAD `d4bee0df`** (4.09s), the only one of the 23
-      testport items that reproduces. Not investigated this loop (one task per
-      loop); it is the next M-NIGHTLY task.
+      **REAL — FIXED 2026-08-10.** Root cause was NOT in MERGE: the three
+      cross-partition UPDATE stamp sites treated
+      `PageSetHeapTupleMovedPartition` as a *replacement* for the ordinary
+      delete-half stamp and so never wrote cmax. Upstream `heap_delete` writes
+      cmax (`heapam.c:3065`) and only then adds the moved-partitions sentinel
+      (`:3071`) — the sentinel is an addition, not an alternative. With cmax
+      unwritten the tuple's stale `t_cid` (its inserting cmin) stood in for
+      cmax, and `mvcc.TupleVisible`'s `effXmax == currentXID` arm read
+      `cmax >= curcid` as "deleted by a later command — pre-image visible", so
+      the moving transaction kept seeing its own moved-away row. Only the
+      writer's own re-scan was affected (all other sessions judge xmax against
+      the snapshot, never cmax), and only when the stale cmin was >= the
+      writer's current command id — hence a same-transaction insert-then-move,
+      the shape most unit tests use, always looked correct. Fixed by unifying
+      all three sites behind `stampMovedPartitionOldTuple`
+      (`internal/executor/operators_storage.go`). Gates: new
+      `TestStampMovedPartitionOldTupleWritesCmax` (with a
+      `bare_sentinel_stamp_leaks_the_row` non-vacuity sub-test),
+      `TestPort_IsolationMergeUpdate` PASS, plus
+      `TestPort_IsolationPartitionKeyUpdate1..4` /
+      `TestPort_IsolationMergeDelete` / `TestPort_IsolationMergeInsertUpdate`
+      green for the two plain-UPDATE sites. Design: addendum in
+      `docs/design/0100-0005n-cross-partition-update-moved-tuple-error.md`.
+      One ledger row (goopg never allocates combo CIDs — `mvcc.AdjustCmax` has
+      no non-test callers, so a same-transaction insert-then-delete loses cmin).
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
