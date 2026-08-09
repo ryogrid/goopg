@@ -590,9 +590,41 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestEncodeArbiterExprKeyEnumIsTypeDirected` +
       `TestExpressionIndexBuildEnumKey` (physical tree scan over bulk build and
       post-build INSERT), both confirmed non-vacuous.
+      **Slice landed 2026-08-10 (12th) — ARRAY key columns** (design
+      `docs/design/0119-0006-array-index-key-encoding.md`). The `int4[]` row of
+      the type cluster, and the same class of defect the float/enum slices
+      found, one layer out: an array column is
+      `catalog.Type{Name:<ELEMENT type>, IsArray:true}`, so every `Name`-only
+      predicate in `encodeBTreeKeyForColumn` answered for the ELEMENT and fed
+      the array its own TEXT (`"{1,2}"`) as a scalar — and
+      `isSupportedBTreeKeyType` admitted the index for the same reason. The two
+      write paths then failed differently and both silently: the bulk build
+      aborted with a bogus `22P02 invalid input syntax for type integer:
+      "{1,2}"`, while the runtime maintain path wrote NO entry at all
+      (`maintainUniqueIndexesForInsert` swallows key-encode errors by design),
+      so `CREATE INDEX` on an empty table SUCCEEDED and left a permanently
+      EMPTY index — an index scan reads it as "no rows" and a UNIQUE array
+      index enforces nothing (confirmed at HEAD: five rows in, zero leaf
+      entries). New `encodeArrayBTreeKey` reproduces upstream `array_ops`
+      (`btarraycmp`→`array_cmp`) in bytes: `0x01 ++ <element key>` per non-NULL
+      element, `0xFF` for a NULL element (NULL sorts after not-NULL), `0x00`
+      closing the array. Element keys recurse into `encodeBTreeKeyForColumn`,
+      so an array key is byte-identical to the scalar keys of its elements.
+      Neither marker is optional — without the tag the NULL marker collides
+      with `EncodeInt4(maxint32)`, and without the end marker the segment is
+      not self-delimiting inside a COMPOSITE key (`('{1}',2)` vs `('{1,2}',0)`)
+      and `{}` encodes to a zero-length key, which `encodeIndexKeyFromCols`
+      cannot tell from "no key" and dropped from the index. Gates:
+      `TestEncodeArrayBTreeKey{MatchesArrayCmpOrder,TextElements,DeclinesMultidim}`
+      + `TestArrayIndex{BuildAndMaintainKeys,CompositeKeyIsSelfDelimiting}`,
+      the orderings captured from the PG 18.3 reference cluster, all five
+      confirmed non-vacuous.
       Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range`/`int4[]`/interval key encodings, and
-      the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      checkunique tier, `box`/`int4range`/`interval` key encodings (and
+      `smallint`/`bool`/`oid`/`time`/`bytea`, which `isSupportedBTreeKeyType`
+      also rejects outright — discovered while probing the array gap), the
+      array DECODE arm for the opclass comparator, and the whole-database
+      (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

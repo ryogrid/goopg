@@ -10911,6 +10911,13 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 // 42804 — the analyzer should have caught it but the runtime guard
 // makes the failure mode crisp.
 func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	// ARRAY column: catalog.Type carries the ELEMENT type in Name plus
+	// IsArray=true (codec_array.go), so every type predicate below would answer
+	// for the element and mis-claim the array. Route arrays to the array_ops
+	// (array_cmp) encoding BEFORE the scalar switch. M0119-0006.
+	if col.Type.IsArray {
+		return encodeArrayBTreeKey(v, col, pos)
+	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
 	// KindString even for an int/numeric/timestamp column, because bare string
