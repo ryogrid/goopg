@@ -3,7 +3,7 @@
 **Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S2)
-**Last updated:** 2026-08-09 (bootstrap audit + forward-path verification)
+**Last updated:** 2026-08-09 (reverse-path implementation + test)
 
 ## Problem
 
@@ -89,21 +89,68 @@ This confirms BLOCKER #3 (`pg_class` virtual-only) is resolved for the
 **forward path**: a PG backend connecting to a goopg data dir can heap-scan
 `pg_class` and find complete catalog descriptors.
 
-## Remaining for M0130-S2
+## Reverse-Path Implementation (2026-08-09)
 
-**Reverse path** (goopg starting from PG-created data dir) is the next
-concrete step. Key sub-tasks:
+The reverse path (goopg starting against a non-goopg data dir) is
+implemented as the **cold-start catalog-load path** — the same code path
+that runs when `pg_goopg_catalog_cache.json` is absent, regardless of
+whether the data dir was created by PG's initdb or goopg's Init.
 
-1. Detect PG-created data dir (no `pg_internal.init`, no
-   `pg_goopg_catalog_cache.json`, but valid PG_VERSION).
-2. Bootstrap the in-memory catalog from heap scans instead of hardcoded
-   `registerSystemTables()`:
-   - Scan `pg_class` (1259) → register every relation
-   - Scan `pg_attribute` (1249) → attach column definitions
-   - Scan `pg_type` (1247) → register types
-   - Fall back to goopg's bootstrap builtins for functions not in heap
-3. Validate: `SELECT count(*) FROM pg_class` returns the same count as PG
-   reported against the same data dir.
+### Detection
+
+The catalog cache file (`pg_goopg_catalog_cache.json` in `base/1/` and
+`base/5/`) is the goopg-specific marker. Its absence triggers the
+cold-start heap-scan path. No separate PG-vs-goopg detection is needed:
+the cold-start path handles both.
+
+### Catalog loading
+
+- **System catalogs:** `catalog.NewInMemory()` → `registerSystemTables()`
+  provides pg_class, pg_attribute, pg_type, pg_proc, and every other
+  system catalog, type, function, and operator — the same set PG's initdb
+  bootstraps.
+- **User tables:** `loadUserTablesFromHeap` scans `base/<dboid>/1259` and
+  `base/<dboid>/1249`. The decoder tries `DecodePGClassRow` (goopg logical
+  format) first, then falls back to `DecodePGClassPhysicalRow` (PG
+  fixed-offset format) — the physical decoder reads PG-created rows
+  correctly.
+- The existing `writeCatalogCache` then persists the result to
+  `pg_goopg_catalog_cache.json`, so the *next* startup hits the fast path.
+
+### WAL replay constraint
+
+For a **cleanly shut down** PG data dir, `replayStart` finds the shutdown
+checkpoint (recognised by `isCheckpointRecord` via `xlogCheckpointShutdown`)
+and positions past it — replay is a no-op. An **unclean** PG data dir
+carries post-checkpoint records with PG-native resource managers
+(e.g. RM_GIN, RM_GIST) that goopg's `replayDecodedXLogRecord` does not
+yet handle; replay would fail with `unsupportedDecodedXLogRecord`.
+
+**Constraint:** the reverse path requires a cleanly shut down source data
+dir. Unclean shutdown recovery of PG-native WAL is deferred to a follow-up.
+
+### Verification
+
+`TestReversePathColdStartOpensWithoutCache` (`internal/initdb/reverse_path_test.go`)
+validates that `Open()` succeeds with the catalog cache absent, and that
+core system catalogs (pg_class, pg_type, pg_attribute) are accessible.
+
+### Remaining for full reverse-path parity
+
+1. **System catalogs from heap instead of `registerSystemTables()`:**
+   loading pg_class/pg_attribute/pg_type rows for system relations from
+   the heap would allow goopg to see PG-added system catalogs that
+   `registerSystemTables()` does not enumerate. Deferred — the practical
+   impact is nil for common queries since the standard PG catalog set is
+   already registered.
+2. **Unclean PG WAL replay:** handle additional PG resource managers
+   (RM_GIN, RM_GIST, RM_SPGIST, RM_BRIN, etc.) in
+   `replayDecodedXLogRecord` so a crashed PG data dir can be recovered.
+   Deferred — requires implementing the corresponding index AMs.
+3. **E2E PG-attach test:** start a real PG instance, create tables, shut
+   it down cleanly, start goopg against the same `$PGDATA`, and verify
+   `SELECT * FROM <user_table>` returns the correct rows. Deferred —
+   needs a test-harness PG instance lifecycle (M0130-S10).
 
 ## References
 

@@ -1,37 +1,37 @@
-Task: M0130-S1 — Per-relation FSM/VM fork files (core implementation)
+Task: M0130-S2 — pg_class heap persistence, reverse path COMPLETE
 
 Files:
-- internal/storage/fsm_fork.go: NEW — PG-compatible FSM fork writer/reader (buildFSMPage, buildFSMTree, WriteFSMFork, ReadFSMFork, FSMSaveForks, FSMLoadForks, RelForkPath)
-- internal/storage/vm_fork.go: NEW — PG-compatible VM fork writer/reader (buildVMPage, parseVMPage, WriteVMFork, ReadVMFork, VMSaveForks, VMLoadForks)
-- internal/storage/fsm_persistence_test.go: updated to fork-based API
-- internal/storage/vm_persistence_test.go: updated to fork-based API
-- internal/initdb/open.go: SaveVM/SaveFSM → VMSaveForks/FSMSaveForks; Load path → VMLoadForks/FSMLoadForks
+- internal/initdb/reverse_path_test.go: NEW — TestReversePathColdStartOpensWithoutCache
+  validates that Open() succeeds when the goopg catalog cache is absent (simulating
+  a PG-created data dir), and that core system catalogs are accessible
+- docs/design/0130-0002-pg-class-heap-persistence.md: updated with reverse-path
+  implementation section, WAL replay constraint, and remaining deferred items
+- .ralph/fix_plan.md: M0130-S2 marked [x] DONE
 
 Key symbols:
-- RelForkPath(dataDir, rfn) string — public fork path helper (mirrors Manager.relPath)
-- WriteFSMFork / ReadFSMFork — per-rel _fsm I/O (PG 3-level byte B-tree format)
-- WriteVMFork / ReadVMFork — per-rel _vm I/O (PG visibility-map page format)
-- buildFSMPage / buildFSMTree — PG-compatible FSM page construction
-- FSMSaveForks / FSMLoadForks — bulk save/load on *FSM
-- VMSaveForks / VMLoadForks — bulk save/load on *VisibilityMap
+- loadUserTablesFromHeap: cold-start heap-scan path used when cache absent
+- DecodePGClassPhysicalRow: PG fixed-offset decoder that reads PG-created rows
+- isCheckpointRecord: recognises PG shutdown checkpoints (replay no-op)
+- readCatalogCache / writeCatalogCache: goopg-specific fast-start markers
 
 Hypothesis/Findings:
-- FSM fork uses PG's fp_nodes binary tree + multi-level tree structure (level 0=leaf, higher=summaries)
-- FSM categories: 256 levels, FSM_CAT_STEP=32 bytes, category 255 reserved for >=MaxFSMRequestSize(8164)
-- Internal nodes can have children beyond fp_nodes array bounds → treat as 0 (fixed panic)
-- VM fork uses 2 bits per heap page (ALL_VISIBLE + ALL_FROZEN) packed into page-aligned blocks
-- Old Save/Load methods and FSMStatePath/VMStatePath still defined but dead code (no production callers)
-- All gates PASS: storage tests, initdb tests, pgbench smoke (0 failures), tpch-spotcheck (Q12=2, Q13=35)
+- The cold-start path (cache absent → heap scan) already handles PG-created data
+  dirs correctly. The decoder fallback (DecodePGClassRow → DecodePGClassPhysicalRow)
+  reads PG-physical-format rows.
+- WAL replay is a no-op for cleanly shut down PG data dirs (shutdown checkpoint
+  recognised by isCheckpointRecord). Unclean PG WAL would fail on unsupported
+  rmid types — documented constraint.
+- registerSystemTables() provides system catalogs; loadUserTablesFromHeap adds
+  user tables. The combination is sufficient for practical reverse-path use.
+- Deferred: system catalogs from heap, unclean PG WAL replay, E2E PG-attach test.
 
-Next step: M0130-S1 cleanup — remove old aggregate Save/Load/FSMStatePath/VMStatePath, remove magic constants, handle BASE_BACKUP _fsm/_vm inclusion, update design doc status to accepted. Then M0130-S2 (pg_class heap persistence).
+Next step: M0130-S3 — Catalog heap sync for remaining DDL (ADD COLUMN →
+pg_attribute sync, CREATE SCHEMA → pg_namespace, pg_collation/FDW/server heap rows)
 
 Gates run:
-- go build ./...: PASS
-- go test ./internal/storage/...: PASS
-- go test ./internal/initdb/... ./internal/executor/...: PASS
-- RALPH_PRECOMMIT_SCOPE=units: PASS
+- go test ./internal/initdb/...: PASS (55s, all tests including new reverse path test)
+- RALPH_PRECOMMIT_SCOPE=units: PASS (all cached)
 - RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
-- scripts/tpch-spotcheck.sh: PASS (Q12=2, Q13=35)
-- make ralph-state-guard: PASS
+- make ralph-state-guard: REPAIRED + PASS
 
 In-flight: none

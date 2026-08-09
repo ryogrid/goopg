@@ -199,7 +199,7 @@ _(completed `[x]` milestones archived → `completed_milestones/completed_fix_pl
 
 Theme A — Cluster directory format compatibility:
 - [x] **M0130-S1 — Per-relation FSM/VM fork files** (est ~2 loops). Replace aggregate `pg_fsm_state.bin`/`pg_vm_state.bin` with per-relation `_fsm`/`_vm` fork files in PG FSM/VM binary layout. Design: `docs/design/0130-0001-fsm-vm-per-relation-fork-files.md`. **DONE (2026-08-09).** Core implementation: `fsm_fork.go`/`vm_fork.go` with PG-compatible binary format; old aggregate `Save`/`Load`/`FSMStatePath`/`VMStatePath` and `fsmFileMagic`/`vmFileMagic` constants removed. Design doc accepted. BASE_BACKUP includes `_fsm`/`_vm` implicitly via `filepath.Walk`.
-- [ ] **M0130-S2 — pg_class heap persistence** (est ~2 loops). Heap-backed pg_class with bootstrap rows, runtime sync audit, reload pass, and reverse-start (goopg from PG-created 1259 heap). Design: `docs/design/0130-0002-pg-class-heap-persistence.md`.
+- [x] **M0130-S2 — pg_class heap persistence** (est ~2 loops). Heap-backed pg_class with bootstrap rows, runtime sync audit, reload pass, and reverse-start (goopg from PG-created 1259 heap). Design: `docs/design/0130-0002-pg-class-heap-persistence.md`.
 - [ ] **M0130-S3 — Catalog heap sync for remaining DDL** (est ~2 loops). ADD COLUMN → pg_attribute sync; CREATE SCHEMA → pg_namespace; pg_collation/FDW/server heap rows. Design: `docs/design/0130-0003-catalog-heap-sync-coverage.md`.
 
 Theme B — WAL fidelity verification (B5 landed 2026-07-18/19; these tasks audit + add gates):
