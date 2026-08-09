@@ -9693,6 +9693,10 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+		// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+		// pg_constraint re-emit the clause on dump. DU-002.
+		idx.Deferrable = act.Deferrable
+		idx.InitiallyDeferred = act.InitiallyDeferred
 	}
 	return nil
 }

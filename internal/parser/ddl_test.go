@@ -760,6 +760,62 @@ func TestParseExcludeDeferrable(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddUniqueDeferrable pins DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] on ALTER TABLE ADD CONSTRAINT ... UNIQUE (cols). pg_dump
+// emits this for a unique constraint whose condeferrable/condeferred are set
+// (e.g. `ALTER TABLE t ADD CONSTRAINT u UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`).
+// Before this slice the trailing DEFERRABLE was a hard parse error. DU-002.
+func TestParseAlterTableAddUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"ALTER TABLE t ADD UNIQUE (a)", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT u UNIQUE (a)", false, false},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE", true, false},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE INITIALLY DEFERRED", true, true},
+		{"ALTER TABLE t ADD UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE", true, false},
+		{"ALTER TABLE t ADD UNIQUE (a) NOT DEFERRABLE", false, false},
+		{"ALTER TABLE t ADD UNIQUE (a) INITIALLY DEFERRED", true, true},
+		{"ALTER TABLE t ADD UNIQUE (a) INITIALLY IMMEDIATE", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT u UNIQUE (a) DEFERRABLE INITIALLY DEFERRED", true, true},
+		// INCLUDE clause with DEFERRABLE
+		{"ALTER TABLE t ADD UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("Parse(%q): got %d statements", c.in, len(stmts))
+			continue
+		}
+		alt, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Errorf("Parse(%q): expected AlterTableStmt, got %T", c.in, stmts[0])
+			continue
+		}
+		if len(alt.Actions) != 1 {
+			t.Errorf("Parse(%q): got %d actions", c.in, len(alt.Actions))
+			continue
+		}
+		act := alt.Actions[0]
+		if act.Kind != AlterTableAddUnique {
+			t.Errorf("Parse(%q): expected AlterTableAddUnique, got %v", c.in, act.Kind)
+			continue
+		}
+		if act.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, act.Deferrable, c.wantDefer)
+		}
+		if act.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, act.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

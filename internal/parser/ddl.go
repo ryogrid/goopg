@@ -9252,6 +9252,23 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: pos, Kind: AlterTableSetTablespace, TablespaceName: identText(tsTok)}, nil
 	}
+	// SET ACCESS METHOD name — change the table's access method (pg_class.relam).
+	// goopg only supports `heap`; the executor rejects any other AM.
+	// DU-002: pg_dump emits `ALTER TABLE ... SET ACCESS METHOD heap` for
+	// partitioned tables whose relam differs from the default.
+	if cur := p.cur(); cur.Kind == TokenKeyword && cur.Keyword == KwSet &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "access") &&
+		p.peek(2).Kind == TokenIdent && strings.EqualFold(p.peek(2).Value, "method") {
+		pos := cur.Pos
+		p.advance() // SET
+		p.advance() // ACCESS
+		p.advance() // METHOD
+		amTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: pos, Kind: AlterTableSetAccessMethod, AccessMethodName: identText(amTok)}, nil
+	}
 	// SET (reloptions) / RESET (reloptions) — table-level storage parameters,
 	// e.g. `ALTER TABLE foo SET (parallel_workers = 2)` or
 	// `RESET (fillfactor)`. Only the parenthesized form is a reloptions update;
@@ -9493,6 +9510,10 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			_, _ = p.parseIdent() // consume indexname
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
+		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
+		// pg_dump emits `UNIQUE (col) DEFERRABLE INITIALLY DEFERRED`
+		// for constraints whose condeferrable/condeferred are set. DU-002.
+		p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
 		act.Kind = AlterTableAddUnique
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
