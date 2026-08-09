@@ -1,44 +1,40 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY AI-20260810-011258-006 (pgbench TPC-B 40001 storm).
-LOCALISED, not fixed — the fix_plan item stays unchecked.
+Last loop: M-NIGHTLY AI-20260810-011258-006 (pgbench TPC-B false deadlocks)
+FIXED and checked off in .ralph/fix_plan.md.
 
-Landed: WFG edge provenance behind `GOOPG_DEBUG_WFG=1` (off by default, one
-bool read on the register path when off) in
-`internal/executor/operators_storage.go`: `wfgDebug`, `wfgEdgeInfo`,
-`wfgDebugTarget` + `wfgNoteTarget` (called at the two hot `epqWait` sites),
-`wfgCallSite`, `dumpWFGCycle`. Records per waiting XID the edge age, the
-`epqWait` call site, and the tuple blocked on (rel/blk/slot, xmin, xmax,
-t_ctid, superseded flag, infomask); dumps the whole cycle on detection.
-Driver: `analysis/wfg-tpcb-repro.sh` (untracked analysis area).
+Root cause: `updateOp`'s index-scan collector in
+`internal/executor/operators_storage.go` appended one `pendingUpdate` per
+scanned index entry. A non-HOT update leaves the superseded index entry live
+until VACUUM, so several entries for one key each resolve via `followHOTChain`
+to the SAME live tuple — the SET expression and the xmax stamp were applied
+once per entry. The duplicate stamps left extra versions in a hot page and two
+clients then genuinely waited on each other's leftovers, closing a WFG cycle PG
+cannot produce. Fix: skip an entry whose resolved `(blk, actualSlot)` is
+already pending (19 lines).
 
-Evidence (2–12 false cycles per 60–120 s at s=10–20, c=100):
-- every cycle is a 2-cycle, edges µs–ms old ⇒ nothing stale/leaked; the
-  detector is correct, its INPUTS are wrong;
-- both participants wait on the same relation, almost always the same block,
-  at DIFFERENT slots — two versions in one hot page, not one contended tuple;
-- the waited-on version is usually `superseded=true` (t_ctid → successor).
-  goopg blocks on the xmax of whatever version the scan landed on; upstream
-  re-enters EvalPlanQual on the chain HEAD (EvalPlanQualFetch / heap_lock_tuple
-  t_ctid walk), so it always blocks on the current holder.
-Two extra discoveries, both wrong-answer class, ledgered separately: waiters
-have usually already stamped a version of their own in the same page (one
-UPDATE may apply `bbalance + :delta` twice — no gate asserts the TPC-B
-balance invariant), and some waited-on versions carry xmax OLDER than their
-own xmin (impossible stamp; M0090-0002's race is not fully closed).
+Both earlier hypotheses were implemented, MEASURED at 8/8 cycles unchanged, and
+reverted — do not retry them: (1) guarding WFG edge registration on
+`TxnMgr.IsXIDActive(xmax)`; (2) `epqResolveHeadBlocker`, redirecting the wait to
+the t_ctid chain head (the dumps showed it working and the cycle closing anyway).
 
-Next step: at both hot `epqWait` sites, walk t_ctid to the chain head before
-computing xmax / registering the WFG edge (`epqFollowHOT` walks, but only
-after the wait). Gate: `SCALE=10 T=120 REPO_ROOT=$PWD bash
-analysis/wfg-tpcb-repro.sh` → 0 `WFG deadlock` lines, plus the isolation
-suite (the wait target changes for every UPDATE/DELETE/MERGE conflict path).
+Gates run: `SCALE=10 T=120 bash analysis/wfg-tpcb-repro.sh` → 8→0 WFG cycles and
+8→0 failed transactions (2× 120 s + 1× 30 s); `go test ./internal/executor/`
+PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); commit-hook pgbench smoke;
+`make ralph-state-guard`.
 
-Gates run: `go test ./internal/executor/` PASS (5.8 s); units precommit PASS
-(cached); 4× pgbench repro runs (s=10/20, c=100, T=60–120); commit-hook
-pgbench smoke; `make ralph-state-guard` OK (auto-repaired progress marker).
+Ledger: 1 row — a deterministic regression test is still owed. A sequential
+in-process fixture (50 index-scan updates, 2 KB filler to force page overflow,
+plan verified `*planner.IndexScan`) passes with AND without the fix, so it was
+not committed; the duplicate needs a concurrent non-HOT interleaving. The
+cheapest standing gate is the TPC-B balance assertion in
+`ci/batch/stages/stage-pgbench.sh` (also the resume point of an older row).
 
-NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-Ledger: 2 rows. Design: follow-up in
+Design: Resolution section in
 `docs/design/0099-0003-deadlock-safe-conflict-waiting.md` (+ README row).
+
+NEXT LOOP (state, not authority — re-read the `## Current Priority` banner):
+M-NIGHTLY has no open item for this subject; the banner puts M0130 next.
 
 In-flight: none.

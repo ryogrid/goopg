@@ -4197,6 +4197,24 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return false, err
 			}
 		}
+		// AI-20260810-011258-006: one physical tuple must be updated AT MOST
+		// ONCE by a single UPDATE. A non-HOT update inserts a fresh index entry
+		// while the old entry stays until VACUUM, so a repeatedly-updated row
+		// accumulates SEVERAL live index entries for the same key. Each is
+		// scanned here and each resolves — via followHOTChain — to the SAME live
+		// tuple, so without this guard `UPDATE … SET bal = bal + :d WHERE aid=?`
+		// applied the delta once per surviving index entry (pgbench TPC-B
+		// balance drift), and the per-tuple xmax stamps it issued for the
+		// duplicates made two clients wait on each other's leftovers in the same
+		// hot page — the false deadlocks in this action item. Upstream cannot
+		// hit this: ExecUpdate is driven by the plan's tuple stream and
+		// heap_update on an already-self-updated tuple returns TM_SelfModified
+		// (postgres/src/backend/access/heap/heapam.c), it does not re-apply.
+		for i := range pending {
+			if pending[i].blk == ptr.Block && pending[i].slot == actualSlot {
+				return true, nil
+			}
+		}
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
@@ -4310,7 +4328,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					if wfgDebug {
 						wfgNoteTarget(o.ctx.Tx.XID, rel, pu.blk, pu.slot, oldTup.Header)
 					}
-					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						if dl, terr := epqWait(o.ctx, xmax); terr != nil {
 						terr.Pos = o.plan.Pos()
 						return nil, terr
 					} else if dl {

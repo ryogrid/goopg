@@ -374,7 +374,7 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       `docs/design/wal-pg-identical-stream/IMPLEMENTATION-TODO.md`. Ledger: one
       row for the sibling audit (domain/range/enum reloads stamp `cat.DBOID()`
       too, masked today by name-scan lookup fallbacks).
-- [ ] **pgbench/nightly** — 79 failed transactions in the *standard* (simple
+- [x] **pgbench/nightly** — 79 failed transactions in the *standard* (simple
       update) stage (AI-20260810-011258-006; repro: `REPO_ROOT=$PWD
       RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`, s=50 c=100
       j=20 T=180). New tonight. Clients abort at ~40 s with `ERROR: current
@@ -458,6 +458,27 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       `bbalance + :delta` twice), and some waited-on versions carry `xmax` older
       than their own `xmin` — an impossible stamp. Design: follow-up section in
       `docs/design/0099-0003-deadlock-safe-conflict-waiting.md`.
+      **FIXED 2026-08-10 (third loop) — checked off.** Both hypotheses above
+      were implemented, measured, and reverted: guarding edge registration on
+      `IsXIDActive` left 8/8 cycles, and the chain-head wait redirect
+      (`epqResolveHeadBlocker`) also left 8/8 — the dumps showed the redirect
+      working and the cycle closing anyway, because each participant genuinely
+      held the head of a *different* tuple in the same page. That is the tell:
+      TPC-B updates one row per table, so a transaction must never hold two
+      versions in a hot page. Root cause: `updateOp`'s index-scan collector
+      appended one `pendingUpdate` per scanned index entry, and a non-HOT
+      update leaves the superseded entry indexed until VACUUM — so several
+      live entries for one key each resolve via `followHOTChain` to the SAME
+      live tuple, and the SET expression (plus an xmax stamp) was applied once
+      per entry. This is exactly the predicted `bbalance + :delta` double-apply;
+      the extra stamps are what made two clients wait on each other's leftovers.
+      Fix: skip an entry whose resolved `(blk, actualSlot)` is already pending.
+      Gate: `SCALE=10 T=120 bash analysis/wfg-tpcb-repro.sh` → **8 → 0** cycles
+      and **8 → 0** failed transactions (2× 120 s + 1× 30 s); units precommit,
+      `go test ./internal/executor/`, and `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35) all PASS. One ledger row filed: a deterministic regression test is
+      still owed (the duplicate needs a concurrent non-HOT interleaving the
+      in-process fixture cannot yet express).
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 

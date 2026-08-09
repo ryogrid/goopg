@@ -255,3 +255,74 @@ Both are carried as deferral-ledger rows; `AI-20260810-011258-006` stays open.
 |------|--------|
 | `internal/executor/operators_storage.go` | `wfgDebug`, `wfgEdgeInfo`, `wfgDebugTarget`, `wfgNoteTarget`, `wfgCallSite`, `dumpWFGCycle`; note calls at the two hot `epqWait` sites |
 | `analysis/wfg-tpcb-repro.sh` | repro driver (untracked analysis area) |
+
+## Resolution (2026-08-10) — the disease was a duplicate index entry, not the wait target
+
+The previous section's "fix direction" was **tested and rejected**, then the real
+cause was isolated. Both experiments used the same driver
+(`SCALE=10 T=120 REPO_ROOT=$PWD bash analysis/wfg-tpcb-repro.sh`,
+s=10 c=100 j=20, ~460k transactions per run), which reproduced 8 `WFG deadlock`
+cycles and 8 failed transactions per run, deterministically.
+
+### Rejected: skipping edges for settled holders
+
+Hypothesis: `isConcurrentlyUpdated` reads a stale `ctx.Snap`, so an
+already-committed writer is still named as the blocker, and two µs-lived edges to
+finished transactions close a phantom cycle. Guarding edge registration with
+`TxnMgr.IsXIDActive(xmax)` changed nothing — **8 cycles before, 8 after**. The
+cycle dumps confirm why: every participant is genuinely still running.
+
+### Rejected: redirecting the wait to the chain head
+
+Hypothesis (the section above): walk `t_ctid` to the head before registering the
+edge, so the blocker is the transaction holding the current version. Implemented
+as `epqResolveHeadBlocker` at both hot `epqWait` sites, with `epqWait` treating a
+self/invalid holder as "nothing to wait for". Again **8 cycles before, 8 after**.
+The dumps then showed the redirect *working* — an edge whose target differed from
+the landed version's xmax — and the cycle closing anyway, because the two
+transactions each genuinely held the head of a different tuple in the same page
+and waited on each other. Waiting on the wrong version was a symptom, not a
+cause. The code was reverted.
+
+### The cause: one UPDATE applying itself twice to the same tuple
+
+That the two participants each held *several* tuples in one page is the tell.
+TPC-B updates exactly one row per table per transaction, so a transaction should
+never hold two versions in a hot page.
+
+`updateOp`'s index-scan path drives writes from `tree.RangeScan` over the index,
+resolving each scanned entry through `followHOTChain` to the live version. A
+non-HOT update inserts a fresh index entry and leaves the superseded one indexed
+until VACUUM, so under concurrency several live entries for one key can each
+resolve to the **same** live tuple. Every one of them was appended to `pending`,
+and the modification phase then applied the SET expression — and stamped xmax —
+once per entry. That is the missing TPC-B balance invariant predicted above,
+observed directly: the duplicate stamps left extra xmax'd versions in the hot
+page, and two clients waiting on each other's leftovers closed a wait-for cycle
+PostgreSQL cannot produce (`ExecUpdate` is driven by the plan's tuple stream, and
+`heap_update` on a tuple the current command already modified returns
+`TM_SelfModified` — `postgres/src/backend/access/heap/heapam.c` — it never
+re-applies).
+
+**Fix:** `updateOp`'s index-scan collector skips an entry whose resolved
+`(block, live slot)` is already in `pending`. One physical tuple, at most one
+modification per UPDATE.
+
+**Result:** 8 → **0** `WFG deadlock` cycles and 8 → **0** failed transactions,
+reproduced across two independent 120 s runs plus one 30 s run. Instrumenting the
+skip shows it firing 13 times in 177k transactions — the same rarity as the
+cycles it removed. TPS is unchanged (3.7k–4.2k, within run-to-run spread).
+
+### Still owed
+
+A deterministic regression test. The duplicate needs a concurrent non-HOT
+interleaving: a sequential in-process fixture (50 index-scan updates of one row,
+2 KB filler to force page overflow, plan verified as `*planner.IndexScan`) never
+produces two entries resolving to the same tuple, so it passes with and without
+the fix and was not committed. Carried as a deferral-ledger row.
+
+### Files (resolution)
+
+| File | Change |
+|------|--------|
+| `internal/executor/operators_storage.go` | `updateOp` index-scan path: skip an index entry whose resolved `(blk, actualSlot)` is already pending |
