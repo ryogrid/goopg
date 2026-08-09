@@ -1026,7 +1026,7 @@ Append new rows in numeric order. Do not reorder.
 | 0130-0004 | [B5 verification: index/attrdef native WAL kinds (landed 2026-07-18; verify + add regression gates)](0130-0004-b5-index-and-attrdef-retirement.md) | draft |
 | 0130-0005 | [B5 verification: view/matview native WAL kinds (landed 2026-07-19; verify + confirm standby replay)](0130-0005-b5-view-matview-retirement.md) | draft |
 | 0130-0006 | [Verify zero rmid-128 emitted; document keep-the-classify-arms decision (deferral-ledger #415)](0130-0006-rmgr-goopg-catalog-retirement.md) | draft |
-| 0130-0007 | [WAL fidelity audit: verify xl_prev 0-based at HEAD + audit atomic heap-update completeness](0130-0007-wal-record-fidelity-xlprev-atomic-update.md) | draft |
+| 0130-0007 | [WAL fidelity audit: verify xl_prev 0-based at HEAD + audit atomic heap-update completeness](0130-0007-wal-record-fidelity-xlprev-atomic-update.md) | accepted |
 | 0130-0008 | [Multi-timeline START_REPLICATION + timeline_id / pg_control reconciliation](0130-0008-multi-timeline-streaming-and-timeline-reconciliation.md) | draft |
 | 0130-0009 | [recovery.signal — archive recovery via restore_command](0130-0009-recovery-signal-archive-recovery.md) | draft |
 | 0130-0010 | [PG 18.3 standby E2E harness — basebackup + streaming + failover + reverse attach](0130-0010-pg183-standby-e2e-harness.md) | draft |
