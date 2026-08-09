@@ -12841,14 +12841,17 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
-		// Try native format first, then PG18-canonical physical format.
-		// syncTableToCatalogHeap writes physical rows; loadUserTablesFromHeap
-		// also handles both, so we must mirror that here.
 		row, err := catalog.DecodePGClassRow(data)
 		if err != nil {
 			row, err = catalog.DecodePGClassPhysicalRow(data)
 		}
-		return err == nil && row.OID == relOID
+		if err == nil {
+			return row.OID == relOID
+		}
+		if len(data) >= 4 {
+			return binary.LittleEndian.Uint32(data[:4]) == relOID
+		}
+		return false
 	})
 	attrRel := storage.RelFileNode{
 		DBOid:  dbOid,
@@ -12860,7 +12863,13 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		if err != nil {
 			row, err = catalog.DecodePGAttributePhysicalRow(data)
 		}
-		return err == nil && row.AttRelID == relOID
+		if err == nil {
+			return row.AttRelID == relOID
+		}
+		if len(data) >= 4 {
+			return binary.LittleEndian.Uint32(data[:4]) == relOID
+		}
+		return false
 	})
 	// B5 Slice B: stamp xmax on this relation's pg_attrdef rows too, so an ALTER
 	// re-sync (delete-old-rows + syncTableToCatalogHeap) or a rolled-back CREATE
