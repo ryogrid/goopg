@@ -612,20 +612,36 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 
 func runGoopgBasebackupToPG(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string) {
 	t.Helper()
+	runGoopgBasebackupToPGSlot(t, repo, bin, primary, outDir, slotName, true)
+}
+
+// runGoopgBasebackupToPGSlot is runGoopgBasebackupToPG with control over
+// whether pg_basebackup creates the slot itself (`-C`). Callers that already
+// created the slot — e.g. TestE2E_PGStandbyFullCycle, which exercises the
+// SQL-callable pg_create_physical_replication_slot — must pass createSlot=false;
+// `-C` against an existing slot is a hard error ("replication slot already
+// exists"), exactly as upstream behaves.
+func runGoopgBasebackupToPGSlot(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string, createSlot bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin,
+	args := []string{
 		"-h", "127.0.0.1",
 		"-p", mustGoopgPort(primary.ListenAddr()),
 		"-U", "postgres",
 		"-D", outDir,
 		"-X", "stream",
-		"-C",
+	}
+	if createSlot {
+		args = append(args, "-C")
+	}
+	args = append(args,
 		"-S", slotName,
 		"-R",
 		"--no-sync",
 		"--no-manifest",
 		"-l", "TestE2E_FailoverGoopgToPG")
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = clientToolEnv(repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("pg_basebackup from goopg failed: %v\n%s", err, out)

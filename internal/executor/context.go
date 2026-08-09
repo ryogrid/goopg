@@ -488,6 +488,16 @@ type Context struct {
 	// (commit returns immediately). M0102-0005.
 	WAL *wal.Writer
 
+	// ReplSlots exposes the cluster's replication-slot registry to the
+	// SQL-callable slot functions (pg_create_physical_replication_slot,
+	// pg_drop_replication_slot). It is the SAME *wal.Slots the walsender
+	// path uses for CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT, so
+	// the SQL and replication-protocol entry points cannot diverge — the
+	// recurring sibling-path trap. nil means the server was started
+	// without slot support, and the functions raise 0A000 exactly as the
+	// wire commands do. M-NIGHTLY AI-20260810-011258-003.
+	ReplSlots *wal.Slots
+
 	// SyncRep is the synchronous-replication wait primitive. execCommit
 	// calls SyncRep.WaitForLSN(commitLSN, mode) after local flush when
 	// SyncCommitMode is anything other than SyncRepOff and the configured

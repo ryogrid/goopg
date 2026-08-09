@@ -11622,6 +11622,15 @@ case "pg_char_to_encoding":
 			}
 		}
 		return NewBoolDatum(true), nil
+	// SQL-callable replication-slot management (slotfuncs.c). Both were
+	// already in pg_proc but had no executor arm, so the M0130-S10 E2E
+	// harness got 42883 from `SELECT pg_create_physical_replication_slot(…)`
+	// on a goopg primary. See expr_replslot.go.
+	// M-NIGHTLY AI-20260810-011258-003.
+	case "pg_create_physical_replication_slot":
+		return evalPgCreatePhysicalReplicationSlot(x, row, ctx)
+	case "pg_drop_replication_slot":
+		return evalPgDropReplicationSlot(x, row, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":

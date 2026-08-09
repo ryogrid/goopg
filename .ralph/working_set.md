@@ -1,44 +1,46 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY `testport/TestPort_PublicationSurvivesRestart`
-(AI-20260810-011258-005). COMPLETE, committed, pushed. Also closed
-AI-20260810-011258-004 (`TestPort_IsolationMergeUpdate`) as CONFIRMED STALE —
-it passes at HEAD in 4.77 s, no code change.
+Last loop: M-NIGHTLY AI-20260810-011258-003 (`TestE2E_PGStandbyFullCycle`).
+Landed and pushed. Also closed AI-20260810-011258-002
+(`TestE2E_FailoverGoopgToPG`) as CONFIRMED STALE — PASS at HEAD in 5.77 s, both
+subtests, no code change.
 
-The discovery: publications silently vanished across EVERY restart, and neither
-the heap nor the reload was at fault. `reloadUserPublicationsFromHeap` found and
-decoded the rows correctly (instrumented: `baseRows=1`, name + `puballtables`
-right) but stamped `Publication.DBOid` with the raw `cat.DBOID()` — the STORAGE
-db oid `detectCatalogDBOID` reads out of the pg_database heap, `PostgresDBOid`
-= 5. Every live path keys on the NAMESPACE oid instead: `resolveDBOid` defaults
-to `DefaultDBOid` = 1, and dispatch.go's pg_publication lister queries
-`PublicationsForDBOid(NamespaceDBOid(ectx.CurrentDatabaseOid))`, which folds
-5 → 1. Since `d14af1e6` made DBOid half the registry key, reloaded rows landed
-in a namespace no `postgres` connection ever reads. Third catalog to hit this
-storage-vs-namespace mismatch (`f1e73ce0` fixed pg_ts_config the same way).
+The discovery: the M0130-S10 acceptance harness had NEVER run green, and died
+at its first statement. goopg could create replication slots only over the
+replication protocol (`CREATE_REPLICATION_SLOT`); upstream also exposes
+`slotfuncs.c`'s `pg_create_physical_replication_slot` (OID 3779) and
+`pg_drop_replication_slot` (3780) as SQL functions. Both OIDs were already
+seeded into `pg_proc`, so name resolution SUCCEEDED and the call then fell out
+of the executor's builtin switch with 42883 — the catalog advertised a
+function the executor could not run. Second blocker: the test created the slot
+via SQL *and* passed `pg_basebackup -C`, which upstream rejects.
 
-Fix: stamp `catalog.NamespaceDBOid(cat.DBOID())` —
-`internal/initdb/catalog_heap_reload.go`. Design: addendum on the B3.3 entry in
-`docs/design/wal-pg-identical-stream/IMPLEMENTATION-TODO.md`. Ledger: 1 row —
-domain (~1382) / range (~1492) / enum (~1583) reloads stamp `cat.DBOID()` the
-same way, unobservable today only because `LookupDomain`/`LookupEnum` fall back
-to a name scan when no dbOid is threaded.
+Fix: `internal/executor/expr_replslot.go` (+ builtin-switch arms in `expr.go`),
+`Context.ReplSlots` wired from `s.cfg.Slots` in `internal/server/dispatch.go`
+so the SQL and wire paths share ONE registry; helper split into
+`runGoopgBasebackupToPGSlot(..., createSlot bool)`. Design: addendum in
+`docs/design/0130-0010-pg183-standby-e2e-harness.md` (+ README row). Ledger:
+2 rows (record-vs-text return, temporary slots, deferred reservation; plus the
+harness's remaining blocker).
 
-Gates run: repro confirmed at HEAD and out-of-test on a manual capped cluster
-(port 5533) BEFORE the fix; `TestPort_PublicationSurvivesRestart` PASS after;
-`go test -run SurvivesRestart ./internal/testport/` PASS (whole restart-
-durability family, 45 s); units precommit PASS (`internal/initdb` re-ran cold,
-59 s); pgbench commit hook PASS; `make ralph-state-guard` OK (auto-repaired the
-previous loop's clean-exit marker).
+AI-...-003 STAYS UNCHECKED. Phase A is now green end to end and Phase B
+replays CREATE TABLE / CREATE INDEX / INSERT, but `ALTER TABLE ... ADD COLUMN
+extra int DEFAULT 0` then makes every query on that relation ON THE PG STANDBY
+raise `could not open relation with OID 2656` — PG's `AttrDefaultFetch`
+opening `pg_attrdef` by `AttrDefaultIndexId` 2656, which goopg does not
+materialize (pre-existing gap ledgered 2026-07-19). Phases C/D have never
+executed. Resume: materialize index 2656 + the relid-2604 tupledesc gap.
+
+Gates run: repro confirmed at HEAD before the fix; new guard
+`TestPort_SQLPhysicalReplicationSlotFuncs` PASS (0.98 s);
+`TestE2E_FailoverGoopgToPG` PASS after the helper refactor (5.76 s);
+`TestE2E_PGStandbyFullCycle` advances from 1.2 s/first-statement to 32 s/Phase
+B; units precommit PASS (`internal/initdb` cold, 58 s); pgbench commit hook
+PASS; `make ralph-state-guard` OK.
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M0130 all `[x]`, so M-NIGHTLY stays the top selectable milestone. 3 items remain
-unchecked, all from batch 20260810-011258: AI-...-002
-`TestE2E_FailoverGoopgToPG` (subtest `sync_remote_apply`), AI-...-003
-`TestE2E_PGStandbyFullCycle`, AI-...-006 pgbench/nightly. -002 and -003 are the
-M0130-S10 standby harness and likely share one root cause — re-run both at HEAD
-first and diagnose together. AI-...-006 stays the highest-value engine item:
-79 aborted clients whose ORIGINATING error is not in the log, and the run still
-prints `0 failed`.
+M-NIGHTLY still top selectable. AI-...-006 (pgbench/nightly, 79 aborted
+clients whose ORIGINATING error is absent from the log while the run prints
+`0 failed`) is the highest-value remaining engine item.
 
 In-flight: none.

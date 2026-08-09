@@ -306,14 +306,47 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       poisons both pools) and `TestAllocBytesRoundTripAcrossChunks` (black-box,
       round-trips 4 chunks of tagged blocks). Design: addendum in
       `docs/design/0107-0001-mctx-memory-context-substrate.md` (+ README row).
-- [ ] **testport/TestE2E_FailoverGoopgToPG** — FAILed, subtest
+- [x] **testport/TestE2E_FailoverGoopgToPG** — FAILed, subtest
       `sync_remote_apply` (AI-20260810-011258-002; repro: `go test -v -run
-      '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`). New tonight;
-      exercises the M0130-S10 standby harness.
+      '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`).
+      **STALE — CONFIRMED, no code change needed (2026-08-10).** Re-run at
+      HEAD: PASS in 5.77 s, both subtests (`async` 2.91 s,
+      `sync_remote_apply` 2.85 s). Re-verified again after the
+      `runGoopgBasebackupToPGSlot` helper refactor below (5.76 s).
 - [ ] **testport/TestE2E_PGStandbyFullCycle** — FAILed
       (AI-20260810-011258-003; repro: `go test -v -run
-      '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`). New tonight; this
-      is the M0130-S10 four-phase harness test itself.
+      '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`). This is the
+      M0130-S10 four-phase harness test itself, and it has **never** run
+      green. **PARTIAL (2026-08-10) — first two blockers fixed, a third
+      (pre-existing) one remains; item stays open.**
+      1. FIXED — the harness died at its FIRST statement,
+         `SELECT pg_create_physical_replication_slot('s10_forward')`, with
+         42883. goopg could create slots only over the replication protocol;
+         upstream also exposes `slotfuncs.c`'s
+         `pg_create_physical_replication_slot` (OID 3779) /
+         `pg_drop_replication_slot` (3780) as SQL functions. Both OIDs were
+         already seeded in `pg_proc`, so resolution succeeded and the call
+         fell out of the executor's builtin switch. Implemented in
+         `internal/executor/expr_replslot.go`, backed by `Context.ReplSlots`
+         — the SAME `*wal.Slots` the walsender mutates (wired in
+         `internal/server/dispatch.go`). Guard:
+         `TestPort_SQLPhysicalReplicationSlotFuncs`.
+      2. FIXED — the test then created the slot twice (SQL *and*
+         `pg_basebackup -C`), which upstream rejects. Helper split into
+         `runGoopgBasebackupToPGSlot(..., createSlot bool)`.
+      3. OPEN — Phase A is now green end to end and Phase B replays
+         CREATE TABLE / CREATE INDEX / INSERT, but the
+         `ALTER TABLE ... ADD COLUMN extra int DEFAULT 0` check fails: any
+         query on that relation ON THE PG STANDBY raises `could not open
+         relation with OID 2656`. That is PG's `AttrDefaultFetch`
+         (`relcache.c`) opening `pg_attrdef` by `AttrDefaultIndexId` = 2656,
+         which goopg does not materialize — the pre-existing `pg_attrdef`
+         gap ledgered 2026-07-19, orthogonal to slot management.
+         **Phases C (failover/promote) and D (reverse attach) have never
+         executed and remain UNVERIFIED.** Resume: materialize pg_attrdef
+         index 2656 (+ the relid-2604 tupledesc gap), then re-run.
+         Design: addendum in
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 2 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

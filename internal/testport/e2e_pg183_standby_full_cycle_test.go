@@ -89,7 +89,10 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 			t.Logf("[s10-pg-standby-log] %s:\n%s", pgLogPath, string(pgLog))
 		}
 	})
-	runGoopgBasebackupToPG(t, repo, pgBasebackupBin, primary, standbyDir, forwardSlot)
+	// createSlot=false: the slot was already created above via
+	// pg_create_physical_replication_slot(). `-C` on an existing slot is a
+	// hard error in upstream pg_basebackup.
+	runGoopgBasebackupToPGSlot(t, repo, pgBasebackupBin, primary, standbyDir, forwardSlot, false)
 
 	// Copy relcache init files so PG can resolve catalog entries.
 	copyInitFiles(t, primary.DataDir(), standbyDir)

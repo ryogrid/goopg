@@ -528,6 +528,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		s.removeRoleCredential(name)
 	}
 	ectx.Promote = s.cfg.Promote
+	// Same registry the walsender's CREATE_REPLICATION_SLOT /
+	// DROP_REPLICATION_SLOT commands mutate, so the SQL functions and the
+	// wire commands see one shared slot set (sibling-path rule).
+	// M-NIGHTLY AI-20260810-011258-003.
+	ectx.ReplSlots = s.cfg.Slots
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
