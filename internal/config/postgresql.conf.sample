@@ -159,6 +159,8 @@
                                         # (SIGHUP to apply)
 #primary_slot_name = ''                 # replication slot to use on primary
                                         # (SIGHUP to apply)
+#restore_command = ''                    # shell command to fetch WAL from archive
+                                        # (change requires restart)
 #wal_receiver_status_interval = 10      # 0-2147483 s; 0 disables status updates
                                         # (SIGHUP to apply)
 #hot_standby = on                       # allow read-only queries during recovery

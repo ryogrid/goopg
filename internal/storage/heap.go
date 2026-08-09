@@ -1053,6 +1053,43 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	return nil
 }
 
+// PageSetHeapTupleXmaxCommitted sets the HEAP_XMAX_COMMITTED hint bit on the
+// tuple at the 1-based slot. The caller must already have set xmax via
+// PageSetHeapTupleXmax (or the tuple was written with a non-zero xmax).
+// This is used by catalog-row stamping (stampCatalogRows) so that runtime
+// seq-scan visibility (TupleVisibleSubxact) takes the fast
+// HeapXmaxCommitted path, avoiding a snapshot-based fallthrough that may
+// incorrectly hold a re-synced catalog row visible after the deleting
+// transaction committed. DU-002.
+func PageSetHeapTupleXmaxCommitted(p Page, slot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask |= HeapXmaxCommitted
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	return nil
+}
+
 // PageSetHeapTupleCmax writes the deleting CommandId (cmax) into the on-page
 // tuple header at offset 8-11 (the t_cid/t_xvac union field) and manages the
 // HEAP_COMBOCID infomask bit. When isCombo is true, HEAP_COMBOCID is set

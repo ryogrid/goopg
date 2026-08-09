@@ -631,6 +631,17 @@ func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Sto
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 
+// TimelineID returns the WAL writer's current timeline ID (M0130-S8).
+// This is the TLI stamped into new segment filenames and WAL page headers.
+// The TLI is set at construction from Config.TimelineID and is immutable
+// for the lifetime of the Writer — no locking needed.
+func (w *Writer) TimelineID() uint32 {
+	if w.stateRef == nil {
+		return 1
+	}
+	return w.stateRef.tli
+}
+
 // Format returns the active on-disk WAL format the writer is
 // emitting. Mirrors the Config.PageHeaders flag the writer was
 // constructed with — static for the lifetime of the Writer.
@@ -2198,7 +2209,7 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 			for existing[nextTarget] {
 				nextTarget++
 			}
-			newPath := filepath.Join(s.cfg.WALDir, formatSegmentName(nextTarget))
+			newPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(nextTarget, s.tli))
 			if rerr := recycleSegmentFile(oldPath, newPath, s.cfg.SegmentSize); rerr != nil {
 				if errors.Is(rerr, os.ErrNotExist) {
 					continue
@@ -2358,7 +2369,7 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	if f, ok := s.files[segNo]; ok {
 		return f, nil
 	}
-	path := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	path := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
 
 	// Detect first-time creation so the preallocator only zero-fills
 	// new segments. Existing files (legacy lazy mode, or a re-open
@@ -2418,7 +2429,7 @@ func (s *state) eagerPreallocSegment(segNo uint64) {
 	if !s.cfg.Preallocate {
 		return
 	}
-	finalPath := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	finalPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
 	if _, err := os.Stat(finalPath); err == nil {
 		return
 	}

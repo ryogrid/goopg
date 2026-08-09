@@ -71,6 +71,12 @@ type Runtime struct {
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
 
+	// Recovery is true when `<DataDir>/recovery.signal` was present
+	// at Open time. cmd/goopg start uses this to enter archive recovery
+	// (fetch WAL segments via restore_command, replay them, then
+	// promote). See docs/design/0130-0009-recovery-signal-archive-recovery.md.
+	Recovery bool
+
 	// walwriterStop, when non-nil, is closed by Close() to signal the
 	// background WAL writer loop to exit. nil when the loop wasn't
 	// started (WalWriterDelay == 0 in tests).
@@ -2326,6 +2332,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
+	recovery, err := IsRecovery(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: recovery signal: %w", err)
+	}
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -2344,6 +2355,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
+		Recovery:       recovery,
 		FSM:            storage.NewFSM(),
 		VM:             storage.NewVisibilityMap(),
 	}

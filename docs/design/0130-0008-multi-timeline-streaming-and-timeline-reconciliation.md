@@ -1,6 +1,6 @@
 # Multi-timeline START_REPLICATION + timeline_id / pg_control reconciliation
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S8)
 
@@ -86,3 +86,54 @@ Three timeline-related gaps block PG physical replication:
 - `internal/wal/timeline_history.go` — `ReadHistory`, `WriteHistory`
 - `cmd/goopg/standby.go` — `finalizePromotion`
 - `postgres/src/backend/access/transam/xlog.c` — timeline management
+
+## What was built (2026-08-09)
+
+### S8.1 — TLI source of truth
+
+`LoadOrCreateTimelineID` (`internal/initdb/timeline.go`) now reads pg_control first
+via `control.ReadControlFile`. Resolution order:
+1. pg_control `CheckPointCopy.ThisTimeLineID` (authoritative).
+2. `global/timeline_id` flat file (fallback when pg_control is absent or CRC-fails).
+3. `BootstrapTimeLineID` (1).
+
+If both exist and disagree, pg_control wins and the flat file is corrected.
+`control.ReadControlFile` gained CRC32C validation so a corrupt or placeholder
+pg_control (e.g. a test stub) is rejected, forcing fallback to the flat file.
+
+### S8.2 — IDENTIFY_SYSTEM
+
+`server.Config.Timeline` (uint32) added and wired at startup from
+`LoadOrCreateTimelineID`. `replyIdentifySystem` returns the real TLI instead of
+hardcoded `"1"`. Zero means "use TLI=1" for backward compat.
+
+### S8.3 — START_REPLICATION TIMELINE n
+
+Multi-timeline validation replaces the old single-timeline rejection. Rules:
+- n=0: defaults to current TLI.
+- n ≤ current TLI: accepted.
+- n > current TLI: rejected (future timeline).
+- n < current TLI: accepted (standby catching up from older timeline).
+
+### S8.3x — WAL segment naming
+
+`FormatSegmentNameTLI(segNo, tli)` added to `internal/wal/format.go`. The writer's
+segment-creation path (`openSegment`, `eagerPreallocSegment`, `reclaimOldSegments`)
+uses the writer's stored TLI; after promotion, new segments get the bumped TLI.
+`Writer.TimelineID()` accessor added. `openSegmentFile` helper in `reader.go` is
+TLI-tolerant: tries TLI=1 first, then scans for any segment matching the log+seg
+suffix. `readStreamFrom` (used by `ReadAll`) updated to use this helper so
+recovery and tests find segments regardless of TLI.
+
+### S8.5 — Promotion pg_control update
+
+`finalizePromotion` (`cmd/goopg/standby.go`) now calls `control.UpdateControlFile`
+to set `CheckPointCopyThisTLI = newTLI` and `CheckPointCopyPrevTLI = oldTLI` after
+writing the flat file. Mirrors upstream's `CreateEndOfRecoveryRecord`.
+
+### Deferred
+
+- Reader functions `detectWritePos` / `scanLastSegmentEnd` still use TLI=1
+  segment naming — they run during initial WAL detection when TLI is always 1.
+- Full multi-timeline WAL serving (stream TLI < current up to the switch point)
+  is structurally supported but not yet exercised end-to-end.

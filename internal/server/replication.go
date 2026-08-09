@@ -132,7 +132,7 @@ func (s *Server) replyTimelineHistory(w *protocol.FrameWriter, args string) erro
 // walreceiver) parse it transparently:
 //
 //	systemid  : text   — pg_control identifier
-//	timeline  : int4   — current timeline; v0 is single-timeline
+//	timeline  : int4   — current timeline from pg_control (M0130-S8)
 //	xlogpos   : text   — current write LSN as `X/X` hex pair
 //	dbname    : text   — empty for physical replication
 func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
@@ -158,7 +158,7 @@ func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	}
 	row := [][]byte{
 		[]byte(systemID),
-		[]byte("1"), // timeline; v0 is single-timeline
+		[]byte(formatTimeline(s.cfg.Timeline)),
 		[]byte(formatLSN(lsn)),
 		nil, // dbname is NULL for physical replication
 	}
@@ -383,9 +383,8 @@ func (s *Server) replyReadReplicationSlot(w *protocol.FrameWriter, args string) 
 		row[0] = []byte("physical")
 		if slot.RestartLSN != 0 {
 			row[1] = []byte(formatLSN(slot.RestartLSN))
-			// goopg operates on a single timeline (see 0005-0001);
-			// any reserved position is on timeline 1.
-			row[2] = []byte("1")
+			// Reserved slot positions are on the current timeline (M0130-S8).
+			row[2] = []byte(formatTimeline(s.cfg.Timeline))
 		}
 	}
 	if err := w.WriteDataRow(row); err != nil {
@@ -404,9 +403,8 @@ func (s *Server) replyReadReplicationSlot(w *protocol.FrameWriter, args string) 
 //
 //	START_REPLICATION [SLOT name] PHYSICAL <X/X> [TIMELINE n]
 //
-// v0 supports physical only; the TIMELINE clause is accepted but a
-// non-1 value is rejected with feature_not_supported (single-timeline
-// operation is the documented v0 scope, see 0005-0001).
+// M0130-S8: multi-timeline support. TIMELINE n is accepted for any
+// n ≤ current timeline; a future TLI (n > current) is rejected.
 //
 // `SLOT name`: when present, the named slot is acquired (made active)
 // and ConfirmedFlushLSN is advanced as standby status updates
@@ -422,9 +420,27 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 	}
-	if args.Timeline != 0 && args.Timeline != 1 {
-		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
-			fmt.Sprintf("START_REPLICATION TIMELINE %d not supported (v0 is single-timeline)", args.Timeline))
+	// M0130-S8: validate and resolve timeline. Zero means "current timeline"
+	// (the default when the client omits TIMELINE). An explicit TLI must not
+	// exceed the current timeline (PG rejects a TLI in the future).
+	curTLI := s.cfg.Timeline
+	if curTLI == 0 {
+		curTLI = 1 // server not configured with a TLI — default bootstrap
+	}
+	if args.Timeline != 0 {
+		if args.Timeline > int(curTLI) {
+			return s.writeQueryError(w, sqlstate.InternalError,
+				fmt.Sprintf("requested starting point %d is ahead of the current timeline %d",
+					args.Timeline, curTLI))
+		}
+		if args.Timeline < int(curTLI) {
+			// The standby is on an older timeline. PG serves WAL from
+			// that timeline up to the switch point recorded in the
+			// history file, then EOF. goopg currently stores all
+			// pre-switch segments under TLI=1 filenames, so this
+			// works naturally when the old TLI is 1. For TLI > 1,
+			// the segment-naming migration (M0130-S8.3x) is needed.
+		}
 	}
 	if args.SlotName != "" {
 		if s.cfg.Slots == nil {
@@ -995,6 +1011,16 @@ func parseLSN(s string) (uint64, error) {
 // big-endian uint64; this is just for the human-facing wire columns.
 func formatLSN(lsn uint64) string {
 	return fmt.Sprintf("%X/%X", uint32(lsn>>32), uint32(lsn))
+}
+
+// formatTimeline returns the TLI as a decimal string for the IDENTIFY_SYSTEM
+// timeline column (int4, text format). Zero means "not configured" — we report
+// TLI=1 as the default.
+func formatTimeline(tli uint32) string {
+	if tli == 0 {
+		return "1"
+	}
+	return strconv.FormatUint(uint64(tli), 10)
 }
 
 // unquoteIdent strips wrapping double quotes if present; otherwise

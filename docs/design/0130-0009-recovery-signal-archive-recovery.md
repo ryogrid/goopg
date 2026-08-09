@@ -1,6 +1,6 @@
 # recovery.signal — archive recovery via restore_command
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S9)
 
@@ -68,3 +68,30 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 - `internal/wal/stream_replayer.go` — `StreamReplayer`
 - `postgres/src/backend/access/transam/xlogarchive.c` — `RestoreArchivedFile`
 - `postgres/src/backend/access/transam/xlogrecovery.c` — recovery loop
+
+## What was built (2026-08-09, M0130-S9)
+
+### New files
+
+| File | What |
+|------|------|
+| `internal/wal/archive_restore.go` | `RestoreArchivedFile(restoreCommand, walDir, segmentName)` — shells out to `restore_command` with `%f`/`%p` substitution, mirrors upstream `BuildRestoreCommand` + `system()` pattern |
+| `internal/wal/archive_recovery.go` | `RunArchiveRecovery(mgr, dataDir, restoreCommand, segmentSize)` — archive recovery loop: discovers highest local segment, fetches missing ones via `RestoreArchivedFile`, reads `ReadSegmentRecords`, replays via `ReplayRecords`, exits when archive exhausted |
+| `internal/wal/archive_recovery_test.go` | Unit tests for `highestLocalSegment`, `RestoreArchivedFile` |
+
+### Modified files
+
+| File | What |
+|------|------|
+| `internal/config/defaults.go` | Registered `restore_command` GUC (string, default `""`, `ContextPostmaster`) |
+| `internal/initdb/standby.go` | Added `IsRecovery()`, `RemoveRecoverySignal()` — mirror `IsStandby()`/`RemoveStandbySignal()` for `recovery.signal` |
+| `internal/initdb/open.go` | Added `Recovery bool` field to `Runtime`; check for `recovery.signal` at Open time |
+| `cmd/goopg/main.go` | Archive recovery path at startup: when `recovery.signal` present (and `standby.signal` absent), call `RunArchiveRecovery` → `promoteAfterRecovery` → become primary |
+| `cmd/goopg/standby.go` | Added `promoteAfterRecovery()` — TLI bump + history write + pg_control update + signal removal, mirrors `finalizePromotion` without the standby controller |
+
+### Deferred
+
+- `recovery_target_time` / `recovery_target_xid` / `recovery_target_name` (PITR targets)
+- `archive_cleanup_command`
+- `recovery_target_timeline` beyond "latest"
+- TLI-aware segment fetch (`FormatSegmentNameTLI` currently hardcodes TLI=1 in the fetch loop)

@@ -230,6 +230,8 @@ func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
 
 // ReadControlFile reads the current pg_control values from dataDir.
 // Returns nil when the file does not exist (fresh cluster before initdb completes).
+// Verifies the CRC32C over the first 292 bytes; a mismatch returns an error so
+// callers (like LoadOrCreateTimelineID) can fall back to the secondary copy.
 // Callers that need to compare GUC echo fields against live configuration
 // use this to avoid a spurious read+write cycle via UpdateControlFile.
 func ReadControlFile(dataDir string) (*ControlFileData, error) {
@@ -243,6 +245,13 @@ func ReadControlFile(dataDir string) (*ControlFileData, error) {
 	}
 	if len(buf) < pgControlCRCOffset+4 {
 		return nil, fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
+	}
+	// Verify CRC32C so a corrupt or placeholder pg_control (e.g. a test
+	// stub filled with 0xC0) does not pass as valid. M0130-S8.
+	stored := binary.LittleEndian.Uint32(buf[pgControlCRCOffset:])
+	computed := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
+	if stored != computed {
+		return nil, fmt.Errorf("control: pg_control CRC mismatch: stored=0x%08X computed=0x%08X", stored, computed)
 	}
 	return decodeControlFileData(buf), nil
 }

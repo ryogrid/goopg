@@ -481,7 +481,7 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 		if max := int(drained - cur); want > max {
 			want = max
 		}
-		buf, err := readSegmentSlice(it.walDir, segNo, segOff, want)
+		buf, err := readSegmentSlice(it.walDir, segNo, segOff, want, it.writer.TimelineID())
 		if err != nil {
 			return nil, err
 		}
@@ -498,11 +498,11 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 	return out, nil
 }
 
-// readSegmentSlice opens segment `segNo`, reads up to `n` bytes at
-// `off`, and returns whatever was actually read (may be short if
+// readSegmentSlice opens segment `segNo` for the given timeline, reads up to
+// `n` bytes at `off`, and returns whatever was actually read (may be short if
 // the file ends inside the requested window).
-func readSegmentSlice(walDir string, segNo uint64, off int64, n int) ([]byte, error) {
-	path := filepath.Join(walDir, formatSegmentName(segNo))
+func readSegmentSlice(walDir string, segNo uint64, off int64, n int, tli uint32) ([]byte, error) {
+	path := filepath.Join(walDir, FormatSegmentNameTLI(segNo, tli))
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("wal: iterator open %s: %w", path, err)

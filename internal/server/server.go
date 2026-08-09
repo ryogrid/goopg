@@ -265,6 +265,12 @@ type Config struct {
 	// `<DataDir>/global/pg_control` once that file exists.
 	SystemID string
 
+	// Timeline is the cluster's current TLI, read from pg_control at
+	// startup (M0130-S8). Reported by IDENTIFY_SYSTEM and used to
+	// validate START_REPLICATION TIMELINE n. Zero means "use TLI=1"
+	// — the default for a freshly-initialised cluster.
+	Timeline uint32
+
 	// DataDir, when set, controls where the server writes its
 	// `postmaster.pid` file and binds its operator-facing control
 	// socket. Empty disables both — useful for in-process tests

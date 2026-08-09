@@ -1273,6 +1273,16 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// Archive recovery: restore_command is the shell command used to fetch
+	// WAL segments from archival storage during archive recovery (triggered
+	// by recovery.signal). %f expands to the segment filename, %p to the
+	// destination path in pg_wal. Empty default disables archive fetch;
+	// ContextPostmaster because changing it requires a restart.
+	r.MustRegister(NewVariable(Variable{
+		Name: "restore_command", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,

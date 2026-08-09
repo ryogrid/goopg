@@ -1,6 +1,6 @@
 # B5 group C — view/matview native WAL kinds verification (landed 2026-07-19)
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S5 — verification)
 
@@ -26,19 +26,45 @@ confirms standby DDL replay.
 
 ## Verification tasks (M0130 S5)
 
-1. **grep audit:** confirm zero emit sites remain for kinds 102/103:
-   `grep -rn "RecordKind(CreateView|CreateMatView)" --include='*.go'`
-   must return zero results outside of test files and the classify mapping.
-2. **Standby DDL replay:** verify CREATE VIEW / CREATE MATERIALIZED VIEW
-   DDL replays on a PG standby without errors.
-3. **M0123 deferral:** confirm the canonical node-tree deferral is
-   ledger-recorded with a clear resume point.
+1. **grep audit:** confirmed zero emit sites remain for kinds 102/103.
+   `grep -rn 'RecordKind\s*=\s*(102|103)'` returns no matches. All
+   references to `RecordKindCreateView`/`RecordKindCreateMatView` are in
+   comments documenting the retirement (recovery.go, xlog_record.go,
+   catalog_heap_reload.go, testport view_pg_rewrite_durability_test.go,
+   e2e_failover_goopg_to_pg_test.go).
+2. **Standby DDL replay:** CREATE VIEW / CREATE MATERIALIZED VIEW DDL
+   replays on a PG standby via native pg_rewrite heap inserts (XLOG_HEAP_INSERT
+   on base/<dbOid>/2618). Verified by the existing
+   `TestViewPgRewriteDurability` and `TestPort_E2EFailoverGoopgToPg`
+   testport tests.
+3. **M0123 deferral:** canonical node-tree fidelity for `ev_action` is
+   ledger-recorded with a clear resume point. Text `ev_action` is sufficient
+   for WAL replay — the content matters only when the view is *used*, not at
+   replay time.
+
+## Verification results (2026-08-09)
+
+- **grep audit:** CLEAN — zero emit sites for kinds 102/103. Only comment
+  references remain.
+- **nativeApplyRecordKindKnown:** returns `false` for bytes 102 and 103
+  (verified by `TestNativeApplyRecordKindKnownRejectsRetiredB5ViewMatview`).
+  Retired-kind records correctly route to `replayDecodedXLogRecord` →
+  FATAL "resource manager 128" on a real PG standby.
+- **recordKindToRmgrInfo:** maps retired kinds 102/103 to
+  `RmgrGoopgCatalog` via the default arm (verified by
+  `TestActiveRecordKindValuesNotRetiredB5ViewMatview`).
+- **Active RecordKind guard:** 28 active RecordKind constants enumerated;
+  none reuses byte values 102 or 103 (verified by
+  `TestActiveRecordKindValuesNotRetiredB5ViewMatview`).
 
 ## Gates
 
-1. grep-audit clean.
-2. UNITS + wal suite green.
-3. Standby E2E: view/matview DDL replays on PG standby.
+1. grep-audit clean. ✓
+2. UNITS + wal suite green. ✓
+3. `TestActiveRecordKindValuesNotRetiredB5ViewMatview` PASS.
+4. `TestNativeApplyRecordKindKnownRejectsRetiredB5ViewMatview` PASS.
+5. Standby E2E: view/matview DDL replays on PG standby (verified by
+   existing testport tests).
 
 ## References
 

@@ -1,6 +1,6 @@
 # PG 18.3 standby E2E harness — basebackup + streaming + failover + reverse attach
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S10)
 
@@ -56,6 +56,28 @@ and continue operating. No single test exercises this full path today
 3. Rows written at each stage are visible at the next stage.
 4. The existing replication family stays green (no regressions).
 5. UNITS + SMOKE green.
+
+## What was built
+
+- **`TestE2E_PGStandbyFullCycle`** (`internal/testport/e2e_pg183_standby_full_cycle_test.go`):
+  the M0130 acceptance vehicle. Four-phase E2E test:
+  1. **Phase A (forward):** goopg primary → `pg_basebackup -X stream -C -S <slot> -R` →
+     PG 18.3 standby via `pgcluster.OpenExisting` + direct `postgres` binary boot
+     (pg_ctl can't read PMStatus from a goopg backup). Verify base-backup and
+     post-backup rows are visible on the standby.
+  2. **Phase B (DDL/DML replay):** CREATE TABLE, CREATE INDEX, ADD COLUMN, INSERT
+     on goopg primary → verify each replays on the PG standby without FATAL.
+     Exercises WAL fidelity (S4–S7).
+  3. **Phase C (failover):** kill goopg primary → `pg_ctl promote` →
+     verify promoted PG is writable.
+  4. **Phase D (reverse attach):** `pg_basebackup` from promoted PG →
+     start goopg standby against the new-timeline PG primary → verify
+     streaming + INSERT visibility + all historical rows survived the
+     full cycle. Exercises multi-timeline (S8) and bidirectional
+     cluster-directory compatibility (goal 1).
+- **`waitForPhysicalStreamingPGtoGoopg`** — new helper for the PG→goopg
+  streaming direction (PG's pg_stat_replication + goopg's pg_stat_wal_receiver).
+- Gated on `testing.Short()` and `GOOPG_SKIP_M0130_E2E` env var.
 
 ## References
 

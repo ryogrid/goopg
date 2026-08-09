@@ -8,12 +8,19 @@ import (
 	"testing"
 )
 
-func mustReadSegment(t *testing.T, walDir string, segNo uint64) []byte {
+func mustReadSegment(t *testing.T, walDir string, segNo uint64, tli uint32) []byte {
 	t.Helper()
-	path := filepath.Join(walDir, formatSegmentName(segNo))
+	path := filepath.Join(walDir, FormatSegmentNameTLI(segNo, tli))
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read segment %d: %v", segNo, err)
+		// Fall back to TLI=1 for tests that write with default naming.
+		path1 := filepath.Join(walDir, FormatSegmentName(segNo))
+		if path1 != path {
+			if data1, err1 := os.ReadFile(path1); err1 == nil {
+				return data1
+			}
+		}
+		t.Fatalf("read segment %d (tli=%d): %v", segNo, tli, err)
 	}
 	return data
 }
@@ -58,7 +65,7 @@ func TestPageEmissionLongHeaderAtSegmentStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data := mustReadSegment(t, walDir, 0)
+	data := mustReadSegment(t, walDir, 0, w.TimelineID())
 	if len(data) < SizeOfXLogLongPHD {
 		t.Fatalf("segment too short: %d", len(data))
 	}
@@ -121,7 +128,7 @@ func TestPageEmissionShortHeaderAtPageBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data := mustReadSegment(t, walDir, 0)
+	data := mustReadSegment(t, walDir, 0, w.TimelineID())
 	pageOff := XLOGBlockSize
 	if len(data) < pageOff+SizeOfXLogShortPHD {
 		t.Fatalf("segment too short: %d", len(data))
@@ -238,7 +245,7 @@ func TestPageEmissionRecordCrossesSegment(t *testing.T) {
 	// Segment 1's first page must be a long-form header
 	// (PageAddr = pickPageSegSize, XLPLongHeader+XLPFirstIsContRecord
 	// both set).
-	data := mustReadSegment(t, walDir, 1)
+	data := mustReadSegment(t, walDir, 1, w.TimelineID())
 	if len(data) < SizeOfXLogLongPHD {
 		t.Fatalf("segment 1 too short: %d", len(data))
 	}
