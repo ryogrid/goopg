@@ -431,7 +431,45 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          outer join (it only supplies `usename`). NOTE the `walreceiver
          WALData start mismatch` INFO line is NOT a blocker — the
          `m.StartLSN < expectedStart` arm already trims.
-      8. OPEN — **the promoted PG performs NO index maintenance on
+      8. FIXED (2026-08-10) — **the promoted PG performs NO index
+         maintenance on goopg-created indexes.** Landed exactly the resume
+         plan below: `bootstrapPgIndexIndrelidIndex`
+         (`internal/initdb/btree_index_bootstrap.go`) writes a populated
+         single-key `oid_ops` btree keyed on `indrelid` to `base/{1,5}/2678`
+         + `global/2678` (duplicates in (key, heap TID) order, the order
+         `nbtsort.c` produces; indexrelid→indrelid read back from
+         `pgIndexInitialEntries()`); `syncIndexToCatalogHeap` AND
+         `resyncIndexHeapRow` now insert into 2678 *and* 2679 after every
+         pg_index heap write (2679 is mandatory collateral — once 2678 makes
+         an index discoverable, PG resolves the row through the INDEXRELID
+         syscache and would FATAL `cache lookup failed for index <oid>`);
+         both OIDs added to `mirrorTouchedCatalogsToPostgresDB`. VERIFIED on
+         the harness: the promoted PG reports one pg_index row for
+         `public.s10_t` and finds its OWN insert through the index
+         (`WHERE val = 'reverse-attach'` → 1). Guards:
+         `TestPgIndexIndrelidIndexBootstrapPopulated` +
+         `TestPgIndexIndrelidSeedsCoverNailedCatalogs`
+         (`internal/initdb/pg_index_indrelid_index_test.go`).
+      9. OPEN — **goopg cannot replay PG's RM_BTREE records.** Now that the
+         promoted PG maintains the index, its WAL carries real `RM_BTREE`
+         records and the reverse standby's replay stops on the first one:
+         `standby replay: stopped on error apply_lsn=50253552 err="wal:
+         stream replay record lsn[50331689,50463176]: wal: btree-newroot
+         trailing bytes (131052 remaining)"`. That decoder
+         (`internal/wal/recovery.go:1389`) belongs to goopg's PRIVATE
+         `RecordKindBTreeNewRoot`: dispatch keys on `payload[0]` instead of
+         `xl_rmid`/`xl_info` (the ledgered routing gap) and hands a real
+         `XLOG_BTREE_NEWROOT` to it. Halting replay is why id=5 is now
+         missing from the reverse standby ENTIRELY — a later failure than
+         blocker #8, not a regression. Resume: rmid-keyed dispatch for
+         rmid=11 + PG-faithful `btree_redo` arms per
+         `postgres/src/backend/access/nbtree/nbtxlog.c`
+         (`INSERT_LEAF/UPPER/META`, `SPLIT_L/R`, `NEWROOT`, `DEDUP`,
+         `VACUUM`, `DELETE`, `MARK_PAGE_HALFDEAD`, `UNLINK_PAGE*`). Repro:
+         `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`
+         (~37 s), then grep the reverse standby's `cluster.log` for
+         `standby_replay_error`.
+      8-detail (kept for reference) — **the promoted PG performs NO index maintenance on
          goopg-created indexes**, so the reverse standby's index scans
          miss every post-promote row. Phase D's
          `SELECT count(*) FROM public.s10_t WHERE id = 5 AND val =
@@ -464,7 +502,7 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          the way `writeAttrdefRow` does. Repro:
          `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`
          (~40 s). Design: addenda in
-         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 8 rows.
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 9 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

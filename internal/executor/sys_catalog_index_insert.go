@@ -43,6 +43,8 @@ const (
 	pgAttributeRelidAttnumIndexOID uint32 = 2659
 	pgAttrdefAdrelidAdnumIndexOID  uint32 = 2656
 	pgAttrdefOidIndexOID           uint32 = 2657
+	pgIndexIndrelidIndexOID        uint32 = 2678
+	pgIndexIndexrelidIndexOID      uint32 = 2679
 )
 
 // All bootstrap btrees write their root-leaf at block 1 (block 0 is the
@@ -344,6 +346,32 @@ func insertPgNamespaceNspnameIndexEntry(ctx *Context, nspname string, tid storag
 func insertPgNamespaceOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
 	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
 	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgIndexIndrelidIndexEntry inserts an entry into
+// pg_index_indrelid_index (OID 2678, IndexIndrelidIndexId) for
+// (indrelid → pg_index heap TID). NON-unique: one entry per index of the
+// relation.
+//
+// This is the index PG's `RelationGetIndexList` (relcache.c) scans to learn
+// which indexes a relation has; a pg_index heap row that is not present here
+// is invisible to a PG 18.3 instance reading a goopg cluster, which then
+// performs NO index maintenance for that index (its own INSERTs emit zero
+// RM_BTREE records). AI-20260810-011258-003 blocker #8.
+func insertPgIndexIndrelidIndexEntry(ctx *Context, indrelid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, indrelid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgIndexIndrelidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgIndexIndexrelidIndexEntry inserts an entry into
+// pg_index_indexrelid_index (OID 2679, IndexRelidIndexId) for
+// (indexrelid → pg_index heap TID). PG resolves every Form_pg_index through
+// the INDEXRELID syscache, which falls back to a sysscan on THIS index; once
+// 2678 makes an index discoverable, its 2679 entry must exist too or the
+// relcache build FATALs with "cache lookup failed for index <oid>".
+func insertPgIndexIndexrelidIndexEntry(ctx *Context, indexrelid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, indexrelid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgIndexIndexrelidIndexOID, tup, cmpKeyUint32)
 }
 
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of

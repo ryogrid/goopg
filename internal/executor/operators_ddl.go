@@ -13865,8 +13865,18 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
+	resyncTID, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx))
+	if err != nil {
 		return fmt.Errorf("pg_index replica-identity resync: %w", err)
+	}
+	// The rewrite lands at a NEW heap TID, so both pg_index indexes need an
+	// entry pointing at it — otherwise PG's sysscan follows the stamped-dead
+	// old TID and the resynced flags are invisible (AI-20260810-011258-003).
+	if err := insertPgIndexIndrelidIndexEntry(ctx, tableOIDForIndex(idx), resyncTID); err != nil {
+		return fmt.Errorf("pg_index_indrelid_index resync: %w", err)
+	}
+	if err := insertPgIndexIndexrelidIndexEntry(ctx, idx.OID, resyncTID); err != nil {
+		return fmt.Errorf("pg_index_indexrelid_index resync: %w", err)
 	}
 	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
 		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
@@ -13919,8 +13929,21 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
+	indexTID, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx))
+	if err != nil {
 		return fmt.Errorf("pg_index: %w", err)
+	}
+	// AI-20260810-011258-003 blocker #8: index the pg_index row. PG's
+	// RelationGetIndexList discovers a relation's indexes ONLY through
+	// pg_index_indrelid_index (2678) and then resolves each row through the
+	// INDEXRELID syscache (2679); until both were maintained here, a PG 18.3
+	// instance on a goopg cluster saw goopg-created indexes as nonexistent and
+	// silently skipped index maintenance for its own INSERTs.
+	if err := insertPgIndexIndrelidIndexEntry(ctx, tableOIDForIndex(idx), indexTID); err != nil {
+		return fmt.Errorf("pg_index_indrelid_index for index: %w", err)
+	}
+	if err := insertPgIndexIndexrelidIndexEntry(ctx, idx.OID, indexTID); err != nil {
+		return fmt.Errorf("pg_index_indexrelid_index for index: %w", err)
 	}
 
 	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a

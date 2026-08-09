@@ -482,3 +482,63 @@ it: a populated NON-unique `oid_ops` btree keyed on `indrelid` at
 `insertPgAttrdefAdrelidAdnumIndexEntry` pattern.
 
 Blocker #8 is recorded in the deferral ledger; the fix_plan item stays open.
+
+## 2026-08-10 addendum — blocker #8 FIXED; blocker #9 (PG RM_BTREE replay) diagnosed
+
+### Blocker #8 fix as landed
+
+Exactly the three pieces the diagnosis called for:
+
+1. `bootstrapPgIndexIndrelidIndex` (`internal/initdb/btree_index_bootstrap.go`)
+   overwrites the empty 2678 placeholder in `base/1`, `base/5` and `global` with
+   a populated single-key `oid_ops` btree, one IndexTuple per `pg_index` seed
+   row keyed on `indrelid`, duplicates ordered by (key, heap TID) — the order
+   `nbtsort.c` produces. The indexrelid→indrelid mapping is read back from
+   `pgIndexInitialEntries()`, so `bootstrapPgIndexTuples`' return type is
+   unchanged.
+2. Runtime maintenance in `syncIndexToCatalogHeap` **and** `resyncIndexHeapRow`
+   (`internal/executor/operators_ddl.go`): every `pg_index` heap write now also
+   inserts into 2678 (`insertPgIndexIndrelidIndexEntry`, keyed on
+   `tableOIDForIndex(idx)`) and 2679 (`insertPgIndexIndexrelidIndexEntry`). 2679
+   is not optional collateral: once 2678 makes an index *discoverable*, PG
+   resolves each row through the INDEXRELID syscache, whose sysscan falls back
+   to 2679 — without it the relcache build would FATAL `cache lookup failed for
+   index <oid>` instead of merely skipping maintenance.
+3. Both index OIDs added to `mirrorTouchedCatalogsToPostgresDB` beside the
+   already-mirrored `pg_index` heap (2610), since the standby attaches with
+   `dbname=postgres` and reads `base/5`.
+
+Verified on the harness: the promoted PG now reports one `pg_index` row for
+`public.s10_t`, and its own `INSERT` is retrievable through the index
+(`WHERE val = 'reverse-attach'` → 1). PG is doing index maintenance.
+
+Guards: `TestPgIndexIndrelidIndexBootstrapPopulated` (physical — 2678 is a
+populated btree in all three locations, keys ascending, one per seed row) and
+`TestPgIndexIndrelidSeedsCoverNailedCatalogs` (logical — pg_class/pg_attribute/
+pg_index/pg_attrdef each contribute their declared index count), both in
+`internal/initdb/pg_index_indrelid_index_test.go`.
+
+### Blocker #9 — goopg cannot replay PG's RM_BTREE records
+
+Because PG now maintains the index, its WAL carries real `RM_BTREE` records for
+the first time in this harness — and goopg's replay stops dead on the first one:
+
+```
+standby replay: stopped on error apply_lsn=50253552
+  err="wal: stream replay record lsn[50331689,50463176]:
+       wal: btree-newroot trailing bytes (131052 remaining)"
+```
+
+That message comes from `internal/wal/recovery.go:1389`, the decoder for
+goopg's **private** `RecordKindBTreeNewRoot`. A real PG `XLOG_BTREE_NEWROOT`
+record is being fed to it: the dispatch is keying on `payload[0]` instead of
+`xl_rmid`/`xl_info`, the long-standing routing gap already on the ledger
+("WAL dispatch: xl_rmid/xl_info not payload[0]"). Replay halting means the
+reverse standby now misses the id=5 heap row entirely — a *later* failure than
+before, not a regression: previously the record never existed.
+
+Blocker #9 is therefore a real subsystem task (PG-faithful `btree_redo`:
+`XLOG_BTREE_INSERT_LEAF/UPPER/META`, `SPLIT_L/R`, `NEWROOT`, `DEDUP`,
+`VACUUM`, `DELETE`, `MARK_PAGE_HALFDEAD`, `UNLINK_PAGE*`, from
+`postgres/src/backend/access/nbtree/nbtxlog.c`) plus rmid-keyed dispatch, and
+is ledgered separately. The fix_plan item stays open.

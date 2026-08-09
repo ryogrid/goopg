@@ -1071,6 +1071,14 @@ func Init(opts Options) error {
 	if err := bootstrapPgIndexIndexrelidIndex(abs, pgIndexTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_index_indexrelid_index: %w", err)
 	}
+	// M-NIGHTLY AI-20260810-011258-003 blocker #8: 2678
+	// (pg_index_indrelid_index) is the index PG's RelationGetIndexList scans
+	// to discover a relation's indexes; while it stayed an empty placeholder
+	// a PG on a goopg cluster performed ZERO index maintenance on
+	// goopg-created indexes. See bootstrapPgIndexIndrelidIndex.
+	if err := bootstrapPgIndexIndrelidIndex(abs, pgIndexTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_index_indrelid_index: %w", err)
+	}
 	// M0106-0010 batched-19: overwrite base/{1,5}/2687 + global/2687 with
 	// a populated btree carrying one oid-keyed IndexTuple per pg_opclass row
 	// (177 rows, potentially multi-page) so PG's LookupOpclassInfo finds

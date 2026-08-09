@@ -181,6 +181,14 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgAttrdefRelOID,               // 2604 pg_attrdef
 		pgAttrdefAdrelidAdnumIndexOID, // 2656
 		pgAttrdefOidIndexOID,          // 2657
+		// AI-20260810-011258-003 blocker #8: both pg_index indexes. The
+		// pg_index HEAP was already mirrored, but a standby reading base/5
+		// resolves a relation's index list ONLY through 2678
+		// (RelationGetIndexList) and each row through 2679 (INDEXRELID
+		// syscache); unmirrored, the promoted PG saw every goopg-created index
+		// as nonexistent and did no index maintenance for its own writes.
+		pgIndexIndrelidIndexOID,   // 2678
+		pgIndexIndexrelidIndexOID, // 2679
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {
