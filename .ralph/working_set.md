@@ -1,44 +1,42 @@
-Task: M0122-0008 pg_client_encoding() + getdatabaseencoding() builtins (LANDED)
+Task: M0122-0008 pg_char_to_encoding() builtin dispatch (LANDED)
 
 Files:
-- internal/executor/expr.go: Added dispatch cases for pg_client_encoding and
-  getdatabaseencoding in evalFuncCall switch; implemented evalPgClientEncoding
-  (reads client_encoding GUC via GetSetting) and evalGetDatabaseEncoding
-  (reads encoding ID from catalog.InMemory.DatabaseEncoding + maps via
-  EncodingIDToName)
-- internal/executor/encoding_builtins_test.go: TestEvalPgClientEncoding +
-  TestEvalGetDatabaseEncoding (nil-ctx fallback, custom GUC, non-default encoding)
-- .ralph/fix_plan.md: Updated M0122-0008 status
-- unimplemented_feat.json: Updated encoding entry code_audit
+- internal/executor/expr.go: Added case "pg_char_to_encoding" dispatch arm in
+  evalFuncCall switch (line 11555); delegates to catalog.EncodingNameToID
+- internal/executor/encoding_builtins_test.go: Added TestEvalPgCharToEncoding
+  (7 subtests: canonical UTF8, alias unicode, LATIN1, NULL, unknown → -1,
+  case insensitive, punctuation variant UTF-8)
 
 Key symbols:
-- evalPgClientEncoding(row, ctx) — returns current client_encoding as name Datum
-- evalGetDatabaseEncoding(row, ctx) — returns database encoding as name Datum
+- evalFuncCall case "pg_char_to_encoding" — inline dispatch, no separate eval func
+- catalog.EncodingNameToID — already existed, used by CREATE CONVERSION validation
 
 Hypothesis/Findings:
-- Both functions were registered in pg_proc_seed_data.go with HandlerName entries
-  but had no dispatch arms in evalFuncCall → returned "function does not exist"
-- Bootstrap encoding enforcement (initdb --encoding validation via resolveEncoding)
-  was already fully implemented — the working_set's "Next step" from the previous
-  loop was stale
-- getdatabaseencoding() uses a type assertion to *catalog.InMemory because
-  DatabaseEncoding is not on the Catalog interface (only on the concrete type)
-- Verified against live psql: default UTF8, SET to LATIN1 reflects correctly
+- pg_encoding_to_char() was ALREADY implemented (dispatch arm at L11542, DU-002 slice 399)
+- pg_char_to_encoding() was registered in pg_proc_seed_data.go (OID 1264, HandlerName
+  "PG_char_to_encoding") but had NO dispatch arm in evalFuncCall
+- The catalog-side function (EncodingNameToID + cleanConvEncodingName +
+  pgConvEncAliases) already existed since DU-002 slice 400, so the executor work
+  was a one-line delegation
 
 Next step:
-- M0130 is COMPLETE. M0119-0005/0006/0007 are blocked/huge (need index AMs + types).
-  M0122-0008 remaining: (1) channel binding blocked on TLS; (2) actual byte-level
-  encoding conversion (port PG mb/conversion_procs). Most tractable next item:
-  start on M0122-0010 btree locking (Lehman-Yao crab-walk first slice), or
-  continue M0122-0008 with a small encoding follow-up like pg_encoding_to_char()
-  and pg_char_to_encoding() SQL builtins (also registered but may lack dispatch).
+- M0130 is COMPLETE. M-NIGHTLY is clear (all 49 items resolved by command-counter fix).
+  M0119-0005/0006/0007 are blocked on index AMs / types / logical decoding.
+  Most tractable next items:
+  (1) M0122-0008 remaining: channel binding (blocked on TLS) and actual byte-level
+      encoding conversion (port PG mb/conversion_procs)
+  (2) M0122-0010 btree locking (Lehman-Yao crab-walk first slice)
+  (3) M0122-0008 small follow-ups: pg_encoding_to_char and pg_char_to_encoding
+      are both done — only the hard blockers remain in this bucket
 
 Gates run:
 - go build ./internal/executor/...: OK
-- go test -run TestEvalPgClientEncoding/TestEvalGetDatabaseEncoding: PASS
-- go test ./internal/executor/...: PASS (5.8s)
+- go test -run TestEvalPgCharToEncoding: PASS (7/7)
+- go test ./internal/executor/...: PASS (5.7s)
+- go test ./internal/catalog/... (encoding): PASS
 - RALPH_PRECOMMIT_SCOPE=units: ALL PASS
 - RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
-- make ralph-state-guard: REPAIRED (progress.json reconciled)
+- Live psql: pg_char_to_encoding('UTF8')=6, ('unicode')=6, (NULL)=NULL, ('nonexistent')=-1 ✓
+- make ralph-state-guard: REPAIRED
 
 In-flight: none

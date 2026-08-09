@@ -616,6 +616,10 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       and maps it to a canonical name via catalog.EncodingIDToName. Tests:
       TestEvalPgClientEncoding + TestEvalGetDatabaseEncoding
       (internal/executor/encoding_builtins_test.go) and live-psql verification.
+      **pg_char_to_encoding() builtin landed (2026-08-09, this loop):**
+      pg_char_to_encoding(name) → int4 dispatch arm added in evalFuncCall; delegates
+      to catalog.EncodingNameToID for canonical-name/alias/clean-name resolution.
+      Tests: TestEvalPgCharToEncoding (7 subtests) + live-psql verification.
       **client_encoding GUC validation landed (2026-08-09, previous loop):**
       SET client_encoding TO 'INVALID' now raises 22023 (invalid_parameter_value).
       Added CheckFn callback to config.Variable; checkClientEncoding resolves the
