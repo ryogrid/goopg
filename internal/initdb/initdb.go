@@ -2706,6 +2706,11 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if e.ArgNames != nil {
 		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
 	}
+	// pg_proc.dat carries no argument defaults; upstream attaches them by
+	// replaying system_functions.sql at the end of initdb. goopg replays that
+	// file's effect from a table instead — see pg_proc_seed_defaults.go for why
+	// a real PG standby cannot resolve short call forms without it.
+	nargDefaults, argDefaults := pgProcSeedArgDefaults(e.OID)
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -2729,13 +2734,13 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewStringDatum(string(vol)),             // 15 provolatile
 		executor.NewStringDatum(string(parallel)),        // 16 proparallel
 		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
-		executor.NewIntDatum(0),                          // 18 pronargdefaults
+		executor.NewIntDatum(int64(nargDefaults)),        // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
 		executor.NewBytesDatum(oidVectorBytes(argTypes)), // 20 proargtypes
 		allArgs,                                // 21 proallargtypes
 		argModes,                               // 22 proargmodes
 		argNames,                               // 23 proargnames
-		executor.NewStringDatum(""),            // 24 proargdefaults (pg_node_tree)
+		executor.NewStringDatum(argDefaults),   // 24 proargdefaults (pg_node_tree)
 		executor.NewStringDatum(""),            // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
 		executor.NewStringDatum(""),            // 27 probin

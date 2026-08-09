@@ -16,6 +16,32 @@ func Out(n Node) string {
 	return sb.String()
 }
 
+// OutList serializes a bare List of nodes — the top-level shape PostgreSQL
+// stores in pg_proc.proargdefaults, where the value is a List of default
+// expressions rather than a single node (see build_function_result_tupdesc /
+// fmgr_sql_validator's use of stringToNode on that column, and
+// postgres/src/backend/parser/parse_func.c:func_get_detail which
+// stringToNode()s it to fill in omitted trailing arguments).
+//
+// nodeToString on a List emits "(elem elem ...)"; a NIL List emits "<>".
+// This mirrors wNodeList's body, which cannot be reused directly because that
+// helper always prefixes a ":fieldname".
+func OutList(nodes []Node) string {
+	if len(nodes) == 0 {
+		return "<>"
+	}
+	var sb strings.Builder
+	sb.WriteByte('(')
+	for i, nd := range nodes {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		outNode(&sb, nd)
+	}
+	sb.WriteByte(')')
+	return sb.String()
+}
+
 // outNode writes a single node wrapped in braces, or "<>" for a nil node —
 // mirroring outNode() in outfuncs.c (a NULL node prints as "<>").
 func outNode(sb *strings.Builder, n Node) {

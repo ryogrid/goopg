@@ -155,3 +155,24 @@ func TestReadNullConst(t *testing.T) {
 		t.Fatalf("null Const round-trip mismatch:\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// TestOutListBareList covers the top-level List shape used by
+// pg_proc.proargdefaults (see initdb/pg_proc_seed_defaults.go). A List is NOT
+// wrapped in braces — nodeToString emits "(elem elem)" — and a NIL List emits
+// "<>", the same token outNode uses for a nil node.
+func TestOutListBareList(t *testing.T) {
+	if got := OutList(nil); got != "<>" {
+		t.Errorf("OutList(nil) = %q, want %q", got, "<>")
+	}
+	if got := OutList([]Node{}); got != "<>" {
+		t.Errorf("OutList(empty) = %q, want %q", got, "<>")
+	}
+	one := OutList([]Node{NewInt4Const(5)})
+	if want := "(" + Out(NewInt4Const(5)) + ")"; one != want {
+		t.Errorf("OutList(1 elem) = %q, want %q", one, want)
+	}
+	two := OutList([]Node{NewBoolConst(false), NewBoolConst(true)})
+	if want := "(" + Out(NewBoolConst(false)) + " " + Out(NewBoolConst(true)) + ")"; two != want {
+		t.Errorf("OutList(2 elems) = %q, want %q", two, want)
+	}
+}

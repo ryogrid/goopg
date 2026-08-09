@@ -354,22 +354,41 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          `TestPgAttrdefCatalogSurfaceIsPGComplete` +
          `TestPgAttrdefIndexFilesBootstrapped`
          (`internal/initdb/pg_attrdef_indexes_test.go`).
-      4. OPEN — **Phase C (failover/promote) now PASSES for the first time**
-         (kill goopg primary → `pg_ctl promote` → write + read on the
-         promoted PG). Phase D (reverse attach) fails on a NEW, unrelated
-         blocker: the promoted PG rejects
-         `SELECT pg_create_physical_replication_slot('s10_reverse')` with
-         `function pg_create_physical_replication_slot(unknown) does not
-         exist`. PG 18's signature is `(slot_name name, immediately_reserve
-         bool DEFAULT false, temporary bool DEFAULT false)`; goopg's seeded
-         pg_proc row for OID 3779 (and 3780) lacks the `pronargdefaults` /
-         `proargdefaults` that let PG resolve the 1-argument call form.
-         Resume: seed `pronargdefaults=2` + a PG-parseable `proargdefaults`
-         pg_node_tree (a LIST of two bool Consts — note internal/pgnodes has
-         no List node yet, ledgered) for 3779 in goopg's pg_proc seed, then
-         re-run `go test -v -run '^TestE2E_PGStandbyFullCycle$'
-         ./internal/testport/`. Design: addenda in
-         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 3 rows.
+      4. FIXED (2026-08-10) — **Phase C (failover/promote) passed for the
+         first time**, and Phase D's slot creation now succeeds too. The
+         promoted PG rejected
+         `SELECT pg_create_physical_replication_slot('s10_reverse')` because
+         goopg's seeded pg_proc row had `pronargdefaults=0`: upstream
+         `pg_proc.dat` has ZERO `pronargdefaults` entries (the bootstrap
+         catalog format cannot express argument defaults), and PG attaches
+         them by replaying `system_functions.sql` at the tail of initdb —
+         which goopg never did. `parse_func.c:func_get_detail` →
+         `FuncnameGetCandidates` only admits a short call form when
+         `pronargdefaults` covers the shortfall. Fix:
+         `internal/initdb/pg_proc_seed_defaults.go` (per-OID table replaying
+         system_functions.sql's effect) + `pgnodes.OutList` (bare-List
+         pg_node_tree, the shape `proargdefaults` holds — unlike the single
+         braced node in `pg_attrdef.adbin`). Bytes pinned against a stock
+         PG 18.3 initdb capture. Guards:
+         `TestPgProcSeedArgDefaultsMatchesRealPG`,
+         `TestPgProcSeedArgDefaultsUnlistedOIDsUnchanged`,
+         `TestPgProcRowCarriesSeedDefaults`, `TestOutListBareList`.
+      5. OPEN — Phase D now fails one step later, in `pg_basebackup` against
+         the promoted PG: `FATAL: no pg_hba.conf entry for replication
+         connection from host "127.0.0.1", user "ryo"`. Same class as #4 —
+         the promoted PG enforces *goopg's* `pg_hba.conf` because the data
+         dir came from goopg's initdb, and `buildPgHBAConf`
+         (`internal/initdb/auth_bootstrap.go`) emits only `all`-database
+         rules, omitting the three `replication` rules upstream initdb writes
+         (`local replication all <local>`, `host replication all
+         127.0.0.1/32 <host>`, and the `::1/128` twin). goopg ignores
+         pg_hba.conf for its own auth (`internal/auth`), so this was
+         invisible until a real PG read the file. Resume: add the three rules
+         to `buildPgHBAConf` with the same `%[1]s`/`%[2]s` host/local method
+         substitution, update the byte-for-byte pg_hba tests, re-run
+         `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`.
+         Design: addenda in
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 4 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

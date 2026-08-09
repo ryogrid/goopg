@@ -206,3 +206,68 @@ not carry the `pronargdefaults` / `proargdefaults` that let PG resolve the
 `TestPgAttrdefIndexFilesBootstrapped` (`internal/initdb/pg_attrdef_indexes_test.go`)
 pin the tupledesc, both index specs, the pg_index seed rows and the on-disk
 placeholder files — cheap static checks that fire long before the PG-binary E2E.
+
+## Addendum (2026-08-10) — blocker #4: pg_proc argument DEFAULTs were never seeded
+
+The blocker recorded at the end of the previous addendum is closed.
+
+**Symptom.** Phase D's very first statement,
+`SELECT pg_create_physical_replication_slot('s10_reverse')`, executed against
+the *promoted PG* (not against goopg), failed with
+`function pg_create_physical_replication_slot(unknown) does not exist`.
+
+**Root cause — not where it looks.** The function is present in goopg's seeded
+`pg_proc`; what is missing is its *defaults*. Upstream
+`postgres/src/include/catalog/pg_proc.dat` has **zero** `pronargdefaults`
+entries — the bootstrap catalog format cannot express argument defaults at all.
+Upstream instead runs `postgres/src/backend/catalog/system_functions.sql` at
+the tail of `initdb`, which `CREATE OR REPLACE FUNCTION`s ~50 built-ins purely
+to attach `DEFAULT` clauses. `pg_create_physical_replication_slot` is
+system_functions.sql:469, where `immediately_reserve` and `temporary` each get
+`DEFAULT false`.
+
+goopg seeds `pg_proc` straight from the generated pg_proc.dat mirror
+(`internal/initdb/pg_proc_seed_data.go`) and never replays
+system_functions.sql, so every seeded row carried `pronargdefaults = 0` and an
+empty `proargdefaults`. That is invisible to goopg itself — its builtin
+dispatch resolves call shapes in Go — but on a real PG reading goopg's cluster
+directory, `parse_func.c:func_get_detail` builds candidates via
+`FuncnameGetCandidates`, which only admits a call with fewer arguments than
+`pronargs` when `pronargdefaults` covers the shortfall. Zero defaults ⇒ the
+1-argument call form does not exist.
+
+**Fix.** `internal/initdb/pg_proc_seed_defaults.go` is a small table replaying
+system_functions.sql's *effect* per OID: `(pronargdefaults, []pgnodes.Node)`.
+`pgProcRow` now writes column 18 from it and column 24 from
+`pgnodes.OutList(defaults)` — a new export that serializes a **bare List**
+(`(elem elem)`, `<>` when NIL), which is the top-level shape `proargdefaults`
+holds, as opposed to the single braced node `pg_attrdef.adbin` holds. The
+rendered bytes are pinned against a stock PG 18.3 `initdb` capture in
+`TestPgProcSeedArgDefaultsMatchesRealPG`; PG runs `stringToNode()` on this
+column, so drift in field order, datum width or list punctuation is a standby
+ERROR rather than a cosmetic diff.
+
+Only OID 3779 is populated so far — the remaining ~50 system_functions.sql
+DEFAULT clauses are ledgered, and adding one is a single table entry.
+
+**Result.** Phase D's slot creation succeeds; the reverse attach now fails one
+step later, in `pg_basebackup` against the promoted PG:
+
+    pg_basebackup: error: connection to server ... FATAL: no pg_hba.conf entry
+    for replication connection from host "127.0.0.1", user "ryo", no encryption
+
+That is **blocker #5**, and it is a goopg gap for the same reason blocker #4
+was: the promoted PG is running on a data directory goopg's `initdb` created,
+so it is enforcing *goopg's* `pg_hba.conf`. `buildPgHBAConf`
+(`internal/initdb/auth_bootstrap.go`) emits only `all`-database rules and omits
+the three `replication` rules upstream `initdb` writes
+(`local replication all <local>` + `host replication all 127.0.0.1/32 <host>` +
+the `::1/128` twin). goopg ignores pg_hba.conf for its own auth decisions, so
+the omission has never mattered until a real PG read the file. Ledgered; the
+fix_plan item stays unchecked.
+
+**Guards.** `TestPgProcSeedArgDefaultsMatchesRealPG`,
+`TestPgProcSeedArgDefaultsUnlistedOIDsUnchanged` and
+`TestPgProcRowCarriesSeedDefaults`
+(`internal/initdb/pg_proc_seed_defaults_test.go`) plus `TestOutListBareList`
+(`internal/pgnodes/pgnodes_test.go`).
