@@ -203,6 +203,20 @@ func getChunk(cs uint32) []byte {
 }
 
 func putChunk(cs uint32, b []byte) {
+	// Only exact-size-class buffers may be pooled. growChunk allocates an
+	// oversized chunk (make([]byte, 0, n) for n > cs) whenever a single
+	// allocation exceeds the chunk size, and Release hands *every* chunk to
+	// putChunk keyed by c.cs — so without this guard a cap>cs buffer lands in
+	// the cs pool and getChunk later returns it to an unrelated context. That
+	// breaks the invariant the (offset, length) encoding rests on: offset is
+	// chunkIdx*cs + offsetWithinChunk, so an allocation at an in-chunk offset
+	// >= cs aliases to chunkIdx+1 and Bytes() resolves into the wrong (often
+	// nonexistent) chunk, silently returning nil. An undersized buffer is
+	// likewise rejected — pooling one would make getChunk hand out a chunk
+	// that cannot hold cs bytes.
+	if cap(b) != int(cs) {
+		return
+	}
 	b = b[:0]
 	switch cs {
 	case defaultChunkSize:

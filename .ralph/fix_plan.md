@@ -281,20 +281,31 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       snapshots; `perWorker = 0` → guard fires). Test-only change;
       `reserve_emitted.go` untouched. Design: addendum in
       `docs/design/0107-0007aa-wal-reserve-emitted.md` (+ README row).
-- [ ] **race/internal/mctx — `TestMultipleChunks` load-sensitive flake**
+- [x] **race/internal/mctx — `TestMultipleChunks` load-sensitive flake**
       (discovered 2026-08-10 while verifying the item above; NOT in the nightly
-      log — it passed there). `make race-gate` still reds on
-      `mctx_test.go:139: second chunk: got ""`. Does not reproduce in isolation
-      (100/100 PASS at default GOMAXPROCS and at GOMAXPROCS=1); only under
-      full-package load, same shape as the wal flake. Hypothesis: the test does
-      `Acquire(nil, KindStmt)` and then assumes *pristine pooled state* — that
-      allocating `defaultChunkSize` will force a chunk boundary
-      (`off1/c.cs != off2/c.cs`). If a concurrently-running test returned a
-      recycled context whose chunk size `c.cs` had already been grown by a
-      large-alloc, that assumption breaks and `c.Bytes(off2, len2)` addresses
-      out of range → `""`. Resume point: `internal/mctx/mctx_test.go:126`
-      `TestMultipleChunks` — assert against `c.cs` rather than
-      `defaultChunkSize`, or acquire a context with a pinned chunk size.
+      log — it passed there). **REAL ENGINE BUG, not a test defect — FIXED
+      2026-08-10; `make race-gate` is now GREEN.** The filed hypothesis (a
+      recycled context carrying a grown `c.cs`) is **refuted**: `Acquire`
+      allocates a fresh `Context` and derives `cs` from `Kind` alone — only
+      chunks are pooled, never contexts. The actual cause is an aliasing bug in
+      the offset encoding. `AllocBytes` returns
+      `offset = chunkIdx*c.cs + offsetWithinChunk` and `Bytes` inverts it with
+      `/c.cs` and `%c.cs`, which is invertible only while every chunk has
+      capacity exactly `c.cs`. `growChunk` deliberately makes oversized chunks
+      (`make([]byte, 0, n)` for `n > cs`) — harmless in-context, since such a
+      chunk is created full — but `Release` handed **every** chunk to
+      `putChunk(c.cs, …)`, filing the oversized one into the `cs` size pool. An
+      unrelated later `Acquire` then drew a `cap > cs` chunk and filled it, and
+      the first allocation to reach in-chunk offset `c.cs` reported
+      `chunkIdx+1`, so `Bytes` resolved into the next (often nonexistent) chunk
+      and returned nil — silently, no panic. That cross-test hand-off through a
+      shared `sync.Pool` is exactly why it needed full-package load and never
+      reproduced in isolation. Fix: `putChunk` pools only buffers whose cap is
+      exactly the pool's size class (`internal/mctx/mctx.go`). Mutation-verified
+      both directions. Tests: `TestOversizedChunkNeverEntersSizePool` (white-box,
+      poisons both pools) and `TestAllocBytesRoundTripAcrossChunks` (black-box,
+      round-trips 4 chunks of tagged blocks). Design: addendum in
+      `docs/design/0107-0001-mctx-memory-context-substrate.md` (+ README row).
 - [ ] **testport/TestE2E_FailoverGoopgToPG** — FAILed, subtest
       `sync_remote_apply` (AI-20260810-011258-002; repro: `go test -v -run
       '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`). New tonight;

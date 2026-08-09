@@ -1,51 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY AI-20260810-011258-001 (`race/internal/wal`). COMPLETE,
-committed, pushed. Nightly batch 20260810-011258 (6 items) fully FILED first.
+Last loop: M-NIGHTLY `race/internal/mctx TestMultipleChunks`. COMPLETE,
+committed, pushed. Nightly batch 20260810-011258 was already fully FILED (all
+6 items present in fix_plan); nothing new to file this loop.
 
-The discovery: the red race-gate was not a data race and not an invariant
-violation — it was the race-closure test's own non-vacuity guard firing
-(`reader took zero snapshots`). Two hazards, and the guard covered only one:
-(1) the reader goroutine was spawned AFTER the writers, whose 8x500
-reservations finish in well under a millisecond, so the reader could see
-`stop` already closed on its first iteration; (2) `observed > 0` counted loop
-iterations, but the assertion only does work on a snapshot catching a stripe
-mid-flight — a scheduled-but-starved reader satisfied the guard while
-asserting nothing.
+The discovery: this was filed as a load-sensitive TEST flake and was a REAL
+ENGINE BUG in the mctx bump allocator. `AllocBytes` encodes
+`offset = chunkIdx*c.cs + offsetWithinChunk`, and `Bytes` inverts with `/c.cs`
+and `%c.cs` — invertible only while EVERY chunk has cap exactly `c.cs`.
+`growChunk` deliberately makes oversized chunks (`make([]byte,0,n)`, n > cs),
+which is harmless in-context because such a chunk is created full — but
+`Release` handed every chunk to `putChunk(c.cs, …)`, filing the oversized one
+into the `cs` size pool. An unrelated later `Acquire` drew a `cap > cs` chunk,
+and the first allocation reaching in-chunk offset `c.cs` reported `chunkIdx+1`,
+so `Bytes` resolved into a nonexistent chunk and returned nil. Silent: no
+panic, no error, just `""`.
 
-Load-bearing detail: it reproduces on 100% of runs under `GOMAXPROCS=1 -race`
-but passes 200/200 in isolation at default GOMAXPROCS. That asymmetry is why
-it escaped review, and it is the cheapest probe for this whole bug family.
-General lesson (recorded in the design doc): a non-vacuity guard must count
-executions of THE ASSERTION, not iterations of the loop containing it.
+The filed hypothesis (recycled context with a grown `c.cs`) is REFUTED —
+`Acquire` allocates a fresh `Context` and derives `cs` from `Kind` alone; only
+chunks are pooled, never contexts. That cross-test hand-off through a shared
+`sync.Pool` is precisely why it needed full-package load and passed 100/100 in
+isolation.
 
-Files: `internal/wal/reserve_emitted_test.go` only — `reserve_emitted.go` is
-untouched (test-only fix). Fix is by construction, not by luck: writers wait
-on a `readerLive` signal the reader sends after its first completed snapshot,
-and `witnessed` counts only snapshots that caught a non-idle stripe, with the
-write burst repeating (bounded 200 rounds) until `witnessed > 0`.
+Fix: `putChunk` pools only buffers whose cap is exactly the pool's size class.
+Files: `internal/mctx/mctx.go` (guard) + `internal/mctx/mctx_test.go` (2 tests).
+Design: addendum in `docs/design/0107-0001-mctx-memory-context-substrate.md`
+(+ README row amended). Ledger: 1 new row (adjacent unguarded entrance —
+`growChunk` inserts after `head` and memmoves the tail, renumbering chunks past
+`head`; unreachable today only as an emergent property of `head` bookkeeping).
 
-Design: addendum in `docs/design/0107-0007aa-wal-reserve-emitted.md` (+ README
-row 0107-0007aa amended). Ledger: 1 new row (race-gate still red on a separate
-cause — see below).
-
-Gates run: mutation-verified BOTH directions — stripe published at `curr`
-=> assertion fires under GOMAXPROCS=1 (where the OLD test took zero
-snapshots); `perWorker = 0` => new guard fires (the OLD guard passes this).
-`go test -race ./internal/wal/` PASS at default GOMAXPROCS and at
-GOMAXPROCS=1; `-count=50` GOMAXPROCS=1 on the target test PASS; units
-precommit PASS; pgbench commit hook PASS. `make race-gate` still FAILS — on
-`internal/mctx` TestMultipleChunks, NOT on wal.
+Gates run: mutation-verified BOTH directions (guard reverted → white-box test
+reports `cap 65636`, black-box fails at block 64 `Bytes returned 0 bytes`);
+`go test -race ./internal/mctx/` PASS; **`make race-gate` GREEN** (it had been
+red on this test for several loops); units precommit PASS; `tpch-spotcheck`
+PASS (Q12=2, Q13=35) since this is the row-data allocation path; pgbench commit
+hook PASS.
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M0130 all `[x]`, so M-NIGHTLY selection is unblocked and is the top milestone.
-5 nightly items remain unchecked, plus the newly-filed mctx flake. Strongest
-candidate: **race/internal/mctx TestMultipleChunks** — it is what still reds
-`make race-gate`, and it is diagnosed to a resume point already
-(`Acquire(nil, KindStmt)` assumes a pristine pooled context; assert against
-`c.cs`, not `defaultChunkSize`). Note AI-...-004 (IsolationMergeUpdate) is
-likely STALE — re-run at HEAD before investigating. The pgbench item is the
-highest-value engine item: clients abort with an error that is NOT itself in
-the log, and the run still prints `0 failed`.
+M0130 all `[x]`, so M-NIGHTLY stays the top selectable milestone. 4 items
+remain unchecked, all from batch 20260810-011258:
+AI-...-002 `TestE2E_FailoverGoopgToPG` (subtest `sync_remote_apply`),
+AI-...-003 `TestE2E_PGStandbyFullCycle`, AI-...-004
+`TestPort_IsolationMergeUpdate` (LIKELY STALE — re-run at HEAD first; the
+cross-partition cmax fix landed after the nightly sha), AI-...-005
+`TestPort_PublicationSurvivesRestart`. Cheapest first move: re-run -004 at HEAD
+to close it. Highest-value engine item remains AI-...-006 pgbench/nightly —
+79 aborted clients whose ORIGINATING error is not in the log, and the run still
+prints `0 failed`.
 
 In-flight: none.
