@@ -1291,11 +1291,24 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	}
 
 	segSizes := make(map[uint64]int64)
+	// M0130-S10 blocker #6: the on-disk TLI per segment. parseSegmentName
+	// discards the timeline, and every downstream recomposition of the
+	// filename used to assume TLI=1 — so goopg refused to start on a base
+	// backup taken from a PROMOTED PG (timeline 2, pg_wal full of
+	// `00000002…` segments) with "wal: read …/000000010000000000000002: no
+	// such file or directory". The reader side has been TLI-tolerant since
+	// openSegmentFile's fallback scan; this is its writer-side twin
+	// (Hard-won Rule #2 — sibling paths must change together).
+	segTLIs := make(map[uint64]uint32)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		segNo, ok := parseSegmentName(e.Name())
+		// segSize=0 → DefaultSegmentSize, exactly what the previous
+		// parseSegmentName call did: segment *names* are always derived
+		// from DefaultSegmentSize in this package (FormatSegmentNameTLI),
+		// independently of the configured runtime segment size.
+		tli, segNo, ok := ParseXLogFileName(e.Name(), 0)
 		if !ok {
 			continue
 		}
@@ -1315,6 +1328,14 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 			continue
 		}
 		segSizes[segNo] = st.Size()
+		// Same segment number present on several timelines (a promoted
+		// cluster keeps the pre-switch copy alongside the new one): prefer
+		// the highest TLI, mirroring upstream XLogFileReadAnyTLI, which
+		// walks expectedTLEs newest-timeline-first
+		// (postgres/src/backend/access/transam/xlog.c).
+		if tli > segTLIs[segNo] {
+			segTLIs[segNo] = tli
+		}
 	}
 
 	if len(segSizes) == 0 {
@@ -1352,6 +1373,10 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		}
 	}
 	firstSegNo := segNos[0]
+	// The timeline the retained run lives on. Used only to name a segment
+	// that is NOT on disk (the gap diagnostic below), where no filename
+	// exists to read a TLI from.
+	runTLI := segTLIs[firstSegNo]
 
 	// M0007 eager-lookahead follow-up: state.eagerPreallocSegment can
 	// leave a fully zero-filled "future" segment on disk beyond the
@@ -1382,7 +1407,7 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	// tolerates more defensively.
 	lastIdx := len(segNos) - 1
 	for lastIdx > 0 && segSizes[segNos[lastIdx]] == segSize {
-		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segSizes[segNos[lastIdx]], segSize, pageHeaders)
+		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segTLIs[segNos[lastIdx]], segSizes[segNos[lastIdx]], segSize, pageHeaders)
 		if scanErr != nil {
 			return 0, 0, scanErr
 		}
@@ -1402,11 +1427,11 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	for i := 0; i < len(segNos); i++ {
 		expected := firstSegNo + uint64(i)
 		if segNos[i] != expected {
-			return 0, 0, fmt.Errorf("wal: gap at segment %s", formatSegmentName(expected))
+			return 0, 0, fmt.Errorf("wal: gap at segment %s", FormatSegmentNameTLI(expected, runTLI))
 		}
 		sz := segSizes[expected]
 		if i < len(segNos)-1 && sz != segSize {
-			return 0, 0, fmt.Errorf("wal: non-final segment %s has size %d, expected %d", formatSegmentName(expected), sz, segSize)
+			return 0, 0, fmt.Errorf("wal: non-final segment %s has size %d, expected %d", FormatSegmentNameTLI(expected, segTLIs[expected]), sz, segSize)
 		}
 		if i < len(segNos)-1 {
 			writePos += sz
@@ -1417,7 +1442,7 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		// both legacy lazy-grown segments (writePos == sz, no
 		// trailing zeros) and preallocated full-size segments
 		// (writePos < sz, zero-fill tail).
-		usedBytes, lastRecPtr, scanErr := scanLastSegmentEnd(walDir, expected, sz, segSize, pageHeaders)
+		usedBytes, lastRecPtr, scanErr := scanLastSegmentEnd(walDir, expected, segTLIs[expected], sz, segSize, pageHeaders)
 		if scanErr != nil {
 			return 0, 0, scanErr
 		}
@@ -1460,8 +1485,17 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 // `pageHeaders=true` walks the file's interleaved page headers and
 // XLogRecord-framed bytes; `false` keeps the legacy flat record-stream
 // walk.
-func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, uint64, error) {
-	path := filepath.Join(walDir, formatSegmentName(segNo))
+//
+// `tli` is the timeline the segment file is actually named on, as read off
+// disk by detectWritePos — not an assumption. A base backup taken from a
+// promoted PG carries `00000002…` segments (M0130-S10 blocker #6); passing 0
+// keeps the historical TLI=1 behaviour for callers that have no timeline
+// context.
+func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, uint64, error) {
+	if tli == 0 {
+		tli = 1
+	}
+	path := filepath.Join(walDir, FormatSegmentNameTLI(segNo, tli))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, fmt.Errorf("wal: read %s: %w", path, err)

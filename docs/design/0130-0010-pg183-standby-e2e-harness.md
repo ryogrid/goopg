@@ -333,3 +333,89 @@ a goopg gap (multi-timeline reverse attach, S8), not a harness one. The
 harness now dumps the reverse standby's `cluster.log` on failure — it lives
 under `t.TempDir()`, which Go deletes before anyone can read the path the
 error prints.
+
+## 2026-08-10 addendum — blocker #6 fixed: TLI-blind segment-name recomposition in `detectWritePos`
+
+**Symptom.** Phase D's reverse attach never got as far as binding a listener:
+
+```
+goopg start: goopg: wal: wal: read <dir>/pg_wal/000000010000000000000002: no such file or directory
+```
+
+**Root cause.** Not the recovery-start LSN and not `backup_label` — it is a
+name-recomposition bug one layer down, in
+`internal/wal.detectWritePos` (`internal/wal/writer.go`), which every start runs
+to find the WAL write position on disk.
+
+`detectWritePos` scanned `pg_wal` with `parseSegmentName`, whose return value
+**discards the timeline** — it forwards to `ParseXLogFileName` and keeps only the
+segment number. Discovery therefore worked perfectly on a promoted PG's backup:
+the `00000002…` files were all found and sized. But the resulting
+`map[segNo]size` had no memory of which timeline each file was named on, and both
+consumers then re-derived the filename with `formatSegmentName`, which hardcodes
+`TLI=1`:
+
+- `scanLastSegmentEnd` — opens the last segment to walk it for the EOS sentinel
+  and the last record's start-LSN. This is the one that failed: `os.ReadFile` on a
+  filename that no promoted cluster ever writes.
+- the `gap at segment` / `non-final segment` diagnostics — cosmetic, but they
+  named a nonexistent file in the one situation where an operator most needs the
+  name to be real.
+
+The *reader* side has been TLI-tolerant since `openSegmentFile` (`reader.go`)
+grew its fallback scan: TLI=1 fast path, then any 24-character name whose
+log+seg suffix matches. The writer-side twin never got the same treatment — a
+textbook instance of Hard-won Rule #2 (sibling paths must change together), and
+the reason no goopg-only test could see it: goopg's own clusters never leave
+timeline 1, so `TLI=1` was correct for every input goopg itself produces.
+
+**Fix.** `detectWritePos` records the on-disk TLI per segment
+(`segTLIs map[uint64]uint32`, populated from `ParseXLogFileName`'s first return
+value) and threads it into `scanLastSegmentEnd`, which now takes a `tli` argument
+and composes its path with `FormatSegmentNameTLI` (`tli == 0` → 1, preserving the
+historical behaviour for callers without timeline context). When one segment
+number is present on several timelines — a promoted cluster keeps the pre-switch
+copy of the segment it switched inside of — the **highest** TLI wins, mirroring
+upstream `XLogFileReadAnyTLI`, which walks `expectedTLEs` newest-timeline-first
+(`postgres/src/backend/access/transam/xlog.c`). The segment-number arithmetic is
+untouched: `ParseXLogFileName` is called with `segSize=0` (→ `DefaultSegmentSize`)
+exactly as `parseSegmentName` did, because in this package segment *names* are
+always derived from `DefaultSegmentSize` regardless of the configured runtime
+segment size.
+
+**Guards.** `internal/wal/writer_detect_tli_test.go`:
+`TestDetectWritePos_PromotedTimelineSegments` builds real records through the
+writer, renames every segment onto timeline 2, and asserts the recovered
+`writePos` equals the last record's end LSN — content-derived, so it cannot be
+satisfied by merely not erroring. `TestDetectWritePos_PrefersHighestTimeline`
+puts the same segment number on both timelines with the TLI-1 copy zeroed to an
+identical length, so a TLI-blind implementation (which cannot tell the two files
+apart) reports the segment base instead. Both mutation-verified against a
+reverted `FormatSegmentNameTLI(segNo, 1)`; the first reproduces the production
+error string verbatim.
+
+**Result.** The reverse standby STARTS on the promoted PG's base backup for the
+first time: it opens the data dir, binds its listener, connects its walreceiver
+to the promoted PG on slot `s10_reverse`, and begins continuous replay. The
+harness now fails two steps later, at **blocker #7**:
+
+- *(harness)* the verification query `SELECT count(*) FROM pg_stat_replication
+   WHERE application_name = 's10_reverse'` is issued against the **promoted PG**,
+   which is running on goopg's catalog directory and therefore cannot evaluate
+   **any** view — `ERROR: cannot open relation "pg_stat_replication" / DETAIL:
+   This operation is not supported for views`. This is the already-documented
+   ruleless-`pg_internal.init` gap (the rewriter reads relcache `rd_rules`, which
+   a goopg-built `pg_internal.init` leaves empty, so row-level view evaluation is
+   refused while `pg_get_viewdef` still works). The harness must probe the
+   underlying set-returning function `pg_stat_get_wal_senders()` directly instead
+   of the view over it.
+The `walreceiver WALData start mismatch start_lsn=50200576 end_lsn=50331648
+expected_start_lsn=50253552` line that precedes the failure is **not** a second
+blocker: the promoted primary begins its stream at a segment boundary below
+goopg's requested start LSN, and `handleReplicationMessage`'s
+`m.StartLSN < expectedStart` arm already trims the leading bytes goopg holds
+(`internal/server/walreceiver.go`) — it logs at INFO and proceeds. The
+`control: immediate stop requested` right after it is the harness's own
+teardown, fired by the failed view query above.
+
+Blocker #7 is recorded in the deferral ledger; the fix_plan item stays open.

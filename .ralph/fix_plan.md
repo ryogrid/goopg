@@ -388,23 +388,47 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          (`internal/auth.nameListMatches`). The three rules are now emitted
          between the loopback `all` rules and the external `reject`
          catch-alls. Guard: `TestBuildPgHBAConf` (needles extended).
-      6. OPEN — Phase D now fails one step later, at
-         `reverseStandby.Start`: goopg refuses to start on the
-         PG-produced base backup with `wal: read
-         <dir>/pg_wal/000000010000000000000002: no such file or
-         directory`. The promoted PG is on **timeline 2**, so its backup's
-         pg_wal holds `00000002…` segments (plus the `.history` file);
-         goopg's startup WAL reader still resolves the segment name on
-         timeline 1. Resume: the recovery-start segment lookup must read
-         `pg_control`'s / the backup label's timeline (and consult
-         `00000002.history`) instead of assuming TLI 1 — see
-         `normalizePGWALSegmentNames` in the harness and goopg's WAL
-         segment-name resolution. Harness now dumps the reverse standby's
-         `cluster.log` on failure (it lives under `t.TempDir()`, which Go
-         deletes before anyone can look). Repro:
+      6. FIXED (2026-08-10) — **the reverse standby now STARTS on the
+         promoted PG's base backup, binds its listener, connects its
+         walreceiver on slot `s10_reverse` and begins continuous replay.**
+         The failure (`wal: read <dir>/pg_wal/000000010000000000000002: no
+         such file or directory`) was NOT recovery-start-LSN logic: it was
+         TLI-blind filename recomposition in `internal/wal.detectWritePos`.
+         Discovery used `parseSegmentName`, which DISCARDS the timeline, so
+         the promoted PG's `00000002…` segments were found and sized
+         correctly — but the resulting `map[segNo]size` remembered no
+         timeline and `scanLastSegmentEnd` (plus the `gap at segment` /
+         `non-final segment` diagnostics) re-derived the name with
+         `formatSegmentName`, hardcoded to TLI=1. Invisible to goopg-only
+         testing because goopg's own clusters never leave timeline 1. The
+         reader side had been TLI-tolerant since `openSegmentFile`'s
+         fallback scan — Hard-won Rule #2 again. Fix: `segTLIs` map
+         populated from `ParseXLogFileName`, threaded into
+         `scanLastSegmentEnd` (`FormatSegmentNameTLI`); highest TLI wins on
+         a collision, mirroring upstream `XLogFileReadAnyTLI`'s
+         newest-first `expectedTLEs` walk. Guards:
+         `TestDetectWritePos_PromotedTimelineSegments` (content-derived) +
+         `TestDetectWritePos_PrefersHighestTimeline`, both
+         mutation-verified; the first reproduces the production error
+         string verbatim.
+      7. OPEN — Phase D's verification query `SELECT count(*) FROM
+         pg_stat_replication WHERE application_name = 's10_reverse' AND
+         state = 'streaming'` runs against the PROMOTED PG and fails with
+         `ERROR: cannot open relation "pg_stat_replication" / DETAIL: This
+         operation is not supported for views`. A real PG on a goopg-built
+         catalog cannot evaluate ANY view: the rewriter reads relcache
+         `rd_rules`, which goopg's `pg_internal.init` leaves empty, so
+         `pg_rewrite` is never scanned (pre-existing, separately ledgered
+         ruleless-init gap; `pg_get_viewdef` works). Resume: probe the
+         underlying SRF `pg_stat_get_wal_senders()` instead of the view
+         (`internal/testport/e2e_pg183_standby_full_cycle_test.go`);
+         populating `rd_rules` is the real engine fix and stays on the
+         ruleless-init ledger row. NOTE the `walreceiver WALData start
+         mismatch` INFO line before the failure is NOT a blocker — the
+         `m.StartLSN < expectedStart` arm already trims. Repro:
          `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`.
          Design: addenda in
-         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 4 rows.
+         `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 6 rows.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —

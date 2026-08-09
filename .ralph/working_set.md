@@ -1,42 +1,48 @@
-(idle — nothing in flight)
+Task: M-NIGHTLY AI-20260810-011258-003 (TestE2E_PGStandbyFullCycle) — blocker #6
+FIXED and committed. The fix_plan item STAYS OPEN — blocker #7 now gates Phase D.
 
-Last loop: M-NIGHTLY AI-20260810-011258-003 blocker #3 (`pg_attrdef`
-catalog completeness) FIXED and committed. The fix_plan item STAYS OPEN —
-a NEW blocker #4 now gates Phase D.
+Landed:
+- `internal/wal/writer.go`: `detectWritePos` records the on-disk TLI per segment
+  (`segTLIs`, from `ParseXLogFileName`) and threads it into `scanLastSegmentEnd`
+  (new `tli` param, `FormatSegmentNameTLI`; 0 → 1) and the `gap`/`non-final`
+  diagnostics. Highest TLI wins on collision (mirrors upstream
+  `XLogFileReadAnyTLI`'s newest-first `expectedTLEs` walk). KEY FACT: discovery
+  never lost the segments — `parseSegmentName` DISCARDS the TLI, and every
+  filename recomposition assumed TLI=1, so goopg did `os.ReadFile` on
+  `000000010000000000000002` in a dir holding only `00000002…` files. Segment
+  ordinals unchanged (`ParseXLogFileName(name, 0)`, same as before).
+- New guards `internal/wal/writer_detect_tli_test.go`:
+  `TestDetectWritePos_PromotedTimelineSegments` (real records via the writer,
+  segments renamed to TLI 2, content-derived assert) +
+  `TestDetectWritePos_PrefersHighestTimeline` (same segNo on both timelines,
+  TLI-1 copy zeroed to identical length). Both mutation-verified; the first
+  reproduces the production error string verbatim.
 
-Landed (3 causes, one commit):
-1. Indexes 2656 (adrelid,adnum) / 2657 (oid) were never materialized —
-   added to `nailedLocalRels` (initdb/relcache_init.go),
-   `pgIndexInitialEntries` (initdb/initdb.go) and all three critical-index
-   placeholder lists (base/1, base/5, global).
-2. `pgAttrdefAttrs()` had 3 attrs while the heap writer wrote 4 — added
-   `adbin` (pg_node_tree/194), relnatts 3→4. pg_attrdef is NOT formrdesc'd,
-   so PG rebuilds its TupleDesc from the streamed pg_attribute rows for 2604.
-3. `mirrorTouchedCatalogsToPostgresDB` did not mirror 2604/2656/2657 into
-   base/5 — a `dbname=postgres` standby read an empty heap and downgraded to
-   `WARNING: 1 pg_attrdef record(s) missing`. THIS was the last 20% and is
-   the non-obvious one: goopg writes user catalog rows to base/1 and mirrors
-   a FIXED LIST of rels to base/5.
-Runtime entries: `writeAttrdefRow` → insertPgAttrdefAdrelidAdnumIndexEntry /
-insertPgAttrdefOidIndexEntry (key shapes identical to 2659 / 2662).
+Result: the reverse standby STARTS on the promoted PG's base backup for the
+first time — opens the data dir, binds, connects its walreceiver on slot
+`s10_reverse`, begins continuous replay.
 
-Result: TestE2E_PGStandbyFullCycle Phases A, B and C now PASS. Phase C
-(failover + promote) had never executed in any prior loop.
+NEXT (blocker #7, fix_plan item 7): the harness's verification query
+`SELECT count(*) FROM pg_stat_replication WHERE application_name='s10_reverse'
+AND state='streaming'` runs against the PROMOTED PG and gets
+`ERROR: cannot open relation "pg_stat_replication" / DETAIL: This operation is
+not supported for views` — a real PG on a goopg-built catalog cannot evaluate
+ANY view (empty relcache `rd_rules`; pre-existing ledgered ruleless-init gap).
+Resume: probe the underlying SRF `pg_stat_get_wal_senders()` instead of the view
+in `internal/testport/e2e_pg183_standby_full_cycle_test.go:~250`. The
+`walreceiver WALData start mismatch` INFO line before it is NOT a blocker —
+`m.StartLSN < expectedStart` already trims. Repro:
+`go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/` (~6 s).
 
-NEXT (blocker #4, fix_plan item 4): Phase D fails because the PROMOTED PG
-rejects `SELECT pg_create_physical_replication_slot('s10_reverse')` —
-`function ...(unknown) does not exist`. PG 18's signature is
-(slot_name name, immediately_reserve bool DEFAULT false, temporary bool
-DEFAULT false); goopg's pg_proc seed for OID 3779/3780 has no
-pronargdefaults/proargdefaults, so PG cannot resolve the 1-arg form.
-May need an internal/pgnodes List IR node first (same gap as stxexprs).
+Gates run: internal/wal full package PASS (5.5 s), detectWritePos suite PASS +
+both new tests mutation-verified, `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS, TLI-1 non-regression
+`TestE2E_FailoverGoopgToPG` / `TestKillKillRecovery` /
+`TestPort_PublicationSurvivesRestart` PASS (7.4 s), `make ralph-state-guard` OK
+(auto-repaired the stale completed marker), commit-hook pgbench smoke PASS.
+TestE2E_PGStandbyFullCycle still FAILS at blocker #7 (expected).
 
-Gates run: internal/initdb PASS (56 s), internal/executor PASS,
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS,
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35), commit-hook pgbench smoke,
-`make ralph-state-guard` OK (auto-repaired the stale completed marker).
-
-Ledger: 1 row, 3 deferrals (pg_proc defaults; stale 2656/2657 leaf entries on
-ALTER re-sync; pg_inherits 2611/2680 has the SAME base/5 mirror gap).
+Ledger: 2 new rows (blocker #6 landed + the history-driven TLI resolution still
+missing; blocker #7 diagnosis).
 
 In-flight: none.
