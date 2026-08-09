@@ -2786,6 +2786,12 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) {
 	if p.acceptKeyword(KwNot) {
 		_ = p.acceptKeyword(KwDeferrable)
+		// Optionally consume INITIALLY {IMMEDIATE|DEFERRED} — pg_dump
+		// emits NOT DEFERRABLE INITIALLY IMMEDIATE as two independent
+		// constraint attributes. DU-002.
+		if p.acceptIdentKeyword("initially") {
+			_ = p.acceptIdentKeyword("immediate") || p.acceptIdentKeyword("deferred")
+		}
 		return
 	}
 	if p.acceptKeyword(KwDeferrable) {

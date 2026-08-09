@@ -138,6 +138,11 @@ func TestParseCreateConstraintTrigger(t *testing.T) {
 			wantConstraint: true,
 		},
 		{
+			name:           "constraint trigger not deferrable initially immediate",
+			sql:            "CREATE CONSTRAINT TRIGGER c2a AFTER UPDATE ON tbl NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint: true,
+		},
+		{
 			name:             "constraint trigger deferrable initially deferred",
 			sql:              "CREATE CONSTRAINT TRIGGER c3 AFTER DELETE ON tbl DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION f()",
 			wantConstraint:   true,
