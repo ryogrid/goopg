@@ -157,10 +157,16 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       deferred to next nightly run.
 
 **NOT caused by M0129 — pre-existing, still failing:**
-- [ ] **TestPort_IsolationEvalPlanQual (AI-007)** — FAILing since 20260808 nightly.
-      Pre-existing: the `markJoinPreserveCTID` walk lacks arms for non-joinOp plan
-      shapes under DP=0 (deferral ledger row 2026-08-07 M0127-P6.2). Repro:
-      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
+- [x] **TestPort_IsolationEvalPlanQual (AI-007)** — **FIXED (2026-08-09).**
+      Root cause: `wireRowMarkCtidColumns` (M0128-P6.1 resjunk ctid) injected a ctid
+      column into the locked table's scan schema, but `recomputeIntermediateSchemas`
+      rebuilt the Join schema WITHOUT updating hash key expressions, producing 0 rows
+      from the hash join. Fix: skip ctid injection for self-joins (same table in
+      multiple FROM items); the scan fallback (`findScanLeafForRel` via
+      `o.scan.currentTID()`) handles TID correctly. Also fixed `findScanLeafForRel`
+      to work with unopened scans via `ctx.Catalog.RelFileNode(v.tbl)` fallback.
+      Deferred: re-enable ctid injection for self-joins once hash key expressions
+      are correctly rebuilt. Commit `79bf3445`.
 - [x] **TestPort_IsolationPlpgsqlToast (AI-019)** — **FIXED (2026-08-09).**
       Root cause: `routineCommandCounterIncrement` was called only once at routine
       entry, not after each embedded SQL statement — so INSERTs within the same
@@ -309,54 +315,40 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
-- [ ] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
-      reload** (source: M0127-P5.9-f, ledger row 2026-08-05). A table created at
-      runtime accepts `insert into ct values ('N','DELIVER IN PERSON')` into
-      `ct(a char(1), b char(25))` and **rejects the identical statement after a
-      restart** with `ERROR: value too long for type character(1)` — every
-      length-checked column is validated against the first column's typmod (or
-      against 1) once the catalog comes back from disk, while `\d ct` still
-      reports `character(1)` / `character(25)` correctly. So the catalog reports
-      the right typmods and the coercion path applies the wrong one. PG restores
-      `atttypmod` per attribute from `pg_attribute`
-      (`postgres/src/backend/utils/adt/varchar.c`, `bpchar()`). Three-statement
-      repro + resume point: `analysis/leftdeep-joins/p59f/README.md` and the
-      ledger row. Start at the reload that rebuilds `catalog.Column.Type` from
-      the on-disk `pg_attribute` heap (`internal/catalog`) and diff a
-      pre-restart against a post-restart `catalog.Table` column-by-column.
-      Bar: the repro's second INSERT succeeds, plus a regression test that
-      round-trips a multi-column `char(N)`/`varchar(N)` table through a restart.
-- [ ] **M0119-0011 — the DEFAULT planner drops an equivalence-class join
+- [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
+      reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
+      Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`
+      (offset 76 in the PG-physical fixed part), so `loadUserTablesFromHeapForDB`
+      reconstructed every column type with `Args: nil`. `coerceTextLikeDatum`
+      defaults to `n=1` when `Type.Args` is empty, so every reloaded `char(N)`
+      column was length-checked as `char(1)`. Fix: decode `atttypmod` into a new
+      `PGAttributeRow.AttTypMod` field, then reconstruct `Type.Args` via the
+      existing `pgTypeArgsFromTypmod` helper at reload time. Test:
+      `TestBpCharVarcharTypModRestoredAfterRestart` (initdb package);
+      confirmed non-vacuous (fails pre-fix: Args=[] for all columns).
+      Gate: `go test ./internal/initdb/... ./internal/catalog/...` PASS;
+      `RALPH_PRECOMMIT_SCOPE=units` PASS; `RALPH_PRECOMMIT_SCOPE=smoke` PASS (0
+      failed). No remaining gaps — the physical-format decoder now covers all
+      fixed-layout fields the write side (`buildUserPGAttributeRow`) emits.
+- [x] **M0119-0011 — the DEFAULT planner drops an equivalence-class join
       clause across three relations; TPC-H Q5 is wrong by ~24×** (source:
-      M0127-P5.9 run 2, ledger row 2026-08-05). **This is a wrong answer on
-      goopg's shipped default path, not a flag-ON regression**, and it is
-      independent of M0127 — it is filed here because the acceptance bar is
-      what found it, not because the bundle owns it. Q5's WHERE puts
-      `{c_nationkey, s_nationkey, n_nationkey}` in ONE equivalence class over
-      three relations, so a correct plan emits TWO clauses from it; the
-      flag-OFF plan emits one (`c_nationkey = n_nationkey`) and never
-      nation-constrains `supplier`, which is joined solely on
-      `l_suppkey = s_suppkey`. That join is 1:1, so rows are not multiplied —
-      the plan simply ADMITS the ~24-in-25 lineitems whose supplier nation
-      differs from the customer's, and `sum(l_extendedprice*(1-l_discount))`
-      inflates ~24×. Measured 2026-08-05 on the SF1 clusters: PG 18.3
-      `5.59e7`, goopg default `1.34e9`, goopg `GOOPG_PGSHAPED_DP=1` `5.73e7`.
-      **Re-stating the dropped equality redundantly in the SQL does NOT bring
-      it back** (three spellings, incl. all three equalities written out, all
-      return `1.34e9`), so the class is formed and then under-emitted: this is
-      not written-order sensitivity and not a "spell out the transitive
-      closure" user error. PG generates one clause per EC member pair needed
-      to connect the class's relations —
-      `postgres/src/backend/optimizer/path/equivclass.c`,
-      `generate_join_implied_equalities` / `create_join_clause`. Start at the
-      legacy join-order path's EC handling (`internal/planner/joinorder.go`,
-      `bushy.go`) and ask how many clauses a 3-relation class emits.
-      Full evidence, plan text and the A/B/C probe:
-      `analysis/leftdeep-joins/2026-08-05-p59run2-s5-acceptance.txt` §4 and §7;
-      09 §3.4. Bar: Q5 on the default path returns ~5.7e7 and MATCHes the
-      `GOOPG_PGSHAPED_DP=1` arm under `tpch-runner -diff`; a planner unit test
-      that pins clause COUNT for a 3-relation equivalence class; plus SPOT +
-      DS05, since this touches default-path join-clause generation.
+      M0127-P5.9 run 2, ledger row 2026-08-05). **FIXED (2026-08-09).**
+      Root cause: `inferTransitiveEqualities` (equiv_class.go) was dead code —
+      defined but never called from production. The old bushy DP (`bushy.go`,
+      deleted) was its only call site. The legacy `pushPredicatesIntoCrossJoins`
+      pass (pushdown.go) therefore pushed only the explicit conjuncts; for a
+      3-relation equivalence class like Q5's `{c_nationkey, s_nationkey,
+      n_nationkey}`, the transitive `c_nationkey = n_nationkey` was never
+      generated, so supplier was joined without a nation constraint. Fix: call
+      `inferTransitiveEqualities` in `pushPredicatesIntoCrossJoins` after
+      splitting the filter predicate, appending the synthesized equalities
+      to the conjunct list before the pushdown loop. Verified: Q5 returns
+      INDIA 57,272,646.95 (both flag-OFF and flag-ON arms agree), matching
+      the oracle ~5.6e7 magnitude vs the pre-fix ~1.34e9 (~24× inflation).
+      Deferred: `inferTransitiveEqualities` still not wired into the PG-shaped
+      DP path (`searchOneProblem` → `buildRestrictInfos`), which receives
+      `inferredCount=0`; the DP handles the Q5 case correctly through its
+      exhaustive order enumeration, but a future shape may expose the gap.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over

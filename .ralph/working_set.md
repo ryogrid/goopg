@@ -1,36 +1,37 @@
-Task: M-NIGHTLY AI-007 EvalPlanQual — partial fix, updwctefail still not erroring
+Task: M0119-0010 — char(N) typmods not restored per column on catalog reload — FIXED
 
 Files:
-- internal/executor/operators_storage.go: `updateWithFrom` — two TM_SelfModified checks added:
-  1. pre-HOT RLock probe (before HOT attempt, catches HOT-path bypass)
-  2. non-EPQ else branch (after isConcurrentlyUpdated returns false)
+- internal/catalog/codec.go: added pgAttributeOffTypMod=76 constant,
+  AttTypMod int32 field on PGAttributeRow, decoding in
+  DecodePGAttributePhysicalRow at offset 76.
+- internal/initdb/open.go: loadUserTablesFromHeapForDB now calls
+  pgTypeArgsFromTypmod(typOID, ar.AttTypMod) to reconstruct Type.Args.
+- internal/initdb/heap_catalog_load_test.go: added
+  TestBpCharVarcharTypModRestoredAfterRestart regression test.
 
-Key symbols: updateWithFrom, tryApplyHOTUpdate, errTupleAlreadyModified, isConcurrentlyUpdated
+Key symbols: PGAttributeRow.AttTypMod, DecodePGAttributePhysicalRow,
+loadUserTablesFromHeapForDB, pgTypeArgsFromTypmod, coerceTextLikeDatum
 
 Hypothesis/Findings:
-- delwctefail NOW errors (confirmed by previous loop's 1458→1462 improvement).
-  My changes did not regress this (verified: line count stable at 1462).
-- updwctefail STILL does NOT error (1462 vs 1468 expected, 6 lines short).
-  The TM_SelfModified checks added to updateWithFrom (pre-HOT probe + non-EPQ
-  else branch) are NOT reached during the test. Root cause unknown — the
-  checking row's xmax at the probed slot is not our XID, or the code path
-  through scanMatching→pending→HOT/non-HOT does not encounter the pre-image
-  tuple. The test permutation is multi-session (wx1 updwctefail c1 c2 read),
-  so the EPQ wait+retry may alter the tuple state before my checks run.
-- A third check was attempted inside tryApplyHOTUpdate (serena) but was
-  reverted — it used position 0 for the error, and adding a `pos` parameter
-  to the shared helper would be needed for a clean fix there.
+- ROOT CAUSE: DecodePGAttributePhysicalRow never decoded atttypmod
+  (offset 76), so loadUserTablesFromHeapForDB set Args: nil on every
+  column. coerceTextLikeDatum defaulted to n=1, so every reloaded
+  char(N) was length-checked as char(1).
+- FIX: 3 lines of code + 1 test. pgTypeArgsFromTypmod already existed
+  for the domain-reload path (catalog_heap_reload.go:1216); reused it.
+- Verified non-vacuous: stash revert → test fails with Args=[] for all
+  3 columns.
 
-Next step: Debug why the updateWithFrom TM_SelfModified checks aren't reached.
-Add server-side logging to trace the tuple's xmax at the pre-HOT RLock probe
-and at the non-EPQ else branch. The EPQ chain resolution (after wx1 commits)
-may route the update to a different slot where xmax is Invalid.
+Next step: Per Current Priority banner, M-NIGHTLY is next (all items are
+checked [x] — verify the restart-failure-cascade infrastructure item
+or move on). Then M0119-0004 (pg_dump TAP), M0119-0005 (pg_waldump),
+M0119-0006 (pg_amcheck), M0119-0007 (recvlogical — blocked).
 
 Gates run:
-- `go build ./internal/executor/...`: PASS
-- `go test ./internal/executor/...`: PASS (6.077s)
-- `scripts/tpch-spotcheck.sh`: PASS (Q12=2, Q13=35)
-- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`: PASS
-  (0 failed, all 3 workloads)
+- go test ./internal/initdb/...: PASS (including new test, ~57s)
+- go test ./internal/catalog/...: PASS (cached)
+- go test ./internal/executor/...: PASS
+- RALPH_PRECOMMIT_SCOPE=units: PASS
+- RALPH_PRECOMMIT_SCOPE=smoke: PASS (0 failed, all 3 workloads)
 
 In-flight: none
