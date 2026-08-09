@@ -281,6 +281,23 @@ func TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent(t *te
 	// two-step (reserve then setInsertingAt) admitted a window where
 	// curr was advanced but the stripe slot still read lsnIdle — the
 	// new joint-atomic primitive forbids that window.
+	//
+	// Non-vacuity (AI-20260810-011258-001). The assertion only does real
+	// work on a snapshot that catches a stripe mid-flight (v != lsnIdle),
+	// so that — not "the reader ran at all" — is what has to be proven to
+	// have happened. Two scheduling hazards left it vacuous, and the old
+	// `observed > 0` guard covered only the first:
+	//  1. the reader goroutine could stay unscheduled until after
+	//     close(stop) and take zero snapshots. This is what reddened the
+	//     nightly race-gate; it reproduces on 100% of runs under
+	//     GOMAXPROCS=1 -race, and intermittently at full package load.
+	//  2. even once scheduled, the reader could be starved across the
+	//     entire (sub-millisecond) write burst and take only snapshots of
+	//     idle stripes — `observed > 0` holds, yet nothing was asserted.
+	// Both are now closed by construction rather than left to chance: the
+	// writers do not start until the reader is confirmed live, and the
+	// burst repeats until the reader has actually witnessed a stripe in
+	// flight.
 	const (
 		segSize    uint64 = 1 << 24
 		workers           = 8
@@ -291,23 +308,15 @@ func TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent(t *te
 	tr := newInsertionTracker()
 
 	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		w := w
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
-				_, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
-				tr.setInsertingAt(w, lsnIdle)
-			}
-		}()
-	}
-
-	var observed int64
+	// witnessed counts only snapshots that caught at least one stripe
+	// mid-flight, i.e. snapshots on which the assertion below was
+	// evaluated non-trivially.
+	var witnessed int64
+	readerLive := make(chan struct{})
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
+		live := readerLive
 		for {
 			select {
 			case <-stop:
@@ -316,24 +325,61 @@ func TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent(t *te
 			}
 			pos.posMu.Lock()
 			curr := pos.curr
+			inFlight := false
 			for s := 0; s < appendLockStripes; s++ {
 				v := tr.insertingAt(s)
-				if v != lsnIdle && uint64(v) >= curr {
-					t.Errorf("snapshot violation: stripe %d insertingAt=%d, curr=%d",
-						s, v, curr)
+				if v != lsnIdle {
+					inFlight = true
+					if uint64(v) >= curr {
+						t.Errorf("snapshot violation: stripe %d insertingAt=%d, curr=%d",
+							s, v, curr)
+					}
 				}
 			}
 			pos.posMu.Unlock()
-			atomic.AddInt64(&observed, 1)
+			if inFlight {
+				atomic.AddInt64(&witnessed, 1)
+			}
+			if live != nil {
+				close(live)
+				live = nil
+			}
 		}
 	}()
 
-	wg.Wait()
+	// Hazard 1: block until the reader has completed a snapshot, so it is
+	// known to be running rather than merely spawned.
+	<-readerLive
+
+	// Hazard 2: repeat the burst until the reader has caught a writer in
+	// flight. Each round is the original workers x perWorker workload; the
+	// round bound exists only so a wedged reader fails the test rather
+	// than hanging it.
+	const maxRounds = 200
+	rounds := 0
+	for ; rounds < maxRounds && atomic.LoadInt64(&witnessed) == 0; rounds++ {
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			w := w
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perWorker; i++ {
+					_, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
+					tr.setInsertingAt(w, lsnIdle)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
 	close(stop)
 	<-readerDone
 
-	if atomic.LoadInt64(&observed) == 0 {
-		t.Fatalf("reader took zero snapshots — race-closure assertion vacuously true")
+	if atomic.LoadInt64(&witnessed) == 0 {
+		t.Fatalf("reader never caught a stripe in flight across %d rounds of %dx%d "+
+			"reservations — race-closure assertion vacuously true",
+			rounds, workers, perWorker)
 	}
 }
 

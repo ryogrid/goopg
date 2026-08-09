@@ -1,44 +1,51 @@
 (idle — nothing in flight)
 
-Last loop: M0119-0006 13th slice — B-tree key encodings for `int2`/`oid`/`bool`/
-`bytea`/`time`. COMPLETE and committed, pushed.
+Last loop: M-NIGHTLY AI-20260810-011258-001 (`race/internal/wal`). COMPLETE,
+committed, pushed. Nightly batch 20260810-011258 (6 items) fully FILED first.
 
-The defect: `isSupportedBTreeKeyType` rejected all five, so `CREATE INDEX` (even
-a `PRIMARY KEY (smallint_col)`) raised `0A000 btree v0 only supports int4 /
-numeric keys`. Not a corner — pg_amcheck's own upstream fixtures index `oid`.
+The discovery: the red race-gate was not a data race and not an invariant
+violation — it was the race-closure test's own non-vacuity guard firing
+(`reader took zero snapshots`). Two hazards, and the guard covered only one:
+(1) the reader goroutine was spawned AFTER the writers, whose 8x500
+reservations finish in well under a millisecond, so the reader could see
+`stop` already closed on its first iteration; (2) `observed > 0` counted loop
+iterations, but the assertion only does work on a snapshot catching a stripe
+mid-flight — a scheduled-but-starved reader satisfied the guard while
+asserting nothing.
 
-Fix: new `internal/executor/btree_scalar_keys.go` — predicates + one encoder
-(`encodeScalarBTreeKey`, routed from `encodeBTreeKeyForColumn` before its type
-switch), one unknown-literal coercer (`coerceScalarKeyStringDatum`, reusing
-`byteaIn`/`parseTimeString`/`evalCast`), one decoder (`decodeScalarBTreeKey`)
-that BOTH key-decode siblings (`decodeIndexKeyColumn`, `decodeBTreeKeyToDatum`)
-route to before their own switches — their shared `default:` arm reads any 8
-leading bytes as an enum float8 and never errors, so an 8-byte oid/time key would
-otherwise decode as a bogus enum. Orders reproduce the default opclass, NOT the
-text: **oid widens to the INT8 key because `oidcmp` is UNSIGNED** (int4 would
-sort OIDs ≥ 2³¹ below OID 0); bytea rides `EncodeVarchar` (escaped,
-0x00-terminated = `byteacmp` memcmp-then-shorter-first, NUL-safe, composite-safe);
-time = int64 micros-of-day. `timetz` DECLINED (two-part comparison).
+Load-bearing detail: it reproduces on 100% of runs under `GOMAXPROCS=1 -race`
+but passes 200/200 in isolation at default GOMAXPROCS. That asymmetry is why
+it escaped review, and it is the cheapest probe for this whole bug family.
+General lesson (recorded in the design doc): a non-vacuity guard must count
+executions of THE ASSERTION, not iterations of the loop containing it.
 
-Method note: the PG reference cluster was already running — connect by ABSOLUTE
-socket path: `postgres/local_install/bin/psql -h
-/home/ryo/work/goopg/goopg/bench/tpch/runtime/sockets -p 65432 -U postgres -d
-tpch` (a relative `-h` is treated as a hostname and fails to resolve).
+Files: `internal/wal/reserve_emitted_test.go` only — `reserve_emitted.go` is
+untouched (test-only fix). Fix is by construction, not by luck: writers wait
+on a `readerLive` signal the reader sends after its first completed snapshot,
+and `witnessed` counts only snapshots that caught a non-idle stripe, with the
+write burst repeating (bounded 200 rounds) until `witnessed > 0`.
 
-Design: `docs/design/0119-0006-scalar-index-key-encodings.md` (+ README row
-`0119-0006h`). 2 ledger rows (timetz; and the INSERT-path gap this surfaced —
-`VALUES ('true')` into a bool column raises XX000, codec bool arm demands
-KindBool).
+Design: addendum in `docs/design/0107-0007aa-wal-reserve-emitted.md` (+ README
+row 0107-0007aa amended). Ledger: 1 new row (race-gate still red on a separate
+cause — see below).
 
-Gates run: 6 new tests PASS, non-vacuous (routing disabled ⇒ all fail);
-`go test ./internal/executor/ ./internal/access/btree/ ./internal/planner/` PASS;
-units precommit PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35);
-pgbench hook PASS at commit; `make ralph-state-guard` OK (auto-repaired the stale
-completed marker).
+Gates run: mutation-verified BOTH directions — stripe published at `curr`
+=> assertion fires under GOMAXPROCS=1 (where the OLD test took zero
+snapshots); `perWorker = 0` => new guard fires (the OLD guard passes this).
+`go test -race ./internal/wal/` PASS at default GOMAXPROCS and at
+GOMAXPROCS=1; `-count=50` GOMAXPROCS=1 on the target test PASS; units
+precommit PASS; pgbench commit hook PASS. `make race-gate` still FAILS — on
+`internal/mctx` TestMultipleChunks, NOT on wal.
 
 NEXT LOOP (state, not authority — re-read the `## Current Priority` banner).
-M0130 all `[x]`; M-NIGHTLY run 20260809-020705 fully triaged (all 49 filed/closed).
-Remaining M0119-0006: checkunique posting-list duplicates, `box`/`int4range`/
-`interval`/`timetz` encodings, the array DECODE arm, unscoped whole-DB pg_amcheck.
+M0130 all `[x]`, so M-NIGHTLY selection is unblocked and is the top milestone.
+5 nightly items remain unchecked, plus the newly-filed mctx flake. Strongest
+candidate: **race/internal/mctx TestMultipleChunks** — it is what still reds
+`make race-gate`, and it is diagnosed to a resume point already
+(`Acquire(nil, KindStmt)` assumes a pristine pooled context; assert against
+`c.cs`, not `defaultChunkSize`). Note AI-...-004 (IsolationMergeUpdate) is
+likely STALE — re-run at HEAD before investigating. The pgbench item is the
+highest-value engine item: clients abort with an error that is NOT itself in
+the log, and the run still prints `0 failed`.
 
 In-flight: none.

@@ -253,6 +253,78 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       One ledger row (goopg never allocates combo CIDs — `mvcc.AdjustCmax` has
       no non-test callers, so a same-transaction insert-then-delete loses cmin).
 
+### Nightly run 20260810-011258 (sha `367d0df1`) — filed 2026-08-10
+
+- [x] **race/internal/wal** — race suite failed in `internal/wal`
+      (AI-20260810-011258-001; repro: `go test -race -timeout 15m
+      ./internal/wal/`). **REAL (a test defect, not an engine defect) — FIXED
+      2026-08-10.** Not a data race and not an invariant violation: the failure
+      was
+      `TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`'s
+      own non-vacuity guard, `reader took zero snapshots`. Two hazards, of
+      which the guard covered only the first. (1) The reader goroutine was
+      spawned *after* the writers, and the 8×500 reservations complete in well
+      under a millisecond, so the reader could observe `stop` already closed on
+      its first loop iteration — reproduces on **100% of runs under
+      `GOMAXPROCS=1 -race`**, intermittently at full package load, yet passes
+      200/200 in isolation at default GOMAXPROCS, which is how it escaped
+      review. (2) `observed > 0` was the wrong invariant: the assertion body
+      only does work on a snapshot that catches a stripe mid-flight
+      (`v != lsnIdle`), so a scheduled-but-starved reader satisfied the guard
+      while asserting nothing — the old guard passes a mutation where the
+      writers perform zero reservations. Both closed by construction: writers
+      wait on a `readerLive` signal the reader sends after its first completed
+      snapshot, and `witnessed` counts only snapshots that caught a non-idle
+      stripe, with the burst repeating (bounded at 200 rounds) until
+      `witnessed > 0`. Mutation-verified both directions (stripe published at
+      `curr` → assertion fires under GOMAXPROCS=1, where the OLD test took zero
+      snapshots; `perWorker = 0` → guard fires). Test-only change;
+      `reserve_emitted.go` untouched. Design: addendum in
+      `docs/design/0107-0007aa-wal-reserve-emitted.md` (+ README row).
+- [ ] **race/internal/mctx — `TestMultipleChunks` load-sensitive flake**
+      (discovered 2026-08-10 while verifying the item above; NOT in the nightly
+      log — it passed there). `make race-gate` still reds on
+      `mctx_test.go:139: second chunk: got ""`. Does not reproduce in isolation
+      (100/100 PASS at default GOMAXPROCS and at GOMAXPROCS=1); only under
+      full-package load, same shape as the wal flake. Hypothesis: the test does
+      `Acquire(nil, KindStmt)` and then assumes *pristine pooled state* — that
+      allocating `defaultChunkSize` will force a chunk boundary
+      (`off1/c.cs != off2/c.cs`). If a concurrently-running test returned a
+      recycled context whose chunk size `c.cs` had already been grown by a
+      large-alloc, that assumption breaks and `c.Bytes(off2, len2)` addresses
+      out of range → `""`. Resume point: `internal/mctx/mctx_test.go:126`
+      `TestMultipleChunks` — assert against `c.cs` rather than
+      `defaultChunkSize`, or acquire a context with a pinned chunk size.
+- [ ] **testport/TestE2E_FailoverGoopgToPG** — FAILed, subtest
+      `sync_remote_apply` (AI-20260810-011258-002; repro: `go test -v -run
+      '^TestE2E_FailoverGoopgToPG$' ./internal/testport/`). New tonight;
+      exercises the M0130-S10 standby harness.
+- [ ] **testport/TestE2E_PGStandbyFullCycle** — FAILed
+      (AI-20260810-011258-003; repro: `go test -v -run
+      '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`). New tonight; this
+      is the M0130-S10 four-phase harness test itself.
+- [ ] **testport/TestPort_IsolationMergeUpdate** — FAILed
+      (AI-20260810-011258-004; repro: `go test -v -run
+      '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **Likely STALE**
+      — the nightly ran at sha `367d0df1`; the cross-partition-UPDATE cmax fix
+      for the identical subject (AI-20260809-020705-018, above) landed
+      2026-08-10. Re-run at HEAD before investigating.
+- [ ] **testport/TestPort_PublicationSurvivesRestart** — FAILed
+      (AI-20260810-011258-005; repro: `go test -v -run
+      '^TestPort_PublicationSurvivesRestart$' ./internal/testport/`). New
+      tonight.
+- [ ] **pgbench/nightly** — 79 failed transactions in the *standard* (simple
+      update) stage (AI-20260810-011258-006; repro: `REPO_ROOT=$PWD
+      RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`, s=50 c=100
+      j=20 T=180). New tonight. Clients abort at ~40 s with `ERROR: current
+      transaction is aborted, commands ignored until end of transaction block`
+      at script command 4 — i.e. the *originating* error happened in an earlier
+      command of the same transaction and is not itself in the log. Note the
+      run summary still prints `0 failed` because aborted clients are dropped
+      rather than counted, and TPS then *rises* (7.6k→14.5k) as ~50 of 100
+      clients die — the failure is silent in the headline numbers. The `-S`
+      select-only stage is clean, so it is write-path specific.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 _(completed `[x]` milestones archived → `completed_milestones/completed_fix_plan_011.md`)_
