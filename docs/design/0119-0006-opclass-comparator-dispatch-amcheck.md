@@ -79,8 +79,8 @@ rationale above.
 Called from `evalBtIndexCheck` and threaded through `btIndexVerify`. It returns
 non-nil only when all of the following hold:
 
-1. the index has no `INCLUDE` columns and every key column is a plain
-   (non-expression) column resolvable in `idx.Table.Columns`;
+1. every key column is a plain (non-expression) column resolvable in
+   `idx.Table.Columns`;
 2. **at least one** key column declares an explicit operator class
    (`idx.ColOpClasses[i]`) that resolves through seam 2 to a routine
    (`Routines().LookupByOID`) taking two arguments.
@@ -122,12 +122,20 @@ Two deliberate fallbacks to byte order inside the comparator:
 `decodeIndexKeyColumn`, so every type that decoder inverts, in any position of a
 composite key, dispatches to its declared opclass.
 
+**2026-08-10 (fourth slice — `INCLUDE`).** Covering indexes are no longer
+declined. The earlier slices assumed goopg's covering-key layout was outside the
+decoder's contract; it is not — goopg builds a stored B-tree key from the **key**
+columns alone (`encodeCompositeBTreeKey` / the unique-index key builder in
+`operators_storage.go` both walk `idx.Columns`, and no non-key attribute is ever
+appended; goopg's index-only scan likewise decodes only key columns). A covering
+index's key bytes are therefore exactly the column-by-column walk above, which is
+also the upstream rule: `_bt_compare` stops at
+`IndexRelationGetNumberOfKeyAttributes`. The guard was one line
+(`len(idx.IncludeColumns) > 0`) and is gone; the `checkunique` tier inherits the
+widening for free, since `btIndexCheckUnique` runs under the same comparator.
+
 Still out of scope:
 
-- **`INCLUDE` columns.** Non-key attributes never participate in ordering
-  upstream, and goopg's covering-key byte layout for them is not part of this
-  decoder's contract; such an index declines dispatch entirely rather than risk
-  mis-slicing the key.
 - **Expression key columns** (`Columns[i] == ""`): there is no catalog column
   whose type drives the decode.
 - **Types the key decoder cannot invert** (e.g. `NUMERIC`, whose encoding is
@@ -158,5 +166,10 @@ index that does not (the comparator is nil and never allocated).
   both shapes the first slice declined outright and therefore reported clean.
   Each keeps the clean-then-damaged pair, so the no-false-positive half is
   asserted for the widened surface too.
+- Fourth slice (2026-08-10):
+  `TestBtIndexCheck_OpClassDamageDetectedInclude` — a user opclass on the key
+  column of an `(i int4_fickle3_ops) INCLUDE (payload)` index. Clean-then-damaged
+  pair as above; confirmed **non-vacuous** (restoring the `IncludeColumns` guard
+  makes the damaged covering index report clean and the test fail).
 - `go test ./internal/amcheck/... ./internal/catalog/...` and the existing
   `TestBtIndexCheck_*` suite PASS unchanged.

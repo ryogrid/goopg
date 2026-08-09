@@ -410,8 +410,17 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestVerifyBtreeUnique_*` (7),
       `TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate`,
       `TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex`. Design:
-      `docs/design/0119-0006-checkunique-tier-amcheck.md`. Still open for 005:
-      `INCLUDE`/expression key columns, posting-list duplicate coverage, and
+      `docs/design/0119-0006-checkunique-tier-amcheck.md`.
+      **Fourth slice landed 2026-08-10 — `INCLUDE` (covering) indexes:** the
+      `len(idx.IncludeColumns) > 0` decline in `btIndexOpClassComparator` was
+      over-conservative. goopg encodes a stored B-tree key from the KEY columns
+      alone (`encodeCompositeBTreeKey` walks `idx.Columns`; no non-key attribute
+      is appended), so a covering index's key bytes are exactly the existing
+      column-by-column walk — upstream's rule too (`_bt_compare` stops at
+      `IndexRelationGetNumberOfKeyAttributes`). A user opclass on a covering
+      index now dispatches, and `checkunique` inherits it. Gate:
+      `TestBtIndexCheck_OpClassDamageDetectedInclude` (non-vacuous). Still open
+      for 005: expression key columns, posting-list duplicate coverage, and
       non-invertible key types (NUMERIC, box/int4range/int4[]) — ledger rows
       2026-08-10.
 

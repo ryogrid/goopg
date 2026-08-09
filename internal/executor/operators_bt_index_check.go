@@ -298,12 +298,16 @@ func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog
 // under its own opclass — the column-wise contract of upstream's _bt_compare,
 // which walks scan-key attributes in order and stops at the first non-equal one.
 // Key columns that resolve to no user routine keep the engine's own byte order
-// for that column (their encoding IS the built-in opclass's order). Indexes with
-// INCLUDE columns are still declined — non-key attributes never participate in
-// ordering upstream, and goopg's covering-key layout for them is not yet part of
-// this decoder's contract. M0119-0006.
+// for that column (their encoding IS the built-in opclass's order).
+//
+// INCLUDE (covering) columns need no special handling: goopg encodes a B-tree
+// key from the *key* columns alone (encodeCompositeBTreeKey walks idx.Columns;
+// no non-key attribute is ever appended), so a covering index's key bytes are
+// exactly the column-by-column walk below. That matches upstream, where
+// non-key attributes never participate in ordering — _bt_compare stops at
+// IndexRelationGetNumberOfKeyAttributes. M0119-0006.
 func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Context, pos int) amcheck.KeyComparator {
-	if len(idx.Columns) == 0 || len(idx.IncludeColumns) > 0 || idx.Table == nil {
+	if len(idx.Columns) == 0 || idx.Table == nil {
 		return nil
 	}
 	method := idx.Method

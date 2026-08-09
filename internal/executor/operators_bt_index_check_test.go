@@ -343,6 +343,62 @@ func TestBtIndexCheck_OpClassDamageDetectedComposite(t *testing.T) {
 	}
 }
 
+// TestBtIndexCheck_OpClassDamageDetectedInclude covers a *covering* index: a
+// user opclass on the key column of an index that also carries INCLUDE
+// (non-key) columns. The earlier slices declined such an index outright,
+// assuming goopg's covering-key layout was outside the decoder's contract; it
+// is not — encodeCompositeBTreeKey builds the stored key from idx.Columns only,
+// so the key bytes of a covering index are exactly its key columns, which is
+// also the upstream rule (_bt_compare stops at the number of KEY attributes).
+//
+// Both halves are asserted: the healthy covering index verifies clean (no false
+// positive from decoding a key that has trailing bytes we mis-modelled), and
+// repointing the amproc row makes the physically-unchanged index report the
+// item-order violation.
+func TestBtIndexCheck_OpClassDamageDetectedInclude(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		`CREATE FUNCTION inc_asc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN 1 ELSE -1 END; $$`,
+		`CREATE FUNCTION inc_desc_cmp (a int4, b int4) RETURNS int LANGUAGE sql AS $$
+			SELECT CASE WHEN $1 = $2 THEN 0 WHEN $1 > $2 THEN -1 ELSE 1 END; $$`,
+		`CREATE OPERATOR CLASS int4_fickle3_ops FOR TYPE int4 USING btree AS
+			OPERATOR 1 < (int4, int4), OPERATOR 2 <= (int4, int4),
+			OPERATOR 3 = (int4, int4), OPERATOR 4 >= (int4, int4),
+			OPERATOR 5 > (int4, int4), FUNCTION 1 inc_asc_cmp(int4, int4)`,
+		"CREATE TABLE inctbl (i int4, payload text)",
+		"INSERT INTO inctbl VALUES (1,'a'), (2,'b'), (3,'c'), (4,'d'), (5,'e'), (6,'f'), (7,'g'), (8,'h')",
+		"CREATE INDEX fickleinc ON inctbl USING btree (i int4_fickle3_ops) INCLUDE (payload)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleinc')"); err != nil {
+		t.Fatalf("healthy covering index under a user operator class raised: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `UPDATE pg_catalog.pg_amproc
+		SET amproc = 'inc_desc_cmp'::regproc
+		WHERE amproc = 'inc_asc_cmp'::regproc`); err != nil {
+		t.Fatalf("amproc damage UPDATE: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT bt_index_check('fickleinc')")
+	if err == nil {
+		t.Fatal("broken operator class on a covering index not detected: bt_index_check reported clean")
+	}
+	const want = `item order invariant violated for index "fickleinc"`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("got %q, want substring %q", err.Error(), want)
+	}
+}
+
 // TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate is the M0119-0006 gate for
 // the `checkunique` tier (upstream bt_entry_unique_check, verify_nbtree.c).
 //
