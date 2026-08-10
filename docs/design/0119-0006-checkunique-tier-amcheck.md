@@ -146,6 +146,31 @@ item order.
   with the upstream message and a heap-TID DETAIL, and (c) an undamaged unique
   index passes with `checkunique` on.
   `TestBtIndexCheck_CheckUniqueSkipsNonUniqueIndex` pins the `ii_Unique` gate.
+- `internal/executor` (2026-08-12, the posting-list arm end to end):
+  `TestBtIndexCheck_CheckUniquePostingListRealTree` in
+  `operators_bt_index_check_posting_test.go` runs the tier over posting lists
+  **goopg's own bulk build wrote** (`deduplicateToRawItems`), on a real heap,
+  under the executor's own snapshot — the gap the fixture suite above could not
+  close. Phase 1 asserts through `PageLeafItems` that the build really
+  deduplicated (without it the rest would silently exercise the plain-item path);
+  phase 2 asserts every non-`checkunique` call is clean while `checkunique`
+  raises with `posting 0 and posting 1` in the DETAIL; phase 3 deletes the
+  duplicate rows and asserts the physically unchanged posting lists now verify
+  CLEAN — the visibility filter judging a real heap, which is the shape a
+  deduplicated PG unique index has after any update.
+  The one injected element is `Index.Unique`: no goopg unique index can hold a
+  posting list, because the bulk build is the only producer of posting bytes (the
+  pre-split `dedupConsolidate` merely drops exact `(key, tid)` duplicates) and it
+  indexes only tuples live to the building snapshot, so it never sees the dead
+  row versions that give a real PG unique index its duplicates. Upstream has no
+  such gap — `_bt_delete_or_dedup_one_page` runs `_bt_dedup_pass` on unique
+  indexes too (`nbtinsert.c:2778`), which is exactly why `bt_entry_unique_check`
+  must walk posting lists. Flipping the catalog flag on pages the real producer
+  wrote is itself a faithful corruption (`pg_index.indisunique` claiming a
+  uniqueness the content lacks) and is recorded as a deferral-ledger row
+  (2026-08-12).
+  Non-vacuity by mutation: making the visibility oracle always-true fails phase 3,
+  and making the build emit plain items instead of postings fails phase 1.
 
 - `internal/testport` (2026-08-10): `TestPort_PgAmcheck005OpclassDamage` drives
   this tier through the **real upstream `pg_amcheck --checkunique` binary**. Its
@@ -162,11 +187,14 @@ item order.
 
 - ~~Posting-list duplicates are expanded and reported with their posting index,
   but no test exercises a posting-list page.~~ **Closed 2026-08-11** by the
-  `verify_nbtree_unique_posting_test.go` fixtures above. What remains is one
+  `verify_nbtree_unique_posting_test.go` fixtures above. ~~What remains is one
   layer down and belongs to the tree, not this tier: no test drives goopg's
   *deduplication* end to end into a posting list a `--checkunique` run then
-  reads, so the arm is proven against the layout `marshalPosting` writes rather
-  than against a posting list a live INSERT/VACUUM sequence produced.
+  reads.~~ **Closed 2026-08-12** by
+  `TestBtIndexCheck_CheckUniquePostingListRealTree` (see §Gates). What that slice
+  *found* stays open and belongs to the tree: goopg's insert path never writes a
+  posting list at all, so no goopg **unique** index can hold one — ledger row
+  2026-08-12, resume point `btree.dedupConsolidate`.
 - Expression key columns remain outside the opclass comparator's contract, so a
   `checkunique` run on such an index falls back to byte order. (`INCLUDE`
   columns were lifted by the fourth slice.)

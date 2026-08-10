@@ -2133,6 +2133,14 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `executor.btIndexOpClassComparator`. Gate:
       `TestBtIndexCheck_OpClassDamageDetected` (verified non-vacuous). Design:
       `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`.
+      **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
+      (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
+      posting lists goopg's own bulk build wrote, on a real heap, under the
+      executor's snapshot; deleting the duplicate rows leaves the pages unchanged
+      and the tier clean. Found: goopg's INSERT path never writes a posting list
+      (`dedupConsolidate` only drops exact `(key,tid)` duplicates), so no goopg
+      unique index can hold one — ledger row 2026-08-12. Design §Gates in
+      `docs/design/0119-0006-checkunique-tier-amcheck.md`.
       **Second slice landed 2026-08-10 — general key decode:** the
       single-int4-key-column restriction is lifted. `btIndexOpClassComparator`
       now walks a composite key column by column (upstream `_bt_compare`'s
