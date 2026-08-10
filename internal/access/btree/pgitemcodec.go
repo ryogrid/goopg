@@ -126,6 +126,23 @@ func (fm IndexFormat) KeyDesc() *PGIndexKeyDesc { return fm.f.desc }
 // M0130-S11.4 slice 3b-2c-ii-B2-c.
 func (fm IndexFormat) CompareKeyAttrs(a, b []byte) int { return fm.f.compareKeyAttrs(a, b) }
 
+// PGBTPostingRaw is the exported face of `marshalPosting`: the ONE encoder for a
+// deduplicated (posting-list) leaf item in this format, the sibling of
+// PGBTItemRaw for plain items. `tids` must hold at least two entries and be
+// ascending, upstream's rule for `_bt_form_posting` (nbtdedup.c).
+//
+// It exists for the same reason PGBTItemRaw does: amcheck's page fixtures have
+// to build the item shapes its readers decode, and a fixture that hand-rolled
+// the alt-TID header would stop describing this package's layout the moment the
+// layout moved (which it did — the posting discriminator was a private high bit
+// of a leading keyLen field until M0130-S11.4 slice 2). The checkunique tier's
+// posting-list arm is the caller: goopg only deduplicates under specific write
+// churn, so a *deterministic* posting-list fixture cannot be produced by driving
+// the tree, and the arm was covered by no test. M0119-0006.
+func (fm IndexFormat) PGBTPostingRaw(key []byte, tids []storage.ItemPointer) []byte {
+	return fm.f.marshalPosting(key, tids)
+}
+
 // tupleKeys reports whether `item.key` is a whole nbtree tuple rather than a
 // bare key payload. It is exactly "this index has a key descriptor": the
 // descriptor is both what makes the tuple shape necessary (nothing else can

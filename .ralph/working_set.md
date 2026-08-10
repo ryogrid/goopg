@@ -1,44 +1,42 @@
 (idle — nothing in flight)
 
-Last loop: M-NIGHTLY AI-20260811-014635-012 — the TPC-DS SF=1 bench cluster was
-carrying pre-M0130-S11 nbtree indexes; REINDEXed, gate restored.
+Last loop: M0119-0006 — the checkunique tier's POSTING-LIST arm is under test
+(design `docs/design/0119-0006-checkunique-tier-amcheck.md` §Gates).
 
-Filed this loop (unconditional M-NIGHTLY duty): all 12 items of nightly run
-`20260811-014635` (sha `46103e4e`). Eleven are PARKED per banner — 2 isolation
-testport failures and 9 regress cases with "output mismatch; normalization rules
-need extension". **Re-run the regress repros at HEAD before investigating**: the
-previous loop ran the FULL `TestPort_RegressSuite` GREEN at `c58650b7`, two
-commits AFTER this nightly's sha, so they may all be stale.
+M-NIGHTLY duty this loop: `ci/logs/action-items.md` is still nightly run
+`20260811-014635` (12 items), ALL already filed by loop #87 — nothing new to
+add. Eleven remain PARKED per banner; re-run the regress repros at HEAD before
+investigating them (the full `TestPort_RegressSuite` ran GREEN two commits after
+that nightly's sha, so they are probably stale).
 
-Findings worth carrying:
-
-- `btree: index contains corrupted page at block 0: special size N, want 16` on
-  a long-lived cluster is **not corruption** — it is an index built before one
-  of the three REINDEX-required M0130-S11 format flips. Fix is
-  `bench/reindex_cluster.sh <port> [db]` (new this loop; 24 TPC-DS PKs in 95 s).
-- The trap is which cluster you REINDEX. 2026-08-10 remediated **SF=0.5**
-  (what the fast gate sweeps); the nightly clones **SF=1**. Whenever a
-  REINDEX-required change lands, walk the whole port table in CLAUDE.md.
-- The reason both incidents got all the way to a nightly: every guarding
-  spotcheck is a seq-scan plan (`tpch-spotcheck.sh` Q12/Q13, `stage-tpcds.sh`
-  Q3/Q98), so it passes green on a cluster whose every index is unreadable.
-  Detection is filed as a ledger row, not built.
-- TPC-H (65433, db `tpch`) is still un-REINDEXed — `REINDEX` inside db `tpch`
-  hits the same per-DB catalog scoping gap the ledger records for ANALYZE.
+What landed: `btree.IndexFormat.PGBTPostingRaw` (exported face of the tree's own
+`marshalPosting`, sibling of `PGBTItemRaw`) + five fixtures in
+`internal/amcheck/verify_nbtree_unique_posting_test.go`. A posting list puts a
+uniqueness violation INSIDE one line pointer, which no earlier gate could reach.
+The tuple-format case is the load-bearing one: each expanded key carries its own
+heap TID, so the duplicate shows only under `CompareKeyAttrs` — the same page
+under the bytewise default is asserted to report nothing. Both mutations bite
+(collapse the posting expansion; neutralise ` posting N`).
 
 Banner state (re-read this loop): M-NIGHTLY filing done; M0130 fully checked;
-banner then falls through to M0119, then M0122.
+banner falls through to M0119 (M0119-0005 is blocked on missing hash/gin/gist/
+spgist/brin AMs, so M0119-0006 is the actionable head), then M0122.
 
-Next loop: per banner, M0119-0006. Fresh candidates from the last slice: an
-end-to-end subscriber round-trip over a publication on an array column
-(`internal/testport`), TOASTed arrays in logical decoding, multi-dimensional /
-NULL-element arrays (needs a WRITER first). Older: date/time array elements,
-array SLICES `a[1:2]` (rejected by the LEXER), `interval[]` refused by
-`decodeArrayKeyElemText`, posting-list duplicate coverage in the checkunique
-tier, `box`/`int4range` key encodings, the whole-database pg_amcheck run.
+Next loop: per banner, M0119-0006 again. Remaining named in fix_plan:
+`box`/`int4range` key encodings (both types are unsupported in goopg entirely —
+`encodeBTreeKeyForColumn` raises 0A000; `int4range` at least has initdb
+`pg_range` seed rows, so a range-type column is the smaller of the two) and the
+whole-database unscoped pg_amcheck run. Fresh from this loop: drive goopg's
+DEDUPLICATION end to end into a posting list a live `--checkunique` reads
+(ledger row 2026-08-11). Older array-thread rows: array SLICES `a[1:2]`
+(rejected by the LEXER), `interval[]` refused by `decodeArrayKeyElemText`,
+TOASTed arrays + multi-dimensional / NULL-element arrays in logical decoding,
+a subscriber round-trip E2E over a publication on an array column.
 
-Gates: units PASS; TPC-DS SF=1 six previously-ERRORing queries (q1 q6 q7 q9 q13
-q91) return rows; SF=0.5 re-verified green. No Go code changed this loop (shell
-script + docs + trackers), so tpch-spotcheck / SF0.5 sweep were not re-run.
+Gates: build + vet clean; `go test ./internal/amcheck/ ./internal/access/btree/`
+PASS; `go test ./internal/executor/ -run TestBtIndexCheck` PASS; units
+(`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`) PASS; pgbench
+smoke via the commit hook. No planner/executor/codec change (one additive
+exported method + tests + docs), so tpch-spotcheck / SF0.5 sweep not re-run.
 
 In-flight: none

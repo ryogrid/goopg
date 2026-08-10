@@ -2665,8 +2665,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Design: `docs/design/0119-0006-pgoutput-array-columns.md`. 3 ledger rows:
       no subscriber round-trip E2E, TOASTed arrays still refused,
       multi-dimensional / NULL-element arrays unhandled.
-      Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range` key encodings, and
+      **Slice landed 2026-08-11 (24th) — the checkunique tier's POSTING-LIST
+      arm is under test** (design `docs/design/0119-0006-checkunique-tier-amcheck.md`
+      §Gates). A deduplicated leaf item holds ONE key over many heap TIDs, so a
+      uniqueness violation can live entirely inside a single line pointer —
+      upstream loops over the posting list for exactly that case
+      (`bt_entry_unique_check`) and `bt_report_duplicate` prints ` posting N`
+      instead of a second `tid=` when the two entries share the line pointer.
+      goopg's arm shipped with the tier but was reachable by no test, because
+      goopg only deduplicates under specific write churn and driving a real tree
+      cannot place a posting list where a test needs one. Landed
+      `btree.IndexFormat.PGBTPostingRaw` (the exported face of the tree's own
+      `marshalPosting`, sibling of the already-exported `PGBTItemRaw` — fixtures
+      must not hand-roll the alt-TID header, which moved once already in
+      M0130-S11.4) plus five fixtures: duplicate inside one posting list,
+      dead-version posting list (clean), posting-vs-plain (the mixed errdetail),
+      adjacent distinct-key posting lists (no false positive), and the TUPLE
+      format, where each expanded key carries its own heap TID so the duplicate
+      shows only under the TID-blind `CompareKeyAttrs` — the same page under the
+      bytewise default is asserted to report NOTHING, which is what makes the
+      comparator argument load-bearing. Non-vacuity mutation-checked twice
+      (collapsing the posting expansion; neutralising the ` posting N`
+      rendering). Ledger row: goopg's deduplication is still not driven
+      end-to-end into a posting list a live `--checkunique` run then reads.
+      Remaining for M0119-0006: `box`/`int4range` key encodings and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`

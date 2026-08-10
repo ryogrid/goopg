@@ -117,6 +117,28 @@ item order.
   `TestPageLeafItemsMatchesLeafEntries`.
   The load-bearing pair is `DuplicateBothVisible` vs `DuplicateOneVisibleClean`:
   identical pages, different visibility oracle, opposite verdicts.
+- `internal/amcheck` (2026-08-11, the posting-list arm):
+  `TestVerifyBtreeUnique_{PostingListBothVisible, PostingListOneVisibleClean,
+  PostingThenPlainDuplicate, AdjacentPostingListsDistinctKeysClean,
+  PostingListTupleFormat}` in `verify_nbtree_unique_posting_test.go`. The
+  fixtures build deduplicated leaf items directly with the newly exported
+  `btree.IndexFormat.PGBTPostingRaw` (the exported face of the tree's own
+  `marshalPosting`, sibling of `PGBTItemRaw`), because goopg only deduplicates
+  under specific write churn — driving a real tree cannot be relied on to place
+  a posting list where a test needs one.
+  Three properties this pins that no earlier gate reached: a duplicate INSIDE
+  one line pointer (which a per-line-pointer walk cannot see at all); the two
+  errdetail spellings upstream's `bt_report_duplicate` distinguishes — index tid
+  printed once with `posting 0`/`posting 1` when the entries share a line
+  pointer, and `posting 1` plus a second `tid=` when they do not; and the
+  tuple-format case, where each expanded entry's key carries its own heap TID so
+  the duplicate is visible only under the TID-blind `CompareKeyAttrs` that
+  `btIndexCheckUnique` injects — the same page under the bytewise default is
+  asserted to report nothing, which is what makes the comparator argument
+  load-bearing rather than decorative.
+  Non-vacuity was checked by mutation: collapsing `PageLeafItems`' posting
+  expansion to its first TID fails all five, and neutralising the ` posting N`
+  rendering fails the three that assert an errdetail.
 - `internal/executor`: `TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate` builds
   a real unique index, rewrites one leaf entry's key in place so two live rows
   claim the same key, and asserts (a) every non-`checkunique` call still reports
@@ -138,9 +160,13 @@ item order.
 
 ## Still open for `005_opclass_damage` / `--checkunique`
 
-- Posting-list duplicates are expanded and reported with their posting index, but
-  no test exercises a posting-list page (goopg deduplicates only under specific
-  churn; constructing one deterministically is a separate fixture).
+- ~~Posting-list duplicates are expanded and reported with their posting index,
+  but no test exercises a posting-list page.~~ **Closed 2026-08-11** by the
+  `verify_nbtree_unique_posting_test.go` fixtures above. What remains is one
+  layer down and belongs to the tree, not this tier: no test drives goopg's
+  *deduplication* end to end into a posting list a `--checkunique` run then
+  reads, so the arm is proven against the layout `marshalPosting` writes rather
+  than against a posting list a live INSERT/VACUUM sequence produced.
 - Expression key columns remain outside the opclass comparator's contract, so a
   `checkunique` run on such an index falls back to byte order. (`INCLUDE`
   columns were lifted by the fourth slice.)
