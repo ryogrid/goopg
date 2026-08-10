@@ -1160,9 +1160,11 @@ sources agree:
             hits the per-DB catalog scoping gap the ledger already records for
             ANALYZE, so SF=1-scale index behaviour stays ungated.
 
-    - **3b-3 — collect the deferrals (in progress).** With the key length
-      descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
-      size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement
+    - **3b-3 — collect the deferrals (2026-08-10, complete: 3b-3a…3b-3d).** With
+      the key length descriptor-derived, restore `index_form_tuple`'s MAXALIGN of
+      the tuple size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset (3b-3b
+      below — both were already satisfied per-format, and the live gap turned out
+      to be `_bt_form_posting`'s total), implement
       `_bt_keep_natts` suffix truncation (pivot natts < nkeyatts at last), and
       retire `MaxHighKeyLen` / `bulkHighKeyReserve` in favour of
       `BTMaxItemSize`.
@@ -1214,10 +1216,61 @@ sources agree:
           future "simplification" round `lp_len` too and silently corrupt
           every blob key.
 
-          Still deferred, unchanged: `index_form_tuple`'s tuple-size MAXALIGN
-          and `BTreeTupleSetPosting`'s posting offset, both of which pad
-          INSIDE the tuple and so stay blocked until every index is
-          descriptor-bearing; `_bt_keep_natts`; `BTMaxItemSize`.
+          Still deferred at the time of 3b-3a, but see 3b-3b below, which
+          revisits the premise: `index_form_tuple`'s tuple-size MAXALIGN and
+          `BTreeTupleSetPosting`'s posting offset, both of which pad INSIDE
+          the tuple; `_bt_keep_natts`; `BTMaxItemSize`.
+    - **3b-3b — the tuple-INTERNAL MAXALIGNs (2026-08-10).** Filed as "blocked
+      until every index is descriptor-bearing", and the block turns out to have
+      been the wrong question. The two MAXALIGNs it named apply to the format
+      that can EXPRESS them, and both were satisfied the moment the format split
+      landed: `index_form_tuple`'s `size = MAXALIGN(hoff + data_size)` is
+      `FormPGIndexTuple`'s `size := MaxAlign(hoff + dataSize)` (`pgtuple.go`),
+      and `BTreeTupleSetPosting`'s `Assert((size_t) postingoffset ==
+      MAXALIGN(postingoffset))` is `postingOffsetFor`'s `MaxAlign(len(key))`
+      (`posting.go`). What was blocked was applying them to a BLOB key, which is
+      not what upstream does — and is not a wait, it is permanent: an expression
+      key, an explicit operator class, a non-bytewise collation or a
+      non-PG-faithful stored image each drop an index to the blob format for
+      good (`buildPGIndexKeyDesc`), and such a key has no per-attribute layout
+      to align to. Ledger row.
+
+      The real gap was a THIRD MAXALIGN the item never named — `_bt_form_posting`'s
+      TOTAL (nbtdedup.c):
+
+      ```c
+      if (nhtids > 1)
+          newsize = MAXALIGN(keysize + nhtids * sizeof(ItemPointerData));
+      else
+          newsize = keysize;
+      Assert(newsize == MAXALIGN(newsize));
+      ```
+
+      A six-byte `ItemPointerData` array leaves the tuple unaligned even when its
+      key material is not, so goopg's exact `postingOffset + n*6` differed from
+      upstream on *every* posting it wrote. That only becomes reachable with a
+      real PG in the picture, which is precisely M0130's subject: after a
+      failover the promoted PG writes MAXALIGNed postings into these indexes, and
+      goopg's `postingBounds` rejected the padding by construction
+      (`postingOffset+n*6 != size`) — a clean parse failure on every deduplicated
+      leaf entry PG had touched, i.e. the reverse-attach direction the S10
+      harness exercises.
+
+      `indexFormat.postingSizeFor` now rounds, tuple format only: the blob
+      posting offset is unaligned by construction (`8 + len(key)`, a blob key
+      having no tuple of its own), so rounding its total would rewrite on-disk
+      bytes for no upstream property. `postingBounds` tolerates a tail of at most
+      seven bytes — the array's location and length are both stated in `t_tid`,
+      so the padding is inert — while still rejecting a full unexplained MAXALIGN
+      unit (that is a TID the count does not admit to) and an array running past
+      the declared size. Old unrounded postings keep parsing, so NO REINDEX is
+      required.
+
+      Guards: `TestPostingBoundsToleratesAlignmentPaddingOnly` and
+      `TestPostingBlobFormatSizeStaysExact`
+      (`internal/access/btree/pgposting_format_test.go`), plus
+      `TestPostingTupleFormatLayoutAndRoundTrip`, which now pins the rounded
+      total rather than the exact one.
     - **3b-3c — `_bt_truncate` suffix truncation (2026-08-10).** A separator is
       not a key: it is a BOUNDARY, and it only has to sit strictly above every
       key on the left page and at-or-below every key on the right one. Upstream

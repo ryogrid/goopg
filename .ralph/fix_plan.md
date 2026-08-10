@@ -797,7 +797,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
       **Pre-existing indexes must be REINDEXed.** `btm_allequalimage` is
       unconditionally true and the cleanup counters are never updated — 1
       ledger row.
-- [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
+- [x] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
       `IndexTupleData` (8-byte header) + null bitmap + PG binary datums;
       internal-page downlinks into `t_tid`. Couples the index format to the
       type-codec layer. Decomposed into three loops:
@@ -850,7 +850,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         rows): pivot natts is always 1 for a keyed separator (one opaque key
         blob — no real suffix truncation), and the tiebreaker-heap-TID pivot is
         not written.
-  - [ ] **slice 3b — comparison layer**. Key bytes become per-attribute binary
+  - [x] **slice 3b — comparison layer**. Key bytes become per-attribute binary
         datums, so `bytes.Compare` gives way to type-aware comparison. That is
         what makes the key length descriptor-derived, and with it: the two
         MAXALIGNs slice 2 deferred (tuple size, posting offset), real suffix
@@ -878,7 +878,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
           `pgcompare_test.go` (9). Not modelled (1 ledger row): collations,
           cross-type comparison, and posting-list tuples (rejected, not
           guessed).
-    - [ ] **3b-2 — thread the descriptor, retire `CompareKeys`**. Build the
+    - [x] **3b-2 — thread the descriptor, retire `CompareKeys`**. Build the
           descriptor from the catalog (`pg_index.indoption` carries DESC and
           NULLS FIRST independently), pass it through `btree.Options`, convert
           the ~20 `CompareKeys` call sites, and flip the writer to
@@ -935,7 +935,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
             goopg orders enums by sort order. Guards:
             `pgindex_keydesc_test.go` (9). The writer flip moved to 3b-2c —
             see there.
-      - [ ] **3b-2c — flip the writer AND route every comparison through the
+      - [x] **3b-2c — flip the writer AND route every comparison through the
             descriptor** (REINDEX-required break). Split into 3b-2c-i (the
             seam, behaviour-preserving — **DONE 2026-08-10**) and 3b-2c-ii
             (plumbing A + codec seam B1 **DONE 2026-08-10**; the writer flip
@@ -1381,7 +1381,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               in db `tpch` hits the per-DB scoping gap), so SF=1 index behaviour
               is ungated. Ledger rows filed for all of it, plus the NULL-keyed-row
               divergence and the missing "needs REINDEX" detection.
-    - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
+    - [x] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.
         - [x] **3b-3a — MAXALIGNed item placement** (2026-08-10). NOT
@@ -1406,9 +1406,45 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               clobbered neighbour — because pinning alignment alone would let
               a later cleanup round `lp_len` and corrupt every blob key.
               Gates: btree/storage/amcheck + units PASS; pgbench smoke PASS.
-        - [ ] **3b-3b** — the two tuple-INTERNAL MAXALIGNs
-              (`index_form_tuple` size rounding, `BTreeTupleSetPosting` posting
-              offset), blocked until every index is descriptor-bearing.
+        - [x] **3b-3b — the tuple-INTERNAL MAXALIGNs** (2026-08-10). NOT
+              REINDEX-required (an unrounded posting still parses; see below).
+              **The filed blocker asked the wrong question.** Both MAXALIGNs
+              this item named were already honoured the moment the format
+              split landed, because each applies to the format that can
+              express it: `index_form_tuple`'s size rounding is
+              `FormPGIndexTuple`'s `size = MaxAlign(hoff + dataSize)`
+              (`pgtuple.go`), and `BTreeTupleSetPosting`'s posting offset is
+              `indexFormat.postingOffsetFor`'s `MaxAlign(len(key))`
+              (`posting.go`). "Blocked until every index is descriptor-bearing"
+              was true only of applying them to a BLOB key, which is not what
+              upstream does — and never will be reachable, since an expression
+              key, an explicit opclass, a non-bytewise collation or a
+              non-PG-faithful stored image all resolve to the blob format
+              permanently (`buildPGIndexKeyDesc`). Ledger row.
+              What WAS missing is a third MAXALIGN the item did not name:
+              `_bt_form_posting`'s **total** — `newsize = MAXALIGN(keysize +
+              nhtids * sizeof(ItemPointerData))`, with `Assert(newsize ==
+              MAXALIGN(newsize))` behind it (nbtdedup.c). A six-byte TID array
+              leaves the tuple unaligned even when its key material is not, so
+              goopg's exact `postingOffset + n*6` diverged from upstream on
+              every posting it wrote. That divergence is only REACHABLE with a
+              real PG in the picture, which is exactly what M0130 is about:
+              after a failover the promoted PG writes MAXALIGNed postings into
+              these indexes, and goopg's `postingBounds` rejected the padding
+              outright (`postingOffset+n*6 != size`) — a clean parse failure on
+              every deduplicated leaf entry PG had touched. Now
+              `indexFormat.postingSizeFor` rounds (tuple format only — the blob
+              posting offset is unaligned by construction, so rounding its
+              total would rewrite on-disk bytes for no upstream property), and
+              `postingBounds` tolerates a tail of at most seven bytes while
+              still rejecting a full unexplained MAXALIGN unit and an array
+              that runs past the declared size. Old unrounded postings keep
+              parsing, which is why no REINDEX is needed. Guards
+              `TestPostingBoundsToleratesAlignmentPaddingOnly` /
+              `TestPostingBlobFormatSizeStaysExact` +
+              `TestPostingTupleFormatLayoutAndRoundTrip` (rounded total).
+              Gates: btree/amcheck/storage + units PASS; tpch-spotcheck PASS
+              (Q12=2, Q13=35); pgbench smoke PASS.
         - [x] **3b-3c — `_bt_truncate` suffix truncation** (2026-08-10). NOT
               REINDEX-required (an untruncated separator is still a legal one).
               `indexFormat.truncateSeparator`
@@ -1459,7 +1495,7 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               `_bt_dedup_pass` `maxpostingsize` cap. Gates: btree/amcheck/
               storage + units PASS; tpch-spotcheck PASS (Q12=2, Q13=35);
               pgbench smoke PASS.
-- [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~4 loops). PG-faithful
+- [x] **M0130-S11.5 — `RM_BTREE` WAL** (est ~4 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.
       Design: `docs/design/0130-0012-rm-btree-wal-content-parity.md`.

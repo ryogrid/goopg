@@ -124,8 +124,14 @@ func TestPostingTupleFormatLayoutAndRoundTrip(t *testing.T) {
 		t.Fatalf("posting offset = %d, want the key tuple's own length %d (blob layout would say %d)",
 			got, wantOffset, SizeOfIndexTupleData+len(base))
 	}
-	if len(raw) != wantOffset+3*6 {
-		t.Fatalf("posting size = %d, want %d", len(raw), wantOffset+3*6)
+	// _bt_form_posting's newsize: MAXALIGN(keysize + nhtids * 6), which for three
+	// TIDs after a 16-byte key is MAXALIGN(34) = 40 — six bytes of inert tail
+	// padding. The array's location and length are both stated in t_tid, so the
+	// padding is unreadable by construction; asserting the ROUNDED total (rather
+	// than the exact one goopg wrote before M0130-S11.4 slice 3b-3b) is what
+	// keeps goopg's postings byte-identical to a promoted PG's.
+	if len(raw) != MaxAlign(wantOffset+3*6) {
+		t.Fatalf("posting size = %d, want MAXALIGN(%d) = %d", len(raw), wantOffset+3*6, MaxAlign(wantOffset+3*6))
 	}
 	if !BTreeTupleIsPosting(raw) || BTreeTupleGetNPosting(raw) != 3 {
 		t.Fatalf("posting header wrong: isPosting=%v n=%d", BTreeTupleIsPosting(raw), BTreeTupleGetNPosting(raw))
@@ -250,5 +256,72 @@ func TestDedupChunkingUsesFormatOffset(t *testing.T) {
 	// And it is still a real saving: one item per TID would be 4000 items.
 	if len(raws) > 10 {
 		t.Fatalf("4000 duplicates needed %d items; deduplication is not doing its job", len(raws))
+	}
+}
+
+// TestPostingBoundsToleratesAlignmentPaddingOnly is the read side of
+// M0130-S11.4 slice 3b-3b. A posting tuple's TID array is located and counted
+// by t_tid alone, so upstream's MAXALIGNed total leaves up to seven bytes of
+// tail padding that no reader looks at. goopg's bounds check used to demand the
+// array end exactly at the declared size, which rejected every posting a
+// promoted PG writes (`_bt_form_posting` has always rounded). It must now
+// tolerate the padding — and ONLY the padding: a tail of eight bytes or more is
+// not alignment, it is a TID the count does not admit to, and staying strict
+// there is what keeps the check a corruption detector.
+func TestPostingBoundsToleratesAlignmentPaddingOnly(t *testing.T) {
+	f := indexFormat{desc: int4Desc()}
+	items := tupleEntries(t, f, 77, 3)
+	base := items[0].key
+	tids := []storage.ItemPointer{items[0].ptr, items[1].ptr, items[2].ptr}
+	raw := f.marshalPosting(base, tids)
+
+	off, n, err := postingBounds(raw)
+	if err != nil {
+		t.Fatalf("postingBounds on a MAXALIGNed posting: %v", err)
+	}
+	if n != len(tids) {
+		t.Fatalf("n = %d, want %d", n, len(tids))
+	}
+	if pad := len(raw) - (off + n*SizeOfItemPointerData); pad == 0 {
+		t.Fatalf("this fixture is meant to carry tail padding; got none (size %d, off %d, n %d)",
+			len(raw), off, n)
+	}
+
+	// One padding byte too many: the same header over a tuple grown by a whole
+	// MAXALIGN unit is a size the alignment rule cannot produce.
+	overpadded := append(append([]byte(nil), raw...), make([]byte, 8)...)
+	pgPutIndexTupleSize(overpadded, len(overpadded))
+	if _, _, err := postingBounds(overpadded); err == nil {
+		t.Fatal("postingBounds accepted a posting with a full MAXALIGN unit of unexplained tail")
+	}
+
+	// And the array must still fit: a count that runs past the declared size is
+	// corruption in the other direction.
+	truncated := append([]byte(nil), raw[:off+SizeOfItemPointerData]...)
+	pgPutIndexTupleSize(truncated, len(truncated))
+	if _, _, err := postingBounds(truncated); err == nil {
+		t.Fatal("postingBounds accepted a posting whose TID array runs past its size")
+	}
+}
+
+// TestPostingBlobFormatSizeStaysExact pins the deliberate asymmetry of 3b-3b:
+// the blob format does NOT round. Its posting offset is `8 + len(key)`, already
+// unaligned by construction because a blob key has no tuple of its own, so
+// rounding the total would rewrite every blob index's bytes on disk without
+// buying any upstream invariant.
+func TestPostingBlobFormatSizeStaysExact(t *testing.T) {
+	key := []byte("abcde")
+	tids := []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}}
+	raw := blobFormat.marshalPosting(key, tids)
+	want := SizeOfIndexTupleData + len(key) + len(tids)*SizeOfItemPointerData
+	if len(raw) != want {
+		t.Fatalf("blob posting size = %d, want the exact %d", len(raw), want)
+	}
+	gotKey, gotTIDs, err := blobFormat.parsePostingRaw(raw)
+	if err != nil {
+		t.Fatalf("parsePostingRaw: %v", err)
+	}
+	if !bytes.Equal(gotKey, key) || len(gotTIDs) != len(tids) {
+		t.Fatalf("blob round trip: key %x tids %v", gotKey, gotTIDs)
 	}
 }

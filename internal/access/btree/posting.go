@@ -57,6 +57,32 @@ func (f indexFormat) postingOffsetFor(key []byte) int {
 	return SizeOfIndexTupleData + len(key)
 }
 
+// postingSizeFor is `_bt_form_posting`'s `newsize` (nbtdedup.c): the whole
+// on-page length of a posting item over `key` and `nhtids` TIDs.
+//
+// M0130-S11.4 slice 3b-3b. Upstream rounds the total —
+// `newsize = MAXALIGN(keysize + nhtids * sizeof(ItemPointerData))`, with an
+// `Assert(newsize == MAXALIGN(newsize))` behind it — because a six-byte TID
+// array leaves the tuple unaligned even when the key material is not, and
+// nbtree reasons about a posting's length with MAXALIGN throughout (the
+// dedup pass's byte budget, `_bt_swap_posting`, `insertstate.itemsz`).
+// goopg wrote the exact length, which is a divergence that only becomes
+// REACHABLE with a real PG in the picture: after a failover a promoted PG
+// writes MAXALIGNed postings into these indexes, and goopg has to read them
+// back (see postingBounds, which used to reject the padding outright).
+//
+// Blob format keeps the exact length. Its posting offset is already unaligned
+// by construction (`8 + len(key)` — a blob key has no tuple of its own to
+// round), so rounding the total alone would buy no upstream property while
+// rewriting the bytes of every blob index on disk.
+func (f indexFormat) postingSizeFor(key []byte, nhtids int) int {
+	size := f.postingOffsetFor(key) + nhtids*SizeOfItemPointerData
+	if f.tupleKeys() {
+		return MaxAlign(size)
+	}
+	return size
+}
+
 // marshalPosting serialises a posting-list item for `key` over `tids`.
 // Callers hold to upstream's rule that a posting list has at least two TIDs;
 // a shorter list is a caller bug and panics rather than silently writing a
@@ -64,7 +90,7 @@ func (f indexFormat) postingOffsetFor(key []byte) int {
 func (f indexFormat) marshalPosting(key []byte, tids []storage.ItemPointer) []byte {
 	n := len(tids)
 	postingOffset := f.postingOffsetFor(key)
-	raw := make([]byte, postingOffset+n*6)
+	raw := make([]byte, f.postingSizeFor(key, n))
 	if f.tupleKeys() {
 		// The key already carries a header whose flag bits (null bitmap
 		// present, varwidth attributes) are what DEFORMS it — copy the tuple
@@ -168,7 +194,14 @@ func postingBounds(raw []byte) (postingOffset, n int, err error) {
 	}
 	postingOffset = BTreeTupleGetPostingOffset(raw)
 	n = int(BTreeTupleGetNPosting(raw))
-	if postingOffset < SizeOfIndexTupleData || postingOffset+n*6 != size {
+	// The TID array need not end at the tuple's declared size: since 3b-3b (and
+	// in upstream `_bt_form_posting` always) the total is MAXALIGNed, so up to
+	// seven bytes of padding may follow the last TID. The array's LOCATION and
+	// LENGTH are both stated explicitly in t_tid, so the padding is inert — but
+	// it must be tolerated rather than read as a count mismatch, or a posting
+	// written by a promoted PG (or by goopg after this slice) fails to parse.
+	body := postingOffset + n*SizeOfItemPointerData
+	if postingOffset < SizeOfIndexTupleData || body > size || size-body >= 8 {
 		return 0, 0, fmt.Errorf("btree posting: size mismatch (size %d, postingOffset %d, n %d)",
 			size, postingOffset, n)
 	}
