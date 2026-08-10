@@ -2914,6 +2914,21 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       with a test pinning the refusal. Design `0125-0007-…` §6 + README row.
       Gates: units, `TestPort_RegressSuite`, tpch-spotcheck (Q12=2/Q13=35) PASS;
       mutation-checked. `BC` era input remains open.
+      **35th slice (2026-08-11) — `ValidateDate()`'s month/day RANGE check is now
+      a real port**: `'20201301'`, `'2020-13-01'`, `'2020-01-32'` were flat 22007
+      ("invalid input syntax") — DecodeDateTime recognises the shape, only
+      ValidateDate rejects the values, and goopg had no ValidateDate step at all.
+      New `pgdatetime.ValidateMonthDay`/`ValidateDateToken` (month 1..12, day
+      1..31 — both of ValidateDate's overflow arms map to the same SQLSTATE
+      22008) wired into `parsePGDateText` and `parsePGTimestampTextParts`.
+      `ValidateDateToken` locates MM/DD from the trailing `-MM-DD` so it survives
+      a run-together year of any width. NOT covered: the day-in-month/leap-year
+      arm (`'2020-02-30'` still silently accepted — needs the era-adjusted year,
+      which is applied AFTER this check runs today; separate follow-up, ledger
+      row 2026-08-11). Gates: `TestValidateDateToken` (pgdatetime),
+      `TestDateTimeInputErrorSeparatesRangeFromSyntax` (updated expectations) +
+      full executor/pgdatetime suites green; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=35). Design `0125-0007-pg-faithful-date-field-decode.md` §13.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

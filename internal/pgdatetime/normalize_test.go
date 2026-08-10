@@ -1,6 +1,7 @@
 package pgdatetime
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -269,6 +270,44 @@ func TestNormalizeInputKeepsTimeOnlyReading(t *testing.T) {
 	for _, in := range []string{"040506", "0405", "20200101", "200101"} {
 		if got := NormalizeInput(in); got != in {
 			t.Errorf("NormalizeInput(%q) = %q, want it untouched (time-only context)", in, got)
+		}
+	}
+}
+
+// TestValidateDateToken pins ValidateDate()'s month/day range checks
+// (DTERR_MD_FIELD_OVERFLOW), the piece M0119-0006 found missing: a
+// month/day that no layout can represent ('2020-13-01', '2020-01-32') fell
+// through every entry in goopg's layout table and came back as the generic
+// "no timestamp layout matched" (22007), where PostgreSQL raises 22008
+// because DecodeDateTime recognised the shape and only ValidateDate rejected
+// the values.
+func TestValidateDateToken(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"2020-01-01", false},
+		{"2020-12-31", false},
+		{"2020-02-29", false}, // leap day: accepted (day 1..31), not yet
+		{"2020-02-30", false}, // full days-in-month check is a separate,
+		// still-deferred ValidateDate() arm — see ValidateMonthDay's doc.
+		{"0202-01-01", false},          // run-together's padded 4-digit year
+		{"20200-10-11", false},         // run-together's wide (>4-digit) year
+		{"2020-13-01", true},           // month 13
+		{"2020-00-01", true},           // month 0
+		{"2020-01-32", true},           // day 32
+		{"2020-01-00", true},           // day 0
+		{"", false},                    // not the shape: left to the caller's parser
+		{"10:00:00", false},            // bare time: not the shape
+		{"2020-01-01 10:00:00", false}, // has a space; not a bare date token
+	}
+	for _, c := range cases {
+		err := ValidateDateToken(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ValidateDateToken(%q) = %v, wantErr %v", c.in, err, c.wantErr)
+		}
+		if err != nil && !errors.Is(err, ErrFieldOutOfRange) {
+			t.Errorf("ValidateDateToken(%q) = %v, want ErrFieldOutOfRange", c.in, err)
 		}
 	}
 }

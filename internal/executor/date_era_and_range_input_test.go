@@ -71,7 +71,13 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		{"1000-01-01", "22008"},
 		{"2020-01-01 BC", "22008"},
 		{"not-a-date", "22007"},
-		{"2020-13-99", "22007"},
+		// M0119-0006: ValidateDate()'s month/day range check—a month/day
+		// no layout can hold is a RANGE failure to PG (DecodeDateTime
+		// recognised the shape; only ValidateDate rejected the values),
+		// not a syntax miss. '2020-13-99' has BOTH fields out of range;
+		// ValidateMonthDay reports the first one it checks (month).
+		{"2020-13-99", "22008"},
+		{"2020-01-32", "22008"},
 	} {
 		_, err := parsePGDateText(c.in)
 		if err == nil {

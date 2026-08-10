@@ -888,6 +888,15 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	if errors.Is(canonErr, pgdatetime.ErrTimeFieldOverflow) {
 		return time.Time{}, 0, pgdatetime.ErrFieldOutOfRange
 	}
+	// M0119-0006: a month/day ValidateDate() would reject ('20201301',
+	// '2020-13-01') matches no layout below and previously fell through to the
+	// generic "no timestamp layout matched" 22007 — a syntax error where PG
+	// raises 22008, since DecodeDateTime DID recognise the shape. The date
+	// token is the same for both candidates (only the time token differs), so
+	// one check ahead of the loop covers it.
+	if err := pgdatetime.ValidateDateToken(dateTokenPrefix(body)); err != nil {
+		return time.Time{}, 0, err
+	}
 	cands := [2]struct {
 		text  string
 		carry int
@@ -907,6 +916,18 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 		}
 	}
 	return time.Time{}, 0, errNoTimestampLayout
+}
+
+// dateTokenPrefix returns the leading date token of a normalized "date<sep>
+// rest" string — the same split normalizeInput uses to attach the time token
+// (first ' ', 'T' or 't'), or the whole string when there is no separator.
+func dateTokenPrefix(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == ' ' || c == 'T' || c == 't' {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 // canonicalizeTimestampTimeToken rewrites the time-of-day token of a
@@ -990,7 +1011,11 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 // pre/post steps around it are shared, which is the property that kept breaking.
 func parsePGDateText(s string) (time.Time, error) {
 	body, bc := pgdatetime.SplitEra(s)
-	t, err := time.Parse("2006-01-02", pgdatetime.NormalizeDateTimeInput(body, bc))
+	norm := pgdatetime.NormalizeDateTimeInput(body, bc)
+	if err := pgdatetime.ValidateDateToken(norm); err != nil {
+		return time.Time{}, err
+	}
+	t, err := time.Parse("2006-01-02", norm)
 	if err != nil {
 		return time.Time{}, err
 	}

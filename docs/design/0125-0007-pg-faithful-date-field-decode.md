@@ -801,3 +801,76 @@ run-together date whose fields decode but cannot exist (`'20201301'`) is `22007`
 on goopg where PG answers `22008`. It is not new — `'2020-13-01'` behaves
 identically at HEAD — because goopg has no `ValidateDate()` step: the Go layout
 simply refuses month 13, which reads as a spelling error rather than a range one.
+
+## 13. Follow-up 2026-08-11 (M0119-0006) — `ValidateDate()`'s month/day range check
+
+### 13.1 The defect
+
+§12.4's closing paragraph named the gap: `'20201301'`, `'2020-13-01'`,
+`'2020-01-32'` all decode a month or day field the Go layout tables cannot hold
+(month 13, day 32), and every entry in `pgTimestampLayouts` simply fails to
+match — the failure that reaches the caller is the generic "no layout matched"
+one, which maps to SQLSTATE `22007` ("invalid input syntax"). PostgreSQL's
+`DecodeDateTime` DOES recognise the shape (three numeric fields in date order);
+it is `ValidateDate()`, a step goopg has never had, that rejects the *values*
+and raises `22008` ("date/time field value out of range") instead
+(`postgres/src/backend/utils/adt/datetime.c`, `ValidateDate()`'s "check for
+valid month" / "minimal check for valid day of month" arms — both
+`DTERR_MD_FIELD_OVERFLOW` and `DTERR_FIELD_OVERFLOW` map to the same
+`ERRCODE_DATETIME_FIELD_OVERFLOW` in `DateTimeParseError`, so the two need not
+be distinguished on the goopg side either).
+
+### 13.2 What landed
+
+Two new functions in `internal/pgdatetime/normalize.go`:
+
+- `ValidateMonthDay(month, day int) error` — the two range checks themselves
+  (month 1..12, day 1..31), returning `ErrFieldOutOfRange` (the same sentinel
+  §10-§12 already use for the era/hour-24/leap-second range failures).
+- `ValidateDateToken(dateToken string) error` — extracts month/day from a
+  normalized `"...-MM-DD"` token and calls `ValidateMonthDay`. It locates the
+  fields from the TRAILING `-MM-DD` (last five characters before the string
+  end) rather than a fixed offset, so it works whether the year field is the
+  usual 4 digits or the wider verbatim year `expandRunTogetherDate` emits past
+  6 input digits (`"20200-10-11"` for `'202001011'`). A token that is not that
+  shape (a bare time, an empty string, anything with a following space) returns
+  `nil` — ValidateDateToken defers to the caller's own parser rather than
+  guess.
+
+Wired into the two normalized-string entry points ahead of the Go `time.Parse`
+attempt(s):
+
+- `parsePGDateText` (`internal/executor/copy_text.go`) — one call, right after
+  `NormalizeDateTimeInput`, before `time.Parse("2006-01-02", norm)`.
+- `parsePGTimestampTextParts` — one call on `dateTokenPrefix(body)` (a new
+  helper that splits the date token off at the first space/`T`/`t`, mirroring
+  `normalizeInput`'s own split), placed ahead of the `cands`/layout loop since
+  the date token is identical for both the `body` and `canon` candidates that
+  loop tries.
+
+### 13.3 What did NOT land
+
+`ValidateDate()`'s THIRD check — "check for valid day of month, now that we
+know for sure the month and year" (`tm_mday > day_tab[isleap(tm_year)][tm_mon -
+1]`) — needs the ASTRONOMICAL (era-adjusted) year, and is not ported. A day
+that is `≤31` but impossible for its actual month (`'2020-02-30'`,
+`'2021-04-31'`) is still silently accepted, unchanged from before this slice —
+not a regression, just not yet closed. The blocker is ordering, not
+difficulty: `ApplyEra` (era.go) — which turns the era-relative year the string
+spelled into the astronomical year goopg stores — runs AFTER `time.Parse`
+succeeds in both call sites, while `ValidateDateToken` runs BEFORE it. Adding
+the day-in-month arm means either threading the astronomical year into
+`ValidateDateToken` (which means computing it earlier) or moving the day-count
+check to run after `ApplyEra` instead.
+
+### 13.4 Verification
+
+`TestValidateDateToken` (`internal/pgdatetime`) pins `ValidateMonthDay`/
+`ValidateDateToken`'s bound checks and the not-our-shape no-op cases (bare
+time, empty string, a token with a space). `TestDateTimeInputErrorSeparatesRangeFromSyntax`
+(`internal/executor`) is updated: `'2020-13-99'` and the new `'2020-01-32'`
+case now assert `22008`, not `22007`. Full `internal/pgdatetime` and
+`internal/executor` suites re-verified green (no regressions — in particular
+`TestRepresentableDatesStillParse`, `TestDateEraLiteralAndCopyPathsAgree` and
+the run-together/hour-24 suites from §9-§12 are unaffected).
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35).

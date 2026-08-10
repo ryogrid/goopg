@@ -266,6 +266,73 @@ func RunTogetherDateIsTimeAmbiguous(s string) bool {
 	return ok && i == len(tok) && (len(digits) == 4 || len(digits) == 6)
 }
 
+// ValidateMonthDay checks a decoded month/day pair the way ValidateDate()'s
+// "check for valid month" / "minimal check for valid day of month" arms do
+// (postgres/src/backend/utils/adt/datetime.c): month must be 1..12, day must
+// be 1..31. Both arms upstream map to the SAME SQLSTATE 22008
+// (DTERR_MD_FIELD_OVERFLOW / DTERR_FIELD_OVERFLOW both reach
+// ERRCODE_DATETIME_FIELD_OVERFLOW in DateTimeParseError), so callers don't
+// need to distinguish them either.
+//
+// NOT yet covered (deferred, see the ledger row for M0119-0006): ValidateDate's
+// THIRD check, "day of month, now that we know for sure the month and year"
+// (`tm_mday > day_tab[isleap(year)][month-1]`) — a day that is <=31 but still
+// impossible for its month (Feb 30, Apr 31) is not caught here and stays
+// accepted, matching goopg's pre-existing behaviour for that narrower case.
+func ValidateMonthDay(month, day int) error {
+	if month < 1 || month > 12 {
+		return ErrFieldOutOfRange
+	}
+	if day < 1 || day > 31 {
+		return ErrFieldOutOfRange
+	}
+	return nil
+}
+
+// ValidateDateToken applies ValidateMonthDay to the MM/DD fields of a
+// zero-padded "...-MM-DD" date token — the shape NormalizeInput /
+// NormalizeDateTimeInput's date arm always produces (padDateFields,
+// expandRunTogetherDate both fix month and day at exactly two digits). A
+// token that is not that shape is left to the caller's own parser to judge:
+// ValidateDateToken returns nil rather than guess.
+//
+// Locating month/day from the TRAILING "-MM-DD" rather than a fixed offset is
+// what makes this work whether the year field is 4 digits or wider
+// (expandRunTogetherDate emits an unpadded year verbatim past 4 digits, e.g.
+// "20200-10-11" for the run-together input "202001011").
+//
+// Before this existed, a string that decoded into an impossible month or day
+// ('20201301', '2020-13-01') fell through every entry in the layout table and
+// came back as goopg's generic "no timestamp layout matched" — 22007 (invalid
+// syntax) — where PostgreSQL raises 22008 (field value out of range) instead,
+// because DecodeDateTime DID recognise the shape; only ValidateDate rejected
+// the values.
+func ValidateDateToken(dateToken string) error {
+	n := len(dateToken)
+	if n < 6 || dateToken[n-6] != '-' || dateToken[n-3] != '-' {
+		return nil
+	}
+	month, ok := parseDigits2(dateToken[n-5 : n-3])
+	if !ok {
+		return nil
+	}
+	day, ok := parseDigits2(dateToken[n-2:])
+	if !ok {
+		return nil
+	}
+	return ValidateMonthDay(month, day)
+}
+
+// parseDigits2 parses an exactly-two-digit ASCII field, as produced by
+// writePadded(..., 2). Anything else (a stray non-digit) is reported as !ok
+// so ValidateDateToken defers to the caller's parser instead of guessing.
+func parseDigits2(s string) (int, bool) {
+	if len(s) != 2 || s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9' {
+		return 0, false
+	}
+	return int(s[0]-'0')*10 + int(s[1]-'0'), true
+}
+
 // padTimeFields zero-pads the leading "h:m[:s]" of a time-of-day token and
 // returns the rest of the string untouched, so fractional seconds, numeric
 // offsets, AM/PM markers and timezone names all survive verbatim. A string
