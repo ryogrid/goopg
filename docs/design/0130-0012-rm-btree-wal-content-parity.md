@@ -1,7 +1,8 @@
 # 0130-0012 — `RM_BTREE` WAL content parity (M0130-S11.5)
 
 Status: **in progress** — S11.5a (`XLOG_BTREE_NEWROOT`), S11.5b-1
-(`XLOG_BTREE_SPLIT_R`) and S11.5c (`XLOG_BTREE_VACUUM`) landed 2026-08-10.
+(`XLOG_BTREE_SPLIT_R`), S11.5c (`XLOG_BTREE_VACUUM`) and S11.5b-3 (the split
+record's block 3) landed 2026-08-10.
 Series: M0130 Theme D, after 0130-0011 (the on-disk format).
 
 ## The gap this closes
@@ -238,6 +239,58 @@ then left, then the sibling back-link), each limb idempotent on its own
 - The obsolete `TestEncodeBtreeSplitPGFPIReplay`, which asserted the FPI form of
   block 1, is deleted — it pinned the property this slice removes.
 
+## S11.5b-3 — the split record's block 3
+
+Upstream reference: `_bt_split`'s XLOG section (nbtinsert.c:1957 and :1989) and
+`btree_xlog_split`'s opening arm (nbtxlog.c:203).
+
+An internal B-tree page is never inserted into for its own sake: the only thing
+that ever lands on one is a separator pushed up by a split one level down. That
+child is still flagged `BTP_INCOMPLETE_SPLIT` at the moment the parent gains its
+downlink, and upstream clears the flag **in the same critical section** as the
+parent's split — `cpageop->btpo_flags &= ~BTP_INCOMPLETE_SPLIT` — then registers
+the child as backup block 3 under `if (!isleaf)`. Its redo does the mirror
+image, and does it *first*, before it locks anything else, with the comment that
+REDO never needs to couple cross-level locks.
+
+goopg had neither half. `splitPage` handed the flag clear to the caller, which
+ran `clearIncompleteSplit` — a separate page record — after the parent insert
+returned, and the split record named no child at all. The consequence is not a
+lost hint: `XLogReadBufferForRedo` **PANICs** on an unregistered block id rather
+than reporting it, so `btree_xlog_split`'s unconditional
+`_bt_clear_incomplete_split(record, 3)` at `level > 0` takes a real standby down
+on the first goopg internal split. This is the same trap S11.5a hit at block 1
+of the newroot record, and it is why "the record is merely less detailed" is
+never a safe reading of a missing block.
+
+The fix follows upstream on both sides rather than only on the record:
+
+- `insertIntoBlock` carries `childBlk` — upstream's `cbuf` — threaded from the
+  three places a separator is pushed up (`splitPage`'s recursion, `finishSplit`,
+  and `createNewRoot`'s lost-the-race fallback). It is `InvalidBlockNumber` for
+  a leaf tuple, which is the only other way into that function.
+- The split path pins the child while it still holds this level's latches
+  (the **descent** direction, so it cannot deadlock against a reader), clears the
+  flag, includes it in the record and stamps the record's LSN onto it.
+- `clearIncompleteSplit` now returns without writing when the flag is already
+  clear, so the caller's later call is a no-op after a cascading parent split
+  and still does the work after a no-split parent insert.
+- `EncodeBtreeSplitPG` refuses **both** violations of upstream's `!isleaf`
+  condition: a `level > 0` record with no child, and a leaf record carrying one
+  (a block PG's redo never reads). The block carries no data — the mutation is
+  re-derived from the page.
+
+### Guards — S11.5b-3
+
+- `internal/wal/btree_split_pg_test.go` — block 3 present, correct, image-free
+  and data-free on an internal record; both level-gate refusals; a replay
+  reproduction asserting the child comes out unflagged at the record's LSN.
+- `internal/access/btree/btree_test.go` — the writer side: 4000 wide-key inserts
+  drive a real internal split, the hook asserts `childBlk` is valid exactly when
+  the split page is internal, and every child named is verified unflagged on the
+  page. An internal split failing to occur is a test **failure**, not a skip —
+  otherwise the assertion would pass vacuously on a two-level tree.
+
 ## S11.5c — `XLOG_BTREE_VACUUM`
 
 Upstream reference: `_bt_delitems_vacuum` (nbtpage.c:1250-1310) and
@@ -340,13 +393,12 @@ anyway, so the loss can cost a later re-check, never correctness.
   the page's new high key) instead of the image, which needs goopg's dedup pass
   unbundled from the split or proven to be a no-op. See "Why goopg cannot emit
   the incremental left half yet" above.
-- **S11.5b-3, block 3 on an internal split** — upstream registers the child
-  buffer whose incomplete-split flag the split completes, and redo calls
-  `_bt_clear_incomplete_split(record, 3)` for every `level > 0` record.
-  `XLogReadBufferForRedo` **PANICs** on an unregistered block id (the same trap
-  S11.5a hit at block 1), so a real PG standby still cannot replay a goopg
-  INTERNAL split. goopg clears the flag in a separate step (`clearIncompleteSplit`)
-  and has no child block at the emit site today.
+- **The `XLOG_BTREE_INSERT_UPPER` child block** — the *other* half of upstream's
+  incomplete-split clear. When the parent insert does **not** split, upstream
+  logs the child as block 1 of an `XLOG_BTREE_INSERT_UPPER` record and clears
+  the flag there. goopg still routes that insertion through its leaf-insert
+  record and leaves the clear to a separate `clearIncompleteSplit` page record,
+  so the split half is faithful (S11.5b-3 above) and the no-split half is not.
 - **The `nupdated` half of `XLOG_BTREE_VACUUM`** — `xl_btree_update`, upstream's
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting

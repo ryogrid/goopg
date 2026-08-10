@@ -124,7 +124,7 @@ func TestEncodeBtreeSplitPGIsContentParity(t *testing.T) {
 	const leftBlk, rightBlk, sibBlk = storage.BlockNumber(4), storage.BlockNumber(9), storage.BlockNumber(5)
 	left, right, sib := splitTestPages(t, 0, leftBlk, rightBlk, sibBlk, 3)
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestEncodeBtreeSplitPGRightmostHasNoSiblingBlock(t *testing.T) {
 	const leftBlk, rightBlk = storage.BlockNumber(4), storage.BlockNumber(9)
 	left, right, _ := splitTestPages(t, 0, leftBlk, rightBlk, storage.InvalidBlockNumber, 2)
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, storage.InvalidBlockNumber, nil)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, storage.InvalidBlockNumber, nil, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestEncodeBtreeSplitPGRejectsUnredoableRightOpaque(t *testing.T) {
 			op := btree.ReadPGOpaque(right)
 			tc.mutate(&op)
 			btree.WritePGOpaque(right, op)
-			if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib); err == nil {
+			if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
 				t.Fatalf("want an error for a right page redo cannot reproduce (%s)", tc.name)
 			}
 		})
@@ -296,7 +296,7 @@ func TestApplyRecordReplaysPGBtreeSplit(t *testing.T) {
 		}
 	}
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,5 +349,115 @@ func TestApplyRecordReplaysPGBtreeSplit(t *testing.T) {
 	}
 	if !bytes.Equal(again, gotRight) {
 		t.Error("second apply at the same LSN changed the right page")
+	}
+}
+
+// TestEncodeBtreeSplitPGInternalCarriesChildBlock pins M0130-S11.5b-3: on an
+// INTERNAL split upstream registers the child one level down whose
+// incomplete-split flag the insertion finishes as backup block 3
+// (nbtinsert.c:1989 `if (!isleaf) XLogRegisterBuffer(3, cbuf, REGBUF_STANDARD)`)
+// and `btree_xlog_split` clears that flag before it touches any other block.
+// The block carries NO data — redo re-derives the mutation from the page.
+func TestEncodeBtreeSplitPGInternalCarriesChildBlock(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 85, Fork: storage.MainFork}
+	const leftBlk, rightBlk, sibBlk = storage.BlockNumber(4), storage.BlockNumber(9), storage.BlockNumber(5)
+	const childBlk = storage.BlockNumber(7)
+	left, right, sib := splitTestPages(t, 1, leftBlk, rightBlk, sibBlk, 3)
+
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, childBlk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err := encodeRecordXLog(framed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := decodeRecordXLogDetailed(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(dec.XLog.MainData[0:4]); got != 1 {
+		t.Fatalf("xl_btree_split.level = %d, want 1", got)
+	}
+	b3, ok := xlogBlockRefByID(dec.XLog, 3)
+	if !ok {
+		t.Fatal("internal split registered no block 3: btree_xlog_split's _bt_clear_incomplete_split(record, 3) would PANIC on a real standby")
+	}
+	if b3.Block != childBlk || b3.HasImage || len(b3.Data) != 0 {
+		t.Errorf("block 3 = blk %d image=%v %d data bytes, want %d/false/0", b3.Block, b3.HasImage, len(b3.Data), childBlk)
+	}
+}
+
+// TestEncodeBtreeSplitPGChildBlockIsLevelGated is the mutation guard on both
+// halves of upstream's `!isleaf` condition. A level > 0 record without block 3
+// takes a PG standby down (XLogReadBufferForRedo PANICs on an unregistered
+// block id — the same trap S11.5a hit at block 1); a leaf record WITH one is a
+// block upstream's redo never reads, so PG could not round-trip it.
+func TestEncodeBtreeSplitPGChildBlockIsLevelGated(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 86, Fork: storage.MainFork}
+	const leftBlk, rightBlk, sibBlk = storage.BlockNumber(4), storage.BlockNumber(9), storage.BlockNumber(5)
+
+	t.Run("internal without child", func(t *testing.T) {
+		left, right, sib := splitTestPages(t, 1, leftBlk, rightBlk, sibBlk, 2)
+		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
+			t.Fatal("want an error for an internal split with no block 3")
+		}
+	})
+	t.Run("leaf with child", func(t *testing.T) {
+		left, right, sib := splitTestPages(t, 0, leftBlk, rightBlk, sibBlk, 2)
+		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, 7); err == nil {
+			t.Fatal("want an error for a leaf split carrying a block 3")
+		}
+	})
+}
+
+// TestApplyRecordReplaysPGBtreeSplitChildClear drives an INTERNAL split record
+// through emit → encode → decode → ApplyRecord and asserts the child page one
+// level down comes out with BTP_INCOMPLETE_SPLIT cleared — the mutation
+// upstream's redo performs FIRST, before it locks any other page.
+func TestApplyRecordReplaysPGBtreeSplitChildClear(t *testing.T) {
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 87, Fork: storage.MainFork}
+	// 0 metapage, 1 the internal page being split, 2 its right sibling,
+	// 3 the leaf child still flagged incomplete-split, 4 the new right half.
+	const leftBlk, sibBlk, childBlk, rightBlk = storage.BlockNumber(1), storage.BlockNumber(2), storage.BlockNumber(3), storage.BlockNumber(4)
+	left, right, sib := splitTestPages(t, 1, leftBlk, rightBlk, sibBlk, 3)
+
+	pre := func(op btree.PGBTPageOpaque) storage.Page {
+		p := make(storage.Page, storage.BlockSize)
+		if err := btree.InitPGBTPage(p); err != nil {
+			t.Fatal(err)
+		}
+		btree.WritePGOpaque(p, op)
+		return p
+	}
+	for _, page := range []storage.Page{
+		pre(btree.PGBTPageOpaque{}),
+		pre(btree.PGBTPageOpaque{Prev: btree.PNone, Next: sibBlk, Level: 1}),
+		pre(btree.PGBTPageOpaque{Prev: leftBlk, Next: btree.PNone, Level: 1}),
+		pre(btree.PGBTPageOpaque{Prev: btree.PNone, Next: btree.PNone, Flags: btree.BTPLeaf | btree.BTPIncompleteSplit}),
+	} {
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, childBlk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPGRecord(t, mgr, framed, 1300)
+
+	gotChild := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, childBlk, gotChild); err != nil {
+		t.Fatal(err)
+	}
+	if op := btree.ReadPGOpaque(gotChild); op.IncompleteSplit() {
+		t.Errorf("replayed child still flagged incomplete-split (flags %#x)", op.Flags)
+	}
+	if lsn := storage.MustHeader(gotChild).LSN(); lsn != 1300 {
+		t.Errorf("replayed child pd_lsn = %d, want 1300", lsn)
 	}
 }

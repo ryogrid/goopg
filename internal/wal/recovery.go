@@ -3052,6 +3052,10 @@ func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDec
 // replayDecodedXLogBtreeSplit applies a PG-format xl_btree_split, mirroring
 // upstream btree_xlog_split (nbtxlog.c:180-352) in the same block order:
 //
+//	block 3 — clear the incomplete-split flag on the child one level down whose
+//	          split this insertion finishes (INTERNAL split only — upstream
+//	          reads block 3 under exactly `if (!isleaf)`, and does it FIRST
+//	          because it needs no cross-level lock coupling);
 //	block 1 — rebuild the new right sibling from scratch: init, opaque from the
 //	          record's level and the record's own block tags, items restored
 //	          from block data;
@@ -3090,6 +3094,24 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 	sibBlk := storage.InvalidBlockNumber
 	if hasSib {
 		sibBlk = sib.Block
+	}
+
+	// Block 3 first, as upstream does: the flag clear needs no cross-level lock
+	// coupling, and a level > 0 record that omits it is one a real PG standby
+	// would PANIC on (XLogReadBufferForRedo on an unregistered block id), so
+	// say so here rather than silently leaving the child marked.
+	child, hasChild := xlogBlockRefByID(xlog, 3)
+	if level > 0 && !hasChild {
+		return fmt.Errorf("wal: xlog btree-split at level %d missing block 3 (child)", level)
+	}
+	if hasChild {
+		if child.HasImage && child.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, child, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-split child image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, child, endLSN, btree.ReplayClearIncompleteSplit); err != nil {
+			return fmt.Errorf("wal: xlog btree-split child apply: %w", err)
+		}
 	}
 
 	if right.HasImage && right.ImageApply {

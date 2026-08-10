@@ -467,6 +467,8 @@ const sizeOfXLogBtreeSplitData = 10
 //	           `_bt_restore_page` order — NO image
 //	block 2:   the page that was the left page's right sibling, no data
 //	           (non-rightmost split only; redo only patches its back-link)
+//	block 3:   the child one level down whose incomplete-split flag this
+//	           insertion finishes, no data (INTERNAL split only)
 //
 // Block 1 must be content, not an image: upstream's redo rebuilds the right
 // page from scratch on every replay (`XLogInitBufferForRedo` + `_bt_pageinit` +
@@ -505,8 +507,25 @@ const sizeOfXLogBtreeSplitData = 10
 // split). A reader that ignores the image and believes the main data therefore
 // still gets a coherent story, just not the one the primary actually executed.
 //
+// Block 3 exists on an INTERNAL split only, and is MANDATORY there
+// (M0130-S11.5b-3): an internal page is only ever inserted into to complete a
+// split one level down, and upstream's redo clears that child's
+// BTP_INCOMPLETE_SPLIT under `if (!isleaf) _bt_clear_incomplete_split(record,
+// 3)` before it touches any other block. `XLogReadBufferForRedo` PANICs on an
+// unregistered block id rather than reporting it, so a level > 0 record without
+// block 3 does not merely lose the flag clear — it takes a real PG standby
+// down. The encoder therefore refuses that combination, the same way
+// EncodeBtreeNewRootPG refuses a level > 0 newroot with no block 1. A leaf
+// split must NOT carry one: upstream has no cbuf there, and a block 3 its redo
+// never reads would be a record PG cannot round-trip.
+//
+// The block carries no data because there is nothing to describe: the primary
+// clears the flag itself (`splitPage`, mirroring _bt_split's own
+// `cpageop->btpo_flags &= ~BTP_INCOMPLETE_SPLIT`) and redo re-derives the same
+// mutation from the page it finds.
+//
 // xl_xid = 0 (index maintenance is not a logical user-data event).
-func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
+func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left/right page must be %d bytes", storage.BlockSize)
 	}
@@ -542,6 +561,14 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 			return nil, fmt.Errorf("wal: btree-split sibling page must be %d bytes", storage.BlockSize)
 		}
 		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true})
+	}
+	if level > 0 {
+		if childBlk == storage.InvalidBlockNumber {
+			return nil, fmt.Errorf("wal: btree-split at level %d has no child block", level)
+		}
+		blocks = append(blocks, BlockRef{ID: 3, Rel: rel, Block: childBlk, SameRel: true})
+	} else if childBlk != storage.InvalidBlockNumber {
+		return nil, fmt.Errorf("wal: btree-split at level 0 must not carry child block %d", childBlk)
 	}
 	body, err := assembleXLogRecord(mainData, blocks)
 	if err != nil {

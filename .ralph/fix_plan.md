@@ -1550,14 +1550,41 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         split). Needs either the split point threaded to the encoder plus a
         proof the dedup pass was a no-op, or the dedup unbundled into its own
         record. Ledger 2026-08-10.
-  - [ ] **S11.5b-3 — block 3 on an INTERNAL split**. Upstream registers the
-        child buffer whose incomplete-split flag the split completes, and
-        `btree_xlog_split` calls `_bt_clear_incomplete_split(record, 3)` for
-        every `level > 0` record. `XLogReadBufferForRedo` PANICs on an
-        unregistered block id (the same trap S11.5a hit at block 1), so a real
-        PG standby still cannot replay a goopg internal split. goopg clears the
-        flag in a separate step (`clearIncompleteSplit`) and has no child block
-        at the emit site. Ledger 2026-08-10.
+  - [x] **S11.5b-3 — block 3 on an INTERNAL split** (2026-08-10). NOT
+        REINDEX-required. An internal page is never inserted into for its own
+        sake — the only thing that lands on one is a separator pushed up by a
+        split ONE LEVEL DOWN, whose page is still flagged BTIncompleteSplit at
+        that moment. Upstream clears that flag inside `_bt_split`'s own critical
+        section (`cpageop->btpo_flags &= ~BTP_INCOMPLETE_SPLIT`) and registers
+        the child as backup block 3 under `if (!isleaf)`; `btree_xlog_split`
+        does the mirror image FIRST, before it locks anything else. goopg had
+        neither half: the flag clear was a separate page record run by the
+        CALLER after the parent insert returned, and the split record named no
+        child — which is not "less detailed" but fatal, since
+        `XLogReadBufferForRedo` PANICs on an unregistered block id rather than
+        reporting it (S11.5a's block-1 trap again). Now: `insertIntoBlock`
+        carries upstream's `cbuf` as `childBlk`, threaded from the three places
+        a separator is pushed up (`splitPage`'s recursion, `finishSplit`,
+        `createNewRoot`'s lost-the-race fallback) and InvalidBlockNumber for a
+        leaf tuple, the only other way in; the split path pins the child while
+        still holding this level's latches (the DESCENT direction, so it cannot
+        deadlock against a reader), clears the flag, logs block 3 with no data
+        (redo re-derives the mutation from the page) and stamps the record LSN;
+        `clearIncompleteSplit` returns without writing when the flag is already
+        clear, so the caller's call is a no-op after a cascading parent split
+        and still does the work after a no-split parent insert.
+        `EncodeBtreeSplitPG` refuses BOTH violations of upstream's `!isleaf`
+        condition — a level > 0 record with no child, and a leaf record carrying
+        one (a block PG's redo never reads). Guards: block-3 shape / both
+        level-gate refusals / a replay reproduction asserting the child comes
+        out unflagged at the record's LSN
+        (`internal/wal/btree_split_pg_test.go`), plus the writer side in
+        `internal/access/btree/btree_test.go` — 4000 wide-key inserts drive a
+        real internal split, and an internal split NOT occurring is a failure
+        rather than a skip, so the assertion cannot pass vacuously. Gates:
+        btree/wal/storage/amcheck/initdb + units PASS, btree -race PASS; pgbench
+        smoke PASS (commit hook). 1 ledger row (the no-split parent insert's
+        half of the same clear — upstream's XLOG_BTREE_INSERT_UPPER block 1).
   - [x] **S11.5c — `XLOG_BTREE_VACUUM`** (2026-08-10). NOT REINDEX-required.
         Both forms now carry upstream's `xl_btree_vacuum{ndeleted, nupdated}`;
         the incremental one adds the deleted offset numbers as block-0 data with

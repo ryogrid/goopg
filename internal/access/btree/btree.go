@@ -1730,7 +1730,13 @@ func (bt *BTree) ResetStats() {
 // callers pass it as sibBlk with its post-relink image as sibPage.
 // On a rightmost split sibBlk is storage.InvalidBlockNumber and
 // sibPage is nil.
-type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error)
+//
+// childBlk (M0130-S11.5b-3) is upstream's backup block 3: on an INTERNAL split
+// it is the page one level down whose BTIncompleteSplit flag this insertion
+// finishes — cleared by the caller in the same critical section, exactly as
+// _bt_split does — so the record can describe the clear too. It is
+// storage.InvalidBlockNumber on a leaf split, where upstream has no cbuf.
+type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error)
 
 // Options carries optional dependencies for Open/Create. The zero
 // value works for tests and callers that don't need WAL-backed
@@ -1807,8 +1813,8 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 	if hook == nil {
 		return nil
 	}
-	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
-		return hook(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		return hook(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage, childBlk)
 	}
 }
 
@@ -2479,7 +2485,9 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	if err != nil {
 		return err
 	}
-	return bt.insertIntoBlock(leafBlk, path, it)
+	// No child completes a split here: `it` is a leaf tuple, upstream's isleaf
+	// arm, which registers no cbuf (M0130-S11.5b-3).
+	return bt.insertIntoBlock(leafBlk, path, it, storage.InvalidBlockNumber)
 }
 
 var errNeedsSplit = errors.New("btree: insert needs split")
@@ -2541,7 +2549,14 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 // The split sequence stamps a high key on the left page BEFORE
 // dropping its latch — readers that descended to it under shared
 // latch will follow the new right-link to find the moved keys.
-func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item) error {
+//
+// childBlk (M0130-S11.5b-3) is upstream's `cbuf`: the page one level down whose
+// BTIncompleteSplit flag `it` — a separator being pushed up — finishes.
+// storage.InvalidBlockNumber for a leaf tuple, which is the only other way in.
+// Every internal-page insertion in goopg completes a child split, so this is
+// non-Invalid exactly when the pinned page turns out to be internal; the split
+// path below both clears the flag and logs the child as backup block 3.
+func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item, childBlk storage.BlockNumber) error {
 	// Lehman-Yao move-right: `blk` was decided by the caller (a fresh
 	// descendToLeaf under splitMu, or a path[] ancestor recorded before
 	// or during this connection's own split). `bt.splitMu` only
@@ -2868,6 +2883,35 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		writeOpaque(sibSlot.Page(), sibOp)
 	}
 
+	// M0130-S11.5b-3: an INTERNAL split is always finishing a split one level
+	// down, so upstream's `_bt_split` clears that child's BTP_INCOMPLETE_SPLIT
+	// inside the same critical section and logs the child as backup block 3.
+	// goopg used to leave the clear to the caller's `clearIncompleteSplit`
+	// after the parent insert returned — a separate record, and none at all
+	// from a real PG standby's point of view, which PANICs when
+	// `btree_xlog_split`'s `_bt_clear_incomplete_split(record, 3)` finds block
+	// 3 unregistered. Do it here instead; the caller's later call sees the flag
+	// already clear and becomes a no-op. Pinning a lower-level page while
+	// holding this level's latches is the DESCENT direction, which is why it
+	// cannot deadlock against a concurrent reader (and the whole split path is
+	// serialised by splitMu within this *BTree anyway).
+	var childSlot *storage.Slot
+	if childBlk != storage.InvalidBlockNumber {
+		childSlot, err = bt.pinW(childBlk)
+		if err != nil {
+			if sibSlot != nil {
+				bt.unpinW(sibSlot)
+			}
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return fmt.Errorf("btree: pin incomplete-split child %d: %w", childBlk, err)
+		}
+		childOp := readOpaque(childSlot.Page())
+		childOp.Flags &^= BTIncompleteSplit
+		writeOpaque(childSlot.Page(), childOp)
+	}
+
 	// Atomic split WAL record (Landing 3a). When a writer is
 	// available, emit ONE record covering both pages (plus the
 	// relinked old right sibling on a non-rightmost split) and stamp
@@ -2884,8 +2928,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if sibSlot != nil {
 			sibPage = sibSlot.Page()
 		}
-		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage)
+		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage, childBlk)
 		if lerr != nil {
+			if childSlot != nil {
+				bt.unpinW(childSlot)
+			}
 			if sibSlot != nil {
 				bt.unpinW(sibSlot)
 			}
@@ -2899,12 +2946,21 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if sibSlot != nil {
 			bt.pool.MarkDirtyWithLSNLocked(sibSlot, lsn)
 		}
+		if childSlot != nil {
+			bt.pool.MarkDirtyWithLSNLocked(childSlot, lsn)
+		}
 	} else {
 		bt.pool.MarkDirty(slot)
 		bt.pool.MarkDirty(rightSlot)
 		if sibSlot != nil {
 			bt.pool.MarkDirty(sibSlot)
 		}
+		if childSlot != nil {
+			bt.pool.MarkDirty(childSlot)
+		}
+	}
+	if childSlot != nil {
+		bt.unpinW(childSlot)
 	}
 	if sibSlot != nil {
 		bt.unpinW(sibSlot)
@@ -2939,11 +2995,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// Otherwise, insert the separator into the parent.
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
 		return err
 	}
 	// Parent insert succeeded — clear the INCOMPLETE_SPLIT flag
-	// on the left page. (M0055-0004-followup.)
+	// on the left page. (M0055-0004-followup.) A cascading parent SPLIT has
+	// already cleared it under its own record (S11.5b-3), in which case this
+	// is a no-op; the parent's no-split path still leaves it to us.
 	return bt.clearIncompleteSplit(blk)
 }
 
@@ -2952,12 +3010,20 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 // a successful split sequence (parent downlink inserted), and
 // by `finishSplit` when a writer / vacuum encounters a stale
 // incomplete-split marker from a crashed prior run.
+// Since M0130-S11.5b-3 a cascading parent SPLIT clears the flag itself (under
+// the split record, as _bt_split does), so this is frequently reached with the
+// flag already clear; it then returns without writing or logging anything
+// rather than emitting a redundant page record.
 func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
 	slot, err := bt.pinW(blk)
 	if err != nil {
 		return err
 	}
 	op := readOpaque(slot.Page())
+	if op.Flags&BTIncompleteSplit == 0 {
+		bt.unpinW(slot)
+		return nil
+	}
 	op.Flags &^= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
 	err = bt.markDirtyWithPageRecord(slot, blk)
@@ -3057,7 +3123,7 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
 	sepItem := downlinkItem(sepKey, rightBlk)
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
 		return err
 	}
 	return bt.clearIncompleteSplit(blk)
@@ -3116,7 +3182,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 			// latest state.
 			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
 		}
-		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem)
+		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem, leftBlk)
 	}
 
 	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)

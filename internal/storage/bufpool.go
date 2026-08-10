@@ -665,7 +665,12 @@ type WALFlusher interface {
 // relinked to rightBlk and sibPage its post-relink image, so the relink is
 // crash-atomic with the split; on a rightmost split sibBlk is
 // InvalidBlockNumber and sibPage is nil.
-type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page) (LSN, error)
+//
+// childBlk (M0130-S11.5b-3) is upstream's backup block 3: on an INTERNAL split
+// it is the page one level down whose incomplete-split flag this insertion
+// finishes, so redo can clear that flag under the same record. It is
+// InvalidBlockNumber on a leaf split, where upstream has no cbuf either.
+type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page, childBlk BlockNumber) (LSN, error)
 
 // LogHeapInsertFunc emits one logical heap-insert redo record. initPage marks
 // the first tuple on a freshly-initialised page (XLOG_HEAP_INIT_PAGE) so a

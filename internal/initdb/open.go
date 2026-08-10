@@ -446,11 +446,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic B-tree split record (Landing 3a of M0002 — see
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
-	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
+	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
 		// A8: emit a PG RM_BTREE split record carrying the post-split pages as
 		// full-page images instead of the goopg-native body. Recovery restores
 		// the images via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage, childBlk)
 		if err != nil {
 			return 0, err
 		}
