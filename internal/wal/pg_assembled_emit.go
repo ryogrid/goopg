@@ -550,22 +550,69 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	return framePGAssembled(RmgrBtree, xlogBtreeSplitR, 0, body), nil
 }
 
+// sizeOfXLogBtreeVacuumData is PG's SizeOfBtreeVacuum: ndeleted(2) +
+// nupdated(2).
+const sizeOfXLogBtreeVacuumData = 4
+
 // EncodeBtreeVacuumPG builds a PostgreSQL RM_BTREE vacuum record
-// (XLOG_BTREE_VACUUM opcode) carrying the post-vacuum leaf page as a full-page
-// image (backup block 0). goopg's vacuum pass already holds the exact final page
-// bytes (dead items removed, opaque flags updated), so this reuses the A0 FPI
-// encoder rather than reconstructing PG's incremental xl_btree_vacuum main-data
-// (ndeleted/nupdated + offset arrays). BKPIMAGE_APPLY makes replay
-// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restore the
-// image, identical to the native replayBtreeVacuum and PG's BLK_RESTORED redo.
-// No main-data is carried (the image is authoritative — a documented deviation
-// from PG's incremental xl_btree_vacuum); xl_xid = 0.
-func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
+// (XLOG_BTREE_VACUUM opcode), shaped for upstream `btree_xlog_vacuum`
+// (nbtxlog.c:479-528):
+//
+//	main data: xl_btree_vacuum{ndeleted, nupdated}
+//	block 0:   the leaf page. Either
+//	           (a) block data = the ndeleted deleted offset numbers (uint16
+//	               each, ascending), no image — the incremental form; or
+//	           (b) a full-page image with ndeleted = nupdated = 0.
+//
+// M0130-S11.5c. The previous form carried NO main data at all, only the image.
+// Unlike newroot/split that is not outright unreplayable — upstream dereferences
+// `xlrec` only under BLK_NEEDS_REDO, which an applied image skips — but the
+// record still lies to everything that reads it without replaying it, starting
+// with `pg_waldump`'s `btree_desc`, which prints ndeleted/nupdated off the end
+// of a zero-length main-data area. Both forms below now carry the struct.
+//
+// Which form is chosen is decided by asking whether the deletion DESCRIBES what
+// the primary did, not by trusting the caller: `btree.CheckVacuumDelete` replays
+// the offsets against the pre-vacuum page and compares the result with the page
+// VACUUM actually wrote. It says no in two cases goopg's vacuum reaches and PG's
+// does not:
+//
+//   - the page carried POSTING LISTS. goopg's vacuum filters an EXPANDED item
+//     list (one entry per TID) and re-marshals the survivors individually, so a
+//     posting tuple that lost one TID — or none — comes back as several ordinary
+//     tuples. Upstream keeps it a posting tuple and describes the change with
+//     `xl_btree_update` (nupdated), which is a rewrite of one item, not a change
+//     of the page's item count. goopg never emits nupdated > 0.
+//   - the page went EMPTY. VACUUM then also stamps BTDeleted|BTHalfDead (phase 1
+//     of page deletion), and no `btree_xlog_vacuum` sets those flags.
+//
+// The caller may also pass deleted = nil outright (the dedup-recovery rewrite in
+// _bt_insertonpg's fallback path reuses this record for a page rewrite that is a
+// CONSOLIDATION, not a deletion — there are no deleted offsets to name).
+//
+// The image form is upstream-legal for the same reason block 0 of the split
+// record is: redo takes BLK_RESTORED and skips the incremental arm entirely.
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, prePage, page storage.Page, deleted []uint16) ([]byte, error) {
 	if len(page) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-vacuum page must be %d bytes", storage.BlockSize)
 	}
-	blocks := []BlockRef{{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}}
-	body, err := assembleXLogRecord(nil, blocks)
+	incremental := len(deleted) > 0 && len(prePage) == storage.BlockSize &&
+		btree.CheckVacuumDelete(prePage, page, deleted) == nil
+
+	mainData := make([]byte, sizeOfXLogBtreeVacuumData)
+	var block BlockRef
+	if incremental {
+		binary.LittleEndian.PutUint16(mainData[0:2], uint16(len(deleted)))
+		blockData := make([]byte, 0, 2*len(deleted))
+		for _, off := range deleted {
+			blockData = binary.LittleEndian.AppendUint16(blockData, off)
+		}
+		block = BlockRef{ID: 0, Rel: rel, Block: blk, Data: blockData}
+	} else {
+		block = BlockRef{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}
+	}
+	body, err := assembleXLogRecord(mainData, []BlockRef{block})
 	if err != nil {
 		return nil, err
 	}

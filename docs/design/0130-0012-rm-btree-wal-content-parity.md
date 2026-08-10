@@ -1,7 +1,7 @@
 # 0130-0012 — `RM_BTREE` WAL content parity (M0130-S11.5)
 
-Status: **in progress** — S11.5a (`XLOG_BTREE_NEWROOT`) and S11.5b-1
-(`XLOG_BTREE_SPLIT_R`) landed 2026-08-10.
+Status: **in progress** — S11.5a (`XLOG_BTREE_NEWROOT`), S11.5b-1
+(`XLOG_BTREE_SPLIT_R`) and S11.5c (`XLOG_BTREE_VACUUM`) landed 2026-08-10.
 Series: M0130 Theme D, after 0130-0011 (the on-disk format).
 
 ## The gap this closes
@@ -238,6 +238,85 @@ then left, then the sibling back-link), each limb idempotent on its own
 - The obsolete `TestEncodeBtreeSplitPGFPIReplay`, which asserted the FPI form of
   block 1, is deleted — it pinned the property this slice removes.
 
+## S11.5c — `XLOG_BTREE_VACUUM`
+
+Upstream reference: `_bt_delitems_vacuum` (nbtpage.c:1250-1310) and
+`btree_xlog_vacuum` (nbtxlog.c:479-528).
+
+This record is the one FPI-only case that was **not** outright unreplayable.
+`btree_xlog_vacuum` dereferences `xlrec` only inside its `BLK_NEEDS_REDO` arm,
+which an applied image skips, so a real standby would survive it. It still lied
+to everything that reads the record without replaying it — starting with
+`pg_waldump`, whose `btree_desc` prints `ndeleted`/`nupdated` straight off the
+end of a zero-length main-data area. Both forms goopg now emits carry the
+struct:
+
+| | main data | block 0 |
+|---|---|---|
+| incremental | `xl_btree_vacuum{ndeleted, 0}` | the deleted offset numbers (`uint16` each, ascending), **no image** |
+| image | `xl_btree_vacuum{0, 0}` | full-page image, `BKPIMAGE_APPLY` |
+
+The image form is upstream-legal for the same reason block 0 of the split record
+is: redo takes `BLK_RESTORED` and never reaches the deletion.
+
+### Why there are two forms, and who decides
+
+goopg's VACUUM does not delete items in place. `VacuumIndexPages` parses the
+page into an item list, filters it, and refills the page (`resetPageItems` +
+re-marshal). That coincides with `PageIndexMultiDelete` — and is therefore
+describable by offset numbers — only sometimes:
+
+- **Posting lists break it.** `pageItemsWithDead` EXPANDS a posting tuple into
+  one entry per TID, and the survivors are re-marshalled individually, so a
+  posting tuple that lost one TID (or none) comes back as several ordinary
+  tuples. That is a change of the page's item *count*, which offset numbers
+  cannot express. Upstream instead rewrites the tuple in place and describes it
+  with `xl_btree_update` — the `nupdated` half of the record. goopg never emits
+  `nupdated > 0`, and its replay refuses a record that does rather than applying
+  the deletions and silently leaving dead TIDs behind.
+- **The page that went empty breaks it.** VACUUM additionally stamps
+  `BTDeleted|BTHalfDead` (phase 1 of page deletion), and no `btree_xlog_vacuum`
+  sets those flags.
+- **The dedup-recovery rewrite is not a deletion at all.** `_bt_insertonpg`'s
+  fallback path (`btree.go`, "dedup-recovery") reuses this record for a
+  CONSOLIDATION; there are no deleted offsets to name.
+
+Rather than enumerate those cases at the emit site and hope the list stays
+complete, the decision is made by asking the two pages: `btree.CheckVacuumDelete`
+replays the offsets against the pre-vacuum page and compares the result — items,
+high key, and opaque — with the page VACUUM actually wrote. Mismatch ⇒ image.
+This is the same stance as S11.5b's right-page opaque check, with a fallback
+instead of a refusal: a record that describes a rewrite the primary did not
+perform must never ship, but VACUUM must not fail either.
+
+`ReplayVacuumDelete` (`internal/access/btree/pgvacuum.go`) is upstream's
+`PageIndexMultiDelete` plus the unconditional hint clear (`btpo_cycleid = 0`,
+`btpo_flags &= ~BTP_HAS_GARBAGE`; goopg has no cycle id). One documented
+difference: it rebuilds the item area rather than compacting line pointers in
+place, so a SURVIVING item that carried an `LP_DEAD` mark comes back unmarked.
+That bit is an unlogged hint and goopg's VACUUM deletes every marked item
+anyway, so the loss can cost a later re-check, never correctness.
+
+## Guards — S11.5c
+
+- `internal/wal/btree_vacuum_pg_test.go` — the incremental record's shape
+  (`SizeOfBtreeVacuum` main data, `ndeleted`, `nupdated = 0`, the offset array as
+  block data, an explicit **"block 0 carries no image"** assertion and a size
+  bound, since shrinking the record is half the point); a replay reproduction
+  against the pre-vacuum page on disk with the garbage hint cleared and
+  same-LSN idempotency; and the fallback — a written page the offsets do not
+  reproduce comes out as an image with `ndeleted = 0`.
+- `internal/access/btree/pgvacuum_test.go` — the deletion itself (survivors keep
+  their order and slide down, high key untouched), the offset-array validation
+  (descending, duplicate, naming the high key, out of range), and
+  `CheckVacuumDelete` accepting the exact result while rejecting a different
+  item set, a differing opaque, and the page-went-empty flag stamp.
+- `internal/access/btree/btree_vacuum_wal_test.go` — the end-to-end half no
+  encoder test can see: the capture hook runs `CheckVacuumDelete` on the offsets
+  `VacuumIndexPages` itself computes, and the test fails if NO emission named
+  any (which would mean the incremental form is dead code behind a silent
+  fallback).
+
 ## Guards — S11.5a
 
 - `internal/wal/btree_newroot_pg_test.go` — record shape (main data, the three
@@ -268,14 +347,16 @@ then left, then the sibling back-link), each limb idempotent on its own
   S11.5a hit at block 1), so a real PG standby still cannot replay a goopg
   INTERNAL split. goopg clears the flag in a separate step (`clearIncompleteSplit`)
   and has no child block at the emit site today.
-- **`XLOG_BTREE_VACUUM`** — `xl_btree_vacuum{ndeleted, nupdated}` plus the
-  deleted/updated offset arrays.
+- **The `nupdated` half of `XLOG_BTREE_VACUUM`** — `xl_btree_update`, upstream's
+  in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
+  re-marshals the survivors as separate tuples instead, so a page with posting
+  lists still falls back to a full-page image (S11.5c above).
 - **`XLOG_BTREE_UNLINK_PAGE`** — the one with a *documented* reason to stay
   native (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage): an
   emit-time FPI can be stale against a concurrent split on another `*BTree`, and
   the PG-faithful form needs incremental link patches rather than a page
   snapshot.
 
-Until all four land, `relhasindex` stays false in `buildUserPGClassRow`
+Until those land, `relhasindex` stays false in `buildUserPGClassRow`
 (S11.6): a PG standby that saw goopg's indexes would try to replay these
 records.

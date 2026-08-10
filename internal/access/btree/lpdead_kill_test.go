@@ -27,7 +27,7 @@ func newTestTreeWAL(t *testing.T) (*BTree, *storage.Pool, func()) {
 		LogPageImage: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
 			return next(), nil
 		},
-		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
+		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, _, _ storage.Page, _ []uint16) (storage.LSN, error) {
 			return next(), nil
 		},
 		WALFrontier: func() uint64 { return uint64(lsn) },
@@ -192,7 +192,7 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 		LogPageImage: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
 			return next(), nil
 		},
-		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, page storage.Page) (storage.LSN, error) {
+		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page, page storage.Page, _ []uint16) (storage.LSN, error) {
 			vacCalls++
 			lastPage = append(storage.Page(nil), page...)
 			return next(), nil

@@ -533,11 +533,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// `btree.VacuumIndexPages` so per-page vacuum cost is
 	// proportional to surviving items rather than 8 KiB of
 	// page bytes.
-	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
-		// A8: emit a PG RM_BTREE vacuum record carrying the post-vacuum page as a
-		// full-page image instead of the goopg-native kept-items body. Recovery
-		// restores the image via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, page)
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, prePage, page storage.Page, deleted []uint16) (storage.LSN, error) {
+		// M0130-S11.5c: emit PG's xl_btree_vacuum — main data {ndeleted,
+		// nupdated} plus the deleted offset numbers as block-0 data, or a
+		// full-page image when the rewrite is not a plain deletion.
+		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, prePage, page, deleted)
 		if err != nil {
 			return 0, err
 		}

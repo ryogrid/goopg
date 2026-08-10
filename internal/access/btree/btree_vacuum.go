@@ -85,10 +85,35 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 			firstKey = append([]byte(nil), items[0].key...)
 		}
 
+		// M0130-S11.5c: PG's xl_btree_vacuum names the doomed items by OFFSET
+		// NUMBER, which is only possible while the item list maps one-to-one
+		// onto line pointers. A posting list expands into several items here
+		// and its survivors are re-marshalled individually below, so the
+		// rewrite changes the page's item count in a way offset numbers cannot
+		// describe — in that case collect nothing and let the encoder log a
+		// full-page image. The pre-vacuum page goes to the encoder as well: it
+		// verifies that replaying these offsets reproduces the page written
+		// here (see btree.CheckVacuumDelete) rather than trusting this loop.
+		lineCount, err := PGDataItemCount(slot.Page())
+		if err != nil {
+			bt.unpinW(slot)
+			return totalRemoved, err
+		}
+		byOffset := lineCount == len(items)
+		var prePage storage.Page
+		var deletedOffs []uint16
+		if byOffset {
+			prePage = make(storage.Page, storage.BlockSize)
+			copy(prePage, slot.Page())
+		}
+
 		var kept []item
 		for i, it := range items {
 			if itemDead[i] || deadSet[tidKey(it.ptr)] {
 				totalRemoved++
+				if byOffset {
+					deletedOffs = append(deletedOffs, pgPhysOffnum(slot.Page(), i))
+				}
 			} else {
 				kept = append(kept, it)
 			}
@@ -139,10 +164,13 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 				writeOpaque(slot.Page(), opAfter)
 			}
 			if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
-				// A8: the record carries the post-vacuum page as a full-page
-				// image, so pass the mutated page rather than the kept items.
+				// M0130-S11.5c: hand the encoder both pages plus the deleted
+				// offsets; it picks the incremental xl_btree_vacuum form when
+				// they reproduce this page and a full-page image when they do
+				// not (posting lists above, or the page that just went empty —
+				// its BTDeleted|BTHalfDead stamp is no part of any vacuum redo).
 				if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logVac(bt.rel, cur, slot.Page())
+					return logVac(bt.rel, cur, prePage, slot.Page(), deletedOffs)
 				}); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err

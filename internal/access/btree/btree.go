@@ -2756,10 +2756,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			writeOpaque(slot.Page(), opAfter)
 		}
 		if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
-			// A8: the record carries the post-vacuum page as a full-page image,
-			// so pass the mutated page rather than the kept-items projection.
+			// M0130-S11.5c: this rewrite is a dedup CONSOLIDATION, not a
+			// deletion — items merged into posting tuples, so no set of
+			// deleted offset numbers describes it. Pass none and let the
+			// encoder log the page as a full-page image.
 			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logVac(bt.rel, blk, slot.Page())
+				return logVac(bt.rel, blk, nil, slot.Page(), nil)
 			}); err != nil {
 				held.release()
 				return err

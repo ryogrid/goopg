@@ -689,10 +689,14 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // LogHeapVacuumFunc emits one logical heap-vacuum (page prune) redo record.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
-// LogBtreeVacuumFunc emits one btree-vacuum redo record. A8: the record now
-// carries the post-vacuum page as a full-page image (see wal.EncodeBtreeVacuumPG),
-// so the caller passes the mutated page rather than the kept-items projection.
-type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
+// LogBtreeVacuumFunc emits one btree-vacuum redo record (PG's
+// xl_btree_vacuum). M0130-S11.5c: the caller passes BOTH pages — the page as it
+// was before the rewrite and the page it wrote — plus the physical offset
+// numbers it deleted, so the encoder can check that "delete these offsets"
+// reproduces the written page and fall back to a full-page image when it does
+// not. `prePage` may be nil and `deleted` empty; that asks for the image form
+// outright (the dedup-recovery rewrite is a consolidation, not a deletion).
+type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, prePage, page Page, deleted []uint16) (LSN, error)
 
 // BtreeUnlinkPageRequest collects the 4-page mutation control info.
 type BtreeUnlinkPageRequest struct {

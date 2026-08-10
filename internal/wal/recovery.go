@@ -2478,8 +2478,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeVacuum:
+			// M0130-S11.5c: goopg emits the real xl_btree_vacuum — main data
+			// {ndeleted, nupdated} plus, when the rewrite is expressible as a
+			// deletion, the deleted offset numbers as block-0 data with no
+			// image. The image form (ndeleted = 0) is restored inside the
+			// replay function.
+			if err := replayDecodedXLogBtreeVacuum(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
-			// Other btree records (split / vacuum / unlink / …) are
+			// Other btree records (unlink / …) are
 			// not flipped yet and are emitted with full-page images; restore
 			// each block from its FPI.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
@@ -3117,6 +3127,50 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 	}
 	return nil
+}
+
+// replayDecodedXLogBtreeVacuum applies a PG-format xl_btree_vacuum, mirroring
+// upstream btree_xlog_vacuum (nbtxlog.c:479-528): delete the named offset
+// numbers from the leaf page, then clear its garbage hint.
+//
+// Block 0 carrying an apply-image is the other form goopg emits (see
+// EncodeBtreeVacuumPG: the rewrite was a consolidation, or touched posting
+// lists, or emptied the page) and is upstream's BLK_RESTORED arm — restore it
+// and do nothing else, exactly as upstream skips the deletion under a restored
+// image.
+//
+// nupdated > 0 is a record only a real PG primary produces: it rewrites posting
+// tuples in place (xl_btree_update) where goopg re-marshals surviving TIDs as
+// separate items. Replaying the deletions while dropping the updates would
+// silently leave dead TIDs on the page, so it is refused instead.
+func replayDecodedXLogBtreeVacuum(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	if len(xlog.MainData) < sizeOfXLogBtreeVacuumData {
+		return fmt.Errorf("wal: xlog btree-vacuum: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeVacuumData)
+	}
+	ndeleted := int(binary.LittleEndian.Uint16(xlog.MainData[0:2]))
+	nupdated := int(binary.LittleEndian.Uint16(xlog.MainData[2:4]))
+
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-vacuum missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, endLSN)
+	}
+	if nupdated != 0 {
+		return fmt.Errorf("wal: xlog btree-vacuum nupdated=%d: PG's posting-list updates (xl_btree_update) are not implemented", nupdated)
+	}
+	if len(block.Data) < 2*ndeleted {
+		return fmt.Errorf("wal: xlog btree-vacuum block data len %d (want >= %d for ndeleted=%d)", len(block.Data), 2*ndeleted, ndeleted)
+	}
+	deleted := make([]uint16, ndeleted)
+	for i := range deleted {
+		deleted[i] = binary.LittleEndian.Uint16(block.Data[2*i : 2*i+2])
+	}
+	return replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		return btree.ReplayVacuumDelete(page, deleted)
+	})
 }
 
 // replayInitedXLogBlock applies `apply` to a WILL_INIT block: the prior page

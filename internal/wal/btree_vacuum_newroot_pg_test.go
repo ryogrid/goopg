@@ -7,9 +7,11 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestEncodeBtreeVacuumPGFPIReplay drives a btree vacuum (one leaf overwritten
-// in place) through the PG-format emit + FPI-restore replay and asserts the page
-// is restored byte-for-byte (modulo pd_lsn, which replay stamps).
+// TestEncodeBtreeVacuumPGFPIReplay drives a btree vacuum through the record's
+// IMAGE form — the one the encoder falls back to when the rewrite is not a plain
+// deletion (no pre-page, no deleted offsets) — and asserts the page is restored
+// byte-for-byte (modulo pd_lsn, which replay stamps). The incremental form is
+// covered by TestEncodeBtreeVacuumPGIncremental.
 func TestEncodeBtreeVacuumPGFPIReplay(t *testing.T) {
 	dataDir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
@@ -28,7 +30,7 @@ func TestEncodeBtreeVacuumPGFPIReplay(t *testing.T) {
 
 	page := splitTestPage(0xC0)
 
-	framed, err := EncodeBtreeVacuumPG(rel, 0, page)
+	framed, err := EncodeBtreeVacuumPG(rel, 0, nil, page, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

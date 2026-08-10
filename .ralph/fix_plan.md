@@ -1558,8 +1558,37 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         PG standby still cannot replay a goopg internal split. goopg clears the
         flag in a separate step (`clearIncompleteSplit`) and has no child block
         at the emit site. Ledger 2026-08-10.
-  - [ ] **S11.5c — `XLOG_BTREE_VACUUM`**. `xl_btree_vacuum{ndeleted, nupdated}`
-        plus the deleted/updated offset arrays.
+  - [x] **S11.5c — `XLOG_BTREE_VACUUM`** (2026-08-10). NOT REINDEX-required.
+        Both forms now carry upstream's `xl_btree_vacuum{ndeleted, nupdated}`;
+        the incremental one adds the deleted offset numbers as block-0 data with
+        NO image. This was the one FPI-only record that was not outright
+        unreplayable — `btree_xlog_vacuum` dereferences `xlrec` only inside its
+        `BLK_NEEDS_REDO` arm, which an applied image skips — but it still lied
+        to every reader that does not replay it, starting with `pg_waldump`'s
+        `btree_desc` printing ndeleted/nupdated off the end of a zero-length
+        main-data area. Which form is emitted is decided by ASKING THE TWO PAGES
+        (`btree.CheckVacuumDelete` replays the offsets against the pre-vacuum
+        page and compares items, high key and opaque with what VACUUM wrote),
+        not by enumerating cases at the emit site: goopg's VACUUM refills the
+        page from a parsed item list, so it coincides with `PageIndexMultiDelete`
+        except when the page carries POSTING LISTS (expanded per TID, survivors
+        re-marshalled as separate tuples — upstream instead rewrites the tuple in
+        place via `xl_btree_update`, the `nupdated` half goopg never emits), when
+        the page went EMPTY (VACUUM also stamps `BTDeleted|BTHalfDead`, which no
+        vacuum redo sets), or when the record is reused for the dedup-recovery
+        CONSOLIDATION. Mismatch ⇒ full-page image, which is upstream-legal for
+        block 0's reason (`BLK_RESTORED` skips the deletion). New
+        `internal/access/btree/pgvacuum.go`: ReplayVacuumDelete (upstream's
+        PageIndexMultiDelete + the unconditional garbage-hint clear; it rebuilds
+        the item area, so a surviving LP_DEAD mark is lost — an unlogged hint),
+        CheckVacuumDelete. Replay `replayDecodedXLogBtreeVacuum` refuses
+        nupdated > 0 rather than dropping the updates. Guards:
+        `internal/wal/btree_vacuum_pg_test.go`,
+        `internal/access/btree/pgvacuum_test.go`, and the capture hook in
+        `btree_vacuum_wal_test.go` now runs CheckVacuumDelete on the offsets
+        VacuumIndexPages itself computes and fails if no emission named any.
+        Gates: btree/wal/storage/amcheck/initdb + units PASS; pgbench smoke PASS
+        (commit hook). 1 ledger row.
   - [ ] **S11.5d — `XLOG_BTREE_UNLINK_PAGE`**. The one with a documented reason
         to stay native (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
         A8-unlinkpage): an emit-time FPI can be stale against a concurrent

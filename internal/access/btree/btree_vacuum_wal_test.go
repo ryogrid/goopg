@@ -23,9 +23,22 @@ type capturedVacuumEmission struct {
 	blk       storage.BlockNumber
 	keptCount int
 	flags     uint16
+	// deleted is the record's xl_btree_vacuum offset array (M0130-S11.5c);
+	// empty when the emission fell back to a full-page image.
+	deleted  []uint16
+	checkErr error
 }
 
-func (c *captureLogBtreeVacuum) emit(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
+func (c *captureLogBtreeVacuum) emit(rel storage.RelFileNode, blk storage.BlockNumber, prePage storage.Page, page storage.Page, deleted []uint16) (storage.LSN, error) {
+	// M0130-S11.5c: when VACUUM names deleted offsets, replaying them against
+	// the pre-vacuum page must reproduce the page it wrote — the same question
+	// wal.EncodeBtreeVacuumPG asks before choosing the incremental form. Doing
+	// it here checks the offsets VacuumIndexPages actually computes, which no
+	// encoder-level test can see.
+	var checkErr error
+	if len(deleted) > 0 {
+		checkErr = CheckVacuumDelete(prePage, page, deleted)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	count, _ := storage.PageLinePointerCount(page)
@@ -34,6 +47,8 @@ func (c *captureLogBtreeVacuum) emit(rel storage.RelFileNode, blk storage.BlockN
 		blk:       blk,
 		keptCount: int(count),
 		flags:     readOpaque(page).Flags,
+		deleted:   append([]uint16(nil), deleted...),
+		checkErr:  checkErr,
 	})
 	c.nextLSN += uint64(64)
 	return storage.LSN(c.nextLSN), nil
@@ -102,7 +117,14 @@ func TestVacuumIndexPagesEmitsLogicalRecord(t *testing.T) {
 	if len(cap.emitted) == 0 {
 		t.Fatal("no LogBtreeVacuum emissions; expected at least one per pruned leaf")
 	}
+	incremental := 0
 	for i, e := range cap.emitted {
+		if len(e.deleted) > 0 {
+			incremental++
+			if e.checkErr != nil {
+				t.Errorf("emission[%d]: deleted offsets %v do not reproduce the written page: %v", i, e.deleted, e.checkErr)
+			}
+		}
 		if e.rel != rel {
 			t.Errorf("emission[%d]: rel=%+v want %+v", i, e.rel, rel)
 		}
@@ -112,6 +134,13 @@ func TestVacuumIndexPagesEmitsLogicalRecord(t *testing.T) {
 		if e.keptCount == 0 && e.flags&halfDead == 0 {
 			t.Errorf("emission[%d]: empty post-vacuum page without BTHalfDead/BTDeleted flags (got flags=%#x)", i, e.flags)
 		}
+	}
+	// M0130-S11.5c: a page of distinct int4 keys carries no posting lists, so
+	// the deletions ARE expressible as offset numbers — if none of the
+	// emissions names any, the encoder silently fell back to page images
+	// everywhere and the incremental record would be dead code.
+	if incremental == 0 {
+		t.Errorf("no emission named deleted offsets; every record fell back to a full-page image")
 	}
 }
 
