@@ -3530,7 +3530,21 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 				collOID = pgIdx.indCollation[i]
 			}
 			colOpClasses = append(colOpClasses, cat.ResolveIndexColumnOpclassName(classOID, col.Type.Name, btreeMethodOID))
-			colCollations = append(colCollations, cat.ResolveIndexColumnCollationName(collOID))
+			// M0130-S11.6: indcollation is no longer "nonzero iff explicit
+			// COLLATE" — it now carries the key column's own collation for
+			// every collatable key, because a real PG 18.3 cannot compare an
+			// index key without it (42P22). So an OID that merely repeats the
+			// column's collation is NOT an explicit clause and must reverse-
+			// resolve to "", or a checkpointed restart would invent a
+			// `COLLATE "default"` that pg_get_indexdef/\d/pg_dump then print.
+			// That is upstream's own test in pg_get_indexdef_worker
+			// (ruleutils.c): print COLLATE only when indcollation differs from
+			// the column's collation.
+			collName := ""
+			if collOID != 0 && collOID != executor.IndexKeyColumnCollationOID(cat, tbl, col.Name) {
+				collName = cat.ResolveIndexColumnCollationName(collOID)
+			}
+			colCollations = append(colCollations, collName)
 		}
 		if len(colNames) == 0 {
 			continue

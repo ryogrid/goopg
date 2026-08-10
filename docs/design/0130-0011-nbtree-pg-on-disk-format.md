@@ -1345,9 +1345,75 @@ sources agree:
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.
-- **S11.6 — unblock #10.** Flip `relhasindex` in `buildUserPGClassRow`, re-run
-  `TestE2E_PGStandbyFullCycle` end to end, and add `pg_amcheck` over a
-  goopg-written user index as the standing gate.
+- **S11.6 — unblock #10 (LANDED 2026-08-10).** The slice this whole theme
+  existed to make safe. `pg_class.relhasindex` for a user table was hardcoded
+  `false`; PG's `get_relation_info` (plancat.c) will not call
+  `RelationGetIndexList` without it and `ExecInitModifyTable` will not call
+  `ExecOpenIndices` without it, so a real PG 18.3 on a goopg cluster planned
+  only seq scans and — the damaging half — silently skipped index maintenance
+  for its own post-failover INSERTs. It could not be flipped before S11.2b /
+  S11.3 / S11.4 because the flag would only have converted that silent gap into
+  `index "…" contains corrupted page at block 0` (blocker #12).
+
+  **The flag is not `len(cat.IndexesOnTable(tbl)) > 0`.** After S11.4 the key
+  format is a per-INDEX property with nothing on disk recording it: an index
+  `buildPGIndexKeyDesc` describes stores real per-attribute PG datums, one it
+  refuses (expression key, explicit opclass, non-bytewise collation, a type
+  with no 3b-2a comparator, and `numeric`/`uuid` whose goopg heap image is not
+  PG's) keeps goopg's order-preserving key BLOB. A blob tree is a structurally
+  valid nbtree — PG pages, PG metapage, real `IndexTupleData` items, so
+  `_bt_checkpage` accepts it — but its keys are ordered by goopg's encoding, not
+  by the opclass, so PG would descend it with the wrong comparator: wrong rows,
+  and inserts filed where goopg's own descent never looks. `relhasindex` is
+  per-RELATION and `RelationGetIndexList` reads every `pg_index` row once it is
+  set, so there is no way to expose only the describable ones. Hence
+  `pgClassRelhasindex` (`internal/executor/pg18_user_catalog_rows.go`) is
+  all-or-nothing: true only when the table has at least one index and EVERY
+  index on it is descriptor-bearing. A mixed table keeps the pre-slice
+  behaviour, which is recoverable (goopg maintains its own indexes) where a
+  mis-ordered write is not.
+
+  **The flag has to be re-derived on CREATE INDEX, in both directions.** goopg
+  writes a table's `pg_class` heap row at CREATE TABLE, when no index exists, and
+  `syncIndexToCatalogHeap` only ever wrote the INDEX's own rows — so the flag
+  would have stayed false forever. `resyncTableClassHeapRowForIndexSet`
+  (`internal/executor/operators_ddl.go`) is upstream's `index_create` →
+  `index_update_stats` → `heap_inplace_update`, and it runs downward too:
+  adding an undescribable index to a table that had the flag must take it back
+  off. DROP INDEX deliberately does not touch it — `index_drop` does not either,
+  a stale true is harmless (PG finds no `pg_index` rows), and it cannot become
+  unsafe because true implies every index was describable, so removing one
+  leaves the survivors describable.
+
+  **Discovery: `pg_index.indcollation` was InvalidOid for every implicit
+  collation.** `ResolveIndexColumnCollationOID` returned nonzero only for an
+  explicit `COLLATE` clause. Upstream's `ComputeIndexAttrs`
+  (src/backend/catalog/index.c) fills `collationIds[]` from the heap attribute's
+  `attcollation`, and `_bt_mkscankey` hands that OID to the comparison function
+  — so a zero on a collatable key makes PG fail *every* scan and *every* insert
+  on the index with `42P22: could not determine which collation to use for
+  string comparison`. This was invisible for as long as PG never opened a goopg
+  index; the flip surfaced it immediately (the E2E's `s10_t_val_idx` is on a
+  `text` column). `IndexKeyColumnCollationOID` now supplies the column's own
+  collation (its per-column `COLLATE`, else `pg_type.typcollation`: 100 for
+  text/varchar/bpchar, 950 for `name`, 0 for non-collatable), and the
+  checkpointed-restart reload (`internal/initdb/open.go`) compares the decoded
+  OID against that same value before calling it an explicit clause — upstream's
+  rule in `pg_get_indexdef_worker`, without which a restart would invent a
+  `COLLATE "default"` that `\d`/pg_dump then print.
+
+  Gate: `TestE2E_PGStandbyFullCycle` now asserts three separate facts after the
+  promotion, each of which failed independently on the way here — `relhasindex`
+  is set on the promoted PG's `pg_class`; an `enable_seqscan=off` lookup finds
+  the row PG itself inserted after promotion (so `ExecInsertIndexTuples` wrote
+  into goopg's tree); and the same forced-index lookup finds a row goopg wrote
+  before the failover (so PG's `_bt_compare` descent agrees with goopg's writer
+  about key order). `pg_amcheck` over a goopg-written user btree was already a
+  standing gate — `TestPort_PgAmcheckBtreeIndexCheck` and
+  `TestPort_PgAmcheckAllTables` — and both still pass.
+
+  Guards: `internal/executor/pgindex_relhasindex_test.go` (no index / describable
+  / undescribable / mixed-takes-it-down / gate-off / index-relation-stays-false).
 
 ## Risks
 

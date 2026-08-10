@@ -13990,6 +13990,49 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 			return fmt.Errorf("mirror catalogs to postgres db: %w", err)
 		}
 	}
+	// M0130-S11.6: the BASE relation's `relhasindex` now depends on the set of
+	// indexes on it (pgClassRelhasindex), so creating one has to rewrite the
+	// table's own pg_class row — upstream's index_create → index_update_stats →
+	// heap_inplace_update. Without this the flag keeps whatever CREATE TABLE
+	// wrote, which is always false: no index exists yet at that point, so a PG
+	// 18.3 on this cluster would go on skipping RelationGetIndexList forever.
+	//
+	// It runs in BOTH directions on purpose. Adding an index goopg cannot
+	// describe (an expression key, a `numeric` column, …) must take the flag
+	// back DOWN on a table that had it, because relhasindex is per-relation
+	// while the key format is per-index: PG would otherwise open the new
+	// blob-format tree with the opclass comparator. See pgClassRelhasindex.
+	if err := resyncTableClassHeapRowForIndexSet(ctx, idx.Table); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resyncTableClassHeapRowForIndexSet rewrites the pg_class (and, as a
+// consequence of reusing the proven delete-old-rows + syncTableToCatalogHeap
+// arm, pg_attribute/pg_attrdef/pg_rewrite) heap rows of a BASE table whose
+// index set just changed, so `relhasindex` on disk matches what
+// pgClassRelhasindex now computes (M0130-S11.6).
+//
+// Only the CREATE side is wired. DROP INDEX deliberately leaves the flag alone,
+// which is upstream's behaviour too — `index_drop` never clears relhasindex; a
+// stale true is harmless (RelationGetIndexList finds no pg_index rows and gives
+// up), and it cannot become unsafe here because the flag is only ever true when
+// EVERY index on the table is descriptor-bearing, so removing one leaves the
+// survivors describable.
+func resyncTableClassHeapRowForIndexSet(ctx *Context, tbl *catalog.Table) error {
+	if tbl == nil || !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(ctx) {
+			deleteCatalogRowsForOID(ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if err := syncTableToCatalogHeap(ctx, tbl); err != nil {
+		return fmt.Errorf("pg_class relhasindex resync for %q: %w", tbl.Name, err)
+	}
 	return nil
 }
 

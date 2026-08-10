@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,6 +206,36 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 		t.Fatalf("post-promote row id=4 = %q, want post-promote", got)
 	}
 
+	// M0130-S11.6 (blocker #10): the promoted PG must now MAINTAIN and READ
+	// the goopg-created index, not merely see its pg_class row. Three separate
+	// facts, each of which failed independently while relhasindex was hardcoded
+	// false or the nbtree on-disk format was goopg-private:
+	//
+	//  1. relhasindex is set on the base relation — without it plancat.c's
+	//     get_relation_info never calls RelationGetIndexList and ExecOpenIndices
+	//     never opens the index, so PG silently plans seq scans and silently
+	//     skips index maintenance for its own INSERTs.
+	//  2. an index-only path finds the row PG itself inserted after promotion,
+	//     which is only possible if ExecInsertIndexTuples wrote into goopg's
+	//     tree.
+	//  3. the same scan finds a row goopg wrote BEFORE the failover, i.e. PG's
+	//     `_bt_compare` descent agrees with goopg's writer about key order.
+	if got := pgScalar(t, standby,
+		"SELECT relhasindex FROM pg_class WHERE relname = 's10_t' AND relkind = 'r'"); got != "t" {
+		t.Fatalf("promoted PG pg_class.relhasindex for s10_t = %q, want t", got)
+	}
+	// enable_seqscan=off forces the planner onto the index; a wrong count here
+	// is an index goopg and PG disagree about, not a missing row (the seq-scan
+	// assertion above already passed).
+	if got := pgIndexScanCount(t, standby, "val = 'post-promote'"); got != "1" {
+		t.Fatalf("index lookup of PG's own post-promote insert = %q, want 1 "+
+			"(PG did not maintain the goopg-created index)", got)
+	}
+	if got := pgIndexScanCount(t, standby, "val = 'with-extra'"); got != "1" {
+		t.Fatalf("index lookup of a goopg-written row = %q, want 1 "+
+			"(PG's descent disagrees with goopg's key order)", got)
+	}
+
 	// ── Phase D: Reverse attach — goopg standby against promoted PG ──
 
 	// Create a replication slot on the promoted PG for the reverse goopg standby.
@@ -280,6 +311,18 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 	}
 
 	t.Logf("[M0130-S10] full cycle PASSED: goopg→PG standby→promote→goopg reverse standby")
+}
+
+// pgIndexScanCount counts s10_t rows matching where with enable_seqscan off, so
+// the planner is forced onto the goopg-created index. The SET and the SELECT
+// must travel in ONE psql invocation (a GUC set in a previous connection is
+// gone), which makes psql echo the SET's command tag ahead of the value — hence
+// the trim rather than a bare pgScalar comparison.
+func pgIndexScanCount(t *testing.T, c *pgcluster.Cluster, where string) string {
+	t.Helper()
+	out := pgScalar(t, c, fmt.Sprintf(
+		"SET enable_seqscan = off; SELECT count(*) FROM public.s10_t WHERE %s", where))
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(out), "SET"))
 }
 
 // waitForPhysicalStreamingPGtoGoopg waits for the goopg standby to reach

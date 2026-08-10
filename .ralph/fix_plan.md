@@ -313,12 +313,12 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       HEAD: PASS in 5.77 s, both subtests (`async` 2.91 s,
       `sync_remote_apply` 2.85 s). Re-verified again after the
       `runGoopgBasebackupToPGSlot` helper refactor below (5.76 s).
-- [ ] **testport/TestE2E_PGStandbyFullCycle** — FAILed
+- [x] **testport/TestE2E_PGStandbyFullCycle** — FAILed
       (AI-20260810-011258-003; repro: `go test -v -run
       '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`). This is the
-      M0130-S10 four-phase harness test itself, and it has **never** run
-      green. **PARTIAL (2026-08-10) — first two blockers fixed, a third
-      (pre-existing) one remains; item stays open.**
+      M0130-S10 four-phase harness test itself, and it had **never** run
+      green. **GREEN 2026-08-10 (7.0 s) — twelve blockers, closed by
+      M0130-S11.6, the last step of the nbtree PG-on-disk-format theme.**
       1. FIXED — the harness died at its FIRST statement,
          `SELECT pg_create_physical_replication_slot('s10_forward')`, with
          42883. goopg could create slots only over the replication protocol;
@@ -569,7 +569,9 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       **2026-08-10 — remaining blockers #10/#12 promoted out of this item into
       M0130 Theme D (M0130-S11.1..S11.6, below).** They are a milestone-sized
       nbtree on-disk-format conversion, not triage work; S11.1 (the PG format
-      layer) landed 2026-08-10. This item stays open and is CLOSED BY S11.6.
+      layer) landed 2026-08-10. **CLOSED BY S11.6 (2026-08-10)** — the whole
+      four-phase cycle is green and the promoted PG both maintains and reads a
+      goopg-written btree.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —
@@ -1806,11 +1808,42 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         putting the horizon's value in record AND page — the one thing the
         redo-side tests cannot see, since they read `0` as "recyclable now").
         Doc: `docs/design/0130-0012-rm-btree-wal-content-parity.md` §S11.5d-3c.
-- [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
-      `relhasindex` in `buildUserPGClassRow`
-      (`internal/executor/pg18_user_catalog_rows.go`), re-run
-      `TestE2E_PGStandbyFullCycle` end to end, and add `pg_amcheck` over a
-      goopg-written user index as the standing gate.
+- [x] **M0130-S11.6 — unblock S10 blocker #10** (landed 2026-08-10).
+      `pg_class.relhasindex` for a user table is no longer hardcoded false, so a
+      real PG 18.3 on a goopg cluster finally calls `RelationGetIndexList` /
+      `ExecOpenIndices` instead of silently planning seq scans and silently
+      skipping index maintenance for its own post-failover INSERTs. It is NOT
+      `len(cat.IndexesOnTable(tbl)) > 0`: since the S11.4 flip the key format is
+      a per-INDEX property with nothing on disk recording it, and a blob-format
+      tree is a structurally VALID nbtree (`_bt_checkpage` accepts it) whose keys
+      PG would order with the wrong comparator — wrong rows, inserts filed where
+      goopg's descent never looks. `relhasindex` is per-RELATION and
+      `RelationGetIndexList` reads every pg_index row once set, so
+      `pgClassRelhasindex` is all-or-nothing: true only when EVERY index on the
+      table is descriptor-bearing. The second half is that it has to be
+      RE-derived: goopg writes the table's pg_class row at CREATE TABLE, when no
+      index exists, so `resyncTableClassHeapRowForIndexSet` runs from
+      `syncIndexToCatalogHeap` (upstream `index_create` → `index_update_stats` →
+      `heap_inplace_update`) — in BOTH directions, since adding an undescribable
+      index must take the flag back off. **Discovery: `pg_index.indcollation` was
+      InvalidOid for every implicit collation** (goopg wrote it only for an
+      explicit `COLLATE`), which makes PG fail EVERY scan and EVERY insert on a
+      collatable index with `42P22: could not determine which collation to use`
+      — invisible until PG actually opened one. `IndexKeyColumnCollationOID` now
+      supplies the column's own collation (upstream `ComputeIndexAttrs`), and the
+      restart reload compares against it before calling a decoded OID explicit
+      (upstream's `pg_get_indexdef_worker` rule), else a restart would invent a
+      `COLLATE "default"`. **`TestE2E_PGStandbyFullCycle` PASSES end to end** —
+      blockers #10 and #12 closed, AI-20260810-011258-003 with them — and now
+      asserts the three facts that failed independently on the way here:
+      relhasindex set on the promoted PG, a forced-index lookup finding the row
+      PG itself inserted, and the same lookup finding a row goopg wrote before
+      the failover. The `pg_amcheck`-over-a-goopg-index standing gate already
+      existed (`TestPort_PgAmcheckBtreeIndexCheck`,
+      `TestPort_PgAmcheckAllTables`) and still passes. Guards:
+      `internal/executor/pgindex_relhasindex_test.go` (6 cases incl. mixed and
+      gate-off). Doc: `docs/design/0130-0011-nbtree-pg-on-disk-format.md` §S11.6.
+      2 ledger rows (expression-key indcollation; DROP INDEX leaves the flag).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
