@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"fmt"
+
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
@@ -119,6 +121,104 @@ func (ctx *Context) compositeUpperBound(idx *catalog.Index, key []byte) []byte {
 		return key
 	}
 	return appendCompositeUpperPadding(key)
+}
+
+// indexProbeKeyPart is one attribute of a scan's SEARCH key: the datum, the
+// table column backing the index key attribute it fills, and the position of
+// the expression it came from (error reporting only — the two formats report
+// an unencodable datum at the same place the open-coded sites did).
+type indexProbeKeyPart struct {
+	col *catalog.Column
+	val Datum
+	pos int
+}
+
+// indexProbeKey builds the search key a scan positions with: an equality probe,
+// or one end of a range, over the FIRST len(parts) key attributes of idx.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-iii — the probe-key funnel, the low-end twin
+// of B2-c-ii's `compositeUpperBound`. Six scan sites (index scan equality +
+// range, index-only scan equality + range, bitmap index scan, the storage
+// UPDATE-by-index path) each built this key by calling
+// `encodeBTreeKeyForColumn` per attribute and CONCATENATING the results. That
+// concatenation is not a detail of the encoder, it is the blob format's whole
+// key layout asserted at ten call sites:
+//
+//   - blob (desc == nil): a page key is exactly that concatenation compared
+//     with `bytes.Compare`, so a probe key is built the same way and a
+//     leading-attribute probe is a byte prefix. Unchanged here, byte for byte.
+//   - tuple (desc != nil): a page key is one `FormPGIndexTuple` image with a
+//     null bitmap, per-attribute alignment padding and a heap TID; the
+//     concatenation of per-column blobs is not a smaller version of it, it is
+//     not one at all. `pgIndexTupleKey` builds the image, and a probe naming
+//     fewer than every key attribute becomes a PIVOT stamped with its own
+//     attribute count — minus infinity beyond what it names, which is the
+//     "position at the first entry matching this prefix" semantics the blob
+//     path got for free from a bytewise prefix. The zero ItemPointer is the
+//     heapkeyspace tiebreaker's minus infinity, so an equality probe still
+//     lands before every real entry sharing its key attributes.
+//
+// Under the tuple format there is no fallback: the tree IS tuple-shaped, so a
+// refusal by `pgIndexTupleKey` (an unresolved TOAST pointer, an over-size key)
+// has to surface as an error rather than quietly emit a blob key that would
+// scan the wrong range. Indexes `buildPGIndexKeyDesc` refuses never get here —
+// they resolve to desc == nil and keep the blob path whole, which is the same
+// per-index dual-format property B2-c-ii asserted for the upper bound.
+func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart) ([]byte, *ExecError) {
+	desc := ctx.pgIndexKeyDesc(idx)
+	if desc == nil {
+		var probe []byte
+		for _, p := range parts {
+			segment, encErr := encodeBTreeKeyForColumn(p.val, p.col, p.pos)
+			if encErr != nil {
+				return nil, encErr
+			}
+			probe = append(probe, segment...)
+		}
+		return probe, nil
+	}
+
+	pos := 0
+	if len(parts) > 0 {
+		pos = parts[0].pos
+	}
+	// pgIndexKeyColumns and buildPGIndexKeyDesc refuse the same indexes, so a
+	// non-nil descriptor guarantees resolvable key columns; taking them from
+	// here rather than from the caller keeps the datums aligned with the
+	// descriptor attributes even if a site looked its column up differently.
+	keyCols := pgIndexKeyColumns(idx)
+	if len(parts) > len(keyCols) {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: %d search-key attributes for index %q with %d key columns", len(parts), idx.Name, len(keyCols))}
+	}
+	cols := make([]*catalog.Column, len(parts))
+	vals := make([]Datum, len(parts))
+	for i, p := range parts {
+		// A probe MUST name a leading prefix of the key. The blob path
+		// tolerated a site that skipped or reordered attributes (it just
+		// produced a key that matched nothing); a pivot silently means
+		// something else — "the first i attributes" — so name the mismatch.
+		if p.col == nil || keyCols[i] == nil || p.col.Name != keyCols[i].Name {
+			return nil, &ExecError{Code: "XX000", Pos: p.pos, Message: fmt.Sprintf(
+				"indexProbeKey: search-key attribute %d is column %q, index %q key attribute %d is %q",
+				i+1, columnNameOrEmpty(p.col), idx.Name, i+1, columnNameOrEmpty(keyCols[i]))}
+		}
+		cols[i] = keyCols[i]
+		vals[i] = p.val
+	}
+	key, _, err := pgIndexTupleKey(desc, cols, vals, storage.ItemPointer{})
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: index %q: %v", idx.Name, err)}
+	}
+	return key, nil
+}
+
+func columnNameOrEmpty(c *catalog.Column) string {
+	if c == nil {
+		return ""
+	}
+	return c.Name
 }
 
 // indexBTreeOptions is the Options every index btree in the engine is

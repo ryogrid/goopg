@@ -179,7 +179,7 @@ func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err e
 	if val.IsNull() {
 		return nil, nil, nil // empty probe
 	}
-	key, encErr := encodeBTreeKeyForColumn(val, col, o.plan.Pos())
+	key, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: val, pos: o.plan.Pos()}})
 	if encErr != nil {
 		return nil, nil, encErr
 	}
@@ -194,7 +194,7 @@ func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err e
 // lookupKeys encodes multi-column equality keys.
 func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte, err error) {
 	// Encode each leading column in order.
-	var keyBytes []byte
+	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, keyExpr := range o.plan.Keys {
 		keyCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
 		if !found {
@@ -207,11 +207,11 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 		if val.IsNull() {
 			return nil, nil, nil // empty probe
 		}
-		k, encErr := encodeBTreeKeyForColumn(val, keyCol, o.plan.Pos())
-		if encErr != nil {
-			return nil, nil, encErr
-		}
-		keyBytes = append(keyBytes, k...)
+		parts = append(parts, indexProbeKeyPart{col: keyCol, val: val, pos: o.plan.Pos()})
+	}
+	keyBytes, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	if encErr != nil {
+		return nil, nil, encErr
 	}
 	_ = firstCol // unified interface; first column is looked up per-key in the loop
 	return keyBytes, keyBytes, nil

@@ -1178,14 +1178,43 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               helper's only caller — mutation-checked by reverting the bitmap
               site, reported by file:line). The scan matters because a seventh
               site added later fails as wrong ROWS, never as a compile error.
+        - [x] **3b-2c-ii-B2-c-iii — the probe-key funnel** (2026-08-10). NO
+              on-disk change, no REINDEX; the low-end twin of B2-c-ii. The same
+              six scan sites built the key they POSITION with (equality probe /
+              range bound) by calling `encodeBTreeKeyForColumn` per attribute
+              and CONCATENATING — ten call sites each asserting the blob
+              format's whole key layout. A tuple-format page key is one
+              `FormPGIndexTuple` image, not a concatenation. All ten now call
+              `(*Context).indexProbeKey(idx, parts)`: concatenation for
+              `desc == nil`, `pgIndexTupleKey` with a ZERO `ItemPointer`
+              otherwise (heapkeyspace minus infinity, so an equality probe still
+              lands before every real entry with the same key attributes — what
+              the blob path got by having no TID). A short probe is a pivot
+              stamped with its own natts, the low-end mirror of B2-c-i's plus
+              infinity. Under the tuple format there is NO fallback: a
+              `pgIndexTupleKey` refusal (TOAST pointer, over-size key) errors
+              rather than emitting a blob key that would scan the wrong range;
+              refused indexes never get there (`desc == nil`). The funnel also
+              takes its columns from `pgIndexKeyColumns` and checks the caller's
+              against them — blob tolerated a non-leading probe (matched
+              nothing), a pivot silently means "the first N attributes". Guards:
+              `internal/executor/pgindex_probekey_test.go` (blob = the
+              concatenation; tuple = `pgIndexTupleKey`, natts 2, and a
+              1-attribute probe that is a 1-natts pivot and NOT a byte prefix of
+              the full key; undescribable index stays blob; non-leading and
+              over-long probes rejected; source scan over the three scan files
+              pinning `indexProbeKey` as the only scan-side encoder,
+              mutation-checked by reverting the bitmap site).
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
-              `ctx.pgIndexKeyDesc(idx)` the tree took (search keys included — a
-              tuple-format search key must itself be tuple-shaped; the ~20
-              single-column `encodeBTreeKeyForColumn` probe sites are what
-              remains on the probe side, the prefix upper bound having moved
-              out to B2-c-i + B2-c-ii),
+              `ctx.pgIndexKeyDesc(idx)` the tree took. The SCAN side is done
+              (B2-c-i + B2-c-ii + B2-c-iii); what remains under
+              `encodeBTreeKeyForColumn` is writer-side — the uniqueness and
+              index-maintenance paths in `operators_storage.go`, the
+              expression-key paths in `operators_upsert.go`, and the two calls
+              inside the composite encoders — all becoming
+              `pgIndexTupleKeyFromRow` with the row's real heap TID,
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a
               tree's format is a per-index property). Gates:

@@ -682,7 +682,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
 		}
 	}
-	var probe []byte
+	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, ke := range o.plan.Keys {
 		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
@@ -699,11 +699,11 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
 			}
 		}
-		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
-		if encErr != nil {
-			return nil, false, encErr
-		}
-		probe = append(probe, segment...)
+		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
+	}
+	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	if encErr != nil {
+		return nil, false, encErr
 	}
 	return probe, true, nil
 }
@@ -724,7 +724,7 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 	if !ok {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
-	key, encErr := encodeBTreeKeyForColumn(v, col, o.plan.Key.Pos())
+	key, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -754,7 +754,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
@@ -770,7 +770,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}

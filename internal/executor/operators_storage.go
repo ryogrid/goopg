@@ -4100,7 +4100,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found on table %q", ix.Index.Columns[0], ix.Table.Name)}
 	}
-	keyBytes, encErr := encodeBTreeKeyForColumn(v, col, ix.Key.Pos())
+	keyBytes, encErr := o.ctx.indexProbeKey(ix.Index, []indexProbeKeyPart{{col: col, val: v, pos: ix.Key.Pos()}})
 	if encErr != nil {
 		return nil, encErr
 	}

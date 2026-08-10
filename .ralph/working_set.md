@@ -1,48 +1,42 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-c-ii (the upper-bound funnel) — DONE,
+Task: M0130-S11.4 slice 3b-2c-ii-B2-c-iii (the probe-key funnel) — DONE,
 committed + pushed. Next is the flip itself (B2-c, REINDEX-required).
 
 Landed (no on-disk change, `pgIndexTupleKeys` still false):
-- `(*Context).compositeUpperBound(idx, key)` in
-  `internal/executor/pgindex_btree.go`. desc==nil ⇒
-  `appendCompositeUpperPadding(key)` (byte-identical to before);
-  desc!=nil ⇒ `key` unchanged (the prefix pivot B2-c-i's `compareHigh`
-  reads as plus infinity).
-- All SIX padding sites now call it: operators_index.go ×2,
-  operators_indexonly.go ×2, operators_bitmap.go:lookupKey,
-  operators_storage.go (UPDATE-by-index).
+- `(*Context).indexProbeKey(idx, []indexProbeKeyPart)` in
+  `internal/executor/pgindex_btree.go`. desc==nil ⇒ concatenated
+  `encodeBTreeKeyForColumn` (byte-identical to before); desc!=nil ⇒
+  `pgIndexTupleKey(desc, cols, vals, storage.ItemPointer{})` — zero TID =
+  heapkeyspace minus infinity; a short probe is a 1-natts pivot.
+- All TEN scan-side call sites now use it: operators_index.go (lookupKeys,
+  lookupKey, lookupRangeBounds ×2), operators_indexonly.go (same four),
+  operators_bitmap.go (lookupKey, lookupKeys), operators_storage.go
+  (UPDATE-by-index probe).
 
-Why (do not re-derive): 64 `0xFF` is a BLOB-format repair, not a scan
-requirement. Under tuple format 0xFF is a malformed attribute image, and
-upstream never invents a maximal key (`_bt_check_compare`). Side effect:
-the sites' `len(Index.Columns) > 1` guard is now a cheap skip, not a
-correctness condition (a full-attribute bound compares the same under
-`compareHigh` and `compare`).
+Why (do not re-derive): concatenation IS the blob key layout, not an
+encoder detail. Tuple keys are one FormPGIndexTuple image. Under the tuple
+format there is no fallback — a pgIndexTupleKey refusal errors instead of
+emitting a blob key. The funnel also checks the caller's columns against
+`pgIndexKeyColumns(idx)` (a pivot silently means "first N attributes").
 
-Guard: `internal/executor/pgindex_upperbound_test.go` (4 tests), incl. a
-SOURCE SCAN pinning `compositeUpperBound` as the padding helper's only
-caller. Mutation-checked: reverting the bitmap site → the scan reports it
-by file:line.
+Guard: `internal/executor/pgindex_probekey_test.go` (5 tests) incl. a
+SOURCE SCAN over the three scan files pinning `indexProbeKey` as the only
+scan-side encoder. Mutation-checked (reverting the bitmap site → reported
+by file:line). operators_storage.go is NOT scanned — it still has ~8
+legitimate writer-side callers (ledger row).
 
-Still open (ledger row appended this loop):
-- ~20 single-column `encodeBTreeKeyForColumn` probe sites still blob.
-- `compositeUpperPaddingLen = 64` heuristic survives for every index the
-  resolver refuses.
-- The source-scan guard is lexical + package-local (helper is unexported).
+Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP, writers only now.
+`encodeCompositeBTreeKey`/`encodeCompositeBTreeKeyWithExprs`
+(operators_ddl.go), `encodeIndexKeyFromCols` + uniqueness paths
+(operators_storage.go ~7184/7264/7347/7439/7524), `encodeArbiterKey` +
+expression paths (operators_upsert.go:1527), the SSI predicate encoder
+(ssi.go) → `pgIndexTupleKeyFromRow` with the row's REAL heap TID; then
+`pgIndexTupleKeys = true`. Scan side needs ZERO further edits. Gates:
+tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin after REINDEX.
+Re-read the fix_plan banner first (M-NIGHTLY filing unconditional; the six
+`AI-20260810-011258-*` items are filed and left unchecked per the banner).
 
-Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP.
-`encodeCompositeBTreeKey` (operators_ddl.go:10785) / `encodeIndexKeyFromCols`
-(operators_storage.go:7148) / `encodeArbiterKey` (operators_upsert.go:1490)
-→ `pgIndexTupleKey` under `ctx.pgIndexKeyDesc(idx)`; the ~20
-`encodeBTreeKeyForColumn` probe sites; `pgIndexTupleKeys = true`; explicit
-dual-format decision for indexes the resolver refuses. The upper bound is
-NO LONGER part of it. Consider one more split (writers vs probes) — but the
-gate flip must be atomic with both. Gates: tpch-spotcheck + **TPC-DS SF0.5
-gate (mandatory)**, re-pin after REINDEX. Re-read the fix_plan banner first
-(M-NIGHTLY filing unconditional; the six `AI-20260810-011258-*` items are
-filed and left unchecked per the banner).
-
-Gates run: `go build ./...` + `go vet` clean; `go test` PASS for
-./internal/executor ./internal/access/btree;
+Gates run: `go build ./...` + `go vet ./internal/executor` clean;
+`go test` PASS for ./internal/executor ./internal/access/btree;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35); commit-hook
 pgbench smoke PASS. NOT run: TPC-DS SF0.5 gate (blob path byte-identical).

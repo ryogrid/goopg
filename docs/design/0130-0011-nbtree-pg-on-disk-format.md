@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -778,6 +778,49 @@ sources agree:
             reports by file and line. That last one matters because a seventh
             site added later would fail as wrong ROWS in a scan, never as a
             compile error.
+          - **3b-2c-ii-B2-c-iii — the probe-key funnel (landed 2026-08-10).**
+            NO on-disk change, no REINDEX. The low-end twin of B2-c-ii. The same
+            six scan sites built the key they POSITION with — an equality probe,
+            or one end of a range — by calling `encodeBTreeKeyForColumn` once
+            per key attribute and concatenating the results, at ten call sites.
+            That concatenation is not an encoder detail; it is the blob format's
+            entire key layout, asserted ten times. Under the tuple format a page
+            key is one `FormPGIndexTuple` image (null bitmap, per-attribute
+            alignment padding, heap TID) and the concatenation of per-column
+            blobs is not a degenerate version of it — it is not one at all. All
+            ten now go through `(*Context).indexProbeKey(idx, parts)`, which
+            resolves the same `pgIndexKeyDesc` the tree took: concatenation for
+            `desc == nil`, `pgIndexTupleKey` under a ZERO `ItemPointer`
+            otherwise. The zero TID is deliberate — heapkeyspace's final
+            tiebreaker reads it as minus infinity, so an equality probe still
+            lands before every real entry sharing its key attributes, which is
+            what the blob path got by having no TID at all. A probe naming fewer
+            than every key attribute becomes a pivot stamped with its own
+            attribute count, i.e. minus infinity beyond what it names — the
+            low-end mirror of the plus infinity B2-c-i taught `compareHigh`.
+            Two consequences worth stating. First, under the tuple format there
+            is no fallback: the tree IS tuple-shaped, so a refusal by
+            `pgIndexTupleKey` (an unresolved TOAST pointer, an over-size key)
+            surfaces as an error rather than quietly emitting a blob key that
+            would scan the wrong range; indexes the resolver refuses never reach
+            that branch, since they resolve to `desc == nil` and keep the blob
+            path whole. Second, the funnel takes its columns from
+            `pgIndexKeyColumns(idx)` and *checks* the caller's against them: the
+            blob format tolerated a site that probed a non-leading attribute (it
+            merely matched nothing), whereas a pivot silently means "the first N
+            attributes", so a mismatch is now named at the call. Guards:
+            `internal/executor/pgindex_probekey_test.go` — blob equality with
+            the concatenation (multi-attribute and leading-attribute), the tuple
+            branch equal to `pgIndexTupleKey` with `BTreeTupleGetNAtts` = 2 and a
+            one-attribute probe that is a 1-natts pivot and NOT a byte prefix of
+            it, the undescribable index staying blob under the gate, the
+            non-leading and over-long probes rejected, and a source scan over the
+            three scan files pinning `indexProbeKey` as the only scan-side
+            encoder — mutation-checked by reverting the bitmap site, reported by
+            file and line. `operators_storage.go` is out of the scan's scope on
+            purpose: its remaining direct `encodeBTreeKeyForColumn` callers are
+            the writer-side uniqueness and index-maintenance paths, which B2-c
+            converts to `pgIndexTupleKeyFromRow` — a different funnel.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -786,9 +829,13 @@ sources agree:
             indexes the resolver refuses. The prefix upper bound is no longer
             part of this slice — B2-c-i taught the scan to read a pivot and
             B2-c-ii routed all six probe sites through the one place that emits
-            it. What remains on the probe side is the ~20 single-column
-            `encodeBTreeKeyForColumn` search keys, which must become
-            tuple-shaped alongside the writers. Gates:
+            it, and B2-c-iii did the same for the low end, so the SCAN side is
+            format-agnostic already. What remains under
+            `encodeBTreeKeyForColumn` is the writer-side set — the uniqueness
+            and index-maintenance paths in `operators_storage.go`, the
+            expression-key paths in `operators_upsert.go`, and the two calls
+            inside the composite encoders themselves — all of which become
+            `pgIndexTupleKeyFromRow` with the row's real heap TID. Gates:
             `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
             a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length

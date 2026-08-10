@@ -620,7 +620,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 				len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
 		}
 	}
-	var probe []byte
+	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, ke := range o.plan.Keys {
 		v, err := evalExpr(ke, nil, o.ctx)
 		if err != nil {
@@ -637,11 +637,11 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
 			}
 		}
-		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
-		if encErr != nil {
-			return nil, false, encErr
-		}
-		probe = append(probe, segment...)
+		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
+	}
+	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	if encErr != nil {
+		return nil, false, encErr
 	}
 	return probe, true, nil
 }
@@ -662,7 +662,7 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
-	k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.Key.Pos())
+	k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -683,7 +683,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		if v.IsNull() {
 			return nil, nil, false, nil
 		}
-		k, encE := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
 		if encE != nil {
 			return nil, nil, false, encE
 		}
@@ -697,7 +697,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		if v.IsNull() {
 			return nil, nil, false, nil
 		}
-		k, encE := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
 		if encE != nil {
 			return nil, nil, false, encE
 		}
