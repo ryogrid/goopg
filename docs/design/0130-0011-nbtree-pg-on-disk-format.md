@@ -1160,6 +1160,42 @@ sources agree:
             hits the per-DB catalog scoping gap the ledger already records for
             ANALYZE, so SF=1-scale index behaviour stays ungated.
 
+            **Addendum (2026-08-11, M-NIGHTLY AI-20260811-014635-012) — the
+            other half of that lesson arrived eleven hours later, and it says
+            "every cluster", not "the cluster you were looking at".** The
+            remediation above REINDEXed the **SF=0.5** TPC-DS cluster, because
+            SF=0.5 is what the fast regression gate sweeps. The nightly batch
+            clones **SF=1** (`bench/tpcds/runtime_goopg/data` →
+            `tmp/goopg-nightly-tpcds-data`), which nobody had touched, so run
+            `20260811-014635` came back with 25 of 99 queries ERRORing on the
+            identical `special size 0, want 16` — q1 q6 q7 q9 q13 q17 q18 q19
+            q22 q26 q27 q29 q34 q40 q44 q48 q61 q68 q73 q75 q79 q80 q84 q85
+            q91. Reproduced at HEAD `c58650b7` on port 65436, so the "is it
+            stale?" step resolved to *real*, and the cause is unambiguously the
+            un-run REINDEX: nothing in the two intervening commits
+            (`02995818`, `46103e4e`) touches nbtree, and REINDEXing the 24
+            SF=1 PKs under the current binary (95 s, all 24 ok) turned every
+            one of the six spot-checked failures back into rows.
+
+            Two things follow, and only the first is done. (1) The remediation
+            is now a script rather than a remembered `psql` session —
+            `bench/reindex_cluster.sh <port> [db]` enumerates
+            `pg_indexes WHERE schemaname='public'` and REINDEXes each,
+            reporting per-index timing so a stale cluster is a one-command fix
+            for whichever port the next flip breaks. (2) *Detection* is still
+            missing, and that is the part that would have made this a
+            non-event: the tpcds stage's own spotcheck (Q3, Q98) passed on the
+            broken cluster because both are seq-scan plans, exactly the way
+            `tpch-spotcheck.sh` passed on the broken SF=0.5 cluster in August
+            10's entry. A cheap fix exists — have the stage run one
+            `CheckPGBTPage` probe per index (or one guaranteed index-scan
+            query) before the sweep and fail with "cluster needs REINDEX"
+            instead of 25 opaque query errors — and it is filed as a ledger
+            row, not built here, so this loop stays one task. The SF=0.5
+            cluster was re-verified green in passing (q1 returns rows on
+            65437); the TPC-H cluster's `tpch` db remains blocked on the
+            per-DB scoping gap as recorded above.
+
     - **3b-3 — collect the deferrals (2026-08-10, complete: 3b-3a…3b-3d).** With
       the key length descriptor-derived, restore `index_form_tuple`'s MAXALIGN of
       the tuple size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset (3b-3b

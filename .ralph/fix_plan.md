@@ -705,6 +705,55 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       still owed (the duplicate needs a concurrent non-HOT interleaving the
       in-process fixture cannot yet express).
 
+### Nightly run 20260811-014635 (sha `46103e4e`, 12 items) — filed 2026-08-11
+
+- [x] **tpcds/stage** — the TPC-DS SF=1 sweep went from 0 errors (run
+      `20260810-011258`) to **25 query ERRORs**, every one of them
+      `ERROR: btree: index contains corrupted page at block 0: special size 0,
+      want 16` (AI-20260811-014635-012; repro: `bash ci/batch/stages/stage-tpcds.sh`,
+      evidence `ci/logs/20260811-014635/tpcds/{stage,run}.log`).
+      **FIXED 2026-08-11 (this loop)** — worked under the banner exception for
+      an item that breaks a gate the priority milestones depend on (the TPC-DS
+      bench clusters). Affected: q1 q6 q7 q9 q13 q17 q18 q19 q22 q26 q27 q29 q34
+      q40 q44 q48 q61 q68 q73 q75 q79 q80 q84 q85 q91.
+      **Not a code regression — a stale-format cluster.** The M0130-S11 nbtree
+      series broke the on-disk index format three times (S11.2b page shape,
+      S11.3 metapage, S11.4 tuple format), each REINDEX-required. When S11.4
+      landed on 2026-08-10 the **SF=0.5** cluster was REINDEXed, because SF=0.5
+      is what the fast regression gate sweeps; the nightly clones **SF=1**
+      (`bench/tpcds/runtime_goopg/data`), which nobody had touched. Reproduced
+      at HEAD `c58650b7` on port 65436 (so: real, not stale), and neither
+      intervening commit touches nbtree. Fix: REINDEXed all 24 SF=1 PKs under
+      the current binary (95 s, 24/24 ok) — six spot-checked failures (q1 q6 q7
+      q9 q13 q91) all return rows again; SF=0.5 re-verified green in passing.
+      The remediation is now a script, `bench/reindex_cluster.sh <port> [db]`,
+      rather than a remembered `psql` session. Design: addendum in
+      `docs/design/0130-0011-nbtree-pg-on-disk-format.md` (+ README row).
+      **Two ledger rows filed**: (a) *detection* is still missing — both times
+      this has bitten, the guarding spotcheck passed on a fully broken cluster
+      because its queries are seq-scan plans (`tpch-spotcheck.sh` Q12/Q13,
+      `stage-tpcds.sh` Q3/Q98); the stage should probe every index and say
+      "cluster needs REINDEX" instead of emitting N opaque query errors;
+      (b) the TPC-H cluster (65433, db `tpch`) is still un-REINDEXed, blocked
+      on the same per-DB catalog scoping gap the ledger records for ANALYZE.
+- [ ] **testport/TestPort_IsolationPredicateHash** — FAILed
+      (AI-20260811-014635-001; repro: `go test -v -run
+      '^TestPort_IsolationPredicateHash$' ./internal/testport/`). PARKED per
+      banner (not a gate the priority milestones depend on).
+- [ ] **testport/TestPort_IsolationReceiptReport** — FAILed
+      (AI-20260811-014635-002; repro: `go test -v -run
+      '^TestPort_IsolationReceiptReport$' ./internal/testport/`). PARKED per
+      banner.
+- [ ] **regress/{delete,enum,functional_deps,index_including,index_including_gist,
+      select,tid,truncate,union}** — 11 baseline-pass regress cases diverged with
+      "output mismatch; normalization rules need extension"
+      (AI-20260811-014635-003..011; repro: `go test -v -run
+      'TestPort_RegressSuite/<case>' ./internal/testport/`). Likely the same
+      class as the 26 cases fixed on 2026-08-10 by `f3a3eca6` (LINE/caret
+      normalization) — note the previous loop ran the FULL `TestPort_RegressSuite`
+      GREEN at `c58650b7` (158 s), two commits after this nightly's sha, so
+      re-run the repro at HEAD before investigating. PARKED per banner.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 _(completed `[x]` milestones archived → `completed_milestones/completed_fix_plan_011.md`)_
