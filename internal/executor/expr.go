@@ -2304,9 +2304,10 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	} else if bIsString && !aIsString {
 		b = tryParseStringAs(a.Kind, b.StringValue())
 	}
-	// KindInterval has no text parse path yet — leave as-is so
-	// the caller still errors instead of silently producing an
-	// invalid comparison.
+	// KindInterval parses through tryParseStringAs like every other target
+	// (it gained its arm when interval columns started decoding as
+	// KindInterval); a string neither side can parse is returned unchanged so
+	// the caller still errors instead of silently comparing garbage.
 	return a, b
 }
 
@@ -2358,6 +2359,19 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		if t, err := parseCopyTimestamp(s); err == nil {
 			return NewTimeDatum(t)
+		}
+	case KindInterval:
+		// `i > '10 days'` on an interval column: the literal is `unknown`
+		// upstream and transformExpr coerces it to interval before the operator
+		// is resolved, so both sides reach interval_gt. goopg has no such
+		// coercion pass, and until interval columns were stored in PG's native
+		// layout both sides happened to be strings, so the comparison "worked"
+		// lexicographically and wrongly. With the column now KindInterval the
+		// string side must be parsed here or the pair falls through to the
+		// Format()-vs-Format() fallback below — text comparison again, just one
+		// level down. Same tokenizer as interval_in / the storage-encode arm.
+		if months, days, micros, ok := parser.ParseIntervalBody(s); ok {
+			return NewIntervalDatumFull(months, days, micros)
 		}
 	}
 	return NewStringDatum(s)

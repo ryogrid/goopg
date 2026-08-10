@@ -2421,6 +2421,47 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `WHERE i > '10 days'` drops a stored `'1 mon'`, `ORDER BY i` is
       alphabetical), so with the index order now correct the answer is
       plan-dependent.
+      **Slice landed 2026-08-10 (18th) — the interval COLUMN gets PG's native
+      16-byte layout** (design
+      `docs/design/0119-0006-interval-column-storage.md`), closing the
+      significant ledger row the 17th slice opened. An `interval` column had no
+      `case` in `encodeValuePG`, so it fell to the varlena `default:` arm and
+      goopg stored **the literal characters the user typed**. Against the PG
+      18.3 oracle that was three wrong answers plus a wrong rendering, not a
+      sort nit: `ORDER BY i` put `2 hours` after `10 days`;
+      `WHERE i > interval '10 days'` returned a DIFFERENT SET (admitted
+      `2 hours`, dropped `1 mon`); `WHERE i = interval '30 days'` missed the
+      `1 mon` PG calls equal; `min(i)` was `1 mon`; and the column echoed
+      `2 hours` where PG prints `02:00:00`. With the 17th slice's B-tree key
+      landed and the heap still text, the answer had become PLAN-DEPENDENT.
+      The discovery worth keeping: goopg already had every interval
+      *mechanism* — `KindInterval`, `compareDatum`'s `interval_cmp_value` port,
+      `formatInterval`, `parser.ParseIntervalBody` — and all four were
+      reachable from expressions and none from a stored column, so this was a
+      missing routing arm, not a missing algorithm, which is exactly why every
+      in-memory interval unit test passed throughout. Landed as PG's `Interval`
+      struct (`{time int64 @0, day int32 @8, month int32 @12}`, typlen 16 /
+      typalign 'd' — values `pg_type` has asserted since initdb, so the heap
+      now agrees with the catalog rather than the reverse) across five seams:
+      encode (accepting the bare `unknown` literal through `interval_in`'s own
+      tokenizer, and raising `22007` where text storage accepted anything),
+      decode, `physicalPGTypeAlign`, `pgPhysicalTypeIsVarlena`, and a
+      `tryParseStringAs` arm so `i > '10 days'` does not fall back to
+      `Format()`-vs-`Format()` (text comparison one level down).
+      `formatInterval` MOVED to leaf `internal/pgdatetime` because the layout
+      has two decoders and `internal/wal`'s pgoutput cannot import the
+      executor — left unrouted it would have read the microsecond field as a
+      varlena header and shipped garbage to a subscriber with no error. Also
+      removes `interval` from the heap-side-divergence class
+      `pgindex_keydesc.go` names (a real PG standby was misreading the column);
+      `numeric` and `uuid` remain. Gates: mixed-column oracle diff
+      byte-identical (NULL / ±infinity / `2147483647 days` / UPDATE / two
+      interval columns), index-path diff clean, COPY + restart durable, 10 unit
+      tests with 7/7 source mutations caught, units + tpch-spotcheck +
+      `TestPort_RegressSuite` PASS. 3 ledger rows: `interval(3)` typmod not
+      applied at storage (`AdjustIntervalForTypmod`), `interval hour to minute`
+      unparseable in a column-type position, and `interval[]` elements still
+      text (`c[1] = c[2]` is `f` where PG says `t`).
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.

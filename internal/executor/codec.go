@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -435,6 +436,52 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// Our Scale stores minutes east of UTC; convert: pgOffset = -Scale*60.
 		pgOffset := int32(-d.TimeTZOffsetSecs())
 		binary.LittleEndian.PutUint32(buf[8:], uint32(pgOffset))
+		return buf[:], nil
+	case "interval":
+		// PG's Interval is a fixed 16-byte, 8-byte-aligned struct
+		// (postgres/src/include/datatype/timestamp.h):
+		//
+		//	typedef struct { TimeOffset time; int32 day; int32 month; } Interval;
+		//
+		// so time (int64 microseconds) sits at offset 0, day at 8, month at 12
+		// — pg_type row {OID 1186, typlen 16, typalign 'd', typbyval false},
+		// seeded that way in internal/initdb/pg_type_seed_data.go since the
+		// beginning. goopg nevertheless stored an interval column through the
+		// varlena default arm, i.e. as the *text* the user typed, which made
+		// every runtime interval operation lexicographic: `ORDER BY i` sorted
+		// '2 hours' after '10 days', `i > interval '10 days'` kept '2 hours'
+		// and dropped '1 mon', `i = interval '30 days'` missed the '1 mon' PG
+		// calls equal, and the value echoed back verbatim ('2 hours') where PG
+		// prints '02:00:00'. Storing the three fields is what makes compareDatum's
+		// existing interval_cmp_value port (expr.go, KindInterval arm) and
+		// formatInterval reachable for a stored column at all.
+		//
+		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
+		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
+		// storage round-trips them exactly.
+		var months, days int32
+		var micros int64
+		switch d.Kind {
+		case KindInterval:
+			months, days, micros = d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
+		case KindString:
+			// A bare quoted literal (`INSERT INTO t(i) VALUES ('1 mon')`) is
+			// `unknown` upstream and reaches the column through interval_in.
+			// parser.ParseIntervalBody is the same tokenizer `'…'::interval`
+			// uses, so the two entry points cannot disagree.
+			var ok bool
+			months, days, micros, ok = parser.ParseIntervalBody(d.StringValue())
+			if !ok {
+				return nil, &ExecError{Code: "22007",
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+			}
+		default:
+			return nil, fmt.Errorf("expected interval, got kind %d", d.Kind)
+		}
+		var buf [16]byte
+		binary.LittleEndian.PutUint64(buf[:8], uint64(micros))
+		binary.LittleEndian.PutUint32(buf[8:12], uint32(days))
+		binary.LittleEndian.PutUint32(buf[12:16], uint32(months))
 		return buf[:], nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
@@ -943,7 +990,10 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 2
 	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
+		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
+		// exceed a Datum — the struct's leading field is an int64.
+		"interval":
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
@@ -975,6 +1025,7 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
+		"interval", // typlen 16, not varlena
 		"name",
 		"float4", "real",
 		"float8", "double precision", "double",
@@ -1163,6 +1214,17 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		pgOffset := int32(binary.LittleEndian.Uint32(data[8:12]))
 		offsetSecs := int(-pgOffset)
 		return NewTimeTZDatum(pgTimeFromMicros(micros), offsetSecs), 12, nil
+	case "interval":
+		// Sibling of the "interval" arm in encodeValuePG: PG's fixed 16-byte
+		// {time int64, day int32, month int32} at typalign 'd'. Every field is
+		// stored raw, so the ±infinity sentinels round-trip without a case.
+		if len(data) < 16 {
+			return Datum{}, 0, fmt.Errorf("truncated interval")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		days := int32(binary.LittleEndian.Uint32(data[8:12]))
+		months := int32(binary.LittleEndian.Uint32(data[12:16]))
+		return NewIntervalDatumFull(months, days, micros), 16, nil
 	case "char":
 		// Single-byte internal "char" type (no length modifier): fixed 1-byte
 		// field. "char(N)" (with args) is bpchar (varlena) and is handled by

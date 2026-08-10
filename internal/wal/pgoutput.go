@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -354,7 +355,9 @@ func pgoPhysicalAlign(off int, t catalog.Type) int {
 	case "int2", "smallint":
 		align = 2
 	case "int8", "bigint", "bigserial", "float8", "double precision", "double",
-		"timestamp", "timestamptz", "time", "timetz":
+		"timestamp", "timestamptz", "time", "timetz",
+		// interval: pg_type OID 1186 is typalign 'd', typlen 16.
+		"interval":
 		align = 8
 	}
 	if align <= 1 {
@@ -449,6 +452,22 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 		}
 		micros := int64(binary.LittleEndian.Uint64(data[:8]))
 		return []byte(time.UnixMicro(micros).UTC().Format("15:04:05.000000")), 12, nil
+	case "interval":
+		// Sibling of executor.encodeValuePG's "interval" arm: PG's fixed
+		// 16-byte {time int64, day int32, month int32}. Before interval columns
+		// gained that layout the varlena fall-through below returned the stored
+		// text and happened to be right; it would now emit 16 raw bytes read as
+		// a varlena header. The text is rendered by the same
+		// pgdatetime.FormatInterval the executor's Datum.Format calls, so a
+		// replicated interval reaches the subscriber spelled exactly as a local
+		// SELECT spells it.
+		if len(data) < 16 {
+			return nil, 0, fmt.Errorf("interval: short read")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		days := int32(binary.LittleEndian.Uint32(data[8:12]))
+		months := int32(binary.LittleEndian.Uint32(data[12:16]))
+		return []byte(pgdatetime.FormatInterval(months, days, micros)), 16, nil
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.
