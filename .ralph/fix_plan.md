@@ -2133,6 +2133,20 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `executor.btIndexOpClassComparator`. Gate:
       `TestBtIndexCheck_OpClassDamageDetected` (verified non-vacuous). Design:
       `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`.
+      **Slice landed 2026-08-11 (33rd) — hour 24 and the leap second are
+      ordinary TIMESTAMP input, and the day they carry is a `timestamp`'s, not a
+      `date`'s**: `'2020-01-01 24:00:00'`, `'…23:59:60'`, `'…10:00:60'`,
+      `'2020-12-31 24:00:00'` and `'…240000'` were flat 22007 on the timestamp
+      path while the TIME path answered them all correctly. `time_overflows()`
+      admits hour 24 / second 60 per-field and then separately caps the TOTAL at
+      24:00:00 (so `'24:00:00.5'`, `'23:59:60.5'`, `'24:00:01'` are 22008 —
+      goopg said 22007); the rollover itself is `tm2timestamp`'s, so `date_in`
+      must NOT roll (`'2020-01-01 24:00:00'::date` is the 1st). Seams:
+      `pgdatetime.TimeOfDay.Overflows`/`Normalize`, `CanonicalizeTimeToken`'s
+      typed error + `dayCarry`, `parsePGTimestampTextParts` /
+      `parseCopyTimestampZoneParts` (carry unapplied), `parseDateInputText`.
+      Gate: `TestTimestampInputHour24AndLeapSecond`. Design:
+      `docs/design/0125-0007-pg-faithful-date-field-decode.md` §11.
       **Slice landed 2026-08-12 (27th) — array index keys render
       date/time/timestamp/timestamptz/bytea elements again**: the five element
       types the 25th slice refused for lack of a heap image to agree with (the

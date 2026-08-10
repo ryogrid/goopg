@@ -381,9 +381,10 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
 				d = inf
 			} else {
-				// date_in never looks at the decoded zone, so the wall clock as
-				// written picks the day (tsZoneMode).
-				ts, err := parseCopyTimestampZone(d.StringValue(), tsDiscardZone)
+				// date_in never looks at the decoded zone, nor at an hour-24 /
+				// leap-second day carry, so the wall clock as written picks the
+				// day (parseDateInputText).
+				ts, err := parseDateInputText(d.StringValue())
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
 				}

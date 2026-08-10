@@ -118,26 +118,87 @@ func ParseTimeOfDay(s string) (TimeOfDay, error) {
 	return tod, nil
 }
 
+const nsecPerDay int64 = 24 * 60 * 60 * 1_000_000_000
+
+// totalNsec is the time of day as a plain offset from midnight. Because hour 24
+// and second 60 are both legal decoded fields, the offset can be exactly — but
+// never more than — one whole day.
+func (t TimeOfDay) totalNsec() int64 {
+	return ((int64(t.Hour)*60+int64(t.Min))*60+int64(t.Sec))*1_000_000_000 + int64(t.Nsec)
+}
+
+// Overflows reimplements time_overflows() (postgres/src/backend/utils/adt/date.c):
+// the fields are range-checked individually — deliberately admitting hour 24 and
+// second 60 — and then the TOTAL is checked against 24:00:00, which is what makes
+// '24:00:00' and '23:59:60' legal while '24:00:00.5', '23:59:60.5' and '24:00:01'
+// are not. Upstream calls it from DecodeDateTime and DecodeTimeOnly, i.e. on the
+// timestamp path as well as the time-only one; goopg checked only the latter.
+func (t TimeOfDay) Overflows() bool {
+	if t.Hour < 0 || t.Hour > 24 ||
+		t.Min < 0 || t.Min > 59 ||
+		t.Sec < 0 || t.Sec > 60 ||
+		t.Nsec < 0 || t.Nsec > 1_000_000_000 {
+		return true
+	}
+	return t.totalNsec() > nsecPerDay
+}
+
+// Normalize range-checks a decoded time of day and folds the two spellings that
+// carry into the next day into a plain time plus a day count.
+//
+// PostgreSQL never folds during decoding: DecodeDateTime leaves hour 24 and
+// second 60 in the struct, and the carry happens in tm2timestamp(), which simply
+// adds date2j(y,m,d) * USECS_PER_DAY to the time-of-day microseconds. So
+// '2020-01-01 24:00:00' and '2020-01-01 23:59:60' both come out as
+// 2020-01-02 00:00:00, and '2020-01-01 10:00:60' as 2020-01-01 10:01:00 — a leap
+// second below the day boundary just rolls the minute.
+//
+// dayCarry is 1 exactly when the time of day is the full day, and the returned
+// TimeOfDay is then midnight. Callers that do NOT compose a date with the time
+// must ignore dayCarry: date_in() never calls tm2timestamp, which is why
+// '2020-01-01 24:00:00'::date is 2020-01-01 and not the next day.
+func (t TimeOfDay) Normalize() (TimeOfDay, int, error) {
+	if t.Overflows() {
+		return TimeOfDay{}, 0, ErrTimeFieldOverflow
+	}
+	if t.totalNsec() == nsecPerDay {
+		return TimeOfDay{}, 1, nil
+	}
+	if t.Sec == 60 {
+		t.Sec = 0
+		t.Min++
+		if t.Min == 60 {
+			t.Min = 0
+			t.Hour++
+		}
+	}
+	return t, 0, nil
+}
+
 // CanonicalizeTimeToken rewrites the time-of-day token at the head of s into
 // the zero-padded `HH:MM:SS[.ffffff]` spelling a Go layout can parse, consuming
 // an AM/PM marker that follows it, and returns the string with the rest (a zone
-// suffix, typically) left byte-identical. ok is false when the head is not a
-// time PostgreSQL would decode, or when it decodes to a value the canonical
-// spelling cannot carry (hour 24, second 60 — both legal to PG, and both still
-// deferred for the timestamp path).
+// suffix, typically) left byte-identical, together with the day carry
+// Normalize produced.
+//
+// The error is ErrTimeBadFormat when the head is not a time PostgreSQL would
+// decode (the caller then leaves the string alone and lets the layout table have
+// its own say), and ErrTimeFieldOverflow when it decodes to an out-of-range
+// value — a distinction the caller needs, because upstream answers 22007 for the
+// first and 22008 for the second.
 //
 // It exists because goopg's timestamp text input is layout-driven end to end:
 // the date and zone parts of '2020-01-01 12:00 AM' are perfectly ordinary to
 // the layout table, and only the time token is beyond it. Canonicalizing just
 // that token lets the timestamp path reuse the field decoder above without
 // re-implementing date and zone decoding.
-func CanonicalizeTimeToken(s string) (string, bool) {
+func CanonicalizeTimeToken(s string) (string, int, error) {
 	end := 0
 	for end < len(s) && (isDigit(s[end]) || s[end] == ':' || s[end] == '.') {
 		end++
 	}
 	if end == 0 {
-		return s, false
+		return s, 0, ErrTimeBadFormat
 	}
 	token, rest := s[:end], s[end:]
 
@@ -155,8 +216,12 @@ func CanonicalizeTimeToken(s string) (string, bool) {
 	}
 
 	tod, err := ParseTimeOfDay(token)
-	if err != nil || tod.Hour >= 24 || tod.Sec >= 60 {
-		return s, false
+	if err != nil {
+		return s, 0, err
+	}
+	tod, dayCarry, err := tod.Normalize()
+	if err != nil {
+		return s, 0, err
 	}
 	var b strings.Builder
 	b.Grow(len(s) + 8)
@@ -171,7 +236,7 @@ func CanonicalizeTimeToken(s string) (string, bool) {
 		b.WriteString(frac)
 	}
 	b.WriteString(rest)
-	return b.String(), true
+	return b.String(), dayCarry, nil
 }
 
 type meridiemKind int

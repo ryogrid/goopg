@@ -118,13 +118,19 @@ func TestParsePGTimestampTextPGFieldRoles(t *testing.T) {
 		}
 	}
 
-	// Still deferred (ledger, M0119-0006): PG rolls hour 24 and the leap second
-	// over into the next day for a TIMESTAMP; goopg's canonical time token
-	// cannot carry either, so both stay rejections rather than wrong instants.
+	// No longer deferred: hour 24 and the leap second roll into the next day
+	// (tm2timestamp), and the total-vs-24:00:00 check decides which spellings
+	// are legal. Owned by TestTimestampInputHour24AndLeapSecond; kept here as
+	// the one assertion that the RETRY path — this test's subject — is what
+	// carries them, since the plain layout pass rejects both outright.
 	for _, in := range []string{"2020-01-01 24:00:00", "2020-01-01 23:59:60"} {
-		if got, err := parsePGTimestampText(in); err == nil {
-			t.Errorf("parsePGTimestampText(%q) = %v, want an error while the "+
-				"next-day rollover is deferred", in, got)
+		got, err := parsePGTimestampText(in)
+		if err != nil {
+			t.Errorf("parsePGTimestampText(%q): %v — PG reads this as 2020-01-02 00:00:00", in, err)
+			continue
+		}
+		if want := time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Errorf("parsePGTimestampText(%q) = %v, want %v (PG 18.3)", in, got, want)
 		}
 	}
 }

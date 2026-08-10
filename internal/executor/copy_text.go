@@ -418,16 +418,6 @@ func parseTimeString(s string) (time.Time, error) {
 
 	h, m, sec, ns := tod.Hour, tod.Min, tod.Sec, tod.Nsec
 
-	// Handle leap second: 23:59:60 → 24:00:00 (or carry).
-	if sec == 60 {
-		sec = 0
-		m++
-		if m == 60 {
-			m = 0
-			h++
-		}
-	}
-
 	// Handle extra fractional precision beyond microseconds (6 digits):
 	// Round nanoseconds to nearest microsecond. If rounding causes carry, propagate.
 	if ns%1000 >= 500 {
@@ -449,18 +439,19 @@ func parseTimeString(s string) (time.Time, error) {
 		}
 	}
 
-	// 24:00:00 is a valid time (midnight); h=24 with m=0, s=0, ns=0 is allowed.
-	// h > 24, or h=24 with any m/s/ns > 0 are invalid.
-	if h > 24 || (h == 24 && (m > 0 || sec > 0 || ns > 0)) {
+	// The range check and the hour-24 / leap-second fold are upstream's
+	// time_overflows() plus tm2time()'s composition, shared with the timestamp
+	// path through pgdatetime — the two used to carry their own copies, and only
+	// this one had them (a timestamp rejected '24:00:00' outright).
+	norm, dayCarry, err := pgdatetime.TimeOfDay{Hour: h, Min: m, Sec: sec, Nsec: ns}.Normalize()
+	if err != nil {
 		return time.Time{}, &ExecError{Code: "22008",
 			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
 	}
 
-	// Anchor to epoch date 1970-01-01 UTC. For h=24, store as next-day midnight.
-	if h == 24 {
-		return time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), nil
-	}
-	return time.Date(1970, 1, 1, h, m, sec, ns, time.UTC), nil
+	// Anchor to epoch date 1970-01-01 UTC. A whole-day time (24:00:00, 23:59:60)
+	// is stored as next-day midnight, which is how it round-trips as 24:00:00.
+	return time.Date(1970, 1, 1+dayCarry, norm.Hour, norm.Min, norm.Sec, norm.Nsec, time.UTC), nil
 }
 
 // stripTimeZoneSuffix removes the zone part of a time-only input: every
@@ -853,6 +844,24 @@ func parsePGTimestampText(s string) (time.Time, error) {
 // parsePGTimestampTextZone is parsePGTimestampText with the target type's zone
 // rule made explicit. See tsZoneMode for why the rule is per-type.
 func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
+	ts, dayCarry, err := parsePGTimestampTextParts(s, zone)
+	if err != nil {
+		return time.Time{}, err
+	}
+	ts = ts.AddDate(0, 0, dayCarry)
+	return ts, checkTimeCarrierRange(ts)
+}
+
+// parsePGTimestampTextParts is parsePGTimestampTextZone with the whole-day carry
+// of an hour-24 / leap-second time of day left UNAPPLIED and returned instead.
+//
+// The split mirrors upstream's: DecodeDateTime hands back a struct pg_tm whose
+// tm_hour may be 24 (or whose tm_sec may be 60), and it is tm2timestamp() — the
+// step that COMPOSES date and time as date2j(y,m,d) * USECS_PER_DAY + time — that
+// turns that into the next day. date_in() never calls tm2timestamp, so it must
+// see the parts, not the composed value: '2020-01-01 24:00:00'::date is
+// 2020-01-01 even though the identical text as a timestamp is 2020-01-02 00:00:00.
+func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error) {
 	body, bc := pgdatetime.SplitEra(s)
 	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
 	// unpadded month, day, hour, minute or second is legal input. Normalise
@@ -866,39 +875,55 @@ func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
 	// the time token in place lets the table below decode the rest unchanged;
 	// it is tried only after the plain spelling fails, so the common path costs
 	// nothing.
-	for _, cand := range [2]string{body, canonicalizeTimestampTimeToken(body)} {
-		if cand == "" {
+	// M0119-0006: hour 24 and the leap second are legal decoded fields that no
+	// Go layout can hold ('24:00:00', '23:59:60'), so the canonicaliser reports
+	// the whole day as a carry the caller composes in. An out-of-range token
+	// ('25:00:00', '24:00:00.5' — see pgdatetime.TimeOfDay.Overflows) is a field
+	// error, not a spelling the layouts should get a second go at.
+	canon, canonCarry, canonErr := canonicalizeTimestampTimeToken(body)
+	if errors.Is(canonErr, pgdatetime.ErrTimeFieldOverflow) {
+		return time.Time{}, 0, pgdatetime.ErrFieldOutOfRange
+	}
+	cands := [2]struct {
+		text  string
+		carry int
+	}{{body, 0}, {canon, canonCarry}}
+	for _, cand := range cands {
+		if cand.text == "" {
 			continue
 		}
 		for _, layout := range pgTimestampLayouts {
-			if ts, err := time.Parse(layout, cand); err == nil {
+			if ts, err := time.Parse(layout, cand.text); err == nil {
 				ts, err := pgdatetime.ApplyEra(applyTSZoneMode(ts, zone), bc)
 				if err != nil {
-					return time.Time{}, err
+					return time.Time{}, 0, err
 				}
-				return ts, checkTimeCarrierRange(ts)
+				return ts, cand.carry, nil
 			}
 		}
 	}
-	return time.Time{}, errNoTimestampLayout
+	return time.Time{}, 0, errNoTimestampLayout
 }
 
 // canonicalizeTimestampTimeToken rewrites the time-of-day token of a
-// "YYYY-MM-DD<sep>..." string through pgdatetime.CanonicalizeTimeToken, and
+// "YYYY-MM-DD<sep>..." string through pgdatetime.CanonicalizeTimeToken. It
 // returns "" when there is nothing to rewrite (no date prefix, or a time token
-// the field decoder does not recognise either).
-func canonicalizeTimestampTimeToken(body string) string {
+// the field decoder does not recognise either), the day carry the token implies
+// ('24:00:00' / '23:59:60' are the whole day), and ErrTimeFieldOverflow when the
+// token decoded but is out of range — which the caller must NOT paper over as a
+// syntax miss, since upstream answers 22008 for it.
+func canonicalizeTimestampTimeToken(body string) (string, int, error) {
 	if len(body) < 12 || body[4] != '-' || body[7] != '-' {
-		return ""
+		return "", 0, nil
 	}
 	if sep := body[10]; sep != ' ' && sep != 'T' {
-		return ""
+		return "", 0, nil
 	}
-	canon, ok := pgdatetime.CanonicalizeTimeToken(body[11:])
-	if !ok {
-		return ""
+	canon, dayCarry, err := pgdatetime.CanonicalizeTimeToken(body[11:])
+	if err != nil {
+		return "", 0, err
 	}
-	return body[:11] + canon
+	return body[:11] + canon, dayCarry, nil
 }
 
 // goopg's KindTime Datum carries an int64 count of NANOSECONDS since 1970
@@ -972,6 +997,28 @@ func parsePGDateText(s string) (time.Time, error) {
 	return t, checkTimeCarrierRange(t)
 }
 
+// parseDateInputText is date_in()'s reading of a string that may carry a time
+// of day: the full timestamp grammar decodes it, but only the year/month/day
+// survive. Two things the timestamp reading does must therefore be undone here,
+// and both were silently wrong before — upstream's date_in calls neither
+// DetermineTimeZoneOffset nor tm2timestamp, it just hands tm_year/mon/mday to
+// date2j():
+//
+//	the zone       — tsDiscardZone, so '2020-01-02 02:00:00+05:30'::date is the
+//	                 2nd (fixed in the preceding M0119-0006 slice)
+//	the day carry  — '2020-01-01 24:00:00'::date is the 1st, not the 2nd, even
+//	                 though the same text AS A TIMESTAMP is 2020-01-02 00:00:00
+//
+// The returned value still carries the decoded wall clock; callers truncate it
+// to midnight as they already did.
+func parseDateInputText(s string) (time.Time, error) {
+	ts, _, err := parseCopyTimestampZoneParts(s, tsDiscardZone)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return ts, checkTimeCarrierRange(ts)
+}
+
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
 // commonly produces: with or without fractional seconds, with or
 // without timezone. It is the timestamptz reading of the input; a caller that
@@ -984,22 +1031,33 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 // parseCopyTimestampZone is parseCopyTimestamp with the target type's zone rule
 // made explicit.
 func parseCopyTimestampZone(s string, zone tsZoneMode) (time.Time, error) {
-	ts, err := parsePGTimestampTextZone(s, zone)
+	ts, dayCarry, err := parseCopyTimestampZoneParts(s, zone)
+	if err != nil {
+		return time.Time{}, err
+	}
+	ts = ts.AddDate(0, 0, dayCarry)
+	return ts, checkTimeCarrierRange(ts)
+}
+
+// parseCopyTimestampZoneParts is parseCopyTimestampZone with the whole-day carry
+// left unapplied; see parsePGTimestampTextParts for why date_in needs it that way.
+func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, error) {
+	ts, dayCarry, err := parsePGTimestampTextParts(s, zone)
 	if err == nil {
-		return ts, nil
+		return ts, dayCarry, nil
 	}
 	if errors.Is(err, pgdatetime.ErrFieldOutOfRange) || errors.Is(err, errTimeCarrierRange) {
 		// A field that decoded but cannot be represented is a range failure, not
 		// a syntax miss: do not let the natural-language fallback below have a
 		// second go at it and turn a definite answer into "invalid timestamp".
-		return time.Time{}, err
+		return time.Time{}, 0, err
 	}
 	// Try verbose natural-language format used by PostgreSQL's datetime output
 	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
 	if ts, err := parseFullTimestamp(pgdatetime.NormalizeInput(s)); err == nil {
-		return ts, nil
+		return ts, 0, nil
 	}
-	return time.Time{}, fmt.Errorf("invalid timestamp %q", s)
+	return time.Time{}, 0, fmt.Errorf("invalid timestamp %q", s)
 }
 
 // parseTimestampInfinityLiteral recognises PostgreSQL's special timestamp input

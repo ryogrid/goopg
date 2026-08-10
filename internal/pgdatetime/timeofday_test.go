@@ -108,31 +108,41 @@ func TestParseTimeOfDayRejects(t *testing.T) {
 // suffix byte-identical, so the timestamp layout table can decode the rest.
 func TestCanonicalizeTimeToken(t *testing.T) {
 	for _, tc := range []struct {
-		in   string
-		want string
-		ok   bool
+		in    string
+		want  string
+		carry int
+		err   error
 	}{
-		{"12:00 AM", "00:00:00", true},
-		{"10:00 PM", "22:00:00", true},
-		{"040506", "04:05:06", true},
-		{"040506.25+02", "04:05:06.25+02", true},
-		{"10::00", "10:00:00", true},
-		{"10:00.5", "00:10:00.5", true},
-		{"10:00:00Z", "10:00:00Z", true},
-		{"10:00:00-04", "10:00:00-04", true},
-		{"10:00 PST", "10:00:00 PST", true},
-		// Deferred: the canonical spelling cannot carry these, so the caller's
-		// existing behaviour (a rejection) is left in place rather than
-		// silently normalised into the wrong instant.
-		{"24:00:00", "24:00:00", false},
-		{"23:59:60", "23:59:60", false},
+		{in: "12:00 AM", want: "00:00:00"},
+		{in: "10:00 PM", want: "22:00:00"},
+		{in: "040506", want: "04:05:06"},
+		{in: "040506.25+02", want: "04:05:06.25+02"},
+		{in: "10::00", want: "10:00:00"},
+		{in: "10:00.5", want: "00:10:00.5"},
+		{in: "10:00:00Z", want: "10:00:00Z"},
+		{in: "10:00:00-04", want: "10:00:00-04"},
+		{in: "10:00 PST", want: "10:00:00 PST"},
+		// The whole day: legal to PG, and the canonical spelling carries it as
+		// midnight plus one day for the caller to compose in (tm2timestamp).
+		{in: "24:00:00", want: "00:00:00", carry: 1},
+		{in: "23:59:60", want: "00:00:00", carry: 1},
+		{in: "23:59:60+05:30", want: "00:00:00+05:30", carry: 1},
+		// Below the day boundary a leap second just rolls the minute.
+		{in: "10:00:60", want: "10:01:00"},
+		{in: "10:59:60", want: "11:00:00"},
+		// Past the day boundary: time_overflows() says no.
+		{in: "24:00:00.5", want: "24:00:00.5", err: ErrTimeFieldOverflow},
+		{in: "23:59:60.5", want: "23:59:60.5", err: ErrTimeFieldOverflow},
+		{in: "24:00:01", want: "24:00:01", err: ErrTimeFieldOverflow},
+		{in: "25:00:00", want: "25:00:00", err: ErrTimeFieldOverflow},
 		// Nothing time-like at the head.
-		{"PST", "PST", false},
-		{"", "", false},
+		{in: "PST", want: "PST", err: ErrTimeBadFormat},
+		{in: "", want: "", err: ErrTimeBadFormat},
 	} {
-		got, ok := CanonicalizeTimeToken(tc.in)
-		if got != tc.want || ok != tc.ok {
-			t.Errorf("CanonicalizeTimeToken(%q) = %q, %v; want %q, %v", tc.in, got, ok, tc.want, tc.ok)
+		got, carry, err := CanonicalizeTimeToken(tc.in)
+		if got != tc.want || carry != tc.carry || !errors.Is(err, tc.err) {
+			t.Errorf("CanonicalizeTimeToken(%q) = %q, %d, %v; want %q, %d, %v",
+				tc.in, got, carry, err, tc.want, tc.carry, tc.err)
 		}
 	}
 }

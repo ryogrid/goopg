@@ -571,3 +571,104 @@ agrees.
    PG prints `2020-01-01 04:30:00+00`), because `KindTime` cannot tell the two
    types apart on output either — the same missing distinction, on the other
    side of the wire.
+
+## 11. Follow-up 2026-08-11 (M0119-0006) — hour 24, the leap second, and the day a `date` must NOT carry
+
+### 11.1 The defect
+
+Six ordinary PG spellings were flat 22007 syntax errors on goopg's timestamp
+path, and one class of genuinely-invalid input got the wrong SQLSTATE:
+
+| input | PG 18.3 | goopg before |
+|---|---|---|
+| `'2020-01-01 24:00:00'::timestamp` | `2020-01-02 00:00:00` | 22007 |
+| `'2020-01-01 23:59:60'::timestamp` | `2020-01-02 00:00:00` | 22007 |
+| `'2020-01-01 10:00:60'::timestamp` | `2020-01-01 10:01:00` | 22007 |
+| `'2020-12-31 24:00:00'::timestamp` | `2021-01-01 00:00:00` | 22007 |
+| `'2020-01-01 240000'::timestamp` | `2020-01-02 00:00:00` | 22007 |
+| `'2020-01-01 24:00:00'::date` | `2020-01-01` | 22007 |
+| `'2020-01-01 25:00:00'::timestamp` | 22008 field out of range | 22007 |
+
+The time-only path already answered every one of these correctly
+(`'24:00:00'::time` → `24:00:00`, `'23:59:60'::time` → `24:00:00`,
+`'10:00:60'::time` → `10:01:00`) — a textbook instance of the sibling-path rule:
+one twin had the behaviour and the other did not, and each carried its own copy
+of the arithmetic.
+
+### 11.2 Why
+
+`DecodeTimeCommon`'s sanity check (`postgres/src/backend/utils/adt/datetime.c`)
+ends with the comment *"but caller must check the range of tm_hour"* — it
+deliberately admits `tm_hour == 24` and `tm_sec == 60`. The caller's check is
+`time_overflows()` (`postgres/src/backend/utils/adt/date.c`), called from both
+`DecodeDateTime` and `DecodeTimeOnly`: the fields are range-checked
+individually, and then, *"because we allow, eg, hour = 24 or sec = 60"*, the
+TOTAL is separately required not to exceed 24:00:00. That total check is the
+whole reason `'24:00:00'` and `'23:59:60'` are legal while `'24:00:00.5'`,
+`'23:59:60.5'` and `'24:00:01'` are not.
+
+The fold into the next day is then **not part of decoding at all**. It falls out
+of `tm2timestamp()`, which composes `date2j(y, m, d) * USECS_PER_DAY` with the
+time-of-day microseconds — 86 400 000 000 of them being exactly one more day.
+
+That is why `date_in()` does not roll over: it never calls `tm2timestamp`, it
+hands `tm_year`/`tm_mon`/`tm_mday` straight to `date2j`. So one string has two
+correct readings, and they differ by a day:
+
+```
+'2020-01-01 24:00:00'::timestamp  ->  2020-01-02 00:00:00
+'2020-01-01 24:00:00'::date       ->  2020-01-01
+```
+
+goopg's shape hid all of this. `CanonicalizeTimeToken` (§9) rewrites the time
+token into the padded `HH:MM:SS` spelling the Go layout table can read, and it
+*declined* any token that spelling cannot hold — which is precisely hour 24 and
+second 60. The timestamp path therefore never saw them.
+
+### 11.3 What landed
+
+The decode/compose split is now goopg's shape too.
+
+- `pgdatetime.TimeOfDay.Overflows()` reimplements `time_overflows()`, total
+  check included, and `TimeOfDay.Normalize()` reimplements the fold: it returns
+  the normalised time plus a **`dayCarry`**, 1 exactly when the time of day is
+  the whole day. A second 60 below the boundary just rolls the minute
+  (`10:00:60` → `10:01:00`), which the same code path gives for free.
+- `CanonicalizeTimeToken` returns `(canon, dayCarry, error)`. The error is now
+  typed: `ErrTimeBadFormat` means "not a time, leave the string alone",
+  `ErrTimeFieldOverflow` means "decoded and out of range" — the caller maps the
+  second to `pgdatetime.ErrFieldOutOfRange`, i.e. 22008, instead of letting the
+  layout table have a second go and report a spelling error.
+- `parsePGTimestampTextParts` / `parseCopyTimestampZoneParts` return the carry
+  **unapplied**; the ordinary `…Zone` wrappers add it. That is the
+  `tm2timestamp` seam, and it is where the range check against the `KindTime`
+  carrier now runs (post-carry, so `'9999-12-31 24:00:00'` is judged on the
+  value it actually becomes).
+- `parseDateInputText` is the new `date_in` reading, used by the `::date` cast
+  and the date arm of `encodeValuePG`: same parse, carry dropped. Its doc names
+  both things `date_in` discards — the zone (§10) and now the carry — because
+  each of them, taken alone, was a whole-day error.
+- `parseTimeString` deletes its private leap-second fold and its private
+  hour-24 range check and calls `Normalize` like everyone else.
+
+### 11.4 Verification
+
+`internal/executor/timestamp_hour24_leap_second_input_test.go` (four subtests:
+timestamp composes the carry, date drops it, past-the-day is 22008, and the
+time-only twin agrees) plus the extended `TestCanonicalizeTimeToken`. All wants
+were captured from a throwaway PG 18.3 cluster and re-diffed end to end against
+a throwaway goopg over the literal, cast and `::date`/`::time`/`::timetz` paths:
+every cell agrees except the three already-open ledger rows below.
+
+### 11.5 Still unimplemented (deferral ledger, 2026-08-11)
+
+1. `'0001-01-01 24:00:00 BC'::timestamp` is a loud 22008 rather than
+   `0001-01-02 00:00:00 BC` — the `KindTime` nanosecond carrier again (§8), not
+   the carry, which composes correctly before the guard rejects the result.
+2. `'23:59:60'::timetz` answers `24:00:00+00` where a `TimeZone = Asia/Tokyo`
+   session answers `24:00:00+09` — the bare-`timetz` session-zone default, open
+   since §9.
+3. The three time-of-day items §9 left open are untouched by this slice: the
+   unvalidated TIME zone suffix (`'10:00 A.M.'`), the run-together DATE half of
+   `DecodeNumberField` (`'20200101T040506'`), and `timestamptz` output's missing
+   zone suffix (§10).

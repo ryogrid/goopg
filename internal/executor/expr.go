@@ -3670,8 +3670,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 			// date_in decodes a zone field and then ignores it, so the day comes
 			// from the wall clock as written: '2020-01-02 02:00:00+05:30'::date
-			// is 2020-01-02, not the previous day (tsZoneMode).
-			t, err := parseCopyTimestampZone(s, tsDiscardZone)
+			// is 2020-01-02, not the previous day (tsZoneMode). It likewise never
+			// composes date with time, so an hour-24 / leap-second day carry is
+			// dropped too — '2020-01-01 24:00:00'::date is the 1st.
+			t, err := parseDateInputText(s)
 			if err != nil {
 				// M0119-0006: a range failure (no year zero, or a value the
 				// KindTime carrier cannot hold) keeps its own 22008 wording —
