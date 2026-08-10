@@ -1216,6 +1216,56 @@ sources agree:
           and `BTreeTupleSetPosting`'s posting offset, both of which pad
           INSIDE the tuple and so stay blocked until every index is
           descriptor-bearing; `_bt_keep_natts`; `BTMaxItemSize`.
+    - **3b-3c — `_bt_truncate` suffix truncation (2026-08-10).** A separator is
+      not a key: it is a BOUNDARY, and it only has to sit strictly above every
+      key on the left page and at-or-below every key on the right one. Upstream
+      keeps just the attributes that distinguish `lastleft` from `firstright`
+      (`_bt_keep_natts` + `index_truncate_tuple`, nbtutils.c); goopg stored the
+      whole right-hand key, because before the flip `item.key` was one opaque
+      blob with no attribute boundary to cut at. `indexFormat.truncateSeparator`
+      (`internal/access/btree/pgtruncate.go`) is that cut, and it is applied at
+      every separator producer: the split path (`insertIntoBlock`) and both bulk
+      loader levels (`buildLevel`, `buildLevelRaw`), leaf levels only — an
+      internal separator is already a truncated pivot, which is why upstream
+      copies it verbatim and why `truncateSeparator` returns a pivot operand
+      unchanged.
+
+      The split path additionally stopped re-deriving the parent's downlink key
+      from `rightItems[0]`: upstream's `_bt_insert_parent` builds it from the
+      LEFT page's high key, and once that key is truncated a parent stating the
+      untruncated one routes descents to a boundary the level below no longer
+      draws.
+
+      The half that is a correctness fix rather than a size one is
+      `_bt_truncate`'s second branch. When the split falls between two entries
+      whose key attributes are all equal — a duplicate-heavy index, or a posting
+      run chunked across pages — upstream keeps `lastleft`'s heap TID as the
+      implicit final key attribute (`BT_PIVOT_HEAP_TID_ATTR`). goopg wrote a
+      pivot with NO heap TID, which `ComparePGIndexTuples` reads as minus
+      infinity there, so every left-page entry sharing that key value compared
+      GREATER than its own page's high key and a descent walked right past the
+      page holding it. Mutation-checked: with truncation disabled, a point
+      descent for the first of 1500 duplicates returns the WRONG heap TID
+      ({12,25} instead of {0,1}). It was unreachable before the flip (a blob key
+      carries no TID, so the two sides compared equal), which is why the
+      tiebreaker lands here rather than staying a deferral.
+
+      `indexFormat.marshal` had to learn the flag too: it re-stamps every
+      pivot's natts on the way to the page, and stamping without
+      `BT_PIVOT_HEAP_TID_ATTR` would leave the trailing `ItemPointerData` on the
+      tuple while telling every reader those six bytes are key data.
+
+      NOT REINDEX-required: an untruncated separator is still a legal one, so
+      pre-slice pages stay readable and only new splits write the shorter form.
+
+      Guard: `internal/access/btree/pgtruncate_test.go` — blob-format
+      byte-for-byte no-op; keep-natts at the first distinguishing attribute (on
+      a THREE-column descriptor, since `FormPGIndexTuple` MAXALIGNs and a 2→1
+      cut fits inside the same 8-byte block); the tiebreaker pivot's TID, its
+      MAXALIGNed size and the leaf `key <= HighKey` invariant it restores, with
+      the pre-slice separator kept in the test as the mutation reference; the
+      marshal round trip; and the end-to-end 1500-duplicate tree where both the
+      point descents and the prefix range scan must find every entry.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.

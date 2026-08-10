@@ -1,43 +1,43 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP. DONE, committed (fea5e8dd)
-+ pushed. A follow-up docs-only commit records the REINDEX-debt finding.
+Task: M0130-S11.4 slice 3b-3c — `_bt_truncate` suffix truncation. DONE, being
+committed this loop.
 
-Landed: `pgIndexTupleKeys = true`. Describable indexes are now PG index tuples
-on disk; refused indexes keep the blob path, so key format is a per-INDEX
-catalog property with nothing on disk recording it (metapage version must stay
-4) — hence REINDEX-required. The eight prior slices had covered every key
-PRODUCER; the flip's real content was four CONSUMERS:
-- `(*BTree).Search`: full-key equality is unsatisfiable once the heap TID is in
-  the key (every unique probe said "no such key"); now `compareKeyAttrs` + a
-  `_bt_stepright`-style right step (a zero-TID probe descends LEFT of a group
-  that starts at a page boundary).
-- `indexFormat.compareHigh`: weighed the TID, so every real entry read as ABOVE
-  a bound naming its exact key → equality scans returned zero rows. Now
-  key-attributes-only. The LOW end keeps the tiebreak deliberately.
-- index-only scan: decoded a tuple image with the blob running-offset walk; now
-  `pgIndexTupleKeyDatums` (DeformPGIndexTuple + decodePhysicalPGValueMctx).
-- amcheck `checkunique`: compared bytewise, had silently STOPPED detecting
-  duplicates; now `IndexFormat.CompareKeyAttrs`.
+Landed: `indexFormat.truncateSeparator` (internal/access/btree/pgtruncate.go)
+= `_bt_keep_natts` + `index_truncate_tuple`, called from the split path
+(`insertIntoBlock`) and both bulk-loader levels (`buildLevel`,
+`buildLevelRaw`), LEAF levels only. The split path also stopped re-deriving the
+parent downlink from `rightItems[0]` — `_bt_insert_parent` builds it from the
+LEFT page's high key, and 3b-3c makes those two different keys.
+Key finding: `_bt_truncate`'s SECOND branch is a correctness fix, not a size
+one. With every key attribute equal, a separator without `lastleft`'s heap TID
+is minus infinity in the implicit last key attribute, so every left-page entry
+sharing that key compares GREATER than its own page's high key. Mutation-checked
+(truncation disabled): a point descent for the first of 1500 duplicates returns
+the WRONG heap TID — {12,25} instead of {0,1}. Unreachable before the flip.
+`indexFormat.marshal` now carries BT_PIVOT_HEAP_TID_ATTR through its natts
+re-stamp (it re-stamps every pivot on the way to the page).
+NOT REINDEX-required: an untruncated separator is still legal.
 
-Gates: units PASS; tpch-spotcheck PASS (Q12=2, Q13=35); pgbench smoke PASS;
-TPC-DS SF0.5 **PASS=95 ERROR=0 MISMATCH=0 CKMISMATCH=0, plans identical**.
+Guard: internal/access/btree/pgtruncate_test.go (blob no-op byte-for-byte;
+keep-natts on a THREE-column desc because FormPGIndexTuple MAXALIGNs and a 2->1
+cut is free; tiebreak TID/size/invariant with the pre-slice separator kept as
+the mutation reference; marshal round trip; 1500-duplicate end-to-end tree).
 
-BIGGEST FINDING (not the flip): the first SF0.5 sweep returned 42 ERRORs that
-reproduce IDENTICALLY on a gate-OFF rebuild. Both bench clusters had been
-carrying un-remediated REINDEX debt from S11.2/S11.3 (page shape + metapage)
-since before the last green sweep. REINDEXing all 24 SF0.5 PKs (46s) restored
-the baseline exactly. TPC-H is STILL un-remediated: `REINDEX` inside db `tpch`
-reports "relation does not exist" (per-DB catalog scoping gap, same one the
-ledger records for ANALYZE), so SF=1 index behaviour is ungated and
-tpch-spotcheck's Q12/Q13 are seq-scan plans that never touch an index.
+Gates: btree/amcheck/storage PASS; units PASS; tpch-spotcheck PASS (Q12=2,
+Q13=35); pgbench smoke via the commit hook. TPC-DS SF0.5 NOT run (backward
+compatible, no REINDEX debt added) — run it before the next REINDEX-required
+slice.
 
-Next step (re-read the fix_plan banner first; M-NIGHTLY filing is unconditional
-and the six AI-20260810-011258-* items are already filed, left unchecked):
-1. **3b-3 — collect the deferrals**: blob MAXALIGN, `_bt_keep_natts` suffix
-   truncation, `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`, dead
-   `backfillBTree`, dead `appendTIDToPosting`/`promoteSingleToPosting`.
-2. Candidate ahead of it: fix the REINDEX per-DB scoping gap, then REINDEX the
-   TPC-H cluster and add ONE index-driven query to tpch-spotcheck.sh — without
-   it the next REINDEX-required slice repeats this exact four-slice blind spot.
+Ledger row filed: leaf items are still admitted without
+`CheckPGBTItemSize(size, true)` (a separator may now need 8 more bytes) ->
+3b-3d; `MaxItemsPerPage` cannot tighten on this slice's account after all (the
+3b-3a resume point was wrong: negative-infinity downlinks stay zero-length);
+bulk loaders skip truncation at an i==0 boundary; still no `_bt_dedup_pass`;
+`keyExceedsHighKey`'s plain `compare` re-audited and found to MATCH upstream.
 
-In-flight: none. (Bench servers all stopped; /tmp/goopg-preflip is a scratch
-gate-OFF build, safe to delete.)
+Next step (re-read the fix_plan banner first; the six AI-20260810-011258-*
+items stay filed and unchecked per the banner):
+1. **3b-3d — `MaxHighKeyLen`/`bulkHighKeyReserve` -> `BTMaxItemSize`**, which is
+   also where the `CheckPGBTItemSize(size, true)` leaf bound belongs.
+2. Then S11.5 (`RM_BTREE` WAL) per the fix_plan order.
+
+In-flight: none.

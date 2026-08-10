@@ -160,16 +160,22 @@ func (f indexFormat) marshal(it item) []byte {
 		// A pivot's t_tid is the downlink plus the nbtree status bits, never a
 		// heap TID (upstream BTreeTupleSetDownLink + BTreeTupleSetNAtts).
 		natts := uint16(f.desc.NKeyAtts())
+		heapTID := false
 		if PGIndexTupleIsAltTID(raw) {
 			// Already a pivot (a parse → re-marshal round trip, e.g. the split
-			// redistribution and the vacuum page rewrites): keep the attribute
-			// count it was truncated to instead of un-truncating it.
+			// redistribution and the vacuum page rewrites, or a separator fresh
+			// from `truncateSeparator`): keep the attribute count it was
+			// truncated to instead of un-truncating it — and keep the
+			// BT_PIVOT_HEAP_TID_ATTR bit with it, since dropping that would
+			// leave the trailing tiebreaker ItemPointerData on the tuple while
+			// telling every reader it is key data (M0130-S11.4 slice 3b-3c).
 			natts = BTreeTupleGetNAtts(raw, uint16(f.desc.NKeyAtts()))
+			heapTID = PGIndexTupleTID(raw).Offset&BTPivotHeapTIDAttr != 0
 		} else if len(raw) == SizeOfIndexTupleData {
 			natts = 0 // negative infinity: no key attributes at all
 		}
 		BTreeTupleSetDownLink(raw, it.ptr.Block)
-		if err := BTreeTupleSetNAtts(raw, natts, false); err != nil {
+		if err := BTreeTupleSetNAtts(raw, natts, heapTID); err != nil {
 			// Unreachable: natts is bounded by the descriptor's key count,
 			// which FormPGIndexTuple already validated against IndexMaxKeys.
 			panic(err)

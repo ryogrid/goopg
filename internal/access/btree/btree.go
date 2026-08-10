@@ -2754,7 +2754,18 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
-	sepKey := rightItems[0].key
+	// _bt_split's separator. On a LEAF split it is `_bt_truncate(lastleft,
+	// firstright)` — the shortest key that still separates the two halves,
+	// with lastleft's heap TID kept as the tiebreaker when no key attribute
+	// distinguishes them (M0130-S11.4 slice 3b-3c). On an INTERNAL split the
+	// first right item is already a truncated pivot from the leaf split that
+	// produced it, and upstream copies it verbatim; truncateSeparator says the
+	// same by returning a pivot operand unchanged.
+	var lastLeft item
+	if len(leftItems) > 0 {
+		lastLeft = leftItems[len(leftItems)-1]
+	}
+	sepKey := bt.format().truncateSeparator(lastLeft, rightItems[0])
 	if len(sepKey) > MaxHighKeyLen {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
@@ -2864,8 +2875,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.unpinW(sibSlot)
 	}
 
-	// The separator key going up is the smallest key in the right page.
-	sepItem := downlinkItem(append([]byte(nil), rightItems[0].key...), rightBlk)
+	// The separator going up is the one just installed as the left page's high
+	// key, NOT the first right key again: upstream's `_bt_insert_parent` builds
+	// the parent's new item from the left page's high key for exactly this
+	// reason (nbtinsert.c). Since 3b-3c that key is truncated, and a parent
+	// downlink that re-stated the untruncated key would route descents to a
+	// boundary the level below no longer draws.
+	sepItem := downlinkItem(append([]byte(nil), sepKey...), rightBlk)
 
 	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)

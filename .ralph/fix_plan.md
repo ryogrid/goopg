@@ -1407,7 +1407,30 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         - [ ] **3b-3b** — the two tuple-INTERNAL MAXALIGNs
               (`index_form_tuple` size rounding, `BTreeTupleSetPosting` posting
               offset), blocked until every index is descriptor-bearing.
-        - [ ] **3b-3c** — `_bt_keep_natts` suffix truncation.
+        - [x] **3b-3c — `_bt_truncate` suffix truncation** (2026-08-10). NOT
+              REINDEX-required (an untruncated separator is still a legal one).
+              `indexFormat.truncateSeparator`
+              (`internal/access/btree/pgtruncate.go`) keeps only the attributes
+              that distinguish `lastleft` from `firstright` (`_bt_keep_natts` +
+              `index_truncate_tuple`), applied at every separator producer: the
+              split path and both bulk-loader levels, LEAF levels only — an
+              internal separator is already a truncated pivot, which upstream
+              copies verbatim. The split path also stopped re-deriving the
+              parent downlink from `rightItems[0]`: `_bt_insert_parent` builds
+              it from the left page's high key, and a parent stating the
+              untruncated key routes descents to a boundary the level below no
+              longer draws. The correctness half is `_bt_truncate`'s second
+              branch: when every key attribute is equal the separator keeps
+              `lastleft`'s heap TID (`BT_PIVOT_HEAP_TID_ATTR`); without it a
+              TID-less pivot is minus infinity in the implicit last key
+              attribute, so every left-page entry sharing that key compared
+              GREATER than its own page's high key — mutation-checked, a point
+              descent for the first of 1500 duplicates returned the WRONG heap
+              TID. `indexFormat.marshal` now preserves the flag when it
+              re-stamps a pivot's natts. Guard
+              `internal/access/btree/pgtruncate_test.go`. Gates: btree/amcheck/
+              storage + units PASS; tpch-spotcheck PASS (Q12=2, Q13=35);
+              pgbench smoke PASS.
         - [ ] **3b-3d** — `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay

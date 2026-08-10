@@ -424,8 +424,17 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 				return nil, fmt.Errorf("btree bulk: PinNew next at level %d: %w", level, err)
 			}
 
-			// highKey of the current page = key of the first item on the next page.
+			// highKey of the current page = the separator between the last item
+			// on it and the first item of the next page. `_bt_buildadd` truncates
+			// that separator on a LEAF level only (nbtsort.c: the internal levels
+			// re-use the pivot the level below produced), which is also what
+			// truncateSeparator does when handed a pivot operand — the level
+			// check here is the readable half of the same statement.
+			// M0130-S11.4 slice 3b-3c.
 			highKey := items[i].key
+			if flags&BTLeaf != 0 && i > 0 {
+				highKey = bt.format().truncateSeparator(items[i-1], items[i])
+			}
 
 			// Flush and release current page, linking it to nextBlk.
 			if err := flushPage(highKey, nextBlk); err != nil {
@@ -668,7 +677,18 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 				bt.pool.Unpin(curSlot)
 				return nil, fmt.Errorf("btree bulk raw: PinNew next: %w", err)
 			}
+			// `_bt_buildadd`'s separator, truncated on a leaf level exactly as in
+			// buildLevel above (M0130-S11.4 slice 3b-3c). This is the path where
+			// the tiebreaker branch earns its keep: a duplicate run chunked
+			// across pages puts two entries with IDENTICAL key attributes on
+			// either side of the boundary, and a separator without lastleft's
+			// heap TID would sort BELOW the left page's own entries.
 			highKey := raws[i].key
+			if flags&BTLeaf != 0 && i > 0 {
+				highKey = bt.format().truncateSeparator(
+					bt.format().rawSeparatorOperand(raws[i-1]),
+					item{key: raws[i].key})
+			}
 			if err := flushPage(highKey, nextBlk); err != nil {
 				bt.pool.Unpin(nextSlot)
 				return nil, err
