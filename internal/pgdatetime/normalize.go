@@ -274,11 +274,10 @@ func RunTogetherDateIsTimeAmbiguous(s string) bool {
 // ERRCODE_DATETIME_FIELD_OVERFLOW in DateTimeParseError), so callers don't
 // need to distinguish them either.
 //
-// NOT yet covered (deferred, see the ledger row for M0119-0006): ValidateDate's
-// THIRD check, "day of month, now that we know for sure the month and year"
-// (`tm_mday > day_tab[isleap(year)][month-1]`) — a day that is <=31 but still
-// impossible for its month (Feb 30, Apr 31) is not caught here and stays
-// accepted, matching goopg's pre-existing behaviour for that narrower case.
+// ValidateDate's THIRD check — "day of month, now that we know for sure the
+// month and year" (`tm_mday > day_tab[isleap(year)][month-1]`) — is NOT here,
+// since it needs the astronomical year rather than just month/day; see
+// ValidateDayOfMonth.
 func ValidateMonthDay(month, day int) error {
 	if month < 1 || month > 12 {
 		return ErrFieldOutOfRange
@@ -308,19 +307,105 @@ func ValidateMonthDay(month, day int) error {
 // because DecodeDateTime DID recognise the shape; only ValidateDate rejected
 // the values.
 func ValidateDateToken(dateToken string) error {
-	n := len(dateToken)
-	if n < 6 || dateToken[n-6] != '-' || dateToken[n-3] != '-' {
-		return nil
-	}
-	month, ok := parseDigits2(dateToken[n-5 : n-3])
-	if !ok {
-		return nil
-	}
-	day, ok := parseDigits2(dateToken[n-2:])
+	month, day, ok := DateTokenMonthDay(dateToken)
 	if !ok {
 		return nil
 	}
 	return ValidateMonthDay(month, day)
+}
+
+// DateTokenMonthDay locates the MM/DD fields of a zero-padded "...-MM-DD"
+// date token — see ValidateDateToken for the shape and the reason month/day
+// are found from the TRAILING "-MM-DD" rather than a fixed offset. ok is
+// false for anything that is not that shape, mirroring ValidateDateToken's
+// "defer to the caller's parser" rule.
+//
+// Split out from ValidateDateToken so a caller can also run ValidateDayOfMonth
+// once it knows the astronomical year (ValidateDate()'s third check needs the
+// era-adjusted year, which is not available until after ApplyEra runs — see
+// the design doc's §13.3 follow-up).
+func DateTokenMonthDay(dateToken string) (month, day int, ok bool) {
+	n := len(dateToken)
+	if n < 6 || dateToken[n-6] != '-' || dateToken[n-3] != '-' {
+		return 0, 0, false
+	}
+	month, ok = parseDigits2(dateToken[n-5 : n-3])
+	if !ok {
+		return 0, 0, false
+	}
+	day, ok = parseDigits2(dateToken[n-2:])
+	if !ok {
+		return 0, 0, false
+	}
+	return month, day, true
+}
+
+// DateTokenYear extracts the (possibly wide, unpadded) YEAR field that
+// precedes DateTokenMonthDay's trailing "-MM-DD" — the digit run from the
+// start of the token up to that suffix. ok is false when the token is not
+// the "...-MM-DD" shape DateTokenMonthDay expects, or when the leading run
+// is not itself all digits (a widened run-together year is still all
+// digits — see expandRunTogetherDate — so this covers that case too).
+//
+// This exists so ValidateDayOfMonth can run BEFORE time.Parse: Go's
+// time.Parse (unlike time.Date/AddDate) already rejects an impossible
+// calendar day itself ("2020-02-30": "day out of range"), but with a bare
+// parse error indistinguishable from a syntax mistake — the caller needs the
+// year in hand to produce PostgreSQL's 22008 instead of falling through to
+// the generic 22007.
+func DateTokenYear(dateToken string) (year int, ok bool) {
+	n := len(dateToken)
+	if n < 6 || dateToken[n-6] != '-' || dateToken[n-3] != '-' {
+		return 0, false
+	}
+	yearPart := dateToken[:n-6]
+	if yearPart == "" {
+		return 0, false
+	}
+	y := 0
+	for i := 0; i < len(yearPart); i++ {
+		c := yearPart[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		y = y*10 + int(c-'0')
+		if y > 1_000_000_000 { // guard a pathological digit run; not a real year either way
+			return 0, false
+		}
+	}
+	return y, true
+}
+
+// daysInMonthTab mirrors PostgreSQL's day_tab[isleap][month-1]
+// (postgres/src/backend/utils/adt/datetime.c) — the non-leap row, index 0.
+var daysInMonthTab = [12]int{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+
+// isLeapYear applies PG's isleap() macro (datetime.h) to an ASTRONOMICAL year
+// (1 BC = year 0, 2 BC = year -1, ... — ApplyEra's convention, not the
+// era-relative year the input text spelled). Go's %, unlike C's, still
+// returns 0 for a negative exact multiple, so the same three comparisons work
+// unchanged for a negative year.
+func isLeapYear(year int) bool {
+	return year%4 == 0 && (year%100 != 0 || year%400 == 0)
+}
+
+// ValidateDayOfMonth is ValidateDate()'s THIRD check (datetime.c: "check for
+// valid day of month, now that we know for sure the month and year") —
+// day-in-month rejects Feb 30 / Apr 31 rather than just capping day at 31.
+// Unlike ValidateMonthDay's other two checks, it needs the ASTRONOMICAL year
+// (post-ApplyEra), since leap-year-ness is a property of that year, not the
+// era-relative digits the input spelled. month must already be validated
+// 1..12 (ValidateMonthDay); an out-of-range month here is a caller bug, not a
+// user-input error, so it panics like a slice index would.
+func ValidateDayOfMonth(year, month, day int) error {
+	max := daysInMonthTab[month-1]
+	if month == 2 && isLeapYear(year) {
+		max = 29
+	}
+	if day > max {
+		return ErrFieldOutOfRange
+	}
+	return nil
 }
 
 // parseDigits2 parses an exactly-two-digit ASCII field, as produced by

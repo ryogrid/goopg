@@ -894,7 +894,7 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// raises 22008, since DecodeDateTime DID recognise the shape. The date
 	// token is the same for both candidates (only the time token differs), so
 	// one check ahead of the loop covers it.
-	if err := pgdatetime.ValidateDateToken(dateTokenPrefix(body)); err != nil {
+	if err := validateDateTokenFull(dateTokenPrefix(body), bc); err != nil {
 		return time.Time{}, 0, err
 	}
 	cands := [2]struct {
@@ -1012,7 +1012,7 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 func parsePGDateText(s string) (time.Time, error) {
 	body, bc := pgdatetime.SplitEra(s)
 	norm := pgdatetime.NormalizeDateTimeInput(body, bc)
-	if err := pgdatetime.ValidateDateToken(norm); err != nil {
+	if err := validateDateTokenFull(norm, bc); err != nil {
 		return time.Time{}, err
 	}
 	t, err := time.Parse("2006-01-02", norm)
@@ -1024,6 +1024,35 @@ func parsePGDateText(s string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return t, checkTimeCarrierRange(t)
+}
+
+// validateDateTokenFull runs all three ValidateDate() checks (month, day,
+// day-in-month) against a normalized "...-MM-DD" date token, using bc to
+// compute the astronomical year the day-in-month check needs.
+// M0119-0006 §13.3: it must run BEFORE time.Parse, not after — Go's
+// time.Parse (unlike time.Date/AddDate) already rejects an impossible
+// calendar day itself ("2020-02-30": "day out of range"), but with a bare
+// parse error that reads as a 22007 syntax mistake rather than PG's 22008
+// field-range one; by the time that error reaches the caller, the token's
+// own digits are gone. DateTokenYear/DateTokenMonthDay read the token
+// directly, so the astronomical year is available before any Parse call.
+func validateDateTokenFull(dateToken string, bc bool) error {
+	month, day, haveMD := pgdatetime.DateTokenMonthDay(dateToken)
+	if !haveMD {
+		return nil
+	}
+	if err := pgdatetime.ValidateMonthDay(month, day); err != nil {
+		return err
+	}
+	year, haveY := pgdatetime.DateTokenYear(dateToken)
+	if !haveY {
+		return nil
+	}
+	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	if !ok {
+		return nil
+	}
+	return pgdatetime.ValidateDayOfMonth(astroYear, month, day)
 }
 
 // parseDateInputText is date_in()'s reading of a string that may carry a time

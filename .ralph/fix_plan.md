@@ -2929,6 +2929,27 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestDateTimeInputErrorSeparatesRangeFromSyntax` (updated expectations) +
       full executor/pgdatetime suites green; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=35). Design `0125-0007-pg-faithful-date-field-decode.md` §13.
+      **36th slice (2026-08-11) — the day-in-month arm landed, ordering fix
+      different than planned**: waiting for `ApplyEra`'s post-`time.Parse`
+      astronomical year never works — Go's `time.Parse` (unlike
+      `time.Date`/`AddDate`) already rejects an impossible calendar day itself
+      (`"2020-02-30": "day out of range"`) before `ApplyEra` runs, so the check
+      must run BEFORE `time.Parse`, not after. New
+      `pgdatetime.DateTokenYear`/`AstronomicalYear` compute the astronomical
+      year straight from the token's digits (no `time.Time` needed), feeding a
+      new `pgdatetime.ValidateDayOfMonth` (`day_tab[isleap]` port). Shared
+      `validateDateTokenFull` in `internal/executor/copy_text.go` composes all
+      three ValidateDate() checks at both call sites. `'2020-02-30'`,
+      `'2021-02-29'`, `'2021-04-31'` are now 22008, verified live against PG
+      18.3. Deferred (ledger, new row): a BC February-29 date where the
+      literal year's leap-ness disagrees with the astronomical year's
+      (`'0001-02-29 BC'`, PG accepts) hits the same `time.Parse` race one layer
+      down, since `time.Parse` still sees the literal (pre-era) year. Gates:
+      `TestValidateDayOfMonth`/`TestDateTokenYear`/`TestAstronomicalYear`
+      (pgdatetime), `TestDateTimeInputErrorSeparatesRangeFromSyntax` extended
+      (executor); full executor/pgdatetime suites green;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35). Design
+      `0125-0007-pg-faithful-date-field-decode.md` §14.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

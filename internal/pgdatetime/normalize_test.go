@@ -312,6 +312,92 @@ func TestValidateDateToken(t *testing.T) {
 	}
 }
 
+// TestValidateDayOfMonth pins ValidateDate()'s third check (M0119-0006 §13.3):
+// day-in-month, given the ASTRONOMICAL year (not the era-relative digits the
+// input spelled). Verified against PG 18.3.
+func TestValidateDayOfMonth(t *testing.T) {
+	cases := []struct {
+		year, month, day int
+		wantErr          bool
+	}{
+		{2020, 2, 29, false}, // 2020 is a Gregorian leap year
+		{2020, 2, 30, true},
+		{2021, 2, 28, false},
+		{2021, 2, 29, true}, // 2021 is not a leap year
+		{1900, 2, 28, false},
+		{1900, 2, 29, true}, // divisible by 100, not by 400: not leap
+		{2000, 2, 29, false},
+		{2000, 2, 30, true}, // divisible by 400: leap, but still caps at 29
+		{2021, 4, 30, false},
+		{2021, 4, 31, true}, // April has 30 days
+		{2020, 1, 31, false},
+		{2020, 12, 31, false},
+		{0, 2, 29, false},  // astronomical year 0 (1 BC) is leap
+		{-4, 2, 29, false}, // astronomical year -4 (5 BC) is leap
+		{-3, 2, 29, true},  // astronomical year -3 (4 BC) is not leap
+	}
+	for _, c := range cases {
+		err := ValidateDayOfMonth(c.year, c.month, c.day)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ValidateDayOfMonth(%d, %d, %d) = %v, wantErr %v",
+				c.year, c.month, c.day, err, c.wantErr)
+		}
+		if err != nil && !errors.Is(err, ErrFieldOutOfRange) {
+			t.Errorf("ValidateDayOfMonth(%d, %d, %d) = %v, want ErrFieldOutOfRange",
+				c.year, c.month, c.day, err)
+		}
+	}
+}
+
+// TestDateTokenYear pins the year-digit extraction DateTokenYear does for
+// validateDateTokenFull's pre-time.Parse day-in-month check.
+func TestDateTokenYear(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantYear int
+		wantOK   bool
+	}{
+		{"2020-01-01", 2020, true},
+		{"0202-01-01", 202, true},    // run-together's padded 4-digit year
+		{"20200-10-11", 20200, true}, // run-together's wide (>4-digit) year
+		{"", 0, false},
+		{"10:00:00", 0, false},            // not the shape
+		{"2020-01-01 10:00:00", 0, false}, // has a space
+		{"x020-01-01", 0, false},          // non-digit in the year run
+	}
+	for _, c := range cases {
+		year, ok := DateTokenYear(c.in)
+		if ok != c.wantOK || (ok && year != c.wantYear) {
+			t.Errorf("DateTokenYear(%q) = (%d, %v), want (%d, %v)", c.in, year, ok, c.wantYear, c.wantOK)
+		}
+	}
+}
+
+// TestAstronomicalYear pins ApplyEra's year conversion, computed without a
+// time.Time — see AstronomicalYear's doc for why it must agree with ApplyEra.
+func TestAstronomicalYear(t *testing.T) {
+	cases := []struct {
+		year   int
+		bc     bool
+		want   int
+		wantOK bool
+	}{
+		{2020, false, 2020, true},
+		{1, true, 0, true},  // 1 BC -> astronomical year 0
+		{2, true, -1, true}, // 2 BC -> astronomical year -1
+		{4, true, -3, true}, // 4 BC -> astronomical year -3
+		{0, false, 0, true}, // not BC: no-op even for the year-zero case (ApplyEra rejects it downstream)
+		{0, true, 0, false}, // BC year 0: "no year zero" is ApplyEra's refusal, not this function's
+	}
+	for _, c := range cases {
+		got, ok := AstronomicalYear(c.year, c.bc)
+		if ok != c.wantOK || (ok && got != c.want) {
+			t.Errorf("AstronomicalYear(%d, %v) = (%d, %v), want (%d, %v)",
+				c.year, c.bc, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
 // TestRunTogetherDateIsTimeAmbiguous pins the widths that BOTH DecodeNumberField
 // arms accept, which is the only case goopg's target-type-less coercion path
 // must not resolve in favour of the date reading.

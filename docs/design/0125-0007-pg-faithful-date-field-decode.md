@@ -848,7 +848,7 @@ attempt(s):
   the date token is identical for both the `body` and `canon` candidates that
   loop tries.
 
-### 13.3 What did NOT land
+### 13.3 What did NOT land (this slice) — closed by §13.5 below
 
 `ValidateDate()`'s THIRD check — "check for valid day of month, now that we
 know for sure the month and year" (`tm_mday > day_tab[isleap(tm_year)][tm_mon -
@@ -874,3 +874,98 @@ case now assert `22008`, not `22007`. Full `internal/pgdatetime` and
 `TestRepresentableDatesStillParse`, `TestDateEraLiteralAndCopyPathsAgree` and
 the run-together/hour-24 suites from §9-§12 are unaffected).
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35).
+
+## 14. Follow-up 2026-08-11 (M0119-0006, 36th slice) — the day-in-month arm
+
+### 14.1 The ordering question resolved differently than proposed
+
+§13.3 framed the choice as "thread the astronomical year into
+`ValidateDateToken` (compute it earlier)" vs. "move the day-count check to run
+after `ApplyEra`". The second option turns out not to work: Go's `time.Parse`
+(unlike `time.Date`/`time.Time.AddDate`, which normalize an out-of-range field
+by rolling it into the next unit) already validates the calendar day itself —
+`time.Parse("2006-01-02", "2020-02-30")` fails with `"day out of range"`
+*before* `ApplyEra` ever runs, so waiting for `ApplyEra`'s output to check
+day-in-month never reaches live code; `time.Parse`'s own bare error wins the
+race and reports as goopg's generic 22007. The only viable ordering is the
+first option: compute the astronomical year BEFORE `time.Parse`, not after.
+
+Doing that does not actually require running `ApplyEra` early (which does need
+a `time.Time` to carry the era-adjusted fields, an unwanted layering
+inversion). The astronomical year is a pure function of the year DIGITS the
+token spelled plus the `bc` flag `SplitEra` already extracted — `ApplyEra`'s
+own transform, minus the `time.Time` plumbing. New `AstronomicalYear(year,
+bc) (int, bool)` (`era.go`) computes exactly that, and `DateTokenYear`
+(`normalize.go`) reads the year digits straight off the normalized token
+(same trailing-anchored technique `DateTokenMonthDay` uses for month/day —
+works for both the padded 4-digit case and the widened run-together year).
+
+### 14.2 What landed
+
+- `pgdatetime.ValidateDayOfMonth(year, month, day int) error` — `ValidateDate()`'s
+  third check itself: a `daysInMonthTab` port of `day_tab[0]` plus an
+  `isLeapYear(year)` port of the `isleap()` macro, applied to the
+  ASTRONOMICAL year the caller supplies.
+- `pgdatetime.DateTokenMonthDay` — `ValidateDateToken`'s month/day extraction,
+  now exposed as its own function (`ValidateDateToken` is a one-line wrapper
+  over it) so a caller can also read `DateTokenYear` and run
+  `ValidateDayOfMonth`.
+- `pgdatetime.DateTokenYear(dateToken string) (year int, ok bool)` — reads the
+  digit run before the trailing `"-MM-DD"`.
+- `pgdatetime.AstronomicalYear(year int, bc bool) (int, bool)` — §14.1's pure
+  conversion; `ok` is false only for `bc && year <= 0` (the "no year zero"
+  refusal — `AstronomicalYear` defers that error to `ApplyEra`'s own check
+  downstream rather than duplicating it).
+- `internal/executor/copy_text.go`'s new `validateDateTokenFull(dateToken
+  string, bc bool) error` composes all three ValidateDate() checks (month,
+  day, day-in-month) and replaces the separate `ValidateMonthDay`/
+  `ValidateDateToken` calls the 35th slice added at both call sites
+  (`parsePGDateText`, `parsePGTimestampTextParts`) — still run BEFORE
+  `time.Parse`, per §14.1.
+
+`'2020-02-30'`, `'2021-02-29'` (2021 is not a leap year), `'2021-04-31'` are
+now `22008` where PG 18.3 agrees (verified live against a throwaway PG 18.3
+and a throwaway goopg on the same inputs — see the psql session cited in the
+deferral ledger row); `'2020-02-29'` and `'2021-04-30'` are unaffected
+(accepted). Run-together and unpadded-month spellings inherit the fix for
+free, since `DateTokenMonthDay`/`DateTokenYear` read the same normalized token
+`ValidateDateToken` always has (`'20200230'`, `'2020-2-30'` both now `22008`).
+
+### 14.3 What did NOT land — a BC-era leap-year edge case
+
+A BC February-29 date where the LITERAL year's leap-ness disagrees with the
+ASTRONOMICAL year's is still wrong: `'0001-02-29 BC'` is astronomical year 0
+(1 BC), which the Gregorian `isleap()` formula counts as leap (`0 % 400 ==
+0`), and PG 18.3 accepts it. goopg's `validateDateTokenFull` gets this RIGHT —
+`AstronomicalYear(1, true) = 0`, `isLeapYear(0) = true`, so
+`ValidateDayOfMonth` passes — but the code downstream still calls
+`time.Parse("2006-01-02", "0001-02-29")` on the LITERAL token (the BC suffix
+was already stripped by `SplitEra`, and nothing hands `time.Parse` the
+astronomical year), and Go's own internal leap check uses literal year 1
+(NOT a leap year), so `time.Parse` itself rejects the day before `ApplyEra`
+ever runs — the same race condition §14.1 diagnosed, recurring one layer
+down. Not a regression: this is identical to the pre-existing (30th-slice-era)
+behaviour, since `time.Parse`'s leap check fires the same way with or without
+this slice's pre-checks. Fixing it needs bypassing `time.Parse`'s built-in day
+validation for a BC date specifically — e.g. constructing the `time.Time` via
+`time.Date(year, month, day, ...)` directly once
+`validateDateTokenFull` has already confirmed month/day/day-in-month are
+valid, rather than relying on `time.Parse` to both extract AND validate the
+fields. That touches the time-of-day handling at both call sites too (the
+timestamp path composes date and time in one `time.Parse` call per layout) and
+is its own slice — ledger row, M0119-0006.
+
+### 14.4 Verification
+
+`TestValidateDayOfMonth`, `TestDateTokenYear`, `TestAstronomicalYear`
+(`internal/pgdatetime`) pin the new functions, including the century/400-year
+leap-year rules (1900 not leap, 2000 leap) and negative (BC) astronomical
+years. `TestDateTimeInputErrorSeparatesRangeFromSyntax` (`internal/executor`)
+gains the day-in-month cases (`'2020-02-30'`, `'2021-02-29'`, `'2021-04-31'`
+→ `22008`; `'2020-02-29'`, `'2021-04-30'` → accepted). Full
+`internal/pgdatetime` and `internal/executor` suites green; no change to
+`TestRepresentableDatesStillParse`, the era suites (§8), or the run-together
+suites (§12) — this slice only tightens an existing acceptance, it does not
+widen one. `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Also verified
+live against throwaway goopg + PG 18.3 servers on the exact repro strings
+above, including the run-together and BC forms.

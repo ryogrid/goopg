@@ -78,7 +78,21 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		// ValidateMonthDay reports the first one it checks (month).
 		{"2020-13-99", "22008"},
 		{"2020-01-32", "22008"},
+		// M0119-0006 §13.3: ValidateDate()'s THIRD check — day-in-month, once
+		// the astronomical year is known. Feb 30 / Apr 31 are <=31 (so the
+		// first two checks pass) but impossible for their month.
+		{"2020-02-30", "22008"}, // 2020 is a leap year; day 30 still overflows Feb
+		{"2021-02-29", "22008"}, // 2021 is NOT a leap year; day 29 overflows Feb
+		{"2021-04-31", "22008"}, // April has 30 days
+		{"2020-02-29", ""},      // 2020 IS a leap year: accepted (wantCode "" checked below)
+		{"2021-04-30", ""},
 	} {
+		if c.wantCode == "" {
+			if _, err := parsePGDateText(c.in); err != nil {
+				t.Errorf("parsePGDateText(%q) unexpectedly failed: %v", c.in, err)
+			}
+			continue
+		}
 		_, err := parsePGDateText(c.in)
 		if err == nil {
 			t.Errorf("parsePGDateText(%q) unexpectedly succeeded", c.in)

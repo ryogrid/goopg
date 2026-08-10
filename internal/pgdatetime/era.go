@@ -89,6 +89,24 @@ func ApplyEra(t time.Time, bc bool) (time.Time, error) {
 		t.Nanosecond(), t.Location()), nil
 }
 
+// AstronomicalYear is ApplyEra's year conversion without a time.Time to carry
+// it in — it exists so a caller holding just the digits a date token spelled
+// (DateTokenYear) can compute the astronomical year, and therefore run
+// ValidateDayOfMonth, BEFORE attempting to parse the rest of the token. ok is
+// false for the no-year-zero case (`year <= 0` under BC — 0 is the "no year
+// zero" refusal itself, and DateTokenYear never returns a negative year), so
+// the caller skips the day-of-month check and leaves that refusal to
+// ApplyEra's own error, run downstream as before.
+func AstronomicalYear(year int, bc bool) (int, bool) {
+	if !bc {
+		return year, true
+	}
+	if year <= 0 {
+		return 0, false
+	}
+	return -(year - 1), true
+}
+
 // EraYear splits an astronomical year into the year DIGITS PostgreSQL prints
 // and whether the era marker " BC" follows: year 0 prints "1 BC", year -1
 // prints "2 BC" (EncodeDateOnly, datetime.c: `(tm->tm_year > 0) ? tm->tm_year
