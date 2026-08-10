@@ -1,8 +1,9 @@
 # 0130-0012 — `RM_BTREE` WAL content parity (M0130-S11.5)
 
 Status: **in progress** — S11.5a (`XLOG_BTREE_NEWROOT`), S11.5b-1
-(`XLOG_BTREE_SPLIT_R`), S11.5c (`XLOG_BTREE_VACUUM`) and S11.5b-3 (the split
-record's block 3) landed 2026-08-10.
+(`XLOG_BTREE_SPLIT_R`), S11.5b-2 (the split record's incremental left half),
+S11.5c (`XLOG_BTREE_VACUUM`) and S11.5b-3 (the split record's block 3) landed
+2026-08-10.
 Series: M0130 Theme D, after 0130-0011 (the on-disk format).
 
 ## The gap this closes
@@ -197,35 +198,75 @@ itself, in the comment above its own `XLogRegisterBufData`: "If XLogInsert
 decides that it can omit orignewitem due to logging a full-page image of the
 left page, everything still works out."
 
-### Why goopg cannot emit the incremental left half yet (S11.5b-2)
+### S11.5b-2 — the incremental left half
 
 The incremental form describes exactly one transformation: *origpage's items
 from `P_FIRSTDATAKEY` to `firstrightoff`, with `newitem` spliced in at
-`newitemoff`*. goopg's split is not that. `splitPage` reads the whole page out,
-appends the new item, runs a **dedup consolidation pass** over the merged list
-(`dedupConsolidate`, M0055-0003 Phase B), and refills both halves — so the left
-half can contain posting tuples that were never on the original page. Upstream
-reaches the same state through two records: an `XLOG_BTREE_DEDUP` followed by a
-plain split. Emitting the incremental form therefore needs either the split
-point threaded down to the encoder *and* a proof that the dedup pass was a
-no-op, or goopg's dedup unbundled into its own record. That is S11.5b-2; the
-image keeps the record replayable in the meantime.
+`newitemoff`, under a new high key*. goopg's split is not that. `splitPage`
+reads the whole page out, appends the new item, runs a **dedup consolidation
+pass** over the merged list (`dedupConsolidate`, M0055-0003 Phase B), and
+refills both halves — so the left half can contain posting tuples that were
+never on the original page, can have lost the LP_DEAD-marked items upstream
+would have copied, and on a ROOT split still carries `BTP_ROOT`, which
+upstream's `_bt_split` clears on the left half and goopg's runtime clears in a
+later step.
 
-The offsets are still filled in coherently rather than zeroed. The record is
-logged as `SPLIT_R` (new item on the right), `firstrightoff` is where the right
-half begins in the split page's offset numbering — `P_FIRSTDATAKEY` is 2, since
-the post-split left page links to the new right page and so is never rightmost
-— `newitemoff` equals it, and `postingoff` is 0. A reader that ignores the
-image and believes the main data gets a consistent story, just not the one the
-primary executed.
+S11.5b-1 read that as "wait for the dedup to be unbundled into its own record".
+It is not what the slice needed. The three offsets do not have to describe every
+split goopg can perform — they have to describe *this* one, and whether they do
+is a question about two pages that the encoder is holding anyway. So the emit
+path **derives** a description and then **verifies** it:
+
+- `btree.DescribeSplitLeft(prePage, leftPage, rightPage, newItem)` reconciles the
+  three pages: the two halves' data items concatenated must equal the pre-split
+  page's data items with `newItem` inserted at exactly one position. That
+  position IS `newitemoff`; how many pre-split items precede the halves'
+  boundary IS `firstrightoff`; which side the splice landed on selects
+  `XLOG_BTREE_SPLIT_L` over `_SPLIT_R`.
+- `btree.CheckSplitLeft` replays that description against a **copy of the
+  pre-split page** and compares the result with the left half the primary
+  actually wrote — items, high key and opaque header.
+
+Only a clean reproduction is logged incrementally; anything else falls back to
+the full-page image. This is `CheckVacuumDelete`'s discipline from S11.5c, for
+its reason: enumerating the undescribable cases at the emit site and hoping the
+list stays complete is how a silent divergence gets shipped. The dedup pass, a
+dropped dead item and the root-flag disagreement are all *caught*, not listed.
+
+The primary pays one page copy per split (`prePage`, taken immediately before
+`resetPageItems` and only when a WAL hook is wired) to stop paying a page per
+split in the WAL stream. `postingoff` stays 0 in both forms: goopg has no
+posting-list split at insert time, and redo refuses a non-zero value rather than
+skipping the `_bt_swap_posting` step it cannot perform.
+
+`LogBtreeSplitFunc`/`LogSplitFunc` grew `prePage` and `newItem` for this. Both
+may be nil — the pre-runtime and bulk callers pass nothing and get the image.
+
+Under the image the offsets are still filled in coherently rather than zeroed:
+the record is logged as `SPLIT_R`, `firstrightoff` is where the right half
+begins in the split page's offset numbering — `P_FIRSTDATAKEY` is 2, since the
+post-split left page links to the new right page and so is never rightmost —
+`newitemoff` equals it, and `postingoff` is 0. A reader that ignores the image
+and believes the main data gets a consistent story, just not the one the primary
+executed.
 
 ### Replay
 
 `replayDecodedXLogBtreeSplit` follows upstream's block order (right page first,
 then left, then the sibling back-link), each limb idempotent on its own
-`pd_lsn` via `replayInitedXLogBlock`/`replayExistingXLogBlock`. A block 0 with
-**no** image is a record a real PG primary produced; goopg returns an explicit
-"not implemented" rather than silently leaving the left half pre-split.
+`pd_lsn` via `replayInitedXLogBlock`/`replayExistingXLogBlock`.
+
+A block 0 with **no** image takes upstream's incremental arm
+(`btree.ReplaySplitLeftPage`, S11.5b-2): the pre-split items below
+`firstrightoff` are re-added in offset order with the record's new item spliced
+in at `newitemoff`, under the high key the block data carries, and the opaque
+header is stamped exactly as upstream stamps it — flags become
+`BTP_INCOMPLETE_SPLIT` (plus `BTP_LEAF` at level 0) and nothing else, so
+`BTP_ROOT` and the garbage hint are dropped. Whether a new item precedes the
+high key in that untagged payload comes from the record's INFO byte
+(`_SPLIT_L` vs `_SPLIT_R`), never from the payload itself. A record with
+`postingoff != 0` — one only a real PG primary produces — is refused rather than
+replayed without its `_bt_swap_posting` step.
 
 ### Guards
 
@@ -238,6 +279,29 @@ then left, then the sibling back-link), each limb idempotent on its own
   half, the swung back-link, and same-LSN idempotency.
 - The obsolete `TestEncodeBtreeSplitPGFPIReplay`, which asserted the FPI form of
   block 1, is deleted — it pinned the property this slice removes.
+
+### Guards — S11.5b-2
+
+- `internal/access/btree/pgsplitleft_test.go` — the offset derivation over
+  hand-built pages (new item mid-left, at the left edge where
+  `newitemoff == firstrightoff` is upstream's "newitem goes at the end" arm, and
+  on the right where the record carries no new item at all), the block-data
+  round trip, and four refusals that are each a rewrite goopg can really produce:
+  a dropped pre-split item, an item the dedup pass invented, a root split (caught
+  by `CheckSplitLeft`, not by the description), and a missing pre-split
+  page/new item. Framing mutations — a one-tuple payload parsed as two, trailing
+  bytes, a truncated tuple — are rejected rather than clamped.
+- `TestRealTreeSplitsAreDescribable` is the premise test: 3000 inserts through a
+  real `BTree`, and **every** split except the root ones must both describe and
+  reproduce. Without it the encoder could fall back to an image on every split
+  and every other guard would still pass.
+- `internal/wal/btree_split_left_pg_test.go` — the record level: block 0 with no
+  image and the two tuples in upstream's order, the `_SPLIT_L`/`_SPLIT_R` opcode,
+  the offsets, the fallback to an image in three cases (an undescribable left
+  half, no pre-split page, no new item), and a replay reproduction landing the
+  primary's items at the same OFFSETS with same-LSN idempotency — which matters
+  more here than under an image, since the incremental arm reads the page it
+  rewrites and a second unskipped apply would cut an already-split page again.
 
 ## S11.5b-3 — the split record's block 3
 

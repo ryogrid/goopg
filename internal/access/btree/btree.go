@@ -1807,7 +1807,13 @@ func (bt *BTree) ResetStats() {
 // finishes — cleared by the caller in the same critical section, exactly as
 // _bt_split does — so the record can describe the clear too. It is
 // storage.InvalidBlockNumber on a leaf split, where upstream has no cbuf.
-type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error)
+//
+// prePage and newItem (M0130-S11.5b-2) are the split page as it stood BEFORE
+// the rewrite and the raw item whose insertion caused the split. They exist so
+// the record can describe the left half incrementally — "the pre-split items up
+// to here, with this one spliced in" — instead of shipping a page image. Both
+// nil is legal and means "log the image".
+type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error)
 
 // Options carries optional dependencies for Open/Create. The zero
 // value works for tests and callers that don't need WAL-backed
@@ -1884,8 +1890,8 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 	if hook == nil {
 		return nil
 	}
-	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
-		return hook(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage, childBlk)
+	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		return hook(rel, leftBlk, rightBlk, prePage, leftPage, rightPage, newItem, sibBlk, sibPage, childBlk)
 	}
 }
 
@@ -2902,6 +2908,19 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// data-slot wrappers derive P_FIRSTDATAKEY from the page's own btpo_next,
 	// so refilling first and relinking afterwards would write every item one
 	// slot to the left of where the finished page says its data begins.
+	// M0130-S11.5b-2: the split record describes the left half as a cut of the
+	// PRE-SPLIT page with the new item spliced in, so the encoder needs that
+	// page — this is the last moment it exists. Copied only when a record will
+	// actually be emitted; the encoder falls back to a full-page image (and
+	// ignores both of these) whenever the description cannot reproduce the page
+	// this rewrite is about to write.
+	var prePage storage.Page
+	var newItemRaw []byte
+	if bt.logSplit != nil {
+		prePage = append(storage.Page(nil), slot.Page()...)
+		newItemRaw = bt.format().marshal(it)
+	}
+
 	resetPageItems(slot.Page())
 	op.Next = rightBlk
 	// M0055-0004-followup-finish-split: mark the LEFT page as
@@ -2999,7 +3018,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if sibSlot != nil {
 			sibPage = sibSlot.Page()
 		}
-		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage, childBlk)
+		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, prePage, slot.Page(), rightSlot.Page(), newItemRaw, sibBlk, sibPage, childBlk)
 		if lerr != nil {
 			if childSlot != nil {
 				bt.unpinW(childSlot)

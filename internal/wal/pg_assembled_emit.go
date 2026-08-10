@@ -462,7 +462,9 @@ const sizeOfXLogBtreeSplitData = 10
 // replay work and nothing else.
 //
 //	main data: xl_btree_split{level, firstrightoff, newitemoff, postingoff}
-//	block 0:   the left half, as a full-page image (see below)
+//	block 0:   the left half — either the incremental form (the new item when it
+//	           landed on this half, then the page's new high key) or a full-page
+//	           image (see below)
 //	block 1:   the new right sibling, WILL_INIT, block data = its item area in
 //	           `_bt_restore_page` order — NO image
 //	block 2:   the page that was the left page's right sibling, no data
@@ -488,24 +490,37 @@ const sizeOfXLogBtreeSplitData = 10
 // ("If XLogInsert decides that it can omit orignewitem due to logging a
 // full-page image of the left page, everything still works out").
 //
-// goopg cannot emit the incremental form today for a reason worth recording
-// rather than working around: its split is not upstream's. `splitPage` reads
-// the whole page out, appends the new item, runs a DEDUP CONSOLIDATION pass
-// over the merged list, and refills both halves — so the left half is not
-// "origpage's items up to firstrightoff with newitem spliced in", which is the
-// only thing the incremental record can describe. Upstream reaches the same
-// state through two records (XLOG_BTREE_DEDUP, then a split). Deferred to
-// S11.5b-2; ledger row 2026-08-10 M0130-S11.5b.
+// M0130-S11.5b-2 makes the incremental form the DEFAULT, so a split record is
+// two tuples rather than a page. It is not unconditional, because goopg's split
+// is not upstream's: `splitPage` reads the whole page out, appends the new item,
+// runs a DEDUP CONSOLIDATION pass over the merged list and refills both halves,
+// so the left half can hold posting tuples that were never on the original page,
+// can have lost the pre-split page's LP_DEAD-marked items, and (on a root split)
+// still carries BTP_ROOT where upstream's `_bt_split` clears it. None of that is
+// describable by three offsets.
 //
-// Because block 0 always carries an image, the three offsets are never read by
-// any redo — upstream's or goopg's. They are still filled in consistently
-// rather than zeroed: the record is logged as SPLIT_R (new item on the right),
-// firstrightoff is where the right half begins in the split page's offset
-// numbering (P_FIRSTDATAKEY is 2 — the post-split left page is never rightmost,
-// it links to the new right page), newitemoff equals it because the new item is
-// the first right item under that description, and postingoff is 0 (no posting
-// split). A reader that ignores the image and believes the main data therefore
-// still gets a coherent story, just not the one the primary actually executed.
+// Rather than enumerate those cases here and hope the list stays complete, the
+// encoder asks the pages: `btree.DescribeSplitLeft` derives the description from
+// the pre-split page and the two halves, `btree.CheckSplitLeft` replays it and
+// compares the result with the left half the primary actually wrote, and only a
+// clean reproduction is logged incrementally. Anything else falls back to the
+// image — the same CheckVacuumDelete discipline S11.5c introduced. A caller with
+// no pre-split page or no new item (the pre-runtime/bulk paths) gets the image
+// too.
+//
+// Under the image the three offsets are never read by any redo — upstream's or
+// goopg's — but they are still filled in consistently rather than zeroed: the
+// record is logged as SPLIT_R (new item on the right), firstrightoff is where
+// the right half begins in the split page's offset numbering (P_FIRSTDATAKEY is
+// 2 — the post-split left page is never rightmost, it links to the new right
+// page), newitemoff equals it because the new item is the first right item under
+// that description, and postingoff is 0 (no posting split). A reader that
+// ignores the image and believes the main data therefore still gets a coherent
+// story, just not the one the primary actually executed.
+//
+// postingoff is 0 in BOTH forms: goopg has no posting-list split at insert time
+// (its dedup pass runs over the whole page instead), and a non-zero value would
+// make redo run `_bt_swap_posting` over an item the primary never rewrote.
 //
 // Block 3 exists on an INTERNAL split only, and is MANDATORY there
 // (M0130-S11.5b-3): an internal page is only ever inserted into to complete a
@@ -525,7 +540,7 @@ const sizeOfXLogBtreeSplitData = 10
 // mutation from the page it finds.
 //
 // xl_xid = 0 (index maintenance is not a logical user-data event).
-func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) ([]byte, error) {
+func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left/right page must be %d bytes", storage.BlockSize)
 	}
@@ -545,15 +560,31 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	// P_FIRSTDATAKEY of the post-split left page: it links to the new right
 	// page, so it is never rightmost and its first data item sits past P_HIKEY.
 	firstRightOff := uint16(2 + leftData)
+	newItemOff := firstRightOff
+	info := xlogBtreeSplitR
+	leftBlock := BlockRef{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}}
+
+	// The incremental left half, when the split the primary performed is one
+	// upstream's record can describe AND replaying that description reproduces
+	// the page it wrote.
+	if desc, derr := btree.DescribeSplitLeft(prePage, leftPage, rightPage, newItem); derr == nil &&
+		btree.CheckSplitLeft(prePage, leftPage, level, rightBlk, desc) == nil {
+		firstRightOff = desc.FirstRightOff
+		newItemOff = desc.NewItemOff
+		if desc.NewItemOnLeft {
+			info = xlogBtreeSplitL
+		}
+		leftBlock = BlockRef{ID: 0, Rel: rel, Block: leftBlk, Data: btree.SplitLeftBlockData(desc)}
+	}
 
 	mainData := make([]byte, sizeOfXLogBtreeSplitData)
 	binary.LittleEndian.PutUint32(mainData[0:4], level)
 	binary.LittleEndian.PutUint16(mainData[4:6], firstRightOff)
-	binary.LittleEndian.PutUint16(mainData[6:8], firstRightOff) // newitemoff
-	binary.LittleEndian.PutUint16(mainData[8:10], 0)            // postingoff
+	binary.LittleEndian.PutUint16(mainData[6:8], newItemOff)
+	binary.LittleEndian.PutUint16(mainData[8:10], 0) // postingoff
 
 	blocks := []BlockRef{
-		{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}},
+		leftBlock,
 		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Data: rightData},
 	}
 	if sibBlk != storage.InvalidBlockNumber {
@@ -574,7 +605,7 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrBtree, xlogBtreeSplitR, 0, body), nil
+	return framePGAssembled(RmgrBtree, info, 0, body), nil
 }
 
 // sizeOfXLogBtreeVacuumData is PG's SizeOfBtreeVacuum: ndeleted(2) +

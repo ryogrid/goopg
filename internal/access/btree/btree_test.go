@@ -189,7 +189,7 @@ func TestSplitInvokesLogSplit(t *testing.T) {
 		left, right storage.BlockNumber
 	}
 	var calls []call
-	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
 		// M0130-S11.5b-3: upstream registers a child (backup block 3) exactly
 		// when the split page is INTERNAL, and never for a leaf split.
 		if isLeaf := readOpaque(leftPage).IsLeaf(); isLeaf != (childBlk == storage.InvalidBlockNumber) {
@@ -432,7 +432,7 @@ func TestInternalSplitLogsAndClearsChild(t *testing.T) {
 
 	var internalSplits int
 	var children []storage.BlockNumber
-	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
 		if readOpaque(leftPage).IsLeaf() {
 			if childBlk != storage.InvalidBlockNumber {
 				t.Errorf("leaf split carried childBlk=%d (upstream has no cbuf there)", childBlk)

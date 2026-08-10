@@ -683,7 +683,14 @@ type WALFlusher interface {
 // it is the page one level down whose incomplete-split flag this insertion
 // finishes, so redo can clear that flag under the same record. It is
 // InvalidBlockNumber on a leaf split, where upstream has no cbuf either.
-type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page, childBlk BlockNumber) (LSN, error)
+//
+// prePage and newItem (M0130-S11.5b-2) describe the left half INCREMENTALLY:
+// prePage is the split page as it stood before the rewrite and newItem the raw
+// item whose insertion caused the split, which together let the encoder log
+// "these items, cut here, with this one spliced in" instead of a page-sized
+// image. Both may be nil — the encoder then logs the image, as it also does
+// when the two cannot reproduce the page the primary wrote.
+type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, prePage, leftPage, rightPage Page, newItem []byte, sibBlk BlockNumber, sibPage Page, childBlk BlockNumber) (LSN, error)
 
 // LogHeapInsertFunc emits one logical heap-insert redo record. initPage marks
 // the first tuple on a freshly-initialised page (XLOG_HEAP_INIT_PAGE) so a

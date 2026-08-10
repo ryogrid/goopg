@@ -2472,9 +2472,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		case xlogBtreeSplitL, xlogBtreeSplitR:
 			// M0130-S11.5b: goopg emits the real xl_btree_split — main data
 			// {level, firstrightoff, newitemoff, postingoff}, block 0 the left
-			// half as an image, block 1 the right sibling's item area as block
+			// half (incrementally since S11.5b-2, as an image when the split is
+			// not describable), block 1 the right sibling's item area as block
 			// data with no image, block 2 the relinked old sibling.
-			if err := replayDecodedXLogBtreeSplit(mgr, r, xlog); err != nil {
+			//
+			// _L vs _R is upstream's only record of which half the new item
+			// landed on, and block 0's data run is untagged, so the opcode is
+			// what tells redo whether a new item precedes the high key.
+			if err := replayDecodedXLogBtreeSplit(mgr, r, xlog, xlog.Header.Info&XLRRmgrInfoMask == xlogBtreeSplitL); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -3275,12 +3280,13 @@ func replayDecodedXLogBtreeUnlinkPage(mgr *storage.Manager, r Record, xlog *XLog
 // replayDecodedXLogBtreeNewRoot uses. Block 1 is WILL_INIT and need not exist
 // yet; it is extended on first touch, matching XLogInitBufferForRedo.
 //
-// A block 0 with no image is a record a REAL PG primary produced (its
-// incremental left-half rebuild replays origpage's items with the new item
-// spliced in). goopg does not implement that arm yet and says so rather than
-// silently leaving the left half at its pre-split contents — see
-// EncodeBtreeSplitPG for why goopg's own splits cannot be logged that way.
-func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+// A block 0 with no image takes upstream's incremental arm (M0130-S11.5b-2):
+// the left half is rebuilt from the items already on the page, cut at
+// firstrightoff, with the record's new item spliced in at newitemoff when the
+// INFO byte says XLOG_BTREE_SPLIT_L, under the new high key the block data
+// carries. `newItemOnLeft` therefore comes from the record kind, not from the
+// payload — the payload's tuple run is untagged.
+func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, newItemOnLeft bool) error {
 	endLSN := storage.LSN(r.EndLSN)
 	if len(xlog.MainData) < sizeOfXLogBtreeSplitData {
 		return fmt.Errorf("wal: xlog btree-split: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeSplitData)
@@ -3337,11 +3343,35 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 	}
 
-	if !left.HasImage || !left.ImageApply {
-		return fmt.Errorf("wal: xlog btree-split block 0 has no apply-image: PG's incremental left-half rebuild is not implemented")
-	}
-	if err := restoreDecodedXLogBlockImage(mgr, left, endLSN); err != nil {
-		return fmt.Errorf("wal: xlog btree-split left image: %w", err)
+	if left.HasImage && left.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, left, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-split left image: %w", err)
+		}
+	} else {
+		newItem, highKey, perr := btree.ParseSplitLeftBlockData(left.Data, newItemOnLeft)
+		if perr != nil {
+			return fmt.Errorf("wal: xlog btree-split left data: %w", perr)
+		}
+		desc := btree.SplitLeftDescription{
+			FirstRightOff: binary.LittleEndian.Uint16(xlog.MainData[4:6]),
+			NewItemOff:    binary.LittleEndian.Uint16(xlog.MainData[6:8]),
+			NewItemOnLeft: newItemOnLeft,
+			NewItem:       newItem,
+			HighKey:       highKey,
+		}
+		if postingOff := binary.LittleEndian.Uint16(xlog.MainData[8:10]); postingOff != 0 {
+			// A posting-list split at insert time: upstream's redo repeats it
+			// with _bt_swap_posting over the item before newitemoff. goopg's
+			// dedup runs over the whole page instead and never emits this, so
+			// replaying the record without it would silently leave the pre-split
+			// posting tuple on the page next to its own new item.
+			return fmt.Errorf("wal: xlog btree-split postingoff=%d: PG's posting-list split (_bt_swap_posting) is not implemented", postingOff)
+		}
+		if err := replayExistingXLogBlock(mgr, left, endLSN, func(page storage.Page) error {
+			return btree.ReplaySplitLeftPage(page, level, right.Block, desc)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-split left apply: %w", err)
+		}
 	}
 
 	if hasSib {

@@ -1540,18 +1540,48 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         `TestEncodeBtreeSplitPGFPIReplay` deleted (pinned the removed property).
         Gates: btree/wal/storage/amcheck/initdb + units PASS; pgbench smoke PASS
         (commit hook). 2 ledger rows.
-  - [ ] **S11.5b-2 — the split record's INCREMENTAL left half**. Replace block
-        0's full-page image with upstream's block-0 data (the new item when it
-        lands on the left, then the page's new high key) so a split record is
-        small rather than page-sized. BLOCKED on goopg's split not being
-        upstream's: `splitPage` reads the page out, appends the new item, runs
-        `dedupConsolidate` over the merged list and refills BOTH halves, so the
-        left half can hold posting tuples that were never on the original page —
-        which is not what `firstrightoff`/`newitemoff` can describe. Upstream
-        reaches the same state with two records (XLOG_BTREE_DEDUP, then a
-        split). Needs either the split point threaded to the encoder plus a
-        proof the dedup pass was a no-op, or the dedup unbundled into its own
-        record. Ledger 2026-08-10.
+  - [x] **S11.5b-2 — the split record's INCREMENTAL left half** (2026-08-10).
+        NOT REINDEX-required. Block 0 is now upstream's block-0 data — the new
+        item when it landed on the left, then the page's new high key — so a
+        split record is two tuples instead of a page. S11.5b-1 filed this as
+        BLOCKED on goopg's split not being upstream's (`splitPage` appends the
+        new item, runs `dedupConsolidate` over the merged list and refills BOTH
+        halves, so the left half can hold posting tuples that were never on the
+        original page) and concluded it needed the dedup unbundled into its own
+        record first. That read the requirement one level too strong: the three
+        offsets do not have to describe every split goopg CAN perform, only the
+        one in hand, and whether they do is a question about pages the encoder
+        already holds. `btree.DescribeSplitLeft` reconciles the two halves' data
+        items against the pre-split page's plus the new item — the single splice
+        position IS `newitemoff`, the halves' boundary IS `firstrightoff`, the
+        side it landed on selects `_SPLIT_L` over `_SPLIT_R` — and
+        `btree.CheckSplitLeft` replays that description against a COPY of the
+        pre-split page, comparing items, high key and opaque with what the
+        primary wrote. Only a clean reproduction goes out incrementally;
+        S11.5c's `CheckVacuumDelete` discipline, so the dedup pass, a dropped
+        LP_DEAD item and the ROOT-flag disagreement (upstream's `_bt_split`
+        clears BTP_ROOT on the left half, goopg's `clearRootFlag` runs a step
+        later) are CAUGHT rather than enumerated. The primary pays one page copy
+        per split — taken immediately before `resetPageItems`, only when a WAL
+        hook is wired — to stop paying a page per split in the stream.
+        `LogBtreeSplitFunc`/`LogSplitFunc` grew `prePage` + `newItem`, both nil
+        meaning "log the image" (the bulk / pre-runtime callers). Replay took
+        upstream's left arm (`btree.ReplaySplitLeftPage`), reading
+        `newitemonleft` from the record's INFO byte because the block-data tuple
+        run is untagged, and refusing `postingoff != 0` — a record only a real
+        PG primary produces — rather than replaying it without `_bt_swap_posting`.
+        Guards: `internal/access/btree/pgsplitleft_test.go` (offset derivation
+        incl. upstream's "newitem goes at the end" arm, framing mutations, four
+        refusals) with `TestRealTreeSplitsAreDescribable` as the PREMISE test —
+        3000 inserts through a real tree, every non-root split must describe AND
+        reproduce, without which the encoder could fall back to an image on
+        every split and every other guard would still pass — and
+        `internal/wal/btree_split_left_pg_test.go` (record shape, the
+        `_SPLIT_L`/`_SPLIT_R` opcode, three image fallbacks, a replay
+        reproduction at matching OFFSETS + same-LSN idempotency, which matters
+        more here than under an image since the arm reads the page it rewrites).
+        Gates: btree/wal/storage/amcheck/initdb + units PASS; tpch-spotcheck
+        PASS (Q12=2, Q13=35); pgbench smoke PASS. 3 ledger rows.
   - [x] **S11.5b-3 — block 3 on an INTERNAL split** (2026-08-10). NOT
         REINDEX-required. An internal page is never inserted into for its own
         sake — the only thing that lands on one is a separator pushed up by a

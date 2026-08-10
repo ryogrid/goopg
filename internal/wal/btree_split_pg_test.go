@@ -124,7 +124,7 @@ func TestEncodeBtreeSplitPGIsContentParity(t *testing.T) {
 	const leftBlk, rightBlk, sibBlk = storage.BlockNumber(4), storage.BlockNumber(9), storage.BlockNumber(5)
 	left, right, sib := splitTestPages(t, 0, leftBlk, rightBlk, sibBlk, 3)
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestEncodeBtreeSplitPGRightmostHasNoSiblingBlock(t *testing.T) {
 	const leftBlk, rightBlk = storage.BlockNumber(4), storage.BlockNumber(9)
 	left, right, _ := splitTestPages(t, 0, leftBlk, rightBlk, storage.InvalidBlockNumber, 2)
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, storage.InvalidBlockNumber, nil, storage.InvalidBlockNumber)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, storage.InvalidBlockNumber, nil, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestEncodeBtreeSplitPGRejectsUnredoableRightOpaque(t *testing.T) {
 			op := btree.ReadPGOpaque(right)
 			tc.mutate(&op)
 			btree.WritePGOpaque(right, op)
-			if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
+			if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
 				t.Fatalf("want an error for a right page redo cannot reproduce (%s)", tc.name)
 			}
 		})
@@ -296,7 +296,7 @@ func TestApplyRecordReplaysPGBtreeSplit(t *testing.T) {
 		}
 	}
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, storage.InvalidBlockNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestEncodeBtreeSplitPGInternalCarriesChildBlock(t *testing.T) {
 	const childBlk = storage.BlockNumber(7)
 	left, right, sib := splitTestPages(t, 1, leftBlk, rightBlk, sibBlk, 3)
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, childBlk)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, childBlk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,13 +399,13 @@ func TestEncodeBtreeSplitPGChildBlockIsLevelGated(t *testing.T) {
 
 	t.Run("internal without child", func(t *testing.T) {
 		left, right, sib := splitTestPages(t, 1, leftBlk, rightBlk, sibBlk, 2)
-		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
+		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, storage.InvalidBlockNumber); err == nil {
 			t.Fatal("want an error for an internal split with no block 3")
 		}
 	})
 	t.Run("leaf with child", func(t *testing.T) {
 		left, right, sib := splitTestPages(t, 0, leftBlk, rightBlk, sibBlk, 2)
-		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, 7); err == nil {
+		if _, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, 7); err == nil {
 			t.Fatal("want an error for a leaf split carrying a block 3")
 		}
 	})
@@ -444,7 +444,7 @@ func TestApplyRecordReplaysPGBtreeSplitChildClear(t *testing.T) {
 		}
 	}
 
-	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, left, right, sibBlk, sib, childBlk)
+	framed, err := EncodeBtreeSplitPG(rel, leftBlk, rightBlk, nil, left, right, nil, sibBlk, sib, childBlk)
 	if err != nil {
 		t.Fatal(err)
 	}
