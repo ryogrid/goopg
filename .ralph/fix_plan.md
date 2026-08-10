@@ -469,6 +469,69 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`
          (~37 s), then grep the reverse standby's `cluster.log` for
          `standby_replay_error`.
+         **RE-TRIAGED 2026-08-10 (loop #33) — does NOT reproduce at HEAD and
+         is not the current blocker.** An `ApplyRecord` trace over the entire
+         reverse-replay stream shows the promoted PG emits ZERO rmid=11
+         records: for the id=5 INSERT it writes only `RM_HEAP`
+         XLOG_HEAP_INSERT (with an FPI) + `RM_XACT` COMMIT, both of which
+         goopg replays cleanly (`standby replay: stopped`, no error, and the
+         heap row IS present on the reverse standby — `SELECT id, val, ctid
+         FROM public.s10_t` returns all 5 rows). #9 was a real decode gap
+         but it can only be re-armed once #10 below lets PG maintain the
+         index; keep the resume plan, work it after #10/#12.
+      10. OPEN — **`pg_class.relhasindex` is hardcoded `false` in every
+         goopg-written user pg_class heap row** (`buildUserPGClassRow`,
+         `internal/executor/pg18_user_catalog_rows.go`), which is the actual
+         reason the promoted PG does no index maintenance. PG's
+         `ExecInitModifyTable` only calls `ExecOpenIndices` when
+         `rd_rel->relhasindex` is set, and `plancat.c`'s `get_relation_info`
+         gates `RelationGetIndexList` on the same flag — so blocker #8's
+         `pg_index_indrelid_index` work is necessary but never reached.
+         Confirmed by direct probe on the promoted PG:
+         `SELECT relhasindex FROM pg_class WHERE oid='public.s10_t'::regclass`
+         → `false`, while `pg_index` has the row with
+         indisvalid/indisready/indislive all `true`. goopg's OWN virtual
+         pg_class row reports `t` the whole time (`catalog.go`'s `hasIdx`) —
+         Hard-won Rule #2 again.
+         **BLOCKED ON #12, do not flip the flag first.** Deriving it
+         (`len(cat.IndexesOnTable(tbl)) > 0`) was implemented and measured
+         this loop: PG then opens the index and the E2E fails EARLIER, in
+         Phase B, with `index "s10_t_val_idx" contains corrupted page at
+         block 0`. Reverted for that reason; the one-line change plus the
+         `resyncTableClassHeapRow` shape it needs are described in the
+         `buildUserPGClassRow` comment and the deferral-ledger row.
+      11. FIXED (2026-08-10) — **an index relation had no pg_attribute rows
+         of its own.** Uncovered by the #10 experiment: the moment PG
+         believed the index existed it hit `pg_attribute catalog is missing
+         1 attribute(s) for relation OID 16410` in `RelationBuildTupleDesc`.
+         PG rebuilds an index's TupleDesc from pg_attribute exactly like a
+         table's; goopg wrote rows only for the parent table because its own
+         catalog reads `catalog.Index` directly. `syncIndexToCatalogHeap`
+         now writes one pg_attribute row per index attribute (key columns
+         then INCLUDE columns, attnum 1..indnatts) plus the matching
+         `pg_attribute_relid_attnum_index` (2659) entries, via
+         `buildUserPGAttributeRowsForIndex` — per-attribute values follow
+         upstream `ConstructTupleDescriptor` (`catalog/index.c`): heap
+         column type/len/byval/align/storage/typmod/collation copied
+         verbatim, every relation-level flag reset. Guards:
+         `TestBuildUserPGAttributeRowsForIndexMatchesPG` +
+         `TestBuildUserPGAttributeRowsForIndexNamesExpressionKeys`
+         (`internal/executor/pg_attribute_index_rows_test.go`).
+      12. OPEN — **goopg's USER btree index files are not PG nbtree.**
+         `internal/access/btree` writes a goopg-private page format
+         (`SizeOfBTPageOpaque = 272`, `btreeVersion = 4`) where PG's
+         `BTPageOpaqueData` is 16 bytes, so `_bt_checkpage` (nbtpage.c)
+         rejects block 0 outright: `index "s10_t_val_idx" contains corrupted
+         page at block 0` (SQLSTATE XX002). Only the initdb-bootstrapped
+         SYSTEM catalog indexes are PG-format
+         (`internal/initdb/btree_index_bootstrap.go`). This gates #10 (and
+         therefore #9): a real PG cannot read, scan, maintain, or WAL-log a
+         goopg user index until the on-disk format is upstream nbtree.
+         Scope is a milestone of its own — page layout (metapage
+         `BTMetaPageData`, `BTPageOpaqueData`, high keys, posting lists),
+         the writers (`bulkload.go`, `btree.go`, `btree_vacuum.go`,
+         `posting.go`), and PG-faithful `btree_redo`
+         (`nbtxlog.c`) on the replay side.
       8-detail (kept for reference) — **the promoted PG performs NO index maintenance on
          goopg-created indexes**, so the reverse standby's index scans
          miss every post-promote row. Phase D's

@@ -1,48 +1,49 @@
-Task: M-NIGHTLY AI-20260810-011258-003 (TestE2E_PGStandbyFullCycle) — blocker #6
-FIXED and committed. The fix_plan item STAYS OPEN — blocker #7 now gates Phase D.
+Task: M-NIGHTLY AI-20260810-011258-003 (TestE2E_PGStandbyFullCycle) — blocker #11
+FIXED and committed; blockers #10/#12 root-caused and filed. Item stays OPEN.
 
-Landed:
-- `internal/wal/writer.go`: `detectWritePos` records the on-disk TLI per segment
-  (`segTLIs`, from `ParseXLogFileName`) and threads it into `scanLastSegmentEnd`
-  (new `tli` param, `FormatSegmentNameTLI`; 0 → 1) and the `gap`/`non-final`
-  diagnostics. Highest TLI wins on collision (mirrors upstream
-  `XLogFileReadAnyTLI`'s newest-first `expectedTLEs` walk). KEY FACT: discovery
-  never lost the segments — `parseSegmentName` DISCARDS the TLI, and every
-  filename recomposition assumed TLI=1, so goopg did `os.ReadFile` on
-  `000000010000000000000002` in a dir holding only `00000002…` files. Segment
-  ordinals unchanged (`ParseXLogFileName(name, 0)`, same as before).
-- New guards `internal/wal/writer_detect_tli_test.go`:
-  `TestDetectWritePos_PromotedTimelineSegments` (real records via the writer,
-  segments renamed to TLI 2, content-derived assert) +
-  `TestDetectWritePos_PrefersHighestTimeline` (same segNo on both timelines,
-  TLI-1 copy zeroed to identical length). Both mutation-verified; the first
-  reproduces the production error string verbatim.
+KEY RE-TRIAGE (do not repeat last loop's plan): blocker #9 ("goopg cannot
+replay PG's RM_BTREE records") does NOT reproduce at HEAD. An ApplyRecord trace
+over the whole reverse-replay stream shows the promoted PG emits ZERO rmid=11
+records; the id=5 INSERT is only RM_HEAP XLOG_HEAP_INSERT (FPI) + RM_XACT
+COMMIT, both replayed cleanly, and the heap row IS present on the reverse
+standby. What returns 0 is the *index-scan* form of the harness query.
 
-Result: the reverse standby STARTS on the promoted PG's base backup for the
-first time — opens the data dir, binds, connects its walreceiver on slot
-`s10_reverse`, begins continuous replay.
+Real chain (fix_plan items 10/11/12 under AI-20260810-011258-003):
+- #10 `pg_class.relhasindex` is hardcoded false in `buildUserPGClassRow`
+  (`internal/executor/pg18_user_catalog_rows.go`). PG's ExecInitModifyTable
+  gates ExecOpenIndices on it, and plancat.c's get_relation_info gates
+  RelationGetIndexList on it — so blocker #8's 2678 work is never reached.
+  Probed live: relhasindex=false while indisvalid/ready/live are all true.
+- #12 (GATES #10 and #9) goopg's USER btree files are a goopg-private format
+  (`internal/access/btree`: SizeOfBTPageOpaque=272, btreeVersion=4) vs PG's
+  16-byte BTPageOpaqueData → `_bt_checkpage` errors `index "s10_t_val_idx"
+  contains corrupted page at block 0` (XX002). Measured: flipping #10 makes
+  the E2E fail EARLIER, in Phase B. That is why #10 was reverted.
+- #11 FIXED this loop.
 
-NEXT (blocker #7, fix_plan item 7): the harness's verification query
-`SELECT count(*) FROM pg_stat_replication WHERE application_name='s10_reverse'
-AND state='streaming'` runs against the PROMOTED PG and gets
-`ERROR: cannot open relation "pg_stat_replication" / DETAIL: This operation is
-not supported for views` — a real PG on a goopg-built catalog cannot evaluate
-ANY view (empty relcache `rd_rules`; pre-existing ledgered ruleless-init gap).
-Resume: probe the underlying SRF `pg_stat_get_wal_senders()` instead of the view
-in `internal/testport/e2e_pg183_standby_full_cycle_test.go:~250`. The
-`walreceiver WALData start mismatch` INFO line before it is NOT a blocker —
-`m.StartLSN < expectedStart` already trims. Repro:
-`go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/` (~6 s).
+Landed (#11 — an index relation had no pg_attribute rows of its own):
+- `buildUserPGAttributeRowsForIndex` + `setPGAttributeCol`
+  (`internal/executor/pg18_user_catalog_rows.go`): one row per index attribute
+  (key cols then INCLUDE, attnum 1..indnatts) per upstream
+  ConstructTupleDescriptor (catalog/index.c) — heap column physical type copied
+  verbatim, all relation-level flags reset; expression key → `pg_expression_N`
+  with a `text` type placeholder (ledgered).
+- `syncIndexToCatalogHeap` (`internal/executor/operators_ddl.go`) writes them
+  + the `pg_attribute_relid_attnum_index` (2659) entries.
+- Guards: `internal/executor/pg_attribute_index_rows_test.go`.
 
-Gates run: internal/wal full package PASS (5.5 s), detectWritePos suite PASS +
-both new tests mutation-verified, `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS, TLI-1 non-regression
-`TestE2E_FailoverGoopgToPG` / `TestKillKillRecovery` /
-`TestPort_PublicationSurvivesRestart` PASS (7.4 s), `make ralph-state-guard` OK
-(auto-repaired the stale completed marker), commit-hook pgbench smoke PASS.
-TestE2E_PGStandbyFullCycle still FAILS at blocker #7 (expected).
+Next step: blocker #12 is a milestone-sized epic (convert
+`internal/access/btree` on-disk layout to upstream nbtree: BTMetaPageData,
+16-byte BTPageOpaqueData, high keys, posting lists; writers bulkload.go /
+btree.go / btree_vacuum.go / posting.go; then PG-faithful btree_redo per
+nbtxlog.c). Per the Current Priority banner, re-read it before selecting —
+do NOT start #12 inside an M-NIGHTLY triage loop without a milestone.
 
-Ledger: 2 new rows (blocker #6 landed + the history-driven TLI resolution still
-missing; blocker #7 diagnosis).
+Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(executor cached-green, initdb 62.7 s), `go build ./...` clean, new guards PASS,
+`TestE2E_PGStandbyFullCycle` fails at the SAME Phase-D point as before this loop
+(no regression; Phases A–C unchanged), commit-hook pgbench smoke — see status.
+
+Ledger: 3 new rows (#11 landed + expression-type deferral; #10; #12).
 
 In-flight: none.

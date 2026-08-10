@@ -16,6 +16,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -487,6 +488,21 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	if relopts := catalog.TableReloptionsElements(tbl); len(relopts) > 0 {
 		reloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
 	}
+	// relhasindex stays FALSE on purpose — see AI-20260810-011258-003 blocker
+	// #10. PG's ExecInitModifyTable only opens a result relation's indexes when
+	// `rd_rel->relhasindex` is set, and plancat.c's get_relation_info gates
+	// RelationGetIndexList on the same flag, so a real PG 18.3 on a goopg
+	// cluster silently does NO index maintenance for its own INSERTs and never
+	// plans an index scan. Deriving the flag from the live catalog
+	// (`len(cat.IndexesOnTable(tbl)) > 0`, the value goopg's own virtual
+	// pg_class row already reports) is a one-line change and was measured to
+	// work — but it is strictly WORSE today: the moment PG believes the index
+	// exists it opens block 0 and ERRORs `index "…" contains corrupted page at
+	// block 0`, because goopg's USER btree files are goopg-private format
+	// (internal/access/btree: 272-byte opaque, `btreeVersion = 4`) and not PG
+	// nbtree (16-byte BTPageOpaqueData; nbtpage.c `_bt_checkpage`). Only the
+	// bootstrapped SYSTEM catalog indexes are PG-format. Flip this line as the
+	// LAST step of the PG-format-user-nbtree work, not before.
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -502,7 +518,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(0),                                             // relallvisible
 		NewIntDatum(0),                                             // relallfrozen
 		NewIntDatum(0),                                             // reltoastrelid
-		NewBoolDatum(false),                                        // relhasindex (updated by CREATE INDEX later)
+		NewBoolDatum(false),                                        // relhasindex (see the blocker-#10 note above — deliberately false)
 		NewBoolDatum(false),                                        // relisshared
 		NewStringDatum(relpersistence),                             // relpersistence
 		NewStringDatum(relkind),                                    // relkind
@@ -963,6 +979,89 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		NullDatum,          // attmissingval
 		attStatTargetDatum, // attstattarget (NULL default; integer override)
 	}
+}
+
+// setPGAttributeCol overwrites one column of a pg_attribute row by NAME rather
+// than by literal slice index, so the index-attribute overrides below survive
+// any future reordering of pgAttributeColumnsPG18 / buildUserPGAttributeRow.
+func setPGAttributeCol(row Row, name string, d Datum) {
+	for i, c := range pgAttributeColumnsPG18() {
+		if c.Name == name {
+			if i < len(row) {
+				row[i] = d
+			}
+			return
+		}
+	}
+}
+
+// buildUserPGAttributeRowsForIndex builds the pg_attribute rows PG's
+// index_create writes for the INDEX relation itself — one per index attribute
+// (key columns first, then INCLUDE columns), attnum 1..indnatts.
+//
+// AI-20260810-011258-003 blocker #11. An index relation is a relation: PG
+// rebuilds its TupleDesc from pg_attribute like any other, and once blocker
+// #10 made a goopg-created index reachable (relhasindex), a PG 18.3 on a goopg
+// cluster hit `pg_attribute catalog is missing 1 attribute(s) for relation OID
+// <index>` in RelationBuildTupleDesc the first time it opened the index.
+// goopg's own catalog never needed these rows (it reads catalog.Index), so the
+// gap was invisible from goopg's side — the recurring sibling-path failure.
+//
+// The per-attribute values mirror upstream ConstructTupleDescriptor
+// (src/backend/catalog/index.c): the heap column's type/len/byval/align/
+// storage/typmod/collation are copied verbatim, while the *relation-level*
+// flags are reset — attnotnull=false, atthasdef/atthasmissing=false,
+// attidentity/attgenerated='\0', attislocal=true, attinhcount=0, and
+// attacl/attoptions/attfdwoptions/attmissingval/attstattarget NULL — because
+// an index attribute carries none of the heap column's constraints.
+//
+// An EXPRESSION key column (Columns[i] == "") is named `pg_expression_<attnum>`
+// exactly as upstream does, but its type is emitted as the parent column-less
+// `text` fallback: goopg has no expression type resolver reachable from here.
+// That divergence is ledgered, not silently absorbed.
+func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) ([]Row, []string) {
+	if idx == nil || idx.Table == nil {
+		return nil, nil
+	}
+	names := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+	names = append(names, idx.Columns...)
+	names = append(names, idx.IncludeColumns...)
+
+	rows := make([]Row, 0, len(names))
+	attnames := make([]string, 0, len(names))
+	for i, colName := range names {
+		attnum := int16(i + 1)
+		attname := colName
+		var src catalog.Column
+		if col, ok := cat.LookupColumn(idx.Table, colName); ok && colName != "" {
+			src = *col
+		} else {
+			// Expression key column (or a column that vanished from the
+			// parent): upstream names it pg_expression_<attnum>.
+			attname = fmt.Sprintf("pg_expression_%d", attnum)
+			src = catalog.Column{Name: attname, Type: catalog.Type{Name: "text"}}
+		}
+		row := buildUserPGAttributeRow(cat, idx.Table, src)
+		setPGAttributeCol(row, "attrelid", NewIntDatum(int64(idx.OID)))
+		setPGAttributeCol(row, "attname", NewStringDatum(attname))
+		setPGAttributeCol(row, "attnum", NewIntDatum(int64(attnum)))
+		setPGAttributeCol(row, "attnotnull", NewBoolDatum(false))
+		setPGAttributeCol(row, "atthasdef", NewBoolDatum(false))
+		setPGAttributeCol(row, "atthasmissing", NewBoolDatum(false))
+		setPGAttributeCol(row, "attidentity", NewStringDatum(""))
+		setPGAttributeCol(row, "attgenerated", NewStringDatum(""))
+		setPGAttributeCol(row, "attisdropped", NewBoolDatum(false))
+		setPGAttributeCol(row, "attislocal", NewBoolDatum(true))
+		setPGAttributeCol(row, "attinhcount", NewIntDatum(0))
+		setPGAttributeCol(row, "attacl", NullDatum)
+		setPGAttributeCol(row, "attoptions", NullDatum)
+		setPGAttributeCol(row, "attfdwoptions", NullDatum)
+		setPGAttributeCol(row, "attmissingval", NullDatum)
+		setPGAttributeCol(row, "attstattarget", NullDatum)
+		rows = append(rows, row)
+		attnames = append(attnames, attname)
+	}
+	return rows, attnames
 }
 
 // pgAttTypmod computes the PG-canonical pg_attribute.atttypmod from a column's

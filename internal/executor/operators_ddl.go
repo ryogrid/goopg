@@ -13946,6 +13946,28 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		return fmt.Errorf("pg_index_indexrelid_index for index: %w", err)
 	}
 
+	// AI-20260810-011258-003 blocker #11: write the INDEX relation's own
+	// pg_attribute rows (upstream index_create → ConstructTupleDescriptor →
+	// AppendAttributeTuples). PG rebuilds an index's TupleDesc from
+	// pg_attribute like any other relation; without these rows the first
+	// RelationBuildTupleDesc on the index ERRORs "pg_attribute catalog is
+	// missing N attribute(s)".
+	attrRel := storage.RelFileNode{
+		DBOid:  heapDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	attrRows, attrNames := buildUserPGAttributeRowsForIndex(ctx.Catalog, idx)
+	for i, attrRow := range attrRows {
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), attrRow)
+		if err != nil {
+			return fmt.Errorf("pg_attribute for index attr %q: %w", attrNames[i], err)
+		}
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, idx.OID, int16(i+1), attrTID); err != nil {
+			return fmt.Errorf("pg_attribute_relid_attnum_index for index attr %q: %w", attrNames[i], err)
+		}
+	}
+
 	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
 	// pg_class row for the new index relation. Flag the txn so the commit
 	// hook emits RecordKindXactCommitInval and refreshes pg_internal.init;

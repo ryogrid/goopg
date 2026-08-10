@@ -542,3 +542,113 @@ Blocker #9 is therefore a real subsystem task (PG-faithful `btree_redo`:
 `VACUUM`, `DELETE`, `MARK_PAGE_HALFDEAD`, `UNLINK_PAGE*`, from
 `postgres/src/backend/access/nbtree/nbtxlog.c`) plus rmid-keyed dispatch, and
 is ledgered separately. The fix_plan item stays open.
+
+## 2026-08-10 addendum — blocker #9 re-triaged; #10/#12 root-caused; #11 FIXED
+
+Loop #33 (M-NIGHTLY AI-20260810-011258-003). Blocker #9 as filed
+("goopg cannot replay PG's RM_BTREE records") **does not reproduce at HEAD**,
+and chasing it would have been wasted work. Tracing every record the reverse
+standby applies (a temporary `APPLYDBG` print in `wal.ApplyRecord` dumping
+`rmid`/`info`/`xid`/block refs) shows the promoted PG emits, for the Phase-D
+`INSERT … (5, 'reverse-attach', 2)`, exactly two records:
+
+```
+rmid=10 info=0x00 xid=12 blk{id=0 rel=5/16406 fork=0 blk=0 img=true apply=true}   RM_HEAP / XLOG_HEAP_INSERT
+rmid=1  info=0x00 xid=12 main=8                                                   RM_XACT / XLOG_XACT_COMMIT
+```
+
+No `rmid=11` record ever arrives. Replay ends cleanly (`standby replay:
+stopped`, no `standby_replay_error`) and the row IS on the reverse standby —
+`SELECT id, val, ctid FROM public.s10_t` returns all five rows. What fails is
+only the *predicate* form the harness uses:
+
+| query on the reverse standby | result |
+|---|---|
+| `SELECT count(*) FROM public.s10_t` | 5 |
+| `SELECT count(*) … WHERE id = 5` | 1 |
+| `SELECT count(*) … WHERE val = 'reverse-attach'` | **0** |
+| `EXPLAIN` of the last one | `Index Scan using public.s10_t_val_idx` |
+
+So the heap is correct and the *index* is missing the PG-authored entries —
+because PG never maintained it.
+
+### Blocker #10 — `pg_class.relhasindex` is hardcoded `false`
+
+The decisive probe, run against the promoted PG:
+
+```
+SELECT relhasindex FROM pg_class WHERE oid = 'public.s10_t'::regclass  →  false
+SELECT indisvalid, indisready, indislive FROM pg_index
+  WHERE indrelid = 'public.s10_t'::regclass                            →  t, t, t
+```
+
+`buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go`) wrote
+`relhasindex = false` unconditionally, with a comment promising "updated by
+CREATE INDEX later" that no code ever honoured. Upstream gates on this flag
+twice: `ExecInitModifyTable` only calls `ExecOpenIndices` when
+`rd_rel->relhasindex` is set, and `get_relation_info` (`plancat.c`) only calls
+`RelationGetIndexList` under the same condition. So blocker #8's
+`pg_index_indrelid_index` work — necessary, and still correct — is never
+reached: PG decides the relation has no indexes before it would consult 2678.
+goopg's own virtual pg_class row (`catalog.go`'s `hasIdx`) reported `t` the
+whole time, the recurring encode/decode-sibling failure of Hard-won Rule #2.
+
+The fix is one line (`NewBoolDatum(len(cat.IndexesOnTable(tbl)) > 0)`) plus a
+`resyncTableClassHeapRow` that rewrites the parent table's pg_class heap row
+when an index is created — upstream's `index_update_stats` side effect. Both
+were implemented and measured this loop, then **reverted**, because of:
+
+### Blocker #12 — goopg's user btree files are not PG nbtree
+
+With `relhasindex = true` the PG standby opens the index and the E2E fails
+*earlier*, in Phase B:
+
+```
+index "s10_t_val_idx" contains corrupted page at block 0   (XX002)
+```
+
+`internal/access/btree` uses a goopg-private page format —
+`SizeOfBTPageOpaque = 272`, `btreeVersion = 4`, variable-length high key in the
+opaque — where upstream `BTPageOpaqueData` is 16 bytes, so `_bt_checkpage`
+(`nbtpage.c`) rejects the page outright. Only the initdb-bootstrapped SYSTEM
+catalog indexes are PG-format (`internal/initdb/btree_index_bootstrap.go`).
+Turning `relhasindex` on today therefore trades a silent gap for a hard error
+on every PG query that plans an index scan. #12 gates #10, and #10 gates #9:
+PG cannot emit RM_BTREE records for an index it will not touch.
+
+### Blocker #11 — FIXED: an index relation had no pg_attribute rows
+
+The `relhasindex` experiment surfaced one gap worth closing on its own. As soon
+as PG believed the index existed it failed in `RelationBuildTupleDesc`:
+
+```
+pg_attribute catalog is missing 1 attribute(s) for relation OID 16410
+```
+
+An index relation is a relation: PG rebuilds its TupleDesc from `pg_attribute`
+like any other. goopg wrote rows only for the parent table, because its own
+catalog answers index questions from `catalog.Index` and never needed them.
+
+`syncIndexToCatalogHeap` now writes one pg_attribute row per index attribute —
+key columns first, then INCLUDE columns, attnum `1..indnatts` — plus the
+matching `pg_attribute_relid_attnum_index` (2659) entries. The row builder
+`buildUserPGAttributeRowsForIndex` mirrors upstream `ConstructTupleDescriptor`
+(`postgres/src/backend/catalog/index.c`): the heap column's
+atttypid/attlen/attbyval/attalign/attstorage/atttypmod/attcollation are copied
+verbatim, while every relation-level flag is reset (attnotnull, atthasdef and
+atthasmissing false; attidentity/attgenerated `'\0'`; attislocal true;
+attinhcount 0; attacl/attoptions/attfdwoptions/attmissingval/attstattarget
+NULL), because an index attribute inherits none of the heap column's
+constraints. An expression key column takes upstream's `pg_expression_<attnum>`
+name; its *type* is a `text` placeholder (the row builder has no expression
+typer), which is a deferral-ledger row, not a silent shortcut.
+
+This lands ahead of #10 deliberately: it is additive, PG-faithful, and is a
+prerequisite for #10 rather than a consequence of it.
+
+Guards: `TestBuildUserPGAttributeRowsForIndexMatchesPG` and
+`TestBuildUserPGAttributeRowsForIndexNamesExpressionKeys`
+(`internal/executor/pg_attribute_index_rows_test.go`).
+`TestE2E_PGStandbyFullCycle` still fails at the same Phase-D point it did
+before this loop (id=5 not visible through the index scan) — no regression;
+Phases A–C are unchanged.
