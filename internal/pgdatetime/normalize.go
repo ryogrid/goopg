@@ -28,9 +28,9 @@
 // Deliberately NOT handled here (each is a separate, still-unimplemented gap;
 // see .ralph/deferral_ledger.md for M0125-0007): textual month names
 // ('2002-May-1', 'May 1, 2002'), the DateStyle-dependent MDY/DMY field orders
-// that a 1-or-2-digit leading field selects ('02-5-1', '5-1-2002'), the
-// run-together form ('20020501'), '/' separators, the 3-digit day-of-year
-// field, 2-digit years, and the BC era suffix.
+// that a 1-or-2-digit leading field selects ('02-5-1', '5-1-2002'), '/'
+// separators, and the 3-digit day-of-year field. (The BC era suffix is handled
+// by era.go, and the run-together date form by NormalizeDateTimeInput below.)
 package pgdatetime
 
 import "strings"
@@ -51,6 +51,41 @@ import "strings"
 // with only surrounding whitespace removed, so a caller can use NormalizeInput
 // unconditionally in front of an existing layout table.
 func NormalizeInput(s string) string {
+	return normalizeInput(s, false, false)
+}
+
+// NormalizeDateTimeInput is NormalizeInput in DecodeDateTime's context — the one
+// PostgreSQL uses for `date`, `timestamp` and `timestamptz` input, as opposed to
+// DecodeTimeOnly's, which NormalizeInput models.
+//
+// The single difference is the RUN-TOGETHER numeric date. PG's field splitter
+// hands a separator-less digit run to DecodeNumberField (datetime.c), which
+// reads it as a date whenever the date is not yet complete — "Start from end and
+// consider first 2 as Day, next 2 as Month, and the rest as Year":
+//
+//	"20200101"        -> 2020-01-01
+//	"200101"          -> 2020-01-01   (2-digit year, see below)
+//	"2020101"         -> 0202-01-01   (a 3-digit year is just "the rest")
+//	"20200101 040506" -> 2020-01-01 04:05:06
+//
+// Only DecodeDateTime reaches that arm: DecodeTimeOnly starts with DTK_DATE_M
+// already set in fmask, so the same six digits are hhmmss there ('040506'::time
+// is 04:05:06 while '040506'::date is 2004-05-06). That is why this is a second
+// entry point rather than a widening of NormalizeInput — the callers that decode
+// a bare `time` / `timetz` must keep the old reading.
+//
+// bc reproduces ValidateDate()'s ordering: the 2-digit-year windowing (< 70 is
+// 20xx, otherwise 19xx) is an `else if` AFTER the BC branch, so an era suffix
+// suppresses it — '200101 BC' is 0020-01-01 BC, not 2020-01-01 BC. Callers split
+// the era off with SplitEra before normalising, so they must pass its answer in.
+//
+// No range validation happens here either: '20201301' normalises to 2020-13-01
+// and the caller's parser still rejects it.
+func NormalizeDateTimeInput(s string, bc bool) string {
+	return normalizeInput(s, true, bc)
+}
+
+func normalizeInput(s string, runTogetherDate, bc bool) string {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		return trimmed
@@ -70,7 +105,11 @@ func NormalizeInput(s string) string {
 		}
 	}
 
-	if padded, ok := padDateFields(datePart); ok {
+	padded, ok := padDateFields(datePart)
+	if !ok && runTogetherDate {
+		padded, ok = expandRunTogetherDate(datePart, bc)
+	}
+	if ok {
 		if sepIdx < 0 {
 			return padded
 		}
@@ -154,6 +193,77 @@ func padDateFields(s string) (string, bool) {
 	b.WriteByte('-')
 	writePadded(&b, d, 2)
 	return b.String(), true
+}
+
+// expandRunTogetherDate rewrites a separator-less numeric date token into the
+// zero-padded "YYYY-MM-DD" spelling, reproducing DecodeNumberField's date arm
+// (postgres/src/backend/utils/adt/datetime.c):
+//
+//	if (len >= 6) { mday = last 2 digits; mon = the 2 before them; year = the rest }
+//
+// The token must be digits ONLY: a decimal point sends upstream down the
+// fractional-seconds branch instead, which then demands a 4- or 6-digit TIME
+// remainder, so '20200101.5' is a syntax error to PG and stays one here.
+//
+// A year field of exactly two digits sets DecodeNumberField's *is2digits, which
+// ValidateDate() later windows onto 1970..2069 — but only when the value is not
+// BC (the branches are `else if`), hence the parameter.
+//
+// Years wider than four digits are emitted verbatim ('202001011' is PG's
+// 20200-10-11). Go's "2006" layout element cannot read those back, so the caller
+// reports a syntax error where upstream reports the date; every such year is far
+// outside goopg's KindTime carrier anyway (see the ledger row for the carrier).
+func expandRunTogetherDate(s string, bc bool) (string, bool) {
+	digits, i, ok := digitRun(s, 0)
+	if !ok || i != len(s) || len(digits) < 6 {
+		return s, false
+	}
+	year := digits[:len(digits)-4]
+	if len(year) == 2 && !bc {
+		// ValidateDate(): "process 1 or 2-digit input as 1970-2069 AD".
+		n := int(year[0]-'0')*10 + int(year[1]-'0')
+		if n < 70 {
+			n += 2000
+		} else {
+			n += 1900
+		}
+		year = string([]byte{
+			byte('0' + n/1000), byte('0' + n/100%10),
+			byte('0' + n/10%10), byte('0' + n%10),
+		})
+	}
+	var b strings.Builder
+	b.Grow(len(digits) + 2)
+	writePadded(&b, year, 4)
+	b.WriteByte('-')
+	b.WriteString(digits[len(digits)-4 : len(digits)-2])
+	b.WriteByte('-')
+	b.WriteString(digits[len(digits)-2:])
+	return b.String(), true
+}
+
+// RunTogetherDateIsTimeAmbiguous reports whether s begins with a separator-less
+// digit run that BOTH DecodeNumberField arms accept: four digits (hhmm) or six
+// (hhmmss) are a time-of-day to DecodeTimeOnly and a date to DecodeDateTime, so
+// '040506' is 04:05:06 as a `time` and 2004-05-06 as a `date`.
+//
+// PostgreSQL never has to choose — transformExpr coerces the unknown literal to
+// the target type before the input function runs, so the fmask it starts from
+// already says which reading applies. goopg has one text→Datum path that reaches
+// the parse with no target type in hand (tryParseStringAs, for a cross-kind
+// comparison against a KindTime datum); this predicate lets it keep the
+// time-of-day reading for exactly the ambiguous widths instead of guessing.
+func RunTogetherDateIsTimeAmbiguous(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	tok := trimmed
+	for i := 0; i < len(trimmed); i++ {
+		if c := trimmed[i]; c == ' ' || c == 'T' || c == 't' {
+			tok = trimmed[:i]
+			break
+		}
+	}
+	digits, i, ok := digitRun(tok, 0)
+	return ok && i == len(tok) && (len(digits) == 4 || len(digits) == 6)
 }
 
 // padTimeFields zero-pads the leading "h:m[:s]" of a time-of-day token and

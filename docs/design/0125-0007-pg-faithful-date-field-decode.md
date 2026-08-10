@@ -672,3 +672,132 @@ every cell agrees except the three already-open ledger rows below.
    unvalidated TIME zone suffix (`'10:00 A.M.'`), the run-together DATE half of
    `DecodeNumberField` (`'20200101T040506'`), and `timestamptz` output's missing
    zone suffix (§10).
+
+## 12. Follow-up 2026-08-11 (M0119-0006) — the RUN-TOGETHER numeric date
+
+The 34th M0119-0006 slice closes the last spelling this doc's §5 listed as
+deferred and that a *numeric* decoder can reach: the separator-less date,
+`'20200101'`. It is the form ISO 8601 calls "basic", the one `date +%Y%m%d`
+prints, and the one every fixed-width extract file in existence carries — and
+goopg answered `22007` for all of it.
+
+### 12.1 What PG does
+
+`ParseDateTime` splits on separators, so `20200101` arrives as one `DTK_NUMBER`
+field and `DecodeNumberField` (`postgres/src/backend/utils/adt/datetime.c`)
+interprets it *by length*, with the comment doing the specifying:
+
+```c
+/* No decimal point and no complete date yet? */
+else if ((fmask & DTK_DATE_M) != DTK_DATE_M)
+{
+    if (len >= 6)
+    {
+        /* Start from end and consider first 2 as Day,
+           next 2 as Month, and the rest as Year. */
+        tm->tm_mday = atoi(str + (len - 2));  ...
+        tm->tm_mon  = atoi(str + (len - 4));  ...
+        tm->tm_year = atoi(str);
+        if ((len - 4) == 2) *is2digits = true;
+        return DTK_DATE;
+    }
+}
+```
+
+Three consequences that a "yyyymmdd" reading would get wrong, all verified on a
+PG 18.3 oracle:
+
+| input | PG 18.3 `::date` | why |
+|---|---|---|
+| `20200101` | `2020-01-01` | the year is "the rest", here four digits |
+| `2020101` | `0202-01-01` | seven digits: the year is *three* digits |
+| `202001011` | `20200-10-11` | nine digits: the year is *five* |
+| `200101` | `2020-01-01` | six digits ⇒ 2-digit year ⇒ windowed |
+| `700101` | `1970-01-01` | the window is 1970..2069, not 2000..2099 |
+| `200101 BC` | `0020-01-01 BC` | BC **suppresses** the windowing |
+
+The last row is the subtle one. The windowing does not live in
+`DecodeNumberField` at all — it lives in `ValidateDate()`, as an `else if` that
+runs only when the BC branch did not:
+
+```c
+if (bc) { ... tm->tm_year = -(tm->tm_year - 1); }
+else if (is2digits) { if (tm_year < 70) tm_year += 2000; else if (tm_year < 100) tm_year += 1900; }
+```
+
+### 12.2 The fmask fork — why this is a second entry point
+
+`DecodeNumberField`'s date arm is guarded by `(fmask & DTK_DATE_M) != DTK_DATE_M`
+and its *time* arm by `(fmask & DTK_TIME_M) != DTK_TIME_M`. `DecodeTimeOnly`
+(`time_in`, `timetz_in`) starts with the date fields already set, so it never
+reaches the date arm; `DecodeDateTime` (`date_in`, `timestamp_in`,
+`timestamptz_in`) does. The same six digits therefore mean two different things,
+and PG 18.3 agrees with itself:
+
+```
+'040506'::time  ->  04:05:06        '040506'::date  ->  2004-05-06
+```
+
+That is why the slice adds `pgdatetime.NormalizeDateTimeInput(s, bc)` beside the
+existing `NormalizeInput(s)` rather than widening the latter. `NormalizeInput`
+*is* the DecodeTimeOnly context and keeps its old behaviour verbatim
+(`parseTimeString`, `parseTimeTZString`); the new function is the DecodeDateTime
+context and is what `parsePGTimestampTextParts`, `parsePGDateText` and the
+verbose-format fallback now call. The `bc` argument exists purely for
+`ValidateDate`'s ordering above — callers already run `SplitEra` first, so they
+have the answer in hand.
+
+The rewrite itself stays where every other spelling in this doc is handled: it
+produces the zero-padded `YYYY-MM-DD` token the existing Go layout tables read,
+so the time-of-day, zone and era machinery around it is untouched. A trailing
+time token survives verbatim and is still canonicalised by
+`CanonicalizeTimeToken`, which is why `'20200101 040506'` and `'20200101T040506'`
+both work: the date half is §12's, the time half is §9's.
+
+### 12.3 The one place goopg still has to guess
+
+`tryParseStringAs` (`internal/executor/expr.go`) coerces an unknown literal to
+match a `KindTime` datum with **no target type in hand** — the standing gap this
+doc's §10 also records, since `KindTime` does not distinguish
+`date`/`time`/`timestamp`/`timestamptz`. PG never guesses here: `transformExpr`
+coerces the literal to the column's type *before* the input function runs, so the
+fmask already says which arm applies.
+
+The slice therefore resolves only the widths where there is nothing to guess.
+`pgdatetime.RunTogetherDateIsTimeAmbiguous` reports whether the leading digit run
+is 4 or 6 long — the two widths `DecodeTimeOnly` also accepts (`hhmm`, `hhmmss`).
+For everything else the date reading is the only reading, and the coercion takes
+it:
+
+| comparison | before | after | PG 18.3 |
+|---|---|---|---|
+| `time_col = '040506'` | 1 row | 1 row | 1 row |
+| `date_col = '20040506'` | **0 rows** | 1 row | 1 row |
+| `ts_col = '20040506 040506'` | **0 rows** | 1 row | 1 row |
+| `date_col = '040506'` | 0 rows | 0 rows | **1 row** |
+
+The last row stays wrong, and stays wrong *silently* — a failed coercion is
+"not equal", not an error, which is the exact shape of the original M0125-0007
+defect. It cannot be fixed by guessing better; it needs the `KindTime` type
+distinction, and it is on the ledger with the rest of that work.
+
+### 12.4 Verification
+
+`TestNormalizeDateTimeInputRunTogetherDate`,
+`TestNormalizeInputKeepsTimeOnlyReading` and `TestRunTogetherDateIsTimeAmbiguous`
+(`internal/pgdatetime`) pin the normalizer and the sibling-path guard;
+`TestRunTogetherDateInput` and `TestRunTogetherTimeStaysTimeOnly`
+(`internal/executor`) pin the executor entry points. All expectations were
+captured from a throwaway PG 18.3 cluster and diffed cast-by-cast
+(`date`/`timestamp`/`time`/`timestamptz`) against a throwaway goopg server: of
+the 80 (input × cast) cells probed, every `date`, `timestamp` and `time` cell now
+matches. The residual `timestamptz` cells differ only by the missing `+HH` output
+suffix (§10's ledger row), and three inputs land outside the `KindTime`
+nanosecond carrier (`'2020101'` = year 202, both BC forms) where goopg answers a
+loud `22008` instead of PG's value — the carrier row, again.
+
+One labelling gap the probe surfaced and this slice does **not** fix: a
+run-together date whose fields decode but cannot exist (`'20201301'`) is `22007`
+on goopg where PG answers `22008`. It is not new — `'2020-13-01'` behaves
+identically at HEAD — because goopg has no `ValidateDate()` step: the Go layout
+simply refuses month 13, which reads as a spelling error rather than a range one.

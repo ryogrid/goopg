@@ -868,7 +868,11 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// before the fixed layouts below, which are not. This is also the coercion
 	// used by the cross-kind comparison path (tryParseStringAs), so leaving it
 	// out here is what made `d_date = '2002-5-01'` silently match no rows.
-	body = pgdatetime.NormalizeInput(body)
+	// M0119-0006: this is DecodeDateTime's context, not DecodeTimeOnly's, so a
+	// separator-less digit run is a DATE ('20200101', '20200101T040506') — see
+	// pgdatetime.NormalizeDateTimeInput. bc must be threaded in because the
+	// 2-digit-year windowing is suppressed under an era suffix.
+	body = pgdatetime.NormalizeDateTimeInput(body, bc)
 	// M0119-0006: a time of day PostgreSQL decodes field-by-field ('10:00 PM',
 	// '040506', '10::00', '10:00.5' — see pgdatetime.ParseTimeOfDay) is beyond
 	// any layout, but the DATE and ZONE parts around it are not. Canonicalizing
@@ -986,7 +990,7 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 // pre/post steps around it are shared, which is the property that kept breaking.
 func parsePGDateText(s string) (time.Time, error) {
 	body, bc := pgdatetime.SplitEra(s)
-	t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(body))
+	t, err := time.Parse("2006-01-02", pgdatetime.NormalizeDateTimeInput(body, bc))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1054,7 +1058,7 @@ func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, err
 	}
 	// Try verbose natural-language format used by PostgreSQL's datetime output
 	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
-	if ts, err := parseFullTimestamp(pgdatetime.NormalizeInput(s)); err == nil {
+	if ts, err := parseFullTimestamp(pgdatetime.NormalizeDateTimeInput(s, false)); err == nil {
 		return ts, 0, nil
 	}
 	return time.Time{}, 0, fmt.Errorf("invalid timestamp %q", s)

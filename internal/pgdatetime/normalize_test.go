@@ -209,3 +209,91 @@ func TestNormalizeInputZuluFoldIsNarrow(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeDateTimeInputRunTogetherDate pins DecodeNumberField's date arm.
+// Every "want" is the padded rendering of what PG 18.3 actually answered for
+// `select '<in>'::date` / `::timestamp` on a stock 18.3 server (port 5599,
+// captured while developing this slice).
+func TestNormalizeDateTimeInputRunTogetherDate(t *testing.T) {
+	cases := []struct {
+		in   string
+		bc   bool
+		want string
+	}{
+		// "Start from end and consider first 2 as Day, next 2 as Month, and the
+		// rest as Year" — the year is whatever is left, at any width.
+		{"20200101", false, "2020-01-01"},
+		{"2020101", false, "0202-01-01"},    // PG: 0202-01-01
+		{"202001011", false, "20200-10-11"}, // PG: 20200-10-11
+		// A two-digit year is windowed onto 1970..2069 by ValidateDate().
+		{"200101", false, "2020-01-01"},
+		{"690101", false, "2069-01-01"},
+		{"700101", false, "1970-01-01"},
+		{"990101", false, "1999-01-01"},
+		{"000101", false, "2000-01-01"},
+		// ...but the windowing is an `else if` after the BC branch, so an era
+		// suffix suppresses it: PG reads '200101 BC' as 0020-01-01 BC.
+		{"200101", true, "0020-01-01"},
+		{"20200101", true, "2020-01-01"}, // 4-digit year: BC changes nothing here
+		// A time of day may follow, on either ISO separator.
+		{"20200101 040506", false, "2020-01-01 040506"},
+		{"20200101T040506", false, "2020-01-01T040506"},
+		{"20200101 04:05:06", false, "2020-01-01 04:05:06"},
+		{"20200101 0405", false, "2020-01-01 0405"},
+		{"20200101 10:00", false, "2020-01-01 10:00:00"},
+		{" 20200101 ", false, "2020-01-01"},
+		// Fewer than six digits is not a date; PG rejects '20200' outright and
+		// reads '0405' as a time only, so both pass through untouched.
+		{"20200", false, "20200"},
+		{"0405", false, "0405"},
+		// A decimal point sends upstream down the fractional-seconds branch,
+		// which then requires a 4- or 6-digit remainder: '20200101.5' is a
+		// syntax error to PG, so nothing is rewritten here either.
+		{"20200101.5", false, "20200101.5"},
+		// Separated spellings keep going through padDateFields unchanged.
+		{"2002-5-1", false, "2002-05-01"},
+		{"2002-May-1", false, "2002-May-1"},
+	}
+	for _, c := range cases {
+		if got := NormalizeDateTimeInput(c.in, c.bc); got != c.want {
+			t.Errorf("NormalizeDateTimeInput(%q, bc=%v) = %q, want %q", c.in, c.bc, got, c.want)
+		}
+	}
+}
+
+// TestNormalizeInputKeepsTimeOnlyReading is the sibling-path guard: the same six
+// digits that are a date to DecodeDateTime must stay a time of day to
+// DecodeTimeOnly, which is the context NormalizeInput models. '040506'::time is
+// 04:05:06 on PG 18.3 even though '040506'::date is 2004-05-06.
+func TestNormalizeInputKeepsTimeOnlyReading(t *testing.T) {
+	for _, in := range []string{"040506", "0405", "20200101", "200101"} {
+		if got := NormalizeInput(in); got != in {
+			t.Errorf("NormalizeInput(%q) = %q, want it untouched (time-only context)", in, got)
+		}
+	}
+}
+
+// TestRunTogetherDateIsTimeAmbiguous pins the widths that BOTH DecodeNumberField
+// arms accept, which is the only case goopg's target-type-less coercion path
+// must not resolve in favour of the date reading.
+func TestRunTogetherDateIsTimeAmbiguous(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"040506", true}, // hhmmss / yymmdd
+		{"0405", true},   // hhmm / (too short for a date)
+		{"040506 PM", true},
+		{"20200101", false}, // 8 digits: a date only
+		{"2020101", false},  // 7 digits: a date only
+		{"20200", false},    // 5 digits: neither
+		{"2020-01-01", false},
+		{"10:00:00", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := RunTogetherDateIsTimeAmbiguous(c.in); got != c.want {
+			t.Errorf("RunTogetherDateIsTimeAmbiguous(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}

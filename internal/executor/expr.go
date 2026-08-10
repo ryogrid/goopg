@@ -2386,7 +2386,16 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		// shape as the unpadded-field defect, one type over. PG never has this
 		// ambiguity: transformExpr coerces the unknown literal to the column's
 		// type before evaluation.
-		if hasISODatePrefix(pgdatetime.NormalizeInput(s)) {
+		// M0119-0006: a separator-less digit run is a date to DecodeDateTime
+		// ('20200101') but a time of day to DecodeTimeOnly ('040506'), and this
+		// path has no target type to decide with. Take the date reading only for
+		// the widths that cannot also be a time — see
+		// pgdatetime.RunTogetherDateIsTimeAmbiguous.
+		normalized := pgdatetime.NormalizeDateTimeInput(s, false)
+		if pgdatetime.RunTogetherDateIsTimeAmbiguous(s) {
+			normalized = pgdatetime.NormalizeInput(s)
+		}
+		if hasISODatePrefix(normalized) {
 			if t, err := parseCopyTimestamp(s); err == nil {
 				return NewTimeDatum(t)
 			}
