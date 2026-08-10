@@ -175,8 +175,16 @@ func pgIndexCollationOrderable(name string) bool {
 // IS PostgreSQL's — the precondition the 3b-2a comparators were written under
 // and the one the descriptor silently assumes.
 //
-// Two types fail it today, both found by slice 3b-2c-ii-B2-a's per-type
-// ordering table (pgindex_tuplekey_test.go) rather than by inspection:
+// Slice 3b-2c-ii-B2-a's per-type ordering table (pgindex_tuplekey_test.go)
+// found TWO types failing it — numeric and uuid. uuid was fixed by the
+// M0119-0006 uuid-column storage slice (encodeValuePG now writes PG's 16-byte
+// pg_uuid_t, so `PGCompareUUID` gets exactly the image it was written for and
+// `DeformPGIndexTuple`'s attlen-16 window lands on the whole value); the
+// pre-flip comment recorded that the descriptor would otherwise have handed
+// the comparator a 16-byte window onto a 37-byte text varlena, i.e. the first
+// 15 characters of the UUID's text.
+//
+// One type still fails it:
 //
 //   - numeric: `encodeValuePG` stores the DECIMAL STRING as a text varlena, not
 //     PG's base-10000 NumericData (weight/sign/dscale + NBASE digits). Fed that,
@@ -184,20 +192,17 @@ func pgIndexCollationOrderable(name string) bool {
 //     bytes.Compare over ASCII, which orders "-1000" above "0" and "0.5" above
 //     "1" — a mis-ORDERED index, exactly the failure mode this mapper exists to
 //     make unreachable.
-//   - uuid: `encodeValuePG` stores the 36-character canonical string as a text
-//     varlena, while the type is attlen 16. The descriptor would hand
-//     `DeformPGIndexTuple` a 16-byte window onto a 37-byte varlena, so the key
-//     would be the first 15 characters of the UUID's text.
 //
-// Both are heap-side divergences (a real PG 18.3 reading a goopg user table
-// with a numeric or uuid column already misreads it), not index-side ones, so
-// the fix belongs to `encodeValuePG` and is a codec change with its own gate
-// list. Until then these indexes keep the pre-S11.4 blob key path, which orders
-// them correctly because goopg's blob encoding is order-preserving over its own
-// image. See the deferral ledger row for M0130-S11.4 B2-a.
+// It is a heap-side divergence (a real PG 18.3 reading a goopg user table with
+// a numeric column already misreads it), not an index-side one, so the fix
+// belongs to `encodeValuePG` and is a codec change with its own gate list —
+// the same shape the uuid flip took. Until then a numeric index keeps the
+// pre-S11.4 blob key path, which orders it correctly because goopg's blob
+// encoding is order-preserving over its own image. See the deferral ledger row
+// for M0130-S11.4 B2-a.
 func pgIndexKeyImageIsPGFaithful(typOID uint32) bool {
 	switch typOID {
-	case catalog.OIDNumeric, catalog.OIDUUID:
+	case catalog.OIDNumeric:
 		return false
 	}
 	return true

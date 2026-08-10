@@ -2462,6 +2462,35 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       applied at storage (`AdjustIntervalForTypmod`), `interval hour to minute`
       unparseable in a column-type position, and `interval[]` elements still
       text (`c[1] = c[2]` is `f` where PG says `t`).
+      **Slice landed 2026-08-10 (19th) — the `uuid` COLUMN gets PG's native
+      16-byte `pg_uuid_t`** (design
+      `docs/design/0119-0006-uuid-column-storage.md`). Same shape as the
+      interval slice one type later, and the interesting half is that **no
+      goopg answer was wrong**: a `uuid` column fell to `encodeValuePG`'s
+      varlena `default:` arm and was stored as the 36-character canonical TEXT
+      (37 bytes behind a varlena header) while goopg's OWN `pg_attribute` row
+      said `attlen 16, attalign 'c', attstorage 'p'` (`userTypeAttrsForOID`,
+      from the pg_type OID 2950 seed). `uuid_cmp` is a `memcmp` and the
+      canonical lowercase-hex text compares in the same order, so ORDER BY,
+      `=`, `min()` and the rendering were already right — the defect is
+      invisible from inside the engine and visible only to a reader that
+      trusts the descriptor: a PG standby deforms 16 raw bytes at the column's
+      offset (the first 16 characters of the text) and finds every FOLLOWING
+      column 21 bytes out of position. Five seams: encode (`string_to_uuid`
+      port), decode (`uuid_out` port), `physicalPGTypeAlign` → 1,
+      `pgPhysicalTypeIsVarlena` → false, and the `internal/wal` pgoutput
+      sibling decoder. The Datum stays the canonical `KindString` the whole
+      engine speaks, so no index-key/comparison/analyzer site moves. One
+      unlock came free and was found BY the units gate: the
+      `pgIndexKeyImageIsPGFaithful` guard that refused uuid was written to
+      FAIL the moment the codec became faithful, so uuid now takes the
+      PG-format index-tuple key path under `btree.PGCompareUUID` and joins
+      `TestPGIndexTupleKeyOrdersEveryDescribableType`; `numeric` is the last
+      member of that divergence class. Gates: 9 new unit tests
+      (`codec_uuid_column_test.go`, `pgoutput_uuid_test.go`), units +
+      tpch-spotcheck (Q12=2, Q13=35) + `TestPort_RegressSuite` PASS. 2 ledger
+      rows: `uuid[]` elements still text, and no on-disk migration for heaps
+      written by an older goopg (the general gap, recorded once).
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.

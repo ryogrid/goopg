@@ -1,41 +1,42 @@
 (idle — nothing in flight)
 
-Last loop: M0119-0006 **18th slice landed** — the interval COLUMN gets PG's
-native 16-byte `Interval` layout (`{time int64 @0, day int32 @8, month int32
-@12}`, typlen 16 / typalign 'd'). It was stored as the literal TEXT the user
-typed, so `ORDER BY i` put `2 hours` after `10 days`, `WHERE i > interval '10
-days'` returned a different SET, `i = interval '30 days'` missed `1 mon`, and
-the column echoed `2 hours` where PG prints `02:00:00`.
+Last loop: M0119-0006 **19th slice landed** — the `uuid` COLUMN gets PG's
+native 16-byte `pg_uuid_t` (typlen 16 / typalign 'c' / typstorage 'p'). It was
+stored as the 36-char canonical TEXT behind a varlena header, i.e. 37 bytes
+under a descriptor that says 16.
 
-Finding worth carrying: goopg already had every interval mechanism
-(`KindInterval`, `compareDatum`'s `interval_cmp_value` port, `formatInterval`,
-`parser.ParseIntervalBody`) — all reachable from EXPRESSIONS, none from a
-stored column. A missing routing arm, not a missing algorithm; that is why
-every in-memory interval unit test passed while three answers were wrong. Look
-for the same shape in the other types `pgindex_keydesc.go` names as heap-side
-divergences: `numeric` (stores the decimal STRING, not base-10000 NumericData)
-and `uuid` (36-char text under an attlen-16 descriptor) are still in that
-class, and a real PG standby misreads both today.
+Finding worth carrying: unlike the interval slice, NO goopg answer was wrong —
+`uuid_cmp` is a memcmp and lowercase-hex text compares in the same order, so
+the divergence is invisible from inside the engine and visible only to a
+reader that trusts the descriptor (a PG standby reads the first 16 text
+characters as the uuid and finds every FOLLOWING column 21 bytes out of
+position). Lesson: "all goopg tests green" is not evidence about heap-format
+fidelity; check the published `pg_attribute` row against `encodeValuePG`'s
+arm, type by type.
 
-`formatInterval` moved to leaf `internal/pgdatetime` — `internal/wal`'s
-pgoutput is the SECOND decoder of the heap layout and cannot import the
-executor.
+The units gate found the free unlock: `pgIndexKeyImageIsPGFaithful`'s guard
+test was deliberately written to FAIL when the codec became faithful, so uuid
+moved onto the PG-format index-tuple key path (`btree.PGCompareUUID`) in the
+same loop. **`numeric` is now the LAST member of that heap-side-divergence
+class** — it stores the decimal STRING, not base-10000 `NumericData`, and it
+is the obvious successor slice: same five seams, plus a `PGCompareNumeric`
+unlock and the M0130-S11.4 B2-a ledger row it would close.
 
-Banner state (re-read this loop): M0130 fully checked, M-NIGHTLY has no open
-items, so the banner falls through to M0119, then M0122.
+Banner state (re-read this loop): M0130 fully checked, M-NIGHTLY's six
+20260810-011258 items are all filed AND checked, so the banner falls through
+to M0119, then M0122.
 
-Next loop: continue M0119-0006. Remaining: posting-list duplicate coverage in
-the checkunique tier, `box`/`int4range` key encodings, the whole-database
-(unscoped) pg_amcheck run — plus this loop's 3 new ledger rows (`interval(3)`
-typmod at storage, `interval hour to minute` unparseable as a column type,
-`interval[]` elements still text) and the standing ASCII-vs-Unicode
-whitespace-trim divergence (one answer owed across all type input functions).
+Next loop: continue M0119-0006. Candidates: the `numeric` heap flip (above,
+highest value), posting-list duplicate coverage in the checkunique tier,
+`box`/`int4range` key encodings, the whole-database (unscoped) pg_amcheck run,
+plus this loop's 2 new ledger rows (`uuid[]` elements still text; no on-disk
+migration for heap-format flips).
 
-Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(first run FAILED on the intended guard, then PASS after the unlock);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); `TestPort_RegressSuite` PASS
-(676 s — hard-won rule #5, mandatory after a codec change); pre-commit pgbench
-smoke PASS. TPC-DS SF0.5 sweep NOT run (~1 h): no planner change, and the codec
-change is scoped to a single new type arm — no TPC-DS query has an interval
-column.
+(161 s, `-timeout 40m` — the default 10 m panics the suite); pre-commit
+pgbench smoke PASS. TPC-DS SF0.5 sweep NOT run (~1 h): no planner change, and
+no TPC-DS query has a uuid column.
 
 In-flight: none

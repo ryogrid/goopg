@@ -344,7 +344,9 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 func pgoPhysicalAlign(off int, t catalog.Type) int {
 	align := 4
 	switch t.Name {
-	case "bool", "boolean", "name":
+	case "bool", "boolean", "name",
+		// uuid: pg_type OID 2950 is typalign 'c', typlen 16 (M0119-0006).
+		"uuid":
 		align = 1
 	case "char":
 		if len(t.Args) == 0 {
@@ -468,6 +470,26 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 		days := int32(binary.LittleEndian.Uint32(data[8:12]))
 		months := int32(binary.LittleEndian.Uint32(data[12:16]))
 		return []byte(pgdatetime.FormatInterval(months, days, micros)), 16, nil
+	case "uuid":
+		// Sibling of executor.encodeValuePG's "uuid" arm: PG's fixed 16-byte
+		// pg_uuid_t. Before uuid columns gained that layout the varlena
+		// fall-through below returned the stored 36-char text and happened to
+		// be right; it would now read the first raw byte as a varlena header.
+		// Rendered by uuid_out's rule (lowercase hex, hyphens after bytes
+		// 4/6/8/10) so the subscriber sees exactly what a local SELECT prints.
+		// M0119-0006.
+		if len(data) < 16 {
+			return nil, 0, fmt.Errorf("uuid: short read")
+		}
+		const hexdigits = "0123456789abcdef"
+		out := make([]byte, 0, 36)
+		for i := 0; i < 16; i++ {
+			if i == 4 || i == 6 || i == 8 || i == 10 {
+				out = append(out, '-')
+			}
+			out = append(out, hexdigits[data[i]>>4], hexdigits[data[i]&0x0f])
+		}
+		return out, 16, nil
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.

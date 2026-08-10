@@ -709,8 +709,23 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return varlenaTextBytes(s), nil
 		}
 	case "uuid":
-		// Validate and normalize UUID to canonical lowercase-with-dashes format.
-		// M0097-0029.
+		// PG's uuid is a fixed 16-byte, 1-byte-aligned, PLAIN-storage type
+		// (pg_type OID 2950: typlen 16, typalign 'c', typstorage 'p' —
+		// postgres/src/include/utils/uuid.h `struct pg_uuid_t { unsigned char
+		// data[UUID_LEN]; }`), and internal/initdb/pg_type_seed_data.go has
+		// seeded exactly that row since initdb existed. goopg nevertheless
+		// stored the 36-character canonical TEXT through varlenaTextBytes, so
+		// the heap disagreed with its own catalog by 21 bytes and by the
+		// varlena header: a PG standby reading a goopg uuid column takes the
+		// first text byte as a varlena length header and returns garbage,
+		// and the attcacheoff fast path (heaptuple.c nocachegetattr) walks
+		// past the column with attlen 16 while the value occupies 37.
+		//
+		// Only the STORAGE changes here — the in-memory Datum stays the
+		// canonical KindString the rest of the engine (index keys,
+		// comparisons, output) already speaks, and lowercase-hex text order is
+		// the same order as uuid_cmp's memcmp over these bytes, so no answer
+		// moves. M0119-0006 (was M0097-0029).
 		if d.Kind != KindString {
 			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
 		}
@@ -719,7 +734,12 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, &ExecError{Code: "22P02",
 				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
 		}
-		return varlenaTextBytes(normalizeUUIDStr(s)), nil
+		raw, ok := uuidBytesFromCanonical(normalizeUUIDStr(s))
+		if !ok {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return append([]byte(nil), raw[:]...), nil
 	case "pg_node_tree":
 		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
 		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
@@ -995,7 +1015,10 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		// exceed a Datum — the struct's leading field is an int64.
 		"interval":
 		return 8
-	case "name":
+	case "name",
+		// uuid is pg_type OID 2950: typlen 16, typalign 'c'. Its 16 bytes
+		// exceed a Datum but carry no field wider than a byte. M0119-0006.
+		"uuid":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
 	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "anyarray", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
@@ -1026,6 +1049,7 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
 		"interval", // typlen 16, not varlena
+		"uuid",     // typlen 16, typalign 'c', typstorage 'p' — not varlena
 		"name",
 		"float4", "real",
 		"float8", "double precision", "double",
@@ -1287,20 +1311,20 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		f8 := math.Float64frombits(binary.LittleEndian.Uint64(data[:8]))
 		return floatTextDatum(PGFloatOut(f8, 64)), 8, nil
 	case "uuid":
-		// goopg stores UUID as varlena-text (canonical lowercase-with-dashes
-		// format). Decode: read the varlena payload and return as KindString.
-		// UUID rows were previously silently dropped because this case was
-		// missing and the default returned "unsupported PostgreSQL physical
-		// type". M0097-0029.
-		payload, n, err := decodePhysicalPGVarlena(data)
-		if err != nil {
-			return Datum{}, 0, err
+		// Sibling of the "uuid" arm in encodeValuePG: PG's fixed 16-byte
+		// pg_uuid_t at typalign 'c'. The Datum stays the canonical
+		// lowercase-with-dashes KindString the engine speaks everywhere else,
+		// rendered by uuid_out's port — so this is the only place the on-disk
+		// bytes are seen. M0119-0006 (was M0097-0029, varlena-text).
+		if len(data) < 16 {
+			return Datum{}, 0, fmt.Errorf("truncated uuid")
 		}
+		s := uuidCanonicalFromBytes(data[:16])
 		if sctx != nil {
-			moff, mlen := sctx.AllocBytes(payload)
-			return newStringArenaDatum(sctx, moff, mlen), n, nil
+			moff, mlen := sctx.AllocBytes([]byte(s))
+			return newStringArenaDatum(sctx, moff, mlen), 16, nil
 		}
-		return NewStringDatum(string(payload)), n, nil
+		return NewStringDatum(s), 16, nil
 	case "bytea":
 		if len(data) >= 13 && data[0] == 0x01 {
 			ptr := make([]byte, 12)
@@ -1637,6 +1661,65 @@ func normalizeUUIDStr(s string) string {
 		return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
 	}
 	return s
+}
+
+// uuidBytesFromCanonical packs the canonical lowercase-with-dashes rendering
+// produced by normalizeUUIDStr into PG's on-disk pg_uuid_t — a bare
+// UUID_LEN (16) byte array, big-endian in the sense that the leftmost text
+// hex pair is byte 0 (postgres/src/backend/utils/adt/uuid.c, string_to_uuid).
+// s must already have passed isValidUUIDStr + normalizeUUIDStr; ok is false
+// only if it did not.
+func uuidBytesFromCanonical(s string) ([16]byte, bool) {
+	var out [16]byte
+	if len(s) != 36 {
+		return out, false
+	}
+	hexVal := func(c byte) (byte, bool) {
+		switch {
+		case c >= '0' && c <= '9':
+			return c - '0', true
+		case c >= 'a' && c <= 'f':
+			return c - 'a' + 10, true
+		}
+		return 0, false
+	}
+	j := 0
+	for i := 0; i < 36; {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if s[i] != '-' {
+				return [16]byte{}, false
+			}
+			i++
+			continue
+		}
+		hi, ok1 := hexVal(s[i])
+		lo, ok2 := hexVal(s[i+1])
+		if !ok1 || !ok2 {
+			return [16]byte{}, false
+		}
+		out[j] = hi<<4 | lo
+		j++
+		i += 2
+	}
+	if j != 16 {
+		return [16]byte{}, false
+	}
+	return out, true
+}
+
+// uuidCanonicalFromBytes is uuidBytesFromCanonical's inverse and the port of
+// PG's uuid_out (uuid.c): 32 lowercase hex digits with hyphens after bytes
+// 4, 6, 8 and 10.
+func uuidCanonicalFromBytes(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, 36)
+	for i := 0; i < 16; i++ {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			out = append(out, '-')
+		}
+		out = append(out, hexdigits[b[i]>>4], hexdigits[b[i]&0x0f])
+	}
+	return string(out)
 }
 
 func encodeVarlen(b []byte) []byte {

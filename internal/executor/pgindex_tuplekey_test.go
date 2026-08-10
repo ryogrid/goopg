@@ -68,9 +68,23 @@ func TestPGIndexTupleKeyOrdersEveryDescribableType(t *testing.T) {
 		{"text", catalog.Type{Name: "text"}, []Datum{NewStringDatum(""), NewStringDatum("A"), NewStringDatum("a"), NewStringDatum("ab"), NewStringDatum("b")}},
 		{"varchar", catalog.Type{Name: "varchar"}, []Datum{NewStringDatum("a"), NewStringDatum("ab"), NewStringDatum("b")}},
 		{"bpchar", catalog.Type{Name: "bpchar", Args: []int64{4}}, []Datum{NewStringDatum("a"), NewStringDatum("ab"), NewStringDatum("b")}},
-		// numeric and uuid are deliberately ABSENT: goopg's stored image for
-		// them is a text varlena, not PostgreSQL's, so the mapper refuses to
-		// describe them — see TestBuildPGIndexKeyDescRefusesNonPGImages.
+		// uuid joined this table when the M0119-0006 storage slice made
+		// encodeValuePG write PG's 16-byte pg_uuid_t: PGCompareUUID now gets
+		// the image it was written for. The values below are ascending
+		// bytewise, which is exactly uuid_cmp's order (a memcmp over the 16
+		// bytes) — and the last pair differs only in the FINAL byte, which the
+		// pre-flip 16-byte window onto the 37-byte text varlena could not have
+		// seen.
+		{"uuid", catalog.Type{Name: "uuid"}, []Datum{
+			NewStringDatum("00000000-0000-0000-0000-000000000000"),
+			NewStringDatum("00000000-0000-0000-0000-000000000001"),
+			NewStringDatum("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+			NewStringDatum("ffffffff-ffff-ffff-ffff-fffffffffffe"),
+			NewStringDatum("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+		}},
+		// numeric is deliberately ABSENT: goopg's stored image for it is a text
+		// varlena, not PostgreSQL's base-10000 NumericData, so the mapper
+		// refuses to describe it — see TestBuildPGIndexKeyDescRefusesNonPGImages.
 		{"date", catalog.Type{Name: "date"}, []Datum{NewStringDatum("1999-12-31"), NewStringDatum("2000-01-01"), NewStringDatum("2026-08-10")}},
 		{"time", catalog.Type{Name: "time"}, []Datum{NewStringDatum("00:00:00"), NewStringDatum("12:34:56"), NewStringDatum("23:59:59")}},
 		{"timetz", catalog.Type{Name: "timetz"}, []Datum{NewStringDatum("00:00:00+00"), NewStringDatum("12:00:00+00"), NewStringDatum("23:00:00+00")}},
@@ -186,15 +200,16 @@ func varlenaPayloadForTest(v []byte) ([]byte, bool) {
 	return v[4:n], true
 }
 
-// numeric and uuid are the two types the B2-a ordering table found goopg does
-// not store the way PostgreSQL does: `encodeValuePG` writes the decimal string
-// / the 36-character canonical UUID as a TEXT varlena. The mapper must refuse
-// them, because a descriptor is a promise that the 3b-2a comparator can order
-// the stored image — and this test also demonstrates the damage that promise
-// would do, so it FAILS (telling the next loop to drop the guard) the moment
-// encodeValuePG becomes PG-faithful.
+// numeric is the last type the B2-a ordering table found goopg does not store
+// the way PostgreSQL does: `encodeValuePG` writes the decimal string as a TEXT
+// varlena rather than base-10000 NumericData. (uuid was the other one until the
+// M0119-0006 storage slice made it PG's 16-byte pg_uuid_t; it now lives in the
+// ordering table above.) The mapper must refuse it, because a descriptor is a
+// promise that the 3b-2a comparator can order the stored image — and this test
+// also demonstrates the damage that promise would do, so it FAILS (telling the
+// next loop to drop the guard) the moment encodeValuePG becomes PG-faithful.
 func TestBuildPGIndexKeyDescRefusesNonPGImages(t *testing.T) {
-	for _, typ := range []string{"numeric", "uuid"} {
+	for _, typ := range []string{"numeric"} {
 		tbl := keyDescTable(col("k", typ))
 		idx := &catalog.Index{Name: "i", Table: tbl, Method: "btree", Columns: []string{"k"}}
 		if _, err := buildPGIndexKeyDesc(idx); err == nil {
@@ -227,14 +242,18 @@ func TestBuildPGIndexKeyDescRefusesNonPGImages(t *testing.T) {
 			"base-10000 NumericData, so drop numeric from pgIndexKeyImageIsPGFaithful and re-add it to the ordering table")
 	}
 
-	// uuid: PG's image is exactly 16 bytes; goopg's is the canonical string.
+	// uuid's guard is the inverse now: the image MUST stay 16 bytes, because the
+	// ordering table above hands it to PGCompareUUID under an attlen-16
+	// descriptor. A regression back to text storage would make the descriptor a
+	// 16-byte window onto a 37-byte varlena — the first 15 characters of the
+	// UUID's text — and mis-order the index rather than fail.
 	uuidImg, err := encodeValuePG(catalog.Type{Name: "uuid"}, NewStringDatum("00000000-0000-0000-0000-000000000001"))
 	if err != nil {
 		t.Fatalf("encodeValuePG(uuid): %v", err)
 	}
-	if len(uuidImg) == 16 {
-		t.Errorf("encodeValuePG now emits a 16-byte uuid image — drop uuid from pgIndexKeyImageIsPGFaithful " +
-			"and re-add it to the ordering table")
+	if len(uuidImg) != 16 {
+		t.Errorf("encodeValuePG(uuid) emits %d bytes, want 16 (pg_uuid_t); the descriptor promises attlen 16",
+			len(uuidImg))
 	}
 }
 
