@@ -1363,13 +1363,22 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               via `withBlobIndexKeys`, while the DDL type-acceptance suites were
               asserting the format only incidentally and now route through the
               engine's own `openIndexBTree` / `indexProbeKey`.
-              Gates: units PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2,
-              Q13 rows=35). **No REINDEX of the TPC-H cluster was possible or
-              needed** — its eight HammerDB PKs are catalog-only (an index scan
-              fails identically on a gate-OFF rebuild, so it predates S11.4) and
-              `REINDEX` inside db `tpch` hits the known per-DB scoping gap. Both
-              filed in the ledger, with the NULL-keyed-row divergence and the
-              missing "needs REINDEX" detection.
+              Gates: units PASS; tpch-spotcheck PASS (Q12 rows=2, Q13 rows=35);
+              pgbench smoke PASS (its `select only` arm is an index scan on a
+              freshly built tuple-format PK at 12.8k TPS); **TPC-DS SF0.5
+              PASS=95 ERROR=0 MISMATCH=0 CKMISMATCH=0, plans identical** — after
+              REINDEXing all 24 SF0.5 PKs (46s). That REINDEX exposed the loop's
+              real find: the first sweep returned 42 ERRORs that were NOT this
+              slice — every index scan on BOTH bench clusters failed
+              `corrupted page at block 0: special size 0, want 16` identically
+              on a gate-OFF rebuild, and the last green sweep predates the whole
+              S11.2/S11.3 series. The clusters had carried those REINDEX-required
+              breaks un-remediated for four slices, because nothing re-runs a
+              REINDEX on a long-lived bench cluster and `tpch-spotcheck.sh`'s
+              Q12/Q13 are seq-scan plans. TPC-H stays un-remediated (`REINDEX`
+              in db `tpch` hits the per-DB scoping gap), so SF=1 index behaviour
+              is ungated. Ledger rows filed for all of it, plus the NULL-keyed-row
+              divergence and the missing "needs REINDEX" detection.
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

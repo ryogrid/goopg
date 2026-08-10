@@ -1134,16 +1134,29 @@ sources agree:
             routed through the engine's own `openIndexBTree` / `indexProbeKey`
             and now track whichever format the index resolves to.
 
-            Gates: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-            PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35).
-            **The TPC-H bench cluster needed no REINDEX, and could not have had
-            one:** its eight HammerDB PK indexes are catalog-only — an index scan
-            on them fails `btree: index contains corrupted page at block 0` on
-            the PRE-FLIP binary too (verified by rebuilding with the gate off),
-            and `REINDEX INDEX <name>` inside db `tpch` reports "relation does
-            not exist", the same per-DB scoping gap the ledger records for
-            ANALYZE. Both are recorded in the deferral ledger; the spotcheck's
-            Q12/Q13 are seq-scan plans and so do not exercise the flip.
+            Gates: units PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2,
+            Q13 rows=35); pgbench smoke PASS — and its `select only` arm is an
+            index scan on a freshly built tuple-format PK at 12.8k TPS, the
+            first end-to-end read of the new format under concurrency.
+            **TPC-DS SF0.5 PASS=95 ERROR=0 MISMATCH=0 CKMISMATCH=0, plan shapes
+            identical** — but only after a REINDEX, and what that REINDEX
+            revealed is worth more than the flip's own gate result: the first
+            sweep came back with 42 queries turned ERROR, and they were NOT this
+            slice's doing. Every index scan on both bench clusters was failing
+            `btree: index contains corrupted page at block 0: special size 0,
+            want 16` — an old-format page read by the 16-byte-opaque reader —
+            *identically on a binary rebuilt with the gate OFF*, and the last
+            green sweep (5ea5078b) predates the entire S11.2/S11.3 series. The
+            clusters had been carrying those two REINDEX-required breaks
+            un-remediated ever since. REINDEXing all 24 SF0.5 PKs under the
+            flipped binary (46s) restored the pre-S11.2 baseline exactly.
+            The general lesson, now a ledger row: a REINDEX-required change is
+            only half done when the code lands — nothing re-runs it on the
+            long-lived bench clusters, and the gate that should have caught it
+            (`tpch-spotcheck.sh`) happens to run two seq-scan plans. The TPC-H
+            cluster is still un-remediated because `REINDEX` inside db `tpch`
+            hits the per-DB catalog scoping gap the ledger already records for
+            ANALYZE, so SF=1-scale index behaviour stays ungated.
 
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple

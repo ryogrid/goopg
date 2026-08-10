@@ -1,40 +1,43 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-c-viii (the fingerprint funnel) — DONE,
-committed + pushed. Nothing uncommitted.
+Task: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP. DONE, committed (fea5e8dd)
++ pushed. A follow-up docs-only commit records the REINDEX-debt finding.
 
-Landed (no behaviour change at all, `pgIndexTupleKeys` still false, no REINDEX):
-- `internal/executor/pgindex_fingerprint.go`: `indexKeyFingerprint` (whole-key)
-  and `indexColumnFingerprint` (per-column). Neither takes a `*Context`, a
-  descriptor or an ItemPointer — they cannot acquire a heap TID by accident.
-- Six sites routed: `indexKeyColumnsChanged`, `ssiRecordHashIndexInsert`,
-  `nndKeyColumnsEqual` (×2), `resolveNNDKeyColsFromRow`, `scanNNDLiveMatches`.
-- Named invariant now in docs/design/0130-0011: after the flip goopg computes a
-  key TWO ways for a describable index (tuple image for the tree, blob for the
-  fingerprints), so `encodeIndexKeyFromCols`/`encodeBTreeKeyForColumn` SURVIVE
-  the flip. Discovery: the SSI hash bucket pairs the WRITER's fingerprint with
-  the READER's *scan search key*, so it holds only because
-  `buildPGIndexKeyDesc` refuses non-btree methods — load-bearing for SSI.
-Guard: internal/executor/pgindex_fingerprint_test.go (6 tests incl. a
-function-scoped source scan), mutation-checked 2 ways (revert one NND site;
-remove the access-method refusal).
+Landed: `pgIndexTupleKeys = true`. Describable indexes are now PG index tuples
+on disk; refused indexes keep the blob path, so key format is a per-INDEX
+catalog property with nothing on disk recording it (metapage version must stay
+4) — hence REINDEX-required. The eight prior slices had covered every key
+PRODUCER; the flip's real content was four CONSUMERS:
+- `(*BTree).Search`: full-key equality is unsatisfiable once the heap TID is in
+  the key (every unique probe said "no such key"); now `compareKeyAttrs` + a
+  `_bt_stepright`-style right step (a zero-TID probe descends LEFT of a group
+  that starts at a page boundary).
+- `indexFormat.compareHigh`: weighed the TID, so every real entry read as ABOVE
+  a bound naming its exact key → equality scans returned zero rows. Now
+  key-attributes-only. The LOW end keeps the tiebreak deliberately.
+- index-only scan: decoded a tuple image with the blob running-offset walk; now
+  `pgIndexTupleKeyDatums` (DeformPGIndexTuple + decodePhysicalPGValueMctx).
+- amcheck `checkunique`: compared bytewise, had silently STOPPED detecting
+  duplicates; now `IndexFormat.CompareKeyAttrs`.
 
-Next step (per fix_plan banner: M-NIGHTLY filing then M0130):
-1. **3b-2c-ii-B2-c — THE FLIP** (REINDEX-required). Every funnel is now in
-   place — scan, row writers, bulk build, arbiter, posting dedup — and the
-   fingerprints are guarded as permanently blob. Remaining: the standing
-   decision that expression indexes stay permanently blob
-   (`buildPGIndexKeyDesc` refuses them), then `pgIndexTupleKeys = true`.
-   Gates: tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin anchors
-   after the REINDEX.
-2. Then 3b-3 (blob MAXALIGN, `_bt_keep_natts` suffix truncation,
-   `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`, dead
-   `backfillBTree`, dead `appendTIDToPosting`/`promoteSingleToPosting`).
-Re-read the fix_plan banner first (M-NIGHTLY filing unconditional; the six
-`AI-20260810-011258-*` items are already filed and left unchecked).
+Gates: units PASS; tpch-spotcheck PASS (Q12=2, Q13=35); pgbench smoke PASS;
+TPC-DS SF0.5 **PASS=95 ERROR=0 MISMATCH=0 CKMISMATCH=0, plans identical**.
 
-Gates run: `go build ./...` + `go vet ./internal/executor` clean; `go test` PASS
-for ./internal/executor ./internal/access/btree; the 6 new guards PASS and fail
-under mutation; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35). NOT run:
-TPC-DS SF0.5 gate (pure rename/indirection, byte-identical output).
+BIGGEST FINDING (not the flip): the first SF0.5 sweep returned 42 ERRORs that
+reproduce IDENTICALLY on a gate-OFF rebuild. Both bench clusters had been
+carrying un-remediated REINDEX debt from S11.2/S11.3 (page shape + metapage)
+since before the last green sweep. REINDEXing all 24 SF0.5 PKs (46s) restored
+the baseline exactly. TPC-H is STILL un-remediated: `REINDEX` inside db `tpch`
+reports "relation does not exist" (per-DB catalog scoping gap, same one the
+ledger records for ANALYZE), so SF=1 index behaviour is ungated and
+tpch-spotcheck's Q12/Q13 are seq-scan plans that never touch an index.
 
-In-flight: none.
+Next step (re-read the fix_plan banner first; M-NIGHTLY filing is unconditional
+and the six AI-20260810-011258-* items are already filed, left unchecked):
+1. **3b-3 — collect the deferrals**: blob MAXALIGN, `_bt_keep_natts` suffix
+   truncation, `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`, dead
+   `backfillBTree`, dead `appendTIDToPosting`/`promoteSingleToPosting`.
+2. Candidate ahead of it: fix the REINDEX per-DB scoping gap, then REINDEX the
+   TPC-H cluster and add ONE index-driven query to tpch-spotcheck.sh — without
+   it the next REINDEX-required slice repeats this exact four-slice blind spot.
+
+In-flight: none. (Bench servers all stopped; /tmp/goopg-preflip is a scratch
+gate-OFF build, safe to delete.)
