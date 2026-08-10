@@ -1308,6 +1308,33 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               and the three `encodeExprIndexKey` fallbacks made blob-only.
               Guard: `internal/executor/pgindex_arbiterkey_test.go` (6 tests,
               mutation-checked: entry TID dropped, name reconciliation dropped).
+        - [x] **3b-2c-ii-B2-c-viii — the fingerprint funnel** (2026-08-10). NO
+              behaviour change at all, no on-disk change, no REINDEX. The
+              counterpart of B2-c-iii..vii: once every TREE-KEY producer had a
+              role name that switches format, what was left on the raw blob
+              encoders was a different kind of caller — a FINGERPRINT, compared
+              with (or hashed alongside) another fingerprint of the same index
+              and never handed to a btree. Landed:
+              `internal/executor/pgindex_fingerprint.go` with whole-key
+              `indexKeyFingerprint` (`indexKeyColumnsChanged`,
+              `ssiRecordHashIndexInsert`) and per-column
+              `indexColumnFingerprint` (the three NULLS NOT DISTINCT sites),
+              neither taking a `*Context`, a descriptor or an ItemPointer, so
+              neither can acquire a heap TID by accident. **Named invariant:**
+              after the flip goopg computes a key TWO ways for a describable
+              index — the tuple image for the tree, the blob concatenation for
+              the fingerprints — so `encodeIndexKeyFromCols` /
+              `encodeBTreeKeyForColumn` SURVIVE the flip. Routing any of the six
+              costs wrong behaviour, never an error (every UPDATE re-probing
+              every unique index; an SSI writer hashing into a bucket no reader
+              holds; the NND heap scan admitting a second NULL-keyed row).
+              Discovery: the SSI hash bucket pairs the WRITER's fingerprint with
+              the READER's *scan search key*, so it holds only while a hash
+              index is undescribable — `buildPGIndexKeyDesc`'s access-method
+              refusal is load-bearing for SSI, and is now guarded as such.
+              Guard: `internal/executor/pgindex_fingerprint_test.go` (6 tests,
+              incl. a function-scoped source scan; mutation-checked: one NND
+              site reverted, the access-method refusal removed).
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -1316,13 +1343,13 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               funnelled (B2-c-iv: entry keys and probe-by-row keys; B2-c-v: the
               CREATE INDEX / REINDEX bulk build — key, sort order and duplicate
               test). B2-c-vii funnelled the ON CONFLICT arbiter's probe and
-              entry keys and made the `encodeExprIndexKey` fallbacks blob-only.
+              entry keys and made the `encodeExprIndexKey` fallbacks blob-only,
+              and B2-c-viii settled the per-column uniqueness comparisons in
+              `operators_storage.go` — they are FINGERPRINTS and stay blob
+              permanently, now a guarded invariant rather than an open item.
               What remains is the standing decision on expression indexes (one
               `buildPGIndexKeyDesc` REFUSES, so they stay permanently blob
-              unless the flip describes them) and the per-column uniqueness
-              comparisons in
-              `operators_storage.go` — all becoming
-              `pgIndexTupleKeyFromRow` with the row's real heap TID,
+              unless the flip describes them),
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a
               tree's format is a per-index property). Gates:

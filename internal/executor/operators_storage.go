@@ -7390,8 +7390,8 @@ func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRo
 		if oldNull {
 			continue
 		}
-		oldKey, oerr := encodeBTreeKeyForColumn(oldRow[ord], col, 0)
-		newKey, nerr := encodeBTreeKeyForColumn(newRow[ord], col, 0)
+		oldKey, oerr := indexColumnFingerprint(oldRow[ord], col)
+		newKey, nerr := indexColumnFingerprint(newRow[ord], col)
 		if oerr != nil || nerr != nil || !bytes.Equal(oldKey, newKey) {
 			return false
 		}
@@ -7429,8 +7429,11 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 // collision cannot be found by a btree probe; instead this seq-scans the heap
 // for a live tuple whose index-key columns match the candidate's NULL pattern
 // and non-NULL values exactly — NULL equals NULL, and a non-NULL column compares
-// byte-equal under the column's index encoding (encodeBTreeKeyForColumn), so the
-// comparison matches what the btree would consider equal. Returns the first
+// byte-equal under the column's index encoding (indexColumnFingerprint), so the
+// comparison matches what the btree would consider equal. The fingerprint is
+// per-COLUMN and TID-free on purpose: the candidate and the scanned rows are
+// different heap tuples, so a tuple-format key would never compare equal and the
+// scan would find no duplicate at all (M0130-S11.4 slice 3b-2c-ii-B2-c-viii). Returns the first
 // matching tuple's ItemPointer and true. The ItemPointer is surfaced for the
 // ON CONFLICT follow-up slice (design 0119-0004 §2.1); the plain INSERT/UPDATE
 // callers only consume the boolean. Mirrors the heap-scan pattern of
@@ -7482,7 +7485,7 @@ func resolveNNDKeyColsFromRow(tbl *catalog.Table, idx *catalog.Index, cols []cat
 		}
 		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
 		if !kc.candNull {
-			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
+			enc, eerr := indexColumnFingerprint(candVal, col)
 			if eerr != nil {
 				return nil, false
 			}
@@ -7567,7 +7570,7 @@ func scanNNDLiveMatches(ctx *Context, tbl *catalog.Table, rel storage.RelFileNod
 					match = false
 					break
 				}
-				existKey, eerr := encodeBTreeKeyForColumn(existVal, kc.col, 0)
+				existKey, eerr := indexColumnFingerprint(existVal, kc.col)
 				if eerr != nil || !bytes.Equal(existKey, kc.candKey) {
 					match = false
 					break
@@ -7675,14 +7678,14 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 // reports "changed" so the caller still performs the uniqueness probe.
 //
 // This is a VALUE fingerprint, not a tree key: the two encodings are never
-// handed to a btree, only compared with each other. It therefore stays on
-// `encodeIndexKeyFromCols` and must NOT move to `indexEntryKey` when the tuple
+// handed to a btree, only compared with each other. It therefore goes through
+// `indexKeyFingerprint` and must NOT move to `indexEntryKey` when the tuple
 // format lands — a tuple key embeds the row's heap TID, and oldRow/newRow are
 // different heap tuples, so every UPDATE would report "key changed" and re-probe
-// every unique index. M0130-S11.4 slice 3b-2c-ii-B2-c-iv.
+// every unique index. M0130-S11.4 slices 3b-2c-ii-B2-c-iv and -viii.
 func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
-	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
-	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
+	oldKey, oerr := indexKeyFingerprint(idx, cols, oldRow, cat)
+	newKey, nerr := indexKeyFingerprint(idx, cols, newRow, cat)
 	if oerr != nil || nerr != nil {
 		return true
 	}

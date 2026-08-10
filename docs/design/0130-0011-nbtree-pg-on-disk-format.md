@@ -1013,6 +1013,58 @@ sources agree:
             calling `encodeArbiterKey` outside the funnel. Mutation-checked:
             dropping the entry TID and dropping the name reconciliation each
             fail by name.
+          - **3b-2c-ii-B2-c-viii — the fingerprint funnel (landed).** The
+            counterpart of B2-c-iii..vii: after every tree-key producer had a
+            name that switches format, what was left calling the raw blob
+            encoders was a different kind of caller, and this slice named it.
+            A FINGERPRINT is an encoding compared with — or hashed alongside —
+            another fingerprint of the same index, never handed to a btree.
+            Two shapes, six sites: whole-key `indexKeyFingerprint`
+            (`indexKeyColumnsChanged`, which decides whether an UPDATE touched
+            an index at all; `ssiRecordHashIndexInsert`, which hashes into an
+            SSI bucket page tag) and per-column `indexColumnFingerprint` (the
+            three NULLS NOT DISTINCT sites — `nndKeyColumnsEqual`,
+            `resolveNNDKeyColsFromRow`, `scanNNDLiveMatches` — where a NULL key
+            column means the row has no btree entry at all, so uniqueness is
+            decided by a heap scan). Both live in
+            `internal/executor/pgindex_fingerprint.go`, take no `*Context`, no
+            descriptor and no `storage.ItemPointer`, so they cannot acquire a
+            heap TID even by accident.
+            **The named invariant this establishes:** after the flip goopg
+            computes a key TWO ways for a describable index — the tuple image
+            for the tree, the blob concatenation for the fingerprints — so
+            `encodeIndexKeyFromCols` and `encodeBTreeKeyForColumn` SURVIVE the
+            flip rather than being deleted by it. Every one of the six compares
+            bytes derived from DIFFERENT heap tuples, and routing any of them
+            costs wrong behaviour, not an error: every UPDATE would report "key
+            changed" and re-probe every unique index, an SSI writer would hash
+            into a bucket no reader holds, and the NND heap scan would stop
+            finding duplicates — a unique constraint silently admitting a second
+            NULL-keyed row. The equivalence they rely on is also not the tree's:
+            blob column encodings are injective per type, so equal bytes means
+            equal values under the type's normalisation, whereas the tuple
+            format answers equality with `ComparePGIndexTupleKeyAttrs` over
+            datums. The two agree for every type `buildPGIndexKeyDesc` accepts
+            (bytewise collations only); a non-deterministic collation is the
+            first place they could diverge, and the resolver refuses those.
+            One pairing the slice made explicit: the SSI hash bucket is computed
+            from the WRITER's fingerprint but from the READER's *scan search
+            key* (`ssiRecordHashBucketRead` is handed `operators_index.go`'s
+            `loBytes`, which comes from the format-aware scan funnel), so the
+            two agree only while a hash index is undescribable —
+            `buildPGIndexKeyDesc`'s access-method refusal is load-bearing for
+            SSI, and is now guarded as such.
+            Guards: `internal/executor/pgindex_fingerprint_test.go` — with the
+            gate on and a describable index the fingerprint still equals the
+            blob and differs from `indexEntryKey`; equal key values fingerprint
+            identically across two row versions; the per-column fingerprint
+            matches `encodeBTreeKeyForColumn`; `nndKeyColumnsEqual` still reports
+            "unchanged" (NULL == NULL included) under the gate; a hash index is
+            never describable; and a function-scoped source scan over
+            `operators_storage.go` + `ssi.go` allows the raw encoders only inside
+            `encodeIndexKeyFromCols` and `encodeExprIndexKey`. Mutation-checked:
+            reverting one NND site and removing the access-method refusal each
+            fail by name.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -1027,9 +1079,11 @@ sources agree:
             resolve the descriptor), and B2-c-v for the CREATE INDEX / REINDEX
             bulk build (key, sort order and duplicate test). B2-c-vii funnelled the ON CONFLICT
             arbiter's probe and entry keys and made the `encodeExprIndexKey`
-            fallbacks blob-only. What remains is the per-column uniqueness
-            comparisons in `operators_storage.go`, the standing decision on
-            expression indexes (`buildPGIndexKeyDesc` refuses them, so they stay
+            fallbacks blob-only, and B2-c-viii settled the per-column
+            uniqueness comparisons in `operators_storage.go` — they are
+            FINGERPRINTS and stay blob permanently, which is now an invariant
+            with a guard rather than an open question. What remains is the
+            standing decision on expression indexes (`buildPGIndexKeyDesc` refuses them, so they stay
             permanently blob unless the flip describes them), and turning
             `pgIndexTupleKeys` on with the explicit per-index dual-format
             decision. Gates:

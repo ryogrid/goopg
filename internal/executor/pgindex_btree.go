@@ -245,13 +245,16 @@ func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart)
 //     matches — a silent under-read, not a failure.
 //
 // Neither is a total replacement for `encodeIndexKeyFromCols`: two callers use
-// that encoder for something that is not a tree key at all (see its remaining
-// call sites — `indexKeyColumnsChanged` compares two rows' key VALUES with
-// bytes.Equal, and `ssiRecordHashIndexInsert` hashes the key into a bucket page
-// tag). Both would break if a heap TID entered the bytes — equal keys from
-// different rows would stop comparing equal, and a bucket tag would stop
-// matching the reader's. They are value fingerprints, and the flip must leave
-// them on a TID-free encoding; see the deferral ledger row for B2-c-iv.
+// that encoder for something that is not a tree key at all
+// (`indexKeyColumnsChanged` compares two rows' key VALUES with bytes.Equal, and
+// `ssiRecordHashIndexInsert` hashes the key into a bucket page tag). Both would
+// break if a heap TID entered the bytes — equal keys from different rows would
+// stop comparing equal, and a bucket tag would stop matching the reader's. They
+// are value fingerprints, they now go through `indexKeyFingerprint`
+// (pgindex_fingerprint.go, slice B2-c-viii, which also names the per-column
+// `indexColumnFingerprint` the NULLS NOT DISTINCT heap scan needs), and the flip
+// must leave all of them on a TID-free encoding; see the ledger rows for
+// B2-c-iv and B2-c-viii.
 //
 // A nil key with a nil error keeps `encodeIndexKeyFromCols`'s meaning: this row
 // has no entry in this index (NULL key column, or an expression key this

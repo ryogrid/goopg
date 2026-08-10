@@ -1,48 +1,40 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-c-iv (the row-key funnels) — DONE,
-committed + pushed. Next is the flip itself (B2-c, REINDEX-required).
+Task: M0130-S11.4 slice 3b-2c-ii-B2-c-viii (the fingerprint funnel) — DONE,
+committed + pushed. Nothing uncommitted.
 
-Landed (no on-disk change, `pgIndexTupleKeys` still false):
-- `(*Context).indexEntryKey(idx, cols, row, tid)` and
-  `(*Context).indexRowProbeKey(idx, cols, row)` over one `indexRowKey`
-  in `internal/executor/pgindex_btree.go`. desc==nil ⇒
-  `encodeIndexKeyFromCols` verbatim; desc!=nil ⇒ `pgIndexTupleKey`.
-- Projection factored out as `indexRowKeyValues` (operators_storage.go).
-- 7 sites routed: entry = maintainUniqueIndexesForInsert +
-  upsert maintainNonArbiterIndexesCapture/ForUpdate; probe =
-  checkUniqueIndexesForInsert/ForUpdate, checkExclusionConstraintsForInsert,
-  queueDeferredExclusionCheck.
-- Spec-insert key cache in maintainNonArbiterIndexesForUpdate now bypassed
-  when a descriptor exists (a cached key carries the SPEC row's TID).
+Landed (no behaviour change at all, `pgIndexTupleKeys` still false, no REINDEX):
+- `internal/executor/pgindex_fingerprint.go`: `indexKeyFingerprint` (whole-key)
+  and `indexColumnFingerprint` (per-column). Neither takes a `*Context`, a
+  descriptor or an ItemPointer — they cannot acquire a heap TID by accident.
+- Six sites routed: `indexKeyColumnsChanged`, `ssiRecordHashIndexInsert`,
+  `nndKeyColumnsEqual` (×2), `resolveNNDKeyColsFromRow`, `scanNNDLiveMatches`.
+- Named invariant now in docs/design/0130-0011: after the flip goopg computes a
+  key TWO ways for a describable index (tuple image for the tree, blob for the
+  fingerprints), so `encodeIndexKeyFromCols`/`encodeBTreeKeyForColumn` SURVIVE
+  the flip. Discovery: the SSI hash bucket pairs the WRITER's fingerprint with
+  the READER's *scan search key*, so it holds only because
+  `buildPGIndexKeyDesc` refuses non-btree methods — load-bearing for SSI.
+Guard: internal/executor/pgindex_fingerprint_test.go (6 tests incl. a
+function-scoped source scan), mutation-checked 2 ways (revert one NND site;
+remove the access-method refusal).
 
-Why (do not re-derive): `encodeIndexKeyFromCols` served FOUR roles. Entry
-key needs the row's real TID; probe key needs the ZERO TID (minus infinity,
-else a duplicate scan starts after its own matches); and TWO value
-fingerprints — `indexKeyColumnsChanged` (bytes.Equal) and
-`ssiRecordHashIndexInsert` (bucket tag) — must stay TID-free forever. Those
-two are deliberately LEFT on encodeIndexKeyFromCols with comments.
-
-Guard: `internal/executor/pgindex_rowkey_test.go` (5 tests) incl. a SOURCE
-SCAN over operators_upsert.go + deferred_exclusion.go. Mutation-checked
-(reverting the deferred-exclusion site → reported by file:line).
-operators_storage.go / ssi.go NOT scanned — that is where the two
-fingerprint uses live (ledger row).
-
-Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP. What remains:
-the BUILD path `encodeCompositeBTreeKey`/`WithExprs` (operators_ddl.go
-~10531/10670 — needs the real heap TID threaded into btree.BulkEntry; a
-bulk build SORTS and the TID is part of the heapkeyspace sort key), the
-expression writers `encodeArbiterKey` (operators_upsert.go:1490) +
-`encodeExprIndexKey`, the per-column uniqueness comparisons in
-operators_storage.go (~7264/7347/7439/7524), then `pgIndexTupleKeys = true`.
-Scan side + row-shaped writers need ZERO further edits. Gates:
-tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin after REINDEX.
+Next step (per fix_plan banner: M-NIGHTLY filing then M0130):
+1. **3b-2c-ii-B2-c — THE FLIP** (REINDEX-required). Every funnel is now in
+   place — scan, row writers, bulk build, arbiter, posting dedup — and the
+   fingerprints are guarded as permanently blob. Remaining: the standing
+   decision that expression indexes stay permanently blob
+   (`buildPGIndexKeyDesc` refuses them), then `pgIndexTupleKeys = true`.
+   Gates: tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin anchors
+   after the REINDEX.
+2. Then 3b-3 (blob MAXALIGN, `_bt_keep_natts` suffix truncation,
+   `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`, dead
+   `backfillBTree`, dead `appendTIDToPosting`/`promoteSingleToPosting`).
 Re-read the fix_plan banner first (M-NIGHTLY filing unconditional; the six
 `AI-20260810-011258-*` items are already filed and left unchecked).
 
-Gates run: `go build ./...` clean; `go test` PASS for ./internal/executor
-./internal/access/btree; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` PASS
-(Q12 rows=2, Q13 rows=35); commit-hook pgbench smoke PASS. NOT run: TPC-DS
-SF0.5 gate (blob path byte-identical, gate still off).
+Gates run: `go build ./...` + `go vet ./internal/executor` clean; `go test` PASS
+for ./internal/executor ./internal/access/btree; the 6 new guards PASS and fail
+under mutation; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35). NOT run:
+TPC-DS SF0.5 gate (pure rename/indirection, byte-identical output).
 
 In-flight: none.
