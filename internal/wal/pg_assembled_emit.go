@@ -448,37 +448,106 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 	return framePGAssembled(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, body), nil
 }
 
-// EncodeBtreeSplitPG builds a PostgreSQL RM_BTREE split record (XLOG_BTREE_SPLIT_L
-// opcode) carrying the post-split left, right, and (non-rightmost) sibling pages
-// as full-page images. goopg's split record already holds the exact final page
-// bytes, so this reuses the A0 FPI encoder rather than reconstructing PG's
-// incremental xl_btree_split main-data: block 0 = left (mutated in place), block
-// 1 = right (WILL_INIT — a new block), block 2 = the left sibling's right-link
-// update (non-rightmost only). Every block carries BKPIMAGE_APPLY, so replay
-// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restores the
-// images — identical to the native replayBtreeSplit and PG's BLK_RESTORED redo.
-// The right block extends when it does not yet exist. No main-data is carried
-// (the images are authoritative — a documented deviation from PG's incremental
-// xl_btree_split); xl_xid = 0.
+// sizeOfXLogBtreeSplitData is PG's SizeOfBtreeSplit: level(4) + firstrightoff(2)
+// + newitemoff(2) + postingoff(2). No tail padding — the uint32 leads.
+const sizeOfXLogBtreeSplitData = 10
+
+// EncodeBtreeSplitPG builds a PostgreSQL RM_BTREE split record
+// (XLOG_BTREE_SPLIT_R opcode), shaped for upstream `btree_xlog_split`
+// (nbtxlog.c:180-352). M0130-S11.5b replaced the previous image-only form,
+// which carried NO main data at all: upstream's redo opens with an
+// unconditional `XLogRecGetData` cast to `xl_btree_split` and reads
+// `xlrec->level` before it looks at any block, so an FPI-only record is
+// unreplayable by the engine it is shaped for — the images made goopg↔goopg
+// replay work and nothing else.
+//
+//	main data: xl_btree_split{level, firstrightoff, newitemoff, postingoff}
+//	block 0:   the left half, as a full-page image (see below)
+//	block 1:   the new right sibling, WILL_INIT, block data = its item area in
+//	           `_bt_restore_page` order — NO image
+//	block 2:   the page that was the left page's right sibling, no data
+//	           (non-rightmost split only; redo only patches its back-link)
+//
+// Block 1 must be content, not an image: upstream's redo rebuilds the right
+// page from scratch on every replay (`XLogInitBufferForRedo` + `_bt_pageinit` +
+// `_bt_restore_page`) and would overwrite a restored image with whatever the
+// block data says — an empty page if there were none. The right page's opaque
+// header is not carried at all; redo derives it from the record's level and
+// block tags, so this encoder REFUSES a right page whose header does not match
+// `btree.SplitRightPageOpaque`, rather than logging a record whose redo builds
+// a different page than the primary wrote.
+//
+// Block 0 as an image is upstream-legal, not a shortcut around it: PG's own
+// `_bt_split` logs the left half incrementally (the new item plus the page's
+// new high key) but its redo reaches that path only under `BLK_NEEDS_REDO` —
+// with a backup image the left half takes `BLK_RESTORED` and the incremental
+// rebuild, along with firstrightoff/newitemoff/postingoff, is skipped entirely.
+// Upstream says as much in the comment above its own `XLogRegisterBufData`
+// ("If XLogInsert decides that it can omit orignewitem due to logging a
+// full-page image of the left page, everything still works out").
+//
+// goopg cannot emit the incremental form today for a reason worth recording
+// rather than working around: its split is not upstream's. `splitPage` reads
+// the whole page out, appends the new item, runs a DEDUP CONSOLIDATION pass
+// over the merged list, and refills both halves — so the left half is not
+// "origpage's items up to firstrightoff with newitem spliced in", which is the
+// only thing the incremental record can describe. Upstream reaches the same
+// state through two records (XLOG_BTREE_DEDUP, then a split). Deferred to
+// S11.5b-2; ledger row 2026-08-10 M0130-S11.5b.
+//
+// Because block 0 always carries an image, the three offsets are never read by
+// any redo — upstream's or goopg's. They are still filled in consistently
+// rather than zeroed: the record is logged as SPLIT_R (new item on the right),
+// firstrightoff is where the right half begins in the split page's offset
+// numbering (P_FIRSTDATAKEY is 2 — the post-split left page is never rightmost,
+// it links to the new right page), newitemoff equals it because the new item is
+// the first right item under that description, and postingoff is 0 (no posting
+// split). A reader that ignores the image and believes the main data therefore
+// still gets a coherent story, just not the one the primary actually executed.
+//
+// xl_xid = 0 (index maintenance is not a logical user-data event).
 func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left/right page must be %d bytes", storage.BlockSize)
 	}
+	level, err := btree.CheckSplitRightPageOpaque(rightPage, leftBlk, sibBlk)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split: %w", err)
+	}
+	rightData, err := btree.PGRestorePageData(rightPage)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split right items: %w", err)
+	}
+
+	leftData, err := btree.PGDataItemCount(leftPage)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split left item count: %w", err)
+	}
+	// P_FIRSTDATAKEY of the post-split left page: it links to the new right
+	// page, so it is never rightmost and its first data item sits past P_HIKEY.
+	firstRightOff := uint16(2 + leftData)
+
+	mainData := make([]byte, sizeOfXLogBtreeSplitData)
+	binary.LittleEndian.PutUint32(mainData[0:4], level)
+	binary.LittleEndian.PutUint16(mainData[4:6], firstRightOff)
+	binary.LittleEndian.PutUint16(mainData[6:8], firstRightOff) // newitemoff
+	binary.LittleEndian.PutUint16(mainData[8:10], 0)            // postingoff
+
 	blocks := []BlockRef{
 		{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}},
-		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Image: &FullPageImage{Page: rightPage, Apply: true}},
+		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Data: rightData},
 	}
 	if sibBlk != storage.InvalidBlockNumber {
 		if len(sibPage) != storage.BlockSize {
 			return nil, fmt.Errorf("wal: btree-split sibling page must be %d bytes", storage.BlockSize)
 		}
-		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true, Image: &FullPageImage{Page: sibPage, Apply: true}})
+		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true})
 	}
-	body, err := assembleXLogRecord(nil, blocks)
+	body, err := assembleXLogRecord(mainData, blocks)
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrBtree, xlogBtreeSplitL, 0, body), nil
+	return framePGAssembled(RmgrBtree, xlogBtreeSplitR, 0, body), nil
 }
 
 // EncodeBtreeVacuumPG builds a PostgreSQL RM_BTREE vacuum record

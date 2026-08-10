@@ -2664,12 +2664,16 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		held.release()
 		return err
 	}
-	rightOpaque := BTPageOpaque{
-		Prev:  blk,
-		Next:  op.Next,
-		Level: op.Level,
-		Flags: op.Flags & ^BTRoot, // right sibling is never the root (root stays the original blk during a split, until we lift)
-	}
+	// The right sibling is never the root (the root stays the original blk
+	// during a split, until we lift), and it does not inherit the split page's
+	// garbage hint: the refill below writes only LIVE items (pageItems skips
+	// dead-marked ones), so the hint would be stale-set from birth.
+	//
+	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
+	// split REDO builds — so the page the primary writes and the page a replay
+	// of the same record builds are byte-identical, which is what lets the
+	// split record log this page as content rather than as an image.
+	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
 	initPage(rightSlot.Page(), rightOpaque)
 	// The high key must land BEFORE any data item: initPage wrote btpo_next,
 	// so the page already reports itself non-rightmost and the data-slot

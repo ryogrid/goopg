@@ -2469,6 +2469,15 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeSplitL, xlogBtreeSplitR:
+			// M0130-S11.5b: goopg emits the real xl_btree_split — main data
+			// {level, firstrightoff, newitemoff, postingoff}, block 0 the left
+			// half as an image, block 1 the right sibling's item area as block
+			// data with no image, block 2 the relinked old sibling.
+			if err := replayDecodedXLogBtreeSplit(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			// Other btree records (split / vacuum / unlink / …) are
 			// not flipped yet and are emitted with full-page images; restore
@@ -3026,6 +3035,86 @@ func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDec
 		return btree.ReplayRestoreMetaPage(page, md)
 	}); err != nil {
 		return fmt.Errorf("wal: xlog btree-newroot meta apply: %w", err)
+	}
+	return nil
+}
+
+// replayDecodedXLogBtreeSplit applies a PG-format xl_btree_split, mirroring
+// upstream btree_xlog_split (nbtxlog.c:180-352) in the same block order:
+//
+//	block 1 — rebuild the new right sibling from scratch: init, opaque from the
+//	          record's level and the record's own block tags, items restored
+//	          from block data;
+//	block 0 — the left half, restored from its full-page image;
+//	block 2 — relink the old right sibling's back-link to the new right page
+//	          (non-rightmost split only).
+//
+// Each block is separately idempotent via its own pd_lsn, so a replay
+// interrupted between blocks resumes correctly — the same per-limb discipline
+// replayDecodedXLogBtreeNewRoot uses. Block 1 is WILL_INIT and need not exist
+// yet; it is extended on first touch, matching XLogInitBufferForRedo.
+//
+// A block 0 with no image is a record a REAL PG primary produced (its
+// incremental left-half rebuild replays origpage's items with the new item
+// spliced in). goopg does not implement that arm yet and says so rather than
+// silently leaving the left half at its pre-split contents — see
+// EncodeBtreeSplitPG for why goopg's own splits cannot be logged that way.
+func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	if len(xlog.MainData) < sizeOfXLogBtreeSplitData {
+		return fmt.Errorf("wal: xlog btree-split: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeSplitData)
+	}
+	level := binary.LittleEndian.Uint32(xlog.MainData[0:4])
+
+	left, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-split missing block 0")
+	}
+	right, ok := xlogBlockRefByID(xlog, 1)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-split missing block 1")
+	}
+	// Upstream reads the sibling's block tag up front and treats an absent
+	// block 2 as P_NONE — the right page's forward link comes from it.
+	sib, hasSib := xlogBlockRefByID(xlog, 2)
+	sibBlk := storage.InvalidBlockNumber
+	if hasSib {
+		sibBlk = sib.Block
+	}
+
+	if right.HasImage && right.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, right, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-split right image: %w", err)
+		}
+	} else {
+		items, err := btree.PGParseRestorePageData(right.Data)
+		if err != nil {
+			return fmt.Errorf("wal: xlog btree-split right items: %w", err)
+		}
+		if err := replayInitedXLogBlock(mgr, right, endLSN, func(page storage.Page) error {
+			return btree.ReplaySplitRightPage(page, level, left.Block, sibBlk, items)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-split right apply: %w", err)
+		}
+	}
+
+	if !left.HasImage || !left.ImageApply {
+		return fmt.Errorf("wal: xlog btree-split block 0 has no apply-image: PG's incremental left-half rebuild is not implemented")
+	}
+	if err := restoreDecodedXLogBlockImage(mgr, left, endLSN); err != nil {
+		return fmt.Errorf("wal: xlog btree-split left image: %w", err)
+	}
+
+	if hasSib {
+		if sib.HasImage && sib.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, sib, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-split sibling image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, sib, endLSN, func(page storage.Page) error {
+			return btree.ReplaySplitSiblingPrev(page, right.Block)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-split sibling apply: %w", err)
+		}
 	}
 	return nil
 }

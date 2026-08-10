@@ -1508,11 +1508,56 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         `internal/access/btree/pgnewroot_test.go`; mutation-checked (ascending
         item order, dropped block-1 limb). Gates: btree/wal/storage/amcheck/
         initdb + units PASS; pgbench smoke PASS (commit hook). 1 ledger row.
-  - [ ] **S11.5b — `XLOG_BTREE_SPLIT_L`/`_R`** (est ~2 loops, the largest).
-        `xl_btree_split{level, firstrightoff, newitemoff, postingoff}`, the new
-        item + the left page's new high key as block-0 data, the right page's
-        tuples as block-1 data in `_bt_restore_page` form (S11.5a's
-        `PGRestorePageData`/`PGParseRestorePageData` are that half already).
+  - [x] **S11.5b-1 — `XLOG_BTREE_SPLIT_R`** (2026-08-10). NOT REINDEX-required.
+        `EncodeBtreeSplitPG` now carries upstream's `xl_btree_split{level,
+        firstrightoff, newitemoff, postingoff}` — the struct `btree_xlog_split`
+        casts before it looks at any block, and which the previous image-only
+        form omitted entirely. Block 1 (the new right sibling) is now CONTENT,
+        not an image, because redo rebuilds that page from scratch on every
+        replay (`XLogInitBufferForRedo` + `_bt_pageinit` + `_bt_restore_page`,
+        return code ignored) and would overwrite a restored image with an empty
+        item area — the mirror of S11.5a's missing-main-data trap. Block 2 (the
+        relinked old sibling) carries nothing: redo derives its new back-link
+        from block 1's tag. The right page's OPAQUE is not carried either — redo
+        builds it from `xlrec->level` and the record's own block tags — so
+        `btree.SplitRightPageOpaque` is the single definition, `splitPage` now
+        stamps it (dropping the stale-from-birth `BTP_HAS_GARBAGE` inheritance,
+        as upstream `_bt_split` does), and the encoder REFUSES a right page that
+        does not match, since the divergence would otherwise be silent. Block 0
+        (the left half) stays a full-page image, which is upstream-LEGAL rather
+        than a shortcut: PG's redo reaches its incremental left-half rebuild only
+        under `BLK_NEEDS_REDO`, and an image takes `BLK_RESTORED` and skips it
+        along with all three offsets — upstream's own comment says so. Replay:
+        `replayDecodedXLogBtreeSplit` (upstream's block order, per-limb pd_lsn
+        idempotency); a block 0 with no image is a real-PG record and returns an
+        explicit "not implemented" rather than leaving the left half pre-split.
+        Guards: `internal/wal/btree_split_pg_test.go` (shape incl. the "block 1
+        is not an image" assertion, the rightmost no-block-2 variant, three
+        right-opaque mutations each rejected by name, a replay reproduction at
+        matching OFFSETS + same-LSN idempotency). Obsolete
+        `TestEncodeBtreeSplitPGFPIReplay` deleted (pinned the removed property).
+        Gates: btree/wal/storage/amcheck/initdb + units PASS; pgbench smoke PASS
+        (commit hook). 2 ledger rows.
+  - [ ] **S11.5b-2 — the split record's INCREMENTAL left half**. Replace block
+        0's full-page image with upstream's block-0 data (the new item when it
+        lands on the left, then the page's new high key) so a split record is
+        small rather than page-sized. BLOCKED on goopg's split not being
+        upstream's: `splitPage` reads the page out, appends the new item, runs
+        `dedupConsolidate` over the merged list and refills BOTH halves, so the
+        left half can hold posting tuples that were never on the original page —
+        which is not what `firstrightoff`/`newitemoff` can describe. Upstream
+        reaches the same state with two records (XLOG_BTREE_DEDUP, then a
+        split). Needs either the split point threaded to the encoder plus a
+        proof the dedup pass was a no-op, or the dedup unbundled into its own
+        record. Ledger 2026-08-10.
+  - [ ] **S11.5b-3 — block 3 on an INTERNAL split**. Upstream registers the
+        child buffer whose incomplete-split flag the split completes, and
+        `btree_xlog_split` calls `_bt_clear_incomplete_split(record, 3)` for
+        every `level > 0` record. `XLogReadBufferForRedo` PANICs on an
+        unregistered block id (the same trap S11.5a hit at block 1), so a real
+        PG standby still cannot replay a goopg internal split. goopg clears the
+        flag in a separate step (`clearIncompleteSplit`) and has no child block
+        at the emit site. Ledger 2026-08-10.
   - [ ] **S11.5c — `XLOG_BTREE_VACUUM`**. `xl_btree_vacuum{ndeleted, nupdated}`
         plus the deleted/updated offset arrays.
   - [ ] **S11.5d — `XLOG_BTREE_UNLINK_PAGE`**. The one with a documented reason
