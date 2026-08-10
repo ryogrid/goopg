@@ -2562,6 +2562,36 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       decodes ANY array as its scalar element type (pre-existing), and
       `interval[]` index-key elements are still refused by
       `decodeArrayKeyElemText`.
+      **Slice landed 2026-08-11 (22nd) — `arr[i]` yields the ELEMENT TYPE's
+      Datum, not text** (design
+      `docs/design/0119-0006-array-subscript-element-typing.md`). Closes the
+      subscript row the 21st slice opened: the storage flip did not move
+      `c[1] = c[2]` over `ARRAY['1 mon','30 days']::interval[]`, because the
+      subscript evaluator decoded the array to TEXT and returned a
+      `KindString`, so `compareDatum` never reached its `interval_cmp_value` /
+      numeric ladders (upstream `ExecEvalSubscriptingRef` returns a Datum OF
+      the element type). One wrong-shape Datum, four wrong answers vs the
+      oracle — `interval[]` equality, `numeric[]` equality (`'1.50' = '1.5'`),
+      `numeric[]` ordering (`'10' > '9'`) and `float8[]` ordering (`9.5 > 10.2`
+      answered `t`) — plus `a[1] + a[3]` over an `int4[]` column failing
+      ANALYSIS with 42804. Three sites shared one blind spot (a user array
+      column is `catalog.Type{Name:<ELEM>, IsArray:true}`, never `elem[]` and
+      never `_elem`): the analyzer's `ArraySubscriptExpr` arm, the planner's
+      `exprType` arm, and the executor via a new `FuncCall.ReturnType` stamp in
+      `resolveExpr`. The fourth site is the one with reach beyond arrays: five
+      `case *FuncCall:` clone-with-rewritten-children helpers (`FoldConstants`,
+      `remapColumnRefsToSchema`, `shiftColumnRefsBy`, `shiftExprColumnIdx`,
+      `unnest.go`'s local `rewriteIdx`) rebuild the node field by field and
+      never listed `ReturnType`, so a USER-DEFINED function call that survived
+      constant folding or a column remap was silently re-typed as unknown too.
+      Gates: 21 new end-to-end SQL assertions all captured from the PG 18.3
+      reference cluster (a `compareDatum` unit test would have passed
+      throughout — which is how this survived the storage slice) + a guard test
+      for the shapes that already worked, units, tpch-spotcheck (Q12=2/Q13=35),
+      `TestPort_RegressSuite`. 3 ledger rows: date/time element types still
+      text on purpose, the `ReturnType` stamp drops the element typmod, and
+      array SLICES (`a[1:2]`) are rejected by the LEXER — unimplemented one
+      layer below this slice.
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.

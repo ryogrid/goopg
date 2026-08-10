@@ -2227,7 +2227,7 @@ func shiftExprColumnIdx(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftExprColumnIdx(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType}
 	case *CastExpr:
 		cl := *x
 		cl.Operand = shiftExprColumnIdx(x.Operand, delta)
@@ -3710,7 +3710,7 @@ func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, inne
 			for i, a := range x.Args {
 				args[i] = rewriteIdx(a)
 			}
-			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType}
 		default:
 			return e
 		}

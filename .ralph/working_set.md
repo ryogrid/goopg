@@ -1,47 +1,48 @@
 (idle — nothing in flight)
 
-Last loop: M0119-0006 **21st slice landed** — the ARRAY ELEMENT images for
-`interval[]` / `uuid[]` / `numeric[]`. One slice closed all three ledger rows
-the interval/uuid/numeric COLUMN slices had each left behind.
+Last loop: M0119-0006 **22nd slice landed** — `arr[i]` now yields the ELEMENT
+TYPE's Datum instead of text. Resumed uncommitted WIP found in the tree (the
+baton said "none" — the previous loop was cut off after committing 46103e4e and
+before rewriting this file; the WIP still had debug `println`s in it).
 
 Findings worth carrying:
 
-- The defect was not "elements are text" but a blob-vs-catalog disagreement:
-  `arrayElemTypeInfo` had no arm for the three, so they took the *unknown
-  element type* fallback, which stamps `elemtype = 25 (text)` in the ArrayType
-  header while `pg_attribute.atttypid` (a different, always-correct mapping in
-  `pg18_user_catalog_rows.go`) said `_interval`/`_uuid`/`_numeric`.
-- That same header field made the legacy read trivial — no byte analysis like
-  the scalar numeric slice needed. The blob STATES its element type, and
-  elemtype 25 under one of these columns can only be the pre-flip encoder.
-- `pg_column_size` on the reference PG (port 65432, `PGPASSWORD=postgres`) is a
-  cheap exact oracle for on-disk element layout: 56/56/44 for a 2-element
-  interval/uuid/numeric array pinned align 8 / 1 / 4 without pageinspect
-  (which is NOT available on that cluster).
-- A round-trip test cannot catch this class — a self-consistent encoder/decoder
-  pair round-trips text elements just as happily. `TestArrayCodecPGTypeOnDiskLayout`
-  asserts the blob length + elemtype directly against PG's `pg_column_size`.
+- The blind spot was ONE fact repeated at three sites: a user array column is
+  `catalog.Type{Name:<ELEMENT>, IsArray:true}` — never `elem[]`, never `_elem`.
+  Analyzer `analyzeExpr`, planner `exprType`, and (via a new `ReturnType` stamp)
+  the executor all probed only for the spellings they never get.
+- The expensive half was the FOURTH site: five `case *FuncCall:` clone helpers
+  (`FoldConstants`, `remapColumnRefsToSchema`, `shiftColumnRefsBy`,
+  `shiftExprColumnIdx`, `unnest.go`'s `rewriteIdx`) rebuild the node field by
+  field and dropped `ReturnType`. Symptom was "stamp applied, executor sees
+  empty" while `pg_typeof` was correct. This also silently un-typed USER-DEFINED
+  function calls that survived folding/remap — worth remembering for any future
+  plan-time stamp: check every clone site, not just the setter.
+- `float8[]` was a wrong answer nobody had filed (`9.5 > 10.2` → `t`). goopg has
+  no `KindFloat`; a float8 COLUMN is already `KindNumeric`, so the float arm
+  makes the subscript agree with its own scalar column.
+- Probe technique that paid off: a throwaway `internal/executor/zz_probe_test.go`
+  on `newDDLFixture`/`runQuery` gives full SQL end-to-end in ~10 ms; the PG
+  oracle on 65432 (`PGPASSWORD=postgres`) answers the same query set in one psql
+  call.
 
 Banner state (re-read this loop): M-NIGHTLY's six `20260810-011258` items all
 filed AND checked; M0130 fully checked; banner falls through to M0119, then
 M0122.
 
-Next loop: continue M0119-0006. Highest-value candidates, all fresh ledger
-rows from this slice: array SUBSCRIPT still yields `KindString` so
-`c[1] = c[2]` over `{'1 mon','30 days'}` is `f` vs PG's `t` (expression
-evaluator, not codec); `internal/wal/pgoutput.go` ignores `t.IsArray` so
-logical replication decodes ANY array as its scalar element type;
-`interval[]` index-key elements refused by `decodeArrayKeyElemText`. Older:
-posting-list duplicate coverage in the checkunique tier, `box`/`int4range`
-key encodings, the whole-database (unscoped) pg_amcheck run.
+Next loop: continue M0119-0006. Fresh candidates: date/time array elements
+(needs `KindTime` rendering proven byte-identical to `decodeArrayElem` first),
+array SLICES `a[1:2]` (rejected by the LEXER — parser slice), the `ReturnType`
+typmod widening. Older: `internal/wal/pgoutput.go` ignores `t.IsArray`;
+`interval[]` refused by `decodeArrayKeyElemText`; posting-list duplicate
+coverage in the checkunique tier; `box`/`int4range` key encodings; the
+whole-database (unscoped) pg_amcheck run.
 
-Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
-`go test -run TestPort_RegressSuite ./internal/testport/` PASS (257s, the
-Rule-#5 codec gate); live throwaway server on 5533 reproduced all three PG
-renderings end to end; pre-commit pgbench smoke PASS. The TPC-DS SF0.5 sweep
-was NOT run: the change is reachable only from `IsArray` columns and TPC-DS
-has none, so the sweep would exercise zero changed lines — arrays are covered
-by the regress port suite instead.
+Gates: units PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
+`TestPort_RegressSuite` PASS (315s — first attempt died at the 600s package
+timeout while the nightly ci/batch was saturating the host; the re-run was
+clean, so load flake, not a regression). TPC-DS SF0.5 sweep NOT run: the script
+hard-refuses while ci/batch is live, and the changed lines are array-subscript
+and `ReturnType`-carry only — TPC-DS has no array columns and no UDFs.
 
 In-flight: none

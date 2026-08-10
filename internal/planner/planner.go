@@ -10701,6 +10701,16 @@ func exprType(e Expr) catalog.Type {
 				if strings.HasPrefix(arrT.Name, "_") {
 					return catalog.Type{Name: arrT.Name[1:]}
 				}
+				// A user array column is catalog.Type{Name:<ELEMENT>, IsArray:true}
+				// (not "_elem"), so the underscore probe above never saw it and
+				// `c[1]` over an `interval[]` column reported text — which is what
+				// made the subscript's Datum text too. M0119-0006.
+				if arrT.IsArray && arrT.Name != "" {
+					return catalog.Type{Name: arrT.Name, Args: append([]int64(nil), arrT.Args...)}
+				}
+				if strings.HasSuffix(arrT.Name, "[]") {
+					return catalog.Type{Name: arrT.Name[:len(arrT.Name)-2]}
+				}
 				// point[i] (0-based) yields the i-th coordinate as float8.
 				if strings.EqualFold(arrT.Name, "point") {
 					return catalog.Type{Name: "float8"}
@@ -11665,7 +11675,19 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &FuncCall{pos: x.Pos(), Name: "array_subscript", Args: []Expr{base, idx}}, nil
+		sub := &FuncCall{pos: x.Pos(), Name: "array_subscript", Args: []Expr{base, idx}}
+		// Stamp the element type the exprType arm already computes. The executor
+		// cannot call exprType (planner-internal) and was inferring the element's
+		// Datum kind from the element TEXT alone, so every element whose kind is
+		// neither int nor text came back KindString and compared lexicographically
+		// — `c[1] = c[2]` over ARRAY['1 mon','30 days']::interval[] answered f
+		// where PG answers t. ReturnType is exprType's own override arm, so
+		// stamping the value it would have returned leaves inference unchanged.
+		// M0119-0006.
+		if et := exprType(sub); et.Name != "" {
+			sub.ReturnType = et.Name
+		}
+		return sub, nil
 	case *parser.ArrayConstructorExpr:
 		// ARRAY[e1, e2, ...] constructor — resolve each element and convert to
 		// array_construct so the executor formats the result as {v1,v2,...}. M0097-0042.
@@ -12209,7 +12231,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, a := range x.Args {
 			args[i] = remapColumnRefsToSchema(a, oldSchema, newIndex)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
 	case *InExpr:
 		list := make([]Expr, len(x.List))
 		for i, item := range x.List {
@@ -12426,7 +12448,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
 	case *InExpr:
 		// Mirror walkColumnRefs' InExpr handling so this rewriter stays in
 		// sync with the side-classifier (classifyConjunctSide). A literal-list

@@ -70,7 +70,10 @@ func FoldConstants(e Expr) Expr {
 		for i, a := range x.Args {
 			foldedArgs[i] = FoldConstants(a)
 		}
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic}
+		// ReturnType is a plan-time type stamp (user-defined functions, and the
+		// array_subscript element type resolveExpr computes) — a clone that drops
+		// it silently re-types the node as unknown downstream. M0119-0006.
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
 
 	// ── Non-foldable: return unchanged ─────────────────────────────────
 	default:

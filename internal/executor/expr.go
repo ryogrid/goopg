@@ -2324,6 +2324,49 @@ func hasISODatePrefix(s string) bool {
 	return len(s) >= 10 && s[4] == '-' && s[7] == '-'
 }
 
+// arraySubscriptElemDatum re-types one array element's already-unquoted text as
+// the element type's own Datum, reporting false when the type has no kind of its
+// own here (text-likes, uuid, the fixed-width integers the caller's own fast path
+// already covers) or when the text does not parse.
+//
+// Scope note (M0119-0006): only the element types whose Datum kind changes the
+// ANSWER are routed. Upstream types every subscript through the element type's
+// input function, but goopg's KindTime rendering is not yet byte-identical to
+// the array codec's element spelling, so routing date/time/timestamp here would
+// trade a comparison fix for a rendering regression — recorded in the deferral
+// ledger rather than guessed at. Falling through leaves the pre-existing text
+// behaviour, which is already correct for ISO date/timestamp comparisons because
+// their spelling sorts the same way their values do.
+func arraySubscriptElemDatum(elemType, elem string) (Datum, bool) {
+	switch strings.ToLower(elemType) {
+	case "interval":
+		// Same tokenizer as interval_in and the storage-encode arm, so the
+		// element re-renders through formatInterval exactly as the array codec
+		// spelled it.
+		if months, days, micros, ok := parser.ParseIntervalBody(elem); ok {
+			return NewIntervalDatumFull(months, days, micros), true
+		}
+	case "numeric", "decimal", "float8", "float4", "double precision", "real":
+		// Numeric equality is value-based, so '1.50' = '1.5'; as text they differ.
+		// The scale survives the round trip, so `n[1]` still prints 1.50.
+		//
+		// The float types land here too, because goopg has no KindFloat: a
+		// float8 COLUMN already decodes to KindNumeric and renders through the
+		// same path, so routing float elements here makes the subscript agree
+		// with its own scalar column. Without it `f[1] > f[2]` over
+		// ARRAY[9.5,10.2]::float8[] answered t (text: "9.5" > "10.2") where PG
+		// answers f. A spelling parseNumeric cannot take (scientific notation)
+		// falls through to the pre-existing text behaviour rather than guessing.
+		if v, scale, ok := parseNumericFast(elem); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, true
+		}
+		if m, sc, err := parseNumeric(elem); err == nil {
+			return newNumeric(m, int(sc)), true
+		}
+	}
+	return NullDatum, false
+}
+
 func tryParseStringAs(target DatumKind, s string) Datum {
 	switch target {
 	case KindInt:
@@ -8500,6 +8543,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			elem := elems[n-1]
+			// The planner stamped the element type onto ReturnType (its exprType
+			// array_subscript arm). Re-type the element text through that type's
+			// own input path so the subscript yields the element type's Datum
+			// kind instead of text — otherwise compareDatum never reaches the
+			// interval_cmp_value / numeric ladders and `c[1] = c[2]` compares the
+			// two element SPELLINGS. M0119-0006.
+			if d, ok := arraySubscriptElemDatum(x.ReturnType, elem); ok {
+				return d, nil
+			}
 			// Try to infer element type: if the element looks like a plain integer
 			// (no decimal point, no quotes), return an integer datum for correct
 			// psql alignment and comparison semantics. Matches PG's behaviour where

@@ -1515,6 +1515,20 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if strings.HasSuffix(baseTyp.Name, "[]") {
 			return catalog.Type{Name: baseTyp.Name[:len(baseTyp.Name)-2]}, nil
 		}
+		// A user array COLUMN is catalog.Type{Name:<ELEMENT>, IsArray:true} —
+		// the element name with a flag, never "elem[]" or "_elem" — so neither
+		// the suffix probe above nor the catalog's "_elem" spelling saw it and
+		// every such subscript typed as text. That made `a[1] + a[3]` over an
+		// int4[] column a 42804 ("operator + requires numeric operands") at
+		// analysis time, before the executor could evaluate anything. Sibling
+		// of planner exprType's array_subscript arm — the two must agree.
+		// M0119-0006.
+		if baseTyp.IsArray && baseTyp.Name != "" {
+			return catalog.Type{Name: baseTyp.Name, Args: append([]int64(nil), baseTyp.Args...)}, nil
+		}
+		if strings.HasPrefix(baseTyp.Name, "_") && len(baseTyp.Name) > 1 {
+			return catalog.Type{Name: baseTyp.Name[1:]}, nil
+		}
 		// Unknown base type → return unknown so arithmetic proceeds.
 		if baseTyp.Name == "" || strings.EqualFold(baseTyp.Name, "unknown") {
 			return catalog.Type{Name: "unknown"}, nil
