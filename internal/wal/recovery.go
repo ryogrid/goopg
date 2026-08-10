@@ -3941,8 +3941,15 @@ func replayBtreeUnlinkPage(mgr *storage.Manager, r Record) error {
 		return fmt.Errorf("wal: btree-unlink leaf: %w", err)
 	}
 	if p.HasParent {
+		// M0130-S11.5d-3a: locate the downlink by CHILD BLOCK, ignoring the
+		// record's ParentRemoveSlot, and apply upstream's retarget-and-delete
+		// — the same `ReplayParentRetargetByChild` the primary runs. The slot
+		// index in the record was always advisory (the primary re-located the
+		// downlink by identity before writing, M0122-0010), which is precisely
+		// what a PG-shaped record may not carry; trusting it here would also
+		// let redo delete an unrelated live child's downlink.
 		if err := apply(p.ParentBlk, func(page storage.Page) error {
-			return btree.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
+			return btree.ReplayParentRetargetByChild(page, p.LeafBlk)
 		}); err != nil {
 			return fmt.Errorf("wal: btree-unlink parent: %w", err)
 		}

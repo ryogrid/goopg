@@ -1681,17 +1681,60 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         pd_lsn-idempotent with an FPI fallback. Guards:
         `internal/wal/btree_unlinkpage_pg_test.go` (+4),
         `internal/access/btree/replay_pagedel_test.go` (+3).
-  - [ ] **S11.5d-3 — rewire the page-deletion emit sites**. `unlinkEmptyLeaf` /
-        `unlinkEmptyInternalPage` emit ONE native record covering both phases,
-        BEFORE applying, and then deliberately re-derive each sibling link under
-        the write pin (the AI-20260709-010336-082 corruption fix) because a
-        split on another connection's `*BTree` can splice a page in. That makes
-        the record's link values advisory, which no PG-shaped record may be.
-        Move to upstream's protocol — pin left/target/right, compute, emit,
-        write — and adopt the retarget-and-delete parent mutation at the same
-        time. This is the real content of the historical "documented reason to
-        stay native" (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
-        A8-unlinkpage).
+  - [x] **S11.5d-3a — the primary adopts the retarget-and-delete parent
+        mutation** (2026-08-10). The half S11.5d-1 filed as a ledger row: goopg's
+        primary deleted the target's downlink outright, absorbing the deleted key
+        range LEFTWARD, where upstream retargets that item at the RIGHT
+        neighbour's child and deletes the neighbour's item. Same input, different
+        parent page — so no PG-shaped mark-halfdead record could be emitted.
+        Three call sites did the old mutation (`applyParentDownlinkRemoval`, the
+        FPI-path `removeDownlinkFromParent`, and redo's parent limb); all three
+        now route through ONE shared `ReplayParentRetargetByChild`, which is the
+        point rather than tidying — the tree a vacuum produces must not depend on
+        whether a WAL emitter happened to be wired, and this is a sibling set
+        that must not be able to drift. The lookup is by CHILD BLOCK identity;
+        redo now ignores the record's `ParentRemoveSlot` entirely, since that
+        value was always advisory (the primary re-located by identity from
+        M0122-0010 on) and an advisory field is exactly what a PG-shaped record
+        may not carry. With it comes upstream's one structural refusal
+        (`ErrParentRightmostChild`, `_bt_lock_subtree_parent`): a page whose
+        downlink is its parent's LAST item cannot be deleted, tested BEFORE any
+        mutation and before the emitter branch so WAL and FPI refuse identically
+        and no half-relinked page is ever left behind; on the leaf path the
+        refusal reverts VACUUM's phase-1 marking (`abandonHalfDeadLeaf`), because
+        a leaf left flagged while its parent still points at it is invisible to
+        `liveSibling` and eligible for `recycleBlock` — a block handed to an
+        unrelated split while still reachable. The refusal RETIRES a mechanism:
+        an internal page can no longer reach zero items through a downlink
+        removal at all (its last item IS its rightmost child), so
+        AI-20260706-201855-001's "empty non-root internal page" is structurally
+        unreachable rather than repaired after the fact by
+        `maybeCascadeEmptyInternal`, and that regression test now asserts the
+        stronger invariant directly. Guards:
+        `internal/access/btree/parent_retarget_test.go` (+4, incl. an end-to-end
+        VacuumIndexPages run proving the parent's last child is left
+        empty-but-live, unflagged, still downlinked, tree readable and writable).
+        Gates: btree/amcheck/wal/storage/initdb PASS; units PASS; btree -race
+        PASS; pgbench smoke PASS (commit hook). 2 ledger rows.
+  - [ ] **S11.5d-3b — rewire the page-deletion emit PROTOCOL**. The mutation is
+        done (S11.5d-3a); the protocol is not. `unlinkEmptyLeaf` /
+        `unlinkEmptyInternalPage` still emit ONE native record covering both
+        phases, BEFORE applying, and then deliberately re-derive each SIBLING
+        link under the write pin (the AI-20260709-010336-082 corruption fix)
+        because a split on another connection's `*BTree` can splice a page in.
+        That makes the record's link values advisory, which no PG-shaped record
+        may be. Move to upstream's protocol — pin left/target/right, compute,
+        emit, write — then emit `EncodeBtreeMarkPageHalfDeadPG` +
+        `EncodeBtreeUnlinkPagePG` in place of the native record, and write the
+        dummy top-parent high key when marking a leaf half-dead. This is the real
+        content of the historical "documented reason to stay native"
+        (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md` A8-unlinkpage).
+  - [ ] **S11.5d-3c — the safexid recycle horizon**. goopg has no
+        `BTPageIsRecyclable`: it stamps `BTDeleted` and recycles the block with
+        no XID horizon, so `BTDeletedPageData` has encode+replay coverage
+        (S11.5d-2) and no runtime producer. Stamp the safexid via
+        `btree.ReplayUnlinkTargetPage` on the primary and gate `recycleBlock` on
+        the horizon. Ledger 2026-08-10 (S11.5d-2 row, item 2).
 - [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
       `relhasindex` in `buildUserPGClassRow`
       (`internal/executor/pg18_user_catalog_rows.go`), re-run

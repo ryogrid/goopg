@@ -574,6 +574,74 @@ and proves the sibling helpers are flag-lossless — including a case that
 documents the legacy helper *is* the lossy one, so a later loop cannot fold them
 back together.
 
+## S11.5d-3a — the primary adopts the retarget-and-delete parent mutation
+
+S11.5d-1 landed `ReplayHalfDeadParent` and recorded, as a ledger row, that goopg
+could not yet *emit* a record shaped for it: the primary removed the deleted
+page's downlink outright, which absorbs the key range **leftward**, while
+upstream retargets that item at the right neighbour's child and deletes the
+neighbour's item, absorbing **rightward**. Both are self-consistent for an empty
+page, but they produce different parent pages from the same input — so a record
+shaped for upstream's redo cannot be produced by a primary doing goopg's
+mutation. This slice closes that half. It is the first of S11.5d-3; the emit-site
+protocol change (pin left/target/right, compute, emit, write) is the rest.
+
+Three call sites performed the old mutation — `applyParentDownlinkRemoval` (the
+WAL path), `removeDownlinkFromParent` (the FPI fallback), and the parent limb of
+`replayBtreeUnlinkPage` (redo). All three now route through one shared function,
+`ReplayParentRetargetByChild`, and that sharing is the point rather than a
+tidying: this is a sibling set that must not be able to drift, and the tree a
+vacuum produces must not depend on whether a WAL emitter happened to be wired.
+
+The lookup is by **child block identity**, not by an offset the caller captured
+earlier. On the primary that was already true and for a reason (M0122-0010: a
+split on another connection's `*BTree` can splice a downlink in ahead of the
+target and shift every later index right, so removing by trusted index would
+delete an unrelated live child). Redo now does the same and ignores the native
+record's `ParentRemoveSlot` field entirely — the value was advisory, which is
+precisely what a PG-shaped record may not carry, and trusting it in redo gave
+the standby a way to diverge that the primary had already closed.
+
+### The refusal, and what it buys
+
+Upstream's retarget needs a right neighbour, so `_bt_lock_subtree_parent`
+refuses to delete a page whose downlink is its parent's **rightmost** item
+("unless it is the only child --- in which case the parent has to be deleted
+too") and abandons the deletion, leaving the empty page linked in the tree.
+goopg now refuses identically, via `ErrParentRightmostChild`. Both entry points
+test for it **before any mutation and before the emitter branch**, so the
+refusal can never leave a half-relinked page behind and the WAL and FPI paths
+refuse the same cases. On the leaf path the refusal also reverts
+`VacuumIndexPages`' phase-1 marking (`abandonHalfDeadLeaf`): a leaf left flagged
+`BTHalfDead|BTDeleted` while its parent still points at it is invisible to
+`liveSibling` and eligible for `recycleBlock`, i.e. a block handed to an
+unrelated split while still reachable.
+
+The refusal has a consequence worth stating on its own, because it retires a
+mechanism rather than adding one. **An internal page can no longer reach zero
+items through a downlink removal at all** — its last item is by definition its
+rightmost child, so the removal that would empty it is exactly the one that is
+refused. The "empty non-root internal page" hazard of AI-20260706-201855-001,
+which `maybeCascadeEmptyInternal` was written to repair after the fact, is now
+structurally unreachable from this path. The cascade stays in place (it still
+handles trees already on disk in that state) but it is no longer the thing
+standing between goopg and `findChildBlockDirect`'s `count == 0` guard.
+
+### Guards — S11.5d-3a
+
+`internal/access/btree/parent_retarget_test.go`: the retarget located by
+identity on both page shapes (P_FIRSTDATAKEY 2 and 1 — the conversion an
+offset-carrying record got wrong), the rightmost-child refusal *and* that it
+leaves the page unmutated, the missing-downlink no-op redo's idempotency
+depends on, and that `PGFindDownlinkOffset` returns a PHYSICAL offset rather
+than a data-slot index. Plus one end-to-end run through the real
+`VacuumIndexPages`: emptying the parent's last child leaves the leaf empty but
+live, unflagged, still downlinked, with the tree readable and writable
+afterwards. `btree_vacuum_internal_cascade_test.go` (the
+AI-20260706-201855-001 regression test) now asserts the stronger invariant
+directly — no live internal page anywhere in the index holds zero items —
+instead of asserting the cascade that used to restore it.
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -590,18 +658,22 @@ back together.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **Rewiring the emit sites (S11.5d-3)** — `unlinkEmptyLeaf` /
-  `unlinkEmptyInternalPage` emit one native record covering the union of both
-  phases, and they emit it **before** applying, then deliberately re-derive each
-  sibling link under the write pin (the AI-20260709-010336-082 fix) because a
-  split on another connection's `*BTree` can splice a page in between. That
+- **Rewiring the emit sites (S11.5d-3b)** — the parent mutation is done
+  (S11.5d-3a above); the *protocol* is not. `unlinkEmptyLeaf` /
+  `unlinkEmptyInternalPage` still emit one native record covering the union of
+  both phases, and they emit it **before** applying, then deliberately re-derive
+  each SIBLING link under the write pin (the AI-20260709-010336-082 fix) because
+  a split on another connection's `*BTree` can splice a page in between. That
   makes the record's own link values advisory, which no PG-shaped record may be.
   Upstream avoids it by holding all three page locks across the insert; goopg
   must move to the same protocol (pin left/target/right, compute, emit, write)
-  and adopt upstream's retarget-and-delete parent mutation at the same time.
-  This is the "documented reason to stay native"
+  before it can emit the two PG records in place of the native one. This is the
+  "documented reason to stay native"
   (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage) restated in
   terms of what actually blocks it.
+- **The safexid horizon (S11.5d-3c)** — goopg has no `BTPageIsRecyclable`: it
+  stamps `BTDeleted` and recycles the block immediately, with no XID horizon, so
+  `BTDeletedPageData` has encode and replay coverage but no runtime producer.
 
 Until those land, `relhasindex` stays false in `buildUserPGClassRow`
 (S11.6): a PG standby that saw goopg's indexes would try to replay these

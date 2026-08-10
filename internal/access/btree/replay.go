@@ -6,6 +6,7 @@ package btree
 // paths.
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -235,6 +236,71 @@ func ReplayHalfDeadParent(page storage.Page, poffset uint16) error {
 		}
 	}
 	return nil
+}
+
+// ErrParentRightmostChild reports upstream's one structural refusal in page
+// deletion: a page whose downlink is its parent's LAST item cannot be deleted,
+// because the retarget mutation has no right neighbour to absorb the key range
+// (`_bt_lock_subtree_parent`, nbtpage.c: "Cannot delete a page that is the
+// rightmost child of its immediate parent, unless it is the only child --- in
+// which case the parent has to be deleted too"). Upstream abandons the deletion
+// and leaves the empty page in the tree; so does goopg. M0130-S11.5d-3a.
+var ErrParentRightmostChild = errors.New("btree: downlink is the parent's rightmost child")
+
+// PGFindDownlinkOffset locates the PHYSICAL OffsetNumber of the item on an
+// internal page whose downlink references childBlk, and reports whether that
+// item is the page's last one. M0130-S11.5d-3a.
+//
+// Physical, not data-slot: this is the coordinate `poffset` that
+// XLOG_BTREE_MARK_PAGE_HALFDEAD carries and ReplayHalfDeadParent consumes, and
+// the two differ by whether the page has a high key.
+//
+// The lookup is by block IDENTITY rather than by a previously captured index,
+// on both the primary and in redo, for the reason M0122-0010 documented: a
+// concurrent split on another connection's *BTree can insert a downlink ahead
+// of the target and shift every later index right, so an index captured before
+// the mutation is advisory — which no PG-shaped record may be.
+func PGFindDownlinkOffset(page storage.Page, childBlk storage.BlockNumber) (poffset uint16, isLast bool, ok bool, err error) {
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return 0, false, false, fmt.Errorf("btree: find downlink offset: %w", err)
+	}
+	first := PGFirstDataKey(ReadPGOpaque(page))
+	for slot := first; int(slot) <= count; slot++ {
+		raw, rerr := storage.PageGetItemRaw(page, slot)
+		if rerr != nil {
+			return 0, false, false, fmt.Errorf("btree: find downlink offset slot %d: %w", slot, rerr)
+		}
+		if BTreeTupleGetDownLink(raw) == childBlk {
+			return slot, int(slot) == count, true, nil
+		}
+	}
+	return 0, false, false, nil
+}
+
+// ReplayParentRetargetByChild is the parent limb of page deletion as BOTH the
+// primary and redo perform it: find childBlk's downlink by identity and apply
+// upstream's retarget-and-delete (ReplayHalfDeadParent). M0130-S11.5d-3a.
+//
+// A missing downlink is a no-op, not an error — that is the already-applied
+// case, which redo reaches through a replayed record and the primary reaches
+// through a racing unlink of the same child.
+//
+// Returns ErrParentRightmostChild when the downlink is the parent's last item.
+// The primary tests for this BEFORE it emits anything and abandons the deletion;
+// redo can only see it from a record no current primary would write.
+func ReplayParentRetargetByChild(page storage.Page, childBlk storage.BlockNumber) error {
+	poffset, isLast, ok, err := PGFindDownlinkOffset(page, childBlk)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if isLast {
+		return ErrParentRightmostChild
+	}
+	return ReplayHalfDeadParent(page, poffset)
 }
 
 // ApplyInsertRecordAt re-runs one B-tree non-split insert against the given
