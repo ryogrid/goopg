@@ -2592,6 +2592,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       text on purpose, the `ReturnType` stamp drops the element typmod, and
       array SLICES (`a[1:2]`) are rejected by the LEXER — unimplemented one
       layer below this slice.
+      **Slice landed 2026-08-11 — pgoutput decodes array columns:**
+      `internal/wal/pgoutput.go` switched on `catalog.Type.Name` alone, and a
+      goopg array column is `Type{Name:<ELEMENT>, IsArray:true}`, so under
+      logical replication EVERY array column was decoded as its scalar element
+      type — an `int4[]` shipped `128` (the ArrayType header's `len<<2`), a
+      `uuid[]` shipped `e0000000-0100-…`, an `interval[]` shipped
+      `98 years 11 mons 01:11:34.96752`. Worse than a wrong value: the byte
+      count is wrong too, so every FOLLOWING column decoded from the middle of
+      the array body (gated — the trailing `int4` came back `1`, not `42`).
+      `pgoPhysicalAlign` had the mirror bug (an `interval[]` aligned to the
+      ELEMENT's `'d'`, where an ArrayType is a varlena at `'i'`), and the `R`
+      message advertised the ELEMENT's OID (23, not `_int4` 1007). Because
+      `internal/wal` cannot import `internal/executor` — which is WHY the
+      support was missing — the renderer moved down to a new leaf package
+      `internal/pgarray` (`ElemTypeInfo`/`RenderText`/`DecodeElem`/
+      `QuoteTextElem`) that the executor now delegates to, so the tree holds
+      ONE element table. Gates: `TestPgoDecodeArrayColumns` (5 element types,
+      expected texts from the PG 18.3 oracle on 65432),
+      `TestPgoPhysicalAlignArrayIsVarlenaAlign`,
+      `TestEncodePgoTuplePhysicalArrayDoesNotShiftFollowingColumn`,
+      `TestPgOutputRelationAdvertisesArrayTypeOID` — all four non-vacuous.
+      Design: `docs/design/0119-0006-pgoutput-array-columns.md`. 3 ledger rows:
+      no subscriber round-trip E2E, TOASTed arrays still refused,
+      multi-dimensional / NULL-element arrays unhandled.
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
