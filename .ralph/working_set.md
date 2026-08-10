@@ -1,51 +1,50 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-b-ii (the redo path's descriptor) — DONE,
-committed + pushed. **All B2-c prerequisites are now closed; B2-c (the flip,
-REINDEX-required) is the next slice.**
+Task: M0130-S11.4 slice 3b-2c-ii-B2-c-i (the prefix upper bound) — DONE,
+committed + pushed. Next is the flip itself (B2-c, REINDEX-required).
 
-Landed (no on-disk PAGE change; `pgIndexTupleKeys` still false — but the native
-WAL record format DID change):
-- `btree.ApplyInsertRecordAt(page, raw, offnum)` replaces
-  `(IndexFormat).ApplyInsertRecord`: one `PageInsertItemRawAt` at the recorded
-  PHYSICAL offset, upstream `btree_xlog_insert`. No parse, no comparison ⇒ no
-  format in redo.
-- Offset emitted for real: `storage.LogBtreeInsertFunc` +offnum, the 3
-  btree.go emit sites use the new `pgPhysOffnum(page, lineIdx)`,
-  `EncodeBtreeInsertPG` stops hard-coding 0 (closes the A5 parity gap for a
-  real-PG standby). Native `btreeInsertHeaderSize` 14 → 16; `offnum == 0`
-  (pre-slice record) is a hard error — **a pre-slice WAL stream is not
-  replayable; re-initdb**.
-- `ReplayRemoveParentDownlink` is format-free (free function again): survivors
-  re-added verbatim, `len(raw) > SizeOfIndexTupleData` = "still has key attrs",
-  `BTreeTupleGetDownLink` = child, `PGBTPivotRaw(nil, child)` for the demoted
-  leftmost.
-- `internal/wal/recovery.go:redoBlobIndexFormat` DELETED.
+Landed (no on-disk change, `pgIndexTupleKeys` still false):
+- `indexFormat.compareHigh(entry, hi)` in
+  `internal/access/btree/pgkeycmp.go` + helper `truncatedPGIndexTuple`.
+  `rangeScanPos`' TWO `hi` tests (posting + normal branch) use it.
+- For `desc == nil` it IS `CompareKeys` byte for byte ⇒ blob behaviour
+  provably unmoved.
 
-Key facts for the next loop (do not re-derive):
-- Minus-infinity pivot bytes are IDENTICAL in blob and tuple format (no key
-  bytes to encode) — that identity is what makes the parent-downlink limb
-  format-free, and it is pinned by `TestMinusInfinityPivotIsFormatIndependent`.
-- `pgPhysOffnum` reading `btpo_next` AFTER the insert is safe: an insert never
-  touches the sibling link, so `P_FIRSTDATAKEY` is stable.
-- Guard file `internal/access/btree/replay_offnum_test.go` keeps the RETIRED
-  by-key body as `oldByKeyReplay` and asserts it DISAGREES with the writer on a
-  tuple-format page (int4 -1 = 0xffffffff sorts after +1 bytewise).
-- Still open (ledger rows): numeric/uuid heap images are TEXT varlenas so
-  `buildPGIndexKeyDesc` refuses them; `bt_child_highkey_check` unported;
-  upstream INSERT_POST/_META variants unemitted (S11.5).
+Why (do not re-derive): a range scan's two bounds are ASYMMETRIC once keys
+are tuples. A prefix search key is a pivot; `ComparePGIndexTuples` makes the
+SHORTER operand minus infinity. Right for the LOW bound (descent lands on
+the group's first member); wrong for the HIGH bound — `compare(entry,hi)>0`
+already holds for that first member, so `WHERE a=?` on a 2-col index returns
+ZERO rows. Blob format hid this by faking plus infinity with bytes
+(`appendCompositeUpperPadding`, 64×0xFF); a tuple cannot use that. Upstream
+never invents a maximal key either (`_bt_check_compare`, nbtutils.c).
 
-Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — the flip. `encodeCompositeBTreeKey`
-/ `encodeIndexKeyFromCols` / `encodeArbiterKey` → `pgIndexTupleKey` under
-`ctx.pgIndexKeyDesc(idx)` (search keys included), `pgIndexTupleKeys` on, explicit
-dual-format decision for indexes the resolver refuses. Gates: tpch-spotcheck +
-**the TPC-DS SF0.5 gate (mandatory for B2-c)**, re-pin after a REINDEX. Re-read
-the fix_plan banner first (M-NIGHTLY filing unconditional; all six
-`AI-20260810-011258-*` items already filed and left unchecked per the banner).
+Guard: `internal/access/btree/prefix_highbound_test.go` (4 tests).
+Mutation-checked: reverting `rangeScanPos` to `compare` → 30-row group
+becomes 0 rows.
+
+Still open (ledger row appended this loop):
+- `keyExceedsHighKey` still plain `compare` — correct ONLY until 3b-3 lands
+  `_bt_keep_natts` suffix truncation; then it needs the search key's own
+  keysz, like upstream `_bt_compare`.
+- `(*BTree).Search` has no bound sense (prefix point-lookup not expressible).
+- The six `appendCompositeUpperPadding` sites still emit 0xFF padding.
+
+Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP.
+`encodeCompositeBTreeKey` (operators_ddl.go:10785) / `encodeIndexKeyFromCols`
+(operators_storage.go:7148) / `encodeArbiterKey` (operators_upsert.go:1490)
+→ `pgIndexTupleKey` under `ctx.pgIndexKeyDesc(idx)`; ~20
+`encodeBTreeKeyForColumn` probe sites; the six `appendCompositeUpperPadding`
+sites → prefix PIVOT; `pgIndexTupleKeys = true`; explicit dual-format
+decision for indexes the resolver refuses. Consider decomposing further
+(writer-side vs probe-side funnel first, still blob). Gates:
+tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin after REINDEX.
+Re-read the fix_plan banner first (M-NIGHTLY filing unconditional; the six
+`AI-20260810-011258-*` items are filed and left unchecked per the banner).
 
 Gates run: `go build ./...` + `go vet` clean; `go test` PASS for
-./internal/access/btree ./internal/wal ./internal/storage ./internal/initdb
-./internal/executor; crash-recovery subset (`TestCrash*`, initdb) PASS;
+./internal/access/btree ./internal/wal ./internal/storage ./internal/amcheck;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35); commit-hook pgbench
-smoke PASS. NOT run: TPC-DS SF0.5 gate (no query-execution change this slice).
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35); commit-hook
+pgbench smoke PASS. NOT run: TPC-DS SF0.5 gate (no query-execution change —
+blob path is byte-identical).
 
 In-flight: none.

@@ -3649,7 +3649,11 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					if lo != nil && bt.format().compare(key, lo) < 0 {
 						continue
 					}
-					if hi != nil && bt.format().compare(key, hi) > 0 {
+					// compareHigh, not compare: a bound naming only a prefix of
+					// the key attributes is PLUS infinity beyond them (see
+					// pgkeycmp.go, slice 3b-2c-ii-B2-c-i). Identical to compare
+					// for the blob format.
+					if hi != nil && bt.format().compareHigh(key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}
@@ -3675,7 +3679,8 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					if lo != nil && bt.format().compare(it.key, lo) < 0 {
 						continue
 					}
-					if hi != nil && bt.format().compare(it.key, hi) > 0 {
+					// compareHigh: see the posting branch above.
+					if hi != nil && bt.format().compareHigh(it.key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}

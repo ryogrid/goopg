@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -714,12 +714,49 @@ sources agree:
             so bytewise order puts it after `+1` while the descriptor's
             comparator puts it before, which is exactly the silent
             standby-only divergence the slice removes.
+          - **3b-2c-ii-B2-c-i — the prefix upper bound (landed 2026-08-10).**
+            NO on-disk change, no REINDEX. A range scan's two bounds stop being
+            symmetric the moment keys are tuples, and nothing in the engine said
+            so. A search key naming only the first *k* key attributes (a
+            composite index probed on its leading column) is a pivot, and
+            `ComparePGIndexTuples` makes the shorter operand MINUS infinity
+            beyond the attributes it stores. For the LOW bound that is exactly
+            right — the descent lands on the first member of the prefix group.
+            For the HIGH bound it is exactly wrong: `compare(entry, hi) > 0`
+            holds for the group's very first member, so the scan would return
+            ZERO rows. The blob format never had to say this out loud because it
+            fakes plus infinity with bytes —
+            `appendCompositeUpperPadding` (internal/executor/operators_index.go)
+            appends 64 `0xFF` bytes so `bytes.Compare` orders the group below the
+            bound — and there is no tuple equivalent: `0xFF` bytes are a
+            malformed attribute image, not a large one. Upstream does not invent
+            a maximal key either; it carries the bound's strategy in the scan key
+            and stops when the compared ATTRIBUTES exceed it
+            (`_bt_check_compare`, nbtutils.c). So the sense of a truncated bound
+            became a property of the comparison, one per end of the range:
+            `indexFormat.compare` is the low end (and every other ordering
+            decision — descent, insert slot, split point), `indexFormat.
+            compareHigh` is the high end, and `rangeScanPos`' two `hi` tests use
+            it. For `desc == nil` `compareHigh` IS `CompareKeys`, byte for byte,
+            which is what let this land ahead of the flip. Guards:
+            `internal/access/btree/prefix_highbound_test.go` — blob-format
+            equivalence over six pairs, the asymmetry at comparison level (the
+            same pair reads `>0` under `compare` and `0` under `compareHigh`), a
+            full-attribute bound agreeing with `compare` including the heap-TID
+            tiebreak, and a 1200-entry two-column tree scanned across leaf-page
+            boundaries with a prefix pivot as BOTH bounds, asserting the group is
+            complete AND exclusive of the next one. Mutation-checked: reverting
+            `rangeScanPos` to `compare` turns the 30-row group into 0 rows.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
             `Context.pgIndexKeyDesc` the tree took, search keys included;
             `pgIndexTupleKeys` on; and the explicit dual-format decision for the
-            indexes the resolver refuses. Gates: `scripts/tpch-spotcheck.sh` and
+            indexes the resolver refuses. The six `appendCompositeUpperPadding`
+            call sites (operators_index.go, operators_indexonly.go,
+            operators_bitmap.go, operators_storage.go) must emit a prefix PIVOT
+            instead of 64 `0xFF` bytes under the tuple format — B2-c-i taught the
+            scan to read one. Gates: `scripts/tpch-spotcheck.sh` and
             the TPC-DS SF0.5 gate (re-pin after a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple

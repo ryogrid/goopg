@@ -1124,11 +1124,40 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               tree also grew 400→1200 keys: 400 int4 tuples fit on ONE leaf
               page, so it had no internal level and the cross-level tiers were
               never exercised.
+        - [x] **3b-2c-ii-B2-c-i — the prefix upper bound** (2026-08-10). NO
+              on-disk change, no REINDEX. A range scan's two bounds are not
+              symmetric once keys are tuples. A search key naming only the first
+              k key attributes is a pivot, and `ComparePGIndexTuples` makes the
+              shorter operand MINUS infinity beyond them — right for the LOW
+              bound (the descent lands on the group's first member), wrong for
+              the HIGH bound, where `compare(entry, hi) > 0` already holds for
+              that same first member and the scan returns ZERO rows. The blob
+              format hid this by faking plus infinity with bytes
+              (`appendCompositeUpperPadding`'s 64 `0xFF`), which a tuple cannot
+              use — `0xFF` is a malformed attribute image, not a large one — and
+              upstream never invents a maximal key either (`_bt_check_compare`
+              stops when the compared ATTRIBUTES exceed the bound). So the sense
+              of a truncated bound is now a property of the comparison, one per
+              end: `indexFormat.compare` is the low end (and descent / insert
+              slot / split point), the new `indexFormat.compareHigh` is the high
+              end, used by `rangeScanPos`' two `hi` tests. `desc == nil` ⇒
+              `compareHigh` IS `CompareKeys`, byte for byte, which is what let it
+              land ahead of the flip. Guard:
+              `internal/access/btree/prefix_highbound_test.go` (blob
+              equivalence; the asymmetry — one pair reading `>0` under `compare`
+              and `0` under `compareHigh`; a full-attribute bound agreeing with
+              `compare` including the heap-TID tiebreak; and a 1200-entry
+              two-column tree scanned across leaf-page boundaries with a prefix
+              pivot as BOTH bounds, group complete AND exclusive of the next).
+              Mutation-checked: reverting `rangeScanPos` to `compare` turns the
+              30-row group into 0 rows.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
               `ctx.pgIndexKeyDesc(idx)` the tree took (search keys included — a
-              tuple-format search key must itself be tuple-shaped),
+              tuple-format search key must itself be tuple-shaped, and the six
+              `appendCompositeUpperPadding` sites must emit a prefix PIVOT
+              instead of 64 `0xFF` bytes, which B2-c-i taught the scan to read),
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a
               tree's format is a per-index property). Gates:

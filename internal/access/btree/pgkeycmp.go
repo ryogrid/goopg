@@ -1,5 +1,7 @@
 package btree
 
+import "fmt"
+
 // ---------------------------------------------------------------------------
 // M0130-S11.4 slice 3b-2c-i — the comparison SEAM, behaviour-preserving.
 //
@@ -84,6 +86,114 @@ func (c indexFormat) compare(a, b []byte) int {
 		return CompareKeys(a, b)
 	}
 	return res
+}
+
+// ---------------------------------------------------------------------------
+// M0130-S11.4 slice 3b-2c-ii-B2-c-i — the prefix UPPER bound.
+//
+// A range scan's two bounds are not symmetric once keys are tuples, and the
+// asymmetry is invisible while keys are opaque blobs. A search key that names
+// only the FIRST k of an index's key attributes (probing a composite index on
+// its leading column) is stamped as a pivot by `pgIndexTupleKey`, and
+// `ComparePGIndexTuples` then applies upstream's truncation rule: equal on the
+// attributes both operands store, the shorter one is MINUS INFINITY beyond
+// them. That is exactly right for the LOW bound — the descent lands on the
+// first entry of the prefix group and `compare(entry, lo) < 0` skips nothing —
+// and exactly WRONG for the high bound, where `compare(entry, hi) > 0` is true
+// for the very first member of the group, so the scan would stop before
+// returning a single row.
+//
+// The blob format never had to say this out loud because it faked plus infinity
+// with bytes: `appendCompositeUpperPadding` (internal/executor/operators_index.go)
+// appends 64 0xFF bytes to a leading-column key so bytes.Compare orders the
+// whole group below it. There is no such trick for a tuple — 0xFF bytes are a
+// malformed attribute image, not a large one — and upstream does not use one
+// either: nbtree carries the bound's strategy in the scan key and stops when the
+// compared ATTRIBUTES exceed the bound (_bt_checkkeys / _bt_check_compare in
+// nbtutils.c), never by inventing a maximal key.
+//
+// So the sense of a truncated bound becomes a property of the comparison, one
+// per end of the range. `compare` is the low end (and every other ordering
+// decision: descent, insert slot, split point — all of which want minus
+// infinity); `compareHigh` is the high end.
+// ---------------------------------------------------------------------------
+
+// compareHigh orders a scan entry against a range scan's UPPER bound, returning
+// >0 exactly when entry is past hi and the scan must stop.
+//
+// It differs from `compare` in one case only: hi stores FEWER attributes than
+// entry and the two agree on all the attributes hi does store. `compare` calls
+// that "entry > hi" (hi is minus infinity in the attributes it dropped);
+// `compareHigh` calls it "entry <= hi", because a bound naming a prefix means
+// "everything whose prefix is this", i.e. plus infinity in the dropped
+// attributes. Where the operands genuinely differ on a shared attribute the two
+// agree, so a bound that names every attribute behaves identically under both.
+//
+// For the blob format (desc == nil) this IS `compare`, byte for byte: an opaque
+// key carries no attribute count, so there is no truncation to interpret and the
+// caller's 0xFF padding keeps doing the job. That equivalence is what lets this
+// land before the flip without moving any behaviour.
+func (c indexFormat) compareHigh(entry, hi []byte) int {
+	if c.desc == nil {
+		return CompareKeys(entry, hi)
+	}
+	res, err := ComparePGIndexTuples(c.desc, entry, hi)
+	if err != nil {
+		return CompareKeys(entry, hi)
+	}
+	if res <= 0 {
+		// Already within the bound; the truncation rule only ever makes the
+		// SHORTER operand smaller, so it cannot have produced this.
+		return res
+	}
+	// res > 0. Was it produced solely by hi being the shorter operand? That is
+	// true iff hi stores fewer attributes AND the operands agree on the ones it
+	// does store — which is what re-comparing entry TRUNCATED to hi's attribute
+	// count answers, without duplicating the deform loop.
+	nkey := uint16(c.desc.NKeyAtts())
+	if len(entry) < SizeOfIndexTupleData || len(hi) < SizeOfIndexTupleData {
+		return res
+	}
+	nHi := BTreeTupleGetNAtts(hi, nkey)
+	if nHi >= BTreeTupleGetNAtts(entry, nkey) {
+		return res
+	}
+	prefix, err := truncatedPGIndexTuple(entry, nHi, nkey)
+	if err != nil {
+		return res
+	}
+	if eq, err := ComparePGIndexTuples(c.desc, prefix, hi); err == nil && eq == 0 {
+		// Equal on every attribute the bound names: inside a plus-infinity
+		// upper bound.
+		return 0
+	}
+	return res
+}
+
+// truncatedPGIndexTuple returns a copy of raw restamped to claim only its first
+// natts key attributes, so it can be compared against a bound that stores that
+// many. The data area is left alone: `ComparePGIndexTuples` deforms exactly
+// `min(nattsA, nattsB)` attributes, so the extra bytes are never read, and
+// re-forming the tuple would mean re-encoding datums inside a comparison.
+//
+// The copy is unavoidable — the source aliases a pinned leaf page (rangeScanPos'
+// M0091-0002 no-copy contract) and restamping in place would corrupt the index.
+// It costs one allocation per entry that reaches the bound test with a truncated
+// bound, i.e. once per scan at the boundary, not per row: an entry strictly
+// inside the range exits at `res <= 0` above, before any of this.
+func truncatedPGIndexTuple(raw []byte, natts, nkey uint16) ([]byte, error) {
+	if natts == 0 || natts >= nkey {
+		return nil, fmt.Errorf("btree: truncatedPGIndexTuple: %d attributes is not a proper prefix of %d", natts, nkey)
+	}
+	out := make([]byte, len(raw))
+	copy(out, raw)
+	// heapTID=false: a prefix bound has no tiebreaker TID, and neither may the
+	// operand being compared to it, or the TID tiebreak below the attribute loop
+	// would order an entry above a bound it is equal to.
+	if err := BTreeTupleSetNAtts(out, natts, false); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // KeyDesc reports the descriptor this tree orders by, or nil for the bytewise
