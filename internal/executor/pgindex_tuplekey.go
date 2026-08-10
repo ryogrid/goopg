@@ -185,3 +185,63 @@ func pgIndexKeyColumns(idx *catalog.Index) []*catalog.Column {
 	}
 	return out
 }
+
+// pgIndexTupleKeyDatums is the INVERSE of pgIndexTupleKey: it deforms a
+// tuple-format index key back into one Datum per key attribute, keyed by the
+// same descriptor and the same columns the key was formed from.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c (the flip). Every other funnel this slice
+// series built runs one way — a key is produced and handed to the tree. The
+// index-only scan is the single reader that runs the other way: it answers a
+// query FROM the index entry, without touching the heap at all, so it has to
+// turn a key back into values. Under the blob format that inverse was
+// `decodeIndexKeyColumn` walking the concatenation with a running offset, one
+// order-preserving segment at a time, because that is what the key was. A tuple
+// image has no such walk: attribute i lives at an offset only the null bitmap
+// and the per-attribute alignment can compute, which is precisely what
+// `DeformPGIndexTuple` does and what a byte offset cannot.
+//
+// The values it hands back are PostgreSQL's own physical images (that is the
+// point of the format), so they decode with `decodePhysicalPGValueMctx` — the
+// same function that reads a heap tuple's data area, which is the inverse of
+// `encodeValuePG` that pgIndexTupleKey used to write them. Sibling paths kept
+// in one place, per the encode↔decode rule.
+//
+// A PIVOT key is refused rather than decoded: it names fewer attributes than
+// the descriptor and stores no heap TID, so it is a separator inside the tree,
+// never an entry an index-only scan may answer a row from.
+func pgIndexTupleKeyDatums(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, key []byte) ([]Datum, error) {
+	nkey := desc.NKeyAtts()
+	if nkey == 0 {
+		return nil, fmt.Errorf("pgIndexTupleKeyDatums: nil or empty key descriptor")
+	}
+	if len(cols) != nkey {
+		return nil, fmt.Errorf("pgIndexTupleKeyDatums: %d columns for a %d-attribute key", len(cols), nkey)
+	}
+	if len(key) < btree.SizeOfIndexTupleData {
+		return nil, fmt.Errorf("pgIndexTupleKeyDatums: %d-byte key is shorter than an index tuple header", len(key))
+	}
+	if natts := int(btree.BTreeTupleGetNAtts(key, uint16(nkey))); natts != nkey {
+		return nil, fmt.Errorf("pgIndexTupleKeyDatums: key names %d of %d key attributes (a pivot, not an entry)", natts, nkey)
+	}
+	images, isnull, err := btree.DeformPGIndexTuple(key, desc.Physical(), nkey)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Datum, nkey)
+	for i := range out {
+		if isnull[i] {
+			out[i] = NullDatum
+			continue
+		}
+		if cols[i] == nil {
+			return nil, fmt.Errorf("pgIndexTupleKeyDatums: key attribute %d has no column", i+1)
+		}
+		d, _, decErr := decodePhysicalPGValueMctx(cols[i].Type, images[i], nil)
+		if decErr != nil {
+			return nil, fmt.Errorf("pgIndexTupleKeyDatums: key attribute %d (%s): %w", i+1, cols[i].Type.Name, decErr)
+		}
+		out[i] = d
+	}
+	return out, nil
+}

@@ -40,6 +40,7 @@ func buildKeyCtxAndIndex(t *testing.T, oid uint32, cols ...catalog.Column) (*Con
 }
 
 func TestIndexBuildEntryKeyBlobIsTheOldEncoderVerbatim(t *testing.T) {
+	withBlobIndexKeys(t)
 	// Gate off is the shipped state: the funnel must reproduce
 	// encodeCompositeBTreeKeyWithExprs exactly, and the heap TID it now receives
 	// must stay out of the bytes (the blob format carries it beside the key, in
@@ -158,6 +159,7 @@ func TestIndexBuildEntryKeyUndescribableIndexKeepsBlob(t *testing.T) {
 }
 
 func TestSortBuildEntriesFindDuplicateBlobUnchanged(t *testing.T) {
+	withBlobIndexKeys(t)
 	// The blob branch must be M0055-0006 Phase E byte for byte: bytewise order,
 	// bytewise equality.
 	ctx, idx, cols := buildKeyCtxAndIndex(t, 424, col("a", "int4"))

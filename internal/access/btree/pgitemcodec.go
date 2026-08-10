@@ -111,6 +111,21 @@ func (bt *BTree) Format() IndexFormat { return IndexFormat{f: bt.keyFmt} }
 // blob format.
 func (fm IndexFormat) KeyDesc() *PGIndexKeyDesc { return fm.f.desc }
 
+// CompareKeyAttrs orders two on-page keys by their KEY ATTRIBUTES ALONE,
+// returning 0 for two entries that carry the same key value at different heap
+// rows. It is the out-of-package spelling of `indexFormat.compareKeyAttrs`; see
+// that function for why a heapkeyspace tree needs the distinction.
+//
+// The caller it exists for is amcheck's `checkunique` tier, which asks exactly
+// the grouping question: "do two adjacent leaf entries hold the same key?"
+// Under the blob format its own `CompareKeys` default answered that, because an
+// opaque key has no TID to differ in. Under the tuple format the TID is inside
+// the key, so a bytewise (or full-`compare`) test finds every entry distinct and
+// the tier silently stops detecting duplicates — an under-report by a
+// CORRUPTION CHECKER, which is worse than a wrong answer from a query.
+// M0130-S11.4 slice 3b-2c-ii-B2-c.
+func (fm IndexFormat) CompareKeyAttrs(a, b []byte) int { return fm.f.compareKeyAttrs(a, b) }
+
 // tupleKeys reports whether `item.key` is a whole nbtree tuple rather than a
 // bare key payload. It is exactly "this index has a key descriptor": the
 // descriptor is both what makes the tuple shape necessary (nothing else can

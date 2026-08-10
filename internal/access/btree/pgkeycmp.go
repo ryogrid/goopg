@@ -173,7 +173,23 @@ func (c indexFormat) compareHigh(entry, hi []byte) int {
 	if c.desc == nil {
 		return CompareKeys(entry, hi)
 	}
-	res, err := ComparePGIndexTuples(c.desc, entry, hi)
+	// KEY ATTRIBUTES ONLY — the heap TID is deliberately not weighed here.
+	//
+	// M0130-S11.4 slice 3b-2c-ii-B2-c (the flip) corrected this from `compare`.
+	// A range bound is a bound on the index's KEY, never on a heap position: it
+	// is built from expressions by `indexProbeKey`, so it always carries the
+	// zero ItemPointer, which is minus infinity in the tiebreak. Weighing it
+	// would put EVERY real entry (real TID > zero TID) above an upper bound that
+	// names its exact key, so an equality scan on a full-key probe — the single
+	// most common index scan there is — would stop before returning its first
+	// row. Upstream has the same split: the scantid participates in `_bt_compare`
+	// during descent, while the scan's stop condition (`_bt_check_compare`,
+	// nbtutils.c) evaluates the scan keys, i.e. attributes.
+	//
+	// The low end keeps `compare` (with its tiebreak) and needs no such change:
+	// there a zero-TID bound is minus infinity among its own duplicates, which is
+	// exactly "start at the first of them".
+	res, err := ComparePGIndexTupleKeyAttrs(c.desc, entry, hi)
 	if err != nil {
 		return CompareKeys(entry, hi)
 	}
@@ -198,7 +214,7 @@ func (c indexFormat) compareHigh(entry, hi []byte) int {
 	if err != nil {
 		return res
 	}
-	if eq, err := ComparePGIndexTuples(c.desc, prefix, hi); err == nil && eq == 0 {
+	if eq, err := ComparePGIndexTupleKeyAttrs(c.desc, prefix, hi); err == nil && eq == 0 {
 		// Equal on every attribute the bound names: inside a plus-infinity
 		// upper bound.
 		return 0

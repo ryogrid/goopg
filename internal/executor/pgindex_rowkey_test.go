@@ -34,6 +34,7 @@ func rowKeyCtxAndIndex(t *testing.T, oid uint32, cols ...catalog.Column) (*Conte
 }
 
 func TestIndexRowKeyBlobEntryAndProbeAreIdentical(t *testing.T) {
+	withBlobIndexKeys(t)
 	// Gate off is the shipped state: both funnels must reproduce
 	// encodeIndexKeyFromCols exactly, and the real heap TID handed to
 	// indexEntryKey must not reach the bytes.

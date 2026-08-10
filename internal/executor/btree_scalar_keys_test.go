@@ -235,6 +235,7 @@ func TestScalarBTreeKeyDecodeSiblingParity(t *testing.T) {
 // This is also the CREATE INDEX acceptance gate: each of these statements
 // failed with 0A000 before this slice.
 func TestScalarIndexBuildAndMaintainKeys(t *testing.T) {
+	withBlobIndexKeys(t)
 	for _, tc := range scalarKeyCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cleanup := newVMFixture(t)

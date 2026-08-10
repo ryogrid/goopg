@@ -348,6 +348,26 @@ func (o *indexOnlyScanOp) Close() error {
 
 // decodeRowFromKey extracts covered column values from a B-tree key.
 func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
+	// Tuple format (M0130-S11.4 slice 3b-2c-ii-B2-c, the flip): the key is one
+	// IndexTuple image, not a concatenation of order-preserving segments, so
+	// neither the single-column fast lane nor the running-offset loop below can
+	// read it — they would consume a type's width out of a null bitmap and an
+	// alignment hole. `pgIndexTupleKeyDatums` is the inverse of the encoder that
+	// wrote it; the projection onto Covered is shared with the blob path, since
+	// only the DECODE differs between the two formats, never which columns the
+	// scan is answering from.
+	if desc := o.ctx.pgIndexKeyDesc(o.plan.Index); desc != nil {
+		keyCols := pgIndexKeyColumns(o.plan.Index)
+		vals, err := pgIndexTupleKeyDatums(desc, keyCols, key)
+		if err != nil {
+			return nil, err
+		}
+		decoded := make(map[string]Datum, len(keyCols))
+		for i, col := range keyCols {
+			decoded[col.Name] = vals[i]
+		}
+		return o.projectCovered(decoded)
+	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
 		d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
 		if err != nil {
@@ -370,6 +390,12 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		decoded[colName] = d
 		off += n
 	}
+	return o.projectCovered(decoded)
+}
+
+// projectCovered picks the scan's output columns out of the decoded key
+// attributes. Shared by both key formats — see decodeRowFromKey.
+func (o *indexOnlyScanOp) projectCovered(decoded map[string]Datum) (Row, error) {
 	row := make(Row, len(o.plan.Covered))
 	for i, col := range o.plan.Covered {
 		d, ok := decoded[col.Name]

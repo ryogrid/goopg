@@ -562,7 +562,26 @@ func TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate(t *testing.T) {
 		t.Fatal("index bicu_a_idx not found")
 	}
 	rel := ctx.Catalog.IndexRelFileNode(idx)
-	key1, key2 := btree.EncodeInt4(1), btree.EncodeInt4(2)
+	// The damage is "make the a=2 entry claim a=1 while keeping its own heap
+	// TID", which is what a live duplicate looks like — so it rewrites the KEY
+	// ATTRIBUTE in place and nothing else.
+	//
+	// Both formats put that attribute at byte 8 of the item, for unrelated
+	// reasons that happen to agree: a blob item is [8-byte item header][key],
+	// and a tuple image is [6-byte t_tid][2-byte t_info][attribute]. What does
+	// NOT agree is the attribute's encoding (order-preserving blob vs
+	// PostgreSQL's own image) or the item's total length (a tuple is padded out
+	// to MAXALIGN, so its trailing bytes are not the key). Hence: same offset,
+	// per-format bytes, and a length check that bounds only what is read.
+	// M0130-S11.4 slice 3b-2c-ii-B2-c.
+	var key1, key2 []byte
+	if ctx.pgIndexKeyDesc(idx) != nil {
+		key1, key2 = make([]byte, 4), make([]byte, 4)
+		binary.LittleEndian.PutUint32(key1, 1)
+		binary.LittleEndian.PutUint32(key2, 2)
+	} else {
+		key1, key2 = btree.EncodeInt4(1), btree.EncodeInt4(2)
+	}
 	patched := false
 	nblocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -580,11 +599,11 @@ func TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate(t *testing.T) {
 			}
 			for slot := uint16(1); slot <= uint16(count); slot++ {
 				raw, rerr := storage.PageGetItemRawNoCopy(s.Page(), slot)
-				if rerr != nil || len(raw) != 8+len(key2) {
+				if rerr != nil || len(raw) < 8+len(key2) {
 					continue
 				}
-				if string(raw[8:]) == string(key2) {
-					copy(raw[8:], key1) // in-place: raw aliases the page
+				if attr := raw[8 : 8+len(key2)]; string(attr) == string(key2) {
+					copy(attr, key1) // in-place: raw aliases the page
 					patched = true
 					break
 				}

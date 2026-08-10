@@ -1065,30 +1065,86 @@ sources agree:
             `encodeIndexKeyFromCols` and `encodeExprIndexKey`. Mutation-checked:
             reverting one NND site and removing the access-method refusal each
             fail by name.
-          - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
-            `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-            `encodeArbiterKey` → `pgIndexTupleKey` under the same
-            `Context.pgIndexKeyDesc` the tree took, search keys included;
-            `pgIndexTupleKeys` on; and the explicit dual-format decision for the
-            indexes the resolver refuses. The prefix upper bound is no longer
-            part of this slice — B2-c-i taught the scan to read a pivot and
-            B2-c-ii routed all six probe sites through the one place that emits
-            it, and B2-c-iii did the same for the low end, so the SCAN side is
-            format-agnostic already, and B2-c-iv did the same for the
-            row-shaped writer sites (entry keys and probe-by-row keys both now
-            resolve the descriptor), and B2-c-v for the CREATE INDEX / REINDEX
-            bulk build (key, sort order and duplicate test). B2-c-vii funnelled the ON CONFLICT
-            arbiter's probe and entry keys and made the `encodeExprIndexKey`
-            fallbacks blob-only, and B2-c-viii settled the per-column
-            uniqueness comparisons in `operators_storage.go` — they are
-            FINGERPRINTS and stay blob permanently, which is now an invariant
-            with a guard rather than an open question. What remains is the
-            standing decision on expression indexes (`buildPGIndexKeyDesc` refuses them, so they stay
-            permanently blob unless the flip describes them), and turning
-            `pgIndexTupleKeys` on with the explicit per-index dual-format
-            decision. Gates:
-            `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
-            a REINDEX).
+          - **3b-2c-ii-B2-c — the flip (landed). REINDEX-required.**
+            `pgIndexTupleKeys` is now **true**: every index the resolver can
+            describe is written and read as PostgreSQL index tuples, and every
+            index it refuses (an expression key, an explicit operator class, a
+            non-bytewise collation, a type with no 3b-2a comparator, and the two
+            types whose goopg stored image is not PG's — numeric and uuid) keeps
+            the blob path. **A tree's key format is therefore a per-INDEX
+            property, derived from the catalog, with nothing on disk recording
+            it.** That is the dual-format decision this slice owed, and it is
+            deliberate: the metapage is byte-faithful `BTMetaPageData` whose
+            version must stay 4 for a real PG to accept it (S11.3), so there is
+            no field to stamp a goopg-private format into. The consequence is
+            the REINDEX requirement — an index built before the flip is read
+            afterwards under the tuple comparator, which cannot deform it.
+
+            The eight preceding funnels made every key PRODUCER format-aware.
+            What the flip itself uncovered is that three CONSUMERS were not, and
+            all three were invisible while the two formats coincided:
+
+              1. **`(*BTree).Search` asked for full-key equality.** Its match
+                 test was `compare(entry, key) == 0`, and under the tuple format
+                 the heap TID is inside the key: a search key carries the zero
+                 TID, a stored entry its row's real one, so equality is
+                 impossible by construction and EVERY unique-index probe
+                 reported "no such key". It now asks `compareKeyAttrs` — the
+                 grouping question B2-c-vi named — at the scan's front door.
+                 The same zero TID also makes the probe minus infinity among its
+                 own duplicates, so a group beginning exactly at a page boundary
+                 sits one page RIGHT of where the probe descends; `Search` now
+                 steps right on an exhausted page, as `_bt_first` does via
+                 `_bt_stepright` (nbtsearch.c).
+              2. **`indexFormat.compareHigh` weighed the heap TID.** A range
+                 bound is a bound on the KEY — `indexProbeKey` builds it from
+                 expressions, so it always carries the zero TID. Weighing it put
+                 every real entry above an upper bound naming its exact key, so
+                 an equality scan stopped before its first row. The bound is now
+                 evaluated on key attributes alone (upstream's split: the scantid
+                 participates in `_bt_compare` during descent, while the scan's
+                 stop condition is `_bt_check_compare` over scan keys). The LOW
+                 end deliberately keeps the tiebreak, where minus infinity is
+                 exactly "start at the first duplicate".
+              3. **The index-only scan decoded keys as blobs.** IOS is the only
+                 reader that runs the funnels backwards — it answers a query FROM
+                 the index entry. Its running-offset walk over concatenated
+                 order-preserving segments cannot read a tuple image (it consumed
+                 a type's width out of a null bitmap and an alignment hole).
+                 `pgIndexTupleKeyDatums` is the inverse of `pgIndexTupleKey`,
+                 built on `DeformPGIndexTuple` + `decodePhysicalPGValueMctx` —
+                 the same function that reads a heap tuple's data area, which is
+                 the inverse of the `encodeValuePG` that wrote the key.
+
+            A fourth consumer was found by the amcheck port rather than by the
+            suite: **`checkunique` compared keys bytewise**, so with the TID
+            inside the key it found every entry distinct and stopped detecting
+            duplicates — an under-report by a CORRUPTION CHECKER, which is worse
+            than a wrong answer from a query. The tier now runs under
+            `IndexFormat.CompareKeyAttrs`. A user-opclass comparator never
+            coexists with a descriptor (the resolver refuses such an index), so
+            the two comparator sources cannot collide.
+
+            The suite's own format assumptions were the rest of the work, and
+            separating the two kinds mattered: the byte-for-byte blob guards are
+            still LIVE code (the refused indexes use it) and now pin the gate off
+            with `withBlobIndexKeys`, whereas the DDL type-acceptance suites were
+            asserting the format only incidentally — "can a timestamp column be
+            indexed and found again?" is a question about the type — so they were
+            routed through the engine's own `openIndexBTree` / `indexProbeKey`
+            and now track whichever format the index resolves to.
+
+            Gates: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+            PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35).
+            **The TPC-H bench cluster needed no REINDEX, and could not have had
+            one:** its eight HammerDB PK indexes are catalog-only — an index scan
+            on them fails `btree: index contains corrupted page at block 0` on
+            the PRE-FLIP binary too (verified by rebuilding with the gate off),
+            and `REINDEX INDEX <name>` inside db `tpch` reports "relation does
+            not exist", the same per-DB scoping gap the ledger records for
+            ANALYZE. Both are recorded in the deferral ledger; the spotcheck's
+            Q12/Q13 are seq-scan plans and so do not exercise the flip.
+
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

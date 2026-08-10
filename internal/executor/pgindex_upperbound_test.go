@@ -27,6 +27,7 @@ import (
 func upperBoundTestKey() []byte { return []byte{0x01, 0x02, 0x03} }
 
 func TestCompositeUpperBoundBlobIsPaddingByteForByte(t *testing.T) {
+	withBlobIndexKeys(t)
 	// Gate off is the shipped state: every index is blob, so the funnel must
 	// reproduce the pre-slice bytes exactly. Anything else is an on-disk
 	// behaviour change smuggled into a behaviour-preserving slice.

@@ -39,6 +39,7 @@ func arbiterFixture(t *testing.T, oid uint32, cols ...catalog.Column) (*Context,
 }
 
 func TestArbiterKeyBlobProbeAndEntryAreIdentical(t *testing.T) {
+	withBlobIndexKeys(t)
 	// Gate off is the shipped state. Both funnels must reproduce
 	// encodeArbiterKey exactly, and the heap TID handed to the entry funnel must
 	// not reach the bytes — otherwise the Phase-B key reuse in applyInsert would

@@ -51,7 +51,7 @@ import (
 //
 // false: `Options.KeyDesc` is always nil → `CompareKeys` (bytes.Compare) over
 // goopg's opaque order-preserving key encoding, which is what is on disk.
-var pgIndexTupleKeys = false
+var pgIndexTupleKeys = true
 
 // pgIndexKeyDesc returns the key descriptor for idx, or nil when this layer
 // cannot order the index exactly the way PostgreSQL does.

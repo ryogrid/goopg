@@ -1335,26 +1335,41 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               Guard: `internal/executor/pgindex_fingerprint_test.go` (6 tests,
               incl. a function-scoped source scan; mutation-checked: one NND
               site reverted, the access-method refusal removed).
-        - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
-              `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-              `encodeArbiterKey` → `pgIndexTupleKey` under the same
-              `ctx.pgIndexKeyDesc(idx)` the tree took. The SCAN side is done
-              (B2-c-i + B2-c-ii + B2-c-iii) and the row-shaped writer sites are
-              funnelled (B2-c-iv: entry keys and probe-by-row keys; B2-c-v: the
-              CREATE INDEX / REINDEX bulk build — key, sort order and duplicate
-              test). B2-c-vii funnelled the ON CONFLICT arbiter's probe and
-              entry keys and made the `encodeExprIndexKey` fallbacks blob-only,
-              and B2-c-viii settled the per-column uniqueness comparisons in
-              `operators_storage.go` — they are FINGERPRINTS and stay blob
-              permanently, now a guarded invariant rather than an open item.
-              What remains is the standing decision on expression indexes (one
-              `buildPGIndexKeyDesc` REFUSES, so they stay permanently blob
-              unless the flip describes them),
-              `pgIndexTupleKeys` on, and an explicit dual-format decision for
-              the indexes the resolver refuses (they keep the blob path, so a
-              tree's format is a per-index property). Gates:
-              `scripts/tpch-spotcheck.sh` + the TPC-DS SF0.5 gate (re-pin after
-              a REINDEX).
+        - [x] **3b-2c-ii-B2-c — THE FLIP** (2026-08-10). REINDEX-required.
+              `pgIndexTupleKeys` is now **true**: every index
+              `buildPGIndexKeyDesc` describes is written and read as PG index
+              tuples, and every index it refuses keeps the blob path — so a
+              tree's key format is a per-INDEX catalog property with nothing on
+              disk recording it (the metapage is byte-faithful `BTMetaPageData`,
+              version must stay 4, so there is no field to stamp; hence
+              REINDEX-required). The eight funnels had made every key PRODUCER
+              format-aware; the flip uncovered three CONSUMERS that were not:
+              `(*BTree).Search` asked FULL-key equality (the in-image heap TID
+              made it unsatisfiable, so every unique probe reported "no such
+              key") and descended left of a group starting at a page boundary —
+              now `compareKeyAttrs` plus a `_bt_stepright`-style right step;
+              `compareHigh` weighed the TID, putting every real entry above a
+              bound naming its exact key, so an equality scan returned ZERO rows
+              — a bound is a KEY bound, now key-attributes-only (the LOW end
+              keeps the tiebreak, where minus infinity means "first duplicate");
+              and the index-only scan, the one reader that runs the funnels
+              backwards, decoded a tuple image with the blob running-offset walk
+              — now `pgIndexTupleKeyDatums`, the inverse of `pgIndexTupleKey`.
+              A fourth was found by the amcheck port: `checkunique` compared
+              bytewise and had silently STOPPED DETECTING duplicates (an
+              under-report by a corruption checker); it now runs under
+              `IndexFormat.CompareKeyAttrs`. Test work split by kind: the
+              byte-for-byte blob guards are still live code and pin the gate off
+              via `withBlobIndexKeys`, while the DDL type-acceptance suites were
+              asserting the format only incidentally and now route through the
+              engine's own `openIndexBTree` / `indexProbeKey`.
+              Gates: units PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2,
+              Q13 rows=35). **No REINDEX of the TPC-H cluster was possible or
+              needed** — its eight HammerDB PKs are catalog-only (an index scan
+              fails identically on a gate-OFF rebuild, so it predates S11.4) and
+              `REINDEX` inside db `tpch` hits the known per-DB scoping gap. Both
+              filed in the ledger, with the NULL-keyed-row divergence and the
+              missing "needs REINDEX" detection.
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

@@ -26,6 +26,11 @@ func withPGIndexTupleKeys(t *testing.T) {
 }
 
 func TestPGIndexKeyDescGateOffYieldsNil(t *testing.T) {
+	// The gate defaults to ON since the flip (3b-2c-ii-B2-c); it survives as a
+	// var because the blob path stays live for the indexes the resolver refuses,
+	// and this pins that turning it off really does put EVERY index back on that
+	// path rather than leaving a half-flipped mix.
+	withBlobIndexKeys(t)
 	tbl := keyDescTable(col("a", "int4"))
 	idx := &catalog.Index{OID: 100, Name: "i", Table: tbl, Method: "btree", Columns: []string{"a"}}
 	// Sanity: this index IS describable, so a nil result here can only come

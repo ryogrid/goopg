@@ -82,22 +82,47 @@ func TestCompareHighPrefixBoundIsPlusInfinity(t *testing.T) {
 	}
 }
 
-// TestCompareHighFullBoundMatchesCompare pins the case that must NOT change: a
-// bound naming every key attribute has no dropped attributes to be infinite in,
-// so the two comparisons have to agree — including on the heap-TID tiebreak,
-// which is what would silently drop the last row of an equality scan.
-func TestCompareHighFullBoundMatchesCompare(t *testing.T) {
+// TestCompareHighFullBoundIsHeapTIDBlind pins what a bound naming EVERY key
+// attribute means. Slice 3b-2c-ii-B2-c-i asserted that such a bound agrees with
+// `compare` outright, heap-TID tiebreak included; the flip
+// (3b-2c-ii-B2-c) disproved that, and this is the corrected contract.
+//
+// A range bound is a bound on the KEY. `indexProbeKey` builds one from
+// expressions, so it always carries the zero ItemPointer — and every real entry
+// carries a real one, which is ABOVE zero in the tiebreak. Had compareHigh kept
+// weighing the TID, an equality scan on a full-key probe would have found its
+// first matching entry already "past" the bound and stopped with zero rows;
+// that is precisely the failure the flip hit across the executor suite.
+//
+// So: agreement with `compare` on every key-attribute difference (the bound
+// still has to end the scan), and TID-blindness where the key attributes are
+// equal (every duplicate of the bound's key is inside it, whatever its heap
+// position — including the last one).
+func TestCompareHighFullBoundIsHeapTIDBlind(t *testing.T) {
 	desc := int4x2Desc()
 	f := indexFormat{desc: desc}
-	bound := tup(t, desc.Attrs, [][]byte{int4Val(5), int4Val(5)},
-		storage.ItemPointer{Block: 10, Offset: 2})
+	// A bound with a non-zero TID as well as the zero one the executor actually
+	// produces: neither may influence the answer.
+	for _, boundTID := range []storage.ItemPointer{{}, {Block: 10, Offset: 2}} {
+		bound := tup(t, desc.Attrs, [][]byte{int4Val(5), int4Val(5)}, boundTID)
 
-	for _, e := range [][3]int32{{5, 5, 0}, {5, 4, 0}, {5, 6, 0}, {4, 9, 0}, {6, 1, 0}} {
-		for _, blk := range []storage.BlockNumber{1, 10, 99} {
-			entry := tup(t, desc.Attrs, [][]byte{int4Val(e[0]), int4Val(e[1])},
-				storage.ItemPointer{Block: blk, Offset: 2})
-			if got, want := f.compareHigh(entry, bound), f.compare(entry, bound); got != want {
-				t.Fatalf("compareHigh((%d,%d)@%d, full bound) = %d, want compare = %d", e[0], e[1], blk, got, want)
+		for _, e := range [][2]int32{{5, 5}, {5, 4}, {5, 6}, {4, 9}, {6, 1}} {
+			// Blocks below, at and above the bound's own: the sign must not move.
+			for _, blk := range []storage.BlockNumber{1, 10, 99} {
+				entry := tup(t, desc.Attrs, [][]byte{int4Val(e[0]), int4Val(e[1])},
+					storage.ItemPointer{Block: blk, Offset: 2})
+				got := f.compareHigh(entry, bound)
+				want := 0
+				switch {
+				case e[0] != 5:
+					want = sign(int(e[0]) - 5)
+				case e[1] != 5:
+					want = sign(int(e[1]) - 5)
+				}
+				if sign(got) != want {
+					t.Fatalf("compareHigh((%d,%d)@%d, full bound tid=%v) = %d, want sign %d",
+						e[0], e[1], blk, boundTID, got, want)
+				}
 			}
 		}
 	}

@@ -153,6 +153,7 @@ func TestDDLNumericIndexSplitWithVariableLengthHighKey(t *testing.T) {
 // dedup-by-encoded-bytes (was dedup-by-int32 before), and
 // search round-trip all still work for int4.
 func TestDDLInt4IndexUnchangedRegressionGuard(t *testing.T) {
+	withBlobIndexKeys(t)
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 

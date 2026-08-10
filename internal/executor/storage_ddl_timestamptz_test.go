@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -69,8 +69,8 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 // timestamptzBTreeKey mirrors the encodeBTreeKeyForColumn timestamptz path:
 // timestamptz shares the int64-micros-since-epoch on-disk form with timestamp
 // without time zone, so it encodes via EncodeTimestamp(micros).
-func timestamptzBTreeKey(ts time.Time) []byte {
-	return btree.EncodeTimestamp(ts.Sub(pgEpoch).Microseconds())
+func timestamptzBTreeKey(t *testing.T, ctx *Context, idx *catalog.Index, ts time.Time) []byte {
+	return indexProbeForTest(t, ctx, idx, NewTimeDatum(ts))
 }
 
 // TestDDLCreateTimestamptzBTreeIndexAcceptsType pins the M0118-0001 acceptance
@@ -113,13 +113,13 @@ func TestDDLCreateTimestamptzBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, ts := range times {
-		key := timestamptzBTreeKey(ts)
+		key := timestamptzBTreeKey(t, ctx, idx, ts)
 		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%v): found=%v err=%v", ts, found, err)
@@ -162,15 +162,15 @@ func TestDDLTimestamptzRangeScanParity(t *testing.T) {
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_start_time"})
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rangeStart := time.Date(2010, 4, 1, 13, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2010, 4, 1, 14, 0, 0, 0, time.UTC)
-	lo := timestamptzBTreeKey(rangeStart)
-	hi := timestamptzBTreeKey(rangeEnd)
+	lo := timestamptzBTreeKey(t, ctx, idx, rangeStart)
+	hi := timestamptzBTreeKey(t, ctx, idx, rangeEnd)
 	indexCount := 0
 	if err := tree.RangeScan(lo, hi, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		indexCount++

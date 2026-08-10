@@ -3526,7 +3526,36 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 		idx := sort.Search(len(items), func(i int) bool {
 			return bt.format().compare(items[i].key, key) >= 0
 		})
-		if idx >= len(items) || bt.format().compare(items[idx].key, key) != 0 {
+		if idx >= len(items) {
+			// M0130-S11.4 slice 3b-2c-ii-B2-c (the flip): the probe can sort
+			// before every entry on this page and still have its matches on the
+			// next one. Under the blob format that was unreachable — a probe key
+			// and an entry key for the same value are the SAME bytes, so descent
+			// landed on the page the group starts on. Under the tuple format the
+			// probe carries the zero heap TID (minus infinity in the
+			// heapkeyspace tiebreak) while the entry carries the row's real one,
+			// so a group beginning exactly at a page boundary sits one page to
+			// the right of where the probe descends. Upstream has the same shape
+			// and answers it the same way: `_bt_binsrch` returns an offset past
+			// the end and `_bt_first` steps right (`_bt_stepright`, nbtsearch.c).
+			// This terminates for the usual reason a right-walk does: the first
+			// item on the next page is >= the probe, so the next iteration
+			// either matches or reports absence.
+			if op.Next == storage.InvalidBlockNumber {
+				return storage.ItemPointer{}, false, nil
+			}
+			cur = op.Next
+			continue
+		}
+		// compareKeyAttrs, not compare: `Search` asks "is there an entry with
+		// these key attributes?", and under the tuple format `compare` also
+		// weighs the heap TID, which a search key never carries — full-key
+		// equality against a real entry is then impossible by construction and
+		// every unique-index probe would report "no such key". This is the
+		// grouping question B2-c-vi named, asked at the scan's front door.
+		// Identical to the old test under the blob format, where both are
+		// `CompareKeys`.
+		if bt.format().compareKeyAttrs(items[idx].key, key) != 0 {
 			return storage.ItemPointer{}, false, nil
 		}
 		return items[idx].ptr, true, nil

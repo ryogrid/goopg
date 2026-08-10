@@ -254,6 +254,16 @@ func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog
 	if d.IsNull() || !d.BoolValue() {
 		return nil, nil
 	}
+	// The tier's equality test must be TID-BLIND under the tuple format: a
+	// duplicate is two entries sharing a KEY at two different heap rows, and the
+	// tuple format puts the heap TID inside the key, so the default bytewise
+	// comparator would find every entry distinct and report nothing. A
+	// user-opclass comparator (cmpKeys != nil) never coexists with a descriptor —
+	// buildPGIndexKeyDesc refuses an index that declares one — so the two
+	// branches cannot both apply. M0130-S11.4 slice 3b-2c-ii-B2-c.
+	if cmpKeys == nil && keyFmt.KeyDesc() != nil {
+		cmpKeys = keyFmt.CompareKeyAttrs
+	}
 	if !idx.Unique || idx.Table == nil || ctx.Snap.Xmax == 0 {
 		// Xmax == 0 is an unseeded snapshot (no transaction snapshot was taken
 		// for this statement); there is nothing to judge tuple liveness against.

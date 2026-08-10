@@ -32,6 +32,7 @@ func probeCtxAndIndex(t *testing.T, oid uint32, cols ...catalog.Column) (*Contex
 }
 
 func TestIndexProbeKeyBlobIsTheConcatenation(t *testing.T) {
+	withBlobIndexKeys(t)
 	// Gate off is the shipped state, so the funnel must reproduce the
 	// pre-slice bytes exactly — including the multi-attribute case, where the
 	// old code appended segment after segment with no separator.
