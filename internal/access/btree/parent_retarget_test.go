@@ -9,7 +9,8 @@ import (
 
 // Guards for M0130-S11.5d-3a: the parent limb of page deletion is now
 // upstream's retarget-and-delete, located by CHILD BLOCK, and shared verbatim
-// between the primary (applyParentDownlinkRemoval / removeDownlinkFromParent)
+// between the primary (the inline retarget in unlinkEmptyLeaf /
+// unlinkEmptyInternalPage, and removeDownlinkFromParent)
 // and redo (replayBtreeUnlinkPage's parent limb). The three properties below
 // are what make that sharing safe; each of them is a way the two sides could
 // silently drift apart.

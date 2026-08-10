@@ -8,7 +8,7 @@ import (
 
 // TestApplyParentDownlinkRemovalIgnoresStaleIndex is the regression test for
 // the M0122-0010 (AI-20260709-010336-082 follow-up) parent-downlink
-// index-drift race: applyParentDownlinkRemoval used to remove-by-INDEX
+// index-drift race: the parent-downlink removal used to remove-by-INDEX
 // against a slot resolved well before the removal actually runs (WAL record
 // emission plus sibling-relink writes happen in between, in
 // unlinkEmptyLeaf/unlinkEmptyInternalPage). bt.splitMu only serialises
@@ -25,7 +25,7 @@ import (
 // needed): it resolves a target leaf's parent slot, then — simulating a
 // same-window concurrent split — splices a brand-new live leaf downlink
 // into the FRONT of the parent's item list (shifting the target's true
-// position by one), and only THEN invokes applyParentDownlinkRemoval keyed
+// position by one), and only THEN invokes the parent-downlink removal keyed
 // on the target's BLOCK. Before the fix (removal by stale index) this
 // would have deleted whichever downlink now sits at that index — a
 // different, live child (the "victim") — while leaving the intended target
@@ -109,8 +109,13 @@ func TestApplyParentDownlinkRemovalIgnoresStaleIndex(t *testing.T) {
 	}
 
 	// Exercise the fix: remove by BLOCK, not the stale index.
-	if err := tree.applyParentDownlinkRemoval(meta.Root, targetBlk, 0); err != nil {
-		t.Fatalf("applyParentDownlinkRemoval: %v", err)
+	// M0130-S11.5d-3b: the WAL path now performs this mutation inline on the
+	// parent page it already holds latched, so the surviving named entry point
+	// is removeDownlinkFromParent (the FPI path) — same
+	// ReplayParentRetargetByChild, same by-block-identity re-location, which is
+	// exactly what this test pins.
+	if err := tree.removeDownlinkFromParent(meta.Root, targetBlk); err != nil {
+		t.Fatalf("removeDownlinkFromParent: %v", err)
 	}
 
 	final := readItemsForTest(t, tree, meta.Root)

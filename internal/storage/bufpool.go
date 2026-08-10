@@ -94,6 +94,14 @@ func (s *Slot) Unlock()  { s.contentMu.Unlock() }
 func (s *Slot) RLock()   { s.contentMu.RLock() }
 func (s *Slot) RUnlock() { s.contentMu.RUnlock() }
 
+// TryRLock attempts the shared content lock without blocking, reporting
+// whether it was taken (the caller must RUnlock on true). It exists so a
+// caller can ASSERT that some other code path is holding a page's exclusive
+// latch — the b-tree page-deletion protocol (M0130-S11.5d-3b) is only correct
+// if the pages named by an unlink record are still latched when the record is
+// emitted, and that is otherwise unobservable.
+func (s *Slot) TryRLock() bool { return s.contentMu.TryRLock() }
+
 // valid is a read helper for tests/internal callers.
 func (s *Slot) isValid() bool { return stateValid(s.state.Load()) }
 

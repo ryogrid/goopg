@@ -1716,19 +1716,45 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         empty-but-live, unflagged, still downlinked, tree readable and writable).
         Gates: btree/amcheck/wal/storage/initdb PASS; units PASS; btree -race
         PASS; pgbench smoke PASS (commit hook). 2 ledger rows.
-  - [ ] **S11.5d-3b — rewire the page-deletion emit PROTOCOL**. The mutation is
-        done (S11.5d-3a); the protocol is not. `unlinkEmptyLeaf` /
-        `unlinkEmptyInternalPage` still emit ONE native record covering both
-        phases, BEFORE applying, and then deliberately re-derive each SIBLING
-        link under the write pin (the AI-20260709-010336-082 corruption fix)
-        because a split on another connection's `*BTree` can splice a page in.
-        That makes the record's link values advisory, which no PG-shaped record
-        may be. Move to upstream's protocol — pin left/target/right, compute,
-        emit, write — then emit `EncodeBtreeMarkPageHalfDeadPG` +
-        `EncodeBtreeUnlinkPagePG` in place of the native record, and write the
-        dummy top-parent high key when marking a leaf half-dead. This is the real
-        content of the historical "documented reason to stay native"
-        (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md` A8-unlinkpage).
+  - [x] **S11.5d-3b — rewire the page-deletion emit PROTOCOL** (landed
+        2026-08-10). goopg walked the sibling chain UNLATCHED, emitted the unlink
+        record with what it found, then RE-DERIVED each link again under the
+        write pin (the AI-20260709-010336-082 corruption fix — a split on another
+        connection's `*BTree` can splice a live page in, and stamping the stale
+        walk stomped that split's relink). The write was right and the RECORD was
+        wrong: every link field was advisory, and `btree_xlog_unlink_page`
+        rebuilds the sibling pages FROM the record with nothing to re-derive
+        from. `acquireUnlinkPins` now holds parent → left → target → right across
+        compute/emit/write. Left→right is `_bt_split`'s own direction; the parent
+        going FIRST is goopg-specific — since S11.5b-3 an internal split pins a
+        lower-level page while holding this level's latches, so goopg latches
+        top-down where upstream latches bottom-up. Re-derivation is replaced by
+        VALIDATION (re-read the two ends and the target under the latches, retry
+        the walk if a link moved — the same self-correction, moved to before the
+        record instead of after it), with a bounded give-up
+        (`errUnlinkChainUnstable`) that abandons the deletion exactly as the
+        rightmost-child refusal does, and an outright refusal for a dead run that
+        loops back onto the target (latching one block twice would deadlock the
+        goroutine against itself). The rightmost-child refusal now reads the
+        LATCHED parent. Dead helpers removed (`applyOpaqueMutation`,
+        `applyParentDownlinkRemoval`, the two `read*FlagsAfterUnlink`). Guards:
+        `internal/access/btree/unlink_protocol_test.go` (+2 — latch-held-at-emit
+        asserted from inside the emitter hook via the new `Slot.TryRLock`, plus
+        record-equals-page for every logged link/flag; and the cyclic-dead-run
+        refusal). Gates: btree/wal/storage/initdb/amcheck PASS; btree -race PASS;
+        units PASS; pgbench smoke PASS (commit hook). 2 ledger rows.
+  - [ ] **S11.5d-3b-2 — swap in the two PG records**. The mutation (S11.5d-3a)
+        and the protocol (S11.5d-3b) are done; the records are not.
+        `unlinkEmptyLeaf` / `unlinkEmptyInternalPage` still emit ONE native
+        `RecordKindBtreeUnlinkPage` covering the union of upstream's two phases.
+        Emit `EncodeBtreeMarkPageHalfDeadPG` + `EncodeBtreeUnlinkPagePG` in its
+        place (the page images they need are the latched pages S11.5d-3b already
+        holds), write the dummy top-parent high key when marking a leaf half-dead
+        (S11.5d-1: a half-dead page IS that tuple, and phase 2 reads
+        `leaftopparent` out of it), and drop the advisory `ParentRemoveSlot` with
+        the native record. Last piece of the historical "documented reason to
+        stay native" (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
+        A8-unlinkpage).
   - [ ] **S11.5d-3c — the safexid recycle horizon**. goopg has no
         `BTPageIsRecyclable`: it stamps `BTDeleted` and recycles the block with
         no XID horizon, so `BTDeletedPageData` has encode+replay coverage

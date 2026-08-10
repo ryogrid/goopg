@@ -642,6 +642,90 @@ AI-20260706-201855-001 regression test) now asserts the stronger invariant
 directly — no live internal page anywhere in the index holds zero items —
 instead of asserting the cascade that used to restore it.
 
+## S11.5d-3b — the emit protocol: latches held across compute → emit → write
+
+S11.5d-3a fixed *what* the primary writes to the parent. This slice fixes *when*
+the primary is allowed to write anything at all, because until it did, no set of
+link values the record carried could be trusted.
+
+The shape goopg had was: walk the sibling chain with **nothing latched** to find
+the nearest live neighbours, emit the unlink record with those values, and then —
+while applying — **re-derive each link again** under the write pin that performs
+the write. The re-derivation was not paranoia. `bt.splitMu` serialises structural
+writes within one `*BTree` Go instance only, and every backend opens its own
+instance per statement, so an Insert-driven split on another connection's
+instance can splice a brand-new live page into this exact chain segment in the
+window between the walk and the write. Stamping the stale walk result there
+stomped that split's own (correct) relink straight back to the pre-split
+neighbour — the mechanism behind block 678's persistent "left link/right link
+pair not in agreement" corruption (AI-20260709-010336-082).
+
+So the write was right and the record was wrong: the primary deliberately wrote
+something other than what it had logged. That makes every link field in the
+record **advisory**, and an advisory field is exactly what a PG-shaped record may
+not carry — `btree_xlog_unlink_page` rebuilds the sibling pages *from the record*
+and has no way to re-derive anything. A standby replaying goopg's stream would
+reconstruct the tree the primary logged, not the tree the primary has.
+
+Upstream does not re-derive; it holds the locks. `_bt_unlink_halfdead_page`
+(nbtpage.c) locks the left sibling, the target and the right sibling, validates
+that the left sibling is still the right one now that it is locked (retrying if a
+split moved it), and only then computes, logs and writes — all inside the same
+critical section. goopg now does the same, in `acquireUnlinkPins`:
+
+- **Acquisition order is parent → left → target → right.** Left→right along the
+  sibling chain is the direction `_bt_split` already takes here (`blk` →
+  `rightBlk` → `oldNext`), so the two cannot deadlock. The parent going *first*
+  is the goopg-specific part: since S11.5b-3 an internal split pins a *lower*
+  level page while holding this level's latches, i.e. goopg latches strictly
+  top-down, and a page deletion that took the parent last would deadlock against
+  it. (Upstream's own order is bottom-up, because upstream's split takes the
+  parent while still holding the child.)
+- **Validation replaces re-derivation.** The neighbour walk is unlatched, so
+  after the three latches are taken the protocol re-reads the two ends and the
+  target and checks the links it walked still hold: the target's own
+  `btpo_prev`/`btpo_next`, the left neighbour's `btpo_next`, the right
+  neighbour's `btpo_prev`. Checking only those three is sufficient because
+  everything in between is a page being deleted in this same pass, and a split
+  never splices next to a dead page — only next to the live page it is
+  splitting, which is precisely the neighbour whose link is checked. On a
+  mismatch the sibling latches are dropped and the walk is redone; a split that
+  spliced a live page in simply makes the next attempt pick *that* page as the
+  new neighbour. This is the same self-correction the old re-derivation
+  performed, moved to before the record is emitted instead of after.
+- **Refusals stay refusals.** After ten failed attempts the protocol gives up
+  (`errUnlinkChainUnstable`) and the caller abandons the deletion exactly as the
+  S11.5d-3a rightmost-child refusal does — the leaf's phase-1 marking is
+  reverted (`abandonHalfDeadLeaf`), the internal page is simply left linked. A
+  dead run that loops back onto the target is refused outright rather than
+  retried, because latching one block twice would deadlock the goroutine against
+  itself.
+- **The rightmost-child refusal now reads the *latched* parent.** It was already
+  before any mutation; it is now also on a page nobody can change underneath it.
+
+With the latches held, the four mutations happen on pages the protocol already
+owns, and the values written are byte-for-byte the values logged. The comment at
+the write site says so, because reintroducing a post-emit re-derivation there is
+the one edit that would silently undo this slice.
+
+Two deliberate non-changes. The **FPI fallbacks** (`unlinkEmptyLeafFPI`,
+`unlinkEmptyInternalPageFPI`, used when no WAL emitter is wired) keep the old
+shape: they log whole page images, so they have no control fields that could go
+stale, and their re-derive-under-the-write remains the correct answer there. And
+`ParentRemoveSlot` is still populated even though nothing reads it — it is part
+of the *native* record, which S11.5d-3b-2 replaces wholesale.
+
+### Guards — S11.5d-3b
+
+`internal/access/btree/unlink_protocol_test.go`. The first guard asserts the
+property the slice exists for, from inside the emitter hook itself — the point in
+the call stack where a PG encoder will read its page images: every block the
+record names must be write-latched at emission (`Slot.TryRLock` succeeds exactly
+when nobody holds the exclusive latch, so the pre-3b code fails this
+deterministically), and afterwards every logged link and flag value must equal
+what is on the page. The second pins the cyclic-dead-run refusal, the one case
+that must fail fast rather than retry.
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -658,19 +742,17 @@ instead of asserting the cascade that used to restore it.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **Rewiring the emit sites (S11.5d-3b)** — the parent mutation is done
-  (S11.5d-3a above); the *protocol* is not. `unlinkEmptyLeaf` /
-  `unlinkEmptyInternalPage` still emit one native record covering the union of
-  both phases, and they emit it **before** applying, then deliberately re-derive
-  each SIBLING link under the write pin (the AI-20260709-010336-082 fix) because
-  a split on another connection's `*BTree` can splice a page in between. That
-  makes the record's own link values advisory, which no PG-shaped record may be.
-  Upstream avoids it by holding all three page locks across the insert; goopg
-  must move to the same protocol (pin left/target/right, compute, emit, write)
-  before it can emit the two PG records in place of the native one. This is the
-  "documented reason to stay native"
-  (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage) restated in
-  terms of what actually blocks it.
+- **Swapping in the two PG records (S11.5d-3b-2)** — the mutation (S11.5d-3a) and
+  the protocol (S11.5d-3b) are both done; the *records* are not.
+  `unlinkEmptyLeaf` / `unlinkEmptyInternalPage` still emit ONE native
+  `RecordKindBtreeUnlinkPage` covering the union of upstream's two phases. What
+  remains is emitting `EncodeBtreeMarkPageHalfDeadPG` +
+  `EncodeBtreeUnlinkPagePG` in their place — which also means writing the dummy
+  top-parent high key when a leaf is marked half-dead (S11.5d-1: a half-dead page
+  IS that tuple, and phase 2 reads `leaftopparent` out of it), and dropping the
+  advisory `ParentRemoveSlot` with the native record. This is the last piece of
+  the "documented reason to stay native"
+  (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage).
 - **The safexid horizon (S11.5d-3c)** — goopg has no `BTPageIsRecyclable`: it
   stamps `BTDeleted` and recycles the block immediately, with no XID horizon, so
   `BTDeletedPageData` has encode and replay coverage but no runtime producer.
