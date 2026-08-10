@@ -1,49 +1,47 @@
-Task: M-NIGHTLY AI-20260810-011258-003 (TestE2E_PGStandbyFullCycle) — blocker #11
-FIXED and committed; blockers #10/#12 root-caused and filed. Item stays OPEN.
+Task: M0130-S11.1 (PG nbtree format layer) — DONE and committed.
 
-KEY RE-TRIAGE (do not repeat last loop's plan): blocker #9 ("goopg cannot
-replay PG's RM_BTREE records") does NOT reproduce at HEAD. An ApplyRecord trace
-over the whole reverse-replay stream shows the promoted PG emits ZERO rmid=11
-records; the id=5 INSERT is only RM_HEAP XLOG_HEAP_INSERT (FPI) + RM_XACT
-COMMIT, both replayed cleanly, and the heap row IS present on the reverse
-standby. What returns 0 is the *index-scan* form of the harness query.
+What changed the plan this loop: M-NIGHTLY AI-20260810-011258-003's remaining
+blockers (#10 relhasindex, #12 private btree page format) are a milestone-sized
+on-disk-format conversion, not triage work. They were promoted out of the
+M-NIGHTLY item into a new **M0130 Theme D (M0130-S11.1 .. S11.6)** with a design
+doc, and S11.1 landed.
 
-Real chain (fix_plan items 10/11/12 under AI-20260810-011258-003):
-- #10 `pg_class.relhasindex` is hardcoded false in `buildUserPGClassRow`
-  (`internal/executor/pg18_user_catalog_rows.go`). PG's ExecInitModifyTable
-  gates ExecOpenIndices on it, and plancat.c's get_relation_info gates
-  RelationGetIndexList on it — so blocker #8's 2678 work is never reached.
-  Probed live: relhasindex=false while indisvalid/ready/live are all true.
-- #12 (GATES #10 and #9) goopg's USER btree files are a goopg-private format
-  (`internal/access/btree`: SizeOfBTPageOpaque=272, btreeVersion=4) vs PG's
-  16-byte BTPageOpaqueData → `_bt_checkpage` errors `index "s10_t_val_idx"
-  contains corrupted page at block 0` (XX002). Measured: flipping #10 makes
-  the E2E fail EARLIER, in Phase B. That is why #10 was reverted.
-- #11 FIXED this loop.
+Landed:
+- `internal/access/btree/pgformat.go` — upstream 16-byte `BTPageOpaqueData` +
+  48-byte `BTMetaPageData` codecs, `BTP_*` flags, `P_NONE`, `InitPGBTPage`
+  (`_bt_pageinit`), `InitPGMetaPage` (`_bt_initmetapage`), `CheckPGBTPage`
+  (Go `_bt_checkpage`). Additive — legacy 272-byte layout in `btree.go` untouched.
+- `internal/access/btree/pgformat_test.go` — 7 guards. Both padding clears
+  (alignment hole at struct offset 28, 7-byte tail after `btm_allequalimage`)
+  mutation-verified.
+- `docs/design/0130-0011-nbtree-pg-on-disk-format.md` (draft) + README row.
+- fix_plan: Theme D slices; AI-003 annotated "CLOSED BY S11.6". Ledger: 1 row.
 
-Landed (#11 — an index relation had no pg_attribute rows of its own):
-- `buildUserPGAttributeRowsForIndex` + `setPGAttributeCol`
-  (`internal/executor/pg18_user_catalog_rows.go`): one row per index attribute
-  (key cols then INCLUDE, attnum 1..indnatts) per upstream
-  ConstructTupleDescriptor (catalog/index.c) — heap column physical type copied
-  verbatim, all relation-level flags reset; expression key → `pg_expression_N`
-  with a `text` type placeholder (ledgered).
-- `syncIndexToCatalogHeap` (`internal/executor/operators_ddl.go`) writes them
-  + the `pg_attribute_relid_attnum_index` (2659) entries.
-- Guards: `internal/executor/pg_attribute_index_rows_test.go`.
+Key facts for the next loop (do not re-derive):
+- Layout verified twice: a `sizeof`/`offsetof` probe compiled with
+  `gcc -Ipostgres/src/include`, and a byte golden from a metapage a real PG 18.3
+  wrote — block 0 of an empty catalog index under
+  `bench/tpch/runtime/pgdata/base/1` (135 such files; find them by
+  `pd_special == 8176 && magic == 0x53162`). No PG server needed.
+- Already PG-correct in goopg and must NOT be "fixed": `BTREE_MAGIC` 0x053162,
+  `BTREE_VERSION` 4, the 24-byte page header, and the line-pointer array
+  (`storage.PageInsertItemRawAt`).
+- Trap: `InitPGMetaPage` zeroes the page via `storage.InitPage`, so a
+  stale-padding test written against it is vacuous — call `WritePGMetaPage`
+  directly on a dirty buffer.
 
-Next step: blocker #12 is a milestone-sized epic (convert
-`internal/access/btree` on-disk layout to upstream nbtree: BTMetaPageData,
-16-byte BTPageOpaqueData, high keys, posting lists; writers bulkload.go /
-btree.go / btree_vacuum.go / posting.go; then PG-faithful btree_redo per
-nbtxlog.c). Per the Current Priority banner, re-read it before selecting —
-do NOT start #12 inside an M-NIGHTLY triage loop without a milestone.
+Next step: M0130-S11.2 (page shape) — switch `readOpaque`/`writeOpaque`/
+`ParseOpaque` in `internal/access/btree/btree.go` to `Read/WritePGOpaque`, move
+the HighKey out of the opaque to a `P_HIKEY` item at offset 1, and translate
+`InvalidBlockNumber`→`P_NONE` plus the flag bits in the SAME edit. Sibling
+readers that must move in lockstep: `internal/amcheck`, `replay.go`; other
+writers: `bulkload.go`, `btree_vacuum.go`. Breaks every existing index on disk
+(REINDEX) — say so in the commit message. Re-read the fix_plan banner first.
 
-Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(executor cached-green, initdb 62.7 s), `go build ./...` clean, new guards PASS,
-`TestE2E_PGStandbyFullCycle` fails at the SAME Phase-D point as before this loop
-(no regression; Phases A–C unchanged), commit-hook pgbench smoke — see status.
-
-Ledger: 3 new rows (#11 landed + expression-type deferral; #10; #12).
+Gates run: `go build ./...` clean; `go vet ./internal/access/btree/` clean;
+`go test ./internal/access/btree/` PASS (2.3 s);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(initdb 60.2 s, wal 8.3 s, rest cached-green); `make ralph-state-guard` OK
+(auto-repaired the stale completed marker); commit-hook pgbench smoke — see status.
 
 In-flight: none.

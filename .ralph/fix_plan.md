@@ -566,6 +566,10 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
          `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`
          (~40 s). Design: addenda in
          `docs/design/0130-0010-pg183-standby-e2e-harness.md`. Ledger: 9 rows.
+      **2026-08-10 — remaining blockers #10/#12 promoted out of this item into
+      M0130 Theme D (M0130-S11.1..S11.6, below).** They are a milestone-sized
+      nbtree on-disk-format conversion, not triage work; S11.1 (the PG format
+      layer) landed 2026-08-10. This item stays open and is CLOSED BY S11.6.
 - [x] **testport/TestPort_IsolationMergeUpdate** — FAILed
       (AI-20260810-011258-004; repro: `go test -v -run
       '^TestPort_IsolationMergeUpdate$' ./internal/testport/`). **STALE —
@@ -726,6 +730,53 @@ Theme C — Physical replication PG compatibility:
 - [x] **M0130-S8 — Multi-timeline START_REPLICATION + timeline reconciliation** (est ~2 loops). TLI source-of-truth = pg_control; IDENTIFY_SYSTEM/START_REPLICATION TIMELINE n; promotion TLI bump. **DONE (2026-08-09).** S8.1: LoadOrCreateTimelineID reads pg_control first (CRC-validated), falls back to flat file. S8.2: IDENTIFY_SYSTEM returns real TLI. S8.3: multi-timeline START_REPLICATION accepted (n ≤ current). S8.3x: FormatSegmentNameTLI + TLI-tolerant reader (openSegmentFile, readStreamFrom). S8.5: finalizePromotion updates pg_control ThisTimeLineID/PrevTimeLineID. Design: `docs/design/0130-0008-multi-timeline-streaming-and-timeline-reconciliation.md` (draft→accepted).
 - [x] **M0130-S9 — recovery.signal archive recovery** (est ~2 loops). recovery.signal mode; restore_command GUC; segment fetch → replay → promote. Design: `docs/design/0130-0009-recovery-signal-archive-recovery.md`. **Build-break repair (2026-08-10):** the S9 commit `2da52113` shipped the tracked caller (`cmd/goopg/main.go` → `wal.RunArchiveRecovery`) but left the implementation files untracked, so a clean checkout of HEAD did **not** compile (`undefined: wal.RunArchiveRecovery`). `internal/wal/archive_recovery.go`, `archive_restore.go`, `archive_recovery_test.go` are now committed, plus a `TestRunArchiveRecoveryFetchesThenStops` end-to-end gate over the fetch/terminate loop.
 - [x] **M0130-S10 — PG 18.3 standby E2E harness** (est ~2 loops). pg_basebackup → pg_ctl start → stream → failover → reverse attach; replcluster PG instance management. Design: `docs/design/0130-0010-pg183-standby-e2e-harness.md`. **DONE (2026-08-09).** `TestE2E_PGStandbyFullCycle` four-phase test: goopg primary → pg_basebackup → PG standby → DDL/DML replay → promote → reverse-attach goopg standby on new timeline. Design accepted.
+
+Theme D — nbtree PG-identical on-disk format (filed 2026-08-10, from S10 blocker #12):
+
+**Why a new theme:** S10's `TestE2E_PGStandbyFullCycle` (AI-20260810-011258-003)
+is blocked on two chained blockers. #10 (`pg_class.relhasindex` hardcoded false)
+cannot be flipped until #12 is done: goopg's user B-tree files use a private page
+format (272-byte special area) that upstream `_bt_checkpage` rejects with XX002
+`contains corrupted page at block 0`. Measured — flipping #10 alone makes the E2E
+fail EARLIER, in Phase B. #12 is milestone-sized, so it is decomposed here rather
+than worked inside an M-NIGHTLY triage loop.
+**Design:** `docs/design/0130-0011-nbtree-pg-on-disk-format.md` (draft).
+**Caution:** S11.2–S11.4 break the on-disk format of every existing goopg index;
+there is no in-place upgrade path (REINDEX). Say so in those commit messages.
+
+- [x] **M0130-S11.1 — PG nbtree format layer** (est ~1 loop). **DONE (2026-08-10).**
+      `internal/access/btree/pgformat.go`: upstream 16-byte `BTPageOpaqueData`
+      and 48-byte `BTMetaPageData` codecs, the `BTP_*` flag set, `P_NONE`,
+      `InitPGBTPage` (`_bt_pageinit`), `InitPGMetaPage` (`_bt_initmetapage`),
+      and `CheckPGBTPage` — a Go transcription of `_bt_checkpage` so writers can
+      be gated on the oracle's own acceptance test. Additive: the legacy layout
+      in `btree.go` is untouched. Layout verified twice — a
+      `sizeof`/`offsetof` probe against `postgres/src/include`, and a byte
+      golden taken from a metapage a real PG 18.3 wrote
+      (`bench/tpch/runtime/pgdata/base/1`). Guards:
+      `internal/access/btree/pgformat_test.go` (7 tests; both padding clears
+      mutation-verified).
+- [ ] **M0130-S11.2 — page shape** (est ~2 loops). Switch
+      `readOpaque`/`writeOpaque`/`ParseOpaque` to the 16-byte form; move the
+      high key out of the opaque into a `P_HIKEY` item at offset 1; translate
+      the sibling sentinel (`InvalidBlockNumber` → `P_NONE`) and the flag bits
+      in the SAME edit (an intermediate that does only some is neither format).
+      Writers: `btree.go`, `bulkload.go`, `btree_vacuum.go`. Sibling readers
+      that must move in lockstep: `internal/amcheck`, `replay.go`.
+- [ ] **M0130-S11.3 — metapage** (est ~1 loop). `BTreeMeta` → `PGBTMetaPage`
+      at block 0 via S11.1's codec, including the `pd_lower` advance.
+- [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
+      `IndexTupleData` (8-byte header) + null bitmap + PG binary datums;
+      internal-page downlinks into `t_tid`. Couples the index format to the
+      type-codec layer.
+- [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
+      `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
+      goopg index maintenance and not merely read a basebackup snapshot.
+- [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
+      `relhasindex` in `buildUserPGClassRow`
+      (`internal/executor/pg18_user_catalog_rows.go`), re-run
+      `TestE2E_PGStandbyFullCycle` end to end, and add `pg_amcheck` over a
+      goopg-written user index as the standing gate.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
