@@ -798,7 +798,30 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
 - [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
       `IndexTupleData` (8-byte header) + null bitmap + PG binary datums;
       internal-page downlinks into `t_tid`. Couples the index format to the
-      type-codec layer.
+      type-codec layer. Decomposed into three loops:
+  - [x] **slice 1 — the codec, additive** (2026-08-10).
+        `internal/access/btree/pgtuple.go`: `FormPGIndexTuple`/
+        `DeformPGIndexTuple` (`index_form_tuple`/`index_deform_tuple` over
+        `heap_compute_data_size`/`fill_val`), the `itup.h` `t_info` accessors,
+        the `(bi_hi, bi_lo)` `ItemPointerData` codec, `nbtree.h`'s
+        alternative-TID overlay (pivot/posting predicates, `Set`/`GetNAtts`,
+        downlink, tiebreaker heap TID) and `BTMaxItemSize` +
+        `CheckPGBTItemSize` (`_bt_check_third_page`). No writer touched.
+        Byte-compared against 8 of the PG-validated hand-rolled encoders in
+        `internal/initdb/btree_index_bootstrap.go`
+        (`TestPGIndexTupleMatchesBootstrapEncoders`) — those are an oracle,
+        since a real PG 18.3 reads the bootstrap indexes they write. No
+        in-line compression / external detoasting (TOAST_INDEX_HACK) and no
+        posting-list writer — 1 ledger row.
+  - [ ] **slice 2 — flip the writers**. Replace `item`/`itemPrefixSize` in
+        `btree.go` with the codec at every writer/reader; internal-page child
+        pointers move into `t_tid` via `BTreeTupleSetDownLink`. **Breaks the
+        on-disk format again — REINDEX.**
+  - [ ] **slice 3 — comparison layer + pivot truncation**. Key bytes become
+        per-attribute binary datums, so `bytes.Compare` gives way to
+        type-aware comparison; `P_HIKEY` becomes a `_bt_truncate` pivot tuple,
+        which is when `MaxHighKeyLen`/`bulkHighKeyReserve` can be retired in
+        favour of `BTMaxItemSize`.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

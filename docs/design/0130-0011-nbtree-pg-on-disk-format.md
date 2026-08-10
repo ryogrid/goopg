@@ -211,7 +211,39 @@ sources agree:
     `_bt_allequalimage` computation (support function 4) is a ledger row.
 - **S11.4 — tuple shape.** goopg `item` → `IndexTupleData` + null bitmap + PG
   binary datums; downlinks into `t_tid`. This is the largest slice and the one
-  that couples the index format to the type-codec layer.
+  that couples the index format to the type-codec layer. Decomposed into three
+  loops; **slice 1 (the codec) landed 2026-08-10**, slices 2/3 (writers, then
+  the comparison layer + pivot truncation) are open.
+  - **S11.4 slice 1 — the codec, additive.** `internal/access/btree/pgtuple.go`
+    is `index_form_tuple`/`index_deform_tuple`
+    (`postgres/src/backend/access/common/indextuple.c`, over `heaptuple.c`'s
+    `heap_compute_data_size`/`heap_fill_tuple`) plus the `t_info` accessors from
+    `itup.h` and the alternative-TID overlay from `nbtree.h`
+    (`BTreeTupleIsPivot`/`IsPosting`, `Set`/`GetNAtts`, the downlink and the
+    tiebreaker heap TID), `BTMaxItemSize` and `_bt_check_third_page`'s
+    criterion. No writer is touched: `item.marshal`/`parseItem` still emit
+    goopg's private body.
+    Two things drove the shape of this slice. First, goopg **already** emits
+    real `index_form_tuple` output — but only from ten hand-rolled fixed-shape
+    encoders in `internal/initdb/btree_index_bootstrap.go`, each with its size
+    worked out in a comment. Those are validated by a real PG 18.3 reading the
+    bootstrap catalog indexes, which makes them an oracle: the new general
+    codec is byte-compared against eight of them by
+    `TestPGIndexTupleMatchesBootstrapEncoders` (internal/initdb), and they
+    become its callers rather than staying duplicates. Second, the codec takes
+    a local `PGIndexAttr` (attlen/attbyval/attalignby/attstorage) instead of a
+    catalog `TupleDesc`, so the on-disk layer keeps its single dependency on
+    `internal/storage` — S11.4 must not be the slice that couples
+    `internal/access/btree` to the type layer, even though slice 3 must
+    consume it.
+    The traps the guards pin: `BlockIdData` is `(bi_hi, bi_lo)` uint16 halves,
+    not a flat LE uint32 (encoding block 3 flat makes PG read 196608); the null
+    bitmap lives at offset `sizeof(IndexTupleData)` = 8, **not** at `hoff` —
+    the MAXALIGN pad between bitmap and data belongs to the data area; a set
+    bitmap bit means the value is PRESENT; and a packable varlena short enough
+    for a 1-byte header is re-headered **and** loses its alignment padding
+    entirely (`fill_val`'s "convert to short varlena -- no alignment" branch),
+    which is the single easiest way to produce a tuple PG reads one byte off.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.
