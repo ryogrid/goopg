@@ -427,6 +427,33 @@ func CheckPGBTItemSize(size int, needHeapTID bool) error {
 	return nil
 }
 
+// CheckPGBTThirdPage is `_bt_check_third_page` itself — the admission gate every
+// nbtree writer runs before an item goes on a page (`_bt_findinsertloc` for the
+// leaf insert path, `_bt_buildadd` for the bulk loader). It is the rule that
+// replaced goopg's `MaxHighKeyLen` in M0130-S11.4 slice 3b-3d.
+//
+// The leaf/internal split is not cosmetic. A leaf tuple is charged the TIGHTER
+// bound because `_bt_truncate` may have to append a tiebreaker heap TID to the
+// separator derived from it (3b-3c), which makes the resulting PIVOT up to one
+// MAXALIGN quantum larger than the leaf tuple it came from; the internal level
+// is charged the looser bound precisely so it can accept that pivot. Upstream
+// says the same by passing `needheaptidspace = isleaf` from the bulk loader and
+// `heapkeyspace` (always true on v4) from the leaf insert path.
+//
+// The distinct internal-page message mirrors upstream's `elog(ERROR, "cannot
+// insert oversized tuple ... on internal page")`: reaching it means an earlier
+// leaf-level insertion that should have failed did not, i.e. a goopg bug rather
+// than a user's over-wide index row.
+func CheckPGBTThirdPage(leaf bool, size int) error {
+	if err := CheckPGBTItemSize(size, leaf); err == nil {
+		return nil
+	}
+	if !leaf {
+		return fmt.Errorf("btree: cannot insert oversized tuple of size %d on an internal page", size)
+	}
+	return CheckPGBTItemSize(size, true)
+}
+
 // ---------------------------------------------------------------------------
 // form / deform
 // ---------------------------------------------------------------------------

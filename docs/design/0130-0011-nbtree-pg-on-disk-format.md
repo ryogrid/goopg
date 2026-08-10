@@ -156,7 +156,9 @@ sources agree:
        that), the dedup-recovery budget subtracts `pageHighKeyFootprint`, and
        the bulk loader withholds `bulkHighKeyReserve` — deliberately the worst
        case, which keeps its per-page data capacity within twelve bytes of the
-       legacy layout's so split points do not move.
+       legacy layout's so split points do not move. (Slice 3b-3d later replaced
+       that constant with the exact separator body, once suffix truncation made
+       one worth computing.)
 
   Three mechanisms decided here, so S11.2b is a mechanical edit rather than a
   redesign:
@@ -1266,6 +1268,80 @@ sources agree:
       the pre-slice separator kept in the test as the mutation reference; the
       marshal round trip; and the end-to-end 1500-duplicate tree where both the
       point descents and the prefix range scan must find every entry.
+    - **3b-3d — `_bt_check_third_page` replaces `MaxHighKeyLen` (2026-08-10).**
+      The last of 3b-3's deferrals, and the one that only became *correct* once
+      3b-3c existed.
+
+      goopg bounded the wrong object. `MaxHighKeyLen = 256` was a ceiling on the
+      SEPARATOR, checked in the split path, and there was no bound on a leaf row
+      at all — the opposite of upstream, which bounds the ROW at a third of a
+      page (`BTMaxItemSize`, `_bt_check_third_page`) and lets the separator be
+      whatever suffix truncation leaves. The consequence was not academic: an
+      over-wide index row was admitted happily and the failure surfaced later,
+      at the unrelated split that had to turn it into a high key, as a message
+      about a key length no user ever wrote.
+
+      `CheckPGBTThirdPage(leaf, size)` (`pgtuple.go`) is now that gate, run
+      where upstream runs it — `BTree.Insert` (`_bt_doinsert`'s "1/3 of a page
+      restriction"; goopg needs it at the one door `tryInsertNoSplit` and
+      `insertIntoBlock` share, since it does not depend on which page wins) and
+      both bulk-loader levels (`_bt_buildadd`). The split path's old
+      `MaxHighKeyLen` test becomes the same check on the resulting pivot at the
+      INTERNAL bound. That leaf/internal asymmetry is the whole reason upstream
+      has two constants: a leaf tuple is charged `BTMaxItemSize` because
+      3b-3c's `_bt_truncate` may append a tiebreaker heap TID to the separator
+      derived from it, and the internal level is charged the 8-byte-looser
+      `BTMaxItemSizeNoHeapTid` precisely so it can accept that grown pivot.
+      Upstream says it by passing `needheaptidspace = isleaf`.
+
+      The second half is `bulkHighKeyReserve` → an exact reserve. The bulk
+      loader cannot know a page's high key while filling it — the separator is
+      the first key of the NEXT page — so it withholds body space for it; the
+      old constant withheld the worst case, `4 + 8 + MaxHighKeyLen = 268`
+      bytes of every page. Upstream reserves only
+      `MAXALIGN(sizeof(ItemPointerData))` and pays for the rest by MOVING the
+      page's last tuple to the new page and overwriting its slot with the
+      separator, which it must do because `_bt_buildadd` is a streaming writer
+      that has not seen the next tuple yet. goopg's loader has the whole sorted
+      run in hand and moves nothing, so it can do better than either: it forms
+      the actual separator for the next boundary (`separatorAt(i+1)`) and
+      reserves exactly its body. The separator is computed one iteration ahead
+      and carried in `pendingSep`, so the check that holds the space and the
+      flush that spends it are the same bytes rather than two independent
+      estimates — the failure mode a re-derivation would reintroduce is a page
+      that fills completely and then cannot hold its own high key.
+
+      A fresh page can never reject its own first item, which is what keeps the
+      loader from looping: the gate caps a data item at 2704 and a separator at
+      2712, and 2708 + 2712 is well under the 8148 bytes a freshly initialised
+      page has after its header, special area and reserved `P_HIKEY` line
+      pointer.
+
+      **Posting tuples are exempt from the gate in `buildLevelRaw`, and that is
+      a recorded gap.** Upstream never has to check them because the writer that
+      builds them bounds them first: `_bt_dedup_pass` caps a posting list at
+      `dstate->maxpostingsize ≤ BTMaxItemSize` (`nbtdedup.c`) and starts a new
+      list at the cap. goopg's `deduplicateToRawItems` has no such cap and hands
+      the loader posting tuples of several thousand bytes; rejecting them here
+      would break bulk index creation on duplicate-heavy columns instead of
+      fixing anything. The fix belongs to the still-missing `_bt_dedup_pass` —
+      ledger row.
+
+      NOT REINDEX-required: nothing about the on-disk shape changes. Pages
+      written before this slice are readable, and the only visible difference is
+      that new bulk-loaded pages pack tighter.
+
+      Guard: `internal/access/btree/pgthirdpage_test.go` — the leaf/internal
+      boundary table (including the 8-byte band an internal page must accept and
+      a leaf must not), the oversized row refused at `Insert` with upstream's
+      "index row size … exceeds btree version 4 maximum" wording, and a
+      variable-width bulk load asserting both directions of the reserve at once:
+      every non-rightmost page still carries a parseable pivot high key (a
+      reserve that under-shot would show up as a flush error or a missing
+      separator), and at least one leaf is packed tighter than the retired
+      268-byte constant ever allowed — the assertion that fails if a later
+      cleanup quietly restores a worst-case constant.
+
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.

@@ -7,32 +7,47 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// bulkHighKeyReserve is the tuple-body budget the bulk loader holds back on
-// every page for the separator it may have to install at flush time.
+// separatorReserve is the page-space budget the bulk loader holds back for the
+// separator it will have to install when it closes the page (M0130-S11.4 slice
+// 3b-3d; it replaced the constant `bulkHighKeyReserve`, a worst-case
+// MaxHighKeyLen body).
 //
-// The bulk loader cannot know a page's high key while it is filling it: the
-// separator is the FIRST KEY OF THE NEXT PAGE, which does not exist yet. The
-// P_HIKEY line pointer is reserved up front by pgReserveHiKeySlot (upstream's
-// pd_lower bump in _bt_blnewpage), but its payload is not, so the budget for
-// that payload has to be withheld here or a page can fill so completely that
-// its own separator no longer fits.
+// A page's high key is the FIRST KEY OF THE NEXT PAGE, so it does not exist
+// while the page is being filled. The P_HIKEY line pointer is reserved up front
+// by pgReserveHiKeySlot (upstream's pd_lower bump in _bt_blnewpage) and is
+// therefore already outside `free` below, but its PAYLOAD is not: without a
+// reserve a page can fill so completely that its own separator no longer fits.
 //
-// Reserving the worst case (a MaxHighKeyLen separator) rather than a measured
-// one is deliberate: it makes the bulk loader's per-page data capacity
-// 8192-24-16-4-8-256 = 7884 bytes, within twelve bytes of the 7896 the legacy
-// 272-byte opaque afforded — so the flip does not move split points and the
-// index-size / page-count expectations in the bulk-load tests hold. Upstream
-// instead truncates the separator to its key attributes (_bt_truncate) and can
-// therefore reserve exactly; that is S11.4 work.
-// (The body term is already a multiple of 8, so the MAXALIGNed placement
-// introduced by 3b-3a does not widen the reserve.)
-const bulkHighKeyReserve = 4 /* ItemIdData */ + SizeOfIndexTupleData + MaxHighKeyLen
+// goopg can reserve EXACTLY where upstream cannot. `_bt_buildadd` is a streaming
+// writer that has not seen the next tuple yet, so it reserves the worst case it
+// can bound — MAXALIGN(sizeof(ItemPointerData)), the most _bt_truncate can add —
+// and pays for the rest by MOVING the page's last tuple to the new page and
+// overwriting its slot with the separator. goopg's loader has the whole sorted
+// run in hand and does not move anything, so it forms the actual separator for
+// the next boundary and reserves its body. `sep` is the very tuple flushPage
+// will write, which is what makes the reserve exact rather than merely safe.
+//
+// `sep == nil` means the page will be the level's rightmost: no high key, no
+// reserve (upstream's _bt_slideleft ending).
+func (f indexFormat) separatorReserve(sep []byte) int {
+	if sep == nil {
+		return 0
+	}
+	return MaxAlign(f.bodySize(sep))
+}
 
-// pageHasSpaceForBulk is pageHasSpaceFor plus that reserve.
-func (f indexFormat) pageHasSpaceForBulk(p storage.Page, it item) bool {
+// pageHasSpaceForBulk is pageHasSpaceFor plus the reserve for `sep`, the
+// separator that would be installed if the NEXT item started a new page.
+//
+// A fresh page always passes: CheckPGBTThirdPage caps a data item at
+// BTMaxItemSize and a separator at BTMaxItemSizeNoHeapTid, and 2704+4 + 2712 is
+// well under the 8148 bytes a freshly initialised page has left after its
+// header, its special area and the reserved P_HIKEY line pointer. So the loader
+// cannot loop allocating pages that reject their own first item.
+func (f indexFormat) pageHasSpaceForBulk(p storage.Page, it item, sep []byte) bool {
 	h := storage.MustHeader(p)
 	free := int(h.Upper()) - int(h.Lower())
-	return free >= f.itemEncodedSize(it)+bulkHighKeyReserve
+	return free >= f.itemEncodedSize(it)+f.separatorReserve(sep)
 }
 
 // BulkEntry is one (encoded-key, heap-pointer) pair for bulk index building.
@@ -406,6 +421,29 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 		return err
 	}
 
+	// separatorAt(i) is the high key the page ending just before items[i] must
+	// carry: the separator between the last item on it and the first item of the
+	// next page. `_bt_buildadd` truncates that separator on a LEAF level only
+	// (nbtsort.c: the internal levels re-use the pivot the level below produced),
+	// which is also what truncateSeparator does when handed a pivot operand — the
+	// level check here is the readable half of the same statement.
+	// M0130-S11.4 slice 3b-3c.
+	separatorAt := func(i int) []byte {
+		if i <= 0 || i >= len(items) {
+			return nil
+		}
+		if flags&BTLeaf != 0 {
+			return bt.format().truncateSeparator(items[i-1], items[i])
+		}
+		return items[i].key
+	}
+
+	// pendingSep is separatorAt(i) for the item about to be examined, computed
+	// one iteration earlier so the space check and the flush that consumes the
+	// reserve agree on the exact bytes rather than on two independent estimates
+	// (3b-3d). nil on the first item and past the last: no boundary there.
+	var pendingSep []byte
+
 	for i, it := range items {
 		// Allocate a page if we don't have one open.
 		if curSlot == nil {
@@ -414,7 +452,15 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 			}
 		}
 
-		if !bt.format().pageHasSpaceForBulk(curSlot.Page(), it) {
+		// _bt_buildadd's `_bt_check_third_page` call.
+		if err := CheckPGBTThirdPage(flags&BTLeaf != 0, MaxAlign(bt.format().bodySize(it.key))); err != nil {
+			curSlot.Unlock()
+			bt.pool.Unpin(curSlot)
+			return nil, err
+		}
+		nextSep := separatorAt(i + 1)
+
+		if !bt.format().pageHasSpaceForBulk(curSlot.Page(), it, nextSep) {
 			// Current page is full. Allocate the next page first so we can
 			// write its block number into the current page's Next field.
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
@@ -424,16 +470,14 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 				return nil, fmt.Errorf("btree bulk: PinNew next at level %d: %w", level, err)
 			}
 
-			// highKey of the current page = the separator between the last item
-			// on it and the first item of the next page. `_bt_buildadd` truncates
-			// that separator on a LEAF level only (nbtsort.c: the internal levels
-			// re-use the pivot the level below produced), which is also what
-			// truncateSeparator does when handed a pivot operand — the level
-			// check here is the readable half of the same statement.
-			// M0130-S11.4 slice 3b-3c.
-			highKey := items[i].key
-			if flags&BTLeaf != 0 && i > 0 {
-				highKey = bt.format().truncateSeparator(items[i-1], items[i])
+			// The separator the page reserved space for while it was filling.
+			highKey := pendingSep
+			if highKey == nil {
+				// i == 0: a fresh page rejecting its very first item. Bounded
+				// away by pageHasSpaceForBulk's size argument, but a wrong
+				// answer here would be a silent structural break, so fall back
+				// to the untruncated key rather than write no high key at all.
+				highKey = items[i].key
 			}
 
 			// Flush and release current page, linking it to nextBlk.
@@ -466,6 +510,7 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 			bt.pool.Unpin(curSlot)
 			return nil, fmt.Errorf("btree bulk: PageAddItemRaw: %w", err)
 		}
+		pendingSep = nextSep
 	}
 
 	// Flush the final (rightmost) page at this level.
@@ -659,6 +704,27 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 		return err
 	}
 
+	// `_bt_buildadd`'s separator, truncated on a leaf level exactly as in
+	// buildLevel above (M0130-S11.4 slice 3b-3c). This is the path where the
+	// tiebreaker branch earns its keep: a duplicate run chunked across pages puts
+	// two entries with IDENTICAL key attributes on either side of the boundary,
+	// and a separator without lastleft's heap TID would sort BELOW the left
+	// page's own entries.
+	separatorAt := func(i int) []byte {
+		if i <= 0 || i >= len(raws) {
+			return nil
+		}
+		if flags&BTLeaf != 0 {
+			return bt.format().truncateSeparator(
+				bt.format().rawSeparatorOperand(raws[i-1]),
+				item{key: raws[i].key})
+		}
+		return raws[i].key
+	}
+	// See buildLevel: computed one iteration ahead so the reserve and the flush
+	// that spends it are the same bytes (3b-3d).
+	var pendingSep []byte
+
 	for i, ri := range raws {
 		if curSlot == nil {
 			if err := startNewPage(prevBlk); err != nil {
@@ -666,28 +732,43 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 			}
 		}
 
-		// Capacity check: need room for a line pointer + the raw bytes.
+		// _bt_buildadd's `_bt_check_third_page` call. The raw path's item is
+		// already marshalled, so its body is exactly len(ri.raw).
+		//
+		// POSTING TUPLES ARE EXEMPT, and that exemption is a recorded gap, not
+		// a design choice. Upstream never has to check them because the writer
+		// that builds them bounds them first: `_bt_dedup_pass` caps a posting
+		// list at `dstate->maxpostingsize` (<= BTMaxItemSize, nbtdedup.c) and
+		// starts a new one when the cap is reached. goopg's dedup
+		// (deduplicateToRawItems) has no such cap, so it hands this loop
+		// posting tuples of several thousand bytes; rejecting them here would
+		// break bulk index creation on duplicate-heavy columns rather than fix
+		// anything. See the deferral ledger — the fix belongs to the missing
+		// `_bt_dedup_pass`, not to the size gate.
+		if !BTreeTupleIsPosting(ri.raw) {
+			if err := CheckPGBTThirdPage(flags&BTLeaf != 0, MaxAlign(len(ri.raw))); err != nil {
+				curSlot.Unlock()
+				bt.pool.Unpin(curSlot)
+				return nil, err
+			}
+		}
+		nextSep := separatorAt(i + 1)
+
+		// Capacity check: need room for a line pointer + the raw bytes, plus the
+		// body of the separator this page will have to carry.
 		h := storage.MustHeader(curSlot.Page())
 		free := int(h.Upper()) - int(h.Lower())
 		const itemIDSize = 4
-		if free < itemIDSize+MaxAlign(len(ri.raw))+bulkHighKeyReserve {
+		if free < itemIDSize+MaxAlign(len(ri.raw))+bt.format().separatorReserve(nextSep) {
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
 			if err != nil {
 				curSlot.Unlock()
 				bt.pool.Unpin(curSlot)
 				return nil, fmt.Errorf("btree bulk raw: PinNew next: %w", err)
 			}
-			// `_bt_buildadd`'s separator, truncated on a leaf level exactly as in
-			// buildLevel above (M0130-S11.4 slice 3b-3c). This is the path where
-			// the tiebreaker branch earns its keep: a duplicate run chunked
-			// across pages puts two entries with IDENTICAL key attributes on
-			// either side of the boundary, and a separator without lastleft's
-			// heap TID would sort BELOW the left page's own entries.
-			highKey := raws[i].key
-			if flags&BTLeaf != 0 && i > 0 {
-				highKey = bt.format().truncateSeparator(
-					bt.format().rawSeparatorOperand(raws[i-1]),
-					item{key: raws[i].key})
+			highKey := pendingSep
+			if highKey == nil {
+				highKey = raws[i].key // i == 0; see buildLevel
 			}
 			if err := flushPage(highKey, nextBlk); err != nil {
 				bt.pool.Unpin(nextSlot)
@@ -714,6 +795,7 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 			bt.pool.Unpin(curSlot)
 			return nil, fmt.Errorf("btree bulk raw: PageAddItemRaw: %w", err)
 		}
+		pendingSep = nextSep
 	}
 
 	if curSlot != nil {

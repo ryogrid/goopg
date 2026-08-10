@@ -786,8 +786,9 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 // index probe (M0053-0001). It must exceed the maximum suffix-column
 // encoding for any plausible composite key. 64 bytes covers up to
 // ~8 trailing int4/int8 columns, ~3 NUMERIC(38) columns, or 1 varchar(60).
-// PostgreSQL's MaxHighKeyLen on goopg is 32, but leaf keys are not
-// truncated, so a generous bound is required.
+// This is a SCAN-KEY padding, not an on-disk bound: separators are suffix-
+// truncated (M0130-S11.4 3b-3c) but a leaf key is not, so the padding has to
+// cover a whole trailing key encoding.
 const compositeUpperPaddingLen = 64
 
 // appendCompositeUpperPadding returns key with `compositeUpperPaddingLen`

@@ -1431,7 +1431,32 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               `internal/access/btree/pgtruncate_test.go`. Gates: btree/amcheck/
               storage + units PASS; tpch-spotcheck PASS (Q12=2, Q13=35);
               pgbench smoke PASS.
-        - [ ] **3b-3d** — `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`.
+        - [x] **3b-3d — `_bt_check_third_page` replaces `MaxHighKeyLen`**
+              (2026-08-10). NOT REINDEX-required (nothing on disk changes
+              shape). goopg bounded the wrong object: `MaxHighKeyLen = 256`
+              capped the SEPARATOR and nothing capped a leaf row, so an
+              over-wide index row was admitted and only failed later, at the
+              split that had to turn it into a high key. `CheckPGBTThirdPage`
+              (`pgtuple.go`) is upstream's rule — bound the ROW at a third of a
+              page — run where upstream runs it: `BTree.Insert` (`_bt_doinsert`;
+              the one door `tryInsertNoSplit` and `insertIntoBlock` share) and
+              both bulk-loader levels (`_bt_buildadd`). The split path's old
+              length test becomes the same check on the resulting pivot at the
+              INTERNAL bound: a leaf row is charged `BTMaxItemSize` because
+              3b-3c's `_bt_truncate` may append a tiebreaker heap TID to a
+              separator derived from it, and the level above is charged the
+              8-byte-looser `BTMaxItemSizeNoHeapTid` so it can accept that grown
+              pivot. `bulkHighKeyReserve`'s worst-case 268 bytes per page became
+              an EXACT reserve — goopg's loader holds the whole sorted run, so
+              it forms the next boundary's separator (`separatorAt(i+1)`,
+              carried in `pendingSep`) and reserves its body, which upstream's
+              streaming `_bt_buildadd` cannot do and pays for by moving the last
+              tuple to the new page instead. Guard
+              `internal/access/btree/pgthirdpage_test.go`. 1 ledger row: posting
+              tuples are exempt from the gate because goopg's dedup has no
+              `_bt_dedup_pass` `maxpostingsize` cap. Gates: btree/amcheck/
+              storage + units PASS; tpch-spotcheck PASS (Q12=2, Q13=35);
+              pgbench smoke PASS.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

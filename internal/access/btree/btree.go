@@ -35,13 +35,12 @@ import (
 // docs/design/0130-0011-nbtree-pg-on-disk-format.md.
 const SizeOfBTPageOpaque = SizeOfBTPageOpaquePG
 
-// MaxHighKeyLen bounds a separator key. It is no longer a FORMAT limit — the
-// high key is an ordinary page item now, so the real ceiling is page space —
-// but it is retained as a writer-side guard because goopg has not yet adopted
-// upstream's actual rule (BTMaxItemSize, roughly a third of a page, enforced in
-// _bt_check_third_page). Replacing it with that rule is S11.4 work; see the
-// deferral ledger.
-const MaxHighKeyLen = 256
+// (MaxHighKeyLen — goopg's 256-byte separator ceiling — was deleted by
+// M0130-S11.4 slice 3b-3d. It was never upstream's rule: nbtree bounds an ITEM,
+// not a high key, at a third of a page (BTMaxItemSize, _bt_check_third_page),
+// and lets the separator be whatever suffix truncation leaves. CheckPGBTThirdPage
+// is now that gate, run where upstream runs it — the leaf insert path and both
+// bulk-loader levels.)
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
 const btSpecialOffset = pgSpecialOffset
@@ -2444,6 +2443,19 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	bt.stats.inserts.Add(1) // M0055-0001
 	it := item{ptr: ptr, key: append([]byte(nil), key...)}
 
+	// _bt_doinsert's 1/3-of-a-page restriction (M0130-S11.4 slice 3b-3d — the
+	// rule that replaced goopg's 256-byte MaxHighKeyLen). Upstream checks in
+	// _bt_findinsertloc, once the leaf is pinned; goopg has two leaf writers
+	// below (tryInsertNoSplit and insertIntoBlock) and the answer does not
+	// depend on the page, so the gate sits at the one door they share. The LEAF
+	// bound is the tighter one: it leaves room for the tiebreaker heap TID
+	// _bt_truncate may append to a separator derived from this row, which is
+	// what makes the split path's pivot check and the bulk loader's separator
+	// reserve sound.
+	if err := CheckPGBTThirdPage(true, MaxAlign(bt.format().bodySize(it.key))); err != nil {
+		return err
+	}
+
 	// Fast path: no split required. Writers touching different leaves
 	// only contend on those page latches, not on a tree-wide mutex.
 	if err := bt.tryInsertNoSplit(it); err == nil {
@@ -2567,6 +2579,19 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			continue
 		}
 		break
+	}
+
+	// _bt_findinsertloc's "Check 1/3 of a page restriction" (M0130-S11.4 slice
+	// 3b-3d — the rule that replaced MaxHighKeyLen). insertIntoBlock serves both
+	// levels — a leaf tuple from Insert, a separator from _bt_insert_parent — so
+	// the bound comes from the pinned page: a LEAF tuple is charged the tighter
+	// BTMaxItemSize, which leaves room for the tiebreaker heap TID _bt_truncate
+	// may later append to a separator derived from it, and the pivot that
+	// results is charged the looser bound on the level above. Rejecting here is
+	// what makes every later size argument sound (the split path's pivot check,
+	// the bulk loader's separator reserve).
+	if err := CheckPGBTThirdPage(op.Flags&BTLeaf != 0, MaxAlign(bt.format().bodySize(it.key))); err != nil {
+		return err
 	}
 
 	// Test-only fault injection: fires exactly where insertItemSorted
@@ -2766,12 +2791,16 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		lastLeft = leftItems[len(leftItems)-1]
 	}
 	sepKey := bt.format().truncateSeparator(lastLeft, rightItems[0])
-	if len(sepKey) > MaxHighKeyLen {
+	// _bt_check_third_page on the resulting PIVOT (3b-3d). The separator lands
+	// on this page at P_HIKEY and a copy of it lands on the parent, so it is
+	// charged the internal-level bound — the looser one, which exists exactly to
+	// absorb the tiebreaker heap TID truncateSeparator may have just appended.
+	// Unreachable unless a leaf item slipped past insertIntoBlock's own gate.
+	if err := CheckPGBTThirdPage(false, MaxAlign(bt.format().bodySize(sepKey))); err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		held.release()
-		return fmt.Errorf("btree: separator key length %d exceeds MaxHighKeyLen %d",
-			len(sepKey), MaxHighKeyLen)
+		return err
 	}
 
 	// Reset left page to empty, then — BEFORE any data item goes back on —
