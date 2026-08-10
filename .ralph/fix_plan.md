@@ -854,6 +854,38 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         MAXALIGNs slice 2 deferred (tuple size, posting offset), real suffix
         truncation (`_bt_keep_natts` → pivot natts < nkeyatts), and retiring
         `MaxHighKeyLen`/`bulkHighKeyReserve` in favour of `BTMaxItemSize`.
+        Itself milestone-sized (it is the slice that couples the on-disk format
+        to the type layer), so decomposed into three:
+    - [x] **3b-1 — descriptor + comparator, additive** (2026-08-10).
+          `internal/access/btree/pgcompare.go`: `PGKeyAttr` /
+          `PGIndexKeyDesc` (the physical `PGIndexAttr` plus the three ordering
+          properties `_bt_compare` consults — the opclass comparator,
+          `SK_BT_DESC`, `SK_BT_NULLS_FIRST`) and `ComparePGIndexTuples`,
+          `_bt_compare`'s body for the tuple-vs-tuple case. Takes upstream's
+          own seam out of "nbtree knows no types": the BTORDER_PROC comparator
+          the caller installs, here a plain left-vs-right func (not upstream's
+          flipped-argument convention), so DESC is one negation in one place.
+          Three rules a naive attribute loop misses, all mutation-verified:
+          truncated attributes are MINUS INFINITY (the shorter side sorts
+          first — this is what orders the zero-attribute downlink with no
+          special case), the heap TID is the final key attribute and an absent
+          one is minus infinity too, and NULL ordering is per-attribute. A nil
+          `Compare` means `CompareKeys` on purpose — that is what lets 3b-2
+          migrate one type at a time instead of as a flag day. Additive: no
+          writer builds a descriptor yet, nothing on disk moved. Guards:
+          `pgcompare_test.go` (9). Not modelled (1 ledger row): collations,
+          cross-type comparison, and posting-list tuples (rejected, not
+          guessed).
+    - [ ] **3b-2 — thread the descriptor, retire `CompareKeys`**. Build the
+          descriptor from the catalog (`pg_index.indoption` carries DESC and
+          NULLS FIRST independently), pass it through `btree.Options`, convert
+          the ~20 `CompareKeys` call sites, and flip the writer to
+          `FormPGIndexTuple` over per-column datums **in the same commit**
+          (sibling-path rule: a descriptor-derived reader against a
+          blob-writing writer reads garbage). REINDEX-required break.
+    - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
+          suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
+          `BTMaxItemSize`.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

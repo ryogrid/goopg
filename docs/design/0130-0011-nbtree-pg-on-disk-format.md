@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a landed 2026-08-10; S11.4 slice 3b, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1 landed 2026-08-10; S11.4 slices 3b-2/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -318,13 +318,64 @@ sources agree:
     (`_bt_truncate`'s `keepnatts > nkeyatts` branch) is not written, because
     goopg's descent treats the separator as inclusive rather than as a strict
     lower bound, so adopting it would change routing rather than only bytes.
-  - **S11.4 slice 3b — comparison layer (open).** Key bytes become
-    per-attribute PG binary datums, so `CompareKeys`/`bytes.Compare` gives way
-    to type-aware comparison and `FormPGIndexTuple`/`DeformPGIndexTuple` reach
-    the writer path. That is what makes the key length descriptor-derived, and
-    with it the two MAXALIGNs slice 2 deferred, real suffix truncation
-    (`_bt_keep_natts`) and the retirement of `MaxHighKeyLen` /
-    `bulkHighKeyReserve` in favour of `BTMaxItemSize` become expressible.
+  - **S11.4 slice 3b — comparison layer.** Key bytes become per-attribute PG
+    binary datums, so `CompareKeys`/`bytes.Compare` gives way to type-aware
+    comparison and `FormPGIndexTuple`/`DeformPGIndexTuple` reach the writer
+    path. That is what makes the key length descriptor-derived, and with it the
+    two MAXALIGNs slice 2 deferred, real suffix truncation (`_bt_keep_natts`)
+    and the retirement of `MaxHighKeyLen` / `bulkHighKeyReserve` in favour of
+    `BTMaxItemSize` become expressible.
+
+    3b is itself milestone-sized — it is the slice that couples the on-disk
+    format to the type layer — so it decomposes into three:
+
+    - **3b-1 — the descriptor and the comparator, additive (landed
+      2026-08-10).** `internal/access/btree/pgcompare.go`. Upstream's bridge
+      out of "nbtree knows no types" is the opclass support function
+      (`BTORDER_PROC`) that `_bt_mkscankey` installs into a `BTScanInsert`'s
+      `ScanKey`s; goopg takes the same seam. `PGKeyAttr` = the physical layout
+      the codec already needs (`PGIndexAttr`) plus the three ordering
+      properties `_bt_compare` consults — the comparator, `SK_BT_DESC` and
+      `SK_BT_NULLS_FIRST` — and `PGIndexKeyDesc` is the per-index vector of
+      them (key attributes only, matching
+      `IndexRelationGetNumberOfKeyAttributes`, so INCLUDE columns need no
+      special case). `ComparePGIndexTuples` is `_bt_compare`'s body for the
+      tuple-vs-tuple case. Three upstream rules an attribute loop otherwise
+      misses, each mutation-verified in `pgcompare_test.go`: a truncated
+      attribute is **minus infinity**, not absent (upstream's
+      `key->keysz > ntupatts ⇒ 1`, so the shorter side sorts first — this is
+      what makes the zero-attribute minus-infinity downlink order correctly
+      without a special case); the **heap TID is the last key attribute**
+      (heapkeyspace), and a pivot whose tiebreaker TID was truncated away is
+      minus infinity there too; and NULL ordering is **per attribute**, never
+      global. `PGAttrComparator` is a plain left-vs-right comparator rather
+      than upstream's flipped-argument convention (upstream calls
+      `sk_func(index_datum, sk_argument)` and inverts for ASC), so `DESC` is
+      one negation applied in exactly one place. A **nil** `Compare` means
+      `CompareKeys`, which is the honest description of goopg's current
+      order-preserving encodings (`EncodeInt4`, `EncodeNumericKey`,
+      `EncodeVarchar`, …) — that is deliberate, and is what lets 3b-2 migrate
+      one type at a time instead of as a flag day. Additive: no writer,
+      descent path or split builds a descriptor yet, so nothing on disk moves.
+      Not modelled, because no user at this layer needs them: collations
+      (goopg's collation handling sits above the AM), cross-type comparison
+      (tuple-vs-tuple is always same-type), and posting-list tuples (which of
+      its heap TIDs would break the tie? — rejected rather than guessed).
+    - **3b-2 — thread the descriptor and retire `CompareKeys` (open).** Build
+      a `PGIndexKeyDesc` from the catalog (`pg_index.indoption` carries the
+      DESC and NULLS FIRST bits independently — neither is derivable from the
+      other), hand it to `btree.Options`, and convert the ~20 `CompareKeys`
+      call sites in `btree.go` / `bulkload.go` / `internal/amcheck` to
+      `ComparePGIndexTuples`. The writer path switches from one opaque key to
+      `FormPGIndexTuple` over per-column datums at the same time; the two must
+      move together (sibling-path rule), since a descriptor-derived reader
+      against a blob-writing writer reads garbage.
+    - **3b-3 — collect the deferrals (open).** With the key length
+      descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
+      size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement
+      `_bt_keep_natts` suffix truncation (pivot natts < nkeyatts at last), and
+      retire `MaxHighKeyLen` / `bulkHighKeyReserve` in favour of
+      `BTMaxItemSize`.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.
