@@ -213,7 +213,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			if op.IsLeaf() || op.IsDeleted() {
 				continue
 			}
-			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name, keyFmt)...)
+			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name, keyFmt, cmpKeys)...)
 		}
 	}
 	return reports, nil

@@ -9,7 +9,8 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// M0130-S11.4 slice 3b-2c-ii-B2-b-iii guard.
+// M0130-S11.4 slice 3b-2c-ii-B2-b-iii guard, extended by B2-b-iv (section (d):
+// the parent-downlink tier's lower bound goes through the opclass comparator).
 //
 // Until this slice every amcheck tier decoded pages with the blob format,
 // named once as the package-level `blobIndexFormat`. That is a CLAIM about the
@@ -26,7 +27,9 @@ import (
 // through the tuple accessors, (b) the same bytes under the blob format return
 // something strictly different, and (c) the item-order tier finds a
 // freshly-built tuple-format tree clean when it is given the format and the
-// descriptor's comparator.
+// descriptor's comparator, and (d) the same holds for the cross-level
+// parent-downlink tier, which reports on that clean tree when the comparator is
+// omitted.
 func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	desc := tupleFmtDesc()
 	dir := t.TempDir()
@@ -44,8 +47,10 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	}
 
 	// Enough inserts to split, so the tree has an internal level and
-	// non-rightmost pages carrying high keys.
-	const n = 400
+	// non-rightmost pages carrying high keys. 400 int4 tuples still fit on one
+	// leaf page (~16 bytes each incl. line pointer) and left the cross-level
+	// tiers unexercised; 1200 produces a real root + four leaves.
+	const n = 1200
 	tids := make(map[int32]storage.ItemPointer, n)
 	for i := range n {
 		v := int32((i*397)%n) - n/2
@@ -120,6 +125,36 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 		if reps := amcheck.VerifyBtreeItemOrderCmp(p, blk, "ix_tuplefmt", tupleFmt, cmp); len(reps) != 0 {
 			t.Fatalf("tuple-format item-order tier reported %q on a clean tree at block %d", reps[0].Msg, blk)
 		}
+	}
+
+	// (d) B2-b-iv: the parent-downlink tier's lower-bound invariant is the other
+	// key comparison amcheck makes, and until this slice it went through
+	// btree.CompareKeys unconditionally. Over tuple bytes that orders by the
+	// t_tid header first, so the clean tree above must come back clean only when
+	// the descriptor's comparator is supplied — a nil comparator has to report.
+	internals := 0
+	badWithBlobCmp := 0
+	for blk := range nblocks {
+		p, perr := src(blk)
+		if perr != nil {
+			t.Fatalf("read block %d: %v", blk, perr)
+		}
+		if op := btree.ParseOpaque(p); blk == btree.MetaBlock || op.IsLeaf() || op.IsDeleted() {
+			continue
+		}
+		internals++
+		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, cmp); len(reps) != 0 {
+			t.Fatalf("tuple-format parent-downlink tier reported %q on a clean tree at block %d", reps[0].Msg, blk)
+		}
+		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, nil); len(reps) != 0 {
+			badWithBlobCmp++
+		}
+	}
+	if internals == 0 {
+		t.Fatalf("tree has no internal pages — the downlink tier was never exercised")
+	}
+	if badWithBlobCmp == 0 {
+		t.Fatalf("the parent-downlink tier agreed with btree.CompareKeys on every one of %d internal pages — the comparator argument is not load-bearing", internals)
 	}
 }
 

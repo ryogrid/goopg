@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-iii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii, 3b-2c-ii-B2-b-iv (parent-downlink comparator), 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii, 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -641,7 +641,30 @@ sources agree:
             Discovered and deferred here: `VerifyBtreeParentDownlinks` compares
             its down-link lower bound with `btree.CompareKeys` and takes no
             comparator at all, so under the flip it would byte-compare whole
-            index tuples. It has its own ledger row and is a B2-c prerequisite.
+            index tuples. It has its own ledger row and is a B2-c prerequisite
+            (B2-b-iv, below).
+          - **3b-2c-ii-B2-b-iv — the parent-downlink comparator (landed
+            2026-08-10). Behaviour-changing for damaged opclasses, no on-disk
+            change, no REINDEX.** `VerifyBtreeParentDownlinks` now takes
+            `cmpKeys amcheck.KeyComparator` next to the `keyFmt` B2-b-iii gave
+            it (nil ⇒ `btree.CompareKeys`, the same convention as the other
+            tiers) and evaluates the down-link lower bound through it;
+            `btIndexVerify` passes the comparator it already holds. This is what
+            upstream does — EVERY key comparison amcheck makes on an index goes
+            through that index's support function 1, so
+            `bt_child_check` → `invariant_l_nontarget_offset`
+            (`verify_nbtree.c:2500-2540`) and `bt_target_page` share one
+            ordering. Two consequences: opclass damage on a separator key is now
+            reported by the cross-level tier as well as the item-order tier, and
+            under the flip the bound compares key columns instead of whole
+            tuples (whose leading `t_tid` header would dominate a byte compare).
+            Guard: section (d) of `verify_nbtree_tupleformat_test.go` runs the
+            tier over every internal page of the tuple-format tree — clean with
+            the descriptor's comparator, and reporting on at least one page with
+            a nil comparator, so the argument cannot go decorative. The same
+            change raised that test's tree from 400 to 1200 keys: 400 int4
+            tuples still fit on ONE leaf page, so it had no internal level and
+            the cross-level tiers were never exercised.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same

@@ -725,7 +725,7 @@ func TestVerifyBtreeParentDownlinks_Clean(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(5), k(7)),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt); len(rs) != 0 {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); len(rs) != 0 {
 		t.Fatalf("clean parent reported %d, want 0: %+v", len(rs), rs)
 	}
 }
@@ -737,7 +737,7 @@ func TestVerifyBtreeParentDownlinks_LowerBoundViolation(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(4), k(7)), // k(4) < k(5)
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `down-link lower bound invariant violated for index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("lower-bound case = %+v, want single %q", rs, want)
@@ -754,7 +754,7 @@ func TestVerifyBtreeParentDownlinks_DownlinkToDeleted(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, none, nil),
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink to deleted page found in index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("deleted-child case = %+v, want single %q", rs, want)
@@ -772,7 +772,7 @@ func TestVerifyBtreeParentDownlinks_ChildLevelNotOneDown(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 2, none, nil, k(5)), // level 2, expected 0
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink points to block in index "ix" whose level is not one level down`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("level case = %+v, want single %q", rs, want)
@@ -789,7 +789,7 @@ func TestVerifyBtreeParentDownlinks_NegInfChildItemSkipped(t *testing.T) {
 		// real separators k(6), k(8) — all real keys >= the parent's k(5).
 		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(6), 11}, dl{k(8), 12}),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt); len(rs) != 0 {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); len(rs) != 0 {
 		t.Fatalf("internal child with neg-inf item reported %d, want 0: %+v", len(rs), rs)
 	}
 }
@@ -801,7 +801,7 @@ func TestVerifyBtreeParentDownlinks_InternalChildRealKeyBelowBound(t *testing.T)
 		1: makeInternalPage(t, 2, none, dl{k(5), 3}),
 		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(4), 11}), // k(4) < k(5)
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `down-link lower bound invariant violated for index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("internal-child real-key case = %+v, want single %q", rs, want)
@@ -813,21 +813,21 @@ func TestVerifyBtreeParentDownlinks_LeafParentNoFindings(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(1), k(2)),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt); rs != nil {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("leaf parent reported %+v, want nil", rs)
 	}
 }
 
 // The metapage carries no downlinks; nil (no read attempted).
 func TestVerifyBtreeParentDownlinks_MetaPageNil(t *testing.T) {
-	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix", blobFmt); rs != nil {
+	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("metapage reported %+v, want nil", rs)
 	}
 }
 
 // An unreadable parent surfaces as a damaged-page finding, not a panic.
 func TestVerifyBtreeParentDownlinks_DamagedParent(t *testing.T) {
-	rs := VerifyBtreeParentDownlinks(mapSource(nil), 7, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(nil), 7, "ix", blobFmt, nil)
 	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 7") {
 		t.Fatalf("damaged parent = %+v, want single damaged-page finding", rs)
 	}
@@ -839,7 +839,7 @@ func TestVerifyBtreeParentDownlinks_DanglingChild(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 99}), // child 99 absent
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt)
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 99") {
 		t.Fatalf("dangling child = %+v, want single damaged-page finding for block 99", rs)
 	}

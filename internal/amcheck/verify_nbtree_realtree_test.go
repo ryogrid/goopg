@@ -180,7 +180,7 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 		if op.IsLeaf() || op.IsDeleted() {
 			continue
 		}
-		if r := amcheck.VerifyBtreeParentDownlinks(src, blk, name, blobFmt); r != nil {
+		if r := amcheck.VerifyBtreeParentDownlinks(src, blk, name, blobFmt, nil); r != nil {
 			t.Fatalf("VerifyBtreeParentDownlinks(internal blk %d, blobFmt) false positive: %+v", blk, r)
 		}
 	}

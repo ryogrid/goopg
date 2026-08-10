@@ -457,12 +457,25 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 //     surfaces as a damaged-page finding, never a Go panic, matching the
 //     report-and-continue model of the other tiers.
 //
+// keyFmt is the on-page key format the parent and its children are decoded
+// under, and cmpKeys the index's opclass comparator (nil selects
+// btree.CompareKeys). The lower-bound test goes through cmpKeys for the same
+// reason the item-order tier does: upstream routes EVERY key comparison
+// amcheck makes on an index through that index's support function 1, so
+// invariant_l_nontarget_offset (verify_nbtree.c:2500-2540) and bt_target_page
+// share one ordering. Comparing the bound with btree.CompareKeys instead would
+// both miss opclass damage the item-order tier reports and, once keys are
+// stored as PG index tuples, byte-compare whole tuples rather than key columns.
+//
 // Like the other tiers it returns 0 or 1 findings: upstream ereport(ERROR)s on
 // the first violation, so the first downlink problem the scan reaches is
 // conclusive. A leaf or deleted parentBlk (no downlinks to descend) and the
 // metapage yield nil. It performs only the cross-level checks; per-page
 // structure and key order are run separately and composed by the SQL surface.
-func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt btree.IndexFormat) []BtreeReport {
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
+	if cmpKeys == nil {
+		cmpKeys = btree.CompareKeys
+	}
 	if parentBlk == btree.MetaBlock {
 		return nil
 	}
@@ -522,7 +535,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 				// bound applies (offset_is_negative_infinity).
 				continue
 			}
-			if btree.CompareKeys(k, dl.Key) < 0 {
+			if cmpKeys(k, dl.Key) < 0 {
 				return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 					"down-link lower bound invariant violated for index \"%s\"", indexName)}}
 			}

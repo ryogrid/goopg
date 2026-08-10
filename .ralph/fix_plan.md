@@ -1096,16 +1096,22 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               400-key tuple-format tree with splits — whole index tuples out of
               the leaf walk, zero keys agreeing with the blob decode, clean
               item-order tier under format + descriptor comparator).
-        - [ ] **3b-2c-ii-B2-b-iv — the parent-downlink comparator**. Blocker
-              for B2-c, discovered by B2-b-iii.
-              `amcheck.VerifyBtreeParentDownlinks` evaluates its down-link
-              lower bound with `btree.CompareKeys` and takes no
-              `KeyComparator` at all, so under the flip it byte-compares whole
-              index tuples (and today it misses opclass damage that the
-              item-order tier catches — upstream routes EVERY comparison
-              through the index's support function 1, verify_nbtree.c's
-              `bt_child_check` → `invariant_l_nontarget_offset`). Add the
-              parameter alongside the format `btIndexVerify` already holds.
+        - [x] **3b-2c-ii-B2-b-iv — the parent-downlink comparator**
+              (2026-08-10). `amcheck.VerifyBtreeParentDownlinks` takes
+              `cmpKeys amcheck.KeyComparator` next to the `keyFmt` B2-b-iii
+              gave it (nil ⇒ `btree.CompareKeys`) and evaluates its down-link
+              lower bound through it; `btIndexVerify` passes the comparator it
+              already held. Matches upstream, where EVERY amcheck key
+              comparison goes through the index's support function 1
+              (`bt_child_check` → `invariant_l_nontarget_offset`,
+              verify_nbtree.c:2500-2540), so opclass damage on a separator is
+              now reported by the cross-level tier too and the flip compares
+              key columns instead of whole tuples. Guard: section (d) of
+              `verify_nbtree_tupleformat_test.go` — clean under the
+              descriptor's comparator, reporting under a nil one. That test's
+              tree also grew 400→1200 keys: 400 int4 tuples fit on ONE leaf
+              page, so it had no internal level and the cross-level tiers were
+              never exercised.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
