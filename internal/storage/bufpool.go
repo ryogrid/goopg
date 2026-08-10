@@ -712,11 +712,15 @@ type BtreeUnlinkPageRequest struct {
 // LogBtreeUnlinkPageFunc emits the M0079-0003 atomic page-deletion redo record.
 type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
 
-// LogBtreeNewRootFunc emits the root-replacement record. A8: the record now
-// carries the new root page (backup block 0) and the updated metapage (backup
-// block 2) as full-page images (see wal.EncodeBtreeNewRootPG), so the caller
-// passes both mutated pages rather than the (rootBlk, level, items) projection.
-type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, metaBlk BlockNumber, metaPage Page) (LSN, error)
+// LogBtreeNewRootFunc emits the root-replacement record. A8: the record carries
+// the new root page (backup block 0) and the updated metapage (backup block 2),
+// so the caller passes both mutated pages rather than the (rootBlk, level,
+// items) projection. M0130-S11.5a: they now ride as PG block DATA rather than
+// full-page images (see wal.EncodeBtreeNewRootPG), which adds `leftChildBlk` —
+// upstream's backup block 1, the child whose incomplete-split flag redo clears.
+// Pass InvalidBlockNumber when the new root is a level-0 (leaf) root, which has
+// no children; the encoder rejects the inconsistent combinations.
+type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, leftChildBlk BlockNumber, metaBlk BlockNumber, metaPage Page) (LSN, error)
 
 // LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only half-dead transition record.
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)

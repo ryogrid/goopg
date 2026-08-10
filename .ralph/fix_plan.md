@@ -1457,9 +1457,69 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               `_bt_dedup_pass` `maxpostingsize` cap. Gates: btree/amcheck/
               storage + units PASS; tpch-spotcheck PASS (Q12=2, Q13=35);
               pgbench smoke PASS.
-- [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
+- [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~4 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.
+      Design: `docs/design/0130-0012-rm-btree-wal-content-parity.md`.
+      **The gap is narrower than "the records are goopg-native": the ENVELOPE is
+      already PG's** — `rmgr_map.go` maps every btree kind onto `RM_BTREE_ID`
+      with the right `nbtxlog.h` opcode and `pg_assembled_emit.go` frames them
+      through `assembleXLogRecord`. What differs is the CONTENT: only
+      `INSERT_LEAF` carried the struct upstream declares; split / vacuum /
+      newroot carried NO main data and shipped full-page images. That is not
+      merely less faithful — PG runs the rmgr redo function whether or not a
+      backup image is present, so e.g. `btree_xlog_newroot`'s unconditional
+      `XLogRecGetData` cast makes an FPI-only record UNREPLAYABLE by the engine
+      it is shaped for. They worked only because goopg's own replay had a
+      default arm that restored the images. One record per slice:
+  - [x] **S11.5a — `XLOG_BTREE_NEWROOT`** (2026-08-10). NOT REINDEX-required
+        (nothing on disk changes shape). `EncodeBtreeNewRootPG` now emits
+        upstream `_bt_newroot`'s record: main data
+        `xl_btree_newroot{rootblk, level}`, block 0 the root WILL_INIT with its
+        item area as `_bt_restore_page` block data, block 1 the left child
+        (redo clears its incomplete-split flag), block 2 the metapage WILL_INIT
+        with a 28-byte `xl_btree_metadata`. `level` and the items come from the
+        root page and the metadata from the metapage, so the caller cannot
+        describe the record inconsistently with the pages it logs — the only
+        new hook parameter is `leftChildBlk`, and block 1 is MANDATORY at
+        level > 0 because `XLogReadBufferForRedo` PANICs on an unregistered
+        block id rather than reporting it, so the encoder refuses that
+        combination. `internal/access/btree/pgnewroot.go` holds
+        `_bt_restore_page`'s producer AND consumer in one file: the payload is
+        an UNTAGGED run of MAXALIGNed index tuples in DESCENDING offset order,
+        framed only by each tuple's own `t_info` size, so a producer/consumer
+        disagreement mis-BUILDS the page rather than failing to parse. It also
+        builds the payload from the line pointers instead of slicing
+        `[pd_upper, pd_special)` as upstream does — goopg inserts at a computed
+        physical offset (`PageInsertItemRawAt`), which shifts line pointers
+        while leaving the data area in allocation order. All of it format-free,
+        for `ApplyInsertRecordAt`'s reason: recovery holds a relfilenode and no
+        catalog to resolve a key descriptor from. Metapage replay is
+        `_bt_restore_meta` (rebuild, not read-modify-write, `pd_lower` advanced
+        past the struct); `ReplayMetaSetRoot` survives only for the
+        goopg-native record, which carries just `(root, level)`. VACUUM's
+        `resetToEmptyRoot` (an empty LEAF root) has no upstream `_bt_newroot`
+        counterpart but is exactly what upstream's REDO handles at level 0 — no
+        item restore, no block 1 — which is why goopg can log it as a newroot.
+        Guards: `internal/wal/btree_newroot_pg_test.go` (shape incl. an
+        explicit "no block carries an FPI" assertion, the missing-child
+        refusal, a replay reproduction at matching OFFSETS, same-LSN
+        idempotency, the leaf-root variant) and
+        `internal/access/btree/pgnewroot_test.go`; mutation-checked (ascending
+        item order, dropped block-1 limb). Gates: btree/wal/storage/amcheck/
+        initdb + units PASS; pgbench smoke PASS (commit hook). 1 ledger row.
+  - [ ] **S11.5b — `XLOG_BTREE_SPLIT_L`/`_R`** (est ~2 loops, the largest).
+        `xl_btree_split{level, firstrightoff, newitemoff, postingoff}`, the new
+        item + the left page's new high key as block-0 data, the right page's
+        tuples as block-1 data in `_bt_restore_page` form (S11.5a's
+        `PGRestorePageData`/`PGParseRestorePageData` are that half already).
+  - [ ] **S11.5c — `XLOG_BTREE_VACUUM`**. `xl_btree_vacuum{ndeleted, nupdated}`
+        plus the deleted/updated offset arrays.
+  - [ ] **S11.5d — `XLOG_BTREE_UNLINK_PAGE`**. The one with a documented reason
+        to stay native (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
+        A8-unlinkpage): an emit-time FPI can be stale against a concurrent
+        split on another `*BTree`, so the PG-faithful form needs incremental
+        link patches, not a page snapshot.
 - [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
       `relhasindex` in `buildUserPGClassRow`
       (`internal/executor/pg18_user_catalog_rows.go`), re-run

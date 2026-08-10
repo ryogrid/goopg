@@ -3153,7 +3153,9 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		m.FastRoot = rootBlk
 		m.FastLevel = level
 		WritePGMetaPage(metaSlot.Page(), m)
-		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
+		// leftBlk is upstream's backup block 1: the child whose
+		// incomplete-split flag redo clears (_bt_newroot registers `lbuf`).
+		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), leftBlk, MetaBlock, metaSlot.Page())
 		if err != nil {
 			bt.unpinW(metaSlot)
 			rootSlot.Unlock()

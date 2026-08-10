@@ -571,12 +571,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return storage.LSN(end), nil
 	}
-	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
-		// A8: emit a PG RM_BTREE new-root record carrying the new root page
-		// (backup block 0) and the updated metapage (backup block 2) as full-page
-		// images instead of the goopg-native (rootBlk, level, items) body.
-		// Recovery restores both images via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, metaBlk, metaPage)
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, leftChildBlk storage.BlockNumber, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+		// A8 / M0130-S11.5a: emit a PG RM_BTREE new-root record — main data
+		// xl_btree_newroot{rootblk, level}, block 0 the new root's item area in
+		// _bt_restore_page form, block 1 the left child (incomplete-split clear),
+		// block 2 the metapage as xl_btree_metadata. Content-parity with
+		// upstream _bt_newroot; no longer full-page images.
+		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage)
 		if err != nil {
 			return 0, err
 		}

@@ -145,7 +145,7 @@ func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
 		unlinkEmissions = append(unlinkEmissions, unlinkCap{rel: rel, req: req})
 		return storage.LSN(1234), nil
 	}
-	logNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+	logNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, leftChildBlk storage.BlockNumber, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
 		// We don't need to track new-root events for this test.
 		return storage.LSN(1234), nil
 	}

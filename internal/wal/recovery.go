@@ -2460,8 +2460,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeNewRoot:
+			// M0130-S11.5a: goopg emits the real xl_btree_newroot — main data
+			// {rootblk, level}, block-0 item area, block-1 left child, block-2
+			// xl_btree_metadata — with no FPI. A real-PG newroot carrying one
+			// is restored via the FPI branch inside the replay function.
+			if err := replayDecodedXLogBtreeNewRoot(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
-			// Other btree records (split / newroot / vacuum / unlink / …) are
+			// Other btree records (split / vacuum / unlink / …) are
 			// not flipped yet and are emitted with full-page images; restore
 			// each block from its FPI.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
@@ -2939,6 +2948,139 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogBtreeNewRoot applies a PG-format xl_btree_newroot, mirroring
+// upstream btree_xlog_newroot (nbtxlog.c:764-800):
+//
+//	block 0 — re-initialise the page as a root at the record's level, then
+//	          restore its items from block data (level > 0 only);
+//	block 1 — clear the left child's incomplete-split flag (level > 0 only);
+//	block 2 — rebuild the metapage from the carried xl_btree_metadata.
+//
+// Each block is separately idempotent via its own pd_lsn, so a replay
+// interrupted between blocks resumes correctly — the same per-limb discipline
+// the native replayBtreeNewRoot uses. Block 0 and block 2 are WILL_INIT, so
+// neither has to exist yet: they are extended when the record is the first
+// thing to touch them (writeBlockOrExtend), matching PG's
+// XLogInitBufferForRedo.
+func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	if len(xlog.MainData) < sizeOfXLogBtreeNewRootData {
+		return fmt.Errorf("wal: xlog btree-newroot: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeNewRootData)
+	}
+	level := binary.LittleEndian.Uint32(xlog.MainData[4:8])
+
+	root, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-newroot missing block 0")
+	}
+	if root.HasImage && root.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, root, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-newroot root image: %w", err)
+		}
+	} else {
+		var items [][]byte
+		if level > 0 {
+			parsed, err := btree.PGParseRestorePageData(root.Data)
+			if err != nil {
+				return fmt.Errorf("wal: xlog btree-newroot root items: %w", err)
+			}
+			items = parsed
+		}
+		if err := replayInitedXLogBlock(mgr, root, endLSN, func(page storage.Page) error {
+			return btree.ReplayNewRootPage(page, level, items)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-newroot root apply: %w", err)
+		}
+	}
+
+	// Block 1 exists only for a level > 0 root; upstream's redo reads it under
+	// exactly the same condition.
+	if child, ok := xlogBlockRefByID(xlog, 1); ok {
+		if child.HasImage && child.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, child, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-newroot child image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, child, endLSN, btree.ReplayClearIncompleteSplit); err != nil {
+			return fmt.Errorf("wal: xlog btree-newroot child apply: %w", err)
+		}
+	}
+
+	meta, ok := xlogBlockRefByID(xlog, 2)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-newroot missing block 2 (metapage)")
+	}
+	if meta.HasImage && meta.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-newroot meta image: %w", err)
+		}
+		return nil
+	}
+	md, err := decodeXLogBtreeMetadata(meta.Data)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-newroot meta: %w", err)
+	}
+	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
+		return btree.ReplayRestoreMetaPage(page, md)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-newroot meta apply: %w", err)
+	}
+	return nil
+}
+
+// replayInitedXLogBlock applies `apply` to a WILL_INIT block: the prior page
+// contents are irrelevant (apply rebuilds the page from scratch), so the block
+// need not exist yet — it is extended when the record is the first thing to
+// touch it. When it does exist and already carries an LSN at or past the
+// record's, the mutation is skipped as already applied.
+func replayInitedXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, apply func(storage.Page) error) error {
+	page := make(storage.Page, storage.BlockSize)
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block < nblocks {
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
+		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= endLSN {
+			return nil // already applied
+		}
+	}
+	if err := apply(page); err != nil {
+		return err
+	}
+	storage.MustHeader(page).SetLSN(endLSN)
+	return writeBlockOrExtend(mgr, block.Rel, block.Block, page)
+}
+
+// replayExistingXLogBlock applies `apply` to a block the record mutates in
+// place. Unlike replayInitedXLogBlock the page must already exist and be
+// initialised: the mutation reads the current contents.
+func replayExistingXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, apply func(storage.Page) error) error {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block >= nblocks {
+		return fmt.Errorf("wal: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: block %d is uninitialised", block.Block)
+	}
+	if storage.MustHeader(page).LSN() >= endLSN {
+		return nil // already applied
+	}
+	if err := apply(page); err != nil {
+		return err
+	}
+	storage.MustHeader(page).SetLSN(endLSN)
 	return mgr.WriteBlock(block.Rel, block.Block, page)
 }
 

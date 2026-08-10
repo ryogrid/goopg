@@ -1281,7 +1281,9 @@ func (bt *BTree) resetToEmptyRoot() error {
 		m.FastRoot = rootBlk
 		m.FastLevel = 0
 		WritePGMetaPage(metaSlot.Page(), m)
-		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
+		// No left child: this root is a level-0 (leaf) root, so upstream's
+		// backup block 1 does not exist and redo does not look for it.
+		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), storage.InvalidBlockNumber, MetaBlock, metaSlot.Page())
 		if err != nil {
 			bt.unpinW(metaSlot)
 			bt.unpinW(rootSlot)

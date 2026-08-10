@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -502,28 +503,100 @@ func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, page 
 	return framePGAssembled(RmgrBtree, xlogBtreeVacuum, 0, body), nil
 }
 
+// sizeOfXLogBtreeNewRootData is PG's SizeOfBtreeNewroot: rootblk(4) + level(4).
+const sizeOfXLogBtreeNewRootData = 8
+
+// sizeOfXLogBtreeMetadata is sizeof(xl_btree_metadata): six uint32 fields, a
+// bool, and 3 bytes of tail padding to the struct's 4-byte alignment. PG's
+// _bt_restore_meta asserts the block-data length is EXACTLY this, so the
+// padding is part of the wire format, not an artefact.
+const sizeOfXLogBtreeMetadata = 28
+
+// encodeXLogBtreeMetadata serialises a metapage as PG's xl_btree_metadata
+// (nbtxlog.h). btm_magic and btm_last_cleanup_num_heap_tuples are NOT carried:
+// upstream's redo re-asserts the magic and resets num_heap_tuples to -1.0.
+func encodeXLogBtreeMetadata(m btree.PGBTMetaPage) []byte {
+	out := make([]byte, sizeOfXLogBtreeMetadata)
+	binary.LittleEndian.PutUint32(out[0:4], m.Version)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(m.Root))
+	binary.LittleEndian.PutUint32(out[8:12], m.Level)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(m.FastRoot))
+	binary.LittleEndian.PutUint32(out[16:20], m.FastLevel)
+	binary.LittleEndian.PutUint32(out[20:24], m.LastCleanupNumDelpages)
+	if m.AllEqualImage {
+		out[24] = 1
+	}
+	return out
+}
+
+// decodeXLogBtreeMetadata is encodeXLogBtreeMetadata's inverse.
+func decodeXLogBtreeMetadata(b []byte) (btree.PGBTMetaPage, error) {
+	if len(b) != sizeOfXLogBtreeMetadata {
+		return btree.PGBTMetaPage{}, fmt.Errorf("wal: xl_btree_metadata is %d bytes, want %d", len(b), sizeOfXLogBtreeMetadata)
+	}
+	le := binary.LittleEndian
+	return btree.PGBTMetaPage{
+		Version:                le.Uint32(b[0:4]),
+		Root:                   storage.BlockNumber(le.Uint32(b[4:8])),
+		Level:                  le.Uint32(b[8:12]),
+		FastRoot:               storage.BlockNumber(le.Uint32(b[12:16])),
+		FastLevel:              le.Uint32(b[16:20]),
+		LastCleanupNumDelpages: le.Uint32(b[20:24]),
+		AllEqualImage:          b[24] != 0,
+	}, nil
+}
+
 // EncodeBtreeNewRootPG builds a PostgreSQL RM_BTREE new-root record
-// (XLOG_BTREE_NEWROOT opcode) carrying the freshly-built root page (backup block
-// 0, WILL_INIT — a new block) and the updated metapage (backup block 2, matching
-// PG's block numbering; block 1 = left child is unused because goopg does not
-// mutate the old root during root replacement). Both ride as full-page images:
-// goopg's createNewRoot holds the exact final bytes for both pages, so this
-// reuses the A0 FPI encoder rather than reconstructing PG's xl_btree_newroot
-// main-data (rootblk + level, which PG's redo uses to rebuild the metapage).
-// BKPIMAGE_APPLY makes replay restore both images via the RmgrBtree default arm
-// — matching native replayBtreeNewRoot (which reconstructs the metapage from
-// rootblk/level) and PG's BLK_RESTORED redo. No main-data is carried (the images
-// are authoritative — a documented deviation from PG's incremental
-// xl_btree_newroot); xl_xid = 0.
-func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) ([]byte, error) {
+// (XLOG_BTREE_NEWROOT opcode), byte-faithful to upstream `_bt_newroot`
+// (nbtinsert.c:2556-2597). M0130-S11.5a replaced the previous full-page-image
+// form: an FPI-only record has a PG-shaped HEADER but no `xl_btree_newroot` main
+// data, and a real PG standby's `btree_xlog_newroot` reads that struct
+// unconditionally — the images made goopg↔goopg replay work while leaving the
+// record unreplayable by the engine it is shaped for.
+//
+//	main data: xl_btree_newroot{rootblk, level}
+//	block 0:   the new root, WILL_INIT, block data = its item area in
+//	           `_bt_restore_page` order (level > 0 only; a level-0 root is empty)
+//	block 1:   the left child, so redo can clear its incomplete-split flag
+//	           (level > 0 only — upstream's redo touches block 1 under exactly
+//	           the same condition)
+//	block 2:   the metapage, WILL_INIT, block data = xl_btree_metadata
+//
+// `level` and the item area come from rootPage, and the metadata from metaPage,
+// so the caller cannot describe the record inconsistently with the pages it is
+// logging. xl_xid = 0 (index changes are not logical user-data events).
+//
+// The level-0 case has no upstream counterpart in `_bt_newroot` (upstream never
+// builds a leaf root through it); goopg reaches it from VACUUM's root reset
+// (`resetToEmptyRoot`). It is nonetheless exactly what upstream's redo handles:
+// `btree_xlog_newroot` initialises the page, sets BTP_ROOT|BTP_LEAF for level 0
+// and skips both the item restore and block 1.
+func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, leftChildBlk storage.BlockNumber, metaBlk storage.BlockNumber, metaPage storage.Page) ([]byte, error) {
 	if len(rootPage) != storage.BlockSize || len(metaPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-newroot root/meta page must be %d bytes", storage.BlockSize)
 	}
-	blocks := []BlockRef{
-		{ID: 0, Rel: rel, Block: rootBlk, WillInit: true, Image: &FullPageImage{Page: rootPage, Apply: true}},
-		{ID: 2, Rel: rel, Block: metaBlk, SameRel: true, Image: &FullPageImage{Page: metaPage, Apply: true}},
+	level := btree.ReadPGOpaque(rootPage).Level
+	mainData := make([]byte, sizeOfXLogBtreeNewRootData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(rootBlk))
+	binary.LittleEndian.PutUint32(mainData[4:8], level)
+
+	blocks := []BlockRef{{ID: 0, Rel: rel, Block: rootBlk, WillInit: true}}
+	if level > 0 {
+		if leftChildBlk == storage.InvalidBlockNumber {
+			return nil, fmt.Errorf("wal: btree-newroot at level %d has no left child block", level)
+		}
+		data, err := btree.PGRestorePageData(rootPage)
+		if err != nil {
+			return nil, fmt.Errorf("wal: btree-newroot root items: %w", err)
+		}
+		blocks[0].Data = data
+		blocks = append(blocks, BlockRef{ID: 1, Rel: rel, Block: leftChildBlk, SameRel: true})
 	}
-	body, err := assembleXLogRecord(nil, blocks)
+	blocks = append(blocks, BlockRef{
+		ID: 2, Rel: rel, Block: metaBlk, SameRel: true, WillInit: true,
+		Data: encodeXLogBtreeMetadata(btree.ReadPGMetaPage(metaPage)),
+	})
+	body, err := assembleXLogRecord(mainData, blocks)
 	if err != nil {
 		return nil, err
 	}
