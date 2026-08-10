@@ -88,35 +88,30 @@ const (
 	MetaBlock storage.BlockNumber = 0
 	rootStart storage.BlockNumber = 1
 
-	btreeMagic   uint32 = 0x053162
-	// btreeVersion is upstream's BTREE_VERSION and must STAY 4: a real PG
-	// rejects anything else in _bt_getmeta. It is therefore not available as
-	// a break marker for goopg's own format changes — M0130-S11.2b moved the
-	// high key out of the opaque and onto the page without bumping it, so an
-	// index written before that commit is unreadable and must be REINDEXed.
-	// (Historically the value did double duty: v3 = variable-length HighKey in
-	// a 48-byte opaque, v4 = 256-byte HighKey field in a 272-byte opaque.)
-	btreeVersion uint32 = 4
-
 	// BTreeMagic and BTreeVersion expose the on-disk metapage magic and
 	// version for out-of-package readers that validate a metapage without
 	// opening the tree — notably the amcheck verify engine
-	// (internal/amcheck). Keeping a single exported source of truth prevents
-	// the magic/version from drifting between the writer (writeMeta) and any
-	// independent validator.
-	BTreeMagic   = btreeMagic
-	BTreeVersion = btreeVersion
+	// (internal/amcheck). They are upstream's BTREE_MAGIC / BTREE_VERSION,
+	// declared once in pgformat.go.
+	//
+	// BTreeVersion must STAY 4: a real PG rejects anything else in
+	// _bt_getmeta. It is therefore not available as a break marker for
+	// goopg's own format changes — M0130-S11.2b moved the high key onto the
+	// page and M0130-S11.3 flipped the metapage to BTMetaPageData, neither
+	// with a version bump, so an index written before those commits is
+	// unreadable and must be REINDEXed. (Historically the value did double
+	// duty: v3 = variable-length HighKey in a 48-byte opaque, v4 = 256-byte
+	// HighKey field in a 272-byte opaque.)
+	BTreeMagic   = BTreeMagicPG
+	BTreeVersion = BTreeVersionPG
 )
 
-// BTreeMeta is the v0 metapage payload.
-type BTreeMeta struct {
-	Magic     uint32
-	Version   uint32
-	Root      storage.BlockNumber
-	Level     uint32
-	FastRoot  storage.BlockNumber
-	FastLevel uint32
-}
+// The metapage payload type is PGBTMetaPage (pgformat.go) — upstream's
+// 48-byte BTMetaPageData, written by WritePGMetaPage at PageGetContents of a
+// PG-shaped block 0. goopg's private 24-byte `BTreeMeta` payload on a page
+// with a zero-length special area was retired by M0130-S11.3; it was the
+// reason a real PG's _bt_checkpage failed on the very first page it read
+// ("contains corrupted page at block 0").
 
 // BTPageOpaque is the engine's typed view over the special area at the end of
 // each B-tree page. It is NOT the on-disk struct: since M0130-S11.2b the bytes
@@ -1626,7 +1621,11 @@ func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) 
 	if err != nil {
 		return nil, err
 	}
-	if meta.Magic != btreeMagic || meta.Version != btreeVersion {
+	// _bt_getmeta's acceptance test: the magic must match exactly, and the
+	// version must lie in [BTREE_MIN_VERSION, BTREE_VERSION]. goopg only ever
+	// writes BTREE_VERSION, but accepting the older versions the oracle
+	// accepts keeps Open from rejecting an index a real PG built.
+	if meta.Magic != BTreeMagicPG || meta.Version < BTreeMinVersionPG || meta.Version > BTreeVersionPG {
 		return nil, ErrNotABTree
 	}
 	return bt, nil
@@ -1708,17 +1707,15 @@ func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options
 	}
 	rootSlot.Unlock()
 
-	// Initialise the metapage.
+	// Initialise the metapage (_bt_initmetapage: BTP_META opaque, the
+	// 48-byte BTMetaPageData at PageGetContents, pd_lower advanced past it).
 	metaSlot.Lock()
-	storage.InitPage(metaSlot.Page())
-	writeMeta(metaSlot.Page(), BTreeMeta{
-		Magic:     btreeMagic,
-		Version:   btreeVersion,
-		Root:      rootBlk,
-		Level:     0,
-		FastRoot:  rootBlk,
-		FastLevel: 0,
-	})
+	if err := initMetaPage(metaSlot.Page(), rootBlk, 0); err != nil {
+		metaSlot.Unlock()
+		pool.Unpin(rootSlot)
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	if err := bt.markDirtyWithPageRecord(metaSlot, MetaBlock); err != nil {
 		metaSlot.Unlock()
 		pool.Unpin(rootSlot)
@@ -1740,15 +1737,29 @@ var (
 
 // readMeta loads the metapage under a shared content latch so the
 // read sees a torn-byte-free snapshot.
-func (bt *BTree) readMeta() (BTreeMeta, error) {
+//
+// The page is gated on CheckPGBTPage — the oracle's own _bt_checkpage — before
+// its bytes are decoded. That turns the one failure mode of the S11.3 format
+// break into a clean error: an index file written before the flip has a
+// zero-length special area, and its 24-byte payload happens to share the
+// magic/version offsets with BTMetaPageData, so without this check it would
+// open "successfully" and then decode Root/Level from the wrong bytes.
+func (bt *BTree) readMeta() (PGBTMetaPage, error) {
 	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: MetaBlock})
 	if err != nil {
-		return BTreeMeta{}, err
+		return PGBTMetaPage{}, err
 	}
 	slot.RLock()
-	m := parseMeta(slot.Page())
+	err = CheckPGBTPage(slot.Page(), MetaBlock)
+	var m PGBTMetaPage
+	if err == nil {
+		m = ReadPGMetaPage(slot.Page())
+	}
 	slot.RUnlock()
 	bt.pool.Unpin(slot)
+	if err != nil {
+		return PGBTMetaPage{}, err
+	}
 	return m, nil
 }
 
@@ -1797,32 +1808,22 @@ func (bt *BTree) unpinW(s *storage.Slot) {
 // ParseMeta exposes the metapage decode for out-of-package readers (the
 // amcheck verify engine) that validate a metapage's magic/version without
 // opening the tree. See ParseOpaque for the single-source-of-truth rationale.
-func ParseMeta(p storage.Page) BTreeMeta { return parseMeta(p) }
+func ParseMeta(p storage.Page) PGBTMetaPage { return ReadPGMetaPage(p) }
 
-func parseMeta(p storage.Page) BTreeMeta {
-	off := storage.SizeOfPageHeaderData
-	return BTreeMeta{
-		Magic:     binary.LittleEndian.Uint32(p[off : off+4]),
-		Version:   binary.LittleEndian.Uint32(p[off+4 : off+8]),
-		Root:      storage.BlockNumber(binary.LittleEndian.Uint32(p[off+8 : off+12])),
-		Level:     binary.LittleEndian.Uint32(p[off+12 : off+16]),
-		FastRoot:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off+16 : off+20])),
-		FastLevel: binary.LittleEndian.Uint32(p[off+20 : off+24]),
-	}
-}
-
-func writeMeta(p storage.Page, m BTreeMeta) {
-	off := storage.SizeOfPageHeaderData
-	binary.LittleEndian.PutUint32(p[off:off+4], m.Magic)
-	binary.LittleEndian.PutUint32(p[off+4:off+8], m.Version)
-	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(m.Root))
-	binary.LittleEndian.PutUint32(p[off+12:off+16], m.Level)
-	binary.LittleEndian.PutUint32(p[off+16:off+20], uint32(m.FastRoot))
-	binary.LittleEndian.PutUint32(p[off+20:off+24], m.FastLevel)
-	// Bump pd_lower so PageLinePointerCount on this page (if anyone
-	// ever asks) reports zero rather than walking into our payload.
-	h := storage.MustHeader(p)
-	h.SetLower(uint16(off + 24))
+// initMetaPage builds block 0 from scratch: upstream's _bt_initmetapage with
+// the one goopg-specific decision baked in, namely allequalimage.
+//
+// goopg deduplicates unconditionally at build time (deduplicateToRawItems in
+// bulkload.go) and on insert, so the metapage MUST advertise allequalimage —
+// upstream's amcheck errors with "index %s has posting list tuples but
+// metapage indicates !allequalimage" otherwise, and a real PG would refuse to
+// add to an existing posting list. The faithful computation is per-opclass
+// (_bt_allequalimage in nbtutils.c, opclass support function 4, false for e.g.
+// numeric and nondeterministic collations); goopg has no equalimage support
+// functions yet, so the flag is unconditional here and the per-opclass
+// computation is a deferral-ledger row (M0130-S11.3).
+func initMetaPage(p storage.Page, root storage.BlockNumber, level uint32) error {
+	return InitPGMetaPage(p, root, level, true /* allequalimage */)
 }
 
 // markDirtyWithPageRecord routes metadata-page mutations through
@@ -1848,12 +1849,12 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	if err != nil {
 		return err
 	}
-	m := parseMeta(slot.Page())
+	m := ReadPGMetaPage(slot.Page())
 	m.Root = root
 	m.Level = level
 	m.FastRoot = root
 	m.FastLevel = level
-	writeMeta(slot.Page(), m)
+	WritePGMetaPage(slot.Page(), m)
 	err = bt.markDirtyWithPageRecord(slot, MetaBlock)
 	bt.unpinW(slot)
 	if err != nil {
@@ -2986,12 +2987,12 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 			bt.pool.Unpin(rootSlot)
 			return err
 		}
-		m := parseMeta(metaSlot.Page())
+		m := ReadPGMetaPage(metaSlot.Page())
 		m.Root = rootBlk
 		m.Level = level
 		m.FastRoot = rootBlk
 		m.FastLevel = level
-		writeMeta(metaSlot.Page(), m)
+		WritePGMetaPage(metaSlot.Page(), m)
 		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
 		if err != nil {
 			bt.unpinW(metaSlot)

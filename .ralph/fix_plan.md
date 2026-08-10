@@ -782,8 +782,19 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
       for out of page space (`pageHighKeyFootprint`, `bulkHighKeyReserve`).
       **Every pre-existing goopg index must be REINDEXed** — `BTREE_VERSION`
       could not carry the break (upstream requires 4). 1 ledger row.
-- [ ] **M0130-S11.3 — metapage** (est ~1 loop). `BTreeMeta` → `PGBTMetaPage`
-      at block 0 via S11.1's codec, including the `pd_lower` advance.
+- [x] **M0130-S11.3 — metapage** (est ~1 loop). **DONE (2026-08-10).**
+      `BTreeMeta`/`parseMeta`/`writeMeta` deleted; block 0 is built by
+      `initMetaPage` → `InitPGMetaPage` (`_bt_initmetapage`) at all four
+      creation sites, so it is a PG-shaped page (16-byte special area,
+      `BTP_META`) with the 48-byte `BTMetaPageData` at `PageGetContents` and
+      `pd_lower` advanced past it. The root-pointer writers and
+      `ReplayMetaSetRoot` are read-modify-write (the cleanup counters and
+      `btm_allequalimage` belong to other writers); `readMeta` gates block 0 on
+      `CheckPGBTPage` so the format break is a clean error instead of a silent
+      garbage decode, and `Open` uses `_bt_getmeta`'s version range.
+      **Pre-existing indexes must be REINDEXed.** `btm_allequalimage` is
+      unconditionally true and the cleanup counters are never updated — 1
+      ledger row.
 - [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
       `IndexTupleData` (8-byte header) + null bitmap + PG binary datums;
       internal-page downlinks into `t_tid`. Couples the index format to the

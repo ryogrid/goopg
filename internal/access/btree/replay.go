@@ -146,11 +146,14 @@ func ReplayNewRootPage(page storage.Page, level uint32, items [][]byte) error {
 // given root + level. Used by the metapage limb of
 // `RecordKindBtreeNewRoot`. (M0079-0003.)
 func ReplayMetaSetRoot(page storage.Page, root storage.BlockNumber, level uint32) error {
-	meta := parseMeta(page)
+	// Read-modify-write, not a re-init: the metapage's LastCleanupNum* and
+	// allequalimage fields are owned by other writers (VACUUM, the build) and
+	// must survive a new-root replay untouched.
+	meta := ReadPGMetaPage(page)
 	meta.Root = root
 	meta.Level = level
 	meta.FastRoot = root
 	meta.FastLevel = level
-	writeMeta(page, meta)
+	WritePGMetaPage(page, meta)
 	return nil
 }

@@ -207,7 +207,7 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation false positive: %+v", rr)
 	}
 
-	meta := func() btree.BTreeMeta {
+	meta := func() btree.PGBTMetaPage {
 		p, err := src(btree.MetaBlock)
 		if err != nil {
 			t.Fatalf("read metapage: %v", err)

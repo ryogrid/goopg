@@ -1270,12 +1270,12 @@ func (bt *BTree) resetToEmptyRoot() error {
 			bt.unpinW(rootSlot)
 			return err
 		}
-		m := parseMeta(metaSlot.Page())
+		m := ReadPGMetaPage(metaSlot.Page())
 		m.Root = rootBlk
 		m.Level = 0
 		m.FastRoot = rootBlk
 		m.FastLevel = 0
-		writeMeta(metaSlot.Page(), m)
+		WritePGMetaPage(metaSlot.Page(), m)
 		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
 		if err != nil {
 			bt.unpinW(metaSlot)

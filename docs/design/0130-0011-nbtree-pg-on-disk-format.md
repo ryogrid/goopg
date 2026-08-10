@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 landed 2026-08-10; S11.3–S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 landed 2026-08-10; S11.4–S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -188,8 +188,27 @@ sources agree:
      `_bt_slideleft` (`postgres/src/backend/access/nbtree/nbtsort.c`).
      `pgReserveHiKeySlot`/`pgSlideLeft` are the Go equivalents; `bulkload.go`'s
      current "set the high key at flush time" shape maps onto them directly.
-- **S11.3 — metapage.** `BTreeMeta` → `PGBTMetaPage` at block 0 via S11.1's
-  codec, including the `pd_lower` advance.
+- **S11.3 — metapage (LANDED 2026-08-10).** `BTreeMeta`/`parseMeta`/`writeMeta`
+  are deleted; block 0 is built by `initMetaPage` → S11.1's `InitPGMetaPage`
+  (`_bt_initmetapage`), so it is a PG-shaped page (16-byte special area,
+  `BTP_META`) carrying the 48-byte `BTMetaPageData` at `PageGetContents` with
+  `pd_lower` advanced past it. Four creation sites (`Create`,
+  `BulkCreateWithOptions` × 2 limbs, `BulkCreateNoDedup` × 2 limbs) now
+  initialise; the three root-pointer writers (`updateRootMeta`, the newroot-WAL
+  limb in `insertIntoBlock`, `resetToEmptyRoot`) and `ReplayMetaSetRoot` are
+  read-modify-write via `ReadPGMetaPage`/`WritePGMetaPage`, because
+  `btm_last_cleanup_num_*` and `btm_allequalimage` belong to other writers.
+  Two decisions the slice plan did not spell out:
+  - `readMeta` now gates block 0 on `CheckPGBTPage` before decoding. Without it
+    the format break is silent, not loud: a pre-S11.3 metapage has the same
+    magic/version *offsets* (both layouts start the payload at
+    `PageGetContents`), so `Open` would succeed and then read `Root`/`Level`
+    out of bytes that no longer mean that. `Open` also relaxed its version test
+    to `_bt_getmeta`'s `[BTREE_MIN_VERSION, BTREE_VERSION]` range.
+  - `btm_allequalimage` is written unconditionally `true`. goopg deduplicates
+    without consulting an opclass, and upstream `amcheck` errors on posting
+    lists in a `!allequalimage` index; the faithful per-opclass
+    `_bt_allequalimage` computation (support function 4) is a ledger row.
 - **S11.4 — tuple shape.** goopg `item` → `IndexTupleData` + null bitmap + PG
   binary datums; downlinks into `t_tid`. This is the largest slice and the one
   that couples the index format to the type-codec layer.

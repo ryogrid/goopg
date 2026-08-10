@@ -16,20 +16,21 @@ import (
 func btSpecial() int { return storage.BlockSize - btree.SizeOfBTPageOpaque }
 
 // makeMetaPage builds a metapage (block 0) carrying the given magic and
-// version, mirroring btree.writeMeta's layout (payload at SizeOfPageHeaderData:
-// magic, version, ...). The remaining metadata fields are left zero — the
-// verify tier only inspects magic and version. It self-checks the bytes through
-// the real decoder so a future layout change fails loudly here rather than
-// silently exercising garbage.
+// version, on the upstream shape M0130-S11.3 flipped to: a PG-format page
+// (16-byte special area, BTP_META) with BTMetaPageData at PageGetContents. The
+// remaining metadata fields are left zero — the verify tier only inspects
+// magic and version. It self-checks the bytes through the real decoder so a
+// future layout change fails loudly here rather than silently exercising
+// garbage.
 func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if err := btree.InitPGMetaPage(p, 0, 0, true); err != nil {
+		t.Fatalf("InitPGMetaPage: %v", err)
 	}
-	off := storage.SizeOfPageHeaderData
-	binary.LittleEndian.PutUint32(p[off:off+4], magic)
-	binary.LittleEndian.PutUint32(p[off+4:off+8], version)
+	m := btree.ReadPGMetaPage(p)
+	m.Magic, m.Version = magic, version
+	btree.WritePGMetaPage(p, m)
 	if got := btree.ParseMeta(p); got.Magic != magic || got.Version != version {
 		t.Fatalf("makeMetaPage self-check: ParseMeta=%+v, want magic=%#x version=%d", got, magic, version)
 	}

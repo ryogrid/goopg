@@ -94,8 +94,13 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 			Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber,
 			Level: 0, Flags: BTLeaf | BTRoot,
 		})
-		writeMeta(metaSlot.Page(), BTreeMeta{Magic: btreeMagic, Version: btreeVersion,
-			Root: rootBlk, Level: 0, FastRoot: rootBlk, FastLevel: 0})
+		if err := initMetaPage(metaSlot.Page(), rootBlk, 0); err != nil {
+			rootSlot.Unlock()
+			pool.Unpin(rootSlot)
+			metaSlot.Unlock()
+			pool.Unpin(metaSlot)
+			return nil, err
+		}
 		_ = bt.markDirtyWithPageRecord(rootSlot, rootBlk)
 		rootSlot.Unlock()
 		pool.Unpin(rootSlot)
@@ -148,8 +153,11 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	writeOpaque(rootSlot2.Page(), rootOp)
 	_ = bt.markDirtyWithPageRecord(rootSlot2, rootBlk)
 	bt.unpinW(rootSlot2)
-	writeMeta(metaSlot.Page(), BTreeMeta{Magic: btreeMagic, Version: btreeVersion,
-		Root: rootBlk, Level: rootLevel, FastRoot: rootBlk, FastLevel: rootLevel})
+	if err := initMetaPage(metaSlot.Page(), rootBlk, rootLevel); err != nil {
+		metaSlot.Unlock()
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	_ = bt.markDirtyWithPageRecord(metaSlot, MetaBlock)
 	metaSlot.Unlock()
 	pool.Unpin(metaSlot)
@@ -199,14 +207,13 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 			Level: 0,
 			Flags: BTLeaf | BTRoot,
 		})
-		writeMeta(metaSlot.Page(), BTreeMeta{
-			Magic:     btreeMagic,
-			Version:   btreeVersion,
-			Root:      rootBlk,
-			Level:     0,
-			FastRoot:  rootBlk,
-			FastLevel: 0,
-		})
+		if err := initMetaPage(metaSlot.Page(), rootBlk, 0); err != nil {
+			rootSlot.Unlock()
+			pool.Unpin(rootSlot)
+			metaSlot.Unlock()
+			pool.Unpin(metaSlot)
+			return nil, err
+		}
 		if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 			rootSlot.Unlock()
 			pool.Unpin(rootSlot)
@@ -291,14 +298,11 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 	bt.unpinW(rootSlot2)
 
 	// Write metapage with the final root.
-	writeMeta(metaSlot.Page(), BTreeMeta{
-		Magic:     btreeMagic,
-		Version:   btreeVersion,
-		Root:      rootBlk,
-		Level:     rootLevel,
-		FastRoot:  rootBlk,
-		FastLevel: rootLevel,
-	})
+	if err := initMetaPage(metaSlot.Page(), rootBlk, rootLevel); err != nil {
+		metaSlot.Unlock()
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	if err := bt.markDirtyWithPageRecord(metaSlot, MetaBlock); err != nil {
 		metaSlot.Unlock()
 		pool.Unpin(metaSlot)
