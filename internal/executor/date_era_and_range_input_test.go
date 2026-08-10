@@ -86,6 +86,17 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		{"2021-04-31", "22008"}, // April has 30 days
 		{"2020-02-29", ""},      // 2020 IS a leap year: accepted (wantCode "" checked below)
 		{"2021-04-30", ""},
+		// M0119-0006 §14.3: a BC date where the LITERAL year's leap-ness
+		// disagrees with the ASTRONOMICAL year's. '0001-02-29 BC' is
+		// astronomical year 0 (1 BC), which 0%400==0 makes leap — PG 18.3
+		// accepts it — but literal year 1 is not leap, so time.Parse's own
+		// day-out-of-range check rejects it a layer below
+		// validateDateTokenFull's (correct) astronomical-year check. Must
+		// not regress to the pre-fix 22007 ("day out of range" read as a
+		// syntax miss); the carrier's own range (1677-2262) still refuses
+		// year 0, so the code is 22008 either way — the assertion that
+		// matters is which PATH produces it.
+		{"0001-02-29 BC", "22008"},
 	} {
 		if c.wantCode == "" {
 			if _, err := parsePGDateText(c.in); err != nil {
@@ -144,6 +155,7 @@ func TestDateEraLiteralAndCopyPathsAgree(t *testing.T) {
 		"2020-01-01 BC", "0001-01-01 BC", "2020-01-01bc",
 		"0000-01-01", "1000-01-01", "2300-01-01",
 		"2020-01-01 BC BC", "BC",
+		"0001-02-29 BC", // M0119-0006 §14.3: BC-era leap-day fallback
 	}
 	for _, in := range forms {
 		_, copyErr := parsePGDateText(in)

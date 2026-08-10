@@ -969,3 +969,57 @@ suites (§12) — this slice only tightens an existing acceptance, it does not
 widen one. `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Also verified
 live against throwaway goopg + PG 18.3 servers on the exact repro strings
 above, including the run-together and BC forms.
+
+## 15. Follow-up 2026-08-11 (M0119-0006, 37th slice) — the DATE half of the BC leap-day race
+
+### 15.1 What landed
+
+§14.3's diagnosis, fixed for `parsePGDateText` only: new `bcLeapDateFallback`
+(`internal/executor/copy_text.go`) is tried when `time.Parse("2006-01-02",
+norm)` fails AFTER `validateDateTokenFull` has already confirmed the token is
+valid. It re-derives month/day (`pgdatetime.DateTokenMonthDay`) and the
+ASTRONOMICAL year (`pgdatetime.DateTokenYear` + `pgdatetime.AstronomicalYear`)
+straight from the token's digits — the same values `validateDateTokenFull`
+itself just validated — and builds the `time.Time` directly via
+`time.Date(astroYear, month, day, 0, 0, 0, 0, time.UTC)`. This sidesteps two
+things at once: `time.Parse`'s own day-out-of-range check (which uses the
+LITERAL year, not the astronomical one) and `pgdatetime.ApplyEra`'s
+literal→astronomical shift (already done by hand, so `ApplyEra` is skipped
+for this path — its only other job, the no-year-zero refusal, is preserved
+by `bcLeapDateFallback` returning `ok=false` when `AstronomicalYear` does,
+which leaves the original `time.Parse` error — itself now dead for every
+input this fallback actually fires on, since `!bc` is the only other `ok=
+false` case — to propagate unchanged).
+
+`'0001-02-29 BC'::date` no longer raises `22007` ("invalid input syntax",
+read as a spelling mistake); PG accepts it and goopg now reaches it too,
+modulo the carrier: the reconstructed astronomical year 0 is still outside
+goopg's nanosecond-carrier domain (1677..2262 — see §9's carrier note and the
+`Datum.Int`/`KindTime` deferral row), so `checkTimeCarrierRange` still
+refuses it, but with the CORRECT SQLSTATE (`22008`, a range failure) instead
+of the wrong one (`22007`, a syntax failure). The typed-literal and COPY
+paths move together for free (`TestDateEraLiteralAndCopyPathsAgree`) — both
+already share `parsePGDateText`.
+
+### 15.2 What did NOT land — the TIMESTAMP half
+
+`parsePGTimestampTextParts` has the identical bug (§14.3 named both call
+sites) and is UNCHANGED: it composes date and time-of-day in one
+`time.Parse` call per layout across two candidate strings (the plain body and
+the hour-24/leap-second-canonicalized one), so a bypass there needs the
+time-of-day fields threaded through the `time.Date` construction too, not
+just month/day/year. `'0001-02-29 10:00:00 BC'::timestamp` still raises
+`22007`. Deliberately deferred — see the M0119-0006 ledger row this slice
+appends — to keep the diff scoped to one call site per Ralph's "ONE task per
+loop" rule; the timestamp site additionally has to decide how the two
+candidate layouts interact with the bypass, which is its own design
+question.
+
+### 15.3 Verification
+
+`TestDateTimeInputErrorSeparatesRangeFromSyntax` gains `'0001-02-29 BC'` →
+`22008`. `TestDateEraLiteralAndCopyPathsAgree` gains the same input. Full
+`internal/pgdatetime` and `internal/executor` suites green;
+`TestRepresentableDatesStillParse` unaffected (this slice only changes the
+error CODE for an input that was already rejected, it does not widen
+acceptance into the representable range).

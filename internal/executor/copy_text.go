@@ -1017,6 +1017,21 @@ func parsePGDateText(s string) (time.Time, error) {
 	}
 	t, err := time.Parse("2006-01-02", norm)
 	if err != nil {
+		// M0119-0006 §14.3: validateDateTokenFull above already ran the full
+		// ValidateDate() battery — including day-in-month — against the
+		// ASTRONOMICAL year, the only one whose leap-ness matters. A BC date
+		// can still lose the race here: time.Parse's OWN day-out-of-range
+		// check runs against the token's LITERAL year, and for a BC date
+		// that disagrees with the astronomical one ('0001-02-29 BC' is
+		// astronomical year 0 — leap, per 0%400==0 — but literal year 1 is
+		// not, so time.Parse rejects a day PG accepts). Since the token is
+		// already known valid, bypass time.Parse's construction entirely:
+		// build the time.Time directly from the validated fields at the
+		// astronomical year, which sidesteps ApplyEra's own literal->
+		// astronomical shift (already done here) as well as its rejection.
+		if t2, ok := bcLeapDateFallback(norm, bc); ok {
+			return t2, checkTimeCarrierRange(t2)
+		}
 		return time.Time{}, err
 	}
 	t, err = pgdatetime.ApplyEra(t.UTC(), bc)
@@ -1024,6 +1039,29 @@ func parsePGDateText(s string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return t, checkTimeCarrierRange(t)
+}
+
+// bcLeapDateFallback reconstructs a validated "...-MM-DD" BC date token
+// directly via time.Date at the ASTRONOMICAL year, bypassing time.Parse's
+// day-out-of-range check — see the M0119-0006 §14.3 comment in
+// parsePGDateText above for why that check disagrees with PG for a BC
+// February 29. ok is false for anything this fallback does not apply to
+// (not BC, or the token/year don't parse — including the no-year-zero
+// refusal, left to the caller's original time.Parse error as before).
+func bcLeapDateFallback(dateToken string, bc bool) (time.Time, bool) {
+	if !bc {
+		return time.Time{}, false
+	}
+	month, day, mdok := pgdatetime.DateTokenMonthDay(dateToken)
+	year, yok := pgdatetime.DateTokenYear(dateToken)
+	if !mdok || !yok {
+		return time.Time{}, false
+	}
+	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	if !ok {
+		return time.Time{}, false
+	}
+	return time.Date(astroYear, time.Month(month), day, 0, 0, 0, 0, time.UTC), true
 }
 
 // validateDateTokenFull runs all three ValidateDate() checks (month, day,

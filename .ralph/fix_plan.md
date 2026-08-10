@@ -2950,6 +2950,23 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (executor); full executor/pgdatetime suites green;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35). Design
       `0125-0007-pg-faithful-date-field-decode.md` §14.
+      **37th slice (2026-08-11) — the DATE half of the BC leap-day race is
+      fixed.** New `bcLeapDateFallback` (`internal/executor/copy_text.go`) re
+      -derives month/day/astronomical-year straight from the token
+      `validateDateTokenFull` already validated, and builds the `time.Time`
+      via `time.Date` directly instead of `time.Parse` — bypassing both
+      `time.Parse`'s literal-year day check AND `ApplyEra`'s literal→
+      astronomical shift together. `'0001-02-29 BC'::date` no longer raises
+      the syntax-shaped 22007; it now reaches the carrier-range 22008 the
+      un-representable astronomical year 0 still deserves (same 282-ref
+      `KindTime` nanosecond-carrier blocker as the sibling rows). Scoped to
+      `parsePGDateText` only — `parsePGTimestampTextParts` has the identical
+      bug but composes date+time-of-day in one `time.Parse` call, so its fix
+      needs the time fields threaded through too; deferred, ledger row
+      appended. Gates: `TestDateTimeInputErrorSeparatesRangeFromSyntax` new
+      `'0001-02-29 BC'` case, `TestDateEraLiteralAndCopyPathsAgree` extended;
+      full executor/pgdatetime suites green. Design
+      `0125-0007-pg-faithful-date-field-decode.md` §15.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
