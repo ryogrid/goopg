@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a landed 2026-08-10; S11.4 slices 3b-2b/3b-2c/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b landed 2026-08-10; S11.4 slices 3b-2c/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -400,23 +400,54 @@ sources agree:
         not match its attlen falls back to `bytes.Compare` (deterministic and
         total, so a split still terminates) instead of panicking; corruption is
         amcheck's business. Additive: still nothing builds a descriptor.
-      - **3b-2b — build the descriptor from the catalog and flip the writer
-        (open).** `catalog.Index` already carries everything needed
-        (`ColDescending` / `ColNullsFirst` — nil means "all default ASC NULLS
-        LAST", so every read must bounds-check — plus `ColOpClasses`,
-        `ColCollations` and the column types); `internal/executor`'s
-        `userTypeAttrsForOID` already maps a type OID to
-        typlen/typbyval/typalign/typstorage, i.e. to `PGIndexAttr`. The mapper
-        must live executor-side: `internal/access/btree` deliberately does not
-        import `catalog`. Same commit flips the encoders
-        (`encodeCompositeBTreeKey`, `encodeIndexKeyFromCols`, `encodeArbiterKey`)
-        to per-column datums through `FormPGIndexTuple`. REINDEX-required.
-      - **3b-2c — route every comparison through the descriptor (open).** The
+      - **3b-2b — build the descriptor from the catalog (landed 2026-08-10).**
+        `internal/executor/pgindex_keydesc.go`: `buildPGIndexKeyDesc(idx
+        *catalog.Index) (*btree.PGIndexKeyDesc, error)`, goopg's
+        `_bt_mkscankey` minus everything that belongs to a scan. It reads what
+        `pg_index` records — the key columns' types (indkey), DESC / NULLS
+        FIRST (indoption, via `ColDescending` / `ColNullsFirst`, both **empty
+        when every column is the default ASC NULLS LAST**, so every read is
+        bounds-checked, and both carried across independently because
+        `... DESC NULLS LAST` is legal), the opclass (indclass) and the
+        collation (indcollation) — and projects each column's type OID through
+        `userTypeAttrsForOID` to a `PGIndexAttr` and through
+        `pgIndexComparatorForOID` to its 3b-2a comparator. The mapper lives
+        executor-side because `internal/access/btree` deliberately does not
+        import `catalog`.
+
+        The design decision that matters is that it is **conservative to the
+        point of erroring**: a non-btree access method, an expression key, an
+        explicit operator class (goopg records the spelling but has no
+        `pg_opclass` registry to resolve it against), a non-bytewise collation,
+        an array/enum/user type, or any type without a 3b-2a comparator yields
+        an error, never a descriptor with a nil `Compare`. Nil means bytewise,
+        which is right only while the on-page key is one of goopg's
+        order-preserving encodings; the instant the writer stores real datums
+        it silently mis-orders the tree. Erroring makes that failure mode
+        unreachable — a caller that cannot get a descriptor stays on the
+        pre-S11.4 path instead of writing a corrupt index. For the same reason
+        the type resolution is a private switch over the built-in spellings
+        rather than `buildUserPGAttributeRow`'s, whose `text` fallback for an
+        unknown name is right for pg_attribute and catastrophic here (an enum
+        column would take the text comparator while goopg orders enums by sort
+        order). Guards: `pgindex_keydesc_test.go`.
+      - **3b-2c — flip the writer and route every comparison through the
+        descriptor (open). REINDEX-required.** The writer flip
+        (`encodeCompositeBTreeKey`, `encodeIndexKeyFromCols`,
+        `encodeArbiterKey` → per-column datums through `FormPGIndexTuple`) was
+        originally planned for 3b-2b; building the mapper made clear it cannot
+        land there. The sibling-path rule is symmetric: a descriptor-derived
+        reader against a blob-writing writer reads garbage, **and** a
+        datum-writing writer against the surviving `CompareKeys` sites orders
+        garbage — real datums are not order-preserving under `bytes.Compare`
+        for any type but bytea/text. So the writer flip and the comparison
+        rerouting are one atomic change, and 3b-2b is exactly the additive part
+        that could be separated from it. The remaining work is the seam: the
         ~20 in-package `CompareKeys` sites compare *key payloads*, whereas
         `ComparePGIndexTuples` needs whole tuples (it reads t_info's null
-        bitmap and t_tid's natts/heap TID). Introducing that seam — one
-        `BTree`/bulk-builder comparison method over tuple-shaped operands — is
-        its own step, and is what finally retires `CompareKeys`.
+        bitmap and t_tid's natts/heap TID), so one `BTree`/bulk-builder
+        comparison method over tuple-shaped operands has to exist before either
+        half can move. That is what finally retires `CompareKeys`.
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

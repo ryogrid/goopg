@@ -909,23 +909,48 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
             caught. Deferred (1 ledger row): non-C collations, and the types
             with no comparator yet (arrays, enum, bit/varbit, inet/cidr/macaddr,
             interval, money, tsvector/tsquery, jsonb, range/multirange).
-      - [ ] **3b-2b — build the descriptor from the catalog, flip the writer**.
-            `catalog.Index.ColDescending`/`ColNullsFirst` (nil == all default
-            ASC NULLS LAST — bounds-check every read), `ColOpClasses`,
-            `ColCollations`; `userTypeAttrsForOID`
-            (`internal/executor/pg18_user_catalog_rows.go`) already maps a type
-            OID to typlen/typbyval/typalign/typstorage, i.e. to `PGIndexAttr`.
-            The mapper must live executor-side — `internal/access/btree` does
-            not import `catalog` on purpose. Same commit flips
-            `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-            `encodeArbiterKey` to per-column datums through `FormPGIndexTuple`.
-            REINDEX-required break.
-      - [ ] **3b-2c — route every comparison through the descriptor**. The ~20
-            in-package `CompareKeys` sites compare *key payloads*;
-            `ComparePGIndexTuples` needs whole tuples (t_info's null bitmap,
-            t_tid's natts/heap TID). Building that seam — one `BTree`/bulk
-            comparison method over tuple-shaped operands — is what finally
-            retires `CompareKeys`.
+      - [x] **3b-2b — build the descriptor from the catalog** (2026-08-10).
+            `internal/executor/pgindex_keydesc.go`: `buildPGIndexKeyDesc(idx
+            *catalog.Index) (*btree.PGIndexKeyDesc, error)` — goopg's
+            `_bt_mkscankey` minus the scan. Reads what pg_index records (key
+            column types, `ColDescending`/`ColNullsFirst` = indoption — both
+            EMPTY for the all-default ASC NULLS LAST case, so every read is
+            bounds-checked, and both carried independently since `DESC NULLS
+            LAST` is legal — `ColOpClasses` = indclass, `ColCollations` =
+            indcollation) and projects the type OID through
+            `userTypeAttrsForOID` → `PGIndexAttr` and
+            `pgIndexComparatorForOID` → the 3b-2a comparator. Executor-side by
+            necessity (`internal/access/btree` does not import `catalog`).
+            **Conservative to the point of erroring**: non-btree AM,
+            expression key, explicit opclass (no `pg_opclass` registry to
+            resolve one), non-bytewise collation, array/enum/user type, or any
+            type with no comparator → error, never a descriptor with a nil
+            `Compare`. Nil means bytewise, which is correct only for the
+            current order-preserving key encodings and silently mis-orders the
+            tree the moment the writer stores real datums. Type resolution is a
+            private built-in switch, NOT `buildUserPGAttributeRow`'s, whose
+            `text` fallback would hand an enum column the text comparator while
+            goopg orders enums by sort order. Guards:
+            `pgindex_keydesc_test.go` (9). The writer flip moved to 3b-2c —
+            see there.
+      - [ ] **3b-2c — flip the writer AND route every comparison through the
+            descriptor** (one atomic change; REINDEX-required break). The
+            writer flip was planned for 3b-2b; building the mapper showed it
+            cannot land there, because the sibling-path rule is symmetric — a
+            descriptor-derived reader against a blob-writing writer reads
+            garbage, and equally a datum-writing writer against the surviving
+            `CompareKeys` sites ORDERS garbage (real datums are not
+            order-preserving under `bytes.Compare` for any type but
+            bytea/text). So `encodeCompositeBTreeKey` /
+            `encodeIndexKeyFromCols` / `encodeArbiterKey` →
+            `FormPGIndexTuple` must land with the comparison rerouting. The
+            seam comes first: the ~20 in-package `CompareKeys` sites compare
+            *key payloads*, while `ComparePGIndexTuples` needs whole tuples
+            (t_info's null bitmap, t_tid's natts/heap TID), so one
+            `BTree`/bulk comparison method over tuple-shaped operands has to
+            exist before either half moves. That is what finally retires
+            `CompareKeys`. Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS
+            SF0.5 gate (re-pin after a REINDEX).
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.
