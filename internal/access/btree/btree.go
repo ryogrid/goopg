@@ -1602,20 +1602,23 @@ func (bt *BTree) ContentMuRecordsForBlock(blk storage.BlockNumber) []ContentMuEv
 // writer's insert and leaving the tree structurally inconsistent.
 // Keeping the lock held end-to-end across both branches (recycled
 // and fresh-PinNew) removes the window entirely.
+//
+// M0130-S11.5d-3c: a block on the free list is a CANDIDATE, not a guarantee.
+// Upstream's `_bt_allocbuf` re-reads each FSM-supplied block and only uses it
+// when `BTPageIsRecyclable` holds; a page deleted while some snapshot could
+// still be descending to it must stay a tombstone. This mirrors that: pop
+// candidates until one is recyclable, put the rest back, and extend the file
+// when none is.
 func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) {
-	if blk, ok := bt.popRecycledBlock(); ok {
-		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
-		if err != nil {
-			// Could not re-pin; fall back to fresh allocation.
-			return bt.pinNewLocked()
-		}
+	if slot, blk, ok := bt.popRecyclableBlock(); ok {
 		// Re-initialise the page bytes so the recycled slot looks
 		// like a fresh PinNew result. The page must be zeroed under
 		// the content lock so a concurrent reader never observes a
 		// partially-zeroed page (M0118-0130: "btree: item length
-		// mismatch keyLen=9 total=37"). The lock is intentionally
-		// NOT released here — see the function doc.
-		slot.Lock()
+		// mismatch keyLen=9 total=37"). popRecyclableBlock already
+		// returns the slot content-locked (it had to read the page to
+		// judge recyclability), and the lock is intentionally NOT
+		// released here — see the function doc.
 		page := slot.Page()
 		for i := range page {
 			page[i] = 0
@@ -1666,6 +1669,74 @@ func (bt *BTree) popRecycledBlock() (storage.BlockNumber, bool) {
 	blk := bt.freeList[n]
 	bt.freeList = bt.freeList[:n]
 	return blk, true
+}
+
+// popRecyclableBlock (M0130-S11.5d-3c) returns a pinned, content-LOCKED slot
+// for a free-list block whose page satisfies PGPageIsRecyclable, i.e. whose
+// deletion is old enough that no in-flight scan can still hold a downlink to
+// it. It is upstream's `_bt_allocbuf` loop (nbtpage.c:875-975), which likewise
+// treats an FSM-supplied block as a candidate and falls through to extending
+// the relation when none passes.
+//
+// Blocks that are not yet recyclable go BACK on the free list — they are
+// tombstones, not garbage, and a later allocation (by which time the horizon
+// has advanced) will take them. A block that cannot be pinned is dropped, as
+// before: it is unreachable from the tree, so leaking it is the safe outcome.
+func (bt *BTree) popRecyclableBlock() (*storage.Slot, storage.BlockNumber, bool) {
+	oldestVisible, gated := bt.recycleHorizon()
+	var keep []storage.BlockNumber
+	defer func() {
+		if len(keep) > 0 {
+			bt.freeListMu.Lock()
+			bt.freeList = append(bt.freeList, keep...)
+			bt.freeListMu.Unlock()
+		}
+	}()
+	for {
+		blk, ok := bt.popRecycledBlock()
+		if !ok {
+			return nil, storage.InvalidBlockNumber, false
+		}
+		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+		if err != nil {
+			continue
+		}
+		slot.Lock()
+		// Without a horizon source the pre-S11.5d-3c contract stands: the
+		// free list is authoritative and the page is not consulted at all.
+		// (Legacy non-WAL deletion paths stamp no safexid, and every unit
+		// test that builds a bare pool lands here.)
+		if !gated || PGPageIsRecyclable(slot.Page(), oldestVisible) {
+			return slot, blk, true
+		}
+		slot.Unlock()
+		bt.pool.Unpin(slot)
+		keep = append(keep, blk)
+	}
+}
+
+// recycleHorizon reads the GlobalVisCheckRemovableFullXid boundary from the
+// pool's configured source. `gated` is false when no source is wired, in which
+// case deletion stamps safexid 0 and every free-list block recycles at once.
+func (bt *BTree) recycleHorizon() (oldestVisible uint64, gated bool) {
+	fn := bt.pool.BtreeRecycleHorizon()
+	if fn == nil {
+		return 0, false
+	}
+	_, oldestVisible = fn()
+	return oldestVisible, true
+}
+
+// nextSafeXid is upstream's `ReadNextFullTransactionId()` at the point
+// `_bt_unlink_halfdead_page` stamps BTDeletedPageData.safexid (M0130-S11.5d-3c).
+// Returns 0 — "recyclable immediately" — when no horizon source is wired.
+func (bt *BTree) nextSafeXid() uint64 {
+	fn := bt.pool.BtreeRecycleHorizon()
+	if fn == nil {
+		return 0
+	}
+	next, _ := fn()
+	return next
 }
 
 // RecycledPageCount returns the number of pages currently in the

@@ -950,6 +950,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	})
 	txnMgr := mvcc.NewManager()
+	// M0130-S11.5d-3c: b-tree page deletion's recycle horizon. `next` is
+	// upstream's ReadNextFullTransactionId (stamped into the deleted page as
+	// its BTDeletedPageData.safexid); `oldestVisible` is the boundary
+	// GlobalVisCheckRemovableFullXid tests — a deleted block stays a tombstone
+	// until no live snapshot can still be descending to it. Both are widened
+	// from goopg's 32-bit XID space with the epoch pinned to 0, the same
+	// convention internal/amcheck uses.
+	pool.SetBtreeRecycleHorizon(func() (next, oldestVisible uint64) {
+		return uint64(txnMgr.NextXID()), uint64(txnMgr.OldestXmin())
+	})
 	// Wire the M0008 logical-decoding xact-marker hook: every
 	// successful Commit / Rollback against this manager appends
 	// an EncodeXactCommit / EncodeXactAbort record to the WAL

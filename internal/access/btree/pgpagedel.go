@@ -81,6 +81,42 @@ func PGDeletedPageSafeXid(page storage.Page) (safexid uint64, ok bool) {
 	return binary.LittleEndian.Uint64(page[storage.SizeOfPageHeaderData : storage.SizeOfPageHeaderData+SizeOfBTDeletedPageData]), true
 }
 
+// PGPageIsRecyclable is upstream's `BTPageIsRecyclable` (nbtree.h:290-318):
+// a deleted page may be handed to a new allocation only once no scan could
+// still be holding a downlink to it. M0130-S11.5d-3c.
+//
+// `oldestVisible` is the FullTransactionId boundary of
+// `GlobalVisCheckRemovableFullXid` — the oldest XID any snapshot in the
+// cluster can still see. The page's safexid was read from the XID counter at
+// the moment of deletion, so a scan that descended to it must have started
+// before that; once no live snapshot reaches back that far, the block is free.
+// This is the tombstone interval upstream keeps and goopg did not: before this
+// slice goopg recycled the block in the same call that unlinked it.
+//
+// Divergence from upstream, deliberate and matching internal/amcheck: goopg
+// works in 32-bit TransactionID space with the epoch pinned to 0, so both
+// operands are epoch-0 FullTransactionIds and the comparison is a plain
+// unsigned `<` rather than FullTransactionIdPrecedes over a wrapping counter.
+//
+// A deleted page WITHOUT BTP_HAS_FULLXID carries no safexid at all. Upstream
+// only ever sees that shape on pg_upgrade'd indexes (where btpo_level doubles
+// as the xid); in goopg it is the pre-S11.5d legacy stamp written by the
+// non-WAL deletion paths (`markDeletedAndRecycle`, `unlinkEmptyLeafSimple`),
+// which recycled immediately. Those keep that behaviour — safexid 0, i.e.
+// always removable — so this predicate never strands a block a previous
+// release would have reused.
+func PGPageIsRecyclable(page storage.Page, oldestVisible uint64) bool {
+	op := ReadPGOpaque(page)
+	if op.Flags&BTPDeleted == 0 {
+		return false
+	}
+	safexid, ok := PGDeletedPageSafeXid(page)
+	if !ok {
+		return true // legacy stamp: no horizon was ever recorded
+	}
+	return safexid < oldestVisible
+}
+
 // ReplayUnlinkLeftSibling repoints the deleted page's left sibling past it —
 // block 1 of XLOG_BTREE_UNLINK_PAGE (nbtxlog.c:882-893). M0130-S11.5d-2.
 //

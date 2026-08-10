@@ -817,6 +817,79 @@ guard over both records (the parent and leaf of phase 1 as well), pairs the two
 phases one-for-one, and now compares the whole target *opaque* against the image
 the record carried rather than a flags word.
 
+## S11.5d-3c — the safexid recycle horizon
+
+The records were right; the *lifetime* was not. S11.5d-3b-2 wrote a
+`BTDeletedPageData` into every deleted page and a `safexid` into every
+`xl_btree_unlink_page`, and both were the literal `0` — because goopg had no
+XID horizon to put there. `unlinkEmptyLeaf` called `recycleBlock` in the same
+call that unlinked the page, and the very next split could take that block.
+
+Upstream does not, and the reason is not bookkeeping. A scan that descended to
+the page *before* the deletion still holds its downlink; it will read the block
+later, and until no such scan can exist the block must stay a tombstone.
+`_bt_unlink_halfdead_page` therefore reads the XID counter at the moment of
+deletion (`safexid = ReadNextFullTransactionId()`, nbtpage.c:2646) and stamps it
+into the page, and `_bt_allocbuf` re-reads every candidate block from the FSM
+and takes it only when `BTPageIsRecyclable` says the safexid is no longer
+visible to anyone (nbtree.h:290-318). Reusing the block early does not merely
+lose space — the late scan lands on a page an unrelated split has meanwhile
+filled with foreign keys.
+
+goopg now does both halves:
+
+- **Stamp.** `unlinkEmptyLeaf` reads `bt.nextSafeXid()` where upstream reads the
+  counter, and hands it to `ReplayUnlinkTargetPage` — so the record, the
+  primary's page and the standby's page all carry the same value by
+  construction, as with every other field of this record.
+- **Gate.** `pinNewOrRecycled` no longer trusts the free list. `popRecyclableBlock`
+  treats each entry as a *candidate*: it pins the block, checks
+  `PGPageIsRecyclable`, and on failure puts it **back** — a tombstone is not
+  garbage, it is a block that becomes reusable later — falling through to
+  extending the relation, which is exactly `_bt_allocbuf`'s shape.
+
+The horizon source is `storage.Pool.SetBtreeRecycleHorizon`, wired in
+`initdb.Open` from the transaction manager: `next` is `NextXID()`
+(`ReadNextFullTransactionId`) and `oldestVisible` is `OldestXmin()` (the
+boundary `GlobalVisCheckRemovableFullXid` tests). It is a post-construction
+setter rather than a `PoolConfig` field only because the pool is created before
+the transaction manager exists.
+
+Two deliberate divergences, both recorded in the deferral ledger:
+
+- **Epoch-0 FullTransactionIds.** goopg's XID space is 32-bit, so both operands
+  are widened with the epoch pinned to 0 and compared with an unsigned `<`
+  rather than `FullTransactionIdPrecedes` over a wrapping counter. This is the
+  same convention `internal/amcheck` already uses.
+- **No horizon source ⇒ no gate.** With `SetBtreeRecycleHorizon` unset the
+  deletion stamps safexid 0 and the free list stays authoritative. That keeps
+  every bare-pool unit test working, and it is also what the *legacy* non-WAL
+  deletion paths (`markDeletedAndRecycle`, the `unlinkEmptyLeafSimple` branch)
+  need: they write goopg's legacy `BTDeleted` stamp with no `BTDeletedPageData`
+  behind it, so there is no safexid to compare and `PGPageIsRecyclable` reports
+  them immediately recyclable — never stranding a block a previous release
+  would have reused. Upstream sees that same shape only on pg_upgrade'd
+  indexes, where `btpo_level` doubles as the xid.
+
+There is still no pending-FSM equivalent: goopg's free list is per-`BTree`,
+in-memory, and lost at restart, so a tombstone that outlives the process leaks
+its block rather than being rediscovered by a later vacuum the way upstream's
+`_bt_pendingfsm_finalize` / FSM round-trip rediscovers it. Ledger row.
+
+### Guards — S11.5d-3c
+
+`internal/access/btree/recycle_horizon_test.go`. `TestPGPageIsRecyclable` pins
+the predicate over the three page shapes it must distinguish (live, deleted
+with a safexid, legacy deleted). `TestPinNewOrRecycledHonoursTombstone` drives
+the allocator: with the horizon at the safexid the block is refused *and put
+back*, and once the horizon moves past it the same block is taken.
+`TestPinNewOrRecycledUngatedKeepsLegacyBehaviour` pins the unwired fallback.
+`TestUnlinkStampsSafeXidFromHorizon` closes the emit half — a real
+`VacuumIndexPages` must put the horizon's `next` in both the record and the
+page image, which is the one thing the redo-side tests cannot see (they read
+`0` as "recyclable immediately" and so would pass against a horizon that
+silently did nothing).
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -833,10 +906,6 @@ the record carried rather than a flags word.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **The safexid horizon (S11.5d-3c)** — goopg has no `BTPageIsRecyclable`: it
-  stamps `BTDeleted` and recycles the block immediately, with no XID horizon, so
-  `BTDeletedPageData` has encode and replay coverage but no runtime producer.
-
 Until those land, `relhasindex` stays false in `buildUserPGClassRow`
 (S11.6): a PG standby that saw goopg's indexes would try to replay these
 records.

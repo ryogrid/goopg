@@ -664,11 +664,17 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// reading the pre-mutation page would describe a different mutation from
 	// the one performed.
 	//
-	// safexid stays 0 until M0130-S11.5d-3c gives goopg a recycle horizon;
-	// recycleBlock below reuses the block immediately, which is the behaviour
-	// that value currently describes.
+	// The safexid is read from the XID counter here, exactly where upstream
+	// reads it (`_bt_unlink_halfdead_page`, nbtpage.c:2646 —
+	// `safexid = ReadNextFullTransactionId(); BTPageSetDeleted(page, safexid)`).
+	// It is the tombstone horizon: any scan that already descended to this
+	// block started before this XID, so the block cannot be handed to a new
+	// allocation until no snapshot reaches back that far (M0130-S11.5d-3c;
+	// enforced by pinNewOrRecycled via PGPageIsRecyclable). 0 when no horizon
+	// source is wired, which reads as "recyclable immediately" and reproduces
+	// the pre-S11.5d-3c behaviour.
 	leftsib, rightsib := pgSibling(pins.leftBlk), pgSibling(pins.rightBlk)
-	const safexid = 0
+	safexid := bt.nextSafeXid()
 	targetAfter := make(storage.Page, storage.BlockSize)
 	copy(targetAfter, pins.target.Page())
 	if err := ReplayUnlinkTargetPage(targetAfter, leftsib, rightsib, targetOp.Level, safexid); err != nil {

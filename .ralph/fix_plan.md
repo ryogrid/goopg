@@ -1780,12 +1780,32 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         btree -race PASS; units PASS; pgbench smoke PASS (commit hook). 2 ledger
         rows (torn phase-1/phase-2 deletion is now possible and goopg cannot
         resume it; no multi-level subtree deletion).
-  - [ ] **S11.5d-3c — the safexid recycle horizon**. goopg has no
-        `BTPageIsRecyclable`: it stamps `BTDeleted` and recycles the block with
-        no XID horizon, so `BTDeletedPageData` has encode+replay coverage
-        (S11.5d-2) and no runtime producer. Stamp the safexid via
-        `btree.ReplayUnlinkTargetPage` on the primary and gate `recycleBlock` on
-        the horizon. Ledger 2026-08-10 (S11.5d-2 row, item 2).
+  - [x] **S11.5d-3c — the safexid recycle horizon** (landed 2026-08-10).
+        `unlinkEmptyLeaf` stamps a real safexid — read where upstream reads it
+        (`_bt_unlink_halfdead_page`: `safexid = ReadNextFullTransactionId()`)
+        from the new `storage.Pool.SetBtreeRecycleHorizon` hook, wired in
+        `initdb.Open` off `mvcc.Manager.NextXID`/`OldestXmin` — into both the
+        record and the page image, so `BTDeletedPageData` finally has a runtime
+        producer. The allocation side is the half that makes it mean anything:
+        a free-list block is now a CANDIDATE, and `popRecyclableBlock` pins it,
+        tests the new `btree.PGPageIsRecyclable` (upstream `BTPageIsRecyclable`,
+        nbtree.h:290-318) and on failure puts it **back**, extending the
+        relation instead — `_bt_allocbuf`'s shape. What this prevents is not
+        wasted space: goopg used to hand the block to the very next split, so a
+        scan that had already read the downlink landed on a page filled with
+        another key range's tuples. Two deliberate divergences, both ledgered:
+        epoch-0 widened 32-bit XIDs compared with unsigned `<` (no wraparound-
+        safe `FullTransactionIdPrecedes`), and no pending-FSM — the free list is
+        per-`BTree` and in-memory, so a block still tombstoned at shutdown leaks
+        rather than being rediscovered. With no horizon source wired (bare-pool
+        unit tests; the legacy non-WAL deletion paths, which stamp no safexid)
+        the pre-slice behaviour stands unchanged. Guards:
+        `internal/access/btree/recycle_horizon_test.go` (predicate over the
+        three page shapes; allocator refuses-and-restores then takes the block
+        once the horizon moves; ungated fallback; and a real `VacuumIndexPages`
+        putting the horizon's value in record AND page — the one thing the
+        redo-side tests cannot see, since they read `0` as "recyclable now").
+        Doc: `docs/design/0130-0012-rm-btree-wal-content-parity.md` §S11.5d-3c.
 - [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
       `relhasindex` in `buildUserPGClassRow`
       (`internal/executor/pg18_user_catalog_rows.go`), re-run

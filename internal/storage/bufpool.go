@@ -138,6 +138,11 @@ type Pool struct {
 	logBtreeUnlinkPage       LogBtreeUnlinkPageFunc
 	logBtreeNewRoot          LogBtreeNewRootFunc
 	logBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+	// btreeRecycleHorizon is the b-tree page-deletion XID horizon source
+	// (M0130-S11.5d-3c). Set after construction rather than through PoolConfig
+	// because the transaction manager that answers it is created after the
+	// pool. See BtreeRecycleHorizonFunc.
+	btreeRecycleHorizon atomic.Pointer[BtreeRecycleHorizonFunc]
 	// M0080-0001 logical record for VACUUM FREEZE.
 	logHeapFreeze LogHeapFreezeFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record.
@@ -728,8 +733,9 @@ type BtreeUnlinkPageRequest struct {
 	TargetBlk  BlockNumber
 	TargetPage Page
 	// SafeXid is the FullTransactionId BTPageSetDeleted stamps — the XID from
-	// which the block becomes recyclable. Still 0 until M0130-S11.5d-3c gives
-	// goopg a recycle horizon.
+	// which the block becomes recyclable. Read from the cluster XID counter at
+	// deletion time via Pool.BtreeRecycleHorizon (M0130-S11.5d-3c); 0 when no
+	// horizon source is wired, which means "recyclable immediately".
 	SafeXid uint64
 	// LeafBlk / LeafPage are the half-dead leaf at the bottom of the subtree.
 	// LeafBlk == TargetBlk (and LeafPage nil) for the single-page deletion
@@ -937,6 +943,39 @@ func (p *Pool) LogHeapUpdate() LogHeapUpdateFunc { return p.logHeapUpdate }
 
 // LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
+
+// BtreeRecycleHorizonFunc reports the two FullTransactionIds b-tree page
+// deletion needs (M0130-S11.5d-3c):
+//
+//   - next: upstream's `ReadNextFullTransactionId()`, stamped into the deleted
+//     page as its BTDeletedPageData.safexid;
+//   - oldestVisible: the boundary `GlobalVisCheckRemovableFullXid` tests
+//     against — the oldest XID any live snapshot can still see, below which a
+//     deleted page can no longer be reached by an in-flight scan.
+//
+// Both are epoch-0 FullTransactionIds (goopg's 32-bit XID space widened; see
+// btree.PGPageIsRecyclable).
+type BtreeRecycleHorizonFunc func() (next, oldestVisible uint64)
+
+// SetBtreeRecycleHorizon installs the page-deletion XID horizon source. Called
+// once during startup wiring, after the transaction manager exists. When unset,
+// b-tree deletion stamps safexid 0 and recycles blocks immediately — the
+// pre-S11.5d-3c behaviour that throwaway pools in tests rely on.
+func (p *Pool) SetBtreeRecycleHorizon(fn BtreeRecycleHorizonFunc) {
+	if fn == nil {
+		p.btreeRecycleHorizon.Store(nil)
+		return
+	}
+	p.btreeRecycleHorizon.Store(&fn)
+}
+
+// BtreeRecycleHorizon returns the configured horizon source, or nil.
+func (p *Pool) BtreeRecycleHorizon() BtreeRecycleHorizonFunc {
+	if fn := p.btreeRecycleHorizon.Load(); fn != nil {
+		return *fn
+	}
+	return nil
+}
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 func (p *Pool) SetFullPageWrites(on bool) { p.fullPageWrites.Store(on) }
