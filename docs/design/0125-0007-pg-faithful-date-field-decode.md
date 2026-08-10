@@ -491,3 +491,83 @@ battery, and the timestamp battery's residue is the four ledger rows below.
    (`'2020-01-01 10:00:00+05:30'` → `04:30:00`; PG ignores the zone). Pre-existing
    — the `Z07` layouts are shared by both types — but this slice let more
    spellings reach it.
+
+## 10. Follow-up 2026-08-11 (M0119-0006) — the zone a `timestamp` and a `date` must THROW AWAY
+
+Closes item (4) of §9.4, and the probe found the same root cause producing a
+**whole-day** error one type over.
+
+### 10.1 The defect
+
+`timestamp` without time zone and `date` decode a time zone field out of their
+input and then ignore it; only `timestamptz` keeps it. goopg applied the zone to
+all three, so the answers were silently wrong — never errors:
+
+| input | goopg (before) | PG 18.3 |
+|---|---|---|
+| `'2020-01-01 10:00:00+05:30'::timestamp` | `2020-01-01 04:30:00` | `2020-01-01 10:00:00` |
+| `'2020-01-02 02:00:00+05:30'::date` | `2020-01-01` | `2020-01-02` |
+| `'2020-01-01 22:00:00-08'::date` | `2020-01-02` | `2020-01-01` |
+| `'2020-01-01 10:00:00+05:30'::timestamptz` | `2020-01-01 04:30:00` | `2020-01-01 04:30:00` |
+
+The `date` rows are the expensive shape: an offset that crosses midnight moves
+the stored day, so a `WHERE d = DATE '2020-01-02'` silently misses the row that
+was inserted as `'2020-01-02 02:00:00+05:30'`.
+
+### 10.2 Why
+
+Upstream runs all three input functions through the SAME `DecodeDateTime()`
+(`postgres/src/backend/utils/adt/datetime.c`), which fills `tzp` whenever the
+text carries an offset. The types differ only in the call after it:
+
+- `timestamptz_in` → `tm2timestamp(tm, fsec, &tz, &result)` — the offset moves
+  the wall clock onto the UTC line;
+- `timestamp_in` → `tm2timestamp(tm, fsec, NULL, &result)` — the decoded zone is
+  discarded (`timestamp.c`);
+- `date_in` → `date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)` — the zone is never
+  consulted at all (`date.c`).
+
+goopg had exactly one shared layout table (§7) whose zone-bearing entries use
+Go's `Z07*` elements, and converted every match with `.UTC()`. That single
+`.UTC()` **is** the timestamptz rule, applied to all three types.
+
+### 10.3 What landed
+
+`internal/executor/copy_text.go` gained the type→rule mapping the shared table
+cannot express:
+
+- `tsZoneMode` (`tsApplyZone` / `tsDiscardZone`) with the upstream call sites
+  documented on it;
+- `tsZoneModeForType(typeName)` — only `timestamptz` / `timestamp with time zone`
+  keep the offset;
+- `applyTSZoneMode(ts, zone)` — `tsDiscardZone` re-reads the parsed wall-clock
+  fields as UTC, which is upstream's `tm2timestamp(..., NULL, ...)`;
+- `parsePGTimestampTextZone` / `parseCopyTimestampZone`, the mode-taking forms of
+  the two shared entry points. The old no-mode names remain as the timestamptz
+  reading for the paths that do not know their target type (§10.5).
+
+Every input path that DOES know its target type now passes the mode: the typed
+literal (`expr.go` `evalTypedStringLit`, from `x.Type`), the `::timestamp` /
+`::timestamptz` and `::date` casts (`evalCast`), `pg_input_is_valid`, the COPY
+TEXT reader (`copy_text.go` `copyTextToDatum`, from the column type) and the
+value encoder (`codec.go` `encodeValuePG`).
+
+### 10.4 Verification
+
+`internal/executor/timestamp_zone_discard_input_test.go` pins the parser against
+PG-18.3-captured answers for both modes. End-to-end, a throwaway goopg was
+diffed against a throwaway PG 18.3 cluster over the literal, cast, `INSERT` and
+`COPY FROM STDIN` paths for `timestamp`, `timestamptz` and `date`: every cell now
+agrees.
+
+### 10.5 Still unimplemented (deferral ledger, 2026-08-11)
+
+1. Four paths still read a string as a timestamp with NO target type in hand and
+   so keep the timestamptz rule: the cross-kind comparison coercion
+   (`tryParseStringAs`), `EXTRACT`, `date_trunc` and the `pg_authid` `validuntil`
+   sync. PG never has this ambiguity — `transformExpr` coerces the unknown
+   literal to the target type before evaluation.
+2. goopg prints a `timestamptz` with no zone suffix (`2020-01-01 04:30:00` where
+   PG prints `2020-01-01 04:30:00+00`), because `KindTime` cannot tell the two
+   types apart on output either — the same missing distinction, on the other
+   side of the wire.

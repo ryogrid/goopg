@@ -347,11 +347,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
 				d = inf
 			} else {
-				t, err := parseCopyTimestamp(d.StringValue())
+				// A zone in the text belongs to the value only for timestamptz;
+				// `timestamp` decodes and discards it (tsZoneMode).
+				ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(t.Name))
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
 				}
-				d = NewTimeDatum(t.UTC())
+				d = NewTimeDatum(ts.UTC())
 			}
 		}
 		if d.Kind != KindTime {
@@ -379,11 +381,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
 				d = inf
 			} else {
-				t, err := parseCopyTimestamp(d.StringValue())
+				// date_in never looks at the decoded zone, so the wall clock as
+				// written picks the day (tsZoneMode).
+				ts, err := parseCopyTimestampZone(d.StringValue(), tsDiscardZone)
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
 				}
-				d = NewTimeDatum(t.UTC())
+				d = NewTimeDatum(ts.UTC())
 			}
 		}
 		if d.Kind != KindTime {

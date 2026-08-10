@@ -322,7 +322,10 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("invalid boolean %q", string(raw))
 		}
 	case "timestamp", "timestamptz", "date":
-		ts, err := parseCopyTimestamp(string(raw))
+		// The column's own type decides whether a zone in the text is applied or
+		// thrown away (tsZoneMode): a COPY of '2020-01-02 02:00:00+05:30' into a
+		// date column is 2020-01-02 upstream, not the previous day.
+		ts, err := parseCopyTimestampZone(string(raw), tsZoneModeForType(t.Name))
 		if err != nil {
 			return Datum{}, err
 		}
@@ -761,6 +764,61 @@ var pgTimestampLayouts = []string{
 	"2006-01-02",
 }
 
+// tsZoneMode says what a timestamp text-input path must do with a time zone
+// field it decoded out of the input, and it is NOT a stylistic choice: upstream
+// decodes the zone for every one of these types and then keeps it for exactly
+// one of them.
+//
+// PostgreSQL's timestamp_in, date_in and timestamptz_in (backend/utils/adt/
+// timestamp.c, date.c) all call the SAME DecodeDateTime(), which fills `tzp`
+// whenever the input carries an offset. What differs is the call after it:
+// timestamptz_in passes `&tz` to tm2timestamp() so the offset shifts the wall
+// clock onto the UTC line, while timestamp_in passes NULL and date_in never
+// looks at the zone at all — so `'2020-01-01 10:00:00+05:30'::timestamp` IS
+// `2020-01-01 10:00:00`, the offset having been parsed and thrown away.
+//
+// goopg had one shared layout table with Go `Z07*` elements and converted every
+// result with .UTC(), which is the timestamptz rule applied to all three. The
+// results were silently wrong, never errors: that literal answered
+// `2020-01-01 04:30:00` as a timestamp, and a date was off by a WHOLE DAY
+// whenever the offset crossed midnight (`'2020-01-02 02:00:00+05:30'::date`
+// answered 2020-01-01 where PG answers 2020-01-02).
+type tsZoneMode bool
+
+const (
+	// tsDiscardZone is the timestamp-without-time-zone / date rule: decode the
+	// zone field (so the spelling stays legal input) and then ignore it, keeping
+	// the wall clock exactly as written.
+	tsDiscardZone tsZoneMode = false
+	// tsApplyZone is the timestamptz rule: the offset moves the wall clock onto
+	// the UTC line, which is what the KindTime carrier stores.
+	tsApplyZone tsZoneMode = true
+)
+
+// tsZoneModeForType picks the rule from the SQL type name a text input is being
+// read as. Only the with-time-zone spellings keep the offset; `timestamp`,
+// `date` and anything else fall on the discard side, as upstream's input
+// functions do.
+func tsZoneModeForType(typeName string) tsZoneMode {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "timestamptz", "timestamp with time zone":
+		return tsApplyZone
+	}
+	return tsDiscardZone
+}
+
+// applyTSZoneMode turns the time.Parse result into the value the target type
+// stores. Go hands back the wall clock plus a fixed zone; tsApplyZone converts
+// to the UTC instant it denotes, tsDiscardZone re-reads the very same wall-clock
+// fields as UTC, which is upstream's "tm2timestamp(tm, fsec, NULL, &result)".
+func applyTSZoneMode(ts time.Time, zone tsZoneMode) time.Time {
+	if zone == tsApplyZone {
+		return ts.UTC()
+	}
+	return time.Date(ts.Year(), ts.Month(), ts.Day(),
+		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC)
+}
+
 // errNoTimestampLayout is parsePGTimestampText's "nothing matched" failure. It
 // is a plain syntax miss (22007 at the call sites); a field that parsed but is
 // out of range comes back as pgdatetime.ErrFieldOutOfRange instead (22008).
@@ -783,7 +841,18 @@ var errNoTimestampLayout = errors.New("no timestamp layout matched")
 //	NormalizeInput — unpadded fields, the 'T'/'t' separator, a lone 'Z', an
 //	                 absent seconds field
 //	ApplyEra       — era → astronomical year, and the no-year-zero range rule
+//
+// The zone-bearing spellings are read under the caller's tsZoneMode, because
+// the layout table alone cannot express the one place the three input functions
+// differ (see tsZoneMode). parsePGTimestampText is the timestamptz reading;
+// every path that KNOWS its target type must call parsePGTimestampTextZone.
 func parsePGTimestampText(s string) (time.Time, error) {
+	return parsePGTimestampTextZone(s, tsApplyZone)
+}
+
+// parsePGTimestampTextZone is parsePGTimestampText with the target type's zone
+// rule made explicit. See tsZoneMode for why the rule is per-type.
+func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
 	body, bc := pgdatetime.SplitEra(s)
 	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
 	// unpadded month, day, hour, minute or second is legal input. Normalise
@@ -803,7 +872,7 @@ func parsePGTimestampText(s string) (time.Time, error) {
 		}
 		for _, layout := range pgTimestampLayouts {
 			if ts, err := time.Parse(layout, cand); err == nil {
-				ts, err := pgdatetime.ApplyEra(ts.UTC(), bc)
+				ts, err := pgdatetime.ApplyEra(applyTSZoneMode(ts, zone), bc)
 				if err != nil {
 					return time.Time{}, err
 				}
@@ -905,9 +974,17 @@ func parsePGDateText(s string) (time.Time, error) {
 
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
 // commonly produces: with or without fractional seconds, with or
-// without timezone.
+// without timezone. It is the timestamptz reading of the input; a caller that
+// knows its target type must use parseCopyTimestampZone instead (see
+// tsZoneMode — `timestamp` and `date` throw a decoded zone away).
 func parseCopyTimestamp(s string) (time.Time, error) {
-	ts, err := parsePGTimestampText(s)
+	return parseCopyTimestampZone(s, tsApplyZone)
+}
+
+// parseCopyTimestampZone is parseCopyTimestamp with the target type's zone rule
+// made explicit.
+func parseCopyTimestampZone(s string, zone tsZoneMode) (time.Time, error) {
+	ts, err := parsePGTimestampTextZone(s, zone)
 	if err == nil {
 		return ts, nil
 	}

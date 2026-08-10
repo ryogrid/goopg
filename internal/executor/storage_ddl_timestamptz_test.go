@@ -27,17 +27,27 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 		valid := []struct {
 			in   string
 			want time.Time
+			// wantNoTZ is the answer for `timestamp` WITHOUT time zone when it
+			// differs from the timestamptz one, i.e. for the offset-bearing
+			// spellings only: timestamp_in decodes the zone and then discards it
+			// (M0119-0006, tsZoneMode), so the wall clock stands as written.
+			// The zero value means "same as want".
+			wantNoTZ time.Time
 		}{
-			{"2010-04-01 10:00", utc(2010, 4, 1, 10, 0, 0)},         // seconds-less (the spec's form)
-			{"2010-04-01 11:00", utc(2010, 4, 1, 11, 0, 0)},         // seconds-less
-			{"2010-04-01 10:00:00", utc(2010, 4, 1, 10, 0, 0)},      // explicit seconds (regression)
-			{"2010-04-01 10:00:00.5", utc(2010, 4, 1, 10, 0, 0)},    // fractional seconds (regression)
-			{"2010-04-01", utc(2010, 4, 1, 0, 0, 0)},                // date only (regression)
-			{"2010-04-01 10:00:00-04", utc(2010, 4, 1, 14, 0, 0)},   // explicit offset honoured
-			{"2010-04-01 10:00-04", utc(2010, 4, 1, 14, 0, 0)},      // seconds-less + offset
-			{"2010-04-01 10:00:00.5-04", utc(2010, 4, 1, 14, 0, 0)}, // fractional + offset
+			{in: "2010-04-01 10:00", want: utc(2010, 4, 1, 10, 0, 0)},      // seconds-less (the spec's form)
+			{in: "2010-04-01 11:00", want: utc(2010, 4, 1, 11, 0, 0)},      // seconds-less
+			{in: "2010-04-01 10:00:00", want: utc(2010, 4, 1, 10, 0, 0)},   // explicit seconds (regression)
+			{in: "2010-04-01 10:00:00.5", want: utc(2010, 4, 1, 10, 0, 0)}, // fractional seconds (regression)
+			{in: "2010-04-01", want: utc(2010, 4, 1, 0, 0, 0)},             // date only (regression)
+			// Explicit offset: honoured by timestamptz, discarded by timestamp.
+			{in: "2010-04-01 10:00:00-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
+			{in: "2010-04-01 10:00-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
+			{in: "2010-04-01 10:00:00.5-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
 		}
 		for _, tc := range valid {
+			if typ == "timestamp" && !tc.wantNoTZ.IsZero() {
+				tc.want = tc.wantNoTZ
+			}
 			x := &planner.TypedStringLit{Type: typ, Value: tc.in}
 			d, err := evalTypedStringLit(x)
 			if err != nil {

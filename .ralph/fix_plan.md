@@ -2220,6 +2220,28 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `timetz`'s session-zone default, and the pre-existing `timestamp`-applies
       -a-decoded-offset defect this slice made reachable from more spellings.
       Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §9.
+      **Slice landed 2026-08-11 (32nd) — the zone a `timestamp` and a `date`
+      must THROW AWAY**: closes the 31st slice's deferral (4), and the probe
+      found the same root cause producing a WHOLE-DAY error one type over.
+      Upstream runs all three input functions through one `DecodeDateTime()` and
+      differs only after it (`timestamptz_in` passes `&tz` to `tm2timestamp()`,
+      `timestamp_in` passes `NULL`, `date_in` never looks at the zone), while
+      goopg had ONE shared layout table with Go `Z07*` elements and `.UTC()`'d
+      every match — the timestamptz rule applied to all three. Silently wrong,
+      never errors: `'2020-01-01 10:00:00+05:30'::timestamp` = `04:30:00`
+      (PG `10:00:00`), and `'2020-01-02 02:00:00+05:30'::date` = `2020-01-01`
+      (PG `2020-01-02`) — an offset crossing midnight moved the STORED DAY, so
+      `WHERE d = DATE '2020-01-02'` silently missed the row it had just
+      inserted. New `tsZoneMode`/`tsZoneModeForType`/`applyTSZoneMode` +
+      mode-taking `parsePGTimestampTextZone`/`parseCopyTimestampZone`
+      (`copy_text.go`); typed literal, the three casts, `pg_input_is_valid`,
+      the COPY TEXT reader and `codec.go`'s encoder all pass their target
+      type's rule. Gate: `timestamp_zone_discard_input_test.go`, plus a
+      literal/cast/INSERT/COPY E2E diff of a throwaway goopg against a
+      throwaway PG 18.3 (every cell agrees). Deferred (ledger): the four
+      target-type-less paths (`tryParseStringAs`, `EXTRACT`, `date_trunc`,
+      `pg_authid` validuntil) that keep the timestamptz reading, and the
+      `timestamptz` OUTPUT missing its `+00` suffix. Design: same doc §10.
       **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
       (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
       posting lists goopg's own bulk build wrote, on a real heap, under the

@@ -3047,7 +3047,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// shared pgTimestampLayouts table) is now parsePGTimestampText, which
 		// the COPY/encode path calls too, so the literal path and the COPY path
 		// can no longer accept different spellings of the same timestamp.
-		t, err := parsePGTimestampText(x.Value)
+		// M0119-0006: the literal's own type decides what happens to a zone the
+		// input carries — TIMESTAMP '2020-01-01 10:00:00+05:30' is 10:00:00, the
+		// offset parsed and thrown away, while the TIMESTAMPTZ spelling of the
+		// same text is 04:30:00 UTC. See tsZoneMode.
+		t, err := parsePGTimestampTextZone(x.Value, tsZoneModeForType(x.Type))
 		if err != nil {
 			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
 				return Datum{}, ee
@@ -3664,7 +3668,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if inf, ok := parseDateInfinityLiteral(s); ok {
 				return inf, nil
 			}
-			t, err := parseCopyTimestamp(s)
+			// date_in decodes a zone field and then ignores it, so the day comes
+			// from the wall clock as written: '2020-01-02 02:00:00+05:30'::date
+			// is 2020-01-02, not the previous day (tsZoneMode).
+			t, err := parseCopyTimestampZone(s, tsDiscardZone)
 			if err != nil {
 				// M0119-0006: a range failure (no year zero, or a value the
 				// KindTime carrier cannot hold) keeps its own 22008 wording —
@@ -3722,7 +3729,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
 				return inf, nil
 			}
-			ts, err := parseCopyTimestamp(d.StringValue())
+			// `::timestamp` discards a zone the text carries, `::timestamptz`
+			// applies it (tsZoneMode).
+			ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(targetType))
 			if err != nil {
 				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
 			}
@@ -8862,7 +8871,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if _, ok := parseTimestampInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				_, err := parseCopyTimestamp(v)
+				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))
 				return NewBoolDatum(err == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.

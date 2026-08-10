@@ -1,42 +1,44 @@
 (idle — nothing in flight)
 
-Last loop (#96): M0119-0006 31st slice — **the time-of-day FIELD ROLES, and a
-second silent twelve-hour error**. Committed + pushed. Design
-`docs/design/0125-0007-pg-faithful-date-field-decode.md` §9 (+ README row edit),
-2 ledger rows.
+Last loop (#97): M0119-0006 32nd slice — **the zone a `timestamp` and a `date`
+must THROW AWAY**. Committed + pushed. Design
+`docs/design/0125-0007-pg-faithful-date-field-decode.md` §10 (+ README row
+edit), 3 ledger rows (1 resolved, 2 new).
 
 M-NIGHTLY duty this loop: `ci/logs/action-items.md` is still nightly run
 `20260811-014635` (12 items), all already filed under M-NIGHTLY (loop #87).
-Nothing new to file; they stay PARKED per the banner.
+Nothing new to file; they stay PARKED per the banner. No unchecked M0130 item
+remains, so M0119-0006 is the actionable head.
 
-What landed: `internal/pgdatetime/timeofday.go` — `ParseTimeOfDay` reimplements
-PG's `DecodeTimeCommon` + the time arms of `DecodeNumberField`, and
-`CanonicalizeTimeToken` rewrites just the time token of a timestamp so the date
-/zone layouts still decode the rest. All three text paths (`parseTimeString`,
-`parseTimeTZString`, `parsePGTimestampText`) share it. `stripTimeZoneSuffix`
-replaces the truncate-at-first-space zone strip that ate the meridiem.
+What landed: `internal/executor/copy_text.go` gained `tsZoneMode`
+(`tsApplyZone`/`tsDiscardZone`), `tsZoneModeForType`, `applyTSZoneMode` and the
+mode-taking `parsePGTimestampTextZone`/`parseCopyTimestampZone`. Every input
+path that knows its target type passes the rule: typed literal
+(`evalTypedStringLit`), `::timestamp`/`::timestamptz`/`::date` casts
+(`evalCast`), `pg_input_is_valid`, `copyTextToDatum`, `encodeValuePG`.
 
-What it FIXED beyond acceptance: `'12:00 AM'` decoded as `12:00:00` (PG:
-`00:00:00`) — twelve hours wrong, no diagnostic; `'13:00 PM'` answered
-`13:00:00` where PG raises 22008.
+What it FIXED: `'…10:00:00+05:30'::timestamp` answered `04:30:00` (PG
+`10:00:00`), and `'2020-01-02 02:00:00+05:30'::date` answered `2020-01-01` (PG
+`2020-01-02`) — an offset crossing midnight moved the STORED DAY.
 
-Next loop: per banner (M0130 fully checked → M0119-0006 is the actionable head).
-Strongest candidate is still the CARRIER: move `Datum.Int` for `KindTime` from
-nanoseconds to MICROSECONDS (282 `KindTime` references — multi-loop; audit every
-`.Int` consumer: storage codec, wire binary in server/dispatch.go, sort/hash/
-spill, interval arithmetic — then delete `checkTimeCarrierRange`). Cheaper, all
-from this loop's ledger rows: `timestamp` WITHOUT tz must DISCARD a decoded zone
-offset (`'2020-01-01 10:00:00+05:30'` → goopg `04:30:00`, PG `10:00:00` — split
-`pgTimestampLayouts` by target type); `timetz`'s bare-time zone should be the
-session `TimeZone` GUC not `+00`; hour-24 / leap-second next-day rollover for
-TIMESTAMP (`CanonicalizeTimeToken` needs a day-carry out-param); unvalidated
-TIME zone suffix (`'10:00 A.M.'` accepted, PG errors).
+Next loop: per banner. Candidates, all from ledger rows: the CARRIER move of
+`Datum.Int` for `KindTime` ns→MICROSECONDS (282 refs, multi-loop, then delete
+`checkTimeCarrierRange`); `timestamptz` OUTPUT missing its `+00` suffix (needs
+`TimeSub` populated at every timestamptz producer — the open half of the
+2026-08-06 M0127-P5.9-u row); the four target-type-less parse paths
+(`tryParseStringAs`, `EXTRACT`, `date_trunc`, `pg_authid` validuntil);
+`timetz`'s bare-time zone should be the session `TimeZone` GUC not `+00`;
+hour-24 / leap-second next-day rollover for TIMESTAMP; unvalidated TIME zone
+suffix (`'10:00 A.M.'` accepted, PG errors).
 
-Gates: build + vet clean; units PASS; `TestPort_RegressSuite` PASS (672 s — one
-run failed only on the flaky `TempDir RemoveAll` cleanup, rerun clean);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); pgbench smoke via the commit
-hook. Wants captured from a throwaway PG 18.3 cluster (socket /tmp, port 5599,
-datadir /tmp/pgoracle-loop94) diffed against a throwaway goopg on 5544 — both
-stopped.
+Gates: build + vet clean; units PASS (2 stale expectations updated:
+`TestEvalTypedStringLitTimestampForms` offset cases are now per-type,
+`TestTimestampLiteralAndCopyPathsAgree` compares both paths under the SAME
+type's rule); `TestPort_RegressSuite` PASS (487 s, needs `-timeout 40m` — the
+default 600 s cut kills it); `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
+pgbench smoke via the commit hook. Wants captured from a throwaway PG 18.3
+cluster (socket /tmp, port 5599, datadir /tmp/pgoracle-loop97) diffed against a
+throwaway goopg on 5544 over literal/cast/INSERT/COPY — both stopped and
+removed.
 
 In-flight: none

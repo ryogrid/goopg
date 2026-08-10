@@ -94,7 +94,11 @@ func TestTimestampLiteralAndCopyPathsAgree(t *testing.T) {
 	}
 	for _, typ := range []string{"timestamp", "timestamptz"} {
 		for _, in := range forms {
-			copyTS, copyErr := parseCopyTimestamp(in)
+			// Both paths are read under the SAME target type: since M0119-0006
+			// a decoded zone is kept by timestamptz and discarded by timestamp,
+			// so comparing the two paths under different rules would assert a
+			// difference the types are supposed to have, not a table drift.
+			copyTS, copyErr := parseCopyTimestampZone(in, tsZoneModeForType(typ))
 			litD, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: typ, Value: in})
 			if (copyErr == nil) != (litErr == nil) {
 				t.Errorf("%s %q: COPY path err=%v but literal path err=%v — the two layout tables have drifted apart again",
