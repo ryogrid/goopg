@@ -2508,8 +2508,9 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := bt.format().marshal(it)
+		offnum := pgPhysOffnum(slot.Page(), lineIdx)
 		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-			return logIns(bt.rel, leafBlk, itemBytes)
+			return logIns(bt.rel, leafBlk, offnum, itemBytes)
 		})
 	}
 	bt.pool.MarkDirty(slot)
@@ -2594,8 +2595,9 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			var derr error
 			if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 				itemBytes := bt.format().marshal(it)
+				offnum := pgPhysOffnum(slot.Page(), lineIdx)
 				derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logIns(bt.rel, blk, itemBytes)
+					return logIns(bt.rel, blk, offnum, itemBytes)
 				})
 			} else {
 				bt.pool.MarkDirty(slot)
@@ -3025,38 +3027,11 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 	return nil
 }
 
-// ApplyInsertRecord re-runs one B-tree non-split insert against
-// the given page bytes during WAL replay (see
-// docs/design/0002-0003-redo-records.md). The raw item is the
-// same payload the writer emitted (item.marshal output: an upstream
-// IndexTupleData header followed by the key). The page must already be a
-// valid initialised B-tree page; replay never creates a fresh
-// btree page from a logical insert (a split record handles that
-// case).
-//
-// Idempotency is the caller's responsibility: WAL recovery
-// compares page pd_lsn against the record's end-LSN before
-// invoking this. The function is "apply unconditionally".
-//
-// The format is the caller's to supply (3b-2c-ii-B2-b). internal/wal's redo
-// path passes the blob format because it genuinely cannot resolve anything
-// else: it holds a relfilenode and recovery has no catalog to turn that into a
-// key descriptor. That is B2-b-ii and has its own ledger row — and note the
-// flip makes the hard-wiring doubly wrong, not just imprecise: a
-// descriptor-ordered tree replayed under the blob format both PARSES the item
-// wrong (its key is the whole tuple, header included) and, ordering the
-// header-less bytes, inserts it at the wrong slot.
-func (fm IndexFormat) ApplyInsertRecord(page storage.Page, raw []byte) error {
-	it, err := fm.f.parse(raw)
-	if err != nil {
-		return err
-	}
-	if !fm.f.pageHasSpaceFor(page, it) {
-		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", len(it.key))
-	}
-	mustInsertItemSorted(fm.f, page, it)
-	return nil
-}
+// (M0130-S11.4 slice 3b-2c-ii-B2-b-ii removed the by-key insert replay that
+// used to live here — see ApplyInsertRecordAt in replay.go, which places the
+// recorded bytes at the recorded offset number and therefore needs neither the
+// index's key format nor its comparison semantics. See
+// docs/design/0002-0003-redo-records.md.)
 
 func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
 	// M0055-0004-followup-stage2-splitmu-removal (race-safe
@@ -3287,8 +3262,9 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := bt.format().marshal(it)
+		offnum := pgPhysOffnum(slot.Page(), lineIdx)
 		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-			return logIns(bt.rel, blk, itemBytes)
+			return logIns(bt.rel, blk, offnum, itemBytes)
 		})
 		bt.unpinW(slot)
 		return true, err

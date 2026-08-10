@@ -241,7 +241,7 @@ func TestClassifySkipsNonTxRecords(t *testing.T) {
 	for _, payload := range [][]byte{
 		EncodeCheckpoint(),
 		EncodeHeapVacuum(rel, 0, []uint16{1, 2}),
-		EncodeBtreeInsert(rel, 0, []byte("item")),
+		EncodeBtreeInsert(rel, 0, 1, []byte("item")),
 	} {
 		if err := Classify(d, Record{Payload: payload, EndLSN: 10}); err != nil {
 			t.Errorf("payload kind=%d err=%v", payload[0], err)

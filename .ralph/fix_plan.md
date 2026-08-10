@@ -1074,14 +1074,26 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               → `btIndexLeftmostByLevel`. Guard: `pgpagereaders_test.go` pins
               both decoders on the same bytes. Two callers still cannot
               resolve, each named once (below).
-        - [ ] **3b-2c-ii-B2-b-ii — the redo path's descriptor**. Blocker for
-              B2-c. `internal/wal/recovery.go:redoBlobIndexFormat` is the single
-              site; recovery has a `RelFileNode` and no catalog. Either register
-              a per-relation descriptor hook (executor → wal; it cannot be an
-              import) or — preferred, and S11.5's direction anyway — make
-              goopg's btree redo offset-based like upstream's
-              `btree_xlog_insert` (`PageAddItem` at `xlrec->offnum`), which
-              removes the need for a comparator in redo at all.
+        - [x] **3b-2c-ii-B2-b-ii — the redo path's descriptor**
+              (2026-08-10). Took the preferred route: goopg's btree redo is now
+              OFFSET-based like upstream's `btree_xlog_insert`, so redo needs no
+              format and `internal/wal/recovery.go:redoBlobIndexFormat` is gone
+              — **B2-c is unblocked**. `btree.ApplyInsertRecord` (parse +
+              re-insert by key) → `btree.ApplyInsertRecordAt(page, raw,
+              offnum)`, one `PageInsertItemRawAt` at the recorded physical
+              offset; `LogBtreeInsertFunc`/`EncodeBtreeInsert` carry the offset
+              (native header 14 → 16 bytes, `offnum == 0` rejected as a
+              pre-slice record) and `EncodeBtreeInsertPG` stops hard-coding 0,
+              which also closes the wal-pg-identical-stream A5 parity gap (a
+              real-PG standby applies at `offnum`). `ReplayRemoveParentDownlink`
+              became format-free by working on raw item bytes: survivors are
+              re-added verbatim and both facts it needs live in the
+              IndexTupleData header (`len(raw) > SizeOfIndexTupleData` =
+              "still has key attrs", `BTreeTupleGetDownLink` = the child).
+              Guard: `internal/access/btree/replay_offnum_test.go` — writer-page
+              reproduction in both formats × both page shapes, plus the retired
+              by-key body kept as an executable counter-example that
+              demonstrably files a tuple-format item at the wrong slot.
         - [x] **3b-2c-ii-B2-b-iii — amcheck takes the format** (2026-08-10).
               The five `internal/amcheck` tiers (`VerifyBtreeItemOrderCmp`,
               `VerifyBtreeParentDownlinks`, `VerifyBtreeUnique`,

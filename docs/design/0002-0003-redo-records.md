@@ -44,8 +44,18 @@ corresponding mutation site:
   `writeHeapRow`. pgbench-i WAL: ~1.6 GB → ~801 MB.
 - **0002-0003b**: `RecordKindBtreeInsert` +
   `btree.insertIntoBlock` non-split path. pgbench-i WAL:
-  ~801 MB → ~21 MB. `btree.ApplyInsertRecord` is the public
-  replay helper that `wal/recovery.go` calls.
+  ~801 MB → ~21 MB. `btree.ApplyInsertRecordAt` is the public
+  replay helper that `wal/recovery.go` calls. (It was
+  `ApplyInsertRecord`, which re-derived the slot by COMPARING keys,
+  until M0130-S11.4 slice 3b-2c-ii-B2-b-ii: the record now carries
+  the physical offset number the writer placed the item at — as
+  upstream's `xl_btree_insert` always has — and replay places the
+  recorded bytes there. Comparing needs the index's key format and
+  opclass, and recovery has only a relfilenode; the catalog that
+  would resolve them is itself being replayed. `btreeInsertHeaderSize`
+  grew 14 → 16 for the offset, so a WAL stream written by an older
+  binary cannot be replayed — the record is rejected rather than
+  guessed at.)
 - **0002-0003c**: `RecordKindHeapDelete` (fixed
   20-byte record: rel + blk + lineSlot + xmax). Migrated both
   `updateOp` (xmax stamp on the old image) and `deleteOp`

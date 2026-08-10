@@ -1,50 +1,51 @@
-Task: M0130-S11.4 slice 3b-2b (catalog → key-descriptor mapper, ADDITIVE)
-— DONE, committed, pushed. **3b-2c is next** and is now BIGGER than planned:
-the writer flip moved into it (see the finding below).
+Task: M0130-S11.4 slice 3b-2c-ii-B2-b-ii (the redo path's descriptor) — DONE,
+committed + pushed. **All B2-c prerequisites are now closed; B2-c (the flip,
+REINDEX-required) is the next slice.**
 
-Landed (NO on-disk change, no REINDEX — the mapper has no caller yet):
-- `internal/executor/pgindex_keydesc.go`:
-  `buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error)`,
-  plus `pgIndexComparatorForOID` (type OID → 3b-2a comparator),
-  `pgIndexKeyTypeOID` (private built-in-spelling switch),
-  `pgIndexCollationOrderable`.
-- `pgindex_keydesc_test.go` (9 tests).
+Landed (no on-disk PAGE change; `pgIndexTupleKeys` still false — but the native
+WAL record format DID change):
+- `btree.ApplyInsertRecordAt(page, raw, offnum)` replaces
+  `(IndexFormat).ApplyInsertRecord`: one `PageInsertItemRawAt` at the recorded
+  PHYSICAL offset, upstream `btree_xlog_insert`. No parse, no comparison ⇒ no
+  format in redo.
+- Offset emitted for real: `storage.LogBtreeInsertFunc` +offnum, the 3
+  btree.go emit sites use the new `pgPhysOffnum(page, lineIdx)`,
+  `EncodeBtreeInsertPG` stops hard-coding 0 (closes the A5 parity gap for a
+  real-PG standby). Native `btreeInsertHeaderSize` 14 → 16; `offnum == 0`
+  (pre-slice record) is a hard error — **a pre-slice WAL stream is not
+  replayable; re-initdb**.
+- `ReplayRemoveParentDownlink` is format-free (free function again): survivors
+  re-added verbatim, `len(raw) > SizeOfIndexTupleData` = "still has key attrs",
+  `BTreeTupleGetDownLink` = child, `PGBTPivotRaw(nil, child)` for the demoted
+  leftmost.
+- `internal/wal/recovery.go:redoBlobIndexFormat` DELETED.
 
 Key facts for the next loop (do not re-derive):
-- **The finding that reshaped the plan:** the sibling-path rule is SYMMETRIC.
-  A datum-writing writer against the surviving ~20 `CompareKeys` sites orders
-  garbage just as badly as a descriptor reader against a blob writer — a real
-  PG datum is not order-preserving under `bytes.Compare` for any type but
-  bytea/text. So the writer flip CANNOT land without the comparison rerouting;
-  both are 3b-2c now (fix_plan + design doc + ledger all updated).
-- The mapper ERRORS (never nil `Compare`) on: non-btree AM, expression key,
-  explicit opclass, non-bytewise collation, array/enum/user type, unknown type.
-  Nil `Compare` means bytewise, correct only for today's encodings.
-- Do NOT reuse `buildUserPGAttributeRow`'s type resolution — its `text`
-  fallback for an unknown name would give an enum column the text comparator
-  while goopg orders enums by sort order.
-- `ColDescending`/`ColNullsFirst` are EMPTY for all-default ASC NULLS LAST →
-  every read bounds-checked; the two bits are independent (`DESC NULLS LAST`).
+- Minus-infinity pivot bytes are IDENTICAL in blob and tuple format (no key
+  bytes to encode) — that identity is what makes the parent-downlink limb
+  format-free, and it is pinned by `TestMinusInfinityPivotIsFormatIndependent`.
+- `pgPhysOffnum` reading `btpo_next` AFTER the insert is safe: an insert never
+  touches the sibling link, so `P_FIRSTDATAKEY` is stable.
+- Guard file `internal/access/btree/replay_offnum_test.go` keeps the RETIRED
+  by-key body as `oldByKeyReplay` and asserts it DISAGREES with the writer on a
+  tuple-format page (int4 -1 = 0xffffffff sorts after +1 bytewise).
+- Still open (ledger rows): numeric/uuid heap images are TEXT varlenas so
+  `buildPGIndexKeyDesc` refuses them; `bt_child_highkey_check` unported;
+  upstream INSERT_POST/_META variants unemitted (S11.5).
 
-Next step: M0130-S11.4 slice 3b-2c. Build the tuple-shaped comparison seam
-FIRST — one `BTree`/bulk-builder method over whole tuples, because
-`ComparePGIndexTuples` needs t_info's null bitmap and t_tid's natts/heap TID
-that a bare key payload does not carry — then in the SAME commit flip
-`encodeCompositeBTreeKey` (`operators_ddl.go:10781`),
-`encodeIndexKeyFromCols` (`operators_storage.go:7148`) and `encodeArbiterKey`
-(`operators_upsert.go:1490`) to per-column datums through
-`btree.FormPGIndexTuple`, threading the descriptor through `btree.Options`
-(`btree.go:1712`). REINDEX-required — say so in the commit message.
-Re-read the fix_plan banner first (M-NIGHTLY filing is unconditional every
-loop; all six `AI-20260810-*` items are already filed).
+Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — the flip. `encodeCompositeBTreeKey`
+/ `encodeIndexKeyFromCols` / `encodeArbiterKey` → `pgIndexTupleKey` under
+`ctx.pgIndexKeyDesc(idx)` (search keys included), `pgIndexTupleKeys` on, explicit
+dual-format decision for indexes the resolver refuses. Gates: tpch-spotcheck +
+**the TPC-DS SF0.5 gate (mandatory for B2-c)**, re-pin after a REINDEX. Re-read
+the fix_plan banner first (M-NIGHTLY filing unconditional; all six
+`AI-20260810-011258-*` items already filed and left unchecked per the banner).
 
-Gates run: `go build ./...` + `go vet ./internal/executor` clean;
-`go test -run TestBuildPGIndexKeyDesc ./internal/executor` PASS;
+Gates run: `go build ./...` + `go vet` clean; `go test` PASS for
+./internal/access/btree ./internal/wal ./internal/storage ./internal/initdb
+./internal/executor; crash-recovery subset (`TestCrash*`, initdb) PASS;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-commit-hook pgbench smoke PASS; `make ralph-state-guard` OK.
-NOT run: `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate — this slice is
-additive dead code (no executor/planner/codec path changed), so Rule #1 does
-not apply; 3b-2c DOES change the codec and must run both (the SF0.5 cluster's
-indexes predate S11.2b — re-pin after a REINDEX).
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35); commit-hook pgbench
+smoke PASS. NOT run: TPC-DS SF0.5 gate (no query-execution change this slice).
 
 In-flight: none.

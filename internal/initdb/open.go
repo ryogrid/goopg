@@ -480,12 +480,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Logical btree non-split insert change record.
-	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) (storage.LSN, error) {
+	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) (storage.LSN, error) {
 		// A5: emit a PostgreSQL xl_btree_insert (INSERT_LEAF) record with the
-		// IndexTuple as block-0 data instead of the goopg-native body. offnum=0
-		// (goopg replay re-inserts by key). Recovery routes it to
-		// replayDecodedXLogBtreeInsert.
-		payload, err := wal.EncodeBtreeInsertPG(rel, blk, 0, item)
+		// IndexTuple as block-0 data instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogBtreeInsert.
+		//
+		// M0130-S11.4 slice 3b-2c-ii-B2-b-ii: offnum is now the REAL physical
+		// offset number the writer placed the tuple at, where it used to be a
+		// placeholder 0 because goopg replay re-inserted by key. That closes
+		// A5's documented parity gap (a real-PG standby applies at offnum) and
+		// is what lets goopg's own replay stop needing the index's key format.
+		payload, err := wal.EncodeBtreeInsertPG(rel, blk, offnum, item)
 		if err != nil {
 			return 0, err
 		}

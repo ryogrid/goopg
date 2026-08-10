@@ -76,6 +76,18 @@ func pgDataSlot(p storage.Page, slot uint16) uint16 {
 	return slot + pgFirstDataSlot(p) - 1
 }
 
+// pgPhysOffnum maps a 0-based data-item index — what insertItemSorted returns —
+// to the PHYSICAL offset number the item now occupies. That, not the data slot,
+// is the coordinate upstream's xl_btree_insert carries and the coordinate
+// btree.ApplyInsertRecordAt replays at (M0130-S11.4 slice 3b-2c-ii-B2-b-ii), so
+// the record means the same thing to a real-PG standby as to goopg recovery.
+//
+// Reading the page's rightmost bit AFTER the insert is safe: an insert never
+// touches btpo_next, so P_FIRSTDATAKEY is the same before and after.
+func pgPhysOffnum(p storage.Page, dataIdx int) uint16 {
+	return pgDataSlot(p, uint16(dataIdx+1))
+}
+
 // PGDataItemCount is the data-item count of a PG-format B-tree page: the line
 // pointer count less the high key, if any. It is the wrapper counterpart of
 // storage.PageLinePointerCount and is exported because the amcheck verify

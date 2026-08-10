@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii, 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -665,6 +665,55 @@ sources agree:
             change raised that test's tree from 400 to 1200 keys: 400 int4
             tuples still fit on ONE leaf page, so it had no internal level and
             the cross-level tiers were never exercised.
+          - **3b-2c-ii-B2-b-ii — the redo path's descriptor (landed
+            2026-08-10). WAL-format change (no on-disk page change, no
+            REINDEX; a pre-slice WAL stream is not replayable).** The other
+            B2-b straggler is resolved by REMOVING the question rather than
+            answering it, which is also what upstream does: nbtree redo never
+            compares keys.
+            - `btree.ApplyInsertRecord` (parse under a format, re-insert by
+              key) is replaced by `btree.ApplyInsertRecordAt(page, raw,
+              offnum)`, one `PageInsertItemRawAt` at the recorded physical
+              offset number — upstream `btree_xlog_insert`'s single
+              `PageAddItem` at `xlrec->offnum`
+              (`postgres/src/backend/access/nbtree/nbtxlog.c:56-70`). Recorded
+              bytes at a recorded offset need neither a parse nor a
+              comparison, so the format parameter is gone.
+            - The offset is now emitted for real. `LogBtreeInsertFunc` takes an
+              `offnum`, the three `btree.go` emit sites compute it with the new
+              `pgPhysOffnum` from the data index `insertItemSorted` already
+              returned (an insert never touches `btpo_next`, so
+              `P_FIRSTDATAKEY` is the same before and after), and
+              `EncodeBtreeInsertPG` stops hard-coding 0. That closes the
+              wal-pg-identical-stream A5 parity gap in the same move: a real-PG
+              standby applies `xl_btree_insert` at `offnum`, so the placeholder
+              was a latent divergence for a heterogeneous standby, not merely a
+              goopg-internal shortcut. The native `RecordKindBtreeInsert`
+              header grew 14 → 16 bytes to carry it; `offnum == 0` is rejected
+              (a pre-slice record) instead of being guessed at.
+            - `ReplayRemoveParentDownlink` becomes format-free by working on
+              RAW item bytes: survivors are re-added verbatim (never parsed, so
+              blob or tuple is immaterial) and the two things it must know live
+              in the IndexTupleData HEADER, which is format-independent — "does
+              the new leftmost item still carry key attributes?" is
+              `len(raw) > SizeOfIndexTupleData`, and its child is t_tid's block
+              half (`BTreeTupleGetDownLink`). The rebuilt minus-infinity pivot
+              is `PGBTPivotRaw(nil, child)`, which is byte-identical to what
+              the tuple format's `marshal` produces for the same item — a
+              zero-attribute pivot has no key bytes to encode.
+            - `internal/wal`'s `redoBlobIndexFormat` is therefore gone, and
+              with it the last untrue "every tree on this cluster is
+              blob-formatted" claim outside the writers. **B2-c is unblocked.**
+            Guards: `internal/access/btree/replay_offnum_test.go` replays the
+            emitted (raw, offnum) pairs onto a fresh page in BOTH formats and
+            on both page shapes (rightmost / high-key-bearing, so the
+            `P_FIRSTDATAKEY` bias is exercised rather than assumed) and demands
+            byte-identical items; a second test keeps the RETIRED by-key body
+            as an executable counter-example and asserts it disagrees with the
+            writer on a tuple-format page — int4 `-1` is `0xffffffff` on disk,
+            so bytewise order puts it after `+1` while the descriptor's
+            comparator puts it before, which is exactly the silent
+            standby-only divergence the slice removes.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same

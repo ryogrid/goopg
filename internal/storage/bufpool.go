@@ -673,7 +673,12 @@ type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, left
 type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte, initPage bool) (LSN, error)
 
 // LogBtreeInsertFunc emits one logical B-tree non-split insert redo record.
-type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
+// `offnum` is the physical 1-based offset number the item was placed at, which
+// replay re-inserts at verbatim (upstream xl_btree_insert.offnum; M0130-S11.4
+// slice 3b-2c-ii-B2-b-ii). It is not a convenience: recovery cannot re-derive
+// the slot by key, because that needs the index's comparison semantics and
+// recovery holds a relfilenode with no catalog to resolve them from.
+type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte) (LSN, error)
 
 // LogHeapDeleteFunc emits one logical heap-delete (xmax stamp) redo record.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)

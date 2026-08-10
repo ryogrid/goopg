@@ -283,10 +283,14 @@ const sizeOfXLogBtreeInsertData = 2
 // EncodeBtreeInsertPG builds a PostgreSQL xl_btree_insert record for one leaf
 // index-tuple insertion (XLOG_BTREE_INSERT_LEAF), framed for the assembled path.
 // Main data is xl_btree_insert{offnum}; block 0 carries the new IndexTuple as
-// block data. goopg replay re-inserts the tuple by key (btree.ApplyInsertRecord)
-// and does not need offnum, so the emit path passes 0 — a documented parity gap
-// (a real-PG standby would need the true leaf offset). xl_xid = 0 (btree index
-// changes are not logical user-data events).
+// block data. `offnum` is the physical 1-based offset number the writer placed
+// the tuple at, which both a real-PG standby and goopg replay
+// (btree.ApplyInsertRecordAt) apply at. It used to be a hard-coded 0 — a
+// documented parity gap — because goopg replay re-inserted the tuple by key;
+// M0130-S11.4 slice 3b-2c-ii-B2-b-ii made the offset real, since re-deriving
+// the slot needs the index's comparison semantics and recovery has no catalog
+// to resolve them from. xl_xid = 0 (btree index changes are not logical
+// user-data events).
 func EncodeBtreeInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) ([]byte, error) {
 	if len(item) == 0 {
 		return nil, fmt.Errorf("wal: btree-insert item is empty")

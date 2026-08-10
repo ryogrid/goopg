@@ -455,8 +455,11 @@ const (
 	// Fork(1) + Block(4) + LineSlot(2) = 16.
 	heapInsertHeaderSize = 16
 	// btreeInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
-	// Fork(1) + Block(4) = 14.
-	btreeInsertHeaderSize = 14
+	// Fork(1) + Block(4) + Offnum(2) = 16. Offnum joined in
+	// M0130-S11.4 slice 3b-2c-ii-B2-b-ii (replay places the item at the
+	// recorded offset instead of re-deriving the slot by key), matching the
+	// heap-insert record, which has carried its line slot from the start.
+	btreeInsertHeaderSize = 16
 	// heapDeleteSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
 	// + Block(4) + LineSlot(2) + Xmax(4) = 20.
 	heapDeleteSize = 20
@@ -1750,23 +1753,25 @@ func DecodeBtreeMetaCleanup(payload []byte) (BtreeMetaCleanupPayload, error) {
 
 // EncodeBtreeInsert encodes one logical B-tree non-split insert
 // redo record. The opaque `item` payload is whatever bytes the
-// caller stored on the page (in v0,
-// internal/access/btree.item.marshal output: keyLen + ptr.block
-// + ptr.offset + key).
-func EncodeBtreeInsert(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) []byte {
+// caller stored on the page (the index's on-page nbtree tuple —
+// internal/access/btree indexFormat.marshal output), and `offnum` is the
+// physical 1-based offset number it was stored at, which is where replay puts
+// it back (M0130-S11.4 slice 3b-2c-ii-B2-b-ii).
+func EncodeBtreeInsert(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) []byte {
 	out := make([]byte, btreeInsertHeaderSize+len(item))
 	out[0] = RecordKindBtreeInsert
 	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
 	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
 	out[9] = byte(rel.Fork)
 	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], offnum)
 	copy(out[btreeInsertHeaderSize:], item)
 	return out
 }
 
-// DecodeBtreeInsert returns the rel + block + raw item bytes
+// DecodeBtreeInsert returns the rel + block + offset number + raw item bytes
 // carried by a BtreeInsert record payload.
-func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, item []byte, err error) {
+func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte, err error) {
 	if len(payload) < btreeInsertHeaderSize {
 		err = fmt.Errorf("wal: invalid btree-insert payload len %d (want >= %d)", len(payload), btreeInsertHeaderSize)
 		return
@@ -1781,6 +1786,7 @@ func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.Blo
 		Fork:   storage.ForkNumber(payload[9]),
 	}
 	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	offnum = binary.LittleEndian.Uint16(payload[14:16])
 	item = make([]byte, len(payload)-btreeInsertHeaderSize)
 	copy(item, payload[btreeInsertHeaderSize:])
 	return
@@ -2885,25 +2891,21 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	return mgr.WriteBlock(block.Rel, oldBlock.Block, oldPage)
 }
 
-// redoBlobIndexFormat is the on-page key format the B-tree redo paths decode
-// and re-insert with. It is btree's blob format — goopg's opaque
-// order-preserving key payloads — which is correct for every index today
-// (M0130-S11.4's writers have not flipped).
-//
-// Since slice 3b-2c-ii-B2-b the btree redo entry points take the format as an
-// argument, and this is the site that cannot yet answer honestly: redo holds a
-// relfilenode, and recovery has no catalog to turn one into a key descriptor
-// (the catalog it would read is itself being replayed). Resolving it —
-// upstream sidesteps the question entirely because nbtree redo re-inserts at
-// the RECORDED offset, never by key — is slice 3b-2c-ii-B2-b-ii and has a
-// ledger row; the flip cannot land before it, since a descriptor-ordered tree
-// replayed here would both misparse the item and file it at the wrong slot.
-var redoBlobIndexFormat = btree.IndexFormat{}
+// (M0130-S11.4 slice 3b-2c-ii-B2-b-ii retired `redoBlobIndexFormat`, the
+// hard-wired blob format the two B-tree redo entry points used to decode and
+// re-insert with. It was the one site that could not answer the format question
+// honestly — redo holds a relfilenode, and recovery has no catalog to turn one
+// into a key descriptor, since the catalog it would read is itself being
+// replayed — so instead of resolving the format, both entry points stopped
+// needing one: the insert replays at the RECORDED offset number (upstream
+// btree_xlog_insert) and the parent-downlink removal works on raw item bytes.
+// That unblocks 3b-2c-ii-B2-c, the flip.)
 
 // replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the
-// IndexTuple carried in block 0's data into the leaf page. Mirrors the native
-// replayBtreeInsert (btree.ApplyInsertRecord re-inserts by key), so goopg↔goopg
-// replay is identical; a full-page image is restored instead. Idempotent via pd_lsn.
+// IndexTuple carried in block 0's data into the leaf page at the offset number
+// carried in the record's main data, exactly as upstream btree_xlog_insert
+// does. Mirrors the native replayBtreeInsert, so goopg↔goopg replay is
+// identical; a full-page image is restored instead. Idempotent via pd_lsn.
 func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
 	block, ok := xlogBlockRefByID(xlog, 0)
 	if !ok {
@@ -2929,7 +2931,11 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
 		return nil // already applied
 	}
-	if err := redoBlobIndexFormat.ApplyInsertRecord(page, block.Data); err != nil {
+	if len(xlog.MainData) < sizeOfXLogBtreeInsertData {
+		return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
+	}
+	offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
+	if err := btree.ApplyInsertRecordAt(page, block.Data, offnum); err != nil {
 		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
@@ -3422,7 +3428,7 @@ func replayBtreeUnlinkPage(mgr *storage.Manager, r Record) error {
 	}
 	if p.HasParent {
 		if err := apply(p.ParentBlk, func(page storage.Page) error {
-			return redoBlobIndexFormat.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
+			return btree.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
 		}); err != nil {
 			return fmt.Errorf("wal: btree-unlink parent: %w", err)
 		}
@@ -3587,7 +3593,7 @@ func replayHeapDelete(mgr *storage.Manager, r Record) error {
 // (a split or initial Create produced the page first), so a
 // missing block is a hard error.
 func replayBtreeInsert(mgr *storage.Manager, r Record) error {
-	rel, blk, item, err := DecodeBtreeInsert(r.Payload)
+	rel, blk, offnum, item, err := DecodeBtreeInsert(r.Payload)
 	if err != nil {
 		return err
 	}
@@ -3608,7 +3614,7 @@ func replayBtreeInsert(mgr *storage.Manager, r Record) error {
 	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
 		return nil // already applied
 	}
-	if err := redoBlobIndexFormat.ApplyInsertRecord(page, item); err != nil {
+	if err := btree.ApplyInsertRecordAt(page, item, offnum); err != nil {
 		return fmt.Errorf("wal: btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
