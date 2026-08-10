@@ -209,13 +209,16 @@ func decodeArrayBTreeKey(key []byte, col catalog.Column) (Datum, int, error) {
 // but not PG's spelling) and a text-like element has to be re-quoted by
 // array_out's rules.
 //
-// An element type with no faithful rendering is refused rather than guessed. The
-// set refused here is not reachable from a stored array anyway: goopg's heap
-// array codec (arrayElemTypeInfo) stores only the fixed-width types below plus
-// varlena text-likes, so bytea/date/time/enum arrays cannot be written in the
-// first place.
+// An element type with no faithful rendering is refused rather than guessed —
+// see arrayKeyElemRenderer, which owns that set and is also what
+// indexKeyColumnIsDecodable consults, so "can this array key be inverted?" is
+// answered by the same table that inverts it.
 func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, error) {
 	name := elemCol.Type.Name
+	render := arrayKeyElemRenderer(name)
+	if render == nil {
+		return "", 0, fmt.Errorf("btree: array element type %q has no key decoding", name)
+	}
 	d, w, err := decodeIndexKeyColumn(key, elemCol)
 	if err != nil {
 		return "", 0, err
@@ -223,28 +226,61 @@ func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, er
 	if w <= 0 {
 		return "", 0, fmt.Errorf("btree: array element of type %q consumed no bytes", name)
 	}
+	text, err := render(d)
+	if err != nil {
+		return "", 0, err
+	}
+	return text, w, nil
+}
+
+// arrayKeyElemRenderer returns the renderer for one array element type, or nil
+// when goopg cannot spell that element the way the heap-side array decode spells
+// it (decodeArrayElem in codec_array.go) — an array read out of an index and the
+// same array read out of the heap must be the same text.
+//
+// Returning nil rather than erroring inside the decode is what lets the
+// index-only scan ask AHEAD of the scan whether the key is invertible
+// (indexKeyColumnIsDecodable): a refusal discovered mid-scan is an XX000 for the
+// whole query, which is exactly the defect the interval[] case shipped with.
+//
+// Deliberately absent (M0119-0006, ledger 2026-08-12):
+//
+//   - interval / timetz: the SCALAR key for these is not invertible at all
+//     (interval's key is upstream's interval_cmp_value span, which has thrown
+//     away the month/day split), so there is nothing to render.
+//   - date / time / timestamp / timestamptz: the key decodes, but goopg's heap
+//     array codec has no arm for these element types (pgarray.ElemTypeInfo), so
+//     a stored `date[]` holds the user's own literal spelling as TEXT while this
+//     path would render the canonical one. Rendering them here would make the
+//     index and the heap disagree about the same value's text.
+//   - bytea / enum: same shape — no heap element image to agree with.
+func arrayKeyElemRenderer(name string) func(Datum) (string, error) {
 	switch {
 	case isInt2Type(name), isInt4Type(name), isInt8Type(name), isOidType(name):
-		return strconv.FormatInt(d.Int, 10), w, nil
+		return func(d Datum) (string, error) { return strconv.FormatInt(d.Int, 10), nil }
 	case isBoolType(name):
-		if d.BoolValue() {
-			return "t", w, nil
+		return func(d Datum) (string, error) {
+			if d.BoolValue() {
+				return "t", nil
+			}
+			return "f", nil
 		}
-		return "f", w, nil
 	case isFloat8Type(name):
-		f, perr := strconv.ParseFloat(d.StringValue(), 64)
-		if perr != nil {
-			return "", 0, fmt.Errorf("btree: array element float key: %w", perr)
+		return func(d Datum) (string, error) {
+			f, perr := strconv.ParseFloat(d.StringValue(), 64)
+			if perr != nil {
+				return "", fmt.Errorf("btree: array element float key: %w", perr)
+			}
+			if isFloat4TypeName(name) {
+				return PGFloatOut(f, 32), nil
+			}
+			return PGFloatOut(f, 64), nil
 		}
-		if isFloat4TypeName(name) {
-			return PGFloatOut(f, 32), w, nil
-		}
-		return PGFloatOut(f, 64), w, nil
 	case isNumericType(name):
-		return d.Format(), w, nil
+		return func(d Datum) (string, error) { return d.Format(), nil }
 	case isVarcharType(name), isCharType(name), isTextType(name), isNameType(name),
 		strings.ToLower(name) == "uuid":
-		return quoteArrayTextElem(d.StringValue()), w, nil
+		return func(d Datum) (string, error) { return quoteArrayTextElem(d.StringValue()), nil }
 	}
-	return "", 0, fmt.Errorf("btree: array element type %q has no key decoding", name)
+	return nil
 }

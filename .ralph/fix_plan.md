@@ -2696,6 +2696,42 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (collapsing the posting expansion; neutralising the ` posting N`
       rendering). Ledger row: goopg's deduplication is still not driven
       end-to-end into a posting list a live `--checkunique` run then reads.
+      **Slice landed 2026-08-12 (25th) — array index-key DECODABILITY** (design
+      `docs/design/0119-0006-array-index-key-decodability.md`). An index-only
+      scan over an ALL_VISIBLE page answers the query FROM the key, so a key
+      encoding goopg cannot invert must be declined UP FRONT — and the predicate
+      that did so read `!col.Type.IsArray && isIntervalTypeName(...)`. The
+      `!IsArray` guard is array-shaped on purpose (a goopg array column is
+      `Type{Name:<ELEMENT>, IsArray:true}`, so unguarded it would have matched
+      for the wrong reason), and it inverted the answer: `interval[]`, whose
+      element key is the SAME non-invertible `interval_cmp_value` span, was
+      declared decodable. Confirmed at HEAD with no corruption and no exotic
+      plan — `SELECT i FROM av WHERE i = '{3 days}'` over an indexed
+      `interval[]` column failed the whole statement with `XX000: IOS decode:
+      btree: interval key is the comparison span …`, and the same for every
+      element type `decodeArrayKeyElemText` refuses (`date[]`, `time[]`,
+      `timetz[]`, `timestamp[]`, `timestamptz[]`, `bytea[]`). Decodability is
+      now answered by the key layer (`indexKeyColumnIsDecodable`, recursing into
+      the element exactly as `decodeArrayBTreeKey` does) over a rendering table
+      lifted out of the decoder as `arrayKeyElemRenderer`, so one table both
+      renders and predicts. The refused element types STAY refused and the open
+      ledger row's proposed `formatInterval` arm is RETRACTED as wrong:
+      interval/timetz keys keep no split to render (PG calls `'1 mon'` and
+      `'30 days'` equal, so the key must lose the difference), and
+      date/time/timestamp/bytea have no heap element image to agree with — a
+      key-side rendering would make index text and heap text disagree. The
+      parity gate surfaced a second drift (Hard-won Rule #2): `uuid` was listed
+      with the text-likes in `decodeIndexKeyColumn` but not in
+      `decodeBTreeKeyToDatum`, so the single-column lane let it reach the
+      `default:` arm that reads any 8 leading bytes as an ENUM sort order and
+      never errors — an empty Datum for a real uuid, latent only because a uuid
+      index takes the PG tuple-image key path. Gates:
+      `TestArrayIndexOnlyScanReadsHeapForRefusedElement`,
+      `TestIndexKeyDecodableMatchesDecoder` (20 types × {scalar, array}, both
+      directions),  `TestIndexKeyDecodeSiblingsAgree` — each non-vacuous under
+      its own mutation. 2 ledger rows (no heap element images for
+      date/time/timestamp/bytea/enum arrays; array-keyed indexes cost heap
+      fetches PG answers index-only).
       Remaining for M0119-0006: `box`/`int4range` key encodings and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 

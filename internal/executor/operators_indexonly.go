@@ -357,10 +357,12 @@ func (o *indexOnlyScanOp) Close() error {
 
 // indexKeyIsDecodable reports whether decodeRowFromKey can invert this index's
 // key. False for an index any of whose key columns has a deliberately
-// non-invertible encoding — today only `interval`, whose key is upstream's
-// interval_cmp_value span (btree_interval_key.go). The whole index is declined
-// rather than the single column because the composite walk decodes columns in
-// order and cannot skip one whose byte width it does not know.
+// non-invertible encoding — `interval`, whose key is upstream's
+// interval_cmp_value span (btree_interval_key.go), and any ARRAY whose element
+// type the key layer cannot render back (btree_key_decodable.go, which owns the
+// whole answer). The whole index is declined rather than the single column
+// because the composite walk decodes columns in order and cannot skip one whose
+// byte width it does not know.
 //
 // Not consulted on the pgIndexKeyDesc (PG tuple-image) path: there the key
 // carries per-attribute datums, so nothing is lost — but such an index does not
@@ -375,7 +377,7 @@ func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
 		if !ok {
 			continue // the decode path reports this one itself
 		}
-		if !col.Type.IsArray && isIntervalTypeName(col.Type.Name) {
+		if !indexKeyColumnIsDecodable(*col) {
 			return false
 		}
 	}
@@ -631,7 +633,17 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		}
 		return numericDatumFromBig(m, scale), nil
 
-	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
+	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
+		strings.EqualFold(typeName, "uuid"):
+		// uuid rides EncodeVarchar (its canonical lowercase-hex text compares as
+		// uuid_cmp's memcmp does), and its sibling decodeIndexKeyColumn has
+		// always listed it here. Without this arm uuid reached the `default:`
+		// enum guess below, which reads the first 8 ASCII bytes as a float8 sort
+		// order and NEVER errors: a single-column index-only scan over a uuid
+		// column answered from the key returned an empty enum Datum instead of
+		// the uuid. Latent today only because a uuid index takes the PG
+		// tuple-image key path (pgIndexTupleKeys), which is exactly why the
+		// blob sibling drifted. M0119-0006, Hard-won Rule #2.
 		b, err := btree.DecodeVarchar(key)
 		if err != nil {
 			return NullDatum, err
