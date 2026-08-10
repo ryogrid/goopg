@@ -1616,11 +1616,55 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         VacuumIndexPages itself computes and fails if no emission named any.
         Gates: btree/wal/storage/amcheck/initdb + units PASS; pgbench smoke PASS
         (commit hook). 1 ledger row.
-  - [ ] **S11.5d — `XLOG_BTREE_UNLINK_PAGE`**. The one with a documented reason
-        to stay native (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
-        A8-unlinkpage): an emit-time FPI can be stale against a concurrent
-        split on another `*BTree`, so the PG-faithful form needs incremental
-        link patches, not a page snapshot.
+  - [x] **S11.5d-1 — `XLOG_BTREE_MARK_PAGE_HALFDEAD`** (2026-08-10). NOT
+        REINDEX-required. Page deletion is TWO records upstream; goopg's single
+        native `RecordKindBtreeUnlinkPage` covers the union of both. This slice
+        lands phase 1's PG form. The record goopg already tagged
+        `RM_BTREE`/`0xB0` carried 16 bytes of `{leafblk, flagsAfter}` and NO
+        registered blocks — and upstream's `btree_xlog_mark_page_halfdead` calls
+        `XLogInitBufferForRedo(record, 0)` unconditionally, so an unregistered
+        block id PANICs the standby (S11.5b-3's shape again: fatal, not lossy).
+        It also has zero live emit sites — the `LogBtreeMarkPageHalfDead` hook
+        is wired end-to-end and never called, because VACUUM bundles the
+        half-dead transition into the vacuum record's opaque trailer.
+        Now: `EncodeBtreeMarkPageHalfDeadPG` emits the 20-byte
+        `xl_btree_mark_page_halfdead{poffset, leafblk, leftblk, rightblk,
+        topparent}` (the 2 alignment bytes after `poffset` are wire format),
+        block 0 the leaf WILL_INIT with no data, block 1 the subtree parent;
+        `leftblk`/`rightblk` are read off the page being logged, not accepted
+        from the caller. Two things upstream's redo DEFINES that goopg's page
+        model lacked: (a) a half-dead page IS its contents — one dummy
+        `SizeOfIndexTupleData` high key whose `t_tid` block half is the subtree
+        top parent, which `_bt_unlink_halfdead_page` reads to find the next page
+        down, so phase 2 is impossible without it; (b) the parent mutation is a
+        RETARGET (point `poffset` at the right neighbour's child, delete the
+        neighbour) not a delete-at-`poffset`, so the deleted key range is
+        absorbed RIGHTWARD, the opposite direction from goopg's
+        `ReplayRemoveParentDownlink`. `ReplayHalfDeadParent` /
+        `ReplayMarkHalfDeadLeaf` implement upstream's; goopg's own stays put
+        until S11.5d-3 switches the primary's mutation with it (ledger row).
+        Guards: `internal/wal/btree_halfdead_pg_test.go` (+3) and
+        `internal/access/btree/replay_halfdead_test.go` (+3, both
+        `P_FIRSTDATAKEY` shapes so the PHYSICAL offset cannot regress into a
+        data-slot index).
+  - [ ] **S11.5d-2 — `XLOG_BTREE_UNLINK_PAGE`**. Phase 2: main data
+        `xl_btree_unlink_page{leftsib, rightsib, level, safexid, leafleftsib,
+        leafrightsib, leaftopparent}`, block 0 the target rewritten as an empty
+        deleted page, blocks 1/2 the siblings, block 3 the half-dead leaf when
+        the target is internal, block 4 the metapage on the `_META` variant.
+        Redo reads block 2 unconditionally — a rightmost target has no legal
+        record, and upstream never deletes one.
+  - [ ] **S11.5d-3 — rewire the page-deletion emit sites**. `unlinkEmptyLeaf` /
+        `unlinkEmptyInternalPage` emit ONE native record covering both phases,
+        BEFORE applying, and then deliberately re-derive each sibling link under
+        the write pin (the AI-20260709-010336-082 corruption fix) because a
+        split on another connection's `*BTree` can splice a page in. That makes
+        the record's link values advisory, which no PG-shaped record may be.
+        Move to upstream's protocol — pin left/target/right, compute, emit,
+        write — and adopt the retarget-and-delete parent mutation at the same
+        time. This is the real content of the historical "documented reason to
+        stay native" (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
+        A8-unlinkpage).
 - [ ] **M0130-S11.6 — unblock S10 blocker #10** (est ~1 loop). Flip
       `relhasindex` in `buildUserPGClassRow`
       (`internal/executor/pg18_user_catalog_rows.go`), re-run

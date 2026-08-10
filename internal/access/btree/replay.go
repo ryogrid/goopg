@@ -139,6 +139,104 @@ func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
 	return nil
 }
 
+// ReplayMarkHalfDeadLeaf rebuilds a leaf page as the HALF-DEAD page phase 1 of
+// btree page deletion leaves behind — block 0 of upstream's
+// XLOG_BTREE_MARK_PAGE_HALFDEAD (`btree_xlog_mark_page_halfdead`,
+// nbtxlog.c:807-848). M0130-S11.5d-1.
+//
+// Upstream recreates the page from scratch rather than patching it, and that is
+// not an optimisation: a half-dead page is DEFINED by its contents (empty item
+// area plus one dummy high key whose downlink field carries the top parent of
+// the subtree being deleted), so every field of it is derivable from the record
+// and none of it is worth a full-page image. The dummy high key is what makes
+// the second phase possible at all — `_bt_unlink_halfdead_page` reads
+// BTreeTupleGetTopParent off it to find the next page down to unlink.
+//
+// `topparent` is InvalidBlockNumber when the leaf IS the top parent of the
+// subtree (the ordinary single-page deletion goopg performs), which is exactly
+// what upstream writes in that case too.
+func ReplayMarkHalfDeadLeaf(page storage.Page, leftblk, rightblk, topparent storage.BlockNumber) error {
+	if err := InitPGBTPage(page); err != nil {
+		return fmt.Errorf("btree: replay mark-halfdead init: %w", err)
+	}
+	writeOpaque(page, BTPageOpaque{
+		Prev:  leftblk,
+		Next:  rightblk,
+		Level: 0,
+		Flags: BTHalfDead | BTLeaf,
+	})
+	// PGBTPivotRaw(nil, topparent) IS upstream's `trunctuple`: SizeOfIndexTupleData
+	// bytes, t_info = 8, zero key attributes, and the block half of t_tid holding
+	// the top-parent link (BTreeTupleSetTopParent and BTreeTupleSetDownLink write
+	// the same field — upstream's two names for it differ only by which page kind
+	// is reading).
+	if _, err := storage.PageAddItemRaw(page, PGBTPivotRaw(nil, topparent)); err != nil {
+		return fmt.Errorf("btree: replay mark-halfdead high key: %w", err)
+	}
+	return nil
+}
+
+// ReplayHalfDeadParent applies upstream's parent-downlink removal — block 1 of
+// XLOG_BTREE_MARK_PAGE_HALFDEAD (`btree_xlog_mark_page_halfdead`,
+// nbtxlog.c:775-800). M0130-S11.5d-1.
+//
+// `poffset` is a PHYSICAL OffsetNumber (the coordinate the record carries), not
+// a data-slot index: on an internal page P_FIRSTDATAKEY is 2 when the page has a
+// high key and 1 when it is rightmost, and the record cannot be re-derived
+// through that distinction on the standby.
+//
+// The algorithm is deliberately NOT "delete the item at poffset", which is what
+// goopg's own `ReplayRemoveParentDownlink` does. Upstream retargets poffset's
+// downlink at the RIGHT neighbour's child and deletes the neighbour's item
+// instead, so the deleted subtree's key range is absorbed by the page to its
+// RIGHT, matching the direction the sibling chain was relinked in. Removing
+// poffset outright absorbs the range LEFTWARD. Both are self-consistent for an
+// empty page, but they produce different parent pages, so a record shaped for
+// upstream's redo must be produced by a primary that did upstream's mutation —
+// see the deferral-ledger row for the emit-side half (S11.5d-3).
+//
+// A deleted page always has a right sibling on its own level (upstream never
+// deletes a rightmost page), so poffset is never the last item.
+func ReplayHalfDeadParent(page storage.Page, poffset uint16) error {
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return fmt.Errorf("btree: replay halfdead parent read: %w", err)
+	}
+	if poffset == 0 || int(poffset)+1 > count {
+		// Out of range: either a malformed record or a page that already has
+		// the post-removal layout. Idempotency is the caller's contract via
+		// pd_lsn, so treat it as a no-op rather than corrupting the page.
+		return nil
+	}
+	// Collect from the first DATA offset only: resetPageItems below re-installs
+	// the high key by itself (its whole reason for existing — pd_lower must
+	// already account for P_HIKEY before the first data item is refilled), so
+	// carrying the high key through this list would duplicate it.
+	first := PGFirstDataKey(ReadPGOpaque(page))
+	if poffset < first {
+		return nil
+	}
+	raws := make([][]byte, 0, count)
+	for slot := first; int(slot) <= count; slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			return fmt.Errorf("btree: replay halfdead parent slot %d: %w", slot, err)
+		}
+		raws = append(raws, raw)
+	}
+	target := int(poffset - first)
+	rightsib := BTreeTupleGetDownLink(raws[target+1])
+	BTreeTupleSetDownLink(raws[target], rightsib)
+	raws = append(raws[:target+1], raws[target+2:]...)
+	resetPageItems(page)
+	for i, raw := range raws {
+		if _, err := storage.PageAddItemRaw(page, raw); err != nil {
+			return fmt.Errorf("btree: replay halfdead parent re-add %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // ApplyInsertRecordAt re-runs one B-tree non-split insert against the given
 // page bytes during WAL replay, placing the raw item at the RECORDED offset
 // number — upstream's btree_xlog_insert, which does exactly one PageAddItem at

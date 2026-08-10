@@ -746,6 +746,76 @@ func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, 
 	return framePGAssembled(RmgrBtree, xlogBtreeNewRoot, 0, body), nil
 }
 
+// sizeOfXLogBtreeMarkPageHalfDeadData is PG's SizeOfBtreeMarkPageHalfDead:
+// poffset(2) + 2 bytes of C alignment padding + leafblk(4) + leftblk(4) +
+// rightblk(4) + topparent(4) = 20. The padding is part of the wire format —
+// upstream casts the main-data area straight to the struct.
+const sizeOfXLogBtreeMarkPageHalfDeadData = 20
+
+// EncodeBtreeMarkPageHalfDeadPG builds a PostgreSQL RM_BTREE phase-1
+// page-deletion record (XLOG_BTREE_MARK_PAGE_HALFDEAD opcode), shaped for
+// upstream `btree_xlog_mark_page_halfdead` (nbtxlog.c:762-848) and emitted by
+// `_bt_mark_page_halfdead` (nbtpage.c):
+//
+//	main data: xl_btree_mark_page_halfdead{poffset, leafblk, leftblk, rightblk,
+//	                                       topparent}
+//	block 0:   the leaf, WILL_INIT, no block data — redo recreates the half-dead
+//	           page from the main data alone
+//	block 1:   the to-be-deleted subtree's parent, so redo can remove the
+//	           downlink
+//
+// M0130-S11.5d-1. The record goopg emitted before this
+// (`EncodeBtreeMarkPageHalfDead`, RecordKind 25) carried leafblk plus a flags
+// word and NO registered blocks at all, under a header that nevertheless
+// announced RM_BTREE/XLOG_BTREE_MARK_PAGE_HALFDEAD. That is the same trap
+// S11.5a found under newroot, one degree worse: upstream's redo does not merely
+// misread the main data, it calls `XLogInitBufferForRedo(record, 0)`
+// unconditionally, and a block id that was never registered is a PANIC in
+// `XLogReadBufferForRedoExtended`, not a bad page. A standby therefore dies on
+// the first goopg page deletion rather than diverging quietly.
+//
+// `leftblk`/`rightblk` are read off leafPage rather than taken from the caller,
+// for the same reason EncodeBtreeNewRootPG derives level from the page it logs:
+// the record must not be able to describe a page differently from the page.
+//
+// `topparent` is InvalidBlockNumber when the leaf is itself the top of the
+// subtree being deleted — upstream writes exactly that when `topparent ==
+// leafblkno`. `poffset` is a PHYSICAL OffsetNumber in the parent.
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeMarkPageHalfDeadPG(rel storage.RelFileNode, leafBlk storage.BlockNumber, leafPage storage.Page, parentBlk storage.BlockNumber, poffset uint16, topparent storage.BlockNumber) ([]byte, error) {
+	if len(leafPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead leaf page must be %d bytes", storage.BlockSize)
+	}
+	if parentBlk == storage.InvalidBlockNumber {
+		// Upstream registers block 1 unconditionally and its redo reads it
+		// unconditionally; a root-only tree never reaches _bt_mark_page_halfdead
+		// because a root is not deletable.
+		return nil, fmt.Errorf("wal: btree-mark-halfdead has no parent block")
+	}
+	if poffset == 0 {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead poffset 0 is not a valid OffsetNumber")
+	}
+	if topparent == leafBlk {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead topparent %d must be InvalidBlockNumber when it is the leaf itself", topparent)
+	}
+	op := btree.ReadPGOpaque(leafPage)
+	mainData := make([]byte, sizeOfXLogBtreeMarkPageHalfDeadData)
+	binary.LittleEndian.PutUint16(mainData[0:2], poffset)
+	binary.LittleEndian.PutUint32(mainData[4:8], uint32(leafBlk))
+	binary.LittleEndian.PutUint32(mainData[8:12], uint32(op.Prev))
+	binary.LittleEndian.PutUint32(mainData[12:16], uint32(op.Next))
+	binary.LittleEndian.PutUint32(mainData[16:20], uint32(topparent))
+
+	body, err := assembleXLogRecord(mainData, []BlockRef{
+		{ID: 0, Rel: rel, Block: leafBlk, WillInit: true},
+		{ID: 1, Rel: rel, Block: parentBlk, SameRel: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeMarkPageHalfDead, 0, body), nil
+}
+
 // EncodePageImagePG builds a PostgreSQL RM_XLOG standalone full-page-image record
 // (XLOG_FPI opcode) carrying the page as a block-0 apply-FPI. goopg's first-touch
 // FPI anchor (storage.Pool.maybeEmitFPI) captures the exact page bytes, so this

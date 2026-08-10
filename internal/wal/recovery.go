@@ -2488,6 +2488,15 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeMarkPageHalfDead:
+			// M0130-S11.5d-1: goopg emits the real xl_btree_mark_page_halfdead —
+			// main data {poffset, leafblk, leftblk, rightblk, topparent}, block 0
+			// the leaf WILL_INIT with no data (redo rebuilds the half-dead page),
+			// block 1 the subtree parent whose downlink is removed.
+			if err := replayDecodedXLogBtreeMarkPageHalfDead(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			// Other btree records (unlink / …) are
 			// not flipped yet and are emitted with full-page images; restore
@@ -3045,6 +3054,67 @@ func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDec
 		return btree.ReplayRestoreMetaPage(page, md)
 	}); err != nil {
 		return fmt.Errorf("wal: xlog btree-newroot meta apply: %w", err)
+	}
+	return nil
+}
+
+// replayDecodedXLogBtreeMarkPageHalfDead applies a PG-format
+// xl_btree_mark_page_halfdead, mirroring upstream btree_xlog_mark_page_halfdead
+// (nbtxlog.c:762-848) in the same block order:
+//
+//	block 1 — the to-be-deleted subtree's parent: retarget poffset's downlink at
+//	          the right neighbour's child and drop the neighbour's item.
+//	          Upstream does this FIRST so it can release the internal page's lock
+//	          without coupling it across levels;
+//	block 0 — the leaf, recreated from scratch as a half-dead page carrying one
+//	          dummy high key whose downlink field holds the top parent.
+//
+// Each block is separately idempotent via its own pd_lsn, so a replay
+// interrupted between the two resumes correctly — the same per-limb discipline
+// replayDecodedXLogBtreeNewRoot uses. Block 0 is WILL_INIT.
+//
+// M0130-S11.5d-1. A real-PG record carrying a full-page image on either block is
+// restored from the image instead, exactly as upstream's BLK_RESTORED arm does.
+func replayDecodedXLogBtreeMarkPageHalfDead(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	if len(xlog.MainData) < sizeOfXLogBtreeMarkPageHalfDeadData {
+		return fmt.Errorf("wal: xlog btree-mark-halfdead: main data len %d (want >= %d)",
+			len(xlog.MainData), sizeOfXLogBtreeMarkPageHalfDeadData)
+	}
+	le := binary.LittleEndian
+	poffset := le.Uint16(xlog.MainData[0:2])
+	leftblk := storage.BlockNumber(le.Uint32(xlog.MainData[8:12]))
+	rightblk := storage.BlockNumber(le.Uint32(xlog.MainData[12:16]))
+	topparent := storage.BlockNumber(le.Uint32(xlog.MainData[16:20]))
+
+	parent, ok := xlogBlockRefByID(xlog, 1)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-mark-halfdead missing block 1 (parent)")
+	}
+	if parent.HasImage && parent.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, parent, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-mark-halfdead parent image: %w", err)
+		}
+	} else if err := replayExistingXLogBlock(mgr, parent, endLSN, func(page storage.Page) error {
+		return btree.ReplayHalfDeadParent(page, poffset)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-mark-halfdead parent apply: %w", err)
+	}
+
+	leaf, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-mark-halfdead missing block 0 (leaf)")
+	}
+	if leaf.HasImage && leaf.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, leaf, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-mark-halfdead leaf image: %w", err)
+		}
+		return nil
+	}
+	if err := replayInitedXLogBlock(mgr, leaf, endLSN, func(page storage.Page) error {
+		return btree.ReplayMarkHalfDeadLeaf(page, leftblk, rightblk, topparent)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-mark-halfdead leaf apply: %w", err)
 	}
 	return nil
 }

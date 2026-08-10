@@ -387,6 +387,99 @@ anyway, so the loss can cost a later re-check, never correctness.
 - Mutation-checked: emitting the item area in ascending order, and dropping the
   block-1 limb, each fail by name.
 
+## S11.5d-1 — `XLOG_BTREE_MARK_PAGE_HALFDEAD`
+
+Page deletion is two records in upstream, and goopg's single native
+`RecordKindBtreeUnlinkPage` covers the union of both. This slice lands the
+phase-1 record's PG form; phase 2 (`XLOG_BTREE_UNLINK_PAGE`) is S11.5d-2 and the
+emit-side rewiring of `unlinkEmptyLeaf` is S11.5d-3.
+
+### The trap, one degree worse than S11.5a's
+
+goopg *did* already emit an `XLOG_BTREE_MARK_PAGE_HALFDEAD`-tagged record
+(`EncodeBtreeMarkPageHalfDead`, RecordKind 25): 16 bytes of `{relfilenode,
+leafblk, flagsAfter}`, **no registered blocks at all**, under a header
+announcing `RM_BTREE` / `0xB0`. Upstream's `btree_xlog_mark_page_halfdead` does
+not merely misread that main data — it calls `XLogInitBufferForRedo(record, 0)`
+unconditionally, and an unregistered block id is a PANIC inside
+`XLogReadBufferForRedoExtended`, not a bad page. The same shape as the S11.5b-3
+finding: the missing block is fatal, not lossy.
+
+(The record also has zero live emit sites today — the `LogBtreeMarkPageHalfDead`
+hook is wired all the way from `initdb/open.go` through `storage.Pool` and never
+called, because VACUUM bundles the half-dead transition into the vacuum record's
+opaque-flags trailer. S11.5d-3 is what gives it a caller.)
+
+### Record
+
+Upstream `_bt_mark_page_halfdead` (nbtpage.c), redo at nbtxlog.c:762-848:
+
+| part | contents |
+|---|---|
+| main data | `xl_btree_mark_page_halfdead{poffset, leafblk, leftblk, rightblk, topparent}` — 20 bytes: a `uint16` then four `uint32`, so **2 bytes of C alignment padding after `poffset` are part of the wire format** |
+| block 0 | the leaf, `WILL_INIT`, **no block data** |
+| block 1 | the to-be-deleted subtree's parent |
+
+`leftblk`/`rightblk` are read off the leaf page inside `EncodeBtreeMarkPageHalfDeadPG`
+rather than accepted from the caller — the same rule S11.5a applied to `level`:
+the record must not be able to describe a page differently from the page it is
+logging. `poffset` is a **physical** `OffsetNumber`, not a data-slot index;
+`P_FIRSTDATAKEY` is 2 on a parent with a high key and 1 on a rightmost one, and
+the standby cannot re-derive which.
+
+### Two things redo defines that goopg's page model did not have
+
+**The half-dead page is defined by its contents.** Upstream recreates block 0
+from scratch: empty item area plus one dummy high key of exactly
+`SizeOfIndexTupleData` bytes whose `t_tid` block half is the *top parent* of the
+subtree being deleted. That tuple is not decoration — `_bt_unlink_halfdead_page`
+reads `BTreeTupleGetTopParent` off it to find the next page down to unlink, so
+phase 2 is impossible without it. `ReplayMarkHalfDeadLeaf` builds it with
+`PGBTPivotRaw(nil, topparent)`, which is byte-identical to upstream's
+`trunctuple` (`BTreeTupleSetTopParent` and `BTreeTupleSetDownLink` write the
+same field under two names). `topparent` is `InvalidBlockNumber` when the leaf is
+itself the top of the subtree — the ordinary case for goopg's single-page
+deletions — and `EncodeBtreeMarkPageHalfDeadPG` **refuses** a `topparent` that
+literally names the leaf, because that record would make phase 2 descend into
+the page it is deleting.
+
+**The parent mutation is a retarget, not a delete.** Upstream points `poffset`'s
+downlink at the *right neighbour's* child and deletes the neighbour's item,
+keeping `poffset`'s own key. goopg's `ReplayRemoveParentDownlink` deletes
+`poffset` outright. Both are self-consistent for an empty page, but they absorb
+the deleted subtree's key range in **opposite directions** — rightward
+(upstream, matching the direction the sibling chain was relinked) versus
+leftward (goopg) — and so produce different parent pages from the same input.
+`ReplayHalfDeadParent` is the upstream one, kept separate from goopg's rather
+than replacing it: the primary still performs goopg's mutation, so switching
+`unlinkEmptyLeaf` to the PG record means switching its parent mutation too.
+That coupling is exactly what makes it S11.5d-3 rather than part of this slice,
+and it is on the ledger.
+
+### Replay
+
+`replayDecodedXLogBtreeMarkPageHalfDead` applies block 1 first and block 0
+second, upstream's order (it does the parent first precisely so it can drop the
+internal page's lock without coupling it across levels). Each limb is
+independently gated on its own `pd_lsn`, so a replay interrupted between the two
+resumes correctly, and each falls back to a full-page image when a real-PG
+record carries one.
+
+### Guards — S11.5d-1
+
+`internal/wal/btree_halfdead_pg_test.go` pins the 20-byte main data field by
+field *including the alignment padding*, asserts block 0 is `WILL_INIT` with
+zero data bytes and block 1 is neither, and fails if any block carries an image.
+`TestEncodeBtreeMarkPageHalfDeadPGRefusesUndescribableRecords` covers the three
+inputs whose record upstream could not replay as written (no parent block,
+`poffset` 0, `topparent` = the leaf). `TestApplyRecordReplaysPGBtreeMarkPageHalfDead`
+drives emit → encode → decode → `ApplyRecord` and checks the rebuilt half-dead
+leaf and the retargeted parent, then re-applies at the same LSN.
+`internal/access/btree/replay_halfdead_test.go` runs the parent mutation on
+*both* page shapes (`P_FIRSTDATAKEY` 2 and 1) so the physical-offset handling
+cannot regress into a data-slot index, and proves the rebuild discards live
+items.
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -403,11 +496,25 @@ anyway, so the loss can cost a later re-check, never correctness.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **`XLOG_BTREE_UNLINK_PAGE`** — the one with a *documented* reason to stay
-  native (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage): an
-  emit-time FPI can be stale against a concurrent split on another `*BTree`, and
-  the PG-faithful form needs incremental link patches rather than a page
-  snapshot.
+- **`XLOG_BTREE_UNLINK_PAGE` (S11.5d-2)** — phase 2: main data
+  `xl_btree_unlink_page{leftsib, rightsib, level, safexid, leafleftsib,
+  leafrightsib, leaftopparent}`, block 0 the target rewritten as an empty
+  deleted page, blocks 1/2 the siblings, block 3 the half-dead leaf when the
+  target is an internal page, block 4 the metapage on the `_META` variant.
+  Upstream's redo reads block 2 unconditionally, so a rightmost target has no
+  legal record — upstream never deletes one either.
+- **Rewiring the emit sites (S11.5d-3)** — `unlinkEmptyLeaf` /
+  `unlinkEmptyInternalPage` emit one native record covering the union of both
+  phases, and they emit it **before** applying, then deliberately re-derive each
+  sibling link under the write pin (the AI-20260709-010336-082 fix) because a
+  split on another connection's `*BTree` can splice a page in between. That
+  makes the record's own link values advisory, which no PG-shaped record may be.
+  Upstream avoids it by holding all three page locks across the insert; goopg
+  must move to the same protocol (pin left/target/right, compute, emit, write)
+  and adopt upstream's retarget-and-delete parent mutation at the same time.
+  This is the "documented reason to stay native"
+  (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage) restated in
+  terms of what actually blocks it.
 
 Until those land, `relhasindex` stays false in `buildUserPGClassRow`
 (S11.6): a PG standby that saw goopg's indexes would try to replay these
