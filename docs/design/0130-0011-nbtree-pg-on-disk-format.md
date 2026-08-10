@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1 landed 2026-08-10; S11.4 slices 3b-2c-ii-B2/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b/3b-2c-ii-B2-c/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -551,14 +551,48 @@ sources agree:
             (`rangeScanPos(nil, …)`, upstream's keysz = 0) is; it now errors,
             so `compare` falls back to the bytewise order where an empty key
             sorts first — which IS minus infinity.
-          - **3b-2c-ii-B2 — the flip (open). REINDEX-required.**
+          - **3b-2c-ii-B2-a — the key encoder (landed 2026-08-10). No
+            on-disk change, no REINDEX.**
+            `internal/executor/pgindex_tuplekey.go` adds `pgIndexTupleKey` /
+            `pgIndexTupleKeyFromRow` / `pgIndexKeyColumns`: the converter from a
+            row's key datums to the `FormPGIndexTuple` image, which no layer
+            could produce before (3b-2b said how the attributes are laid out and
+            ordered; nothing turned a `Datum` into the attribute image). The
+            per-attribute bytes come from `encodeValuePG` — the heap's own
+            encoder — because an index datum and a heap datum of the same type
+            are the SAME physical image upstream (`index_form_tuple` and
+            `heap_form_tuple` share `heap_fill_tuple`), and a second encoder
+            would be exactly the sibling-pair divergence the ledger keeps
+            recording. A prefix key (a scan positioning on part of a composite
+            index) is stamped as a pivot via `BTreeTupleSetNAtts`, without which
+            `BTreeTupleGetNAtts` would claim the index's full key count for a
+            tuple that physically holds fewer attributes and
+            `DeformPGIndexTuple` would read past the data area; with it,
+            `ComparePGIndexTuples`' truncation rule reproduces the "position at
+            the first entry matching this prefix" semantics the blob path got
+            free from a bytewise prefix compare. Nothing calls it on a
+            production path yet.
+            **Discovery: goopg's stored image for `numeric` and `uuid` is not
+            PostgreSQL's.** `encodeValuePG` writes the decimal string and the
+            36-character canonical UUID as text varlenas, so `PGCompareNumeric`
+            (which decodes base-10000 `NumericData`) orders `-1000` above `0`,
+            and a `uuid` key would be a 16-byte window onto a 37-byte varlena.
+            Both are HEAP-side divergences — a real PG 18.3 already misreads a
+            goopg `numeric`/`uuid` column — so `buildPGIndexKeyDesc` now refuses
+            those two types (`pgIndexKeyImageIsPGFaithful`) and they keep the
+            blob key path; fixing the image belongs to `encodeValuePG`.
+          - **3b-2c-ii-B2-b — the format-resolution sites (open). No on-disk
+            change.** Teach the `blobFormat` sites — amcheck's four exported
+            page readers and the two redo entry points — to resolve a per-index
+            format, which is behaviour-preserving while every index still
+            resolves to blob.
+          - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-            `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
-            `pgIndexTupleKeys` on, the redo-path descriptor lookup above, the
-            `blobFormat` call sites above taught to resolve a per-index format,
-            and an explicit dual-format decision for the indexes ii-A's
-            resolver refuses. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS
-            SF0.5 gate (re-pin after a REINDEX).
+            `encodeArbiterKey` → `pgIndexTupleKey` under the same
+            `Context.pgIndexKeyDesc` the tree took, search keys included;
+            `pgIndexTupleKeys` on; and the explicit dual-format decision for the
+            indexes the resolver refuses. Gates: `scripts/tpch-spotcheck.sh` and
+            the TPC-DS SF0.5 gate (re-pin after a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

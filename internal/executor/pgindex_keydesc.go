@@ -171,6 +171,56 @@ func pgIndexCollationOrderable(name string) bool {
 	return false
 }
 
+// pgIndexKeyImageIsPGFaithful reports whether goopg's stored image for a type
+// IS PostgreSQL's — the precondition the 3b-2a comparators were written under
+// and the one the descriptor silently assumes.
+//
+// Two types fail it today, both found by slice 3b-2c-ii-B2-a's per-type
+// ordering table (pgindex_tuplekey_test.go) rather than by inspection:
+//
+//   - numeric: `encodeValuePG` stores the DECIMAL STRING as a text varlena, not
+//     PG's base-10000 NumericData (weight/sign/dscale + NBASE digits). Fed that,
+//     `PGCompareNumeric` cannot decode a numeric header and falls back to
+//     bytes.Compare over ASCII, which orders "-1000" above "0" and "0.5" above
+//     "1" — a mis-ORDERED index, exactly the failure mode this mapper exists to
+//     make unreachable.
+//   - uuid: `encodeValuePG` stores the 36-character canonical string as a text
+//     varlena, while the type is attlen 16. The descriptor would hand
+//     `DeformPGIndexTuple` a 16-byte window onto a 37-byte varlena, so the key
+//     would be the first 15 characters of the UUID's text.
+//
+// Both are heap-side divergences (a real PG 18.3 reading a goopg user table
+// with a numeric or uuid column already misreads it), not index-side ones, so
+// the fix belongs to `encodeValuePG` and is a codec change with its own gate
+// list. Until then these indexes keep the pre-S11.4 blob key path, which orders
+// them correctly because goopg's blob encoding is order-preserving over its own
+// image. See the deferral ledger row for M0130-S11.4 B2-a.
+func pgIndexKeyImageIsPGFaithful(typOID uint32) bool {
+	switch typOID {
+	case catalog.OIDNumeric, catalog.OIDUUID:
+		return false
+	}
+	return true
+}
+
+// findColumnByName resolves an index key column name against its table,
+// case-insensitively (the catalog stores the declared spelling; pg_index's
+// indkey is resolved by name here). It returns a pointer INTO idx.Table.Columns
+// so the descriptor and the key encoder both read one catalog.Column — the
+// sibling-pair hazard this file's header describes applies to the column
+// resolution itself, not just to the bytes.
+func findColumnByName(tbl *catalog.Table, name string) *catalog.Column {
+	if tbl == nil {
+		return nil
+	}
+	for j := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[j].Name, name) {
+			return &tbl.Columns[j]
+		}
+	}
+	return nil
+}
+
 // buildPGIndexKeyDesc builds the `btree.PGIndexKeyDesc` for a catalog index:
 // one PGKeyAttr per KEY column (INCLUDE columns are non-key and excluded, as
 // IndexRelationGetNumberOfKeyAttributes does), carrying the physical layout
@@ -203,13 +253,7 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 			// comparator for it.
 			return nil, fmt.Errorf("btree key descriptor: index %q key %d is an expression", idx.Name, i+1)
 		}
-		var col *catalog.Column
-		for j := range idx.Table.Columns {
-			if strings.EqualFold(idx.Table.Columns[j].Name, name) {
-				col = &idx.Table.Columns[j]
-				break
-			}
-		}
+		col := findColumnByName(idx.Table, name)
 		if col == nil {
 			return nil, fmt.Errorf("btree key descriptor: index %q key column %q not found on table %q", idx.Name, name, idx.Table.Name)
 		}
@@ -226,6 +270,9 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 		typOID, ok := pgIndexKeyTypeOID(col)
 		if !ok {
 			return nil, fmt.Errorf("btree key descriptor: index %q key %q has type %q, which has no btree comparator", idx.Name, name, col.Type.Name)
+		}
+		if !pgIndexKeyImageIsPGFaithful(typOID) {
+			return nil, fmt.Errorf("btree key descriptor: index %q key %q has type %q, whose goopg stored image is not PostgreSQL's", idx.Name, name, col.Type.Name)
 		}
 		cmp := pgIndexComparatorForOID(typOID)
 		if cmp == nil {

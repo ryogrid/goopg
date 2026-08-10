@@ -1030,17 +1030,54 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               shorter than a tuple header, i.e. on a minus-infinity search key
               (`rangeScanPos(nil, …)`); it now errors so `compare` falls back
               to bytewise, where an empty key sorts first = minus infinity.
-        - [ ] **3b-2c-ii-B2 — the flip** (REINDEX-required).
+        - [x] **3b-2c-ii-B2-a — the key encoder** (2026-08-10). NO on-disk
+              change, no REINDEX. `internal/executor/pgindex_tuplekey.go`:
+              `pgIndexTupleKey` / `pgIndexTupleKeyFromRow` /
+              `pgIndexKeyColumns` turn a row's key datums into the
+              `FormPGIndexTuple` image — the converter no layer could produce
+              before (3b-2b said how attributes are laid out and ordered;
+              nothing turned a `Datum` into an attribute image). The bytes come
+              from `encodeValuePG`, the HEAP's encoder, because upstream's
+              `index_form_tuple` and `heap_form_tuple` share `heap_fill_tuple`
+              and a second encoder would be the sibling-pair divergence again.
+              A prefix (partial-key) search key is stamped as a pivot via
+              `BTreeTupleSetNAtts` — without it `BTreeTupleGetNAtts` claims the
+              index's full key count and `DeformPGIndexTuple` reads past the
+              data area; with it the truncation rule gives "position at the
+              first entry matching this prefix" for free. Nothing calls it on a
+              production path yet. Guards: `pgindex_tuplekey_test.go` — a
+              per-type ordering table over EVERY type the descriptor accepts
+              (values chosen to break LE-bytewise, sign, IEEE-754, varlena
+              headers and bpchar blank-padding), which also asserts the table
+              disagrees with `bytes.Compare` somewhere, else it could not
+              detect a regression to bytewise; plus the pivot/minus-infinity
+              rule, the zero-TID search key, NULL + DESC/NULLS FIRST, the
+              row→key-order projection, and TOAST/oversize refusal.
+              **Discovery: goopg's stored image for `numeric` and `uuid` is NOT
+              PostgreSQL's** — `encodeValuePG` writes the decimal string and
+              the 36-char UUID as text varlenas, so `PGCompareNumeric` orders
+              `-1000` above `0` and a `uuid` key would be a 16-byte window onto
+              a 37-byte varlena. Both are HEAP-side divergences (a real PG 18.3
+              already misreads those columns), so `buildPGIndexKeyDesc` refuses
+              them (`pgIndexKeyImageIsPGFaithful`) and they keep the blob path.
+        - [ ] **3b-2c-ii-B2-b — the format-resolution sites**. No on-disk
+              change: teach the `blobFormat` sites — amcheck's four exported
+              page readers (`PageItemKeys`/`PageLeafItems`/`PageDownlinks`/
+              `PageHighKey`) and the two redo entry points (`ApplyInsertRecord`,
+              `ReplayRemoveParentDownlink`, called from
+              `internal/wal/recovery.go:2917`/`:3596`/`:3410`) — to resolve a
+              per-index format instead of assuming blob. Behaviour-preserving
+              while every index still resolves to blob.
+        - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-              `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums
-              (search keys included — a tuple-format search key must itself be
-              tuple-shaped), `pgIndexTupleKeys` on, the redo-path descriptor
-              lookup, the `blobFormat` sites above taught to resolve a
-              per-index format, and an explicit dual-format decision for the
-              indexes ii-A's resolver refuses (they keep the blob path, so a
-              tree's format is now a per-index property that amcheck and the
-              redo path must both learn). Gates: `scripts/tpch-spotcheck.sh` +
-              the TPC-DS SF0.5 gate (re-pin after a REINDEX).
+              `encodeArbiterKey` → `pgIndexTupleKey` under the same
+              `ctx.pgIndexKeyDesc(idx)` the tree took (search keys included — a
+              tuple-format search key must itself be tuple-shaped),
+              `pgIndexTupleKeys` on, and an explicit dual-format decision for
+              the indexes the resolver refuses (they keep the blob path, so a
+              tree's format is a per-index property). Gates:
+              `scripts/tpch-spotcheck.sh` + the TPC-DS SF0.5 gate (re-pin after
+              a REINDEX).
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

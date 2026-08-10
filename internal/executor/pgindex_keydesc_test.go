@@ -33,7 +33,7 @@ func TestBuildPGIndexKeyDescPhysicalLayout(t *testing.T) {
 	tbl := keyDescTable(
 		col("a", "int4"),
 		col("b", "text"),
-		col("c", "numeric"),
+		col("c", "bytea"),
 		col("d", "timestamptz"),
 	)
 	idx := &catalog.Index{Name: "i", Table: tbl, Method: "btree", Columns: []string{"a", "b", "c", "d"}}
@@ -47,7 +47,7 @@ func TestBuildPGIndexKeyDescPhysicalLayout(t *testing.T) {
 	want := []btree.PGIndexAttr{
 		{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'},   // int4
 		{Len: -1, ByVal: false, AlignBy: 4, Storage: 'x'}, // text
-		{Len: -1, ByVal: false, AlignBy: 4, Storage: 'm'}, // numeric
+		{Len: -1, ByVal: false, AlignBy: 4, Storage: 'x'}, // bytea
 		{Len: 8, ByVal: true, AlignBy: 8, Storage: 'p'},   // timestamptz
 	}
 	for i, w := range want {
@@ -239,6 +239,11 @@ func TestBuildPGIndexKeyDescRejects(t *testing.T) {
 // Every type with a 3b-2a comparator must be reachable through the catalog
 // spellings a CREATE INDEX can use — a missing case arm silently downgrades a
 // perfectly indexable column to "unsupported".
+//
+// numeric/decimal/uuid are NOT here: their spellings resolve and their
+// comparators exist, but goopg's stored image for them is a text varlena rather
+// than PostgreSQL's, so 3b-2c-ii-B2-a's pgIndexKeyImageIsPGFaithful refuses
+// them one step later (TestBuildPGIndexKeyDescRefusesNonPGImages).
 func TestBuildPGIndexKeyDescAcceptsEverySupportedSpelling(t *testing.T) {
 	spellings := []string{
 		"bool", "boolean", "bytea", "name",
@@ -246,7 +251,6 @@ func TestBuildPGIndexKeyDescAcceptsEverySupportedSpelling(t *testing.T) {
 		"int8", "bigint", "bigserial", "oid",
 		"float4", "real", "float8", "double precision",
 		"text", "varchar", "character varying", "bpchar",
-		"numeric", "decimal", "uuid",
 		"date", "time", "timetz", "timestamp", "timestamptz",
 	}
 	for _, sp := range spellings {
