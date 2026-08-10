@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"math/big"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -47,20 +46,13 @@ func TestDDLCreateNumericBTreeIndexAcceptsType(t *testing.T) {
 	if err := runDDL(t, ctx, "CREATE INDEX idx_prices_amount ON prices (amount)"); err != nil {
 		t.Fatalf("CREATE INDEX on numeric column: %v", err)
 	}
-	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_prices_amount"})
-	if !ok {
-		t.Fatal("index not in catalog after CREATE INDEX")
-	}
-	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
-	if err != nil {
-		t.Fatalf("btree.Open: %v", err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_prices_amount")
 	for _, k := range []struct {
 		m int64
-		s int8
+		s int16
 	}{{10, 1}, {25, 1}, {7, 0}} {
-		_, found, err := tree.Search(btree.EncodeNumericKey(big.NewInt(k.m), int16(k.s)))
+		key := indexProbeForTest(t, ctx, idx, NewNumericInt64Datum(k.m, k.s))
+		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%d,%d): found=%v err=%v", k.m, k.s, found, err)
 		}
@@ -132,15 +124,11 @@ func TestDDLNumericIndexSplitWithVariableLengthHighKey(t *testing.T) {
 		t.Fatalf("CREATE INDEX with split required: %v", err)
 	}
 
-	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_prices_n"})
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatalf("btree.Open: %v", err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_prices_n")
 	// Probe 50 spaced-out keys to exercise the descent path
 	// across multiple leaves post-split.
 	for i := 0; i < nRows; i += nRows / 50 {
-		key := btree.EncodeNumericKey(big.NewInt(int64(i+1)), int16(i%4))
+		key := indexProbeForTest(t, ctx, idx, NewNumericInt64Datum(int64(i+1), int16(i%4)))
 		if _, found, err := tree.Search(key); err != nil || !found {
 			t.Fatalf("Search row %d: found=%v err=%v", i, found, err)
 		}

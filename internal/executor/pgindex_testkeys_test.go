@@ -69,6 +69,33 @@ func indexProbeForTest(t *testing.T, ctx *Context, idx *catalog.Index, val Datum
 	return key
 }
 
+// indexProbeMultiForTest is indexProbeForTest over the first len(vals) KEY
+// columns of a COMPOUND index — the test-side spelling of `WHERE a = ? AND
+// b = ?`, or of one end of a range when it names only a prefix.
+//
+// It exists because the compound suites used to build such a key by
+// CONCATENATING per-column blob encodings, which is the blob format's layout
+// rather than a property of compound indexing; `indexProbeKey` is the engine's
+// own funnel and produces whichever format the index resolved to. (M0119-0006
+// brought numeric into the tuple format, which is what made every
+// numeric-bearing compound test's hand-built key stop matching.)
+func indexProbeMultiForTest(t *testing.T, ctx *Context, idx *catalog.Index, vals ...Datum) []byte {
+	t.Helper()
+	cols := pgIndexKeyColumns(idx)
+	if len(cols) < len(vals) {
+		t.Fatalf("index %q: %d search values for %d resolvable key columns", idx.Name, len(vals), len(cols))
+	}
+	parts := make([]indexProbeKeyPart, len(vals))
+	for i, v := range vals {
+		parts[i] = indexProbeKeyPart{col: cols[i], val: v}
+	}
+	key, err := ctx.indexProbeKey(idx, parts)
+	if err != nil {
+		t.Fatalf("indexProbeKey(%s): %v", idx.Name, err)
+	}
+	return key
+}
+
 // withBlobIndexKeys forces the BLOB key format for the duration of a test, the
 // mirror of pgindex_btree_test.go's withPGIndexTupleKeys.
 //

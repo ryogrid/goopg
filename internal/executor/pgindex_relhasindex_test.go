@@ -54,6 +54,7 @@ func TestPGClassRelhasindexTracksDescribableIndexes(t *testing.T) {
 	intCols := []catalog.Column{
 		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0},
 		{Name: "amount", Type: catalog.Type{Name: "numeric"}, Ordinal: 1},
+		{Name: "span", Type: catalog.Type{Name: "interval"}, Ordinal: 2},
 	}
 
 	t.Run("no indexes", func(t *testing.T) {
@@ -86,16 +87,18 @@ func TestPGClassRelhasindexTracksDescribableIndexes(t *testing.T) {
 	})
 
 	t.Run("undescribable index alone", func(t *testing.T) {
-		// `numeric` is refused by pgIndexKeyImageIsPGFaithful: goopg's stored
-		// image is a decimal-string varlena, not PG's NumericData, so the tree
-		// keeps the blob key format (3b-2c-ii-B2-a's discovery).
-		cat, tbl := newRelhasindexCatalog(t, "rhi_num", intCols)
-		if _, err := cat.CreateIndex(parser.ObjectName{Schema: "public", Name: "rhi_num_idx"},
-			tbl, []string{"amount"}, false, "btree", false); err != nil {
+		// `interval` has no 3b-2a comparator (pgIndexComparatorForOID returns
+		// nil for it), so the tree keeps the blob key format. This subtest used
+		// `numeric` until M0119-0006 made goopg's numeric image PostgreSQL's
+		// own, which moved numeric onto the tuple format and took the premise
+		// with it.
+		cat, tbl := newRelhasindexCatalog(t, "rhi_span", intCols)
+		if _, err := cat.CreateIndex(parser.ObjectName{Schema: "public", Name: "rhi_span_idx"},
+			tbl, []string{"span"}, false, "btree", false); err != nil {
 			t.Fatalf("CreateIndex: %v", err)
 		}
 		if _, err := buildPGIndexKeyDesc(cat.IndexesOnTable(tbl)[0]); err == nil {
-			t.Fatal("buildPGIndexKeyDesc accepted a numeric key — test premise gone")
+			t.Fatal("buildPGIndexKeyDesc accepted an interval key — test premise gone")
 		}
 		if pgClassRelhasindex(cat, tbl) {
 			t.Error("pgClassRelhasindex = true for a blob-format index")
@@ -111,9 +114,9 @@ func TestPGClassRelhasindexTracksDescribableIndexes(t *testing.T) {
 		if !pgClassRelhasindex(cat, tbl) {
 			t.Fatal("premise: describable-only table should be true")
 		}
-		if _, err := cat.CreateIndex(parser.ObjectName{Schema: "public", Name: "rhi_mixed_num"},
-			tbl, []string{"amount"}, false, "btree", false); err != nil {
-			t.Fatalf("CreateIndex(numeric): %v", err)
+		if _, err := cat.CreateIndex(parser.ObjectName{Schema: "public", Name: "rhi_mixed_span"},
+			tbl, []string{"span"}, false, "btree", false); err != nil {
+			t.Fatalf("CreateIndex(interval): %v", err)
 		}
 		// relhasindex is per-RELATION and RelationGetIndexList reads every
 		// pg_index row once it is set — there is no way to expose only the

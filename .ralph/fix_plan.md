@@ -2491,6 +2491,45 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       tpch-spotcheck (Q12=2, Q13=35) + `TestPort_RegressSuite` PASS. 2 ledger
       rows: `uuid[]` elements still text, and no on-disk migration for heaps
       written by an older goopg (the general gap, recorded once).
+      **Slice landed 2026-08-11 (20th) — the `numeric` COLUMN stops being
+      text** (design `docs/design/0119-0006-numeric-column-storage.md`), the
+      LAST member of the heap-side-divergence class and the one the descriptor
+      could not have caught: `pg_type` agrees numeric is a varlena, so goopg's
+      `pg_attribute` row was right and no following column moved — the PAYLOAD
+      was the divergence. `encodeValuePG` stored the DECIMAL STRING, and every
+      reader that trusts the TYPE feeds it to `numeric_out` as a
+      `NumericData`, reading `"1234"` as `n_header 0x3231` (NUMERIC_POS,
+      dscale 12849) with weight 13363: a PG 18.3 standby, `pg_amcheck`'s heap
+      tier, and goopg's OWN PG-format index tuples, where `PGCompareNumeric`
+      falls back to `bytes.Compare` and orders `-1000` above `0`. The
+      serializer already existed — `internal/pgnodes/datum.go` ported
+      `numeric_in`/`numeric_out` in full for pg_node_tree — so the slice
+      EXPORTED it for the heap (`internal/pgnodes/numeric_storage.go`) instead
+      of writing a second port. Four seams: encode (via the new
+      `varlenaBytes`), decode, the `internal/wal` pgoutput sibling (unrouted it
+      would have shipped the raw digit array to a subscriber WITHOUT erroring),
+      and `pgIndexKeyImageIsPGFaithful`, which now refuses NO type and closes
+      the M0130-S11.4 B2-a ledger row. Unlike uuid/interval there IS pre-flip
+      data everywhere, so `NumericTextFromStoredPayload` reads both forms and
+      the two are EXACTLY disjoint (a payload spellable from `[0-9+-.eE]` is
+      always legacy text: short/special headers have a high byte >= 0x80,
+      long-form digits <= 0x27, long-form zero 0x00). Six executor tests that
+      probed numeric indexes with hand-built BLOB keys moved onto the engine
+      funnels (`openIndexTreeForTest`/`indexProbeForTest`/the new
+      `indexProbeMultiForTest`/`compositeUpperBound`), and the relhasindex
+      suite's "undescribable index" premise moved from numeric to `interval`.
+      Gates: 9 new unit tests across executor/wal/pgnodes + the inverted
+      `TestPGIndexKeyImagesStayPGFaithful` guard + numeric's row in
+      `TestPGIndexTupleKeyOrdersEveryDescribableType`; units PASS;
+      tpch-spotcheck PASS (Q12=2, Q13=35) ON THE PRE-FLIP CLUSTER, i.e. the
+      legacy read path against real data; TPC-DS SF0.5 sweep PASS=95
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 with 57 value checksums over
+      decimal-heavy queries. 4 ledger rows: numeric-keyed indexes built before
+      this loop need REINDEX (the key format is recomputed from the catalog,
+      not stamped on disk), the dual read is goopg-side only (a PG standby
+      still misreads a pre-flip row), `numeric[]` is built with elemtype OID
+      25 (text) because `arrayElemTypeInfo` has no numeric case, and numeric
+      NaN/+-Infinity still has no Datum representation.
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.

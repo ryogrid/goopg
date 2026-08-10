@@ -12,6 +12,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -601,17 +602,34 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[:], v)
 		return buf[:], nil
 	case "numeric", "decimal":
-		// Store as PG varlena-text. coerceTextLikeDatum yields the decimal
-		// string for KindNumeric/KindInt and passes a KindString through
-		// verbatim (e.g. INSERT ... VALUES ('123.45') arriving as text) —
-		// numericText alone reads only the Int/Scale fields and would emit
-		// "0" for a KindString. M0111-0002 (restores the string→numeric path
-		// the removed legacy encodeValue had).
+		// M0119-0006: PG's base-10000 NumericData varlena (numeric.c
+		// make_result), not the decimal string this arm used to store. The
+		// string was a heap-format divergence of exactly the class the uuid
+		// and interval slices closed — pg_type says numeric is a varlena, so
+		// the descriptor never caught it, but a reader that trusts the TYPE
+		// (a PG 18.3 standby, pg_amcheck's heap tier, a logical subscriber)
+		// hands the payload to numeric_out as a NumericData and reads the
+		// first two ASCII characters as n_header. It also mis-ORDERED a
+		// PG-format index tuple, which is why pgIndexKeyImageIsPGFaithful had
+		// to refuse numeric until now.
+		//
+		// coerceTextLikeDatum still produces the text first: it yields the
+		// decimal string for KindNumeric/KindInt and passes a KindString
+		// through verbatim (e.g. INSERT ... VALUES ('123.45') arriving as
+		// text), where numericText alone reads only the Int/Scale fields and
+		// would emit "0" for a KindString (M0111-0002). The text is then the
+		// input to numeric_in's port, so no precision is lost that the Datum
+		// was carrying.
 		s, err := coerceTextLikeDatum(t, d)
 		if err != nil {
 			return nil, err
 		}
-		return varlenaTextBytes(s), nil
+		body, nerr := pgnodes.NumericBodyFromText(s)
+		if nerr != nil {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type numeric: %q", s)}
+		}
+		return varlenaBytes(body), nil
 	case "aclitem[]", "_aclitem":
 		// PG binary empty ArrayType, elemtype = aclitem (1033).
 		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
@@ -789,6 +807,25 @@ func emptyArrayTypeBytes(elemType uint32) []byte {
 // means by it.
 func varlenaPayloadBytes(b []byte) []byte {
 	return varlenaTextBytes(string(b))
+}
+
+// varlenaBytes is varlenaTextBytes for a payload that is not text — the same
+// header rule (PG's heap_fill_tuple prefers the 1-byte short header whenever
+// the value fits and the attribute's storage is not 'p'), applied to raw bytes.
+// Used by the numeric arm, whose payload is a NumericData body. M0119-0006.
+func varlenaBytes(b []byte) []byte {
+	total := len(b) + 1
+	if total <= 127 {
+		buf := make([]byte, total)
+		buf[0] = byte(total<<1) | 1
+		copy(buf[1:], b)
+		return buf
+	}
+	total = len(b) + 4
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	copy(buf[4:], b)
+	return buf
 }
 
 func varlenaTextBytes(s string) []byte {
@@ -1341,14 +1378,24 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
 	case "numeric", "decimal":
-		// goopg encodes numeric as varlena-text (via the default encodeValuePG
-		// path which calls varlenaTextBytes). Decode: read the varlena payload
-		// as a plain text string and parse it back to KindNumeric.
+		// Sibling of the "numeric" arm in encodeValuePG: PG's base-10000
+		// NumericData behind a varlena header (M0119-0006). The in-memory
+		// Datum is unchanged — KindNumeric mantissa+scale — so this and the
+		// encoder are the only two places the on-disk bytes are seen.
+		//
+		// NumericTextFromStoredPayload also accepts the pre-flip payload (the
+		// decimal string): the flip has no on-disk migration, and every
+		// cluster that predates it — the TPC-H and TPC-DS benchmark clusters
+		// among them — holds text in its numeric columns. See that function
+		// for why the two forms are exactly, not heuristically, disjoint.
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err
 		}
-		text := string(payload)
+		text, err := pgnodes.NumericTextFromStoredPayload(payload)
+		if err != nil {
+			return Datum{}, 0, err
+		}
 		if v, scale, ok := parseNumericFastInt(text); ok {
 			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
 		}

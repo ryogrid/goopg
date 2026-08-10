@@ -82,9 +82,22 @@ func TestPGIndexTupleKeyOrdersEveryDescribableType(t *testing.T) {
 			NewStringDatum("ffffffff-ffff-ffff-ffff-fffffffffffe"),
 			NewStringDatum("ffffffff-ffff-ffff-ffff-ffffffffffff"),
 		}},
-		// numeric is deliberately ABSENT: goopg's stored image for it is a text
-		// varlena, not PostgreSQL's base-10000 NumericData, so the mapper
-		// refuses to describe it — see TestBuildPGIndexKeyDescRefusesNonPGImages.
+		// numeric joined this table when the M0119-0006 storage slice made
+		// encodeValuePG write PG's base-10000 NumericData: PGCompareNumeric
+		// now decodes a real n_header instead of ASCII. The values below are
+		// the ones the pre-flip guard used to prove the text image MIS-ordered
+		// (-1000 sorted above 0 bytewise, and 0.5 above 1). The
+		// dscale-insensitivity that goes with it (1 = 1.00 under numeric_cmp,
+		// which no byte comparison of either image can produce) is asserted
+		// separately in TestPGIndexKeyImagesStayPGFaithful.
+		{"numeric", catalog.Type{Name: "numeric"}, []Datum{
+			NewNumericInt64Datum(-1000, 0),
+			NewNumericInt64Datum(-1, 0),
+			NewNumericInt64Datum(0, 0),
+			NewNumericInt64Datum(5, 1), // 0.5
+			NewNumericInt64Datum(1, 0),
+			NewNumericInt64Datum(1000, 0),
+		}},
 		{"date", catalog.Type{Name: "date"}, []Datum{NewStringDatum("1999-12-31"), NewStringDatum("2000-01-01"), NewStringDatum("2026-08-10")}},
 		{"time", catalog.Type{Name: "time"}, []Datum{NewStringDatum("00:00:00"), NewStringDatum("12:34:56"), NewStringDatum("23:59:59")}},
 		{"timetz", catalog.Type{Name: "timetz"}, []Datum{NewStringDatum("00:00:00+00"), NewStringDatum("12:00:00+00"), NewStringDatum("23:00:00+00")}},
@@ -200,49 +213,49 @@ func varlenaPayloadForTest(v []byte) ([]byte, bool) {
 	return v[4:n], true
 }
 
-// numeric is the last type the B2-a ordering table found goopg does not store
-// the way PostgreSQL does: `encodeValuePG` writes the decimal string as a TEXT
-// varlena rather than base-10000 NumericData. (uuid was the other one until the
-// M0119-0006 storage slice made it PG's 16-byte pg_uuid_t; it now lives in the
-// ordering table above.) The mapper must refuse it, because a descriptor is a
-// promise that the 3b-2a comparator can order the stored image — and this test
-// also demonstrates the damage that promise would do, so it FAILS (telling the
-// next loop to drop the guard) the moment encodeValuePG becomes PG-faithful.
-func TestBuildPGIndexKeyDescRefusesNonPGImages(t *testing.T) {
-	for _, typ := range []string{"numeric"} {
-		tbl := keyDescTable(col("k", typ))
-		idx := &catalog.Index{Name: "i", Table: tbl, Method: "btree", Columns: []string{"k"}}
-		if _, err := buildPGIndexKeyDesc(idx); err == nil {
-			t.Errorf("%s: descriptor built, but goopg's stored image is not PostgreSQL's", typ)
-		} else if !strings.Contains(err.Error(), "not PostgreSQL's") {
-			t.Errorf("%s: refused for the wrong reason: %v", typ, err)
-		}
-	}
-
-	// numeric: the ascending values below must NOT come out ascending under the
-	// real numeric comparator, because the images are ASCII.
+// Every type in the B2-a ordering table above is there on the promise that
+// goopg's STORED image is PostgreSQL's — a descriptor is that promise, and the
+// 3b-2a comparators were written under it. Two types once failed it and were
+// fixed by M0119-0006 storage slices (uuid: 16-byte pg_uuid_t instead of the
+// 36-char text; numeric: base-10000 NumericData instead of the decimal
+// string), so `pgIndexKeyImageIsPGFaithful` refuses nothing today.
+//
+// This test is the inverse guard the old refusal test became: it fails on a
+// REGRESSION back to a convenience image, which would mis-ORDER an index
+// rather than error.
+func TestPGIndexKeyImagesStayPGFaithful(t *testing.T) {
+	// numeric: the image must be a decodable NumericData, not ASCII. Two
+	// properties no byte comparison of the text form can have — "-1000" sorts
+	// above "0" bytewise, and "1.00" is not byte-equal to "1" — pin it.
 	numType := catalog.Type{Name: "numeric"}
-	ascending := []Datum{NewNumericInt64Datum(-1000, 0), NewNumericInt64Datum(-1, 0), NewNumericInt64Datum(0, 0), NewNumericInt64Datum(1, 0)}
-	imgs := make([][]byte, len(ascending))
-	for i, d := range ascending {
-		img, err := encodeValuePG(numType, d)
+	numImg := func(mant int64, scale int16) []byte {
+		img, err := encodeValuePG(numType, NewNumericInt64Datum(mant, scale))
 		if err != nil {
-			t.Fatalf("encodeValuePG(numeric): %v", err)
+			t.Fatalf("encodeValuePG(numeric %d/%d): %v", mant, scale, err)
 		}
-		imgs[i] = img
+		return img
 	}
-	ordered := true
-	for i := range imgs[:len(imgs)-1] {
-		if btree.PGCompareNumeric(imgs[i], imgs[i+1]) >= 0 {
-			ordered = false
-		}
+	if c := btree.PGCompareNumeric(numImg(-1000, 0), numImg(0, 0)); c >= 0 {
+		t.Errorf("PGCompareNumeric(-1000, 0) = %d, want < 0 — the image looks like ASCII text again", c)
 	}
-	if ordered {
-		t.Errorf("PGCompareNumeric now orders goopg's numeric images correctly — encodeValuePG appears to emit PG's " +
-			"base-10000 NumericData, so drop numeric from pgIndexKeyImageIsPGFaithful and re-add it to the ordering table")
+	if c := btree.PGCompareNumeric(numImg(5, 1), numImg(1, 0)); c >= 0 {
+		t.Errorf("PGCompareNumeric(0.5, 1) = %d, want < 0 — the image looks like ASCII text again", c)
+	}
+	// dscale is display-only: 1.00 = 1, though the two images differ byte for
+	// byte (different dscale, and a digit array of one element either way).
+	if c := btree.PGCompareNumeric(numImg(100, 2), numImg(1, 0)); c != 0 {
+		t.Errorf("PGCompareNumeric(1.00, 1) = %d, want 0 (numeric_cmp ignores dscale)", c)
+	}
+	if bytes.Equal(numImg(100, 2), numImg(1, 0)) {
+		t.Errorf("1.00 and 1 encode to identical bytes; the equality above proves nothing")
+	}
+	// And the mapper must now DESCRIBE a numeric index (it refused before).
+	numIdx := &catalog.Index{Name: "i", Table: keyDescTable(col("k", "numeric")), Method: "btree", Columns: []string{"k"}}
+	if _, err := buildPGIndexKeyDesc(numIdx); err != nil {
+		t.Errorf("numeric index refused: %v", err)
 	}
 
-	// uuid's guard is the inverse now: the image MUST stay 16 bytes, because the
+	// uuid's guard: the image MUST stay 16 bytes, because the
 	// ordering table above hands it to PGCompareUUID under an attlen-16
 	// descriptor. A regression back to text storage would make the descriptor a
 	// 16-byte window onto a 37-byte varlena — the first 15 characters of the

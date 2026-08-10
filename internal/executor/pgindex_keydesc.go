@@ -184,28 +184,23 @@ func pgIndexCollationOrderable(name string) bool {
 // the comparator a 16-byte window onto a 37-byte text varlena, i.e. the first
 // 15 characters of the UUID's text.
 //
-// One type still fails it:
+// numeric was the last one, and the M0119-0006 numeric-column storage slice
+// closed it the same way: `encodeValuePG` now writes PG's base-10000
+// NumericData (weight/sign/dscale + NBASE digits) instead of the decimal
+// string, so `PGCompareNumeric` decodes a real n_header instead of falling
+// back to bytes.Compare over ASCII — which used to order "-1000" above "0" and
+// "0.5" above "1", a mis-ORDERED index, exactly the failure mode this mapper
+// exists to make unreachable. The B2-a ledger row is closed with it.
 //
-//   - numeric: `encodeValuePG` stores the DECIMAL STRING as a text varlena, not
-//     PG's base-10000 NumericData (weight/sign/dscale + NBASE digits). Fed that,
-//     `PGCompareNumeric` cannot decode a numeric header and falls back to
-//     bytes.Compare over ASCII, which orders "-1000" above "0" and "0.5" above
-//     "1" — a mis-ORDERED index, exactly the failure mode this mapper exists to
-//     make unreachable.
-//
-// It is a heap-side divergence (a real PG 18.3 reading a goopg user table with
-// a numeric column already misreads it), not an index-side one, so the fix
-// belongs to `encodeValuePG` and is a codec change with its own gate list —
-// the same shape the uuid flip took. Until then a numeric index keeps the
-// pre-S11.4 blob key path, which orders it correctly because goopg's blob
-// encoding is order-preserving over its own image. See the deferral ledger row
-// for M0130-S11.4 B2-a.
+// No type fails the test today. The function stays (rather than the callers
+// dropping it) because it is the guard the next divergence has to trip: a type
+// whose heap image is goopg's convenience form must be refused here BEFORE a
+// descriptor promises a comparator can order it.
 func pgIndexKeyImageIsPGFaithful(typOID uint32) bool {
 	switch typOID {
-	case catalog.OIDNumeric:
-		return false
+	default:
+		return true
 	}
-	return true
 }
 
 // findColumnByName resolves an index key column name against its table,

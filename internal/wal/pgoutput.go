@@ -34,6 +34,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -490,6 +491,25 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 			out = append(out, hexdigits[data[i]>>4], hexdigits[data[i]&0x0f])
 		}
 		return out, 16, nil
+	case "numeric", "decimal":
+		// Sibling of executor.encodeValuePG's "numeric" arm: PG's base-10000
+		// NumericData behind a varlena header. Before numeric columns gained
+		// that layout the varlena fall-through below returned the stored
+		// decimal string and happened to be right; it would now ship the raw
+		// digit array to the subscriber as if it were text, WITHOUT erroring —
+		// the same silent-garbage shape the uuid slice found here.
+		// pgnodes.NumericTextFromStoredPayload renders numeric_out's text and
+		// also accepts the pre-flip payload, so replication out of a cluster
+		// that predates the flip keeps working. M0119-0006.
+		payload, n, err := pgoDecodePhysicalVarlena(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		s, err := pgnodes.NumericTextFromStoredPayload(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		return []byte(s), n, nil
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.

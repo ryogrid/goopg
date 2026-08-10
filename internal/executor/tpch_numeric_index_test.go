@@ -1,10 +1,8 @@
 package executor
 
 import (
-	"math/big"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/testutil/tpch"
@@ -78,17 +76,11 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 
 	// Sanity-check one of the indexes via a direct btree.Search so
 	// the bytes line up between backfill and a fresh probe.
-	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "orders_pk"})
-	if !ok {
-		t.Fatal("orders_pk missing from catalog after CREATE INDEX")
-	}
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatalf("btree.Open(orders_pk): %v", err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "orders_pk")
 	// SampleInserts inserts orders 1..8 with NUMERIC o_orderkey.
 	for _, k := range []int64{1, 4, 8} {
-		if _, found, err := tree.Search(btree.EncodeNumericKey(big.NewInt(k), 0)); err != nil || !found {
+		key := indexProbeForTest(t, ctx, idx, NewNumericInt64Datum(k, 0))
+		if _, found, err := tree.Search(key); err != nil || !found {
 			t.Errorf("orders_pk search o_orderkey=%d: found=%v err=%v", k, found, err)
 		}
 	}
