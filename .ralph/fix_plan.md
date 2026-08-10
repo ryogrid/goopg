@@ -1082,15 +1082,30 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               goopg's btree redo offset-based like upstream's
               `btree_xlog_insert` (`PageAddItem` at `xlrec->offnum`), which
               removes the need for a comparator in redo at all.
-        - [ ] **3b-2c-ii-B2-b-iii — amcheck takes the format**. Blocker for
-              B2-c. Thread `btree.IndexFormat` from
-              `operators_bt_index_check.go:evalBtIndexCheck` (it already has
-              `keyFmt`) through the five `internal/amcheck` tier signatures —
-              exactly as `cmpKeys amcheck.KeyComparator` is threaded today —
-              and delete `amcheck.blobIndexFormat`. Mechanical; ~100 test call
-              sites update with it. Without it a flipped index is verified with
-              the blob decoder, i.e. every amcheck tier reads the tuple header
-              as key payload.
+        - [x] **3b-2c-ii-B2-b-iii — amcheck takes the format** (2026-08-10).
+              The five `internal/amcheck` tiers (`VerifyBtreeItemOrderCmp`,
+              `VerifyBtreeParentDownlinks`, `VerifyBtreeUnique`,
+              `CollectBtreeLeafEntries`,
+              `VerifyBtreeHeapAllIndexedRelation`) plus the shared
+              `leftmostLeafBlock` descent take a `btree.IndexFormat` from their
+              caller, exactly as `cmpKeys amcheck.KeyComparator` is threaded;
+              `amcheck.blobIndexFormat` is gone and
+              `operators_bt_index_check.go` passes its already-resolved
+              `keyFmt` down. Guard:
+              `internal/amcheck/verify_nbtree_tupleformat_test.go` (real
+              400-key tuple-format tree with splits — whole index tuples out of
+              the leaf walk, zero keys agreeing with the blob decode, clean
+              item-order tier under format + descriptor comparator).
+        - [ ] **3b-2c-ii-B2-b-iv — the parent-downlink comparator**. Blocker
+              for B2-c, discovered by B2-b-iii.
+              `amcheck.VerifyBtreeParentDownlinks` evaluates its down-link
+              lower bound with `btree.CompareKeys` and takes no
+              `KeyComparator` at all, so under the flip it byte-compares whole
+              index tuples (and today it misses opclass damage that the
+              item-order tier catches — upstream routes EVERY comparison
+              through the index's support function 1, verify_nbtree.c's
+              `bt_child_check` → `invariant_l_nontarget_offset`). Add the
+              parameter alongside the format `btIndexVerify` already holds.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same

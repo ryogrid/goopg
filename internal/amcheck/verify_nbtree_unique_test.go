@@ -38,7 +38,7 @@ func TestVerifyBtreeUnique_DistinctKeysClean(t *testing.T) {
 			le{k(2), 10, 2},
 			le{k(3), 10, 3}),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestVerifyBtreeUnique_DuplicateBothVisible(t *testing.T) {
 			le{k(1), 10, 7},
 			le{k(3), 10, 3}),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestVerifyBtreeUnique_DuplicateOneVisibleClean(t *testing.T) {
 			le{k(1), 10, 1},
 			le{k(1), 10, 7}),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil,
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil,
 		visibleTIDs(storage.ItemPointer{Block: 10, Offset: 7}))
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
@@ -109,7 +109,7 @@ func TestVerifyBtreeUnique_DuplicateAcrossLeafBoundary(t *testing.T) {
 		2: makeLeafPage(t, 3, le{k(1), 20, 1}, le{k(5), 20, 2}),
 		3: makeLeafPage(t, none, le{k(5), 21, 1}, le{k(7), 21, 2}),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestVerifyBtreeUnique_RunResetsOnKeyChange(t *testing.T) {
 			le{k(2), 10, 2},
 			le{k(1), 10, 3}),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestVerifyBtreeUnique_HonoursKeyComparator(t *testing.T) {
 			le{k(2), 10, 2}),
 	}
 	allEqual := func(a, b []byte) int { return 0 }
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", allEqual, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, allEqual, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique: %v", err)
 	}
@@ -176,11 +176,11 @@ func TestVerifyBtreeUnique_EdgeCases(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		btree.MetaBlock: makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion),
 	}
-	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, allVisible())
+	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil || len(got) != 0 {
 		t.Fatalf("empty tree: got %d findings, err %v; want 0, nil", len(got), err)
 	}
-	if _, err := VerifyBtreeUnique(mapSource(pages), "uidx", nil, nil); err == nil {
+	if _, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, nil); err == nil {
 		t.Fatal("nil visibility function accepted; want an error")
 	}
 }
@@ -190,11 +190,11 @@ func TestVerifyBtreeUnique_EdgeCases(t *testing.T) {
 // each entry's slot — the coordinates the duplicate detail prints.
 func TestPageLeafItemsMatchesLeafEntries(t *testing.T) {
 	p := makeLeafPage(t, none, le{k(1), 10, 1}, le{k(2), 10, 2}, le{k(3), 11, 5})
-	items, err := blobIndexFormat.PageLeafItems(p)
+	items, err := blobFmt.PageLeafItems(p)
 	if err != nil {
 		t.Fatalf("PageLeafItems: %v", err)
 	}
-	entries, err := blobIndexFormat.PageLeafEntries(p)
+	entries, err := blobFmt.PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	}

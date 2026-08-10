@@ -121,7 +121,7 @@ func leftmostByLevel(t *testing.T, src amcheck.PageSource, root storage.BlockNum
 		if op.IsLeaf() {
 			return out
 		}
-		dls, err := (btree.IndexFormat{}).PageDownlinks(p)
+		dls, err := blobFmt.PageDownlinks(p)
 		if err != nil {
 			t.Fatalf("PageDownlinks(blk %d): %v", blk, err)
 		}
@@ -180,8 +180,8 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 		if op.IsLeaf() || op.IsDeleted() {
 			continue
 		}
-		if r := amcheck.VerifyBtreeParentDownlinks(src, blk, name); r != nil {
-			t.Fatalf("VerifyBtreeParentDownlinks(internal blk %d) false positive: %+v", blk, r)
+		if r := amcheck.VerifyBtreeParentDownlinks(src, blk, name, blobFmt); r != nil {
+			t.Fatalf("VerifyBtreeParentDownlinks(internal blk %d, blobFmt) false positive: %+v", blk, r)
 		}
 	}
 
@@ -190,7 +190,7 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 	// zero "lacks matching index tuple" findings — every entry fingerprints and
 	// probes to the same value through fingerprintLeafEntry (sibling-path
 	// invariant on real leaf bytes).
-	leaves, err := amcheck.CollectBtreeLeafEntries(src)
+	leaves, err := amcheck.CollectBtreeLeafEntries(src, blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -201,7 +201,7 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 	if r := amcheck.VerifyBtreeHeapAllIndexed(leaves, leaves, name, tbl, seed); r != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexed round-trip false positive: %+v", r)
 	}
-	if rr, err := amcheck.VerifyBtreeHeapAllIndexedRelation(src, leaves, name, tbl, seed); err != nil {
+	if rr, err := amcheck.VerifyBtreeHeapAllIndexedRelation(src, blobFmt, leaves, name, tbl, seed); err != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation: %v", err)
 	} else if rr != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation false positive: %+v", rr)
@@ -771,7 +771,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	// iteration (TID.Offset == i+1) — a cluster would point at a specific
 	// eviction/flush window rather than a uniformly-random race.
 	src := realPageSource(t, pool, rel)
-	actual, err := amcheck.CollectBtreeLeafEntries(src)
+	actual, err := amcheck.CollectBtreeLeafEntries(src, blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -1180,7 +1180,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				// `present` map lookup itself is the bug, not the tree).
 				if p, perr := src(last.Block); perr == nil {
 					op := btree.ParseOpaque(p)
-					entries, eerr := (btree.IndexFormat{}).PageLeafEntries(p)
+					entries, eerr := blobFmt.PageLeafEntries(p)
 					var sameKey []btree.LeafEntry
 					if eerr == nil {
 						for _, le := range entries {

@@ -59,20 +59,17 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// blobIndexFormat is the on-page key format every amcheck tier decodes pages
-// with. It is btree's blob format — goopg's opaque order-preserving key
-// payloads — which is correct for every index today (M0130-S11.4's writers
-// have not flipped; internal/executor's pgIndexTupleKeys is false).
-//
-// It is named once, here, because it is a CLAIM the tiers cannot yet check:
-// the format is a per-index catalog property (btree.IndexFormatFor), and the
-// tiers take an indexName, not an index. Threading the format down from
-// internal/executor's bt_index_check — which does hold the catalog entry, and
-// already resolves the sibling per-index property (the opclass KeyComparator)
-// exactly that way — is slice 3b-2c-ii-B2-b-iii, and has a ledger row. Until
-// then a descriptor-ordered index would be verified under the wrong decoder,
-// which is why the flip (B2-c) cannot land before that threading does.
-var blobIndexFormat = btree.IndexFormat{}
+// The on-page key format is a per-index catalog property, exactly like the
+// opclass KeyComparator below: an index whose keys are stored as PG index
+// tuples (a key descriptor resolved by btree.IndexFormatFor) must be decoded by
+// the tuple decoder, and one whose keys are goopg's opaque order-preserving
+// blobs by the blob decoder. Neither is derivable from the page bytes, and the
+// tiers take an indexName, not an index — so every tier that decodes keys takes
+// a btree.IndexFormat from its caller, which internal/executor's bt_index_check
+// resolves from the catalog entry (ctx.pgIndexKeyDesc) the same way it resolves
+// the comparator. The zero IndexFormat is the blob format, which is what the
+// page-bytes-only convenience wrappers and tests pass.
+// M0130-S11.4 slice 3b-2c-ii-B2-b-iii.
 
 // BtreeReport is one B-tree index corruption finding. Block is the 0-based
 // block number the corruption was found on; Msg is the upstream-matching
@@ -217,8 +214,11 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 // metapage and deleted pages hold no orderable items and yield nil. A page whose
 // items cannot be decoded surfaces as a finding, never a Go error, matching the
 // report-and-continue model of the heap engine.
+// It decodes the page under the blob key format (the zero btree.IndexFormat);
+// a caller holding the index's catalog entry must use VerifyBtreeItemOrderCmp
+// and pass the resolved format.
 func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName string) []BtreeReport {
-	return VerifyBtreeItemOrderCmp(p, blkno, indexName, nil)
+	return VerifyBtreeItemOrderCmp(p, blkno, indexName, btree.IndexFormat{}, nil)
 }
 
 // KeyComparator compares two encoded index keys, returning <0, 0 or >0 exactly
@@ -240,11 +240,13 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 // column uses a built-in operator class. M0119-0006 (005_opclass_damage).
 type KeyComparator func(a, b []byte) int
 
-// VerifyBtreeItemOrderCmp is VerifyBtreeItemOrder with an explicit key
-// comparator (see KeyComparator). Both invariants — high key and item order —
-// are evaluated under it, matching upstream where a single opclass comparator
-// governs every key comparison amcheck performs on the index.
-func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, cmpKeys KeyComparator) []BtreeReport {
+// VerifyBtreeItemOrderCmp is VerifyBtreeItemOrder with the index's two catalog
+// properties supplied explicitly: keyFmt is the on-page key format the page is
+// decoded under (see the note above KeyComparator's block), and cmpKeys the key
+// comparator. Both invariants — high key and item order — are evaluated under
+// the comparator, matching upstream where a single opclass comparator governs
+// every key comparison amcheck performs on the index.
+func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
 	if cmpKeys == nil {
 		cmpKeys = btree.CompareKeys
 	}
@@ -258,7 +260,7 @@ func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexNam
 		return nil
 	}
 
-	keys, err := blobIndexFormat.PageItemKeys(p)
+	keys, err := keyFmt.PageItemKeys(p)
 	if err != nil {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
@@ -269,7 +271,7 @@ func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexNam
 	// item from above. This mirrors the engine's keyExceedsHighKey gating
 	// (rightmost pages have no high key to honour). PageItemKeys returns DATA
 	// item keys only, so the separator is never compared against itself.
-	highKey, checkHighKey, hkErr := blobIndexFormat.PageHighKey(p)
+	highKey, checkHighKey, hkErr := keyFmt.PageHighKey(p)
 	if hkErr != nil {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, hkErr)}}
@@ -460,7 +462,7 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 // conclusive. A leaf or deleted parentBlk (no downlinks to descend) and the
 // metapage yield nil. It performs only the cross-level checks; per-page
 // structure and key order are run separately and composed by the SQL surface.
-func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string) []BtreeReport {
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt btree.IndexFormat) []BtreeReport {
 	if parentBlk == btree.MetaBlock {
 		return nil
 	}
@@ -478,7 +480,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		return nil
 	}
 
-	downlinks, err := blobIndexFormat.PageDownlinks(parent)
+	downlinks, err := keyFmt.PageDownlinks(parent)
 	if err != nil {
 		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
@@ -508,7 +510,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		// Down-link lower bound: every real child key must be >= the parent's
 		// separator key for this child. Skip the child's negative-infinity item
 		// (the first item of an internal child, stored with the empty key).
-		keys, err := blobIndexFormat.PageItemKeys(child)
+		keys, err := keyFmt.PageItemKeys(child)
 		if err != nil {
 			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}

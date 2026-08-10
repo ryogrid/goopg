@@ -71,7 +71,8 @@ type lastVisibleEntry struct {
 }
 
 // VerifyBtreeUnique runs the checkunique tier over the whole leaf level of the
-// index rooted at src's metapage. cmpKeys selects the ordering the equality test
+// index rooted at src's metapage. keyFmt is the index's on-page key format (the
+// zero value is the blob format); cmpKeys selects the ordering the equality test
 // is performed under (nil ⇒ btree.CompareKeys, the built-in operator-class
 // order); visible supplies heap visibility. Callers must invoke it only for an
 // index that actually declares UNIQUE — upstream gates on
@@ -80,7 +81,7 @@ type lastVisibleEntry struct {
 // It returns at most one finding (the first duplicate is conclusive) and a Go
 // error only for a genuine read/decode failure of the leaf level, which the SQL
 // surface reports rather than silently treating as a clean index.
-func VerifyBtreeUnique(src PageSource, indexName string, cmpKeys KeyComparator, visible HeapVisibilityFunc) ([]BtreeReport, error) {
+func VerifyBtreeUnique(src PageSource, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator, visible HeapVisibilityFunc) ([]BtreeReport, error) {
 	if src == nil {
 		return nil, fmt.Errorf("amcheck: nil page source")
 	}
@@ -101,7 +102,7 @@ func VerifyBtreeUnique(src PageSource, indexName string, cmpKeys KeyComparator, 
 	if meta.Root == btree.MetaBlock || meta.Root == storage.InvalidBlockNumber {
 		return nil, nil // no key level: vacuously unique
 	}
-	leftmost, err := leftmostLeafBlock(src, meta.Root)
+	leftmost, err := leftmostLeafBlock(src, meta.Root, keyFmt)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func VerifyBtreeUnique(src PageSource, indexName string, cmpKeys KeyComparator, 
 			current = opaque.Next
 			continue
 		}
-		items, err := blobIndexFormat.PageLeafItems(p)
+		items, err := keyFmt.PageLeafItems(p)
 		if err != nil {
 			return nil, fmt.Errorf("amcheck: decoding leaf block %d: %w", current, err)
 		}

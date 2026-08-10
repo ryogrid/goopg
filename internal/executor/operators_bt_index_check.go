@@ -149,7 +149,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 		// bt_entry_unique_check from inside bt_target_page_check, which never
 		// runs once an earlier per-page invariant has ereport(ERROR)ed.
 		var ureports []amcheck.BtreeReport
-		ureports, err = btIndexCheckUnique(x, row, ctx, idx, src, parentCheck, cmpKeys)
+		ureports, err = btIndexCheckUnique(x, row, ctx, idx, src, parentCheck, cmpKeys, keyFmt)
 		reports = append(reports, ureports...)
 	}
 	if err != nil {
@@ -179,7 +179,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			return nil, err
 		}
 		reports = append(reports, amcheck.VerifyBtreePage(p, blk, name)...)
-		reports = append(reports, amcheck.VerifyBtreeItemOrderCmp(p, blk, name, cmpKeys)...)
+		reports = append(reports, amcheck.VerifyBtreeItemOrderCmp(p, blk, name, keyFmt, cmpKeys)...)
 	}
 
 	// A tree with only the metapage (an empty index, or none) has no key levels
@@ -213,7 +213,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			if op.IsLeaf() || op.IsDeleted() {
 				continue
 			}
-			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name)...)
+			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name, keyFmt)...)
 		}
 	}
 	return reports, nil
@@ -238,7 +238,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 // a snapshot in Context there is nothing to judge liveness against, so the tier
 // is skipped rather than answered wrongly. M0119-0006.
 func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog.Index,
-	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator,
+	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat,
 ) ([]amcheck.BtreeReport, error) {
 	argIdx := 2
 	if parentCheck {
@@ -278,7 +278,7 @@ func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog
 		return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
 			ctx.comboStore(), ctx.MultiXact)
 	}
-	return amcheck.VerifyBtreeUnique(src, idx.Name, cmpKeys, visible)
+	return amcheck.VerifyBtreeUnique(src, idx.Name, keyFmt, cmpKeys, visible)
 }
 
 // btIndexOpClassComparator returns the operator-class key comparator to verify

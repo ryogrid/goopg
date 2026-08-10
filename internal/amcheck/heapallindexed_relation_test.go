@@ -35,7 +35,7 @@ func makeLeafPage(t *testing.T, next storage.BlockNumber, entries ...le) storage
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	got, err := blobIndexFormat.PageLeafEntries(p)
+	got, err := blobFmt.PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("makeLeafPage PageLeafEntries self-check: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestCollectBtreeLeafEntries_SingleRootLeaf(t *testing.T) {
 			le{k(2), 10, 2},
 			le{k(3), 11, 5}),
 	}
-	got, err := CollectBtreeLeafEntries(mapSource(pages))
+	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestCollectBtreeLeafEntries_MultiLevel(t *testing.T) {
 		2: makeLeafPage(t, 3, le{k(1), 20, 1}, le{k(2), 20, 2}),
 		3: makeLeafPage(t, none, le{k(5), 21, 1}, le{k(7), 21, 2}),
 	}
-	got, err := CollectBtreeLeafEntries(mapSource(pages))
+	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestCollectBtreeLeafEntries_NoKeyLevel(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		btree.MetaBlock: makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion), // Root left 0
 	}
-	got, err := CollectBtreeLeafEntries(mapSource(pages))
+	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestCollectBtreeLeafEntries_EmptyLeaf(t *testing.T) {
 		btree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeLeafPage(t, none),
 	}
-	got, err := CollectBtreeLeafEntries(mapSource(pages))
+	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestCollectBtreeLeafEntries_DeletedLeafSkipped(t *testing.T) {
 		2:               makeDeletedLeaf(t, 3),
 		3:               makeLeafPage(t, none, le{k(9), 31, 1}),
 	}
-	got, err := CollectBtreeLeafEntries(mapSource(pages))
+	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestCollectBtreeLeafEntries_SiblingCycle(t *testing.T) {
 		1:               makeLeafPage(t, 2, le{k(1), 40, 1}),
 		2:               makeLeafPage(t, 1, le{k(2), 40, 2}), // points back to 1
 	}
-	_, err := CollectBtreeLeafEntries(mapSource(pages))
+	_, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err == nil {
 		t.Fatal("expected error on sibling cycle, got nil")
 	}
@@ -191,7 +191,7 @@ func TestCollectBtreeLeafEntries_DescentReadError(t *testing.T) {
 		btree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeInternalPage(t, 1, none, dl{nil, 2}), // child 2 absent from map
 	}
-	_, err := CollectBtreeLeafEntries(mapSource(pages))
+	_, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err == nil {
 		t.Fatal("expected error on missing child block, got nil")
 	}
@@ -211,7 +211,7 @@ func TestVerifyBtreeHeapAllIndexedRelation_Clean(t *testing.T) {
 		{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}},
 		{Key: k(2), TID: storage.ItemPointer{Block: 10, Offset: 2}},
 	}
-	reports, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), heap, "ix", "tbl", 0x9e3779b97f4a7c15)
+	reports, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), blobFmt, heap, "ix", "tbl", 0x9e3779b97f4a7c15)
 	if err != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestVerifyBtreeHeapAllIndexedRelation_MissingEntry(t *testing.T) {
 		{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}}, // present
 		{Key: k(2), TID: storage.ItemPointer{Block: 12, Offset: 7}}, // absent
 	}
-	reports, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), heap, "ix", "tbl", 0x9e3779b97f4a7c15)
+	reports, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), blobFmt, heap, "ix", "tbl", 0x9e3779b97f4a7c15)
 	if err != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestVerifyBtreeHeapAllIndexedRelation_IndexWalkError(t *testing.T) {
 		btree.MetaBlock: makeMetaWithRoot(t, 1), // block 1 absent → read error
 	}
 	heap := []btree.LeafEntry{{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}}}
-	_, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), heap, "ix", "tbl", 1)
+	_, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), blobFmt, heap, "ix", "tbl", 1)
 	if err == nil {
 		t.Fatal("expected error on unreadable index, got nil")
 	}

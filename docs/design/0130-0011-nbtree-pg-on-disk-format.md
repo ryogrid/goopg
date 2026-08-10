@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii/-iii, 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-iii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii, 3b-2c-ii-B2-b-iv (parent-downlink comparator), 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -613,6 +613,35 @@ sources agree:
             does not merely lose precision, it strips the header the comparison
             and amcheck read, so the tree would be verified with the wrong
             decoder and replayed into the wrong slot.
+          - **3b-2c-ii-B2-b-iii — amcheck takes the format (landed
+            2026-08-10). No on-disk change, no REINDEX.** The five
+            `internal/amcheck` tiers that decode key bytes —
+            `VerifyBtreeItemOrderCmp`, `VerifyBtreeParentDownlinks`,
+            `VerifyBtreeUnique`, `CollectBtreeLeafEntries` and
+            `VerifyBtreeHeapAllIndexedRelation` (plus the internal
+            `leftmostLeafBlock` descent they share) — take a
+            `btree.IndexFormat` from their caller, exactly as
+            `cmpKeys amcheck.KeyComparator` is threaded, and
+            `amcheck.blobIndexFormat` is gone. `internal/executor`'s
+            `bt_index_check` already resolved the format in B2-b and now passes
+            it down through `btIndexVerify` and `btIndexCheckUnique`, so the
+            one caller that holds a catalog entry resolves for real and every
+            other caller (page-bytes-only tests, the `VerifyBtreeItemOrder`
+            convenience wrapper) states the blob choice explicitly as the zero
+            `IndexFormat`. Guard:
+            `internal/amcheck/verify_nbtree_tupleformat_test.go` builds a REAL
+            400-key tuple-format tree with splits and asserts the leaf-walk
+            collector under the resolved format returns whole index tuples
+            (`PGIndexTupleSize` == len, `PGIndexTupleTID` == the reported TID),
+            that NOT ONE of those keys decodes identically under the blob
+            format, and that the item-order tier finds the tree clean when it
+            is given the format together with the descriptor's comparator —
+            because a tier that agreed with either decoder would make the
+            parameter decorative.
+            Discovered and deferred here: `VerifyBtreeParentDownlinks` compares
+            its down-link lower bound with `btree.CompareKeys` and takes no
+            comparator at all, so under the flip it would byte-compare whole
+            index tuples. It has its own ledger row and is a B2-c prerequisite.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
