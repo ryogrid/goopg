@@ -1,47 +1,48 @@
-Task: M0130-S11.1 (PG nbtree format layer) — DONE and committed.
+Task: M0130-S11.2a (nbtree page-shape primitives) — DONE and committed.
 
-What changed the plan this loop: M-NIGHTLY AI-20260810-011258-003's remaining
-blockers (#10 relhasindex, #12 private btree page format) are a milestone-sized
-on-disk-format conversion, not triage work. They were promoted out of the
-M-NIGHTLY item into a new **M0130 Theme D (M0130-S11.1 .. S11.6)** with a design
-doc, and S11.1 landed.
+S11.2 was split this loop: the primitives (additive, independently testable)
+landed as S11.2a; the on-disk flip is now S11.2b and is the next task.
 
 Landed:
-- `internal/access/btree/pgformat.go` — upstream 16-byte `BTPageOpaqueData` +
-  48-byte `BTMetaPageData` codecs, `BTP_*` flags, `P_NONE`, `InitPGBTPage`
-  (`_bt_pageinit`), `InitPGMetaPage` (`_bt_initmetapage`), `CheckPGBTPage`
-  (Go `_bt_checkpage`). Additive — legacy 272-byte layout in `btree.go` untouched.
-- `internal/access/btree/pgformat_test.go` — 7 guards. Both padding clears
-  (alignment hole at struct offset 28, 7-byte tail after `btm_allequalimage`)
-  mutation-verified.
-- `docs/design/0130-0011-nbtree-pg-on-disk-format.md` (draft) + README row.
-- fix_plan: Theme D slices; AI-003 annotated "CLOSED BY S11.6". Ledger: 1 row.
+- `internal/storage/linepointer.go` — `PageReserveLinePointer` (the `pd_lower`
+  bump in `_bt_blnewpage`) and `PageDeleteLinePointerAt` (`_bt_slideleft`).
+  goopg had neither: `PageAddItemRaw` always allocates payload and
+  `PageRemoveHeapTuple` blanks a slot in place instead of sliding the array.
+- `internal/access/btree/pgpage.go` — `P_HIKEY`/`P_FIRSTKEY`, `PGFirstDataKey`
+  (`P_FIRSTDATAKEY`), the `pgXxx(p, dataSlot)` accessor wrappers, `PGHighKeyRaw`
+  / `pgSetHighKeyRaw` / `pgPromoteToNonRightmost`, `pgReserveHiKeySlot` /
+  `pgSlideLeft`, `pgSibling`/`legacySibling`, `pgFlags`.
+- Tests: `pgpage_test.go` (8), `linepointer_test.go` (3). The `P_FIRSTDATAKEY`
+  bias is mutation-verified (forcing it to 1 fails 3 tests).
+- Design doc §S11.2 now fixes the flip mechanism; fix_plan S11.2a[x]/S11.2b[ ];
+  1 ledger row.
 
 Key facts for the next loop (do not re-derive):
-- Layout verified twice: a `sizeof`/`offsetof` probe compiled with
-  `gcc -Ipostgres/src/include`, and a byte golden from a metapage a real PG 18.3
-  wrote — block 0 of an empty catalog index under
-  `bench/tpch/runtime/pgdata/base/1` (135 such files; find them by
-  `pd_special == 8176 && magic == 0x53162`). No PG server needed.
-- Already PG-correct in goopg and must NOT be "fixed": `BTREE_MAGIC` 0x053162,
-  `BTREE_VERSION` 4, the 24-byte page header, and the line-pointer array
-  (`storage.PageInsertItemRawAt`).
-- Trap: `InitPGMetaPage` zeroes the page via `storage.InitPage`, so a
-  stale-padding test written against it is vacuous — call `WritePGMetaPage`
-  directly on a dirty buffer.
+- Upstream has NO "has high key" flag — `P_FIRSTDATAKEY` keys off `P_RIGHTMOST`
+  and 0x0008 is `BTP_META`. So `BTHasHighKey` is DELETED in the flip, and
+  `HasHighKey()` becomes `!IsRightmost()`. Deleting the constant is the trick
+  that makes the compiler enumerate all ~25 real high-key sites.
+- Sibling link and high key must be written in the same critical section: the
+  wrappers read the rightmost bit off the page, so between the two writes the
+  page's own accessors disagree about where its data starts.
+- Bulk load: reserve `P_HIKEY` at page creation, fill from `P_FIRSTKEY`, and
+  slide it away if the page ends up rightmost (nbtsort.c lines ~627, ~677-700).
+- Call-site inventory for the flip: 45 `storage.PageXxx(` calls in
+  `internal/access/btree/*.go` + `internal/amcheck/*.go`; ~25 non-comment
+  `HighKey` sites; 65 `InvalidBlockNumber` sites. External `ParseOpaque`
+  consumers: `internal/amcheck/{verify_nbtree,verify_nbtree_unique,
+  heapallindexed_relation}.go`, `internal/executor/operators_bt_index_check.go`.
 
-Next step: M0130-S11.2 (page shape) — switch `readOpaque`/`writeOpaque`/
-`ParseOpaque` in `internal/access/btree/btree.go` to `Read/WritePGOpaque`, move
-the HighKey out of the opaque to a `P_HIKEY` item at offset 1, and translate
-`InvalidBlockNumber`→`P_NONE` plus the flag bits in the SAME edit. Sibling
-readers that must move in lockstep: `internal/amcheck`, `replay.go`; other
-writers: `bulkload.go`, `btree_vacuum.go`. Breaks every existing index on disk
-(REINDEX) — say so in the commit message. Re-read the fix_plan banner first.
+Next step: M0130-S11.2b — the flip, in ONE commit. Start by deleting
+`BTHasHighKey` and the `HighKey` field from `BTPageOpaque` in btree.go and let
+the build errors drive the edit; commit message must say every existing index
+needs REINDEX. Re-read the fix_plan banner first.
 
-Gates run: `go build ./...` clean; `go vet ./internal/access/btree/` clean;
-`go test ./internal/access/btree/` PASS (2.3 s);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(initdb 60.2 s, wal 8.3 s, rest cached-green); `make ralph-state-guard` OK
-(auto-repaired the stale completed marker); commit-hook pgbench smoke — see status.
+Gates run: `go build ./...` clean; `go vet ./internal/storage/
+./internal/access/btree/` clean; `go test ./internal/access/btree/
+./internal/storage/` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (initdb 59.7 s, wal 8.3 s, rest
+cached-green); `make ralph-state-guard` OK; commit-hook pgbench smoke — see
+status.
 
 In-flight: none.

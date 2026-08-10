@@ -112,6 +112,54 @@ sources agree:
   Writers: `btree.go` (split/insert/newroot), `bulkload.go`, `btree_vacuum.go`.
   Readers that must move in lockstep (sibling-path rule): `internal/amcheck`
   (`ParseOpaque` consumer) and `replay.go`.
+
+  Split into two commits, because the *primitives* the flip needs are additive
+  and testable on their own while the flip itself is all-or-nothing:
+
+  - **S11.2a — page-shape primitives (LANDED 2026-08-10).**
+    `internal/storage/linepointer.go`: `PageReserveLinePointer` and
+    `PageDeleteLinePointerAt`, the two line-pointer-array operations upstream
+    needs but goopg had no way to express (`PageAddItemRaw` always allocates
+    payload; `PageRemoveHeapTuple` blanks a slot in place instead of sliding
+    the array down, which would leave a hole where `P_FIRSTDATAKEY` is
+    expected). `internal/access/btree/pgpage.go`: `P_HIKEY`/`P_FIRSTKEY`,
+    `PGFirstDataKey` (`P_FIRSTDATAKEY`), the data-slot accessor wrappers, the
+    high-key item accessors, `pgReserveHiKeySlot`/`pgSlideLeft`, and the
+    sentinel/flag translators. Guards in `pgpage_test.go` +
+    `linepointer_test.go`; the `P_FIRSTDATAKEY` bias is mutation-verified.
+  - **S11.2b — the flip.** Point the writers and readers at those primitives in
+    one commit.
+
+  Three mechanisms decided here, so S11.2b is a mechanical edit rather than a
+  redesign:
+
+  1. **Data slots, not physical slots.** Moving the high key onto the page means
+     a line-pointer offset is no longer a data-item index — on a non-rightmost
+     page every data item shifts right by one. Instead of respelling that at
+     each of the ~45 `storage.PageXxx(p, slot)` call sites in the package (and
+     getting one wrong), S11.2b swaps them for the `pgXxx(p, slot)` wrappers,
+     which take a 1-based *data* slot and apply the `P_FIRSTDATAKEY` bias
+     themselves. Binary search, split, dedup and vacuum keep counting from 1 and
+     do not change. The wrappers read the bias from the page's own opaque rather
+     than accepting a caller-supplied one: a threaded opaque eventually goes
+     stale, and a stale rightmost bit shifts every subsequent read by one slot.
+  2. **High-key presence is derived, never flagged.** Upstream has no
+     "has high key" bit — `P_FIRSTDATAKEY` keys off `P_RIGHTMOST`, and 0x0008
+     is `BTP_META`. So `BTHasHighKey` is *deleted* in the flip, not renumbered,
+     and `HasHighKey()` becomes `!IsRightmost()`. This is why the sibling-link
+     update and the high-key write must happen in the same critical section:
+     between them the page's own accessors disagree about where its data starts.
+     `pgPromoteToNonRightmost` (rightmost page acquiring a right sibling at
+     split) and `pgSetHighKeyRaw` (replacing an existing separator) are separate
+     entry points precisely so that transition is explicit at each call site.
+  3. **Bulk load reserves `P_HIKEY` up front.** `_bt_buildadd` does not know
+     whether a page will end up rightmost until the level is finished, so
+     `_bt_blnewpage` bumps `pd_lower` by one `ItemIdData` to "make the P_HIKEY
+     line pointer appear allocated", data items start at `P_FIRSTKEY`, and a
+     page that turns out rightmost gets the placeholder removed by
+     `_bt_slideleft` (`postgres/src/backend/access/nbtree/nbtsort.c`).
+     `pgReserveHiKeySlot`/`pgSlideLeft` are the Go equivalents; `bulkload.go`'s
+     current "set the high key at flush time" shape maps onto them directly.
 - **S11.3 — metapage.** `BTreeMeta` → `PGBTMetaPage` at block 0 via S11.1's
   codec, including the `pd_lower` advance.
 - **S11.4 — tuple shape.** goopg `item` → `IndexTupleData` + null bitmap + PG

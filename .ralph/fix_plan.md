@@ -756,13 +756,28 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
       (`bench/tpch/runtime/pgdata/base/1`). Guards:
       `internal/access/btree/pgformat_test.go` (7 tests; both padding clears
       mutation-verified).
-- [ ] **M0130-S11.2 — page shape** (est ~2 loops). Switch
-      `readOpaque`/`writeOpaque`/`ParseOpaque` to the 16-byte form; move the
-      high key out of the opaque into a `P_HIKEY` item at offset 1; translate
-      the sibling sentinel (`InvalidBlockNumber` → `P_NONE`) and the flag bits
-      in the SAME edit (an intermediate that does only some is neither format).
-      Writers: `btree.go`, `bulkload.go`, `btree_vacuum.go`. Sibling readers
-      that must move in lockstep: `internal/amcheck`, `replay.go`.
+- [x] **M0130-S11.2a — page-shape primitives** (est ~1 loop). **DONE
+      (2026-08-10).** `internal/storage/linepointer.go`:
+      `PageReserveLinePointer` + `PageDeleteLinePointerAt` (upstream's
+      `_bt_blnewpage` `pd_lower` bump and `_bt_slideleft`) — the two
+      line-pointer-array operations goopg could not express.
+      `internal/access/btree/pgpage.go`: `P_HIKEY`/`P_FIRSTKEY`,
+      `PGFirstDataKey`, the data-slot accessor wrappers that hide the high key
+      from the ~45 `storage.PageXxx` call sites, the high-key item accessors
+      (`PGHighKeyRaw`, `pgSetHighKeyRaw`, `pgPromoteToNonRightmost`),
+      `pgReserveHiKeySlot`/`pgSlideLeft`, and the sentinel/flag translators.
+      Additive — no writer flipped yet. Guards: `pgpage_test.go` (8) +
+      `linepointer_test.go` (3); the `P_FIRSTDATAKEY` bias mutation-verified.
+- [ ] **M0130-S11.2b — the flip** (est ~2 loops). Point `readOpaque`/
+      `writeOpaque`/`ParseOpaque` at the 16-byte form, delete `BTHasHighKey`
+      (upstream derives high-key presence from `P_RIGHTMOST`; 0x0008 is
+      `BTP_META`), swap the accessor call sites for S11.2a's `pgXxx` wrappers,
+      and translate the sibling sentinel + flag bits — all in ONE commit (an
+      intermediate that does only some is neither format). Writers:
+      `btree.go`, `bulkload.go`, `btree_vacuum.go`. Sibling readers that must
+      move in lockstep: `internal/amcheck`, `replay.go`,
+      `internal/executor/operators_bt_index_check.go`. Mechanism is fixed in
+      the design doc's S11.2 section — do not redesign it.
 - [ ] **M0130-S11.3 — metapage** (est ~1 loop). `BTreeMeta` → `PGBTMetaPage`
       at block 0 via S11.1's codec, including the `pd_lower` advance.
 - [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →
