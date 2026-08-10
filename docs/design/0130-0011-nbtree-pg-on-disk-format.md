@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1 landed 2026-08-10; S11.4 slices 3b-2/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a landed 2026-08-10; S11.4 slices 3b-2b/3b-2c/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -361,15 +361,62 @@ sources agree:
       (goopg's collation handling sits above the AM), cross-type comparison
       (tuple-vs-tuple is always same-type), and posting-list tuples (which of
       its heap TIDs would break the tie? — rejected rather than guessed).
-    - **3b-2 — thread the descriptor and retire `CompareKeys` (open).** Build
-      a `PGIndexKeyDesc` from the catalog (`pg_index.indoption` carries the
+    - **3b-2 — thread the descriptor and retire `CompareKeys`.** Build a
+      `PGIndexKeyDesc` from the catalog (`pg_index.indoption` carries the
       DESC and NULLS FIRST bits independently — neither is derivable from the
       other), hand it to `btree.Options`, and convert the ~20 `CompareKeys`
       call sites in `btree.go` / `bulkload.go` / `internal/amcheck` to
       `ComparePGIndexTuples`. The writer path switches from one opaque key to
       `FormPGIndexTuple` over per-column datums at the same time; the two must
       move together (sibling-path rule), since a descriptor-derived reader
-      against a blob-writing writer reads garbage.
+      against a blob-writing writer reads garbage. Three steps:
+
+      - **3b-2a — the opclass comparators (landed 2026-08-10).**
+        `internal/access/btree/pgcompare_types.go`. 3b-1 left `PGKeyAttr.Compare`
+        with only its nil default, which means `bytes.Compare` and is correct
+        exactly while the key bytes are goopg's order-preserving encodings.
+        The moment 3b-2b's writer stores the datum's real PG binary image,
+        bytewise ordering is wrong for nearly every type, so the opclass
+        support-function-1 side has to exist FIRST or the flip has nothing
+        correct to switch to. This lands `btint2cmp`/`btint4cmp`/`btint8cmp`
+        (signed, LITTLE-endian native — a datum's on-disk image is its native
+        memory image on the x86-64 PG 18.3 target, the same assumption
+        `encodeValuePG` already makes), `btoidcmp` (**unsigned** — OIDs above
+        2^31 exist), `btboolcmp`, `btcharcmp` (unsigned by upstream's explicit
+        choice), `btfloat4cmp`/`btfloat8cmp` (`float8_cmp_internal`: NaN is
+        larger than every non-NaN and equal to itself, and −0 = +0 — two rules
+        a bit-pattern compare gets wrong), `byteacmp` and `bttextcmp` under the
+        C collation, `bpcharcmp` (blank-padded: `bcTruelen` strips trailing
+        spaces, so reusing the text comparator on a bpchar column is a silent
+        wrong answer on every padded value), `btnamecmp`, `uuid_cmp`,
+        `timetz_cmp` (ordered by GMT-equivalent time, then local time, then
+        zone) and `numeric_cmp` over the on-disk `NumericData`
+        (`cmp_numerics` → `cmp_var_common` → `cmp_abs_common`, including the
+        −Infinity < finite < +Infinity < **NaN** ladder and the short header's
+        sign-extended 7-bit weight). date/timestamp/timestamptz/time reuse the
+        int4/int8 comparators, as upstream does. `PGAttrComparator` has no
+        error return by design — it is the innermost loop of a descent and
+        upstream's `sk_func` cannot fail either — so a datum whose length does
+        not match its attlen falls back to `bytes.Compare` (deterministic and
+        total, so a split still terminates) instead of panicking; corruption is
+        amcheck's business. Additive: still nothing builds a descriptor.
+      - **3b-2b — build the descriptor from the catalog and flip the writer
+        (open).** `catalog.Index` already carries everything needed
+        (`ColDescending` / `ColNullsFirst` — nil means "all default ASC NULLS
+        LAST", so every read must bounds-check — plus `ColOpClasses`,
+        `ColCollations` and the column types); `internal/executor`'s
+        `userTypeAttrsForOID` already maps a type OID to
+        typlen/typbyval/typalign/typstorage, i.e. to `PGIndexAttr`. The mapper
+        must live executor-side: `internal/access/btree` deliberately does not
+        import `catalog`. Same commit flips the encoders
+        (`encodeCompositeBTreeKey`, `encodeIndexKeyFromCols`, `encodeArbiterKey`)
+        to per-column datums through `FormPGIndexTuple`. REINDEX-required.
+      - **3b-2c — route every comparison through the descriptor (open).** The
+        ~20 in-package `CompareKeys` sites compare *key payloads*, whereas
+        `ComparePGIndexTuples` needs whole tuples (it reads t_info's null
+        bitmap and t_tid's natts/heap TID). Introducing that seam — one
+        `BTree`/bulk-builder comparison method over tuple-shaped operands — is
+        its own step, and is what finally retires `CompareKeys`.
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

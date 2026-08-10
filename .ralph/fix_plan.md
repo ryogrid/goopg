@@ -883,6 +883,49 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
           `FormPGIndexTuple` over per-column datums **in the same commit**
           (sibling-path rule: a descriptor-derived reader against a
           blob-writing writer reads garbage). REINDEX-required break.
+          Decomposed into three:
+      - [x] **3b-2a — the opclass comparators** (2026-08-10).
+            `internal/access/btree/pgcompare_types.go`: btree support-function-1
+            for every type goopg indexes, over the datum's real PG binary image
+            (little-endian native, the x86-64 PG 18.3 layout `encodeValuePG`
+            already assumes). 3b-1 left `PGKeyAttr.Compare` with only its nil
+            default = `bytes.Compare`, which is correct exactly while the keys
+            are goopg's order-preserving encodings; the instant 3b-2b's writer
+            stores real datums it is wrong for nearly every type, so this had
+            to exist before the flip had anything correct to switch to.
+            `btint2/4/8cmp` (signed LE), `btoidcmp` (**unsigned**),
+            `btboolcmp`, `btcharcmp` (unsigned by upstream's explicit choice),
+            `btfloat4/8cmp` (NaN largest and equal to itself; −0 = +0),
+            `byteacmp`/`bttextcmp` (C collation), `bpcharcmp` (blank-padded —
+            `bcTruelen`), `btnamecmp`, `uuid_cmp`, `timetz_cmp` (GMT-equivalent
+            first) and `numeric_cmp` over the on-disk `NumericData`
+            (−Inf < finite < +Inf < **NaN**, plus the short header's
+            sign-extended 7-bit weight). date/timestamp/time reuse int4/int8 as
+            upstream does. No error return by design (innermost descent loop,
+            like `sk_func`): a length that does not match attlen falls back to
+            `bytes.Compare` — total and deterministic, so a split terminates —
+            and corruption stays amcheck's business. Additive; nothing builds a
+            descriptor yet. Guards: `pgcompare_types_test.go` (18), 9 mutations
+            caught. Deferred (1 ledger row): non-C collations, and the types
+            with no comparator yet (arrays, enum, bit/varbit, inet/cidr/macaddr,
+            interval, money, tsvector/tsquery, jsonb, range/multirange).
+      - [ ] **3b-2b — build the descriptor from the catalog, flip the writer**.
+            `catalog.Index.ColDescending`/`ColNullsFirst` (nil == all default
+            ASC NULLS LAST — bounds-check every read), `ColOpClasses`,
+            `ColCollations`; `userTypeAttrsForOID`
+            (`internal/executor/pg18_user_catalog_rows.go`) already maps a type
+            OID to typlen/typbyval/typalign/typstorage, i.e. to `PGIndexAttr`.
+            The mapper must live executor-side — `internal/access/btree` does
+            not import `catalog` on purpose. Same commit flips
+            `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
+            `encodeArbiterKey` to per-column datums through `FormPGIndexTuple`.
+            REINDEX-required break.
+      - [ ] **3b-2c — route every comparison through the descriptor**. The ~20
+            in-package `CompareKeys` sites compare *key payloads*;
+            `ComparePGIndexTuples` needs whole tuples (t_info's null bitmap,
+            t_tid's natts/heap TID). Building that seam — one `BTree`/bulk
+            comparison method over tuple-shaped operands — is what finally
+            retires `CompareKeys`.
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.
