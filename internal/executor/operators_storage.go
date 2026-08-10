@@ -7146,11 +7146,48 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 // cat is optional (may be nil): when provided, KindString values on enum-typed
 // columns are converted to KindEnum so encoding is consistent with the probe path.
 func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, cat...)
+	if !ok {
+		return nil, nil
+	}
+	var out []byte
+	for i, v := range vals {
+		keyPart, err := encodeBTreeKeyForColumn(v, keyCols[i], 0)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, keyPart...)
+	}
+	return out, nil
+}
+
+// indexRowKeyValues projects a heap row down to idx's KEY attributes: for each
+// name in idx.Columns it resolves the column in cols (case-insensitively, the
+// spelling the catalog stores), reads the row value at that column's position,
+// and normalises enum labels.
+//
+// ok is false — not an error — when the projection cannot be made at all:
+// a key column that is not in cols (an expression key, `Columns[i] == ""`), a
+// position past the end of the row, or a NULL key value. Those are exactly the
+// cases `encodeIndexKeyFromCols` has always answered with a nil key, and the
+// callers read a nil key as "this row is not in this index" (NULLs do not
+// participate in unique constraints; an expression index takes the
+// `encodeExprIndexKey` fallback).
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-iv split this out of the encoder because the
+// PROJECTION is format-independent while the encoding is not: the tuple-format
+// funnels in pgindex_btree.go need the same columns, the same row positions and
+// the same enum normalisation, and deriving them a second time is precisely the
+// sibling-pair divergence the ledger keeps recording. The returned columns are
+// pointers INTO cols, parallel to vals and to the descriptor attributes
+// buildPGIndexKeyDesc derives from the same idx.Columns order.
+func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
 	var im *catalog.InMemory
 	if len(cat) > 0 && cat[0] != nil {
 		im, _ = cat[0].(*catalog.InMemory)
 	}
-	var out []byte
+	keyCols := make([]*catalog.Column, 0, len(idx.Columns))
+	vals := make([]Datum, 0, len(idx.Columns))
 	for _, idxColName := range idx.Columns {
 		var col *catalog.Column
 		var colOrd int
@@ -7162,11 +7199,11 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, 
 			}
 		}
 		if col == nil || colOrd >= len(row) {
-			return nil, nil
+			return nil, nil, false
 		}
 		v := row[colOrd]
 		if v.IsNull() {
-			return nil, nil // NULLs don't participate in unique constraints
+			return nil, nil, false // NULLs don't participate in unique constraints
 		}
 		// For enum columns: convert KindString labels to KindEnum (sort order)
 		// so encoding matches the btree probe path. M0097-0022.
@@ -7181,13 +7218,10 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, 
 				}
 			}
 		}
-		keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, keyPart...)
+		keyCols = append(keyCols, col)
+		vals = append(vals, v)
 	}
-	return out, nil
+	return keyCols, vals, true
 }
 
 // maintainUniqueIndexesForInsert updates all unique/primary btree indexes
@@ -7205,7 +7239,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
 			// Fall back to expression-column encoding for expression-based indexes
 			// (e.g. CREATE UNIQUE INDEX ON t(lower(col))). encodeIndexKeyFromCols
@@ -7578,7 +7612,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, row)
 		if err != nil || key == nil {
 			// NULLS NOT DISTINCT: a candidate row with NULL key column(s) has no
 			// btree key (encodeIndexKeyFromCols returns nil) and is never stored
@@ -7627,6 +7661,13 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 // it matches exactly the value the btree stores (collation / type
 // normalisation included). If either row cannot be encoded, it conservatively
 // reports "changed" so the caller still performs the uniqueness probe.
+//
+// This is a VALUE fingerprint, not a tree key: the two encodings are never
+// handed to a btree, only compared with each other. It therefore stays on
+// `encodeIndexKeyFromCols` and must NOT move to `indexEntryKey` when the tuple
+// format lands — a tuple key embeds the row's heap TID, and oldRow/newRow are
+// different heap tuples, so every UPDATE would report "key changed" and re-probe
+// every unique index. M0130-S11.4 slice 3b-2c-ii-B2-c-iv.
 func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
 	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
 	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
@@ -7692,7 +7733,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, newRow, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, newRow)
 		if err != nil || key == nil {
 			// NULLS NOT DISTINCT: new version has NULL key column(s). The old
 			// version was already stamped xmax = effectiveWriterXID before this
@@ -7760,7 +7801,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 			if err != nil {
 				continue
 			}
-			key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+			key, err := ctx.indexRowProbeKey(idx, cols, row)
 			if err != nil || key == nil {
 				continue
 			}

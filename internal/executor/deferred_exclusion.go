@@ -71,7 +71,7 @@ func queueDeferredExclusionCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 	}
 	switch idx.ExclusionOp {
 	case "=":
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, row)
 		if err != nil || key == nil {
 			return // NULL key column never conflicts.
 		}

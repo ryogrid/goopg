@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -821,6 +821,65 @@ sources agree:
             purpose: its remaining direct `encodeBTreeKeyForColumn` callers are
             the writer-side uniqueness and index-maintenance paths, which B2-c
             converts to `pgIndexTupleKeyFromRow` — a different funnel.
+          - **3b-2c-ii-B2-c-iv — the row-key funnels (landed 2026-08-10).**
+            NO on-disk change, no REINDEX. The writer-side counterpart of
+            B2-c-iii, and the discovery that reshaped the remaining flip: one
+            function, `encodeIndexKeyFromCols`, has served *four* distinct jobs
+            since M0100-0005, and the blob format is what made that invisible.
+            The four are (a) the key an index ENTRY is stored under, (b) the key
+            a uniqueness / exclusion probe POSITIONS with, (c) a VALUE
+            FINGERPRINT compared with `bytes.Equal` (`indexKeyColumnsChanged`,
+            deciding whether an UPDATE touched an index at all), and (d) a value
+            fingerprint HASHED into an SSI bucket page tag
+            (`ssiRecordHashIndexInsert`). A blob key is TID-free, so all four are
+            the same bytes and no caller could ask for the wrong one. A tuple key
+            is not: the heap TID lives *inside* the image (`t_tid`) and is the
+            final tiebreaker of the heapkeyspace ordering. Under the tuple format
+            (a) must carry the row's real TID so duplicates of one key sort by
+            physical position exactly as `_bt_compare` orders them; (b) must
+            carry the ZERO TID, which is minus infinity in that position, so a
+            probe lands *before* every real entry sharing its key attributes —
+            handing a probe an entry key would start a duplicate scan after some
+            of its own matches, a silent under-read; and (c)/(d) must stay
+            TID-free entirely, because two heap versions of one logical row would
+            otherwise never compare equal (every UPDATE would report "key
+            changed") and a writer would hash into a different bucket than its
+            readers. So the split is three-way, not two-way: `(*Context).
+            indexEntryKey(idx, cols, row, tid)` and `(*Context).indexRowProbeKey
+            (idx, cols, row)` (both over one `indexRowKey`, blob-identical when
+            `desc == nil`), and the two fingerprint callers deliberately LEFT on
+            `encodeIndexKeyFromCols`, each with a comment saying why it must not
+            move. Seven call sites routed: three entry sites
+            (`maintainUniqueIndexesForInsert`, and the upsert operator's two
+            non-arbiter maintenance paths) and four probe sites
+            (`checkUniqueIndexesForInsert`, `checkUniqueIndexesForUpdate`,
+            `checkExclusionConstraintsForInsert`, `queueDeferredExclusionCheck`).
+            The shared PROJECTION — resolve each `idx.Columns` name in the
+            caller's `cols`, read the row at that position, normalise enum labels
+            to `KindEnum` — was factored out as `indexRowKeyValues` so the two
+            formats cannot derive the key columns differently; `ok == false`
+            keeps the encoder's long-standing "nil key means this row is not in
+            this index" answer (NULL key column, expression key). One subtlety
+            the split exposed: `maintainNonArbiterIndexesForUpdate` reuses the
+            key cached from the SPECULATIVE insert to avoid re-evaluating a
+            side-effectful expression index. A blob key is TID-free so the spec
+            row's key *is* the updated row's key; a tuple key is not, and this
+            insert points at a different heap tuple, so the cache is now bypassed
+            whenever a descriptor exists (such an index is never an expression
+            index — `buildPGIndexKeyDesc` refuses those — so re-encoding costs
+            only a projection). Guards:
+            `internal/executor/pgindex_rowkey_test.go` — blob entry key ==
+            probe key == `encodeIndexKeyFromCols` byte for byte with a real TID
+            supplied; tuple entry != probe, entry is not a pivot, `probe <
+            entry` under `ComparePGIndexTuples`, and both deform to identical
+            attributes; a NULL key attribute still yields `nil, nil` on both
+            funnels (indexing NULLs is a semantic change, not a format one — see
+            the ledger row for B2-a); an undescribable index keeps the blob key;
+            and a source scan over `operators_upsert.go` and
+            `deferred_exclusion.go` pinning the funnels as the only tree-key
+            writers there, mutation-checked by reverting the deferred-exclusion
+            site. `operators_storage.go` and `ssi.go` are out of the scan's scope
+            on purpose — they are exactly where the two fingerprint uses live.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -830,12 +889,18 @@ sources agree:
             part of this slice — B2-c-i taught the scan to read a pivot and
             B2-c-ii routed all six probe sites through the one place that emits
             it, and B2-c-iii did the same for the low end, so the SCAN side is
-            format-agnostic already. What remains under
-            `encodeBTreeKeyForColumn` is the writer-side set — the uniqueness
-            and index-maintenance paths in `operators_storage.go`, the
-            expression-key paths in `operators_upsert.go`, and the two calls
-            inside the composite encoders themselves — all of which become
-            `pgIndexTupleKeyFromRow` with the row's real heap TID. Gates:
+            format-agnostic already, and B2-c-iv did the same for the
+            row-shaped writer sites (entry keys and probe-by-row keys both now
+            resolve the descriptor). What remains is the set B2-c-iv could not
+            funnel: the composite encoders on the CREATE INDEX / REINDEX build
+            path (`encodeCompositeBTreeKey` /
+            `encodeCompositeBTreeKeyWithExprs` in `operators_ddl.go`), the
+            expression-key paths (`encodeArbiterKey`, `encodeExprIndexKey`),
+            and the per-column uniqueness comparisons in
+            `operators_storage.go` — plus turning `pgIndexTupleKeys` on and the
+            explicit per-index dual-format decision. The build path is the one
+            that most needs the real heap TID: a bulk build sorts entries, and
+            under heapkeyspace the TID is part of the sort key. Gates:
             `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
             a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length

@@ -1205,15 +1205,42 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               over-long probes rejected; source scan over the three scan files
               pinning `indexProbeKey` as the only scan-side encoder,
               mutation-checked by reverting the bitmap site).
+        - [x] **3b-2c-ii-B2-c-iv — the row-key funnels** (2026-08-10). NO
+              on-disk change, no REINDEX; the writer-side counterpart of
+              B2-c-iii. The finding: `encodeIndexKeyFromCols` has served FOUR
+              roles since M0100-0005 — the key an entry is STORED under, the key
+              a uniqueness/exclusion probe POSITIONS with, a value fingerprint
+              compared with `bytes.Equal` (`indexKeyColumnsChanged`), and a value
+              fingerprint hashed into an SSI bucket tag
+              (`ssiRecordHashIndexInsert`). A blob key is TID-free so all four
+              are the same bytes; a tuple key embeds the heap TID, so the stored
+              key needs the row's real TID, the probe key needs the ZERO TID
+              (minus infinity — otherwise a duplicate scan starts after some of
+              its own matches), and the two fingerprints must stay TID-free or
+              every UPDATE reports "key changed" and SSI writers hash into the
+              wrong bucket. Landed `(*Context).indexEntryKey` +
+              `(*Context).indexRowProbeKey` over one `indexRowKey`, seven call
+              sites routed (3 entry, 4 probe), the shared projection factored out
+              as `indexRowKeyValues`, and the spec-insert key cache bypassed when
+              a descriptor exists. Guards:
+              `internal/executor/pgindex_rowkey_test.go` (blob entry == probe ==
+              the old encoder; tuple entry != probe with `probe < entry` under
+              `ComparePGIndexTuples` and identical deformed attributes; NULL key
+              still `nil, nil`; undescribable index keeps blob; source scan over
+              the two fully-routed files, mutation-checked).
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
               `ctx.pgIndexKeyDesc(idx)` the tree took. The SCAN side is done
-              (B2-c-i + B2-c-ii + B2-c-iii); what remains under
-              `encodeBTreeKeyForColumn` is writer-side — the uniqueness and
-              index-maintenance paths in `operators_storage.go`, the
-              expression-key paths in `operators_upsert.go`, and the two calls
-              inside the composite encoders — all becoming
+              (B2-c-i + B2-c-ii + B2-c-iii) and the row-shaped writer sites are
+              funnelled (B2-c-iv: entry keys and probe-by-row keys). What remains
+              is the BUILD path (`encodeCompositeBTreeKey` /
+              `encodeCompositeBTreeKeyWithExprs` in `operators_ddl.go` — the one
+              that most needs the real heap TID, since a bulk build sorts and the
+              TID is part of the heapkeyspace sort key), the expression-key
+              writers (`encodeArbiterKey`, `encodeExprIndexKey`), and the
+              per-column uniqueness comparisons in `operators_storage.go` — all
+              becoming
               `pgIndexTupleKeyFromRow` with the row's real heap TID,
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a

@@ -1196,7 +1196,7 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {
@@ -1230,11 +1230,18 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 		if err != nil {
 			continue
 		}
-		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.indexKeyUnchangedFromSpec(idx, cols, row) {
+		// The cache exists to avoid RE-EVALUATING a side-effectful expression
+		// index, and a blob key is TID-free, so the spec row's key is literally
+		// the updated row's key. A tuple-format key is not: it carries the heap
+		// TID of the row it was built for, and this insert points at a different
+		// one. Such an index is never an expression index (buildPGIndexKeyDesc
+		// refuses those), so re-encoding it costs nothing but a projection.
+		// M0130-S11.4 slice 3b-2c-ii-B2-c-iv.
+		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.ctx.pgIndexKeyDesc(idx) == nil && o.indexKeyUnchangedFromSpec(idx, cols, row) {
 			_ = tree.Insert(cached, ptr)
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {

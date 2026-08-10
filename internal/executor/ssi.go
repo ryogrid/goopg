@@ -137,6 +137,14 @@ func ssiRecordHashBucketRead(ctx *Context, dbOid, indexOID uint32, key []byte) {
 // reader holding that bucket's SIREAD — and aborting this INSERT in place
 // (40001) when it closes a dangerous structure to an already-committed pivot,
 // exactly like ssiRecordTupleWrite. No-op for non-hash tables / RC / RR.
+//
+// The key here is a VALUE fingerprint hashed into a bucket tag, not a tree key,
+// and it must match what the READER (ssiRecordHashBucketRead) computed from an
+// expression. It therefore stays on `encodeIndexKeyFromCols` rather than moving
+// to `indexEntryKey`: a tuple-format key embeds the writing row's heap TID, so
+// every writer would hash into a different bucket than its readers. (These are
+// DeclaredHash indexes in any case, which buildPGIndexKeyDesc refuses.)
+// M0130-S11.4 slice 3b-2c-ii-B2-c-iv.
 func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
 	if !ssiActive(ctx) || tbl == nil {
 		return nil

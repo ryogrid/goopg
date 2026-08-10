@@ -214,6 +214,81 @@ func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart)
 	return key, nil
 }
 
+// indexEntryKey builds the key an index ENTRY is stored under: every key
+// attribute of idx, taken from a heap row that lives at tid.
+//
+// indexRowProbeKey builds the key a probe POSITIONS with for the same row and
+// the same index: every key attribute, no heap TID.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-iv — the row-key funnels, the writer-side
+// counterpart of B2-c-iii's `indexProbeKey` (which funnels a scan's search key,
+// built from EXPRESSIONS rather than from a row). Both delegate to the same
+// `indexRowKey`, and under the blob format they are byte-identical — which is
+// why one function, `encodeIndexKeyFromCols`, has served both roles since
+// M0100-0005. That is the thing this slice exists to end:
+//
+//   - blob (desc == nil): a key is the concatenation of each key column's
+//     `encodeBTreeKeyForColumn` image and carries no heap TID at all. The
+//     entry's TID travels beside the key, in the btree item. Stored key and
+//     probe key are therefore the same bytes, and asking for one when you meant
+//     the other is undetectable.
+//   - tuple (desc != nil): the heap TID is INSIDE the image (`t_tid`) and is the
+//     final tiebreaker of the heapkeyspace ordering. A stored entry carries its
+//     row's real TID, so duplicates of one key sort by physical position exactly
+//     as `_bt_compare` orders them; a search key carries the zero TID, which is
+//     minus infinity in that position, so a probe lands BEFORE every real entry
+//     sharing its key attributes rather than in the middle of them. Handing a
+//     probe an entry key would start a duplicate scan after some of its own
+//     matches — a silent under-read, not a failure.
+//
+// Neither is a total replacement for `encodeIndexKeyFromCols`: two callers use
+// that encoder for something that is not a tree key at all (see its remaining
+// call sites — `indexKeyColumnsChanged` compares two rows' key VALUES with
+// bytes.Equal, and `ssiRecordHashIndexInsert` hashes the key into a bucket page
+// tag). Both would break if a heap TID entered the bytes — equal keys from
+// different rows would stop comparing equal, and a bucket tag would stop
+// matching the reader's. They are value fingerprints, and the flip must leave
+// them on a TID-free encoding; see the deferral ledger row for B2-c-iv.
+//
+// A nil key with a nil error keeps `encodeIndexKeyFromCols`'s meaning: this row
+// has no entry in this index (NULL key column, or an expression key this
+// projection cannot make). Under the tuple format a refusal by `pgIndexTupleKey`
+// is an ERROR rather than a fallback, for the reason B2-c-iii gives: the tree is
+// tuple-shaped, so emitting a blob key would address the wrong place.
+func (ctx *Context) indexEntryKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer) ([]byte, error) {
+	return ctx.indexRowKey(idx, cols, row, tid)
+}
+
+// indexRowProbeKey — see indexEntryKey.
+func (ctx *Context) indexRowProbeKey(idx *catalog.Index, cols []catalog.Column, row Row) ([]byte, error) {
+	return ctx.indexRowKey(idx, cols, row, storage.ItemPointer{})
+}
+
+func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer) ([]byte, error) {
+	desc := ctx.pgIndexKeyDesc(idx)
+	if desc == nil {
+		return encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+	}
+	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, ctx.Catalog)
+	if !ok {
+		return nil, nil
+	}
+	// buildPGIndexKeyDesc walks the same idx.Columns, so a non-nil descriptor
+	// and a successful projection cannot disagree on the attribute count; the
+	// check is here because a mismatch would silently make a full-key write a
+	// PIVOT (minus infinity beyond what it names), which no reader could tell
+	// from a legitimately truncated one.
+	if len(vals) != desc.NKeyAtts() {
+		return nil, fmt.Errorf("indexRowKey: index %q: %d projected key attributes for a %d-attribute descriptor",
+			idx.Name, len(vals), desc.NKeyAtts())
+	}
+	key, _, err := pgIndexTupleKey(desc, keyCols, vals, tid)
+	if err != nil {
+		return nil, fmt.Errorf("indexRowKey: index %q: %w", idx.Name, err)
+	}
+	return key, nil
+}
+
 func columnNameOrEmpty(c *catalog.Column) string {
 	if c == nil {
 		return ""
