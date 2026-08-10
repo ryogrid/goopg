@@ -2789,6 +2789,21 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       "no heap image to agree with" half of that refusal is now gone.
       Remaining for M0119-0006: `box`/`int4range` key encodings and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
+      closed.** A time-of-day with no seconds field is ordinary PG input
+      (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),
+      but goopg's two layout tables disagreed: `evalTypedStringLit` lists
+      `"2006-01-02 15:04"`, `parseCopyTimestamp` did not — and the latter is what
+      COPY TEXT, `encodeValuePG` and the array-element encoder funnel through, so
+      `INSERT INTO t(ts) VALUES ('2020-01-01 10:00')` raised 22007 while
+      `timestamp '2020-01-01 10:00'` parsed. Supplied once in `padTimeFields`
+      (`internal/pgdatetime/normalize.go`) instead of per table, incl. `10:00+05`,
+      `10:00 PM` and the empty trailing field `10:00:`. `'10:00.5'` (PG reads
+      `MM:SS.f` → `00:10:00.5`) and `'10::00'` (empty MINUTE field) stay refused
+      — guessing there would be a wrong time, not an error — as ledger rows, each
+      with a test pinning the refusal. Design `0125-0007-…` §6 + README row.
+      Gates: units, `TestPort_RegressSuite`, tpch-spotcheck (Q12=2/Q13=35) PASS;
+      mutation-checked. `BC` era input remains open.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

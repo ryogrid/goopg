@@ -31,7 +31,20 @@ func TestNormalizeInputPGAcceptedForms(t *testing.T) {
 		{"3:04:05", "03:04:05"},
 		{"03:04:5", "03:04:05"},
 		{"03:04:05", "03:04:05"},
-		{"3:4", "03:04"},
+		// Seconds are OPTIONAL to DecodeTime and default to 0, so the missing
+		// field is supplied rather than passed through: PG reads '3:4' as
+		// 03:04:00 (verified on 18.3), and goopg's layout tables are not
+		// uniformly willing to parse a secondless time.
+		{"3:4", "03:04:00"},
+		{"10:00", "10:00:00"},
+		{"10:00:00", "10:00:00"}, // already canonical: untouched
+		// An empty trailing seconds field is unambiguously "no seconds"
+		// (PG: '10:00:' = 10:00:00) and the stray ':' is dropped.
+		{"10:00:", "10:00:00"},
+		// The seconds default rides in front of whatever followed the minute.
+		{"10:00+05", "10:00:00+05"},
+		{"10:00 PM", "10:00:00 PM"},
+		{"2002-5-1T3:4Z", "2002-05-01T03:04:00Z"},
 		// Fractional seconds, offsets and AM/PM markers ride along verbatim.
 		{"3:4:5.25", "03:04:05.25"},
 		{"3:4:5-07", "03:04:05-07"},
@@ -44,7 +57,7 @@ func TestNormalizeInputPGAcceptedForms(t *testing.T) {
 		{"2002-5-1 3:4:5", "2002-05-01 03:04:05"},
 		{"2002-5-1T3:4:5Z", "2002-05-01T03:04:05Z"},
 		{"2002-5-1 3:4:5.25-04", "2002-05-01 03:04:05.25-04"},
-		{"2002-5-1 3:4", "2002-05-01 03:04"},
+		{"2002-5-1 3:4", "2002-05-01 03:04:00"},
 		{"2002-05-01 03:04:05", "2002-05-01 03:04:05"},
 		// An unrecognised tail is padded around but never interpreted: the date
 		// fields normalise, the 'BC' era marker is passed through untouched and
@@ -71,23 +84,32 @@ func TestNormalizeInputPGAcceptedForms(t *testing.T) {
 // rejecting them; see .ralph/deferral_ledger.md for the follow-up rows.
 func TestNormalizeInputLeavesForeignSpellingsAlone(t *testing.T) {
 	unchanged := []string{
-		"2002-May-1",   // textual month — DecodeSpecial, not implemented
-		"May 1, 2002",  // textual month, MDY word order
-		"20020501",     // run-together digits (DecodeNumberField)
-		"2002/5/1",     // '/' separator
-		"5-1-2002",     // DateStyle MDY order
-		"02-5-1",       // two-digit leading field: DateStyle-dependent
-		"2002-005-01",  // three-digit second field is PG's day-of-year, not a month
-		"2002-5",       // too few fields
-		"2002-5-1abc",  // trailing garbage
-		"garbage",      // not a date at all
-		"infinity",     // handled upstream by the ±infinity literal probe
-		"epoch",        //          "
-		"1234567890",   // bare integer
-		"",             //
-		"-",            //
-		"::",           //
-		"12:34:5678",   // over-wide seconds run: left for the layouts to reject
+		"2002-May-1",  // textual month — DecodeSpecial, not implemented
+		"May 1, 2002", // textual month, MDY word order
+		"20020501",    // run-together digits (DecodeNumberField)
+		"2002/5/1",    // '/' separator
+		"5-1-2002",    // DateStyle MDY order
+		"02-5-1",      // two-digit leading field: DateStyle-dependent
+		"2002-005-01", // three-digit second field is PG's day-of-year, not a month
+		"2002-5",      // too few fields
+		"2002-5-1abc", // trailing garbage
+		"garbage",     // not a date at all
+		"infinity",    // handled upstream by the ±infinity literal probe
+		"epoch",       //          "
+		"1234567890",  // bare integer
+		"",            //
+		"-",           //
+		"::",          //
+		"12:34:5678",  // over-wide seconds run: left for the layouts to reject
+		"12:34:ab",    // malformed seconds field: left for the layouts to reject
+		// PG accepts both of these, and both mean something a "supply the
+		// missing seconds" rewrite would get WRONG: '10:00.5' decodes as
+		// 00:10:00.5 (DecodeNumberField reads the fractional field as MM:SS.f,
+		// not HH:MM plus fractional minutes), and '10::00' is an empty MINUTE
+		// field, not an empty seconds one. Deferral-ledger rows; a loud 22007 is
+		// the right answer until the real DecodeTime field walk is ported.
+		"10:00.5",
+		"10::00",
 		"1-2-3",        // one-digit leading field: DateStyle-dependent
 		"999999999999", //
 	}

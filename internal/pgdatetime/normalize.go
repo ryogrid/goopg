@@ -41,6 +41,7 @@ import "strings"
 //
 //	"2002-5-1"            -> "2002-05-01"
 //	"2002-5-1 3:4:5"      -> "2002-05-01 03:04:05"
+//	"2002-05-01 10:00"    -> "2002-05-01 10:00:00"  (DecodeTime: no seconds = 0)
 //	"2002-5-1T3:4:5.25Z"  -> "2002-05-01T03:04:05.25Z"
 //	"3:4:5 PM"            -> "03:04:05 PM"
 //	" 2002-05-01 "        -> "2002-05-01"     (PG trims surrounding space)
@@ -124,6 +125,23 @@ func padDateFields(s string) (string, bool) {
 // returns the rest of the string untouched, so fractional seconds, numeric
 // offsets, AM/PM markers and timezone names all survive verbatim. A string
 // that does not begin with a numeric time is returned unchanged.
+//
+// An ABSENT seconds field is supplied as ":00" rather than left out. PostgreSQL
+// decodes a time-of-day field by field (DecodeTime, datetime.c): it requires
+// hour and minute, and only reads seconds `if (*cp == ':')`, leaving tm_sec = 0
+// otherwise — so `10:00` IS `10:00:00`, and `2020-01-01 10:00` is a perfectly
+// ordinary timestamp. goopg's layout tables are not uniform about it (the typed
+// -literal path in expr.go lists "2006-01-02 15:04", parseCopyTimestamp does
+// not), which is how an INSERT of '2020-01-01 10:00' into a `timestamp` column
+// raised 22007 while the same text as a literal parsed. Supplying the field here
+// makes every call site agree, the same way the padding above does.
+//
+// Two spellings PG accepts are deliberately NOT rewritten, because guessing
+// would trade a loud error for a silently wrong time (ledger, M0119-0006):
+// `10:00.5`, where PG's DecodeNumberField reads the fractional field as
+// MM:SS.frac (`00:10:00.5`, NOT `10:00:00.5`), and `10::00`, an empty minute
+// field PG's field splitter tolerates. A trailing empty seconds field (`10:00:`)
+// IS handled, since it is unambiguously "no seconds".
 func padTimeFields(s string) string {
 	h, i, ok := digitRun(s, 0)
 	if !ok || len(h) > 2 || i >= len(s) || s[i] != ':' {
@@ -134,15 +152,29 @@ func padTimeFields(s string) string {
 		return s
 	}
 	sec, rest := "", s[j:]
-	if j < len(s) && s[j] == ':' {
+	secAbsent := false
+	switch {
+	case j >= len(s):
+		secAbsent = true // "10:00"
+	case s[j] == ':':
 		var k int
 		if sec, k, ok = digitRun(s, j+1); ok && len(sec) <= 2 {
 			rest = s[k:]
+		} else if j+1 == len(s) {
+			sec, rest, secAbsent = "", "", true // "10:00:" — empty trailing field
 		} else {
-			sec = ""
+			sec = "" // malformed seconds: leave it for the parser to reject
 		}
+	case s[j] == '.':
+		// "10:00.5": a fractional field after the SECOND numeric run means
+		// something else entirely to PG — not ours to normalise.
+	default:
+		secAbsent = true // "10:00+05", "10:00 PM", "10:00Z"
 	}
-	if len(h) == 2 && len(m) == 2 && (sec == "" || len(sec) == 2) {
+	if secAbsent {
+		sec = "00"
+	}
+	if len(h) == 2 && len(m) == 2 && len(sec) == 2 && !secAbsent {
 		return s // already canonical
 	}
 	var b strings.Builder

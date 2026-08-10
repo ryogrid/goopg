@@ -152,3 +152,56 @@ And two behaviours that are wrong rather than merely absent:
   of range`) for `'2002-5-32'` / `'2002-13-1'` and 22007 only for a malformed
   string. goopg raises 22007 for both, because the range check is Go's layout
   parser rather than an equivalent of `ValidateDate()`.
+
+## 6. Follow-up 2026-08-12 (M0119-0006) — the absent seconds field
+
+`INSERT INTO t(ts) VALUES ('2020-01-01 10:00')` raised
+
+```
+22007: invalid input syntax for type timestamp: "2020-01-01 10:00"
+```
+
+while `timestamp '2020-01-01 10:00'` — the same text, one code path over —
+parsed fine. PostgreSQL has no such split: `DecodeTime`
+(`postgres/src/backend/utils/adt/datetime.c`) requires hour and minute and only
+reads a seconds field `if (*cp == ':')`, leaving `tm_sec = 0` otherwise, so
+`10:00` **is** `10:00:00` for `time`, `timetz`, `timestamp` and `timestamptz`
+alike.
+
+goopg's two tables disagreed about it: `evalTypedStringLit` (`expr.go`) lists a
+`"2006-01-02 15:04"` layout, `parseCopyTimestamp` (`copy_text.go`) does not — and
+`parseCopyTimestamp` is what the COPY TEXT reader, `encodeValuePG` and the array
+element encoder all funnel through. The array-element slice
+(`0119-0006-array-element-datetime-images.md`) made that visible in a second
+place when it stopped storing element text verbatim: `'{2020-01-01 10:00}'::timestamp[]`
+inherited the scalar column's rejection.
+
+The fix supplies the missing field once, in `padTimeFields`
+(`internal/pgdatetime/normalize.go`), for exactly the same reason the padding
+lives there: adding a layout per table is how the two tables drifted apart.
+`"10:00"` → `"10:00:00"`, `"10:00+05"` → `"10:00:00+05"`, `"10:00 PM"` →
+`"10:00:00 PM"`, and the empty trailing field `"10:00:"` (which PG also accepts)
+→ `"10:00:00"`.
+
+Two spellings PG accepts are deliberately **not** rewritten, because a plausible
+guess would be a wrong time rather than a loud error — the failure mode this
+whole document exists for:
+
+* `'10:00.5'` — PG answers `00:10:00.5`: a fractional field after the *second*
+  numeric run makes `DecodeNumberField` read the pair as `MM:SS.f`, not as
+  `HH:MM` plus fractional minutes. A seconds default would silently produce
+  `10:00:00.5`.
+* `'10::00'` — an empty **minute** field, not an empty seconds one (PG:
+  `10:00:00`).
+
+Both stay 22007 and are ledger rows for the day the real `DecodeTime` field walk
+is ported. `'2020-01-01 10'` (a lone hour) is rejected by PG too and must stay
+rejected.
+
+Tests: `TestNormalizeInputPGAcceptedForms` gains the rewrite cases and
+`TestNormalizeInputLeavesForeignSpellingsAlone` the two refusals;
+`internal/executor/timestamp_secondless_input_test.go` pins the executor-visible
+half (`parseCopyTimestamp`, `parseTimeString`, `parseTimeTZString`, and the
+`timestamp[]` / `time[]` element round-trip), including a guard that the default
+does not fire for the ambiguous forms. Every expected value was read from a PG
+18.3 cluster (socket `/tmp`, port 5599).
