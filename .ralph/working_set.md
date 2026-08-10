@@ -1,60 +1,51 @@
 (idle — nothing in flight)
 
-Last loop (#102): M0119-0006 **37th slice — the DATE half of the BC
-leap-day race is fixed.** Design
-`docs/design/0125-0007-pg-faithful-date-field-decode.md` §15 (+ README row),
-1 ledger row resolved (36th slice's row) + 1 new ledger row appended.
-Committed pending push to `make-db-cluster-compat`.
+Last loop (#103): M0119-0006 **38th slice — the TIMESTAMP half of the BC
+leap-day race is fixed**, closing the 37th slice's deferral. Design
+`docs/design/0125-0007-pg-faithful-date-field-decode.md` §16 (+ README row),
+1 ledger row resolved (37th slice's) + 1 new row appended.
 
-M-NIGHTLY duty this loop: `ci/logs/action-items.md` still nightly run
-`20260811-014635` (12 items, unchanged from loops #100/#101). Reconfirmed
-all 12 already filed under M-NIGHTLY (lines 713, 740, 744, 750 of
-fix_plan.md). Nothing new to file. M0130 confirmed fully checked ([x] on
-every subtask through S11.6), so M0119-0006 remains the actionable head
-(M0119-0005 precedes it in file order but needs hash/gin/gist/spgist/brin
-index AMs — out of scope for a single-loop slice).
+M-NIGHTLY duty this loop: `ci/logs/action-items.md` still run
+`20260811-014635` (12 items, unchanged since loop #100). All 12 already
+filed under M-NIGHTLY. Nothing new to file. M0130 re-verified CLOSED
+(0 unchecked in lines 761-1962 of fix_plan.md), so M0119 stays the head.
 
-What landed: new `bcLeapDateFallback` in `internal/executor/copy_text.go`,
-tried inside `parsePGDateText` when `time.Parse("2006-01-02", norm)` fails
-AFTER `validateDateTokenFull` already confirmed the token valid. It
-re-derives month/day (`pgdatetime.DateTokenMonthDay`) and the ASTRONOMICAL
-year (`pgdatetime.DateTokenYear` + `pgdatetime.AstronomicalYear`) straight
-from the token's digits and builds the `time.Time` directly via
-`time.Date(astroYear, month, day, 0,0,0,0, UTC)` — bypassing BOTH
-`time.Parse`'s literal-year day check and `ApplyEra`'s literal→astronomical
-shift (done by hand instead). `'0001-02-29 BC'::date` no longer raises the
-syntax-shaped 22007; it now reaches the carrier-range 22008 the
-un-representable astronomical year 0 still deserves (goopg's nanosecond
-`KindTime` carrier is 1677..2262, so year 0 is refused either way — just
-with the CORRECT SQLSTATE now). `bcLeapDateFallback` returns `ok=false`
-(falls through to the original time.Parse error) for `!bc` and for the
-`AstronomicalYear` no-year-zero refusal, so behavior for every other input
-is unchanged.
+What landed: new `bcLeapTimestampFallback` + `bcLeapProxyYear` in
+`internal/executor/copy_text.go`, hooked INSIDE `parsePGTimestampTextParts`'s
+candidate loop (after each candidate's layout loop fails, before the next
+candidate) so the hour-24 / leap-second canonicalized candidate still takes
+its turn. The 37th slice's open question — how to thread the time-of-day
+fields through the `time.Date` rebuild — is answered by NOT hand-parsing
+them: substitute a leap PROXY YEAR (2000) into the date token, re-parse
+through the ordinary `pgTimestampLayouts` table (so time/fraction/`T`/zone
+stay owned by the shared table), then rebuild the decoded wall clock at the
+real astronomical year via `time.Date`. The zone rule is applied to the
+PROXY value before the rebuild and its whole-day delta re-applied with
+`AddDate`, because `tsApplyZone` can cross midnight.
 
-What did NOT land: `parsePGTimestampTextParts` (the TIMESTAMP-domain
-sibling) has the IDENTICAL bug — deliberately deferred (ledger row
-appended) since it composes date and time-of-day in one `time.Parse` call
-per layout across two candidate strings, so the bypass needs the
-time-of-day fields threaded through too, not just month/day/year. Scoped to
-one call site to keep this slice self-contained (Ralph "ONE task per loop"
-rule).
+Oracle (throwaway PG 18.3 on :5599): 6 cells captured, all matching —
+incl. `'0001-02-29 00:30:00+05:30 BC'` as timestamp (00:30, offset dropped)
+vs timestamptz (0001-02-28 19:00), `'0001-02-29 24:00:00 BC'` →
+0001-03-01, `'0005-02-29 10:00:00 BC'` (astronomical -4, leap), and
+`'0001-02-30 10:00:00 BC'` → 22008.
+
+Still refused after the fix (deliberate, unchanged): the nanosecond
+`KindTime` carrier (1677..2262) cannot STORE any BC value, so these are
+22008 either way — what moved is the PATH and therefore the code (was
+22007) plus the decoded fields underneath. That carrier move is the
+standing 282-reference ledger row.
 
 Next loop: per banner (M-NIGHTLY filing unconditional, then M0130 — CLOSED
-— then M0119 top-to-bottom, then M0122). Within M0119-0006, candidates:
-the `parsePGTimestampTextParts` BC leap-day fix just deferred (natural
-next slice, same shape as this one but needs time-of-day field threading);
-the CARRIER move of `Datum.Int` for `KindTime` ns→MICROSECONDS (282 refs,
-multi-loop, then delete `checkTimeCarrierRange`); `timestamptz` OUTPUT
-missing its `+00` suffix; the four target-type-less parse paths
+— then M0119 top-to-bottom, then M0122). Within M0119-0006 remaining
+candidates: the `Datum.Int` KindTime carrier move ns→MICROSECONDS (282
+refs, multi-loop, then delete `checkTimeCarrierRange`); `timestamptz`
+OUTPUT missing its `+00` suffix; the four target-type-less parse paths
 (`tryParseStringAs`, `EXTRACT`, `date_trunc`, `pg_authid` validuntil);
 `timetz`'s bare-time zone should be the session `TimeZone` GUC; textual
 month names and DateStyle MDY/DMY orders.
 
-Gates: build clean; `go test ./internal/pgdatetime/...
-./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35). `make ralph-state-guard` PASS (auto-repaired the routine
-running/completed loop-boundary marker). pgbench smoke will run via commit
-hook.
+Gates: build clean; `go test ./internal/pgdatetime/... ./internal/executor/...`
+PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). pgbench smoke via commit hook.
 
 In-flight: none

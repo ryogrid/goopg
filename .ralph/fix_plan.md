@@ -2968,6 +2968,32 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       full executor/pgdatetime suites green. Design
       `0125-0007-pg-faithful-date-field-decode.md` §15.
 
+      **38th slice (2026-08-11) — the TIMESTAMP half of that race is fixed
+      too, closing the 37th slice's deferral.** New
+      `bcLeapTimestampFallback` hooks INSIDE `parsePGTimestampTextParts`'s
+      candidate loop (so the hour-24 / leap-second canonicalized candidate
+      still takes its own turn — `'0001-02-29 24:00:00 BC'` composes to
+      March 1st with `carry=1`). The 37th slice's open question — how to
+      thread the time-of-day fields through the `time.Date` construction —
+      is answered by NOT hand-parsing them: a leap PROXY YEAR (2000) is
+      substituted into the date token and the candidate re-parsed through
+      the ordinary `pgTimestampLayouts` table, so time of day, fractional
+      seconds, the `T` separator and every zone spelling stay owned by the
+      shared table (a private parser here would be a fourth instance of the
+      two-table drift that table exists to end); the decoded wall clock is
+      then rebuilt at the real astronomical year. The zone rule is applied
+      to the proxy BEFORE the rebuild and its whole-day movement re-applied,
+      because `tsApplyZone` can cross midnight
+      (`'0001-02-29 00:30:00+05:30 BC'::timestamptz` is the 28th in UTC).
+      Six PG 18.3 oracle cells captured live, all matching. Gates: two new
+      tests (`TestBCLeapDayTimestampDecodesAtTheAstronomicalYear` — asserts
+      the DECODED FIELDS, since a SQLSTATE-only assertion would pass with
+      the fields still wrong — and
+      `TestBCLeapDayTimestampFallbackKeepsTheErrorClasses`), both mutation
+      -checked; `RALPH_PRECOMMIT_SCOPE=units` PASS; `tpch-spotcheck.sh` PASS
+      (Q12=2, Q13=35). Design
+      `0125-0007-pg-faithful-date-field-decode.md` §16.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

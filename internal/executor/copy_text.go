@@ -914,8 +914,79 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 				return ts, cand.carry, nil
 			}
 		}
+		// M0119-0006 §15.2: the TIMESTAMP half of the BC leap-day race the
+		// preceding slice fixed for DATE. validateDateTokenFull above already
+		// accepted the date token against the ASTRONOMICAL year, but every
+		// layout here still runs time.Parse's own day-in-month check against
+		// the token's LITERAL year — so '0001-02-29 10:00:00 BC' (astronomical
+		// year 0, leap) matches nothing and reads as a syntax miss (22007)
+		// where PG answers a field-range error. Try the proxy-year rebuild
+		// before giving up on this candidate, so the hour-24 / leap-second
+		// canonical candidate still gets its own turn afterwards.
+		if ts, ok := bcLeapTimestampFallback(cand.text, bc, zone); ok {
+			return ts, cand.carry, nil
+		}
 	}
 	return time.Time{}, 0, errNoTimestampLayout
+}
+
+// bcLeapProxyYear is the year bcLeapTimestampFallback substitutes into the date
+// token so the layout table can decode the TIME and ZONE fields around it. It
+// only has to be a year every validated month/day fits in — i.e. a leap one,
+// since Feb 29 is the whole point — and to be spelled with four digits, which
+// is what the layouts' "2006" element expects.
+const bcLeapProxyYear = 2000
+
+// bcLeapTimestampFallback is bcLeapDateFallback for a token that also carries a
+// time of day. The date half cannot be handed to time.Parse at its own year (see
+// the call site), but the time and zone halves must still be decoded by the
+// SAME layout table as every other input — hand-rolling a second time-of-day
+// parser here is exactly the divergence pgTimestampLayouts exists to prevent.
+// So the year is swapped for a leap proxy, the candidate is re-parsed through
+// the ordinary table, and the decoded wall clock is then rebuilt at the real
+// astronomical year (which also performs ApplyEra's era shift by hand, as the
+// DATE fallback does).
+//
+// The zone rule is applied to the PROXY value, not afterwards, because
+// tsApplyZone shifts the wall clock onto the UTC line and that shift can cross
+// midnight ('0001-02-29 00:30:00+05:30 BC' is the 28th in UTC). The resulting
+// whole-day movement is measured against the proxy date and re-applied to the
+// rebuilt one, so the fallback and the ordinary path agree about which day the
+// value lands on.
+//
+// ok is false for everything this does not apply to: a non-BC input (whose
+// literal and astronomical years agree, so time.Parse never disagreed), a token
+// whose fields do not read back, the no-year-zero refusal, and any candidate
+// the proxy rebuild still fails to parse — all of which keep the caller's
+// existing errNoTimestampLayout.
+func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode) (time.Time, bool) {
+	if !bc {
+		return time.Time{}, false
+	}
+	dateTok := dateTokenPrefix(text)
+	month, day, mdok := pgdatetime.DateTokenMonthDay(dateTok)
+	year, yok := pgdatetime.DateTokenYear(dateTok)
+	if !mdok || !yok {
+		return time.Time{}, false
+	}
+	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	if !ok {
+		return time.Time{}, false
+	}
+	probe := fmt.Sprintf("%04d-%02d-%02d", bcLeapProxyYear, month, day) + text[len(dateTok):]
+	for _, layout := range pgTimestampLayouts {
+		ts, err := time.Parse(layout, probe)
+		if err != nil {
+			continue
+		}
+		ts = applyTSZoneMode(ts, zone)
+		dayShift := int(time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, time.UTC).
+			Sub(time.Date(bcLeapProxyYear, time.Month(month), day, 0, 0, 0, 0, time.UTC)).Hours() / 24)
+		return time.Date(astroYear, time.Month(month), day,
+			ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC).
+			AddDate(0, 0, dayShift), true
+	}
+	return time.Time{}, false
 }
 
 // dateTokenPrefix returns the leading date token of a normalized "date<sep>

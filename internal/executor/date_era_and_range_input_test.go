@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/planner"
@@ -164,5 +165,111 @@ func TestDateEraLiteralAndCopyPathsAgree(t *testing.T) {
 			t.Errorf("date %q: shared-entry err=%v but literal path err=%v — the date input paths have drifted apart",
 				in, copyErr, litErr)
 		}
+	}
+}
+
+// M0119-0006 §15.2: the TIMESTAMP half of the BC leap-day race. The preceding
+// slice fixed parsePGDateText, whose date token goes through ONE layout; the
+// timestamp entry point composes the same token with a time of day and a zone
+// inside a single time.Parse per layout, so it kept losing the same race:
+// time.Parse checks day-in-month against the token's LITERAL year (1) while
+// PostgreSQL checks the ASTRONOMICAL one (0, leap because 0%400==0).
+//
+// Verified against PG 18.3, which accepts all of these:
+//
+//	'0001-02-29 10:00:00 BC'::timestamp        -> 0001-02-29 10:00:00 BC
+//	'0001-02-29 00:30:00+05:30 BC'::timestamp  -> 0001-02-29 00:30:00 BC (offset dropped)
+//	'0001-02-29 00:30:00+05:30 BC'::timestamptz-> 0001-02-28 19:00:00 BC (offset applied)
+//	'0001-02-29 24:00:00 BC'::timestamp        -> 0001-03-01 00:00:00 BC (whole-day carry)
+//	'0005-02-29 10:00:00 BC'::timestamp        -> 0005-02-29 10:00:00 BC (astronomical -4)
+//
+// The DECODED FIELDS are what this pins, because goopg's nanosecond carrier
+// refuses every BC value regardless (1677..2262) — asserting only the error
+// would pass with the fields still wrong. So the parts-level entry point is
+// checked for the value, and the composed one for the SQLSTATE.
+func TestBCLeapDayTimestampDecodesAtTheAstronomicalYear(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		zone tsZoneMode
+		want time.Time
+	}{
+		// Astronomical year 0 is 1 BC, and it IS a leap year.
+		{"0001-02-29 10:00:00 BC", tsDiscardZone, time.Date(0, 2, 29, 10, 0, 0, 0, time.UTC)},
+		{"0001-02-29 BC", tsDiscardZone, time.Date(0, 2, 29, 0, 0, 0, 0, time.UTC)},
+		{"0001-02-29T10:00:00 BC", tsDiscardZone, time.Date(0, 2, 29, 10, 0, 0, 0, time.UTC)},
+		{"0001-02-29 10:00:00.25 BC", tsDiscardZone, time.Date(0, 2, 29, 10, 0, 0, 250000000, time.UTC)},
+		// The zone rule still separates the two types, and applying an offset
+		// may cross midnight — the day the value lands on must move with it.
+		{"0001-02-29 00:30:00+05:30 BC", tsDiscardZone, time.Date(0, 2, 29, 0, 30, 0, 0, time.UTC)},
+		{"0001-02-29 00:30:00+05:30 BC", tsApplyZone, time.Date(0, 2, 28, 19, 0, 0, 0, time.UTC)},
+		// 5 BC is astronomical -4: divisible by 4, so leap as well.
+		{"0005-02-29 10:00:00 BC", tsDiscardZone, time.Date(-4, 2, 29, 10, 0, 0, 0, time.UTC)},
+	} {
+		got, carry, err := parsePGTimestampTextParts(c.in, c.zone)
+		if err != nil {
+			t.Errorf("parsePGTimestampTextParts(%q) failed: %v — PG 18.3 accepts this", c.in, err)
+			continue
+		}
+		if carry != 0 {
+			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 0", c.in, carry)
+		}
+		if !got.Equal(c.want) {
+			t.Errorf("parsePGTimestampTextParts(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	// The whole-day carry composes on top of the rebuilt date, so an hour-24 /
+	// leap-second time of day on the BC leap day rolls into March 1st exactly
+	// as it does upstream.
+	for _, in := range []string{"0001-02-29 24:00:00 BC", "0001-02-29 23:59:60 BC"} {
+		got, carry, err := parsePGTimestampTextParts(in, tsDiscardZone)
+		if err != nil {
+			t.Errorf("parsePGTimestampTextParts(%q) failed: %v", in, err)
+			continue
+		}
+		if carry != 1 {
+			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 1 (the whole day)", in, carry)
+		}
+		if want := time.Date(0, 3, 1, 0, 0, 0, 0, time.UTC); !got.AddDate(0, 0, carry).Equal(want) {
+			t.Errorf("parsePGTimestampTextParts(%q)+carry = %v, want %v", in, got.AddDate(0, 0, carry), want)
+		}
+	}
+}
+
+// The fallback must not widen anything: a day that is impossible even at the
+// astronomical year stays a RANGE error (22008, as upstream), and a genuine
+// syntax miss stays 22007. The composed entry point is the one the SQLSTATE
+// mapping sees, and for a BC value the carrier refuses it either way — the
+// assertion that matters is which PATH produced the code, so the impossible-day
+// and the leap-day cases are checked against each other.
+func TestBCLeapDayTimestampFallbackKeepsTheErrorClasses(t *testing.T) {
+	for _, c := range []struct {
+		in       string
+		wantCode string
+	}{
+		{"0001-02-29 10:00:00 BC", "22008"}, // valid fields, carrier range
+		{"0001-02-30 10:00:00 BC", "22008"}, // no such day in ANY year
+		{"0002-02-29 10:00:00 BC", "22008"}, // astronomical -1: NOT leap
+		{"0000-02-29 10:00:00 BC", "22008"}, // no year zero
+		{"not-a-timestamp BC", "22007"},     // still a syntax miss
+		{"0001-02-29 25:00:00 BC", "22008"}, // hour out of range, not a spelling
+	} {
+		_, err := parsePGTimestampText(c.in)
+		if err == nil {
+			t.Errorf("parsePGTimestampText(%q) unexpectedly succeeded", c.in)
+			continue
+		}
+		if got := dateTimeInputError(err, "timestamp", c.in, 0).Code; got != c.wantCode {
+			t.Errorf("dateTimeInputError(%q).Code = %s, want %s", c.in, got, c.wantCode)
+		}
+	}
+	// Non-BC input never reaches the fallback (literal and astronomical years
+	// agree there), so the ordinary path's answers are untouched.
+	for _, in := range []string{"2020-02-29 10:00:00", "2020-01-01 10:00:00", "1998-12-01"} {
+		if _, err := parsePGTimestampText(in); err != nil {
+			t.Errorf("parsePGTimestampText(%q): %v — inside the representable range", in, err)
+		}
+	}
+	if _, err := parsePGTimestampText("2021-02-29 10:00:00"); !errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+		t.Errorf("parsePGTimestampText(2021-02-29 10:00:00) err = %v, want ErrFieldOutOfRange — 2021 is not leap", err)
 	}
 }

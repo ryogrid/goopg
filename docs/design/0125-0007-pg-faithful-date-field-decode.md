@@ -1023,3 +1023,79 @@ question.
 `TestRepresentableDatesStillParse` unaffected (this slice only changes the
 error CODE for an input that was already rejected, it does not widen
 acceptance into the representable range).
+
+## 16. Follow-up 2026-08-11 (M0119-0006, 38th slice) — the TIMESTAMP half of the BC leap-day race
+
+### 16.1 What landed
+
+§15.2's deferral, closed. `parsePGTimestampTextParts`
+(`internal/executor/copy_text.go`) now falls back to a new
+`bcLeapTimestampFallback` when a candidate matches no layout, and the answer to
+§15.2's open design question — "how do the time-of-day fields get threaded
+through the `time.Date` construction?" — is that they must NOT be re-parsed by
+hand. `pgTimestampLayouts` exists precisely because three separate M0119-0006
+slices found the timestamp input paths disagreeing about a spelling; a private
+time-of-day parser inside the fallback would be a fourth such divergence,
+invisible until some later slice widened the table and forgot this one.
+
+So the fallback substitutes a **proxy year** into the date token
+(`bcLeapProxyYear = 2000`, chosen only because it is leap — Feb 29 is the whole
+point — and four digits wide, which is what the layouts' `2006` element wants)
+and re-parses the candidate through the ordinary table. Everything but the year
+is decoded by the same code as every other input: time of day, fractional
+seconds, the `T` separator, and the zone spellings. The decoded wall clock is
+then rebuilt at the real astronomical year via `time.Date`, which performs
+`ApplyEra`'s literal→astronomical shift by hand exactly as the DATE fallback
+does.
+
+One subtlety the DATE half does not have: the zone rule must be applied to the
+PROXY value, before the rebuild. `applyTSZoneMode(ts, tsApplyZone)` shifts the
+wall clock onto the UTC line, and that shift can cross midnight —
+`'0001-02-29 00:30:00+05:30 BC'::timestamptz` is the 28th in UTC. Rebuilding at
+the token's own month/day after the shift would silently discard that day
+movement. The fallback therefore measures the whole-day delta between the zoned
+proxy value and the proxy date and re-applies it with `AddDate` after the
+rebuild, so the fallback and the ordinary path land on the same day.
+
+`ok=false` (caller keeps its existing `errNoTimestampLayout`) for: `!bc` —
+where the literal and astronomical years agree, so `time.Parse` never disagreed
+in the first place; a token whose fields do not read back; the no-year-zero
+refusal (`AstronomicalYear` `ok=false`); and any candidate the proxy rebuild
+still fails to parse. The hook sits INSIDE the candidate loop rather than after
+it, so the hour-24 / leap-second canonicalized candidate still gets its own
+turn when the plain body's rebuild fails — which is what makes
+`'0001-02-29 24:00:00 BC'` compose to March 1st with `carry=1` rather than
+falling out as a syntax miss.
+
+Range behavior is unchanged and unchanged deliberately: every BC value is still
+outside the nanosecond carrier (1677..2262), so `'0001-02-29 10:00:00 BC'` is
+still refused — with `22008` (a field/range failure, as upstream) instead of
+`22007` (a spelling mistake). What moved is the PATH and therefore the code,
+plus the decoded fields underneath, which is what the tests pin.
+
+### 16.2 PG 18.3 oracle
+
+Captured from a throwaway 18.3 cluster; all five are accepted upstream and all
+five now decode to the same fields in goopg:
+
+| input | PG 18.3 |
+|---|---|
+| `'0001-02-29 10:00:00 BC'::timestamp` | `0001-02-29 10:00:00 BC` |
+| `'0001-02-29 00:30:00+05:30 BC'::timestamp` | `0001-02-29 00:30:00 BC` (offset dropped) |
+| `'0001-02-29 00:30:00+05:30 BC'::timestamptz` | `0001-02-28 19:00:00 BC` (offset applied) |
+| `'0001-02-29 24:00:00 BC'::timestamp` | `0001-03-01 00:00:00 BC` (whole-day carry) |
+| `'0005-02-29 10:00:00 BC'::timestamp` | `0005-02-29 10:00:00 BC` (astronomical −4, leap) |
+| `'0001-02-30 10:00:00 BC'::timestamp` | ERROR 22008 |
+
+### 16.3 Verification
+
+Two new tests in `internal/executor/date_era_and_range_input_test.go`:
+`TestBCLeapDayTimestampDecodesAtTheAstronomicalYear` asserts the DECODED
+FIELDS through `parsePGTimestampTextParts` (both zone modes, plus the hour-24
+and leap-second carries) — asserting only the SQLSTATE would pass with the
+fields still wrong, since the carrier refuses every BC value regardless — and
+`TestBCLeapDayTimestampFallbackKeepsTheErrorClasses` pins the error classes on
+either side of the fallback (impossible day, non-leap astronomical year, year
+zero, a real syntax miss, an out-of-range hour, and the untouched non-BC path).
+Mutation-checked: short-circuiting `bcLeapTimestampFallback` to `ok=false`
+turns all seven field assertions red and returns the `22008` case to `22007`.
