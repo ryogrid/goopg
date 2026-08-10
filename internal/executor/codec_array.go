@@ -79,6 +79,18 @@ func encodeArrayValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		body = append(body, eb...)
 	}
+	// Upstream construct_md_array (postgres/src/backend/utils/adt/arrayfuncs.c)
+	// re-aligns the running length AFTER each element, the last one included, so
+	// a PG array's VARSIZE is padded up to the element alignment. goopg used to
+	// stop at the final element, which was invisible to any reader (elements are
+	// found by count, never by scanning to the end) but made the blob a different
+	// SIZE from the one PG writes for the same value — visible to pg_column_size,
+	// to a byte-compare against a PG-written tuple, and to pg_amcheck. Pinned on
+	// PG 18.3: a 1-element timetz array is 40 bytes = MAXALIGN(24 + 12), a
+	// 1-element `\x01` bytea array is 32 = align4(24 + 5). M0119-0006.
+	if pad := alignPad(len(body), align); pad > 0 {
+		body = append(body, make([]byte, pad)...)
+	}
 	total := arrayHeaderSize + len(body)
 	buf := make([]byte, total)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
@@ -118,9 +130,34 @@ func encodeArrayElem(elemName, e string, varlena bool) ([]byte, error) {
 			}
 			return array4ByteVarlenaBytes(body), nil
 		}
+		if lower == "bytea" {
+			// Sibling of encodeValuePG's "bytea" arm: an element arrives as the
+			// TEXT inside the array literal, which upstream routes through
+			// byteain, and the stored body is the RAW bytes. Note the header is
+			// array4ByteVarlenaBytes, not the scalar arm's varlenaPayloadBytes:
+			// a scalar bytea may use PG's 1-byte short header, while inside an
+			// array body the elements are the always-4-byte form at align 4
+			// (pinned on PG 18.3: three 1-byte bytea elements make a 48-byte
+			// array = 24-byte header + 3 × MAXALIGN-padded 8).
+			raw, err := byteaIn(e, 0)
+			if err != nil {
+				return nil, err
+			}
+			return array4ByteVarlenaBytes(raw), nil
+		}
 		return array4ByteVarlena(e), nil
 	}
 	switch lower {
+	case "date", "time", "timestamp", "timestamptz", "timetz":
+		// The date-time element images, delegated to the SCALAR encoder rather
+		// than re-derived here (Hard-won Rule #2 — the element and the column
+		// must produce identical bytes, and every one of these arms already
+		// accepts the KindString an array element always is: date/timestamp go
+		// through parseCopyTimestamp plus the ±infinity literals, time through
+		// parseTimeString, timetz through parseTimeTZString). The widths the
+		// element table declares (4/8/8/8/12) are exactly what those arms
+		// return, which is what keeps the array body self-describing.
+		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
 	case "uuid":
 		// Sibling of encodeValuePG's "uuid" arm: pg_uuid_t, 16 raw bytes.
 		s := normalizeUUIDStr(strings.TrimSpace(e))

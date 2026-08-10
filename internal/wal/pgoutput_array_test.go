@@ -44,6 +44,21 @@ func le32(v uint32) []byte {
 	return b
 }
 
+func le64(v uint64) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, v)
+	return b
+}
+
+// byteaElem is one bytea array element: the same 4-byte varlena header as a text
+// element, over the RAW bytes rather than text.
+func byteaElem(raw []byte) []byte {
+	b := make([]byte, 4+len(raw))
+	binary.LittleEndian.PutUint32(b[0:4], uint32(4+len(raw))<<2)
+	copy(b[4:], raw)
+	return b
+}
+
 // textElem is one varlena array element: 4-byte header (len<<2) + payload.
 func textElem(s string) []byte {
 	b := make([]byte, 4+len(s))
@@ -100,6 +115,37 @@ func TestPgoDecodeArrayColumns(t *testing.T) {
 			typ:  catalog.Type{Name: "interval", IsArray: true},
 			blob: arrayBlob(1187, 2, append(ivl(1, 0, 0), ivl(0, 0, 2*3600*1_000_000)...)),
 			want: `{"1 mon",02:00:00}`,
+		},
+		// The date-time and bytea element images (M0119-0006 part 2). Before the
+		// element table covered them a subscriber received these columns as TEXT
+		// bodies under an elemtype-25 header; now the SAME bytes the heap holds
+		// must render as upstream's type output. Expected texts from PG 18.3 with
+		// TimeZone=UTC.
+		{
+			name: "date[]",
+			typ:  catalog.Type{Name: "date", IsArray: true},
+			// 7305 = days from 2000-01-01 to 2020-01-01; 7836 = 2021-06-15.
+			blob: arrayBlob(1082, 2, append(le32(uint32(int32(7305))), le32(uint32(int32(7836)))...)),
+			want: "{2020-01-01,2021-06-15}",
+		},
+		{
+			// The timestamp text contains a space, so array_out quotes it — a
+			// renderer that skipped the quoting would produce an array literal a
+			// subscriber re-parses into two elements.
+			name: "timestamp[]",
+			typ:  catalog.Type{Name: "timestamp", IsArray: true},
+			blob: arrayBlob(1114, 1, le64(uint64(7305*86400*int64(1_000_000)+10*3600*int64(1_000_000)))),
+			want: `{"2020-01-01 10:00:00"}`,
+		},
+		{
+			name: "bytea[]",
+			typ:  catalog.Type{Name: "bytea", IsArray: true},
+			// Raw bytes behind the 4-byte element header, at typalign 'i': the
+			// first element is 4+1 bytes and the second starts at the next
+			// 4-boundary.
+			blob: arrayBlob(17, 2, append(append(byteaElem([]byte{0x01}), 0, 0, 0),
+				byteaElem([]byte{0x01, 0x02, 0xff})...)),
+			want: `{"\\x01","\\x0102ff"}`,
 		},
 		{
 			name: "empty array",

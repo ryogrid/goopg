@@ -76,6 +76,34 @@ func ElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok boo
 		return 1186, 16, 8, false, true // pg_type 1186: typlen 16, typalign 'd'
 	case "numeric", "decimal":
 		return 1700, -1, 4, true, true // pg_type 1700: varlena, typalign 'i'
+	// M0119-0006 array-element slice, part 2 — the date-time types and bytea.
+	// Same defect as the interval/uuid/numeric arms above, one type family
+	// later: with no arm here a `date[]`/`time[]`/`timestamp[]`/`timestamptz[]`/
+	// `timetz[]`/`bytea[]` column fell to the unknown-element fallback and was
+	// written as an ArrayType whose elemtype field says 25 (text) over element
+	// TEXT bodies, while pg_attribute.atttypid for the same column says
+	// _date/_time/_timestamp/_timestamptz/_timetz/_bytea. goopg read its own
+	// text back correctly, so nothing inside the engine was wrong — the blob and
+	// the catalog simply disagreed, which is exactly what a descriptor-trusting
+	// reader (a PG 18.3 standby, pg_amcheck's heap tier) deforms wrongly.
+	// Widths/alignments are pg_type's own (typlen/typalign for OIDs 1082/1083/
+	// 1114/1184/1266/17), cross-checked against PG 18.3 pg_column_size for
+	// 2-element arrays: 32 = 24 + 4 + 4 (date), 40 = 24 + 8 + 8 (time,
+	// timestamp, timestamptz), 56 = MAXALIGN(24 + 12 + pad4 + 12) (timetz), and bytea
+	// elements carrying the same 4-byte varlena header at align 4 that the text
+	// elements use (a 3×1-byte bytea array is 48 = 24 + 3×8).
+	case "date":
+		return 1082, 4, 4, false, true
+	case "time":
+		return 1083, 8, 8, false, true
+	case "timestamp":
+		return 1114, 8, 8, false, true
+	case "timestamptz":
+		return 1184, 8, 8, false, true
+	case "timetz":
+		return 1266, 12, 8, false, true
+	case "bytea":
+		return 17, -1, 4, true, true
 	default:
 		return 0, 0, 0, false, false
 	}
@@ -166,6 +194,14 @@ func DecodeElem(elemName string, data []byte, varlena bool, size int) (string, i
 			}
 			return text, sz, nil
 		}
+		if lower == "bytea" {
+			// Sibling of encodeArrayElem's "bytea" arm: the body is the RAW
+			// bytes, so it renders through byteaout's hex form rather than being
+			// treated as text (which would emit the raw bytes and could not even
+			// be quoted safely). The backslash makes array_out quote it, so the
+			// element comes back as PG prints it: {"\\x0102"}.
+			return QuoteTextElem(ByteaOutHex(data[4:sz])), sz, nil
+		}
 		return QuoteTextElem(string(data[4:sz])), sz, nil
 	}
 	if len(data) < size {
@@ -203,9 +239,42 @@ func DecodeElem(elemName string, data []byte, varlena bool, size int) (string, i
 			return "t", 1, nil
 		}
 		return "f", 1, nil
+	// Siblings of encodeArrayElem's date-time arms (M0119-0006). Each renders
+	// the same integer image the SCALAR column stores, through the shared
+	// pgdatetime renderers, so the element text is upstream's type output
+	// function verbatim; QuoteTextElem then applies array_out's quoting, which
+	// is not optional for timestamp/timestamptz (their text contains a space).
+	case "date":
+		return QuoteTextElem(pgdatetime.FormatDate(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
+	case "time":
+		return QuoteTextElem(pgdatetime.FormatTime(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
+	case "timestamp":
+		return QuoteTextElem(pgdatetime.FormatTimestamp(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
+	case "timestamptz":
+		return QuoteTextElem(pgdatetime.FormatTimestampTZUTC(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
+	case "timetz":
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		zone := int32(binary.LittleEndian.Uint32(data[8:12]))
+		return QuoteTextElem(pgdatetime.FormatTimeTZ(micros, zone)), 12, nil
 	default:
 		return "", 0, fmt.Errorf("unsupported fixed array element type %q", elemName)
 	}
+}
+
+// ByteaOutHex is byteaout under the default `bytea_output = hex` GUC: the two
+// literal characters `\x` followed by lowercase hex. It lives in this leaf
+// package for the same reason the element table does — the array element
+// decoder here and the executor's scalar bytea renderer must produce the same
+// text, and internal/wal's pgoutput (which reads array elements too) cannot
+// import the executor. executor.byteaOutHex delegates here. M0119-0006.
+func ByteaOutHex(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, 2+len(b)*2)
+	out = append(out, '\\', 'x')
+	for _, c := range b {
+		out = append(out, hexdigits[c>>4], hexdigits[c&0x0f])
+	}
+	return string(out)
 }
 
 // QuoteTextElem applies PG array-output quoting: an element is double-quoted

@@ -2732,6 +2732,48 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       its own mutation. 2 ledger rows (no heap element images for
       date/time/timestamp/bytea/enum arrays; array-keyed indexes cost heap
       fetches PG answers index-only).
+      **Slice landed 2026-08-12 (26th) — `date[]`/`time[]`/`timestamp[]`/
+      `timestamptz[]`/`timetz[]`/`bytea[]` ELEMENT images** (design
+      `docs/design/0119-0006-array-element-datetime-images.md`). Part 2 of the
+      21st slice, one type family later: `pgarray.ElemTypeInfo` had no arm for
+      any date-time type or for `bytea`, so all six fell to the *unknown
+      element* fallback — an `ArrayType` whose `elemtype` says **25 (text)** over
+      the literal characters the user typed, while `pg_attribute.atttypid` for
+      the same column says `_date`/`_time`/`_timestamp`/`_timestamptz`/`_timetz`/
+      `_bytea` (confirmed at HEAD on a throwaway cluster: OIDs
+      1182/1183/1115/1185/1270/1001 over text bodies). goopg read its own text
+      straight back, so the defect is invisible from inside the engine and
+      visible only to a descriptor-trusting reader — a PG 18.3 standby,
+      `pg_amcheck`'s heap tier, the pgoutput decoder. The user-visible half is
+      that the text path echoed the INPUT spelling instead of the type's OUTPUT
+      function: `'{2020-1-2}'::date[]`, `'{1:2:3}'::time[]`,
+      `'{04:05:06.100000}'::time[]`, a `+02` timestamptz and
+      `'{01:02:03+05:00}'::timetz[]` were five wrong answers against the PG 18.3
+      oracle, all five now byte-identical to it. Widths/alignments are
+      `pg_type`'s own, cross-checked against `pg_column_size` (32/40/40/40/56/44).
+      The encode side DELEGATES to `encodeValuePG` with the scalar element type
+      instead of re-deriving the image, so element and column cannot drift
+      (Hard-won Rule #2 made structural); the decode side renders through new
+      leaf `pgdatetime.Format{Date,Time,Timestamp,TimestampTZUTC,TimeTZ}` —
+      ports of `date_out`/`time_out`/`timestamp_out`/`timetz_out` over a `j2date`
+      port, in the leaf package because `internal/wal` cannot import the
+      executor — and `executor.byteaOutHex` moved down to `pgarray.ByteaOutHex`
+      for the same reason. The slice also surfaced a fidelity bug no reader could
+      notice: upstream `construct_md_array` re-aligns the running length after
+      EVERY element including the last, so a 1-element `timetz[]` is 40 bytes in
+      PG and was 36 in goopg — goopg's arrays were a different SIZE from PG's for
+      the same value (previously-landed element types unaffected: 56/56/44).
+      Gates: 4 `pgdatetime` format tests (the timetz one asserts the zone SIGN
+      direction, which a whole-value table can pass with the sign inverted),
+      5 array-codec tests (round-trip normalisation, on-disk layout,
+      element-bytes-equal-scalar-column-bytes, legacy pre-flip blob, invalid
+      element) and 3 new `TestPgoDecodeArrayColumns` rows; three
+      mutation-checked. Units + `TestPort_RegressSuite` + tpch-spotcheck
+      (Q12=2/Q13=35) PASS. 3 ledger rows: timestamptz elements render in UTC
+      only, the date/timestamp input functions reject `BC` and `HH:MM` spellings
+      PG accepts (pre-existing in the scalar column, now inherited by arrays),
+      and `decodeArrayKeyElemText` still refuses these element types although the
+      "no heap image to agree with" half of that refusal is now gone.
       Remaining for M0119-0006: `box`/`int4range` key encodings and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 

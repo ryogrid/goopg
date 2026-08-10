@@ -3,6 +3,8 @@ package executor
 import (
 	"fmt"
 	"unicode/utf8"
+
+	"github.com/goopg/goopg/internal/pgarray"
 )
 
 // PG-faithful bytea input/output primitives (M0125-0021).
@@ -331,11 +333,8 @@ func byteaOperand(d Datum) ([]byte, bool) {
 // byteaOutHex is byteaout under the default `bytea_output = hex` GUC: the
 // literal two characters `\x` followed by lowercase hex. This is the text a
 // bytea value takes on when cast to text and what the wire renderer emits.
-func byteaOutHex(b []byte) string {
-	out := make([]byte, 0, 2+len(b)*2)
-	out = append(out, '\\', 'x')
-	for _, c := range b {
-		out = append(out, hexLowerDigits[c>>4], hexLowerDigits[c&0x0f])
-	}
-	return string(out)
-}
+// The implementation moved to the leaf internal/pgarray when bytea ARRAY
+// elements started storing raw bytes: the element decoder there renders the
+// same text and cannot import the executor, so keeping a second copy here
+// would be exactly the sibling drift Hard-won Rule #2 exists to prevent.
+func byteaOutHex(b []byte) string { return pgarray.ByteaOutHex(b) }
