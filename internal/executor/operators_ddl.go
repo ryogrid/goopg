@@ -11252,6 +11252,9 @@ func isSupportedBTreeKeyType(name string) bool {
 		isByteaType(name) || isTimeOfDayType(name) ||
 		// timetz — M0119-0006, the two-part key (btree_scalar_keys.go).
 		isTimeTzType(name) ||
+		// interval — M0119-0006, the lossy 128-bit comparison span
+		// (btree_interval_key.go).
+		isIntervalTypeName(name) ||
 		strings.ToLower(name) == "uuid"
 }
 

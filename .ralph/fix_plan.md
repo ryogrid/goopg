@@ -2382,8 +2382,47 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       reported error in three of them. 1 ledger row (ASCII-vs-Unicode
       whitespace trim, which applies to every type input function and deserves
       one answer).
+      **Slice landed 2026-08-10 (17th) — `interval` key encoding, the first
+      goopg index key with NO decode sibling** (design
+      `docs/design/0119-0006-interval-index-key-encoding.md`). `CREATE INDEX ON
+      t(interval_col)` raised `0A000 btree v0 only supports int4 / numeric
+      keys`, so an interval column could not be indexed at all. Upstream
+      `interval_cmp_value` (`postgres/src/backend/utils/adt/timestamp.c`)
+      collapses months/days/micros into ONE signed 128-bit span
+      `(month*30 + day)*USECS_PER_DAY + time` and `interval_cmp` compares
+      nothing else, so the key is that span alone — deliberately lossy, and the
+      loss is the correct behaviour: `'1 mon' = '30 days'` is TRUE in PG
+      (captured from the 18.3 reference cluster), so a field-preserving key
+      would pass an ordering test and still order values PG calls equal, let a
+      UNIQUE index accept a duplicate PG rejects, and make a probe for
+      `'30 days'` miss a stored `'1 mon'`. Landed as `btree.EncodeInt128` (the
+      sign-bit flip applied to the high half only; 128 bits is not optional —
+      the day total reaches 6.4e10 and scaling by USECS_PER_DAY overflows
+      int64) plus new `internal/executor/btree_interval_key.go`, routed through
+      the same three seams as the timetz slice. Text is parsed with
+      `parser.ParseIntervalBody`, the entry point `'…'::interval` uses, which
+      matters because goopg holds an interval COLUMN as text — `KindString` is
+      the shape that actually reaches both stored-key writers. The decode arm
+      REFUSES rather than being absent (the siblings' shared `default:` arm
+      reads any 8 leading bytes as an enum float8 and never errors), and new
+      `indexOnlyScanOp.indexKeyIsDecodable` makes the index-only scan decline
+      its decode-from-key fast path and read the heap instead — without it the
+      query fails `XX000 IOS decode: …`, confirmed by mutation. Gates:
+      `TestEncodeIntervalBTreeKeyMatchesPGOrder`,
+      `TestIntervalKeyIsTheComparisonSpan`,
+      `TestIntervalKeyStringAndIntervalDatumAgree`,
+      `TestIntervalKeyRejectsUnparseableText`,
+      `TestIntervalKeyDecodeIsRefused`,
+      `TestIntervalIndexBuildAndMaintainKeys`,
+      `TestIntervalCompositeKeyIsSelfDelimiting`,
+      `TestIntervalIndexOnlyScanReadsHeap` — each non-vacuous under one of five
+      source mutations. 2 ledger rows, the first of them significant: an
+      interval COLUMN still compares as TEXT at runtime (seq-scan
+      `WHERE i > '10 days'` drops a stored `'1 mon'`, `ORDER BY i` is
+      alphabetical), so with the index order now correct the answer is
+      plan-dependent.
       Remaining for M0119-0006: posting-list duplicate coverage in the
-      checkunique tier, `box`/`int4range`/`interval` key encodings, and
+      checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`

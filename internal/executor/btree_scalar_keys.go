@@ -253,6 +253,11 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 				Message: fmt.Sprintf("column %q is not time with time zone at runtime", col.Name)}
 		}
 		return encodeTimeTzBTreeKey(v), true, nil
+	case isIntervalTypeName(col.Type.Name):
+		// The 128-bit comparison span; see btree_interval_key.go for why the
+		// key is lossy on purpose.
+		k, encErr := encodeIntervalBTreeKey(v, col.Name, pos)
+		return k, true, encErr
 	case isTimeOfDayType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -320,6 +325,10 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		// the offset EAST of UTC.
 		local := gmt - int64(pgZone)*1_000_000
 		return NewTimeTZDatum(pgTimeFromMicros(local), int(-pgZone)), 12, true, nil
+	case isIntervalTypeName(typeName):
+		// Refused by construction, not unimplemented — see
+		// intervalKeyNotDecodable.
+		return NullDatum, 0, true, intervalKeyNotDecodable()
 	case isTimeOfDayType(typeName):
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: time key truncated, got %d bytes", len(key))

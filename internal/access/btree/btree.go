@@ -510,6 +510,24 @@ func EncodeInt8(key int64) []byte {
 	return b[:]
 }
 
+// EncodeInt128 encodes a signed 128-bit value, given as its two's-complement
+// (high int64, low uint64) halves, into a sortable 16-byte representation: the
+// same sign-bit flip EncodeInt4/EncodeInt8 use, applied to the HIGH half only.
+// Flipping just the high half is sufficient and necessary — the low half is a
+// pure magnitude continuation whose unsigned big-endian order is already the
+// correct tiebreak once the high halves are equal.
+//
+// The only user is the `interval` index key (M0119-0006): upstream's
+// interval_cmp_value (postgres/src/backend/utils/adt/timestamp.c) reduces an
+// interval to an INT128 span because month*30 days scaled to microseconds
+// overflows int64.
+func EncodeInt128(hi int64, lo uint64) []byte {
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[0:8], uint64(hi)^0x8000000000000000)
+	binary.BigEndian.PutUint64(b[8:16], lo)
+	return b[:]
+}
+
 // DecodeInt8 inverts EncodeInt8.
 func DecodeInt8(b []byte) (int64, error) {
 	if len(b) != 8 {

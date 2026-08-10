@@ -166,9 +166,18 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
 	}
 
+	// Some key encodings cannot be inverted (interval's key is the lossy
+	// comparison span — btree_interval_key.go), so the decode-from-key fast
+	// path below has nothing to decode. Reading the heap instead is always
+	// correct, just slower — and it is what the ALL_VISIBLE flag is an
+	// optimization over — whereas letting decodeRowFromKey error would fail the
+	// whole query. Decided once per scan: it is a property of the index's
+	// column types, not of the row.
+	keyDecodable := o.indexKeyIsDecodable()
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
-		if ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
+		if keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
 			row, err := o.decodeRowFromKey(key)
 			if err != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
@@ -344,6 +353,33 @@ func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 func (o *indexOnlyScanOp) Close() error {
 	o.rows = nil
 	return nil
+}
+
+// indexKeyIsDecodable reports whether decodeRowFromKey can invert this index's
+// key. False for an index any of whose key columns has a deliberately
+// non-invertible encoding — today only `interval`, whose key is upstream's
+// interval_cmp_value span (btree_interval_key.go). The whole index is declined
+// rather than the single column because the composite walk decodes columns in
+// order and cannot skip one whose byte width it does not know.
+//
+// Not consulted on the pgIndexKeyDesc (PG tuple-image) path: there the key
+// carries per-attribute datums, so nothing is lost — but such an index does not
+// take the fast path through this predicate either, since decodeRowFromKey
+// routes on the descriptor first.
+func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
+	if o.plan.Index == nil || o.ctx == nil || o.ctx.Catalog == nil {
+		return true
+	}
+	for _, colName := range o.plan.Index.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !ok {
+			continue // the decode path reports this one itself
+		}
+		if !col.Type.IsArray && isIntervalTypeName(col.Type.Name) {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeRowFromKey extracts covered column values from a B-tree key.
