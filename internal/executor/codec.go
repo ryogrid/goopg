@@ -169,6 +169,26 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	return s, nil
 }
 
+// pgBoolIn reproduces PostgreSQL's boolean input conversion —
+// `parse_bool_with_len` (postgres/src/backend/utils/adt/bool.c), which boolin
+// calls after trimming surrounding whitespace. The accepted spellings are the
+// unambiguous prefixes of "true"/"false"/"yes"/"no"/"on"/"off" plus "1"/"0";
+// note "o" alone is NOT accepted (it cannot distinguish on from off).
+// Returns (value, true) on success, (false, false) for unrecognised input.
+//
+// Single source of truth for the four sites that used to carry their own copy
+// of this table (evalTypedStringLit, evalCast, isValidBoolInput, and the
+// encodeValuePG bool arm) — Hard-won Rule #2.
+func pgBoolIn(s string) (bool, bool) {
+	switch strings.TrimSpace(strings.ToLower(s)) {
+	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
+		return true, true
+	case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
+		return false, true
+	}
+	return false, false
+}
+
 // encodeValuePG encodes a single datum in PG-native format.
 func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
@@ -180,10 +200,26 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
-		if d.Kind != KindBool {
+		var b bool
+		switch d.Kind {
+		case KindBool:
+			b = d.BoolValue()
+		case KindString:
+			// A bare quoted literal (`INSERT INTO t(b) VALUES ('true')`) is
+			// typed `unknown` upstream and reaches the column through boolin
+			// (postgres/src/backend/utils/adt/bool.c), so PG loads every
+			// pg_dump / COPY-style script that quotes its booleans. Sibling to
+			// the KindString arms every other scalar case below already has.
+			var ok bool
+			b, ok = pgBoolIn(d.StringValue())
+			if !ok {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
+			}
+		default:
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
 		}
-		if d.BoolValue() {
+		if b {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil

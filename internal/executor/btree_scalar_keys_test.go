@@ -50,15 +50,11 @@ func timeTzDatumOfDay(micros int64, offsetEastSecs int) Datum {
 	return NewTimeTZDatum(pgTimeFromMicros(micros), offsetEastSecs)
 }
 
-// sqlLiteralForKeyType writes the value as an INSERT literal. Everything is
-// quoted except boolean: goopg's codec bool arm requires KindBool strictly, so
-// `VALUES ('true')` into a bool column raises XX000 where PG accepts it (the
-// unknown-literal coercion gap recorded in the deferral ledger). That gap is
-// upstream of index keys, so this test uses the unquoted form.
-func sqlLiteralForKeyType(typ, lit string) string {
-	if isBoolType(typ) {
-		return lit
-	}
+// sqlLiteralForKeyType writes the value as an INSERT literal — quoted for every
+// type including boolean. The bool arm used to be excepted because goopg's codec
+// demanded KindBool strictly and `VALUES ('true')` raised XX000; that gap is
+// closed (pgBoolIn), so the quoted form now exercises the same path PG does.
+func sqlLiteralForKeyType(lit string) string {
 	return "'" + lit + "'"
 }
 
@@ -255,11 +251,11 @@ func TestScalarIndexBuildAndMaintainKeys(t *testing.T) {
 				fmt.Sprintf("CREATE INDEX %s_idx ON %s (k)", mt, mt),
 			}
 			for _, lit := range ins {
-				stmts = append(stmts, fmt.Sprintf("INSERT INTO %s VALUES (%s)", mt, sqlLiteralForKeyType(tc.typ, lit)))
+				stmts = append(stmts, fmt.Sprintf("INSERT INTO %s VALUES (%s)", mt, sqlLiteralForKeyType(lit)))
 			}
 			stmts = append(stmts, fmt.Sprintf("CREATE TABLE %s (k %s)", bt, tc.typ))
 			for _, lit := range ins {
-				stmts = append(stmts, fmt.Sprintf("INSERT INTO %s VALUES (%s)", bt, sqlLiteralForKeyType(tc.typ, lit)))
+				stmts = append(stmts, fmt.Sprintf("INSERT INTO %s VALUES (%s)", bt, sqlLiteralForKeyType(lit)))
 			}
 			stmts = append(stmts, fmt.Sprintf("CREATE INDEX %s_idx ON %s (k)", bt, bt))
 			for _, sql := range stmts {

@@ -2349,6 +2349,39 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       confirmed non-vacuous by four separate source mutations. 2 ledger rows
       (interval; and `timetz[]` elements, which now encode but have no
       renderer in `decodeArrayKeyElemText`).
+      **Slice landed 2026-08-10 (16th) — `boolean` input from an unknown
+      literal** (design
+      `docs/design/0119-0006-bool-unknown-literal-input.md`). The INSERT-path
+      coercion defect the 13th slice's E2E test had to work around by inserting
+      booleans UNQUOTED: `INSERT INTO t(b) VALUES ('true')` raised
+      `XX000 expected bool, got kind 3` because `encodeValuePG`'s bool arm
+      demanded `KindBool` strictly. Upstream types a bare literal `unknown` and
+      coerces it through the column type's input function — `boolin`
+      (`postgres/src/backend/utils/adt/bool.c`) — so every `pg_dump` archive /
+      COPY-style loader script that quotes its booleans loads on PG and failed
+      here, and a `boolean[]` column was unwritable by ANY spelling
+      (`encodeArrayValuePG` recurses per element and an element is always
+      element TEXT). Auditing all 15 `expected …, got kind` sites in
+      `encodeValuePG` shows bool was the lone holdout — every other scalar arm
+      already routes `KindString` — so this is one arm, not a sweep. New
+      `pgBoolIn` reproduces `boolin` (trim + `parse_bool_with_len`) and becomes
+      the SINGLE source of the spelling table, which four sites had each copied
+      (`evalTypedStringLit`, `evalCast`, `isValidBoolInput`, the codec arm) —
+      Hard-won Rule #2. Two upstream details are load-bearing and gated: a lone
+      `o` is REJECTED (it prefixes both `on` and `off`, hence upstream's
+      minimum compare length of 2) while `of` is accepted, and `1`/`0` count
+      only at length one. `KindInt` is deliberately NOT accepted — `VALUES (1)`
+      into a bool column is an error upstream too. Gates:
+      `TestPgBoolInMatchesParseBoolWithLen`,
+      `TestEncodeValuePGBoolAcceptsUnknownLiteral`,
+      `TestBoolColumnAcceptsQuotedLiteralEndToEnd` (scalar AND array column
+      through the real INSERT path, plus a refusal case), and
+      `TestScalarIndexBuildAndMaintainKeys/bool`, whose fixture drops its bool
+      exception so `sqlLiteralForKeyType` now quotes every type — all
+      non-vacuous under one source mutation, which reproduced the exact
+      reported error in three of them. 1 ledger row (ASCII-vs-Unicode
+      whitespace trim, which applies to every type input function and deserves
+      one answer).
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range`/`interval` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.

@@ -2818,16 +2818,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	}
 	switch x.Type {
 	case "bool", "boolean":
-		v := strings.TrimSpace(strings.ToLower(x.Value))
-		switch v {
-		case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
-			return NewBoolDatum(true), nil
-		case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-			return NewBoolDatum(false), nil
-		default:
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type boolean: %q", x.Value)}
+		if b, ok := pgBoolIn(x.Value); ok {
+			return NewBoolDatum(b), nil
 		}
+		return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: fmt.Sprintf("invalid input syntax for type boolean: %q", x.Value)}
 
 	case "int2", "smallint":
 		n, err := parseIntegerInput(x.Value, "smallint", 16)
@@ -3280,16 +3275,11 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		case KindBool:
 			return d, nil
 		case KindString:
-			v := strings.TrimSpace(strings.ToLower(d.StringValue()))
-			switch v {
-			case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
-				return NewBoolDatum(true), nil
-			case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-				return NewBoolDatum(false), nil
-			default:
-				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
-					Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
+			if b, ok := pgBoolIn(d.StringValue()); ok {
+				return NewBoolDatum(b), nil
 			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
 		case KindInt:
 			return NewBoolDatum(d.Int != 0), nil
 		default:
@@ -13517,12 +13507,8 @@ func currentSchemasArray(ctx *Context, includeImplicit bool) (Datum, error) {
 }
 
 func isValidBoolInput(v string) bool {
-	switch strings.TrimSpace(strings.ToLower(v)) {
-	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1",
-		"f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-		return true
-	}
-	return false
+	_, ok := pgBoolIn(v)
+	return ok
 }
 
 // hashPartTypesCompatible returns true if the arg type is compatible with the column type
