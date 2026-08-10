@@ -1382,6 +1382,33 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.
+        - [x] **3b-3a — MAXALIGNed item placement** (2026-08-10). NOT
+              REINDEX-required. Slice 2 filed two MAXALIGNs under one reason —
+              a blob key's length is only `size - SizeOfIndexTupleData`, so
+              padding destroys it — but the reason covers only one of them.
+              `PageAddItemExtended` rounds the ALLOCATION
+              (`upper -= MAXALIGN(size)`) while `ItemIdSetNormal` records the
+              EXACT size, so the pad lands between items and `lp_len` still
+              yields the key length. `storage.PageAddItemRaw`,
+              `PageInsertItemRawAt` and `PageReplaceItemRaw`'s grow branch now
+              allocate `maxAlign8(len(raw))` — the helper the heap path has
+              used since M0106-0010, so the two halves of the page layer
+              finally agree. The replace path's in-place branch deliberately
+              does not reuse an item's own padding (a pre-slice page has none;
+              growing into it clobbers the neighbour). The budget moved with
+              the writer or root-0040 re-opens inverted:
+              `indexFormat.itemEncodedSize` charges `MaxAlign(bodySize)`, and
+              `pageHighKeyFootprint` + the bulk loader's raw-append check
+              match it. Guard `TestRawItemPlacementIsMaxAligned` pins BOTH
+              halves — aligned `lp_off`/`pd_upper`, UNROUNDED `lp_len`, no
+              clobbered neighbour — because pinning alignment alone would let
+              a later cleanup round `lp_len` and corrupt every blob key.
+              Gates: btree/storage/amcheck + units PASS; pgbench smoke PASS.
+        - [ ] **3b-3b** — the two tuple-INTERNAL MAXALIGNs
+              (`index_form_tuple` size rounding, `BTreeTupleSetPosting` posting
+              offset), blocked until every index is descriptor-bearing.
+        - [ ] **3b-3c** — `_bt_keep_natts` suffix truncation.
+        - [ ] **3b-3d** — `MaxHighKeyLen`/`bulkHighKeyReserve` → `BTMaxItemSize`.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

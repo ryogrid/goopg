@@ -36,7 +36,11 @@ func TestItemCodecBlobFormatUnchanged(t *testing.T) {
 		if want := SizeOfIndexTupleData + len(it.key); blobFormat.bodySize(it.key) != want {
 			t.Fatalf("bodySize = %d, want %d", blobFormat.bodySize(it.key), want)
 		}
-		if want := 4 + SizeOfIndexTupleData + len(it.key); blobFormat.itemEncodedSize(it) != want {
+		// The BODY is unchanged; the BUDGET is MAXALIGNed since 3b-3a,
+		// because that is what PageAddItemRaw now allocates. The blob bytes
+		// on disk are still the same bytes — only the padding between items
+		// (which no reader ever addresses) is new.
+		if want := 4 + MaxAlign(SizeOfIndexTupleData+len(it.key)); blobFormat.itemEncodedSize(it) != want {
 			t.Fatalf("itemEncodedSize = %d, want %d", blobFormat.itemEncodedSize(it), want)
 		}
 		back, err := blobFormat.parse(got)

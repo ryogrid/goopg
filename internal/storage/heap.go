@@ -684,12 +684,21 @@ func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// MAXALIGNed placement, exactly as PageAddItemExtended does it
+	// (postgres/src/backend/storage/page/bufpage.c): the allocation is
+	// MAXALIGN(size) but the line pointer records the UNALIGNED size, so a
+	// reader still recovers the item's true length from lp_len (and, for a
+	// B-tree blob key, its key length as lp_len - SizeOfIndexTupleData).
+	// Keeping pd_upper 8-byte aligned is what lets a real PG backend deform
+	// an item in place: index_deform_tuple / heap_deform_tuple read
+	// alignment-sensitive datums directly off the page. M0130-S11.4 3b-3a.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	count, err := PageLinePointerCount(p)
 	if err != nil {
 		return 0, err
@@ -725,7 +734,9 @@ func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// MAXALIGNed placement — see PageAddItemRaw. M0130-S11.4 3b-3a.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
@@ -736,12 +747,12 @@ func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
 	if int(slot) < 1 || int(slot) > count+1 {
 		return 0, fmt.Errorf("PageInsertItemRawAt: slot %d out of range [1,%d]", slot, count+1)
 	}
-	// Append the new tuple bytes at upper-len(raw); existing tuple
+	// Append the new tuple bytes at upper-MAXALIGN(len(raw)); existing tuple
 	// data on the page does NOT need to move (each line pointer
 	// references its tuple by absolute offset, so existing items
 	// remain addressable).
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	// Shift the line-pointer array's [slot-1 .. count) entries right
 	// by one slot (line pointers are 0-based in the array but
 	// 1-based externally).
@@ -814,11 +825,16 @@ func PageReplaceItemRaw(p Page, slot uint16, raw []byte) error {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	if upper-lower < len(raw) {
+	// MAXALIGNed placement — see PageAddItemRaw. The in-place branch above
+	// deliberately does NOT reuse this item's alignment padding: a page
+	// written before M0130-S11.4 3b-3a has no padding to reuse, so growing
+	// into it would clobber the neighbouring item.
+	alignedSize := maxAlign8(len(raw))
+	if upper-lower < alignedSize {
 		return ErrNoSpaceInPage
 	}
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	newID := ItemID{Offset: uint16(newUpper), Flags: id.Flags, Length: uint16(len(raw))}
 	if err := writeItemID(p, int(slot)-1, newID); err != nil {
 		return err

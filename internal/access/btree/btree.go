@@ -311,11 +311,11 @@ type item struct {
 // The divisor is the minimum per-item footprint: a 4-byte line pointer (the
 // itemIDSize that pageHasSpaceFor reserves) plus the smallest possible item
 // body. The smallest body is a bare IndexTupleData header with a zero-length
-// key — an internal page's negative-infinity downlink. goopg stores item
-// bodies unaligned (pageHasSpaceFor reserves exactly itemIDSize +
-// SizeOfIndexTupleData + len(key)), so there is no MAXALIGN term, unlike
-// upstream's MAXALIGN(sizeof(IndexTupleData)+1) — see the S11.4-slice-2 ledger
-// row on MAXALIGNed item placement.
+// key — an internal page's negative-infinity downlink, 8 bytes, which is
+// already MAXALIGNed. Upstream's divisor is MAXALIGN(sizeof(IndexTupleData)+1)
+// = 16 because it assumes at least one key byte; goopg keeps 8, which makes
+// this bound LOOSER than upstream's and therefore still free of the false
+// positives that would turn a legal zero-key page into a corruption report.
 // Like upstream the bound is deliberately conservative: it ignores the per-page
 // special (opaque) area, so the true maximum is a little lower — that headroom is
 // exactly what keeps the corruption check free of false positives.
@@ -340,13 +340,16 @@ const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 
 // sizes, downlinks and heap TIDs — everything `_bt_checkpage` and the page
 // structure need — but cannot yet `index_deform_tuple` the key itself.
 //
-// Two further upstream properties are deliberately NOT reproduced yet, both
-// for the same reason — the opaque key's length is recoverable only as
-// size - SizeOfIndexTupleData, so any padding would destroy it (ledger row,
-// M0130-S11.4): index_form_tuple MAXALIGNs the tuple size ("be conservative"),
-// and PageAddItemExtended MAXALIGNs the item's placement. Neither affects a
-// non-assert PG build's ability to read the page — it reaches every field
-// through t_info and the line pointer — but slice 3 restores both.
+// Of the two MAXALIGNs slice 2 deferred, 3b-3a restored the second and only
+// the second. PageAddItemExtended's MAXALIGNed PLACEMENT is now reproduced
+// (storage.PageAddItemRaw and friends) — it was always safe here, because the
+// alignment lands in pd_upper and the padding BETWEEN items while lp_len keeps
+// the exact size, so a blob key's length is still size - SizeOfIndexTupleData.
+// index_form_tuple's MAXALIGNed tuple SIZE stays deferred for exactly the
+// reason slice 2 gave: it would round t_info's size field, and for a blob key
+// that field IS the key length. It becomes safe per-index once every index is
+// descriptor-bearing (the key length then comes from the descriptor, not from
+// arithmetic on the size) — see the ledger row.
 //
 // The 13-bit INDEX_SIZE_MASK cannot overflow here: a body must fit in a page,
 // and BlockSize (8192) minus the page header already leaves less than 8191.
@@ -3350,7 +3353,9 @@ func pageHighKeyFootprint(p storage.Page) int {
 		return 0
 	}
 	const itemIDSize = 4 // matches storage.itemIDSize
-	return itemIDSize + len(raw)
+	// MAXALIGNed, matching what PageAddItemRaw will actually allocate when the
+	// separator is re-added by a whole-page rewrite (M0130-S11.4 3b-3a).
+	return itemIDSize + MaxAlign(len(raw))
 }
 
 // pageOccupied returns the bytes already used by line pointers

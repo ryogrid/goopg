@@ -228,9 +228,15 @@ func (f indexFormat) bodySize(key []byte) int {
 // pageHasSpaceFor and PageInsertItemRawAt depend on — they were once computed
 // from different expressions and a mismatch at a nearly-full leaf triggered the
 // "not enough free space in page" panic (root-0040).
+//
+// Since M0130-S11.4 3b-3a the body is charged at MAXALIGN(bodySize), because
+// storage.PageAddItemRaw / PageInsertItemRawAt now allocate the MAXALIGNed
+// footprint upstream's PageAddItemExtended does. Charging the unaligned size
+// here would re-open root-0040 from the other side: the caller would be told a
+// 3-byte-short page had room and the writer would return ErrNoSpaceInPage.
 func (f indexFormat) itemEncodedSize(it item) int {
 	const itemIDSize = 4 // matches storage.itemIDSize
-	return itemIDSize + f.bodySize(it.key)
+	return itemIDSize + MaxAlign(f.bodySize(it.key))
 }
 
 // pageHasSpaceFor reports whether `it` would fit on `p` if appended.

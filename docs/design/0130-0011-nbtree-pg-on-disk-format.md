@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v-3b-2c-ii-B2-c-vi-3b-2c-ii-B2-c-vii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v-3b-2c-ii-B2-c-vi-3b-2c-ii-B2-c-vii 3b-2c-ii-B2-c + 3b-3a landed 2026-08-10; S11.4 rest of 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -1158,12 +1158,64 @@ sources agree:
             hits the per-DB catalog scoping gap the ledger already records for
             ANALYZE, so SF=1-scale index behaviour stays ungated.
 
-    - **3b-3 — collect the deferrals (open).** With the key length
+    - **3b-3 — collect the deferrals (in progress).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement
       `_bt_keep_natts` suffix truncation (pivot natts < nkeyatts at last), and
       retire `MaxHighKeyLen` / `bulkHighKeyReserve` in favour of
       `BTMaxItemSize`.
+
+        - **3b-3a — MAXALIGNed item placement (2026-08-10, landed).** The
+          first of the deferred MAXALIGNs, and the one that never actually
+          needed a descriptor. Slice 2 filed *two* of them together —
+          `index_form_tuple`'s rounding of the tuple SIZE, and
+          `PageAddItemExtended`'s rounding of the item's PLACEMENT — under one
+          reason: a blob key's length is recoverable only as
+          `size - SizeOfIndexTupleData`, so padding destroys it. That reason
+          holds for the first and not the second. Upstream's placement
+          arithmetic is
+
+              alignedSize = MAXALIGN(size);
+              upper -= alignedSize;
+              ItemIdSetNormal(itemId, upper, size);
+
+          — the *allocation* is aligned, the *line pointer* keeps the exact
+          size. The padding therefore lands between items, where no reader
+          addresses it, and `lp_len - SizeOfIndexTupleData` is still the blob
+          key's length. So it lands now, for both formats and for the
+          pre-existing pages of both: alignment only governs where the NEXT
+          item goes, so nothing on disk has to be rewritten and this slice is
+          *not* REINDEX-required (unlike every S11.2–S11.4 slice before it).
+
+          `storage.PageAddItemRaw`, `PageInsertItemRawAt` and
+          `PageReplaceItemRaw`'s grow branch now allocate `maxAlign8(len(raw))`
+          — the same helper `PageAddHeapTuple` has used since M0106-0010, so
+          the heap and index sides of the page layer finally agree. The
+          replace path's *in-place* branch deliberately does NOT reuse an
+          item's own alignment padding: a page written before this slice has
+          none, and growing into it would clobber the neighbouring item.
+
+          The budget had to move with the writer or root-0040 re-opens from
+          the other side (caller told a page has room, writer answers
+          `ErrNoSpaceInPage`): `indexFormat.itemEncodedSize` — the single
+          source both `pageHasSpaceFor` and the insert path read — now charges
+          `MaxAlign(bodySize)`, and the two sites that compute a footprint
+          without it (`pageHighKeyFootprint`, the bulk loader's raw-append
+          check) match. `bulkHighKeyReserve` is unchanged: its body term is
+          already a multiple of 8.
+
+          Guard: `TestRawItemPlacementIsMaxAligned`
+          (`internal/storage/page_item_maxalign_test.go`) pins both halves at
+          once — every residue mod 8 through all three writers, asserting
+          `lp_off` and `pd_upper` are aligned, `lp_len` is *not* rounded, and
+          no neighbour is clobbered. Asserting only alignment would let a
+          future "simplification" round `lp_len` too and silently corrupt
+          every blob key.
+
+          Still deferred, unchanged: `index_form_tuple`'s tuple-size MAXALIGN
+          and `BTreeTupleSetPosting`'s posting offset, both of which pad
+          INSIDE the tuple and so stay blocked until every index is
+          descriptor-bearing; `_bt_keep_natts`; `BTMaxItemSize`.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.

@@ -24,6 +24,8 @@ import (
 // index-size / page-count expectations in the bulk-load tests hold. Upstream
 // instead truncates the separator to its key attributes (_bt_truncate) and can
 // therefore reserve exactly; that is S11.4 work.
+// (The body term is already a multiple of 8, so the MAXALIGNed placement
+// introduced by 3b-3a does not widen the reserve.)
 const bulkHighKeyReserve = 4 /* ItemIdData */ + SizeOfIndexTupleData + MaxHighKeyLen
 
 // pageHasSpaceForBulk is pageHasSpaceFor plus that reserve.
@@ -659,7 +661,7 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 		h := storage.MustHeader(curSlot.Page())
 		free := int(h.Upper()) - int(h.Lower())
 		const itemIDSize = 4
-		if free < itemIDSize+len(ri.raw)+bulkHighKeyReserve {
+		if free < itemIDSize+MaxAlign(len(ri.raw))+bulkHighKeyReserve {
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
 			if err != nil {
 				curSlot.Unlock()

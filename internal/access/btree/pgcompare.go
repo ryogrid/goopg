@@ -15,9 +15,11 @@ import (
 // order-preserving blob compared with `CompareKeys` (bytes.Compare). Every
 // remaining S11.4 deferral traces back to that single fact: with an opaque
 // blob the key's length is recoverable only as `size - SizeOfIndexTupleData`,
-// so nothing may be padded (the two MAXALIGNs slice 2 deferred), and nothing
-// may be truncated attribute-wise (`_bt_keep_natts`, hence pivot natts stuck
-// at 1).
+// so nothing INSIDE the tuple may be padded (index_form_tuple's size rounding
+// and the posting offset — 3b-3a restored the third MAXALIGN, the PAGE
+// PLACEMENT one, precisely because it pads OUTSIDE the tuple and leaves lp_len
+// exact), and nothing may be truncated attribute-wise (`_bt_keep_natts`, hence
+// pivot natts stuck at 1).
 //
 // The bridge out is upstream's own: nbtree never knows a key's type. It
 // compares through an opclass support function (BTORDER_PROC) that the
@@ -36,7 +38,7 @@ import (
 // It stays additive: no writer, descent path or split builds a descriptor
 // yet, so no on-disk format changes here. Threading a descriptor from the
 // catalog into BTree.Options and retiring `CompareKeys` is 3b-2; the
-// MAXALIGNs and real suffix truncation are 3b-3. See
+// remaining MAXALIGNs and real suffix truncation are 3b-3. See
 // docs/design/0130-0011-nbtree-pg-on-disk-format.md.
 //
 // Deliberately NOT modelled (goopg has no user of them at this layer):
