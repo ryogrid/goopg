@@ -3,7 +3,6 @@ package executor
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -229,7 +228,7 @@ func indexByNameOnTable(ctx *Context, tbl *catalog.Table, name string) *catalog.
 func recheckDeferredUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Index, key []byte, detail string) error {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		// Index unreadable (e.g. dropped in-txn) — nothing to enforce.
 		return nil

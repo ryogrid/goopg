@@ -153,7 +153,7 @@ func (o *upsertOp) Open(ctx *Context) error {
 	}
 	if o.plan.OnConflict.ArbiterIndex != nil {
 		idxRel := ctx.Catalog.IndexRelFileNode(o.plan.OnConflict.ArbiterIndex)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, o.plan.OnConflict.ArbiterIndex, idxRel)
 		if err != nil {
 			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 		}
@@ -588,7 +588,7 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree,
 		return leaf, nil, nil
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(leafIdx)
-	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	tree, err := openIndexBTree(o.ctx, leafIdx, idxRel)
 	if err != nil {
 		return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -1192,7 +1192,7 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 			continue
 		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		tree, err := openIndexBTree(o.ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
@@ -1226,7 +1226,7 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 			continue
 		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		tree, err := openIndexBTree(o.ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}

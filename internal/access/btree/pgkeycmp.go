@@ -74,6 +74,13 @@ func (c keyComparer) compare(a, b []byte) int {
 	return res
 }
 
+// KeyDesc reports the descriptor this tree orders by, or nil for the bytewise
+// order. It exists so a caller that ASSEMBLED the tree can verify what it got
+// (M0130-S11.4 slice 3b-2c-ii-A wires descriptors through nineteen open sites;
+// "the descriptor reached the tree" is otherwise unobservable from outside the
+// package) and so amcheck can report the ordering it is verifying against.
+func (bt *BTree) KeyDesc() *PGIndexKeyDesc { return bt.cmp.desc }
+
 // keyCmp is the comparer for this index. Reading it through a method (rather
 // than touching the field) keeps the "a BTree assembled by a path that forgot
 // to set it still compares bytewise" case explicit instead of accidental.

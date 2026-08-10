@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/kvcache"
@@ -273,6 +274,13 @@ type Context struct {
 	//
 	// Nil outside a split aggregate, which is the serial case.
 	PartialAggStates map[*planner.Aggregate]*aggPartialAccum
+
+	// pgKeyDescCache memoises buildPGIndexKeyDesc per index OID for this
+	// statement (M0130-S11.4 slice 3b-2c-ii-A). A present-but-nil entry is
+	// the memoised "this layer cannot describe that index" answer, so the
+	// refusal costs one derivation, not one per row. Populated lazily by
+	// (*Context).pgIndexKeyDesc; nil until the first index btree is opened.
+	pgKeyDescCache map[uint32]*btree.PGIndexKeyDesc
 
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it

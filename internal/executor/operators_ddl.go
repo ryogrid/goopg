@@ -10387,7 +10387,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// Before this, `CREATE INDEX ON t(lower(c))` over pre-existing rows built an
 	// EMPTY index while INSERT-time maintenance did populate it.
 	keyExprs := resolveIndexKeyExprs(tbl, idx)
-	buildErr = o.bulkBuildBTreeFull(idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
+	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
@@ -10421,12 +10421,16 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // expression index, parallel to cols (see encodeCompositeBTreeKeyWithExprs);
 // callers building a plain index pass nil and get the pre-existing behaviour.
 // predExpr is the partial-index predicate, or nil.
-func (o *ddlOp) bulkBuildBTreeFull(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+// idx is the catalog index the build is FOR (M0130-S11.4 slice 3b-2c-ii-A). It
+// is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
+// relfile — and the bulk sort needs it: the build's own ordering and every
+// later reader's must come from the same key descriptor.
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
 	entries, err := o.collectBTreeEntries(tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
-	_, err = btree.BulkCreateWithXID(o.ctx.Pool, idxRel, entries, o.ctx.Tx.XID)
+	_, err = bulkCreateIndexBTree(o.ctx, idx, idxRel, entries)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -11693,7 +11697,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		// have no entries to clear. (Btrees track their
 		// own free space inline.) Pair the FSM/VM cleanup
 		// only with the heap rel above.
-		if _, err := btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID); err != nil {
+		if _, err := createIndexBTree(o.ctx, idx, idxRel); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
@@ -14899,7 +14903,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTreeFull(idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
+			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
 				return err
 			}
 		}
@@ -20683,7 +20687,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
+		_, _ = createIndexBTree(o.ctx, idx, idxRel)
 	}
 
 	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
@@ -20820,7 +20824,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
+		_, _ = createIndexBTree(o.ctx, idx, idxRel)
 	}
 
 	// Phase 4: re-insert all rows with the new encoding.

@@ -1779,6 +1779,14 @@ func CreateWithXID(pool *storage.Pool, rel storage.RelFileNode, xid storage.Tran
 	return CreateWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool), CreateXID: xid})
 }
 
+// PoolLogSplit returns the pool's split-WAL hook in btree's LogSplitFunc
+// shape, or nil when no hook is wired. It is what Open/Create install by
+// default; it is exported for callers that must assemble an Options value
+// themselves and still want the standard hook — internal/executor's
+// indexBTreeOptions, which adds the index key descriptor (M0130-S11.4 slice
+// 3b-2c-ii-A) and would otherwise silently drop split WAL logging.
+func PoolLogSplit(pool *storage.Pool) LogSplitFunc { return adaptPoolLogSplit(pool) }
+
 // adaptPoolLogSplit returns the pool's split-WAL hook in btree's
 // LogSplitFunc shape, or nil when no hook is wired (tests etc.).
 func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {

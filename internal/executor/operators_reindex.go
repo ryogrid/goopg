@@ -249,7 +249,7 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 	}
 	defer release()
 	dop := &ddlOp{ctx: o.ctx}
-	return dop.bulkBuildBTreeFull(idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+	return dop.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 }
 
 // rebuildTableIndexes rebuilds every btree index on tbl. Used by plain
@@ -405,7 +405,7 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 	shadowRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	shadowRel.RelOid = o.ctx.Catalog.AllocOID()
 	dop := &ddlOp{ctx: o.ctx}
-	buildErr := dop.bulkBuildBTreeFull(shadowRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+	buildErr := dop.bulkBuildBTreeFull(idx, shadowRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 	if buildErr != nil {
 		o.removeShadowFile(shadowRel)
 		return storage.RelFileNode{}, false, buildErr

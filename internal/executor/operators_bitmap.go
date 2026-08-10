@@ -69,7 +69,7 @@ func (o *bitmapIndexScanOp) Open(ctx *Context) error {
 
 	// Open the B-tree index.
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, o.plan.Index, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}

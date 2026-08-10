@@ -319,7 +319,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	// back to the relation-grain SIREAD. See ssiRecordIndexScanGapLock for the
 	// multiple-row-versions rationale.
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, o.plan.Index, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}

@@ -978,13 +978,38 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               row): `ApplyInsertRecord` (WAL redo) has no `BTree` handle and
               so passes the bytewise comparer explicitly — 3b-2c-ii must
               carry a per-relation descriptor lookup into the redo path.
-        - [ ] **3b-2c-ii — the flip** (REINDEX-required).
+        - [x] **3b-2c-ii-A — the plumbing** (2026-08-10). No on-disk change.
+              `internal/executor/pgindex_btree.go`: the three choke points
+              `openIndexBTree` / `createIndexBTree` / `bulkCreateIndexBTree`,
+              each resolving `buildPGIndexKeyDesc` into `Options.KeyDesc`.
+              The executor's **nineteen** direct `btree.Open` /
+              `CreateWithXID` / `BulkCreateWithXID` calls are gone — the
+              package now names a btree constructor only inside that one
+              file, which is grep-enforceable and is the invariant 3b-2c-ii-B
+              depends on. The descriptor is memoised per statement on
+              `Context.pgKeyDescCache` (keyed by index OID; a present-but-nil
+              entry caches the REFUSAL, because the callers are per-row index
+              maintenance and re-deriving a refusal per row is the expensive
+              case). `bulkBuildBTreeFull` gained an `*catalog.Index` param —
+              not derivable from the relfilenode, since REINDEX CONCURRENTLY
+              builds into a shadow relfile. `btree.PoolLogSplit` exported so
+              an assembled `Options` cannot silently drop split WAL logging;
+              `(*BTree).KeyDesc()` makes "the descriptor reached the tree"
+              observable. Gate `pgIndexTupleKeys` is **false** → every
+              descriptor nil → `CompareKeys` byte for byte; it is a var, not
+              a const, so the plumbing is testable ahead of the flip
+              (`pgindex_btree_test.go`, 5 tests). Indexes the resolver
+              refuses (expression key / explicit opclass / non-bytewise
+              collation / no comparator) get nil and keep the blob path.
+        - [ ] **3b-2c-ii-B — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
-              `buildPGIndexKeyDesc` wired into `btree.Options.KeyDesc` at
-              every index-open site, and the redo-path descriptor lookup —
-              one commit. Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS
-              SF0.5 gate (re-pin after a REINDEX).
+              `pgIndexTupleKeys` on, the redo-path descriptor lookup, and an
+              explicit dual-format decision for the indexes ii-A's resolver
+              refuses (they keep the blob path, so a tree's format is now a
+              per-index property that amcheck and the redo path must both
+              learn). Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS SF0.5
+              gate (re-pin after a REINDEX).
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

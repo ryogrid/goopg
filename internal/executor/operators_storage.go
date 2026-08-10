@@ -4082,7 +4082,7 @@ func (o *updateOp) nextVirtualPgAmproc() (TupleSlot, error) {
 func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (TupleSlot, error) {
 	ix := o.idxScan
 	idxRel := o.ctx.Catalog.IndexRelFileNode(ix.Index)
-	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	tree, err := openIndexBTree(o.ctx, ix.Index, idxRel)
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(), Message: err.Error()}
 	}
@@ -7201,7 +7201,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	}
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
@@ -7574,7 +7574,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
@@ -7688,7 +7688,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
@@ -7756,7 +7756,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 		switch idx.ExclusionOp {
 		case "=":
 			idxRel := ctx.Catalog.IndexRelFileNode(idx)
-			tree, err := btree.Open(ctx.Pool, idxRel)
+			tree, err := openIndexBTree(ctx, idx, idxRel)
 			if err != nil {
 				continue
 			}

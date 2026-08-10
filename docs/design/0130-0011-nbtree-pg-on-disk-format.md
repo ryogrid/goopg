@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i landed 2026-08-10; S11.4 slices 3b-2c-ii/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A landed 2026-08-10; S11.4 slices 3b-2c-ii-B/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -486,13 +486,41 @@ sources agree:
           tree replayed bytewise would insert at the wrong slot, so 3b-2c-ii
           must carry a per-relation descriptor lookup into the redo path.
           Ledger row.
-        - **3b-2c-ii — the flip (open). REINDEX-required.**
-          `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-          `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
-          `buildPGIndexKeyDesc` wired into `btree.Options.KeyDesc` at every
-          index-open site, and the redo-path descriptor lookup above — one
-          commit. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate
-          (re-pin after a REINDEX).
+        - **3b-2c-ii — the flip.** Split in two, because "did every
+          btree-opening site learn about descriptors?" is a question about
+          nineteen call sites and is far cheaper to answer against a tree whose
+          behaviour has not moved:
+          - **3b-2c-ii-A — the plumbing (landed 2026-08-10). No on-disk
+            change.** `internal/executor/pgindex_btree.go` adds the three
+            choke points `openIndexBTree` / `createIndexBTree` /
+            `bulkCreateIndexBTree`; the executor's nineteen direct
+            `btree.Open` / `CreateWithXID` / `BulkCreateWithXID` calls are gone
+            (grep-enforceable: the package now names a btree constructor only
+            inside that file). Each resolves `buildPGIndexKeyDesc` and passes
+            it as `Options.KeyDesc`, memoised per statement on
+            `Context.pgKeyDescCache` — keyed by index OID, with a
+            present-but-nil entry caching the REFUSAL, since the callers are
+            per-row index maintenance and re-deriving a refusal per row is the
+            expensive case. `bulkBuildBTreeFull` gained an `*catalog.Index`
+            parameter (not derivable from the relfilenode: REINDEX
+            CONCURRENTLY builds into a shadow relfile). `btree.PoolLogSplit`
+            is exported so an assembled `Options` cannot silently drop split
+            WAL logging, and `(*BTree).KeyDesc()` makes "the descriptor
+            reached the tree" observable. The gate `pgIndexTupleKeys` is
+            **false**, so every descriptor is nil and the ordering is
+            `CompareKeys`, byte for byte; it is a var, not a const, precisely
+            so the plumbing is testable ahead of the flip
+            (`pgindex_btree_test.go`, 5 tests). An index this layer refuses to
+            describe (expression key, explicit opclass, non-bytewise
+            collation, a type with no comparator) yields nil and keeps the
+            blob path — so the flip cannot simply delete that path.
+          - **3b-2c-ii-B — the flip (open). REINDEX-required.**
+            `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
+            `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
+            `pgIndexTupleKeys` on, the redo-path descriptor lookup above, and
+            an explicit dual-format decision for the indexes ii-A's resolver
+            refuses. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5
+            gate (re-pin after a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement
