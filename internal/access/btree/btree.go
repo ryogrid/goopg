@@ -2043,13 +2043,13 @@ func (f indexFormat) pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 			return nil, nil, err
 		}
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := f.postingItems(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parsePostingRaw")
 				return nil, nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, item{ptr: tid, key: key})
+			for _, it := range its {
+				out = append(out, it)
 				dead = append(dead, isDead)
 			}
 		} else {
@@ -2085,14 +2085,12 @@ func (f indexFormat) pageItems(p storage.Page) ([]item, error) {
 		// Posting-list items (M0047-0003) are expanded to individual
 		// (key, TID) pairs so callers like insertItemSorted work correctly.
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := f.postingItems(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItems: parsePostingRaw")
 				return nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, item{ptr: tid, key: key})
-			}
+			out = append(out, its...)
 		} else {
 			it, perr := f.parse(raw)
 			if perr != nil {
@@ -2136,7 +2134,7 @@ func (fm IndexFormat) PageItemKeys(p storage.Page) ([][]byte, error) {
 			return nil, err
 		}
 		if isPostingRaw(raw) {
-			key, _, perr := parsePostingRaw(raw)
+			key, _, perr := fm.f.parsePostingRaw(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageItemKeys: parsePostingRaw")
 				return nil, perr
@@ -2233,13 +2231,13 @@ func (fm IndexFormat) PageLeafItems(p storage.Page) ([]LeafItem, error) {
 			return nil, err
 		}
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := fm.f.postingItems(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageLeafItems: parsePostingRaw")
 				return nil, perr
 			}
-			for i, tid := range tids {
-				out = append(out, LeafItem{Key: key, TID: tid, Slot: pgDataSlot(p, slot), PostingIndex: i})
+			for i, it := range its {
+				out = append(out, LeafItem{Key: it.key, TID: it.ptr, Slot: pgDataSlot(p, slot), PostingIndex: i})
 			}
 		} else {
 			it, perr := fm.f.parse(raw)
@@ -3432,7 +3430,7 @@ func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 		return item{}, err
 	}
 	if isPostingRaw(raw) {
-		key, tids, perr := parsePostingRaw(raw)
+		key, tids, perr := f.parsePostingRaw(raw)
 		if perr != nil {
 			maybeDumpPageOnParseErr(p, "readPageItem: parsePostingRaw")
 			return item{}, perr
@@ -3441,6 +3439,9 @@ func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 		if len(tids) > 0 {
 			ptr = tids[0]
 		}
+		// The parsed key already names tids[0] in the tuple format, so the
+		// item is self-consistent: this is the posting's FIRST entry, which is
+		// what an ordering probe against the run wants.
 		return item{ptr: ptr, key: key}, nil
 	}
 	it, perr := f.parse(raw)
@@ -3642,7 +3643,7 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					// Out-of-scope for M0091; pgbench pkey is
 					// non-posting so this branch doesn't fire
 					// in the target workload.
-					key, tids, perr := parsePostingRaw(r)
+					key, tids, perr := bt.format().parsePostingRaw(r)
 					if perr != nil {
 						continue
 					}

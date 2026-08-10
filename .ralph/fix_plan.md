@@ -1262,8 +1262,22 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               scoped source scan over operators_ddl.go). Mutation-checked
               (forcing the blob branch, and restoring the TID tiebreak in the
               duplicate test, each fail by name).
-        - [ ] **3b-2c-ii-B2-c-vi — posting-list dedup groups by KEY
+        - [x] **3b-2c-ii-B2-c-vi — posting-list dedup groups by KEY
               attributes** (found by B2-c-v; must land with or before the flip).
+              LANDED 2026-08-10: `indexFormat.compareKeyAttrs` (nil desc ⇒
+              `CompareKeys` byte for byte) now closes the run in
+              `deduplicateToRawItems`. The posting LAYOUT moved with it, since
+              a run that forms is a run that gets marshalled: `marshalPosting`
+              / `parsePostingRaw` are `indexFormat` methods with
+              `postingOffsetFor` naming the split (blob key at `[8:]`
+              unchanged; tuple key at `[0:MAXALIGN(len)]` per
+              `_bt_form_posting`), a tuple-format parse returns the plain leaf
+              tuple the posting stands for (first TID restamped, alt-TID bit
+              cleared) so the round trip closes, and the new
+              `indexFormat.postingItems` centralises the four page readers'
+              expansion with a PER-TID key stamp. Guard:
+              `internal/access/btree/pgposting_format_test.go` (5 structural
+              tests, mutation-checked).
               `deduplicateToRawItems`
               (`internal/access/btree/bulkload.go:518`) groups adjacent bulk
               entries with `f.compare(a, b) == 0`, which under the tuple format

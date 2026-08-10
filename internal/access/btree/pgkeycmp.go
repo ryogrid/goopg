@@ -88,6 +88,42 @@ func (c indexFormat) compare(a, b []byte) int {
 	return res
 }
 
+// compareKeyAttrs orders two key operands by their KEY ATTRIBUTES ALONE,
+// returning 0 for operands that name the same key value but different heap
+// rows. It is `compare` minus the heap-TID tiebreak.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-vi. The distinction exists because a
+// heapkeyspace tree has two different notions of "the same":
+//
+//   - ordering ("which comes first?") must be a TOTAL order, so it breaks ties
+//     on the heap TID and therefore NEVER reports equality between two distinct
+//     entries — that is `compare`, and it is what descent, split points and
+//     the bulk sort want;
+//   - grouping ("do these belong in one posting list?" / "does a unique build
+//     reject this?") must ignore the TID, because the whole point of a posting
+//     list is to hold the many TIDs that share ONE key.
+//
+// Under the blob format the two coincide byte for byte — an opaque key carries
+// no TID, so `CompareKeys` already answers both — which is why the difference
+// could stay invisible until the tuple format put the TID inside the key. The
+// upstream pair is `_bt_keep_natts_fast` (nbtutils.c), which `_bt_load` and
+// `_bt_dedup_pass` use to close a posting run, versus `_bt_compare`, which
+// orders.
+//
+// The error fallback matches `compare`'s, for the same reason: a grouping
+// predicate driving `sort`-shaped loops has nowhere to put an error, and the
+// bytewise order keeps the answer deterministic.
+func (c indexFormat) compareKeyAttrs(a, b []byte) int {
+	if c.desc == nil {
+		return CompareKeys(a, b)
+	}
+	res, err := ComparePGIndexTupleKeyAttrs(c.desc, a, b)
+	if err != nil {
+		return CompareKeys(a, b)
+	}
+	return res
+}
+
 // ---------------------------------------------------------------------------
 // M0130-S11.4 slice 3b-2c-ii-B2-c-i — the prefix UPPER bound.
 //

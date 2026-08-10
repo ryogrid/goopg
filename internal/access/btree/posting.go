@@ -25,9 +25,20 @@ import (
 // the discriminator had to move with the tuple shape or a large enough block
 // number would have made a plain leaf item read back as a posting list.
 //
-// The key is still one opaque blob (see `(item).marshal`), so its length is
-// recovered as postingOffset - SizeOfIndexTupleData and postingOffset is NOT
-// MAXALIGNed. Slice 3 fixes both together.
+// Slice 3b-2c-ii-B2-c-vi makes the layout a property of the index's format,
+// because the two formats disagree about what "the key" is:
+//
+//   - blob format (desc == nil): the key is an opaque payload that the header
+//     is built AROUND, so it sits at [8:postingOffset] and postingOffset is
+//     8+len(key), NOT MAXALIGNed (the alignment gap is a 3b-3 deferral);
+//   - tuple format (desc != nil): the key IS a whole nbtree tuple, so it sits
+//     at [0:len(key)] and postingOffset is MAXALIGN(len(key)) — exactly
+//     upstream's `_bt_form_posting` (nbtdedup.c), which copies `keysize` bytes
+//     of the base tuple and puts the TID array at MAXALIGN(keysize).
+//
+// The round trip is stable in both: parsing a posting yields the plain leaf
+// tuple the posting stands for (its first TID stamped back into t_tid, the
+// alt-TID bit cleared), which is precisely the `base` a re-marshal expects.
 
 // BTPostingMaxTIDs is the largest TID count the offset-number field can hold
 // (BT_OFFSET_MASK). Far above what a page can physically store — one 8 KiB
@@ -35,16 +46,36 @@ import (
 // policy limit.
 const BTPostingMaxTIDs = BTOffsetMask
 
+// postingOffsetFor is where the TID array starts for a posting item over
+// `key` in this format — and, equivalently, how many bytes of key material the
+// posting carries in front of it.
+func (f indexFormat) postingOffsetFor(key []byte) int {
+	if f.tupleKeys() {
+		// _bt_form_posting: MAXALIGN(keysize), where the key IS the tuple.
+		return MaxAlign(len(key))
+	}
+	return SizeOfIndexTupleData + len(key)
+}
+
 // marshalPosting serialises a posting-list item for `key` over `tids`.
 // Callers hold to upstream's rule that a posting list has at least two TIDs;
 // a shorter list is a caller bug and panics rather than silently writing a
 // tuple whose alt-TID bits say "posting" but whose array holds one entry.
-func marshalPosting(key []byte, tids []storage.ItemPointer) []byte {
+func (f indexFormat) marshalPosting(key []byte, tids []storage.ItemPointer) []byte {
 	n := len(tids)
-	postingOffset := SizeOfIndexTupleData + len(key)
+	postingOffset := f.postingOffsetFor(key)
 	raw := make([]byte, postingOffset+n*6)
-	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
-	copy(raw[SizeOfIndexTupleData:], key)
+	if f.tupleKeys() {
+		// The key already carries a header whose flag bits (null bitmap
+		// present, varwidth attributes) are what DEFORMS it — copy the tuple
+		// whole and rewrite only the size half, or the posting becomes
+		// undecodable as a key.
+		copy(raw, key)
+		pgPutIndexTupleSize(raw, len(raw))
+	} else {
+		binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
+		copy(raw[SizeOfIndexTupleData:], key)
+	}
 	off := postingOffset
 	for _, tid := range tids {
 		PutPGItemPointer(raw[off:off+6], tid)
@@ -66,7 +97,14 @@ func isPostingRaw(raw []byte) bool {
 
 // parsePostingRaw decodes a posting-list item into its key and TID list.
 // Returns an error when the bytes are structurally invalid.
-func parsePostingRaw(raw []byte) (key []byte, tids []storage.ItemPointer, err error) {
+//
+// In the tuple format the returned key is the plain leaf TUPLE the posting
+// stands for — the key material restamped to declare its own length, with the
+// alt-TID bit cleared and t_tid set back to the first heap TID — not a slice of
+// anonymous bytes. That is what every consumer of an `item.key` in this package
+// expects (`indexFormat.compare` refuses a posting tuple outright), and it is
+// the same `base` shape `marshalPosting` takes back, so the round trip closes.
+func (f indexFormat) parsePostingRaw(raw []byte) (key []byte, tids []storage.ItemPointer, err error) {
 	postingOffset, n, err := postingBounds(raw)
 	if err != nil {
 		return nil, nil, err
@@ -77,8 +115,45 @@ func parsePostingRaw(raw []byte) (key []byte, tids []storage.ItemPointer, err er
 		tids[i] = PGItemPointerAt(raw[off : off+6])
 		off += 6
 	}
-	key = append([]byte(nil), raw[SizeOfIndexTupleData:postingOffset]...)
+	if !f.tupleKeys() {
+		key = append([]byte(nil), raw[SizeOfIndexTupleData:postingOffset]...)
+		return key, tids, nil
+	}
+	key = append([]byte(nil), raw[:postingOffset]...)
+	// Undo BTreeTupleSetPosting: size back to the key material's own length
+	// (padding included, as upstream's keysize is), alt-TID bit off, and the
+	// first heap TID back in t_tid. A posting always has n >= 1 here —
+	// postingBounds proved the array is that long.
+	binary.LittleEndian.PutUint16(key[6:8], pgTInfo(key)&^IndexAltTIDMask)
+	pgPutIndexTupleSize(key, postingOffset)
+	PutPGItemPointer(key, tids[0])
 	return key, tids, nil
+}
+
+// postingItems expands a posting-list item into one `item` per heap TID, the
+// form every in-package page reader hands to insert/sort/compare code.
+//
+// It exists because the expansion is NOT "the same key repeated" once keys are
+// tuples: an entry's key carries its own heap TID, so each expanded item needs
+// its TID stamped into its own copy. Sharing one key slice across the run (what
+// the blob format did, correctly, because a blob key has no TID in it) would
+// give every expanded item the FIRST TID — an ordering that disagrees with
+// `item.ptr` and with what a re-marshal writes back.
+func (f indexFormat) postingItems(raw []byte) ([]item, error) {
+	key, tids, err := f.parsePostingRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]item, len(tids))
+	for i, tid := range tids {
+		k := key
+		if f.tupleKeys() && i > 0 {
+			k = append([]byte(nil), key...)
+			PutPGItemPointer(k, tid)
+		}
+		out[i] = item{ptr: tid, key: k}
+	}
+	return out, nil
 }
 
 // postingBounds validates a posting tuple's header and returns its posting
@@ -100,8 +175,14 @@ func postingBounds(raw []byte) (postingOffset, n int, err error) {
 	return postingOffset, n, nil
 }
 
-// postingKeyOf extracts only the key bytes from a raw posting item
-// without allocating a TID slice. Used for key comparisons.
+// postingKeyOf extracts only the key bytes from a BLOB-format posting item
+// without allocating a TID slice.
+//
+// It is deliberately not an indexFormat method: a tuple-format key cannot be
+// returned as a sub-slice of the posting at all (the header has to be
+// restamped — see parsePostingRaw), so a "cheap aliasing key" is a
+// blob-format-only affordance and naming the format keeps that explicit rather
+// than implied. No production caller remains; the round-trip tests do.
 func postingKeyOf(raw []byte) []byte {
 	postingOffset, _, err := postingBounds(raw)
 	if err != nil {
@@ -115,8 +196,8 @@ func postingKeyOf(raw []byte) []byte {
 // the steady-state insert path to grow a posting in place when an
 // inserted key matches an existing posting's key, instead of
 // allocating a fresh single-TID line pointer.
-func appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]byte, error) {
-	key, tids, err := parsePostingRaw(raw)
+func (f indexFormat) appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]byte, error) {
+	key, tids, err := f.parsePostingRaw(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -124,13 +205,13 @@ func appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]byte, error) {
 	if len(tids) > BTPostingMaxTIDs {
 		return nil, fmt.Errorf("btree posting: %d TIDs exceeds BT_OFFSET_MASK %d", len(tids), BTPostingMaxTIDs)
 	}
-	return marshalPosting(key, tids), nil
+	return f.marshalPosting(key, tids), nil
 }
 
 // promoteSingleToPosting (M0055-0003) builds a 2-TID posting
 // payload from an existing single-TID line pointer's `(key, ptr)`
 // plus a new `tid`. Used by the steady-state insert path when a
 // duplicate-key insert hits a non-posting line pointer.
-func promoteSingleToPosting(existingKey []byte, existingPtr storage.ItemPointer, newTID storage.ItemPointer) []byte {
-	return marshalPosting(existingKey, []storage.ItemPointer{existingPtr, newTID})
+func (f indexFormat) promoteSingleToPosting(existingKey []byte, existingPtr storage.ItemPointer, newTID storage.ItemPointer) []byte {
+	return f.marshalPosting(existingKey, []storage.ItemPointer{existingPtr, newTID})
 }

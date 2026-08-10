@@ -510,12 +510,25 @@ const maxRawItemSize = 7800
 // preserved at the cost of slightly higher index size for very
 // high-cardinality keys (e.g. LINEITEM(L_LINENUMBER) at TPC-H SF=1
 // where one value can have ~1.5M duplicates).
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-vi: the run is closed by
+// `compareKeyAttrs`, not by the tree's ORDERING. The two are the same function
+// in the blob format, so nothing here moves today — but they are not the same
+// question, and under the tuple format the ordering breaks ties on the heap
+// TID, which no two entries of a heapkeyspace tree ever share. Grouping by the
+// ordering would therefore close every run at length 1 and silently disable
+// deduplication altogether: same rows, same order, one line pointer per TID,
+// an index several times its proper size. That is invisible to every
+// row-count gate, which is why it gets a structural guard
+// (pgposting_format_test.go) instead. Upstream draws the same line:
+// `_bt_load` closes a posting run with `_bt_keep_natts_fast` (nbtutils.c),
+// never with `_bt_compare`.
 func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 	out := make([]rawItem, 0, len(items))
 	i := 0
 	for i < len(items) {
 		j := i + 1
-		for j < len(items) && f.compare(items[j].key, items[i].key) == 0 {
+		for j < len(items) && f.compareKeyAttrs(items[j].key, items[i].key) == 0 {
 			j++
 		}
 		key := items[i].key
@@ -527,10 +540,12 @@ func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 				tids[k-i] = items[k].ptr
 			}
 			// Compute the maximum number of TIDs that fit in one posting
-			// item: maxRawItemSize - SizeOfIndexTupleData - len(key) bytes
-			// available for TIDs at 6 bytes each (the TID array starts at
-			// the posting offset, immediately after the key).
-			maxTIDsPerChunk := (maxRawItemSize - SizeOfIndexTupleData - len(key)) / 6
+			// item: the bytes left after the key material at 6 bytes each
+			// (the TID array starts at the posting offset). The offset is
+			// format-dependent — 8+len(key) for a blob payload, but
+			// MAXALIGN(len(key)) for a tuple, which already includes its
+			// own header — so it is asked rather than recomputed here.
+			maxTIDsPerChunk := (maxRawItemSize - f.postingOffsetFor(key)) / 6
 			if maxTIDsPerChunk < 1 {
 				// Pathological: key alone exceeds the page limit. Fall
 				// back to single-item-per-TID encoding so each entry
@@ -541,7 +556,7 @@ func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 					out = append(out, rawItem{raw: f.marshal(items[k]), key: key})
 				}
 			} else if len(tids) <= maxTIDsPerChunk {
-				out = append(out, rawItem{raw: marshalPosting(key, tids), key: key})
+				out = append(out, rawItem{raw: f.marshalPosting(key, tids), key: key})
 			} else {
 				for off := 0; off < len(tids); off += maxTIDsPerChunk {
 					end := off + maxTIDsPerChunk
@@ -557,7 +572,7 @@ func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 						out = append(out, rawItem{raw: f.marshal(item{ptr: chunk[0], key: key}), key: key})
 						continue
 					}
-					out = append(out, rawItem{raw: marshalPosting(key, chunk), key: key})
+					out = append(out, rawItem{raw: f.marshalPosting(key, chunk), key: key})
 				}
 			}
 		}

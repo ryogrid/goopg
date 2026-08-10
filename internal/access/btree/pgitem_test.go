@@ -112,7 +112,7 @@ func TestParseItemRoundTrip(t *testing.T) {
 // correct — so parseItemBody tests BT_IS_POSTING explicitly. (A PIVOT tuple by
 // contrast is decoded, not rejected: see TestParseItemDecodesPivot.)
 func TestParseItemRejectsPosting(t *testing.T) {
-	post := marshalPosting(EncodeInt4(1), []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}})
+	post := blobFormat.marshalPosting(EncodeInt4(1), []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}})
 	if _, err := parseItem(post); err == nil {
 		t.Fatal("parseItem accepted a posting tuple")
 	}
@@ -246,7 +246,7 @@ func TestParseItemRejectsSizeMismatch(t *testing.T) {
 func TestPostingTupleIsUpstreamShape(t *testing.T) {
 	key := EncodeInt4(42)
 	tids := []storage.ItemPointer{{Block: 0, Offset: 1}, {Block: 2, Offset: 3}, {Block: 900, Offset: 5}}
-	raw := marshalPosting(key, tids)
+	raw := blobFormat.marshalPosting(key, tids)
 
 	if !BTreeTupleIsPosting(raw) {
 		t.Fatal("BTreeTupleIsPosting = false")
@@ -269,7 +269,7 @@ func TestPostingTupleIsUpstreamShape(t *testing.T) {
 		t.Errorf("BTreeTupleGetHeapTID = %+v/%v, want %+v", first, ok, tids[0])
 	}
 
-	gotKey, gotTIDs, err := parsePostingRaw(raw)
+	gotKey, gotTIDs, err := blobFormat.parsePostingRaw(raw)
 	if err != nil {
 		t.Fatalf("parsePostingRaw: %v", err)
 	}
@@ -290,11 +290,11 @@ func TestPostingTupleIsUpstreamShape(t *testing.T) {
 // two independent header fields, so a mismatch between them must not read off
 // the end of the tuple.
 func TestPostingBoundsRejectsCorruption(t *testing.T) {
-	raw := marshalPosting(EncodeInt4(1), []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}})
+	raw := blobFormat.marshalPosting(EncodeInt4(1), []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}})
 
 	bad := append([]byte(nil), raw...)
 	binary.LittleEndian.PutUint16(bad[4:6], 9|BTIsPosting) // nhtids too large
-	if _, _, err := parsePostingRaw(bad); err == nil {
+	if _, _, err := blobFormat.parsePostingRaw(bad); err == nil {
 		t.Error("parsePostingRaw accepted an over-large TID count")
 	}
 	if postingKeyOf(bad) != nil {
@@ -303,7 +303,7 @@ func TestPostingBoundsRejectsCorruption(t *testing.T) {
 
 	bad = append([]byte(nil), raw...)
 	BTreeTupleSetDownLink(bad, 2) // posting offset inside the header
-	if _, _, err := parsePostingRaw(bad); err == nil {
+	if _, _, err := blobFormat.parsePostingRaw(bad); err == nil {
 		t.Error("parsePostingRaw accepted a posting offset inside the header")
 	}
 }

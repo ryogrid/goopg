@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v-3b-2c-ii-B2-c-vi landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -926,6 +926,49 @@ sources agree:
             themselves and dead `backfillBTree`. Mutation-checked: forcing the
             blob branch and giving the duplicate test the TID tiebreak each fail
             with the message naming the defect.
+          - **3b-2c-ii-B2-c-vi — posting lists group by the KEY ATTRIBUTES
+            (landed 2026-08-10).** NO on-disk change, no REINDEX. Found by
+            B2-c-v, and the same distinction one level down: `_bt_load` closes a
+            posting run when the KEY attributes stop matching
+            (`_bt_keep_natts_fast`, `src/backend/access/nbtree/nbtutils.c`),
+            never with `_bt_compare`, because a heapkeyspace tree's ordering
+            breaks ties on the heap TID and therefore reports NO two entries
+            equal. `deduplicateToRawItems` grouped with `indexFormat.compare`,
+            so under the tuple format every run would close at length 1: same
+            rows, same order, one line pointer per TID — deduplication silently
+            off, and an index several times its proper size. A row-count gate
+            cannot see that, so the guard is structural.
+            Landed: `indexFormat.compareKeyAttrs` (nil desc ⇒ `CompareKeys`,
+            byte for byte; else `ComparePGIndexTupleKeyAttrs`) and the grouping
+            switched onto it. The posting LAYOUT had to move with it, because a
+            run that now forms is a run that gets marshalled: `marshalPosting` /
+            `parsePostingRaw` became `indexFormat` methods, with
+            `postingOffsetFor` naming the split — blob keys stay at
+            `[8:8+len(key)]` byte for byte (the un-MAXALIGNed offset remains a
+            3b-3 deferral), while a tuple key IS the tuple, so it sits at
+            `[0:MAXALIGN(len(key))]` exactly as `_bt_form_posting`
+            (`nbtdedup.c`) copies `keysize` bytes of its base and puts the array
+            at `MAXALIGN(keysize)`. Parsing a tuple-format posting returns the
+            PLAIN leaf tuple it stands for — size restamped, alt-TID bit
+            cleared, first heap TID back in `t_tid` — which is both what
+            `ComparePGIndexTuples` will accept (it refuses posting tuples
+            outright) and the `base` a re-marshal takes back, so the round trip
+            closes. The new `indexFormat.postingItems` centralises the four page
+            readers' expansion of a posting into one item per TID, which is not
+            "the same key repeated" once keys are tuples: each item's key is
+            stamped with its OWN TID, or `item.key` would disagree with
+            `item.ptr` and `marshal` would write the disagreement to the page.
+            Guards: `internal/access/btree/pgposting_format_test.go` — five
+            same-key/different-TID entries produce ONE posting while the
+            ordering still calls all five distinct; the blob path reproduces the
+            pre-seam bytes and the `[8:]` key position; the tuple layout puts
+            the array at the key tuple's own length (24 would be the blob
+            answer) and round-trips through parse and re-marshal; expansion
+            stamps per-TID keys that re-marshal to themselves; and an
+            oversized 4000-duplicate run still chunks under `maxRawItemSize`
+            while holding every TID. Mutation-checked: grouping by `compare`,
+            using the blob offset under the tuple format, and dropping the
+            per-TID stamp each fail by name.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
