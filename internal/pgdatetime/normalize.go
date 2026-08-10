@@ -56,13 +56,15 @@ func NormalizeInput(s string) string {
 		return trimmed
 	}
 
-	// Split a leading date token from the remainder on the first ' ' or 'T'.
-	// PostgreSQL's ParseDateTime treats whitespace as a field break; 'T' is the
-	// RFC 3339 separator that several of goopg's layouts use.
+	// Split a leading date token from the remainder on the first ' ', 'T' or
+	// 't'. PostgreSQL's ParseDateTime treats whitespace as a field break, and
+	// the ISO 8601 'T' as an ordinary one in either case — `2020-01-01t10:00`
+	// decodes exactly like `2020-01-01 10:00`. Go's layouts cannot express
+	// "either case", so the separator is folded to upper 'T' here.
 	datePart := trimmed
 	sepIdx := -1
 	for i := 0; i < len(trimmed); i++ {
-		if c := trimmed[i]; c == ' ' || c == 'T' {
+		if c := trimmed[i]; c == ' ' || c == 'T' || c == 't' {
 			datePart, sepIdx = trimmed[:i], i
 			break
 		}
@@ -72,12 +74,45 @@ func NormalizeInput(s string) string {
 		if sepIdx < 0 {
 			return padded
 		}
-		return padded + trimmed[sepIdx:sepIdx+1] + padTimeFields(trimmed[sepIdx+1:])
+		sep := " "
+		if trimmed[sepIdx] != ' ' {
+			sep = "T"
+		}
+		return padded + sep + padTimeFields(canonicalZulu(trimmed[sepIdx+1:]))
 	}
 
 	// No leading ISO date — the whole string may still start with a bare
 	// time-of-day ("3:4:5", "3:4:5-07", "3:4:5 PM").
-	return padTimeFields(trimmed)
+	return padTimeFields(canonicalZulu(trimmed))
+}
+
+// canonicalZulu folds PostgreSQL's spellings of the UTC zone token onto the one
+// spelling Go's `Z07*` layout elements recognise: an uppercase 'Z' attached
+// directly to the time. PG reaches 'Z' through datetbl's DTZ entry, which its
+// field splitter finds whether it is written 'Z' or 'z' and whether or not
+// whitespace precedes it, so `10:00:00Z`, `10:00:00z` and `10:00:00 Z` are the
+// same instant to PG but three different strings to time.Parse.
+//
+// The rewrite is deliberately narrow: the letter must be the last character and
+// what remains after dropping it and any trailing space must end in a digit.
+// That keeps it off timezone ABBREVIATIONS that merely end in the same letter
+// ('10:00:00 NZ' is left for the caller's parser to judge) and off the verbose
+// natural-language spelling handled elsewhere.
+func canonicalZulu(s string) string {
+	if s == "" {
+		return s
+	}
+	if c := s[len(s)-1]; c != 'Z' && c != 'z' {
+		return s
+	}
+	head := strings.TrimRight(s[:len(s)-1], " \t")
+	if head == "" {
+		return s
+	}
+	if c := head[len(head)-1]; c < '0' || c > '9' {
+		return s
+	}
+	return head + "Z"
 }
 
 // padDateFields zero-pads the three numeric fields of an ISO "Y-M-D" token.

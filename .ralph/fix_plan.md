@@ -2146,6 +2146,27 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Found + deferred: an IOS over `numeric`/`numeric[]` prints `1.5` where PG
       and the heap print `1.50` (display scale lost by `EncodeNumericKey`).
       Design: `docs/design/0119-0006-array-key-datetime-renderers.md`.
+      **Slice landed 2026-08-12 (29th) — the ISO 8601 `T` separator and the `Z`
+      zone**: `'2020-01-01T10:00:00'` (plain ISO 8601 — what every JSON encoder
+      and `date -Is` emits) raised 22007, as did `…t10:00:00`, `2020-01-01
+      10:00:00Z`, `…z`, `… Z`, every `T`-separated offset form, and on BOTH
+      separators any offset wider than two digits (`+0530`, `+05:30`). Go's
+      `RFC3339`/`RFC3339Nano` constants were the trap: they demand the `T` AND a
+      zone, so a zone-less `T` form matched neither them nor the space layouts.
+      Fixed structurally — this was the THIRD consecutive slice to find goopg's
+      two timestamp layout tables disagreeing: one shared `pgTimestampLayouts`
+      (separator x offset-width, via Go's `Z07*` elements) is now iterated by
+      `parseCopyTimestamp` AND `evalTypedStringLit`, with case/spacing folded
+      upstream in `pgdatetime.NormalizeInput` (`canonicalZulu`, which requires a
+      digit before the letter so it cannot touch zone ABBREVIATIONS — folding
+      `'10:00:00 NZ'` to UTC would be a silent 12-hour error). Gates:
+      `TestTimestampLiteralAndCopyPathsAgree` asserts the two paths agree on
+      every form, so widening one alone fails the build; plus a 20-form accepted
+      table, the `timestamp[]` element round-trip and a refusal guard
+      (`timestamp_iso8601_tz_input_test.go`), all mutation-checked. Found +
+      deferred: a zone on a bare DATE (`'2020-01-01Z'`, PG accepts) and
+      timezone-abbreviation lookup (`NZ`/`EST`/`PDT`, needs a `datetbl` port).
+      Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §7.
       **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
       (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
       posting lists goopg's own bulk build wrote, on a real heap, under the

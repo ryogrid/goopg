@@ -205,3 +205,92 @@ half (`parseCopyTimestamp`, `parseTimeString`, `parseTimeTZString`, and the
 `timestamp[]` / `time[]` element round-trip), including a guard that the default
 does not fire for the ambiguous forms. Every expected value was read from a PG
 18.3 cluster (socket `/tmp`, port 5599).
+
+## 7. Follow-up 2026-08-12 (M0119-0006) — the ISO 8601 `T` separator and the `Z` zone
+
+The 29th M0119-0006 slice, and the third consecutive one to find goopg's two
+timestamp layout tables disagreeing with each other. This one closes that
+recurrence structurally rather than case by case.
+
+### The defect
+
+`'2020-01-01T10:00:00'` — plain ISO 8601, the spelling every JSON encoder,
+`date -Is` and ORM emits — raised `22007` on goopg. So did `2020-01-01t10:00:00`
+(PG's field splitter is case-blind), `2020-01-01 10:00:00Z`, `…z`, `… Z`, and
+every `T`-separated form carrying an offset. PG 18.3 accepts all of them: they
+are the same instant.
+
+Two further gaps fell out of the same root cause and are fixed here: an offset
+wider than two digits (`+0530`, `+05:30`) was rejected on *both* separators,
+because the only offset layout anywhere was `-07`.
+
+### Why
+
+PostgreSQL never matches a layout. `ParseDateTime()`
+(`postgres/src/backend/utils/adt/datetime.c`) splits the input into fields —
+treating the ISO 8601 `T` as an ordinary field break, in either case — and
+`DecodeDateTime()` resolves the zone token against `datetbl`, where `Z` is a DTZ
+entry for UTC, found case-insensitively and whether or not it arrives as its own
+whitespace-delimited field.
+
+goopg had two hand-written Go layout tables standing in for that machinery:
+`parseCopyTimestamp` (`copy_text.go` — the COPY TEXT reader, the codec's value
+encoder, the array element encoder, and the cross-kind comparison coercion) and
+the list inside `evalTypedStringLit` (`expr.go` — typed literals). Between them
+they covered the space separator with an optional `-07`, plus Go's `RFC3339` /
+`RFC3339Nano` constants. Those two constants are the whole trap: they demand the
+`T` **and** a zone, so `2020-01-01T10:00:00` matched neither the space layouts
+(wrong separator) nor RFC3339 (no zone), and fell through to `invalid timestamp`.
+
+### What landed
+
+Two changes, deliberately split by which model each belongs to:
+
+1. **One shared layout table.** `pgTimestampLayouts` (`copy_text.go`) is now the
+   single table both paths iterate. It enumerates the separator × offset-width
+   grid using Go's `Z07` / `Z0700` / `Z07:00` elements — each of which matches a
+   literal `Z` as well as its numeric offset — with the zone-bearing layouts
+   first so an explicit offset is honoured before the zone-less fallbacks treat
+   the wall clock as UTC. No fractional-seconds layout is needed: Go's parser
+   accepts a fraction after the seconds field even when the layout omits it.
+   The RFC3339 constants are gone; they were never the right shape.
+2. **Case and spacing folded upstream**, in `pgdatetime.NormalizeInput`, next to
+   the field padding and for the same reason — a layout per spelling is exactly
+   how the tables drifted. The separator scan now also breaks on lowercase `t`
+   and emits canonical `T`; a space separator stays a space, since other call
+   sites still carry space-only layouts. `canonicalZulu` folds a trailing
+   `Z`/`z`, with any whitespace before it, onto an attached uppercase `Z`.
+
+`canonicalZulu` is narrow on purpose: the letter must be last, and what remains
+after dropping it and any trailing space must end in a **digit**. That keeps it
+off timezone abbreviations that merely end in the same letter — `'10:00:00 NZ'`
+is New Zealand time to PG, and folding it to UTC would be a silent 12-hour
+error, the exact failure mode this document exists for.
+
+### Still unimplemented (ledger rows, 2026-08-12)
+
+* `'2020-01-01Z'` — PG accepts a zone on a bare **date** (`2020-01-01 00:00:00`).
+  goopg's date token scan does not treat `Z` as a field break, so this stays
+  22007.
+* Timezone **abbreviations** (`NZ`, `EST`, `PDT`) — PG resolves them through
+  `datetbl`/`pg_timezone_abbrevs`; goopg has no such table, so only numeric
+  offsets and `Z` are understood.
+
+`'2020-01-01T'` (dangling separator) and `'…+05:3'` (truncated offset) are
+rejected by PG too and must stay rejected.
+
+### Verification
+
+`internal/executor/timestamp_iso8601_tz_input_test.go`: the accepted-forms table
+(20 spellings, every `want` read from a PG 18.3 cluster on socket `/tmp` port
+5599 under `set timezone='UTC'`), the `timestamp[]` element round-trip, and a
+mutation guard pinning the four refusals above.
+`TestTimestampLiteralAndCopyPathsAgree` is the structural one: it asserts the
+literal path and the COPY path **agree** — same instant, or both erroring — for
+every form, so widening only one table fails the build. `pgdatetime` gains
+`TestNormalizeInputFoldsSeparatorAndZuluCase` and
+`TestNormalizeInputZuluFoldIsNarrow`.
+
+Mutation-checked in both halves: reverting `normalize.go` alone and removing the
+`T` layouts alone each reproduce the failures. Gates: units, `TestPort_RegressSuite`
+(249 s), `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35), pgbench smoke via the hook.

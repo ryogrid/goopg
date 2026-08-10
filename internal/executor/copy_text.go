@@ -772,6 +772,42 @@ func wrapTimeTZError(err error, orig string) error {
 		Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
 }
 
+// pgTimestampLayouts is the single layout table every timestamp/timestamptz
+// *text input* path in goopg parses against, shared so the COPY TEXT reader
+// (parseCopyTimestamp) and the typed-literal path (evalTypedStringLit) cannot
+// drift apart again — they disagreed twice already, most recently about the
+// seconds-less `HH:MM` form, which made an INSERT of '2020-01-01 10:00' raise
+// 22007 while the identical text as a literal parsed.
+//
+// PostgreSQL does not use layouts at all: ParseDateTime() splits the input into
+// fields and DecodeDateTime() interprets each one, so the date/time separator
+// may be a space or a `T`/`t` (datetime.c treats the ISO 8601 `T` as an
+// ordinary field break), and the zone may be spelled `Z`, `+05`, `+0530` or
+// `+05:30` — `Z` being the DTZ entry for UTC in datetbl. Go's parser needs one
+// layout per spelling, so the zone-bearing forms are enumerated here with Go's
+// `Z07*` elements (each of which matches a literal `Z` as well as its numeric
+// offset). Case and a space before a lone `Z` are folded upstream of this table
+// by pgdatetime.NormalizeInput, which also supplies an absent seconds field, so
+// no `t`-separator or lowercase-`z` layout is needed.
+//
+// Zone-bearing layouts come first so an explicit offset is honoured before the
+// zone-less fallbacks treat the wall clock as UTC. A fractional-seconds field
+// needs no layout of its own: Go's parser accepts one after the seconds field
+// even when the layout does not mention it.
+var pgTimestampLayouts = []string{
+	"2006-01-02 15:04:05Z07:00",
+	"2006-01-02 15:04:05Z0700",
+	"2006-01-02 15:04:05Z07",
+	"2006-01-02T15:04:05Z07:00",
+	"2006-01-02T15:04:05Z0700",
+	"2006-01-02T15:04:05Z07",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04Z07",
+	"2006-01-02 15:04",
+	"2006-01-02",
+}
+
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
 // commonly produces: with or without fractional seconds, with or
 // without timezone.
@@ -782,16 +818,7 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 	// used by the cross-kind comparison path (tryParseStringAs), so leaving it
 	// out here is what made `d_date = '2002-5-01'` silently match no rows.
 	s = pgdatetime.NormalizeInput(s)
-	layouts := []string{
-		"2006-01-02",
-		"2006-01-02 15:04:05.000000",
-		"2006-01-02 15:04:05",
-		"2006-01-02 15:04:05.000000-07",
-		"2006-01-02 15:04:05-07",
-		time.RFC3339,
-		time.RFC3339Nano,
-	}
-	for _, layout := range layouts {
+	for _, layout := range pgTimestampLayouts {
 		if ts, err := time.Parse(layout, s); err == nil {
 			return ts.UTC(), nil
 		}

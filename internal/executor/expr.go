@@ -3040,19 +3040,13 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		layouts := []string{
-			"2006-01-02 15:04:05.999999-07",
-			"2006-01-02 15:04:05-07",
-			"2006-01-02 15:04-07",
-			"2006-01-02 15:04:05.999999",
-			"2006-01-02 15:04:05",
-			"2006-01-02 15:04",
-			"2006-01-02",
-		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
 		// PG takes '2002-5-1 3:4:5' for a timestamp, the layouts below do not.
+		// M0119-0006: the table itself is shared with parseCopyTimestamp (see
+		// pgTimestampLayouts) so the literal path and the COPY/encode path can
+		// no longer accept different spellings of the same timestamp.
 		normalized := pgdatetime.NormalizeInput(x.Value)
-		for _, layout := range layouts {
+		for _, layout := range pgTimestampLayouts {
 			if t, err := time.Parse(layout, normalized); err == nil {
 				x.CachedTime = t.UTC()
 				x.CacheValid = true

@@ -1,6 +1,9 @@
 package pgdatetime
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestNormalizeInputPGAcceptedForms pins the spellings PostgreSQL's
 // DecodeDate/DecodeNumber accept but a fixed Go layout does not. Every "want"
@@ -153,6 +156,56 @@ func TestNormalizeInputIsIdempotent(t *testing.T) {
 		once := NormalizeInput(in)
 		if twice := NormalizeInput(once); twice != once {
 			t.Errorf("NormalizeInput not idempotent for %q: %q -> %q", in, once, twice)
+		}
+	}
+}
+
+// TestNormalizeInputFoldsSeparatorAndZuluCase covers the ISO 8601 spelling
+// variants PostgreSQL's field splitter absorbs but Go's layouts cannot express:
+// ParseDateTime() (datetime.c) breaks fields on a 'T' in either case, and
+// DecodeDateTime() finds the UTC zone token 'Z' in datetbl case-insensitively
+// and whether or not it arrives as a separate whitespace-delimited field. Go
+// needs one canonical spelling, so both are folded here — upper 'T', an
+// uppercase 'Z' attached directly — leaving the layout table to enumerate only
+// the separator/offset shapes. M0119-0006.
+func TestNormalizeInputFoldsSeparatorAndZuluCase(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"2020-01-01t10:00:00", "2020-01-01T10:00:00"},
+		{"2020-01-01T10:00:00", "2020-01-01T10:00:00"},
+		{"2020-1-1t3:4:5", "2020-01-01T03:04:05"},
+		{"2020-01-01T10:00:00z", "2020-01-01T10:00:00Z"},
+		{"2020-01-01 10:00:00 Z", "2020-01-01 10:00:00Z"},
+		{"2020-01-01T10:00 z", "2020-01-01T10:00:00Z"},
+		{"2020-01-01t10:00", "2020-01-01T10:00:00"},
+		{"10:00:00 z", "10:00:00Z"}, // bare time-of-day path
+		{"2020-01-01T10:00:00.25Z", "2020-01-01T10:00:00.25Z"},
+		// The space separator must survive as a space: several call sites still
+		// carry space-only layouts, and rewriting it would be a silent break.
+		{"2020-01-01 10:00:00", "2020-01-01 10:00:00"},
+	}
+	for _, c := range cases {
+		if got := NormalizeInput(c.in); got != c.want {
+			t.Errorf("NormalizeInput(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestNormalizeInputZuluFoldIsNarrow is the mutation guard for the fold above.
+// A trailing 'Z'/'z' is only the UTC zone token when it stands alone: inside a
+// timezone ABBREVIATION ('NZ') or a name it is just a letter, and rewriting it
+// would turn input PG reads as New Zealand time into UTC. The rule is that what
+// precedes the letter (after any space) must be a digit.
+func TestNormalizeInputZuluFoldIsNarrow(t *testing.T) {
+	unchanged := []string{
+		"2020-01-01 10:00:00 NZ", // zone abbreviation, not a Zulu token
+		"2020-01-01 10:00:00 nz",
+		"z", "Z", " Z", // no time to attach to
+		"2020-01-01Z", // a zone on a bare DATE: PG accepts, goopg does not yet
+	}
+	for _, in := range unchanged {
+		want := strings.TrimSpace(in)
+		if got := NormalizeInput(in); got != want {
+			t.Errorf("NormalizeInput(%q) = %q, want %q (fold must not touch this)", in, got, want)
 		}
 	}
 }
