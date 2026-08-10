@@ -235,3 +235,71 @@ func TestBtIndexCheck_OpClassDamageDetectedAfterArrayColumn(t *testing.T) {
 		t.Errorf("got %q, want substring %q", err.Error(), want)
 	}
 }
+
+// TestArrayKeyTextMatchesHeapText is the property arrayKeyElemRenderer exists
+// for, asserted directly instead of by reading the two tables side by side: the
+// array text an index-only scan reconstructs FROM THE KEY must be the array text
+// the same value reads back as from the HEAP (encodeArrayValuePG →
+// decodeArrayValuePG). A divergence here is not a slow plan, it is the same row
+// printing differently depending on which plan the planner picked.
+//
+// It is what let the 27th slice re-arm date/time/timestamp/timestamptz/bytea:
+// those five element types were refused since the 25th slice precisely because
+// there was no heap element image to agree with, and the 26th slice gave them
+// one.
+//
+// numeric is the one KNOWN divergence and is asserted as such rather than
+// skipped, so the day it is fixed this test says so (deferral ledger 2026-08-12):
+// EncodeNumericKey strips trailing mantissa zeros, so the key for 1.50 decodes
+// as 1.5 and the display scale PG preserves is gone.
+func TestArrayKeyTextMatchesHeapText(t *testing.T) {
+	const scaleLossyType = "numeric"
+	checked, sawLossy := 0, false
+	for _, c := range indexKeyTypeCases() {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: c.typ, IsArray: true}}
+		if !indexKeyColumnIsDecodable(col) {
+			continue
+		}
+		lit := "{" + c.lit + "}"
+		key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+		if encErr != nil {
+			t.Fatalf("%s[]: key encode %q: %s", c.typ, lit, encErr.Message)
+		}
+		keyDatum, err := decodeBTreeKeyToDatum(key, col)
+		if err != nil {
+			t.Fatalf("%s[]: key decode: %v", c.typ, err)
+		}
+		blob, err := encodeArrayValuePG(col.Type, NewStringDatum(lit))
+		if err != nil {
+			t.Fatalf("%s[]: heap encode: %v", c.typ, err)
+		}
+		heapDatum, _, err := decodeArrayValuePG(col.Type, blob)
+		if err != nil {
+			t.Fatalf("%s[]: heap decode: %v", c.typ, err)
+		}
+		fromKey, fromHeap := keyDatum.StringValue(), heapDatum.StringValue()
+		if c.typ == scaleLossyType {
+			sawLossy = true
+			if fromKey == fromHeap {
+				t.Errorf("%s[]: key and heap now AGREE (%q) — the display-scale "+
+					"deferral row is resolved; drop this exception", c.typ, fromKey)
+			}
+			continue
+		}
+		checked++
+		if fromKey != fromHeap {
+			t.Errorf("%s[]: index-only scan would print %q where the heap prints %q",
+				c.typ, fromKey, fromHeap)
+		}
+	}
+	// Non-vacuity: the loop must actually reach the five types this slice
+	// re-armed, not silently skip them via the decodability predicate.
+	for _, typ := range []string{"date", "time", "timestamp", "timestamptz", "bytea"} {
+		if !indexKeyColumnIsDecodable(catalog.Column{Name: "c", Type: catalog.Type{Name: typ, IsArray: true}}) {
+			t.Errorf("%s[] is refused by indexKeyColumnIsDecodable — the 27th slice regressed", typ)
+		}
+	}
+	if checked < 10 || !sawLossy {
+		t.Fatalf("degenerate case table: checked=%d sawLossy=%v", checked, sawLossy)
+	}
+}

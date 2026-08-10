@@ -70,6 +70,8 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/pgdatetime"
 )
 
 const (
@@ -248,14 +250,27 @@ func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, er
 //   - interval / timetz: the SCALAR key for these is not invertible at all
 //     (interval's key is upstream's interval_cmp_value span, which has thrown
 //     away the month/day split), so there is nothing to render.
-//   - date / time / timestamp / timestamptz: the key decodes, but goopg's heap
-//     array codec has no arm for these element types (pgarray.ElemTypeInfo), so
-//     a stored `date[]` holds the user's own literal spelling as TEXT while this
-//     path would render the canonical one. Rendering them here would make the
-//     index and the heap disagree about the same value's text.
-//   - bytea / enum: same shape — no heap element image to agree with.
+//   - enum: no heap element image to agree with (pgarray.ElemTypeInfo has no
+//     arm, so a stored enum[] holds the user's literal spelling as TEXT while
+//     this path would render a canonical one).
+//
+// date / time / timestamp / timestamptz / bytea were in that list until the
+// 26th slice gave them real heap element images (pgarray.ElemTypeInfo arms over
+// upstream's own integer/byte-string form, rendered by pgdatetime.Format* /
+// pgarray.ByteaOutHex). Their renderers below call THE SAME leaf functions the
+// heap-side decode calls (pgarray.decodeArrayElem), which is what makes index
+// text and heap text the same text by construction rather than by review — and
+// each is gated on pgarray.ElemTypeInfo actually having the arm, so a type-name
+// spelling the heap table does not know (which the heap encodes through its
+// text fallback) is refused here instead of being rendered canonically.
 func arrayKeyElemRenderer(name string) func(Datum) (string, error) {
 	switch {
+	case isDateType(name), isTimeOfDayType(name), isTimestampType(name),
+		isTimestamptzType(name), isByteaType(name):
+		if _, _, _, _, ok := pgarray.ElemTypeInfo(name); !ok {
+			return nil
+		}
+		return arrayKeyElemRendererPGImage(name)
 	case isInt2Type(name), isInt4Type(name), isInt8Type(name), isOidType(name):
 		return func(d Datum) (string, error) { return strconv.FormatInt(d.Int, 10), nil }
 	case isBoolType(name):
@@ -283,4 +298,51 @@ func arrayKeyElemRenderer(name string) func(Datum) (string, error) {
 		return func(d Datum) (string, error) { return quoteArrayTextElem(d.StringValue()), nil }
 	}
 	return nil
+}
+
+// arrayKeyElemRendererPGImage renders the element types whose heap image is
+// upstream's own physical form, by converting the key's Datum back to that
+// form's integer/byte payload and handing it to the very renderer the heap-side
+// element decode uses. Anything else — re-deriving the text from the Datum with
+// a second formatter — is the sibling drift Hard-won Rule #2 is about.
+//
+// The Datum shapes come from the key decoders: date/timestamp/timestamptz
+// decode to a KindTime at pgEpoch + offset (operators_indexonly.go), `time` to
+// a KindTime at the Unix epoch holding the time of day (decodeScalarBTreeKey),
+// and bytea to KindBytes.
+func arrayKeyElemRendererPGImage(name string) func(Datum) (string, error) {
+	switch {
+	case isDateType(name):
+		return func(d Datum) (string, error) {
+			// Seconds, not micros: a date's key covers PG's full 4714 BC ..
+			// 5874897 AD range, whose microsecond count overflows int64. The
+			// decode built the time as pgEpoch + n*24h, so the division is exact.
+			days := (d.TimeValue().UTC().Unix() - pgEpochUnixMicros/1_000_000) / 86400
+			return quoteArrayTextElem(pgdatetime.FormatDate(int32(days))), nil
+		}
+	case isTimeOfDayType(name):
+		return func(d Datum) (string, error) {
+			return quoteArrayTextElem(pgdatetime.FormatTime(pgTimeMicros(d.TimeValue()))), nil
+		}
+	case isTimestampType(name):
+		return func(d Datum) (string, error) {
+			return quoteArrayTextElem(pgdatetime.FormatTimestamp(pgTimestampMicrosOfDatum(d))), nil
+		}
+	case isTimestamptzType(name):
+		return func(d Datum) (string, error) {
+			return quoteArrayTextElem(pgdatetime.FormatTimestampTZUTC(pgTimestampMicrosOfDatum(d))), nil
+		}
+	case isByteaType(name):
+		return func(d Datum) (string, error) {
+			return quoteArrayTextElem(byteaOutHex(d.BytesValue())), nil
+		}
+	}
+	return nil
+}
+
+// pgTimestampMicrosOfDatum is the timestamp/timestamptz heap image (int64
+// microseconds since the PG epoch) of a KindTime datum — the inverse of the
+// `pgEpoch.Add(micros)` the key decoder applies.
+func pgTimestampMicrosOfDatum(d Datum) int64 {
+	return d.TimeValue().UTC().UnixMicro() - pgEpochUnixMicros
 }

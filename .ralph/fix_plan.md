@@ -2133,6 +2133,19 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `executor.btIndexOpClassComparator`. Gate:
       `TestBtIndexCheck_OpClassDamageDetected` (verified non-vacuous). Design:
       `docs/design/0119-0006-opclass-comparator-dispatch-amcheck.md`.
+      **Slice landed 2026-08-12 (27th) — array index keys render
+      date/time/timestamp/timestamptz/bytea elements again**: the five element
+      types the 25th slice refused for lack of a heap image to agree with (the
+      26th slice gave them one) are back on the index-only-scan fast path, via
+      five arms in `arrayKeyElemRenderer` that convert the key Datum to the heap
+      IMAGE and call the heap decode's own leaf renderers. `interval`/`timetz`
+      stay refused (lossy comparison span). New gates
+      `TestArrayKeyTextMatchesHeapText` (key text == heap text, every indexable
+      array type) and `TestArrayIndexOnlyScanAnswersFromKey` (E2E, plan must be
+      an IndexOnlyScan, rows == PG 18.3 `array_out`), both mutation-checked.
+      Found + deferred: an IOS over `numeric`/`numeric[]` prints `1.5` where PG
+      and the heap print `1.50` (display scale lost by `EncodeNumericKey`).
+      Design: `docs/design/0119-0006-array-key-datetime-renderers.md`.
       **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
       (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
       posting lists goopg's own bulk build wrote, on a real heap, under the
