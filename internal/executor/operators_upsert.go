@@ -346,7 +346,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			// call in applyInsert used a pre-computed key (no re-eval), so we
 			// compensate with two explicit calls here.
 			for range 2 {
-				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+				if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 					return nil, err
 				}
 			}
@@ -358,7 +358,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			// no-op (no side-effectful evaluation). Mirrors PG's ExecBuildArbiterKey
 			// call in ExecOnConflictUpdate.
 			if o.plan.OnConflict.ArbiterIndex != nil {
-				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+				if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 					return nil, err
 				}
 			}
@@ -398,7 +398,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					// the arbiter expression once more, then wait and re-probe with the
 					// already-computed key so completion stays blocked until the other
 					// transaction settles.
-					if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+					if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 						return nil, err
 					}
 					qctx := o.ctx.Ctx
@@ -416,7 +416,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						}
 						if waited {
 							// Re-run arbiter expression after spec token released.
-							if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+							if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 								return nil, err
 							}
 						}
@@ -644,7 +644,7 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 	if o.arbiterTree == nil {
 		return nil, storage.ItemPointer{}, nil, false, nil
 	}
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil {
 		return nil, storage.ItemPointer{}, nil, false, err
 	}
@@ -849,7 +849,7 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, inserted Row)
 	if o.arbiterTree == nil || o.ctx == nil {
 		return 0, false, false, nil
 	}
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
 		return 0, false, false, nil
 	}
@@ -960,7 +960,7 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// here until the controller releases the Phase-B advisory lock.
 	var phaseBKey []byte
 	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
-		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, insertedParent, o.plan.Pos())
+		key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, insertedParent, o.plan.Pos())
 		if err != nil {
 			return storage.ItemPointer{}, err
 		}
@@ -980,7 +980,24 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// Insert the arbiter btree entry using the pre-computed Phase B key so the
 	// expression is not re-evaluated (avoiding extra NOTICEs for plain INSERT).
 	if phaseBKey != nil {
-		_ = o.maintainArbiter(phaseBKey, ptr)
+		// The Phase-B key is a PROBE key: it was built before the heap write, so
+		// it cannot carry the TID the row now lives at. Under the blob format
+		// that is exactly the entry key too (no TID in the bytes), and reusing it
+		// is the point — it is what keeps a side-effectful arbiter expression
+		// from being evaluated a second time. Under the tuple format the entry
+		// key embeds the heap TID, so it has to be rebuilt now that there is one;
+		// such an index has no expression key column (buildPGIndexKeyDesc refuses
+		// those), so the rebuild costs a projection and repeats no side effect.
+		// M0130-S11.4 slice 3b-2c-ii-B2-c-vii.
+		entryKey := phaseBKey
+		if o.ctx.pgIndexKeyDesc(o.plan.OnConflict.ArbiterIndex) != nil {
+			k, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, insertedParent, ptr, o.plan.Pos())
+			if err != nil {
+				return storage.ItemPointer{}, err
+			}
+			entryKey = k
+		}
+		_ = o.maintainArbiter(entryKey, ptr)
 		// Register the speculative insertion token now that the unique index
 		// entry is visible. SettleSpec is called by the caller after
 		// probeSpeculativeConflict returns. M0100-0006b.
@@ -1102,7 +1119,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// This produces 2 NOTICEs for blurt_and_lock_* expression indexes, mirroring
 	// PG's ExecOnConflictUpdate → ExecUpdate → ExecInsertIndexTuples behavior.
 	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
-		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, updatedParent, o.plan.Pos())
+		key, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, updatedParent, newPtr, o.plan.Pos())
 		if err != nil {
 			return err
 		}
@@ -1198,6 +1215,11 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 		}
 		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
+			// Blob-format repair only — see maintainUniqueIndexesForInsert's note
+			// on this fallback (M0130-S11.4 slice 3b-2c-ii-B2-c-vii).
+			if o.ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {
 				continue
@@ -1243,6 +1265,11 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 		}
 		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
+			// Blob-format repair only — see maintainUniqueIndexesForInsert's note
+			// on this fallback (M0130-S11.4 slice 3b-2c-ii-B2-c-vii).
+			if o.ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {
 				continue
@@ -1443,7 +1470,7 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 }
 
 func (o *upsertOp) maintainArbiterRow(row Row, ptr storage.ItemPointer) error {
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
+	key, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, row, ptr, o.plan.Pos())
 	if err != nil {
 		return err
 	}

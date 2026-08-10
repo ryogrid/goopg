@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -366,6 +367,101 @@ func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Colum
 			"indexBuildEntryKey: index %q: %v", idx.Name, encErr)}
 	}
 	return k, false, nil
+}
+
+// arbiterProbeKey builds the key an ON CONFLICT arbiter probe POSITIONS with:
+// the conflict-key columns of the proposed row, no heap TID.
+//
+// arbiterEntryKey builds the key the arbiter index ENTRY for the same row is
+// stored under: the same key attributes, plus the heap TID the row was written
+// at.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-vii — the arbiter-key funnel, and the last of
+// the writer conflations the flip has to undo. It is B2-c-iv's split
+// (`indexEntryKey` vs `indexRowProbeKey`) applied to the one index the upsert
+// path does NOT maintain through those funnels: the arbiter, whose key
+// `encodeArbiterKey` builds once and whose bytes are then used for BOTH roles —
+// probed against the tree (`probeArbiterByKey`, `findInProgressConflictKey`) and
+// inserted into it (`maintainArbiter`). Under the blob format that is sound, and
+// deliberately so: a blob key carries no TID, so the probe key and the entry key
+// ARE the same bytes, and reusing them is what keeps a side-effectful arbiter
+// expression (`blurt_and_lock_*`) from being evaluated twice. Under the tuple
+// format they differ in the heapkeyspace tiebreaker — the entry carries the
+// row's real TID, the probe the zero TID that is minus infinity — and using one
+// for the other files the entry among the wrong duplicates, or starts a probe
+// after some of its own matches.
+//
+// `oc.ArbiterColumns` is built in the arbiter INDEX's key order (planner.go's
+// `resolveArbiterIndex` walks `idx.Columns`), which is what makes attribute i of
+// this key attribute i of the descriptor. The ordinals index the table the
+// upsert is running against, which need not be the table the index was resolved
+// on (the partitioned path probes with the parent's row), so the two sides are
+// reconciled by NAME rather than by ordinal, and a disagreement is reported
+// instead of encoded — a key built from the wrong column is not a key that
+// misses, it is a key that hits something else.
+//
+// A nil key with a nil error keeps `encodeArbiterKey`'s meaning: a NULL
+// conflict-key column never conflicts, so there is no probe and no entry.
+// Expression arbiter columns (`ArbiterColumns[i] == -1`) only ever appear on
+// indexes `buildPGIndexKeyDesc` refuses, which resolve to a nil descriptor and
+// keep the blob path whole.
+func (ctx *Context) arbiterProbeKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
+	return ctx.arbiterKey(oc, tbl, row, storage.ItemPointer{}, pos)
+}
+
+// arbiterEntryKey — see arbiterProbeKey.
+func (ctx *Context) arbiterEntryKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
+	return ctx.arbiterKey(oc, tbl, row, tid, pos)
+}
+
+func (ctx *Context) arbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
+	if oc == nil || oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
+		return nil, nil
+	}
+	idx := oc.ArbiterIndex
+	desc := ctx.pgIndexKeyDesc(idx)
+	if desc == nil {
+		return encodeArbiterKey(ctx, oc, tbl, row, pos)
+	}
+	if tbl == nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"arbiterKey: index %q: no target table", idx.Name)}
+	}
+	keyCols := pgIndexKeyColumns(idx)
+	if len(keyCols) != desc.NKeyAtts() || len(oc.ArbiterColumns) != len(keyCols) {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"arbiterKey: index %q: %d arbiter columns / %d resolved key columns / %d descriptor attributes",
+			idx.Name, len(oc.ArbiterColumns), len(keyCols), desc.NKeyAtts())}
+	}
+	vals := make([]Datum, len(keyCols))
+	for i, ord := range oc.ArbiterColumns {
+		if ord < 0 || ord >= len(tbl.Columns) || ord >= len(row) || keyCols[i] == nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+				"arbiterKey: index %q: arbiter column %d has ordinal %d on a %d-column table / %d-column row",
+				idx.Name, i+1, ord, len(tbl.Columns), len(row))}
+		}
+		if !strings.EqualFold(tbl.Columns[ord].Name, keyCols[i].Name) {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+				"arbiterKey: index %q: arbiter column %d is %q, index key attribute %d is %q",
+				idx.Name, i+1, tbl.Columns[ord].Name, i+1, keyCols[i].Name)}
+		}
+		v := row[ord]
+		if v.IsNull() {
+			return nil, nil
+		}
+		vals[i] = v
+	}
+	// keyCols, not tbl's columns: the descriptor was derived from these, and the
+	// per-attribute physical layout has to come from the same catalog.Column the
+	// comparator was chosen for (pgindex_keydesc.go's findColumnByName note).
+	key, _, err := pgIndexTupleKey(desc, keyCols, vals, tid)
+	if err != nil {
+		// No blob fallback, for B2-c-iii's reason: the tree is tuple-shaped, so a
+		// blob key would address the wrong place rather than be rejected.
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"arbiterKey: index %q: %v", idx.Name, err)}
+	}
+	return key, nil
 }
 
 // sortBuildEntriesFindDuplicate sorts entries into idx's OWN key order and

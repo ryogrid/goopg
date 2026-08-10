@@ -7246,6 +7246,18 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 			// returns nil when idx.Columns[i]=="" (expression column); evaluate the
 			// stored ColExprs to produce the btree key so concurrent sessions can
 			// detect the in-progress insert via the arbiter scan. M0100-0005.
+			//
+			// The fallback is a BLOB-format repair, and only that: it concatenates
+			// per-column blobs, so under the tuple format it would file a key the
+			// tree cannot parse — an entry addressed by garbage rather than a
+			// missing entry. An index the descriptor resolver ACCEPTS is never an
+			// expression index anyway (buildPGIndexKeyDesc refuses those), so the
+			// only way to arrive here with a descriptor is a refusal by the tuple
+			// encoder itself, which must not be papered over.
+			// M0130-S11.4 slice 3b-2c-ii-B2-c-vii.
+			if ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(ctx, idx, tbl, row)
 			if key == nil {
 				continue

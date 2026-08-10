@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v-3b-2c-ii-B2-c-vi landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v-3b-2c-ii-B2-c-vi-3b-2c-ii-B2-c-vii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -969,6 +969,50 @@ sources agree:
             while holding every TID. Mutation-checked: grouping by `compare`,
             using the blob offset under the tuple format, and dropping the
             per-TID stamp each fail by name.
+          - **3b-2c-ii-B2-c-vii — the arbiter-key funnel (landed
+            2026-08-10).** NO on-disk change, no REINDEX. The last writer
+            conflation, and B2-c-iv's split applied to the one index the upsert
+            path does not maintain through those funnels: the ON CONFLICT
+            arbiter. `encodeArbiterKey` builds ONE key that is both PROBED with
+            (`probeArbiterByKey`, `findInProgressConflictKey`,
+            `probeSpeculativeConflict`) and INSERTED (`maintainArbiter`). Under
+            the blob format those are the same bytes, and reusing them is
+            deliberate — it is what keeps a side-effectful arbiter expression
+            (`blurt_and_lock_*`, insert-conflict-specconflict.spec) from being
+            evaluated twice, including the Phase-B key `applyInsert` computes
+            BEFORE the heap write. Under the tuple format they are two keys: the
+            entry carries the row's heap TID, the probe the zero TID that is
+            heapkeyspace's minus infinity. Using one for the other files the
+            entry among the wrong duplicates or starts the conflict probe after
+            some of its own matches — a MISSED conflict, i.e. a duplicate row,
+            which no format check would report.
+            Landed: `Context.arbiterProbeKey` / `arbiterEntryKey` over one
+            `arbiterKey` (blob branch = `encodeArbiterKey` verbatim), the nine
+            call sites in `operators_upsert.go` routed by role, and
+            `applyInsert` rebuilding the entry key from the Phase-B probe key
+            once the heap TID exists — only under the tuple format, where the
+            arbiter index provably has no expression key column, so no side
+            effect is repeated. `oc.ArbiterColumns` is in the arbiter INDEX's
+            key order (`resolveArbiterIndex` walks `idx.Columns`), but its
+            ordinals address the table the upsert runs against, which need not
+            be the table the index was resolved on (the partitioned path probes
+            with the parent's row), so the two sides are reconciled BY NAME and
+            a disagreement is reported rather than encoded — a blob key built
+            from the wrong column matched nothing, a tuple key matches something
+            else. The same slice made the three `encodeExprIndexKey` fallbacks
+            blob-only: that fallback concatenates per-column blobs, so under the
+            tuple format it would file an unparseable key instead of skipping a
+            row, and the only way to reach it WITH a descriptor is a refusal by
+            the tuple encoder itself, which must not be papered over.
+            Guards: `internal/executor/pgindex_arbiterkey_test.go` — blob probe
+            and entry are byte-identical to `encodeArbiterKey`; the tuple pair
+            differ, compare equal on key attributes and the probe sorts first;
+            a NULL conflict column still answers (nil, nil) in both roles; an
+            expression arbiter keeps the blob answer; swapped and out-of-range
+            ordinals error; and a source scan keeps `operators_upsert.go` from
+            calling `encodeArbiterKey` outside the funnel. Mutation-checked:
+            dropping the entry TID and dropping the name reconciliation each
+            fail by name.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -981,13 +1025,14 @@ sources agree:
             format-agnostic already, and B2-c-iv did the same for the
             row-shaped writer sites (entry keys and probe-by-row keys both now
             resolve the descriptor), and B2-c-v for the CREATE INDEX / REINDEX
-            bulk build (key, sort order and duplicate test). What remains is the
-            expression-key paths (`encodeArbiterKey`, `encodeExprIndexKey` — an
-            expression index is one `buildPGIndexKeyDesc` currently refuses, so
-            the decision is whether the flip describes them or leaves them
-            permanently blob), the per-column uniqueness comparisons in
-            `operators_storage.go`, and turning `pgIndexTupleKeys` on with the
-            explicit per-index dual-format decision. Gates:
+            bulk build (key, sort order and duplicate test). B2-c-vii funnelled the ON CONFLICT
+            arbiter's probe and entry keys and made the `encodeExprIndexKey`
+            fallbacks blob-only. What remains is the per-column uniqueness
+            comparisons in `operators_storage.go`, the standing decision on
+            expression indexes (`buildPGIndexKeyDesc` refuses them, so they stay
+            permanently blob unless the flip describes them), and turning
+            `pgIndexTupleKeys` on with the explicit per-index dual-format
+            decision. Gates:
             `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
             a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length

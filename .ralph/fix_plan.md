@@ -1290,6 +1290,24 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               `ComparePGIndexTupleKeyAttrs`) and group with it. Invisible to a
               row-count gate — it changes index SIZE, not rows — so it needs a
               size/structure assertion, not a spotcheck.
+        - [x] **3b-2c-ii-B2-c-vii — the arbiter-key funnel** (2026-08-10). NO
+              on-disk change, no REINDEX. `encodeArbiterKey` built ONE key that
+              the upsert path both PROBED the arbiter tree with and INSERTED
+              into it — sound under the blob format (a blob key has no TID, and
+              the reuse is what keeps a side-effectful arbiter expression from
+              being evaluated twice, including `applyInsert`'s Phase-B key,
+              computed before the heap write), a missed conflict under the tuple
+              format (the entry carries the row's heap TID, the probe the zero
+              TID that is minus infinity). Landed: `Context.arbiterProbeKey` /
+              `arbiterEntryKey` over one `arbiterKey` (blob branch =
+              `encodeArbiterKey` verbatim), the nine `operators_upsert.go` call
+              sites routed by role, `applyInsert` rebuilding the entry key from
+              the probe key once the TID exists (tuple format only), arbiter
+              ordinals reconciled with the index's key attributes BY NAME (they
+              address the upsert's table, the index may be resolved on another),
+              and the three `encodeExprIndexKey` fallbacks made blob-only.
+              Guard: `internal/executor/pgindex_arbiterkey_test.go` (6 tests,
+              mutation-checked: entry TID dropped, name reconciliation dropped).
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -1297,11 +1315,12 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               (B2-c-i + B2-c-ii + B2-c-iii) and the row-shaped writer sites are
               funnelled (B2-c-iv: entry keys and probe-by-row keys; B2-c-v: the
               CREATE INDEX / REINDEX bulk build — key, sort order and duplicate
-              test). What remains is the expression-key writers
-              (`encodeArbiterKey`, `encodeExprIndexKey` — an expression index is
-              one `buildPGIndexKeyDesc` currently REFUSES, so the open decision
-              is whether the flip describes them or leaves them permanently
-              blob) and the per-column uniqueness comparisons in
+              test). B2-c-vii funnelled the ON CONFLICT arbiter's probe and
+              entry keys and made the `encodeExprIndexKey` fallbacks blob-only.
+              What remains is the standing decision on expression indexes (one
+              `buildPGIndexKeyDesc` REFUSES, so they stay permanently blob
+              unless the flip describes them) and the per-column uniqueness
+              comparisons in
               `operators_storage.go` — all becoming
               `pgIndexTupleKeyFromRow` with the row's real heap TID,
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
