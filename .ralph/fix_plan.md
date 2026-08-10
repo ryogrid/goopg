@@ -2530,6 +2530,38 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       still misreads a pre-flip row), `numeric[]` is built with elemtype OID
       25 (text) because `arrayElemTypeInfo` has no numeric case, and numeric
       NaN/+-Infinity still has no Datum representation.
+      **Slice landed 2026-08-11 (21st) — `interval[]` / `uuid[]` / `numeric[]`
+      ELEMENT images** (design
+      `docs/design/0119-0006-array-element-pg-images.md`). The residue the three
+      column slices each left behind, closed as ONE slice because all three
+      ledger rows named the same seam. `arrayElemTypeInfo` had no arm for any of
+      the three, so all three fell to the *unknown element type* fallback and
+      were written as an `ArrayType` whose `elemtype` field says 25 (text) while
+      `pg_attribute.atttypid` for the same column says `_interval`/`_uuid`/
+      `_numeric` — the blob and the catalog disagreed about one column's element
+      type, which is worse than "the elements are text". The layout was pinned
+      from the oracle, not derived: PG 18.3 `pg_column_size` is 56/56/44 for a
+      2-element interval/uuid/numeric array = 24-byte header + two 16-byte
+      fields at align 8, + two at align 1, + a 10-byte varlena padded to 12 plus
+      an 8-byte one at align 4, i.e. the new `(2950,16,1,false)` /
+      `(1186,16,8,false)` / `(1700,-1,4,true)` arms. All six encode/decode arms
+      are ports of the SCALAR arms, not second implementations; numeric is the
+      one varlena element whose body is not its own text, so
+      `encodeArrayElem`'s `if varlena` short-circuit grew a case ahead of it.
+      Only interval moves a user-visible answer, onto PG:
+      `{1 mon,30 days,2 hours}` → `{"1 mon","30 days",02:00:00}`. Pre-flip data
+      needs no byte analysis this time — the blob STATES its own element type,
+      and elemtype 25 under one of these columns can only be the old fallback.
+      Gates: `TestArrayCodecPGType{ElementRoundTrip,OnDiskLayout,
+      LegacyTextBlob,InvalidElement}` (the layout test is the one a round-trip
+      cannot make) + a live throwaway server reproducing all three renderings
+      end to end. 3 ledger rows: array SUBSCRIPT still yields a `KindString` so
+      `c[1] = c[2]` over `{'1 mon','30 days'}` is still `f` vs PG's `t` (the
+      cause moved from storage to the expression evaluator),
+      `internal/wal/pgoutput.go` ignores `t.IsArray` so logical replication
+      decodes ANY array as its scalar element type (pre-existing), and
+      `interval[]` index-key elements are still refused by
+      `decodeArrayKeyElemText`.
       Remaining for M0119-0006: posting-list duplicate coverage in the
       checkunique tier, `box`/`int4range` key encodings, and
       the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
