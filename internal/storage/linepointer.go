@@ -84,3 +84,27 @@ func PageDeleteLinePointerAt(p Page, slot uint16) error {
 	h.SetLower(uint16(SizeOfPageHeaderData + (count-1)*itemIDSize))
 	return nil
 }
+
+// PageSetLinePointerNormal marks the 1-based line pointer `slot` LP_NORMAL.
+//
+// It exists for the one transition PageReplaceItemRaw cannot make on its own:
+// that function deliberately PRESERVES the existing line pointer's flags (so a
+// rewrite cannot silently resurrect an LP_DEAD entry), which means filling a
+// slot reserved by PageReserveLinePointer leaves it LP_UNUSED and therefore
+// unreadable. The nbtree bulk loader does exactly that — reserve P_HIKEY on an
+// empty page, then write the separator into it once the page is full.
+func PageSetLinePointerNormal(p Page, slot uint16) error {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	if int(slot) < 1 || int(slot) > count {
+		return fmt.Errorf("PageSetLinePointerNormal: slot %d out of range [1,%d]", slot, count)
+	}
+	id, err := readItemID(p, int(slot)-1)
+	if err != nil {
+		return err
+	}
+	id.Flags = ItemIDNormal
+	return writeItemID(p, int(slot)-1, id)
+}

@@ -42,12 +42,10 @@ func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 func makeDataPage(t *testing.T, flags uint16, level uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if err := btree.InitPGBTPage(p); err != nil {
+		t.Fatalf("InitPGBTPage: %v", err)
 	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level) // Level
-	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)
+	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Level: level, Flags: pgFlagsForTest(flags)})
 	op := btree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level {
 		t.Fatalf("makeDataPage self-check: ParseOpaque flags=%#x level=%d, want flags=%#x level=%d", op.Flags, op.Level, flags, level)
@@ -239,6 +237,53 @@ func TestVerifyBtreePage_DeletedPageSuppressesItemCount(t *testing.T) {
 	}
 }
 
+// pgInitTestPage initialises an upstream-shaped B-tree page and, when the page
+// is NOT rightmost, installs the P_HIKEY placeholder that upstream requires
+// there. Since M0130-S11.2b the first line pointer of a non-rightmost page IS
+// the high key, so a builder that starts writing data at offset 1 silently
+// loses its first item to the high-key reader.
+//
+// The placeholder is all-0xFF, i.e. above every key these tests use, so the
+// high-key invariant tier stays quiet on pages built for the other tiers.
+func pgInitTestPage(t *testing.T, p storage.Page, next storage.BlockNumber, level uint32, flags uint16) {
+	t.Helper()
+	if err := btree.InitPGBTPage(p); err != nil {
+		t.Fatalf("InitPGBTPage: %v", err)
+	}
+	pgNext := next
+	if next == storage.InvalidBlockNumber {
+		pgNext = btree.PNone
+	}
+	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: pgNext, Level: level, Flags: pgFlagsForTest(flags)})
+	if pgNext != btree.PNone {
+		if _, err := storage.PageAddItemRaw(p, btItemRaw([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})); err != nil {
+			t.Fatalf("PageAddItemRaw P_HIKEY placeholder: %v", err)
+		}
+	}
+}
+
+// pgFlagsForTest mirrors btree's own legacy->BTP_* flag translation for the
+// page builders here, which speak the engine's in-memory flag names. It is
+// deliberately a duplicate of an unexported mapping: the point of these tests
+// is to construct pages INDEPENDENTLY of the writer, so importing the writer's
+// translator would hide a drift in it.
+func pgFlagsForTest(legacy uint16) uint16 {
+	var out uint16
+	for _, m := range []struct{ legacy, pg uint16 }{
+		{btree.BTLeaf, btree.BTPLeaf},
+		{btree.BTRoot, btree.BTPRoot},
+		{btree.BTDeleted, btree.BTPDeleted},
+		{btree.BTIncompleteSplit, btree.BTPIncompleteSplit},
+		{btree.BTHalfDead, btree.BTPHalfDead},
+		{btree.BTHasGarbage, btree.BTPHasGarbage},
+	} {
+		if legacy&m.legacy != 0 {
+			out |= m.pg
+		}
+	}
+	return out
+}
+
 // btItemRaw marshals a B-tree line-pointer item in the on-disk layout parseItem
 // expects: keyLen(2) | block(4) | offset(2) | key. The TID is left zero — the
 // item-order / high-key tier compares only keys.
@@ -250,36 +295,43 @@ func btItemRaw(key []byte) []byte {
 }
 
 // makeItemsPage builds a non-meta B-tree page carrying keys as line pointers in
-// slot order, with the given opaque flags/level/next-sibling and optional high
-// key. It sets pd_special/pd_upper to the B-tree special offset before adding
-// items (mirroring btree.initPage) so item data grows above the opaque area
-// instead of clobbering it, then writes the opaque bytes (mirroring
-// btree.writeOpaque). A non-nil highKey sets BTHasHighKey. Self-checks the
-// decoded opaque and key sequence through the real readers so a layout change
-// fails loudly here rather than silently exercising garbage.
+// data-slot order, with the given opaque flags/level/next-sibling and optional
+// high key.
+//
+// Since M0130-S11.2b the page is built the way the engine builds one: an
+// upstream 16-byte special area (btree.InitPGBTPage + btree.WritePGOpaque, with
+// the P_NONE sentinel translation), the high key as an ordinary item at P_HIKEY
+// so data starts at P_FIRSTKEY, and no "has high key" flag — presence is
+// derived from btpo_next. `next` is given in the engine's in-memory spelling
+// (storage.InvalidBlockNumber for "rightmost"), and a non-nil highKey therefore
+// requires a real sibling. Self-checks the decoded opaque and key sequence
+// through the real readers so a layout change fails loudly here rather than
+// silently exercising garbage.
 func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockNumber, highKey []byte, keys ...[]byte) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if highKey != nil && next == storage.InvalidBlockNumber {
+		t.Fatalf("makeItemsPage: a high key requires a right sibling (upstream derives presence from btpo_next)")
 	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecial()))
-	h.SetUpper(uint16(btSpecial()))
+	if highKey != nil {
+		if err := btree.InitPGBTPage(p); err != nil {
+			t.Fatalf("InitPGBTPage: %v", err)
+		}
+		btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: next, Level: level, Flags: pgFlagsForTest(flags)})
+		if _, err := storage.PageAddItemRaw(p, btItemRaw(highKey)); err != nil {
+			t.Fatalf("PageAddItemRaw high key: %v", err)
+		}
+	} else {
+		// No separator asked for: pgInitTestPage still has to install the
+		// P_HIKEY placeholder when the page is non-rightmost, since data may
+		// not start at offset 1 there.
+		pgInitTestPage(t, p, next, level, flags)
+	}
 	for i, k := range keys {
 		if _, err := storage.PageAddItemRaw(p, btItemRaw(k)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	if highKey != nil {
-		flags |= btree.BTHasHighKey
-	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
-	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)      // Flags
-	binary.LittleEndian.PutUint16(p[off+14:off+16], uint16(len(highKey)))
-	copy(p[off+16:off+16+len(highKey)], highKey)
 
 	op := btree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level || op.Next != next {
@@ -395,10 +447,12 @@ func TestVerifyBtreeItemOrder_InternalNegInfinityClean(t *testing.T) {
 	}
 }
 
-// A rightmost page (Next == InvalidBlockNumber) has no high key to honour even
-// if a stale high key value lingers in its opaque area.
+// A rightmost page has NO high key at all — since M0130-S11.2b presence is
+// derived from btpo_next, so there is no stale separator to mistake for one and
+// item 1 is real data. k(5) would violate a k(3) separator; on a rightmost page
+// nothing is reported.
 func TestVerifyBtreeItemOrder_RightmostNoHighKeyCheck(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, storage.InvalidBlockNumber, k(3), k(1), k(5))
+	p := makeItemsPage(t, btree.BTLeaf, 0, storage.InvalidBlockNumber, nil, k(1), k(5))
 	if rs := VerifyBtreeItemOrder(p, 9, "ix"); len(rs) != 0 {
 		t.Fatalf("rightmost page reported %d, want 0 (high key not enforced): %+v", len(rs), rs)
 	}
@@ -626,21 +680,13 @@ type dl struct {
 func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, downlinks ...dl) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
-	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecial()))
-	h.SetUpper(uint16(btSpecial()))
+	// Flags = 0 → internal (not leaf), not deleted.
+	pgInitTestPage(t, p, next, level, 0)
 	for i, d := range downlinks {
 		if _, err := storage.PageAddItemRaw(p, btDownlinkRaw(d.key, d.child)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
-	// Flags = 0 → internal (not leaf), not deleted.
 	got, err := btree.PageDownlinks(p)
 	if err != nil {
 		t.Fatalf("makeInternalPage PageDownlinks self-check: %v", err)

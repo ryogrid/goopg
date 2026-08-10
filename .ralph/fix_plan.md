@@ -768,16 +768,20 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
       `pgReserveHiKeySlot`/`pgSlideLeft`, and the sentinel/flag translators.
       Additive — no writer flipped yet. Guards: `pgpage_test.go` (8) +
       `linepointer_test.go` (3); the `P_FIRSTDATAKEY` bias mutation-verified.
-- [ ] **M0130-S11.2b — the flip** (est ~2 loops). Point `readOpaque`/
-      `writeOpaque`/`ParseOpaque` at the 16-byte form, delete `BTHasHighKey`
-      (upstream derives high-key presence from `P_RIGHTMOST`; 0x0008 is
-      `BTP_META`), swap the accessor call sites for S11.2a's `pgXxx` wrappers,
-      and translate the sibling sentinel + flag bits — all in ONE commit (an
-      intermediate that does only some is neither format). Writers:
-      `btree.go`, `bulkload.go`, `btree_vacuum.go`. Sibling readers that must
-      move in lockstep: `internal/amcheck`, `replay.go`,
-      `internal/executor/operators_bt_index_check.go`. Mechanism is fixed in
-      the design doc's S11.2 section — do not redesign it.
+- [x] **M0130-S11.2b — the flip** (est ~2 loops). **DONE (2026-08-10).**
+      `readOpaque`/`writeOpaque`/`ParseOpaque` now speak upstream's 16-byte
+      `BTPageOpaqueData`; `BTHasHighKey` is deleted and `HasHighKey()` is
+      `!P_RIGHTMOST`; the high key is an item at `P_HIKEY`; every accessor in
+      `btree.go` / `btree_vacuum.go` / `lpdead_kill.go` goes through S11.2a's
+      data-slot wrappers; the sibling sentinel and flag bits translate at the
+      read/write boundary only (one `flagTranslation` table for both
+      directions). Three invariants the plan did not anticipate, all now
+      guarded: repointing `btpo_next` must slide the separator away in the
+      same step (`pgWriteNextSibling`), `resetPageItems` must preserve it
+      across all four whole-page rewrite paths, and the separator is now paid
+      for out of page space (`pageHighKeyFootprint`, `bulkHighKeyReserve`).
+      **Every pre-existing goopg index must be REINDEXed** — `BTREE_VERSION`
+      could not carry the break (upstream requires 4). 1 ledger row.
 - [ ] **M0130-S11.3 — metapage** (est ~1 loop). `BTreeMeta` → `PGBTMetaPage`
       at block 0 via S11.1's codec, including the `pd_lower` advance.
 - [ ] **M0130-S11.4 — tuple shape** (est ~3 loops, LARGE). goopg `item` →

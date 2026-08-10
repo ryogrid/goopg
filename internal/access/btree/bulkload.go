@@ -7,6 +7,32 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// bulkHighKeyReserve is the tuple-body budget the bulk loader holds back on
+// every page for the separator it may have to install at flush time.
+//
+// The bulk loader cannot know a page's high key while it is filling it: the
+// separator is the FIRST KEY OF THE NEXT PAGE, which does not exist yet. The
+// P_HIKEY line pointer is reserved up front by pgReserveHiKeySlot (upstream's
+// pd_lower bump in _bt_blnewpage), but its payload is not, so the budget for
+// that payload has to be withheld here or a page can fill so completely that
+// its own separator no longer fits.
+//
+// Reserving the worst case (a MaxHighKeyLen separator) rather than a measured
+// one is deliberate: it makes the bulk loader's per-page data capacity
+// 8192-24-16-4-8-256 = 7884 bytes, within twelve bytes of the 7896 the legacy
+// 272-byte opaque afforded — so the flip does not move split points and the
+// index-size / page-count expectations in the bulk-load tests hold. Upstream
+// instead truncates the separator to its key attributes (_bt_truncate) and can
+// therefore reserve exactly; that is S11.4 work.
+const bulkHighKeyReserve = 4 /* ItemIdData */ + itemPrefixSize + MaxHighKeyLen
+
+// pageHasSpaceForBulk is pageHasSpaceFor plus that reserve.
+func pageHasSpaceForBulk(p storage.Page, it item) bool {
+	h := storage.MustHeader(p)
+	free := int(h.Upper()) - int(h.Lower())
+	return free >= itemEncodedSize(it)+bulkHighKeyReserve
+}
+
 // BulkEntry is one (encoded-key, heap-pointer) pair for bulk index building.
 // The key must already be encoded with the same EncodeXxx functions that the
 // normal Insert path uses — BulkCreate treats keys as opaque byte slices and
@@ -339,6 +365,15 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 			Level: level,
 			Flags: flags,
 		})
+		// _bt_blnewpage: reserve the P_HIKEY line pointer before any data
+		// item, because whether this page ends up rightmost is not known
+		// until the level is finished. Data therefore starts at P_FIRSTKEY
+		// and flushPage resolves the placeholder.
+		if err := pgReserveHiKeySlot(slot.Page()); err != nil {
+			slot.Unlock()
+			bt.pool.Unpin(slot)
+			return fmt.Errorf("btree bulk: reserve P_HIKEY at level %d: %w", level, err)
+		}
 		curSlot = slot
 		curBlk = blk
 		return nil
@@ -349,11 +384,24 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 	flushPage := func(highKey []byte, nextBlk storage.BlockNumber) error {
 		op := readOpaque(curSlot.Page())
 		op.Next = nextBlk
-		if len(highKey) > 0 {
-			op.Flags |= BTHasHighKey
-			op.HighKey = append([]byte(nil), highKey...)
-		}
 		writeOpaque(curSlot.Page(), op)
+		// _bt_buildadd's endgame: the P_HIKEY slot reserved by startNewPage
+		// either receives the separator (non-rightmost page) or is slid away
+		// again (_bt_slideleft) so the rightmost page of the level starts its
+		// data at P_HIKEY like upstream expects.
+		if len(highKey) > 0 {
+			if err := pgSetHighKeyRaw(curSlot.Page(), highKeyItem(highKey).marshal()); err != nil {
+				curSlot.Unlock()
+				bt.pool.Unpin(curSlot)
+				curSlot = nil
+				return err
+			}
+		} else if err := pgSlideLeft(curSlot.Page()); err != nil {
+			curSlot.Unlock()
+			bt.pool.Unpin(curSlot)
+			curSlot = nil
+			return err
+		}
 		result = append(result, bulkLink{blk: curBlk, highKey: highKey})
 		err := bt.markDirtyWithPageRecord(curSlot, curBlk)
 		curSlot.Unlock()
@@ -371,7 +419,7 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 			}
 		}
 
-		if !pageHasSpaceFor(curSlot.Page(), it) {
+		if !pageHasSpaceForBulk(curSlot.Page(), it) {
 			// Current page is full. Allocate the next page first so we can
 			// write its block number into the current page's Next field.
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
@@ -399,6 +447,11 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 				Level: level,
 				Flags: flags,
 			})
+			if err := pgReserveHiKeySlot(nextSlot.Page()); err != nil {
+				nextSlot.Unlock()
+				bt.pool.Unpin(nextSlot)
+				return nil, fmt.Errorf("btree bulk: reserve P_HIKEY at level %d: %w", level, err)
+			}
 			curSlot = nextSlot
 			curBlk = nextBlk
 		}
@@ -533,6 +586,15 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 			Level: level,
 			Flags: flags,
 		})
+		// _bt_blnewpage: reserve the P_HIKEY line pointer before any data
+		// item, because whether this page ends up rightmost is not known
+		// until the level is finished. Data therefore starts at P_FIRSTKEY
+		// and flushPage resolves the placeholder.
+		if err := pgReserveHiKeySlot(slot.Page()); err != nil {
+			slot.Unlock()
+			bt.pool.Unpin(slot)
+			return fmt.Errorf("btree bulk: reserve P_HIKEY at level %d: %w", level, err)
+		}
 		curSlot = slot
 		curBlk = blk
 		return nil
@@ -541,11 +603,24 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 	flushPage := func(highKey []byte, nextBlk storage.BlockNumber) error {
 		op := readOpaque(curSlot.Page())
 		op.Next = nextBlk
-		if len(highKey) > 0 {
-			op.Flags |= BTHasHighKey
-			op.HighKey = append([]byte(nil), highKey...)
-		}
 		writeOpaque(curSlot.Page(), op)
+		// _bt_buildadd's endgame: the P_HIKEY slot reserved by startNewPage
+		// either receives the separator (non-rightmost page) or is slid away
+		// again (_bt_slideleft) so the rightmost page of the level starts its
+		// data at P_HIKEY like upstream expects.
+		if len(highKey) > 0 {
+			if err := pgSetHighKeyRaw(curSlot.Page(), highKeyItem(highKey).marshal()); err != nil {
+				curSlot.Unlock()
+				bt.pool.Unpin(curSlot)
+				curSlot = nil
+				return err
+			}
+		} else if err := pgSlideLeft(curSlot.Page()); err != nil {
+			curSlot.Unlock()
+			bt.pool.Unpin(curSlot)
+			curSlot = nil
+			return err
+		}
 		result = append(result, bulkLink{blk: curBlk, highKey: highKey})
 		err := bt.markDirtyWithPageRecord(curSlot, curBlk)
 		curSlot.Unlock()
@@ -566,7 +641,7 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 		h := storage.MustHeader(curSlot.Page())
 		free := int(h.Upper()) - int(h.Lower())
 		const itemIDSize = 4
-		if free < itemIDSize+len(ri.raw) {
+		if free < itemIDSize+len(ri.raw)+bulkHighKeyReserve {
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
 			if err != nil {
 				curSlot.Unlock()
@@ -585,6 +660,11 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 				Level: level,
 				Flags: flags,
 			})
+			if err := pgReserveHiKeySlot(nextSlot.Page()); err != nil {
+				nextSlot.Unlock()
+				bt.pool.Unpin(nextSlot)
+				return nil, fmt.Errorf("btree bulk raw: reserve P_HIKEY at level %d: %w", level, err)
+			}
 			curSlot = nextSlot
 			curBlk = nextBlk
 		}

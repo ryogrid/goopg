@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 landed 2026-08-10; S11.2–S11.6 not started)
+**Status:** draft (S11.1 + S11.2 landed 2026-08-10; S11.3–S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -127,8 +127,36 @@ sources agree:
     high-key item accessors, `pgReserveHiKeySlot`/`pgSlideLeft`, and the
     sentinel/flag translators. Guards in `pgpage_test.go` +
     `linepointer_test.go`; the `P_FIRSTDATAKEY` bias is mutation-verified.
-  - **S11.2b — the flip.** Point the writers and readers at those primitives in
-    one commit.
+  - **S11.2b — the flip (LANDED 2026-08-10).** Writers and readers point at
+    those primitives; `readOpaque`/`writeOpaque` now encode upstream's 16-byte
+    `BTPageOpaqueData` and translate at that single boundary. Every existing
+    goopg index is unreadable from this commit on and must be REINDEXed —
+    `BTREE_VERSION` could not be used as a break marker because upstream's
+    `_bt_getmeta` insists it is 4.
+
+    Three things the slice discovered that the plan above did not anticipate:
+
+    1. **The in-memory spelling did not have to change with the on-disk one.**
+       `BTPageOpaque` keeps `storage.InvalidBlockNumber` for "no sibling" and
+       the legacy `BT*` flag bits; `pgSibling`/`legacySibling` and
+       `pgFlags`/`legacyFlags` translate in `readOpaque`/`writeOpaque`. Both
+       directions come from one `flagTranslation` table so the encode/decode
+       pair cannot drift. Converting the ~65 `InvalidBlockNumber` sites too
+       would have multiplied the flip's blast radius for no on-disk gain
+       (ledger row, S11.2b).
+    2. **Repointing `btpo_next` is a high-key operation.** Because presence is
+       derived, a page that loses its right sibling (page deletion relinking a
+       left sibling past an unlinked page) must slide its separator away in the
+       same step, or `P_FIRSTDATAKEY` drops onto the stale separator and every
+       data slot is off by one from then on. `pgWriteNextSibling` pairs the two
+       and refuses the reverse transition, which only a split may make.
+    3. **The separator is now paid for out of page space.** It used to sit in
+       the 272-byte opaque's 256-byte reserve. `resetPageItems` therefore
+       preserves and re-installs it (all four whole-page rewrite paths rely on
+       that), the dedup-recovery budget subtracts `pageHighKeyFootprint`, and
+       the bulk loader withholds `bulkHighKeyReserve` — deliberately the worst
+       case, which keeps its per-page data capacity within twelve bytes of the
+       legacy layout's so split points do not move.
 
   Three mechanisms decided here, so S11.2b is a mechanical edit rather than a
   redesign:

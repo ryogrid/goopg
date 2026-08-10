@@ -279,8 +279,8 @@ func TestPGSiblingSentinelTranslation(t *testing.T) {
 // mechanical copy of the legacy flags word would tell a real PG that every
 // non-rightmost goopg page is a metapage.
 func TestPGFlagsTranslationMovesTheThreeDivergentBits(t *testing.T) {
-	if got := pgFlags(BTHasHighKey); got != 0 {
-		t.Fatalf("pgFlags(BTHasHighKey) = 0x%x, want 0 (upstream has no such bit; 0x0008 is BTP_META)", got)
+	if got := pgFlags(0x0008); got != 0 {
+		t.Fatalf("pgFlags(0x0008) = 0x%x, want 0 (goopg's old BTHasHighKey bit is unclaimed; upstream uses it for BTP_META)", got)
 	}
 	if got := pgFlags(BTIncompleteSplit); got != BTPIncompleteSplit {
 		t.Fatalf("pgFlags(BTIncompleteSplit) = 0x%x, want 0x%x", got, BTPIncompleteSplit)
@@ -288,12 +288,137 @@ func TestPGFlagsTranslationMovesTheThreeDivergentBits(t *testing.T) {
 	if got := pgFlags(BTHalfDead); got != BTPHalfDead {
 		t.Fatalf("pgFlags(BTHalfDead) = 0x%x, want 0x%x", got, BTPHalfDead)
 	}
-	all := BTLeaf | BTRoot | BTDeleted | BTHasHighKey | BTIncompleteSplit | BTHalfDead | BTHasGarbage
+	all := BTLeaf | BTRoot | BTDeleted | 0x0008 | BTIncompleteSplit | BTHalfDead | BTHasGarbage
 	want := BTPLeaf | BTPRoot | BTPDeleted | BTPIncompleteSplit | BTPHalfDead | BTPHasGarbage
 	if got := pgFlags(all); got != want {
 		t.Fatalf("pgFlags(all legacy bits) = 0x%x, want 0x%x", got, want)
 	}
 	if pgFlags(all)&BTPMeta != 0 {
 		t.Fatal("translated flags claim BTP_META — a real PG would treat the page as the metapage")
+	}
+}
+
+// --- M0130-S11.2b flip guards -------------------------------------------
+//
+// These three cover the invariants the flip introduced that no pre-existing
+// test could express, because before it the high key lived in the opaque area
+// and was therefore immune to every page-level operation below.
+
+// A page's on-disk bytes must round-trip through the engine's in-memory
+// spelling without losing the sentinel or a flag. This is the encode/decode
+// sibling-pair rule: readOpaque and writeOpaque are the only translators, and a
+// disagreement between them corrupts silently rather than loudly.
+func TestOpaqueRoundTripsThroughUpstreamBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   BTPageOpaque
+	}{
+		{"rightmost leaf", BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf | BTRoot}},
+		{"interior leaf", BTPageOpaque{Prev: 4, Next: 9, Level: 0, Flags: BTLeaf | BTHasGarbage}},
+		{"internal mid-split", BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: 12, Level: 3, Flags: BTIncompleteSplit}},
+		{"half-dead", BTPageOpaque{Prev: 2, Next: storage.InvalidBlockNumber, Level: 1, Flags: BTDeleted | BTHalfDead}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := make(storage.Page, storage.BlockSize)
+			initPage(p, tc.op)
+			if got := readOpaque(p); got != tc.op {
+				t.Fatalf("round trip: got %+v, want %+v", got, tc.op)
+			}
+			// The bytes a real PG reads must be the upstream ones.
+			if err := CheckPGBTPage(p, 1); err != nil {
+				t.Fatalf("_bt_checkpage equivalent rejected the page: %v", err)
+			}
+			pg := ReadPGOpaque(p)
+			if tc.op.Next == storage.InvalidBlockNumber && pg.Next != PNone {
+				t.Fatalf("rightmost page wrote btpo_next=%d, want P_NONE", pg.Next)
+			}
+			if pg.Flags&BTPMeta != 0 {
+				t.Fatal("a data page claims BTP_META to a real PG")
+			}
+		})
+	}
+}
+
+// resetPageItems is used by every whole-page rewrite (split, dedup recovery,
+// VACUUM kept-items, WAL replay). If it dropped the separator, the rewritten
+// non-rightmost page would say its data starts at offset 2 while holding it at
+// offset 1 — every read off by one, silently.
+func TestResetPageItemsKeepsTheHighKey(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: 6, Level: 0, Flags: BTLeaf})
+	if err := pgSetHighKeyRaw(p, highKeyItem([]byte("sep")).marshal()); err != nil {
+		t.Fatalf("pgSetHighKeyRaw: %v", err)
+	}
+	if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte("k1")}.marshal()); err != nil {
+		t.Fatalf("add data: %v", err)
+	}
+
+	resetPageItems(p)
+
+	hk, ok, err := pageHighKey(p)
+	if err != nil || !ok {
+		t.Fatalf("high key after reset: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(hk, []byte("sep")) {
+		t.Fatalf("high key after reset = %q, want %q", hk, "sep")
+	}
+	if n, err := PGDataItemCount(p); err != nil || n != 0 {
+		t.Fatalf("data items after reset = %d (err %v), want 0", n, err)
+	}
+	// And the refill must land at P_FIRSTKEY, not on top of the separator.
+	if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte("k2")}.marshal()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	raw, err := pgGetItemRaw(p, 1)
+	if err != nil {
+		t.Fatalf("read refilled data item 1: %v", err)
+	}
+	it, err := parseItem(raw)
+	if err != nil || !bytes.Equal(it.key, []byte("k2")) {
+		t.Fatalf("data item 1 = %q (err %v), want %q", it.key, err, "k2")
+	}
+}
+
+// Page deletion hands a left sibling the rightmost position. Because high-key
+// presence is derived from btpo_next, the separator has to go at the same
+// moment — otherwise P_FIRSTDATAKEY moves down onto the stale separator and the
+// page reports it as its first data item forever after.
+func TestWriteNextSiblingSlidesTheHighKeyAway(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: 6, Level: 0, Flags: BTLeaf})
+	if err := pgSetHighKeyRaw(p, highKeyItem([]byte("sep")).marshal()); err != nil {
+		t.Fatalf("pgSetHighKeyRaw: %v", err)
+	}
+	for _, k := range []string{"k1", "k2"} {
+		if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte(k)}.marshal()); err != nil {
+			t.Fatalf("add %s: %v", k, err)
+		}
+	}
+
+	if err := pgWriteNextSibling(p, readOpaque(p), storage.InvalidBlockNumber); err != nil {
+		t.Fatalf("pgWriteNextSibling: %v", err)
+	}
+
+	if _, ok, _ := pageHighKey(p); ok {
+		t.Fatal("rightmost page still reports a high key")
+	}
+	n, err := PGDataItemCount(p)
+	if err != nil || n != 2 {
+		t.Fatalf("data items after slide-left = %d (err %v), want 2", n, err)
+	}
+	for i, want := range []string{"k1", "k2"} {
+		raw, err := pgGetItemRaw(p, uint16(i+1))
+		if err != nil {
+			t.Fatalf("data item %d: %v", i+1, err)
+		}
+		it, perr := parseItem(raw)
+		if perr != nil || !bytes.Equal(it.key, []byte(want)) {
+			t.Fatalf("data item %d = %q (err %v), want %q", i+1, it.key, perr, want)
+		}
+	}
+
+	// The reverse transition is a split's job and must be refused here.
+	if err := pgWriteNextSibling(p, readOpaque(p), 8); err == nil {
+		t.Fatal("gaining a right sibling outside a split was accepted; no separator exists to install")
 	}
 }

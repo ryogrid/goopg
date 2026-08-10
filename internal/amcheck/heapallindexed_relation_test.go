@@ -34,20 +34,12 @@ type le struct {
 func makeLeafPage(t *testing.T, next storage.BlockNumber, entries ...le) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
-	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecial()))
-	h.SetUpper(uint16(btSpecial()))
+	pgInitTestPage(t, p, next, 0, btree.BTLeaf)
 	for i, e := range entries {
 		if _, err := storage.PageAddItemRaw(p, btLeafRaw(e.key, e.block, e.offset)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
-	binary.LittleEndian.PutUint16(p[off+12:off+14], btree.BTLeaf)
 	got, err := btree.PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("makeLeafPage PageLeafEntries self-check: %v", err)

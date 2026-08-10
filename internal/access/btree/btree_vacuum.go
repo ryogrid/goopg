@@ -280,7 +280,7 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		return err
 	}
 	recheckOp := readOpaque(recheckSlot.Page())
-	count, cerr := storage.PageLinePointerCount(recheckSlot.Page())
+	count, cerr := PGDataItemCount(recheckSlot.Page())
 	if cerr != nil {
 		bt.unpinW(recheckSlot)
 		return cerr
@@ -724,8 +724,10 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 			bt.unpinW(s)
 			return werr
 		}
-		op.Next = newNext
-		writeOpaque(s.Page(), op)
+		if err := pgWriteNextSibling(s.Page(), op, newNext); err != nil {
+			bt.unpinW(s)
+			return err
+		}
 		err = bt.markDirtyWithPageRecord(s, leftLive)
 		bt.unpinW(s)
 		if err != nil {
@@ -867,7 +869,7 @@ func (bt *BTree) maybeCascadeEmptyInternal(blk storage.BlockNumber, ancestorPath
 			bt.unpinR(slot)
 			return nil
 		}
-		count, cerr := storage.PageLinePointerCount(slot.Page())
+		count, cerr := PGDataItemCount(slot.Page())
 		prev, next := op.Prev, op.Next
 		bt.unpinR(slot)
 		if cerr != nil {
@@ -1026,8 +1028,10 @@ func (bt *BTree) unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive 
 			bt.unpinW(s)
 			return werr
 		}
-		op.Next = newNext
-		writeOpaque(s.Page(), op)
+		if err := pgWriteNextSibling(s.Page(), op, newNext); err != nil {
+			bt.unpinW(s)
+			return err
+		}
 		err = bt.markDirtyWithPageRecord(s, leftLive)
 		bt.unpinW(s)
 		if err != nil {
@@ -1198,7 +1202,7 @@ func (bt *BTree) isTreeEmpty() (bool, error) {
 			bt.unpinR(slot)
 			break
 		}
-		count, countErr := storage.PageLinePointerCount(slot.Page())
+		count, countErr := PGDataItemCount(slot.Page())
 		next := op.Next
 		bt.unpinR(slot)
 		if countErr != nil {
@@ -1301,11 +1305,11 @@ func readInternalFirstChildBlock(p storage.Page) storage.BlockNumber {
 	if op.IsLeaf() {
 		return storage.InvalidBlockNumber
 	}
-	count, err := storage.PageLinePointerCount(p)
+	count, err := PGDataItemCount(p)
 	if err != nil || count == 0 {
 		return storage.InvalidBlockNumber
 	}
-	raw, err := storage.PageGetItemRaw(p, 1)
+	raw, err := pgGetItemRaw(p, 1)
 	if err != nil || len(raw) < itemPrefixSize {
 		return storage.InvalidBlockNumber
 	}

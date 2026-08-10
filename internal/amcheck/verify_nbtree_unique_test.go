@@ -120,7 +120,9 @@ func TestVerifyBtreeUnique_DuplicateAcrossLeafBoundary(t *testing.T) {
 		t.Fatalf("finding Block = %d, want 3 (the right sibling)", got[0].Block)
 	}
 	// Both index locations are on different pages, so both tids are printed.
-	if !strings.Contains(got[0].Detail, "Index tid=(2,2)") ||
+	// Offsets are PHYSICAL (upstream's errdetail spelling): page 2 is
+	// non-rightmost, so P_HIKEY owns offset 1 and its second entry sits at 3.
+	if !strings.Contains(got[0].Detail, "Index tid=(2,3)") ||
 		!strings.Contains(got[0].Detail, "tid=(3,1)") {
 		t.Errorf("Detail %q does not name both cross-page index tids", got[0].Detail)
 	}

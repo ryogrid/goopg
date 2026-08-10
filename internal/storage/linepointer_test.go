@@ -104,3 +104,37 @@ func TestPageDeleteLinePointerAtRejectsOutOfRange(t *testing.T) {
 		t.Fatal("PageDeleteLinePointerAt(0): want error, got nil")
 	}
 }
+
+// PageReplaceItemRaw preserves the target line pointer's flags, so filling a
+// slot reserved by PageReserveLinePointer leaves it LP_UNUSED — readable by
+// nothing. The nbtree bulk loader does exactly that for P_HIKEY, so the
+// promotion has to be explicit and has to work.
+func TestPageSetLinePointerNormalMakesAReservedSlotReadable(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatalf("InitPage: %v", err)
+	}
+	if _, err := PageReserveLinePointer(p); err != nil {
+		t.Fatalf("PageReserveLinePointer: %v", err)
+	}
+	want := []byte("separator")
+	if err := PageReplaceItemRaw(p, 1, want); err != nil {
+		t.Fatalf("PageReplaceItemRaw: %v", err)
+	}
+	if _, err := PageGetItemRawAllowDead(p, 1); err == nil {
+		t.Fatal("a reserved-then-replaced slot read back before promotion; the flags fix is not needed?")
+	}
+	if err := PageSetLinePointerNormal(p, 1); err != nil {
+		t.Fatalf("PageSetLinePointerNormal: %v", err)
+	}
+	got, err := PageGetItemRawAllowDead(p, 1)
+	if err != nil {
+		t.Fatalf("PageGetItemRawAllowDead after promotion: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("slot 1 = %q, want %q", got, want)
+	}
+	if err := PageSetLinePointerNormal(p, 2); err == nil {
+		t.Fatal("PageSetLinePointerNormal accepted an out-of-range slot")
+	}
+}

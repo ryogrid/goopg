@@ -48,13 +48,14 @@ func ReplayVacuumPage(page storage.Page, keptItems [][]byte, opaqueFlagsAfter ui
 
 // ReplaySetSiblingNext replays the left-sibling Next pointer
 // update half of `RecordKindBtreeUnlinkPage`. Other opaque
-// fields (Prev, Level, Flags, HighKey) are preserved verbatim.
+// fields (Prev, Level, Flags) are preserved verbatim.
 // (M0079-0003.)
 func ReplaySetSiblingNext(page storage.Page, newNext storage.BlockNumber) error {
-	op := readOpaque(page)
-	op.Next = newNext
-	writeOpaque(page, op)
-	return nil
+	// pgWriteNextSibling, not a bare writeOpaque: losing the right sibling
+	// also means losing the high key (S11.2b — presence is derived from
+	// btpo_next), and a page left carrying a stale separator numbers its data
+	// slots one too high forever after.
+	return pgWriteNextSibling(page, readOpaque(page), newNext)
 }
 
 // ReplaySetSiblingPrev replays the right-sibling Prev pointer
@@ -119,10 +120,9 @@ func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
 // `resetToEmptyRoot` writes after a full vacuum empties the
 // tree. (M0079-0003.)
 func ReplayNewRootPage(page storage.Page, level uint32, items [][]byte) error {
-	if err := storage.InitPage(page); err != nil {
+	if err := InitPGBTPage(page); err != nil {
 		return fmt.Errorf("btree: replay newroot init: %w", err)
 	}
-	storage.MustHeader(page).SetSpecial(uint16(btSpecialOffset))
 	flags := uint16(BTRoot)
 	if level == 0 {
 		flags |= BTLeaf

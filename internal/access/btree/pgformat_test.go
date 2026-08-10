@@ -57,10 +57,19 @@ func TestPGOpaqueLayoutMatchesUpstream(t *testing.T) {
 	if pgSpecialOffset != storage.BlockSize-16 {
 		t.Fatalf("pgSpecialOffset = %d, want %d", pgSpecialOffset, storage.BlockSize-16)
 	}
-	// The upstream flag bits must not be confused with this package's
-	// legacy set; two of them genuinely differ in meaning at the same bit.
-	if BTPMeta != BTHasHighKey {
-		t.Fatalf("bit 3 sanity: BTPMeta=%#x BTHasHighKey=%#x", BTPMeta, BTHasHighKey)
+	// The upstream flag bits must not be confused with this package's legacy
+	// set. Bit 3 is the one that used to collide: goopg spelled it
+	// BTHasHighKey, upstream spells it BTP_META. The bit is now unclaimed on
+	// the goopg side (high-key presence is derived from btpo_next), and no
+	// legacy flag may ever map onto it again — a page that told a real PG it
+	// was the metapage would fail every subsequent lookup.
+	if BTPMeta != 0x0008 {
+		t.Fatalf("BTPMeta = %#x, want 0x0008", BTPMeta)
+	}
+	for _, m := range flagTranslation {
+		if m.pg == BTPMeta {
+			t.Fatalf("legacy flag %#x translates to BTP_META", m.legacy)
+		}
 	}
 	if BTPHalfDead == BTHalfDead {
 		t.Fatalf("BTP_HALF_DEAD (%#x) must differ from the legacy BTHalfDead (%#x); "+
@@ -93,16 +102,19 @@ func TestInitPGBTPageMatchesBtPageinit(t *testing.T) {
 }
 
 // TestCheckPGBTPageRejectsLegacyOpaque is the regression this whole slice
-// exists for: goopg's current 272-byte opaque is exactly what a real PG
-// rejects with XX002 "contains corrupted page at block 0".
+// exists for: goopg's OLD 272-byte opaque is exactly what a real PG rejects
+// with XX002 "contains corrupted page at block 0". The size is spelled
+// literally here rather than through btSpecialOffset because S11.2b pointed
+// that constant at the upstream 16-byte layout — the very fix under test.
 func TestCheckPGBTPageRejectsLegacyOpaque(t *testing.T) {
+	const legacySpecialOffset = storage.BlockSize - 272
 	p := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(p); err != nil {
 		t.Fatalf("InitPage: %v", err)
 	}
 	h := storage.MustHeader(p)
-	h.SetUpper(uint16(btSpecialOffset))
-	h.SetSpecial(uint16(btSpecialOffset))
+	h.SetUpper(uint16(legacySpecialOffset))
+	h.SetSpecial(uint16(legacySpecialOffset))
 	err := CheckPGBTPage(p, 0)
 	if err == nil {
 		t.Fatal("CheckPGBTPage accepted a legacy 272-byte opaque; _bt_checkpage would not")

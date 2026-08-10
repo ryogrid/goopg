@@ -250,15 +250,20 @@ func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexNam
 	}
 
 	leaf := opaque.IsLeaf()
-	// A non-rightmost page that carries a high key bounds every item from above.
-	// This mirrors the engine's keyExceedsHighKey gating (rightmost pages have no
-	// high key to honour).
-	checkHighKey := opaque.HasHighKey() && opaque.Next != storage.InvalidBlockNumber
+	// A non-rightmost page carries a high key at P_HIKEY that bounds every data
+	// item from above. This mirrors the engine's keyExceedsHighKey gating
+	// (rightmost pages have no high key to honour). PageItemKeys returns DATA
+	// item keys only, so the separator is never compared against itself.
+	highKey, checkHighKey, hkErr := btree.PageHighKey(p)
+	if hkErr != nil {
+		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, hkErr)}}
+	}
 
 	for i, key := range keys {
 		if checkHighKey {
 			// Leaf: key <= high key. Internal: key < high key.
-			cmp := cmpKeys(key, opaque.HighKey)
+			cmp := cmpKeys(key, highKey)
 			if (leaf && cmp > 0) || (!leaf && cmp >= 0) {
 				return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 					"high key invariant violated for index \"%s\"", indexName)}}

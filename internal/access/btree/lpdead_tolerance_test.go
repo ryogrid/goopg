@@ -300,7 +300,9 @@ func TestRangeScanWithPosCoordinates(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := slot.Page()
-		raw, rerr := storage.PageGetItemRawAllowDead(p, e.pos.Slot)
+		// ScanPos.Slot is a DATA slot (S11.2b): on a non-rightmost page the
+		// physical offset is one higher, because P_HIKEY owns offset 1.
+		raw, rerr := pgGetItemRawAllowDead(p, e.pos.Slot)
 		if rerr != nil {
 			t.Fatalf("blk=%d slot=%d: %v", e.pos.Blk, e.pos.Slot, rerr)
 		}

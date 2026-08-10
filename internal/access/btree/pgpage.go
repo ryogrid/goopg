@@ -186,8 +186,13 @@ func pgSetHighKeyRaw(p storage.Page, raw []byte) error {
 	}
 	// The page already reserves offset 1 for the high key (it was
 	// non-rightmost before this call, or a bulk-load placeholder is sitting
-	// there), so overwrite in place.
-	return storage.PageReplaceItemRaw(p, PHiKey, raw)
+	// there), so overwrite in place. PageReplaceItemRaw preserves the line
+	// pointer's flags, so a bulk-load placeholder would stay LP_UNUSED (and
+	// unreadable) without the explicit promotion.
+	if err := storage.PageReplaceItemRaw(p, PHiKey, raw); err != nil {
+		return err
+	}
+	return storage.PageSetLinePointerNormal(p, PHiKey)
 }
 
 // pgPromoteToNonRightmost makes room for a high key on a page that currently
@@ -233,6 +238,37 @@ func pgSlideLeft(p storage.Page) error {
 	return storage.PageDeleteLinePointerAt(p, PHiKey)
 }
 
+// pgWriteNextSibling repoints btpo_next and keeps the P_HIKEY item consistent
+// with the resulting rightmost-ness, in one step.
+//
+// This pairing is not optional. High-key presence is DERIVED from the sibling
+// link (there is no flag), so a page that loses its right sibling and keeps its
+// separator — or gains one and does not acquire a separator — mis-numbers every
+// data slot from that moment on: P_FIRSTDATAKEY moves but the items do not.
+// Page deletion is the caller that matters (`liveSibling` can hand a left
+// sibling the rightmost position when the page to its right is unlinked).
+//
+// The rightmost -> non-rightmost direction is refused rather than guessed: the
+// only writer that legitimately makes that transition is a split, which has a
+// real separator key to install and does so through pgSetHighKeyRaw.
+func pgWriteNextSibling(p storage.Page, op BTPageOpaque, newNext storage.BlockNumber) error {
+	wasRightmost := op.Next == storage.InvalidBlockNumber
+	nowRightmost := newNext == storage.InvalidBlockNumber
+	if wasRightmost && !nowRightmost {
+		return fmt.Errorf("btree: page gained a right sibling (%d) outside a split — no separator to install", newNext)
+	}
+	if !wasRightmost && nowRightmost {
+		// _bt_slideleft: the separator is meaningless now, and leaving it
+		// would put P_FIRSTDATAKEY one slot past the real first data item.
+		if err := pgSlideLeft(p); err != nil {
+			return err
+		}
+	}
+	op.Next = newNext
+	writeOpaque(p, op)
+	return nil
+}
+
 // pgSibling translates a legacy sibling link to the upstream sentinel:
 // storage.InvalidBlockNumber means "no sibling" in goopg's legacy opaque,
 // upstream spells the same thing P_NONE (0). Block 0 is the metapage and can
@@ -260,17 +296,36 @@ func legacySibling(pg storage.BlockNumber) storage.BlockNumber {
 // into upstream's positions. BTLeaf/BTRoot/BTDeleted/BTHasGarbage already agree.
 func pgFlags(legacy uint16) uint16 {
 	var out uint16
-	for _, m := range []struct{ from, to uint16 }{
-		{BTLeaf, BTPLeaf},
-		{BTRoot, BTPRoot},
-		{BTDeleted, BTPDeleted},
-		{BTIncompleteSplit, BTPIncompleteSplit},
-		{BTHalfDead, BTPHalfDead},
-		{BTHasGarbage, BTPHasGarbage},
-	} {
-		if legacy&m.from != 0 {
-			out |= m.to
+	for _, m := range flagTranslation {
+		if legacy&m.legacy != 0 {
+			out |= m.pg
 		}
 	}
 	return out
+}
+
+// legacyFlags is pgFlags' inverse: the on-disk BTP_* word as the engine's
+// in-memory BT* word. BTP_META and BTP_HAS_FULLXID have no legacy counterpart
+// and are dropped — goopg's metapage is not written through this path, and
+// BTDeletedPageData is S11.5 work.
+func legacyFlags(pg uint16) uint16 {
+	var out uint16
+	for _, m := range flagTranslation {
+		if pg&m.pg != 0 {
+			out |= m.legacy
+		}
+	}
+	return out
+}
+
+// flagTranslation is the single source of truth for the two flag words, so the
+// two directions cannot drift (the sibling-paths rule: an encode/decode pair
+// that disagrees silently corrupts).
+var flagTranslation = []struct{ legacy, pg uint16 }{
+	{BTLeaf, BTPLeaf},
+	{BTRoot, BTPRoot},
+	{BTDeleted, BTPDeleted},
+	{BTIncompleteSplit, BTPIncompleteSplit},
+	{BTHalfDead, BTPHalfDead},
+	{BTHasGarbage, BTPHasGarbage},
 }
