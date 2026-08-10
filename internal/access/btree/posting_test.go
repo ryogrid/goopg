@@ -41,16 +41,29 @@ func TestPostingMarshalRoundTrip(t *testing.T) {
 // TestIsPostingRaw distinguishes posting from regular raw items.
 func TestIsPostingRaw(t *testing.T) {
 	// Regular item bytes from item.marshal().
-	it := item{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(42)}
+	it := item{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(42)}
 	reg := it.marshal()
 	if isPostingRaw(reg) {
 		t.Error("regular item should not be detected as posting")
 	}
 
-	// Posting item.
-	post := marshalPosting(EncodeInt4(42), []storage.ItemPointer{{Block: 0, Offset: 1}})
+	// Posting item (>= 2 TIDs — nbtree.h's BTreeTupleSetPosting rejects a
+	// one-TID "posting list", so a degenerate one is no longer constructible).
+	post := marshalPosting(EncodeInt4(42), []storage.ItemPointer{{Block: 0, Offset: 1}, {Block: 0, Offset: 2}})
 	if !isPostingRaw(post) {
 		t.Error("posting item should be detected as posting")
+	}
+
+	// A plain item whose heap TID has a large block number must NOT read back
+	// as a posting list: before S11.4 slice 2 the posting discriminator was the
+	// high bit of a leading keyLen field, which now lands inside t_tid's bi_hi
+	// half. The discriminator moved to t_info's INDEX_ALT_TID_MASK with it.
+	high := item{ptr: storage.ItemPointer{Block: 0xFFFF_FFF0, Offset: 0xFFF0}, key: EncodeInt4(42)}.marshal()
+	if isPostingRaw(high) {
+		t.Error("plain item with a high heap-TID block read back as a posting list")
+	}
+	if _, err := parseItem(high); err != nil {
+		t.Errorf("parseItem(high-block plain item): %v", err)
 	}
 }
 
@@ -58,12 +71,12 @@ func TestIsPostingRaw(t *testing.T) {
 // posting-list rawItems while unique keys remain as regular items.
 func TestDeduplicateToRawItems(t *testing.T) {
 	items := []item{
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 2}, key: EncodeInt4(2)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 3}, key: EncodeInt4(2)}, // dup
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 1}, key: EncodeInt4(3)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 2}, key: EncodeInt4(3)}, // dup
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 3}, key: EncodeInt4(3)}, // dup
+		{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)},
+		{ptr: storage.ItemPointer{Block: 0, Offset: 2}, key: EncodeInt4(2)},
+		{ptr: storage.ItemPointer{Block: 0, Offset: 3}, key: EncodeInt4(2)}, // dup
+		{ptr: storage.ItemPointer{Block: 1, Offset: 1}, key: EncodeInt4(3)},
+		{ptr: storage.ItemPointer{Block: 1, Offset: 2}, key: EncodeInt4(3)}, // dup
+		{ptr: storage.ItemPointer{Block: 1, Offset: 3}, key: EncodeInt4(3)}, // dup
 	}
 
 	raws := deduplicateToRawItems(items)
@@ -249,9 +262,8 @@ func TestDeduplicateOversizedPostingSplits(t *testing.T) {
 	items := make([]item, dupCount)
 	for i := 0; i < dupCount; i++ {
 		items[i] = item{
-			keyLen: uint16(len(key)),
-			ptr:    storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
-			key:    key,
+			ptr: storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
+			key: key,
 		}
 	}
 
@@ -343,7 +355,7 @@ func TestPageItemKeys(t *testing.T) {
 	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
 
 	// Slot 1: regular single-TID item, key = int4(1).
-	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
+	reg := item{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
 	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
 		t.Fatalf("add regular: %v", err)
 	}
@@ -380,7 +392,7 @@ func TestPageLeafEntries(t *testing.T) {
 
 	// Slot 1: regular single-TID item, key = int4(1), TID = (0,1).
 	regTID := storage.ItemPointer{Block: 0, Offset: 1}
-	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: regTID, key: EncodeInt4(1)}
+	reg := item{ptr: regTID, key: EncodeInt4(1)}
 	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
 		t.Fatalf("add regular: %v", err)
 	}

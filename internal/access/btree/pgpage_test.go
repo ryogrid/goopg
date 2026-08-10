@@ -349,7 +349,7 @@ func TestResetPageItemsKeepsTheHighKey(t *testing.T) {
 	if err := pgSetHighKeyRaw(p, highKeyItem([]byte("sep")).marshal()); err != nil {
 		t.Fatalf("pgSetHighKeyRaw: %v", err)
 	}
-	if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte("k1")}.marshal()); err != nil {
+	if _, err := pgAddItemRaw(p, item{key: []byte("k1")}.marshal()); err != nil {
 		t.Fatalf("add data: %v", err)
 	}
 
@@ -366,7 +366,7 @@ func TestResetPageItemsKeepsTheHighKey(t *testing.T) {
 		t.Fatalf("data items after reset = %d (err %v), want 0", n, err)
 	}
 	// And the refill must land at P_FIRSTKEY, not on top of the separator.
-	if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte("k2")}.marshal()); err != nil {
+	if _, err := pgAddItemRaw(p, item{key: []byte("k2")}.marshal()); err != nil {
 		t.Fatalf("refill: %v", err)
 	}
 	raw, err := pgGetItemRaw(p, 1)
@@ -390,7 +390,7 @@ func TestWriteNextSiblingSlidesTheHighKeyAway(t *testing.T) {
 		t.Fatalf("pgSetHighKeyRaw: %v", err)
 	}
 	for _, k := range []string{"k1", "k2"} {
-		if _, err := pgAddItemRaw(p, item{keyLen: 2, key: []byte(k)}.marshal()); err != nil {
+		if _, err := pgAddItemRaw(p, item{key: []byte(k)}.marshal()); err != nil {
 			t.Fatalf("add %s: %v", k, err)
 		}
 	}

@@ -677,7 +677,7 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk, childBlk storage.BlockNum
 	newItems = append(newItems, items[:idx]...)
 	newItems = append(newItems, items[idx+1:]...)
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{keyLen: 0, ptr: newItems[0].ptr, key: nil}
+		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
 	}
 	resetPageItems(s.Page())
 	for _, it := range newItems {
@@ -1169,7 +1169,7 @@ func (bt *BTree) removeDownlinkFromParent(parentBlk, childBlk storage.BlockNumbe
 	// If the removed item was the leftmost (nil key), the new first item
 	// must adopt nil key to maintain the B-tree invariant.
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{keyLen: 0, ptr: newItems[0].ptr, key: nil}
+		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
 	}
 
 	resetPageItems(s.Page())
@@ -1310,7 +1310,7 @@ func readInternalFirstChildBlock(p storage.Page) storage.BlockNumber {
 		return storage.InvalidBlockNumber
 	}
 	raw, err := pgGetItemRaw(p, 1)
-	if err != nil || len(raw) < itemPrefixSize {
+	if err != nil || len(raw) < SizeOfIndexTupleData {
 		return storage.InvalidBlockNumber
 	}
 	return storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6]))

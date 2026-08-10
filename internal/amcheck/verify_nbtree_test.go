@@ -289,10 +289,7 @@ func pgFlagsForTest(legacy uint16) uint16 {
 // expects: keyLen(2) | block(4) | offset(2) | key. The TID is left zero — the
 // item-order / high-key tier compares only keys.
 func btItemRaw(key []byte) []byte {
-	raw := make([]byte, 8+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
-	copy(raw[8:], key)
-	return raw
+	return btree.PGBTItemRaw(key, storage.ItemPointer{})
 }
 
 // makeItemsPage builds a non-meta B-tree page carrying keys as line pointers in
@@ -660,11 +657,7 @@ func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 // layout (keyLen(2) | child-block(4) | offset(2) | key), setting the downlink's
 // child block — the field btItemRaw leaves zero.
 func btDownlinkRaw(key []byte, child storage.BlockNumber) []byte {
-	raw := make([]byte, 8+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
-	binary.LittleEndian.PutUint32(raw[2:6], uint32(child))
-	copy(raw[8:], key)
-	return raw
+	return btree.PGBTItemRaw(key, storage.ItemPointer{Block: child})
 }
 
 // dl is a (separator key, child block) downlink for makeInternalPage.

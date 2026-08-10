@@ -7,83 +7,107 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// BTPostingFlag is the high bit of keyLen in a posting-list item.
-// When set, the raw item encodes multiple heap TIDs for a single key
-// rather than the standard single-TID layout (M0047-0003).
-const BTPostingFlag = uint16(0x8000)
+// Posting-list items in upstream's shape (M0130-S11.4 slice 2).
+//
+// A deduplicated nbtree tuple is an ordinary IndexTupleData whose t_tid does
+// NOT address a heap row: INDEX_ALT_TID_MASK is set in t_info, the offset half
+// of t_tid carries BT_IS_POSTING|nhtids and its block half carries the byte
+// offset of a trailing ItemPointerData array
+// (postgres/src/include/access/nbtree.h, `BTreeTupleSetPosting`). Layout:
+//
+//	[0:6]                  t_tid  = (postingOffset, nhtids|BT_IS_POSTING)
+//	[6:8]                  t_info = INDEX_ALT_TID_MASK | total size
+//	[8:postingOffset]      key bytes
+//	[postingOffset:size]   nhtids × 6-byte ItemPointerData, ascending
+//
+// Before slice 2 this was a goopg-private layout discriminated by the high bit
+// of a leading keyLen field. That bit now lands inside t_tid's bi_hi half, so
+// the discriminator had to move with the tuple shape or a large enough block
+// number would have made a plain leaf item read back as a posting list.
+//
+// The key is still one opaque blob (see `(item).marshal`), so its length is
+// recovered as postingOffset - SizeOfIndexTupleData and postingOffset is NOT
+// MAXALIGNed. Slice 3 fixes both together.
 
-// postingHeaderSize is the fixed-size prefix before TID arrays and key bytes.
-//   [0:2] keyLen | BTPostingFlag  (uint16 LE)
-//   [2:4] TID count              (uint16 LE)
-// = 4 bytes
-const postingHeaderSize = 4
+// BTPostingMaxTIDs is the largest TID count the offset-number field can hold
+// (BT_OFFSET_MASK). Far above what a page can physically store — one 8 KiB
+// page holds at most ~1350 six-byte TIDs — so it is a structural guard, not a
+// policy limit.
+const BTPostingMaxTIDs = BTOffsetMask
 
-// marshalPosting serialises a posting-list item:
-//   postingHeaderSize | count*6 bytes (TIDs) | keyLen bytes (key)
-// The keyLen high bit is set to BTPostingFlag so readers distinguish
-// this from the standard 8-byte prefix item layout.
+// marshalPosting serialises a posting-list item for `key` over `tids`.
+// Callers hold to upstream's rule that a posting list has at least two TIDs;
+// a shorter list is a caller bug and panics rather than silently writing a
+// tuple whose alt-TID bits say "posting" but whose array holds one entry.
 func marshalPosting(key []byte, tids []storage.ItemPointer) []byte {
 	n := len(tids)
-	raw := make([]byte, postingHeaderSize+n*6+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key))|BTPostingFlag)
-	binary.LittleEndian.PutUint16(raw[2:4], uint16(n))
-	off := postingHeaderSize
+	postingOffset := SizeOfIndexTupleData + len(key)
+	raw := make([]byte, postingOffset+n*6)
+	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
+	copy(raw[SizeOfIndexTupleData:], key)
+	off := postingOffset
 	for _, tid := range tids {
-		binary.LittleEndian.PutUint32(raw[off:off+4], uint32(tid.Block))
-		binary.LittleEndian.PutUint16(raw[off+4:off+6], tid.Offset)
+		PutPGItemPointer(raw[off:off+6], tid)
 		off += 6
 	}
-	copy(raw[off:], key)
+	if err := BTreeTupleSetPosting(raw, uint16(n), postingOffset); err != nil {
+		panic(err)
+	}
 	return raw
 }
 
 // isPostingRaw reports whether raw encodes a posting-list item.
 func isPostingRaw(raw []byte) bool {
-	if len(raw) < 2 {
+	if len(raw) < SizeOfIndexTupleData {
 		return false
 	}
-	return binary.LittleEndian.Uint16(raw[0:2])&BTPostingFlag != 0
+	return BTreeTupleIsPosting(raw)
 }
 
 // parsePostingRaw decodes a posting-list item into its key and TID list.
 // Returns an error when the bytes are structurally invalid.
 func parsePostingRaw(raw []byte) (key []byte, tids []storage.ItemPointer, err error) {
-	if len(raw) < postingHeaderSize {
-		return nil, nil, fmt.Errorf("btree posting: raw too short (%d bytes)", len(raw))
-	}
-	keyLen := int(binary.LittleEndian.Uint16(raw[0:2]) &^ BTPostingFlag)
-	n := int(binary.LittleEndian.Uint16(raw[2:4]))
-	wantLen := postingHeaderSize + n*6 + keyLen
-	if len(raw) != wantLen {
-		return nil, nil, fmt.Errorf("btree posting: size mismatch (got %d want %d, n=%d keyLen=%d)",
-			len(raw), wantLen, n, keyLen)
+	postingOffset, n, err := postingBounds(raw)
+	if err != nil {
+		return nil, nil, err
 	}
 	tids = make([]storage.ItemPointer, n)
-	off := postingHeaderSize
+	off := postingOffset
 	for i := range tids {
-		tids[i] = storage.ItemPointer{
-			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[off : off+4])),
-			Offset: binary.LittleEndian.Uint16(raw[off+4 : off+6]),
-		}
+		tids[i] = PGItemPointerAt(raw[off : off+6])
 		off += 6
 	}
-	key = append([]byte(nil), raw[off:off+keyLen]...)
+	key = append([]byte(nil), raw[SizeOfIndexTupleData:postingOffset]...)
 	return key, tids, nil
+}
+
+// postingBounds validates a posting tuple's header and returns its posting
+// offset and TID count.
+func postingBounds(raw []byte) (postingOffset, n int, err error) {
+	if len(raw) < SizeOfIndexTupleData {
+		return 0, 0, fmt.Errorf("btree posting: raw too short (%d bytes)", len(raw))
+	}
+	size := PGIndexTupleSize(raw)
+	if size != len(raw) {
+		return 0, 0, fmt.Errorf("btree posting: t_info size %d != raw length %d", size, len(raw))
+	}
+	postingOffset = BTreeTupleGetPostingOffset(raw)
+	n = int(BTreeTupleGetNPosting(raw))
+	if postingOffset < SizeOfIndexTupleData || postingOffset+n*6 != size {
+		return 0, 0, fmt.Errorf("btree posting: size mismatch (size %d, postingOffset %d, n %d)",
+			size, postingOffset, n)
+	}
+	return postingOffset, n, nil
 }
 
 // postingKeyOf extracts only the key bytes from a raw posting item
 // without allocating a TID slice. Used for key comparisons.
 func postingKeyOf(raw []byte) []byte {
-	if len(raw) < postingHeaderSize {
+	postingOffset, _, err := postingBounds(raw)
+	if err != nil {
 		return nil
 	}
-	keyLen := int(binary.LittleEndian.Uint16(raw[0:2]) &^ BTPostingFlag)
-	n := int(binary.LittleEndian.Uint16(raw[2:4]))
-	off := postingHeaderSize + n*6
-	if off+keyLen > len(raw) {
-		return nil
-	}
-	return raw[off : off+keyLen]
+	return raw[SizeOfIndexTupleData:postingOffset]
 }
 
 // appendTIDToPosting (M0055-0003) returns a new posting payload
@@ -97,6 +121,9 @@ func appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]byte, error) {
 		return nil, err
 	}
 	tids = append(tids, tid)
+	if len(tids) > BTPostingMaxTIDs {
+		return nil, fmt.Errorf("btree posting: %d TIDs exceeds BT_OFFSET_MASK %d", len(tids), BTPostingMaxTIDs)
+	}
 	return marshalPosting(key, tids), nil
 }
 

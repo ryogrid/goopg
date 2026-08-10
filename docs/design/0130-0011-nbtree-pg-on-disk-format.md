@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 landed 2026-08-10; S11.4–S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2 landed 2026-08-10; S11.4 slice 3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -212,8 +212,8 @@ sources agree:
 - **S11.4 — tuple shape.** goopg `item` → `IndexTupleData` + null bitmap + PG
   binary datums; downlinks into `t_tid`. This is the largest slice and the one
   that couples the index format to the type-codec layer. Decomposed into three
-  loops; **slice 1 (the codec) landed 2026-08-10**, slices 2/3 (writers, then
-  the comparison layer + pivot truncation) are open.
+  loops; **slices 1 (the codec) and 2 (the writer flip) landed 2026-08-10**,
+  slice 3 (the comparison layer + pivot truncation) is open.
   - **S11.4 slice 1 — the codec, additive.** `internal/access/btree/pgtuple.go`
     is `index_form_tuple`/`index_deform_tuple`
     (`postgres/src/backend/access/common/indextuple.c`, over `heaptuple.c`'s
@@ -244,6 +244,43 @@ sources agree:
     for a 1-byte header is re-headered **and** loses its alignment padding
     entirely (`fill_val`'s "convert to short varlena -- no alignment" branch),
     which is the single easiest way to produce a tuple PG reads one byte off.
+  - **S11.4 slice 2 — flip the writers.** `(item).marshal`/`parseItem`/
+    `parseItemNoCopy` in `btree.go` and the whole of `posting.go` now emit and
+    read upstream `IndexTupleData`; the goopg-private body (`itemPrefixSize` =
+    keyLen | flat LE uint32 block | offset) is deleted, and with it the `item`
+    struct's redundant `keyLen` field — the key length is now recovered from
+    `t_info`'s size, which is the single fact the whole slice turns on. The
+    `item` struct survives as an in-memory (key, pointer) pair only.
+    Three consequences the plan did not spell out:
+    1. **The posting discriminator had to move in the same commit.** goopg
+       marked a deduplicated item by setting the high bit of the leading
+       `keyLen` field. Those two bytes are now `t_tid`'s `bi_hi` half, so a
+       leaf item whose heap TID sits in a high enough block would have read
+       back as a posting list. `posting.go` is therefore rewritten onto
+       upstream's own discriminator and layout: `INDEX_ALT_TID_MASK` in
+       `t_info`, `BT_IS_POSTING|nhtids` in `t_tid`'s offset half, the TID array
+       at the byte offset carried in `t_tid`'s block half
+       (`BTreeTupleSetPosting`, new in `pgtuple.go` this slice). Upstream
+       requires ≥ 2 TIDs in a posting list, so the bulk loader's chunking now
+       emits a plain item for a one-TID remainder.
+    2. **Symmetrically, `parseItem` must reject `INDEX_ALT_TID_MASK`.** A pivot
+       or posting tuple decoded as a plain item hands the caller nbtree status
+       bits as a heap TID, and the size check does not catch it (a posting
+       tuple's `t_info` size is correct).
+    3. **Two MAXALIGNs are deferred to slice 3.** `index_form_tuple` rounds the
+       tuple size up ("be conservative") and `BTreeTupleSetPosting` asserts a
+       MAXALIGNed posting offset. goopg cannot honour either while its key is
+       one opaque blob, because the key's length is recoverable only as
+       `size - sizeof(IndexTupleData)` and padding destroys it. Neither stops a
+       non-assert PG build from reading the page — it reaches every field
+       through `t_info` and the line pointer — and slice 3 restores both once
+       the key length comes from the index descriptor. Ledger row.
+    Downlinks moved into `t_tid`'s block half via the new `downlinkItem`
+    constructor (upstream's `BTreeTupleSetDownLink`), which is also the single
+    site slice 3 converts into a truncated pivot tuple. The one encoder is
+    exported as `PGBTItemRaw` so `internal/amcheck`'s page fixtures build pages
+    through the engine's encoder instead of the hand-rolled second (and third,
+    and fourth) transcription they carried before.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.

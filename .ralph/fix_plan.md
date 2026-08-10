@@ -813,15 +813,29 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         since a real PG 18.3 reads the bootstrap indexes they write. No
         in-line compression / external detoasting (TOAST_INDEX_HACK) and no
         posting-list writer — 1 ledger row.
-  - [ ] **slice 2 — flip the writers**. Replace `item`/`itemPrefixSize` in
-        `btree.go` with the codec at every writer/reader; internal-page child
-        pointers move into `t_tid` via `BTreeTupleSetDownLink`. **Breaks the
-        on-disk format again — REINDEX.**
+  - [x] **slice 2 — flip the writers** (2026-08-10). `(item).marshal`/
+        `parseItem`/`parseItemNoCopy` emit and read upstream `IndexTupleData`;
+        the private `itemPrefixSize` body and the `item.keyLen` field are gone
+        (the key length comes from `t_info`'s size). Downlinks live in `t_tid`
+        via the new `downlinkItem` (= `BTreeTupleSetDownLink`), and the one
+        encoder is exported as `PGBTItemRaw` so `internal/amcheck`'s fixtures
+        stop hand-rolling their own. `posting.go` had to move in the same
+        commit: goopg's posting flag was the high bit of the old leading
+        `keyLen`, which is now `t_tid`'s `bi_hi` half, so posting tuples are
+        rewritten onto upstream's `INDEX_ALT_TID_MASK` + `BT_IS_POSTING|nhtids`
+        + posting-offset layout (`BTreeTupleSetPosting`, new in `pgtuple.go`),
+        and `parseItem` rejects any alt-TID tuple. **Pre-existing indexes must
+        be REINDEXed.** Deferred (1 ledger row): `index_form_tuple`'s MAXALIGN
+        of the tuple size and `BTreeTupleSetPosting`'s MAXALIGNed posting
+        offset — both destroy the opaque key's only length record until
+        slice 3 makes it descriptor-derived.
   - [ ] **slice 3 — comparison layer + pivot truncation**. Key bytes become
         per-attribute binary datums, so `bytes.Compare` gives way to
         type-aware comparison; `P_HIKEY` becomes a `_bt_truncate` pivot tuple,
         which is when `MaxHighKeyLen`/`bulkHighKeyReserve` can be retired in
-        favour of `BTMaxItemSize`.
+        favour of `BTMaxItemSize`. Also restores the two MAXALIGNs slice 2
+        deferred (tuple size, posting offset) — they only become expressible
+        once the key length is derivable from the index descriptor.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

@@ -225,7 +225,7 @@ func PageHighKey(p storage.Page) (key []byte, ok bool, err error) { return pageH
 // highKeyItem builds the P_HIKEY item that carries `key` as the page's
 // separator.
 func highKeyItem(key []byte) item {
-	return item{keyLen: uint16(len(key)), key: append([]byte(nil), key...)}
+	return item{key: append([]byte(nil), key...)}
 }
 
 // keyExceedsHighKey reports whether `key` is strictly greater than the page's
@@ -281,13 +281,9 @@ func initPage(p storage.Page, o BTPageOpaque) {
 // On internal pages the pointer's Block is the child page; on leaf
 // pages the pointer is the heap row (block, line-pointer-slot).
 type item struct {
-	keyLen uint16
-	ptr    storage.ItemPointer
-	key    []byte
+	ptr storage.ItemPointer
+	key []byte
 }
-
-// itemPrefixSize is the fixed bytes before key_bytes.
-const itemPrefixSize = 2 + 4 + 2
 
 // MaxItemsPerPage is the goopg analogue of upstream's MaxIndexTuplesPerPage
 // (postgres/src/include/access/itup.h): an upper bound on how many line-pointer
@@ -296,44 +292,96 @@ const itemPrefixSize = 2 + 4 + 2
 // bound, mirroring palloc_btree_page's `maxoffset > MaxIndexTuplesPerPage` test
 // (postgres/contrib/amcheck/verify_nbtree.c:3397).
 //
-// The divisor is goopg's minimum per-item footprint: a 4-byte line pointer (the
+// The divisor is the minimum per-item footprint: a 4-byte line pointer (the
 // itemIDSize that pageHasSpaceFor reserves) plus the smallest possible item
-// body. The smallest body is a bare itemPrefix with a zero-length key — an
-// internal page's negative-infinity downlink. goopg stores items unaligned
-// (pageHasSpaceFor reserves exactly itemIDSize+itemPrefixSize+len(key)), so
-// there is no MAXALIGN term, unlike upstream's MAXALIGN(sizeof(IndexTupleData)+1).
+// body. The smallest body is a bare IndexTupleData header with a zero-length
+// key — an internal page's negative-infinity downlink. goopg stores item
+// bodies unaligned (pageHasSpaceFor reserves exactly itemIDSize +
+// SizeOfIndexTupleData + len(key)), so there is no MAXALIGN term, unlike
+// upstream's MAXALIGN(sizeof(IndexTupleData)+1) — see the S11.4-slice-2 ledger
+// row on MAXALIGNed item placement.
 // Like upstream the bound is deliberately conservative: it ignores the per-page
 // special (opaque) area, so the true maximum is a little lower — that headroom is
-// exactly what keeps the corruption check free of false positives. Defined here,
-// alongside itemPrefixSize, so the tuple-size accounting has a single source of
-// truth (the engine never re-derives the inline item layout).
-const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + itemPrefixSize)
+// exactly what keeps the corruption check free of false positives.
+const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + SizeOfIndexTupleData)
 
-func (it item) marshal() []byte {
-	out := make([]byte, itemPrefixSize+len(it.key))
-	binary.LittleEndian.PutUint16(out[0:2], it.keyLen)
-	binary.LittleEndian.PutUint32(out[2:6], uint32(it.ptr.Block))
-	binary.LittleEndian.PutUint16(out[6:8], it.ptr.Offset)
-	copy(out[itemPrefixSize:], it.key)
+// marshal encodes the item as an upstream `IndexTupleData`
+// (postgres/src/include/access/itup.h), which since M0130-S11.4 slice 2 is
+// goopg's ONLY on-page index-tuple representation:
+//
+//	[0:6]  t_tid   — ItemPointerData: the heap TID on a leaf page, the child
+//	                 block number on an internal page (upstream's
+//	                 BTreeTupleSetDownLink, which writes exactly this field).
+//	[6:8]  t_info  — flags | size. Size is the WHOLE tuple length, which is how
+//	                 a reader recovers the key length; goopg keys carry no NULLs
+//	                 and no varlena header of their own, so INDEX_NULL_MASK /
+//	                 INDEX_VAR_MASK / INDEX_ALT_TID_MASK are all clear.
+//	[8:]   key     — the opaque order-preserving key encoding.
+//
+// The key bytes are still ONE opaque blob rather than per-attribute PG binary
+// datums: slice 3 replaces them (and with them `CompareKeys`) with a real
+// index tuple descriptor. Until then a real PG can walk goopg's line pointers,
+// sizes, downlinks and heap TIDs — everything `_bt_checkpage` and the page
+// structure need — but cannot yet `index_deform_tuple` the key itself.
+//
+// Two further upstream properties are deliberately NOT reproduced yet, both
+// for the same reason — the opaque key's length is recoverable only as
+// size - SizeOfIndexTupleData, so any padding would destroy it (ledger row,
+// M0130-S11.4): index_form_tuple MAXALIGNs the tuple size ("be conservative"),
+// and PageAddItemExtended MAXALIGNs the item's placement. Neither affects a
+// non-assert PG build's ability to read the page — it reaches every field
+// through t_info and the line pointer — but slice 3 restores both.
+//
+// The 13-bit INDEX_SIZE_MASK cannot overflow here: a body must fit in a page,
+// and BlockSize (8192) minus the page header already leaves less than 8191.
+func (it item) marshal() []byte { return PGBTItemRaw(it.key, it.ptr) }
+
+// PGBTItemRaw is the exported form of `(item).marshal` — the ONE encoder for a
+// plain on-page nbtree item. Exported so out-of-package structural validators
+// and their fixtures (internal/amcheck) build pages through the engine's own
+// encoder instead of a second hand-rolled one, which is how the pre-S11.4
+// layout came to have four independent transcriptions.
+func PGBTItemRaw(key []byte, tid storage.ItemPointer) []byte {
+	out := make([]byte, SizeOfIndexTupleData+len(key))
+	PutPGItemPointer(out, tid)
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(out)))
+	copy(out[SizeOfIndexTupleData:], key)
 	return out
 }
 
+// downlinkItem builds an internal-page item whose t_tid addresses `child`.
+// Equivalent to upstream's `BTreeTupleSetDownLink` on a freshly formed pivot
+// tuple; kept as a named constructor so slice 3 has ONE site to convert into a
+// truncated pivot tuple (`_bt_truncate` + `BTreeTupleSetNAtts`).
+func downlinkItem(key []byte, child storage.BlockNumber) item {
+	return item{ptr: storage.ItemPointer{Block: child}, key: key}
+}
+
+// parseItemBody validates the IndexTupleData header shared by parseItem and
+// parseItemNoCopy and returns the tuple's data area.
+func parseItemBody(raw []byte) (storage.ItemPointer, []byte, error) {
+	if len(raw) < SizeOfIndexTupleData {
+		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	}
+	size := PGIndexTupleSize(raw)
+	if size != len(raw) {
+		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item length mismatch t_info size=%d total=%d", size, len(raw))
+	}
+	// A plain data item must not carry the nbtree alternative-TID overlay: a
+	// pivot/posting tuple decoded as one would hand the caller status bits as
+	// a heap TID.
+	if PGIndexTupleIsAltTID(raw) {
+		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item has INDEX_ALT_TID_MASK set (t_info=%#x)", pgTInfo(raw))
+	}
+	return PGIndexTupleTID(raw), raw[SizeOfIndexTupleData:], nil
+}
+
 func parseItem(raw []byte) (item, error) {
-	if len(raw) < itemPrefixSize {
-		return item{}, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	ptr, key, err := parseItemBody(raw)
+	if err != nil {
+		return item{}, err
 	}
-	keyLen := binary.LittleEndian.Uint16(raw[0:2])
-	if int(keyLen)+itemPrefixSize != len(raw) {
-		return item{}, fmt.Errorf("btree: item length mismatch keyLen=%d total=%d", keyLen, len(raw))
-	}
-	return item{
-		keyLen: keyLen,
-		ptr: storage.ItemPointer{
-			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6])),
-			Offset: binary.LittleEndian.Uint16(raw[6:8]),
-		},
-		key: append([]byte(nil), raw[itemPrefixSize:]...),
-	}, nil
+	return item{ptr: ptr, key: append([]byte(nil), key...)}, nil
 }
 
 // parseItemNoCopy returns an `item` whose `key` field ALIASES `raw`
@@ -342,21 +390,11 @@ func parseItem(raw []byte) (item, error) {
 // callers don't retain key, so we can skip the per-slot
 // allocation that the regular `parseItem` does.
 func parseItemNoCopy(raw []byte) (item, error) {
-	if len(raw) < itemPrefixSize {
-		return item{}, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	ptr, key, err := parseItemBody(raw)
+	if err != nil {
+		return item{}, err
 	}
-	keyLen := binary.LittleEndian.Uint16(raw[0:2])
-	if int(keyLen)+itemPrefixSize != len(raw) {
-		return item{}, fmt.Errorf("btree: item length mismatch keyLen=%d total=%d", keyLen, len(raw))
-	}
-	return item{
-		keyLen: keyLen,
-		ptr: storage.ItemPointer{
-			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6])),
-			Offset: binary.LittleEndian.Uint16(raw[6:8]),
-		},
-		key: raw[itemPrefixSize:], // alias — caller must not retain
-	}, nil
+	return item{ptr: ptr, key: key}, nil // key aliases raw — caller must not retain
 }
 
 // EncodeInt4 is the canonical key encoding for v0 (4-byte big-endian int32).
@@ -1895,7 +1933,7 @@ func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 				return nil, nil, perr
 			}
 			for _, tid := range tids {
-				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+				out = append(out, item{ptr: tid, key: key})
 				dead = append(dead, isDead)
 			}
 		} else {
@@ -1937,7 +1975,7 @@ func pageItems(p storage.Page) ([]item, error) {
 				return nil, perr
 			}
 			for _, tid := range tids {
-				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+				out = append(out, item{ptr: tid, key: key})
 			}
 		} else {
 			it, perr := parseItem(raw)
@@ -2020,7 +2058,7 @@ type LeafEntry struct {
 // Exported, like PageItemKeys / PageDownlinks, so amcheck's heapallindexed
 // checker (internal/amcheck.VerifyBtreeHeapAllIndexed) fingerprints the leaf
 // entries through the canonical on-disk reader here instead of re-deriving the
-// inline (keyLen, TID) item layout — the same single-source-of-truth discipline
+// inline IndexTupleData item layout — the same single-source-of-truth discipline
 // that guards against the v3->v4 layout drift. Unlike PageItemKeys (which
 // collapses a posting item to its one separator key for the item-order tier),
 // this expands posting items because heapallindexed fingerprints every heap TID
@@ -2119,7 +2157,7 @@ type Downlink struct {
 // Exported, like PageItemKeys, so amcheck's cross-level checker
 // (internal/amcheck.VerifyBtreeParentDownlinks) follows each parent downlink to
 // its child through the canonical on-disk reader here instead of re-deriving the
-// inline (keyLen, child-block) item layout — the same single-source-of-truth
+// inline IndexTupleData item layout — the same single-source-of-truth
 // discipline that guards against the v3->v4 layout drift.
 func PageDownlinks(p storage.Page) ([]Downlink, error) {
 	count, err := PGDataItemCount(p)
@@ -2287,11 +2325,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	bt.stats.inserts.Add(1) // M0055-0001
-	it := item{
-		keyLen: uint16(len(key)),
-		ptr:    ptr,
-		key:    append([]byte(nil), key...),
-	}
+	it := item{ptr: ptr, key: append([]byte(nil), key...)}
 
 	// Fast path: no split required. Writers touching different leaves
 	// only contend on those page latches, not on a tree-wide mutex.
@@ -2712,11 +2746,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 
 	// The separator key going up is the smallest key in the right page.
-	sepItem := item{
-		keyLen: rightItems[0].keyLen,
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    append([]byte(nil), rightItems[0].key...),
-	}
+	sepItem := downlinkItem(append([]byte(nil), rightItems[0].key...), rightBlk)
 
 	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)
@@ -2856,11 +2886,7 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	}
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	sepItem := item{
-		keyLen: uint16(len(sepKey)),
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    sepKey,
-	}
+	sepItem := downlinkItem(sepKey, rightBlk)
 	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
 		return err
 	}
@@ -2886,8 +2912,8 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 // ApplyInsertRecord re-runs one B-tree non-split insert against
 // the given page bytes during WAL replay (see
 // docs/design/0002-0003-redo-records.md). The raw item is the
-// same payload the writer emitted (item.marshal output: keyLen +
-// ptr.block + ptr.offset + key). The page must already be a
+// same payload the writer emitted (item.marshal output: an upstream
+// IndexTupleData header followed by the key). The page must already be a
 // valid initialised B-tree page; replay never creates a fresh
 // btree page from a logical insert (a split record handles that
 // case).
@@ -2901,7 +2927,7 @@ func ApplyInsertRecord(page storage.Page, raw []byte) error {
 		return err
 	}
 	if !pageHasSpaceFor(page, it) {
-		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", it.keyLen)
+		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", len(it.key))
 	}
 	mustInsertItemSorted(page, it)
 	return nil
@@ -2927,11 +2953,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		// already lifted a new root above `leftBlk`. Insert our
 		// separator into the current root through the regular
 		// path.
-		sepItem := item{
-			keyLen: uint16(len(rightKey)),
-			ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-			key:    append([]byte(nil), rightKey...),
-		}
+		sepItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
 		_, parentPath, err := bt.descendToLeaf(rightKey)
 		if err != nil {
 			return err
@@ -2958,16 +2980,8 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	})
 
 	// Leftmost internal item: empty key, pointer to leftBlk.
-	leftItem := item{
-		keyLen: 0,
-		ptr:    storage.ItemPointer{Block: leftBlk, Offset: 0},
-		key:    nil,
-	}
-	rightItem := item{
-		keyLen: uint16(len(rightKey)),
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    append([]byte(nil), rightKey...),
-	}
+	leftItem := downlinkItem(nil, leftBlk)
+	rightItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
 	mustInsertItemSorted(rootSlot.Page(), leftItem)
 	mustInsertItemSorted(rootSlot.Page(), rightItem)
 
@@ -3026,7 +3040,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 // "not enough free space in page" panic (root-0040).
 func itemEncodedSize(it item) int {
 	const itemIDSize = 4 // matches storage.itemIDSize
-	return itemIDSize + itemPrefixSize + len(it.key)
+	return itemIDSize + SizeOfIndexTupleData + len(it.key)
 }
 
 // pageHasSpaceFor reports whether `it` would fit on `p` if appended.
@@ -3285,11 +3299,11 @@ func byteAwareSplitLoc(items []item) int {
 	total := 0
 	sizes := make([]int, len(items))
 	for i, it := range items {
-		// 8-byte fixed prefix + variable-length key (per
+		// 8-byte IndexTupleData header + variable-length key (per
 		// `(item).marshal()` layout). We use the encoded size
 		// rather than just key length so the metric matches the
 		// on-page footprint.
-		sizes[i] = 8 + len(it.key)
+		sizes[i] = SizeOfIndexTupleData + len(it.key)
 		total += sizes[i]
 	}
 	half := total / 2
@@ -3340,7 +3354,7 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 		if len(tids) > 0 {
 			ptr = tids[0]
 		}
-		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
+		return item{ptr: ptr, key: key}, nil
 	}
 	it, perr := parseItem(raw)
 	if perr != nil {

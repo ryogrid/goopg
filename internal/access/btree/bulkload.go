@@ -24,7 +24,7 @@ import (
 // index-size / page-count expectations in the bulk-load tests hold. Upstream
 // instead truncates the separator to its key attributes (_bt_truncate) and can
 // therefore reserve exactly; that is S11.4 work.
-const bulkHighKeyReserve = 4 /* ItemIdData */ + itemPrefixSize + MaxHighKeyLen
+const bulkHighKeyReserve = 4 /* ItemIdData */ + SizeOfIndexTupleData + MaxHighKeyLen
 
 // pageHasSpaceForBulk is pageHasSpaceFor plus that reserve.
 func pageHasSpaceForBulk(p storage.Page, it item) bool {
@@ -112,7 +112,7 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 
 	items := make([]item, len(entries))
 	for i, e := range entries {
-		items[i] = item{keyLen: uint16(len(e.Key)), ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
+		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return CompareKeys(items[i].key, items[j].key) < 0 })
 
@@ -236,11 +236,7 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 	// Convert entries to internal items and sort by key.
 	items := make([]item, len(entries))
 	for i, e := range entries {
-		items[i] = item{
-			keyLen: uint16(len(e.Key)),
-			ptr:    e.Ptr,
-			key:    append([]byte(nil), e.Key...),
-		}
+		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		return CompareKeys(items[i].key, items[j].key) < 0
@@ -326,18 +322,10 @@ type bulkLink struct {
 // sibling as the separator key.
 func linksToInternalItems(links []bulkLink) []item {
 	out := make([]item, len(links))
-	out[0] = item{
-		keyLen: 0,
-		ptr:    storage.ItemPointer{Block: links[0].blk},
-		key:    nil,
-	}
+	out[0] = downlinkItem(nil, links[0].blk)
 	for i := 1; i < len(links); i++ {
 		sep := links[i-1].highKey // separator = first key of this child = highKey of prev sibling
-		out[i] = item{
-			keyLen: uint16(len(sep)),
-			ptr:    storage.ItemPointer{Block: links[i].blk},
-			key:    append([]byte(nil), sep...),
-		}
+		out[i] = downlinkItem(append([]byte(nil), sep...), links[i].blk)
 	}
 	return out
 }
@@ -510,7 +498,8 @@ const maxRawItemSize = 7800
 // posting-list rawItems (M0047-0003). Items must already be sorted by key.
 //
 //   - A run of 1: marshalled as a normal item (8+keyLen bytes).
-//   - A run of N≥2: marshalled as a posting-list item (4+N×6+keyLen bytes).
+//   - A run of N≥2: marshalled as an upstream posting-list tuple
+//     (8+keyLen bytes then N×6 bytes of ItemPointerData).
 //
 // M0053-0005: When a single run would produce a posting item exceeding
 // the 15-bit page line-pointer limit (0x7FFF bytes), the run is split
@@ -537,9 +526,10 @@ func deduplicateToRawItems(items []item) []rawItem {
 				tids[k-i] = items[k].ptr
 			}
 			// Compute the maximum number of TIDs that fit in one posting
-			// item: maxRawItemSize - postingHeaderSize - len(key) bytes
-			// available for TIDs at 6 bytes each.
-			maxTIDsPerChunk := (maxRawItemSize - postingHeaderSize - len(key)) / 6
+			// item: maxRawItemSize - SizeOfIndexTupleData - len(key) bytes
+			// available for TIDs at 6 bytes each (the TID array starts at
+			// the posting offset, immediately after the key).
+			maxTIDsPerChunk := (maxRawItemSize - SizeOfIndexTupleData - len(key)) / 6
 			if maxTIDsPerChunk < 1 {
 				// Pathological: key alone exceeds the page limit. Fall
 				// back to single-item-per-TID encoding so each entry
@@ -558,6 +548,14 @@ func deduplicateToRawItems(items []item) []rawItem {
 						end = len(tids)
 					}
 					chunk := tids[off:end]
+					if len(chunk) == 1 {
+						// A posting list is defined to hold >= 2 TIDs
+						// (nbtree.h's BTreeTupleSetPosting asserts it), so a
+						// trailing one-TID remainder goes back to a plain
+						// item rather than a degenerate posting tuple.
+						out = append(out, rawItem{raw: item{ptr: chunk[0], key: key}.marshal(), key: key})
+						continue
+					}
 					out = append(out, rawItem{raw: marshalPosting(key, chunk), key: key})
 				}
 			}

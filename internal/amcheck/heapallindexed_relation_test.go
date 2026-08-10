@@ -13,12 +13,7 @@ import (
 // (keyLen(2) | block(4) | offset(2) | key), setting BOTH the heap TID block and
 // offset — btItemRaw leaves them zero and btDownlinkRaw sets only the block.
 func btLeafRaw(key []byte, block storage.BlockNumber, offset uint16) []byte {
-	raw := make([]byte, 8+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
-	binary.LittleEndian.PutUint32(raw[2:6], uint32(block))
-	binary.LittleEndian.PutUint16(raw[6:8], offset)
-	copy(raw[8:], key)
-	return raw
+	return btree.PGBTItemRaw(key, storage.ItemPointer{Block: block, Offset: offset})
 }
 
 // le is a (key, heap TID) leaf entry for makeLeafPage.

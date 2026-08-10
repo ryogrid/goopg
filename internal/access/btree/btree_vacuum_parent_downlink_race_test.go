@@ -84,7 +84,7 @@ func TestApplyParentDownlinkRemovalIgnoresStaleIndex(t *testing.T) {
 	initPage(splicedSlot.Page(), BTPageOpaque{Level: 0, Flags: BTLeaf})
 	pool.Unpin(splicedSlot)
 
-	newItem := item{keyLen: 0, ptr: storage.ItemPointer{Block: splicedBlk, Offset: 0}, key: nil}
+	newItem := item{ptr: storage.ItemPointer{Block: splicedBlk, Offset: 0}, key: nil}
 	spliced := append([]item{newItem}, rootItems...)
 
 	rootSlot, err := tree.pinW(meta.Root)

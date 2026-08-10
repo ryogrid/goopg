@@ -19,7 +19,7 @@ import (
 // overwrite the opaque flags.
 //
 // `keptItems` carries each surviving item's raw bytes (the
-// `keyLen | ptr.block | ptr.offset | key` blob produced by
+// `IndexTupleData header | key` blob produced by
 // `item.marshal`). The caller is responsible for emitting
 // these in the order they should appear post-replay.
 //
@@ -103,7 +103,7 @@ func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
 	// adopts the leftmost slot and currently has a non-empty
 	// key, blank its key to maintain the B-tree invariant.
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{keyLen: 0, ptr: newItems[0].ptr, key: nil}
+		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
 	}
 	resetPageItems(page)
 	for i, it := range newItems {

@@ -7,16 +7,19 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// M0130-S11.4 (slice 1 of 3), doc docs/design/0130-0011-nbtree-pg-on-disk-format.md
+// M0130-S11.4, doc docs/design/0130-0011-nbtree-pg-on-disk-format.md
 // §"S11.4 — tuple shape".
 //
 // This file is the UPSTREAM index-tuple layout — `IndexTupleData` plus the
-// nbtree alternative-TID conventions — as an ADDITIVE layer, exactly like
-// S11.1's `pgformat.go` (page/metapage) and S11.2a's `pgpage.go` (line-pointer
-// shape) were before their flips. Nothing in `btree.go` uses it yet; goopg's
-// private `item` encoding (`itemPrefixSize` = keyLen/block/offset, then a
-// sort-order-preserving key blob) is still what every writer emits. Slices 2
-// and 3 of S11.4 migrate the writers and the comparison layer onto this.
+// nbtree alternative-TID conventions. Slice 1 landed it as an additive layer;
+// slice 2 flipped the writers, so `(item).marshal` / `parseItem` /
+// `marshalPosting` in btree.go and posting.go now speak exactly this shape and
+// the goopg-private `itemPrefixSize` layout (keyLen | flat LE uint32 block |
+// offset) is gone. What slice 3 still owes: the key is one opaque
+// order-preserving blob rather than per-attribute binary datums, so
+// FormPGIndexTuple/DeformPGIndexTuple below are not yet on the writer path,
+// and the two MAXALIGNs that depend on a descriptor-derived key length
+// (index_form_tuple's size rounding and the posting offset) are deferred.
 //
 // Why it is needed: after S11.2b/S11.3 a real PG 18.3 accepts a goopg index
 // PAGE (`_bt_checkpage` passes), but the first thing it then does is
@@ -26,19 +29,18 @@ import (
 //	[ IndexAttributeBitMapData, iff t_info & INDEX_NULL_MASK ]
 //	[ attribute values, starting at MAXALIGN(header [+ bitmap]) ]
 //
-// goopg's body is none of that: its first two bytes are a key length, its
-// pointer is a flat LE uint32 block (upstream splits BlockIdData into
+// Before slice 2 goopg's body was none of that: its first two bytes were a key
+// length, its pointer a flat LE uint32 block (upstream splits BlockIdData into
 // (bi_hi, bi_lo) uint16 halves — see storage/block.h BlockIdSet), and its key
-// bytes are an order-preserving *encoding* (EncodeInt4 flips the sign bit)
-// rather than the type's binary datum image. So every field disagrees.
+// bytes an order-preserving *encoding* (EncodeInt4 flips the sign bit) rather
+// than the type's binary datum image. The header and the pointer are fixed;
+// the key encoding is what slice 3 still has to convert.
 //
-// Scope of THIS slice: the codec and the accessors only, with no writer
-// touched, so the byte layout can be pinned by tests (including against the
-// hand-rolled per-catalog encoders goopg already ships in
-// internal/initdb/btree_index_bootstrap.go and
+// The byte layout is pinned by tests against the hand-rolled per-catalog
+// encoders goopg already ships in internal/initdb/btree_index_bootstrap.go and
 // internal/executor/sys_catalog_index_insert.go, which produce real
-// index_form_tuple output for a handful of fixed shapes — this layer must
-// agree with them byte-for-byte, and they become its callers later).
+// index_form_tuple output for a handful of fixed shapes — a real PG 18.3 reads
+// the bootstrap indexes they write, so they are an oracle.
 
 // Sizes and masks from postgres/src/include/access/itup.h.
 const (
@@ -339,6 +341,43 @@ func BTreeTupleSetDownLink(raw []byte, child storage.BlockNumber) {
 	binary.LittleEndian.PutUint16(raw[0:2], uint16(uint32(child)>>16))
 	binary.LittleEndian.PutUint16(raw[2:4], uint16(uint32(child)&0xFFFF))
 }
+
+// BTreeTupleSetPosting is nbtree.h's BTreeTupleSetPosting(): it turns a plain
+// index tuple into a posting-list tuple by setting INDEX_ALT_TID_MASK and
+// overwriting t_tid with (postingOffset, nhtids|BT_IS_POSTING) — the byte
+// offset of the trailing ItemPointerData array and its length.
+//
+// Upstream additionally asserts postingOffset == MAXALIGN(postingOffset).
+// goopg cannot honour that yet: its key is still one opaque blob whose length
+// is only recoverable as postingOffset - SizeOfIndexTupleData, so padding the
+// offset would lose it. S11.4 slice 3 (per-attribute datums) makes the key
+// length derivable from the index descriptor and restores the MAXALIGN — see
+// the deferral ledger. The divergence is invisible to a non-assert PG build,
+// which reaches the array by plain pointer arithmetic.
+func BTreeTupleSetPosting(raw []byte, nhtids uint16, postingOffset int) error {
+	if nhtids < 2 {
+		return fmt.Errorf("btree: posting list needs at least 2 TIDs, got %d", nhtids)
+	}
+	if nhtids&BTStatusOffsetMask != 0 {
+		return fmt.Errorf("btree: posting count %d exceeds BT_OFFSET_MASK %d", nhtids, BTOffsetMask)
+	}
+	if postingOffset < SizeOfIndexTupleData || postingOffset >= IndexSizeMask {
+		return fmt.Errorf("btree: invalid posting offset %d", postingOffset)
+	}
+	binary.LittleEndian.PutUint16(raw[4:6], nhtids|BTIsPosting)
+	BTreeTupleSetDownLink(raw, storage.BlockNumber(postingOffset))
+	binary.LittleEndian.PutUint16(raw[6:8], pgTInfo(raw)|IndexAltTIDMask)
+	return nil
+}
+
+// BTreeTupleGetNPosting is nbtree.h's BTreeTupleGetNPosting().
+func BTreeTupleGetNPosting(raw []byte) uint16 {
+	return PGIndexTupleTID(raw).Offset & BTOffsetMask
+}
+
+// BTreeTupleGetPostingOffset is nbtree.h's BTreeTupleGetPostingOffset(): the
+// byte offset of the TID array, carried in t_tid's block half.
+func BTreeTupleGetPostingOffset(raw []byte) int { return int(PGIndexTupleTID(raw).Block) }
 
 // BTreeTupleGetHeapTID returns the tiebreaker heap TID of a pivot tuple that
 // kept one, or ok=false when the pivot's TID was truncated away. For a plain
