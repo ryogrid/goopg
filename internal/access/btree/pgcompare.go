@@ -177,6 +177,18 @@ func ComparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte) (int, error) {
 	if nkey == 0 {
 		return 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
 	}
+	if len(a) < SizeOfIndexTupleData || len(b) < SizeOfIndexTupleData {
+		// An operand too short to hold an IndexTupleData header is not a tuple
+		// at all. The case that actually occurs is a MINUS-INFINITY search key:
+		// `rangeScanPos(nil, …)` and the leftmost descent pass an empty key,
+		// which upstream expresses as a BTScanInsert with keysz = 0 rather than
+		// as a tuple. Returning an error (rather than reading past the slice,
+		// which panicked before M0130-S11.4 slice 3b-2c-ii-B1) lets
+		// indexFormat.compare fall back to the bytewise order, where an empty
+		// key sorts before every tuple — which IS minus infinity, so the
+		// descent lands on the leftmost leaf exactly as intended.
+		return 0, fmt.Errorf("btree: ComparePGIndexTuples operand of %d/%d bytes is shorter than an index tuple header", len(a), len(b))
+	}
 	if BTreeTupleIsPosting(a) || BTreeTupleIsPosting(b) {
 		// A posting list's key is a single value shared by many heap TIDs;
 		// comparing one is meaningful, but the heap-TID tiebreak below would

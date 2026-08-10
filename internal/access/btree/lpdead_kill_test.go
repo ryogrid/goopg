@@ -226,7 +226,7 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 		if perr != nil {
 			t.Fatal(perr)
 		}
-		full := !pageHasSpaceFor(slot.Page(), item{key: make([]byte, 512)})
+		full := !blobFormat.pageHasSpaceFor(slot.Page(), item{key: make([]byte, 512)})
 		slot.RUnlock()
 		bt.pool.Unpin(slot)
 		if full {

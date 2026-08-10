@@ -37,7 +37,7 @@ func maybeDumpPageOnParseErr(p storage.Page, ctx string) {
 	fmt.Fprintf(f, "context: %s\n", ctx)
 
 	op := readOpaque(p)
-	hk, hasHK, _ := pageHighKey(p)
+	hk, hasHK, _ := blobFormat.pageHighKey(p)
 	fmt.Fprintf(f, "opaque: Prev=%d Next=%d Level=%d Flags=0x%x HighKey=%v/%d\n",
 		op.Prev, op.Next, op.Level, op.Flags, hasHK, len(hk))
 

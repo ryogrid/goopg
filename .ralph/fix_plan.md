@@ -936,7 +936,8 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
       - [ ] **3b-2c — flip the writer AND route every comparison through the
             descriptor** (REINDEX-required break). Split into 3b-2c-i (the
             seam, behaviour-preserving — **DONE 2026-08-10**) and 3b-2c-ii
-            (the flip, still open) — see the two sub-items below. The
+            (plumbing A + codec seam B1 **DONE 2026-08-10**; the writer flip
+            B2 still open) — see the two sub-items below. The
             writer flip was planned for 3b-2b; building the mapper showed it
             cannot land there, because the sibling-path rule is symmetric — a
             descriptor-derived reader against a blob-writing writer reads
@@ -1001,15 +1002,45 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               (`pgindex_btree_test.go`, 5 tests). Indexes the resolver
               refuses (expression key / explicit opclass / non-bytewise
               collation / no comparator) get nil and keep the blob path.
-        - [ ] **3b-2c-ii-B — the flip** (REINDEX-required).
+        - [x] **3b-2c-ii-B1 — the item-codec seam** (2026-08-10). NO on-disk
+              change, no REINDEX. The descriptor decides a third thing besides
+              the ordering: what `item.key` IS — a header-less payload (blob)
+              or the whole `FormPGIndexTuple` image (tuple), the only operand
+              shape `ComparePGIndexTuples` can order. So `keyComparer` was
+              renamed **`indexFormat`** and grew the codec
+              (`internal/access/btree/pgitemcodec.go`): `marshal` / `parse` /
+              `parseNoCopy` / `bodySize` / `itemEncodedSize` /
+              `pageHasSpaceFor` plus the page helpers that moved onto it
+              (`pageItems`, `pageItemsWithDead`, `pageHighKey`, `readPageItem`,
+              `byteAwareSplitLoc`, `compactRawSize`, `itemsToRawItems`,
+              `pageHasSpaceForBulk`, `snapshotPageItemsAsLog`). ~30 call sites
+              now ask the tree's format instead of hard-wiring the blob layout.
+              Ordering and layout are ONE object on purpose — one decision
+              (`desc`), and a disagreement between them mis-ORDERS rather than
+              failing to parse. Sites with a page but no index identity name
+              `blobFormat` explicitly (greppable): the four exported page
+              readers (amcheck's) and both redo entry points — exactly what B2
+              must teach to resolve a per-index format. Guards:
+              `pgitemcodec_test.go` (6), 2 mutations caught; the tuple branch
+              is driven END TO END (3000 int4 keys, out-of-order across the
+              sign boundary, scanned in exact `btint4cmp` order through splits
+              and multi-level descent, with the on-page bytes asserted to BE
+              the tuple — ordering alone does not catch a layout slip). Bug
+              found and fixed: `ComparePGIndexTuples` panicked on an operand
+              shorter than a tuple header, i.e. on a minus-infinity search key
+              (`rangeScanPos(nil, …)`); it now errors so `compare` falls back
+              to bytewise, where an empty key sorts first = minus infinity.
+        - [ ] **3b-2c-ii-B2 — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
-              `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
-              `pgIndexTupleKeys` on, the redo-path descriptor lookup, and an
-              explicit dual-format decision for the indexes ii-A's resolver
-              refuses (they keep the blob path, so a tree's format is now a
-              per-index property that amcheck and the redo path must both
-              learn). Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS SF0.5
-              gate (re-pin after a REINDEX).
+              `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums
+              (search keys included — a tuple-format search key must itself be
+              tuple-shaped), `pgIndexTupleKeys` on, the redo-path descriptor
+              lookup, the `blobFormat` sites above taught to resolve a
+              per-index format, and an explicit dual-format decision for the
+              indexes ii-A's resolver refuses (they keep the blob path, so a
+              tree's format is now a per-index property that amcheck and the
+              redo path must both learn). Gates: `scripts/tpch-spotcheck.sh` +
+              the TPC-DS SF0.5 gate (re-pin after a REINDEX).
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

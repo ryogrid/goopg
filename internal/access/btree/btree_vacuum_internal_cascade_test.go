@@ -128,10 +128,10 @@ func readItemsForTest(t *testing.T, bt *BTree, blk storage.BlockNumber) []item {
 	if err != nil {
 		t.Fatalf("pinR(%d): %v", blk, err)
 	}
-	items, err := pageItems(slot.Page())
+	items, err := blobFormat.pageItems(slot.Page())
 	bt.unpinR(slot)
 	if err != nil {
-		t.Fatalf("pageItems(%d): %v", blk, err)
+		t.Fatalf("blobFormat.pageItems(%d): %v", blk, err)
 	}
 	return items
 }

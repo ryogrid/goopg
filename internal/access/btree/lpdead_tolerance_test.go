@@ -132,7 +132,7 @@ func TestLPDeadSkippedByPageReaders(t *testing.T) {
 	} else if len(entries) != 2 {
 		t.Fatalf("PageLeafEntries returned %d, want 2", len(entries))
 	}
-	if items, err := pageItems(p); err != nil {
+	if items, err := blobFormat.pageItems(p); err != nil {
 		t.Fatalf("pageItems: %v", err)
 	} else if len(items) != 2 {
 		t.Fatalf("pageItems returned %d, want 2", len(items))

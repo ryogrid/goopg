@@ -202,12 +202,12 @@ func writeOpaque(p storage.Page, o BTPageOpaque) {
 // rightmost. The high key is stored as an ordinary item at P_HIKEY whose key
 // bytes are the separator; its pointer half is unused (S11.4 turns it into a
 // real pivot tuple whose t_tid carries the downlink).
-func pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
+func (f indexFormat) pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
 	raw, ok, err := PGHighKeyRaw(p)
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	it, perr := parseItem(raw)
+	it, perr := f.parse(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
 		return nil, false, perr
@@ -220,7 +220,12 @@ func pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
 // PageItemKeys: the high key's on-page representation is a format detail that
 // has already moved once (opaque field -> P_HIKEY item) and a second decoder
 // would silently drift on the next move.
-func PageHighKey(p storage.Page) (key []byte, ok bool, err error) { return pageHighKey(p) }
+// It reads the page in the BLOB format: an out-of-package caller has a page,
+// not an index identity, so it cannot resolve a key descriptor. Teaching
+// amcheck to ask the catalog for the format is 3b-2c-ii-B2 (ledger row).
+func PageHighKey(p storage.Page) (key []byte, ok bool, err error) {
+	return blobFormat.pageHighKey(p)
+}
 
 // highKeyItem builds the P_HIKEY item that carries `key` as the page's
 // separator. Since M0130-S11.4 slice 3a it is a real nbtree PIVOT tuple
@@ -233,12 +238,12 @@ func highKeyItem(key []byte) item {
 // high key — i.e., the search has overshot this page and must follow btpo_next
 // under right-link recovery. A rightmost page (or an unreadable high key, which
 // the structural validators report separately) never overshoots.
-func keyExceedsHighKey(cmp keyComparer, p storage.Page, key []byte) bool {
-	hk, ok, err := pageHighKey(p)
+func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
+	hk, ok, err := f.pageHighKey(p)
 	if err != nil || !ok {
 		return false
 	}
-	return cmp.compare(key, hk) > 0
+	return f.compare(key, hk) > 0
 }
 
 // itemOvershootsHighKey reports whether a new item keyed `key` belongs
@@ -252,12 +257,12 @@ func keyExceedsHighKey(cmp keyComparer, p storage.Page, key []byte) bool {
 // stored-item invariant in VerifyBtreeItemOrder (verify_nbtree.go) —
 // HighKey is itself the separator that was pushed up when this page last
 // split, so a downlink equal to it belongs to the right sibling.
-func itemOvershootsHighKey(cmp keyComparer, p storage.Page, op BTPageOpaque, key []byte) bool {
-	hk, ok, err := pageHighKey(p)
+func itemOvershootsHighKey(f indexFormat, p storage.Page, op BTPageOpaque, key []byte) bool {
+	hk, ok, err := f.pageHighKey(p)
 	if err != nil || !ok {
 		return false
 	}
-	res := cmp.compare(key, hk)
+	res := f.compare(key, hk)
 	if op.IsLeaf() {
 		return res > 0
 	}
@@ -345,6 +350,10 @@ const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 
 //
 // The 13-bit INDEX_SIZE_MASK cannot overflow here: a body must fit in a page,
 // and BlockSize (8192) minus the page header already leaves less than 8191.
+// Since M0130-S11.4 slice 3b-2c-ii-B1 this is the BLOB format's encoder
+// specifically, reached through `indexFormat.marshal` (pgitemcodec.go) — a
+// descriptor-bearing index's key is already a whole tuple and needs no header
+// synthesised around it. Call sites go through the format, never here.
 func (it item) marshal() []byte {
 	if it.pivot {
 		return PGBTPivotRaw(it.key, it.ptr.Block)
@@ -830,7 +839,7 @@ func DecodeVarchar(b []byte) ([]byte, error) {
 // CompareKeys is straight bytewise lexicographic comparison.
 //
 // Since M0130-S11.4 slice 3b-2c-i the engine no longer calls this directly:
-// every ordering decision goes through `keyComparer.compare` (pgkeycmp.go),
+// every ordering decision goes through `indexFormat.compare` (pgkeycmp.go),
 // for which this is the nil-descriptor branch. It stays exported because the
 // out-of-package structural validators (internal/amcheck) and the executor's
 // bt_index_check need to name goopg's default key order explicitly.
@@ -868,12 +877,14 @@ type BTree struct {
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
-	// cmp is the index's key comparer (M0130-S11.4 slice 3b-2c-i) — the one
-	// place every ordering decision in this package resolves. Its zero value
-	// is the bytewise order goopg's key encodings are built for; a non-nil
-	// descriptor (3b-2c-ii) switches the whole tree to `_bt_compare` over PG
-	// binary datums. See pgkeycmp.go.
-	cmp keyComparer
+	// keyFmt is the index's key FORMAT (M0130-S11.4 slices 3b-2c-i and
+	// 3b-2c-ii-B1) — the one place every ordering AND item-layout decision in
+	// this package resolves. Its zero value is the blob format: the bytewise
+	// order goopg's key encodings are built for, over header-less key
+	// payloads. A non-nil descriptor switches the whole tree to `_bt_compare`
+	// over PG binary datums, with whole index tuples as its key operands. See
+	// pgkeycmp.go and pgitemcodec.go.
+	keyFmt indexFormat
 
 	// splitMu serialises split-path inserts and metapage
 	// publication. (M0055-0004-followup-stage2-splitmu-removal:
@@ -1102,18 +1113,18 @@ type fastPathItemIdent struct {
 // DebugVerifyFastPathInserts is false.
 func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) (int, error) {
 	if !bt.DebugVerifyFastPathInserts {
-		return insertItemSorted(bt.keyCmp(), p, it)
+		return insertItemSorted(bt.format(), p, it)
 	}
-	pre, err := pageItems(p)
+	pre, err := bt.format().pageItems(p)
 	if err != nil {
 		panic(err)
 	}
 	preSnap := append([]item(nil), pre...)
-	lineIdx, err := insertItemSorted(bt.keyCmp(), p, it)
+	lineIdx, err := insertItemSorted(bt.format(), p, it)
 	if err != nil {
 		return 0, err
 	}
-	post, err := pageItems(p)
+	post, err := bt.format().pageItems(p)
 	if err != nil {
 		panic(err)
 	}
@@ -1305,7 +1316,7 @@ func (bt *BTree) RecordFlushSnapshot(tag storage.BufferTag, page storage.Page) {
 	if !bt.DebugTraceFlushes || tag.Rel != bt.rel {
 		return
 	}
-	items, err := pageItems(page)
+	items, err := bt.format().pageItems(page)
 	if err != nil {
 		return
 	}
@@ -1356,7 +1367,7 @@ func (bt *BTree) RecordReloadSnapshot(tag storage.BufferTag, page storage.Page) 
 	if !bt.DebugTraceReloads || tag.Rel != bt.rel {
 		return
 	}
-	items, err := pageItems(page)
+	items, err := bt.format().pageItems(page)
 	if err != nil {
 		return
 	}
@@ -1501,7 +1512,7 @@ func (bt *BTree) recordContentMuLock(blk storage.BlockNumber, page storage.Page)
 	if !bt.DebugTraceContentMu {
 		return
 	}
-	recs := snapshotPageItemsAsLog(blk, page)
+	recs := bt.format().snapshotPageItemsAsLog(blk, page)
 	if recs == nil {
 		return
 	}
@@ -1523,7 +1534,7 @@ func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Pag
 	if !bt.DebugTraceContentMu {
 		return
 	}
-	recs := snapshotPageItemsAsLog(blk, page)
+	recs := bt.format().snapshotPageItemsAsLog(blk, page)
 	bt.insertLogMu.Lock()
 	before, ok := bt.contentMuBefore[blk]
 	if ok {
@@ -1542,8 +1553,8 @@ func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Pag
 // (not an error) on decode failure, matching RecordFlushSnapshot/
 // RecordReloadSnapshot's best-effort behavior — this is debug
 // instrumentation, not a correctness path.
-func snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
-	items, err := pageItems(page)
+func (f indexFormat) snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
+	items, err := f.pageItems(page)
 	if err != nil {
 		return nil
 	}
@@ -1751,7 +1762,7 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 
 // OpenWithOptions is the wired-up Open variant.
 func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, cmp: keyComparer{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
@@ -1801,7 +1812,7 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, cmp: keyComparer{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
 
 	// Ensure the relation file starts at block 0 (see
 	// BulkCreateWithOptions for rationale).
@@ -2015,7 +2026,7 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 // then replays the entry back as Normal pointing at a recycled heap slot
 // (C3-S1 review MUST-FIX 1). PG's btbulkdelete likewise deletes by TID
 // regardless of LP_DEAD.
-func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
+func (f indexFormat) pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, nil, err
@@ -2042,7 +2053,7 @@ func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 				dead = append(dead, isDead)
 			}
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parseItem")
 				return nil, nil, perr
@@ -2054,7 +2065,7 @@ func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 	return out, dead, nil
 }
 
-func pageItems(p storage.Page) ([]item, error) {
+func (f indexFormat) pageItems(p storage.Page) ([]item, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
@@ -2083,7 +2094,7 @@ func pageItems(p storage.Page) ([]item, error) {
 				out = append(out, item{ptr: tid, key: key})
 			}
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItems: parseItem")
 				return nil, perr
@@ -2132,7 +2143,7 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 			}
 			out = append(out, key)
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := blobFormat.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageItemKeys: parseItem")
 				return nil, perr
@@ -2231,7 +2242,7 @@ func PageLeafItems(p storage.Page) ([]LeafItem, error) {
 				out = append(out, LeafItem{Key: key, TID: tid, Slot: pgDataSlot(p, slot), PostingIndex: i})
 			}
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := blobFormat.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageLeafItems: parseItem")
 				return nil, perr
@@ -2281,7 +2292,7 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 		if err != nil {
 			return nil, err
 		}
-		it, perr := parseItem(raw)
+		it, perr := blobFormat.parse(raw)
 		if perr != nil {
 			maybeDumpPageOnParseErr(p, "PageDownlinks: parseItem")
 			return nil, perr
@@ -2297,9 +2308,9 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 // key. By v0 convention the leftmost internal item carries the empty
 // key (lowest possible), so the search is well-defined for the first
 // child too.
-func findChildBlock(cmp keyComparer, items []item, key []byte) storage.BlockNumber {
+func findChildBlock(f indexFormat, items []item, key []byte) storage.BlockNumber {
 	idx := sort.Search(len(items), func(i int) bool {
-		return cmp.compare(items[i].key, key) > 0
+		return f.compare(items[i].key, key) > 0
 	})
 	if idx == 0 {
 		// All items are > key; descend through the first item anyway
@@ -2315,7 +2326,7 @@ func findChildBlock(cmp keyComparer, items []item, key []byte) storage.BlockNumb
 // child block to descend into for `key`, without decoding all items
 // first.  Replaces the pageItems + findChildBlock pair (which allocated
 // a slice of all items on every descent).  M0027-0001.
-func findChildBlockDirect(cmp keyComparer, p storage.Page, key []byte) (storage.BlockNumber, error) {
+func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.BlockNumber, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return 0, err
@@ -2330,11 +2341,11 @@ func findChildBlockDirect(cmp keyComparer, p storage.Page, key []byte) (storage.
 		if err != nil {
 			return true // will surface at the final error check
 		}
-		it, err := parseItem(raw)
+		it, err := f.parse(raw)
 		if err != nil {
 			return true
 		}
-		return cmp.compare(it.key, key) > 0
+		return f.compare(it.key, key) > 0
 	})
 	// sort.Search returns [0, n]; idx==n means all items ≤ key.
 	if idx >= n {
@@ -2349,7 +2360,7 @@ func findChildBlockDirect(cmp keyComparer, p storage.Page, key []byte) (storage.
 	if err != nil {
 		return 0, err
 	}
-	it, err := parseItem(raw)
+	it, err := f.parse(raw)
 	if err != nil {
 		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
@@ -2383,7 +2394,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		// Right-link recovery: a concurrent split may have moved
 		// our target keys to the right sibling. Follow op.Next
 		// until we land on a page that covers the search key.
-		if keyExceedsHighKey(bt.keyCmp(), slot.Page(), key) {
+		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -2416,7 +2427,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 
 		// Binary-search the internal page directly, without decoding
 		// all items (avoids allocation & linear decode — M0027-0001).
-		child, err := findChildBlockDirect(bt.keyCmp(), slot.Page(), key)
+		child, err := findChildBlockDirect(bt.format(), slot.Page(), key)
 		bt.unpinR(slot)
 		if err != nil {
 			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
@@ -2483,10 +2494,10 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	defer bt.unpinW(slot)
 
-	if keyExceedsHighKey(bt.keyCmp(), slot.Page(), it.key) {
+	if keyExceedsHighKey(bt.format(), slot.Page(), it.key) {
 		return errNeedsSplit
 	}
-	if !pageHasSpaceFor(slot.Page(), it) {
+	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
 		return errNeedsSplit
 	}
 
@@ -2496,7 +2507,7 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-		itemBytes := it.marshal()
+		itemBytes := bt.format().marshal(it)
 		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 			return logIns(bt.rel, leafBlk, itemBytes)
 		})
@@ -2547,7 +2558,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		held.hold(slot)
 		op = readOpaque(slot.Page())
-		if itemOvershootsHighKey(bt.keyCmp(), slot.Page(), op, it.key) {
+		if itemOvershootsHighKey(bt.format(), slot.Page(), op, it.key) {
 			next := op.Next
 			held.release()
 			blk = next
@@ -2563,7 +2574,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.panicBeforeLeafWrite(blk)
 	}
 
-	if pageHasSpaceFor(slot.Page(), it) {
+	if bt.format().pageHasSpaceFor(slot.Page(), it) {
 		lineIdx, err := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
 		if err != nil {
 			// pageHasSpaceFor and PageInsertItemRawAt disagreed
@@ -2582,7 +2593,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			// wired (test helpers, pre-runtime callers).
 			var derr error
 			if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-				itemBytes := it.marshal()
+				itemBytes := bt.format().marshal(it)
 				derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 					return logIns(bt.rel, blk, itemBytes)
 				})
@@ -2656,14 +2667,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// is off (traceRewrite no-ops immediately).
 	preLineCount, _ := PGDataItemCount(slot.Page())
 
-	allItems, err := pageItems(slot.Page())
+	allItems, err := bt.format().pageItems(slot.Page())
 	if err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		held.release()
 		return err
 	}
-	allItems = appendSorted(bt.keyCmp(), allItems, it)
+	allItems = appendSorted(bt.format(), allItems, it)
 	var postPageItemsSnap []item
 	if bt.DebugTraceInserts {
 		postPageItemsSnap = append([]item(nil), allItems...)
@@ -2675,7 +2686,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// page may fit comfortably in a single leaf after dedup,
 	// avoiding the split entirely. We bail back to the no-split
 	// path if dedup recovers enough space.
-	allItems = dedupConsolidate(bt.keyCmp(), allItems)
+	allItems = dedupConsolidate(bt.format(), allItems)
 	var postDedupSnap []item
 	if bt.DebugTraceInserts {
 		postDedupSnap = append([]item(nil), allItems...)
@@ -2684,14 +2695,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// resetPageItems re-installs before any data item goes back on (S11.2b:
 	// the separator is a page item now, not opaque-area reserve, so it has to
 	// be paid for out of the same budget).
-	if compactRawSize(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+	if bt.format().compactRawSize(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
 		for _, x := range allItems {
-			lineIdx := mustInsertItemSorted(bt.keyCmp(), slot.Page(), x)
+			lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
 			bt.traceInsert(blk, lineIdx, x)
 		}
 		// Drop the freshly-allocated right slot — split avoided.
@@ -2736,7 +2747,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// equivalent to count-midpoint; for variable-width keys it
 	// produces balanced halves in bytes (the on-disk metric the
 	// page fill threshold actually cares about).
-	mid := byteAwareSplitLoc(allItems)
+	mid := bt.format().byteAwareSplitLoc(allItems)
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
@@ -2766,7 +2777,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// resume guarantee).
 	op.Flags |= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
-	if err := pgSetHighKeyRaw(slot.Page(), highKeyItem(sepKey).marshal()); err != nil {
+	if err := pgSetHighKeyRaw(slot.Page(), bt.format().marshal(highKeyItem(sepKey))); err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		held.release()
@@ -2774,11 +2785,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 
 	for _, x := range leftItems {
-		lineIdx := mustInsertItemSorted(bt.keyCmp(), slot.Page(), x)
+		lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
 		bt.traceInsert(blk, lineIdx, x)
 	}
 	for _, x := range rightItems {
-		lineIdx := mustInsertItemSorted(bt.keyCmp(), rightSlot.Page(), x)
+		lineIdx := mustInsertItemSorted(bt.format(), rightSlot.Page(), x)
 		bt.traceInsert(rightBlk, lineIdx, x)
 	}
 
@@ -2957,7 +2968,7 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	}
 	// Read the high key + Next to reconstruct the separator
 	// item that the original split was about to push up.
-	hk, hasHK, hkErr := pageHighKey(slot.Page())
+	hk, hasHK, hkErr := bt.format().pageHighKey(slot.Page())
 	if hkErr != nil {
 		bt.unpinW(slot)
 		return hkErr
@@ -3027,20 +3038,22 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 // compares page pd_lsn against the record's end-LSN before
 // invoking this. The function is "apply unconditionally".
 func ApplyInsertRecord(page storage.Page, raw []byte) error {
-	it, err := parseItem(raw)
+	it, err := blobFormat.parse(raw)
 	if err != nil {
 		return err
 	}
-	if !pageHasSpaceFor(page, it) {
+	if !blobFormat.pageHasSpaceFor(page, it) {
 		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", len(it.key))
 	}
-	// keyComparer{} is the bytewise comparer, which is correct while every
-	// index has a nil descriptor. Replay has no BTree handle and therefore no
-	// route to one, so 3b-2c-ii must carry the descriptor into the redo path
-	// (a per-relation lookup at recovery time) before any index can be opened
-	// with one — recorded as a deferral, since a descriptor-ordered tree
-	// replayed bytewise would insert at the wrong slot.
-	mustInsertItemSorted(keyComparer{}, page, it)
+	// blobFormat is the pre-flip format — bytewise order over header-less key
+	// payloads — which is correct while every index has a nil descriptor.
+	// Replay has no BTree handle and therefore no route to one, so 3b-2c-ii-B2
+	// must carry the descriptor into the redo path (a per-relation lookup at
+	// recovery time) before any index can be opened with one. Recorded as a
+	// deferral, and note the flip makes it doubly wrong: a descriptor-ordered
+	// tree replayed this way both PARSES the item wrong (its key is the whole
+	// tuple, header included) and inserts it at the wrong slot.
+	mustInsertItemSorted(blobFormat, page, it)
 	return nil
 }
 
@@ -3093,8 +3106,8 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	// Leftmost internal item: empty key, pointer to leftBlk.
 	leftItem := downlinkItem(nil, leftBlk)
 	rightItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
-	mustInsertItemSorted(bt.keyCmp(), rootSlot.Page(), leftItem)
-	mustInsertItemSorted(bt.keyCmp(), rootSlot.Page(), rightItem)
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), leftItem)
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), rightItem)
 
 	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
 	// both the new root page (backup block 0) and the updated metapage
@@ -3143,23 +3156,9 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	return bt.updateRootMeta(rootBlk, level)
 }
 
-// itemEncodedSize returns the number of bytes the raw item occupies on a page,
-// including the line-pointer ItemID (4 bytes) and the prefix+key body.
-// This is the single source of truth for the budget both pageHasSpaceFor and
-// PageInsertItemRawAt depend on — they were once computed from different
-// expressions and a mismatch at a nearly-full leaf triggered the
-// "not enough free space in page" panic (root-0040).
-func itemEncodedSize(it item) int {
-	const itemIDSize = 4 // matches storage.itemIDSize
-	return itemIDSize + SizeOfIndexTupleData + len(it.key)
-}
-
-// pageHasSpaceFor reports whether `it` would fit on `p` if appended.
-func pageHasSpaceFor(p storage.Page, it item) bool {
-	h := storage.MustHeader(p)
-	free := int(h.Upper()) - int(h.Lower())
-	return free >= itemEncodedSize(it)
-}
+// itemEncodedSize / pageHasSpaceFor moved onto indexFormat in M0130-S11.4
+// slice 3b-2c-ii-B1 (pgitemcodec.go): what an item costs on a page depends on
+// whether its key carries its own tuple header, which is a per-index property.
 
 // insertItemSorted (M0055-0002 Phase A) writes `it` into its
 // sorted position on the page WITHOUT decoding and re-encoding
@@ -3179,7 +3178,7 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // via pageHasSpaceFor should use mustInsertItemSorted; callers on the
 // no-split fast path should route storage.ErrNoSpaceInPage to the split
 // path instead of panicking (root-0040).
-func insertItemSorted(cmp keyComparer, p storage.Page, it item) (int, error) {
+func insertItemSorted(f indexFormat, p storage.Page, it item) (int, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		panic(err)
@@ -3190,11 +3189,11 @@ func insertItemSorted(cmp keyComparer, p storage.Page, it item) (int, error) {
 	lo, hi := 0, count
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		midItem, err := readPageItem(p, mid)
+		midItem, err := f.readPageItem(p, mid)
 		if err != nil {
 			panic(err)
 		}
-		if cmp.compare(midItem.key, it.key) < 0 {
+		if f.compare(midItem.key, it.key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -3205,7 +3204,7 @@ func insertItemSorted(cmp keyComparer, p storage.Page, it item) (int, error) {
 	// accumulates over many duplicate inserts. The pre-split
 	// dedup compaction variant — see `dedupPageBeforeSplit` —
 	// is the safer landing for steady-state dedup retention.)
-	raw := it.marshal()
+	raw := f.marshal(it)
 	// PageInsertItemRawAt is 1-based, line-pointer index lo is
 	// 0-based; convert.
 	if _, err := pgInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
@@ -3219,8 +3218,8 @@ func insertItemSorted(cmp keyComparer, p storage.Page, it item) (int, error) {
 // createNewRoot, WAL replay). A panic here means the space estimate and
 // the real insert logic have diverged — a logic bug, not a runtime
 // condition.
-func mustInsertItemSorted(cmp keyComparer, p storage.Page, it item) int {
-	idx, err := insertItemSorted(cmp, p, it)
+func mustInsertItemSorted(f indexFormat, p storage.Page, it item) int {
+	idx, err := insertItemSorted(f, p, it)
 	if err != nil {
 		panic(err)
 	}
@@ -3269,13 +3268,13 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 	// fall back to the descent path in that case.
 	count, perr := PGDataItemCount(slot.Page())
 	if perr == nil && count > 0 {
-		first, ferr := readPageItem(slot.Page(), 0)
-		if ferr == nil && bt.keyCmp().compare(it.key, first.key) < 0 {
+		first, ferr := bt.format().readPageItem(slot.Page(), 0)
+		if ferr == nil && bt.format().compare(it.key, first.key) < 0 {
 			bt.unpinW(slot)
 			return false, nil
 		}
 	}
-	if !pageHasSpaceFor(slot.Page(), it) {
+	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
 		bt.unpinW(slot)
 		return false, nil
 	}
@@ -3286,7 +3285,7 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 	}
 	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-		itemBytes := it.marshal()
+		itemBytes := bt.format().marshal(it)
 		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 			return logIns(bt.rel, blk, itemBytes)
 		})
@@ -3324,7 +3323,7 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 // from the expanded list. That alone bounds duplicate-heavy
 // workloads where the same heap tuple shows up multiple times
 // in the bulk-build's input.
-func dedupConsolidate(cmp keyComparer, items []item) []item {
+func dedupConsolidate(f indexFormat, items []item) []item {
 	if len(items) <= 1 {
 		return items
 	}
@@ -3335,7 +3334,7 @@ func dedupConsolidate(cmp keyComparer, items []item) []item {
 			continue
 		}
 		prev := out[len(out)-1]
-		if cmp.compare(prev.key, it.key) == 0 && prev.ptr == it.ptr {
+		if f.compare(prev.key, it.key) == 0 && prev.ptr == it.ptr {
 			// Exact duplicate — drop.
 			continue
 		}
@@ -3348,10 +3347,10 @@ func dedupConsolidate(cmp keyComparer, items []item) []item {
 // size of every item in `items` plus the per-item line-pointer
 // overhead. Used to decide whether dedup recovered enough space
 // to skip the split.
-func compactRawSize(items []item) int {
+func (f indexFormat) compactRawSize(items []item) int {
 	total := 0
 	for _, it := range items {
-		total += itemEncodedSize(it)
+		total += f.itemEncodedSize(it)
 	}
 	return total
 }
@@ -3403,7 +3402,7 @@ func pageOccupied(p storage.Page) int {
 // item) and the maximum is len(items)-1 so the right side is
 // non-empty. A degenerate single-item input returns 1 (caller
 // guarantees ≥ 2 items because we're splitting a full page).
-func byteAwareSplitLoc(items []item) int {
+func (f indexFormat) byteAwareSplitLoc(items []item) int {
 	if len(items) <= 2 {
 		return 1
 	}
@@ -3447,7 +3446,7 @@ func byteAwareSplitLoc(items []item) int {
 // (M0047-0003) it returns the FIRST tid bundled in the posting
 // — that's enough for the binary search since all posting tids
 // share the same key.
-func readPageItem(p storage.Page, idx int) (item, error) {
+func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
 	// items retain valid key bytes until purged, and result filtering
 	// happens at the caller's visibility layer.
@@ -3467,16 +3466,16 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 		}
 		return item{ptr: ptr, key: key}, nil
 	}
-	it, perr := parseItem(raw)
+	it, perr := f.parse(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
 	}
 	return it, perr
 }
 
-func appendSorted(cmp keyComparer, items []item, it item) []item {
+func appendSorted(f indexFormat, items []item, it item) []item {
 	idx := sort.Search(len(items), func(i int) bool {
-		return cmp.compare(items[i].key, it.key) >= 0
+		return f.compare(items[i].key, it.key) >= 0
 	})
 	out := make([]item, len(items)+1)
 	copy(out[:idx], items[:idx])
@@ -3535,21 +3534,21 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 			return storage.ItemPointer{}, false, err
 		}
 		op := readOpaque(slot.Page())
-		if keyExceedsHighKey(bt.keyCmp(), slot.Page(), key) {
+		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
 			continue
 		}
-		items, err := pageItems(slot.Page())
+		items, err := bt.format().pageItems(slot.Page())
 		bt.unpinR(slot)
 		if err != nil {
 			return storage.ItemPointer{}, false, err
 		}
 		idx := sort.Search(len(items), func(i int) bool {
-			return bt.keyCmp().compare(items[i].key, key) >= 0
+			return bt.format().compare(items[i].key, key) >= 0
 		})
-		if idx >= len(items) || bt.keyCmp().compare(items[idx].key, key) != 0 {
+		if idx >= len(items) || bt.format().compare(items[idx].key, key) != 0 {
 			return storage.ItemPointer{}, false, nil
 		}
 		return items[idx].ptr, true, nil
@@ -3629,7 +3628,7 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 		// covers `lo` (or we run out of pages).
 		// When lo is nil, keyExceedsHighKey(page, nil) is always false
 		// (nil compares less than any real key), so we never skip — correct.
-		if lo != nil && keyExceedsHighKey(bt.keyCmp(), slot.Page(), lo) {
+		if lo != nil && keyExceedsHighKey(bt.format(), slot.Page(), lo) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -3670,10 +3669,10 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					if perr != nil {
 						continue
 					}
-					if lo != nil && bt.keyCmp().compare(key, lo) < 0 {
+					if lo != nil && bt.format().compare(key, lo) < 0 {
 						continue
 					}
-					if hi != nil && bt.keyCmp().compare(key, hi) > 0 {
+					if hi != nil && bt.format().compare(key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}
@@ -3692,14 +3691,14 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 				} else {
 					// M0091-0002: parseItemNoCopy aliases the
 					// page; key MUST NOT be retained by fn.
-					it, perr := parseItemNoCopy(r)
+					it, perr := bt.format().parseNoCopy(r)
 					if perr != nil {
 						continue
 					}
-					if lo != nil && bt.keyCmp().compare(it.key, lo) < 0 {
+					if lo != nil && bt.format().compare(it.key, lo) < 0 {
 						continue
 					}
-					if hi != nil && bt.keyCmp().compare(it.key, hi) > 0 {
+					if hi != nil && bt.format().compare(it.key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}

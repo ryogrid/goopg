@@ -73,7 +73,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		// them here would leave marked entries out of the rewrite while
 		// the heap reclaims their TIDs; a crash replays them back as
 		// Normal pointing at recycled heap slots.
-		items, itemDead, err := pageItemsWithDead(slot.Page())
+		items, itemDead, err := bt.format().pageItemsWithDead(slot.Page())
 		if err != nil {
 			bt.unpinW(slot)
 			return totalRemoved, err
@@ -100,7 +100,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
 			for _, it := range kept {
-				raw := it.marshal()
+				raw := bt.format().marshal(it)
 				if _, err := storage.PageAddItemRaw(slot.Page(), raw); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err
@@ -215,7 +215,7 @@ func (bt *BTree) findLeftmostLeaf() (storage.BlockNumber, error) {
 			return cur, nil
 		}
 		// Internal page: follow leftmost child (first item's ptr).
-		items, err := pageItems(slot.Page())
+		items, err := bt.format().pageItems(slot.Page())
 		bt.unpinR(slot)
 		if err != nil {
 			return storage.InvalidBlockNumber, err
@@ -561,7 +561,7 @@ func (bt *BTree) findParentDownlinkByBlock(childBlk storage.BlockNumber) (storag
 			bt.unpinR(slot)
 			return 0, nil, false, nil
 		}
-		items, perr := pageItems(slot.Page())
+		items, perr := bt.format().pageItems(slot.Page())
 		bt.unpinR(slot)
 		if perr != nil {
 			return 0, nil, false, perr
@@ -588,7 +588,7 @@ func (bt *BTree) findDownlinkSlotInParent(parentBlk, childBlk storage.BlockNumbe
 		return 0, err
 	}
 	defer bt.unpinR(slot)
-	items, err := pageItems(slot.Page())
+	items, err := bt.format().pageItems(slot.Page())
 	if err != nil {
 		return 0, err
 	}
@@ -655,7 +655,7 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk, childBlk storage.BlockNum
 	if err != nil {
 		return err
 	}
-	items, err := pageItems(s.Page())
+	items, err := bt.format().pageItems(s.Page())
 	if err != nil {
 		bt.unpinW(s)
 		return err
@@ -685,7 +685,7 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk, childBlk storage.BlockNum
 	}
 	resetPageItems(s.Page())
 	for _, it := range newItems {
-		if _, err := storage.PageAddItemRaw(s.Page(), it.marshal()); err != nil {
+		if _, err := storage.PageAddItemRaw(s.Page(), bt.format().marshal(it)); err != nil {
 			bt.unpinW(s)
 			return err
 		}
@@ -1151,7 +1151,7 @@ func (bt *BTree) removeDownlinkFromParent(parentBlk, childBlk storage.BlockNumbe
 	if err != nil {
 		return err
 	}
-	items, err := pageItems(s.Page())
+	items, err := bt.format().pageItems(s.Page())
 	if err != nil {
 		bt.unpinW(s)
 		return err
@@ -1179,7 +1179,7 @@ func (bt *BTree) removeDownlinkFromParent(parentBlk, childBlk storage.BlockNumbe
 
 	resetPageItems(s.Page())
 	for _, it := range newItems {
-		if _, addErr := storage.PageAddItemRaw(s.Page(), it.marshal()); addErr != nil {
+		if _, addErr := storage.PageAddItemRaw(s.Page(), bt.format().marshal(it)); addErr != nil {
 			bt.unpinW(s)
 			return addErr
 		}

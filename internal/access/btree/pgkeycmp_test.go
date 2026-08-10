@@ -18,7 +18,7 @@ import (
 // empty-key cases the descent path relies on (the minus-infinity leftmost
 // downlink carries an empty key).
 func TestKeyComparerNilDescIsBytewise(t *testing.T) {
-	var c keyComparer
+	var c indexFormat
 	operands := [][]byte{
 		nil, {}, {0x00}, {0x00, 0x00}, {0x01}, {0x01, 0x00}, {0x7f}, {0x80},
 		{0xff}, {0xff, 0xff}, []byte("abc"), []byte("abcd"), []byte("abd"),
@@ -43,7 +43,7 @@ func TestKeyComparerDescRoutesToBtCompare(t *testing.T) {
 	attr := int4Attr()
 	attr.Compare = PGCompareInt4
 	desc := &PGIndexKeyDesc{Attrs: []PGKeyAttr{attr}}
-	c := keyComparer{desc: desc}
+	c := indexFormat{desc: desc}
 
 	tid := storage.ItemPointer{Block: 1, Offset: 1}
 	neg := tup(t, desc.Attrs, [][]byte{int4Val(-1)}, tid)
@@ -72,7 +72,7 @@ func TestKeyComparerFallsBackOnUndecodableOperand(t *testing.T) {
 	attr := int4Attr()
 	attr.Compare = PGCompareInt4
 	desc := &PGIndexKeyDesc{Attrs: []PGKeyAttr{attr}}
-	c := keyComparer{desc: desc}
+	c := indexFormat{desc: desc}
 
 	plain := tup(t, desc.Attrs, [][]byte{int4Val(7)}, storage.ItemPointer{Block: 1, Offset: 1})
 	posting := append([]byte(nil), plain...)
@@ -113,14 +113,14 @@ func TestBTreeKeyCmpCarriesOptionsDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateWithOptions: %v", err)
 	}
-	if bt.keyCmp().desc != desc {
+	if bt.format().desc != desc {
 		t.Fatalf("CreateWithOptions dropped Options.KeyDesc")
 	}
 	reopened, err := OpenWithOptions(pool, rel, Options{KeyDesc: desc})
 	if err != nil {
 		t.Fatalf("OpenWithOptions: %v", err)
 	}
-	if reopened.keyCmp().desc != desc {
+	if reopened.format().desc != desc {
 		t.Fatalf("OpenWithOptions dropped Options.KeyDesc")
 	}
 	// And the default path — every caller today — must stay bytewise.
@@ -128,7 +128,7 @@ func TestBTreeKeyCmpCarriesOptionsDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if plain.keyCmp().desc != nil {
+	if plain.format().desc != nil {
 		t.Fatalf("a tree opened without a descriptor must compare bytewise")
 	}
 }

@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A landed 2026-08-10; S11.4 slices 3b-2c-ii-B/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1 landed 2026-08-10; S11.4 slices 3b-2c-ii-B2/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -514,13 +514,51 @@ sources agree:
             describe (expression key, explicit opclass, non-bytewise
             collation, a type with no comparator) yields nil and keeps the
             blob path — so the flip cannot simply delete that path.
-          - **3b-2c-ii-B — the flip (open). REINDEX-required.**
+          - **3b-2c-ii-B1 — the item-codec seam (landed 2026-08-10). No
+            on-disk change.** The descriptor decides a third thing besides the
+            ordering: what `item.key` IS. In the blob format the key is a
+            header-less payload and `(item).marshal` SYNTHESISES the
+            `IndexTupleData` header from `item.ptr`; in the tuple format the
+            key is the whole `FormPGIndexTuple` image (header included),
+            because that is the only operand shape `ComparePGIndexTuples` can
+            order. So ~30 sites that said `it.marshal()` / `parseItem(raw)` /
+            `SizeOfIndexTupleData + len(it.key)` now ask the index's format.
+            `keyComparer` was accordingly renamed `indexFormat` and grew the
+            codec (`pgitemcodec.go`): `marshal` / `parse` / `parseNoCopy` /
+            `bodySize` / `itemEncodedSize` / `pageHasSpaceFor` /
+            `pageItems` / `pageItemsWithDead` / `pageHighKey` / `readPageItem`
+            / `byteAwareSplitLoc` / `compactRawSize` / `itemsToRawItems` /
+            `pageHasSpaceForBulk` / `snapshotPageItemsAsLog`. Ordering and
+            layout are ONE object on purpose — they are one decision (`desc`),
+            and letting them disagree yields a silently mis-ordered tree rather
+            than a parse failure. Every production descriptor is still nil, so
+            every method takes its blob branch. Sites with no index identity
+            name `blobFormat` explicitly (greppable): the exported page readers
+            (`PageItemKeys` / `PageLeafItems` / `PageDownlinks` /
+            `PageHighKey`, used by internal/amcheck) and the two redo entry
+            points (`ApplyInsertRecord`, `ReplayRemoveParentDownlink`) — the
+            two places ii-B2 must teach that the format is a per-index catalog
+            property. Guards (`pgitemcodec_test.go`, 6): the blob branch is
+            pinned against `PGBTItemRaw`/`PGBTPivotRaw` directly, and the
+            tuple branch is driven end to end — a descriptor-bearing tree of
+            3000 int4 keys, inserted out of order across the sign boundary,
+            scans in exact `btint4cmp` order through splits and multi-level
+            descent, with the on-page bytes asserted to BE the tuple (ordering
+            alone does not catch a layout slip: a nested tuple compares
+            correctly and reads as garbage to PG). One bug found and fixed:
+            `ComparePGIndexTuples` PANICKED on an operand shorter than a tuple
+            header, which is what a minus-infinity search key
+            (`rangeScanPos(nil, …)`, upstream's keysz = 0) is; it now errors,
+            so `compare` falls back to the bytewise order where an empty key
+            sorts first — which IS minus infinity.
+          - **3b-2c-ii-B2 — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
-            `pgIndexTupleKeys` on, the redo-path descriptor lookup above, and
-            an explicit dual-format decision for the indexes ii-A's resolver
-            refuses. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5
-            gate (re-pin after a REINDEX).
+            `pgIndexTupleKeys` on, the redo-path descriptor lookup above, the
+            `blobFormat` call sites above taught to resolve a per-index format,
+            and an explicit dual-format decision for the indexes ii-A's
+            resolver refuses. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS
+            SF0.5 gate (re-pin after a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

@@ -355,7 +355,7 @@ func TestResetPageItemsKeepsTheHighKey(t *testing.T) {
 
 	resetPageItems(p)
 
-	hk, ok, err := pageHighKey(p)
+	hk, ok, err := blobFormat.pageHighKey(p)
 	if err != nil || !ok {
 		t.Fatalf("high key after reset: ok=%v err=%v", ok, err)
 	}
@@ -399,7 +399,7 @@ func TestWriteNextSiblingSlidesTheHighKeyAway(t *testing.T) {
 		t.Fatalf("pgWriteNextSibling: %v", err)
 	}
 
-	if _, ok, _ := pageHighKey(p); ok {
+	if _, ok, _ := blobFormat.pageHighKey(p); ok {
 		t.Fatal("rightmost page still reports a high key")
 	}
 	n, err := PGDataItemCount(p)

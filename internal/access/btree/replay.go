@@ -85,7 +85,9 @@ func ReplaySetOpaqueFlags(page storage.Page, flagsAfter uint16) error {
 // semantics including the leftmost-key adoption when slot 1 is
 // removed. (M0079-0003.)
 func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
-	items, err := pageItems(page)
+	// blobFormat: same redo-path gap as ApplyInsertRecord — no BTree handle
+	// here, so no descriptor (M0130-S11.4 slice 3b-2c-ii-B1 ledger row).
+	items, err := blobFormat.pageItems(page)
 	if err != nil {
 		return fmt.Errorf("btree: replay parent downlink read: %w", err)
 	}
@@ -109,7 +111,7 @@ func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
 	}
 	resetPageItems(page)
 	for i, it := range newItems {
-		if _, err := storage.PageAddItemRaw(page, it.marshal()); err != nil {
+		if _, err := storage.PageAddItemRaw(page, blobFormat.marshal(it)); err != nil {
 			return fmt.Errorf("btree: replay parent downlink re-add %d: %w", i, err)
 		}
 	}

@@ -79,7 +79,7 @@ func TestDeduplicateToRawItems(t *testing.T) {
 		{ptr: storage.ItemPointer{Block: 1, Offset: 3}, key: EncodeInt4(3)}, // dup
 	}
 
-	raws := deduplicateToRawItems(keyComparer{}, items)
+	raws := deduplicateToRawItems(indexFormat{}, items)
 	if len(raws) != 3 { // keys 1, 2, 3
 		t.Fatalf("expected 3 raw items, got %d", len(raws))
 	}
@@ -267,7 +267,7 @@ func TestDeduplicateOversizedPostingSplits(t *testing.T) {
 		}
 	}
 
-	raws := deduplicateToRawItems(keyComparer{}, items)
+	raws := deduplicateToRawItems(indexFormat{}, items)
 
 	if len(raws) < 2 {
 		t.Fatalf("expected the run to be split into >=2 posting items, got %d", len(raws))

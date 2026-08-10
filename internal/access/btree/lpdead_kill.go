@@ -75,7 +75,7 @@ func (bt *BTree) KillItems(kills []KillItem) {
 			if isPostingRaw(raw) {
 				continue // O-C3-1: posting kills deferred
 			}
-			it, perr := parseItem(raw)
+			it, perr := bt.format().parse(raw)
 			if perr != nil || it.ptr != k.Ptr {
 				continue // TID pre-filter (paranoia under an equal LSN)
 			}

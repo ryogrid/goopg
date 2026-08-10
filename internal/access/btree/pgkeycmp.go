@@ -26,7 +26,19 @@ package btree
 // `CompareKeys`, byte for byte.
 // ---------------------------------------------------------------------------
 
-// keyComparer orders two KEY OPERANDS of one index.
+// indexFormat is ONE index's key format: how its key operands are ordered
+// (this file) and how they are laid out in an on-page tuple (pgitemcodec.go).
+//
+// It was born in 3b-2c-i as `keyComparer`, an ordering-only object, and grew
+// the item codec in 3b-2c-ii-B1 for the reason the rename records: the
+// descriptor decides BOTH. A descriptor-bearing index does not merely compare
+// differently, it stores a different thing in `item.key` (the whole
+// FormPGIndexTuple image rather than a bare payload), so an ordering object and
+// a layout object keyed by the same `desc` would be two names for one decision
+// — and the failure mode of letting them disagree is a tree that is silently
+// mis-ordered rather than one that fails to parse.
+//
+// As an ordering, indexFormat orders two KEY OPERANDS of one index.
 //
 // "Key operand" is deliberately the index's own key representation rather than
 // a fixed byte layout, because that representation is exactly what 3b-2c-ii
@@ -45,7 +57,7 @@ package btree
 //
 // The zero value is the bytewise comparer, so a BTree built without a
 // descriptor behaves exactly as it did before this seam existed.
-type keyComparer struct {
+type indexFormat struct {
 	// desc is the index's key descriptor, or nil for bytewise ordering.
 	desc *PGIndexKeyDesc
 }
@@ -63,7 +75,7 @@ type keyComparer struct {
 // attlen. That keeps the ordering TOTAL and DETERMINISTIC, which is what a
 // split needs to terminate; detecting the corruption itself is amcheck's job
 // (internal/amcheck/verify_nbtree.go), not the descent loop's.
-func (c keyComparer) compare(a, b []byte) int {
+func (c indexFormat) compare(a, b []byte) int {
 	if c.desc == nil {
 		return CompareKeys(a, b)
 	}
@@ -79,9 +91,10 @@ func (c keyComparer) compare(a, b []byte) int {
 // (M0130-S11.4 slice 3b-2c-ii-A wires descriptors through nineteen open sites;
 // "the descriptor reached the tree" is otherwise unobservable from outside the
 // package) and so amcheck can report the ordering it is verifying against.
-func (bt *BTree) KeyDesc() *PGIndexKeyDesc { return bt.cmp.desc }
+func (bt *BTree) KeyDesc() *PGIndexKeyDesc { return bt.keyFmt.desc }
 
-// keyCmp is the comparer for this index. Reading it through a method (rather
-// than touching the field) keeps the "a BTree assembled by a path that forgot
-// to set it still compares bytewise" case explicit instead of accidental.
-func (bt *BTree) keyCmp() keyComparer { return bt.cmp }
+// format is the key format of this index — the comparer AND the item codec.
+// Reading it through a method (rather than touching the field) keeps the "a
+// BTree assembled by a path that forgot to set it still uses the blob format"
+// case explicit instead of accidental.
+func (bt *BTree) format() indexFormat { return bt.keyFmt }

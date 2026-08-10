@@ -27,16 +27,16 @@ import (
 const bulkHighKeyReserve = 4 /* ItemIdData */ + SizeOfIndexTupleData + MaxHighKeyLen
 
 // pageHasSpaceForBulk is pageHasSpaceFor plus that reserve.
-func pageHasSpaceForBulk(p storage.Page, it item) bool {
+func (f indexFormat) pageHasSpaceForBulk(p storage.Page, it item) bool {
 	h := storage.MustHeader(p)
 	free := int(h.Upper()) - int(h.Lower())
-	return free >= itemEncodedSize(it)+bulkHighKeyReserve
+	return free >= f.itemEncodedSize(it)+bulkHighKeyReserve
 }
 
 // BulkEntry is one (encoded-key, heap-pointer) pair for bulk index building.
 // The key must already be encoded with the same EncodeXxx functions that the
 // normal Insert path uses — BulkCreate treats keys as opaque byte slices and
-// compares them with the tree's keyComparer (bytewise lexicographic order
+// compares them with the tree's indexFormat (bytewise lexicographic order
 // while the index has no key descriptor — see pgkeycmp.go).
 type BulkEntry struct {
 	Key []byte
@@ -115,10 +115,10 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	for i, e := range entries {
 		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
-	sort.SliceStable(items, func(i, j int) bool { return bt.keyCmp().compare(items[i].key, items[j].key) < 0 })
+	sort.SliceStable(items, func(i, j int) bool { return bt.format().compare(items[i].key, items[j].key) < 0 })
 
 	// Build without dedup: each entry becomes a regular item.
-	leafRaws := itemsToRawItems(items)
+	leafRaws := bt.format().itemsToRawItems(items)
 	leafLinks, err := bt.buildLevelRaw(leafRaws, BTLeaf, 0)
 	if err != nil {
 		metaSlot.Unlock()
@@ -167,7 +167,7 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 
 // BulkCreateWithOptions is BulkCreate with explicit Options.
 func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, cmp: keyComparer{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
 
 	// Ensure the relation file starts at block 0.  A previous failed
 	// bulk build or WAL replay (recovery after a crash that left WAL
@@ -240,13 +240,13 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
-		return bt.keyCmp().compare(items[i].key, items[j].key) < 0
+		return bt.format().compare(items[i].key, items[j].key) < 0
 	})
 
 	// Phase 1: build leaf level with deduplication (M0047-0003).
 	// Same-key entries are grouped into posting-list items so a key
 	// with N duplicates occupies one page slot instead of N.
-	leafRaws := deduplicateToRawItems(bt.keyCmp(), items)
+	leafRaws := deduplicateToRawItems(bt.format(), items)
 	leafLinks, err := bt.buildLevelRaw(leafRaws, BTLeaf, 0)
 	if err != nil {
 		metaSlot.Unlock()
@@ -383,7 +383,7 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 		// again (_bt_slideleft) so the rightmost page of the level starts its
 		// data at P_HIKEY like upstream expects.
 		if len(highKey) > 0 {
-			if err := pgSetHighKeyRaw(curSlot.Page(), highKeyItem(highKey).marshal()); err != nil {
+			if err := pgSetHighKeyRaw(curSlot.Page(), bt.format().marshal(highKeyItem(highKey))); err != nil {
 				curSlot.Unlock()
 				bt.pool.Unpin(curSlot)
 				curSlot = nil
@@ -412,7 +412,7 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 			}
 		}
 
-		if !pageHasSpaceForBulk(curSlot.Page(), it) {
+		if !bt.format().pageHasSpaceForBulk(curSlot.Page(), it) {
 			// Current page is full. Allocate the next page first so we can
 			// write its block number into the current page's Next field.
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
@@ -450,7 +450,7 @@ func (bt *BTree) buildLevel(items []item, flags uint16, level uint32) ([]bulkLin
 		}
 
 		// Append item to the current page.
-		if _, err := storage.PageAddItemRaw(curSlot.Page(), it.marshal()); err != nil {
+		if _, err := storage.PageAddItemRaw(curSlot.Page(), bt.format().marshal(it)); err != nil {
 			curSlot.Unlock()
 			bt.pool.Unpin(curSlot)
 			return nil, fmt.Errorf("btree bulk: PageAddItemRaw: %w", err)
@@ -477,10 +477,10 @@ type rawItem struct {
 
 // itemsToRawItems converts items to rawItems without deduplication,
 // one rawItem per input item. Used for baseline comparisons in tests.
-func itemsToRawItems(items []item) []rawItem {
+func (f indexFormat) itemsToRawItems(items []item) []rawItem {
 	out := make([]rawItem, len(items))
 	for i, it := range items {
-		out[i] = rawItem{raw: it.marshal(), key: it.key}
+		out[i] = rawItem{raw: f.marshal(it), key: it.key}
 	}
 	return out
 }
@@ -510,17 +510,17 @@ const maxRawItemSize = 7800
 // preserved at the cost of slightly higher index size for very
 // high-cardinality keys (e.g. LINEITEM(L_LINENUMBER) at TPC-H SF=1
 // where one value can have ~1.5M duplicates).
-func deduplicateToRawItems(cmp keyComparer, items []item) []rawItem {
+func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 	out := make([]rawItem, 0, len(items))
 	i := 0
 	for i < len(items) {
 		j := i + 1
-		for j < len(items) && cmp.compare(items[j].key, items[i].key) == 0 {
+		for j < len(items) && f.compare(items[j].key, items[i].key) == 0 {
 			j++
 		}
 		key := items[i].key
 		if j-i == 1 {
-			out = append(out, rawItem{raw: items[i].marshal(), key: key})
+			out = append(out, rawItem{raw: f.marshal(items[i]), key: key})
 		} else {
 			tids := make([]storage.ItemPointer, j-i)
 			for k := i; k < j; k++ {
@@ -538,7 +538,7 @@ func deduplicateToRawItems(cmp keyComparer, items []item) []rawItem {
 				// that overflows, the underlying PageAddItemRaw will
 				// reject and the caller sees a clean error).
 				for k := i; k < j; k++ {
-					out = append(out, rawItem{raw: items[k].marshal(), key: key})
+					out = append(out, rawItem{raw: f.marshal(items[k]), key: key})
 				}
 			} else if len(tids) <= maxTIDsPerChunk {
 				out = append(out, rawItem{raw: marshalPosting(key, tids), key: key})
@@ -554,7 +554,7 @@ func deduplicateToRawItems(cmp keyComparer, items []item) []rawItem {
 						// (nbtree.h's BTreeTupleSetPosting asserts it), so a
 						// trailing one-TID remainder goes back to a plain
 						// item rather than a degenerate posting tuple.
-						out = append(out, rawItem{raw: item{ptr: chunk[0], key: key}.marshal(), key: key})
+						out = append(out, rawItem{raw: f.marshal(item{ptr: chunk[0], key: key}), key: key})
 						continue
 					}
 					out = append(out, rawItem{raw: marshalPosting(key, chunk), key: key})
@@ -612,7 +612,7 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 		// again (_bt_slideleft) so the rightmost page of the level starts its
 		// data at P_HIKEY like upstream expects.
 		if len(highKey) > 0 {
-			if err := pgSetHighKeyRaw(curSlot.Page(), highKeyItem(highKey).marshal()); err != nil {
+			if err := pgSetHighKeyRaw(curSlot.Page(), bt.format().marshal(highKeyItem(highKey))); err != nil {
 				curSlot.Unlock()
 				bt.pool.Unpin(curSlot)
 				curSlot = nil
