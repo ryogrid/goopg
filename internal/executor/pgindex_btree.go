@@ -2,9 +2,11 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -287,6 +289,137 @@ func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row R
 		return nil, fmt.Errorf("indexRowKey: index %q: %w", idx.Name, err)
 	}
 	return key, nil
+}
+
+// indexBuildEntryKey builds the key ONE bulk-build entry is stored under: every
+// key attribute of idx, taken from a heap row that lives at tid.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-v — the build path's key. It is the third and
+// last writer funnel (B2-c-iii funnelled scan search keys, B2-c-iv the
+// row-shaped runtime writers), and the one the flip most depends on, for a
+// reason the runtime path does not have: a bulk build SORTS its entries, and
+// under the tuple format the heap TID is part of what it sorts by. An entry
+// built without its TID is not merely missing a field — it is placed in the
+// wrong position among its own duplicates, and every later `_bt_compare`
+// descent that carries a real scantid then looks for it somewhere else.
+//
+// The two formats:
+//
+//   - blob (desc == nil): `encodeCompositeBTreeKeyWithExprs` verbatim — the
+//     concatenation of each key column's `encodeBTreeKeyForColumn` image, TID
+//     free, with the entry's TID travelling beside it in `btree.BulkEntry.Ptr`.
+//   - tuple (desc != nil): one `FormPGIndexTuple` image carrying the row's REAL
+//     heap TID, which is also `BulkEntry.Ptr` — the same fact in the two places
+//     the two formats each need it.
+//
+// hasNullKey keeps `encodeCompositeBTreeKeyWithExprs`'s meaning in both: a NULL
+// value key column means the row has no entry in this index, and the caller
+// skips it (NULLS DISTINCT) or dedups it against other null-bearing rows
+// (NULLS NOT DISTINCT). That is a goopg divergence under the tuple format —
+// PG's index tuples have a null bitmap and DO store NULL-keyed rows — but it is
+// the pre-existing one, unchanged here and recorded in the deferral ledger;
+// changing it is not a key-encoding question.
+//
+// keyExprs (an expression index's resolved key expressions) is only ever
+// non-nil on the blob path: an expression key column has no
+// `*catalog.Column`, so `pgIndexKeyColumns` returns nil for such an index and
+// `buildPGIndexKeyDesc` refuses it. A descriptor arriving together with an
+// unresolvable column is therefore a contradiction, and is reported rather than
+// silently encoded as a shorter (pivot!) key.
+func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Column, keyExprs []planner.Expr, row Row, tid storage.ItemPointer, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+	desc := ctx.pgIndexKeyDesc(idx)
+	if desc == nil {
+		return encodeCompositeBTreeKeyWithExprs(ctx, row, cols, keyExprs, pos)
+	}
+	keyCols := pgIndexKeyColumns(idx)
+	if len(keyCols) != desc.NKeyAtts() || len(cols) != len(keyCols) {
+		return nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexBuildEntryKey: index %q: %d build columns / %d resolved key columns / %d descriptor attributes",
+			idx.Name, len(cols), len(keyCols), desc.NKeyAtts())}
+	}
+	vals := make([]Datum, len(keyCols))
+	for i, col := range keyCols {
+		// The build's own column list and the descriptor's must be the same
+		// columns in the same order, or the key would describe a different
+		// index than the tree it is inserted into.
+		if cols[i] == nil || cols[i].Name != col.Name {
+			return nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+				"indexBuildEntryKey: index %q: build key column %d is %q, index key attribute %d is %q",
+				idx.Name, i+1, columnNameOrEmpty(cols[i]), i+1, col.Name)}
+		}
+		if col.Ordinal < 0 || col.Ordinal >= len(row) {
+			return nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+				"indexBuildEntryKey: index %q: key column %q at ordinal %d is outside a %d-column row",
+				idx.Name, col.Name, col.Ordinal, len(row))}
+		}
+		v := row[col.Ordinal]
+		if v.IsNull() {
+			return nil, true, nil
+		}
+		vals[i] = v
+	}
+	k, _, encErr := pgIndexTupleKey(desc, keyCols, vals, tid)
+	if encErr != nil {
+		// No blob fallback, for B2-c-iii's reason: the tree is tuple-shaped, so
+		// a blob key would be filed in the wrong place rather than rejected.
+		return nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexBuildEntryKey: index %q: %v", idx.Name, encErr)}
+	}
+	return k, false, nil
+}
+
+// sortBuildEntriesFindDuplicate sorts entries into idx's OWN key order and
+// reports the first adjacent pair that duplicates a key — the unique-index
+// build's 23505 test.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-v. Both halves were format assertions the
+// blob key made invisible:
+//
+//   - the ORDER. Sorting by `string(key)` is the bytewise order, which is the
+//     blob encoding's whole design and is meaningless for a tuple image (a real
+//     PG datum is not order-preserving under bytes.Compare for any type but
+//     bytea/text). It now goes through the same comparison the tree itself
+//     uses, so "adjacent" means the same thing to the check as to the build.
+//   - the EQUALITY. `bytes.Equal` on a tuple key can never report a duplicate:
+//     the heap TID is inside the image and is distinct by construction, so a
+//     unique build over genuinely duplicated data would succeed and produce a
+//     unique index containing duplicates. The test therefore asks
+//     `ComparePGIndexTupleKeyAttrs` — key attributes only, no TID tiebreak,
+//     which is exactly where upstream raises the error
+//     (`comparetup_index_btree`, tuplesortvariants.c:1668, before its
+//     ItemPointer tiebreak).
+//
+// For the blob format both reduce to what M0055-0006 Phase E shipped, byte for
+// byte: `CompareKeys` IS bytes.Compare, and equality under it IS bytesEqual.
+func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.BulkEntry) bool {
+	cmp := func(a, b []byte) int { return btree.CompareKeys(a, b) }
+	dup := func(a, b []byte) bool { return btree.CompareKeys(a, b) == 0 }
+	if desc != nil {
+		cmp = func(a, b []byte) int {
+			res, err := btree.ComparePGIndexTuples(desc, a, b)
+			if err != nil {
+				// Same total-order fallback indexFormat.compare makes: a sort
+				// predicate has nowhere to put an error, and an intransitive
+				// one is worse than a wrong one.
+				return btree.CompareKeys(a, b)
+			}
+			return res
+		}
+		dup = func(a, b []byte) bool {
+			res, err := btree.ComparePGIndexTupleKeyAttrs(desc, a, b)
+			if err != nil {
+				return false
+			}
+			return res == 0
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return cmp(entries[i].Key, entries[j].Key) < 0 })
+	for i := 1; i < len(entries); i++ {
+		if dup(entries[i].Key, entries[i-1].Key) {
+			return true
+		}
+	}
+	return false
 }
 
 func columnNameOrEmpty(c *catalog.Column) string {

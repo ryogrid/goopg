@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii-3b-2c-ii-B2-c-iii-3b-2c-ii-B2-c-iv-3b-2c-ii-B2-c-v landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -880,6 +880,52 @@ sources agree:
             writers there, mutation-checked by reverting the deferred-exclusion
             site. `operators_storage.go` and `ssi.go` are out of the scan's scope
             on purpose — they are exactly where the two fingerprint uses live.
+          - **3b-2c-ii-B2-c-v — the build path's key, order and duplicate test
+            (landed 2026-08-10).** NO on-disk change, no REINDEX. The last of
+            the three writer funnels, and the one with a property the runtime
+            writers do not have: a bulk build SORTS its entries and then decides
+            uniqueness by comparing neighbours. Both steps read the key, and both
+            were written against the blob format's two silent assumptions —
+            "a key is a byte string whose bytewise order is the index order" and
+            "two rows with equal key values produce equal key bytes". Under the
+            tuple format both are false, and each fails differently:
+            a bytewise sort of tuple images files entries where no `_bt_compare`
+            descent looks for them (a real PG datum is order-preserving under
+            `bytes.Compare` for no type but bytea/text), while `bytes.Equal` on
+            tuple images can NEVER report a duplicate, because the heap TID is
+            inside the image and distinct by construction — so a unique build
+            over genuinely duplicated data would succeed and produce a unique
+            index containing duplicates. Upstream keeps the two questions apart
+            inside one comparator: `comparetup_index_btree`
+            (`src/backend/utils/sort/tuplesortvariants.c:1668`, PG 18.3) walks
+            the key attributes, raises 23505 the moment they all compare equal,
+            and only THEN falls through to the ItemPointer tiebreak "required for
+            btree indexes, since heap TID is treated as an implicit last key
+            attribute". Landed: `(*Context).indexBuildEntryKey` (blob ⇒
+            `encodeCompositeBTreeKeyWithExprs` verbatim; tuple ⇒
+            `pgIndexTupleKey` with the row's REAL heap TID — the same fact that
+            travels beside the key in `BulkEntry.Ptr`), `btree.ComparePGIndexTupleKeyAttrs`
+            (`ComparePGIndexTuples` minus the TID tiebreak), and
+            `sortBuildEntriesFindDuplicate`, which folds the former
+            `sortBulkEntriesByKey` + `bytesEqual` into one format-aware place —
+            both deleted rather than left unused, since a surviving copy is what
+            a later build path reaches for. `collectBTreeEntries` now takes the
+            `*catalog.Index` it is building. `backfillBTree` (the pre-M0047-0001
+            one-at-a-time build) is NOT routed: it has no callers, and its
+            comment now says a caller may not be re-added without routing it.
+            Guards: `internal/executor/pgindex_buildkey_test.go` — blob key is
+            the old encoder verbatim for both a zero and a real TID; the tuple
+            key carries the row's TID, is not a pivot, orders two duplicates by
+            TID, and compares EQUAL under `ComparePGIndexTupleKeyAttrs`; NULL key
+            column still yields `hasNullKey` in both formats; an undescribable
+            index keeps the blob key; the sort puts 1 before 256 where the
+            bytewise order is the opposite (same TID on both, since `t_tid` leads
+            the image and would otherwise dominate the byte comparison); the
+            duplicate test fires for two rows with one value; and a scoped source
+            scan over `operators_ddl.go` allowing only the two encoders
+            themselves and dead `backfillBTree`. Mutation-checked: forcing the
+            blob branch and giving the duplicate test the TID tiebreak each fail
+            with the message naming the defect.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
@@ -891,16 +937,14 @@ sources agree:
             it, and B2-c-iii did the same for the low end, so the SCAN side is
             format-agnostic already, and B2-c-iv did the same for the
             row-shaped writer sites (entry keys and probe-by-row keys both now
-            resolve the descriptor). What remains is the set B2-c-iv could not
-            funnel: the composite encoders on the CREATE INDEX / REINDEX build
-            path (`encodeCompositeBTreeKey` /
-            `encodeCompositeBTreeKeyWithExprs` in `operators_ddl.go`), the
-            expression-key paths (`encodeArbiterKey`, `encodeExprIndexKey`),
-            and the per-column uniqueness comparisons in
-            `operators_storage.go` — plus turning `pgIndexTupleKeys` on and the
-            explicit per-index dual-format decision. The build path is the one
-            that most needs the real heap TID: a bulk build sorts entries, and
-            under heapkeyspace the TID is part of the sort key. Gates:
+            resolve the descriptor), and B2-c-v for the CREATE INDEX / REINDEX
+            bulk build (key, sort order and duplicate test). What remains is the
+            expression-key paths (`encodeArbiterKey`, `encodeExprIndexKey` — an
+            expression index is one `buildPGIndexKeyDesc` currently refuses, so
+            the decision is whether the flip describes them or leaves them
+            permanently blob), the per-column uniqueness comparisons in
+            `operators_storage.go`, and turning `pgIndexTupleKeys` on with the
+            explicit per-index dual-format decision. Gates:
             `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
             a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length

@@ -10426,7 +10426,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // relfile — and the bulk sort needs it: the build's own ordering and every
 // later reader's must come from the same key descriptor.
 func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
-	entries, err := o.collectBTreeEntries(tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
+	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -10439,7 +10439,12 @@ func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNod
 
 // collectBTreeEntries scans the heap, decodes visible tuples, encodes
 // B-tree keys, enforces uniqueness, and returns the entries for bulk build.
-func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+//
+// idx is the index being built (M0130-S11.4 slice 3b-2c-ii-B2-c-v). Every key
+// this loop encodes, and the order + duplicate test it then applies to them,
+// are properties of THAT index's key format, not of the column list: see
+// `indexBuildEntryKey` and `sortBuildEntriesFindDuplicate`.
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -10528,7 +10533,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 					continue
 				}
 			}
-			key, hasNullKey, encErr := encodeCompositeBTreeKeyWithExprs(o.ctx, row, cols, keyExprs, pos)
+			key, hasNullKey, encErr := o.ctx.indexBuildEntryKey(idx, cols, keyExprs, row, storage.ItemPointer{Block: blk, Offset: i}, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
@@ -10583,38 +10588,31 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
 	if unique && len(entries) > 1 {
-		sortBulkEntriesByKey(entries)
-		for i := 1; i < len(entries); i++ {
-			if bytesEqual(entries[i].Key, entries[i-1].Key) {
-				return nil, &ExecError{Code: "23505", Pos: pos,
-					Message: fmt.Sprintf("could not create unique index %q", indexName)}
-			}
+		if sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries) {
+			return nil, &ExecError{Code: "23505", Pos: pos,
+				Message: fmt.Sprintf("could not create unique index %q", indexName)}
 		}
 	}
 	return entries, nil
 }
 
-// sortBulkEntriesByKey (M0055-0006 Phase E) sorts in place by
-// byte-wise key order, the same order BulkBuild expects.
-func sortBulkEntriesByKey(entries []btree.BulkEntry) {
-	sort.SliceStable(entries, func(i, j int) bool {
-		return string(entries[i].Key) < string(entries[j].Key)
-	})
-}
+// `sortBulkEntriesByKey` (M0055-0006 Phase E, sort by `string(key)`) and
+// `bytesEqual` lived here until M0130-S11.4 slice 3b-2c-ii-B2-c-v folded both
+// into `sortBuildEntriesFindDuplicate`. They are deleted rather than left
+// unused on purpose: each was a bare assertion that a btree key is an opaque
+// byte string whose bytewise order is the index order, which is true of exactly
+// one of the two key formats, and a surviving copy is something a later build
+// path can reach for without noticing that.
 
-// bytesEqual is a small no-allocation byte slice equality check.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
+// backfillBTree is the pre-M0047-0001 insert-one-at-a-time index build, kept
+// after `bulkBuildBTreeFull` replaced it. It has NO callers.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-v did not route it, and a caller must not be
+// re-added without doing so: it still calls `encodeCompositeBTreeKey` (a key
+// with no heap TID) and still dedups with `seen[string(key)]` (a byte-identity
+// test). Both are blob-format assertions — see `indexBuildEntryKey` and
+// `sortBuildEntriesFindDuplicate` for what the tuple format needs instead, and
+// the deferral-ledger row for B2-c-v.
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)

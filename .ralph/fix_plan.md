@@ -1228,19 +1228,67 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               `ComparePGIndexTuples` and identical deformed attributes; NULL key
               still `nil, nil`; undescribable index keeps blob; source scan over
               the two fully-routed files, mutation-checked).
+        - [x] **3b-2c-ii-B2-c-v — the build path's key, order and duplicate
+              test** (2026-08-10). NO on-disk change, no REINDEX; the last
+              writer funnel. The bulk build has a property the runtime writers
+              do not: it SORTS its entries and then decides uniqueness by
+              comparing neighbours, and both steps were blob-format assertions.
+              A bytewise sort (`string(key)`) is meaningless for a tuple image —
+              a PG datum is order-preserving under `bytes.Compare` for no type
+              but bytea/text — so entries would be filed where no `_bt_compare`
+              descent looks for them; and `bytes.Equal` on tuple images can
+              NEVER report a duplicate, because the heap TID is inside the image
+              and distinct by construction, so a unique build over duplicated
+              data would succeed and produce a unique index containing
+              duplicates. Upstream keeps both questions in one comparator and
+              answers them in this order — `comparetup_index_btree`
+              (tuplesortvariants.c:1668) raises 23505 when the key attributes
+              all compare equal, THEN falls through to the ItemPointer tiebreak.
+              Landed `(*Context).indexBuildEntryKey` (blob ⇒
+              `encodeCompositeBTreeKeyWithExprs` verbatim, tuple ⇒
+              `pgIndexTupleKey` with the row's real heap TID),
+              `btree.ComparePGIndexTupleKeyAttrs` (the full comparison minus the
+              TID tiebreak) and `sortBuildEntriesFindDuplicate`, which folds the
+              deleted `sortBulkEntriesByKey` + `bytesEqual` into one
+              format-aware place; `collectBTreeEntries` now takes the index it
+              is building. `backfillBTree` is unrouted dead code and its comment
+              now says so. Guard:
+              `internal/executor/pgindex_buildkey_test.go` (blob verbatim under
+              both a zero and a real TID; tuple key carries the TID, is not a
+              pivot, orders duplicates by TID yet compares EQUAL on key
+              attributes; NULL key column unchanged in both formats;
+              undescribable index keeps blob; 1 sorts before 256 where the
+              bytewise order is the opposite; the duplicate test fires;
+              scoped source scan over operators_ddl.go). Mutation-checked
+              (forcing the blob branch, and restoring the TID tiebreak in the
+              duplicate test, each fail by name).
+        - [ ] **3b-2c-ii-B2-c-vi — posting-list dedup groups by KEY
+              attributes** (found by B2-c-v; must land with or before the flip).
+              `deduplicateToRawItems`
+              (`internal/access/btree/bulkload.go:518`) groups adjacent bulk
+              entries with `f.compare(a, b) == 0`, which under the tuple format
+              includes the heap-TID tiebreak — no two entries of a heapkeyspace
+              tree are ever equal, so NO posting list is ever formed and a
+              duplicate-heavy index grows to one item per TID. Upstream's
+              `_bt_load` groups by key attributes (`_bt_keep_natts_fast`,
+              nbtsort.c / nbtutils.c). Fix: give `indexFormat` a
+              `compareKeyAttrs` (nil desc ⇒ `CompareKeys`, else
+              `ComparePGIndexTupleKeyAttrs`) and group with it. Invisible to a
+              row-count gate — it changes index SIZE, not rows — so it needs a
+              size/structure assertion, not a spotcheck.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
               `ctx.pgIndexKeyDesc(idx)` the tree took. The SCAN side is done
               (B2-c-i + B2-c-ii + B2-c-iii) and the row-shaped writer sites are
-              funnelled (B2-c-iv: entry keys and probe-by-row keys). What remains
-              is the BUILD path (`encodeCompositeBTreeKey` /
-              `encodeCompositeBTreeKeyWithExprs` in `operators_ddl.go` — the one
-              that most needs the real heap TID, since a bulk build sorts and the
-              TID is part of the heapkeyspace sort key), the expression-key
-              writers (`encodeArbiterKey`, `encodeExprIndexKey`), and the
-              per-column uniqueness comparisons in `operators_storage.go` — all
-              becoming
+              funnelled (B2-c-iv: entry keys and probe-by-row keys; B2-c-v: the
+              CREATE INDEX / REINDEX bulk build — key, sort order and duplicate
+              test). What remains is the expression-key writers
+              (`encodeArbiterKey`, `encodeExprIndexKey` — an expression index is
+              one `buildPGIndexKeyDesc` currently REFUSES, so the open decision
+              is whether the flip describes them or leaves them permanently
+              blob) and the per-column uniqueness comparisons in
+              `operators_storage.go` — all becoming
               `pgIndexTupleKeyFromRow` with the row's real heap TID,
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a

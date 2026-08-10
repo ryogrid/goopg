@@ -173,6 +173,34 @@ func (a PGKeyAttr) compareAttr(av []byte, anull bool, bv []byte, bnull bool) int
 // minus-infinity downlink is simply a zero-attribute pivot, which the
 // truncation rule already sorts first.
 func ComparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte) (int, error) {
+	return comparePGIndexTuples(desc, a, b, true)
+}
+
+// ComparePGIndexTupleKeyAttrs is ComparePGIndexTuples WITHOUT the heap-TID
+// tiebreak: it returns 0 for two tuples that agree on every key attribute, even
+// though they name different heap rows and are therefore distinct entries of a
+// heapkeyspace tree.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-v. This is the question a UNIQUE index build
+// asks, and it is a different question from ordering. Upstream splits them
+// inside one comparator: `comparetup_index_btree`
+// (postgres/src/backend/utils/sort/tuplesortvariants.c:1668, PG 18.3) walks the
+// key attributes, raises 23505 "could not create unique index" the moment they
+// all compare equal, and only THEN falls through to the ItemPointer tiebreak
+// "required for btree indexes, since heap TID is treated as an implicit last
+// key attribute". If the duplicate test used the full ordering, no two entries
+// of a heapkeyspace index would ever compare equal — every duplicate key would
+// be admitted, because the TIDs differ by construction.
+//
+// Under the blob format the distinction cannot arise (a blob key carries no
+// TID, so `CompareKeys` already answers both questions); this exists for the
+// tuple format, where the two answers diverge for exactly the rows a unique
+// build must reject.
+func ComparePGIndexTupleKeyAttrs(desc *PGIndexKeyDesc, a, b []byte) (int, error) {
+	return comparePGIndexTuples(desc, a, b, false)
+}
+
+func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
 		return 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
@@ -228,6 +256,12 @@ func ComparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte) (int, error) {
 			return -1, nil
 		}
 		return 1, nil
+	}
+
+	if !withHeapTID {
+		// Equal on every key attribute. The caller asked the uniqueness
+		// question, not the ordering one — see ComparePGIndexTupleKeyAttrs.
+		return 0, nil
 	}
 
 	// Heap TID, the implicit final key attribute. Absent (truncated) is
