@@ -497,10 +497,12 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	}
 	bt.unpinW(recheckSlot)
 
-	// Resolve the parent block + the slot index of leaf's
-	// downlink BEFORE any mutation so the WAL record carries
-	// the control fields.
-	parentBlk, parentSlot, hasParent, ancestorPath, err := bt.resolveParentDownlink(leaf)
+	// Resolve the parent block (and the ancestor path the cascade needs)
+	// BEFORE any mutation. The slot index it also returns is used only by the
+	// FPI fallback now: since S11.5d-3b-2 the WAL path re-finds the downlink
+	// by child identity on the LATCHED parent, and the record carries a
+	// poffset read from that page rather than a value captured earlier.
+	parentBlk, _, hasParent, ancestorPath, err := bt.resolveParentDownlink(leaf)
 	if err != nil {
 		return err
 	}
@@ -520,12 +522,17 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// child, so a downlink removal can no longer take a page to zero
 	// items.
 	emitter := bt.pool.LogBtreeUnlinkPage()
-	if emitter == nil {
+	halfDeadEmitter := bt.pool.LogBtreeMarkPageHalfDead()
+	if emitter == nil || halfDeadEmitter == nil {
 		// The FPI fallback keeps the pre-S11.5d-3b shape deliberately: it
 		// logs whole page images, so it has no record control fields that
 		// could go stale, and its re-derive-under-the-write is still the
 		// right answer there. It makes the same refusal, off an unlatched
 		// read of the parent.
+		//
+		// S11.5d-3b-2: the deletion now needs BOTH emitters — the two
+		// upstream phases are two records — so either one missing sends the
+		// whole deletion down this path rather than logging half of it.
 		if hasParent {
 			isRightmost, found, rerr := bt.parentDownlinkIsRightmostChild(parentBlk, leaf.blk)
 			if rerr != nil {
@@ -570,36 +577,111 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// the last item of an internal page is by definition its rightmost
 	// child, so a downlink removal can no longer take a page to zero
 	// items.
+	//
+	// S11.5d-3b-2 adds two more refusals of the same kind — shapes that
+	// upstream never produces and that its two records therefore cannot
+	// express, so emitting them would leave a standby unable to replay:
+	//
+	//   * NO PARENT (or no downlink found in it): `_bt_mark_page_halfdead`
+	//     exists to take the downlink out of a subtree parent, and
+	//     `btree_xlog_mark_page_halfdead` reads block 1 unconditionally. A
+	//     leaf nothing points at is not deletable through this protocol.
+	//   * RIGHTMOST TARGET: `btree_xlog_unlink_page` reads block 2 (the right
+	//     sibling) unconditionally, so "no right sibling" has no
+	//     representation in the record at all — consistent with upstream,
+	//     which never deletes a rightmost page because that would have to
+	//     update the parent's high key.
+	//
+	// Refusing leaves the page empty-but-live, exactly as the rightmost-child
+	// refusal does.
+	var poffset uint16
 	if pins.parent != nil {
-		_, isRightmost, found, ferr := PGFindDownlinkOffset(pins.parent.Page(), leaf.blk)
+		off, isRightmost, found, ferr := PGFindDownlinkOffset(pins.parent.Page(), leaf.blk)
 		if ferr != nil {
 			pins.release(bt)
 			return ferr
 		}
-		if found && isRightmost {
+		if !found || isRightmost {
 			pins.release(bt)
 			return bt.abandonHalfDeadLeaf(leaf.blk)
 		}
+		poffset = off
+	}
+	if pins.parent == nil || pins.rightBlk == storage.InvalidBlockNumber {
+		pins.release(bt)
+		return bt.abandonHalfDeadLeaf(leaf.blk)
 	}
 
-	// The post-unlink leaf flags: BTDeleted (existing "this page has been
-	// vacuumed empty" signal) plus clear BTHalfDead (Phase 2 complete).
-	leafFlagsAfter := (readOpaque(pins.target.Page()).Flags &^ BTHalfDead) | BTDeleted
-
-	req := storage.BtreeUnlinkPageRequest{
-		LeafBlk:          leaf.blk,
-		LeafFlagsAfter:   leafFlagsAfter,
-		HasLeftSib:       pins.leftBlk != storage.InvalidBlockNumber,
-		LeftSibBlk:       pins.leftBlk,
-		LeftSibNewNext:   pins.rightBlk,
-		HasRightSib:      pins.rightBlk != storage.InvalidBlockNumber,
-		RightSibBlk:      pins.rightBlk,
-		RightSibNewPrev:  pins.leftBlk,
-		HasParent:        hasParent,
-		ParentBlk:        parentBlk,
-		ParentRemoveSlot: parentSlot,
+	// ---- PHASE 1: xl_btree_mark_page_halfdead (M0130-S11.5d-3b-2) ----
+	//
+	// Upstream's `_bt_mark_page_halfdead`: retarget-and-delete the downlink in
+	// the subtree parent, and rewrite the leaf as a half-dead page whose only
+	// item is a dummy high key carrying the top parent of the deleted subtree.
+	// goopg deletes one page at a time, so the leaf IS the top parent and the
+	// link is InvalidBlockNumber — upstream writes exactly that in the same
+	// case.
+	//
+	// Both mutations are applied by the SAME functions the record's redo runs
+	// (ReplayMarkHalfDeadLeaf / ReplayParentRetargetByChild), which is the
+	// point: a primary that computed its own version of "what half-dead looks
+	// like" could drift from the standby that rebuilds the page from the
+	// record alone.
+	targetOp := readOpaque(pins.target.Page())
+	lsn1, err := halfDeadEmitter(bt.rel, storage.BtreeMarkPageHalfDeadRequest{
+		LeafBlk:   leaf.blk,
+		LeafPage:  pins.target.Page(),
+		ParentBlk: parentBlk,
+		POffset:   poffset,
+		TopParent: storage.InvalidBlockNumber,
+	})
+	if err != nil {
+		pins.release(bt)
+		return fmt.Errorf("btree: emit mark-halfdead record: %w", err)
 	}
-	lsn, err := emitter(bt.rel, req)
+	if err := ReplayMarkHalfDeadLeaf(pins.target.Page(), targetOp.Prev, targetOp.Next, storage.InvalidBlockNumber); err != nil {
+		pins.release(bt)
+		return fmt.Errorf("btree: mark block %d half-dead: %w", leaf.blk, err)
+	}
+	bt.pool.MarkDirtyWithLSNLocked(pins.target, lsn1)
+	// Upstream's RETARGET-and-delete, via the very same
+	// ReplayParentRetargetByChild the record's redo runs (S11.5d-3a); it
+	// locates the item by CHILD BLOCK identity rather than by `poffset`, so
+	// primary and redo cannot disagree about which item moved.
+	if err := ReplayParentRetargetByChild(pins.parent.Page(), leaf.blk); err != nil {
+		pins.release(bt)
+		return fmt.Errorf("btree: parent retarget on block %d for child %d: %w", parentBlk, leaf.blk, err)
+	}
+	bt.pool.MarkDirtyWithLSNLocked(pins.parent, lsn1)
+
+	// ---- PHASE 2: xl_btree_unlink_page (M0130-S11.5d-3b-2) ----
+	//
+	// The record's leftsib/rightsib/level are read off the TARGET IMAGE, and
+	// the image handed to the encoder is the post-mutation one, produced by
+	// the redo function itself. That indirection is not ceremony: goopg
+	// relinks the nearest LIVE siblings (a vacuum pass marks a whole adjacent
+	// run dead before unlinking any of it), so the target's own
+	// btpo_prev/btpo_next are NOT the blocks being relinked and an encoder
+	// reading the pre-mutation page would describe a different mutation from
+	// the one performed.
+	//
+	// safexid stays 0 until M0130-S11.5d-3c gives goopg a recycle horizon;
+	// recycleBlock below reuses the block immediately, which is the behaviour
+	// that value currently describes.
+	leftsib, rightsib := pgSibling(pins.leftBlk), pgSibling(pins.rightBlk)
+	const safexid = 0
+	targetAfter := make(storage.Page, storage.BlockSize)
+	copy(targetAfter, pins.target.Page())
+	if err := ReplayUnlinkTargetPage(targetAfter, leftsib, rightsib, targetOp.Level, safexid); err != nil {
+		pins.release(bt)
+		return fmt.Errorf("btree: unlink target image for block %d: %w", leaf.blk, err)
+	}
+	lsn, err := emitter(bt.rel, storage.BtreeUnlinkPageRequest{
+		TargetBlk:  leaf.blk,
+		TargetPage: targetAfter,
+		SafeXid:    safexid,
+		LeafBlk:    leaf.blk,
+		MetaBlk:    storage.InvalidBlockNumber,
+	})
 	if err != nil {
 		pins.release(bt)
 		return fmt.Errorf("btree: emit unlink record: %w", err)
@@ -626,35 +708,23 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// and recomputed. Do NOT reintroduce a post-emit re-derivation here —
 	// it would make the record advisory again.
 	if pins.left != nil {
-		op := readOpaque(pins.left.Page())
-		op.Next = pins.rightBlk
-		writeOpaque(pins.left.Page(), op)
+		if err := ReplayUnlinkLeftSibling(pins.left.Page(), rightsib); err != nil {
+			pins.release(bt)
+			return fmt.Errorf("btree: unlink left sibling %d: %w", pins.leftBlk, err)
+		}
 		bt.pool.MarkDirtyWithLSNLocked(pins.left, lsn)
 	}
 	if pins.right != nil {
-		op := readOpaque(pins.right.Page())
-		op.Prev = pins.leftBlk
-		writeOpaque(pins.right.Page(), op)
+		if err := ReplayUnlinkRightSibling(pins.right.Page(), leftsib); err != nil {
+			pins.release(bt)
+			return fmt.Errorf("btree: unlink right sibling %d: %w", pins.rightBlk, err)
+		}
 		bt.pool.MarkDirtyWithLSNLocked(pins.right, lsn)
 	}
-	if pins.parent != nil {
-		// Upstream's RETARGET-and-delete, via the very same
-		// ReplayParentRetargetByChild the record's redo runs (S11.5d-3a);
-		// it locates the item by CHILD BLOCK identity, so it stays correct
-		// even though req.ParentRemoveSlot is a plain advisory index that
-		// redo ignores (and that S11.5d-3b-2 removes with the record).
-		if err := ReplayParentRetargetByChild(pins.parent.Page(), leaf.blk); err != nil {
-			pins.release(bt)
-			return fmt.Errorf("btree: parent retarget on block %d for child %d: %w", req.ParentBlk, leaf.blk, err)
-		}
-		bt.pool.MarkDirtyWithLSNLocked(pins.parent, lsn)
-	}
-	{
-		op := readOpaque(pins.target.Page())
-		op.Flags = req.LeafFlagsAfter
-		writeOpaque(pins.target.Page(), op)
-		bt.pool.MarkDirtyWithLSNLocked(pins.target, lsn)
-	}
+	// The image the record already carries, byte for byte — not a second,
+	// independently computed rewrite of the same page.
+	copy(pins.target.Page(), targetAfter)
+	bt.pool.MarkDirtyWithLSNLocked(pins.target, lsn)
 	pins.release(bt)
 
 	// M0055-0005 Phase D: page recycling. The unlinked leaf is
@@ -671,8 +741,8 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// and raises "btree: empty internal page", independent of any
 	// race. Cascade the same unlink one level up for as long as
 	// removing a downlink keeps emptying the next ancestor.
-	if req.HasParent {
-		if err := bt.maybeCascadeEmptyInternal(req.ParentBlk, ancestorPath[:len(ancestorPath)-1]); err != nil {
+	if hasParent {
+		if err := bt.maybeCascadeEmptyInternal(parentBlk, ancestorPath[:len(ancestorPath)-1]); err != nil {
 			return err
 		}
 	}
@@ -1083,101 +1153,50 @@ func (bt *BTree) unlinkEmptyInternalPage(blk, prev, next, parentBlk storage.Bloc
 		return nil
 	}
 	emitter := bt.pool.LogBtreeUnlinkPage()
-	if emitter == nil {
-		// See unlinkEmptyLeaf: the FPI fallback keeps the pre-S11.5d-3b
-		// shape (whole page images, no control fields, re-derive under the
-		// write), including the unlatched refusal.
-		isRightmost, found, rerr := bt.parentDownlinkIsRightmostChild(parentBlk, blk)
-		if rerr != nil {
-			return rerr
-		}
-		if !found || isRightmost {
-			return nil
-		}
-		leftLive, lerr := bt.liveSibling(prev, false)
-		if lerr != nil {
-			return lerr
-		}
-		rightLive, rerr2 := bt.liveSibling(next, true)
-		if rerr2 != nil {
-			return rerr2
-		}
-		return bt.unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive)
-	}
-
-	// M0130-S11.5d-3b: the leaf path's protocol, one level up — latch
-	// parent → left → target → right, then compute/emit/write with nothing
-	// re-derived afterwards. (prev/next are only the caller's snapshot of
-	// this page's links; acquireUnlinkPins re-reads them under its own
-	// latch, which is why they are not passed down.)
-	pins, err := bt.acquireUnlinkPins(blk, parentBlk, true)
-	if err != nil {
-		if errors.Is(err, errUnlinkChainUnstable) {
-			// Leave the empty internal page linked, as the rightmost-child
-			// refusal does. It has no phase-1 marker to revert.
-			return nil
-		}
-		return err
-	}
-
-	// M0130-S11.5d-3a: the same refusal unlinkEmptyLeaf makes, one
-	// level up (see there, and ErrParentRightmostChild). Nothing has
-	// been mutated yet at this point, so giving up here simply leaves
-	// the empty internal page in the tree, which is what upstream does.
-	_, isRightmost, found, err := PGFindDownlinkOffset(pins.parent.Page(), blk)
-	if err != nil {
-		pins.release(bt)
-		return err
-	}
-	if !found || isRightmost {
-		pins.release(bt)
+	if emitter != nil {
+		// M0130-S11.5d-3b-2: a STANDALONE internal-page deletion has no
+		// PostgreSQL record shape. Upstream never deletes an internal page on
+		// its own — it deletes a leaf-rooted SUBTREE, and every
+		// xl_btree_unlink_page whose target is internal registers the
+		// subtree's half-dead leaf as block 3, which
+		// `btree_xlog_unlink_page` reads unconditionally (level > 0) and
+		// whose dummy high key supplies `leaftopparent`, the next page down.
+		// goopg has no such leaf here: this cascade starts at an internal
+		// page that reached zero items after a downlink removal, with no
+		// phase-1 marker of its own. Emitting the record with LeafBlk ==
+		// TargetBlk would omit block 3 and PANIC a standby in
+		// XLogReadBufferForRedoExtended.
+		//
+		// Refusing is not a behaviour regression, because S11.5d-3a made the
+		// case structurally unreachable: the parent mutation RETARGETS the
+		// downlink at its right neighbour's child and deletes the neighbour's
+		// item, and it refuses outright when the downlink is the parent's
+		// last item — so a downlink removal always leaves at least one item
+		// behind and can no longer take a page to zero. The cascade survives
+		// only as a defence for pages emptied some other way (a pre-S11.5d-3a
+		// index), and for those we leave the page linked rather than log a
+		// record no standby can replay.
 		return nil
 	}
-
-	req := storage.BtreeUnlinkPageRequest{
-		LeafBlk:          blk,
-		LeafFlagsAfter:   readOpaque(pins.target.Page()).Flags | BTDeleted,
-		HasLeftSib:       pins.leftBlk != storage.InvalidBlockNumber,
-		LeftSibBlk:       pins.leftBlk,
-		LeftSibNewNext:   pins.rightBlk,
-		HasRightSib:      pins.rightBlk != storage.InvalidBlockNumber,
-		RightSibBlk:      pins.rightBlk,
-		RightSibNewPrev:  pins.leftBlk,
-		HasParent:        true,
-		ParentBlk:        parentBlk,
-		ParentRemoveSlot: parentSlot,
+	// See unlinkEmptyLeaf: the FPI fallback keeps the pre-S11.5d-3b
+	// shape (whole page images, no control fields, re-derive under the
+	// write), including the unlatched refusal.
+	isRightmost, found, rerr := bt.parentDownlinkIsRightmostChild(parentBlk, blk)
+	if rerr != nil {
+		return rerr
 	}
-	lsn, err := emitter(bt.rel, req)
-	if err != nil {
-		pins.release(bt)
-		return fmt.Errorf("btree: emit internal-page unlink record: %w", err)
+	if !found || isRightmost {
+		return nil
 	}
-	if pins.left != nil {
-		op := readOpaque(pins.left.Page())
-		op.Next = pins.rightBlk
-		writeOpaque(pins.left.Page(), op)
-		bt.pool.MarkDirtyWithLSNLocked(pins.left, lsn)
+	leftLive, lerr := bt.liveSibling(prev, false)
+	if lerr != nil {
+		return lerr
 	}
-	if pins.right != nil {
-		op := readOpaque(pins.right.Page())
-		op.Prev = pins.leftBlk
-		writeOpaque(pins.right.Page(), op)
-		bt.pool.MarkDirtyWithLSNLocked(pins.right, lsn)
+	rightLive, rerr2 := bt.liveSibling(next, true)
+	if rerr2 != nil {
+		return rerr2
 	}
-	if err := ReplayParentRetargetByChild(pins.parent.Page(), blk); err != nil {
-		pins.release(bt)
-		return fmt.Errorf("btree: parent retarget on block %d for child %d: %w", parentBlk, blk, err)
-	}
-	bt.pool.MarkDirtyWithLSNLocked(pins.parent, lsn)
-	{
-		op := readOpaque(pins.target.Page())
-		op.Flags = req.LeafFlagsAfter
-		writeOpaque(pins.target.Page(), op)
-		bt.pool.MarkDirtyWithLSNLocked(pins.target, lsn)
-	}
-	pins.release(bt)
-	bt.recycleBlock(blk)
-	return nil
+	return bt.unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive)
 }
 
 // unlinkEmptyInternalPageFPI is the legacy per-page FPI fallback for

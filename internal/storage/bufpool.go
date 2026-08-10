@@ -711,22 +711,38 @@ type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16
 // outright (the dedup-recovery rewrite is a consolidation, not a deletion).
 type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, prePage, page Page, deleted []uint16) (LSN, error)
 
-// BtreeUnlinkPageRequest collects the 4-page mutation control info.
+// BtreeUnlinkPageRequest is the PHASE 2 half of btree page deletion — upstream's
+// xl_btree_unlink_page (M0130-S11.5d-3b-2). It carries PAGES, not link fields:
+// the encoder reads leftsib/rightsib/level off the target image and
+// leafleftsib/leafrightsib/leaftopparent off the half-dead leaf's dummy high
+// key, so the record cannot describe a page differently from the page the
+// primary wrote (the discipline S11.5a established, and the reason the old
+// native record's advisory control fields — including ParentRemoveSlot — are
+// gone).
 type BtreeUnlinkPageRequest struct {
-	LeafBlk          BlockNumber
-	LeafFlagsAfter   uint16
-	HasLeftSib       bool
-	LeftSibBlk       BlockNumber
-	LeftSibNewNext   BlockNumber
-	HasRightSib      bool
-	RightSibBlk      BlockNumber
-	RightSibNewPrev  BlockNumber
-	HasParent        bool
-	ParentBlk        BlockNumber
-	ParentRemoveSlot uint16
+	// TargetBlk / TargetPage are the page being unlinked. TargetPage is the
+	// POST-mutation image: goopg relinks the nearest LIVE siblings rather than
+	// the target's own btpo_prev/btpo_next (a vacuum pass marks a whole
+	// adjacent run dead before unlinking any of it), so the pre-mutation links
+	// on the page are not the blocks this record relinks.
+	TargetBlk  BlockNumber
+	TargetPage Page
+	// SafeXid is the FullTransactionId BTPageSetDeleted stamps — the XID from
+	// which the block becomes recyclable. Still 0 until M0130-S11.5d-3c gives
+	// goopg a recycle horizon.
+	SafeXid uint64
+	// LeafBlk / LeafPage are the half-dead leaf at the bottom of the subtree.
+	// LeafBlk == TargetBlk (and LeafPage nil) for the single-page deletion
+	// goopg performs; a deeper subtree registers the leaf as block 3.
+	LeafBlk  BlockNumber
+	LeafPage Page
+	// MetaBlk / MetaPage select the _META variant; MetaBlk is
+	// InvalidBlockNumber when the metapage is untouched.
+	MetaBlk  BlockNumber
+	MetaPage Page
 }
 
-// LogBtreeUnlinkPageFunc emits the M0079-0003 atomic page-deletion redo record.
+// LogBtreeUnlinkPageFunc emits the phase-2 page-deletion redo record.
 type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
 
 // LogBtreeNewRootFunc emits the root-replacement record. A8: the record carries
@@ -739,8 +755,26 @@ type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (L
 // no children; the encoder rejects the inconsistent combinations.
 type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, leftChildBlk BlockNumber, metaBlk BlockNumber, metaPage Page) (LSN, error)
 
-// LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only half-dead transition record.
-type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)
+// BtreeMarkPageHalfDeadRequest is the PHASE 1 half of btree page deletion —
+// upstream's xl_btree_mark_page_halfdead (M0130-S11.5d-3b-2). Like its phase-2
+// twin it passes the leaf PAGE: the record's leftblk/rightblk are read off it,
+// never accepted from the caller.
+type BtreeMarkPageHalfDeadRequest struct {
+	LeafBlk  BlockNumber
+	LeafPage Page
+	// ParentBlk / POffset locate the downlink being retargeted-and-deleted.
+	// POffset is a PHYSICAL OffsetNumber, and is never 0: upstream registers
+	// the parent unconditionally and its redo reads it unconditionally.
+	ParentBlk BlockNumber
+	POffset   uint16
+	// TopParent is the root of the subtree being deleted, or
+	// InvalidBlockNumber when that is the leaf itself (goopg's only case so
+	// far — it deletes one page at a time).
+	TopParent BlockNumber
+}
+
+// LogBtreeMarkPageHalfDeadFunc emits the phase-1 half-dead transition record.
+type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, req BtreeMarkPageHalfDeadRequest) (LSN, error)
 
 // LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
 type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)

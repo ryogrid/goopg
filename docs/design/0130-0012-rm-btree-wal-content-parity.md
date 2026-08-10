@@ -726,6 +726,97 @@ deterministically), and afterwards every logged link and flag value must equal
 what is on the page. The second pins the cyclic-dead-run refusal, the one case
 that must fail fast rather than retry.
 
+## S11.5d-3b-2 — the two PG records replace the native one
+
+The mutation (S11.5d-3a) and the protocol (S11.5d-3b) were done; the *records*
+were not. `unlinkEmptyLeaf` still emitted ONE goopg-native
+`RecordKindBtreeUnlinkPage` covering the union of upstream's two phases, under
+an RM_BTREE/`XLOG_BTREE_UNLINK_PAGE` header. This slice emits upstream's pair
+instead — `EncodeBtreeMarkPageHalfDeadPG` then `EncodeBtreeUnlinkPagePG`, both
+inside the latch section S11.5d-3b established — and with it the last piece of
+the historical "documented reason to stay native"
+(`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage) is gone.
+
+### What the primary now writes
+
+Phase 1 (`_bt_mark_page_halfdead`): retarget-and-delete the downlink in the
+parent, and **rewrite the leaf as a half-dead page** — `_bt_pageinit`, links
+preserved, `BTP_HALF_DEAD|BTP_LEAF`, and one dummy high key whose downlink field
+carries the top parent of the subtree. goopg deletes one page at a time, so the
+leaf *is* the top parent and the link is `InvalidBlockNumber`, exactly what
+upstream writes in that case. That tuple is not decoration: it is what makes a
+half-dead page resumable, and writing it is the difference between goopg's old
+"set a flag bit" marking and upstream's.
+
+Phase 2 (`_bt_unlink_halfdead_page`): relink the siblings and **rewrite the
+target as an empty deleted page** — `BTP_DELETED|BTP_HAS_FULLXID`, contents a
+single `BTDeletedPageData`, `pd_lower`/`pd_upper` closed up so no item can ever
+be added.
+
+Every one of those mutations is applied by the very function the corresponding
+redo runs (`ReplayMarkHalfDeadLeaf`, `ReplayParentRetargetByChild`,
+`ReplayUnlinkTargetPage`, `ReplayUnlinkLeftSibling`, `ReplayUnlinkRightSibling`).
+The primary no longer has its own idea of what a half-dead or deleted page looks
+like — which matters more here than elsewhere, because both records are
+WILL_INIT with **no block data at all**: the standby rebuilds these pages from
+the 20- and 36-byte main data alone, so any field the primary computes
+differently is a silent divergence with nothing in the record to catch it.
+
+### The one indirection: the target image
+
+The phase-2 encoder reads `leftsib`/`rightsib`/`level` off the target page
+rather than accepting them from the caller (the S11.5a discipline: a record must
+not be able to describe a page differently from the page it logs). On the
+primary that needs one extra step, because goopg relinks the nearest **live**
+siblings — a vacuum pass marks a whole adjacent run of leaves dead before
+unlinking any of them, so the target's own `btpo_prev`/`btpo_next` are *not* the
+blocks being relinked. Feeding the pre-mutation page to the encoder would
+describe a different mutation from the one performed.
+
+So the emit site builds the **post-mutation image** first, with
+`ReplayUnlinkTargetPage` itself, hands that to the encoder, and then copies the
+same bytes onto the pinned page. The record and the page are the same object by
+construction rather than by agreement.
+
+### Three refusals, all of them upstream's
+
+The two records cannot express shapes upstream never produces, so the emit path
+refuses them rather than logging something no standby can replay. Each leaves
+the page empty-but-live, exactly as the S11.5d-3a rightmost-child refusal does:
+
+- **No parent downlink.** `_bt_mark_page_halfdead` exists to take a downlink out
+  of a subtree parent and its redo reads block 1 unconditionally; a page nothing
+  points at is not deletable through this protocol (and a root never is).
+- **A rightmost target.** `btree_xlog_unlink_page` reads block 2 (the right
+  sibling) unconditionally, so "no right sibling" has no representation at all —
+  consistent with upstream, which never deletes a rightmost page because that
+  would have to update the parent's high key.
+- **A standalone internal page.** `unlinkEmptyInternalPage`'s WAL path is now a
+  refusal outright. Upstream never deletes an internal page on its own: it
+  deletes a leaf-rooted *subtree*, and an `xl_btree_unlink_page` with an
+  internal target registers that subtree's half-dead leaf as block 3, which redo
+  reads (level > 0) and reads `leaftopparent` out of. goopg's cascade has no
+  such leaf. This costs nothing, because S11.5d-3a already made the case
+  structurally unreachable — the retarget mutation always leaves at least one
+  item on the parent, so a downlink removal can no longer take a page to zero.
+  The FPI fallback keeps the old cascade for a WAL-less pool.
+
+### Guards — S11.5d-3b-2
+
+`internal/wal/btree_pagedel_producer_test.go` is the new one, and it is the
+guard the encoders' own tests could not be: they hand-build their inputs, so
+they cannot catch a *real* vacuum handing an encoder something it rejects
+(poffset 0, a rightmost target, a topparent equal to the leaf). It runs an
+actual `VacuumIndexPages` through the actual encoders and decodes what came out
+— asserting that every deletion emits mark-halfdead immediately followed by
+unlink-page, with the block registrations upstream's redo reads unconditionally
+and no full-page images anywhere.
+
+`internal/access/btree/unlink_protocol_test.go` extends the S11.5d-3b latch
+guard over both records (the parent and leaf of phase 1 as well), pairs the two
+phases one-for-one, and now compares the whole target *opaque* against the image
+the record carried rather than a flags word.
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -742,17 +833,6 @@ that must fail fast rather than retry.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **Swapping in the two PG records (S11.5d-3b-2)** — the mutation (S11.5d-3a) and
-  the protocol (S11.5d-3b) are both done; the *records* are not.
-  `unlinkEmptyLeaf` / `unlinkEmptyInternalPage` still emit ONE native
-  `RecordKindBtreeUnlinkPage` covering the union of upstream's two phases. What
-  remains is emitting `EncodeBtreeMarkPageHalfDeadPG` +
-  `EncodeBtreeUnlinkPagePG` in their place — which also means writing the dummy
-  top-parent high key when a leaf is marked half-dead (S11.5d-1: a half-dead page
-  IS that tuple, and phase 2 reads `leaftopparent` out of it), and dropping the
-  advisory `ParentRemoveSlot` with the native record. This is the last piece of
-  the "documented reason to stay native"
-  (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`, A8-unlinkpage).
 - **The safexid horizon (S11.5d-3c)** — goopg has no `BTPageIsRecyclable`: it
   stamps `BTDeleted` and recycles the block immediately, with no XID horizon, so
   `BTDeletedPageData` has encode and replay coverage but no runtime producer.

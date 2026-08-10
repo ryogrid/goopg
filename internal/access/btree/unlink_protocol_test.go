@@ -38,29 +38,22 @@ func TestUnlinkRecordEmittedUnderWriteLatches(t *testing.T) {
 
 	var pool *storage.Pool
 	var emissions []storage.BtreeUnlinkPageRequest
+	var halfDead []storage.BtreeMarkPageHalfDeadRequest
 	var unlatched []storage.BlockNumber
 
 	vacCap := &captureLogBtreeVacuum{}
-	logUnlink := func(r storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
-		emissions = append(emissions, req)
-		// Every block the record names must be write-latched right now.
-		// Pinning is not latching, so this cannot deadlock: TryRLock
-		// fails exactly when someone (us, the caller up the stack) holds
-		// the exclusive content latch.
-		named := []storage.BlockNumber{req.LeafBlk}
-		if req.HasLeftSib {
-			named = append(named, req.LeftSibBlk)
-		}
-		if req.HasRightSib {
-			named = append(named, req.RightSibBlk)
-		}
-		if req.HasParent {
-			named = append(named, req.ParentBlk)
-		}
+	// latchCheck asserts that every block a record names is still exclusively
+	// latched at the moment the record is emitted. Pinning is not latching, so
+	// this cannot deadlock: TryRLock fails exactly when someone (us, the caller
+	// up the stack) holds the exclusive content latch.
+	latchCheck := func(r storage.RelFileNode, named ...storage.BlockNumber) error {
 		for _, blk := range named {
+			if blk == storage.InvalidBlockNumber {
+				continue
+			}
 			s, err := pool.Pin(storage.BufferTag{Rel: r, Block: blk})
 			if err != nil {
-				return 0, err
+				return err
 			}
 			if s.TryRLock() {
 				s.RUnlock()
@@ -68,12 +61,24 @@ func TestUnlinkRecordEmittedUnderWriteLatches(t *testing.T) {
 			}
 			pool.Unpin(s)
 		}
+		return nil
+	}
+	logUnlink := func(r storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
+		emissions = append(emissions, req)
+		op := ReadPGOpaque(req.TargetPage)
+		if err := latchCheck(r, req.TargetBlk, legacySibling(op.Prev), legacySibling(op.Next)); err != nil {
+			return 0, err
+		}
+		return storage.LSN(1234), nil
+	}
+	logHalfDead := func(r storage.RelFileNode, req storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
+		halfDead = append(halfDead, req)
+		if err := latchCheck(r, req.LeafBlk, req.ParentBlk); err != nil {
+			return 0, err
+		}
 		return storage.LSN(1234), nil
 	}
 	noopRoot := func(storage.RelFileNode, storage.BlockNumber, storage.Page, storage.BlockNumber, storage.BlockNumber, storage.Page) (storage.LSN, error) {
-		return storage.LSN(1234), nil
-	}
-	noopHalfDead := func(storage.RelFileNode, storage.BlockNumber, uint16) (storage.LSN, error) {
 		return storage.LSN(1234), nil
 	}
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
@@ -81,7 +86,7 @@ func TestUnlinkRecordEmittedUnderWriteLatches(t *testing.T) {
 		LogBtreeVacuum:           vacCap.emit,
 		LogBtreeUnlinkPage:       logUnlink,
 		LogBtreeNewRoot:          noopRoot,
-		LogBtreeMarkPageHalfDead: noopHalfDead,
+		LogBtreeMarkPageHalfDead: logHalfDead,
 	})
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
@@ -120,46 +125,71 @@ func TestUnlinkRecordEmittedUnderWriteLatches(t *testing.T) {
 			"the record's fields are advisory again (M0130-S11.5d-3b)", unlatched)
 	}
 
+	// Every unlink is preceded by its own phase-1 record: since S11.5d-3b-2 the
+	// deletion is upstream's PAIR (xl_btree_mark_page_halfdead then
+	// xl_btree_unlink_page), and a phase-2 record for a page nothing ever
+	// marked half-dead would describe a mutation the primary never made.
+	if len(halfDead) != len(emissions) {
+		t.Errorf("%d mark-halfdead records for %d unlink records — the two phases must pair up",
+			len(halfDead), len(emissions))
+	}
+	for i, req := range halfDead {
+		if req.POffset == 0 {
+			t.Errorf("halfdead[%d]: poffset 0 is not a valid OffsetNumber", i)
+		}
+		if req.ParentBlk == storage.InvalidBlockNumber {
+			t.Errorf("halfdead[%d]: no parent block; redo reads block 1 unconditionally", i)
+		}
+		if req.TopParent != storage.InvalidBlockNumber {
+			t.Errorf("halfdead[%d]: topparent=%d, want InvalidBlockNumber (goopg deletes one page at a time)",
+				i, req.TopParent)
+		}
+	}
+
 	// The record must describe the page state that was actually written. A
 	// later unlink in the same pass may legitimately rewrite a sibling link
 	// again, so each page is checked against the LAST emission naming it.
 	wantNext := map[storage.BlockNumber]storage.BlockNumber{}
 	wantPrev := map[storage.BlockNumber]storage.BlockNumber{}
-	wantFlags := map[storage.BlockNumber]uint16{}
+	wantTarget := map[storage.BlockNumber]PGBTPageOpaque{}
 	for _, req := range emissions {
-		if req.HasLeftSib {
-			wantNext[req.LeftSibBlk] = req.LeftSibNewNext
+		op := ReadPGOpaque(req.TargetPage)
+		if op.Next == PNone {
+			t.Errorf("unlink of block %d has no right sibling; upstream's redo reads block 2 unconditionally",
+				req.TargetBlk)
 		}
-		if req.HasRightSib {
-			wantPrev[req.RightSibBlk] = req.RightSibNewPrev
+		if left := legacySibling(op.Prev); left != storage.InvalidBlockNumber {
+			wantNext[left] = legacySibling(op.Next)
 		}
-		wantFlags[req.LeafBlk] = req.LeafFlagsAfter
+		wantPrev[legacySibling(op.Next)] = legacySibling(op.Prev)
+		wantTarget[req.TargetBlk] = op
 	}
-	readOp := func(blk storage.BlockNumber) BTPageOpaque {
+	readOp := func(blk storage.BlockNumber) PGBTPageOpaque {
 		t.Helper()
 		s, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			t.Fatalf("pin %d: %v", blk, err)
 		}
 		s.RLock()
-		op := readOpaque(s.Page())
+		op := ReadPGOpaque(s.Page())
 		s.RUnlock()
 		pool.Unpin(s)
 		return op
 	}
 	for blk, want := range wantNext {
-		if got := readOp(blk).Next; got != want {
+		if got := legacySibling(readOp(blk).Next); got != want {
 			t.Errorf("block %d btpo_next=%d but the last record naming it logged %d", blk, got, want)
 		}
 	}
 	for blk, want := range wantPrev {
-		if got := readOp(blk).Prev; got != want {
+		if got := legacySibling(readOp(blk).Prev); got != want {
 			t.Errorf("block %d btpo_prev=%d but the last record naming it logged %d", blk, got, want)
 		}
 	}
-	for blk, want := range wantFlags {
-		if got := readOp(blk).Flags; got != want {
-			t.Errorf("block %d flags=%#x but its unlink record logged %#x", blk, got, want)
+	for blk, want := range wantTarget {
+		got := readOp(blk)
+		if got != want {
+			t.Errorf("block %d opaque=%+v but its unlink record logged the image %+v", blk, got, want)
 		}
 	}
 }

@@ -178,7 +178,7 @@ func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
 		// We don't need to track new-root events for this test.
 		return storage.LSN(1234), nil
 	}
-	logMarkHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
+	logMarkHalfDead := func(rel storage.RelFileNode, req storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
 		return storage.LSN(1234), nil
 	}
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
@@ -195,7 +195,12 @@ func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
 
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 16405, Fork: storage.MainFork}
 
-	const n = 200
+	// Enough entries to force a multi-level tree. M0130-S11.5d-3b-2 refuses to
+	// delete a page with no parent downlink — upstream's phase-1 record exists
+	// to take that downlink out, and a root is not deletable — so the 200-entry
+	// single-leaf-root tree this test used to build now (correctly) unlinks
+	// nothing at all and reaches the same end state through resetToEmptyRoot.
+	const n = 5000
 	entries := make([]BulkEntry, n)
 	for i := 0; i < n; i++ {
 		entries[i] = BulkEntry{
@@ -222,16 +227,22 @@ func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
 		if e.rel != rel {
 			t.Errorf("emission[%d]: rel=%+v want %+v", i, e.rel, rel)
 		}
-		if e.req.LeafBlk == 0 {
-			t.Errorf("emission[%d]: LeafBlk=0 (metapage); unlink should never target the metapage", i)
+		if e.req.TargetBlk == 0 {
+			t.Errorf("emission[%d]: TargetBlk=0 (metapage); unlink should never target the metapage", i)
 		}
-		// The post-unlink leaf flags must keep BTDeleted set
-		// and clear BTHalfDead.
-		if e.req.LeafFlagsAfter&BTDeleted == 0 {
-			t.Errorf("emission[%d]: LeafFlagsAfter missing BTDeleted (got %#x)", i, e.req.LeafFlagsAfter)
+		// M0130-S11.5d-3b-2: the record no longer carries a flags word —
+		// it carries the target IMAGE, which redo reproduces byte for byte
+		// from the main data. That image must be the deleted page upstream
+		// writes: BTP_DELETED set, BTP_HALF_DEAD gone.
+		op := ReadPGOpaque(e.req.TargetPage)
+		if op.Flags&BTPDeleted == 0 {
+			t.Errorf("emission[%d]: target image missing BTP_DELETED (flags %#x)", i, op.Flags)
 		}
-		if e.req.LeafFlagsAfter&BTHalfDead != 0 {
-			t.Errorf("emission[%d]: LeafFlagsAfter still has BTHalfDead (got %#x)", i, e.req.LeafFlagsAfter)
+		if op.Flags&BTPHalfDead != 0 {
+			t.Errorf("emission[%d]: target image still half-dead (flags %#x)", i, op.Flags)
+		}
+		if _, ok := PGDeletedPageSafeXid(e.req.TargetPage); !ok {
+			t.Errorf("emission[%d]: target image is not a BTP_HAS_FULLXID deleted page", i)
 		}
 	}
 }

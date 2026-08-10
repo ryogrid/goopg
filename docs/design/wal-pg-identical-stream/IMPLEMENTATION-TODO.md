@@ -111,7 +111,11 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     items)`→`(rel, rootBlk, rootPage, metaBlk, metaPage)`; both emit sites now update the metapage in memory
     under `splitMu` BEFORE emit so its bytes ride the same record (retired `updateRootMetaWithLSN`). Metapage
     FPI is hole-safe (meta struct at [24:48] sits below pd_lower=48). No new replay.
-  - [ ] **A8-unlinkpage** — DELIBERATELY kept native/incremental (not a deferral of convenience): at emit the
+  - [x] **A8-unlinkpage** — DONE (M0130-S11.5d-3b-2, 2026-08-10): the emit site now holds the sibling latches
+    across compute → emit → write (S11.5d-3b), so nothing is re-derived after the record and the link fields are
+    authoritative; `unlinkEmptyLeaf` emits PG's real pair `xl_btree_mark_page_halfdead` + `xl_btree_unlink_page`
+    (incremental main data, no images) and the native `RecordKindBtreeUnlinkPage` producer is retired. Original
+    note kept for the record: DELIBERATELY kept native/incremental (not a deferral of convenience): at emit the
     sibling pages are unmutated and their btpo_prev/btpo_next are re-derived at apply under a fresh pin to
     survive a concurrent split on another connection's `*BTree` for the same rel (splitMu is per-instance). An
     emit-time FPI snapshot would be stale and stomp a racing relink. A PG-format flip must emit PG's real

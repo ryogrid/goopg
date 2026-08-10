@@ -548,23 +548,29 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
-	// M0079-0003 logical records covering the remaining FPI
-	// fallback paths in btree page deletion + root replacement.
+	// Btree page deletion, phase 2 of 2 (M0130-S11.5d-3b-2): emit PG's
+	// xl_btree_unlink_page — main data {leftsib, rightsib, level, safexid,
+	// leaf*}, block 0 the target (WILL_INIT, redo rewrites it as an empty
+	// deleted page), blocks 1/2 the siblings, block 3 the half-dead leaf of a
+	// multi-level subtree, block 4 the metapage on the _META variant. Replaces
+	// the goopg-native `RecordKindBtreeUnlinkPage`, which covered BOTH upstream
+	// phases in one record under an RM_BTREE/XLOG_BTREE_UNLINK_PAGE header — a
+	// standby reading it casts the main data to a struct it is not and then
+	// PANICs in XLogInitBufferForRedo on a block id that was never registered.
 	logBtreeUnlinkPage := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
-		payload := wal.EncodeBtreeUnlinkPage(wal.BtreeUnlinkPagePayload{
-			Rel:              rel,
-			LeafBlk:          req.LeafBlk,
-			LeafFlagsAfter:   req.LeafFlagsAfter,
-			HasLeftSib:       req.HasLeftSib,
-			LeftSibBlk:       req.LeftSibBlk,
-			LeftSibNewNext:   req.LeftSibNewNext,
-			HasRightSib:      req.HasRightSib,
-			RightSibBlk:      req.RightSibBlk,
-			RightSibNewPrev:  req.RightSibNewPrev,
-			HasParent:        req.HasParent,
-			ParentBlk:        req.ParentBlk,
-			ParentRemoveSlot: req.ParentRemoveSlot,
+		payload, err := wal.EncodeBtreeUnlinkPagePG(wal.BtreeUnlinkPagePGRequest{
+			Rel:        rel,
+			TargetBlk:  req.TargetBlk,
+			TargetPage: req.TargetPage,
+			SafeXid:    req.SafeXid,
+			LeafBlk:    req.LeafBlk,
+			LeafPage:   req.LeafPage,
+			MetaBlk:    req.MetaBlk,
+			MetaPage:   req.MetaPage,
 		})
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -587,12 +593,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return storage.LSN(end), nil
 	}
-	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
-		payload := wal.EncodeBtreeMarkPageHalfDead(wal.BtreeMarkHalfDeadPayload{
-			Rel:        rel,
-			LeafBlk:    leafBlk,
-			FlagsAfter: flagsAfter,
-		})
+	// Btree page deletion, phase 1 of 2 (M0130-S11.5d-3b-2): emit PG's
+	// xl_btree_mark_page_halfdead — main data {poffset, leafblk, leftblk,
+	// rightblk, topparent}, block 0 the leaf (WILL_INIT; redo rebuilds it as a
+	// half-dead page carrying the dummy top-parent high key), block 1 the
+	// parent whose downlink is retargeted-and-deleted. Replaces the native
+	// `RecordKindBtreeMarkPageHalfDead` (leafblk + a flags word, no registered
+	// blocks at all) — see EncodeBtreeMarkPageHalfDeadPG for why that record
+	// PANICs a standby rather than merely diverging.
+	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, req storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
+		payload, err := wal.EncodeBtreeMarkPageHalfDeadPG(rel, req.LeafBlk, req.LeafPage, req.ParentBlk, req.POffset, req.TopParent)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err

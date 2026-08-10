@@ -1743,18 +1743,43 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         record-equals-page for every logged link/flag; and the cyclic-dead-run
         refusal). Gates: btree/wal/storage/initdb/amcheck PASS; btree -race PASS;
         units PASS; pgbench smoke PASS (commit hook). 2 ledger rows.
-  - [ ] **S11.5d-3b-2 — swap in the two PG records**. The mutation (S11.5d-3a)
-        and the protocol (S11.5d-3b) are done; the records are not.
-        `unlinkEmptyLeaf` / `unlinkEmptyInternalPage` still emit ONE native
-        `RecordKindBtreeUnlinkPage` covering the union of upstream's two phases.
-        Emit `EncodeBtreeMarkPageHalfDeadPG` + `EncodeBtreeUnlinkPagePG` in its
-        place (the page images they need are the latched pages S11.5d-3b already
-        holds), write the dummy top-parent high key when marking a leaf half-dead
-        (S11.5d-1: a half-dead page IS that tuple, and phase 2 reads
-        `leaftopparent` out of it), and drop the advisory `ParentRemoveSlot` with
-        the native record. Last piece of the historical "documented reason to
-        stay native" (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md`
-        A8-unlinkpage).
+  - [x] **S11.5d-3b-2 — swap in the two PG records** (landed 2026-08-10).
+        `unlinkEmptyLeaf` now emits upstream's PAIR inside the S11.5d-3b latch
+        section — `EncodeBtreeMarkPageHalfDeadPG` then `EncodeBtreeUnlinkPagePG`
+        — retiring the native `RecordKindBtreeUnlinkPage` producer and with it
+        the last "documented reason to stay native"
+        (`wal-pg-identical-stream/IMPLEMENTATION-TODO.md` A8-unlinkpage). The
+        primary writes what redo writes, through the redo functions themselves:
+        phase 1 REBUILDS the leaf as a half-dead page carrying the dummy
+        top-parent high key (`ReplayMarkHalfDeadLeaf`; goopg deletes one page at
+        a time, so the link is InvalidBlockNumber) and retargets the parent
+        (`ReplayParentRetargetByChild`), phase 2 REBUILDS the target as an empty
+        `BTP_DELETED|BTP_HAS_FULLXID` page (`ReplayUnlinkTargetPage`) and
+        relinks the siblings (`ReplayUnlink{Left,Right}Sibling`). That sharing
+        matters more here than elsewhere: both records are WILL_INIT with NO
+        block data, so the standby rebuilds these pages from 20 and 36 bytes of
+        main data alone and any field the primary computed its own way would
+        diverge with nothing in the record to catch it. One indirection was
+        needed — the phase-2 encoder reads leftsib/rightsib/level off the target
+        PAGE, but goopg relinks the nearest LIVE siblings (a vacuum marks a whole
+        adjacent run dead before unlinking any of it), so the emit site builds
+        the POST-mutation image with `ReplayUnlinkTargetPage` first, encodes
+        from it, and copies those same bytes onto the pinned page. Three shapes
+        upstream never produces are refused instead of logged unreplayable (no
+        parent downlink; a rightmost target — redo reads block 2
+        unconditionally; a STANDALONE internal page — upstream only deletes
+        leaf-rooted subtrees, and S11.5d-3a had already made goopg's cascade
+        unreachable), each leaving the page empty-but-live. `ParentRemoveSlot`
+        is gone from the storage request. Guards:
+        `internal/wal/btree_pagedel_producer_test.go` (NEW — runs a real
+        VacuumIndexPages through the real encoders and decodes the output, the
+        one thing the encoders' hand-built unit tests cannot do) plus the
+        extended `unlink_protocol_test.go` (latch check over BOTH records,
+        phases paired one-for-one, whole target opaque compared against the
+        logged image). Gates: btree/wal/storage/initdb/amcheck/vacuum PASS;
+        btree -race PASS; units PASS; pgbench smoke PASS (commit hook). 2 ledger
+        rows (torn phase-1/phase-2 deletion is now possible and goopg cannot
+        resume it; no multi-level subtree deletion).
   - [ ] **S11.5d-3c — the safexid recycle horizon**. goopg has no
         `BTPageIsRecyclable`: it stamps `BTDeleted` and recycles the block with
         no XID horizon, so `BTDeletedPageData` has encode+replay coverage
