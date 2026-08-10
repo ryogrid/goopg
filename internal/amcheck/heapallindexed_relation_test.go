@@ -35,7 +35,7 @@ func makeLeafPage(t *testing.T, next storage.BlockNumber, entries ...le) storage
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	got, err := btree.PageLeafEntries(p)
+	got, err := blobIndexFormat.PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("makeLeafPage PageLeafEntries self-check: %v", err)
 	}

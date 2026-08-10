@@ -122,12 +122,12 @@ func TestLPDeadSkippedByPageReaders(t *testing.T) {
 	defer func() { slot.RUnlock(); bt.pool.Unpin(slot) }()
 	p := slot.Page()
 
-	if keys, err := PageItemKeys(p); err != nil {
+	if keys, err := (IndexFormat{}).PageItemKeys(p); err != nil {
 		t.Fatalf("PageItemKeys: %v", err)
 	} else if len(keys) != 2 {
 		t.Fatalf("PageItemKeys returned %d keys, want 2 (dead skipped)", len(keys))
 	}
-	if entries, err := PageLeafEntries(p); err != nil {
+	if entries, err := (IndexFormat{}).PageLeafEntries(p); err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	} else if len(entries) != 2 {
 		t.Fatalf("PageLeafEntries returned %d, want 2", len(entries))

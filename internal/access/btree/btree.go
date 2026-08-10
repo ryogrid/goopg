@@ -220,11 +220,11 @@ func (f indexFormat) pageHighKey(p storage.Page) (key []byte, ok bool, err error
 // PageItemKeys: the high key's on-page representation is a format detail that
 // has already moved once (opaque field -> P_HIKEY item) and a second decoder
 // would silently drift on the next move.
-// It reads the page in the BLOB format: an out-of-package caller has a page,
-// not an index identity, so it cannot resolve a key descriptor. Teaching
-// amcheck to ask the catalog for the format is 3b-2c-ii-B2 (ledger row).
-func PageHighKey(p storage.Page) (key []byte, ok bool, err error) {
-	return blobFormat.pageHighKey(p)
+// Since 3b-2c-ii-B2-b the caller says which format the page is in (the zero
+// IndexFormat is the blob format, which is what every index resolves to until
+// the writers flip); see IndexFormat in pgitemcodec.go.
+func (fm IndexFormat) PageHighKey(p storage.Page) (key []byte, ok bool, err error) {
+	return fm.f.pageHighKey(p)
 }
 
 // highKeyItem builds the P_HIKEY item that carries `key` as the page's
@@ -2118,7 +2118,7 @@ func (f indexFormat) pageItems(p storage.Page) ([]item, error) {
 // keys through the canonical on-disk reader here instead of re-implementing the
 // item layout — the same single-source-of-truth discipline as ParseMeta /
 // ParseOpaque (the inline 2-byte-length key layout is a v3->v4 drift hazard).
-func PageItemKeys(p storage.Page) ([][]byte, error) {
+func (fm IndexFormat) PageItemKeys(p storage.Page) ([][]byte, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
@@ -2143,7 +2143,7 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 			}
 			out = append(out, key)
 		} else {
-			it, perr := blobFormat.parse(raw)
+			it, perr := fm.f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageItemKeys: parseItem")
 				return nil, perr
@@ -2179,8 +2179,8 @@ type LeafEntry struct {
 // collapses a posting item to its one separator key for the item-order tier),
 // this expands posting items because heapallindexed fingerprints every heap TID
 // the index references.
-func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
-	items, err := PageLeafItems(p)
+func (fm IndexFormat) PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
+	items, err := fm.PageLeafItems(p)
 	if err != nil {
 		return nil, err
 	}
@@ -2215,7 +2215,7 @@ type LeafItem struct {
 // PageLeafEntries is a thin projection of this reader, so the two never drift
 // apart on the ItemIDDead skip or the posting-list expansion rule — the
 // sibling-paths-must-agree discipline that guards the on-disk item layout.
-func PageLeafItems(p storage.Page) ([]LeafItem, error) {
+func (fm IndexFormat) PageLeafItems(p storage.Page) ([]LeafItem, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
@@ -2242,7 +2242,7 @@ func PageLeafItems(p storage.Page) ([]LeafItem, error) {
 				out = append(out, LeafItem{Key: key, TID: tid, Slot: pgDataSlot(p, slot), PostingIndex: i})
 			}
 		} else {
-			it, perr := blobFormat.parse(raw)
+			it, perr := fm.f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageLeafItems: parseItem")
 				return nil, perr
@@ -2275,7 +2275,7 @@ type Downlink struct {
 // its child through the canonical on-disk reader here instead of re-deriving the
 // inline IndexTupleData item layout — the same single-source-of-truth
 // discipline that guards against the v3->v4 layout drift.
-func PageDownlinks(p storage.Page) ([]Downlink, error) {
+func (fm IndexFormat) PageDownlinks(p storage.Page) ([]Downlink, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
@@ -2292,7 +2292,7 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 		if err != nil {
 			return nil, err
 		}
-		it, perr := blobFormat.parse(raw)
+		it, perr := fm.f.parse(raw)
 		if perr != nil {
 			maybeDumpPageOnParseErr(p, "PageDownlinks: parseItem")
 			return nil, perr
@@ -3037,23 +3037,24 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 // Idempotency is the caller's responsibility: WAL recovery
 // compares page pd_lsn against the record's end-LSN before
 // invoking this. The function is "apply unconditionally".
-func ApplyInsertRecord(page storage.Page, raw []byte) error {
-	it, err := blobFormat.parse(raw)
+//
+// The format is the caller's to supply (3b-2c-ii-B2-b). internal/wal's redo
+// path passes the blob format because it genuinely cannot resolve anything
+// else: it holds a relfilenode and recovery has no catalog to turn that into a
+// key descriptor. That is B2-b-ii and has its own ledger row — and note the
+// flip makes the hard-wiring doubly wrong, not just imprecise: a
+// descriptor-ordered tree replayed under the blob format both PARSES the item
+// wrong (its key is the whole tuple, header included) and, ordering the
+// header-less bytes, inserts it at the wrong slot.
+func (fm IndexFormat) ApplyInsertRecord(page storage.Page, raw []byte) error {
+	it, err := fm.f.parse(raw)
 	if err != nil {
 		return err
 	}
-	if !blobFormat.pageHasSpaceFor(page, it) {
+	if !fm.f.pageHasSpaceFor(page, it) {
 		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", len(it.key))
 	}
-	// blobFormat is the pre-flip format — bytewise order over header-less key
-	// payloads — which is correct while every index has a nil descriptor.
-	// Replay has no BTree handle and therefore no route to one, so 3b-2c-ii-B2
-	// must carry the descriptor into the redo path (a per-relation lookup at
-	// recovery time) before any index can be opened with one. Recorded as a
-	// deferral, and note the flip makes it doubly wrong: a descriptor-ordered
-	// tree replayed this way both PARSES the item wrong (its key is the whole
-	// tuple, header included) and inserts it at the wrong slot.
-	mustInsertItemSorted(blobFormat, page, it)
+	mustInsertItemSorted(fm.f, page, it)
 	return nil
 }
 

@@ -341,7 +341,7 @@ func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockN
 	if op.Flags != flags || op.Level != level || op.Next != next {
 		t.Fatalf("makeItemsPage opaque self-check: got %+v, want flags=%#x level=%d next=%d", op, flags, level, next)
 	}
-	got, err := btree.PageItemKeys(p)
+	got, err := blobIndexFormat.PageItemKeys(p)
 	if err != nil {
 		t.Fatalf("makeItemsPage PageItemKeys self-check: %v", err)
 	}
@@ -688,7 +688,7 @@ func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, down
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	got, err := btree.PageDownlinks(p)
+	got, err := blobIndexFormat.PageDownlinks(p)
 	if err != nil {
 		t.Fatalf("makeInternalPage PageDownlinks self-check: %v", err)
 	}

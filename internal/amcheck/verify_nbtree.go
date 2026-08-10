@@ -59,6 +59,21 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// blobIndexFormat is the on-page key format every amcheck tier decodes pages
+// with. It is btree's blob format — goopg's opaque order-preserving key
+// payloads — which is correct for every index today (M0130-S11.4's writers
+// have not flipped; internal/executor's pgIndexTupleKeys is false).
+//
+// It is named once, here, because it is a CLAIM the tiers cannot yet check:
+// the format is a per-index catalog property (btree.IndexFormatFor), and the
+// tiers take an indexName, not an index. Threading the format down from
+// internal/executor's bt_index_check — which does hold the catalog entry, and
+// already resolves the sibling per-index property (the opclass KeyComparator)
+// exactly that way — is slice 3b-2c-ii-B2-b-iii, and has a ledger row. Until
+// then a descriptor-ordered index would be verified under the wrong decoder,
+// which is why the flip (B2-c) cannot land before that threading does.
+var blobIndexFormat = btree.IndexFormat{}
+
 // BtreeReport is one B-tree index corruption finding. Block is the 0-based
 // block number the corruption was found on; Msg is the upstream-matching
 // corruption message (verbatim from verify_nbtree.c, including the
@@ -243,7 +258,7 @@ func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexNam
 		return nil
 	}
 
-	keys, err := btree.PageItemKeys(p)
+	keys, err := blobIndexFormat.PageItemKeys(p)
 	if err != nil {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
@@ -254,7 +269,7 @@ func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexNam
 	// item from above. This mirrors the engine's keyExceedsHighKey gating
 	// (rightmost pages have no high key to honour). PageItemKeys returns DATA
 	// item keys only, so the separator is never compared against itself.
-	highKey, checkHighKey, hkErr := btree.PageHighKey(p)
+	highKey, checkHighKey, hkErr := blobIndexFormat.PageHighKey(p)
 	if hkErr != nil {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, hkErr)}}
@@ -463,7 +478,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		return nil
 	}
 
-	downlinks, err := btree.PageDownlinks(parent)
+	downlinks, err := blobIndexFormat.PageDownlinks(parent)
 	if err != nil {
 		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
@@ -493,7 +508,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		// Down-link lower bound: every real child key must be >= the parent's
 		// separator key for this child. Skip the child's negative-infinity item
 		// (the first item of an internal child, stored with the empty key).
-		keys, err := btree.PageItemKeys(child)
+		keys, err := blobIndexFormat.PageItemKeys(child)
 		if err != nil {
 			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}

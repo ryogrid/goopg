@@ -263,7 +263,7 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 	// A8: the record now carries the post-vacuum page as a full-page image
 	// (what crash-replay restores verbatim). It must exclude the dead key.
 	deadKey := wide(2)
-	keys, err := PageItemKeys(lastPage)
+	keys, err := (IndexFormat{}).PageItemKeys(lastPage)
 	if err != nil {
 		t.Fatalf("post-vacuum page keys unreadable (format drift): %v", err)
 	}

@@ -190,11 +190,11 @@ func TestVerifyBtreeUnique_EdgeCases(t *testing.T) {
 // each entry's slot — the coordinates the duplicate detail prints.
 func TestPageLeafItemsMatchesLeafEntries(t *testing.T) {
 	p := makeLeafPage(t, none, le{k(1), 10, 1}, le{k(2), 10, 2}, le{k(3), 11, 5})
-	items, err := btree.PageLeafItems(p)
+	items, err := blobIndexFormat.PageLeafItems(p)
 	if err != nil {
 		t.Fatalf("PageLeafItems: %v", err)
 	}
-	entries, err := btree.PageLeafEntries(p)
+	entries, err := blobIndexFormat.PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	}

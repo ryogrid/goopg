@@ -128,7 +128,7 @@ func VerifyBtreeUnique(src PageSource, indexName string, cmpKeys KeyComparator, 
 			current = opaque.Next
 			continue
 		}
-		items, err := btree.PageLeafItems(p)
+		items, err := blobIndexFormat.PageLeafItems(p)
 		if err != nil {
 			return nil, fmt.Errorf("amcheck: decoding leaf block %d: %w", current, err)
 		}

@@ -121,7 +121,7 @@ func leftmostByLevel(t *testing.T, src amcheck.PageSource, root storage.BlockNum
 		if op.IsLeaf() {
 			return out
 		}
-		dls, err := btree.PageDownlinks(p)
+		dls, err := (btree.IndexFormat{}).PageDownlinks(p)
 		if err != nil {
 			t.Fatalf("PageDownlinks(blk %d): %v", blk, err)
 		}
@@ -1180,7 +1180,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				// `present` map lookup itself is the bug, not the tree).
 				if p, perr := src(last.Block); perr == nil {
 					op := btree.ParseOpaque(p)
-					entries, eerr := btree.PageLeafEntries(p)
+					entries, eerr := (btree.IndexFormat{}).PageLeafEntries(p)
 					var sameKey []btree.LeafEntry
 					if eerr == nil {
 						for _, le := range entries {

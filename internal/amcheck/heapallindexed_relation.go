@@ -93,7 +93,7 @@ func CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error) {
 		// A fully deleted page is unlinked and holds no live items; skip it
 		// rather than decoding type-punned fields.
 		if !opaque.IsDeleted() {
-			leafEntries, err := btree.PageLeafEntries(p)
+			leafEntries, err := blobIndexFormat.PageLeafEntries(p)
 			if err != nil {
 				return nil, fmt.Errorf("amcheck: decoding leaf block %d: %w", current, err)
 			}
@@ -129,7 +129,7 @@ func leftmostLeafBlock(src PageSource, root storage.BlockNumber) (storage.BlockN
 		if opaque.IsLeaf() {
 			return current, nil
 		}
-		downlinks, err := btree.PageDownlinks(p)
+		downlinks, err := blobIndexFormat.PageDownlinks(p)
 		if err != nil {
 			return 0, fmt.Errorf("amcheck: decoding internal block %d during leftmost descent: %w", current, err)
 		}

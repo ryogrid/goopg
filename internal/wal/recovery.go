@@ -2885,6 +2885,21 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	return mgr.WriteBlock(block.Rel, oldBlock.Block, oldPage)
 }
 
+// redoBlobIndexFormat is the on-page key format the B-tree redo paths decode
+// and re-insert with. It is btree's blob format — goopg's opaque
+// order-preserving key payloads — which is correct for every index today
+// (M0130-S11.4's writers have not flipped).
+//
+// Since slice 3b-2c-ii-B2-b the btree redo entry points take the format as an
+// argument, and this is the site that cannot yet answer honestly: redo holds a
+// relfilenode, and recovery has no catalog to turn one into a key descriptor
+// (the catalog it would read is itself being replayed). Resolving it —
+// upstream sidesteps the question entirely because nbtree redo re-inserts at
+// the RECORDED offset, never by key — is slice 3b-2c-ii-B2-b-ii and has a
+// ledger row; the flip cannot land before it, since a descriptor-ordered tree
+// replayed here would both misparse the item and file it at the wrong slot.
+var redoBlobIndexFormat = btree.IndexFormat{}
+
 // replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the
 // IndexTuple carried in block 0's data into the leaf page. Mirrors the native
 // replayBtreeInsert (btree.ApplyInsertRecord re-inserts by key), so goopg↔goopg
@@ -2914,7 +2929,7 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
 		return nil // already applied
 	}
-	if err := btree.ApplyInsertRecord(page, block.Data); err != nil {
+	if err := redoBlobIndexFormat.ApplyInsertRecord(page, block.Data); err != nil {
 		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
@@ -3407,7 +3422,7 @@ func replayBtreeUnlinkPage(mgr *storage.Manager, r Record) error {
 	}
 	if p.HasParent {
 		if err := apply(p.ParentBlk, func(page storage.Page) error {
-			return btree.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
+			return redoBlobIndexFormat.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
 		}); err != nil {
 			return fmt.Errorf("wal: btree-unlink parent: %w", err)
 		}
@@ -3593,7 +3608,7 @@ func replayBtreeInsert(mgr *storage.Manager, r Record) error {
 	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
 		return nil // already applied
 	}
-	if err := btree.ApplyInsertRecord(page, item); err != nil {
+	if err := redoBlobIndexFormat.ApplyInsertRecord(page, item); err != nil {
 		return fmt.Errorf("wal: btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))

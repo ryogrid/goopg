@@ -104,7 +104,7 @@ func leafTIDs(t *testing.T, src amcheck.PageSource, blk storage.BlockNumber) []s
 	if err != nil {
 		t.Fatalf("read leaf %d: %v", blk, err)
 	}
-	entries, err := btree.PageLeafEntries(p)
+	entries, err := (btree.IndexFormat{}).PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("PageLeafEntries(%d): %v", blk, err)
 	}

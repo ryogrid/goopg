@@ -367,7 +367,7 @@ func TestPageItemKeys(t *testing.T) {
 		t.Fatalf("add posting: %v", err)
 	}
 
-	keys, err := PageItemKeys(p)
+	keys, err := (IndexFormat{}).PageItemKeys(p)
 	if err != nil {
 		t.Fatalf("PageItemKeys: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestPageLeafEntries(t *testing.T) {
 		t.Fatalf("add posting: %v", err)
 	}
 
-	entries, err := PageLeafEntries(p)
+	entries, err := (IndexFormat{}).PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	}

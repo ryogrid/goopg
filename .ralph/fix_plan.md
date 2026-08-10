@@ -1060,14 +1060,37 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               a 37-byte varlena. Both are HEAP-side divergences (a real PG 18.3
               already misreads those columns), so `buildPGIndexKeyDesc` refuses
               them (`pgIndexKeyImageIsPGFaithful`) and they keep the blob path.
-        - [ ] **3b-2c-ii-B2-b — the format-resolution sites**. No on-disk
-              change: teach the `blobFormat` sites — amcheck's four exported
-              page readers (`PageItemKeys`/`PageLeafItems`/`PageDownlinks`/
-              `PageHighKey`) and the two redo entry points (`ApplyInsertRecord`,
-              `ReplayRemoveParentDownlink`, called from
-              `internal/wal/recovery.go:2917`/`:3596`/`:3410`) — to resolve a
-              per-index format instead of assuming blob. Behaviour-preserving
-              while every index still resolves to blob.
+        - [x] **3b-2c-ii-B2-b — the format-resolution sites** (2026-08-10). NO
+              on-disk change, no REINDEX. All six `blobFormat` sites — the four
+              exported page readers (`PageItemKeys`/`PageLeafItems`+
+              `PageLeafEntries`/`PageDownlinks`/`PageHighKey`) and the two redo
+              entry points (`ApplyInsertRecord`, `ReplayRemoveParentDownlink`)
+              — are now methods on the exported `btree.IndexFormat`, so the
+              format is an ARGUMENT the caller supplies. `IndexFormatFor(desc)`
+              from a catalog descriptor, `(*BTree).Format()` from a live tree,
+              zero value = blob (same nil-means-blob convention as
+              `Options.KeyDesc`). `bt_index_check` resolves it for real from
+              `ctx.pgIndexKeyDesc(idx)` and threads it through `btIndexVerify`
+              → `btIndexLeftmostByLevel`. Guard: `pgpagereaders_test.go` pins
+              both decoders on the same bytes. Two callers still cannot
+              resolve, each named once (below).
+        - [ ] **3b-2c-ii-B2-b-ii — the redo path's descriptor**. Blocker for
+              B2-c. `internal/wal/recovery.go:redoBlobIndexFormat` is the single
+              site; recovery has a `RelFileNode` and no catalog. Either register
+              a per-relation descriptor hook (executor → wal; it cannot be an
+              import) or — preferred, and S11.5's direction anyway — make
+              goopg's btree redo offset-based like upstream's
+              `btree_xlog_insert` (`PageAddItem` at `xlrec->offnum`), which
+              removes the need for a comparator in redo at all.
+        - [ ] **3b-2c-ii-B2-b-iii — amcheck takes the format**. Blocker for
+              B2-c. Thread `btree.IndexFormat` from
+              `operators_bt_index_check.go:evalBtIndexCheck` (it already has
+              `keyFmt`) through the five `internal/amcheck` tier signatures —
+              exactly as `cmpKeys amcheck.KeyComparator` is threaded today —
+              and delete `amcheck.blobIndexFormat`. Mechanical; ~100 test call
+              sites update with it. Without it a flipped index is verified with
+              the blob decoder, i.e. every amcheck tier reads the tuple header
+              as key payload.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same

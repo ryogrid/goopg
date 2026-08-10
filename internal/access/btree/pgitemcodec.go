@@ -41,13 +41,13 @@ import (
 // branches here are therefore written and TESTED (pgitemcodec_test.go) ahead
 // of the writers that will produce their input.
 //
-// NOT converted, deliberately (ledger row, M0130-S11.4): the package's
-// exported page readers (PageItemKeys / PageLeafItems / PageDownlinks /
-// PageHighKey) and the two WAL redo entry points (ApplyInsertRecord,
-// ReplayRemoveParentDownlink) have no index identity to resolve a descriptor
-// from, so they name `blobFormat` explicitly. Their callers — internal/amcheck
-// and internal/wal/recovery.go — are exactly the two places 3b-2c-ii-B2 has to
-// teach that a tree's key format is a per-index catalog property.
+// NOT converted in B1, deliberately: the package's exported page readers
+// (PageItemKeys / PageLeafItems / PageDownlinks / PageHighKey) and the two WAL
+// redo entry points (ApplyInsertRecord, ReplayRemoveParentDownlink) had no
+// index identity to resolve a descriptor from, so they named `blobFormat`
+// explicitly. B2-b (below) turns the format into a parameter of all six; the
+// remaining question — can the caller answer it? — is now asked by the
+// compiler at each of them.
 //
 // See docs/design/0130-0011-nbtree-pg-on-disk-format.md.
 // ---------------------------------------------------------------------------
@@ -57,6 +57,59 @@ import (
 // cannot resolve an index descriptor so that "this site assumes the blob
 // format" is greppable rather than implied by an omitted argument.
 var blobFormat = indexFormat{}
+
+// ---------------------------------------------------------------------------
+// M0130-S11.4 slice 3b-2c-ii-B2-b — the format becomes an ARGUMENT of the
+// out-of-package page readers.
+//
+// B1 left six sites naming `blobFormat` because they read a page without
+// holding a BTree: the four exported page readers (amcheck's decoders) and the
+// two WAL redo entry points. Hard-wiring there is not a missing plumbing
+// detail, it is a wrong claim — "every tree on this cluster is blob-formatted"
+// — that the flip turns into silent misparsing, because a descriptor-ordered
+// tuple's key IS the tuple (header included) and a blob parse strips exactly
+// the bytes the comparison needs.
+//
+// So the readers move onto IndexFormat: the caller must now say which format
+// the page it is handing over is in. Today every caller resolves to the blob
+// format (the zero value), so nothing on disk or in behaviour moves — but
+// "who still cannot resolve a descriptor?" is now a compile-time question
+// about a parameter rather than a grep for an identifier.
+//
+// The two redo entry points keep taking the format the same way, but the WAL
+// side genuinely cannot resolve one yet: recovery has a relfilenode and no
+// catalog. That is B2-b-ii and has its own ledger row; see ApplyInsertRecord.
+// ---------------------------------------------------------------------------
+
+// IndexFormat is one index's on-page key format, as seen from OUTSIDE the
+// package: what an item's key bytes mean, and therefore how a page's items
+// decode. It is the exported face of indexFormat — out-of-package callers get
+// the readers and the redo entry points, not the ordering and layout internals
+// the tree itself uses.
+//
+// The zero value is the blob format (goopg's opaque order-preserving key
+// payloads, bytewise order), which is what every index resolves to until
+// 3b-2c-ii-B2-c flips the writers. Callers that hold an index's catalog entry
+// should build one with IndexFormatFor; callers that hold a live tree should
+// ask it with (*BTree).Format so the reader can never disagree with the tree
+// that wrote the page.
+type IndexFormat struct{ f indexFormat }
+
+// IndexFormatFor returns the format of an index whose key descriptor is
+// `desc`. A nil descriptor is the blob format, matching (*BTree).KeyDesc and
+// Options.KeyDesc: one nil-means-blob convention across the whole seam.
+func IndexFormatFor(desc *PGIndexKeyDesc) IndexFormat {
+	return IndexFormat{f: indexFormat{desc: desc}}
+}
+
+// Format returns the format this tree reads and writes its pages in, so an
+// out-of-package reader of one of its pages decodes it the same way the tree
+// does.
+func (bt *BTree) Format() IndexFormat { return IndexFormat{f: bt.keyFmt} }
+
+// KeyDesc reports the key descriptor this format decodes by, or nil for the
+// blob format.
+func (fm IndexFormat) KeyDesc() *PGIndexKeyDesc { return fm.f.desc }
 
 // tupleKeys reports whether `item.key` is a whole nbtree tuple rather than a
 // bare key payload. It is exactly "this index has a key descriptor": the

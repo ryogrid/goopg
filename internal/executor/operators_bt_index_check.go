@@ -137,7 +137,13 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 	}
 
 	cmpKeys := btIndexOpClassComparator(idx, im, ctx, x.Pos())
-	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys)
+	// The index's on-page key format is a per-index catalog property, resolved
+	// from the same catalog entry as the opclass comparator above (M0130-S11.4
+	// slice 3b-2c-ii-B2-b). It is nil-descriptor / blob for every index today,
+	// but this is where the answer comes from once the writers flip, so the
+	// engine's readers are never handed a format they had to assume.
+	keyFmt := btree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
+	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys, keyFmt)
 	if err == nil && len(reports) == 0 {
 		// checkunique runs only on a structurally sound index: upstream reaches
 		// bt_entry_unique_check from inside bt_target_page_check, which never
@@ -163,7 +169,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 // returns every finding (so the SQL surface can report the count, mirroring how
 // the standalone realtree test exercises the same tiers). It returns a Go error
 // only for a genuine page-read failure, never for a corruption finding.
-func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator) ([]amcheck.BtreeReport, error) {
+func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat) ([]amcheck.BtreeReport, error) {
 	var reports []amcheck.BtreeReport
 
 	// Per-page tiers over every block, including the metapage (block 0).
@@ -189,7 +195,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 		return nil, err
 	}
 	if meta := btree.ParseMeta(metaPage); meta.Root != 0 {
-		for _, lm := range btIndexLeftmostByLevel(src, meta.Root) {
+		for _, lm := range btIndexLeftmostByLevel(src, meta.Root, keyFmt) {
 			reports = append(reports, amcheck.VerifyBtreeLevelSiblingLinks(src, lm, name)...)
 		}
 	}
@@ -456,7 +462,7 @@ func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd
 // read/decode error or an empty internal page stops the descent gracefully (the
 // per-page tier already flagged the structural fault); a visited-set guards
 // against a downlink cycle so a corrupt tree cannot loop forever.
-func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber) []storage.BlockNumber {
+func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, keyFmt btree.IndexFormat) []storage.BlockNumber {
 	var out []storage.BlockNumber
 	seen := make(map[storage.BlockNumber]bool)
 	for blk := root; ; {
@@ -473,7 +479,7 @@ func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber) []
 		if op.IsLeaf() {
 			return out
 		}
-		dls, err := btree.PageDownlinks(p)
+		dls, err := keyFmt.PageDownlinks(p)
 		if err != nil || len(dls) == 0 {
 			return out
 		}

@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b/3b-2c-ii-B2-c/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-b-ii/-iii, 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -581,11 +581,38 @@ sources agree:
             goopg `numeric`/`uuid` column — so `buildPGIndexKeyDesc` now refuses
             those two types (`pgIndexKeyImageIsPGFaithful`) and they keep the
             blob key path; fixing the image belongs to `encodeValuePG`.
-          - **3b-2c-ii-B2-b — the format-resolution sites (open). No on-disk
-            change.** Teach the `blobFormat` sites — amcheck's four exported
-            page readers and the two redo entry points — to resolve a per-index
-            format, which is behaviour-preserving while every index still
-            resolves to blob.
+          - **3b-2c-ii-B2-b — the format-resolution sites (landed 2026-08-10).
+            No on-disk change, no REINDEX.** The six sites B1 left naming
+            `blobFormat` — the four exported page readers (`PageItemKeys`,
+            `PageLeafItems`/`PageLeafEntries`, `PageDownlinks`, `PageHighKey`)
+            and the two redo entry points (`ApplyInsertRecord`,
+            `ReplayRemoveParentDownlink`) — move onto the exported
+            `btree.IndexFormat` (`pgitemcodec.go`), so the format is now an
+            ARGUMENT the caller supplies rather than an assumption the reader
+            makes. `IndexFormatFor(desc)` builds one from a catalog descriptor
+            and `(*BTree).Format()` from a live tree, keeping the one
+            nil-means-blob convention already used by `Options.KeyDesc` and
+            `(*BTree).KeyDesc`. The zero value is the blob format, so every
+            caller resolves to blob today and neither the bytes nor the
+            behaviour move; what changes is that "which sites still cannot
+            resolve a descriptor?" became a compile-time question about a
+            parameter. `internal/executor`'s `bt_index_check` resolves the
+            format for real — from `Context.pgIndexKeyDesc(idx)`, the same
+            catalog entry it already resolves the sibling per-index property
+            (the opclass `KeyComparator`) from — and threads it through
+            `btIndexVerify` → `btIndexLeftmostByLevel`.
+            Two callers still cannot answer, and each now says so in exactly
+            one named place with its own ledger row:
+            `internal/amcheck`'s `blobIndexFormat` (its tiers take an
+            `indexName`, not an index; threading the executor's resolved format
+            down through them is **B2-b-iii**) and `internal/wal`'s
+            `redoBlobIndexFormat` (recovery holds a relfilenode and has no
+            catalog to resolve — upstream sidesteps this because nbtree redo
+            re-inserts at the RECORDED offset, never by key; **B2-b-ii**).
+            Both must land before B2-c: under the flip a wrongly-blob decode
+            does not merely lose precision, it strips the header the comparison
+            and amcheck read, so the tree would be verified with the wrong
+            decoder and replayed into the wrong slot.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
