@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b landed 2026-08-10; S11.4 slices 3b-2c/3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i landed 2026-08-10; S11.4 slices 3b-2c-ii/3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -432,7 +432,7 @@ sources agree:
         column would take the text comparator while goopg orders enums by sort
         order). Guards: `pgindex_keydesc_test.go`.
       - **3b-2c — flip the writer and route every comparison through the
-        descriptor (open). REINDEX-required.** The writer flip
+        descriptor. REINDEX-required.** The writer flip
         (`encodeCompositeBTreeKey`, `encodeIndexKeyFromCols`,
         `encodeArbiterKey` → per-column datums through `FormPGIndexTuple`) was
         originally planned for 3b-2b; building the mapper made clear it cannot
@@ -447,7 +447,52 @@ sources agree:
         `ComparePGIndexTuples` needs whole tuples (it reads t_info's null
         bitmap and t_tid's natts/heap TID), so one `BTree`/bulk-builder
         comparison method over tuple-shaped operands has to exist before either
-        half can move. That is what finally retires `CompareKeys`.
+        half can move. That is what finally retires `CompareKeys`. Split in
+        two, because the seam is behaviour-preserving and the flip is not:
+
+        - **3b-2c-i — the seam (landed 2026-08-10). No on-disk change.**
+          `internal/access/btree/pgkeycmp.go`: `keyComparer`, one per-index
+          comparer holding an optional `*PGIndexKeyDesc`, plus
+          `Options.KeyDesc` / `BTree.cmp` / `(*BTree).keyCmp()` to carry it
+          from the catalog to every ordering decision. All ~20 in-package
+          `CompareKeys` call sites now route through
+          `keyComparer.compare` — the descent (`descendToLeaf`,
+          `findChildBlockDirect`), both high-key overshoot tests
+          (`keyExceedsHighKey`, `itemOvershootsHighKey`), the insert-slot
+          binary search (`insertItemSorted`), the rightmost-cache range check,
+          the split-path page rewrite (`appendSorted`, `dedupConsolidate`),
+          `Search`, `rangeScanPos`, and both bulk-load sorts plus
+          `deduplicateToRawItems`. The free helpers take the comparer as a
+          parameter rather than becoming methods, so a caller cannot silently
+          get the wrong index's order. `CompareKeys` survives only as the
+          seam's nil-descriptor branch and as the exported name amcheck and
+          `bt_index_check` use for goopg's default key order.
+
+          Two properties are load-bearing and guarded (`pgkeycmp_test.go`, 4
+          tests, 3 mutations caught). First, `compare` returns no error: it is
+          called from `sort.Search` predicates and the innermost descent loop,
+          the same constraint upstream places on `sk_func`, so an operand
+          `ComparePGIndexTuples` refuses (a posting-list tuple, whose heap-TID
+          tiebreak is ambiguous) falls back to the bytewise order — total and
+          deterministic, which is what makes a split terminate; the corruption
+          itself stays amcheck's business. Second, "key operand" is
+          deliberately the index's *own* key representation, not a fixed
+          layout: today the opaque blob, after 3b-2c-ii a whole index tuple,
+          on both the stored and the search-key side.
+
+          One gap the seam exposed and did not close: `ApplyInsertRecord` (WAL
+          redo) has no `BTree` handle and therefore no route to a descriptor,
+          so it passes the bytewise comparer explicitly. A descriptor-ordered
+          tree replayed bytewise would insert at the wrong slot, so 3b-2c-ii
+          must carry a per-relation descriptor lookup into the redo path.
+          Ledger row.
+        - **3b-2c-ii — the flip (open). REINDEX-required.**
+          `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
+          `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
+          `buildPGIndexKeyDesc` wired into `btree.Options.KeyDesc` at every
+          index-open site, and the redo-path descriptor lookup above — one
+          commit. Gates: `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate
+          (re-pin after a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

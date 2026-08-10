@@ -934,7 +934,9 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
             `pgindex_keydesc_test.go` (9). The writer flip moved to 3b-2c —
             see there.
       - [ ] **3b-2c — flip the writer AND route every comparison through the
-            descriptor** (one atomic change; REINDEX-required break). The
+            descriptor** (REINDEX-required break). Split into 3b-2c-i (the
+            seam, behaviour-preserving — **DONE 2026-08-10**) and 3b-2c-ii
+            (the flip, still open) — see the two sub-items below. The
             writer flip was planned for 3b-2b; building the mapper showed it
             cannot land there, because the sibling-path rule is symmetric — a
             descriptor-derived reader against a blob-writing writer reads
@@ -951,6 +953,38 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
             exist before either half moves. That is what finally retires
             `CompareKeys`. Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS
             SF0.5 gate (re-pin after a REINDEX).
+        - [x] **3b-2c-i — the seam** (2026-08-10). NO on-disk change, no
+              REINDEX. `internal/access/btree/pgkeycmp.go`: `keyComparer`
+              (one per-index comparer over an optional `*PGIndexKeyDesc`),
+              carried by `Options.KeyDesc` → `BTree.cmp` →
+              `(*BTree).keyCmp()`. All ~20 in-package `CompareKeys` sites now
+              route through it: descent (`descendToLeaf`,
+              `findChildBlockDirect`), both high-key overshoot tests, the
+              insert-slot binary search (`insertItemSorted`), the
+              rightmost-cache range check, the split-path page rewrite
+              (`appendSorted`/`dedupConsolidate`), `Search`, `rangeScanPos`,
+              and both bulk-load sorts + `deduplicateToRawItems`. The free
+              helpers take the comparer as a parameter, so no caller can
+              silently pick up the wrong index's order. `CompareKeys` survives
+              only as the seam's nil-descriptor branch and as amcheck's /
+              `bt_index_check`'s name for goopg's default order. `compare`
+              returns NO error by design (it runs inside `sort.Search`
+              predicates and the descent loop, upstream's `sk_func`
+              constraint): an operand `ComparePGIndexTuples` refuses — a
+              posting-list tuple, whose heap-TID tiebreak is ambiguous —
+              falls back to bytewise, keeping the order total and
+              deterministic so a split terminates. Guards:
+              `pgkeycmp_test.go` (4), 3 mutations caught. Deferred (1 ledger
+              row): `ApplyInsertRecord` (WAL redo) has no `BTree` handle and
+              so passes the bytewise comparer explicitly — 3b-2c-ii must
+              carry a per-relation descriptor lookup into the redo path.
+        - [ ] **3b-2c-ii — the flip** (REINDEX-required).
+              `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
+              `encodeArbiterKey` → `FormPGIndexTuple` over per-column datums,
+              `buildPGIndexKeyDesc` wired into `btree.Options.KeyDesc` at
+              every index-open site, and the redo-path descriptor lookup —
+              one commit. Gates: `scripts/tpch-spotcheck.sh` + the TPC-DS
+              SF0.5 gate (re-pin after a REINDEX).
     - [ ] **3b-3 — collect the deferrals**. The two MAXALIGNs, `_bt_keep_natts`
           suffix truncation, and `MaxHighKeyLen`/`bulkHighKeyReserve` →
           `BTMaxItemSize`.

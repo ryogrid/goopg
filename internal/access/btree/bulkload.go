@@ -36,7 +36,8 @@ func pageHasSpaceForBulk(p storage.Page, it item) bool {
 // BulkEntry is one (encoded-key, heap-pointer) pair for bulk index building.
 // The key must already be encoded with the same EncodeXxx functions that the
 // normal Insert path uses — BulkCreate treats keys as opaque byte slices and
-// compares them with CompareKeys (bytewise lexicographic order).
+// compares them with the tree's keyComparer (bytewise lexicographic order
+// while the index has no key descriptor — see pgkeycmp.go).
 type BulkEntry struct {
 	Key []byte
 	Ptr storage.ItemPointer
@@ -114,7 +115,7 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	for i, e := range entries {
 		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
-	sort.SliceStable(items, func(i, j int) bool { return CompareKeys(items[i].key, items[j].key) < 0 })
+	sort.SliceStable(items, func(i, j int) bool { return bt.keyCmp().compare(items[i].key, items[j].key) < 0 })
 
 	// Build without dedup: each entry becomes a regular item.
 	leafRaws := itemsToRawItems(items)
@@ -166,7 +167,7 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 
 // BulkCreateWithOptions is BulkCreate with explicit Options.
 func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, cmp: keyComparer{desc: opts.KeyDesc}}
 
 	// Ensure the relation file starts at block 0.  A previous failed
 	// bulk build or WAL replay (recovery after a crash that left WAL
@@ -239,13 +240,13 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 		items[i] = item{ptr: e.Ptr, key: append([]byte(nil), e.Key...)}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
-		return CompareKeys(items[i].key, items[j].key) < 0
+		return bt.keyCmp().compare(items[i].key, items[j].key) < 0
 	})
 
 	// Phase 1: build leaf level with deduplication (M0047-0003).
 	// Same-key entries are grouped into posting-list items so a key
 	// with N duplicates occupies one page slot instead of N.
-	leafRaws := deduplicateToRawItems(items)
+	leafRaws := deduplicateToRawItems(bt.keyCmp(), items)
 	leafLinks, err := bt.buildLevelRaw(leafRaws, BTLeaf, 0)
 	if err != nil {
 		metaSlot.Unlock()
@@ -509,12 +510,12 @@ const maxRawItemSize = 7800
 // preserved at the cost of slightly higher index size for very
 // high-cardinality keys (e.g. LINEITEM(L_LINENUMBER) at TPC-H SF=1
 // where one value can have ~1.5M duplicates).
-func deduplicateToRawItems(items []item) []rawItem {
+func deduplicateToRawItems(cmp keyComparer, items []item) []rawItem {
 	out := make([]rawItem, 0, len(items))
 	i := 0
 	for i < len(items) {
 		j := i + 1
-		for j < len(items) && CompareKeys(items[j].key, items[i].key) == 0 {
+		for j < len(items) && cmp.compare(items[j].key, items[i].key) == 0 {
 			j++
 		}
 		key := items[i].key
