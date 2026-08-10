@@ -2,7 +2,9 @@ package executor
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -808,24 +810,136 @@ var pgTimestampLayouts = []string{
 	"2006-01-02",
 }
 
-// parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
-// commonly produces: with or without fractional seconds, with or
-// without timezone.
-func parseCopyTimestamp(s string) (time.Time, error) {
+// errNoTimestampLayout is parsePGTimestampText's "nothing matched" failure. It
+// is a plain syntax miss (22007 at the call sites); a field that parsed but is
+// out of range comes back as pgdatetime.ErrFieldOutOfRange instead (22008).
+var errNoTimestampLayout = errors.New("no timestamp layout matched")
+
+// parsePGTimestampText is the single text→time.Time entry point behind every
+// timestamp/date TEXT input path in goopg: the typed-literal path
+// (evalTypedStringLit), the COPY TEXT reader and the cross-kind comparison
+// coercion all reach the layout table through here, so a spelling PostgreSQL
+// accepts cannot be accepted by one and rejected by another. (Three consecutive
+// M0119-0006 slices found exactly that divergence — first the seconds-less
+// `HH:MM` form, then the ISO 8601 `T`; sharing the table alone was not enough,
+// because each caller still ran its own pre- and post-processing around it.)
+//
+// The three steps around the table are the ones PostgreSQL's field decoder does
+// implicitly and Go's layout parser cannot express at all:
+//
+//	SplitEra       — the trailing ADBC token ('2020-01-01 BC'), removed before
+//	                 the layouts see the string and re-applied to the year after
+//	NormalizeInput — unpadded fields, the 'T'/'t' separator, a lone 'Z', an
+//	                 absent seconds field
+//	ApplyEra       — era → astronomical year, and the no-year-zero range rule
+func parsePGTimestampText(s string) (time.Time, error) {
+	body, bc := pgdatetime.SplitEra(s)
 	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
 	// unpadded month, day, hour, minute or second is legal input. Normalise
 	// before the fixed layouts below, which are not. This is also the coercion
 	// used by the cross-kind comparison path (tryParseStringAs), so leaving it
 	// out here is what made `d_date = '2002-5-01'` silently match no rows.
-	s = pgdatetime.NormalizeInput(s)
+	body = pgdatetime.NormalizeInput(body)
 	for _, layout := range pgTimestampLayouts {
-		if ts, err := time.Parse(layout, s); err == nil {
-			return ts.UTC(), nil
+		if ts, err := time.Parse(layout, body); err == nil {
+			ts, err := pgdatetime.ApplyEra(ts.UTC(), bc)
+			if err != nil {
+				return time.Time{}, err
+			}
+			return ts, checkTimeCarrierRange(ts)
 		}
+	}
+	return time.Time{}, errNoTimestampLayout
+}
+
+// goopg's KindTime Datum carries an int64 count of NANOSECONDS since 1970
+// (datum.go: NewTimeDatum / TimeValue), which is Go's UnixNano domain and spans
+// only 1677-09-21 .. 2262-04-11. PostgreSQL's timestamp is an int64 count of
+// MICROSECONDS since 2000-01-01, spanning 4713 BC .. 294276 AD, and its date is
+// an int32 day count over the same span.
+//
+// The mismatch was silent and produced WRONG ANSWERS, not errors: '1000-01-01'
+// wrapped to 2169-02-08 and '2300-01-01' to 1715-06-13, because UnixNano
+// overflows int64 outside its domain and Go leaves the wrapped value in place.
+// Until the carrier moves to microseconds (deferral ledger, M0119-0006 — it is
+// the same blocker that keeps a BC date from being STORED after this slice
+// taught the input path to READ one), every text-input entry point refuses what
+// it cannot represent, so an out-of-range date is a loud 22008 instead of a
+// plausible-looking different date.
+var (
+	timeCarrierMin = time.Unix(0, math.MinInt64).UTC()
+	timeCarrierMax = time.Unix(0, math.MaxInt64).UTC()
+
+	errTimeCarrierRange = errors.New("date/time value outside goopg's representable range")
+)
+
+// checkTimeCarrierRange reports whether t survives a round trip through the
+// KindTime carrier. See the comment on timeCarrierMin above.
+func checkTimeCarrierRange(t time.Time) error {
+	if t.Before(timeCarrierMin) || t.After(timeCarrierMax) {
+		return errTimeCarrierRange
+	}
+	return nil
+}
+
+// dateTimeInputError maps a parsePGDateText / parsePGTimestampText failure onto
+// the SQLSTATE PostgreSQL raises for it. Upstream separates the two: a string
+// no field decoder recognises is 22007 ("invalid input syntax for type date"),
+// while one that decoded into fields that cannot exist — the no-year-zero rule
+// ValidateDate() enforces — is 22008 ("date/time field value out of range").
+// goopg reported 22007 for both, which mislabels a range error as a typo.
+func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
+	if errors.Is(err, errTimeCarrierRange) {
+		return &ExecError{Code: "22008", Pos: pos,
+			Message: fmt.Sprintf("date/time value out of range for %s: %q "+
+				"(goopg stores %s between %s and %s)",
+				typeName, input, typeName,
+				timeCarrierMin.Format("2006-01-02"), timeCarrierMax.Format("2006-01-02"))}
+	}
+	if errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+		return &ExecError{Code: "22008", Pos: pos,
+			Message: fmt.Sprintf("date/time field value out of range: %q", input)}
+	}
+	return &ExecError{Code: "22007", Pos: pos,
+		Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, input)}
+}
+
+// parsePGDateText is the DATE-domain sibling of parsePGTimestampText: the same
+// era split and field normalisation in front of the one calendar-only layout
+// the typed-literal date arm accepts. It is deliberately narrower than the
+// timestamp entry point (a date literal carrying a time of day still goes down
+// the cast path, not this one), so the two differ only in the layout set — the
+// pre/post steps around it are shared, which is the property that kept breaking.
+func parsePGDateText(s string) (time.Time, error) {
+	body, bc := pgdatetime.SplitEra(s)
+	t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(body))
+	if err != nil {
+		return time.Time{}, err
+	}
+	t, err = pgdatetime.ApplyEra(t.UTC(), bc)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t, checkTimeCarrierRange(t)
+}
+
+// parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
+// commonly produces: with or without fractional seconds, with or
+// without timezone.
+func parseCopyTimestamp(s string) (time.Time, error) {
+	ts, err := parsePGTimestampText(s)
+	if err == nil {
+		return ts, nil
+	}
+	if errors.Is(err, pgdatetime.ErrFieldOutOfRange) || errors.Is(err, errTimeCarrierRange) {
+		// A field that decoded but cannot be represented is a range failure, not
+		// a syntax miss: do not let the natural-language fallback below have a
+		// second go at it and turn a definite answer into "invalid timestamp".
+		return time.Time{}, err
 	}
 	// Try verbose natural-language format used by PostgreSQL's datetime output
 	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
-	if ts, err := parseFullTimestamp(s); err == nil {
+	if ts, err := parseFullTimestamp(pgdatetime.NormalizeInput(s)); err == nil {
 		return ts, nil
 	}
 	return time.Time{}, fmt.Errorf("invalid timestamp %q", s)

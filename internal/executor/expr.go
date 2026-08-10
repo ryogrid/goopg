@@ -2996,12 +2996,13 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		// M0125-0007: PG's DecodeDate reads each numeric field on its own, so
-		// '2002-5-1' is the same date as '2002-05-01'. Normalise to the padded
-		// spelling the fixed Go layout below requires.
-		t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(x.Value))
+		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
+		// its own ('2002-5-1' is '2002-05-01') and accepts a trailing era token
+		// ('2020-01-01 BC'); parsePGDateText applies both around the fixed Go
+		// layout, which can express neither.
+		t, err := parsePGDateText(x.Value)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
+			return Datum{}, dateTimeInputError(err, "date", x.Value, x.Pos())
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
@@ -3042,18 +3043,20 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
 		// PG takes '2002-5-1 3:4:5' for a timestamp, the layouts below do not.
-		// M0119-0006: the table itself is shared with parseCopyTimestamp (see
-		// pgTimestampLayouts) so the literal path and the COPY/encode path can
-		// no longer accept different spellings of the same timestamp.
-		normalized := pgdatetime.NormalizeInput(x.Value)
-		for _, layout := range pgTimestampLayouts {
-			if t, err := time.Parse(layout, normalized); err == nil {
-				x.CachedTime = t.UTC()
-				x.CacheValid = true
-				return NewTimeDatum(x.CachedTime), nil
+		// M0119-0006: the whole entry point (era split + normalisation + the
+		// shared pgTimestampLayouts table) is now parsePGTimestampText, which
+		// the COPY/encode path calls too, so the literal path and the COPY path
+		// can no longer accept different spellings of the same timestamp.
+		t, err := parsePGTimestampText(x.Value)
+		if err != nil {
+			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
+				return Datum{}, ee
 			}
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
 		}
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+		x.CachedTime = t
+		x.CacheValid = true
+		return NewTimeDatum(x.CachedTime), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -3661,12 +3664,16 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if inf, ok := parseDateInfinityLiteral(s); ok {
 				return inf, nil
 			}
-			if t, err := parseCopyTimestamp(s); err == nil {
-				t2 := t.UTC()
-				return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
+			t, err := parseCopyTimestamp(s)
+			if err != nil {
+				// M0119-0006: a range failure (no year zero, or a value the
+				// KindTime carrier cannot hold) keeps its own 22008 wording —
+				// reporting it as a syntax error points the user at the
+				// spelling, which is not what is wrong with it.
+				return Datum{}, dateTimeInputError(err, "date", s, pos)
 			}
-			return Datum{}, &ExecError{Code: "22007", Pos: pos,
-				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
+			t2 := t.UTC()
+			return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		if d.Kind == KindTime {
 			// A ±infinity timestamp/date sentinel casts to the same-signed date
@@ -3717,8 +3724,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 			ts, err := parseCopyTimestamp(d.StringValue())
 			if err != nil {
-				return Datum{}, &ExecError{Code: "22007", Pos: pos,
-					Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
 			}
 			return NewTimeDatum(ts), nil
 		}
@@ -8846,9 +8852,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if _, ok := parseDateInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				// M0125-0007: pg_input_is_valid must agree with the cast path,
-				// which now accepts PG's unpadded month/day fields.
-				_, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(v))
+				// M0125-0007 / M0119-0006: pg_input_is_valid must agree with the
+				// cast path, so it goes through the same entry point (unpadded
+				// fields, trailing era token, no year zero).
+				_, err := parsePGDateText(v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
 				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).

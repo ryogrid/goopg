@@ -120,22 +120,46 @@ func ParseDateStyleValue(s string) (style, order string) {
 // depend on that invariant). Unrecognized style falls back to ISO, matching
 // ParseDateStyleValue's own default.
 func FormatDate(t time.Time, style, order string) string {
+	t, era := eraDisplay(t)
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return t.Format("02/01/2006")
+			return t.Format("02/01/2006") + era
 		}
-		return t.Format("01/02/2006")
+		return t.Format("01/02/2006") + era
 	case "Postgres":
 		if order == "DMY" {
-			return t.Format("02-01-2006")
+			return t.Format("02-01-2006") + era
 		}
-		return t.Format("01-02-2006")
+		return t.Format("01-02-2006") + era
 	case "German":
-		return t.Format("02.01.2006")
+		return t.Format("02.01.2006") + era
 	default:
-		return t.Format("2006-01-02")
+		return t.Format("2006-01-02") + era
 	}
+}
+
+// eraDisplay converts a stored (astronomical) instant into the pair every
+// EncodeDateOnly/EncodeDateTime style needs: a time whose YEAR field holds the
+// digits PostgreSQL prints, and the trailing era marker.
+//
+// goopg stores dates the way PG's date2j/j2date count them — 1 BC is year 0,
+// 2 BC is year -1 — so a BC date must not be handed to Go's layout formatter
+// as-is: `t.Format("2006-01-02")` renders year -2019 as "-2019-01-01", where
+// upstream prints "2020-01-01 BC" (datetime.c: the year digits are
+// `-(tm_year - 1)` for tm_year <= 0 and " BC" is appended after everything
+// else, including the time of day and the zone offset).
+//
+// Only the year field is rewritten, never the instant, so callers that also
+// print a WEEKDAY (the Postgres style's "Mon") must take it from the original
+// time — 1 January 2020 BC is a Thursday and 1 January 2020 AD is not.
+func eraDisplay(t time.Time) (time.Time, string) {
+	y := t.Year()
+	if y > 0 {
+		return t, ""
+	}
+	return time.Date(-(y - 1), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
+		t.Nanosecond(), t.Location()), " BC"
 }
 
 
@@ -179,20 +203,24 @@ func fracSecondsSuffix(t time.Time) string {
 // padding to 6 digits.
 func FormatTimestamp(t time.Time, style, order string) string {
 	frac := fracSecondsSuffix(t)
+	// The Postgres style prints a weekday, which belongs to the stored instant,
+	// so it keeps formatting from t; every other style embeds only the year and
+	// formats from the era-adjusted copy. " BC" trails the whole value.
+	disp, era := eraDisplay(t)
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return t.Format("02/01/2006 15:04:05") + frac
+			return disp.Format("02/01/2006 15:04:05") + frac + era
 		}
-		return t.Format("01/02/2006 15:04:05") + frac
+		return disp.Format("01/02/2006 15:04:05") + frac + era
 	case "Postgres":
 		if order == "DMY" {
-			return t.Format("Mon 02 Jan 15:04:05") + frac + t.Format(" 2006")
+			return t.Format("Mon 02 Jan 15:04:05") + frac + disp.Format(" 2006") + era
 		}
-		return t.Format("Mon Jan 02 15:04:05") + frac + t.Format(" 2006")
+		return t.Format("Mon Jan 02 15:04:05") + frac + disp.Format(" 2006") + era
 	case "German":
-		return t.Format("02.01.2006 15:04:05") + frac
+		return disp.Format("02.01.2006 15:04:05") + frac + era
 	default:
-		return t.Format("2006-01-02 15:04:05") + frac
+		return disp.Format("2006-01-02 15:04:05") + frac + era
 	}
 }

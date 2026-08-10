@@ -1319,8 +1319,13 @@ func TestTimestampIntervalInfinity(t *testing.T) {
 		{"SELECT (" + base + " - interval 'infinity') - interval 'infinity'", "-infinity"},
 		// Ordering: the sentinels sort beyond every finite timestamp and each
 		// other (-infinity < finite < +infinity).
-		{"SELECT (" + base + " + interval 'infinity') > timestamp '9999-01-01'", "t"},
-		{"SELECT (" + base + " - interval 'infinity') < timestamp '0001-01-01'", "t"},
+		// The finite operands are the extremes of the range the KindTime carrier
+		// (int64 NANOSECONDS since 1970) can hold, not PG's '9999-01-01' /
+		// '0001-01-01': those are now a loud 22008 rather than the silently
+		// wrapped timestamp they used to decode to. See
+		// date_era_and_range_input_test.go and the M0119-0006 ledger row.
+		{"SELECT (" + base + " + interval 'infinity') > timestamp '2262-04-11'", "t"},
+		{"SELECT (" + base + " - interval 'infinity') < timestamp '1678-01-01'", "t"},
 	}
 	for _, c := range accept {
 		rows := runQuery(t, ctx, c.sql+" FROM t")

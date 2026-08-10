@@ -294,3 +294,108 @@ every form, so widening only one table fails the build. `pgdatetime` gains
 Mutation-checked in both halves: reverting `normalize.go` alone and removing the
 `T` layouts alone each reproduce the failures. Gates: units, `TestPort_RegressSuite`
 (249 s), `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35), pgbench smoke via the hook.
+
+## 8. Follow-up 2026-08-12 (M0119-0006) — the BC era, and the nanosecond carrier underneath it
+
+### The defect probed
+
+PostgreSQL's date/time input carries an **era**: `'2020-01-01 BC'` is an
+ordinary date, spelled with the `ADBC` token `DecodeDateTime` resolves out of
+`datetbl` (`postgres/src/backend/utils/adt/datetime.c`). goopg raised `22007`
+for every spelling of it — `'0001-01-01 BC'`, `'2020-01-01bc'` (PG's field
+splitter does not need the space), `'2020-01-01 AD'` — which is the item the
+25th slice's ledger row left open.
+
+### What the probe found underneath
+
+Teaching the input path to read an era exposed a far larger defect, and it was
+producing **wrong answers rather than errors**. goopg's `KindTime` Datum stores
+an int64 count of **nanoseconds** since 1970 (`datum.go`: `NewTimeDatum` /
+`TimeValue`) — Go's `UnixNano` domain, which spans only 1677-09-21 ..
+2262-04-11. PostgreSQL's `timestamp` is an int64 count of **microseconds** since
+2000-01-01 (4713 BC .. 294276 AD) and its `date` an int32 day count over the
+same span. Outside the narrower domain `UnixNano` overflows int64 and Go leaves
+the wrapped value in place, so goopg answered ordinary historical input with a
+plausible-looking different date and no diagnostic (measured at HEAD before this
+slice, against PG 18.3 on socket `/tmp` port 5599):
+
+| input | goopg | PG 18.3 |
+|---|---|---|
+| `'1000-01-01'::date` | `2169-02-08` | `1000-01-01` |
+| `'1600-01-01'::date` | `2184-07-20` | `1600-01-01` |
+| `'2300-01-01'::date` | `1715-06-13` | `2300-01-01` |
+| `'0000-01-01'::date` | `1753-08-29` | `22008` (there is no year zero) |
+| `'1000-01-01 12:00:00'::timestamp` | `2169-02-09 11:09:07.419103` | `1000-01-01 12:00:00` |
+
+This is the M0125-0007 failure mode exactly: a silently wrong answer from input
+PostgreSQL accepts, with nothing in the log.
+
+### What landed
+
+**The era model** (`internal/pgdatetime/era.go`, a leaf package so the pgoutput
+and array decoders can share it):
+
+- `SplitEra` strips the trailing `AD`/`BC` token, case-insensitively and with
+  the whitespace optional, before any layout sees the string. It is as narrow as
+  `canonicalZulu`: what precedes the token must end in a **digit**, so a doubled
+  era (`'2020-01-01 BC BC'`), a bare `'BC'` and `'B.C.'` (PG reads that as a
+  timezone name) are left for the parser to reject, as upstream does. Only a
+  trailing token is recognised — PG rejects a leading `'BC 2020-01-01'` too.
+- `ApplyEra` converts the era-relative year to the astronomical year goopg
+  stores (`1 BC` is year 0, `2 BC` is year -1 — `date2j`/`j2date`'s own
+  convention) and enforces the one range rule the era model owns: **there is no
+  year zero** in either era, which upstream raises from `ValidateDate()` as
+  `22008`, not as a syntax error.
+- `EraYear` is the output-side inverse, tested as such so the two cannot drift.
+
+**One entry point per domain** (`internal/executor/copy_text.go`). The previous
+three slices each found goopg's two timestamp tables disagreeing and shared one
+more thing between them; sharing the *table* was still not enough, because each
+caller ran its own pre- and post-processing around it. `parsePGTimestampText`
+(era split → `NormalizeInput` → the shared layouts → `ApplyEra` → range check)
+and its calendar-only sibling `parsePGDateText` are now the entry points behind
+the typed-literal path, the cast path, the COPY reader and `pg_input_is_valid`.
+
+**Era-aware output** (`internal/config/datestyle.go`). `eraDisplay` rewrites
+only the YEAR field and returns the trailing marker, so every DateStyle prints
+what `EncodeDateOnly`/`EncodeDateTime` print (`-(tm_year - 1)` digits plus a
+trailing `" BC"` after the time of day). The `Postgres` style keeps formatting
+its **weekday** off the original instant: 15 June 1 BC is a Thursday and 15 June
+AD 1 is not, so formatting the whole value off a year-substituted copy would
+print the wrong day name there and nowhere else.
+
+**The wrap is now loud.** Until the carrier moves to microseconds, every text
+-input entry point refuses what it cannot represent with `22008` naming the
+supported range, instead of storing a wrapped date. `dateTimeInputError` also
+separates the two SQLSTATEs upstream distinguishes and goopg had merged: `22008`
+(field/range) vs `22007` (syntax).
+
+### Deliberately deferred (ledger row, same date)
+
+The carrier itself. The honest consequence of the guard is an **acceptance
+regression**: `'1000-01-01'` and `'2300-01-01'` are valid PG input that goopg
+now rejects rather than answering wrongly, and a BC date can be *read* but still
+not *stored*. Two in-tree tests asserted against out-of-range literals
+(`date_infinity_literal_test.go`, `interval_subday_test.go` compared the
+±infinity sentinels to `'9999-12-31'` / `'0001-01-01'`) and were moved onto the
+representable extremes with the reason recorded inline. The fix is to move
+`Datum.Int` for `KindTime` from nanoseconds to **microseconds** — PG's own unit,
+whose int64 range (±292,471 years) covers the whole PG span — which is a
+carrier-wide change (storage codec, wire binary, sort/hash, spill) and needs its
+own loop and the full gate battery, not a tail-end edit here.
+
+### Verification
+
+`internal/pgdatetime/era_test.go` (`SplitEra` table incl. the four non-era
+spellings, `ApplyEra` year math + both year-zero refusals, and `EraYear` proven
+to be `ApplyEra`'s inverse); `internal/config/datestyle_era_test.go` (BC
+rendering in all four DateStyles for date and timestamp, the `Postgres`-style
+weekday, and the AD boundary at year 1); `internal/executor/
+date_era_and_range_input_test.go` (the wrap table above now refused, year zero,
+the `22008`/`22007` split, the era-split mutation guard, the representable range
+untouched, and `TestDateEraLiteralAndCopyPathsAgree` — the sibling guard, which
+asserts agreement so the carrier fix must widen both paths together). Every
+`want` read from PG 18.3 on socket `/tmp` port 5599.
+
+Gates: units, `TestPort_RegressSuite` (632 s), `scripts/tpch-spotcheck.sh`,
+pgbench smoke via the commit hook.

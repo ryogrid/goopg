@@ -2167,6 +2167,32 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       deferred: a zone on a bare DATE (`'2020-01-01Z'`, PG accepts) and
       timezone-abbreviation lookup (`NZ`/`EST`/`PDT`, needs a `datetbl` port).
       Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §7.
+      **Slice landed 2026-08-12 (30th) — the BC era, and the nanosecond carrier
+      underneath it**: `'2020-01-01 BC'` raised 22007. New leaf
+      `internal/pgdatetime/era.go` (`SplitEra`/`ApplyEra`/`EraYear`) reads PG's
+      trailing `ADBC` token (case-insensitive, whitespace optional, digit-before
+      -the-token so `'BC BC'`/`'BC'`/`'B.C.'` stay refused as PG refuses them),
+      converts to the astronomical year `date2j`/`j2date` use (1 BC = year 0),
+      and enforces PG's no-year-zero rule as 22008. Fourth consecutive two-table
+      drift ended by sharing the whole ENTRY POINT, not one more table:
+      `parsePGTimestampText`/`parsePGDateText` now sit behind the literal, cast,
+      COPY and `pg_input_is_valid` paths. Output learns the era in all four
+      DateStyles (`eraDisplay`, with the `Postgres` style's WEEKDAY still taken
+      from the real instant). **What the probe FOUND is bigger than the era**:
+      the `KindTime` Datum counts NANOSECONDS since 1970 (Go's `UnixNano`
+      domain, 1677..2262) where PG counts MICROSECONDS since 2000 (4713 BC ..
+      294276 AD), so outside that window `UnixNano` overflowed and goopg
+      answered ordinary PG input with a plausible WRONG DATE and no diagnostic
+      (`'1000-01-01'::date` → `2169-02-08`, `'2300-01-01'` → `1715-06-13`,
+      `'0000-01-01'` → `1753-08-29`). This slice makes the wrap LOUD (22008
+      naming the range) — a BC date can now be read but still not stored, and
+      the honest cost is an acceptance regression on valid far dates. Gates:
+      `TestDateEraLiteralAndCopyPathsAgree` (sibling agreement, so the carrier
+      fix must widen both paths together), `date_era_and_range_input_test.go`,
+      `era_test.go`, `datestyle_era_test.go`; units + `TestPort_RegressSuite`
+      (632 s) + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35). Deferred (ledger):
+      move `Datum.Int` for `KindTime` to MICROSECONDS and drop the guard.
+      Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §8.
       **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
       (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
       posting lists goopg's own bulk build wrote, on a real heap, under the

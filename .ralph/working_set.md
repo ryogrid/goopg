@@ -1,53 +1,48 @@
 (idle — nothing in flight)
 
-Last loop (#94): M0119-0006 29th slice — **the ISO 8601 `T` separator and the
-`Z` zone are ordinary PG timestamp input again**. Committed + pushed. Design
-`docs/design/0125-0007-pg-faithful-date-field-decode.md` §7 (+ README row edit),
-1 ledger row.
+Last loop (#95): M0119-0006 30th slice — **the BC era is ordinary date/time
+input again, and the probe found the nanosecond carrier underneath it**.
+Committed + pushed. Design `docs/design/0125-0007-pg-faithful-date-field-decode.md`
+§8 (+ README row edit), 1 ledger row.
 
 M-NIGHTLY duty this loop: `ci/logs/action-items.md` is still nightly run
 `20260811-014635` (12 items), all already filed under M-NIGHTLY (loop #87).
 Nothing new to file; they stay PARKED per the banner.
 
-What landed + what it FOUND: `'2020-01-01T10:00:00'` — plain ISO 8601, what
-every JSON encoder and `date -Is` emits — raised 22007. So did `…t10:00:00`,
-`2020-01-01 10:00:00Z`, `…z`, `… Z`, every `T`-separated offset form, and on
-BOTH separators any offset wider than two digits (`+0530`, `+05:30`). Root
-cause: Go's `RFC3339`/`RFC3339Nano` constants demand the `T` AND a zone, so a
-zone-less `T` form matched neither them nor the space-separated layouts. Fixed
-structurally, since this was the THIRD consecutive slice to catch goopg's two
-timestamp layout tables disagreeing: ONE shared `pgTimestampLayouts`
-(`copy_text.go`, separator × offset-width via Go's `Z07*` elements, zone-bearing
-first) now iterated by `parseCopyTimestamp` AND `evalTypedStringLit`, with
-case/spacing folded upstream in `pgdatetime.NormalizeInput` (separator scan
-breaks on `t`; new `canonicalZulu`). `canonicalZulu` requires a DIGIT before the
-letter so it cannot touch zone abbreviations — folding `'10:00:00 NZ'` to UTC
-would be a silent 12-hour error. Deferred (ledger + refusal tests): a zone on a
-bare DATE (`'2020-01-01Z'`, PG accepts) and abbreviation lookup generally
-(needs a `datetbl` port).
+What landed: `internal/pgdatetime/era.go` (`SplitEra`/`ApplyEra`/`EraYear`) —
+PG's trailing `ADBC` token, case-insensitive, whitespace optional, digit-before
+-the-token so `'BC BC'`/`'BC'`/`'B.C.'` stay refused; era → astronomical year
+(1 BC = year 0); PG's no-year-zero rule as 22008. The whole ENTRY POINT is now
+shared (`parsePGTimestampText`/`parsePGDateText` in copy_text.go behind the
+literal, cast, COPY and `pg_input_is_valid` paths) — sharing only the layout
+table was not enough, this was the 4th consecutive drift. Output: `eraDisplay`
+in `internal/config/datestyle.go`, all four DateStyles, `Postgres`-style weekday
+still from the real instant.
 
-Banner state: M-NIGHTLY filing done; M0130 fully checked; banner falls through
-to M0119 (M0119-0005 blocked on missing hash/gin/gist/spgist/brin AMs, so
-M0119-0006 stays the actionable head), then M0122.
+What it FOUND (bigger than the era): `KindTime` Datum stores int64 NANOSECONDS
+since 1970 (`datum.go`), i.e. 1677..2262, where PG stores MICROSECONDS since
+2000 (4713 BC..294276 AD). Outside that window `UnixNano` overflows and Go keeps
+the wrapped value, so goopg silently answered `'1000-01-01'::date` → 2169-02-08,
+`'2300-01-01'` → 1715-06-13, `'0000-01-01'` → 1753-08-29. This slice makes it
+LOUD (22008 naming the range); a BC date can be READ but not STORED. Honest
+cost: acceptance regression on valid far dates, and two in-tree tests that
+compared ±infinity to `'9999-12-31'`/`'0001-01-01'` moved to the representable
+extremes.
 
-Next loop: per banner, M0119-0006 again. Candidates, cheapest first: the `BC`
-era input gap (needs a real `DecodeDateTime` field walk + era-aware output —
-note the `'10:00.5'`/`'10::00'`/`'2020-01-01Z'` rows all resolve into that same
-field walk, so it is now a 4-in-1); the `numeric` index-key display-scale
-divergence (`EncodeNumericKey` strips trailing mantissa zeros — the ledger's
-"trailing metadata" resume point is SUSPECT, since appending scale bytes to a
-memcmp'd blob key would break UNIQUE equality of `1.0` vs `1.00`; re-derive
-before coding); array SLICES `a[1:2]` (lexer); TOASTed / multi-dim / NULL-element
-arrays in logical decoding. Still blocked: `box`/`int4range` key encodings and
-the unscoped whole-database pg_amcheck run.
+Next loop: per banner (M0130 fully checked → M0119-0006 is the actionable head).
+Strongest candidate is now the CARRIER: move `Datum.Int` for `KindTime` from
+nanoseconds to MICROSECONDS (PG's unit; ±292k years) — `NewTimeDatum`/
+`NewDateDatum`/`NewTimeTZDatum`/`TimeValue`, then audit every `.Int` consumer
+(storage codec, wire binary in server/dispatch.go, sort/hash/spill, interval
+arithmetic) and delete `checkTimeCarrierRange`. Needs the FULL gate battery — a
+single missed consumer scales every timestamp by 1000. Cheaper alternatives:
+`'10:00.5'`/`'10::00'` field roles, `'2020-01-01Z'`; numeric index-key display
+scale (ledger resume point SUSPECT); array slices `a[1:2]` (lexer); TOASTed /
+multi-dim / NULL-element arrays in logical decoding.
 
-Gates: build + vet clean; units (`RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh`) PASS; `TestPort_RegressSuite` PASS (249 s,
-warm cache — needs `-timeout 45m`, the go default 10 m kills it);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); pgbench smoke via the commit
-hook. Both halves of the fix mutation-checked independently. Expected values
-captured from a throwaway PG 18.3 cluster (socket /tmp, port 5599, datadir
-/tmp/pgoracle-loop94 — stop it with `pg_ctl -D $(cat /tmp/pgoracle.path) stop`
-if it is still up).
+Gates: build + vet clean; units PASS; `TestPort_RegressSuite` PASS (632 s, warm
+cache — needs `-timeout 45m`); `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35);
+pgbench smoke via the commit hook. Wants captured from a throwaway PG 18.3
+cluster (socket /tmp, port 5599, datadir /tmp/pgoracle-loop94 — stopped).
 
 In-flight: none
