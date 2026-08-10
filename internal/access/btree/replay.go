@@ -101,9 +101,11 @@ func ReplayRemoveParentDownlink(page storage.Page, removeSlot uint16) error {
 	newItems = append(newItems, items[idx+1:]...)
 	// Mirror removeDownlinkFromParent: when the new first item
 	// adopts the leftmost slot and currently has a non-empty
-	// key, blank its key to maintain the B-tree invariant.
+	// key, blank its key to maintain the B-tree invariant. downlinkItem keeps
+	// it a zero-attribute minus-infinity PIVOT tuple (M0130-S11.4 slice 3a) —
+	// a bare literal would replay the page into plain tuples.
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
+		newItems[0] = downlinkItem(nil, newItems[0].ptr.Block)
 	}
 	resetPageItems(page)
 	for i, it := range newItems {

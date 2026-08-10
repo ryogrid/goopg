@@ -106,27 +106,120 @@ func TestParseItemRoundTrip(t *testing.T) {
 	}
 }
 
-// TestParseItemRejectsAltTID: a pivot or posting tuple decoded as a plain item
-// would hand the caller nbtree status bits as a heap TID. The size check alone
-// does not catch it (a posting tuple's t_info size is correct), so parseItem
-// tests INDEX_ALT_TID_MASK explicitly.
-func TestParseItemRejectsAltTID(t *testing.T) {
+// TestParseItemRejectsPosting: a posting tuple decoded as a plain item would
+// hand the caller nbtree status bits (TID count, array offset) as a heap TID.
+// The size check alone does not catch it — a posting tuple's t_info size is
+// correct — so parseItemBody tests BT_IS_POSTING explicitly. (A PIVOT tuple by
+// contrast is decoded, not rejected: see TestParseItemDecodesPivot.)
+func TestParseItemRejectsPosting(t *testing.T) {
 	post := marshalPosting(EncodeInt4(1), []storage.ItemPointer{{Block: 1, Offset: 1}, {Block: 1, Offset: 2}})
 	if _, err := parseItem(post); err == nil {
 		t.Fatal("parseItem accepted a posting tuple")
 	}
+}
 
-	pivot := item{ptr: storage.ItemPointer{Block: 12}, key: EncodeInt4(1)}.marshal()
-	if err := BTreeTupleSetNAtts(pivot, 1, false); err != nil {
+// TestParseItemDecodesPivot pins the slice-3a decode contract: a pivot tuple
+// round-trips through parseItem/marshal with its downlink, its key and its
+// pivot status intact. The re-marshal half is the one that matters — the vacuum
+// and LP_DEAD page rewrites parse every item and write it back, and a pivot
+// demoted to a plain tuple on that path would publish nbtree status bits to a
+// real PG as a heap TID.
+func TestParseItemDecodesPivot(t *testing.T) {
+	raw := downlinkItem(EncodeInt4(1), 12).marshal()
+	if !BTreeTupleIsPivot(raw) {
+		t.Fatal("downlinkItem did not produce a pivot tuple")
+	}
+	if got := BTreeTupleGetDownLink(raw); got != 12 {
+		t.Errorf("downlink = %d, want 12", got)
+	}
+	if got := BTreeTupleGetNAtts(raw, 1); got != 1 {
+		t.Errorf("natts = %d, want 1", got)
+	}
+
+	it, err := parseItem(raw)
+	if err != nil {
+		t.Fatalf("parseItem: %v", err)
+	}
+	if !it.pivot {
+		t.Error("parseItem lost the pivot flag")
+	}
+	// t_tid's offset half is status data, never a line pointer.
+	if it.ptr != (storage.ItemPointer{Block: 12}) {
+		t.Errorf("ptr = %+v, want {Block:12}", it.ptr)
+	}
+	if !bytes.Equal(it.key, EncodeInt4(1)) {
+		t.Errorf("key = %x, want %x", it.key, EncodeInt4(1))
+	}
+	if got := it.marshal(); !bytes.Equal(got, raw) {
+		t.Errorf("pivot did not survive a parse/marshal round trip:\n got %x\nwant %x", got, raw)
+	}
+}
+
+// TestNegativeInfinityPivotHasZeroNAtts: the first downlink of every internal
+// page has no key at all, which upstream represents as a pivot with natts = 0
+// (_bt_truncate's fully-truncated form). amcheck checks that count, so a
+// keyless downlink stamped natts = 1 would read as a corrupt index.
+func TestNegativeInfinityPivotHasZeroNAtts(t *testing.T) {
+	raw := downlinkItem(nil, 7).marshal()
+	if !BTreeTupleIsPivot(raw) {
+		t.Fatal("minus-infinity downlink is not a pivot tuple")
+	}
+	if got := BTreeTupleGetNAtts(raw, 1); got != 0 {
+		t.Errorf("natts = %d, want 0", got)
+	}
+	if got := BTreeTupleGetDownLink(raw); got != 7 {
+		t.Errorf("downlink = %d, want 7", got)
+	}
+	if got := PGIndexTupleSize(raw); got != SizeOfIndexTupleData {
+		t.Errorf("size = %d, want %d", got, SizeOfIndexTupleData)
+	}
+}
+
+// TestHighKeyIsPivotTuple: P_HIKEY is a pivot too (M0130-S11.4 slice 3a). Its
+// t_tid block half is P_NONE — goopg does not use the top-parent link — and the
+// separator bytes are the tuple's data area.
+func TestHighKeyIsPivotTuple(t *testing.T) {
+	sep := EncodeInt4(99)
+	raw := highKeyItem(sep).marshal()
+	if !BTreeTupleIsPivot(raw) {
+		t.Fatal("high key is not a pivot tuple")
+	}
+	if got := BTreeTupleGetDownLink(raw); got != 0 {
+		t.Errorf("high-key t_tid block = %d, want P_NONE (0)", got)
+	}
+	if got := BTreeTupleGetNAtts(raw, 1); got != 1 {
+		t.Errorf("natts = %d, want 1", got)
+	}
+	if !bytes.Equal(raw[SizeOfIndexTupleData:], sep) {
+		t.Errorf("separator bytes = %x, want %x", raw[SizeOfIndexTupleData:], sep)
+	}
+}
+
+// TestParsePivotStripsTiebreakerHeapTID: goopg does not yet WRITE the
+// tiebreaker representation (PGBTPivotRaw's ledger row), but a pivot that
+// carries one keeps a trailing ItemPointerData that is not part of the key —
+// decoding it as key bytes would corrupt every comparison against that
+// separator.
+func TestParsePivotStripsTiebreakerHeapTID(t *testing.T) {
+	key := EncodeInt4(5)
+	tid := storage.ItemPointer{Block: 3, Offset: 4}
+	raw := make([]byte, SizeOfIndexTupleData+len(key)+SizeOfItemPointerData)
+	copy(raw[SizeOfIndexTupleData:], key)
+	PutPGItemPointer(raw[len(raw)-SizeOfItemPointerData:], tid)
+	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
+	if err := BTreeTupleSetNAtts(raw, 1, true); err != nil {
 		t.Fatalf("BTreeTupleSetNAtts: %v", err)
 	}
-	if _, err := parseItem(pivot); err == nil {
-		t.Fatal("parseItem accepted a pivot tuple")
+
+	it, err := parseItem(raw)
+	if err != nil {
+		t.Fatalf("parseItem: %v", err)
 	}
-	// The downlink survives the alt-TID stamp — that is the whole point of
-	// keeping the child pointer in t_tid's block half.
-	if got := BTreeTupleGetDownLink(pivot); got != 12 {
-		t.Errorf("downlink after SetNAtts = %d, want 12", got)
+	if !bytes.Equal(it.key, key) {
+		t.Errorf("key = %x, want %x (trailing heap TID must not be part of the key)", it.key, key)
+	}
+	if got, ok := BTreeTupleGetHeapTID(raw); !ok || got != tid {
+		t.Errorf("BTreeTupleGetHeapTID = %+v (ok=%v), want %+v", got, ok, tid)
 	}
 }
 

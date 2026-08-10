@@ -677,7 +677,11 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk, childBlk storage.BlockNum
 	newItems = append(newItems, items[:idx]...)
 	newItems = append(newItems, items[idx+1:]...)
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
+		// Rebuild through downlinkItem, not a bare literal: the leftmost item
+		// of an internal page is the zero-attribute "minus infinity" PIVOT
+		// tuple (M0130-S11.4 slice 3a), and a literal would demote it to a
+		// plain tuple on this rewrite.
+		newItems[0] = downlinkItem(nil, newItems[0].ptr.Block)
 	}
 	resetPageItems(s.Page())
 	for _, it := range newItems {
@@ -1167,9 +1171,10 @@ func (bt *BTree) removeDownlinkFromParent(parentBlk, childBlk storage.BlockNumbe
 	}
 
 	// If the removed item was the leftmost (nil key), the new first item
-	// must adopt nil key to maintain the B-tree invariant.
+	// must adopt nil key to maintain the B-tree invariant. downlinkItem keeps
+	// it a zero-attribute minus-infinity PIVOT tuple (M0130-S11.4 slice 3a).
 	if len(newItems) > 0 && len(newItems[0].key) > 0 {
-		newItems[0] = item{ptr: newItems[0].ptr, key: nil}
+		newItems[0] = downlinkItem(nil, newItems[0].ptr.Block)
 	}
 
 	resetPageItems(s.Page())

@@ -223,9 +223,10 @@ func pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
 func PageHighKey(p storage.Page) (key []byte, ok bool, err error) { return pageHighKey(p) }
 
 // highKeyItem builds the P_HIKEY item that carries `key` as the page's
-// separator.
+// separator. Since M0130-S11.4 slice 3a it is a real nbtree PIVOT tuple
+// (`_bt_truncate`'s output), not a plain item — see PGBTPivotRaw.
 func highKeyItem(key []byte) item {
-	return item{key: append([]byte(nil), key...)}
+	return item{key: append([]byte(nil), key...), pivot: true}
 }
 
 // keyExceedsHighKey reports whether `key` is strictly greater than the page's
@@ -283,6 +284,16 @@ func initPage(p storage.Page, o BTPageOpaque) {
 type item struct {
 	ptr storage.ItemPointer
 	key []byte
+	// pivot marks the item as an nbtree PIVOT tuple — every internal-page
+	// downlink and every P_HIKEY separator (M0130-S11.4 slice 3a). It is an
+	// IN-MEMORY flag only: on disk the fact lives in INDEX_ALT_TID_MASK plus
+	// t_tid's offset half (BTreeTupleIsPivot), and parseItemBody reads it back
+	// off the tuple. It exists because several paths parse an item and
+	// re-marshal it (the vacuum/LP_DEAD page rewrites, split redistribution);
+	// without carrying the flag through, a round trip would silently demote a
+	// pivot to a plain tuple and hand a real PG nbtree status bits as a heap
+	// TID.
+	pivot bool
 }
 
 // MaxItemsPerPage is the goopg analogue of upstream's MaxIndexTuplesPerPage
@@ -334,7 +345,12 @@ const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 
 //
 // The 13-bit INDEX_SIZE_MASK cannot overflow here: a body must fit in a page,
 // and BlockSize (8192) minus the page header already leaves less than 8191.
-func (it item) marshal() []byte { return PGBTItemRaw(it.key, it.ptr) }
+func (it item) marshal() []byte {
+	if it.pivot {
+		return PGBTPivotRaw(it.key, it.ptr.Block)
+	}
+	return PGBTItemRaw(it.key, it.ptr)
+}
 
 // PGBTItemRaw is the exported form of `(item).marshal` — the ONE encoder for a
 // plain on-page nbtree item. Exported so out-of-package structural validators
@@ -349,39 +365,100 @@ func PGBTItemRaw(key []byte, tid storage.ItemPointer) []byte {
 	return out
 }
 
-// downlinkItem builds an internal-page item whose t_tid addresses `child`.
-// Equivalent to upstream's `BTreeTupleSetDownLink` on a freshly formed pivot
-// tuple; kept as a named constructor so slice 3 has ONE site to convert into a
-// truncated pivot tuple (`_bt_truncate` + `BTreeTupleSetNAtts`).
+// PGBTPivotRaw is the ONE encoder for an nbtree PIVOT tuple — an internal-page
+// downlink or a P_HIKEY separator. It is upstream's `_bt_truncate` output for
+// goopg's current key shape: `index_truncate_tuple` copies the key attributes
+// that must be kept, `BTreeTupleSetDownLink` puts the child block in t_tid's
+// block half, and `BTreeTupleSetNAtts` stamps the kept-attribute count into
+// t_tid's offset half together with INDEX_ALT_TID_MASK.
+//
+// natts is 1 for a keyed pivot and 0 for the negative-infinity downlink (the
+// first item of every internal page, which upstream also stores as a
+// zero-attribute pivot). goopg's key is still ONE opaque blob, so 1 is the only
+// non-zero count expressible: a composite index's separator is one blob to this
+// layer, and true suffix truncation to a prefix of the key attributes needs the
+// per-attribute datums of slice 3b. Ledger row.
+//
+// The tiebreaker-heap-TID pivot representation (`_bt_truncate`'s `keepnatts >
+// nkeyatts` branch, taken when the split point falls between two equal keys) is
+// likewise deferred: goopg's descent treats the separator as inclusive rather
+// than as a strict lower bound, so adopting the tiebreaker would change routing,
+// not just the tuple's bytes. Ledger row.
+//
+// A high key's t_tid block half is written P_NONE (0). Upstream leaves whatever
+// block `firstright` carried there, because its pivot starts life as a copy of
+// that tuple; the field is only read as BTreeTupleGetTopParent, and only on a
+// half-dead page, so a deterministic 0 is both safe and easier to assert on.
+func PGBTPivotRaw(key []byte, child storage.BlockNumber) []byte {
+	out := make([]byte, SizeOfIndexTupleData+len(key))
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(out)))
+	copy(out[SizeOfIndexTupleData:], key)
+	BTreeTupleSetDownLink(out, child)
+	natts := uint16(1)
+	if len(key) == 0 {
+		natts = 0 // negative infinity: no key attributes survive truncation
+	}
+	if err := BTreeTupleSetNAtts(out, natts, false); err != nil {
+		// Unreachable: natts is 0 or 1 and heapTID is false.
+		panic(err)
+	}
+	return out
+}
+
+// downlinkItem builds an internal-page pivot tuple whose t_tid addresses
+// `child` (upstream's `BTreeTupleSetDownLink`).
 func downlinkItem(key []byte, child storage.BlockNumber) item {
-	return item{ptr: storage.ItemPointer{Block: child}, key: key}
+	return item{ptr: storage.ItemPointer{Block: child}, key: key, pivot: true}
 }
 
 // parseItemBody validates the IndexTupleData header shared by parseItem and
-// parseItemNoCopy and returns the tuple's data area.
-func parseItemBody(raw []byte) (storage.ItemPointer, []byte, error) {
+// parseItemNoCopy and returns the tuple's data area plus whether it is a pivot.
+//
+// Since M0130-S11.4 slice 3a a PIVOT tuple decodes here rather than being
+// rejected — internal-page downlinks and P_HIKEY separators are pivots, and
+// every generic page reader (pageItems, PageItemKeys, readPageItem, …) walks
+// internal pages too. The two halves of t_tid mean different things for a
+// pivot, so they are translated here, once: the block half is the downlink and
+// the offset half is nbtree status data (natts | BT_PIVOT), never a line
+// pointer, so it is dropped rather than handed on as part of a heap TID.
+//
+// A POSTING tuple still errors out: it has its own decoder in posting.go, and
+// its t_tid halves mean a third thing again (TID count and array offset).
+func parseItemBody(raw []byte) (storage.ItemPointer, []byte, bool, error) {
 	if len(raw) < SizeOfIndexTupleData {
-		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+		return storage.ItemPointer{}, nil, false, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
 	}
 	size := PGIndexTupleSize(raw)
 	if size != len(raw) {
-		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item length mismatch t_info size=%d total=%d", size, len(raw))
+		return storage.ItemPointer{}, nil, false, fmt.Errorf("btree: item length mismatch t_info size=%d total=%d", size, len(raw))
 	}
-	// A plain data item must not carry the nbtree alternative-TID overlay: a
-	// pivot/posting tuple decoded as one would hand the caller status bits as
-	// a heap TID.
-	if PGIndexTupleIsAltTID(raw) {
-		return storage.ItemPointer{}, nil, fmt.Errorf("btree: item has INDEX_ALT_TID_MASK set (t_info=%#x)", pgTInfo(raw))
+	if !PGIndexTupleIsAltTID(raw) {
+		return PGIndexTupleTID(raw), raw[SizeOfIndexTupleData:], false, nil
 	}
-	return PGIndexTupleTID(raw), raw[SizeOfIndexTupleData:], nil
+	if BTreeTupleIsPosting(raw) {
+		return storage.ItemPointer{}, nil, false,
+			fmt.Errorf("btree: item is a posting-list tuple (t_info=%#x)", pgTInfo(raw))
+	}
+	body := raw[SizeOfIndexTupleData:]
+	// Defensive: goopg never writes the tiebreaker representation yet (see
+	// PGBTPivotRaw), but a pivot that carries one keeps a trailing
+	// ItemPointerData that is NOT part of the key.
+	if PGIndexTupleTID(raw).Offset&BTPivotHeapTIDAttr != 0 {
+		if len(body) < SizeOfItemPointerData {
+			return storage.ItemPointer{}, nil, false,
+				fmt.Errorf("btree: heap-TID pivot too short (%d bytes)", len(raw))
+		}
+		body = body[:len(body)-SizeOfItemPointerData]
+	}
+	return storage.ItemPointer{Block: BTreeTupleGetDownLink(raw)}, body, true, nil
 }
 
 func parseItem(raw []byte) (item, error) {
-	ptr, key, err := parseItemBody(raw)
+	ptr, key, pivot, err := parseItemBody(raw)
 	if err != nil {
 		return item{}, err
 	}
-	return item{ptr: ptr, key: append([]byte(nil), key...)}, nil
+	return item{ptr: ptr, key: append([]byte(nil), key...), pivot: pivot}, nil
 }
 
 // parseItemNoCopy returns an `item` whose `key` field ALIASES `raw`
@@ -390,11 +467,11 @@ func parseItem(raw []byte) (item, error) {
 // callers don't retain key, so we can skip the per-slot
 // allocation that the regular `parseItem` does.
 func parseItemNoCopy(raw []byte) (item, error) {
-	ptr, key, err := parseItemBody(raw)
+	ptr, key, pivot, err := parseItemBody(raw)
 	if err != nil {
 		return item{}, err
 	}
-	return item{ptr: ptr, key: key}, nil // key aliases raw — caller must not retain
+	return item{ptr: ptr, key: key, pivot: pivot}, nil // key aliases raw — caller must not retain
 }
 
 // EncodeInt4 is the canonical key encoding for v0 (4-byte big-endian int32).

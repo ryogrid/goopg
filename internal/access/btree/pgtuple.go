@@ -49,6 +49,12 @@ const (
 	// member is a uint16.
 	SizeOfIndexTupleData = 8
 
+	// SizeOfItemPointerData is sizeof(ItemPointerData) (postgres/src/include/
+	// storage/itemptr.h): BlockIdData (two uint16 halves) + OffsetNumber. It is
+	// the size of t_tid, and also the size of the tiebreaker heap TID a pivot
+	// tuple carries after its key attributes.
+	SizeOfItemPointerData = 6
+
 	// IndexMaxKeys is INDEX_MAX_KEYS (postgres/src/include/pg_config_manual.h).
 	IndexMaxKeys = 32
 

@@ -134,6 +134,23 @@ func TestPGIndexTupleMatchesBootstrapEncoders(t *testing.T) {
 	}
 }
 
+// TestPGBTPivotRawMatchesBootstrapMinusInfinityDownlink is the slice-3a half of
+// the same oracle argument. initdb's `pgBuildBtreeMinusInfinityDownlink` writes
+// the leftmost downlink of every bootstrap catalog index, and a real PG 18.3
+// descends those indexes — so its 8 bytes are a validated reference for the
+// zero-attribute pivot tuple the engine's `btree.PGBTPivotRaw` now emits for the
+// same slot. The two encoders live in different packages for the layering reason
+// in pgtuple.go; this test is what keeps them from drifting.
+func TestPGBTPivotRawMatchesBootstrapMinusInfinityDownlink(t *testing.T) {
+	for _, child := range []uint32{1, 2, 0x1234, 0x00010002} {
+		want := pgBuildBtreeMinusInfinityDownlink(child)
+		got := btree.PGBTPivotRaw(nil, storage.BlockNumber(child))
+		if !bytes.Equal(got, want) {
+			t.Errorf("child %d: PGBTPivotRaw = % x, bootstrap encoder = % x", child, got, want)
+		}
+	}
+}
+
 func u16le(v uint16) []byte { return []byte{byte(v), byte(v >> 8)} }
 
 func u32le(v uint32) []byte {

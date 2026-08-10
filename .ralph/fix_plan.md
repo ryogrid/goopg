@@ -829,13 +829,31 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         of the tuple size and `BTreeTupleSetPosting`'s MAXALIGNed posting
         offset — both destroy the opaque key's only length record until
         slice 3 makes it descriptor-derived.
-  - [ ] **slice 3 — comparison layer + pivot truncation**. Key bytes become
-        per-attribute binary datums, so `bytes.Compare` gives way to
-        type-aware comparison; `P_HIKEY` becomes a `_bt_truncate` pivot tuple,
-        which is when `MaxHighKeyLen`/`bulkHighKeyReserve` can be retired in
-        favour of `BTMaxItemSize`. Also restores the two MAXALIGNs slice 2
-        deferred (tuple size, posting offset) — they only become expressible
-        once the key length is derivable from the index descriptor.
+  - [x] **slice 3a — pivot tuples** (2026-08-10). Internal-page downlinks and
+        `P_HIKEY` separators are now real nbtree PIVOT tuples
+        (`INDEX_ALT_TID_MASK` + natts in t_tid's offset half + downlink in its
+        block half) built by the one new encoder `PGBTPivotRaw` — upstream's
+        `_bt_truncate` output for goopg's current key shape. `parseItemBody`
+        decodes pivots (translating t_tid's two halves once) instead of
+        rejecting all alt-TID tuples; the rejection narrows to BT_IS_POSTING.
+        The `item` struct carries an in-memory `pivot` flag so the
+        parse/re-marshal round trip in the split, VACUUM and WAL-replay page
+        rewrites cannot demote a pivot to a plain tuple, and the three
+        "leftmost item adopts a nil key" sites rebuild through `downlinkItem`
+        so the minus-infinity downlink stays a zero-attribute pivot. Guards:
+        `pgpivot_tree_test.go` walks every page of an engine-built and a
+        bulk-loaded tree asserting the invariants (mutation-verified),
+        `pgitem_test.go` +4, and `PGBTPivotRaw(nil, child)` is byte-compared
+        against initdb's PG-validated bootstrap encoder. Deferred (2 ledger
+        rows): pivot natts is always 1 for a keyed separator (one opaque key
+        blob — no real suffix truncation), and the tiebreaker-heap-TID pivot is
+        not written.
+  - [ ] **slice 3b — comparison layer**. Key bytes become per-attribute binary
+        datums, so `bytes.Compare` gives way to type-aware comparison. That is
+        what makes the key length descriptor-derived, and with it: the two
+        MAXALIGNs slice 2 deferred (tuple size, posting offset), real suffix
+        truncation (`_bt_keep_natts` → pivot natts < nkeyatts), and retiring
+        `MaxHighKeyLen`/`bulkHighKeyReserve` in favour of `BTMaxItemSize`.
 - [ ] **M0130-S11.5 — `RM_BTREE` WAL** (est ~2 loops). PG-faithful
       `XLOG_BTREE_*` emit/replay per `nbtxlog.c`, so a PG standby can replay
       goopg index maintenance and not merely read a basebackup snapshot.

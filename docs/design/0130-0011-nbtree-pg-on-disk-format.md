@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2 landed 2026-08-10; S11.4 slice 3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a landed 2026-08-10; S11.4 slice 3b, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -281,6 +281,50 @@ sources agree:
     exported as `PGBTItemRaw` so `internal/amcheck`'s page fixtures build pages
     through the engine's encoder instead of the hand-rolled second (and third,
     and fourth) transcription they carried before.
+  - **S11.4 slice 3a — pivot tuples.** Slice 2 left every on-page tuple a
+    *plain* one: an internal-page downlink was an `IndexTupleData` whose t_tid
+    happened to hold a child block, and the P_HIKEY separator was an ordinary
+    item. Upstream has a third tuple class for exactly these two slots — the
+    PIVOT tuple, `_bt_truncate`'s output: `INDEX_ALT_TID_MASK` in `t_info`, the
+    kept-key-attribute count in t_tid's offset half (`BTreeTupleSetNAtts`), the
+    downlink in its block half. `PGBTPivotRaw` is now the ONE encoder for both
+    slots, and the `item` struct carries an in-memory `pivot` flag so the
+    parse/re-marshal round trip cannot demote one.
+    Three things this slice turns on:
+    1. **`parseItemBody` decodes pivots instead of rejecting them.** Slice 2's
+       blanket alt-TID rejection was too strong once downlinks became pivots:
+       every generic page reader (`pageItems`, `PageItemKeys`, `readPageItem`,
+       the range scan) walks internal pages too. The rejection narrows to
+       BT_IS_POSTING, which keeps its own decoder in `posting.go`. The pivot's
+       t_tid halves are translated exactly once, here: block half → downlink,
+       offset half → status data that is DROPPED rather than handed on as part
+       of a heap TID.
+    2. **The minus-infinity downlink is a zero-attribute pivot.** Upstream's
+       leftmost internal item has no key at all (`nbtsort.c`); goopg's three
+       "the leftmost item adopts a nil key" sites (`removeDownlinkFromParent`,
+       its vacuum twin and the WAL replay path) rebuild it through
+       `downlinkItem`, because an `item{ptr: …, key: nil}` literal would drop
+       the pivot flag and re-emit a plain tuple.
+    3. **The initdb bootstrap builder is the oracle again.**
+       `pgBuildBtreeMinusInfinityDownlink` writes the leftmost downlink of every
+       bootstrap catalog index and a real PG 18.3 descends those indexes, so its
+       8 bytes are a validated reference — `PGBTPivotRaw(nil, child)` is
+       byte-compared against it
+       (`TestPGBTPivotRawMatchesBootstrapMinusInfinityDownlink`).
+    Two upstream properties stay deferred (ledger rows): natts is 1 for every
+    keyed pivot, because goopg's key is still ONE opaque blob and a composite
+    index's separator cannot be truncated to a prefix of its attributes without
+    slice 3b's per-attribute datums; and the tiebreaker-heap-TID pivot
+    (`_bt_truncate`'s `keepnatts > nkeyatts` branch) is not written, because
+    goopg's descent treats the separator as inclusive rather than as a strict
+    lower bound, so adopting it would change routing rather than only bytes.
+  - **S11.4 slice 3b — comparison layer (open).** Key bytes become
+    per-attribute PG binary datums, so `CompareKeys`/`bytes.Compare` gives way
+    to type-aware comparison and `FormPGIndexTuple`/`DeformPGIndexTuple` reach
+    the writer path. That is what makes the key length descriptor-derived, and
+    with it the two MAXALIGNs slice 2 deferred, real suffix truncation
+    (`_bt_keep_natts`) and the retirement of `MaxHighKeyLen` /
+    `bulkHighKeyReserve` in favour of `BTMaxItemSize` become expressible.
 - **S11.5 — `RM_BTREE` WAL.** PG-faithful `XLOG_BTREE_*` emission/replay per
   `nbtxlog.c`, so a PG standby can replay goopg index maintenance rather than
   only read a snapshot.

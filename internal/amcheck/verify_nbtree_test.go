@@ -285,11 +285,17 @@ func pgFlagsForTest(legacy uint16) uint16 {
 	return out
 }
 
-// btItemRaw marshals a B-tree line-pointer item in the on-disk layout parseItem
-// expects: keyLen(2) | block(4) | offset(2) | key. The TID is left zero — the
-// item-order / high-key tier compares only keys.
+// btItemRaw marshals a plain (non-pivot) B-tree line-pointer item through the
+// engine's own encoder. The TID is left zero — the item-order / high-key tier
+// compares only keys.
 func btItemRaw(key []byte) []byte {
 	return btree.PGBTItemRaw(key, storage.ItemPointer{})
+}
+
+// btHighKeyRaw marshals a P_HIKEY separator, which since M0130-S11.4 slice 3a
+// is a PIVOT tuple (INDEX_ALT_TID_MASK + natts) rather than a plain item.
+func btHighKeyRaw(key []byte) []byte {
+	return btree.PGBTPivotRaw(key, 0)
 }
 
 // makeItemsPage builds a non-meta B-tree page carrying keys as line pointers in
@@ -316,7 +322,7 @@ func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockN
 			t.Fatalf("InitPGBTPage: %v", err)
 		}
 		btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: next, Level: level, Flags: pgFlagsForTest(flags)})
-		if _, err := storage.PageAddItemRaw(p, btItemRaw(highKey)); err != nil {
+		if _, err := storage.PageAddItemRaw(p, btHighKeyRaw(highKey)); err != nil {
 			t.Fatalf("PageAddItemRaw high key: %v", err)
 		}
 	} else {
@@ -653,11 +659,12 @@ func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 
 // --- Cross-level downlink tier (VerifyBtreeParentDownlinks) ------------------
 
-// btDownlinkRaw marshals an internal-page line pointer in parseItem's on-disk
-// layout (keyLen(2) | child-block(4) | offset(2) | key), setting the downlink's
-// child block — the field btItemRaw leaves zero.
+// btDownlinkRaw marshals an internal-page downlink through the engine's own
+// encoder. Since M0130-S11.4 slice 3a that is a PIVOT tuple: the child block
+// lives in t_tid's block half and the offset half carries natts, not a line
+// pointer.
 func btDownlinkRaw(key []byte, child storage.BlockNumber) []byte {
-	return btree.PGBTItemRaw(key, storage.ItemPointer{Block: child})
+	return btree.PGBTPivotRaw(key, child)
 }
 
 // dl is a (separator key, child block) downlink for makeInternalPage.
