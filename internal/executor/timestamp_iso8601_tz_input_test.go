@@ -151,7 +151,10 @@ func TestArrayElementISO8601Timestamp(t *testing.T) {
 func TestISO8601NormalisationStopsAtTheUnhandledForms(t *testing.T) {
 	for _, in := range []string{
 		"2020-01-01Z", "2020-01-01 10:00:00 NZ", "2020-01-01T",
-		"2020-01-01T10:00:00+05:3", "2020-01-01Tgarbage", "2020-01-01T10:00.5",
+		"2020-01-01T10:00:00+05:3", "2020-01-01Tgarbage",
+		// '2020-01-01T10:00.5' left this list when the time-field decoder
+		// landed: PG reads it as 2020-01-01 00:10:00.5 (MINUTE TO SECOND), and
+		// TestParsePGTimestampTextPGFieldRoles now pins that reading.
 	} {
 		if got, err := parseCopyTimestamp(in); err == nil {
 			t.Errorf("parseCopyTimestamp(%q) = %v, want an error — the separator/zone folding must not guess", in, got)

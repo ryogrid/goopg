@@ -378,117 +378,44 @@ func parseTimeString(s string) (time.Time, error) {
 	// Full timestamp with date prefix: strip date, keep time part.
 	// e.g. "2003-03-07 15:36:39 America/New_York" → "15:36:39"
 	// PostgreSQL accepts timezone names in full timestamp→time casts (strips them).
+	hadDatePrefix := false
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
-		// Extract time portion after the date (YYYY-MM-DD ).
-		rest := strings.TrimSpace(s[10:])
-		// Strip any timezone suffix (abbreviation, offset, or named zone like America/New_York).
-		if idx := strings.Index(rest, " "); idx >= 0 {
-			rest = rest[:idx]
-		}
-		s = rest
+		// Extract time portion after the date (YYYY-MM-DD ); any zone suffix
+		// it carries is dropped by stripTimeZoneSuffix below.
+		hadDatePrefix = true
+		s = strings.TrimSpace(s[10:])
 	}
 
 	// Detect and reject named timezone in bare time strings (e.g. "15:36:39 America/New_York").
-	if idx := strings.Index(s, " "); idx >= 0 {
-		tz := s[idx+1:]
-		if strings.Contains(tz, "/") {
+	if !hadDatePrefix {
+		if idx := strings.Index(s, " "); idx >= 0 && strings.Contains(s[idx+1:], "/") {
 			return time.Time{}, &ExecError{Code: "22007",
 				Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
 		}
 	}
 
-	// Strip AM/PM suffix.
-	upper := strings.ToUpper(s)
-	isPM := false
-	if strings.HasSuffix(upper, " PM") {
-		isPM = true
-		s = strings.TrimSpace(s[:len(s)-3])
-	} else if strings.HasSuffix(upper, " AM") {
-		s = strings.TrimSpace(s[:len(s)-3])
-	}
+	// Strip the timezone suffix (e.g. " PST", " EDT", "+05", "+05:30"); a
+	// time-only value has no zone to apply it to. The AM/PM marker is NOT a
+	// zone and must survive — dropping it here is what made
+	// '2020-01-01 12:00 AM'::timestamp lose its meridiem.
+	s = stripTimeZoneSuffix(s)
 
-	// Strip timezone abbreviation suffix (e.g. " PST", " EDT", "+05", "+05:30").
-	// Only strip if it's after the time portion.
-	if idx := strings.LastIndex(s, " "); idx >= 0 {
-		s = s[:idx]
-	} else if plus := strings.LastIndex(s, "+"); plus > 2 {
-		s = s[:plus]
-	} else if minus := strings.LastIndex(s, "-"); minus > 2 {
-		s = s[:minus]
-	}
-
-	// Pre-process special time strings that Go's time.Parse can't handle:
-	// - Hour=24 (midnight-of-next-day): normalize to a parseable form first.
-	// - Second=60 (leap second): replace with 59 and add 1 sec in post-processing.
-	var origHour int = -1
-	hasLeapSec := false
-	if len(s) >= 2 {
-		if h, err := strconv.Atoi(s[:2]); err == nil && h >= 24 {
-			origHour = h
-			s = "00" + s[2:] // Replace with "00" so time.Parse succeeds
+	// M0119-0006: field decoding proper is PostgreSQL's, not a layout table's —
+	// see pgdatetime.ParseTimeOfDay for the forms this unlocks ('10:00.5' as
+	// MINUTE TO SECOND, '040506', '10::00', 'allballs', hour-12 AM).
+	tod, err := pgdatetime.ParseTimeOfDay(s)
+	if err != nil {
+		if errors.Is(err, pgdatetime.ErrTimeFieldOverflow) {
+			return time.Time{}, &ExecError{Code: "22008",
+				Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
 		}
-	}
-	// Detect ":60" leap-second pattern (HH:MM:60 or HH:MM:60.xxx).
-	if len(s) >= 8 && s[5] == ':' {
-		secStr := s[6:]
-		// Take up to 2 digit characters for the seconds value.
-		end := 0
-		for end < len(secStr) && secStr[end] >= '0' && secStr[end] <= '9' {
-			end++
-		}
-		if end == 2 {
-			if secStr[:2] == "60" {
-				hasLeapSec = true
-				s = s[:6] + "59" + secStr[2:] // replace :60 with :59
-			}
-		}
-	}
-
-	// Try time layouts.
-	layouts := []string{
-		"15:04:05.000000",
-		"15:04:05.99999",
-		"15:04:05.9999",
-		"15:04:05.999",
-		"15:04:05.99",
-		"15:04:05.9",
-		"15:04:05",
-		"15:04",
-	}
-	var t time.Time
-	var parseErr error
-	for _, layout := range layouts {
-		if parsed, err := time.Parse(layout, s); err == nil {
-			t = parsed
-			parseErr = nil
-			break
-		} else {
-			parseErr = err
-		}
-	}
-	if parseErr != nil {
 		return time.Time{}, &ExecError{Code: "22007",
 			Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
 	}
 
-	// Capture the actual parsed components.
-	// If we substituted the hour (for h>=24), use origHour instead.
-	parsedH := t.Hour()
-	if origHour >= 0 {
-		parsedH = origHour
-	}
-
-	// Apply AM/PM to parsedH.
-	if isPM && parsedH < 12 {
-		parsedH += 12
-	}
-
-	h, m, sec, ns := parsedH, t.Minute(), t.Second(), t.Nanosecond()
+	h, m, sec, ns := tod.Hour, tod.Min, tod.Sec, tod.Nsec
 
 	// Handle leap second: 23:59:60 → 24:00:00 (or carry).
-	if hasLeapSec {
-		sec = 60
-	}
 	if sec == 60 {
 		sec = 0
 		m++
@@ -531,6 +458,34 @@ func parseTimeString(s string) (time.Time, error) {
 		return time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), nil
 	}
 	return time.Date(1970, 1, 1, h, m, sec, ns, time.UTC), nil
+}
+
+// stripTimeZoneSuffix removes the zone part of a time-only input: every
+// space-separated trailing token ("PST", "+05:30", "America/New_York") plus an
+// attached numeric offset ("10:00+05"). A time has no date to resolve a zone
+// against, so PostgreSQL's time_in likewise decodes and then ignores it.
+//
+// The AM/PM marker is explicitly NOT a zone token. It is an ordinary field to
+// PostgreSQL's splitter, and stripping it here was how goopg turned
+// '2020-01-01 12:00 AM' into a parse failure and '12:00 AM' into noon.
+func stripTimeZoneSuffix(s string) string {
+	for {
+		idx := strings.LastIndex(s, " ")
+		if idx < 0 {
+			break
+		}
+		switch strings.ToUpper(strings.TrimSpace(s[idx+1:])) {
+		case "AM", "PM":
+			return s
+		}
+		s = strings.TrimSpace(s[:idx])
+	}
+	if plus := strings.LastIndex(s, "+"); plus > 2 {
+		return s[:plus]
+	} else if minus := strings.LastIndex(s, "-"); minus > 2 {
+		return s[:minus]
+	}
+	return s
 }
 
 // tzAbbrevOffsets maps common timezone abbreviations to their UTC offsets
@@ -705,14 +660,13 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		}
 	}
 
-	// Strip AM/PM first (before timezone extraction)
+	// Detach the AM/PM marker before timezone extraction so the zone scan below
+	// does not mistake it for an abbreviation; it is re-attached verbatim for
+	// parseTimeString, which owns the meridiem rules (hour 12 AM is hour 0).
 	upper := strings.ToUpper(s)
-	isPM := false
-	if strings.HasSuffix(upper, " PM") {
-		isPM = true
-		s = strings.TrimSpace(s[:len(s)-3])
-		upper = strings.ToUpper(s)
-	} else if strings.HasSuffix(upper, " AM") {
+	meridiem := ""
+	if strings.HasSuffix(upper, " PM") || strings.HasSuffix(upper, " AM") {
+		meridiem = s[len(s)-3:]
 		s = strings.TrimSpace(s[:len(s)-3])
 		upper = strings.ToUpper(s)
 	}
@@ -749,11 +703,8 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		}
 	}
 
-	// Now parse the bare time portion (re-apply isPM if needed)
-	if isPM {
-		// Prepend PM back since parseTimeString handles it
-		s = s + " PM"
-	}
+	// Now parse the bare time portion with its meridiem re-attached.
+	s += meridiem
 
 	t, err := parseTimeString(s)
 	if err != nil {
@@ -840,16 +791,45 @@ func parsePGTimestampText(s string) (time.Time, error) {
 	// used by the cross-kind comparison path (tryParseStringAs), so leaving it
 	// out here is what made `d_date = '2002-5-01'` silently match no rows.
 	body = pgdatetime.NormalizeInput(body)
-	for _, layout := range pgTimestampLayouts {
-		if ts, err := time.Parse(layout, body); err == nil {
-			ts, err := pgdatetime.ApplyEra(ts.UTC(), bc)
-			if err != nil {
-				return time.Time{}, err
+	// M0119-0006: a time of day PostgreSQL decodes field-by-field ('10:00 PM',
+	// '040506', '10::00', '10:00.5' — see pgdatetime.ParseTimeOfDay) is beyond
+	// any layout, but the DATE and ZONE parts around it are not. Canonicalizing
+	// the time token in place lets the table below decode the rest unchanged;
+	// it is tried only after the plain spelling fails, so the common path costs
+	// nothing.
+	for _, cand := range [2]string{body, canonicalizeTimestampTimeToken(body)} {
+		if cand == "" {
+			continue
+		}
+		for _, layout := range pgTimestampLayouts {
+			if ts, err := time.Parse(layout, cand); err == nil {
+				ts, err := pgdatetime.ApplyEra(ts.UTC(), bc)
+				if err != nil {
+					return time.Time{}, err
+				}
+				return ts, checkTimeCarrierRange(ts)
 			}
-			return ts, checkTimeCarrierRange(ts)
 		}
 	}
 	return time.Time{}, errNoTimestampLayout
+}
+
+// canonicalizeTimestampTimeToken rewrites the time-of-day token of a
+// "YYYY-MM-DD<sep>..." string through pgdatetime.CanonicalizeTimeToken, and
+// returns "" when there is nothing to rewrite (no date prefix, or a time token
+// the field decoder does not recognise either).
+func canonicalizeTimestampTimeToken(body string) string {
+	if len(body) < 12 || body[4] != '-' || body[7] != '-' {
+		return ""
+	}
+	if sep := body[10]; sep != ' ' && sep != 'T' {
+		return ""
+	}
+	canon, ok := pgdatetime.CanonicalizeTimeToken(body[11:])
+	if !ok {
+		return ""
+	}
+	return body[:11] + canon
 }
 
 // goopg's KindTime Datum carries an int64 count of NANOSECONDS since 1970

@@ -2193,6 +2193,33 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (632 s) + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35). Deferred (ledger):
       move `Datum.Int` for `KindTime` to MICROSECONDS and drop the guard.
       Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §8.
+      **Slice landed 2026-08-11 (31st) — the time-of-day FIELD ROLES, and a
+      second silent twelve-hour error**: the time half of the input path still
+      ran a Go layout list where PG assigns a ROLE to each numeric run after
+      splitting (`DecodeTimeCommon` + the time arms of `DecodeNumberField`). So
+      `'10:00.5'` (PG: `00:10:00.5` — two fields plus a fraction are MINUTE TO
+      SECOND, the fields SHIFT), `'10::00'`/`'10:'` (an empty subfield is 0),
+      `':10:00'` (leading punctuation is a delimiter), `'040506'`/`'0405'`/
+      `'040506.5'` (run-together `hhmmss`/`hhmm`), `'T040506'`, `'10:00AM'` and
+      `'allballs'` were all 22007 — and `'12:00 AM'` was WORSE: decoded as
+      `12:00:00` against PG's `00:00:00` (`DTK_AM` maps hour 12 to 0), twelve
+      hours wrong with no diagnostic, while `'2020-01-01 12:00 AM'::timestamp`
+      lost its meridiem to a zone stripper that truncated at the first space.
+      New leaf `internal/pgdatetime/timeofday.go` (`ParseTimeOfDay`,
+      `CanonicalizeTimeToken`) owns field decoding for `parseTimeString`,
+      `parseTimeTZString` and `parsePGTimestampText`, splits 22007 from 22008 as
+      `DTERR_BAD_FORMAT`/`DTERR_FIELD_OVERFLOW` do, and lets the hour-24 rewrite
+      and `:60` string surgery go with the layouts. Gates: `timeofday_test.go`,
+      `time_field_roles_input_test.go` (36-case `::time` + 16-case `::timestamp`
+      psql batteries against PG 18.3, 0 divergences left in the time battery);
+      units + `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35). Two §6/§7 mutation guards named `'10:00.5'`/`'10::00'` as
+      "refuse until a real DecodeTime walk lands" — this is that walk, so both
+      moved to their PG readings. Deferred (ledger): unvalidated TIME zone
+      suffixes (`'10:00 A.M.'`), the hour-24/leap-second rollover for TIMESTAMP,
+      `timetz`'s session-zone default, and the pre-existing `timestamp`-applies
+      -a-decoded-offset defect this slice made reachable from more spellings.
+      Design: `docs/design/0125-0007-pg-faithful-date-field-decode.md` §9.
       **Slice landed 2026-08-12 — the checkunique posting-list arm END TO END**
       (`TestBtIndexCheck_CheckUniquePostingListRealTree`): the tier now runs over
       posting lists goopg's own bulk build wrote, on a real heap, under the

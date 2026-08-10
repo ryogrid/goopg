@@ -113,19 +113,21 @@ func TestArrayElementSecondlessTimestamp(t *testing.T) {
 // is one PG also has an opinion about, and that opinion is NOT "hh:mm plus
 // whatever followed" — so goopg must keep raising rather than invent a time.
 //
-//	'10:00.5'          PG: 00:10:00.5 (the fractional field is MM:SS.f)
-//	'10::00'           PG: 10:00:00 via an empty MINUTE field
 //	'2020-01-01 10'    PG: 22007 — a lone hour is not a time-of-day
 //
-// The first two are deferral-ledger rows (a real DecodeTime field walk), the
-// third must stay rejected forever.
+// It must stay rejected forever. The two forms this guard used to also list —
+// '10:00.5' (PG: 00:10:00.5, the fractional field is MM:SS.f) and '10::00' (PG:
+// 10:00:00 via an empty MINUTE field) — were the ledger rows asking for a real
+// DecodeTime field walk, and a later M0119-0006 slice landed exactly that
+// (pgdatetime.ParseTimeOfDay). They are pinned to PG's readings in
+// TestParseTimeStringPGFieldRoles now, not to a rejection.
 func TestSecondlessNormalisationStopsAtTheAmbiguousForms(t *testing.T) {
-	for _, lit := range []string{"2020-01-01 10", "2020-01-01 10:00.5", "2020-01-01 10::00"} {
+	for _, lit := range []string{"2020-01-01 10"} {
 		if got, err := parseCopyTimestamp(lit); err == nil {
 			t.Errorf("parseCopyTimestamp(%q) = %v, want an error — the seconds default must not guess", lit, got)
 		}
 	}
-	for _, lit := range []string{"10:00.5", "10::00", "10:00:ab"} {
+	for _, lit := range []string{"10:00:ab"} {
 		if got, err := parseTimeString(lit); err == nil {
 			t.Errorf("parseTimeString(%q) = %v, want an error — the seconds default must not guess", lit, got)
 		}

@@ -399,3 +399,95 @@ asserts agreement so the carrier fix must widen both paths together). Every
 
 Gates: units, `TestPort_RegressSuite` (632 s), `scripts/tpch-spotcheck.sh`,
 pgbench smoke via the commit hook.
+
+## 9. Follow-up 2026-08-11 (M0119-0006) — the time-of-day FIELD ROLES
+
+The eight sections above taught the date half of the input path to decode
+fields instead of matching layouts. The time half was never converted: it still
+ran a list of Go layouts (`"15:04:05"`, `"15:04"`, six fractional variants) in
+`parseTimeString`. PostgreSQL has no such list — `DecodeTimeCommon` and the time
+arms of `DecodeNumberField` (`postgres/src/backend/utils/adt/datetime.c`) assign
+a ROLE to each numeric run after the fact, so the meaning of a field depends on
+how many fields there are, whether one carries a fraction, and whether a
+meridiem follows.
+
+### 9.1 What PG accepts and goopg did not
+
+Verified against PG 18.3 (local cluster, socket `/tmp`, port 5599):
+
+| input | PG | goopg before | rule |
+|---|---|---|---|
+| `'10:00.5'` | `00:10:00.5` | 22007 | a fraction on TWO fields is MINUTE TO SECOND — the fields **shift right** |
+| `'10::00'`, `'10:'` | `10:00:00` | 22007 | an empty subfield decodes as 0 (`strtoint` consumes nothing) |
+| `':10:00'` | `10:00:00` | 22007 | leading punctuation is only a field delimiter |
+| `'040506'`, `'0405'` | `04:05:06`, `04:05:00` | 22007 | `DecodeNumberField`: a 6-digit run is `hhmmss`, a 4-digit one `hhmm` |
+| `'040506.5'`, `'0405.5'` | `04:05:06.5`, `04:05:00.5` | 22007 | the fraction is split off **first**, so the rest still picks its role |
+| `'T040506'` | `04:05:06` | 22007 | the ISO 8601 separator in front of a bare time |
+| `'10:00AM'` | `10:00:00` | 22007 | the tokenizer ends a numeric field at the first non-digit, so no space is needed |
+| `'allballs'` | `00:00:00` | 22007 | the `datetktbl` zero-time token |
+| **`'12:00 AM'`** | **`00:00:00`** | **`12:00:00`** | `DecodeDateTime`'s `DTK_AM` arm maps hour 12 to 0 |
+
+The last row is the one that matters: a **silently wrong answer twelve hours
+off**, not an error. `'13:00 PM'` was equally wrong in the other direction —
+PG raises 22008 (a meridiem past hour 12 is out of range), goopg answered
+`13:00:00`.
+
+Every spelling above is also legal after a date, and there the failure had a
+second cause: `parseTimeString` truncated its input at the first space to drop a
+zone, so `'2020-01-01 12:00 AM'` lost its meridiem before decoding.
+
+### 9.2 What landed
+
+`internal/pgdatetime/timeofday.go` — a leaf sibling of `era.go`:
+
+- `ParseTimeOfDay(s) (TimeOfDay, error)` reimplements `DecodeTimeCommon` (the
+  colon forms, including the MINUTE TO SECOND shift and the empty-subfield rule)
+  and the time arms of `DecodeNumberField` (the run-together forms), plus the
+  `am`/`pm` and `allballs` tokens. It returns raw fields — hour may be 24 and
+  second 60, exactly as PG leaves them for `time_in` to validate — so the
+  caller keeps ownership of the range check.
+- `ErrTimeBadFormat` / `ErrTimeFieldOverflow` mirror PG's `DTERR_BAD_FORMAT` vs
+  `DTERR_FIELD_OVERFLOW` split, which is 22007 vs 22008 at the call sites. goopg
+  reported 22007 for both.
+- `CanonicalizeTimeToken(s)` rewrites just the time token of a timestamp into
+  the padded `HH:MM:SS[.ffffff]` spelling, leaving the date and zone parts
+  byte-identical, so `parsePGTimestampText` reuses the decoder without
+  re-implementing date or zone decoding. It is tried only **after** the plain
+  layout pass fails, so the common path costs nothing.
+
+In the executor, `stripTimeZoneSuffix` replaces the truncate-at-first-space
+logic and explicitly refuses to treat `AM`/`PM` as a zone token; `parseTimeString`
+now delegates field decoding entirely, which also deletes its hour-24 rewrite
+and its `:60` leap-second string surgery (both were only there to make a Go
+layout match). `parseTimeTZString` re-attaches the meridiem it detaches for zone
+extraction — it used to re-attach only `PM`.
+
+### 9.3 Verification
+
+`TestParseTimeOfDayPGAcceptedForms` / `TestParseTimeOfDayRejects` /
+`TestCanonicalizeTimeToken` (unit), and `TestParseTimeStringPGFieldRoles`,
+`TestParseTimeTZStringPGFieldRoles`, `TestParsePGTimestampTextPGFieldRoles`
+(executor) pin every row of the table above to the PG 18.3 answer, plus the
+unchanged behaviour the rewrite could have dropped (hour 24, the leap second, a
+zone a time has no date to apply). Two mutation guards from §6/§7 named
+`'10:00.5'` and `'10::00'` as forms that must keep raising **until a real
+`DecodeTime` field walk lands**; that walk is this section, so both moved to
+their PG readings.
+
+A 36-case `::time` battery and a 16-case `::timestamp` battery were diffed
+goopg-vs-PG through `psql` before and after: 0 divergences remain in the time
+battery, and the timestamp battery's residue is the four ledger rows below.
+
+### 9.4 Still unimplemented (deferral ledger, 2026-08-11)
+
+1. The zone suffix of a TIME is stripped without validation, so `'10:00 A.M.'`
+   is accepted where PG raises `time zone "a.m." not recognized`.
+2. A TIMESTAMP still rejects hour 24 and the leap second (`'2020-01-01 24:00:00'`,
+   `'2020-01-01 23:59:60'`; PG rolls both to `2020-01-02 00:00:00`) — the
+   canonical token cannot carry them, so `CanonicalizeTimeToken` declines rather
+   than invent an instant.
+3. A bare `timetz` takes `+00` instead of the session `TimeZone`.
+4. `timestamp` WITHOUT time zone **applies** a decoded zone offset
+   (`'2020-01-01 10:00:00+05:30'` → `04:30:00`; PG ignores the zone). Pre-existing
+   — the `Z07` layouts are shared by both types — but this slice let more
+   spellings reach it.
