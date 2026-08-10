@@ -4121,7 +4121,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 
 	hiBytes := keyBytes
 	if len(ix.Index.Columns) > 1 {
-		hiBytes = appendCompositeUpperPadding(keyBytes)
+		hiBytes = o.ctx.compositeUpperBound(ix.Index, keyBytes)
 	}
 	err = tree.RangeScan(keyBytes, hiBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})

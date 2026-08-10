@@ -1151,13 +1151,41 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
               pivot as BOTH bounds, group complete AND exclusive of the next).
               Mutation-checked: reverting `rangeScanPos` to `compare` turns the
               30-row group into 0 rows.
+        - [x] **3b-2c-ii-B2-c-ii — the upper-bound funnel** (2026-08-10). NO
+              on-disk change, no REINDEX. B2-c-i gave the SCAN a high end that
+              reads a truncated bound as plus infinity; this gives the PROBES
+              one place to decide what to hand it. Six sites — index scan
+              (equality + range), index-only scan (equality + range), bitmap
+              index scan, and the storage UPDATE-by-index path — each
+              open-coded `appendCompositeUpperPadding(key)`, i.e. each
+              independently asserted that a prefix upper bound is spelled with
+              64 `0xFF` bytes, which is true of exactly ONE of the two formats.
+              All six now call `(*Context).compositeUpperBound(idx, key)`,
+              which resolves the same `pgIndexKeyDesc` the tree took: padded
+              blob bound for `desc == nil`, the prefix pivot UNCHANGED
+              otherwise. Gate off ⇒ byte-for-byte unmoved; gate on ⇒ the flip
+              no longer touches these six files. Side effect worth naming: the
+              sites' `len(Index.Columns) > 1` guard degrades from a correctness
+              condition to a cheap skip, since under the tuple format widening
+              is a no-op and a full-attribute bound compares identically under
+              `compareHigh` and `compare`. An index the resolver refuses keeps
+              the padding even with the gate on — the dual-format property
+              asserted, not assumed. Guards:
+              `internal/executor/pgindex_upperbound_test.go` (blob equality +
+              no aliasing of the caller's key, which is simultaneously the LOW
+              bound; the tuple branch with no `0xFF` run; the undescribable
+              index; and a source scan pinning `compositeUpperBound` as the
+              helper's only caller — mutation-checked by reverting the bitmap
+              site, reported by file:line). The scan matters because a seventh
+              site added later fails as wrong ROWS, never as a compile error.
         - [ ] **3b-2c-ii-B2-c — the flip** (REINDEX-required).
               `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
               `encodeArbiterKey` → `pgIndexTupleKey` under the same
               `ctx.pgIndexKeyDesc(idx)` the tree took (search keys included — a
-              tuple-format search key must itself be tuple-shaped, and the six
-              `appendCompositeUpperPadding` sites must emit a prefix PIVOT
-              instead of 64 `0xFF` bytes, which B2-c-i taught the scan to read),
+              tuple-format search key must itself be tuple-shaped; the ~20
+              single-column `encodeBTreeKeyForColumn` probe sites are what
+              remains on the probe side, the prefix upper bound having moved
+              out to B2-c-i + B2-c-ii),
               `pgIndexTupleKeys` on, and an explicit dual-format decision for
               the indexes the resolver refuses (they keep the blob path, so a
               tree's format is a per-index property). Gates:

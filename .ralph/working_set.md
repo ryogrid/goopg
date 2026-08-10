@@ -1,50 +1,50 @@
-Task: M0130-S11.4 slice 3b-2c-ii-B2-c-i (the prefix upper bound) — DONE,
+Task: M0130-S11.4 slice 3b-2c-ii-B2-c-ii (the upper-bound funnel) — DONE,
 committed + pushed. Next is the flip itself (B2-c, REINDEX-required).
 
 Landed (no on-disk change, `pgIndexTupleKeys` still false):
-- `indexFormat.compareHigh(entry, hi)` in
-  `internal/access/btree/pgkeycmp.go` + helper `truncatedPGIndexTuple`.
-  `rangeScanPos`' TWO `hi` tests (posting + normal branch) use it.
-- For `desc == nil` it IS `CompareKeys` byte for byte ⇒ blob behaviour
-  provably unmoved.
+- `(*Context).compositeUpperBound(idx, key)` in
+  `internal/executor/pgindex_btree.go`. desc==nil ⇒
+  `appendCompositeUpperPadding(key)` (byte-identical to before);
+  desc!=nil ⇒ `key` unchanged (the prefix pivot B2-c-i's `compareHigh`
+  reads as plus infinity).
+- All SIX padding sites now call it: operators_index.go ×2,
+  operators_indexonly.go ×2, operators_bitmap.go:lookupKey,
+  operators_storage.go (UPDATE-by-index).
 
-Why (do not re-derive): a range scan's two bounds are ASYMMETRIC once keys
-are tuples. A prefix search key is a pivot; `ComparePGIndexTuples` makes the
-SHORTER operand minus infinity. Right for the LOW bound (descent lands on
-the group's first member); wrong for the HIGH bound — `compare(entry,hi)>0`
-already holds for that first member, so `WHERE a=?` on a 2-col index returns
-ZERO rows. Blob format hid this by faking plus infinity with bytes
-(`appendCompositeUpperPadding`, 64×0xFF); a tuple cannot use that. Upstream
-never invents a maximal key either (`_bt_check_compare`, nbtutils.c).
+Why (do not re-derive): 64 `0xFF` is a BLOB-format repair, not a scan
+requirement. Under tuple format 0xFF is a malformed attribute image, and
+upstream never invents a maximal key (`_bt_check_compare`). Side effect:
+the sites' `len(Index.Columns) > 1` guard is now a cheap skip, not a
+correctness condition (a full-attribute bound compares the same under
+`compareHigh` and `compare`).
 
-Guard: `internal/access/btree/prefix_highbound_test.go` (4 tests).
-Mutation-checked: reverting `rangeScanPos` to `compare` → 30-row group
-becomes 0 rows.
+Guard: `internal/executor/pgindex_upperbound_test.go` (4 tests), incl. a
+SOURCE SCAN pinning `compositeUpperBound` as the padding helper's only
+caller. Mutation-checked: reverting the bitmap site → the scan reports it
+by file:line.
 
 Still open (ledger row appended this loop):
-- `keyExceedsHighKey` still plain `compare` — correct ONLY until 3b-3 lands
-  `_bt_keep_natts` suffix truncation; then it needs the search key's own
-  keysz, like upstream `_bt_compare`.
-- `(*BTree).Search` has no bound sense (prefix point-lookup not expressible).
-- The six `appendCompositeUpperPadding` sites still emit 0xFF padding.
+- ~20 single-column `encodeBTreeKeyForColumn` probe sites still blob.
+- `compositeUpperPaddingLen = 64` heuristic survives for every index the
+  resolver refuses.
+- The source-scan guard is lexical + package-local (helper is unexported).
 
 Next step: M0130-S11.4 slice 3b-2c-ii-B2-c — THE FLIP.
 `encodeCompositeBTreeKey` (operators_ddl.go:10785) / `encodeIndexKeyFromCols`
 (operators_storage.go:7148) / `encodeArbiterKey` (operators_upsert.go:1490)
-→ `pgIndexTupleKey` under `ctx.pgIndexKeyDesc(idx)`; ~20
-`encodeBTreeKeyForColumn` probe sites; the six `appendCompositeUpperPadding`
-sites → prefix PIVOT; `pgIndexTupleKeys = true`; explicit dual-format
-decision for indexes the resolver refuses. Consider decomposing further
-(writer-side vs probe-side funnel first, still blob). Gates:
-tpch-spotcheck + **TPC-DS SF0.5 gate (mandatory)**, re-pin after REINDEX.
-Re-read the fix_plan banner first (M-NIGHTLY filing unconditional; the six
-`AI-20260810-011258-*` items are filed and left unchecked per the banner).
+→ `pgIndexTupleKey` under `ctx.pgIndexKeyDesc(idx)`; the ~20
+`encodeBTreeKeyForColumn` probe sites; `pgIndexTupleKeys = true`; explicit
+dual-format decision for indexes the resolver refuses. The upper bound is
+NO LONGER part of it. Consider one more split (writers vs probes) — but the
+gate flip must be atomic with both. Gates: tpch-spotcheck + **TPC-DS SF0.5
+gate (mandatory)**, re-pin after REINDEX. Re-read the fix_plan banner first
+(M-NIGHTLY filing unconditional; the six `AI-20260810-011258-*` items are
+filed and left unchecked per the banner).
 
 Gates run: `go build ./...` + `go vet` clean; `go test` PASS for
-./internal/access/btree ./internal/wal ./internal/storage ./internal/amcheck;
+./internal/executor ./internal/access/btree;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=35); commit-hook
-pgbench smoke PASS. NOT run: TPC-DS SF0.5 gate (no query-execution change —
-blob path is byte-identical).
+pgbench smoke PASS. NOT run: TPC-DS SF0.5 gate (blob path byte-identical).
 
 In-flight: none.

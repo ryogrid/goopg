@@ -186,7 +186,7 @@ func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err e
 	lo = key
 	hi = key
 	if len(o.plan.Index.Columns) > 1 {
-		hi = appendCompositeUpperPadding(key)
+		hi = o.ctx.compositeUpperBound(o.plan.Index, key)
 	}
 	return lo, hi, nil
 }

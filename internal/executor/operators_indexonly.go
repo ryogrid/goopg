@@ -141,7 +141,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		loBytes = key
 		hiBytes = key
 		if len(o.plan.Index.Columns) > 1 {
-			hiBytes = appendCompositeUpperPadding(key)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
 	default:
 		lo, hi, ok, err := o.lookupRangeBounds()
@@ -154,7 +154,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		loBytes = lo
 		hiBytes = hi
 		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = appendCompositeUpperPadding(hiBytes)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
 		}
 	}
 

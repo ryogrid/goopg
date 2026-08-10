@@ -403,14 +403,12 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = key
 		hiBytes = key
-		// Composite-index leading-column probe (M0053-0001):
-		// page keys carry suffix bytes for the trailing columns, so the
-		// inclusive upper bound must be widened to match every key whose
-		// leading bytes equal `key`. CompareKeys is byte-wise via
-		// bytes.Compare; appending 0xFF padding produces an upper bound
-		// that exceeds any realistic trailing-column encoding.
+		// Composite-index leading-column probe (M0053-0001): the inclusive
+		// upper bound must cover every key whose leading columns equal `key`.
+		// How that is expressed depends on the key format — see
+		// (*Context).compositeUpperBound.
 		if len(o.plan.Index.Columns) > 1 {
-			hiBytes = appendCompositeUpperPadding(key)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
 	} else {
 		// Range scan: evaluate lo/hi bounds independently.
@@ -425,7 +423,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		loBytes = lo
 		hiBytes = hiB
 		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = appendCompositeUpperPadding(hiBytes)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
 		}
 	}
 

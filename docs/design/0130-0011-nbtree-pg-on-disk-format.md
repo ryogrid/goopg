@@ -1,7 +1,7 @@
 # 0130-0011 — nbtree PG-identical on-disk format
 
 **Milestone:** M0130 (Cluster-directory compat with PG 18.3 + PG physical replication)
-**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
+**Status:** draft (S11.1 + S11.2 + S11.3 + S11.4 slices 1-2-3a-3b-1-3b-2a-3b-2b-3b-2c-i-3b-2c-ii-A-3b-2c-ii-B1-3b-2c-ii-B2-a-3b-2c-ii-B2-b-3b-2c-ii-B2-b-ii-3b-2c-ii-B2-b-iii-3b-2c-ii-B2-b-iv-3b-2c-ii-B2-c-i-3b-2c-ii-B2-c-ii landed 2026-08-10; S11.4 slices 3b-2c-ii-B2-c, 3b-3, S11.5, S11.6 not started)
 **Predecessor:** `0130-0010-pg183-standby-e2e-harness.md` — this doc exists because
 that harness's blocker #12 is milestone-sized and does not belong in an addendum.
 
@@ -747,17 +747,50 @@ sources agree:
             boundaries with a prefix pivot as BOTH bounds, asserting the group is
             complete AND exclusive of the next one. Mutation-checked: reverting
             `rangeScanPos` to `compare` turns the 30-row group into 0 rows.
+          - **3b-2c-ii-B2-c-ii — the upper-bound funnel (landed 2026-08-10).**
+            NO on-disk change, no REINDEX. B2-c-i gave the *scan* a high end that
+            reads a truncated bound as plus infinity; this slice gives the
+            *probes* one place to decide what to hand it. Six sites — index scan
+            (equality and range), index-only scan (equality and range), bitmap
+            index scan, and the storage UPDATE-by-index path — each open-coded
+            `appendCompositeUpperPadding(key)`, i.e. each independently asserted
+            that a prefix upper bound is spelled with 64 `0xFF` bytes. That is
+            true of exactly one of the two formats. All six now call
+            `(*Context).compositeUpperBound(idx, key)`, which resolves the same
+            `pgIndexKeyDesc` the tree took and returns the padded blob bound for
+            `desc == nil` and the prefix pivot UNCHANGED otherwise. With the gate
+            off every site is byte-for-byte what it was, so the funnel lands
+            ahead of the flip; with the gate on the flip no longer has to touch
+            these six files at all. Note what the funnel also does to the sites'
+            `len(Index.Columns) > 1` guard: under the tuple format widening is a
+            no-op, so that test degrades from a correctness condition to a cheap
+            skip — a bound naming every key attribute compares identically under
+            `compareHigh` and `compare`, heap-TID tiebreak included. An index the
+            resolver refuses keeps the padding even with the gate on, which is
+            the dual-format property stated as a test rather than assumed.
+            Guards: `internal/executor/pgindex_upperbound_test.go` — blob
+            equality with `appendCompositeUpperPadding` (plus no aliasing of the
+            caller's key, which is simultaneously the LOW bound), the tuple
+            branch returning the prefix with no `0xFF` run, the undescribable
+            index keeping padding under the gate, and a source scan asserting
+            `compositeUpperBound` is the ONLY caller of the padding helper —
+            mutation-checked by reverting the bitmap site, which the scan
+            reports by file and line. That last one matters because a seventh
+            site added later would fail as wrong ROWS in a scan, never as a
+            compile error.
           - **3b-2c-ii-B2-c — the flip (open). REINDEX-required.**
             `encodeCompositeBTreeKey` / `encodeIndexKeyFromCols` /
             `encodeArbiterKey` → `pgIndexTupleKey` under the same
             `Context.pgIndexKeyDesc` the tree took, search keys included;
             `pgIndexTupleKeys` on; and the explicit dual-format decision for the
-            indexes the resolver refuses. The six `appendCompositeUpperPadding`
-            call sites (operators_index.go, operators_indexonly.go,
-            operators_bitmap.go, operators_storage.go) must emit a prefix PIVOT
-            instead of 64 `0xFF` bytes under the tuple format — B2-c-i taught the
-            scan to read one. Gates: `scripts/tpch-spotcheck.sh` and
-            the TPC-DS SF0.5 gate (re-pin after a REINDEX).
+            indexes the resolver refuses. The prefix upper bound is no longer
+            part of this slice — B2-c-i taught the scan to read a pivot and
+            B2-c-ii routed all six probe sites through the one place that emits
+            it. What remains on the probe side is the ~20 single-column
+            `encodeBTreeKeyForColumn` search keys, which must become
+            tuple-shaped alongside the writers. Gates:
+            `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 gate (re-pin after
+            a REINDEX).
     - **3b-3 — collect the deferrals (open).** With the key length
       descriptor-derived, restore `index_form_tuple`'s MAXALIGN of the tuple
       size and `BTreeTupleSetPosting`'s MAXALIGNed posting offset, implement

@@ -84,6 +84,43 @@ func (ctx *Context) pgIndexKeyDesc(idx *catalog.Index) *btree.PGIndexKeyDesc {
 	return desc
 }
 
+// compositeUpperBound returns the inclusive upper bound to hand
+// `RangeScan`/`RangeScanPos` for a probe on a COMPOSITE index whose search key
+// may name only the leading key attributes.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-ii — the upper-bound funnel. The two key
+// formats express "everything under this prefix" in opposite ways, and this is
+// the one place that knows which:
+//
+//   - blob (desc == nil): a page key is the concatenation of every column's
+//     encoding, and `CompareKeys` is `bytes.Compare`, so a leading-column key
+//     compares BELOW every member of its own group. The bound has to be faked
+//     upwards with bytes — `appendCompositeUpperPadding`'s 64 trailing 0xFF
+//     (M0053-0001). Nothing about that is a valid key; it is a byte string
+//     chosen to sort above any plausible suffix encoding.
+//   - tuple (desc != nil): the key IS the prefix, unchanged. 0xFF padding is
+//     not available (an 0xFF run is a malformed attribute image, not a large
+//     one, and upstream never invents a maximal key either — `_bt_check_compare`
+//     stops when the compared ATTRIBUTES exceed the bound). Instead slice
+//     3b-2c-ii-B2-c-i taught the scan's high-end test to read a truncated bound
+//     as PLUS infinity beyond the attributes it names (`indexFormat.compareHigh`),
+//     which is exactly what a prefix pivot means. A bound that happens to name
+//     every key attribute is unaffected: `compareHigh` then agrees with
+//     `compare` attribute for attribute, heap-TID tiebreak included.
+//
+// So under the tuple format this is a no-op, and the callers' `len(Columns) > 1`
+// guard becomes merely a cheap skip rather than a correctness condition —
+// widening is a blob-format repair, not a scan requirement.
+//
+// The returned slice is caller-owned in the blob case and ALIASES key in the
+// tuple case; callers only read it (they hand it straight to a scan).
+func (ctx *Context) compositeUpperBound(idx *catalog.Index, key []byte) []byte {
+	if ctx.pgIndexKeyDesc(idx) != nil {
+		return key
+	}
+	return appendCompositeUpperPadding(key)
+}
+
 // indexBTreeOptions is the Options every index btree in the engine is
 // opened/created with: the pool's split-WAL hook (what plain btree.Open
 // supplies) plus this index's key descriptor.
