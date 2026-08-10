@@ -480,6 +480,100 @@ leaf and the retargeted parent, then re-applies at the same LSN.
 cannot regress into a data-slot index, and proves the rebuild discards live
 items.
 
+## S11.5d-2 — `XLOG_BTREE_UNLINK_PAGE`
+
+Phase 2, the other half of the pair S11.5d-1 opened. Same trap in the same
+shape: goopg's single native `RecordKindBtreeUnlinkPage` covers the union of
+both phases and is framed under this record's `RM_BTREE`/`0x80` header, so a
+real standby casts a 41-byte native payload to `xl_btree_unlink_page` and then
+PANICs in `XLogInitBufferForRedo(record, 0)` on a block that was never
+registered.
+
+### Record
+
+`EncodeBtreeUnlinkPagePG` (`internal/wal/pg_assembled_emit.go`) emits the
+36-byte `xl_btree_unlink_page{leftsib, rightsib, level, safexid, leafleftsib,
+leafrightsib, leaftopparent}`. Two layout details are wire format, not
+artefacts: the 4 bytes of padding before `safexid` (a `FullTransactionId` is a
+`uint64`, so the struct is 8-byte aligned and upstream casts rather than
+parses), and the *absence* of the struct's own trailing padding —
+`SizeOfBtreeUnlinkPage` is `offsetof(leaftopparent) + sizeof(BlockNumber)`, so
+the record is 36 bytes and not 40.
+
+Blocks: 0 the target `WILL_INIT` with no data, 1 the left sibling **only when
+there is one**, 2 the right sibling unconditionally, 3 the half-dead leaf
+`WILL_INIT` **only when the target is an internal page**, 4 the metapage on the
+`_META` variant (`0x90`), carrying the same 28-byte `xl_btree_metadata` S11.5a
+introduced.
+
+Every structural field is read off a page rather than accepted from the caller —
+the discipline S11.5a and S11.5d-1 established, that a record must not be able
+to describe a page differently from the page it logs. `leftsib`/`rightsib`/
+`level` come from the target's opaque (the unlink preserves all three, so the
+pre- and post-mutation images agree); `leafleftsib`/`leafrightsib` from the
+leaf's; and `leaftopparent` from **the leaf's dummy high key** — precisely the
+tuple S11.5d-1 discovered a half-dead page is defined by. `_bt_unlink_halfdead_page`
+writes the next child down into it and the next invocation reads it back out, so
+phase 2 both consumes and reproduces phase 1's one-item page. That is what makes
+the two records compose over a subtree of arbitrary depth, and it is why block 3
+is `WILL_INIT` with no data: the leaf is *rebuilt*, by the same
+`ReplayMarkHalfDeadLeaf` phase 1's block 0 uses.
+
+The encoder refuses a **rightmost target**. This is structural, not defensive:
+upstream's redo reads block 2 without testing `rightsib`, so "no right sibling"
+has no representation in the record at all — and correspondingly `_bt_pagedel`
+never deletes a rightmost page.
+
+### The deleted page is also defined by its contents
+
+`ReplayUnlinkTargetPage` (`internal/access/btree/pgpagedel.go`) is upstream's
+`_bt_pageinit` + `BTPageSetDeleted`. As with the half-dead page, the rewrite is
+not an optimisation over patching: a deleted page has **no line pointers**, its
+`pd_lower` covers exactly one `BTDeletedPageData`, and its `pd_upper` is closed
+up against `pd_special` so nothing can ever be added. Everything a reader may
+still ask of it lives in the opaque and in that one 8-byte payload — which
+siblings it used to sit between (`_bt_walk_left` follows the links of *deleted*
+pages), what level it was on, and the `safexid` from which the block becomes
+RECYCLABLE. None of it needs a full-page image and all of it is in the record.
+
+`BTP_HAS_FULLXID` is the reason the sibling link fixes get their own helpers
+(`ReplayUnlinkLeftSibling` / `ReplayUnlinkRightSibling`) instead of reusing
+`ReplaySetSiblingNext` / `ReplaySetSiblingPrev`: those round-trip the opaque
+through goopg's legacy `BT*` flag word, and `legacyFlags` has no counterpart for
+`BTP_HAS_FULLXID` (or `BTP_META`), so it silently drops the bit. Dropping it on
+a page that carries a `BTDeletedPageData` turns the `safexid` into garbage for
+`BTPageIsRecyclable`. Upstream's link fix is one field write, so the new helpers
+do exactly one field write. `ReplaySetSiblingNext`'s extra high-key handling is
+also unnecessary here for a reason worth stating: `rightsib` is never `P_NONE`
+in a legal record, so the left sibling stays non-rightmost and the separator it
+already carries still bounds the same key range — the deleted page held no keys.
+
+### Replay
+
+`replayDecodedXLogBtreeUnlinkPage` applies block 1, then 0, then 2, then 3, then
+4 — upstream's order, which is its **lock** order (left to right), preserved
+because a torn replay must leave the sibling chain traversable in the direction
+a live reader walks it. Each limb is independently gated on its own `pd_lsn` and
+falls back to a full-page image when a real-PG record carries one.
+
+### Guards — S11.5d-2
+
+`internal/wal/btree_unlinkpage_pg_test.go` pins the 36-byte main data field by
+field including both alignment holes, checks the leaf-target case registers
+exactly blocks 0/1/2 (and that `leafleftsib`/`leafrightsib` are the target's own
+links with `leaftopparent` invalid, which is what upstream writes), checks the
+internal-target + metapage case adds blocks 3/4 with the `_META` opcode and
+takes the leaf fields from the *leaf*, and fails if any block carries an image.
+`TestEncodeBtreeUnlinkPagePGRefusesUndescribableRecords` covers six inputs
+upstream's redo could not replay as written, the rightmost target among them.
+`TestApplyRecordReplaysPGBtreeUnlinkPage` drives emit → encode → decode →
+`ApplyRecord` over a five-block relation and checks all four limbs.
+`internal/access/btree/replay_pagedel_test.go` pins the deleted page's shape
+against `BTPageSetDeleted` (flags, header, safexid, byte-identical on re-replay)
+and proves the sibling helpers are flag-lossless — including a case that
+documents the legacy helper *is* the lossy one, so a later loop cannot fold them
+back together.
+
 ## Remaining in S11.5
 
 - **S11.5b-2, the incremental left half** — block-0 data (the new item, then
@@ -496,13 +590,6 @@ items.
   in-place rewrite of a posting tuple that lost a subset of its TIDs. goopg
   re-marshals the survivors as separate tuples instead, so a page with posting
   lists still falls back to a full-page image (S11.5c above).
-- **`XLOG_BTREE_UNLINK_PAGE` (S11.5d-2)** — phase 2: main data
-  `xl_btree_unlink_page{leftsib, rightsib, level, safexid, leafleftsib,
-  leafrightsib, leaftopparent}`, block 0 the target rewritten as an empty
-  deleted page, blocks 1/2 the siblings, block 3 the half-dead leaf when the
-  target is an internal page, block 4 the metapage on the `_META` variant.
-  Upstream's redo reads block 2 unconditionally, so a rightmost target has no
-  legal record — upstream never deletes one either.
 - **Rewiring the emit sites (S11.5d-3)** — `unlinkEmptyLeaf` /
   `unlinkEmptyInternalPage` emit one native record covering the union of both
   phases, and they emit it **before** applying, then deliberately re-derive each

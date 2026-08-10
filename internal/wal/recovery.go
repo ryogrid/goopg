@@ -2497,8 +2497,19 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeUnlinkPage, xlogBtreeUnlinkPageMeta:
+			// M0130-S11.5d-2: goopg emits the real xl_btree_unlink_page — main
+			// data {leftsib, rightsib, level, safexid, leafleftsib,
+			// leafrightsib, leaftopparent}, block 0 the target WILL_INIT with
+			// no data (redo rewrites it as an empty deleted page), blocks 1/2
+			// the siblings, block 3 the half-dead leaf for an internal target,
+			// block 4 the metapage on the _META variant.
+			if err := replayDecodedXLogBtreeUnlinkPage(mgr, r, xlog, xlog.Header.Info&XLRRmgrInfoMask == xlogBtreeUnlinkPageMeta); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
-			// Other btree records (unlink / …) are
+			// Other btree records (dedup / delete / reuse-page / …) are
 			// not flipped yet and are emitted with full-page images; restore
 			// each block from its FPI.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
@@ -3115,6 +3126,132 @@ func replayDecodedXLogBtreeMarkPageHalfDead(mgr *storage.Manager, r Record, xlog
 		return btree.ReplayMarkHalfDeadLeaf(page, leftblk, rightblk, topparent)
 	}); err != nil {
 		return fmt.Errorf("wal: xlog btree-mark-halfdead leaf apply: %w", err)
+	}
+	return nil
+}
+
+// replayDecodedXLogBtreeUnlinkPage applies a PG-format xl_btree_unlink_page,
+// mirroring upstream btree_xlog_unlink_page (nbtxlog.c:850-1005) in the same
+// block order — which is upstream's LOCK order, left to right, and is preserved
+// here because a torn replay must leave the sibling chain traversable in the
+// same direction a live reader walks it:
+//
+//	block 1 — the left sibling, if any: btpo_next skips past the target;
+//	block 0 — the target, recreated from scratch as an empty deleted page
+//	          carrying only its BTDeletedPageData safexid;
+//	block 2 — the right sibling: btpo_prev skips back past the target;
+//	block 3 — the half-dead leaf, only when the target was an INTERNAL page:
+//	          recreated with a dummy high key naming the next child down, so the
+//	          next _bt_unlink_halfdead_page call can find it;
+//	block 4 — the metapage, only on XLOG_BTREE_UNLINK_PAGE_META.
+//
+// Each block is separately idempotent via its own pd_lsn, the same per-limb
+// discipline replayDecodedXLogBtreeNewRoot and …MarkPageHalfDead use. Blocks 0
+// and 3 are WILL_INIT.
+//
+// M0130-S11.5d-2. A real-PG record carrying a full-page image on any block is
+// restored from the image instead, exactly as upstream's BLK_RESTORED arm does.
+func replayDecodedXLogBtreeUnlinkPage(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, isMeta bool) error {
+	endLSN := storage.LSN(r.EndLSN)
+	if len(xlog.MainData) < sizeOfXLogBtreeUnlinkPageData {
+		return fmt.Errorf("wal: xlog btree-unlink-page: main data len %d (want >= %d)",
+			len(xlog.MainData), sizeOfXLogBtreeUnlinkPageData)
+	}
+	le := binary.LittleEndian
+	leftsib := storage.BlockNumber(le.Uint32(xlog.MainData[0:4]))
+	rightsib := storage.BlockNumber(le.Uint32(xlog.MainData[4:8]))
+	level := le.Uint32(xlog.MainData[8:12])
+	safexid := le.Uint64(xlog.MainData[16:24])
+	leafleftsib := storage.BlockNumber(le.Uint32(xlog.MainData[24:28]))
+	leafrightsib := storage.BlockNumber(le.Uint32(xlog.MainData[28:32]))
+	leaftopparent := storage.BlockNumber(le.Uint32(xlog.MainData[32:36]))
+
+	// Block 1 is registered under exactly the condition upstream's redo tests.
+	if leftsib != btree.PNone {
+		left, ok := xlogBlockRefByID(xlog, 1)
+		if !ok {
+			return fmt.Errorf("wal: xlog btree-unlink-page leftsib %d but no block 1", leftsib)
+		}
+		if left.HasImage && left.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, left, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-unlink-page left image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, left, endLSN, func(page storage.Page) error {
+			return btree.ReplayUnlinkLeftSibling(page, rightsib)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-unlink-page left apply: %w", err)
+		}
+	}
+
+	target, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-unlink-page missing block 0 (target)")
+	}
+	if target.HasImage && target.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, target, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-unlink-page target image: %w", err)
+		}
+	} else if err := replayInitedXLogBlock(mgr, target, endLSN, func(page storage.Page) error {
+		return btree.ReplayUnlinkTargetPage(page, leftsib, rightsib, level, safexid)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-unlink-page target apply: %w", err)
+	}
+
+	// Block 2 is unconditional — upstream reads it without testing rightsib,
+	// because a rightmost page is never deleted.
+	right, ok := xlogBlockRefByID(xlog, 2)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-unlink-page missing block 2 (right sibling)")
+	}
+	if right.HasImage && right.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, right, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-unlink-page right image: %w", err)
+		}
+	} else if err := replayExistingXLogBlock(mgr, right, endLSN, func(page storage.Page) error {
+		return btree.ReplayUnlinkRightSibling(page, leftsib)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-unlink-page right apply: %w", err)
+	}
+
+	// Block 3 exists iff the target was internal; upstream gates on the block
+	// reference's presence, not on the level, so this does the same.
+	if leaf, ok := xlogBlockRefByID(xlog, 3); ok {
+		if leaf.HasImage && leaf.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, leaf, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-unlink-page leaf image: %w", err)
+			}
+		} else if err := replayInitedXLogBlock(mgr, leaf, endLSN, func(page storage.Page) error {
+			// Byte-identical to phase 1's block 0: upstream builds the
+			// half-dead page the same way in both redo routines, which is what
+			// makes the two records composable across an arbitrary number of
+			// levels.
+			return btree.ReplayMarkHalfDeadLeaf(page, leafleftsib, leafrightsib, leaftopparent)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-unlink-page leaf apply: %w", err)
+		}
+	}
+
+	if !isMeta {
+		return nil
+	}
+	meta, ok := xlogBlockRefByID(xlog, 4)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-unlink-page-meta missing block 4 (metapage)")
+	}
+	if meta.HasImage && meta.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-unlink-page meta image: %w", err)
+		}
+		return nil
+	}
+	md, err := decodeXLogBtreeMetadata(meta.Data)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-unlink-page meta: %w", err)
+	}
+	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
+		return btree.ReplayRestoreMetaPage(page, md)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-unlink-page meta apply: %w", err)
 	}
 	return nil
 }

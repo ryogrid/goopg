@@ -816,6 +816,161 @@ func EncodeBtreeMarkPageHalfDeadPG(rel storage.RelFileNode, leafBlk storage.Bloc
 	return framePGAssembled(RmgrBtree, xlogBtreeMarkPageHalfDead, 0, body), nil
 }
 
+// sizeOfXLogBtreeUnlinkPageData is PG's SizeOfBtreeUnlinkPage:
+// leftsib(4) + rightsib(4) + level(4) + 4 bytes of C alignment padding +
+// safexid(8) + leafleftsib(4) + leafrightsib(4) + leaftopparent(4) = 36. The
+// padding exists because FullTransactionId is a uint64 and therefore 8-byte
+// aligned; like every other main-data struct it is cast, not parsed, so the
+// hole is wire format. 36 is `offsetof(leaftopparent) + sizeof(BlockNumber)` —
+// upstream registers the offsetof size, not sizeof(struct), so the record does
+// NOT carry the struct's own 4 bytes of trailing padding.
+const sizeOfXLogBtreeUnlinkPageData = 36
+
+// BtreeUnlinkPagePGRequest is the input to EncodeBtreeUnlinkPagePG. The record's
+// link/level fields are deliberately NOT in it: they are read off the pages
+// being logged (see EncodeBtreeUnlinkPagePG).
+type BtreeUnlinkPagePGRequest struct {
+	Rel storage.RelFileNode
+	// TargetBlk / TargetPage are the page being unlinked. TargetPage may be
+	// either its pre- or post-mutation image: the unlink preserves btpo_prev,
+	// btpo_next and btpo_level, which are the only fields read from it.
+	TargetBlk  storage.BlockNumber
+	TargetPage storage.Page
+	// SafeXid is the FullTransactionId stamped by BTPageSetDeleted — upstream's
+	// `ReadNextFullTransactionId()` at deletion time, the XID from which the
+	// block becomes recyclable.
+	SafeXid uint64
+	// LeafBlk is the half-dead leaf at the bottom of the subtree being deleted.
+	// It equals TargetBlk on the last (or only) page of the subtree, in which
+	// case LeafPage must be nil and no block 3 is registered.
+	LeafBlk  storage.BlockNumber
+	LeafPage storage.Page
+	// MetaBlk / MetaPage make this the XLOG_BTREE_UNLINK_PAGE_META variant.
+	// MetaBlk is storage.InvalidBlockNumber when the metapage is untouched.
+	MetaBlk  storage.BlockNumber
+	MetaPage storage.Page
+}
+
+// EncodeBtreeUnlinkPagePG builds a PostgreSQL RM_BTREE phase-2 page-deletion
+// record (XLOG_BTREE_UNLINK_PAGE, or …_META when a metapage is supplied),
+// shaped for upstream `btree_xlog_unlink_page` (nbtxlog.c:850-1005) and emitted
+// by `_bt_unlink_halfdead_page` (nbtpage.c:2680-2740):
+//
+//	main data: xl_btree_unlink_page{leftsib, rightsib, level, safexid,
+//	                                leafleftsib, leafrightsib, leaftopparent}
+//	block 0:   the target, WILL_INIT, no data — redo rewrites it as an empty
+//	           deleted page from the main data alone
+//	block 1:   the left sibling, ONLY when the target has one
+//	block 2:   the right sibling, unconditionally
+//	block 3:   the half-dead leaf, ONLY when the target is an internal page —
+//	           WILL_INIT, no data, redo recreates it with the next child down
+//	block 4:   the metapage on the _META variant, WILL_INIT + xl_btree_metadata
+//
+// M0130-S11.5d-2, the second half of the pair S11.5d-1 started. goopg's native
+// `RecordKindBtreeUnlinkPage` covers BOTH phases in one record and is emitted
+// under this same RM_BTREE/0x80 header, so a standby reading it hits the same
+// class of failure S11.5d-1 documented for phase 1: the main data is read as a
+// struct it is not, and `XLogInitBufferForRedo(record, 0)` PANICs on a block id
+// that was never registered.
+//
+// Every structural field is read off a page rather than accepted from the
+// caller, the discipline S11.5a/S11.5d-1 established — the record must not be
+// able to describe a page differently from the page it logs. `leftsib`,
+// `rightsib` and `level` come from the target's opaque; `leafleftsib` and
+// `leafrightsib` from the leaf's; `leaftopparent` from the leaf's dummy high
+// key, which is where `_bt_unlink_halfdead_page` has just written it (nbtpage.c
+// BTreeTupleSetTopParent(leafhikey, leaftopparent)) and where the NEXT
+// invocation will read it back from.
+//
+// A rightmost target is refused rather than encoded: upstream's redo reads block
+// 2 unconditionally, so "no right sibling" has no representation in this record
+// at all — which is consistent, because `_bt_pagedel` never deletes a rightmost
+// page (it would have to update the parent's high key).
+//
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeUnlinkPagePG(req BtreeUnlinkPagePGRequest) ([]byte, error) {
+	if len(req.TargetPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-unlink-page target page must be %d bytes", storage.BlockSize)
+	}
+	op := btree.ReadPGOpaque(req.TargetPage)
+	leftsib, rightsib, level := op.Prev, op.Next, op.Level
+	if rightsib == btree.PNone {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is rightmost; upstream redo reads block 2 unconditionally", req.TargetBlk)
+	}
+	if leftsib == req.TargetBlk || rightsib == req.TargetBlk {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is its own sibling", req.TargetBlk)
+	}
+
+	// Upstream's own values for the target-is-leaf case: the leaf's links ARE
+	// the target's, and there is no next child down because this is the last
+	// page of the subtree being deleted.
+	leafleftsib, leafrightsib := leftsib, rightsib
+	leaftopparent := storage.InvalidBlockNumber
+	blocks := []BlockRef{{ID: 0, Rel: req.Rel, Block: req.TargetBlk, WillInit: true}}
+	if leftsib != btree.PNone {
+		blocks = append(blocks, BlockRef{ID: 1, Rel: req.Rel, Block: leftsib, SameRel: true})
+	}
+	blocks = append(blocks, BlockRef{ID: 2, Rel: req.Rel, Block: rightsib, SameRel: true})
+
+	if req.LeafBlk != req.TargetBlk {
+		if level == 0 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf %d differs from level-0 target %d", req.LeafBlk, req.TargetBlk)
+		}
+		if len(req.LeafPage) != storage.BlockSize {
+			return nil, fmt.Errorf("wal: btree-unlink-page internal target needs the half-dead leaf page")
+		}
+		leafOp := btree.ReadPGOpaque(req.LeafPage)
+		if leafOp.Flags&btree.BTPHalfDead == 0 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf %d is not half-dead", req.LeafBlk)
+		}
+		hikey, ok, err := btree.PGHighKeyRaw(req.LeafPage)
+		if err != nil {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf high key: %w", err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("wal: btree-unlink-page half-dead leaf %d has no top-parent high key", req.LeafBlk)
+		}
+		leafleftsib, leafrightsib = leafOp.Prev, leafOp.Next
+		leaftopparent = btree.BTreeTupleGetDownLink(hikey)
+		// Upstream's Assert: a valid leaftopparent means there is still a level
+		// between the leaf and the target, so the target sits at level > 1.
+		if leaftopparent != storage.InvalidBlockNumber && level <= 1 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaftopparent %d at target level %d (want > 1)", leaftopparent, level)
+		}
+		blocks = append(blocks, BlockRef{ID: 3, Rel: req.Rel, Block: req.LeafBlk, SameRel: true, WillInit: true})
+	} else if req.LeafPage != nil {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is the leaf; no separate leaf page may be logged", req.TargetBlk)
+	}
+
+	info := xlogBtreeUnlinkPage
+	if req.MetaBlk != storage.InvalidBlockNumber {
+		if len(req.MetaPage) != storage.BlockSize {
+			return nil, fmt.Errorf("wal: btree-unlink-page meta page must be %d bytes", storage.BlockSize)
+		}
+		blocks = append(blocks, BlockRef{
+			ID: 4, Rel: req.Rel, Block: req.MetaBlk, SameRel: true, WillInit: true,
+			Data: encodeXLogBtreeMetadata(btree.ReadPGMetaPage(req.MetaPage)),
+		})
+		info = xlogBtreeUnlinkPageMeta
+	}
+
+	mainData := make([]byte, sizeOfXLogBtreeUnlinkPageData)
+	le := binary.LittleEndian
+	le.PutUint32(mainData[0:4], uint32(leftsib))
+	le.PutUint32(mainData[4:8], uint32(rightsib))
+	le.PutUint32(mainData[8:12], level)
+	le.PutUint64(mainData[16:24], req.SafeXid)
+	le.PutUint32(mainData[24:28], uint32(leafleftsib))
+	le.PutUint32(mainData[28:32], uint32(leafrightsib))
+	le.PutUint32(mainData[32:36], uint32(leaftopparent))
+
+	body, err := assembleXLogRecord(mainData, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, info, 0, body), nil
+}
+
 // EncodePageImagePG builds a PostgreSQL RM_XLOG standalone full-page-image record
 // (XLOG_FPI opcode) carrying the page as a block-0 apply-FPI. goopg's first-touch
 // FPI anchor (storage.Pool.maybeEmitFPI) captures the exact page bytes, so this

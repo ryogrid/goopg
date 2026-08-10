@@ -1647,13 +1647,40 @@ there is no in-place upgrade path (REINDEX). Say so in those commit messages.
         `internal/access/btree/replay_halfdead_test.go` (+3, both
         `P_FIRSTDATAKEY` shapes so the PHYSICAL offset cannot regress into a
         data-slot index).
-  - [ ] **S11.5d-2 — `XLOG_BTREE_UNLINK_PAGE`**. Phase 2: main data
-        `xl_btree_unlink_page{leftsib, rightsib, level, safexid, leafleftsib,
-        leafrightsib, leaftopparent}`, block 0 the target rewritten as an empty
-        deleted page, blocks 1/2 the siblings, block 3 the half-dead leaf when
-        the target is internal, block 4 the metapage on the `_META` variant.
-        Redo reads block 2 unconditionally — a rightmost target has no legal
-        record, and upstream never deletes one.
+  - [x] **S11.5d-2 — `XLOG_BTREE_UNLINK_PAGE`** (2026-08-10). Phase 2, the
+        other half of the pair S11.5d-1 opened; same trap in the same shape
+        (goopg's native 41-byte `RecordKindBtreeUnlinkPage` is framed under this
+        record's `RM_BTREE`/`0x80` header, so a standby casts it to
+        `xl_btree_unlink_page` and then PANICs in
+        `XLogInitBufferForRedo(record, 0)`). Now: `EncodeBtreeUnlinkPagePG`
+        emits the 36-byte `xl_btree_unlink_page{leftsib, rightsib, level,
+        safexid, leafleftsib, leafrightsib, leaftopparent}` — both alignment
+        holes are wire format, and the size is `offsetof(leaftopparent) +
+        sizeof(BlockNumber)` = 36, NOT `sizeof(struct)` = 40 — with block 0 the
+        target `WILL_INIT` no data, block 1 the left sibling only when there is
+        one, block 2 the right sibling UNCONDITIONALLY (so a rightmost target is
+        refused: upstream's redo reads block 2 without testing `rightsib`, which
+        is consistent because `_bt_pagedel` never deletes a rightmost page),
+        block 3 the half-dead leaf `WILL_INIT` for an internal target, block 4
+        the metapage on the `_META` (`0x90`) variant. Every structural field is
+        read off a page, S11.5a's discipline; `leaftopparent` comes out of the
+        leaf's DUMMY HIGH KEY — the tuple S11.5d-1 discovered a half-dead page
+        is defined by — and block 3 rebuilds it with the same
+        `ReplayMarkHalfDeadLeaf` phase 1 uses, which is exactly what makes the
+        two records compose over a subtree of arbitrary depth. New
+        `internal/access/btree/pgpagedel.go`: `ReplayUnlinkTargetPage`
+        (`_bt_pageinit` + `BTPageSetDeleted` — a deleted page is ALSO defined by
+        its contents: no line pointers, `pd_lower` covering one
+        `BTDeletedPageData`, `pd_upper` closed against `pd_special`),
+        `PGDeletedPageSafeXid`, and PG-level `ReplayUnlinkLeftSibling` /
+        `ReplayUnlinkRightSibling` — the legacy `ReplaySetSibling*` round-trip
+        the opaque through the `BT*` flag word, which has no counterpart for
+        `BTP_HAS_FULLXID` and silently drops it, turning the safexid into
+        garbage for `BTPageIsRecyclable`. `replayDecodedXLogBtreeUnlinkPage` +
+        dispatch arm apply blocks 1/0/2/3/4 in upstream's LOCK order, each limb
+        pd_lsn-idempotent with an FPI fallback. Guards:
+        `internal/wal/btree_unlinkpage_pg_test.go` (+4),
+        `internal/access/btree/replay_pagedel_test.go` (+3).
   - [ ] **S11.5d-3 — rewire the page-deletion emit sites**. `unlinkEmptyLeaf` /
         `unlinkEmptyInternalPage` emit ONE native record covering both phases,
         BEFORE applying, and then deliberately re-derive each sibling link under
