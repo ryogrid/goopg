@@ -157,7 +157,7 @@ free reuse.
 | opcode | hex | goopg | upstream redo | produced by |
 |---|---|---|---|---|
 | `XLOG_SMGR_CREATE` | 0x10 | H `:2304` | `smgrcreate` `storage.c:989-996` | `CREATE TABLE/INDEX`, new fork |
-| `XLOG_SMGR_TRUNCATE` | 0x20 | **X** | per-fork `smgrtruncate` to `xlrec->blkno` `storage.c:997-1091` | `TRUNCATE`, `VACUUM` tail truncation |
+| `XLOG_SMGR_TRUNCATE` | 0x20 | H (part 6) | per-fork `smgrtruncate` to `xlrec->blkno` `storage.c:997-1091` | `TRUNCATE`, `VACUUM` tail truncation |
 
 **Native analog, measured.** `replaySmgrTruncate` (`internal/wal/recovery.go:4657-4670`)
 exists and is idempotent, but truncates to **zero** blocks
@@ -716,6 +716,61 @@ fail-when-broken by a scripted revert of the dispatch case): a fresh
 `pageno=3` creates segment `0000`, sized to cover the page, all-zero; a
 `pageno=65` (segment 2, `pageInSeg=1`) creates segment `0002` and does not
 create segment `0000`.
+
+### S21a-2 — implementation notes, part 6: SMGR_TRUNCATE (landed 2026-08-12)
+
+`XLOG_SMGR_TRUNCATE` (0x20, RM_SMGR) is the physical half of every
+`TABLE`/`INDEX` `TRUNCATE` and every `VACUUM` tail truncation —
+`XLOG_HEAP_TRUNCATE` (RM_HEAP 0x30, recognised as a no-op in S21a-1) carries
+only OIDs for logical decoding; the actual file shrink arrives here
+(`heapam_xlog.c:1201-1208`). Its main data is `BlockNumber blkno` +
+`RelFileLocator{spcOid,dbOid,relNumber}` + `int flags` (20 bytes,
+`storage_xlog.h:46-51`); `smgr_redo`'s arm (`storage.c:997-1094`) forcibly
+`smgrcreate`s the main fork (a later-dropped relation still gets its truncate
+replayed, "prefer to recreate the rel … until the drop is seen"), then
+truncates each fork the `SMGR_TRUNCATE_{HEAP,VM,FSM}` flag selects — the main
+fork to `blkno` (a NON-zero surviving prefix for a VACUUM tail truncation),
+the vm and fsm forks unconditionally to zero.
+
+**Why goopg's native analog cannot be reused as-is.** goopg's own
+`RecordKindSmgrTruncate` / `replaySmgrTruncate` (`recovery.go`) always
+truncates to zero blocks (`mgr.TruncateRelation`) and its decoder
+(`DecodeSmgrTruncate`) carries only `{dbOid, relOid, fork}` — no `blkno`, no
+fork bitmask, because goopg's own `TRUNCATE` always empties the whole file. A
+real PG's VACUUM tail truncation is a genuinely partial shrink, which needed
+two new primitives: `storage.relFile.truncateTo(n)` / `Manager.TruncateRelationTo`
+(idempotent — a no-op if the file already has `<= n` blocks, mirroring
+`TruncateRelation`'s zero-block idempotency) alongside the existing
+truncate-to-zero pair, and a new PG decoder
+(`decodeXLogSmgrTruncate`, `internal/wal/recovery.go`) that keeps
+`decodeXLogSmgrCreate`'s default/global tablespace-OID remap to goopg's
+`TblOid=0` convention. `applySmgrTruncate` reproduces `smgr_redo`'s
+create-then-truncate order and per-flag fork selection directly (~0% redo
+reuse from the native path; the idempotency shape is what transfers).
+
+**Deliberate deviation, no ledger row needed:** upstream calls `XLogFlush(lsn)`
+before truncating "so that if the truncation fails … you cannot start up the
+system … until you fix the underlying situation" — a torn-truncate durability
+guard for a *live* server applying WAL during normal operation. goopg only
+replays this opcode during a single-threaded startup/crash-recovery pass with
+no concurrent WAL writer and no independent flush point to protect, so the
+`XLogFlush` call has no counterpart here; skipping it changes no observable
+outcome in a batch-replay context.
+
+Guards (`internal/wal/smgr_truncate_pg_test.go`, 4 tests, proven
+fail-when-broken by a scripted revert of the dispatch case): a partial
+main-fork truncate to `blkno=3` on a 10-block file lands at exactly 3 blocks
+and is idempotent on replay; `SMGR_TRUNCATE_VM` alone truncates only the vm
+fork to zero, leaving the main and fsm forks untouched; a truncate record
+naming a relation with no on-disk main fork recreates it (one init block)
+and then truncates it per the flags, matching upstream's recreate-then-drop
+order; the default/global tablespace OID remap round-trips through the new
+decoder.
+
+**STILL OPEN in S21a-2: `HEAP2_REWRITE`'s loud refusal** (0x00 RM_HEAP2,
+out-of-scope `VACUUM FULL`/`CLUSTER` with a logical slot — needs an
+`ErrUnsupportedRecord`-style message, not real redo). Then S21b (btree, ~6
+opcodes, gated on S16 which is already done).
 
 ## Guards
 

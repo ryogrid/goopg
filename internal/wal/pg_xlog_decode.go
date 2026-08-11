@@ -147,6 +147,12 @@ const (
 	// (doc 04 §3.1) to map SmgrCreate onto RM_SMGR_ID.
 	xlogSmgrCreate uint8 = 0x10
 
+	// XLOG_SMGR_TRUNCATE (storage_xlog.h:31). M0131-S21a-2 part 6: goopg
+	// never emits this opcode (its own truncate-to-zero rides the native
+	// RecordKindSmgrTruncate), so this arm exists only for a real-PG crash
+	// tail — every TABLE/INDEX TRUNCATE and every VACUUM tail truncation.
+	xlogSmgrTruncate uint8 = 0x20
+
 	// RM_TBLSPC_ID info codes (commands/tablespace.h). B4.1d.
 	xlogTblspcCreate uint8 = 0x00 // XLOG_TBLSPC_CREATE
 	xlogTblspcDrop   uint8 = 0x10 // XLOG_TBLSPC_DROP

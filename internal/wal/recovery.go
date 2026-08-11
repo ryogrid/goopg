@@ -2544,6 +2544,22 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogSmgrTruncate:
+			// M0131-S21a-2 part 6: every TABLE/INDEX TRUNCATE (the physical
+			// half — XLOG_HEAP_TRUNCATE above is the logical-decoding-only
+			// no-op) and every VACUUM tail truncation. goopg emits its own
+			// truncate-to-zero as the native RecordKindSmgrTruncate, so this
+			// arm is reached only by a real-PG record — which, unlike
+			// goopg's, can truncate the main fork to a NON-zero surviving
+			// prefix and independently truncate the vm/fsm forks.
+			rel, blkno, flags, err := decodeXLogSmgrTruncate(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applySmgrTruncate(mgr, rel, blkno, flags); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -5637,6 +5653,77 @@ func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
 	}
 	_, err = mgr.Extend(rel, page)
 	return err
+}
+
+// SMGR_TRUNCATE_{HEAP,VM,FSM} — flags for xl_smgr_truncate
+// (storage_xlog.h:40-44). M0131-S21a-2 part 6.
+const (
+	smgrTruncateHeap uint32 = 0x0001
+	smgrTruncateVM   uint32 = 0x0002
+	smgrTruncateFSM  uint32 = 0x0004
+)
+
+// decodeXLogSmgrTruncate parses a PG xl_smgr_truncate main-data body
+// (BlockNumber blkno + RelFileLocator{spcOid,dbOid,relNumber} + int flags,
+// 20 bytes, storage_xlog.h:46-51). The decoded RelFileNode carries no Fork —
+// the caller derives it per SMGR_TRUNCATE_* flag, since one record can
+// truncate up to three forks to three different lengths. Mirrors
+// decodeXLogSmgrCreate's tablespace-OID remap. M0131-S21a-2 part 6.
+func decodeXLogSmgrTruncate(mainData []byte) (rel storage.RelFileNode, blkno storage.BlockNumber, flags uint32, err error) {
+	if len(mainData) < 20 {
+		err = fmt.Errorf("wal: xl_smgr_truncate main-data len %d (want 20)", len(mainData))
+		return
+	}
+	blkno = storage.BlockNumber(binary.LittleEndian.Uint32(mainData[0:4]))
+	rel = storage.RelFileNode{
+		TblOid: binary.LittleEndian.Uint32(mainData[4:8]),
+		DBOid:  binary.LittleEndian.Uint32(mainData[8:12]),
+		RelOid: binary.LittleEndian.Uint32(mainData[12:16]),
+	}
+	flags = binary.LittleEndian.Uint32(mainData[16:20])
+	if rel.TblOid == pgDefaultTableSpaceOID || rel.TblOid == pgGlobalTableSpaceOID {
+		rel.TblOid = 0
+	}
+	return rel, blkno, flags, nil
+}
+
+// applySmgrTruncate mirrors smgr_redo's XLOG_SMGR_TRUNCATE arm
+// (storage.c:997-1094): forcibly recreate the main fork (a later-dropped
+// relation still needs its truncate replayed as best-effort, same rationale
+// as applySmgrCreate's own idempotent recreate), then truncate each fork the
+// flags select — MAIN to blkno (a VACUUM tail truncation, or the surviving
+// prefix of a same-transaction TRUNCATE), VM and FSM unconditionally to zero
+// (upstream never partially truncates them: FreeSpaceMapTruncateRel's rounds
+// only pick the summary level, and the vm fork's truncate always drops to
+// zero blocks — visibilitymap.c/freespace.c both re-derive their content
+// from a live heap, never from a partial fork). Idempotent via
+// TruncateRelationTo's own no-op-if-already-shorter check.
+func applySmgrTruncate(mgr *storage.Manager, rel storage.RelFileNode, blkno storage.BlockNumber, flags uint32) error {
+	mainRel := rel
+	mainRel.Fork = storage.MainFork
+	if err := applySmgrCreate(mgr, mainRel); err != nil {
+		return err
+	}
+	if flags&smgrTruncateHeap != 0 {
+		if err := mgr.TruncateRelationTo(mainRel, blkno); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay main fork: %w", err)
+		}
+	}
+	if flags&smgrTruncateVM != 0 {
+		vmRel := rel
+		vmRel.Fork = storage.VisibilityMapFork
+		if err := mgr.TruncateRelationTo(vmRel, 0); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay vm fork: %w", err)
+		}
+	}
+	if flags&smgrTruncateFSM != 0 {
+		fsmRel := rel
+		fsmRel.Fork = storage.FSMFork
+		if err := mgr.TruncateRelationTo(fsmRel, 0); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay fsm fork: %w", err)
+		}
+	}
+	return nil
 }
 
 // decodeXLogTblspcCreate parses a PG xl_tblspc_create_rec main-data body
