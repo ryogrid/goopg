@@ -26,11 +26,13 @@
 // validation to ValidateDate() after decoding.
 //
 // Deliberately NOT handled here (each is a separate, still-unimplemented gap;
-// see .ralph/deferral_ledger.md for M0125-0007): textual month names
-// ('2002-May-1', 'May 1, 2002'), the DateStyle-dependent MDY/DMY field orders
-// that a 1-or-2-digit leading field selects ('02-5-1', '5-1-2002'), '/'
-// separators, and the 3-digit day-of-year field. (The BC era suffix is handled
-// by era.go, and the run-together date form by NormalizeDateTimeInput below.)
+// see .ralph/deferral_ledger.md for M0125-0007): the DateStyle-dependent
+// MDY/DMY field orders that a 1-or-2-digit leading field selects ('02-5-1',
+// '5-1-2002'), '/' separators between NUMERIC fields, and the 3-digit
+// day-of-year field. (The BC era suffix is handled by era.go, the run-together
+// date form by NormalizeDateTimeInput below, and the textual month name —
+// '2002-May-1', 'May 1, 2002' — by monthname.go, which is DateOrder-independent
+// precisely because the month is spelled out.)
 package pgdatetime
 
 import "strings"
@@ -120,7 +122,22 @@ func normalizeInput(s string, runTogetherDate, bc bool) string {
 		return padded + sep + padTimeFields(canonicalZulu(trimmed[sepIdx+1:]))
 	}
 
-	// No leading ISO date — the whole string may still start with a bare
+	// No leading NUMERIC date — the date may still be written with a textual
+	// month ('2002-May-1', 'May 1, 2002'), which DecodeDate resolves before any
+	// numeric field and therefore reads the same under every DateOrder. That
+	// form has to be matched against the WHOLE string rather than datePart,
+	// since its own fields may be space-separated (the split above would stop
+	// at the space inside 'May 1, 2002'). It belongs to DecodeDateTime's
+	// context only: `'May 1, 2002'::time` is an error upstream, so
+	// NormalizeInput must not rewrite it into something a time layout could
+	// mistake for input it accepts.
+	if runTogetherDate {
+		if dateToken, rest, ok := normalizeTextualMonthDate(trimmed, bc); ok {
+			return joinNormalizedDate(dateToken, rest)
+		}
+	}
+
+	// Not a date at all — the whole string may still start with a bare
 	// time-of-day ("3:4:5", "3:4:5-07", "3:4:5 PM").
 	return padTimeFields(canonicalZulu(trimmed))
 }

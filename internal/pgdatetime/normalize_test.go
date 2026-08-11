@@ -253,7 +253,9 @@ func TestNormalizeDateTimeInputRunTogetherDate(t *testing.T) {
 		{"20200101.5", false, "20200101.5"},
 		// Separated spellings keep going through padDateFields unchanged.
 		{"2002-5-1", false, "2002-05-01"},
-		{"2002-May-1", false, "2002-May-1"},
+		// A textual month goes through monthname.go instead (see
+		// TestNormalizeDateTimeInputTextualMonth), not through padDateFields.
+		{"2002-May-1", false, "2002-05-01"},
 	}
 	for _, c := range cases {
 		if got := NormalizeDateTimeInput(c.in, c.bc); got != c.want {
