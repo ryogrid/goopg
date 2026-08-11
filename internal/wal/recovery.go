@@ -2723,6 +2723,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeap2Visible:
+			// M0131-S21a-2 part 3: every VACUUM page it marks all-visible, plus
+			// the freeze an INSERT does on a page it filled itself. goopg emits
+			// its own VM updates as the native RecordKindHeapVisible (payload[0]
+			// = 29), whose ApplyRecord arm is a documented no-op, so this arm is
+			// reached only by a real-PG record — and unlike the native one it
+			// really writes the visibility-map fork.
+			if err := replayDecodedXLogHeap2Visible(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		case xlogHeap2NewCid:
 			// M0131-S21a: XLOG_HEAP2_NEW_CID exists solely so logical decoding
 			// can map a catalog tuple to the command id that produced it;
@@ -3478,15 +3489,23 @@ func replayDecodedXLogHeapLock(mgr *storage.Manager, r Record, xlog *XLogDecoded
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	xmax, offnum, infobits, _, err := decodeXLogHeapLockMainData(xlog.MainData)
+	xmax, offnum, infobits, flags, err := decodeXLogHeapLockMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
-	// The flags byte's only bit, XLH_LOCK_ALL_FROZEN_CLEARED, asks for the
-	// block's visibility-map ALL_FROZEN bit to be cleared. goopg's replay path
-	// holds no VM handle (the whole VM fork story in redo is S21a-2's
-	// XLOG_HEAP2_VISIBLE slice); the bit is deliberately not acted on here and
-	// is recorded in the deferral ledger with the same resume point.
+	// XLH_LOCK_ALL_FROZEN_CLEARED, the flags byte's only bit: the locker had to
+	// clear the block's visibility-map ALL_FROZEN bit, because a frozen page may
+	// not carry a live locker. Upstream does this BEFORE (and independently of)
+	// the heap page redo, with the comment "the visibility map may need to be
+	// fixed even if the heap page is already up-to-date" (heapam_xlog.c
+	// heap_xlog_lock) — so it deliberately runs even when the pd_lsn interlock
+	// skips the tuple stamp below. M0131-S21a-2 part 3 discharges the part-2
+	// deferral of this bit.
+	if flags&xlhLockAllFrozenCleared != 0 {
+		if err := redoClearVMBitsForHeapBlock(mgr, block.Rel, block.Block, storage.VMAllFrozen); err != nil {
+			return fmt.Errorf("wal: xlog heap-lock vm: %w", err)
+		}
+	}
 	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
 	if err != nil {
 		return fmt.Errorf("wal: xlog heap-lock: %w", err)
@@ -3535,6 +3554,228 @@ func replayDecodedXLogHeapConfirm(mgr *storage.Manager, r Record, xlog *XLogDeco
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// sizeOfXLogHeapVisibleData is PG's SizeOfHeapVisible:
+// snapshotConflictHorizon(4) + flags(1) (heapam_xlog.h xl_heap_visible).
+const sizeOfXLogHeapVisibleData = 5
+
+// decodeXLogHeapVisibleMainData parses the fixed xl_heap_visible struct from a
+// PG-format XLOG_HEAP2_VISIBLE record's main data.
+func decodeXLogHeapVisibleMainData(mainData []byte) (snapshotConflictHorizon uint32, flags uint8, err error) {
+	if len(mainData) < sizeOfXLogHeapVisibleData {
+		return 0, 0, fmt.Errorf("wal: invalid xlog heap-visible main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapVisibleData)
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), mainData[4], nil
+}
+
+// replayDecodedXLogHeap2Visible applies a real-PG XLOG_HEAP2_VISIBLE, mirroring
+// heap_xlog_visible (heapam_xlog.c). M0131-S21a-2 part 3.
+//
+// Every VACUUM emits one per page it marks all-visible/all-frozen, and so does
+// an INSERT that freezes a page it filled itself, which makes this the first
+// record a bulk-loaded PG cluster's tail hits after the COPY records. It is
+// also the FIRST record in goopg's redo whose mutation lands on a fork other
+// than `main`: block 0 is the *visibility-map* buffer (fork 2, vm block number),
+// block 1 is the heap block whose bits are being set.
+//
+// Both halves must run and they are independent:
+//
+//   - **Heap page (block 1).** All redo does is set PD_ALL_VISIBLE. Upstream
+//     reads it with XLogReadBufferForRedo, i.e. RBM_NORMAL — a heap file
+//     dropped or truncated later in the stream is simply absent, "we don't need
+//     to update the page, but we'd better still update the visibility map".
+//     That comment is why the block-1 skip must not skip block 0.
+//   - **VM page (block 0).** Read with RBM_ZERO_ON_ERROR: a vm fork that does
+//     not reach this block yet is not an error, it is initialised on the spot.
+//     This is the one place recovery *creates* vm-fork content, and it is what
+//     makes the bits survive into the running server: crash recovery replays
+//     before Runtime.VM is populated from the forks (internal/initdb/open.go),
+//     so a fork page written here is loaded by VMLoadForks a moment later.
+//
+// Upstream additionally (a) resolves hot-standby snapshot conflicts against
+// xlrec->snapshotConflictHorizon and (b) feeds the heap page's free space into
+// the FSM so a promoted standby does not inherit a stale map. goopg does
+// neither — both are deferral-ledger rows, not silent omissions; neither can
+// corrupt the map, and (a) is unreachable while goopg has no hot-standby
+// query traffic during replay.
+func replayDecodedXLogHeap2Visible(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	vmRef, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-visible missing block 0 (visibility map)")
+	}
+	heapRef, ok := xlogBlockRefByID(xlog, 1)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-visible missing block 1 (heap)")
+	}
+	_, flags, err := decodeXLogHeapVisibleMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// Upstream asserts the record carries nothing outside
+	// VISIBILITYMAP_XLOG_VALID_BITS; goopg refuses instead of asserting,
+	// because an unknown bit means the record was written by a PG whose map
+	// semantics goopg does not know.
+	if flags&^(storage.VMValidBits|xlogVisibilitymapXLogCatalogRel) != 0 {
+		return fmt.Errorf("%w: xlog heap-visible flags 0x%02x carry unknown bits", ErrUnsupportedRecord, flags)
+	}
+
+	// Half 1: the heap page's PD_ALL_VISIBLE.
+	if heapRef.HasImage && heapRef.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, heapRef, storage.LSN(r.EndLSN)); err != nil {
+			return err
+		}
+	} else {
+		page, skip, err := redoExistingHeapPageForBlock(mgr, heapRef, storage.LSN(r.EndLSN))
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-visible heap page: %w", err)
+		}
+		if !skip {
+			hdr := storage.MustHeader(page)
+			hdr.SetFlags(hdr.Flags() | storage.PDAllVisible)
+			// Upstream stamps the heap page's LSN only when
+			// XLogHintBitIsNeeded() (checksums or wal_log_hints), since without
+			// those the record carries no FPI for the heap page and a bumped
+			// LSN would lie about what is protected. goopg's redo stamps it
+			// unconditionally: the pd_lsn guard in redoExistingHeapPageForBlock
+			// is what makes every goopg heap redo idempotent, and the stamp is
+			// the conservative direction — it can only cause a later record to
+			// skip a page whose content is already at this LSN.
+			hdr.SetLSN(storage.LSN(r.EndLSN))
+			if err := mgr.WriteBlock(heapRef.Rel, heapRef.Block, page); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Half 2: the visibility-map bits. Runs even when the heap half was
+	// skipped — see the function comment.
+	if vmRef.HasImage && vmRef.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, vmRef, storage.LSN(r.EndLSN))
+	}
+	vmPage, skip, err := redoVMPageForBlock(mgr, vmRef, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-visible vm page: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	if storage.VMBlockForHeapBlock(heapRef.Block) != vmRef.Block {
+		return fmt.Errorf("wal: xlog heap-visible vm block %d does not cover heap block %d (want vm block %d)",
+			vmRef.Block, heapRef.Block, storage.VMBlockForHeapBlock(heapRef.Block))
+	}
+	changed, err := storage.VMPageSetBits(vmPage, heapRef.Block, flags&storage.VMValidBits)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-visible vm apply: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+	storage.MustHeader(vmPage).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(vmRef.Rel, vmRef.Block, vmPage)
+}
+
+// redoVMPageForBlock is the visibility-map counterpart of
+// redoHeapPageForBlock/redoExistingHeapPageForBlock: upstream reads the vm
+// buffer with RBM_ZERO_ON_ERROR and PageInits it when it comes back new
+// (heap_xlog_visible), so a vm fork shorter than the referenced block is not a
+// replay gap — it is the normal state of a fork whose extension was never
+// WAL-logged. Intervening pages are zero-extended and then initialised, the
+// same shape redoHeapPageForBlock uses, because an all-zero vm page and an
+// initialised one mean the same thing (no bits set) and PG's vm_extend writes
+// initialised pages.
+//
+// Returns skip=true when the page is already at or past this record's LSN.
+func redoVMPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if block.Block < nblocks {
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return nil, false, err
+		}
+		if storage.IsNew(page) || block.WillInit {
+			if err := storage.InitPage(page); err != nil {
+				return nil, false, err
+			}
+			return page, false, nil
+		}
+		if storage.MustHeader(page).LSN() >= endLSN {
+			return nil, true, nil
+		}
+		return page, false, nil
+	}
+	zero := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(zero); err != nil {
+		return nil, false, err
+	}
+	for blk := nblocks; blk < block.Block; blk++ {
+		got, err := mgr.Extend(block.Rel, zero)
+		if err != nil {
+			return nil, false, err
+		}
+		if got != blk {
+			return nil, false, fmt.Errorf("vm zero-extend returned block %d, want %d", got, blk)
+		}
+	}
+	if err := storage.InitPage(page); err != nil {
+		return nil, false, err
+	}
+	got, err := mgr.Extend(block.Rel, page)
+	if err != nil {
+		return nil, false, err
+	}
+	if got != block.Block {
+		return nil, false, fmt.Errorf("vm extend returned block %d, want %d", got, block.Block)
+	}
+	return page, false, nil
+}
+
+// redoClearVMBitsForHeapBlock is upstream's visibilitymap_pin +
+// visibilitymap_clear pair as redo uses it (heap_xlog_lock, and every other
+// record that reports having cleared a bit): heapRel names the MAIN fork, the
+// bits live in that relation's visibility-map fork at
+// HEAPBLK_TO_MAPBLOCK(heapBlk).
+//
+// A vm fork that does not reach the covering block is left alone rather than
+// extended. Upstream's visibilitymap_pin does extend it, but only because it
+// must hand visibilitymap_clear a valid buffer; the bits it would then clear
+// are already zero, so the sole difference is whether an all-zero vm page
+// materialises on disk — and materialising one for a *clear* would invent map
+// content that the primary may never have had.
+func redoClearVMBitsForHeapBlock(mgr *storage.Manager, heapRel storage.RelFileNode, heapBlk storage.BlockNumber, bits uint8) error {
+	vmRel := heapRel
+	vmRel.Fork = storage.VisibilityMapFork
+	vmBlk := storage.VMBlockForHeapBlock(heapBlk)
+	nblocks, err := mgr.NBlocks(vmRel)
+	if err != nil {
+		return err
+	}
+	if vmBlk >= nblocks {
+		return nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(vmRel, vmBlk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return nil
+	}
+	// No pd_lsn interlock here, deliberately: upstream's visibilitymap_clear
+	// neither checks nor stamps the vm page's LSN (visibilitymap.c). Clearing
+	// is the conservative direction — a cleared bit only costs an extra heap
+	// fetch — so re-running it after the page has moved past this LSN cannot
+	// produce a wrong answer, whereas skipping it can.
+	changed, err := storage.VMPageClearBits(page, heapBlk, bits)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return mgr.WriteBlock(vmRel, vmBlk, page)
 }
 
 // decodeXLogHeapUpdateMainData parses the fixed xl_heap_update struct from a

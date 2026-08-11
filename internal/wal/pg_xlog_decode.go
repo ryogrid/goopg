@@ -73,6 +73,19 @@ const (
 	xlogHeap2NewCid      uint8 = 0x70 // XLOG_HEAP2_NEW_CID
 	xlogHeap2MultiInsert uint8 = 0x50 // XLOG_HEAP2_MULTI_INSERT
 
+	// XLOG_HEAP2_VISIBLE (M0131-S21a-2 part 3): every VACUUM that marks a page
+	// all-visible emits one, and so does an INSERT that freezes a page it
+	// filled itself. It is the FIRST record whose redo writes the
+	// visibility-map fork rather than the main fork.
+	xlogHeap2Visible uint8 = 0x40
+
+	// xlogVisibilitymapXLogCatalogRel is VISIBILITYMAP_XLOG_CATALOG_REL
+	// (visibilitymapdefs.h:31): an xl_heap_visible flags bit that exists only
+	// on the wire, telling a hot standby that the relation is catalog-ish when
+	// resolving snapshot conflicts. It must be masked off before the flags
+	// reach the map page (visibilitymapdefs.h:29).
+	xlogVisibilitymapXLogCatalogRel uint8 = 0x04
+
 	// XLH_INSERT_* flag bits carried in xl_heap_insert/xl_heap_multi_insert's
 	// `flags` byte (heapam_xlog.h:72-79). Redo consults only the two
 	// visibility-map bits: ALL_VISIBLE_CLEARED clears PD_ALL_VISIBLE on the

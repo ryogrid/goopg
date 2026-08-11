@@ -1,46 +1,44 @@
 (idle — nothing in flight)
 
-M0131-S21a-1 LANDED (loop #155) — the RECOGNITION layer of S21a.
+M0131-S21a-2 PART 3 LANDED (loop #158) — `XLOG_HEAP2_VISIBLE` + the VM fork.
 
-Files: `internal/wal/{pg_xlog_decode.go,pg_assembled_emit.go,recovery.go}`,
-`internal/initdb/{xact_recovery.go,open.go}`, tests in
-`internal/wal/{reader_fail_closed_test.go,xlog_replay_test.go}` +
-`internal/initdb/xact_recovery_test.go`.
+Files: `internal/wal/{recovery.go,pg_xlog_decode.go}`, new
+`internal/storage/vm_redo.go`, new tests
+`internal/wal/heap_visible_pg_test.go` + `internal/storage/vm_redo_test.go`,
+design `docs/design/0131-0015-pg-wal-opcode-coverage.md` §"S21a-2 … part 3"
+(+ README row), fix_plan S21 note, 1 ledger row (4 deferrals).
+
+Key symbols: `replayDecodedXLogHeap2Visible`, `redoVMPageForBlock`,
+`redoClearVMBitsForHeapBlock`, `decodeXLogHeapVisibleMainData`,
+`storage.VMPageSetBits` / `VMPageClearBits` / `VMPageBits` /
+`VMBlockForHeapBlock` / `VMValidBits`.
 
 What landed:
-- RM_HEAP2 masked with `xlogHeapOpMask` 0x70 (was 0xF0) — `heap2_redo` itself
-  switches on `info & XLOG_HEAP_OPMASK` (heapam_xlog.c:1229); upstream ORs
-  INIT_PAGE into a MULTI_INSERT onto a fresh page, so every COPY is 0xD0.
-- Recognised no-ops w/ citations: HEAP_TRUNCATE, HEAP2_NEW_CID,
-  XACT_ASSIGNMENT/INVALIDATIONS, STANDBY_LOCK/INVALIDATIONS. STANDBY_LOCK
-  alone refused the start on any PG tail containing DDL.
-- 2PC opcodes refuse loudly (ErrUnsupportedRecord + "two-phase commit").
-- **XLOG_NEXTOID now really applies**, via a two-pass split: recognised as a
-  page no-op in `replayDecodedXLogRecord`, applied by new
-  `replayNextOIDFromWAL` (initdb) called from `Open` after the pg_control seed.
-  New `wal.EncodeXLogNextOidPG`/`DecodeXLogNextOid`.
+- Every VACUUM's `XLOG_HEAP2_VISIBLE` (0x40) replays: heap page gets
+  PD_ALL_VISIBLE, vm page gets the bits, halves independent (a dropped heap
+  page must NOT skip the map update).
+- `redoVMPageForBlock` = the RBM_ZERO_ON_ERROR member of the
+  `redo*PageForBlock` family; an absent vm page is initialised, not a gap.
+- No VM handle needed after all: replay runs at `initdb/open.go:380`,
+  `VMLoadForks` at `:2472`, so the on-disk fork is the target that survives.
+- Part 2's `XLH_LOCK_ALL_FROZEN_CLEARED` deferral discharged, in upstream's
+  position — before and independent of the heap redo (so an LSN-skipped lock
+  record still fixes the map).
+- `VISIBILITYMAP_XLOG_CATALOG_REL` masked off; unknown flag bits refuse.
 
-4 new guards, ALL proven fail-when-broken by scripted reverts. One pre-existing
-test corrected: `TestApplyRecordRejectsUnknownDecodedXLogStandbyRecord` used
-0x20 as "unknown"; now 0x30 (PG really leaves it undefined).
+10 guards / 12 subtests, all proven fail-when-broken by 6 scripted reverts.
 
-2 ledger rows: S21a-2's whole page-mutating set still refused; and the
-max-vs-set deviation from upstream's OID-wraparound-safe "believe the record
-exactly" (goopg's allocator is monotone, no wraparound path).
-
-Gates: internal/wal PASS + `-race` PASS, internal/initdb PASS (75 s), UNITS
-precommit PASS, pgbench smoke via the commit hook.
+Gates: `internal/wal` PASS + `-race` PASS, `internal/storage` PASS,
+`internal/initdb` PASS (77 s), UNITS precommit PASS, pgbench smoke via hook.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
-items already filed under M-NIGHTLY (fix_plan.md:766) — parked per banner.
+items already filed under M-NIGHTLY — parked per banner.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): **M0131-S21a-2**, the page
-work — `XLOG_HEAP2_MULTI_INSERT` 0x50 first (~70% reuse from
-`replayHeapMultiInsert`, recovery.go:3842; needs the xl_heap_multi_insert /
-xl_multi_insert_tuple block-0 decoder + INIT_PAGE + offsets[]), then
-`XLOG_HEAP_LOCK` 0x60 and `XLOG_HEAP2_VISIBLE` 0x40 (0% reuse — goopg's
-HeapVisible replay is an explicit no-op), plus the zero-extend at
-`replayDecodedXLogHeapInsert`'s replay-gap `default:`. Each landing shrinks
-S28's skip. Design: `docs/design/0131-0015-pg-wal-opcode-coverage.md` §S21a.
+Next loop (banner = M-NIGHTLY filing, then M0131): **S21a-2 part 4** —
+`XLOG_HEAP2_LOCK_UPDATED` 0x60 (`heap_xlog_lock_updated`, the multixact
+member update; near-sibling of part 2's HEAP_LOCK, so `PageApplyHeapLockRedo`
++ `redoExistingHeapPageForBlock` should both reuse), then `CLOG_ZEROPAGE`
+0x00, `SMGR_TRUNCATE` 0x20, `HEAP2_REWRITE`'s refusal. Each landing shrinks
+S28's self-arming skip.
 
 In-flight: none.

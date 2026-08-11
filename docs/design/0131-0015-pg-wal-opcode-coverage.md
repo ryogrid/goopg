@@ -539,6 +539,93 @@ seeded its two rows from a **map literal**, so Go's randomised iteration order
 inserted slot 2 first on roughly half of all runs and the test failed with "slot
 2 out of range". It is an ordered slice now.
 
+### S21a-2 — implementation notes, part 3: HEAP2_VISIBLE + the VM fork (landed 2026-08-12)
+
+`XLOG_HEAP2_VISIBLE` (0x40) is emitted by every VACUUM for each page it marks
+all-visible, and by an INSERT that freezes a page it filled itself. It is the
+first opcode in this milestone with **zero reuse** — goopg's own VM updates are
+the native `RecordKindHeapVisible`, whose `ApplyRecord` arm is an explicit no-op
+— and the first record whose redo writes a fork other than `main`.
+
+**The record is two independent halves.** Block 1 is the heap page and block 0
+is the *visibility-map* page (fork 2, vm block number, not the heap block
+number). Upstream reads the heap page with `XLogReadBufferForRedo`
+(`RBM_NORMAL`) and says why the halves must not be coupled: "If the heap file
+has dropped or truncated later in recovery, we don't need to update the page,
+but we'd better still update the visibility map." goopg therefore runs the
+`redoExistingHeapPageForBlock` skip on the heap half and continues to the vm
+half regardless — a coupling bug here leaves the map permanently un-set for
+exactly the pages a later truncate touched.
+
+**The vm half is `RBM_ZERO_ON_ERROR`, and that is the new shape.** A vm fork
+shorter than the referenced block is not a replay gap: like a heap extension,
+a vm extension is not WAL-logged, and upstream simply `PageInit`s the page it
+read as zeros. `redoVMPageForBlock` is that rule — the third member of the
+`redo*PageForBlock` family, whose members differ *only* in what they do with an
+absent page (zero-extend / skip / zero-extend-and-init), which is exactly the
+distinction upstream draws between `RBM_EXTEND`, `RBM_NORMAL` and
+`RBM_ZERO_ON_ERROR`.
+
+**Why redo can write the fork without a `VisibilityMap` handle.** `ApplyRecord`
+is given only a `*storage.Manager`, and part 2 deferred both VM items for that
+reason. The resolution is that the handle was never the right target: crash
+recovery replays at `internal/initdb/open.go:380`, while `Runtime.VM` is
+populated by `VMLoadForks` at `:2472` — *after*. A redo that mutated the
+in-memory map would be overwritten by the load; a redo that mutates the on-disk
+`_vm` fork is picked up by it. The on-disk layout was already PG's
+(`vm_fork.go`: 2 bits per heap block, 4 per byte, data at
+`MAXALIGN(SizeOfPageHeaderData)` = `PageGetContents`), so only the addressing
+arithmetic was new: `internal/storage/vm_redo.go` ports `HEAPBLK_TO_MAPBLOCK` /
+`HEAPBLK_TO_MAPBYTE` / `HEAPBLK_TO_OFFSET` plus the two bit mutations inside
+`visibilitymap_set` (OR, with upstream's `flags != status` short-circuit that
+lets redo skip the page write entirely) and `visibilitymap_clear` (AND-NOT).
+
+**`VISIBILITYMAP_XLOG_CATALOG_REL` is wire-only.** It rides in the record's
+flags byte to tell a hot standby the relation is catalog-ish while resolving
+snapshot conflicts, and upstream forbids passing it to `visibilitymap_set`.
+goopg masks with `VMValidBits` before the bits reach the page and *refuses* a
+flags byte carrying anything outside `VISIBILITYMAP_XLOG_VALID_BITS`, where
+upstream only asserts — an unknown bit means a PG whose map semantics goopg does
+not know.
+
+**Part 2's `XLH_LOCK_ALL_FROZEN_CLEARED` deferral is discharged here**, in the
+place upstream puts it: `heap_xlog_lock` clears the block's `ALL_FROZEN` bit
+*before* the heap page redo and independently of it, under the comment "the
+visibility map may need to be fixed even if the heap page is already
+up-to-date". Skipping the clear when the pd_lsn interlock skips the tuple stamp
+would leave an index-only scan trusting an all-frozen bit for a page that now
+carries a live locker, so the ordering is a guard, not a detail. Only
+`ALL_FROZEN` is cleared, never `ALL_VISIBLE` alone — upstream asserts against
+that combination and `VMPageClearBits` refuses it.
+
+**One deliberate deviation from `visibilitymap_pin`:** a *clear* against a
+relation whose vm fork does not reach the covering block leaves the fork alone
+instead of extending it. Upstream extends only because it must hand
+`visibilitymap_clear` a valid buffer; the bits it then clears are already zero,
+so the only difference is whether an all-zero vm page materialises on disk —
+and materialising one for a clear would invent map content the primary may never
+have had.
+
+Three ledger rows: upstream's hot-standby snapshot-conflict resolution
+(`ResolveRecoveryConflictWithSnapshot` against `snapshotConflictHorizon`) is
+decoded and not acted on; upstream's `XLogRecordPageWithFreeSpace` FSM update is
+not performed, so a promoted goopg inherits a stale free-space map; and
+`VMSaveForks` rewrites every fork from the in-memory map, which tracks
+`ALL_VISIBLE` only — so an `ALL_FROZEN` bit replayed here survives until the
+first VM save, then silently drops to 0 (conservative: a lost frozen bit costs
+work, never correctness).
+
+Guards (`internal/wal/heap_visible_pg_test.go` 6 tests / 8 subtests +
+`internal/storage/vm_redo_test.go` 4 tests, all proven fail-when-broken by six
+scripted reverts): both halves landing; ALL_VISIBLE+ALL_FROZEN with the
+catalog-rel bit masked off; a heap block mapping to vm block 1 that creates the
+vm fork *and* leaves the absent heap page unextended; idempotency under a stale
+re-apply; three refusals (unknown flag bit, truncated main data, missing heap
+block ref); the ALL_FROZEN clear, including that it runs when the heap half is
+LSN-skipped and that it does not create an absent fork; and the addressing
+math's three boundaries (within a byte, across a byte, across a vm page) round-
+tripped through `parseVMPage` so redo and the fork writer cannot drift.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
