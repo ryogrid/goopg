@@ -135,3 +135,86 @@ outranks the WAL-atomicity work S30 was filed for.
 `analysis/idxprobe.sh` (committed with this document). Env: `CLIENTS` (default
 4), `SECS` (default 20). Uses port 5534 and the cgroup cap wrapper per the
 standing server-lifecycle rule.
+
+---
+
+# RESOLVED — 2026-08-11 (M0131-S31)
+
+## Root cause
+
+**Opportunistic HOT prune never re-points a redirect it created earlier**, and
+the same pass then reclaims the slot that redirect addresses.
+
+`pagePruneCore` (`internal/storage/prune.go`) walked the line pointers and did
+`if item.Flags != ItemIDNormal { continue }`. An `ItemIDRedirect` root — the
+line pointer a *previous* prune produced for a HOT chain whose root had died —
+was therefore invisible to the prune. Meanwhile the redirect's target, by then a
+dead HEAP_ONLY tuple further down the same chain, was correctly classified as
+HOT-only dead and appended to `result.Unused`. After
+`VacuumHeapPageBySlots` the sequence is:
+
+```
+LP 102: REDIRECT → 227      (untouched: not ItemIDNormal)
+LP 227: UNUSED              (reclaimed in the same pass)
+LP 228: NORMAL, live        (unreachable — nothing points here)
+```
+
+The btree entry for the key still addresses LP 102, and
+`followHOTChainNoCopy` stops dead at a non-NORMAL chain end. The row is gone
+from every index scan — an equality probe returns 0 rows, an ordered range scan
+appears to *skip* the key — while a seq scan (`WHERE id+0 = k`) still returns
+it. Upstream does not have this hole: `heap_prune_chain`
+(`postgres/src/backend/access/heap/pruneheap.c`) starts from redirected roots
+too (`if (ItemIdIsRedirected(rootlp))`) and re-points the redirect at the new
+surviving tip.
+
+**Two HOT updates of one row on a page that prunes are sufficient.** That is why
+the loss looked random and load-dependent: it needs the page-full prune (which
+`tryApplyHOTUpdate` triggers) plus a second HOT update of an already-redirected
+root. A row whose first update happened to go non-HOT got a fresh index entry
+pointing past the redirect and stayed reachable — the "interleaved" losses of
+the original diagnosis.
+
+Repairing that exposed a second, latent defect in the same helper:
+`pruneChainTip` followed `t_ctid.Offset` on *any* dead member, including one
+whose update was **non-HOT**. A non-HOT successor lives on a different block, so
+its offset read as a slot on *this* page lands on an unrelated tuple; if that
+tuple is live it becomes the redirect target and the root's index entry then
+resolves to a **foreign row** (`WHERE id=104` returned two rows in the first
+build of the fix). Upstream ends the chain at `!HeapTupleHeaderIsHotUpdated`
+for exactly this reason.
+
+## Fix
+
+`internal/storage/prune.go`, both arms in `pagePruneCore`/`pruneChainTip` — so
+`PagePruneOpt` (opportunistic) and `PageVacuumPrune` (VACUUM) get it alike:
+
+1. An `ItemIDRedirect` line pointer is treated as a chain root: follow it with
+   `pruneChainTip` and re-point it (recording a `Redirects` entry, which the
+   existing prune WAL record already carries, so replay stays in step).
+2. `pruneChainTip` stops at a dead member that is not `HeapHotUpdated`.
+
+## Verification
+
+| probe | before | after |
+|---|---|---|
+| `analysis/idxprobe.sh` (pgbench, 4 clients, 20 s, 20000 rows) | 5576 unreachable ids | **0** |
+| `analysis/idxprobe3.sh` (single session, 20000 serial updates) | 4335 unreachable of 12591 updated | **0** |
+| `analysis/idxprobe2.sh` (deterministic 1..5 updates of 5 ids) | ids with 2–4 updates unreachable, one update lost | **all reachable, no lost update** |
+| `REINDEX INDEX t_pkey` after the pgbench probe | `could not create unique index` | **OK** |
+
+The `REINDEX` failure was the same defect, not a second one: the index builder
+was reading a heap whose chains had been severed. It is dropped from the open
+list.
+
+Regression tests: `TestPagePruneOptRepointsExistingRedirect` and
+`TestPagePruneOptStopsAtNonHOTChainEnd` (`internal/storage/prune_test.go`) —
+both fail on the pre-fix `prune.go`.
+
+## Still deferred
+
+A redirect whose entire chain is dead is left in place rather than converted to
+`LP_DEAD` (upstream `heap_prune_record_dead`), because the prune WAL record has
+no way to express an LP_DEAD transition and `VacuumHeapPageBySlots` ignores
+non-NORMAL slots. Readers treat a non-NORMAL chain end as "no live tuple", so
+this costs a line pointer, not correctness. See the deferral ledger.

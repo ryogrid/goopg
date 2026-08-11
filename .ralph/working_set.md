@@ -1,51 +1,43 @@
 (idle — nothing in flight)
 
-Loop #128 landed **M0131-S20.1 + S20.2**. S20 stays UNCHECKED — S20.3/.4/.5 remain.
+Loop #131 CLOSED **M0131-S31** — the highest-severity open bug (silent wrong
+answers on ordinary traffic). Root-caused, fixed, tested, documented.
 
-Carry-forward:
+**Root cause:** `pagePruneCore` (`internal/storage/prune.go`) did
+`if item.Flags != ItemIDNormal { continue }`, so an `ItemIDRedirect` root left by
+an EARLIER prune was never re-pointed — while the SAME pass reclaimed the (dead,
+HEAP_ONLY) slot that redirect addressed. Chain severed: the btree entry resolves
+to an LP_UNUSED slot, the row disappears from every index scan while a seq scan
+still returns it. Two HOT updates of one row on a page that prunes suffice.
+Upstream `heap_prune_chain` starts from redirected roots for this exact reason.
+Fixing it exposed a second defect: `pruneChainTip` followed `t_ctid.Offset` past
+a dead member whose update was NON-HOT (successor on another block) — the offset
+read as a local slot could point the redirect at a FOREIGN live row (`WHERE
+id=104` returned two rows in the first build). Both arms fixed, so
+`PagePruneOpt` and `PageVacuumPrune` share the repair.
 
-- **Next pick per the banner:** finish M0131-S20 (S20.3 unconditional pre-replay
-  `pg_internal.init` sweep, S20.4 `multixact.NewStoreAt` seeding from
-  `pg_control.nextMulti` — the seam exists and still has no caller, S20.5 write
-  the `minRecoveryPoint` policy down). Then S29.
-- **New seam:** `internal/initdb/recovery_state.go` — `beginRecovery(dataDir)`
-  returns `startupRecoveryDecision{crashRecovery, redoLSN, prevState}` and is the
-  ONLY reader of `pg_control.State` in the tree. Anything else that needs to know
-  "is this start a recovery?" asks it. `endOfRecoveryCheckpoint` next to it.
-  On the WAL side: `wal.ReplayRecordsFrom` / `ReplayFromDirWithMgrAt` /
-  `replayStartAt` take an explicit redo anchor; `redo == 0` = "use the scan".
-- **Plan corrections recorded in the design doc, not silently applied:**
-  `DB_SHUTDOWNED_IN_RECOVERY` is NOT clean (upstream's test is a single
-  `!= DB_SHUTDOWNED`), and the "teach `isCheckpointRecord` about
-  `XLOG_CHECKPOINT_REDO`" subtask is dropped as a mis-specification.
-- **⚠ Biggest finding of the loop — filed as M0131-S30, wrong-answer class:**
-  goopg crash recovery LOSES and DUPLICATES heap rows. Scale-5 pgbench + SIGKILL
-  + restart: 500000 → 499949 rows, 218 missing `aid`s against 64 net missing
-  (~154 duplicated). **Reproduced identically on a worktree build of the parent
-  commit `15e73de3`** (500000 → 499936) — pre-existing, not an S20 regression.
-  Prime suspect is the already-ledgered non-atomic non-HOT update
-  (`HeapDelete` + `HeapInsert` as two records). Confirm with `pg_waldump` around
-  a duplicated `aid` BEFORE changing code.
-- 3 ledger rows: the archive-recovery (`recovery.signal`) InRecovery arm is still
-  unimplemented in `beginRecovery`; goopg never VALIDATES that a checkpoint record
-  actually lives at the redo address (upstream's "could not locate a valid
-  checkpoint record"); plus the S30 discovery.
+**How it was found (method worth reusing):** binary-search the workload down to a
+deterministic repro, then flip suspects off one at a time in a rebuilt binary.
+Order that worked: pgbench → single psql session → 15 serial statements
+(`analysis/idxprobe2.sh`, ids 101..105 updated 1..5 times) → kill-list disabled
+(not it) → call-site prints (non-HOT path never reached; all updates HOT) →
+prune disabled (all rows reachable) → print the PruneResult, which showed
+`redirects=[[102 227]]` followed by `unused=[227]`.
 
-Technique reused (seventh loop): every guard proven fail-when-broken by scripted
-revert over /tmp backups — 6 break directions here, each caught by a different
-assertion.
+**Verified:** idxprobe.sh 5576→0 unreachable, idxprobe3.sh 4335→0,
+idxprobe2.sh clean, `REINDEX INDEX t_pkey` OK (it was the same defect).
 
-Traps: port 5533 was held by an ORPHANED `goopg-sub` from an earlier session —
-used 5534/5535 instead; always `ss -ltnp` first and grep the server log for
-"address already in use". The in-situ crash smoke is only meaningful with a
-same-shape baseline run (worktree build of the parent commit) — that comparison
-is what turned "S20 broke durability" into "pre-existing, file it".
+Gates run: units suite PASS (`RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`, warm cache); `scripts/tpch-spotcheck.sh`
+RESULT=PASS (Q12 rows=2, Q13 rows=35); `make ralph-state-guard` clean after
+self-repair; pgbench smoke via the commit hook.
 
-Gates run this loop: 6 new guards PASS + each proven failing without the fix,
-`internal/wal` + `internal/control` + `internal/initdb` PASS (74 s),
-`TestE2E_PGColdStart*`/`PGStandbyFullCycle`/`Failover*` PASS (68 s), in-situ
-SIGKILL crash-restart smoke (both HEAD and parent-commit builds), UNITS PASS,
-`scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35), pgbench smoke via the
-commit hook.
+Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
+(AI-…-001..012), all already filed under M-NIGHTLY; nothing new.
+
+NEXT LOOP: re-read the `## Current Priority` banner (M-NIGHTLY, then M0131).
+M0131-S30 still retains its one unmeasured claim (raw `count(*)` loss under a
+kill that provably fires) — note that S31's fix may well have been its whole
+substance.
 
 In-flight: none.

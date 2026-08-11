@@ -140,6 +140,32 @@ func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
 		if err != nil {
 			return result, 0, err
 		}
+		if item.Flags == ItemIDRedirect {
+			// M0131-S31: a root that a PREVIOUS prune already turned into a
+			// redirect is still a chain root — upstream's heap_prune_chain
+			// starts from redirected roots too (`if (ItemIdIsRedirected(rootlp))`,
+			// postgres/src/backend/access/heap/pruneheap.c) and re-points the
+			// redirect at the surviving tip. Skipping it, as this loop did, lets
+			// the SAME pass mark the redirect's target unused (the target is a
+			// dead HEAP_ONLY tuple by then) while the redirect keeps addressing
+			// it: the index entry on the root resolves to an LP_UNUSED slot and
+			// the row silently disappears from every index scan while a seq scan
+			// still returns it. Two HOT updates of one row on a page that prunes
+			// were enough to lose it.
+			tip := pruneChainTip(p, item.Offset, isDead)
+			if tip != 0 && tip != item.Offset {
+				if err := PageSetItemIDRedirect(p, slot, tip); err != nil {
+					return result, 0, err
+				}
+				result.Redirects = append(result.Redirects, [2]uint16{slot, tip})
+			}
+			// tip == 0 (whole chain dead) is left alone: upstream converts such a
+			// root to LP_DEAD for index vacuum to clean up, which goopg's prune
+			// WAL cannot express yet (see the deferral ledger). Leaving the stale
+			// redirect is safe — every reader treats a non-NORMAL chain end as
+			// "no live tuple".
+			continue
+		}
 		if item.Flags != ItemIDNormal {
 			continue
 		}
@@ -230,6 +256,15 @@ func pruneChainTip(p Page, startSlot uint16, isDead func(HeapTupleHeader) bool) 
 		}
 		if !isDead(t.Header) {
 			return cur // live slot found
+		}
+		// M0131-S31: only a HOT successor lives on this page. A dead member whose
+		// update was non-HOT has a t_ctid naming a slot on a DIFFERENT block, and
+		// following its offset here lands on an unrelated tuple — which, if live,
+		// would make the redirect resolve the root's index entry to a foreign row.
+		// PG's heap_prune_chain stops for the same reason (`!HeapTupleHeaderIsHotUpdated`
+		// ends the chain, pruneheap.c).
+		if !t.Header.IsHotUpdated() {
+			return 0
 		}
 		if t.Header.CTID.Offset == cur {
 			return 0 // self-reference guard
