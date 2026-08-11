@@ -1257,6 +1257,40 @@ func EncodeRunningXactsPG(nextXid, oldestRunning, latestCompleted uint32, xids [
 	return framePGAssembled(RmgrStandby, xlogStandbyRunningXacts, 0, body), nil
 }
 
+// EncodeXLogNextOidPG builds the pre-assembled envelope for an XLOG_NEXTOID
+// record carrying nextOID — the encode sibling of DecodeXLogNextOid.
+//
+// goopg does not emit XLOG_NEXTOID in normal operation: it allocates OIDs one
+// at a time from the in-memory catalog and republishes the counter at every
+// checkpoint, where PG pre-allocates blocks of VAR_OID_PREFETCH and must
+// therefore log each block's ceiling. The encoder exists so the decode/replay
+// path can be exercised against bytes produced by goopg's own real framing
+// rather than a hand-built buffer, keeping the encode↔decode pair honest.
+func EncodeXLogNextOidPG(nextOID uint32) ([]byte, error) {
+	mainData := make([]byte, 4)
+	binary.LittleEndian.PutUint32(mainData, nextOID)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXLog, xlogXLogNextOid, 0, body), nil
+}
+
+// DecodeXLogNextOid parses an XLOG_NEXTOID main-data body — a bare Oid
+// (uint32), which is upstream's whole record: XLogPutNextOid writes
+// `XLogRegisterData(&nextOid, sizeof(Oid))` (xlog.c:8114-8138) and xlog_redo
+// reads it back with a single memcpy (xlog.c:8292-8308).
+//
+// M0131-S21a. Used by the initdb OID-recovery scan, not by the physical replay
+// pass — replayDecodedXLogRecord has a *storage.Manager and no catalog handle,
+// the same split that already routes CLOG_TRUNCATE through DecodeXLogClogTruncate.
+func DecodeXLogNextOid(mainData []byte) (uint32, error) {
+	if len(mainData) < 4 {
+		return 0, fmt.Errorf("wal: XLOG_NEXTOID main-data len %d (want 4)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), nil
+}
+
 // DecodeXLogClogTruncate parses a PG xl_clog_truncate main-data body into its
 // three fields. Used by the initdb clog-recovery scan to re-apply the truncation.
 func DecodeXLogClogTruncate(mainData []byte) (pageno int64, oldestXact storage.TransactionID, oldestXactDb uint32, err error) {

@@ -23,6 +23,23 @@ const (
 	xlogXactAbort           uint8 = 0x20
 	xlogXactOpMask          uint8 = 0x70
 
+	// M0131-S21a: the RM_HEAP_ID opcode goopg never emits but a real PG
+	// crash tail carries (heapam_xlog.h:36). Recognised — not implemented:
+	// heap_redo's TRUNCATE arm is an explicit no-op upstream ("TRUNCATE is a
+	// no-op because the actions are already logged as SMGR WAL records",
+	// heapam_xlog.c:1201-1208).
+	xlogHeapTruncate uint8 = 0x30 // XLOG_HEAP_TRUNCATE
+
+	// M0131-S21a: RM_XACT_ID's remaining opcodes (xact.h:169-175). ASSIGNMENT
+	// and INVALIDATIONS are recovery-bookkeeping records goopg has no consumer
+	// for; the three two-phase-commit opcodes are refused loudly rather than
+	// dropped (see the RmgrXact arm in recovery.go).
+	xlogXactPrepare        uint8 = 0x10 // XLOG_XACT_PREPARE
+	xlogXactCommitPrepared uint8 = 0x30 // XLOG_XACT_COMMIT_PREPARED
+	xlogXactAbortPrepared  uint8 = 0x40 // XLOG_XACT_ABORT_PREPARED
+	xlogXactAssignment     uint8 = 0x50 // XLOG_XACT_ASSIGNMENT
+	xlogXactInvalidations  uint8 = 0x60 // XLOG_XACT_INVALIDATIONS
+
 	// XlogXactCommit and XlogXactAbort are exported for the crash-recovery
 	// xact-stamp pass in internal/initdb. (M0106-0013)
 	XlogXactCommit = xlogXactCommit
@@ -32,6 +49,12 @@ const (
 	// XlogClogTruncate is exported for the initdb clog-recovery scan (A9).
 	XlogClogTruncate = xlogClogTruncate
 	xlogStandbyRunningXacts uint8 = 0x10
+	// M0131-S21a: RM_STANDBY_ID's other two opcodes (standbydefs.h:34-36).
+	// Both are hot-standby-only upstream — standby_redo returns immediately
+	// when standbyState == STANDBY_DISABLED, which is always true during a
+	// crash-recovery start (standby.c:1170-1172).
+	xlogStandbyLock          uint8 = 0x00 // XLOG_STANDBY_LOCK
+	xlogStandbyInvalidations uint8 = 0x20 // XLOG_INVALIDATIONS
 	// xlogXLogParameterChange is the xl_info opcode for XLOG_PARAMETER_CHANGE
 	// (pg_control.h:74). Emitted by the primary when GUC echo fields change;
 	// replayed on the standby to update pg_control's GUC echo section.
@@ -43,6 +66,11 @@ const (
 	xlogHeap2PruneOnAccess    uint8 = 0x10 // XLOG_HEAP2_PRUNE_ON_ACCESS
 	xlogHeap2PruneVacuumScan  uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
 	xlogHeap2PruneVacuumClean uint8 = 0x30 // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
+
+	// M0131-S21a: the RM_HEAP2_ID opcodes goopg never emits
+	// (heapam_xlog.h:59-66). NEW_CID is logical-decoding-only and a physical
+	// no-op; the rest are real page mutations still awaiting redo (S21a-2).
+	xlogHeap2NewCid uint8 = 0x70 // XLOG_HEAP2_NEW_CID
 
 	// XLOG_HEAP_LOCK (heapam_xlog.h:39), shares RM_HEAP_ID's opmask
 	// with xlogHeap{Insert,Delete,Update,HotUpdate,Inplace}. Used by
@@ -83,8 +111,8 @@ const (
 	// (pg_control.h:68-82). Named so replayDecodedXLogRecord can enumerate
 	// the benign no-ops explicitly and refuse anything outside the list,
 	// instead of collapsing the whole space into one silent `default:`.
-	// XLOG_NEXTOID is deliberately absent from the benign set — see the
-	// default arm in recovery.go.
+	// XLOG_NEXTOID is deliberately absent from the benign set — it carries
+	// real state and is applied by the initdb OID-recovery scan (S21a).
 	xlogXLogCheckpointShutdown  uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
 	xlogXLogCheckpointOnline    uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
 	xlogXLogNoop                uint8 = 0x20 // XLOG_NOOP
@@ -97,6 +125,12 @@ const (
 	xlogXLogFPIForHint          uint8 = 0xA0 // XLOG_FPI_FOR_HINT
 	xlogXLogOverwriteContrecord uint8 = 0xD0 // XLOG_OVERWRITE_CONTRECORD
 	xlogXLogCheckpointRedo      uint8 = 0xE0 // XLOG_CHECKPOINT_REDO
+
+	// XlogXLogNextOid is exported for the initdb OID-recovery scan (S21a):
+	// the physical replay pass has no catalog handle, so — exactly like
+	// CLOG_TRUNCATE — the record is recognised in replayDecodedXLogRecord and
+	// re-applied by a second pass in internal/initdb.
+	XlogXLogNextOid = xlogXLogNextOid
 
 	// CLOG_TRUNCATE (clog.h:56), RM_CLOG_ID's (only non-zeropage)
 	// opcode. Used by recordKindToRmgrInfo (doc 04 §3.1) to map

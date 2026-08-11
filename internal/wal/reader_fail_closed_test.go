@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -423,9 +424,6 @@ func TestReplayRmgrXLogOpcodeCoverage(t *testing.T) {
 		name string
 		info uint8
 	}{
-		// The whole point of S16.4: NEXTOID is not benign. Real work is
-		// M0131-S21a; until then a refused start beats a rewound OID counter.
-		{"XLOG_NEXTOID", xlogXLogNextOid},
 		// The one opcode value PG 18 leaves undefined that goopg does not
 		// claim either — a newer producer, or corruption that survived the
 		// CRC check by construction. (0xF0, the other free slot, is goopg's
@@ -470,5 +468,133 @@ func TestReplayAppliesXLogFPIForHint(t *testing.T) {
 	}
 	if !applied {
 		t.Fatal("applied = false: XLOG_FPI_FOR_HINT fell through to the no-op set again")
+	}
+}
+
+// --- M0131-S21a: opcode coverage inside the already-handled rmgrs ----------
+//
+// S16 made an unrecognised record stop the start instead of silently
+// truncating the WAL. That is the right failure, but it is still a failure:
+// every opcode goopg does not EMIT was unrecognised, and ordinary PG traffic
+// (a TRUNCATE, a DDL's standby lock, a subxact assignment) refused the start
+// outright. S21a splits that space into three honest answers — applied,
+// recognised-and-genuinely-nothing-to-do, and refused-for-a-named-reason —
+// instead of one blanket refusal.
+//
+// Design: docs/design/0131-0014-pg-wal-opcode-coverage.md.
+
+// TestReplayRecognisesPGOnlyNoOpOpcodes pins the recognised-no-op set. Each
+// entry is an opcode goopg never emits, whose upstream redo arm does nothing a
+// crash-recovery start needs; applied=false is the point (the dispatcher must
+// not claim it changed a page), err=nil is what keeps a real-PG tail startable.
+func TestReplayRecognisesPGOnlyNoOpOpcodes(t *testing.T) {
+	cases := []struct {
+		name string
+		rmid Rmgr
+		info uint8
+	}{
+		// heap_redo's explicit no-op: the physical effect of a TRUNCATE is
+		// logged as SMGR records (heapam_xlog.c:1201-1208).
+		{"XLOG_HEAP_TRUNCATE", RmgrHeap, xlogHeapTruncate},
+		// heap2_redo: "Nothing to do on a real replay, only used during
+		// logical decoding" (heapam_xlog.c:1246-1252).
+		{"XLOG_HEAP2_NEW_CID", RmgrHeap2, xlogHeap2NewCid},
+		// xact_redo: standby-only / ignored outright (xact.c:6429-6443).
+		{"XLOG_XACT_ASSIGNMENT", RmgrXact, xlogXactAssignment},
+		{"XLOG_XACT_INVALIDATIONS", RmgrXact, xlogXactInvalidations},
+		// standby_redo returns before its first arm when standbyState ==
+		// STANDBY_DISABLED, which a crash-recovery start always is
+		// (standby.c:1170-1172). Every DDL emits a STANDBY_LOCK, so this one
+		// alone used to refuse the start on any PG tail containing DDL.
+		{"XLOG_STANDBY_LOCK", RmgrStandby, xlogStandbyLock},
+		{"XLOG_INVALIDATIONS", RmgrStandby, xlogStandbyInvalidations},
+		// Recognised here, applied by initdb's replayNextOIDFromWAL — the
+		// same two-pass split CLOG_TRUNCATE uses. See
+		// TestReplayNextOIDFromWAL in internal/initdb for the other half.
+		{"XLOG_NEXTOID", RmgrXLog, xlogXLogNextOid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := Record{XLog: &XLogDecodedRecord{
+				Header: XLogRecord{Rmid: tc.rmid, Info: tc.info},
+			}}
+			applied, err := replayDecodedXLogRecord(nil, rec)
+			if err != nil {
+				t.Fatalf("replay err = %v, want nil (recognised no-op)", err)
+			}
+			if applied {
+				t.Fatal("applied = true, want false (physical no-op)")
+			}
+		})
+	}
+}
+
+// TestReplayRefusesTwoPhaseCommitOpcodes: the three 2PC opcodes are the
+// counterweight to the no-op set above. goopg's max_prepared_transactions
+// BootVal is "0", so it has no pg_twophase state to rebuild — and quietly
+// no-opping a COMMIT_PREPARED would stamp an XID committed whose PREPARE (and
+// therefore whose heap changes) were never applied. Refusal must be explicit,
+// and the message must say why so an operator is not left guessing.
+func TestReplayRefusesTwoPhaseCommitOpcodes(t *testing.T) {
+	cases := []struct {
+		name string
+		info uint8
+	}{
+		{"XLOG_XACT_PREPARE", xlogXactPrepare},
+		{"XLOG_XACT_COMMIT_PREPARED", xlogXactCommitPrepared},
+		{"XLOG_XACT_ABORT_PREPARED", xlogXactAbortPrepared},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := Record{XLog: &XLogDecodedRecord{
+				Header: XLogRecord{Rmid: RmgrXact, Info: tc.info},
+			}}
+			applied, err := replayDecodedXLogRecord(nil, rec)
+			if err == nil {
+				t.Fatalf("replay err = nil (applied=%v), want refusal", applied)
+			}
+			if !errors.Is(err, ErrUnsupportedRecord) {
+				t.Fatalf("replay err = %v, want ErrUnsupportedRecord", err)
+			}
+			if applied {
+				t.Fatal("applied = true alongside error")
+			}
+			if !strings.Contains(err.Error(), "two-phase commit") {
+				t.Fatalf("refusal message %q does not name two-phase commit", err.Error())
+			}
+		})
+	}
+}
+
+// TestReplayHeap2UsesHeapOpMask is the mask guard. RM_HEAP2 shares RM_HEAP's
+// XLOG_HEAP_OPMASK (0x70) — heap2_redo switches on `info & XLOG_HEAP_OPMASK`
+// (heapam_xlog.c:1229) — but goopg masked it with the generic 0xF0. Upstream
+// ORs XLOG_HEAP_INIT_PAGE (0x80) into the info byte when the record's target
+// is a freshly extended page (heapam.c:2607-2611), so those records arrive
+// with the high bit set and, under a 0xF0 mask, match no case at all.
+//
+// The live victim is XLOG_HEAP2_MULTI_INSERT (0x50 → 0xD0), i.e. every COPY
+// onto a new page; its redo lands in S21a-2, so the observable consequence
+// today is on the prune opcodes, which DO have arms. A prune record with the
+// init bit set must reach the prune arm rather than the refusing default.
+func TestReplayHeap2UsesHeapOpMask(t *testing.T) {
+	// Wired through the refusal message rather than a real page apply so the
+	// guard stays a pure unit test: under the old 0xF0 mask the record hits
+	// `default:` and the error names info=0xD0; under 0x70 it is recognised
+	// as MULTI_INSERT and the (still unimplemented) opcode is reported as
+	// 0x50 — the value redo actually has to dispatch on.
+	rec := Record{XLog: &XLogDecodedRecord{
+		Header: XLogRecord{Rmid: RmgrHeap2, Info: xlogHeap2PruneOnAccess | xlogHeapInit},
+	}}
+	_, err := replayDecodedXLogRecord(nil, rec)
+	if err == nil {
+		// The prune arm was reached (it fails later for want of a manager or
+		// a block, which is fine) — the mask is right.
+		return
+	}
+	if strings.Contains(err.Error(), "unsupported xlog record") {
+		t.Fatalf("PRUNE_ON_ACCESS|INIT_PAGE (0x%02x) was refused as an unknown opcode: %v"+
+			" — RM_HEAP2 is being masked with 0xF0 instead of XLOG_HEAP_OPMASK 0x70",
+			xlogHeap2PruneOnAccess|xlogHeapInit, err)
 	}
 }

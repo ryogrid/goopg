@@ -1242,6 +1242,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// before any of its incrementals.
 		pool.PublishRedoRecPtr(pgCtrl.CheckPointCopyRedo)
 		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
+		// M0131-S21a: pg_control's nextOid is only as fresh as the last
+		// checkpoint. PG WAL-logs every fresh OID block it allocates
+		// (XLOG_NEXTOID) precisely so a crash between checkpoints does not
+		// rewind the counter, so a cluster PG crashed on can carry a higher
+		// nextOid in its WAL tail than in its control file. Without this the
+		// OIDs of catalog rows PG created after its last checkpoint would be
+		// handed out again to new objects.
+		if walNextOID, oerr := replayNextOIDFromWAL(filepath.Join(abs, "pg_wal")); oerr == nil {
+			cat.AdvanceNextOIDPast(walNextOID)
+		} else {
+			slog.Warn("initdb.Open: XLOG_NEXTOID scan failed; OID counter seeded from pg_control only", "err", oerr)
+		}
 		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
 		// nextXid so snapshots taken after restart have Xmax >= the
 		// last-checkpointed NextXID. The low 32 bits of the FullTransactionId

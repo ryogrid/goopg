@@ -419,3 +419,77 @@ func TestReplayCLogFromWAL_AdvancesPastInFlightXID(t *testing.T) {
 		t.Errorf("GetStatus(%d) after sweep = %v, want Committed", committed, got)
 	}
 }
+
+// TestReplayNextOIDFromWAL is the initdb half of M0131-S21a's XLOG_NEXTOID
+// replay. The physical pass recognises the record and reports "no page
+// changed"; this scan is what actually recovers the counter.
+//
+// The failure it prevents: initdb.Open seeds the OID counter from
+// pg_control's checkPointCopy.nextOid, which is only refreshed at a
+// checkpoint. PG allocates OIDs in blocks of VAR_OID_PREFETCH (8192) and
+// WAL-logs each new block's ceiling (XLogPutNextOid, xlog.c:8114-8138). A PG
+// cluster that crashed after allocating a block therefore holds catalog rows
+// whose OIDs are ABOVE anything pg_control knows — and goopg, starting on that
+// directory, would hand those same OIDs out again.
+func TestReplayNextOIDFromWAL(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two blocks, logged in allocation order, with an unrelated record
+	// between them: the scan must return the HIGHEST, not the last-seen or
+	// the first.
+	for _, oid := range []uint32{24576, 32768} {
+		payload, eerr := wal.EncodeXLogNextOidPG(oid)
+		if eerr != nil {
+			t.Fatal(eerr)
+		}
+		if _, _, aerr := w.Append(payload); aerr != nil {
+			t.Fatalf("Append NEXTOID %d: %v", oid, aerr)
+		}
+		if _, _, aerr := w.Append(wal.EncodeXactCommit(storage.TransactionID(7))); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	_ = w.Close()
+
+	got, err := replayNextOIDFromWAL(walDir)
+	if err != nil {
+		t.Fatalf("replayNextOIDFromWAL: %v", err)
+	}
+	if got != 32768 {
+		t.Fatalf("nextOID = %d, want 32768 (highest XLOG_NEXTOID in the tail)", got)
+	}
+}
+
+// TestReplayNextOIDFromWALNoRecords: a WAL with no XLOG_NEXTOID — every WAL
+// goopg itself writes — must return 0 so the caller's AdvanceNextOIDPast is a
+// no-op and the pg_control seed stands. A missing pg_wal is the same answer.
+func TestReplayNextOIDFromWALNoRecords(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(wal.EncodeXactCommit(storage.TransactionID(11))); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	got, err := replayNextOIDFromWAL(walDir)
+	if err != nil {
+		t.Fatalf("replayNextOIDFromWAL: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("nextOID = %d, want 0 (no XLOG_NEXTOID in this WAL)", got)
+	}
+
+	if got, err = replayNextOIDFromWAL(filepath.Join(dir, "absent_wal")); err != nil || got != 0 {
+		t.Fatalf("missing walDir: got (%d, %v), want (0, nil)", got, err)
+	}
+}

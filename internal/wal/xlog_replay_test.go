@@ -188,11 +188,16 @@ func TestApplyRecordRecognizesDecodedXLogStandbyRunningXacts(t *testing.T) {
 }
 
 func TestApplyRecordRejectsUnknownDecodedXLogStandbyRecord(t *testing.T) {
+	// 0x30 is outside RM_STANDBY_ID's defined opcode space: standbydefs.h:34-36
+	// defines exactly LOCK (0x00), RUNNING_XACTS (0x10) and INVALIDATIONS
+	// (0x20), and M0131-S21a recognises all three. This case originally used
+	// 0x20 as its stand-in for "unknown"; it now names a value PG really does
+	// not define, so the guard still tests the refusing default arm.
 	rec := Record{
 		StartLSN: 33,
 		EndLSN:   44,
 		XLog: &XLogDecodedRecord{
-			Header: XLogRecord{Rmid: RmgrStandby, Info: 0x20},
+			Header: XLogRecord{Rmid: RmgrStandby, Info: 0x30},
 		},
 	}
 
@@ -203,7 +208,7 @@ func TestApplyRecordRejectsUnknownDecodedXLogStandbyRecord(t *testing.T) {
 	if applied {
 		t.Fatal("ApplyRecord applied=true, want false")
 	}
-	if !strings.Contains(err.Error(), "rmid=8 info=0x20") {
+	if !strings.Contains(err.Error(), "rmid=8 info=0x30") {
 		t.Fatalf("err = %v, want standby rmgr/opcode context", err)
 	}
 }

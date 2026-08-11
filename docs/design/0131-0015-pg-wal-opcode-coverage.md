@@ -254,6 +254,74 @@ Upstream's `XLogReadBufferExtended` instead `smgrcreate`s and, for any
 file. A PG crash tail routinely references a block past the flushed length, so
 this arm is reachable on the very first reverse crash start.
 
+### S21a-1 — implementation notes (landed 2026-08-12)
+
+S21a is split in two. **S21a-1 is the recognition layer**: every opcode whose
+correct redo is *nothing*, plus the two decisions that had to be made before any
+page-mutating arm can be written. **S21a-2** is the page work — `MULTI_INSERT`,
+`VISIBLE`, `LOCK`, `CONFIRM`, `LOCK_UPDATED`, the zero-extend, `CLOG_ZEROPAGE`,
+`SMGR_TRUNCATE`, `HEAP2_REWRITE`'s refusal — and is unchanged from the plan
+above.
+
+What landed, all in `replayDecodedXLogRecord` (`internal/wal/recovery.go`)
+unless noted:
+
+- **The RM_HEAP2 mask** is now `xlogHeapOpMask` (0x70), matching `heap2_redo`'s
+  own `info & XLOG_HEAP_OPMASK` (`heapam_xlog.c:1229`). Landing this *before*
+  the multi-insert arm means the two changes never have to be right at the same
+  time. Its guard (`TestReplayHeap2UsesHeapOpMask`) rides a prune opcode with
+  the init bit set, because the opcode the mask actually protects —
+  `MULTI_INSERT|INIT_PAGE` = 0xD0 — has no arm to reach until S21a-2.
+- **Recognised no-ops** with their upstream citation in the comment:
+  `HEAP_TRUNCATE` (heap_redo's arm is an explicit comment-only break,
+  `heapam_xlog.c:1201-1208` — the physical effect arrives as SMGR records),
+  `HEAP2_NEW_CID` (`heapam_xlog.c:1246-1252`), `XACT_ASSIGNMENT` /
+  `XACT_INVALIDATIONS` (`xact.c:6429-6443`; the latter is ignored outright
+  upstream), `STANDBY_LOCK` / `STANDBY_INVALIDATIONS` (`standby_redo` returns
+  before its first arm when `standbyState == STANDBY_DISABLED`,
+  `standby.c:1170-1172`, which a crash-recovery start always is).
+  `STANDBY_LOCK` alone is why any PG tail containing DDL refused the start.
+- **Loud refusal** for `XACT_PREPARE` / `COMMIT_PREPARED` / `ABORT_PREPARED`,
+  wrapping `ErrUnsupportedRecord` and naming two-phase commit in the message.
+  Silently no-opping a `COMMIT_PREPARED` would stamp an XID committed whose
+  `PREPARE` — and therefore whose heap changes — were never applied.
+
+**`XLOG_NEXTOID` is applied in two passes, not one.** S16.4 refused it because
+`xlog_redo` sets `nextOid` exactly (`xlog.c:8292-8308`) and dropping one lets
+goopg re-issue OIDs a crashed PG already handed to catalog rows. It is now
+recognised as a *page-level* no-op in `replayDecodedXLogRecord` and applied by
+`replayNextOIDFromWAL` (`internal/initdb/xact_recovery.go`), which
+`initdb.Open` calls immediately after seeding the counter from
+`pg_control.checkPointCopy.nextOid`. The reason is structural, not incidental:
+the physical pass is handed a `*storage.Manager` and nothing else, while the
+OID counter lives in `catalog.InMemory`. `CLOG_TRUNCATE` and the xact
+commit/abort stamps already use exactly this split, and keeping physical replay
+a pure page function is worth more than routing a catalog handle into it.
+
+Two deliberate deviations from upstream, both recorded in the code:
+
+- Upstream *sets* `nextOid` from the record ("better to just believe the record
+  exactly") because it must survive OID wraparound. goopg takes the **maximum**
+  of the pg_control seed and the WAL records, because
+  `catalog.InMemory.advanceNextOIDLocked` is monotone and has no wraparound
+  path; both sources are lower bounds on what PG had already allocated, so the
+  counter must clear both.
+- `replayNextOIDFromWAL` scans from record **zero**, not from
+  `ExportedReplayStart`. A pre-checkpoint `NEXTOID` is only redundant with
+  pg_control if that checkpoint refreshed `nextOid`, and one extra idempotent
+  maximum costs nothing on a shared, already-decoded `ReadAll`.
+
+`EncodeXLogNextOidPG` exists as the encode sibling of `DecodeXLogNextOid` so the
+guard exercises goopg's real framing rather than a hand-built buffer; goopg
+never emits the record in normal operation (it allocates OIDs one at a time and
+republishes the counter at each checkpoint, where PG pre-allocates blocks of
+`VAR_OID_PREFETCH` and must log each block's ceiling).
+
+**S28 stays a self-arming skip**, as expected: its refusal simply moves from
+`rmid=0 info=0x30` to the first page-mutating opcode in the tail. The skip
+predicate matches any "unsupported xlog record" refusal, so nothing needed
+changing there.
+
 ### S21b — btree (est ~2 loops, gated on S16.3)
 
 Land only after S16.3 has turned the FPI-only `default:` into a refusal;

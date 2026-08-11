@@ -1,38 +1,46 @@
 (idle — nothing in flight)
 
-M0131-S28.0 LANDED (loop #153). `pgcluster` now has a *true* SIGKILL:
-`Start()` sets `SysProcAttr{Setpgid: true}` and `KillHard()` does
-`syscall.Kill(-pgid, SIGKILL)` + reap; `Stop()`'s 20 s escape hatch upgraded
-from `Process.Kill()` to the same group kill; `Kill()`'s doc comment corrected
-(it is `pg_ctl -m immediate`, i.e. SIGQUIT — the postmaster still reaches
-`on_proc_exit(UnlinkLockFiles)` and removes `postmaster.pid`). Guard
-`internal/testutil/pgcluster/kill_hard_test.go` is a paired probe: `killhard`
-asserts the lock file survives, the pinned `pg_backend_pid()` dies with the
-group, and PG replays its own WAL with all 500 committed rows;
-`pg_ctl_immediate` asserts the lock file is removed, so an upstream change that
-made `Kill()` sufficient fails loudly instead of leaving dead code.
+M0131-S21a-1 LANDED (loop #155) — the RECOGNITION layer of S21a.
 
-Discovery (ledger row filed): goopg has NO stale-lock-file check on start —
-`internal/server/server.go:677` calls `control.WritePIDFile` unconditionally,
-where upstream `CreateLockFile` probes the recorded PID + shmem key and refuses
-("Is another postmaster running?"). Two goopg servers on one dir silently
-coexist. Deferred: a start-refusal breaks every harness that restarts over a
-crashed directory until each learns stale-vs-live.
+Files: `internal/wal/{pg_xlog_decode.go,pg_assembled_emit.go,recovery.go}`,
+`internal/initdb/{xact_recovery.go,open.go}`, tests in
+`internal/wal/{reader_fail_closed_test.go,xlog_replay_test.go}` +
+`internal/initdb/xact_recovery_test.go`.
 
-Gates: `go test ./internal/testutil/...` (all ok, incl. the new test),
-units precommit (all green/cached), pgbench smoke via the commit hook.
-Design `docs/design/0131-0017` updated with the S28.0 LANDED section.
+What landed:
+- RM_HEAP2 masked with `xlogHeapOpMask` 0x70 (was 0xF0) — `heap2_redo` itself
+  switches on `info & XLOG_HEAP_OPMASK` (heapam_xlog.c:1229); upstream ORs
+  INIT_PAGE into a MULTI_INSERT onto a fresh page, so every COPY is 0xD0.
+- Recognised no-ops w/ citations: HEAP_TRUNCATE, HEAP2_NEW_CID,
+  XACT_ASSIGNMENT/INVALIDATIONS, STANDBY_LOCK/INVALIDATIONS. STANDBY_LOCK
+  alone refused the start on any PG tail containing DDL.
+- 2PC opcodes refuse loudly (ErrUnsupportedRecord + "two-phase commit").
+- **XLOG_NEXTOID now really applies**, via a two-pass split: recognised as a
+  page no-op in `replayDecodedXLogRecord`, applied by new
+  `replayNextOIDFromWAL` (initdb) called from `Open` after the pg_control seed.
+  New `wal.EncodeXLogNextOidPG`/`DecodeXLogNextOid`.
 
-Nightly triage: `ci/logs/action-items.md` run `20260812-005501`'s 4 items were
-all already filed under M-NIGHTLY (2 new + 2 recurrences); parked per banner.
+4 new guards, ALL proven fail-when-broken by scripted reverts. One pre-existing
+test corrected: `TestApplyRecordRejectsUnknownDecodedXLogStandbyRecord` used
+0x20 as "unknown"; now 0x30 (PG really leaves it undefined).
 
-Next loop: banner = M-NIGHTLY (filing only) then M0131. Continue **M0131-S28**
-proper — write `internal/testport/e2e_goopg_crashstart_on_pgdata_test.go`:
-`pgcluster.New`/`Start` → the S21/S22 opcode workload (COPY, VACUUM, FOR
-UPDATE, TRUNCATE, SAVEPOINT, index-heavy INSERT) → capture answers →
-`KillHard()` → `cluster.New(… DataDir: pgDir …)` + `Start()` WITHOUT `Init()`
-(idiom: `e2e_goopg_coldstart_on_pgdata_test.go:165-182`) → compare. Then the
-GIN-refusal variant and the `..._concurrent` S24 re-arm variant carrying
-`t.Skip("re-arm trigger for M0131-S24")`. Design `docs/design/0131-0017`.
+2 ledger rows: S21a-2's whole page-mutating set still refused; and the
+max-vs-set deviation from upstream's OID-wraparound-safe "believe the record
+exactly" (goopg's allocator is monotone, no wraparound path).
+
+Gates: internal/wal PASS + `-race` PASS, internal/initdb PASS (75 s), UNITS
+precommit PASS, pgbench smoke via the commit hook.
+
+Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
+items already filed under M-NIGHTLY (fix_plan.md:766) — parked per banner.
+
+Next loop (banner = M-NIGHTLY filing, then M0131): **M0131-S21a-2**, the page
+work — `XLOG_HEAP2_MULTI_INSERT` 0x50 first (~70% reuse from
+`replayHeapMultiInsert`, recovery.go:3842; needs the xl_heap_multi_insert /
+xl_multi_insert_tuple block-0 decoder + INIT_PAGE + offsets[]), then
+`XLOG_HEAP_LOCK` 0x60 and `XLOG_HEAP2_VISIBLE` 0x40 (0% reuse — goopg's
+HeapVisible replay is an explicit no-op), plus the zero-extend at
+`replayDecodedXLogHeapInsert`'s replay-gap `default:`. Each landing shrinks
+S28's skip. Design: `docs/design/0131-0015-pg-wal-opcode-coverage.md` §S21a.
 
 In-flight: none.

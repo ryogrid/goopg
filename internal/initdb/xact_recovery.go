@@ -127,6 +127,69 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 	return nil
 }
 
+// replayNextOIDFromWAL returns the highest OID published by an XLOG_NEXTOID
+// record in the WAL under walDir, or 0 if the WAL carries none.
+//
+// M0131-S21a. This is the second half of XLOG_NEXTOID's replay: the physical
+// pass (wal.replayDecodedXLogRecord) recognises the record and reports it as a
+// page-level no-op, because the OID counter lives in the in-memory catalog and
+// that pass is handed only a *storage.Manager. The split is the same one
+// CLOG_TRUNCATE already uses.
+//
+// Why the record matters at all: initdb.Open seeds the counter from
+// pg_control's checkPointCopy.nextOid, which is only as fresh as the LAST
+// CHECKPOINT. PG allocates OIDs in blocks of VAR_OID_PREFETCH (8192) and WAL-logs
+// each new block's ceiling exactly so the counter survives a crash between
+// checkpoints (XLogPutNextOid, xlog.c:8114-8138). Without this pass, goopg
+// starting on a PG cluster that crashed after allocating a fresh OID block
+// would re-issue OIDs PG had already handed to real catalog rows.
+//
+// Upstream "believe the record exactly" (xlog.c:8296-8300) is a SET, not a max,
+// because it must survive OID wraparound. goopg's counter has no wraparound
+// path (catalog.InMemory.advanceNextOIDLocked is monotone) and the caller
+// applies this alongside the pg_control seed, so taking the maximum of the two
+// is the faithful behaviour here: both sources are lower bounds on what PG had
+// already allocated, and the counter must clear both.
+func replayNextOIDFromWAL(walDir string) (uint32, error) {
+	if _, err := os.Stat(walDir); err != nil {
+		return 0, nil
+	}
+	records, err := wal.ReadAll(filepath.Clean(walDir), 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	// Unlike the clog pass this walks from record ZERO, not from
+	// ExportedReplayStart: a NEXTOID record emitted BEFORE the last checkpoint
+	// is not redundant with pg_control unless that checkpoint actually
+	// refreshed nextOid, and reading one extra (idempotent, monotone) maximum
+	// costs nothing. The records are already decoded by the shared recovery
+	// ReadAll memoization.
+	var maxOID uint32
+	for _, r := range records {
+		if r.XLog == nil || r.XLog.Header.Rmid != wal.RmgrXLog {
+			continue
+		}
+		if (r.XLog.Header.Info & wal.XLRRmgrInfoMask) != wal.XlogXLogNextOid {
+			continue
+		}
+		nextOID, derr := wal.DecodeXLogNextOid(r.XLog.MainData)
+		if derr != nil {
+			// A malformed body is not a reason to refuse the start — the
+			// reader already CRC-verified the bytes, so this can only mean a
+			// record shape goopg does not understand. Skipping it leaves the
+			// counter at the pg_control seed, which is the pre-S21a behaviour.
+			continue
+		}
+		if nextOID > maxOID {
+			maxOID = nextOID
+		}
+	}
+	return maxOID, nil
+}
+
 // replayClogTruncate re-applies a CLOG_TRUNCATE record (G9). Truncation is
 // idempotent: TruncateCLOG advances oldestClogXid monotonically and removes
 // only segments/banks/flat-file-prefix entirely below oldestXid's page, so

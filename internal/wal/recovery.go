@@ -2411,15 +2411,27 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// opcode space is the high nibble only and it defines nothing at
 			// 0xF0 — a real PG producer can never emit this value.
 			return false, nil
+		case xlogXLogNextOid:
+			// M0131-S21a: XLOG_NEXTOID is the opcode S16.4 refused rather than
+			// dropped, because xlog_redo sets nextOid EXACTLY from it
+			// (xlog.c:8292-8308) and losing one lets goopg re-issue OIDs a
+			// crashed PG had already allocated after the last checkpoint.
+			//
+			// It is now APPLIED — but not here. The OID counter lives in the
+			// in-memory catalog (catalog.InMemory.AdvanceNextOIDPast), which
+			// this pass cannot reach: replayDecodedXLogRecord is handed a
+			// *storage.Manager and nothing else. The record is therefore a
+			// page-level no-op recognised here and re-applied by
+			// replayNextOIDFromWAL in internal/initdb — the same two-pass split
+			// that already routes CLOG_TRUNCATE (see the RmgrCLOG arm below)
+			// and the xact commit/abort stamps. Physical replay stays a pure
+			// page function; the counter recovery rides the initdb scan that
+			// seeds nextOid from pg_control in the first place.
+			return false, nil
 		default:
-			// M0131-S16.4: everything else — including XLOG_NEXTOID — is
-			// refused rather than silently skipped. XLOG_NEXTOID is the reason
-			// this arm stopped being a blanket no-op: xlog_redo sets nextOid
-			// EXACTLY from it (xlog.c:8292-8308), so dropping one lets goopg
-			// re-issue OIDs a crashed PG had already allocated after the last
-			// checkpoint. Implementing it is M0131-S21a; until then, refusing
-			// to start beats starting with a rewound OID counter. goopg emits
-			// no NEXTOID of its own, so this cannot fire on goopg's own WAL.
+			// M0131-S16.4: everything else is refused rather than silently
+			// skipped. goopg emits no RM_XLOG opcode outside the named arms,
+			// so this cannot fire on goopg's own WAL.
 			return false, fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		}
 	case RmgrXact:
@@ -2437,6 +2449,37 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, nil
 		case xlogXactAbort:
 			return false, nil
+		case xlogXactAssignment, xlogXactInvalidations:
+			// M0131-S21a: two recovery-bookkeeping records goopg never emits
+			// but that appear in any real-PG tail. Neither touches a page.
+			//
+			// XLOG_XACT_ASSIGNMENT reports a batch of subtransaction→parent
+			// links so a hot standby can populate KnownAssignedXids;
+			// xact_redo's arm calls ProcArrayApplyXidAssignment and nothing
+			// else (xact.c:6429-6435), and goopg rebuilds its own subxact map
+			// from its native subxact markers (RecordKindXactAssignment). A
+			// real-PG assignment record is therefore informational here.
+			//
+			// XLOG_XACT_INVALIDATIONS carries the invalidation messages of a
+			// transaction that has not committed yet, again for standby
+			// relcache maintenance — and upstream's arm ignores it outright
+			// ("what matters are invalidations written into the commit
+			// record", xact.c:6437-6443). goopg's relcache-file
+			// unlink rides the COMMIT record's HAS_INVALS payload instead
+			// (see the xlogXactCommit arm above), which is the message set
+			// that actually became visible.
+			return false, nil
+		case xlogXactPrepare, xlogXactCommitPrepared, xlogXactAbortPrepared:
+			// M0131-S21a: two-phase commit is out of scope — goopg's
+			// max_prepared_transactions BootVal is "0", so it can neither
+			// produce these records nor rebuild the pg_twophase state a
+			// PREPARED transaction needs. Refuse with a message that names
+			// the reason: replaying the COMMIT_PREPARED of a transaction
+			// whose PREPARE we skipped would stamp an XID committed whose
+			// heap changes were never applied.
+			return false, fmt.Errorf("%w: %s (two-phase commit recovery is not supported; "+
+				"max_prepared_transactions must be 0 on a cluster goopg starts)",
+				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -2471,6 +2514,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// goopg's replay path has no consumer for that metadata yet, so
 			// treat the record as a recognised no-op and keep failing closed
 			// on any other Standby opcode.
+			return false, nil
+		case xlogStandbyLock, xlogStandbyInvalidations:
+			// M0131-S21a: the remaining two RM_STANDBY opcodes. Upstream's
+			// standby_redo takes the AccessExclusiveLock / processes the
+			// invalidation messages only to keep a HOT STANDBY's queries
+			// consistent with the primary; every arm is reached through code
+			// that returns immediately when standbyState == STANDBY_DISABLED
+			// (standby.c:1170-1172), which is what a crash-recovery start
+			// always is. goopg runs no concurrent queries during replay and
+			// holds no relcache init files open, so both are genuine no-ops
+			// here — recognised so a real-PG tail (every DDL emits a
+			// STANDBY_LOCK) does not refuse the start.
 			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
@@ -2607,11 +2662,30 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeapTruncate:
+			// M0131-S21a: recognised, deliberately not implemented. Upstream's
+			// heap_redo says it outright — "TRUNCATE is a no-op because the
+			// actions are already logged as SMGR WAL records" (heapam_xlog.c:
+			// 1201-1208): the physical effect of a TRUNCATE arrives as
+			// XLOG_SMGR_TRUNCATE (and, for a table created in the same
+			// transaction, as the new relfilenode's XLOG_SMGR_CREATE). The
+			// xl_heap_truncate body carries only the relation OIDs, for
+			// logical decoding — which is also why PG only emits it at
+			// wal_level=logical (tablecmds.c:2303).
+			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
 	case RmgrHeap2:
-		switch xlog.Header.Info & XLRRmgrInfoMask {
+		// M0131-S21a: RM_HEAP2 shares RM_HEAP's XLOG_HEAP_OPMASK (0x70), NOT
+		// the generic 0xF0 rmgr-info mask. Upstream ORs XLOG_HEAP_INIT_PAGE
+		// (0x80) into the info byte of a MULTI_INSERT onto a freshly extended
+		// page (heapam.c:2607-2611), so a COPY arrives as info == 0xD0. Masked
+		// with 0xF0 that value matches no case and the record is refused;
+		// masked with 0x70 it is the MULTI_INSERT it actually is. Fixing the
+		// mask BEFORE the multi-insert redo lands (S21a-2) keeps the two
+		// changes from having to be correct simultaneously.
+		switch xlog.Header.Info & xlogHeapOpMask {
 		case xlogHeap2PruneOnAccess, xlogHeap2PruneVacuumScan, xlogHeap2PruneVacuumClean:
 			// A7: goopg's opportunistic prune / VACUUM prune / freeze all emit
 			// xl_heap_prune (block-0 sub-records: redirects, now-unused, freeze
@@ -2621,6 +2695,15 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeap2NewCid:
+			// M0131-S21a: XLOG_HEAP2_NEW_CID exists solely so logical decoding
+			// can map a catalog tuple to the command id that produced it;
+			// heap2_redo's arm is empty apart from an Assert that recovery is
+			// not supposed to see it in any consuming form
+			// (heapam_xlog.c:1244-1252 — "Nothing to do on a real replay, only
+			// used during logical decoding"). Recognised so a wal_level=logical
+			// PG tail does not refuse the start.
+			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
