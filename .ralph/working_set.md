@@ -1,46 +1,47 @@
 (idle — nothing in flight)
 
-Last loop (#112): **M0131-S4 — forward cold-start E2E** — DONE, ticked, committed,
-pushed to `make-db-cluster-compat`.
+Last loop (#113): **M0131-S5 — runtime `pg_rewrite` index maintenance (2692/2693)**
+— DONE, ticked, committed, pushed to `make-db-cluster-compat`.
 
 M-NIGHTLY duty: `ci/logs/action-items.md` still run `20260811-014635` (12 items,
 unchanged since loop #100). All already filed; the open ones stay PARKED per
 banner. No new filing needed.
 
+**The headline: a real PG 18.3 hosted on a goopg catalog now expands and reads
+goopg-authored user views.** `SELECT count(*) FROM public.b5c_view` returned
+42809 for the whole life of the M0123 line; it now returns the base-table count
+on the promoted standby, and so do `b5c_view2` (bool/null WHERE) and
+`b5c_view3` (searched CASE). The canonical `ev_action` serializer was never the
+blocker — `writeViewRewriteRow` wrote the `_RETURN` heap row and DISCARDED the
+TID, so `RelationBuildRuleLock` (relcache.c:785-806, `indexOK=true` hard
+constant, no seq-scan fallback in genam.c:397-401) left `rd_rules` NULL and the
+planner raised at plancat.c:139-147.
+
 What landed:
-- `TestE2E_PGColdStartOnGoopgDataDir`
-  (`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`). Real PG 18.3
-  starts on the LIVE directory a goopg server just shut down, zero conf edits,
-  and reads goopg data correctly. **`0130-0002` Guard #1 DISCHARGED** (its text
-  updated in the same commit).
-- Guard 7 POSITIVE: index-qualified read under `enable_seqscan = off` returns
-  the right row through a goopg-authored btree — blocker #12 did NOT resurface.
-- S4.5: the non-atomic non-HOT UPDATE gap did NOT surface here.
-- **Four gaps measured**, each locked in FAIL-WHEN-FIXED, filed as S12-S15 with
-  a ledger row each:
-  F1/S12 no sort works for any type — `GetDefaultOpClass` scans `pg_opclass`
-    via index **2686** (indexOK, no seq fallback); goopg leaves 2686 an empty
-    root page while the heap is correct. Fix pattern = the 2754 bootstrapper.
-  F2/S13 any LANGUAGE SQL builtin aborts the backend — ALL 3397 `pg_proc` rows
-    carry a malformed non-NULL `proconfig` → `TransformGUCArray` assert.
-    Builtins unaffected (`fmgr_isbuiltin` never reads pg_proc).
-  F3/S14 `ADD COLUMN … DEFAULT` reads NULL on old rows (no fast-default);
-    `attmissingval` isn't even a column in goopg's pg_attribute. pg_attrdef
-    half asserted POSITIVELY and correct.
-  F4/S15 goopg-`CREATE DATABASE`-minted DB PANICs `could not open critical
-    system index 2662`.
-- Harness: `pgcluster.Stop` was unbounded and hung a whole `go test` for 20 min
-  when the postmaster sat in crash recovery — now 20 s then SIGKILL. New
-  `pgcluster.PSQLCombined` returns output without `t.Fatalf`.
-- Design `0131-0004` draft → accepted + §Findings; README row.
+- `writeViewRewriteRow` captures the TID → `insertPgRewriteRelRulenameIndexEntry`
+  (2693, load-bearing) + `insertPgRewriteOidIndexEntry` (2692); both OIDs joined
+  `mirroredCatalogOIDs()` (omitting the mirror = blocker #8 repeated).
+- Gate: the soft `t.Logf` in `e2e_failover_goopg_to_pg_test.go` is now a hard
+  count assertion over all three views, with a non-vacuity guard.
+- New `internal/executor/sys_pg_rewrite_index_test.go` (2 tests) — leaf shape,
+  TID resolving to the LIVE heap row with the right ev_class, mirror membership,
+  and S5.5's DROP/recreate cycle VERIFIED (stale + fresh leaf, exactly one live).
+- Three plan corrections: **S5.1 was already done** (`buildIndexTupleOidNameKey`
+  / `cmpKeyOidName` already in `sys_pg_enum.go` for pg_enum 3503, identical
+  80-byte layout — Guards 1/2 subsumed); `"_RETURN"` → `viewRuleName` const
+  shared by heap row and index key; inline `mirroredOIDs` → `mirroredCatalogOIDs()`.
+- Design `0131-0005` draft → accepted + §Findings; README row. 1 ledger row.
 
 Next loop: per banner — M-NIGHTLY filing, then M0131 top-to-bottom. Next
-unchecked is **M0131-S5** (`pg_rewrite` runtime index maintenance 2692/2693,
-design `0131-0005`). Note S13.3 and S14.1 share a root (trailing nullable
-catalog attributes) — whoever takes one should probe the other.
+unchecked is **M0131-S6** (flip `relhasrules=true` for the 6 nailed system
+views; `relHasRules = true` is commented out at `internal/initdb/initdb.go:5817`
+— RISKY, and S8a is marked "must precede S6 AND S7", so read S8a first and
+consider taking it instead). Note S13.3 and S14.1 still share a root (trailing
+nullable catalog attributes).
 
-Gates: new test PASS; whole `^TestE2E_` family PASS (99 s); UNITS PASS;
-pgbench smoke PASS via the commit hook. No executor/planner/codec change, so
-tpch-spotcheck / TPC-DS SF0.5 not required (Hard-won Rule #1 not triggered).
+Gates: new component tests PASS; `TestE2E_FailoverGoopgToPG` PASS (11.5 s, both
+subtests); UNITS PASS (no FAILs); pgbench smoke PASS via the commit hook. No
+executor/planner/codec *query-path* change (catalog index maintenance only), so
+tpch-spotcheck / TPC-DS SF0.5 not required.
 
 In-flight: none

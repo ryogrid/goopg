@@ -503,20 +503,40 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 			t.Fatalf("standby pg_get_viewdef(b5c_view3)=%q, missing %q", vd3, want)
 		}
 	}
-	// KNOWN BLOCKER (deferral ledger 2026-07-19, M0123-S3 sub-slice 2c; cause
-	// re-attributed by M0131-S10): a direct `SELECT * FROM b5c_view` on the
-	// promoted standby still fails 42809 — PG's rewriter uses the relcache rule
-	// lock (rd_rules), not the direct pg_rewrite scan pg_get_viewdef uses, and
-	// `RelationBuildRuleLock` (relcache.c:801-805) populates rd_rules by scanning
-	// pg_rewrite (2618) via index `pg_rewrite_rel_rulename_index` (2693, NOT
-	// 2620 = pg_trigger) with `indexOK=true` and no seq-scan fallback. goopg
-	// does not maintain 2692/2693 at runtime, so the scan finds nothing and
-	// rd_rules stays NULL. The pg_internal.init copy this test used to make was
-	// never the cause (it is unlinked in StartupXLOG and saves no rules anyway —
-	// docs/design/0131-0010-copyinitfiles-retirement.md); M0131-S5 is the fix.
-	// The canonical serializer itself is proven above.
-	if _, err := pgCountMaybe(standby, "SELECT count(*) FROM public.b5c_view"); err == nil {
-		t.Logf("[m0123] standby row-level view expansion now works — promote the deferred gate")
+	// M0131-S5 — THE gate this milestone slice exists for, promoted from a soft
+	// t.Logf. `SELECT * FROM <view>` on the promoted standby used to fail 42809:
+	// PG's rewriter expands a view through the relcache rule lock (rd_rules), not
+	// the direct pg_rewrite scan pg_get_viewdef uses, and `RelationBuildRuleLock`
+	// (relcache.c:785-806) populates rd_rules by scanning pg_rewrite (2618) via
+	// `pg_rewrite_rel_rulename_index` (2693, NOT 2620 = pg_trigger) with
+	// `indexOK=true` — a hard constant, so systable_beginscan (genam.c:397-401)
+	// has no seq-scan fallback. goopg wrote the heap row and discarded the TID,
+	// so the scan found nothing, rd_rules stayed NULL, the view kept
+	// rd_tableam == NULL and the planner raised at plancat.c:139-147.
+	// writeViewRewriteRow now maintains 2692/2693 (and both mirror to base/5),
+	// so all three canonical views must expand row-for-row.
+	//
+	// The pg_internal.init copy this test used to blame was never the cause (it
+	// is unlinked in StartupXLOG and saves no rules anyway —
+	// docs/design/0131-0010-copyinitfiles-retirement.md).
+	wantViewRows, err := pgCountMaybe(standby, "SELECT count(*) FROM public.bench_log WHERE client > 0")
+	if err != nil {
+		t.Fatalf("standby base-table count for the view gate: %v", err)
+	}
+	// Non-vacuity: all three views select `client > 0` (b5c_view2 also
+	// `src IS NOT NULL`, but src is NOT NULL in the DDL), so a zero here would
+	// make every comparison below trivially true.
+	if wantViewRows == 0 {
+		t.Fatalf("standby has 0 bench_log rows with client > 0 — the view gate would be vacuous")
+	}
+	for _, view := range []string{"b5c_view", "b5c_view2", "b5c_view3"} {
+		got, err := pgCountMaybe(standby, "SELECT count(*) FROM public."+view)
+		if err != nil {
+			t.Fatalf("standby SELECT count(*) FROM %s: %v (rd_rules NULL — is the 2693 leaf missing?)", view, err)
+		}
+		if got != wantViewRows {
+			t.Fatalf("standby count(*) FROM %s = %d, want %d (base rows with client > 0)", view, got, wantViewRows)
+		}
 	}
 
 	// B2-prep: the goopg-created function must be resolvable and executable

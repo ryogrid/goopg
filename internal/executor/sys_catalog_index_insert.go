@@ -211,6 +211,44 @@ const (
 	pgProcPronameArgsNspIndexOID = 2691
 )
 
+// pg_rewrite index OIDs (postgres/src/include/catalog/pg_rewrite.h:56-57).
+// M0131-S5. Note 2620 — named in three deferral-ledger rows as "the pg_rewrite
+// index" — is actually pg_trigger (pg_trigger.h:34); the pg_rewrite pair is
+// 2692/2693 on heap 2618.
+const (
+	pgRewriteOidIndexOID         uint32 = 2692
+	pgRewriteRelRulenameIndexOID uint32 = 2693
+)
+
+// The (oid, NameData) key shape 2693 needs — the COLUMN-REVERSED sibling of
+// buildIndexTupleNameOidKey — already exists as buildIndexTupleOidNameKey /
+// cmpKeyOidName (sys_pg_enum.go, added for pg_enum_typid_label_index 3503).
+// Both are byte-identical to initdb's pgBuildIndexTupleOidNameKey, which is
+// what bootstrapPgRewriteRelRulenameIndex writes, so runtime entries sort
+// correctly beside the bootstrap ones in the same leaf.
+
+// insertPgRewriteRelRulenameIndexEntry inserts an entry into
+// pg_rewrite_rel_rulename_index (2693, RewriteRelRulenameIndexId) for
+// ((ev_class, rulename) → heap TID). This index is LOAD-BEARING for a real PG
+// hosted on a goopg catalog: RelationBuildRuleLock
+// (postgres/src/backend/utils/cache/relcache.c:785-806) scans pg_rewrite with
+// indexOK=true — a hard constant, so systable_beginscan
+// (access/index/genam.c:397-401) has no seq-scan fallback. An empty 2693 leaves
+// rd_rules == NULL, the view keeps rd_tableam == NULL, and the planner raises
+// 42809 at optimizer/util/plancat.c:139-147. M0131-S5.
+func insertPgRewriteRelRulenameIndexEntry(ctx *Context, evClass uint32, ruleName string, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidNameKey(uint32(tid.Block), tid.Offset, evClass, ruleName)
+	return insertCanonicalSysBtreeLeaf(ctx, pgRewriteRelRulenameIndexOID, tup, cmpKeyOidName)
+}
+
+// insertPgRewriteOidIndexEntry inserts an entry into pg_rewrite_oid_index
+// (2692, RewriteOidIndexId) for (rule oid → heap TID). Used by PG's RULEOID
+// syscache and the dependency machinery (RemoveRewriteRuleById). M0131-S5.
+func insertPgRewriteOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgRewriteOidIndexOID, tup, cmpKeyUint32)
+}
+
 // pg_type index OIDs (postgres/src/include/catalog/pg_type.h). B2.1a.
 const (
 	pgTypeOidIndexOID        = 2703

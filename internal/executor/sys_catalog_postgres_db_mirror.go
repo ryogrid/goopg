@@ -134,7 +134,21 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 // `syncTableToCatalogHeap` (and `syncIndexToCatalogHeap`, which is a
 // strict subset) from DBOid=1 to DBOid=5.
 func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
-	mirroredOIDs := []uint32{
+	for _, oid := range mirroredCatalogOIDs() {
+		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mirroredCatalogOIDs is the relfile set mirrorTouchedCatalogsToPostgresDB
+// copies from DBOid=1 to DBOid=5. Split out from the loop so a regression test
+// can assert membership without running a whole DDL fixture: every entry here
+// is load-bearing for a real PG attached with dbname=postgres, and each
+// omission has historically been its own multi-loop blocker.
+func mirroredCatalogOIDs() []uint32 {
+	return []uint32{
 		catalog.RelationRelationId,  // 1259 pg_class
 		catalog.AttributeRelationId, // 1249 pg_attribute
 		catalog.IndexRelationId,     // 2610 pg_index — syncIndexToCatalogHeap's
@@ -170,6 +184,14 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		// written to base/1 by syncTableToCatalogHeap (writeViewRewriteRow); the
 		// standby (dbname=postgres) reads base/5, so the heap must mirror.
 		pgRewriteRelOID, // 2618 pg_rewrite
+		// M0131-S5: both pg_rewrite indexes, for the same reason blocker #8
+		// applied to 2678/2679 below. writeViewRewriteRow indexes the rule row
+		// in base/<tableCatalogHeapDBOid>; an attached PG connects
+		// dbname=postgres and reads base/5, where an unmirrored index is an
+		// EMPTY index — and RelationBuildRuleLock's scan of 2693 is indexOK
+		// with no seq-scan fallback, so the view stays unqueryable (42809).
+		pgRewriteRelRulenameIndexOID, // 2693
+		pgRewriteOidIndexOID,         // 2692
 		// M-NIGHTLY AI-20260810-011258-003: pg_attrdef + both of its declared
 		// indexes. syncTableToCatalogHeap writes column DEFAULTs to base/1
 		// (writeAttrdefRow); a PG 18.3 standby attached with dbname=postgres
@@ -190,10 +212,4 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgIndexIndrelidIndexOID,   // 2678
 		pgIndexIndexrelidIndexOID, // 2679
 	}
-	for _, oid := range mirroredOIDs {
-		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {
-			return err
-		}
-	}
-	return nil
 }

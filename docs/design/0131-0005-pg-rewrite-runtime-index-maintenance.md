@@ -1,6 +1,6 @@
 # pg_rewrite runtime index maintenance — a hosted PG can finally evaluate a user view
 
-**Status:** draft
+**Status:** accepted — landed 2026-08-11 (see §Findings)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S5)
 
@@ -170,6 +170,55 @@ gap as the sole remaining blocker.
 7. DROP VIEW → recreate → `VACUUM` → re-query on the standby (the S5.5 probe).
 8. `go test -run '^TestE2E_FailoverGoopgToPG$' ./internal/testport/` green.
 9. UNITS + SMOKE green.
+
+## Findings (implementation, 2026-08-11)
+
+**The headline: a real PG 18.3 hosted on a goopg catalog now expands and reads
+goopg-authored user views.** `SELECT count(*) FROM public.b5c_view` — 42809 for
+the whole life of the M0123 line — returns the base-table row count on the
+promoted standby, and so do `b5c_view2` (bool/null WHERE) and `b5c_view3`
+(searched CASE WHERE). The design's diagnosis was exactly right: the canonical
+`ev_action` serializer was never the blocker, the missing 2693 leaf was.
+
+Three corrections to the plan above:
+
+1. **S5.1 was already done.** `buildIndexTupleOidNameKey` and `cmpKeyOidName`
+   already exist in `internal/executor/sys_pg_enum.go` (added for
+   `pg_enum_typid_label_index` 3503) with the identical 80-byte layout, so no
+   new key encoder was written — only a cross-reference comment in
+   `sys_catalog_index_insert.go` pointing at them, and Guard 1/2's separate unit
+   tests are unnecessary duplication of that file's existing coverage.
+   `cmpKeyOidName` delegates its name half to `cmpKeyName`, which is the same
+   `bytes.Compare` over the 64-byte NUL-padded NameData the design specified.
+2. **`"_RETURN"` was a bare literal in two places** once the index entry needed
+   it (heap row + 2693 key). Promoted to a named `viewRuleName` const in
+   `sys_pg_rewrite.go` — the heap row and the leaf key cannot drift apart.
+3. **`mirroredOIDs` was an inline slice**, unreachable from a test. Split into
+   `mirroredCatalogOIDs()` so `TestPgRewriteIndexesAreMirroredToPostgresDB`
+   asserts membership statically. Every omission from that list has historically
+   been its own multi-loop blocker (#8 for 2678/2679, the pg_attrdef trio), so a
+   cheap membership guard is worth more than its two lines.
+
+Guard status: 1/2 subsumed by the existing `sys_pg_enum.go` coverage (see
+correction 1); 3, 4 and 7 landed as
+`internal/executor/sys_pg_rewrite_index_test.go`
+(`TestWriteViewRewriteRowMaintainsPgRewriteIndexes`,
+`TestPgRewriteIndexesAreMirroredToPostgresDB`) — guard 4 as a static membership
+assertion rather than a byte-comparison of the two files, and guard 7's
+DROP/recreate cycle at the component level: after `stampViewRewriteRows` + a
+re-sync the leaf-root holds a stale leaf beside a fresh one and **exactly one
+resolves to a live heap row**, which is what `RelationBuildRuleLock` needs.
+Guard 5 (the gate) and 6 landed in
+`internal/testport/e2e_failover_goopg_to_pg_test.go`, extended to all three
+views at once instead of `b5c_view` first — they were all already canonical, so
+there was nothing to stage. A non-vacuity check was added there: the base count
+must be non-zero, or every comparison would be trivially true. Guards 8 and 9
+green.
+
+The residual — a hosted PG pruning the `pg_rewrite` page and reusing the dead
+line pointer the stale leaf points at — is unreachable in goopg's own operation
+and needs a pre-promotion DDL phase in the failover test to observe; it is on
+the deferral ledger rather than fixed here.
 
 ## References
 
