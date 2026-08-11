@@ -111,6 +111,29 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	// absolute page address is simply baseOffset+off.
 	pv := xlogPageValidator{segSize: segSize}
 
+	// M0131-S30.2: every stop below is a candidate end-of-WAL, but only a stop
+	// with nothing durable behind it is a real one. `stop` logs the WARN as
+	// before and, when durable WAL is still present past the stop point,
+	// records the refusal that readAllPageAware returns to its caller — which
+	// initdb.Open turns into a refused start instead of a silently truncated
+	// cluster. See reader_early_end.go.
+	var early error
+	stop := func(off int, reason string, cause error) {
+		if early == nil {
+			early = earlyEndOfWAL(stream, off, segSize, baseOffset, reason, cause)
+		}
+		endOfWAL(off, baseOffset, reason, cause)
+	}
+	// A page whose header is all zero is the ordinary preallocated tail — the
+	// normal way the walk ends, so it gets no WARN. It is still checked: a
+	// zeroed page with durable pages BEHIND it is a hole, which is the exact
+	// shape the writer defects of this series left behind.
+	stopQuiet := func(off int, reason string, cause error) {
+		if early == nil {
+			early = earlyEndOfWAL(stream, off, segSize, baseOffset, reason, cause)
+		}
+	}
+
 	// root-0032: the stream does not necessarily begin on a record boundary.
 	// It starts at the first segment of the live run, and the record that was
 	// being written when that segment began may have started in a segment that
@@ -132,8 +155,8 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		// corrupt page — leave it to the main loop's isZeroBytes branch.
 		if !isZeroBytes(stream[:hsize]) {
 			if err := pv.check(stream[:hsize], baseOffset); err != nil {
-				endOfWAL(0, baseOffset, "invalid page header", err)
-				return nil, nil
+				stop(0, "invalid page header", err)
+				return nil, early
 			}
 		}
 		if hdr, err := DecodeXLogPageHeader(stream[:hsize]); err == nil && hdr.Info&XLPFirstIsContRecord != 0 {
@@ -152,6 +175,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 				break
 			}
 			if isZeroBytes(stream[off : off+hsize]) {
+				stopQuiet(off, "zero page header", errPreallocatedPage)
 				break
 			}
 			// M0131-S19: a page that does not claim the address it is stored
@@ -159,7 +183,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			// recycled segment PostgreSQL renamed into place without
 			// zero-filling. Upstream ends the read here too.
 			if err := pv.check(stream[off:off+hsize], baseOffset+uint64(off)); err != nil {
-				endOfWAL(off, baseOffset, "invalid page header", err)
+				stop(off, "invalid page header", err)
 				break
 			}
 			off += hsize
@@ -233,7 +257,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if derr := durableUnknownRecord(stream, off, pos, segSize, header, err); derr != nil {
 				return records, fmt.Errorf("wal: lsn %d: %w", baseOffset+uint64(off)+1, derr)
 			}
-			endOfWAL(off, baseOffset, "invalid record header", err)
+			stop(off, "invalid record header", err)
 			break
 		}
 		total := int(h.TotLen)
@@ -241,7 +265,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[off:]) {
 				break
 			}
-			endOfWAL(off, baseOffset, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
+			stop(off, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
 			break
 		}
 		paddedTotal := maxAlignXLog(total)
@@ -253,7 +277,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		// record straddles without looking at them. Validate them before the
 		// assembled bytes are trusted.
 		if verr := pv.checkSpan(stream, off, consumed, baseOffset); verr != nil {
-			endOfWAL(off, baseOffset, "invalid page header", verr)
+			stop(off, "invalid page header", verr)
 			break
 		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)
@@ -274,7 +298,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[tailStart:]) {
 				break
 			}
-			endOfWAL(off, baseOffset, "record failed to decode", err)
+			stop(off, "record failed to decode", err)
 			break
 		}
 		if decoded.Consumed != len(fullBytes) {
@@ -285,7 +309,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[tailStart:]) {
 				break
 			}
-			endOfWAL(off, baseOffset, "record size mismatch",
+			stop(off, "record size mismatch",
 				fmt.Errorf("decoded %d of %d bytes", decoded.Consumed, len(fullBytes)))
 			break
 		}
@@ -294,7 +318,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
 		off += consumed
 	}
-	return records, nil
+	return records, early
 }
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the

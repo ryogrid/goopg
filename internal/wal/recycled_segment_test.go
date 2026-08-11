@@ -135,7 +135,17 @@ func TestReadAll_StopsAtStalePageAddr(t *testing.T) {
 	if _, derr := DecodeXLogPageHeader(seg[hdrOff : hdrOff+SizeOfXLogShortPHD]); derr != nil {
 		t.Fatalf("expected a valid page header at offset %d: %v", hdrOff, derr)
 	}
-	binary.LittleEndian.PutUint64(seg[hdrOff+8:hdrOff+16], 0)
+	// M0131-S30.2: falsify EVERY page from here on, not just page 1. A real
+	// recycled segment carries the previous cycle's addresses on all of its
+	// pages; falsifying only one leaves a valid page BEHIND the stale one,
+	// which is a hole in the stream and now (correctly) refuses the start as an
+	// early end of WAL rather than being a clean stop.
+	for off := hdrOff; off+SizeOfXLogShortPHD <= len(seg); off += int(XLOGBlockSize) {
+		if _, derr := DecodeXLogPageHeader(seg[off : off+SizeOfXLogShortPHD]); derr != nil {
+			continue
+		}
+		binary.LittleEndian.PutUint64(seg[off+8:off+16], 0)
+	}
 	if err := os.WriteFile(segPath, seg, 0o644); err != nil {
 		t.Fatal(err)
 	}
