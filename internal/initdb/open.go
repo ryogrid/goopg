@@ -1035,6 +1035,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// that page's highest associated commit-record LSN first — the invariant
 	// synchronous_commit=off relies on instead of an inline per-commit fsync.
 	clog.SetFlushWALHook(walWriter.FlushUpTo)
+	// M0131-S30.7: attach the durable commit log to the transaction manager so
+	// every snapshot it captures can resolve an XID the in-memory
+	// InProgress/Aborted arrays cannot classify. Manager.SetCLog was added by
+	// M0117-0002 with exactly this contract ("called once during startup/recovery
+	// wiring (initdb.Open)") but NO production caller was ever added, so
+	// Snapshot.clog was nil on every live server and the whole durable-abort
+	// fallback in Snapshot.SeesCommittedXID was dead code. The visible symptom:
+	// after crash recovery the in-memory aborted array is empty, so the heap
+	// changes of transactions that were in flight at the crash — correctly
+	// stamped Aborted in pg_xact by the MarkUnknownAsAborted sweep below — read
+	// as committed and broke sum(pgbench_accounts.abalance) ==
+	// sum(pgbench_history.delta).
+	txnMgr.SetCLog(clog)
 	// fsync=off (test harnesses only): skip the CLOG store's per-segment
 	// fsyncs; write-through and ordering (including the FlushWAL barrier
 	// above) are unchanged. See ci/design/test-gate-speedups/02.

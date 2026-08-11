@@ -188,3 +188,41 @@ func TestManagerCaptureSnapshot_AttachesCLog(t *testing.T) {
 		t.Fatal("captureSnapshot must attach nil when SetCLog was never called")
 	}
 }
+
+// TestSeesCommittedXID_BelowXminAborted_Invisible pins M0131-S30.7: the CLOG
+// consult must run BEFORE the `xid < Xmin` shortcut, not only for the in-window
+// residual case.
+//
+// This is the exact post-crash geometry. initdb.Open's MarkUnknownAsAborted
+// sweep stamps every XID that was in flight at the crash Aborted, and then
+// advances NextXID past all of them, so the first snapshot a post-restart
+// session takes has Xmin ABOVE the whole aborted range. Before the fix those
+// XIDs took the below-Xmin shortcut and read as committed, which made the
+// replayed half of a torn pgbench transaction visible and broke
+// sum(pgbench_accounts.abalance) == sum(pgbench_history.delta). Upstream's
+// HeapTupleSatisfiesMVCC always resolves a non-hinted xmin through
+// TransactionIdDidCommit, whatever the snapshot's xmin is.
+func TestSeesCommittedXID_BelowXminAborted_Invisible(t *testing.T) {
+	c := newTestCLog(t)
+	if err := c.SetAborted(40); err != nil {
+		t.Fatalf("SetAborted: %v", err)
+	}
+	if err := c.SetCommitted(41); err != nil {
+		t.Fatalf("SetCommitted: %v", err)
+	}
+	// Xmin/Xmax both above the recovered range, as after a restart with no
+	// running transactions.
+	s := Snapshot{Xmin: 50, Xmax: 50}.WithCLog(c)
+	if s.SeesCommittedXID(40) {
+		t.Fatal("an XID the CLOG says aborted must be invisible even below Xmin")
+	}
+	// The shortcut's positive direction is unchanged.
+	if !s.SeesCommittedXID(41) {
+		t.Fatal("a committed XID below Xmin must stay visible")
+	}
+	// An XID with no CLOG lane at all still falls through to committed — the
+	// consult only acts on a POSITIVE abort (conservative contract).
+	if !s.SeesCommittedXID(42) {
+		t.Fatal("an unknown-status XID below Xmin must stay visible")
+	}
+}
