@@ -1,47 +1,48 @@
-(idle — nothing in flight)
+Task: **M0131-S7 — `ev_action` capture tooling** — S7.1/S7.2/S7.3/S7.5/S7.6
+LANDED this loop (#116). The task stays UNCHECKED: **S7.4 (the Go generator) is
+the only remaining slice.**
 
-Last loop (#115): **M0131-S6 — relhasrules flip for the 6 nailed system views**
-— DONE, ticked, committed, pushed to `make-db-cluster-compat`.
+Files:
+- `scripts/capture-ev-action.sh` (NEW) — the throwaway-PG-18.3 oracle: initdb,
+  3 queries/view, emits `.dat` + manifest, `--verify` acceptance mode.
+- `internal/initdb/nailed_view_manifest.tsv` (NEW, generated) — 6 rel rows +
+  87 attr rows, oracle-stamped (PG 18.3, catversion 202506291).
+- `internal/initdb/nailed_view_manifest_test.go` (NEW) — offline guard #2.
+- `internal/initdb/relcache_init.go`, `pg_replication_views_nailed_test.go` —
+  the slot_name bug fix (both siblings carried the same wrong value).
+- `docs/design/0131-0007-*.md` (+ README row), `.ralph/fix_plan.md`,
+  `.ralph/deferral_ledger.md`.
 
-M-NIGHTLY duty: `ci/logs/action-items.md` still run `20260811-014635` (12 items,
-unchanged since loop #100). All already filed; the open ones stay PARKED per
-banner. No new filing needed.
+Key symbols: `pgStatReplicationSlotsViewAttrs`, `nailedAttr`, `nailedLocalRels`,
+`systemViewOIDPins`, `readNailedViewManifest`,
+`TestNailedViewManifestMatchesGoTables`.
 
-**Headline: a real PG 18.3 hosted on a goopg-initdb'd directory now evaluates
-ALL SIX nailed views** (`assertNailedSystemViewsAreEvaluable`, S4 cold-start
-E2E). The acceptance gate is restored: `waitForPhysicalStreamingPGtoGoopg`
-queries the `pg_stat_replication` VIEW again (AI-20260810-011258-003's SRF-join
-workaround retired).
+Findings: **`--verify` re-derives all six committed blobs byte-identically**
+(guard #1) across three independent initdb runs (guard #6). The `:relid 12261`
+landmine (guard #3) never fired — S8a's repin disarmed it, so NO rewriting pass
+was grown; identity is *asserted*, not applied. Guard #2 caught a real
+transcription bug first try: `pg_stat_replication_slots.slot_name` is
+`text`(25,−1) — the SRF's OUT param — not `name`(19,64) from the base view.
+Latent only because the view returns zero rows with no slots. Generalises the
+S6 `pgSubscriptionAttrs` lesson: hand-transcribed catalog shape needs a machine
+oracle, and the ~40 other nailed catalogs are still unaudited.
 
-**The one real failure was NOT the predicted tupledesc/attalign shape.**
-`pg_stat_subscription` gave `cache lookup failed for attribute 10 of relation
-6100`: `pgSubscriptionAttrs` declared **9 of pg_subscription's 18 columns**
-while goopg's own writer `PGSubscriptionColumnsPG18`
-(`internal/executor/sys_pg_subscription.go`) has emitted all 18 since B4.4 — a
-silent sibling divergence. Fixed to 18 (+ relnatts 9→18, `substream`
-bool(16)→char(18)), values read from a live PG 18.3 initdb's own pg_attribute.
+Deviations from the design (both real, both now documented): PG 18 `initdb` has
+no `-q`; psql `-F $'\t'` instead of `||` (ambiguous `text || "char"`).
 
-**Hand forward:** no other nailed catalog was audited for the same truncation.
-The cheap oracle is one throwaway `initdb` + `SELECT attnum,attname,atttypid,
-attlen,attnotnull FROM pg_attribute WHERE attrelid='<cat>'::regclass` — a
-table-driven guard over every `nailedAttr` list would close S13.3/S14.1's shared
-root (trailing nullable catalog attributes) in one slice. Ledgered.
+Next step: **S7.4** — `cmd/gen-nailed-view-tables/main.go` (`//go:build ignore`,
+`// Code generated …; DO NOT EDIT.` per `cmd/gen-pg-proc-data/main.go`), reading
+`nailed_view_manifest.tsv` → `internal/initdb/nailed_view_seed_data.go`, then
+delete the six hand-written `*ViewAttrs()` funcs and repoint guard #2 (it turns
+tautological once the tables are generated). Ledger row says: consider landing
+it only after S9.1 widens the manifest past six views, so its Go shape is not
+fixed prematurely — the banner decides.
 
-S6.1 was already discharged by S8a's repin (no blob patch). S6.5 (per-view
-composite `reltype` vs 2249 RECORDOID) stays open, ledgered under S8a.
-S6.6's bisect was met more cheaply by t.Errorf-per-view than by flipping one at
-a time.
-
-Next loop: per banner — M-NIGHTLY filing, then M0131 top-to-bottom. Next
-unchecked after S6 is **M0131-S7** (the ev_action capture tool; under Option A
-the mapping is the identity function, so S7.6 is a plain `cmp` against
-upstream's bytes — do NOT grow a rewriting pass).
-
-Gates: `internal/initdb` PASS (61 s); `TestE2E_PGColdStartOnGoopgDataDir` PASS;
-`TestE2E_PGStandbyFullCycle` PASS; whole `^TestE2E_` family PASS (99 s);
-`internal/estimateaudit` + `internal/executor` PASS; UNITS PASS (no FAILs);
-pgbench smoke PASS via the commit hook. No query-path executor/planner/codec
-change (initdb catalog description + one bootstrap flag), so tpch-spotcheck /
-TPC-DS SF0.5 not required.
+Gates run: `internal/initdb` PASS (61 s); whole `^TestE2E_` family PASS (100 s)
+— covers `TestE2E_PGColdStartOnGoopgDataDir`, the hosted-PG reader of the
+changed pg_attribute row; `scripts/capture-ev-action.sh --verify` PASS; pgbench
+smoke via the commit hook. No query-path executor/planner/codec change (initdb
+catalog description + a new script), so tpch-spotcheck / TPC-DS SF0.5 not
+required.
 
 In-flight: none

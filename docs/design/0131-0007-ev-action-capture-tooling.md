@@ -1,6 +1,7 @@
 # `ev_action` capture tooling — make the system-view corpus mechanical, not artisanal
 
-**Status:** draft
+**Status:** in progress — S7.1/S7.2/S7.3/S7.5/S7.6 landed 2026-08-11; S7.4 (the
+Go generator) pending. See "Implementation status" and "Findings" at the end.
 **Date:** 2026-08-11
 **Milestone:** M0131 (S7)
 
@@ -163,6 +164,71 @@ generated whole. Nothing downstream changes: `pgRewriteRow` (`:203-214`) and
    deterministic for a fixed PG 18.3 build — the assumption S8's pinning option
    rests on.
 7. UNITS + SMOKE green.
+
+## Implementation status (2026-08-11)
+
+Landed: `scripts/capture-ev-action.sh` (S7.1 the throwaway oracle, S7.2 the
+three queries, S7.3 the `.dat` + `internal/initdb/nailed_view_manifest.tsv`
+emitters, S7.5 the unknown-`atttypid` hard error, S7.6 `--verify`) and
+`internal/initdb/nailed_view_manifest_test.go` (guard #2, offline — the
+manifest is checked in, so only re-capturing needs a real PG).
+
+Pending: **S7.4**, `cmd/gen-nailed-view-tables/main.go`, which renders the
+manifest into `internal/initdb/nailed_view_seed_data.go`. Until it exists the
+`nailedRel`/`nailedAttr` tables stay hand-written in `relcache_init.go` and the
+manifest *checks* them rather than *generating* them — which is why guard #2 is
+worth having on its own. S8b's guards consume the same manifest.
+
+Two deviations from the design as written, both forced by the oracle:
+
+- **PG 18's `initdb` has no `-q`/`--quiet`** (only `-d/--debug`), contrary to
+  the `scripts/pg-oracle-diff.sh:134` citation; silence it by redirecting.
+- Queries use psql's `-F $'\t'` field separator rather than `||`-concatenating
+  columns, because `text || "char"` is ambiguous in PG 18
+  (`pg_class.relkind` — "operator is not unique").
+
+The pinned table and the pg_type bootstrap set are parsed out of
+`system_view_oid_pins.go` and `pg_type_seed_data.go` at run time rather than
+duplicated in the script, so the tool cannot drift from the tree's own policy.
+
+## Findings
+
+**Guard #1 passed on the first complete run: all six committed blobs re-derive
+byte-identically**, including `pg_stat_replication_slots`'s `:relid 12261`
+(design guard #3's expected landmine — disarmed for free by S8a's repin, so no
+mapping row was ever needed). Three independent `initdb` runs produced
+identical output, which is guard #6's idempotence check and, with it, further
+evidence that PG 18.3's `12xxx` assignments are deterministic — the assumption
+Option A rests on.
+
+**Guard #2 found a real transcription bug on its first run.**
+`pgStatReplicationSlotsViewAttrs()` declared `slot_name` as `name`(19, len 64);
+the oracle says `text`(25, len −1). The view selects `s.slot_name` — the OUT
+parameter of `pg_stat_get_replication_slot`, whose `proallargtypes` starts
+`{text,text,…}` (`pg_proc.dat:5676-5680`) — not `r.slot_name` from the
+`pg_replication_slots` base view, which really *is* `name`(19)
+(`system_views.sql:1045-1059`). Both the table and the hand-pinned test that
+should have caught it (`TestPgStatReplicationSlotsViewAttrs`) carried the same
+wrong value, because both were transcribed by the same reading of
+`system_views.sql`; only an oracle capture could break the tie. This is exactly
+the failure shape the design predicted — a hosted PG builds its `TupleDesc`
+from these rows and would deform a `text` datum as `name`/64
+(`tupdesc.c:105`) — and it stayed latent only because the view returns zero
+rows with no replication slots defined, which is all M0131-S6's evaluability
+assertion exercises.
+
+The generalisable lesson is the one M0131-S6 already paid for once with
+`pgSubscriptionAttrs` (9 of 18 columns): **hand-transcribed catalog shape is
+wrong often enough that it needs a machine oracle, not more care.** The six
+nailed views are now covered; every *other* `nailedAttr` table in
+`relcache_init.go` is still hand-written and unchecked.
+
+Noted, not fixed: goopg's own runtime virtual replication views
+(`internal/initdb/replication_views.go`) declare **every** column as `text`,
+including ones PG types as `name`/`int8`/`timestamptz`. That is a separate,
+wholesale divergence on the runtime SELECT-side lane rather than the on-disk
+nailed-catalog lane this milestone works, and it is ledgered rather than folded
+in here.
 
 ## References
 

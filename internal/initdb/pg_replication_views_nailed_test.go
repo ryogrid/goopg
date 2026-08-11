@@ -189,7 +189,13 @@ func TestPgStatReplicationSlotsViewAttrs(t *testing.T) {
 		TypeOID uint32
 		Len     int16
 	}{
-		{"slot_name", 19, 64},
+		// text(25), not name(19): the view selects `s.slot_name`, the OUT
+		// parameter of pg_stat_get_replication_slot (pg_proc.dat:5676-5680),
+		// not `r.slot_name` from the pg_replication_slots base view. This
+		// test pinned the wrong value from the day it was written; M0131-S7's
+		// oracle capture (scripts/capture-ev-action.sh) caught it and the
+		// value below now comes from a real PG 18.3's own pg_attribute.
+		{"slot_name", 25, -1},
 		{"spill_txns", 20, 8},
 		{"spill_count", 20, 8},
 		{"spill_bytes", 20, 8},

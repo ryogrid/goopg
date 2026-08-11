@@ -2734,7 +2734,17 @@ func pgReplicationSlotsViewAttrs() []nailedAttr {
 // Column order and types from system_views.sql:1045-1059 + pg_proc.dat (OID 6169).
 func pgStatReplicationSlotsViewAttrs() []nailedAttr {
 	return []nailedAttr{
-		{Name: "slot_name", TypeOID: 19, Num: 1, Len: 64},
+		// text(25), NOT name(19). M0131-S7's oracle capture caught this
+		// transcription bug: the view selects `s.slot_name`, the OUT
+		// parameter of pg_stat_get_replication_slot (pg_proc.dat:5676-5680,
+		// proallargtypes starts `{text,text,…}`), NOT `r.slot_name` from the
+		// pg_replication_slots base view — that one really is name(19), which
+		// is where the wrong value came from (system_views.sql:1045-1059).
+		// A hosted PG builds its TupleDesc from these rows, so name/64 here
+		// against a text/-1 datum deforms garbage (tupdesc.c:105). It stayed
+		// latent only because the view returns zero rows with no slots
+		// defined, which is what M0131-S6's evaluability assertion sees.
+		{Name: "slot_name", TypeOID: 25, Num: 1, Len: -1},
 		{Name: "spill_txns", TypeOID: 20, Num: 2, Len: 8},
 		{Name: "spill_count", TypeOID: 20, Num: 3, Len: 8},
 		{Name: "spill_bytes", TypeOID: 20, Num: 4, Len: 8},
