@@ -145,9 +145,13 @@ type stripeWriterCore struct {
 // into the closure so the call-site rewrite cannot inadvertently
 // rewire them without rebuilding the core. emitSegmentPad errors
 // panic per the "fatal pad failure" contract documented above.
-func newStripeWriterCore(segSize, startCurr, startPrev uint64, walBuf *walBuffer, memRing *MemRing) *stripeWriterCore {
+// `lay` (M0131-S30.1b) carries the page-header layout the pad must be
+// emitted with — the pad occupies stream bytes, and in page-header mode
+// those bytes include any page header the gap spans. Its zero value keeps
+// the legacy raw-bytes shape for header-less fixtures.
+func newStripeWriterCore(segSize, startCurr, startPrev uint64, walBuf *walBuffer, memRing *MemRing, lay padLayout) *stripeWriterCore {
 	onCross := func(start, boundary, gapPrev uint64) {
-		if err := emitSegmentPad(walBuf, memRing, start, boundary, gapPrev); err != nil {
+		if _, err := emitSegmentPad(walBuf, memRing, start, boundary, gapPrev, lay); err != nil {
 			panic(fmt.Sprintf("wal: stripeWriterCore: cross-segment pad emit failed: %v", err))
 		}
 	}

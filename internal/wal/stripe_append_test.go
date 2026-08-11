@@ -58,7 +58,7 @@ func makeStripeAppendFixtureWithCross(t *testing.T, cap int64, segSize uint64) (
 	wb := walBuf
 	mr := memRing
 	posTracker = newInsertPosTracker(0, 0, segSize, func(start, boundary, prev uint64) {
-		if err := emitSegmentPad(wb, mr, start, boundary, prev); err != nil {
+		if err := emitSegmentPadErr(wb, mr, start, boundary, prev, padLayout{}); err != nil {
 			t.Errorf("emitSegmentPad in onCrossSegment: %v", err)
 		}
 	})

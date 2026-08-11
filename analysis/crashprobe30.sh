@@ -86,6 +86,16 @@ for run in $(seq 1 $RUNS); do
     wait $PB 2>/dev/null
     sleep 2
 
+    # ---- snapshot the crashed WAL (M0131-S30.1b) --------------------------
+    # Recovery appends over the bytes past its stop point, so the evidence for
+    # an early end-of-WAL is destroyed by the very restart that reports it.
+    # Copy pg_wal (and pg_control) aside BEFORE the restart. SNAPWAL=0 opts out.
+    if [ "${SNAPWAL:-1}" = "1" ]; then
+        cp -a "$DIR/pg_wal" "$W/pg_wal_crash" 2>/dev/null
+        cp -a "$DIR/global" "$W/global_crash" 2>/dev/null
+        echo "WAL_SNAPSHOT $W/pg_wal_crash"
+    fi
+
     # ---- restart ----------------------------------------------------------
     GOOPG_CG_UNIT=cp30-$run-b $REPO/scripts/goopg-test-run.sh \
         $REPO/bin/goopg start -D $DIR --listen 127.0.0.1:$PORT >$W/restart.log 2>&1 &

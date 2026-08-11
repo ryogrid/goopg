@@ -604,6 +604,12 @@ func NewWriter(cfg Config) (*Writer, error) {
 		st.prevRecPtr,
 		st.walBuf,
 		st.memRing,
+		padLayout{
+			pageHeaders: st.pageHeaders,
+			segSize:     cfg.SegmentSize,
+			sysID:       st.sysID,
+			tli:         st.tli,
+		},
 	)
 	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
 	st.writeMu = newWALWriteLock()

@@ -332,7 +332,7 @@ func TestStripeWriterCoreAppendBuiltDelegatesToStripeAppendBuild(t *testing.T) {
 	walBuf := newWALBuffer(4096)
 	walBuf.reset(0)
 	memRing := NewMemRing(4096)
-	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing, padLayout{})
 
 	const sz = 24
 	var receivedPrev uint64

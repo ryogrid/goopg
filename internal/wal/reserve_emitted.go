@@ -159,6 +159,10 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 			if t.onCrossSegment != nil {
 				t.onCrossSegment(startCandidate, boundary, gapPrev)
 			}
+			// NOTE (M0131-S30.1b, deferred): xl_prev names a record's CONTENT
+			// start (see `t.prev = start + leading` below), so when the pad
+			// itself lands on a page boundary this should be
+			// `startCandidate + padLeading`. Deferral-ledger row 2026-08-12.
 			t.prev = startCandidate
 		}
 		startCandidate = boundary

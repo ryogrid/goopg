@@ -103,26 +103,90 @@ import "fmt"
 // composer as `insertPosTracker.onCrossSegment`; foundation-first
 // pattern matches slice C and the eleven earlier slice B
 // foundations.
-func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gapPrev uint64) error {
+func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gapPrev uint64, lay padLayout) (leading int, err error) {
 	if boundary <= gapStart {
-		return fmt.Errorf("wal: emitSegmentPad: boundary=%d must exceed gapStart=%d", boundary, gapStart)
+		return 0, fmt.Errorf("wal: emitSegmentPad: boundary=%d must exceed gapStart=%d", boundary, gapStart)
 	}
-	padLen := int(boundary - gapStart)
-	pad, err := buildSegmentPadRecord(padLen, gapPrev)
+	gapLen := int(boundary - gapStart)
+
+	// M0131-S30.1b: the gap is a range of STREAM bytes, and in page-header
+	// mode the stream is not all record bytes — every 8 KiB boundary inside
+	// the gap holds a page header. Building a gapLen-byte record and writing
+	// it verbatim at gapStart (what this composer did until 2026-08-12)
+	// overwrites those header slots with record bytes and overruns the
+	// boundary by the same amount. Recovery then reads the pad's own
+	// xl_info/xl_rmid pair (0x20, RM_XLOG_ID) where a page header belongs and
+	// stops: `invalid page header: magic=0x0020 want 0xd118`, discarding every
+	// committed record behind it (measured: 6762 rows, docs/design/0131-0028).
+	//
+	// Size the pad RECORD to gapLen minus the header bytes the emitter will
+	// interleave, then emit it through the same emitWithPageHeaders every
+	// other record goes through, so the pad occupies exactly [gapStart,
+	// boundary) in stream space and the page headers inside it are real.
+	recLen := gapLen
+	if lay.pageHeaders && lay.segSize > 0 {
+		recLen -= pageHeaderBytesIn(int64(gapStart), int64(boundary), lay.segSize)
+		if recLen < SizeOfXLogRecord {
+			return 0, fmt.Errorf("wal: emitSegmentPad: gap [%d,%d) leaves %d record bytes after page headers, below minimum %d",
+				gapStart, boundary, recLen, SizeOfXLogRecord)
+		}
+	}
+	pad, err := buildSegmentPadRecord(recLen, gapPrev)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	out := pad
+	if lay.pageHeaders && lay.segSize > 0 {
+		out, leading = emitWithPageHeaders(pad, recLen, int64(gapStart), lay.segSize, lay.sysID, lay.tli)
+		if len(out) != gapLen {
+			return 0, fmt.Errorf("wal: emitSegmentPad: emitted %d bytes for gap [%d,%d) of %d",
+				len(out), gapStart, boundary, gapLen)
+		}
 	}
 	if walBuf != nil {
-		if err := walBuf.writeReserved(int64(gapStart), pad); err != nil {
-			return err
+		if err := walBuf.writeReserved(int64(gapStart), out); err != nil {
+			return 0, err
 		}
 	}
 	if memRing != nil {
 		// Advance ring window to accommodate the pad at [gapStart, boundary).
 		memRing.AdvanceWindow(int64(boundary))
-		if err := memRing.WriteReserved(int64(gapStart), pad); err != nil {
-			return err
+		if err := memRing.WriteReserved(int64(gapStart), out); err != nil {
+			return 0, err
 		}
 	}
-	return nil
+	return leading, nil
+}
+
+// padLayout carries the page-header layout parameters emitSegmentPad needs to
+// lay a pad record out exactly the way every other record is laid out.
+// Zero value (pageHeaders false) reproduces the pre-M0131-S30.1b raw-bytes
+// behaviour, which is correct for the legacy header-less stream shape a few
+// unit fixtures still build.
+type padLayout struct {
+	pageHeaders bool
+	segSize     int64
+	sysID       uint64
+	tli         uint32
+}
+
+// pageHeaderBytesIn returns the number of page-header bytes emitWithPageHeaders
+// interleaves into the stream range [from, to) — one header at every page
+// boundary in the range, long-form (40 B) at a segment boundary and short-form
+// (24 B) elsewhere. A boundary at `from` counts (the emitter writes a leading
+// header when it starts on one); a boundary at `to` does not (the emitter stops
+// emitting once the record's last byte is written).
+func pageHeaderBytesIn(from, to, segSize int64) int {
+	if segSize <= 0 || to <= from {
+		return 0
+	}
+	pos := from
+	if rem := pos % XLOGBlockSize; rem != 0 {
+		pos += XLOGBlockSize - rem
+	}
+	n := 0
+	for ; pos < to; pos += XLOGBlockSize {
+		n += pageHeaderSizeAt(pos, segSize)
+	}
+	return n
 }
