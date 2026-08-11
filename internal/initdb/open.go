@@ -337,6 +337,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		mgr.SetAIO(aioEngineAdapter{eng: eng})
 	}
 
+	// M0131-S20.1: ask pg_control whether the previous run shut down
+	// cleanly, and stamp DB_IN_CRASH_RECOVERY if it did not, BEFORE any
+	// record is replayed. Until this slice goopg never read State at all,
+	// so a crashed cluster was indistinguishable from a clean one both to
+	// goopg and to anything reading the control file mid-replay.
+	recov, err := beginRecovery(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
+	}
+
 	// Crash recovery: replay any WAL records past the last
 	// checkpoint into the data files BEFORE the buffer pool comes
 	// online, so the pool always observes a consistent on-disk
@@ -344,7 +355,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// records past the last checkpoint, so this is a no-op for
 	// normal restarts. See M0002 "Crash-recovery test" in
 	// .ralph/fix_plan.md.
-	if _, err := wal.ReplayFromDirWithMgr(mgr, filepath.Join(abs, "pg_wal"), 0); err != nil {
+	//
+	// M0131-S20.2: the replay start comes from pg_control's
+	// checkPointCopy.redo, the way upstream's InitWalRecovery gets it,
+	// instead of being reconstructed by scanning the stream for a record
+	// goopg's own isCheckpointRecord recognises. The scan survives as the
+	// fallback for redo == 0 (fresh cluster / no control file).
+	if _, err := wal.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
@@ -2489,6 +2506,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			activity.ClearCurrentGoroutine()
 		}
 		rt.bgwriter.Start()
+	}
+
+	// M0131-S20.1: crash recovery replayed above; make its result durable
+	// with an end-of-recovery checkpoint before the state flips to
+	// DB_IN_PRODUCTION, so pg_control's redo pointer describes the
+	// recovered cluster rather than the pre-crash one. No-op for a clean
+	// start (the common path pays nothing).
+	if recov.crashRecovery {
+		endOfRecoveryCheckpoint(rt.Checkpointer, abs)
 	}
 
 	// M0131-S17: the cluster is now live — say so in pg_control BEFORE the

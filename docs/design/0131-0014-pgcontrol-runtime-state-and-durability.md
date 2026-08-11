@@ -2,7 +2,8 @@
 
 **Status:** S17 **accepted — landed 2026-08-11**; S18.1 + S18.2 **accepted —
 landed 2026-08-11**; S18.3 + S18.4 **accepted — landed 2026-08-11** (S18 now
-complete); S20 / S29 still draft
+complete); S20.1 + S20.2 **accepted — landed 2026-08-11**; S20.3/.4/.5 and S29
+still draft
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S17 + S18 + S20)
 
@@ -148,6 +149,80 @@ than a real datfrozenxid horizon (goopg computes one for CLOG truncation but it
 is not plumbed here), `oldestMulti` is pinned to `FirstMultiXactId` because
 goopg's multixact store never truncates, and the multixact counter is still
 in-memory-only — S24 owns its durability. Ledgered.
+
+## Findings — S20.1 + S20.2 as built (2026-08-11)
+
+The design held, with **one correction to its own S20.1 wording** and **one
+subtask dropped as wrong**.
+
+**Correction — `DB_SHUTDOWNED_IN_RECOVERY` is not clean.** The plan (and this
+doc's §S20.1) said "neither `DBStateShutdowned` nor
+`DBStateShutdownedInRecovery`". Upstream's test is a single equality:
+`else if (ControlFile->state != DB_SHUTDOWNED) InRecovery = true`
+(`xlogrecovery.c:931`). A standby shut down tidily still has to replay its way
+back to consistency, so the two-value set would have skipped recovery on
+exactly the cluster that needs it. `beginRecovery`
+(`internal/initdb/recovery_state.go`) implements upstream's test, and a subtest
+pins the distinction.
+
+**Second arm implemented too.** `redo < CheckPoint` (the checkpoint record's
+own location) is the signature of an ONLINE checkpoint, i.e. a cluster that
+never ran its shutdown checkpoint — upstream forces recovery on it
+(`xlogrecovery.c:924-929`) regardless of the state byte. goopg can evaluate it
+because S18 made both fields real. Verified it does *not* misfire on a clean
+goopg restart: `runCheckpoint` samples a shutdown checkpoint's redo at the WAL
+frontier where the record is then appended and nothing may be written in
+between, so `redo == CheckPoint` exactly. Where upstream PANICs on this arm
+with `state == DB_SHUTDOWNED` ("invalid redo record in shutdown checkpoint"),
+goopg logs and recovers: refusing to start is the worse outcome for a directory
+goopg may not have written, and replaying from an online checkpoint's redo is
+correct, only slower.
+
+**S20.2's "teach `isCheckpointRecord` about `XLOG_CHECKPOINT_REDO` (0xE0)" is
+dropped as a mis-specification.** `XLOG_CHECKPOINT_REDO` is not a checkpoint
+record: it carries a 4-byte `wal_level`, not an 88-byte `CheckPoint` struct, and
+`isCheckpointRecord` is consumed by `checkpointStructOf` and by
+`DiscoverLastCheckpointLSN`, both of which want the struct. Classifying the
+marker as a checkpoint would have made `DiscoverLastCheckpointLSN` return a
+location with no checkpoint at it. It is also unnecessary: the marker's whole
+purpose is to *be* the redo point of the online checkpoint that follows, and
+that address is precisely what `checkPointCopy.redo` now supplies directly.
+Recorded here rather than silently skipped.
+
+**Where the pointer wins.** `replayStartAt` (`internal/wal/recovery.go`) takes
+the anchor from `pg_control` alone when it has one; the scan survives for
+`redo == 0` (fresh cluster, hand-assembled directory with no control file, the
+standalone `ReplayFromDir` entry point) and still supplies the *reported*
+`CheckpointLSN`, which is bookkeeping rather than an anchor. Trusting the
+pointer is safe in the one direction it can be stale: goopg appends the
+checkpoint record before updating pg_control, so a crash between the two leaves
+an *older* redo, which replays a superset — idempotent via pd_lsn guards and
+terminal-state CLOG stamps.
+
+**End-of-recovery checkpoint.** `Open` forces one (`CheckpointNow`) after a
+crash-recovery replay, mirroring `CHECKPOINT_END_OF_RECOVERY`. Without it the
+recovered state is undurable until the first scheduled checkpoint — one
+`checkpoint_timeout` (300 s) away — and a second crash replays the same span.
+It costs a clean start nothing, which is why the S17 guard's
+`LastCheckpointLSN() == 0` assertion is also a guard on *this*: misclassifying
+a normal boot as a crash would fire a checkpoint on every start and break it.
+
+**Discovery — crash recovery loses and duplicates rows, and it is NOT this
+slice.** The in-situ smoke (scale-5 pgbench, 18 459 txns, SIGKILL, restart) came
+back with `500000 → 499949` rows, and a `generate_series` anti-join found **218
+missing `aid`s against only 64 net missing rows — i.e. ~154 duplicated ones**.
+Reproduced identically on a worktree build of the parent commit `15e73de3`
+(`500000 → 499936`), so it is pre-existing, not a regression from the redo
+pointer. The shape matches the known non-atomic non-HOT update path
+(`updateOp.Next()` emits `HeapDelete` + `HeapInsert` as two separate records —
+ledger M0118-0129 / M0130-S7.2): a crash between them leaves either both
+versions or neither. Ledgered and filed as its own fix_plan item; the
+crash-recovery smoke is the repro.
+
+**Still deferred after this slice:** S20.3 (unconditional pre-replay
+`pg_internal.init` sweep), S20.4 (`NewStoreAt` seeding from `nextMulti`) and
+S20.5 (write the `minRecoveryPoint` policy down) are untouched — S20 stays
+unchecked.
 
 ## Problem
 

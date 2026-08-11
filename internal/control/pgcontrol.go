@@ -36,6 +36,29 @@ const (
 	DBStateInProduction         = uint32(6)
 )
 
+// DBStateName renders a DBState the way pg_controldata does, so goopg's
+// startup log lines are greppable against a real cluster's. The strings are
+// upstream's dbState[] table (postgres/src/bin/pg_controldata/pg_controldata.c),
+// including its "unrecognized status code" fallback. M0131-S20.1.
+func DBStateName(state uint32) string {
+	switch state {
+	case DBStateShutdowned:
+		return "shut down"
+	case DBStateShutdownedInRecovery:
+		return "shut down in recovery"
+	case DBStateShutdowning:
+		return "shutting down"
+	case DBStateInCrashRecovery:
+		return "in crash recovery"
+	case DBStateInArchiveRecovery:
+		return "in archive recovery"
+	case DBStateInProduction:
+		return "in production"
+	default:
+		return "unrecognized status code"
+	}
+}
+
 var pgCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 // ControlFileData holds the mutable runtime fields of the PostgreSQL

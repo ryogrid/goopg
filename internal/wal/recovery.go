@@ -2024,8 +2024,33 @@ func DecodePageImage(payload []byte) (storage.RelFileNode, storage.BlockNumber, 
 // If no checkpoint record exists, all records are replayed from the
 // start (safe for fresh clusters or WAL without checkpoints).
 func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) {
+	return ReplayRecordsFrom(mgr, records, 0)
+}
+
+// ReplayRecordsFrom is ReplayRecords with an explicit redo pointer, which is
+// where upstream actually gets its replay start: InitWalRecovery reads
+// checkPoint.redo out of the control file's checkPointCopy and hands it to
+// PerformWalRecovery, which never searches the stream for a checkpoint
+// (postgres/src/backend/access/transam/xlogrecovery.c:597-707). goopg has
+// always scanned instead, which works only for WAL goopg itself wrote in a
+// shape its own isCheckpointRecord recognises.
+//
+// redoLSN == 0 means "no control-file redo available" and keeps the
+// goopg-authored scan (replayStart) as the fallback: a fresh cluster, a
+// hand-assembled directory with no pg_control, or the standalone
+// ReplayFromDir entry point. M0131-S20.2.
+//
+// The pointer is trusted the way upstream trusts it, and the one way it can
+// be wrong is safe: goopg's checkpointer appends the checkpoint record first
+// and updates pg_control afterwards (checkpointer.go runCheckpoint), so a
+// crash between the two leaves an OLDER redo in pg_control, which replays a
+// superset. Replay is idempotent — pages carry pd_lsn guards and CLOG stamps
+// are terminal-state writes — so replaying too much costs time, never
+// correctness. Replaying too little is the direction that loses data, and
+// pg_control can never point past the WAL it was written from.
+func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
-	startIdx, checkpointLSN := replayStart(records)
+	startIdx, checkpointLSN := replayStartAt(records, redoLSN)
 	stats.CheckpointLSN = checkpointLSN
 
 	for i, r := range records[startIdx:] {
@@ -3879,6 +3904,13 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 // with a non-default segment size compute every record LSN against the wrong
 // base — see readAllUncached for why that silently defeats pd_lsn idempotency.
 func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error) {
+	return ReplayFromDirWithMgrAt(mgr, walDir, segmentSize, 0)
+}
+
+// ReplayFromDirWithMgrAt is ReplayFromDirWithMgr with the control file's redo
+// pointer (M0131-S20.2). initdb.Open passes pg_control's checkPointCopy.redo
+// here; redoLSN == 0 falls back to the stream scan. See ReplayRecordsFrom.
+func ReplayFromDirWithMgrAt(mgr *storage.Manager, walDir string, segmentSize int64, redoLSN uint64) (ReplayStats, error) {
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		// Missing pg_wal on a fresh data dir is fine — no records
@@ -3888,7 +3920,7 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		}
 		return ReplayStats{}, err
 	}
-	return ReplayRecords(mgr, records)
+	return ReplayRecordsFrom(mgr, records, redoLSN)
 }
 
 // replayHeapVacuum applies one logical heap-vacuum prune record.
@@ -4600,6 +4632,35 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 //
 // If no checkpoint is found, returns (0, 0) — replay all records
 // from the beginning (correct for fresh clusters or early startup).
+// replayStartAt is replayStart with an authoritative redo pointer from
+// pg_control (M0131-S20.2). With redoLSN != 0 the start index comes from the
+// pointer alone — the stream scan is not consulted for the anchor, because
+// its whole purpose is to reconstruct a redo pointer goopg now has directly,
+// and on PG-authored WAL the reconstruction is the part that fails.
+//
+// The reported CheckpointLSN is still scanned for: it is bookkeeping
+// (ReplayStats, the startup xact-stamp pass) rather than a replay anchor, and
+// leaving it 0 on a pointer-driven replay would make a recovered cluster look
+// checkpoint-less to every caller that reads the stat.
+func replayStartAt(records []Record, redoLSN uint64) (int, uint64) {
+	if redoLSN == 0 {
+		return replayStart(records)
+	}
+	_, checkpointLSN := replayStart(records)
+	// Record LSNs are 1-based absolute positions and redoLSN is a 0-based
+	// XLogRecPtr, so "EndLSN > redoLSN" keeps the record the redo pointer
+	// sits inside rather than skipping it — the same one-record-early bias
+	// replayStart's walk-back has, and idempotent for the same reason.
+	startIdx := len(records)
+	for i, r := range records {
+		if r.EndLSN > redoLSN {
+			startIdx = i
+			break
+		}
+	}
+	return startIdx, checkpointLSN
+}
+
 func replayStart(records []Record) (int, uint64) {
 	ckptIdx := -1
 	var checkpointLSN uint64
