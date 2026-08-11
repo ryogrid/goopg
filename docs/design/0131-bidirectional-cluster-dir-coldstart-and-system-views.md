@@ -44,9 +44,17 @@ Theme A first: it is the cheaper direction (the decoders are already proven
 against PG-authored rows by `TestE2E_FailoverPGtoGoopg`), and its two engine
 fixes are single-function. Theme B is "write the test and see" — budget for
 discoveries. Theme C is independent of A and B and may proceed in parallel;
-within C the order is strict (S5 → S6 → S7 → S8 → S9), because S5 gives the E2E
-harness a working row-level view assertion that S6 then reuses, and S8's OID
-decision must land before S9 captures a corpus that would have to be redone.
+within C the order is strict — **corrected after review to
+`S5 → S8a → S6 → S7 → S8b → S9`**. The original `S7 → S8` was circular: S7's
+capture tool consumes S8's OID-mapping table, while S8's guards verify against
+S7's manifest. Splitting S8 into **S8a** (the policy decision + the pinned OID
+table, no manifest needed) and **S8b** (the manifest-based guards) breaks the
+cycle. S8a must also precede **S6**, because under pinning S6.1's
+`12261 → 12105` blob patch is *reverted* and `pg_replication_slots` moves the
+other way (`12105 → 12261`) — deciding first avoids three rework items. S5 and
+S6 are in fact independent (S5's `b5c_view` gate shares nothing with S6's
+`pg_stat_replication` gate); S5 is listed first only because it is the smaller
+of the two.
 S10 should land early — leaving `copyInitFiles` in place while writing new
 cold-start tests risks copying the same dead pattern into them.
 
@@ -187,7 +195,7 @@ Clean-shutdown precondition and its rationale:
 
 ## Theme B — Forward cold start (real PG on a goopg-created directory)
 
-### S4 — E2E: `goopg init` → goopg workload → clean stop → real PG serves (est ~2 loops)
+### S4 — E2E: `goopg init` → goopg workload → clean stop → real PG serves (est ~4 loops)
 
 **Sources:** `internal/testutil/pgcluster/cluster.go:117-125` (`OpenExisting`
 takes any directory and does not run initdb or touch the conf), `:236-289`
@@ -217,7 +225,7 @@ uncovers.
 
 **Also corrected:** `pg_class.relhasindex` is no longer hardcoded false —
 `pgClassRelhasindex` (`internal/executor/pg18_user_catalog_rows.go:591-635`)
-with `pgIndexTupleKeys = true` (`internal/access/btree/pgindex_btree.go:54`)
+with `pgIndexTupleKeys = true` (`internal/executor/pgindex_btree.go:54`)
 means a hosted PG may genuinely plan an index scan over a goopg user index. So
 S4 should put an index-qualified predicate in scope and treat `XX002`
 (`_bt_checkpage` rejection) as a **regression signal**, not an expected wall.
@@ -294,7 +302,7 @@ table. That assertion fails 42809 today and is the precise gate.
 ### S6 — Flip `relhasrules=true` for the six nailed system views (est ~1-2 loops, RISKY)
 
 **Sources:** `internal/initdb/initdb.go:5809-5817` — `relHasRules = true` is
-present but **commented out**, with a rationale ("Needed until the ev_action
+present but **commented out** (`:5817`), with a rationale ("Needed until the ev_action
 format is fully compatible with the running PG18 version") that is now stale;
 `RelationBuildDesc` short-circuits on `relhasrules` at `relcache.c:1250-1256`.
 The six views (OIDs 12100, 12102-12106: `pg_stat_wal_receiver`,
@@ -326,16 +334,21 @@ pg_subscription; the other two → none).
   `internal/initdb/*_ev_action.dat` for `:relid` values; fail on any that is
   neither a pinned catalog OID nor a goopg-assigned view OID. It must fail on
   the unfixed blob.
-- S6.3 Uncomment `relHasRules = true` at `internal/initdb/initdb.go:5811` and
+- S6.3 Uncomment `relHasRules = true` at `internal/initdb/initdb.go:5817` and
   replace the stale comment with the real reason.
 - S6.4 Invert the lock-in test
   `internal/initdb/pg_stat_wal_receiver_nailed_test.go:111-118`
-  (`row[20].BoolValue()` must now be true) and rewrite its rationale.
+  (`row[20].BoolValue()` must now be true) and rewrite its rationale. **Do not
+  assume it is the only one:** a bootstrap pg_class byte change plausibly moves
+  more. `grep` the whole 12100-12111 band (42 references across 6 files per
+  `0131-0008`) — at least `internal/initdb/pg_replication_views_nailed_test.go`,
+  `catalog_heap_reload.go:617`/`:674` and `internal/estimateaudit/parity_test.go`
+  are in range — and re-run `internal/initdb` + `internal/estimateaudit`.
 - S6.5 Probe `reltype`: `relcache_init.go:693-697` gives all six `RelType: 2249`
   (RECORDOID) where real PG creates a per-view composite `pg_type` row. Plain
   SELECT after rule expansion likely does not touch it — probe, do not assume;
   ledger if it diverges.
-- S6.6 **Risk control:** if the first flip FATALs a backend, flip the six one at
+- S6.6 **Risk control:** if the first flip errors out a backend, flip the six one at
   a time. The blobs are independent and a bad one takes the whole backend down
   (`TupleDescInitEntry` / `populate_compact_attribute_internal` FATAL at
   `tupdesc.c:105` is the known shape from M0106).
@@ -348,7 +361,7 @@ AI-20260810-011258-003 installed. Reverting that harness downgrade is the gate.
 (~40 s) + UNITS + SMOKE.
 **Design doc:** `docs/design/0131-0006-system-view-relhasrules-flip.md`.
 
-### S7 — `ev_action` capture tooling + invariant gate (est ~2 loops)
+### S7 — `ev_action` capture tooling + invariant gate (est ~3 loops)
 
 **Sources:** the six existing blobs and their `//go:embed` wiring
 (`internal/initdb/pg_rewrite_bootstrap.go:29-45`, heap writer at `:221`).
@@ -366,7 +379,7 @@ blob-patching over OID-pinning.
 **Gates:** the oracle test + UNITS.
 **Design doc:** `docs/design/0131-0007-ev-action-capture-tooling.md`.
 
-### S8 — System-view OID policy (est ~1-2 loops, DECISION)
+### S8a / S8b — System-view OID policy (est ~1-2 loops, DECISION; SPLIT after review)
 
 **Sources:** the 12261 finding; `system_views.sql` is full of view-on-view
 chains (`pg_stat_sys_tables` → `pg_stat_all_tables`, the `pg_statio_*` family),
@@ -508,18 +521,21 @@ so `copyInitFiles` re-introduces a file both implementations deliberately drop.
   rules, views never pass `RelationIdIsInInitFile`, and the file is deleted at
   `StartupXLOG`), and the index OID is **2693**, not 2620 (2620 is `pg_trigger`).
   Name S5/S6 as the real fix.
-- S10.4 Update `docs/design/0130-0002-pg-class-heap-persistence.md`: Guards #1
-  and #2 still say *"not yet implemented"* / *"Reverse path not yet
-  implemented"*, stale relative to that doc's own later sections; and item 3 of
-  its "Remaining for full reverse-path parity" list names a blocker
-  ("needs a test-harness PG instance lifecycle (M0130-S10)") that no longer
-  exists — the harness landed; the real obstruction was S1's GUC gap.
+- S10.4 Update `docs/design/0130-0002-pg-class-heap-persistence.md` — **Guard
+  #2 only** (corrected after review). Guard #2 (*"Reverse path not yet
+  implemented"*) is stale relative to that doc's own later sections. Guard #1
+  (*"PG started against goopg data dir … Needs E2E PG-attach test — not yet
+  implemented"*) is **still true** until S4 lands, so **S4 owns it, not S10**.
+  S10 also corrects item 3 of the "Remaining for full reverse-path parity" list,
+  which names a blocker ("needs a test-harness PG instance lifecycle
+  (M0130-S10)") that no longer exists — the harness landed; the real obstruction
+  was S1's GUC gap.
 - S10.5 File the three missing ledger rows for that list's items 1–3. They have
   never had one, which the inherited filing rule does not permit.
 - S10.6 Note in the ledger the two unread/unsupported gaps this milestone
   deliberately does not close: `pg_filenode.map` is write-only (re-arm trigger
   already recorded at row #388), and `replayDecodedXLogRecord`
-  (`internal/wal/recovery.go:2208+`, `default:` arm at `:2526`) handles rmids
+  (`internal/wal/recovery.go:2207`, `default:` arm at `:2525`) handles rmids
   0,1,2,3,4,5,7,8,9,10,11,15,128 — missing **6 MultiXact, 12 Hash, 13 Gin,
   14 Gist, 16 SPGist, 17 BRIN, 18 CommitTs, 19 ReplicationOrigin, 20 Generic,
   21 LogicalMessage**. Note that 6/18/19 are *not* index AMs and do appear in
@@ -534,19 +550,34 @@ so `copyInitFiles` re-introduces a file both implementations deliberately drop.
 ## Dependencies
 
 ```
-S1 ─┬─> S3 ──> (Theme A complete)
+S1 ─┬─> S3 ──> (Theme A complete)          S1 LANDED 2026-08-11 (6c81151d)
 S2 ─┘
 S4  (independent; assertions over views wait for S6)
-S5 ──> S6 ──> S7 ──> S8 ──> S9.1 ──> S9.2 ──> S9.3 ──> S9.4 (likely deferred)
-S10 (independent; land early)
+S5 ─┬─> S8a ──> S6 ──> S7 ──> S8b ──> S9.1 ──> S9.2 ──> S9.3 ──> S9.4 (likely deferred)
+    └── (S5 and S6 are technically independent; S5 first only because it is smaller)
+S10 (independent; land FIRST)
 ```
 
 - S3 needs S1 (goopg cannot start on the directory otherwise) and S2 (or the
   system ID silently diverges).
 - S4's view assertions need S6; its table assertions need nothing.
-- S6 needs S5 only for ordering convenience — S5 gives the E2E harness a working
-  row-level view assertion that S6 reuses. The two fixes are technically
-  independent.
-- S9 needs S8 decided, or its captured corpus may need redoing.
+- **S6 does NOT depend on S5** (corrected after review). S5's gate is
+  `b5c_view` in `TestE2E_FailoverGoopgToPG`; S6's is `pg_stat_replication` in
+  `waitForPhysicalStreamingPGtoGoopg`. They share nothing. S5 is listed first
+  only because it is the smaller change; S6 has the stronger claim to urgency,
+  since it reverts a harness downgrade that ledger rows 995/996 record as a
+  knowing loss of coverage.
+- **S6 needs S8a**, not the reverse: under pinning, S6.1's blob patch inverts.
+- **S7 needs S8a** (the OID-mapping table is S8a's output, and S7 refuses to
+  emit for an in-band relid with no mapping entry). **S8b needs S7** (its guards
+  verify against S7's manifest). This is why S8 is split.
+- S9 needs S8a decided, or its captured corpus may need redoing.
+- **S6's flip reaches only freshly `goopg init`'d directories.** `relhasrules`
+  is written by `pgClassRow` → `bootstrapPgClassTuples` at initdb time, so every
+  existing goopg `$PGDATA` — the bench clusters on 65433/65436/65437 and any
+  operator directory — keeps `relhasrules='f'` on disk and a hosted PG still
+  cannot read its system views. There is **no in-place upgrade path; re-initdb
+  is required.** Every M0131 gate initdbs fresh, so nothing catches this: say it
+  in the S6 commit message and file a ledger row.
 - S10 is independent and should land first so the new Theme A/B tests are not
   written against the dead pattern.
