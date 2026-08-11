@@ -3,6 +3,15 @@
 status: design · date: 2026-07-14 · base: `a640d2b0` · gates: G-unit, G-tpch,
 D-002 isolation, G-perf → [README](README.md)
 
+> **Superseded (on landing) by M0132**, 2026-08-12: milestone
+> `docs/milestones/0132-extended-protocol-explicit-transactions.md`, plan
+> `docs/design/0132-extended-protocol-explicit-transactions.md`. That filing corrects
+> three things below: slice S1 ("thread `connTxState`") is **already done**; `Sync` is
+> **already correct** and must not be changed; and §2/§4.1's `transactionOp.execCommit`
+> route **does not exist** — the simple-query COMMIT deliberately bypasses `execCommit`
+> (`dispatch.go:2803-2807`) and runs the deferred FK/UNIQUE/EXCLUDE checks inline at
+> `dispatch.go:2818-2828`. This doc stays `design` until M0132 lands.
+
 ## 1. Problem and numbers
 
 The 06-03 read-path analysis noted that plan+parse cost (~20 % of `-S` CPU)
