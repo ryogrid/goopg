@@ -71,6 +71,15 @@ type Runtime struct {
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
 
+	// NextMultiXact is pg_control's checkPointCopy.nextMulti as read at
+	// Open time — the MultiXactId the previous run would have handed out
+	// next. cmd/goopg seeds the process-shared multixact.Store from it
+	// (multixact.NewStoreAt) so a restarted cluster does not re-issue
+	// MultiXactIds the pre-restart run already stamped into tuple xmax
+	// fields. 0 when there was no usable control file; NewStoreAt clamps
+	// that up to FirstMultiXactId. M0131-S20.4.
+	NextMultiXact uint32
+
 	// Recovery is true when `<DataDir>/recovery.signal` was present
 	// at Open time. cmd/goopg start uses this to enter archive recovery
 	// (fetch WAL segments via restore_command, replay them, then
@@ -347,6 +356,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
 	}
+
+	// M0131-S20.3: sweep every pg_internal.init in the cluster before a
+	// single record is replayed, the way StartupXLOG does
+	// (xlog.c:5633). Unconditional by design — upstream removes them even
+	// after a clean shutdown, and for goopg the file on disk may have been
+	// written by real PostgreSQL against a catalog replay is about to move.
+	clearRelcacheInitFiles(abs)
 
 	// Crash recovery: replay any WAL records past the last
 	// checkpoint into the data files BEFORE the buffer pool comes
@@ -2414,6 +2430,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir:        abs,
 		Standby:        standby,
 		Recovery:       recovery,
+		NextMultiXact:  recov.nextMulti,
 		FSM:            storage.NewFSM(),
 		VM:             storage.NewVisibilityMap(),
 	}

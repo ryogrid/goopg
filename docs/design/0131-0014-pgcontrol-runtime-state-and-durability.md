@@ -2,8 +2,8 @@
 
 **Status:** S17 **accepted — landed 2026-08-11**; S18.1 + S18.2 **accepted —
 landed 2026-08-11**; S18.3 + S18.4 **accepted — landed 2026-08-11** (S18 now
-complete); S20.1 + S20.2 **accepted — landed 2026-08-11**; S20.3/.4/.5 and S29
-still draft
+complete); S20.1 + S20.2 **accepted — landed 2026-08-11**; S20.3 + S20.4 + S20.5
+**accepted — landed 2026-08-11** (S20 now complete); S29 still draft
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S17 + S18 + S20)
 
@@ -223,6 +223,81 @@ crash-recovery smoke is the repro.
 `pg_internal.init` sweep), S20.4 (`NewStoreAt` seeding from `nextMulti`) and
 S20.5 (write the `minRecoveryPoint` policy down) are untouched — S20 stays
 unchecked.
+
+## Findings — S20.3 + S20.4 + S20.5 as built (2026-08-11)
+
+S20 closes here. All three landed as designed; the interesting part is a guard
+that was **green while proving nothing**, and what fixing it revealed about
+which init file the sweep can actually be observed on.
+
+**S20.3 — the sweep.** `catalog.RelcacheInitFileRemoveAll(dataDir)` mirrors
+`RelationCacheInitFileRemove` plus its `RelationCacheInitFileRemoveInDir`
+helper: `global/pg_internal.init`, then every all-digit entry of `base/`, then
+every all-digit entry of `pg_tblspc/` descended through
+`config.TablespaceVersionDirectory`. `clearRelcacheInitFiles`
+(`internal/initdb/recovery_state.go`) calls it under the existing
+`WithRelCacheInitLock` and **before** replay, from `Open`. Failure warns and
+continues — upstream passes `elevel = LOG` to `unlink_initfile` from this call
+site, deliberately not `ERROR`. The all-digit test is upstream's
+`strspn(d_name, "0123456789") == strlen(d_name)`, and it is load-bearing:
+without it the sweep descends into `pgsql_tmp` and treats any future
+non-database directory as a database.
+
+**The false guard, and the fix.** The obvious assertion — plant a foreign
+`global/pg_internal.init`, `Open`, assert it is gone — **passes with the sweep
+deleted outright**, and also passes with the sweep made conditional on
+`crashRecovery`. Both break directions were scripted and both stayed green.
+The reason: `Open` *regenerates* `global/`, `base/1/` and `base/5/` after
+replay (`relcache_init.go:31-47`, called from `open.go:1690/1844`), so those
+three files are overwritten whether or not anything swept them. The guard has
+to plant in a database directory goopg does **not** regenerate for —
+`base/16384` — which is not a testing detail but the actual gap S20.3 closes:
+the pre-existing reactive path takes ONE `dboid`, so nothing ever reached a
+database the running session had not itself invalidated. Retargeted, both
+break directions fail as they should.
+
+**S20.4 — the seed.** `beginRecovery` now also returns
+`checkPointCopy.nextMulti`, `Open` publishes it as `Runtime.NextMultiXact`, and
+`cmd/goopg/main.go` builds the process-shared store with
+`multixact.NewStoreAt(...)` instead of `NewStore()`. The split is deliberate:
+the store is process-shared and constructed after `Open` returns, so `initdb`
+publishes the value and `cmd` applies it. `NewStoreAt` clamps anything below
+`FirstMultiXactId`, so the no-control-file case (0) degrades exactly to the old
+behaviour. What this fixes is not a hypothetical: MultiXactIds are stamped into
+tuple `xmax` fields, which are **on disk and outlive the process**, so an
+allocator that rewinds to 1 on every restart re-issues ids that existing tuples
+already carry. Note the asymmetry with S18.4, which made the counter *visible*
+to a checkpoint — this makes it *survive* one. Membership is still in-memory
+and transient (the SLRU is S24), so a seeded id resolves to an *unknown* member
+set rather than a wrong one, which is the same answer upstream gives for a
+truncated-away multixact.
+
+**S20.5 — the policy, as an executable assertion.** Upstream's rule is one line
+and one comment in `CreateCheckPoint`: `/* crash recovery should always recover
+to the end of WAL */`, then `minRecoveryPoint = InvalidXLogRecPtr` and
+`minRecoveryPointTLI = 0`, unconditionally, on every checkpoint a
+non-recovering cluster writes (`xlog.c:7295-7297`). The reader half agrees:
+`InitWalRecovery` adopts the control file's value only when `InArchiveRecovery`
+and uses `InvalidXLogRecPtr` otherwise (`xlog.c:5778-5794`), with the comment
+explaining why — a stale location makes the startup process declare consistency
+early and then complain about invalid page references. goopg's checkpointer
+already writes `0`/`0` (`internal/wal/checkpointer.go`), and `beginRecovery`
+writes only `State`, so the policy already held; what it lacked was anything
+that would notice it being broken. `TestCrashRecoveryLeavesMinRecoveryPointInvalid`
+poisons **both** fields (`0xDEAD` / tli 9) before the crash-shaped `Open`, so a
+pass requires the end-of-recovery checkpoint to actively clear them rather than
+merely never having written them. Deleting the checkpointer's two clearing
+lines fails it.
+
+The one deliberate violator remains **S29**: `UpdateControlCheckpoint` writes
+`MinRecoveryPoint = 1` so a PG standby restoring a BASE_BACKUP passes
+`XLogRecPtrIsInvalid()` in `CheckRecoveryConsistency`. Confirmed this loop that
+`internal/server/basebackup.go:232` is its **only** caller, so the divergence is
+confined to the backup lane — but that call mutates the **live primary's**
+control file, which upstream's `basebackup.c` never does (it sends a modified
+*copy* in the stream). So a crash in the BASE_BACKUP → next-checkpoint window
+leaves the primary advertising a minimum recovery point it invented. Ledgered
+against S29 rather than fixed here.
 
 ## Problem
 
@@ -476,10 +551,25 @@ rather than mutating the source.
 6. **S20.1.** A `DB_IN_PRODUCTION` directory produces the crash-recovery banner
    and an end-of-recovery checkpoint on the next start; a `DB_SHUTDOWNED` one
    produces neither.
-7. **S20.3.** Plant `pg_internal.init` in `global/` and two `base/<n>/` dirs
-   before start; all three are gone after `Open()` returns.
-8. **S20.4.** Seed `nextMulti = 4242`; the store's first allocation is ≥ 4242.
-9. UNITS + SMOKE green —
+7. **S20.3 — corrected as built.** The plan's "plant in `global/` and two
+   `base/<n>/` dirs; all three are gone after `Open()`" **cannot detect the
+   bug**: `Open` regenerates `global/`, `base/1/` and `base/5/` after replay, so
+   that assertion passes with the sweep deleted (verified by scripted revert).
+   The guard plants in `base/16384/`, a database goopg does not regenerate for.
+   `TestOpenRemovesPreexistingRelcacheInitFile` (`internal/initdb/`) does this on
+   a **clean** start, pinning that the sweep is unconditional;
+   `TestClearRelcacheInitFilesSweepsWholeCluster` covers `global/`, three
+   `base/<n>/`, a `pg_tblspc/<oid>/<verdir>/<n>/`, and the three non-numeric
+   entries that must survive.
+8. **S20.4.** Seed `nextMulti = 4242`; `Runtime.NextMultiXact == 4242`
+   (`TestOpenSeedsMultiXactFromPgControl`), and a directory with no pg_control
+   yields 0, which `NewStoreAt` clamps
+   (`TestOpenWithoutControlFileLeavesMultiXactUnseeded`).
+9. **S20.5.** Poison `minRecoveryPoint`/`TLI` to `0xDEAD`/`9`, crash-shape the
+   control file, `Open`: both are back to 0 afterwards
+   (`TestCrashRecoveryLeavesMinRecoveryPointInvalid`). Poisoning is what makes
+   the guard mean "actively cleared" rather than "never written".
+10. UNITS + SMOKE green —
     `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` plus the git
     hook's mandatory pgbench smoke (never `--no-verify`, never `-count=1`). S18
     touches the checkpoint path, so `scripts/tpch-spotcheck.sh` too. Any guard

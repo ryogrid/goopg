@@ -554,10 +554,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.TxnMgr = rt.TxnMgr
 		// Process-shared MultiXact member store (M0118-0003). One per server
 		// process; the dispatch path plumbs it into every executor.Context so
-		// concurrent row-lock holders combine into a MultiXactId. Starts at
-		// FirstMultiXactId; persisting/seeding from pg_control.nextMulti is a
-		// deferred enhancement (membership is in-memory and transient in v0).
-		cfg.MultiXact = multixact.NewStore()
+		// concurrent row-lock holders combine into a MultiXactId.
+		//
+		// M0131-S20.4: the allocator is SEEDED from pg_control's
+		// checkPointCopy.nextMulti (Runtime.NextMultiXact, read by
+		// beginRecovery) instead of always restarting at
+		// FirstMultiXactId. The NewStoreAt seam has existed since
+		// M0118-0003 and had no caller, so every restart rewound the
+		// counter and began re-issuing MultiXactIds that the previous
+		// run had already stamped into tuple xmax fields — upstream
+		// keeps the counter monotonic across restarts precisely because
+		// those stamps outlive the process (MultiXactShmemInit /
+		// StartupMultiXact seed from the same checkpoint field).
+		// Membership itself is still in-memory and transient (the SLRU
+		// is M0131-S24), so a seeded id resolves to an unknown member
+		// set rather than a wrong one — which is the same answer a
+		// truncated-away multixact gives upstream.
+		cfg.MultiXact = multixact.NewStoreAt(multixact.MultiXactId(rt.NextMultiXact))
 		// M0131-S18.4: publish the allocator's next-to-assign MultiXactId
 		// into every checkpoint (record + pg_control). Before this the
 		// encoder wrote a literal 1, so a cluster that had combined row

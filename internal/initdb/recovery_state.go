@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -30,6 +31,12 @@ type startupRecoveryDecision struct {
 	// prevState is the DBState pg_control carried on entry, kept for the
 	// log line and for the post-replay stamp's before/after reporting.
 	prevState uint32
+	// nextMulti is pg_control's checkPointCopy.nextMulti — the MultiXactId
+	// the previous run would have handed out next. 0 when there is no
+	// usable control file; multixact.NewStoreAt clamps anything below
+	// FirstMultiXactId, so 0 degrades to the pre-M0131-S20.4 behaviour of
+	// starting the allocator at FirstMultiXactId. M0131-S20.4.
+	nextMulti uint32
 }
 
 // beginRecovery reads pg_control, decides whether this start is a crash
@@ -75,7 +82,11 @@ func beginRecovery(dataDir string) (startupRecoveryDecision, error) {
 		return startupRecoveryDecision{}, nil
 	}
 
-	d := startupRecoveryDecision{redoLSN: cd.CheckPointCopyRedo, prevState: cd.State}
+	d := startupRecoveryDecision{
+		redoLSN:   cd.CheckPointCopyRedo,
+		prevState: cd.State,
+		nextMulti: cd.CheckPointCopyNextMulti,
+	}
 	onlineCheckpoint := cd.CheckPointCopyRedo < cd.CheckPoint
 	d.crashRecovery = cd.State != control.DBStateShutdowned || onlineCheckpoint
 	if !d.crashRecovery {
@@ -103,6 +114,33 @@ func beginRecovery(dataDir string) (startupRecoveryDecision, error) {
 		return d, err
 	}
 	return d, nil
+}
+
+// clearRelcacheInitFiles sweeps every pg_internal.init in the cluster before
+// replay, mirroring the unconditional RelationCacheInitFileRemove() upstream
+// runs at xlog.c:5633. M0131-S20.3.
+//
+// Before this, goopg only ever unlinked init files REACTIVELY — one database
+// at a time, from an invalidation it had itself generated
+// (catalog.RelcacheInitFileUnlink). Nothing removed a file that was already on
+// disk when the server started, so a PG-authored `global/pg_internal.init`
+// survived into a goopg session and described a catalog that WAL replay was
+// about to change. Upstream sweeps even after a clean shutdown ("it seems
+// safest to just remove them always"), and so does this: the decision is
+// deliberately NOT conditioned on decision.crashRecovery.
+//
+// Failure is logged, not fatal — the same elevel = LOG posture upstream's
+// unlink_initfile is called with here. A file that could not be removed is a
+// hazard, but so is refusing to open a cluster over it, and the reactive
+// unlink path gets another chance at the first invalidation.
+func clearRelcacheInitFiles(dataDir string) {
+	err := catalog.WithRelCacheInitLock(func() error {
+		return catalog.RelcacheInitFileRemoveAll(dataDir)
+	})
+	if err != nil {
+		slog.Warn("could not remove some relcache init files before replay; a stale pg_internal.init may describe a pre-replay catalog",
+			"dataDir", dataDir, "err", err)
+	}
 }
 
 // endOfRecoveryCheckpoint forces a checkpoint after crash recovery has
