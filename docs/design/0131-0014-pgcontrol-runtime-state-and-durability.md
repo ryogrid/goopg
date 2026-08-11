@@ -1,6 +1,7 @@
 # pg_control runtime state and durability — stamp `DB_IN_PRODUCTION`, make the writer crash-safe, start from pg_control
 
-**Status:** S17 **accepted — landed 2026-08-11**; S18 / S20 / S29 still draft
+**Status:** S17 **accepted — landed 2026-08-11**; S18.1 + S18.2 **accepted —
+landed 2026-08-11**; S18.3 / S18.4 / S20 / S29 still draft
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S17 + S18 + S20)
 
@@ -39,6 +40,51 @@ S17.3's check came back negative and stays open: goopg still never reads
 `State`, so it does not act on its own stamp — a goopg restart over a
 `DB_IN_PRODUCTION` directory replays WAL for unrelated reasons (the checkpoint
 scan), not because it recognised a crash. That is S20.1, ledgered.
+
+## Findings — S18.1 + S18.2 as built (2026-08-11)
+
+Both landed as designed; the §S18.2 offset table needed no correction — the real
+`pg_controldata` agrees with every one of its nine rows on a goopg-authored
+directory. Four things worth recording:
+
+1. **The writer's real failure mode is "cannot set", not "writes zeros".** The
+   filing said the nine fields "survive only by read-modify-write". That is
+   right, but it has a consequence the guards had to be designed around: with an
+   *encode* line missing, RMW **preserves** the on-disk value, so both the
+   oracle comparison and a byte-for-byte round-trip stay green — the field is
+   merely unsettable. Only a *decode* line missing is destructive (the field
+   decodes as 0 and encode writes that 0 over live data). So the golden test
+   needs three distinct assertions, and they were each proven fail-when-broken
+   by scripted revert: byte-for-byte identity (catches a wrong offset — an
+   88→89 slip reports `changed byte 89`), oracle agreement (catches goopg and
+   PG disagreeing about the same bytes), and **settability** (seed 55, read back
+   55 — the only one that catches a dropped encode line, and it reports
+   `oldestMulti = 55, want 9005`).
+2. **`writeControlFileDurably` is a no-`O_CREATE` writer.** `os.WriteFile` would
+   conjure a pg_control out of nothing; the new one requires the file to exist,
+   which is correct — initdb creates it, updates only overwrite it. The
+   short-file promotion at the top of `UpdateControlFile` stays as the
+   grow-to-8192 path, and the write is now explicitly `buf[:8192]`, so a
+   hypothetical longer file keeps its tail instead of being truncated away
+   (upstream's `O_RDWR` + fixed-size `write()` has the same property).
+3. **The truncation guard is testable without a crash.** Proving "there is no
+   window in which pg_control is zero bytes" directly needs a fault injector.
+   The observable proxy is a sentinel past byte 8192: an `O_TRUNC` writer erases
+   it and shortens the file, a `WriteAt` writer does not. That, plus the
+   no-`O_CREATE` assertion, is what pins the open flags — the design's guard #3
+   proposed "assert by construction", and this is strictly better.
+4. **The fsync is not measurably on any hot path.** `UpdateControlFile`'s
+   callers are the checkpointer, promotion, `XLOG_PARAMETER_CHANGE` replay and
+   BASE_BACKUP — none per-transaction. No GUC gate (`fsync = off`) was wired in:
+   upstream passes `do_sync = true` from every backend caller of
+   `update_controlfile`, and pg_control is the one file whose loss is
+   unrecoverable.
+
+`oldestActiveXid` is now written correctly rather than left at 0, as the design
+asked. S18.3 (live TLI) and S18.4 (`encodeCheckPointStruct`'s constants) remain
+open — and S18.4 gained a fifth constant while reading it: `PrevTimeLineID`
+(payload offset 12) is never written at all, so every goopg checkpoint record
+carries `PrevTimeLineID = 0` where PG writes the current TLI.
 
 ## Problem
 
