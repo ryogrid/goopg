@@ -61,6 +61,15 @@ VIEWS=()
 BAND_LO=12000
 BAND_HI=16384
 
+# Inline heap-tuple budget for a seeded pg_rewrite row (guard #5).
+# MaxHeapTupleSize = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) -
+# MAXALIGN(sizeof(ItemIdData)) = 8192 - 24 - 8 (postgres/src/include/access/
+# htup_details.h:561-563). The other seven columns are fixed-width plus the
+# "<>" ev_qual varlena and the tuple header, so reserve a flat 160 B.
+MAX_HEAP_TUPLE_SIZE=8160
+TUPLE_OVERHEAD_BUDGET=160
+MAX_EV_ACTION_STORED=$((MAX_HEAP_TUPLE_SIZE - TUPLE_OVERHEAD_BUDGET))
+
 die()  { echo "capture-ev-action: $*" >&2; exit 2; }
 fail() { echo "capture-ev-action: GUARD FAILED: $*" >&2; exit 1; }
 
@@ -84,7 +93,12 @@ done
 # Single sources of truth read out of the Go tree
 # -------------------------------------------------------------------------- #
 PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
-TYPES_GO="${INITDB_DIR}/pg_type_seed_data.go"
+# pgTypeCanonical, not pg_type_seed_data.go: the CANONICAL table is what
+# bootstrapPgTypeTuples derives attalign/attbyval from, and it is a strict
+# subset of the seed data. Parsing the wider file made guard #5 vacuous —
+# M0131-S9.1's tranche needed 1007/1700/2211 added to pgTypeCanonical, which
+# only the Go test caught.
+TYPES_GO="${INITDB_DIR}/pg_type_bootstrap.go"
 [[ -f "$PINS_GO" ]]  || die "missing ${PINS_GO}"
 [[ -f "$TYPES_GO" ]] || die "missing ${TYPES_GO}"
 
@@ -109,7 +123,7 @@ done < <(sed -n 's/^[[:space:]]*{"\([a-z_]*\)", *\([0-9]*\), *\([0-9]*\), *\([0-
 # captured atttypid outside it has no resolvable alignment (guard #5).
 declare -A known_type
 while read -r oid; do known_type["$oid"]=1; done \
-    < <(grep -o '{OID: [0-9]*' "$TYPES_GO" | grep -o '[0-9]*')
+    < <(sed -n 's/^[[:space:]]*return pgTypeEntry{\([0-9]*\),.*/\1/p' "$TYPES_GO")
 [[ ${#known_type[@]} -gt 0 ]] || die "parsed zero pg_type entries out of ${TYPES_GO}"
 
 if [[ $VERIFY -eq 1 ]]; then
@@ -231,6 +245,22 @@ for view in "${VIEWS[@]}"; do
         || fail "${view}: ev_action spans multiple lines — the blob is not one line"
     [[ "$(head -c1 "$dat")" == "(" && "$(tail -c1 "$dat")" == ")" ]] \
         || fail "${view}: ev_action is not parenthesis-delimited"
+
+    # Guard #5 (0131-0009 "Guards" §5): the seeded pg_rewrite row must fit an
+    # inline heap tuple. goopg stores ev_action as a PGLZ-compressed varlena
+    # (pgRewriteRow → pglzVarlenaDatum) into base/{1,5}/2618 with NO toaster:
+    # DECLARE_TOAST(pg_rewrite, 2838, 2839) is NOT bootstrapped, so an
+    # overflowing capture would seed a row a hosted PG cannot read. Measure
+    # the compressed size the oracle itself stores (pg_column_size applies the
+    # same pglz), leave headroom for the other seven columns + tuple header,
+    # and fail loudly naming the slice that must land first.
+    stored_len="$(psql_q "SELECT pg_column_size(r.ev_action) FROM pg_rewrite r
+                           WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+                             AND r.rulename = '_RETURN'")"
+    [[ -n "$stored_len" ]] || die "${view}: pg_column_size query returned nothing"
+    if [[ "$stored_len" -gt $MAX_EV_ACTION_STORED ]]; then
+        fail "${view}: ev_action stores as ${stored_len} B compressed, over the ${MAX_EV_ACTION_STORED} B inline budget (MaxHeapTupleSize ${MAX_HEAP_TUPLE_SIZE} B minus ${TUPLE_OVERHEAD_BUDGET} B of header + the other pg_rewrite columns) — bootstrapping DECLARE_TOAST(pg_rewrite, 2838, 2839) is the prerequisite slice"
+    fi
 
     # Guard #4: every in-band :relid inside the blob must be an OID this tree
     # pins. Out-of-band relids are upstream-pinned catalogs (1259, 6100, …)

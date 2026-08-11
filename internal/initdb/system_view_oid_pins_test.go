@@ -234,8 +234,14 @@ func TestSystemViewOIDPinConstantsAgree(t *testing.T) {
 		{"pg_replication_slots", pgReplicationSlotsViewOID, pgRewriteOIDPgReplicationSlotsReturn},
 		{"pg_stat_replication_slots", pgStatReplicationSlotsViewOID, pgRewriteOIDPgStatReplicationSlotsReturn},
 	}
-	if len(cases) != len(systemViewOIDPins()) {
-		t.Fatalf("%d constant pairs vs %d pins — a view was added to one side only",
+	// The named constants exist only for the six views that predate the
+	// generated seed data (M0131-S7.4); every view added since is reached by
+	// name through nailedViewSeedOID/nailedViewRewriteEntry and mints no Go
+	// constant. So the invariant is containment — every surviving constant
+	// agrees with its pin — plus the one-row-per-pin check the generated
+	// side owns (TestNailedViewManifestMatchesGeneratedTables).
+	if len(cases) > len(systemViewOIDPins()) {
+		t.Fatalf("%d constant pairs vs %d pins — a constant lost its pin",
 			len(cases), len(systemViewOIDPins()))
 	}
 	for _, tc := range cases {

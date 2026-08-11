@@ -144,8 +144,13 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
 		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1007:
+		return pgTypeEntry{1007, "_int4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1009:
 		return pgTypeEntry{1009, "_text", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 2211:
+		// _regtype: the array of regtype (2206), pg_type.dat:389.
+		return pgTypeEntry{2211, "_regtype", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1028:
 		return pgTypeEntry{1028, "_oid", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1033:
@@ -165,6 +170,12 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		// interval: 16-byte fixed time interval; typcategory='T', typalign='d'.
 		// interval_in=1160, interval_out=1161, interval_recv=2478, interval_send=2479.
 		return pgTypeEntry{1186, "interval", 16, false, 'b', 'T', 'd', 'p', 1160, 1161, 2478, 2479}, true
+	case 1700:
+		// numeric: variable-length arbitrary precision; typcategory='N',
+		// typstorage='m' (main — never toasted out of line by choice).
+		// numeric_in=1701, numeric_out=1702, numeric_recv=2460,
+		// numeric_send=2461 (pg_type.dat:348-354).
+		return pgTypeEntry{1700, "numeric", -1, false, 'b', 'N', 'i', 'm', 1701, 1702, 2460, 2461}, true
 	case 2277:
 		return pgTypeEntry{2277, "anyarray", -1, false, 'p', 'P', 'i', 'x', 2296, 2297, 2502, 2503}, true
 	case 2281:

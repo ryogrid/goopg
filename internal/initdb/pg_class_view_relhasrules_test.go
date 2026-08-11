@@ -107,9 +107,21 @@ func TestBootstrappedViewsCarryRelhasrules(t *testing.T) {
 }
 
 // nailedViewOIDs lists the bootstrapped system views, in the pinned upstream
-// OIDs M0131-S8a adopted. Kept as a function rather than derived from
-// nailedLocalRels so the count is an independent statement of intent: a view
-// silently dropped from (or added to) the nailed set fails the guard above.
+// OIDs M0131-S8a adopted. Derived from systemViewOIDPins() — the HAND-WRITTEN
+// policy table — and deliberately NOT from nailedLocalRels/the manifest, which
+// are generated from the same capture the guard above reads. The independence
+// that matters is hand-written-vs-generated: a view that reaches the pg_class
+// heap without a pin (or a pin whose capture was never regenerated into the
+// seed data) still fails the count check.
+//
+// M0131-S9.1 replaced the six hand-listed OIDs with this derivation: at 29
+// views and climbing toward system_views.sql's 80, re-typing the list is the
+// error, not the guard.
 func nailedViewOIDs() []uint32 {
-	return []uint32{12231, 12240, 12244, 12248, 12261, 12266}
+	pins := systemViewOIDPins()
+	out := make([]uint32, 0, len(pins))
+	for _, p := range pins {
+		out = append(out, p.ViewOID)
+	}
+	return out
 }

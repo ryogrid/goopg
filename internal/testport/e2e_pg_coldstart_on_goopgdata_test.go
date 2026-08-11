@@ -611,24 +611,67 @@ func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Clus
 // views still carry relhasrules='f', so a hosted PG cannot EVALUATE them yet
 // (that is M0131-S6). Name resolution needs only the pg_class row, which is
 // exactly what this test is measuring.
-func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster) {
-	t.Helper()
-	// Upstream PG 18.3 initdb assignments, captured 2026-08-11 from a
-	// throwaway `initdb --no-sync` (two independent runs, identical). These
-	// are literals on purpose — the point is to compare against the oracle,
-	// not against goopg's own systemViewOIDPins() table.
-	want := []struct {
+// nailedSystemViewProbeSet is the on-disk system-view corpus this hosted-PG
+// lane probes, with the OID PG 18.3's OWN initdb assigns to each.
+//
+// These are literals on purpose — the point of both probes below is to compare
+// goopg's on-disk bytes against the oracle, not against goopg's own
+// systemViewOIDPins() table (which internal/testport cannot see anyway, and
+// which would make the check circular if it could).
+//
+// The first six are M0131-S8a's replication views; the remaining 23 are
+// M0131-S9.1's SRF-only tranche — every one `FROM <set-returning function>`
+// with no catalog relation and no view dependency, hence zero in-band :relid
+// in its ev_action. Captured 2026-08-11 from a throwaway `initdb --no-sync`.
+//
+// Deliberately absent: pg_stat_bgwriter (12293) and pg_stat_checkpointer
+// (12297), whose FROM-less Query carries an RTE_RESULT that no captured blob
+// exercises yet (0131-0009 §"Two unmeasured ev_action shapes"); and
+// pg_timezone_abbrevs (12122), whose ORDER BY needs a pg_amop row goopg does
+// not bootstrap ("operator 664 is not a valid ordering operator") — this probe
+// is what found that, and it is ledgered.
+func nailedSystemViewProbeSet() []struct {
+	view string
+	oid  string
+} {
+	return []struct {
 		view string
 		oid  string
 	}{
+		{"pg_catalog.pg_locks", "12073"},
+		{"pg_catalog.pg_cursors", "12077"},
+		{"pg_catalog.pg_prepared_statements", "12095"},
+		{"pg_catalog.pg_settings", "12104"},
+		{"pg_catalog.pg_file_settings", "12110"},
+		{"pg_catalog.pg_hba_file_rules", "12114"},
+		{"pg_catalog.pg_ident_file_mappings", "12118"},
+		{"pg_catalog.pg_timezone_names", "12126"},
+		{"pg_catalog.pg_config", "12130"},
+		{"pg_catalog.pg_shmem_allocations", "12134"},
+		{"pg_catalog.pg_shmem_allocations_numa", "12138"},
+		{"pg_catalog.pg_backend_memory_contexts", "12142"},
 		{"pg_catalog.pg_stat_replication", "12231"},
+		{"pg_catalog.pg_stat_slru", "12236"},
 		{"pg_catalog.pg_stat_wal_receiver", "12240"},
 		{"pg_catalog.pg_stat_recovery_prefetch", "12244"},
 		{"pg_catalog.pg_stat_subscription", "12248"},
+		{"pg_catalog.pg_stat_ssl", "12253"},
+		{"pg_catalog.pg_stat_gssapi", "12257"},
 		{"pg_catalog.pg_replication_slots", "12261"},
 		{"pg_catalog.pg_stat_replication_slots", "12266"},
+		{"pg_catalog.pg_stat_archiver", "12289"},
+		{"pg_catalog.pg_stat_io", "12301"},
+		{"pg_catalog.pg_stat_wal", "12305"},
+		{"pg_catalog.pg_stat_progress_basebackup", "12329"},
+		{"pg_catalog.pg_replication_origin_status", "12343"},
+		{"pg_catalog.pg_wait_events", "12351"},
+		{"pg_catalog.pg_aios", "12355"},
 	}
-	for _, tc := range want {
+}
+
+func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster) {
+	t.Helper()
+	for _, tc := range nailedSystemViewProbeSet() {
 		got, err := pgQueryScalarAllowError(pg, "SELECT '"+tc.view+"'::regclass::oid")
 		if err != nil {
 			t.Fatalf("hosted PG cannot resolve %s at all: %v\n%s", tc.view, err, got)
@@ -670,14 +713,12 @@ func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster
 // assertion under test is rule expansion, not row content.
 func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
 	t.Helper()
-	for _, view := range []string{
-		"pg_catalog.pg_stat_replication",
-		"pg_catalog.pg_stat_wal_receiver",
-		"pg_catalog.pg_stat_recovery_prefetch",
-		"pg_catalog.pg_stat_subscription",
-		"pg_catalog.pg_replication_slots",
-		"pg_catalog.pg_stat_replication_slots",
-	} {
+	// M0131-S9.1 widened this from the six replication views to the whole
+	// on-disk corpus (nailedSystemViewProbeSet). The per-view Errorf is what
+	// makes that affordable: 29 independent blobs, and a bad tupledesc names
+	// its own view instead of forcing a bisect.
+	for _, tc := range nailedSystemViewProbeSet() {
+		view := tc.view
 		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 		if err != nil {
 			logTail, _ := os.ReadFile(pgLogPathFor(goopgDir))

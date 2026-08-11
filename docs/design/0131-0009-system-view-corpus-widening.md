@@ -1,6 +1,6 @@
 # System-view corpus widening — take the six-view island to `system_views.sql` scale
 
-**Status:** draft
+**Status:** in progress (S9.0, S9.1 landed)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S9)
 
@@ -332,6 +332,88 @@ payload still fails.
 Gates: `internal/initdb` PASS (61 s), `^TestE2E_` PASS (105 s, includes
 `TestE2E_PGColdStartOnGoopgDataDir` — a real PG reading the reordered
 `pg_rewrite` heap), UNITS PASS, pgbench smoke via the commit hook.
+
+## Implementation status — S9.1 (2026-08-11)
+
+**The on-disk corpus is 28 views, up from 6, and a real PG 18.3 hosted on a
+goopg `$PGDATA` evaluates every one of them.** 22 of the 23 SRF-only views in
+§"S9.1" landed; the tranche cost one capture run and one generator run, which
+is the claim S9.0 was built to make true.
+
+What the loop actually did:
+
+1. **Pinned 22 new views** in `internal/initdb/system_view_oid_pins.go` (the
+   hand-written policy table, now 28 rows in upstream-OID order). Checked
+   against the oracle before pinning: every one of the 25 candidate views has
+   **zero in-band `:relid`** in its `ev_action`, so the whole tranche could be
+   pinned in one pass without ordering it by view-on-view edges.
+2. **One capture, one regeneration.** `scripts/capture-ev-action.sh <28 views>`
+   then `go run cmd/gen-nailed-view-tables/main.go >
+   internal/initdb/nailed_view_seed_data.go`. No hand-edit of `nailedRel`,
+   `nailedAttr`, the `pg_rewrite` seed rows, or any `//go:embed` line — S9.0's
+   two closed hand-edits held at 4.7× the corpus size.
+3. **Guard #5 (the `MaxHeapTupleSize` assertion) is implemented**, at capture
+   time as the design asks: the script reads `pg_column_size(ev_action)` — the
+   compressed size the oracle itself stores, which is the same pglz `goopg`'s
+   `pglzVarlenaDatum` produces — and fails against an 8000 B budget
+   (`MaxHeapTupleSize` 8160 minus 160 B of tuple header + the other seven
+   columns), naming `DECLARE_TOAST(pg_rewrite, 2838, 2839)` as the prerequisite
+   slice. Ceiling #1 measured, not assumed: the largest blob in the tranche
+   stores at **1875 B**, the largest raw text is `pg_timezone_abbrevs` at
+   9058 B — i.e. the raw-vs-stored distinction is what keeps the corpus inline,
+   and a raw-size guard would have been wrong.
+4. **Guards #1/#3/#4 extended to the whole corpus.**
+   `assertNailedSystemViewsAreEvaluable` and
+   `assertSystemViewOIDsArePinnedToUpstream` now share one literal probe set
+   (`nailedSystemViewProbeSet`, `internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`)
+   covering all 28; `--verify` re-derives all 28 blobs **byte-identically**.
+
+### Findings
+
+**F1 — `pg_timezone_abbrevs` is blocked by `pg_amop`, not by capture.** It is
+the only blob in the tranche carrying a `SortGroupClause`, and a hosted PG
+rejects it with `operator 664 is not a valid ordering operator`:
+`get_ordering_op_properties` looks (664 = `text_lt`, btree, strategy 1) up
+through `pg_amop_fam_strat_index` (**2653**). The heap is not the problem —
+`bootstrapPgAmopTuples` seeds all 945 `pg_amop.dat` rows — but 2653 is a bare
+`makeBtreeRootPage()` placeholder in the three empty-root-page lists
+(`initdb.go:1886/:2031/:2128`), so the index-only lookup finds nothing. **That
+is M0131-S12's exact shape** (empty `pg_opclass_am_name_nsp_index` 2686,
+`indexOK = true`, no seq-scan fallback) one catalog over, which makes it a
+known-class blocker rather than a new one. The per-view
+`t.Errorf` design (S6.6's risk control) is exactly what localised this — 27
+views passed in the same run. Dropped from the tranche, pin removed, ledgered.
+This generalises: **any S9 view with an `ORDER BY` in its definition needs
+`pg_amop` bootstrapped first**, which was not on the ceiling list.
+
+**F2 — three ceilings retired, one confirmed.** Ceiling #1 (inline tuple size)
+is now measured and guarded. The "pg_proc signature drift" ceiling never fired:
+every `atttypid` in the tranche resolved. The dual-definition hazard (ceiling
+#3) did **not** bite at scale — a goopg server was probed directly and
+`pg_settings`(42 rows), `pg_locks`, `pg_cursors`, `pg_prepared_statements`,
+`pg_stat_wal`, `pg_config`(23), `pg_stat_io`(79) and `pg_timezone_names`(32)
+all still answer from their VIRTUAL definitions with the heap `pg_class` rows
+present. Confirmed instead: `pgTypeCanonical` (not `pg_type_seed_data.go`) is
+the type set that matters, and it was missing `_int4`(1007), `numeric`(1700)
+and `_regtype`(2211) — added. The capture script's guard #4 had been parsing
+the *wider* seed file, making it vacuous for exactly this failure; it now parses
+`pgTypeCanonical`'s case labels.
+
+**F3 — the multi-page `pg_rewrite` heap is real now.** 28 seeded rules no
+longer fit one 8 KB page, so `bootstrapPgRewriteTuples` returns TIDs with
+`Block > 0` and the 2692/2693 btree leaves stamp them. A test that pinned
+`wal_receiver` to page 0 failed and was rewritten to assert the invariant that
+holds (every TID a real 1-based ItemPointer). A hosted PG reads the multi-page
+heap through both indexes without complaint.
+
+**Not done, ledgered:** `pg_stat_bgwriter`/`pg_stat_checkpointer` (the
+`RTE_RESULT` pair, deliberately held to a two-view blast radius),
+`pg_timezone_abbrevs` (F1), and guard #2's *before* half — the E2E asserts the
+post-capture state but nothing mechanises the 42P01→resolvable transition.
+
+Gates: `internal/initdb` PASS (64 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (100 s), `capture-ev-action.sh --verify` PASS
+(28/28 byte-identical), UNITS PASS, pgbench smoke via the commit hook.
 
 ## References
 

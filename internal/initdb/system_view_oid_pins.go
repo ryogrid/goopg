@@ -94,12 +94,54 @@ type systemViewOIDPin struct {
 // this IS the manifest for the six hosted views.
 func systemViewOIDPins() []systemViewOIDPin {
 	return []systemViewOIDPin{
+		// M0131-S9.1 (2026-08-11): the SRF-only tranche. Every one of these
+		// views is `FROM <set-returning function>` with no catalog relation
+		// and no view dependency, so its ev_action carries ZERO in-band
+		// `:relid` — verified against the oracle before pinning, which is why
+		// the whole tranche could be pinned in one pass without ordering it
+		// by view-on-view edges. Same capture run as the six below.
+		{"pg_locks", 12073, 12076, 12075, 16},
+		{"pg_cursors", 12077, 12080, 12079, 6},
+		{"pg_prepared_statements", 12095, 12098, 12097, 8},
+		{"pg_settings", 12104, 12107, 12106, 17},
+		{"pg_file_settings", 12110, 12113, 12112, 7},
+		{"pg_hba_file_rules", 12114, 12117, 12116, 11},
+		{"pg_ident_file_mappings", 12118, 12121, 12120, 7},
+		// NOT pinned: pg_timezone_abbrevs (12122). Its ev_action is the only
+		// blob in the tranche carrying a SortGroupClause (`ORDER BY abbrev`),
+		// and a hosted PG 18.3 rejects it with "operator 664 is not a valid
+		// ordering operator" — get_ordering_op_properties (lsyscache.c) scans
+		// pg_amop for (664, btree, strategy 1) and goopg's on-disk pg_amop
+		// does not carry text_lt's row. That is a catalog gap, not a capture
+		// gap; ledgered, and the resume point is bootstrapping pg_amop.
+		{"pg_timezone_names", 12126, 12129, 12128, 4},
+		{"pg_config", 12130, 12133, 12132, 2},
+		{"pg_shmem_allocations", 12134, 12137, 12136, 4},
+		{"pg_shmem_allocations_numa", 12138, 12141, 12140, 3},
+		{"pg_backend_memory_contexts", 12142, 12145, 12144, 10},
+		// The six M0131-S8a views, interleaved by upstream OID.
 		{"pg_stat_replication", 12231, 12234, 12233, 20},
+		{"pg_stat_slru", 12236, 12239, 12238, 9},
 		{"pg_stat_wal_receiver", 12240, 12243, 12242, 15},
 		{"pg_stat_recovery_prefetch", 12244, 12247, 12246, 10},
 		{"pg_stat_subscription", 12248, 12251, 12250, 11},
+		{"pg_stat_ssl", 12253, 12256, 12255, 8},
+		{"pg_stat_gssapi", 12257, 12260, 12259, 5},
 		{"pg_replication_slots", 12261, 12264, 12263, 21},
 		{"pg_stat_replication_slots", 12266, 12269, 12268, 10},
+		{"pg_stat_archiver", 12289, 12292, 12291, 7},
+		{"pg_stat_io", 12301, 12304, 12303, 20},
+		{"pg_stat_wal", 12305, 12308, 12307, 5},
+		{"pg_stat_progress_basebackup", 12329, 12332, 12331, 6},
+		{"pg_replication_origin_status", 12343, 12346, 12345, 4},
+		{"pg_wait_events", 12351, 12354, 12353, 3},
+		{"pg_aios", 12355, 12358, 12357, 15},
+		// NOT pinned here on purpose: pg_stat_bgwriter (12293) and
+		// pg_stat_checkpointer (12297). They have no FROM clause at all, so
+		// their Query carries an RTE_RESULT — a fifth RTE kind no captured
+		// blob exercises yet (0131-0009 §"Two unmeasured ev_action shapes").
+		// They are the next slice, deliberately kept to a two-view blast
+		// radius.
 	}
 }
 

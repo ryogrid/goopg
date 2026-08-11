@@ -4,6 +4,113 @@
 #
 # rel  <name> <oracle_oid> <goopg_oid> <rule_oid> <oracle_reltype> <goopg_reltype> <relkind> <relnatts>
 # attr <name> <attnum> <attname> <atttypid> <attlen> <attnotnull> <attisdropped>
+rel	pg_locks	12073	12073	12076	12075	2249	v	16
+attr	pg_locks	1	locktype	25	-1	f	f
+attr	pg_locks	2	database	26	4	f	f
+attr	pg_locks	3	relation	26	4	f	f
+attr	pg_locks	4	page	23	4	f	f
+attr	pg_locks	5	tuple	21	2	f	f
+attr	pg_locks	6	virtualxid	25	-1	f	f
+attr	pg_locks	7	transactionid	28	4	f	f
+attr	pg_locks	8	classid	26	4	f	f
+attr	pg_locks	9	objid	26	4	f	f
+attr	pg_locks	10	objsubid	21	2	f	f
+attr	pg_locks	11	virtualtransaction	25	-1	f	f
+attr	pg_locks	12	pid	23	4	f	f
+attr	pg_locks	13	mode	25	-1	f	f
+attr	pg_locks	14	granted	16	1	f	f
+attr	pg_locks	15	fastpath	16	1	f	f
+attr	pg_locks	16	waitstart	1184	8	f	f
+rel	pg_cursors	12077	12077	12080	12079	2249	v	6
+attr	pg_cursors	1	name	25	-1	f	f
+attr	pg_cursors	2	statement	25	-1	f	f
+attr	pg_cursors	3	is_holdable	16	1	f	f
+attr	pg_cursors	4	is_binary	16	1	f	f
+attr	pg_cursors	5	is_scrollable	16	1	f	f
+attr	pg_cursors	6	creation_time	1184	8	f	f
+rel	pg_prepared_statements	12095	12095	12098	12097	2249	v	8
+attr	pg_prepared_statements	1	name	25	-1	f	f
+attr	pg_prepared_statements	2	statement	25	-1	f	f
+attr	pg_prepared_statements	3	prepare_time	1184	8	f	f
+attr	pg_prepared_statements	4	parameter_types	2211	-1	f	f
+attr	pg_prepared_statements	5	result_types	2211	-1	f	f
+attr	pg_prepared_statements	6	from_sql	16	1	f	f
+attr	pg_prepared_statements	7	generic_plans	20	8	f	f
+attr	pg_prepared_statements	8	custom_plans	20	8	f	f
+rel	pg_settings	12104	12104	12107	12106	2249	v	17
+attr	pg_settings	1	name	25	-1	f	f
+attr	pg_settings	2	setting	25	-1	f	f
+attr	pg_settings	3	unit	25	-1	f	f
+attr	pg_settings	4	category	25	-1	f	f
+attr	pg_settings	5	short_desc	25	-1	f	f
+attr	pg_settings	6	extra_desc	25	-1	f	f
+attr	pg_settings	7	context	25	-1	f	f
+attr	pg_settings	8	vartype	25	-1	f	f
+attr	pg_settings	9	source	25	-1	f	f
+attr	pg_settings	10	min_val	25	-1	f	f
+attr	pg_settings	11	max_val	25	-1	f	f
+attr	pg_settings	12	enumvals	1009	-1	f	f
+attr	pg_settings	13	boot_val	25	-1	f	f
+attr	pg_settings	14	reset_val	25	-1	f	f
+attr	pg_settings	15	sourcefile	25	-1	f	f
+attr	pg_settings	16	sourceline	23	4	f	f
+attr	pg_settings	17	pending_restart	16	1	f	f
+rel	pg_file_settings	12110	12110	12113	12112	2249	v	7
+attr	pg_file_settings	1	sourcefile	25	-1	f	f
+attr	pg_file_settings	2	sourceline	23	4	f	f
+attr	pg_file_settings	3	seqno	23	4	f	f
+attr	pg_file_settings	4	name	25	-1	f	f
+attr	pg_file_settings	5	setting	25	-1	f	f
+attr	pg_file_settings	6	applied	16	1	f	f
+attr	pg_file_settings	7	error	25	-1	f	f
+rel	pg_hba_file_rules	12114	12114	12117	12116	2249	v	11
+attr	pg_hba_file_rules	1	rule_number	23	4	f	f
+attr	pg_hba_file_rules	2	file_name	25	-1	f	f
+attr	pg_hba_file_rules	3	line_number	23	4	f	f
+attr	pg_hba_file_rules	4	type	25	-1	f	f
+attr	pg_hba_file_rules	5	database	1009	-1	f	f
+attr	pg_hba_file_rules	6	user_name	1009	-1	f	f
+attr	pg_hba_file_rules	7	address	25	-1	f	f
+attr	pg_hba_file_rules	8	netmask	25	-1	f	f
+attr	pg_hba_file_rules	9	auth_method	25	-1	f	f
+attr	pg_hba_file_rules	10	options	1009	-1	f	f
+attr	pg_hba_file_rules	11	error	25	-1	f	f
+rel	pg_ident_file_mappings	12118	12118	12121	12120	2249	v	7
+attr	pg_ident_file_mappings	1	map_number	23	4	f	f
+attr	pg_ident_file_mappings	2	file_name	25	-1	f	f
+attr	pg_ident_file_mappings	3	line_number	23	4	f	f
+attr	pg_ident_file_mappings	4	map_name	25	-1	f	f
+attr	pg_ident_file_mappings	5	sys_name	25	-1	f	f
+attr	pg_ident_file_mappings	6	pg_username	25	-1	f	f
+attr	pg_ident_file_mappings	7	error	25	-1	f	f
+rel	pg_timezone_names	12126	12126	12129	12128	2249	v	4
+attr	pg_timezone_names	1	name	25	-1	f	f
+attr	pg_timezone_names	2	abbrev	25	-1	f	f
+attr	pg_timezone_names	3	utc_offset	1186	16	f	f
+attr	pg_timezone_names	4	is_dst	16	1	f	f
+rel	pg_config	12130	12130	12133	12132	2249	v	2
+attr	pg_config	1	name	25	-1	f	f
+attr	pg_config	2	setting	25	-1	f	f
+rel	pg_shmem_allocations	12134	12134	12137	12136	2249	v	4
+attr	pg_shmem_allocations	1	name	25	-1	f	f
+attr	pg_shmem_allocations	2	off	20	8	f	f
+attr	pg_shmem_allocations	3	size	20	8	f	f
+attr	pg_shmem_allocations	4	allocated_size	20	8	f	f
+rel	pg_shmem_allocations_numa	12138	12138	12141	12140	2249	v	3
+attr	pg_shmem_allocations_numa	1	name	25	-1	f	f
+attr	pg_shmem_allocations_numa	2	numa_node	23	4	f	f
+attr	pg_shmem_allocations_numa	3	size	20	8	f	f
+rel	pg_backend_memory_contexts	12142	12142	12145	12144	2249	v	10
+attr	pg_backend_memory_contexts	1	name	25	-1	f	f
+attr	pg_backend_memory_contexts	2	ident	25	-1	f	f
+attr	pg_backend_memory_contexts	3	type	25	-1	f	f
+attr	pg_backend_memory_contexts	4	level	23	4	f	f
+attr	pg_backend_memory_contexts	5	path	1007	-1	f	f
+attr	pg_backend_memory_contexts	6	total_bytes	20	8	f	f
+attr	pg_backend_memory_contexts	7	total_nblocks	20	8	f	f
+attr	pg_backend_memory_contexts	8	free_bytes	20	8	f	f
+attr	pg_backend_memory_contexts	9	free_chunks	20	8	f	f
+attr	pg_backend_memory_contexts	10	used_bytes	20	8	f	f
 rel	pg_stat_replication	12231	12231	12234	12233	2249	v	20
 attr	pg_stat_replication	1	pid	23	4	f	f
 attr	pg_stat_replication	2	usesysid	26	4	f	f
@@ -25,6 +132,16 @@ attr	pg_stat_replication	17	replay_lag	1186	16	f	f
 attr	pg_stat_replication	18	sync_priority	23	4	f	f
 attr	pg_stat_replication	19	sync_state	25	-1	f	f
 attr	pg_stat_replication	20	reply_time	1184	8	f	f
+rel	pg_stat_slru	12236	12236	12239	12238	2249	v	9
+attr	pg_stat_slru	1	name	25	-1	f	f
+attr	pg_stat_slru	2	blks_zeroed	20	8	f	f
+attr	pg_stat_slru	3	blks_hit	20	8	f	f
+attr	pg_stat_slru	4	blks_read	20	8	f	f
+attr	pg_stat_slru	5	blks_written	20	8	f	f
+attr	pg_stat_slru	6	blks_exists	20	8	f	f
+attr	pg_stat_slru	7	flushes	20	8	f	f
+attr	pg_stat_slru	8	truncates	20	8	f	f
+attr	pg_stat_slru	9	stats_reset	1184	8	f	f
 rel	pg_stat_wal_receiver	12240	12240	12243	12242	2249	v	15
 attr	pg_stat_wal_receiver	1	pid	23	4	f	f
 attr	pg_stat_wal_receiver	2	status	25	-1	f	f
@@ -64,6 +181,21 @@ attr	pg_stat_subscription	8	last_msg_send_time	1184	8	f	f
 attr	pg_stat_subscription	9	last_msg_receipt_time	1184	8	f	f
 attr	pg_stat_subscription	10	latest_end_lsn	3220	8	f	f
 attr	pg_stat_subscription	11	latest_end_time	1184	8	f	f
+rel	pg_stat_ssl	12253	12253	12256	12255	2249	v	8
+attr	pg_stat_ssl	1	pid	23	4	f	f
+attr	pg_stat_ssl	2	ssl	16	1	f	f
+attr	pg_stat_ssl	3	version	25	-1	f	f
+attr	pg_stat_ssl	4	cipher	25	-1	f	f
+attr	pg_stat_ssl	5	bits	23	4	f	f
+attr	pg_stat_ssl	6	client_dn	25	-1	f	f
+attr	pg_stat_ssl	7	client_serial	1700	-1	f	f
+attr	pg_stat_ssl	8	issuer_dn	25	-1	f	f
+rel	pg_stat_gssapi	12257	12257	12260	12259	2249	v	5
+attr	pg_stat_gssapi	1	pid	23	4	f	f
+attr	pg_stat_gssapi	2	gss_authenticated	16	1	f	f
+attr	pg_stat_gssapi	3	principal	25	-1	f	f
+attr	pg_stat_gssapi	4	encrypted	16	1	f	f
+attr	pg_stat_gssapi	5	credentials_delegated	16	1	f	f
 rel	pg_replication_slots	12261	12261	12264	12263	2249	v	21
 attr	pg_replication_slots	1	slot_name	19	64	f	f
 attr	pg_replication_slots	2	plugin	19	64	f	f
@@ -97,3 +229,70 @@ attr	pg_stat_replication_slots	7	stream_bytes	20	8	f	f
 attr	pg_stat_replication_slots	8	total_txns	20	8	f	f
 attr	pg_stat_replication_slots	9	total_bytes	20	8	f	f
 attr	pg_stat_replication_slots	10	stats_reset	1184	8	f	f
+rel	pg_stat_archiver	12289	12289	12292	12291	2249	v	7
+attr	pg_stat_archiver	1	archived_count	20	8	f	f
+attr	pg_stat_archiver	2	last_archived_wal	25	-1	f	f
+attr	pg_stat_archiver	3	last_archived_time	1184	8	f	f
+attr	pg_stat_archiver	4	failed_count	20	8	f	f
+attr	pg_stat_archiver	5	last_failed_wal	25	-1	f	f
+attr	pg_stat_archiver	6	last_failed_time	1184	8	f	f
+attr	pg_stat_archiver	7	stats_reset	1184	8	f	f
+rel	pg_stat_io	12301	12301	12304	12303	2249	v	20
+attr	pg_stat_io	1	backend_type	25	-1	f	f
+attr	pg_stat_io	2	object	25	-1	f	f
+attr	pg_stat_io	3	context	25	-1	f	f
+attr	pg_stat_io	4	reads	20	8	f	f
+attr	pg_stat_io	5	read_bytes	1700	-1	f	f
+attr	pg_stat_io	6	read_time	701	8	f	f
+attr	pg_stat_io	7	writes	20	8	f	f
+attr	pg_stat_io	8	write_bytes	1700	-1	f	f
+attr	pg_stat_io	9	write_time	701	8	f	f
+attr	pg_stat_io	10	writebacks	20	8	f	f
+attr	pg_stat_io	11	writeback_time	701	8	f	f
+attr	pg_stat_io	12	extends	20	8	f	f
+attr	pg_stat_io	13	extend_bytes	1700	-1	f	f
+attr	pg_stat_io	14	extend_time	701	8	f	f
+attr	pg_stat_io	15	hits	20	8	f	f
+attr	pg_stat_io	16	evictions	20	8	f	f
+attr	pg_stat_io	17	reuses	20	8	f	f
+attr	pg_stat_io	18	fsyncs	20	8	f	f
+attr	pg_stat_io	19	fsync_time	701	8	f	f
+attr	pg_stat_io	20	stats_reset	1184	8	f	f
+rel	pg_stat_wal	12305	12305	12308	12307	2249	v	5
+attr	pg_stat_wal	1	wal_records	20	8	f	f
+attr	pg_stat_wal	2	wal_fpi	20	8	f	f
+attr	pg_stat_wal	3	wal_bytes	1700	-1	f	f
+attr	pg_stat_wal	4	wal_buffers_full	20	8	f	f
+attr	pg_stat_wal	5	stats_reset	1184	8	f	f
+rel	pg_stat_progress_basebackup	12329	12329	12332	12331	2249	v	6
+attr	pg_stat_progress_basebackup	1	pid	23	4	f	f
+attr	pg_stat_progress_basebackup	2	phase	25	-1	f	f
+attr	pg_stat_progress_basebackup	3	backup_total	20	8	f	f
+attr	pg_stat_progress_basebackup	4	backup_streamed	20	8	f	f
+attr	pg_stat_progress_basebackup	5	tablespaces_total	20	8	f	f
+attr	pg_stat_progress_basebackup	6	tablespaces_streamed	20	8	f	f
+rel	pg_replication_origin_status	12343	12343	12346	12345	2249	v	4
+attr	pg_replication_origin_status	1	local_id	26	4	f	f
+attr	pg_replication_origin_status	2	external_id	25	-1	f	f
+attr	pg_replication_origin_status	3	remote_lsn	3220	8	f	f
+attr	pg_replication_origin_status	4	local_lsn	3220	8	f	f
+rel	pg_wait_events	12351	12351	12354	12353	2249	v	3
+attr	pg_wait_events	1	type	25	-1	f	f
+attr	pg_wait_events	2	name	25	-1	f	f
+attr	pg_wait_events	3	description	25	-1	f	f
+rel	pg_aios	12355	12355	12358	12357	2249	v	15
+attr	pg_aios	1	pid	23	4	f	f
+attr	pg_aios	2	io_id	23	4	f	f
+attr	pg_aios	3	io_generation	20	8	f	f
+attr	pg_aios	4	state	25	-1	f	f
+attr	pg_aios	5	operation	25	-1	f	f
+attr	pg_aios	6	off	20	8	f	f
+attr	pg_aios	7	length	20	8	f	f
+attr	pg_aios	8	target	25	-1	f	f
+attr	pg_aios	9	handle_data_len	21	2	f	f
+attr	pg_aios	10	raw_result	23	4	f	f
+attr	pg_aios	11	result	25	-1	f	f
+attr	pg_aios	12	target_desc	25	-1	f	f
+attr	pg_aios	13	f_sync	16	1	f	f
+attr	pg_aios	14	f_localmem	16	1	f	f
+attr	pg_aios	15	f_buffered	16	1	f	f

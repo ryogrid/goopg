@@ -51,8 +51,14 @@ func TestPgRewriteColDefsMatchesPg18(t *testing.T) {
 // a PG standby opens any of the other replication views.
 func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	entries := pgRewriteInitialEntries()
-	if len(entries) != 6 {
-		t.Fatalf("pgRewriteInitialEntries: %d rows, want 6", len(entries))
+	// One seeded rule per nailed view, no more and no less: a view on disk
+	// with no _RETURN rule is the "cache lookup failed for rule …" FATAL,
+	// and a rule with no view is an ev_class dangling into nothing.
+	// M0131-S9.1: the count is the pinned-view count (29 and growing), not
+	// the original literal 6.
+	if len(entries) != len(systemViewOIDPins()) {
+		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (one per pinned view)",
+			len(entries), len(systemViewOIDPins()))
 	}
 	// M0131-S9.0: the rows come from the manifest in capture order, so the
 	// wal_receiver entry is no longer index 0. Look it up by view instead of
@@ -115,8 +121,12 @@ func TestReplicationViewRewriteEntries(t *testing.T) {
 	// M0131-S9.0: the entries are generated from the manifest, so this pins the
 	// five batched-29 rules by view name rather than by position — the
 	// hand-written slice they used to index into is gone.
-	if got := len(pgRewriteInitialEntries()); got != len(wants)+1 {
-		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (five batched-29 + wal_receiver)", got, len(wants)+1)
+	// The five batched-29 views plus wal_receiver are a SUBSET now
+	// (M0131-S9.1 widened the corpus to the SRF-only tranche), so assert
+	// containment rather than an exact count — the exact count is
+	// TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn's job.
+	if got := len(pgRewriteInitialEntries()); got < len(wants)+1 {
+		t.Fatalf("pgRewriteInitialEntries: %d rows, want at least %d (five batched-29 + wal_receiver)", got, len(wants)+1)
 	}
 	for i, w := range wants {
 		e, ok := nailedViewRewriteEntry(w.view)
@@ -227,15 +237,26 @@ func TestBootstrapPgRewriteTuplesWritesRowToBase1And5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrapPgRewriteTuples: %v", err)
 	}
-	if len(tids) != 6 {
-		t.Fatalf("tids len = %d, want 6", len(tids))
+	if len(tids) != len(pgRewriteInitialEntries()) {
+		t.Fatalf("tids len = %d, want %d (one TID per seeded rule)",
+			len(tids), len(pgRewriteInitialEntries()))
 	}
 	tid, ok := tids[pgRewriteOIDPgStatWalReceiverReturn]
 	if !ok {
 		t.Fatalf("tids missing rule OID %d", pgRewriteOIDPgStatWalReceiverReturn)
 	}
-	if tid.Block != 0 || tid.Offset == 0 {
-		t.Errorf("first heap tuple TID = (%d, %d), want (0, >=1)", tid.Block, tid.Offset)
+	// M0131-S9.1: with 29 seeded rules the 2618 heap spans several pages and
+	// wal_receiver no longer lands on page 0 — what must hold is that its TID
+	// is a real ItemPointer (offset >= 1, PG offsets are 1-based) inside the
+	// file the bootstrapper wrote, since the 2692/2693 btree leaves stamp it
+	// verbatim.
+	if tid.Offset == 0 {
+		t.Errorf("wal_receiver heap TID = (%d, %d), want offset >= 1", tid.Block, tid.Offset)
+	}
+	for oid, got := range tids {
+		if got.Offset == 0 {
+			t.Errorf("rule %d: heap TID = (%d, %d), want offset >= 1", oid, got.Block, got.Offset)
+		}
 	}
 	for _, d := range []string{"base/1/2618", "base/5/2618"} {
 		path := filepath.Join(dir, d)
