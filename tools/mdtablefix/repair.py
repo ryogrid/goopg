@@ -20,9 +20,12 @@ def repair_table(table: Table) -> Table:
        - Too many → right-to-left greedy merge.
        - Too few  → trailing empty-cell padding.
     3. Record each repair in ``table.fixes``.
+
+    Structural fixes already recorded by the detector (removed body-splitting
+    blank lines, restored outer pipes) are preserved — they are part of the
+    same repair and must survive into the report.
     """
     expected_cols = len(table.header.cells)
-    table.fixes = []
 
     for row in table.data_rows:
         actual = len(row.cells)
@@ -65,8 +68,43 @@ def _escape_bare_pipes_in_row(row: Row, table: Table) -> None:
             )
 
 
+def _drop_excess_empty_cells(row: Row, expected: int, table: Table) -> None:
+    """Drop empty excess cells, left to right, while the row is oversplit.
+
+    The classic cause of a single excess cell is a doubled separator —
+    ``| resolved | | 2026-08-11 | …`` — which shifts every following column
+    one position right.  Merging the tail (the fallback strategy) would
+    render correctly but leave the row's *meaning* scrambled, joining two
+    unrelated columns.  An empty cell carries no content, so removing it is
+    lossless and restores the intended column alignment instead.
+    """
+    excess = len(row.cells) - expected
+    idx = 0
+    while excess > 0 and idx < len(row.cells):
+        if row.cells[idx].content == "":
+            del row.cells[idx]
+            excess -= 1
+            table.fixes.append(
+                Fix(
+                    type="extra_cell",
+                    line=row.line_number,
+                    column=idx + 1,
+                    detail=(
+                        f"Dropped empty extra cell at column {idx + 1} "
+                        "(doubled column separator); the following columns "
+                        "shift back into place"
+                    ),
+                )
+            )
+            continue
+        idx += 1
+
+
 def _repair_oversplit_row(row: Row, expected: int, table: Table) -> None:
     """Merge excess cells into the rightmost columns.
+
+    Empty excess cells are dropped first (see ``_drop_excess_empty_cells``);
+    only content cells reach the merge below.
 
     The rightmost ``expected`` cells absorb all overflow from the
     extra cells.  The separating pipes are replaced with ``\\|``
@@ -79,7 +117,10 @@ def _repair_oversplit_row(row: Row, expected: int, table: Table) -> None:
         → merge G|H\\|I →  [..., F, G\\|H\\|I]  (1 excess remaining)
         → [A, B, C, D, E, F, G\\|H\\|I]         (done)
     """
+    _drop_excess_empty_cells(row, expected, table)
     excess = len(row.cells) - expected
+    if excess == 0:
+        return
 
     # Keep the first (expected-1) cells untouched.
     # Merge the remaining (excess+1) cells into the last column.

@@ -7,7 +7,7 @@ blocks are ignored.
 
 from __future__ import annotations
 
-from .detector import detect_table
+from .detector import detect_table, is_separator_row
 from .models import CodeBlock, Document, TextBlock
 
 
@@ -15,6 +15,21 @@ def _is_table_line(line: str) -> bool:
     """Return True if *line* looks like a table row candidate."""
     stripped = line.strip()
     return stripped.startswith("|") or stripped.endswith("|")
+
+
+def _starts_new_table(lines: list[str], idx: int) -> bool:
+    """Return True if a *new* table begins at ``lines[idx]``.
+
+    A fresh table is a header line immediately followed by a separator row.
+    This is what distinguishes two independent tables separated by a blank
+    line — which must stay separate — from a single table whose body was
+    accidentally split by one (they have no second header/separator pair).
+    """
+    return (
+        idx + 1 < len(lines)
+        and _is_table_line(lines[idx])
+        and is_separator_row(lines[idx + 1])
+    )
 
 
 def _is_fence_line(line: str) -> bool:
@@ -86,18 +101,33 @@ def parse_document(text: str) -> Document:
             table_lines: list[str] = []
             start_line = i + 1  # 1-based
 
-            # Collect consecutive table lines.  Blank lines between
-            # table rows are absorbed (they are formatting errors
-            # within the table body).
+            # Collect consecutive table lines.  A run of blank lines is
+            # absorbed when what follows continues THIS table body (a
+            # formatting error: in GFM the blank line ends the table and the
+            # rest renders as literal text).  A run followed by a fresh
+            # header+separator pair is left alone — those are two separate
+            # tables and merging them would corrupt both.
             while i < len(raw_lines):
-                stripped = raw_lines[i].strip()
                 if _is_table_line(raw_lines[i]):
                     table_lines.append(raw_lines[i])
                     i += 1
-                elif stripped == "" and i + 1 < len(raw_lines) and _is_table_line(raw_lines[i + 1]):
-                    # Blank line followed by another table row — absorb it.
-                    table_lines.append(raw_lines[i])
-                    i += 1
+                    continue
+                if raw_lines[i].strip() != "":
+                    break
+
+                blank_end = i
+                while (
+                    blank_end < len(raw_lines)
+                    and raw_lines[blank_end].strip() == ""
+                ):
+                    blank_end += 1
+                if (
+                    blank_end < len(raw_lines)
+                    and _is_table_line(raw_lines[blank_end])
+                    and not _starts_new_table(raw_lines, blank_end)
+                ):
+                    table_lines.extend(raw_lines[i:blank_end])
+                    i = blank_end
                 else:
                     break
 

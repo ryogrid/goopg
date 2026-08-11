@@ -73,5 +73,64 @@ class TestParseDocument(unittest.TestCase):
         self.assertEqual(len(text_blocks), 1)
 
 
+class TestBlankLineHandling(unittest.TestCase):
+    """A blank line inside a table body must be absorbed, not honoured.
+
+    In GFM a blank line terminates the table, so every row after it renders
+    as literal ``|``-text.  The parser rejoins the fragments — but only when
+    the fragment is a continuation, never when a second table starts.
+    """
+
+    def test_body_split_by_blank_line_is_rejoined(self):
+        text = (
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+            "\n"
+            "| 3 | 4 |\n"
+        )
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0].data_rows), 2)
+
+    def test_multiple_blank_lines_are_absorbed(self):
+        text = (
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+            "\n\n\n"
+            "| 3 | 4 |\n"
+        )
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0].data_rows), 2)
+
+    def test_blank_separated_tables_are_not_merged(self):
+        """A header+separator pair after the blank starts a NEW table."""
+        text = (
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+            "\n"
+            "| c | d |\n| --- | --- |\n| 3 | 4 |\n"
+        )
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        self.assertEqual(len(tables), 2)
+        self.assertEqual(tables[0].header.cells[0].content, "a")
+        self.assertEqual(tables[1].header.cells[0].content, "c")
+
+    def test_trailing_paragraph_stays_outside_the_table(self):
+        text = (
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+            "\n"
+            "Some prose.\n"
+        )
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0].data_rows), 1)
+        text_blocks = [b for b in doc.blocks if isinstance(b, TextBlock)]
+        self.assertTrue(
+            any("Some prose." in "\n".join(b.lines) for b in text_blocks)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
