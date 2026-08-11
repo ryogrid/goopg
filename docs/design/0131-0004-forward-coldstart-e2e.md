@@ -1,6 +1,7 @@
 # Forward cold-start E2E — real PG 18.3 serves a live goopg cluster directory
 
-**Status:** draft
+**Status:** accepted (landed 2026-08-11 as `TestE2E_PGColdStartOnGoopgDataDir`;
+see §Findings)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S4)
 
@@ -170,6 +171,109 @@ walreceiver, so this is the first test exercising those records on that path.
    UPDATE.
 9. The E2E family stays green (`go test -v -run '^TestE2E_' ./internal/testport/`).
 10. UNITS + SMOKE green.
+
+## Findings (2026-08-11, from the first runs)
+
+**The headline result is positive, and it is the one the milestone asked for.**
+A real PG 18.3 starts on the live directory a goopg server just shut down, with
+**zero** edits to `postgresql.conf`, and reads goopg-written data correctly:
+`SELECT relname FROM pg_class` lists both user tables (`0130-0002` Guard #1, now
+discharged), `count(*)`/`sum(qty)` agree with goopg across the UPDATE and the
+DELETE, the non-public schema resolves, and an index-qualified read under
+`enable_seqscan = off` returns the right row through a goopg-authored btree —
+so blocker #12 did **not** resurface (guard 7). Zero FATAL in the log up to the
+two deliberately destructive probes below (guard 4). The three "deltas versus
+the basebackup lane" predicted above all held: `pg_internal.init` was inert,
+file modes were a non-issue, and the directory carried neither
+`postmaster.pid` nor `postmaster.opts` after the clean stop.
+
+Four gaps were measured. Each is locked into the test in the **fail-when-fixed**
+direction — the same discipline `0131-0003` used for the HOT-flag finding that
+became S11 — so none can be silently "fixed" without the test demanding the
+assertion be inverted.
+
+**F1 — a hosted PG cannot execute ANY sort, for ANY type (→ M0131-S12).**
+`SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x` fails with *"could not
+identify an ordering operator for type integer"*; nothing in that query touches
+a goopg table. The chain is `lookup_type_cache(TYPECACHE_LT_OPR)` →
+`GetDefaultOpClass`, which at `postgres/src/backend/commands/indexcmds.c:2374-2384`
+scans `pg_opclass` through `OpclassAmNameNspIndexId` (**2686**) with
+`indexOK = true` and no seq-scan fallback — the identical shape as blockers
+\#7/\#8 and M0131-S5. The heap is complete and correct (probed on the hosted PG:
+177 rows, `int4_ops` = oid 1978 / `opcmethod` 403 / `opcdefault` 't', 38 default
+btree opclasses) and `pg_index` carries valid 2686/2687 rows. What is missing is
+the index **content**: `internal/initdb/initdb.go` writes 2686 as a bare
+`makeBtreeRootPage()` placeholder, while its sibling
+`pg_opfamily_am_name_nsp_index` (2754) gets a real bulk-load bootstrapper —
+and `pgBuildIndexTupleOidNameOidKey`
+(`internal/initdb/btree_index_bootstrap.go:1909`) already names 2686 in its doc
+comment as one of the two indexes it serves. No caller ever builds 2686's
+tuples. Lock-in: `assertEmptyOpclassIndexStillBlocksSorts`; the Guard-#1 query
+carries no `ORDER BY` and sorts in Go until S12 lands.
+
+**F2 — calling any LANGUAGE SQL builtin crashes the hosted backend (→ M0131-S13).**
+`SELECT 'a'::text || 1` aborts with
+`TRAP: failed Assert("ARR_NDIM(array) == 1"), File: "guc.c", Line: 6411`, via
+`TransformGUCArray` ← `fmgr_security_definer`. Cause: goopg writes **every one**
+of its 3397 `pg_proc` rows with a NON-NULL `proconfig` (probed:
+`SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL` = 3397 = the full row
+count; `prosecdef` is correctly `'f'` everywhere, so it is `proconfig` alone),
+and the bytes behind that attribute are not a valid 1-D `text[]`. Upstream
+reaches the handler from `fmgr_info_cxt_security`
+(`postgres/src/backend/utils/fmgr/fmgr.c:203-211`), whose condition is
+`prosecdef || !heap_attisnull(…, Anum_pg_proc_proconfig, NULL) || FmgrHookIsNeeded`.
+The blast radius is bounded precisely by `fmgr_isbuiltin`: a function in the
+compiled-in `fmgrtab` never reads `pg_proc`, which is why `int4eq`, `textout`,
+`count` and `sum` are all fine and every other probe in this test survives. It
+is the LANGUAGE SQL builtins that break — `textanycat` (oid 2003) among them,
+which is what `text || integer` resolves to. This is an assert-enabled PG build,
+so the failure is loud; a production build would walk a bogus `ArrayType`
+instead, which is worse. Lock-in:
+`assertProconfigGapStillCrashesSQLFunctions`, run LAST because it takes the
+postmaster down; the row-content reads use two separate scalars rather than
+`label || '/' || qty`.
+
+**F3 — `ADD COLUMN … DEFAULT` reads NULL on pre-existing rows (→ M0131-S14).**
+goopg reads `'dflt'`; the hosted PG reads NULL for all 15 rows. **The pg_attrdef
+half is entirely correct** — the hosted PG reads
+`pg_get_expr(adbin, adrelid)` as `'dflt'::text` on `adnum` 4 and
+`pg_class.relnatts` as 4, which is M0130's 2604/2656/2657 work validated outside
+the basebackup lane for the first time, and the test asserts that positively.
+What is missing is PG's **fast-default** mechanism: since PG 11, ADD COLUMN with
+a non-volatile DEFAULT does not rewrite the heap but stores the value in
+`pg_attribute.attmissingval` with `atthasmissing = true`, and short tuples
+materialise it on read. goopg neither rewrites the rows nor records the missing
+value. Underneath sits a sharper fact: `attmissingval` does not exist as a
+column at all on the hosted PG (`SELECT attmissingval FROM pg_attribute` →
+42703), so goopg's `pg_attribute` heap is short of at least one attribute in its
+own self-description (the rows for relid 1249). Lock-in:
+`assertFastDefaultGapReadsNullOnHostedPG`.
+
+**F4 — a goopg-`CREATE DATABASE`-minted database is unopenable (→ M0131-S15).**
+Connecting to `s4other` fails with
+`PANIC: could not open critical system index 2662` (`pg_class_oid_index`) —
+`RelationCacheInitializePhase3` nails and opens a small set of critical indexes
+during `InitPostgres`, and a failure there is a PANIC, so the cluster goes down
+with the connection attempt. This is a statement about goopg's **runtime**
+CREATE DATABASE, not about the cold start: the `postgres` database in the SAME
+directory serves every assertion above. `initdb` writes each bootstrapped btree
+into `base/1` **and** `base/5`; the runtime path clones only what goopg itself
+needs, and goopg reads its catalogs without those indexes, so nothing in the
+goopg-only world notices. Lock-in:
+`assertGoopgCreatedDatabaseStillUnopenableByPG`, also destructive.
+
+**Harness correction.** `pgcluster.Stop` sent SIGINT and waited unboundedly. A
+postmaster that has entered crash recovery after a backend abort never acts on
+it, which hung the whole `go test` for its 20-minute timeout instead of
+reporting the crash that caused it. `Stop` now waits 20 s and then SIGKILLs.
+A new `PSQLCombined` returns combined output without a `t.Fatalf`, so a caller
+can classify the error text — F1/F2/F4 are all diagnosed from error text.
+
+**S4.5 verdict: the non-atomic non-HOT UPDATE gap did NOT surface.** The
+workload's UPDATE (`qty = qty + 1 WHERE id % 3 = 0`) and DELETE both read back
+correctly through the hosted PG — `sum(qty)` matches goopg exactly, and the
+UPDATEd row id=9 has the right label and qty. Ledger M0118-0129 stays open, but
+this lane is not where it shows.
 
 ## References
 

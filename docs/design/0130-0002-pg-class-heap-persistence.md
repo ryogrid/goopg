@@ -66,7 +66,15 @@ no path to read pg_class rows from heap file 1259.
 ## Guards
 
 1. PG started against goopg data dir: `SELECT relname FROM pg_class` lists
-   user tables. *(Needs E2E PG-attach test — not yet implemented.)*
+   user tables. *(**DISCHARGED 2026-08-11, M0131-S4:**
+   `TestE2E_PGColdStartOnGoopgDataDir`
+   (`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`) points a real
+   PG 18.3 at the LIVE directory a goopg server just shut down — not a
+   `pg_basebackup` tar, which is how every other M0130 acceptance item was
+   proven — and the query lists both user tables. Row-level reads, the
+   non-public schema and an index-qualified read through a goopg-authored btree
+   all agree with goopg. Four gaps were measured in the same run and filed as
+   M0131-S12/S13/S14/S15; see `0131-0004-forward-coldstart-e2e.md` §Findings.)*
 2. goopg started against PG-initdb'd data dir: serves reads via psql.
    *(Updated 2026-08-11, M0131-S10: the reverse path IS implemented — see
    "Reverse-Path Implementation (2026-08-09)" below, and M0131-S1/S2 removed the
