@@ -357,7 +357,14 @@ func TestReplayPGHeapMultiInsertRefusesLinePointerReuse(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 4026, Fork: storage.MainFork}
 
 	// Two rows on the page, then a record targeting slot 1 — already in use.
-	for slot, val := range map[uint16]string{1: "a", 2: "b"} {
+	// The seeding order matters (slot 2 cannot be inserted before slot 1
+	// exists), so this is an ordered slice, not a map: as a map literal the
+	// test failed on roughly half of all runs with "slot 2 out of range".
+	for _, seed := range []struct {
+		slot uint16
+		val  string
+	}{{1, "a"}, {2, "b"}} {
+		slot, val := seed.slot, seed.val
 		framed, err := EncodeHeapInsertPG(rel, 0, slot, multiInsertTuples(t, 4, val)[0], slot == 1)
 		if err != nil {
 			t.Fatal(err)

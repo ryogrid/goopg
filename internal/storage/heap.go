@@ -175,7 +175,42 @@ const (
 	// ComboCIDStore to recover the real cmin and cmax. Mirrors
 	// PostgreSQL's HEAP_COMBOCID (0x0020, htup_details.h:197).
 	HeapComboCID uint16 = 0x0020
+
+	// HeapMovedOff / HeapMovedIn are the pre-9.0 VACUUM FULL relocation bits
+	// (htup_details.h:211-217). goopg never sets them — no goopg tuple can
+	// have come from a pre-9.0 cluster — but they are named here because
+	// upstream's redo routines clear them: heap_xlog_lock turns off
+	// HEAP_XMAX_BITS *and* HEAP_MOVED before restamping xmax, since t_field3
+	// is the t_xvac/t_cid union and a MOVED tuple's field3 must not be read
+	// back as a cmax (HeapTupleHeaderSetCmax even asserts on it,
+	// htup_details.h:436). A goopg cluster hosting a PG cold-start
+	// (M0131) can be handed such a tuple by a pg_upgrade'd cluster's WAL, so
+	// the clear is reproduced rather than assumed away.
+	HeapMovedOff uint16 = 0x4000
+	HeapMovedIn  uint16 = 0x8000
+	HeapMoved           = HeapMovedOff | HeapMovedIn
+
+	// HeapXmaxBits is upstream's HEAP_XMAX_BITS (htup_details.h:284): every
+	// infomask bit that describes the CURRENT xmax and therefore has to be
+	// turned off before a different xmax is stamped in its place.
+	HeapXmaxBits = HeapXmaxCommitted | HeapXmaxInvalid | HeapXmaxIsMulti | HeapXmaxLockMask | HeapXmaxLockOnly
 )
+
+// isHeapXmaxLockedOnlyPG is upstream's HEAP_XMAX_IS_LOCKED_ONLY in full
+// (htup_details.h:230-234), including the pre-9.3 clause the exported
+// IsHeapTupleLockOnly deliberately omits: a bare HEAP_XMAX_EXCL_LOCK with
+// neither HEAP_XMAX_LOCK_ONLY nor HEAP_XMAX_IS_MULTI also means "locked, not
+// deleted".
+//
+// The narrowed predicate is correct for tuples goopg itself wrote (its lock
+// stamps always set HEAP_XMAX_LOCK_ONLY), but redo of a real-PG record must
+// classify a tuple PG wrote, so the redo path uses the full expression. Keep
+// the two in sync: this one is the reference, IsHeapTupleLockOnly is the
+// goopg-tuple shortcut.
+func isHeapXmaxLockedOnlyPG(infomask uint16) bool {
+	return infomask&HeapXmaxLockOnly != 0 ||
+		infomask&(HeapXmaxIsMulti|HeapXmaxLockMask) == HeapXmaxExclLock
+}
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
 // tuple's xmax represents a row lock (not a delete). Mirrors
@@ -1436,6 +1471,82 @@ func PageSetHeapTupleLockOnly(p Page, slot uint16, xmax TransactionID, lockStren
 	infomask &^= HeapXmaxIsMulti // single-holder xmax: clear any prior multi bit
 	infomask |= HeapXmaxLockOnly
 	infomask |= lockStrength & HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	return nil
+}
+
+// PageApplyHeapLockRedo re-applies a PostgreSQL XLOG_HEAP_LOCK record's tuple
+// mutation, mirroring heap_xlog_lock (heapam_xlog.c) byte for byte. M0131-S21a-2.
+//
+// It is the redo sibling of PageSetHeapTupleLockOnly, and deliberately NOT the
+// same function: the runtime helper stamps a lock goopg is taking right now
+// (single xid, always lock-only, strength bit required), whereas redo must
+// reproduce whatever PG decided — a multixact xmax, an updater's key-share
+// lock, or a lock-only stamp — from the record's infobits, and additionally
+// resets t_ctid and cmax the way upstream does.
+//
+// infomaskBits / infomask2Bits are the OUTPUT of upstream's
+// fix_infomask_from_infobits, i.e. the caller (the WAL layer, which owns
+// knowledge of the XLHL_* wire bits) has already translated xl_heap_lock's
+// infobits_set byte. Only the four xmax-classification bits and
+// HEAP_KEYS_UPDATED are honoured; anything else in the arguments is ignored.
+//
+// Order of operations, all from heap_xlog_lock:
+//
+//  1. clear HEAP_XMAX_BITS and HEAP_MOVED in t_infomask, HEAP_KEYS_UPDATED in
+//     t_infomask2, then OR in the record's bits;
+//  2. if the resulting xmax is locked-only, clear HEAP_HOT_UPDATED and point
+//     t_ctid at the tuple itself — a locker must not leave a forward chain
+//     link behind, or a reader would follow it to a version that does not
+//     exist;
+//  3. stamp xmax, and set cmax = FirstCommandId with HEAP_COMBOCID cleared
+//     (the combo cid of the locking backend is meaningless after a crash).
+//
+// blk is the page's own block number, needed for the self-pointing t_ctid.
+// Callers hold the page write lock and set pd_lsn themselves.
+func PageApplyHeapLockRedo(p Page, slot uint16, xmax TransactionID, infomaskBits, infomask2Bits uint16, blk BlockNumber) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	// Upstream elog(PANIC, "invalid lp") here; goopg returns the error so the
+	// caller can name the record that carried the bad offset.
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+
+	infomask &^= HeapXmaxBits | HeapMoved
+	infomask2 &^= HeapKeysUpdated
+	infomask |= infomaskBits & (HeapXmaxIsMulti | HeapXmaxLockOnly | HeapXmaxExclLock | HeapXmaxKeyShrLock)
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+
+	if isHeapXmaxLockedOnlyPG(infomask) {
+		infomask2 &^= HeapHotUpdated
+		binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+		binary.LittleEndian.PutUint16(p[off+16:off+18], slot)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(FirstCommandId))
+	infomask &^= HeapComboCID
+
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }

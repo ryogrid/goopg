@@ -457,6 +457,88 @@ apply, idempotent re-apply, zero-extend across a 2-block gap **on both heap
 paths**, the two malformed-block-data refusals, and the line-pointer-reuse
 refusal.
 
+### S21a-2 — implementation notes, part 2: HEAP_LOCK + HEAP_CONFIRM (landed 2026-08-12)
+
+The two remaining **RM_HEAP** page mutations. Both stamp a single tuple header on
+an already-existing page, which is what makes them one slice rather than two:
+they share the buffer-acquisition rule that distinguishes them from every
+insert-like record.
+
+**`XLOG_HEAP_LOCK` (0x60) — `replayDecodedXLogHeapLock`.** After MULTI_INSERT
+this is the most common record in an OLTP tail: every `SELECT … FOR UPDATE/SHARE`,
+every foreign-key row check, and the tuple lock an UPDATE takes on a row it is
+about to rewrite. goopg emits its own row locks as the *native*
+`RecordKindHeapLock` record (`replayHeapLock`), so this arm is reached only by a
+real-PG record — which, unlike goopg's, can carry a multixact xmax or an
+updater's key-share lock. Redo mirrors `heap_xlog_lock` (`heapam_xlog.c`):
+
+- Main data is `xl_heap_lock{TransactionId xmax; OffsetNumber offnum;
+  uint8 infobits_set; uint8 flags}` (`SizeOfHeapLock = 8`, `heapam_xlog.h:396`).
+- `infobits_set` is the wire encoding of the infomask bits, decoded by
+  `xlogHeapLockInfomaskBits` — goopg's port of `fix_infomask_from_infobits`.
+  `HEAP_XMAX_SHR_LOCK` is deliberately absent there, as upstream notes: a share
+  lock arrives as its two component bits.
+- The page mutation itself is `storage.PageApplyHeapLockRedo`, the **redo
+  sibling** of the runtime `PageSetHeapTupleLockOnly`. They are separate on
+  purpose: the runtime helper stamps a lock goopg is taking *now* (single xid,
+  always lock-only, strength bit mandatory), while redo must reproduce whatever
+  PG decided, and additionally resets `t_ctid` and cmax. It clears
+  `HEAP_XMAX_BITS | HEAP_MOVED` (the "turn these all off when Xmax is to change"
+  clause, `htup_details.h:284`) plus `HEAP_KEYS_UPDATED` before OR-ing the
+  record's bits in; **if the result is locked-only it clears `HEAP_HOT_UPDATED`
+  and re-points `t_ctid` at the tuple itself**, because a locker must not leave a
+  forward chain link behind; then stamps xmax and sets `cmax = FirstCommandId`
+  with `HEAP_COMBOCID` cleared.
+- "Locked-only" is decided by `isHeapXmaxLockedOnlyPG`, upstream's
+  `HEAP_XMAX_IS_LOCKED_ONLY` **in full** — including the pre-9.3 bare-EXCL_LOCK
+  clause that the exported `IsHeapTupleLockOnly` deliberately omits. The narrowed
+  predicate is right for tuples goopg wrote; redo classifies tuples PG wrote.
+  The two are cross-referenced in their doc comments so they cannot drift.
+- `HEAP_MOVED_OFF/IN` are named in `internal/storage` for the first time here.
+  goopg never sets them, but redo must still *clear* them: `t_field3` is the
+  `t_xvac`/`t_cid` union, and a pg_upgrade'd tuple's field3 must not survive as a
+  cmax.
+
+**`XLOG_HEAP_CONFIRM` (0x50) — `replayDecodedXLogHeapConfirm`.** The second
+record of every `INSERT … ON CONFLICT`. The speculative insert writes the tuple
+with a speculative *token* in `t_ctid`; confirming it overwrites the token with
+the tuple's own `(block, offset)` — which is exactly goopg's fresh-insert
+convention, so the apply is one `PageSetHeapTupleCtid`. Replaying only the insert
+would leave a tuple whose `t_ctid` points at a garbage location for a chain
+follower to chase.
+
+**`redoExistingHeapPageForBlock` — the RBM_NORMAL sibling.** Both opcodes
+register their buffer with `XLogReadBufferForRedo`, i.e. `RBM_NORMAL`, where a
+block past the fork's length or an all-zero page yields `InvalidBuffer` =
+`BLK_NOTFOUND` and the redo routine does nothing (`xlogutils.c:500-540`). That is
+the opposite of `redoHeapPageForBlock`'s zero-extend, and the asymmetry is
+upstream's, not an approximation: an insert-like record legitimately references a
+block whose extension was never logged, whereas a pure tuple stamp can only find
+its page missing if the relation is dropped or truncated later in the same
+stream — in which case the mutation is moot. Extending instead would materialise
+an empty page and then fail "invalid lp" on it.
+
+**Two deviations, both ledger rows.** (1) Upstream also records a BLK_NOTFOUND
+reference in its invalid-page hash and PANICs at end of recovery if nothing later
+drops or truncates that relation; goopg keeps no such table, so a genuinely
+missing page is skipped silently. (2) `XLH_LOCK_ALL_FROZEN_CLEARED` asks for the
+block's visibility-map `ALL_FROZEN` bit to be cleared; the replay path holds no
+VM handle, so the flag is decoded and deliberately not acted on — same resume
+point as the VM fork work in the `XLOG_HEAP2_VISIBLE` slice.
+
+Guards (`internal/wal/heap_lock_confirm_pg_test.go`, 8 tests / 9 subtests, all
+proven fail-when-broken by six scripted reverts): the lock-only shape (self
+`t_ctid`, HOT bit cleared, cmax reset), the multixact + keys-updated shape (chain
+link and HOT bit **preserved** — the branch the first shape must not take), the
+stale-xmax-bit clear, pd_lsn idempotency, the absent-page skip *with* an
+assertion that the fork was not extended, the invalid-offset refusal, and a
+truncated-main-data refusal per opcode.
+
+Also fixed here: `TestReplayPGHeapMultiInsertRefusesLinePointerReuse` (part 1)
+seeded its two rows from a **map literal**, so Go's randomised iteration order
+inserted slot 2 first on roughly half of all runs and the test failed with "slot
+2 out of range". It is an ordered slice now.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via

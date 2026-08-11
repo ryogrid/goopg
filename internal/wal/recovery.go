@@ -2662,6 +2662,23 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeapLock:
+			// M0131-S21a-2: every SELECT ... FOR UPDATE/SHARE, every foreign-key
+			// check, and the tuple lock an UPDATE takes before rewriting a row.
+			// goopg emits its own row locks as the native RecordKindHeapLock
+			// (payload[0] = 10, replayHeapLock), so this arm is reached only by a
+			// real-PG record — which, unlike goopg's, can carry a multixact xmax
+			// or an updater's key-share lock.
+			if err := replayDecodedXLogHeapLock(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapConfirm:
+			// M0131-S21a-2: the second half of every INSERT ... ON CONFLICT.
+			if err := replayDecodedXLogHeapConfirm(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		case xlogHeapTruncate:
 			// M0131-S21a: recognised, deliberately not implemented. Upstream's
 			// heap_redo says it outright — "TRUNCATE is a no-op because the
@@ -3347,6 +3364,174 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// sizeOfXLogHeapLockData is PG's SizeOfHeapLock: xmax(4) + offnum(2) +
+// infobits_set(1) + flags(1) (heapam_xlog.h:396-404).
+const sizeOfXLogHeapLockData = 8
+
+// sizeOfXLogHeapConfirmData is PG's SizeOfHeapConfirm: offnum(2).
+const sizeOfXLogHeapConfirmData = 2
+
+// decodeXLogHeapLockMainData parses the fixed xl_heap_lock struct from a
+// PG-format heap-lock record's main data.
+func decodeXLogHeapLockMainData(mainData []byte) (xmax uint32, offnum uint16, infobits, flags uint8, err error) {
+	if len(mainData) < sizeOfXLogHeapLockData {
+		return 0, 0, 0, 0, fmt.Errorf("wal: invalid xlog heap-lock main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapLockData)
+	}
+	xmax = binary.LittleEndian.Uint32(mainData[0:4])
+	offnum = binary.LittleEndian.Uint16(mainData[4:6])
+	infobits = mainData[6]
+	flags = mainData[7]
+	return xmax, offnum, infobits, flags, nil
+}
+
+// xlogHeapLockInfomaskBits is upstream's fix_infomask_from_infobits
+// (heapam_xlog.c): translate xl_heap_lock's infobits_set wire byte into the
+// t_infomask / t_infomask2 bits redo has to restore. Note HEAP_XMAX_SHR_LOCK is
+// deliberately absent — upstream says so in a comment; a share lock arrives as
+// the two component bits.
+func xlogHeapLockInfomaskBits(infobits uint8) (infomask, infomask2 uint16) {
+	if infobits&xlhlXmaxIsMulti != 0 {
+		infomask |= storage.HeapXmaxIsMulti
+	}
+	if infobits&xlhlXmaxLockOnly != 0 {
+		infomask |= storage.HeapXmaxLockOnly
+	}
+	if infobits&xlhlXmaxExclLock != 0 {
+		infomask |= storage.HeapXmaxExclLock
+	}
+	if infobits&xlhlXmaxKeyShrLock != 0 {
+		infomask |= storage.HeapXmaxKeyShrLock
+	}
+	if infobits&xlhlKeysUpdated != 0 {
+		infomask2 |= storage.HeapKeysUpdated
+	}
+	return infomask, infomask2
+}
+
+// redoExistingHeapPageForBlock is redoHeapPageForBlock's RBM_NORMAL sibling:
+// the page must ALREADY exist and be initialised, and when it does not the
+// record is skipped rather than applied to a zero-extended page.
+//
+// M0131-S21a-2. That asymmetry is upstream's, not an approximation. Insert-like
+// records reference a block whose extension was never WAL-logged, so
+// XLogReadBufferExtended is called in an RBM_ZERO/WILL_INIT mode and extends.
+// A record that only STAMPS an existing tuple (lock, confirm) is read with
+// RBM_NORMAL, where a missing or all-zero page returns InvalidBuffer =
+// BLK_NOTFOUND and the redo routine does nothing (xlogutils.c:500-540): the
+// only way the page can be absent is that the relation is dropped or truncated
+// later in the same replay stream, in which case the mutation is moot.
+//
+// Deviation, ledger row: upstream ALSO records the reference in its
+// invalid-page hash and PANICs at the end of recovery if no later record
+// dropped or truncated that relation. goopg keeps no such table, so a genuinely
+// missing page is silently skipped instead of failing the start. It cannot
+// corrupt anything on these two opcodes — a lost row-lock stamp or speculative
+// confirmation is bookkeeping about a transaction that the crash ended anyway —
+// but it does hide a real inconsistency.
+//
+// Returns skip=true when there is nothing to do (page absent, uninitialised, or
+// already at/past this record's LSN).
+func redoExistingHeapPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	if block.Block >= nblocks {
+		return nil, true, nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return nil, false, err
+	}
+	if storage.IsNew(page) {
+		return nil, true, nil
+	}
+	if storage.MustHeader(page).LSN() >= endLSN {
+		return nil, true, nil
+	}
+	return page, false, nil
+}
+
+// replayDecodedXLogHeapLock applies a real-PG XLOG_HEAP_LOCK, mirroring
+// heap_xlog_lock (heapam_xlog.c). M0131-S21a-2.
+//
+// This is one of the most common records in an OLTP tail: every SELECT ... FOR
+// UPDATE/SHARE, every foreign-key row check, and the tuple lock an UPDATE takes
+// on a row it is about to rewrite all emit one. The mutation is confined to a
+// single tuple header — xmax, the xmax-classification infomask bits, cmax, and
+// (for a locked-only result) t_ctid and HEAP_HOT_UPDATED — which is why the
+// work lives in storage.PageApplyHeapLockRedo, the redo sibling of the runtime
+// PageSetHeapTupleLockOnly.
+//
+// Idempotent via pd_lsn. A record carrying a full-page image restores it
+// instead.
+func replayDecodedXLogHeapLock(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-lock missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	xmax, offnum, infobits, _, err := decodeXLogHeapLockMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// The flags byte's only bit, XLH_LOCK_ALL_FROZEN_CLEARED, asks for the
+	// block's visibility-map ALL_FROZEN bit to be cleared. goopg's replay path
+	// holds no VM handle (the whole VM fork story in redo is S21a-2's
+	// XLOG_HEAP2_VISIBLE slice); the bit is deliberately not acted on here and
+	// is recorded in the deferral ledger with the same resume point.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-lock: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	infomaskBits, infomask2Bits := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapLockRedo(page, offnum, storage.TransactionID(xmax), infomaskBits, infomask2Bits, block.Block); err != nil {
+		return fmt.Errorf("wal: xlog heap-lock apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogHeapConfirm applies a real-PG XLOG_HEAP_CONFIRM, mirroring
+// heap_xlog_confirm (heapam_xlog.c). M0131-S21a-2.
+//
+// It is the second record of every INSERT ... ON CONFLICT. The speculative
+// insert wrote the tuple with a *speculative token* in t_ctid rather than a
+// self-pointer; confirming it means overwriting that token with the tuple's own
+// (block, offset), which is exactly goopg's own fresh-insert convention. Redo
+// therefore has to run: replaying only the insert would leave a tuple whose
+// t_ctid points at a garbage location, and a chain follower would chase it.
+func replayDecodedXLogHeapConfirm(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-confirm missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	if len(xlog.MainData) < sizeOfXLogHeapConfirmData {
+		return fmt.Errorf("wal: invalid xlog heap-confirm main-data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogHeapConfirmData)
+	}
+	offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-confirm: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	if err := storage.PageSetHeapTupleCtid(page, offnum, storage.ItemPointer{Block: block.Block, Offset: offnum}); err != nil {
+		return fmt.Errorf("wal: xlog heap-confirm apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)

@@ -88,6 +88,26 @@ const (
 	// recordKindToRmgrInfo (doc 04 §3.1) to map HeapLock.
 	xlogHeapLock uint8 = 0x60
 
+	// XLOG_HEAP_CONFIRM (heapam_xlog.h:38) completes a speculative insert
+	// (INSERT .. ON CONFLICT): the inserter first writes the tuple with a
+	// speculative token in t_ctid, then confirms it. goopg never emits one —
+	// its upsert path takes the row lock before inserting — but every PG
+	// ON CONFLICT statement produces one, so a PG tail needs the redo.
+	xlogHeapConfirm uint8 = 0x50
+
+	// XLHL_* are the bits of xl_heap_lock.infobits_set (heapam_xlog.h:386-390),
+	// the wire encoding of the infomask/infomask2 bits redo must restore. The
+	// translation to page bits is upstream's fix_infomask_from_infobits.
+	xlhlXmaxIsMulti    uint8 = 0x01
+	xlhlXmaxLockOnly   uint8 = 0x02
+	xlhlXmaxExclLock   uint8 = 0x04
+	xlhlXmaxKeyShrLock uint8 = 0x08
+	xlhlKeysUpdated    uint8 = 0x10
+
+	// XLH_LOCK_ALL_FROZEN_CLEARED (heapam_xlog.h:393): the locker had to clear
+	// the block's visibility-map ALL_FROZEN bit.
+	xlhLockAllFrozenCleared uint8 = 0x01
+
 	// RM_BTREE_ID (rmid 11) opcodes (nbtxlog.h:27-39). Used by
 	// recordKindToRmgrInfo (doc 04 §3.1) to map
 	// BtreeInsert/BtreeSplit/BtreeVacuum/BtreeUnlinkPage/BtreeNewRoot/
