@@ -57,14 +57,13 @@
 // on-disk multixact) and TOAST pointer validation (goopg's TOAST layout differs
 // from PG's on-disk varlena format); see the design doc.
 //
-// Infomask layout divergence (goopg vs upstream PG): upstream stores
-// HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE in t_infomask2, but goopg packs them into
-// t_infomask (storage/heap.go HeapHotUpdated/HeapOnlyTuple are read/written
-// against HeapTupleHeader.Infomask — see storage/prune.go and the heap_update
-// path). Because this engine inspects goopg's own on-disk pages, the
-// HOT-updated check below reads the flag from t_infomask (goopg's position),
-// not t_infomask2. The corruption messages stay byte-for-byte identical to
-// upstream so the later SRF + 004_verify_heapam port can reuse them.
+// Infomask layout (M0131-S11, 2026-08-11): HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE
+// live in t_infomask2, exactly as upstream places them
+// (htup_details.h:550/:568). goopg packed them into t_infomask until M0131-S11
+// moved them, and the checks below moved with it — this engine inspects raw
+// page bytes, so it reads them from [lpOff+18 : lpOff+20]. The corruption
+// messages stay byte-for-byte identical to upstream so the later SRF +
+// 004_verify_heapam port can reuse them.
 //
 // One upstream check_tuple_header invariant is intentionally NOT ported here:
 // "tuple is heap only, but not the result of an update" tests
@@ -490,7 +489,7 @@ func checkUpdateChains(p storage.Page, maxoff int, entries []lpEntry, report fun
 		}
 		predecessor[nextoff] = offnum
 
-		currHotUpdated := currInfomask&storage.HeapHotUpdated != 0
+		currHotUpdated := readInfomask2(p, currOff)&storage.HeapHotUpdated != 0
 		nextHeapOnly := isHeapOnly(p, nextOff)
 		if !currHotUpdated && nextHeapOnly {
 			report(offnum, fmt.Sprintf(
@@ -713,11 +712,15 @@ func readInfomask(p storage.Page, lpOff int) uint16 {
 	return binary.LittleEndian.Uint16(p[lpOff+20 : lpOff+22])
 }
 
-// isHeapOnly mirrors HeapTupleHeaderIsHeapOnly for goopg's layout: the
-// HEAP_ONLY_TUPLE bit lives in t_infomask here (not t_infomask2 — see the
-// package doc).
+// readInfomask2 reads t_infomask2 from the tuple header at lpOff.
+func readInfomask2(p storage.Page, lpOff int) uint16 {
+	return binary.LittleEndian.Uint16(p[lpOff+18 : lpOff+20])
+}
+
+// isHeapOnly mirrors HeapTupleHeaderIsHeapOnly: the HEAP_ONLY_TUPLE bit lives
+// in t_infomask2 (htup_details.h:562).
 func isHeapOnly(p storage.Page, lpOff int) bool {
-	return readInfomask(p, lpOff)&storage.HeapOnlyTuple != 0
+	return readInfomask2(p, lpOff)&storage.HeapOnlyTuple != 0
 }
 
 // checkTupleHeader mirrors verify_heapam.c:check_tuple_header for the checks
@@ -764,8 +767,8 @@ func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report fu
 	// (verify_heapam.c:1029). curr_xmax for a non-multi xmax is the raw xmax
 	// field; the multixact case needs a member-table lookup we cannot do
 	// page-structurally, so it is skipped. HEAP_HOT_UPDATED is read from
-	// t_infomask per goopg's layout (see the package doc).
-	if infomask&heapXmaxIsMulti == 0 && isHotUpdated(infomask) && rawXmax(p, lpOff) == 0 {
+	// t_infomask2, upstream's position (M0131-S11 — see the package doc).
+	if infomask&heapXmaxIsMulti == 0 && isHotUpdated(readInfomask2(p, lpOff), infomask) && rawXmax(p, lpOff) == 0 {
 		report(offnum, "tuple has been HOT updated, but xmax is 0")
 	}
 
@@ -807,11 +810,11 @@ func rawXmax(p storage.Page, lpOff int) uint32 {
 	return binary.LittleEndian.Uint32(p[lpOff+4 : lpOff+8])
 }
 
-// isHotUpdated mirrors HeapTupleHeaderIsHotUpdated for goopg's layout: the
-// HEAP_HOT_UPDATED bit (in t_infomask here, not t_infomask2 — see the package
-// doc) is set, xmax is not marked invalid, and xmin is not marked invalid.
-func isHotUpdated(infomask uint16) bool {
-	return infomask&storage.HeapHotUpdated != 0 &&
+// isHotUpdated mirrors HeapTupleHeaderIsHotUpdated: the HEAP_HOT_UPDATED bit
+// (t_infomask2 — htup_details.h:542) is set, xmax is not marked invalid, and
+// xmin is not marked invalid (both hints live in t_infomask).
+func isHotUpdated(infomask2, infomask uint16) bool {
+	return infomask2&storage.HeapHotUpdated != 0 &&
 		infomask&storage.HeapXmaxInvalid == 0 &&
 		!xminInvalid(infomask)
 }

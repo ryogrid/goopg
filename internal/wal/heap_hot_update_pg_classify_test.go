@@ -17,7 +17,7 @@ func TestClassifyPGHeapHotUpdateRoutesByXid(t *testing.T) {
 
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 16400}
 	newTup := storage.NewHeapTuple(0, storage.InvalidTransactionID, []byte("newrow"))
-	newTup.Header.Infomask |= storage.HeapOnlyTuple
+	newTup.Header.SetHeapOnly()
 	newBytes, err := newTup.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)

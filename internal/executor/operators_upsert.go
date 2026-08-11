@@ -702,7 +702,7 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 			// Re-pin the page and follow the chain so a concurrent HOT update
 			// doesn't leave the arbiter probe without a conflict match.
 			// M0100-0005 (Bug A — HOT path).
-			if tuple.Header.Infomask&storage.HeapHotUpdated != 0 && o.ctx.Pool != nil {
+			if tuple.Header.IsHotUpdated() && o.ctx.Pool != nil {
 				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 				if perr == nil {
 					hotBuf.RLock()

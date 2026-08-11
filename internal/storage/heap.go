@@ -115,10 +115,23 @@ const (
 	// following an index pointer must walk the chain (same page, follow
 	// CTID.Offset) until they find a tuple without this bit set.
 	// Mirrors PostgreSQL's HEAP_HOT_UPDATED (0x4000).
+	//
+	// M0131-S11: this bit lives in **t_infomask2**, not t_infomask —
+	// HeapTupleHeaderSetHotUpdated writes `tup->t_infomask2 |=
+	// HEAP_HOT_UPDATED` (htup_details.h:550) and the reader at :542 tests
+	// the same field. goopg kept it in t_infomask until 2026-08-11, which
+	// made every HOT chain mutually unreadable across engines: goopg read
+	// zero rows from a PG-authored chain, and a PG reading a goopg page saw
+	// 0x4000/0x8000 in t_infomask as HEAP_MOVED_OFF/HEAP_MOVED_IN and took
+	// the pre-9.0 t_xvac visibility path (heapam_visibility.c:183/:202).
+	// Access the bits through IsHotUpdated/SetHotUpdated/IsHeapOnly/
+	// SetHeapOnly below rather than naming the field, so the reader and
+	// writer siblings can never drift apart again.
 	HeapHotUpdated uint16 = 0x4000
 	// HeapOnlyTuple indicates this tuple is a HOT-only version: it was
 	// inserted as the successor in a HOT update chain and has no direct
-	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
+	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000), and like
+	// HeapHotUpdated it lives in t_infomask2 (htup_details.h:568).
 	HeapOnlyTuple uint16 = 0x8000
 
 	// HEAP_HASNULL indicates the tuple contains NULL values (null bitmap
@@ -314,6 +327,21 @@ type HeapTuple struct {
 func (h *HeapTupleHeader) SetNatts(natts int) {
 	h.Infomask2 = (h.Infomask2 &^ HeapNattsMask) | (uint16(natts) & HeapNattsMask)
 }
+
+// IsHotUpdated mirrors HeapTupleHeaderIsHotUpdated
+// (postgres/src/include/access/htup_details.h:542) minus the xmin/xmax hint
+// screening, which callers that need it apply themselves (internal/amcheck).
+// The bit is read from t_infomask2 — see HeapHotUpdated for why.
+func (h *HeapTupleHeader) IsHotUpdated() bool { return h.Infomask2&HeapHotUpdated != 0 }
+
+// SetHotUpdated mirrors HeapTupleHeaderSetHotUpdated (htup_details.h:550).
+func (h *HeapTupleHeader) SetHotUpdated() { h.Infomask2 |= HeapHotUpdated }
+
+// IsHeapOnly mirrors HeapTupleHeaderIsHeapOnly (htup_details.h:562).
+func (h *HeapTupleHeader) IsHeapOnly() bool { return h.Infomask2&HeapOnlyTuple != 0 }
+
+// SetHeapOnly mirrors HeapTupleHeaderSetHeapOnly (htup_details.h:568).
+func (h *HeapTupleHeader) SetHeapOnly() { h.Infomask2 |= HeapOnlyTuple }
 
 func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	out := make([]byte, len(data))
@@ -1470,12 +1498,16 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	// Set CTID to (blk, newSlot) — same-page chain link.
 	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
 	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
-	// Update infomask: clear lock-only bits (a delete supersedes any
-	// lingering row-lock), then set HeapHotUpdated.
+	// Update t_infomask at [20:22]: clear lock-only bits (a delete supersedes
+	// any lingering row-lock).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
-	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Mark the HOT chain in t_infomask2 at [18:20] — HEAP_HOT_UPDATED lives
+	// there, not in t_infomask (M0131-S11; htup_details.h:550).
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask2 |= HeapHotUpdated
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
 	// once xmax is committed and xmax < OldestXmin.
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
@@ -1575,18 +1607,20 @@ func PageStampHotOldTupleMulti(p Page, oldSlot uint16, multi TransactionID, info
 	// Set CTID to (blk, newSlot) — same-page HOT chain link.
 	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
 	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
-	// t_infomask2 at [18:20]: refresh HEAP_KEYS_UPDATED from the multi hint.
+	// t_infomask2 at [18:20]: refresh HEAP_KEYS_UPDATED from the multi hint,
+	// and mark the HOT chain — HEAP_HOT_UPDATED lives in this field, not in
+	// t_infomask (M0131-S11; htup_details.h:550).
 	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
 	infomask2 &^= HeapKeysUpdated
 	infomask2 |= infomask2Bits & HeapKeysUpdated
+	infomask2 |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
-	// t_infomask at [20:22]: clear xmax-classification bits, OR in the multi
-	// hint bits (which set HEAP_XMAX_IS_MULTI and clear HEAP_XMAX_LOCK_ONLY for
-	// an updater-bearing multi), then mark the HOT chain.
+	// t_infomask at [20:22]: clear xmax-classification bits, then OR in the
+	// multi hint bits (which set HEAP_XMAX_IS_MULTI and clear
+	// HEAP_XMAX_LOCK_ONLY for an updater-bearing multi).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockMask | HeapXmaxLockOnly | HeapXmaxInvalid | HeapXmaxCommitted | HeapXmaxIsMulti
 	infomask |= infomaskBits
-	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid (M0046-0002) using the real update member: the old
 	// HOT tuple is dead once the updater commits and is < OldestXmin. The multi

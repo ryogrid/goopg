@@ -131,7 +131,8 @@ func TestIsConcurrentlyUpdatedHelper(t *testing.T) {
 		{"unset xmax", storage.HeapTupleHeader{Xmax: 0, Infomask: 0}, false},
 		{"xmax=myXID", storage.HeapTupleHeader{Xmax: myXID, Infomask: 0}, false},
 		{"xmax=other", storage.HeapTupleHeader{Xmax: 50, Infomask: 0}, true},
-		{"HeapHotUpdated bit set", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapHotUpdated}, true},
+		// HEAP_HOT_UPDATED is a t_infomask2 bit (M0131-S11).
+		{"HeapHotUpdated bit set", storage.HeapTupleHeader{Xmax: 50, Infomask2: storage.HeapHotUpdated}, true},
 		{"HeapXmaxInvalid bit set with xmax=other", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapXmaxInvalid}, false},
 		{"lock-only xmax (FOR UPDATE)", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxExclLock}, false},
 	}

@@ -186,9 +186,19 @@ func infomaskOffset(t *testing.T, p storage.Page, slot uint16) int {
 	return int(item.Offset) + 20
 }
 
+// setInfomask stamps the given logical flags on a tuple. HEAP_HOT_UPDATED and
+// HEAP_ONLY_TUPLE live in t_infomask2 (M0131-S11), so they are split out and
+// written there; everything else goes to t_infomask. Callers keep naming the
+// flags without caring which field holds them, so the ~20 call sites below did
+// not have to move when the bits did.
 func setInfomask(t *testing.T, p storage.Page, slot uint16, mask uint16) {
 	t.Helper()
-	binary.LittleEndian.PutUint16(p[infomaskOffset(t, p, slot):infomaskOffset(t, p, slot)+2], mask)
+	const hotBits = storage.HeapHotUpdated | storage.HeapOnlyTuple
+	off := infomaskOffset(t, p, slot)
+	binary.LittleEndian.PutUint16(p[off:off+2], mask&^hotBits)
+	// t_infomask2 sits immediately before t_infomask; preserve natts.
+	im2 := binary.LittleEndian.Uint16(p[off-2 : off])
+	binary.LittleEndian.PutUint16(p[off-2:off], (im2&^hotBits)|(mask&hotBits))
 }
 
 func setXmax(t *testing.T, p storage.Page, slot uint16, xmax uint32) {

@@ -3212,7 +3212,7 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	}
 	// Beyond this point, any xmax/HOT marker is from a DIFFERENT
 	// transaction.
-	if h.Infomask&storage.HeapHotUpdated != 0 {
+	if h.IsHotUpdated() {
 		// M0100-0005: If the HOT-updating transaction already aborted, the
 		// HeapHotUpdated flag is stale — the row is not actually "concurrently
 		// updated", so proceed directly without EPQ retry.
@@ -3591,7 +3591,8 @@ func tryApplyHOTUpdate(
 	} else {
 		tup = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
-	tup.Header.Infomask |= storage.HeapOnlyTuple
+	// HEAP_ONLY_TUPLE lives in t_infomask2 (M0131-S11; htup_details.h:568).
+	tup.Header.SetHeapOnly()
 	tup.Header.SetNatts(len(cols))
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	// HEAP_HASVARWIDTH: PG18 nocachegetattr crashes when this bit is

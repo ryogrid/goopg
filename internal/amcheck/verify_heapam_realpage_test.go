@@ -30,7 +30,7 @@ import (
 func addRealHotSuccessor(t *testing.T, p storage.Page, xid storage.TransactionID, dataLen int) uint16 {
 	t.Helper()
 	tup := storage.NewHeapTuple(xid, storage.InvalidTransactionID, make([]byte, dataLen))
-	tup.Header.Infomask |= storage.HeapOnlyTuple
+	tup.Header.SetHeapOnly()
 	tup.Header.SetNatts(1)
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	slot, err := storage.PageAddHeapTuple(p, tup)

@@ -51,7 +51,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			// Chain end: tuple is not visible and has no successor.
 			return storage.HeapTuple{}, 0, false
 		}
@@ -94,7 +94,7 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			return storage.HeapTuple{}, 0, false
 		}
 		next := t.Header.CTID.Offset
@@ -147,7 +147,7 @@ func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.
 		if !storage.TupleDeadToAll(t.Header, oldestXmin) {
 			return false
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			return true // chain ends here; every member was dead-to-all
 		}
 		next := t.Header.CTID.Offset

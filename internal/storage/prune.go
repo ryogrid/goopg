@@ -157,10 +157,10 @@ func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
 			continue
 		}
 
-		if t.Header.Infomask&HeapOnlyTuple != 0 {
+		if t.Header.IsHeapOnly() {
 			// HOT-only: not pointed to by any index → mark unused.
 			result.Unused = append(result.Unused, slot)
-		} else if t.Header.Infomask&HeapHotUpdated != 0 {
+		} else if t.Header.IsHotUpdated() {
 			// HOT chain root: the B-tree index points here. Follow the
 			// chain to the live tip and create a redirect.
 			liveTip := pruneChainTip(p, t.Header.CTID.Offset, isDead)

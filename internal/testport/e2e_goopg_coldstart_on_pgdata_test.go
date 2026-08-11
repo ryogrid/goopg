@@ -237,39 +237,29 @@ func TestE2E_GoopgColdStartOnPGDataDir(t *testing.T) {
 		t.Fatalf("goopg row id=9 (UPDATEd, seq scan) = %q, PG said %q", got, wantRow9)
 	}
 
-	// …but reading it through EITHER index does not. This is the S3 finding,
-	// locked in rather than hidden — deferral ledger, M0131-S11.
-	//
-	// PG stores HEAP_HOT_UPDATED (0x4000) and HEAP_ONLY_TUPLE (0x8000) in
-	// **t_infomask2** (postgres/src/include/access/htup_details.h:550, :568).
-	// goopg stores the same two bit VALUES in **t_infomask**
-	// (internal/storage/heap.go:118-122, written at :1477/:1589/:3594, read at
-	// internal/executor/operators_index.go:54 and internal/storage/prune.go:160).
-	// So on a PG-authored page followHOTChain sees HeapHotUpdated == 0 on the
-	// root tuple, calls it a chain end, and the index scan yields nothing —
-	// while the seq scan above, which never consults the flag, is correct.
-	//
-	// The divergence is bidirectional and the forward direction is worse: in
-	// PG's t_infomask 0x4000/0x8000 are HEAP_MOVED_OFF/HEAP_MOVED_IN, and
-	// heapam_visibility.c:183/:202 branch on them to decide visibility from
-	// t_xvac — so a hosted PG reading a goopg HOT chain does not merely miss
-	// rows, it takes the pre-9.0 binary-upgrade path on garbage.
-	//
-	// WHEN M0131-S11 LANDS, THIS BLOCK MUST BE INVERTED: delete it and restore
-	// the direct `WHERE id = 9` / `WHERE label = 'label-9'` assertions against
-	// wantRow9. A failure here means the gap closed and the test is stale.
+	// …and since M0131-S11 so does reading it through EITHER index. This block
+	// was the S3 finding, inverted now that the gap is closed: PG stores
+	// HEAP_HOT_UPDATED (0x4000) and HEAP_ONLY_TUPLE (0x8000) in **t_infomask2**
+	// (postgres/src/include/access/htup_details.h:550, :568), goopg kept the
+	// same bit VALUES in t_infomask, and followHOTChain therefore read
+	// HeapHotUpdated == 0 on a PG-authored chain root, called it a chain end
+	// and returned nothing — while the seq scan above, which never consults
+	// the flag, was correct. S11 moved the bits; these two queries walk the
+	// PG-authored HOT chain through both the primary-key and the label index.
 	for _, q := range []string{
-		"SELECT count(*) FROM public.s3_items WHERE id = 9",
-		"SELECT count(*) FROM public.s3_items WHERE label = 'label-9'",
+		"SELECT label || '/' || qty FROM public.s3_items WHERE id = 9",
+		"SELECT label || '/' || qty FROM public.s3_items WHERE label = 'label-9'",
 	} {
-		if got := coldStartScalar(t, ctx, g, q); got != "0" {
-			t.Fatalf("index scan %q returned %q, want %q while the t_infomask2 gap is open — "+
-				"if this now finds the row, M0131-S11 has landed: invert this block "+
-				"(see docs/design/0131-0003-reverse-coldstart-e2e.md §Findings)", q, got, "0")
+		if got := coldStartScalar(t, ctx, g, q); got != wantRow9 {
+			t.Fatalf("index scan %q on the PG-authored HOT chain = %q, PG said %q — "+
+				"M0131-S11 moved HEAP_HOT_UPDATED/HEAP_ONLY_TUPLE into t_infomask2; "+
+				"a miss here means followHOTChain regressed to reading t_infomask "+
+				"(see docs/design/0131-0011-hot-flags-infomask2.md)", q, got, wantRow9)
 		}
 	}
-	// The un-updated row still resolves through the same index, so the miss is
-	// specific to HOT chains and not a wholesale PG-btree read failure.
+	// The un-updated row still resolves through the same index, so any miss
+	// above would be specific to HOT chains and not a wholesale PG-btree read
+	// failure.
 	if got := coldStartScalar(t, ctx, g, "SELECT count(*) FROM public.s3_items WHERE id = 7"); got != "1" {
 		t.Fatalf("index scan for the un-UPDATEd id=7 returned %q, want 1 — "+
 			"goopg cannot read the PG-authored btree at all, which is a wider failure than the HOT-chain gap", got)

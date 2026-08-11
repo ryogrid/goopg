@@ -360,7 +360,7 @@ func TestPageStampHotOldTupleMulti(t *testing.T) {
 	if got.Header.Infomask&HeapXmaxLockOnly != 0 {
 		t.Errorf("Infomask = %#x, HEAP_XMAX_LOCK_ONLY should have cleared", got.Header.Infomask)
 	}
-	if got.Header.Infomask&HeapHotUpdated == 0 {
+	if !got.Header.IsHotUpdated() {
 		t.Errorf("Infomask = %#x, HEAP_HOT_UPDATED should be set", got.Header.Infomask)
 	}
 	if got.Header.Infomask2&HeapKeysUpdated == 0 {
