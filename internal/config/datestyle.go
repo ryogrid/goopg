@@ -194,33 +194,42 @@ func fracSecondsSuffix(t time.Time) string {
 // FormatTimestamp renders a TIMESTAMP/TIMESTAMPTZ value's text according to
 // the given DateStyle (style, order) pair, matching PostgreSQL's
 // EncodeDateTime (postgres/src/backend/utils/adt/datetime.c) with
-// print_tz=false — goopg has no session-timezone-aware conversion or offset
-// rendering for TIMESTAMPTZ yet (a separate, larger deferred gap; see the
-// deferral ledger), so both types render their stored instant identically to
-// plain TIMESTAMP, same as before this DateStyle fix. Fractional seconds are
+// print_tz=false — i.e. `timestamp without time zone`. TIMESTAMPTZ has its own
+// entry point, FormatTimestampTZ (timestamptz_out.go), which converts to the
+// session TimeZone and prints the zone. Fractional seconds are
 // trimmed of trailing zeros (and omitted entirely when zero) via
 // fracSecondsSuffix, matching PostgreSQL's AppendSeconds rather than always
 // padding to 6 digits.
 func FormatTimestamp(t time.Time, style, order string) string {
+	body, era := formatTimestampBody(t, style, order)
+	return body + era
+}
+
+// formatTimestampBody is FormatTimestamp split at the seam upstream's
+// EncodeDateTime has: everything up to (but not including) the zone, and the
+// trailing era marker, which upstream appends AFTER the zone
+// ("0001-02-28 10:00:00+05:53:28 BC"). FormatTimestamp joins the two directly;
+// FormatTimestampTZ splices the encoded zone between them.
+func formatTimestampBody(t time.Time, style, order string) (body, era string) {
 	frac := fracSecondsSuffix(t)
 	// The Postgres style prints a weekday, which belongs to the stored instant,
 	// so it keeps formatting from t; every other style embeds only the year and
-	// formats from the era-adjusted copy. " BC" trails the whole value.
+	// formats from the era-adjusted copy.
 	disp, era := eraDisplay(t)
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return disp.Format("02/01/2006 15:04:05") + frac + era
+			return disp.Format("02/01/2006 15:04:05") + frac, era
 		}
-		return disp.Format("01/02/2006 15:04:05") + frac + era
+		return disp.Format("01/02/2006 15:04:05") + frac, era
 	case "Postgres":
 		if order == "DMY" {
-			return t.Format("Mon 02 Jan 15:04:05") + frac + disp.Format(" 2006") + era
+			return t.Format("Mon 02 Jan 15:04:05") + frac + disp.Format(" 2006"), era
 		}
-		return t.Format("Mon Jan 02 15:04:05") + frac + disp.Format(" 2006") + era
+		return t.Format("Mon Jan 02 15:04:05") + frac + disp.Format(" 2006"), era
 	case "German":
-		return disp.Format("02.01.2006 15:04:05") + frac + era
+		return disp.Format("02.01.2006 15:04:05") + frac, era
 	default:
-		return disp.Format("2006-01-02 15:04:05") + frac + era
+		return disp.Format("2006-01-02 15:04:05") + frac, era
 	}
 }

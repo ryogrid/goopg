@@ -189,6 +189,22 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.Snap = snap
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
+	// A standalone `COPY ... TO STDOUT` built its executor context by hand and
+	// never attached the session GUC hooks, so it was the one COPY path that
+	// could not see `SET datestyle` / `SET timezone` — RunCopyTo's lookups all
+	// fell back to the boot defaults and output rendering silently ignored the
+	// session. The INLINE COPY path (runInlineCopy) has always had them, since
+	// it borrows the batch's ectx; this brings the two into line. M0119-0006.
+	if sess != nil {
+		ectx.GetSetting = func(name string) (string, bool) {
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		}
+		ectx.GetSettingDisplay = func(name string) (string, bool) {
+			_, eff, ok := sess.GetDisplay(name)
+			return eff, ok
+		}
+	}
 
 	switch plan.Direction {
 	case planner.CopyTo:

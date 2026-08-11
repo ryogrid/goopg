@@ -2993,6 +2993,38 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       -checked; `RALPH_PRECOMMIT_SCOPE=units` PASS; `tpch-spotcheck.sh` PASS
       (Q12=2, Q13=35). Design
       `0125-0007-pg-faithful-date-field-decode.md` §16.
+      **39th slice (2026-08-11) — `timestamptz` OUTPUT renders its zone and
+      leaves UTC.** goopg printed a `timestamp with time zone` exactly like a
+      plain `timestamp`: stored instant, UTC, no zone marker, `SET TimeZone`
+      ignored — so under a non-UTC session the text goopg returned denoted a
+      DIFFERENT instant than the one it stored, with no error. New
+      `config.FormatTimestampTZ` + `encodeTimezone`
+      (`internal/config/timestamptz_out.go`) port `EncodeDateTime` with
+      `print_tz=true` and `EncodeTimezone`
+      (`postgres/src/backend/utils/adt/datetime.c`). Conversion and marker land
+      together because neither is right alone. The per-DateStyle zone spelling
+      is NOT uniform (ISO = numeric offset, no space; SQL/Postgres/German = the
+      ABBREVIATION after a space), `EncodeTimezone` has three widths that all
+      occur in real tzdata (`+00`, `+05:30`, `+05:53:28` — Kolkata LMT), and
+      `" BC"` trails the ZONE, not the seconds. `Datum.TimeSub` turned out NOT
+      to be a prerequisite: the two output paths that matter know the declared
+      column type, and were split off the shared `case "timestamp",
+      "timestamptz"` as siblings — `dispatch.go`'s `appendTypedCellText` and
+      `copy_text.go`'s `datumToCopyText` (`timeZone` threaded through
+      `EncodeCopyTextRow`/`EncodeCopyCsvRow`/`RunCopyTo`). Wiring the COPY half
+      surfaced a pre-existing bug: standalone `COPY … TO STDOUT`
+      (`dispatchCopyViaExecutor`) built its executor context by hand and never
+      attached the session GUC hooks, so it read NO GUCs at all — `SET
+      datestyle` was ignored there too, though the same statement inside a `\;`
+      batch honoured it. Still deferred: the `::text` cast path (bare Datum, no
+      `TimeSub` producer — M0127-P5.9-u) and POSIX `TimeZone` spellings
+      (`'+05:30'`, inverted sign) which fall back to UTC. Gates: 19 PG-18.3
+      oracle cells (`TestFormatTimestampTZAgainstPG18Oracle`) + one sibling test
+      per output path, each also asserting the plain-`timestamp` column does NOT
+      move; `TestPort_RegressSuite` PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS;
+      `tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design
+      `0119-0006-timestamptz-output-zone-rendering.md` + README row
+      `0119-0006v`.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

@@ -32,7 +32,7 @@ import (
 // column rendering (PostgreSQL's DateStyle GUC style/order components,
 // e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
 // for the boot default.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder string) ([]byte, error) {
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -45,7 +45,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone)
 		if err != nil {
 			return nil, err
 		}
@@ -247,7 +247,7 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 
 // datumToCopyText renders a non-null Datum into the byte string
 // COPY TEXT expects, before per-byte escaping.
-func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder string) (string, error) {
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string) (string, error) {
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		if d.Kind != KindInt {
@@ -271,16 +271,24 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder string) (stri
 			return "", fmt.Errorf("expected time datum for date, got kind %d", d.Kind)
 		}
 		return config.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
-	case "timestamp", "timestamptz":
+	case "timestamp":
 		// DateStyle-aware, mirroring the "date" case above and dispatch.go's
-		// appendTypedCellText. No session-timezone-aware conversion/offset for
-		// timestamptz yet (separate deferred gap, matches this column's
-		// pre-existing behavior). M-NIGHTLY (run 20260714-011651) DateStyle
+		// appendTypedCellText. M-NIGHTLY (run 20260714-011651) DateStyle
 		// output-rendering follow-up.
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
 		return config.FormatTimestamp(d.TimeValue().UTC(), dateStyle, dateOrder), nil
+	case "timestamptz":
+		// COPY TO emits the same text timestamptz_out does, so this must track
+		// dispatch.go's appendTypedCellText exactly: convert into the session
+		// TimeZone and print the zone (`COPY z TO STDOUT` under
+		// TimeZone='Asia/Kolkata' is "2020-06-15 15:30:00+05:30" upstream).
+		// Split off from the shared "timestamp" case in M0119-0006.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
+		}
+		return config.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
 	default:
 		switch d.Kind {
 		case KindString:

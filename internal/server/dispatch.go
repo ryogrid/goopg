@@ -3361,14 +3361,11 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, config.FormatDate(d.TimeValue(), style, order)...)
 		}
 		return d.AppendValueText(dst)
-	case "timestamp", "timestamptz":
+	case "timestamp":
 		// Timestamp columns render per the session's DateStyle GUC (style x
 		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
-		// Previously hardcoded ISO regardless of `SET datestyle`. No
-		// session-timezone-aware conversion/offset for timestamptz yet
-		// (separate deferred gap — matches this column's pre-existing
-		// behavior, unchanged by this fix). M-NIGHTLY (run 20260714-011651)
-		// DateStyle output-rendering follow-up.
+		// Previously hardcoded ISO regardless of `SET datestyle`. M-NIGHTLY
+		// (run 20260714-011651) DateStyle output-rendering follow-up.
 		if d.Kind == executor.KindTime {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
@@ -3377,6 +3374,27 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 				}
 			}
 			return append(dst, config.FormatTimestamp(d.TimeValue(), style, order)...)
+		}
+		return d.AppendValueText(dst)
+	case "timestamptz":
+		// timestamptz_out: convert the stored (UTC) instant into the session's
+		// TimeZone GUC and print the zone, which plain `timestamp` above does
+		// not. Split off from the shared "timestamp" case in M0119-0006 —
+		// before that, goopg printed a timestamptz with no zone at all and
+		// never left UTC, so under `SET TimeZone` the text READ as a different
+		// instant than the one stored.
+		if d.Kind == executor.KindTime {
+			style, order := "ISO", "MDY"
+			zone := ""
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+				if v, ok := getSetting("timezone"); ok {
+					zone = v
+				}
+			}
+			return append(dst, config.FormatTimestampTZ(d.TimeValue(), style, order, zone)...)
 		}
 		return d.AppendValueText(dst)
 	case "time":

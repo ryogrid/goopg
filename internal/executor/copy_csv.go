@@ -119,7 +119,7 @@ func (f copyToFormat) appendHeader(dst []byte, cols []catalog.Column) []byte {
 // settings. NULL fields are written as the (unquoted) null string; all
 // other fields are quoted when they need it or when force-quote applies.
 // dateStyle/dateOrder select DATE column rendering, same as EncodeCopyTextRow.
-func EncodeCopyCsvRow(dst []byte, row Row, cols []catalog.Column, f copyToFormat, dateStyle, dateOrder string) ([]byte, error) {
+func EncodeCopyCsvRow(dst []byte, row Row, cols []catalog.Column, f copyToFormat, dateStyle, dateOrder, timeZone string) ([]byte, error) {
 	for i, c := range cols {
 		if i > 0 {
 			dst = append(dst, f.delim)
@@ -129,7 +129,7 @@ func EncodeCopyCsvRow(dst []byte, row Row, cols []catalog.Column, f copyToFormat
 			dst = append(dst, f.nullStr...)
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone)
 		if err != nil {
 			return nil, err
 		}

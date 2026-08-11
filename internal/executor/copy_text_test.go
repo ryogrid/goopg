@@ -28,7 +28,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 		{Kind: KindInt, Int: 0},
 		NewStringDatum(""),
 	}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 func TestEncodeCopyTextRowEscaping(t *testing.T) {
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
 	row := Row{NewStringDatum("a\\b\nc\rd\te")}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestEncodeCopyTextRowNullSentinel(t *testing.T) {
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
 	row := Row{NullDatum, NewStringDatum("x")}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestEncodeCopyTextRowDate(t *testing.T) {
 		{"German", "DMY", "14.07.2026\n"},
 	}
 	for _, tc := range cases {
-		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order)
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC")
 		if err != nil {
 			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
 		}
@@ -110,9 +110,10 @@ func TestEncodeCopyTextRowDate(t *testing.T) {
 // case was hardcoded to ISO regardless of the caller's DateStyle (style,
 // order) pair, so `SET datestyle` had zero effect on COPY output for
 // timestamp columns even though it already worked for DATE. Matches
-// PostgreSQL's EncodeDateTime with print_tz=false (goopg has no
-// session-timezone conversion/offset for timestamptz yet). A zero fsec
-// omits the fractional part entirely, matching PostgreSQL's AppendSeconds.
+// PostgreSQL's EncodeDateTime with print_tz=false. A zero fsec omits the
+// fractional part entirely, matching PostgreSQL's AppendSeconds. The
+// timestamptz half moved to TestEncodeCopyTextRowTimestampTZ below when
+// M0119-0006 split the two types apart.
 func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 	cols := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
 	when := time.Date(2026, time.July, 14, 9, 5, 3, 0, time.UTC)
@@ -129,13 +130,57 @@ func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 		{"German", "DMY", "14.07.2026 09:05:03\n"},
 	}
 	for _, tc := range cases {
-		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order)
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC")
 		if err != nil {
 			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
 		}
 		if string(got) != tc.want {
 			t.Errorf("style=%s order=%s: got %q, want %q", tc.style, tc.order, got, tc.want)
 		}
+	}
+}
+
+// TestEncodeCopyTextRowTimestampTZ is the COPY-side sibling of the server's
+// TestAppendTypedCellTextTimestampTZHonorsTimeZone. `COPY <t> TO STDOUT` emits
+// the same text timestamptz_out produces, so the two output paths must agree
+// cell for cell — a divergence here would mean `COPY t TO STDOUT` and
+// `SELECT * FROM t` disagreed about what the same stored value IS. Before
+// M0119-0006 this column shared the plain-timestamp case: no conversion, no
+// zone. Values pinned against PG 18.3 (`SET timezone='Asia/Kolkata'; COPY z TO
+// STDOUT` → "2020-06-15 15:30:00+05:30").
+func TestEncodeCopyTextRowTimestampTZ(t *testing.T) {
+	cols := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamptz"}}}
+	row := Row{NewTimeDatum(time.Date(2020, time.June, 15, 10, 0, 0, 0, time.UTC))}
+
+	cases := []struct {
+		style, order, zone, want string
+	}{
+		{"ISO", "MDY", "UTC", "2020-06-15 10:00:00+00\n"},
+		{"ISO", "MDY", "", "2020-06-15 10:00:00+00\n"},
+		{"ISO", "MDY", "Asia/Kolkata", "2020-06-15 15:30:00+05:30\n"},
+		{"ISO", "MDY", "America/Los_Angeles", "2020-06-15 03:00:00-07\n"},
+		{"SQL", "DMY", "Asia/Kolkata", "15/06/2020 15:30:00 IST\n"},
+		{"Postgres", "MDY", "America/Los_Angeles", "Mon Jun 15 03:00:00 2020 PDT\n"},
+		{"German", "DMY", "Asia/Kolkata", "15.06.2020 15:30:00 IST\n"},
+	}
+	for _, tc := range cases {
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, tc.zone)
+		if err != nil {
+			t.Fatalf("style=%s order=%s zone=%s: %v", tc.style, tc.order, tc.zone, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("style=%s order=%s zone=%s: got %q, want %q", tc.style, tc.order, tc.zone, got, tc.want)
+		}
+	}
+
+	// The plain-timestamp column in the same row set must NOT move.
+	plain := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
+	got, err := EncodeCopyTextRow(nil, row, plain, "ISO", "MDY", "Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "2020-06-15 10:00:00\n" {
+		t.Errorf("timestamp under TimeZone=Asia/Kolkata: got %q, want %q", got, "2020-06-15 10:00:00\n")
 	}
 }
 
@@ -157,7 +202,7 @@ func TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed(t *testing.T) {
 	for _, tc := range cases {
 		when := time.Date(2026, time.July, 14, 9, 5, 3, tc.ns, time.UTC)
 		row := Row{NewTimeDatum(when)}
-		got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+		got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -265,7 +310,7 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 		NewBoolDatum(true),
 		NewTimeDatum(now),
 	}
-	enc, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+	enc, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
 	if err != nil {
 		t.Fatal(err)
 	}
