@@ -184,14 +184,19 @@ func TestReadAllSkipsShortSegmentTailGapWithStaleBytes(t *testing.T) {
 	assertAllPayloadsReplayed(t, walDir, payloads)
 }
 
-// TestReadAllKeepsRecordStraddlingSegmentBoundary is the Path-A (direct write)
-// case and the reason the skip above is CRC-conditional: appendPGCompat's
-// direct path emits at the tracker cursor with no boundary re-land, so a
-// record really can begin in a segment's last 8 bytes and continue after the
-// next segment's long page header. Skipping the tail unconditionally — the
-// first shape of the S30.1 fix — dropped that record and everything after it.
+// TestReadAllKeepsRecordStraddlingSegmentBoundary is the reader-robustness
+// half of the S30.1 fix and the reason the segment-tail skip is CRC-conditional
+// rather than positional: a record that legitimately BEGINS in a segment's last
+// 8 bytes and continues after the next segment's long page header must still be
+// read.
+//
+// Since M0131-S30.6 no goopg append path produces that shape — Path A now
+// re-lands a crossing record at the boundary exactly as the stripe path does —
+// so the fixture is built by hand, emitting at the cursor with no re-land the
+// way Path A used to. Streams written by older goopg versions have this shape
+// on disk, so the reader must keep handling it.
 func TestReadAllKeepsRecordStraddlingSegmentBoundary(t *testing.T) {
-	walDir, payloads := writeWALWithShortSegmentTailGap(t, 8, 0)
+	walDir, payloads := writeWALWithStraddlingRecord(t, 8)
 
 	// Sanity: this fixture must really straddle, otherwise it guards nothing.
 	stream, err := readStreamFrom(walDir, tailGapSegSize, 0)
@@ -204,4 +209,111 @@ func TestReadAllKeepsRecordStraddlingSegmentBoundary(t *testing.T) {
 	}
 
 	assertAllPayloadsReplayed(t, walDir, payloads)
+}
+
+// writeWALWithStraddlingRecord builds a two-segment WAL whose first segment
+// ends `lead` bytes (lead < 24) before the boundary and whose next record
+// STARTS in those bytes and continues into the following segment. The records
+// up to the boundary are written by a real Writer; the straddling record and
+// the ones behind it are emitted by hand at the cursor (encodeRecordXLog +
+// emitWithPageHeaders, prev threaded manually), which is exactly what
+// state.appendPGCompat's Path A did before M0131-S30.6.
+func writeWALWithStraddlingRecord(t *testing.T, lead int64) (walDir string, payloads []string) {
+	t.Helper()
+	if lead <= 0 || lead >= int64(xlogRecordHeaderSize) {
+		t.Fatalf("lead=%d must be in (0, %d)", lead, xlogRecordHeaderSize)
+	}
+	walDir = t.TempDir()
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: tailGapSegSize,
+		Preallocate: true,
+		WALBuffers:  1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysID, tli := w.stateRef.sysID, w.stateRef.tli
+
+	target := uint64(tailGapSegSize) - uint64(lead)
+	var cur, lastStart, lastEnd uint64
+	for cur < target {
+		remain := int(target - cur)
+		step := remain
+		if step > 512 {
+			step = 512
+		}
+		p, ok := payloadOfEmittedSize(cur, step, tailGapSegSize)
+		if !ok {
+			t.Fatalf("no payload produces an emitted size of %d bytes at pos=%d", step, cur)
+		}
+		start, end, aerr := w.Append([]byte(p))
+		if aerr != nil {
+			t.Fatalf("append %q: %v", p, aerr)
+		}
+		payloads = append(payloads, p)
+		lastStart, lastEnd, cur = start, end, end
+	}
+	if cur != target {
+		t.Fatalf("cursor landed at %d, want %d", cur, target)
+	}
+	if err := w.FlushUpTo(lastEnd); err != nil {
+		t.Fatal(err)
+	}
+	w.stateRef.eagerWG.Wait()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hand-emit from the cursor with no boundary re-land. Append returns a
+	// 1-based start, so the prev pointer (0-based record-CONTENT start) of the
+	// last writer record is start-1.
+	pos := int64(target)
+	prev := lastStart - 1
+	for _, p := range []string{"straddles-the-boundary", "after-boundary-0", "after-boundary-1"} {
+		record, realRecLen, eerr := encodeRecordXLog([]byte(p), prev)
+		if eerr != nil {
+			t.Fatalf("encodeRecordXLog(%q): %v", p, eerr)
+		}
+		out, leading := emitWithPageHeaders(record, realRecLen, pos, tailGapSegSize, sysID, tli)
+		writeStreamBytes(t, walDir, tailGapSegSize, pos, out)
+		payloads = append(payloads, p)
+		prev = uint64(pos) + uint64(leading)
+		pos += int64(len(out))
+	}
+	return walDir, payloads
+}
+
+// writeStreamBytes lands `b` at absolute stream position `pos`, splitting the
+// write across segment files and creating (zero-filled) any segment that does
+// not exist yet.
+func writeStreamBytes(t *testing.T, walDir string, segSize, pos int64, b []byte) {
+	t.Helper()
+	for len(b) > 0 {
+		segNo := uint64(pos / segSize)
+		off := pos % segSize
+		n := int64(len(b))
+		if off+n > segSize {
+			n = segSize - off
+		}
+		name := filepath.Join(walDir, formatSegmentName(segNo))
+		if _, err := os.Stat(name); os.IsNotExist(err) {
+			if werr := os.WriteFile(name, make([]byte, segSize), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		}
+		f, err := os.OpenFile(name, os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteAt(b[:n], off); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		b = b[n:]
+		pos += n
+	}
 }

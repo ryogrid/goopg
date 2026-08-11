@@ -77,8 +77,9 @@ func TestInsertPosTrackerReserveAndPublishCrossSegmentPublishesNewStart(t *testi
 	t.Parallel()
 	const segSize = uint64(100)
 	var hookCalls []struct{ start, boundary, prev uint64 }
-	pos := newInsertPosTracker(80, 70, segSize, func(s, b, p uint64) {
+	pos := newInsertPosTracker(80, 70, segSize, func(s, b, p uint64) bool {
 		hookCalls = append(hookCalls, struct{ start, boundary, prev uint64 }{s, b, p})
+		return true
 	})
 	tr := newInsertionTracker()
 
@@ -202,8 +203,9 @@ func TestInsertPosTrackerReserveAndPublishConcurrentChain(t *testing.T) {
 		size       = uint64(16)
 		segSize    = uint64(1 << 20)
 	)
-	pos := newInsertPosTracker(0, 0, segSize, func(_, _, _ uint64) {
+	pos := newInsertPosTracker(0, 0, segSize, func(_, _, _ uint64) bool {
 		t.Errorf("onCross fired in single-segment scenario")
+		return true
 	})
 	tr := newInsertionTracker()
 

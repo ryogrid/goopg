@@ -150,10 +150,12 @@ type stripeWriterCore struct {
 // those bytes include any page header the gap spans. Its zero value keeps
 // the legacy raw-bytes shape for header-less fixtures.
 func newStripeWriterCore(segSize, startCurr, startPrev uint64, walBuf *walBuffer, memRing *MemRing, lay padLayout) *stripeWriterCore {
-	onCross := func(start, boundary, gapPrev uint64) {
-		if _, err := emitSegmentPad(walBuf, memRing, start, boundary, gapPrev, lay); err != nil {
+	onCross := func(start, boundary, gapPrev uint64) (padded bool) {
+		_, padded, err := emitSegmentPad(walBuf, memRing, start, boundary, gapPrev, lay)
+		if err != nil {
 			panic(fmt.Sprintf("wal: stripeWriterCore: cross-segment pad emit failed: %v", err))
 		}
+		return padded
 	}
 	return &stripeWriterCore{
 		locks:      &appendLockSet{},

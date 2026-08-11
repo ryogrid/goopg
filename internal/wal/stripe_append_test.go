@@ -57,10 +57,11 @@ func makeStripeAppendFixtureWithCross(t *testing.T, cap int64, segSize uint64) (
 	// Capture rings in the hook closure.
 	wb := walBuf
 	mr := memRing
-	posTracker = newInsertPosTracker(0, 0, segSize, func(start, boundary, prev uint64) {
+	posTracker = newInsertPosTracker(0, 0, segSize, func(start, boundary, prev uint64) bool {
 		if err := emitSegmentPadErr(wb, mr, start, boundary, prev, padLayout{}); err != nil {
 			t.Errorf("emitSegmentPad in onCrossSegment: %v", err)
 		}
+		return true
 	})
 	return
 }

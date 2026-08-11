@@ -103,9 +103,9 @@ import "fmt"
 // composer as `insertPosTracker.onCrossSegment`; foundation-first
 // pattern matches slice C and the eleven earlier slice B
 // foundations.
-func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gapPrev uint64, lay padLayout) (leading int, err error) {
+func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gapPrev uint64, lay padLayout) (leading int, padded bool, err error) {
 	if boundary <= gapStart {
-		return 0, fmt.Errorf("wal: emitSegmentPad: boundary=%d must exceed gapStart=%d", boundary, gapStart)
+		return 0, false, fmt.Errorf("wal: emitSegmentPad: boundary=%d must exceed gapStart=%d", boundary, gapStart)
 	}
 	gapLen := int(boundary - gapStart)
 
@@ -126,36 +126,48 @@ func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gap
 	recLen := gapLen
 	if lay.pageHeaders && lay.segSize > 0 {
 		recLen -= pageHeaderBytesIn(int64(gapStart), int64(boundary), lay.segSize)
-		if recLen < SizeOfXLogRecord {
-			return 0, fmt.Errorf("wal: emitSegmentPad: gap [%d,%d) leaves %d record bytes after page headers, below minimum %d",
-				gapStart, boundary, recLen, SizeOfXLogRecord)
-		}
 	}
-	pad, err := buildSegmentPadRecord(recLen, gapPrev)
-	if err != nil {
-		return 0, err
-	}
-	out := pad
-	if lay.pageHeaders && lay.segSize > 0 {
-		out, leading = emitWithPageHeaders(pad, recLen, int64(gapStart), lay.segSize, lay.sysID, lay.tli)
-		if len(out) != gapLen {
-			return 0, fmt.Errorf("wal: emitSegmentPad: emitted %d bytes for gap [%d,%d) of %d",
-				len(out), gapStart, boundary, gapLen)
+
+	// M0131-S30.6: a gap with too few record bytes for a well-formed XLOG_NOOP
+	// (and the 25-byte case buildSegmentPadRecord cannot encode) is ZERO-FILLED
+	// instead of padded, and the caller is told so via padded=false so it does
+	// not advance the xl_prev chain onto a record that does not exist. Writing
+	// zeros rather than leaving the bytes untouched matches PG, where
+	// AdvanceXLInsertBuffer zeroes each WAL page before insertion so an
+	// unusable page tail is durable zeros; leaving it unwritten left the
+	// segment file SHORT when Config.Preallocate was off, and replay stopped at
+	// the short read.
+	var out []byte
+	if recLen < SizeOfXLogRecord || recLen == SizeOfXLogRecord+1 {
+		out = make([]byte, gapLen)
+	} else {
+		pad, perr := buildSegmentPadRecord(recLen, gapPrev)
+		if perr != nil {
+			return 0, false, perr
 		}
+		out = pad
+		if lay.pageHeaders && lay.segSize > 0 {
+			out, leading = emitWithPageHeaders(pad, recLen, int64(gapStart), lay.segSize, lay.sysID, lay.tli)
+			if len(out) != gapLen {
+				return 0, false, fmt.Errorf("wal: emitSegmentPad: emitted %d bytes for gap [%d,%d) of %d",
+					len(out), gapStart, boundary, gapLen)
+			}
+		}
+		padded = true
 	}
 	if walBuf != nil {
 		if err := walBuf.writeReserved(int64(gapStart), out); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
 	if memRing != nil {
 		// Advance ring window to accommodate the pad at [gapStart, boundary).
 		memRing.AdvanceWindow(int64(boundary))
 		if err := memRing.WriteReserved(int64(gapStart), out); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
-	return leading, nil
+	return leading, padded, nil
 }
 
 // padLayout carries the page-header layout parameters emitSegmentPad needs to

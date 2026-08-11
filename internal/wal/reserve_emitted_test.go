@@ -118,8 +118,9 @@ func TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 		start, boundary, prev uint64
 	}
 	var gaps []gap
-	pos.onCrossSegment = func(s, b, p uint64) {
+	pos.onCrossSegment = func(s, b, p uint64) bool {
 		gaps = append(gaps, gap{s, b, p})
+		return true
 	}
 
 	const recordLen = 100
@@ -400,8 +401,9 @@ func TestReserveEmittedAndPublishCrossSegmentChainIntegrity(t *testing.T) {
 		start, boundary, prev uint64
 	}
 	var gaps []gap
-	pos.onCrossSegment = func(s, b, p uint64) {
+	pos.onCrossSegment = func(s, b, p uint64) bool {
 		gaps = append(gaps, gap{s, b, p})
+		return true
 	}
 
 	// Rec1: 100 bytes at startPos1 → no leading, no page crossings
@@ -505,8 +507,14 @@ func TestReserveEmittedAndPublishWatchdog(t *testing.T) {
 // TestReserveEmittedAndPublishSmallGapSkipsNoop verifies the fix for the
 // "pad record padLen below minimum 24" panic. When a record would create a
 // gap of < 24 bytes before a segment boundary, reserveEmittedAndPublish must
-// advance curr to the boundary WITHOUT calling onCrossSegment, and the new
-// record's xl_prev must point to the last valid record before the gap.
+// advance curr to the boundary and the new record's xl_prev must point to the
+// last valid record before the gap.
+//
+// M0131-S30.6 changed WHO decides: the hook is now called for every crossing
+// (it zero-fills a gap too small to hold a record, so the segment file has no
+// hole) and reports back whether it wrote a real pad RECORD. Only a real pad
+// advances prev. This test therefore pins "hook returns false ⇒ prev does not
+// advance onto the gap" rather than "hook is not called".
 func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
 	t.Parallel()
 	// Use segSize = 2 * XLOGBlockSize (16 KiB) so boundary is small enough
@@ -517,8 +525,10 @@ func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
 	gapStart := boundary - 8
 
 	hookFired := false
-	pos := newInsertPosTracker(gapStart, 0, segSize, func(start, bound, prev uint64) {
+	pos := newInsertPosTracker(gapStart, 0, segSize, func(start, bound, prev uint64) bool {
 		hookFired = true
+		// The composer zero-fills a sub-24-byte gap and reports padded=false.
+		return false
 	})
 	tr := newInsertionTracker()
 
@@ -528,15 +538,17 @@ func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
 	start, prev, total, leading := pos.reserveEmittedAndPublish(32, 0, tr)
 	tr.setInsertingAt(0, lsnIdle)
 
-	if hookFired {
-		t.Fatal("onCrossSegment was called for a sub-24-byte gap")
+	if !hookFired {
+		t.Fatal("onCrossSegment was not called for a sub-24-byte gap — the gap would be left unwritten, leaving a hole in the segment file (M0131-S30.6)")
 	}
 	if start < boundary {
 		t.Fatalf("record should start at boundary (%d) or later, got start=%d", boundary, start)
 	}
-	// prev should point to the record before the gap (= 0 in this test),
-	// NOT to gapStart (the skip means xl_prev skips the gap entirely).
-	_ = prev
+	// prev points to the record before the gap (= 0 in this test), NOT to
+	// gapStart: the zero-filled gap carries no record to link to.
+	if prev != 0 {
+		t.Fatalf("prev=%d, want 0 — xl_prev must skip a gap that holds no record", prev)
+	}
 	_ = total
 	_ = leading
 }

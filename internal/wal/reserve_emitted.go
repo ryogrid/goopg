@@ -142,23 +142,29 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 	if startCandidate+uint64(total) > boundary {
 		gapLen := boundary - startCandidate
 		gapPrev := t.prev
-		if gapLen < xlogMinimumRecordSize {
-			// Gap is too small to fit a valid XLOG_NOOP record (minimum
-			// xlogMinimumRecordSize bytes). Skip the gap silently — those
-			// bytes remain zeroed in the pre-allocated segment file and WAL
-			// recovery treats them as end-of-segment. The xl_prev chain is
-			// preserved by keeping t.prev unchanged so the new record at
-			// boundary links directly to the last valid record before the gap.
-			// PG avoids this case via page-alignment invariants on record sizes;
-			// goopg handles it here as defence-in-depth.
-		} else {
-			// Normal cross-segment slow path: pad the gap [startCandidate, boundary)
-			// via the onCrossSegment hook (matches reserveLocked's semantics),
-			// then re-predict at boundary so the reservation lands with a
-			// boundary-correct header schedule.
-			if t.onCrossSegment != nil {
-				t.onCrossSegment(startCandidate, boundary, gapPrev)
-			}
+		// Cross-segment slow path: hand the gap [startCandidate, boundary) to
+		// the onCrossSegment hook, then re-predict at boundary so the
+		// reservation lands with a boundary-correct header schedule.
+		//
+		// The hook decides whether the gap gets a real XLOG_NOOP PAD RECORD or
+		// is merely ZERO-FILLED: a gap that cannot hold a well-formed record
+		// (fewer than xlogMinimumRecordSize bytes left once the page headers
+		// inside it are accounted for) carries no record, so `prev` must not
+		// advance to it — the record at the boundary links directly to the last
+		// valid record before the gap. Zero-filling rather than skipping is
+		// what PG does: AdvanceXLInsertBuffer zeroes a WAL page before it is
+		// inserted into, so an unusable page tail is written zeros and the
+		// segment file never has a hole (M0131-S30.6; a skipped gap left the
+		// segment file SHORT when Config.Preallocate was off, and replay then
+		// stopped at the short read, losing every record behind it).
+		//
+		// With no hook installed (unit fixtures) the historical assumption
+		// holds: a gap large enough for a record is treated as padded.
+		padded := gapLen >= xlogMinimumRecordSize
+		if t.onCrossSegment != nil {
+			padded = t.onCrossSegment(startCandidate, boundary, gapPrev)
+		}
+		if padded {
 			// NOTE (M0131-S30.1b, deferred): xl_prev names a record's CONTENT
 			// start (see `t.prev = start + leading` below), so when the pad
 			// itself lands on a page boundary this should be

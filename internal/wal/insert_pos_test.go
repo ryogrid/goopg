@@ -60,8 +60,9 @@ func TestInsertPosTrackerCrossSegmentInvokesHook(t *testing.T) {
 	t.Parallel()
 	type callArg struct{ start, boundary, prev uint64 }
 	var calls []callArg
-	tr := newInsertPosTracker(1000, 990, 1024, func(start, boundary, prev uint64) {
+	tr := newInsertPosTracker(1000, 990, 1024, func(start, boundary, prev uint64) bool {
 		calls = append(calls, callArg{start, boundary, prev})
+		return true
 	})
 	start, prev := tr.reserve(50) // 1000 + 50 = 1050, crosses 1024 boundary
 	if len(calls) != 1 {
@@ -85,7 +86,7 @@ func TestInsertPosTrackerCrossSegmentInvokesHook(t *testing.T) {
 func TestInsertPosTrackerReserveAtExactBoundaryNoHook(t *testing.T) {
 	t.Parallel()
 	fired := false
-	tr := newInsertPosTracker(1024-32, 1000, 1024, func(_, _, _ uint64) { fired = true })
+	tr := newInsertPosTracker(1024-32, 1000, 1024, func(_, _, _ uint64) bool { fired = true; return true })
 	start, prev := tr.reserve(32) // 1024-32 .. 1024, last byte = 1023, still seg 0
 	if fired {
 		t.Fatalf("onCross fired on exact-boundary reservation; should not")
@@ -146,8 +147,9 @@ func TestInsertPosTrackerConcurrentReservesFormChain(t *testing.T) {
 		size       = uint64(16)
 		segSize    = uint64(1 << 20)
 	)
-	tr := newInsertPosTracker(0, 0, segSize, func(_, _, _ uint64) {
+	tr := newInsertPosTracker(0, 0, segSize, func(_, _, _ uint64) bool {
 		t.Errorf("onCross fired in single-segment scenario")
+		return true
 	})
 	type pair struct{ start, prev uint64 }
 	results := make([]pair, goroutines*perG)
@@ -232,10 +234,11 @@ func TestInsertPosTrackerConcurrentCrossSegmentHookOncePerBoundary(t *testing.T)
 		hookMu sync.Mutex
 		hooks  []uint64 // boundary values
 	)
-	tr := newInsertPosTracker(startCurr, 0, segSize, func(_, boundary, _ uint64) {
+	tr := newInsertPosTracker(startCurr, 0, segSize, func(_, boundary, _ uint64) bool {
 		hookMu.Lock()
 		hooks = append(hooks, boundary)
 		hookMu.Unlock()
+		return true
 	})
 	type pair struct{ start, prev uint64 }
 	results := make([]pair, goroutines)
@@ -285,8 +288,9 @@ func TestInsertPosTrackerCrossSegmentPrevIsCrossingStart(t *testing.T) {
 	t.Parallel()
 	type hookCall struct{ start, boundary, prev uint64 }
 	var calls []hookCall
-	tr := newInsertPosTracker(0, 0, 100, func(start, boundary, prev uint64) {
+	tr := newInsertPosTracker(0, 0, 100, func(start, boundary, prev uint64) bool {
 		calls = append(calls, hookCall{start, boundary, prev})
+		return true
 	})
 
 	// Three reservations: 40, 40, 40 — third one crosses the
