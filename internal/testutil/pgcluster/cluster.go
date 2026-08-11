@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -254,6 +255,13 @@ func (c *Cluster) Start() error {
 	cmd.Env = env
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// M0131-S28.0: put the postmaster in its own process group so KillHard()
+	// can SIGKILL postmaster *and* every backend/auxiliary process in one
+	// `kill(-pgid)`. Signalling only the postmaster PID leaves the children
+	// running — they keep the port's shared memory and the data directory
+	// busy, which is neither a faithful crash nor a usable starting point for
+	// the reverse cold-start E2E.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return fmt.Errorf("pgcluster: postgres start: %w", err)
@@ -307,7 +315,10 @@ func (c *Cluster) Stop() error {
 		select {
 		case <-done:
 		case <-time.After(20 * time.Second):
-			_ = c.postgresCmd.Process.Kill()
+			// Group-kill, not Process.Kill(): Start() gave the postmaster its
+			// own process group, and a postmaster stuck in PM_RECOVERY leaves
+			// backends behind that would otherwise outlive the test.
+			c.sigkillGroup()
 			<-done
 		}
 		c.postgresCmd = nil
@@ -320,8 +331,13 @@ func (c *Cluster) Stop() error {
 	return nil
 }
 
-// Kill issues `pg_ctl -m immediate stop`, the upstream equivalent of
-// a SIGKILL of the postmaster process group.
+// Kill issues `pg_ctl -m immediate stop`: the postmaster SIGQUITs its
+// children and exits without a shutdown checkpoint, so the next start
+// performs crash recovery.
+//
+// It is NOT a SIGKILL — the postmaster reaches its on_proc_exit hooks and
+// UnlinkLockFiles() removes `postmaster.pid`. Tests that need the directory a
+// power-loss leaves behind must use KillHard() instead.
 func (c *Cluster) Kill() error {
 	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
 		"-D", c.dataDir, "-m", "immediate", "-w", "stop")
@@ -330,6 +346,61 @@ func (c *Cluster) Kill() error {
 	c.started = false
 	if err != nil {
 		return fmt.Errorf("pgcluster: pg_ctl immediate stop: %v\n%s", err, out)
+	}
+	return nil
+}
+
+// KillHard SIGKILLs the whole postmaster process group — a true `kill -9`
+// crash, as opposed to Kill()'s `pg_ctl -m immediate stop`.
+//
+// The distinction matters for crash-interchange tests (M0131-S28). An
+// immediate stop signals SIGQUIT, so the postmaster still runs its
+// on_proc_exit hooks and UnlinkLockFiles() removes `postmaster.pid`
+// (postgres/src/backend/utils/init/miscinit.c:1495) — the directory left
+// behind is *not* what a machine that lost power leaves behind. KillHard
+// leaves `postmaster.pid` and any shared-memory state exactly as a real crash
+// does, which is the starting point the reverse cold-start E2E needs when it
+// hands the directory to goopg.
+//
+// Requires the cluster to have been brought up by Start() (KillHard signals
+// the process group Start() created); it returns an error otherwise. Killing
+// an already-dead group is not an error — the cluster is left marked stopped
+// so a later Start() performs crash recovery.
+func (c *Cluster) KillHard() error {
+	if c.postgresCmd == nil || c.postgresCmd.Process == nil {
+		return errors.New("pgcluster: KillHard requires a cluster started by Start()")
+	}
+	err := c.sigkillGroup()
+	// Reap so the postmaster does not linger as a zombie for the rest of the
+	// test binary's life.
+	_ = c.postgresCmd.Wait()
+	c.postgresCmd = nil
+	if c.logFile != nil {
+		_ = c.logFile.Close()
+		c.logFile = nil
+	}
+	c.started = false
+	return err
+}
+
+// sigkillGroup SIGKILLs the postmaster's process group. ESRCH (the group is
+// already gone) is reported as success — the caller wanted it dead.
+func (c *Cluster) sigkillGroup() error {
+	if c.postgresCmd == nil || c.postgresCmd.Process == nil {
+		return nil
+	}
+	pid := c.postgresCmd.Process.Pid
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		// The process may already be gone; fall back to the bare PID rather
+		// than risk signalling an unrelated group.
+		pgid = pid
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("pgcluster: SIGKILL process group -%d: %w", pgid, err)
 	}
 	return nil
 }

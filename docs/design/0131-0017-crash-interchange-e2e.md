@@ -151,6 +151,34 @@ postmaster still exits through `ExitPostmaster` → `proc_exit`
 `syscall.Kill(-pgid, SIGKILL)` helper alongside it, mirroring `cluster.Kill()`;
 `pgcluster.Start` must `Setpgid` the postmaster for that to be safe.
 
+**S28.0 — LANDED (2026-08-12).** `pgcluster.Start` now sets
+`SysProcAttr{Setpgid: true}` and `pgcluster.KillHard()` group-kills with
+`syscall.Kill(-pgid, SIGKILL)`, reaps, and marks the cluster stopped;
+`Stop()`'s 20 s escape hatch was upgraded from `Process.Kill()` to the same
+group kill so a `PM_RECOVERY` postmaster cannot leave backends behind.
+`Kill()` keeps its `pg_ctl -m immediate` meaning and its doc comment now says
+so. `internal/testutil/pgcluster/kill_hard_test.go` is the paired probe: the
+`killhard` subtest asserts `postmaster.pid` survives, that the pinned backend
+PID (`pg_backend_pid()`) dies with the group, and that PG replays its own WAL
+with all 500 committed rows intact; the `pg_ctl_immediate` subtest asserts the
+lock file is *removed*, so an upstream behaviour change that made `Kill()`
+sufficient would show up as a failure rather than as silently redundant code.
+
+Two facts S28 must build on, both found while landing S28.0:
+
+- After a real SIGKILL the directory carries a stale `postmaster.pid`, and the
+  *restarting* engine has to deal with it. The test removes it before
+  restarting PG. goopg does not need that step — and that is itself the gap:
+  `internal/server/server.go:677` calls `control.WritePIDFile` unconditionally,
+  with no equivalent of upstream's `CreateLockFile` stale-lock check
+  (`miscinit.c`), so goopg silently overwrites a *live* peer's lock file
+  instead of refusing to start. Ledger row filed; S28 asserts goopg starts on
+  the crashed directory and must not be read as blessing that behaviour.
+- `Setpgid` moves the postmaster out of the test binary's process group, so a
+  hard-killed `go test` no longer takes its PG clusters down with it. Teardown
+  (`Stop()`/`t.Cleanup`) is now the only reaper — the same trade-off
+  `internal/testutil/cluster` already makes for goopg servers.
+
 The workload exercises precisely the S21/S22 opcode set. Every element maps to
 one opcode, and the table is the test's specification:
 
