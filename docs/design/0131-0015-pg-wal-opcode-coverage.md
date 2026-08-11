@@ -140,7 +140,7 @@ plus an unknown-opcode error is byte-exact parity, not an approximation.
 
 | opcode | hex | goopg | upstream redo | produced by |
 |---|---|---|---|---|
-| `CLOG_ZEROPAGE` | 0x00 | **X** | `ZeroCLOGPage` + `SimpleLruWritePage` `clog.c:1114-1130` | every 32768 XIDs (8192 B × 4 XIDs/byte) |
+| `CLOG_ZEROPAGE` | 0x00 | H (part 5) | `ZeroCLOGPage` + `SimpleLruWritePage` `clog.c:1114-1130` | every 32768 XIDs (8192 B × 4 XIDs/byte) |
 | `CLOG_TRUNCATE` | 0x10 | H `:2376` (page no-op; the second pass applies it) | `AdvanceOldestClogXid` + `TruncateCLOG` | `VACUUM` freeze-horizon advance |
 
 **Native analog, measured.** `EnablePGSLRUMirror` (`internal/mvcc/clog.go:567-601`)
@@ -671,6 +671,51 @@ the pd_lsn idempotency interlock; the RBM_NORMAL absent-page skip; the
 `XLH_LOCK_ALL_FROZEN_CLEARED` clearing the VM's `ALL_FROZEN` bit through the
 shared `redoClearVMBitsForHeapBlock` call (proving the new dispatch case wires
 it correctly, not just that the shared helper works).
+
+### S21a-2 — implementation notes, part 5: CLOG_ZEROPAGE (landed 2026-08-12)
+
+`CLOG_ZEROPAGE` (0x00, RM_CLOG) is the opcode `WriteZeroPageXlogRec`
+(`clog.c:1073-1078`) writes once per 32768 XIDs, immediately before
+`ExtendCLOG` hands out the first XID of a fresh CLOG page — every long-running
+cluster hits this regularly, not just at checkpoint boundaries. Its main data
+is a bare `int64 pageno`; `clog_redo` (`clog.c:1114-1130`) zeroes the page and
+writes it to the `pg_xact/` segment via `SimpleLruWritePage`.
+
+**Why goopg needs an arm at all, given its own CLOG reads already default
+missing pages to zero.** `clogBufferPool.readPageFromDisk`
+(`clog_bufferpool.go:181-202`) already zero-fills a buffer when the backing
+segment is short or absent — so for goopg's *own* reads, silently dropping
+this record was accidentally harmless. It stops being harmless the moment
+anything outside goopg's lenient fault-in path touches `pg_xact/` directly:
+upstream `SimpleLruReadPage` treats a missing segment as a hard `ERROR`, not a
+zero-fill (`slru.c`), so a real PG standby cold-starting on a goopg-written
+cluster, or any tool that reads the SLRU segments directly (`pg_resetwal`,
+`amcheck`), expects a segment file to physically exist for every XID range
+ever assigned. A crashed real PG's WAL tail that allocated a fresh page during
+the crashed run left that segment simply absent.
+
+**No catalog/txn-manager handle needed, so — unlike `CLOG_TRUNCATE` — this is
+replayed directly in the physical pass, not deferred to `replayCLogFromWAL`'s
+initdb second pass.** `CLOG_TRUNCATE` needs `AdvanceOldestClogXid` and a live
+`*mvcc.CLog`, which does not exist yet at the point physical replay runs
+(`internal/initdb/open.go:380`, well before `mvcc.OpenCLog` at `:1006`).
+`CLOG_ZEROPAGE` needs neither: it is pure page-zeroing at a fixed segment
+offset, computable from `mgr.DataDir()` alone.
+
+**Segment path math is a deliberate small duplication, not a shared call.**
+`wal` cannot import `internal/mvcc` (`mvcc` already imports `wal` for the
+async-commit WAL-flush hook — importing back would cycle), so
+`replayDecodedXLogClogZeroPage` reimplements
+`clogBufferPool.segPathForPage`'s arithmetic (`clogSLRUPagesPerSegment = 32`,
+segment name `"%04X"` of `pageno/32`, byte offset `(pageno%32)*BLCKSZ`) rather
+than reaching into `mvcc`. Same trade discussed for `CLOG_TRUNCATE`
+(`wal_pg_faithful_rmgr_dispatch_preference`).
+
+Guards (`internal/wal/clog_zeropage_pg_test.go`, 2 tests, proven
+fail-when-broken by a scripted revert of the dispatch case): a fresh
+`pageno=3` creates segment `0000`, sized to cover the page, all-zero; a
+`pageno=65` (segment 2, `pageInSeg=1`) creates segment `0002` and does not
+create segment `0000`.
 
 ## Guards
 

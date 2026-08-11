@@ -190,6 +190,11 @@ const (
 	// ClogTruncate.
 	xlogClogTruncate uint8 = 0x10
 
+	// CLOG_ZEROPAGE (clog.h:55), RM_CLOG_ID's other opcode: WriteZeroPageXlogRec
+	// (clog.c:1073-1078) fires once per 32768 XIDs, right before ExtendCLOG
+	// hands out the first XID of a fresh page. M0131-S21a-2 part 5.
+	xlogClogZeroPage uint8 = 0x00
+
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
 	bkpBlockHasData  byte = 0x20

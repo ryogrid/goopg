@@ -2610,6 +2610,27 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// case); the actual CLOG truncation is re-applied by the initdb
 			// clog-recovery scan (replayCLogFromWAL), which decodes the PG body.
 			return false, nil
+		case xlogClogZeroPage:
+			// M0131-S21a-2 part 5: unlike CLOG_TRUNCATE, ZEROPAGE needs no
+			// catalog/txn-manager handle — it is pure page-zeroing at a fixed
+			// segment offset (WriteZeroPageXlogRec, clog.c:1073-1078; fires
+			// once per 32768 XIDs, right before the first commit/abort into a
+			// fresh page), so it is re-applied HERE in the physical pass
+			// rather than deferred to replayCLogFromWAL. goopg's own
+			// clogBufferPool fault-in already treats a missing/short segment
+			// as all-zero (readPageFromDisk, clog_bufferpool.go:181-202), so
+			// this arm is not needed for goopg's own reads — it is needed
+			// because upstream `SimpleLruReadPage` treats a missing segment
+			// as a hard error (slru.c), not a lenient zero-fill: a real PG
+			// standby cold-starting on this cluster, or any tool that reads
+			// pg_xact/ directly (pg_resetwal, amcheck), expects the segment
+			// file for every XID range that was ever assigned to physically
+			// exist. Without this arm, a crashed PG's post-checkpoint tail
+			// that allocated a fresh CLOG page leaves that segment absent.
+			if err := replayDecodedXLogClogZeroPage(mgr, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -5701,6 +5722,50 @@ func applyDbaseDrop(mgr *storage.Manager, dbOID uint32) error {
 	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("wal: dbase-drop replay RemoveAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// clogSLRUPagesPerSegment mirrors mvcc's slruPagesPerSegment (clog.go:549) —
+// PG's SLRU_PAGES_PER_SEGMENT for pg_xact: 32 BLCKSZ pages per 256 KiB segment
+// file, named "%04X" of pageno/32. wal cannot import internal/mvcc (mvcc
+// imports wal for the async-commit WAL-flush hook — an import cycle), so the
+// constant and the segment-path arithmetic below are a deliberate small
+// duplication of clogBufferPool.segPathForPage, not a shared helper.
+const clogSLRUPagesPerSegment = 32
+
+// replayDecodedXLogClogZeroPage re-applies a PG CLOG_ZEROPAGE record: it
+// writes a zero-filled BLCKSZ page into the pg_xact/ segment file at pageno's
+// offset, creating the segment (and any zero gap up to the offset) if it does
+// not yet exist. This runs in the physical replay pass, BEFORE internal/initdb
+// opens the live *mvcc.CLog, so it talks to the segment file directly rather
+// than through clogBufferPool — see the case comment at the call site for why
+// this differs from CLOG_TRUNCATE's initdb-second-pass treatment.
+func replayDecodedXLogClogZeroPage(mgr *storage.Manager, xlog *XLogDecodedRecord) error {
+	pageno, err := DecodeXLogClogZeroPage(xlog.MainData)
+	if err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay decode: %w", err)
+	}
+	segNo := pageno / clogSLRUPagesPerSegment
+	pageInSeg := pageno % clogSLRUPagesPerSegment
+	segDir := filepath.Join(mgr.DataDir(), "pg_xact")
+	segPath := filepath.Join(segDir, fmt.Sprintf("%04X", segNo))
+	off := pageInSeg * int64(storage.BlockSize)
+
+	if err := os.MkdirAll(segDir, 0o700); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay mkdir %q: %w", segDir, err)
+	}
+	f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay open %q: %w", segPath, err)
+	}
+	defer f.Close()
+	zero := make([]byte, storage.BlockSize)
+	if _, err := f.WriteAt(zero, off); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay write %q@%d: %w", segPath, off, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay sync %q: %w", segPath, err)
 	}
 	return nil
 }

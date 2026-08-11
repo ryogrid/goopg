@@ -1303,3 +1303,18 @@ func DecodeXLogClogTruncate(mainData []byte) (pageno int64, oldestXact storage.T
 	oldestXactDb = binary.LittleEndian.Uint32(mainData[12:16])
 	return
 }
+
+// DecodeXLogClogZeroPage parses a PG xl_clog_zeropage main-data body: a bare
+// int64 pageno (WriteZeroPageXlogRec, clog.c:1073-1078 — `XLogRegisterData(&pageno,
+// sizeof(pageno))`). Unlike CLOG_TRUNCATE, ZEROPAGE needs no catalog handle to
+// re-apply (it is pure page-zeroing on a fixed segment path), so it is decoded
+// and replayed directly in the physical pass — see
+// replayDecodedXLogClogZeroPage (recovery.go).
+func DecodeXLogClogZeroPage(mainData []byte) (pageno int64, err error) {
+	if len(mainData) < 8 {
+		err = fmt.Errorf("wal: xl_clog_zeropage main-data len %d (want 8)", len(mainData))
+		return
+	}
+	pageno = int64(binary.LittleEndian.Uint64(mainData[0:8]))
+	return
+}
