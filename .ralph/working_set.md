@@ -1,60 +1,63 @@
 (idle — nothing in flight)
 
-M0131-S21a-2 PART 5 LANDED (loop #160) — `CLOG_ZEROPAGE` (RM_CLOG, 0x00).
-Commit pending push to `make-db-cluster-compat`.
+M0131-S21a-2 PART 6 LANDED (loop #161) — `SMGR_TRUNCATE` (RM_SMGR, 0x20).
+Committed + pushed to `make-db-cluster-compat` (1bc53c79).
 
-Files: `internal/wal/{pg_xlog_decode.go,pg_assembled_emit.go,recovery.go}`,
-new `internal/wal/clog_zeropage_pg_test.go`, design
-`docs/design/0131-0015-pg-wal-opcode-coverage.md` §"S21a-2 … part 5"
+Files: `internal/wal/{pg_xlog_decode.go,recovery.go}`,
+new `internal/wal/smgr_truncate_pg_test.go`, `internal/storage/smgr.go`,
+design `docs/design/0131-0015-pg-wal-opcode-coverage.md` §"S21a-2 … part 6"
 (+ opcode-matrix row + `docs/design/README.md` index line +
 `.ralph/fix_plan.md` S21 note update).
 
-Key symbols: `replayDecodedXLogClogZeroPage`, `DecodeXLogClogZeroPage`,
-`clogSLRUPagesPerSegment` (duplicated from `mvcc.slruPagesPerSegment` —
-`wal` cannot import `internal/mvcc`, reverse import already exists for the
-WAL-flush hook).
+Key symbols: `decodeXLogSmgrTruncate`, `applySmgrTruncate`,
+`storage.Manager.TruncateRelationTo` / `relFile.truncateTo` (new partial-
+truncate primitive; existing `TruncateRelation`/`truncateToZero` only ever
+went to 0 blocks).
 
 What landed:
-- `WriteZeroPageXlogRec`'s opcode, fired once per 32768 XIDs right before
-  the first commit/abort into a fresh CLOG page. Unlike `CLOG_TRUNCATE` it
-  needs no `*mvcc.CLog`/catalog handle, so it replays directly in the
-  PHYSICAL pass (`initdb/open.go:380`, well before `mvcc.OpenCLog` at
-  `:1006`) rather than deferring to `replayCLogFromWAL`'s initdb second
-  pass.
-- Writes a zero-filled BLCKSZ page into `pg_xact/<%04X of pageno/32>` at
-  offset `(pageno%32)*BLCKSZ`, creating the segment (+ MkdirAll the dir,
-  defensive) if absent.
-- Why an arm is needed even though goopg's own `clogBufferPool` fault-in
-  already zero-fills a missing/short segment (so dropping the record was
-  ACCIDENTALLY harmless for goopg's own reads): upstream
-  `SimpleLruReadPage` hard-errors on a missing segment — a real PG standby
-  cold-starting on this cluster, or `pg_resetwal`/`amcheck` reading
-  `pg_xact/` directly, expects the segment to physically exist.
-- 2 guards (`internal/wal/clog_zeropage_pg_test.go`): low-segment pageno
-  creates+zero-fills segment 0000; high-segment pageno (65) creates 0002
-  without touching 0000. Both proven fail-when-broken by a scripted revert
-  of the dispatch case (commented out the case body, confirmed both tests
-  fail with "segment file not created", restored, confirmed pass).
+- goopg's native `RecordKindSmgrTruncate`/`replaySmgrTruncate` always drops
+  a relfile to 0 blocks and its decoder carries only `{dbOid,relOid,fork}`
+  — no `blkno`, no fork bitmask. A real PG VACUUM tail truncation is
+  genuinely partial (main fork to a non-zero surviving prefix) plus an
+  independent vm/fsm-fork zero-out, which those primitives can't express.
+- `decodeXLogSmgrTruncate` parses `xl_smgr_truncate` (BlockNumber blkno +
+  RelFileLocator + int flags, 20 bytes), reusing `decodeXLogSmgrCreate`'s
+  default/global tablespace-OID → TblOid=0 remap.
+- `applySmgrTruncate` mirrors `smgr_redo`'s exact order: `applySmgrCreate`s
+  the main fork first (upstream "prefer to recreate the rel … until the
+  drop is seen"), then truncates main to `blkno` under
+  `SMGR_TRUNCATE_HEAP`, vm to 0 under `_VM`, fsm to 0 under `_FSM`, each
+  flag independently gated.
+- Deliberate deviation, no ledger row: upstream's pre-truncate
+  `XLogFlush(lsn)` is a live-server torn-truncate durability guard;
+  goopg's single-threaded startup replay pass has no counterpart need.
+- 4 guards (`internal/wal/smgr_truncate_pg_test.go`): partial main-fork
+  truncate (10→3 blocks, idempotent replay); VM-only flag leaves
+  main/fsm untouched; a truncate naming a relation with no on-disk main
+  fork recreates then truncates it (matches upstream's create-then-drop,
+  net 0 blocks when blkno=0); tablespace-OID remap round-trip. ALL proven
+  fail-when-broken by a scripted revert of the dispatch case (commented
+  out, confirmed all 3 dispatch-dependent tests fail with "unsupported
+  xlog record rmid=2 info=0x20", restored, confirmed pass).
 
 Gates: `internal/wal` PASS + `-race` PASS, `internal/storage` PASS, UNITS
-precommit PASS (`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`).
-Pgbench smoke runs via the commit hook (not yet committed as of this write —
-commit happens right after this file).
+precommit PASS (`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`),
+pgbench smoke PASS via the commit hook (SCOPE=smoke on commit).
+`make ralph-state-guard` PASS (self-repaired a stale progress.json marker
+from the prior loop's clean exit, as usual).
 
 Nightly triage: `ci/logs/action-items.md` still on run `20260812-005501`
-(same as last loop — no new nightly run landed this loop); all 4 `## AI-`
-items already filed under M-NIGHTLY per prior loop's confirmation, nothing
-new to file.
+(unchanged from loop #160 — no new nightly run landed); all 4 `## AI-`
+items already filed under M-NIGHTLY, nothing new to file this loop.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): **S21a-2 part 6** —
-`SMGR_TRUNCATE` 0x20 (native `replaySmgrTruncate` exists at
-`recovery.go:~5732` but truncates to ZERO blocks / decoder carries no
-`blkno`+fork-bitmask — PG's `xl_smgr_truncate` needs both a new PG decoder
-and a partial-length truncate primitive in `storage.Manager`; see design
-doc §"RM_SMGR" for the exact gap), then `HEAP2_REWRITE`'s loud refusal
-(0x00 RM_HEAP2, out-of-scope VACUUM-FULL-with-logical-slot — needs an
-`ErrUnsupportedRecord`-style message, not real redo). Then S21b (btree,
-~6 opcodes, gated on S16 which is already done). Each landing shrinks
-S28's self-arming skip further.
+Next loop (banner = M-NIGHTLY filing, then M0131): **`HEAP2_REWRITE`'s
+loud refusal** (0x00 RM_HEAP2, out-of-scope VACUUM-FULL/CLUSTER-with-a-
+logical-slot — needs an `ErrUnsupportedRecord`-style message naming the
+feature, not real redo; goopg has no `pg_logical/mappings` consumer).
+That closes S21a-2 entirely. Then **S21b** (btree, ~6 opcodes —
+INSERT_UPPER 0x10, INSERT_META 0x20, INSERT_POST 0x50, DEDUP 0x60,
+DELETE 0x70, META_CLEANUP 0xE0; REUSE_PAGE 0xD0 needs no redo, already
+recognised in S21a-1), gated on S16 which is already done. Each landing
+shrinks S28's self-arming skip further.
 
 In-flight: none.
