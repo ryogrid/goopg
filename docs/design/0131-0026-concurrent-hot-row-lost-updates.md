@@ -171,13 +171,107 @@ So theresidual is now ~0.25 % on the single hottest 5-row table under a
 4-table `BEGIN`/`COMMIT` workload, tracked as **M0131-S32.3**; the isolated
 single-table repro is exact.
 
-## 8. Files
+## 8. M0131-S32.3 — the stale-snapshot commit window (fixed 2026-08-12, loop #147)
 
-- `internal/executor/operators_storage.go` — `epqChainPendingWriter`, the
-  pending-writer wait in both EPQ loops, the `TM_SelfModified` guard in both.
+### The residual was never 0.25 % — it was ~1 update
+
+The S32.2 hand-off described the remainder as "0.25 % of `pgbench_branches`"
+(`sum(bbalance)` −966 698 vs `sum(delta)` −969 135). That framing was an
+artefact of pgbench's random `:delta`: with `delta` uniform on ±5000, `sum(delta)`
+is itself a random walk of standard deviation ≈ 592 000 over 42 000
+transactions, so a *single* mis-applied update moves the difference by up to
+5000. The 2437 gap is **one update**, not 0.25 % of them.
+
+Re-running with the delta pinned to `1` makes the residual countable, and the
+measurement is unambiguous — a branches-only pgbench script (16 clients, 30 s,
+5 hot rows, no other table involved):
+
+```
+number of transactions actually processed: 42487
+bbal=42481  hist=42487        <- 6 increments lost
+S321: ... epq_chain_notfound=6 ...
+```
+
+Six losses, and the write-phase `epq_chain_notfound` counter reads exactly six.
+That also retires the S32.2 hypothesis: the multi-statement 4-table transaction
+is **not** required — one hot `UPDATE` plus one `INSERT` reproduces it. The
+harness extension written to test that hypothesis (`MULTI=1` in
+`analysis/concurrent-hotrow.sh`, TPC-B statement order with a wide table, a
+read-back `SELECT` and a history `INSERT`) passes exactly at 3200/3200, which is
+what ruled the transaction shape out.
+
+### Root cause E — the chain-follow decides "latest version" by snapshot
+
+Both chain-follow helpers locate the newest version through **snapshot
+visibility**: `epqFollowHOT` hands `ctx.Snap` to `followHOTChain`, and
+`epqFollowChainFull` calls `mvcc.TupleVisible` at the tail. The EPQ loop
+refreshes `ctx.Snap` and then walks the chain — and if the winning writer commits
+in the window *between* the refresh and the walk, its version is live on the page
+but outside our snapshot. Chain-follow reports not-found;
+`epqChainPendingWriter` (S32.1) correctly reports nobody in flight, because that
+writer has already committed and is therefore neither in-flight nor aborted; so
+the caller falls through to the silent skip and this statement's write is
+dropped while it still reports `UPDATE 1`. It is the same silent-skip family as
+defects A and C, one commit-window later.
+
+Upstream has no such window because EvalPlanQual never uses a snapshot to find
+the latest version at all. `heap_lock_tuple` follows `t_ctid` until it reaches a
+version whose `xmax` is invalid or aborted, whatever its `xmin` commit time
+(`postgres/src/backend/access/heap/heapam.c`, and `EvalPlanQualFetch` in
+`executor/execMain.c`); only the *qual* is re-evaluated, and that against the
+original snapshot.
+
+**Fix.** A third classifier, `epqChainTailLiveButUnseen`, partitions the
+remaining not-found cases against `epqChainPendingWriter`: it walks to the chain
+tail and returns true only when the tail's `xmin` has **committed**, its `xmax`
+is not a committed delete, and `mvcc.TupleVisible` still says no. The three EPQ
+sites (index-arm write phase, seq-arm write phase, seq-arm scan phase) then
+refresh the snapshot and take another lap instead of skipping. The predicate is
+deliberately narrow so the retry cannot livelock: it is false as soon as the
+version *is* visible, so the very next lap terminates; false for a genuinely
+deleted row; and false for an in-flight or aborted writer, which remain
+`epqChainPendingWriter`'s and the existing skip's cases respectively.
+
+### Result
+
+The branches-only probe with `delta = 1` is now exact (42 600 = 42 600,
+`epq_chain_notfound = 0`), and the full gate passes for the first time since the
+tellers/branches arm was added:
+
+```
+RUNS=1 LOADSEC=30 analysis/atomicity-nocrash-control.sh
+  [LIVE]    sum(abalance)=133157 sum(tbalance)=133157 sum(bbalance)=133157
+            sum(history.delta)=133157  history_rows=39907 = pgbench processed
+  [RESTART] identical
+  OVERALL: PASS
+```
+
+| table | S32.1 | S32.2 | S32.3 |
+|---|---|---|---|
+| `pgbench_accounts` | exact | exact | exact |
+| `pgbench_tellers` | exact | exact | exact |
+| `pgbench_branches` | −21 % | −1 update | **exact** |
+
+Regression guard: `TestEPQChainTailLiveButUnseen`
+(`internal/executor/epq_stale_snapshot_test.go`) pins both directions of the
+classifier at the page level — the retry case and, more importantly, the three
+false cases that keep the retry terminating.
+
+## 9. Files
+
+- `internal/executor/operators_storage.go` — `epqChainPendingWriter`,
+  `epqChainTailLiveButUnseen`, `epqRefreshSnapForRetry`, the pending-writer wait
+  and the stale-snapshot re-lap in all three EPQ sites, the `TM_SelfModified`
+  guard in both write-phase loops.
+- `internal/executor/epq_stale_snapshot_test.go` — `TestEPQChainTailLiveButUnseen`,
+  the S32.3 regression guard (both directions of the classifier).
 - `internal/executor/s321_probe.go` — env-gated diagnostic counters
   (`GOOPG_S321_PROBE=1`) and the `GOOPG_S321_NOWAIT=1` / `GOOPG_S322_NOWAIT=1`
   A/B kill switches (write-phase and scan-phase wait respectively — the split is
-  what attributed the fork to defect D rather than to defect C). Temporary;
-  remove with M0131-S32.3.
-- `analysis/concurrent-hotrow.sh` — the deterministic minimal repro / gate.
+  what attributed the fork to defect D rather than to defect C). Now that S32 is
+  closed these are diagnostic-only; retire them once the arithmetic gate has run
+  green across several nightlies (deferral ledger).
+- `analysis/concurrent-hotrow.sh` — the deterministic minimal repro / gate;
+  `MULTI=1` adds the TPC-B-shaped multi-table transaction.
+- `analysis/atomicity-nocrash-control.sh` — the pgbench arithmetic gate, green
+  since S32.3.

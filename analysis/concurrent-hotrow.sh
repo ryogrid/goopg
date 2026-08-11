@@ -33,6 +33,19 @@ ROWS=${ROWS:-5}
 CLIENTS=${CLIENTS:-8}
 N=${N:-200}
 TXN=${TXN:-0}          # 1 = wrap each UPDATE in BEGIN/COMMIT (pgbench-like)
+# MULTI=1 (S32.3) closes the last structural gap to the pgbench harness: the hot
+# UPDATE stops being the ONLY statement in its transaction.  TPC-B updates a
+# WIDE table (accounts, 500k rows — never contended), reads it back, updates the
+# hot narrow table, then INSERTs a history row, all inside one BEGIN/COMMIT.  So
+# by the time the hot UPDATE runs, the transaction already owns an XID, has
+# written tuples, and is several command-ids in — none of which the single
+# statement repro exercises.  MULTI implies TXN.  The invariant becomes
+#     sum(t.v) == count(h)   (one history row per committed hot increment)
+# which is exactly what atomicity-nocrash-control.sh checks as
+# sum(bbalance) == sum(history.delta).
+MULTI=${MULTI:-0}
+[ "$MULTI" = "1" ] && TXN=1
+WIDE=${WIDE:-2000}     # rows in the uncontended wide table (accounts analogue)
 W=${W:-/tmp/hotrow32}
 
 q() { psql -h 127.0.0.1 -p $PORT -U postgres -d postgres -Atc "$1" 2>&1; }
@@ -61,14 +74,27 @@ else
     q "create table t(id int primary key, v bigint not null default 0)" >/dev/null
 fi
 for r in $(seq 1 $ROWS); do q "insert into t values ($r, 0)" >/dev/null; done
-echo "table t: $ROWS rows, clients=$CLIENTS updates/client=$N txn=$TXN"
+if [ "$MULTI" = "1" ]; then
+    q "create table w(id int primary key, v bigint not null default 0)" >/dev/null
+    q "insert into w select g, 0 from generate_series(1,$WIDE) g" >/dev/null
+    q "create table h(hid bigserial, id int, ts timestamp)" >/dev/null
+fi
+echo "table t: $ROWS rows, clients=$CLIENTS updates/client=$N txn=$TXN multi=$MULTI"
 
 # Each client k hammers row (k mod ROWS)+1 so the collision pattern is fixed.
 for c in $(seq 1 $CLIENTS); do
     id=$(( (c - 1) % ROWS + 1 ))
     : >$W/c$c.sql
     for i in $(seq 1 $N); do
-        if [ "$TXN" = "1" ]; then
+        if [ "$MULTI" = "1" ]; then
+            # TPC-B statement order, verbatim in shape: wide UPDATE, read-back
+            # SELECT, hot UPDATE, history INSERT.  The wide row id is derived
+            # from the client and iteration so no two clients collide there —
+            # only `t` is contended, as in pgbench.
+            wid=$(( (c * 7919 + i * 31) % WIDE + 1 ))
+            printf 'BEGIN;\nUPDATE w SET v = v + 1 WHERE id = %d;\nSELECT v FROM w WHERE id = %d;\nUPDATE t SET v = v + 1 WHERE id = %d;\nINSERT INTO h(id, ts) VALUES (%d, now());\nCOMMIT;\n' \
+                $wid $wid $id $id >>$W/c$c.sql
+        elif [ "$TXN" = "1" ]; then
             printf 'BEGIN;\nUPDATE t SET v = v + 1 WHERE id = %d;\nCOMMIT;\n' $id >>$W/c$c.sql
         else
             printf 'UPDATE t SET v = v + 1 WHERE id = %d;\n' $id >>$W/c$c.sql
@@ -86,6 +112,17 @@ for p in $PIDS; do wait $p; done
 echo "clients done; errors: $(cat $W/c*.log | grep -c ERROR)"
 
 WANT=$((CLIENTS * N))
+if [ "$MULTI" = "1" ]; then
+    # An error anywhere in the transaction rolls back BOTH the hot UPDATE and
+    # its history row, so the committed-work invariant is sum(t.v)==count(h),
+    # mirroring sum(bbalance)==sum(history.delta).  CLIENTS*N is still printed
+    # so a run that lost whole transactions to errors is distinguishable from
+    # one that lost only the hot UPDATE.
+    HN=$(q "select count(*) from h")
+    WBAL=$(q "select coalesce(sum(v),0) from w")
+    echo "history_rows=$HN (issued $WANT)  sum(w.v)=$WBAL"
+    WANT=$HN
+fi
 GOT=$(q "select coalesce(sum(v),0) from t")
 CNT=$(q "select count(*) from t")
 IDXCNT=$(q "select count(*) from t where id between 1 and $ROWS")
@@ -102,6 +139,11 @@ fi
 bad=0
 [ "$CNT" = "$ROWS" ] || { echo "FAIL: count(*)=$CNT want $ROWS"; bad=1; }
 [ "$IDXCNT" = "$ROWS" ] || { echo "FAIL: index-driven count=$IDXCNT want $ROWS"; bad=1; }
+if [ "$MULTI" = "1" ]; then
+    # The wide table is the accounts analogue: uncontended, so it must be exact.
+    # If it diverges too, the defect is not contention-specific.
+    [ "$WBAL" = "$HN" ] || { echo "FAIL: sum(w.v)=$WBAL != history_rows=$HN (UNCONTENDED table diverged)"; bad=1; }
+fi
 if [ "$GOT" = "$WANT" ]; then
     echo "OVERALL: PASS"
 else

@@ -794,6 +794,91 @@ func epqChainPendingWriter(ctx *Context, rel storage.RelFileNode, blk storage.Bl
 	return 0, false
 }
 
+// epqChainTailLiveButUnseen reports whether the t_ctid chain from (blk, slot)
+// ends at a version that is LIVE (xmin committed, not deleted) but which our
+// current snapshot cannot see yet.
+//
+// Why this exists (M0131-S32.3). Both chain-follow helpers decide which version
+// is "the latest" by SNAPSHOT visibility — epqFollowHOT passes ctx.Snap to
+// followHOTChain, and epqFollowChainFull calls mvcc.TupleVisible at the tail.
+// That is wrong for an EvalPlanQual re-fetch. The EPQ loop refreshes ctx.Snap,
+// then walks the chain; if the winning writer commits in the window BETWEEN the
+// refresh and the walk, its version is live on the page but outside our
+// snapshot, so both helpers report not-found. epqChainPendingWriter then reports
+// "not pending" (the writer has committed, so it is neither in-flight nor
+// aborted), and the caller takes the silent skip — the statement's write is
+// DROPPED while it still reports `UPDATE 1`. Measured at 6 lost increments in
+// 42487 pgbench transactions on 5 hot rows, matching epq_chain_notfound exactly.
+//
+// Upstream has no such window because EvalPlanQual does not use a snapshot to
+// find the latest version at all: heap_lock_tuple follows t_ctid until it
+// reaches a version whose xmax is invalid or aborted, whatever its xmin commit
+// time (postgres/src/backend/access/heap/heapam.c heap_lock_tuple, and
+// EvalPlanQualFetch in executor/execMain.c). Only the *qual* is re-evaluated
+// against the original snapshot.
+//
+// Returning true tells the caller to refresh its snapshot and take another EPQ
+// lap rather than skip. The predicate is deliberately narrow so it cannot
+// livelock: it is false once the version IS visible (the next lap makes it so),
+// false for a genuinely deleted row, and false for an aborted/in-flight writer
+// (epqChainPendingWriter owns that case).
+func epqChainTailLiveButUnseen(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16) bool {
+	curBlk, curSlot := blk, slot
+	for i := 0; i < maxCTIDChainWalk; i++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if err != nil {
+			return false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			return false
+		}
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			return false
+		}
+		if !isChainTailCTID(tup.Header.CTID, curBlk, curSlot) {
+			curBlk, curSlot = tup.Header.CTID.Block, tup.Header.CTID.Offset
+			continue
+		}
+		xmin := tup.Header.Xmin
+		if xmin == storage.InvalidTransactionID || xmin == ctx.Tx.XID {
+			return false
+		}
+		// Only a COMMITTED creator qualifies: in-flight is epqChainPendingWriter's
+		// case (wait for it), aborted means there is nothing live here.
+		if aborted, committed := epqXmaxSettled(ctx, xmin); aborted || !committed {
+			return false
+		}
+		// A committed xmax on a chain-tail version is a real DELETE (an UPDATE
+		// would have stamped t_ctid at the successor, so this would not be the
+		// tail) — skipping the row is then correct.
+		if xmax := tup.Header.Xmax; xmax != storage.InvalidTransactionID && xmax != ctx.Tx.XID {
+			if aborted, committed := epqXmaxSettled(ctx, xmax); committed && !aborted {
+				return false
+			}
+		}
+		return !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+			ctx.comboStore(), ctx.MultiXact)
+	}
+	return false
+}
+
+// epqRefreshSnapForRetry refreshes ctx.Snap under READ COMMITTED so the next
+// EvalPlanQual lap sees everything committed since the last refresh. A no-op at
+// RR/Serializable, where the snapshot is frozen for the whole transaction.
+func epqRefreshSnapForRetry(ctx *Context) {
+	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted || ctx.TxnMgr == nil {
+		return
+	}
+	if newSnap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx); err == nil {
+		ctx.Snap = newSnap
+	}
+}
+
 // stampOldCtid updates the t_ctid field of the tuple at (rel, blk, slot)
 // to point at newPtr. Called after a non-HOT cross-page UPDATE writes the
 // new tuple version, so that EPQ chain followers (epqFollowChain) can
@@ -4575,6 +4660,17 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							}
 							continue
 						}
+						// M0131-S32.3: same silent drop, one commit-window later.
+						// The tail is LIVE but its writer committed after our
+						// last snapshot refresh, so the snapshot-driven
+						// chain-follow reports not-found while nobody is in
+						// flight for epqChainPendingWriter to wait on.
+						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, rel, pu.blk, pu.slot) {
+							s321Note(s321EPQChainStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
+							continue
+						}
 						s321Note(s321EPQChainNotFound)
 						epqSkip = true
 						break
@@ -5123,6 +5219,18 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							}
 							continue
 						}
+						// M0131-S32.3: the chain tail may be a LIVE version whose
+						// writer committed after our last snapshot refresh. Both
+						// chain-follow helpers pick "the latest version" by
+						// snapshot visibility, so such a tail reads as not-found
+						// while epqChainPendingWriter (correctly) reports nobody
+						// in flight — and the row is dropped. Refresh and re-lap.
+						if !s322NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, captureRel, writeBlk, writeSlot) {
+							s321Note(s321ScanEPQStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
+							continue
+						}
 						s321Note(s321ScanEPQNotFound)
 						o.ctx.Snap = scanSnap
 						return nil // row genuinely deleted by concurrent tx
@@ -5401,6 +5509,15 @@ func (o *updateOp) Next() (TupleSlot, error) {
 									o.ctx.Snap = newSnap
 								}
 							}
+							continue
+						}
+						// M0131-S32.3: see the index-arm site above — a tail that
+						// is live but committed after our last snapshot refresh
+						// must be re-lapped, not skipped.
+						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, puRel, pu.blk, pu.slot) {
+							s321Note(s321EPQChainStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
 							continue
 						}
 						s321Note(s321EPQChainNotFound)

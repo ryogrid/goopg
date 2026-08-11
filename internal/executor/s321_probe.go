@@ -48,6 +48,8 @@ const (
 	s321EPQChainPendingWait                 // EPQ: chain tip owned by an in-flight writer -> wait + retry
 	s321ScanEPQNotFound                     // S32.2: scan-phase EPQ gave up on the chain -> row SKIPPED
 	s321ScanEPQPendingWait                  // S32.2: scan-phase chain tip in flight -> wait + retry
+	s321EPQChainStaleSnap                   // S32.3: write-phase tail live but outside our snapshot -> refresh + retry
+	s321ScanEPQStaleSnap                    // S32.3: scan-phase tail live but outside our snapshot -> refresh + retry
 	s321NumSites
 )
 
@@ -56,6 +58,7 @@ var s321Names = [s321NumSites]string{
 	"epq_chain_notfound", "epq_oldget_fail", "epq_chain_followed", "epq_wrote",
 	"scan_no_row", "scan_dedup", "epq_self_modified", "epq_chain_pending_wait",
 	"scan_epq_notfound", "scan_epq_pending_wait",
+	"epq_chain_stale_snap", "scan_epq_stale_snap",
 }
 
 var s321Events atomic.Int64

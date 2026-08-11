@@ -30,14 +30,15 @@
 # waited for, and the wait is verified by parsing pgbench's completion line
 # before any query runs.  A partially-loaded table must never be measurable.
 #
-# CURRENT EXPECTED RESULT (2026-08-12, after the M0131-S32 chain-walk fix):
-# the accounts/history arm PASSES, and the tellers/branches arm added on
-# 2026-08-12 FAILS — under 16 clients the two narrow tables both diverge from
-# sum(delta), in BOTH directions (one under-applied, one ~10x over-applied).
-# That is the still-open concurrent half of S32, filed as M0131-S32.1; the
-# single-client half is fixed and guarded by analysis/hotstall.sh and
-# TestHOTUpdateChainBeyond64Versions. So `OVERALL: FAIL` here is the KNOWN
-# state, not a fresh regression — read the per-table lines, not just the verdict.
+# CURRENT EXPECTED RESULT (2026-08-12, after M0131-S32.3): `OVERALL: PASS`.
+# All three tables — accounts (500k rows), tellers (50) and branches (5) — must
+# equal sum(history.delta) exactly, at LIVE and again after RESTART. This became
+# green only with S32.3; the S32/S32.1/S32.2 fixes each closed one silent-skip
+# path in the EvalPlanQual loops (docs/design/0131-0026). A FAILURE here is now a
+# real regression, not the known state. Read the per-table lines: `branches` is
+# the most contended and fails first, and note that pgbench's random :delta makes
+# a ONE-update loss look like a ~2000-unit divergence — count losses with a
+# delta-pinned script before believing a percentage.
 #
 # Usage: RUNS=2 bash analysis/atomicity-nocrash-control.sh
 set -u
