@@ -1176,10 +1176,22 @@ func EncodeClogTruncatePG(oldestXid storage.TransactionID, oldestXactDb uint32) 
 // decoded replay path (a recognised no-op; checkpoint consumers are the
 // header-driven isCheckpointRecord/replayStart, not replay).
 func EncodeCheckpointPG(shutdown bool, redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) ([]byte, error) {
-	if nextXid < 3 {
-		nextXid = 3
-	}
-	mainData := encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, oldestActiveXid)
+	return EncodeCheckpointPGFields(shutdown, CheckPointFields{
+		RedoLSN0:        redoLSN0,
+		ThisTLI:         tli,
+		NextXid:         nextXid,
+		NextOid:         nextOid,
+		OldestActiveXid: oldestActiveXid,
+	})
+}
+
+// EncodeCheckpointPGFields is EncodeCheckpointPG over the full
+// CheckPointFields set (M0131-S18.4). The runtime checkpointer uses this
+// form so the live timeline, full_page_writes and multixact counters
+// reach the record; EncodeCheckpointPG stays as the narrow constructor
+// for callers that only know the four historical values.
+func EncodeCheckpointPGFields(shutdown bool, f CheckPointFields) ([]byte, error) {
+	mainData := encodeCheckPointStruct(f)
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
 		return nil, err

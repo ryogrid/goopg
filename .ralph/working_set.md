@@ -1,41 +1,44 @@
 (idle — nothing in flight)
 
-Loop #125 landed **M0131-S18.1 + S18.2**; S18 stays UNCHECKED because S18.3
-(live TLI) + S18.4 (`encodeCheckPointStruct` constants) remain.
+Loop #126 landed **M0131-S18.3 + S18.4**; **S18 is now checked off — complete**.
 
 Carry-forward:
 
-- **Next pick is the rest of S18 (S18.3 + S18.4, ~1 loop)** — the fix_plan line
-  now carries both, and S18.4 gained a fifth item: `encodeCheckPointStruct`
-  (`internal/wal/recovery.go:783-794`) never writes payload offsets 12
-  (`PrevTimeLineID`) or 16 (`fullPageWrites`) AT ALL, so every goopg checkpoint
-  record carries `PrevTimeLineID = 0`. Extend
-  `TestPgControlCheckPointCopyMatchesPgControldata` rather than writing a new
-  harness. After that: S19 (RISKY, writer half is the load-bearing one),
-  then S20/S29.
-- **Discovery worth remembering (shaped all the guards):** with pg_control's
-  read-modify-write cycle, a missing *encode* line is INVISIBLE to both an
-  oracle comparison and a byte-for-byte round-trip — the on-disk value is
-  preserved, the field is merely *unsettable*. Only a missing *decode* line is
-  destructive (decodes 0, then encode writes that 0 over live data). Any future
-  pg_control field work needs a **settability** assertion, not just a
-  round-trip.
-- **The doc number is `0131-0014`, not `-0013`** (`-0013` is the WAL-reader
-  doc). The fix_plan pointer was wrong for the second loop running and is now
-  corrected in the S18 line.
-- 2 ledger rows filed: the nine new fields are settable but nothing POPULATES
-  them from live state (a goopg checkpoint still leaves `nextMulti = 1` /
-  `oldestXid = 3` forever — checkpointer work, and multixact durability is the
-  deferred S24), and the `PrevTimeLineID`/`fullPageWrites` payload discovery.
+- **Next pick per the banner is M0131-S19** (RISKY, est ~2 loops — validate
+  `xlp_pageaddr`/`xlp_tli`, stop trusting recycled segments). Its writer half
+  (`scanLastSegmentEnd` / `detectWritePos` in `internal/wal/writer.go`) is the
+  load-bearing one and reproduces unconditionally; the reader half is
+  conditional on the last page ending exactly on a boundary. Land with a
+  crash-restart test, not unit tests alone — it is the most likely slice to
+  break goopg's own restart. After that: S20, then S29.
+- **New reusable seam:** `wal.CheckPointFields` + `EncodeCheckpointPGFields`.
+  Anything that needs to publish live cluster state into a checkpoint now adds
+  a member there and a hook on `CheckpointerConfig`; `runCheckpoint` samples
+  ONCE and both the WAL record and pg_control read that struct, so the two can
+  no longer drift. `withDefaults()` holds the PG-faithful floors.
+- **Discovery:** two long-standing values were wrong, not just unset —
+  `oldestCommitTsXid`/`newestCommitTsXid` were `3` where PG writes `0` with
+  `track_commit_timestamp` off, and `oldestXidDB`/`oldestMultiDB` were `0`
+  where PG's bootstrap writes `Template1DbOid` (1). The reference cluster's
+  `pg_controldata` is the cheapest oracle for this class of question —
+  `pg_controldata -D bench/tpch/runtime/pgdata`.
+- 2 ledger rows filed: `oldestXid`/`oldestMulti` still publish the bootstrap
+  floor (the datfrozenxid horizon lives inside the CLOG-truncation closure and
+  is computed AFTER the marker is durable), and the multixact counter is
+  in-memory-only and never seeded back on restart (S20.4 owns the reader half,
+  S24 the SLRU).
 
-Technique reused (fourth loop running): every guard proven fail-when-broken by
-scripted revert over a /tmp backup — 5 break directions here (drop encode line,
-drop decode line, shift an offset 88→89, restore `os.WriteFile`, and the
-no-`O_CREATE` contract), each caught by a *different* assertion.
+Technique reused (fifth loop running): every guard proven fail-when-broken by
+scripted revert over a /tmp backup — 8 break directions here (drop the
+PrevTimeLineID encode, drop the fullPageWrites byte, restore commitTs=3 +
+oldestXidDB=0, re-hardcode the checkpointer TLI, re-hardcode full_page_writes,
+and the same three against the pg_control writer), each caught by a *different*
+assertion, with the real `pg_controldata` as the independent oracle.
 
-Gates run this loop: `internal/control` PASS, `internal/initdb` PASS (67 s),
-`internal/wal` + `internal/storage` PASS, both cold-start E2Es PASS (27 s),
-UNITS PASS, pgbench smoke via the commit hook, `make ralph-state-guard` OK
-(auto-repaired the previous loop's clean-exit marker).
+Gates run this loop: 4 new guards PASS + each proven failing without the fix,
+`internal/wal` PASS (7 s), `internal/control` PASS, `internal/initdb` PASS
+(68 s), cold-start + standby E2Es PASS (34 s), UNITS PASS, pgbench smoke via
+the commit hook, `make ralph-state-guard` OK (auto-repaired the previous loop's
+clean-exit marker).
 
 In-flight: none.

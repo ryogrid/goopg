@@ -1797,6 +1797,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// A crashed cluster can then recover nextOid from pg_control
 		// without depending on pg_catalog.json.
 		NextOIDFn: cat.NextOID,
+		// M0131-S18.3: the LIVE timeline and full_page_writes setting.
+		// Both used to be hardcoded (TLI 1 / always-on) in the checkpoint
+		// record AND in pg_control, so the first checkpoint after a
+		// promotion rewrote pg_control's checkPointCopy back to timeline 1
+		// while pg_wal held segments named for timeline 2 — a real PG then
+		// PANICs "could not locate a valid checkpoint record". The pool is
+		// the right source for full_page_writes because that is where the
+		// runtime GUC lands (cmd/goopg/main.go, Pool.SetFullPageWrites),
+		// mirroring upstream's Insert->fullPageWrites sample.
+		TimelineIDFn:     walWriter.TimelineID,
+		FullPageWritesFn: pool.FullPageWrites,
 		// M0106-0011 follow-up (b): regenerate pg_internal.init after
 		// each checkpoint so PG standbys can always attach. Uses
 		// WithRelCacheInitLock to prevent TOCTOU races with concurrent

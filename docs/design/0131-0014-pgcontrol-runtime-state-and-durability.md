@@ -1,7 +1,8 @@
 # pg_control runtime state and durability — stamp `DB_IN_PRODUCTION`, make the writer crash-safe, start from pg_control
 
 **Status:** S17 **accepted — landed 2026-08-11**; S18.1 + S18.2 **accepted —
-landed 2026-08-11**; S18.3 / S18.4 / S20 / S29 still draft
+landed 2026-08-11**; S18.3 + S18.4 **accepted — landed 2026-08-11** (S18 now
+complete); S20 / S29 still draft
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S17 + S18 + S20)
 
@@ -85,6 +86,68 @@ asked. S18.3 (live TLI) and S18.4 (`encodeCheckPointStruct`'s constants) remain
 open — and S18.4 gained a fifth constant while reading it: `PrevTimeLineID`
 (payload offset 12) is never written at all, so every goopg checkpoint record
 carries `PrevTimeLineID = 0` where PG writes the current TLI.
+
+## Findings — S18.3 + S18.4 as built (2026-08-11)
+
+Landed as designed, with three deviations worth recording.
+
+1. **The record and pg_control now come from ONE sample, not two.** The design
+   treats S18.3 (pg_control TLI) and S18.4 (record constants) as separate
+   slices, and the code had them in separate places — `EncodeCheckpointPG`'s
+   literal `1` and `cd.CheckPointCopyThisTLI = 1`, forty lines apart in
+   `runCheckpoint`. Implementing them separately would have left two
+   independently-driftable copies of the same state, and PG cross-checks the
+   two at startup. So `runCheckpoint` samples once into a `CheckPointFields`
+   before encoding and the pg_control writer reads that struct rather than
+   re-deriving anything. This is why the new tests assert both halves against
+   the same expected values.
+2. **`CheckPointFields` replaces the positional signature, and defaults are
+   PG's — including two corrections.** `encodeCheckPointStruct` had five
+   positional parameters and eight literals; with the two never-written members
+   added it would have taken fifteen. It now takes one struct with a
+   `withDefaults()` that mirrors upstream's bootstrap floors. Two of those
+   defaults are **not** what goopg used to write, and the change is deliberate:
+   `oldestCommitTsXid`/`newestCommitTsXid` were hardcoded `3`, but PG writes
+   `InvalidTransactionId` (0) while `track_commit_timestamp` is off — the
+   reference cluster's `pg_controldata` confirms `0` — and `oldestXidDB`/
+   `oldestMultiDB` were left `0`, where upstream's bootstrap names
+   `Template1DbOid` (1). Neither had a defender; both are now pinned to the
+   oracle by `TestCheckPointFieldsDefaultsMatchPG`.
+3. **`full_page_writes` is sampled from the buffer pool, not the GUC registry.**
+   Upstream reads `Insert->fullPageWrites` under the WAL insert lock
+   (`xlog.c:7041`), not the `postgresql.conf` text, because a runtime change
+   only takes effect at the next `XLOG_FPW_CHANGE`. goopg's equivalent of that
+   shadow copy is `Pool.fullPageWrites` (where `cmd/goopg/main.go` lands the
+   GUC), so `FullPageWritesFn` is wired to `Pool.FullPageWrites`.
+
+Two smaller notes. `UpdateControlCheckpoint` took the TLI as a new parameter
+rather than reading it internally, so BASE_BACKUP passes the same
+`LoadOrCreateTimelineID` value its `START_TIMELINE` reply carries — the call
+moved *after* the timeline load for that reason; `MinRecoveryPointTLI` moved
+off its own hardcoded `1` at the same time, since a mismatch there is the exact
+`xlogrecovery.c:878-886` FATAL that S29 is filed for. And the multixact hook is
+a **setter** (`SetNextMultiXactFn`), not a `CheckpointerConfig` field like the
+other two, because the process-shared multixact store is created in
+`cmd/goopg/main.go` long after `initdb.Open` has built the checkpointer.
+
+Guards, all proven fail-when-broken by scripted revert over a `/tmp` backup —
+eight break directions, each caught by a different assertion:
+`TestEncodeCheckPointStructSettable`, `TestCheckPointFieldsDefaultsMatchPG`,
+`TestCheckpointerStampsLiveTimelineAndFPW` (`internal/wal/`), and
+`TestCheckpointerWritesLiveTimelineToPgControl` (`internal/initdb/`, which runs
+a real checkpointer against a real `initdb` directory and cross-checks the
+result with the real `pg_controldata`, including the text-valued
+`full_page_writes: off` line no numeric helper covers). The settability
+discipline from the S18.1/S18.2 findings above carried over unchanged and
+earned its keep immediately: dropping the new `PrevTimeLineID` line is
+invisible to any round-trip, and only the seed-then-read-back assertion catches
+it.
+
+**Still deferred after this slice:** `oldestXid` remains the `3` floor rather
+than a real datfrozenxid horizon (goopg computes one for CLOG truncation but it
+is not plumbed here), `oldestMulti` is pinned to `FirstMultiXactId` because
+goopg's multixact store never truncates, and the multixact counter is still
+in-memory-only — S24 owns its durability. Ledgered.
 
 ## Problem
 

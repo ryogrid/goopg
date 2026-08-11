@@ -215,17 +215,21 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	// with the checkpoint REDO location so the resulting backup's
 	// global/pg_control carries a valid checkpoint — PostgreSQL
 	// standbys reject pg_control with a zero redo point.
+	// M0131-S18.3: the timeline is resolved BEFORE the pg_control patch so
+	// the checkPointCopy TLI matches the one the backup's segment names
+	// and the START_TIMELINE reply carry. It used to be hardcoded to 1,
+	// which only happened to be right on a never-promoted cluster.
+	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.InternalError,
+			fmt.Sprintf("BASE_BACKUP: timeline: %v", err))
+	}
 	baseLSN0 := uint64(0)
 	ckptLSN0 := uint64(0)
 	if redoLSN > 0 {
 		baseLSN0 = redoLSN - 1
 		ckptLSN0 = ckptRecLSN - 1
-		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN, ckptRecLSN)
-	}
-	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
-	if err != nil {
-		return s.writeQueryError(w, sqlstate.InternalError,
-			fmt.Sprintf("BASE_BACKUP: timeline: %v", err))
+		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN, ckptRecLSN, startTLI)
 	}
 
 	// --- result-set 1: start LSN + TLI ---

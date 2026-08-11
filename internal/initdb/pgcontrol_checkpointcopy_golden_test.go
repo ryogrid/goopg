@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // pgControldataBin locates the real pg_controldata: PATH first, then the
@@ -204,3 +205,108 @@ func TestPgControlCheckPointCopyMatchesPgControldata(t *testing.T) {
 		t.Errorf("oldestMulti = %d after round-trip, want 55", cd2.CheckPointCopyOldestMulti)
 	}
 }
+
+// TestCheckpointerWritesLiveTimelineToPgControl is the pg_control half of the
+// M0131-S18.3 guard (the WAL-record half lives in
+// internal/wal/checkpoint_fields_pg_test.go). It runs a real Checkpointer
+// against a real initdb'd directory with a promoted (TLI 3) writer and
+// full_page_writes = off, then reads the result back through BOTH goopg's
+// decoder and the real pg_controldata.
+//
+// Why it matters: ThisTimeLineID/PrevTimeLineID/fullPageWrites were literals
+// (1/1/true) in the checkpointer's pg_control update. On a cluster promoted by
+// M0130-S8.5's finalizePromotion, the next checkpoint therefore stomped
+// pg_control back to timeline 1 while pg_wal held segments named for timeline
+// 2, and a real PG booted on it PANICs "could not locate a valid checkpoint
+// record". The record and pg_control are written from ONE sample, so this test
+// also pins that they cannot drift apart.
+func TestCheckpointerWritesLiveTimelineToPgControl(t *testing.T) {
+	bin := pgControldataBin(t)
+	if bin == "" {
+		t.Skip("pg_controldata not found on PATH or in postgres/local_install/bin")
+	}
+	dir := filepath.Join(t.TempDir(), "cluster")
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// Precondition: a fresh cluster is on the bootstrap timeline, so a green
+	// run cannot be "it was already 3".
+	if cd, err := control.ReadControlFile(dir); err != nil {
+		t.Fatalf("ReadControlFile: %v", err)
+	} else if cd.CheckPointCopyThisTLI != 1 {
+		t.Fatalf("fresh cluster ThisTimeLineID = %d, want 1 (test precondition)",
+			cd.CheckPointCopyThisTLI)
+	}
+
+	// A private WAL dir: this test is about what reaches pg_control, and
+	// writing TLI-3 segments into the cluster's own pg_wal would leave a
+	// directory no later assertion could interpret.
+	w, err := wal.NewWriter(wal.Config{
+		WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
+		SegmentSize: 1 << 20,
+		TimelineID:  3,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	cp := wal.NewCheckpointer(nopFlusher{}, w, wal.CheckpointerConfig{
+		DataDir:             dir,
+		SegmentSize:         1 << 20,
+		PGCompatCheckpoints: true,
+		GUCParams:           wal.DefaultGUCParameters(),
+		NextXIDFn:           func() uint64 { return 42 },
+		TimelineIDFn:        w.TimelineID,
+		FullPageWritesFn:    func() bool { return false },
+		NextMultiXactFn:     func() (uint32, uint32, uint32) { return 9, 17, 1 },
+	})
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatalf("CheckpointNow: %v", err)
+	}
+
+	cd, err := control.ReadControlFile(dir)
+	if err != nil {
+		t.Fatalf("ReadControlFile after checkpoint: %v", err)
+	}
+	if cd.CheckPointCopyThisTLI != 3 {
+		t.Errorf("checkPointCopy.ThisTimeLineID = %d, want 3 (the live writer timeline)",
+			cd.CheckPointCopyThisTLI)
+	}
+	if cd.CheckPointCopyPrevTLI != 3 {
+		t.Errorf("checkPointCopy.PrevTimeLineID = %d, want 3", cd.CheckPointCopyPrevTLI)
+	}
+	if cd.CheckPointCopyFullPageWrites {
+		t.Error("checkPointCopy.fullPageWrites = true, want false (full_page_writes = off)")
+	}
+	if cd.CheckPointCopyNextMulti != 9 {
+		t.Errorf("checkPointCopy.nextMulti = %d, want 9 (the live allocator)",
+			cd.CheckPointCopyNextMulti)
+	}
+	if cd.CheckPointCopyNextMultiOffset != 17 {
+		t.Errorf("checkPointCopy.nextMultiOffset = %d, want 17", cd.CheckPointCopyNextMultiOffset)
+	}
+
+	// The independent oracle: pg_controldata must read the same bytes the
+	// same way, including the two text-valued fields the numeric helper
+	// above cannot cover.
+	fields := runPgControldata(t, bin, dir)
+	for label, want := range map[string]string{
+		"Latest checkpoint's TimeLineID":       "3",
+		"Latest checkpoint's PrevTimeLineID":   "3",
+		"Latest checkpoint's full_page_writes": "off",
+		"Latest checkpoint's NextMultiXactId":  "9",
+		"Latest checkpoint's NextMultiOffset":  "17",
+	} {
+		if got := fields[label]; got != want {
+			t.Errorf("pg_controldata %q = %q, want %q", label, got, want)
+		}
+	}
+	t.Run("oracle_agreement", func(t *testing.T) { checkPointCopyGolden(t, bin, dir, cd) })
+}
+
+// nopFlusher satisfies wal.DirtyPageFlusher for a checkpointer that has no
+// buffer pool — this test asserts on pg_control, not on page writeback.
+type nopFlusher struct{}
+
+func (nopFlusher) FlushAll() error { return nil }

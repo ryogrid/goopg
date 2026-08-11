@@ -558,6 +558,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// FirstMultiXactId; persisting/seeding from pg_control.nextMulti is a
 		// deferred enhancement (membership is in-memory and transient in v0).
 		cfg.MultiXact = multixact.NewStore()
+		// M0131-S18.4: publish the allocator's next-to-assign MultiXactId
+		// into every checkpoint (record + pg_control). Before this the
+		// encoder wrote a literal 1, so a cluster that had combined row
+		// locks still reported nextMulti = 1 and a PG resuming from that
+		// checkpoint would re-hand-out MultiXactIds goopg already used.
+		// oldest stays FirstMultiXactId: the store never truncates.
+		if rt.Checkpointer != nil {
+			mx := cfg.MultiXact
+			rt.Checkpointer.SetNextMultiXactFn(func() (uint32, uint32, uint32) {
+				return uint32(mx.Next()), 0, uint32(multixact.FirstMultiXactId)
+			})
+		}
 		// Wire the storage-package vacuum/freeze/prune read paths to the
 		// process-shared member store so they can resolve an updater-bearing
 		// multixact xmax (a MultiXactId, not an xid) to its updater before

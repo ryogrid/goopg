@@ -713,15 +713,116 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	if nextXid < 3 {
 		nextXid = 3
 	}
-	return encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, uint32(nextXid))
+	return encodeCheckPointStruct(CheckPointFields{
+		RedoLSN0:        redoLSN0,
+		ThisTLI:         tli,
+		NextXid:         nextXid,
+		NextOid:         nextOid,
+		OldestActiveXid: uint32(nextXid),
+	})
 }
 
+// CheckPointFields is the live cluster state stamped into the PG18
+// CheckPoint struct (M0131-S18.4). Before it existed, every member past
+// `redo`/`ThisTimeLineID`/`nextXid`/`nextOid`/`oldestActiveXid` was a
+// literal in the encoder — and two members, PrevTimeLineID and
+// fullPageWrites, were never written AT ALL, so every goopg checkpoint
+// record claimed `PrevTimeLineID = 0` and `full_page_writes = off`
+// (upstream sets PrevTimeLineID = ThisTimeLineID for every checkpoint
+// except an end-of-recovery one, xlog.c:7030-7034, and fullPageWrites
+// from Insert->fullPageWrites, xlog.c:7041).
+//
+// A zero value is NOT a valid CheckPoint: withDefaults applies the same
+// floors upstream's bootstrap does, so callers only fill what they know.
+type CheckPointFields struct {
+	// RedoLSN0 is the 0-based byte position of the checkpoint's redo
+	// point. PG's xlogreader validates it against ReadRecPtr.
+	RedoLSN0 uint64
+	ThisTLI  uint32
+	// PrevTLI defaults to ThisTLI. Only an end-of-recovery checkpoint
+	// differs (it names the timeline forked off from).
+	PrevTLI uint32
+	// FullPageWrites mirrors the full_page_writes GUC as the buffer pool
+	// currently sees it, not the postgresql.conf text: PG samples
+	// Insert->fullPageWrites under the WAL insert lock.
+	FullPageWrites bool
+	WalLevel       uint32
+	NextXid        uint64
+	NextOid        uint32
+	// NextMulti/NextMultiOffset/OldestMulti come from the multixact
+	// allocator. A cluster that has never created a multixact reports
+	// NextMulti = OldestMulti = FirstMultiXactId (1), NextMultiOffset = 0.
+	NextMulti       uint32
+	NextMultiOffset uint32
+	OldestXid       uint32
+	// OldestXidDB / OldestMultiDB name the database holding the horizon.
+	// Upstream's bootstrap seeds both with Template1DbOid; a fresh PG 18
+	// cluster reports 1 for each, so 0 (goopg's old value) was never a
+	// value real PG writes.
+	OldestXidDB   uint32
+	OldestMulti   uint32
+	OldestMultiDB uint32
+	// OldestCommitTsXid / NewestCommitTsXid are InvalidTransactionId (0)
+	// while track_commit_timestamp is off — which is goopg's only mode
+	// today, and what a real PG 18 pg_controldata reports. goopg used to
+	// hardcode 3 here, a value PG never writes with commit ts disabled.
+	OldestCommitTsXid uint32
+	NewestCommitTsXid uint32
+	// OldestActiveXid: PG stamps InvalidTransactionId (0) on shutdown
+	// checkpoints (recovery derives it from PrescanPreparedTransactions)
+	// and GetOldestActiveTransactionId() on online ones.
+	OldestActiveXid uint32
+}
+
+// firstMultiXactId mirrors FirstMultiXactId (multixact.h) — the lowest
+// MultiXactId ever handed out; 0 is InvalidMultiXactId.
+const firstMultiXactId = uint32(1)
+
+// withDefaults applies the floors and mirrors upstream establishes so a
+// partially-filled CheckPointFields still encodes a struct PG accepts.
+func (f CheckPointFields) withDefaults() CheckPointFields {
+	if f.ThisTLI == 0 {
+		f.ThisTLI = 1
+	}
+	if f.PrevTLI == 0 {
+		f.PrevTLI = f.ThisTLI
+	}
+	if f.WalLevel == 0 {
+		f.WalLevel = 1 // replica
+	}
+	if f.NextXid < 3 { // FirstNormalTransactionId
+		f.NextXid = 3
+	}
+	if f.NextOid < firstNormalObjectID {
+		f.NextOid = firstNormalObjectID
+	}
+	if f.NextMulti < firstMultiXactId {
+		f.NextMulti = firstMultiXactId
+	}
+	if f.OldestMulti < firstMultiXactId {
+		f.OldestMulti = firstMultiXactId
+	}
+	if f.OldestXid < 3 {
+		f.OldestXid = 3
+	}
+	if f.OldestXidDB == 0 {
+		f.OldestXidDB = template1DbOid
+	}
+	if f.OldestMultiDB == 0 {
+		f.OldestMultiDB = template1DbOid
+	}
+	return f
+}
+
+// firstNormalObjectID mirrors FirstNormalObjectId (transam.h).
+const firstNormalObjectID = uint32(16384)
+
+// template1DbOid mirrors Template1DbOid (pg_database_d.h) — the database
+// upstream's bootstrap names as the holder of the xid/multi horizons.
+const template1DbOid = uint32(1)
+
 // encodeCheckPointStruct builds the raw 88-byte PG18 CheckPoint struct.
-// oldestActiveXid is parameterised (A9-checkpoint-opcode): PG stamps
-// InvalidTransactionId (0) on shutdown checkpoints and
-// GetOldestActiveTransactionId() on online ones (xlog.c CreateCheckPoint);
-// EncodeCheckpointCompat keeps its historical nextXid mirror.
-func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) []byte {
+func encodeCheckPointStruct(f CheckPointFields) []byte {
 	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
 	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
@@ -763,26 +864,33 @@ func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// ShmemVariableCache->nextOid from this field so after a crash the
 	// OID counter is restored from the last checkpoint rather than from
 	// the pg_catalog.json snapshot.
+	//
+	// M0131-S18.4: every remaining literal is now a CheckPointFields
+	// member, and offsets 12 (PrevTimeLineID) and 16 (fullPageWrites) are
+	// written for the first time — they were skipped entirely, so a real
+	// PG reading a goopg checkpoint saw PrevTimeLineID = 0 (the pad-zero)
+	// and full_page_writes = off.
 	const checkPointSize = 88
-	if nextXid < 3 {
-		nextXid = 3
-	}
-	const firstNormalOID = uint32(16384) // FirstNormalObjectId
-	if nextOid < firstNormalOID {
-		nextOid = firstNormalOID
-	}
+	f = f.withDefaults()
 	payload := make([]byte, checkPointSize)
 	le := binary.LittleEndian
 	now := time.Now()
 
-	le.PutUint64(payload[0:8], redoLSN0)  // redo
-	le.PutUint32(payload[8:12], tli)      // ThisTimeLineID
-	le.PutUint32(payload[20:24], 1)       // wal_level (replica)
-	le.PutUint64(payload[24:32], nextXid) // nextXid (>= FirstNormalTxnId)
-	le.PutUint32(payload[32:36], nextOid) // nextOid (>= FirstNormalObjectId)
-	le.PutUint32(payload[36:40], 1)       // nextMulti
-	le.PutUint32(payload[44:48], 3)       // oldestXid
-	le.PutUint32(payload[52:56], 1)       // oldestMulti
+	le.PutUint64(payload[0:8], f.RedoLSN0)  // redo
+	le.PutUint32(payload[8:12], f.ThisTLI)  // ThisTimeLineID
+	le.PutUint32(payload[12:16], f.PrevTLI) // PrevTimeLineID
+	if f.FullPageWrites {
+		payload[16] = 1 // fullPageWrites (bool; offsets 17-19 stay pad)
+	}
+	le.PutUint32(payload[20:24], f.WalLevel)        // wal_level
+	le.PutUint64(payload[24:32], f.NextXid)         // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], f.NextOid)         // nextOid (>= FirstNormalObjectId)
+	le.PutUint32(payload[36:40], f.NextMulti)       // nextMulti
+	le.PutUint32(payload[40:44], f.NextMultiOffset) // nextMultiOffset
+	le.PutUint32(payload[44:48], f.OldestXid)       // oldestXid
+	le.PutUint32(payload[48:52], f.OldestXidDB)     // oldestXidDB
+	le.PutUint32(payload[52:56], f.OldestMulti)     // oldestMulti
+	le.PutUint32(payload[56:60], f.OldestMultiDB)   // oldestMultiDB
 	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
 	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
 	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
@@ -790,9 +898,9 @@ func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
 	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
 	// oldestActiveXid=80, sizeof(CheckPoint)=88.
-	le.PutUint32(payload[72:76], 3)               // oldestCommitTsXid
-	le.PutUint32(payload[76:80], 3)               // newestCommitTsXid
-	le.PutUint32(payload[80:84], oldestActiveXid) // oldestActiveXid
+	le.PutUint32(payload[72:76], f.OldestCommitTsXid) // oldestCommitTsXid
+	le.PutUint32(payload[76:80], f.NewestCommitTsXid) // newestCommitTsXid
+	le.PutUint32(payload[80:84], f.OldestActiveXid)   // oldestActiveXid
 
 	return payload
 }

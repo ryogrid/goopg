@@ -149,6 +149,37 @@ type CheckpointerConfig struct {
 	// pg_catalog.json. M0106-0013.
 	NextOIDFn func() uint32
 
+	// TimelineIDFn, when non-nil, is invoked at each checkpoint to read
+	// the LIVE timeline the WAL writer is emitting on (M0131-S18.3).
+	// Both the checkpoint record's ThisTimeLineID/PrevTimeLineID and
+	// pg_control's checkPointCopy used to be hardcoded to 1, so the first
+	// checkpoint after a promotion (M0130-S8.5 finalizePromotion) stomped
+	// pg_control back to TLI 1 while the segments on disk were named for
+	// TLI 2 — a real PG then PANICs "could not locate a valid checkpoint
+	// record". Wired to Writer.TimelineID by initdb.Open; nil keeps the
+	// historical TLI 1. PrevTimeLineID mirrors ThisTimeLineID, matching
+	// upstream CreateCheckPoint for every non-end-of-recovery checkpoint
+	// (xlog.c:7030-7034).
+	TimelineIDFn func() uint32
+
+	// FullPageWritesFn, when non-nil, reports the live full_page_writes
+	// setting as the buffer pool sees it — upstream samples
+	// Insert->fullPageWrites under the WAL insert lock (xlog.c:7041), not
+	// the postgresql.conf text, because a runtime ALTER SYSTEM takes
+	// effect only at the next XLOG_FPW_CHANGE. The GUC reaches the pool
+	// (cmd/goopg/main.go, Pool.SetFullPageWrites) but never reached
+	// pg_control or the checkpoint record before M0131-S18.3. nil keeps
+	// the historical unconditional `on`.
+	FullPageWritesFn func() bool
+
+	// NextMultiXactFn, when non-nil, reports the multixact allocator's
+	// next-to-assign MultiXactId, its next member offset, and the oldest
+	// MultiXactId still needed. goopg's store never truncates, so oldest
+	// stays FirstMultiXactId; the seam exists so pg_control stops
+	// claiming nextMulti = 1 on a cluster that has created multixacts
+	// (M0131-S18.4). nil keeps FirstMultiXactId/0/FirstMultiXactId.
+	NextMultiXactFn func() (next, nextOffset, oldest uint32)
+
 	// PostCheckpointFn, when non-nil, is called at the end of each
 	// successful checkpoint (timed, volume-triggered, or on-demand).
 	// initdb.Open wires this to regenerate pg_internal.init files so PG
@@ -416,6 +447,14 @@ func (c *Checkpointer) SetRetainer(r Retainer) {
 	c.retainer = r
 }
 
+// SetNextMultiXactFn installs the multixact-counter hook (M0131-S18.4).
+// A setter rather than a CheckpointerConfig literal because the
+// process-shared multixact store is created in cmd/goopg after
+// initdb.Open has already built the checkpointer. Call before Run starts.
+func (c *Checkpointer) SetNextMultiXactFn(fn func() (next, nextOffset, oldest uint32)) {
+	c.cfg.NextMultiXactFn = fn
+}
+
 // SetCompletionTarget updates the spread fraction (0 disables
 // spreading, 1 spreads across the full Interval). Out-of-range
 // values are clamped.
@@ -540,6 +579,39 @@ func (c *Checkpointer) runningXacts(nextXid uint64) ([]uint32, uint32, uint32) {
 		nextXid = 3 // FirstNormalTransactionId floor, mirrors EncodeCheckpointPG
 	}
 	return nil, uint32(nextXid), uint32(nextXid - 1)
+}
+
+// timelineID reports the timeline this checkpoint belongs to (M0131-S18.3).
+// Falls back to 1 — the bootstrap timeline — when no hook is wired, which
+// is what every caller got unconditionally before the hook existed.
+func (c *Checkpointer) timelineID() uint32 {
+	if c.cfg.TimelineIDFn == nil {
+		return 1
+	}
+	if tli := c.cfg.TimelineIDFn(); tli != 0 {
+		return tli
+	}
+	return 1
+}
+
+// fullPageWrites reports the live full_page_writes setting (M0131-S18.3).
+// Defaults to true, matching both the GUC's BootVal and the historical
+// hardcoded value.
+func (c *Checkpointer) fullPageWrites() bool {
+	if c.cfg.FullPageWritesFn == nil {
+		return true
+	}
+	return c.cfg.FullPageWritesFn()
+}
+
+// nextMultiXact reports the multixact allocator state for the checkpoint
+// (M0131-S18.4). Without a hook it reports the bootstrap triple, which is
+// what the encoder hardcoded before.
+func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
+	if c.cfg.NextMultiXactFn == nil {
+		return firstMultiXactId, 0, firstMultiXactId
+	}
+	return c.cfg.NextMultiXactFn()
 }
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
@@ -677,6 +749,22 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if c.cfg.NextOIDFn != nil {
 		nextOid = c.cfg.NextOIDFn()
 	}
+	// M0131-S18.3/.4: sample the live timeline, full_page_writes and
+	// multixact counters ONCE, before the record is encoded, so the
+	// checkpoint record and the pg_control checkPointCopy written below
+	// cannot disagree — PG cross-checks the two at startup.
+	cpFields := CheckPointFields{
+		ThisTLI:        c.timelineID(),
+		FullPageWrites: c.fullPageWrites(),
+		WalLevel:       uint32(max(c.cfg.GUCParams.WalLevel, 0)),
+		NextXid:        nextXid,
+		NextOid:        nextOid,
+	}
+	cpFields.NextMulti, cpFields.NextMultiOffset, cpFields.OldestMulti = c.nextMultiXact()
+	// Resolve PrevTLI/OldestXidDB/OldestMultiDB and every floor now, so the
+	// pg_control writer below reads the same values the record encodes
+	// rather than re-deriving them.
+	cpFields = cpFields.withDefaults()
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
 		// A9-checkpoint-opcode: explicit ONLINE/SHUTDOWN opcode via the
@@ -701,7 +789,9 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			}
 		}
 		var cerr error
-		checkpointPayload, cerr = EncodeCheckpointPG(shutdown, redoLSN0, 1, nextXid, nextOid, oldestActive)
+		cpFields.RedoLSN0 = redoLSN0
+		cpFields.OldestActiveXid = oldestActive
+		checkpointPayload, cerr = EncodeCheckpointPGFields(shutdown, cpFields)
 		if cerr != nil {
 			return fmt.Errorf("encode checkpoint record: %w", cerr)
 		}
@@ -750,9 +840,16 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			cd.CheckPoint = checkLSN0
 			cd.CheckPointCopyRedo = redoLSN0
 			cd.CheckPointCopyTime = now
-			cd.CheckPointCopyThisTLI = 1
-			cd.CheckPointCopyPrevTLI = 1
-			cd.CheckPointCopyFullPageWrites = true
+			// M0131-S18.3/.4: the same sample the checkpoint record above
+			// carries. These three were hardcoded 1/1/true, which stomped
+			// pg_control back to TLI 1 after a promotion.
+			cd.CheckPointCopyThisTLI = cpFields.ThisTLI
+			cd.CheckPointCopyPrevTLI = cpFields.PrevTLI
+			cd.CheckPointCopyFullPageWrites = cpFields.FullPageWrites
+			cd.CheckPointCopyNextMulti = cpFields.NextMulti
+			cd.CheckPointCopyNextMultiOffset = cpFields.NextMultiOffset
+			cd.CheckPointCopyOldestMulti = cpFields.OldestMulti
+			cd.CheckPointCopyOldestMultiDB = cpFields.OldestMultiDB
 			// M0106-0010 batched-45: refresh checkPointCopy.nextXid so a
 			// PG standby attached after this checkpoint sees the right
 			// snapshot xmax instead of the bootstrap FirstNormalXID=3.

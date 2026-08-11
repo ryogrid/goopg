@@ -131,7 +131,13 @@ func walLevelInt(reg *config.Registry) uint32 {
 // UpdateControlCheckpoint overwrites the checkpoint-related fields in the
 // on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
 // a PostgreSQL standby booted from the backup sees a valid REDO location.
-func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) error {
+// tli is the LIVE timeline the WAL writer is emitting on (M0131-S18.3);
+// pass 0 when unknown and the bootstrap timeline 1 is assumed. It used to
+// be hardcoded to 1, so a BASE_BACKUP taken from a promoted (TLI >= 2)
+// cluster wrote checkPointCopy.ThisTimeLineID = 1 into a pg_control whose
+// segments were named for TLI 2, and a PG booted from it PANICs "could not
+// locate a valid checkpoint record".
+func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64, tli uint32) error {
 	// goopg uses 1-based LSNs internally; PG expects 0-based.
 	lsn0 := redoLSN - 1
 	// CheckPoint names the checkpoint RECORD's own start — since
@@ -143,6 +149,9 @@ func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) erro
 	if ckptRecordLSN > 0 {
 		ckpt0 = ckptRecordLSN - 1
 	}
+	if tli == 0 {
+		tli = 1
+	}
 	now := time.Now()
 	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
 		cd.State = control.DBStateInProduction
@@ -150,13 +159,18 @@ func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) erro
 		cd.CheckPoint = ckpt0
 		cd.CheckPointCopyRedo = lsn0
 		cd.CheckPointCopyTime = now.Unix()
-		cd.CheckPointCopyThisTLI = 1
-		cd.CheckPointCopyPrevTLI = 1
+		// PrevTimeLineID mirrors ThisTimeLineID for every checkpoint that
+		// is not an end-of-recovery one (xlog.c:7030-7034).
+		cd.CheckPointCopyThisTLI = tli
+		cd.CheckPointCopyPrevTLI = tli
 		cd.CheckPointCopyFullPageWrites = true
 		// minRecoveryPoint must be non-zero so CheckRecoveryConsistency
 		// doesn't bail out immediately (XLogRecPtrIsInvalid(0) returns true).
+		// Its timeline must be the live one too, or PG FATALs "requested
+		// timeline %u does not contain minimum recovery point"
+		// (xlogrecovery.c:878-886).
 		cd.MinRecoveryPoint = 1
-		cd.MinRecoveryPointTLI = 1
+		cd.MinRecoveryPointTLI = tli
 		// backupEndPoint = redo LSN so ReachedEndOfBackup() is satisfied
 		// after the first WAL record (the checkpoint) has been replayed.
 		cd.BackupEndPoint = lsn0
