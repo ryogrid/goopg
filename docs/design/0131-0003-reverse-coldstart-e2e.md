@@ -1,6 +1,6 @@
 # Reverse cold-start E2E — goopg serves a cluster directory real PG created and wrote
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-11
 **Milestone:** M0131 (S3)
 
@@ -136,6 +136,54 @@ that leaves it off via the Go zero value — the path `reverse_path_test.go:23`
 takes. Either way `Open` reads the flag from `pg_control` and configures the
 storage `Manager` accordingly (`open.go:286-294`). The comment at `:290` calling
 `0` "the goopg default" is stale relative to `main.go:184`; correct it here.
+
+## Findings (added when the test first ran, 2026-08-11)
+
+The test did its job as a discovery probe: it found two real defects, one closed
+here and one too large to close in this slice.
+
+**1. `max_logical_replication_workers` was unregistered (closed here).** goopg
+refused to start on the handed-over directory: `unknown parameter
+"max_logical_replication_workers"` at `postgresql.conf:896`. This is exactly the
+S1 class — the name is a real PG 18 GUC (`guc_tables.c:3353-3361`, boot value 4,
+range `0..MAX_BACKENDS`) and an unregistered name is a hard start failure in
+`config.ApplyConfigEntries`. It is not emitted by `initdb`, which is why S1's
+sweep missed it; the pgcluster harness appends it
+(`internal/testutil/pgcluster/cluster.go` `appendConf`), and so would any real
+subscriber cluster. Registered as an accepted stub in
+`internal/config/defaults.go` plus a `postgresql.conf.sample` entry. **Guard 3
+therefore holds only after this fix** — it did not hold when S1 was declared
+done, which is the honest reading of "any required edit is an S1 defect".
+
+**2. The HOT flags live in the wrong header field (deferred → M0131-S11).**
+PG keeps `HEAP_HOT_UPDATED` (0x4000) and `HEAP_ONLY_TUPLE` (0x8000) in
+**`t_infomask2`** (`postgres/src/include/access/htup_details.h:550`, `:568`,
+read back at `:542`, `:562`). goopg defines the same two bit values but keeps
+them in **`t_infomask`** (`internal/storage/heap.go:118-122`; written at
+`:1477`, `:1589` and `internal/executor/operators_storage.go:3594`; read at
+`internal/executor/operators_index.go:54` and `internal/storage/prune.go:160-163`).
+
+Reverse direction (measured): PG HOT-updated `id = 9`, so no new index entry
+exists and the index entry addresses the chain root. `followHOTChain` reads
+`Infomask & HeapHotUpdated == 0` on that root, declares a chain end, and the
+index scan returns **zero rows** — while a seq scan over the same page returns
+the correct row, because it never consults the flag. Both indexes miss it; the
+un-updated `id = 7` resolves through the same index, so this is HOT-specific and
+not a failure to read PG's btree.
+
+Forward direction (by inspection, worse): in PG's `t_infomask`, 0x4000/0x8000
+are `HEAP_MOVED_OFF`/`HEAP_MOVED_IN`, and `heapam_visibility.c:183`/`:202`
+branch on them to derive visibility from `t_xvac`. A hosted PG reading a goopg
+HOT chain does not merely lose rows — it enters the pre-9.0 binary-upgrade path
+with an uninitialised `xvac`. This is a blocker for M0131-S4's workload, which
+includes `UPDATE`.
+
+Out of scope here: the fix is an on-disk format change touching every reader and
+writer of the two bits, the pruner, WAL replay and every existing goopg
+`$PGDATA` (no in-place upgrade — the bits are wrong on already-written pages).
+Filed as **M0131-S11** with a ledger row. The test locks the current behaviour
+in explicitly and instructs the S11 loop to invert the block, so the gap is
+loud rather than absent.
 
 ## Guards
 

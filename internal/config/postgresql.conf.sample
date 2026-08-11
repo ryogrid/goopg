@@ -170,6 +170,12 @@
 #hot_standby = on                       # allow read-only queries during recovery
                                         # (change requires restart)
 
+# - Subscribers -
+
+#max_logical_replication_workers = 4    # 0-262143; accepted, goopg runs no
+                                        # logical-replication apply workers
+                                        # (change requires restart)
+
 
 #------------------------------------------------------------------------------
 # QUERY TUNING

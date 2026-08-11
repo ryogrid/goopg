@@ -1335,6 +1335,18 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
+	// M0131-S3: accepted stub. goopg runs no logical-replication apply
+	// workers, but a real PG conf may set this (the pgcluster test harness
+	// does, internal/testutil/pgcluster/cluster.go appendConf), and an
+	// unregistered name is a hard start failure — config.ApplyConfigEntries
+	// (guc.go). Boot value / range from guc_tables.c:3353-3361 (4, 0,
+	// MAX_BACKENDS), never a goopg-tuned value.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_logical_replication_workers", Type: TypeInt, BootVal: "4",
+		MinVal: 0, MaxVal: 262143, // MAX_BACKENDS
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
 		MinVal: 0, MaxVal: 1 << 30,
