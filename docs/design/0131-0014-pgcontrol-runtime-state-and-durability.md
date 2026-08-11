@@ -1,8 +1,44 @@
 # pg_control runtime state and durability — stamp `DB_IN_PRODUCTION`, make the writer crash-safe, start from pg_control
 
-**Status:** draft
+**Status:** S17 **accepted — landed 2026-08-11**; S18 / S20 / S29 still draft
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S17 + S18 + S20)
+
+## Findings — S17 as built (2026-08-11)
+
+The design held without correction. `Open` (`internal/initdb/open.go`) now calls a
+new `stampInProduction` immediately before it returns the `Runtime` — after WAL
+replay, the buffer pool, the VM/FSM loads and the background workers, and
+strictly before `cmd/goopg/main.go` hands the runtime to the server's accept
+loop. It is the only non-test caller of `initdb.Open` (`main.go:453`, inside
+`runStart`), so the stamp is server-start-only: `goopg init`, `goopg stop` and
+`goopg checkpoint` do not go through it.
+
+Three things worth recording:
+
+1. **Failure policy.** A genuinely absent `pg_control` warns and continues; every
+   other failure (unreadable, short, unwritable) aborts `Open` after releasing
+   the pool, WAL writer and storage manager. Upstream PANICs on the same
+   conditions; the absent-file exemption exists only for hand-assembled
+   directories, since `verifyInitialized` checks `PG_VERSION` and nothing else.
+2. **The guard is proven fail-when-broken**, not merely green: with the stamp
+   short-circuited, `TestOpenStampsDBInProduction`
+   (`internal/initdb/pgcontrol_runtime_state_test.go`) reports `state after Open:
+   got 1, want 6`. It also asserts the precondition (a fresh `initdb` directory
+   is `DB_SHUTDOWNED`), `LastCheckpointLSN() == 0` at the moment of the
+   assertion — so a pass cannot be a checkpoint in disguise — and the inverse
+   direction, that a clean `Close` still lands on `DB_SHUTDOWNED`.
+3. **The stamp is not yet crash-safe itself** — it rides `UpdateControlFile`,
+   whose `os.WriteFile` (`O_TRUNC`, no fsync) is exactly the S18.1 defect. A
+   SIGKILL inside that write can leave a zero-length `pg_control`, which upstream
+   reads as `PANIC: could not read file "global/pg_control": read 0 of 296`. S17
+   narrows the window from `checkpoint_timeout` (300 s) to a single unsynced
+   write; S18.1 closes it. Ledgered.
+
+S17.3's check came back negative and stays open: goopg still never reads
+`State`, so it does not act on its own stamp — a goopg restart over a
+`DB_IN_PRODUCTION` directory replays WAL for unrelated reasons (the checkpoint
+scan), not because it recognised a crash. That is S20.1, ledgered.
 
 ## Problem
 

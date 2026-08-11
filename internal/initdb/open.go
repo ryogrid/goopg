@@ -2480,7 +2480,58 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		rt.bgwriter.Start()
 	}
 
+	// M0131-S17: the cluster is now live — say so in pg_control BEFORE the
+	// first client can be admitted, mirroring upstream's end-of-StartupXLOG
+	// stamp (`ControlFile->state = DB_IN_PRODUCTION` then UpdateControlFile,
+	// postgres/src/backend/access/transam/xlog.c:6204-6211).
+	//
+	// Until this landed, NOTHING in the startup path wrote State: initdb
+	// stamps DB_SHUTDOWNED and the only runtime writer is the checkpointer,
+	// whose first tick is one full checkpoint_timeout (PG default 300 s)
+	// after start. A SIGKILL inside that window therefore left pg_control
+	// claiming DB_SHUTDOWNED over a WAL tail full of committed work, and a
+	// real PG opening the directory took neither of the InRecovery arms at
+	// xlogrecovery.c:924-936 — it skipped PerformWalRecovery() entirely and
+	// resumed inserting WAL over goopg's tail, with no PANIC and nothing
+	// alarming logged. Live data loss; see
+	// docs/design/0131-0014-pgcontrol-runtime-state-and-durability.md §S17.
+	if err := stampInProduction(abs); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: %w", err)
+	}
+
 	return rt, nil
+}
+
+// stampInProduction records DB_IN_PRODUCTION plus the current time in
+// pg_control, the way upstream does at the end of StartupXLOG
+// (xlog.c:6204-6211). Called from Open once replay and storage are up and
+// before any client is accepted.
+//
+// A genuinely absent pg_control is tolerated with a warning rather than
+// failing the start: goopg's own `init` always writes one, so this only
+// arises for a hand-assembled directory, where the pre-M0131-S17 behaviour
+// (start anyway) is the less surprising one. Every other failure — an
+// unreadable, short, or unwritable control file — is fatal, because
+// continuing would mean serving a cluster whose crash state can never be
+// advertised. (Upstream PANICs on the same conditions.)
+func stampInProduction(dataDir string) error {
+	err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = time.Now().Unix()
+	})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		slog.Warn("pg_control absent: cluster state not stamped DB_IN_PRODUCTION",
+			"dataDir", dataDir,
+			"note", "a crash here is indistinguishable from a clean shutdown")
+		return nil
+	}
+	return fmt.Errorf("stamp pg_control DB_IN_PRODUCTION: %w", err)
 }
 
 // aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.
@@ -3190,7 +3241,13 @@ func (r *Runtime) Close() error {
 	if r.Checkpointer != nil && r.immediateShutdown {
 		// Immediate shutdown (`goopg stop -mode immediate`): skip the
 		// final checkpoint entirely so pg_control's State stays at
-		// DB_IN_PRODUCTION. External tools (pg_resetwal/pg_rewind/
+		// DB_IN_PRODUCTION — which Open's own startup stamp
+		// (stampInProduction, M0131-S17) is what establishes. Before
+		// that stamp existed this comment asserted a postcondition the
+		// code did not have: on a cluster younger than
+		// checkpoint_timeout that never crossed max_wal_size, no
+		// checkpoint had ever run and the byte was still initdb's
+		// DB_SHUTDOWNED. External tools (pg_resetwal/pg_rewind/
 		// pg_controldata) then see an unclean cluster that needs
 		// recovery, and goopg's own next start replays WAL. Mirrors
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)

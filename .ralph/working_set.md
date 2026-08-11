@@ -1,43 +1,46 @@
 (idle — nothing in flight)
 
-Loop #120 landed **M0131-S9.1b**: the on-disk system-view corpus is **30 views**
-(`pg_stat_bgwriter` 12293, `pg_stat_checkpointer` 12297 added), both evaluate on
-a real PG 18.3 hosted on a goopg `$PGDATA`, and design 0131-0009's guard #2 now
-has BOTH halves. One capture run + one generator run, zero hand-edits.
+Loop #122 landed **M0131-S17** — goopg now stamps `pg_control.State =
+DB_IN_PRODUCTION` at the end of `Open`, before any client is accepted. This
+closed a LIVE data-loss bug: a SIGKILL inside the first `checkpoint_timeout`
+(300 s) left the directory claiming `DB_SHUTDOWNED`, so a hosted PG took none
+of the three `InRecovery` arms (`xlogrecovery.c:924-936`), skipped
+`PerformWalRecovery()` entirely, and overwrote goopg's committed WAL tail with
+no PANIC and nothing alarming logged.
 
-Carry-forward for the next loop:
+Carry-forward:
 
-- **Next per the banner: M0131-S12** — bulk-load `pg_opclass_am_name_nsp_index`
-  (2686) at initdb. It is the same failure shape as the `pg_amop` 2653 blocker
-  that keeps `pg_timezone_abbrevs` off disk and blocks EVERY future system view
-  with an `ORDER BY`, so landing it before S9.2 pays twice. Subtasks S12.1–S12.5
-  are spelled out in fix_plan; note S12.5 INVERTS
-  `assertEmptyOpclassIndexStillBlocksSorts`.
-- **`assertNonCorpusSystemViewIsStillAbsent` is fail-when-fixed on
-  `pg_catalog.pg_tables`** — the moment S9.2 adopts pg_tables that assertion
-  goes red on purpose; re-point it at the next un-adopted view, don't delete it.
-- **F4 correction worth remembering:** `RTE_RESULT` is a PLANNER construct and
-  never appears in `pg_rewrite.ev_action`. A FROM-less view serialises an empty
-  `:rtable`/`:fromlist`. The still-unmeasured shape is `LATERAL`
-  (`pg_statio_all_tables`, `pg_stats_ext`).
-- **F6, ledgered not fixed:** goopg's virtual `pg_stat_checkpointer`
-  (`internal/initdb/open.go:2625-2646`) omits `num_done`, adds `total_time`, and
-  types all 11 columns `text`. Same COUNT as upstream, different SET — a
-  count-only audit passes. Resume point is in the ledger row; a table-driven
-  `nailedViewSeedAttrs(name)` vs virtual-`Columns` test would audit the whole
-  corpus at once.
+- **The remaining "LAND FIRST" data-loss item is M0131-S16** (WAL reader treats
+  rmids 16-21 as end-of-WAL → silent truncation → permanent on first append,
+  design `0131-0013`). That is the cheapest high-value next pick unless the
+  banner moves.
+- **S18.1 is the natural follow-on to what just landed**: the new stamp rides
+  `control.UpdateControlFile`, whose `os.WriteFile` is `O_TRUNC` + no fsync, so
+  a crash mid-write leaves a zero-length `pg_control` and PG PANICs `read 0 of
+  296`. Ledgered. S18 also carries the nine undecoded `checkPointCopy` fields
+  and the hardcoded TLI 1 (which stomps a promoted cluster).
+- **goopg still has NO reader of `pg_control.State`** (S17.3 probe, ledgered) —
+  it cannot tell its own crashed directory from a clean one. That is S20.1. The
+  fix_plan's "S15 changes that" pointer was stale; the reader is S20.
+- The fix_plan's S17 row cited design `0131-0013`; the real doc is
+  **`0131-0014`** (0131-0013 is the WAL-reader doc). Corrected in the check-off
+  text; other Theme F rows may carry the same off-by-one — check before trusting
+  a design filename in this milestone's rows.
+- Nightly `20260811-014635` (12 items) was **already filed** by a prior loop at
+  fix_plan.md:717 — do not re-file. 9 of them are `regress/*` "output mismatch;
+  normalization rules need extension", the same recurring class as the
+  20260809 batch.
 
-Procedure reminder for any corpus widening: add pins to
-`internal/initdb/system_view_oid_pins.go`, then
-`scripts/capture-ev-action.sh $(sed -n 's/^\t\t{"\([a-z_]*\)".*/\1/p'
-internal/initdb/system_view_oid_pins.go)` (the script REWRITES the whole
-manifest — always pass the FULL list), then
-`go run cmd/gen-nailed-view-tables/main.go > internal/initdb/nailed_view_seed_data.go`,
-then add the view to `nailedSystemViewProbeSet()` in
-`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`.
+Technique worth reusing: the guard was proven fail-when-broken by
+short-circuiting `stampInProduction` with a temporary `if true { return nil }`
+(file backed up to /tmp, restored, rebuild verified) — `got 1, want 6`. A green
+new test on a startup path proves very little otherwise.
 
-Gates run this loop: `internal/initdb` PASS (64 s), `^TestE2E_` family PASS
-(100 s), `capture-ev-action.sh --verify` PASS (30/30 byte-identical), UNITS
-PASS, pgbench smoke via the commit hook, `make ralph-state-guard` OK.
+Gates run this loop: new `TestOpenStampsDBInProduction` PASS (and PASS-inverted
+without the fix), `internal/initdb` PASS (65 s), `internal/control` +
+`internal/wal` PASS, `TestE2E_{PGColdStartOnGoopgDataDir,GoopgColdStartOnPGDataDir}`
+PASS (27 s), whole `^TestE2E_` family PASS, UNITS PASS, pgbench smoke via the
+commit hook, `make ralph-state-guard` OK (auto-repaired the stale
+completed-marker, as usual).
 
 In-flight: none.
