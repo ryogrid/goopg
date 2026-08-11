@@ -165,6 +165,46 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			off += hsize
 			continue
 		}
+		// M0131-S30.1: a segment tail too small to hold a record header may be
+		// unusable space rather than the start of a record — skip it instead
+		// of reading garbage and calling it end-of-WAL.
+		//
+		// The stripe writer (Path B, the production path) never lets a record
+		// straddle a segment boundary: when a reservation would cross one,
+		// insertPosTracker.reserveEmittedAndPublish re-lands the record at the
+		// boundary and fills the gap `[curr, boundary)` with an XLOG_NOOP pad
+		// — except when the gap is smaller than one record header, which
+		// cannot carry a pad and is left untouched (reserve_emitted.go,
+		// `gapLen < xlogMinimumRecordSize`). This walk used to decode those
+		// leftover bytes as a record header; extractRecordBytes completes the
+		// 24 bytes from the NEXT segment's first page, so the assembled
+		// "header" is the gap bytes glued to the head of a real record. The
+		// measured failure was exactly that: `padding bytes nonzero
+		// (0xff 0x07)` at lsn=134217721 — 8 bytes before a segment boundary —
+		// where 0x07ff is the high half of the FOLLOWING record's xl_prev.
+		// Replay called that end-of-WAL and discarded every committed record
+		// behind it (docs/design/0131-0020, docs/design/0131-0022).
+		//
+		// The skip is conditional on the bytes NOT being a valid record,
+		// because goopg's other writer path disagrees about this layout:
+		// state.appendPGCompat's Path A (walBuf disabled / oversized record /
+		// drain) emits at `trackerCurr` through emitWithPageHeaders with no
+		// boundary re-land, so it DOES produce records that begin in the last
+		// few bytes of a segment and continue after the next segment's long
+		// page header. Those are real, CRC-valid records and must still be
+		// replayed — hence recordStartsAt below decides, not the offset alone.
+		// (The writer divergence itself is filed separately; the reader must
+		// read every stream goopg has already written either way.)
+		//
+		// Guarded on segSize >= XLOGBlockSize: a few unit fixtures build
+		// sub-page "segments" whose every offset would otherwise look like an
+		// unusable tail.
+		if segRemain := segSize - pos%segSize; segSize >= XLOGBlockSize &&
+			segRemain < int64(xlogRecordHeaderSize) &&
+			!recordStartsAt(stream, off, pos, segSize) {
+			off += int(segRemain)
+			continue
+		}
 		// Mid-page record. The first 24 bytes are the XLogRecord
 		// header; if all zero, EOS.
 		if off+xlogRecordHeaderSize > len(stream) {
@@ -259,6 +299,37 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the
 // PG-frame page-aware walk uses isPreallocatedTail directly.)
+
+// recordStartsAt reports whether stream[off:] really is the first byte of a
+// record: its header decodes AND the record's own CRC checks out over the
+// bytes extractRecordBytes assembles from there (page headers skipped).
+//
+// M0131-S30.1: used to tell a segment's unusable sub-header tail gap (stripe
+// Path B's layout — bytes that belong to no record) apart from a record that
+// legitimately begins there and straddles the boundary (Path A's layout). The
+// CRC is the only evidence that distinguishes them, and it is the same
+// evidence durableUnknownRecord uses for the neighbouring question; a false
+// positive costs a 2^-32 collision on garbage, a false negative would drop a
+// durable record and everything behind it.
+func recordStartsAt(stream []byte, off int, pos, segSize int64) bool {
+	header, _ := extractRecordBytes(stream[off:], pos, segSize, xlogRecordHeaderSize)
+	if len(header) < xlogRecordHeaderSize {
+		return false
+	}
+	if isZeroXLogRecordHeader(header) {
+		return false
+	}
+	total := int(binary.LittleEndian.Uint32(header[0:4]))
+	if total < xlogRecordHeaderSize || total > len(stream)-off {
+		return false
+	}
+	fullBytes, _ := extractRecordBytes(stream[off:], pos, segSize, maxAlignXLog(total))
+	if len(fullBytes) < total {
+		return false
+	}
+	want := binary.LittleEndian.Uint32(header[20:24])
+	return VerifyXLogRecordCRC(fullBytes[:xlogRecordHeaderSize], fullBytes[xlogRecordHeaderSize:total], want) == nil
+}
 
 // durableUnknownRecord decides whether a record whose HEADER failed validation
 // is nevertheless a real, durable record — in which case it returns a non-nil
