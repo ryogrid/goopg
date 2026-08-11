@@ -335,24 +335,20 @@ func waitForPhysicalStreamingPGtoGoopg(t *testing.T, pgPrimary *pgcluster.Cluste
 	for time.Now().Before(deadline) {
 		// Check PG side: the standby appears among the walsenders.
 		//
-		// This probes the two SRFs that `pg_stat_replication` is built from
-		// rather than the view itself. The PG in this phase runs on a data
-		// directory that goopg's initdb created. PG rebuilds its relcache from
-		// the heap, and `RelationBuildRuleLock` (relcache.c:801-805) finds the
-		// rules by scanning `pg_rewrite` (2618) through index
-		// `pg_rewrite_rel_rulename_index` (2693) with `indexOK=true` — there is
-		// no seq-scan fallback, so an index goopg never populates at runtime
-		// yields `rd_rules = NULL` (M0131-S5 closes this; M0131-S6 flips
-		// `relhasrules` for the nailed system views). PG therefore
-		// answers any `SELECT ... FROM <view>` with
-		// `cannot open relation "pg_stat_replication" / This operation is not
-		// supported for views`. The join below is exactly the view body from
-		// upstream `system_views.sql:906` minus the `pg_authid` outer join,
-		// which only supplies `usename`.
+		// M0131-S6 RESTORED this to query the view itself (2026-08-11).
+		// It had been downgraded to a hand-rolled join over the two SRFs
+		// `pg_stat_replication` is built from (AI-20260810-011258-003),
+		// because the PG in this phase runs on a directory goopg's initdb
+		// created and every bootstrapped view carried `relhasrules=false`
+		// — so `RelationBuildDesc` skipped the `pg_rewrite` scan entirely
+		// (relcache.c:1249-1255) and PG answered any `SELECT ... FROM
+		// <view>` with "This operation is not supported for views".
+		// S6 flips the flag, and reverting this downgrade IS the gate:
+		// a hosted PG must now expand the nailed views' _RETURN rules
+		// from goopg's own pg_rewrite heap and index 2693.
 		pgReady := pgPrimary.QueryScalar(t, fmt.Sprintf(
-			`SELECT count(*) FROM pg_stat_get_activity(NULL) AS s
-			   JOIN pg_stat_get_wal_senders() AS w ON (s.pid = w.pid)
-			  WHERE s.application_name = '%s' AND w.state = 'streaming'`,
+			`SELECT count(*) FROM pg_stat_replication
+			  WHERE application_name = '%s' AND state = 'streaming'`,
 			appName)) == "1"
 
 		// Check goopg side: pg_stat_wal_receiver reports streaming.

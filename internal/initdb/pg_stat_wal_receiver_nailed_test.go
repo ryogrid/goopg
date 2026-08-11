@@ -109,13 +109,16 @@ func TestPgClassRowForViewSetsZeroRelfilenode(t *testing.T) {
 	if row[7].Int != 0 {
 		t.Fatalf("view pg_class.relfilenode=%d want 0", row[7].Int)
 	}
-	// NAILED replication system views (12231-12266) keep relhasrules=false: their
-	// canonical ev_action IS present, but PG serves these views from its own
-	// built-in relcache entries, so enabling standby-side rule expansion for them
-	// is a separate track. M0123-S3 sub-slice 2c landed canonical ev_action +
-	// relhasrules=true for USER views only (buildUserPGClassRow reads
-	// tbl.RuleIsCanonical); this bootstrap pgClassRow path is unaffected.
-	if row[20].BoolValue() {
-		t.Fatalf("nailed view pg_class.relhasrules=true want false")
+	// M0131-S6 INVERTED (2026-08-11). This used to require
+	// relhasrules=false, on the premise that "PG serves these views from
+	// its own built-in relcache entries". That premise does not hold on a
+	// goopg-created directory: a hosted PG has no built-in entry for
+	// anything and builds every relcache entry from goopg's heaps, so
+	// relhasrules=false makes RelationBuildDesc skip the pg_rewrite scan
+	// (relcache.c:1249-1255) and the view is unevaluable. The six nailed
+	// views (12231-12266) now carry relhasrules=true, matching their
+	// bootstrapped _RETURN rows and both pg_rewrite btrees.
+	if !row[20].BoolValue() {
+		t.Fatalf("nailed view pg_class.relhasrules=false want true")
 	}
 }

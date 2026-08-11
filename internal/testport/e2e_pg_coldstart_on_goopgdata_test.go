@@ -252,15 +252,16 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	assertEmptyOpclassIndexStillBlocksSorts(t, pg)
 	assertSystemViewOIDsArePinnedToUpstream(t, pg)
 
-	// Row-level reads. S4.4 — no view assertions: a hosted PG cannot evaluate
-	// ANY view on a goopg directory today (the rewriter reads relcache
-	// rd_rules, RelationBuildRuleLock populates it only through pg_rewrite
-	// index 2693 which goopg does not maintain at runtime, and
-	// systable_beginscan with indexOK=true has no seq-scan fallback → 42809
-	// from plancat.c:139-149). Every probe below is phrased over user tables.
-	// TODO(M0131-S6): once relhasrules flips for the nailed system views, add
-	//   `SELECT count(*) FROM pg_stat_activity` here — that is the assertion
-	//   this lane is missing, and S6's gate is where it becomes possible.
+	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
+
+	// Row-level reads over user tables. S4.4 originally carried no view
+	// assertion at all because a hosted PG could not evaluate ANY view on a
+	// goopg directory; M0131-S6 flipped `relhasrules` and the probe directly
+	// above is the assertion that gap left missing. Its TODO named
+	// `pg_stat_activity`, which was the wrong target — that view is not in
+	// goopg's nailed set (it has no bootstrapped pg_class/pg_rewrite rows at
+	// all, so it would fail 42P01 for an unrelated reason and is S9's work).
+	// The six views S6 actually enables are the ones probed.
 	pgLog := pgLogPathFor(goopgDir)
 	if got := s4Scalar(t, pg, pgLog, "SELECT count(*) FROM public.s4_items"); got != wantCount {
 		t.Fatalf("hosted PG count(*) on a goopg-written heap = %q, goopg said %q", got, wantCount)
@@ -639,6 +640,55 @@ func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster
 				"mismatch means a captured ev_action that embeds this view's "+
 				"relid names a relation this cluster does not have.",
 				tc.view, g, tc.oid)
+		}
+	}
+}
+
+// assertNailedSystemViewsAreEvaluable is the M0131-S6 acceptance probe (design
+// 0131-0006 guard 4): a real PG 18.3 hosted on a goopg-initdb'd directory must
+// be able to EVALUATE each of the six nailed replication views, not merely
+// resolve its name.
+//
+// Before S6 every bootstrapped view row carried relhasrules=false, so
+// RelationBuildDesc took the else arm at relcache.c:1249-1255, rd_rules stayed
+// NULL, and the rewriter rejected the query — "cannot open relation … this
+// operation is not supported for views" (42809). Reaching this point means PG
+// scanned goopg's own pg_rewrite heap through index 2693, found the _RETURN
+// rule, and substituted its Query for the RTE.
+//
+// The views are probed ONE AT A TIME and a failure is reported per view
+// (t.Errorf, not Fatalf) with the PG log tail attached — that IS S6.6's risk
+// control: the six blobs are independent, so naming every failing view in one
+// run is what localises a bad tupledesc (the known shape is
+// populate_compact_attribute_internal, tupdesc.c:105) instead of forcing a
+// manual bisect. This is how the pg_subscription 9-vs-18 attribute gap was
+// isolated: five views passed and only pg_stat_subscription reported
+// "cache lookup failed for attribute 10 of relation 6100".
+//
+// LIMIT 0 is deliberate. These views read live shared-memory replication state
+// through SRFs; on a standalone hosted PG they are legitimately empty, and the
+// assertion under test is rule expansion, not row content.
+func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	for _, view := range []string{
+		"pg_catalog.pg_stat_replication",
+		"pg_catalog.pg_stat_wal_receiver",
+		"pg_catalog.pg_stat_recovery_prefetch",
+		"pg_catalog.pg_stat_subscription",
+		"pg_catalog.pg_replication_slots",
+		"pg_catalog.pg_stat_replication_slots",
+	} {
+		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
+		if err != nil {
+			logTail, _ := os.ReadFile(pgLogPathFor(goopgDir))
+			t.Errorf("hosted PG cannot evaluate %s: %v\n%s\n"+
+				"M0131-S6 flipped pg_class.relhasrules for the six nailed views "+
+				"(internal/initdb/initdb.go, pgClassRow) so PG would scan "+
+				"pg_rewrite for their _RETURN rules. A 42809 here means the flag "+
+				"did not reach this directory's base/{1,5}/1259; any other error "+
+				"means the rule was found and something downstream of "+
+				"RelationBuildRuleLock rejected it.\n--- PG log ---\n%s",
+				view, err, out, tailLines(string(logTail), 60))
 		}
 	}
 }

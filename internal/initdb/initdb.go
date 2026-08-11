@@ -5870,11 +5870,25 @@ func pgClassRow(rel nailedRel) executor.Row {
 	relHasRules := false
 	if rel.RelKind == 'v' {
 		relFilenode = 0
-		// Keep relHasRules=false: the view is found in pg_class (name lookup works)
-		// and PG won't try to load the rewrite rule. Querying the view will return
-		// an error (no storage) but won't crash. Needed until the ev_action format
-		// is fully compatible with the running PG18 version.
-		// relHasRules = true
+		// M0131-S6 (2026-08-11): relhasrules FLIPPED to true. The old
+		// rationale ("Needed until the ev_action format is fully
+		// compatible with the running PG18 version") is discharged: the
+		// six nailed views' ev_action blobs are verbatim PG 18.3 dumps
+		// of system_views.sql (pg_rewrite_bootstrap.go), both pg_rewrite
+		// btrees 2692/2693 are bootstrapped, and M0131-S8a repinned the
+		// view OIDs to upstream's own initdb assignments so the
+		// view-on-view :relid inside pg_stat_replication_slots'
+		// ev_action resolves. With relhasrules=false, PG's
+		// RelationBuildDesc takes the else arm at
+		// postgres/src/backend/utils/cache/relcache.c:1249-1255 and
+		// never scans pg_rewrite, so a hosted PG cannot evaluate any of
+		// the six; true is what makes RelationBuildRuleLock run.
+		//
+		// Scope limit: this is written at initdb time, so it reaches
+		// only freshly `goopg init`'d directories. An existing goopg
+		// $PGDATA keeps relhasrules='f' on disk — re-initdb required,
+		// there is no in-place upgrade path (ledgered under M0131-S6).
+		relHasRules = true
 	}
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)), // 0: oid

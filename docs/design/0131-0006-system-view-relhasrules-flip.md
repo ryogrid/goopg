@@ -1,6 +1,6 @@
 # System-view `relhasrules` flip — a hosted PG stops short-circuiting on the six nailed views
 
-**Status:** draft
+**Status:** accepted (implemented 2026-08-11 — see Findings)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S6)
 
@@ -213,3 +213,68 @@ the *runtime* equivalent for user views; S6 supplies the flag.
 - `internal/testport/e2e_pg183_standby_full_cycle_test.go:330-366`
 - `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md` §S6
 - `docs/design/0131-0005-pg-rewrite-runtime-index-maintenance.md` (S5, runtime side)
+
+## Findings (implementation, 2026-08-11)
+
+**The flip works, and it works for all six views.** A real PG 18.3 hosted on a
+directory `goopg init` created now evaluates every one of
+`pg_stat_replication`, `pg_stat_wal_receiver`, `pg_stat_recovery_prefetch`,
+`pg_stat_subscription`, `pg_replication_slots` and
+`pg_stat_replication_slots` — it scans goopg's own `pg_rewrite` heap through
+index 2693, finds the `_RETURN` rule and substitutes its `Query` for the RTE.
+`assertNailedSystemViewsAreEvaluable`
+(`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`) is the probe;
+`waitForPhysicalStreamingPGtoGoopg` querying `pg_stat_replication` again is the
+gate.
+
+Five deltas against the design as written:
+
+1. **S6.1 needed no work.** The `:relid 12261` landmine was discharged by
+   M0131-S8a taking the "repin per S8" branch: `pg_replication_slots` *is*
+   12261 now, so the verbatim blob is correct as captured. The blob-patch route
+   was never taken. The OID table in §"The six views" above is pre-S8a
+   (12100-12106) and is superseded by
+   `internal/initdb/system_view_oid_pins.go`.
+2. **One view did fail, for a reason the design did not predict** —
+   `pg_stat_subscription`, with `ERROR: cache lookup failed for attribute 10 of
+   relation 6100`. Not a tupledesc/`attalign` failure (guard 5's predicted
+   shape) but a **truncated catalog self-description**: `pgSubscriptionAttrs`
+   declared 9 of pg_subscription's 18 columns, while that view's `ev_action`
+   carries Vars up to `varattno 18`. goopg's own heap *writer*
+   (`PGSubscriptionColumnsPG18`) had emitted all 18 columns since B4.4 — the
+   two siblings had disagreed silently the whole time. Fixed here: 18 columns,
+   `relnatts` 9 → 18, and `substream` corrected from bool (16) to char (18),
+   with every value read from a live PG 18.3 `initdb`'s own `pg_attribute`
+   rather than transcribed from the header. Ledgered, including the fact that
+   no other nailed catalog was audited for the same truncation (same root as
+   S13.3 / S14.1).
+3. **Guard 4's probe reports per view rather than bisecting by hand.** The six
+   blobs are independent, so `t.Errorf` per view names every failure in one
+   run — that is what isolated finding 2 (five passes, one failure) without a
+   manual flip-one-at-a-time cycle. S6.6's risk control is satisfied more
+   cheaply than by the procedure it prescribed.
+4. **Guard 2 pins both directions on disk**, not just `pgClassRow` in isolation:
+   `TestBootstrappedViewsCarryRelhasrules` reads FormData_pg_class offset 124
+   out of `base/1/1259` and `base/5/1259` and requires `true` for every
+   `relkind='v'` tuple and `false` for every `relkind='r'` tuple. The false
+   direction matters — a spurious `true` on a rule-less catalog sends PG into
+   `RelationBuildRuleLock` for nothing, and that failure is *silent*
+   (`relcache.c:4313-4318` retries once, then quietly clears its local copy of
+   the flag).
+5. **S6.5 (`reltype`) remains open and is not this slice's.** The six views
+   still carry 2249 RECORDOID where PG mints a per-view composite type;
+   M0131-S8a captured upstream's values (12233/12242/12246/12250/12263/12268)
+   and pins the divergence as deliberate. Adopting them needs real `pg_type`
+   rows — ledgered under S8a. Nothing in the six probes above consults
+   `reltype`, so the flip did not surface it.
+
+**Scope limit (ledgered).** `relhasrules` is written at initdb time, so the flip
+reaches only freshly `goopg init`'d directories. Every existing goopg `$PGDATA`
+keeps `relhasrules='f'` on disk; re-initdb is the only path, and every M0131
+gate initdbs fresh so nothing catches it.
+
+**Gates:** `internal/initdb` (61 s) PASS incl. the new and the inverted guard;
+`TestE2E_PGColdStartOnGoopgDataDir` PASS; `TestE2E_PGStandbyFullCycle` PASS
+(the restored view query); whole `^TestE2E_` family PASS (99 s);
+`internal/estimateaudit` + `internal/executor` PASS; UNITS PASS; pgbench smoke
+via the commit hook.

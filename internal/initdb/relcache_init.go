@@ -85,7 +85,9 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// PANICs every connecting client backend. See
 	// docs/design/0106-0010-step3v-pg-shseclabel-reltype.md.
 	{3592, "pg_shseclabel", 4066, 'r', 4, true, pgShseclabelAttrs()},
-	{6100, "pg_subscription", 6101, 'r', 9, true, pgSubscriptionAttrs()},
+	// relnatts 9 → 18 (M0131-S6): Natts_pg_subscription is 18 and goopg's
+	// own writer has always emitted 18 columns; see pgSubscriptionAttrs.
+	{6100, "pg_subscription", 6101, 'r', 18, true, pgSubscriptionAttrs()},
 	// M0106-0010 step 3bp: pg_parameter_acl is opened during PG-standby
 	// boot once Step 3bo cleared the pg_opfamily family. Without a
 	// pg_class row, `RelationBuildDesc(6243) → ScanPgRelation(6243)`
@@ -689,9 +691,9 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// RelNatts=15 matches the OUT-arg list. pgClassRow handles
 	// RelKind='v' specially: relam=0, relfilenode=0, relhasrules=true
 	// (PG fetches the rewrite rule from pg_rewrite when relhasrules is
-	// true). The pg_rewrite row carrying ev_action is the next blocker
-	// (Step 3dm) — without it the view is openable but `SELECT` returns
-	// no rows.
+	// true). The pg_rewrite _RETURN rows carrying ev_action landed with
+	// Step 3dm (pg_rewrite_bootstrap.go); M0131-S6 flipped relhasrules
+	// on, so a hosted PG actually runs RelationBuildRuleLock over them.
 	{pgStatWalReceiverViewOID, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
 	// M0106-0010 batched-28: seed pg_class + pg_attribute rows for the 5
 	// remaining replication views so PG's RangeVarGetRelid returns a non-zero
@@ -2170,6 +2172,29 @@ func pgShseclabelAttrs() []nailedAttr {
 	}
 }
 
+// pgSubscriptionAttrs returns the FULL 18-column PG18 pg_subscription schema
+// (postgres/src/include/catalog/pg_subscription.h:43-97).
+//
+// M0131-S6 (2026-08-11) extended this from 9 columns to 18 and corrected
+// substream's type. Two independent reasons:
+//
+//   - It was the sibling half of an already-PG-faithful writer.
+//     PGSubscriptionColumnsPG18 (internal/executor/sys_pg_subscription.go) has
+//     written all 18 columns since B4.4, and reloadSubscriptionsFromHeap reads
+//     column 13/14/16 back — so goopg's own heap rows always carried 18
+//     attributes while goopg's *self-description* claimed 9.
+//   - It blocked M0131-S6's sixth view. pg_stat_subscription's verbatim
+//     ev_action carries Vars up to `varattno 18` over relation 6100; with a
+//     9-column pg_attribute a hosted PG fails rule expansion outright:
+//     "cache lookup failed for attribute 10 of relation 6100".
+//
+// substream was TypeOID 16 (bool); upstream declares `char substream` and the
+// writer already emits "f"/LOGICALREP_STREAM_OFF as a char. Values verified
+// against a live PG 18.3 `initdb` (attnum/attname/atttypid/attlen/attnotnull
+// read from its own pg_attribute), not transcribed from the header: the two
+// nullable columns are subslotname (BKI_FORCE_NULL) and suborigin (BKI_DEFAULT
+// with no FORCE_NOT_NULL), while subconninfo/subsynccommit/subpublications
+// carry BKI_FORCE_NOT_NULL and are attnotnull.
 func pgSubscriptionAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
@@ -2179,8 +2204,18 @@ func pgSubscriptionAttrs() []nailedAttr {
 		{Name: "subowner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "subenabled", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
 		{Name: "subbinary", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
-		{Name: "substream", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
+		{Name: "substream", TypeOID: 18, Num: 8, Len: 1, NotNull: true},
 		{Name: "subtwophasestate", TypeOID: 18, Num: 9, Len: 1, NotNull: true},
+		{Name: "subdisableonerr", TypeOID: 16, Num: 10, Len: 1, NotNull: true},
+		{Name: "subpasswordrequired", TypeOID: 16, Num: 11, Len: 1, NotNull: true},
+		{Name: "subrunasowner", TypeOID: 16, Num: 12, Len: 1, NotNull: true},
+		{Name: "subfailover", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
+		// CATALOG_VARLEN block starts here.
+		{Name: "subconninfo", TypeOID: 25, Num: 14, Len: -1, NotNull: true},
+		{Name: "subslotname", TypeOID: 19, Num: 15, Len: 64, NotNull: false},
+		{Name: "subsynccommit", TypeOID: 25, Num: 16, Len: -1, NotNull: true},
+		{Name: "subpublications", TypeOID: 1009, Num: 17, Len: -1, NotNull: true},
+		{Name: "suborigin", TypeOID: 25, Num: 18, Len: -1, NotNull: false},
 	}
 }
 

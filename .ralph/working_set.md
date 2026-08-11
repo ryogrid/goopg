@@ -1,47 +1,47 @@
 (idle — nothing in flight)
 
-Last loop (#113): **M0131-S5 — runtime `pg_rewrite` index maintenance (2692/2693)**
+Last loop (#115): **M0131-S6 — relhasrules flip for the 6 nailed system views**
 — DONE, ticked, committed, pushed to `make-db-cluster-compat`.
 
 M-NIGHTLY duty: `ci/logs/action-items.md` still run `20260811-014635` (12 items,
 unchanged since loop #100). All already filed; the open ones stay PARKED per
 banner. No new filing needed.
 
-**The headline: a real PG 18.3 hosted on a goopg catalog now expands and reads
-goopg-authored user views.** `SELECT count(*) FROM public.b5c_view` returned
-42809 for the whole life of the M0123 line; it now returns the base-table count
-on the promoted standby, and so do `b5c_view2` (bool/null WHERE) and
-`b5c_view3` (searched CASE). The canonical `ev_action` serializer was never the
-blocker — `writeViewRewriteRow` wrote the `_RETURN` heap row and DISCARDED the
-TID, so `RelationBuildRuleLock` (relcache.c:785-806, `indexOK=true` hard
-constant, no seq-scan fallback in genam.c:397-401) left `rd_rules` NULL and the
-planner raised at plancat.c:139-147.
+**Headline: a real PG 18.3 hosted on a goopg-initdb'd directory now evaluates
+ALL SIX nailed views** (`assertNailedSystemViewsAreEvaluable`, S4 cold-start
+E2E). The acceptance gate is restored: `waitForPhysicalStreamingPGtoGoopg`
+queries the `pg_stat_replication` VIEW again (AI-20260810-011258-003's SRF-join
+workaround retired).
 
-What landed:
-- `writeViewRewriteRow` captures the TID → `insertPgRewriteRelRulenameIndexEntry`
-  (2693, load-bearing) + `insertPgRewriteOidIndexEntry` (2692); both OIDs joined
-  `mirroredCatalogOIDs()` (omitting the mirror = blocker #8 repeated).
-- Gate: the soft `t.Logf` in `e2e_failover_goopg_to_pg_test.go` is now a hard
-  count assertion over all three views, with a non-vacuity guard.
-- New `internal/executor/sys_pg_rewrite_index_test.go` (2 tests) — leaf shape,
-  TID resolving to the LIVE heap row with the right ev_class, mirror membership,
-  and S5.5's DROP/recreate cycle VERIFIED (stale + fresh leaf, exactly one live).
-- Three plan corrections: **S5.1 was already done** (`buildIndexTupleOidNameKey`
-  / `cmpKeyOidName` already in `sys_pg_enum.go` for pg_enum 3503, identical
-  80-byte layout — Guards 1/2 subsumed); `"_RETURN"` → `viewRuleName` const
-  shared by heap row and index key; inline `mirroredOIDs` → `mirroredCatalogOIDs()`.
-- Design `0131-0005` draft → accepted + §Findings; README row. 1 ledger row.
+**The one real failure was NOT the predicted tupledesc/attalign shape.**
+`pg_stat_subscription` gave `cache lookup failed for attribute 10 of relation
+6100`: `pgSubscriptionAttrs` declared **9 of pg_subscription's 18 columns**
+while goopg's own writer `PGSubscriptionColumnsPG18`
+(`internal/executor/sys_pg_subscription.go`) has emitted all 18 since B4.4 — a
+silent sibling divergence. Fixed to 18 (+ relnatts 9→18, `substream`
+bool(16)→char(18)), values read from a live PG 18.3 initdb's own pg_attribute.
+
+**Hand forward:** no other nailed catalog was audited for the same truncation.
+The cheap oracle is one throwaway `initdb` + `SELECT attnum,attname,atttypid,
+attlen,attnotnull FROM pg_attribute WHERE attrelid='<cat>'::regclass` — a
+table-driven guard over every `nailedAttr` list would close S13.3/S14.1's shared
+root (trailing nullable catalog attributes) in one slice. Ledgered.
+
+S6.1 was already discharged by S8a's repin (no blob patch). S6.5 (per-view
+composite `reltype` vs 2249 RECORDOID) stays open, ledgered under S8a.
+S6.6's bisect was met more cheaply by t.Errorf-per-view than by flipping one at
+a time.
 
 Next loop: per banner — M-NIGHTLY filing, then M0131 top-to-bottom. Next
-unchecked is **M0131-S6** (flip `relhasrules=true` for the 6 nailed system
-views; `relHasRules = true` is commented out at `internal/initdb/initdb.go:5817`
-— RISKY, and S8a is marked "must precede S6 AND S7", so read S8a first and
-consider taking it instead). Note S13.3 and S14.1 still share a root (trailing
-nullable catalog attributes).
+unchecked after S6 is **M0131-S7** (the ev_action capture tool; under Option A
+the mapping is the identity function, so S7.6 is a plain `cmp` against
+upstream's bytes — do NOT grow a rewriting pass).
 
-Gates: new component tests PASS; `TestE2E_FailoverGoopgToPG` PASS (11.5 s, both
-subtests); UNITS PASS (no FAILs); pgbench smoke PASS via the commit hook. No
-executor/planner/codec *query-path* change (catalog index maintenance only), so
-tpch-spotcheck / TPC-DS SF0.5 not required.
+Gates: `internal/initdb` PASS (61 s); `TestE2E_PGColdStartOnGoopgDataDir` PASS;
+`TestE2E_PGStandbyFullCycle` PASS; whole `^TestE2E_` family PASS (99 s);
+`internal/estimateaudit` + `internal/executor` PASS; UNITS PASS (no FAILs);
+pgbench smoke PASS via the commit hook. No query-path executor/planner/codec
+change (initdb catalog description + one bootstrap flag), so tpch-spotcheck /
+TPC-DS SF0.5 not required.
 
 In-flight: none
