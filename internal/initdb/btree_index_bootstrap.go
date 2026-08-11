@@ -2010,7 +2010,12 @@ func bootstrapPgOpfamilyAmNameNspIndex(dataDir string, tids map[uint32]heapTID) 
 	for i, it := range items {
 		tuples[i] = pgBuildIndexTupleOidNameOidKey(it.block, it.off, it.method, it.name, it.namespace)
 	}
-	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 4)
+	// nkeyatts = 3, matching this index's indnkeyatts
+	// (pgIndexInitialEntries entry(2754, …, []int16{2, 3, 4}, …)). It read 4
+	// until M0131-S12 built 2686 on the same shape and cross-checked both
+	// against pg_index; 2754 is multi-leaf, so the wrong value was baked into
+	// its pivot tuples' BTreeTupleGetNAtts.
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 3)
 	if err != nil {
 		return fmt.Errorf("pg_opfamily_am_name_nsp_index bulk-load: %w", err)
 	}
@@ -2020,6 +2025,255 @@ func bootstrapPgOpfamilyAmNameNspIndex(dataDir string, tids map[uint32]heapTID) 
 	} {
 		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2754, 10)), file, 0o600); err != nil {
 			return fmt.Errorf("write pg_opfamily_am_name_nsp_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgOpclassAmNameNspIndex writes pg_opclass_am_name_nsp_index
+// (OID 2686) — a UNIQUE btree on (opcmethod, opcname, opcnamespace),
+// see pgIndexInitialEntries' entry(2686, ...) — to base/{1,5} and
+// global/, overwriting the empty placeholder root page.
+//
+// M0131-S12 (measured by M0131-S4 finding F1): while 2686 stayed empty a
+// real PG hosted on a goopg $PGDATA could not execute a sort of ANY type —
+// `... ORDER BY x` failed with "could not identify an ordering operator for
+// type integer". The heap (2616) and the pg_index row were already correct;
+// only the index was empty. GetDefaultOpClass scans pg_opclass through this
+// index with indexOK = true and has NO seq-scan fallback
+// (postgres/src/backend/commands/indexcmds.c:2374-2384), so an empty index is
+// indistinguishable from "no default opclass exists".
+//
+// Same tuple shape as its sibling pg_opfamily_am_name_nsp_index (2754) —
+// btree(oid oid_ops, name name_ops, oid oid_ops) — so it reuses
+// pgBuildIndexTupleOidNameOidKey, which has named 2686 in its doc comment
+// since it was written without ever having a caller that built 2686's tuples.
+// name_ops compares with C-collation strcmp, so Go's byte-wise string
+// ordering is the correct sort key.
+func bootstrapPgOpclassAmNameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgOpclassInitialEntries()
+	type indexed struct {
+		method    uint32
+		name      string
+		namespace uint32
+		block     uint32
+		off       uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_opclass_am_name_nsp_index: no heap TID for opclass OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			method:    e.Method,
+			name:      e.Name,
+			namespace: e.Namespace,
+			block:     tid.Block,
+			off:       tid.Offset,
+		})
+	}
+	// Sort by (opcmethod, opcname, opcnamespace) — matches oid_ops/name_ops/oid_ops ordering.
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.method != b.method {
+			return a.method < b.method
+		}
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		return a.namespace < b.namespace
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidNameOidKey(it.block, it.off, it.method, it.name, it.namespace)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 3)
+	if err != nil {
+		return fmt.Errorf("pg_opclass_am_name_nsp_index bulk-load: %w", err)
+	}
+	// base/{1,5} plus global/ — the same three directories
+	// bootstrapPgOpclassOidIndex (2687) writes, so both indexes of the
+	// pg_opclass catalog are populated wherever PG may look for them.
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2686, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_opclass_am_name_nsp_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgAmopFamStratIndex writes pg_amop_fam_strat_index (OID 2653) — a
+// UNIQUE btree on (amopfamily, amoplefttype, amoprighttype, amopstrategy),
+// pgIndexInitialEntries entry(2653, 2602, []int16{2, 3, 4, 5}, …) — to
+// base/{1,5} and global/.
+//
+// M0131-S12. This is the index behind the AMOPSTRATEGY syscache, i.e. behind
+// get_opfamily_member (postgres/src/backend/utils/cache/lsyscache.c). Syscache
+// lookups are index-only by construction — there is no seq-scan fallback the
+// way there is for a plain systable scan — so an empty 2653 makes every
+// strategy-operator lookup fail even though goopg's pg_amop heap is correct.
+// The user-visible symptom is the same "could not identify an ordering
+// operator for type integer" that an empty pg_opclass_am_name_nsp_index (2686)
+// produces: lookup_type_cache(TYPECACHE_LT_OPR) walks
+// GetDefaultOpClass (2686) → get_opclass_family → get_opfamily_member (2653),
+// and either empty index stops it. S12 populates both; fixing only 2686 leaves
+// the failure bit-identical, which is why the S4-F1 finding had to be measured
+// twice before it moved.
+//
+// Same 4-key fixed-width shape as pg_amproc_fam_proc_index (2655), so it
+// reuses that index's tuple encoder.
+func bootstrapPgAmopFamStratIndex(dataDir string, tids []heapTID) error {
+	entries := pgAmopInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_amop_fam_strat_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	type indexed struct {
+		family, lefttype, righttype uint32
+		strategy                    int16
+		block                       uint32
+		off                         uint16
+	}
+	items := make([]indexed, len(entries))
+	for i, e := range entries {
+		items[i] = indexed{
+			family:    e.Family,
+			lefttype:  e.LeftType,
+			righttype: e.RightType,
+			strategy:  e.Strategy,
+			block:     tids[i].Block,
+			off:       tids[i].Offset,
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.family != b.family {
+			return a.family < b.family
+		}
+		if a.lefttype != b.lefttype {
+			return a.lefttype < b.lefttype
+		}
+		if a.righttype != b.righttype {
+			return a.righttype < b.righttype
+		}
+		return a.strategy < b.strategy
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidOidOidInt2Key(it.block, it.off, it.family, it.lefttype, it.righttype, it.strategy)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 24, 4)
+	if err != nil {
+		return fmt.Errorf("pg_amop_fam_strat_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2653, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_amop_fam_strat_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// pgBuildIndexTupleOidCharOidKey encodes the 3-column composite IndexTuple of
+// pg_amop_opr_fam_index (2654): btree(oid oid_ops, char char_ops, oid oid_ops).
+//
+// Layout follows index_form_tuple's attribute packing, hoff = 8:
+//
+//	[8..11]  oid1   (amopopr)      — align 4
+//	[12]     ch     (amoppurpose)  — char, typalign 'c', no padding before it
+//	[13..15] pad                   — the next oid realigns to 4
+//	[16..19] oid2   (amopfamily)
+//
+// size = MAXALIGN(8 + 12) = 24, the same total as the 4-key
+// pgBuildIndexTupleOidOidOidInt2Key tuple.
+func pgBuildIndexTupleOidCharOidKey(heapBlk uint32, heapOff uint16, oid1 uint32, ch byte, oid2 uint32) []byte {
+	const (
+		hoff = 8
+		size = 24
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	out[hoff+4] = ch
+	le.PutUint32(out[hoff+8:hoff+12], oid2)
+	return out
+}
+
+// bootstrapPgAmopOprFamIndex writes pg_amop_opr_fam_index (OID 2654) — a UNIQUE
+// btree on (amopopr, amoppurpose, amopfamily), pgIndexInitialEntries
+// entry(2654, 2602, []int16{7, 6, 2}, …) — to base/{1,5} and global/.
+//
+// M0131-S12. 2654 backs the AMOPOPID syscache LIST, which the planner reaches
+// through get_ordering_op_properties / op_in_opfamily once a sort operator has
+// been chosen — the step AFTER the 2653 lookup above. Populating 2653 alone
+// moves the failure rather than closing it.
+//
+// char_ops compares amoppurpose as an unsigned byte (btcharcmp), and the only
+// values goopg seeds are 's' and 'o', so Go's byte ordering is the index order.
+func bootstrapPgAmopOprFamIndex(dataDir string, tids []heapTID) error {
+	entries := pgAmopInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_amop_opr_fam_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	type indexed struct {
+		opr     uint32
+		purpose byte
+		family  uint32
+		block   uint32
+		off     uint16
+	}
+	items := make([]indexed, len(entries))
+	for i, e := range entries {
+		items[i] = indexed{
+			opr:     e.Operator,
+			purpose: e.Purpose,
+			family:  e.Family,
+			block:   tids[i].Block,
+			off:     tids[i].Offset,
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.opr != b.opr {
+			return a.opr < b.opr
+		}
+		if a.purpose != b.purpose {
+			return a.purpose < b.purpose
+		}
+		return a.family < b.family
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidCharOidKey(it.block, it.off, it.opr, it.purpose, it.family)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 24, 3)
+	if err != nil {
+		return fmt.Errorf("pg_amop_opr_fam_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2654, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_amop_opr_fam_index in %s: %w", dir, err)
 		}
 	}
 	return nil

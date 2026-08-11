@@ -1088,8 +1088,22 @@ func Init(opts Options) error {
 	// (queried at planning time via AMOPSTRATEGY/AMOPOPID) and
 	// pg_amproc support function rows (load-bearing — scanned by
 	// LookupOpclassInfo during RelationInitIndexAccessInfo).
-	if err := bootstrapPgAmopTuples(abs); err != nil {
+	pgAmopTIDs, err := bootstrapPgAmopTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_amop tuples: %w", err)
+	}
+	// M0131-S12: the pg_amop HEAP alone is not reachable by the lookups that
+	// matter. lookup_type_cache(TYPECACHE_LT_OPR) → get_opfamily_member goes
+	// through the AMOPSTRATEGY syscache (index 2653) and the planner's
+	// get_ordering_op_properties through AMOPOPID (index 2654); syscache
+	// lookups are index-only, with no seq-scan fallback. While 2653/2654 were
+	// empty placeholders a hosted PG could not sort ANY type even with a
+	// correct heap and a populated pg_opclass_am_name_nsp_index (2686).
+	if err := bootstrapPgAmopFamStratIndex(abs, pgAmopTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_amop_fam_strat_index: %w", err)
+	}
+	if err := bootstrapPgAmopOprFamIndex(abs, pgAmopTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_amop_opr_fam_index: %w", err)
 	}
 	pgAmprocTIDs, err := bootstrapPgAmprocTuples(abs)
 	if err != nil {
@@ -1145,6 +1159,14 @@ func Init(opts Options) error {
 	// every opclass via pg_opclass_oid_index.
 	if err := bootstrapPgOpclassOidIndex(abs, pgOpclassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_opclass_oid_index: %w", err)
+	}
+	// M0131-S12 (measured by M0131-S4 finding F1): pg_opclass's OTHER index,
+	// pg_opclass_am_name_nsp_index (2686), stayed an empty placeholder, and
+	// GetDefaultOpClass has no seq-scan fallback — so a real PG hosted on a
+	// goopg $PGDATA could not sort ANY type ("could not identify an ordering
+	// operator for type integer"). Populate it from the same heap TIDs.
+	if err := bootstrapPgOpclassAmNameNspIndex(abs, pgOpclassTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_opclass_am_name_nsp_index: %w", err)
 	}
 	// M0106-0010 batched-19: seed pg_opfamily_oid_index (2755) and
 	// pg_opfamily_am_name_nsp_index (2754) so PG's OPFAMILYOID and
@@ -1899,7 +1921,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -2044,7 +2066,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -2141,7 +2163,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -4459,15 +4481,18 @@ func pgAmopRow(e pgAmopEntry) executor.Row {
 // lookups via the AMOPOPID / AMOPSTRATEGY syscaches), so the
 // rows are not load-bearing for hot-standby boot but ARE required
 // for any non-trivial SELECT against a system view.
-func bootstrapPgAmopTuples(dataDir string) error {
+// It returns the heap TIDs in pgAmopInitialEntries order so
+// bootstrapPgAmopFamStratIndex / bootstrapPgAmopOprFamIndex (M0131-S12) can
+// build 2653/2654 over them; before S12 the TIDs were discarded and both
+// indexes stayed empty placeholders.
+func bootstrapPgAmopTuples(dataDir string) ([]heapTID, error) {
 	cols := pgAmopColDefs()
 	entries := pgAmopInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgAmopRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2602", cols, rows)
-	return err
+	return writeMultiPageHeapRows(dataDir, "2602", cols, rows)
 }
 
 // pgAmprocEntry mirrors one row of PG18's pg_amproc.dat — see

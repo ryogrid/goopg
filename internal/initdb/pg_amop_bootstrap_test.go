@@ -146,8 +146,16 @@ func TestBootstrapPgAmopTuplesWritesRowsToBase1And5(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgAmopTuples(dir); err != nil {
+	tids, err := bootstrapPgAmopTuples(dir)
+	if err != nil {
 		t.Fatalf("bootstrapPgAmopTuples: %v", err)
+	}
+	// M0131-S12 turned the discarded TIDs into a return value; 2653/2654 are
+	// built from them, so a length mismatch here would silently mis-key both
+	// indexes.
+	if len(tids) != len(pgAmopInitialEntries()) {
+		t.Fatalf("bootstrapPgAmopTuples returned %d TIDs, want one per entry (%d)",
+			len(tids), len(pgAmopInitialEntries()))
 	}
 	// Build the needle: oid=7000 || family=1976 || left=23 || right=23.
 	le := binary.LittleEndian

@@ -17,9 +17,9 @@ package testport
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -237,19 +237,23 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	//
 	// Guard 3 / 0130-0002 Guard #1: `SELECT relname FROM pg_class` lists the
 	// user tables. This is the sentence that guard has been waiting for.
-	// NOTE the query carries no ORDER BY, and the sort happens in Go. That is
-	// not a style choice — see assertEmptyOpclassIndexStillBlocksSorts below,
-	// the finding this test measured.
+	// The query carries an ORDER BY and PG does the sorting. It used to sort in
+	// Go instead, because until M0131-S12 populated
+	// pg_opclass_am_name_nsp_index (2686) a hosted PG could not sort at all —
+	// see assertHostedPGCanSort below. Sorting server-side keeps the guard
+	// honest: it now exercises the ordering path over a real goopg catalog scan,
+	// not just over a VALUES list.
+	assertHostedPGCanSort(t, pg, goopgDir)
+
 	relnames := pgQueryColumn(t, pg, `SELECT c.relname
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname IN ('public', 's4app') AND c.relkind = 'r'`)
-	sort.Strings(relnames)
+		WHERE n.nspname IN ('public', 's4app') AND c.relkind = 'r'
+		ORDER BY c.relname`)
 	if got := strings.Join(relnames, ","); got != "s4_items,s4_notes" {
 		t.Fatalf("hosted PG lists user tables %q, want \"s4_items,s4_notes\" — "+
 			"this is docs/design/0130-0002-pg-class-heap-persistence.md Guard #1", got)
 	}
 
-	assertEmptyOpclassIndexStillBlocksSorts(t, pg)
 	assertSystemViewOIDsArePinnedToUpstream(t, pg)
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
@@ -384,14 +388,14 @@ func assertHostedPGIndexReadable(t *testing.T, pg *pgcluster.Cluster) {
 	}
 }
 
-// assertEmptyOpclassIndexStillBlocksSorts locks in the finding this test
-// measured, in the direction that fails loudly the moment the gap closes —
-// the same discipline M0131-S3 used for the HOT-flag finding that became S11.
+// assertHostedPGCanSort is the INVERTED form of what used to be
+// `assertEmptyOpclassIndexStillBlocksSorts` — M0131-S12 landed and the
+// fail-when-fixed assertion fired exactly as designed.
 //
-// A real PG hosted on a goopg-created directory cannot execute ANY sort, for
-// ANY type. `SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x` fails with
-// "could not identify an ordering operator for type integer" — nothing in the
-// query touches goopg's own tables.
+// The gap it measured: a real PG hosted on a goopg-created directory could not
+// execute ANY sort, for ANY type. `SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x`
+// failed with "could not identify an ordering operator for type integer" —
+// nothing in that query touches goopg's own tables.
 //
 // Diagnosis (measured, not inferred). The chain is
 // lookup_type_cache(TYPECACHE_LT_OPR) → GetDefaultOpClass, which at
@@ -402,35 +406,48 @@ func assertHostedPGIndexReadable(t *testing.T, pg *pgcluster.Cluster) {
 //	scan = systable_beginscan(rel, OpclassAmNameNspIndexId /* 2686 */, true, …);
 //
 // `indexOK = true` with no seq-scan fallback — the identical shape as blockers
-// #7/#8 and M0131-S5. goopg's pg_opclass HEAP is complete and correct (probed:
-// 177 rows; int4_ops is oid 1978, opcmethod 403, opcdefault 't'; 38 default
-// btree opclasses), and pg_index carries valid rows for 2686/2687. What is
-// missing is the index CONTENT: internal/initdb/initdb.go writes 2686 as a bare
-// `makeBtreeRootPage()` placeholder (the ~2047 list), while its sibling
-// pg_opfamily_am_name_nsp_index (2754) gets a real bulk-load bootstrapper.
-// pgBuildIndexTupleOidNameOidKey (internal/initdb/btree_index_bootstrap.go:1909)
-// even names 2686 in its doc comment as one of the two indexes it serves — no
-// caller ever builds 2686's tuples. So the scan returns zero rows and PG
-// concludes no type has a default btree opclass.
+// #7/#8 and M0131-S5. goopg's pg_opclass HEAP was already complete and correct
+// (177 rows; int4_ops is oid 1978, opcmethod 403, opcdefault 't'; 38 default
+// btree opclasses) and pg_index carried valid rows for 2686/2687. Only the index
+// CONTENT was missing, so the scan returned zero rows and PG concluded that no
+// type has a default btree opclass.
 //
-// Filed as M0131-S12 with a deferral-ledger row. When S12 lands, this assertion
-// FAILS — invert it then: replace it with the direct
-// `ORDER BY`-carrying form of the Guard-#1 query above and drop the Go-side
-// sort.
-func assertEmptyOpclassIndexStillBlocksSorts(t *testing.T, pg *pgcluster.Cluster) {
+// The fix is `bootstrapPgOpclassAmNameNspIndex`
+// (internal/initdb/btree_index_bootstrap.go), which bulk-loads 2686 from the same
+// heap TIDs `bootstrapPgOpclassOidIndex` (2687) uses. This assertion now holds it
+// in the POSITIVE direction: a regression here means 2686 went empty again.
+//
+// Keep the probe FROM-less/table-less on purpose: it isolates the opclass
+// lookup from anything about goopg's own heaps. The ORDER BY over real goopg
+// tables is asserted separately by the Guard #1 query at the call site, which
+// S12 restored to its ORDER BY form.
+func assertHostedPGCanSort(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
 	t.Helper()
-	const probe = "SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x"
+	const probe = "SELECT string_agg(x::text, ',' ORDER BY x) FROM (VALUES (2), (1), (3)) v(x)"
 	out, err := pgQueryScalarAllowError(pg, probe)
-	if err == nil {
-		t.Fatalf("a hosted PG can now sort (%q returned %q) — M0131-S12 has landed. "+
-			"INVERT this assertion: restore the ORDER BY form of the Guard #1 query, "+
-			"drop the Go-side sort, and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			probe, strings.TrimSpace(out))
+	if err != nil {
+		// Report the on-disk size of 2686 in both databases: an 8 KB file is
+		// the bare `makeBtreeRootPage()` placeholder (the pre-S12 state, i.e.
+		// the bootstrapper did not run), while a larger file means the index
+		// was built but PG could not use its content.
+		var sizes []string
+		for _, db := range []string{"1", "5"} {
+			p := filepath.Join(goopgDir, "base", db, "2686")
+			if st, sErr := os.Stat(p); sErr == nil {
+				sizes = append(sizes, fmt.Sprintf("%s=%d bytes", p, st.Size()))
+			} else {
+				sizes = append(sizes, fmt.Sprintf("%s: %v", p, sErr))
+			}
+		}
+		t.Fatalf("a hosted PG can no longer sort (%q): M0131-S12 REGRESSED — "+
+			"pg_opclass_am_name_nsp_index (2686) is empty again, see "+
+			"bootstrapPgOpclassAmNameNspIndex.\non-disk: %s\n%s",
+			probe, strings.Join(sizes, ", "), out)
 	}
-	if !strings.Contains(out, "could not identify an ordering operator") {
-		t.Fatalf("hosted PG sort failed with an UNEXPECTED error — the known gap is the empty "+
-			"pg_opclass_am_name_nsp_index (2686, M0131-S12); this is something else:\n%s", out)
+	if got := strings.TrimSpace(out); got != "1,2,3" {
+		t.Fatalf("hosted PG sorted to %q, want \"1,2,3\" — the 2686 index is populated but "+
+			"produces the wrong order (key layout or sort order in "+
+			"bootstrapPgOpclassAmNameNspIndex)", got)
 	}
 }
 
